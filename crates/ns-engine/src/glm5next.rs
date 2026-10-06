@@ -317,6 +317,14 @@ pub struct Decoder {
     pub accepted: u64,
 }
 
+impl Decoder {
+    /// The committed token not fed yet (the last step's), handed over - e.g. to a batch step - and the draft dropped
+    pub fn pending(&mut self) -> Option<u32> {
+        self.draft = None;
+        self.next.take()
+    }
+}
+
 fn argmax(v: &[f32]) -> u32 {
     v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32)
 }
@@ -1619,7 +1627,7 @@ impl<'g> Glm<'g> {
     /// its row. Each row comes out as that session's own one-token pass would (`nextsycl batch-check`). The draft
     /// block is left out: a session's draft cache misses these positions (its next drafts are then guesses; exact
     /// acceptance keeps the output the same).
-    pub fn forward_batch(&self, sess: &mut [Session], tokens: &[u32], tap: Tap) -> Result<Vec<Vec<f32>>> {
+    pub fn forward_batch(&self, sess: &mut [&mut Session], tokens: &[u32], tap: Tap) -> Result<Vec<Vec<f32>>> {
         let g = &self.m.g;
         let t = tokens.len();
         if t == 0 || t != sess.len() || t > MMVQ_COLS {
@@ -1851,6 +1859,12 @@ impl<'g> Glm<'g> {
     /// Generation from a prompt `feed` returned `logits` for; `mtp`: draft with the MTP block (when loaded).
     pub fn decoder(&self, logits: Vec<f32>, mtp: bool) -> Decoder {
         Decoder { logits, next: None, draft: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
+    }
+
+    /// A decoder whose last committed token `next` is not fed yet (one handed over by `Decoder::pending`, or a batch
+    /// step's): its first step feeds it
+    pub fn decoder_after(&self, next: u32, mtp: bool) -> Decoder {
+        Decoder { logits: Vec::new(), next: Some(next), draft: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
     }
 
     /// The next committed token(s): one, or two when a draft is accepted. `sample` draws a token from logits. With

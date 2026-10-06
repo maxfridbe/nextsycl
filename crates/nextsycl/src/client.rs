@@ -105,20 +105,23 @@ fn status_table(st: &Value) -> String {
         out += &format!("{:>90}\n", format!("the GPUs draw {watts:.0} W"));
     }
     out += "\n";
-    match st["running"].as_object() {
-        Some(_) => {
-            let r = &st["running"];
-            let reused = match r["source"].as_str() {
-                Some(src) => format!("{} reused ({src})", r["reused"]),
-                None => "reading".into(),
-            };
-            out += &format!("request #{} ({}): {}, prompt {} tokens, {}, {} / {} generated{}, {}{}\n", r["id"], r["via"].as_str().unwrap_or("?"),
-                            r["state"].as_str().unwrap_or("?"), r["prompt_tokens"], reused, r["generated"], r["max_tokens"],
-                            r["tok_s"].as_f64().map_or(String::new(), |t| format!(" at {t:.1} tok/s")),
-                            dur(now() - r["started"].as_f64().unwrap_or(now())),
-                            r["energy_j"].as_f64().map_or(String::new(), |j| format!(", {} so far", joules(j))));
-        }
-        None => out += "idle\n",
+    let active = st["active"].as_array().cloned().unwrap_or_else(|| st["running"].as_object().map(|_| vec![st["running"].clone()]).unwrap_or_default());
+    if active.is_empty() {
+        out += "idle\n";
+    }
+    for r in &active {
+        let reused = match r["source"].as_str() {
+            Some(src) => format!("{} reused ({src})", r["reused"]),
+            None => if r["state"].as_str() == Some("waiting") { "waiting for a session".into() } else { "reading".into() },
+        };
+        out += &format!("request #{} ({}): {}, prompt {} tokens, {}, {} / {} generated{}, {}{}\n", r["id"], r["via"].as_str().unwrap_or("?"),
+                        r["state"].as_str().unwrap_or("?"), r["prompt_tokens"], reused, r["generated"], r["max_tokens"],
+                        r["tok_s"].as_f64().map_or(String::new(), |t| format!(" at {t:.1} tok/s")),
+                        dur(now() - r["started"].as_f64().unwrap_or(now())),
+                        r["energy_j"].as_f64().map_or(String::new(), |j| format!(", {} so far", joules(j))));
+    }
+    if st["waiting"].as_u64().unwrap_or(0) > 0 {
+        out += &format!("{} more waiting\n", st["waiting"]);
     }
     match st["prompt_cache"].as_object() {
         Some(_) => {
@@ -163,7 +166,7 @@ pub fn ps(raw: &[String]) -> Result<(), String> {
     let v = get("/server/requests")?;
     println!("{:<6} {:<7} {:<11} {:>7} {:>16} {:>7} {:>10} {:>7} {:>9} {:>6} {:<7} {:>8}", "ID", "VIA", "STATE", "PROMPT", "REUSED", "READ", "GENERATED",
              "TOK/S", "ENERGY", "AVG W", "FINISH", "AGO");
-    let mut rows: Vec<Value> = v["running"].as_object().map(|_| vec![v["running"].clone()]).unwrap_or_default();
+    let mut rows: Vec<Value> = v["active"].as_array().cloned().unwrap_or_else(|| v["running"].as_object().map(|_| vec![v["running"].clone()]).unwrap_or_default());
     rows.extend(v["done"].as_array().cloned().unwrap_or_default().into_iter().take(if all { usize::MAX } else { 10 }));
     for r in rows {
         let reused = r["source"].as_str().map_or("-".into(), |s| format!("{} {s}", r["reused"]));

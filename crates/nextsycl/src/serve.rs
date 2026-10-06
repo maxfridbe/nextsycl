@@ -29,7 +29,10 @@
 //!     GET  /server/cache           the prompt cache's checkpoints;  POST /server/cache/clear  drops them
 //!     POST /server/shutdown        stop once no request runs (as SIGTERM)
 //!
-//! One request runs at a time (the others wait). The prompt cache (cache.rs, --prompt-cache-mib) keeps the
+//! Up to `--parallel` requests (NS_PARALLEL, default 2) decode together: an engine thread owns that many sessions,
+//! reads a new request's prompt into a free one, and steps every active session at once (`Glm::forward_batch`: the
+//! weights read once for all of them; each row as its own pass would be) - one active request decodes alone, with
+//! the draft block. The rest wait in order. The prompt cache (cache.rs, --prompt-cache-mib) keeps the
 //! conversation state at three points of every prompt - the end of its first turn (a system prompt other
 //! conversations share), the start of its last user turn (an edited or regenerated message), its end (the next turn
 //! of the conversation) - and a request mounts the longest cached prefix of its tokens, or continues the live
@@ -38,6 +41,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::mpsc;
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -45,7 +49,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ns_engine::glm5next::{Glm, Session};
+use ns_engine::glm5next::{Decoder, Glm, Session};
 
 use crate::cache::PromptCache;
 use crate::telemetry::Telemetry;
@@ -63,11 +67,20 @@ pub struct Server {
     pub name: String,
     pub max_ctx: usize,
     pub default_effort: Effort,
-    state: Mutex<Conv>,
-    busy: AtomicBool,
+    /// the requests waiting for a session, and the engine's wake-up
+    queue: Mutex<VecDeque<Job>>,
+    wake: std::sync::Condvar,
+    /// requests taken and not yet ended (the stop waits for none)
+    inflight: AtomicU64,
+    /// the sessions decoding together at most
+    parallel: usize,
+    /// the prompt cache (the engine thread's while it reads a prompt; status calls only try)
+    cache: Mutex<PromptCache>,
+    /// each session's tokens held, for status
+    live_lens: Mutex<Vec<usize>>,
     started: Instant,
-    /// the request running (its JSON row, updated as it goes) and the last `keep` that ended
-    current: Mutex<Option<Value>>,
+    /// the requests running (their JSON rows, updated as they go) and the last `keep` that ended
+    running: Mutex<std::collections::BTreeMap<u64, Value>>,
     done: Mutex<VecDeque<Value>>,
     next_id: AtomicU64,
     /// how many ended requests `done` keeps
@@ -131,12 +144,51 @@ fn cors_headers(origin: Option<&str>, allowed: &[String]) -> String {
     }
 }
 
-/// The working session with the tokens it has consumed, and the prompt cache.
-struct Conv {
-    work: Session,
+/// A request for the engine: its prompt's tokens, how to sample, where its tokens go
+struct Job {
+    #[allow(dead_code)]
+    id: u64,
+    ids: Vec<u32>,
+    max: usize,
+    temp: f32,
+    top_p: f32,
+    logprobs: Option<usize>,
+    tx: mpsc::Sender<Ev>,
+    /// the client went away: end it
+    cancel: Arc<AtomicBool>,
+}
+
+/// What the engine tells a request's thread
+enum Ev {
+    /// its prompt is read: tokens reused, from where, seconds reading, checkpoints saved
+    Read { from: usize, source: &'static str, seconds: f64, saved: usize },
+    /// a token, and its logprob entry when asked for
+    Tok(u32, Option<Value>),
+    /// the end: why, and the drafts accepted / proposed
+    End { finish: &'static str, accepted: u64, drafted: u64 },
+    Fail(String),
+}
+
+/// A session of the engine's, and the tokens it holds
+struct Slot {
+    sess: Session,
     live: Vec<u32>,
-    cache: PromptCache,
-    rng: Rng,
+}
+
+/// A request decoding: its session, the state between steps, what it has made
+struct Active {
+    job: Job,
+    slot: usize,
+    /// decoding alone (with the draft block), or between batch steps: the logits to sample from, or the token
+    /// committed and not fed yet
+    dec: Option<Decoder>,
+    logits: Option<Vec<f32>>,
+    pending: Option<u32>,
+    n: usize,
+    committed: Vec<u32>,
+    accepted: u64,
+    drafted: u64,
+    finish: Option<&'static str>,
 }
 
 /// Prefixes shorter than this are read again rather than cached
@@ -176,13 +228,13 @@ fn text_of(v: &Value) -> String {
 impl Server {
     #[allow(clippy::too_many_arguments)]
     pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, max_ctx: usize, default_effort: Effort, cache_bytes: usize,
-               cors: Vec<String>, keep: usize) -> Result<Server, String> {
-        let work = glm.session(max_ctx).map_err(|e| e.0)?;
+               cors: Vec<String>, keep: usize, parallel: usize) -> Result<Server, String> {
         let tele = Telemetry::start(&glm.gpu_info().iter().map(|g| g.pci.clone()).collect::<Vec<_>>());
-        Ok(Server { glm, tok, name, max_ctx, default_effort,
-                    state: Mutex::new(Conv { work, live: Vec::new(), cache: PromptCache::new(cache_bytes), rng: Rng(0x5DEECE66D) }),
-                    busy: AtomicBool::new(false), started: Instant::now(), current: Mutex::new(None), done: Mutex::new(VecDeque::new()),
-                    next_id: AtomicU64::new(1), keep, tele, cors })
+        let parallel = parallel.max(1);
+        Ok(Server { glm, tok, name, max_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
+                    inflight: AtomicU64::new(0), parallel, cache: Mutex::new(PromptCache::new(cache_bytes)),
+                    live_lens: Mutex::new(vec![0; parallel]), started: Instant::now(), running: Mutex::new(Default::default()),
+                    done: Mutex::new(VecDeque::new()), next_id: AtomicU64::new(1), keep, tele, cors })
     }
 
     /// The checkpoint positions of a prompt: the end of its first turn and the start of its last user turn (each
@@ -226,11 +278,12 @@ impl Server {
             }
             None => None,
         };
-        eprintln!("[serving {} on http://{addr}{}]", self.name, socket.as_ref().map_or(String::new(), |p| format!(" and {}", p.display())));
+        let me = self.clone();
+        std::thread::spawn(move || me.engine());
+        eprintln!("[serving {} on http://{addr}{}, {} request(s) at once]", self.name, socket.as_ref().map_or(String::new(), |p| format!(" and {}", p.display())),
+                  self.parallel);
         loop {
-            if STOP.load(Ordering::SeqCst) {
-                // finish what runs (the request's thread holds the conversation's lock)
-                let _wait = self.state.lock().unwrap();
+            if STOP.load(Ordering::SeqCst) && self.inflight.load(Ordering::SeqCst) == 0 {
                 eprintln!("[stopping: no request running]");
                 if let Some(p) = &socket {
                     let _ = std::fs::remove_file(p);
@@ -262,8 +315,8 @@ impl Server {
         }
     }
 
-    /// The model, its GPUs, the request running, the cache (the cache's figures only when no request holds the
-    /// conversation: a status call never waits).
+    /// The model, its GPUs, the requests running, the cache (the cache's figures only when the engine is not reading
+    /// a prompt with it: a status call never waits).
     fn status_json(&self) -> Value {
         let rd = self.tele.readings();
         let gpus: Vec<Value> = self.glm.gpu_info().iter().enumerate().map(|(i, g)| {
@@ -271,11 +324,14 @@ impl Server {
             json!({"index": g.index, "name": g.name, "pci": g.pci, "total": g.total, "free": g.free, "layers": [g.layers.0, g.layers.1],
                    "expert_slots": g.expert_slots, "host_slots": g.host_slots, "watts": r.watts, "temp_c": r.temp_c, "vram_temp_c": r.vram_c})
         }).collect();
-        let cache = self.state.try_lock().ok().map(|st| json!({"entries": st.cache.len(), "bytes": st.cache.bytes(), "budget": st.cache.budget(),
-                                                              "evictions": st.cache.evictions, "live_tokens": st.live.len()}));
+        let lives = self.live_lens.lock().unwrap().clone();
+        let cache = self.cache.try_lock().ok().map(|c| json!({"entries": c.len(), "bytes": c.bytes(), "budget": c.budget(),
+                                                             "evictions": c.evictions, "live_tokens": lives.iter().sum::<usize>(), "sessions": lives}));
+        let running: Vec<Value> = self.running.lock().unwrap().values().cloned().collect();
         json!({"model": self.name, "version": crate::VERSION, "uptime_seconds": self.started.elapsed().as_secs_f64(),
-               "context": self.max_ctx, "mtp": self.glm.mtp.is_some(), "gpus": gpus, "busy": self.busy.load(Ordering::Relaxed),
-               "running": self.current.lock().unwrap().clone(), "served": self.next_id.load(Ordering::Relaxed) - 1,
+               "context": self.max_ctx, "mtp": self.glm.mtp.is_some(), "parallel": self.parallel, "gpus": gpus,
+               "busy": !running.is_empty(), "running": running.first().cloned(), "active": running,
+               "waiting": self.queue.lock().unwrap().len(), "served": self.next_id.load(Ordering::Relaxed) - 1,
                "prompt_cache": cache, "stopping": STOP.load(Ordering::SeqCst)})
     }
 
@@ -304,11 +360,12 @@ impl Server {
             ("GET", "/server/status") => respond(&mut s, 200, &self.status_json()),
             ("GET", "/server/requests") => {
                 let done: Vec<Value> = self.done.lock().unwrap().iter().rev().cloned().collect();
-                respond(&mut s, 200, &json!({"running": self.current.lock().unwrap().clone(), "done": done, "keep": self.keep}))
+                let running: Vec<Value> = self.running.lock().unwrap().values().cloned().collect();
+                respond(&mut s, 200, &json!({"running": running.first().cloned(), "active": running, "done": done, "keep": self.keep}))
             }
             ("GET", p) if p.starts_with("/server/requests/") => {
                 let id: Option<u64> = p["/server/requests/".len()..].trim_start_matches('#').parse().ok();
-                let running = self.current.lock().unwrap().clone().filter(|r| r["id"].as_u64() == id);
+                let running = id.and_then(|i| self.running.lock().unwrap().get(&i).cloned());
                 let found = running.or_else(|| self.done.lock().unwrap().iter().find(|r| r["id"].as_u64() == id).cloned());
                 match found {
                     Some(r) => respond(&mut s, 200, &r),
@@ -316,23 +373,23 @@ impl Server {
                                                                                     &p["/server/requests/".len()..], self.keep)}})),
                 }
             }
-            ("GET", "/server/cache") => match self.state.try_lock() {
-                Ok(st) => {
-                    let list: Vec<Value> = st.cache.list().iter().map(|(t, b, _)| json!({"tokens": t, "bytes": b})).collect();
-                    respond(&mut s, 200, &json!({"entries": list, "bytes": st.cache.bytes(), "budget": st.cache.budget(), "evictions": st.cache.evictions}))
+            ("GET", "/server/cache") => match self.cache.try_lock() {
+                Ok(c) => {
+                    let list: Vec<Value> = c.list().iter().map(|(t, b, _)| json!({"tokens": t, "bytes": b})).collect();
+                    respond(&mut s, 200, &json!({"entries": list, "bytes": c.bytes(), "budget": c.budget(), "evictions": c.evictions}))
                 }
-                Err(_) => respond(&mut s, 409, &json!({"error": {"message": "a request is running; ask again when it is done"}})),
+                Err(_) => respond(&mut s, 409, &json!({"error": {"message": "a prompt is being read; ask again when it is done"}})),
             },
-            ("POST", "/server/cache/clear") => match self.state.try_lock() {
-                Ok(mut st) => {
-                    let n = st.cache.clear();
+            ("POST", "/server/cache/clear") => match self.cache.try_lock() {
+                Ok(mut c) => {
+                    let n = c.clear();
                     respond(&mut s, 200, &json!({"dropped": n}))
                 }
-                Err(_) => respond(&mut s, 409, &json!({"error": {"message": "a request is running; ask again when it is done"}})),
+                Err(_) => respond(&mut s, 409, &json!({"error": {"message": "a prompt is being read; ask again when it is done"}})),
             },
             ("POST", "/server/shutdown") => {
                 STOP.store(true, Ordering::SeqCst);
-                respond(&mut s, 200, &json!({"stopping": true, "running": self.busy.load(Ordering::Relaxed)}))
+                respond(&mut s, 200, &json!({"stopping": true, "running": self.inflight.load(Ordering::SeqCst) > 0}))
             }
             ("GET", "/v1/models") | ("GET", "/models") => http::respond_with(&mut s, 200, &json!({"object": "list", "data": [
                 {"id": self.name, "object": "model", "owned_by": "nextsycl", "created": now(), "status": {"value": "loaded"},
@@ -345,9 +402,10 @@ impl Server {
                     Err(e) => return http::respond_with(&mut s, 400, &json!({"error": {"message": e}}), &cors),
                 };
                 let via = if api == Api::Lines { "web" } else { s.kind() };
-                let r = self.chat(&mut s, &ask, api, &cors, via);
+                let mut rid = 0;
+                let r = self.chat(&mut s, &ask, api, &cors, via, &mut rid);
                 // a request that ended on an error is still recorded
-                if let Some(mut row) = self.current.lock().unwrap().take() {
+                if let Some(mut row) = self.running.lock().unwrap().remove(&rid) {
                     row["state"] = json!("failed");
                     row["error"] = json!(r.as_ref().err());
                     self.remember(row);
@@ -368,9 +426,9 @@ impl Server {
         }
     }
 
-    /// Updates the running request's row.
-    fn live(&self, f: impl FnOnce(&mut Value)) {
-        if let Some(row) = self.current.lock().unwrap().as_mut() {
+    /// Updates a running request's row.
+    fn live(&self, rid: u64, f: impl FnOnce(&mut Value)) {
+        if let Some(row) = self.running.lock().unwrap().get_mut(&rid) {
             f(row);
         }
     }
@@ -401,7 +459,228 @@ impl Server {
                  } })
     }
 
-    fn chat(&self, s: &mut Conn, ask: &Ask, api: Api, cors: &str, via: &str) -> Result<(), String> {
+    // ------------------------------------------------------------------ the engine thread
+
+    /// Owns the sessions and the prompt cache: takes waiting requests into free sessions (reading their prompts),
+    /// and steps the active ones - alone with the draft block, or together in one batch pass.
+    fn engine(&self) {
+        let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
+        let mut slots: Vec<Slot> = match (0..self.parallel).map(|_| self.glm.session(self.max_ctx).map(|sess| Slot { sess, live: Vec::new() }))
+            .collect::<ns_core::Result<Vec<_>>>() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[the engine cannot make its sessions: {}]", e.0);
+                return;
+            }
+        };
+        let mut rng = Rng(0x5DEECE66D);
+        let mut active: Vec<Active> = Vec::new();
+        loop {
+            // take waiting requests while sessions are free
+            while active.len() < self.parallel {
+                let Some(job) = self.queue.lock().unwrap().pop_front() else { break };
+                let used: Vec<usize> = active.iter().map(|a| a.slot).collect();
+                // the free session holding the longest prefix of this prompt
+                let slot = (0..slots.len()).filter(|i| !used.contains(i))
+                    .max_by_key(|&i| { let l = &slots[i].live; if l.len() < job.ids.len() && job.ids.starts_with(l) { l.len() + 1 } else { 0 } })
+                    .unwrap_or(0);
+                match self.read_prompt(&mut slots[slot], &job.ids, &mut none) {
+                    Ok((logits, from, source, seconds, saved)) => {
+                        let _ = job.tx.send(Ev::Read { from, source, seconds, saved });
+                        active.push(Active { job, slot, dec: None, logits: Some(logits), pending: None, n: 0, committed: Vec::new(), accepted: 0,
+                                             drafted: 0, finish: None });
+                    }
+                    Err(e) => {
+                        let _ = job.tx.send(Ev::Fail(e));
+                        self.inflight.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                self.lives(&slots);
+            }
+            if active.is_empty() {
+                let q = self.queue.lock().unwrap();
+                if q.is_empty() {
+                    let _ = self.wake.wait_timeout(q, std::time::Duration::from_millis(200));
+                }
+                continue;
+            }
+            active.sort_by_key(|a| a.slot);
+            for a in active.iter_mut() {
+                if a.job.cancel.load(Ordering::Relaxed) {
+                    a.finish = Some("client gone");
+                }
+            }
+            let r = if active.iter().filter(|a| a.finish.is_none()).count() == 1 {
+                self.step_alone(&mut slots, &mut active, &mut rng, &mut none)
+            } else {
+                self.step_together(&mut slots, &mut active, &mut rng, &mut none)
+            };
+            if let Err(e) = r {
+                for a in active.drain(..) {
+                    let _ = a.job.tx.send(Ev::Fail(e.clone()));
+                    self.inflight.fetch_sub(1, Ordering::SeqCst);
+                }
+                self.lives(&slots);
+                continue;
+            }
+            // the ended ones: what their sessions hold now, their end
+            let mut i = 0;
+            while i < active.len() {
+                if let Some(finish) = active[i].finish {
+                    let mut a = active.remove(i);
+                    if let Some(d) = a.dec.take() {
+                        a.accepted += d.accepted;
+                        a.drafted += d.drafted;
+                    }
+                    let sl = &mut slots[a.slot];
+                    let fed = sl.sess.pos.saturating_sub(a.job.ids.len()).min(a.committed.len());
+                    sl.live = a.job.ids.clone();
+                    sl.live.extend_from_slice(&a.committed[..fed]);
+                    let _ = a.job.tx.send(Ev::End { finish, accepted: a.accepted, drafted: a.drafted });
+                    self.inflight.fetch_sub(1, Ordering::SeqCst);
+                } else {
+                    i += 1;
+                }
+            }
+            self.lives(&slots);
+        }
+    }
+
+    fn lives(&self, slots: &[Slot]) {
+        *self.live_lens.lock().unwrap() = slots.iter().map(|s| s.live.len()).collect();
+    }
+
+    /// A prompt into a session: from the live state when it holds a prefix, a cached checkpoint when that is longer,
+    /// else from the start; checkpoints saved at the prompt's stops. (logits, tokens reused, from where, seconds,
+    /// checkpoints saved)
+    fn read_prompt(&self, sl: &mut Slot, ids: &[u32], none: ns_engine::Tap) -> Result<(Vec<f32>, usize, &'static str, f64, usize), String> {
+        let t0 = Instant::now();
+        let mut cache = self.cache.lock().unwrap();
+        let live_len = if sl.live.len() < ids.len() && ids.starts_with(&sl.live) { sl.live.len() } else { 0 };
+        let cached = if cache.enabled() { cache.best(ids) } else { None };
+        let (from, source) = match cached {
+            Some((i, len)) if len > live_len => {
+                let ck = cache.get(i);
+                self.glm.restore(&mut sl.sess, ck).map_err(|e| e.0)?;
+                (len, "cache")
+            }
+            _ if live_len > 0 => (live_len, "live"),
+            _ => {
+                self.glm.reset_session(&mut sl.sess).map_err(|e| e.0)?;
+                (0, "none")
+            }
+        };
+        sl.live.clear(); // until this prompt is read, the session is in between
+        let mut logits = Vec::new();
+        let mut at = from;
+        let mut saved = 0;
+        for stop in self.stops(ids).into_iter().filter(|p| *p > from) {
+            logits = self.glm.feed(&mut sl.sess, &ids[at..stop], &mut *none).map_err(|e| e.0)?;
+            at = stop;
+            if cache.enabled() && !cache.touch(&ids[..stop]) {
+                let ck = self.glm.save(&sl.sess).map_err(|e| e.0)?;
+                if cache.put(ids[..stop].to_vec(), ck) {
+                    saved += 1;
+                }
+            }
+        }
+        if at < ids.len() {
+            logits = self.glm.feed(&mut sl.sess, &ids[at..], &mut *none).map_err(|e| e.0)?;
+        }
+        sl.live = ids.to_vec();
+        Ok((logits, from, source, t0.elapsed().as_secs_f64(), saved))
+    }
+
+    /// A committed token of `a`'s: to its request (or the end, at a stop token or its limit)
+    fn commit(&self, a: &mut Active, y: u32, lp: Option<Value>) {
+        a.committed.push(y);
+        if a.finish.is_some() {
+            return;
+        }
+        if self.tok.stop.contains(&y) {
+            a.finish = Some("stop");
+            return;
+        }
+        a.n += 1;
+        if a.job.tx.send(Ev::Tok(y, lp)).is_err() {
+            a.finish = Some("client gone");
+        } else if a.n >= a.job.max {
+            a.finish = Some("length");
+        }
+    }
+
+    /// One request active: a step of its own, with the draft block (one token, or two with a draft accepted)
+    fn step_alone(&self, slots: &mut [Slot], active: &mut [Active], rng: &mut Rng, none: ns_engine::Tap) -> Result<(), String> {
+        let Some(a) = active.iter_mut().find(|a| a.finish.is_none()) else { return Ok(()) };
+        if a.dec.is_none() {
+            a.dec = Some(match (a.logits.take(), a.pending.take()) {
+                (Some(l), _) => self.glm.decoder(l, true),
+                (None, Some(y)) => self.glm.decoder_after(y, true),
+                (None, None) => return Err("a request without logits or a token to feed".into()),
+            });
+        }
+        let (temp, top_p, k) = (a.job.temp, a.job.top_p, a.job.logprobs);
+        let mut lps: VecDeque<Value> = VecDeque::new();
+        let tok = &self.tok;
+        let mut draw = |l: &[f32]| {
+            let y = sample(l, temp, top_p, rng);
+            if let Some(k) = k {
+                lps.push_back(logprob_entry(tok, l, y, k));
+            }
+            y
+        };
+        let toks = self.glm.step(&mut slots[a.slot].sess, a.dec.as_mut().unwrap(), &mut draw, &mut *none).map_err(|e| e.0)?;
+        for y in toks {
+            let lp = lps.pop_front();
+            self.commit(a, y, lp);
+        }
+        Ok(())
+    }
+
+    /// Several active: a token each, one batch pass for all of them
+    fn step_together(&self, slots: &mut [Slot], active: &mut [Active], rng: &mut Rng, none: ns_engine::Tap) -> Result<(), String> {
+        // each one's next token: drawn from its logits, or the one its own steps committed and did not feed
+        let mut feed: Vec<(usize, u32)> = Vec::new(); // (index in active, token)
+        for (i, a) in active.iter_mut().enumerate() {
+            if a.finish.is_some() {
+                continue;
+            }
+            if let Some(mut d) = a.dec.take() {
+                a.accepted += d.accepted;
+                a.drafted += d.drafted;
+                a.pending = d.pending();
+            }
+            let y = match (a.logits.take(), a.pending.take()) {
+                (Some(l), _) => {
+                    let y = sample(&l, a.job.temp, a.job.top_p, rng);
+                    let lp = a.job.logprobs.map(|k| logprob_entry(&self.tok, &l, y, k));
+                    self.commit(a, y, lp);
+                    y
+                }
+                (None, Some(y)) => y,
+                (None, None) => return Err("a request without logits or a token to feed".into()),
+            };
+            if a.finish.is_none() {
+                feed.push((i, y));
+            }
+        }
+        if feed.is_empty() {
+            return Ok(());
+        }
+        // the sessions of `feed`, in its order (active is sorted by slot, and slots differ)
+        let want: Vec<usize> = feed.iter().map(|(i, _)| active[*i].slot).collect();
+        let mut sess: Vec<&mut Session> = slots.iter_mut().enumerate().filter(|(si, _)| want.contains(si)).map(|(_, s)| &mut s.sess).collect();
+        let toks: Vec<u32> = feed.iter().map(|(_, y)| *y).collect();
+        let logits = self.glm.forward_batch(&mut sess, &toks, &mut *none).map_err(|e| e.0)?;
+        for ((i, _), l) in feed.iter().zip(logits) {
+            active[*i].logits = Some(l);
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ a request's thread
+
+    fn chat(&self, s: &mut Conn, ask: &Ask, api: Api, cors: &str, via: &str, rid_out: &mut u64) -> Result<(), String> {
         let messages: Vec<Message> = ask.messages.iter().map(|(r, c, rc)| Message { role: r, content: c, reasoning: rc.as_deref() }).collect();
         let ids = self.tok.encode(&ns_tok::glm_chat(&messages, ask.effort));
         if ids.len() + 16 > self.max_ctx {
@@ -410,17 +689,15 @@ impl Server {
         let max = ask.max.unwrap_or(4096).min(self.max_ctx - ids.len() - 1);
         let (temp, top_p, stream) = (ask.temp, ask.top_p, ask.stream);
         let id = format!("chatcmpl-{}", now());
-
-        let mut st = self.state.lock().unwrap();
-        self.busy.store(true, Ordering::Relaxed);
         let rid = self.next_id.fetch_add(1, Ordering::Relaxed);
+        *rid_out = rid;
         let effort = match ask.effort {
             Effort::Low => "low",
             Effort::High => "high",
             Effort::Max => "max",
         };
         let last_user = ask.messages.iter().rev().find(|m| m.0 == "user").map_or("", |m| m.1.as_str());
-        *self.current.lock().unwrap() = Some(json!({"id": rid, "via": via, "state": "reading", "started": now(), "prompt_tokens": ids.len(),
+        self.running.lock().unwrap().insert(rid, json!({"id": rid, "via": via, "state": "waiting", "started": now(), "prompt_tokens": ids.len(),
                                                     "max_tokens": max, "generated": 0, "model": self.name,
                                                     "api": if api == Api::Lines { "/api/chat" } else { "/v1/chat/completions" },
                                                     "settings": {"effort": effort, "temperature": round4(temp), "top_p": round4(top_p), "stream": stream,
@@ -428,50 +705,22 @@ impl Server {
                                                     "messages": ask.messages.len(),
                                                     "prompt_chars": ask.messages.iter().map(|m| m.1.len()).sum::<usize>(),
                                                     "last_user": preview(last_user)}));
-        let _idle = Guard(&self.busy);
-        let st = &mut *st;
-        // the cards' energy counters at the start: the request's energy is their rise
+        // the cards' energy counters at the start: the request's energy is their rise (other requests running at the
+        // same time draw on the same counters)
         let j0 = self.tele.joules();
         let energy = || -> Option<f64> { Some(self.tele.joules()? - j0?) };
-        let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
-        let t0 = Instant::now();
-        // where to start: the live session when it holds a prefix of this prompt, a cached checkpoint when that is
-        // longer, else the beginning
-        let live_len = if st.live.len() < ids.len() && ids.starts_with(&st.live) { st.live.len() } else { 0 };
-        let cached = if st.cache.enabled() { st.cache.best(&ids) } else { None };
-        let (from, source) = match cached {
-            Some((i, len)) if len > live_len => {
-                let ck = st.cache.get(i);
-                self.glm.restore(&mut st.work, ck).map_err(|e| e.0)?;
-                (len, "cache")
-            }
-            _ if live_len > 0 => (live_len, "live"),
-            _ => {
-                self.glm.reset_session(&mut st.work).map_err(|e| e.0)?;
-                (0, "none")
-            }
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+        self.queue.lock().unwrap().push_back(Job { id: rid, ids: ids.clone(), max, temp, top_p, logprobs: ask.logprobs, tx, cancel: cancel.clone() });
+        self.wake.notify_one();
+        // its prompt read
+        let (from, source, prefill, saved) = match rx.recv() {
+            Ok(Ev::Read { from, source, seconds, saved }) => (from, source, seconds, saved),
+            Ok(Ev::Fail(e)) => return Err(e),
+            _ => return Err("the engine ended the request".into()),
         };
-        st.live.clear(); // until this prompt is read, the session is in between
-        // read the rest, stopping at the checkpoint positions past `from` to save the state there
-        let mut logits = Vec::new();
-        let mut at = from;
-        let mut saved = 0;
-        for stop in self.stops(&ids).into_iter().filter(|p| *p > from) {
-            logits = self.glm.feed(&mut st.work, &ids[at..stop], &mut none).map_err(|e| e.0)?;
-            at = stop;
-            if st.cache.enabled() && !st.cache.touch(&ids[..stop]) {
-                let ck = self.glm.save(&st.work).map_err(|e| e.0)?;
-                if st.cache.put(ids[..stop].to_vec(), ck) {
-                    saved += 1;
-                }
-            }
-        }
-        if at < ids.len() {
-            logits = self.glm.feed(&mut st.work, &ids[at..], &mut none).map_err(|e| e.0)?;
-        }
-        st.live = ids.clone();
-        let prefill = t0.elapsed().as_secs_f64();
-        self.live(|r| {
+        self.live(rid, |r| {
             r["state"] = json!("generating");
             r["reused"] = json!(from);
             r["source"] = json!(source);
@@ -487,7 +736,6 @@ impl Server {
                                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
             write!(s, "data: {chunk}\n\n").and_then(|_| s.flush()).is_ok()
         };
-        // one piece of the answer as it comes: the thinking or the answer's text
         // one piece of the answer as it comes, with the logprobs of the answer tokens it completes (when asked)
         let lp_on = ask.logprobs.is_some();
         let emit = |s: &mut Conn, thinking: bool, text: String, lps: Vec<Value>| -> bool {
@@ -517,36 +765,19 @@ impl Server {
         let mut thinking = true; // the prompt ends in <think>
         let mut pending: Vec<u8> = Vec::new();
         let mut n = 0;
-        let mut finish = "length";
         let t1 = Instant::now();
-        let mut dec = self.glm.decoder(logits, true);
-        let mut out: std::collections::VecDeque<u32> = Default::default();
-        let mut committed: Vec<u32> = Vec::new();
-        // logprobs: each sampled token's entry in order (a step's samples are its tokens, in order), the answer's
-        // ones kept (all, and those not sent yet)
-        let mut lps: VecDeque<Value> = VecDeque::new();
         let (mut lp_all, mut lp_pending): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
-        while n < max {
-            if out.is_empty() {
-                let rng = &mut st.rng;
-                let tok = &self.tok;
-                let lpq = &mut lps;
-                let mut draw = |l: &[f32]| {
-                    let y = sample(l, temp, top_p, rng);
-                    if let Some(k) = ask.logprobs {
-                        lpq.push_back(logprob_entry(tok, l, y, k));
-                    }
-                    y
-                };
-                let toks = self.glm.step(&mut st.work, &mut dec, &mut draw, &mut none).map_err(|e| e.0)?;
-                committed.extend(&toks);
-                out.extend(toks);
-            }
-            let next = out.pop_front().unwrap_or_default();
-            let lp = lps.pop_front();
-            if self.tok.stop.contains(&next) {
-                finish = "stop";
-                break;
+        let mut gone = false;
+        let (finish, accepted, drafted) = loop {
+            let (next, lp) = match rx.recv() {
+                Ok(Ev::Tok(y, lp)) => (y, lp),
+                Ok(Ev::End { finish, accepted, drafted }) => break (finish, accepted, drafted),
+                Ok(Ev::Fail(e)) => return Err(e),
+                Ok(Ev::Read { .. }) => continue,
+                Err(_) => return Err("the engine ended the request".into()),
+            };
+            if gone {
+                continue; // drain until the engine ends it
             }
             // the thinking's tokens carry none (as OpenAI's reasoning models)
             if let Some(e) = lp.filter(|_| !thinking) {
@@ -555,7 +786,7 @@ impl Server {
             }
             n += 1;
             let el = t1.elapsed().as_secs_f64();
-            self.live(|r| {
+            self.live(rid, |r| {
                 r["generated"] = json!(n);
                 r["tok_s"] = json!(n as f64 / el.max(1e-9));
                 r["energy_j"] = json!(energy());
@@ -591,32 +822,26 @@ impl Server {
                 for (is_r, p) in parts {
                     let l = if is_r { Vec::new() } else { std::mem::take(&mut lp_pending) };
                     if !p.is_empty() && !emit(s, is_r, p, l) {
-                        finish = "client gone";
+                        gone = true;
+                        cancel.store(true, Ordering::Relaxed);
                     }
                 }
-                if finish == "client gone" {
-                    break;
-                }
             }
-        }
+        };
         let dt = t1.elapsed().as_secs_f64();
-        // what the session holds now: the prompt and the committed tokens it has fed (the last ones may be pending)
-        let fed = st.work.pos.saturating_sub(ids.len()).min(committed.len());
-        st.live.extend_from_slice(&committed[..fed]);
-        eprintln!("[request: {} prompt tokens ({} reused from {source}, {} fed in {prefill:.1} s, {saved} checkpoint(s) saved; cache {} entries, {:.2} GiB), {n} generated in {dt:.1} s ({:.2} tok/s), drafts {}/{} accepted, {finish}]",
-                  ids.len(), from, ids.len() - from, st.cache.len(), st.cache.bytes() as f64 / (1u64 << 30) as f64, n as f64 / dt.max(1e-9),
-                  dec.accepted, dec.drafted);
+        eprintln!("[request #{rid}: {} prompt tokens ({} reused from {source}, {} fed in {prefill:.1} s, {saved} checkpoint(s) saved), {n} generated in {dt:.1} s ({:.2} tok/s), drafts {}/{} accepted, {finish}]",
+                  ids.len(), from, ids.len() - from, n as f64 / dt.max(1e-9), accepted, drafted);
         // the energy both cards drew while it ran (idle power included): joules, and watt-hours in the answer
         let e = energy();
         let wh = e.map(|j| (j / 3600.0 * 1e4).round() / 1e4);
         let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": n, "total_tokens": ids.len() + n, "energy_wh": wh});
-        if let Some(mut row) = self.current.lock().unwrap().take() {
+        if let Some(mut row) = self.running.lock().unwrap().remove(&rid) {
             row["state"] = json!("done");
             row["finish"] = json!(finish);
             row["generated"] = json!(n);
             row["tok_s"] = json!(n as f64 / dt.max(1e-9));
             row["generate_seconds"] = json!(dt);
-            row["drafts"] = json!([dec.accepted, dec.drafted]);
+            row["drafts"] = json!([accepted, drafted]);
             row["checkpoints_saved"] = json!(saved);
             row["ended"] = json!(now());
             let r1 = |x: f64| (x * 10.0).round() / 10.0;
@@ -661,14 +886,6 @@ impl Server {
                                                 "predicted_per_second": n as f64 / dt.max(1e-9), "energy_wh": wh}}), cors);
         }
         Ok(())
-    }
-}
-
-/// Clears the busy flag when a request ends (also on an error).
-struct Guard<'a>(&'a AtomicBool);
-impl Drop for Guard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Relaxed);
     }
 }
 

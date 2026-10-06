@@ -69,8 +69,11 @@ by default (`--no-mtp` turns it off).
       all resident, no swaps over its slow link; the B70's swaps on x16). Simulated (reference/expert-cache/splits.py)
       copy time a pass 5.9 ms vs 8.8 at today's best; with today's even split it would be 18.6 (worse). Measure with
       `nextsycl bench` after.
-- [ ] Several requests at once (benchy: 1, 2, 4 clients all ~17 tok/s together - one request at a time today):
-      batch decode passes across sessions.
+- [x] Several requests at once (branch `batching`): forward_batch + an engine thread with NS_PARALLEL sessions -
+      bit-exact; 2 clients 18.1 -> 20.3 tok/s in all, the second's first token 10.4 -> 2.0 s
+- [ ] Batch: MLA's projections once for all rows (only its cache, indexer and attention per session); a prompt read
+      in chunks between decode steps (a long prompt now stalls the others' decode); the draft block in batches;
+      per-request energy (concurrent requests share the counters - each counts both)
 
 ## LogProbChain (an API option)
 
