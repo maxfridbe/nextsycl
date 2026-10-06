@@ -57,7 +57,10 @@ by default (`--no-mtp` turns it off).
 - [x] Expert cache policy studied offline (reference/expert-cache): LRU is the best simple policy; the rest of the
       gap to Belady needs better prediction
 - [ ] Swaps are still ~1/3 of decode time (both cards on Gen5 x8)
-- [ ] Better expert prediction (now ~54% of guesses used): the router of l+1 on a later state, or two layers ahead
+- [x] Better expert prediction: guesses by chance of use (rank hit rates; reference/expert-cache) - p >= 0.6,
+      read at the router's wait: decode 18.4 -> 19.4 tok/s. Two layers ahead predicts worse (93% at rank 1 vs 96%)
+- [ ] The rest of the gap to Belady: a guess from a later state (needs the hidden state before the layer's attention
+      on the host - another wait), or the copies of a wrong guess cancelled
 - [ ] Two requests at once would use both cards at the same time (each is ~55% busy at decode today)
 
 ## To try

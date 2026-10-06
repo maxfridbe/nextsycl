@@ -38,12 +38,28 @@ fn f16_min() -> usize {
 /// The widest dense matrix input the fp16 path takes (MLA's output projection: 64 heads of 256)
 const X16_COLS: usize = 16384;
 
-/// Experts swapped in ahead of their layer, at most, a layer (NS_PREFETCH, default 2: about half the guesses are
-/// right - decode +2%; more guesses cost more PCIe than they save; 0 = none)
+/// Experts swapped in ahead of their layer, at most, a layer (NS_PREFETCH, default 8; 0 = none)
 fn prefetch_limit() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("NS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
+    *V.get_or_init(|| std::env::var("NS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(8))
 }
+
+/// Whether decode's swaps wait for the GPU's queued work first (NS_SWAP_WAIT=1; not needed - see `ensure`)
+fn swap_wait() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_SWAP_WAIT").is_ok_and(|v| v == "1"))
+}
+
+/// The chance of use from which a guessed expert is fetched ahead (NS_PREFETCH_P, default 0.6: measured best of
+/// 0.4-0.8 - lower wastes copies, higher leaves misses)
+fn prefetch_p() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_PREFETCH_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.6))
+}
+
+/// How often the next layer's router, run on this layer's input, has its k-th best expert among the ones the next
+/// layer asks for (measured over 300 decode tokens of GLM-5.3: reference/expert-cache)
+const GUESS_HIT: [f32; 16] = [0.96, 0.92, 0.86, 0.77, 0.66, 0.56, 0.45, 0.36, 0.29, 0.22, 0.18, 0.15, 0.12, 0.11, 0.09, 0.08];
 
 /// The arena of decode and short prompt chunks; past it, a pass takes the big one back from the expert store
 const SMALL_ARENA: usize = 384 << 20;
@@ -197,6 +213,8 @@ pub struct Part {
     pub arena: Arena,
     big: DevBuf,
     small: DevBuf,
+    /// the routers' biases, kept on the host once read
+    biases: Mutex<HashMap<u64, Arc<Vec<f32>>>>,
     pub layers: Range<u64>,
     mats: BTreeMap<(u64, Role), Mat>,
     vecs: BTreeMap<(u64, Role), DevBuf>,
@@ -541,7 +559,7 @@ impl Part {
         store.lend = lend;
         store.lent = lend > 0;
         let arena = Arena::on(if lend > 0 { small.view(0, small.len)? } else { big.view(0, big.len)? });
-        Ok(Part { ops, arena, big, small, layers, mats, vecs, scratch, x16, q8, experts: Mutex::new(store), eh, expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes })
+        Ok(Part { ops, arena, big, small, biases: Mutex::new(HashMap::new()), layers, mats, vecs, scratch, x16, q8, experts: Mutex::new(store), eh, expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes })
     }
 
     /// The arena a pass of `t` tokens needs: the small one, or the big one - its memory then out of the expert store
@@ -584,6 +602,16 @@ impl Part {
             self.arena.set(self.small.view(0, self.small.len)?);
         }
         Ok(())
+    }
+
+    /// Layer `l`'s router bias in host memory (read from the GPU once: a read waits for the GPU's queue)
+    fn router_bias(&self, l: u64) -> Result<Arc<Vec<f32>>> {
+        if let Some(b) = self.biases.lock().unwrap().get(&l) {
+            return Ok(b.clone());
+        }
+        let b = Arc::new(self.vec(l, Role::RouterBias)?.to_f32()?);
+        self.biases.lock().unwrap().insert(l, b.clone());
+        Ok(b)
     }
 
     fn mat(&self, l: u64, r: Role) -> Result<&Mat> {
@@ -701,8 +729,10 @@ impl Part {
             let mut order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick && c.usable(i)).collect();
             order.sort_by_key(|&i| if c.vowner[i].is_none() { 0 } else { c.vused[i] + 1 });
             let mut buf: Option<Vec<u8>> = None;
-            // the copies wait for what the GPU's queue holds so far (a kernel may still read a victim's slot)
-            let after = Some(self.ops.mark()?);
+            // a copy waits for what the GPU's queue holds (a kernel may still read a victim's slot) - except at decode
+            // (NS_SWAP_WAIT=1 keeps it): the host has just read this layer's router, so what is queued is this
+            // layer's own work, and a victim is never one of this layer's experts
+            let after = if promote && !swap_wait() { None } else { Some(self.ops.mark()?) };
             for (ex, &s) in missing.iter().zip(&order) {
                 c.misses += 1;
                 if let Some(up) = self.swap_in(m, c, l, *ex, s, after, &mut reading, &mut buf)? {
@@ -806,7 +836,8 @@ impl Part {
         }
         let mut order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick && c.usable(i)).collect();
         order.sort_by_key(|&i| if c.vowner[i].is_none() { 0 } else { c.vused[i] + 1 });
-        let after = Some(self.ops.mark()?);
+        // queued now: this layer's expert work (none of its experts is a victim) - the copies need not wait for it
+        let after = if swap_wait() { Some(self.ops.mark()?) } else { None };
         let mut reading: HashMap<usize, i64> = HashMap::new();
         let mut buf = None;
         for (ex, &s) in cand.iter().zip(&order) {
@@ -1716,7 +1747,13 @@ impl<'g> Glm<'g> {
         let tw = Instant::now();
         let lv = logits.to_f32()?;
         ROUTER_WAIT_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        let bias = p.vec(l, Role::RouterBias)?.to_f32()?;
+        // the guess's logits now, at the same wait (read after this layer's expert work was queued, the read would
+        // wait for that work, and the GPU would idle until the host queued the next layer)
+        let guess = match guess {
+            Some(gl) => Some(gl.to_f32()?),
+            None => None,
+        };
+        let bias = p.router_bias(l)?;
         // expert -> (token, weight)
         let mut by: BTreeMap<usize, Vec<(i32, f32)>> = BTreeMap::new();
         for ti in 0..t {
@@ -1738,6 +1775,21 @@ impl<'g> Glm<'g> {
             p.mm(l, Role::ShDown, &sg, t)
         })?;
         let need: Vec<u64> = by.keys().map(|e| *e as u64).collect();
+        if t <= MMVQ_COLS {
+            if let Ok(fpath) = std::env::var("NS_TRACE_GUESS") {
+                use std::io::Write;
+                let mut rows: Vec<Vec<usize>> = vec![Vec::new(); t];
+                for (e, list) in &by {
+                    for (ti, _) in list {
+                        rows[*ti as usize].push(*e);
+                    }
+                }
+                let lines: String = rows.iter().enumerate().map(|(ti, r)| format!("A {l} {ti} {}\n", r.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(","))).collect();
+                if let Ok(mut w) = std::fs::OpenOptions::new().create(true).append(true).open(fpath) {
+                    let _ = w.write_all(lines.as_bytes());
+                }
+            }
+        }
         // prompt chunks read host-slot experts in place; decode makes them resident (NS_DECODE_DIRECT=1: in place too)
         let promote = t <= MMVQ_COLS && !std::env::var("NS_DECODE_DIRECT").is_ok_and(|v| v == "1");
         let (slots, arriving, copies) = self.timed(p, "expert misses (swaps / file)", || p.ensure(&self.m, l, &need, promote))?;
@@ -1964,19 +2016,45 @@ impl<'g> Glm<'g> {
             ints_view.copy_within(0, &ib, base * 4, (t + 1 + total) * 4)?;
             o.moe_combine(&y, &dn, &ints_view, &wb, t, total, d)
         })?;
-        if let Some(gl) = guess {
-            let (gv, gb) = (gl.to_f32()?, p.vec(l + 1, Role::RouterBias)?.to_f32()?);
-            // per row its top `used` by score (as the router picks), the rows' best first
-            let mut score: BTreeMap<usize, f32> = BTreeMap::new();
+        // NS_TRACE_GUESS=FILE: the routers of the next two layers on this layer's input, each row's 16 best in order
+        // ("G layer target row experts"), beside NS_TRACE_EXPERTS' actual requests - for offline scoring
+        if t <= MMVQ_COLS {
+            if let Ok(fpath) = std::env::var("NS_TRACE_GUESS") {
+                use std::io::Write;
+                let mut lines = String::new();
+                for ahead in 1..=2u64 {
+                    let tl = l + ahead;
+                    if p.mat(tl, Role::Router).is_err() {
+                        continue;
+                    }
+                    let (gv, gb) = (p.mm(tl, Role::Router, x, t)?.to_f32()?, p.vec(tl, Role::RouterBias)?.to_f32()?);
+                    for ti in 0..t {
+                        let pr: Vec<f32> = gv[ti * ne..(ti + 1) * ne].iter().map(|z| 1.0 / (1.0 + (-z).exp())).collect();
+                        let mut order: Vec<usize> = (0..ne).collect();
+                        order.sort_by(|a, b| (pr[*b] + gb[*b]).total_cmp(&(pr[*a] + gb[*a])));
+                        lines += &format!("G {l} {tl} {ti} {}\n", order[..16].iter().map(|e| e.to_string()).collect::<Vec<_>>().join(","));
+                    }
+                }
+                if let Ok(mut w) = std::fs::OpenOptions::new().create(true).append(true).open(fpath) {
+                    let _ = w.write_all(lines.as_bytes());
+                }
+            }
+        }
+        if let Some(gv) = guess {
+            let gb = p.router_bias(l + 1)?;
+            // each expert's chance of being asked for: per row, the measured hit rate of its rank in the guess
+            // (GUESS_HIT), the rows combined; the ones likely enough, likeliest first
+            let mut miss: BTreeMap<usize, f32> = BTreeMap::new();
             for ti in 0..t {
                 let pr: Vec<f32> = gv[ti * ne..(ti + 1) * ne].iter().map(|z| 1.0 / (1.0 + (-z).exp())).collect();
                 let mut order: Vec<usize> = (0..ne).collect();
                 order.sort_by(|a, b| (pr[*b] + gb[*b]).total_cmp(&(pr[*a] + gb[*a])));
-                for &e in &order[..used] {
-                    *score.entry(e).or_default() += pr[e] + gb[e];
+                for (rank, &e) in order.iter().take(GUESS_HIT.len()).enumerate() {
+                    *miss.entry(e).or_insert(1.0) *= 1.0 - GUESS_HIT[rank];
                 }
             }
-            let mut want: Vec<(usize, f32)> = score.into_iter().collect();
+            let th = prefetch_p();
+            let mut want: Vec<(usize, f32)> = miss.into_iter().map(|(e, q)| (e, 1.0 - q)).filter(|x| x.1 >= th).collect();
             want.sort_by(|a, b| b.1.total_cmp(&a.1));
             let want: Vec<u64> = want.into_iter().map(|(e, _)| e as u64).collect();
             self.timed(p, "expert prefetch", || p.prefetch(&self.m, l + 1, &want, pf))?;
