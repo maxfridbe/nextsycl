@@ -1385,7 +1385,11 @@ impl<'g> Glm<'g> {
                 o.quantize_q8_1((x, 0), &xq, d, t)?;
                 let scratch = p.arena.bytes(o.moe_scratch_bytes(total, f))?;
                 let dn = p.arena.f32(total * d)?;
-                o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, total, &xq, &scratch, &dn, lim)?;
+                // prompt chunks a sub-group a row (NS_PROMPT_LANES), decode the kernels' default
+                static PROMPT_LANES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let pl = *PROMPT_LANES.get_or_init(|| std::env::var("NS_PROMPT_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(32));
+                let lanes = if t > MMVQ_COLS { pl } else { 0 };
+                o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, total, &xq, &scratch, &dn, lim, lanes)?;
                 let cb = p.arena.bytes((t + 1 + total) * 4)?;
                 cb.write(0, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 return o.moe_combine(&y, &dn, &cb, &wb, t, total, d);

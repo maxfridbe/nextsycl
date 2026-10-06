@@ -27,6 +27,26 @@ by default (`--no-mtp` turns it off).
       grouped expert kernels themselves (28 s; a tiled int8 / XMX prompt kernel is the next lever)
 - [ ] Decode past 2K: 12.1 vs 15.7 tok/s short - the indexer's per-token GEMM + the attention kernel
 
+## Prompt speed: what Strata's prompt path teaches (its numbers on the B70, docs/INTEL.md there)
+
+- [ ] **Bigger chunks.** Strata reads prompts in 4,096-token chunks; at 2,048 an 80K prompt took 278 s, at 4,096 77 s
+      (its experts not in VRAM are streamed once per chunk). Here a 512-token chunk routes ~14 tokens to an expert;
+      at 4,096 it would be ~114, so every expert's weights (from VRAM or over PCIe) serve 8x the tokens, and the
+      expanded fp16 GEMM path (measured slower at 512: 22.6 tok/s) becomes a real GEMM. What stops it: the arena
+      (~1.5 MB of temporaries a token: 6 GB at 4,096). Trim the per-token temporaries (fp16 activations, in-place
+      KDA/MoE buffers), and borrow VRAM for the rest.
+- [ ] **Borrow expert slots for the prompt** (Strata's "prompt path borrows N cache slots"): during a long prompt,
+      lend part of the VRAM expert cache to the chunk's temporaries / a streaming ring, give it back for decode.
+      Strata mirrors the lent slots in pinned host memory so the refill after the prompt is a RAM copy (its "lend
+      mirror": prompt +15-40%, refill 720-2,240 -> 200-380 ms).
+- [ ] **A stager: stream the next layer's experts while this one computes** (Strata's 96-slot streamed ring, a copy
+      queue, a polled sequence flag - never host waits on queue events: they deadlocked under Level Zero v2). Today
+      the in-place PCIe reads sit on the compute critical path.
+- [ ] **Group by expert across the chunk, one launch a layer** - done (the grouped kernels); prompt lanes 32 a row.
+- [ ] **QSA / indexer scores as GEMM tiles** (Strata's QSA block scores: a GEMM tile per block pair) - the indexer
+      here already scores by GEMM; the MLA prompt attention (12 s of 47 at 3K) is the per-row kernel: tile it.
+- [ ] **Dequant with vector stores** (Strata: 575 -> 841 tok/s at 2K / 8K) for any path that still expands weights.
+
 ## Speed, later
 
 - [x] Prompt chunks read host-slot experts in place over PCIe (no swaps); decode still swaps (faster there: 12.5 vs

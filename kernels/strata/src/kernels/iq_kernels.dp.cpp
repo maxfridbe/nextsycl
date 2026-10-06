@@ -2320,8 +2320,11 @@ inline int lanes_env(const char* name) {
     const int n = v ? std::atoi(v) : kExpertLanes;
     return n == 4 || n == 8 || n == 16 || n == 32 ? n : kExpertLanes;
 }
-inline int gu_lanes() { static const int v = lanes_env("STRATA_GU_LANES"); return v; }
-inline int down_lanes() { static const int v = lanes_env("STRATA_DOWN_LANES"); return v; }
+// nextsycl: a per-call lane count (prompt chunks: 32 - a sub-group a row, ~20% faster at ~14 entries per expert;
+// decode keeps the default, faster there); 0 = the environment's / the default
+int g_lanes_call = 0;
+inline int gu_lanes() { static const int v = lanes_env("STRATA_GU_LANES"); return g_lanes_call ? g_lanes_call : v; }
+inline int down_lanes() { static const int v = lanes_env("STRATA_DOWN_LANES"); return g_lanes_call ? g_lanes_call : v; }
 template <int TG, int LN>
 void launch_gu_port(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
                     const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
@@ -2665,6 +2668,7 @@ float g_swiglu_limit = 0.0f;   // nextsycl: the grouped experts' SwiGLU clamp (0
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
 void native_expert_set_swiglu_limit(float limit) { g_swiglu_limit = limit; }   // nextsycl
+void native_expert_set_lanes(int lanes) { g_lanes_call = lanes == 4 || lanes == 8 || lanes == 16 || lanes == 32 ? lanes : 0; }   // nextsycl
 
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
