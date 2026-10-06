@@ -31,6 +31,19 @@ impl Mat {
     }
 }
 
+/// A conversation's state on the GPU: per KDA layer the recurrent state and the convolutions' last inputs, per MLA
+/// layer the latent cache; `pos` tokens so far.
+pub struct Session {
+    pub pos: usize,
+    pub max_ctx: usize,
+    layers: Vec<LayerState>,
+}
+
+enum LayerState {
+    Kda { s: DevBuf, conv: [DevBuf; 3] },
+    Mla { c: DevBuf },
+}
+
 pub struct Glm<'g> {
     pub m: Model<'g>,
     ops: Ops,
@@ -150,12 +163,40 @@ impl<'g> Glm<'g> {
         Ok(y)
     }
 
-    /// The prompt `tokens` from position 0: the logits of the last token. `tap` sees each named step.
-    pub fn forward(&self, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
+    /// A new conversation, up to `max_ctx` tokens (MLA attends to every earlier token: exact up to ~2,048).
+    pub fn session(&self, max_ctx: usize) -> Result<Session> {
+        let g = &self.m.g;
+        let gpu = &self.ops.gpu;
+        let kw = (g.kda_heads * g.kda_dim) as usize;
+        let mut layers = Vec::new();
+        for l in 0..g.n_layer {
+            layers.push(if g.is_mla(l) {
+                LayerState::Mla { c: DevBuf::f32(gpu, max_ctx * g.kv_lora as usize)? }
+            } else {
+                let s = DevBuf::f32(gpu, (g.kda_heads * g.kda_dim * g.kda_dim) as usize)?;
+                s.fill(0)?;
+                let conv = [0, 1, 2].map(|_| DevBuf::f32(gpu, (g.kda_conv as usize - 1) * kw));
+                let [a, b, c] = conv;
+                let conv = [a?, b?, c?];
+                for cb in &conv {
+                    cb.fill(0)?;
+                }
+                LayerState::Kda { s, conv }
+            });
+        }
+        Ok(Session { pos: 0, max_ctx, layers })
+    }
+
+    /// The next `tokens` of a conversation: the logits of the last one. `tap` sees each named step.
+    pub fn forward(&self, sess: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
         let g = &self.m.g;
         let gpu = &self.ops.gpu;
         let o = &self.ops;
         let t = tokens.len();
+        let pos0 = sess.pos;
+        if pos0 + t > sess.max_ctx {
+            return Err(Error(format!("the context is {} tokens; {} more do not fit", sess.max_ctx, t)));
+        }
         let (d, eps) = (g.n_embd as usize, g.rms_eps as f32);
         let kw = (g.kda_heads * g.kda_dim) as usize;
         let (kh, kd) = (g.kda_heads as usize, g.kda_dim as usize);
@@ -204,18 +245,16 @@ impl<'g> Glm<'g> {
             // ---- attention half
             hc_pre(l, Role::HcAttnFn, Role::HcAttnBase, Role::HcAttnScale, &x, Role::AttnNorm)?;
             tap(&format!("attn_norm-{l}"), &normed)?;
-            let att = if !g.is_mla(l) {
-                let conv = |r: Role, w: Role| -> Result<DevBuf> {
+            let att = if let LayerState::Kda { s: kstate, conv: cstate } = &sess.layers[l as usize] {
+                let conv = |r: Role, w: Role, state: &DevBuf| -> Result<DevBuf> {
                     let p = self.mm(l, r, &normed, t)?;
-                    let state = DevBuf::f32(gpu, (g.kda_conv as usize - 1) * kw)?;
-                    state.fill(0)?;
                     let out = DevBuf::f32(gpu, t * kw)?;
-                    o.conv_silu(&p, &state, self.vec(l, w)?, &out, t, kw, g.kda_conv as usize)?;
+                    o.conv_silu(&p, state, self.vec(l, w)?, &out, t, kw, g.kda_conv as usize)?;
                     Ok(out)
                 };
-                let q = conv(Role::KdaQ, Role::KdaQConv)?;
-                let k = conv(Role::KdaK, Role::KdaKConv)?;
-                let v = conv(Role::KdaV, Role::KdaVConv)?;
+                let q = conv(Role::KdaQ, Role::KdaQConv, &cstate[0])?;
+                let k = conv(Role::KdaK, Role::KdaKConv, &cstate[1])?;
+                let v = conv(Role::KdaV, Role::KdaVConv, &cstate[2])?;
                 tap(&format!("kda_q_conv-{l}"), &q)?;
                 tap(&format!("kda_k_conv-{l}"), &k)?;
                 tap(&format!("kda_v_conv-{l}"), &v)?;
@@ -228,10 +267,8 @@ impl<'g> Glm<'g> {
                 let beta = self.mm(l, Role::KdaBeta, &normed, t)?;
                 o.sigmoid(&beta, t * kh)?;
                 tap(&format!("kda_beta-{l}"), &beta)?;
-                let s = DevBuf::f32(gpu, kh * kd * kd)?;
-                s.fill(0)?;
                 let scan = DevBuf::f32(gpu, t * kw)?;
-                o.kda_scan(&q, &k, &v, &gate, &beta, &s, &scan, t, kh, kd)?;
+                o.kda_scan(&q, &k, &v, &gate, &beta, kstate, &scan, t, kh, kd)?;
                 tap(&format!("kda_scan_out-{l}"), &scan)?;
                 let ga = self.mm(l, Role::KdaGA, &normed, t)?;
                 let g2 = self.mm(l, Role::KdaGB, &ga, t)?;
@@ -242,6 +279,7 @@ impl<'g> Glm<'g> {
                 tap(&format!("kda_out-{l}"), &out)?;
                 out
             } else {
+                let LayerState::Mla { c: cache } = &sess.layers[l as usize] else { return Err(Error("layer state".into())) };
                 let (nh, hd, lat) = (g.n_head as usize, g.head_dim as usize, g.kv_lora as usize);
                 let qa = self.mm(l, Role::MlaQA, &normed, t)?;
                 let qr = DevBuf::f32(gpu, t * g.q_lora as usize)?;
@@ -252,6 +290,7 @@ impl<'g> Glm<'g> {
                 let c = DevBuf::f32(gpu, t * lat)?;
                 o.rms_norm(&kv, Some(self.vec(l, Role::MlaKvANorm)?), &c, t, lat, eps)?;
                 tap(&format!("kv_cmpr-{l}"), &c)?;
+                cache.copy_within(pos0 * lat * 4, &c, 0, t * lat * 4)?;
                 // the absorbed queries: per head, q~ = k_b[h] . q_h
                 let kb = self.vec(l, Role::MlaKB)?;
                 let qt = DevBuf::f32(gpu, t * nh * lat)?;
@@ -259,7 +298,7 @@ impl<'g> Glm<'g> {
                     o.gemm_at(t, lat, hd, (&q, hh * hd, nh * hd), (kb, hh * lat * hd), (&qt, hh * lat, nh * lat), false)?;
                 }
                 let u = DevBuf::f32(gpu, t * nh * lat)?;
-                o.mla_attend(&qt, &c, &u, t, nh, lat, 0, 1.0 / (hd as f32).sqrt())?;
+                o.mla_attend(&qt, cache, &u, t, nh, lat, pos0, 1.0 / (hd as f32).sqrt())?;
                 let vb = self.vec(l, Role::MlaVB)?;
                 let oh = DevBuf::f32(gpu, t * nh * hd)?;
                 for hh in 0..nh {
@@ -305,6 +344,7 @@ impl<'g> Glm<'g> {
         tap("result_norm", &out)?;
         let logits = self.mm(0, Role::Output, &out, 1)?;
         tap("result_output", &logits)?;
+        sess.pos += t;
         logits.to_f32()
     }
 

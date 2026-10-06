@@ -445,3 +445,17 @@ impl Ops {
         self.ok(rc, "add")
     }
 }
+
+impl DevBuf {
+    /// Bytes `[src_at, src_at + n)` of `src` (same GPU) into `[at, at + n)`, queued in order.
+    pub fn copy_within(&self, at: usize, src: &DevBuf, src_at: usize, n: usize) -> Result<()> {
+        self.bounds(at, n)?;
+        src.bounds(src_at, n)?;
+        if !Arc::ptr_eq(&self.gpu, &src.gpu) {
+            return Err(Error("copy_within: the buffers are on different GPUs (copy_from_peer)".into()));
+        }
+        let g = &self.gpu;
+        // SAFETY: both ranges in bounds (checked), same GPU and context.
+        check(g.api, unsafe { (g.api.copy_dev)(g.raw, self.ptr.cast::<u8>().add(at).cast(), src.ptr.cast::<u8>().add(src_at).cast(), n) }, "copying on the GPU")
+    }
+}

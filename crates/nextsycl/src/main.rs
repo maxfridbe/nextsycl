@@ -17,7 +17,9 @@ const USAGE: &str = "usage:
   nextsycl info <model.gguf>    the architecture and geometry, every tensor checked by role, bytes by group
   nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
   nextsycl check <model.gguf> <dump dir> [--gpu N]
-                                the forward pass on a reference dump's prompt, every step compared, the next token";
+                                the forward pass on a reference dump's prompt, every step compared, the next token
+  nextsycl tokenize <model.gguf> <text>
+  nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N]";
 
 fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
@@ -215,14 +217,136 @@ fn check(model: &Path, dump: &Path, gpu: usize) -> Result<(), String> {
         }
         Ok(())
     };
-    let logits = glm.forward(&tokens, &mut tap).map_err(e)?;
+    let mut sess = glm.session(tokens.len().max(16)).map_err(e)?;
+    let logits = glm.forward(&mut sess, &tokens, &mut tap).map_err(e)?;
     let best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as u32).unwrap_or(0);
     let vocab = f.meta("tokenizer.ggml.tokens").and_then(|v| v.as_array());
     let word = |id: u32| vocab.and_then(|v| v.get(id as usize)).and_then(|v| v.as_str()).unwrap_or("?").replace('\u{120}', " ").to_string();
     println!("forward  : {:.1} s", t0.elapsed().as_secs_f64());
+    // the same prompt incrementally: all but the last token, then the last alone (decode's path)
+    if tokens.len() > 1 {
+        let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
+        let mut s2 = glm.session(tokens.len()).map_err(e)?;
+        glm.forward(&mut s2, &tokens[..tokens.len() - 1], &mut none).map_err(e)?;
+        let inc = glm.forward(&mut s2, &tokens[tokens.len() - 1..], &mut none).map_err(e)?;
+        let (cos, rel, _) = compare(&inc, &logits);
+        println!("decode   : the last token alone after the rest: logits cosine {cos:.7}, rel err {rel:.2e} against the whole prompt at once");
+    }
     println!("worst    : {} (cosine {:.6})", worst.1, worst.0);
     println!("next     : {best} {:?}{}", word(best), want_next.map_or(String::new(), |w| format!(", the reference {w} {:?}{}", word(w),
                                                          if w == best { " - the same" } else { " - DIFFERENT" })));
+    Ok(())
+}
+
+/// `nextsycl tokenize <model.gguf> <text>`: the ids and their pieces (special tokens parsed).
+fn tokenize(model: &Path, text: &str) -> Result<(), String> {
+    let f = Gguf::open(model).map_err(|e| e.0)?;
+    let t = ns_tok::Tokenizer::from_gguf(&f)?;
+    let ids = t.encode(text);
+    println!("{} tokens: {:?}", ids.len(), ids);
+    for id in &ids {
+        println!("  {id:>7} {:?}", t.decode(&[*id]));
+    }
+    let back = t.decode(&ids);
+    println!("round trip: {}", if back == text { "identical" } else { "DIFFERENT" });
+    Ok(())
+}
+
+/// A tiny deterministic generator for sampling (xorshift64*).
+struct Rng(u64);
+impl Rng {
+    fn next_f32(&mut self) -> f32 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        ((self.0.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f32) / (1u64 << 24) as f32
+    }
+}
+
+/// Greedy at temperature 0; else softmax(logits / temp) restricted to the smallest set of top tokens holding top_p.
+fn sample(logits: &[f32], temp: f32, top_p: f32, rng: &mut Rng) -> u32 {
+    if temp <= 0.0 {
+        return logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32);
+    }
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]));
+    let mx = logits[idx[0]];
+    let mut p: Vec<(usize, f32)> = idx.iter().take(256).map(|&i| (i, ((logits[i] - mx) / temp).exp())).collect();
+    let sum: f32 = p.iter().map(|x| x.1).sum();
+    let mut acc = 0.0;
+    let mut keep = p.len();
+    for (n, x) in p.iter_mut().enumerate() {
+        x.1 /= sum;
+        acc += x.1;
+        if acc >= top_p {
+            keep = n + 1;
+            break;
+        }
+    }
+    p.truncate(keep);
+    let total: f32 = p.iter().map(|x| x.1).sum();
+    let mut r = rng.next_f32() * total;
+    for (i, w) in &p {
+        r -= w;
+        if r <= 0.0 {
+            return *i as u32;
+        }
+    }
+    p.last().map_or(0, |x| x.0 as u32)
+}
+
+/// `nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N]`
+fn generate(args: &[String]) -> Result<(), String> {
+    use std::io::Write;
+    let e = |x: ns_core::Error| x.0;
+    let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+    let model = args.get(1).ok_or("generate <model.gguf> --prompt ...")?;
+    let prompt = opt("--prompt").ok_or("--prompt TEXT")?;
+    let effort = ns_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|high|max")?;
+    let max: usize = opt("--max").and_then(|v| v.parse().ok()).unwrap_or(256);
+    let temp: f32 = opt("--temp").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let top_p: f32 = opt("--top-p").and_then(|v| v.parse().ok()).unwrap_or(0.95);
+    let gpu: usize = opt("--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let f = Gguf::open(Path::new(model)).map_err(|e| e.0)?;
+    let tok = ns_tok::Tokenizer::from_gguf(&f)?;
+    let text = ns_tok::glm_chat(&[ns_tok::Message { role: "user", content: &prompt, reasoning: None }], effort);
+    let ids = tok.encode(&text);
+    let g = ns_core::Gpu::open(gpu).map_err(e)?;
+    let mut log = |_: String| {};
+    let glm = ns_engine::glm5next::Glm::load(&f, &g, &mut log).map_err(e)?;
+    eprintln!("[{} on {}, {} prompt tokens, loaded in {:.1} s]", f.meta("general.name").and_then(|v| v.as_str()).unwrap_or("?"), g.name, ids.len(), glm.load_seconds);
+    let mut sess = glm.session(ids.len() + max + 1).map_err(e)?;
+    let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
+    let t0 = std::time::Instant::now();
+    let mut logits = glm.forward(&mut sess, &ids, &mut none).map_err(e)?;
+    let prefill = t0.elapsed().as_secs_f64();
+    let mut rng = Rng(0x9E3779B97F4A7C15);
+    let mut pending: Vec<u8> = Vec::new();
+    let mut out = std::io::stdout();
+    print!("<think>");
+    let t1 = std::time::Instant::now();
+    let mut n = 0;
+    for _ in 0..max {
+        let next = sample(&logits, temp, top_p, &mut rng);
+        if tok.stop.contains(&next) {
+            break;
+        }
+        n += 1;
+        pending.extend(tok.decode_bytes(&[next]));
+        // print what is valid UTF-8 so far; keep a cut character for the next token
+        let valid = match std::str::from_utf8(&pending) {
+            Ok(s) => s.len(),
+            Err(err) => err.valid_up_to(),
+        };
+        print!("{}", String::from_utf8_lossy(&pending[..valid]));
+        pending.drain(..valid);
+        let _ = out.flush();
+        logits = glm.forward(&mut sess, &[next], &mut none).map_err(e)?;
+    }
+    println!("{}", String::from_utf8_lossy(&pending));
+    let dt = t1.elapsed().as_secs_f64();
+    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s)]", ids.len(), ids.len() as f64 / prefill,
+              n as f64 / dt.max(1e-9));
     Ok(())
 }
 
@@ -231,6 +355,8 @@ fn main() -> ExitCode {
     let r = match args.first().map(String::as_str) {
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),
         Some("gpus") => gpus(),
+        Some("tokenize") if args.len() == 3 => tokenize(Path::new(&args[1]), &args[2]),
+        Some("generate") => generate(&args),
         Some("check") if args.len() >= 3 => {
             let gpu = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0);
             check(Path::new(&args[1]), Path::new(&args[2]), gpu)

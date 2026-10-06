@@ -10,3 +10,4 @@ ns-gguf.workspace = true
 ns-model.workspace = true
 ns-core.workspace = true
 ns-engine.workspace = true
+ns-tok.workspace = true
