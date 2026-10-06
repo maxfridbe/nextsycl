@@ -500,7 +500,7 @@ impl Part {
         let f16 = f16_min();
         let fits = |b: &DevBuf| t * w.cols * 2 <= b.len;
         if let Some(x16) = self.x16.as_ref().filter(|b| f16 > 0 && t >= f16 && t > MMVQ_COLS && fits(b))
-            .filter(|_| x.2 == w.cols && w.cols % 256 == 0 && F16_TYPES.contains(&w.ty.code())) {
+            .filter(|_| x.2 == w.cols && w.cols.is_multiple_of(256) && F16_TYPES.contains(&w.ty.code())) {
             self.ops.to_f16(&x.0.view(x.1 * 4, t * w.cols * 4)?, x16, t * w.cols)?;
             let chunk = (SCRATCH * 2 / w.cols).max(1).min(w.rows);
             let mut r0 = 0;
