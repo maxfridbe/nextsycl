@@ -174,6 +174,17 @@ struct MtpState {
     next: Vec<u32>,
 }
 
+/// One GPU's share of the model (`Glm::gpu_info`).
+pub struct GpuInfo {
+    pub index: usize,
+    pub name: String,
+    pub total: u64,
+    pub free: Option<u64>,
+    pub layers: (u64, u64),
+    pub expert_slots: usize,
+    pub host_slots: usize,
+}
+
 /// A conversation's state at a position, in host memory (`Glm::save` / `Glm::restore`).
 pub struct Checkpoint {
     pub pos: usize,
@@ -619,6 +630,16 @@ impl<'g> Glm<'g> {
         let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(BTreeMap::new()));
         let mtp = (mtp && m.g.n_mtp > 0).then_some(n);
         Ok(Glm { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, mtp, prof })
+    }
+
+    /// Per GPU: its number and name, memory (total, free when the driver says), its layers, its expert slots in
+    /// VRAM and in pinned host memory.
+    pub fn gpu_info(&self) -> Vec<GpuInfo> {
+        self.parts.iter().map(|p| {
+            let (total, free) = p.ops.gpu.memory().unwrap_or((0, None));
+            GpuInfo { index: p.ops.gpu.index, name: p.ops.gpu.name.clone(), total, free, layers: (p.layers.start, p.layers.end),
+                      expert_slots: p.expert_slots, host_slots: p.host_slots }
+        }).collect()
     }
 
     pub fn expert_slots(&self) -> usize {

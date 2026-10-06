@@ -3,9 +3,17 @@
 //!
 //!     GET  /health                 {"status": "ok"} once the model is loaded
 //!     GET  /v1/models              the one model
-//!     GET  /status                 {"busy": bool}
+//!     GET  /status                 {"busy": bool, "prompt_cache": ...}
 //!     POST /v1/chat/completions    messages, max_tokens, temperature, top_p, stream, reasoning_effort (or
 //!                                  chat_template_kwargs.reasoning_effort): low | high | max
+//!
+//! The same routes and the control ones answer on a Unix socket too (`--socket`; `nextsycl start` puts it in
+//! $XDG_RUNTIME_DIR/nextsycl), which the host command line talks to (client.rs), as sycl-h3 talks to h3d:
+//!
+//!     GET  /server/status          the model, its GPUs (memory, layers, expert slots), the request running, the cache
+//!     GET  /server/requests        the requests: the running one and the last 100
+//!     GET  /server/cache           the prompt cache's checkpoints;  POST /server/cache/clear  drops them
+//!     POST /server/shutdown        stop once no request runs (as SIGTERM)
 //!
 //! One request runs at a time (the others wait). The prompt cache (cache.rs, --prompt-cache-mib) keeps the
 //! conversation state at three points of every prompt - the end of its first turn (a system prompt other
@@ -14,15 +22,19 @@
 //! session when that is longer, and reads only the rest. GLM's thinking comes back as `reasoning_content`, the
 //! answer as `content`.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::io::Write;
+use std::net::TcpListener;
+use std::os::unix::net::UnixListener;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ns_engine::glm5next::{Glm, Session};
 
 use crate::cache::PromptCache;
+use crate::http::{self, Conn};
 use ns_tok::{Effort, Message, Tokenizer};
 use serde_json::{json, Value};
 
@@ -38,6 +50,11 @@ pub struct Server {
     pub default_effort: Effort,
     state: Mutex<Conv>,
     busy: AtomicBool,
+    started: Instant,
+    /// the request running (its JSON row, updated as it goes) and the last 100 that ended
+    current: Mutex<Option<Value>>,
+    done: Mutex<VecDeque<Value>>,
+    next_id: AtomicU64,
 }
 
 /// The working session with the tokens it has consumed, and the prompt cache.
@@ -51,15 +68,8 @@ struct Conv {
 /// Prefixes shorter than this are read again rather than cached
 const MIN_CHECKPOINT: usize = 64;
 
-fn respond(s: &mut TcpStream, code: u16, body: &Value) {
-    let b = body.to_string();
-    let reason = match code {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        _ => "Internal Server Error",
-    };
-    let _ = write!(s, "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+fn respond(s: &mut Conn, code: u16, body: &Value) {
+    http::respond(s, code, body)
 }
 
 fn now() -> u64 {
@@ -80,7 +90,8 @@ impl Server {
         let work = glm.session(max_ctx).map_err(|e| e.0)?;
         Ok(Server { glm, tok, name, max_ctx, default_effort,
                     state: Mutex::new(Conv { work, live: Vec::new(), cache: PromptCache::new(cache_bytes), rng: Rng(0x5DEECE66D) }),
-                    busy: AtomicBool::new(false) })
+                    busy: AtomicBool::new(false), started: Instant::now(), current: Mutex::new(None), done: Mutex::new(VecDeque::new()),
+                    next_id: AtomicU64::new(1) })
     }
 
     /// The checkpoint positions of a prompt: the end of its first turn and the start of its last user turn (each
@@ -101,7 +112,7 @@ impl Server {
 
     /// Serves until SIGTERM / SIGINT, then ends once no request runs: a GPU process stopped inside a kernel can
     /// leave the driver stuck, so a stop never cuts a generation off.
-    pub fn run(self: Arc<Self>, addr: &str) -> Result<(), String> {
+    pub fn run(self: Arc<Self>, addr: &str, socket: Option<PathBuf>) -> Result<(), String> {
         extern "C" fn on_signal(_: i32) {
             STOP.store(true, Ordering::SeqCst);
         }
@@ -115,71 +126,120 @@ impl Server {
         }
         let l = TcpListener::bind(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
         l.set_nonblocking(true).map_err(|e| e.to_string())?;
-        eprintln!("[serving {} on http://{addr}]", self.name);
+        let u = match &socket {
+            Some(p) => {
+                let _ = std::fs::remove_file(p); // one from a server before
+                let u = UnixListener::bind(p).map_err(|e| format!("cannot listen on {}: {e}", p.display()))?;
+                u.set_nonblocking(true).map_err(|e| e.to_string())?;
+                Some(u)
+            }
+            None => None,
+        };
+        eprintln!("[serving {} on http://{addr}{}]", self.name, socket.as_ref().map_or(String::new(), |p| format!(" and {}", p.display())));
         loop {
             if STOP.load(Ordering::SeqCst) {
                 // finish what runs (the request's thread holds the conversation's lock)
                 let _wait = self.state.lock().unwrap();
                 eprintln!("[stopping: no request running]");
+                if let Some(p) = &socket {
+                    let _ = std::fs::remove_file(p);
+                }
                 return Ok(());
             }
+            let mut idle = true;
             match l.accept() {
                 Ok((c, _)) => {
                     let _ = c.set_nonblocking(false);
                     let me = self.clone();
-                    std::thread::spawn(move || me.handle(c));
+                    std::thread::spawn(move || me.handle(Conn::Tcp(c)));
+                    idle = false;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => {}
+            }
+            if let Some(u) = &u {
+                if let Ok((c, _)) = u.accept() {
+                    let _ = c.set_nonblocking(false);
+                    let me = self.clone();
+                    std::thread::spawn(move || me.handle(Conn::Unix(c)));
+                    idle = false;
+                }
+            }
+            if idle {
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
     }
 
-    fn handle(&self, mut s: TcpStream) {
-        let mut r = BufReader::new(match s.try_clone() {
+    /// The model, its GPUs, the request running, the cache (the cache's figures only when no request holds the
+    /// conversation: a status call never waits).
+    fn status_json(&self) -> Value {
+        let gpus: Vec<Value> = self.glm.gpu_info().iter().map(|g| json!({
+            "index": g.index, "name": g.name, "total": g.total, "free": g.free, "layers": [g.layers.0, g.layers.1],
+            "expert_slots": g.expert_slots, "host_slots": g.host_slots})).collect();
+        let cache = self.state.try_lock().ok().map(|st| json!({"entries": st.cache.len(), "bytes": st.cache.bytes(), "budget": st.cache.budget(),
+                                                              "evictions": st.cache.evictions, "live_tokens": st.live.len()}));
+        json!({"model": self.name, "version": env!("CARGO_PKG_VERSION"), "uptime_seconds": self.started.elapsed().as_secs_f64(),
+               "context": self.max_ctx, "mtp": self.glm.mtp.is_some(), "gpus": gpus, "busy": self.busy.load(Ordering::Relaxed),
+               "running": self.current.lock().unwrap().clone(), "served": self.next_id.load(Ordering::Relaxed) - 1,
+               "prompt_cache": cache, "stopping": STOP.load(Ordering::SeqCst)})
+    }
+
+    fn handle(&self, mut s: Conn) {
+        let Ok(req) = http::read_request(match s.try_clone() {
             Ok(c) => c,
             Err(_) => return,
-        });
-        let mut line = String::new();
-        if r.read_line(&mut line).is_err() {
-            return;
+        }) else { return };
+        let (method, path) = (req.method.as_str(), req.path.as_str());
+        // the control routes answer on the socket only: the API port may be open to the network
+        if path.starts_with("/server/") && s.kind() != "socket" {
+            return respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path} (the control routes are on the server's socket)")}}));
         }
-        let mut parts = line.split_whitespace();
-        let (method, path) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string());
-        let mut len = 0usize;
-        loop {
-            let mut h = String::new();
-            if r.read_line(&mut h).is_err() || h.trim().is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':') {
-                if k.trim().eq_ignore_ascii_case("content-length") {
-                    len = v.trim().parse().unwrap_or(0);
-                }
-            }
-        }
-        let mut body = vec![0u8; len.min(64 << 20)];
-        if r.read_exact(&mut body).is_err() {
-            return;
-        }
-        let path = path.split('?').next().unwrap_or("").to_string();
-        match (method.as_str(), path.as_str()) {
+        match (method, path) {
             ("GET", "/health") => respond(&mut s, 200, &json!({"status": "ok"})),
             ("GET", "/status") => {
-                let busy = self.busy.load(Ordering::Relaxed);
-                // the cache's figures when no request holds the state (a status call never waits)
-                let cache = self.state.try_lock().ok().map(|st| json!({"entries": st.cache.len(), "bytes": st.cache.bytes(),
-                                                                      "evictions": st.cache.evictions, "live_tokens": st.live.len()}));
-                respond(&mut s, 200, &json!({"busy": busy, "prompt_cache": cache}))
+                let st = self.status_json();
+                respond(&mut s, 200, &json!({"busy": st["busy"], "prompt_cache": st["prompt_cache"]}))
+            }
+            ("GET", "/server/status") => respond(&mut s, 200, &self.status_json()),
+            ("GET", "/server/requests") => {
+                let done: Vec<Value> = self.done.lock().unwrap().iter().rev().cloned().collect();
+                respond(&mut s, 200, &json!({"running": self.current.lock().unwrap().clone(), "done": done}))
+            }
+            ("GET", "/server/cache") => match self.state.try_lock() {
+                Ok(st) => {
+                    let list: Vec<Value> = st.cache.list().iter().map(|(t, b, _)| json!({"tokens": t, "bytes": b})).collect();
+                    respond(&mut s, 200, &json!({"entries": list, "bytes": st.cache.bytes(), "budget": st.cache.budget(), "evictions": st.cache.evictions}))
+                }
+                Err(_) => respond(&mut s, 409, &json!({"error": {"message": "a request is running; ask again when it is done"}})),
+            },
+            ("POST", "/server/cache/clear") => match self.state.try_lock() {
+                Ok(mut st) => {
+                    let n = st.cache.clear();
+                    respond(&mut s, 200, &json!({"dropped": n}))
+                }
+                Err(_) => respond(&mut s, 409, &json!({"error": {"message": "a request is running; ask again when it is done"}})),
+            },
+            ("POST", "/server/shutdown") => {
+                STOP.store(true, Ordering::SeqCst);
+                respond(&mut s, 200, &json!({"stopping": true, "running": self.busy.load(Ordering::Relaxed)}))
             }
             ("GET", "/v1/models") | ("GET", "/models") => respond(&mut s, 200, &json!({"object": "list", "data": [
                 {"id": self.name, "object": "model", "owned_by": "nextsycl", "created": now(), "status": {"value": "loaded"}}]})),
             ("POST", "/v1/chat/completions") | ("POST", "/chat/completions") => {
-                let req: Value = match serde_json::from_slice(&body) {
+                let body: Value = match serde_json::from_slice(&req.body) {
                     Ok(v) => v,
                     Err(e) => return respond(&mut s, 400, &json!({"error": {"message": format!("the body is not JSON: {e}")}})),
                 };
-                if let Err(e) = self.chat(&mut s, &req) {
+                let via = s.kind();
+                let r = self.chat(&mut s, &body, via);
+                // a request that ended on an error is still recorded
+                if let Some(mut row) = self.current.lock().unwrap().take() {
+                    row["state"] = json!("failed");
+                    row["error"] = json!(r.as_ref().err());
+                    self.remember(row);
+                }
+                if let Err(e) = r {
                     respond(&mut s, 500, &json!({"error": {"message": e}}));
                 }
             }
@@ -187,7 +247,22 @@ impl Server {
         }
     }
 
-    fn chat(&self, s: &mut TcpStream, req: &Value) -> Result<(), String> {
+    fn remember(&self, row: Value) {
+        let mut d = self.done.lock().unwrap();
+        d.push_back(row);
+        while d.len() > 100 {
+            d.pop_front();
+        }
+    }
+
+    /// Updates the running request's row.
+    fn live(&self, f: impl FnOnce(&mut Value)) {
+        if let Some(row) = self.current.lock().unwrap().as_mut() {
+            f(row);
+        }
+    }
+
+    fn chat(&self, s: &mut Conn, req: &Value, via: &str) -> Result<(), String> {
         let msgs: Vec<(String, String, Option<String>)> = req["messages"].as_array().ok_or("messages are required")?.iter().map(|m| {
             (m["role"].as_str().unwrap_or("user").to_string(), text_of(&m["content"]), m["reasoning_content"].as_str().map(str::to_string))
         }).collect();
@@ -207,6 +282,9 @@ impl Server {
 
         let mut st = self.state.lock().unwrap();
         self.busy.store(true, Ordering::Relaxed);
+        let rid = self.next_id.fetch_add(1, Ordering::Relaxed);
+        *self.current.lock().unwrap() = Some(json!({"id": rid, "via": via, "state": "reading", "started": now(), "prompt_tokens": ids.len(),
+                                                    "max_tokens": max, "generated": 0}));
         let _idle = Guard(&self.busy);
         let st = &mut *st;
         let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
@@ -247,11 +325,17 @@ impl Server {
         }
         st.live = ids.clone();
         let prefill = t0.elapsed().as_secs_f64();
+        self.live(|r| {
+            r["state"] = json!("generating");
+            r["reused"] = json!(from);
+            r["source"] = json!(source);
+            r["read_seconds"] = json!(prefill);
+        });
 
         if stream {
             let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
         }
-        let send = |s: &mut TcpStream, delta: Value, finish: Option<&str>| -> bool {
+        let send = |s: &mut Conn, delta: Value, finish: Option<&str>| -> bool {
             let chunk = json!({"id": id, "object": "chat.completion.chunk", "created": now(), "model": self.name,
                                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
             write!(s, "data: {chunk}\n\n").and_then(|_| s.flush()).is_ok()
@@ -282,6 +366,11 @@ impl Server {
                 break;
             }
             n += 1;
+            let el = t1.elapsed().as_secs_f64();
+            self.live(|r| {
+                r["generated"] = json!(n);
+                r["tok_s"] = json!(n as f64 / el.max(1e-9));
+            });
             pending.extend(self.tok.decode_bytes(&[next]));
             let valid = match std::str::from_utf8(&pending) {
                 Ok(t) => t.len(),
@@ -328,6 +417,16 @@ impl Server {
                   ids.len(), from, ids.len() - from, st.cache.len(), st.cache.bytes() as f64 / (1u64 << 30) as f64, n as f64 / dt.max(1e-9),
                   dec.accepted, dec.drafted);
         let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": n, "total_tokens": ids.len() + n});
+        if let Some(mut row) = self.current.lock().unwrap().take() {
+            row["state"] = json!("done");
+            row["finish"] = json!(finish);
+            row["generated"] = json!(n);
+            row["tok_s"] = json!(n as f64 / dt.max(1e-9));
+            row["generate_seconds"] = json!(dt);
+            row["drafts"] = json!([dec.accepted, dec.drafted]);
+            row["checkpoints_saved"] = json!(saved);
+            self.remember(row);
+        }
         let finish = if finish == "client gone" { "stop" } else { finish };
         if stream {
             send(s, json!({}), Some(finish));

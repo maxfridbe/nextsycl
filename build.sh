@@ -9,7 +9,7 @@ run() { podman run --rm --security-opt label=disable -e AOT -e JOBS -e ONLY -e L
           -e CARGO_HOME=/src/target/cargo-home "$IMAGE" bash -c "$1"; }
 case "$what" in
   kernels) run "kernels/build.sh" ;;
-  rust) run "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; cargo build --release && mkdir -p dist && cp target/release/nextsycl dist/" ;;
+  rust) run "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; cargo build --release && mkdir -p dist && cp target/release/nextsycl dist/.nextsycl.new && mv -f dist/.nextsycl.new dist/nextsycl" ;;
   all) "$0" kernels && "$0" rust ;;
   *) echo "build.sh [kernels|rust|all]"; exit 2 ;;
 esac

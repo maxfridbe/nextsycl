@@ -42,5 +42,7 @@ if [ "$fail" = 1 ]; then
   [ -n "${LINK_ANYWAY:-}" ] || exit 1
 fi
 echo "==> linking libnextsycl.so"
-icpx "${LINK[@]}" "$OBJ"/*.o -o "$OUT/libnextsycl.so"
+# linked beside it, then renamed over it: a running server keeps the library it mapped (writing over a mapped
+# library in place would change the code under it)
+icpx "${LINK[@]}" "$OBJ"/*.o -o "$OUT/.libnextsycl.so.new" && mv -f "$OUT/.libnextsycl.so.new" "$OUT/libnextsycl.so"
 ls -la "$OUT/libnextsycl.so"

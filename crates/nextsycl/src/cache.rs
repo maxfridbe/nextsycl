@@ -34,6 +34,23 @@ impl PromptCache {
         self.entries.iter().map(|e| e.ck.bytes).sum()
     }
 
+    /// (tokens, bytes, last use - higher is more recent) per entry, the most recently used first
+    pub fn list(&self) -> Vec<(usize, usize, u64)> {
+        let mut v: Vec<_> = self.entries.iter().map(|e| (e.tokens.len(), e.ck.bytes, e.used)).collect();
+        v.sort_by_key(|e| std::cmp::Reverse(e.2));
+        v
+    }
+
+    pub fn clear(&mut self) -> usize {
+        let n = self.entries.len();
+        self.entries.clear();
+        n
+    }
+
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
     /// The longest entry that is a proper prefix of `ids` (some token is left to read): its index and length.
     pub fn best(&self, ids: &[u32]) -> Option<(usize, usize)> {
         self.entries.iter().enumerate()

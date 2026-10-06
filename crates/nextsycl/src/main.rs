@@ -1,4 +1,5 @@
-//! `nextsycl`: the command line.
+//! `nextsycl`: the command line - the server as a service (start / stop / status / ps / cache / chat / logs, sycl-h3's
+//! scheme: a container, a control socket, NS_* settings), and the tools that run in this process.
 //!
 //!     nextsycl info <model.gguf>      the architecture, its geometry, every tensor checked by role, bytes by group
 //!     nextsycl gpus                   each GPU in its own context: memory, copies and their rates, GPU to GPU, and
@@ -10,7 +11,12 @@
 //!                                     step compared: cosine and relative error per tensor, then the next token
 
 mod cache;
+mod client;
+mod config;
+mod container;
+mod http;
 mod serve;
+mod service;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -18,22 +24,48 @@ use std::process::ExitCode;
 use ns_gguf::Gguf;
 use ns_model::glm5next::{Group, Model};
 
-const USAGE: &str = "usage:
+const USAGE: &str = "nextsycl - GLM-5.3-Flash on Intel Arc GPUs (Rust + SYCL)
+
+the server (a container; the model stays loaded on the GPUs):
+  nextsycl start [--gpu N ...] [--model PATH] [--port N] [--host H] [--ctx N] [--name ID] [--effort low|high|max]
+                 [--prompt-cache-mib N] [--no-mtp]
+                                the OpenAI API on NS_HOST:NS_PORT (default 127.0.0.1:8085), control on a Unix socket
+  nextsycl stop                 gracefully: the request running finishes, then the server ends
+
+the server (over its socket):
+  nextsycl status [--no-stream] live, like docker stats: the model, its GPUs, the request running, the prompt cache
+  nextsycl ps [-a]              the request running and the last ones
+  nextsycl cache [ls | clear]   the prompt cache's checkpoints
+  nextsycl chat <text> [--effort E] [--max N] [--temp T]
+                                one request, streamed
+  nextsycl logs [--no-follow]   the server's log, followed
+  nextsycl version
+
+in this process (inside the image: the kernels need the oneAPI runtime):
+  nextsycl serve <model.gguf> [--gpu 0,1 | all] [--host H] [--port N] [--name ID] [--ctx N] [--effort E] [--socket PATH]
+                 [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)]
+                                the server in the foreground (what start runs)
+  nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
+                    [--expert-gib G] [--mirror-gib G] [--no-mtp]
   nextsycl info <model.gguf>    the architecture and geometry, every tensor checked by role, bytes by group
   nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
-  nextsycl check <model.gguf> <dump dir> [--gpu N]
-                                the forward pass on a reference dump's prompt, every step compared, the next token
   nextsycl tokenize <model.gguf> <text>
-  nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
-                    [--expert-gib G]   VRAM for routed experts (default: what is free less 3 GiB)
-                    [--mirror-gib G]   pinned host memory mirroring experts (default: available less 10 GiB)
-                    [--no-mtp]         decode without the MTP draft block (drafts are on when the file has one)
-  nextsycl kernels <model.gguf> [--gpu N]   each weight type's decode kernel against the exact path
+  nextsycl check <model.gguf> <dump dir> [--gpu N[,M]]
+                                the forward pass on a reference dump's prompt, every step compared, the next token
   nextsycl spec-check <model.gguf> --prompt TEXT [--n N] [--gpu 0,1]
                                 verify passes (2 rows, then a rollback to 1) against one-token decode, logits compared
-  nextsycl serve <model.gguf> [--gpu 0,1] [--host 0.0.0.0] [--port 8085] [--name ID] [--ctx 8192] [--effort low]
-                 [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)]
-                                the OpenAI-compatible server";
+  nextsycl kernels <model.gguf> [--gpu N]   each weight type's decode kernel against the exact path
+
+settings (environment, or NAME=value lines in nextsycl.conf beside the repository or ~/.config/nextsycl.conf):
+  NS_MODELS        host directory with the model files, seen as /models                  (required for start)
+  NS_MODEL         the model as seen in the container (default /models/glm53-iq2/GLM-5.3-Flash-Uncensored-IQ2-imatrix-MTP-ds4.gguf)
+  NS_GPUS          GPUs, e.g. \"0 1\" (default all)
+  NS_HOST, NS_PORT the OpenAI API (default 127.0.0.1, 8085; 0.0.0.0 = the network, no password)
+  NS_CTX           tokens of context (default 65536)      NS_NAME   the model id clients see (glm-5.3-flash-uncensored)
+  NS_EFFORT        default reasoning effort (low)        NS_NO_MTP=1   decode without the draft block
+  NS_PROMPT_CACHE_MIB   host memory for the prompt cache's checkpoints (default 4096; 0 = off)
+  NS_SOCKET_DIR    where the control socket lives (default $XDG_RUNTIME_DIR/nextsycl)
+  NS_IMAGE, NS_CONTAINER_ENGINE   the image with the oneAPI runtime (localhost/h3-build) and podman / docker";
 
 fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
@@ -557,7 +589,12 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let e = |x: ns_core::Error| x.0;
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
     let model = args.get(1).ok_or("serve <model.gguf> ...")?;
-    let gpus: Vec<usize> = opt("--gpu").unwrap_or_else(|| "0".into()).split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}"))).collect::<Result<_, _>>()?;
+    let g = opt("--gpu").unwrap_or_else(|| "0".into());
+    let gpus: Vec<usize> = if g == "all" {
+        ns_core::gpus().map_err(e)?.into_iter().map(|(i, _)| i).collect()
+    } else {
+        g.split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}"))).collect::<Result<_, _>>()?
+    };
     let addr = format!("{}:{}", opt("--host").unwrap_or_else(|| "127.0.0.1".into()), opt("--port").unwrap_or_else(|| "8085".into()));
     let ctx: usize = opt("--ctx").and_then(|v| v.parse().ok()).unwrap_or(8192);
     let effort = ns_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|high|max")?;
@@ -580,12 +617,30 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), mirror, mtp, (ctx, 1), &mut log).map_err(e)?;
     eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds);
     let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort, cache)?);
-    srv.run(&addr)
+    srv.run(&addr, opt("--socket").map(std::path::PathBuf::from))
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let cfg = config::Config::load();
+    let _ = client::SERVER.set(http::Target::Unix(cfg.socket()));
+    let rest = args.get(1..).unwrap_or(&[]);
     let r = match args.first().map(String::as_str) {
+        Some("start") => service::start(&cfg, rest),
+        Some("stop") => service::stop(&cfg),
+        Some("logs") => service::logs(&cfg, rest),
+        Some("status") => client::status(rest),
+        Some("ps") => client::ps(rest),
+        Some("cache") => client::cache(rest),
+        Some("chat") => client::chat(rest),
+        Some("version") => {
+            println!("nextsycl {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("help") | Some("--help") | Some("-h") => {
+            println!("{USAGE}");
+            Ok(())
+        }
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),
         Some("gpus") => gpus(),
         Some("tokenize") if args.len() == 3 => tokenize(Path::new(&args[1]), &args[2]),
