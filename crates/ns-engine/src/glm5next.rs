@@ -1532,8 +1532,7 @@ impl<'g> Glm<'g> {
                 let xh = p.arena.bytes(nmax * d * 2)?;
                 let w16 = p.arena.bytes(2 * f * d * 2)?; // gate | up of one expert; down reuses the first half
                 let wu = w16.view(f * d * 2, f * d * 2)?;
-                let g32 = p.arena.f32(nmax * f)?;
-                let u32b = p.arena.f32(nmax * f)?;
+                let gu = p.arena.f32(nmax * 2 * f)?; // [n, gate | up]
                 let hh = p.arena.bytes(nmax * f * 2)?;
                 let dn = p.arena.f32(nmax * d)?;
                 // an expert in pinned host memory is copied into a VRAM staging slot first (the copy engine moves it
@@ -1577,11 +1576,10 @@ impl<'g> Glm<'g> {
                     o.dequant_f16(parts.gate.2.code(), buf, parts.gate.0, parts.gate.1, f * d, &w16)?;
                     o.dequant_f16(parts.up.2.code(), buf, parts.up.0, parts.up.1, f * d, &wu)?;
                     let m2 = self.lap(p, "MoE f16: expand gate/up", m1);
-                    o.gemm_f16(n, f, d, (&xh, 0, d), (&w16, 0), (&g32, 0, f), false)?;
-                    o.gemm_f16(n, f, d, (&xh, 0, d), (&wu, 0), (&u32b, 0, f), false)?;
+                    // gate and up expanded side by side: one GEMM of 2f outputs
+                    o.gemm_f16(n, 2 * f, d, (&xh, 0, d), (&w16, 0), (&gu, 0, 2 * f), false)?;
                     let m3 = self.lap(p, "MoE f16: gemm gate/up", m2);
-                    o.swiglu_clamp(&g32, &u32b, &g32, n * f, lim)?;
-                    o.to_f16(&g32, &hh, n * f)?;
+                    o.swiglu_gu_f16(&gu, &hh, n, f, lim)?;
                     let m4 = self.lap(p, "MoE f16: swiglu", m3);
                     o.dequant_f16(parts.down.2.code(), buf, parts.down.0, parts.down.1, d * f, &w16)?;
                     if let Some(r) = slot {

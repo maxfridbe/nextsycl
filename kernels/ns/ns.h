@@ -79,6 +79,7 @@ int ns_kda_scan(ns_gpu* g, const float* q, const float* k, const float* v, const
 int ns_kda_out(ns_gpu* g, const float* o, const float* gate, const float* w, float* y, int64_t T, int64_t H, int64_t d, float eps);
 /* FFN, MLA, experts */
 int ns_swiglu_clamp(ns_gpu* g, const float* gate, const float* up, float* out, int64_t n, float limit);
+int ns_swiglu_gu_f16(ns_gpu* g, const float* gu, uint16_t* out, int64_t T, int64_t F, float limit);
 int ns_mla_attend(ns_gpu* g, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale);
 /* the DSA indexer: pooled keys of the pools tokens [pos0, pos0 + T) complete (ring [4][2D]: the last tokens' ik | ig);
  * pool scores (S [T*H, n] = iq . pooled^T for pools [j0, j0 + n); score rows ld apart); top K per row; MLA over a

@@ -525,6 +525,14 @@ impl Ops {
         let rc = unsafe { (self.a().kda_out)(self.raw(), o.fp(), g.fp(), w.fp(), y.fp(), t as i64, h as i64, d as i64, eps) };
         self.ok(rc, "kda_out")
     }
+    /// out [t, f] (fp16) = swiglu of gu [t, 2f] (each row's gate, then its up), clamped like swiglu_clamp
+    pub fn swiglu_gu_f16(&self, gu: &DevBuf, out: &DevBuf, t: usize, f: usize, limit: f32) -> Result<()> {
+        need!(gu, t * 2 * f, "swiglu_gu gu");
+        out.bounds(0, t * f * 2)?;
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().swiglu_gu_f16)(self.raw(), gu.fp(), out.ptr.cast(), t as i64, f as i64, limit) };
+        self.ok(rc, "swiglu_gu_f16")
+    }
     pub fn swiglu_clamp(&self, gate: &DevBuf, up: &DevBuf, out: &DevBuf, n: usize, limit: f32) -> Result<()> {
         need!(gate, n, "swiglu gate");
         need!(up, n, "swiglu up");

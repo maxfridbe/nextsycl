@@ -586,6 +586,21 @@ int ns_kda_out(ns_gpu* g, const float* o, const float* gate, const float* w, flo
     NS_CATCH
 }
 
+// out [T, F] (fp16) = silu(min(g, limit)) * clamp(u, -limit, limit), gu [T, 2F] each row's gate then up (one
+// GEMM's output for a gate | up pair)
+int ns_swiglu_gu_f16(ns_gpu* g, const float* gu, uint16_t* out, int64_t T, int64_t F, float limit) {
+    NS_TRY
+    sycl::half* h = (sycl::half*) out;
+    g->q.parallel_for(sycl::range<2>(T, F), [=](sycl::id<2> id) {
+        const int64_t t = id[0], c = id[1];
+        const float a = sycl::fmin(gu[t * 2 * F + c], limit);
+        const float u = sycl::fmin(sycl::fmax(gu[t * 2 * F + F + c], -limit), limit);
+        h[t * F + c] = (sycl::half) (a / (1.f + sycl::exp(-a)) * u);
+    });
+    return 0;
+    NS_CATCH
+}
+
 // out = silu(min(gate, limit)) * clamp(up, -limit, limit); gate, up, out [n]
 int ns_swiglu_clamp(ns_gpu* g, const float* gate, const float* up, float* out, int64_t n, float limit) {
     NS_TRY
