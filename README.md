@@ -14,11 +14,16 @@ PCIe. It runs on one card or splits the layers over several.
 - **MTP speculative decoding:** the model's own draft block. Verify passes are bit-identical to one-token decode,
   so greedy output with MTP equals greedy output without it.
 - **Long context:** the DSA indexer past 2,048 tokens (each row attends to its top 512 pools of 4 tokens and its
-  own unfinished pool), checked against llama.cpp.
+  own unfinished pool), checked against llama.cpp; the latent cache in fp16 (64K of context per session by default).
+- **A prompt path on the XMX units:** prompts are read in chunks of 4,096 tokens, with the experts, the dense
+  matrices and MLA's attention in fp16 through oneMKL's half GEMMs, and the experts that live in host memory copied
+  on a second queue while the previous ones compute.
 - **A prompt cache:** checkpoints of the whole conversation state in host memory, at the end of a prompt's first
   turn, at the start of its last user turn, and at its end.
 - **An OpenAI-compatible server** with streaming and the thinking split out, run as a service: `nextsycl start`,
   `stop`, `status`, `ps`, `cache`, `chat`, `logs`, over a control socket.
+- **A record of each request:** `nextsycl inspect <id>` prints one as JSON (settings, timings, previews of the prompt
+  and the answer); the server keeps the last `NS_KEEP_REQUESTS` (100).
 - **`POST /api/chat` for web pages:** the same chat as JSON lines (`{"thinking": ...}`, `{"content": ...}`, then a
   `{"done": true, ...}` line with the timings), with CORS for loopback pages and the origins in `NS_CORS`.
 
@@ -54,6 +59,33 @@ ID     VIA     STATE        PROMPT           REUSED    READ  GENERATED   TOK/S F
 #4     tcp     done             23           0 none    0.9s       1502    13.8 stop      15m15s
 #2     web     done             19           0 none    0.8s         55    15.6 stop      17m23s
 ```
+
+## Speed
+
+GLM-5.3-Flash IQ2 (the ds4 file, 80 GB of experts) on an Arc Pro B70 and an Arc Pro B65, 6 October 2026:
+
+| | |
+|---|---|
+| prompt, 3K tokens | ~400 tokens/s |
+| prompt, 12K tokens | ~430-450 tokens/s |
+| decode, short context, MTP on | ~16.6 tokens/s (87-90% of drafts accepted) |
+| decode, MTP off | ~14.4 tokens/s |
+| load | ~18 s |
+
+About 60% of the experts fit in VRAM; the rest sit in pinned host memory. At decode a missed expert is swapped in
+over PCIe (both directions at once, on two copy queues, while the resident experts compute) - those swaps are about
+a third of decode time today, the next thing being worked on (`TODO.md`).
+
+## Checking it
+
+- `nextsycl check <model> <dump dir>`: the forward pass against a llama.cpp dump (`reference/llama-dump`), every
+  step compared by cosine, the next token and the top logits.
+- `nextsycl spec-check <model> --prompt-file F`: verify passes against one-token decode - must stay 0 difference
+  (greedy output with MTP equals greedy output without).
+- `NS_PROFILE=1 nextsycl generate ...`: seconds per section, the GPU synced at each boundary; `NS_PROFILE=gpu`: device
+  timestamps instead (no syncs - the honest view of decode, where sections are tens of microseconds).
+- Switches for A/B measurements: `NS_DENSE_F16=0`, `NS_PROMPT_F16_MIN`, `NS_PREFILL_CHUNK`, `NS_HC_FUSED=0`,
+  `NS_DECODE_LANES`, `NS_DECODE_DIRECT=1`, `NS_ARENA_MIB`.
 
 ## Standing on
 
