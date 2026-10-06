@@ -3,3 +3,4 @@ target/
 __pycache__/
 nextsycl.conf
 dist/
+benchy-results/

@@ -122,6 +122,27 @@ queues, while the resident experts compute; the next layer's likely experts pref
 those swaps are still the largest share of decode time (`TODO.md`). `--gpu all` puts the GPU that computes most last
 (it takes the head and the draft block); `NS_SPLIT` sets the layers per GPU.
 
+## Benchy
+
+`nextsycl bench` runs Strata's benchy v1 (its prompts as text in `bench/v1`) against the running server, and sends
+several requests at once. The first run, `docs/benchy/v1-2026-10-06.md` (B65 + B70):
+
+| Input tokens | PP (tok/s) | TTFT (s) | TG (tok/s) | Drafts accepted | Energy (J) | Avg power (W) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 31 | - | 1.3 | 17.5 | 91% | 1,422 | 161 |
+| 2,216 | 337 | 7.0 | 15.7 | 78% | 3,919 | 171 |
+| 7,975 | 334 | 24.5 | 15.3 | 77% | 6,904 | 170 |
+| 39,758 | 427 | 93.6 | 15.6 | 75% | 20,464 | 187 |
+
+| Clients at once | Tokens/s, all | Latency mean / max (s) | First token mean / max (s) |
+|---:|---:|---:|---:|
+| 1 | 16.9 | 15.1 / 15.1 | 1.1 / 1.1 |
+| 2 | 17.4 | 19.2 / 24.1 | 8.2 / 15.4 |
+| 4 | 17.3 | 25.6 / 39.3 | 16.8 / 32.1 |
+
+The server runs one request at a time, so several at once share its speed (each card is ~55% busy at decode: the
+room batching would use).
+
 ## Checking it
 
 - `nextsycl check <model> <dump dir>`: the forward pass against a llama.cpp dump (`reference/llama-dump`), every

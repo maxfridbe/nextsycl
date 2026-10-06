@@ -56,10 +56,18 @@ by default (`--no-mtp` turns it off).
       the prompt arena's VRAM lent to experts at decode, the strongest GPU last
 - [x] Expert cache policy studied offline (reference/expert-cache): LRU is the best simple policy; the rest of the
       gap to Belady needs better prediction
-- [ ] Swaps are still ~1/3 of decode time (both cards on Gen5 x8). If the B70 moves to an x16 slot and the B65 to
-      Gen4 x4: NS_SPLIT=15 (B65's layers all resident) - simulated copy time 2/3 of today's best; then measure
+- [ ] Swaps are still ~1/3 of decode time (both cards on Gen5 x8)
 - [ ] Better expert prediction (now ~54% of guesses used): the router of l+1 on a later state, or two layers ahead
 - [ ] Two requests at once would use both cards at the same time (each is ~55% busy at decode today)
+
+## To try
+
+- [ ] Swap the cards' slots: the B70 to the x16 slot, the B65 to Gen4 x4 - then NS_SPLIT=15 (the B65's 12 MoE layers
+      all resident, no swaps over its slow link; the B70's swaps on x16). Simulated (reference/expert-cache/splits.py)
+      copy time a pass 5.9 ms vs 8.8 at today's best; with today's even split it would be 18.6 (worse). Measure with
+      `nextsycl bench` after.
+- [ ] Several requests at once (benchy: 1, 2, 4 clients all ~17 tok/s together - one request at a time today):
+      batch decode passes across sessions.
 
 ## Speed, later
 

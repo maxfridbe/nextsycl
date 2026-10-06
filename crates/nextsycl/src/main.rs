@@ -10,6 +10,7 @@
 //!                                     the forward pass on a reference dump's prompt (reference/llama-dump), every
 //!                                     step compared: cosine and relative error per tensor, then the next token
 
+mod bench;
 mod cache;
 mod client;
 mod config;
@@ -43,6 +44,8 @@ the server (over its socket):
   nextsycl status [--no-stream] live, like docker stats: the model, its GPUs, the request running, the prompt cache
   nextsycl ps [-a]              the request running and the last ones
   nextsycl inspect <id>         one request (an ID from ps) as JSON: settings, messages, timings, previews
+  nextsycl bench [--sizes 20,2185,8000,40000] [--new 256] [--parallel 1,2,4] [--out DIR]
+                                benchy v1 against the running server, and several requests at once (matrix.md)
   nextsycl cache [ls | clear]   the prompt cache's checkpoints
   nextsycl chat <text> [--effort E] [--max N] [--temp T]
                                 one request, streamed
@@ -665,6 +668,7 @@ fn main() -> ExitCode {
         Some("status") => client::status(rest),
         Some("ps") => client::ps(rest),
         Some("inspect") => client::inspect(rest),
+        Some("bench") => bench::bench(rest),
         Some("cache") => client::cache(rest),
         Some("chat") => client::chat(rest),
         Some("version") => {
