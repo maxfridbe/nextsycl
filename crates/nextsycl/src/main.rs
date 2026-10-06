@@ -449,8 +449,8 @@ fn generate(args: &[String]) -> Result<(), String> {
     for (i, (peak, spills)) in glm.arena_peaks().iter().enumerate() {
         eprintln!("[arena {i}: peak {:.2} GiB, {spills} request(s) past it]", *peak as f64 / (1u64 << 30) as f64);
     }
-    let (hits, misses, mirrored, direct) = glm.expert_stats();
-    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); drafts {} of {} accepted; experts: {hits} VRAM hits, {direct} read from host memory by prompt passes, {misses} swapped in ({mirrored} of them from host memory)]",
+    let (hits, misses, mirrored, direct, pf, pf_used) = glm.expert_stats();
+    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); drafts {} of {} accepted; experts: {hits} VRAM hits, {direct} read from host memory by prompt passes, {misses} swapped in ({mirrored} of them from host memory), {pf} prefetched ({pf_used} of them asked for)]",
               ids.len(), ids.len() as f64 / prefill, n as f64 / dt.max(1e-9), dec.accepted, dec.drafted);
     Ok(())
 }

@@ -36,7 +36,7 @@ pub struct Api {
     pub copy_from: unsafe extern "C" fn(Gpu, *mut c_void, *const c_void, usize) -> c_int,
     pub copy_dev: unsafe extern "C" fn(Gpu, *mut c_void, *const c_void, usize) -> c_int,
     pub mark: unsafe extern "C" fn(Gpu, *mut i64) -> c_int,
-    pub stream_copy: unsafe extern "C" fn(Gpu, *mut c_void, *const c_void, usize, i64, i64, c_int, *mut i64) -> c_int,
+    pub stream_copy: unsafe extern "C" fn(Gpu, *mut c_void, *const c_void, usize, *const i64, c_int, c_int, *mut i64) -> c_int,
     pub await_: unsafe extern "C" fn(Gpu, i64) -> c_int,
     pub stamp: unsafe extern "C" fn(Gpu, *mut i64) -> c_int,
     pub elapsed: unsafe extern "C" fn(Gpu, i64, i64, *mut f64) -> c_int,

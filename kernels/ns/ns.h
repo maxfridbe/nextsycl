@@ -41,7 +41,7 @@ int ns_copy_to(ns_gpu* g, void* dst, const void* src_host, size_t bytes);
 int ns_copy_from(ns_gpu* g, void* dst_host, const void* src, size_t bytes);
 int ns_copy_dev(ns_gpu* g, void* dst, const void* src, size_t bytes);
 int ns_mark(ns_gpu* g, int64_t* ticket);
-int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, int64_t after, int64_t after2, int lane, int64_t* ticket);
+int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, const int64_t* after, int ndeps, int lane, int64_t* ticket);
 int ns_await(ns_gpu* g, int64_t ticket);
 int ns_stamp(ns_gpu* g, int64_t* ticket);
 int ns_elapsed(ns_gpu* g, int64_t t0, int64_t t1, double* ns);

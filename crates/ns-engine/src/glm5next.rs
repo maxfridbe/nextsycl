@@ -38,6 +38,13 @@ fn f16_min() -> usize {
 /// The widest dense matrix input the fp16 path takes (MLA's output projection: 64 heads of 256)
 const X16_COLS: usize = 16384;
 
+/// Experts swapped in ahead of their layer, at most, a layer (NS_PREFETCH, default 2: about half the guesses are
+/// right - decode +2%; more guesses cost more PCIe than they save; 0 = none)
+fn prefetch_limit() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
+}
+
 /// Whether the dense matrices take the fp16 path too (NS_DENSE_F16=0: only the experts)
 fn dense_f16() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -143,6 +150,13 @@ struct Store {
     /// of all (what reads host slots in place waits for)
     rwrite: HashMap<usize, i64>,
     down_any: Option<i64>,
+    /// per VRAM slot, the copy up that last filled it (a copy down out of it waits for that); the last copy up
+    vfill: HashMap<usize, i64>,
+    last_up: Option<i64>,
+    /// experts swapped in ahead of their layer (`prefetch`), not yet asked for: their copy up's ticket
+    prefetched: HashMap<(u64, u64), i64>,
+    pf_issued: u64,
+    pf_used: u64,
 }
 
 impl Store {
@@ -486,7 +500,8 @@ impl Part {
             vowner[i] = Some(*k);
         }
         let store = Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree, tick: 0, hits: 0, misses: 0, from_host: 0, direct: 0,
-                            rwrite: HashMap::new(), down_any: None };
+                            rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(), last_up: None, prefetched: HashMap::new(),
+                            pf_issued: 0, pf_used: 0 };
         let arena = Arena::new(gpu, arena_bytes())?;
         Ok(Part { ops, arena, layers, mats, vecs, scratch, x16, q8, experts: Mutex::new(store), eh, expert_slots: nv, host_slots: nr, weight_bytes: bytes })
     }
@@ -573,79 +588,39 @@ impl Part {
         let tick = c.tick;
         let mut missing = Vec::new();
         let mut pending: Vec<(u64, u64)> = Vec::new();
-        let mut last: Option<i64> = None; // the last copy up (lane 1)
-        // a host slot's copy up in this call, still reading it: a copy down into it waits for that (the copies
-        // up of earlier calls are done - the GPU's queue awaited them)
+        let mut last: Option<i64> = None; // the latest copy up these experts wait for (lane 1 is in order)
         let mut reading: HashMap<usize, i64> = HashMap::new();
         for &ex in need {
             match c.loc.get(&(l, ex)).copied() {
                 Some(Loc::V(s)) => {
                     c.hits += 1;
                     c.vused[s] = tick;
+                    if let Some(tk) = c.prefetched.remove(&(l, ex)) {
+                        // swapped in ahead: its copy may still be on its way
+                        c.pf_used += 1;
+                        pending.push((l, ex));
+                        last = last.max(Some(tk));
+                    }
                 }
                 Some(Loc::R(_)) if !promote => {}
                 _ => missing.push(ex),
             }
         }
+        // this layer's other guesses stay resident, as any expert would
+        c.prefetched.retain(|k, _| k.0 != l);
         if !missing.is_empty() {
             let mut order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick).collect();
             order.sort_by_key(|&i| if c.vowner[i].is_none() { 0 } else { c.vused[i] + 1 });
-            let parts = expert_parts(m, l)?;
             let mut buf: Option<Vec<u8>> = None;
             // the copies wait for what the GPU's queue holds so far (a kernel may still read a victim's slot)
             let after = Some(self.ops.mark()?);
             for (ex, &s) in missing.iter().zip(&order) {
                 c.misses += 1;
-                let key = (l, *ex);
-                let (vch, vo) = c.vat(s);
-                let from = c.loc.get(&key).copied();
-                let mut down: Option<i64> = None;
-                // 1. the victim down to a free host slot (when there is one; else it is only on the file again)
-                if let Some(v) = c.vowner[s].take() {
-                    c.loc.remove(&v);
-                    // the wanted expert's own host slot frees below, so a full host side still has room after it
-                    if let Some(f) = c.rfree.pop() {
-                        let (rch, ro) = c.rat(f);
-                        let sb = c.slot_bytes;
-                        down = Some(self.ops.stream_copy_on(0, &c.host[rch].device_view(ro, sb)?, 0, &c.vram[vch], vo, sb,
-                                                            [after, reading.get(&f).copied()])?);
-                        c.rwrite.insert(f, down.unwrap());
-                        c.down_any = down;
-                        c.loc.insert(v, Loc::R(f));
-                    }
+                if let Some(up) = self.swap_in(m, c, l, *ex, s, after, &mut reading, &mut buf)? {
+                    last = last.max(Some(up));
+                    pending.push((l, *ex));
                 }
-                // 2. the wanted expert up
-                match from {
-                    Some(Loc::R(r)) => {
-                        c.from_host += 1;
-                        let (rch, ro) = c.rat(r);
-                        let sb = c.slot_bytes;
-                        // after the victim's copy out of the same slot (the copy queue is in order); the host slot
-                        // goes back to the free list - a later copy into it queues behind this one
-                        // after the victim's copy out of this VRAM slot (which follows `after`) - else `after` - and
-                        // after whatever copy down last wrote the host slot
-                        let up = self.ops.stream_copy_on(1, &c.vram[vch], vo, &c.host[rch].device_view(ro, sb)?, 0, sb,
-                                                         [down.or(after), c.rwrite.get(&r).copied()])?;
-                        reading.insert(r, up);
-                        last = Some(up);
-                        pending.push(key);
-                        c.rfree.push(r);
-                    }
-                    _ => {
-                        // from the file (rare: the store holds every expert): a plain write, once the copies so far
-                        // (one may be this slot's victim going down) are done
-                        for t in [last, c.down_any].into_iter().flatten() {
-                            self.ops.await_ticket(t)?;
-                        }
-                        self.ops.gpu.sync()?;
-                        let b = buf.get_or_insert_with(|| vec![0u8; c.slot_bytes]);
-                        read_expert(m, l, *ex, &parts, b)?;
-                        c.vram[vch].write(vo, b)?;
-                    }
-                }
-                c.vowner[s] = Some(key);
                 c.vused[s] = tick;
-                c.loc.insert(key, Loc::V(s));
             }
         }
         let sb = c.slot_bytes;
@@ -669,6 +644,90 @@ impl Part {
             }
         }
         Ok((slots, arriving, last))
+    }
+
+    /// Expert `(l, ex)` into VRAM slot `s`: the slot's expert down to a free host slot (if there is one; else it is
+    /// on the file only again), then the wanted one up from its host slot - on the copy lanes, after `after` and
+    /// whatever copies those slots still wait for. The copy up's ticket; None when it came from the file (written in
+    /// place, waited for).
+    #[allow(clippy::too_many_arguments)]
+    fn swap_in(&self, m: &Model, c: &mut Store, l: u64, ex: u64, s: usize, after: Option<i64>, reading: &mut HashMap<usize, i64>,
+               buf: &mut Option<Vec<u8>>) -> Result<Option<i64>> {
+        let key = (l, ex);
+        let (vch, vo) = c.vat(s);
+        let sb = c.slot_bytes;
+        let from = c.loc.get(&key).copied();
+        let fill = c.vfill.get(&s).copied(); // a copy up into this slot that may still run
+        let mut down: Option<i64> = None;
+        if let Some(v) = c.vowner[s].take() {
+            c.loc.remove(&v);
+            c.prefetched.remove(&v);
+            // the wanted expert's own host slot frees below, so a full host side still has room after it
+            if let Some(f) = c.rfree.pop() {
+                let (rch, ro) = c.rat(f);
+                let t = self.ops.stream_copy_on(0, &c.host[rch].device_view(ro, sb)?, 0, &c.vram[vch], vo, sb, &[after, reading.get(&f).copied(), fill])?;
+                down = Some(t);
+                c.rwrite.insert(f, t);
+                c.down_any = Some(t);
+                c.loc.insert(v, Loc::R(f));
+            }
+        }
+        let up = match from {
+            Some(Loc::R(r)) => {
+                c.from_host += 1;
+                let (rch, ro) = c.rat(r);
+                // after the slot's copy down (which follows `after`) - else `after` - and after whatever copy down
+                // last wrote the host slot; the host slot goes back to the free list (a copy into it queues behind)
+                let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &c.host[rch].device_view(ro, sb)?, 0, sb, &[down.or(after), c.rwrite.get(&r).copied()])?;
+                reading.insert(r, t);
+                c.rfree.push(r);
+                c.vfill.insert(s, t);
+                c.last_up = Some(t);
+                Some(t)
+            }
+            _ => {
+                // from the file (rare: the store holds every expert): a plain write, once every copy so far is done
+                for t in [c.last_up, c.down_any].into_iter().flatten() {
+                    self.ops.await_ticket(t)?;
+                }
+                self.ops.gpu.sync()?;
+                let parts = expert_parts(m, l)?;
+                let b = buf.get_or_insert_with(|| vec![0u8; sb]);
+                read_expert(m, l, ex, &parts, b)?;
+                c.vram[vch].write(vo, b)?;
+                c.vfill.remove(&s);
+                None
+            }
+        };
+        c.vowner[s] = Some(key);
+        c.loc.insert(key, Loc::V(s));
+        Ok(up)
+    }
+
+    /// Decode: the experts layer `l` is expected to want (its router on the layer before's input), swapped in now so
+    /// they arrive while the layer's attention runs. Only ones in host memory; the layer being computed (this tick)
+    /// keeps its experts; at most `limit`.
+    fn prefetch(&self, m: &Model, l: u64, want: &[u64], limit: usize) -> Result<()> {
+        let mut c = self.experts.lock().unwrap();
+        let c = &mut *c;
+        let tick = c.tick;
+        let cand: Vec<u64> = want.iter().copied().filter(|ex| matches!(c.loc.get(&(l, *ex)), Some(Loc::R(_)))).take(limit).collect();
+        if cand.is_empty() {
+            return Ok(());
+        }
+        let mut order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick).collect();
+        order.sort_by_key(|&i| if c.vowner[i].is_none() { 0 } else { c.vused[i] + 1 });
+        let after = Some(self.ops.mark()?);
+        let mut reading: HashMap<usize, i64> = HashMap::new();
+        let mut buf = None;
+        for (ex, &s) in cand.iter().zip(&order) {
+            if let Some(up) = self.swap_in(m, c, l, *ex, s, after, &mut reading, &mut buf)? {
+                c.prefetched.insert((l, *ex), up);
+                c.pf_issued += 1;
+            }
+            c.vused[s] = tick; // not a victim for the rest of this layer's guesses
+        }
+        Ok(())
     }
 
     /// Several matrices on the same input x [t, cols]: one Q8_1 quantization of x serves every decode product.
@@ -777,10 +836,11 @@ impl<'g> Glm<'g> {
 
     /// (VRAM hits, misses (swaps), swaps served from pinned host memory, host-slot experts a prompt pass read from
     /// pinned memory) so far
-    pub fn expert_stats(&self) -> (u64, u64, u64, u64) {
-        self.parts.iter().fold((0, 0, 0, 0), |a, p| {
+    /// (VRAM hits, swaps, of them from host memory, host-memory reads by prompt passes, prefetched, prefetches used)
+    pub fn expert_stats(&self) -> (u64, u64, u64, u64, u64, u64) {
+        self.parts.iter().fold((0, 0, 0, 0, 0, 0), |a, p| {
             let c = p.experts.lock().unwrap();
-            (a.0 + c.hits, a.1 + c.misses, a.2 + c.from_host, a.3 + c.direct)
+            (a.0 + c.hits, a.1 + c.misses, a.2 + c.from_host, a.3 + c.direct, a.4 + c.pf_issued, a.5 + c.pf_used)
         })
     }
 
@@ -1536,6 +1596,14 @@ impl<'g> Glm<'g> {
         let (d, ne, used) = (g.n_embd as usize, g.n_expert as usize, g.n_expert_used as usize);
         let lim = g.swiglu_limit as f32;
         let logits = self.timed(p, "router", || p.mm(l, Role::Router, x, t))?;
+        // decode: the next layer's router on this layer's input - a guess at its experts, so the missing ones can be
+        // on their way while its attention runs (NS_PREFETCH: at most that many a layer; 0 = off)
+        let pf = prefetch_limit();
+        let guess = if t <= MMVQ_COLS && pf > 0 && p.mat(l + 1, Role::Router).is_ok() {
+            Some(p.mm(l + 1, Role::Router, x, t)?)
+        } else {
+            None
+        };
         tap(&format!("ffn_moe_logits-{l}"), &logits)?;
         let tw = Instant::now();
         let lv = logits.to_f32()?;
@@ -1788,6 +1856,23 @@ impl<'g> Glm<'g> {
             ints_view.copy_within(0, &ib, base * 4, (t + 1 + total) * 4)?;
             o.moe_combine(&y, &dn, &ints_view, &wb, t, total, d)
         })?;
+        if let Some(gl) = guess {
+            let (gv, gb) = (gl.to_f32()?, p.vec(l + 1, Role::RouterBias)?.to_f32()?);
+            // per row its top `used` by score (as the router picks), the rows' best first
+            let mut score: BTreeMap<usize, f32> = BTreeMap::new();
+            for ti in 0..t {
+                let pr: Vec<f32> = gv[ti * ne..(ti + 1) * ne].iter().map(|z| 1.0 / (1.0 + (-z).exp())).collect();
+                let mut order: Vec<usize> = (0..ne).collect();
+                order.sort_by(|a, b| (pr[*b] + gb[*b]).total_cmp(&(pr[*a] + gb[*a])));
+                for &e in &order[..used] {
+                    *score.entry(e).or_default() += pr[e] + gb[e];
+                }
+            }
+            let mut want: Vec<(usize, f32)> = score.into_iter().collect();
+            want.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let want: Vec<u64> = want.into_iter().map(|(e, _)| e as u64).collect();
+            self.timed(p, "expert prefetch", || p.prefetch(&self.m, l + 1, &want, pf))?;
+        }
         Ok(y)
     }
 }

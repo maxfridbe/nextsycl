@@ -362,19 +362,20 @@ impl Ops {
     /// n bytes of src (from src_at) into dst (from at) on the GPU's copy queue, beside its work, after ticket
     /// `after`: the copy's ticket
     pub fn stream_copy(&self, dst: &DevBuf, at: usize, src: &DevBuf, src_at: usize, n: usize, after: Option<i64>) -> Result<i64> {
-        self.stream_copy_on(0, dst, at, src, src_at, n, [after, None])
+        self.stream_copy_on(0, dst, at, src, src_at, n, &[after])
     }
-    /// `stream_copy` on copy lane `lane` (0 or 1: the two run side by side - one PCIe direction each), after
-    /// both tickets of `after`
+    /// `stream_copy` on copy lane `lane` (0 or 1: the two run side by side - one PCIe direction each), after every
+    /// ticket of `after`
     #[allow(clippy::too_many_arguments)]
-    pub fn stream_copy_on(&self, lane: i32, dst: &DevBuf, at: usize, src: &DevBuf, src_at: usize, n: usize, after: [Option<i64>; 2]) -> Result<i64> {
+    pub fn stream_copy_on(&self, lane: i32, dst: &DevBuf, at: usize, src: &DevBuf, src_at: usize, n: usize, after: &[Option<i64>]) -> Result<i64> {
+        let deps: Vec<i64> = after.iter().flatten().copied().collect();
         dst.bounds(at, n)?;
         src.bounds(src_at, n)?;
         let mut t = 0i64;
         // SAFETY: both ranges in bounds (checked); t is a valid out pointer.
         let rc = unsafe {
-            (self.a().stream_copy)(self.raw(), dst.ptr.cast::<u8>().add(at).cast(), src.ptr.cast::<u8>().add(src_at).cast(), n, after[0].unwrap_or(-1),
-                                   after[1].unwrap_or(-1), lane, &mut t)
+            (self.a().stream_copy)(self.raw(), dst.ptr.cast::<u8>().add(at).cast(), src.ptr.cast::<u8>().add(src_at).cast(), n, deps.as_ptr(),
+                                   deps.len() as i32, lane, &mut t)
         };
         self.ok(rc, "stream_copy")?;
         Ok(t)

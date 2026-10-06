@@ -151,12 +151,11 @@ int ns_mark(ns_gpu* g, int64_t* ticket) {
     NS_CATCH
 }
 
-// bytes from src to dst on copy lane `lane` (0 or 1), after tickets `after` and `after2` (< 0: none); its own ticket
-int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, int64_t after, int64_t after2, int lane, int64_t* ticket) {
+// bytes from src to dst on copy lane `lane` (0 or 1), after the `ndeps` tickets `deps`; its own ticket
+int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, const int64_t* after, int ndeps, int lane, int64_t* ticket) {
     NS_TRY
     std::vector<sycl::event> deps;
-    if (after >= 0) deps.push_back(g->ev[after % g->ev.size()]);
-    if (after2 >= 0) deps.push_back(g->ev[after2 % g->ev.size()]);
+    for (int i = 0; i < ndeps; ++i) deps.push_back(g->ev[after[i] % g->ev.size()]);
     sycl::queue& q = lane ? g->cq2 : g->cq;
     *ticket = keep(g, q.memcpy(dst, src, bytes, deps));
     return 0;
