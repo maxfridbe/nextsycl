@@ -43,7 +43,7 @@ pub struct Api {
     pub gemm: unsafe extern "C" fn(Gpu, i64, i64, i64, *const f32, i64, *const f32, *mut f32, i64, c_int) -> c_int,
     pub rms_norm: unsafe extern "C" fn(Gpu, *const f32, *const f32, *mut f32, i64, i64, f32) -> c_int,
     pub layer_norm: unsafe extern "C" fn(Gpu, *const f32, *const f32, *const f32, *mut f32, i64, i64, f32) -> c_int,
-    pub hc_pre: unsafe extern "C" fn(Gpu, *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32, i64, i64, f32, c_int) -> c_int,
+    pub hc_pre: unsafe extern "C" fn(Gpu, *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32, *mut f32, i64, i64, f32, c_int) -> c_int,
     pub hc_post: unsafe extern "C" fn(Gpu, *const f32, *const f32, *const f32, *const f32, *mut f32, i64, i64) -> c_int,
     pub hc_mean: unsafe extern "C" fn(Gpu, *const f32, *mut f32, i64, i64) -> c_int,
     pub conv_silu: unsafe extern "C" fn(Gpu, *const f32, *mut f32, *const f32, *mut f32, i64, i64, c_int) -> c_int,

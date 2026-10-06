@@ -256,10 +256,9 @@ int ns_layer_norm(ns_gpu* g, const float* x, const float* w, const float* b, flo
 // mHC, before a half: from the mixes m [T, 24] (fn . rms(flatten X)) and X [T, 4, C]:
 //   h [T, C] = sum_s pre[s] X[s];  post [T, 4];  comb [T, 16] (comb[dst + 4 src]), Sinkhorn-normalized
 int ns_hc_pre(ns_gpu* g, const float* m, const float* scale, const float* base, const float* X, float* h, float* post, float* comb,
-              int64_t T, int64_t C, float eps, int iters) {
+              float* pre, int64_t T, int64_t C, float eps, int iters) {
     NS_TRY
     auto& q = g->q;
-    float* pre = sycl::malloc_device<float>(T * 4, q);
     q.parallel_for(sycl::range<1>(T), [=](sycl::id<1> id) {
         const int64_t t = id[0];
         const float* mt = m + t * 24;
@@ -301,8 +300,6 @@ int ns_hc_pre(ns_gpu* g, const float* m, const float* scale, const float* base, 
         for (int i = 0; i < 4; ++i) s += pre[t * 4 + i] * X[(t * 4 + i) * C + k];
         h[t * C + k] = s;
     });
-    q.wait();
-    sycl::free(pre, q);
     return 0;
     NS_CATCH
 }

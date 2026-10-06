@@ -112,6 +112,8 @@ pub struct DevBuf {
     gpu: Arc<Gpu>,
     ptr: *mut c_void,
     pub len: usize,
+    /// false for a view (`view`, an `Arena`'s): the owner frees the memory
+    owned: bool,
 }
 
 // SAFETY: a device pointer; access goes through the GPU's queue.
@@ -120,8 +122,10 @@ unsafe impl Sync for DevBuf {}
 
 impl Drop for DevBuf {
     fn drop(&mut self) {
-        // SAFETY: allocated by this GPU; the queue is in order, so work queued on the buffer runs first.
-        unsafe { (self.gpu.api.free)(self.gpu.raw, self.ptr) };
+        if self.owned {
+            // SAFETY: allocated by this GPU; the queue is in order, so work queued on the buffer runs first.
+            unsafe { (self.gpu.api.free)(self.gpu.raw, self.ptr) };
+        }
     }
 }
 
@@ -130,7 +134,7 @@ impl DevBuf {
         let mut ptr = std::ptr::null_mut();
         // SAFETY: an out-pointer to a local.
         check(gpu.api, unsafe { (gpu.api.alloc)(gpu.raw, len.max(1), &mut ptr) }, &format!("allocating {len} bytes on {}", gpu.name))?;
-        Ok(DevBuf { gpu: gpu.clone(), ptr, len })
+        Ok(DevBuf { gpu: gpu.clone(), ptr, len, owned: true })
     }
     pub fn ptr(&self) -> *mut c_void {
         self.ptr
@@ -324,8 +328,9 @@ impl Ops {
         self.ok(rc, "layer_norm")
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn hc_pre(&self, m: &DevBuf, scale: &DevBuf, base: &DevBuf, x: &DevBuf, h: &DevBuf, post: &DevBuf, comb: &DevBuf, t: usize, c: usize,
+    pub fn hc_pre(&self, m: &DevBuf, scale: &DevBuf, base: &DevBuf, x: &DevBuf, h: &DevBuf, post: &DevBuf, comb: &DevBuf, pre: &DevBuf, t: usize, c: usize,
                   eps: f32, iters: u32) -> Result<()> {
+        need!(pre, t * 4, "hc_pre pre");
         need!(m, t * 24, "hc_pre m");
         need!(scale, 3, "hc_pre scale");
         need!(base, 24, "hc_pre base");
@@ -334,7 +339,7 @@ impl Ops {
         need!(post, t * 4, "hc_pre post");
         need!(comb, t * 16, "hc_pre comb");
         // SAFETY: sizes checked.
-        let rc = unsafe { (self.a().hc_pre)(self.raw(), m.fp(), scale.fp(), base.fp(), x.fp(), h.fp(), post.fp(), comb.fp(), t as i64, c as i64, eps, iters as i32) };
+        let rc = unsafe { (self.a().hc_pre)(self.raw(), m.fp(), scale.fp(), base.fp(), x.fp(), h.fp(), post.fp(), comb.fp(), pre.fp(), t as i64, c as i64, eps, iters as i32) };
         self.ok(rc, "hc_pre")
     }
     pub fn hc_post(&self, y: &DevBuf, x: &DevBuf, post: &DevBuf, comb: &DevBuf, xo: &DevBuf, t: usize, c: usize) -> Result<()> {
@@ -534,5 +539,49 @@ impl DevBuf {
         let g = &self.gpu;
         // SAFETY: both ranges in bounds (checked), same GPU and context.
         check(g.api, unsafe { (g.api.copy_dev)(g.raw, self.ptr.cast::<u8>().add(at).cast(), src.ptr.cast::<u8>().add(src_at).cast(), n) }, "copying on the GPU")
+    }
+}
+
+impl DevBuf {
+    /// Bytes `[at, at + len)` of this buffer as a buffer of its own that does not free them. The caller keeps the
+    /// owner alive while the view is used.
+    pub fn view(&self, at: usize, len: usize) -> Result<DevBuf> {
+        self.bounds(at, len)?;
+        // SAFETY: in bounds (checked).
+        Ok(DevBuf { gpu: self.gpu.clone(), ptr: unsafe { self.ptr.cast::<u8>().add(at).cast() }, len, owned: false })
+    }
+}
+
+/// A bump allocator over one device allocation: temporaries without a `malloc_device` each. `reset` makes all of it
+/// free again - the caller resets only when no view of it is in use (the queue is in order, so work already queued
+/// on the old views runs before work on the new ones). Requests that do not fit get an allocation of their own.
+pub struct Arena {
+    buf: DevBuf,
+    off: std::sync::Mutex<usize>,
+    /// the most used between resets, and the requests that did not fit
+    pub peak: std::sync::atomic::AtomicUsize,
+    pub spills: std::sync::atomic::AtomicUsize,
+}
+
+impl Arena {
+    pub fn new(gpu: &Arc<Gpu>, bytes: usize) -> Result<Arena> {
+        Ok(Arena { buf: DevBuf::new(gpu, bytes)?, off: std::sync::Mutex::new(0), peak: 0.into(), spills: 0.into() })
+    }
+    pub fn bytes(&self, n: usize) -> Result<DevBuf> {
+        let mut off = self.off.lock().unwrap();
+        let at = off.next_multiple_of(256);
+        if at + n > self.buf.len {
+            self.spills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return DevBuf::new(&self.buf.gpu, n);
+        }
+        *off = at + n;
+        self.peak.fetch_max(*off, std::sync::atomic::Ordering::Relaxed);
+        self.buf.view(at, n.max(1).min(self.buf.len - at))
+    }
+    pub fn f32(&self, n: usize) -> Result<DevBuf> {
+        self.bytes(n * 4)
+    }
+    pub fn reset(&self) {
+        *self.off.lock().unwrap() = 0;
     }
 }

@@ -56,7 +56,7 @@ int ns_rms_norm(ns_gpu* g, const float* x, const float* w, float* y, int64_t row
 int ns_layer_norm(ns_gpu* g, const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t C, float eps);
 /* mHC (docs/glm5next.md): m [T, 24] mixes; X [T, 4, C]; h [T, C]; post [T, 4]; comb [T, 16] */
 int ns_hc_pre(ns_gpu* g, const float* m, const float* scale, const float* base, const float* X, float* h, float* post, float* comb,
-              int64_t T, int64_t C, float eps, int iters);
+              float* pre, int64_t T, int64_t C, float eps, int iters);   /* pre [T, 4]: scratch */
 int ns_hc_post(ns_gpu* g, const float* y, const float* X, const float* post, const float* comb, float* Xo, int64_t T, int64_t C);
 int ns_hc_mean(ns_gpu* g, const float* X, float* y, int64_t T, int64_t C);
 /* KDA */

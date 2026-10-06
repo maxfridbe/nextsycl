@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ns_core::{DevBuf, Error, Gpu, HostBuf, Ops, Result};
+use ns_core::{Arena, DevBuf, Error, Gpu, HostBuf, Ops, Result};
 use ns_gguf::{GType, Gguf};
 use ns_model::glm5next::{Model, Role, Scheme};
 
@@ -92,6 +92,8 @@ impl Store {
 /// One GPU's share of the model.
 pub struct Part {
     ops: Ops,
+    /// the forward pass's temporaries, reset at each layer
+    pub arena: Arena,
     pub layers: Range<u64>,
     mats: BTreeMap<(u64, Role), Mat>,
     vecs: BTreeMap<(u64, Role), DevBuf>,
@@ -310,7 +312,8 @@ impl Part {
             vowner[i] = Some(*k);
         }
         let store = Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree, tick: 0, hits: 0, misses: 0, from_host: 0 };
-        Ok(Part { ops, layers, mats, vecs, scratch, q8, experts: Mutex::new(store), expert_slots: nv, host_slots: nr, weight_bytes: bytes })
+        let arena = Arena::new(gpu, 1 << 30)?;
+        Ok(Part { ops, arena, layers, mats, vecs, scratch, q8, experts: Mutex::new(store), expert_slots: nv, host_slots: nr, weight_bytes: bytes })
     }
 
     fn mat(&self, l: u64, r: Role) -> Result<&Mat> {
@@ -345,7 +348,7 @@ impl Part {
     /// y [t, rows] = x [t, cols] . W^T (contiguous)
     fn mm(&self, l: u64, r: Role, x: &DevBuf, t: usize) -> Result<DevBuf> {
         let w = self.mat(l, r)?;
-        let y = DevBuf::f32(&self.ops.gpu, t * w.rows)?;
+        let y = self.arena.f32(t * w.rows)?;
         self.matmul(w, t, (x, 0, w.cols), (&y, 0, w.rows), false)?;
         Ok(y)
     }
@@ -426,7 +429,7 @@ impl Part {
         if t <= MMVQ_COLS && quantized > 1 && ws.iter().all(|w| w.cols == cols) && cols <= MAX_COLS {
             self.ops.quantize_q8_1((x, 0), &self.q8, cols, t)?;
             return ws.iter().map(|w| {
-                let y = DevBuf::f32(&self.ops.gpu, t * w.rows)?;
+                let y = self.arena.f32(t * w.rows)?;
                 if !w.f32 && self.ops.mmvq_supported(w.ty.code()) {
                     self.ops.mmvq(w.ty.code(), (&w.buf, 0), w.buf.len, &self.q8, (&y, 0), w.cols, w.rows, t)?;
                 } else {
@@ -580,38 +583,49 @@ impl<'g> Glm<'g> {
                 xs[(ti * 4 + s) * d..(ti * 4 + s + 1) * d].copy_from_slice(&e0[ti * d..(ti + 1) * d]);
             }
         }
-        let mut x = DevBuf::from_f32(&p0.ops.gpu, &xs)?;
-        tap("hc_init", &x)?;
+        let x_init = DevBuf::from_f32(&p0.ops.gpu, &xs)?;
+        tap("hc_init", &x_init)?;
         let mut staging = vec![0u8; t * 4 * d * 4];
 
+        // the stream rotates through three buffers per GPU (a layer's input, after its attention, after its FFN);
+        // every other temporary of a layer comes from the part's arena, reset at the layer's start
         let mut cur = usize::MAX;
-        let mut ws: Option<[DevBuf; 5]> = None; // flat, h, normed, post, comb on the current part's GPU
+        let mut ring: Vec<DevBuf> = Vec::new();
+        let mut ix = 0usize;
+        let mut ws: Option<[DevBuf; 6]> = None; // flat, h, normed, post, comb, pre on the current part's GPU
         for l in 0..g.n_layer {
             let pi = self.owner[l as usize];
             let p = &self.parts[pi];
             let o = &p.ops;
             let gpu = &o.gpu;
             if pi != cur {
-                if cur != usize::MAX {
+                let next: Vec<DevBuf> = (0..3).map(|_| DevBuf::f32(gpu, t * 4 * d)).collect::<Result<_>>()?;
+                if cur == usize::MAX {
+                    next[0].copy_within(0, &x_init, 0, t * 4 * d * 4)?;
+                } else {
                     // the stream to this part's GPU
-                    let nx = DevBuf::f32(gpu, t * 4 * d)?;
-                    self.timed(p, "GPU to GPU", || nx.copy_from_peer(&x, &mut staging))?;
-                    x = nx;
+                    self.timed(p, "GPU to GPU", || next[0].copy_from_peer(&ring[ix], &mut staging))?;
                 }
-                ws = Some([DevBuf::f32(gpu, t * 4 * d)?, DevBuf::f32(gpu, t * d)?, DevBuf::f32(gpu, t * d)?, DevBuf::f32(gpu, t * 4)?, DevBuf::f32(gpu, t * 16)?]);
+                ring = next;
+                ix = 0;
+                ws = Some([DevBuf::f32(gpu, t * 4 * d)?, DevBuf::f32(gpu, t * d)?, DevBuf::f32(gpu, t * d)?, DevBuf::f32(gpu, t * 4)?, DevBuf::f32(gpu, t * 16)?,
+                           DevBuf::f32(gpu, t * 4)?]);
                 cur = pi;
             }
-            let [flat, h, normed, post, comb] = ws.as_ref().unwrap();
+            p.arena.reset();
+            let x = &ring[ix];
+            let (x1, x2) = (&ring[(ix + 1) % 3], &ring[(ix + 2) % 3]);
+            let [flat, h, normed, post, comb, pre] = ws.as_ref().unwrap();
             // before a half: the mixes, h, post, comb; then the half's norm
             let hc_pre = |fn_: Role, base: Role, scale: Role, x: &DevBuf, norm: Role| -> Result<()> {
                 o.rms_norm(x, None, flat, t, 4 * d, eps)?;
                 let mixes = p.mm(l, fn_, flat, t)?;
-                o.hc_pre(&mixes, p.vec(l, scale)?, p.vec(l, base)?, x, h, post, comb, t, d, g.hc_eps as f32, g.hc_iters as u32)?;
+                o.hc_pre(&mixes, p.vec(l, scale)?, p.vec(l, base)?, x, h, post, comb, pre, t, d, g.hc_eps as f32, g.hc_iters as u32)?;
                 o.rms_norm(h, Some(p.vec(l, norm)?), normed, t, d, eps)
             };
 
             // ---- attention half
-            self.timed(p, "hc pre", || hc_pre(Role::HcAttnFn, Role::HcAttnBase, Role::HcAttnScale, &x, Role::AttnNorm))?;
+            self.timed(p, "hc pre", || hc_pre(Role::HcAttnFn, Role::HcAttnBase, Role::HcAttnScale, x, Role::AttnNorm))?;
             tap(&format!("attn_norm-{l}"), normed)?;
             let att = self.timed(p, if g.is_mla(l) { "MLA" } else { "KDA" }, || -> Result<DevBuf> {
                 Ok(if let LayerState::Kda { s: kstate, conv: cstate } = &sess.layers[l as usize] {
@@ -619,7 +633,7 @@ impl<'g> Glm<'g> {
                     let mut pj = p.mm_many(l, &[Role::KdaQ, Role::KdaK, Role::KdaV, Role::KdaFA, Role::KdaGA, Role::KdaBeta], normed, t)?.into_iter();
                     let (pq, pk, pv, fa, ga, beta) = (pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap());
                     let conv = |pr: &DevBuf, w: Role, state: &DevBuf| -> Result<DevBuf> {
-                        let out = DevBuf::f32(gpu, t * kw)?;
+                        let out = p.arena.f32(t * kw)?;
                         o.conv_silu(pr, state, p.vec(l, w)?, &out, t, kw, g.kda_conv as usize)?;
                         Ok(out)
                     };
@@ -636,12 +650,12 @@ impl<'g> Glm<'g> {
                     tap(&format!("kda_g1-{l}"), &gate)?;
                     o.sigmoid(&beta, t * kh)?;
                     tap(&format!("kda_beta-{l}"), &beta)?;
-                    let scan = DevBuf::f32(gpu, t * kw)?;
+                    let scan = p.arena.f32(t * kw)?;
                     o.kda_scan(&q, &k, &v, &gate, &beta, kstate, &scan, t, kh, kd)?;
                     tap(&format!("kda_scan_out-{l}"), &scan)?;
                     let g2 = p.mm(l, Role::KdaGB, &ga, t)?;
                     tap(&format!("kda_g2-{l}"), &g2)?;
-                    let y = DevBuf::f32(gpu, t * kw)?;
+                    let y = p.arena.f32(t * kw)?;
                     o.kda_out(&scan, &g2, p.vec(l, Role::KdaONorm)?, &y, t, kh, kd, eps)?;
                     let out = p.mm(l, Role::KdaOut, &y, t)?;
                     tap(&format!("kda_out-{l}"), &out)?;
@@ -651,24 +665,24 @@ impl<'g> Glm<'g> {
                     let (nh, hd, lat) = (g.n_head as usize, g.head_dim as usize, g.kv_lora as usize);
                     let mut pj = p.mm_many(l, &[Role::MlaQA, Role::MlaKvA], normed, t)?.into_iter();
                     let (qa, kv) = (pj.next().unwrap(), pj.next().unwrap());
-                    let qr = DevBuf::f32(gpu, t * g.q_lora as usize)?;
+                    let qr = p.arena.f32(t * g.q_lora as usize)?;
                     o.rms_norm(&qa, Some(p.vec(l, Role::MlaQANorm)?), &qr, t, g.q_lora as usize, eps)?;
                     tap(&format!("q_resid-{l}"), &qr)?;
                     let q = p.mm(l, Role::MlaQB, &qr, t)?;
-                    let c = DevBuf::f32(gpu, t * lat)?;
+                    let c = p.arena.f32(t * lat)?;
                     o.rms_norm(&kv, Some(p.vec(l, Role::MlaKvANorm)?), &c, t, lat, eps)?;
                     tap(&format!("kv_cmpr-{l}"), &c)?;
                     cache.copy_within(pos0 * lat * 4, &c, 0, t * lat * 4)?;
                     // the absorbed queries: per head, q~ = k_b[h] . q_h
                     let kb = p.vec(l, Role::MlaKB)?;
-                    let qt = DevBuf::f32(gpu, t * nh * lat)?;
+                    let qt = p.arena.f32(t * nh * lat)?;
                     for hh in 0..nh {
                         o.gemm_at(t, lat, hd, (&q, hh * hd, nh * hd), (kb, hh * lat * hd), (&qt, hh * lat, nh * lat), false)?;
                     }
-                    let u = DevBuf::f32(gpu, t * nh * lat)?;
+                    let u = p.arena.f32(t * nh * lat)?;
                     o.mla_attend(&qt, cache, &u, t, nh, lat, pos0, 1.0 / (hd as f32).sqrt())?;
                     let vb = p.vec(l, Role::MlaVB)?;
-                    let oh = DevBuf::f32(gpu, t * nh * hd)?;
+                    let oh = p.arena.f32(t * nh * hd)?;
                     for hh in 0..nh {
                         o.gemm_at(t, hd, lat, (&u, hh * lat, nh * lat), (vb, hh * hd * lat), (&oh, hh * hd, nh * hd), false)?;
                     }
@@ -678,12 +692,11 @@ impl<'g> Glm<'g> {
                     out
                 })
             })?;
-            let x1 = DevBuf::f32(gpu, t * 4 * d)?;
-            o.hc_post(&att, &x, post, comb, &x1, t, d)?;
-            tap(&format!("hc_attn_post-{l}"), &x1)?;
+            o.hc_post(&att, x, post, comb, x1, t, d)?;
+            tap(&format!("hc_attn_post-{l}"), x1)?;
 
             // ---- feed-forward half
-            self.timed(p, "hc pre", || hc_pre(Role::HcFfnFn, Role::HcFfnBase, Role::HcFfnScale, &x1, Role::FfnNorm))?;
+            self.timed(p, "hc pre", || hc_pre(Role::HcFfnFn, Role::HcFfnBase, Role::HcFfnScale, x1, Role::FfnNorm))?;
             tap(&format!("ffn_norm-{l}"), normed)?;
             let lim = g.swiglu_limit as f32;
             let ffn = if !g.is_moe(l) {
@@ -697,20 +710,21 @@ impl<'g> Glm<'g> {
                 self.moe(p, l, t, normed, &mut *tap)?
             };
             tap(&format!("ffn_out-{l}"), &ffn)?;
-            let x2 = DevBuf::f32(gpu, t * 4 * d)?;
-            o.hc_post(&ffn, &x1, post, comb, &x2, t, d)?;
-            tap(&format!("l_out-{l}"), &x2)?;
-            x = x2;
+            o.hc_post(&ffn, x1, post, comb, x2, t, d)?;
+            tap(&format!("l_out-{l}"), x2)?;
+            ix = (ix + 2) % 3;
         }
 
         // the head, for the last token (on the last part)
         let p = self.parts.last().unwrap();
         let o = &p.ops;
-        let mean = DevBuf::f32(&o.gpu, t * d)?;
-        o.hc_mean(&x, &mean, t, d)?;
-        let last = DevBuf::f32(&o.gpu, d)?;
+        p.arena.reset();
+        let x = &ring[ix];
+        let mean = p.arena.f32(t * d)?;
+        o.hc_mean(x, &mean, t, d)?;
+        let last = p.arena.f32(d)?;
         last.copy_within(0, &mean, (t - 1) * d * 4, d * 4)?;
-        let out = DevBuf::f32(&o.gpu, d)?;
+        let out = p.arena.f32(d)?;
         o.rms_norm(&last, Some(p.vec(0, Role::OutputNorm)?), &out, 1, d, eps)?;
         tap("result_norm", &out)?;
         let logits = p.mm(0, Role::Output, &out, 1)?;
@@ -724,7 +738,6 @@ impl<'g> Glm<'g> {
     fn moe(&self, p: &Part, l: u64, t: usize, x: &DevBuf, tap: Tap) -> Result<DevBuf> {
         let g = &self.m.g;
         let o = &p.ops;
-        let gpu = &o.gpu;
         let (d, ne, used) = (g.n_embd as usize, g.n_expert as usize, g.n_expert_used as usize);
         let lim = g.swiglu_limit as f32;
         let logits = self.timed(p, "router", || p.mm(l, Role::Router, x, t))?;
@@ -781,7 +794,8 @@ impl<'g> Glm<'g> {
             let base = ints.len();
             ints.extend(&t_ptr);
             ints.extend(&ent);
-            let wb = DevBuf::from_f32(gpu, &wts)?;
+            let wb = p.arena.f32(wts.len())?;
+            wb.write(0, &wts.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
             // the grouped kernels (two launches for the layer), when they take this layer's types
             if parts.gate.2 == parts.up.2 && o.moe_grouped_supported(parts.gate.2.code(), parts.down.2.code(), d, f) {
                 let groups = by.len();
@@ -803,25 +817,25 @@ impl<'g> Glm<'g> {
                 for ti in &tok {
                     table.extend(ti.to_le_bytes());
                 }
-                let tb = DevBuf::new(gpu, table.len())?;
+                let tb = p.arena.bytes(table.len())?;
                 tb.write(0, &table)?;
-                let xq = DevBuf::new(gpu, o.q8_1_bytes(d, t))?;
+                let xq = p.arena.bytes(o.q8_1_bytes(d, t))?;
                 o.quantize_q8_1((x, 0), &xq, d, t)?;
-                let scratch = DevBuf::new(gpu, o.moe_scratch_bytes(total, f))?;
-                let dn = DevBuf::f32(gpu, total * d)?;
+                let scratch = p.arena.bytes(o.moe_scratch_bytes(total, f))?;
+                let dn = p.arena.f32(total * d)?;
                 o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, total, &xq, &scratch, &dn, lim)?;
                 drop(c);
-                let cb = DevBuf::new(gpu, (t + 1 + total) * 4)?;
+                let cb = p.arena.bytes((t + 1 + total) * 4)?;
                 cb.write(0, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 return o.moe_combine(&y, &dn, &cb, &wb, t, total, d);
             }
-            let ib = DevBuf::new(gpu, ints.len() * 4)?;
+            let ib = p.arena.bytes(ints.len() * 4)?;
             ib.write(0, &ints.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-            let xe = DevBuf::f32(gpu, total * d)?;
+            let xe = p.arena.f32(total * d)?;
             o.gather(x, &ib, &xe, total, d)?;
-            let gt = DevBuf::f32(gpu, total * f)?;
-            let ut = DevBuf::f32(gpu, total * f)?;
-            let dn = DevBuf::f32(gpu, total * d)?;
+            let gt = p.arena.f32(total * f)?;
+            let ut = p.arena.f32(total * f)?;
+            let dn = p.arena.f32(total * d)?;
             let c = p.experts.lock().unwrap();
             let mut row = 0;
             for (list, slot) in by.values().zip(&slots) {
@@ -840,7 +854,7 @@ impl<'g> Glm<'g> {
             }
             drop(c);
             // the combine reads t_ptr and ent behind the entries' token list in `ib`
-            let ints_view = DevBuf::new(gpu, (t + 1 + total) * 4)?;
+            let ints_view = p.arena.bytes((t + 1 + total) * 4)?;
             ints_view.copy_within(0, &ib, base * 4, (t + 1 + total) * 4)?;
             o.moe_combine(&y, &dn, &ints_view, &wb, t, total, d)
         })?;
