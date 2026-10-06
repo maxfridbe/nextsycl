@@ -666,6 +666,15 @@ impl Part {
         }
         c.tick += 1;
         let tick = c.tick;
+        // NS_TRACE_EXPERTS=FILE: every decode request for experts (GPU, tick, layer, experts), for offline policy studies
+        if promote {
+            if let Ok(f) = std::env::var("NS_TRACE_EXPERTS") {
+                use std::io::Write;
+                if let Ok(mut w) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+                    let _ = writeln!(w, "{} {} {} {}", self.ops.gpu.index, tick, l, need.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","));
+                }
+            }
+        }
         let mut missing = Vec::new();
         let mut pending: Vec<(u64, u64)> = Vec::new();
         let mut last: Option<i64> = None; // the latest copy up these experts wait for (lane 1 is in order)

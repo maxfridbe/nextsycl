@@ -50,6 +50,17 @@ by default (`--no-mtp` turns it off).
       here already scores by GEMM; the MLA prompt attention (12 s of 47 at 3K) is the per-row kernel: tile it.
 - [ ] **Dequant with vector stores** (Strata: 575 -> 841 tok/s at 2K / 8K) for any path that still expands weights.
 
+## Decode (2026-10-06 night: 18.5-20 tok/s)
+
+- [x] hc pre fused, async swaps on two copy lanes, 4 lanes a row, prefetch by the next layer's router (2 a layer),
+      the prompt arena's VRAM lent to experts at decode, the strongest GPU last
+- [x] Expert cache policy studied offline (reference/expert-cache): LRU is the best simple policy; the rest of the
+      gap to Belady needs better prediction
+- [ ] Swaps are still ~1/3 of decode time (both cards on Gen5 x8). If the B70 moves to an x16 slot and the B65 to
+      Gen4 x4: NS_SPLIT=15 (B65's layers all resident) - simulated copy time 2/3 of today's best; then measure
+- [ ] Better expert prediction (now ~54% of guesses used): the router of l+1 on a later state, or two layers ahead
+- [ ] Two requests at once would use both cards at the same time (each is ~55% busy at decode today)
+
 ## Speed, later
 
 - [x] Prompt chunks read host-slot experts in place over PCIe (no swaps); decode still swaps (faster there: 12.5 vs
