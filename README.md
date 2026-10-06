@@ -25,6 +25,9 @@ PCIe. It runs on one card or splits the layers over several.
 - **Energy and logprobs in every answer:** `usage.energy_wh` (and `energy_wh` on `/api/chat`'s last line) - the watt-hours
   both cards drew for the request; `logprobs: true` (+ `top_logprobs`, up to 20) returns each answer token's
   log-probability and the likeliest alternatives, as OpenAI's `choices[0].logprobs.content`, streamed or not.
+- **Several requests at once:** up to `NS_PARALLEL` (2) conversations decode together - one pass carries a token of
+  each, the weights read once for all of them, each row exactly as its own pass would be (`nextsycl batch-check`);
+  a single request decodes alone, with the draft block. More wait in order.
 - **A record of each request:** `nextsycl inspect <id>` prints one as JSON (settings, timings, previews of the prompt
   and the answer); the server keeps the last `NS_KEEP_REQUESTS` (100).
 - **`POST /api/chat` for web pages:** the same chat as JSON lines (`{"thinking": ...}`, `{"content": ...}`, then a
@@ -134,19 +137,29 @@ several requests at once. The latest run, `docs/benchy/v1-2026-10-06-prefetch.md
 | 7,975 | 314 | 26.0 | 16.1 | 77% | 6,837 | 166 |
 | 39,758 | 416 | 96.1 | 16.1 | 75% | 21,412 | 192 |
 
-| Clients at once | Tokens/s, all | Latency mean / max (s) | First token mean / max (s) |
-|---:|---:|---:|---:|
-| 1 | 17.6 | 14.6 / 14.6 | 1.1 / 1.1 |
-| 2 | 18.1 | 16.3 / 23.1 | 5.7 / 10.4 |
-| 4 | 17.9 | 24.4 / 38.1 | 15.8 / 29.1 |
+Several at once, before and after batched decode (`docs/benchy/v1-2026-10-06-parallel.md`; the short prompt, 256
+tokens each):
 
-The server runs one request at a time, so several at once share its speed (each card is ~55% busy at decode: the
-room batching would use).
+| Clients at once | Tokens/s, all: one at a time | batched (NS_PARALLEL=2) | First token mean / max: one at a time | batched |
+|---:|---:|---:|---:|---:|
+| 1 | 17.6 | 17.0 | 1.1 / 1.1 s | 1.0 / 1.0 s |
+| 2 | 18.1 | 20.3 | 5.7 / 10.4 s | 2.0 / 2.0 s |
+| 4 | 17.9 | 19.8 | 15.8 / 29.1 s | 14.8 / 27.5 s (two at a time) |
+
+`nextsycl batch-check` (the engine alone, no draft block): 2 conversations together 23-30 tokens/s in all against
+16-18 one at a time (over 32 to 128 tokens: the longer, the more their experts differ), the tokens and logits
+exactly those of each alone.
+
+With NS_PARALLEL=2 two requests decode in one pass; a third waits for a free session. The batch's limits today: MLA
+runs per session (its projections read once per conversation), and two conversations want more distinct experts a
+layer (more swaps).
 
 ## Checking it
 
 - `nextsycl check <model> <dump dir>`: the forward pass against a llama.cpp dump (`reference/llama-dump`), every
   step compared by cosine, the next token and the top logits.
+- `nextsycl batch-check <model> [--prompts "a|b"] [--n N]`: conversations decoded together against each decoded
+  alone - the same greedy tokens, the logits exactly equal - and the speed of both.
 - `nextsycl spec-check <model> --prompt-file F`: verify passes against one-token decode - must stay 0 difference
   (greedy output with MTP equals greedy output without).
 - `NS_PROFILE=1 nextsycl generate ...`: seconds per section, the GPU synced at each boundary; `NS_PROFILE=gpu`: device

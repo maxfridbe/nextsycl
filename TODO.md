@@ -69,8 +69,31 @@ by default (`--no-mtp` turns it off).
       all resident, no swaps over its slow link; the B70's swaps on x16). Simulated (reference/expert-cache/splits.py)
       copy time a pass 5.9 ms vs 8.8 at today's best; with today's even split it would be 18.6 (worse). Measure with
       `nextsycl bench` after.
-- [ ] Several requests at once (benchy: 1, 2, 4 clients all ~17 tok/s together - one request at a time today):
-      batch decode passes across sessions.
+- [x] Several requests at once (branch `batching`): forward_batch + an engine thread with NS_PARALLEL sessions -
+      bit-exact; 2 clients 18.1 -> 20.3 tok/s in all, the second's first token 10.4 -> 2.0 s
+- [ ] Batch: MLA's projections once for all rows (only its cache, indexer and attention per session); a prompt read
+      in chunks between decode steps (a long prompt now stalls the others' decode); the draft block in batches;
+      per-request energy (concurrent requests share the counters - each counts both)
+
+## LogProbChain (an API option)
+
+A request option `logprob_chain` (beside `logprobs` / `top_logprobs`): logprobs corrected for what the model is
+only echoing from earlier in its own turn. The thinking tokens skew the answer's logprobs: a token the thinking
+already wrote comes out near-certain because the model copies it, not because it is sure of it.
+
+- [ ] For each output token X, one attention vector over the context: combine the heads of the attention layers -
+      experiment: all MLA layers averaged, the most informative layers only (by entropy or by how peaked they are),
+      the last layers, weighted by head; MLA's absorbed scores (q~ . c) give per-position weights cheaply; KDA layers
+      have no attention matrix (only a state) - leave them out or approximate
+- [ ] For X's candidates (its top logprobs), any candidate that equals a token at a position of this turn (thinking
+      or answer generated so far) that X attends to: skew its logprob in proportion to THAT earlier token's own
+      logprob times the attention weight on it (an echo of a confident earlier token is discounted; of an uncertain
+      one, kept low) - the exact formula is part of the experiment
+- [ ] Keep each generated token's own logprob (already computed for `logprobs`) so the chain can look it up
+- [ ] Return the chained logprobs beside the raw ones (e.g. `chained_logprob` on each entry), and say which earlier
+      positions dominated
+- [ ] Validate: questions with known answers, with and without thinking; does the chained confidence of the final
+      answer track correctness better than the raw one (calibration)
 
 ## Speed, later
 

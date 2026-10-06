@@ -317,6 +317,14 @@ pub struct Decoder {
     pub accepted: u64,
 }
 
+impl Decoder {
+    /// The committed token not fed yet (the last step's), handed over - e.g. to a batch step - and the draft dropped
+    pub fn pending(&mut self) -> Option<u32> {
+        self.draft = None;
+        self.next.take()
+    }
+}
+
 fn argmax(v: &[f32]) -> u32 {
     v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32)
 }
@@ -1612,6 +1620,166 @@ impl<'g> Glm<'g> {
         Ok(v.chunks(vocab).map(|c| c.to_vec()).collect())
     }
 
+    /// One decode step of several conversations at once: `tokens[b]` the next token of `sess[b]`, the logits after
+    /// it per session. A row per session through every layer: what treats rows alike (the norms, the products at
+    /// decode width, the router and the experts, the head) runs once for all of them - the weights read once - and
+    /// what holds a conversation's state (KDA's convolution and scan, MLA with its cache and indexer) per session on
+    /// its row. Each row comes out as that session's own one-token pass would (`nextsycl batch-check`). The draft
+    /// block is left out: a session's draft cache misses these positions (its next drafts are then guesses; exact
+    /// acceptance keeps the output the same).
+    pub fn forward_batch(&self, sess: &mut [&mut Session], tokens: &[u32], tap: Tap) -> Result<Vec<Vec<f32>>> {
+        let g = &self.m.g;
+        let t = tokens.len();
+        if t == 0 || t != sess.len() || t > MMVQ_COLS {
+            return Err(Error(format!("forward_batch: {t} tokens for {} sessions (1..={MMVQ_COLS})", sess.len())));
+        }
+        if let Some(s) = sess.iter().find(|s| s.pos + 1 > s.max_ctx) {
+            return Err(Error(format!("the context is {} tokens; no more fit", s.max_ctx)));
+        }
+        for p in &self.parts {
+            p.arena_for(t)?;
+        }
+        let (d, eps) = (g.n_embd as usize, g.rms_eps as f32);
+        let kw = (g.kda_heads * g.kda_dim) as usize;
+        let (kh, kd) = (g.kda_heads as usize, g.kda_dim as usize);
+        let p0 = &self.parts[0];
+        let x0 = self.embed(p0, tokens)?;
+        let e0 = x0.to_f32()?;
+        let mut xs = vec![0f32; t * 4 * d];
+        for ti in 0..t {
+            for s in 0..4 {
+                xs[(ti * 4 + s) * d..(ti * 4 + s + 1) * d].copy_from_slice(&e0[ti * d..(ti + 1) * d]);
+            }
+        }
+        let x_init = DevBuf::from_f32(&p0.ops.gpu, &xs)?;
+        let mut staging = vec![0u8; t * 4 * d * 4];
+        let mut cur = usize::MAX;
+        let mut ring: Vec<DevBuf> = Vec::new();
+        let mut ix = 0usize;
+        let mut ws: Option<[DevBuf; 6]> = None;
+        let row = |b: &DevBuf, i: usize, w: usize| b.view(i * w * 4, w * 4);
+        for l in 0..g.n_layer {
+            let pi = self.owner[l as usize];
+            let p = &self.parts[pi];
+            let o = &p.ops;
+            let gpu = &o.gpu;
+            if pi != cur {
+                let next: Vec<DevBuf> = (0..3).map(|_| DevBuf::f32(gpu, t * 4 * d)).collect::<Result<_>>()?;
+                if cur == usize::MAX {
+                    next[0].copy_within(0, &x_init, 0, t * 4 * d * 4)?;
+                } else {
+                    self.timed(p, "GPU to GPU", || next[0].copy_from_peer(&ring[ix], &mut staging))?;
+                }
+                ring = next;
+                ix = 0;
+                ws = Some([DevBuf::f32(gpu, t * 4 * d)?, DevBuf::f32(gpu, t * d)?, DevBuf::f32(gpu, t * d)?, DevBuf::f32(gpu, t * 4)?, DevBuf::f32(gpu, t * 16)?,
+                           DevBuf::f32(gpu, t * 4)?]);
+                cur = pi;
+            }
+            p.arena.reset();
+            let x = &ring[ix];
+            let (x1, x2) = (&ring[(ix + 1) % 3], &ring[(ix + 2) % 3]);
+            let [flat, h, normed, post, comb, pre] = ws.as_ref().unwrap();
+            let hc_pre = |fn_: Role, base: Role, scale: Role, x: &DevBuf, norm: Role| -> Result<()> {
+                let w = p.mat(l, fn_)?;
+                if w.f32 && w.rows == 24 && std::env::var("NS_HC_FUSED").map_or(true, |v| v != "0") {
+                    return o.hc_pre_fused(x, &w.buf, p.vec(l, scale)?, p.vec(l, base)?, p.vec(l, norm)?, h, post, comb, pre, normed,
+                                          &p.arena.f32(t * 32 * 25)?, t, d, eps, g.hc_eps as f32, g.hc_iters as u32);
+                }
+                let mixes = p.arena.f32(t * 24)?;
+                if w.f32 && w.rows == 24 {
+                    o.hc_mix(x, &w.buf, &mixes, &p.arena.f32(t * 32 * 25)?, t, 4 * d, eps)?;
+                } else {
+                    o.rms_norm(x, None, flat, t, 4 * d, eps)?;
+                    p.matmul(w, t, (flat, 0, w.cols), (&mixes, 0, w.rows), false)?;
+                }
+                o.hc_pre(&mixes, p.vec(l, scale)?, p.vec(l, base)?, x, h, post, comb, pre, t, d, g.hc_eps as f32, g.hc_iters as u32)?;
+                o.rms_norm(h, Some(p.vec(l, norm)?), normed, t, d, eps)
+            };
+
+            // ---- attention half
+            self.timed(p, "hc pre", || hc_pre(Role::HcAttnFn, Role::HcAttnBase, Role::HcAttnScale, x, Role::AttnNorm))?;
+            let att = self.timed(p, if g.is_mla(l) { "MLA" } else { "KDA" }, || -> Result<DevBuf> {
+                if g.is_mla(l) {
+                    // per session: its row through MLA (its cache, its indexer, its position)
+                    let att = p.arena.f32(t * d)?;
+                    for (b, s) in sess.iter().enumerate() {
+                        let LayerState::Mla { c: cache, idx } = &s.layers[l as usize] else { return Err(Error("layer state".into())) };
+                        let out = self.mla(p, l, &row(normed, b, d)?, cache, idx, s.pos, 1, &mut *tap)?;
+                        att.copy_within(b * d * 4, &out, 0, d * 4)?;
+                    }
+                    return Ok(att);
+                }
+                let mut pj = p.mm_many(l, &[Role::KdaQ, Role::KdaK, Role::KdaV, Role::KdaFA, Role::KdaGA, Role::KdaBeta], normed, t)?.into_iter();
+                let (pq, pk, pv, fa, ga, beta) = (pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap());
+                let (q, k, v) = (p.arena.f32(t * kw)?, p.arena.f32(t * kw)?, p.arena.f32(t * kw)?);
+                // the short convolutions: each session's row against its own last inputs
+                for (b, s) in sess.iter().enumerate() {
+                    let LayerState::Kda { conv: cstate, .. } = &s.layers[l as usize] else { return Err(Error("layer state".into())) };
+                    for (pr, w, st, out) in [(&pq, Role::KdaQConv, &cstate[0], &q), (&pk, Role::KdaKConv, &cstate[1], &k), (&pv, Role::KdaVConv, &cstate[2], &v)] {
+                        o.conv_silu(&row(pr, b, kw)?, st, p.vec(l, w)?, &row(out, b, kw)?, 1, kw, g.kda_conv as usize, None)?;
+                    }
+                }
+                o.l2_norm(&q, t * kh, kd, 1e-6)?;
+                o.l2_norm(&k, t * kh, kd, 1e-6)?;
+                let gate = p.mm(l, Role::KdaFB, &fa, t)?;
+                o.kda_gate(&gate, p.vec(l, Role::KdaDtBias)?, p.vec(l, Role::KdaA)?, t, kh, kd, g.kda_gate_low as f32)?;
+                o.exp(&gate, t * kh * kd)?;
+                o.sigmoid(&beta, t * kh)?;
+                let scan = p.arena.f32(t * kw)?;
+                // the recurrence: each session's state, its row
+                for (b, s) in sess.iter().enumerate() {
+                    let LayerState::Kda { s: kstate, .. } = &s.layers[l as usize] else { return Err(Error("layer state".into())) };
+                    o.kda_scan(&row(&q, b, kw)?, &row(&k, b, kw)?, &row(&v, b, kw)?, &row(&gate, b, kw)?, &row(&beta, b, kh)?, kstate,
+                               &row(&scan, b, kw)?, 1, kh, kd, None)?;
+                }
+                let g2 = p.mm(l, Role::KdaGB, &ga, t)?;
+                let y = p.arena.f32(t * kw)?;
+                o.kda_out(&scan, &g2, p.vec(l, Role::KdaONorm)?, &y, t, kh, kd, eps)?;
+                p.mm(l, Role::KdaOut, &y, t)
+            })?;
+            o.hc_post(&att, x, post, comb, x1, t, d)?;
+
+            // ---- feed-forward half (rows alike)
+            self.timed(p, "hc pre", || hc_pre(Role::HcFfnFn, Role::HcFfnBase, Role::HcFfnScale, x1, Role::FfnNorm))?;
+            let lim = g.swiglu_limit as f32;
+            let ffn = if !g.is_moe(l) {
+                self.timed(p, "dense FFN", || {
+                    let mut pj = p.mm_many(l, &[Role::FfnGate, Role::FfnUp], normed, t)?.into_iter();
+                    let (gt, up) = (pj.next().unwrap(), pj.next().unwrap());
+                    o.swiglu_clamp(&gt, &up, &gt, t * g.ffn_dense as usize, lim)?;
+                    p.mm(l, Role::FfnDown, &gt, t)
+                })?
+            } else {
+                self.moe(p, l, t, normed, &mut *tap)?
+            };
+            o.hc_post(&ffn, x1, post, comb, x2, t, d)?;
+            ix = (ix + 2) % 3;
+        }
+
+        // the head, every row
+        let p = self.parts.last().unwrap();
+        let o = &p.ops;
+        p.arena.reset();
+        let x = &ring[ix];
+        let mean = p.arena.f32(t * d)?;
+        o.hc_mean(x, &mean, t, d)?;
+        let out = p.arena.f32(t * d)?;
+        o.rms_norm(&mean, Some(p.vec(0, Role::OutputNorm)?), &out, t, d, eps)?;
+        let logits = p.mm(0, Role::Output, &out, t)?;
+        for s in sess.iter_mut() {
+            s.pos += 1;
+            s.snapped = None;
+            if let Some(ms) = &mut s.mtp {
+                ms.rows = 0; // the draft block skips these positions (see above)
+                ms.next.clear();
+            }
+        }
+        let v = logits.to_f32()?;
+        let vocab = g.n_vocab as usize;
+        Ok(v.chunks(vocab).map(|c| c.to_vec()).collect())
+    }
+
     /// Keeps only the first `keep` tokens of the last forward pass (a verify pass of 2..=MAX_VERIFY): the KDA
     /// states back to their snapshots after row `keep - 1`, the position back, the draft block's rows cut. The MLA
     /// caches need nothing: the position bounds what is read, later rows overwrite the rest.
@@ -1691,6 +1859,12 @@ impl<'g> Glm<'g> {
     /// Generation from a prompt `feed` returned `logits` for; `mtp`: draft with the MTP block (when loaded).
     pub fn decoder(&self, logits: Vec<f32>, mtp: bool) -> Decoder {
         Decoder { logits, next: None, draft: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
+    }
+
+    /// A decoder whose last committed token `next` is not fed yet (one handed over by `Decoder::pending`, or a batch
+    /// step's): its first step feeds it
+    pub fn decoder_after(&self, next: u32, mtp: bool) -> Decoder {
+        Decoder { logits: Vec::new(), next: Some(next), draft: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
     }
 
     /// The next committed token(s): one, or two when a draft is accepted. `sample` draws a token from logits. With

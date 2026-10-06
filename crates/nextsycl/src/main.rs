@@ -55,7 +55,7 @@ the server (over its socket):
 in this process (inside the image: the kernels need the oneAPI runtime):
   nextsycl serve <model.gguf> [--gpu 0,1 | all] [--host H] [--port N] [--name ID] [--ctx N] [--effort E] [--socket PATH]
                  [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)] [--cors ORIGINS]
-                 [--keep-requests N (100)]
+                 [--keep-requests N (100)] [--parallel N (2: requests decoded together)]
                                 the server in the foreground (what start runs)
   nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
                     [--expert-gib G] [--mirror-gib G] [--no-mtp]
@@ -79,6 +79,7 @@ settings (environment, or NAME=value lines in nextsycl.conf beside the repositor
   NS_EFFORT        default reasoning effort (low)        NS_NO_MTP=1   decode without the draft block
   NS_PROMPT_CACHE_MIB   host memory for the prompt cache's checkpoints (default 4096; 0 = off)
   NS_KEEP_REQUESTS ended requests the server keeps for ps and inspect (default 100)
+  NS_PARALLEL      requests decoded together, each with a session of its own (default 2; 1 = one at a time)
   NS_SOCKET_DIR    where the control socket lives (default $XDG_RUNTIME_DIR/nextsycl)
   NS_IMAGE, NS_CONTAINER_ENGINE   the image with the oneAPI runtime (localhost/h3-build) and podman / docker";
 
@@ -529,6 +530,89 @@ fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
 
 /// `nextsycl spec-check`: greedy decode one token at a time (the reference), then the same tokens as 2-row verify
 /// passes each rolled back to its first row; every row's logits against the reference's at that position.
+/// `nextsycl batch-check <model.gguf> [--prompts "a|b|c"] [--n N] [--gpu 1,0]`: several conversations decoded
+/// together (`forward_batch`) against each decoded alone - the same greedy tokens, the logits' largest difference -
+/// and the speed of both.
+fn batch_check(args: &[String]) -> Result<(), String> {
+    let e = |x: ns_core::Error| x.0;
+    let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+    let model = args.get(1).ok_or("batch-check <model.gguf> ...")?;
+    let prompts: Vec<String> = opt("--prompts")
+        .unwrap_or_else(|| "Write a haiku about rivers.|Explain TCP slow start.|List five prime numbers and why.|What is a monad?".into())
+        .split('|').map(String::from).collect();
+    let n: usize = opt("--n").and_then(|v| v.parse().ok()).unwrap_or(32);
+    let gpus: Vec<usize> = opt("--gpu").unwrap_or_else(|| "1,0".into()).split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}"))).collect::<Result<_, _>>()?;
+    let f = Gguf::open(Path::new(model)).map_err(|e| e.0)?;
+    let tok = ns_tok::Tokenizer::from_gguf(&f)?;
+    let ids: Vec<Vec<u32>> = prompts.iter()
+        .map(|p| tok.encode(&ns_tok::glm_chat(&[ns_tok::Message { role: "user", content: p, reasoning: None }], ns_tok::Effort::Low)))
+        .collect();
+    let ctx = ids.iter().map(|v| v.len()).max().unwrap_or(0) + n + 8;
+    let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
+    let mut log = |l: String| eprintln!("[{l}]");
+    let mtp = args.iter().any(|a| a == "--mtp"); // the draft block loaded (it is not used here; its experts take store slots)
+    let glm = ns_engine::glm5next::Glm::load(&f, &gs, None, None, mtp, (ctx, prompts.len() + 1), &mut log).map_err(e)?;
+    let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
+    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i) as u32;
+    // alone: each conversation, one token a pass
+    let mut solo_toks: Vec<Vec<u32>> = Vec::new();
+    let mut solo_logits: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut solo_s = 0.0;
+    for p in &ids {
+        let mut s = glm.session(ctx).map_err(e)?;
+        let mut l = glm.feed(&mut s, p, &mut none).map_err(e)?;
+        let (mut ts, mut ls) = (Vec::new(), Vec::new());
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let t = argmax(&l);
+            ts.push(t);
+            l = glm.forward(&mut s, &[t], &mut none).map_err(e)?;
+            ls.push(l.clone());
+        }
+        solo_s += t0.elapsed().as_secs_f64();
+        solo_toks.push(ts);
+        solo_logits.push(ls);
+    }
+    // together
+    let mut sess: Vec<ns_engine::glm5next::Session> = Vec::new();
+    let mut last: Vec<Vec<f32>> = Vec::new();
+    for p in &ids {
+        let mut s = glm.session(ctx).map_err(e)?;
+        last.push(glm.feed(&mut s, p, &mut none).map_err(e)?);
+        sess.push(s);
+    }
+    let mut worst = 0f32;
+    let mut differ = 0;
+    let t0 = std::time::Instant::now();
+    for step in 0..n {
+        let toks: Vec<u32> = last.iter().map(|l| argmax(l)).collect();
+        for (b, t) in toks.iter().enumerate() {
+            if *t != solo_toks[b][step] {
+                differ += 1;
+            }
+        }
+        // each session takes the token its own run took, so the comparison stays aligned
+        let feed: Vec<u32> = (0..ids.len()).map(|b| solo_toks[b][step]).collect();
+        let mut refs: Vec<&mut ns_engine::glm5next::Session> = sess.iter_mut().collect();
+        last = glm.forward_batch(&mut refs, &feed, &mut none).map_err(e)?;
+        for (b, l) in last.iter().enumerate() {
+            let r = &solo_logits[b][step];
+            worst = worst.max(l.iter().zip(r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max));
+        }
+    }
+    let batch_s = t0.elapsed().as_secs_f64();
+    let b = ids.len();
+    println!("{b} conversations, {n} tokens each: alone {:.2} tok/s (each, {:.1} s in all); together {:.2} tok/s in all ({:.2} each)",
+             n as f64 * b as f64 / solo_s, solo_s, n as f64 * b as f64 / batch_s, n as f64 / batch_s);
+    println!("greedy tokens different in {differ} of {} steps; the logits' largest difference {worst:.3e}", n * b);
+    let (hits, misses, _, _, pf, pf_used) = glm.expert_stats();
+    println!("experts (both runs): {hits} VRAM hits, {misses} swapped in, {pf} prefetched ({pf_used} asked for)");
+    for (name, secs, calls) in glm.profile() {
+        println!("[profile {name:<40} {secs:7.2} s {calls:>8} calls]");
+    }
+    Ok(())
+}
+
 fn spec_check(args: &[String]) -> Result<(), String> {
     let e = |x: ns_core::Error| x.0;
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
@@ -648,11 +732,13 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             .lines().find(|l| l.starts_with("MemAvailable:"))?.split_whitespace().nth(1)?.parse::<usize>().ok()? * 1024;
         Some(avail.saturating_sub((10 << 30) + cache))
     });
-    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), mirror, mtp, (ctx, 1), &mut log).map_err(e)?;
+    // the sessions decoding together (their attention caches come out of the expert store)
+    let parallel: usize = opt("--parallel").and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 8);
+    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), mirror, mtp, (ctx, parallel), &mut log).map_err(e)?;
     eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds);
     let cors: Vec<String> = opt("--cors").unwrap_or_default().split([',', ' ']).filter(|o| !o.is_empty()).map(String::from).collect();
     let keep: usize = opt("--keep-requests").and_then(|v| v.parse().ok()).unwrap_or(100);
-    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort, cache, cors, keep)?);
+    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort, cache, cors, keep, parallel)?);
     srv.run(&addr, opt("--socket").map(std::path::PathBuf::from))
 }
 
@@ -685,6 +771,7 @@ fn main() -> ExitCode {
         Some("generate") => generate(&args),
         Some("serve") => serve_cmd(&args),
         Some("spec-check") => spec_check(&args),
+        Some("batch-check") => batch_check(&args),
         Some("kernels") if args.len() >= 2 => {
             let gpu = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0);
             kernels(Path::new(&args[1]), gpu)
