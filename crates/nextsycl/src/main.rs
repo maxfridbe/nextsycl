@@ -3,9 +3,13 @@
 //!     nextsycl info <model.gguf>      the architecture, its geometry, every tensor checked by role, bytes by group
 //!     nextsycl gpus                   each GPU in its own context: memory, copies and their rates, GPU to GPU, and
 //!                                     that device memory costs no host RAM
+//!     nextsycl serve <model.gguf> [--gpu 0,1] [--host 0.0.0.0] [--port 8085] [--name ID] [--ctx 8192] [--effort low]
+//!                                     the OpenAI-compatible server (serve.rs)
 //!     nextsycl check <model.gguf> <dump dir> [--gpu N]
 //!                                     the forward pass on a reference dump's prompt (reference/llama-dump), every
 //!                                     step compared: cosine and relative error per tensor, then the next token
+
+mod serve;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -22,7 +26,9 @@ const USAGE: &str = "usage:
   nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
                     [--expert-gib G]   VRAM for routed experts (default: what is free less 3 GiB)
                     [--mirror-gib G]   pinned host memory mirroring experts (default: available less 10 GiB)
-  nextsycl kernels <model.gguf> [--gpu N]   each weight type's decode kernel against the exact path";
+  nextsycl kernels <model.gguf> [--gpu N]   each weight type's decode kernel against the exact path
+  nextsycl serve <model.gguf> [--gpu 0,1] [--host 0.0.0.0] [--port 8085] [--name ID] [--ctx 8192] [--effort low]
+                 [--expert-gib G] [--mirror-gib G]   the OpenAI-compatible server";
 
 fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
@@ -325,7 +331,7 @@ fn generate(args: &[String]) -> Result<(), String> {
     let mut sess = glm.session(ids.len() + max + 1).map_err(e)?;
     let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
     let t0 = std::time::Instant::now();
-    let mut logits = glm.forward(&mut sess, &ids, &mut none).map_err(e)?;
+    let mut logits = glm.feed(&mut sess, &ids, &mut none).map_err(e)?;
     let prefill = t0.elapsed().as_secs_f64();
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let mut pending: Vec<u8> = Vec::new();
@@ -428,6 +434,28 @@ fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// `nextsycl serve`: load, then answer on HTTP (serve.rs).
+fn serve_cmd(args: &[String]) -> Result<(), String> {
+    let e = |x: ns_core::Error| x.0;
+    let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+    let model = args.get(1).ok_or("serve <model.gguf> ...")?;
+    let gpus: Vec<usize> = opt("--gpu").unwrap_or_else(|| "0".into()).split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}"))).collect::<Result<_, _>>()?;
+    let addr = format!("{}:{}", opt("--host").unwrap_or_else(|| "127.0.0.1".into()), opt("--port").unwrap_or_else(|| "8085".into()));
+    let ctx: usize = opt("--ctx").and_then(|v| v.parse().ok()).unwrap_or(8192);
+    let effort = ns_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|high|max")?;
+    let gib_opt = |k: &str| opt(k).and_then(|v| v.parse::<f64>().ok()).map(|x| (x * (1u64 << 30) as f64) as usize);
+    // the model's file lives as long as the server
+    let f: &'static Gguf = Box::leak(Box::new(Gguf::open(Path::new(model)).map_err(|e| e.0)?));
+    let name = opt("--name").unwrap_or_else(|| Path::new(model).file_stem().map_or("model".into(), |s| s.to_string_lossy().to_lowercase()));
+    let tok = ns_tok::Tokenizer::from_gguf(f)?;
+    let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
+    let mut log = |l: String| eprintln!("[{l}]");
+    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), gib_opt("--mirror-gib"), &mut log).map_err(e)?;
+    eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds);
+    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort)?);
+    srv.run(&addr)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let r = match args.first().map(String::as_str) {
@@ -435,6 +463,7 @@ fn main() -> ExitCode {
         Some("gpus") => gpus(),
         Some("tokenize") if args.len() == 3 => tokenize(Path::new(&args[1]), &args[2]),
         Some("generate") => generate(&args),
+        Some("serve") => serve_cmd(&args),
         Some("kernels") if args.len() >= 2 => {
             let gpu = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0);
             kernels(Path::new(&args[1]), gpu)

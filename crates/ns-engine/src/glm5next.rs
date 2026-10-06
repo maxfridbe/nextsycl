@@ -24,6 +24,8 @@ const MMVQ_COLS: usize = 8;
 const MAX_COLS: usize = 16384;
 /// expert slots and the mirror are allocated in chunks of this size (single allocations stay small)
 const CHUNK: usize = 2 << 30;
+/// prompt tokens per forward pass (a layer's temporaries are ~1.5 MB a token; the arenas are 1 GiB)
+pub const PREFILL_CHUNK: usize = 256;
 
 /// A matrix on the GPU: `rows` x `cols` (a tensor's outer dimensions folded into rows), in its stored quantized
 /// form, or - for the 16- and 32-bit ones - as float32.
@@ -547,7 +549,59 @@ impl<'g> Glm<'g> {
         Ok(Session { pos: 0, max_ctx, layers })
     }
 
-    /// The next `tokens` of a conversation: the logits of the last one. `tap` sees each named step.
+    /// The next `tokens` of a conversation in chunks of at most `PREFILL_CHUNK` (the arenas bound a chunk): the
+    /// logits of the last token.
+    pub fn feed(&self, sess: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
+        let mut logits = Vec::new();
+        for c in tokens.chunks(PREFILL_CHUNK) {
+            logits = self.forward(sess, c, &mut *tap)?;
+        }
+        Ok(logits)
+    }
+
+    /// Back to an empty conversation (the recurrent states zeroed; the MLA caches need nothing: `pos` bounds them).
+    pub fn reset_session(&self, sess: &mut Session) -> Result<()> {
+        for l in &sess.layers {
+            if let LayerState::Kda { s, conv } = l {
+                s.fill(0)?;
+                for c in conv {
+                    c.fill(0)?;
+                }
+            }
+        }
+        sess.pos = 0;
+        Ok(())
+    }
+
+    /// `dst` becomes a copy of `src` (same model, same context size): the recurrent states and the MLA caches up to
+    /// `src.pos`. How a conversation is kept at the end of a prompt and resumed from there.
+    pub fn copy_session(&self, dst: &mut Session, src: &Session) -> Result<()> {
+        if dst.max_ctx != src.max_ctx || dst.layers.len() != src.layers.len() {
+            return Err(Error("copy_session: the sessions differ in shape".into()));
+        }
+        let lat = self.m.g.kv_lora as usize * 4;
+        for (d, s) in dst.layers.iter().zip(&src.layers) {
+            match (d, s) {
+                (LayerState::Kda { s: ds, conv: dc }, LayerState::Kda { s: ss, conv: sc }) => {
+                    ds.copy_within(0, ss, 0, ss.len)?;
+                    for (a, b) in dc.iter().zip(sc) {
+                        a.copy_within(0, b, 0, b.len)?;
+                    }
+                }
+                (LayerState::Mla { c: dcache }, LayerState::Mla { c: scache }) => {
+                    if src.pos > 0 {
+                        dcache.copy_within(0, scache, 0, src.pos * lat)?;
+                    }
+                }
+                _ => return Err(Error("copy_session: layer kinds differ".into())),
+            }
+        }
+        dst.pos = src.pos;
+        Ok(())
+    }
+
+    /// The next `tokens` of a conversation (at most a chunk; `feed` splits longer ones): the logits of the last
+    /// one. `tap` sees each named step.
     pub fn forward(&self, sess: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
         let g = &self.m.g;
         let t = tokens.len();
