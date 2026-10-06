@@ -453,15 +453,20 @@ int ns_hc_mean(ns_gpu* g, const float* X, float* y, int64_t T, int64_t C) {
 int ns_conv_silu(ns_gpu* g, const float* x, float* state, const float* w, float* out, int64_t T, int64_t D, int k, float* snap) {
     NS_TRY
     auto& q = g->q;
+    // the outputs: a work-item per (token, channel) - a channel's tokens in one work-item walked a 4,096-token chunk
+    // in series on 8,192 work-items; the same sums in the same order
+    q.parallel_for(sycl::range<2>(T, D), [=](sycl::id<2> id) {
+        const int64_t t = id[0], c = id[1];
+        auto in = [&](int64_t src) { return src >= 0 ? x[src * D + c] : state[(k - 1 + src) * D + c]; };
+        float s = 0.f;
+        for (int j = 0; j < k; ++j) s += in(t - (k - 1) + j) * w[c * k + j];   // inputs t-k+1 .. t
+        out[t * D + c] = s / (1.f + sycl::exp(-s));
+    });
+    // then (the queue is in order) the snapshots and the new state, per channel
     q.parallel_for(sycl::range<1>(D), [=](sycl::id<1> id) {
         const int64_t c = id[0];
         // input src (relative to row 0): x for src >= 0, the earlier inputs in state before
         auto in = [&](int64_t src) { return src >= 0 ? x[src * D + c] : state[(k - 1 + src) * D + c]; };
-        for (int64_t t = 0; t < T; ++t) {
-            float s = 0.f;
-            for (int j = 0; j < k; ++j) s += in(t - (k - 1) + j) * w[c * k + j];   // inputs t-k+1 .. t
-            out[t * D + c] = s / (1.f + sycl::exp(-s));
-        }
         if (snap)
             for (int64_t r = 0; r + 1 < T; ++r)
                 for (int j = 0; j < k - 1; ++j) snap[(r * (k - 1) + j) * D + c] = in(r + 1 - (k - 1) + j);
