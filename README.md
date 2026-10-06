@@ -29,6 +29,7 @@ PCIe. It runs on one card or splits the layers over several.
 echo "NS_MODELS=$HOME/models" > nextsycl.conf
 dist/nextsycl start             # loads the model on every GPU; the OpenAI API on 127.0.0.1:8085
 dist/nextsycl status            # live: the GPUs, the request running, the prompt cache
+dist/nextsycl inspect 4         # one request as JSON (settings, timings, previews; NS_KEEP_REQUESTS are kept)
 dist/nextsycl chat "Hello"
 dist/nextsycl stop
 ```

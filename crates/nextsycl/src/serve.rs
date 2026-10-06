@@ -20,7 +20,10 @@
 //! $XDG_RUNTIME_DIR/nextsycl), which the host command line talks to (client.rs), as sycl-h3 talks to h3d:
 //!
 //!     GET  /server/status          the model, its GPUs (memory, layers, expert slots), the request running, the cache
-//!     GET  /server/requests        the requests: the running one and the last 100
+//!     GET  /server/requests        the requests: the running one and the last ones that ended (--keep-requests,
+//!                                  100 by default)
+//!     GET  /server/requests/<id>   one of them in full: its settings, messages, timings, previews of its prompt and
+//!                                  answer
 //!     GET  /server/cache           the prompt cache's checkpoints;  POST /server/cache/clear  drops them
 //!     POST /server/shutdown        stop once no request runs (as SIGTERM)
 //!
@@ -60,10 +63,12 @@ pub struct Server {
     state: Mutex<Conv>,
     busy: AtomicBool,
     started: Instant,
-    /// the request running (its JSON row, updated as it goes) and the last 100 that ended
+    /// the request running (its JSON row, updated as it goes) and the last `keep` that ended
     current: Mutex<Option<Value>>,
     done: Mutex<VecDeque<Value>>,
     next_id: AtomicU64,
+    /// how many ended requests `done` keeps
+    keep: usize,
     /// origins beyond the loopback ones a browser may call from
     cors: Vec<String>,
 }
@@ -116,6 +121,20 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+/// A float32 setting as the client wrote it (0.95, not 0.949999988)
+fn round4(x: f32) -> f64 {
+    (x as f64 * 1e4).round() / 1e4
+}
+
+/// The start of a text for a request's record (at most PREVIEW characters)
+fn preview(s: &str) -> String {
+    const PREVIEW: usize = 300;
+    match s.char_indices().nth(PREVIEW) {
+        Some((i, _)) => format!("{}...", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
 /// A message's text: a string, or the text parts of a list.
 fn text_of(v: &Value) -> String {
     match v {
@@ -126,13 +145,14 @@ fn text_of(v: &Value) -> String {
 }
 
 impl Server {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, max_ctx: usize, default_effort: Effort, cache_bytes: usize,
-               cors: Vec<String>) -> Result<Server, String> {
+               cors: Vec<String>, keep: usize) -> Result<Server, String> {
         let work = glm.session(max_ctx).map_err(|e| e.0)?;
         Ok(Server { glm, tok, name, max_ctx, default_effort,
                     state: Mutex::new(Conv { work, live: Vec::new(), cache: PromptCache::new(cache_bytes), rng: Rng(0x5DEECE66D) }),
                     busy: AtomicBool::new(false), started: Instant::now(), current: Mutex::new(None), done: Mutex::new(VecDeque::new()),
-                    next_id: AtomicU64::new(1), cors })
+                    next_id: AtomicU64::new(1), keep, cors })
     }
 
     /// The checkpoint positions of a prompt: the end of its first turn and the start of its last user turn (each
@@ -251,7 +271,17 @@ impl Server {
             ("GET", "/server/status") => respond(&mut s, 200, &self.status_json()),
             ("GET", "/server/requests") => {
                 let done: Vec<Value> = self.done.lock().unwrap().iter().rev().cloned().collect();
-                respond(&mut s, 200, &json!({"running": self.current.lock().unwrap().clone(), "done": done}))
+                respond(&mut s, 200, &json!({"running": self.current.lock().unwrap().clone(), "done": done, "keep": self.keep}))
+            }
+            ("GET", p) if p.starts_with("/server/requests/") => {
+                let id: Option<u64> = p["/server/requests/".len()..].trim_start_matches('#').parse().ok();
+                let running = self.current.lock().unwrap().clone().filter(|r| r["id"].as_u64() == id);
+                let found = running.or_else(|| self.done.lock().unwrap().iter().find(|r| r["id"].as_u64() == id).cloned());
+                match found {
+                    Some(r) => respond(&mut s, 200, &r),
+                    None => respond(&mut s, 404, &json!({"error": {"message": format!("no request {} (the server keeps the last {})",
+                                                                                    &p["/server/requests/".len()..], self.keep)}})),
+                }
             }
             ("GET", "/server/cache") => match self.state.try_lock() {
                 Ok(st) => {
@@ -300,7 +330,7 @@ impl Server {
     fn remember(&self, row: Value) {
         let mut d = self.done.lock().unwrap();
         d.push_back(row);
-        while d.len() > 100 {
+        while d.len() > self.keep {
             d.pop_front();
         }
     }
@@ -346,8 +376,20 @@ impl Server {
         let mut st = self.state.lock().unwrap();
         self.busy.store(true, Ordering::Relaxed);
         let rid = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let effort = match ask.effort {
+            Effort::Low => "low",
+            Effort::High => "high",
+            Effort::Max => "max",
+        };
+        let last_user = ask.messages.iter().rev().find(|m| m.0 == "user").map_or("", |m| m.1.as_str());
         *self.current.lock().unwrap() = Some(json!({"id": rid, "via": via, "state": "reading", "started": now(), "prompt_tokens": ids.len(),
-                                                    "max_tokens": max, "generated": 0}));
+                                                    "max_tokens": max, "generated": 0, "model": self.name,
+                                                    "api": if api == Api::Lines { "/api/chat" } else { "/v1/chat/completions" },
+                                                    "settings": {"effort": effort, "temperature": round4(temp), "top_p": round4(top_p), "stream": stream,
+                                                                 "max_tokens": max},
+                                                    "messages": ask.messages.len(),
+                                                    "prompt_chars": ask.messages.iter().map(|m| m.1.len()).sum::<usize>(),
+                                                    "last_user": preview(last_user)}));
         let _idle = Guard(&self.busy);
         let st = &mut *st;
         let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
@@ -499,6 +541,9 @@ impl Server {
             row["generate_seconds"] = json!(dt);
             row["drafts"] = json!([dec.accepted, dec.drafted]);
             row["checkpoints_saved"] = json!(saved);
+            row["ended"] = json!(now());
+            row["answer"] = json!({"chars": content.trim().len(), "preview": preview(content.trim())});
+            row["thinking"] = json!({"chars": reasoning.trim().len(), "preview": preview(reasoning.trim())});
             self.remember(row);
         }
         let finish = if finish == "client gone" { "stop" } else { finish };

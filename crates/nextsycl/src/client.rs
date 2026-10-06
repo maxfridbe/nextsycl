@@ -3,6 +3,7 @@
 //!     nextsycl status [--no-stream]     the server, live (like `docker stats`): the model, its GPUs, the request
 //!                                       running, the prompt cache; --no-stream: once
 //!     nextsycl ps [-a]                  the request running and the last ones (-a: all the server remembers)
+//!     nextsycl inspect <id>             one request in full, as JSON
 //!     nextsycl cache [ls | clear]       the prompt cache's checkpoints, or drop them
 //!     nextsycl chat <text> [--effort low|high|max] [--max N] [--temp T]
 //!                                       one request, streamed: the thinking dimmed, then the answer
@@ -158,6 +159,17 @@ pub fn ps(raw: &[String]) -> Result<(), String> {
                  r["tok_s"].as_f64().map_or("-".into(), |t| format!("{t:.1}")), r["finish"].as_str().unwrap_or("-"),
                  dur(now() - r["started"].as_f64().unwrap_or(now())));
     }
+    Ok(())
+}
+
+/// `nextsycl inspect <id>`: the server's record of one request (an ID from `ps`, with or without the #)
+pub fn inspect(raw: &[String]) -> Result<(), String> {
+    let id = raw.first().ok_or("nextsycl inspect <id>")?.trim_start_matches('#');
+    if id.parse::<u64>().is_err() {
+        return Err(format!("nextsycl inspect: {id:?} is not a request ID (nextsycl ps lists them)"));
+    }
+    let v = get(&format!("/server/requests/{id}"))?;
+    println!("{}", serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?);
     Ok(())
 }
 

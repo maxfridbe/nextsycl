@@ -41,6 +41,7 @@ the server (a container; the model stays loaded on the GPUs):
 the server (over its socket):
   nextsycl status [--no-stream] live, like docker stats: the model, its GPUs, the request running, the prompt cache
   nextsycl ps [-a]              the request running and the last ones
+  nextsycl inspect <id>         one request (an ID from ps) as JSON: settings, messages, timings, previews
   nextsycl cache [ls | clear]   the prompt cache's checkpoints
   nextsycl chat <text> [--effort E] [--max N] [--temp T]
                                 one request, streamed
@@ -50,6 +51,7 @@ the server (over its socket):
 in this process (inside the image: the kernels need the oneAPI runtime):
   nextsycl serve <model.gguf> [--gpu 0,1 | all] [--host H] [--port N] [--name ID] [--ctx N] [--effort E] [--socket PATH]
                  [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)] [--cors ORIGINS]
+                 [--keep-requests N (100)]
                                 the server in the foreground (what start runs)
   nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
                     [--expert-gib G] [--mirror-gib G] [--no-mtp]
@@ -72,6 +74,7 @@ settings (environment, or NAME=value lines in nextsycl.conf beside the repositor
   NS_CTX           tokens of context (default 65536)      NS_NAME   the model id clients see (glm-5.3-flash-uncensored)
   NS_EFFORT        default reasoning effort (low)        NS_NO_MTP=1   decode without the draft block
   NS_PROMPT_CACHE_MIB   host memory for the prompt cache's checkpoints (default 4096; 0 = off)
+  NS_KEEP_REQUESTS ended requests the server keeps for ps and inspect (default 100)
   NS_SOCKET_DIR    where the control socket lives (default $XDG_RUNTIME_DIR/nextsycl)
   NS_IMAGE, NS_CONTAINER_ENGINE   the image with the oneAPI runtime (localhost/h3-build) and podman / docker";
 
@@ -639,7 +642,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), mirror, mtp, (ctx, 1), &mut log).map_err(e)?;
     eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds);
     let cors: Vec<String> = opt("--cors").unwrap_or_default().split([',', ' ']).filter(|o| !o.is_empty()).map(String::from).collect();
-    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort, cache, cors)?);
+    let keep: usize = opt("--keep-requests").and_then(|v| v.parse().ok()).unwrap_or(100);
+    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort, cache, cors, keep)?);
     srv.run(&addr, opt("--socket").map(std::path::PathBuf::from))
 }
 
@@ -654,6 +658,7 @@ fn main() -> ExitCode {
         Some("logs") => service::logs(&cfg, rest),
         Some("status") => client::status(rest),
         Some("ps") => client::ps(rest),
+        Some("inspect") => client::inspect(rest),
         Some("cache") => client::cache(rest),
         Some("chat") => client::chat(rest),
         Some("version") => {

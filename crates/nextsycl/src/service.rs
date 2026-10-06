@@ -77,7 +77,7 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     args.extend(["--gpu".into(), gpus.join(",")]);
     for (flag, setting, default) in [("--host", "NS_HOST", "127.0.0.1"), ("--port", "NS_PORT", "8085"), ("--ctx", "NS_CTX", "65536"),
                                      ("--name", "NS_NAME", "glm-5.3-flash-uncensored"), ("--effort", "NS_EFFORT", "low"),
-                                     ("--prompt-cache-mib", "NS_PROMPT_CACHE_MIB", "4096")] {
+                                     ("--prompt-cache-mib", "NS_PROMPT_CACHE_MIB", "4096"), ("--keep-requests", "NS_KEEP_REQUESTS", "100")] {
         args.extend([flag.into(), arg(raw, flag, cfg, setting, default)]);
     }
     if raw.iter().any(|a| a == "--no-mtp") || cfg.get("NS_NO_MTP").is_some_and(|v| v == "1") {
