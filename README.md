@@ -44,6 +44,14 @@ dist/nextsycl stop
 - **Zhipu AI's GLM-5.3**, and the people who quantized it: the uncensored GSQ-RCO and IQ2 files.
 - **Intel's oneAPI:** SYCL, oneMKL, and SYCLomatic, which migrated the kernels from CUDA.
 
+## Releases
+
+The version is `yy.mmdd.###`: the commit's date (UTC), then its number among that day's commits, from git
+(`./version.sh`; `nextsycl version` prints the one built in). Every push to `main` is built and tested by
+`.github/workflows/build.yml` and published as a release `v<version>` with `nextsycl-<version>-linux-x86_64.tar.gz`
+(the program, `libnextsycl.so`, `ns.h`, the docs). Other branches and pull requests keep the tarball as a workflow
+artifact.
+
 ## Docs
 
 - `docs/glm5next.md`: the model's math, as this runtime computes it.

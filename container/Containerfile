@@ -1,0 +1,22 @@
+# The build image of nextsycl: Intel's SYCL compiler and oneMKL (the kernel library) and Rust (the runtime). Everything
+# is built inside it, so the host needs podman only; it also runs the server (nextsycl start).
+#
+# The base is a public image with the oneAPI 2026 compiler and the Level Zero driver stack for Xe2 (Arc B-series)
+# already set up (the same base as the H3 engine's image).
+ARG BASE=ghcr.io/snailium/llama.cpp-sycl-intel-b70/llama-sycl-b70:stable
+FROM ${BASE}
+
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+      build-essential ca-certificates curl git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust, for every user id the container may run as; crates are fetched into the mounted source tree's target/
+ARG RUST=1.97.1
+ENV RUSTUP_HOME=/opt/rust/rustup PATH=/opt/rust/cargo/bin:$PATH
+RUN curl -sSf https://sh.rustup.rs | CARGO_HOME=/opt/rust/cargo sh -s -- -y --profile minimal --default-toolchain ${RUST} -c clippy \
+    && chmod -R a+rX /opt/rust
+
+ENV ZES_ENABLE_SYSMAN=1
+WORKDIR /src
+ENTRYPOINT []
+CMD ["/bin/bash"]

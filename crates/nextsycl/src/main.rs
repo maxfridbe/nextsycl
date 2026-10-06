@@ -24,6 +24,12 @@ use std::process::ExitCode;
 use ns_gguf::Gguf;
 use ns_model::glm5next::{Group, Model};
 
+/// yy.mmdd.### from git (version.sh), handed in by build.sh; "dev" for a build without it
+pub const VERSION: &str = match option_env!("NS_VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
+
 const USAGE: &str = "nextsycl - GLM-5.3-Flash on Intel Arc GPUs (Rust + SYCL)
 
 the server (a container; the model stays loaded on the GPUs):
@@ -637,7 +643,7 @@ fn main() -> ExitCode {
         Some("cache") => client::cache(rest),
         Some("chat") => client::chat(rest),
         Some("version") => {
-            println!("nextsycl {}", env!("CARGO_PKG_VERSION"));
+            println!("nextsycl {VERSION}");
             Ok(())
         }
         Some("help") | Some("--help") | Some("-h") => {

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ns-sys", "crates/ns-core", "crates/ns-gguf", "crates/ns-model", "crates/ns-engine", "crates/ns-tok", "crates/nextsycl"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.0"  # the release version is yy.mmdd.### from git (version.sh), handed in as NS_VERSION
 edition = "2021"
 license = "MIT"
 

@@ -557,7 +557,7 @@ mod tests {
         b.extend(1u64.to_le_bytes());
         b.extend(8u32.to_le_bytes());
         b.extend(32u64.to_le_bytes());
-        while b.len() % 32 != 0 {
+        while !b.len().is_multiple_of(32) {
             b.push(0);
         }
         b.extend((0..6).flat_map(|i| (i as f32).to_le_bytes()));

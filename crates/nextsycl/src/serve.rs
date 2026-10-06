@@ -179,7 +179,7 @@ impl Server {
             "expert_slots": g.expert_slots, "host_slots": g.host_slots})).collect();
         let cache = self.state.try_lock().ok().map(|st| json!({"entries": st.cache.len(), "bytes": st.cache.bytes(), "budget": st.cache.budget(),
                                                               "evictions": st.cache.evictions, "live_tokens": st.live.len()}));
-        json!({"model": self.name, "version": env!("CARGO_PKG_VERSION"), "uptime_seconds": self.started.elapsed().as_secs_f64(),
+        json!({"model": self.name, "version": crate::VERSION, "uptime_seconds": self.started.elapsed().as_secs_f64(),
                "context": self.max_ctx, "mtp": self.glm.mtp.is_some(), "gpus": gpus, "busy": self.busy.load(Ordering::Relaxed),
                "running": self.current.lock().unwrap().clone(), "served": self.next_id.load(Ordering::Relaxed) - 1,
                "prompt_cache": cache, "stopping": STOP.load(Ordering::SeqCst)})

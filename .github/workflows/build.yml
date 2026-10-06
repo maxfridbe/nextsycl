@@ -1,0 +1,103 @@
+# Build nextsycl in its own container, test it, and publish.
+#
+#   every push and pull request   build image -> ./build.sh -> ./build.sh test -> tarball artifact
+#   pushes to main                also publish the build image to the GitHub container registry, and a GitHub release
+#                                 v<version> with the tarball
+#
+# The version is yy.mmdd.### from git (./version.sh): the commit's date, then its number among that day's commits.
+#
+# No GPU is needed: the SYCL kernels are compiled ahead of time for the Arc B-series (AOT bmg-g31) and the Rust tests
+# run on the CPU. What needs a card (check, spec-check, kernels, bench) is run by hand on a machine that has one.
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # the release
+  packages: write   # the build image
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # version.sh counts the day's commits
+
+      - name: Version
+        run: |
+          echo "NS_VERSION=$(./version.sh)" >> "$GITHUB_ENV"
+          ./version.sh
+
+      - name: Free disk space (the build image is about 10 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # The image depends only on container/Containerfile, so it is published under that file's hash and reused
+      # until the file changes.
+      - name: Build image, or pull the one already published for this Containerfile
+        run: |
+          tag=$(sha256sum container/Containerfile | cut -c1-12)
+          ref="ghcr.io/${GITHUB_REPOSITORY,,}/nextsycl-build"
+          echo "IMAGE_REF=$ref" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin || true
+          if podman pull "$ref:$tag"; then
+            podman tag "$ref:$tag" localhost/nextsycl-build
+          else
+            ./build.sh image
+          fi
+
+      # the kernel library compiles template-heavy files at 2-3 GB of RAM a job: 4 jobs fit the 16 GB runner
+      - name: Build (SYCL kernels, Rust runtime)
+        env:
+          NS_IMAGE: localhost/nextsycl-build
+          JOBS: "4"
+        run: ./build.sh all
+
+      - name: Test (lints and unit tests)
+        env:
+          NS_IMAGE: localhost/nextsycl-build
+        run: ./build.sh test
+
+      - name: Package
+        run: |
+          name="nextsycl-$NS_VERSION-linux-x86_64"
+          mkdir -p "pkg/$name"
+          cp dist/nextsycl dist/libnextsycl.so kernels/ns/ns.h README.md "pkg/$name/"
+          cp -r docs "pkg/$name/"
+          echo "$NS_VERSION" > "pkg/$name/VERSION"
+          tar -C pkg -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "PKG=$name.tar.gz" >> "$GITHUB_ENV"
+          ls -la "$name.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextsycl
+          path: |
+            ${{ env.PKG }}
+            ${{ env.PKG }}.sha256
+
+      - name: Publish the build image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          podman tag localhost/nextsycl-build "$IMAGE_REF:$IMAGE_TAG"
+          podman push "$IMAGE_REF:$IMAGE_TAG"
+          podman tag localhost/nextsycl-build "$IMAGE_REF:latest"
+          podman push "$IMAGE_REF:latest"
+
+      - name: Publish the release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # every push to main is a release, tagged v<version> on the commit built
+          if gh release view "v$NS_VERSION" >/dev/null 2>&1; then echo "v$NS_VERSION is out already"; exit 0; fi
+          gh release create "v$NS_VERSION" "$PKG" "$PKG.sha256" --target "$GITHUB_SHA" --title "nextsycl $NS_VERSION" --generate-notes

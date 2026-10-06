@@ -51,7 +51,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "nextsycl"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ns-core",
  "ns-engine",
@@ -63,14 +63,14 @@ dependencies = [
 
 [[package]]
 name = "ns-core"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ns-sys",
 ]
 
 [[package]]
 name = "ns-engine"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ns-core",
  "ns-gguf",
@@ -79,22 +79,22 @@ dependencies = [
 
 [[package]]
 name = "ns-gguf"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "ns-model"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ns-gguf",
 ]
 
 [[package]]
 name = "ns-sys"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "ns-tok"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "fancy-regex",
  "ns-gguf",

@@ -2,3 +2,4 @@ target/
 *.gguf
 __pycache__/
 nextsycl.conf
+dist/
