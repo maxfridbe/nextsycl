@@ -52,6 +52,11 @@ int ns_dequant(ns_gpu* g, int type, const void* src, size_t n, float* dst);
 /* y [T, N] (+)= x [T, K] . w [N, K]^T; rows of x ldx floats apart, rows of y ldy apart */
 int ns_gemm(ns_gpu* g, int64_t T, int64_t N, int64_t K, const float* x, int64_t ldx, const float* w, float* y, int64_t ldy,
             int accumulate);
+/* batch products: y + b*sy [T, N] (+)= (x + b*sx) [T, K] . (w + b*sw) [N, K]^T */
+int ns_gemm_batch(ns_gpu* g, int64_t batch, int64_t T, int64_t N, int64_t K, const float* x, int64_t ldx, int64_t sx, const float* w, int64_t sw,
+                  float* y, int64_t ldy, int64_t sy, int accumulate);
+/* mHC mixes: m [T, 24] = fn [24, n] . rms(x [T, n]); part: scratch of T * 32 * 25 floats */
+int ns_hc_mix(ns_gpu* g, const float* x, const float* fn, float* m, float* part, int64_t T, int64_t n, float eps);
 int ns_rms_norm(ns_gpu* g, const float* x, const float* w, float* y, int64_t rows, int64_t C, float eps);
 int ns_layer_norm(ns_gpu* g, const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t C, float eps);
 /* mHC (docs/glm5next.md): m [T, 24] mixes; X [T, 4, C]; h [T, C]; post [T, 4]; comb [T, 16] */

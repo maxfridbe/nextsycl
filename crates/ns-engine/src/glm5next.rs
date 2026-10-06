@@ -618,8 +618,14 @@ impl<'g> Glm<'g> {
             let [flat, h, normed, post, comb, pre] = ws.as_ref().unwrap();
             // before a half: the mixes, h, post, comb; then the half's norm
             let hc_pre = |fn_: Role, base: Role, scale: Role, x: &DevBuf, norm: Role| -> Result<()> {
-                o.rms_norm(x, None, flat, t, 4 * d, eps)?;
-                let mixes = p.mm(l, fn_, flat, t)?;
+                let w = p.mat(l, fn_)?;
+                let mixes = p.arena.f32(t * 24)?;
+                if w.f32 && w.rows == 24 {
+                    o.hc_mix(x, &w.buf, &mixes, &p.arena.f32(t * 32 * 25)?, t, 4 * d, eps)?;
+                } else {
+                    o.rms_norm(x, None, flat, t, 4 * d, eps)?;
+                    p.matmul(w, t, (flat, 0, w.cols), (&mixes, 0, w.rows), false)?;
+                }
                 o.hc_pre(&mixes, p.vec(l, scale)?, p.vec(l, base)?, x, h, post, comb, pre, t, d, g.hc_eps as f32, g.hc_iters as u32)?;
                 o.rms_norm(h, Some(p.vec(l, norm)?), normed, t, d, eps)
             };
@@ -676,15 +682,25 @@ impl<'g> Glm<'g> {
                     // the absorbed queries: per head, q~ = k_b[h] . q_h
                     let kb = p.vec(l, Role::MlaKB)?;
                     let qt = p.arena.f32(t * nh * lat)?;
-                    for hh in 0..nh {
-                        o.gemm_at(t, lat, hd, (&q, hh * hd, nh * hd), (kb, hh * lat * hd), (&qt, hh * lat, nh * lat), false)?;
+                    // one token: every head's slice is contiguous, so the 64 heads are one batched call (oneMKL wants
+                    // the batches' outputs apart: rows interleaved by head only work at one row)
+                    if t == 1 {
+                        o.gemm_batch(nh, 1, lat, hd, (&q, 0, hd, hd), (kb, 0, lat * hd), (&qt, 0, lat, lat), false)?;
+                    } else {
+                        for hh in 0..nh {
+                            o.gemm_at(t, lat, hd, (&q, hh * hd, nh * hd), (kb, hh * lat * hd), (&qt, hh * lat, nh * lat), false)?;
+                        }
                     }
                     let u = p.arena.f32(t * nh * lat)?;
                     o.mla_attend(&qt, cache, &u, t, nh, lat, pos0, 1.0 / (hd as f32).sqrt())?;
                     let vb = p.vec(l, Role::MlaVB)?;
                     let oh = p.arena.f32(t * nh * hd)?;
-                    for hh in 0..nh {
-                        o.gemm_at(t, hd, lat, (&u, hh * lat, nh * lat), (vb, hh * hd * lat), (&oh, hh * hd, nh * hd), false)?;
+                    if t == 1 {
+                        o.gemm_batch(nh, 1, hd, lat, (&u, 0, lat, lat), (vb, 0, hd * lat), (&oh, 0, hd, hd), false)?;
+                    } else {
+                        for hh in 0..nh {
+                            o.gemm_at(t, hd, lat, (&u, hh * lat, nh * lat), (vb, hh * hd * lat), (&oh, hh * hd, nh * hd), false)?;
+                        }
                     }
                     tap(&format!("kqv_out-{l}"), &oh)?;
                     let out = p.mm(l, Role::MlaOut, &oh, t)?;

@@ -216,6 +216,60 @@ int ns_gemm(ns_gpu* g, int64_t T, int64_t N, int64_t K, const float* x, int64_t 
     NS_CATCH
 }
 
+// batch independent products: y_b [T, N] (+)= x_b [T, K] . w_b [N, K]^T, x_b = x + b * sx (rows ldx apart),
+// w_b = w + b * sw, y_b = y + b * sy (rows ldy apart) - one call for MLA's 64 heads
+int ns_gemm_batch(ns_gpu* g, int64_t batch, int64_t T, int64_t N, int64_t K, const float* x, int64_t ldx, int64_t sx, const float* w, int64_t sw,
+                  float* y, int64_t ldy, int64_t sy, int accumulate) {
+    NS_TRY
+    using oneapi::mkl::transpose;
+    oneapi::mkl::blas::row_major::gemm_batch(g->q, transpose::nontrans, transpose::trans, T, N, K, 1.0f, x, ldx, sx, w, K, sw,
+                                             accumulate ? 1.0f : 0.0f, y, ldy, sy, batch);
+    return 0;
+    NS_CATCH
+}
+
+// mHC's mixes: m [T, 24] = fn [24, n] . rms(x [T, n]) (no weight). Two passes so one token still spreads over
+// the GPU: NB work-groups per token reduce a column block each to 24 partial dots and a partial sum of squares;
+// then one work-item per (token, mix) adds the NB partials. (One work-group per token ran the whole 1.5 MB
+// reduction on one core: 4.6x slower than oneMKL.)
+int ns_hc_mix(ns_gpu* g, const float* x, const float* fn, float* m, float* part, int64_t T, int64_t n, float eps) {
+    NS_TRY
+    constexpr int WG = 256, M = 24, NB = 32;
+    auto& q = g->q;
+    const int64_t chunk = (n + NB - 1) / NB;
+    q.parallel_for(sycl::nd_range<1>(T * NB * WG, WG), [=](sycl::nd_item<1> it) {
+        const int64_t grp = it.get_group(0), t = grp / NB, b = grp % NB;
+        const float* xr = x + t * n;
+        const int lid = it.get_local_id(0);
+        const int64_t c0 = b * chunk, c1 = sycl::min(n, c0 + chunk);
+        float ss = 0.f, acc[M];
+        for (int o = 0; o < M; ++o) acc[o] = 0.f;
+        for (int64_t c = c0 + lid; c < c1; c += WG) {
+            const float v = xr[c];
+            ss += v * v;
+            for (int o = 0; o < M; ++o) acc[o] += fn[o * n + c] * v;
+        }
+        float* pr = part + grp * (M + 1);
+        for (int o = 0; o < M; ++o) {
+            const float r = sycl::reduce_over_group(it.get_group(), acc[o], sycl::plus<float>());
+            if (lid == 0) pr[o] = r;
+        }
+        ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+        if (lid == 0) pr[M] = ss;
+    });
+    q.parallel_for(sycl::range<1>(T * M), [=](sycl::id<1> id) {
+        const int64_t t = id[0] / M, o = id[0] % M;
+        float d = 0.f, ss = 0.f;
+        for (int b = 0; b < NB; ++b) {
+            d += part[(t * NB + b) * (M + 1) + o];
+            ss += part[(t * NB + b) * (M + 1) + M];
+        }
+        m[t * M + o] = d / sycl::sqrt(ss / (float) n + eps);
+    });
+    return 0;
+    NS_CATCH
+}
+
 // y = x / sqrt(mean(x^2) + eps) (* w when given), rows of C; y may be x
 int ns_rms_norm(ns_gpu* g, const float* x, const float* w, float* y, int64_t rows, int64_t C, float eps) {
     NS_TRY

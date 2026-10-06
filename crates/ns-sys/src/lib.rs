@@ -41,6 +41,8 @@ pub struct Api {
     // the bring-up kernels (glm.cpp)
     pub dequant: unsafe extern "C" fn(Gpu, c_int, *const c_void, usize, *mut f32) -> c_int,
     pub gemm: unsafe extern "C" fn(Gpu, i64, i64, i64, *const f32, i64, *const f32, *mut f32, i64, c_int) -> c_int,
+    pub gemm_batch: unsafe extern "C" fn(Gpu, i64, i64, i64, i64, *const f32, i64, i64, *const f32, i64, *mut f32, i64, i64, c_int) -> c_int,
+    pub hc_mix: unsafe extern "C" fn(Gpu, *const f32, *const f32, *mut f32, *mut f32, i64, i64, f32) -> c_int,
     pub rms_norm: unsafe extern "C" fn(Gpu, *const f32, *const f32, *mut f32, i64, i64, f32) -> c_int,
     pub layer_norm: unsafe extern "C" fn(Gpu, *const f32, *const f32, *const f32, *mut f32, i64, i64, f32) -> c_int,
     pub hc_pre: unsafe extern "C" fn(Gpu, *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32, *mut f32, i64, i64, f32, c_int) -> c_int,
@@ -136,6 +138,8 @@ impl Api {
             copy_peer: sym!("ns_copy_peer"),
             dequant: sym!("ns_dequant"),
             gemm: sym!("ns_gemm"),
+            gemm_batch: sym!("ns_gemm_batch"),
+            hc_mix: sym!("ns_hc_mix"),
             rms_norm: sym!("ns_rms_norm"),
             layer_norm: sym!("ns_layer_norm"),
             hc_pre: sym!("ns_hc_pre"),

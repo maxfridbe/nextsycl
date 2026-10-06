@@ -308,6 +308,34 @@ impl Ops {
         };
         self.ok(rc, "gemm")
     }
+    /// `batch` products on strided slices (in floats): x from x.1, rows x.2 apart, batch b at + b * x.3; w from w.1,
+    /// [n, k] contiguous, batch b at + b * w.2; y as x.
+    pub fn gemm_batch(&self, batch: usize, t: usize, n: usize, k: usize, x: (&DevBuf, usize, usize, usize), w: (&DevBuf, usize, usize),
+                      y: (&DevBuf, usize, usize, usize), acc: bool) -> Result<()> {
+        if batch == 0 || t == 0 || n == 0 {
+            return Ok(());
+        }
+        let last = batch - 1;
+        need!(x.0, x.1 + last * x.3 + (t - 1) * x.2 + k, "gemm_batch x");
+        need!(w.0, w.1 + last * w.2 + n * k, "gemm_batch w");
+        need!(y.0, y.1 + last * y.3 + (t - 1) * y.2 + n, "gemm_batch y");
+        // SAFETY: every batch's extent checked above.
+        let rc = unsafe {
+            (self.a().gemm_batch)(self.raw(), batch as i64, t as i64, n as i64, k as i64, x.0.fp().add(x.1), x.2 as i64, x.3 as i64, w.0.fp().add(w.1),
+                                  w.2 as i64, y.0.fp().add(y.1), y.2 as i64, y.3 as i64, acc as i32)
+        };
+        self.ok(rc, "gemm_batch")
+    }
+    /// m [t, 24] = fn [24, n] . rms(x [t, n]); `part` scratch of t * 32 * 25 floats
+    pub fn hc_mix(&self, x: &DevBuf, fn_: &DevBuf, m: &DevBuf, part: &DevBuf, t: usize, n: usize, eps: f32) -> Result<()> {
+        need!(x, t * n, "hc_mix x");
+        need!(fn_, 24 * n, "hc_mix fn");
+        need!(m, t * 24, "hc_mix m");
+        need!(part, t * 32 * 25, "hc_mix scratch");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().hc_mix)(self.raw(), x.fp(), fn_.fp(), m.fp(), part.fp(), t as i64, n as i64, eps) };
+        self.ok(rc, "hc_mix")
+    }
     pub fn rms_norm(&self, x: &DevBuf, w: Option<&DevBuf>, y: &DevBuf, rows: usize, c: usize, eps: f32) -> Result<()> {
         need!(x, rows * c, "rms_norm x");
         need!(y, rows * c, "rms_norm y");
