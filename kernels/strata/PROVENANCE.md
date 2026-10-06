@@ -25,3 +25,6 @@ New code goes in `kernels/ns/`. The changes made here, each marked `nextsycl` in
   matvec format lists, Q4_K / Q5_K to the down list; Q2_K in `is_iq` / `iq_row_bytes` - GLM-5.3's expert files.
   The grouped experts' SwiGLU takes an optional clamp (`native_expert_set_swiglu_limit`, 0 = none as before;
   GLM-5.3's `silu(min(g, 10)) * clamp(u, -10, 10)`).
+- `iq_kernels.dp.cpp`: multi-entry dots for IQ2_XXS (`Multi<16>`) and Q2_K (`Multi<10>`, a `custom` per-token dot),
+  and 8-entry passes in the grouped expert kernels: GLM-5.3's expert formats decoded once per 8 tokens of a prompt
+  chunk instead of once per token. Same arithmetic as the single-entry dots.

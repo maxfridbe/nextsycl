@@ -204,6 +204,26 @@ int ns_dequant(ns_gpu* g, int type, const void* src, size_t n, float* dst) {
     NS_CATCH
 }
 
+// x float32 -> fp16 (rows of the prompt path's half GEMMs)
+int ns_to_f16(ns_gpu* g, const float* x, uint16_t* y, int64_t n) {
+    NS_TRY
+    sycl::half* h = (sycl::half*) y;
+    g->q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { h[i] = (sycl::half) x[i]; });
+    return 0;
+    NS_CATCH
+}
+
+// y [T, N] (+)= x [T, K] . w [N, K]^T with fp16 x and w, float32 y and accumulation (oneMKL: the XMX units)
+int ns_gemm_f16(ns_gpu* g, int64_t T, int64_t N, int64_t K, const uint16_t* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                int accumulate) {
+    NS_TRY
+    using oneapi::mkl::transpose;
+    oneapi::mkl::blas::row_major::gemm(g->q, transpose::nontrans, transpose::trans, T, N, K, 1.0f, (const sycl::half*) x, ldx,
+                                       (const sycl::half*) w, K, accumulate ? 1.0f : 0.0f, y, ldy);
+    return 0;
+    NS_CATCH
+}
+
 // y [T, N] (+)= x [T, K] . w [N, K]^T, float32 row-major; rows of x are ldx apart, rows of y ldy apart (column
 // slices: one head's columns of a wider activation, one row chunk of a matrix into its columns of the output)
 int ns_gemm(ns_gpu* g, int64_t T, int64_t N, int64_t K, const float* x, int64_t ldx, const float* w, float* y, int64_t ldy,

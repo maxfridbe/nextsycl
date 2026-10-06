@@ -31,7 +31,7 @@ const MAX_COLS: usize = 16384;
 /// expert slots and the mirror are allocated in chunks of this size (single allocations stay small)
 const CHUNK: usize = 2 << 30;
 /// prompt tokens per forward pass (a layer's temporaries are ~1.5 MB a token; the arenas are 1 GiB)
-pub const PREFILL_CHUNK: usize = 256;
+pub const PREFILL_CHUNK: usize = 512;
 /// rows of a verify pass (the token and its draft); the KDA states keep a snapshot after each row but the last
 pub const MAX_VERIFY: usize = 2;
 /// the indexer's pool scores per GEMM (floats): pools are scored in chunks that fit (64 MiB)
@@ -1239,7 +1239,9 @@ impl<'g> Glm<'g> {
             let wb = p.arena.f32(wts.len())?;
             wb.write(0, &wts.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
             // the grouped kernels (two launches for the layer), when they take this layer's types
-            if parts.gate.2 == parts.up.2 && o.moe_grouped_supported(parts.gate.2.code(), parts.down.2.code(), d, f) {
+            // NS_PROMPT_DEQUANT=1: prompt chunks take the expanded-GEMM path instead (a measurement switch)
+            let dequant = t > MMVQ_COLS && (std::env::var("NS_PROMPT_DEQUANT").is_ok_and(|v| v == "1") || std::env::var("NS_PROMPT_F16").is_ok_and(|v| v == "1"));
+            if !dequant && parts.gate.2 == parts.up.2 && o.moe_grouped_supported(parts.gate.2.code(), parts.down.2.code(), d, f) {
                 let groups = by.len();
                 let mut table: Vec<u8> = Vec::with_capacity(groups * 8 + (groups + 2 + 2 * total) * 4);
                 for slot in &slots {
@@ -1276,6 +1278,35 @@ impl<'g> Glm<'g> {
             let gt = p.arena.f32(total * f)?;
             let ut = p.arena.f32(total * f)?;
             let dn = p.arena.f32(total * d)?;
+            // NS_PROMPT_F16=1: each expert expanded to fp16 once a chunk, its rows multiplied by oneMKL's half GEMM
+            if t > MMVQ_COLS && std::env::var("NS_PROMPT_F16").is_ok_and(|v| v == "1") {
+                let xh = p.arena.bytes(total * d * 2)?;
+                o.to_f16(&xe, &xh, total * d)?;
+                let w16 = p.arena.bytes(f * d * 2 * 2)?; // gate | up of one expert (down reuses the first half)
+                let mut row = 0;
+                for (list, buf) in by.values().zip(&slots) {
+                    let n = list.len();
+                    o.dequant_f16(parts.gate.2.code(), buf, parts.gate.0, parts.gate.1, f * d, &w16)?;
+                    let wu = w16.view(f * d * 2, f * d * 2)?;
+                    o.dequant_f16(parts.up.2.code(), buf, parts.up.0, parts.up.1, f * d, &wu)?;
+                    o.gemm_f16(n, f, d, (&xh, row * d, d), (&w16, 0), (&gt, row * f, f), false)?;
+                    o.gemm_f16(n, f, d, (&xh, row * d, d), (&wu, 0), (&ut, row * f, f), false)?;
+                    row += n;
+                }
+                o.swiglu_clamp(&gt, &ut, &gt, total * f, lim)?;
+                let hh = p.arena.bytes(total * f * 2)?;
+                o.to_f16(&gt, &hh, total * f)?;
+                let mut row = 0;
+                for (list, buf) in by.values().zip(&slots) {
+                    let n = list.len();
+                    o.dequant_f16(parts.down.2.code(), buf, parts.down.0, parts.down.1, d * f, &w16)?;
+                    o.gemm_f16(n, d, f, (&hh, row * f, f), (&w16, 0), (&dn, row * d, d), false)?;
+                    row += n;
+                }
+                let ints_view = p.arena.bytes((t + 1 + total) * 4)?;
+                ints_view.copy_within(0, &ib, base * 4, (t + 1 + total) * 4)?;
+                return o.moe_combine(&y, &dn, &ints_view, &wb, t, total, d);
+            }
             let mut row = 0;
             for (list, buf) in by.values().zip(&slots) {
                 let n = list.len();

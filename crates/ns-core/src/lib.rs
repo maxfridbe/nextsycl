@@ -294,6 +294,39 @@ impl Ops {
         let rc = unsafe { (self.a().dequant)(self.raw(), ty as i32, src.ptr.cast::<u8>().add(at).cast::<c_void>(), n, dst.fp()) };
         self.ok(rc, "dequant")
     }
+    /// n values of a stored matrix (bytes [at, at + bytes) of src) expanded to fp16 into dst (2 bytes a value)
+    pub fn dequant_f16(&self, ty: u32, src: &DevBuf, at: usize, bytes: usize, n: usize, dst: &DevBuf) -> Result<()> {
+        src.bounds(at, bytes)?;
+        dst.bounds(0, n * 2)?;
+        // SAFETY: both ranges checked.
+        let rc = unsafe { (self.a().dequant_f16)(self.raw(), ty as i32, src.ptr.cast::<u8>().add(at).cast::<c_void>(), n as i64, dst.ptr.cast()) };
+        self.ok(rc, "dequant_f16")
+    }
+    /// x [n] float32 -> y [n] fp16
+    pub fn to_f16(&self, x: &DevBuf, y: &DevBuf, n: usize) -> Result<()> {
+        need!(x, n, "to_f16 x");
+        y.bounds(0, n * 2)?;
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().to_f16)(self.raw(), x.fp(), y.ptr.cast(), n as i64) };
+        self.ok(rc, "to_f16")
+    }
+    /// y [t, n] (+)= x [t, k] . w [n, k]^T, fp16 x (from value `x.1`, rows `x.2` apart) and w (from value `w.1`),
+    /// float32 y (from float `y.1`, rows `y.2` apart)
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16(&self, t: usize, n: usize, k: usize, x: (&DevBuf, usize, usize), w: (&DevBuf, usize), y: (&DevBuf, usize, usize), acc: bool) -> Result<()> {
+        if t == 0 || n == 0 {
+            return Ok(());
+        }
+        x.0.bounds(x.1 * 2, ((t - 1) * x.2 + k) * 2)?;
+        w.0.bounds(w.1 * 2, n * k * 2)?;
+        need!(y.0, y.1 + (t - 1) * y.2 + n, "gemm_f16 y");
+        // SAFETY: extents checked.
+        let rc = unsafe {
+            (self.a().gemm_f16)(self.raw(), t as i64, n as i64, k as i64, x.0.ptr.cast::<u16>().add(x.1), x.2 as i64, w.0.ptr.cast::<u16>().add(w.1),
+                                y.0.fp().add(y.1), y.2 as i64, acc as i32)
+        };
+        self.ok(rc, "gemm_f16")
+    }
     /// y [t, n] (+)= x [t, k] . w [n, k]^T, all contiguous
     pub fn gemm(&self, t: usize, n: usize, k: usize, x: &DevBuf, w: &DevBuf, y: &DevBuf, acc: bool) -> Result<()> {
         self.gemm_at(t, n, k, (x, 0, k), (w, 0), (y, 0, n), acc)

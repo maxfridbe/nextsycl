@@ -89,6 +89,12 @@ int ns_mla_attend_sel(ns_gpu* g, const float* qa, const float* c, float* u, int6
 int ns_scatter_add(ns_gpu* g, float* y, const float* src, const int32_t* idx, const float* w, int64_t n, int64_t C);
 int ns_gather(ns_gpu* g, const float* src, const int32_t* idx, float* out, int64_t n, int64_t C);
 int ns_add(ns_gpu* g, float* y, const float* x, int64_t n);
+/* the prompt path's half GEMMs: a stored matrix expanded to fp16 (types the IQ kernels take), float32 -> fp16, and
+ * y [T, N] (+)= x [T, K] . w [N, K]^T with fp16 x / w, float32 y */
+int ns_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
+int ns_to_f16(ns_gpu* g, const float* x, uint16_t* y, int64_t n);
+int ns_gemm_f16(ns_gpu* g, int64_t T, int64_t N, int64_t K, const uint16_t* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                int accumulate);
 /* MoE combine per token: y[t] += sum_{j in [t_ptr[t], t_ptr[t+1])} w[j] * rows[ent[j]], rows [entries, C] */
 int ns_moe_combine(ns_gpu* g, float* y, const float* rows, const int32_t* t_ptr, const int32_t* ent, const float* w, int64_t T, int64_t C);
 

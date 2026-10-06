@@ -1197,10 +1197,10 @@ mmvq_multi_kernel(const uint8_t *__restrict__ w, size_t row_bytes,
 // (weights, once) and `acts` + `finish` (per token). NW packed int32s of weights per call.
 struct MultiW { int w[8]; int a = 0, b = 0; float d = 0.f; };
 
-template <int TY> struct Multi { static constexpr bool has = false; static constexpr int NW = 0; };
+template <int TY> struct Multi { static constexpr bool has = false, custom = false; static constexpr int NW = 0; };
 
 template <> struct Multi<18> {   // iq3_xxs
-    static constexpr bool has = true; static constexpr int NW = 8;
+    static constexpr bool has = true, custom = false; static constexpr int NW = 8;
     __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* grid = nullptr) {
         const block_iq3_xxs* bq3 = (const block_iq3_xxs*) vbq + kbx;
 #if STRATA_IQ4NL_FAST
@@ -1237,7 +1237,7 @@ template <> struct Multi<18> {   // iq3_xxs
 };
 
 template <> struct Multi<22> {   // iq2_s
-    static constexpr bool has = true; static constexpr int NW = 8;
+    static constexpr bool has = true, custom = false; static constexpr int NW = 8;
     __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* grid = nullptr) {
         const block_iq2_s* bq2 = (const block_iq2_s*) vbq + kbx;
 #if STRATA_IQ4NL_FAST
@@ -1275,7 +1275,7 @@ template <> struct Multi<22> {   // iq2_s
 };
 
 template <> struct Multi<21> {   // iq3_s
-    static constexpr bool has = true; static constexpr int NW = 8;
+    static constexpr bool has = true, custom = false; static constexpr int NW = 8;
     __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* grid = nullptr) {
         const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
 #if STRATA_IQ4NL_FAST
@@ -1312,7 +1312,7 @@ template <> struct Multi<21> {   // iq3_s
 };
 
 template <> struct Multi<20> {   // iq4_nl (down)
-    static constexpr bool has = true; static constexpr int NW = 4;
+    static constexpr bool has = true, custom = false; static constexpr int NW = 4;
     __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* = nullptr) {
         const block_iq4_nl* bq4 = (const block_iq4_nl*) vbq + kbx;
 #if STRATA_IQ4NL_FAST
@@ -1341,7 +1341,7 @@ template <> struct Multi<20> {   // iq4_nl (down)
 };
 
 template <> struct Multi<42> {   // q2_0 (down)
-    static constexpr bool has = true; static constexpr int NW = 8;
+    static constexpr bool has = true, custom = false; static constexpr int NW = 8;
     __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* = nullptr) {
         const block_q2_0* bq2_0 = (const block_q2_0*) vbq + kbx;
         const int16_t* qs = (const int16_t*) bq2_0->qs + iqs * 4;
@@ -1364,6 +1364,72 @@ template <> struct Multi<42> {   // q2_0 (down)
     __dpct_inline__ static float finish(int s0, int s1, const MultiW& m, float ds) { return m.d * ds * (float) (s0 + s1); }
 };
 
+// nextsycl: IQ2_XXS (GLM-5.3's expert gate / up) - vec_dot_iq2_xxs_q8_1 split as Multi<18>; the same integers and the
+// same float order, so a token's result equals the single-entry path's
+template <> struct Multi<16> {   // iq2_xxs
+    static constexpr bool has = true, custom = false; static constexpr int NW = 8;
+    __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* = nullptr) {
+        const block_iq2_xxs* bq2 = (const block_iq2_xxs*) vbq + kbx;
+        const int q2 = get_int_b2(bq2->qs, iqs);
+        const uint8_t* aux8 = (const uint8_t*) &q2;
+        const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+#pragma unroll
+        for (int k0 = 0; k0 < 8; k0 += 2) {
+            const sycl::uint2 grid_pos = ((const sycl::uint2*) iq2xxs_grid)[aux8[k0 / 2]];
+            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+            const int signs0 = swar_ne4(signs & 0x08040201);
+            const int signs1 = swar_ne4(signs & 0x80402010);
+            m.w[k0 + 0] = swar_sub4(grid_pos.x() ^ signs0, signs0);
+            m.w[k0 + 1] = swar_sub4(grid_pos.y() ^ signs1, signs1);
+        }
+        m.a = (int) (aux32 >> 27 | 1);
+        m.d = sycl::vec<sycl::half, 1>(bq2->d).convert<float, sycl::rounding_mode::automatic>()[0];
+    }
+    __dpct_inline__ static void acts(const block_q8_1* y, int iqs, int* u, float& ds) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) u[j] = get_int_b4(y[iqs / 2].qs, j);
+        ds = y[iqs / 2].ds[0];
+    }
+    __dpct_inline__ static float finish(int s0, int s1, const MultiW& m, float ds) {
+        const int sumi = (s0 + s1) * m.a / 8;
+        return m.d * ds * (float) sumi;
+    }
+};
+
+// nextsycl: Q2_K (GLM-5.3's expert down) - one call spans four q8_1 blocks with their own scales, so the per-token
+// part is a whole `dot` over the prepared weights (custom), the arithmetic of vec_dot_q2_K_q8_1
+template <> struct Multi<10> {   // q2_K
+    static constexpr bool has = true, custom = true; static constexpr int NW = 0;
+    __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* = nullptr) {
+        const block_q2_K* b = (const block_q2_K*) vbq + kbx;
+        const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+        const uint8_t* scales = b->scales + scale_offset;
+        m.w[0] = get_int_b4(b->qs, iqs);
+#pragma unroll
+        for (int i = 0; i < QR2_K; ++i) m.w[1 + i] = scales[2 * i];
+        const sycl::float2 dm2f = b->dm.convert<float, sycl::rounding_mode::automatic>();
+        m.d = dm2f.x();
+        m.b = sycl::bit_cast<int>(dm2f.y());
+    }
+    __dpct_inline__ static float dot(const MultiW& m, const block_q8_1* y, int iqs) {
+        const int bq8_offset = QR2_K * (iqs / QI8_1);
+        float sumf_d = 0.0f, sumf_m = 0.0f;
+#pragma unroll
+        for (int i = 0; i < QR2_K; ++i) {
+            const int u = get_int_b4(y[bq8_offset + i].qs, iqs % QI8_1);
+            const float d8 = y[bq8_offset + i].ds[0];
+            const int sc = m.w[1 + i];
+            const int vi = (m.w[0] >> (2 * i)) & 0x03030303;
+            sumf_d += d8 * (ggml_cuda_dp4a(vi, u, 0) * (sc & 0xF));
+            int mm = sc >> 4;
+            mm |= mm << 8;
+            mm |= mm << 16;
+            sumf_m += d8 * ggml_cuda_dp4a(mm, u, 0);
+        }
+        return m.d * sumf_d - sycl::bit_cast<float>(m.b) * sumf_m;
+    }
+};
+
 // One row against E activations at once, LANES lanes per row.
 template <int TY, int LANES, int E>
 __dpct_inline__ void row_dot_multi(const uint8_t* row, const block_q8_1* const* xs, int nb, int sub, float* out,
@@ -1379,15 +1445,19 @@ __dpct_inline__ void row_dot_multi(const uint8_t* row, const block_q8_1* const* 
         M::prep(row, kbx, iqs, m, grid);
 #pragma unroll
         for (int e = 0; e < E; ++e) {
-            int u[8];
-            float ds;
-            M::acts(xs[e] + kbx * (F::qk / 32), iqs, u, ds);
-            int s0 = 0, s1 = 0;
+            if constexpr (M::custom) {
+                s[e] += M::dot(m, xs[e] + kbx * (F::qk / 32), iqs);
+            } else {
+                int u[8];
+                float ds;
+                M::acts(xs[e] + kbx * (F::qk / 32), iqs, u, ds);
+                int s0 = 0, s1 = 0;
 #pragma unroll
-            for (int j = 0; j < M::NW / 2; ++j) s0 = ggml_cuda_dp4a(m.w[j], u[j], s0);
+                for (int j = 0; j < M::NW / 2; ++j) s0 = ggml_cuda_dp4a(m.w[j], u[j], s0);
 #pragma unroll
-            for (int j = M::NW / 2; j < M::NW; ++j) s1 = ggml_cuda_dp4a(m.w[j], u[j], s1);
-            s[e] += M::finish(s0, s1, m, ds);
+                for (int j = M::NW / 2; j < M::NW; ++j) s1 = ggml_cuda_dp4a(m.w[j], u[j], s1);
+                s[e] += M::finish(s0, s1, m, ds);
+            }
         }
     }
 #pragma unroll
@@ -1401,6 +1471,17 @@ __dpct_inline__ void row_entries(const uint8_t* wr, const block_q8_1* x, int x_s
                                  const void* grid = nullptr) {
     int e = e0;
     if constexpr (Multi<TY>::has) {
+        // nextsycl: prompt chunks route ~8-16 tokens to an expert - 8 at a time decodes its weights half as often
+        for (; e + 8 <= e1; e += 8) {
+            const block_q8_1* xs[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) xs[i] = x + (size_t) ent_idx[e + i] * x_stride;
+            float o[8];
+            row_dot_multi<TY, LANES, 8>(wr, xs, nb, sub, o, grid);
+            if (sub == 0)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) dst[(size_t) (e + i) * dst_stride] = o[i];
+        }
         for (; e + 4 <= e1; e += 4) {
             const block_q8_1* xs[4] = {x + (size_t) ent_idx[e] * x_stride, x + (size_t) ent_idx[e + 1] * x_stride,
                                        x + (size_t) ent_idx[e + 2] * x_stride, x + (size_t) ent_idx[e + 3] * x_stride};
@@ -1542,6 +1623,16 @@ __dpct_inline__ void native_down_kernel(
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         int e = e0;
         if constexpr (Multi<TD>::has) {
+            for (; e + 8 <= e1; e += 8) {   // nextsycl: prompt chunks (see row_entries)
+                const block_q8_1* xs[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) xs[i] = hq + (size_t) (e + i) * hb;
+                float o[8];
+                row_dot_multi<TD, LN, 8>(wr, xs, nb, sub, o);
+                if (sub == 0)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) out[(size_t) ent_dst[e + i] * L.n_embd + r] = o[i];
+            }
             for (; e + 4 <= e1; e += 4) {
                 const block_q8_1* xs[4] = {hq + (size_t) e * hb, hq + (size_t) (e + 1) * hb, hq + (size_t) (e + 2) * hb, hq + (size_t) (e + 3) * hb};
                 float o[4];

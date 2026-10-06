@@ -68,4 +68,13 @@ int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n
     NS_CATCH
 }
 
+// n values of a stored expert matrix (n a multiple of 256) expanded to fp16, for the prompt path's half GEMMs
+int ns_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst) {
+    NS_TRY
+    if (!strata::kernels::iq_supported(type) || n % 256 != 0) return ns_fail("ns_dequant_f16: ggml type " + std::to_string(type));
+    strata::kernels::iq_dequant_f16(type, src, n, dst, &g->q);
+    return 0;
+    NS_CATCH
+}
+
 }  // extern "C"
