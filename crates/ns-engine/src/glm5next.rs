@@ -174,6 +174,16 @@ struct MtpState {
     next: Vec<u32>,
 }
 
+/// A conversation's state at a position, in host memory (`Glm::save` / `Glm::restore`).
+pub struct Checkpoint {
+    pub pos: usize,
+    max_ctx: usize,
+    bufs: Vec<Vec<u8>>,
+    mtp: Option<(usize, usize, Vec<u32>)>,
+    /// host bytes held
+    pub bytes: usize,
+}
+
 /// Generation from a fed prompt: `Glm::step` commits the next token(s) each call. The last committed token is fed
 /// at the start of the following call (a stop token is never fed).
 pub struct Decoder {
@@ -694,6 +704,94 @@ impl<'g> Glm<'g> {
             logits = self.forward(sess, c, &mut *tap)?;
         }
         Ok(logits)
+    }
+
+    /// The conversation's whole state at `sess.pos`, copied to host memory: per KDA layer its recurrent state and
+    /// convolution inputs, per MLA layer its latents and pooled keys up to the position and its indexer ring, and the
+    /// draft block's side (its cache, indexer, pending rows). `restore` puts it back into a session of the same shape
+    /// - the prompt cache's checkpoints. Pageable memory: a checkpoint spans both GPUs' contexts.
+    pub fn save(&self, sess: &Session) -> Result<Checkpoint> {
+        let g = &self.m.g;
+        let (lat, d, n) = (g.kv_lora as usize * 4, g.idx_dim as usize * 4, sess.pos);
+        let mut bufs: Vec<Vec<u8>> = Vec::new();
+        let mut take = |b: &DevBuf, len: usize| -> Result<()> {
+            let mut v = vec![0u8; len];
+            if len > 0 {
+                b.read(0, &mut v)?;
+            }
+            bufs.push(v);
+            Ok(())
+        };
+        for l in &sess.layers {
+            match l {
+                LayerState::Kda { s, conv, .. } => {
+                    take(s, s.len)?;
+                    for c in conv {
+                        take(c, c.len)?;
+                    }
+                }
+                LayerState::Mla { c, idx } => {
+                    take(c, n * lat)?;
+                    take(&idx.ring, idx.ring.len)?;
+                    take(&idx.pooled, n / 4 * d)?;
+                }
+            }
+        }
+        let mtp = match &sess.mtp {
+            Some(ms) => {
+                let upto = if ms.rows > 0 { ms.slot0 } else { n };
+                take(&ms.cache, upto * lat)?;
+                take(&ms.idx.ring, ms.idx.ring.len)?;
+                take(&ms.idx.pooled, upto / 4 * d)?;
+                take(&ms.hid, ms.rows * g.n_embd as usize * 4)?;
+                Some((ms.rows, ms.slot0, ms.next.clone()))
+            }
+            None => None,
+        };
+        let bytes = bufs.iter().map(|b| b.len()).sum();
+        Ok(Checkpoint { pos: n, max_ctx: sess.max_ctx, bufs, mtp, bytes })
+    }
+
+    /// `sess` becomes the conversation `ck` was saved from (same context size).
+    pub fn restore(&self, sess: &mut Session, ck: &Checkpoint) -> Result<()> {
+        if ck.max_ctx != sess.max_ctx {
+            return Err(Error("restore: the checkpoint is of another context size".into()));
+        }
+        let mut it = ck.bufs.iter();
+        let mut put = |b: &DevBuf| -> Result<()> {
+            let v = it.next().ok_or("restore: the checkpoint is short")?;
+            if !v.is_empty() {
+                b.write(0, v)?;
+            }
+            Ok(())
+        };
+        for l in &sess.layers {
+            match l {
+                LayerState::Kda { s, conv, .. } => {
+                    put(s)?;
+                    for c in conv {
+                        put(c)?;
+                    }
+                }
+                LayerState::Mla { c, idx } => {
+                    put(c)?;
+                    put(&idx.ring)?;
+                    put(&idx.pooled)?;
+                }
+            }
+        }
+        if let (Some(ms), Some((rows, slot0, next))) = (&mut sess.mtp, &ck.mtp) {
+            put(&ms.cache)?;
+            put(&ms.idx.ring)?;
+            put(&ms.idx.pooled)?;
+            put(&ms.hid)?;
+            ms.rows = *rows;
+            ms.slot0 = *slot0;
+            ms.next = next.clone();
+        }
+        sess.pos = ck.pos;
+        sess.snapped = None;
+        Ok(())
     }
 
     /// Back to an empty conversation (the recurrent states zeroed; the MLA caches need nothing: `pos` bounds them).

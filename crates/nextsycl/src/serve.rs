@@ -7,9 +7,12 @@
 //!     POST /v1/chat/completions    messages, max_tokens, temperature, top_p, stream, reasoning_effort (or
 //!                                  chat_template_kwargs.reasoning_effort): low | high | max
 //!
-//! One request runs at a time (the others wait). The conversation is kept at the end of each prompt (the recurrent
-//! states and the MLA caches): a request whose prompt begins with the previous prompt feeds only the rest. GLM's
-//! thinking comes back as `reasoning_content`, the answer as `content`.
+//! One request runs at a time (the others wait). The prompt cache (cache.rs, --prompt-cache-mib) keeps the
+//! conversation state at three points of every prompt - the end of its first turn (a system prompt other
+//! conversations share), the start of its last user turn (an edited or regenerated message), its end (the next turn
+//! of the conversation) - and a request mounts the longest cached prefix of its tokens, or continues the live
+//! session when that is longer, and reads only the rest. GLM's thinking comes back as `reasoning_content`, the
+//! answer as `content`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -18,6 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ns_engine::glm5next::{Glm, Session};
+
+use crate::cache::PromptCache;
 use ns_tok::{Effort, Message, Tokenizer};
 use serde_json::{json, Value};
 
@@ -35,13 +40,16 @@ pub struct Server {
     busy: AtomicBool,
 }
 
-/// The working session, and a copy of it at the end of the last prompt with that prompt's tokens.
+/// The working session with the tokens it has consumed, and the prompt cache.
 struct Conv {
     work: Session,
-    snap: Session,
-    snap_tokens: Vec<u32>,
+    live: Vec<u32>,
+    cache: PromptCache,
     rng: Rng,
 }
+
+/// Prefixes shorter than this are read again rather than cached
+const MIN_CHECKPOINT: usize = 64;
 
 fn respond(s: &mut TcpStream, code: u16, body: &Value) {
     let b = body.to_string();
@@ -68,11 +76,27 @@ fn text_of(v: &Value) -> String {
 }
 
 impl Server {
-    pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, max_ctx: usize, default_effort: Effort) -> Result<Server, String> {
+    pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, max_ctx: usize, default_effort: Effort, cache_bytes: usize) -> Result<Server, String> {
         let work = glm.session(max_ctx).map_err(|e| e.0)?;
-        let snap = glm.session(max_ctx).map_err(|e| e.0)?;
-        Ok(Server { glm, tok, name, max_ctx, default_effort, state: Mutex::new(Conv { work, snap, snap_tokens: Vec::new(), rng: Rng(0x5DEECE66D) }),
+        Ok(Server { glm, tok, name, max_ctx, default_effort,
+                    state: Mutex::new(Conv { work, live: Vec::new(), cache: PromptCache::new(cache_bytes), rng: Rng(0x5DEECE66D) }),
                     busy: AtomicBool::new(false) })
+    }
+
+    /// The checkpoint positions of a prompt: the end of its first turn and the start of its last user turn (each
+    /// where a `<|user|>` token begins), and its end.
+    fn stops(&self, ids: &[u32]) -> Vec<usize> {
+        let mut v = Vec::new();
+        if let Some(u) = self.tok.id("<|user|>") {
+            let at: Vec<usize> = ids.iter().enumerate().filter(|(_, t)| **t == u).map(|(i, _)| i).collect();
+            v.extend(at.first().copied());
+            v.extend(at.last().copied());
+        }
+        v.push(ids.len());
+        v.retain(|p| *p >= MIN_CHECKPOINT);
+        v.sort();
+        v.dedup();
+        v
     }
 
     /// Serves until SIGTERM / SIGINT, then ends once no request runs: a GPU process stopped inside a kernel can
@@ -141,7 +165,13 @@ impl Server {
         let path = path.split('?').next().unwrap_or("").to_string();
         match (method.as_str(), path.as_str()) {
             ("GET", "/health") => respond(&mut s, 200, &json!({"status": "ok"})),
-            ("GET", "/status") => respond(&mut s, 200, &json!({"busy": self.busy.load(Ordering::Relaxed)})),
+            ("GET", "/status") => {
+                let busy = self.busy.load(Ordering::Relaxed);
+                // the cache's figures when no request holds the state (a status call never waits)
+                let cache = self.state.try_lock().ok().map(|st| json!({"entries": st.cache.len(), "bytes": st.cache.bytes(),
+                                                                      "evictions": st.cache.evictions, "live_tokens": st.live.len()}));
+                respond(&mut s, 200, &json!({"busy": busy, "prompt_cache": cache}))
+            }
             ("GET", "/v1/models") | ("GET", "/models") => respond(&mut s, 200, &json!({"object": "list", "data": [
                 {"id": self.name, "object": "model", "owned_by": "nextsycl", "created": now(), "status": {"value": "loaded"}}]})),
             ("POST", "/v1/chat/completions") | ("POST", "/chat/completions") => {
@@ -181,18 +211,41 @@ impl Server {
         let st = &mut *st;
         let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
         let t0 = Instant::now();
-        // resume from the previous prompt when this one continues it
-        let reuse = !st.snap_tokens.is_empty() && ids.len() > st.snap_tokens.len() && ids.starts_with(&st.snap_tokens);
-        let from = if reuse {
-            self.glm.copy_session(&mut st.work, &st.snap).map_err(|e| e.0)?;
-            st.snap_tokens.len()
-        } else {
-            self.glm.reset_session(&mut st.work).map_err(|e| e.0)?;
-            0
+        // where to start: the live session when it holds a prefix of this prompt, a cached checkpoint when that is
+        // longer, else the beginning
+        let live_len = if st.live.len() < ids.len() && ids.starts_with(&st.live) { st.live.len() } else { 0 };
+        let cached = if st.cache.enabled() { st.cache.best(&ids) } else { None };
+        let (from, source) = match cached {
+            Some((i, len)) if len > live_len => {
+                let ck = st.cache.get(i);
+                self.glm.restore(&mut st.work, ck).map_err(|e| e.0)?;
+                (len, "cache")
+            }
+            _ if live_len > 0 => (live_len, "live"),
+            _ => {
+                self.glm.reset_session(&mut st.work).map_err(|e| e.0)?;
+                (0, "none")
+            }
         };
-        let logits = self.glm.feed(&mut st.work, &ids[from..], &mut none).map_err(|e| e.0)?;
-        self.glm.copy_session(&mut st.snap, &st.work).map_err(|e| e.0)?;
-        st.snap_tokens = ids.clone();
+        st.live.clear(); // until this prompt is read, the session is in between
+        // read the rest, stopping at the checkpoint positions past `from` to save the state there
+        let mut logits = Vec::new();
+        let mut at = from;
+        let mut saved = 0;
+        for stop in self.stops(&ids).into_iter().filter(|p| *p > from) {
+            logits = self.glm.feed(&mut st.work, &ids[at..stop], &mut none).map_err(|e| e.0)?;
+            at = stop;
+            if st.cache.enabled() && !st.cache.touch(&ids[..stop]) {
+                let ck = self.glm.save(&st.work).map_err(|e| e.0)?;
+                if st.cache.put(ids[..stop].to_vec(), ck) {
+                    saved += 1;
+                }
+            }
+        }
+        if at < ids.len() {
+            logits = self.glm.feed(&mut st.work, &ids[at..], &mut none).map_err(|e| e.0)?;
+        }
+        st.live = ids.clone();
         let prefill = t0.elapsed().as_secs_f64();
 
         if stream {
@@ -214,11 +267,14 @@ impl Server {
         let t1 = Instant::now();
         let mut dec = self.glm.decoder(logits, true);
         let mut out: std::collections::VecDeque<u32> = Default::default();
+        let mut committed: Vec<u32> = Vec::new();
         while n < max {
             if out.is_empty() {
                 let rng = &mut st.rng;
                 let mut draw = |l: &[f32]| sample(l, temp, top_p, rng);
-                out.extend(self.glm.step(&mut st.work, &mut dec, &mut draw, &mut none).map_err(|e| e.0)?);
+                let toks = self.glm.step(&mut st.work, &mut dec, &mut draw, &mut none).map_err(|e| e.0)?;
+                committed.extend(&toks);
+                out.extend(toks);
             }
             let next = out.pop_front().unwrap_or_default();
             if self.tok.stop.contains(&next) {
@@ -265,8 +321,12 @@ impl Server {
             }
         }
         let dt = t1.elapsed().as_secs_f64();
-        eprintln!("[request: {} prompt tokens ({} reused, {} fed in {prefill:.1} s), {n} generated in {dt:.1} s ({:.2} tok/s), drafts {}/{} accepted, {finish}]",
-                  ids.len(), from, ids.len() - from, n as f64 / dt.max(1e-9), dec.accepted, dec.drafted);
+        // what the session holds now: the prompt and the committed tokens it has fed (the last ones may be pending)
+        let fed = st.work.pos.saturating_sub(ids.len()).min(committed.len());
+        st.live.extend_from_slice(&committed[..fed]);
+        eprintln!("[request: {} prompt tokens ({} reused from {source}, {} fed in {prefill:.1} s, {saved} checkpoint(s) saved; cache {} entries, {:.2} GiB), {n} generated in {dt:.1} s ({:.2} tok/s), drafts {}/{} accepted, {finish}]",
+                  ids.len(), from, ids.len() - from, st.cache.len(), st.cache.bytes() as f64 / (1u64 << 30) as f64, n as f64 / dt.max(1e-9),
+                  dec.accepted, dec.drafted);
         let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": n, "total_tokens": ids.len() + n});
         let finish = if finish == "client gone" { "stop" } else { finish };
         if stream {

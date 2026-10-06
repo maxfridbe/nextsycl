@@ -9,6 +9,7 @@
 //!                                     the forward pass on a reference dump's prompt (reference/llama-dump), every
 //!                                     step compared: cosine and relative error per tensor, then the next token
 
+mod cache;
 mod serve;
 
 use std::path::Path;
@@ -31,7 +32,8 @@ const USAGE: &str = "usage:
   nextsycl spec-check <model.gguf> --prompt TEXT [--n N] [--gpu 0,1]
                                 verify passes (2 rows, then a rollback to 1) against one-token decode, logits compared
   nextsycl serve <model.gguf> [--gpu 0,1] [--host 0.0.0.0] [--port 8085] [--name ID] [--ctx 8192] [--effort low]
-                 [--expert-gib G] [--mirror-gib G] [--no-mtp]   the OpenAI-compatible server";
+                 [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)]
+                                the OpenAI-compatible server";
 
 fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
@@ -567,10 +569,17 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let mut log = |l: String| eprintln!("[{l}]");
     let mtp = !args.iter().any(|a| a == "--no-mtp");
-    // the server's two sessions: the working one and its copy at the end of the last prompt
-    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), gib_opt("--mirror-gib"), mtp, (ctx, 2), &mut log).map_err(e)?;
+    // the prompt cache lives in host memory: what it may take comes out of the expert mirror's default share
+    let cache_mib: usize = opt("--prompt-cache-mib").and_then(|v| v.parse().ok()).unwrap_or(4096);
+    let cache = cache_mib << 20;
+    let mirror = gib_opt("--mirror-gib").or_else(|| {
+        let avail = std::fs::read_to_string("/proc/meminfo").ok()?
+            .lines().find(|l| l.starts_with("MemAvailable:"))?.split_whitespace().nth(1)?.parse::<usize>().ok()? * 1024;
+        Some(avail.saturating_sub((10 << 30) + cache))
+    });
+    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), mirror, mtp, (ctx, 1), &mut log).map_err(e)?;
     eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds);
-    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort)?);
+    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort, cache)?);
     srv.run(&addr)
 }
 
