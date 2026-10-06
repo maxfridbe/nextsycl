@@ -41,24 +41,26 @@ dist/nextsycl stop
 
 `dist/nextsycl help` lists every command and setting.
 
-What `status` shows during a chat (GLM-5.3-Flash IQ2 on an Arc Pro B70 and a B65, from Open WebUI):
+What `status` shows during a chat (GLM-5.3-Flash IQ2 on an Arc Pro B70 and a B65), and `ps` after it:
 
 ```
 $ nextsycl status
-glm-5.3-flash-uncensored - up 3m02s, context 65536, MTP on, 4 request(s) served
+glm-5.3-flash-uncensored - up 15s, context 65536, MTP on, 1 request(s) served
 
-GPU  CARD                      VRAM USED      FREE   LAYERS EXPERTS VRAM/HOST
-0    Arc Pro B70        30.1GiB / 31.9GiB    1.8GiB     0-21      3479 / 1994
-1    Arc Pro B65        30.2GiB / 31.9GiB    1.7GiB    22-44      3314 / 3496
+GPU  CARD                      VRAM USED      FREE   LAYERS EXPERTS VRAM/HOST   TEMP   VRAM   POWER
+0    Arc Pro B70        30.1GiB / 31.9GiB    1.8GiB     0-21      3447 / 2026    36C    36C     78W
+1    Arc Pro B65        30.1GiB / 31.9GiB    1.8GiB    22-44      3301 / 3474    34C    36C     86W
+                                                                       the GPUs draw 164 W
 
-request #4 (tcp): generating, prompt 23 tokens, 0 reused (none), 585 / 4096 generated at 14.0 tok/s, 43s
-prompt cache: (busy)
+request #1 (socket): generating, prompt 18 tokens, 0 reused (none), 184 / 300 generated at 16.9 tok/s, 12s, 1863 J so far
 
 $ nextsycl ps
-ID     VIA     STATE        PROMPT           REUSED    READ  GENERATED   TOK/S FINISH       AGO
-#4     tcp     done             23           0 none    0.9s       1502    13.8 stop      15m15s
-#2     web     done             19           0 none    0.8s         55    15.6 stop      17m23s
+ID     VIA     STATE        PROMPT           REUSED    READ  GENERATED   TOK/S    ENERGY  AVG W FINISH       AGO
+#1     socket  done             18           0 none    1.0s        300    16.9    2994 J    160 length       27s
 ```
+
+TEMP and VRAM are the cards' package and memory temperatures, POWER each card's draw over the last second, and
+ENERGY what both cards drew while the request ran (idle power included) - from the xe driver's sensors.
 
 ## Speed
 

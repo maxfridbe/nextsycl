@@ -53,6 +53,18 @@ int ns_gpu_name(int index, char* buf, size_t len) {
     NS_CATCH
 }
 
+// the PCI address of GPU `index` ("0000:03:00.0") into buf; an empty string when the driver does not say
+int ns_gpu_pci(int index, char* buf, size_t len) {
+    NS_TRY
+    auto v = gpus();
+    if (index < 0 || index >= (int) v.size()) return fail("no GPU " + std::to_string(index));
+    std::string a;
+    if (v[index].has(sycl::aspect::ext_intel_pci_address)) a = v[index].get_info<sycl::ext::intel::info::device::pci_address>();
+    std::snprintf(buf, len, "%s", a.c_str());
+    return 0;
+    NS_CATCH
+}
+
 int ns_gpu_open(int index, ns_gpu** out) {
     NS_TRY
     auto v = gpus();

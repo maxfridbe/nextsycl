@@ -64,6 +64,11 @@ fn t(v: &Value) -> String {
     }
 }
 
+/// 840 -> "840 J", 12345 -> "12.3 kJ"
+fn joules(j: f64) -> String {
+    if j < 1e4 { format!("{j:.0} J") } else { format!("{:.1} kJ", j / 1e3) }
+}
+
 fn gib(b: f64) -> String {
     format!("{:.1}GiB", b / (1u64 << 30) as f64)
 }
@@ -82,14 +87,22 @@ fn status_table(st: &Value) -> String {
         st["served"],
         if st["stopping"].as_bool() == Some(true) { " - stopping" } else { "" }
     );
-    out += &format!("{:<4} {:<18} {:>16} {:>9} {:>8} {:>16}\n", "GPU", "CARD", "VRAM USED", "FREE", "LAYERS", "EXPERTS VRAM/HOST");
+    out += &format!("{:<4} {:<18} {:>16} {:>9} {:>8} {:>16} {:>6} {:>6} {:>7}\n", "GPU", "CARD", "VRAM USED", "FREE", "LAYERS", "EXPERTS VRAM/HOST",
+                    "TEMP", "VRAM", "POWER");
+    let mut watts = 0.0;
     for g in st["gpus"].as_array().cloned().unwrap_or_default() {
+        watts += g["watts"].as_f64().unwrap_or(0.0);
+        let deg = |v: &Value| v.as_f64().map_or("-".into(), |c| format!("{c:.0}C"));
         let total = g["total"].as_f64().unwrap_or(0.0);
         let free = g["free"].as_f64();
         let used = free.map_or("-".into(), |f| format!("{} / {}", gib(total - f), gib(total)));
         let layers = g["layers"].as_array().map_or("-".into(), |l| format!("{}-{}", l[0], l[1].as_u64().unwrap_or(1).saturating_sub(1)));
-        out += &format!("{:<4} {:<18} {:>16} {:>9} {:>8} {:>16}\n", t(&g["index"]), card(g["name"].as_str().unwrap_or("?")), used,
-                        free.map_or("-".into(), gib), layers, format!("{} / {}", g["expert_slots"], g["host_slots"]));
+        out += &format!("{:<4} {:<18} {:>16} {:>9} {:>8} {:>16} {:>6} {:>6} {:>7}\n", t(&g["index"]), card(g["name"].as_str().unwrap_or("?")), used,
+                        free.map_or("-".into(), gib), layers, format!("{} / {}", g["expert_slots"], g["host_slots"]), deg(&g["temp_c"]),
+                        deg(&g["vram_temp_c"]), g["watts"].as_f64().map_or("-".into(), |w| format!("{w:.0}W")));
+    }
+    if watts > 0.0 {
+        out += &format!("{:>90}\n", format!("the GPUs draw {watts:.0} W"));
     }
     out += "\n";
     match st["running"].as_object() {
@@ -99,10 +112,11 @@ fn status_table(st: &Value) -> String {
                 Some(src) => format!("{} reused ({src})", r["reused"]),
                 None => "reading".into(),
             };
-            out += &format!("request #{} ({}): {}, prompt {} tokens, {}, {} / {} generated{}, {}\n", r["id"], r["via"].as_str().unwrap_or("?"),
+            out += &format!("request #{} ({}): {}, prompt {} tokens, {}, {} / {} generated{}, {}{}\n", r["id"], r["via"].as_str().unwrap_or("?"),
                             r["state"].as_str().unwrap_or("?"), r["prompt_tokens"], reused, r["generated"], r["max_tokens"],
                             r["tok_s"].as_f64().map_or(String::new(), |t| format!(" at {t:.1} tok/s")),
-                            dur(now() - r["started"].as_f64().unwrap_or(now())));
+                            dur(now() - r["started"].as_f64().unwrap_or(now())),
+                            r["energy_j"].as_f64().map_or(String::new(), |j| format!(", {} so far", joules(j))));
         }
         None => out += "idle\n",
     }
@@ -147,16 +161,17 @@ pub fn status(raw: &[String]) -> Result<(), String> {
 pub fn ps(raw: &[String]) -> Result<(), String> {
     let all = raw.iter().any(|a| a == "-a" || a == "--all");
     let v = get("/server/requests")?;
-    println!("{:<6} {:<7} {:<11} {:>7} {:>16} {:>7} {:>10} {:>7} {:<7} {:>8}", "ID", "VIA", "STATE", "PROMPT", "REUSED", "READ", "GENERATED", "TOK/S",
-             "FINISH", "AGO");
+    println!("{:<6} {:<7} {:<11} {:>7} {:>16} {:>7} {:>10} {:>7} {:>9} {:>6} {:<7} {:>8}", "ID", "VIA", "STATE", "PROMPT", "REUSED", "READ", "GENERATED",
+             "TOK/S", "ENERGY", "AVG W", "FINISH", "AGO");
     let mut rows: Vec<Value> = v["running"].as_object().map(|_| vec![v["running"].clone()]).unwrap_or_default();
     rows.extend(v["done"].as_array().cloned().unwrap_or_default().into_iter().take(if all { usize::MAX } else { 10 }));
     for r in rows {
         let reused = r["source"].as_str().map_or("-".into(), |s| format!("{} {s}", r["reused"]));
-        println!("{:<6} {:<7} {:<11} {:>7} {:>16} {:>7} {:>10} {:>7} {:<7} {:>8}", format!("#{}", r["id"]), r["via"].as_str().unwrap_or("?"),
+        println!("{:<6} {:<7} {:<11} {:>7} {:>16} {:>7} {:>10} {:>7} {:>9} {:>6} {:<7} {:>8}", format!("#{}", r["id"]), r["via"].as_str().unwrap_or("?"),
                  r["state"].as_str().unwrap_or("?"), t(&r["prompt_tokens"]), reused,
                  r["read_seconds"].as_f64().map_or("-".into(), |s| format!("{s:.1}s")), t(&r["generated"]),
-                 r["tok_s"].as_f64().map_or("-".into(), |t| format!("{t:.1}")), r["finish"].as_str().unwrap_or("-"),
+                 r["tok_s"].as_f64().map_or("-".into(), |t| format!("{t:.1}")), r["energy_j"].as_f64().map_or("-".into(), joules),
+                 r["avg_watts"].as_f64().map_or("-".into(), |w| format!("{w:.0}")), r["finish"].as_str().unwrap_or("-"),
                  dur(now() - r["started"].as_f64().unwrap_or(now())));
     }
     Ok(())

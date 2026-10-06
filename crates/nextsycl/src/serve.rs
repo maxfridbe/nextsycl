@@ -46,6 +46,7 @@ use std::time::Instant;
 use ns_engine::glm5next::{Glm, Session};
 
 use crate::cache::PromptCache;
+use crate::telemetry::Telemetry;
 use crate::http::{self, Conn};
 use ns_tok::{Effort, Message, Tokenizer};
 use serde_json::{json, Value};
@@ -69,6 +70,8 @@ pub struct Server {
     next_id: AtomicU64,
     /// how many ended requests `done` keeps
     keep: usize,
+    /// the GPUs' power and temperature
+    tele: Arc<Telemetry>,
     /// origins beyond the loopback ones a browser may call from
     cors: Vec<String>,
 }
@@ -149,10 +152,11 @@ impl Server {
     pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, max_ctx: usize, default_effort: Effort, cache_bytes: usize,
                cors: Vec<String>, keep: usize) -> Result<Server, String> {
         let work = glm.session(max_ctx).map_err(|e| e.0)?;
+        let tele = Telemetry::start(&glm.gpu_info().iter().map(|g| g.pci.clone()).collect::<Vec<_>>());
         Ok(Server { glm, tok, name, max_ctx, default_effort,
                     state: Mutex::new(Conv { work, live: Vec::new(), cache: PromptCache::new(cache_bytes), rng: Rng(0x5DEECE66D) }),
                     busy: AtomicBool::new(false), started: Instant::now(), current: Mutex::new(None), done: Mutex::new(VecDeque::new()),
-                    next_id: AtomicU64::new(1), keep, cors })
+                    next_id: AtomicU64::new(1), keep, tele, cors })
     }
 
     /// The checkpoint positions of a prompt: the end of its first turn and the start of its last user turn (each
@@ -235,9 +239,12 @@ impl Server {
     /// The model, its GPUs, the request running, the cache (the cache's figures only when no request holds the
     /// conversation: a status call never waits).
     fn status_json(&self) -> Value {
-        let gpus: Vec<Value> = self.glm.gpu_info().iter().map(|g| json!({
-            "index": g.index, "name": g.name, "total": g.total, "free": g.free, "layers": [g.layers.0, g.layers.1],
-            "expert_slots": g.expert_slots, "host_slots": g.host_slots})).collect();
+        let rd = self.tele.readings();
+        let gpus: Vec<Value> = self.glm.gpu_info().iter().enumerate().map(|(i, g)| {
+            let r = rd.get(i).copied().unwrap_or_default();
+            json!({"index": g.index, "name": g.name, "pci": g.pci, "total": g.total, "free": g.free, "layers": [g.layers.0, g.layers.1],
+                   "expert_slots": g.expert_slots, "host_slots": g.host_slots, "watts": r.watts, "temp_c": r.temp_c, "vram_temp_c": r.vram_c})
+        }).collect();
         let cache = self.state.try_lock().ok().map(|st| json!({"entries": st.cache.len(), "bytes": st.cache.bytes(), "budget": st.cache.budget(),
                                                               "evictions": st.cache.evictions, "live_tokens": st.live.len()}));
         json!({"model": self.name, "version": crate::VERSION, "uptime_seconds": self.started.elapsed().as_secs_f64(),
@@ -392,6 +399,9 @@ impl Server {
                                                     "last_user": preview(last_user)}));
         let _idle = Guard(&self.busy);
         let st = &mut *st;
+        // the cards' energy counters at the start: the request's energy is their rise
+        let j0 = self.tele.joules();
+        let energy = || -> Option<f64> { Some(self.tele.joules()? - j0?) };
         let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
         let t0 = Instant::now();
         // where to start: the live session when it holds a prefix of this prompt, a cached checkpoint when that is
@@ -486,6 +496,7 @@ impl Server {
             self.live(|r| {
                 r["generated"] = json!(n);
                 r["tok_s"] = json!(n as f64 / el.max(1e-9));
+                r["energy_j"] = json!(energy());
             });
             pending.extend(self.tok.decode_bytes(&[next]));
             let valid = match std::str::from_utf8(&pending) {
@@ -542,6 +553,11 @@ impl Server {
             row["drafts"] = json!([dec.accepted, dec.drafted]);
             row["checkpoints_saved"] = json!(saved);
             row["ended"] = json!(now());
+            // the energy both cards drew while it ran (idle power included), and the average
+            let e = energy();
+            let r1 = |x: f64| (x * 10.0).round() / 10.0;
+            row["energy_j"] = json!(e.map(r1));
+            row["avg_watts"] = json!(e.map(|e| r1(e / (prefill + dt).max(1e-9))));
             row["answer"] = json!({"chars": content.trim().len(), "preview": preview(content.trim())});
             row["thinking"] = json!({"chars": reasoning.trim().len(), "preview": preview(reasoning.trim())});
             self.remember(row);

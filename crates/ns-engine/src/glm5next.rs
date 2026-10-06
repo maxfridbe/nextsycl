@@ -245,6 +245,7 @@ struct MtpState {
 pub struct GpuInfo {
     pub index: usize,
     pub name: String,
+    pub pci: Option<String>,
     pub total: u64,
     pub free: Option<u64>,
     pub layers: (u64, u64),
@@ -819,7 +820,7 @@ impl<'g> Glm<'g> {
     pub fn gpu_info(&self) -> Vec<GpuInfo> {
         self.parts.iter().map(|p| {
             let (total, free) = p.ops.gpu.memory().unwrap_or((0, None));
-            GpuInfo { index: p.ops.gpu.index, name: p.ops.gpu.name.clone(), total, free, layers: (p.layers.start, p.layers.end),
+            GpuInfo { index: p.ops.gpu.index, name: p.ops.gpu.name.clone(), pci: p.ops.gpu.pci.clone(), total, free, layers: (p.layers.start, p.layers.end),
                       expert_slots: p.expert_slots, host_slots: p.host_slots }
         }).collect()
     }

@@ -17,6 +17,7 @@ mod container;
 mod http;
 mod serve;
 mod service;
+mod telemetry;
 
 use std::path::Path;
 use std::process::ExitCode;

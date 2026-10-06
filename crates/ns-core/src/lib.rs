@@ -64,6 +64,8 @@ pub struct Gpu {
     raw: ns_sys::Gpu,
     pub index: usize,
     pub name: String,
+    /// its PCI address ("0000:03:00.0"), when the driver says - where its sensors are (sysfs hwmon)
+    pub pci: Option<String>,
     /// pinned host memory the small uploads go through without waiting (`DevBuf::write_async`)
     up: std::sync::Mutex<Upload>,
 }
@@ -107,7 +109,12 @@ impl Gpu {
         let mut up = std::ptr::null_mut();
         // SAFETY: an out-pointer to a local; the handle is live.
         check(api, unsafe { (api.alloc_host)(raw, UPLOAD_BYTES, &mut up) }, "pinning the upload ring")?;
-        Ok(Arc::new(Gpu { api, raw, index, name, up: std::sync::Mutex::new(Upload { ptr: up.cast(), len: UPLOAD_BYTES, off: 0 }) }))
+        let mut pb = [0 as c_char; 64];
+        // SAFETY: pb is 64 bytes, its length passed; the library NUL-terminates.
+        let pci = (unsafe { (api.gpu_pci)(index as i32, pb.as_mut_ptr(), pb.len()) } == 0)
+            .then(|| unsafe { std::ffi::CStr::from_ptr(pb.as_ptr()) }.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty());
+        Ok(Arc::new(Gpu { api, raw, index, name, pci, up: std::sync::Mutex::new(Upload { ptr: up.cast(), len: UPLOAD_BYTES, off: 0 }) }))
     }
 
     /// The queue, for the imported kernels' `void* stream`.
