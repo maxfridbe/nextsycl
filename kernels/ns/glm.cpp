@@ -472,6 +472,14 @@ int ns_kda_gate(ns_gpu* g, float* gate, const float* dt_bias, const float* A, in
     NS_CATCH
 }
 
+// in place: x = exp(x)
+int ns_exp(ns_gpu* g, float* x, int64_t n) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { x[i] = sycl::exp(x[i]); });
+    return 0;
+    NS_CATCH
+}
+
 // in place: x = sigmoid(x)
 int ns_sigmoid(ns_gpu* g, float* x, int64_t n) {
     NS_TRY
@@ -480,41 +488,49 @@ int ns_sigmoid(ns_gpu* g, float* x, int64_t n) {
     NS_CATCH
 }
 
-// The KDA recurrence (the fused op of docs/glm5next.md), tokens in order. q, k, v, gate [T, H, d]; beta [T, H];
-// S [H, d key, d value], updated; o [T, H, d]. One work-group per head, a work-item per value column.
-int ns_kda_scan(ns_gpu* g, const float* qv, const float* kv, const float* vv, const float* gate, const float* beta, float* S, float* o,
+// The KDA recurrence (the fused op of docs/glm5next.md), tokens in order. q, k, v [T, H, d]; eg [T, H, d] the decay
+// factors exp(g); beta [T, H]; S [H, d key, d value], updated; o [T, H, d]. The value columns of a head are
+// independent: a sub-group of 16 per column, each lane 8 of its 128 keys (registers), the two sums over the keys
+// as sub-group reductions - 8,192 sub-groups at work instead of 64 work-groups, no barriers. Decode and verify
+// passes run it too, so their rows stay equal.
+int ns_kda_scan(ns_gpu* g, const float* qv, const float* kv, const float* vv, const float* eg, const float* beta, float* S, float* o,
                 int64_t T, int64_t H, int64_t d, float* snap) {
     NS_TRY
     if (d != 128) return ns_fail("ns_kda_scan: head size 128 only");
-    g->q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> lq(sycl::range<1>(128), h), lk(sycl::range<1>(128), h), lg(sycl::range<1>(128), h);
-        h.parallel_for(sycl::nd_range<1>(H * 128, 128), [=](sycl::nd_item<1> it) {
-            const int64_t hd = it.get_group(0);
-            const int j = it.get_local_id(0);           // the value column this work-item owns
-            float col[128];                              // S[i][j] for every key i
-            float* Sh = S + hd * 128 * 128;
-            for (int i = 0; i < 128; ++i) col[i] = Sh[i * 128 + j];
-            const float scale = 1.f / sycl::sqrt(128.f);
-            for (int64_t t = 0; t < T; ++t) {
-                const int64_t base = (t * H + hd) * 128;
-                lq[j] = qv[base + j];
-                lk[j] = kv[base + j];
-                lg[j] = sycl::exp(gate[base + j]);
-                sycl::group_barrier(it.get_group());
-                float dot = 0.f;
-                for (int i = 0; i < 128; ++i) { col[i] *= lg[i]; dot += col[i] * lk[i]; }
-                const float delta = (vv[base + j] - dot) * beta[t * H + hd];
-                float out = 0.f;
-                for (int i = 0; i < 128; ++i) { col[i] += lk[i] * delta; out += col[i] * lq[i]; }
-                o[base + j] = out * scale;
-                if (snap && t + 1 < T) {
-                    float* Sn = snap + (t * H + hd) * 128 * 128;
-                    for (int i = 0; i < 128; ++i) Sn[i * 128 + j] = col[i];
-                }
-                sycl::group_barrier(it.get_group());
+    constexpr int SG = 16, KPL = 128 / SG, COLS = 8;   // lanes a column, keys a lane, columns a work-group
+    g->q.parallel_for(sycl::nd_range<1>(H * 128 * SG, COLS * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const auto sg = it.get_sub_group();
+        const int64_t c = it.get_global_id(0) / SG;   // the column: head hd, value j
+        const int64_t hd = c / 128;
+        const int j = (int) (c % 128), lane = (int) sg.get_local_id()[0], i0 = lane * KPL;
+        float* Sh = S + hd * 128 * 128;
+        float col[KPL];
+#pragma unroll
+        for (int i = 0; i < KPL; ++i) col[i] = Sh[(i0 + i) * 128 + j];
+        const float scale = 1.f / sycl::sqrt(128.f);
+        for (int64_t t = 0; t < T; ++t) {
+            const int64_t base = (t * H + hd) * 128;
+            const sycl::vec<float, KPL> kq = *reinterpret_cast<const sycl::vec<float, KPL>*>(kv + base + i0);
+            const sycl::vec<float, KPL> gq = *reinterpret_cast<const sycl::vec<float, KPL>*>(eg + base + i0);
+            const sycl::vec<float, KPL> qq = *reinterpret_cast<const sycl::vec<float, KPL>*>(qv + base + i0);
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < KPL; ++i) { col[i] *= gq[i]; dot += col[i] * kq[i]; }
+            dot = sycl::reduce_over_group(sg, dot, sycl::plus<float>());
+            const float delta = (vv[base + j] - dot) * beta[t * H + hd];
+            float out = 0.f;
+#pragma unroll
+            for (int i = 0; i < KPL; ++i) { col[i] += kq[i] * delta; out += col[i] * qq[i]; }
+            out = sycl::reduce_over_group(sg, out, sycl::plus<float>());
+            if (lane == 0) o[base + j] = out * scale;
+            if (snap && t + 1 < T) {
+                float* Sn = snap + (t * H + hd) * 128 * 128;
+#pragma unroll
+                for (int i = 0; i < KPL; ++i) Sn[(i0 + i) * 128 + j] = col[i];
             }
-            for (int i = 0; i < 128; ++i) Sh[i * 128 + j] = col[i];
-        });
+        }
+#pragma unroll
+        for (int i = 0; i < KPL; ++i) Sh[(i0 + i) * 128 + j] = col[i];
     });
     return 0;
     NS_CATCH

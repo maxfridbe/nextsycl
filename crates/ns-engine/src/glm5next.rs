@@ -1230,6 +1230,7 @@ impl<'g> Glm<'g> {
                     let gate = p.mm(l, Role::KdaFB, &fa, t)?;
                     o.kda_gate(&gate, p.vec(l, Role::KdaDtBias)?, p.vec(l, Role::KdaA)?, t, kh, kd, g.kda_gate_low as f32)?;
                     tap(&format!("kda_g1-{l}"), &gate)?;
+                    o.exp(&gate, t * kh * kd)?; // the scan takes the decay factors themselves
                     o.sigmoid(&beta, t * kh)?;
                     tap(&format!("kda_beta-{l}"), &beta)?;
                     let scan = p.arena.f32(t * kw)?;

@@ -70,6 +70,7 @@ int ns_conv_silu(ns_gpu* g, const float* x, float* state, const float* w, float*
 int ns_l2_norm(ns_gpu* g, float* x, int64_t rows, int64_t n, float eps);
 int ns_kda_gate(ns_gpu* g, float* gate, const float* dt_bias, const float* A, int64_t T, int64_t H, int64_t dh, float low);
 int ns_sigmoid(ns_gpu* g, float* x, int64_t n);
+int ns_exp(ns_gpu* g, float* x, int64_t n);
 int ns_kda_scan(ns_gpu* g, const float* q, const float* k, const float* v, const float* gate, const float* beta, float* S, float* o,
                 int64_t T, int64_t H, int64_t d, float* snap);
 int ns_kda_out(ns_gpu* g, const float* o, const float* gate, const float* w, float* y, int64_t T, int64_t H, int64_t d, float eps);

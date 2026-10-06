@@ -466,6 +466,13 @@ impl Ops {
         let rc = unsafe { (self.a().sigmoid)(self.raw(), x.fp(), n as i64) };
         self.ok(rc, "sigmoid")
     }
+    /// in place: x = exp(x)
+    pub fn exp(&self, x: &DevBuf, n: usize) -> Result<()> {
+        need!(x, n, "exp");
+        // SAFETY: size checked.
+        let rc = unsafe { (self.a().exp)(self.raw(), x.fp(), n as i64) };
+        self.ok(rc, "exp")
+    }
     #[allow(clippy::too_many_arguments)]
     /// `snap`: the state after each row but the last, [t-1][h][d][d] (rolling back a rejected draft)
     pub fn kda_scan(&self, q: &DevBuf, k: &DevBuf, v: &DevBuf, g: &DevBuf, beta: &DevBuf, s: &DevBuf, o: &DevBuf, t: usize, h: usize, d: usize,
