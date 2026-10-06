@@ -40,6 +40,9 @@ int ns_free_host(ns_gpu* g, void* p);
 int ns_copy_to(ns_gpu* g, void* dst, const void* src_host, size_t bytes);
 int ns_copy_from(ns_gpu* g, void* dst_host, const void* src, size_t bytes);
 int ns_copy_dev(ns_gpu* g, void* dst, const void* src, size_t bytes);
+int ns_mark(ns_gpu* g, int64_t* ticket);
+int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, int64_t after, int64_t* ticket);
+int ns_await(ns_gpu* g, int64_t ticket);
 int ns_fill(ns_gpu* g, void* dst, uint8_t value, size_t bytes);
 int ns_sync(ns_gpu* g);
 /* device memory of one GPU to another's, through `staging`: host memory of `bytes` (pinned memory belongs to one

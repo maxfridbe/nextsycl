@@ -302,6 +302,33 @@ impl Ops {
         let rc = unsafe { (self.a().dequant_f16)(self.raw(), ty as i32, src.ptr.cast::<u8>().add(at).cast::<c_void>(), n as i64, dst.ptr.cast()) };
         self.ok(rc, "dequant_f16")
     }
+    /// A ticket for everything submitted to this GPU's queue so far
+    pub fn mark(&self) -> Result<i64> {
+        let mut t = 0i64;
+        // SAFETY: t is a valid out pointer.
+        let rc = unsafe { (self.a().mark)(self.raw(), &mut t) };
+        self.ok(rc, "mark")?;
+        Ok(t)
+    }
+    /// n bytes of src (from src_at) into dst (from at) on the GPU's copy queue, beside its work, after ticket
+    /// `after`: the copy's ticket
+    pub fn stream_copy(&self, dst: &DevBuf, at: usize, src: &DevBuf, src_at: usize, n: usize, after: Option<i64>) -> Result<i64> {
+        dst.bounds(at, n)?;
+        src.bounds(src_at, n)?;
+        let mut t = 0i64;
+        // SAFETY: both ranges in bounds (checked); t is a valid out pointer.
+        let rc = unsafe {
+            (self.a().stream_copy)(self.raw(), dst.ptr.cast::<u8>().add(at).cast(), src.ptr.cast::<u8>().add(src_at).cast(), n, after.unwrap_or(-1), &mut t)
+        };
+        self.ok(rc, "stream_copy")?;
+        Ok(t)
+    }
+    /// The GPU's queue waits, on the device, for ticket `t` (a copy, or a mark)
+    pub fn await_ticket(&self, t: i64) -> Result<()> {
+        // SAFETY: plain call.
+        let rc = unsafe { (self.a().await_)(self.raw(), t) };
+        self.ok(rc, "await")
+    }
     /// x [n] float32 -> y [n] fp16
     pub fn to_f16(&self, x: &DevBuf, y: &DevBuf, n: usize) -> Result<()> {
         need!(x, n, "to_f16 x");

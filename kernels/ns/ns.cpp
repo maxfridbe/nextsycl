@@ -57,14 +57,15 @@ int ns_gpu_open(int index, ns_gpu** out) {
     auto v = gpus();
     if (index < 0 || index >= (int) v.size()) return fail("no GPU " + std::to_string(index) + " (" + std::to_string(v.size()) + " found)");
     sycl::context ctx(v[index]);
-    *out = new ns_gpu{v[index], ctx, sycl::queue(ctx, v[index], sycl::property::queue::in_order())};
+    *out = new ns_gpu{v[index], ctx, sycl::queue(ctx, v[index], sycl::property::queue::in_order()),
+                      sycl::queue(ctx, v[index], sycl::property::queue::in_order())};
     return 0;
     NS_CATCH
 }
 
 void ns_gpu_close(ns_gpu* g) {
     if (!g) return;
-    try { g->q.wait(); } catch (...) {}
+    try { g->q.wait(); g->cq.wait(); } catch (...) {}
     delete g;
 }
 
@@ -123,6 +124,39 @@ int ns_copy_from(ns_gpu* g, void* dst, const void* src, size_t bytes) {
 int ns_copy_dev(ns_gpu* g, void* dst, const void* src, size_t bytes) {
     NS_TRY
     g->q.memcpy(dst, src, bytes);
+    return 0;
+    NS_CATCH
+}
+
+// Copies beside the GPU's work. The order between the two queues is kept on the device (barriers with events):
+// the host never waits on an event (Strata: host waits on queue events deadlocked under Level Zero v2).
+static int64_t keep(ns_gpu* g, sycl::event e) {
+    const int64_t t = g->next_ev++;
+    g->ev[t % 256] = e;
+    return t;
+}
+
+// a ticket for everything submitted to the GPU's queue so far
+int ns_mark(ns_gpu* g, int64_t* ticket) {
+    NS_TRY
+    *ticket = keep(g, g->q.ext_oneapi_submit_barrier());
+    return 0;
+    NS_CATCH
+}
+
+// bytes from src to dst on the copy queue, after ticket `after` (< 0: none); its own ticket
+int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, int64_t after, int64_t* ticket) {
+    NS_TRY
+    sycl::event e = after < 0 ? g->cq.memcpy(dst, src, bytes) : g->cq.memcpy(dst, src, bytes, g->ev[after % 256]);
+    *ticket = keep(g, e);
+    return 0;
+    NS_CATCH
+}
+
+// the GPU's queue waits (on the device) for ticket t
+int ns_await(ns_gpu* g, int64_t t) {
+    NS_TRY
+    g->q.ext_oneapi_submit_barrier({g->ev[t % 256]});
     return 0;
     NS_CATCH
 }

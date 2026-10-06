@@ -1539,18 +1539,39 @@ impl<'g> Glm<'g> {
                 // an expert in pinned host memory is copied into a VRAM staging slot first (the copy engine moves it
                 // at full PCIe speed; the expansion kernel reading it in place moved a few bytes a transaction)
                 let sb = parts.down.0 + parts.down.1;
-                let ring = [p.arena.bytes(sb)?, p.arena.bytes(sb)?];
+                // The copies run on the GPU's copy queue, RING ahead of the compute: the experts' compute hides them
+                // (in series they were 6 of 37 s at 12K). A copy into a slot waits for the last expansion that read
+                // it; an expert's expansion waits for its copy - both on the device.
+                const RING: usize = 3;
+                let ring = (0..RING).map(|_| p.arena.bytes(sb)).collect::<Result<Vec<_>>>()?;
+                let hosts: Vec<usize> = slots.iter().enumerate().filter(|(_, s)| s.1).map(|(k, _)| k).collect();
+                let mut copied: Vec<Option<(i64, usize)>> = vec![None; slots.len()]; // (ticket, slot) per host expert
+                let mut freed: [Option<i64>; RING] = [None; RING];
+                let mut next = 0;
+                let issue = |next: &mut usize, freed: &[Option<i64>; RING], copied: &mut [Option<(i64, usize)>]| -> Result<()> {
+                    if let Some(&k) = hosts.get(*next) {
+                        let r = *next % RING;
+                        copied[k] = Some((o.stream_copy(&ring[r], 0, &slots[k].0, 0, sb, freed[r])?, r));
+                        *next += 1;
+                    }
+                    Ok(())
+                };
+                for _ in 0..RING {
+                    issue(&mut next, &freed, &mut copied)?;
+                }
                 let mut row = 0;
                 for (k, (list, (hbuf, host))) in by.values().zip(&slots).enumerate() {
                     let n = list.len();
                     let toks = tb.view(row * 4, n * 4)?;
-                    let buf = if *host {
-                        ring[k % 2].copy_within(0, hbuf, 0, sb)?;
-                        &ring[k % 2]
-                    } else {
-                        hbuf
+                    let h0 = self.mark(p);
+                    let (buf, slot) = match copied[k] {
+                        Some((ticket, r)) if *host => {
+                            o.await_ticket(ticket)?;
+                            (&ring[r], Some(r))
+                        }
+                        _ => (hbuf, None),
                     };
-                    let m0 = self.mark(p);
+                    let m0 = if *host { self.lap(p, "MoE f16: host copy (wait)", h0) } else { h0 };
                     o.gather_f16(x, &toks, &xh, n, d)?;
                     let m1 = self.lap(p, "MoE f16: gather", m0);
                     o.dequant_f16(parts.gate.2.code(), buf, parts.gate.0, parts.gate.1, f * d, &w16)?;
@@ -1563,6 +1584,11 @@ impl<'g> Glm<'g> {
                     o.to_f16(&g32, &hh, n * f)?;
                     let m4 = self.lap(p, "MoE f16: swiglu", m3);
                     o.dequant_f16(parts.down.2.code(), buf, parts.down.0, parts.down.1, d * f, &w16)?;
+                    if let Some(r) = slot {
+                        // the slot is read: the next copy may take it
+                        freed[r] = Some(o.mark()?);
+                        issue(&mut next, &freed, &mut copied)?;
+                    }
                     let m5 = self.lap(p, "MoE f16: expand down", m4);
                     o.gemm_f16(n, d, f, (&hh, 0, f), (&w16, 0), (&dn, 0, d), false)?;
                     let m6 = self.lap(p, "MoE f16: gemm down", m5);

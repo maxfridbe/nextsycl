@@ -1,12 +1,16 @@
 // ns_internal.hpp: what the C ABI's translation units share (not part of the ABI).
 #pragma once
 #include <sycl/sycl.hpp>
+#include <array>
 #include <string>
 
 struct ns_gpu {
     sycl::device dev;
     sycl::context ctx;   // this GPU alone (see ns.h)
     sycl::queue q;
+    sycl::queue cq;      // copies that overlap q's work (ns_stream_copy); ordered against q on the device only
+    std::array<sycl::event, 256> ev{};   // tickets (ns_mark, ns_stream_copy), ticket % 256
+    int64_t next_ev = 0;
 };
 
 // sets the thread's error (ns_last_error) and returns -1

@@ -23,12 +23,11 @@ by default (`--no-mtp` turns it off).
       same next token; deeper layers drift smoothly (0.98 by layer 23, no layer jumps); spec-check 0 difference
 - [x] 12,202-token prompt runs (prompt 60 tok/s, decode 12.1 tok/s - flat with context); the chat mode serves 64K
 - [ ] 128K: the latents are float32 (2 KB a token a layer; 6.5 GB for two 128K sessions) - fp16 latents first
-- [ ] Prompt speed (2026-10-06): 290 tok/s at 3K, 359 at 12K (from 23 at the start of the long-context work; 4,096
-      chunks; experts, dense matrices and MLA attention in fp16 on XMX; the KDA scan a sub-group per column; hc mix
-      a GEMM). At 12K, of 34 s: routed experts ~18 s (fp16 gate/up GEMM 5.0, expansion 3.8, down 1.9, the PCIe
-      copies of host experts ~4 - in series with the compute), MLA attention 4.8 (the gather of each row's cells
-      2.1: score a row block against the union of its cells instead), KDA 3.7. Next: copy host experts on a copy
-      queue while the previous one computes; a fused dequant + XMX GEMM; MLA over row-block unions
+- [ ] Prompt speed (2026-10-06): 396 tok/s at 3K, 425 at 12K (from 23 at the start of the long-context work; 4,096
+      chunks; experts, dense matrices and MLA attention in fp16 on XMX; host experts copied on a copy queue beside
+      the compute; the KDA scan a sub-group per column; hc mix a GEMM). Left at 12K: the experts' fp16 GEMMs and
+      expansion (~11 s), MLA's per-row gather of its cells (2.1 s: score a row block against the union of its
+      cells), KDA 3.7 s. Next: a fused dequant + XMX GEMM; MLA over row-block unions
 - [ ] Decode past 2K: 12.1 vs 15.7 tok/s short - the indexer's per-token GEMM + the attention kernel
 
 ## Prompt speed: what Strata's prompt path teaches (its numbers on the B70, docs/INTEL.md there)
