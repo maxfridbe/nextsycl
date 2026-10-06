@@ -49,7 +49,7 @@ the server (over its socket):
 
 in this process (inside the image: the kernels need the oneAPI runtime):
   nextsycl serve <model.gguf> [--gpu 0,1 | all] [--host H] [--port N] [--name ID] [--ctx N] [--effort E] [--socket PATH]
-                 [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)]
+                 [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)] [--cors ORIGINS]
                                 the server in the foreground (what start runs)
   nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
                     [--expert-gib G] [--mirror-gib G] [--no-mtp]
@@ -66,7 +66,9 @@ settings (environment, or NAME=value lines in nextsycl.conf beside the repositor
   NS_MODELS        host directory with the model files, seen as /models                  (required for start)
   NS_MODEL         the model as seen in the container (default /models/glm53-iq2/GLM-5.3-Flash-Uncensored-IQ2-imatrix-MTP-ds4.gguf)
   NS_GPUS          GPUs, e.g. \"0 1\" (default all)
-  NS_HOST, NS_PORT the OpenAI API (default 127.0.0.1, 8085; 0.0.0.0 = the network, no password)
+  NS_HOST, NS_PORT the OpenAI API and /api/chat (default 127.0.0.1, 8085; 0.0.0.0 = the network, no password)
+  NS_CORS          web pages that may call the API from a browser, beyond the loopback ones, e.g.
+                   \"http://studio:8095\" (comma-separated; * = any)
   NS_CTX           tokens of context (default 65536)      NS_NAME   the model id clients see (glm-5.3-flash-uncensored)
   NS_EFFORT        default reasoning effort (low)        NS_NO_MTP=1   decode without the draft block
   NS_PROMPT_CACHE_MIB   host memory for the prompt cache's checkpoints (default 4096; 0 = off)
@@ -625,7 +627,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     });
     let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), mirror, mtp, (ctx, 1), &mut log).map_err(e)?;
     eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds);
-    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort, cache)?);
+    let cors: Vec<String> = opt("--cors").unwrap_or_default().split([',', ' ']).filter(|o| !o.is_empty()).map(String::from).collect();
+    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort, cache, cors)?);
     srv.run(&addr, opt("--socket").map(std::path::PathBuf::from))
 }
 

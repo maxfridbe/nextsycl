@@ -83,6 +83,9 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     if raw.iter().any(|a| a == "--no-mtp") || cfg.get("NS_NO_MTP").is_some_and(|v| v == "1") {
         args.push("--no-mtp".into());
     }
+    if let Some(c) = cfg.get("NS_CORS") {
+        args.extend(["--cors".into(), c]);
+    }
     args.extend(["--socket".into(), format!("{SOCKET_DIR_IN}/nextsycl.sock")]);
     let st = ce.cmd().args(&args).stdout(Stdio::null()).status().map_err(|e| e.to_string())?;
     if !st.success() {

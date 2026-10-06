@@ -19,6 +19,8 @@ PCIe. It runs on one card or splits the layers over several.
   turn, at the start of its last user turn, and at its end.
 - **An OpenAI-compatible server** with streaming and the thinking split out, run as a service: `nextsycl start`,
   `stop`, `status`, `ps`, `cache`, `chat`, `logs`, over a control socket.
+- **`POST /api/chat` for web pages:** the same chat as JSON lines (`{"thinking": ...}`, `{"content": ...}`, then a
+  `{"done": true, ...}` line with the timings), with CORS for loopback pages and the origins in `NS_CORS`.
 
 ## Quick start
 

@@ -6,6 +6,15 @@
 //!     GET  /status                 {"busy": bool, "prompt_cache": ...}
 //!     POST /v1/chat/completions    messages, max_tokens, temperature, top_p, stream, reasoning_effort (or
 //!                                  chat_template_kwargs.reasoning_effort): low | high | max
+//!     POST /api/chat               the same for a web page, simpler: {"messages": [{"role", "content", "thinking"?}],
+//!                                  "effort"?, "max_tokens"?, "temperature"?, "top_p"?, "stream"? (default true)};
+//!                                  streamed as JSON lines - {"thinking": text} and {"content": text} as they come,
+//!                                  then {"done": true, "finish", "prompt_tokens", "reused", "generated",
+//!                                  "read_seconds", "generate_seconds", "tok_s"}; not streamed, one object with
+//!                                  "content" and "thinking" beside those
+//!
+//! A browser may call these from a page on a loopback origin (http://localhost:*, http://127.0.0.1:*) or one
+//! `--cors` names (NS_CORS; * = any): the answers carry the CORS headers, OPTIONS answers the preflight.
 //!
 //! The same routes and the control ones answer on a Unix socket too (`--socket`; `nextsycl start` puts it in
 //! $XDG_RUNTIME_DIR/nextsycl), which the host command line talks to (client.rs), as sycl-h3 talks to h3d:
@@ -55,6 +64,37 @@ pub struct Server {
     current: Mutex<Option<Value>>,
     done: Mutex<VecDeque<Value>>,
     next_id: AtomicU64,
+    /// origins beyond the loopback ones a browser may call from
+    cors: Vec<String>,
+}
+
+/// A chat request, from either API.
+struct Ask {
+    messages: Vec<(String, String, Option<String>)>,
+    effort: Effort,
+    max: Option<usize>,
+    temp: f32,
+    top_p: f32,
+    stream: bool,
+}
+
+/// How a chat's answer is written: OpenAI's chunks (server-sent events), or /api/chat's JSON lines.
+#[derive(Clone, Copy, PartialEq)]
+enum Api {
+    OpenAi,
+    Lines,
+}
+
+/// The CORS header lines for a request from `origin`, when that origin may call
+fn cors_headers(origin: Option<&str>, allowed: &[String]) -> String {
+    let Some(o) = origin else { return String::new() };
+    let loopback = ["http://localhost", "http://127.0.0.1", "http://[::1]"].iter()
+        .any(|h| o == *h || o.strip_prefix(h).is_some_and(|rest| rest.starts_with(':')));
+    if loopback || allowed.iter().any(|a| a == "*" || a.trim_end_matches('/') == o) {
+        format!("Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\n")
+    } else {
+        String::new()
+    }
 }
 
 /// The working session with the tokens it has consumed, and the prompt cache.
@@ -86,12 +126,13 @@ fn text_of(v: &Value) -> String {
 }
 
 impl Server {
-    pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, max_ctx: usize, default_effort: Effort, cache_bytes: usize) -> Result<Server, String> {
+    pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, max_ctx: usize, default_effort: Effort, cache_bytes: usize,
+               cors: Vec<String>) -> Result<Server, String> {
         let work = glm.session(max_ctx).map_err(|e| e.0)?;
         Ok(Server { glm, tok, name, max_ctx, default_effort,
                     state: Mutex::new(Conv { work, live: Vec::new(), cache: PromptCache::new(cache_bytes), rng: Rng(0x5DEECE66D) }),
                     busy: AtomicBool::new(false), started: Instant::now(), current: Mutex::new(None), done: Mutex::new(VecDeque::new()),
-                    next_id: AtomicU64::new(1) })
+                    next_id: AtomicU64::new(1), cors })
     }
 
     /// The checkpoint positions of a prompt: the end of its first turn and the start of its last user turn (each
@@ -195,7 +236,13 @@ impl Server {
         if path.starts_with("/server/") && s.kind() != "socket" {
             return respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path} (the control routes are on the server's socket)")}}));
         }
+        let cors = cors_headers(req.origin.as_deref(), &self.cors);
         match (method, path) {
+            ("OPTIONS", _) => {
+                let _ = write!(s, "HTTP/1.1 204 No Content\r\n{cors}Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+                                   Access-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Max-Age: 600\r\n\
+                                   Content-Length: 0\r\nConnection: close\r\n\r\n");
+            }
             ("GET", "/health") => respond(&mut s, 200, &json!({"status": "ok"})),
             ("GET", "/status") => {
                 let st = self.status_json();
@@ -224,15 +271,18 @@ impl Server {
                 STOP.store(true, Ordering::SeqCst);
                 respond(&mut s, 200, &json!({"stopping": true, "running": self.busy.load(Ordering::Relaxed)}))
             }
-            ("GET", "/v1/models") | ("GET", "/models") => respond(&mut s, 200, &json!({"object": "list", "data": [
-                {"id": self.name, "object": "model", "owned_by": "nextsycl", "created": now(), "status": {"value": "loaded"}}]})),
-            ("POST", "/v1/chat/completions") | ("POST", "/chat/completions") => {
-                let body: Value = match serde_json::from_slice(&req.body) {
-                    Ok(v) => v,
-                    Err(e) => return respond(&mut s, 400, &json!({"error": {"message": format!("the body is not JSON: {e}")}})),
+            ("GET", "/v1/models") | ("GET", "/models") => http::respond_with(&mut s, 200, &json!({"object": "list", "data": [
+                {"id": self.name, "object": "model", "owned_by": "nextsycl", "created": now(), "status": {"value": "loaded"},
+                 "context": self.max_ctx}]}), &cors),
+            ("POST", "/v1/chat/completions") | ("POST", "/chat/completions") | ("POST", "/api/chat") => {
+                let api = if path == "/api/chat" { Api::Lines } else { Api::OpenAi };
+                let ask = match serde_json::from_slice::<Value>(&req.body).map_err(|e| format!("the body is not JSON: {e}"))
+                    .and_then(|b| self.ask(&b, api)) {
+                    Ok(a) => a,
+                    Err(e) => return http::respond_with(&mut s, 400, &json!({"error": {"message": e}}), &cors),
                 };
-                let via = s.kind();
-                let r = self.chat(&mut s, &body, via);
+                let via = if api == Api::Lines { "web" } else { s.kind() };
+                let r = self.chat(&mut s, &ask, api, &cors, via);
                 // a request that ended on an error is still recorded
                 if let Some(mut row) = self.current.lock().unwrap().take() {
                     row["state"] = json!("failed");
@@ -240,7 +290,7 @@ impl Server {
                     self.remember(row);
                 }
                 if let Err(e) = r {
-                    respond(&mut s, 500, &json!({"error": {"message": e}}));
+                    http::respond_with(&mut s, 500, &json!({"error": {"message": e}}), &cors);
                 }
             }
             _ => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}})),
@@ -262,22 +312,35 @@ impl Server {
         }
     }
 
-    fn chat(&self, s: &mut Conn, req: &Value, via: &str) -> Result<(), String> {
-        let msgs: Vec<(String, String, Option<String>)> = req["messages"].as_array().ok_or("messages are required")?.iter().map(|m| {
-            (m["role"].as_str().unwrap_or("user").to_string(), text_of(&m["content"]), m["reasoning_content"].as_str().map(str::to_string))
+    /// A request's body as an `Ask` (OpenAI's fields, or /api/chat's).
+    fn ask(&self, req: &Value, api: Api) -> Result<Ask, String> {
+        let thinking_key = if api == Api::Lines { "thinking" } else { "reasoning_content" };
+        let messages = req["messages"].as_array().ok_or("messages are required")?.iter().map(|m| {
+            (m["role"].as_str().unwrap_or("user").to_string(), text_of(&m["content"]), m[thinking_key].as_str().map(str::to_string))
         }).collect();
-        let effort = req["reasoning_effort"].as_str().or_else(|| req["chat_template_kwargs"]["reasoning_effort"].as_str())
-            .and_then(Effort::parse).unwrap_or(self.default_effort);
-        let messages: Vec<Message> = msgs.iter().map(|(r, c, rc)| Message { role: r, content: c, reasoning: rc.as_deref() }).collect();
-        let ids = self.tok.encode(&ns_tok::glm_chat(&messages, effort));
+        let effort = match api {
+            Api::Lines => req["effort"].as_str(),
+            Api::OpenAi => req["reasoning_effort"].as_str().or_else(|| req["chat_template_kwargs"]["reasoning_effort"].as_str()),
+        };
+        let effort = match effort {
+            Some(e) => Effort::parse(e).ok_or(format!("effort {e:?}: low, high or max"))?,
+            None => self.default_effort,
+        };
+        Ok(Ask { messages, effort,
+                 max: req["max_tokens"].as_u64().or_else(|| req["max_completion_tokens"].as_u64()).map(|n| n as usize),
+                 temp: req["temperature"].as_f64().unwrap_or(1.0) as f32,
+                 top_p: req["top_p"].as_f64().unwrap_or(0.95) as f32,
+                 stream: req["stream"].as_bool().unwrap_or(api == Api::Lines) })
+    }
+
+    fn chat(&self, s: &mut Conn, ask: &Ask, api: Api, cors: &str, via: &str) -> Result<(), String> {
+        let messages: Vec<Message> = ask.messages.iter().map(|(r, c, rc)| Message { role: r, content: c, reasoning: rc.as_deref() }).collect();
+        let ids = self.tok.encode(&ns_tok::glm_chat(&messages, ask.effort));
         if ids.len() + 16 > self.max_ctx {
             return Err(format!("the prompt is {} tokens; the context is {}", ids.len(), self.max_ctx));
         }
-        let max = req["max_tokens"].as_u64().or_else(|| req["max_completion_tokens"].as_u64()).unwrap_or(4096) as usize;
-        let max = max.min(self.max_ctx - ids.len() - 1);
-        let temp = req["temperature"].as_f64().unwrap_or(1.0) as f32;
-        let top_p = req["top_p"].as_f64().unwrap_or(0.95) as f32;
-        let stream = req["stream"].as_bool().unwrap_or(false);
+        let max = ask.max.unwrap_or(4096).min(self.max_ctx - ids.len() - 1);
+        let (temp, top_p, stream) = (ask.temp, ask.top_p, ask.stream);
         let id = format!("chatcmpl-{}", now());
 
         let mut st = self.state.lock().unwrap();
@@ -333,14 +396,25 @@ impl Server {
         });
 
         if stream {
-            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+            let kind = if api == Api::Lines { "application/x-ndjson" } else { "text/event-stream" };
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nCache-Control: no-cache\r\n{cors}Connection: close\r\n\r\n");
         }
         let send = |s: &mut Conn, delta: Value, finish: Option<&str>| -> bool {
             let chunk = json!({"id": id, "object": "chat.completion.chunk", "created": now(), "model": self.name,
                                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
             write!(s, "data: {chunk}\n\n").and_then(|_| s.flush()).is_ok()
         };
-        if stream {
+        // one piece of the answer as it comes: the thinking or the answer's text
+        let emit = |s: &mut Conn, thinking: bool, text: String| -> bool {
+            match api {
+                Api::OpenAi => send(s, if thinking { json!({"reasoning_content": text}) } else { json!({"content": text}) }, None),
+                Api::Lines => {
+                    let line = if thinking { json!({"thinking": text}) } else { json!({"content": text}) };
+                    writeln!(s, "{line}").and_then(|_| s.flush()).is_ok()
+                }
+            }
+        };
+        if stream && api == Api::OpenAi {
             send(s, json!({"role": "assistant"}), None);
         }
         let (mut reasoning, mut content) = (String::new(), String::new());
@@ -400,7 +474,7 @@ impl Server {
             }
             if stream {
                 for (is_r, p) in parts {
-                    if !p.is_empty() && !send(s, if is_r { json!({"reasoning_content": p}) } else { json!({"content": p}) }, None) {
+                    if !p.is_empty() && !emit(s, is_r, p) {
                         finish = "client gone";
                     }
                 }
@@ -428,17 +502,28 @@ impl Server {
             self.remember(row);
         }
         let finish = if finish == "client gone" { "stop" } else { finish };
-        if stream {
+        if api == Api::Lines {
+            let mut end = json!({"done": true, "finish": finish, "model": self.name, "prompt_tokens": ids.len(), "reused": from, "generated": n,
+                                 "read_seconds": prefill, "generate_seconds": dt, "tok_s": n as f64 / dt.max(1e-9)});
+            if stream {
+                let _ = writeln!(s, "{end}");
+                let _ = s.flush();
+            } else {
+                end["content"] = json!(content.trim());
+                end["thinking"] = json!(reasoning.trim());
+                http::respond_with(s, 200, &end, cors);
+            }
+        } else if stream {
             send(s, json!({}), Some(finish));
             let _ = write!(s, "data: {}\n\ndata: [DONE]\n\n", json!({"id": id, "object": "chat.completion.chunk", "created": now(), "model": self.name,
                                                                       "choices": [], "usage": usage}));
         } else {
-            respond(s, 200, &json!({"id": id, "object": "chat.completion", "created": now(), "model": self.name,
+            http::respond_with(s, 200, &json!({"id": id, "object": "chat.completion", "created": now(), "model": self.name,
                                     "choices": [{"index": 0, "message": {"role": "assistant", "content": content.trim(),
                                                  "reasoning_content": reasoning.trim()}, "finish_reason": finish}],
                                     "usage": usage,
                                     "timings": {"prompt_n": ids.len() - from, "prompt_ms": prefill * 1000.0, "predicted_n": n,
-                                                "predicted_per_second": n as f64 / dt.max(1e-9)}}));
+                                                "predicted_per_second": n as f64 / dt.max(1e-9)}}), cors);
         }
         Ok(())
     }
@@ -449,5 +534,23 @@ struct Guard<'a>(&'a AtomicBool);
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cors_headers;
+
+    #[test]
+    fn cors_lets_loopback_and_named_origins_in() {
+        let none: Vec<String> = Vec::new();
+        assert!(cors_headers(Some("http://localhost:8095"), &none).contains("http://localhost:8095"));
+        assert!(cors_headers(Some("http://127.0.0.1:5173"), &none).contains("Access-Control-Allow-Origin"));
+        assert_eq!(cors_headers(Some("http://localhost.evil.com"), &none), "");
+        assert_eq!(cors_headers(Some("https://example.com"), &none), "");
+        assert_eq!(cors_headers(None, &none), "");
+        let named = vec!["http://studio:8095/".to_string()];
+        assert!(cors_headers(Some("http://studio:8095"), &named).contains("http://studio:8095"));
+        assert!(cors_headers(Some("https://example.com"), &["*".to_string()]).contains("https://example.com"));
     }
 }

@@ -86,6 +86,8 @@ pub struct Request {
     pub method: String,
     /// the path without the query
     pub path: String,
+    /// the Origin header (a browser's request)
+    pub origin: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -99,6 +101,7 @@ pub fn read_request(stream: impl Read) -> Result<Request, String> {
     let target = parts.next().ok_or("no path in the request")?.to_string();
     let path = target.split('?').next().unwrap_or("/").to_string();
     let mut length = 0usize;
+    let mut origin = None;
     loop {
         let mut h = String::new();
         let n = r.read_line(&mut h).map_err(|e| e.to_string())?;
@@ -108,6 +111,8 @@ pub fn read_request(stream: impl Read) -> Result<Request, String> {
         if let Some((k, v)) = h.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
                 length = v.trim().parse().map_err(|_| "bad Content-Length")?;
+            } else if k.trim().eq_ignore_ascii_case("origin") {
+                origin = Some(v.trim().to_string());
             }
         }
     }
@@ -116,12 +121,13 @@ pub fn read_request(stream: impl Read) -> Result<Request, String> {
     }
     let mut body = vec![0u8; length];
     r.read_exact(&mut body).map_err(|e| e.to_string())?;
-    Ok(Request { method, path, body })
+    Ok(Request { method, path, origin, body })
 }
 
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
         409 => "Conflict",
@@ -130,9 +136,15 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-pub fn respond(mut w: impl Write, status: u16, body: &Value) {
+pub fn respond(w: impl Write, status: u16, body: &Value) {
+    respond_with(w, status, body, "")
+}
+
+/// `respond` with more header lines (each ending in \r\n), e.g. CORS
+pub fn respond_with(mut w: impl Write, status: u16, body: &Value, headers: &str) {
     let b = body.to_string();
-    let _ = write!(w, "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", reason(status), b.len());
+    let _ = write!(w, "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{b}",
+                   reason(status), b.len());
     let _ = w.flush();
 }
 
