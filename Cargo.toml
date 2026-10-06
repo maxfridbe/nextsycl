@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ns-sys", "crates/ns-core", "crates/ns-gguf", "crates/ns-model", "crates/nextsycl"]
+members = ["crates/ns-sys", "crates/ns-core", "crates/ns-gguf", "crates/ns-model", "crates/ns-engine", "crates/nextsycl"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ license = "MIT"
 ns-gguf = { path = "crates/ns-gguf" }
 ns-model = { path = "crates/ns-model" }
 ns-core = { path = "crates/ns-core" }
+ns-engine = { path = "crates/ns-engine" }
 serde_json = "1"
 
 [profile.release]

@@ -1,6 +1,7 @@
 // ns.cpp: the devices, memory and copies of the C ABI (ns.h). Kernels are called through their own wrappers
 // (ns_*.cpp beside this), each taking the ns_gpu's queue.
 #include "ns.h"
+#include "ns_internal.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -13,10 +14,7 @@ namespace {
 
 thread_local std::string g_err;
 
-int fail(const std::string& what) {
-    g_err = what;
-    return -1;
-}
+int fail(const std::string& what) { return ns_fail(what); }
 
 std::vector<sycl::device> gpus() {
     std::vector<sycl::device> v;
@@ -29,15 +27,10 @@ std::vector<sycl::device> gpus() {
 
 }  // namespace
 
-struct ns_gpu {
-    sycl::device dev;
-    sycl::context ctx;   // this GPU alone (see ns.h)
-    sycl::queue q;
-};
-
-#define NS_TRY try {
-#define NS_CATCH } catch (const sycl::exception& e) { return fail(std::string("sycl: ") + e.what()); } \
-                   catch (const std::exception& e) { return fail(e.what()); }
+int ns_fail(const std::string& what) {
+    g_err = what;
+    return -1;
+}
 
 extern "C" {
 

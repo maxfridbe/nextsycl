@@ -7,6 +7,7 @@ name = "nextsycl"
 version = "0.1.0"
 dependencies = [
  "ns-core",
+ "ns-engine",
  "ns-gguf",
  "ns-model",
 ]
@@ -16,6 +17,15 @@ name = "ns-core"
 version = "0.1.0"
 dependencies = [
  "ns-sys",
+]
+
+[[package]]
+name = "ns-engine"
+version = "0.1.0"
+dependencies = [
+ "ns-core",
+ "ns-gguf",
+ "ns-model",
 ]
 
 [[package]]

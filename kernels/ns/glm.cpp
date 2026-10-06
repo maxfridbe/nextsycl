@@ -1,0 +1,530 @@
+// glm.cpp: the bring-up kernels - exact and plain, float32 activations, one kernel per step of docs/glm5next.md.
+// Correctness first: every one is checked against llama.cpp's dumps; the imported optimized kernels replace them
+// where speed matters, checked against these.
+#include "ns.h"
+#include "ns_internal.hpp"
+
+#include <sycl/sycl.hpp>
+#include <oneapi/mkl/blas.hpp>
+
+#define GGML_COMMON_DECL_SYCL
+#define GGML_COMMON_IMPL_SYCL
+#include "ggml-common.h"
+
+#include <cmath>
+#include <string>
+
+namespace {
+
+inline float h2f(ggml_half h) { return (float) h; }
+
+// ---- dequantization: one work-item per block, the order and arithmetic of ggml-quants.c's dequantize_row_*
+
+inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
+    if (j < 4) {
+        *d = q[j] & 63; *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+void deq_q8_0(const block_q8_0* x, float* y) {
+    const float d = h2f(x->d);
+    for (int j = 0; j < QK8_0; ++j) y[j] = x->qs[j] * d;
+}
+
+void deq_q2_K(const block_q2_K* x, float* y) {
+    const float d = (float) x->dm[0], mn = (float) x->dm[1];   // the SYCL ggml-common.h's (d, dmin) pair
+    const uint8_t* q = x->qs;
+    int is = 0;
+    for (int n = 0; n < QK_K; n += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            uint8_t sc = x->scales[is++];
+            float dl = d * (sc & 0xF), ml = mn * (sc >> 4);
+            for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t) ((q[l] >> shift) & 3)) - ml;
+            sc = x->scales[is++];
+            dl = d * (sc & 0xF); ml = mn * (sc >> 4);
+            for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t) ((q[l + 16] >> shift) & 3)) - ml;
+            shift += 2;
+        }
+        q += 32;
+    }
+}
+
+void deq_q3_K(const block_q3_K* x, float* y) {
+    const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+    uint32_t aux[4];
+    const int8_t* scales = (const int8_t*) aux;
+    const float d_all = h2f(x->d);
+    const uint8_t* q = x->qs;
+    const uint8_t* hm = x->hmask;
+    uint8_t m = 1;
+    for (int i = 0; i < 3; ++i) {
+        aux[i] = (uint32_t) x->scales[4 * i] | ((uint32_t) x->scales[4 * i + 1] << 8) | ((uint32_t) x->scales[4 * i + 2] << 16) |
+                 ((uint32_t) x->scales[4 * i + 3] << 24);
+    }
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    int is = 0;
+    for (int n = 0; n < QK_K; n += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            float dl = d_all * (scales[is++] - 32);
+            for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t) ((q[l + 0] >> shift) & 3) - ((hm[l + 0] & m) ? 0 : 4));
+            dl = d_all * (scales[is++] - 32);
+            for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t) ((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+            shift += 2;
+            m <<= 1;
+        }
+        q += 32;
+    }
+}
+
+void deq_q4_K(const block_q4_K* x, float* y) {
+    const uint8_t* q = x->qs;
+    const float d = (float) x->dm[0], mn = (float) x->dm[1];   // the SYCL ggml-common.h's (d, dmin) pair
+    int is = 0;
+    uint8_t sc, m;
+    for (int j = 0; j < QK_K; j += 64) {
+        get_scale_min_k4(is + 0, x->scales, &sc, &m);
+        const float d1 = d * sc, m1 = mn * m;
+        get_scale_min_k4(is + 1, x->scales, &sc, &m);
+        const float d2 = d * sc, m2 = mn * m;
+        for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
+        for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l] >> 4) - m2;
+        q += 32;
+        is += 2;
+    }
+}
+
+void deq_q5_K(const block_q5_K* x, float* y) {
+    const uint8_t* ql = x->qs;
+    const uint8_t* qh = x->qh;
+    const float d = (float) x->dm[0], mn = (float) x->dm[1];   // the SYCL ggml-common.h's (d, dmin) pair
+    int is = 0;
+    uint8_t sc, m;
+    uint8_t u1 = 1, u2 = 2;
+    for (int j = 0; j < QK_K; j += 64) {
+        get_scale_min_k4(is + 0, x->scales, &sc, &m);
+        const float d1 = d * sc, m1 = mn * m;
+        get_scale_min_k4(is + 1, x->scales, &sc, &m);
+        const float d2 = d * sc, m2 = mn * m;
+        for (int l = 0; l < 32; ++l) *y++ = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+        for (int l = 0; l < 32; ++l) *y++ = d2 * ((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
+        ql += 32;
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
+void deq_q6_K(const block_q6_K* x, float* y) {
+    const float d = h2f(x->d);
+    const uint8_t* ql = x->ql;
+    const uint8_t* qh = x->qh;
+    const int8_t* sc = x->scales;
+    for (int n = 0; n < QK_K; n += 128) {
+        for (int l = 0; l < 32; ++l) {
+            const int is = l / 16;
+            const int8_t q1 = (int8_t) ((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            const int8_t q2 = (int8_t) ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            const int8_t q3 = (int8_t) ((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            const int8_t q4 = (int8_t) ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            y[l + 0] = d * sc[is + 0] * q1;
+            y[l + 32] = d * sc[is + 2] * q2;
+            y[l + 64] = d * sc[is + 4] * q3;
+            y[l + 96] = d * sc[is + 6] * q4;
+        }
+        y += 128;
+        ql += 64;
+        qh += 32;
+        sc += 8;
+    }
+}
+
+void deq_iq2_xxs(const block_iq2_xxs* x, float* y) {
+    const float d = h2f(x->d);
+    for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+        const uint16_t* q2 = x->qs + 4 * ib32;
+        const uint32_t a0 = (uint32_t) q2[0] | ((uint32_t) q2[1] << 16);
+        const uint32_t a1 = (uint32_t) q2[2] | ((uint32_t) q2[3] << 16);
+        const float db = d * (0.5f + (a1 >> 28)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t idx = (uint8_t) (a0 >> (8 * l));
+            const uint8_t* grid = (const uint8_t*) (iq2xxs_grid + idx);
+            const uint8_t signs = ksigns_iq2xs[(a1 >> 7 * l) & 127];
+            for (int j = 0; j < 8; ++j) y[j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+            y += 8;
+        }
+    }
+}
+
+template <class Block, int QK, void (*F)(const Block*, float*)>
+void dequant_blocks(sycl::queue& q, const void* src, size_t n, float* dst) {
+    const size_t nb = n / QK;
+    const Block* b = (const Block*) src;
+    q.parallel_for(sycl::range<1>(nb), [=](sycl::id<1> i) { F(b + i[0], dst + i[0] * QK); });
+}
+
+}  // namespace
+
+extern "C" {
+
+int ns_dequant(ns_gpu* g, int type, const void* src, size_t n, float* dst) {
+    NS_TRY
+    auto& q = g->q;
+    switch (type) {
+        case 0:  // F32
+            q.memcpy(dst, src, n * 4);
+            return 0;
+        case 1: {  // F16
+            const sycl::half* s = (const sycl::half*) src;
+            q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { dst[i] = (float) s[i]; });
+            return 0;
+        }
+        case 30: {  // BF16: the top half of a float32
+            const uint16_t* s = (const uint16_t*) src;
+            q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { dst[i] = sycl::bit_cast<float>((uint32_t) s[i] << 16); });
+            return 0;
+        }
+        case 8: dequant_blocks<block_q8_0, QK8_0, deq_q8_0>(q, src, n, dst); return 0;
+        case 10: dequant_blocks<block_q2_K, QK_K, deq_q2_K>(q, src, n, dst); return 0;
+        case 11: dequant_blocks<block_q3_K, QK_K, deq_q3_K>(q, src, n, dst); return 0;
+        case 12: dequant_blocks<block_q4_K, QK_K, deq_q4_K>(q, src, n, dst); return 0;
+        case 13: dequant_blocks<block_q5_K, QK_K, deq_q5_K>(q, src, n, dst); return 0;
+        case 14: dequant_blocks<block_q6_K, QK_K, deq_q6_K>(q, src, n, dst); return 0;
+        case 16: dequant_blocks<block_iq2_xxs, QK_K, deq_iq2_xxs>(q, src, n, dst); return 0;
+        default: return ns_fail("ns_dequant: ggml type " + std::to_string(type) + " is not supported yet");
+    }
+    NS_CATCH
+}
+
+// y [T, N] (+)= x [T, K] . w [N, K]^T, float32 row-major; rows of x are ldx apart, rows of y ldy apart (column
+// slices: one head's columns of a wider activation, one row chunk of a matrix into its columns of the output)
+int ns_gemm(ns_gpu* g, int64_t T, int64_t N, int64_t K, const float* x, int64_t ldx, const float* w, float* y, int64_t ldy,
+            int accumulate) {
+    NS_TRY
+    using oneapi::mkl::transpose;
+    oneapi::mkl::blas::row_major::gemm(g->q, transpose::nontrans, transpose::trans, T, N, K, 1.0f, x, ldx, w, K,
+                                       accumulate ? 1.0f : 0.0f, y, ldy);
+    return 0;
+    NS_CATCH
+}
+
+// y = x / sqrt(mean(x^2) + eps) (* w when given), rows of C; y may be x
+int ns_rms_norm(ns_gpu* g, const float* x, const float* w, float* y, int64_t rows, int64_t C, float eps) {
+    NS_TRY
+    constexpr int WG = 256;
+    g->q.parallel_for(sycl::nd_range<1>(rows * WG, WG), [=](sycl::nd_item<1> it) {
+        const int64_t r = it.get_group(0);
+        const float* xr = x + r * C;
+        float s = 0.f;
+        for (int64_t c = it.get_local_id(0); c < C; c += WG) s += xr[c] * xr[c];
+        s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+        const float inv = 1.f / sycl::sqrt(s / (float) C + eps);
+        for (int64_t c = it.get_local_id(0); c < C; c += WG) y[r * C + c] = xr[c] * inv * (w ? w[c] : 1.f);
+    });
+    return 0;
+    NS_CATCH
+}
+
+// y = (x - mean) / sqrt(var + eps) * w + b, rows of C
+int ns_layer_norm(ns_gpu* g, const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t C, float eps) {
+    NS_TRY
+    constexpr int WG = 128;
+    g->q.parallel_for(sycl::nd_range<1>(rows * WG, WG), [=](sycl::nd_item<1> it) {
+        const int64_t r = it.get_group(0);
+        const float* xr = x + r * C;
+        float s = 0.f;
+        for (int64_t c = it.get_local_id(0); c < C; c += WG) s += xr[c];
+        const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
+        float v = 0.f;
+        for (int64_t c = it.get_local_id(0); c < C; c += WG) v += (xr[c] - mean) * (xr[c] - mean);
+        const float var = sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>()) / (float) C;
+        const float inv = 1.f / sycl::sqrt(var + eps);
+        for (int64_t c = it.get_local_id(0); c < C; c += WG) y[r * C + c] = (xr[c] - mean) * inv * (w ? w[c] : 1.f) + (b ? b[c] : 0.f);
+    });
+    return 0;
+    NS_CATCH
+}
+
+// mHC, before a half: from the mixes m [T, 24] (fn . rms(flatten X)) and X [T, 4, C]:
+//   h [T, C] = sum_s pre[s] X[s];  post [T, 4];  comb [T, 16] (comb[dst + 4 src]), Sinkhorn-normalized
+int ns_hc_pre(ns_gpu* g, const float* m, const float* scale, const float* base, const float* X, float* h, float* post, float* comb,
+              int64_t T, int64_t C, float eps, int iters) {
+    NS_TRY
+    auto& q = g->q;
+    float* pre = sycl::malloc_device<float>(T * 4, q);
+    q.parallel_for(sycl::range<1>(T), [=](sycl::id<1> id) {
+        const int64_t t = id[0];
+        const float* mt = m + t * 24;
+        for (int i = 0; i < 4; ++i) {
+            pre[t * 4 + i] = 1.f / (1.f + sycl::exp(-(mt[i] * scale[0] + base[i]))) + eps;
+            post[t * 4 + i] = 2.f / (1.f + sycl::exp(-(mt[4 + i] * scale[1] + base[4 + i])));
+        }
+        float c[16];
+        for (int i = 0; i < 16; ++i) c[i] = mt[8 + i] * scale[2] + base[8 + i];
+        // softmax over dst for each src (ggml_soft_max over ne0 = dst), then + eps
+        for (int src = 0; src < 4; ++src) {
+            float mx = c[4 * src];
+            for (int d = 1; d < 4; ++d) mx = sycl::fmax(mx, c[d + 4 * src]);
+            float sum = 0.f;
+            for (int d = 0; d < 4; ++d) { c[d + 4 * src] = sycl::exp(c[d + 4 * src] - mx); sum += c[d + 4 * src]; }
+            for (int d = 0; d < 4; ++d) c[d + 4 * src] = c[d + 4 * src] / sum + eps;
+        }
+        auto norm_cols = [&]() {   // for each dst: divide by (eps + sum over src)
+            for (int d = 0; d < 4; ++d) {
+                float s = eps;
+                for (int src = 0; src < 4; ++src) s += c[d + 4 * src];
+                for (int src = 0; src < 4; ++src) c[d + 4 * src] /= s;
+            }
+        };
+        auto norm_rows = [&]() {   // for each src: divide by (eps + sum over dst)
+            for (int src = 0; src < 4; ++src) {
+                float s = eps;
+                for (int d = 0; d < 4; ++d) s += c[d + 4 * src];
+                for (int d = 0; d < 4; ++d) c[d + 4 * src] /= s;
+            }
+        };
+        norm_cols();
+        for (int i = 1; i < iters; ++i) { norm_rows(); norm_cols(); }
+        for (int i = 0; i < 16; ++i) comb[t * 16 + i] = c[i];
+    });
+    q.parallel_for(sycl::range<2>(T, C), [=](sycl::id<2> id) {
+        const int64_t t = id[0], k = id[1];
+        float s = 0.f;
+        for (int i = 0; i < 4; ++i) s += pre[t * 4 + i] * X[(t * 4 + i) * C + k];
+        h[t * C + k] = s;
+    });
+    q.wait();
+    sycl::free(pre, q);
+    return 0;
+    NS_CATCH
+}
+
+// mHC, after a half: Xo[t][d] = post[t][d] * y[t] + sum_s comb[t][d + 4 s] * X[t][s]   (Xo may not be X)
+int ns_hc_post(ns_gpu* g, const float* y, const float* X, const float* post, const float* comb, float* Xo, int64_t T, int64_t C) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<3>(T, 4, C), [=](sycl::id<3> id) {
+        const int64_t t = id[0], d = id[1], k = id[2];
+        float s = post[t * 4 + d] * y[t * C + k];
+        for (int src = 0; src < 4; ++src) s += comb[t * 16 + d + 4 * src] * X[(t * 4 + src) * C + k];
+        Xo[(t * 4 + d) * C + k] = s;
+    });
+    return 0;
+    NS_CATCH
+}
+
+// y [T, C] = mean over the 4 streams of X [T, 4, C]
+int ns_hc_mean(ns_gpu* g, const float* X, float* y, int64_t T, int64_t C) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<2>(T, C), [=](sycl::id<2> id) {
+        const int64_t t = id[0], k = id[1];
+        float s = 0.f;
+        for (int i = 0; i < 4; ++i) s += X[(t * 4 + i) * C + k];
+        y[t * C + k] = s * 0.25f;
+    });
+    return 0;
+    NS_CATCH
+}
+
+// KDA's short convolution, then silu: x [T, D] (this ubatch's projections), state [k-1, D] (the previous tokens'
+// projections, oldest first; updated in place to the last k-1 inputs), w [D, k]; out [T, D]
+int ns_conv_silu(ns_gpu* g, const float* x, float* state, const float* w, float* out, int64_t T, int64_t D, int k) {
+    NS_TRY
+    auto& q = g->q;
+    q.parallel_for(sycl::range<1>(D), [=](sycl::id<1> id) {
+        const int64_t c = id[0];
+        for (int64_t t = 0; t < T; ++t) {
+            float s = 0.f;
+            for (int j = 0; j < k; ++j) {   // inputs t-k+1 .. t, weight j for input t-k+1+j
+                const int64_t src = t - (k - 1) + j;
+                const float v = src >= 0 ? x[src * D + c] : state[(k - 1 + src) * D + c];
+                s += v * w[c * k + j];
+            }
+            out[t * D + c] = s / (1.f + sycl::exp(-s));
+        }
+        // the new state: the last k-1 inputs
+        float last[8];
+        for (int j = 0; j < k - 1; ++j) {
+            const int64_t src = T - (k - 1) + j;
+            last[j] = src >= 0 ? x[src * D + c] : state[(k - 1 + src) * D + c];
+        }
+        for (int j = 0; j < k - 1; ++j) state[j * D + c] = last[j];
+    });
+    return 0;
+    NS_CATCH
+}
+
+// per row of n: x / sqrt(sum x^2 + eps), in place (KDA's q and k per head)
+int ns_l2_norm(ns_gpu* g, float* x, int64_t rows, int64_t n, float eps) {
+    NS_TRY
+    constexpr int WG = 128;
+    g->q.parallel_for(sycl::nd_range<1>(rows * WG, WG), [=](sycl::nd_item<1> it) {
+        float* xr = x + it.get_group(0) * n;
+        float s = 0.f;
+        for (int64_t c = it.get_local_id(0); c < n; c += WG) s += xr[c] * xr[c];
+        s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+        const float inv = 1.f / sycl::sqrt(s + eps);
+        for (int64_t c = it.get_local_id(0); c < n; c += WG) xr[c] *= inv;
+    });
+    return 0;
+    NS_CATCH
+}
+
+// KDA decay gate, in place over g [T, H, dh]: g = low * sigmoid(-((g + dt_bias) * A[h]))
+int ns_kda_gate(ns_gpu* g, float* gate, const float* dt_bias, const float* A, int64_t T, int64_t H, int64_t dh, float low) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<1>(T * H * dh), [=](sycl::id<1> id) {
+        const int64_t i = id[0], c = i % (H * dh), h = c / dh;
+        const float v = (gate[i] + dt_bias[c]) * A[h];
+        gate[i] = low / (1.f + sycl::exp(v));
+    });
+    return 0;
+    NS_CATCH
+}
+
+// in place: x = sigmoid(x)
+int ns_sigmoid(ns_gpu* g, float* x, int64_t n) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { x[i] = 1.f / (1.f + sycl::exp(-x[i])); });
+    return 0;
+    NS_CATCH
+}
+
+// The KDA recurrence (the fused op of docs/glm5next.md), tokens in order. q, k, v, gate [T, H, d]; beta [T, H];
+// S [H, d key, d value], updated; o [T, H, d]. One work-group per head, a work-item per value column.
+int ns_kda_scan(ns_gpu* g, const float* qv, const float* kv, const float* vv, const float* gate, const float* beta, float* S, float* o,
+                int64_t T, int64_t H, int64_t d) {
+    NS_TRY
+    if (d != 128) return ns_fail("ns_kda_scan: head size 128 only");
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> lq(sycl::range<1>(128), h), lk(sycl::range<1>(128), h), lg(sycl::range<1>(128), h);
+        h.parallel_for(sycl::nd_range<1>(H * 128, 128), [=](sycl::nd_item<1> it) {
+            const int64_t hd = it.get_group(0);
+            const int j = it.get_local_id(0);           // the value column this work-item owns
+            float col[128];                              // S[i][j] for every key i
+            float* Sh = S + hd * 128 * 128;
+            for (int i = 0; i < 128; ++i) col[i] = Sh[i * 128 + j];
+            const float scale = 1.f / sycl::sqrt(128.f);
+            for (int64_t t = 0; t < T; ++t) {
+                const int64_t base = (t * H + hd) * 128;
+                lq[j] = qv[base + j];
+                lk[j] = kv[base + j];
+                lg[j] = sycl::exp(gate[base + j]);
+                sycl::group_barrier(it.get_group());
+                float dot = 0.f;
+                for (int i = 0; i < 128; ++i) { col[i] *= lg[i]; dot += col[i] * lk[i]; }
+                const float delta = (vv[base + j] - dot) * beta[t * H + hd];
+                float out = 0.f;
+                for (int i = 0; i < 128; ++i) { col[i] += lk[i] * delta; out += col[i] * lq[i]; }
+                o[base + j] = out * scale;
+                sycl::group_barrier(it.get_group());
+            }
+            for (int i = 0; i < 128; ++i) Sh[i * 128 + j] = col[i];
+        });
+    });
+    return 0;
+    NS_CATCH
+}
+
+// KDA output: per head, y = rms_norm(o) * w * sigmoid(gate); o, gate [T, H, d] -> y [T, H, d]
+int ns_kda_out(ns_gpu* g, const float* o, const float* gate, const float* w, float* y, int64_t T, int64_t H, int64_t d, float eps) {
+    NS_TRY
+    constexpr int WG = 128;
+    g->q.parallel_for(sycl::nd_range<1>(T * H * WG, WG), [=](sycl::nd_item<1> it) {
+        const int64_t r = it.get_group(0);
+        const float* orow = o + r * d;
+        float s = 0.f;
+        for (int64_t c = it.get_local_id(0); c < d; c += WG) s += orow[c] * orow[c];
+        s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+        const float inv = 1.f / sycl::sqrt(s / (float) d + eps);
+        for (int64_t c = it.get_local_id(0); c < d; c += WG) {
+            const float gt = gate[r * d + c];
+            y[r * d + c] = orow[c] * inv * w[c] / (1.f + sycl::exp(-gt));
+        }
+    });
+    return 0;
+    NS_CATCH
+}
+
+// out = silu(min(gate, limit)) * clamp(up, -limit, limit); gate, up, out [n]
+int ns_swiglu_clamp(ns_gpu* g, const float* gate, const float* up, float* out, int64_t n, float limit) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+        const float a = sycl::fmin(gate[i], limit);
+        const float u = sycl::fmin(sycl::fmax(up[i], -limit), limit);
+        out[i] = a / (1.f + sycl::exp(-a)) * u;
+    });
+    return 0;
+    NS_CATCH
+}
+
+// MLA attention over the cached latents, causal, every cached token (no indexer: exact up to ~2048 tokens).
+// qa [T, H, L] (the absorbed queries of this ubatch, tokens pos0 .. pos0+T-1), c [n_cached, L] (all latents so far,
+// including this ubatch's); u [T, H, L] = sum_t' softmax(qa . c(t') * scale) c(t'), t' <= pos
+int ns_mla_attend(ns_gpu* g, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale) {
+    NS_TRY
+    constexpr int WG = 256;
+    g->q.parallel_for(sycl::nd_range<1>(T * H * WG, WG), [=](sycl::nd_item<1> it) {
+        const int64_t th = it.get_group(0), t = th / H;
+        const float* qr = qa + th * L;
+        const int64_t n = pos0 + t + 1;
+        const int lid = it.get_local_id(0);
+        // pass 1: the max score; pass 2: the sum and the weighted latents (two passes: exact, n is small here)
+        float mx = -INFINITY;
+        for (int64_t s = 0; s < n; ++s) {
+            float dot = 0.f;
+            for (int64_t r = lid; r < L; r += WG) dot += qr[r] * c[s * L + r];
+            dot = sycl::reduce_over_group(it.get_group(), dot, sycl::plus<float>()) * scale;
+            mx = sycl::fmax(mx, dot);
+        }
+        float sum = 0.f;
+        float acc[2] = {0.f, 0.f};   // L = 512, WG = 256: two latent features a work-item
+        for (int64_t s = 0; s < n; ++s) {
+            float dot = 0.f;
+            for (int64_t r = lid; r < L; r += WG) dot += qr[r] * c[s * L + r];
+            dot = sycl::reduce_over_group(it.get_group(), dot, sycl::plus<float>()) * scale;
+            const float p = sycl::exp(dot - mx);
+            sum += p;
+            for (int k = 0; k < 2 && lid + k * WG < L; ++k) acc[k] += p * c[s * L + lid + k * WG];
+        }
+        for (int k = 0; k < 2 && lid + k * WG < L; ++k) u[th * L + lid + k * WG] = acc[k] / sum;
+    });
+    return 0;
+    NS_CATCH
+}
+
+// y[idx[i]] += w[i] * src[i]; rows of C (the experts' outputs back into their tokens); idx distinct per call
+int ns_scatter_add(ns_gpu* g, float* y, const float* src, const int32_t* idx, const float* w, int64_t n, int64_t C) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<2>(n, C), [=](sycl::id<2> id) {
+        const int64_t i = id[0], k = id[1];
+        y[idx[i] * C + k] += w[i] * src[i * C + k];
+    });
+    return 0;
+    NS_CATCH
+}
+
+// out[i] = src[idx[i]] rows of C (the tokens an expert serves)
+int ns_gather(ns_gpu* g, const float* src, const int32_t* idx, float* out, int64_t n, int64_t C) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<2>(n, C), [=](sycl::id<2> id) { out[id[0] * C + id[1]] = src[idx[id[0]] * C + id[1]]; });
+    return 0;
+    NS_CATCH
+}
+
+// y += x (n values)
+int ns_add(ns_gpu* g, float* y, const float* x, int64_t n) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { y[i] += x[i]; });
+    return 0;
+    NS_CATCH
+}
+
+}  // extern "C"

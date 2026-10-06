@@ -1,12 +1,11 @@
 [package]
-name = "nextsycl"
-description = "The command line: info, check, generate, serve"
+name = "ns-engine"
+description = "The models' forward passes on the GPUs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ns-core.workspace = true
 ns-gguf.workspace = true
 ns-model.workspace = true
-ns-core.workspace = true
-ns-engine.workspace = true

@@ -3,6 +3,9 @@
 //!     nextsycl info <model.gguf>      the architecture, its geometry, every tensor checked by role, bytes by group
 //!     nextsycl gpus                   each GPU in its own context: memory, copies and their rates, GPU to GPU, and
 //!                                     that device memory costs no host RAM
+//!     nextsycl check <model.gguf> <dump dir> [--gpu N]
+//!                                     the forward pass on a reference dump's prompt (reference/llama-dump), every
+//!                                     step compared: cosine and relative error per tensor, then the next token
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -12,7 +15,9 @@ use ns_model::glm5next::{Group, Model};
 
 const USAGE: &str = "usage:
   nextsycl info <model.gguf>    the architecture and geometry, every tensor checked by role, bytes by group
-  nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected";
+  nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
+  nextsycl check <model.gguf> <dump dir> [--gpu N]
+                                the forward pass on a reference dump's prompt, every step compared, the next token";
 
 fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
@@ -154,11 +159,82 @@ fn gpus() -> Result<(), String> {
     Ok(())
 }
 
+/// (cosine, relative L2 error, max |a - b|)
+fn compare(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+    let (mut ab, mut aa, mut bb, mut dd, mut mx) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (*x as f64, *y as f64);
+        ab += x * y;
+        aa += x * x;
+        bb += y * y;
+        dd += (x - y) * (x - y);
+        mx = mx.max((x - y).abs());
+    }
+    (ab / (aa.sqrt() * bb.sqrt()).max(1e-30), (dd / bb.max(1e-30)).sqrt(), mx)
+}
+
+fn check(model: &Path, dump: &Path, gpu: usize) -> Result<(), String> {
+    use std::collections::BTreeMap;
+    let e = |x: ns_core::Error| x.0;
+    let f = Gguf::open(model).map_err(|e| e.0)?;
+    let read = |n: &str| std::fs::read_to_string(dump.join(n)).map_err(|e| format!("{}: {e}", dump.join(n).display()));
+    let tokens: Vec<u32> = read("tokens.txt")?.split_whitespace().map(|t| t.parse().map_err(|_| format!("token {t}"))).collect::<Result<_, _>>()?;
+    let want_next: Option<u32> = read("next.txt").ok().and_then(|s| s.trim().parse().ok());
+    // name -> element count (the last line of a name wins: its file holds the last write)
+    let mut index: BTreeMap<String, usize> = BTreeMap::new();
+    for line in read("index.tsv")?.lines() {
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.len() >= 6 {
+            let n: usize = c[2..6].iter().map(|v| v.parse::<usize>().unwrap_or(1)).product();
+            index.insert(c[0].to_string(), n);
+        }
+    }
+    let g = ns_core::Gpu::open(gpu).map_err(e)?;
+    println!("gpu      : {} ({})", g.name, g.index);
+    let mut log = |l: String| println!("load     : {l}");
+    let glm = ns_engine::glm5next::Glm::load(&f, &g, &mut log).map_err(e)?;
+    println!("load     : {:.2} GiB in {:.1} s", gib(glm.load_bytes), glm.load_seconds);
+    println!("prompt   : {} tokens {:?}", tokens.len(), tokens);
+    println!("{:<26} {:>10} {:>10} {:>10}", "tensor", "cosine", "rel err", "max diff");
+    let mut worst: (f64, String) = (1.0, String::new());
+    let t0 = std::time::Instant::now();
+    let mut tap = |name: &str, b: &ns_core::DevBuf| -> ns_core::Result<()> {
+        let Some(&n) = index.get(name) else { return Ok(()) };
+        let mine = b.to_f32()?;
+        let path = dump.join(format!("{name}.f32"));
+        let raw = std::fs::read(&path).map_err(|x| ns_core::Error(format!("{}: {x}", path.display())))?;
+        let theirs: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        if theirs.len() != n || mine.len() < n {
+            println!("{name:<26} sizes differ: mine {}, the reference {} ({n} in its index)", mine.len(), theirs.len());
+            return Ok(());
+        }
+        let (cos, rel, mx) = compare(&mine[..n], &theirs);
+        println!("{name:<26} {cos:>10.6} {rel:>10.2e} {mx:>10.3e}");
+        if cos < worst.0 {
+            worst = (cos, name.to_string());
+        }
+        Ok(())
+    };
+    let logits = glm.forward(&tokens, &mut tap).map_err(e)?;
+    let best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as u32).unwrap_or(0);
+    let vocab = f.meta("tokenizer.ggml.tokens").and_then(|v| v.as_array());
+    let word = |id: u32| vocab.and_then(|v| v.get(id as usize)).and_then(|v| v.as_str()).unwrap_or("?").replace('\u{120}', " ").to_string();
+    println!("forward  : {:.1} s", t0.elapsed().as_secs_f64());
+    println!("worst    : {} (cosine {:.6})", worst.1, worst.0);
+    println!("next     : {best} {:?}{}", word(best), want_next.map_or(String::new(), |w| format!(", the reference {w} {:?}{}", word(w),
+                                                         if w == best { " - the same" } else { " - DIFFERENT" })));
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let r = match args.first().map(String::as_str) {
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),
         Some("gpus") => gpus(),
+        Some("check") if args.len() >= 3 => {
+            let gpu = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0);
+            check(Path::new(&args[1]), Path::new(&args[2]), gpu)
+        }
         _ => Err(USAGE.into()),
     };
     match r {

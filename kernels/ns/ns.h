@@ -46,6 +46,34 @@ int ns_sync(ns_gpu* g);
  * context, so it is pinned for at most one of the two copies; plain memory works for both, slower); waits */
 int ns_copy_peer(ns_gpu* to, void* dst, ns_gpu* from, const void* src, size_t bytes, void* staging);
 
+/* ---- the bring-up kernels (glm.cpp): float32 activations, row-major, all queued on the GPU's queue ---- */
+/* n values of a ggml-typed tensor (0 F32, 1 F16, 30 BF16, 8 Q8_0, 10-14 Q2_K..Q6_K, 16 IQ2_XXS) into float32 */
+int ns_dequant(ns_gpu* g, int type, const void* src, size_t n, float* dst);
+/* y [T, N] (+)= x [T, K] . w [N, K]^T; rows of x ldx floats apart, rows of y ldy apart */
+int ns_gemm(ns_gpu* g, int64_t T, int64_t N, int64_t K, const float* x, int64_t ldx, const float* w, float* y, int64_t ldy,
+            int accumulate);
+int ns_rms_norm(ns_gpu* g, const float* x, const float* w, float* y, int64_t rows, int64_t C, float eps);
+int ns_layer_norm(ns_gpu* g, const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t C, float eps);
+/* mHC (docs/glm5next.md): m [T, 24] mixes; X [T, 4, C]; h [T, C]; post [T, 4]; comb [T, 16] */
+int ns_hc_pre(ns_gpu* g, const float* m, const float* scale, const float* base, const float* X, float* h, float* post, float* comb,
+              int64_t T, int64_t C, float eps, int iters);
+int ns_hc_post(ns_gpu* g, const float* y, const float* X, const float* post, const float* comb, float* Xo, int64_t T, int64_t C);
+int ns_hc_mean(ns_gpu* g, const float* X, float* y, int64_t T, int64_t C);
+/* KDA */
+int ns_conv_silu(ns_gpu* g, const float* x, float* state, const float* w, float* out, int64_t T, int64_t D, int k);
+int ns_l2_norm(ns_gpu* g, float* x, int64_t rows, int64_t n, float eps);
+int ns_kda_gate(ns_gpu* g, float* gate, const float* dt_bias, const float* A, int64_t T, int64_t H, int64_t dh, float low);
+int ns_sigmoid(ns_gpu* g, float* x, int64_t n);
+int ns_kda_scan(ns_gpu* g, const float* q, const float* k, const float* v, const float* gate, const float* beta, float* S, float* o,
+                int64_t T, int64_t H, int64_t d);
+int ns_kda_out(ns_gpu* g, const float* o, const float* gate, const float* w, float* y, int64_t T, int64_t H, int64_t d, float eps);
+/* FFN, MLA, experts */
+int ns_swiglu_clamp(ns_gpu* g, const float* gate, const float* up, float* out, int64_t n, float limit);
+int ns_mla_attend(ns_gpu* g, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale);
+int ns_scatter_add(ns_gpu* g, float* y, const float* src, const int32_t* idx, const float* w, int64_t n, int64_t C);
+int ns_gather(ns_gpu* g, const float* src, const int32_t* idx, float* out, int64_t n, int64_t C);
+int ns_add(ns_gpu* g, float* y, const float* x, int64_t n);
+
 #ifdef __cplusplus
 }
 #endif
