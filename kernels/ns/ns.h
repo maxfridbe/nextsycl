@@ -74,6 +74,14 @@ int ns_scatter_add(ns_gpu* g, float* y, const float* src, const int32_t* idx, co
 int ns_gather(ns_gpu* g, const float* src, const int32_t* idx, float* out, int64_t n, int64_t C);
 int ns_add(ns_gpu* g, float* y, const float* x, int64_t n);
 
+/* ---- decode-width products from the stored blocks (mmvq.cpp) ---- */
+size_t ns_q8_1_bytes(int64_t n_in, int64_t ncols);
+int ns_mmvq_supported(int type);
+/* x [ncols, n_in] float32 -> Q8_1 (36 bytes per 32 values, column j at j * n_in / 32 blocks) */
+int ns_quantize_q8_1(ns_gpu* g, const float* x, void* q8_1, int64_t n_in, int64_t ncols);
+/* y [ncols, n_out] = W [n_out, n_in] . x for 1..8 columns; W in its ggml type */
+int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+
 #ifdef __cplusplus
 }
 #endif

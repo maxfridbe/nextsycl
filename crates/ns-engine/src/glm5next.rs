@@ -4,8 +4,8 @@
 //! this). Prompt only, from position 0; MLA attends to every earlier token (the indexer selects all of them up to
 //! ~2,048 tokens of context, docs/glm5next.md).
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ns_core::{DevBuf, Error, Gpu, Ops, Result};
@@ -16,13 +16,42 @@ use crate::Tap;
 
 /// float32 values expanded per matrix chunk (128 MiB)
 const SCRATCH: usize = 32 << 20;
+/// the decode kernels take up to this many rows (tokens) at once
+const MMVQ_COLS: usize = 8;
+/// widest matrix input (MLA's output projection)
+const MAX_COLS: usize = 16384;
+/// expert slots are allocated in chunks of this size (single device allocations stay small)
+const CHUNK: usize = 2 << 30;
 
-/// A matrix in its stored form on the GPU: `rows` x `cols` (a tensor's outer dimensions folded into rows).
+/// A matrix on the GPU: `rows` x `cols` (a tensor's outer dimensions folded into rows), in its stored quantized
+/// form, or - for the 16- and 32-bit ones - as float32.
 struct Mat {
     buf: DevBuf,
     ty: GType,
     rows: usize,
     cols: usize,
+    /// expanded at load (BF16 / F16 / F32 matrices: small, multiplied as they are)
+    f32: bool,
+}
+
+/// The experts of a layer in a slot: [gate | up | down], each matrix's stored bytes.
+struct ExpertParts {
+    gate: (usize, usize, GType),
+    up: (usize, usize, GType),
+    down: (usize, usize, GType),
+}
+
+/// Routed experts resident on the GPU: fixed-size slots, least recently used out. Filled from the file.
+struct ExpertCache {
+    chunks: Vec<DevBuf>,
+    slot_bytes: usize,
+    per_chunk: usize,
+    map: HashMap<(u64, u64), usize>,
+    owner: Vec<Option<(u64, u64)>>,
+    used: Vec<u64>,
+    tick: u64,
+    pub hits: u64,
+    pub misses: u64,
 }
 
 impl Mat {
@@ -50,10 +79,13 @@ pub struct Glm<'g> {
     mats: BTreeMap<(u64, Role), Mat>,
     vecs: BTreeMap<(u64, Role), DevBuf>,
     scratch: DevBuf,
-    /// one expert matrix's stored bytes
-    staging: DevBuf,
+    /// Q8_1 of up to MMVQ_COLS rows of MAX_COLS
+    q8: DevBuf,
+    experts: Mutex<ExpertCache>,
     pub load_seconds: f64,
     pub load_bytes: u64,
+    /// slots the expert cache holds
+    pub expert_slots: usize,
 }
 
 const VECTORS: [Role; 18] = [Role::OutputNorm, Role::AttnNorm, Role::FfnNorm, Role::HcAttnBase, Role::HcAttnScale, Role::HcFfnBase, Role::HcFfnScale, Role::KdaQConv,
@@ -65,8 +97,9 @@ fn e(x: impl std::fmt::Display) -> Error {
 }
 
 impl<'g> Glm<'g> {
-    /// Loads everything but the routed experts (and the MTP block) onto `gpu`.
-    pub fn load(file: &'g Gguf, gpu: &Arc<Gpu>, log: &mut dyn FnMut(String)) -> Result<Glm<'g>> {
+    /// Loads everything but the routed experts (and the MTP block) onto `gpu`; `expert_bytes` of it for routed
+    /// experts (None: what the card has free less 3 GiB).
+    pub fn load(file: &'g Gguf, gpu: &Arc<Gpu>, expert_bytes: Option<usize>, log: &mut dyn FnMut(String)) -> Result<Glm<'g>> {
         let t0 = Instant::now();
         let m = Model::open(file).map_err(e)?;
         let ops = Ops { gpu: gpu.clone() };
@@ -102,7 +135,13 @@ impl<'g> Glm<'g> {
                     vecs.insert((l, r), f);
                 } else {
                     let cols = *t.shape.last().unwrap_or(&1) as usize;
-                    mats.insert((l, r), Mat { buf: raw, ty: t.ty, rows: n / cols, cols });
+                    if matches!(t.ty, GType::F32 | GType::F16 | GType::BF16) {
+                        let f = DevBuf::f32(gpu, n)?;
+                        ops.dequant(t.ty.code(), &raw, 0, t.bytes as usize, n, &f)?;
+                        mats.insert((l, r), Mat { buf: f, ty: GType::F32, rows: n / cols, cols, f32: true });
+                    } else {
+                        mats.insert((l, r), Mat { buf: raw, ty: t.ty, rows: n / cols, cols, f32: false });
+                    }
                 }
             }
             if l % 5 == 4 {
@@ -110,12 +149,82 @@ impl<'g> Glm<'g> {
             }
         }
         gpu.sync()?;
-        let biggest = (m.g.n_dense..m.g.n_layer)
-            .flat_map(|l| [Role::ExpGate, Role::ExpUp, Role::ExpDown].map(|r| m.tensor(l, r).map_or(0, |t| t.bytes / m.g.n_expert)))
-            .max()
-            .unwrap_or(0) as usize;
-        let staging = DevBuf::new(gpu, biggest.max(1))?;
-        Ok(Glm { m, ops, mats, vecs, scratch, staging, load_seconds: t0.elapsed().as_secs_f64(), load_bytes: bytes })
+        let q8 = DevBuf::new(gpu, ops.q8_1_bytes(MAX_COLS, MMVQ_COLS))?;
+        // the expert cache: slots of the largest layer's [gate | up | down], in 2 GiB chunks
+        let slot_bytes = (m.g.n_dense..m.g.n_layer).map(|l| m.expert_bytes(l) as usize).max().unwrap_or(0).next_multiple_of(256);
+        let budget = match expert_bytes {
+            Some(b) => b,
+            None => gpu.memory()?.1.map_or(8usize << 30, |f| (f as usize).saturating_sub(3 << 30)),
+        };
+        let per_chunk = (CHUNK / slot_bytes.max(1)).max(1);
+        let total = budget / slot_bytes.max(1);
+        let mut chunks = Vec::new();
+        let mut have = 0;
+        while have < total {
+            let n = per_chunk.min(total - have);
+            chunks.push(DevBuf::new(gpu, n * slot_bytes)?);
+            have += n;
+        }
+        let experts = Mutex::new(ExpertCache {
+            chunks, slot_bytes, per_chunk, map: HashMap::new(), owner: vec![None; have], used: vec![0; have], tick: 0, hits: 0, misses: 0,
+        });
+        log(format!("expert cache: {have} slots of {:.1} MiB ({:.1} GiB)", slot_bytes as f64 / 1048576.0, (have * slot_bytes) as f64 / (1u64 << 30) as f64));
+        Ok(Glm { m, ops, mats, vecs, scratch, q8, experts, load_seconds: t0.elapsed().as_secs_f64(), load_bytes: bytes, expert_slots: have })
+    }
+
+    /// (hits, misses) of the expert cache so far
+    pub fn expert_stats(&self) -> (u64, u64) {
+        let c = self.experts.lock().unwrap();
+        (c.hits, c.misses)
+    }
+
+    fn parts(&self, l: u64) -> Result<ExpertParts> {
+        let mut off = 0;
+        let mut part = |r: Role| -> Result<(usize, usize, GType)> {
+            let t = self.m.tensor(l, r).ok_or_else(|| Error(format!("block {l}: {r:?} missing")))?;
+            let b = (t.bytes / self.m.g.n_expert) as usize;
+            let p = (off, b, t.ty);
+            off += b;
+            Ok(p)
+        };
+        Ok(ExpertParts { gate: part(Role::ExpGate)?, up: part(Role::ExpUp)?, down: part(Role::ExpDown)? })
+    }
+
+    /// The slot holding expert `ex` of layer `l` (read from the file on a miss): (chunk, byte offset).
+    fn expert_slot(&self, l: u64, ex: u64) -> Result<(usize, usize)> {
+        let mut c = self.experts.lock().unwrap();
+        if c.owner.is_empty() {
+            return Err(Error("the expert cache has no slots (no room on the GPU)".into()));
+        }
+        c.tick += 1;
+        let tick = c.tick;
+        let slot = match c.map.get(&(l, ex)) {
+            Some(&s) => {
+                c.hits += 1;
+                s
+            }
+            None => {
+                c.misses += 1;
+                // a free slot, else the least recently used
+                let s = (0..c.owner.len()).min_by_key(|&i| if c.owner[i].is_none() { 0 } else { c.used[i] + 1 }).unwrap();
+                if let Some(old) = c.owner[s].take() {
+                    c.map.remove(&old);
+                }
+                let p = self.parts(l)?;
+                let mut host = vec![0u8; p.down.0 + p.down.1];
+                for (r, (o, n, _)) in [(Role::ExpGate, p.gate), (Role::ExpUp, p.up), (Role::ExpDown, p.down)] {
+                    let t = self.m.tensor(l, r).ok_or("expert tensor")?;
+                    self.m.file.read_into(t, ex * n as u64, &mut host[o..o + n]).map_err(e)?;
+                }
+                let (ch, at) = (s / c.per_chunk, (s % c.per_chunk) * c.slot_bytes);
+                c.chunks[ch].write(at, &host)?;
+                c.owner[s] = Some((l, ex));
+                c.map.insert((l, ex), s);
+                s
+            }
+        };
+        c.used[slot] = tick;
+        Ok((slot / c.per_chunk, (slot % c.per_chunk) * c.slot_bytes))
     }
 
     fn mat(&self, l: u64, r: Role) -> Result<&Mat> {
@@ -125,9 +234,17 @@ impl<'g> Glm<'g> {
         self.vecs.get(&(l, r)).ok_or_else(|| Error(format!("block {l}: vector {r:?} not loaded")))
     }
 
-    /// y[t rows from yoff, ldy apart] (+)= x . W^T for a stored matrix, expanded in row chunks.
+    /// y[t rows from yoff, ldy apart] (+)= x . W^T. Float matrices multiply as they are; quantized ones from their
+    /// blocks for up to MMVQ_COLS contiguous rows (decode), else expanded in row chunks.
     #[allow(clippy::too_many_arguments)]
     fn matmul(&self, w: &Mat, t: usize, x: (&DevBuf, usize, usize), y: (&DevBuf, usize, usize), acc: bool) -> Result<()> {
+        if w.f32 {
+            return self.ops.gemm_at(t, w.rows, w.cols, x, (&w.buf, 0), y, acc);
+        }
+        if !acc && t <= MMVQ_COLS && x.2 == w.cols && y.2 == w.rows && w.cols <= MAX_COLS && self.ops.mmvq_supported(w.ty.code()) {
+            self.ops.quantize_q8_1((x.0, x.1), &self.q8, w.cols, t)?;
+            return self.ops.mmvq(w.ty.code(), (&w.buf, 0), w.buf.len, &self.q8, (y.0, y.1), w.cols, w.rows, t);
+        }
         let chunk = (SCRATCH / w.cols).max(1).min(w.rows);
         let rb = w.row_bytes();
         let mut r0 = 0;
@@ -148,18 +265,28 @@ impl<'g> Glm<'g> {
         Ok(y)
     }
 
-    /// One routed expert's matrix (`r` = ExpGate / ExpUp / ExpDown of layer `l`, expert `ex`) applied to x [n, cols].
+    /// One routed expert's matrix (`r` = ExpGate / ExpUp / ExpDown of layer `l`, expert `ex`) applied to x [n, cols],
+    /// from its slot in the expert cache.
     fn expert_mm(&self, l: u64, r: Role, ex: u64, x: &DevBuf, n: usize) -> Result<DevBuf> {
         let t = self.m.tensor(l, r).ok_or_else(|| Error(format!("block {l}: {r:?} missing")))?;
-        let per = (t.bytes / self.m.g.n_expert) as usize;
         let (rows, cols) = (t.shape[1] as usize, t.shape[2] as usize);
-        let mut host = vec![0u8; per];
-        self.m.file.read_into(t, ex * per as u64, &mut host).map_err(e)?;
-        self.staging.write(0, &host)?;
-        self.ops.gpu.sync()?;
-        self.ops.dequant(t.ty.code(), &self.staging, 0, per, rows * cols, &self.scratch)?;
+        let p = self.parts(l)?;
+        let (off, bytes, ty) = match r {
+            Role::ExpGate => p.gate,
+            Role::ExpUp => p.up,
+            _ => p.down,
+        };
+        let (ch, at) = self.expert_slot(l, ex)?;
+        let c = self.experts.lock().unwrap();
+        let buf = &c.chunks[ch];
         let y = DevBuf::f32(&self.ops.gpu, n * rows)?;
-        self.ops.gemm_at(n, rows, cols, (x, 0, cols), (&self.scratch, 0), (&y, 0, rows), false)?;
+        if n <= MMVQ_COLS && self.ops.mmvq_supported(ty.code()) {
+            self.ops.quantize_q8_1((x, 0), &self.q8, cols, n)?;
+            self.ops.mmvq(ty.code(), (buf, at + off), bytes, &self.q8, (&y, 0), cols, rows, n)?;
+        } else {
+            self.ops.dequant(ty.code(), buf, at + off, bytes, rows * cols, &self.scratch)?;
+            self.ops.gemm_at(n, rows, cols, (x, 0, cols), (&self.scratch, 0), (&y, 0, rows), false)?;
+        }
         Ok(y)
     }
 

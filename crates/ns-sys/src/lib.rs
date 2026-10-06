@@ -57,6 +57,11 @@ pub struct Api {
     pub scatter_add: unsafe extern "C" fn(Gpu, *mut f32, *const f32, *const i32, *const f32, i64, i64) -> c_int,
     pub gather: unsafe extern "C" fn(Gpu, *const f32, *const i32, *mut f32, i64, i64) -> c_int,
     pub add: unsafe extern "C" fn(Gpu, *mut f32, *const f32, i64) -> c_int,
+    // decode-width products (mmvq.cpp)
+    pub q8_1_bytes: unsafe extern "C" fn(i64, i64) -> usize,
+    pub mmvq_supported: unsafe extern "C" fn(c_int) -> c_int,
+    pub quantize_q8_1: unsafe extern "C" fn(Gpu, *const f32, *mut c_void, i64, i64) -> c_int,
+    pub mmvq: unsafe extern "C" fn(Gpu, c_int, *const c_void, *const c_void, *mut f32, i64, i64, i64) -> c_int,
 }
 
 // SAFETY: plain function pointers into a library that stays loaded for the process's life.
@@ -142,6 +147,10 @@ impl Api {
             scatter_add: sym!("ns_scatter_add"),
             gather: sym!("ns_gather"),
             add: sym!("ns_add"),
+            q8_1_bytes: sym!("ns_q8_1_bytes"),
+            mmvq_supported: sym!("ns_mmvq_supported"),
+            quantize_q8_1: sym!("ns_quantize_q8_1"),
+            mmvq: sym!("ns_mmvq"),
         })
     }
 

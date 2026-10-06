@@ -18,5 +18,8 @@ Include order as in Strata's CMake: `include-sycl/` before `include/` (the migra
 Licences: Strata is MIT (`LICENSE` here, copyright Niko1221 and the Strata contributors); `third_party/ggml` is
 MIT (its own `LICENSE`); the `dpct/` helpers are Intel's, Apache-2.0 WITH LLVM-exception (their headers).
 
-Changes to these files are made in `kernels/ns/` (new files or wrappers), so this directory stays a clean copy
-that can be refreshed from the branch.
+New code goes in `kernels/ns/`. The changes made here, each marked `nextsycl` in the file:
+
+- `src/kernels/iq_kernels.dp.cpp`: Q2_K and Q3_K dot products (from ggml-sycl's `vecdotq.hpp`, llama.cpp
+  de25343, in this file's (row, kbx) form) and their `Fmt` traits; Q2_K / Q3_K added to the gate-up, down and
+  matvec format lists, Q4_K / Q5_K to the down list; Q2_K in `is_iq` / `iq_row_bytes` - GLM-5.3's expert files.

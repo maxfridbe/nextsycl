@@ -19,7 +19,9 @@ const USAGE: &str = "usage:
   nextsycl check <model.gguf> <dump dir> [--gpu N]
                                 the forward pass on a reference dump's prompt, every step compared, the next token
   nextsycl tokenize <model.gguf> <text>
-  nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N]";
+  nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N]
+                    [--expert-gib G]   VRAM for routed experts (default: what is free less 3 GiB)
+  nextsycl kernels <model.gguf> [--gpu N]   each weight type's decode kernel against the exact path";
 
 fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
@@ -194,7 +196,7 @@ fn check(model: &Path, dump: &Path, gpu: usize) -> Result<(), String> {
     let g = ns_core::Gpu::open(gpu).map_err(e)?;
     println!("gpu      : {} ({})", g.name, g.index);
     let mut log = |l: String| println!("load     : {l}");
-    let glm = ns_engine::glm5next::Glm::load(&f, &g, &mut log).map_err(e)?;
+    let glm = ns_engine::glm5next::Glm::load(&f, &g, None, &mut log).map_err(e)?;
     println!("load     : {:.2} GiB in {:.1} s", gib(glm.load_bytes), glm.load_seconds);
     println!("prompt   : {} tokens {:?}", tokens.len(), tokens);
     println!("{:<26} {:>10} {:>10} {:>10}", "tensor", "cosine", "rel err", "max diff");
@@ -312,8 +314,9 @@ fn generate(args: &[String]) -> Result<(), String> {
     let text = ns_tok::glm_chat(&[ns_tok::Message { role: "user", content: &prompt, reasoning: None }], effort);
     let ids = tok.encode(&text);
     let g = ns_core::Gpu::open(gpu).map_err(e)?;
-    let mut log = |_: String| {};
-    let glm = ns_engine::glm5next::Glm::load(&f, &g, &mut log).map_err(e)?;
+    let expert_gib: Option<f64> = opt("--expert-gib").and_then(|v| v.parse().ok());
+    let mut log = |l: String| eprintln!("[{l}]");
+    let glm = ns_engine::glm5next::Glm::load(&f, &g, expert_gib.map(|x| (x * (1u64 << 30) as f64) as usize), &mut log).map_err(e)?;
     eprintln!("[{} on {}, {} prompt tokens, loaded in {:.1} s]", f.meta("general.name").and_then(|v| v.as_str()).unwrap_or("?"), g.name, ids.len(), glm.load_seconds);
     let mut sess = glm.session(ids.len() + max + 1).map_err(e)?;
     let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
@@ -345,8 +348,76 @@ fn generate(args: &[String]) -> Result<(), String> {
     }
     println!("{}", String::from_utf8_lossy(&pending));
     let dt = t1.elapsed().as_secs_f64();
-    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s)]", ids.len(), ids.len() as f64 / prefill,
-              n as f64 / dt.max(1e-9));
+    let (hits, misses) = glm.expert_stats();
+    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); experts: {hits} hits, {misses} misses ({:.0}% hit)]",
+              ids.len(), ids.len() as f64 / prefill, n as f64 / dt.max(1e-9), 100.0 * hits as f64 / (hits + misses).max(1) as f64);
+    Ok(())
+}
+
+/// `nextsycl kernels <model.gguf> [--gpu N]`: each stored weight type of the file through the decode kernels against
+/// the exact path (expand to float32, multiply), on a real matrix of that type; and the decode kernel's rate.
+fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
+    use ns_core::{DevBuf, Ops};
+    use ns_model::glm5next::Role;
+    let e = |x: ns_core::Error| x.0;
+    let f = Gguf::open(model).map_err(|e| e.0)?;
+    let m = Model::open(&f).map_err(|e| e.0)?;
+    let g = ns_core::Gpu::open(gpu).map_err(e)?;
+    let o = Ops { gpu: g.clone() };
+    println!("gpu: {}", g.name);
+    // one matrix per (type, role kind): routed experts' expert 0, else the whole matrix
+    let mut picks: Vec<(String, ns_gguf::GType, usize, usize, Vec<u8>)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for l in 0..m.g.n_layer {
+        for r in m.roles(l) {
+            let Some(t) = m.tensor(l, r) else { continue };
+            if t.shape.len() < 2 || t.ty == ns_gguf::GType::F32 || !seen.insert((t.ty, matches!(r, Role::ExpGate | Role::ExpUp | Role::ExpDown))) {
+                continue;
+            }
+            let (rows, cols) = (t.shape[t.shape.len() - 2] as usize, t.shape[t.shape.len() - 1] as usize);
+            let bytes = t.ty.bytes((rows * cols) as u64).unwrap_or(0) as usize;
+            let mut b = vec![0u8; bytes];
+            f.read_into(t, 0, &mut b).map_err(|e| e.0)?;
+            picks.push((t.name.clone(), t.ty, rows, cols, b));
+        }
+    }
+    let mut rng = Rng(12345);
+    println!("{:<34} {:<8} {:>12} {:>10} {:>10} {:>11}", "matrix", "type", "rows x cols", "1 col err", "4 col err", "1 col rate");
+    for (name, ty, rows, cols, bytes) in picks {
+        let w = DevBuf::new(&g, bytes.len()).map_err(e)?;
+        w.write(0, &bytes).map_err(e)?;
+        let wf = DevBuf::f32(&g, rows * cols).map_err(e)?;
+        o.dequant(ty.code(), &w, 0, bytes.len(), rows * cols, &wf).map_err(e)?;
+        if !o.mmvq_supported(ty.code()) {
+            println!("{name:<34} {:<8} {:>12} no decode kernel", ty.name(), format!("{rows}x{cols}"));
+            continue;
+        }
+        let mut errs = Vec::new();
+        let mut rate = 0.0;
+        for nc in [1usize, 4] {
+            let xs: Vec<f32> = (0..nc * cols).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
+            let x = DevBuf::from_f32(&g, &xs).map_err(e)?;
+            let yr = DevBuf::f32(&g, nc * rows).map_err(e)?;
+            o.gemm(nc, rows, cols, &x, &wf, &yr, false).map_err(e)?;
+            let q = DevBuf::new(&g, o.q8_1_bytes(cols, nc)).map_err(e)?;
+            o.quantize_q8_1((&x, 0), &q, cols, nc).map_err(e)?;
+            let y = DevBuf::f32(&g, nc * rows).map_err(e)?;
+            o.mmvq(ty.code(), (&w, 0), bytes.len(), &q, (&y, 0), cols, rows, nc).map_err(e)?;
+            let (_, rel, _) = compare(&y.to_f32().map_err(e)?, &yr.to_f32().map_err(e)?);
+            errs.push(rel);
+            if nc == 1 {
+                g.sync().map_err(e)?;
+                let n = 50;
+                let t0 = std::time::Instant::now();
+                for _ in 0..n {
+                    o.mmvq(ty.code(), (&w, 0), bytes.len(), &q, (&y, 0), cols, rows, 1).map_err(e)?;
+                }
+                g.sync().map_err(e)?;
+                rate = bytes.len() as f64 * n as f64 / t0.elapsed().as_secs_f64() / 1e9;
+            }
+        }
+        println!("{name:<34} {:<8} {:>12} {:>10.2e} {:>10.2e} {:>8.0} GB/s", ty.name(), format!("{rows}x{cols}"), errs[0], errs[1], rate);
+    }
     Ok(())
 }
 
@@ -357,6 +428,10 @@ fn main() -> ExitCode {
         Some("gpus") => gpus(),
         Some("tokenize") if args.len() == 3 => tokenize(Path::new(&args[1]), &args[2]),
         Some("generate") => generate(&args),
+        Some("kernels") if args.len() >= 2 => {
+            let gpu = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0);
+            kernels(Path::new(&args[1]), gpu)
+        }
         Some("check") if args.len() >= 3 => {
             let gpu = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0);
             check(Path::new(&args[1]), Path::new(&args[2]), gpu)

@@ -437,6 +437,38 @@ impl Ops {
         let rc = unsafe { (self.a().gather)(self.raw(), src.fp(), idx.ptr.cast(), out.fp(), n as i64, c as i64) };
         self.ok(rc, "gather")
     }
+    /// Bytes of Q8_1 for `ncols` columns of `n_in`.
+    pub fn q8_1_bytes(&self, n_in: usize, ncols: usize) -> usize {
+        // SAFETY: arithmetic only.
+        unsafe { (self.a().q8_1_bytes)(n_in as i64, ncols as i64) }
+    }
+    pub fn mmvq_supported(&self, ty: u32) -> bool {
+        // SAFETY: a capability query.
+        unsafe { (self.a().mmvq_supported)(ty as i32) != 0 }
+    }
+    /// x [ncols, n_in] (floats from `x.1`) -> Q8_1 into `q`.
+    pub fn quantize_q8_1(&self, x: (&DevBuf, usize), q: &DevBuf, n_in: usize, ncols: usize) -> Result<()> {
+        need!(x.0, x.1 + n_in * ncols, "quantize x");
+        if q.len < self.q8_1_bytes(n_in, ncols) {
+            return Err(Error(format!("quantize: {} bytes for {} of Q8_1", q.len, self.q8_1_bytes(n_in, ncols))));
+        }
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().quantize_q8_1)(self.raw(), x.0.fp().add(x.1), q.ptr, n_in as i64, ncols as i64) };
+        self.ok(rc, "quantize_q8_1")
+    }
+    /// y [ncols, n_out] (floats from `y.1`) = W . x: W the stored blocks at bytes `w.1..w.1 + w_bytes` of `w.0`.
+    pub fn mmvq(&self, ty: u32, w: (&DevBuf, usize), w_bytes: usize, q: &DevBuf, y: (&DevBuf, usize), n_in: usize, n_out: usize, ncols: usize) -> Result<()> {
+        w.0.bounds(w.1, w_bytes)?;
+        if q.len < self.q8_1_bytes(n_in, ncols) {
+            return Err(Error("mmvq: the Q8_1 input is short".into()));
+        }
+        need!(y.0, y.1 + n_out * ncols, "mmvq y");
+        // SAFETY: sizes checked (w_bytes is the caller's count of the matrix's stored bytes).
+        let rc = unsafe {
+            (self.a().mmvq)(self.raw(), ty as i32, w.0.ptr.cast::<u8>().add(w.1).cast(), q.ptr, y.0.fp().add(y.1), n_in as i64, n_out as i64, ncols as i64)
+        };
+        self.ok(rc, "mmvq")
+    }
     pub fn add(&self, y: &DevBuf, x: &DevBuf, n: usize) -> Result<()> {
         need!(y, n, "add y");
         need!(x, n, "add x");

@@ -620,6 +620,61 @@ __dpct_inline__ float vec_dot_q8_0_q8_1(const void *__restrict__ vbq,
     return d8_0 * d8_1 * ((float) sumi);
 }
 
+// nextsycl: Q2_K and Q3_K, from ggml-sycl's vecdotq.hpp (llama.cpp de25343) in this file's (row, kbx) form, for
+// GLM-5.3's expert files (their down projections are Q2_K / Q3_K)
+__dpct_inline__ float vec_dot_q2_K_q8_1(const void *__restrict__ vbq, const block_q8_1 *__restrict__ bq8_1,
+                                        const int &kbx, const int &iqs) {
+    const block_q2_K* b = (const block_q2_K*) vbq + kbx;
+    const int bq8_offset = QR2_K * (iqs / QI8_1);
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+    const uint8_t* scales = b->scales + scale_offset;
+    const int v = get_int_b4(b->qs, iqs);
+    float sumf_d = 0.0f, sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        const int u = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        const float d8 = bq8_1[bq8_offset + i].ds[0];
+        const int sc = scales[2 * i];
+        const int vi = (v >> (2 * i)) & 0x03030303;
+        sumf_d += d8 * (ggml_cuda_dp4a(vi, u, 0) * (sc & 0xF));
+        int m = sc >> 4;
+        m |= m << 8;
+        m |= m << 16;
+        sumf_m += d8 * ggml_cuda_dp4a(m, u, 0);
+    }
+    const sycl::float2 dm2f = b->dm.convert<float, sycl::rounding_mode::automatic>();
+    return dm2f.x() * sumf_d - dm2f.y() * sumf_m;
+}
+__dpct_inline__ float vec_dot_q3_K_q8_1(const void *__restrict__ vbq, const block_q8_1 *__restrict__ bq8_1,
+                                        const int &kbx, const int &iqs) {
+    const block_q3_K* b = (const block_q3_K*) vbq + kbx;
+    const int bq8_offset = QR3_K * (iqs / (QI3_K / 2));
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+    const float d3 = (float) b->d;
+    const int vl = get_int_b2(b->qs, iqs);
+    // ~ so that a 0/1 high bit means 4/0 subtracted
+    const int vh = ~get_int_b2(b->hmask, iqs % (QI3_K / 2)) >> bq8_offset;
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        const int u = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        const float d8 = bq8_1[bq8_offset + i].ds[0];
+        const int isc = scale_offset + 2 * i;
+        const int isc_low = isc % (QK_K / 32);
+        const int sc_shift_low = 4 * (isc / (QK_K / 32));
+        const int sc_low = (b->scales[isc_low] >> sc_shift_low) & 0xF;
+        const int isc_high = isc % (QK_K / 64);
+        const int sc_shift_high = 2 * (isc / (QK_K / 64));
+        const int sc_high = ((b->scales[(QK_K / 32) + isc_high] >> sc_shift_high) & 3) << 4;
+        const int sc = (sc_low | sc_high) - 32;
+        const int vil = (vl >> (2 * i)) & 0x03030303;
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+        const int vi = dpct::vectorized_binary<sycl::char4>(vil, vih, dpct::sub_sat());
+        sumf += d8 * (ggml_cuda_dp4a(vi, u, 0) * sc);
+    }
+    return d3 * sumf;
+}
+
 // ---------------------------------------------------------------- the formats
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
 template<int TY> 
@@ -652,12 +707,17 @@ template<> struct Fmt<6> { static constexpr int qk = 32, ipb = QI5_0 / VDR_Q5_0,
     static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0, step = VDR_Q8_0;
     static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<10> { static constexpr int qk = 256, ipb = QI2_K, step = 1;   // nextsycl
+    static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_K_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<11> { static constexpr int qk = 256, ipb = QI3_K, step = 1;   // nextsycl
+    static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q3_K_q8_1(v, y, kbx, iqs); } };
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8)
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8)
+// nextsycl: + Q2_K (10) and Q3_K (11) everywhere, Q4_K / Q5_K for down projections too (GLM-5.3's files)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8) X(10) X(11)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8) X(10) X(11) X(12) X(13)
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8) X(10) X(11)
 
 __dpct_inline__ float warp_sum(float v) {
 #pragma unroll
@@ -1986,7 +2046,7 @@ __dpct_inline__ void dequant_gu_kernel(
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 12 || t == 13 || t == 7 || t == 6 || t == 8;
+           t == 12 || t == 13 || t == 7 || t == 6 || t == 8 || t == 10;   // nextsycl: + Q2_K
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
@@ -2303,6 +2363,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 29: return (size_t) (n / 256) * sizeof(block_iq1_m);
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
+        case 10: return (size_t) (n / 256) * sizeof(block_q2_K);   // nextsycl
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
