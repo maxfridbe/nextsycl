@@ -1,0 +1,3 @@
+target/
+*.gguf
+__pycache__/

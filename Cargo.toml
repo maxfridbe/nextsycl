@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/ns-gguf", "crates/ns-model", "crates/nextsycl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+ns-gguf = { path = "crates/ns-gguf" }
+ns-model = { path = "crates/ns-model" }
+serde_json = "1"
+
+[profile.release]
+debug = 1
