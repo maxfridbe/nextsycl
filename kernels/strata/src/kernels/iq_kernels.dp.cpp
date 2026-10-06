@@ -1803,17 +1803,25 @@ __dpct_inline__ void store_run(dst_t* y, const float* v) {
 template <typename dst_t>
 inline void dq_iq2_xxs(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     const block_iq2_xxs* x = (const block_iq2_xxs*) vx;
-    const int64_t il = tid / 8, ib = tid % 8;
+    // nextsycl: lane tid writes values 8 tid .. 8 tid + 7, so a sub-group's stores are contiguous (llama.cpp's
+    // il = tid / 8, ib = tid % 8 put neighbouring lanes 64 bytes apart: 4x slower than Q2_K's expansion)
+    const int64_t il = tid % 4, ib = tid / 4;
     dst_t* y = yy + 32 * ib + 8 * il;
     const uint16_t* q2 = x[ibs].qs + 4 * ib;
     const uint8_t* aux8 = (const uint8_t*) q2;
-    const uint8_t* grid = (const uint8_t*) (iq2xxs_grid + aux8[il]);
+    // nextsycl: the grid entry in one 8-byte load, the signs computed (ksigns_iq2xs[k] = k | parity(k) << 7,
+    // kmask_iq2xs[j] = 1 << j) - the table reads, a byte at a time from global memory, were 5x the cost of Q2_K's
+    const sycl::uint2 g = ((const sycl::uint2*) iq2xxs_grid)[aux8[il]];
     const uint32_t aux32 = q2[2] | (q2[3] << 16);
     const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.25f;
-    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+    const uint32_t s7 = (aux32 >> 7 * il) & 127;
+    const uint32_t signs = s7 | ((sycl::popcount(s7) & 1u) << 7);
     float v[8];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) v[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t b = ((j < 4 ? g.x() : g.y()) >> (8 * (j % 4))) & 0xff;
+        v[j] = d * (float) b * ((signs >> j) & 1 ? -1.f : 1.f);
+    }
     store_run<dst_t, 8>(y, v);
 }
 template <typename dst_t>
@@ -2530,8 +2538,6 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp16});
@@ -2544,7 +2550,7 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(n / 256)) *
                                           sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    [=](sycl::nd_item<3> item_ct1) {
                         dequant_flat_kernel<sycl::half>(
                             t, src, (sycl::half *)dst);
                     });

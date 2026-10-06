@@ -51,7 +51,7 @@ in this process (inside the image: the kernels need the oneAPI runtime):
   nextsycl serve <model.gguf> [--gpu 0,1 | all] [--host H] [--port N] [--name ID] [--ctx N] [--effort E] [--socket PATH]
                  [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)] [--cors ORIGINS]
                                 the server in the foreground (what start runs)
-  nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
+  nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
                     [--expert-gib G] [--mirror-gib G] [--no-mtp]
   nextsycl info <model.gguf>    the architecture and geometry, every tensor checked by role, bytes by group
   nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
@@ -379,7 +379,10 @@ fn generate(args: &[String]) -> Result<(), String> {
     let e = |x: ns_core::Error| x.0;
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
     let model = args.get(1).ok_or("generate <model.gguf> --prompt ...")?;
-    let prompt = opt("--prompt").ok_or("--prompt TEXT")?;
+    let prompt = match opt("--prompt-file") {
+        Some(f) => std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?,
+        None => opt("--prompt").ok_or("--prompt TEXT or --prompt-file PATH")?,
+    };
     let effort = ns_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|high|max")?;
     let max: usize = opt("--max").and_then(|v| v.parse().ok()).unwrap_or(256);
     let temp: f32 = opt("--temp").and_then(|v| v.parse().ok()).unwrap_or(0.0);
@@ -515,7 +518,10 @@ fn spec_check(args: &[String]) -> Result<(), String> {
     let e = |x: ns_core::Error| x.0;
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
     let model = args.get(1).ok_or("spec-check <model.gguf> --prompt ...")?;
-    let prompt = opt("--prompt").ok_or("--prompt TEXT")?;
+    let prompt = match opt("--prompt-file") {
+        Some(f) => std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?,
+        None => opt("--prompt").ok_or("--prompt TEXT or --prompt-file PATH")?,
+    };
     let n: usize = opt("--n").and_then(|v| v.parse().ok()).unwrap_or(32);
     let gpus: Vec<usize> = opt("--gpu").unwrap_or_else(|| "0,1".into()).split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}"))).collect::<Result<_, _>>()?;
     let f = Gguf::open(Path::new(model)).map_err(|e| e.0)?;
