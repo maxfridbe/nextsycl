@@ -72,6 +72,26 @@ by default (`--no-mtp` turns it off).
 - [ ] Several requests at once (benchy: 1, 2, 4 clients all ~17 tok/s together - one request at a time today):
       batch decode passes across sessions.
 
+## LogProbChain (an API option)
+
+A request option `logprob_chain` (beside `logprobs` / `top_logprobs`): logprobs corrected for what the model is
+only echoing from earlier in its own turn. The thinking tokens skew the answer's logprobs: a token the thinking
+already wrote comes out near-certain because the model copies it, not because it is sure of it.
+
+- [ ] For each output token X, one attention vector over the context: combine the heads of the attention layers -
+      experiment: all MLA layers averaged, the most informative layers only (by entropy or by how peaked they are),
+      the last layers, weighted by head; MLA's absorbed scores (q~ . c) give per-position weights cheaply; KDA layers
+      have no attention matrix (only a state) - leave them out or approximate
+- [ ] For X's candidates (its top logprobs), any candidate that equals a token at a position of this turn (thinking
+      or answer generated so far) that X attends to: skew its logprob in proportion to THAT earlier token's own
+      logprob times the attention weight on it (an echo of a confident earlier token is discounted; of an uncertain
+      one, kept low) - the exact formula is part of the experiment
+- [ ] Keep each generated token's own logprob (already computed for `logprobs`) so the chain can look it up
+- [ ] Return the chained logprobs beside the raw ones (e.g. `chained_logprob` on each entry), and say which earlier
+      positions dominated
+- [ ] Validate: questions with known answers, with and without thinking; does the chained confidence of the final
+      answer track correctness better than the raw one (calibration)
+
 ## Speed, later
 
 - [x] Prompt chunks read host-slot experts in place over PCIe (no swaps); decode still swaps (faster there: 12.5 vs
