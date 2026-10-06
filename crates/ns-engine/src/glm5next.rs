@@ -1163,7 +1163,9 @@ impl<'g> Glm<'g> {
                 if let LayerState::Kda { s: kstate, conv: cstate, snap } = &sess.layers[l as usize] {
                     let snap = snap.as_ref().filter(|_| snapping);
                     // every product of the layer's input at once (one quantization of it)
+                    let k0 = self.mark(p);
                     let mut pj = p.mm_many(l, &[Role::KdaQ, Role::KdaK, Role::KdaV, Role::KdaFA, Role::KdaGA, Role::KdaBeta], normed, t)?.into_iter();
+                    let k1 = self.lap(p, "KDA: input projections", k0);
                     let (pq, pk, pv, fa, ga, beta) = (pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap());
                     let conv = |pr: &DevBuf, w: Role, state: &DevBuf, sn: Option<&DevBuf>| -> Result<DevBuf> {
                         let out = p.arena.f32(t * kw)?;
@@ -1184,13 +1186,16 @@ impl<'g> Glm<'g> {
                     o.sigmoid(&beta, t * kh)?;
                     tap(&format!("kda_beta-{l}"), &beta)?;
                     let scan = p.arena.f32(t * kw)?;
+                    let k2 = self.lap(p, "KDA: conv, norms, gates", k1);
                     o.kda_scan(&q, &k, &v, &gate, &beta, kstate, &scan, t, kh, kd, snap.map(|s| &s.0))?;
+                    let k3 = self.lap(p, "KDA: scan", k2);
                     tap(&format!("kda_scan_out-{l}"), &scan)?;
                     let g2 = p.mm(l, Role::KdaGB, &ga, t)?;
                     tap(&format!("kda_g2-{l}"), &g2)?;
                     let y = p.arena.f32(t * kw)?;
                     o.kda_out(&scan, &g2, p.vec(l, Role::KdaONorm)?, &y, t, kh, kd, eps)?;
                     let out = p.mm(l, Role::KdaOut, &y, t)?;
+                    self.lap(p, "KDA: output gate + projection", k3);
                     tap(&format!("kda_out-{l}"), &out)?;
                     Ok(out)
                 } else {
