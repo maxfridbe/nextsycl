@@ -268,6 +268,23 @@ int ns_hc_mix(ns_gpu* g, const float* x, const float* fn, float* m, float* part,
     NS_TRY
     constexpr int WG = 256, M = 24, NB = 32;
     auto& q = g->q;
+    if (T > 8) {
+        // a prompt chunk: the 24 products as one oneMKL GEMM (the kernel below reads all of fn again for every
+        // token: 6 GB a call at 4,096), then each row scaled by its rms. Decode widths keep the kernel below, whose
+        // rows do not depend on T (a verify pass's rows equal one-token passes).
+        using oneapi::mkl::transpose;
+        oneapi::mkl::blas::row_major::gemm(q, transpose::nontrans, transpose::trans, T, M, n, 1.0f, x, n, fn, n, 0.0f, m, M);
+        q.parallel_for(sycl::nd_range<1>(T * WG, WG), [=](sycl::nd_item<1> it) {
+            const int64_t t = it.get_group(0);
+            const float* xr = x + t * n;
+            float ss = 0.f;
+            for (int64_t c = it.get_local_id(0); c < n; c += WG) ss += xr[c] * xr[c];
+            ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+            const int lid = it.get_local_id(0);
+            if (lid < M) m[t * M + lid] /= sycl::sqrt(ss / (float) n + eps);
+        });
+        return 0;
+    }
     const int64_t chunk = (n + NB - 1) / NB;
     q.parallel_for(sycl::nd_range<1>(T * NB * WG, WG), [=](sycl::nd_item<1> it) {
         const int64_t grp = it.get_group(0), t = grp / NB, b = grp % NB;
