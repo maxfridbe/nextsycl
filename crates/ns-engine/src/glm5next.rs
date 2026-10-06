@@ -30,8 +30,23 @@ const MMVQ_COLS: usize = 8;
 const MAX_COLS: usize = 16384;
 /// expert slots and the mirror are allocated in chunks of this size (single allocations stay small)
 const CHUNK: usize = 2 << 30;
-/// prompt tokens per forward pass (a layer's temporaries are ~1.5 MB a token; the arenas are 1 GiB)
-pub const PREFILL_CHUNK: usize = 512;
+/// Prompt tokens per forward pass (NS_PREFILL_CHUNK, default 4096, 64..8192): bigger chunks give each expert's
+/// weights more tokens (Strata's lesson: experts are streamed once a chunk), and need a bigger arena.
+pub fn prefill_chunk() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096).clamp(64, 8192))
+}
+
+/// Bytes of each GPU's arena (NS_ARENA_MIB; default: 1 GiB, or ~0.55 MiB a token of the prompt chunk past 1,900 -
+/// the temporaries measured 0.56 GiB at 512 and 2.0 GiB at 4,096 with the fp16 expert path)
+pub fn arena_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("NS_ARENA_MIB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(m) => m << 20,
+        // the fp16 path's peak: ~0.5 MB a token at 4,096 (measured 2.0 GiB)
+        None => (1usize << 30).max(prefill_chunk() * (560 << 10)),
+    })
+}
 /// rows of a verify pass (the token and its draft); the KDA states keep a snapshot after each row but the last
 pub const MAX_VERIFY: usize = 2;
 /// the indexer's pool scores per GEMM (floats): pools are scored in chunks that fit (64 MiB)
@@ -90,7 +105,7 @@ struct Store {
     hits: u64,
     misses: u64,
     from_host: u64,
-    /// host-slot experts the GPU read in place (no swap)
+    /// host-slot experts a prompt pass reads from pinned memory (in place, or copied to a staging slot first)
     direct: u64,
 }
 
@@ -335,7 +350,8 @@ impl Part {
             Some(b) => b,
             // what is free less 3 GiB (the arena, the forward pass, at least 1.5 GiB left over) and the sessions'
             // attention caches, sized now so a long context never pushes VRAM into the driver's spill path
-            None => gpu.memory()?.1.map_or(8usize << 30, |f| (f as usize).saturating_sub((3 << 30) + kv_reserve)),
+            // (the arena past its 1 GiB comes out of the experts too)
+            None => gpu.memory()?.1.map_or(8usize << 30, |f| (f as usize).saturating_sub((2 << 30) + arena_bytes().max(1 << 30) + kv_reserve)),
         };
         let per_chunk = (CHUNK / slot_bytes).max(1);
         let nv = (budget / slot_bytes).min(n_exp);
@@ -352,6 +368,7 @@ impl Part {
             Ok(v)
         };
         let vram = alloc_v(nv)?;
+
         let mut host = Vec::new();
         {
             let mut have = 0;
@@ -422,7 +439,7 @@ impl Part {
             vowner[i] = Some(*k);
         }
         let store = Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree, tick: 0, hits: 0, misses: 0, from_host: 0, direct: 0 };
-        let arena = Arena::new(gpu, 1 << 30)?;
+        let arena = Arena::new(gpu, arena_bytes())?;
         Ok(Part { ops, arena, layers, mats, vecs, scratch, q8, experts: Mutex::new(store), eh, expert_slots: nv, host_slots: nr, weight_bytes: bytes })
     }
 
@@ -476,7 +493,7 @@ impl Part {
     /// VRAM expert (it goes down to a free host slot, the wanted one comes up from its host slot or the file).
     /// Without, an expert in a pinned host slot is read there in place by the GPU over PCIe (once per pass - what a
     /// prompt chunk wants), and only the ones on the file alone come into VRAM.
-    fn ensure(&self, m: &Model, l: u64, need: &[u64], promote: bool) -> Result<Vec<DevBuf>> {
+    fn ensure(&self, m: &Model, l: u64, need: &[u64], promote: bool) -> Result<Vec<(DevBuf, bool)>> {
         let mut c = self.experts.lock().unwrap();
         let c = &mut *c;
         if c.vowner.len() < need.len() {
@@ -491,7 +508,7 @@ impl Part {
                     c.hits += 1;
                     c.vused[s] = tick;
                 }
-                Some(Loc::R(_)) if !promote => c.direct += 1,
+                Some(Loc::R(_)) if !promote => {}
                 _ => missing.push(ex),
             }
         }
@@ -540,11 +557,12 @@ impl Part {
         need.iter().map(|ex| match c.loc[&(l, *ex)] {
             Loc::V(s) => {
                 let (ch, o) = c.vat(s);
-                c.vram[ch].view(o, sb)
+                Ok((c.vram[ch].view(o, sb)?, false))
             }
             Loc::R(r) => {
-                let (ch, o) = c.rat(r);
-                c.host[ch].device_view(o, sb)
+                c.direct += 1;
+                let (rch, ro) = c.rat(r);
+                Ok((c.host[rch].device_view(ro, sb)?, true))
             }
         }).collect()
     }
@@ -642,11 +660,18 @@ impl<'g> Glm<'g> {
         }).collect()
     }
 
+    /// Per GPU: the arena's most used bytes between resets, and the requests that did not fit it (own allocations)
+    pub fn arena_peaks(&self) -> Vec<(usize, usize)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.parts.iter().map(|p| (p.arena.peak.load(Relaxed), p.arena.spills.load(Relaxed))).collect()
+    }
+
     pub fn expert_slots(&self) -> usize {
         self.parts.iter().map(|p| p.expert_slots).sum()
     }
 
-    /// (VRAM hits, misses (swaps), swaps served from pinned host memory, host-slot experts read in place) so far
+    /// (VRAM hits, misses (swaps), swaps served from pinned host memory, host-slot experts a prompt pass read from
+    /// pinned memory) so far
     pub fn expert_stats(&self) -> (u64, u64, u64, u64) {
         self.parts.iter().fold((0, 0, 0, 0), |a, p| {
             let c = p.experts.lock().unwrap();
@@ -727,7 +752,7 @@ impl<'g> Glm<'g> {
         let mtp = match self.mtp {
             Some(_) => {
                 let gpu = &self.parts.last().unwrap().ops.gpu;
-                Some(MtpState { cache: DevBuf::f32(gpu, max_ctx * g.kv_lora as usize)?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)?, hid: DevBuf::f32(gpu, PREFILL_CHUNK * g.n_embd as usize)?, rows: 0,
+                Some(MtpState { cache: DevBuf::f32(gpu, max_ctx * g.kv_lora as usize)?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)?, hid: DevBuf::f32(gpu, prefill_chunk() * g.n_embd as usize)?, rows: 0,
                                 slot0: 0, next: Vec::new() })
             }
             None => None,
@@ -735,11 +760,11 @@ impl<'g> Glm<'g> {
         Ok(Session { pos: 0, max_ctx, layers, snapped: None, mtp })
     }
 
-    /// The next `tokens` of a conversation in chunks of at most `PREFILL_CHUNK` (the arenas bound a chunk): the
+    /// The next `tokens` of a conversation in chunks of at most `prefill_chunk()` (the arenas bound a chunk): the
     /// logits of the last token.
     pub fn feed(&self, sess: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
         let mut logits = Vec::new();
-        for c in tokens.chunks(PREFILL_CHUNK) {
+        for c in tokens.chunks(prefill_chunk()) {
             logits = self.forward(sess, c, &mut *tap)?;
         }
         Ok(logits)
@@ -1057,7 +1082,7 @@ impl<'g> Glm<'g> {
     pub fn forward_rows(&self, sess: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
         let g = &self.m.g;
         let t = tokens.len();
-        if t == 0 || t > PREFILL_CHUNK || n_out == 0 || n_out > t.min(MMVQ_COLS) {
+        if t == 0 || t > prefill_chunk() || n_out == 0 || n_out > t.min(MMVQ_COLS) {
             return Err(Error(format!("forward: {t} tokens, {n_out} outputs")));
         }
         if sess.mtp.as_ref().is_some_and(|m| m.rows > 0) {
@@ -1404,12 +1429,76 @@ impl<'g> Glm<'g> {
             let wb = p.arena.f32(wts.len())?;
             wb.write(0, &wts.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
             // the grouped kernels (two launches for the layer), when they take this layer's types
-            // NS_PROMPT_DEQUANT=1: prompt chunks take the expanded-GEMM path instead (a measurement switch)
-            let dequant = t > MMVQ_COLS && (std::env::var("NS_PROMPT_DEQUANT").is_ok_and(|v| v == "1") || std::env::var("NS_PROMPT_F16").is_ok_and(|v| v == "1"));
+            // Big prompt chunks: each expert expanded to fp16 once a chunk and its tokens multiplied by oneMKL's half
+            // GEMM (the XMX units) - Strata's prompt path. The expansion is the cost and the chunk amortizes it, so
+            // from NS_PROMPT_F16_MIN tokens (default 1024; 0 = never) - below, the grouped kernels win (measured
+            // 2.0x slower at 512). Memory stays one expert's worth however big the chunk: its tokens gathered to
+            // fp16, its outputs added into y.
+            static F16_MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let f16_min = *F16_MIN.get_or_init(|| std::env::var("NS_PROMPT_F16_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1024));
+            if f16_min > 0 && t >= f16_min && t > MMVQ_COLS {
+                let mut gtok: Vec<i32> = Vec::with_capacity(total);
+                let mut gw: Vec<f32> = Vec::with_capacity(total);
+                for list in by.values() {
+                    for (ti, w) in list {
+                        gtok.push(*ti);
+                        gw.push(*w);
+                    }
+                }
+                let tb = p.arena.bytes(total * 4)?;
+                tb.write(0, &gtok.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                let wtb = p.arena.f32(total)?;
+                wtb.write(0, &gw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                let nmax = by.values().map(|l| l.len()).max().unwrap_or(1);
+                let xh = p.arena.bytes(nmax * d * 2)?;
+                let w16 = p.arena.bytes(2 * f * d * 2)?; // gate | up of one expert; down reuses the first half
+                let wu = w16.view(f * d * 2, f * d * 2)?;
+                let g32 = p.arena.f32(nmax * f)?;
+                let u32b = p.arena.f32(nmax * f)?;
+                let hh = p.arena.bytes(nmax * f * 2)?;
+                let dn = p.arena.f32(nmax * d)?;
+                // an expert in pinned host memory is copied into a VRAM staging slot first (the copy engine moves it
+                // at full PCIe speed; the expansion kernel reading it in place moved a few bytes a transaction)
+                let sb = parts.down.0 + parts.down.1;
+                let ring = [p.arena.bytes(sb)?, p.arena.bytes(sb)?];
+                let mut row = 0;
+                for (k, (list, (hbuf, host))) in by.values().zip(&slots).enumerate() {
+                    let n = list.len();
+                    let toks = tb.view(row * 4, n * 4)?;
+                    let buf = if *host {
+                        ring[k % 2].copy_within(0, hbuf, 0, sb)?;
+                        &ring[k % 2]
+                    } else {
+                        hbuf
+                    };
+                    let m0 = self.mark(p);
+                    o.gather_f16(x, &toks, &xh, n, d)?;
+                    let m1 = self.lap(p, "MoE f16: gather", m0);
+                    o.dequant_f16(parts.gate.2.code(), buf, parts.gate.0, parts.gate.1, f * d, &w16)?;
+                    o.dequant_f16(parts.up.2.code(), buf, parts.up.0, parts.up.1, f * d, &wu)?;
+                    let m2 = self.lap(p, "MoE f16: expand gate/up", m1);
+                    o.gemm_f16(n, f, d, (&xh, 0, d), (&w16, 0), (&g32, 0, f), false)?;
+                    o.gemm_f16(n, f, d, (&xh, 0, d), (&wu, 0), (&u32b, 0, f), false)?;
+                    let m3 = self.lap(p, "MoE f16: gemm gate/up", m2);
+                    o.swiglu_clamp(&g32, &u32b, &g32, n * f, lim)?;
+                    o.to_f16(&g32, &hh, n * f)?;
+                    let m4 = self.lap(p, "MoE f16: swiglu", m3);
+                    o.dequant_f16(parts.down.2.code(), buf, parts.down.0, parts.down.1, d * f, &w16)?;
+                    let m5 = self.lap(p, "MoE f16: expand down", m4);
+                    o.gemm_f16(n, d, f, (&hh, 0, f), (&w16, 0), (&dn, 0, d), false)?;
+                    let m6 = self.lap(p, "MoE f16: gemm down", m5);
+                    o.scatter_add(&y, &dn, &toks, &wtb.view(row * 4, n * 4)?, n, d)?;
+                    self.lap(p, "MoE f16: scatter", m6);
+                    row += n;
+                }
+                return Ok(());
+            }
+            // NS_PROMPT_DEQUANT=1: prompt chunks take the float32 expanded-GEMM path instead (a measurement switch)
+            let dequant = t > MMVQ_COLS && std::env::var("NS_PROMPT_DEQUANT").is_ok_and(|v| v == "1");
             if !dequant && parts.gate.2 == parts.up.2 && o.moe_grouped_supported(parts.gate.2.code(), parts.down.2.code(), d, f) {
                 let groups = by.len();
                 let mut table: Vec<u8> = Vec::with_capacity(groups * 8 + (groups + 2 + 2 * total) * 4);
-                for slot in &slots {
+                for (slot, _) in &slots {
                     table.extend((slot.ptr() as u64).to_le_bytes());
                 }
                 let mut start = 0i32;
@@ -1447,37 +1536,9 @@ impl<'g> Glm<'g> {
             let gt = p.arena.f32(total * f)?;
             let ut = p.arena.f32(total * f)?;
             let dn = p.arena.f32(total * d)?;
-            // NS_PROMPT_F16=1: each expert expanded to fp16 once a chunk, its rows multiplied by oneMKL's half GEMM
-            if t > MMVQ_COLS && std::env::var("NS_PROMPT_F16").is_ok_and(|v| v == "1") {
-                let xh = p.arena.bytes(total * d * 2)?;
-                o.to_f16(&xe, &xh, total * d)?;
-                let w16 = p.arena.bytes(f * d * 2 * 2)?; // gate | up of one expert (down reuses the first half)
-                let mut row = 0;
-                for (list, buf) in by.values().zip(&slots) {
-                    let n = list.len();
-                    o.dequant_f16(parts.gate.2.code(), buf, parts.gate.0, parts.gate.1, f * d, &w16)?;
-                    let wu = w16.view(f * d * 2, f * d * 2)?;
-                    o.dequant_f16(parts.up.2.code(), buf, parts.up.0, parts.up.1, f * d, &wu)?;
-                    o.gemm_f16(n, f, d, (&xh, row * d, d), (&w16, 0), (&gt, row * f, f), false)?;
-                    o.gemm_f16(n, f, d, (&xh, row * d, d), (&wu, 0), (&ut, row * f, f), false)?;
-                    row += n;
-                }
-                o.swiglu_clamp(&gt, &ut, &gt, total * f, lim)?;
-                let hh = p.arena.bytes(total * f * 2)?;
-                o.to_f16(&gt, &hh, total * f)?;
-                let mut row = 0;
-                for (list, buf) in by.values().zip(&slots) {
-                    let n = list.len();
-                    o.dequant_f16(parts.down.2.code(), buf, parts.down.0, parts.down.1, d * f, &w16)?;
-                    o.gemm_f16(n, d, f, (&hh, row * f, f), (&w16, 0), (&dn, row * d, d), false)?;
-                    row += n;
-                }
-                let ints_view = p.arena.bytes((t + 1 + total) * 4)?;
-                ints_view.copy_within(0, &ib, base * 4, (t + 1 + total) * 4)?;
-                return o.moe_combine(&y, &dn, &ints_view, &wb, t, total, d);
-            }
+
             let mut row = 0;
-            for (list, buf) in by.values().zip(&slots) {
+            for (list, (buf, _)) in by.values().zip(&slots) {
                 let n = list.len();
                 p.expert_into(buf, 0, parts.gate, f, cols, (&xe, row * cols), (&gt, row * f), n, true)?;
                 p.expert_into(buf, 0, parts.up, f, cols, (&xe, row * cols), (&ut, row * f), n, false)?;
@@ -1485,7 +1546,7 @@ impl<'g> Glm<'g> {
             }
             o.swiglu_clamp(&gt, &ut, &gt, total * f, lim)?;
             let mut row = 0;
-            for (list, buf) in by.values().zip(&slots) {
+            for (list, (buf, _)) in by.values().zip(&slots) {
                 let n = list.len();
                 p.expert_into(buf, 0, parts.down, d, f, (&gt, row * f), (&dn, row * d), n, true)?;
                 row += n;

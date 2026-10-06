@@ -1919,6 +1919,23 @@ inline void dq_iq4_nl(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     }
     store_run<dst_t, 8>(y, v);
 }
+// nextsycl: Q2_K (GLM-5.3's expert down) - ggml's dequantize_row_q2_K, 8 values a thread: value v of the block is in
+// half n = v / 128, shift 2 * ((v % 128) / 32), sub-block (v % 32) / 16 (scale / min index 8n + 2j + sub)
+template <typename dst_t>
+inline void dq_q2_k(const void *vx, int64_t ibs, dst_t *yy, int tid) {
+    const block_q2_K* x = (const block_q2_K*) vx + ibs;
+    const int v0 = 8 * tid;
+    const int n = v0 / 128, j = (v0 % 128) / 32, l2 = v0 % 32, sub = l2 / 16, l = l2 % 16;
+    const uint8_t sc = x->scales[8 * n + 2 * j + sub];
+    const sycl::float2 dm = x->dm.convert<float, sycl::rounding_mode::automatic>();
+    const float d1 = dm.x() * (float) (sc & 0xF), m1 = dm.y() * (float) (sc >> 4);
+    const uint8_t* q = x->qs + 32 * n + 16 * sub + l;
+    float v[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) v[k] = d1 * (float) ((q[k] >> (2 * j)) & 3) - m1;
+    store_run<dst_t, 8>(yy + v0, v);
+}
+
 // Q3_K (the Q2_0 file's token_embd): llama.cpp's dequantize_block_q3_K, its 64 threads folded onto 32
 template <typename dst_t>
 inline void dq_q3_k(const void *vx, int64_t ibs, dst_t *yy, int tid) {
@@ -2104,6 +2121,7 @@ dq_dispatch(int ty, const void *vx, int64_t ibs, dst_t *y, int tid) {
         case 22: dq_iq2_s(vx, ibs, y, tid); break;
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
+        case 10: dq_q2_k(vx, ibs, y, tid); break;   // nextsycl
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;

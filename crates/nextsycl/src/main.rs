@@ -253,7 +253,7 @@ fn check(model: &Path, dump: &Path, gpus: &[usize]) -> Result<(), String> {
     // a prompt longer than a chunk: all but the last chunk first, then the last one compared - its rows against the
     // reference's last rows (the dump holds the whole prompt when llama.cpp ran it as one ubatch)
     let total = tokens.len();
-    let last = total - (total - 1) % ns_engine::glm5next::PREFILL_CHUNK - 1;
+    let last = total - (total - 1) % ns_engine::glm5next::prefill_chunk() - 1;
     let tc = total - last;
     let mut tap = |name: &str, b: &ns_core::DevBuf| -> ns_core::Result<()> {
         let Some(&n) = index.get(name) else { return Ok(()) };
@@ -294,7 +294,7 @@ fn check(model: &Path, dump: &Path, gpus: &[usize]) -> Result<(), String> {
     let word = |id: u32| vocab.and_then(|v| v.get(id as usize)).and_then(|v| v.as_str()).unwrap_or("?").replace('\u{120}', " ").to_string();
     println!("forward  : {:.1} s", t0.elapsed().as_secs_f64());
     // the same prompt incrementally: all but the last token, then the last alone (decode's path)
-    if tokens.len() > 1 && tokens.len() <= ns_engine::glm5next::PREFILL_CHUNK {
+    if tokens.len() > 1 && tokens.len() <= ns_engine::glm5next::prefill_chunk() {
         let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
         let mut s2 = glm.session(tokens.len()).map_err(e)?;
         glm.forward(&mut s2, &tokens[..tokens.len() - 1], &mut none).map_err(e)?;
@@ -425,8 +425,11 @@ fn generate(args: &[String]) -> Result<(), String> {
     for (name, secs, calls) in glm.profile() {
         eprintln!("[profile {name:<34} {secs:>7.2} s  {calls:>6} calls  {:>8.2} ms/token]", secs * 1000.0 / (n + 1) as f64);
     }
+    for (i, (peak, spills)) in glm.arena_peaks().iter().enumerate() {
+        eprintln!("[arena {i}: peak {:.2} GiB, {spills} request(s) past it]", *peak as f64 / (1u64 << 30) as f64);
+    }
     let (hits, misses, mirrored, direct) = glm.expert_stats();
-    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); drafts {} of {} accepted; experts: {hits} VRAM hits, {direct} read in place from host memory, {misses} swapped in ({mirrored} of them from host memory)]",
+    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); drafts {} of {} accepted; experts: {hits} VRAM hits, {direct} read from host memory by prompt passes, {misses} swapped in ({mirrored} of them from host memory)]",
               ids.len(), ids.len() as f64 / prefill, n as f64 / dt.max(1e-9), dec.accepted, dec.drafted);
     Ok(())
 }

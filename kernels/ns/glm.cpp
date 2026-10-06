@@ -606,6 +606,15 @@ int ns_gather(ns_gpu* g, const float* src, const int32_t* idx, float* out, int64
     NS_CATCH
 }
 
+// out[i] = (fp16) src[idx[i]] rows of C (an expert's tokens, as the half GEMMs take them)
+int ns_gather_f16(ns_gpu* g, const float* src, const int32_t* idx, uint16_t* out, int64_t n, int64_t C) {
+    NS_TRY
+    sycl::half* h = (sycl::half*) out;
+    g->q.parallel_for(sycl::range<2>(n, C), [=](sycl::id<2> id) { h[id[0] * C + id[1]] = (sycl::half) src[idx[id[0]] * C + id[1]]; });
+    return 0;
+    NS_CATCH
+}
+
 // The MoE combine, per token (no two entries write one row): y[t] += sum_j w[j] * rows[ent[j]] for j in
 // [t_ptr[t], t_ptr[t+1]); rows [entries, C]
 int ns_moe_combine(ns_gpu* g, float* y, const float* rows, const int32_t* t_ptr, const int32_t* ent, const float* w, int64_t T, int64_t C) {

@@ -610,6 +610,14 @@ impl Ops {
         let rc = unsafe { (self.a().scatter_add)(self.raw(), y.fp(), src.fp(), idx.ptr.cast(), w.fp(), n as i64, c as i64) };
         self.ok(rc, "scatter_add")
     }
+    /// out [n, c] fp16 = rows idx of src (float32)
+    pub fn gather_f16(&self, src: &DevBuf, idx: &DevBuf, out: &DevBuf, n: usize, c: usize) -> Result<()> {
+        idx.bounds(0, n * 4)?;
+        out.bounds(0, n * c * 2)?;
+        // SAFETY: sizes checked; indices are rows of src (the caller's).
+        let rc = unsafe { (self.a().gather_f16)(self.raw(), src.fp(), idx.ptr.cast(), out.ptr.cast(), n as i64, c as i64) };
+        self.ok(rc, "gather_f16")
+    }
     pub fn gather(&self, src: &DevBuf, idx: &DevBuf, out: &DevBuf, n: usize, c: usize) -> Result<()> {
         need!(idx, n, "gather idx");
         need!(out, n * c, "gather out");
