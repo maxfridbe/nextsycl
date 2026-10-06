@@ -529,6 +529,82 @@ fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
 
 /// `nextsycl spec-check`: greedy decode one token at a time (the reference), then the same tokens as 2-row verify
 /// passes each rolled back to its first row; every row's logits against the reference's at that position.
+/// `nextsycl batch-check <model.gguf> [--prompts "a|b|c"] [--n N] [--gpu 1,0]`: several conversations decoded
+/// together (`forward_batch`) against each decoded alone - the same greedy tokens, the logits' largest difference -
+/// and the speed of both.
+fn batch_check(args: &[String]) -> Result<(), String> {
+    let e = |x: ns_core::Error| x.0;
+    let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+    let model = args.get(1).ok_or("batch-check <model.gguf> ...")?;
+    let prompts: Vec<String> = opt("--prompts")
+        .unwrap_or_else(|| "Write a haiku about rivers.|Explain TCP slow start.|List five prime numbers and why.|What is a monad?".into())
+        .split('|').map(String::from).collect();
+    let n: usize = opt("--n").and_then(|v| v.parse().ok()).unwrap_or(32);
+    let gpus: Vec<usize> = opt("--gpu").unwrap_or_else(|| "1,0".into()).split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}"))).collect::<Result<_, _>>()?;
+    let f = Gguf::open(Path::new(model)).map_err(|e| e.0)?;
+    let tok = ns_tok::Tokenizer::from_gguf(&f)?;
+    let ids: Vec<Vec<u32>> = prompts.iter()
+        .map(|p| tok.encode(&ns_tok::glm_chat(&[ns_tok::Message { role: "user", content: p, reasoning: None }], ns_tok::Effort::Low)))
+        .collect();
+    let ctx = ids.iter().map(|v| v.len()).max().unwrap_or(0) + n + 8;
+    let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
+    let mut log = |l: String| eprintln!("[{l}]");
+    let glm = ns_engine::glm5next::Glm::load(&f, &gs, None, None, false, (ctx, prompts.len() + 1), &mut log).map_err(e)?;
+    let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
+    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i) as u32;
+    // alone: each conversation, one token a pass
+    let mut solo_toks: Vec<Vec<u32>> = Vec::new();
+    let mut solo_logits: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut solo_s = 0.0;
+    for p in &ids {
+        let mut s = glm.session(ctx).map_err(e)?;
+        let mut l = glm.feed(&mut s, p, &mut none).map_err(e)?;
+        let (mut ts, mut ls) = (Vec::new(), Vec::new());
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let t = argmax(&l);
+            ts.push(t);
+            l = glm.forward(&mut s, &[t], &mut none).map_err(e)?;
+            ls.push(l.clone());
+        }
+        solo_s += t0.elapsed().as_secs_f64();
+        solo_toks.push(ts);
+        solo_logits.push(ls);
+    }
+    // together
+    let mut sess: Vec<ns_engine::glm5next::Session> = Vec::new();
+    let mut last: Vec<Vec<f32>> = Vec::new();
+    for p in &ids {
+        let mut s = glm.session(ctx).map_err(e)?;
+        last.push(glm.feed(&mut s, p, &mut none).map_err(e)?);
+        sess.push(s);
+    }
+    let mut worst = 0f32;
+    let mut differ = 0;
+    let t0 = std::time::Instant::now();
+    for step in 0..n {
+        let toks: Vec<u32> = last.iter().map(|l| argmax(l)).collect();
+        for (b, t) in toks.iter().enumerate() {
+            if *t != solo_toks[b][step] {
+                differ += 1;
+            }
+        }
+        // each session takes the token its own run took, so the comparison stays aligned
+        let feed: Vec<u32> = (0..ids.len()).map(|b| solo_toks[b][step]).collect();
+        last = glm.forward_batch(&mut sess, &feed, &mut none).map_err(e)?;
+        for (b, l) in last.iter().enumerate() {
+            let r = &solo_logits[b][step];
+            worst = worst.max(l.iter().zip(r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max));
+        }
+    }
+    let batch_s = t0.elapsed().as_secs_f64();
+    let b = ids.len();
+    println!("{b} conversations, {n} tokens each: alone {:.2} tok/s (each, {:.1} s in all); together {:.2} tok/s in all ({:.2} each)",
+             n as f64 * b as f64 / solo_s, solo_s, n as f64 * b as f64 / batch_s, n as f64 / batch_s);
+    println!("greedy tokens different in {differ} of {} steps; the logits' largest difference {worst:.3e}", n * b);
+    Ok(())
+}
+
 fn spec_check(args: &[String]) -> Result<(), String> {
     let e = |x: ns_core::Error| x.0;
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
@@ -685,6 +761,7 @@ fn main() -> ExitCode {
         Some("generate") => generate(&args),
         Some("serve") => serve_cmd(&args),
         Some("spec-check") => spec_check(&args),
+        Some("batch-check") => batch_check(&args),
         Some("kernels") if args.len() >= 2 => {
             let gpu = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0);
             kernels(Path::new(&args[1]), gpu)
