@@ -24,6 +24,22 @@ use crate::Tap;
 
 /// float32 values expanded per matrix chunk (128 MiB)
 const SCRATCH: usize = 32 << 20;
+
+/// Prompt chunks of this many tokens or more multiply in fp16 on the XMX units (NS_PROMPT_F16_MIN, default 1024;
+/// 0 = never): the experts, and the dense matrices whose type the fp16 expander takes.
+fn f16_min() -> usize {
+    static F16_MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *F16_MIN.get_or_init(|| std::env::var("NS_PROMPT_F16_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1024))
+}
+
+/// Whether the dense matrices take the fp16 path too (NS_DENSE_F16=0: only the experts)
+fn dense_f16() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NS_DENSE_F16").map_or(true, |v| v != "0"))
+}
+
+/// The ggml types the fp16 expander (ns_dequant_f16) takes
+const F16_TYPES: [u32; 16] = [6, 7, 8, 10, 11, 12, 13, 16, 17, 18, 20, 21, 22, 23, 29, 42];
 /// the decode kernels take up to this many rows (tokens) at once
 const MMVQ_COLS: usize = 8;
 /// widest matrix input (MLA's output projection)
@@ -468,8 +484,24 @@ impl Part {
             self.ops.quantize_q8_1((x.0, x.1), &self.q8, w.cols, t)?;
             return self.ops.mmvq(w.ty.code(), (&w.buf, 0), w.buf.len, &self.q8, (y.0, y.1), w.cols, w.rows, t);
         }
-        let chunk = (SCRATCH / w.cols).max(1).min(w.rows);
         let rb = w.row_bytes();
+        // a big prompt chunk: the activations to fp16 once, the matrix expanded to fp16 a row block at a time, oneMKL's
+        // half GEMM (XMX) - the float32 GEMM below runs on the vector units
+        let f16 = f16_min();
+        if f16 > 0 && t >= f16 && t > MMVQ_COLS && dense_f16() && x.2 == w.cols && w.cols % 256 == 0 && F16_TYPES.contains(&w.ty.code()) {
+            let x16 = self.arena.bytes(t * w.cols * 2)?;
+            self.ops.to_f16(&x.0.view(x.1 * 4, t * w.cols * 4)?, &x16, t * w.cols)?;
+            let chunk = (SCRATCH * 2 / w.cols).max(1).min(w.rows);
+            let mut r0 = 0;
+            while r0 < w.rows {
+                let r = chunk.min(w.rows - r0);
+                self.ops.dequant_f16(w.ty.code(), &w.buf, r0 * rb, r * rb, r * w.cols, &self.scratch)?;
+                self.ops.gemm_f16(t, r, w.cols, (&x16, 0, w.cols), (&self.scratch, 0), (y.0, y.1 + r0, y.2), acc)?;
+                r0 += r;
+            }
+            return Ok(());
+        }
+        let chunk = (SCRATCH / w.cols).max(1).min(w.rows);
         let mut r0 = 0;
         while r0 < w.rows {
             let r = chunk.min(w.rows - r0);
@@ -1439,8 +1471,7 @@ impl<'g> Glm<'g> {
             // from NS_PROMPT_F16_MIN tokens (default 1024; 0 = never) - below, the grouped kernels win (measured
             // 2.0x slower at 512). Memory stays one expert's worth however big the chunk: its tokens gathered to
             // fp16, its outputs added into y.
-            static F16_MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-            let f16_min = *F16_MIN.get_or_init(|| std::env::var("NS_PROMPT_F16_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1024));
+            let f16_min = f16_min();
             if f16_min > 0 && t >= f16_min && t > MMVQ_COLS {
                 let mut gtok: Vec<i32> = Vec::with_capacity(total);
                 let mut gw: Vec<f32> = Vec::with_capacity(total);

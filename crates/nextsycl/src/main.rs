@@ -313,6 +313,11 @@ fn check(model: &Path, dump: &Path, gpus: &[usize]) -> Result<(), String> {
     println!("worst    : {} (cosine {:.6})", worst.1, worst.0);
     println!("next     : {best} {:?}{}", word(best), want_next.map_or(String::new(), |w| format!(", the reference {w} {:?}{}", word(w),
                                                          if w == best { " - the same" } else { " - DIFFERENT" })));
+    // how close the call is: the top logits, and where the reference's token stands
+    let mut order: Vec<usize> = (0..logits.len()).collect();
+    order.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]));
+    let top: Vec<String> = order.iter().take(5).map(|&i| format!("{:?} {:.3}", word(i as u32), logits[i])).collect();
+    println!("top      : {}{}", top.join(", "), want_next.map_or(String::new(), |w| format!("; the reference's token {:.3}", logits[w as usize])));
     Ok(())
 }
 
