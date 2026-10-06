@@ -649,7 +649,7 @@ impl Ops {
     pub fn mla_attend_sel(&self, qa: &DevBuf, c: &DevBuf, u: &DevBuf, t: usize, h: usize, l: usize, pos0: usize, scale: f32,
                           sel: Option<(&DevBuf, &DevBuf)>, k: usize) -> Result<()> {
         need!(qa, t * h * l, "mla qa");
-        need!(c, (pos0 + t) * l, "mla latents");
+        c.bounds(0, (pos0 + t) * l * 2)?; // fp16 latents
         need!(u, t * h * l, "mla u");
         let (sp, cp) = match sel {
             Some((s, n)) => {
@@ -660,7 +660,7 @@ impl Ops {
             None => (std::ptr::null(), std::ptr::null()),
         };
         // SAFETY: sizes checked.
-        let rc = unsafe { (self.a().mla_attend_sel)(self.raw(), qa.fp(), c.fp(), u.fp(), t as i64, h as i64, l as i64, pos0 as i64, scale, sp, cp, k as i64) };
+        let rc = unsafe { (self.a().mla_attend_sel)(self.raw(), qa.fp(), c.ptr.cast(), u.fp(), t as i64, h as i64, l as i64, pos0 as i64, scale, sp, cp, k as i64) };
         self.ok(rc, "mla_attend_sel")
     }
     /// y[idx[i]] += w[i] * src[i] (rows of c); idx and w on the device (`n` int32 / float32)
@@ -673,6 +673,14 @@ impl Ops {
         self.ok(rc, "scatter_add")
     }
     /// out [n, c] fp16 = rows idx of src (float32)
+    /// out[i] = src[idx[i]], rows of c fp16 values (the MLA cache's cells)
+    pub fn gather_h(&self, src: &DevBuf, idx: &DevBuf, out: &DevBuf, n: usize, c: usize) -> Result<()> {
+        idx.bounds(0, n * 4)?;
+        out.bounds(0, n * c * 2)?;
+        // SAFETY: idx and out sized (checked); the indices are cells below the position, inside src (mla_cells).
+        let rc = unsafe { (self.a().gather_h)(self.raw(), src.ptr.cast(), idx.ptr.cast(), out.ptr.cast(), n as i64, c as i64) };
+        self.ok(rc, "gather_h")
+    }
     pub fn gather_f16(&self, src: &DevBuf, idx: &DevBuf, out: &DevBuf, n: usize, c: usize) -> Result<()> {
         idx.bounds(0, n * 4)?;
         out.bounds(0, n * c * 2)?;

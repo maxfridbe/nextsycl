@@ -676,6 +676,19 @@ int ns_gather_f16(ns_gpu* g, const float* src, const int32_t* idx, uint16_t* out
     NS_CATCH
 }
 
+// out[i] = src[idx[i]], fp16 rows of C (the MLA cache's cells; 8 halves a work-item)
+int ns_gather_h(ns_gpu* g, const uint16_t* src, const int32_t* idx, uint16_t* out, int64_t n, int64_t C) {
+    NS_TRY
+    if (C % 8 != 0) return ns_fail("ns_gather_h: row width not a multiple of 8");
+    using V = sycl::vec<uint16_t, 8>;
+    const int64_t cv = C / 8;
+    const V* s = (const V*) src;
+    V* o = (V*) out;
+    g->q.parallel_for(sycl::range<2>(n, cv), [=](sycl::id<2> id) { o[id[0] * cv + id[1]] = s[idx[id[0]] * cv + id[1]]; });
+    return 0;
+    NS_CATCH
+}
+
 // The MoE combine, per token (no two entries write one row): y[t] += sum_j w[j] * rows[ent[j]] for j in
 // [t_ptr[t], t_ptr[t+1]); rows [entries, C]
 int ns_moe_combine(ns_gpu* g, float* y, const float* rows, const int32_t* t_ptr, const int32_t* ent, const float* w, int64_t T, int64_t C) {
@@ -873,7 +886,7 @@ int ns_softmax_masked(ns_gpu* g, float* S, int64_t R, int64_t H, int64_t NC, con
 }  // extern "C"
 
 template <int HG>
-static void mla_sel(sycl::queue& q, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
+static void mla_sel(sycl::queue& q, const float* qa, const sycl::half* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
                     const int32_t* sel, const int32_t* sel_cnt, int64_t K) {
     constexpr int WG = 256, MAXN = 2560, MAXL = 512;
     q.submit([&](sycl::handler& h) {
@@ -895,10 +908,10 @@ static void mla_sel(sycl::queue& q, const float* qa, const float* c, float* u, i
             float mx[HG];
             for (int k = 0; k < HG; ++k) mx[k] = -INFINITY;
             for (int64_t i = lid; i < n; i += WG) {
-                const sycl::float4* cs = reinterpret_cast<const sycl::float4*>(c + cell(i) * L);
+                const sycl::vec<sycl::half, 4>* cs = reinterpret_cast<const sycl::vec<sycl::half, 4>*>(c + cell(i) * L);
                 float dot[HG] = {};
                 for (int64_t r = 0; r < L / 4; ++r) {
-                    const sycl::float4 v = cs[r];
+                    const sycl::float4 v = cs[r].convert<float>();
                     for (int k = 0; k < HG; ++k)
                         dot[k] += qs[k * L + 4 * r] * v.x() + qs[k * L + 4 * r + 1] * v.y() + qs[k * L + 4 * r + 2] * v.z() + qs[k * L + 4 * r + 3] * v.w();
                 }
@@ -922,9 +935,9 @@ static void mla_sel(sycl::queue& q, const float* qa, const float* c, float* u, i
             sycl::group_barrier(it.get_group());
             float acc[HG][MAXL / WG] = {};
             for (int64_t i = 0; i < n; ++i) {
-                const float* cs = c + cell(i) * L;
+                const sycl::half* cs = c + cell(i) * L;
                 float cv[MAXL / WG];
-                for (int f = 0; f < L / WG; ++f) cv[f] = cs[lid + f * WG];
+                for (int f = 0; f < L / WG; ++f) cv[f] = (float) cs[lid + f * WG];
                 for (int k = 0; k < HG; ++k) {
                     const float w = sc[k * MAXN + i];
                     for (int f = 0; f < L / WG; ++f) acc[k][f] += w * cv[f];
@@ -938,13 +951,14 @@ static void mla_sel(sycl::queue& q, const float* qa, const float* c, float* u, i
 
 extern "C" {
 
-int ns_mla_attend_sel(ns_gpu* g, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
+int ns_mla_attend_sel(ns_gpu* g, const float* qa, const uint16_t* c16, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
                       const int32_t* sel, const int32_t* sel_cnt, int64_t K) {
     NS_TRY
     if (L > 512 || L % 256 != 0) return ns_fail("ns_mla_attend_sel: latent width 256 or 512");
     if (pos0 + T > 2560 && !sel_cnt) return ns_fail("ns_mla_attend_sel: a dense row past 2,560 tokens (the indexer selects there)");
     // NS_MLA_HG=4: 4 heads a work-group in prompt chunks (measured slower at 3K: 13.7 vs 12.1 s - occupancy)
     static const bool hg4 = getenv("NS_MLA_HG") && getenv("NS_MLA_HG")[0] == '4';
+    const sycl::half* c = (const sycl::half*) c16;   // the cache's latents, fp16
     if (hg4 && T > 8 && H % 4 == 0) mla_sel<4>(g->q, qa, c, u, T, H, L, pos0, scale, sel, sel_cnt, K);
     else mla_sel<1>(g->q, qa, c, u, T, H, L, pos0, scale, sel, sel_cnt, K);
     return 0;

@@ -678,8 +678,8 @@ impl<'g> Glm<'g> {
             let extra = if last && mtp && m.g.n_mtp > 0 { n..n + 1 } else { n..n };
             let blocks = n + u64::from(mtp && m.g.n_mtp > 0);
             let share = mirror * (range.end - range.start + extra.end - extra.start) as usize / blocks as usize;
-            // per session: each MLA layer's latents [ctx, kv_lora] and pooled keys [ctx / 4, idx_dim], float32
-            let per_layer = kv.0 * m.g.kv_lora as usize * 4 + (kv.0 / 4 + 1) * m.g.idx_dim as usize * 4;
+            // per session: each MLA layer's latents [ctx, kv_lora] in fp16 and pooled keys [ctx / 4, idx_dim], float32
+            let per_layer = kv.0 * m.g.kv_lora as usize * 2 + (kv.0 / 4 + 1) * m.g.idx_dim as usize * 4;
             let mla = range.clone().filter(|l| m.g.is_mla(*l)).count() + (extra.end - extra.start) as usize;
             let reserve = kv.1 * mla * per_layer;
             if reserve > 0 {
@@ -772,7 +772,7 @@ impl<'g> Glm<'g> {
         for l in 0..g.n_layer {
             let gpu = &self.parts[self.owner[l as usize]].ops.gpu;
             layers.push(if g.is_mla(l) {
-                LayerState::Mla { c: DevBuf::f32(gpu, max_ctx * g.kv_lora as usize)?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)? }
+                LayerState::Mla { c: DevBuf::new(gpu, max_ctx * g.kv_lora as usize * 2)?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)? }
             } else {
                 let sz = (g.kda_heads * g.kda_dim * g.kda_dim) as usize;
                 let s = DevBuf::f32(gpu, sz)?;
@@ -795,7 +795,7 @@ impl<'g> Glm<'g> {
         let mtp = match self.mtp {
             Some(_) => {
                 let gpu = &self.parts.last().unwrap().ops.gpu;
-                Some(MtpState { cache: DevBuf::f32(gpu, max_ctx * g.kv_lora as usize)?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)?, hid: DevBuf::f32(gpu, prefill_chunk() * g.n_embd as usize)?, rows: 0,
+                Some(MtpState { cache: DevBuf::new(gpu, max_ctx * g.kv_lora as usize * 2)?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)?, hid: DevBuf::f32(gpu, prefill_chunk() * g.n_embd as usize)?, rows: 0,
                                 slot0: 0, next: Vec::new() })
             }
             None => None,
@@ -819,7 +819,7 @@ impl<'g> Glm<'g> {
     /// - the prompt cache's checkpoints. Pageable memory: a checkpoint spans both GPUs' contexts.
     pub fn save(&self, sess: &Session) -> Result<Checkpoint> {
         let g = &self.m.g;
-        let (lat, d, n) = (g.kv_lora as usize * 4, g.idx_dim as usize * 4, sess.pos);
+        let (lat, d, n) = (g.kv_lora as usize * 2, g.idx_dim as usize * 4, sess.pos); // bytes a cell: fp16 latents
         let mut bufs: Vec<Vec<u8>> = Vec::new();
         let mut take = |b: &DevBuf, len: usize| -> Result<()> {
             let mut v = vec![0u8; len];
@@ -927,7 +927,7 @@ impl<'g> Glm<'g> {
         if dst.max_ctx != src.max_ctx || dst.layers.len() != src.layers.len() {
             return Err(Error("copy_session: the sessions differ in shape".into()));
         }
-        let lat = self.m.g.kv_lora as usize * 4;
+        let lat = self.m.g.kv_lora as usize * 2; // the latents' bytes a cell (fp16)
         for (d, s) in dst.layers.iter().zip(&src.layers) {
             match (d, s) {
                 (LayerState::Kda { s: ds, conv: dc, .. }, LayerState::Kda { s: ss, conv: sc, .. }) => {
@@ -1001,7 +1001,8 @@ impl<'g> Glm<'g> {
         let c = p.arena.f32(t * lat)?;
         o.rms_norm(&kv, Some(p.vec(l, Role::MlaKvANorm)?), &c, t, lat, eps)?;
         tap(&format!("kv_cmpr-{l}"), &c)?;
-        cache.copy_within(pos0 * lat * 4, &c, 0, t * lat * 4)?;
+        // the cache keeps the latents in fp16 (as llama.cpp's): half the VRAM, half the reads of every attention
+        o.to_f16(&c, &cache.view(pos0 * lat * 2, t * lat * 2)?, t * lat)?;
         let t_abs = self.lap(p, "MLA: projections", t_proj);
         // the absorbed queries: per head, q~ = k_b[h] . q_h
         let kb = p.vec(l, Role::MlaKB)?;
@@ -1038,39 +1039,26 @@ impl<'g> Glm<'g> {
             let c0 = self.mark(p);
             o.mla_cells(sel.as_ref().map(|(a, b)| (a, b)), t, kp, pos0, &idx, &cnt, nc)?;
             self.lap(p, "MLA att: cells", c0);
-            if std::env::var("NS_MLA_F16").map_or(true, |v| v != "0") {
-                // in fp16 on the XMX units: the gathered latents (a row's 2,051 cells are 4 MB in float32, read
-                // twice), the queries and the probabilities; scores and outputs in float32
-                const RB: usize = 32;
-                let gh = p.arena.bytes(RB * nc * lat * 2)?;
-                let qh = p.arena.bytes(RB * nh * lat * 2)?;
-                let sb = p.arena.f32(RB * nh * nc)?;
-                let ph = p.arena.bytes(RB * nh * nc * 2)?;
-                for r0 in (0..t).step_by(RB) {
-                    let tr = RB.min(t - r0);
-                    let a0 = self.mark(p);
-                    o.gather_f16(cache, &idx.view(r0 * nc * 4, tr * nc * 4)?, &gh, tr * nc, lat)?;
-                    o.to_f16(&qt.view(r0 * nh * lat * 4, tr * nh * lat * 4)?, &qh, tr * nh * lat)?;
-                    let a1 = self.lap(p, "MLA att: gather", a0);
-                    o.gemm_batch_h(tr, true, nh, nc, lat, (&qh, 0, lat, nh * lat), (&gh, 0, lat, nc * lat), (&sb, 0, nc, nh * nc))?;
-                    let a2 = self.lap(p, "MLA att: scores", a1);
-                    o.softmax_masked(&sb, tr, nh, nc, &cnt.view(r0 * 4, tr * 4)?, scale)?;
-                    o.to_f16(&sb, &ph, tr * nh * nc)?;
-                    let a3 = self.lap(p, "MLA att: softmax", a2);
-                    o.gemm_batch_h(tr, false, nh, lat, nc, (&ph, 0, nc, nh * nc), (&gh, 0, lat, nc * lat), (&u, r0 * nh * lat, lat, nh * lat))?;
-                    self.lap(p, "MLA att: values", a3);
-                }
-            } else {
-                const RB: usize = 16;
-                let gb = p.arena.f32(RB * nc * lat)?;
-                let sb = p.arena.f32(RB * nh * nc)?;
-                for r0 in (0..t).step_by(RB) {
-                    let tr = RB.min(t - r0);
-                    o.gather(cache, &idx.view(r0 * nc * 4, tr * nc * 4)?, &gb, tr * nc, lat)?;
-                    o.gemm_batch(tr, nh, nc, lat, (&qt, r0 * nh * lat, lat, nh * lat), (&gb, 0, nc * lat), (&sb, 0, nc, nh * nc), false)?;
-                    o.softmax_masked(&sb, tr, nh, nc, &cnt.view(r0 * 4, tr * 4)?, scale)?;
-                    o.gemm_batch_nn(tr, nh, lat, nc, (&sb, 0, nc, nh * nc), (&gb, 0, lat, nc * lat), (&u, r0 * nh * lat, lat, nh * lat))?;
-                }
+            // in fp16 on the XMX units: the gathered latents (rows of the fp16 cache), the queries and the
+            // probabilities; scores and outputs in float32
+            const RB: usize = 32;
+            let gh = p.arena.bytes(RB * nc * lat * 2)?;
+            let qh = p.arena.bytes(RB * nh * lat * 2)?;
+            let sb = p.arena.f32(RB * nh * nc)?;
+            let ph = p.arena.bytes(RB * nh * nc * 2)?;
+            for r0 in (0..t).step_by(RB) {
+                let tr = RB.min(t - r0);
+                let a0 = self.mark(p);
+                o.gather_h(cache, &idx.view(r0 * nc * 4, tr * nc * 4)?, &gh, tr * nc, lat)?;
+                o.to_f16(&qt.view(r0 * nh * lat * 4, tr * nh * lat * 4)?, &qh, tr * nh * lat)?;
+                let a1 = self.lap(p, "MLA att: gather", a0);
+                o.gemm_batch_h(tr, true, nh, nc, lat, (&qh, 0, lat, nh * lat), (&gh, 0, lat, nc * lat), (&sb, 0, nc, nh * nc))?;
+                let a2 = self.lap(p, "MLA att: scores", a1);
+                o.softmax_masked(&sb, tr, nh, nc, &cnt.view(r0 * 4, tr * 4)?, scale)?;
+                o.to_f16(&sb, &ph, tr * nh * nc)?;
+                let a3 = self.lap(p, "MLA att: softmax", a2);
+                o.gemm_batch_h(tr, false, nh, lat, nc, (&ph, 0, nc, nh * nc), (&gh, 0, lat, nc * lat), (&u, r0 * nh * lat, lat, nh * lat))?;
+                self.lap(p, "MLA att: values", a3);
             }
         }
         let t_vb = self.lap(p, "MLA: attention", t_att);

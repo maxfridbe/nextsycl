@@ -98,7 +98,7 @@ int ns_gemm_batch_nn(ns_gpu* g, int64_t batch, int64_t T, int64_t N, int64_t K, 
                      int64_t ldw, int64_t sw, float* y, int64_t ldy, int64_t sy, int accumulate);
 int ns_gemm_batch_h(ns_gpu* g, int64_t batch, int trans_w, int64_t T, int64_t N, int64_t K, const uint16_t* x, int64_t ldx, int64_t sx,
                     const uint16_t* w, int64_t ldw, int64_t sw, float* y, int64_t ldy, int64_t sy, int accumulate);
-int ns_mla_attend_sel(ns_gpu* g, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
+int ns_mla_attend_sel(ns_gpu* g, const float* qa, const uint16_t* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
                       const int32_t* sel, const int32_t* sel_cnt, int64_t K);
 int ns_scatter_add(ns_gpu* g, float* y, const float* src, const int32_t* idx, const float* w, int64_t n, int64_t C);
 int ns_gather(ns_gpu* g, const float* src, const int32_t* idx, float* out, int64_t n, int64_t C);
@@ -108,6 +108,7 @@ int ns_add(ns_gpu* g, float* y, const float* x, int64_t n);
 int ns_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
 int ns_to_f16(ns_gpu* g, const float* x, uint16_t* y, int64_t n);
 int ns_gather_f16(ns_gpu* g, const float* src, const int32_t* idx, uint16_t* out, int64_t n, int64_t C);
+int ns_gather_h(ns_gpu* g, const uint16_t* src, const int32_t* idx, uint16_t* out, int64_t n, int64_t C);
 int ns_gemm_f16(ns_gpu* g, int64_t T, int64_t N, int64_t K, const uint16_t* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                 int accumulate);
 /* MoE combine per token: y[t] += sum_{j in [t_ptr[t], t_ptr[t+1])} w[j] * rows[ent[j]], rows [entries, C] */
