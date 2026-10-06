@@ -35,6 +35,25 @@ dist/nextsycl stop
 
 `dist/nextsycl help` lists every command and setting.
 
+What `status` shows during a chat (GLM-5.3-Flash IQ2 on an Arc Pro B70 and a B65, from Open WebUI):
+
+```
+$ nextsycl status
+glm-5.3-flash-uncensored - up 3m02s, context 65536, MTP on, 4 request(s) served
+
+GPU  CARD                      VRAM USED      FREE   LAYERS EXPERTS VRAM/HOST
+0    Arc Pro B70        30.1GiB / 31.9GiB    1.8GiB     0-21      3479 / 1994
+1    Arc Pro B65        30.2GiB / 31.9GiB    1.7GiB    22-44      3314 / 3496
+
+request #4 (tcp): generating, prompt 23 tokens, 0 reused (none), 585 / 4096 generated at 14.0 tok/s, 43s
+prompt cache: (busy)
+
+$ nextsycl ps
+ID     VIA     STATE        PROMPT           REUSED    READ  GENERATED   TOK/S FINISH       AGO
+#4     tcp     done             23           0 none    0.9s       1502    13.8 stop      15m15s
+#2     web     done             19           0 none    0.8s         55    15.6 stop      17m23s
+```
+
 ## Standing on
 
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp):** the GGUF format, the quantization formats and their
