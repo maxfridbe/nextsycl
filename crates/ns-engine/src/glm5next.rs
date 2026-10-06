@@ -668,6 +668,24 @@ impl<'g> Glm<'g> {
         Ok(r)
     }
 
+    /// Profiling inside a section: now (the GPU synced), when profiling.
+    fn mark(&self, p: &Part) -> Option<Instant> {
+        self.prof.as_ref()?;
+        p.ops.gpu.sync().ok()?;
+        Some(Instant::now())
+    }
+
+    /// Adds the time since `from` to `name` and starts the next lap.
+    fn lap(&self, p: &Part, name: &'static str, from: Option<Instant>) -> Option<Instant> {
+        let (pr, t0) = (self.prof.as_ref()?, from?);
+        p.ops.gpu.sync().ok()?;
+        let mut m = pr.lock().unwrap();
+        let x = m.entry(name).or_insert((0.0, 0));
+        x.0 += t0.elapsed().as_secs_f64();
+        x.1 += 1;
+        Some(Instant::now())
+    }
+
     /// The profile so far: (section, seconds, calls), slowest first.
     pub fn profile(&self) -> Vec<(&'static str, f64, u64)> {
         let Some(p) = &self.prof else { return Vec::new() };
@@ -905,6 +923,7 @@ impl<'g> Glm<'g> {
         let o = &p.ops;
         let eps = g.rms_eps as f32;
         let (nh, hd, lat) = (g.n_head as usize, g.head_dim as usize, g.kv_lora as usize);
+        let t_proj = self.mark(p);
         let mut pj = p.mm_many(l, &[Role::MlaQA, Role::MlaKvA], normed, t)?.into_iter();
         let (qa, kv) = (pj.next().unwrap(), pj.next().unwrap());
         let qr = p.arena.f32(t * g.q_lora as usize)?;
@@ -915,6 +934,7 @@ impl<'g> Glm<'g> {
         o.rms_norm(&kv, Some(p.vec(l, Role::MlaKvANorm)?), &c, t, lat, eps)?;
         tap(&format!("kv_cmpr-{l}"), &c)?;
         cache.copy_within(pos0 * lat * 4, &c, 0, t * lat * 4)?;
+        let t_abs = self.lap(p, "MLA: projections", t_proj);
         // the absorbed queries: per head, q~ = k_b[h] . q_h
         let kb = p.vec(l, Role::MlaKB)?;
         let qt = p.arena.f32(t * nh * lat)?;
@@ -930,11 +950,35 @@ impl<'g> Glm<'g> {
                 o.gemm_at(t, lat, hd, (&q, hh * hd, nh * hd), (kb, hh * lat * hd), (&qt, hh * lat, nh * lat), false)?;
             }
         }
+        let t_idx = self.lap(p, "MLA: absorbed queries", t_abs);
         // the indexer: this pass's pooled keys; the rows that see more pools than it keeps attend to its selection
         let sel = self.select(p, l, normed, &qr, idx, pos0, t, &mut *tap)?;
+        let t_att = self.lap(p, "MLA: indexer", t_idx);
         let u = p.arena.f32(t * nh * lat)?;
         let kp = (g.idx_top_k / g.idx_pool) as usize;
-        o.mla_attend_sel(&qt, cache, &u, t, nh, lat, pos0, 1.0 / (hd as f32).sqrt(), sel.as_ref().map(|(a, b)| (a, b)), kp)?;
+        let scale = 1.0 / (hd as f32).sqrt();
+        if t <= MMVQ_COLS || std::env::var("NS_MLA_KERNEL").is_ok_and(|v| v == "1") {
+            // decode widths: the per-row kernel (a verify pass's rows equal one-token passes)
+            o.mla_attend_sel(&qt, cache, &u, t, nh, lat, pos0, scale, sel.as_ref().map(|(a, b)| (a, b)), kp)?;
+        } else {
+            // prompt chunks as GEMMs, a block of rows at a time: each row's cells gathered contiguous, then per row
+            // scores [heads, cells] = q~ . G^T, a masked softmax, latents [heads, 512] = P . G
+            let nc = if sel.is_some() { 4 * kp + 3 } else { pos0 + t };
+            let idx = p.arena.bytes(t * nc * 4)?;
+            let cnt = p.arena.bytes(t * 4)?;
+            o.mla_cells(sel.as_ref().map(|(a, b)| (a, b)), t, kp, pos0, &idx, &cnt, nc)?;
+            const RB: usize = 16;
+            let gb = p.arena.f32(RB * nc * lat)?;
+            let sb = p.arena.f32(RB * nh * nc)?;
+            for r0 in (0..t).step_by(RB) {
+                let tr = RB.min(t - r0);
+                o.gather(cache, &idx.view(r0 * nc * 4, tr * nc * 4)?, &gb, tr * nc, lat)?;
+                o.gemm_batch(tr, nh, nc, lat, (&qt, r0 * nh * lat, lat, nh * lat), (&gb, 0, nc * lat), (&sb, 0, nc, nh * nc), false)?;
+                o.softmax_masked(&sb, tr, nh, nc, &cnt.view(r0 * 4, tr * 4)?, scale)?;
+                o.gemm_batch_nn(tr, nh, lat, nc, (&sb, 0, nc, nh * nc), (&gb, 0, lat, nc * lat), (&u, r0 * nh * lat, lat, nh * lat))?;
+            }
+        }
+        let t_vb = self.lap(p, "MLA: attention", t_att);
         let vb = p.vec(l, Role::MlaVB)?;
         let oh = p.arena.f32(t * nh * hd)?;
         if t <= MMVQ_COLS {
@@ -947,7 +991,9 @@ impl<'g> Glm<'g> {
             }
         }
         tap(&format!("kqv_out-{l}"), &oh)?;
+        let t_out = self.lap(p, "MLA: values (v_b)", t_vb);
         let out = p.mm(l, Role::MlaOut, &oh, t)?;
+        self.lap(p, "MLA: output projection", t_out);
         tap(&format!("attn_out-{l}"), &out)?;
         Ok(out)
     }

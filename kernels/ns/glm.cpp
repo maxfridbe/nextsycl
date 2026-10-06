@@ -12,6 +12,7 @@
 #include "ggml-common.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <string>
 
 namespace {
@@ -243,6 +244,17 @@ int ns_gemm_batch(ns_gpu* g, int64_t batch, int64_t T, int64_t N, int64_t K, con
     NS_TRY
     using oneapi::mkl::transpose;
     oneapi::mkl::blas::row_major::gemm_batch(g->q, transpose::nontrans, transpose::trans, T, N, K, 1.0f, x, ldx, sx, w, K, sw,
+                                             accumulate ? 1.0f : 0.0f, y, ldy, sy, batch);
+    return 0;
+    NS_CATCH
+}
+
+// batch products without the transpose: y + b*sy [T, N] (+)= (x + b*sx) [T, K] . (w + b*sw) [K, N]
+int ns_gemm_batch_nn(ns_gpu* g, int64_t batch, int64_t T, int64_t N, int64_t K, const float* x, int64_t ldx, int64_t sx, const float* w,
+                     int64_t ldw, int64_t sw, float* y, int64_t ldy, int64_t sy, int accumulate) {
+    NS_TRY
+    using oneapi::mkl::transpose;
+    oneapi::mkl::blas::row_major::gemm_batch(g->q, transpose::nontrans, transpose::nontrans, T, N, K, 1.0f, x, ldx, sx, w, ldw, sw,
                                              accumulate ? 1.0f : 0.0f, y, ldy, sy, batch);
     return 0;
     NS_CATCH
@@ -740,20 +752,64 @@ int ns_topk(ns_gpu* g, const float* score, int32_t* sel, int64_t T, int64_t n, i
     NS_CATCH
 }
 
+// The prompt path's MLA as GEMMs (rows of a chunk): per row t, the cells it attends to (as ns_mla_attend_sel: every
+// earlier one, or its selected pools' and its incomplete pool's) as indices idx [T][NC] (padding: 0) and their
+// count n [T].
+int ns_mla_cells(ns_gpu* g, const int32_t* sel, const int32_t* sel_cnt, int64_t T, int64_t K, int64_t pos0, int32_t* idx, int32_t* n,
+                 int64_t NC) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<2>(T, NC), [=](sycl::id<2> id) {
+        const int64_t t = id[0], i = id[1];
+        const int64_t p = pos0 + t;
+        const int32_t ns = sel_cnt ? sel_cnt[t] : -1;
+        const int64_t tail0 = 4 * ((p + 1) / 4);
+        const int64_t cnt = ns < 0 ? p + 1 : 4 * (int64_t) ns + (p + 1 - tail0);
+        int64_t c = 0;
+        if (i < cnt) c = ns < 0 ? i : i < 4 * (int64_t) ns ? 4 * (int64_t) sel[t * K + i / 4] + i % 4 : tail0 + (i - 4 * (int64_t) ns);
+        idx[t * NC + i] = (int32_t) c;
+        if (i == 0) n[t] = (int32_t) sycl::min<int64_t>(cnt, NC);
+    });
+    return 0;
+    NS_CATCH
+}
+
+// Row softmax of scores S [R * H rows of NC] (row r's heads valid over its first n[r] cells, scaled): the rest 0
+int ns_softmax_masked(ns_gpu* g, float* S, int64_t R, int64_t H, int64_t NC, const int32_t* n, float scale) {
+    NS_TRY
+    constexpr int WG = 256;
+    g->q.parallel_for(sycl::nd_range<1>(R * H * WG, WG), [=](sycl::nd_item<1> it) {
+        const int64_t rh = it.get_group(0), r = rh / H;
+        float* row = S + rh * NC;
+        const int64_t m = n[r];
+        const int lid = it.get_local_id(0);
+        float mx = -INFINITY;
+        for (int64_t i = lid; i < m; i += WG) mx = sycl::fmax(mx, row[i] * scale);
+        mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
+        float sum = 0.f;
+        for (int64_t i = lid; i < m; i += WG) sum += sycl::exp(row[i] * scale - mx);
+        sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+        for (int64_t i = lid; i < NC; i += WG) row[i] = i < m ? sycl::exp(row[i] * scale - mx) / sum : 0.f;
+    });
+    return 0;
+    NS_CATCH
+}
+
 // MLA over a row's selection: sel_cnt[t] < 0 - every earlier token (dense causal, as ns_mla_attend); else the tokens
 // of pools sel[t][0, sel_cnt[t]) (4 each) and the row's incomplete pool (positions 4 * ((p + 1) / 4) .. p). A row
 // reads at most K * 4 + 3 cells (the indexer switches on past K pools), so its scores live in local memory: every
-// work-item scores whole cells, one softmax, then the weighted latents with the cells' rows read coalesced.
-int ns_mla_attend_sel(ns_gpu* g, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
-                      const int32_t* sel, const int32_t* sel_cnt, int64_t K) {
-    NS_TRY
+// work-item scores whole cells, one softmax, then the weighted latents with the cells' rows read coalesced. A
+// work-group takes HG heads of a row: each cell's latent is read once for all of them (prompt chunks: HG = 4; one
+// row - decode - keeps HG = 1 for the parallelism). The per-head arithmetic is the same either way.
+}  // extern "C"
+
+template <int HG>
+static void mla_sel(sycl::queue& q, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
+                    const int32_t* sel, const int32_t* sel_cnt, int64_t K) {
     constexpr int WG = 256, MAXN = 2560, MAXL = 512;
-    if (L > MAXL || L % WG != 0) return ns_fail("ns_mla_attend_sel: latent width 256 or 512");
-    if (pos0 + T > MAXN && !sel_cnt) return ns_fail("ns_mla_attend_sel: a dense row past 2,560 tokens (the indexer selects there)");
-    g->q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> sc(sycl::range<1>(MAXN), h), qs(sycl::range<1>(MAXL), h);
-        h.parallel_for(sycl::nd_range<1>(T * H * WG, WG), [=](sycl::nd_item<1> it) {
-            const int64_t th = it.get_group(0), t = th / H;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sc(sycl::range<1>(HG * MAXN), h), qs(sycl::range<1>(HG * MAXL), h);
+        h.parallel_for(sycl::nd_range<1>(T * (H / HG) * WG, WG), [=](sycl::nd_item<1> it) {
+            const int64_t grp = it.get_group(0), t = grp / (H / HG), h0 = (grp % (H / HG)) * HG;
             const int lid = it.get_local_id(0);
             const int64_t p = pos0 + t;
             const int32_t ns = sel_cnt ? sel_cnt[t] : -1;
@@ -764,38 +820,63 @@ int ns_mla_attend_sel(ns_gpu* g, const float* qa, const float* c, float* u, int6
                 if (i < 4 * (int64_t) ns) return 4 * (int64_t) sel[t * K + i / 4] + i % 4;
                 return tail0 + (i - 4 * (int64_t) ns);
             };
-            for (int64_t r = lid; r < L; r += WG) qs[r] = qa[th * L + r];
+            for (int64_t r = lid; r < HG * L; r += WG) qs[r] = qa[(t * H + h0) * L + r];
             sycl::group_barrier(it.get_group());
-            float mx = -INFINITY;
+            float mx[HG];
+            for (int k = 0; k < HG; ++k) mx[k] = -INFINITY;
             for (int64_t i = lid; i < n; i += WG) {
                 const sycl::float4* cs = reinterpret_cast<const sycl::float4*>(c + cell(i) * L);
-                float dot = 0.f;
+                float dot[HG] = {};
                 for (int64_t r = 0; r < L / 4; ++r) {
                     const sycl::float4 v = cs[r];
-                    dot += qs[4 * r] * v.x() + qs[4 * r + 1] * v.y() + qs[4 * r + 2] * v.z() + qs[4 * r + 3] * v.w();
+                    for (int k = 0; k < HG; ++k)
+                        dot[k] += qs[k * L + 4 * r] * v.x() + qs[k * L + 4 * r + 1] * v.y() + qs[k * L + 4 * r + 2] * v.z() + qs[k * L + 4 * r + 3] * v.w();
                 }
-                dot *= scale;
-                sc[i] = dot;
-                mx = sycl::fmax(mx, dot);
+                for (int k = 0; k < HG; ++k) {
+                    dot[k] *= scale;
+                    sc[k * MAXN + i] = dot[k];
+                    mx[k] = sycl::fmax(mx[k], dot[k]);
+                }
             }
-            mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
-            float sum = 0.f;
-            for (int64_t i = lid; i < n; i += WG) {
-                const float e = sycl::exp(sc[i] - mx);
-                sc[i] = e;
-                sum += e;
+            float sum[HG];
+            for (int k = 0; k < HG; ++k) {
+                mx[k] = sycl::reduce_over_group(it.get_group(), mx[k], sycl::maximum<float>());
+                float sk = 0.f;
+                for (int64_t i = lid; i < n; i += WG) {
+                    const float e = sycl::exp(sc[k * MAXN + i] - mx[k]);
+                    sc[k * MAXN + i] = e;
+                    sk += e;
+                }
+                sum[k] = sycl::reduce_over_group(it.get_group(), sk, sycl::plus<float>());
             }
-            sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
             sycl::group_barrier(it.get_group());
-            float acc[MAXL / WG] = {};
+            float acc[HG][MAXL / WG] = {};
             for (int64_t i = 0; i < n; ++i) {
-                const float w = sc[i];
                 const float* cs = c + cell(i) * L;
-                for (int k = 0; k < L / WG; ++k) acc[k] += w * cs[lid + k * WG];
+                float cv[MAXL / WG];
+                for (int f = 0; f < L / WG; ++f) cv[f] = cs[lid + f * WG];
+                for (int k = 0; k < HG; ++k) {
+                    const float w = sc[k * MAXN + i];
+                    for (int f = 0; f < L / WG; ++f) acc[k][f] += w * cv[f];
+                }
             }
-            for (int k = 0; k < L / WG; ++k) u[th * L + lid + k * WG] = acc[k] / sum;
+            for (int k = 0; k < HG; ++k)
+                for (int f = 0; f < L / WG; ++f) u[(t * H + h0 + k) * L + lid + f * WG] = acc[k][f] / sum[k];
         });
     });
+}
+
+extern "C" {
+
+int ns_mla_attend_sel(ns_gpu* g, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
+                      const int32_t* sel, const int32_t* sel_cnt, int64_t K) {
+    NS_TRY
+    if (L > 512 || L % 256 != 0) return ns_fail("ns_mla_attend_sel: latent width 256 or 512");
+    if (pos0 + T > 2560 && !sel_cnt) return ns_fail("ns_mla_attend_sel: a dense row past 2,560 tokens (the indexer selects there)");
+    // NS_MLA_HG=4: 4 heads a work-group in prompt chunks (measured slower at 3K: 13.7 vs 12.1 s - occupancy)
+    static const bool hg4 = getenv("NS_MLA_HG") && getenv("NS_MLA_HG")[0] == '4';
+    if (hg4 && T > 8 && H % 4 == 0) mla_sel<4>(g->q, qa, c, u, T, H, L, pos0, scale, sel, sel_cnt, K);
+    else mla_sel<1>(g->q, qa, c, u, T, H, L, pos0, scale, sel, sel_cnt, K);
     return 0;
     NS_CATCH
 }

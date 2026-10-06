@@ -531,6 +531,49 @@ impl Ops {
         let rc = unsafe { (self.a().idx_score)(self.raw(), s.fp(), w.fp(), score.fp(), t as i64, h as i64, j0 as i64, n as i64, ld as i64, pos0 as i64) };
         self.ok(rc, "idx_score")
     }
+    /// Each row's MLA cells (idx [t][nc] int32, count n [t] int32) from a selection (None: every earlier cell)
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_cells(&self, sel: Option<(&DevBuf, &DevBuf)>, t: usize, k: usize, pos0: usize, idx: &DevBuf, n: &DevBuf, nc: usize) -> Result<()> {
+        idx.bounds(0, t * nc * 4)?;
+        n.bounds(0, t * 4)?;
+        let (sp, cp) = match sel {
+            Some((s, c)) => {
+                s.bounds(0, t * k * 4)?;
+                c.bounds(0, t * 4)?;
+                (s.ptr as *const i32, c.ptr as *const i32)
+            }
+            None => (std::ptr::null(), std::ptr::null()),
+        };
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().mla_cells)(self.raw(), sp, cp, t as i64, k as i64, pos0 as i64, idx.ptr.cast(), n.ptr.cast(), nc as i64) };
+        self.ok(rc, "mla_cells")
+    }
+    /// softmax over each of r * h rows of nc scores, row r's heads over its first n[r] (scaled), the rest 0
+    pub fn softmax_masked(&self, s: &DevBuf, r: usize, h: usize, nc: usize, n: &DevBuf, scale: f32) -> Result<()> {
+        need!(s, r * h * nc, "softmax_masked S");
+        n.bounds(0, r * 4)?;
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().softmax_masked)(self.raw(), s.fp(), r as i64, h as i64, nc as i64, n.ptr.cast(), scale) };
+        self.ok(rc, "softmax_masked")
+    }
+    /// batch products y_b [t, n] = x_b [t, k] . w_b [k, n] (offsets and strides in floats)
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batch_nn(&self, batch: usize, t: usize, n: usize, k: usize, x: (&DevBuf, usize, usize, usize), w: (&DevBuf, usize, usize, usize),
+                         y: (&DevBuf, usize, usize, usize)) -> Result<()> {
+        if batch == 0 || t == 0 || n == 0 {
+            return Ok(());
+        }
+        let last = batch - 1;
+        need!(x.0, x.1 + last * x.3 + (t - 1) * x.2 + k, "gemm_batch_nn x");
+        need!(w.0, w.1 + last * w.3 + (k - 1) * w.2 + n, "gemm_batch_nn w");
+        need!(y.0, y.1 + last * y.3 + (t - 1) * y.2 + n, "gemm_batch_nn y");
+        // SAFETY: every batch's extent checked above.
+        let rc = unsafe {
+            (self.a().gemm_batch_nn)(self.raw(), batch as i64, t as i64, n as i64, k as i64, x.0.fp().add(x.1), x.2 as i64, x.3 as i64, w.0.fp().add(w.1),
+                                     w.2 as i64, w.3 as i64, y.0.fp().add(y.1), y.2 as i64, y.3 as i64, 0)
+        };
+        self.ok(rc, "gemm_batch_nn")
+    }
     /// sel [t, k] (int32): the k highest of each score row [0, n), rows ld apart
     pub fn topk(&self, score: &DevBuf, sel: &DevBuf, t: usize, n: usize, ld: usize, k: usize) -> Result<()> {
         need!(score, (t - 1) * ld + n, "topk score");
