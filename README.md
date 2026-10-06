@@ -125,20 +125,20 @@ those swaps are still the largest share of decode time (`TODO.md`). `--gpu all` 
 ## Benchy
 
 `nextsycl bench` runs Strata's benchy v1 (its prompts as text in `bench/v1`) against the running server, and sends
-several requests at once. The first run, `docs/benchy/v1-2026-10-06.md` (B65 + B70):
+several requests at once. The latest run, `docs/benchy/v1-2026-10-06-prefetch.md` (B65 + B70, the B70 last):
 
 | Input tokens | PP (tok/s) | TTFT (s) | TG (tok/s) | Drafts accepted | Energy (J) | Avg power (W) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 31 | - | 1.3 | 17.5 | 91% | 1,422 | 161 |
-| 2,216 | 337 | 7.0 | 15.7 | 78% | 3,919 | 171 |
-| 7,975 | 334 | 24.5 | 15.3 | 77% | 6,904 | 170 |
-| 39,758 | 427 | 93.6 | 15.6 | 75% | 20,464 | 187 |
+| 31 | - | 1.3 | 18.0 | 91% | 1,431 | 166 |
+| 2,216 | 332 | 7.1 | 15.9 | 78% | 3,946 | 173 |
+| 7,975 | 314 | 26.0 | 16.1 | 77% | 6,837 | 166 |
+| 39,758 | 416 | 96.1 | 16.1 | 75% | 21,412 | 192 |
 
 | Clients at once | Tokens/s, all | Latency mean / max (s) | First token mean / max (s) |
 |---:|---:|---:|---:|
-| 1 | 16.9 | 15.1 / 15.1 | 1.1 / 1.1 |
-| 2 | 17.4 | 19.2 / 24.1 | 8.2 / 15.4 |
-| 4 | 17.3 | 25.6 / 39.3 | 16.8 / 32.1 |
+| 1 | 17.6 | 14.6 / 14.6 | 1.1 / 1.1 |
+| 2 | 18.1 | 16.3 / 23.1 | 5.7 / 10.4 |
+| 4 | 17.9 | 24.4 / 38.1 | 15.8 / 29.1 |
 
 The server runs one request at a time, so several at once share its speed (each card is ~55% busy at decode: the
 room batching would use).
