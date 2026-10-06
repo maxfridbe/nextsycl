@@ -44,26 +44,64 @@ dist/nextsycl stop
 
 `dist/nextsycl help` lists every command and setting.
 
-What `status` shows during a chat (GLM-5.3-Flash IQ2 on an Arc Pro B70 and a B65), and `ps` after it:
+What the commands show during and after a chat (GLM-5.3-Flash IQ2 on an Arc Pro B65 and an Arc Pro B70, the B70
+last):
 
 ```
 $ nextsycl status
-glm-5.3-flash-uncensored - up 15s, context 65536, MTP on, 1 request(s) served
+glm-5.3-flash-uncensored - up 1m44s, context 65536, MTP on, 2 request(s) served
 
 GPU  CARD                      VRAM USED      FREE   LAYERS EXPERTS VRAM/HOST   TEMP   VRAM   POWER
-0    Arc Pro B70        30.1GiB / 31.9GiB    1.8GiB     0-21      3447 / 2026    36C    36C     78W
-1    Arc Pro B65        30.1GiB / 31.9GiB    1.8GiB    22-44      3301 / 3474    34C    36C     86W
-                                                                       the GPUs draw 164 W
+1    Arc Pro B65        30.1GiB / 31.9GiB    1.8GiB     0-21      3784 / 2080    36C    38C     77W
+0    Arc Pro B70        30.1GiB / 31.9GiB    1.8GiB    22-44      3633 / 3496    42C    40C    105W
+                                                                       the GPUs draw 183 W
 
-request #1 (socket): generating, prompt 18 tokens, 0 reused (none), 184 / 300 generated at 16.9 tok/s, 12s, 1863 J so far
+request #2 (socket): generating, prompt 23 tokens, 0 reused (none), 166 / 400 generated at 20.5 tok/s, 9s, 1565 J so far
+prompt cache: (busy)
 
 $ nextsycl ps
 ID     VIA     STATE        PROMPT           REUSED    READ  GENERATED   TOK/S    ENERGY  AVG W FINISH       AGO
-#1     socket  done             18           0 none    1.0s        300    16.9    2994 J    160 length       27s
+#2     socket  done             23           0 none    0.8s        169    20.2    1613 J    175 stop         34s
+#1     socket  done             20           0 none    1.1s        195    19.5    1903 J    171 stop       2m08s
+
+$ nextsycl inspect 2
+{
+  "answer": {
+    "chars": 873,
+    "preview": "The sky appears blue because of a phenomenon called Rayleigh scattering. Sunlight is made up of all the colors of the visible spectrum, and as it passes through Earth's atmosphere, it collides with molecules of nitrogen and oxygen—particles much smaller than the wavelengths of visible light. Shorter..."
+  },
+  "api": "/v1/chat/completions",
+  "avg_watts": 174.8,
+  "checkpoints_saved": 0,
+  "drafts": [75, 94],
+  "ended": 1791318178,
+  "energy_j": 1613.1,
+  "finish": "stop",
+  "generate_seconds": 8.385545438,
+  "generated": 169,
+  "id": 2,
+  "last_user": "Explain in a paragraph why the sky is blue.",
+  "max_tokens": 400,
+  "messages": 1,
+  "model": "glm-5.3-flash-uncensored",
+  "prompt_chars": 43,
+  "prompt_tokens": 23,
+  "read_seconds": 0.843844816,
+  "reused": 0,
+  "settings": {"effort": "low", "max_tokens": 400, "stream": true, "temperature": 1.0, "top_p": 0.95},
+  "source": "none",
+  "started": 1791318169,
+  "state": "done",
+  "thinking": {"chars": 0, "preview": ""},
+  "tok_s": 20.153727774720338,
+  "via": "socket"
+}
 ```
 
 TEMP and VRAM are the cards' package and memory temperatures, POWER each card's draw over the last second, and
-ENERGY what both cards drew while the request ran (idle power included) - from the xe driver's sensors.
+ENERGY what both cards drew while the request ran (idle power included) - from the xe driver's sensors. `drafts` is
+MTP's accepted / proposed drafts; `reused` the prompt tokens the prompt cache or the live session already held.
+Every API answer carries the same energy as `usage.energy_wh` (here 0.448 Wh).
 
 ## Speed
 
@@ -73,7 +111,9 @@ GLM-5.3-Flash IQ2 (the ds4 file, 80 GB of experts) on an Arc Pro B70 and an Arc 
 |---|---|
 | prompt, 3K tokens | ~400 tokens/s |
 | prompt, 12K tokens | ~475 tokens/s |
-| decode, short context, MTP on | ~18.5-19.5 tokens/s (87-90% of drafts accepted) |
+| decode, short context, MTP on | ~18.5-20 tokens/s (80-90% of drafts accepted) |
+| power while decoding | ~175-185 W for both cards (~1.6-1.9 kJ for a 170-200-token answer) |
+| idle | ~9 W for both cards |
 | load | ~18 s |
 
 About 60% of the experts fit in VRAM (plus ~380 slots a GPU lent by the prompt arena while decode runs); the rest sit
