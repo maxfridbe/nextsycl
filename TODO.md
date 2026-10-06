@@ -11,26 +11,27 @@ by default (`--no-mtp` turns it off).
       rollback, exact acceptance. Greedy 13.1 -> 15.7 tok/s, 87% of drafts accepted on a code prompt; verify rows
       bit-identical to one-token decode (`nextsycl spec-check`: 0 difference over 94 rows)
 
-## Next: long context (in progress - reading the reference)
+## Long context (done 2026-10-06)
 
-Today MLA attends to every earlier token, which is exact only up to ~2,048 tokens of context.
-
-- [ ] Read the indexer's exact semantics from llama.cpp de25343 `src/models/glm5-next.cpp` (`build_kpool_select`,
-      ~line 567; `set_input_kpool` in `llama-memory-hybrid-idx.cpp`): which pools count as complete for a query,
-      the tail (`kpool_select_tail`), mask / tie handling, `indexer_index_share_mtp`, `indexer.types`
-- [ ] Indexer cache per MLA layer: per-token ik / ig of the incomplete pool, pooled keys [ctx / 4, 128]
-- [ ] Indexer scoring: iq = W_iqb . qr [32 x 128], w = W_proj . x / sqrt(128 * 32), score = sum_h relu(iq_h . pool) * w_h;
-      top 512 pools per query (as a GEMM for prefill rows - Strata's QSA block scores went GEMM tiles for the same reason)
-- [ ] Sparse MLA kernel: attend over the selected pools' tokens + the tail
-- [ ] The MTP block's attention through its own indexer too (it has the weights)
-- [ ] VRAM budget (Strata's 80K-token stall: the expert cache filled VRAM before the KV was added): reserve the latent caches (f32 [ctx, 512] per MLA layer, 11 + 1) and indexer caches before the
-      expert store takes "free less 3 GiB"; keep >= 1.5 GB free (the VRAM spill hang). Consider f16 latents.
-- [ ] Parity against llama.cpp past 2,048 tokens (a long-prompt dump), then `--ctx` 32K / 128K in serve and the mode
-- [ ] Long-prompt prefill speed (256-token chunks; the indexer GEMM)
+- [x] The DSA lightning indexer (llama.cpp de25343 `build_kpool_select` / `set_input_kpool`): pools of 4, a pool
+      visible once complete, top 512 pools per row plus the row's incomplete pool, dense below 512 pools
+- [x] Pooled keys in the pass that completes them (a 4-token ring of ik | ig per layer); scores as GEMMs; a radix
+      top-k with a scan compaction (deterministic); attention scores in local memory (<= 2,051 cells a row)
+- [x] The MTP block through its own indexer
+- [x] VRAM held for the sessions' attention caches before the expert store sizes itself
+- [x] Parity: 3,180-token prompt against llama.cpp - layer 3's attention output 0.99999 with selection active, the
+      same next token; deeper layers drift smoothly (0.98 by layer 23, no layer jumps); spec-check 0 difference
+- [x] 12,202-token prompt runs (prompt 60 tok/s, decode 12.1 tok/s - flat with context); the chat mode serves 64K
+- [ ] 128K: the latents are float32 (2 KB a token a layer; 6.5 GB for two 128K sessions) - fp16 latents first
+- [ ] Prompt speed: 67 tok/s at 3K (a 32K prompt ~9 min). Left: MLA prompt attention (12 s of 47), KDA (8 s), the
+      grouped expert kernels themselves (28 s; a tiled int8 / XMX prompt kernel is the next lever)
+- [ ] Decode past 2K: 12.1 vs 15.7 tok/s short - the indexer's per-token GEMM + the attention kernel
 
 ## Speed, later
 
-- [ ] Expert swaps: 32 ms/token with MTP (2-row passes touch more experts). Strata's answer (its 2.6 -> 40.9 tok/s on
+- [x] Prompt chunks read host-slot experts in place over PCIe (no swaps); decode still swaps (faster there: 12.5 vs
+      11.2 tok/s with NS_DECODE_DIRECT=1)
+- [ ] Expert swaps at decode: 32 ms/token with MTP (2-row passes touch more experts). Strata's answer (its 2.6 -> 40.9 tok/s on
       the B70): the GPU reads missed experts straight from pinned host memory in the expert kernel (the grouped
       kernel already takes a pointer per expert - pass the host slot's address), a share of the misses (pcie_frac
       ~0.55) and LRU admission for the rest. Pinned memory belongs to the context that allocated it: each part reads
