@@ -63,6 +63,8 @@ pub struct Api {
     pub mla_cells: unsafe extern "C" fn(Gpu, *const i32, *const i32, i64, i64, i64, *mut i32, *mut i32, i64) -> c_int,
     pub softmax_masked: unsafe extern "C" fn(Gpu, *mut f32, i64, i64, i64, *const i32, f32) -> c_int,
     pub gemm_batch_nn: unsafe extern "C" fn(Gpu, i64, i64, i64, i64, *const f32, i64, i64, *const f32, i64, i64, *mut f32, i64, i64, c_int) -> c_int,
+    #[allow(clippy::type_complexity)]
+    pub gemm_batch_h: unsafe extern "C" fn(Gpu, i64, c_int, i64, i64, i64, *const u16, i64, i64, *const u16, i64, i64, *mut f32, i64, i64, c_int) -> c_int,
     pub dequant_f16: unsafe extern "C" fn(Gpu, c_int, *const c_void, i64, *mut u16) -> c_int,
     pub to_f16: unsafe extern "C" fn(Gpu, *const f32, *mut u16, i64) -> c_int,
     pub gather_f16: unsafe extern "C" fn(Gpu, *const f32, *const i32, *mut u16, i64, i64) -> c_int,
@@ -172,6 +174,7 @@ impl Api {
             mla_cells: sym!("ns_mla_cells"),
             softmax_masked: sym!("ns_softmax_masked"),
             gemm_batch_nn: sym!("ns_gemm_batch_nn"),
+            gemm_batch_h: sym!("ns_gemm_batch_h"),
             dequant_f16: sym!("ns_dequant_f16"),
             to_f16: sym!("ns_to_f16"),
             gather_f16: sym!("ns_gather_f16"),

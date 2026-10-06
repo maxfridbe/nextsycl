@@ -1031,19 +1031,46 @@ impl<'g> Glm<'g> {
         } else {
             // prompt chunks as GEMMs, a block of rows at a time: each row's cells gathered contiguous, then per row
             // scores [heads, cells] = q~ . G^T, a masked softmax, latents [heads, 512] = P . G
-            let nc = if sel.is_some() { 4 * kp + 3 } else { pos0 + t };
+            // padded to 64 cells (masked: index 0, probability 0) - the GEMMs ran 2.4x slower over 2,051
+            let nc = if sel.is_some() { 4 * kp + 3 } else { pos0 + t }.next_multiple_of(64);
             let idx = p.arena.bytes(t * nc * 4)?;
             let cnt = p.arena.bytes(t * 4)?;
+            let c0 = self.mark(p);
             o.mla_cells(sel.as_ref().map(|(a, b)| (a, b)), t, kp, pos0, &idx, &cnt, nc)?;
-            const RB: usize = 16;
-            let gb = p.arena.f32(RB * nc * lat)?;
-            let sb = p.arena.f32(RB * nh * nc)?;
-            for r0 in (0..t).step_by(RB) {
-                let tr = RB.min(t - r0);
-                o.gather(cache, &idx.view(r0 * nc * 4, tr * nc * 4)?, &gb, tr * nc, lat)?;
-                o.gemm_batch(tr, nh, nc, lat, (&qt, r0 * nh * lat, lat, nh * lat), (&gb, 0, nc * lat), (&sb, 0, nc, nh * nc), false)?;
-                o.softmax_masked(&sb, tr, nh, nc, &cnt.view(r0 * 4, tr * 4)?, scale)?;
-                o.gemm_batch_nn(tr, nh, lat, nc, (&sb, 0, nc, nh * nc), (&gb, 0, lat, nc * lat), (&u, r0 * nh * lat, lat, nh * lat))?;
+            self.lap(p, "MLA att: cells", c0);
+            if std::env::var("NS_MLA_F16").map_or(true, |v| v != "0") {
+                // in fp16 on the XMX units: the gathered latents (a row's 2,051 cells are 4 MB in float32, read
+                // twice), the queries and the probabilities; scores and outputs in float32
+                const RB: usize = 32;
+                let gh = p.arena.bytes(RB * nc * lat * 2)?;
+                let qh = p.arena.bytes(RB * nh * lat * 2)?;
+                let sb = p.arena.f32(RB * nh * nc)?;
+                let ph = p.arena.bytes(RB * nh * nc * 2)?;
+                for r0 in (0..t).step_by(RB) {
+                    let tr = RB.min(t - r0);
+                    let a0 = self.mark(p);
+                    o.gather_f16(cache, &idx.view(r0 * nc * 4, tr * nc * 4)?, &gh, tr * nc, lat)?;
+                    o.to_f16(&qt.view(r0 * nh * lat * 4, tr * nh * lat * 4)?, &qh, tr * nh * lat)?;
+                    let a1 = self.lap(p, "MLA att: gather", a0);
+                    o.gemm_batch_h(tr, true, nh, nc, lat, (&qh, 0, lat, nh * lat), (&gh, 0, lat, nc * lat), (&sb, 0, nc, nh * nc))?;
+                    let a2 = self.lap(p, "MLA att: scores", a1);
+                    o.softmax_masked(&sb, tr, nh, nc, &cnt.view(r0 * 4, tr * 4)?, scale)?;
+                    o.to_f16(&sb, &ph, tr * nh * nc)?;
+                    let a3 = self.lap(p, "MLA att: softmax", a2);
+                    o.gemm_batch_h(tr, false, nh, lat, nc, (&ph, 0, nc, nh * nc), (&gh, 0, lat, nc * lat), (&u, r0 * nh * lat, lat, nh * lat))?;
+                    self.lap(p, "MLA att: values", a3);
+                }
+            } else {
+                const RB: usize = 16;
+                let gb = p.arena.f32(RB * nc * lat)?;
+                let sb = p.arena.f32(RB * nh * nc)?;
+                for r0 in (0..t).step_by(RB) {
+                    let tr = RB.min(t - r0);
+                    o.gather(cache, &idx.view(r0 * nc * 4, tr * nc * 4)?, &gb, tr * nc, lat)?;
+                    o.gemm_batch(tr, nh, nc, lat, (&qt, r0 * nh * lat, lat, nh * lat), (&gb, 0, nc * lat), (&sb, 0, nc, nh * nc), false)?;
+                    o.softmax_masked(&sb, tr, nh, nc, &cnt.view(r0 * 4, tr * 4)?, scale)?;
+                    o.gemm_batch_nn(tr, nh, lat, nc, (&sb, 0, nc, nh * nc), (&gb, 0, lat, nc * lat), (&u, r0 * nh * lat, lat, nh * lat))?;
+                }
             }
         }
         let t_vb = self.lap(p, "MLA: attention", t_att);

@@ -581,6 +581,26 @@ impl Ops {
         };
         self.ok(rc, "gemm_batch_nn")
     }
+    /// batch products in fp16, float32 out: y_b [t, n] = x_b [t, k] . (w_b^T with `trans_w`: w_b [n, k]; else w_b
+    /// [k, n]). x and w (buffer, offset, row stride, batch stride) in halves; y in floats.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batch_h(&self, batch: usize, trans_w: bool, t: usize, n: usize, k: usize, x: (&DevBuf, usize, usize, usize),
+                        w: (&DevBuf, usize, usize, usize), y: (&DevBuf, usize, usize, usize)) -> Result<()> {
+        if batch == 0 || t == 0 || n == 0 {
+            return Ok(());
+        }
+        let last = batch - 1;
+        let (wr, wc) = if trans_w { (n, k) } else { (k, n) };
+        x.0.bounds(0, (x.1 + last * x.3 + (t - 1) * x.2 + k) * 2)?;
+        w.0.bounds(0, (w.1 + last * w.3 + (wr - 1) * w.2 + wc) * 2)?;
+        need!(y.0, y.1 + last * y.3 + (t - 1) * y.2 + n, "gemm_batch_h y");
+        // SAFETY: every batch's extent checked above.
+        let rc = unsafe {
+            (self.a().gemm_batch_h)(self.raw(), batch as i64, trans_w as i32, t as i64, n as i64, k as i64, x.0.ptr.cast::<u16>().add(x.1), x.2 as i64,
+                                    x.3 as i64, w.0.ptr.cast::<u16>().add(w.1), w.2 as i64, w.3 as i64, y.0.fp().add(y.1), y.2 as i64, y.3 as i64, 0)
+        };
+        self.ok(rc, "gemm_batch_h")
+    }
     /// sel [t, k] (int32): the k highest of each score row [0, n), rows ld apart
     pub fn topk(&self, score: &DevBuf, sel: &DevBuf, t: usize, n: usize, ld: usize, k: usize) -> Result<()> {
         need!(score, (t - 1) * ld + n, "topk score");

@@ -260,6 +260,19 @@ int ns_gemm_batch_nn(ns_gpu* g, int64_t batch, int64_t T, int64_t N, int64_t K, 
     NS_CATCH
 }
 
+// batch products in fp16 on the XMX units, float32 out: y_b [T, N] (+)= x_b [T, K] . op(w_b), op(w) = w^T
+// ([N, K], rows ldw apart) with trans_w, else w ([K, N]); x_b = x + b * sx, and so on (strides in elements)
+int ns_gemm_batch_h(ns_gpu* g, int64_t batch, int trans_w, int64_t T, int64_t N, int64_t K, const uint16_t* x, int64_t ldx, int64_t sx,
+                    const uint16_t* w, int64_t ldw, int64_t sw, float* y, int64_t ldy, int64_t sy, int accumulate) {
+    NS_TRY
+    using oneapi::mkl::transpose;
+    oneapi::mkl::blas::row_major::gemm_batch(g->q, transpose::nontrans, trans_w ? transpose::trans : transpose::nontrans, T, N, K, 1.0f,
+                                             (const sycl::half*) x, ldx, sx, (const sycl::half*) w, ldw, sw, accumulate ? 1.0f : 0.0f, y,
+                                             ldy, sy, batch);
+    return 0;
+    NS_CATCH
+}
+
 // mHC's mixes: m [T, 24] = fn [24, n] . rms(x [T, n]) (no weight). Two passes so one token still spreads over
 // the GPU: NB work-groups per token reduce a column block each to 24 partial dots and a partial sum of squares;
 // then one work-item per (token, mix) adds the NB partials. (One work-group per token ran the whole 1.5 MB

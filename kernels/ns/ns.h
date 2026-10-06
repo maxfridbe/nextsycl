@@ -92,6 +92,8 @@ int ns_mla_cells(ns_gpu* g, const int32_t* sel, const int32_t* sel_cnt, int64_t 
 int ns_softmax_masked(ns_gpu* g, float* S, int64_t R, int64_t H, int64_t NC, const int32_t* n, float scale);
 int ns_gemm_batch_nn(ns_gpu* g, int64_t batch, int64_t T, int64_t N, int64_t K, const float* x, int64_t ldx, int64_t sx, const float* w,
                      int64_t ldw, int64_t sw, float* y, int64_t ldy, int64_t sy, int accumulate);
+int ns_gemm_batch_h(ns_gpu* g, int64_t batch, int trans_w, int64_t T, int64_t N, int64_t K, const uint16_t* x, int64_t ldx, int64_t sx,
+                    const uint16_t* w, int64_t ldw, int64_t sw, float* y, int64_t ldy, int64_t sy, int accumulate);
 int ns_mla_attend_sel(ns_gpu* g, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
                       const int32_t* sel, const int32_t* sel_cnt, int64_t K);
 int ns_scatter_add(ns_gpu* g, float* y, const float* src, const int32_t* idx, const float* w, int64_t n, int64_t C);
