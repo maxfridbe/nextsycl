@@ -70,5 +70,7 @@ Each phase ends with a parity check against the reference (cosine per tensor, th
    store: resident sets per card, a VRAM cache, pinned RAM, NVMe reads; grouped per prompt chunk.
 5. **Two cards.** Layer placement by memory plan; activations between cards through host memory.
 6. **Serve.** OpenAI-compatible server (chat template with reasoning effort), the box's model switch.
-7. **MTP** speculative decoding (the ds4 file's draft head).
+7. **MTP** speculative decoding (the ds4 file's draft head). Done 2026-10-06: one draft per cycle, 87% accepted on
+   code, 13.1 -> 15.7 tok/s greedy; verify rows bit-identical to one-token decode. Next: the swaps a 2-row pass adds
+   (32 ms/token in the profile), deeper drafts.
 8. **qwen4exp.** The Strata models through the same runtime; `--model` chooses.

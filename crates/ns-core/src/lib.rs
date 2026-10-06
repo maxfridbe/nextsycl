@@ -388,13 +388,18 @@ impl Ops {
         self.ok(rc, "hc_mean")
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn conv_silu(&self, x: &DevBuf, state: &DevBuf, w: &DevBuf, out: &DevBuf, t: usize, d: usize, k: usize) -> Result<()> {
+    /// `snap`: the state after each row but the last, [t-1][k-1][d] (rolling back a rejected draft)
+    pub fn conv_silu(&self, x: &DevBuf, state: &DevBuf, w: &DevBuf, out: &DevBuf, t: usize, d: usize, k: usize, snap: Option<&DevBuf>) -> Result<()> {
         need!(x, t * d, "conv x");
         need!(state, (k - 1) * d, "conv state");
         need!(w, d * k, "conv w");
         need!(out, t * d, "conv out");
+        if let Some(s) = snap {
+            need!(s, t.saturating_sub(1) * (k - 1) * d, "conv snapshots");
+        }
+        let sp = snap.map_or(std::ptr::null_mut(), |s| s.fp());
         // SAFETY: sizes checked.
-        let rc = unsafe { (self.a().conv_silu)(self.raw(), x.fp(), state.fp(), w.fp(), out.fp(), t as i64, d as i64, k as i32) };
+        let rc = unsafe { (self.a().conv_silu)(self.raw(), x.fp(), state.fp(), w.fp(), out.fp(), t as i64, d as i64, k as i32, sp) };
         self.ok(rc, "conv_silu")
     }
     pub fn l2_norm(&self, x: &DevBuf, rows: usize, n: usize, eps: f32) -> Result<()> {
@@ -419,12 +424,18 @@ impl Ops {
         self.ok(rc, "sigmoid")
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn kda_scan(&self, q: &DevBuf, k: &DevBuf, v: &DevBuf, g: &DevBuf, beta: &DevBuf, s: &DevBuf, o: &DevBuf, t: usize, h: usize, d: usize) -> Result<()> {
+    /// `snap`: the state after each row but the last, [t-1][h][d][d] (rolling back a rejected draft)
+    pub fn kda_scan(&self, q: &DevBuf, k: &DevBuf, v: &DevBuf, g: &DevBuf, beta: &DevBuf, s: &DevBuf, o: &DevBuf, t: usize, h: usize, d: usize,
+                    snap: Option<&DevBuf>) -> Result<()> {
         for (b, n, what) in [(q, t * h * d, "q"), (k, t * h * d, "k"), (v, t * h * d, "v"), (g, t * h * d, "g"), (beta, t * h, "beta"), (s, h * d * d, "S"), (o, t * h * d, "o")] {
             need!(b, n, format!("kda_scan {what}"));
         }
+        if let Some(sn) = snap {
+            need!(sn, t.saturating_sub(1) * h * d * d, "kda_scan snapshots");
+        }
+        let sp = snap.map_or(std::ptr::null_mut(), |s| s.fp());
         // SAFETY: sizes checked.
-        let rc = unsafe { (self.a().kda_scan)(self.raw(), q.fp(), k.fp(), v.fp(), g.fp(), beta.fp(), s.fp(), o.fp(), t as i64, h as i64, d as i64) };
+        let rc = unsafe { (self.a().kda_scan)(self.raw(), q.fp(), k.fp(), v.fp(), g.fp(), beta.fp(), s.fp(), o.fp(), t as i64, h as i64, d as i64, sp) };
         self.ok(rc, "kda_scan")
     }
     #[allow(clippy::too_many_arguments)]

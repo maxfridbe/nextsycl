@@ -26,9 +26,12 @@ const USAGE: &str = "usage:
   nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
                     [--expert-gib G]   VRAM for routed experts (default: what is free less 3 GiB)
                     [--mirror-gib G]   pinned host memory mirroring experts (default: available less 10 GiB)
+                    [--no-mtp]         decode without the MTP draft block (drafts are on when the file has one)
   nextsycl kernels <model.gguf> [--gpu N]   each weight type's decode kernel against the exact path
+  nextsycl spec-check <model.gguf> --prompt TEXT [--n N] [--gpu 0,1]
+                                verify passes (2 rows, then a rollback to 1) against one-token decode, logits compared
   nextsycl serve <model.gguf> [--gpu 0,1] [--host 0.0.0.0] [--port 8085] [--name ID] [--ctx 8192] [--effort low]
-                 [--expert-gib G] [--mirror-gib G]   the OpenAI-compatible server";
+                 [--expert-gib G] [--mirror-gib G] [--no-mtp]   the OpenAI-compatible server";
 
 fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
@@ -203,7 +206,7 @@ fn check(model: &Path, dump: &Path, gpu: usize) -> Result<(), String> {
     let g = ns_core::Gpu::open(gpu).map_err(e)?;
     println!("gpu      : {} ({})", g.name, g.index);
     let mut log = |l: String| println!("load     : {l}");
-    let glm = ns_engine::glm5next::Glm::load(&f, std::slice::from_ref(&g), None, Some(0), &mut log).map_err(e)?;
+    let glm = ns_engine::glm5next::Glm::load(&f, std::slice::from_ref(&g), None, Some(0), false, &mut log).map_err(e)?;
     println!("load     : {:.2} GiB in {:.1} s", gib(glm.load_bytes), glm.load_seconds);
     println!("prompt   : {} tokens {:?}", tokens.len(), tokens);
     println!("{:<26} {:>10} {:>10} {:>10}", "tensor", "cosine", "rel err", "max diff");
@@ -324,37 +327,40 @@ fn generate(args: &[String]) -> Result<(), String> {
     let expert_gib: Option<f64> = opt("--expert-gib").and_then(|v| v.parse().ok());
     let mirror_gib: Option<f64> = opt("--mirror-gib").and_then(|v| v.parse().ok());
     let mut log = |l: String| eprintln!("[{l}]");
+    let mtp = !args.iter().any(|a| a == "--no-mtp");
     let glm = ns_engine::glm5next::Glm::load(&f, &gs, expert_gib.map(|x| (x * (1u64 << 30) as f64) as usize),
-                                                 mirror_gib.map(|x| (x * (1u64 << 30) as f64) as usize), &mut log).map_err(e)?;
+                                                 mirror_gib.map(|x| (x * (1u64 << 30) as f64) as usize), mtp, &mut log).map_err(e)?;
     eprintln!("[{} on {}, {} prompt tokens, loaded in {:.1} s]", f.meta("general.name").and_then(|v| v.as_str()).unwrap_or("?"),
               gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), ids.len(), glm.load_seconds);
     let mut sess = glm.session(ids.len() + max + 1).map_err(e)?;
     let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
     let t0 = std::time::Instant::now();
-    let mut logits = glm.feed(&mut sess, &ids, &mut none).map_err(e)?;
+    let logits = glm.feed(&mut sess, &ids, &mut none).map_err(e)?;
     let prefill = t0.elapsed().as_secs_f64();
     let mut rng = Rng(0x9E3779B97F4A7C15);
+    let mut draw = |l: &[f32]| sample(l, temp, top_p, &mut rng);
+    let mut dec = glm.decoder(logits, mtp);
     let mut pending: Vec<u8> = Vec::new();
     let mut out = std::io::stdout();
     print!("<think>");
     let t1 = std::time::Instant::now();
     let mut n = 0;
-    for _ in 0..max {
-        let next = sample(&logits, temp, top_p, &mut rng);
-        if tok.stop.contains(&next) {
-            break;
+    'gen: while n < max {
+        for next in glm.step(&mut sess, &mut dec, &mut draw, &mut none).map_err(e)? {
+            if tok.stop.contains(&next) || n >= max {
+                break 'gen;
+            }
+            n += 1;
+            pending.extend(tok.decode_bytes(&[next]));
+            // print what is valid UTF-8 so far; keep a cut character for the next token
+            let valid = match std::str::from_utf8(&pending) {
+                Ok(s) => s.len(),
+                Err(err) => err.valid_up_to(),
+            };
+            print!("{}", String::from_utf8_lossy(&pending[..valid]));
+            pending.drain(..valid);
+            let _ = out.flush();
         }
-        n += 1;
-        pending.extend(tok.decode_bytes(&[next]));
-        // print what is valid UTF-8 so far; keep a cut character for the next token
-        let valid = match std::str::from_utf8(&pending) {
-            Ok(s) => s.len(),
-            Err(err) => err.valid_up_to(),
-        };
-        print!("{}", String::from_utf8_lossy(&pending[..valid]));
-        pending.drain(..valid);
-        let _ = out.flush();
-        logits = glm.forward(&mut sess, &[next], &mut none).map_err(e)?;
     }
     println!("{}", String::from_utf8_lossy(&pending));
     let dt = t1.elapsed().as_secs_f64();
@@ -362,8 +368,8 @@ fn generate(args: &[String]) -> Result<(), String> {
         eprintln!("[profile {name:<34} {secs:>7.2} s  {calls:>6} calls  {:>8.2} ms/token]", secs * 1000.0 / (n + 1) as f64);
     }
     let (hits, misses, mirrored) = glm.expert_stats();
-    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); experts: {hits} hits, {misses} misses ({:.0}% hit), {mirrored} of the misses from the mirror]",
-              ids.len(), ids.len() as f64 / prefill, n as f64 / dt.max(1e-9), 100.0 * hits as f64 / (hits + misses).max(1) as f64);
+    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); drafts {} of {} accepted; experts: {hits} hits, {misses} misses ({:.0}% hit), {mirrored} of the misses from the mirror]",
+              ids.len(), ids.len() as f64 / prefill, n as f64 / dt.max(1e-9), dec.accepted, dec.drafted, 100.0 * hits as f64 / (hits + misses).max(1) as f64);
     Ok(())
 }
 
@@ -434,6 +440,92 @@ fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// `nextsycl spec-check`: greedy decode one token at a time (the reference), then the same tokens as 2-row verify
+/// passes each rolled back to its first row; every row's logits against the reference's at that position.
+fn spec_check(args: &[String]) -> Result<(), String> {
+    let e = |x: ns_core::Error| x.0;
+    let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+    let model = args.get(1).ok_or("spec-check <model.gguf> --prompt ...")?;
+    let prompt = opt("--prompt").ok_or("--prompt TEXT")?;
+    let n: usize = opt("--n").and_then(|v| v.parse().ok()).unwrap_or(32);
+    let gpus: Vec<usize> = opt("--gpu").unwrap_or_else(|| "0,1".into()).split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}"))).collect::<Result<_, _>>()?;
+    let f = Gguf::open(Path::new(model)).map_err(|e| e.0)?;
+    let tok = ns_tok::Tokenizer::from_gguf(&f)?;
+    let ids = tok.encode(&ns_tok::glm_chat(&[ns_tok::Message { role: "user", content: &prompt, reasoning: None }], ns_tok::Effort::Low));
+    let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
+    let mut log = |l: String| eprintln!("[{l}]");
+    let glm = ns_engine::glm5next::Glm::load(&f, &gs, None, None, true, &mut log).map_err(e)?;
+    let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
+    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
+    // the margin between the best two logits
+    let margin = |v: &[f32]| {
+        let mut s: Vec<f32> = v.to_vec();
+        s.sort_by(|a, b| b.total_cmp(a));
+        s[0] - s[1]
+    };
+    let mut a = glm.session(ids.len() + n + 4).map_err(e)?;
+    let mut la = glm.feed(&mut a, &ids, &mut none).map_err(e)?;
+    let mut toks = Vec::new();
+    let mut refs = Vec::new(); // refs[i]: the logits after toks[i]
+    for _ in 0..n {
+        let t = argmax(&la) as u32;
+        toks.push(t);
+        la = glm.forward(&mut a, &[t], &mut none).map_err(e)?;
+        refs.push(la.clone());
+    }
+    let mut b = glm.session(ids.len() + n + 4).map_err(e)?;
+    glm.feed(&mut b, &ids, &mut none).map_err(e)?;
+    if args.iter().any(|a| a == "--layers") {
+        // the first verify pass's row 0 against a one-token pass from the same state, step by step
+        let mut c = glm.session(ids.len() + n + 4).map_err(e)?;
+        glm.copy_session(&mut c, &b).map_err(e)?;
+        let mut one: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut keep = |name: &str, x: &ns_core::DevBuf| -> ns_core::Result<()> {
+            one.push((name.to_string(), x.to_f32()?));
+            Ok(())
+        };
+        glm.forward(&mut c, &[toks[0]], &mut keep).map_err(e)?;
+        let mut two: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut keep2 = |name: &str, x: &ns_core::DevBuf| -> ns_core::Result<()> {
+            two.push((name.to_string(), x.to_f32()?));
+            Ok(())
+        };
+        let mut d = glm.session(ids.len() + n + 4).map_err(e)?;
+        glm.copy_session(&mut d, &b).map_err(e)?;
+        glm.forward_rows(&mut d, &[toks[0], toks[1]], 1, &mut keep2).map_err(e)?;
+        for ((na, va), (_, vb)) in one.iter().zip(&two) {
+            // row 0 of the 2-row tensor: its first len/1 values (rows are outermost)
+            let w = va.len();
+            if na.starts_with("result") || vb.len() < w {
+                continue;
+            }
+            let rb = &vb[..w];
+            let dd = va.iter().zip(rb).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            let mx = va.iter().map(|x| x.abs()).fold(0f32, f32::max).max(1e-20);
+            println!("{na:<24} {:.3e}", dd / mx);
+        }
+        return Ok(());
+    }
+    println!("{:>4} {:>4} {:>12} {:>10} {:>6} {:>8}", "pos", "row", "max |diff|", "max |ref|", "top1", "margin");
+    let (mut worst, mut flips) = (0f32, 0);
+    for i in 0..n - 1 {
+        let rows = glm.forward_rows(&mut b, &[toks[i], toks[i + 1]], 2, &mut none).map_err(e)?;
+        for (r, (got, want)) in rows.iter().zip([&refs[i], &refs[i + 1]]).enumerate() {
+            let d = got.iter().zip(want.iter()).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            let mx = want.iter().map(|x| x.abs()).fold(0f32, f32::max);
+            let same = argmax(got) == argmax(want);
+            worst = worst.max(d / mx);
+            flips += usize::from(!same);
+            if i < 4 || !same || i % 8 == 0 {
+                println!("{:>4} {:>4} {:>12.5} {:>10.3} {:>6} {:>8.4}", i, r, d, mx, if same { "same" } else { "FLIP" }, margin(want));
+            }
+        }
+        glm.rollback(&mut b, 1).map_err(e)?;
+    }
+    println!("worst max|diff| / max|ref| {worst:.2e}; top-1 differs in {flips} of {} rows", 2 * (n - 1));
+    Ok(())
+}
+
 /// `nextsycl serve`: load, then answer on HTTP (serve.rs).
 fn serve_cmd(args: &[String]) -> Result<(), String> {
     let e = |x: ns_core::Error| x.0;
@@ -450,7 +542,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let tok = ns_tok::Tokenizer::from_gguf(f)?;
     let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let mut log = |l: String| eprintln!("[{l}]");
-    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), gib_opt("--mirror-gib"), &mut log).map_err(e)?;
+    let mtp = !args.iter().any(|a| a == "--no-mtp");
+    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), gib_opt("--mirror-gib"), mtp, &mut log).map_err(e)?;
     eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds);
     let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort)?);
     srv.run(&addr)
@@ -464,6 +557,7 @@ fn main() -> ExitCode {
         Some("tokenize") if args.len() == 3 => tokenize(Path::new(&args[1]), &args[2]),
         Some("generate") => generate(&args),
         Some("serve") => serve_cmd(&args),
+        Some("spec-check") => spec_check(&args),
         Some("kernels") if args.len() >= 2 => {
             let gpu = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0);
             kernels(Path::new(&args[1]), gpu)

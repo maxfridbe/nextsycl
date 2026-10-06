@@ -65,12 +65,13 @@ int ns_hc_pre(ns_gpu* g, const float* m, const float* scale, const float* base, 
 int ns_hc_post(ns_gpu* g, const float* y, const float* X, const float* post, const float* comb, float* Xo, int64_t T, int64_t C);
 int ns_hc_mean(ns_gpu* g, const float* X, float* y, int64_t T, int64_t C);
 /* KDA */
-int ns_conv_silu(ns_gpu* g, const float* x, float* state, const float* w, float* out, int64_t T, int64_t D, int k);
+/* snap (nullable): the state after each row but the last, [T-1][k-1][D] (conv) / [T-1][H][d][d] (scan) - speculative rollback */
+int ns_conv_silu(ns_gpu* g, const float* x, float* state, const float* w, float* out, int64_t T, int64_t D, int k, float* snap);
 int ns_l2_norm(ns_gpu* g, float* x, int64_t rows, int64_t n, float eps);
 int ns_kda_gate(ns_gpu* g, float* gate, const float* dt_bias, const float* A, int64_t T, int64_t H, int64_t dh, float low);
 int ns_sigmoid(ns_gpu* g, float* x, int64_t n);
 int ns_kda_scan(ns_gpu* g, const float* q, const float* k, const float* v, const float* gate, const float* beta, float* S, float* o,
-                int64_t T, int64_t H, int64_t d);
+                int64_t T, int64_t H, int64_t d, float* snap);
 int ns_kda_out(ns_gpu* g, const float* o, const float* gate, const float* w, float* y, int64_t T, int64_t H, int64_t d, float eps);
 /* FFN, MLA, experts */
 int ns_swiglu_clamp(ns_gpu* g, const float* gate, const float* up, float* out, int64_t n, float limit);

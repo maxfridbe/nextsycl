@@ -99,6 +99,23 @@ swiglu10(g, u) = silu(min(g, 10)) * clamp(u, -10, 10)
 
 ## MTP (the ds4 file's block 45)
 
-`eh_proj [4096, 8192]` over `concat(enorm * rms(embed(next token)), hnorm * rms(h))`, then one MLA + MoE block,
-`shared_head_norm`, the shared output head. (llama.cpp loads it but has no graph for it yet; to be checked
-against ds4 when MTP is implemented.)
+Read from antirez's ds4 (`glm_graph_mtp_step`, `ds4_session_glm_spec_cycle_impl` in `ds4.c`), the reference for the
+ds4 file. A plain pre-norm block - no hyper-connections - fed with position p's final hidden state and the token at
+p + 1, predicting the token at p + 2:
+
+```text
+h     = mean_s X[s]                                     the trunk's last streams (weights 1/4), before output_norm
+cur   = eh_proj . concat(enorm * rms(embed(token[p+1])), hnorm * rms(h))      eh_proj [4096, 8192]
+cur  += MLA(rms(cur) * attn_norm)                       its own latent cache (slot p), no rotary embedding
+cur  += MoE(rms(cur) * ffn_norm)                        router + 288 experts + shared expert, as the trunk's
+draft = argmax(output . (rms(cur) * shared_head_norm))  the shared output head
+```
+
+ds4 attends only over the slots written since decoding began; nextsycl also runs the block over the prompt (batched,
+one chunk behind), so its cache covers the conversation. Indexer selection for the block's attention past ~2,048
+tokens comes with the trunk's.
+
+Verification: `[token, draft]` in one 2-row pass; the token drawn for row 0 is compared with the draft (accepted only
+when equal - exact sampling for a point-mass proposal); on a reject the KDA states go back to their snapshot after
+row 0. Decode-width products run row by row (oneMKL's GEMM picks its kernel by row count), so a verify pass's rows
+are bit-identical to one-token passes: greedy output with MTP equals greedy output without (`nextsycl spec-check`).

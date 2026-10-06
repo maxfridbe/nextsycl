@@ -386,26 +386,26 @@ int ns_hc_mean(ns_gpu* g, const float* X, float* y, int64_t T, int64_t C) {
 
 // KDA's short convolution, then silu: x [T, D] (this ubatch's projections), state [k-1, D] (the previous tokens'
 // projections, oldest first; updated in place to the last k-1 inputs), w [D, k]; out [T, D]
-int ns_conv_silu(ns_gpu* g, const float* x, float* state, const float* w, float* out, int64_t T, int64_t D, int k) {
+// causal depthwise conv over T rows + the k-1 earlier inputs in `state`, then SiLU; state becomes the last k-1
+// inputs. snap (nullable): [T-1][k-1][D], the state as it is after each row but the last (speculative rollback)
+int ns_conv_silu(ns_gpu* g, const float* x, float* state, const float* w, float* out, int64_t T, int64_t D, int k, float* snap) {
     NS_TRY
     auto& q = g->q;
     q.parallel_for(sycl::range<1>(D), [=](sycl::id<1> id) {
         const int64_t c = id[0];
+        // input src (relative to row 0): x for src >= 0, the earlier inputs in state before
+        auto in = [&](int64_t src) { return src >= 0 ? x[src * D + c] : state[(k - 1 + src) * D + c]; };
         for (int64_t t = 0; t < T; ++t) {
             float s = 0.f;
-            for (int j = 0; j < k; ++j) {   // inputs t-k+1 .. t, weight j for input t-k+1+j
-                const int64_t src = t - (k - 1) + j;
-                const float v = src >= 0 ? x[src * D + c] : state[(k - 1 + src) * D + c];
-                s += v * w[c * k + j];
-            }
+            for (int j = 0; j < k; ++j) s += in(t - (k - 1) + j) * w[c * k + j];   // inputs t-k+1 .. t
             out[t * D + c] = s / (1.f + sycl::exp(-s));
         }
+        if (snap)
+            for (int64_t r = 0; r + 1 < T; ++r)
+                for (int j = 0; j < k - 1; ++j) snap[(r * (k - 1) + j) * D + c] = in(r + 1 - (k - 1) + j);
         // the new state: the last k-1 inputs
         float last[8];
-        for (int j = 0; j < k - 1; ++j) {
-            const int64_t src = T - (k - 1) + j;
-            last[j] = src >= 0 ? x[src * D + c] : state[(k - 1 + src) * D + c];
-        }
+        for (int j = 0; j < k - 1; ++j) last[j] = in(T - (k - 1) + j);
         for (int j = 0; j < k - 1; ++j) state[j * D + c] = last[j];
     });
     return 0;
@@ -451,7 +451,7 @@ int ns_sigmoid(ns_gpu* g, float* x, int64_t n) {
 // The KDA recurrence (the fused op of docs/glm5next.md), tokens in order. q, k, v, gate [T, H, d]; beta [T, H];
 // S [H, d key, d value], updated; o [T, H, d]. One work-group per head, a work-item per value column.
 int ns_kda_scan(ns_gpu* g, const float* qv, const float* kv, const float* vv, const float* gate, const float* beta, float* S, float* o,
-                int64_t T, int64_t H, int64_t d) {
+                int64_t T, int64_t H, int64_t d, float* snap) {
     NS_TRY
     if (d != 128) return ns_fail("ns_kda_scan: head size 128 only");
     g->q.submit([&](sycl::handler& h) {
@@ -475,6 +475,10 @@ int ns_kda_scan(ns_gpu* g, const float* qv, const float* kv, const float* vv, co
                 float out = 0.f;
                 for (int i = 0; i < 128; ++i) { col[i] += lk[i] * delta; out += col[i] * lq[i]; }
                 o[base + j] = out * scale;
+                if (snap && t + 1 < T) {
+                    float* Sn = snap + (t * H + hd) * 128 * 128;
+                    for (int i = 0; i < 128; ++i) Sn[i * 128 + j] = col[i];
+                }
                 sycl::group_barrier(it.get_group());
             }
             for (int i = 0; i < 128; ++i) Sh[i * 128 + j] = col[i];

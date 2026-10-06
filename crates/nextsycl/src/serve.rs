@@ -190,7 +190,7 @@ impl Server {
             self.glm.reset_session(&mut st.work).map_err(|e| e.0)?;
             0
         };
-        let mut logits = self.glm.feed(&mut st.work, &ids[from..], &mut none).map_err(|e| e.0)?;
+        let logits = self.glm.feed(&mut st.work, &ids[from..], &mut none).map_err(|e| e.0)?;
         self.glm.copy_session(&mut st.snap, &st.work).map_err(|e| e.0)?;
         st.snap_tokens = ids.clone();
         let prefill = t0.elapsed().as_secs_f64();
@@ -212,8 +212,15 @@ impl Server {
         let mut n = 0;
         let mut finish = "length";
         let t1 = Instant::now();
-        for _ in 0..max {
-            let next = sample(&logits, temp, top_p, &mut st.rng);
+        let mut dec = self.glm.decoder(logits, true);
+        let mut out: std::collections::VecDeque<u32> = Default::default();
+        while n < max {
+            if out.is_empty() {
+                let rng = &mut st.rng;
+                let mut draw = |l: &[f32]| sample(l, temp, top_p, rng);
+                out.extend(self.glm.step(&mut st.work, &mut dec, &mut draw, &mut none).map_err(|e| e.0)?);
+            }
+            let next = out.pop_front().unwrap_or_default();
             if self.tok.stop.contains(&next) {
                 finish = "stop";
                 break;
@@ -256,11 +263,10 @@ impl Server {
                     break;
                 }
             }
-            logits = self.glm.forward(&mut st.work, &[next], &mut none).map_err(|e| e.0)?;
         }
         let dt = t1.elapsed().as_secs_f64();
-        eprintln!("[request: {} prompt tokens ({} reused, {} fed in {prefill:.1} s), {n} generated in {dt:.1} s ({:.2} tok/s), {finish}]",
-                  ids.len(), from, ids.len() - from, n as f64 / dt.max(1e-9));
+        eprintln!("[request: {} prompt tokens ({} reused, {} fed in {prefill:.1} s), {n} generated in {dt:.1} s ({:.2} tok/s), drafts {}/{} accepted, {finish}]",
+                  ids.len(), from, ids.len() - from, n as f64 / dt.max(1e-9), dec.accepted, dec.drafted);
         let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": n, "total_tokens": ids.len() + n});
         let finish = if finish == "client gone" { "stop" } else { finish };
         if stream {
