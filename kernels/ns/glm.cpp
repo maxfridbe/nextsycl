@@ -420,6 +420,118 @@ int ns_hc_pre(ns_gpu* g, const float* m, const float* scale, const float* base, 
     NS_CATCH
 }
 
+// Decode widths (T <= 8): ns_hc_mix + ns_hc_pre + ns_rms_norm of one token in one work-group - five launches in
+// a row cost ~0.15 ms a call for a few microseconds of work. m = fn . rms(x), then pre / post / comb (as ns_hc_pre),
+// h = sum_i pre_i X_i, normed = rms_norm(h) * w.
+int ns_hc_pre_fused(ns_gpu* g, const float* x, const float* fn, const float* scale, const float* base, const float* nw, float* h,
+                    float* post, float* comb, float* pre, float* normed, float* part, int64_t T, int64_t C, float eps, float hc_eps, int iters) {
+    NS_TRY
+    constexpr int WG = 512, M = 24, NB = 32, WA = 256;
+    const int64_t n = 4 * C;
+    const float heps = hc_eps;
+    // 1. the 24 dots and the sum of squares, NB blocks of columns a token (ns_hc_mix's first pass)
+    const int64_t chunk = (n + NB - 1) / NB;
+    // the 25 sums: across each sub-group by shuffles, then the sub-groups' through local memory - one barrier (25
+    // work-group reductions in a row, a barrier each, took most of this kernel's ~20 us)
+    constexpr int SGN = WA / 16;
+    g->q.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(SGN * (M + 1)), hd);
+        hd.parallel_for(sycl::nd_range<1>(T * NB * WA, WA), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int64_t grp = it.get_group(0), t = grp / NB, b = grp % NB;
+            const float* xr = x + t * n;
+            const int lid = it.get_local_id(0);
+            const auto sg = it.get_sub_group();
+            const int sgi = sg.get_group_id()[0], ln = sg.get_local_id()[0];
+            const int64_t c0 = b * chunk, c1 = sycl::min(n, c0 + chunk);
+            float ss = 0.f, acc[M];
+            for (int o = 0; o < M; ++o) acc[o] = 0.f;
+            for (int64_t c = c0 + lid; c < c1; c += WA) {
+                const float v = xr[c];
+                ss += v * v;
+                for (int o = 0; o < M; ++o) acc[o] += fn[o * n + c] * v;
+            }
+            for (int o = 0; o < M; ++o) {
+                const float r = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+                if (ln == 0) red[sgi * (M + 1) + o] = r;
+            }
+            const float r = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+            if (ln == 0) red[sgi * (M + 1) + M] = r;
+            sycl::group_barrier(it.get_group());
+            if (lid <= M) {
+                float v = 0.f;
+                for (int k = 0; k < SGN; ++k) v += red[k * (M + 1) + lid];
+                part[grp * (M + 1) + lid] = v;
+            }
+        });
+    });
+    // 2. per token: the mixes, pre / post / comb, h, rms_norm(h). The 4 x 4 Sinkhorn on the first sub-group, a lane
+    // per entry c[d + 4 src] (one work-item doing it all took ~60 us: its divisions in a row): a row's sums over
+    // dst are the xor-1/2 shuffles, a column's over src the xor-4/8 ones.
+    g->q.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<float, 1> pw(sycl::range<1>(4), hd);
+        hd.parallel_for(sycl::nd_range<1>(T * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int64_t t = it.get_group(0);
+            const int lid = it.get_local_id(0);
+            const float* xr = x + t * n;
+            if (lid < 16) {
+                const auto sg = it.get_sub_group();
+                const int ln = lid;   // entry d + 4 src
+                auto mix = [&](int o) {
+                    float v = 0.f;
+                    for (int b = 0; b < NB; ++b) v += part[(t * NB + b) * (M + 1) + o];
+                    return v;
+                };
+                float ss = 0.f;
+                for (int b = 0; b < NB; ++b) ss += part[(t * NB + b) * (M + 1) + M];
+                const float inv = 1.f / sycl::sqrt(ss / (float) n + eps);
+                const float e = heps;
+                if (ln < 4) {
+                    const float pv = 1.f / (1.f + sycl::exp(-(mix(ln) * inv * scale[0] + base[ln]))) + e;
+                    pre[t * 4 + ln] = pv;
+                    pw[ln] = pv;
+                } else if (ln < 8) {
+                    post[t * 4 + ln - 4] = 2.f / (1.f + sycl::exp(-(mix(ln) * inv * scale[1] + base[ln])));
+                }
+                float c = mix(8 + ln) * inv * scale[2] + base[8 + ln];
+                auto row = [&](float v, bool mx) {   // over the 4 dst of this src (lanes 4 src .. 4 src + 3)
+                    for (int k = 1; k < 4; k <<= 1) {
+                        const float o = sycl::permute_group_by_xor(sg, v, k);
+                        v = mx ? sycl::fmax(v, o) : v + o;
+                    }
+                    return v;
+                };
+                auto col = [&](float v) {            // over the 4 src of this dst (lanes d, d + 4, d + 8, d + 12)
+                    for (int k = 4; k < 16; k <<= 1) v += sycl::permute_group_by_xor(sg, v, k);
+                    return v;
+                };
+                // softmax over dst for each src, then + eps
+                const float mx = row(c, true);
+                c = sycl::exp(c - mx);
+                c = c / row(c, false) + e;
+                c /= e + col(c);                     // norm_cols
+                for (int k = 1; k < iters; ++k) {
+                    c /= e + row(c, false);          // norm_rows
+                    c /= e + col(c);                 // norm_cols
+                }
+                comb[t * 16 + ln] = c;
+            }
+            sycl::group_barrier(it.get_group());
+            float s2 = 0.f;
+            for (int64_t k = lid; k < C; k += WG) {
+                float v = 0.f;
+                for (int i = 0; i < 4; ++i) v += pw[i] * xr[i * C + k];
+                h[t * C + k] = v;
+                s2 += v * v;
+            }
+            s2 = sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>());
+            const float inv2 = 1.f / sycl::sqrt(s2 / (float) C + eps);
+            for (int64_t k = lid; k < C; k += WG) normed[t * C + k] = h[t * C + k] * inv2 * nw[k];
+        });
+    });
+    return 0;
+    NS_CATCH
+}
+
 // mHC, after a half: Xo[t][d] = post[t][d] * y[t] + sum_s comb[t][d + 4 s] * X[t][s]   (Xo may not be X)
 int ns_hc_post(ns_gpu* g, const float* y, const float* X, const float* post, const float* comb, float* Xo, int64_t T, int64_t C) {
     NS_TRY

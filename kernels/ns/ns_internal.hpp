@@ -2,6 +2,7 @@
 #pragma once
 #include <sycl/sycl.hpp>
 #include <array>
+#include <vector>
 #include <string>
 
 struct ns_gpu {
@@ -9,7 +10,8 @@ struct ns_gpu {
     sycl::context ctx;   // this GPU alone (see ns.h)
     sycl::queue q;
     sycl::queue cq;      // copies that overlap q's work (ns_stream_copy); ordered against q on the device only
-    std::array<sycl::event, 256> ev{};   // tickets (ns_mark, ns_stream_copy), ticket % 256
+    sycl::queue cq2;     // a second copy lane: the other PCIe direction runs beside the first
+    std::vector<sycl::event> ev = std::vector<sycl::event>(1 << 16);   // tickets (ns_mark, ns_stream_copy, ns_stamp), % size
     int64_t next_ev = 0;
 };
 

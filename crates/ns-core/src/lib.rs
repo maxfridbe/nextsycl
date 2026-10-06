@@ -64,7 +64,19 @@ pub struct Gpu {
     raw: ns_sys::Gpu,
     pub index: usize,
     pub name: String,
+    /// pinned host memory the small uploads go through without waiting (`DevBuf::write_async`)
+    up: std::sync::Mutex<Upload>,
 }
+
+/// A ring of pinned host memory: bytes written at `off`, copied to the GPU in queue order
+struct Upload {
+    ptr: *mut u8,
+    len: usize,
+    off: usize,
+}
+
+/// The upload ring's size: a pass's small uploads (routing tables, counts) fit many times over
+const UPLOAD_BYTES: usize = 16 << 20;
 
 // SAFETY: the library's GPU handle is a queue and a context; SYCL queues are thread-safe.
 unsafe impl Send for Gpu {}
@@ -72,8 +84,16 @@ unsafe impl Sync for Gpu {}
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        // SAFETY: the handle came from gpu_open; buffers keep an Arc<Gpu>, so none outlives it.
-        unsafe { (self.api.gpu_close)(self.raw) }
+        // SAFETY: the handle came from gpu_open; buffers keep an Arc<Gpu>, so none outlives it. The upload ring
+        // was pinned by this context; the close waits for the queue first, so freeing it after is safe.
+        unsafe {
+            let up = self.up.get_mut().map_or(std::ptr::null_mut(), |u| u.ptr);
+            let _ = (self.api.sync)(self.raw);
+            if !up.is_null() {
+                (self.api.free_host)(self.raw, up.cast());
+            }
+            (self.api.gpu_close)(self.raw)
+        }
     }
 }
 
@@ -84,7 +104,10 @@ impl Gpu {
         let mut raw: ns_sys::Gpu = std::ptr::null_mut();
         // SAFETY: an out-pointer to a local.
         check(api, unsafe { (api.gpu_open)(index as i32, &mut raw) }, &format!("opening GPU {index}"))?;
-        Ok(Arc::new(Gpu { api, raw, index, name }))
+        let mut up = std::ptr::null_mut();
+        // SAFETY: an out-pointer to a local; the handle is live.
+        check(api, unsafe { (api.alloc_host)(raw, UPLOAD_BYTES, &mut up) }, "pinning the upload ring")?;
+        Ok(Arc::new(Gpu { api, raw, index, name, up: std::sync::Mutex::new(Upload { ptr: up.cast(), len: UPLOAD_BYTES, off: 0 }) }))
     }
 
     /// The queue, for the imported kernels' `void* stream`.
@@ -149,6 +172,32 @@ impl DevBuf {
         // SAFETY: in bounds (checked); synced before `src` can go.
         check(g.api, unsafe { (g.api.copy_to)(g.raw, self.ptr.cast::<u8>().add(at).cast(), src.as_ptr().cast(), src.len()) }, "copying to the GPU")?;
         g.sync()
+    }
+    /// Host bytes into `[at, at + src.len())` without waiting: staged in the GPU's pinned upload ring, copied in
+    /// queue order (the kernels after it see them). A wrap of the ring waits for the copies out of it so far; bytes
+    /// past a quarter of it take `write`, and so does a buffer that owns its memory (it could be freed, the copy
+    /// still queued: views of an arena are what this is for).
+    pub fn write_async(&self, at: usize, src: &[u8]) -> Result<()> {
+        self.bounds(at, src.len())?;
+        let g = &self.gpu;
+        let mut u = g.up.lock().unwrap();
+        if src.len() > u.len / 4 || self.owned {
+            drop(u);
+            return self.write(at, src);
+        }
+        if u.off + src.len() > u.len {
+            g.sync()?;
+            u.off = 0;
+        }
+        // SAFETY: [off, off + len) inside the ring (checked above); no queued copy reads it (the ring wrapped past
+        // it only after a sync); the destination is in bounds (checked).
+        unsafe {
+            let p = u.ptr.add(u.off);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), p, src.len());
+            check(g.api, (g.api.copy_to)(g.raw, self.ptr.cast::<u8>().add(at).cast(), p.cast(), src.len()), "copying to the GPU")?;
+        }
+        u.off = (u.off + src.len()).next_multiple_of(64);
+        Ok(())
     }
     /// `[at, at + dst.len())` into host memory, waiting.
     pub fn read(&self, at: usize, dst: &mut [u8]) -> Result<()> {
@@ -313,15 +362,38 @@ impl Ops {
     /// n bytes of src (from src_at) into dst (from at) on the GPU's copy queue, beside its work, after ticket
     /// `after`: the copy's ticket
     pub fn stream_copy(&self, dst: &DevBuf, at: usize, src: &DevBuf, src_at: usize, n: usize, after: Option<i64>) -> Result<i64> {
+        self.stream_copy_on(0, dst, at, src, src_at, n, [after, None])
+    }
+    /// `stream_copy` on copy lane `lane` (0 or 1: the two run side by side - one PCIe direction each), after
+    /// both tickets of `after`
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_copy_on(&self, lane: i32, dst: &DevBuf, at: usize, src: &DevBuf, src_at: usize, n: usize, after: [Option<i64>; 2]) -> Result<i64> {
         dst.bounds(at, n)?;
         src.bounds(src_at, n)?;
         let mut t = 0i64;
         // SAFETY: both ranges in bounds (checked); t is a valid out pointer.
         let rc = unsafe {
-            (self.a().stream_copy)(self.raw(), dst.ptr.cast::<u8>().add(at).cast(), src.ptr.cast::<u8>().add(src_at).cast(), n, after.unwrap_or(-1), &mut t)
+            (self.a().stream_copy)(self.raw(), dst.ptr.cast::<u8>().add(at).cast(), src.ptr.cast::<u8>().add(src_at).cast(), n, after[0].unwrap_or(-1),
+                                   after[1].unwrap_or(-1), lane, &mut t)
         };
         self.ok(rc, "stream_copy")?;
         Ok(t)
+    }
+    /// A device timestamp after everything queued so far (NS_PROFILE=gpu queues keep them): its ticket
+    pub fn stamp(&self) -> Result<i64> {
+        let mut t = 0i64;
+        // SAFETY: t is a valid out pointer.
+        let rc = unsafe { (self.a().stamp)(self.raw(), &mut t) };
+        self.ok(rc, "stamp")?;
+        Ok(t)
+    }
+    /// Seconds between two stamps (waits for them)
+    pub fn elapsed(&self, t0: i64, t1: i64) -> Result<f64> {
+        let mut ns = 0f64;
+        // SAFETY: ns is a valid out pointer.
+        let rc = unsafe { (self.a().elapsed)(self.raw(), t0, t1, &mut ns) };
+        self.ok(rc, "elapsed")?;
+        Ok(ns * 1e-9)
     }
     /// The GPU's queue waits, on the device, for ticket `t` (a copy, or a mark)
     pub fn await_ticket(&self, t: i64) -> Result<()> {
@@ -439,6 +511,28 @@ impl Ops {
         // SAFETY: sizes checked.
         let rc = unsafe { (self.a().hc_pre)(self.raw(), m.fp(), scale.fp(), base.fp(), x.fp(), h.fp(), post.fp(), comb.fp(), pre.fp(), t as i64, c as i64, eps, iters as i32) };
         self.ok(rc, "hc_pre")
+    }
+    /// Decode widths: hc_mix + hc_pre + rms_norm(h) * nw in one launch (fn [24, 4c] float32)
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_pre_fused(&self, x: &DevBuf, fn_: &DevBuf, scale: &DevBuf, base: &DevBuf, nw: &DevBuf, h: &DevBuf, post: &DevBuf, comb: &DevBuf,
+                        pre: &DevBuf, normed: &DevBuf, part: &DevBuf, t: usize, c: usize, eps: f32, hc_eps: f32, iters: u32) -> Result<()> {
+        need!(part, t * 32 * 25, "hc_pre_fused scratch");
+        need!(x, t * 4 * c, "hc_pre_fused X");
+        need!(fn_, 24 * 4 * c, "hc_pre_fused fn");
+        need!(scale, 3, "hc_pre_fused scale");
+        need!(base, 24, "hc_pre_fused base");
+        need!(nw, c, "hc_pre_fused norm");
+        need!(h, t * c, "hc_pre_fused h");
+        need!(normed, t * c, "hc_pre_fused normed");
+        need!(post, t * 4, "hc_pre_fused post");
+        need!(comb, t * 16, "hc_pre_fused comb");
+        need!(pre, t * 4, "hc_pre_fused pre");
+        // SAFETY: sizes checked.
+        let rc = unsafe {
+            (self.a().hc_pre_fused)(self.raw(), x.fp(), fn_.fp(), scale.fp(), base.fp(), nw.fp(), h.fp(), post.fp(), comb.fp(), pre.fp(), normed.fp(),
+                                    part.fp(), t as i64, c as i64, eps, hc_eps, iters as i32)
+        };
+        self.ok(rc, "hc_pre_fused")
     }
     pub fn hc_post(&self, y: &DevBuf, x: &DevBuf, post: &DevBuf, comb: &DevBuf, xo: &DevBuf, t: usize, c: usize) -> Result<()> {
         need!(y, t * c, "hc_post y");

@@ -25,6 +25,9 @@ use crate::Tap;
 /// float32 values expanded per matrix chunk (128 MiB)
 const SCRATCH: usize = 32 << 20;
 
+/// Time the host spent waiting for the routers' logits (the GPU finishing the layer up to them), all layers
+pub static ROUTER_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Prompt chunks of this many tokens or more multiply in fp16 on the XMX units (NS_PROMPT_F16_MIN, default 1024;
 /// 0 = never): the experts, and the dense matrices whose type the fp16 expander takes.
 fn f16_min() -> usize {
@@ -96,6 +99,16 @@ struct ExpertParts {
     down: (usize, usize, GType),
 }
 
+/// A section's device stamps: (name, its GPU, start, end)
+type Stamp = (&'static str, Arc<Gpu>, i64, i64);
+
+/// A profiling mark: a host time (the GPU synced) or a device stamp's ticket
+#[derive(Clone, Copy)]
+enum Mk {
+    Host(Instant),
+    Gpu(i64),
+}
+
 /// Where an expert is.
 #[derive(Clone, Copy)]
 enum Loc {
@@ -126,6 +139,10 @@ struct Store {
     from_host: u64,
     /// host-slot experts a prompt pass reads from pinned memory (in place, or copied to a staging slot first)
     direct: u64,
+    /// per host slot, the copy down that last wrote it (a copy up out of it waits for that), and the last copy down
+    /// of all (what reads host slots in place waits for)
+    rwrite: HashMap<usize, i64>,
+    down_any: Option<i64>,
 }
 
 impl Store {
@@ -256,8 +273,12 @@ pub struct Glm<'g> {
     pub load_bytes: u64,
     /// the MTP block's layer, when it is loaded (on the last part)
     pub mtp: Option<u64>,
-    /// NS_PROFILE=1: seconds and calls per section (the GPU synced at each boundary)
+    /// NS_PROFILE=1: seconds and calls per section (the GPU synced at each boundary); NS_PROFILE=gpu: device
+    /// timestamps instead (no syncs: the decode-width sections' real times)
     prof: Option<Mutex<BTreeMap<&'static str, (f64, u64)>>>,
+    gpu_prof: bool,
+    /// NS_PROFILE=gpu: (section, its GPU, start stamp, end stamp) not yet read
+    stamps: Mutex<Vec<Stamp>>,
 }
 
 const VECTORS: [Role; 21] = [Role::MtpENorm, Role::MtpHNorm, Role::MtpHeadNorm, Role::OutputNorm, Role::AttnNorm, Role::FfnNorm, Role::HcAttnBase, Role::HcAttnScale, Role::HcFfnBase, Role::HcFfnScale, Role::KdaQConv,
@@ -464,7 +485,8 @@ impl Part {
         for (i, k) in in_v.iter().enumerate() {
             vowner[i] = Some(*k);
         }
-        let store = Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree, tick: 0, hits: 0, misses: 0, from_host: 0, direct: 0 };
+        let store = Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree, tick: 0, hits: 0, misses: 0, from_host: 0, direct: 0,
+                            rwrite: HashMap::new(), down_any: None };
         let arena = Arena::new(gpu, arena_bytes())?;
         Ok(Part { ops, arena, layers, mats, vecs, scratch, x16, q8, experts: Mutex::new(store), eh, expert_slots: nv, host_slots: nr, weight_bytes: bytes })
     }
@@ -536,7 +558,12 @@ impl Part {
     /// VRAM expert (it goes down to a free host slot, the wanted one comes up from its host slot or the file).
     /// Without, an expert in a pinned host slot is read there in place by the GPU over PCIe (once per pass - what a
     /// prompt chunk wants), and only the ones on the file alone come into VRAM.
-    fn ensure(&self, m: &Model, l: u64, need: &[u64], promote: bool) -> Result<Vec<(DevBuf, bool)>> {
+    ///
+    /// The swaps go on the GPU's copy queue (the victim down, the wanted one up), the host waiting on none of them:
+    /// the second value marks the experts whose copy is still on its way, the third the ticket of the last copy -
+    /// the GPU's queue awaits it before it reads them, and computes the resident ones meanwhile.
+    #[allow(clippy::type_complexity)]
+    fn ensure(&self, m: &Model, l: u64, need: &[u64], promote: bool) -> Result<(Vec<(DevBuf, bool)>, Vec<bool>, Option<i64>)> {
         let mut c = self.experts.lock().unwrap();
         let c = &mut *c;
         if c.vowner.len() < need.len() {
@@ -545,6 +572,11 @@ impl Part {
         c.tick += 1;
         let tick = c.tick;
         let mut missing = Vec::new();
+        let mut pending: Vec<(u64, u64)> = Vec::new();
+        let mut last: Option<i64> = None; // the last copy up (lane 1)
+        // a host slot's copy up in this call, still reading it: a copy down into it waits for that (the copies
+        // up of earlier calls are done - the GPU's queue awaited them)
+        let mut reading: HashMap<usize, i64> = HashMap::new();
         for &ex in need {
             match c.loc.get(&(l, ex)).copied() {
                 Some(Loc::V(s)) => {
@@ -560,11 +592,14 @@ impl Part {
             order.sort_by_key(|&i| if c.vowner[i].is_none() { 0 } else { c.vused[i] + 1 });
             let parts = expert_parts(m, l)?;
             let mut buf: Option<Vec<u8>> = None;
+            // the copies wait for what the GPU's queue holds so far (a kernel may still read a victim's slot)
+            let after = Some(self.ops.mark()?);
             for (ex, &s) in missing.iter().zip(&order) {
                 c.misses += 1;
                 let key = (l, *ex);
                 let (vch, vo) = c.vat(s);
                 let from = c.loc.get(&key).copied();
+                let mut down: Option<i64> = None;
                 // 1. the victim down to a free host slot (when there is one; else it is only on the file again)
                 if let Some(v) = c.vowner[s].take() {
                     c.loc.remove(&v);
@@ -572,7 +607,10 @@ impl Part {
                     if let Some(f) = c.rfree.pop() {
                         let (rch, ro) = c.rat(f);
                         let sb = c.slot_bytes;
-                        c.vram[vch].read(vo, &mut c.host[rch].as_mut_slice()[ro..ro + sb])?;
+                        down = Some(self.ops.stream_copy_on(0, &c.host[rch].device_view(ro, sb)?, 0, &c.vram[vch], vo, sb,
+                                                            [after, reading.get(&f).copied()])?);
+                        c.rwrite.insert(f, down.unwrap());
+                        c.down_any = down;
                         c.loc.insert(v, Loc::R(f));
                     }
                 }
@@ -582,10 +620,24 @@ impl Part {
                         c.from_host += 1;
                         let (rch, ro) = c.rat(r);
                         let sb = c.slot_bytes;
-                        c.vram[vch].write(vo, &c.host[rch].as_slice()[ro..ro + sb])?;
+                        // after the victim's copy out of the same slot (the copy queue is in order); the host slot
+                        // goes back to the free list - a later copy into it queues behind this one
+                        // after the victim's copy out of this VRAM slot (which follows `after`) - else `after` - and
+                        // after whatever copy down last wrote the host slot
+                        let up = self.ops.stream_copy_on(1, &c.vram[vch], vo, &c.host[rch].device_view(ro, sb)?, 0, sb,
+                                                         [down.or(after), c.rwrite.get(&r).copied()])?;
+                        reading.insert(r, up);
+                        last = Some(up);
+                        pending.push(key);
                         c.rfree.push(r);
                     }
                     _ => {
+                        // from the file (rare: the store holds every expert): a plain write, once the copies so far
+                        // (one may be this slot's victim going down) are done
+                        for t in [last, c.down_any].into_iter().flatten() {
+                            self.ops.await_ticket(t)?;
+                        }
+                        self.ops.gpu.sync()?;
                         let b = buf.get_or_insert_with(|| vec![0u8; c.slot_bytes]);
                         read_expert(m, l, *ex, &parts, b)?;
                         c.vram[vch].write(vo, b)?;
@@ -597,7 +649,7 @@ impl Part {
             }
         }
         let sb = c.slot_bytes;
-        need.iter().map(|ex| match c.loc[&(l, *ex)] {
+        let slots = need.iter().map(|ex| match c.loc[&(l, *ex)] {
             Loc::V(s) => {
                 let (ch, o) = c.vat(s);
                 Ok((c.vram[ch].view(o, sb)?, false))
@@ -607,7 +659,16 @@ impl Part {
                 let (rch, ro) = c.rat(r);
                 Ok((c.host[rch].device_view(ro, sb)?, true))
             }
-        }).collect()
+        }).collect::<Result<Vec<_>>>()?;
+        let arriving = need.iter().map(|ex| pending.contains(&(l, *ex))).collect();
+        // the GPU awaits the last copy up before it reads the swapped experts; the copies down only gate later
+        // copies (by ticket) - but a host-slot expert read in place (prompts) must not be one still going down
+        if !promote {
+            if let Some(t) = c.down_any.take() {
+                self.ops.await_ticket(t)?;
+            }
+        }
+        Ok((slots, arriving, last))
     }
 
     /// Several matrices on the same input x [t, cols]: one Q8_1 quantization of x serves every decode product.
@@ -688,9 +749,10 @@ impl<'g> Glm<'g> {
             parts.push(Part::load(&m, gpu, range, extra, last, expert_bytes, share, reserve, log)?);
         }
         let load_bytes = parts.iter().map(|p| p.weight_bytes).sum();
-        let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(BTreeMap::new()));
+        let gpu_prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "gpu");
+        let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1" || v == "gpu").then(|| Mutex::new(BTreeMap::new()));
         let mtp = (mtp && m.g.n_mtp > 0).then_some(n);
-        Ok(Glm { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, mtp, prof })
+        Ok(Glm { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, mtp, prof, gpu_prof, stamps: Mutex::new(Vec::new()) })
     }
 
     /// Per GPU: its number and name, memory (total, free when the driver says), its layers, its expert slots in
@@ -724,39 +786,68 @@ impl<'g> Glm<'g> {
 
     /// Runs `f`, adding its time to section `name` when profiling (`p`'s GPU synced around it).
     fn timed<T>(&self, p: &Part, name: &'static str, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let Some(pr) = &self.prof else { return f() };
-        p.ops.gpu.sync()?;
-        let t0 = Instant::now();
+        if self.prof.is_none() {
+            return f();
+        }
+        let m = self.mark(p);
         let r = f()?;
-        p.ops.gpu.sync()?;
-        let mut m = pr.lock().unwrap();
-        let x = m.entry(name).or_insert((0.0, 0));
-        x.0 += t0.elapsed().as_secs_f64();
-        x.1 += 1;
+        self.lap(p, name, m);
         Ok(r)
     }
 
-    /// Profiling inside a section: now (the GPU synced), when profiling.
-    fn mark(&self, p: &Part) -> Option<Instant> {
+    /// Profiling inside a section: now (NS_PROFILE=1: the GPU synced; gpu: a device stamp), when profiling.
+    fn mark(&self, p: &Part) -> Option<Mk> {
         self.prof.as_ref()?;
+        if self.gpu_prof {
+            return p.ops.stamp().ok().map(Mk::Gpu);
+        }
         p.ops.gpu.sync().ok()?;
-        Some(Instant::now())
+        Some(Mk::Host(Instant::now()))
     }
 
     /// Adds the time since `from` to `name` and starts the next lap.
-    fn lap(&self, p: &Part, name: &'static str, from: Option<Instant>) -> Option<Instant> {
+    fn lap(&self, p: &Part, name: &'static str, from: Option<Mk>) -> Option<Mk> {
         let (pr, t0) = (self.prof.as_ref()?, from?);
-        p.ops.gpu.sync().ok()?;
+        match t0 {
+            Mk::Gpu(a) => {
+                let b = p.ops.stamp().ok()?;
+                let mut st = self.stamps.lock().unwrap();
+                st.push((name, p.ops.gpu.clone(), a, b));
+                // read them back before the ticket ring (65,536) comes round
+                if st.len() > 8192 {
+                    let v = std::mem::take(&mut *st);
+                    drop(st);
+                    self.read_stamps(v);
+                }
+                Some(Mk::Gpu(b))
+            }
+            Mk::Host(t0) => {
+                p.ops.gpu.sync().ok()?;
+                let mut m = pr.lock().unwrap();
+                let x = m.entry(name).or_insert((0.0, 0));
+                x.0 += t0.elapsed().as_secs_f64();
+                x.1 += 1;
+                Some(Mk::Host(Instant::now()))
+            }
+        }
+    }
+
+    fn read_stamps(&self, v: Vec<Stamp>) {
+        let Some(pr) = &self.prof else { return };
         let mut m = pr.lock().unwrap();
-        let x = m.entry(name).or_insert((0.0, 0));
-        x.0 += t0.elapsed().as_secs_f64();
-        x.1 += 1;
-        Some(Instant::now())
+        for (name, gpu, a, b) in v {
+            let dt = Ops { gpu }.elapsed(a, b).unwrap_or(0.0);
+            let x = m.entry(name).or_insert((0.0, 0));
+            x.0 += dt;
+            x.1 += 1;
+        }
     }
 
     /// The profile so far: (section, seconds, calls), slowest first.
     pub fn profile(&self) -> Vec<(&'static str, f64, u64)> {
         let Some(p) = &self.prof else { return Vec::new() };
+        let v = std::mem::take(&mut *self.stamps.lock().unwrap());
+        self.read_stamps(v);
         let mut v: Vec<_> = p.lock().unwrap().iter().map(|(k, (s, n))| (*k, *s, *n)).collect();
         v.sort_by(|a, b| b.1.total_cmp(&a.1));
         v
@@ -977,7 +1068,7 @@ impl<'g> Glm<'g> {
             self.m.file.read_into(emb, *tok as u64 * rb as u64, &mut rows[i * rb..(i + 1) * rb]).map_err(e)?;
         }
         let raw = DevBuf::new(&p.ops.gpu, rows.len())?;
-        raw.write(0, &rows)?;
+        raw.write_async(0, &rows)?;
         let x = DevBuf::f32(&p.ops.gpu, tokens.len() * g.n_embd as usize)?;
         p.ops.dequant(emb.ty.code(), &raw, 0, rows.len(), tokens.len() * g.n_embd as usize, &x)?;
         Ok(x)
@@ -1128,7 +1219,7 @@ impl<'g> Glm<'g> {
         }
         let cnt: Vec<i32> = (0..t).map(|r| if (pos0 + r + 1) / 4 > kp { kp as i32 } else { -1 }).collect();
         let cb = p.arena.bytes(t * 4)?;
-        cb.write(0, &cnt.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        cb.write_async(0, &cnt.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
         Ok(Some((sel, cb)))
     }
 
@@ -1207,6 +1298,12 @@ impl<'g> Glm<'g> {
             // before a half: the mixes, h, post, comb; then the half's norm
             let hc_pre = |fn_: Role, base: Role, scale: Role, x: &DevBuf, norm: Role| -> Result<()> {
                 let w = p.mat(l, fn_)?;
+                if t <= MMVQ_COLS && w.f32 && w.rows == 24 && std::env::var("NS_HC_FUSED").map_or(true, |v| v != "0") {
+                    // decode widths: two launches (the partial dots over the GPU, then the rest per token) for the
+                    // five of the steps below
+                    return o.hc_pre_fused(x, &w.buf, p.vec(l, scale)?, p.vec(l, base)?, p.vec(l, norm)?, h, post, comb, pre, normed,
+                                          &p.arena.f32(t * 32 * 25)?, t, d, eps, g.hc_eps as f32, g.hc_iters as u32);
+                }
                 let mixes = p.arena.f32(t * 24)?;
                 if w.f32 && w.rows == 24 {
                     o.hc_mix(x, &w.buf, &mixes, &p.arena.f32(t * 32 * 25)?, t, 4 * d, eps)?;
@@ -1440,7 +1537,9 @@ impl<'g> Glm<'g> {
         let lim = g.swiglu_limit as f32;
         let logits = self.timed(p, "router", || p.mm(l, Role::Router, x, t))?;
         tap(&format!("ffn_moe_logits-{l}"), &logits)?;
+        let tw = Instant::now();
         let lv = logits.to_f32()?;
+        ROUTER_WAIT_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let bias = p.vec(l, Role::RouterBias)?.to_f32()?;
         // expert -> (token, weight)
         let mut by: BTreeMap<usize, Vec<(i32, f32)>> = BTreeMap::new();
@@ -1465,7 +1564,7 @@ impl<'g> Glm<'g> {
         let need: Vec<u64> = by.keys().map(|e| *e as u64).collect();
         // prompt chunks read host-slot experts in place; decode makes them resident (NS_DECODE_DIRECT=1: in place too)
         let promote = t <= MMVQ_COLS && !std::env::var("NS_DECODE_DIRECT").is_ok_and(|v| v == "1");
-        let slots = self.timed(p, "expert misses (swaps / file)", || p.ensure(&self.m, l, &need, promote))?;
+        let (slots, arriving, copies) = self.timed(p, "expert misses (swaps / file)", || p.ensure(&self.m, l, &need, promote))?;
         let parts = expert_parts(&self.m, l)?;
         let (f, cols) = (g.ffn_expert as usize, d);
         self.timed(p, "routed experts", || {
@@ -1495,7 +1594,7 @@ impl<'g> Glm<'g> {
             ints.extend(&t_ptr);
             ints.extend(&ent);
             let wb = p.arena.f32(wts.len())?;
-            wb.write(0, &wts.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            wb.write_async(0, &wts.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
             // the grouped kernels (two launches for the layer), when they take this layer's types
             // Big prompt chunks: each expert expanded to fp16 once a chunk and its tokens multiplied by oneMKL's half
             // GEMM (the XMX units) - Strata's prompt path. The expansion is the cost and the chunk amortizes it, so
@@ -1504,6 +1603,9 @@ impl<'g> Glm<'g> {
             // fp16, its outputs added into y.
             let f16_min = f16_min();
             if f16_min > 0 && t >= f16_min && t > MMVQ_COLS {
+                if let Some(tk) = copies {
+                    o.await_ticket(tk)?; // experts swapped in (from the file only, in prompt passes)
+                }
                 let mut gtok: Vec<i32> = Vec::with_capacity(total);
                 let mut gw: Vec<f32> = Vec::with_capacity(total);
                 for list in by.values() {
@@ -1513,9 +1615,9 @@ impl<'g> Glm<'g> {
                     }
                 }
                 let tb = p.arena.bytes(total * 4)?;
-                tb.write(0, &gtok.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                tb.write_async(0, &gtok.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 let wtb = p.arena.f32(total)?;
-                wtb.write(0, &gw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                wtb.write_async(0, &gw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 let nmax = by.values().map(|l| l.len()).max().unwrap_or(1);
                 let xh = p.arena.bytes(nmax * d * 2)?;
                 let w16 = p.arena.bytes(2 * f * d * 2)?; // gate | up of one expert; down reuses the first half
@@ -1587,26 +1689,43 @@ impl<'g> Glm<'g> {
             // NS_PROMPT_DEQUANT=1: prompt chunks take the float32 expanded-GEMM path instead (a measurement switch)
             let dequant = t > MMVQ_COLS && std::env::var("NS_PROMPT_DEQUANT").is_ok_and(|v| v == "1");
             if !dequant && parts.gate.2 == parts.up.2 && o.moe_grouped_supported(parts.gate.2.code(), parts.down.2.code(), d, f) {
-                let groups = by.len();
-                let mut table: Vec<u8> = Vec::with_capacity(groups * 8 + (groups + 2 + 2 * total) * 4);
-                for (slot, _) in &slots {
-                    table.extend((slot.ptr() as u64).to_le_bytes());
+                // the layer's entries by group, numbered in order (an entry's row of dn)
+                let lists: Vec<&Vec<(i32, f32)>> = by.values().collect();
+                let mut first = Vec::with_capacity(lists.len());
+                let mut e0 = 0i32;
+                for list in &lists {
+                    first.push(e0);
+                    e0 += list.len() as i32;
                 }
-                let mut start = 0i32;
-                table.extend(start.to_le_bytes());
-                for list in by.values() {
-                    start += list.len() as i32;
-                    table.extend(start.to_le_bytes());
-                }
-                table.extend((groups as i32).to_le_bytes());
-                for e in 0..total as i32 {
-                    table.extend(e.to_le_bytes()); // ent_dst: an entry's own row
-                }
-                for ti in &tok {
-                    table.extend(ti.to_le_bytes());
-                }
-                let tb = p.arena.bytes(table.len())?;
-                tb.write(0, &table)?;
+                // one launch's table: its groups' slots, their entries (renumbered from 0 for the kernel's scratch,
+                // each still writing its own row of dn), the entries' tokens
+                let table = |gs: &[usize]| -> Result<(DevBuf, usize, usize)> {
+                    let n: usize = gs.iter().map(|&k| lists[k].len()).sum();
+                    let mut tb: Vec<u8> = Vec::with_capacity(gs.len() * 8 + (gs.len() + 2 + 2 * n) * 4);
+                    for &k in gs {
+                        tb.extend((slots[k].0.ptr() as u64).to_le_bytes());
+                    }
+                    let mut start = 0i32;
+                    tb.extend(start.to_le_bytes());
+                    for &k in gs {
+                        start += lists[k].len() as i32;
+                        tb.extend(start.to_le_bytes());
+                    }
+                    tb.extend((gs.len() as i32).to_le_bytes());
+                    for &k in gs {
+                        for j in 0..lists[k].len() as i32 {
+                            tb.extend((first[k] + j).to_le_bytes()); // ent_dst: the entry's row
+                        }
+                    }
+                    for &k in gs {
+                        for j in 0..lists[k].len() {
+                            tb.extend(tok[first[k] as usize + j].to_le_bytes());
+                        }
+                    }
+                    let b = p.arena.bytes(tb.len())?;
+                    b.write_async(0, &tb)?;
+                    Ok((b, gs.len(), n))
+                };
                 let xq = p.arena.bytes(o.q8_1_bytes(d, t))?;
                 o.quantize_q8_1((x, 0), &xq, d, t)?;
                 let scratch = p.arena.bytes(o.moe_scratch_bytes(total, f))?;
@@ -1614,14 +1733,36 @@ impl<'g> Glm<'g> {
                 // prompt chunks a sub-group a row (NS_PROMPT_LANES), decode the kernels' default
                 static PROMPT_LANES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
                 let pl = *PROMPT_LANES.get_or_init(|| std::env::var("NS_PROMPT_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(32));
-                let lanes = if t > MMVQ_COLS { pl } else { 0 };
-                o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, total, &xq, &scratch, &dn, lim, lanes)?;
+                // decode: 4 lanes a row (measured alone for 8 experts: 182 us for one token, 216 for a verify pass; the
+                // kernels' default 259 / 233). One count for both widths: the lanes set the sums' order, and a verify
+                // pass's rows must equal one-token passes. NS_DECODE_LANES overrides
+                static DECODE_LANES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let dl = *DECODE_LANES.get_or_init(|| std::env::var("NS_DECODE_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(4));
+                let lanes = if t > MMVQ_COLS { pl } else { dl };
+                // the resident experts first, while the swapped ones arrive; then those (each entry's arithmetic is
+                // the same in either launch)
+                let (now, later): (Vec<usize>, Vec<usize>) = (0..lists.len()).partition(|&k| !arriving[k]);
+                for (gs, wait) in [(now, false), (later, true)] {
+                    if gs.is_empty() {
+                        continue;
+                    }
+                    if wait {
+                        if let Some(tk) = copies {
+                            o.await_ticket(tk)?;
+                        }
+                    }
+                    let (tb, groups, n) = table(&gs)?;
+                    o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, n, &xq, &scratch, &dn, lim, lanes)?;
+                }
                 let cb = p.arena.bytes((t + 1 + total) * 4)?;
-                cb.write(0, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                cb.write_async(0, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 return o.moe_combine(&y, &dn, &cb, &wb, t, total, d);
             }
+            if let Some(tk) = copies {
+                o.await_ticket(tk)?; // the paths below read every expert at once
+            }
             let ib = p.arena.bytes(ints.len() * 4)?;
-            ib.write(0, &ints.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            ib.write_async(0, &ints.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
             let xe = p.arena.f32(total * d)?;
             o.gather(x, &ib, &xe, total, d)?;
             let gt = p.arena.f32(total * f)?;

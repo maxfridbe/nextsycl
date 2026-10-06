@@ -4,6 +4,7 @@
 #include "ns_internal.hpp"
 
 #include <sycl/sycl.hpp>
+#include <cstdlib>
 
 #include <cstring>
 #include <memory>
@@ -57,7 +58,13 @@ int ns_gpu_open(int index, ns_gpu** out) {
     auto v = gpus();
     if (index < 0 || index >= (int) v.size()) return fail("no GPU " + std::to_string(index) + " (" + std::to_string(v.size()) + " found)");
     sycl::context ctx(v[index]);
-    *out = new ns_gpu{v[index], ctx, sycl::queue(ctx, v[index], sycl::property::queue::in_order()),
+    // NS_PROFILE=gpu: the queue keeps device timestamps (ns_stamp / ns_elapsed)
+    const char* pf = getenv("NS_PROFILE");
+    const bool stamps = pf && std::string(pf) == "gpu";
+    sycl::property_list qp = stamps ? sycl::property_list{sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}
+                                    : sycl::property_list{sycl::property::queue::in_order()};
+    *out = new ns_gpu{v[index], ctx, sycl::queue(ctx, v[index], qp),
+                      sycl::queue(ctx, v[index], sycl::property::queue::in_order()),
                       sycl::queue(ctx, v[index], sycl::property::queue::in_order())};
     return 0;
     NS_CATCH
@@ -65,7 +72,7 @@ int ns_gpu_open(int index, ns_gpu** out) {
 
 void ns_gpu_close(ns_gpu* g) {
     if (!g) return;
-    try { g->q.wait(); g->cq.wait(); } catch (...) {}
+    try { g->q.wait(); g->cq.wait(); g->cq2.wait(); } catch (...) {}
     delete g;
 }
 
@@ -132,7 +139,7 @@ int ns_copy_dev(ns_gpu* g, void* dst, const void* src, size_t bytes) {
 // the host never waits on an event (Strata: host waits on queue events deadlocked under Level Zero v2).
 static int64_t keep(ns_gpu* g, sycl::event e) {
     const int64_t t = g->next_ev++;
-    g->ev[t % 256] = e;
+    g->ev[t % g->ev.size()] = e;
     return t;
 }
 
@@ -144,11 +151,33 @@ int ns_mark(ns_gpu* g, int64_t* ticket) {
     NS_CATCH
 }
 
-// bytes from src to dst on the copy queue, after ticket `after` (< 0: none); its own ticket
-int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, int64_t after, int64_t* ticket) {
+// bytes from src to dst on copy lane `lane` (0 or 1), after tickets `after` and `after2` (< 0: none); its own ticket
+int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, int64_t after, int64_t after2, int lane, int64_t* ticket) {
     NS_TRY
-    sycl::event e = after < 0 ? g->cq.memcpy(dst, src, bytes) : g->cq.memcpy(dst, src, bytes, g->ev[after % 256]);
-    *ticket = keep(g, e);
+    std::vector<sycl::event> deps;
+    if (after >= 0) deps.push_back(g->ev[after % g->ev.size()]);
+    if (after2 >= 0) deps.push_back(g->ev[after2 % g->ev.size()]);
+    sycl::queue& q = lane ? g->cq2 : g->cq;
+    *ticket = keep(g, q.memcpy(dst, src, bytes, deps));
+    return 0;
+    NS_CATCH
+}
+
+// a timestamp: a one-item kernel on the GPU's queue (its end is when the work before it ended); its ticket
+int ns_stamp(ns_gpu* g, int64_t* ticket) {
+    NS_TRY
+    *ticket = keep(g, g->q.single_task([=]() {}));
+    return 0;
+    NS_CATCH
+}
+
+// nanoseconds between the ends of tickets t0 and t1 (stamps; waits for them - profiling only)
+int ns_elapsed(ns_gpu* g, int64_t t0, int64_t t1, double* ns) {
+    NS_TRY
+    const auto& a = g->ev[t0 % g->ev.size()];
+    const auto& b = g->ev[t1 % g->ev.size()];
+    *ns = (double) b.get_profiling_info<sycl::info::event_profiling::command_end>() -
+          (double) a.get_profiling_info<sycl::info::event_profiling::command_end>();
     return 0;
     NS_CATCH
 }
@@ -156,7 +185,7 @@ int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, int64_t 
 // the GPU's queue waits (on the device) for ticket t
 int ns_await(ns_gpu* g, int64_t t) {
     NS_TRY
-    g->q.ext_oneapi_submit_barrier({g->ev[t % 256]});
+    g->q.ext_oneapi_submit_barrier({g->ev[t % g->ev.size()]});
     return 0;
     NS_CATCH
 }

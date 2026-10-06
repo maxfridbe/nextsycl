@@ -41,8 +41,10 @@ int ns_copy_to(ns_gpu* g, void* dst, const void* src_host, size_t bytes);
 int ns_copy_from(ns_gpu* g, void* dst_host, const void* src, size_t bytes);
 int ns_copy_dev(ns_gpu* g, void* dst, const void* src, size_t bytes);
 int ns_mark(ns_gpu* g, int64_t* ticket);
-int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, int64_t after, int64_t* ticket);
+int ns_stream_copy(ns_gpu* g, void* dst, const void* src, size_t bytes, int64_t after, int64_t after2, int lane, int64_t* ticket);
 int ns_await(ns_gpu* g, int64_t ticket);
+int ns_stamp(ns_gpu* g, int64_t* ticket);
+int ns_elapsed(ns_gpu* g, int64_t t0, int64_t t1, double* ns);
 int ns_fill(ns_gpu* g, void* dst, uint8_t value, size_t bytes);
 int ns_sync(ns_gpu* g);
 /* device memory of one GPU to another's, through `staging`: host memory of `bytes` (pinned memory belongs to one
@@ -64,7 +66,9 @@ int ns_rms_norm(ns_gpu* g, const float* x, const float* w, float* y, int64_t row
 int ns_layer_norm(ns_gpu* g, const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t C, float eps);
 /* mHC (docs/glm5next.md): m [T, 24] mixes; X [T, 4, C]; h [T, C]; post [T, 4]; comb [T, 16] */
 int ns_hc_pre(ns_gpu* g, const float* m, const float* scale, const float* base, const float* X, float* h, float* post, float* comb,
-              float* pre, int64_t T, int64_t C, float eps, int iters);   /* pre [T, 4]: scratch */
+              float* pre, int64_t T, int64_t C, float eps, int iters);
+int ns_hc_pre_fused(ns_gpu* g, const float* x, const float* fn, const float* scale, const float* base, const float* nw, float* h,
+                    float* post, float* comb, float* pre, float* normed, float* part, int64_t T, int64_t C, float eps, float hc_eps, int iters);   /* pre [T, 4]: scratch */
 int ns_hc_post(ns_gpu* g, const float* y, const float* X, const float* post, const float* comb, float* Xo, int64_t T, int64_t C);
 int ns_hc_mean(ns_gpu* g, const float* X, float* y, int64_t T, int64_t C);
 /* KDA */
