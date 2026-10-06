@@ -342,6 +342,8 @@ pub struct Glm<'g> {
     /// timestamps instead (no syncs: the decode-width sections' real times)
     prof: Option<Mutex<BTreeMap<&'static str, (f64, u64)>>>,
     gpu_prof: bool,
+    /// `capture_attention`: one-token passes add each MLA layer's attention (its heads' mean) per position here
+    capture: Mutex<Option<(Vec<f32>, usize)>>,
     /// NS_PROFILE=gpu: (section, its GPU, start stamp, end stamp) not yet read
     stamps: Mutex<Vec<Stamp>>,
 }
@@ -953,7 +955,7 @@ impl<'g> Glm<'g> {
         let gpu_prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "gpu");
         let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1" || v == "gpu").then(|| Mutex::new(BTreeMap::new()));
         let mtp = (mtp && m.g.n_mtp > 0).then_some(n);
-        Ok(Glm { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, mtp, prof, gpu_prof, stamps: Mutex::new(Vec::new()) })
+        Ok(Glm { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, mtp, prof, gpu_prof, stamps: Mutex::new(Vec::new()), capture: Mutex::new(None) })
     }
 
     /// Per GPU: its number and name, memory (total, free when the driver says), its layers, its expert slots in
@@ -1315,6 +1317,9 @@ impl<'g> Glm<'g> {
         let t_idx = self.lap(p, "MLA: absorbed queries", t_abs);
         // the indexer: this pass's pooled keys; the rows that see more pools than it keeps attend to its selection
         let sel = self.select(p, l, normed, &qr, idx, pos0, t, &mut *tap)?;
+        if t == 1 && self.capture.lock().unwrap().is_some() {
+            self.capture_layer(p, l, cache, &qt, sel.as_ref(), pos0)?;
+        }
         let t_att = self.lap(p, "MLA: indexer", t_idx);
         let u = p.arena.f32(t * nh * lat)?;
         let kp = (g.idx_top_k / g.idx_pool) as usize;
@@ -1618,6 +1623,67 @@ impl<'g> Glm<'g> {
         let v = logits.to_f32()?;
         let vocab = g.n_vocab as usize;
         Ok(v.chunks(vocab).map(|c| c.to_vec()).collect())
+    }
+
+    /// Starts (or stops) capturing attention: each one-token pass from now adds, per MLA layer, its heads' mean
+    /// attention over the positions it reads (`take_attention`). For LogProbChain - a few small reads a layer.
+    pub fn capture_attention(&self, on: bool) {
+        *self.capture.lock().unwrap() = on.then(|| (Vec::new(), 0));
+    }
+
+    /// The attention captured since the last take: per position, the mean over the heads and the MLA layers of the
+    /// softmax weight the last one-token pass's query gave it (sums to 1); None when no layer captured
+    pub fn take_attention(&self) -> Option<Vec<f32>> {
+        let mut c = self.capture.lock().unwrap();
+        let (w, n) = c.as_mut()?;
+        if *n == 0 {
+            return None;
+        }
+        let out = w.iter().map(|x| x / *n as f32).collect();
+        *w = Vec::new();
+        *n = 0;
+        Some(out)
+    }
+
+    /// One MLA layer's attention for a one-token pass, scored as the prompt path does (the cells gathered, q~ . c per
+    /// head, the masked softmax), its heads' mean added to the capture per position
+    fn capture_layer(&self, p: &Part, l: u64, cache: &DevBuf, qt: &DevBuf, sel: Option<&(DevBuf, DevBuf)>, pos0: usize) -> Result<()> {
+        let _ = l;
+        let g = &self.m.g;
+        let o = &p.ops;
+        let (nh, hd, lat) = (g.n_head as usize, g.head_dim as usize, g.kv_lora as usize);
+        let kp = (g.idx_top_k / g.idx_pool) as usize;
+        let nc = if sel.is_some() { 4 * kp + 3 } else { pos0 + 1 }.next_multiple_of(64);
+        let idx = p.arena.bytes(nc * 4)?;
+        let cnt = p.arena.bytes(4)?;
+        o.mla_cells(sel.map(|(a, b)| (a, b)), 1, kp, pos0, &idx, &cnt, nc)?;
+        let gh = p.arena.bytes(nc * lat * 2)?;
+        o.gather_h(cache, &idx, &gh, nc, lat)?;
+        let qh = p.arena.bytes(nh * lat * 2)?;
+        o.to_f16(qt, &qh, nh * lat)?;
+        let sb = p.arena.f32(nh * nc)?;
+        o.gemm_batch_h(1, true, nh, nc, lat, (&qh, 0, lat, nh * lat), (&gh, 0, lat, nc * lat), (&sb, 0, nc, nh * nc))?;
+        o.softmax_masked(&sb, 1, nh, nc, &cnt, 1.0 / (hd as f32).sqrt())?;
+        let probs = sb.to_f32()?;
+        let mut ib = vec![0u8; nc * 4];
+        idx.read(0, &mut ib)?;
+        let mut cb = [0u8; 4];
+        cnt.read(0, &mut cb)?;
+        let n = (i32::from_le_bytes(cb).max(0) as usize).min(nc);
+        let mut c = self.capture.lock().unwrap();
+        let Some((w, layers)) = c.as_mut() else { return Ok(()) };
+        if w.len() < pos0 + 1 {
+            w.resize(pos0 + 1, 0.0);
+        }
+        for i in 0..n {
+            let pos = i32::from_le_bytes([ib[4 * i], ib[4 * i + 1], ib[4 * i + 2], ib[4 * i + 3]]) as usize;
+            let m: f32 = (0..nh).map(|h| probs[h * nc + i]).sum::<f32>() / nh as f32;
+            if pos < w.len() {
+                w[pos] += m;
+            }
+        }
+        *layers += 1;
+        Ok(())
     }
 
     /// One decode step of several conversations at once: `tokens[b]` the next token of `sess[b]`, the logits after

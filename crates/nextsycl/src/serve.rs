@@ -6,7 +6,10 @@
 //!     GET  /status                 {"busy": bool, "prompt_cache": ...}
 //!     POST /v1/chat/completions    messages, max_tokens, temperature, top_p, stream, reasoning_effort (or
 //!                                  chat_template_kwargs.reasoning_effort): low | high | max; logprobs, top_logprobs
-//!                                  (the answer's tokens, as OpenAI's choices[0].logprobs.content); usage.energy_wh
+//!                                  (the answer's tokens, as OpenAI's choices[0].logprobs.content); usage.energy_wh;
+//!                                  logprob_chain: true - each entry also "chain": its logprob chained through the
+//!                                  attention to this turn's own earlier tokens (see chain_entry), and each
+//!                                  alternative a "chained_logprob" (decoded one token a pass, no draft block)
 //!     POST /api/chat               the same for a web page, simpler: {"messages": [{"role", "content", "thinking"?}],
 //!                                  "effort"?, "max_tokens"?, "temperature"?, "top_p"?, "stream"? (default true)};
 //!                                  streamed as JSON lines - {"thinking": text} and {"content": text} as they come,
@@ -101,6 +104,47 @@ struct Ask {
     stream: bool,
     /// logprobs asked for: how many alternatives with each (top_logprobs, at most 20)
     logprobs: Option<usize>,
+    /// LogProbChain: the logprobs also chained through the attention to this turn's own earlier tokens
+    chain: bool,
+}
+
+/// LogProbChain on one generated token's entry: for its token and each alternative, the logprob plus, over this
+/// turn's earlier tokens equal to it, the attention the token's position gave each times that token's own logprob -
+/// p' = p * prod_j p_j^a_j: an echo of what the turn already wrote counts only as much as that earlier token was
+/// sure. `att`: per position (sums to 1); `turn`: the turn's tokens so far with their own logprobs, from `base`.
+fn chain_entry(e: &mut Value, att: &[f32], turn: &[(u32, f64)], base: usize, tok: &Tokenizer) {
+    let echo = |id: u32| -> (f64, Vec<(usize, f64, f64)>) {
+        let mut sum = 0.0;
+        let mut parts = Vec::new();
+        for (k, (t, lp)) in turn.iter().enumerate() {
+            if *t == id {
+                let a = att.get(base + k).copied().unwrap_or(0.0) as f64;
+                if a > 0.0 {
+                    sum += a * lp;
+                    parts.push((k, a, *lp));
+                }
+            }
+        }
+        (sum, parts)
+    };
+    let id = e["id"].as_u64().unwrap_or(0) as u32;
+    let (sum, mut parts) = echo(id);
+    let lp = e["logprob"].as_f64().unwrap_or(0.0);
+    parts.sort_by(|a, b| (b.1 * -b.2).total_cmp(&(a.1 * -a.2)).then(b.1.total_cmp(&a.1)));
+    let turn_att: f64 = att.iter().skip(base).map(|x| *x as f64).sum();
+    e["chain"] = json!({
+        "logprob": lp + sum,
+        "attention_to_turn": turn_att,
+        "echo": parts.iter().take(3).map(|(k, a, l)| json!({"turn_position": k, "token": String::from_utf8_lossy(&tok.decode_bytes(&[turn[*k].0])),
+                                                          "attention": a, "logprob": l})).collect::<Vec<_>>(),
+    });
+    if let Some(top) = e["top_logprobs"].as_array_mut() {
+        for t in top {
+            let tid = t["id"].as_u64().unwrap_or(0) as u32;
+            let (s2, _) = echo(tid);
+            t["chained_logprob"] = json!(t["logprob"].as_f64().unwrap_or(0.0) + s2);
+        }
+    }
 }
 
 /// One generated token's logprob entry (OpenAI's shape): its log-probability under the model (the raw logits'
@@ -110,7 +154,7 @@ fn logprob_entry(tok: &Tokenizer, l: &[f32], y: u32, k: usize) -> Value {
     let lse = mx + l.iter().map(|&v| (v as f64 - mx).exp()).sum::<f64>().ln();
     let one = |id: u32| {
         let b = tok.decode_bytes(&[id]);
-        json!({"token": String::from_utf8_lossy(&b), "logprob": l[id as usize] as f64 - lse, "bytes": b})
+        json!({"token": String::from_utf8_lossy(&b), "logprob": l[id as usize] as f64 - lse, "bytes": b, "id": id})
     };
     let mut e = one(y);
     let mut top: Vec<u32> = Vec::new();
@@ -153,6 +197,8 @@ struct Job {
     temp: f32,
     top_p: f32,
     logprobs: Option<usize>,
+    /// LogProbChain: decoded one token a pass (no draft block), the attention captured
+    chain: bool,
     tx: mpsc::Sender<Ev>,
     /// the client went away: end it
     cancel: Arc<AtomicBool>,
@@ -189,6 +235,8 @@ struct Active {
     accepted: u64,
     drafted: u64,
     finish: Option<&'static str>,
+    /// LogProbChain: this turn's tokens so far and their own logprobs
+    turn: Vec<(u32, f64)>,
 }
 
 /// Prefixes shorter than this are read again rather than cached
@@ -447,6 +495,7 @@ impl Server {
             Some(e) => Effort::parse(e).ok_or(format!("effort {e:?}: low, high or max"))?,
             None => self.default_effort,
         };
+        let chain = req["logprob_chain"].as_bool().or_else(|| req["LogProbChain"].as_bool()).unwrap_or(false);
         Ok(Ask { messages, effort,
                  max: req["max_tokens"].as_u64().or_else(|| req["max_completion_tokens"].as_u64()).map(|n| n as usize),
                  temp: req["temperature"].as_f64().unwrap_or(1.0) as f32,
@@ -455,8 +504,10 @@ impl Server {
                  logprobs: match &req["logprobs"] {
                      Value::Bool(true) => Some(req["top_logprobs"].as_u64().unwrap_or(0).min(20) as usize),
                      Value::Number(n) => Some(n.as_u64().unwrap_or(0).min(20) as usize), // the completions API's form
+                     _ if chain => Some(req["top_logprobs"].as_u64().unwrap_or(5).min(20) as usize),
                      _ => None,
-                 } })
+                 },
+                 chain })
     }
 
     // ------------------------------------------------------------------ the engine thread
@@ -488,7 +539,7 @@ impl Server {
                     Ok((logits, from, source, seconds, saved)) => {
                         let _ = job.tx.send(Ev::Read { from, source, seconds, saved });
                         active.push(Active { job, slot, dec: None, logits: Some(logits), pending: None, n: 0, committed: Vec::new(), accepted: 0,
-                                             drafted: 0, finish: None });
+                                             drafted: 0, finish: None, turn: Vec::new() });
                     }
                     Err(e) => {
                         let _ = job.tx.send(Ev::Fail(e));
@@ -510,11 +561,31 @@ impl Server {
                     a.finish = Some("client gone");
                 }
             }
-            let r = if active.iter().filter(|a| a.finish.is_none()).count() == 1 {
-                self.step_alone(&mut slots, &mut active, &mut rng, &mut none)
-            } else {
-                self.step_together(&mut slots, &mut active, &mut rng, &mut none)
-            };
+            // LogProbChain requests step one at a time, their attention captured; the others alone or together
+            let mut r = Ok(());
+            for a in active.iter_mut() {
+                if a.job.chain && a.finish.is_none() && r.is_ok() {
+                    r = self.step_chain(&mut slots, a, &mut rng, &mut none);
+                }
+            }
+            let mut rest: Vec<Active> = Vec::new();
+            let mut i = 0;
+            while i < active.len() {
+                if active[i].job.chain {
+                    i += 1;
+                } else {
+                    rest.push(active.remove(i));
+                }
+            }
+            if r.is_ok() && rest.iter().any(|a| a.finish.is_none()) {
+                r = if rest.iter().filter(|a| a.finish.is_none()).count() == 1 {
+                    self.step_alone(&mut slots, &mut rest, &mut rng, &mut none)
+                } else {
+                    self.step_together(&mut slots, &mut rest, &mut rng, &mut none)
+                };
+            }
+            active.extend(rest);
+            active.sort_by_key(|a| a.slot);
             if let Err(e) = r {
                 for a in active.drain(..) {
                     let _ = a.job.tx.send(Ev::Fail(e.clone()));
@@ -637,6 +708,40 @@ impl Server {
         Ok(())
     }
 
+    /// A LogProbChain request's step: one token (no draft block), the attention of the pass that made its logits
+    /// captured, the token's entry chained through it
+    fn step_chain(&self, slots: &mut [Slot], a: &mut Active, rng: &mut Rng, none: ns_engine::Tap) -> Result<(), String> {
+        if a.dec.is_none() {
+            a.dec = Some(match (a.logits.take(), a.pending.take()) {
+                (Some(l), _) => self.glm.decoder(l, false),
+                (None, Some(y)) => self.glm.decoder_after(y, false),
+                (None, None) => return Err("a request without logits or a token to feed".into()),
+            });
+        }
+        let (temp, top_p, k) = (a.job.temp, a.job.top_p, a.job.logprobs.unwrap_or(5));
+        let mut entry: Option<Value> = None;
+        let tok = &self.tok;
+        let mut draw = |l: &[f32]| {
+            let y = sample(l, temp, top_p, rng);
+            entry = Some(logprob_entry(tok, l, y, k));
+            y
+        };
+        self.glm.capture_attention(true);
+        let toks = self.glm.step(&mut slots[a.slot].sess, a.dec.as_mut().unwrap(), &mut draw, &mut *none);
+        let att = self.glm.take_attention();
+        self.glm.capture_attention(false);
+        let toks = toks.map_err(|e| e.0)?;
+        let mut e = entry.unwrap_or(Value::Null);
+        if let Some(att) = &att {
+            chain_entry(&mut e, att, &a.turn, a.job.ids.len(), &self.tok);
+        }
+        for y in toks {
+            a.turn.push((y, e["logprob"].as_f64().unwrap_or(0.0)));
+            self.commit(a, y, Some(e.clone()));
+        }
+        Ok(())
+    }
+
     /// Several active: a token each, one batch pass for all of them
     fn step_together(&self, slots: &mut [Slot], active: &mut [Active], rng: &mut Rng, none: ns_engine::Tap) -> Result<(), String> {
         // each one's next token: drawn from its logits, or the one its own steps committed and did not feed
@@ -712,7 +817,8 @@ impl Server {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         self.inflight.fetch_add(1, Ordering::SeqCst);
-        self.queue.lock().unwrap().push_back(Job { id: rid, ids: ids.clone(), max, temp, top_p, logprobs: ask.logprobs, tx, cancel: cancel.clone() });
+        self.queue.lock().unwrap().push_back(Job { id: rid, ids: ids.clone(), max, temp, top_p, logprobs: ask.logprobs, chain: ask.chain, tx,
+                                                   cancel: cancel.clone() });
         self.wake.notify_one();
         // its prompt read
         let (from, source, prefill, saved) = match rx.recv() {

@@ -81,6 +81,11 @@ A request option `logprob_chain` (beside `logprobs` / `top_logprobs`): logprobs 
 only echoing from earlier in its own turn. The thinking tokens skew the answer's logprobs: a token the thinking
 already wrote comes out near-certain because the model copies it, not because it is sure of it.
 
+- [x] v1 (2026-10-06): `logprob_chain: true`; the attention = the mean over heads and MLA layers of a one-token
+      pass's softmax (Glm::capture_attention); chained = logprob + sum over equal turn tokens of attention x their
+      own logprob; `chain` on each entry (with the top 3 echoes) and `chained_logprob` on each alternative
+- [ ] The mean dilutes: an echoed token gets 1-3% of the attention while the turn gets 20-30% - try the max over
+      heads, the heads that attend most to the turn, the last layers only
 - [ ] For each output token X, one attention vector over the context: combine the heads of the attention layers -
       experiment: all MLA layers averaged, the most informative layers only (by entropy or by how peaked they are),
       the last layers, weighted by head; MLA's absorbed scores (q~ . c) give per-position weights cheaply; KDA layers

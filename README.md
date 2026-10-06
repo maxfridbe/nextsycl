@@ -28,6 +28,9 @@ PCIe. It runs on one card or splits the layers over several.
 - **Several requests at once:** up to `NS_PARALLEL` (2) conversations decode together - one pass carries a token of
   each, the weights read once for all of them, each row exactly as its own pass would be (`nextsycl batch-check`);
   a single request decodes alone, with the draft block. More wait in order.
+- **LogProbChain** (`logprob_chain: true`, experimental): each answer token's logprob also chained through the attention
+  to the turn's own earlier tokens - an answer that only repeats its thinking counts only as sure as the thinking was
+  (below).
 - **A record of each request:** `nextsycl inspect <id>` prints one as JSON (settings, timings, previews of the prompt
   and the answer); the server keeps the last `NS_KEEP_REQUESTS` (100).
 - **`POST /api/chat` for web pages:** the same chat as JSON lines (`{"thinking": ...}`, `{"content": ...}`, then a
@@ -153,6 +156,33 @@ exactly those of each alone.
 With NS_PARALLEL=2 two requests decode in one pass; a third waits for a free session. The batch's limits today: MLA
 runs per session (its projections read once per conversation), and two conversations want more distinct experts a
 layer (more swaps).
+
+## LogProbChain
+
+Thinking skews an answer's logprobs: the answer copies what the thinking wrote, so it looks certain. With
+`"logprob_chain": true` every answer token's entry also carries `chain`: for it and each alternative, the logprob plus,
+over this turn's earlier tokens equal to it, the attention its position gives each times that token's own logprob
+(p' = p x prod p_j^a_j). The attention is the mean over MLA's 64 heads and 11 layers of the softmax weights of the pass
+that produced the token. An example (`reference/logprob-chain-show.py` prints a response this way):
+
+```
+question: Which is larger, 9.11 or 9.9? Reply with just the number.   (reasoning_effort high, greedy)
+thinking: '9.11 vs 9.9: 9.9 = 9.90 > 9.11. Answer: 9.9'
+answer:   '9.9'
+
+'9'        logprob  -0.0056   chained  -0.0078   attention to this turn 0.257
+     echoes turn token #0 '9': attention 0.0121 x its logprob -0.1324
+     echoes turn token #12 '9': attention 0.0026 x its logprob -0.2098
+     echoes turn token #10 '9': attention 0.0031 x its logprob -0.0035
+'.'        logprob  -0.0001   chained  -0.0005   attention to this turn 0.316
+'9'        logprob  -0.0000   chained  -0.0023   attention to this turn 0.272
+     echoes turn token #0 '9': attention 0.0086 x its logprob -0.1324
+     echoes turn token #12 '9': attention 0.0047 x its logprob -0.2098
+     echoes turn token #31 '9': attention 0.0226 x its logprob -0.0056
+```
+
+The last `9` reads as certain (-0.0000) but chains to -0.0023: most of it from the thinking's two hesitant `9`s.
+Requests with it decode one token a pass (no draft block), a few small reads a layer more.
 
 ## Checking it
 
