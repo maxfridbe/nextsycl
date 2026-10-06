@@ -22,6 +22,9 @@ PCIe. It runs on one card or splits the layers over several.
   turn, at the start of its last user turn, and at its end.
 - **An OpenAI-compatible server** with streaming and the thinking split out, run as a service: `nextsycl start`,
   `stop`, `status`, `ps`, `cache`, `chat`, `logs`, over a control socket.
+- **Energy and logprobs in every answer:** `usage.energy_wh` (and `energy_wh` on `/api/chat`'s last line) - the watt-hours
+  both cards drew for the request; `logprobs: true` (+ `top_logprobs`, up to 20) returns each answer token's
+  log-probability and the likeliest alternatives, as OpenAI's `choices[0].logprobs.content`, streamed or not.
 - **A record of each request:** `nextsycl inspect <id>` prints one as JSON (settings, timings, previews of the prompt
   and the answer); the server keeps the last `NS_KEEP_REQUESTS` (100).
 - **`POST /api/chat` for web pages:** the same chat as JSON lines (`{"thinking": ...}`, `{"content": ...}`, then a

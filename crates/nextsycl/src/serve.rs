@@ -5,13 +5,15 @@
 //!     GET  /v1/models              the one model
 //!     GET  /status                 {"busy": bool, "prompt_cache": ...}
 //!     POST /v1/chat/completions    messages, max_tokens, temperature, top_p, stream, reasoning_effort (or
-//!                                  chat_template_kwargs.reasoning_effort): low | high | max
+//!                                  chat_template_kwargs.reasoning_effort): low | high | max; logprobs, top_logprobs
+//!                                  (the answer's tokens, as OpenAI's choices[0].logprobs.content); usage.energy_wh
 //!     POST /api/chat               the same for a web page, simpler: {"messages": [{"role", "content", "thinking"?}],
 //!                                  "effort"?, "max_tokens"?, "temperature"?, "top_p"?, "stream"? (default true)};
 //!                                  streamed as JSON lines - {"thinking": text} and {"content": text} as they come,
 //!                                  then {"done": true, "finish", "prompt_tokens", "reused", "generated",
-//!                                  "read_seconds", "generate_seconds", "tok_s"}; not streamed, one object with
-//!                                  "content" and "thinking" beside those
+//!                                  "read_seconds", "generate_seconds", "tok_s", "energy_wh"}; not streamed, one object
+//!                                  with "content" and "thinking" beside those; "logprobs": true (+ "top_logprobs")
+//!                                  adds the answer tokens' entries ("logprobs" on the lines, or all at the end)
 //!
 //! A browser may call these from a page on a loopback origin (http://localhost:*, http://127.0.0.1:*) or one
 //! `--cors` names (NS_CORS; * = any): the answers carry the CORS headers, OPTIONS answers the preflight.
@@ -84,6 +86,30 @@ struct Ask {
     temp: f32,
     top_p: f32,
     stream: bool,
+    /// logprobs asked for: how many alternatives with each (top_logprobs, at most 20)
+    logprobs: Option<usize>,
+}
+
+/// One generated token's logprob entry (OpenAI's shape): its log-probability under the model (the raw logits'
+/// softmax, before temperature and top-p), its text and bytes, and the `k` likeliest tokens at that position
+fn logprob_entry(tok: &Tokenizer, l: &[f32], y: u32, k: usize) -> Value {
+    let mx = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let lse = mx + l.iter().map(|&v| (v as f64 - mx).exp()).sum::<f64>().ln();
+    let one = |id: u32| {
+        let b = tok.decode_bytes(&[id]);
+        json!({"token": String::from_utf8_lossy(&b), "logprob": l[id as usize] as f64 - lse, "bytes": b})
+    };
+    let mut e = one(y);
+    let mut top: Vec<u32> = Vec::new();
+    if k > 0 {
+        let mut idx: Vec<u32> = (0..l.len() as u32).collect();
+        idx.select_nth_unstable_by(k - 1, |a, b| l[*b as usize].total_cmp(&l[*a as usize]));
+        idx.truncate(k);
+        idx.sort_by(|a, b| l[*b as usize].total_cmp(&l[*a as usize]));
+        top = idx;
+    }
+    e["top_logprobs"] = json!(top.into_iter().map(one).collect::<Vec<_>>());
+    e
 }
 
 /// How a chat's answer is written: OpenAI's chunks (server-sent events), or /api/chat's JSON lines.
@@ -367,7 +393,12 @@ impl Server {
                  max: req["max_tokens"].as_u64().or_else(|| req["max_completion_tokens"].as_u64()).map(|n| n as usize),
                  temp: req["temperature"].as_f64().unwrap_or(1.0) as f32,
                  top_p: req["top_p"].as_f64().unwrap_or(0.95) as f32,
-                 stream: req["stream"].as_bool().unwrap_or(api == Api::Lines) })
+                 stream: req["stream"].as_bool().unwrap_or(api == Api::Lines),
+                 logprobs: match &req["logprobs"] {
+                     Value::Bool(true) => Some(req["top_logprobs"].as_u64().unwrap_or(0).min(20) as usize),
+                     Value::Number(n) => Some(n.as_u64().unwrap_or(0).min(20) as usize), // the completions API's form
+                     _ => None,
+                 } })
     }
 
     fn chat(&self, s: &mut Conn, ask: &Ask, api: Api, cors: &str, via: &str) -> Result<(), String> {
@@ -457,11 +488,24 @@ impl Server {
             write!(s, "data: {chunk}\n\n").and_then(|_| s.flush()).is_ok()
         };
         // one piece of the answer as it comes: the thinking or the answer's text
-        let emit = |s: &mut Conn, thinking: bool, text: String| -> bool {
+        // one piece of the answer as it comes, with the logprobs of the answer tokens it completes (when asked)
+        let lp_on = ask.logprobs.is_some();
+        let emit = |s: &mut Conn, thinking: bool, text: String, lps: Vec<Value>| -> bool {
             match api {
-                Api::OpenAi => send(s, if thinking { json!({"reasoning_content": text}) } else { json!({"content": text}) }, None),
+                Api::OpenAi => {
+                    let delta = if thinking { json!({"reasoning_content": text}) } else { json!({"content": text}) };
+                    let mut chunk = json!({"id": id, "object": "chat.completion.chunk", "created": now(), "model": self.name,
+                                           "choices": [{"index": 0, "delta": delta, "finish_reason": null}]});
+                    if lp_on {
+                        chunk["choices"][0]["logprobs"] = if lps.is_empty() { Value::Null } else { json!({"content": lps}) };
+                    }
+                    write!(s, "data: {chunk}\n\n").and_then(|_| s.flush()).is_ok()
+                }
                 Api::Lines => {
-                    let line = if thinking { json!({"thinking": text}) } else { json!({"content": text}) };
+                    let mut line = if thinking { json!({"thinking": text}) } else { json!({"content": text}) };
+                    if !lps.is_empty() {
+                        line["logprobs"] = json!(lps);
+                    }
                     writeln!(s, "{line}").and_then(|_| s.flush()).is_ok()
                 }
             }
@@ -478,18 +522,36 @@ impl Server {
         let mut dec = self.glm.decoder(logits, true);
         let mut out: std::collections::VecDeque<u32> = Default::default();
         let mut committed: Vec<u32> = Vec::new();
+        // logprobs: each sampled token's entry in order (a step's samples are its tokens, in order), the answer's
+        // ones kept (all, and those not sent yet)
+        let mut lps: VecDeque<Value> = VecDeque::new();
+        let (mut lp_all, mut lp_pending): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
         while n < max {
             if out.is_empty() {
                 let rng = &mut st.rng;
-                let mut draw = |l: &[f32]| sample(l, temp, top_p, rng);
+                let tok = &self.tok;
+                let lpq = &mut lps;
+                let mut draw = |l: &[f32]| {
+                    let y = sample(l, temp, top_p, rng);
+                    if let Some(k) = ask.logprobs {
+                        lpq.push_back(logprob_entry(tok, l, y, k));
+                    }
+                    y
+                };
                 let toks = self.glm.step(&mut st.work, &mut dec, &mut draw, &mut none).map_err(|e| e.0)?;
                 committed.extend(&toks);
                 out.extend(toks);
             }
             let next = out.pop_front().unwrap_or_default();
+            let lp = lps.pop_front();
             if self.tok.stop.contains(&next) {
                 finish = "stop";
                 break;
+            }
+            // the thinking's tokens carry none (as OpenAI's reasoning models)
+            if let Some(e) = lp.filter(|_| !thinking) {
+                lp_all.push(e.clone());
+                lp_pending.push(e);
             }
             n += 1;
             let el = t1.elapsed().as_secs_f64();
@@ -527,7 +589,8 @@ impl Server {
             }
             if stream {
                 for (is_r, p) in parts {
-                    if !p.is_empty() && !emit(s, is_r, p) {
+                    let l = if is_r { Vec::new() } else { std::mem::take(&mut lp_pending) };
+                    if !p.is_empty() && !emit(s, is_r, p, l) {
                         finish = "client gone";
                     }
                 }
@@ -543,7 +606,10 @@ impl Server {
         eprintln!("[request: {} prompt tokens ({} reused from {source}, {} fed in {prefill:.1} s, {saved} checkpoint(s) saved; cache {} entries, {:.2} GiB), {n} generated in {dt:.1} s ({:.2} tok/s), drafts {}/{} accepted, {finish}]",
                   ids.len(), from, ids.len() - from, st.cache.len(), st.cache.bytes() as f64 / (1u64 << 30) as f64, n as f64 / dt.max(1e-9),
                   dec.accepted, dec.drafted);
-        let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": n, "total_tokens": ids.len() + n});
+        // the energy both cards drew while it ran (idle power included): joules, and watt-hours in the answer
+        let e = energy();
+        let wh = e.map(|j| (j / 3600.0 * 1e4).round() / 1e4);
+        let usage = json!({"prompt_tokens": ids.len(), "completion_tokens": n, "total_tokens": ids.len() + n, "energy_wh": wh});
         if let Some(mut row) = self.current.lock().unwrap().take() {
             row["state"] = json!("done");
             row["finish"] = json!(finish);
@@ -553,8 +619,6 @@ impl Server {
             row["drafts"] = json!([dec.accepted, dec.drafted]);
             row["checkpoints_saved"] = json!(saved);
             row["ended"] = json!(now());
-            // the energy both cards drew while it ran (idle power included), and the average
-            let e = energy();
             let r1 = |x: f64| (x * 10.0).round() / 10.0;
             row["energy_j"] = json!(e.map(r1));
             row["avg_watts"] = json!(e.map(|e| r1(e / (prefill + dt).max(1e-9))));
@@ -565,26 +629,36 @@ impl Server {
         let finish = if finish == "client gone" { "stop" } else { finish };
         if api == Api::Lines {
             let mut end = json!({"done": true, "finish": finish, "model": self.name, "prompt_tokens": ids.len(), "reused": from, "generated": n,
-                                 "read_seconds": prefill, "generate_seconds": dt, "tok_s": n as f64 / dt.max(1e-9)});
+                                 "read_seconds": prefill, "generate_seconds": dt, "tok_s": n as f64 / dt.max(1e-9), "energy_wh": wh});
+            if stream && !lp_pending.is_empty() {
+                end["logprobs"] = json!(lp_pending); // the answer's last tokens, when no text followed them
+            }
             if stream {
                 let _ = writeln!(s, "{end}");
                 let _ = s.flush();
             } else {
                 end["content"] = json!(content.trim());
                 end["thinking"] = json!(reasoning.trim());
+                if lp_on {
+                    end["logprobs"] = json!(lp_all);
+                }
                 http::respond_with(s, 200, &end, cors);
             }
         } else if stream {
+            if !lp_pending.is_empty() {
+                emit(s, false, String::new(), std::mem::take(&mut lp_pending));
+            }
             send(s, json!({}), Some(finish));
             let _ = write!(s, "data: {}\n\ndata: [DONE]\n\n", json!({"id": id, "object": "chat.completion.chunk", "created": now(), "model": self.name,
                                                                       "choices": [], "usage": usage}));
         } else {
             http::respond_with(s, 200, &json!({"id": id, "object": "chat.completion", "created": now(), "model": self.name,
                                     "choices": [{"index": 0, "message": {"role": "assistant", "content": content.trim(),
-                                                 "reasoning_content": reasoning.trim()}, "finish_reason": finish}],
+                                                 "reasoning_content": reasoning.trim()}, "finish_reason": finish,
+                                                 "logprobs": if lp_on { json!({"content": lp_all}) } else { Value::Null }}],
                                     "usage": usage,
                                     "timings": {"prompt_n": ids.len() - from, "prompt_ms": prefill * 1000.0, "predicted_n": n,
-                                                "predicted_per_second": n as f64 / dt.max(1e-9)}}), cors);
+                                                "predicted_per_second": n as f64 / dt.max(1e-9), "energy_wh": wh}}), cors);
         }
         Ok(())
     }
