@@ -72,14 +72,15 @@ GLM-5.3-Flash IQ2 (the ds4 file, 80 GB of experts) on an Arc Pro B70 and an Arc 
 | | |
 |---|---|
 | prompt, 3K tokens | ~400 tokens/s |
-| prompt, 12K tokens | ~430-450 tokens/s |
-| decode, short context, MTP on | ~16.6 tokens/s (87-90% of drafts accepted) |
-| decode, MTP off | ~14.4 tokens/s |
+| prompt, 12K tokens | ~475 tokens/s |
+| decode, short context, MTP on | ~18.5-19.5 tokens/s (87-90% of drafts accepted) |
 | load | ~18 s |
 
-About 60% of the experts fit in VRAM; the rest sit in pinned host memory. At decode a missed expert is swapped in
-over PCIe (both directions at once, on two copy queues, while the resident experts compute) - those swaps are about
-a third of decode time today, the next thing being worked on (`TODO.md`).
+About 60% of the experts fit in VRAM (plus ~380 slots a GPU lent by the prompt arena while decode runs); the rest sit
+in pinned host memory. At decode a missed expert is swapped in over PCIe (both directions at once, on two copy
+queues, while the resident experts compute; the next layer's likely experts prefetched) - on these cards' x8 links
+those swaps are still the largest share of decode time (`TODO.md`). `--gpu all` puts the GPU that computes most last
+(it takes the head and the draft block); `NS_SPLIT` sets the layers per GPU.
 
 ## Checking it
 
@@ -90,7 +91,7 @@ a third of decode time today, the next thing being worked on (`TODO.md`).
 - `NS_PROFILE=1 nextsycl generate ...`: seconds per section, the GPU synced at each boundary; `NS_PROFILE=gpu`: device
   timestamps instead (no syncs - the honest view of decode, where sections are tens of microseconds).
 - Switches for A/B measurements: `NS_DENSE_F16=0`, `NS_PROMPT_F16_MIN`, `NS_PREFILL_CHUNK`, `NS_HC_FUSED=0`,
-  `NS_DECODE_LANES`, `NS_DECODE_DIRECT=1`, `NS_ARENA_MIB`.
+  `NS_DECODE_LANES`, `NS_DECODE_DIRECT=1`, `NS_ARENA_MIB`, `NS_PREFETCH`, `NS_LEND=0`, `NS_SPLIT`.
 
 ## Standing on
 
