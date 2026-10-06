@@ -23,3 +23,5 @@ New code goes in `kernels/ns/`. The changes made here, each marked `nextsycl` in
 - `src/kernels/iq_kernels.dp.cpp`: Q2_K and Q3_K dot products (from ggml-sycl's `vecdotq.hpp`, llama.cpp
   de25343, in this file's (row, kbx) form) and their `Fmt` traits; Q2_K / Q3_K added to the gate-up, down and
   matvec format lists, Q4_K / Q5_K to the down list; Q2_K in `is_iq` / `iq_row_bytes` - GLM-5.3's expert files.
+  The grouped experts' SwiGLU takes an optional clamp (`native_expert_set_swiglu_limit`, 0 = none as before;
+  GLM-5.3's `silu(min(g, 10)) * clamp(u, -10, 10)`).

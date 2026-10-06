@@ -469,6 +469,51 @@ impl Ops {
         };
         self.ok(rc, "mmvq")
     }
+    /// y [t, c] += per token the weighted sum of its entries' rows: `ints` holds t_ptr [t + 1] then ent [entries]
+    /// (int32), `w` [entries]
+    pub fn moe_combine(&self, y: &DevBuf, rows: &DevBuf, ints: &DevBuf, w: &DevBuf, t: usize, entries: usize, c: usize) -> Result<()> {
+        need!(y, t * c, "combine y");
+        need!(rows, entries * c, "combine rows");
+        need!(ints, t + 1 + entries, "combine index");
+        need!(w, entries, "combine w");
+        // SAFETY: sizes checked; the index values are the caller's (rows of `rows`, prefix sums within entries).
+        let rc = unsafe {
+            (self.a().moe_combine)(self.raw(), y.fp(), rows.fp(), ints.ptr.cast(), ints.ptr.cast::<i32>().add(t + 1), w.fp(), t as i64, c as i64)
+        };
+        self.ok(rc, "moe_combine")
+    }
+    pub fn moe_grouped_supported(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> bool {
+        // SAFETY: a capability query.
+        unsafe { (self.a().moe_grouped_supported)(gu as i32, down as i32, n_embd as i64, n_ff as i64) != 0 }
+    }
+    pub fn moe_scratch_bytes(&self, entries: usize, n_ff: usize) -> usize {
+        // SAFETY: arithmetic only.
+        unsafe { (self.a().moe_scratch_bytes)(entries as i64, n_ff as i64) }
+    }
+    /// A layer's experts in two launches. `table` holds, as u64: the groups' blob pointers [groups]; then as i32:
+    /// grp_start [groups + 1], n_groups [1], ent_dst [entries], ent_tok [entries] (at the offsets returned by
+    /// `moe_table`). `xq` the tokens' Q8_1, `out` [entries, n_embd] (unweighted rows).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_grouped(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize, table: &DevBuf, groups: usize, entries: usize, xq: &DevBuf, scratch: &DevBuf,
+                       out: &DevBuf, limit: f32) -> Result<()> {
+        let ints = groups * 2 + (groups + 1) + 1 + 2 * entries; // the u64 pointers as two i32 each, then the i32 tables
+        if table.len < ints * 4 || scratch.len < self.moe_scratch_bytes(entries, n_ff) {
+            return Err(Error("moe_grouped: the table or the scratch is short".into()));
+        }
+        need!(out, entries * n_embd, "moe_grouped out");
+        let base = table.ptr.cast::<u8>();
+        // SAFETY: the table's layout as written by the caller (above), sizes checked; the blob pointers are the
+        // caller's (VRAM slots of this GPU holding the experts).
+        let rc = unsafe {
+            let ptrs = base.cast::<u64>();
+            let i32s = base.add(groups * 8).cast::<i32>();
+            let (gs, ng) = (i32s, i32s.add(groups + 1));
+            let (dst, tok) = (ng.add(1), ng.add(1 + entries));
+            (self.a().moe_grouped)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64, entries as i64,
+                                   xq.ptr, scratch.ptr, out.fp(), limit)
+        };
+        self.ok(rc, "moe_grouped")
+    }
     pub fn add(&self, y: &DevBuf, x: &DevBuf, n: usize) -> Result<()> {
         need!(y, n, "add y");
         need!(x, n, "add x");

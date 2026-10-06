@@ -418,21 +418,44 @@ impl Part {
         }).collect())
     }
 
-    /// One part of a resident expert ((chunk, offset) from `ensure`) applied to x [n, cols].
-    fn expert_mm(&self, slot: (usize, usize), part: (usize, usize, GType), rows: usize, cols: usize, x: &DevBuf, n: usize) -> Result<DevBuf> {
-        let (off, bytes, ty) = part;
-        let c = self.experts.lock().unwrap();
-        let buf = &c.vram[slot.0];
-        let y = DevBuf::f32(&self.ops.gpu, n * rows)?;
-        if n <= MMVQ_COLS && self.ops.mmvq_supported(ty.code()) {
-            self.ops.quantize_q8_1((x, 0), &self.q8, cols, n)?;
-            self.ops.mmvq(ty.code(), (buf, slot.1 + off), bytes, &self.q8, (&y, 0), cols, rows, n)?;
-        } else {
-            self.ops.dequant(ty.code(), buf, slot.1 + off, bytes, rows * cols, &self.scratch)?;
-            self.ops.gemm_at(n, rows, cols, (x, 0, cols), (&self.scratch, 0), (&y, 0, rows), false)?;
+    /// Several matrices on the same input x [t, cols]: one Q8_1 quantization of x serves every decode product.
+    fn mm_many(&self, l: u64, roles: &[Role], x: &DevBuf, t: usize) -> Result<Vec<DevBuf>> {
+        let ws: Vec<&Mat> = roles.iter().map(|r| self.mat(l, *r)).collect::<Result<_>>()?;
+        let quantized = ws.iter().filter(|w| !w.f32 && self.ops.mmvq_supported(w.ty.code())).count();
+        let cols = ws[0].cols;
+        if t <= MMVQ_COLS && quantized > 1 && ws.iter().all(|w| w.cols == cols) && cols <= MAX_COLS {
+            self.ops.quantize_q8_1((x, 0), &self.q8, cols, t)?;
+            return ws.iter().map(|w| {
+                let y = DevBuf::f32(&self.ops.gpu, t * w.rows)?;
+                if !w.f32 && self.ops.mmvq_supported(w.ty.code()) {
+                    self.ops.mmvq(w.ty.code(), (&w.buf, 0), w.buf.len, &self.q8, (&y, 0), w.cols, w.rows, t)?;
+                } else {
+                    self.matmul(w, t, (x, 0, w.cols), (&y, 0, w.rows), false)?;
+                }
+                Ok(y)
+            }).collect();
         }
-        Ok(y)
+        roles.iter().map(|r| self.mm(l, *r, x, t)).collect()
     }
+
+    /// One part of a resident expert (its VRAM chunk `buf`, slot offset `at`) on x rows [n, cols] from float
+    /// `x.1` into y rows [n, rows] from float `y.1`. `quantize`: x into Q8_1 first (false: the previous call's
+    /// quantization of the same rows serves - gate and up share it).
+    #[allow(clippy::too_many_arguments)]
+    fn expert_into(&self, buf: &DevBuf, at: usize, part: (usize, usize, GType), rows: usize, cols: usize, x: (&DevBuf, usize), y: (&DevBuf, usize),
+                   n: usize, quantize: bool) -> Result<()> {
+        let (off, bytes, ty) = part;
+        if n <= MMVQ_COLS && self.ops.mmvq_supported(ty.code()) {
+            if quantize {
+                self.ops.quantize_q8_1(x, &self.q8, cols, n)?;
+            }
+            self.ops.mmvq(ty.code(), (buf, at + off), bytes, &self.q8, y, cols, rows, n)
+        } else {
+            self.ops.dequant(ty.code(), buf, at + off, bytes, rows * cols, &self.scratch)?;
+            self.ops.gemm_at(n, rows, cols, (x.0, x.1, cols), (&self.scratch, 0), (y.0, y.1, rows), false)
+        }
+    }
+
 }
 
 impl<'g> Glm<'g> {
@@ -592,31 +615,30 @@ impl<'g> Glm<'g> {
             tap(&format!("attn_norm-{l}"), normed)?;
             let att = self.timed(p, if g.is_mla(l) { "MLA" } else { "KDA" }, || -> Result<DevBuf> {
                 Ok(if let LayerState::Kda { s: kstate, conv: cstate } = &sess.layers[l as usize] {
-                    let conv = |r: Role, w: Role, state: &DevBuf| -> Result<DevBuf> {
-                        let pr = p.mm(l, r, normed, t)?;
+                    // every product of the layer's input at once (one quantization of it)
+                    let mut pj = p.mm_many(l, &[Role::KdaQ, Role::KdaK, Role::KdaV, Role::KdaFA, Role::KdaGA, Role::KdaBeta], normed, t)?.into_iter();
+                    let (pq, pk, pv, fa, ga, beta) = (pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap());
+                    let conv = |pr: &DevBuf, w: Role, state: &DevBuf| -> Result<DevBuf> {
                         let out = DevBuf::f32(gpu, t * kw)?;
-                        o.conv_silu(&pr, state, p.vec(l, w)?, &out, t, kw, g.kda_conv as usize)?;
+                        o.conv_silu(pr, state, p.vec(l, w)?, &out, t, kw, g.kda_conv as usize)?;
                         Ok(out)
                     };
-                    let q = conv(Role::KdaQ, Role::KdaQConv, &cstate[0])?;
-                    let k = conv(Role::KdaK, Role::KdaKConv, &cstate[1])?;
-                    let v = conv(Role::KdaV, Role::KdaVConv, &cstate[2])?;
+                    let q = conv(&pq, Role::KdaQConv, &cstate[0])?;
+                    let k = conv(&pk, Role::KdaKConv, &cstate[1])?;
+                    let v = conv(&pv, Role::KdaVConv, &cstate[2])?;
                     tap(&format!("kda_q_conv-{l}"), &q)?;
                     tap(&format!("kda_k_conv-{l}"), &k)?;
                     tap(&format!("kda_v_conv-{l}"), &v)?;
                     o.l2_norm(&q, t * kh, kd, 1e-6)?;
                     o.l2_norm(&k, t * kh, kd, 1e-6)?;
-                    let fa = p.mm(l, Role::KdaFA, normed, t)?;
                     let gate = p.mm(l, Role::KdaFB, &fa, t)?;
                     o.kda_gate(&gate, p.vec(l, Role::KdaDtBias)?, p.vec(l, Role::KdaA)?, t, kh, kd, g.kda_gate_low as f32)?;
                     tap(&format!("kda_g1-{l}"), &gate)?;
-                    let beta = p.mm(l, Role::KdaBeta, normed, t)?;
                     o.sigmoid(&beta, t * kh)?;
                     tap(&format!("kda_beta-{l}"), &beta)?;
                     let scan = DevBuf::f32(gpu, t * kw)?;
                     o.kda_scan(&q, &k, &v, &gate, &beta, kstate, &scan, t, kh, kd)?;
                     tap(&format!("kda_scan_out-{l}"), &scan)?;
-                    let ga = p.mm(l, Role::KdaGA, normed, t)?;
                     let g2 = p.mm(l, Role::KdaGB, &ga, t)?;
                     tap(&format!("kda_g2-{l}"), &g2)?;
                     let y = DevBuf::f32(gpu, t * kw)?;
@@ -627,12 +649,12 @@ impl<'g> Glm<'g> {
                 } else {
                     let LayerState::Mla { c: cache } = &sess.layers[l as usize] else { return Err(Error("layer state".into())) };
                     let (nh, hd, lat) = (g.n_head as usize, g.head_dim as usize, g.kv_lora as usize);
-                    let qa = p.mm(l, Role::MlaQA, normed, t)?;
+                    let mut pj = p.mm_many(l, &[Role::MlaQA, Role::MlaKvA], normed, t)?.into_iter();
+                    let (qa, kv) = (pj.next().unwrap(), pj.next().unwrap());
                     let qr = DevBuf::f32(gpu, t * g.q_lora as usize)?;
                     o.rms_norm(&qa, Some(p.vec(l, Role::MlaQANorm)?), &qr, t, g.q_lora as usize, eps)?;
                     tap(&format!("q_resid-{l}"), &qr)?;
                     let q = p.mm(l, Role::MlaQB, &qr, t)?;
-                    let kv = p.mm(l, Role::MlaKvA, normed, t)?;
                     let c = DevBuf::f32(gpu, t * lat)?;
                     o.rms_norm(&kv, Some(p.vec(l, Role::MlaKvANorm)?), &c, t, lat, eps)?;
                     tap(&format!("kv_cmpr-{l}"), &c)?;
@@ -666,8 +688,8 @@ impl<'g> Glm<'g> {
             let lim = g.swiglu_limit as f32;
             let ffn = if !g.is_moe(l) {
                 self.timed(p, "dense FFN", || {
-                    let gt = p.mm(l, Role::FfnGate, normed, t)?;
-                    let up = p.mm(l, Role::FfnUp, normed, t)?;
+                    let mut pj = p.mm_many(l, &[Role::FfnGate, Role::FfnUp], normed, t)?.into_iter();
+                    let (gt, up) = (pj.next().unwrap(), pj.next().unwrap());
                     o.swiglu_clamp(&gt, &up, &gt, t * g.ffn_dense as usize, lim)?;
                     p.mm(l, Role::FfnDown, &gt, t)
                 })?
@@ -724,8 +746,8 @@ impl<'g> Glm<'g> {
         }
         // the shared expert first, then each routed expert added into it
         let y = self.timed(p, "shared expert", || {
-            let sg = p.mm(l, Role::ShGate, x, t)?;
-            let su = p.mm(l, Role::ShUp, x, t)?;
+            let mut pj = p.mm_many(l, &[Role::ShGate, Role::ShUp], x, t)?.into_iter();
+            let (sg, su) = (pj.next().unwrap(), pj.next().unwrap());
             o.swiglu_clamp(&sg, &su, &sg, t * g.ffn_expert as usize * g.n_expert_shared as usize, lim)?;
             p.mm(l, Role::ShDown, &sg, t)
         })?;
@@ -734,20 +756,93 @@ impl<'g> Glm<'g> {
         let parts = expert_parts(&self.m, l)?;
         let (f, cols) = (g.ffn_expert as usize, d);
         self.timed(p, "routed experts", || {
-            for ((_, list), slot) in by.iter().zip(&slots) {
-                let n = list.len();
-                let idx = DevBuf::new(gpu, n * 4)?;
-                idx.write(0, &list.iter().flat_map(|(ti, _)| ti.to_le_bytes()).collect::<Vec<u8>>())?;
-                let w = DevBuf::from_f32(gpu, &list.iter().map(|(_, w)| *w).collect::<Vec<f32>>())?;
-                let xe = DevBuf::f32(gpu, n * d)?;
-                o.gather(x, &idx, &xe, n, d)?;
-                let gt = p.expert_mm(*slot, parts.gate, f, cols, &xe, n)?;
-                let up = p.expert_mm(*slot, parts.up, f, cols, &xe, n)?;
-                o.swiglu_clamp(&gt, &up, &gt, n * f, lim)?;
-                let dn = p.expert_mm(*slot, parts.down, d, f, &gt, n)?;
-                o.scatter_add(&y, &dn, &idx, &w, n, d)?;
+            // the entries grouped by expert (rows of xe / gt / ut / dn), and per token its entries (the combine):
+            // one upload of the layer's routing
+            let total: usize = by.values().map(|v| v.len()).sum();
+            let mut tok = Vec::with_capacity(total);
+            let mut per_token: Vec<Vec<(i32, f32)>> = vec![Vec::new(); t];
+            for list in by.values() {
+                for (ti, w) in list {
+                    per_token[*ti as usize].push((tok.len() as i32, *w));
+                    tok.push(*ti);
+                }
             }
-            Ok(())
+            let mut ints: Vec<i32> = tok.clone();
+            let mut t_ptr = vec![0i32];
+            let mut ent = Vec::with_capacity(total);
+            let mut wts = Vec::with_capacity(total);
+            for list in &per_token {
+                for (row, w) in list {
+                    ent.push(*row);
+                    wts.push(*w);
+                }
+                t_ptr.push(ent.len() as i32);
+            }
+            let base = ints.len();
+            ints.extend(&t_ptr);
+            ints.extend(&ent);
+            let wb = DevBuf::from_f32(gpu, &wts)?;
+            // the grouped kernels (two launches for the layer), when they take this layer's types
+            if parts.gate.2 == parts.up.2 && o.moe_grouped_supported(parts.gate.2.code(), parts.down.2.code(), d, f) {
+                let groups = by.len();
+                let c = p.experts.lock().unwrap();
+                let mut table: Vec<u8> = Vec::with_capacity(groups * 8 + (groups + 2 + 2 * total) * 4);
+                for slot in &slots {
+                    table.extend((c.vram[slot.0].ptr() as u64 + slot.1 as u64).to_le_bytes());
+                }
+                let mut start = 0i32;
+                table.extend(start.to_le_bytes());
+                for list in by.values() {
+                    start += list.len() as i32;
+                    table.extend(start.to_le_bytes());
+                }
+                table.extend((groups as i32).to_le_bytes());
+                for e in 0..total as i32 {
+                    table.extend(e.to_le_bytes()); // ent_dst: an entry's own row
+                }
+                for ti in &tok {
+                    table.extend(ti.to_le_bytes());
+                }
+                let tb = DevBuf::new(gpu, table.len())?;
+                tb.write(0, &table)?;
+                let xq = DevBuf::new(gpu, o.q8_1_bytes(d, t))?;
+                o.quantize_q8_1((x, 0), &xq, d, t)?;
+                let scratch = DevBuf::new(gpu, o.moe_scratch_bytes(total, f))?;
+                let dn = DevBuf::f32(gpu, total * d)?;
+                o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, total, &xq, &scratch, &dn, lim)?;
+                drop(c);
+                let cb = DevBuf::new(gpu, (t + 1 + total) * 4)?;
+                cb.write(0, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                return o.moe_combine(&y, &dn, &cb, &wb, t, total, d);
+            }
+            let ib = DevBuf::new(gpu, ints.len() * 4)?;
+            ib.write(0, &ints.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            let xe = DevBuf::f32(gpu, total * d)?;
+            o.gather(x, &ib, &xe, total, d)?;
+            let gt = DevBuf::f32(gpu, total * f)?;
+            let ut = DevBuf::f32(gpu, total * f)?;
+            let dn = DevBuf::f32(gpu, total * d)?;
+            let c = p.experts.lock().unwrap();
+            let mut row = 0;
+            for (list, slot) in by.values().zip(&slots) {
+                let n = list.len();
+                let buf = &c.vram[slot.0];
+                p.expert_into(buf, slot.1, parts.gate, f, cols, (&xe, row * cols), (&gt, row * f), n, true)?;
+                p.expert_into(buf, slot.1, parts.up, f, cols, (&xe, row * cols), (&ut, row * f), n, false)?;
+                row += n;
+            }
+            o.swiglu_clamp(&gt, &ut, &gt, total * f, lim)?;
+            let mut row = 0;
+            for (list, slot) in by.values().zip(&slots) {
+                let n = list.len();
+                p.expert_into(&c.vram[slot.0], slot.1, parts.down, d, f, (&gt, row * f), (&dn, row * d), n, true)?;
+                row += n;
+            }
+            drop(c);
+            // the combine reads t_ptr and ent behind the entries' token list in `ib`
+            let ints_view = DevBuf::new(gpu, (t + 1 + total) * 4)?;
+            ints_view.copy_within(0, &ib, base * 4, (t + 1 + total) * 4)?;
+            o.moe_combine(&y, &dn, &ints_view, &wb, t, total, d)
         })?;
         Ok(y)
     }

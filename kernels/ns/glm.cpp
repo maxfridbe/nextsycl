@@ -519,6 +519,20 @@ int ns_gather(ns_gpu* g, const float* src, const int32_t* idx, float* out, int64
     NS_CATCH
 }
 
+// The MoE combine, per token (no two entries write one row): y[t] += sum_j w[j] * rows[ent[j]] for j in
+// [t_ptr[t], t_ptr[t+1]); rows [entries, C]
+int ns_moe_combine(ns_gpu* g, float* y, const float* rows, const int32_t* t_ptr, const int32_t* ent, const float* w, int64_t T, int64_t C) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<2>(T, C), [=](sycl::id<2> id) {
+        const int64_t t = id[0], k = id[1];
+        float s = 0.f;
+        for (int32_t j = t_ptr[t]; j < t_ptr[t + 1]; ++j) s += w[j] * rows[(int64_t) ent[j] * C + k];
+        y[t * C + k] += s;
+    });
+    return 0;
+    NS_CATCH
+}
+
 // y += x (n values)
 int ns_add(ns_gpu* g, float* y, const float* x, int64_t n) {
     NS_TRY

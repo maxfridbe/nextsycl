@@ -73,6 +73,8 @@ int ns_mla_attend(ns_gpu* g, const float* qa, const float* c, float* u, int64_t 
 int ns_scatter_add(ns_gpu* g, float* y, const float* src, const int32_t* idx, const float* w, int64_t n, int64_t C);
 int ns_gather(ns_gpu* g, const float* src, const int32_t* idx, float* out, int64_t n, int64_t C);
 int ns_add(ns_gpu* g, float* y, const float* x, int64_t n);
+/* MoE combine per token: y[t] += sum_{j in [t_ptr[t], t_ptr[t+1])} w[j] * rows[ent[j]], rows [entries, C] */
+int ns_moe_combine(ns_gpu* g, float* y, const float* rows, const int32_t* t_ptr, const int32_t* ent, const float* w, int64_t T, int64_t C);
 
 /* ---- decode-width products from the stored blocks (mmvq.cpp) ---- */
 size_t ns_q8_1_bytes(int64_t n_in, int64_t ncols);
@@ -81,6 +83,12 @@ int ns_mmvq_supported(int type);
 int ns_quantize_q8_1(ns_gpu* g, const float* x, void* q8_1, int64_t n_in, int64_t ncols);
 /* y [ncols, n_out] = W [n_out, n_in] . x for 1..8 columns; W in its ggml type */
 int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+/* a layer's routed experts in two launches (mmvq.cpp): see there */
+int ns_moe_grouped_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+size_t ns_moe_scratch_bytes(int64_t entries, int64_t n_ff);
+int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const uint64_t* grp_ptr, const int32_t* grp_start,
+                   const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t groups, int64_t entries, const void* x_q8_1,
+                   void* scratch, float* out, float limit);
 
 #ifdef __cplusplus
 }

@@ -44,4 +44,28 @@ int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, in
     NS_CATCH
 }
 
+// ---- a layer's routed experts in two launches (the imported grouped kernels): gate+up for every entry, then
+// SwiGLU (clamped at `limit` when > 0) quantized, then down. grp_ptr [groups] the experts' [gate | up | down]
+// blobs, grp_start [groups + 1] their entries' ranges, n_groups (one int), ent_tok [entries] each entry's token
+// row of x_q8_1, ent_dst [entries] its output row of out [., n_embd]; all device memory.
+int ns_moe_grouped_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+    return strata::kernels::native_expert_supported(gu_type, d_type, n_embd, n_ff) ? 1 : 0;
+}
+
+size_t ns_moe_scratch_bytes(int64_t entries, int64_t n_ff) { return strata::kernels::native_expert_scratch_bytes(entries, n_ff); }
+
+int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const uint64_t* grp_ptr, const int32_t* grp_start,
+                   const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t groups, int64_t entries, const void* x_q8_1,
+                   void* scratch, float* out, float limit) {
+    NS_TRY
+    if (!strata::kernels::native_expert_supported(gu_type, d_type, n_embd, n_ff))
+        return ns_fail("ns_moe_grouped: types " + std::to_string(gu_type) + "/" + std::to_string(d_type) + " not supported");
+    strata::kernels::native_expert_set_swiglu_limit(limit);
+    const auto L = strata::kernels::native_expert_layout(gu_type, d_type, n_embd, n_ff);
+    strata::kernels::native_expert_grouped(L, (const unsigned long long*) grp_ptr, grp_start, n_groups, ent_dst, ent_tok, groups, entries, x_q8_1,
+                                           scratch, out, &g->q);
+    return 0;
+    NS_CATCH
+}
+
 }  // extern "C"

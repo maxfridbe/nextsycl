@@ -57,11 +57,16 @@ pub struct Api {
     pub scatter_add: unsafe extern "C" fn(Gpu, *mut f32, *const f32, *const i32, *const f32, i64, i64) -> c_int,
     pub gather: unsafe extern "C" fn(Gpu, *const f32, *const i32, *mut f32, i64, i64) -> c_int,
     pub add: unsafe extern "C" fn(Gpu, *mut f32, *const f32, i64) -> c_int,
+    pub moe_combine: unsafe extern "C" fn(Gpu, *mut f32, *const f32, *const i32, *const i32, *const f32, i64, i64) -> c_int,
     // decode-width products (mmvq.cpp)
     pub q8_1_bytes: unsafe extern "C" fn(i64, i64) -> usize,
     pub mmvq_supported: unsafe extern "C" fn(c_int) -> c_int,
     pub quantize_q8_1: unsafe extern "C" fn(Gpu, *const f32, *mut c_void, i64, i64) -> c_int,
     pub mmvq: unsafe extern "C" fn(Gpu, c_int, *const c_void, *const c_void, *mut f32, i64, i64, i64) -> c_int,
+    pub moe_grouped_supported: unsafe extern "C" fn(c_int, c_int, i64, i64) -> c_int,
+    pub moe_scratch_bytes: unsafe extern "C" fn(i64, i64) -> usize,
+    pub moe_grouped: unsafe extern "C" fn(Gpu, c_int, c_int, i64, i64, *const u64, *const i32, *const i32, *const i32, *const i32, i64, i64,
+                                          *const c_void, *mut c_void, *mut f32, f32) -> c_int,
 }
 
 // SAFETY: plain function pointers into a library that stays loaded for the process's life.
@@ -147,10 +152,14 @@ impl Api {
             scatter_add: sym!("ns_scatter_add"),
             gather: sym!("ns_gather"),
             add: sym!("ns_add"),
+            moe_combine: sym!("ns_moe_combine"),
             q8_1_bytes: sym!("ns_q8_1_bytes"),
             mmvq_supported: sym!("ns_mmvq_supported"),
             quantize_q8_1: sym!("ns_quantize_q8_1"),
             mmvq: sym!("ns_mmvq"),
+            moe_grouped_supported: sym!("ns_moe_grouped_supported"),
+            moe_scratch_bytes: sym!("ns_moe_scratch_bytes"),
+            moe_grouped: sym!("ns_moe_grouped"),
         })
     }
 

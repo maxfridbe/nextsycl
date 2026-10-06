@@ -1511,14 +1511,15 @@ __dpct_inline__ void native_gu_multi_kernel(
 
 __dpct_inline__ void swiglu_entries_kernel(const float *__restrict__ gate,
                                            const float *__restrict__ up,
-                                           float *__restrict__ h, long long n) {
+                                           float *__restrict__ h, long long n, float limit /* nextsycl */) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long i =
         (long long)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
         item_ct1.get_local_id(2);
     if (i >= n) return;
-    const float g = gate[i];
-    h[i] = (g / (1.0f + sycl::native::exp(-g))) * up[i];
+    const float g = limit > 0.0f ? sycl::fmin(gate[i], limit) : gate[i];
+    const float u = limit > 0.0f ? sycl::fmin(sycl::fmax(up[i], -limit), limit) : up[i];
+    h[i] = (g / (1.0f + sycl::native::exp(-g))) * u;
 }
 
 template <int TD, int LN = kExpertLanes>
@@ -1653,7 +1654,7 @@ __dpct_inline__ void quantize_q8_1_kernel(const float *__restrict__ x,
 __dpct_inline__ void swiglu_q8_1_entries_kernel(
     const float *__restrict__ gate, const float *__restrict__ up,
     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
-    int n_ff, block_q8_1 *__restrict__ hq) {
+    int n_ff, block_q8_1 *__restrict__ hq, float limit /* nextsycl: > 0 clamps as GLM's swiglu_clamp */) {
     // the product rounded on its own (no contraction into q8_1_store's block sum), as through memory in the v1 kernels
     // - HIP's form; icpx is clang too (SYCL port)
 #pragma clang fp contract(off)
@@ -1666,9 +1667,11 @@ __dpct_inline__ void swiglu_q8_1_entries_kernel(
              item_ct1.get_local_id(2);
          i < hi; i += (long long)item_ct1.get_group_range(2) *
                       item_ct1.get_local_range(2)) {
-        const float g = gate[i];
+        // nextsycl: silu(min(g, limit)) * clamp(u, -limit, limit) when a limit is set (GLM-5.3), else as before
+        const float g = limit > 0.0f ? sycl::fmin(gate[i], limit) : gate[i];
+        const float u = limit > 0.0f ? sycl::fmin(sycl::fmax(up[i], -limit), limit) : up[i];
 #if defined(__HIPCC__)
-        const float h = (g / (1.0f + __expf(-g))) * up[i];
+        const float h = (g / (1.0f + __expf(-g))) * u;
 #else
         /*
         DPCT1013: The rounding mode could not be specified and the
@@ -1676,7 +1679,7 @@ __dpct_inline__ void swiglu_q8_1_entries_kernel(
         Verify the correctness. SYCL math built-in function rounding mode is
         aligned with OpenCL C 1.2 standard.
         */
-        const float h = (g / (1.0f + sycl::native::exp(-g))) * up[i];
+        const float h = (g / (1.0f + sycl::native::exp(-g))) * u;
 #endif
         q8_1_store(h, hq, i);
     }
@@ -2566,9 +2569,11 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 
 namespace {
 bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
+float g_swiglu_limit = 0.0f;   // nextsycl: the grouped experts' SwiGLU clamp (0: none, as before)
 }  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+void native_expert_set_swiglu_limit(float limit) { g_swiglu_limit = limit; }   // nextsycl
 
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
@@ -2597,6 +2602,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
+    const float limit = g_swiglu_limit;   // nextsycl
     if (v1) {
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
@@ -2609,7 +2615,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                         sycl::range(1, 1, 256),
                     sycl::range(1, 1, 256)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    swiglu_entries_kernel(gate, up, h, nh);
+                    swiglu_entries_kernel(gate, up, h, nh, limit);
                 });
         }
         {
@@ -2640,7 +2646,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             exp_props,
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
                 swiglu_q8_1_entries_kernel(gate, up, grp_start, n_groups,
-                                           (int)L.n_ff, hq);
+                                           (int)L.n_ff, hq, limit);
             });
     }
     check("native_expert_grouped/swiglu");
