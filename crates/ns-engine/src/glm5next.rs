@@ -32,6 +32,9 @@ fn f16_min() -> usize {
     *F16_MIN.get_or_init(|| std::env::var("NS_PROMPT_F16_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1024))
 }
 
+/// The widest dense matrix input the fp16 path takes (MLA's output projection: 64 heads of 256)
+const X16_COLS: usize = 16384;
+
 /// Whether the dense matrices take the fp16 path too (NS_DENSE_F16=0: only the experts)
 fn dense_f16() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -59,8 +62,8 @@ pub fn arena_bytes() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| match std::env::var("NS_ARENA_MIB").ok().and_then(|v| v.parse::<usize>().ok()) {
         Some(m) => m << 20,
-        // the fp16 path's peak: ~0.5 MB a token at 4,096 (measured 2.0 GiB)
-        None => (1usize << 30).max(prefill_chunk() * (560 << 10)),
+        // the fp16 path's peak: measured 2.52 GiB at 4,096 on the part with 7 of the MLA layers (~645 KiB a token)
+        None => (1usize << 30).max(prefill_chunk() * (660 << 10)),
     })
 }
 /// rows of a verify pass (the token and its draft); the KDA states keep a snapshot after each row but the last
@@ -143,6 +146,8 @@ pub struct Part {
     mats: BTreeMap<(u64, Role), Mat>,
     vecs: BTreeMap<(u64, Role), DevBuf>,
     scratch: DevBuf,
+    /// a prompt chunk's activations in fp16 for the dense matmuls (X16_COLS wide; one buffer, reused by each)
+    x16: Option<DevBuf>,
     /// Q8_1 of up to MMVQ_COLS rows of MAX_COLS
     q8: DevBuf,
     experts: Mutex<Store>,
@@ -303,6 +308,11 @@ impl Part {
             kv_reserve: usize, log: &mut dyn FnMut(String)) -> Result<Part> {
         let ops = Ops { gpu: gpu.clone() };
         let scratch = DevBuf::f32(gpu, SCRATCH)?;
+        let x16 = if f16_min() > 0 && dense_f16() && prefill_chunk() >= f16_min() {
+            Some(DevBuf::new(gpu, prefill_chunk() * X16_COLS * 2)?)
+        } else {
+            None
+        };
         let mut mats = BTreeMap::new();
         let mut vecs = BTreeMap::new();
         let mut bytes = 0u64;
@@ -456,7 +466,7 @@ impl Part {
         }
         let store = Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree, tick: 0, hits: 0, misses: 0, from_host: 0, direct: 0 };
         let arena = Arena::new(gpu, arena_bytes())?;
-        Ok(Part { ops, arena, layers, mats, vecs, scratch, q8, experts: Mutex::new(store), eh, expert_slots: nv, host_slots: nr, weight_bytes: bytes })
+        Ok(Part { ops, arena, layers, mats, vecs, scratch, x16, q8, experts: Mutex::new(store), eh, expert_slots: nv, host_slots: nr, weight_bytes: bytes })
     }
 
     fn mat(&self, l: u64, r: Role) -> Result<&Mat> {
@@ -488,15 +498,16 @@ impl Part {
         // a big prompt chunk: the activations to fp16 once, the matrix expanded to fp16 a row block at a time, oneMKL's
         // half GEMM (XMX) - the float32 GEMM below runs on the vector units
         let f16 = f16_min();
-        if f16 > 0 && t >= f16 && t > MMVQ_COLS && dense_f16() && x.2 == w.cols && w.cols % 256 == 0 && F16_TYPES.contains(&w.ty.code()) {
-            let x16 = self.arena.bytes(t * w.cols * 2)?;
-            self.ops.to_f16(&x.0.view(x.1 * 4, t * w.cols * 4)?, &x16, t * w.cols)?;
+        let fits = |b: &DevBuf| t * w.cols * 2 <= b.len;
+        if let Some(x16) = self.x16.as_ref().filter(|b| f16 > 0 && t >= f16 && t > MMVQ_COLS && fits(b))
+            .filter(|_| x.2 == w.cols && w.cols % 256 == 0 && F16_TYPES.contains(&w.ty.code())) {
+            self.ops.to_f16(&x.0.view(x.1 * 4, t * w.cols * 4)?, x16, t * w.cols)?;
             let chunk = (SCRATCH * 2 / w.cols).max(1).min(w.rows);
             let mut r0 = 0;
             while r0 < w.rows {
                 let r = chunk.min(w.rows - r0);
                 self.ops.dequant_f16(w.ty.code(), &w.buf, r0 * rb, r * rb, r * w.cols, &self.scratch)?;
-                self.ops.gemm_f16(t, r, w.cols, (&x16, 0, w.cols), (&self.scratch, 0), (y.0, y.1 + r0, y.2), acc)?;
+                self.ops.gemm_f16(t, r, w.cols, (x16, 0, w.cols), (&self.scratch, 0), (y.0, y.1 + r0, y.2), acc)?;
                 r0 += r;
             }
             return Ok(());
@@ -1078,24 +1089,28 @@ impl<'g> Glm<'g> {
         let iq = p.mm(l, Role::IdxQB, qr, t)?; // [t, heads * d]
         // the head weights; their 1/sqrt(d * heads) scale is positive, so it cannot change a top-k: left out
         let w = p.mm(l, Role::IdxProj, x, t)?;
-        let score = p.arena.f32(t * n)?;
-        // decode widths a row at a time (a verify pass's rows equal one-token passes); prompt chunks at once
-        let rows = if t <= MMVQ_COLS { 1 } else { t };
+        // decode widths a row at a time (a verify pass's rows equal one-token passes); prompt chunks in blocks of
+        // rows whose scores fit IDX_S_FLOATS (at 64K a chunk's scores for every pool would be 256 MiB)
+        let rows = if t <= MMVQ_COLS { 1 } else { (IDX_S_FLOATS / n).clamp(1, t) };
+        let score = p.arena.f32(rows * n)?;
         let nc_max = (IDX_S_FLOATS / (rows * hh)).max(1).min(n);
         let sbuf = p.arena.f32(rows * hh * nc_max)?;
+        let sel = p.arena.bytes(t * kp * 4)?;
         for r0 in (0..t).step_by(rows) {
             let tr = rows.min(t - r0);
+            let sc = score.view(0, tr * n * 4)?;
             let mut j0 = 0;
             while j0 < n {
                 let nc = nc_max.min(n - j0);
                 o.gemm_at(tr * hh, nc, d, (&iq, r0 * hh * d, d), (&idx.pooled, j0 * d), (&sbuf, 0, nc), false)?;
-                o.idx_score(&sbuf, &w.view(r0 * hh * 4, tr * hh * 4)?, &score.view(r0 * n * 4, tr * n * 4)?, tr, hh, j0, nc, n, pos0 + r0)?;
+                o.idx_score(&sbuf, &w.view(r0 * hh * 4, tr * hh * 4)?, &sc, tr, hh, j0, nc, n, pos0 + r0)?;
                 j0 += nc;
             }
+            if tr == t {
+                tap(&format!("indexer_score-{l}"), &sc)?;
+            }
+            o.topk(&sc, &sel.view(r0 * kp * 4, tr * kp * 4)?, tr, n, n, kp)?;
         }
-        tap(&format!("indexer_score-{l}"), &score)?;
-        let sel = p.arena.bytes(t * kp * 4)?;
-        o.topk(&score, &sel, t, n, n, kp)?;
         let cnt: Vec<i32> = (0..t).map(|r| if (pos0 + r + 1) / 4 > kp { kp as i32 } else { -1 }).collect();
         let cb = p.arena.bytes(t * 4)?;
         cb.write(0, &cnt.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
