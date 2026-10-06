@@ -596,4 +596,187 @@ int ns_add(ns_gpu* g, float* y, const float* x, int64_t n) {
     NS_CATCH
 }
 
+
+// ---- DSA lightning indexer (docs/glm5next.md): pools of 4 consecutive tokens, a pooled key per completed pool ----
+
+// The pools completed by tokens [pos0, pos0 + T): pooled[j][c] = sum_m softmax_m(ig_m[c] + ape[m][c]) * ik_m[c] over
+// the 4 members m (positions 4j + m). A member before pos0 comes from `ring` ([4][2 * D]: ik | ig at slot pos % 4,
+// the last tokens of the previous pass); then the ring takes this pass's last tokens.
+int ns_idx_pool(ns_gpu* g, float* ring, const float* ik, const float* ig, const float* ape, float* pooled, int64_t pos0, int64_t T,
+                int64_t D) {
+    NS_TRY
+    const int64_t j_lo = pos0 / 4, j_hi = (pos0 + T) / 4;
+    auto& q = g->q;
+    if (j_hi > j_lo) {
+        q.parallel_for(sycl::range<2>(j_hi - j_lo, D), [=](sycl::id<2> id) {
+            const int64_t j = j_lo + id[0], c = id[1];
+            float lg[4], kv[4], mx = -INFINITY;
+            for (int m = 0; m < 4; ++m) {
+                const int64_t p = 4 * j + m;
+                const float* k = p >= pos0 ? ik + (p - pos0) * D : ring + (p % 4) * 2 * D;
+                const float* gg = p >= pos0 ? ig + (p - pos0) * D : ring + (p % 4) * 2 * D + D;
+                kv[m] = k[c];
+                lg[m] = gg[c] + ape[m * D + c];
+                mx = sycl::fmax(mx, lg[m]);
+            }
+            float s = 0.f, acc = 0.f;
+            for (int m = 0; m < 4; ++m) { const float e = sycl::exp(lg[m] - mx); s += e; acc += e * kv[m]; }
+            pooled[j * D + c] = acc / s;
+        });
+    }
+    const int64_t first = sycl::max<int64_t>(pos0, pos0 + T - 3);
+    q.parallel_for(sycl::range<2>(pos0 + T - first, D), [=](sycl::id<2> id) {
+        const int64_t p = first + id[0], c = id[1];
+        ring[(p % 4) * 2 * D + c] = ik[(p - pos0) * D + c];
+        ring[(p % 4) * 2 * D + D + c] = ig[(p - pos0) * D + c];
+    });
+    return 0;
+    NS_CATCH
+}
+
+// Pool scores of rows [T] against pools [j0, j0 + n): S [T * H, n] = iq . pooled^T (a GEMM, heads as rows), w [T, H]:
+// score[r][j0 + jj] = sum_h relu(S[r * H + h][jj]) * w[r][h] for the pools row r sees (j < (pos0 + r + 1) / 4), else
+// -inf. score rows are ld floats apart.
+int ns_idx_score(ns_gpu* g, const float* S, const float* w, float* score, int64_t T, int64_t H, int64_t j0, int64_t n, int64_t ld,
+                 int64_t pos0) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<2>(T, n), [=](sycl::id<2> id) {
+        const int64_t r = id[0], jj = id[1], j = j0 + jj;
+        const int64_t nv = (pos0 + r + 1) / 4;
+        float s = -INFINITY;
+        if (j < nv) {
+            s = 0.f;
+            for (int64_t h = 0; h < H; ++h) s += sycl::fmax(S[(r * H + h) * n + jj], 0.f) * w[r * H + h];
+        }
+        score[r * ld + j] = s;
+    });
+    return 0;
+    NS_CATCH
+}
+
+// Per row r: the K highest of score[r][0, n) (rows ld apart) into sel[r][0, K), in ascending position (ties at the
+// K-th value broken by position). A radix select over the float's order-preserving key, 8 bits at a time, then one compaction.
+int ns_topk(ns_gpu* g, const float* score, int32_t* sel, int64_t T, int64_t n, int64_t ld, int64_t K) {
+    NS_TRY
+    constexpr int WG = 256;
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> hist(sycl::range<1>(256), h);
+        sycl::local_accessor<uint32_t, 1> st(sycl::range<1>(4), h);   // prefix, mask, need, ties taken
+        h.parallel_for(sycl::nd_range<1>(T * WG, WG), [=](sycl::nd_item<1> it) {
+            const int64_t r = it.get_group(0);
+            const int lid = it.get_local_id(0);
+            const float* row = score + r * ld;
+            auto key = [](float f) {
+                uint32_t u = sycl::bit_cast<uint32_t>(f);
+                return (u & 0x80000000u) ? ~u : (u | 0x80000000u);   // larger float -> larger key
+            };
+            if (lid == 0) { st[0] = 0; st[1] = 0; st[2] = (uint32_t) K; st[3] = 0; }
+            for (int shift = 24; shift >= 0; shift -= 8) {
+                for (int b = lid; b < 256; b += WG) hist[b] = 0;
+                sycl::group_barrier(it.get_group());
+                const uint32_t prefix = st[0], mask = st[1];
+                for (int64_t j = lid; j < n; j += WG) {
+                    const uint32_t k = key(row[j]);
+                    if ((k & mask) == prefix) {
+                        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                         sycl::access::address_space::local_space> a(hist[(k >> shift) & 255]);
+                        a.fetch_add(1u);
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+                if (lid == 0) {
+                    // the digit, from the top, where the count of keys at or above it reaches `need`
+                    uint32_t need = st[2], above = 0;
+                    int d = 255;
+                    for (; d > 0; --d) {
+                        if (above + hist[d] >= need) break;
+                        above += hist[d];
+                    }
+                    st[0] = prefix | ((uint32_t) d << shift);
+                    st[1] = mask | (255u << shift);
+                    st[2] = need - above;   // still needed among the keys equal to the prefix so far
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            // st[0] is the K-th key; every key above it goes, then the first st[2] equal ones by position. A prefix
+            // scan per tile places them in ascending position order: the same selection, in the same order, every
+            // run (atomics would order it by timing, and the attention's sums with it)
+            const uint32_t kth = st[0], ties = st[2];
+            uint32_t out = 0, eq_seen = 0;
+            for (int64_t j0 = 0; j0 < n; j0 += WG) {
+                const int64_t j = j0 + lid;
+                const uint32_t k = j < n ? key(row[j]) : 0u;
+                const uint32_t eq = j < n && k == kth ? 1u : 0u;
+                const uint32_t eq_before = sycl::exclusive_scan_over_group(it.get_group(), eq, sycl::plus<uint32_t>()) + eq_seen;
+                const uint32_t take = (j < n && k > kth) || (eq && eq_before < ties) ? 1u : 0u;
+                const uint32_t at = sycl::exclusive_scan_over_group(it.get_group(), take, sycl::plus<uint32_t>()) + out;
+                if (take) sel[r * K + at] = (int32_t) j;
+                out += sycl::reduce_over_group(it.get_group(), take, sycl::plus<uint32_t>());
+                eq_seen += sycl::reduce_over_group(it.get_group(), eq, sycl::plus<uint32_t>());
+            }
+        });
+    });
+    return 0;
+    NS_CATCH
+}
+
+// MLA over a row's selection: sel_cnt[t] < 0 - every earlier token (dense causal, as ns_mla_attend); else the tokens
+// of pools sel[t][0, sel_cnt[t]) (4 each) and the row's incomplete pool (positions 4 * ((p + 1) / 4) .. p). A row
+// reads at most K * 4 + 3 cells (the indexer switches on past K pools), so its scores live in local memory: every
+// work-item scores whole cells, one softmax, then the weighted latents with the cells' rows read coalesced.
+int ns_mla_attend_sel(ns_gpu* g, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
+                      const int32_t* sel, const int32_t* sel_cnt, int64_t K) {
+    NS_TRY
+    constexpr int WG = 256, MAXN = 2560, MAXL = 512;
+    if (L > MAXL || L % WG != 0) return ns_fail("ns_mla_attend_sel: latent width 256 or 512");
+    if (pos0 + T > MAXN && !sel_cnt) return ns_fail("ns_mla_attend_sel: a dense row past 2,560 tokens (the indexer selects there)");
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sc(sycl::range<1>(MAXN), h), qs(sycl::range<1>(MAXL), h);
+        h.parallel_for(sycl::nd_range<1>(T * H * WG, WG), [=](sycl::nd_item<1> it) {
+            const int64_t th = it.get_group(0), t = th / H;
+            const int lid = it.get_local_id(0);
+            const int64_t p = pos0 + t;
+            const int32_t ns = sel_cnt ? sel_cnt[t] : -1;
+            const int64_t tail0 = 4 * ((p + 1) / 4);
+            const int64_t n = ns < 0 ? p + 1 : 4 * (int64_t) ns + (p + 1 - tail0);
+            auto cell = [&](int64_t i) -> int64_t {
+                if (ns < 0) return i;
+                if (i < 4 * (int64_t) ns) return 4 * (int64_t) sel[t * K + i / 4] + i % 4;
+                return tail0 + (i - 4 * (int64_t) ns);
+            };
+            for (int64_t r = lid; r < L; r += WG) qs[r] = qa[th * L + r];
+            sycl::group_barrier(it.get_group());
+            float mx = -INFINITY;
+            for (int64_t i = lid; i < n; i += WG) {
+                const sycl::float4* cs = reinterpret_cast<const sycl::float4*>(c + cell(i) * L);
+                float dot = 0.f;
+                for (int64_t r = 0; r < L / 4; ++r) {
+                    const sycl::float4 v = cs[r];
+                    dot += qs[4 * r] * v.x() + qs[4 * r + 1] * v.y() + qs[4 * r + 2] * v.z() + qs[4 * r + 3] * v.w();
+                }
+                dot *= scale;
+                sc[i] = dot;
+                mx = sycl::fmax(mx, dot);
+            }
+            mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
+            float sum = 0.f;
+            for (int64_t i = lid; i < n; i += WG) {
+                const float e = sycl::exp(sc[i] - mx);
+                sc[i] = e;
+                sum += e;
+            }
+            sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+            sycl::group_barrier(it.get_group());
+            float acc[MAXL / WG] = {};
+            for (int64_t i = 0; i < n; ++i) {
+                const float w = sc[i];
+                const float* cs = c + cell(i) * L;
+                for (int k = 0; k < L / WG; ++k) acc[k] += w * cs[lid + k * WG];
+            }
+            for (int k = 0; k < L / WG; ++k) u[th * L + lid + k * WG] = acc[k] / sum;
+        });
+    });
+    return 0;
+    NS_CATCH
+}
 }  // extern "C"

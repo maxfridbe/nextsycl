@@ -76,6 +76,16 @@ int ns_kda_out(ns_gpu* g, const float* o, const float* gate, const float* w, flo
 /* FFN, MLA, experts */
 int ns_swiglu_clamp(ns_gpu* g, const float* gate, const float* up, float* out, int64_t n, float limit);
 int ns_mla_attend(ns_gpu* g, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale);
+/* the DSA indexer: pooled keys of the pools tokens [pos0, pos0 + T) complete (ring [4][2D]: the last tokens' ik | ig);
+ * pool scores (S [T*H, n] = iq . pooled^T for pools [j0, j0 + n); score rows ld apart); top K per row; MLA over a
+ * row's selected pools + its incomplete pool (sel_cnt[t] < 0: every earlier token) */
+int ns_idx_pool(ns_gpu* g, float* ring, const float* ik, const float* ig, const float* ape, float* pooled, int64_t pos0, int64_t T,
+                int64_t D);
+int ns_idx_score(ns_gpu* g, const float* S, const float* w, float* score, int64_t T, int64_t H, int64_t j0, int64_t n, int64_t ld,
+                 int64_t pos0);
+int ns_topk(ns_gpu* g, const float* score, int32_t* sel, int64_t T, int64_t n, int64_t ld, int64_t K);
+int ns_mla_attend_sel(ns_gpu* g, const float* qa, const float* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
+                      const int32_t* sel, const int32_t* sel_cnt, int64_t K);
 int ns_scatter_add(ns_gpu* g, float* y, const float* src, const int32_t* idx, const float* w, int64_t n, int64_t C);
 int ns_gather(ns_gpu* g, const float* src, const int32_t* idx, float* out, int64_t n, int64_t C);
 int ns_add(ns_gpu* g, float* y, const float* x, int64_t n);

@@ -49,6 +49,8 @@ pub struct Geometry {
     pub expert_norm: bool,
     pub swiglu_limit: f64,
     pub rms_eps: f64,
+    /// the indexer key's layer norm (llama.cpp f_norm_eps: 1e-6 in the GCSA file, absent from ds4's)
+    pub ln_eps: f64,
     /// MLA
     pub n_head: u64,
     pub q_lora: u64,
@@ -306,6 +308,7 @@ impl<'g> Model<'g> {
             expert_norm: meta_u(file, &["expert_weights_norm"]).unwrap_or(1) != 0,
             swiglu_limit: meta_f(file, &["swiglu_limit", "swiglu_clamp_exp"], None)?,
             rms_eps: meta_f(file, &["attention.layer_norm_rms_epsilon"], None)?,
+            ln_eps: meta_f(file, &["attention.layer_norm_epsilon"], Some(1e-6))?,
             n_head: meta_u(file, &["attention.head_count"])?,
             q_lora: meta_u(file, &["attention.q_lora_rank"])?,
             kv_lora: meta_u(file, &["attention.kv_lora_rank"])?,

@@ -20,18 +20,21 @@ Today MLA attends to every earlier token, which is exact only up to ~2,048 token
       the tail (`kpool_select_tail`), mask / tie handling, `indexer_index_share_mtp`, `indexer.types`
 - [ ] Indexer cache per MLA layer: per-token ik / ig of the incomplete pool, pooled keys [ctx / 4, 128]
 - [ ] Indexer scoring: iq = W_iqb . qr [32 x 128], w = W_proj . x / sqrt(128 * 32), score = sum_h relu(iq_h . pool) * w_h;
-      top 512 pools per query (as a GEMM for prefill rows)
+      top 512 pools per query (as a GEMM for prefill rows - Strata's QSA block scores went GEMM tiles for the same reason)
 - [ ] Sparse MLA kernel: attend over the selected pools' tokens + the tail
 - [ ] The MTP block's attention through its own indexer too (it has the weights)
-- [ ] VRAM budget: reserve the latent caches (f32 [ctx, 512] per MLA layer, 11 + 1) and indexer caches before the
+- [ ] VRAM budget (Strata's 80K-token stall: the expert cache filled VRAM before the KV was added): reserve the latent caches (f32 [ctx, 512] per MLA layer, 11 + 1) and indexer caches before the
       expert store takes "free less 3 GiB"; keep >= 1.5 GB free (the VRAM spill hang). Consider f16 latents.
 - [ ] Parity against llama.cpp past 2,048 tokens (a long-prompt dump), then `--ctx` 32K / 128K in serve and the mode
 - [ ] Long-prompt prefill speed (256-token chunks; the indexer GEMM)
 
 ## Speed, later
 
-- [ ] Expert swaps: 32 ms/token with MTP (2-row passes touch more experts). Ideas: compute misses straight from pinned
-      host memory (no victim D2H), admit to VRAM only on repeat use, hot-expert placement from usage counts
+- [ ] Expert swaps: 32 ms/token with MTP (2-row passes touch more experts). Strata's answer (its 2.6 -> 40.9 tok/s on
+      the B70): the GPU reads missed experts straight from pinned host memory in the expert kernel (the grouped
+      kernel already takes a pointer per expert - pass the host slot's address), a share of the misses (pcie_frac
+      ~0.55) and LRU admission for the rest. Pinned memory belongs to the context that allocated it: each part reads
+      only its own mirror (Strata #1054 hung two B70s on a cross-context fill)
 - [ ] Deeper drafts (chain the MTP block; MAX_VERIFY > 2)
 - [ ] Launch overhead: SYCL graph replay for the decode step
 - [ ] Prefill speed

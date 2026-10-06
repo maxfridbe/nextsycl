@@ -34,6 +34,8 @@ const CHUNK: usize = 2 << 30;
 pub const PREFILL_CHUNK: usize = 256;
 /// rows of a verify pass (the token and its draft); the KDA states keep a snapshot after each row but the last
 pub const MAX_VERIFY: usize = 2;
+/// the indexer's pool scores per GEMM (floats): pools are scored in chunks that fit (64 MiB)
+const IDX_S_FLOATS: usize = 16 << 20;
 
 /// A matrix on the GPU: `rows` x `cols` (a tensor's outer dimensions folded into rows), in its stored quantized
 /// form, or - for the 16- and 32-bit ones - as float32.
@@ -88,6 +90,8 @@ struct Store {
     hits: u64,
     misses: u64,
     from_host: u64,
+    /// host-slot experts the GPU read in place (no swap)
+    direct: u64,
 }
 
 impl Store {
@@ -132,7 +136,30 @@ pub struct Session {
 enum LayerState {
     /// `snap`: the recurrent state and the convolutions' inputs after each row of a verify pass but the last
     Kda { s: DevBuf, conv: [DevBuf; 3], snap: Option<Box<(DevBuf, [DevBuf; 3])>> },
-    Mla { c: DevBuf },
+    Mla { c: DevBuf, idx: Idx },
+}
+
+/// An MLA layer's indexer state: the last tokens' key and pool gate (ring [4][2 * idx_dim], slot pos % 4) and the
+/// pooled key of every completed pool [ctx / 4 + 1, idx_dim].
+struct Idx {
+    ring: DevBuf,
+    pooled: DevBuf,
+}
+
+impl Idx {
+    fn new(gpu: &Arc<Gpu>, max_ctx: usize, d: usize) -> Result<Idx> {
+        let ring = DevBuf::f32(gpu, 8 * d)?;
+        ring.fill(0)?;
+        Ok(Idx { ring, pooled: DevBuf::f32(gpu, (max_ctx / 4 + 1) * d)? })
+    }
+    /// `self` = `src` for a conversation of `pos` tokens
+    fn copy_from(&self, src: &Idx, pos: usize, d: usize) -> Result<()> {
+        self.ring.copy_within(0, &src.ring, 0, src.ring.len)?;
+        if pos >= 4 {
+            self.pooled.copy_within(0, &src.pooled, 0, pos / 4 * d * 4)?;
+        }
+        Ok(())
+    }
 }
 
 /// The draft block's side of a conversation (on the last GPU): its latent cache (slot p: the pair at position p),
@@ -140,6 +167,7 @@ enum LayerState {
 /// the token that follows each (the last one's comes with the next call).
 struct MtpState {
     cache: DevBuf,
+    idx: Idx,
     hid: DevBuf,
     rows: usize,
     slot0: usize,
@@ -220,7 +248,7 @@ impl Part {
     /// mirror.
     #[allow(clippy::too_many_arguments)]
     fn load(m: &Model, gpu: &Arc<Gpu>, layers: Range<u64>, extra: Range<u64>, last: bool, expert_bytes: Option<usize>, mirror_bytes: usize,
-            log: &mut dyn FnMut(String)) -> Result<Part> {
+            kv_reserve: usize, log: &mut dyn FnMut(String)) -> Result<Part> {
         let ops = Ops { gpu: gpu.clone() };
         let scratch = DevBuf::f32(gpu, SCRATCH)?;
         let mut mats = BTreeMap::new();
@@ -284,7 +312,9 @@ impl Part {
         let slot_bytes = moe.iter().map(|l| m.expert_bytes(*l) as usize).max().unwrap_or(256).next_multiple_of(256);
         let budget = match expert_bytes {
             Some(b) => b,
-            None => gpu.memory()?.1.map_or(8usize << 30, |f| (f as usize).saturating_sub(3 << 30)),
+            // what is free less 3 GiB (the arena, the forward pass, at least 1.5 GiB left over) and the sessions'
+            // attention caches, sized now so a long context never pushes VRAM into the driver's spill path
+            None => gpu.memory()?.1.map_or(8usize << 30, |f| (f as usize).saturating_sub((3 << 30) + kv_reserve)),
         };
         let per_chunk = (CHUNK / slot_bytes).max(1);
         let nv = (budget / slot_bytes).min(n_exp);
@@ -370,7 +400,7 @@ impl Part {
         for (i, k) in in_v.iter().enumerate() {
             vowner[i] = Some(*k);
         }
-        let store = Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree, tick: 0, hits: 0, misses: 0, from_host: 0 };
+        let store = Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree, tick: 0, hits: 0, misses: 0, from_host: 0, direct: 0 };
         let arena = Arena::new(gpu, 1 << 30)?;
         Ok(Part { ops, arena, layers, mats, vecs, scratch, q8, experts: Mutex::new(store), eh, expert_slots: nv, host_slots: nr, weight_bytes: bytes })
     }
@@ -420,10 +450,12 @@ impl Part {
         Ok(y)
     }
 
-    /// Every expert of `need` (layer `l`) in VRAM at once, none evicting another: a miss swaps with the least
-    /// recently used VRAM expert (it goes down to a free host slot, the wanted one comes up from its host slot or
-    /// the file). Their VRAM slots, (chunk, byte offset), in `need`'s order.
-    fn ensure(&self, m: &Model, l: u64, need: &[u64]) -> Result<Vec<(usize, usize)>> {
+    /// Where every expert of `need` (layer `l`) is read from, in `need`'s order, as a view of its slot. With
+    /// `promote`, every one is made VRAM-resident, none evicting another: a miss swaps with the least recently used
+    /// VRAM expert (it goes down to a free host slot, the wanted one comes up from its host slot or the file).
+    /// Without, an expert in a pinned host slot is read there in place by the GPU over PCIe (once per pass - what a
+    /// prompt chunk wants), and only the ones on the file alone come into VRAM.
+    fn ensure(&self, m: &Model, l: u64, need: &[u64], promote: bool) -> Result<Vec<DevBuf>> {
         let mut c = self.experts.lock().unwrap();
         let c = &mut *c;
         if c.vowner.len() < need.len() {
@@ -438,6 +470,7 @@ impl Part {
                     c.hits += 1;
                     c.vused[s] = tick;
                 }
+                Some(Loc::R(_)) if !promote => c.direct += 1,
                 _ => missing.push(ex),
             }
         }
@@ -482,10 +515,17 @@ impl Part {
                 c.loc.insert(key, Loc::V(s));
             }
         }
-        Ok(need.iter().map(|ex| match c.loc[&(l, *ex)] {
-            Loc::V(s) => c.vat(s),
-            Loc::R(_) => (0, 0), // not reached: every needed expert is in VRAM now
-        }).collect())
+        let sb = c.slot_bytes;
+        need.iter().map(|ex| match c.loc[&(l, *ex)] {
+            Loc::V(s) => {
+                let (ch, o) = c.vat(s);
+                c.vram[ch].view(o, sb)
+            }
+            Loc::R(r) => {
+                let (ch, o) = c.rat(r);
+                c.host[ch].device_view(o, sb)
+            }
+        }).collect()
     }
 
     /// Several matrices on the same input x [t, cols]: one Q8_1 quantization of x serves every decode product.
@@ -532,8 +572,10 @@ impl<'g> Glm<'g> {
     /// Loads the model over `gpus` (layers split evenly by count; the head on the last). Per GPU, `expert_bytes` of
     /// VRAM for routed experts (None: what is free less 3 GiB); `mirror_bytes` of pinned host memory in all for
     /// mirrored experts (None: what the host has available less 10 GiB), shared by the parts in proportion to their
-    /// layers. `mtp`: the draft block too (when the file has one), on the last GPU.
-    pub fn load(file: &'g Gguf, gpus: &[Arc<Gpu>], expert_bytes: Option<usize>, mirror_bytes: Option<usize>, mtp: bool,
+    /// layers. `mtp`: the draft block too (when the file has one), on the last GPU. `kv`: (context, sessions) - the
+    /// MLA latents and indexer caches of that many sessions of that context are held back from the expert store.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(file: &'g Gguf, gpus: &[Arc<Gpu>], expert_bytes: Option<usize>, mirror_bytes: Option<usize>, mtp: bool, kv: (usize, usize),
                 log: &mut dyn FnMut(String)) -> Result<Glm<'g>> {
         let t0 = Instant::now();
         let m = Model::open(file).map_err(e)?;
@@ -554,7 +596,14 @@ impl<'g> Glm<'g> {
             let extra = if last && mtp && m.g.n_mtp > 0 { n..n + 1 } else { n..n };
             let blocks = n + u64::from(mtp && m.g.n_mtp > 0);
             let share = mirror * (range.end - range.start + extra.end - extra.start) as usize / blocks as usize;
-            parts.push(Part::load(&m, gpu, range, extra, last, expert_bytes, share, log)?);
+            // per session: each MLA layer's latents [ctx, kv_lora] and pooled keys [ctx / 4, idx_dim], float32
+            let per_layer = kv.0 * m.g.kv_lora as usize * 4 + (kv.0 / 4 + 1) * m.g.idx_dim as usize * 4;
+            let mla = range.clone().filter(|l| m.g.is_mla(*l)).count() + (extra.end - extra.start) as usize;
+            let reserve = kv.1 * mla * per_layer;
+            if reserve > 0 {
+                log(format!("{}: {:.2} GiB held for {} session(s) of {} tokens ({} attention layers)", gpu.name, gib(reserve), kv.1, kv.0, mla));
+            }
+            parts.push(Part::load(&m, gpu, range, extra, last, expert_bytes, share, reserve, log)?);
         }
         let load_bytes = parts.iter().map(|p| p.weight_bytes).sum();
         let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(BTreeMap::new()));
@@ -566,11 +615,11 @@ impl<'g> Glm<'g> {
         self.parts.iter().map(|p| p.expert_slots).sum()
     }
 
-    /// (VRAM hits, misses, misses served from pinned host memory) of the expert stores so far
-    pub fn expert_stats(&self) -> (u64, u64, u64) {
-        self.parts.iter().fold((0, 0, 0), |a, p| {
+    /// (VRAM hits, misses (swaps), swaps served from pinned host memory, host-slot experts read in place) so far
+    pub fn expert_stats(&self) -> (u64, u64, u64, u64) {
+        self.parts.iter().fold((0, 0, 0, 0), |a, p| {
             let c = p.experts.lock().unwrap();
-            (a.0 + c.hits, a.1 + c.misses, a.2 + c.from_host)
+            (a.0 + c.hits, a.1 + c.misses, a.2 + c.from_host, a.3 + c.direct)
         })
     }
 
@@ -606,7 +655,7 @@ impl<'g> Glm<'g> {
         for l in 0..g.n_layer {
             let gpu = &self.parts[self.owner[l as usize]].ops.gpu;
             layers.push(if g.is_mla(l) {
-                LayerState::Mla { c: DevBuf::f32(gpu, max_ctx * g.kv_lora as usize)? }
+                LayerState::Mla { c: DevBuf::f32(gpu, max_ctx * g.kv_lora as usize)?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)? }
             } else {
                 let sz = (g.kda_heads * g.kda_dim * g.kda_dim) as usize;
                 let s = DevBuf::f32(gpu, sz)?;
@@ -629,7 +678,7 @@ impl<'g> Glm<'g> {
         let mtp = match self.mtp {
             Some(_) => {
                 let gpu = &self.parts.last().unwrap().ops.gpu;
-                Some(MtpState { cache: DevBuf::f32(gpu, max_ctx * g.kv_lora as usize)?, hid: DevBuf::f32(gpu, PREFILL_CHUNK * g.n_embd as usize)?, rows: 0,
+                Some(MtpState { cache: DevBuf::f32(gpu, max_ctx * g.kv_lora as usize)?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)?, hid: DevBuf::f32(gpu, PREFILL_CHUNK * g.n_embd as usize)?, rows: 0,
                                 slot0: 0, next: Vec::new() })
             }
             None => None,
@@ -682,10 +731,11 @@ impl<'g> Glm<'g> {
                         a.copy_within(0, b, 0, b.len)?;
                     }
                 }
-                (LayerState::Mla { c: dcache }, LayerState::Mla { c: scache }) => {
+                (LayerState::Mla { c: dcache, idx: di }, LayerState::Mla { c: scache, idx: si }) => {
                     if src.pos > 0 {
                         dcache.copy_within(0, scache, 0, src.pos * lat)?;
                     }
+                    di.copy_from(si, src.pos, self.m.g.idx_dim as usize)?;
                 }
                 _ => return Err(Error("copy_session: layer kinds differ".into())),
             }
@@ -696,6 +746,7 @@ impl<'g> Glm<'g> {
             if upto > 0 {
                 dm.cache.copy_within(0, &sm.cache, 0, upto * lat)?;
             }
+            dm.idx.copy_from(&sm.idx, upto, self.m.g.idx_dim as usize)?;
             if sm.rows > 0 {
                 dm.hid.copy_within(0, &sm.hid, 0, sm.rows * self.m.g.n_embd as usize * 4)?;
             }
@@ -730,7 +781,7 @@ impl<'g> Glm<'g> {
     /// MLA of layer `l` on x [t, d] (normed) at positions pos0.., its latents written to `cache` and attending to
     /// every earlier one: the output [t, d].
     #[allow(clippy::too_many_arguments)]
-    fn mla(&self, p: &Part, l: u64, normed: &DevBuf, cache: &DevBuf, pos0: usize, t: usize, tap: Tap) -> Result<DevBuf> {
+    fn mla(&self, p: &Part, l: u64, normed: &DevBuf, cache: &DevBuf, idx: &Idx, pos0: usize, t: usize, tap: Tap) -> Result<DevBuf> {
         let g = &self.m.g;
         let o = &p.ops;
         let eps = g.rms_eps as f32;
@@ -760,8 +811,11 @@ impl<'g> Glm<'g> {
                 o.gemm_at(t, lat, hd, (&q, hh * hd, nh * hd), (kb, hh * lat * hd), (&qt, hh * lat, nh * lat), false)?;
             }
         }
+        // the indexer: this pass's pooled keys; the rows that see more pools than it keeps attend to its selection
+        let sel = self.select(p, l, normed, &qr, idx, pos0, t, &mut *tap)?;
         let u = p.arena.f32(t * nh * lat)?;
-        o.mla_attend(&qt, cache, &u, t, nh, lat, pos0, 1.0 / (hd as f32).sqrt())?;
+        let kp = (g.idx_top_k / g.idx_pool) as usize;
+        o.mla_attend_sel(&qt, cache, &u, t, nh, lat, pos0, 1.0 / (hd as f32).sqrt(), sel.as_ref().map(|(a, b)| (a, b)), kp)?;
         let vb = p.vec(l, Role::MlaVB)?;
         let oh = p.arena.f32(t * nh * hd)?;
         if t <= MMVQ_COLS {
@@ -777,6 +831,53 @@ impl<'g> Glm<'g> {
         let out = p.mm(l, Role::MlaOut, &oh, t)?;
         tap(&format!("attn_out-{l}"), &out)?;
         Ok(out)
+    }
+
+    /// The DSA lightning indexer of MLA layer `l` (docs/glm5next.md) on x [t, d] (the attention input) and qr [t,
+    /// q_lora]: the pooled keys of the pools this pass completes; then, when the last row sees more pools than the
+    /// indexer keeps (idx_top_k / idx_pool = 512, past ~2,048 tokens), each row's top pools by score (`sel` [t, 512])
+    /// and its count (`cnt` [t]: 512, or -1 for a row that still sees fewer: every earlier token). None: all dense.
+    #[allow(clippy::too_many_arguments)]
+    fn select(&self, p: &Part, l: u64, x: &DevBuf, qr: &DevBuf, idx: &Idx, pos0: usize, t: usize, tap: Tap) -> Result<Option<(DevBuf, DevBuf)>> {
+        let g = &self.m.g;
+        let o = &p.ops;
+        let (d, hh) = (g.idx_dim as usize, g.idx_heads as usize);
+        let kp = (g.idx_top_k / g.idx_pool) as usize;
+        let raw = p.mm(l, Role::IdxK, x, t)?;
+        let ik = p.arena.f32(t * d)?;
+        o.layer_norm(&raw, p.vec(l, Role::IdxKNorm)?, p.vec(l, Role::IdxKNormBias)?, &ik, t, d, g.ln_eps as f32)?;
+        tap(&format!("indexer_k-{l}"), &ik)?;
+        let ig = p.mm(l, Role::IdxPoolGate, x, t)?;
+        o.idx_pool(&idx.ring, &ik, &ig, &p.mat(l, Role::IdxPoolApe)?.buf, &idx.pooled, pos0, t, d)?;
+        let n = (pos0 + t) / 4; // the pools the last row sees
+        if n <= kp {
+            return Ok(None);
+        }
+        let iq = p.mm(l, Role::IdxQB, qr, t)?; // [t, heads * d]
+        // the head weights; their 1/sqrt(d * heads) scale is positive, so it cannot change a top-k: left out
+        let w = p.mm(l, Role::IdxProj, x, t)?;
+        let score = p.arena.f32(t * n)?;
+        // decode widths a row at a time (a verify pass's rows equal one-token passes); prompt chunks at once
+        let rows = if t <= MMVQ_COLS { 1 } else { t };
+        let nc_max = (IDX_S_FLOATS / (rows * hh)).max(1).min(n);
+        let sbuf = p.arena.f32(rows * hh * nc_max)?;
+        for r0 in (0..t).step_by(rows) {
+            let tr = rows.min(t - r0);
+            let mut j0 = 0;
+            while j0 < n {
+                let nc = nc_max.min(n - j0);
+                o.gemm_at(tr * hh, nc, d, (&iq, r0 * hh * d, d), (&idx.pooled, j0 * d), (&sbuf, 0, nc), false)?;
+                o.idx_score(&sbuf, &w.view(r0 * hh * 4, tr * hh * 4)?, &score.view(r0 * n * 4, tr * n * 4)?, tr, hh, j0, nc, n, pos0 + r0)?;
+                j0 += nc;
+            }
+        }
+        tap(&format!("indexer_score-{l}"), &score)?;
+        let sel = p.arena.bytes(t * kp * 4)?;
+        o.topk(&score, &sel, t, n, n, kp)?;
+        let cnt: Vec<i32> = (0..t).map(|r| if (pos0 + r + 1) / 4 > kp { kp as i32 } else { -1 }).collect();
+        let cb = p.arena.bytes(t * 4)?;
+        cb.write(0, &cnt.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        Ok(Some((sel, cb)))
     }
 
     /// The next `tokens` of a conversation (at most a chunk; `feed` splits longer ones): the logits of the last
@@ -903,8 +1004,8 @@ impl<'g> Glm<'g> {
                     tap(&format!("kda_out-{l}"), &out)?;
                     Ok(out)
                 } else {
-                    let LayerState::Mla { c: cache } = &sess.layers[l as usize] else { return Err(Error("layer state".into())) };
-                    self.mla(p, l, normed, cache, pos0, t, &mut *tap)
+                    let LayerState::Mla { c: cache, idx } = &sess.layers[l as usize] else { return Err(Error("layer state".into())) };
+                    self.mla(p, l, normed, cache, idx, pos0, t, &mut *tap)
                 }
             })?;
             o.hc_post(&att, x, post, comb, x1, t, d)?;
@@ -1015,7 +1116,7 @@ impl<'g> Glm<'g> {
             tap("mtp_eh", &cur)?;
             let an = p.arena.f32(n * d)?;
             o.rms_norm(&cur, Some(p.vec(ml, Role::AttnNorm)?), &an, n, d, eps)?;
-            let att = self.mla(p, ml, &an, &ms.cache, slot0, rows, &mut *tap)?;
+            let att = self.mla(p, ml, &an, &ms.cache, &ms.idx, slot0, rows, &mut *tap)?;
             o.add(&cur, &att, n * d)?;
             let fnm = p.arena.f32(n * d)?;
             o.rms_norm(&cur, Some(p.vec(ml, Role::FfnNorm)?), &fnm, n, d, eps)?;
@@ -1104,7 +1205,9 @@ impl<'g> Glm<'g> {
             p.mm(l, Role::ShDown, &sg, t)
         })?;
         let need: Vec<u64> = by.keys().map(|e| *e as u64).collect();
-        let slots = self.timed(p, "expert misses (swaps / file)", || p.ensure(&self.m, l, &need))?;
+        // prompt chunks read host-slot experts in place; decode makes them resident (NS_DECODE_DIRECT=1: in place too)
+        let promote = t <= MMVQ_COLS && !std::env::var("NS_DECODE_DIRECT").is_ok_and(|v| v == "1");
+        let slots = self.timed(p, "expert misses (swaps / file)", || p.ensure(&self.m, l, &need, promote))?;
         let parts = expert_parts(&self.m, l)?;
         let (f, cols) = (g.ffn_expert as usize, d);
         self.timed(p, "routed experts", || {
@@ -1138,10 +1241,9 @@ impl<'g> Glm<'g> {
             // the grouped kernels (two launches for the layer), when they take this layer's types
             if parts.gate.2 == parts.up.2 && o.moe_grouped_supported(parts.gate.2.code(), parts.down.2.code(), d, f) {
                 let groups = by.len();
-                let c = p.experts.lock().unwrap();
                 let mut table: Vec<u8> = Vec::with_capacity(groups * 8 + (groups + 2 + 2 * total) * 4);
                 for slot in &slots {
-                    table.extend((c.vram[slot.0].ptr() as u64 + slot.1 as u64).to_le_bytes());
+                    table.extend((slot.ptr() as u64).to_le_bytes());
                 }
                 let mut start = 0i32;
                 table.extend(start.to_le_bytes());
@@ -1163,7 +1265,6 @@ impl<'g> Glm<'g> {
                 let scratch = p.arena.bytes(o.moe_scratch_bytes(total, f))?;
                 let dn = p.arena.f32(total * d)?;
                 o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, total, &xq, &scratch, &dn, lim)?;
-                drop(c);
                 let cb = p.arena.bytes((t + 1 + total) * 4)?;
                 cb.write(0, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 return o.moe_combine(&y, &dn, &cb, &wb, t, total, d);
@@ -1175,23 +1276,20 @@ impl<'g> Glm<'g> {
             let gt = p.arena.f32(total * f)?;
             let ut = p.arena.f32(total * f)?;
             let dn = p.arena.f32(total * d)?;
-            let c = p.experts.lock().unwrap();
             let mut row = 0;
-            for (list, slot) in by.values().zip(&slots) {
+            for (list, buf) in by.values().zip(&slots) {
                 let n = list.len();
-                let buf = &c.vram[slot.0];
-                p.expert_into(buf, slot.1, parts.gate, f, cols, (&xe, row * cols), (&gt, row * f), n, true)?;
-                p.expert_into(buf, slot.1, parts.up, f, cols, (&xe, row * cols), (&ut, row * f), n, false)?;
+                p.expert_into(buf, 0, parts.gate, f, cols, (&xe, row * cols), (&gt, row * f), n, true)?;
+                p.expert_into(buf, 0, parts.up, f, cols, (&xe, row * cols), (&ut, row * f), n, false)?;
                 row += n;
             }
             o.swiglu_clamp(&gt, &ut, &gt, total * f, lim)?;
             let mut row = 0;
-            for (list, slot) in by.values().zip(&slots) {
+            for (list, buf) in by.values().zip(&slots) {
                 let n = list.len();
-                p.expert_into(&c.vram[slot.0], slot.1, parts.down, d, f, (&gt, row * f), (&dn, row * d), n, true)?;
+                p.expert_into(buf, 0, parts.down, d, f, (&gt, row * f), (&dn, row * d), n, true)?;
                 row += n;
             }
-            drop(c);
             // the combine reads t_ptr and ent behind the entries' token list in `ib`
             let ints_view = p.arena.bytes((t + 1 + total) * 4)?;
             ints_view.copy_within(0, &ib, base * 4, (t + 1 + total) * 4)?;

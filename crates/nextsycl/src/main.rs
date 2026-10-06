@@ -187,7 +187,7 @@ fn compare(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
     (ab / (aa.sqrt() * bb.sqrt()).max(1e-30), (dd / bb.max(1e-30)).sqrt(), mx)
 }
 
-fn check(model: &Path, dump: &Path, gpu: usize) -> Result<(), String> {
+fn check(model: &Path, dump: &Path, gpus: &[usize]) -> Result<(), String> {
     use std::collections::BTreeMap;
     let e = |x: ns_core::Error| x.0;
     let f = Gguf::open(model).map_err(|e| e.0)?;
@@ -203,26 +203,45 @@ fn check(model: &Path, dump: &Path, gpu: usize) -> Result<(), String> {
             index.insert(c[0].to_string(), n);
         }
     }
-    let g = ns_core::Gpu::open(gpu).map_err(e)?;
-    println!("gpu      : {} ({})", g.name, g.index);
+    let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
+    for g in &gs {
+        println!("gpu      : {} ({})", g.name, g.index);
+    }
     let mut log = |l: String| println!("load     : {l}");
-    let glm = ns_engine::glm5next::Glm::load(&f, std::slice::from_ref(&g), None, Some(0), false, &mut log).map_err(e)?;
+    // one GPU: no host mirror (bring-up); several: the mirror as generate has it (a long prompt touches every expert)
+    let mirror = if gs.len() == 1 { Some(0) } else { None };
+    let glm = ns_engine::glm5next::Glm::load(&f, &gs, None, mirror, false, (tokens.len() + 8, 2), &mut log).map_err(e)?;
     println!("load     : {:.2} GiB in {:.1} s", gib(glm.load_bytes), glm.load_seconds);
     println!("prompt   : {} tokens {:?}", tokens.len(), tokens);
     println!("{:<26} {:>10} {:>10} {:>10}", "tensor", "cosine", "rel err", "max diff");
     let mut worst: (f64, String) = (1.0, String::new());
     let t0 = std::time::Instant::now();
+    // a prompt longer than a chunk: all but the last chunk first, then the last one compared - its rows against the
+    // reference's last rows (the dump holds the whole prompt when llama.cpp ran it as one ubatch)
+    let total = tokens.len();
+    let last = total - (total - 1) % ns_engine::glm5next::PREFILL_CHUNK - 1;
+    let tc = total - last;
     let mut tap = |name: &str, b: &ns_core::DevBuf| -> ns_core::Result<()> {
         let Some(&n) = index.get(name) else { return Ok(()) };
         let mine = b.to_f32()?;
         let path = dump.join(format!("{name}.f32"));
         let raw = std::fs::read(&path).map_err(|x| ns_core::Error(format!("{}: {x}", path.display())))?;
         let theirs: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        if theirs.len() != n || mine.len() < n {
-            println!("{name:<26} sizes differ: mine {}, the reference {} ({n} in its index)", mine.len(), theirs.len());
+        if theirs.len() != n {
+            println!("{name:<26} the reference file holds {} values, its index {n}", theirs.len());
             return Ok(());
         }
-        let (cos, rel, mx) = compare(&mine[..n], &theirs);
+        // per-token tensors: the reference has `total` rows (or one: the head), mine the last chunk's
+        let (mine, theirs): (&[f32], &[f32]) = if n % total == 0 && total > tc && mine.len() >= n / total * tc {
+            let row = n / total;
+            (&mine[..row * tc], &theirs[row * (total - tc)..])
+        } else if mine.len() >= n {
+            (&mine[..n], &theirs[..])
+        } else {
+            println!("{name:<26} sizes differ: mine {}, the reference {n}", mine.len());
+            return Ok(());
+        };
+        let (cos, rel, mx) = compare(mine, theirs);
         println!("{name:<26} {cos:>10.6} {rel:>10.2e} {mx:>10.3e}");
         if cos < worst.0 {
             worst = (cos, name.to_string());
@@ -230,13 +249,18 @@ fn check(model: &Path, dump: &Path, gpu: usize) -> Result<(), String> {
         Ok(())
     };
     let mut sess = glm.session(tokens.len().max(16)).map_err(e)?;
-    let logits = glm.forward(&mut sess, &tokens, &mut tap).map_err(e)?;
+    if last > 0 {
+        let mut quiet = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
+        glm.feed(&mut sess, &tokens[..last], &mut quiet).map_err(e)?;
+        println!("prefix   : {last} tokens fed, comparing the last {tc} (positions {last}-{})", total - 1);
+    }
+    let logits = glm.forward(&mut sess, &tokens[last..], &mut tap).map_err(e)?;
     let best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as u32).unwrap_or(0);
     let vocab = f.meta("tokenizer.ggml.tokens").and_then(|v| v.as_array());
     let word = |id: u32| vocab.and_then(|v| v.get(id as usize)).and_then(|v| v.as_str()).unwrap_or("?").replace('\u{120}', " ").to_string();
     println!("forward  : {:.1} s", t0.elapsed().as_secs_f64());
     // the same prompt incrementally: all but the last token, then the last alone (decode's path)
-    if tokens.len() > 1 {
+    if tokens.len() > 1 && tokens.len() <= ns_engine::glm5next::PREFILL_CHUNK {
         let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
         let mut s2 = glm.session(tokens.len()).map_err(e)?;
         glm.forward(&mut s2, &tokens[..tokens.len() - 1], &mut none).map_err(e)?;
@@ -329,7 +353,7 @@ fn generate(args: &[String]) -> Result<(), String> {
     let mut log = |l: String| eprintln!("[{l}]");
     let mtp = !args.iter().any(|a| a == "--no-mtp");
     let glm = ns_engine::glm5next::Glm::load(&f, &gs, expert_gib.map(|x| (x * (1u64 << 30) as f64) as usize),
-                                                 mirror_gib.map(|x| (x * (1u64 << 30) as f64) as usize), mtp, &mut log).map_err(e)?;
+                                                 mirror_gib.map(|x| (x * (1u64 << 30) as f64) as usize), mtp, (ids.len() + max + 1, 1), &mut log).map_err(e)?;
     eprintln!("[{} on {}, {} prompt tokens, loaded in {:.1} s]", f.meta("general.name").and_then(|v| v.as_str()).unwrap_or("?"),
               gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), ids.len(), glm.load_seconds);
     let mut sess = glm.session(ids.len() + max + 1).map_err(e)?;
@@ -367,9 +391,9 @@ fn generate(args: &[String]) -> Result<(), String> {
     for (name, secs, calls) in glm.profile() {
         eprintln!("[profile {name:<34} {secs:>7.2} s  {calls:>6} calls  {:>8.2} ms/token]", secs * 1000.0 / (n + 1) as f64);
     }
-    let (hits, misses, mirrored) = glm.expert_stats();
-    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); drafts {} of {} accepted; experts: {hits} hits, {misses} misses ({:.0}% hit), {mirrored} of the misses from the mirror]",
-              ids.len(), ids.len() as f64 / prefill, n as f64 / dt.max(1e-9), dec.accepted, dec.drafted, 100.0 * hits as f64 / (hits + misses).max(1) as f64);
+    let (hits, misses, mirrored, direct) = glm.expert_stats();
+    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); drafts {} of {} accepted; experts: {hits} VRAM hits, {direct} read in place from host memory, {misses} swapped in ({mirrored} of them from host memory)]",
+              ids.len(), ids.len() as f64 / prefill, n as f64 / dt.max(1e-9), dec.accepted, dec.drafted);
     Ok(())
 }
 
@@ -454,7 +478,7 @@ fn spec_check(args: &[String]) -> Result<(), String> {
     let ids = tok.encode(&ns_tok::glm_chat(&[ns_tok::Message { role: "user", content: &prompt, reasoning: None }], ns_tok::Effort::Low));
     let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let mut log = |l: String| eprintln!("[{l}]");
-    let glm = ns_engine::glm5next::Glm::load(&f, &gs, None, None, true, &mut log).map_err(e)?;
+    let glm = ns_engine::glm5next::Glm::load(&f, &gs, None, None, true, (ids.len() + n + 4, 2), &mut log).map_err(e)?;
     let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
     let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
     // the margin between the best two logits
@@ -543,7 +567,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let mut log = |l: String| eprintln!("[{l}]");
     let mtp = !args.iter().any(|a| a == "--no-mtp");
-    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), gib_opt("--mirror-gib"), mtp, &mut log).map_err(e)?;
+    // the server's two sessions: the working one and its copy at the end of the last prompt
+    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), gib_opt("--mirror-gib"), mtp, (ctx, 2), &mut log).map_err(e)?;
     eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds);
     let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort)?);
     srv.run(&addr)
@@ -563,8 +588,8 @@ fn main() -> ExitCode {
             kernels(Path::new(&args[1]), gpu)
         }
         Some("check") if args.len() >= 3 => {
-            let gpu = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0);
-            check(Path::new(&args[1]), Path::new(&args[2]), gpu)
+            let gpus: Vec<usize> = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).map_or(vec![0], |v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+            check(Path::new(&args[1]), Path::new(&args[2]), &gpus)
         }
         _ => Err(USAGE.into()),
     };

@@ -208,6 +208,16 @@ impl HostBuf {
         check(gpu.api, unsafe { (gpu.api.alloc_host)(gpu.raw, len.max(1), &mut ptr) }, &format!("pinning {len} bytes"))?;
         Ok(HostBuf { gpu: gpu.clone(), ptr: ptr.cast(), len })
     }
+    /// Bytes `[at, at + len)` as a buffer this GPU's kernels read in place, over PCIe: pinned memory of a GPU's own
+    /// context is device-accessible. A view: it does not free them, and only this GPU may use it (pinned memory of
+    /// another GPU's context is not its to read).
+    pub fn device_view(&self, at: usize, len: usize) -> Result<DevBuf> {
+        if at.checked_add(len).is_none_or(|e| e > self.len) {
+            return Err(Error(format!("device_view: [{at}, {}) outside {} bytes", at + len, self.len)));
+        }
+        // SAFETY: in bounds (checked); the memory outlives the view by the caller's contract.
+        Ok(DevBuf { gpu: self.gpu.clone(), ptr: unsafe { self.ptr.add(at).cast() }, len, owned: false })
+    }
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: len bytes, owned.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
@@ -464,6 +474,56 @@ impl Ops {
         // SAFETY: sizes checked.
         let rc = unsafe { (self.a().mla_attend)(self.raw(), qa.fp(), c.fp(), u.fp(), t as i64, h as i64, l as i64, pos0 as i64, scale) };
         self.ok(rc, "mla_attend")
+    }
+    /// The pools tokens [pos0, pos0 + t) complete: pooled[j] from their members' ik / ig (`ring` [4][2d] holds the
+    /// previous pass's last tokens), then the ring takes this pass's last tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn idx_pool(&self, ring: &DevBuf, ik: &DevBuf, ig: &DevBuf, ape: &DevBuf, pooled: &DevBuf, pos0: usize, t: usize, d: usize) -> Result<()> {
+        need!(ring, 8 * d, "idx_pool ring");
+        need!(ik, t * d, "idx_pool ik");
+        need!(ig, t * d, "idx_pool ig");
+        need!(ape, 4 * d, "idx_pool ape");
+        need!(pooled, (pos0 + t) / 4 * d, "idx_pool pooled");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().idx_pool)(self.raw(), ring.fp(), ik.fp(), ig.fp(), ape.fp(), pooled.fp(), pos0 as i64, t as i64, d as i64) };
+        self.ok(rc, "idx_pool")
+    }
+    /// score[r][j0 + jj] for rows [t] and pools [j0, j0 + n) from S [t * h, n] and w [t, h]
+    #[allow(clippy::too_many_arguments)]
+    pub fn idx_score(&self, s: &DevBuf, w: &DevBuf, score: &DevBuf, t: usize, h: usize, j0: usize, n: usize, ld: usize, pos0: usize) -> Result<()> {
+        need!(s, t * h * n, "idx_score S");
+        need!(w, t * h, "idx_score w");
+        need!(score, (t - 1) * ld + j0 + n, "idx_score score");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().idx_score)(self.raw(), s.fp(), w.fp(), score.fp(), t as i64, h as i64, j0 as i64, n as i64, ld as i64, pos0 as i64) };
+        self.ok(rc, "idx_score")
+    }
+    /// sel [t, k] (int32): the k highest of each score row [0, n), rows ld apart
+    pub fn topk(&self, score: &DevBuf, sel: &DevBuf, t: usize, n: usize, ld: usize, k: usize) -> Result<()> {
+        need!(score, (t - 1) * ld + n, "topk score");
+        need!(sel, t * k, "topk sel");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().topk)(self.raw(), score.fp(), sel.ptr.cast(), t as i64, n as i64, ld as i64, k as i64) };
+        self.ok(rc, "topk")
+    }
+    /// MLA over each row's selection (`sel` [t, k] pools, `cnt` [t]: < 0 = every earlier token); None: dense
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_attend_sel(&self, qa: &DevBuf, c: &DevBuf, u: &DevBuf, t: usize, h: usize, l: usize, pos0: usize, scale: f32,
+                          sel: Option<(&DevBuf, &DevBuf)>, k: usize) -> Result<()> {
+        need!(qa, t * h * l, "mla qa");
+        need!(c, (pos0 + t) * l, "mla latents");
+        need!(u, t * h * l, "mla u");
+        let (sp, cp) = match sel {
+            Some((s, n)) => {
+                need!(s, t * k, "mla sel");
+                need!(n, t, "mla sel count");
+                (s.ptr as *const i32, n.ptr as *const i32)
+            }
+            None => (std::ptr::null(), std::ptr::null()),
+        };
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().mla_attend_sel)(self.raw(), qa.fp(), c.fp(), u.fp(), t as i64, h as i64, l as i64, pos0 as i64, scale, sp, cp, k as i64) };
+        self.ok(rc, "mla_attend_sel")
     }
     /// y[idx[i]] += w[i] * src[i] (rows of c); idx and w on the device (`n` int32 / float32)
     pub fn scatter_add(&self, y: &DevBuf, src: &DevBuf, idx: &DevBuf, w: &DevBuf, n: usize, c: usize) -> Result<()> {
