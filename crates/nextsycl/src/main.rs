@@ -56,6 +56,7 @@ in this process (inside the image: the kernels need the oneAPI runtime):
   nextsycl serve <model.gguf> [--gpu 0,1 | all] [--host H] [--port N] [--name ID] [--ctx N] [--effort E] [--socket PATH]
                  [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)] [--cors ORIGINS]
                  [--keep-requests N (100)] [--parallel N (2: requests decoded together)]
+                 [--max-tokens N (a request without max_tokens: N; default the rest of the context)]
                                 the server in the foreground (what start runs)
   nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
                     [--expert-gib G] [--mirror-gib G] [--no-mtp]
@@ -80,6 +81,7 @@ settings (environment, or NAME=value lines in nextsycl.conf beside the repositor
   NS_PROMPT_CACHE_MIB   host memory for the prompt cache's checkpoints (default 4096; 0 = off)
   NS_KEEP_REQUESTS ended requests the server keeps for ps and inspect (default 100)
   NS_PARALLEL      requests decoded together, each with a session of its own (default 2; 1 = one at a time)
+  NS_MAX_TOKENS    the tokens a request without max_tokens may make (default: to the end of the context)
   NS_SOCKET_DIR    where the control socket lives (default $XDG_RUNTIME_DIR/nextsycl)
   NS_IMAGE, NS_CONTAINER_ENGINE   the image with the oneAPI runtime (localhost/h3-build) and podman / docker";
 
@@ -738,7 +740,9 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds);
     let cors: Vec<String> = opt("--cors").unwrap_or_default().split([',', ' ']).filter(|o| !o.is_empty()).map(String::from).collect();
     let keep: usize = opt("--keep-requests").and_then(|v| v.parse().ok()).unwrap_or(100);
-    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort, cache, cors, keep, parallel)?);
+    // what a request without max_tokens may make: --max-tokens N (0 or none: to the end of the context)
+    let default_max = opt("--max-tokens").and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0);
+    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort, cache, cors, keep, parallel, default_max)?);
     srv.run(&addr, opt("--socket").map(std::path::PathBuf::from))
 }
 

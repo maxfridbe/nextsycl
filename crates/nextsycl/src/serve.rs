@@ -4,7 +4,8 @@
 //!     GET  /health                 {"status": "ok"} once the model is loaded
 //!     GET  /v1/models              the one model
 //!     GET  /status                 {"busy": bool, "prompt_cache": ...}
-//!     POST /v1/chat/completions    messages, max_tokens, temperature, top_p, stream, reasoning_effort (or
+//!     POST /v1/chat/completions    messages, max_tokens (none: --max-tokens, else the rest of the context),
+//!                                  temperature, top_p, stream, reasoning_effort (or
 //!                                  chat_template_kwargs.reasoning_effort): low | high | max; logprobs, top_logprobs
 //!                                  (the answer's tokens, as OpenAI's choices[0].logprobs.content); usage.energy_wh;
 //!                                  logprob_chain: true - each entry also "chain": its logprob chained through the
@@ -77,6 +78,8 @@ pub struct Server {
     inflight: AtomicU64,
     /// the sessions decoding together at most
     parallel: usize,
+    /// the tokens a request without max_tokens may make (None: to the end of the context)
+    default_max: Option<usize>,
     /// the prompt cache (the engine thread's while it reads a prompt; status calls only try)
     cache: Mutex<PromptCache>,
     /// each session's tokens held, for status
@@ -276,11 +279,11 @@ fn text_of(v: &Value) -> String {
 impl Server {
     #[allow(clippy::too_many_arguments)]
     pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, max_ctx: usize, default_effort: Effort, cache_bytes: usize,
-               cors: Vec<String>, keep: usize, parallel: usize) -> Result<Server, String> {
+               cors: Vec<String>, keep: usize, parallel: usize, default_max: Option<usize>) -> Result<Server, String> {
         let tele = Telemetry::start(&glm.gpu_info().iter().map(|g| g.pci.clone()).collect::<Vec<_>>());
         let parallel = parallel.max(1);
         Ok(Server { glm, tok, name, max_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
-                    inflight: AtomicU64::new(0), parallel, cache: Mutex::new(PromptCache::new(cache_bytes)),
+                    inflight: AtomicU64::new(0), parallel, default_max, cache: Mutex::new(PromptCache::new(cache_bytes)),
                     live_lens: Mutex::new(vec![0; parallel]), started: Instant::now(), running: Mutex::new(Default::default()),
                     done: Mutex::new(VecDeque::new()), next_id: AtomicU64::new(1), keep, tele, cors })
     }
@@ -791,7 +794,9 @@ impl Server {
         if ids.len() + 16 > self.max_ctx {
             return Err(format!("the prompt is {} tokens; the context is {}", ids.len(), self.max_ctx));
         }
-        let max = ask.max.unwrap_or(4096).min(self.max_ctx - ids.len() - 1);
+        // a request without max_tokens: the server's cap (NS_MAX_TOKENS), else to the end of the context - a long
+        // think is never cut off before its answer unless asked
+        let max = ask.max.or(self.default_max).unwrap_or(usize::MAX).min(self.max_ctx - ids.len() - 1);
         let (temp, top_p, stream) = (ask.temp, ask.top_p, ask.stream);
         let id = format!("chatcmpl-{}", now());
         let rid = self.next_id.fetch_add(1, Ordering::Relaxed);
