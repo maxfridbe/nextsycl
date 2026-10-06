@@ -152,7 +152,8 @@ fn gpus() -> Result<(), String> {
     for (i, name) in &list {
         let g = Gpu::open(*i).map_err(e)?;
         let (total, free) = g.memory().map_err(e)?;
-        println!("GPU {i}: {name}, {:.1} GiB{}", gib(total), free.map_or(String::new(), |f| format!(" ({:.1} GiB free)", gib(f))));
+        let units = ns_core::gpu_units(*i).map_or(String::new(), |(u, m)| format!(", {u} compute units at {m} MHz"));
+        println!("GPU {i}: {name}, {:.1} GiB{}{units}", gib(total), free.map_or(String::new(), |f| format!(" ({:.1} GiB free)", gib(f))));
         open.push(g);
     }
     // copies: 256 MiB through pinned memory, each way, checked
@@ -619,7 +620,9 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let model = args.get(1).ok_or("serve <model.gguf> ...")?;
     let g = opt("--gpu").unwrap_or_else(|| "0".into());
     let gpus: Vec<usize> = if g == "all" {
-        ns_core::gpus().map_err(e)?.into_iter().map(|(i, _)| i).collect()
+        // the one that computes most last: it takes the head and the draft block (measured on a B65 + B70: the
+        // B70 last reads prompts 6% faster; decode the same)
+        ns_core::gpus_weakest_first().map_err(e)?
     } else {
         g.split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}"))).collect::<Result<_, _>>()?
     };

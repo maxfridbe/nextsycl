@@ -40,6 +40,23 @@ fn check(api: &Api, rc: i32, what: &str) -> Result<()> {
 }
 
 /// The GPUs the library sees: (index, name).
+/// GPU `index`'s compute units and their clock (MHz)
+pub fn gpu_units(index: usize) -> Result<(u32, u32)> {
+    let a = api()?;
+    let (mut u, mut m) = (0, 0);
+    // SAFETY: out-pointers to locals.
+    check(a, unsafe { (a.gpu_units)(index as i32, &mut u, &mut m) }, "the GPU's compute units")?;
+    Ok((u as u32, m as u32))
+}
+
+/// Every GPU's index, the one that computes most last (`--gpu all`: the last GPU takes the head and the draft
+/// block); ties keep the driver's order
+pub fn gpus_weakest_first() -> Result<Vec<usize>> {
+    let mut v: Vec<(usize, u64)> = gpus()?.into_iter().map(|(i, _)| (i, gpu_units(i).map_or(0, |(u, m)| u as u64 * m as u64))).collect();
+    v.sort_by_key(|x| x.1);
+    Ok(v.into_iter().map(|x| x.0).collect())
+}
+
 pub fn gpus() -> Result<Vec<(usize, String)>> {
     let a = api()?;
     // SAFETY: no arguments.
@@ -911,7 +928,8 @@ impl DevBuf {
 /// free again - the caller resets only when no view of it is in use (the queue is in order, so work already queued
 /// on the old views runs before work on the new ones). Requests that do not fit get an allocation of their own.
 pub struct Arena {
-    buf: DevBuf,
+    /// the memory it hands out (a view; `set` swaps it)
+    buf: std::sync::Mutex<DevBuf>,
     off: std::sync::Mutex<usize>,
     /// the most used between resets, and the requests that did not fit
     pub peak: std::sync::atomic::AtomicUsize,
@@ -920,18 +938,34 @@ pub struct Arena {
 
 impl Arena {
     pub fn new(gpu: &Arc<Gpu>, bytes: usize) -> Result<Arena> {
-        Ok(Arena { buf: DevBuf::new(gpu, bytes)?, off: std::sync::Mutex::new(0), peak: 0.into(), spills: 0.into() })
+        Ok(Arena::on(DevBuf::new(gpu, bytes)?))
+    }
+    /// An arena over `buf` (which must outlive it: a view of memory its owner keeps)
+    pub fn on(buf: DevBuf) -> Arena {
+        Arena { buf: std::sync::Mutex::new(buf), off: std::sync::Mutex::new(0), peak: 0.into(), spills: 0.into() }
+    }
+    /// Hands out `buf` from now on (from its start); nothing handed out before may be used after
+    pub fn set(&self, buf: DevBuf) {
+        *self.buf.lock().unwrap() = buf;
+        *self.off.lock().unwrap() = 0;
+    }
+    pub fn len(&self) -> usize {
+        self.buf.lock().unwrap().len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
     pub fn bytes(&self, n: usize) -> Result<DevBuf> {
         let mut off = self.off.lock().unwrap();
+        let buf = self.buf.lock().unwrap();
         let at = off.next_multiple_of(256);
-        if at + n > self.buf.len {
+        if at + n > buf.len {
             self.spills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return DevBuf::new(&self.buf.gpu, n);
+            return DevBuf::new(&buf.gpu, n);
         }
         *off = at + n;
         self.peak.fetch_max(*off, std::sync::atomic::Ordering::Relaxed);
-        self.buf.view(at, n.max(1).min(self.buf.len - at))
+        buf.view(at, n.max(1).min(buf.len - at))
     }
     pub fn f32(&self, n: usize) -> Result<DevBuf> {
         self.bytes(n * 4)

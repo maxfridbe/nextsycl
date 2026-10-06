@@ -45,6 +45,15 @@ fn prefetch_limit() -> usize {
     *V.get_or_init(|| std::env::var("NS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
 }
 
+/// The arena of decode and short prompt chunks; past it, a pass takes the big one back from the expert store
+const SMALL_ARENA: usize = 384 << 20;
+
+/// Whether the big arena's memory holds experts while no prompt chunk needs it (NS_LEND=0: it does not)
+fn lend_arena() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_LEND").map_or(true, |v| v != "0"))
+}
+
 /// Whether the dense matrices take the fp16 path too (NS_DENSE_F16=0: only the experts)
 fn dense_f16() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -155,13 +164,25 @@ struct Store {
     last_up: Option<i64>,
     /// experts swapped in ahead of their layer (`prefetch`), not yet asked for: their copy up's ticket
     prefetched: HashMap<(u64, u64), i64>,
+    /// the VRAM slots of its own (`base`), then `lend` more in the big arena's memory (the last of `vram`), which
+    /// hold experts while no prompt chunk needs that arena (`lent`)
+    base: usize,
+    lend: usize,
+    lent: bool,
     pf_issued: u64,
     pf_used: u64,
 }
 
 impl Store {
     fn vat(&self, s: usize) -> (usize, usize) {
+        if s >= self.base {
+            return (self.vram.len() - 1, (s - self.base) * self.slot_bytes);
+        }
         (s / self.per_chunk, (s % self.per_chunk) * self.slot_bytes)
+    }
+    /// whether slot `s` may hold an expert now
+    fn usable(&self, s: usize) -> bool {
+        s < self.base || self.lent
     }
     fn rat(&self, r: usize) -> (usize, usize) {
         (r / self.per_chunk, (r % self.per_chunk) * self.slot_bytes)
@@ -171,8 +192,11 @@ impl Store {
 /// One GPU's share of the model.
 pub struct Part {
     ops: Ops,
-    /// the forward pass's temporaries, reset at each layer
+    /// the forward pass's temporaries, reset at each layer: over `small`, or over `big` for a prompt chunk that needs
+    /// it (whose memory otherwise holds experts: `arena_for`)
     pub arena: Arena,
+    big: DevBuf,
+    small: DevBuf,
     pub layers: Range<u64>,
     mats: BTreeMap<(u64, Role), Mat>,
     vecs: BTreeMap<(u64, Role), DevBuf>,
@@ -413,7 +437,7 @@ impl Part {
             // what is free less 3 GiB (the arena, the forward pass, at least 1.5 GiB left over) and the sessions'
             // attention caches, sized now so a long context never pushes VRAM into the driver's spill path
             // (the arena past its 1 GiB comes out of the experts too)
-            None => gpu.memory()?.1.map_or(8usize << 30, |f| (f as usize).saturating_sub((2 << 30) + arena_bytes().max(1 << 30) + kv_reserve)),
+            None => gpu.memory()?.1.map_or(8usize << 30, |f| (f as usize).saturating_sub((2 << 30) + arena_bytes().max(1 << 30) + SMALL_ARENA + kv_reserve)),
         };
         let per_chunk = (CHUNK / slot_bytes).max(1);
         let nv = (budget / slot_bytes).min(n_exp);
@@ -502,9 +526,64 @@ impl Part {
         }
         let store = Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree, tick: 0, hits: 0, misses: 0, from_host: 0, direct: 0,
                             rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(), last_up: None, prefetched: HashMap::new(),
-                            pf_issued: 0, pf_used: 0 };
-        let arena = Arena::new(gpu, arena_bytes())?;
-        Ok(Part { ops, arena, layers, mats, vecs, scratch, x16, q8, experts: Mutex::new(store), eh, expert_slots: nv, host_slots: nr, weight_bytes: bytes })
+                            pf_issued: 0, pf_used: 0, base: nv, lend: 0, lent: false };
+        // the big arena (prompt chunks) lends its memory to the store while decode runs on the small one
+        let big = DevBuf::new(gpu, arena_bytes())?;
+        let small = DevBuf::new(gpu, SMALL_ARENA)?;
+        let lend = if lend_arena() && !moe.is_empty() { big.len / slot_bytes } else { 0 };
+        let mut store = store;
+        if lend > 0 {
+            store.vram.push(big.view(0, lend * slot_bytes)?);
+            store.vowner.resize(nv + lend, None);
+            store.vused.resize(nv + lend, 0);
+        }
+        store.base = nv;
+        store.lend = lend;
+        store.lent = lend > 0;
+        let arena = Arena::on(if lend > 0 { small.view(0, small.len)? } else { big.view(0, big.len)? });
+        Ok(Part { ops, arena, big, small, layers, mats, vecs, scratch, x16, q8, experts: Mutex::new(store), eh, expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes })
+    }
+
+    /// The arena a pass of `t` tokens needs: the small one, or the big one - its memory then out of the expert store
+    /// (the experts there down to free host slots first, every copy done). Back to the store once a pass fits the
+    /// small one again.
+    fn arena_for(&self, t: usize) -> Result<()> {
+        let mut c = self.experts.lock().unwrap();
+        if c.lend == 0 {
+            return Ok(());
+        }
+        let need = t * (arena_bytes() / prefill_chunk()).max(1) + (64 << 20);
+        let c = &mut *c;
+        if need > SMALL_ARENA && c.lent {
+            let after = Some(self.ops.mark()?);
+            let sb = c.slot_bytes;
+            let (base, lend) = (c.base, c.lend);
+            for s in base..base + lend {
+                let Some(v) = c.vowner[s].take() else { continue };
+                c.loc.remove(&v);
+                c.prefetched.remove(&v);
+                let (vch, vo) = c.vat(s);
+                if let Some(f) = c.rfree.pop() {
+                    let (rch, ro) = c.rat(f);
+                    let t = self.ops.stream_copy_on(0, &c.host[rch].device_view(ro, sb)?, 0, &c.vram[vch], vo, sb, &[after, c.vfill.get(&s).copied(), c.rwrite.get(&f).copied()])?;
+                    c.rwrite.insert(f, t);
+                    c.down_any = Some(t);
+                    c.loc.insert(v, Loc::R(f));
+                }
+                c.vfill.remove(&s);
+            }
+            for t in [c.down_any, c.last_up].into_iter().flatten() {
+                self.ops.await_ticket(t)?;
+            }
+            self.ops.gpu.sync()?;
+            c.lent = false;
+            self.arena.set(self.big.view(0, self.big.len)?);
+        } else if need <= SMALL_ARENA && !c.lent {
+            // the big arena's last pass is queued before any copy into these slots (each waits for a mark)
+            c.lent = true;
+            self.arena.set(self.small.view(0, self.small.len)?);
+        }
+        Ok(())
     }
 
     fn mat(&self, l: u64, r: Role) -> Result<&Mat> {
@@ -610,7 +689,7 @@ impl Part {
         // this layer's other guesses stay resident, as any expert would
         c.prefetched.retain(|k, _| k.0 != l);
         if !missing.is_empty() {
-            let mut order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick).collect();
+            let mut order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick && c.usable(i)).collect();
             order.sort_by_key(|&i| if c.vowner[i].is_none() { 0 } else { c.vused[i] + 1 });
             let mut buf: Option<Vec<u8>> = None;
             // the copies wait for what the GPU's queue holds so far (a kernel may still read a victim's slot)
@@ -716,7 +795,7 @@ impl Part {
         if cand.is_empty() {
             return Ok(());
         }
-        let mut order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick).collect();
+        let mut order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick && c.usable(i)).collect();
         order.sort_by_key(|&i| if c.vowner[i].is_none() { 0 } else { c.vused[i] + 1 });
         let after = Some(self.ops.mark()?);
         let mut reading: HashMap<usize, i64> = HashMap::new();
@@ -772,7 +851,7 @@ impl Part {
 }
 
 impl<'g> Glm<'g> {
-    /// Loads the model over `gpus` (layers split evenly by count; the head on the last). Per GPU, `expert_bytes` of
+    /// Loads the model over `gpus` (layers split evenly by count, or as NS_SPLIT says; the head on the last). Per GPU, `expert_bytes` of
     /// VRAM for routed experts (None: what is free less 3 GiB); `mirror_bytes` of pinned host memory in all for
     /// mirrored experts (None: what the host has available less 10 GiB), shared by the parts in proportion to their
     /// layers. `mtp`: the draft block too (when the file has one), on the last GPU. `kv`: (context, sessions) - the
@@ -790,8 +869,22 @@ impl<'g> Glm<'g> {
         let mirror = mirror_bytes.unwrap_or(mem_available().saturating_sub(10 << 30));
         let mut parts = Vec::new();
         let mut owner = vec![0usize; n as usize];
+        // NS_SPLIT=a,b,...: the layers of each GPU but the last (which takes the rest); else even by count
+        let mut bounds: Vec<u64> = (0..=k).map(|i| i * n / k).collect();
+        if let Ok(v) = std::env::var("NS_SPLIT") {
+            let counts: Vec<u64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if counts.len() + 1 == k as usize && counts.iter().sum::<u64>() < n {
+                let mut at = 0;
+                for (i, c) in counts.iter().enumerate() {
+                    at += c;
+                    bounds[i + 1] = at;
+                }
+            } else {
+                return Err(Error(format!("NS_SPLIT={v}: {} layer counts below {n} for {k} GPUs", k - 1)));
+            }
+        }
         for (i, gpu) in gpus.iter().enumerate() {
-            let range = (i as u64 * n / k)..((i as u64 + 1) * n / k);
+            let range = bounds[i]..bounds[i + 1];
             for l in range.clone() {
                 owner[l as usize] = i;
             }
@@ -1298,6 +1391,11 @@ impl<'g> Glm<'g> {
         let t = tokens.len();
         if t == 0 || t > prefill_chunk() || n_out == 0 || n_out > t.min(MMVQ_COLS) {
             return Err(Error(format!("forward: {t} tokens, {n_out} outputs")));
+        }
+        // the arena this pass needs (the draft block's pending rows - the last chunk's - run first)
+        let rows = t.max(sess.mtp.as_ref().map_or(0, |m| m.rows));
+        for p in &self.parts {
+            p.arena_for(rows)?;
         }
         if sess.mtp.as_ref().is_some_and(|m| m.rows > 0) {
             self.mtp_run(sess, tokens[0], false, &mut *tap)?;

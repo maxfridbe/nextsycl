@@ -24,6 +24,7 @@ const char* ns_version(void);
 int ns_gpu_count(void);
 int ns_gpu_name(int index, char* buf, size_t len);
 int ns_gpu_pci(int index, char* buf, size_t len);
+int ns_gpu_units(int index, int* units, int* mhz);
 /* opens GPU `index` with its own context and one in-order queue */
 int ns_gpu_open(int index, ns_gpu** out);
 void ns_gpu_close(ns_gpu* g);

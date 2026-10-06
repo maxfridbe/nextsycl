@@ -53,6 +53,17 @@ int ns_gpu_name(int index, char* buf, size_t len) {
     NS_CATCH
 }
 
+// GPU `index`'s compute units (Xe vector engines) and their clock (MHz): how much it computes
+int ns_gpu_units(int index, int* units, int* mhz) {
+    NS_TRY
+    auto v = gpus();
+    if (index < 0 || index >= (int) v.size()) return fail("no GPU " + std::to_string(index));
+    *units = (int) v[index].get_info<sycl::info::device::max_compute_units>();
+    *mhz = (int) v[index].get_info<sycl::info::device::max_clock_frequency>();
+    return 0;
+    NS_CATCH
+}
+
 // the PCI address of GPU `index` ("0000:03:00.0") into buf; an empty string when the driver does not say
 int ns_gpu_pci(int index, char* buf, size_t len) {
     NS_TRY
