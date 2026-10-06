@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 ns-gguf.workspace = true
 ns-model.workspace = true
+ns-core.workspace = true
