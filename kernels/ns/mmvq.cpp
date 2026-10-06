@@ -3,6 +3,8 @@
 #include "ns.h"
 #include "ns_internal.hpp"
 
+#include <cstdlib>
+
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -27,10 +29,14 @@ int ns_quantize_q8_1(ns_gpu* g, const float* x, void* q8_1, int64_t n_in, int64_
 int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
     NS_TRY
     if (ncols < 1 || ncols > 8) return ns_fail("ns_mmvq: 1..8 columns");
-    if (strata::kernels::iq_supported(type)) {
-        strata::kernels::iq_mmvq(type, w, x_q8_1, y, (int) n_in, (int) n_out, (int) ncols, &g->q);
-    } else if (strata::kernels::native_mmvq_supported(type)) {
+    // the tuned dense kernels first (Q8_0, Q3_K-Q6_K, ...), the IQ family for the rest (IQ2_XXS, Q2_K, ...);
+    // NS_MMVQ_IQ_FIRST=1 swaps the order (for comparisons)
+    static const bool iq_first = getenv("NS_MMVQ_IQ_FIRST") && getenv("NS_MMVQ_IQ_FIRST")[0] == '1';
+    const bool native = strata::kernels::native_mmvq_supported(type), iq = strata::kernels::iq_supported(type);
+    if (native && !(iq_first && iq)) {
         strata::kernels::native_mmvq(type, w, x_q8_1, y, (int) n_in, (int) n_out, (int) ncols, &g->q);
+    } else if (iq) {
+        strata::kernels::iq_mmvq(type, w, x_q8_1, y, (int) n_in, (int) n_out, (int) ncols, &g->q);
     } else {
         return ns_fail("ns_mmvq: ggml type " + std::to_string(type) + " has no decode kernel");
     }

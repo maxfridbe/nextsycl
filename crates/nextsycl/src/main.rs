@@ -19,8 +19,9 @@ const USAGE: &str = "usage:
   nextsycl check <model.gguf> <dump dir> [--gpu N]
                                 the forward pass on a reference dump's prompt, every step compared, the next token
   nextsycl tokenize <model.gguf> <text>
-  nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N]
+  nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
                     [--expert-gib G]   VRAM for routed experts (default: what is free less 3 GiB)
+                    [--mirror-gib G]   pinned host memory mirroring experts (default: available less 10 GiB)
   nextsycl kernels <model.gguf> [--gpu N]   each weight type's decode kernel against the exact path";
 
 fn gib(b: u64) -> f64 {
@@ -196,7 +197,7 @@ fn check(model: &Path, dump: &Path, gpu: usize) -> Result<(), String> {
     let g = ns_core::Gpu::open(gpu).map_err(e)?;
     println!("gpu      : {} ({})", g.name, g.index);
     let mut log = |l: String| println!("load     : {l}");
-    let glm = ns_engine::glm5next::Glm::load(&f, &g, None, &mut log).map_err(e)?;
+    let glm = ns_engine::glm5next::Glm::load(&f, std::slice::from_ref(&g), None, Some(0), &mut log).map_err(e)?;
     println!("load     : {:.2} GiB in {:.1} s", gib(glm.load_bytes), glm.load_seconds);
     println!("prompt   : {} tokens {:?}", tokens.len(), tokens);
     println!("{:<26} {:>10} {:>10} {:>10}", "tensor", "cosine", "rel err", "max diff");
@@ -308,16 +309,19 @@ fn generate(args: &[String]) -> Result<(), String> {
     let max: usize = opt("--max").and_then(|v| v.parse().ok()).unwrap_or(256);
     let temp: f32 = opt("--temp").and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let top_p: f32 = opt("--top-p").and_then(|v| v.parse().ok()).unwrap_or(0.95);
-    let gpu: usize = opt("--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let gpus: Vec<usize> = opt("--gpu").unwrap_or_else(|| "0".into()).split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}: a GPU number"))).collect::<Result<_, _>>()?;
     let f = Gguf::open(Path::new(model)).map_err(|e| e.0)?;
     let tok = ns_tok::Tokenizer::from_gguf(&f)?;
     let text = ns_tok::glm_chat(&[ns_tok::Message { role: "user", content: &prompt, reasoning: None }], effort);
     let ids = tok.encode(&text);
-    let g = ns_core::Gpu::open(gpu).map_err(e)?;
+    let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let expert_gib: Option<f64> = opt("--expert-gib").and_then(|v| v.parse().ok());
+    let mirror_gib: Option<f64> = opt("--mirror-gib").and_then(|v| v.parse().ok());
     let mut log = |l: String| eprintln!("[{l}]");
-    let glm = ns_engine::glm5next::Glm::load(&f, &g, expert_gib.map(|x| (x * (1u64 << 30) as f64) as usize), &mut log).map_err(e)?;
-    eprintln!("[{} on {}, {} prompt tokens, loaded in {:.1} s]", f.meta("general.name").and_then(|v| v.as_str()).unwrap_or("?"), g.name, ids.len(), glm.load_seconds);
+    let glm = ns_engine::glm5next::Glm::load(&f, &gs, expert_gib.map(|x| (x * (1u64 << 30) as f64) as usize),
+                                                 mirror_gib.map(|x| (x * (1u64 << 30) as f64) as usize), &mut log).map_err(e)?;
+    eprintln!("[{} on {}, {} prompt tokens, loaded in {:.1} s]", f.meta("general.name").and_then(|v| v.as_str()).unwrap_or("?"),
+              gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), ids.len(), glm.load_seconds);
     let mut sess = glm.session(ids.len() + max + 1).map_err(e)?;
     let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
     let t0 = std::time::Instant::now();
@@ -348,8 +352,11 @@ fn generate(args: &[String]) -> Result<(), String> {
     }
     println!("{}", String::from_utf8_lossy(&pending));
     let dt = t1.elapsed().as_secs_f64();
-    let (hits, misses) = glm.expert_stats();
-    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); experts: {hits} hits, {misses} misses ({:.0}% hit)]",
+    for (name, secs, calls) in glm.profile() {
+        eprintln!("[profile {name:<34} {secs:>7.2} s  {calls:>6} calls  {:>8.2} ms/token]", secs * 1000.0 / (n + 1) as f64);
+    }
+    let (hits, misses, mirrored) = glm.expert_stats();
+    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); experts: {hits} hits, {misses} misses ({:.0}% hit), {mirrored} of the misses from the mirror]",
               ids.len(), ids.len() as f64 / prefill, n as f64 / dt.max(1e-9), 100.0 * hits as f64 / (hits + misses).max(1) as f64);
     Ok(())
 }
