@@ -90,6 +90,13 @@ of IQ2_XXS instead could win twice.
       with NS_FUSED_DOWN_MAX=128 (the default; 2.9 at 64, 3.25 at 256), the same text
 - [ ] 2D block loads for A; the B fill (joint_matrix_apply, ~55 us of the 128-token call with plain fp16 weights) is
       the gap to oneMKL's ceiling
+- [x] The expansion itself: alone (reference/expand.cpp, 2048 x 4096, cold) IQ2_XXS took 67 us on a B70 and 100
+      on a B65 a work-item 8 values of one block; two blocks a work-item (their grid loads overlap) 40 / 58 us,
+      exact; bigger work-groups or 4 blocks no better; Q2_K (36-37 us) already at its bound. In the engine the gain
+      is small: the B65's gate/up expansion at 36K 4.17 -> 3.92 s (its build of the old kernel was already faster
+      than the bench's), 36K 989 -> 992 tok/s
+- [ ] The expansion beside the GEMMs: it is memory bound, the GEMMs compute bound - expand expert k + 1 on a second
+      compute queue while expert k multiplies (two fp16 buffers), hiding most of its ~4 s at 36K on the B65
 
 ## Prompt: the two GPUs in a pipeline (2026-10-07)
 

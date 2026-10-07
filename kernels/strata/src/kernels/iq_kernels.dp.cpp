@@ -2536,6 +2536,24 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    // nextsycl: IQ2_XXS (the experts' gate/up) two blocks a work-item - its grid-table loads overlap: 67 -> 40 us a
+    // 2048 x 4096 matrix on a B70, 100 -> 58 on a B65, the same values (Q2_K gained nothing: already at its bound)
+    const int64_t nb = n / 256;
+    if (t == 16 && nb % 16 == 0) {
+        const int64_t items = nb / 2 * 32;
+        sycl::half* y = (sycl::half*) dst;
+        strata::q_of(stream)->parallel_for(sycl::nd_range<1>(items, 256), [=](sycl::nd_item<1> it) {
+            const int64_t w = it.get_global_id(0);
+            const int tid = (int) (w % 32);
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int64_t b = w / 32 + k * (items / 32);
+                dq_iq2_xxs<sycl::half>(src, b, y + b * QK_K, tid);
+            }
+        });
+        check("iq_dequant_f16");
+        return;
+    }
     {
 
         dpct::has_capability_or_fail(
