@@ -27,6 +27,8 @@ const SCRATCH: usize = 32 << 20;
 
 /// Time the host spent waiting for the routers' logits (the GPU finishing the layer up to them), all layers
 pub static ROUTER_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Time the host spent choosing each row's experts (all layers)
+pub static ROUTE_HOST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Prompt chunks of this many tokens or more multiply in fp16 on the XMX units (NS_PROMPT_F16_MIN, default 1024;
 /// 0 = never): the experts, and the dense matrices whose type the fp16 expander takes.
@@ -1490,6 +1492,7 @@ impl<'g> Glm<'g> {
 
         // the embedding rows, on the first part's GPU
         let p0 = &self.parts[0];
+        let m_emb = self.mark(p0);
         let x0 = self.embed(p0, tokens)?;
         tap("inp_embd", &x0)?;
         // the 4 streams start as copies of the embedding
@@ -1502,6 +1505,7 @@ impl<'g> Glm<'g> {
         }
         let x_init = DevBuf::from_f32(&p0.ops.gpu, &xs)?;
         tap("hc_init", &x_init)?;
+        self.lap(p0, "embedding + the 4 streams", m_emb);
         let mut staging = vec![0u8; t * 4 * d * 4];
 
         // the stream rotates through three buffers per GPU (a layer's input, after its attention, after its FFN);
@@ -1627,6 +1631,7 @@ impl<'g> Glm<'g> {
         // the head, for the last n_out tokens (on the last part)
         let p = self.parts.last().unwrap();
         let o = &p.ops;
+        let m_head = self.mark(p);
         p.arena.reset();
         let x = &ring[ix];
         let mean = p.arena.f32(t * d)?;
@@ -1647,6 +1652,7 @@ impl<'g> Glm<'g> {
         sess.pos += t;
         sess.snapped = snapping.then_some((pos0, t));
         let v = logits.to_f32()?;
+        self.lap(p, "head", m_head);
         let vocab = g.n_vocab as usize;
         Ok(v.chunks(vocab).map(|c| c.to_vec()).collect())
     }
@@ -2135,18 +2141,36 @@ impl<'g> Glm<'g> {
         };
         let bias = p.router_bias(l)?;
         // expert -> (token, weight)
-        let mut by: BTreeMap<usize, Vec<(i32, f32)>> = BTreeMap::new();
-        for ti in 0..t {
+        let th = Instant::now();
+        // each row's `used` best by score (the best kept in the order a full sort gives them: their sum is added in
+        // that order), its weights; a prompt chunk's rows over threads, merged in row order
+        let pick = |ti: usize| -> Vec<(usize, f32)> {
             let pr: Vec<f32> = lv[ti * ne..(ti + 1) * ne].iter().map(|z| 1.0 / (1.0 + (-z).exp())).collect();
+            let key = |i: usize| pr[i] + bias[i];
             let mut order: Vec<usize> = (0..ne).collect();
-            order.sort_by(|a, b| (pr[*b] + bias[*b]).total_cmp(&(pr[*a] + bias[*a])));
-            let sel = &order[..used];
+            order.select_nth_unstable_by(used - 1, |a, b| key(*b).total_cmp(&key(*a)).then(a.cmp(b)));
+            let sel = &mut order[..used];
+            sel.sort_by(|a, b| key(*b).total_cmp(&key(*a)).then(a.cmp(b)));
             let sum: f32 = sel.iter().map(|i| pr[*i]).sum::<f32>().max(6.103_516e-5); // the smallest normal half, as llama.cpp clamps
-            for i in sel {
-                let w = if g.expert_norm { pr[*i] / sum } else { pr[*i] } * g.expert_scale as f32;
-                by.entry(*i).or_default().push((ti as i32, w));
+            sel.iter().map(|&i| (i, if g.expert_norm { pr[i] / sum } else { pr[i] } * g.expert_scale as f32)).collect()
+        };
+        let rows: Vec<Vec<(usize, f32)>> = if t >= 256 {
+            let parts = 16.min(t);
+            let per = t.div_ceil(parts);
+            std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..parts).map(|k| { let pick = &pick; sc.spawn(move || (k * per..((k + 1) * per).min(t)).map(pick).collect::<Vec<_>>()) }).collect();
+                hs.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+            })
+        } else {
+            (0..t).map(pick).collect()
+        };
+        let mut by: BTreeMap<usize, Vec<(i32, f32)>> = BTreeMap::new();
+        for (ti, sel) in rows.into_iter().enumerate() {
+            for (i, w) in sel {
+                by.entry(i).or_default().push((ti as i32, w));
             }
         }
+        ROUTE_HOST_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         // the shared expert first, then each routed expert added into it
         let y = self.timed(p, "shared expert", || {
             let mut pj = p.mm_many(l, &[Role::ShGate, Role::ShUp], x, t)?.into_iter();

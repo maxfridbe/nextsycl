@@ -452,8 +452,9 @@ fn generate(args: &[String]) -> Result<(), String> {
     for (name, secs, calls) in glm.profile() {
         eprintln!("[profile {name:<34} {secs:>7.2} s  {calls:>6} calls  {:>8.2} ms/token]", secs * 1000.0 / (n + 1) as f64);
     }
-    eprintln!("[host waited {:.2} s for the routers' logits]",
-              ns_engine::glm5next::ROUTER_WAIT_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9);
+    eprintln!("[host waited {:.2} s for the routers' logits, chose the experts in {:.2} s]",
+              ns_engine::glm5next::ROUTER_WAIT_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9,
+              ns_engine::glm5next::ROUTE_HOST_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9);
     for (i, (peak, spills)) in glm.arena_peaks().iter().enumerate() {
         eprintln!("[arena {i}: peak {:.2} GiB, {spills} request(s) past it]", *peak as f64 / (1u64 << 30) as f64);
     }
