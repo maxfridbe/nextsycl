@@ -20,7 +20,7 @@ PCIe. It runs on one card or splits the layers over several.
   (no RoPE in its MLA); a passphrase is found at 10 / 50 / 90% of 32K-249K documents (`bench --needle`, 9 of 9). The
   latent cache in fp16, or q8 with `NS_KV=q8` (544 bytes a token and layer instead of 1,024; the same needle
   result). Plan and measurements: `docs/256k-context.md`.
-- **A prompt path on the XMX units:** prompts are read in chunks of 4,096 tokens, with the experts, the dense
+- **A prompt path on the XMX units:** prompts are read in chunks of 6,144 tokens, with the experts, the dense
   matrices and MLA's attention in fp16 through oneMKL's half GEMMs, and the experts that live in host memory copied
   on a second queue while the previous ones compute.
 - **A prompt cache:** checkpoints of the whole conversation state in host memory, at the end of a prompt's first
@@ -128,10 +128,10 @@ the server:
 
 | | |
 |---|---|
-| prompt, 2K tokens (one chunk) | ~435 tokens/s |
-| prompt, 8K tokens | ~760 tokens/s |
+| prompt, 2K tokens (one chunk) | ~430 tokens/s |
+| prompt, 8K tokens | ~740 tokens/s |
 | prompt, 12K tokens | ~820 tokens/s |
-| prompt, 36-40K tokens | ~950-1,010 tokens/s |
+| prompt, 36-40K tokens | ~1,050-1,100 tokens/s |
 | prompt, 128K tokens | ~1,000 tokens/s (126 s) |
 | prompt, 253K tokens | ~930 tokens/s (272 s) |
 | decode, short context, MTP on | ~18-21 tokens/s (80-90% of drafts accepted) |
@@ -146,8 +146,9 @@ About 60% of the experts fit in VRAM (plus ~380 slots a GPU lent by the prompt a
 in pinned host memory. At decode a missed expert is swapped in over PCIe (both directions at once, on two copy
 queues, while the resident experts compute; the next layer's likely experts prefetched) - on these cards' x8 links
 those swaps are still the largest share of decode time (`TODO.md`). `--gpu all` puts the GPU that computes most last
-(it takes the head and the draft block); `NS_SPLIT` sets the layers per GPU. A prompt longer than a chunk (4,096
+(it takes the head and the draft block); `NS_SPLIT` sets the layers per GPU. A prompt longer than a chunk (6,144
 tokens) runs the two GPUs as a pipeline: the first reads chunk n+1 while the second finishes chunk n.
+The latest benchy: `docs/benchy/v1-2026-10-07-chunk6144.md`.
 
 ## Benchy
 

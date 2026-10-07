@@ -82,7 +82,7 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     }
     args.extend(["-e".into(), "NEXTSYCL_LIB=/app/libnextsycl.so".into(), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // engine settings the server reads from its environment (NS_KV=q8: the latent cache in q8)
-    for k in ["NS_KV"] {
+    for k in ["NS_KV", "NS_PREFILL_CHUNK", "NS_PIPE_TRACE", "NS_VRAM_GUARD_GIB"] {
         if let Some(v) = cfg.get(k) {
             args.extend(["-e".into(), format!("{k}={v}")]);
         }

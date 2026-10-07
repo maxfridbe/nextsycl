@@ -104,6 +104,41 @@ fn gather_lat(o: &Ops, cache: &DevBuf, idx: &DevBuf, out: &DevBuf, n: usize, lat
     if kv_q8() { o.gather_q8_h(cache, idx, out, n, lat) } else { o.gather_h(cache, idx, out, n, lat) }
 }
 
+/// NS_VRAM_GUARD_GIB: a prompt read stops with an error once a GPU has less VRAM free than this after a chunk
+/// (before an allocation could go to the driver's spill path - the box's known hang); off by default
+fn vram_guard() -> Option<u64> {
+    static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_VRAM_GUARD_GIB").ok().and_then(|v| v.parse::<f64>().ok()).map(|g| (g * (1u64 << 30) as f64) as u64))
+}
+
+/// Err when `gpu` has less free VRAM than the guard
+fn check_vram(gpu: &Gpu) -> Result<()> {
+    if let Some(g) = vram_guard() {
+        if let Some(free) = gpu.memory()?.1 {
+            if free < g {
+                return Err(Error(format!("{}: {:.2} GiB of VRAM free, under the guard (NS_VRAM_GUARD_GIB)", gpu.name, gib(free as usize))));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `tokens` in chunks of `c`, the last two split evenly when the last would be under half a chunk (a pipeline runs
+/// at its longer stage: 8K in 6,144 + 1,831 read at 711 tok/s, 762 as two of ~4K)
+fn chunked(tokens: &[u32], c: usize) -> Vec<&[u32]> {
+    let mut v: Vec<&[u32]> = tokens.chunks(c).collect();
+    if v.len() >= 2 && v[v.len() - 1].len() < c / 2 {
+        let n = v.len();
+        let start = (n - 2) * c;
+        let both = &tokens[start..];
+        let half = both.len().div_ceil(2);
+        v.truncate(n - 2);
+        v.push(&both[..half]);
+        v.push(&both[half..]);
+    }
+    v
+}
+
 /// The rows the fused kernel computes for n tokens: to 32, above 64 to 64 (its wide form)
 fn fused_rows(n: usize) -> usize {
     n.next_multiple_of(if n > 64 { 64 } else { 32 })
@@ -161,13 +196,13 @@ const MMVQ_COLS: usize = 8;
 const MAX_COLS: usize = 16384;
 /// expert slots and the mirror are allocated in chunks of this size (single allocations stay small)
 const CHUNK: usize = 2 << 30;
-/// Prompt tokens per forward pass (NS_PREFILL_CHUNK, default 4096, 64..8192): bigger chunks give each expert's
-/// weights more tokens (Strata's lesson: experts are streamed once a chunk), and need a bigger arena. 36K, pipelined,
-/// generate: 961 tok/s at 4096, 993 at 5120, 1072 at 6144 - but 6144 faulted the B70 in the server (two 64K
-/// sessions; TODO.md); 7168 did not fit the B65's VRAM.
+/// Prompt tokens per forward pass (NS_PREFILL_CHUNK, default 6144, 64..8192): bigger chunks give each expert's
+/// weights more tokens (Strata's lesson: experts are streamed once a chunk), and need a bigger arena and pass buffers
+/// (both come out of the expert store). Through the server: 40K at 1,096 tok/s at 6144 vs 1,011 at 4096; 7168 did
+/// not fit the B65's VRAM.
 pub fn prefill_chunk() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("NS_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096).clamp(64, 8192))
+    *V.get_or_init(|| std::env::var("NS_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(6144).clamp(64, 8192))
 }
 
 /// Bytes of each GPU's arena (NS_ARENA_MIB; default: 1 GiB, or ~0.55 MiB a token of the prompt chunk past 1,900 -
@@ -616,10 +651,15 @@ impl Part {
         let slot_bytes = moe.iter().map(|l| m.expert_bytes(*l) as usize).max().unwrap_or(256).next_multiple_of(256);
         let budget = match expert_bytes {
             Some(b) => b,
-            // what is free less 3 GiB (the arena, the forward pass, at least 1.5 GiB left over) and the sessions'
-            // attention caches, sized now so a long context never pushes VRAM into the driver's spill path
-            // (the arena past its 1 GiB comes out of the experts too)
-            None => gpu.memory()?.1.map_or(8usize << 30, |f| (f as usize).saturating_sub((2 << 30) + arena_bytes().max(1 << 30) + SMALL_ARENA + kv_reserve)),
+            // what is free less the arena, the forward pass's own buffers (its stream ring and work buffers, ~352 KB a
+            // token of the chunk: 1.4 GiB at 4096 - the 2 GiB this kept before, whatever the chunk, left a 6144 pass
+            // short of 100 MB on the server's B70) with 0.6 GiB to spare, and the sessions' attention caches - sized
+            // now so a long context never pushes VRAM into the driver's spill path (the arena past its 1 GiB comes out
+            // of the experts too)
+            None => gpu.memory()?.1.map_or(8usize << 30, |f| {
+                let pass = (600 << 20) + prefill_chunk() * (352 << 10);
+                (f as usize).saturating_sub(pass + arena_bytes().max(1 << 30) + SMALL_ARENA + kv_reserve)
+            }),
         };
         let per_chunk = (CHUNK / slot_bytes).max(1);
         let nv = (budget / slot_bytes).min(n_exp);
@@ -1279,7 +1319,7 @@ impl<'g> Glm<'g> {
     /// As `feed`, but `stop()` - asked before each chunk past the first - ends it early at a chunk's end: (the tokens
     /// read, the last one's logits). The server stops a long prompt this way when another request arrives.
     pub fn feed_until(&self, sess: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
-        let chunks: Vec<&[u32]> = tokens.chunks(prefill_chunk()).collect();
+        let chunks = chunked(tokens, prefill_chunk());
         let runs = self.runs();
         if chunks.len() >= 2 && runs.len() == 2 && pipeline() {
             return self.feed_pipelined(sess, &chunks, (runs[0], runs[1]), stop, tap);
@@ -1331,6 +1371,7 @@ impl<'g> Glm<'g> {
                         Ok(v)
                     });
                     let t1 = std::time::Instant::now();
+                    let r = r.and_then(|v| check_vram(&self.parts[runs.0.0].ops.gpu).map(|_| v));
                     let failed = r.is_err();
                     if tx.send(r).is_err() || failed {
                         return;
@@ -1364,6 +1405,7 @@ impl<'g> Glm<'g> {
                     })?;
                     let x = self.run_layers(layers, runs.1, x, at, c.len(), false, &mut *tap)?;
                     let l = self.head(mtp, &x, at, c, 1, &mut *tap)?.pop().unwrap_or_default();
+                    check_vram(&p1.ops.gpu)?;
                     if trace {
                         let free = p1.ops.gpu.memory().ok().and_then(|m| m.1).map_or(-1.0, |f| f as f64 / (1u64 << 30) as f64);
                         eprintln!("[pipeline: chunk {i} second stage: waited {:.2} s, draft block {:.2} s, layers + head {:.2} s; {free:.2} GiB free]",

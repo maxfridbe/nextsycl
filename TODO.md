@@ -133,6 +133,11 @@ of IQ2_XXS instead could win twice.
       (no silent spill), so the server's fault at 6144 may not be memory at all: its chunks were 5,680 tokens then
       (the equal split, since reverted). Next: a server run at 6144 with plain chunks, watching free VRAM - only
       with a margin of >= 1.5 GiB at every chunk end, stopped at once otherwise
+- [x] Done: in the server at 6144 the B70 then ran out cleanly (a 100 MB allocation failed, no fault): the expert
+      budget's fixed 2 GiB was the pass buffers at 4096. Now 0.6 GiB + ~352 KB a chunk token (2 GiB at 4096 as
+      before, 2.7 at 6144: ~100 experts fewer a GPU); NS_VRAM_GUARD_GIB stops a read before a GPU runs short. 6144
+      is the default: benchy 40K 1,011 -> 1,096 tok/s, 2K 435 / 428, 8K 762 / 736, decode 17.7-18.5; the last two
+      chunks split evenly when the last is under half (8K: 711 -> 736); free VRAM >= 1.79 GiB at every chunk end
 - [ ] Fused gate/up: no gain from more column tiles a sub-group (NB 2: slower, NB 4: spills) or limits past 64 (128:
       the same 7.5 s, 192-256: 8.1)
 
@@ -202,7 +207,8 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
       stops at a chunk's end once a request waits (`feed_until`; groups of 8 alone had cost 8%: 294 vs 273 s at
       253K); the shortest read goes first and a request that starts decoding gets a group's time before the next
       group. A chat sent 20 s into a 253K read: answered in 9.8 s (was 258 s that morning), 18.4 tok/s; the long
-      prompt 280 s vs 273 alone
+      prompt 280 s vs 273 alone; the window holds back long reads only (it had made a second short request wait 11 s for
+      its first token)
 - [x] The disk tier, measured: a 256K prompt's checkpoint pushed out by a 128K one, its follow-up mounted from the
       file - 4.5 s, the right answer
 - [x] The disk tier outlives the server: a subdirectory per fingerprint (the model file and size, the cache's form,

@@ -257,11 +257,13 @@ struct Reading {
     saved: usize,
 }
 
-/// Prompt tokens read a round while other requests decode: four chunks (the GPUs' pipeline keeps ~80% of its
-/// speed over four; a 256K prompt read at once held every other request for 4.5 minutes). Read alone, a prompt goes
+/// Prompt tokens read a round while other requests decode: three chunks (18K; the GPUs' pipeline keeps ~75% of
+/// its speed over three; a 256K prompt read at once held every other request for 4.5 minutes). Read alone, a prompt goes
 /// to its end in one pipelined read, stopped at a chunk's end when a request arrives (groups of 8 alone had cost
 /// 8%: the pipeline drained at each)
-const READ_GROUP: usize = 4 * 4096;
+fn read_group() -> usize {
+    3 * ns_engine::glm5next::prefill_chunk()
+}
 
 /// Prefixes shorter than this are read again rather than cached
 const MIN_CHECKPOINT: usize = 64;
@@ -605,13 +607,16 @@ impl Server {
             active.sort_by_key(|a| a.reading.as_ref().map_or(0, |r| a.job.ids.len() - r.at));
             let mut i = 0;
             while i < active.len() {
-                if active[i].reading.is_none() || (decoding && Instant::now() < read_after) {
+                // the decode share holds back long reads only: a prompt of a chunk or less reads at once (a second
+                // short request waited out the first one's window - 11 s to its first token)
+                let left = active[i].reading.as_ref().map_or(0, |r| active[i].job.ids.len() - r.at);
+                if active[i].reading.is_none() || (decoding && left > ns_engine::glm5next::prefill_chunk() && Instant::now() < read_after) {
                     i += 1;
                     continue;
                 }
                 let g0 = Instant::now();
                 let a = &mut active[i];
-                let limit = if others { READ_GROUP } else { usize::MAX };
+                let limit = if others { read_group() } else { usize::MAX };
                 let r = if a.job.cancel.load(Ordering::Relaxed) {
                     Err("client gone".to_string())
                 } else {
@@ -619,7 +624,7 @@ impl Server {
                 };
                 // the round's reading in all (a short prompt read after a long group must not shorten the share)
                 read_after = read_after.max(Instant::now()) + g0.elapsed();
-                if others && limit == READ_GROUP && g0.elapsed() > last_group / 2 {
+                if others && limit == read_group() && g0.elapsed() > last_group / 2 {
                     last_group = g0.elapsed();
                 }
                 match r {
