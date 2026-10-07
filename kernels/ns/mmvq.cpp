@@ -56,12 +56,13 @@ size_t ns_moe_scratch_bytes(int64_t entries, int64_t n_ff) { return strata::kern
 
 int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const uint64_t* grp_ptr, const int32_t* grp_start,
                    const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t groups, int64_t entries, const void* x_q8_1,
-                   void* scratch, float* out, float limit, int lanes) {
+                   void* scratch, float* out, float limit, int lanes, int phase) {
     NS_TRY
     if (!strata::kernels::native_expert_supported(gu_type, d_type, n_embd, n_ff))
         return ns_fail("ns_moe_grouped: types " + std::to_string(gu_type) + "/" + std::to_string(d_type) + " not supported");
     strata::kernels::native_expert_set_swiglu_limit(limit);
     strata::kernels::native_expert_set_lanes(lanes);
+    strata::kernels::native_expert_set_phase(phase);
     const auto L = strata::kernels::native_expert_layout(gu_type, d_type, n_embd, n_ff);
     strata::kernels::native_expert_grouped(L, (const unsigned long long*) grp_ptr, grp_start, n_groups, ent_dst, ent_tok, groups, entries, x_q8_1,
                                            scratch, out, &g->q);

@@ -2693,6 +2693,10 @@ float g_swiglu_limit = 0.0f;   // nextsycl: the grouped experts' SwiGLU clamp (0
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
 void native_expert_set_swiglu_limit(float limit) { g_swiglu_limit = limit; }   // nextsycl
 void native_expert_set_lanes(int lanes) { g_lanes_call = lanes == 4 || lanes == 8 || lanes == 16 || lanes == 32 ? lanes : 0; }   // nextsycl
+// nextsycl: which half of the next grouped calls runs - 0 both, 1 gate/up and the activation, 2 down (the scratch
+// carries the activation from a phase-1 call to its phase-2 call)
+static int g_phase = 0;
+void native_expert_set_phase(int phase) { g_phase = phase; }
 
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
@@ -2713,6 +2717,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
     const dpct::dim3 ggu((unsigned)((2 * L.n_ff + kExpertRows - 1) / kExpertRows),
                          (unsigned)gy);
+    if (g_phase != 2) {
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         STRATA_GU_FMTS(STRATA_GU)
@@ -2769,6 +2774,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             });
     }
     check("native_expert_grouped/swiglu");
+    }
+    if (g_phase == 1) return;
     const dpct::dim3 gd((unsigned)((L.n_embd + kExpertRows - 1) / kExpertRows), (unsigned)gy);
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;

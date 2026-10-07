@@ -872,7 +872,7 @@ impl Ops {
     /// `moe_table`). `xq` the tokens' Q8_1, `out` [entries, n_embd] (unweighted rows).
     #[allow(clippy::too_many_arguments)]
     pub fn moe_grouped(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize, table: &DevBuf, groups: usize, entries: usize, xq: &DevBuf, scratch: &DevBuf,
-                       out: &DevBuf, limit: f32, lanes: usize) -> Result<()> {
+                       out: &DevBuf, limit: f32, lanes: usize, phase: i32) -> Result<()> {
         let ints = groups * 2 + (groups + 1) + 1 + 2 * entries; // the u64 pointers as two i32 each, then the i32 tables
         if table.len < ints * 4 || scratch.len < self.moe_scratch_bytes(entries, n_ff) {
             return Err(Error("moe_grouped: the table or the scratch is short".into()));
@@ -887,7 +887,7 @@ impl Ops {
             let (gs, ng) = (i32s, i32s.add(groups + 1));
             let (dst, tok) = (ng.add(1), ng.add(1 + entries));
             (self.a().moe_grouped)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64, entries as i64,
-                                   xq.ptr, scratch.ptr, out.fp(), limit, lanes as i32)
+                                   xq.ptr, scratch.ptr, out.fp(), limit, lanes as i32, phase)
         };
         self.ok(rc, "moe_grouped")
     }

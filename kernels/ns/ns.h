@@ -132,7 +132,8 @@ int ns_moe_grouped_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
 size_t ns_moe_scratch_bytes(int64_t entries, int64_t n_ff);
 int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const uint64_t* grp_ptr, const int32_t* grp_start,
                    const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t groups, int64_t entries, const void* x_q8_1,
-                   void* scratch, float* out, float limit, int lanes);   /* lanes per row: 4/8/16/32, 0 = the default */
+                   void* scratch, float* out, float limit, int lanes, int phase);   /* lanes per row: 4/8/16/32, 0 = the default;
+                                                                                       phase: 0 both halves, 1 gate/up + activation, 2 down */
 
 #ifdef __cplusplus
 }

@@ -94,7 +94,7 @@ pub struct Api {
     pub moe_grouped_supported: unsafe extern "C" fn(c_int, c_int, i64, i64) -> c_int,
     pub moe_scratch_bytes: unsafe extern "C" fn(i64, i64) -> usize,
     pub moe_grouped: unsafe extern "C" fn(Gpu, c_int, c_int, i64, i64, *const u64, *const i32, *const i32, *const i32, *const i32, i64, i64,
-                                          *const c_void, *mut c_void, *mut f32, f32, c_int) -> c_int,
+                                          *const c_void, *mut c_void, *mut f32, f32, c_int, c_int) -> c_int,
 }
 
 // SAFETY: plain function pointers into a library that stays loaded for the process's life.

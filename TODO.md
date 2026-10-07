@@ -68,8 +68,8 @@ by default (`--no-mtp` turns it off).
 Per token: routed experts 27.7 ms (the kernel ~0.3 ms a layer-pass of the ~1.2: the rest waits on PCIe copies of the
 misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the shared expert 2.1, hc 1.5.
 
-- [ ] An expert's gate/up computed as soon as its gate/up bytes are in (2/3 of the copy), its down while the down
-      copies (split moe_grouped into its two launches with a wait between) - a third of each miss's wait
+- [x] An arriving expert's gate/up launched once its gate | up bytes are in, its down once the rest is (two copies up,
+      moe_grouped in two phases) - +1% (most misses are prefetched now; little demand wait is left)
 - [ ] The card swap (below) - the misses' copies at x16
 
 ## To try

@@ -68,7 +68,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 /// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.
 void native_grouped_set_v1(bool v1);
 void native_expert_set_swiglu_limit(float limit);   // nextsycl: GLM's clamp in the grouped SwiGLU (0: none)
-void native_expert_set_lanes(int lanes);   // nextsycl: lanes per row for the next grouped calls (4/8/16/32; 0: the default)
+void native_expert_set_lanes(int lanes);
+void native_expert_set_phase(int phase);   // nextsycl: 0 both halves, 1 gate/up + activation, 2 down   // nextsycl: lanes per row for the next grouped calls (4/8/16/32; 0: the default)
 
 /// The bench only: the AMD kernel layout (STRATA_EXP_MODE values; -1 = the environment's) and the phase
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down).
