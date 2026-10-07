@@ -132,11 +132,13 @@ int ns_moe_grouped_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
 size_t ns_moe_scratch_bytes(int64_t entries, int64_t n_ff);
 int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const uint64_t* grp_ptr, const int32_t* grp_start,
                    const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t groups, int64_t entries, const void* x_q8_1,
-                   void* scratch, float* out, float limit, int lanes, int phase);
-/* prompt chunks: an expert's gate | up (IQ2_XXS rows, N = 2 n_ff) times its tokens (x [M, K] fp16, M a multiple of
- * 32), the weights decoded inside the matrix-engine GEMM (fused.cpp): out [M, N] float32 */
-int ns_moe_fused_gu(ns_gpu* g, const uint16_t* x, const void* w, float* out, int64_t M, int64_t N, int64_t K);   /* lanes per row: 4/8/16/32, 0 = the default;
-                                                                                       phase: 0 both halves, 1 gate/up + activation, 2 down */
+                   void* scratch, float* out, float limit, int lanes, int phase);   /* lanes per row: 4/8/16/32, 0 = the default;
+                                                                                         phase: 0 both halves, 1 gate/up + activation, 2 down */
+/* prompt chunks: an expert's gate | up (IQ2_XXS rows, N = 2 n_ff) or down (Q2_K rows, N = n_embd) times its tokens
+ * (x [M, K] fp16, M a multiple of 32, of 64 above 64), the weights decoded inside the matrix-engine GEMM (fused.cpp):
+ * out [M, N] float32 */
+int ns_moe_fused_gu(ns_gpu* g, const uint16_t* x, const void* w, float* out, int64_t M, int64_t N, int64_t K);
+int ns_moe_fused_down(ns_gpu* g, const uint16_t* x, const void* w, float* out, int64_t M, int64_t N, int64_t K);
 
 #ifdef __cplusplus
 }

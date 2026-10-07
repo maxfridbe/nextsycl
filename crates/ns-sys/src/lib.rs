@@ -76,6 +76,7 @@ pub struct Api {
     pub gemm_batch_nn: unsafe extern "C" fn(Gpu, i64, i64, i64, i64, *const f32, i64, i64, *const f32, i64, i64, *mut f32, i64, i64, c_int) -> c_int,
     #[allow(clippy::type_complexity)]
     pub moe_fused_gu: unsafe extern "C" fn(Gpu, *const u16, *const c_void, *mut f32, i64, i64, i64) -> c_int,
+    pub moe_fused_down: unsafe extern "C" fn(Gpu, *const u16, *const c_void, *mut f32, i64, i64, i64) -> c_int,
     pub gemm_batch_h: unsafe extern "C" fn(Gpu, i64, c_int, i64, i64, i64, *const u16, i64, i64, *const u16, i64, i64, *mut f32, i64, i64, c_int) -> c_int,
     pub dequant_f16: unsafe extern "C" fn(Gpu, c_int, *const c_void, i64, *mut u16) -> c_int,
     pub to_f16: unsafe extern "C" fn(Gpu, *const f32, *mut u16, i64) -> c_int,
@@ -198,6 +199,7 @@ impl Api {
             gemm_batch_nn: sym!("ns_gemm_batch_nn"),
             gemm_batch_h: sym!("ns_gemm_batch_h"),
             moe_fused_gu: sym!("ns_moe_fused_gu"),
+            moe_fused_down: sym!("ns_moe_fused_down"),
             dequant_f16: sym!("ns_dequant_f16"),
             to_f16: sym!("ns_to_f16"),
             gather_f16: sym!("ns_gather_f16"),

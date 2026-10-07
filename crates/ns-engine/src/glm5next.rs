@@ -53,6 +53,19 @@ fn fused_max() -> usize {
     *V.get_or_init(|| std::env::var("NS_FUSED_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
 }
 
+/// The same for the down projection (NS_FUSED_DOWN_MAX, default 128; Q2_K weights only): at 12K the down took 2.8 s
+/// of GPU time against 3.3 expanded (2.9 at 64, 3.25 at 256)
+fn fused_down_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_FUSED_DOWN_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(128))
+}
+
+/// Whether a prompt of several chunks on two GPUs runs as a pipeline (NS_PIPELINE=0: in turn)
+fn pipeline() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_PIPELINE").map_or(true, |v| v != "0"))
+}
+
 /// The rows the fused kernel computes for n tokens: to 32, above 64 to 64 (its wide form)
 fn fused_rows(n: usize) -> usize {
     n.next_multiple_of(if n > 64 { 64 } else { 32 })
@@ -1140,10 +1153,85 @@ impl<'g> Glm<'g> {
     /// The next `tokens` of a conversation in chunks of at most `prefill_chunk()` (the arenas bound a chunk): the
     /// logits of the last token.
     pub fn feed(&self, sess: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
+        let chunks: Vec<&[u32]> = tokens.chunks(prefill_chunk()).collect();
+        let runs = self.runs();
+        if chunks.len() >= 2 && runs.len() == 2 && pipeline() {
+            return self.feed_pipelined(sess, &chunks, (runs[0], runs[1]), tap);
+        }
         let mut logits = Vec::new();
-        for c in tokens.chunks(prefill_chunk()) {
+        for c in chunks {
             logits = self.forward(sess, c, &mut *tap)?;
         }
+        Ok(logits)
+    }
+
+    /// `feed` on two GPUs with the chunks in a pipeline: a thread runs the first GPU's layers a chunk ahead while this
+    /// one runs the second's, the draft block and the head - each GPU busy while the other works on its chunk (in
+    /// turn, each idled through the other's half). The chunks' order on each GPU is kept: the same result. The taps
+    /// see the second GPU's layers only.
+    fn feed_pipelined(&self, sess: &mut Session, chunks: &[&[u32]], runs: ((usize, u64, u64), (usize, u64, u64)), tap: Tap) -> Result<Vec<f32>> {
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        if sess.pos + total > sess.max_ctx {
+            return Err(Error(format!("the context is {} tokens; {} more do not fit", sess.max_ctx, total)));
+        }
+        let rows = chunks.iter().map(|c| c.len()).max().unwrap_or(0).max(sess.mtp.as_ref().map_or(0, |m| m.rows));
+        for p in &self.parts {
+            p.arena_for(rows)?;
+        }
+        let Session { layers, mtp, pos, snapped, .. } = sess;
+        let layers: &[LayerState] = layers;
+        let start = *pos;
+        // the first GPU's streams, a chunk at a time (in host memory: the copy between the GPUs goes through it)
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(1);
+        let logits = std::thread::scope(|sc| -> Result<Vec<f32>> {
+            let ahead = sc.spawn(move || {
+                let mut none = |_: &str, _: &DevBuf| Ok(());
+                let mut at = start;
+                for c in chunks {
+                    let r = self.streams(c, &mut none).and_then(|x| self.run_layers(layers, runs.0, x, at, c.len(), false, &mut none)).and_then(|x| {
+                        let mut v = vec![0u8; x.len];
+                        x.read(0, &mut v)?;
+                        Ok(v)
+                    });
+                    let failed = r.is_err();
+                    if tx.send(r).is_err() || failed {
+                        return;
+                    }
+                    at += c.len();
+                }
+            });
+            let mut out = Ok(Vec::new());
+            let mut at = start;
+            let p1 = &self.parts[runs.1.0];
+            for c in chunks {
+                let step = (|| -> Result<Vec<f32>> {
+                    if mtp.as_ref().is_some_and(|m| m.rows > 0) {
+                        self.mtp_run(mtp, c[0], false, &mut *tap)?;
+                    }
+                    let v = rx.recv().map_err(|_| Error("the pipeline's first stage ended".into()))??;
+                    let x = self.timed(p1, "GPU to GPU", || {
+                        let x = DevBuf::new(&p1.ops.gpu, v.len())?;
+                        x.write(0, &v)?;
+                        Ok(x)
+                    })?;
+                    let x = self.run_layers(layers, runs.1, x, at, c.len(), false, &mut *tap)?;
+                    Ok(self.head(mtp, &x, at, c, 1, &mut *tap)?.pop().unwrap_or_default())
+                })();
+                match step {
+                    Ok(l) => out = Ok(l),
+                    Err(e) => {
+                        out = Err(e);
+                        break;
+                    }
+                }
+                at += c.len();
+            }
+            drop(rx);
+            ahead.join().map_err(|_| Error("the pipeline's first stage panicked".into()))?;
+            out
+        })?;
+        *pos += total;
+        *snapped = None;
         Ok(logits)
     }
 
@@ -1479,7 +1567,6 @@ impl<'g> Glm<'g> {
     /// states after each but the last (`rollback`). With the draft block loaded, the rows the previous pass left it
     /// are read first (their following token is `tokens[0]`), and this pass's rows are left to the next one.
     pub fn forward_rows(&self, sess: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
-        let g = &self.m.g;
         let t = tokens.len();
         if t == 0 || t > prefill_chunk() || n_out == 0 || n_out > t.min(MMVQ_COLS) {
             return Err(Error(format!("forward: {t} tokens, {n_out} outputs")));
@@ -1490,19 +1577,44 @@ impl<'g> Glm<'g> {
             p.arena_for(rows)?;
         }
         if sess.mtp.as_ref().is_some_and(|m| m.rows > 0) {
-            self.mtp_run(sess, tokens[0], false, &mut *tap)?;
+            self.mtp_run(&mut sess.mtp, tokens[0], false, &mut *tap)?;
         }
         let pos0 = sess.pos;
         if pos0 + t > sess.max_ctx {
             return Err(Error(format!("the context is {} tokens; {} more do not fit", sess.max_ctx, t)));
         }
-        let (d, eps) = (g.n_embd as usize, g.rms_eps as f32);
-        let kw = (g.kda_heads * g.kda_dim) as usize;
-        let (kh, kd) = (g.kda_heads as usize, g.kda_dim as usize);
         // verify passes keep snapshots (as many rows as the sessions have room for: NS_DRAFTS + 1)
         let snapping = (2..=drafts() + 1).contains(&t) && self.mtp.is_some();
+        let mut x = self.streams(tokens, &mut *tap)?;
+        let mut staging = Vec::new();
+        for (k, run) in self.runs().into_iter().enumerate() {
+            if k > 0 {
+                x = self.to_part(run.0, &x, &mut staging)?;
+            }
+            x = self.run_layers(&sess.layers, run, x, pos0, t, snapping, &mut *tap)?;
+        }
+        let out = self.head(&mut sess.mtp, &x, pos0, tokens, n_out, &mut *tap)?;
+        sess.pos += t;
+        sess.snapped = snapping.then_some((pos0, t));
+        Ok(out)
+    }
 
-        // the embedding rows, on the first part's GPU
+    /// The layers in order as runs on one part: (part, first layer, end)
+    fn runs(&self) -> Vec<(usize, u64, u64)> {
+        let mut v: Vec<(usize, u64, u64)> = Vec::new();
+        for (l, &pi) in self.owner.iter().enumerate() {
+            match v.last_mut() {
+                Some(r) if r.0 == pi => r.2 = l as u64 + 1,
+                _ => v.push((pi, l as u64, l as u64 + 1)),
+            }
+        }
+        v
+    }
+
+    /// The embedding rows on the first part's GPU, as the 4 streams [t, 4, d]
+    fn streams(&self, tokens: &[u32], tap: Tap) -> Result<DevBuf> {
+        let d = self.m.g.n_embd as usize;
+        let t = tokens.len();
         let p0 = &self.parts[0];
         let m_emb = self.mark(p0);
         let x0 = self.embed(p0, tokens)?;
@@ -1518,37 +1630,41 @@ impl<'g> Glm<'g> {
         let x_init = DevBuf::from_f32(&p0.ops.gpu, &xs)?;
         tap("hc_init", &x_init)?;
         self.lap(p0, "embedding + the 4 streams", m_emb);
-        let mut staging = vec![0u8; t * 4 * d * 4];
+        Ok(x_init)
+    }
 
-        // the stream rotates through three buffers per GPU (a layer's input, after its attention, after its FFN);
-        // every other temporary of a layer comes from the part's arena, reset at the layer's start
-        let mut cur = usize::MAX;
-        let mut ring: Vec<DevBuf> = Vec::new();
+    /// The stream `x` copied to part `pi`'s GPU
+    fn to_part(&self, pi: usize, x: &DevBuf, staging: &mut Vec<u8>) -> Result<DevBuf> {
+        let p = &self.parts[pi];
+        let next = DevBuf::new(&p.ops.gpu, x.len)?;
+        staging.resize(staging.len().max(x.len), 0);
+        self.timed(p, "GPU to GPU", || next.copy_from_peer(x, staging))?;
+        Ok(next)
+    }
+
+    /// One run of layers (`run`: its part, first layer, end) over the stream `x` (on that part's GPU) of the pass's
+    /// `t` tokens at `pos0`: the stream after the run's last layer
+    #[allow(clippy::too_many_arguments)]
+    fn run_layers(&self, layers: &[LayerState], run: (usize, u64, u64), x: DevBuf, pos0: usize, t: usize, snapping: bool, tap: Tap) -> Result<DevBuf> {
+        let g = &self.m.g;
+        let (d, eps) = (g.n_embd as usize, g.rms_eps as f32);
+        let kw = (g.kda_heads * g.kda_dim) as usize;
+        let (kh, kd) = (g.kda_heads as usize, g.kda_dim as usize);
+        let p = &self.parts[run.0];
+        let o = &p.ops;
+        let gpu = &o.gpu;
+        // the stream rotates through three buffers (a layer's input, after its attention, after its FFN); every
+        // other temporary of a layer comes from the part's arena, reset at the layer's start
+        let mut ring = vec![x, DevBuf::f32(gpu, t * 4 * d)?, DevBuf::f32(gpu, t * 4 * d)?];
         let mut ix = 0usize;
-        let mut ws: Option<[DevBuf; 6]> = None; // flat, h, normed, post, comb, pre on the current part's GPU
-        for l in 0..g.n_layer {
-            let pi = self.owner[l as usize];
-            let p = &self.parts[pi];
-            let o = &p.ops;
-            let gpu = &o.gpu;
-            if pi != cur {
-                let next: Vec<DevBuf> = (0..3).map(|_| DevBuf::f32(gpu, t * 4 * d)).collect::<Result<_>>()?;
-                if cur == usize::MAX {
-                    next[0].copy_within(0, &x_init, 0, t * 4 * d * 4)?;
-                } else {
-                    // the stream to this part's GPU
-                    self.timed(p, "GPU to GPU", || next[0].copy_from_peer(&ring[ix], &mut staging))?;
-                }
-                ring = next;
-                ix = 0;
-                ws = Some([DevBuf::f32(gpu, t * 4 * d)?, DevBuf::f32(gpu, t * d)?, DevBuf::f32(gpu, t * d)?, DevBuf::f32(gpu, t * 4)?, DevBuf::f32(gpu, t * 16)?,
-                           DevBuf::f32(gpu, t * 4)?]);
-                cur = pi;
-            }
+        // flat, h, normed, post, comb, pre
+        let ws = [DevBuf::f32(gpu, t * 4 * d)?, DevBuf::f32(gpu, t * d)?, DevBuf::f32(gpu, t * d)?, DevBuf::f32(gpu, t * 4)?, DevBuf::f32(gpu, t * 16)?,
+                  DevBuf::f32(gpu, t * 4)?];
+        for l in run.1..run.2 {
             p.arena.reset();
             let x = &ring[ix];
             let (x1, x2) = (&ring[(ix + 1) % 3], &ring[(ix + 2) % 3]);
-            let [flat, h, normed, post, comb, pre] = ws.as_ref().unwrap();
+            let [flat, h, normed, post, comb, pre] = &ws;
             // before a half: the mixes, h, post, comb; then the half's norm
             let hc_pre = |fn_: Role, base: Role, scale: Role, x: &DevBuf, norm: Role| -> Result<()> {
                 let w = p.mat(l, fn_)?;
@@ -1573,7 +1689,7 @@ impl<'g> Glm<'g> {
             self.timed(p, "hc pre", || hc_pre(Role::HcAttnFn, Role::HcAttnBase, Role::HcAttnScale, x, Role::AttnNorm))?;
             tap(&format!("attn_norm-{l}"), normed)?;
             let att = self.timed(p, if g.is_mla(l) { "MLA" } else { "KDA" }, || -> Result<DevBuf> {
-                if let LayerState::Kda { s: kstate, conv: cstate, snap } = &sess.layers[l as usize] {
+                if let LayerState::Kda { s: kstate, conv: cstate, snap } = &layers[l as usize] {
                     let snap = snap.as_ref().filter(|_| snapping);
                     // every product of the layer's input at once (one quantization of it)
                     let k0 = self.mark(p);
@@ -1613,7 +1729,7 @@ impl<'g> Glm<'g> {
                     tap(&format!("kda_out-{l}"), &out)?;
                     Ok(out)
                 } else {
-                    let LayerState::Mla { c: cache, idx } = &sess.layers[l as usize] else { return Err(Error("layer state".into())) };
+                    let LayerState::Mla { c: cache, idx } = &layers[l as usize] else { return Err(Error("layer state".into())) };
                     self.mla(p, l, normed, cache, idx, pos0, t, &mut *tap)
                 }
             })?;
@@ -1639,16 +1755,22 @@ impl<'g> Glm<'g> {
             tap(&format!("l_out-{l}"), x2)?;
             ix = (ix + 2) % 3;
         }
+        Ok(ring.swap_remove(ix))
+    }
 
-        // the head, for the last n_out tokens (on the last part)
+    /// The head after the last layer (`x`, on the last part), for the last `n_out` of the pass's `tokens`; the
+    /// draft block's rows left for the next pass
+    fn head(&self, mtp: &mut Option<MtpState>, x: &DevBuf, pos0: usize, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
+        let g = &self.m.g;
+        let (d, eps) = (g.n_embd as usize, g.rms_eps as f32);
+        let t = tokens.len();
         let p = self.parts.last().unwrap();
         let o = &p.ops;
         let m_head = self.mark(p);
         p.arena.reset();
-        let x = &ring[ix];
         let mean = p.arena.f32(t * d)?;
         o.hc_mean(x, &mean, t, d)?;
-        if let Some(ms) = &mut sess.mtp {
+        if let Some(ms) = mtp {
             // the draft block reads these rows with the tokens that follow them
             ms.hid.copy_within(0, &mean, 0, t * d * 4)?;
             ms.rows = t;
@@ -1661,8 +1783,6 @@ impl<'g> Glm<'g> {
         tap("result_norm", &out)?;
         let logits = p.mm(0, Role::Output, &out, n_out)?;
         tap("result_output", &logits)?;
-        sess.pos += t;
-        sess.snapped = snapping.then_some((pos0, t));
         let v = logits.to_f32()?;
         self.lap(p, "head", m_head);
         let vocab = g.n_vocab as usize;
@@ -1971,8 +2091,8 @@ impl<'g> Glm<'g> {
 
     /// The draft block over the rows the last forward pass left it, each with the token that follows it (`next`
     /// for the last row): their slots of its cache written; with `head`, the draft logits after the last row.
-    fn mtp_run(&self, sess: &mut Session, next: u32, head: bool, tap: Tap) -> Result<Option<Vec<f32>>> {
-        let (Some(ml), Some(ms)) = (self.mtp, sess.mtp.as_mut()) else { return Ok(None) };
+    fn mtp_run(&self, mtp: &mut Option<MtpState>, next: u32, head: bool, tap: Tap) -> Result<Option<Vec<f32>>> {
+        let (Some(ml), Some(ms)) = (self.mtp, mtp.as_mut()) else { return Ok(None) };
         if ms.rows == 0 {
             return Ok(None);
         }
@@ -2079,7 +2199,7 @@ impl<'g> Glm<'g> {
                 (vec![y], y)
             }
         };
-        dec.draft = if dec.mtp { self.mtp_run(sess, tail, true, &mut *tap)?.map(|l| argmax(&l)) } else { None };
+        dec.draft = if dec.mtp { self.mtp_run(&mut sess.mtp, tail, true, &mut *tap)?.map(|l| argmax(&l)) } else { None };
         dec.draft2 = match dec.draft {
             Some(d) if dec.mtp && drafts() >= 2 => self.mtp_chain(sess, d, &mut *tap)?.map(|l| argmax(&l)),
             _ => None,
@@ -2322,15 +2442,25 @@ impl<'g> Glm<'g> {
                     };
                     o.swiglu_gu_f16(&gu, &hh, n, f, lim)?;
                     let m4 = self.lap(p, "MoE f16: swiglu", m3);
-                    o.dequant_f16(parts.down.2.code(), buf, parts.down.0, parts.down.1, d * f, &w16)?;
-                    if let Some(r) = slot {
-                        // the slot is read: the next copy may take it
-                        freed[r] = Some(o.mark()?);
-                        issue(&mut next, &freed, &mut copied)?;
-                    }
-                    let m5 = self.lap(p, "MoE f16: expand down", m4);
-                    o.gemm_f16(n, d, f, (&hh, 0, f), (&w16, 0), (&dn, 0, d), false)?;
-                    let m6 = self.lap(p, "MoE f16: gemm down", m5);
+                    let m6 = if n <= fused_down_max() && parts.down.2.code() == 10 {
+                        // few tokens: down decoded inside the GEMM too
+                        o.moe_fused_down(&hh, buf, parts.down.0, &dn, fused_rows(n), d, f)?;
+                        if let Some(r) = slot {
+                            freed[r] = Some(o.mark()?);
+                            issue(&mut next, &freed, &mut copied)?;
+                        }
+                        self.lap(p, "MoE f16: fused down", m4)
+                    } else {
+                        o.dequant_f16(parts.down.2.code(), buf, parts.down.0, parts.down.1, d * f, &w16)?;
+                        if let Some(r) = slot {
+                            // the slot is read: the next copy may take it
+                            freed[r] = Some(o.mark()?);
+                            issue(&mut next, &freed, &mut copied)?;
+                        }
+                        let m5 = self.lap(p, "MoE f16: expand down", m4);
+                        o.gemm_f16(n, d, f, (&hh, 0, f), (&w16, 0), (&dn, 0, d), false)?;
+                        self.lap(p, "MoE f16: gemm down", m5)
+                    };
                     o.scatter_add(&y, &dn, &toks, &wtb.view(row * 4, n * 4)?, n, d)?;
                     self.lap(p, "MoE f16: scatter", m6);
                     row += n;

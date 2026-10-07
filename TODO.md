@@ -85,8 +85,21 @@ of IQ2_XXS instead could win twice.
       engine's own expand (109 us, faster than the bench's) + oneMKL; above that oneMKL's larger tiles win (with no
       limit gate/up took 9.5 s vs 7.9). NS_FUSED_MAX now defaults to 64: gate/up 7.3 s vs 7.9 of GPU time over
       both cards, the same text; end to end within the run-to-run noise (504-541 tok/s either way)
-- [ ] The down projection (Q2_K, 0.9 s expand + 1.9 s GEMM) the same way for the small experts; 2D block loads for
-      A; the B fill (joint_matrix_apply, ~55 us of the 128-token call with plain fp16 weights) is the ceiling's gap
+- [x] The down projection (Q2_K: 16 k share a scale byte and a shift of 16 quant bytes, no table) the same way:
+      alone 39-40 us at 64-128 tokens (B70); in the engine the down took 2.8 s of GPU time at 12K vs 3.3 expanded
+      with NS_FUSED_DOWN_MAX=128 (the default; 2.9 at 64, 3.25 at 256), the same text
+- [ ] 2D block loads for A; the B fill (joint_matrix_apply, ~55 us of the 128-token call with plain fp16 weights) is
+      the gap to oneMKL's ceiling
+
+## Prompt: the two GPUs in a pipeline (2026-10-07)
+
+- [x] A prompt of several chunks ran the GPUs in turn (each idle through the other's layers). `feed` now runs the
+      first GPU's layers on a thread a chunk ahead (NS_PIPELINE=0: in turn): 12K 542 -> 721 tok/s, 36K 527 -> 744
+      (B70 first), the same text; in the server's order (B65 first) 12K at 786. Splits (12K / decode): B70 first 22
+      731 / 21.1, 26 802 / 20.4; B65 first 22 786 / 20.9, 20 740 / 21.7, 18 502. Smaller chunks lose (2048: 585,
+      3072: 609 - the experts' weights serve fewer tokens)
+- [ ] Balance the stages from measured per-chunk times (the last GPU also runs the head and the draft block)
+- [ ] Overlap the hand-off between the GPUs (read back, then written: synchronous on both sides today)
 
 ## Decode, what is left (2026-10-07: 18-19 tok/s, MTP on)
 
