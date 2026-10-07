@@ -63,6 +63,15 @@ by default (`--no-mtp` turns it off).
       on the host - another wait), or the copies of a wrong guess cancelled
 - [ ] Two requests at once would use both cards at the same time (each is ~55% busy at decode today)
 
+## Decode, what is left (2026-10-07: 18-19 tok/s, MTP on)
+
+Per token: routed experts 27.7 ms (the kernel ~0.3 ms a layer-pass of the ~1.2: the rest waits on PCIe copies of the
+misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the shared expert 2.1, hc 1.5.
+
+- [ ] An expert's gate/up computed as soon as its gate/up bytes are in (2/3 of the copy), its down while the down
+      copies (split moe_grouped into its two launches with a wait between) - a third of each miss's wait
+- [ ] The card swap (below) - the misses' copies at x16
+
 ## To try
 
 - [ ] Swap the cards' slots: the B70 to the x16 slot, the B65 to Gen4 x4 - then NS_SPLIT=15 (the B65's 12 MoE layers
