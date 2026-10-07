@@ -115,9 +115,10 @@ GLM-5.3-Flash IQ2 (the ds4 file, 80 GB of experts) on an Arc Pro B70 and an Arc 
 
 | | |
 |---|---|
-| prompt, 3K tokens | ~400 tokens/s |
-| prompt, 12K tokens | ~720-790 tokens/s |
-| prompt, 36-40K tokens | ~720-745 tokens/s |
+| prompt, 2K tokens (one chunk) | ~435 tokens/s |
+| prompt, 8K tokens | ~760 tokens/s |
+| prompt, 12K tokens | ~820 tokens/s |
+| prompt, 36-40K tokens | ~950-1,010 tokens/s |
 | decode, short context, MTP on | ~18.5-20 tokens/s (80-90% of drafts accepted) |
 | power while decoding | ~175-185 W for both cards (~1.6-1.9 kJ for a 170-200-token answer) |
 | idle | ~9 W for both cards |
@@ -133,15 +134,18 @@ tokens) runs the two GPUs as a pipeline: the first reads chunk n+1 while the sec
 ## Benchy
 
 `nextsycl bench` runs Strata's benchy v1 (its prompts as text in `bench/v1`) against the running server, and sends
-several requests at once. The latest run, `docs/benchy/v1-2026-10-07-pipeline.md` (B65 + B70, the B70 last; the
-GPUs in a pipeline for prompts over a chunk - the 40K prompt read at 720 tokens/s against 416 the day before):
+several requests at once. The latest run, `docs/benchy/v1-2026-10-07-mirror.md` (B65 + B70, the B70 last; the GPUs
+in a pipeline for prompts over a chunk, the KDA scan 4-8 columns a sub-group, the pinned host memory shared by need -
+before it, 268 of the last GPU's experts were read from the file each prompt pass):
 
 | Input tokens | PP (tok/s) | TTFT (s) | TG (tok/s) | Drafts accepted | Energy (J) | Avg power (W) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 31 | - | 1.4 | 17.7 | 91% | 1,442 | 163 |
-| 2,216 | 345 | 6.9 | 16.5 | 83% | 3,803 | 173 |
-| 7,975 | 408 | 20.0 | 16.3 | 81% | 6,678 | 190 |
-| 39,758 | 720 | 55.6 | 15.7 | 72% | 19,698 | 275 |
+| 31 | - | 1.2 | 18.2 | 91% | 1,394 | 165 |
+| 2,216 | 435 | 5.4 | 17.1 | 83% | 3,604 | 179 |
+| 7,975 | 762 | 10.9 | 16.9 | 81% | 5,535 | 216 |
+| 39,758 | 1,011 | 39.7 | 16.4 | 72% | 17,194 | 313 |
+
+The day before (`docs/benchy/v1-2026-10-06-prefetch.md`): 332 / 314 / 416 tokens/s at 2K / 8K / 40K.
 
 Several at once, before and after batched decode (`docs/benchy/v1-2026-10-06-parallel.md`; the short prompt, 256
 tokens each):

@@ -106,6 +106,11 @@ of IQ2_XXS instead could win twice.
       sub-group (shared loads, overlapping reductions; NS_KDA_COLS): the B65's scan 1.46 -> 0.54 s at 12K, the B70's
       0.25; 36K 914 -> 989 tok/s, the same text (each column's arithmetic unchanged)
 - [ ] The B65's stage is still the longer one: its MLA attention (4.2 s at 36K) and the experts' expand + GEMM
+- [x] The server read 36K in 82 s against generate's 37: its two 64K sessions' VRAM pushed experts to host memory,
+      whose share went by layer count - the B65 left part of its share unused while 268 of the B70's experts stayed
+      on the file only (read from it each prompt pass). A GPU's unused share now goes to the next: 0 on the file,
+      36K through the server in 38.4 s; benchy 2K 345 -> 435, 8K 408 -> 762, 40K 720 -> 1,011 tok/s
+- [ ] The shares by need both ways (only a later GPU gets an earlier one's spare today)
 
 ## Decode, what is left (2026-10-07: 18-19 tok/s, MTP on)
 

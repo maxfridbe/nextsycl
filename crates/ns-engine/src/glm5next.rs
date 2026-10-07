@@ -985,6 +985,7 @@ impl<'g> Glm<'g> {
                 return Err(Error(format!("NS_SPLIT={v}: {} layer counts below {n} for {k} GPUs", k - 1)));
             }
         }
+        let mut spare = 0usize;
         for (i, gpu) in gpus.iter().enumerate() {
             let range = bounds[i]..bounds[i + 1];
             for l in range.clone() {
@@ -993,7 +994,9 @@ impl<'g> Glm<'g> {
             let last = i + 1 == gpus.len();
             let extra = if last && mtp && m.g.n_mtp > 0 { n..n + 1 } else { n..n };
             let blocks = n + u64::from(mtp && m.g.n_mtp > 0);
-            let share = mirror * (range.end - range.start + extra.end - extra.start) as usize / blocks as usize;
+            // by layer count, plus what the GPUs before left unused (a GPU with most of its experts in VRAM needs less;
+            // the next then keeps more out of the file - 268 of the server's last GPU's experts were read from it)
+            let share = mirror * (range.end - range.start + extra.end - extra.start) as usize / blocks as usize + spare;
             // per session: each MLA layer's latents [ctx, kv_lora] in fp16 and pooled keys [ctx / 4, idx_dim], float32
             let per_layer = kv.0 * m.g.kv_lora as usize * 2 + (kv.0 / 4 + 1) * m.g.idx_dim as usize * 4;
             let mla = range.clone().filter(|l| m.g.is_mla(*l)).count() + (extra.end - extra.start) as usize;
@@ -1001,7 +1004,9 @@ impl<'g> Glm<'g> {
             if reserve > 0 {
                 log(format!("{}: {:.2} GiB held for {} session(s) of {} tokens ({} attention layers)", gpu.name, gib(reserve), kv.1, kv.0, mla));
             }
-            parts.push(Part::load(&m, gpu, range, extra, last, expert_bytes, share, reserve, log)?);
+            let part = Part::load(&m, gpu, range, extra, last, expert_bytes, share, reserve, log)?;
+            spare = share.saturating_sub(part.host_slots * part.experts.lock().unwrap().slot_bytes);
+            parts.push(part);
         }
         let load_bytes = parts.iter().map(|p| p.weight_bytes).sum();
         let gpu_prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "gpu");
