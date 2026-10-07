@@ -1336,7 +1336,9 @@ impl<'g> Glm<'g> {
                         return;
                     }
                     if trace {
-                        eprintln!("[pipeline: chunk {i} first stage {:.2} s, then waited {:.2} s to hand it on]", (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
+                        let free = self.parts[runs.0.0].ops.gpu.memory().ok().and_then(|m| m.1).map_or(-1.0, |f| f as f64 / (1u64 << 30) as f64);
+                        eprintln!("[pipeline: chunk {i} first stage {:.2} s, then waited {:.2} s to hand it on; {free:.2} GiB free]", (t1 - t0).as_secs_f64(),
+                                  t1.elapsed().as_secs_f64());
                     }
                     at += c.len();
                 }
@@ -1363,8 +1365,9 @@ impl<'g> Glm<'g> {
                     let x = self.run_layers(layers, runs.1, x, at, c.len(), false, &mut *tap)?;
                     let l = self.head(mtp, &x, at, c, 1, &mut *tap)?.pop().unwrap_or_default();
                     if trace {
-                        eprintln!("[pipeline: chunk {i} second stage: waited {:.2} s, draft block {:.2} s, layers + head {:.2} s]", (t1 - t0).as_secs_f64(),
-                                  (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64());
+                        let free = p1.ops.gpu.memory().ok().and_then(|m| m.1).map_or(-1.0, |f| f as f64 / (1u64 << 30) as f64);
+                        eprintln!("[pipeline: chunk {i} second stage: waited {:.2} s, draft block {:.2} s, layers + head {:.2} s; {free:.2} GiB free]",
+                                  (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64());
                     }
                     Ok(l)
                 })();

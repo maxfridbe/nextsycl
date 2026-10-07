@@ -95,8 +95,11 @@ of IQ2_XXS instead could win twice.
       exact; bigger work-groups or 4 blocks no better; Q2_K (36-37 us) already at its bound. In the engine the gain
       is small: the B65's gate/up expansion at 36K 4.17 -> 3.92 s (its build of the old kernel was already faster
       than the bench's), 36K 989 -> 992 tok/s
-- [ ] The expansion beside the GEMMs: it is memory bound, the GEMMs compute bound - expand expert k + 1 on a second
-      compute queue while expert k multiplies (two fp16 buffers), hiding most of its ~4 s at 36K on the B65
+- [x] The expansion beside the GEMMs (a side compute queue, expert k + 1 expanded while expert k multiplied, two fp16
+      buffers): slower - 36K 919-927 vs 995 tok/s. The GEMMs at these widths are memory bound too (they read the
+      33.5 MB fp16 expert): the expansion still waited 4.5 s and the gate/up GEMMs went 4.0 -> 4.5 s. Reverted. The
+      fp16 copy itself is the cost: only not making it (the fused kernels, wider) or bigger chunks (fewer per
+      token) remove it
 
 ## Prompt: the two GPUs in a pipeline (2026-10-07)
 
@@ -124,6 +127,12 @@ of IQ2_XXS instead could win twice.
       a fixed 2 GiB besides the arenas, while a pass's own buffers (the stream ring and work buffers, t x ~64 KB each,
       ~1.5 GiB at 6144) grow with the chunk. Budget those per chunk, then retry - with VRAM headroom checked before,
       never by reproducing the fault. Cutting a prompt into equal chunks did not help at 4096 (40K: 975 vs 1,011)
+      Measured 2026-10-07 (NS_PIPE_TRACE now prints each GPU's free VRAM after a chunk): at 36K in generate the
+      free VRAM after a chunk is about the same at 4096 and 6144 (B65 1.85 / 1.85 GiB, B70 1.54 / 1.38) - the store
+      gives the bigger arena its room - and 6144 read 1,060 vs 938 tok/s. 7168 failed with a clean allocation error
+      (no silent spill), so the server's fault at 6144 may not be memory at all: its chunks were 5,680 tokens then
+      (the equal split, since reverted). Next: a server run at 6144 with plain chunks, watching free VRAM - only
+      with a margin of >= 1.5 GiB at every chunk end, stopped at once otherwise
 - [ ] Fused gate/up: no gain from more column tiles a sub-group (NB 2: slower, NB 4: spills) or limits past 64 (128:
       the same 7.5 s, 192-256: 8.1)
 
