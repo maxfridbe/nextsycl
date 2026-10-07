@@ -124,7 +124,9 @@ const MAX_COLS: usize = 16384;
 /// expert slots and the mirror are allocated in chunks of this size (single allocations stay small)
 const CHUNK: usize = 2 << 30;
 /// Prompt tokens per forward pass (NS_PREFILL_CHUNK, default 4096, 64..8192): bigger chunks give each expert's
-/// weights more tokens (Strata's lesson: experts are streamed once a chunk), and need a bigger arena.
+/// weights more tokens (Strata's lesson: experts are streamed once a chunk), and need a bigger arena. 36K, pipelined,
+/// generate: 961 tok/s at 4096, 993 at 5120, 1072 at 6144 - but 6144 faulted the B70 in the server (two 64K
+/// sessions; TODO.md); 7168 did not fit the B65's VRAM.
 pub fn prefill_chunk() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096).clamp(64, 8192))

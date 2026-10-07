@@ -111,6 +111,14 @@ of IQ2_XXS instead could win twice.
       on the file only (read from it each prompt pass). A GPU's unused share now goes to the next: 0 on the file,
       36K through the server in 38.4 s; benchy 2K 345 -> 435, 8K 408 -> 762, 40K 720 -> 1,011 tok/s
 - [ ] The shares by need both ways (only a later GPU gets an earlier one's spare today)
+- [ ] Bigger prompt chunks: 6144 read 36K at 1,072 tok/s vs 961 (generate; 2 x 6K = 3 x 4K at 12K, decode the
+      same), but in the server (two 64K sessions reserved) the 40K prompt faulted the B70 (an engine reset, the host
+      heap corrupted, exit 139). Suspect the driver's VRAM spill path (the box's known hang): the expert budget keeps
+      a fixed 2 GiB besides the arenas, while a pass's own buffers (the stream ring and work buffers, t x ~64 KB each,
+      ~1.5 GiB at 6144) grow with the chunk. Budget those per chunk, then retry - with VRAM headroom checked before,
+      never by reproducing the fault. Cutting a prompt into equal chunks did not help at 4096 (40K: 975 vs 1,011)
+- [ ] Fused gate/up: no gain from more column tiles a sub-group (NB 2: slower, NB 4: spills) or limits past 64 (128:
+      the same 7.5 s, 192-256: 8.1)
 
 ## Decode, what is left (2026-10-07: 18-19 tok/s, MTP on)
 
