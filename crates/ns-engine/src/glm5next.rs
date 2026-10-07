@@ -343,7 +343,6 @@ pub struct GpuInfo {
 /// A conversation's state at a position, in host memory (`Glm::save` / `Glm::restore`).
 pub struct Checkpoint {
     pub pos: usize,
-    max_ctx: usize,
     bufs: Vec<Vec<u8>>,
     mtp: Option<(usize, usize, Vec<u32>)>,
     /// host bytes held
@@ -1004,7 +1003,7 @@ impl<'g> Glm<'g> {
             let mla = range.clone().filter(|l| m.g.is_mla(*l)).count() + (extra.end - extra.start) as usize;
             let reserve = kv.1 * mla * per_layer;
             if reserve > 0 {
-                log(format!("{}: {:.2} GiB held for {} session(s) of {} tokens ({} attention layers)", gpu.name, gib(reserve), kv.1, kv.0, mla));
+                log(format!("{}: {:.2} GiB held for the sessions' {} tokens ({} attention layers)", gpu.name, gib(reserve), kv.0 * kv.1, mla));
             }
             let part = Part::load(&m, gpu, range, extra, last, expert_bytes, share, reserve, log)?;
             spare = share.saturating_sub(part.host_slots * part.experts.lock().unwrap().slot_bytes);
@@ -1306,13 +1305,14 @@ impl<'g> Glm<'g> {
             None => None,
         };
         let bytes = bufs.iter().map(|b| b.len()).sum();
-        Ok(Checkpoint { pos: n, max_ctx: sess.max_ctx, bufs, mtp, bytes })
+        Ok(Checkpoint { pos: n, bufs, mtp, bytes })
     }
 
     /// `sess` becomes the conversation `ck` was saved from (same context size).
     pub fn restore(&self, sess: &mut Session, ck: &Checkpoint) -> Result<()> {
-        if ck.max_ctx != sess.max_ctx {
-            return Err(Error("restore: the checkpoint is of another context size".into()));
+        // what it holds is up to its position: any session that long takes it
+        if ck.pos + 1 > sess.max_ctx {
+            return Err(Error(format!("restore: a checkpoint of {} tokens into a session of {}", ck.pos, sess.max_ctx)));
         }
         let mut it = ck.bufs.iter();
         let mut put = |b: &DevBuf| -> Result<()> {

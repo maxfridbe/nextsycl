@@ -122,7 +122,11 @@ of IQ2_XXS instead could win twice.
 
 ## 256K context (plan: docs/256k-context.md, 2026-10-07)
 
-- [ ] 1. Per-slot context (`--ctx 262144,32768`); 128K and 256K measured in generate (TTFT, decode at depth, VRAM)
+- [x] 1. Per-slot context (`--ctx 262144,32768`: a session each; a request goes to the smallest free one it fits,
+        else waits; a checkpoint restores into any session as long; its tokens end at its session's context). 256K
+        served: 253,308 tokens read in 271 s (933 tok/s, 29.6 Wh), decode at that depth 14.5-15.6 tok/s, a short
+        request in the 32K session at 21 tok/s; the attention reserve 3.8 GiB (B65 1.58, B70 2.21), ~320 experts
+        fewer in VRAM, 0 on the file; the checkpoint 3.5 GiB; a follow-up on the document in 4.4 s (reused from it)
   - [x] 128K in generate: the prompt at 998 tok/s (126 s), the answer right, stages ~3.9 s a chunk to the end, 0
         experts on the file. Decode at that depth was 13.0 tok/s (21-22 short): per layer and pass the indexer's
         top-k 330 us a row (one histogram's counters took every add; the selection written with four collectives

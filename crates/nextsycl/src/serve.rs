@@ -69,7 +69,10 @@ pub struct Server {
     pub glm: Glm<'static>,
     pub tok: Tokenizer,
     pub name: String,
+    /// the largest session's context (a request must fit one)
     pub max_ctx: usize,
+    /// each session's context
+    slot_ctx: Vec<usize>,
     pub default_effort: Effort,
     /// the requests waiting for a session, and the engine's wake-up
     queue: Mutex<VecDeque<Job>>,
@@ -278,11 +281,12 @@ fn text_of(v: &Value) -> String {
 
 impl Server {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, max_ctx: usize, default_effort: Effort, cache_bytes: usize,
-               cors: Vec<String>, keep: usize, parallel: usize, default_max: Option<usize>) -> Result<Server, String> {
+    pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, slot_ctx: Vec<usize>, default_effort: Effort, cache_bytes: usize,
+               cors: Vec<String>, keep: usize, default_max: Option<usize>) -> Result<Server, String> {
         let tele = Telemetry::start(&glm.gpu_info().iter().map(|g| g.pci.clone()).collect::<Vec<_>>());
-        let parallel = parallel.max(1);
-        Ok(Server { glm, tok, name, max_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
+        let parallel = slot_ctx.len().max(1);
+        let max_ctx = slot_ctx.iter().copied().max().unwrap_or(8192);
+        Ok(Server { glm, tok, name, max_ctx, slot_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
                     inflight: AtomicU64::new(0), parallel, default_max, cache: Mutex::new(PromptCache::new(cache_bytes)),
                     live_lens: Mutex::new(vec![0; parallel]), started: Instant::now(), running: Mutex::new(Default::default()),
                     done: Mutex::new(VecDeque::new()), next_id: AtomicU64::new(1), keep, tele, cors })
@@ -380,7 +384,7 @@ impl Server {
                                                              "evictions": c.evictions, "live_tokens": lives.iter().sum::<usize>(), "sessions": lives}));
         let running: Vec<Value> = self.running.lock().unwrap().values().cloned().collect();
         json!({"model": self.name, "version": crate::VERSION, "uptime_seconds": self.started.elapsed().as_secs_f64(),
-               "context": self.max_ctx, "mtp": self.glm.mtp.is_some(), "parallel": self.parallel, "gpus": gpus,
+               "context": self.max_ctx, "contexts": self.slot_ctx, "mtp": self.glm.mtp.is_some(), "parallel": self.parallel, "gpus": gpus,
                "busy": !running.is_empty(), "running": running.first().cloned(), "active": running,
                "waiting": self.queue.lock().unwrap().len(), "served": self.next_id.load(Ordering::Relaxed) - 1,
                "prompt_cache": cache, "stopping": STOP.load(Ordering::SeqCst)})
@@ -519,7 +523,7 @@ impl Server {
     /// and steps the active ones - alone with the draft block, or together in one batch pass.
     fn engine(&self) {
         let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
-        let mut slots: Vec<Slot> = match (0..self.parallel).map(|_| self.glm.session(self.max_ctx).map(|sess| Slot { sess, live: Vec::new() }))
+        let mut slots: Vec<Slot> = match self.slot_ctx.iter().map(|&c| self.glm.session(c).map(|sess| Slot { sess, live: Vec::new() }))
             .collect::<ns_core::Result<Vec<_>>>() {
             Ok(v) => v,
             Err(e) => {
@@ -532,12 +536,23 @@ impl Server {
         loop {
             // take waiting requests while sessions are free
             while active.len() < self.parallel {
-                let Some(job) = self.queue.lock().unwrap().pop_front() else { break };
+                let Some(mut job) = self.queue.lock().unwrap().pop_front() else { break };
                 let used: Vec<usize> = active.iter().map(|a| a.slot).collect();
-                // the free session holding the longest prefix of this prompt
-                let slot = (0..slots.len()).filter(|i| !used.contains(i))
-                    .max_by_key(|&i| { let l = &slots[i].live; if l.len() < job.ids.len() && job.ids.starts_with(l) { l.len() + 1 } else { 0 } })
-                    .unwrap_or(0);
+                let fits = |i: usize| slots[i].sess.max_ctx >= job.ids.len() + 16;
+                // among the free sessions it fits: the one holding the longest prefix of this prompt, then the
+                // smallest (a long session kept for the long prompts)
+                let slot = (0..slots.len()).filter(|i| !used.contains(i) && fits(*i))
+                    .max_by_key(|&i| {
+                        let l = &slots[i].live;
+                        (if l.len() < job.ids.len() && job.ids.starts_with(l) { l.len() + 1 } else { 0 }, std::cmp::Reverse(slots[i].sess.max_ctx))
+                    });
+                let Some(slot) = slot else {
+                    // only busy sessions fit it: it waits at the front
+                    self.queue.lock().unwrap().push_front(job);
+                    break;
+                };
+                // its tokens end at its session's context
+                job.max = job.max.min(slots[slot].sess.max_ctx - job.ids.len() - 1);
                 match self.read_prompt(&mut slots[slot], &job.ids, &mut none) {
                     Ok((logits, from, source, seconds, saved)) => {
                         let _ = job.tx.send(Ev::Read { from, source, seconds, saved });

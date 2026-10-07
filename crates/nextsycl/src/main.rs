@@ -35,7 +35,7 @@ pub const VERSION: &str = match option_env!("NS_VERSION") {
 const USAGE: &str = "nextsycl - GLM-5.3-Flash on Intel Arc GPUs (Rust + SYCL)
 
 the server (a container; the model stays loaded on the GPUs):
-  nextsycl start [--gpu N ...] [--model PATH] [--port N] [--host H] [--ctx N] [--name ID] [--effort low|high|max]
+  nextsycl start [--gpu N ...] [--model PATH] [--port N] [--host H] [--ctx N | N,M,...] [--name ID] [--effort low|high|max]
                  [--prompt-cache-mib N] [--no-mtp]
                                 the OpenAI API on NS_HOST:NS_PORT (default 127.0.0.1:8085), control on a Unix socket
   nextsycl stop                 gracefully: the request running finishes, then the server ends
@@ -53,7 +53,7 @@ the server (over its socket):
   nextsycl version
 
 in this process (inside the image: the kernels need the oneAPI runtime):
-  nextsycl serve <model.gguf> [--gpu 0,1 | all] [--host H] [--port N] [--name ID] [--ctx N] [--effort E] [--socket PATH]
+  nextsycl serve <model.gguf> [--gpu 0,1 | all] [--host H] [--port N] [--name ID] [--ctx N | N,M,... (a session each)] [--effort E] [--socket PATH]
                  [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)] [--cors ORIGINS]
                  [--keep-requests N (100)] [--parallel N (2: requests decoded together)]
                  [--max-tokens N (a request without max_tokens: N; default the rest of the context)]
@@ -721,7 +721,12 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         g.split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}"))).collect::<Result<_, _>>()?
     };
     let addr = format!("{}:{}", opt("--host").unwrap_or_else(|| "127.0.0.1".into()), opt("--port").unwrap_or_else(|| "8085".into()));
-    let ctx: usize = opt("--ctx").and_then(|v| v.parse().ok()).unwrap_or(8192);
+    // --ctx N (every session N tokens) or N,M,... (a session each: one long, others short - a 256K session's attention
+    // cache is 3.4 GiB of VRAM)
+    let ctx_list: Vec<usize> = opt("--ctx").unwrap_or_else(|| "8192".into()).split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    if ctx_list.is_empty() || ctx_list.iter().any(|c| *c < 256) {
+        return Err("--ctx N or N,M,... (tokens, at least 256 each)".into());
+    }
     let effort = ns_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|high|max")?;
     let gib_opt = |k: &str| opt(k).and_then(|v| v.parse::<f64>().ok()).map(|x| (x * (1u64 << 30) as f64) as usize);
     // the model's file lives as long as the server
@@ -741,13 +746,19 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     });
     // the sessions decoding together (their attention caches come out of the expert store)
     let parallel: usize = opt("--parallel").and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 8);
-    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), mirror, mtp, (ctx, parallel), &mut log).map_err(e)?;
+    let slot_ctx: Vec<usize> = if ctx_list.len() > 1 { ctx_list.clone() } else { vec![ctx_list[0]; parallel] };
+    if slot_ctx.len() > 8 {
+        return Err("at most 8 sessions".into());
+    }
+    // the attention reserve is per token: the sessions' tokens in all (a pool row each besides)
+    let kv = (slot_ctx.iter().sum::<usize>() + 4 * slot_ctx.len(), 1);
+    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), mirror, mtp, kv, &mut log).map_err(e)?;
     eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds);
     let cors: Vec<String> = opt("--cors").unwrap_or_default().split([',', ' ']).filter(|o| !o.is_empty()).map(String::from).collect();
     let keep: usize = opt("--keep-requests").and_then(|v| v.parse().ok()).unwrap_or(100);
     // what a request without max_tokens may make: --max-tokens N (0 or none: to the end of the context)
     let default_max = opt("--max-tokens").and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0);
-    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, ctx, effort, cache, cors, keep, parallel, default_max)?);
+    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, slot_ctx, effort, cache, cors, keep, default_max)?);
     srv.run(&addr, opt("--socket").map(std::path::PathBuf::from))
 }
 

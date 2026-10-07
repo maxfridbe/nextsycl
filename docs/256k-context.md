@@ -42,6 +42,14 @@ The indexer's cost is its layout: per head scores for every (token, pool) - 4,09
 At decode the indexer reads each layer's pooled keys once a token (32 MB a layer at 256K: ~0.4 GB a token over both
 cards, under a millisecond each) - decode should barely slow with depth; to be measured.
 
+## Measured (2026-10-07)
+
+- 128K, generate: the prompt at 998 tok/s (126 s); decode at that depth 13.0 tok/s at first - the indexer's top-k
+  and MLA's decode attention were slow at depth - now 17.1.
+- 256K, through the server (`--ctx 262144,32768`): 253,308 tokens in 271 s (933 tok/s, 29.6 Wh), a right answer,
+  decode at that depth 14.5-15.6 tok/s; the B65's stage 4.3 s a chunk at the start, 4.6 at the end (the indexer's
+  quadratic part far below the fit above); a follow-up on the document 4.4 s (the checkpoint, 3.5 GiB, restored).
+
 ## Steps
 
 1. **Fit and measure, no new kernels.** Per-slot context (`--ctx 262144,32768`: one long session, one short,
