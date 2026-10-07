@@ -98,8 +98,14 @@ of IQ2_XXS instead could win twice.
       (B70 first), the same text; in the server's order (B65 first) 12K at 786. Splits (12K / decode): B70 first 22
       731 / 21.1, 26 802 / 20.4; B65 first 22 786 / 20.9, 20 740 / 21.7, 18 502. Smaller chunks lose (2048: 585,
       3072: 609 - the experts' weights serve fewer tokens)
-- [ ] Balance the stages from measured per-chunk times (the last GPU also runs the head and the draft block)
-- [ ] Overlap the hand-off between the GPUs (read back, then written: synchronous on both sides today)
+- [x] Measured the stages (NS_PIPE_TRACE=1; NS_PROFILE=gpu NS_PROFILE_PART=i profiles one GPU): 36K, B65 first, a
+      chunk 4.1 s on the B65 vs 3.45 on the B70 (with the draft block's 0.22). Splits do not balance it: a layer moves
+      its experts too (21: 3.9 / 3.6, the same total; 20: the B70 4.7). The hand-off is ~17 ms a chunk
+- [x] The KDA scan was latency bound by occupancy: a sub-group a value column, H x 128 long-running sub-groups - ~3
+      waves on the B65 (twice the B70's scan time for the same layers). Now 4 (B70) or 8 (B65) columns of a head a
+      sub-group (shared loads, overlapping reductions; NS_KDA_COLS): the B65's scan 1.46 -> 0.54 s at 12K, the B70's
+      0.25; 36K 914 -> 989 tok/s, the same text (each column's arithmetic unchanged)
+- [ ] The B65's stage is still the longer one: its MLA attention (4.2 s at 36K) and the experts' expand + GEMM
 
 ## Decode, what is left (2026-10-07: 18-19 tok/s, MTP on)
 

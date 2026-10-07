@@ -640,45 +640,92 @@ int ns_sigmoid(ns_gpu* g, float* x, int64_t n) {
 // independent: a sub-group of 16 per column, each lane 8 of its 128 keys (registers), the two sums over the keys
 // as sub-group reductions - 8,192 sub-groups at work instead of 64 work-groups, no barriers. Decode and verify
 // passes run it too, so their rows stay equal.
-int ns_kda_scan(ns_gpu* g, const float* qv, const float* kv, const float* vv, const float* eg, const float* beta, float* S, float* o,
-                int64_t T, int64_t H, int64_t d, float* snap) {
-    NS_TRY
-    if (d != 128) return ns_fail("ns_kda_scan: head size 128 only");
-    constexpr int SG = 16, KPL = 128 / SG, COLS = 8;   // lanes a column, keys a lane, columns a work-group
-    g->q.parallel_for(sycl::nd_range<1>(H * 128 * SG, COLS * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+}  // extern "C"
+
+namespace {
+// NC value columns of one head a sub-group: they share the step's key, decay and query loads, and their reductions
+// overlap - one column a sub-group was H * 128 long-running sub-groups, in ~3 waves on a B65 (a step's latency each)
+template <int NC>
+void kda_scan(sycl::queue& q, const float* qv, const float* kv, const float* vv, const float* eg, const float* beta, float* S, float* o,
+              int64_t T, int64_t H, float* snap) {
+    constexpr int SG = 16, KPL = 128 / SG, WGS = 8;   // lanes a column, keys a lane, sub-groups a work-group
+    const int64_t groups = H * 128 / NC;
+    q.parallel_for(sycl::nd_range<1>((groups + WGS - 1) / WGS * WGS * SG, WGS * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
         const auto sg = it.get_sub_group();
-        const int64_t c = it.get_global_id(0) / SG;   // the column: head hd, value j
-        const int64_t hd = c / 128;
-        const int j = (int) (c % 128), lane = (int) sg.get_local_id()[0], i0 = lane * KPL;
+        const int64_t c0 = it.get_global_id(0) / SG * NC;   // the first column: head hd, values j0..j0 + NC
+        if (c0 >= H * 128) return;
+        const int64_t hd = c0 / 128;
+        const int j0 = (int) (c0 % 128), lane = (int) sg.get_local_id()[0], i0 = lane * KPL;
         float* Sh = S + hd * 128 * 128;
-        float col[KPL];
+        float col[NC][KPL];
 #pragma unroll
-        for (int i = 0; i < KPL; ++i) col[i] = Sh[(i0 + i) * 128 + j];
+        for (int n = 0; n < NC; ++n)
+#pragma unroll
+            for (int i = 0; i < KPL; ++i) col[n][i] = Sh[(i0 + i) * 128 + j0 + n];
         const float scale = 1.f / sycl::sqrt(128.f);
         for (int64_t t = 0; t < T; ++t) {
             const int64_t base = (t * H + hd) * 128;
             const sycl::vec<float, KPL> kq = *reinterpret_cast<const sycl::vec<float, KPL>*>(kv + base + i0);
             const sycl::vec<float, KPL> gq = *reinterpret_cast<const sycl::vec<float, KPL>*>(eg + base + i0);
             const sycl::vec<float, KPL> qq = *reinterpret_cast<const sycl::vec<float, KPL>*>(qv + base + i0);
-            float dot = 0.f;
+            const float bt = beta[t * H + hd];
+            float dot[NC], out[NC];
 #pragma unroll
-            for (int i = 0; i < KPL; ++i) { col[i] *= gq[i]; dot += col[i] * kq[i]; }
-            dot = sycl::reduce_over_group(sg, dot, sycl::plus<float>());
-            const float delta = (vv[base + j] - dot) * beta[t * H + hd];
-            float out = 0.f;
+            for (int n = 0; n < NC; ++n) {
+                dot[n] = 0.f;
 #pragma unroll
-            for (int i = 0; i < KPL; ++i) { col[i] += kq[i] * delta; out += col[i] * qq[i]; }
-            out = sycl::reduce_over_group(sg, out, sycl::plus<float>());
-            if (lane == 0) o[base + j] = out * scale;
+                for (int i = 0; i < KPL; ++i) { col[n][i] *= gq[i]; dot[n] += col[n][i] * kq[i]; }
+            }
+#pragma unroll
+            for (int n = 0; n < NC; ++n) dot[n] = sycl::reduce_over_group(sg, dot[n], sycl::plus<float>());
+#pragma unroll
+            for (int n = 0; n < NC; ++n) {
+                const float delta = (vv[base + j0 + n] - dot[n]) * bt;
+                out[n] = 0.f;
+#pragma unroll
+                for (int i = 0; i < KPL; ++i) { col[n][i] += kq[i] * delta; out[n] += col[n][i] * qq[i]; }
+            }
+#pragma unroll
+            for (int n = 0; n < NC; ++n) out[n] = sycl::reduce_over_group(sg, out[n], sycl::plus<float>());
+            if (lane < NC) {
+                float mine = out[0];
+#pragma unroll
+                for (int n = 1; n < NC; ++n) mine = lane == n ? out[n] : mine;
+                o[base + j0 + lane] = mine * scale;
+            }
             if (snap && t + 1 < T) {
                 float* Sn = snap + (t * H + hd) * 128 * 128;
 #pragma unroll
-                for (int i = 0; i < KPL; ++i) Sn[(i0 + i) * 128 + j] = col[i];
+                for (int n = 0; n < NC; ++n)
+#pragma unroll
+                    for (int i = 0; i < KPL; ++i) Sn[(i0 + i) * 128 + j0 + n] = col[n][i];
             }
         }
 #pragma unroll
-        for (int i = 0; i < KPL; ++i) Sh[(i0 + i) * 128 + j] = col[i];
+        for (int n = 0; n < NC; ++n)
+#pragma unroll
+            for (int i = 0; i < KPL; ++i) Sh[(i0 + i) * 128 + j0 + n] = col[n][i];
     });
+}
+}  // namespace
+
+extern "C" {
+
+int ns_kda_scan(ns_gpu* g, const float* qv, const float* kv, const float* vv, const float* eg, const float* beta, float* S, float* o,
+                int64_t T, int64_t H, int64_t d, float* snap) {
+    NS_TRY
+    if (d != 128) return ns_fail("ns_kda_scan: head size 128 only");
+    // columns a sub-group (NS_KDA_COLS: 1, 2, 4 or 8; default by the GPU's size - 12K prompt, a layer's scan: B70
+    // (256 units) 0.7 ms at 4 against 1.2 at 8 and 4.1 at 1; B65 (160) 1.5 at 8 against 2.0 at 4 and 4.1 at 1; 16
+    // spills)
+    static const int env = [] { const char* v = std::getenv("NS_KDA_COLS"); return v ? std::atoi(v) : 0; }();
+    const int nc = env ? env : g->q.get_device().get_info<sycl::info::device::max_compute_units>() >= 200 ? 4 : 8;
+    switch (nc) {
+        case 1: kda_scan<1>(g->q, qv, kv, vv, eg, beta, S, o, T, H, snap); break;
+        case 2: kda_scan<2>(g->q, qv, kv, vv, eg, beta, S, o, T, H, snap); break;
+        case 8: kda_scan<8>(g->q, qv, kv, vv, eg, beta, S, o, T, H, snap); break;
+        default: kda_scan<4>(g->q, qv, kv, vv, eg, beta, S, o, T, H, snap); break;
+    }
     return 0;
     NS_CATCH
 }

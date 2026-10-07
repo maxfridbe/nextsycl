@@ -1064,6 +1064,13 @@ impl<'g> Glm<'g> {
     /// Adds the time since `from` to `name` and starts the next lap.
     fn lap(&self, p: &Part, name: &'static str, from: Option<Mk>) -> Option<Mk> {
         let (pr, t0) = (self.prof.as_ref()?, from?);
+        // NS_PROFILE_PART=i: only part i's sections (the GPUs run at once in a pipelined prompt)
+        static ONLY: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        if let Some(i) = *ONLY.get_or_init(|| std::env::var("NS_PROFILE_PART").ok().and_then(|v| v.parse().ok())) {
+            if self.parts.get(i).is_some_and(|q| !std::ptr::eq(q, p)) {
+                return Some(t0);
+            }
+        }
         match t0 {
             Mk::Gpu(a) => {
                 let b = p.ops.stamp().ok()?;
@@ -1183,19 +1190,25 @@ impl<'g> Glm<'g> {
         let start = *pos;
         // the first GPU's streams, a chunk at a time (in host memory: the copy between the GPUs goes through it)
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(1);
+        let trace = std::env::var("NS_PIPE_TRACE").is_ok_and(|v| v != "0");
         let logits = std::thread::scope(|sc| -> Result<Vec<f32>> {
             let ahead = sc.spawn(move || {
                 let mut none = |_: &str, _: &DevBuf| Ok(());
                 let mut at = start;
-                for c in chunks {
+                for (i, c) in chunks.iter().enumerate() {
+                    let t0 = std::time::Instant::now();
                     let r = self.streams(c, &mut none).and_then(|x| self.run_layers(layers, runs.0, x, at, c.len(), false, &mut none)).and_then(|x| {
                         let mut v = vec![0u8; x.len];
                         x.read(0, &mut v)?;
                         Ok(v)
                     });
+                    let t1 = std::time::Instant::now();
                     let failed = r.is_err();
                     if tx.send(r).is_err() || failed {
                         return;
+                    }
+                    if trace {
+                        eprintln!("[pipeline: chunk {i} first stage {:.2} s, then waited {:.2} s to hand it on]", (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
                     }
                     at += c.len();
                 }
@@ -1203,19 +1216,27 @@ impl<'g> Glm<'g> {
             let mut out = Ok(Vec::new());
             let mut at = start;
             let p1 = &self.parts[runs.1.0];
-            for c in chunks {
+            for (i, c) in chunks.iter().enumerate() {
                 let step = (|| -> Result<Vec<f32>> {
+                    let t0 = std::time::Instant::now();
                     if mtp.as_ref().is_some_and(|m| m.rows > 0) {
                         self.mtp_run(mtp, c[0], false, &mut *tap)?;
                     }
+                    let t1 = std::time::Instant::now();
                     let v = rx.recv().map_err(|_| Error("the pipeline's first stage ended".into()))??;
+                    let t2 = std::time::Instant::now();
                     let x = self.timed(p1, "GPU to GPU", || {
                         let x = DevBuf::new(&p1.ops.gpu, v.len())?;
                         x.write(0, &v)?;
                         Ok(x)
                     })?;
                     let x = self.run_layers(layers, runs.1, x, at, c.len(), false, &mut *tap)?;
-                    Ok(self.head(mtp, &x, at, c, 1, &mut *tap)?.pop().unwrap_or_default())
+                    let l = self.head(mtp, &x, at, c, 1, &mut *tap)?.pop().unwrap_or_default();
+                    if trace {
+                        eprintln!("[pipeline: chunk {i} second stage: draft block {:.2} s, waited {:.2} s, layers + head {:.2} s]", (t1 - t0).as_secs_f64(),
+                                  (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64());
+                    }
+                    Ok(l)
                 })();
                 match step {
                     Ok(l) => out = Ok(l),
