@@ -66,6 +66,44 @@ fn pipeline() -> bool {
     *V.get_or_init(|| std::env::var("NS_PIPELINE").map_or(true, |v| v != "0"))
 }
 
+/// The MLA latent cache's form (NS_KV): f16 (default; 1,024 bytes a token and layer) or q8 (an fp16 scale a block of
+/// 32, int8 values: 544 bytes - docs/256k-context.md)
+pub fn kv_q8() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_KV").is_ok_and(|v| v == "q8"))
+}
+
+/// bytes of a latent row of `lat` values in the cache
+fn lat_row(lat: usize) -> usize {
+    if kv_q8() { Ops::q8_row_bytes(lat) } else { lat * 2 }
+}
+
+/// `t` latent rows (float32) into the cache at `pos`
+fn put_latents(o: &Ops, c: &DevBuf, cache: &DevBuf, pos: usize, t: usize, lat: usize) -> Result<()> {
+    let rb = lat_row(lat);
+    if kv_q8() {
+        o.to_q8row(c, &cache.view(pos * rb, t * rb)?, t, lat)
+    } else {
+        o.to_f16(c, &cache.view(pos * rb, t * rb)?, t * lat)
+    }
+}
+
+/// MLA's attention at decode widths over the cache's form
+#[allow(clippy::too_many_arguments)]
+fn attend(o: &Ops, qa: &DevBuf, cache: &DevBuf, u: &DevBuf, t: usize, h: usize, lat: usize, pos0: usize, scale: f32,
+          sel: Option<(&DevBuf, &DevBuf)>, k: usize) -> Result<()> {
+    if kv_q8() {
+        o.mla_attend_sel_q8(qa, cache, u, t, h, lat, pos0, scale, sel, k)
+    } else {
+        o.mla_attend_sel(qa, cache, u, t, h, lat, pos0, scale, sel, k)
+    }
+}
+
+/// cache rows idx -> fp16 [n, lat] (the prompt path's GEMMs)
+fn gather_lat(o: &Ops, cache: &DevBuf, idx: &DevBuf, out: &DevBuf, n: usize, lat: usize) -> Result<()> {
+    if kv_q8() { o.gather_q8_h(cache, idx, out, n, lat) } else { o.gather_h(cache, idx, out, n, lat) }
+}
+
 /// The rows the fused kernel computes for n tokens: to 32, above 64 to 64 (its wide form)
 fn fused_rows(n: usize) -> usize {
     n.next_multiple_of(if n > 64 { 64 } else { 32 })
@@ -999,7 +1037,7 @@ impl<'g> Glm<'g> {
             // the next then keeps more out of the file - 268 of the server's last GPU's experts were read from it)
             let share = mirror * (range.end - range.start + extra.end - extra.start) as usize / blocks as usize + spare;
             // per session: each MLA layer's latents [ctx, kv_lora] in fp16 and pooled keys [ctx / 4, idx_dim], float32
-            let per_layer = kv.0 * m.g.kv_lora as usize * 2 + (kv.0 / 4 + 1) * m.g.idx_dim as usize * 4;
+            let per_layer = kv.0 * lat_row(m.g.kv_lora as usize) + (kv.0 / 4 + 1) * m.g.idx_dim as usize * 4;
             let mla = range.clone().filter(|l| m.g.is_mla(*l)).count() + (extra.end - extra.start) as usize;
             let reserve = kv.1 * mla * per_layer;
             if reserve > 0 {
@@ -1132,7 +1170,7 @@ impl<'g> Glm<'g> {
         for l in 0..g.n_layer {
             let gpu = &self.parts[self.owner[l as usize]].ops.gpu;
             layers.push(if g.is_mla(l) {
-                LayerState::Mla { c: DevBuf::new(gpu, max_ctx * g.kv_lora as usize * 2)?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)? }
+                LayerState::Mla { c: DevBuf::new(gpu, max_ctx * lat_row(g.kv_lora as usize))?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)? }
             } else {
                 let sz = (g.kda_heads * g.kda_dim * g.kda_dim) as usize;
                 let s = DevBuf::f32(gpu, sz)?;
@@ -1155,7 +1193,7 @@ impl<'g> Glm<'g> {
         let mtp = match self.mtp {
             Some(_) => {
                 let gpu = &self.parts.last().unwrap().ops.gpu;
-                Some(MtpState { cache: DevBuf::new(gpu, max_ctx * g.kv_lora as usize * 2)?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)?, hid: DevBuf::f32(gpu, prefill_chunk() * g.n_embd as usize)?, rows: 0,
+                Some(MtpState { cache: DevBuf::new(gpu, max_ctx * lat_row(g.kv_lora as usize))?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)?, hid: DevBuf::f32(gpu, prefill_chunk() * g.n_embd as usize)?, rows: 0,
                                 slot0: 0, next: Vec::new(), chain: DevBuf::f32(gpu, g.n_embd as usize)?, chain_pos: None })
             }
             None => None,
@@ -1268,7 +1306,7 @@ impl<'g> Glm<'g> {
     /// - the prompt cache's checkpoints. Pageable memory: a checkpoint spans both GPUs' contexts.
     pub fn save(&self, sess: &Session) -> Result<Checkpoint> {
         let g = &self.m.g;
-        let (lat, d, n) = (g.kv_lora as usize * 2, g.idx_dim as usize * 4, sess.pos); // bytes a cell: fp16 latents
+        let (lat, d, n) = (lat_row(g.kv_lora as usize), g.idx_dim as usize * 4, sess.pos); // bytes a cell: the latents
         let mut bufs: Vec<Vec<u8>> = Vec::new();
         let mut take = |b: &DevBuf, len: usize| -> Result<()> {
             let mut v = vec![0u8; len];
@@ -1377,7 +1415,7 @@ impl<'g> Glm<'g> {
         if dst.max_ctx != src.max_ctx || dst.layers.len() != src.layers.len() {
             return Err(Error("copy_session: the sessions differ in shape".into()));
         }
-        let lat = self.m.g.kv_lora as usize * 2; // the latents' bytes a cell (fp16)
+        let lat = lat_row(self.m.g.kv_lora as usize); // the latents' bytes a cell
         for (d, s) in dst.layers.iter().zip(&src.layers) {
             match (d, s) {
                 (LayerState::Kda { s: ds, conv: dc, .. }, LayerState::Kda { s: ss, conv: sc, .. }) => {
@@ -1451,8 +1489,8 @@ impl<'g> Glm<'g> {
         let c = p.arena.f32(t * lat)?;
         o.rms_norm(&kv, Some(p.vec(l, Role::MlaKvANorm)?), &c, t, lat, eps)?;
         tap(&format!("kv_cmpr-{l}"), &c)?;
-        // the cache keeps the latents in fp16 (as llama.cpp's): half the VRAM, half the reads of every attention
-        o.to_f16(&c, &cache.view(pos0 * lat * 2, t * lat * 2)?, t * lat)?;
+        // the cache keeps the latents in fp16 (as llama.cpp's) or q8 (NS_KV)
+        put_latents(o, &c, cache, pos0, t, lat)?;
         let t_abs = self.lap(p, "MLA: projections", t_proj);
         // the absorbed queries: per head, q~ = k_b[h] . q_h
         let kb = p.vec(l, Role::MlaKB)?;
@@ -1481,7 +1519,7 @@ impl<'g> Glm<'g> {
         let scale = 1.0 / (hd as f32).sqrt();
         if t <= MMVQ_COLS || std::env::var("NS_MLA_KERNEL").is_ok_and(|v| v == "1") {
             // decode widths: the per-row kernel (a verify pass's rows equal one-token passes)
-            o.mla_attend_sel(&qt, cache, &u, t, nh, lat, pos0, scale, sel.as_ref().map(|(a, b)| (a, b)), kp)?;
+            attend(o, &qt, cache, &u, t, nh, lat, pos0, scale, sel.as_ref().map(|(a, b)| (a, b)), kp)?;
         } else {
             // prompt chunks as GEMMs, a block of rows at a time: each row's cells gathered contiguous, then per row
             // scores [heads, cells] = q~ . G^T, a masked softmax, latents [heads, 512] = P . G
@@ -1502,7 +1540,7 @@ impl<'g> Glm<'g> {
             for r0 in (0..t).step_by(RB) {
                 let tr = RB.min(t - r0);
                 let a0 = self.mark(p);
-                o.gather_h(cache, &idx.view(r0 * nc * 4, tr * nc * 4)?, &gh, tr * nc, lat)?;
+                gather_lat(o, cache, &idx.view(r0 * nc * 4, tr * nc * 4)?, &gh, tr * nc, lat)?;
                 o.to_f16(&qt.view(r0 * nh * lat * 4, tr * nh * lat * 4)?, &qh, tr * nh * lat)?;
                 let a1 = self.lap(p, "MLA att: gather", a0);
                 o.gemm_batch_h(tr, true, nh, nc, lat, (&qh, 0, lat, nh * lat), (&gh, 0, lat, nc * lat), (&sb, 0, nc, nh * nc))?;
@@ -1840,7 +1878,7 @@ impl<'g> Glm<'g> {
         let c = p.arena.f32(t * lat)?;
         o.rms_norm(&kv, Some(p.vec(l, Role::MlaKvANorm)?), &c, t, lat, eps)?;
         for (b, (cache, _, pos)) in per.iter().enumerate() {
-            o.to_f16(&c.view(b * lat * 4, lat * 4)?, &cache.view(pos * lat * 2, lat * 2)?, lat)?;
+            put_latents(o, &c.view(b * lat * 4, lat * 4)?, cache, *pos, 1, lat)?;
         }
         let t_abs = self.lap(p, "MLA: projections", t_proj);
         let kb = p.vec(l, Role::MlaKB)?;
@@ -1861,7 +1899,7 @@ impl<'g> Glm<'g> {
             if capture {
                 self.capture_layer(p, l, cache, &qtb, sel.as_ref(), *pos)?;
             }
-            o.mla_attend_sel(&qtb, cache, &u.view(b * nh * lat * 4, nh * lat * 4)?, 1, nh, lat, *pos, scale, sel.as_ref().map(|(a, b)| (a, b)), kp)?;
+            attend(o, &qtb, cache, &u.view(b * nh * lat * 4, nh * lat * 4)?, 1, nh, lat, *pos, scale, sel.as_ref().map(|(a, b)| (a, b)), kp)?;
         }
         let t_vb = self.lap(p, "MLA: attention", t_idx);
         let vb = p.vec(l, Role::MlaVB)?;
@@ -1908,7 +1946,7 @@ impl<'g> Glm<'g> {
         let cnt = p.arena.bytes(4)?;
         o.mla_cells(sel.map(|(a, b)| (a, b)), 1, kp, pos0, &idx, &cnt, nc)?;
         let gh = p.arena.bytes(nc * lat * 2)?;
-        o.gather_h(cache, &idx, &gh, nc, lat)?;
+        gather_lat(o, cache, &idx, &gh, nc, lat)?;
         let qh = p.arena.bytes(nh * lat * 2)?;
         o.to_f16(qt, &qh, nh * lat)?;
         let sb = p.arena.f32(nh * nc)?;

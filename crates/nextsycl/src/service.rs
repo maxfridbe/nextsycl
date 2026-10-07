@@ -71,6 +71,12 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     args.extend(mount(&PathBuf::from(&models), "/models", true));
     args.extend(mount(&sock_dir, SOCKET_DIR_IN, false));
     args.extend(["-e".into(), "NEXTSYCL_LIB=/app/libnextsycl.so".into(), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
+    // engine settings the server reads from its environment (NS_KV=q8: the latent cache in q8)
+    for k in ["NS_KV"] {
+        if let Some(v) = cfg.get(k) {
+            args.extend(["-e".into(), format!("{k}={v}")]);
+        }
+    }
     args.extend([ce.image.clone(), "bash".into(), "-c".into(),
                  "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; exec /app/nextsycl serve \"$@\"".into(), "nextsycl".into()]);
     args.push(arg(raw, "--model", cfg, "NS_MODEL", "/models/glm53-iq2/GLM-5.3-Flash-Uncensored-IQ2-imatrix-MTP-ds4.gguf"));

@@ -820,6 +820,45 @@ impl Ops {
         let rc = unsafe { (self.a().gather_h)(self.raw(), src.ptr.cast(), idx.ptr.cast(), out.ptr.cast(), n as i64, c as i64) };
         self.ok(rc, "gather_h")
     }
+    /// The latent cache in q8: bytes a row of `l` values ([l / 32 fp16 scales][l int8])
+    pub fn q8_row_bytes(l: usize) -> usize {
+        l / 32 * 2 + l
+    }
+    /// y (q8 rows) = x [n, l] float32
+    pub fn to_q8row(&self, x: &DevBuf, y: &DevBuf, n: usize, l: usize) -> Result<()> {
+        need!(x, n * l, "to_q8row x");
+        y.bounds(0, n * Self::q8_row_bytes(l))?;
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().to_q8row)(self.raw(), x.fp(), y.ptr.cast(), n as i64, l as i64) };
+        self.ok(rc, "to_q8row")
+    }
+    /// out [n, l] fp16 = the q8 rows idx of src, dequantized
+    pub fn gather_q8_h(&self, src: &DevBuf, idx: &DevBuf, out: &DevBuf, n: usize, l: usize) -> Result<()> {
+        idx.bounds(0, n * 4)?;
+        out.bounds(0, n * l * 2)?;
+        // SAFETY: idx and out sized (checked); the indices are cells below the position, inside src (mla_cells).
+        let rc = unsafe { (self.a().gather_q8_h)(self.raw(), src.ptr.cast(), idx.ptr.cast(), out.ptr.cast(), n as i64, l as i64) };
+        self.ok(rc, "gather_q8_h")
+    }
+    /// `mla_attend_sel` over a q8 latent cache (decode widths)
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_attend_sel_q8(&self, qa: &DevBuf, c: &DevBuf, u: &DevBuf, t: usize, h: usize, l: usize, pos0: usize, scale: f32,
+                             sel: Option<(&DevBuf, &DevBuf)>, k: usize) -> Result<()> {
+        need!(qa, t * h * l, "mla qa");
+        c.bounds(0, (pos0 + t) * Self::q8_row_bytes(l))?;
+        need!(u, t * h * l, "mla u");
+        let (sp, cp) = match sel {
+            Some((s, n)) => {
+                need!(s, t * k, "mla sel");
+                need!(n, t, "mla sel count");
+                (s.ptr as *const i32, n.ptr as *const i32)
+            }
+            None => (std::ptr::null(), std::ptr::null()),
+        };
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().mla_attend_sel_q8)(self.raw(), qa.fp(), c.ptr.cast(), u.fp(), t as i64, h as i64, l as i64, pos0 as i64, scale, sp, cp, k as i64) };
+        self.ok(rc, "mla_attend_sel_q8")
+    }
     pub fn gather_f16(&self, src: &DevBuf, idx: &DevBuf, out: &DevBuf, n: usize, c: usize) -> Result<()> {
         idx.bounds(0, n * 4)?;
         out.bounds(0, n * c * 2)?;

@@ -50,6 +50,10 @@ cards, under a millisecond each) - decode should barely slow with depth; to be m
   decode at that depth 14.5-15.6 tok/s; the B65's stage 4.3 s a chunk at the start, 4.6 at the end (the indexer's
   quadratic part far below the fit above); a follow-up on the document 4.4 s (the checkpoint, 3.5 GiB, restored).
 
+- Needle (fp16, through the server): found 9 of 9 at 10 / 50 / 90% of 32K, 130K and 249K tokens.
+- NS_KV=q8: 544 bytes a token and layer instead of 1,024; against llama.cpp at 3K the final logits' cosine 0.9952
+  (fp16 0.9964); 128K read at 1,019 tok/s, decode 17.2 tok/s at depth - the same speeds as fp16.
+
 ## Steps
 
 1. **Fit and measure, no new kernels.** Per-slot context (`--ctx 262144,32768`: one long session, one short,

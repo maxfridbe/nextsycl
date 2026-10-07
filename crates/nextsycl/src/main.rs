@@ -45,6 +45,7 @@ the server (over its socket):
   nextsycl ps [-a]              the request running and the last ones
   nextsycl inspect <id>         one request (an ID from ps) as JSON: settings, messages, timings, previews
   nextsycl bench [--sizes 20,2185,8000,40000] [--new 256] [--parallel 1,2,4] [--out DIR]
+  nextsycl bench --needle [--sizes 32768,131072,250000] [--depths 10,50,90] [--out DIR]
                                 benchy v1 against the running server, and several requests at once (matrix.md)
   nextsycl cache [ls | clear]   the prompt cache's checkpoints
   nextsycl chat <text> [--effort E] [--max N] [--temp T]
@@ -78,6 +79,7 @@ settings (environment, or NAME=value lines in nextsycl.conf beside the repositor
                    \"http://studio:8095\" (comma-separated; * = any)
   NS_CTX           tokens of context (default 65536)      NS_NAME   the model id clients see (glm-5.3-flash-uncensored)
   NS_EFFORT        default reasoning effort (low)        NS_NO_MTP=1   decode without the draft block
+  NS_KV            the latent cache's form: f16 (default) or q8 (544 bytes a token and layer instead of 1,024)
   NS_PROMPT_CACHE_MIB   host memory for the prompt cache's checkpoints (default 4096; 0 = off)
   NS_KEEP_REQUESTS ended requests the server keeps for ps and inspect (default 100)
   NS_PARALLEL      requests decoded together, each with a session of its own (default 2; 1 = one at a time)

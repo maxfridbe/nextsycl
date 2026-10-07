@@ -1069,11 +1069,20 @@ int ns_softmax_masked(ns_gpu* g, float* S, int64_t R, int64_t H, int64_t NC, con
 // sub-group reduction, the weighted latents summed per sub-group over every 16th cell, then across the 16 through
 // local memory. The work-group-wide walk over the cells (each step a dependent load of 2 halves a work-item) took
 // 1 ms a layer at 128K. A row's arithmetic does not depend on T: verify rows equal one-token passes.
+// The latent cache in q8 (NS_KV=q8): a row [L / 32 fp16 scales][L int8] - 544 bytes at L = 512, against 1,024 in
+// fp16; value j = scale[j / 32] * q[j]. With L = 512 a lane's 32 values are one block: one scale, two 16-byte loads.
 template <int L>
-static void mla_dec(sycl::queue& q, const float* qa, const sycl::half* c, float* u, int64_t T, int64_t H, int64_t pos0, float scale,
+constexpr int64_t q8_row_bytes() { return L / 32 * 2 + L; }
+
+template <int L, bool Q8 = false>
+static void mla_dec(sycl::queue& q, const float* qa, const void* cv, float* u, int64_t T, int64_t H, int64_t pos0, float scale,
                     const int32_t* sel, const int32_t* sel_cnt, int64_t K) {
     constexpr int SG = 16, NSG = 16, WG = SG * NSG, MAXN = 2560, DL = L / SG, V = DL / 8, U = 4;   // U cells a step
+    static_assert(!Q8 || DL == 32, "q8 rows: a lane's values one block");
     using h8 = sycl::vec<sycl::half, 8>;
+    using i16 = sycl::vec<int8_t, 16>;
+    const sycl::half* c = (const sycl::half*) cv;
+    const uint8_t* c8 = (const uint8_t*) cv;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sc(sycl::range<1>(MAXN), h), part(sycl::range<1>(NSG * L), h), red(sycl::range<1>(2 * NSG), h);
         h.parallel_for(sycl::nd_range<1>(T * H * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
@@ -1090,12 +1099,24 @@ static void mla_dec(sycl::queue& q, const float* qa, const sycl::half* c, float*
                 return tail0 + (i - 4 * (int64_t) ns);
             };
             auto load = [&](int64_t i, float (&x)[DL]) {
-                const h8* cs = reinterpret_cast<const h8*>(c + cell(i) * L + lane * DL);
+                if constexpr (Q8) {
+                    const uint8_t* row = c8 + cell(i) * q8_row_bytes<L>();
+                    const float d = (float) reinterpret_cast<const sycl::half*>(row)[lane];
+                    const i16* qs = reinterpret_cast<const i16*>(row + L / 32 * 2 + lane * 32);
 #pragma unroll
-                for (int v = 0; v < V; ++v) {
-                    const h8 w = cs[v];
+                    for (int v = 0; v < 2; ++v) {
+                        const i16 w = qs[v];
 #pragma unroll
-                    for (int e = 0; e < 8; ++e) x[v * 8 + e] = (float) w[e];
+                        for (int e = 0; e < 16; ++e) x[v * 16 + e] = d * (float) w[e];
+                    }
+                } else {
+                    const h8* cs = reinterpret_cast<const h8*>(c + cell(i) * L + lane * DL);
+#pragma unroll
+                    for (int v = 0; v < V; ++v) {
+                        const h8 w = cs[v];
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) x[v * 8 + e] = (float) w[e];
+                    }
                 }
             };
             const float* qrow = qa + (t * H + hd) * L + lane * DL;
@@ -1237,8 +1258,66 @@ int ns_mla_attend_sel(ns_gpu* g, const float* qa, const uint16_t* c16, float* u,
     static const bool hg4 = getenv("NS_MLA_HG") && getenv("NS_MLA_HG")[0] == '4';
     const sycl::half* c = (const sycl::half*) c16;   // the cache's latents, fp16
     if (hg4 && T > 8 && H % 4 == 0) mla_sel<4>(g->q, qa, c, u, T, H, L, pos0, scale, sel, sel_cnt, K);
-    else if (T <= 8 && L == 512 && !(getenv("NS_MLA_DEC") && getenv("NS_MLA_DEC")[0] == '0')) mla_dec<512>(g->q, qa, c, u, T, H, pos0, scale, sel, sel_cnt, K);
+    else if (T <= 8 && L == 512 && !(getenv("NS_MLA_DEC") && getenv("NS_MLA_DEC")[0] == '0')) mla_dec<512>(g->q, qa, (const void*) c, u, T, H, pos0, scale, sel, sel_cnt, K);
     else mla_sel<1>(g->q, qa, c, u, T, H, L, pos0, scale, sel, sel_cnt, K);
+    return 0;
+    NS_CATCH
+}
+
+// The same over a q8 latent cache (decode widths only: the prompt path gathers its cells to fp16 with ns_gather_q8_h)
+int ns_mla_attend_sel_q8(ns_gpu* g, const float* qa, const void* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
+                         const int32_t* sel, const int32_t* sel_cnt, int64_t K) {
+    NS_TRY
+    if (L != 512 || T > 8) return ns_fail("ns_mla_attend_sel_q8: latent width 512, at most 8 rows");
+    if (pos0 + T > 2560 && !sel_cnt) return ns_fail("ns_mla_attend_sel_q8: a dense row past 2,560 tokens");
+    mla_dec<512, true>(g->q, qa, c, u, T, H, pos0, scale, sel, sel_cnt, K);
+    return 0;
+    NS_CATCH
+}
+
+// rows [n, 512] float32 -> q8 latent rows (one sub-group a row, a lane a block of 32: its scale amax / 127, rounded
+// to fp16 before the values are divided by it)
+int ns_to_q8row(ns_gpu* g, const float* x, void* y, int64_t n, int64_t L) {
+    NS_TRY
+    if (L != 512) return ns_fail("ns_to_q8row: latent width 512");
+    constexpr int SG = 16;
+    uint8_t* yb = (uint8_t*) y;
+    g->q.parallel_for(sycl::nd_range<1>(n * SG, SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const int64_t r = it.get_group(0);
+        const int lane = it.get_local_id(0);
+        const float* xr = x + r * 512 + lane * 32;
+        float amax = 0.f;
+        for (int e = 0; e < 32; ++e) amax = sycl::fmax(amax, sycl::fabs(xr[e]));
+        const sycl::half dh = (sycl::half) (amax / 127.f);
+        const float d = (float) dh, inv = d > 0.f ? 1.f / d : 0.f;
+        uint8_t* row = yb + r * q8_row_bytes<512>();
+        reinterpret_cast<sycl::half*>(row)[lane] = dh;
+        int8_t* qs = reinterpret_cast<int8_t*>(row + 32 + lane * 32);
+        for (int e = 0; e < 32; ++e) qs[e] = (int8_t) sycl::clamp(sycl::round(xr[e] * inv), -127.f, 127.f);
+    });
+    return 0;
+    NS_CATCH
+}
+
+// out [n, 512] fp16 = the q8 latent rows idx[i] of src, dequantized (a work-item 8 values: one 8-byte load, one
+// 16-byte store - the work-item a block of 32 read the prompt at 655 tok/s against fp16's ~850)
+int ns_gather_q8_h(ns_gpu* g, const void* src, const int32_t* idx, uint16_t* out, int64_t n, int64_t L) {
+    NS_TRY
+    if (L != 512) return ns_fail("ns_gather_q8_h: latent width 512");
+    const uint8_t* sb = (const uint8_t*) src;
+    using h8 = sycl::vec<sycl::half, 8>;
+    using i8 = sycl::vec<int8_t, 8>;
+    h8* o = (h8*) out;
+    g->q.parallel_for(sycl::range<2>(n, 64), [=](sycl::id<2> id) {
+        const uint8_t* row = sb + (int64_t) idx[id[0]] * q8_row_bytes<512>();
+        const int64_t v0 = id[1] * 8;
+        const float d = (float) reinterpret_cast<const sycl::half*>(row)[v0 / 32];
+        const i8 q = *reinterpret_cast<const i8*>(row + 32 + v0);
+        h8 r;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) r[e] = (sycl::half) (d * (float) q[e]);
+        o[id[0] * 64 + id[1]] = r;
+    });
     return 0;
     NS_CATCH
 }

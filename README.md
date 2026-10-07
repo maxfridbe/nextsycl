@@ -13,8 +13,11 @@ PCIe. It runs on one card or splits the layers over several.
   VRAM / pinned-RAM store.
 - **MTP speculative decoding:** the model's own draft block. Verify passes are bit-identical to one-token decode,
   so greedy output with MTP equals greedy output without it.
-- **Long context:** the DSA indexer past 2,048 tokens (each row attends to its top 512 pools of 4 tokens and its
-  own unfinished pool), checked against llama.cpp; the latent cache in fp16 (64K of context per session by default).
+- **Long context, to 256K:** the DSA indexer past 2,048 tokens (each row attends to its top 512 pools of 4 tokens and
+  its own unfinished pool), checked against llama.cpp; a context per session (`--ctx 262144,32768` / `NS_CTX`: one
+  long session and a short one; default two of 64K). A 253K-token prompt reads in 271 s (933 tok/s) and decodes at
+  ~15 tok/s at that depth; a follow-up on it restores its checkpoint in seconds. The latent cache in fp16, or q8
+  with `NS_KV=q8` (544 bytes a token and layer instead of 1,024). Plan and measurements: `docs/256k-context.md`.
 - **A prompt path on the XMX units:** prompts are read in chunks of 4,096 tokens, with the experts, the dense
   matrices and MLA's attention in fp16 through oneMKL's half GEMMs, and the experts that live in host memory copied
   on a second queue while the previous ones compute.
@@ -199,11 +202,13 @@ Requests with it decode one token a pass (no draft block), a few small reads a l
   alone - the same greedy tokens, the logits exactly equal - and the speed of both.
 - `nextsycl spec-check <model> --prompt-file F`: verify passes against one-token decode - must stay 0 difference
   (greedy output with MTP equals greedy output without).
+- `nextsycl bench --needle [--sizes 32768,131072,250000] [--depths 10,50,90]`: a passphrase placed at each depth of
+  a long document, asked for at the end - can the running server find it (its context must hold the size).
 - `NS_PROFILE=1 nextsycl generate ...`: seconds per section, the GPU synced at each boundary; `NS_PROFILE=gpu`: device
   timestamps instead (no syncs - the honest view of decode, where sections are tens of microseconds).
 - Switches for A/B measurements: `NS_DENSE_F16=0`, `NS_PROMPT_F16_MIN`, `NS_PREFILL_CHUNK`, `NS_HC_FUSED=0`,
   `NS_DECODE_LANES`, `NS_DECODE_DIRECT=1`, `NS_ARENA_MIB`, `NS_PREFETCH`, `NS_LEND=0`, `NS_SPLIT`, `NS_PIPELINE=0`,
-  `NS_FUSED_MAX`, `NS_FUSED_DOWN_MAX`.
+  `NS_FUSED_MAX`, `NS_FUSED_DOWN_MAX`, `NS_KDA_COLS`, `NS_KV=q8`, `NS_MLA_DEC=0`.
 
 ## Standing on
 

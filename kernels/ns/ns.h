@@ -115,6 +115,11 @@ int ns_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* ds
 int ns_to_f16(ns_gpu* g, const float* x, uint16_t* y, int64_t n);
 int ns_gather_f16(ns_gpu* g, const float* src, const int32_t* idx, uint16_t* out, int64_t n, int64_t C);
 int ns_gather_h(ns_gpu* g, const uint16_t* src, const int32_t* idx, uint16_t* out, int64_t n, int64_t C);
+/* the latent cache in q8 (NS_KV=q8): rows [L/32 fp16 scales][L int8], L = 512 (glm.cpp) */
+int ns_to_q8row(ns_gpu* g, const float* x, void* y, int64_t n, int64_t L);
+int ns_gather_q8_h(ns_gpu* g, const void* src, const int32_t* idx, uint16_t* out, int64_t n, int64_t L);
+int ns_mla_attend_sel_q8(ns_gpu* g, const float* qa, const void* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
+                         const int32_t* sel, const int32_t* sel_cnt, int64_t K);
 int ns_gemm_f16(ns_gpu* g, int64_t T, int64_t N, int64_t K, const uint16_t* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                 int accumulate);
 /* MoE combine per token: y[t] += sum_{j in [t_ptr[t], t_ptr[t+1])} w[j] * rows[ent[j]], rows [entries, C] */

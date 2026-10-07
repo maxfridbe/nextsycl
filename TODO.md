@@ -136,8 +136,16 @@ of IQ2_XXS instead could win twice.
         batch-check, the same text)
   - [ ] Decode at depth, what is left a layer: the indexer's projections (~300 us), attention 444 us (each of the
         64 heads' work-groups reads the same 2 MB of cells)
-- [ ] 2. A needle check at 32K-256K; logits across chunk sizes; an int32 audit of the attention and indexer kernels
-- [ ] 3. Smaller cache entries: NS_KV=f16|q8|q4 (latents q8_0 / 4-bit, pooled keys fp16) - quality against fp16
+- [x] 2. A needle check: `nextsycl bench --needle` - 9 of 9 found at 10 / 50 / 90% of 32K, 130K and 249K
+        (docs/benchy/needle-2026-10-07-f16.md; 249K prompts read in ~267 s). Indices: positions are int32 cells,
+        every size and product in the kernels int64 - no limit below 2^31 tokens
+- [ ] 2b. Logits of one long prompt read in other chunk sizes (a chunking-independence check)
+- [x] 3. NS_KV=q8: the latents as [16 fp16 scales][512 int8] a row (544 bytes vs 1,024), written by ns_to_q8row,
+        read by the decode kernel (a lane's 32 values one block) and gathered to fp16 for the prompt's GEMMs. Exact
+        within itself (spec-check, batch-check). Against llama.cpp at 3K: final logits cosine 0.99521 vs fp16's
+        0.99640, the same top 5. 12K prompt 852 tok/s (= fp16); 128K: 1,019 tok/s, decode 17.2 at depth (fp16
+        17.1), the attention reserve 0.95 GiB vs 1.63. The needle on q8: below
+- [ ] 3b. The indexer's pooled keys in fp16 (128 -> 64 bytes a token and layer); a 4-bit latent form
 - [ ] 4. The indexer fused (XMX scores, the heads' sum and the top-k in one kernel; no T x H x pools scores)
 - [ ] 5. Long prompts' checkpoints on the NVMe (~3.5 GiB at 256K)
 - [ ] 6. Serve it: NS_CTX per slot, the HTTP limit, the tokenizer on ~1 MB, the client's context setting
