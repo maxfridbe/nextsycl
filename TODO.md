@@ -111,7 +111,9 @@ already wrote comes out near-certain because the model copies it, not because it
       kernel already takes a pointer per expert - pass the host slot's address), a share of the misses (pcie_frac
       ~0.55) and LRU admission for the rest. Pinned memory belongs to the context that allocated it: each part reads
       only its own mirror (Strata #1054 hung two B70s on a cross-context fill)
-- [ ] Deeper drafts (chain the MTP block; MAX_VERIFY > 2)
+- [x] Deeper drafts: NS_DRAFTS=2 chains the draft block on its own output, a 3-row verify - exact (the same greedy
+      output), 2.36 tokens a pass vs 1.83 (the 2nd draft accepted 71%), but a 3-row pass costs 33% more (3 tokens'
+      experts, the block run twice): 18.4 vs 19.1 tok/s. One draft stays the default
 - [ ] Launch overhead: SYCL graph replay for the decode step
 - [ ] Prefill speed
 

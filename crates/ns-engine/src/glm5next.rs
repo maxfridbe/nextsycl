@@ -70,6 +70,12 @@ fn lend_arena() -> bool {
     *V.get_or_init(|| std::env::var("NS_LEND").map_or(true, |v| v != "0"))
 }
 
+/// Drafts a verify pass checks (NS_DRAFTS: 1, or 2 - the draft block chained on its own output)
+fn drafts() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 2))
+}
+
 /// Whether the dense matrices take the fp16 path too (NS_DENSE_F16=0: only the experts)
 fn dense_f16() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -102,7 +108,7 @@ pub fn arena_bytes() -> usize {
     })
 }
 /// rows of a verify pass (the token and its draft); the KDA states keep a snapshot after each row but the last
-pub const MAX_VERIFY: usize = 2;
+pub const MAX_VERIFY: usize = 3;
 /// the indexer's pool scores per GEMM (floats): pools are scored in chunks that fit (64 MiB)
 const IDX_S_FLOATS: usize = 16 << 20;
 
@@ -281,6 +287,10 @@ struct MtpState {
     rows: usize,
     slot0: usize,
     next: Vec<u32>,
+    /// the block's output for its last row (a second draft runs the block again on it: `mtp_chain`), and that
+    /// draft's position
+    chain: DevBuf,
+    chain_pos: Option<usize>,
 }
 
 /// One GPU's share of the model (`Glm::gpu_info`).
@@ -311,6 +321,8 @@ pub struct Decoder {
     logits: Vec<f32>,
     next: Option<u32>,
     draft: Option<u32>,
+    /// a second draft, the draft block chained on its own output (NS_DRAFTS=2)
+    draft2: Option<u32>,
     mtp: bool,
     /// drafts verified, and accepted
     pub drafted: u64,
@@ -321,6 +333,7 @@ impl Decoder {
     /// The committed token not fed yet (the last step's), handed over - e.g. to a batch step - and the draft dropped
     pub fn pending(&mut self) -> Option<u32> {
         self.draft = None;
+        self.draft2 = None;
         self.next.take()
     }
 }
@@ -1079,7 +1092,7 @@ impl<'g> Glm<'g> {
                     Ok(b)
                 };
                 let snap = if spec {
-                    let r = MAX_VERIFY - 1;
+                    let r = drafts(); // a snapshot after each verified row but the last (NS_DRAFTS rows)
                     Some(Box::new((DevBuf::f32(gpu, r * sz)?, [DevBuf::f32(gpu, r * cw)?, DevBuf::f32(gpu, r * cw)?, DevBuf::f32(gpu, r * cw)?])))
                 } else {
                     None
@@ -1091,7 +1104,7 @@ impl<'g> Glm<'g> {
             Some(_) => {
                 let gpu = &self.parts.last().unwrap().ops.gpu;
                 Some(MtpState { cache: DevBuf::new(gpu, max_ctx * g.kv_lora as usize * 2)?, idx: Idx::new(gpu, max_ctx, g.idx_dim as usize)?, hid: DevBuf::f32(gpu, prefill_chunk() * g.n_embd as usize)?, rows: 0,
-                                slot0: 0, next: Vec::new() })
+                                slot0: 0, next: Vec::new(), chain: DevBuf::f32(gpu, g.n_embd as usize)?, chain_pos: None })
             }
             None => None,
         };
@@ -1460,7 +1473,8 @@ impl<'g> Glm<'g> {
         let (d, eps) = (g.n_embd as usize, g.rms_eps as f32);
         let kw = (g.kda_heads * g.kda_dim) as usize;
         let (kh, kd) = (g.kda_heads as usize, g.kda_dim as usize);
-        let snapping = (2..=MAX_VERIFY).contains(&t) && self.mtp.is_some();
+        // verify passes keep snapshots (as many rows as the sessions have room for: NS_DRAFTS + 1)
+        let snapping = (2..=drafts() + 1).contains(&t) && self.mtp.is_some();
 
         // the embedding rows, on the first part's GPU
         let p0 = &self.parts[0];
@@ -1966,6 +1980,8 @@ impl<'g> Glm<'g> {
                 return Ok(None);
             }
             let last = y.view((n - 1) * d * 4, d * 4)?;
+            ms.chain.copy_within(0, &last, 0, d * 4)?;
+            ms.chain_pos = Some(slot0 + rows);
             let hn2 = p.arena.f32(d)?;
             o.rms_norm(&last, Some(p.vec(ml, Role::MtpHeadNorm)?), &hn2, 1, d, eps)?;
             Ok(Some(p.mm(0, Role::Output, &hn2, 1)?.to_f32()?))
@@ -1975,49 +1991,110 @@ impl<'g> Glm<'g> {
 
     /// Generation from a prompt `feed` returned `logits` for; `mtp`: draft with the MTP block (when loaded).
     pub fn decoder(&self, logits: Vec<f32>, mtp: bool) -> Decoder {
-        Decoder { logits, next: None, draft: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
+        Decoder { logits, next: None, draft: None, draft2: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
     }
 
     /// A decoder whose last committed token `next` is not fed yet (one handed over by `Decoder::pending`, or a batch
     /// step's): its first step feeds it
     pub fn decoder_after(&self, next: u32, mtp: bool) -> Decoder {
-        Decoder { logits: Vec::new(), next: Some(next), draft: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
+        Decoder { logits: Vec::new(), next: Some(next), draft: None, draft2: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
     }
 
     /// The next committed token(s): one, or two when a draft is accepted. `sample` draws a token from logits. With
     /// MTP a draft is accepted exactly when the token drawn for its position is the draft itself, so what is
     /// committed is distributed as plain sampling would be.
     pub fn step(&self, sess: &mut Session, dec: &mut Decoder, sample: &mut dyn FnMut(&[f32]) -> u32, tap: Tap) -> Result<Vec<u32>> {
-        let fits = sess.pos + MAX_VERIFY <= sess.max_ctx;
-        match (dec.next, dec.draft) {
-            (Some(x), Some(d)) if dec.mtp && fits => {
+        let fits = |k: usize| sess.pos + k <= sess.max_ctx;
+        let (out, tail) = match (dec.next, dec.draft, dec.draft2) {
+            (Some(x), Some(d), Some(d2)) if dec.mtp && fits(3) => {
+                // two drafts: [token, draft, draft2] verified in one pass, each accepted exactly
+                let rows = self.forward_rows(sess, &[x, d, d2], 3, &mut *tap)?;
+                let y0 = sample(&rows[0]);
+                dec.drafted += 1;
+                if y0 != d {
+                    self.rollback(sess, 1)?;
+                    (vec![y0], y0)
+                } else {
+                    dec.accepted += 1;
+                    let y1 = sample(&rows[1]);
+                    dec.drafted += 1;
+                    if y1 != d2 {
+                        self.rollback(sess, 2)?;
+                        (vec![d, y1], y1)
+                    } else {
+                        dec.accepted += 1;
+                        let y2 = sample(&rows[2]);
+                        (vec![d, d2, y2], y2)
+                    }
+                }
+            }
+            (Some(x), Some(d), _) if dec.mtp && fits(2) => {
                 let rows = self.forward_rows(sess, &[x, d], 2, &mut *tap)?;
                 let y0 = sample(&rows[0]);
                 dec.drafted += 1;
-                let (out, tail) = if y0 == d {
+                if y0 == d {
                     dec.accepted += 1;
                     let y1 = sample(&rows[1]);
                     (vec![d, y1], y1)
                 } else {
                     self.rollback(sess, 1)?;
                     (vec![y0], y0)
-                };
-                dec.draft = self.mtp_run(sess, tail, true, &mut *tap)?.map(|l| argmax(&l));
-                dec.next = Some(tail);
-                Ok(out)
+                }
             }
             _ => {
                 if let Some(x) = dec.next.take() {
                     dec.logits = self.forward(sess, &[x], &mut *tap)?;
                 }
                 let y = sample(&dec.logits);
-                dec.draft = if dec.mtp { self.mtp_run(sess, y, true, &mut *tap)?.map(|l| argmax(&l)) } else { None };
-                dec.next = Some(y);
-                Ok(vec![y])
+                (vec![y], y)
             }
-        }
+        };
+        dec.draft = if dec.mtp { self.mtp_run(sess, tail, true, &mut *tap)?.map(|l| argmax(&l)) } else { None };
+        dec.draft2 = match dec.draft {
+            Some(d) if dec.mtp && drafts() >= 2 => self.mtp_chain(sess, d, &mut *tap)?.map(|l| argmax(&l)),
+            _ => None,
+        };
+        dec.next = Some(tail);
+        Ok(out)
     }
 
+    /// The draft block once more, on its own last output and the draft it made (one position further): the logits
+    /// of a second draft
+    fn mtp_chain(&self, sess: &mut Session, draft: u32, tap: Tap) -> Result<Option<Vec<f32>>> {
+        let (Some(ml), Some(ms)) = (self.mtp, sess.mtp.as_mut()) else { return Ok(None) };
+        let Some(pos) = ms.chain_pos.take() else { return Ok(None) };
+        if pos + 1 > sess.max_ctx {
+            return Ok(None);
+        }
+        let g = &self.m.g;
+        let (d, eps) = (g.n_embd as usize, g.rms_eps as f32);
+        let p = self.parts.last().unwrap();
+        let o = &p.ops;
+        self.timed(p, "MTP draft 2", || -> Result<Option<Vec<f32>>> {
+            p.arena.reset();
+            let emb = self.embed(p, &[draft])?;
+            let en = p.arena.f32(d)?;
+            o.rms_norm(&emb, Some(p.vec(ml, Role::MtpENorm)?), &en, 1, d, eps)?;
+            let hn = p.arena.f32(d)?;
+            o.rms_norm(&ms.chain, Some(p.vec(ml, Role::MtpHNorm)?), &hn, 1, d, eps)?;
+            let [we, wh] = p.eh.as_ref().ok_or("the MTP block's eh_proj is not loaded")?;
+            let cur = p.arena.f32(d)?;
+            p.matmul(we, 1, (&en, 0, d), (&cur, 0, d), false)?;
+            p.matmul(wh, 1, (&hn, 0, d), (&cur, 0, d), true)?;
+            let an = p.arena.f32(d)?;
+            o.rms_norm(&cur, Some(p.vec(ml, Role::AttnNorm)?), &an, 1, d, eps)?;
+            // its cache and indexer at `pos`: the verified row there overwrites both later
+            let att = self.mla(p, ml, &an, &ms.cache, &ms.idx, pos, 1, &mut *tap)?;
+            o.add(&cur, &att, d)?;
+            let fnm = p.arena.f32(d)?;
+            o.rms_norm(&cur, Some(p.vec(ml, Role::FfnNorm)?), &fnm, 1, d, eps)?;
+            let y = self.moe(p, ml, 1, &fnm, &mut *tap)?;
+            o.add(&y, &cur, d)?;
+            let hn2 = p.arena.f32(d)?;
+            o.rms_norm(&y, Some(p.vec(ml, Role::MtpHeadNorm)?), &hn2, 1, d, eps)?;
+            Ok(Some(p.mm(0, Role::Output, &hn2, 1)?.to_f32()?))
+        })
+    }
     /// The MoE half of layer `l` on x [t, d]: the router (on the host), the shared expert, the routed experts
     /// grouped by expert (made resident together first).
     fn moe(&self, p: &Part, l: u64, t: usize, x: &DevBuf, tap: Tap) -> Result<DevBuf> {
