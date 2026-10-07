@@ -111,12 +111,13 @@ Every API answer carries the same energy as `usage.energy_wh` (here 0.448 Wh).
 
 ## Speed
 
-GLM-5.3-Flash IQ2 (the ds4 file, 80 GB of experts) on an Arc Pro B70 and an Arc Pro B65, 6 October 2026:
+GLM-5.3-Flash IQ2 (the ds4 file, 80 GB of experts) on an Arc Pro B70 and an Arc Pro B65, 7 October 2026:
 
 | | |
 |---|---|
 | prompt, 3K tokens | ~400 tokens/s |
-| prompt, 12K tokens | ~475 tokens/s |
+| prompt, 12K tokens | ~720-790 tokens/s |
+| prompt, 36-40K tokens | ~720-745 tokens/s |
 | decode, short context, MTP on | ~18.5-20 tokens/s (80-90% of drafts accepted) |
 | power while decoding | ~175-185 W for both cards (~1.6-1.9 kJ for a 170-200-token answer) |
 | idle | ~9 W for both cards |
@@ -126,19 +127,21 @@ About 60% of the experts fit in VRAM (plus ~380 slots a GPU lent by the prompt a
 in pinned host memory. At decode a missed expert is swapped in over PCIe (both directions at once, on two copy
 queues, while the resident experts compute; the next layer's likely experts prefetched) - on these cards' x8 links
 those swaps are still the largest share of decode time (`TODO.md`). `--gpu all` puts the GPU that computes most last
-(it takes the head and the draft block); `NS_SPLIT` sets the layers per GPU.
+(it takes the head and the draft block); `NS_SPLIT` sets the layers per GPU. A prompt longer than a chunk (4,096
+tokens) runs the two GPUs as a pipeline: the first reads chunk n+1 while the second finishes chunk n.
 
 ## Benchy
 
 `nextsycl bench` runs Strata's benchy v1 (its prompts as text in `bench/v1`) against the running server, and sends
-several requests at once. The latest run, `docs/benchy/v1-2026-10-06-prefetch.md` (B65 + B70, the B70 last):
+several requests at once. The latest run, `docs/benchy/v1-2026-10-07-pipeline.md` (B65 + B70, the B70 last; the
+GPUs in a pipeline for prompts over a chunk - the 40K prompt read at 720 tokens/s against 416 the day before):
 
 | Input tokens | PP (tok/s) | TTFT (s) | TG (tok/s) | Drafts accepted | Energy (J) | Avg power (W) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 31 | - | 1.3 | 18.0 | 91% | 1,431 | 166 |
-| 2,216 | 332 | 7.1 | 15.9 | 78% | 3,946 | 173 |
-| 7,975 | 314 | 26.0 | 16.1 | 77% | 6,837 | 166 |
-| 39,758 | 416 | 96.1 | 16.1 | 75% | 21,412 | 192 |
+| 31 | - | 1.4 | 17.7 | 91% | 1,442 | 163 |
+| 2,216 | 345 | 6.9 | 16.5 | 83% | 3,803 | 173 |
+| 7,975 | 408 | 20.0 | 16.3 | 81% | 6,678 | 190 |
+| 39,758 | 720 | 55.6 | 15.7 | 72% | 19,698 | 275 |
 
 Several at once, before and after batched decode (`docs/benchy/v1-2026-10-06-parallel.md`; the short prompt, 256
 tokens each):
