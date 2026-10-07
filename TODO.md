@@ -63,6 +63,23 @@ by default (`--no-mtp` turns it off).
       on the host - another wait), or the copies of a wrong guess cancelled
 - [ ] Two requests at once would use both cards at the same time (each is ~55% busy at decode today)
 
+## Prompt: experts without the fp16 copy (started 2026-10-07)
+
+The prompt path expands each expert to fp16 (13.8 s of a 36K prompt) and oneMKL multiplies it (17 s). At 128 tokens
+oneMKL is bound by reading the 33.5 MB fp16 expert (92 us at 128 tokens, 94 at 256), so a kernel that reads the 2 MB
+of IQ2_XXS instead could win twice.
+
+- [x] joint_matrix (XMX) GEMMs on Xe2 measured (scratchpad, kept in kernels/ns/fused.cpp's notes): A and a col-major B
+      straight from global memory reach oneMKL (63-82 TFLOPS); staging B through local memory (any layout) or a
+      global scratch is 2-3x slower; a B fragment filled in registers works - lane n holds column n's 16 k in order
+      (probed by loading a known matrix; the coordinate form of joint_matrix_apply faulted the GPU)
+- [x] fused.cpp: each lane decodes its 16 IQ2_XXS weights into B (two 8-value groups), 32 tokens a sub-group -
+      exact against expand + oneMKL; alone on the B70 2x faster at 64 tokens, even at 128-256; in a real 12K
+      prompt 223 us a call vs 215 for expand + GEMM (larger experts): no gain yet, NS_FUSED_MAX=64 turns it on
+- [ ] Make the decode cheaper: decode 32 k a lane per step (two B tiles a decode), the grid table in local memory,
+      more token rows per decode (large-register mode removed the spill at 128 rows but was not faster), 2D block
+      loads for A; then the down projection (Q2_K) the same way
+
 ## Decode, what is left (2026-10-07: 18-19 tok/s, MTP on)
 
 Per token: routed experts 27.7 ms (the kernel ~0.3 ms a layer-pass of the ~1.2: the rest waits on PCIe copies of the

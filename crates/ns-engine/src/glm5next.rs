@@ -46,6 +46,13 @@ fn prefetch_limit() -> usize {
     *V.get_or_init(|| std::env::var("NS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(8))
 }
 
+/// The prompt path's experts with at most this many tokens take the fused gate | up kernel (NS_FUSED_MAX; default 0 =
+/// never: in a 12K prompt it took 223 us a call against expand + GEMM's 215 for larger experts - not yet a win)
+fn fused_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_FUSED_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
 /// Whether an arriving expert's gate | up runs before its down is in (NS_SPLIT_COPY=0: no)
 fn split_copy() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2250,7 +2257,8 @@ impl<'g> Glm<'g> {
                 tb.write_async(0, &gtok.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 let wtb = p.arena.f32(total)?;
                 wtb.write_async(0, &gw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-                let nmax = by.values().map(|l| l.len()).max().unwrap_or(1);
+                // rows for the fused kernel's padding to 32 (the rows past an expert's tokens are read, never used)
+                let nmax = by.values().map(|l| l.len()).max().unwrap_or(1).next_multiple_of(32);
                 let xh = p.arena.bytes(nmax * d * 2)?;
                 let w16 = p.arena.bytes(2 * f * d * 2)?; // gate | up of one expert; down reuses the first half
                 let wu = w16.view(f * d * 2, f * d * 2)?;
@@ -2295,12 +2303,18 @@ impl<'g> Glm<'g> {
                     let m0 = if *host { self.lap(p, "MoE f16: host copy (wait)", h0) } else { h0 };
                     o.gather_f16(x, &toks, &xh, n, d)?;
                     let m1 = self.lap(p, "MoE f16: gather", m0);
-                    o.dequant_f16(parts.gate.2.code(), buf, parts.gate.0, parts.gate.1, f * d, &w16)?;
-                    o.dequant_f16(parts.up.2.code(), buf, parts.up.0, parts.up.1, f * d, &wu)?;
-                    let m2 = self.lap(p, "MoE f16: expand gate/up", m1);
-                    // gate and up expanded side by side: one GEMM of 2f outputs
-                    o.gemm_f16(n, 2 * f, d, (&xh, 0, d), (&w16, 0), (&gu, 0, 2 * f), false)?;
-                    let m3 = self.lap(p, "MoE f16: gemm gate/up", m2);
+                    let m3 = if n <= fused_max() && parts.gate.2.code() == 16 && parts.up.2.code() == 16 && parts.up.0 == parts.gate.0 + parts.gate.1 {
+                        // few tokens: gate | up decoded inside the matrix-engine GEMM, no fp16 copy (fused.cpp)
+                        o.moe_fused_gu(&xh, buf, parts.gate.0, &gu, n.next_multiple_of(32), 2 * f, d)?;
+                        self.lap(p, "MoE f16: fused gate/up", m1)
+                    } else {
+                        o.dequant_f16(parts.gate.2.code(), buf, parts.gate.0, parts.gate.1, f * d, &w16)?;
+                        o.dequant_f16(parts.up.2.code(), buf, parts.up.0, parts.up.1, f * d, &wu)?;
+                        let m2 = self.lap(p, "MoE f16: expand gate/up", m1);
+                        // gate and up expanded side by side: one GEMM of 2f outputs
+                        o.gemm_f16(n, 2 * f, d, (&xh, 0, d), (&w16, 0), (&gu, 0, 2 * f), false)?;
+                        self.lap(p, "MoE f16: gemm gate/up", m2)
+                    };
                     o.swiglu_gu_f16(&gu, &hh, n, f, lim)?;
                     let m4 = self.lap(p, "MoE f16: swiglu", m3);
                     o.dequant_f16(parts.down.2.code(), buf, parts.down.0, parts.down.1, d * f, &w16)?;

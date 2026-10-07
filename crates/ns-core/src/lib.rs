@@ -755,6 +755,16 @@ impl Ops {
         };
         self.ok(rc, "gemm_batch_h")
     }
+    /// An expert's gate | up for m tokens (x [m, k] fp16, m a multiple of 32): out [m, n] = x . w^T with w IQ2_XXS
+    /// (n rows of k), decoded inside the matrix-engine GEMM
+    pub fn moe_fused_gu(&self, x: &DevBuf, w: &DevBuf, w_at: usize, out: &DevBuf, m: usize, n: usize, k: usize) -> Result<()> {
+        x.bounds(0, m * k * 2)?;
+        w.bounds(w_at, n * k / 256 * 66)?;
+        need!(out, m * n, "moe_fused_gu out");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().moe_fused_gu)(self.raw(), x.ptr.cast(), w.ptr.cast::<u8>().add(w_at).cast(), out.fp(), m as i64, n as i64, k as i64) };
+        self.ok(rc, "moe_fused_gu")
+    }
     /// sel [t, k] (int32): the k highest of each score row [0, n), rows ld apart
     pub fn topk(&self, score: &DevBuf, sel: &DevBuf, t: usize, n: usize, ld: usize, k: usize) -> Result<()> {
         need!(score, (t - 1) * ld + n, "topk score");
