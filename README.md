@@ -22,7 +22,9 @@ PCIe. It runs on one card or splits the layers over several.
   matrices and MLA's attention in fp16 through oneMKL's half GEMMs, and the experts that live in host memory copied
   on a second queue while the previous ones compute.
 - **A prompt cache:** checkpoints of the whole conversation state in host memory, at the end of a prompt's first
-  turn, at the start of its last user turn, and at its end.
+  turn, at the start of its last user turn, and at its end; those pushed out of memory go to disk
+  (`NS_CACHE_DIR`, default `~/.cache/nextsycl/prompts`, `NS_CACHE_DISK_GIB` 32) - a 256K prompt's checkpoint is
+  ~3.5 GiB, mounted again in seconds instead of re-reading the prompt for minutes.
 - **An OpenAI-compatible server** with streaming and the thinking split out, run as a service: `nextsycl start`,
   `stop`, `status`, `ps`, `cache`, `chat`, `logs`, over a control socket.
 - **Energy and logprobs in every answer:** `usage.energy_wh` (and `energy_wh` on `/api/chat`'s last line) - the watt-hours
@@ -31,6 +33,8 @@ PCIe. It runs on one card or splits the layers over several.
 - **Several requests at once:** up to `NS_PARALLEL` (2) conversations decode together - one pass carries a token of
   each, the weights read once for all of them, each row exactly as its own pass would be (`nextsycl batch-check`);
   a single request decodes alone, with the draft block. More wait in order.
+  A long prompt is read in groups of chunks with the others' decode steps between them (a chat beside a 253K
+  prompt's read decodes at ~18 tok/s).
 - **LogProbChain** (`logprob_chain: true`, experimental): each answer token's logprob also chained through the attention
   to the turn's own earlier tokens - an answer that only repeats its thinking counts only as sure as the thinking was
   (below).

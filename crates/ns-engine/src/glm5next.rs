@@ -389,6 +389,73 @@ pub struct Checkpoint {
     pub bytes: usize,
 }
 
+impl Checkpoint {
+    /// The checkpoint as a file (the prompt cache's disk tier): "NSCK1", the position, the buffers, the draft
+    /// block's rows
+    pub fn write_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        let u = |w: &mut dyn std::io::Write, x: usize| w.write_all(&(x as u64).to_le_bytes());
+        w.write_all(b"NSCK1")?;
+        u(w, self.pos)?;
+        u(w, self.bufs.len())?;
+        for b in &self.bufs {
+            u(w, b.len())?;
+            w.write_all(b)?;
+        }
+        match &self.mtp {
+            Some((a, b, next)) => {
+                u(w, 1)?;
+                u(w, *a)?;
+                u(w, *b)?;
+                u(w, next.len())?;
+                for t in next {
+                    w.write_all(&t.to_le_bytes())?;
+                }
+            }
+            None => u(w, 0)?,
+        }
+        Ok(())
+    }
+
+    /// `write_to`'s file back
+    pub fn read_from(r: &mut impl std::io::Read) -> std::io::Result<Checkpoint> {
+        let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "not a checkpoint file");
+        let u = |r: &mut dyn std::io::Read| -> std::io::Result<usize> {
+            let mut b = [0u8; 8];
+            r.read_exact(&mut b)?;
+            Ok(u64::from_le_bytes(b) as usize)
+        };
+        let mut magic = [0u8; 5];
+        r.read_exact(&mut magic)?;
+        if &magic != b"NSCK1" {
+            return Err(bad());
+        }
+        let pos = u(r)?;
+        let n = u(r)?;
+        let mut bufs = Vec::with_capacity(n);
+        let mut bytes = 0;
+        for _ in 0..n {
+            let len = u(r)?;
+            let mut v = vec![0u8; len];
+            r.read_exact(&mut v)?;
+            bytes += len;
+            bufs.push(v);
+        }
+        let mtp = if u(r)? == 1 {
+            let (a, b, k) = (u(r)?, u(r)?, u(r)?);
+            let mut next = Vec::with_capacity(k);
+            for _ in 0..k {
+                let mut t = [0u8; 4];
+                r.read_exact(&mut t)?;
+                next.push(u32::from_le_bytes(t));
+            }
+            Some((a, b, next))
+        } else {
+            None
+        };
+        Ok(Checkpoint { pos, bufs, mtp, bytes })
+    }
+}
+
 /// Generation from a fed prompt: `Glm::step` commits the next token(s) each call. The last committed token is fed
 /// at the start of the following call (a stop token is never fed).
 pub struct Decoder {
@@ -1206,23 +1273,34 @@ impl<'g> Glm<'g> {
     /// The next `tokens` of a conversation in chunks of at most `prefill_chunk()` (the arenas bound a chunk): the
     /// logits of the last token.
     pub fn feed(&self, sess: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
+        Ok(self.feed_until(sess, tokens, &|| false, tap)?.1)
+    }
+
+    /// As `feed`, but `stop()` - asked before each chunk past the first - ends it early at a chunk's end: (the tokens
+    /// read, the last one's logits). The server stops a long prompt this way when another request arrives.
+    pub fn feed_until(&self, sess: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
         let chunks: Vec<&[u32]> = tokens.chunks(prefill_chunk()).collect();
         let runs = self.runs();
         if chunks.len() >= 2 && runs.len() == 2 && pipeline() {
-            return self.feed_pipelined(sess, &chunks, (runs[0], runs[1]), tap);
+            return self.feed_pipelined(sess, &chunks, (runs[0], runs[1]), stop, tap);
         }
-        let mut logits = Vec::new();
-        for c in chunks {
+        let (mut fed, mut logits) = (0, Vec::new());
+        for (i, c) in chunks.iter().enumerate() {
+            if i > 0 && stop() {
+                break;
+            }
             logits = self.forward(sess, c, &mut *tap)?;
+            fed += c.len();
         }
-        Ok(logits)
+        Ok((fed, logits))
     }
 
     /// `feed` on two GPUs with the chunks in a pipeline: a thread runs the first GPU's layers a chunk ahead while this
     /// one runs the second's, the draft block and the head - each GPU busy while the other works on its chunk (in
     /// turn, each idled through the other's half). The chunks' order on each GPU is kept: the same result. The taps
     /// see the second GPU's layers only.
-    fn feed_pipelined(&self, sess: &mut Session, chunks: &[&[u32]], runs: ((usize, u64, u64), (usize, u64, u64)), tap: Tap) -> Result<Vec<f32>> {
+    fn feed_pipelined(&self, sess: &mut Session, chunks: &[&[u32]], runs: ((usize, u64, u64), (usize, u64, u64)), stop: &(dyn Fn() -> bool + Sync),
+                      tap: Tap) -> Result<(usize, Vec<f32>)> {
         let total: usize = chunks.iter().map(|c| c.len()).sum();
         if sess.pos + total > sess.max_ctx {
             return Err(Error(format!("the context is {} tokens; {} more do not fit", sess.max_ctx, total)));
@@ -1237,11 +1315,15 @@ impl<'g> Glm<'g> {
         // the first GPU's streams, a chunk at a time (in host memory: the copy between the GPUs goes through it)
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(1);
         let trace = std::env::var("NS_PIPE_TRACE").is_ok_and(|v| v != "0");
-        let logits = std::thread::scope(|sc| -> Result<Vec<f32>> {
+        let logits = std::thread::scope(|sc| -> Result<(usize, Vec<f32>)> {
             let ahead = sc.spawn(move || {
                 let mut none = |_: &str, _: &DevBuf| Ok(());
                 let mut at = start;
                 for (i, c) in chunks.iter().enumerate() {
+                    // a stop ends the read at a chunk's end: the second stage reads what this one handed on
+                    if i > 0 && stop() {
+                        return;
+                    }
                     let t0 = std::time::Instant::now();
                     let r = self.streams(c, &mut none).and_then(|x| self.run_layers(layers, runs.0, x, at, c.len(), false, &mut none)).and_then(|x| {
                         let mut v = vec![0u8; x.len];
@@ -1263,13 +1345,15 @@ impl<'g> Glm<'g> {
             let mut at = start;
             let p1 = &self.parts[runs.1.0];
             for (i, c) in chunks.iter().enumerate() {
+                // the first stage's next chunk, or its end (a stop): the draft block's rows only for a chunk that comes
+                let t0 = std::time::Instant::now();
+                let Ok(v) = rx.recv() else { break };
                 let step = (|| -> Result<Vec<f32>> {
-                    let t0 = std::time::Instant::now();
+                    let v = v?;
+                    let t1 = std::time::Instant::now();
                     if mtp.as_ref().is_some_and(|m| m.rows > 0) {
                         self.mtp_run(mtp, c[0], false, &mut *tap)?;
                     }
-                    let t1 = std::time::Instant::now();
-                    let v = rx.recv().map_err(|_| Error("the pipeline's first stage ended".into()))??;
                     let t2 = std::time::Instant::now();
                     let x = self.timed(p1, "GPU to GPU", || {
                         let x = DevBuf::new(&p1.ops.gpu, v.len())?;
@@ -1279,7 +1363,7 @@ impl<'g> Glm<'g> {
                     let x = self.run_layers(layers, runs.1, x, at, c.len(), false, &mut *tap)?;
                     let l = self.head(mtp, &x, at, c, 1, &mut *tap)?.pop().unwrap_or_default();
                     if trace {
-                        eprintln!("[pipeline: chunk {i} second stage: draft block {:.2} s, waited {:.2} s, layers + head {:.2} s]", (t1 - t0).as_secs_f64(),
+                        eprintln!("[pipeline: chunk {i} second stage: waited {:.2} s, draft block {:.2} s, layers + head {:.2} s]", (t1 - t0).as_secs_f64(),
                                   (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64());
                     }
                     Ok(l)
@@ -1295,9 +1379,9 @@ impl<'g> Glm<'g> {
             }
             drop(rx);
             ahead.join().map_err(|_| Error("the pipeline's first stage panicked".into()))?;
-            out
+            out.map(|l| (at - start, l))
         })?;
-        *pos += total;
+        *pos += logits.0;
         *snapped = None;
         Ok(logits)
     }

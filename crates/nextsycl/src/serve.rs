@@ -258,10 +258,10 @@ struct Reading {
 }
 
 /// Prompt tokens read a round while other requests decode: four chunks (the GPUs' pipeline keeps ~80% of its
-/// speed over four; a 256K prompt read at once held every other request for 4.5 minutes)
+/// speed over four; a 256K prompt read at once held every other request for 4.5 minutes). Read alone, a prompt goes
+/// to its end in one pipelined read, stopped at a chunk's end when a request arrives (groups of 8 alone had cost
+/// 8%: the pipeline drained at each)
 const READ_GROUP: usize = 4 * 4096;
-/// ... and alone: eight (~89%; a request arriving meanwhile waits at most one group, ~35 s)
-const READ_GROUP_ALONE: usize = 8 * 4096;
 
 /// Prefixes shorter than this are read again rather than cached
 const MIN_CHECKPOINT: usize = 64;
@@ -299,13 +299,13 @@ fn text_of(v: &Value) -> String {
 
 impl Server {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, slot_ctx: Vec<usize>, default_effort: Effort, cache_bytes: usize,
+    pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, slot_ctx: Vec<usize>, default_effort: Effort, cache: PromptCache,
                cors: Vec<String>, keep: usize, default_max: Option<usize>) -> Result<Server, String> {
         let tele = Telemetry::start(&glm.gpu_info().iter().map(|g| g.pci.clone()).collect::<Vec<_>>());
         let parallel = slot_ctx.len().max(1);
         let max_ctx = slot_ctx.iter().copied().max().unwrap_or(8192);
         Ok(Server { glm, tok, name, max_ctx, slot_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
-                    inflight: AtomicU64::new(0), parallel, default_max, cache: Mutex::new(PromptCache::new(cache_bytes)),
+                    inflight: AtomicU64::new(0), parallel, default_max, cache: Mutex::new(cache),
                     live_lens: Mutex::new(vec![0; parallel]), started: Instant::now(), running: Mutex::new(Default::default()),
                     done: Mutex::new(VecDeque::new()), next_id: AtomicU64::new(1), keep, tele, cors })
     }
@@ -399,7 +399,8 @@ impl Server {
         }).collect();
         let lives = self.live_lens.lock().unwrap().clone();
         let cache = self.cache.try_lock().ok().map(|c| json!({"entries": c.len(), "bytes": c.bytes(), "budget": c.budget(),
-                                                             "evictions": c.evictions, "live_tokens": lives.iter().sum::<usize>(), "sessions": lives}));
+                                                             "evictions": c.evictions, "live_tokens": lives.iter().sum::<usize>(), "sessions": lives,
+                                                             "disk": c.disk().map(|(n, b, g)| json!({"entries": n, "bytes": b, "budget": g}))}));
         let running: Vec<Value> = self.running.lock().unwrap().values().cloned().collect();
         json!({"model": self.name, "version": crate::VERSION, "uptime_seconds": self.started.elapsed().as_secs_f64(),
                "context": self.max_ctx, "contexts": self.slot_ctx, "mtp": self.glm.mtp.is_some(), "parallel": self.parallel, "gpus": gpus,
@@ -448,8 +449,9 @@ impl Server {
             }
             ("GET", "/server/cache") => match self.cache.try_lock() {
                 Ok(c) => {
-                    let list: Vec<Value> = c.list().iter().map(|(t, b, _)| json!({"tokens": t, "bytes": b})).collect();
-                    respond(&mut s, 200, &json!({"entries": list, "bytes": c.bytes(), "budget": c.budget(), "evictions": c.evictions}))
+                    let list: Vec<Value> = c.list().iter().map(|(t, b, _, disk)| json!({"tokens": t, "bytes": b, "disk": disk})).collect();
+                    respond(&mut s, 200, &json!({"entries": list, "bytes": c.bytes(), "budget": c.budget(), "evictions": c.evictions,
+                                                 "disk": c.disk().map(|(n, b, g)| json!({"entries": n, "bytes": b, "budget": g}))}))
                 }
                 Err(_) => respond(&mut s, 409, &json!({"error": {"message": "a prompt is being read; ask again when it is done"}})),
             },
@@ -551,8 +553,10 @@ impl Server {
         };
         let mut rng = Rng(0x5DEECE66D);
         let mut active: Vec<Active> = Vec::new();
-        // the next prompt group waits until then while others decode
+        // the next prompt group waits until then while others decode; the last group's time (a request that starts
+        // decoding gets that long before the next group)
         let mut read_after = Instant::now();
+        let mut last_group = std::time::Duration::from_secs(15); // ~a group on a B65 + B70 until one is timed
         loop {
             // take waiting requests while sessions are free
             while active.len() < self.parallel {
@@ -589,7 +593,9 @@ impl Server {
             // the GPUs are shared by time: after a group of t seconds they decode for t seconds (one decode step a
             // group gave a chat 0.23 tok/s beside a 256K prompt)
             let others = active.len() > 1 || !self.queue.lock().unwrap().is_empty();
-            let decoding = active.iter().any(|a| a.reading.is_none());
+            let mut decoding = active.iter().any(|a| a.reading.is_none());
+            // the shortest left to read first (a chat behind a 256K prompt then starts at once)
+            active.sort_by_key(|a| a.reading.as_ref().map_or(0, |r| a.job.ids.len() - r.at));
             let mut i = 0;
             while i < active.len() {
                 if active[i].reading.is_none() || (decoding && Instant::now() < read_after) {
@@ -598,7 +604,7 @@ impl Server {
                 }
                 let g0 = Instant::now();
                 let a = &mut active[i];
-                let limit = if others { READ_GROUP } else { READ_GROUP_ALONE };
+                let limit = if others { READ_GROUP } else { usize::MAX };
                 let r = if a.job.cancel.load(Ordering::Relaxed) {
                     Err("client gone".to_string())
                 } else {
@@ -606,8 +612,14 @@ impl Server {
                 };
                 // the round's reading in all (a short prompt read after a long group must not shorten the share)
                 read_after = read_after.max(Instant::now()) + g0.elapsed();
+                if others && limit == READ_GROUP && g0.elapsed() > last_group / 2 {
+                    last_group = g0.elapsed();
+                }
                 match r {
                     Ok(Some(logits)) => {
+                        // it decodes from now: a window before the next group
+                        decoding = true;
+                        read_after = read_after.max(Instant::now() + last_group);
                         let rd = a.reading.take().unwrap();
                         slots[a.slot].live = a.job.ids.clone();
                         let _ = a.job.tx.send(Ev::Read { from: rd.from, source: rd.source, seconds: rd.t0.elapsed().as_secs_f64(), saved: rd.saved });
@@ -722,10 +734,9 @@ impl Server {
         let live_len = if sl.live.len() < ids.len() && ids.starts_with(&sl.live) { sl.live.len() } else { 0 };
         let cached = if cache.enabled() { cache.best(ids) } else { None };
         let (from, source) = match cached {
-            Some((i, len)) if len > live_len => {
-                let ck = cache.get(i);
-                self.glm.restore(&mut sl.sess, ck).map_err(|e| e.0)?;
-                (len, "cache")
+            Some((hit, len)) if len > live_len => {
+                cache.with(hit, |ck| self.glm.restore(&mut sl.sess, ck))?.map_err(|e| e.0)?;
+                (len, if matches!(hit, crate::cache::Hit::Disk(_)) { "disk" } else { "cache" })
             }
             _ if live_len > 0 => (live_len, "live"),
             _ => {
@@ -745,9 +756,14 @@ impl Server {
         while rd.at < ids.len() && budget > 0 {
             let stop = rd.stops.first().copied().unwrap_or(ids.len());
             let end = stop.min(rd.at.saturating_add(budget)).min(ids.len());
-            let logits = self.glm.feed(&mut sl.sess, &ids[rd.at..end], &mut *none).map_err(|e| e.0)?;
-            budget -= end - rd.at;
-            rd.at = end;
+            // read alone (no limit), it stops at a chunk's end once another request waits
+            let arrived = || limit == usize::MAX && !self.queue.lock().unwrap().is_empty();
+            let (fed, logits) = self.glm.feed_until(&mut sl.sess, &ids[rd.at..end], &arrived, &mut *none).map_err(|e| e.0)?;
+            budget = budget.saturating_sub(fed);
+            rd.at += fed;
+            if rd.at < end {
+                return Ok(None); // stopped for a newcomer
+            }
             if !rd.stops.is_empty() && end == stop {
                 rd.stops.remove(0);
                 let mut cache = self.cache.lock().unwrap();

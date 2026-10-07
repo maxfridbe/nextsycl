@@ -128,6 +128,10 @@ fn status_table(st: &Value) -> String {
             let c = &st["prompt_cache"];
             out += &format!("prompt cache: {} checkpoint(s), {} of {}, {} evicted; the live session holds {} tokens\n", c["entries"],
                             gib(c["bytes"].as_f64().unwrap_or(0.0)), gib(c["budget"].as_f64().unwrap_or(0.0)), c["evictions"], c["live_tokens"]);
+            if let Some(d) = c["disk"].as_object() {
+                out += &format!("  on disk: {} checkpoint(s), {} of {}\n", d["entries"], gib(d["bytes"].as_f64().unwrap_or(0.0)),
+                                gib(d["budget"].as_f64().unwrap_or(0.0)));
+            }
         }
         None => out += "prompt cache: (busy)\n",
     }
@@ -196,9 +200,10 @@ pub fn cache(raw: &[String]) -> Result<(), String> {
     match raw.first().map(String::as_str) {
         None | Some("ls") => {
             let v = get("/server/cache")?;
-            println!("{:>4} {:>8} {:>10}", "#", "TOKENS", "SIZE");
+            println!("{:>4} {:>8} {:>10} {:>6}", "#", "TOKENS", "SIZE", "WHERE");
             for (i, e) in v["entries"].as_array().cloned().unwrap_or_default().iter().enumerate() {
-                println!("{:>4} {:>8} {:>10}", i + 1, t(&e["tokens"]), gib(e["bytes"].as_f64().unwrap_or(0.0)));
+                println!("{:>4} {:>8} {:>10} {:>6}", i + 1, t(&e["tokens"]), gib(e["bytes"].as_f64().unwrap_or(0.0)),
+                         if e["disk"].as_bool() == Some(true) { "disk" } else { "memory" });
             }
             println!("{} of {}, {} evicted (most recently used first)", gib(v["bytes"].as_f64().unwrap_or(0.0)), gib(v["budget"].as_f64().unwrap_or(0.0)),
                      v["evictions"]);

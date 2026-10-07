@@ -70,6 +70,16 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     args.extend(mount(&cfg.dist, "/app", true));
     args.extend(mount(&PathBuf::from(&models), "/models", true));
     args.extend(mount(&sock_dir, SOCKET_DIR_IN, false));
+    // the prompt cache's disk tier (NS_CACHE_DIR, default ~/.cache/nextsycl/prompts; NS_CACHE_DISK_GIB, default 32,
+    // 0 = none): checkpoints pushed out of memory - a 256K prompt's is ~3.5 GiB
+    let disk_gib = cfg.or("NS_CACHE_DISK_GIB", "32");
+    let cache_dir = (disk_gib.trim() != "0").then(|| {
+        PathBuf::from(cfg.get("NS_CACHE_DIR").unwrap_or_else(|| format!("{}/.cache/nextsycl/prompts", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))))
+    });
+    if let Some(d) = &cache_dir {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        args.extend(mount(d, "/cache", false));
+    }
     args.extend(["-e".into(), "NEXTSYCL_LIB=/app/libnextsycl.so".into(), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // engine settings the server reads from its environment (NS_KV=q8: the latent cache in q8)
     for k in ["NS_KV"] {
@@ -95,6 +105,9 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     }
     if let Some(c) = cfg.get("NS_CORS") {
         args.extend(["--cors".into(), c]);
+    }
+    if cache_dir.is_some() {
+        args.extend(["--cache-dir".into(), "/cache".into(), "--cache-disk-gib".into(), disk_gib]);
     }
     args.extend(["--socket".into(), format!("{SOCKET_DIR_IN}/nextsycl.sock")]);
     let st = ce.cmd().args(&args).stdout(Stdio::null()).status().map_err(|e| e.to_string())?;

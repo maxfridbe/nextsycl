@@ -57,6 +57,7 @@ in this process (inside the image: the kernels need the oneAPI runtime):
   nextsycl serve <model.gguf> [--gpu 0,1 | all] [--host H] [--port N] [--name ID] [--ctx N | N,M,... (a session each)] [--effort E] [--socket PATH]
                  [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)] [--cors ORIGINS]
                  [--keep-requests N (100)] [--parallel N (2: requests decoded together)]
+                 [--cache-dir DIR [--cache-disk-gib G (32)]: checkpoints pushed out of memory kept there]
                  [--max-tokens N (a request without max_tokens: N; default the rest of the context)]
                                 the server in the foreground (what start runs)
   nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
@@ -760,7 +761,13 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let keep: usize = opt("--keep-requests").and_then(|v| v.parse().ok()).unwrap_or(100);
     // what a request without max_tokens may make: --max-tokens N (0 or none: to the end of the context)
     let default_max = opt("--max-tokens").and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0);
-    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, slot_ctx, effort, cache, cors, keep, default_max)?);
+    // the prompt cache's disk tier: --cache-dir DIR [--cache-disk-gib G (32)]
+    let mut pc = cache::PromptCache::new(cache);
+    if let Some(dir) = opt("--cache-dir") {
+        let g: f64 = opt("--cache-disk-gib").and_then(|v| v.parse().ok()).unwrap_or(32.0);
+        pc = pc.with_disk(std::path::PathBuf::from(dir), (g * (1u64 << 30) as f64) as usize)?;
+    }
+    let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, slot_ctx, effort, pc, cors, keep, default_max)?);
     srv.run(&addr, opt("--socket").map(std::path::PathBuf::from))
 }
 

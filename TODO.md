@@ -139,7 +139,8 @@ of IQ2_XXS instead could win twice.
 - [x] 2. A needle check: `nextsycl bench --needle` - 9 of 9 found at 10 / 50 / 90% of 32K, 130K and 249K
         (docs/benchy/needle-2026-10-07-f16.md; 249K prompts read in ~267 s). Indices: positions are int32 cells,
         every size and product in the kernels int64 - no limit below 2^31 tokens
-- [ ] 2b. Logits of one long prompt read in other chunk sizes (a chunking-independence check)
+- [x] 2b. Chunk sizes: the 12K prompt read in chunks of 2048 gives the same text as 4096; 3072 differs at one
+        word ten tokens in (oneMKL tiles by the row count: the sums' order moves, a near tie flips)
 - [x] 3. NS_KV=q8: the latents as [16 fp16 scales][512 int8] a row (544 bytes vs 1,024), written by ns_to_q8row,
         read by the decode kernel (a lane's 32 values one block) and gathered to fp16 for the prompt's GEMMs. Exact
         within itself (spec-check, batch-check). Against llama.cpp at 3K: final logits cosine 0.99521 vs fp16's
@@ -147,7 +148,9 @@ of IQ2_XXS instead could win twice.
         17.1), the attention reserve 0.95 GiB vs 1.63. The needle on q8: below
 - [ ] 3b. The indexer's pooled keys in fp16 (128 -> 64 bytes a token and layer); a 4-bit latent form
 - [ ] 4. The indexer fused (XMX scores, the heads' sum and the top-k in one kernel; no T x H x pools scores)
-- [ ] 5. Long prompts' checkpoints on the NVMe (~3.5 GiB at 256K)
+- [x] 5. A disk tier for the prompt cache: checkpoints pushed out of memory written to NS_CACHE_DIR (32 GiB),
+        mounted from there when they are the best prefix; emptied at start (a checkpoint fits only its process's
+        sessions)
 - [ ] 6. Serve it: NS_CTX per slot, the HTTP limit, the tokenizer on ~1 MB, the client's context setting
 
 ## Decode, what is left (2026-10-07: 18-19 tok/s, MTP on)
@@ -179,7 +182,13 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
       decode share to its own second (now the round's reading in all). Now 17.9 tok/s beside a 253K read, the chat
       done 35 s after it was sent (19 of them waiting for the group in progress). The big arena also stays with the
       prompt while one is read (`hold_arena`: no lending back and forth at each switch)
-- [ ] A request arriving mid-group waits for the group (up to ~35 s alone): stop a pipelined feed between chunks
+- [x] A request arriving mid-group waited for the group: a prompt read alone now goes in one pipelined read that
+      stops at a chunk's end once a request waits (`feed_until`; groups of 8 alone had cost 8%: 294 vs 273 s at
+      253K); the shortest read goes first and a request that starts decoding gets a group's time before the next
+      group. A chat sent 20 s into a 253K read: answered in 9.8 s (was 258 s that morning), 18.4 tok/s; the long
+      prompt 280 s vs 273 alone
+- [x] The disk tier, measured: a 256K prompt's checkpoint pushed out by a 128K one, its follow-up mounted from the
+      file - 4.5 s, the right answer
 - [ ] Batch: the draft block in batches; per-request energy (concurrent requests share the counters - each counts
       both)
 
