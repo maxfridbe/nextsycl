@@ -560,7 +560,9 @@ fn batch_check(args: &[String]) -> Result<(), String> {
     let mut solo_toks: Vec<Vec<u32>> = Vec::new();
     let mut solo_logits: Vec<Vec<Vec<f32>>> = Vec::new();
     let mut solo_s = 0.0;
-    for p in &ids {
+    // --no-solo: the batch alone (its profile; the tokens are then taken greedily from the batch itself)
+    let solo = !args.iter().any(|a| a == "--no-solo");
+    for p in ids.iter().filter(|_| solo) {
         let mut s = glm.session(ctx).map_err(e)?;
         let mut l = glm.feed(&mut s, p, &mut none).map_err(e)?;
         let (mut ts, mut ls) = (Vec::new(), Vec::new());
@@ -588,16 +590,18 @@ fn batch_check(args: &[String]) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     for step in 0..n {
         let toks: Vec<u32> = last.iter().map(|l| argmax(l)).collect();
-        for (b, t) in toks.iter().enumerate() {
-            if *t != solo_toks[b][step] {
-                differ += 1;
+        if solo {
+            for (b, t) in toks.iter().enumerate() {
+                if *t != solo_toks[b][step] {
+                    differ += 1;
+                }
             }
         }
         // each session takes the token its own run took, so the comparison stays aligned
-        let feed: Vec<u32> = (0..ids.len()).map(|b| solo_toks[b][step]).collect();
+        let feed: Vec<u32> = if solo { (0..ids.len()).map(|b| solo_toks[b][step]).collect() } else { toks.clone() };
         let mut refs: Vec<&mut ns_engine::glm5next::Session> = sess.iter_mut().collect();
         last = glm.forward_batch(&mut refs, &feed, &mut none).map_err(e)?;
-        for (b, l) in last.iter().enumerate() {
+        for (b, l) in last.iter().enumerate().filter(|_| solo) {
             let r = &solo_logits[b][step];
             worst = worst.max(l.iter().zip(r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max));
         }

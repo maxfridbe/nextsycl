@@ -1625,6 +1625,59 @@ impl<'g> Glm<'g> {
         Ok(v.chunks(vocab).map(|c| c.to_vec()).collect())
     }
 
+    /// MLA for a batch's rows (one a session): the projections, the absorbed queries, the values' and the output
+    /// projections once for all rows; each session's cache write, indexer and attention on its own row. Every row as
+    /// `mla` computes it for a one-token pass (the decode-width products are per row either way).
+    fn mla_batch(&self, p: &Part, l: u64, normed: &DevBuf, per: &[(&DevBuf, &Idx, usize)], tap: Tap) -> Result<DevBuf> {
+        let g = &self.m.g;
+        let o = &p.ops;
+        let t = per.len();
+        let eps = g.rms_eps as f32;
+        let (nh, hd, lat, ql) = (g.n_head as usize, g.head_dim as usize, g.kv_lora as usize, g.q_lora as usize);
+        let t_proj = self.mark(p);
+        let mut pj = p.mm_many(l, &[Role::MlaQA, Role::MlaKvA], normed, t)?.into_iter();
+        let (qa, kv) = (pj.next().unwrap(), pj.next().unwrap());
+        let qr = p.arena.f32(t * ql)?;
+        o.rms_norm(&qa, Some(p.vec(l, Role::MlaQANorm)?), &qr, t, ql, eps)?;
+        let q = p.mm(l, Role::MlaQB, &qr, t)?;
+        let c = p.arena.f32(t * lat)?;
+        o.rms_norm(&kv, Some(p.vec(l, Role::MlaKvANorm)?), &c, t, lat, eps)?;
+        for (b, (cache, _, pos)) in per.iter().enumerate() {
+            o.to_f16(&c.view(b * lat * 4, lat * 4)?, &cache.view(pos * lat * 2, lat * 2)?, lat)?;
+        }
+        let t_abs = self.lap(p, "MLA: projections", t_proj);
+        let kb = p.vec(l, Role::MlaKB)?;
+        let qt = p.arena.f32(t * nh * lat)?;
+        for r in 0..t {
+            o.gemm_batch(nh, 1, lat, hd, (&q, r * nh * hd, hd, hd), (kb, 0, lat * hd), (&qt, r * nh * lat, lat, lat), false)?;
+        }
+        let t_idx = self.lap(p, "MLA: absorbed queries", t_abs);
+        let u = p.arena.f32(t * nh * lat)?;
+        let kp = (g.idx_top_k / g.idx_pool) as usize;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let capture = self.capture.lock().unwrap().is_some();
+        for (b, (cache, idx, pos)) in per.iter().enumerate() {
+            let nb = normed.view(b * g.n_embd as usize * 4, g.n_embd as usize * 4)?;
+            let qb = qr.view(b * ql * 4, ql * 4)?;
+            let sel = self.select(p, l, &nb, &qb, idx, *pos, 1, &mut *tap)?;
+            let qtb = qt.view(b * nh * lat * 4, nh * lat * 4)?;
+            if capture {
+                self.capture_layer(p, l, cache, &qtb, sel.as_ref(), *pos)?;
+            }
+            o.mla_attend_sel(&qtb, cache, &u.view(b * nh * lat * 4, nh * lat * 4)?, 1, nh, lat, *pos, scale, sel.as_ref().map(|(a, b)| (a, b)), kp)?;
+        }
+        let t_vb = self.lap(p, "MLA: attention", t_idx);
+        let vb = p.vec(l, Role::MlaVB)?;
+        let oh = p.arena.f32(t * nh * hd)?;
+        for r in 0..t {
+            o.gemm_batch(nh, 1, hd, lat, (&u, r * nh * lat, lat, lat), (vb, 0, hd * lat), (&oh, r * nh * hd, hd, hd), false)?;
+        }
+        let t_out = self.lap(p, "MLA: values (v_b)", t_vb);
+        let out = p.mm(l, Role::MlaOut, &oh, t)?;
+        self.lap(p, "MLA: output projection", t_out);
+        Ok(out)
+    }
+
     /// Starts (or stops) capturing attention: each one-token pass from now adds, per MLA layer, its heads' mean
     /// attention over the positions it reads (`take_attention`). For LogProbChain - a few small reads a layer.
     pub fn capture_attention(&self, on: bool) {
@@ -1767,14 +1820,12 @@ impl<'g> Glm<'g> {
             self.timed(p, "hc pre", || hc_pre(Role::HcAttnFn, Role::HcAttnBase, Role::HcAttnScale, x, Role::AttnNorm))?;
             let att = self.timed(p, if g.is_mla(l) { "MLA" } else { "KDA" }, || -> Result<DevBuf> {
                 if g.is_mla(l) {
-                    // per session: its row through MLA (its cache, its indexer, its position)
-                    let att = p.arena.f32(t * d)?;
-                    for (b, s) in sess.iter().enumerate() {
+                    let mut per: Vec<(&DevBuf, &Idx, usize)> = Vec::with_capacity(t);
+                    for s in sess.iter() {
                         let LayerState::Mla { c: cache, idx } = &s.layers[l as usize] else { return Err(Error("layer state".into())) };
-                        let out = self.mla(p, l, &row(normed, b, d)?, cache, idx, s.pos, 1, &mut *tap)?;
-                        att.copy_within(b * d * 4, &out, 0, d * 4)?;
+                        per.push((cache, idx, s.pos));
                     }
-                    return Ok(att);
+                    return self.mla_batch(p, l, normed, &per, &mut *tap);
                 }
                 let mut pj = p.mm_many(l, &[Role::KdaQ, Role::KdaK, Role::KdaV, Role::KdaFA, Role::KdaGA, Role::KdaBeta], normed, t)?.into_iter();
                 let (pq, pk, pv, fa, ga, beta) = (pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap(), pj.next().unwrap());

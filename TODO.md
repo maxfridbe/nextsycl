@@ -71,7 +71,9 @@ by default (`--no-mtp` turns it off).
       `nextsycl bench` after.
 - [x] Several requests at once (branch `batching`): forward_batch + an engine thread with NS_PARALLEL sessions -
       bit-exact; 2 clients 18.1 -> 20.3 tok/s in all, the second's first token 10.4 -> 2.0 s
-- [ ] Batch: MLA's projections once for all rows (only its cache, indexer and attention per session); a prompt read
+- [x] Batch: MLA's projections once for all rows (mla_batch) - +3% (24.1 -> 24.9 tok/s for 2): the batch is bound by
+      its experts - two conversations want ~15 distinct experts a layer, not 8 (49 ms a 2-row pass of 90)
+- [ ] Batch: a prompt read
       in chunks between decode steps (a long prompt now stalls the others' decode); the draft block in batches;
       per-request energy (concurrent requests share the counters - each counts both)
 
