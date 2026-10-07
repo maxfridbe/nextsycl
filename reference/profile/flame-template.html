@@ -1,0 +1,191 @@
+<title>nextsycl Flame Graph</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600&display=swap">
+<style>
+/* layout: one wide icicle (rows = nesting depth, widths = share of the pass), its zoom trail above, the level's table below */
+:root {
+  --bg: #f4f5f7; --panel: #ffffff; --fg: #1d2330; --muted: #5d6576; --line: #d8dce4;
+  --exp: #e2622c; --wait: #b8323f; --kda: #1f8a80; --mla: #4659c2; --mtp: #c48a12; --hc: #7a6f99; --other: #9aa1ad; --root: #3b4252;
+  --ink-on: #ffffff;
+  --sans: "IBM Plex Sans", system-ui, sans-serif; --cond: "IBM Plex Sans Condensed", "IBM Plex Sans", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12151c; --panel: #1a1e27; --fg: #e4e7ee; --muted: #9aa2b3; --line: #2d3340;
+  --exp: #f0773f; --wait: #d4505c; --kda: #2fa89c; --mla: #6b7de0; --mtp: #d9a326; --hc: #9488b8; --other: #6c7383; --root: #4a5266;
+  --ink-on: #0f1218; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #12151c; --panel: #1a1e27; --fg: #e4e7ee; --muted: #9aa2b3; --line: #2d3340;
+  --exp: #f0773f; --wait: #d4505c; --kda: #2fa89c; --mla: #6b7de0; --mtp: #d9a326; --hc: #9488b8; --other: #6c7383; --root: #4a5266;
+  --ink-on: #0f1218; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font: 15px/1.55 var(--sans); }
+.wrap { max-width: 1180px; margin: 0 auto; padding-inline: 20px; padding-block: 28px 48px; display: grid; gap: 22px; }
+h1 { font: 600 26px/1.2 var(--cond); margin: 0; letter-spacing: .01em; text-wrap: balance; }
+.sub { color: var(--muted); max-width: 72ch; margin: 6px 0 0; }
+.facts { display: flex; flex-wrap: wrap; gap: 8px 22px; font: 13px var(--mono); color: var(--muted); }
+.facts b { color: var(--fg); font-weight: 500; }
+.bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+.tabs { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); }
+.tabs button { font: 500 14px var(--sans); padding: 8px 16px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.tabs button[aria-pressed="true"] { background: var(--root); color: #fff; }
+.tabs button:focus-visible, .cell:focus-visible, .crumb button:focus-visible { outline: 2px solid var(--mla); outline-offset: 1px; }
+.crumb { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; font: 13px var(--mono); color: var(--muted); }
+.crumb button { font: inherit; border: 0; background: none; color: var(--mla); cursor: pointer; padding: 2px 4px; border-radius: 4px; }
+.crumb span.sep { opacity: .6; }
+.flame-box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; overflow-x: auto; }
+.flame { position: relative; min-width: 640px; }
+.cell { position: absolute; height: 32px; box-sizing: border-box; border: 1px solid var(--panel); border-radius: 4px; overflow: hidden;
+  color: var(--ink-on); font: 500 12.5px/30px var(--cond); padding-inline: 7px; white-space: nowrap; text-overflow: ellipsis; cursor: pointer; }
+.cell.est { background-image: repeating-linear-gradient(135deg, transparent 0 6px, rgba(255,255,255,.18) 6px 9px); }
+.cell .v { font: 12px var(--mono); opacity: .85; margin-left: 6px; }
+.cell:hover { filter: brightness(1.08); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--muted); }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; }
+.tip { position: fixed; z-index: 5; max-width: 320px; background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; font-size: 13px; box-shadow: 0 6px 24px rgba(0,0,0,.18); pointer-events: none; }
+.tip b { font: 600 14px var(--cond); display: block; margin-bottom: 2px; }
+.tip .n { font: 12.5px var(--mono); color: var(--muted); }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 22px; align-items: start; }
+@media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+th { font: 600 11.5px var(--cond); text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
+td.num, th.num { text-align: right; font-family: var(--mono); font-size: 13px; }
+tr:last-child td { border-bottom: 0; }
+td .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 8px; vertical-align: 0; }
+.tbl { overflow-x: auto; }
+.notes { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; }
+.notes h2 { font: 600 15px var(--cond); text-transform: uppercase; letter-spacing: .06em; margin: 0 0 8px; color: var(--muted); }
+.notes ul { margin: 0; padding-left: 18px; display: grid; gap: 8px; }
+.notes li { max-width: 68ch; }
+.foot { color: var(--muted); font-size: 12.5px; max-width: 90ch; }
+@media (prefers-reduced-motion: no-preference) { .cell { transition: left .25s ease, width .25s ease; } }
+</style>
+<div class="wrap">
+  <header>
+    <h1>Where a pass's time goes</h1>
+    <p class="sub">GLM-5.3-Flash (IQ2) on nextsycl, an Arc Pro B65 and an Arc Pro B70, measured with device timestamps
+      (<code>NS_PROFILE=gpu</code>). A block's width is its share of the wall time; click one to zoom in.</p>
+  </header>
+  <div class="facts" id="facts"></div>
+  <div class="bar">
+    <div class="tabs" role="group" aria-label="Phase">
+      <button id="tab-prompt" aria-pressed="true">Prompt, 36K tokens</button>
+      <button id="tab-decode" aria-pressed="false">Decode, 300 tokens</button>
+    </div>
+    <div class="crumb" id="crumb"></div>
+  </div>
+  <div class="flame-box"><div class="flame" id="flame" role="tree"></div></div>
+  <div class="legend" id="legend"></div>
+  <div class="grid2">
+    <div class="tbl"><table id="table"></table></div>
+    <div class="notes" id="notes"></div>
+  </div>
+  <p class="foot">The draft block (MTP) runs its own attention and experts; those are counted in its row and again inside
+    the MLA and expert rows, so a parent can be a little over its share. Time the GPU spends waiting for the host is
+    counted in the section that runs next (in the prompt, mostly hc pre). In decode the expert section has no inner
+    timestamps: its split into kernels and waiting comes from the grouped kernel measured alone (~0.32 ms a two-row
+    layer pass), marked with stripes.</p>
+</div>
+<div class="tip" id="tip" hidden></div>
+<script>
+const DATA = __DATA__;
+const CAT = { exp: ["Experts", "var(--exp)"], wait: ["Waiting on copies", "var(--wait)"], kda: ["KDA attention", "var(--kda)"],
+  mla: ["MLA attention", "var(--mla)"], mtp: ["Draft block (MTP)", "var(--mtp)"], hc: ["Mixing, router", "var(--hc)"],
+  other: ["Other", "var(--other)"], root: ["Whole pass", "var(--root)"] };
+const FACTS = {
+  prompt: [["prompt", "36,585 tokens"], ["read in", "74.2 s (was 80.3)"], ["speed", "492.7 tok/s"], ["chunks", "4,096 tokens"], ["host experts read", "49,969"]],
+  decode: [["prompt", "26 tokens"], ["generated", "300 tokens"], ["speed", "17.8 tok/s"], ["drafts accepted", "136 of 163"], ["swaps", "7,148 + 5,883 prefetched"]],
+};
+const NOTES = {
+  prompt: [
+    "Experts are 49% of reading: 13.8 s of it expands each expert's 2-bit weights to fp16, 17 s is the half-precision GEMMs. A fused dequant-and-multiply kernel would remove the expansion's write and read-back.",
+    "MLA attention grows with the context: at 36K every row attends to 2,051 selected cells; scores, softmax and values are 9.2 s.",
+    "The KDA scan (6.9 s) walks the tokens in order; a chunked form would turn it into matrix products.",
+    "The unattributed time fell from 8 s to under 1 s: the host chose each row's experts with a full sort while the GPU waited (2.8 s at 12K), now a partial selection over 16 threads (0.3 s).",
+  ],
+  decode: [
+    "Half of decode is the routed experts, and most of that is waiting for missed experts to arrive over PCIe (both cards on x8 links), not the expert kernels.",
+    "KDA's input projections (5.9 ms a token) already read their weights at about 613 GB/s, the card's bandwidth.",
+    "The draft block costs 3.3 ms a token and saves about 45% of the passes (1.83 tokens a pass).",
+    "Moving the B70 to an x16 slot (with the B65's layers all in its own VRAM) would cut the waiting row the most.",
+  ],
+};
+let phase = "prompt", path = [];
+const flame = document.getElementById("flame"), tip = document.getElementById("tip");
+function depth(n) { return 1 + Math.max(0, ...(n.kids || []).map(depth)); }
+function fmt(s) { return s >= 10 ? s.toFixed(1) + " s" : s >= 1 ? s.toFixed(2) + " s" : (s * 1000).toFixed(0) + " ms"; }
+function perUnit(n) {
+  const u = DATA[phase].units;
+  return DATA[phase].unit === "token" ? (n.s / u * 1000).toFixed(2) + " ms a token" : (n.s / u).toFixed(2) + " s per 1K tokens";
+}
+function current() { let n = DATA[phase]; for (const i of path) n = n.kids[i]; return n; }
+function render() {
+  const root = current(), D = depth(root), H = 36;
+  flame.innerHTML = ""; flame.style.height = (D * H) + "px";
+  const place = (n, x, w, d, p) => {
+    const el = document.createElement("div");
+    el.className = "cell" + (n.est ? " est" : ""); el.tabIndex = 0; el.setAttribute("role", "treeitem");
+    el.style.left = (x * 100) + "%"; el.style.width = "calc(" + (w * 100) + "% - 1px)"; el.style.top = (d * H) + "px";
+    el.style.background = CAT[n.cat || "other"][1];
+    el.innerHTML = n.name.replace(/&/g, "&amp;").replace(/</g, "&lt;") + '<span class="v">' + fmt(n.s) + "</span>";
+    el.setAttribute("aria-label", n.name + ", " + fmt(n.s));
+    const show = (e) => {
+      const pct = (n.s / DATA[phase].s * 100).toFixed(1);
+      tip.innerHTML = "<b></b><div class='n'></div><div class='x'></div>";
+      tip.querySelector("b").textContent = n.name + (n.est ? " (estimate)" : "");
+      tip.querySelector(".n").textContent = fmt(n.s) + " · " + pct + "% of the pass · " + perUnit(n) + (n.calls ? " · " + n.calls.toLocaleString() + " calls" : "");
+      tip.querySelector(".x").textContent = n.note || "";
+      tip.hidden = false;
+      const r = el.getBoundingClientRect(), tx = Math.min(window.innerWidth - 336, Math.max(8, (e && e.clientX ? e.clientX : r.left) + 12));
+      tip.style.left = tx + "px"; tip.style.top = (r.bottom + 6) + "px";
+    };
+    el.addEventListener("mousemove", show); el.addEventListener("focus", show);
+    el.addEventListener("mouseleave", () => tip.hidden = true); el.addEventListener("blur", () => tip.hidden = true);
+    // the focused block zooms out; a block with parts zooms into it; a leaf focuses its parent
+    const zoom = () => {
+      if (p.length === path.length) { if (path.length) path = path.slice(0, -1); }
+      else path = n.kids ? p : p.slice(0, -1);
+      tip.hidden = true; render();
+    };
+    el.addEventListener("click", zoom); el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); zoom(); } });
+    flame.appendChild(el);
+    let cx = x; const tot = Math.max(n.s, (n.kids || []).reduce((a, k) => a + k.s, 0));
+    (n.kids || []).forEach((k, i) => { const kw = w * k.s / tot; place(k, cx, kw, d + 1, p.concat(i)); cx += kw; });
+  };
+  place(root, 0, 1, 0, path.slice());
+  renderCrumb(); renderTable(root);
+}
+function renderCrumb() {
+  const c = document.getElementById("crumb"); c.innerHTML = "";
+  let n = DATA[phase]; const parts = [[n.name, []]];
+  path.forEach((i, j) => { n = n.kids[i]; parts.push([n.name, path.slice(0, j + 1)]); });
+  parts.forEach(([name, p], j) => {
+    if (j) { const s = document.createElement("span"); s.className = "sep"; s.textContent = "›"; c.appendChild(s); }
+    const b = document.createElement("button"); b.textContent = j === 0 ? (phase === "prompt" ? "whole prompt" : "whole decode") : name;
+    b.addEventListener("click", () => { path = p; render(); }); c.appendChild(b);
+  });
+}
+function renderTable(root) {
+  const t = document.getElementById("table"), kids = root.kids || [];
+  const unitH = DATA[phase].unit === "token" ? "ms a token" : "s per 1K tokens";
+  let h = "<thead><tr><th>Section</th><th class='num'>Time</th><th class='num'>Share</th><th class='num'>" + unitH + "</th></tr></thead><tbody>";
+  for (const k of kids) {
+    const per = DATA[phase].unit === "token" ? (k.s / DATA[phase].units * 1000).toFixed(2) : (k.s / DATA[phase].units).toFixed(2);
+    h += "<tr><td><span class='sw' style='background:" + CAT[k.cat || "other"][1] + "'></span>" + k.name.replace(/</g, "&lt;") + (k.est ? " <em>(estimate)</em>" : "") +
+      "</td><td class='num'>" + fmt(k.s) + "</td><td class='num'>" + (k.s / root.s * 100).toFixed(1) + "%</td><td class='num'>" + per + "</td></tr>";
+  }
+  t.innerHTML = h + "</tbody>";
+}
+function renderStatic() {
+  document.getElementById("facts").innerHTML = FACTS[phase].map(([k, v]) => k + " <b>" + v + "</b>").join("");
+  document.getElementById("notes").innerHTML = "<h2>Reading it</h2><ul>" + NOTES[phase].map(s => "<li>" + s + "</li>").join("") + "</ul>";
+  const cats = new Set(); (function walk(n) { cats.add(n.cat || "other"); (n.kids || []).forEach(walk); })(DATA[phase]);
+  document.getElementById("legend").innerHTML = [...cats].filter(c => c !== "root").map(c => "<span><i style='background:" + CAT[c][1] + "'></i>" + CAT[c][0] + "</span>").join("");
+  document.getElementById("tab-prompt").setAttribute("aria-pressed", phase === "prompt");
+  document.getElementById("tab-decode").setAttribute("aria-pressed", phase === "decode");
+}
+document.getElementById("tab-prompt").addEventListener("click", () => { phase = "prompt"; path = []; renderStatic(); render(); });
+document.getElementById("tab-decode").addEventListener("click", () => { phase = "decode"; path = []; renderStatic(); render(); });
+renderStatic(); render();
+</script>

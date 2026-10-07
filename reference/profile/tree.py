@@ -49,7 +49,8 @@ def tree(d, wall, label, unit, units, decode):
     top.append(group(d, "KDA", "KDA: ", "kda", "KDA: "))
     top.append(mla)
     for name, cat in [("MTP draft", "mtp"), ("hc pre", "hc"), ("shared expert", "exp"), ("GPU to GPU", "wait"), ("dense FFN", "exp"), ("router", "hc"),
-                      ("expert misses (swaps / file)", "wait"), ("expert prefetch", "wait")]:
+                      ("expert misses (swaps / file)", "wait"), ("expert prefetch", "wait"),
+                      ("embedding + the 4 streams", "other"), ("head", "other")]:
         if name in d and d[name][0] > 0.004:
             n = node(name, d[name][0], d[name][1]); n["cat"] = cat; top.append(n)
     top.sort(key=lambda n: -n["s"])
@@ -60,6 +61,6 @@ def tree(d, wall, label, unit, units, decode):
     root["unit"] = unit; root["units"] = units
     return root
 fp, fd = load(sys.argv[1]), load(sys.argv[2])
-out = {"prompt": tree(fp, 80.3, "Reading a 36,585-token prompt", "1K tokens", 36.585, False),
+out = {"prompt": tree(fp, float(sys.argv[3]) if len(sys.argv) > 3 else 80.3, "Reading a 36,585-token prompt", "1K tokens", 36.585, False),
        "decode": tree(fd, 16.8, "Decoding 300 tokens (MTP on)", "token", 300, True)}
 print(json.dumps(out))
