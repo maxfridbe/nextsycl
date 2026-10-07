@@ -169,9 +169,16 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
       bit-exact; 2 clients 18.1 -> 20.3 tok/s in all, the second's first token 10.4 -> 2.0 s
 - [x] Batch: MLA's projections once for all rows (mla_batch) - +3% (24.1 -> 24.9 tok/s for 2): the batch is bound by
       its experts - two conversations want ~15 distinct experts a layer, not 8 (49 ms a 2-row pass of 90)
-- [ ] Batch: a prompt read
-      in chunks between decode steps (a long prompt now stalls the others' decode); the draft block in batches;
-      per-request energy (concurrent requests share the counters - each counts both)
+- [x] Batch: a prompt read in groups between rounds - 4 chunks (16K tokens, ~17 s) while others decode or wait, 8
+      alone (a request arriving meanwhile waits one group); the GPUs shared by time while others decode (after a
+      group of t seconds they decode for t). A 256K prompt read at once held every other request for 4.5 minutes;
+      one decode step a group gave a chat 0.23 tok/s. Measured: a chat sent 20 s after a 253K prompt answered in
+      55 s (it waited one group, 19 s; then 2.9 tok/s), the long prompt 304 s vs 271 alone. Checkpoints at the stops
+      as before
+- [ ] The chat's decode beside a prompt read: 2.9 tok/s, not the ~10 of a half share - suspect the big arena moving
+      between the expert store and the prompt at each switch (NS_LEND); take new requests within a group too
+- [ ] Batch: the draft block in batches; per-request energy (concurrent requests share the counters - each counts
+      both)
 
 ## LogProbChain (an API option)
 

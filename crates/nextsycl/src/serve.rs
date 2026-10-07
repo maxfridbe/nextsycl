@@ -243,7 +243,25 @@ struct Active {
     finish: Option<&'static str>,
     /// LogProbChain: this turn's tokens so far and their own logprobs
     turn: Vec<(u32, f64)>,
+    /// its prompt still being read (a group of chunks a round while others decode)
+    reading: Option<Reading>,
 }
+
+/// A prompt being read into its session: up to `at`, from `from` (`source`), the stops still ahead
+struct Reading {
+    at: usize,
+    from: usize,
+    source: &'static str,
+    stops: Vec<usize>,
+    t0: Instant,
+    saved: usize,
+}
+
+/// Prompt tokens read a round while other requests decode: four chunks (the GPUs' pipeline keeps ~80% of its
+/// speed over four; a 256K prompt read at once held every other request for 4.5 minutes)
+const READ_GROUP: usize = 4 * 4096;
+/// ... and alone: eight (~89%; a request arriving meanwhile waits at most one group, ~35 s)
+const READ_GROUP_ALONE: usize = 8 * 4096;
 
 /// Prefixes shorter than this are read again rather than cached
 const MIN_CHECKPOINT: usize = 64;
@@ -533,6 +551,8 @@ impl Server {
         };
         let mut rng = Rng(0x5DEECE66D);
         let mut active: Vec<Active> = Vec::new();
+        // the next prompt group waits until then while others decode
+        let mut read_after = Instant::now();
         loop {
             // take waiting requests while sessions are free
             while active.len() < self.parallel {
@@ -553,14 +573,50 @@ impl Server {
                 };
                 // its tokens end at its session's context
                 job.max = job.max.min(slots[slot].sess.max_ctx - job.ids.len() - 1);
-                match self.read_prompt(&mut slots[slot], &job.ids, &mut none) {
-                    Ok((logits, from, source, seconds, saved)) => {
-                        let _ = job.tx.send(Ev::Read { from, source, seconds, saved });
-                        active.push(Active { job, slot, dec: None, logits: Some(logits), pending: None, n: 0, committed: Vec::new(), accepted: 0,
-                                             drafted: 0, finish: None, turn: Vec::new() });
+                match self.begin_read(&mut slots[slot], &job.ids) {
+                    Ok(rd) => {
+                        active.push(Active { job, slot, dec: None, logits: None, pending: None, n: 0, committed: Vec::new(), accepted: 0,
+                                             drafted: 0, finish: None, turn: Vec::new(), reading: Some(rd) });
                     }
                     Err(e) => {
                         let _ = job.tx.send(Ev::Fail(e));
+                        self.inflight.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                self.lives(&slots);
+            }
+            // the prompts being read: a group each round (new requests are taken between groups). While others decode
+            // the GPUs are shared by time: after a group of t seconds they decode for t seconds (one decode step a
+            // group gave a chat 0.23 tok/s beside a 256K prompt)
+            let others = active.len() > 1 || !self.queue.lock().unwrap().is_empty();
+            let decoding = active.iter().any(|a| a.reading.is_none());
+            let mut i = 0;
+            while i < active.len() {
+                if active[i].reading.is_none() || (decoding && Instant::now() < read_after) {
+                    i += 1;
+                    continue;
+                }
+                let g0 = Instant::now();
+                let a = &mut active[i];
+                let limit = if others { READ_GROUP } else { READ_GROUP_ALONE };
+                let r = if a.job.cancel.load(Ordering::Relaxed) {
+                    Err("client gone".to_string())
+                } else {
+                    self.read_some(&mut slots[a.slot], &a.job.ids, a.reading.as_mut().unwrap(), limit, &mut none)
+                };
+                read_after = Instant::now() + g0.elapsed();
+                match r {
+                    Ok(Some(logits)) => {
+                        let rd = a.reading.take().unwrap();
+                        slots[a.slot].live = a.job.ids.clone();
+                        let _ = a.job.tx.send(Ev::Read { from: rd.from, source: rd.source, seconds: rd.t0.elapsed().as_secs_f64(), saved: rd.saved });
+                        a.logits = Some(logits);
+                        i += 1;
+                    }
+                    Ok(None) => i += 1,
+                    Err(e) => {
+                        let a = active.remove(i);
+                        let _ = a.job.tx.send(Ev::Fail(e));
                         self.inflight.fetch_sub(1, Ordering::SeqCst);
                     }
                 }
@@ -571,6 +627,20 @@ impl Server {
                 if q.is_empty() {
                     let _ = self.wake.wait_timeout(q, std::time::Duration::from_millis(200));
                 }
+                continue;
+            }
+            // the ones still reading wait out this round's steps
+            let mut readers: Vec<Active> = Vec::new();
+            let mut i = 0;
+            while i < active.len() {
+                if active[i].reading.is_some() {
+                    readers.push(active.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            if active.is_empty() {
+                active = readers;
                 continue;
             }
             active.sort_by_key(|a| a.slot);
@@ -609,6 +679,7 @@ impl Server {
                     let _ = a.job.tx.send(Ev::Fail(e.clone()));
                     self.inflight.fetch_sub(1, Ordering::SeqCst);
                 }
+                active.append(&mut readers);
                 self.lives(&slots);
                 continue;
             }
@@ -631,6 +702,7 @@ impl Server {
                     i += 1;
                 }
             }
+            active.append(&mut readers);
             self.lives(&slots);
         }
     }
@@ -639,10 +711,9 @@ impl Server {
         *self.live_lens.lock().unwrap() = slots.iter().map(|s| s.live.len()).collect();
     }
 
-    /// A prompt into a session: from the live state when it holds a prefix, a cached checkpoint when that is longer,
-    /// else from the start; checkpoints saved at the prompt's stops. (logits, tokens reused, from where, seconds,
-    /// checkpoints saved)
-    fn read_prompt(&self, sl: &mut Slot, ids: &[u32], none: ns_engine::Tap) -> Result<(Vec<f32>, usize, &'static str, f64, usize), String> {
+    /// A prompt's read begun in a session: from the live state when it holds a prefix, a cached checkpoint when that
+    /// is longer, else from the start (the cache only gives a prefix shorter than the prompt: a token is always fed)
+    fn begin_read(&self, sl: &mut Slot, ids: &[u32]) -> Result<Reading, String> {
         let t0 = Instant::now();
         let mut cache = self.cache.lock().unwrap();
         let live_len = if sl.live.len() < ids.len() && ids.starts_with(&sl.live) { sl.live.len() } else { 0 };
@@ -660,24 +731,35 @@ impl Server {
             }
         };
         sl.live.clear(); // until this prompt is read, the session is in between
-        let mut logits = Vec::new();
-        let mut at = from;
-        let mut saved = 0;
-        for stop in self.stops(ids).into_iter().filter(|p| *p > from) {
-            logits = self.glm.feed(&mut sl.sess, &ids[at..stop], &mut *none).map_err(|e| e.0)?;
-            at = stop;
-            if cache.enabled() && !cache.touch(&ids[..stop]) {
-                let ck = self.glm.save(&sl.sess).map_err(|e| e.0)?;
-                if cache.put(ids[..stop].to_vec(), ck) {
-                    saved += 1;
+        let stops = self.stops(ids).into_iter().filter(|p| *p > from).collect();
+        Ok(Reading { at: from, from, source, stops, t0, saved: 0 })
+    }
+
+    /// Up to `limit` more of a prompt's tokens (a checkpoint saved at each stop passed): the last token's logits once
+    /// it is read to its end
+    fn read_some(&self, sl: &mut Slot, ids: &[u32], rd: &mut Reading, limit: usize, none: ns_engine::Tap) -> Result<Option<Vec<f32>>, String> {
+        let mut budget = limit;
+        while rd.at < ids.len() && budget > 0 {
+            let stop = rd.stops.first().copied().unwrap_or(ids.len());
+            let end = stop.min(rd.at.saturating_add(budget)).min(ids.len());
+            let logits = self.glm.feed(&mut sl.sess, &ids[rd.at..end], &mut *none).map_err(|e| e.0)?;
+            budget -= end - rd.at;
+            rd.at = end;
+            if !rd.stops.is_empty() && end == stop {
+                rd.stops.remove(0);
+                let mut cache = self.cache.lock().unwrap();
+                if cache.enabled() && !cache.touch(&ids[..stop]) {
+                    let ck = self.glm.save(&sl.sess).map_err(|e| e.0)?;
+                    if cache.put(ids[..stop].to_vec(), ck) {
+                        rd.saved += 1;
+                    }
                 }
             }
+            if rd.at == ids.len() {
+                return Ok(Some(logits));
+            }
         }
-        if at < ids.len() {
-            logits = self.glm.feed(&mut sl.sess, &ids[at..], &mut *none).map_err(|e| e.0)?;
-        }
-        sl.live = ids.to_vec();
-        Ok((logits, from, source, t0.elapsed().as_secs_f64(), saved))
+        Ok(None)
     }
 
     /// A committed token of `a`'s: to its request (or the end, at a stop token or its limit)
