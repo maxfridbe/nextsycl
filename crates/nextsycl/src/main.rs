@@ -57,7 +57,7 @@ in this process (inside the image: the kernels need the oneAPI runtime):
   nextsycl serve <model.gguf> [--gpu 0,1 | all] [--host H] [--port N] [--name ID] [--ctx N | N,M,... (a session each)] [--effort E] [--socket PATH]
                  [--expert-gib G] [--mirror-gib G] [--no-mtp] [--prompt-cache-mib N (4096; 0 = off)] [--cors ORIGINS]
                  [--keep-requests N (100)] [--parallel N (2: requests decoded together)]
-                 [--cache-dir DIR [--cache-disk-gib G (32)]: checkpoints pushed out of memory kept there]
+                 [--cache-dir DIR [--cache-disk-gib G (32)] [--cache-ttl-hours H (24)]: checkpoints pushed out of memory kept there]
                  [--max-tokens N (a request without max_tokens: N; default the rest of the context)]
                                 the server in the foreground (what start runs)
   nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
@@ -78,10 +78,13 @@ settings (environment, or NAME=value lines in nextsycl.conf beside the repositor
   NS_HOST, NS_PORT the OpenAI API and /api/chat (default 127.0.0.1, 8085; 0.0.0.0 = the network, no password)
   NS_CORS          web pages that may call the API from a browser, beyond the loopback ones, e.g.
                    \"http://studio:8095\" (comma-separated; * = any)
-  NS_CTX           tokens of context (default 65536)      NS_NAME   the model id clients see (glm-5.3-flash-uncensored)
+  NS_CTX           tokens of context per session (default 65536), or one a session: 262144,32768 (one long, one short)
+  NS_NAME          the model id clients see (glm-5.3-flash-uncensored)
   NS_EFFORT        default reasoning effort (low)        NS_NO_MTP=1   decode without the draft block
   NS_KV            the latent cache's form: f16 (default) or q8 (544 bytes a token and layer instead of 1,024)
   NS_PROMPT_CACHE_MIB   host memory for the prompt cache's checkpoints (default 4096; 0 = off)
+  NS_CACHE_DIR, NS_CACHE_DISK_GIB, NS_CACHE_TTL_HOURS   checkpoints pushed out of memory (and those in it at a stop)
+                   on disk (default ~/.cache/nextsycl/prompts, 32 GiB - 0 = none, 24 h unused before removal)
   NS_KEEP_REQUESTS ended requests the server keeps for ps and inspect (default 100)
   NS_PARALLEL      requests decoded together, each with a session of its own (default 2; 1 = one at a time)
   NS_MAX_TOKENS    the tokens a request without max_tokens may make (default: to the end of the context)
@@ -765,7 +768,12 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let mut pc = cache::PromptCache::new(cache);
     if let Some(dir) = opt("--cache-dir") {
         let g: f64 = opt("--cache-disk-gib").and_then(|v| v.parse().ok()).unwrap_or(32.0);
-        pc = pc.with_disk(std::path::PathBuf::from(dir), (g * (1u64 << 30) as f64) as usize)?;
+        let hours: f64 = opt("--cache-ttl-hours").and_then(|v| v.parse().ok()).unwrap_or(24.0);
+        // what a checkpoint must match to fit these sessions: the model file, the cache's form, the draft block
+        let size = std::fs::metadata(model).map_or(0, |m| m.len());
+        let fp = format!("{model} {size} kv={} mtp={} nsck1", if ns_engine::glm5next::kv_q8() { "q8" } else { "f16" }, mtp);
+        pc = pc.with_disk(std::path::PathBuf::from(dir), (g * (1u64 << 30) as f64) as usize, &fp,
+                          std::time::Duration::from_secs_f64(hours.max(0.0) * 3600.0))?;
     }
     let srv = std::sync::Arc::new(serve::Server::new(glm, tok, name, slot_ctx, effort, pc, cors, keep, default_max)?);
     srv.run(&addr, opt("--socket").map(std::path::PathBuf::from))

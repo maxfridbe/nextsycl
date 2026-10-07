@@ -189,6 +189,9 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
       prompt 280 s vs 273 alone
 - [x] The disk tier, measured: a 256K prompt's checkpoint pushed out by a 128K one, its follow-up mounted from the
       file - 4.5 s, the right answer
+- [x] The disk tier outlives the server: a subdirectory per fingerprint (the model file and size, the cache's form,
+      MTP), the tokens beside each file, a stop writing the checkpoints still in memory; unused for 24 h (or past
+      32 GiB, least recently used first) removed. A 12K checkpoint from the 64K mode mounted by the 256K mode
 - [ ] Batch: the draft block in batches; per-request energy (concurrent requests share the counters - each counts
       both)
 

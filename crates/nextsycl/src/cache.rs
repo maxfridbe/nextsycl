@@ -4,8 +4,11 @@
 //!
 //! With a disk tier (`--cache-dir`), a checkpoint pushed out of memory is written there instead of dropped (a 256K
 //! prompt's checkpoint is ~3.5 GiB: the memory budget holds one) and mounted from the file when it is the best
-//! prefix - ~1-3 s for 3.5 GiB from the NVMe against minutes to read the prompt again. The directory is emptied at
-//! start: a checkpoint only fits sessions of the process that made it (the model, the split, the cache's form).
+//! prefix - ~1-3 s for 3.5 GiB from the NVMe against minutes to read the prompt again. The files outlive the server
+//! (a stop writes the ones still in memory too): they sit in a subdirectory per fingerprint - the model file, the
+//! cache's form, the draft block - so a checkpoint is only mounted by a server whose sessions it fits (the context
+//! sizes may differ: one only needs to be as long). A file unused for the TTL (24 h) is removed, at start and at
+//! each write; past the size budget the least recently used go first.
 
 use std::path::PathBuf;
 
@@ -22,13 +25,51 @@ struct DiskEntry {
     path: PathBuf,
     bytes: usize,
     used: u64,
+    /// when it was last written or mounted (the file's modification time)
+    touched: std::time::SystemTime,
 }
 
 struct Disk {
     dir: PathBuf,
     budget: usize,
+    ttl: std::time::Duration,
     entries: Vec<DiskEntry>,
     next: u64,
+}
+
+/// 64-bit FNV-1a of a string, in hex (the fingerprint's directory name)
+fn fnv(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+fn sidecar(path: &std::path::Path) -> PathBuf {
+    path.with_extension("tok")
+}
+
+/// The tokens a checkpoint file is the state after ([count u64][u32 ...]), beside it
+fn write_tokens(path: &std::path::Path, tokens: &[u32]) -> std::io::Result<()> {
+    let mut b = Vec::with_capacity(8 + tokens.len() * 4);
+    b.extend_from_slice(&(tokens.len() as u64).to_le_bytes());
+    for t in tokens {
+        b.extend_from_slice(&t.to_le_bytes());
+    }
+    std::fs::write(sidecar(path), b)
+}
+
+fn read_tokens(path: &std::path::Path) -> Option<Vec<u32>> {
+    let b = std::fs::read(sidecar(path)).ok()?;
+    let n = u64::from_le_bytes(b.get(..8)?.try_into().ok()?) as usize;
+    let body = b.get(8..8 + n * 4)?;
+    Some(body.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+fn remove(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(sidecar(path));
 }
 
 /// Where a cached prefix is
@@ -51,15 +92,52 @@ impl PromptCache {
         PromptCache { entries: Vec::new(), budget, clock: 0, evictions: 0, disk: None }
     }
 
-    /// A disk tier of `budget` bytes in `dir` (emptied of earlier checkpoint files)
-    pub fn with_disk(mut self, dir: PathBuf, budget: usize) -> Result<PromptCache, String> {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        for f in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
-            if f.path().extension().is_some_and(|x| x == "nsck") {
-                let _ = std::fs::remove_file(f.path());
+    /// A disk tier of `budget` bytes under `root`, in the subdirectory of `fingerprint` (what a checkpoint must
+    /// match to fit this server's sessions): the files there from earlier runs taken back, those unused for `ttl`
+    /// (in every subdirectory) removed
+    pub fn with_disk(mut self, root: PathBuf, budget: usize, fingerprint: &str, ttl: std::time::Duration) -> Result<PromptCache, String> {
+        let now = std::time::SystemTime::now();
+        let stale = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).map_or(true, |t| now.duration_since(t).unwrap_or_default() > ttl);
+        std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+        // every fingerprint's stale files out (a model or a cache form no longer served leaves its files to this)
+        for d in std::fs::read_dir(&root).map_err(|e| e.to_string())?.flatten().filter(|d| d.path().is_dir()) {
+            for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
+                let p = f.path();
+                if p.extension().is_some_and(|x| x == "nsck") && stale(&p) {
+                    remove(&p);
+                }
             }
+            let _ = std::fs::remove_dir(d.path()); // only when empty
         }
-        self.disk = Some(Disk { dir, budget, entries: Vec::new(), next: 0 });
+        let dir = root.join(fnv(fingerprint));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let _ = std::fs::write(dir.join("fingerprint.txt"), format!("{fingerprint}\n"));
+        // the checkpoints of earlier runs with this fingerprint, oldest first (their use order)
+        let mut found: Vec<(std::time::SystemTime, DiskEntry, u64)> = Vec::new();
+        for f in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+            let p = f.path();
+            if p.extension().is_none_or(|x| x != "nsck") {
+                continue;
+            }
+            let (Some(tokens), Ok(meta)) = (read_tokens(&p), p.metadata()) else {
+                remove(&p); // half written
+                continue;
+            };
+            let n = p.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let t = meta.modified().unwrap_or(now);
+            found.push((t, DiskEntry { tokens, path: p, bytes: meta.len() as usize, used: 0, touched: t }, n));
+        }
+        found.sort_by_key(|f| f.0);
+        let next = found.iter().map(|f| f.2).max().unwrap_or(0);
+        let entries: Vec<DiskEntry> = found.into_iter().map(|(_, mut e, _)| {
+            self.clock += 1;
+            e.used = self.clock;
+            e
+        }).collect();
+        self.disk = Some(Disk { dir, budget, ttl, entries, next });
+        if let Some(d) = &mut self.disk {
+            d.prune(0);
+        }
         Ok(self)
     }
 
@@ -96,7 +174,7 @@ impl PromptCache {
         if let Some(d) = &mut self.disk {
             n += d.entries.len();
             for e in d.entries.drain(..) {
-                let _ = std::fs::remove_file(&e.path);
+                remove(&e.path);
             }
         }
         n
@@ -133,6 +211,10 @@ impl PromptCache {
             Hit::Disk(i) => {
                 let d = self.disk.as_mut().ok_or("no disk tier")?;
                 d.entries[i].used = self.clock;
+                d.entries[i].touched = std::time::SystemTime::now();
+                if let Ok(f) = std::fs::File::options().write(true).open(&d.entries[i].path) {
+                    let _ = f.set_modified(d.entries[i].touched);
+                }
                 let file = std::fs::File::open(&d.entries[i].path).map_err(|e| format!("{}: {e}", d.entries[i].path.display()))?;
                 let ck = Checkpoint::read_from(&mut std::io::BufReader::with_capacity(8 << 20, file)).map_err(|e| e.to_string())?;
                 Ok(f(&ck))
@@ -175,34 +257,57 @@ impl PromptCache {
         true
     }
 
-    /// An entry out of memory onto the disk tier (its own least recently used files removed to make room)
+    /// Every checkpoint still in memory onto the disk tier (a stop: the next server takes them back); how many
+    pub fn persist_all(&mut self) -> usize {
+        let v = std::mem::take(&mut self.entries);
+        v.into_iter().map(|e| self.spill(e)).filter(|w| *w).count()
+    }
+
+    /// An entry out of memory onto the disk tier (stale files and then the least recently used removed to make room)
     fn spill(&mut self, e: Entry) -> bool {
         let Some(d) = &mut self.disk else { return false };
         if e.ck.bytes > d.budget || d.entries.iter().any(|x| x.tokens == e.tokens) {
             return false;
         }
-        while d.entries.iter().map(|x| x.bytes).sum::<usize>() + e.ck.bytes > d.budget {
-            let Some((i, _)) = d.entries.iter().enumerate().min_by_key(|(_, x)| x.used) else { break };
-            let x = d.entries.swap_remove(i);
-            let _ = std::fs::remove_file(&x.path);
-        }
+        d.prune(e.ck.bytes);
         d.next += 1;
         let path = d.dir.join(format!("{}.nsck", d.next));
+        // the tokens' file last: a checkpoint without it is a half-written one
         let written = std::fs::File::create(&path).and_then(|f| {
             let mut w = std::io::BufWriter::with_capacity(8 << 20, f);
             e.ck.write_to(&mut w)?;
             std::io::Write::flush(&mut w)
-        });
+        }).and_then(|_| write_tokens(&path, &e.tokens));
         match written {
             Ok(()) => {
-                d.entries.push(DiskEntry { tokens: e.tokens, path, bytes: e.ck.bytes, used: e.used });
+                d.entries.push(DiskEntry { tokens: e.tokens, path, bytes: e.ck.bytes, used: e.used, touched: std::time::SystemTime::now() });
                 true
             }
             Err(err) => {
                 eprintln!("[prompt cache: writing {} failed: {err}]", path.display());
-                let _ = std::fs::remove_file(&path);
+                remove(&path);
                 false
             }
+        }
+    }
+}
+
+impl Disk {
+    /// Files unused for the TTL out, then the least recently used until `room` more bytes fit the budget
+    fn prune(&mut self, room: usize) {
+        let now = std::time::SystemTime::now();
+        let ttl = self.ttl;
+        self.entries.retain(|e| {
+            let keep = now.duration_since(e.touched).unwrap_or_default() <= ttl;
+            if !keep {
+                remove(&e.path);
+            }
+            keep
+        });
+        while self.entries.iter().map(|x| x.bytes).sum::<usize>() + room > self.budget {
+            let Some((i, _)) = self.entries.iter().enumerate().min_by_key(|(_, x)| x.used) else { break };
+            let x = self.entries.swap_remove(i);
+            remove(&x.path);
         }
     }
 }

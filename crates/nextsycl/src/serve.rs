@@ -358,6 +358,13 @@ impl Server {
         loop {
             if STOP.load(Ordering::SeqCst) && self.inflight.load(Ordering::SeqCst) == 0 {
                 eprintln!("[stopping: no request running]");
+                // the checkpoints in memory onto the disk tier, for the next server
+                if let Ok(mut c) = self.cache.lock() {
+                    let n = c.persist_all();
+                    if n > 0 {
+                        eprintln!("[prompt cache: {n} checkpoint(s) written to disk]");
+                    }
+                }
                 if let Some(p) = &socket {
                     let _ = std::fs::remove_file(p);
                 }

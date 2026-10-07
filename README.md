@@ -16,15 +16,19 @@ PCIe. It runs on one card or splits the layers over several.
 - **Long context, to 256K:** the DSA indexer past 2,048 tokens (each row attends to its top 512 pools of 4 tokens and
   its own unfinished pool), checked against llama.cpp; a context per session (`--ctx 262144,32768` / `NS_CTX`: one
   long session and a short one; default two of 64K). A 253K-token prompt reads in 271 s (933 tok/s) and decodes at
-  ~15 tok/s at that depth; a follow-up on it restores its checkpoint in seconds. The latent cache in fp16, or q8
-  with `NS_KV=q8` (544 bytes a token and layer instead of 1,024). Plan and measurements: `docs/256k-context.md`.
+  ~15 tok/s at that depth; a follow-up on it restores its checkpoint in seconds. The model is trained to 1M tokens
+  (no RoPE in its MLA); a passphrase is found at 10 / 50 / 90% of 32K-249K documents (`bench --needle`, 9 of 9). The
+  latent cache in fp16, or q8 with `NS_KV=q8` (544 bytes a token and layer instead of 1,024; the same needle
+  result). Plan and measurements: `docs/256k-context.md`.
 - **A prompt path on the XMX units:** prompts are read in chunks of 4,096 tokens, with the experts, the dense
   matrices and MLA's attention in fp16 through oneMKL's half GEMMs, and the experts that live in host memory copied
   on a second queue while the previous ones compute.
 - **A prompt cache:** checkpoints of the whole conversation state in host memory, at the end of a prompt's first
   turn, at the start of its last user turn, and at its end; those pushed out of memory go to disk
-  (`NS_CACHE_DIR`, default `~/.cache/nextsycl/prompts`, `NS_CACHE_DISK_GIB` 32) - a 256K prompt's checkpoint is
-  ~3.5 GiB, mounted again in seconds instead of re-reading the prompt for minutes.
+  (`NS_CACHE_DIR`, default `~/.cache/nextsycl/prompts`, `NS_CACHE_DISK_GIB` 32), and a stop writes the rest there -
+  a 256K prompt's checkpoint is ~3.5 GiB, mounted again in seconds instead of re-reading the prompt for minutes.
+  The files outlive the server (another context size of the same model and cache form takes them); one unused for
+  `NS_CACHE_TTL_HOURS` (24) is removed, and past the size budget the least recently used go first.
 - **An OpenAI-compatible server** with streaming and the thinking split out, run as a service: `nextsycl start`,
   `stop`, `status`, `ps`, `cache`, `chat`, `logs`, over a control socket.
 - **Energy and logprobs in every answer:** `usage.energy_wh` (and `energy_wh` on `/api/chat`'s last line) - the watt-hours
@@ -33,8 +37,9 @@ PCIe. It runs on one card or splits the layers over several.
 - **Several requests at once:** up to `NS_PARALLEL` (2) conversations decode together - one pass carries a token of
   each, the weights read once for all of them, each row exactly as its own pass would be (`nextsycl batch-check`);
   a single request decodes alone, with the draft block. More wait in order.
-  A long prompt is read in groups of chunks with the others' decode steps between them (a chat beside a 253K
-  prompt's read decodes at ~18 tok/s).
+  A long prompt is read in one pass that stops at a chunk's end when another request arrives; then in groups of
+  chunks with the others' decode steps between them (a chat sent during a 253K prompt's read is answered in ~10 s,
+  at ~18 tok/s).
 - **LogProbChain** (`logprob_chain: true`, experimental): each answer token's logprob also chained through the attention
   to the turn's own earlier tokens - an answer that only repeats its thinking counts only as sure as the thinking was
   (below).
@@ -118,7 +123,8 @@ Every API answer carries the same energy as `usage.energy_wh` (here 0.448 Wh).
 
 ## Speed
 
-GLM-5.3-Flash IQ2 (the ds4 file, 80 GB of experts) on an Arc Pro B70 and an Arc Pro B65, 7 October 2026:
+GLM-5.3-Flash IQ2 (the ds4 file, 80 GB of experts) on an Arc Pro B70 and an Arc Pro B65, 7 October 2026, through
+the server:
 
 | | |
 |---|---|
@@ -126,7 +132,12 @@ GLM-5.3-Flash IQ2 (the ds4 file, 80 GB of experts) on an Arc Pro B70 and an Arc 
 | prompt, 8K tokens | ~760 tokens/s |
 | prompt, 12K tokens | ~820 tokens/s |
 | prompt, 36-40K tokens | ~950-1,010 tokens/s |
-| decode, short context, MTP on | ~18.5-20 tokens/s (80-90% of drafts accepted) |
+| prompt, 128K tokens | ~1,000 tokens/s (126 s) |
+| prompt, 253K tokens | ~930 tokens/s (272 s) |
+| decode, short context, MTP on | ~18-21 tokens/s (80-90% of drafts accepted) |
+| decode at 128K / 253K of context | ~17 / ~15 tokens/s |
+| a follow-up on a 253K document | ~4.5 s (its checkpoint mounted, in memory or from disk) |
+| a chat sent while a 253K prompt is read | answered in ~10 s (the read stops for it at a chunk's end) |
 | power while decoding | ~175-185 W for both cards (~1.6-1.9 kJ for a 170-200-token answer) |
 | idle | ~9 W for both cards |
 | load | ~18 s |

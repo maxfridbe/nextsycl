@@ -107,7 +107,7 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
         args.extend(["--cors".into(), c]);
     }
     if cache_dir.is_some() {
-        args.extend(["--cache-dir".into(), "/cache".into(), "--cache-disk-gib".into(), disk_gib]);
+        args.extend(["--cache-dir".into(), "/cache".into(), "--cache-disk-gib".into(), disk_gib, "--cache-ttl-hours".into(), cfg.or("NS_CACHE_TTL_HOURS", "24")]);
     }
     args.extend(["--socket".into(), format!("{SOCKET_DIR_IN}/nextsycl.sock")]);
     let st = ce.cmd().args(&args).stdout(Stdio::null()).status().map_err(|e| e.to_string())?;
