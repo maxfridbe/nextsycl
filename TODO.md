@@ -175,8 +175,11 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
       one decode step a group gave a chat 0.23 tok/s. Measured: a chat sent 20 s after a 253K prompt answered in
       55 s (it waited one group, 19 s; then 2.9 tok/s), the long prompt 304 s vs 271 alone. Checkpoints at the stops
       as before
-- [ ] The chat's decode beside a prompt read: 2.9 tok/s, not the ~10 of a half share - suspect the big arena moving
-      between the expert store and the prompt at each switch (NS_LEND); take new requests within a group too
+- [x] The chat's decode beside a prompt read was 2.9 tok/s: a short prompt read after a long group reset the
+      decode share to its own second (now the round's reading in all). Now 17.9 tok/s beside a 253K read, the chat
+      done 35 s after it was sent (19 of them waiting for the group in progress). The big arena also stays with the
+      prompt while one is read (`hold_arena`: no lending back and forth at each switch)
+- [ ] A request arriving mid-group waits for the group (up to ~35 s alone): stop a pipelined feed between chunks
 - [ ] Batch: the draft block in batches; per-request energy (concurrent requests share the counters - each counts
       both)
 

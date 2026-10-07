@@ -604,7 +604,8 @@ impl Server {
                 } else {
                     self.read_some(&mut slots[a.slot], &a.job.ids, a.reading.as_mut().unwrap(), limit, &mut none)
                 };
-                read_after = Instant::now() + g0.elapsed();
+                // the round's reading in all (a short prompt read after a long group must not shorten the share)
+                read_after = read_after.max(Instant::now()) + g0.elapsed();
                 match r {
                     Ok(Some(logits)) => {
                         let rd = a.reading.take().unwrap();
@@ -629,6 +630,8 @@ impl Server {
                 }
                 continue;
             }
+            // the big arena stays with the prompts while one is being read
+            self.glm.hold_arena(active.iter().any(|a| a.reading.is_some()));
             // the ones still reading wait out this round's steps
             let mut readers: Vec<Active> = Vec::new();
             let mut i = 0;

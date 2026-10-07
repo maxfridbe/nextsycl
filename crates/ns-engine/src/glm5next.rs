@@ -303,6 +303,8 @@ pub struct Part {
     /// Q8_1 of up to MMVQ_COLS rows of MAX_COLS
     q8: DevBuf,
     experts: Mutex<Store>,
+    /// the big arena kept (not lent to the experts) while a prompt is being read in groups between decode steps
+    hold: std::sync::atomic::AtomicBool,
     /// the MTP block's eh_proj as its [embedding | hidden] halves, [n_embd, n_embd] each (on the part holding it)
     eh: Option<[Mat; 2]>,
     pub expert_slots: usize,
@@ -654,7 +656,7 @@ impl Part {
         store.lend = lend;
         store.lent = lend > 0;
         let arena = Arena::on(if lend > 0 { small.view(0, small.len)? } else { big.view(0, big.len)? });
-        Ok(Part { ops, arena, big, small, biases: Mutex::new(HashMap::new()), layers, mats, vecs, scratch, x16, q8, experts: Mutex::new(store), eh, expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes })
+        Ok(Part { ops, arena, big, small, biases: Mutex::new(HashMap::new()), layers, mats, vecs, scratch, x16, q8, experts: Mutex::new(store), hold: std::sync::atomic::AtomicBool::new(false), eh, expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes })
     }
 
     /// The arena a pass of `t` tokens needs: the small one, or the big one - its memory then out of the expert store
@@ -691,7 +693,7 @@ impl Part {
             self.ops.gpu.sync()?;
             c.lent = false;
             self.arena.set(self.big.view(0, self.big.len)?);
-        } else if need <= SMALL_ARENA && !c.lent {
+        } else if need <= SMALL_ARENA && !c.lent && !self.hold.load(std::sync::atomic::Ordering::Relaxed) {
             // the big arena's last pass is queued before any copy into these slots (each waits for a mark)
             c.lent = true;
             self.arena.set(self.small.view(0, self.small.len)?);
@@ -1911,6 +1913,15 @@ impl<'g> Glm<'g> {
         let out = p.mm(l, Role::MlaOut, &oh, t)?;
         self.lap(p, "MLA: output projection", t_out);
         Ok(out)
+    }
+
+    /// Keeps each GPU's big arena out of the expert store (`on`) while a prompt is read in groups between other
+    /// requests' decode steps: lent and reclaimed at every switch, its ~380 expert slots were copied out and refilled
+    /// each time (a chat beside a 256K prompt decoded at 2.9 tok/s)
+    pub fn hold_arena(&self, on: bool) {
+        for p in &self.parts {
+            p.hold.store(on, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Starts (or stops) capturing attention: each one-token pass from now adds, per MLA layer, its heads' mean
