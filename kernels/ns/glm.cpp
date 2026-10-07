@@ -937,10 +937,13 @@ int ns_idx_score(ns_gpu* g, const float* S, const float* w, float* score, int64_
 // K-th value broken by position). A radix select over the float's order-preserving key, 8 bits at a time, then one compaction.
 int ns_topk(ns_gpu* g, const float* score, int32_t* sel, int64_t T, int64_t n, int64_t ld, int64_t K) {
     NS_TRY
-    constexpr int WG = 256;
+    // a work-group a row; the histogram in NH copies (scores of one magnitude share a top digit: one copy took every
+    // add of a row on two or three counters - 330 us a decode row at 128K); the selection written in one pass, each
+    // work-item its own run of positions (one scan each for the ties and the places, not four a tile of 256)
+    constexpr int WG = 1024, NH = 32;
     g->q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> hist(sycl::range<1>(256), h);
-        sycl::local_accessor<uint32_t, 1> st(sycl::range<1>(4), h);   // prefix, mask, need, ties taken
+        sycl::local_accessor<uint32_t, 1> hist(sycl::range<1>(NH * 256), h);
+        sycl::local_accessor<uint32_t, 1> st(sycl::range<1>(4), h);   // prefix, mask, need
         h.parallel_for(sycl::nd_range<1>(T * WG, WG), [=](sycl::nd_item<1> it) {
             const int64_t r = it.get_group(0);
             const int lid = it.get_local_id(0);
@@ -949,18 +952,25 @@ int ns_topk(ns_gpu* g, const float* score, int32_t* sel, int64_t T, int64_t n, i
                 uint32_t u = sycl::bit_cast<uint32_t>(f);
                 return (u & 0x80000000u) ? ~u : (u | 0x80000000u);   // larger float -> larger key
             };
-            if (lid == 0) { st[0] = 0; st[1] = 0; st[2] = (uint32_t) K; st[3] = 0; }
+            if (lid == 0) { st[0] = 0; st[1] = 0; st[2] = (uint32_t) K; }
+            uint32_t* mine = &hist[(lid % NH) * 256];
             for (int shift = 24; shift >= 0; shift -= 8) {
-                for (int b = lid; b < 256; b += WG) hist[b] = 0;
+                for (int b = lid; b < NH * 256; b += WG) hist[b] = 0;
                 sycl::group_barrier(it.get_group());
                 const uint32_t prefix = st[0], mask = st[1];
                 for (int64_t j = lid; j < n; j += WG) {
                     const uint32_t k = key(row[j]);
                     if ((k & mask) == prefix) {
                         sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
-                                         sycl::access::address_space::local_space> a(hist[(k >> shift) & 255]);
+                                         sycl::access::address_space::local_space> a(mine[(k >> shift) & 255]);
                         a.fetch_add(1u);
                     }
+                }
+                sycl::group_barrier(it.get_group());
+                if (lid < 256) {   // the copies summed into the first (each column read and written by one item)
+                    uint32_t c = 0;
+                    for (int m = 0; m < NH; ++m) c += hist[m * 256 + lid];
+                    hist[lid] = c;
                 }
                 sycl::group_barrier(it.get_group());
                 if (lid == 0) {
@@ -977,21 +987,27 @@ int ns_topk(ns_gpu* g, const float* score, int32_t* sel, int64_t T, int64_t n, i
                 }
                 sycl::group_barrier(it.get_group());
             }
-            // st[0] is the K-th key; every key above it goes, then the first st[2] equal ones by position. A prefix
-            // scan per tile places them in ascending position order: the same selection, in the same order, every
-            // run (atomics would order it by timing, and the attention's sums with it)
+            // st[0] is the K-th key; every key above it goes, then the first st[2] equal ones by position - in
+            // ascending position order, the same every run (atomics would order it by timing, and the attention's
+            // sums with it)
             const uint32_t kth = st[0], ties = st[2];
-            uint32_t out = 0, eq_seen = 0;
-            for (int64_t j0 = 0; j0 < n; j0 += WG) {
-                const int64_t j = j0 + lid;
-                const uint32_t k = j < n ? key(row[j]) : 0u;
-                const uint32_t eq = j < n && k == kth ? 1u : 0u;
-                const uint32_t eq_before = sycl::exclusive_scan_over_group(it.get_group(), eq, sycl::plus<uint32_t>()) + eq_seen;
-                const uint32_t take = (j < n && k > kth) || (eq && eq_before < ties) ? 1u : 0u;
-                const uint32_t at = sycl::exclusive_scan_over_group(it.get_group(), take, sycl::plus<uint32_t>()) + out;
-                if (take) sel[r * K + at] = (int32_t) j;
-                out += sycl::reduce_over_group(it.get_group(), take, sycl::plus<uint32_t>());
-                eq_seen += sycl::reduce_over_group(it.get_group(), eq, sycl::plus<uint32_t>());
+            const int64_t seg = (n + WG - 1) / WG, j0 = sycl::min<int64_t>(n, lid * seg), j1 = sycl::min<int64_t>(n, j0 + seg);
+            uint32_t gt = 0, eq = 0;
+            for (int64_t j = j0; j < j1; ++j) {
+                const uint32_t k = key(row[j]);
+                gt += k > kth;
+                eq += k == kth;
+            }
+            const uint32_t eq_before = sycl::exclusive_scan_over_group(it.get_group(), eq, sycl::plus<uint32_t>());
+            const uint32_t eq_take = eq_before >= ties ? 0u : sycl::min(eq, ties - eq_before);
+            uint32_t at = sycl::exclusive_scan_over_group(it.get_group(), gt + eq_take, sycl::plus<uint32_t>());
+            uint32_t eq_left = eq_take;
+            for (int64_t j = j0; j < j1; ++j) {
+                const uint32_t k = key(row[j]);
+                if (k > kth || (k == kth && eq_left > 0)) {
+                    if (k == kth) --eq_left;
+                    sel[r * K + at++] = (int32_t) j;
+                }
             }
         });
     });
@@ -1048,6 +1064,103 @@ int ns_softmax_masked(ns_gpu* g, float* S, int64_t R, int64_t H, int64_t NC, con
 // work-group takes HG heads of a row: each cell's latent is read once for all of them (prompt chunks: HG = 4; one
 // row - decode - keeps HG = 1 for the parallelism). The per-head arithmetic is the same either way.
 }  // extern "C"
+
+// Decode widths (a few rows): a sub-group of 16 a cell at a time, each lane 32 of the latent's 512 - the score a
+// sub-group reduction, the weighted latents summed per sub-group over every 16th cell, then across the 16 through
+// local memory. The work-group-wide walk over the cells (each step a dependent load of 2 halves a work-item) took
+// 1 ms a layer at 128K. A row's arithmetic does not depend on T: verify rows equal one-token passes.
+template <int L>
+static void mla_dec(sycl::queue& q, const float* qa, const sycl::half* c, float* u, int64_t T, int64_t H, int64_t pos0, float scale,
+                    const int32_t* sel, const int32_t* sel_cnt, int64_t K) {
+    constexpr int SG = 16, NSG = 16, WG = SG * NSG, MAXN = 2560, DL = L / SG, V = DL / 8, U = 4;   // U cells a step
+    using h8 = sycl::vec<sycl::half, 8>;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sc(sycl::range<1>(MAXN), h), part(sycl::range<1>(NSG * L), h), red(sycl::range<1>(2 * NSG), h);
+        h.parallel_for(sycl::nd_range<1>(T * H * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const auto sg = it.get_sub_group();
+            const int64_t t = it.get_group(0) / H, hd = it.get_group(0) % H;
+            const int lid = it.get_local_id(0), lane = sg.get_local_id()[0], sgi = lid / SG;
+            const int64_t p = pos0 + t;
+            const int32_t ns = sel_cnt ? sel_cnt[t] : -1;
+            const int64_t tail0 = 4 * ((p + 1) / 4);
+            const int64_t n = ns < 0 ? p + 1 : 4 * (int64_t) ns + (p + 1 - tail0);
+            auto cell = [&](int64_t i) -> int64_t {
+                if (ns < 0) return i;
+                if (i < 4 * (int64_t) ns) return 4 * (int64_t) sel[t * K + i / 4] + i % 4;
+                return tail0 + (i - 4 * (int64_t) ns);
+            };
+            auto load = [&](int64_t i, float (&x)[DL]) {
+                const h8* cs = reinterpret_cast<const h8*>(c + cell(i) * L + lane * DL);
+#pragma unroll
+                for (int v = 0; v < V; ++v) {
+                    const h8 w = cs[v];
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) x[v * 8 + e] = (float) w[e];
+                }
+            };
+            const float* qrow = qa + (t * H + hd) * L + lane * DL;
+            float qv[DL];
+#pragma unroll
+            for (int f = 0; f < DL; ++f) qv[f] = qrow[f];
+            // the sub-group's cells: sgi, sgi + NSG, ... - U of them a step (their loads and reductions overlap)
+            float mx = -INFINITY;
+            for (int64_t i0 = sgi; i0 < n; i0 += NSG * U) {
+                float d[U];
+#pragma unroll
+                for (int k = 0; k < U; ++k) {
+                    d[k] = 0.f;
+                    const int64_t i = i0 + k * NSG;
+                    if (i < n) {
+                        float x[DL];
+                        load(i, x);
+#pragma unroll
+                        for (int f = 0; f < DL; ++f) d[k] += qv[f] * x[f];
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < U; ++k) d[k] = sycl::reduce_over_group(sg, d[k], sycl::plus<float>()) * scale;
+#pragma unroll
+                for (int k = 0; k < U; ++k) {
+                    const int64_t i = i0 + k * NSG;
+                    if (i < n) {
+                        if (lane == 0) sc[i] = d[k];
+                        mx = sycl::fmax(mx, d[k]);
+                    }
+                }
+            }
+            if (lane == 0) red[sgi] = mx;
+            sycl::group_barrier(it.get_group());
+            mx = -INFINITY;
+            for (int k = 0; k < NSG; ++k) mx = sycl::fmax(mx, red[k]);
+            float acc[DL] = {}, sk = 0.f;
+            for (int64_t i0 = sgi; i0 < n; i0 += NSG * U) {
+#pragma unroll
+                for (int k = 0; k < U; ++k) {
+                    const int64_t i = i0 + k * NSG;
+                    if (i < n) {
+                        const float w = sycl::exp(sc[i] - mx);
+                        sk += w;
+                        float x[DL];
+                        load(i, x);
+#pragma unroll
+                        for (int f = 0; f < DL; ++f) acc[f] += w * x[f];
+                    }
+                }
+            }
+#pragma unroll
+            for (int f = 0; f < DL; ++f) part[sgi * L + lane * DL + f] = acc[f];
+            if (lane == 0) red[NSG + sgi] = sk;
+            sycl::group_barrier(it.get_group());
+            float sum = 0.f;
+            for (int k = 0; k < NSG; ++k) sum += red[NSG + k];
+            for (int64_t r = lid; r < L; r += WG) {
+                float v = 0.f;
+                for (int k = 0; k < NSG; ++k) v += part[k * L + r];
+                u[(t * H + hd) * L + r] = v / sum;
+            }
+        });
+    });
+}
 
 template <int HG>
 static void mla_sel(sycl::queue& q, const float* qa, const sycl::half* c, float* u, int64_t T, int64_t H, int64_t L, int64_t pos0, float scale,
@@ -1124,6 +1237,7 @@ int ns_mla_attend_sel(ns_gpu* g, const float* qa, const uint16_t* c16, float* u,
     static const bool hg4 = getenv("NS_MLA_HG") && getenv("NS_MLA_HG")[0] == '4';
     const sycl::half* c = (const sycl::half*) c16;   // the cache's latents, fp16
     if (hg4 && T > 8 && H % 4 == 0) mla_sel<4>(g->q, qa, c, u, T, H, L, pos0, scale, sel, sel_cnt, K);
+    else if (T <= 8 && L == 512 && !(getenv("NS_MLA_DEC") && getenv("NS_MLA_DEC")[0] == '0')) mla_dec<512>(g->q, qa, c, u, T, H, pos0, scale, sel, sel_cnt, K);
     else mla_sel<1>(g->q, qa, c, u, T, H, L, pos0, scale, sel, sel_cnt, K);
     return 0;
     NS_CATCH

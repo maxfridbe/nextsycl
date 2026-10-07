@@ -1570,14 +1570,19 @@ impl<'g> Glm<'g> {
             let mut j0 = 0;
             while j0 < n {
                 let nc = nc_max.min(n - j0);
+                let s0 = self.mark(p);
                 o.gemm_at(tr * hh, nc, d, (&iq, r0 * hh * d, d), (&idx.pooled, j0 * d), (&sbuf, 0, nc), false)?;
+                let s1 = self.lap(p, "MLA idx: scores (gemm)", s0);
                 o.idx_score(&sbuf, &w.view(r0 * hh * 4, tr * hh * 4)?, &sc, tr, hh, j0, nc, n, pos0 + r0)?;
+                self.lap(p, "MLA idx: heads' sum", s1);
                 j0 += nc;
             }
             if tr == t {
                 tap(&format!("indexer_score-{l}"), &sc)?;
             }
+            let s2 = self.mark(p);
             o.topk(&sc, &sel.view(r0 * kp * 4, tr * kp * 4)?, tr, n, n, kp)?;
+            self.lap(p, "MLA idx: top-k", s2);
         }
         let cnt: Vec<i32> = (0..t).map(|r| if (pos0 + r + 1) / 4 > kp { kp as i32 } else { -1 }).collect();
         let cb = p.arena.bytes(t * 4)?;

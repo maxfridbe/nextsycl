@@ -120,6 +120,24 @@ of IQ2_XXS instead could win twice.
 - [ ] Fused gate/up: no gain from more column tiles a sub-group (NB 2: slower, NB 4: spills) or limits past 64 (128:
       the same 7.5 s, 192-256: 8.1)
 
+## 256K context (plan: docs/256k-context.md, 2026-10-07)
+
+- [ ] 1. Per-slot context (`--ctx 262144,32768`); 128K and 256K measured in generate (TTFT, decode at depth, VRAM)
+  - [x] 128K in generate: the prompt at 998 tok/s (126 s), the answer right, stages ~3.9 s a chunk to the end, 0
+        experts on the file. Decode at that depth was 13.0 tok/s (21-22 short): per layer and pass the indexer's
+        top-k 330 us a row (one histogram's counters took every add; the selection written with four collectives
+        a tile) and MLA's attention 1,047 us (a work-group walking 2,051 cells a load at a time). Now 32 histogram
+        copies and a one-pass selection (45 us, the same selection), and a decode-width attention kernel (a
+        sub-group a cell, 16-byte loads, 4 cells a step: 444 us): 17.1 tok/s at 128K, exact (spec-check,
+        batch-check, the same text)
+  - [ ] Decode at depth, what is left a layer: the indexer's projections (~300 us), attention 444 us (each of the
+        64 heads' work-groups reads the same 2 MB of cells)
+- [ ] 2. A needle check at 32K-256K; logits across chunk sizes; an int32 audit of the attention and indexer kernels
+- [ ] 3. Smaller cache entries: NS_KV=f16|q8|q4 (latents q8_0 / 4-bit, pooled keys fp16) - quality against fp16
+- [ ] 4. The indexer fused (XMX scores, the heads' sum and the top-k in one kernel; no T x H x pools scores)
+- [ ] 5. Long prompts' checkpoints on the NVMe (~3.5 GiB at 256K)
+- [ ] 6. Serve it: NS_CTX per slot, the HTTP limit, the tokenizer on ~1 MB, the client's context setting
+
 ## Decode, what is left (2026-10-07: 18-19 tok/s, MTP on)
 
 Per token: routed experts 27.7 ms (the kernel ~0.3 ms a layer-pass of the ~1.2: the rest waits on PCIe copies of the
