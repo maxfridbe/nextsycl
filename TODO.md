@@ -74,11 +74,19 @@ of IQ2_XXS instead could win twice.
       global scratch is 2-3x slower; a B fragment filled in registers works - lane n holds column n's 16 k in order
       (probed by loading a known matrix; the coordinate form of joint_matrix_apply faulted the GPU)
 - [x] fused.cpp: each lane decodes its 16 IQ2_XXS weights into B (two 8-value groups), 32 tokens a sub-group -
-      exact against expand + oneMKL; alone on the B70 2x faster at 64 tokens, even at 128-256; in a real 12K
-      prompt 223 us a call vs 215 for expand + GEMM (larger experts): no gain yet, NS_FUSED_MAX=64 turns it on
-- [ ] Make the decode cheaper: decode 32 k a lane per step (two B tiles a decode), the grid table in local memory,
-      more token rows per decode (large-register mode removed the spill at 128 rows but was not faster), 2D block
-      loads for A; then the down projection (Q2_K) the same way
+      exact against expand + oneMKL; in a real 12K prompt 223 us a call vs 215 for expand + GEMM: no gain
+- [x] Cheaper decode: 32 k a lane a step (the group's 8 bytes read once - grid indices, scale, signs - for two B
+      tiles), 8 row tiles a sub-group above 64 tokens (large register file). Alone (4096 x 4096, 64 experts
+      rotated so the weights come cold): B70 117 us vs 202 for expand + oneMKL at 64 tokens, 135 / 214 at 128; B65
+      150 / 344, 224 / 358. Not helping: the grid table in local memory; each sub-group staging B through its own
+      local-memory tile and a block load (164-196 us vs 144-146 for the register fill); -fp-model=precise costs
+      nothing here
+- [x] In the engine (12K, NS_PROFILE=gpu): 172 us a call for the experts of <= 64 tokens vs ~200 for the
+      engine's own expand (109 us, faster than the bench's) + oneMKL; above that oneMKL's larger tiles win (with no
+      limit gate/up took 9.5 s vs 7.9). NS_FUSED_MAX now defaults to 64: gate/up 7.3 s vs 7.9 of GPU time over
+      both cards, the same text; end to end within the run-to-run noise (504-541 tok/s either way)
+- [ ] The down projection (Q2_K, 0.9 s expand + 1.9 s GEMM) the same way for the small experts; 2D block loads for
+      A; the B fill (joint_matrix_apply, ~55 us of the 128-token call with plain fp16 weights) is the ceiling's gap
 
 ## Decode, what is left (2026-10-07: 18-19 tok/s, MTP on)
 

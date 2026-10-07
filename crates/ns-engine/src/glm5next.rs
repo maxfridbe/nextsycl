@@ -46,11 +46,16 @@ fn prefetch_limit() -> usize {
     *V.get_or_init(|| std::env::var("NS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(8))
 }
 
-/// The prompt path's experts with at most this many tokens take the fused gate | up kernel (NS_FUSED_MAX; default 0 =
-/// never: in a 12K prompt it took 223 us a call against expand + GEMM's 215 for larger experts - not yet a win)
+/// The prompt path's experts with at most this many tokens take the fused gate | up kernel (NS_FUSED_MAX, default 64,
+/// 0 = never): in a 12K prompt 172 us a call against ~200 for expand + GEMM; above it oneMKL's larger tiles win
 fn fused_max() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("NS_FUSED_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    *V.get_or_init(|| std::env::var("NS_FUSED_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
+}
+
+/// The rows the fused kernel computes for n tokens: to 32, above 64 to 64 (its wide form)
+fn fused_rows(n: usize) -> usize {
+    n.next_multiple_of(if n > 64 { 64 } else { 32 })
 }
 
 /// Whether an arriving expert's gate | up runs before its down is in (NS_SPLIT_COPY=0: no)
@@ -2257,8 +2262,8 @@ impl<'g> Glm<'g> {
                 tb.write_async(0, &gtok.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 let wtb = p.arena.f32(total)?;
                 wtb.write_async(0, &gw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-                // rows for the fused kernel's padding to 32 (the rows past an expert's tokens are read, never used)
-                let nmax = by.values().map(|l| l.len()).max().unwrap_or(1).next_multiple_of(32);
+                // rows for the fused kernel's padding (the rows past an expert's tokens are read, never used)
+                let nmax = fused_rows(by.values().map(|l| l.len()).max().unwrap_or(1));
                 let xh = p.arena.bytes(nmax * d * 2)?;
                 let w16 = p.arena.bytes(2 * f * d * 2)?; // gate | up of one expert; down reuses the first half
                 let wu = w16.view(f * d * 2, f * d * 2)?;
@@ -2305,7 +2310,7 @@ impl<'g> Glm<'g> {
                     let m1 = self.lap(p, "MoE f16: gather", m0);
                     let m3 = if n <= fused_max() && parts.gate.2.code() == 16 && parts.up.2.code() == 16 && parts.up.0 == parts.gate.0 + parts.gate.1 {
                         // few tokens: gate | up decoded inside the matrix-engine GEMM, no fp16 copy (fused.cpp)
-                        o.moe_fused_gu(&xh, buf, parts.gate.0, &gu, n.next_multiple_of(32), 2 * f, d)?;
+                        o.moe_fused_gu(&xh, buf, parts.gate.0, &gu, fused_rows(n), 2 * f, d)?;
                         self.lap(p, "MoE f16: fused gate/up", m1)
                     } else {
                         o.dequant_f16(parts.gate.2.code(), buf, parts.gate.0, parts.gate.1, f * d, &w16)?;
