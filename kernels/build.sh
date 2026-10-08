@@ -43,6 +43,11 @@ if [ "$fail" = 1 ]; then
   [ -n "${LINK_ANYWAY:-}" ] || exit 1
 fi
 echo "==> linking libnextsycl.so"
+# objects of sources that are gone (moved or removed) would link twice or stale: only the current sources' objects
+ALL=$(ls $S/src/kernels/*.dp.cpp $S/src/prefill/*.dp.cpp ns/*.cpp engines/*/*.cpp 2>/dev/null)
+for o in "$OBJ"/*.o; do
+  printf '%s\n' $ALL | tr / _ | sed 's/$/.o/' | grep -qx "$(basename "$o")" || rm -f "$o" "$o.log"
+done
 # linked beside it, then renamed over it: a running server keeps the library it mapped (writing over a mapped
 # library in place would change the code under it)
 icpx "${LINK[@]}" "$OBJ"/*.o -o "$OUT/.libnextsycl.so.new" && mv -f "$OUT/.libnextsycl.so.new" "$OUT/libnextsycl.so"

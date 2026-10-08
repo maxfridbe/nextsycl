@@ -4,7 +4,9 @@
 //! `kind()` is its registry entry. Its own kernels are in `kernels/engines/glm5next/`.
 
 pub mod engine;
+pub mod ffi;
 pub mod model;
+pub mod ops;
 pub mod tools;
 
 use std::any::Any;

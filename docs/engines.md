@@ -10,14 +10,14 @@ pipeline), and a second model gets the same freedom.
 
 ```
 crates/ns-sys       the C ABI of libnextsycl (the kernel library)            shared
-crates/ns-core      GPUs, device / host buffers, an arena, the shared ops     shared
+crates/ns-core      GPUs, device / host buffers, an arena, copies             shared
 crates/ns-gguf      the file format                                          shared
 crates/ns-tok       the tokenizer, the chat templates                        shared
 crates/ns-runtime   the contract: Engine, Session / Decoder / Checkpoint,     shared
                     Sampler, Tap, GpuInfo, LoadOptions, EngineKind
 engines/<arch>      ONE ENGINE A MODEL: its model description (geometry, tensors by role, checked), its engine
                     (forward passes, memory plan, decode loop, drafts), its tools (`info`, `kernels`)
-kernels/ns          the shared kernels: queues and copies, norms, GEMMs, the quantized decode products
+kernels/ns          the shared part: GPUs, memory, queues, copies, tickets and timers
 kernels/engines/<arch>   that engine's own kernels (in the same library; its own symbols)
 kernels/strata      the imported Strata kernels (MIT), used by any engine
 crates/nextsycl     the program: the server, the CLI, bench - only `dyn Engine`, picked by the file

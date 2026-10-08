@@ -472,7 +472,7 @@ impl<'g> Qwen<'g> {
         check_geometry(&m)?;
         let g = &m.g;
         let nl = g.n_layer;
-        let lib = ns_core::api()?;
+        let lib = ffi::api()?;
         for l in 0..nl {
             let (gu, d) = (m.t(l, Role::ExpGate).ty.code(), m.t(l, Role::ExpDown).ty.code());
             // SAFETY: plain values.

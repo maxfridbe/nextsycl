@@ -88,12 +88,13 @@ pub fn info(f: &Gguf) -> Result<String, String> {
 /// `nextsycl kernels`: each stored weight type of the file through the decode kernels against the exact path (expand
 /// to float32, multiply), on a real matrix of that type; and the decode kernel's rate.
 pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
-    use ns_core::{DevBuf, Ops};
+    use crate::ops::Ops;
+    use ns_core::DevBuf;
     let e = |x: ns_core::Error| x.0;
     let f = Gguf::open(model).map_err(|e| e.0)?;
     let m = Model::open(&f).map_err(|e| e.0)?;
     let g = ns_core::Gpu::open(gpu).map_err(e)?;
-    let o = Ops { gpu: g.clone() };
+    let o = Ops::new(g.clone()).map_err(e)?;
     println!("gpu: {}", g.name);
     // one matrix per (type, role kind): routed experts' expert 0, else the whole matrix
     let mut picks: Vec<(String, ns_gguf::GType, usize, usize, Vec<u8>)> = Vec::new();

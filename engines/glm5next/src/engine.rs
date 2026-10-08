@@ -16,7 +16,9 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ns_core::{Arena, DevBuf, Error, Gpu, HostBuf, Ops, Result};
+use ns_core::{Arena, DevBuf, Error, Gpu, HostBuf, Result};
+
+use crate::ops::Ops;
 use ns_gguf::{GType, Gguf};
 use crate::model::{Model, Role, Scheme};
 
@@ -692,7 +694,7 @@ impl Part {
     #[allow(clippy::too_many_arguments)]
     fn load(m: &Model, gpu: &Arc<Gpu>, layers: Range<u64>, extra: Range<u64>, last: bool, expert_bytes: Option<usize>, mirror_bytes: usize,
             kv_reserve: usize, log: &mut dyn FnMut(String)) -> Result<Part> {
-        let ops = Ops { gpu: gpu.clone() };
+        let ops = Ops::new(gpu.clone())?;
         let scratch = DevBuf::f32(gpu, SCRATCH)?;
         let x16 = if f16_min() > 0 && dense_f16() && prefill_chunk() >= f16_min() {
             Some(DevBuf::new(gpu, prefill_chunk() * X16_COLS * 2)?)
@@ -1383,7 +1385,7 @@ impl<'g> Glm<'g> {
         let Some(pr) = &self.prof else { return };
         let mut m = pr.lock().unwrap();
         for (name, gpu, a, b) in v {
-            let dt = Ops { gpu }.elapsed(a, b).unwrap_or(0.0);
+            let dt = Ops::new(gpu).and_then(|o| o.elapsed(a, b)).unwrap_or(0.0);
             let x = m.entry(name).or_insert((0.0, 0));
             x.0 += dt;
             x.1 += 1;
