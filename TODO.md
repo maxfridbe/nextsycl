@@ -93,8 +93,14 @@ of IQ2_XXS instead could win twice.
       fill first is removed by the compiler (3 us: no work). With joint_matrix a register-filled B costs ~30-45 us
       over a block load whatever the form, and B staged through local memory was 2-3x slower: fused decoding cannot
       beat expand + oneMKL for the large experts this way
-- [ ] Fused decoding in ESIMD (xmx::dpas with B decoded straight into its register layout, no fill): the large
-      experts' gate/up on the B65 at 36K is ~3.9 s of expansion + ~4.0 of GEMM - up to ~11% of its stage
+- [x] Fused decoding in ESIMD (reference/esimd-fused.cpp: xmx::dpas, B decoded with vector selects straight into its
+      VNNI layout, A by 2D block loads, the weight words a step ahead): exact, but slower - B70, 64 / 128 / 256
+      tokens: best 181 / 278 / 402 us vs expand + oneMKL 318 / 244 / 242 and joint_matrix's fused 110 / 135 / 200.
+      Few row tiles a thread: the decode dominates (each thread decodes its B tile for one dpas - RM=1 scales with
+      the tokens: 1,372 us at 256); many: too few threads to hide the chain (gathered words -> gathered grid ->
+      decode -> dpas); the weights' 16 rows 1 KB apart are a scattered gather a step. Untried: the grid in local
+      memory, the words as one 8-byte gather, a work-group decoding a tile once into local memory for several
+      threads' dpas
 - [x] The expansion itself: alone (reference/expand.cpp, 2048 x 4096, cold) IQ2_XXS took 67 us on a B70 and 100
       on a B65 a work-item 8 values of one block; two blocks a work-item (their grid loads overlap) 40 / 58 us,
       exact; bigger work-groups or 4 blocks no better; Q2_K (36-37 us) already at its bound. In the engine the gain
