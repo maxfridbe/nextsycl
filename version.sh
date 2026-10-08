@@ -8,6 +8,8 @@ cd "$(dirname "$0")"
 git rev-parse --git-dir >/dev/null 2>&1 || { echo dev; exit 0; }
 day() { TZ=UTC git log "$@" --format=%cd --date=format-local:%y.%m%d; }
 d=$(day -1)
-n=$(day --first-parent | awk -v d="$d" '$0 == d { n++; next } { exit } END { print n + 0 }')
+# awk reads to the end: an early `exit` closed the pipe on git, whose SIGPIPE failed the script under pipefail (the
+# CI's Version step, with the whole history checked out)
+n=$(day --first-parent | awk -v d="$d" 'stop { next } $0 == d { n++; next } { stop = 1 } END { print n + 0 }')
 dirty=; git diff --quiet HEAD -- 2>/dev/null || dirty=-dirty
 printf '%s.%03d%s\n' "$d" "$n" "$dirty"
