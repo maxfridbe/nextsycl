@@ -63,6 +63,8 @@ pub enum GType {
     TQ1_0,
     TQ2_0,
     MXFP4,
+    /// GSQ-RCO's 2-bit type (Qwen3.8-Flash-Next's files): 64 values, an f16 scale and 2-bit codes
+    Q2_0,
 }
 
 impl GType {
@@ -101,6 +103,7 @@ impl GType {
             34 => TQ1_0,
             35 => TQ2_0,
             39 => MXFP4,
+            42 => Q2_0,
             _ => return None,
         })
     }
@@ -141,6 +144,7 @@ impl GType {
             TQ1_0 => 34,
             TQ2_0 => 35,
             MXFP4 => 39,
+            Q2_0 => 42,
         }
     }
 
@@ -160,6 +164,7 @@ impl GType {
             Q8_1 => (32, 36),
             IQ4NL => (32, 18),
             MXFP4 => (32, 17),
+            Q2_0 => (64, 18),
             Q2K => (256, 84),
             Q3K => (256, 110),
             Q4K => (256, 144),
@@ -226,6 +231,7 @@ impl GType {
             TQ1_0 => "TQ1_0",
             TQ2_0 => "TQ2_0",
             MXFP4 => "MXFP4",
+            Q2_0 => "Q2_0",
         }
     }
 }

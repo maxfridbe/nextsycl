@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 # shared crates, the contract (ns-runtime), one engine a model architecture (engines/), the program
-members = ["crates/ns-sys", "crates/ns-core", "crates/ns-gguf", "crates/ns-tok", "crates/ns-runtime", "engines/glm5next", "crates/nextsycl"]
+members = ["crates/ns-sys", "crates/ns-core", "crates/ns-gguf", "crates/ns-tok", "crates/ns-runtime", "engines/glm5next", "engines/qwen4exp", "crates/nextsycl"]
 
 [workspace.package]
 version = "0.0.0"  # the release version is yy.mmdd.### from git (version.sh), handed in as NS_VERSION
@@ -13,6 +13,7 @@ ns-gguf = { path = "crates/ns-gguf" }
 ns-core = { path = "crates/ns-core" }
 ns-runtime = { path = "crates/ns-runtime" }
 ns-glm5next = { path = "engines/glm5next" }
+ns-qwen4exp = { path = "engines/qwen4exp" }
 ns-tok = { path = "crates/ns-tok" }
 serde_json = "1"
 

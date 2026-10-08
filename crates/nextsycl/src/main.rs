@@ -97,7 +97,7 @@ fn gib(b: u64) -> f64 {
 
 /// The engines this program has, one a model architecture (engines/<arch>)
 fn engines() -> Vec<EngineKind> {
-    vec![ns_glm5next::kind()]
+    vec![ns_glm5next::kind(), ns_qwen4exp::kind()]
 }
 
 /// The engine for `f`'s architecture, loaded on `gpus`

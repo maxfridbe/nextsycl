@@ -54,9 +54,10 @@ name = "nextsycl"
 version = "0.0.0"
 dependencies = [
  "ns-core",
- "ns-engine",
  "ns-gguf",
- "ns-model",
+ "ns-glm5next",
+ "ns-qwen4exp",
+ "ns-runtime",
  "ns-tok",
  "serde_json",
 ]
@@ -69,22 +70,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "ns-engine"
-version = "0.0.0"
-dependencies = [
- "ns-core",
- "ns-gguf",
- "ns-model",
-]
-
-[[package]]
 name = "ns-gguf"
 version = "0.0.0"
 
 [[package]]
-name = "ns-model"
+name = "ns-glm5next"
 version = "0.0.0"
 dependencies = [
+ "ns-core",
+ "ns-gguf",
+ "ns-runtime",
+]
+
+[[package]]
+name = "ns-qwen4exp"
+version = "0.0.0"
+dependencies = [
+ "ns-core",
+ "ns-gguf",
+ "ns-runtime",
+]
+
+[[package]]
+name = "ns-runtime"
+version = "0.0.0"
+dependencies = [
+ "ns-core",
  "ns-gguf",
 ]
 

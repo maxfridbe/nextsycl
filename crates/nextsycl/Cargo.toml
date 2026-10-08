@@ -10,5 +10,6 @@ ns-gguf.workspace = true
 ns-core.workspace = true
 ns-runtime.workspace = true
 ns-glm5next.workspace = true
+ns-qwen4exp.workspace = true
 ns-tok.workspace = true
 serde_json.workspace = true
