@@ -77,6 +77,7 @@ typedef struct ns_qw_desc {
     const uint8_t* cache_base;
     const uint64_t* slot_off; /* host, n_slots */
     int64_t n_slots;
+    const int32_t* h_res; /* host [n_layer * 512]: d_res's copy (the prompt path walks the experts on the host) */
 } ns_qw_desc;
 
 int ns_qw_new(ns_gpu* g, const ns_qw_desc* d, ns_qw** out);
@@ -102,4 +103,11 @@ int ns_qw_window(ns_qw* w, ns_qw_state* st, int T, const int32_t* tokens, int64_
                  int logits_from, float* logits_host);
 /* the last window's first n_keep tokens made permanent */
 int ns_qw_commit(ns_qw* w, ns_qw_state* st, int n_keep);
+
+/* the prompt path (Strata's prefill.cpp): chunks of up to `chunk` tokens; ns_qw_prefill_buffers sizes the stage's
+ * buffers for it (once; a larger chunk reallocates) and gives the residual R (chunk x 4 x 2560 floats, device): a later
+ * stage reads its chunk's residual there, an earlier one leaves it there */
+int ns_qw_prefill_buffers(ns_qw* w, int64_t chunk, float** R);
+/* T tokens at pos0.. (committed: the state advances); ple_rows (host, T x 2560) for the stage with layer 1 */
+int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, int64_t pos0, const float* ple_rows);
 #endif

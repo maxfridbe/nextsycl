@@ -177,8 +177,15 @@ of IQ2_XXS instead could win twice.
       experts planned on the device; the PLE rows hashed and read in Rust. spec-check 2 / 4 / 8 rows (short, 3K,
       12K) and batch-check exact (max diff 0). Decode 37 tok/s, prompt 142 tok/s (8-token windows)
 - [x] The chat templates by engine (`EngineKind::chat`: glm_chat, qwen_chat); ns-tok's `qwen35` pre-tokenizer
-- [ ] qwen4exp: the prompt path (Strata's prefill.cpp: GEMM chunks, the grouped experts), then parity with
-      Strata's own output (its prefill + first window; a like-for-like run there needs the same path)
+- [x] qwen4exp: the prompt path (kernels/engines/qwen4exp/prefill.cpp = Strata's prefill.cpp default path: the HC
+      reads as BF16 GEMMs, Gemm::native projections, the GDN / QSA chunk kernels, the selection as GEMM tiles, the
+      experts grouped on the host and run dequantized to FP16 + oneMKL, the writes fused with the next norm); a
+      prompt reads as Strata's does (all but the last token in chunks, the first 256, then a window). 3K 702 tok/s
+      (2048 chunks) / 805 (4096), 12K 1,023 tok/s (was 142). Strata's own output on the same ids: identical text
+      on a short prompt; 3K identical for ~65 tokens (Strata on one B70 computes its non-resident experts on the
+      CPU, so not bitwise there). spec-check 8 rows and batch-check still exact
+- [ ] qwen4exp: the prompt path's speed (Strata reads 3K at 1,046 tok/s on one B70 with streamed experts; here every
+      expert is in VRAM): profile it, the expert GEMMs per expert, the split by compute
 - [ ] qwen4exp: MTP (Strata's draft layer from the base checkpoint, mtp/rt), the window graph captured, the split
       by compute (the B65 has 9 layers), the Coder IQ1_M and Swift files
 - [ ] The GLM-only kernels' declarations out of ns.h's shared part

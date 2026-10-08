@@ -20,6 +20,13 @@ use crate::ple;
 
 /// tokens a window takes (the kernels' kVerifyMaxT)
 pub const MAX_WINDOW: usize = 8;
+
+/// tokens a prompt-path chunk takes (NS_QW_CHUNK; Strata serves --prefill 4096): its buffers grow with it, ~0.4 MiB a
+/// token on each GPU
+pub fn prompt_chunk() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("NS_QW_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n >= 16).unwrap_or(2048))
+}
 /// the longest session a stage is sized for (the model's context)
 const STAGE_CELLS: i64 = 262144;
 
@@ -504,6 +511,7 @@ impl<'g> Qwen<'g> {
             cache_base: base as *const u8,
             slot_off: slot_off.as_ptr(),
             n_slots: slot_off.len() as i64,
+            h_res: res.as_ptr(),
         };
         let mut raw = std::ptr::null_mut();
         // SAFETY: the description's pointers live through the call (it copies them); the buffers outlive the stage.
@@ -653,25 +661,89 @@ impl<'g> Qwen<'g> {
         Ok(())
     }
 
-    /// Tokens read: windows of up to 8, each committed; the last token's logits
+    /// Tokens read: all but the last through the prompt path (in chunks), the last as a window (as Strata reads a
+    /// prompt: its first window is the prompt's last token); the last token's logits. NS_QW_WINDOWS=1: every token
+    /// through windows of 8 (the decode arithmetic throughout)
     pub fn forward(&self, s: &mut Session, tokens: &[u32]) -> Result<Vec<f32>> {
+        Ok(self.feed_until(s, tokens, &|| false)?.1)
+    }
+
+    /// As `forward`, `stop()` asked between prompt chunks: (tokens read, the last one's logits - none when stopped)
+    pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync)) -> Result<(usize, Vec<f32>)> {
         let mut run = self.run.lock().unwrap();
         self.flush(&mut run)?;
         self.settle(&mut run, s)?;
         if s.open.is_some() {
             return Err(err("a window on a session with an uncommitted verify pass"));
         }
-        let mut last = Vec::new();
         let n = tokens.len();
-        for (i, w) in tokens.chunks(MAX_WINDOW).enumerate() {
-            let end = (i + 1) * MAX_WINDOW >= n;
+        if n == 0 {
+            return Err(err("a pass of no tokens"));
+        }
+        if s.pos + n > s.max_ctx {
+            return Err(err(format!("{} tokens past the session's context ({} of {} used)", n, s.pos, s.max_ctx)));
+        }
+        static WINDOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let windows = *WINDOWS.get_or_init(|| std::env::var("NS_QW_WINDOWS").is_ok_and(|v| v == "1"));
+        let head = if windows { 0 } else { n - 1 };
+        let chunk = prompt_chunk();
+        let mut c0 = 0;
+        while c0 < head {
+            if c0 > 0 && stop() {
+                return Ok((c0, Vec::new()));
+            }
+            // Strata's first chunk is short (256) when the prompt is longer than twice that: the same boundaries
+            let t = if c0 == 0 && head > 512 && chunk > 256 { 256 } else { chunk.min(head - c0) };
+            self.prefill(&mut run, s, &tokens[c0..c0 + t])?;
+            c0 += t;
+        }
+        let mut last = Vec::new();
+        let rest = &tokens[head..];
+        let m = rest.len();
+        for (i, w) in rest.chunks(MAX_WINDOW).enumerate() {
+            let end = (i + 1) * MAX_WINDOW >= m;
             let l = self.window(&mut run, s, w, if end { w.len() - 1 } else { w.len() })?;
             self.commit(s, w, w.len())?;
             if end {
                 last = l;
             }
         }
-        Ok(last)
+        Ok((n, last))
+    }
+
+    /// One prompt-path chunk through every stage, committed
+    fn prefill(&self, run: &mut Run, s: &mut Session, tokens: &[u32]) -> Result<()> {
+        let t = tokens.len();
+        let chunk = prompt_chunk().max(t);
+        let mut prev = s.prev;
+        let rows = self.table.rows(tokens, &mut prev);
+        let ple = self.table.gather(&rows)?;
+        let toks: Vec<i32> = tokens.iter().map(|x| *x as i32).collect();
+        let mut r_prev: (*mut f32, Option<&Stage>) = (std::ptr::null_mut(), None);
+        for (st, x) in self.stages.iter().zip(&s.states) {
+            let mut r = std::ptr::null_mut();
+            // SAFETY: a live stage; out-pointer to a local.
+            ffi::check(unsafe { (self.api.prefill_buffers)(st.raw, chunk as i64, &mut r) }, &format!("{}: the prompt path", st.gpu.name))?;
+            if let (p, Some(ps)) = r_prev {
+                // the previous stage's residual (t x 4 x 2560 floats) into this one's
+                let n = t * 4 * 2560 * 4;
+                if run.staging.len() < n {
+                    run.staging.resize(n, 0);
+                }
+                let lib = ns_core::api()?;
+                // SAFETY: both buffers hold `chunk` >= t tokens' rows; the staging n bytes; the call waits.
+                let rc = unsafe { (lib.copy_peer)(st.gpu.raw(), r.cast(), ps.gpu.raw(), p.cast(), n, run.staging.as_mut_ptr().cast()) };
+                ffi::check(rc, "the prompt's hand-off between GPUs")?;
+            }
+            let has_ple = st.lb <= 1 && 1 < st.le;
+            // SAFETY: a live stage and its state; t tokens and t rows of PLE floats.
+            let rc = unsafe { (self.api.prefill)(st.raw, *x, t as i64, toks.as_ptr(), s.pos as i64, if has_ple { ple.as_ptr() } else { std::ptr::null() }) };
+            ffi::check(rc, &format!("{}: a prompt chunk at {}", st.gpu.name, s.pos))?;
+            r_prev = (r, Some(st));
+        }
+        s.prev = prev;
+        s.pos += t;
+        Ok(())
     }
 
     /// One verify pass (up to 8 tokens): the last `n_out` rows' logits, left open for `rollback`

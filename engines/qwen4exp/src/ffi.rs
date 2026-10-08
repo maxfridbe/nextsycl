@@ -98,6 +98,7 @@ pub struct Desc {
     pub cache_base: *const u8,
     pub slot_off: *const u64,
     pub n_slots: i64,
+    pub h_res: *const i32,
 }
 
 pub type Stage = *mut c_void;
@@ -118,6 +119,8 @@ pub struct Api {
     pub state_copy: unsafe extern "C" fn(Stage, State, State, i64) -> c_int,
     pub window: unsafe extern "C" fn(Stage, State, c_int, *const i32, i64, *const f32, c_int, *mut f32) -> c_int,
     pub commit: unsafe extern "C" fn(Stage, State, c_int) -> c_int,
+    pub prefill_buffers: unsafe extern "C" fn(Stage, i64, *mut *mut f32) -> c_int,
+    pub prefill: unsafe extern "C" fn(Stage, State, i64, *const i32, i64, *const f32) -> c_int,
 }
 
 // SAFETY: plain function pointers into the library, which stays loaded.
@@ -156,6 +159,8 @@ pub fn api() -> ns_core::Result<&'static Api> {
             state_copy: sym!("ns_qw_state_copy"),
             window: sym!("ns_qw_window"),
             commit: sym!("ns_qw_commit"),
+            prefill_buffers: sym!("ns_qw_prefill_buffers"),
+            prefill: sym!("ns_qw_prefill"),
         })
     })
     .as_ref()

@@ -110,7 +110,7 @@ impl Engine for engine::Qwen<'_> {
         false
     }
     fn prefill_chunk(&self) -> usize {
-        512
+        engine::prompt_chunk()
     }
     fn max_verify(&self) -> usize {
         engine::MAX_WINDOW
@@ -130,20 +130,10 @@ impl Engine for engine::Qwen<'_> {
     }
 
     fn feed(&self, s: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
-        Ok(self.feed_until(s, tokens, &|| false, tap)?.1)
+        Ok(Engine::feed_until(self, s, tokens, &|| false, tap)?.1)
     }
     fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync), _tap: Tap) -> Result<(usize, Vec<f32>)> {
-        let s = sess_mut(s)?;
-        let mut last = Vec::new();
-        let mut done = 0;
-        for c in tokens.chunks(self.prefill_chunk()) {
-            if done > 0 && stop() {
-                break;
-            }
-            last = engine::Qwen::forward(self, s, c)?;
-            done += c.len();
-        }
-        Ok((done, last))
+        engine::Qwen::feed_until(self, sess_mut(s)?, tokens, stop)
     }
     fn forward(&self, s: &mut Session, tokens: &[u32], _tap: Tap) -> Result<Vec<f32>> {
         engine::Qwen::forward(self, sess_mut(s)?, tokens)

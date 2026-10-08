@@ -9,7 +9,7 @@ indexer, 288 experts, and hyper-connections. The experts that do not fit the car
 the GPU reads them over PCIe. It runs on one card or splits the layers over several. Second model:
 **Qwen3.8-Flash-Next** (`qwen4exp`, `engines/qwen4exp`): Gated DeltaNet and QSA attention, hyper-connections, a
 hashed per-layer embedding and 512 experts, on the Strata SYCL port's kernels - every weight in VRAM over the two
-cards, decode at 37 tok/s (no draft yet), verify passes and batches bit-exact.
+cards, decode at 37 tok/s (no draft yet), prompts at 700-1,000 tok/s, verify passes and batches bit-exact.
 
 ## What it does
 
