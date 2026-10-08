@@ -106,7 +106,11 @@ of IQ2_XXS instead could win twice.
       (joint_matrix 117 / 135 / 200), B65 165 / 213 / 327 (206 / 224 / -); past 256 (B70) or 128 (B65) expand +
       oneMKL wins (512: 335 vs 294 on the B70). In the engine (fused.cpp, ns_moe_fused_gu_esimd; NS_ESIMD_MAX):
       36K 1,052-1,063 -> 1,096-1,097 tok/s
-- [ ] The down projection (Q2_K) the same way; the B65's ESIMD past 128 tokens (decode-bound: its fewer units)
+- [x] The down projection (Q2_K) the same way (reference/esimd-down.cpp): exact, slower than the joint_matrix down
+      already in the engine - B70 48 / 52 / 69 us at 64 / 128 / 256 tokens vs 39 / 40 / 55, B65 105 / 143 / 132
+      vs 47 / 66 / 119. K is 2,048 (8 blocks a row) and Q2_K's decode needs no table: little to share, and the
+      work-group's barriers and local-memory round trips cost more than they save. Not used
+- [ ] The B65's ESIMD gate | up past 128 tokens (decode-bound: its fewer units)
 - [x] The expansion itself: alone (reference/expand.cpp, 2048 x 4096, cold) IQ2_XXS took 67 us on a B70 and 100
       on a B65 a work-item 8 values of one block; two blocks a work-item (their grid loads overlap) 40 / 58 us,
       exact; bigger work-groups or 4 blocks no better; Q2_K (36-37 us) already at its bound. In the engine the gain
