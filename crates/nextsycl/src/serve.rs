@@ -823,11 +823,16 @@ impl Server {
     fn step_alone(&self, slots: &mut [Slot], active: &mut [Active], rng: &mut Rng, none: ns_engine::Tap) -> Result<(), String> {
         let Some(a) = active.iter_mut().find(|a| a.finish.is_none()) else { return Ok(()) };
         if a.dec.is_none() {
-            a.dec = Some(match (a.logits.take(), a.pending.take()) {
+            let mut dec = match (a.logits.take(), a.pending.take()) {
                 (Some(l), _) => self.glm.decoder(l, true),
                 (None, Some(y)) => self.glm.decoder_after(y, true),
                 (None, None) => return Err("a request without logits or a token to feed".into()),
-            });
+            };
+            // the conversation so far, for prompt-lookup drafts (NS_NGRAM)
+            let mut ctx = a.job.ids.clone();
+            ctx.extend_from_slice(&a.committed);
+            dec.set_context(&ctx);
+            a.dec = Some(dec);
         }
         let (temp, top_p, k) = (a.job.temp, a.job.top_p, a.job.logprobs);
         let mut lps: VecDeque<Value> = VecDeque::new();

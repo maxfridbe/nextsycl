@@ -67,7 +67,7 @@ in this process (inside the image: the kernels need the oneAPI runtime):
   nextsycl tokenize <model.gguf> <text>
   nextsycl check <model.gguf> <dump dir> [--gpu N[,M]]
                                 the forward pass on a reference dump's prompt, every step compared, the next token
-  nextsycl spec-check <model.gguf> --prompt TEXT [--n N] [--gpu 0,1]
+  nextsycl spec-check <model.gguf> --prompt TEXT [--n N] [--rows R (2..5)] [--gpu 0,1]
                                 verify passes (2 rows, then a rollback to 1) against one-token decode, logits compared
   nextsycl kernels <model.gguf> [--gpu N]   each weight type's decode kernel against the exact path
 
@@ -440,6 +440,7 @@ fn generate(args: &[String]) -> Result<(), String> {
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let mut draw = |l: &[f32]| sample(l, temp, top_p, &mut rng);
     let mut dec = glm.decoder(logits, mtp);
+    dec.set_context(&ids);
     let mut pending: Vec<u8> = Vec::new();
     let mut out = std::io::stdout();
     print!("<think>");
@@ -476,6 +477,9 @@ fn generate(args: &[String]) -> Result<(), String> {
     let (hits, misses, mirrored, direct, pf, pf_used) = glm.expert_stats();
     eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); drafts {} of {} accepted; experts: {hits} VRAM hits, {direct} read from host memory by prompt passes, {misses} swapped in ({mirrored} of them from host memory), {pf} prefetched ({pf_used} of them asked for)]",
               ids.len(), ids.len() as f64 / prefill, n as f64 / dt.max(1e-9), dec.accepted, dec.drafted);
+    if dec.ng_drafted > 0 {
+        eprintln!("[prompt lookup: {} of {} drafts accepted]", dec.ng_accepted, dec.ng_drafted);
+    }
     Ok(())
 }
 
@@ -672,7 +676,13 @@ fn spec_check(args: &[String]) -> Result<(), String> {
     let mut b = glm.session(ids.len() + n + 4).map_err(e)?;
     glm.feed(&mut b, &ids, &mut none).map_err(e)?;
     if args.iter().any(|a| a == "--layers") {
-        // the first verify pass's row 0 against a one-token pass from the same state, step by step
+        // a verify pass's row against a one-token pass from the same state, step by step; --at N: N one-token passes
+        // first
+        let at: usize = opt("--at").and_then(|v| v.parse().ok()).unwrap_or(0);
+        for &t in &toks[..at] {
+            glm.forward(&mut b, &[t], &mut none).map_err(e)?;
+        }
+        let toks = &toks[at..];
         let mut c = glm.session(ids.len() + n + 4).map_err(e)?;
         glm.copy_session(&mut c, &b).map_err(e)?;
         let mut one: Vec<(String, Vec<f32>)> = Vec::new();
@@ -680,7 +690,13 @@ fn spec_check(args: &[String]) -> Result<(), String> {
             one.push((name.to_string(), x.to_f32()?));
             Ok(())
         };
-        glm.forward(&mut c, &[toks[0]], &mut keep).map_err(e)?;
+        // --rows R --row k: row k of an R-row pass against a one-token pass at its position (k one-token passes first)
+        let width: usize = opt("--rows").and_then(|v| v.parse().ok()).unwrap_or(2).clamp(2, ns_engine::glm5next::MAX_VERIFY);
+        let row: usize = opt("--row").and_then(|v| v.parse().ok()).unwrap_or(0).min(width - 1);
+        for &t in &toks[..row] {
+            glm.forward(&mut c, &[t], &mut none).map_err(e)?;
+        }
+        glm.forward(&mut c, &[toks[row]], &mut keep).map_err(e)?;
         let mut two: Vec<(String, Vec<f32>)> = Vec::new();
         let mut keep2 = |name: &str, x: &ns_core::DevBuf| -> ns_core::Result<()> {
             two.push((name.to_string(), x.to_f32()?));
@@ -688,14 +704,17 @@ fn spec_check(args: &[String]) -> Result<(), String> {
         };
         let mut d = glm.session(ids.len() + n + 4).map_err(e)?;
         glm.copy_session(&mut d, &b).map_err(e)?;
-        glm.forward_rows(&mut d, &[toks[0], toks[1]], 1, &mut keep2).map_err(e)?;
-        for ((na, va), (_, vb)) in one.iter().zip(&two) {
-            // row 0 of the 2-row tensor: its first len/1 values (rows are outermost)
+        glm.forward_rows(&mut d, &toks[..width], 1, &mut keep2).map_err(e)?;
+        // matched by name (a pass of several rows taps some steps it splits by row only once, or not at all)
+        let by_name: std::collections::HashMap<&str, &Vec<f32>> = two.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        for (na, va) in &one {
+            let Some(vb) = by_name.get(na.as_str()) else { continue };
+            // row `row` of the R-row tensor (rows are outermost)
             let w = va.len();
-            if na.starts_with("result") || vb.len() < w {
+            if na.starts_with("result") || vb.len() < w * width {
                 continue;
             }
-            let rb = &vb[..w];
+            let rb = &vb[row * w..(row + 1) * w];
             let dd = va.iter().zip(rb).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
             let mx = va.iter().map(|x| x.abs()).fold(0f32, f32::max).max(1e-20);
             println!("{na:<24} {:.3e}", dd / mx);
@@ -704,21 +723,23 @@ fn spec_check(args: &[String]) -> Result<(), String> {
     }
     println!("{:>4} {:>4} {:>12} {:>10} {:>6} {:>8}", "pos", "row", "max |diff|", "max |ref|", "top1", "margin");
     let (mut worst, mut flips) = (0f32, 0);
-    for i in 0..n - 1 {
-        let rows = glm.forward_rows(&mut b, &[toks[i], toks[i + 1]], 2, &mut none).map_err(e)?;
-        for (r, (got, want)) in rows.iter().zip([&refs[i], &refs[i + 1]]).enumerate() {
+    // --rows R: verify passes of R tokens (2 = one draft; up to 5 with NS_NGRAM=4's snapshots)
+    let width: usize = opt("--rows").and_then(|v| v.parse().ok()).unwrap_or(2).clamp(2, ns_engine::glm5next::MAX_VERIFY);
+    for i in 0..n + 1 - width {
+        let rows = glm.forward_rows(&mut b, &toks[i..i + width], width, &mut none).map_err(e)?;
+        for (r, (got, want)) in rows.iter().zip(&refs[i..i + width]).enumerate() {
             let d = got.iter().zip(want.iter()).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
             let mx = want.iter().map(|x| x.abs()).fold(0f32, f32::max);
             let same = argmax(got) == argmax(want);
             worst = worst.max(d / mx);
             flips += usize::from(!same);
-            if i < 4 || !same || i % 8 == 0 {
+            if i < 4 || !same || i % 8 == 0 || d > 0.0 {
                 println!("{:>4} {:>4} {:>12.5} {:>10.3} {:>6} {:>8.4}", i, r, d, mx, if same { "same" } else { "FLIP" }, margin(want));
             }
         }
         glm.rollback(&mut b, 1).map_err(e)?;
     }
-    println!("worst max|diff| / max|ref| {worst:.2e}; top-1 differs in {flips} of {} rows", 2 * (n - 1));
+    println!("worst max|diff| / max|ref| {worst:.2e}; top-1 differs in {flips} of {} rows ({width}-row passes)", width * (n + 1 - width));
     Ok(())
 }
 
@@ -780,7 +801,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         let hours: f64 = opt("--cache-ttl-hours").and_then(|v| v.parse().ok()).unwrap_or(24.0);
         // what a checkpoint must match to fit these sessions: the model file, the cache's form, the draft block
         let size = std::fs::metadata(model).map_or(0, |m| m.len());
-        let fp = format!("{model} {size} kv={} mtp={} nsck1", if ns_engine::glm5next::kv_q8() { "q8" } else { "f16" }, mtp);
+        // nsck2: the indexer ring of 8 slots (nsck1's 4 restore wrong)
+        let fp = format!("{model} {size} kv={} mtp={} nsck2", if ns_engine::glm5next::kv_q8() { "q8" } else { "f16" }, mtp);
         pc = pc.with_disk(std::path::PathBuf::from(dir), (g * (1u64 << 30) as f64) as usize, &fp,
                           std::time::Duration::from_secs_f64(hours.max(0.0) * 3600.0))?;
     }

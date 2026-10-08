@@ -879,7 +879,7 @@ int ns_add(ns_gpu* g, float* y, const float* x, int64_t n) {
 // ---- DSA lightning indexer (docs/glm5next.md): pools of 4 consecutive tokens, a pooled key per completed pool ----
 
 // The pools completed by tokens [pos0, pos0 + T): pooled[j][c] = sum_m softmax_m(ig_m[c] + ape[m][c]) * ik_m[c] over
-// the 4 members m (positions 4j + m). A member before pos0 comes from `ring` ([4][2 * D]: ik | ig at slot pos % 4,
+// the 4 members m (positions 4j + m). A member before pos0 comes from `ring` ([8][2 * D]: ik | ig at slot pos % 8,
 // the last tokens of the previous pass); then the ring takes this pass's last tokens.
 int ns_idx_pool(ns_gpu* g, float* ring, const float* ik, const float* ig, const float* ape, float* pooled, int64_t pos0, int64_t T,
                 int64_t D) {
@@ -892,8 +892,8 @@ int ns_idx_pool(ns_gpu* g, float* ring, const float* ik, const float* ig, const 
             float lg[4], kv[4], mx = -INFINITY;
             for (int m = 0; m < 4; ++m) {
                 const int64_t p = 4 * j + m;
-                const float* k = p >= pos0 ? ik + (p - pos0) * D : ring + (p % 4) * 2 * D;
-                const float* gg = p >= pos0 ? ig + (p - pos0) * D : ring + (p % 4) * 2 * D + D;
+                const float* k = p >= pos0 ? ik + (p - pos0) * D : ring + (p % 8) * 2 * D;
+                const float* gg = p >= pos0 ? ig + (p - pos0) * D : ring + (p % 8) * 2 * D + D;
                 kv[m] = k[c];
                 lg[m] = gg[c] + ape[m * D + c];
                 mx = sycl::fmax(mx, lg[m]);
@@ -903,11 +903,14 @@ int ns_idx_pool(ns_gpu* g, float* ring, const float* ik, const float* ig, const 
             pooled[j * D + c] = acc / s;
         });
     }
-    const int64_t first = sycl::max<int64_t>(pos0, pos0 + T - 3);
+    // the ring keeps the last 8 positions (slot pos % 8), every row of a decode pass: a verify pass of up to 5 rows
+    // rolled back to any length still finds the 3 before its next pool's end (with 4 slots, a 3-row pass's rejected
+    // rows overwrote positions still needed - 3+-row verify passes drifted at long context)
+    const int64_t first = sycl::max<int64_t>(pos0, pos0 + T - 8);
     q.parallel_for(sycl::range<2>(pos0 + T - first, D), [=](sycl::id<2> id) {
         const int64_t p = first + id[0], c = id[1];
-        ring[(p % 4) * 2 * D + c] = ik[(p - pos0) * D + c];
-        ring[(p % 4) * 2 * D + D + c] = ig[(p - pos0) * D + c];
+        ring[(p % 8) * 2 * D + c] = ik[(p - pos0) * D + c];
+        ring[(p % 8) * 2 * D + D + c] = ig[(p - pos0) * D + c];
     });
     return 0;
     NS_CATCH

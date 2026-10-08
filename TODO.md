@@ -260,6 +260,19 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
 - [x] Sampling at a temperature sorted the whole vocabulary (154,880) for its top 256 a token (~2.5 ms): now a linear
       selection, then the 256 sorted (the same order, the same tokens - the drafts accepted matched exactly). Decode
       at temperature 0.7 21.3-21.6 -> 22.7-23.0 tok/s, at 1.0 20.4-20.9 -> 21.6-22.2 (greedy 23.0-23.8)
+- [x] Prompt-lookup drafts (NS_NGRAM=K, off by default): the up to K tokens that followed the last 3 where they
+      occurred before, verified in one pass. Exact, and ~90% accepted on a copy-heavy answer (adding comments to a
+      file: 902 of 979 at K=4) - but slower at every K (17.46 tok/s without, 16.85 / 17.13 / 16.87 at K = 2 / 3 / 4):
+      a 5-row pass took ~280 ms against a 2-row one's ~110 (2.5x for 2.4x the tokens) - each row brings its own 8
+      experts (swaps +11-15%), the pass's cost grows almost with its rows. The draft block's 2-row passes (93%
+      accepted on that answer) are the better trade on an MoE
+- [x] A real bug on the way: verify passes of 3+ rows drifted at long context (spec-check --rows 3 at 3K: 3.2e-2).
+      The indexer's ring of the last 4 tokens' keys (slot pos % 4) - a 3-row pass's rejected rows overwrote slots
+      of positions the next pool still needed. Now 8 slots, every row of a pass written: 2 / 3 / 5-row passes exact
+      at short and long context. NS_DRAFTS=2 was affected too. Disk checkpoints of the old layout: fingerprint nsck2.
+      spec-check: --rows R (2..5), --layers --at N --row k, tensors matched by name
+- [ ] Speculative sampling at a temperature: the draft sampled from the draft block's distribution, accepted with
+      min(1, p/q) - more accepted when the model is unsure, the output distributed exactly as now (2-row passes)
 - [ ] Decode is spread out now (per token: experts' kernels, KDA 10.6 ms, MLA 4.9, the draft 2.5, the shared expert
       2.2): no single kernel holds a big share. Levers left: more VRAM (fewer misses: <= 13%), MTP acceptance
 - [ ] Batch: the draft block in batches; per-request energy (concurrent requests share the counters - each counts

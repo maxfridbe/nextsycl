@@ -204,6 +204,19 @@ fn lend_arena() -> bool {
     *V.get_or_init(|| std::env::var("NS_LEND").map_or(true, |v| v != "0"))
 }
 
+/// Prompt-lookup drafts (NS_NGRAM=K, 1..4; 0 = off): when the last 3 tokens occurred earlier in the conversation, the
+/// up to K tokens that followed them there are verified in one pass (the answer copying its context: code, quotes,
+/// names); else the draft block's one. Each session keeps K state snapshots (~136 MB each)
+pub fn ngram_k() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_NGRAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(MAX_VERIFY - 1))
+}
+
+/// The most drafts a verify pass holds (a session's snapshot rows)
+fn max_drafts() -> usize {
+    drafts().max(ngram_k())
+}
+
 /// Drafts a verify pass checks (NS_DRAFTS: 1, or 2 - the draft block chained on its own output)
 fn drafts() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -244,7 +257,7 @@ pub fn arena_bytes() -> usize {
     })
 }
 /// rows of a verify pass (the token and its draft); the KDA states keep a snapshot after each row but the last
-pub const MAX_VERIFY: usize = 3;
+pub const MAX_VERIFY: usize = 5;
 /// the indexer's pool scores per GEMM (floats): pools are scored in chunks that fit (64 MiB)
 const IDX_S_FLOATS: usize = 16 << 20;
 
@@ -396,7 +409,7 @@ enum LayerState {
     Mla { c: DevBuf, idx: Idx },
 }
 
-/// An MLA layer's indexer state: the last tokens' key and pool gate (ring [4][2 * idx_dim], slot pos % 4) and the
+/// An MLA layer's indexer state: the last tokens' key and pool gate (ring [8][2 * idx_dim], slot pos % 8) and the
 /// pooled key of every completed pool [ctx / 4 + 1, idx_dim].
 struct Idx {
     ring: DevBuf,
@@ -405,7 +418,7 @@ struct Idx {
 
 impl Idx {
     fn new(gpu: &Arc<Gpu>, max_ctx: usize, d: usize) -> Result<Idx> {
-        let ring = DevBuf::f32(gpu, 8 * d)?;
+        let ring = DevBuf::f32(gpu, 16 * d)?;
         ring.fill(0)?;
         Ok(Idx { ring, pooled: DevBuf::f32(gpu, (max_ctx / 4 + 1) * d)? })
     }
@@ -528,6 +541,11 @@ impl Checkpoint {
 pub struct Decoder {
     logits: Vec<f32>,
     next: Option<u32>,
+    /// the conversation's tokens and the place after each 3-gram's last occurrence (prompt lookup, NS_NGRAM)
+    look: Option<Lookup>,
+    /// prompt-lookup drafts verified, and accepted
+    pub ng_drafted: u64,
+    pub ng_accepted: u64,
     draft: Option<u32>,
     /// a second draft, the draft block chained on its own output (NS_DRAFTS=2)
     draft2: Option<u32>,
@@ -537,7 +555,49 @@ pub struct Decoder {
     pub accepted: u64,
 }
 
+/// A conversation's tokens with a 3-gram index: `after[(a, b, c)]` is the position following that 3-gram's most recent
+/// earlier occurrence
+#[derive(Default)]
+struct Lookup {
+    hist: Vec<u32>,
+    after: HashMap<(u32, u32, u32), usize>,
+}
+
+impl Lookup {
+    fn push(&mut self, t: u32) {
+        self.hist.push(t);
+        let n = self.hist.len();
+        if n >= 4 {
+            // the 3-gram before this token now has a follower
+            self.after.insert((self.hist[n - 4], self.hist[n - 3], self.hist[n - 2]), n - 1);
+        }
+    }
+    /// Up to `k` tokens that followed the last 3 tokens where they occurred before
+    fn propose(&self, k: usize) -> Vec<u32> {
+        let n = self.hist.len();
+        if n < 3 || k == 0 {
+            return Vec::new();
+        }
+        match self.after.get(&(self.hist[n - 3], self.hist[n - 2], self.hist[n - 1])) {
+            Some(&p) if p < n => self.hist[p..(p + k).min(n)].to_vec(),
+            _ => Vec::new(),
+        }
+    }
+}
+
 impl Decoder {
+    /// The conversation so far (its prompt and what is committed): prompt-lookup drafts from it (NS_NGRAM)
+    pub fn set_context(&mut self, tokens: &[u32]) {
+        if ngram_k() == 0 {
+            return;
+        }
+        let mut l = Lookup { hist: Vec::with_capacity(tokens.len() + 4096), after: HashMap::with_capacity(tokens.len()) };
+        for &t in tokens {
+            l.push(t);
+        }
+        self.look = Some(l);
+    }
+
     /// The committed token not fed yet (the last step's), handed over - e.g. to a batch step - and the draft dropped
     pub fn pending(&mut self) -> Option<u32> {
         self.draft = None;
@@ -1345,7 +1405,7 @@ impl<'g> Glm<'g> {
                     Ok(b)
                 };
                 let snap = if spec {
-                    let r = drafts(); // a snapshot after each verified row but the last (NS_DRAFTS rows)
+                    let r = max_drafts(); // a snapshot after each verified row but the last
                     Some(Box::new((DevBuf::f32(gpu, r * sz)?, [DevBuf::f32(gpu, r * cw)?, DevBuf::f32(gpu, r * cw)?, DevBuf::f32(gpu, r * cw)?])))
                 } else {
                     None
@@ -1840,7 +1900,7 @@ impl<'g> Glm<'g> {
             return Err(Error(format!("the context is {} tokens; {} more do not fit", sess.max_ctx, t)));
         }
         // verify passes keep snapshots (as many rows as the sessions have room for: NS_DRAFTS + 1)
-        let snapping = (2..=drafts() + 1).contains(&t) && self.mtp.is_some();
+        let snapping = (2..=max_drafts() + 1).contains(&t) && self.mtp.is_some();
         let mut x = self.streams(tokens, &mut *tap)?;
         let mut staging = Vec::new();
         for (k, run) in self.runs().into_iter().enumerate() {
@@ -2436,13 +2496,13 @@ impl<'g> Glm<'g> {
 
     /// Generation from a prompt `feed` returned `logits` for; `mtp`: draft with the MTP block (when loaded).
     pub fn decoder(&self, logits: Vec<f32>, mtp: bool) -> Decoder {
-        Decoder { logits, next: None, draft: None, draft2: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
+        Decoder { logits, next: None, look: None, ng_drafted: 0, ng_accepted: 0, draft: None, draft2: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
     }
 
     /// A decoder whose last committed token `next` is not fed yet (one handed over by `Decoder::pending`, or a batch
     /// step's): its first step feeds it
     pub fn decoder_after(&self, next: u32, mtp: bool) -> Decoder {
-        Decoder { logits: Vec::new(), next: Some(next), draft: None, draft2: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
+        Decoder { logits: Vec::new(), next: Some(next), look: None, ng_drafted: 0, ng_accepted: 0, draft: None, draft2: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
     }
 
     /// The next committed token(s): one, or two when a draft is accepted. `sample` draws a token from logits. With
@@ -2450,7 +2510,41 @@ impl<'g> Glm<'g> {
     /// committed is distributed as plain sampling would be.
     pub fn step(&self, sess: &mut Session, dec: &mut Decoder, sample: &mut dyn FnMut(&[f32]) -> u32, tap: Tap) -> Result<Vec<u32>> {
         let fits = |k: usize| sess.pos + k <= sess.max_ctx;
-        let (out, tail) = match (dec.next, dec.draft, dec.draft2) {
+        // prompt lookup: the tokens that followed the last 3 where they occurred before, ahead of the draft block's
+        let ng: Vec<u32> = match (&dec.look, dec.next) {
+            (Some(l), Some(_)) if dec.mtp => {
+                // the history holds what is committed; the token not fed yet is its last
+                let mut v = l.propose(ngram_k());
+                v.truncate(sess.max_ctx.saturating_sub(sess.pos + 1));
+                v
+            }
+            _ => Vec::new(),
+        };
+        let (out, tail) = if let (Some(x), true) = (dec.next, ng.len() >= 2) {
+            // [token, drafts...] verified in one pass: the longest prefix the sampled tokens match is committed
+            let mut toks = vec![x];
+            toks.extend_from_slice(&ng);
+            let rows = self.forward_rows(sess, &toks, toks.len(), &mut *tap)?;
+            let mut out = Vec::with_capacity(toks.len());
+            for (i, r) in rows.iter().enumerate() {
+                let y = sample(r);
+                out.push(y);
+                if i < ng.len() {
+                    dec.ng_drafted += 1;
+                    if y == ng[i] {
+                        dec.ng_accepted += 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            if out.len() < toks.len() {
+                self.rollback(sess, out.len())?;
+            }
+            let tail = *out.last().unwrap();
+            (out, tail)
+        } else {
+        match (dec.next, dec.draft, dec.draft2) {
             (Some(x), Some(d), Some(d2)) if dec.mtp && fits(3) => {
                 // two drafts: [token, draft, draft2] verified in one pass, each accepted exactly
                 let rows = self.forward_rows(sess, &[x, d, d2], 3, &mut *tap)?;
@@ -2493,7 +2587,13 @@ impl<'g> Glm<'g> {
                 let y = sample(&dec.logits);
                 (vec![y], y)
             }
+        }
         };
+        if let Some(l) = &mut dec.look {
+            for &t in &out {
+                l.push(t);
+            }
+        }
         dec.draft = if dec.mtp { self.mtp_run(&mut sess.mtp, tail, true, &mut *tap)?.map(|l| argmax(&l)) } else { None };
         dec.draft2 = match dec.draft {
             Some(d) if dec.mtp && drafts() >= 2 => self.mtp_chain(sess, d, &mut *tap)?.map(|l| argmax(&l)),
