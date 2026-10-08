@@ -184,10 +184,16 @@ of IQ2_XXS instead could win twice.
       (2048 chunks) / 805 (4096), 12K 1,023 tok/s (was 142). Strata's own output on the same ids: identical text
       on a short prompt; 3K identical for ~65 tokens (Strata on one B70 computes its non-resident experts on the
       CPU, so not bitwise there). spec-check 8 rows and batch-check still exact
-- [ ] qwen4exp: the prompt path's speed (Strata reads 3K at 1,046 tok/s on one B70 with streamed experts; here every
-      expert is in VRAM): profile it, the expert GEMMs per expert, the split by compute
-- [ ] qwen4exp: MTP (Strata's draft layer from the base checkpoint, mtp/rt), the window graph captured, the split
-      by compute (the B65 has 9 layers), the Coder IQ1_M and Swift files
+- [x] qwen4exp at Strata's own numbers (INTEL_PERFORMANCE.md, benchy v1 on the B70), one card: the MTP draft layer
+      (kernels/engines/qwen4exp/mtp.cpp = Strata's MtpDrafter, NS_QW_MTP=<mtp rt dir>; --spec 4 --spec-min-p 0.5 as
+      NS_QW_SPEC / NS_QW_SPEC_MIN_P), the window / commit / drafter as SYCL graphs a session (recorded when it is
+      made), the cold experts in pinned host memory read over PCIe by the plan (resident_plan_set_mirror; ranked by
+      Strata's expert profile, NS_QW_EXPERT_PROFILE), greedy picks on the GPU (Sampler::greedy). 20 / 2,185 / 8,000 /
+      40,000 tokens: prompt 62 / 795 / 1,180 / 1,254 tok/s (Strata 60 / 745 / 1,050 / 1,117), decode 76 / 80-87 /
+      82-89 / 70-75 (70 / 77 / 78 / 72). Two cards are slower (the B65 runs a layer at half the B70's speed)
+- [ ] qwen4exp: serve it (a chat mode, the prompt cache with the drafter's K/V), the Coder IQ1_M and Swift files,
+      sampled decoding's acceptance (drafts verified by drawing each row: exact, less accepted than Strata's coupled
+      sampling), the decode window's 4-row cost (28 ms in Strata, 32 here)
 - [ ] The GLM-only kernels' declarations out of ns.h's shared part
 
 ## 256K context (plan: docs/256k-context.md, 2026-10-07)

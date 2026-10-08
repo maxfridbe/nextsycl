@@ -9,7 +9,10 @@ indexer, 288 experts, and hyper-connections. The experts that do not fit the car
 the GPU reads them over PCIe. It runs on one card or splits the layers over several. Second model:
 **Qwen3.8-Flash-Next** (`qwen4exp`, `engines/qwen4exp`): Gated DeltaNet and QSA attention, hyper-connections, a
 hashed per-layer embedding and 512 experts, on the Strata SYCL port's kernels - every weight in VRAM over the two
-cards, decode at 37 tok/s (no draft yet), prompts at 700-1,000 tok/s, verify passes and batches bit-exact.
+cards or on one with its cold experts in pinned host memory, the MTP draft layer, the window and the drafter as SYCL
+graphs; verify passes and batches bit-exact, greedy output with drafts equal to output without. On one Arc Pro B70,
+Strata's v1 bench (its own numbers on this card in brackets): 20 tokens 62-64 / 76-77 tok/s prompt / decode (60 / 70),
+2,185 795 / 80-87 (745 / 77), 8,000 1,180 / 82-89 (1,050 / 78), 40,000 1,254 / 70-75 (1,117 / 72).
 
 ## What it does
 

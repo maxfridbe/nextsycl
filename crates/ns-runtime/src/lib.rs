@@ -29,6 +29,11 @@ pub trait Sampler {
         0.0
     }
     fn record(&mut self, _logits: &[f32], _token: u32) {}
+    /// true: `sample` is the argmax and nothing reads the logits (no logprobs), so an engine may pick the tokens on the
+    /// GPU (the lowest index wins a tie there) and leave the logits where they are
+    fn greedy(&self) -> bool {
+        false
+    }
 }
 
 impl<F: FnMut(&[f32]) -> u32> Sampler for F {

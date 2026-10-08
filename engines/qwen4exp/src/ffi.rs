@@ -99,6 +99,8 @@ pub struct Desc {
     pub slot_off: *const u64,
     pub n_slots: i64,
     pub h_res: *const i32,
+    pub mirror: *const u64,
+    pub h_mirror: *const u64,
 }
 
 pub type Stage = *mut c_void;
@@ -113,14 +115,18 @@ pub struct Api {
     pub state_new: unsafe extern "C" fn(Stage, i64, *mut State) -> c_int,
     pub state_free: unsafe extern "C" fn(State),
     pub state_reset: unsafe extern "C" fn(Stage, State) -> c_int,
+    pub state_warm: unsafe extern "C" fn(Stage, State, c_int) -> c_int,
     pub state_bytes: unsafe extern "C" fn(State, i64, *mut u64) -> c_int,
     pub state_save: unsafe extern "C" fn(Stage, State, i64, *mut c_void) -> c_int,
     pub state_load: unsafe extern "C" fn(Stage, State, i64, *const c_void) -> c_int,
     pub state_copy: unsafe extern "C" fn(Stage, State, State, i64) -> c_int,
-    pub window: unsafe extern "C" fn(Stage, State, c_int, *const i32, i64, *const f32, c_int, *mut f32) -> c_int,
+    pub window: unsafe extern "C" fn(Stage, State, c_int, *const i32, i64, *const f32, c_int, *mut f32, *mut i32) -> c_int,
     pub commit: unsafe extern "C" fn(Stage, State, c_int) -> c_int,
     pub prefill_buffers: unsafe extern "C" fn(Stage, i64, *mut *mut f32) -> c_int,
     pub prefill: unsafe extern "C" fn(Stage, State, i64, *const i32, i64, *const f32) -> c_int,
+    pub mtp_load: unsafe extern "C" fn(Stage, *const std::ffi::c_char, c_int, i64, c_int, *const c_void, usize) -> c_int,
+    pub mtp_prefill: unsafe extern "C" fn(Stage, State, i64, i64, *const i32) -> c_int,
+    pub mtp_draft: unsafe extern "C" fn(Stage, State, *const i32, i64, c_int, c_int, f32, *mut i32, *mut f32, *mut c_int) -> c_int,
 }
 
 // SAFETY: plain function pointers into the library, which stays loaded.
@@ -153,6 +159,7 @@ pub fn api() -> ns_core::Result<&'static Api> {
             state_new: sym!("ns_qw_state_new"),
             state_free: sym!("ns_qw_state_free"),
             state_reset: sym!("ns_qw_state_reset"),
+            state_warm: sym!("ns_qw_state_warm"),
             state_bytes: sym!("ns_qw_state_bytes"),
             state_save: sym!("ns_qw_state_save"),
             state_load: sym!("ns_qw_state_load"),
@@ -161,6 +168,9 @@ pub fn api() -> ns_core::Result<&'static Api> {
             commit: sym!("ns_qw_commit"),
             prefill_buffers: sym!("ns_qw_prefill_buffers"),
             prefill: sym!("ns_qw_prefill"),
+            mtp_load: sym!("ns_qw_mtp_load"),
+            mtp_prefill: sym!("ns_qw_mtp_prefill"),
+            mtp_draft: sym!("ns_qw_mtp_draft"),
         })
     })
     .as_ref()

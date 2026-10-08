@@ -34,10 +34,14 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/resident_plan_mirror.hpp"
 #include "strata/kernels/rope_scaling.hpp"
+#include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -83,6 +87,8 @@ void carve(ns_qw* w, Bump& b) {
     w->head_logits = b.take<float>(w->vocab > 0 ? T * (uint64_t) w->vocab : 1);
     w->hist_snap = b.take<float>(T * HS);
     w->ple_scratch = b.take<uint8_t>(ple_block_scratch_bytes() + NG_HC_DIM * sizeof(float));
+    w->out_ids = b.take<int32_t>(T + 4);
+    w->arg_scratch = b.take<uint8_t>(argmax_rows_scratch_bytes((int) T));
     w->hand_in = b.take<float>(T * handoff_floats());
     w->hand_out = b.take<float>(T * handoff_floats());
 }
@@ -105,277 +111,23 @@ float* Rt(ns_qw* w, int t) { return w->R + (size_t) t * HC * N; }
 
 }  // namespace
 
-extern "C" {
-
-int ns_qw_new(ns_gpu* g, const ns_qw_desc* d, ns_qw** out) {
-    NS_TRY
-    native_preset();
-    auto* w = new ns_qw();
-    w->g = g;
-    w->q = &g->q;
-    w->lb = d->lb; w->le = d->le; w->n_layer = d->n_layer; w->max_cells = d->max_cells;
-    w->L.assign(d->layers, d->layers + (d->le - d->lb));
-    w->E = d->edges;
-    w->vocab = d->le == d->n_layer ? d->edges.vocab : 0;
-    w->has_ple = d->lb <= 1 && 1 < d->le;
-    for (int64_t l = d->lb; l < d->le; ++l) {
-        w->gdn_idx.push_back(is_qsa(l) ? -1 : w->nG);
-        w->qsa_idx.push_back(is_qsa(l) ? w->nQ : -1);
-        (is_qsa(l) ? w->nQ : w->nG) += 1;
-    }
-    w->s = qsa_real_shapes();
-    w->cap = qsa_selection_width(kTopkMaxCells, w->s);
-    w->max_blocks = d->max_cells / w->s.idx_block + 2;
-    w->attn_floats = (int64_t) qsa_decode_attn_scratch_floats(w->cap, w->s);
-    {   // the plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
-        const int64_t cap = (int64_t) MAXT * K;
-        const int64_t i32 = 4 + (cap + 1) + cap + cap;
-        const int64_t ptr_off = (i32 + 1) & ~1ll;
-        w->plan_i32 = ptr_off + 4 * cap + (cap + 1) + 1;
-    }
-    w->d_res = d->d_res;
-    w->cache_base = d->cache_base;
-    if (d->h_res != nullptr) w->h_res.assign(d->h_res, d->h_res + d->n_layer * NE);
-    Bump count;
-    carve(w, count);
-    w->arena = sycl::malloc_device(count.used + 64, g->dev, g->ctx);
-    if (w->arena == nullptr) { delete w; return ns_fail("qwen: the window's device buffers (" + std::to_string(count.used >> 20) + " MiB) do not fit"); }
-    g->q.memset(w->arena, 0, count.used).wait();
-    Bump real;
-    real.base = (uint8_t*) w->arena;
-    carve(w, real);
-    const int32_t one = 1;
-    g->q.memcpy(w->one, &one, sizeof one).wait();
-    if (d->n_slots > 0) {
-        w->slot_off = sycl::malloc_device<unsigned long long>((size_t) d->n_slots, g->dev, g->ctx);
-        g->q.memcpy(w->slot_off, d->slot_off, (size_t) d->n_slots * 8).wait();
-        w->h_slot_off.assign(d->slot_off, d->slot_off + d->n_slots);
-    }
-    const size_t in_ints = (size_t) MAXT * (1 + kStepCount + NH + NKV + IQ) + 2 + MAXT;
-    w->h_in = (int32_t*) sycl::malloc_host(in_ints * 4, g->ctx);
-    w->h_ple = (float*) sycl::malloc_host((size_t) MAXT * N * 4, g->ctx);
-    w->h_plan_err = (uint32_t*) sycl::malloc_host(64, g->ctx);
-    if (!w->h_in || !w->h_ple || !w->h_plan_err) { ns_qw_free(w); return ns_fail("qwen: pinned staging"); }
-    std::memset(w->h_plan_err, 0, 64);
-    *out = w;
-    return 0;
-    NS_CATCH
-}
-
-void ns_qw_free(ns_qw* w) {
-    if (w == nullptr) return;
-    try {
-        w->q->wait();
-        qw::prefill_free(w);
-        if (w->arena) sycl::free(w->arena, w->g->ctx);
-        if (w->slot_off) sycl::free(w->slot_off, w->g->ctx);
-        if (w->h_in) sycl::free(w->h_in, w->g->ctx);
-        if (w->h_ple) sycl::free(w->h_ple, w->g->ctx);
-        if (w->h_plan_err) sycl::free(w->h_plan_err, w->g->ctx);
-    } catch (...) {}
-    delete w;
-}
-
-int ns_qw_buffers(ns_qw* w, float** hand_in, float** hand_out, size_t* hand_floats) {
-    *hand_in = w->hand_in;
-    *hand_out = w->hand_out;
-    *hand_floats = (size_t) handoff_floats();
-    return 0;
-}
-
-// ---- session state
-
-int ns_qw_state_new(ns_qw* w, int64_t max_cells, ns_qw_state** out) {
-    NS_TRY
-    if (max_cells > w->max_cells || max_cells < 8) return ns_fail("qwen: a session's context past the stage's");
-    auto* st = new ns_qw_state();
-    st->g = w->g;
-    st->max_cells = max_cells;
-    const QsaShapes& s = w->s;
-    const int64_t pages = (max_cells + s.page_size - 1) / s.page_size;
-    const uint64_t rows = (uint64_t) pages * s.n_head_kv * s.page_size;
-    const uint64_t scale_row = (uint64_t) (s.head_dim / KV_Q8_GROUP);
-    const uint64_t pooled_rows = (uint64_t) (max_cells / s.idx_block + 2);
-    auto lay = [&](Bump& b) {
-        st->parts.clear();
-        auto part = [&](uint64_t fixed, uint64_t per_cell) {
-            // a part's bytes: `fixed` always, plus `per_cell` for each cell up to the session's position
-            st->parts.push_back({b.used, fixed, per_cell});
-        };
-        part((uint64_t) w->nG * GDN_FLOATS * 4, 0);
-        st->gdn = b.take<float>((uint64_t) w->nG * GDN_FLOATS);
-        st->qsa.assign((size_t) w->nQ, Qsa{});
-        for (auto& q : st->qsa) {
-            // one cell is n_head_kv rows of its page: (page * n_head_kv + h) * page_size + cell % page_size, so a prefix
-            // of cells is a prefix of pages - whole pages copied
-            part(0, (uint64_t) s.n_head_kv * s.head_dim);
-            q.k_q = b.take<int8_t>(rows * s.head_dim);
-            part(0, (uint64_t) s.n_head_kv * s.head_dim);
-            q.v_q = b.take<int8_t>(rows * s.head_dim);
-            part(0, (uint64_t) s.n_head_kv * scale_row * 2);
-            q.k_scale = b.take<uint16_t>(rows * scale_row);
-            part(0, (uint64_t) s.n_head_kv * scale_row * 2);
-            q.v_scale = b.take<uint16_t>(rows * scale_row);
-            q.page_table = b.take<int32_t>((uint64_t) pages);
-            part((uint64_t) (s.idx_block - 1) * ID * 4, 0);
-            q.idx_tail = b.take<float>((uint64_t) (s.idx_block - 1) * ID);
-            part((uint64_t) ID * 4, 0);
-            q.idx_dead = b.take<float>((uint64_t) ID);
-            part(2 * ID * 4, ID);   // a pooled row a block: 1/idx_block of a row a cell, rounded up below
-            q.idx_pooled = b.take<float>(pooled_rows * ID);
-            part(4, 0);
-            q.idx_block_pos = b.take<int32_t>(1);
-        }
-        if (w->has_ple) {
-            part((uint64_t) HS * 4, 0);
-            st->ple_hist = b.take<float>((uint64_t) HS);
-        }
-    };
-    Bump count;
-    lay(count);
-    st->bytes = count.used;
-    st->arena = sycl::malloc_device(count.used + 64, w->g->dev, w->g->ctx);
-    if (st->arena == nullptr) { delete st; return ns_fail("qwen: a session's state (" + std::to_string(count.used >> 20) + " MiB) does not fit"); }
-    Bump real;
-    real.base = (uint8_t*) st->arena;
-    lay(real);
-    std::vector<int32_t> tab((size_t) pages);
-    for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
-    for (auto& q : st->qsa) w->g->q.memcpy(q.page_table, tab.data(), tab.size() * 4).wait();
-    *out = st;
-    return ns_qw_state_reset(w, st);
-    NS_CATCH
-}
-
-void ns_qw_state_free(ns_qw_state* st) {
-    if (st == nullptr) return;
-    try {
-        st->g->q.wait();
-        if (st->arena) sycl::free(st->arena, st->g->ctx);
-    } catch (...) {}
-    delete st;
-}
-
-int ns_qw_state_reset(ns_qw* w, ns_qw_state* st) {
-    NS_TRY
-    // everything but the page tables: zero (Strata's session_init / qsa_state_zero)
-    sycl::queue& q = w->g->q;
-    q.memset(st->gdn, 0, (size_t) w->nG * GDN_FLOATS * 4);
-    const QsaShapes& s = w->s;
-    const int64_t pages = (st->max_cells + s.page_size - 1) / s.page_size;
-    const uint64_t rows = (uint64_t) pages * s.n_head_kv * s.page_size;
-    for (auto& x : st->qsa) {
-        q.memset(x.k_q, 0, rows * s.head_dim);
-        q.memset(x.v_q, 0, rows * s.head_dim);
-        q.memset(x.k_scale, 0, rows * (s.head_dim / KV_Q8_GROUP) * 2);
-        q.memset(x.v_scale, 0, rows * (s.head_dim / KV_Q8_GROUP) * 2);
-        q.memset(x.idx_tail, 0, (size_t) (s.idx_block - 1) * ID * 4);
-        q.memset(x.idx_dead, 0, (size_t) ID * 4);
-        q.memset(x.idx_pooled, 0, (size_t) (st->max_cells / s.idx_block + 2) * ID * 4);
-        q.memset(x.idx_block_pos, 0, 4);
-    }
-    if (st->ple_hist) q.memset(st->ple_hist, 0, (size_t) HS * 4);
-    q.wait();
-    return 0;
-    NS_CATCH
-}
-
-// the bytes of each part a session at position `pos` holds
-static uint64_t part_bytes(const ns_qw_state* st, const ns_qw_state::Part& p, int64_t pos) {
-    if (p.per_cell == 0) return p.fixed;
-    // the K/V parts: whole pages; the pooled indexer rows: a row a completed block, plus the two spare
-    const int64_t cells = std::min<int64_t>(st->max_cells, (pos + 3) / 4 * 4);
-    if (p.fixed > 0) return p.fixed + (uint64_t) (cells / 4) * p.per_cell * 4;
-    return (uint64_t) cells * p.per_cell;
-}
-
-int ns_qw_state_bytes(ns_qw_state* st, int64_t pos, uint64_t* bytes) {
-    uint64_t n = 0;
-    for (const auto& p : st->parts) n += part_bytes(st, p, pos);
-    *bytes = n;
-    return 0;
-}
-
-int ns_qw_state_save(ns_qw* w, ns_qw_state* st, int64_t pos, void* host) {
-    NS_TRY
-    uint8_t* h = (uint8_t*) host;
-    for (const auto& p : st->parts) {
-        const uint64_t b = part_bytes(st, p, pos);
-        w->g->q.memcpy(h, (uint8_t*) st->arena + p.off, b);
-        h += b;
-    }
-    w->g->q.wait();
-    return 0;
-    NS_CATCH
-}
-
-int ns_qw_state_load(ns_qw* w, ns_qw_state* st, int64_t pos, const void* host) {
-    NS_TRY
-    if (pos > st->max_cells) return ns_fail("qwen: a checkpoint past this session's context");
-    const uint8_t* h = (const uint8_t*) host;
-    for (const auto& p : st->parts) {
-        const uint64_t b = part_bytes(st, p, pos);
-        w->g->q.memcpy((uint8_t*) st->arena + p.off, h, b);
-        h += b;
-    }
-    w->g->q.wait();
-    return 0;
-    NS_CATCH
-}
-
-int ns_qw_state_copy(ns_qw* w, ns_qw_state* dst, const ns_qw_state* src, int64_t pos) {
-    NS_TRY
-    if (dst->max_cells < pos || dst->parts.size() != src->parts.size()) return ns_fail("qwen: copying a session into a smaller one");
-    for (size_t i = 0; i < src->parts.size(); ++i)
-        w->g->q.memcpy((uint8_t*) dst->arena + dst->parts[i].off, (const uint8_t*) src->arena + src->parts[i].off,
-                       part_bytes(src, src->parts[i], pos));
-    w->g->q.wait();
-    return 0;
-    NS_CATCH
-}
-
-// ---- the window
-
-int ns_qw_window(ns_qw* w, ns_qw_state* st, int T, const int32_t* tokens, int64_t pos0, const float* ple_rows,
-                 int logits_from, float* logits_host) {
-    NS_TRY
-    if (T < 1 || T > MAXT) return ns_fail("qwen: a window holds 1.." + std::to_string(MAXT) + " tokens");
-    if (pos0 + T > st->max_cells) return ns_fail("qwen: the window runs past the session's context");
+namespace {
+// a window of T tokens on the device, everything after the host staged its inputs (in pinned memory): what its graph holds
+void window_body(ns_qw* w, ns_qw_state* st, int T) {
     sycl::queue* cs = w->q;
     const QsaShapes& s = w->s;
     const GrShapes gs{N, HC, HC_LR};
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t MT = MAXT;
     const bool self_commit = T == 1;   // Strata's one_token_self_commit (on except on HIP)
-    native_expert_set_swiglu_limit(0.0f);   // the shared grouped-expert kernels' nextsycl switches: as upstream
-    native_expert_set_lanes(0);
-    native_expert_set_phase(0);
-
-    // ---- the inputs (Strata's stage_inputs), through this GPU's pinned memory
-    {
-        int32_t* h = w->h_in;
-        int32_t* h_tok = h;
-        int32_t* h_step = h_tok + MT;
-        int32_t* h_pos = h_step + MT * kStepCount;
-        int32_t* pk = h_pos + MT * NH;
-        int32_t* pi = pk + MT * NKV;
-        for (int t = 0; t < T; ++t) {
-            h_tok[t] = tokens[t];
-            qsa_step_fill(h_step + t * kStepCount, pos0 + t, s);
-            const int32_t p = (int32_t) (pos0 + t);
-            for (int64_t i = 0; i < NH; ++i) h_pos[t * NH + i] = p;
-            for (int64_t i = 0; i < NKV; ++i) pk[t * NKV + i] = p;
-            for (int64_t i = 0; i < IQ; ++i) pi[t * IQ + i] = p;
-        }
-        cs->memcpy(w->tok, h_tok, (size_t) T * 4);
-        cs->memcpy(w->step, h_step, (size_t) T * kStepCount * 4);
-        cs->memcpy(w->pos, h_pos, (size_t) MT * (NH + NKV + IQ) * 4);
-        if (w->has_ple) {
-            if (ple_rows == nullptr) return ns_fail("qwen: the PLE layer's stage needs the window's PLE rows");
-            std::memcpy(w->h_ple, ple_rows, (size_t) T * N * 4);
-            cs->memcpy(w->ple, w->h_ple, (size_t) T * N * 4);
-        }
-    }
+    int32_t* const h_tok = w->h_in;
+    int32_t* const h_step = h_tok + MT;
+    int32_t* const h_pos = h_step + MT * kStepCount;
+    // the inputs from pinned memory (read when the graph runs)
+    copy_i32_from_mapped(w->tok, h_tok, T, cs);
+    copy_i32_from_mapped(w->step, h_step, (int64_t) T * kStepCount, cs);
+    copy_i32_from_mapped(w->pos, h_pos, MT * (NH + NKV + IQ), cs);
+    if (w->has_ple) copy_from_mapped(w->ple, w->h_ple, (int64_t) T * N, cs);
 
     // ---- the embeddings broadcast to the streams, or the previous stage's residual, pending write and inject
     if (w->lb > 0) {
@@ -508,6 +260,9 @@ int ns_qw_window(ns_qw* w, ns_qw_state* st, int T, const int32_t* tokens, int64_
         // ---- the router: softmax over the experts, top 10, renormalized
         bf16_gemv_fp32_mmvf_multi(w->mixed, N, v.router, w->logits, NE, N, NE, n, cs);
         native_router_top10_multi_ne(w->logits, w->ids, w->w, n, (int) NE, cs);
+        // an expert not in VRAM is read from its pinned host mirror over PCIe (the plan points at it), as Strata's
+        // single-card serving does (its RAM mirror)
+        resident_plan_set_mirror(w->mirror != nullptr ? w->d_res : nullptr, w->mirror);
         resident_plan(w->ids, n * (int) K, (int) K, w->d_res + l * NE, (int) NE, w->cache_base, w->slot_off, 0, w->plan,
                       (long long) MT * K, nullptr, 0, cs, w->h_plan_err);
         // ---- the shared expert, scaled by sigmoid(gate_inp_shexp . x)
@@ -554,35 +309,16 @@ int ns_qw_window(ns_qw* w, ns_qw_state* st, int T, const int32_t* tokens, int64_
         fused_gr_read_multi(fa, T, w->xn, cs);
         native_quantize_q8_1(w->head_mixed, w->xq, (int) N, T, cs);
         native_mmvq(w->E.out_type, w->E.out, w->xq, w->head_logits, (int) N, (int) w->vocab, T, cs);
-        if (logits_host != nullptr && logits_from < T)
-            cs->memcpy(logits_host, w->head_logits + (size_t) logits_from * w->vocab,
-                       (size_t) (T - logits_from) * w->vocab * 4);
     }
-    cs->wait_and_throw();
-    if (*(volatile uint32_t*) w->h_plan_err != 0) {
-        *(volatile uint32_t*) w->h_plan_err = 0;
-        return ns_fail("qwen: the expert plan met an expert that is not in VRAM");
-    }
-    w->last_t = T;
-    w->last_pos0 = pos0;
-    w->last_st = st;
-    return 0;
-    NS_CATCH
 }
 
-int ns_qw_commit(ns_qw* w, ns_qw_state* st, int n_keep) {
-    NS_TRY
-    if (st != w->last_st || n_keep < 1 || n_keep > w->last_t) return ns_fail("qwen: a commit that is not the last window's");
-    w->last_st = nullptr;
-    if (w->last_t == 1) return 0;   // a one-token window committed itself
+// the commit of the stage's last window on the device (n_keep and the positions staged in pinned memory)
+void commit_body(ns_qw* w, ns_qw_state* st) {
     sycl::queue* cs = w->q;
     const QsaShapes& s = w->s;
     const int64_t TS = (s.idx_block - 1) * ID, MT = MAXT;
-    int32_t* hc = w->h_in;   // reused: the window's inputs are on the device
-    hc[0] = n_keep;
-    hc[1] = n_keep - 1;
-    for (int t = 0; t < MT; ++t) hc[2 + t] = t < n_keep ? (int32_t) (w->last_pos0 + t) : -1;
-    cs->memcpy(w->commit, hc, (size_t) (2 + MT) * 4);
+    int32_t* hc = w->h_in;
+    copy_i32_from_mapped(w->commit, hc, 2 + MT, cs);
     for (int64_t l = w->lb; l < w->le; ++l) {
         const ns_qw_layer& v = w->L[(size_t) (l - w->lb)];
         const int64_t li = l - w->lb;
@@ -604,6 +340,369 @@ int ns_qw_commit(ns_qw* w, ns_qw_state* st, int n_keep) {
         }
     }
     if (w->has_ple) copy_indexed(st->ple_hist, w->hist_snap, HS, w->commit + 1, HS, cs);
+}
+
+}  // namespace
+
+extern "C" {
+
+int ns_qw_new(ns_gpu* g, const ns_qw_desc* d, ns_qw** out) {
+    NS_TRY
+    native_preset();
+    auto* w = new ns_qw();
+    w->g = g;
+    w->q = &g->q;
+    w->lb = d->lb; w->le = d->le; w->n_layer = d->n_layer; w->max_cells = d->max_cells;
+    w->L.assign(d->layers, d->layers + (d->le - d->lb));
+    w->E = d->edges;
+    w->vocab = d->le == d->n_layer ? d->edges.vocab : 0;
+    w->has_ple = d->lb <= 1 && 1 < d->le;
+    for (int64_t l = d->lb; l < d->le; ++l) {
+        w->gdn_idx.push_back(is_qsa(l) ? -1 : w->nG);
+        w->qsa_idx.push_back(is_qsa(l) ? w->nQ : -1);
+        (is_qsa(l) ? w->nQ : w->nG) += 1;
+    }
+    w->s = qsa_real_shapes();
+    w->cap = qsa_selection_width(kTopkMaxCells, w->s);
+    w->max_blocks = d->max_cells / w->s.idx_block + 2;
+    w->attn_floats = (int64_t) qsa_decode_attn_scratch_floats(w->cap, w->s);
+    {   // the plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
+        const int64_t cap = (int64_t) MAXT * K;
+        const int64_t i32 = 4 + (cap + 1) + cap + cap;
+        const int64_t ptr_off = (i32 + 1) & ~1ll;
+        w->plan_i32 = ptr_off + 4 * cap + (cap + 1) + 1;
+    }
+    w->d_res = d->d_res;
+    w->cache_base = d->cache_base;
+    if (d->h_res != nullptr) w->h_res.assign(d->h_res, d->h_res + d->n_layer * NE);
+    w->mirror = (const unsigned long long*) d->mirror;
+    if (d->h_mirror != nullptr) w->h_mirror.assign(d->h_mirror, d->h_mirror + d->n_layer * NE);
+    Bump count;
+    carve(w, count);
+    w->arena = sycl::malloc_device(count.used + 64, g->dev, g->ctx);
+    if (w->arena == nullptr) { delete w; return ns_fail("qwen: the window's device buffers (" + std::to_string(count.used >> 20) + " MiB) do not fit"); }
+    g->q.memset(w->arena, 0, count.used).wait();
+    Bump real;
+    real.base = (uint8_t*) w->arena;
+    carve(w, real);
+    const int32_t one = 1;
+    g->q.memcpy(w->one, &one, sizeof one).wait();
+    if (d->n_slots > 0) {
+        w->slot_off = sycl::malloc_device<unsigned long long>((size_t) d->n_slots, g->dev, g->ctx);
+        g->q.memcpy(w->slot_off, d->slot_off, (size_t) d->n_slots * 8).wait();
+        w->h_slot_off.assign(d->slot_off, d->slot_off + d->n_slots);
+    }
+    const size_t in_ints = (size_t) MAXT * (1 + kStepCount + NH + NKV + IQ) + 2 + MAXT;
+    w->h_in = (int32_t*) sycl::malloc_host(in_ints * 4, g->ctx);
+    w->h_ple = (float*) sycl::malloc_host((size_t) MAXT * N * 4, g->ctx);
+    w->h_plan_err = (uint32_t*) sycl::malloc_host(64, g->ctx);
+    if (w->vocab > 0) w->h_logits = (float*) sycl::malloc_host((size_t) MAXT * (size_t) w->vocab * 4, g->ctx);
+    if (!w->h_in || !w->h_ple || !w->h_plan_err) { ns_qw_free(w); return ns_fail("qwen: pinned staging"); }
+    std::memset(w->h_plan_err, 0, 64);
+    *out = w;
+    return 0;
+    NS_CATCH
+}
+
+void ns_qw_free(ns_qw* w) {
+    if (w == nullptr) return;
+    try {
+        w->q->wait();
+        qw::prefill_free(w);
+        qw::mtp_free(w);
+        if (w->arena) sycl::free(w->arena, w->g->ctx);
+        if (w->slot_off) sycl::free(w->slot_off, w->g->ctx);
+        if (w->h_in) sycl::free(w->h_in, w->g->ctx);
+        if (w->h_ple) sycl::free(w->h_ple, w->g->ctx);
+        if (w->h_plan_err) sycl::free(w->h_plan_err, w->g->ctx);
+        if (w->h_logits) sycl::free(w->h_logits, w->g->ctx);
+    } catch (...) {}
+    delete w;
+}
+
+int ns_qw_buffers(ns_qw* w, float** hand_in, float** hand_out, size_t* hand_floats) {
+    *hand_in = w->hand_in;
+    *hand_out = w->hand_out;
+    *hand_floats = (size_t) handoff_floats();
+    return 0;
+}
+
+// ---- session state
+
+int ns_qw_state_new(ns_qw* w, int64_t max_cells, ns_qw_state** out) {
+    NS_TRY
+    if (max_cells > w->max_cells || max_cells < 8) return ns_fail("qwen: a session's context past the stage's");
+    auto* st = new ns_qw_state();
+    st->g = w->g;
+    st->max_cells = max_cells;
+    const QsaShapes& s = w->s;
+    const int64_t pages = (max_cells + s.page_size - 1) / s.page_size;
+    const uint64_t rows = (uint64_t) pages * s.n_head_kv * s.page_size;
+    const uint64_t scale_row = (uint64_t) (s.head_dim / KV_Q8_GROUP);
+    const uint64_t pooled_rows = (uint64_t) (max_cells / s.idx_block + 2);
+    auto lay = [&](Bump& b) {
+        st->parts.clear();
+        auto part = [&](uint64_t fixed, uint64_t per_cell) {
+            // a part's bytes: `fixed` always, plus `per_cell` for each cell up to the session's position
+            st->parts.push_back({b.used, fixed, per_cell});
+        };
+        part((uint64_t) w->nG * GDN_FLOATS * 4, 0);
+        st->gdn = b.take<float>((uint64_t) w->nG * GDN_FLOATS);
+        st->qsa.assign((size_t) w->nQ, Qsa{});
+        for (auto& q : st->qsa) {
+            // one cell is n_head_kv rows of its page: (page * n_head_kv + h) * page_size + cell % page_size, so a prefix
+            // of cells is a prefix of pages - whole pages copied
+            part(0, (uint64_t) s.n_head_kv * s.head_dim);
+            q.k_q = b.take<int8_t>(rows * s.head_dim);
+            part(0, (uint64_t) s.n_head_kv * s.head_dim);
+            q.v_q = b.take<int8_t>(rows * s.head_dim);
+            part(0, (uint64_t) s.n_head_kv * scale_row * 2);
+            q.k_scale = b.take<uint16_t>(rows * scale_row);
+            part(0, (uint64_t) s.n_head_kv * scale_row * 2);
+            q.v_scale = b.take<uint16_t>(rows * scale_row);
+            q.page_table = b.take<int32_t>((uint64_t) pages);
+            part((uint64_t) (s.idx_block - 1) * ID * 4, 0);
+            q.idx_tail = b.take<float>((uint64_t) (s.idx_block - 1) * ID);
+            part((uint64_t) ID * 4, 0);
+            q.idx_dead = b.take<float>((uint64_t) ID);
+            part(2 * ID * 4, ID);   // a pooled row a block: 1/idx_block of a row a cell, rounded up below
+            q.idx_pooled = b.take<float>(pooled_rows * ID);
+            part(4, 0);
+            q.idx_block_pos = b.take<int32_t>(1);
+        }
+        if (w->has_ple) {
+            part((uint64_t) HS * 4, 0);
+            st->ple_hist = b.take<float>((uint64_t) HS);
+        }
+        if (w->mtp != nullptr) {   // the draft layer's K/V: int8 pools and an identity page table, as a QSA layer's
+            Qsa& q = st->mtp;
+            part(0, (uint64_t) s.n_head_kv * s.head_dim);
+            q.k_q = b.take<int8_t>(rows * s.head_dim);
+            part(0, (uint64_t) s.n_head_kv * s.head_dim);
+            q.v_q = b.take<int8_t>(rows * s.head_dim);
+            part(0, (uint64_t) s.n_head_kv * scale_row * 2);
+            q.k_scale = b.take<uint16_t>(rows * scale_row);
+            part(0, (uint64_t) s.n_head_kv * scale_row * 2);
+            q.v_scale = b.take<uint16_t>(rows * scale_row);
+            q.page_table = b.take<int32_t>((uint64_t) pages);
+        }
+    };
+    Bump count;
+    lay(count);
+    st->bytes = count.used;
+    st->arena = sycl::malloc_device(count.used + 64, w->g->dev, w->g->ctx);
+    if (st->arena == nullptr) { delete st; return ns_fail("qwen: a session's state (" + std::to_string(count.used >> 20) + " MiB) does not fit"); }
+    Bump real;
+    real.base = (uint8_t*) st->arena;
+    lay(real);
+    std::vector<int32_t> tab((size_t) pages);
+    for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
+    for (auto& q : st->qsa) w->g->q.memcpy(q.page_table, tab.data(), tab.size() * 4).wait();
+    if (st->mtp.page_table) w->g->q.memcpy(st->mtp.page_table, tab.data(), tab.size() * 4).wait();
+    *out = st;
+    return ns_qw_state_reset(w, st);
+    NS_CATCH
+}
+
+void ns_qw_state_free(ns_qw_state* st) {
+    if (st == nullptr) return;
+    try {
+        st->g->q.wait();
+        if (st->arena) sycl::free(st->arena, st->g->ctx);
+    } catch (...) {}
+    delete st;
+}
+
+int ns_qw_state_reset(ns_qw* w, ns_qw_state* st) {
+    NS_TRY
+    // everything but the page tables: zero (Strata's session_init / qsa_state_zero)
+    sycl::queue& q = w->g->q;
+    q.memset(st->gdn, 0, (size_t) w->nG * GDN_FLOATS * 4);
+    const QsaShapes& s = w->s;
+    const int64_t pages = (st->max_cells + s.page_size - 1) / s.page_size;
+    const uint64_t rows = (uint64_t) pages * s.n_head_kv * s.page_size;
+    for (auto& x : st->qsa) {
+        q.memset(x.k_q, 0, rows * s.head_dim);
+        q.memset(x.v_q, 0, rows * s.head_dim);
+        q.memset(x.k_scale, 0, rows * (s.head_dim / KV_Q8_GROUP) * 2);
+        q.memset(x.v_scale, 0, rows * (s.head_dim / KV_Q8_GROUP) * 2);
+        q.memset(x.idx_tail, 0, (size_t) (s.idx_block - 1) * ID * 4);
+        q.memset(x.idx_dead, 0, (size_t) ID * 4);
+        q.memset(x.idx_pooled, 0, (size_t) (st->max_cells / s.idx_block + 2) * ID * 4);
+        q.memset(x.idx_block_pos, 0, 4);
+    }
+    if (st->ple_hist) q.memset(st->ple_hist, 0, (size_t) HS * 4);
+    if (st->mtp.k_q) {
+        Qsa& x = st->mtp;
+        q.memset(x.k_q, 0, rows * s.head_dim);
+        q.memset(x.v_q, 0, rows * s.head_dim);
+        q.memset(x.k_scale, 0, rows * (s.head_dim / KV_Q8_GROUP) * 2);
+        q.memset(x.v_scale, 0, rows * (s.head_dim / KV_Q8_GROUP) * 2);
+    }
+    q.wait();
+    return 0;
+    NS_CATCH
+}
+
+// the bytes of each part a session at position `pos` holds
+static uint64_t part_bytes(const ns_qw_state* st, const ns_qw_state::Part& p, int64_t pos) {
+    if (p.per_cell == 0) return p.fixed;
+    // the K/V parts: whole pages; the pooled indexer rows: a row a completed block, plus the two spare
+    const int64_t cells = std::min<int64_t>(st->max_cells, (pos + 3) / 4 * 4);
+    if (p.fixed > 0) return p.fixed + (uint64_t) (cells / 4) * p.per_cell * 4;
+    return (uint64_t) cells * p.per_cell;
+}
+
+int ns_qw_state_bytes(ns_qw_state* st, int64_t pos, uint64_t* bytes) {
+    uint64_t n = 0;
+    for (const auto& p : st->parts) n += part_bytes(st, p, pos);
+    *bytes = n;
+    return 0;
+}
+
+int ns_qw_state_save(ns_qw* w, ns_qw_state* st, int64_t pos, void* host) {
+    NS_TRY
+    uint8_t* h = (uint8_t*) host;
+    for (const auto& p : st->parts) {
+        const uint64_t b = part_bytes(st, p, pos);
+        w->g->q.memcpy(h, (uint8_t*) st->arena + p.off, b);
+        h += b;
+    }
+    w->g->q.wait();
+    return 0;
+    NS_CATCH
+}
+
+int ns_qw_state_load(ns_qw* w, ns_qw_state* st, int64_t pos, const void* host) {
+    NS_TRY
+    if (pos > st->max_cells) return ns_fail("qwen: a checkpoint past this session's context");
+    const uint8_t* h = (const uint8_t*) host;
+    for (const auto& p : st->parts) {
+        const uint64_t b = part_bytes(st, p, pos);
+        w->g->q.memcpy((uint8_t*) st->arena + p.off, h, b);
+        h += b;
+    }
+    w->g->q.wait();
+    return 0;
+    NS_CATCH
+}
+
+int ns_qw_state_copy(ns_qw* w, ns_qw_state* dst, const ns_qw_state* src, int64_t pos) {
+    NS_TRY
+    if (dst->max_cells < pos || dst->parts.size() != src->parts.size()) return ns_fail("qwen: copying a session into a smaller one");
+    for (size_t i = 0; i < src->parts.size(); ++i)
+        w->g->q.memcpy((uint8_t*) dst->arena + dst->parts[i].off, (const uint8_t*) src->arena + src->parts[i].off,
+                       part_bytes(src, src->parts[i], pos));
+    w->g->q.wait();
+    return 0;
+    NS_CATCH
+}
+
+// ---- the window
+
+int ns_qw_window(ns_qw* w, ns_qw_state* st, int T, const int32_t* tokens, int64_t pos0, const float* ple_rows,
+                 int logits_from, float* logits_host, int32_t* argmax_host) {
+    NS_TRY
+    if (T < 1 || T > MAXT) return ns_fail("qwen: a window holds 1.." + std::to_string(MAXT) + " tokens");
+    if (pos0 + T > st->max_cells) return ns_fail("qwen: the window runs past the session's context");
+    sycl::queue* cs = w->q;
+    const QsaShapes& s = w->s;
+    const GrShapes gs{N, HC, HC_LR};
+    const int64_t TS = (s.idx_block - 1) * ID;
+    const int64_t MT = MAXT;
+    const bool self_commit = T == 1;   // Strata's one_token_self_commit (on except on HIP)
+    native_expert_set_swiglu_limit(0.0f);   // the shared grouped-expert kernels' nextsycl switches: as upstream
+    native_expert_set_lanes(0);
+    native_expert_set_phase(0);
+
+    // ---- the inputs (Strata's stage_inputs), through this GPU's pinned memory
+    {
+        int32_t* h = w->h_in;
+        int32_t* h_tok = h;
+        int32_t* h_step = h_tok + MT;
+        int32_t* h_pos = h_step + MT * kStepCount;
+        int32_t* pk = h_pos + MT * NH;
+        int32_t* pi = pk + MT * NKV;
+        for (int t = 0; t < T; ++t) {
+            h_tok[t] = tokens[t];
+            qsa_step_fill(h_step + t * kStepCount, pos0 + t, s);
+            const int32_t p = (int32_t) (pos0 + t);
+            for (int64_t i = 0; i < NH; ++i) h_pos[t * NH + i] = p;
+            for (int64_t i = 0; i < NKV; ++i) pk[t * NKV + i] = p;
+            for (int64_t i = 0; i < IQ; ++i) pi[t * IQ + i] = p;
+        }
+        if (w->has_ple) {
+            if (ple_rows == nullptr) return ns_fail("qwen: the PLE layer's stage needs the window's PLE rows");
+            std::memcpy(w->h_ple, ple_rows, (size_t) T * N * 4);
+        }
+    }
+    int32_t* const h_tok = w->h_in;
+    int32_t* const h_step = h_tok + MT;
+    int32_t* const h_pos = h_step + MT * kStepCount;
+
+    run_graph(*cs, st->win[T], [&] { window_body(w, st, T); });
+    static const bool prof = [] { const char* v = std::getenv("NS_QW_PROFILE"); return v && v[0] == '1'; }();
+    const auto tg0 = std::chrono::steady_clock::now();
+    if (prof) cs->wait_and_throw();
+    const auto tg1 = std::chrono::steady_clock::now();
+    if (w->le == w->n_layer && logits_host != nullptr && logits_from < T) {
+        const size_t bytes = (size_t) (T - logits_from) * w->vocab * 4;
+        cs->memcpy(w->h_logits, w->head_logits + (size_t) logits_from * w->vocab, bytes);
+        cs->wait_and_throw();
+        std::memcpy(logits_host, w->h_logits, bytes);
+    }
+    if (w->le == w->n_layer && argmax_host != nullptr) {
+        if (argmax_rows_wanted()) {
+            argmax_rows(w->head_logits, T, (int) w->vocab, w->arg_scratch, w->out_ids, cs);
+        } else {
+            SamplerParams sp;
+            sp.greedy = true;
+            sp.temperature = 0.0f;
+            sample_tokens(w->head_logits, T, (int) w->vocab, nullptr, 0, sp, w->out_ids, cs);
+        }
+        cs->memcpy(w->h_in, w->out_ids, (size_t) T * 4);   // (the inputs' staging: read by the graph, done)
+        cs->wait_and_throw();
+        std::memcpy(argmax_host, w->h_in, (size_t) T * 4);
+    }
+    cs->wait_and_throw();
+    if (prof)
+        std::fprintf(stderr, "[qw stage %lld-%lld T %d: graph %.2f ms, logits %.2f ms]\n", (long long) w->lb, (long long) w->le - 1, T,
+                     std::chrono::duration<double, std::milli>(tg1 - tg0).count(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg1).count());
+    if (*(volatile uint32_t*) w->h_plan_err != 0) {
+        *(volatile uint32_t*) w->h_plan_err = 0;
+        return ns_fail("qwen: the expert plan met an expert that is not in VRAM");
+    }
+    w->last_t = T;
+    w->last_pos0 = pos0;
+    w->last_st = st;
+    return 0;
+    NS_CATCH
+}
+
+int ns_qw_state_warm(ns_qw* w, ns_qw_state* st, int max_t) {
+    NS_TRY
+    // every graph a session's decode uses, recorded now (Strata's warm: no capture inside a decode round)
+    for (int T = 1; T <= std::min(max_t, MAXT); ++T) run_graph(*w->q, st->win[T], [&] { window_body(w, st, T); }, false);
+    run_graph(*w->q, st->commit, [&] { commit_body(w, st); }, false);
+    if (w->mtp != nullptr) qw::mtp_warm(w, st);
+    return 0;
+    NS_CATCH
+}
+
+int ns_qw_commit(ns_qw* w, ns_qw_state* st, int n_keep) {
+    NS_TRY
+    if (st != w->last_st || n_keep < 1 || n_keep > w->last_t) return ns_fail("qwen: a commit that is not the last window's");
+    w->last_st = nullptr;
+    if (w->last_t == 1) return 0;   // a one-token window committed itself
+    sycl::queue* cs = w->q;
+    const QsaShapes& s = w->s;
+    const int64_t TS = (s.idx_block - 1) * ID, MT = MAXT;
+    int32_t* hc = w->h_in;   // reused: the window's inputs are on the device
+    hc[0] = n_keep;
+    hc[1] = n_keep - 1;
+    for (int t = 0; t < MT; ++t) hc[2 + t] = t < n_keep ? (int32_t) (w->last_pos0 + t) : -1;
+    run_graph(*cs, st->commit, [&] { commit_body(w, st); });
     cs->wait_and_throw();
     return 0;
     NS_CATCH

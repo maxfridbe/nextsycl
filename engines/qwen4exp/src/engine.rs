@@ -21,6 +21,24 @@ use crate::ple;
 /// tokens a window takes (the kernels' kVerifyMaxT)
 pub const MAX_WINDOW: usize = 8;
 
+/// the speculative window with the draft layer (Strata's --spec 4: the token and up to 3 drafts; NS_QW_SPEC)
+fn spec() -> usize {
+    static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("NS_QW_SPEC").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| (2..=MAX_WINDOW).contains(n)).unwrap_or(4))
+}
+/// NS_QW_PROFILE=1: each decode round's time by part, on stderr
+fn profile() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("NS_QW_PROFILE").is_ok_and(|v| v == "1"))
+}
+
+/// a draft goes into the window while at least this likely under the draft layer (Strata's --spec-min-p 0.5;
+/// NS_QW_SPEC_MIN_P)
+fn spec_min_p() -> f32 {
+    static P: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("NS_QW_SPEC_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5))
+}
+
 /// tokens a prompt-path chunk takes (NS_QW_CHUNK; Strata serves --prefill 4096): its buffers grow with it, ~0.4 MiB a
 /// token on each GPU
 pub fn prompt_chunk() -> usize {
@@ -49,9 +67,15 @@ struct Stage {
     hand_floats: usize,
     weight_bytes: u64,
     expert_bytes: u64,
+    /// the token embedding when this stage has it (the first)
+    embd_ptr: *const std::ffi::c_void,
+    vram_slots: usize,
+    host_slots: usize,
     // kept alive for `raw`
     _dense: Vec<DevBuf>,
     _experts: Vec<DevBuf>,
+    _hosts: Vec<ns_core::HostBuf>,
+    _d_mirror: Option<DevBuf>,
     _d_res: DevBuf,
 }
 
@@ -79,6 +103,13 @@ pub struct Session {
 // SAFETY: the states are device memory reached only through the engine, which serializes its calls.
 unsafe impl Send for Session {}
 
+impl Session {
+    /// this session among the live ones
+    fn uid(&self) -> usize {
+        Arc::as_ptr(&self.alive) as usize
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::SeqCst);
@@ -91,15 +122,26 @@ impl Drop for Session {
     }
 }
 
-/// Generation: the logits to draw the next token from, or the drawn token not fed yet
+/// Generation: the logits to draw the next token from, or the drawn token not fed yet and the draft layer's guesses
+/// after it (each with its probability under the draft layer)
 pub struct Decoder {
     pub logits: Option<Vec<f32>>,
     pub next: Option<u32>,
+    pub draft: bool,
+    pub drafts: Vec<u32>,
+    pub probs: Vec<f32>,
+    pub drafted: u64,
+    pub accepted: u64,
 }
 
 impl Decoder {
+    pub fn new(logits: Option<Vec<f32>>, next: Option<u32>, draft: bool) -> Decoder {
+        Decoder { logits, next, draft, drafts: Vec::new(), probs: Vec::new(), drafted: 0, accepted: 0 }
+    }
     pub fn pending(&mut self) -> Option<u32> {
         self.logits = None;
+        self.drafts.clear();
+        self.probs.clear();
         self.next.take()
     }
 }
@@ -169,6 +211,8 @@ struct Run {
     /// the last window id committed whole by another call (a session's open pass found it so)
     flushed: Vec<u64>,
     staging: Vec<u8>,
+    /// the last window run: (the session, its first position, its tokens) - the drafter reads its residual rows
+    last_window: Option<(usize, usize, usize)>,
 }
 
 pub struct Qwen<'g> {
@@ -178,6 +222,8 @@ pub struct Qwen<'g> {
     table: ple::Table,
     api: &'static ffi::Api,
     run: Mutex<Run>,
+    /// the draft layer is on the last stage
+    pub mtp: bool,
     pub load_seconds: f64,
     pub load_bytes: u64,
     pub vocab: usize,
@@ -233,13 +279,33 @@ fn check_geometry(m: &Model) -> Result<()> {
     Ok(())
 }
 
+/// Strata's expert profile (tools/make_profile.py: `STRP`, version, n_layers, n_expert, slots, n_ranked, then the
+/// ranked (layer, expert) pairs as u16 pairs, most routed first)
+fn read_profile(path: &str, nl: u64, ne: usize) -> Result<Vec<(usize, usize)>> {
+    let b = std::fs::read(path).map_err(|e| err(format!("{path}: {e}")))?;
+    let u = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    if b.len() < 24 || &b[..4] != b"STRP" || u(8) as u64 != nl || u(12) as usize != ne {
+        return Err(err(format!("{path}: not an expert profile of {nl} layers x {ne} experts")));
+    }
+    let n = u(20) as usize;
+    if b.len() < 24 + n * 4 {
+        return Err(err(format!("{path}: its ranked list is truncated")));
+    }
+    Ok((0..n).map(|i| {
+        let at = 24 + i * 4;
+        (u16::from_le_bytes([b[at], b[at + 1]]) as usize, u16::from_le_bytes([b[at + 2], b[at + 3]]) as usize)
+    })
+    .filter(|(l, e)| (*l as u64) < nl && *e < ne)
+    .collect())
+}
+
 /// The bytes of layer `l`'s weights other than the routed experts
 fn dense_bytes(m: &Model, l: u64) -> u64 {
     m.roles(l).iter().filter(|r| !matches!(r, Role::ExpGate | Role::ExpUp | Role::ExpDown)).filter_map(|r| m.tensor(l, *r)).map(|t| (t.bytes + 255) & !255).sum()
 }
 
 impl<'g> Qwen<'g> {
-    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], kv: (usize, usize), log: &mut dyn FnMut(String)) -> Result<Qwen<'g>> {
+    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], kv: (usize, usize), draft: bool, log: &mut dyn FnMut(String)) -> Result<Qwen<'g>> {
         let t0 = Instant::now();
         let api = ffi::api()?;
         let m = Model::open(f).map_err(|e| err(e.0))?;
@@ -271,7 +337,7 @@ impl<'g> Qwen<'g> {
             q * 1184 * kv_tokens as u64 + gd * (128 * 48 * 128 + 10240 * 3) * 4 * kv_sessions.max(1) as u64
         };
         let margin: u64 = std::env::var("NS_VRAM_GUARD_GIB").ok().and_then(|v| v.parse::<f64>().ok()).map_or(1536 << 20, |g| (g * (1u64 << 30) as f64) as u64);
-        let window_b: u64 = 400 << 20;
+        let window_b: u64 = 128 << 20; // the window buffers (~60 MiB) and the GEMM scratch
         let split_env: Option<Vec<u64>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
         let mut bounds = Vec::new();
         let mut lb = 0u64;
@@ -303,13 +369,59 @@ impl<'g> Qwen<'g> {
         if gpus.is_empty() || bounds.last().map(|b| b.1) != Some(nl) {
             return Err(err("qwen4exp: the layers do not fit these GPUs"));
         }
+        // ---- the experts in VRAM: every one, unless the last stage's do not all fit (one card holds 24-25 GiB of the
+        // 33): then the most routed by the expert profile (NS_QW_EXPERT_PROFILE, Strata's STRP file), the rest in this
+        // GPU's pinned host memory, read by the expert kernels over PCIe (Strata's single-card RAM mirror)
+        let ne = g.n_expert as usize;
+        let mut resident = vec![true; nl as usize * ne];
+        if let (Some(&(lb, le)), Some(gpu)) = (bounds.last(), gpus.get(bounds.len() - 1)) {
+            let (total, free) = gpu.memory()?;
+            let mut have = free.unwrap_or(total).saturating_sub(margin + window_b + state_b(lb, le));
+            if lb == 0 {
+                have = have.saturating_sub(embd_b);
+            }
+            let head_b = [Role::Output, Role::OutputHcNorm, Role::OutputHcDown, Role::OutputHcUp].iter().map(|r| m.t(0, *r).bytes).sum::<u64>();
+            let mtp_b: u64 = if draft && std::env::var("NS_QW_MTP").is_ok_and(|d| !d.is_empty()) { 1100 << 20 } else { 0 };
+            let prompt_b = prompt_chunk() as u64 * (420 << 10) + (128 << 20); // carve(): ~1.65 GiB at 4096
+            have = have.saturating_sub(head_b + mtp_b + prompt_b + (lb..le).map(|l| dense_bytes(&m, l)).sum::<u64>());
+            let all: u64 = (lb..le).map(|l| m.expert_bytes(l) * g.n_expert).sum();
+            if all > have {
+                let ranked = match std::env::var("NS_QW_EXPERT_PROFILE").ok().filter(|p| !p.is_empty()) {
+                    Some(path) => read_profile(&path, nl, ne)?,
+                    None => {
+                        log("qwen4exp: the experts do not all fit and no NS_QW_EXPERT_PROFILE ranks them: layer order".into());
+                        (0..nl as usize).flat_map(|l| (0..ne).map(move |e| (l, e))).collect()
+                    }
+                };
+                for l in lb..le {
+                    for e in 0..ne {
+                        resident[l as usize * ne + e] = false;
+                    }
+                }
+                let mut used = 0u64;
+                for (l, e) in ranked {
+                    if (l as u64) < lb || (l as u64) >= le {
+                        continue;
+                    }
+                    let b = m.expert_bytes(l as u64);
+                    if used + b > have {
+                        continue;
+                    }
+                    used += b;
+                    resident[l * ne + e] = true;
+                }
+                let n_in = (lb..le).map(|l| (0..ne).filter(|e| resident[l as usize * ne + e]).count()).sum::<usize>();
+                log(format!("qwen4exp: {} of {} experts in {}'s VRAM ({:.1} GiB), the rest ({:.1} GiB) in its pinned host memory",
+                            n_in, (le - lb) as usize * ne, gpu.name, gib(used), gib(all - used)));
+            }
+        }
         let mut stages = Vec::new();
         let mut load_bytes = 0u64;
         for (i, (gpu, &(lb, le))) in gpus.iter().zip(&bounds).enumerate() {
             if lb == le {
                 continue;
             }
-            let st = Self::load_stage(f, &m, gpu, lb, le, i == 0, le == nl, api, log)?;
+            let st = Self::load_stage(f, &m, gpu, lb, le, i == 0, le == nl, &resident, api, log)?;
             load_bytes += st.weight_bytes + st.expert_bytes;
             stages.push(st);
         }
@@ -320,13 +432,35 @@ impl<'g> Qwen<'g> {
                     stages.len(),
                     stages.iter().map(|s| format!("{} layers {}-{}", s.gpu.name, s.lb, s.le - 1)).collect::<Vec<_>>().join(", "),
                     gib(load_bytes), load_seconds));
-        Ok(Qwen { file: f, m, stages, table, api, run: Mutex::new(Run { open: None, next_id: 1, flushed: Vec::new(), staging: Vec::new() }), load_seconds,
-                  load_bytes, vocab })
+        // ---- the MTP draft layer (Strata's runtime directory: NS_QW_MTP), on the last stage beside the head
+        let mut mtp = false;
+        let mtp_dir = std::env::var("NS_QW_MTP").ok().filter(|d| !d.is_empty() && draft);
+        if let (Some(dir), Some(last)) = (mtp_dir, stages.last_mut()) {
+            let t = m.t(0, Role::TokenEmbd);
+            // the drafter embeds its tokens: the embedding on its GPU (the first stage has its own)
+            let (ety, eptr, erow) = if last.lb == 0 {
+                (t.ty.code() as i32, last.embd_ptr, (t.bytes / g.n_vocab) as usize)
+            } else {
+                let buf = DevBuf::new(&last.gpu, t.bytes as usize)?;
+                upload(f, t, &buf, 0)?;
+                let p = buf.ptr();
+                last._dense.push(buf);
+                (t.ty.code() as i32, p as *const std::ffi::c_void, (t.bytes / g.n_vocab) as usize)
+            };
+            let c = std::ffi::CString::new(dir.clone()).map_err(|e| err(e.to_string()))?;
+            // SAFETY: a live stage; the embedding stays alive with it (its buffers).
+            ffi::check(unsafe { (api.mtp_load)(last.raw, c.as_ptr(), spec() as i32, 32768, ety, eptr, erow) }, &format!("{dir}: the draft layer"))?;
+            mtp = true;
+            log(format!("qwen4exp: the MTP draft layer from {dir} on {}", last.gpu.name));
+        }
+        Ok(Qwen { file: f, m, stages, table, api,
+                  run: Mutex::new(Run { open: None, next_id: 1, flushed: Vec::new(), staging: Vec::new(), last_window: None }), mtp,
+                  load_seconds, load_bytes, vocab })
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn load_stage(f: &Gguf, m: &Model, gpu: &Arc<Gpu>, lb: u64, le: u64, first: bool, last: bool, api: &ffi::Api, log: &mut dyn FnMut(String))
-                  -> Result<Stage> {
+    fn load_stage(f: &Gguf, m: &Model, gpu: &Arc<Gpu>, lb: u64, le: u64, first: bool, last: bool, resident: &[bool], api: &ffi::Api,
+                  log: &mut dyn FnMut(String)) -> Result<Stage> {
         let g = &m.g;
         let t0 = Instant::now();
         let mut dense = Vec::new();
@@ -416,11 +550,16 @@ impl<'g> Qwen<'g> {
             dense.push(buf);
         }
 
-        // ---- the routed experts: a blob each, [gate rows | up rows | down rows], a buffer a layer
+        // ---- the routed experts: a blob each, [gate rows | up rows | down rows]; a layer's resident ones in a VRAM
+        // buffer, the others in pinned host memory (the mirror)
         let ne = g.n_expert as usize;
         let mut experts = Vec::new();
-        let mut blobs = Vec::new(); // (layer buffer, blob bytes)
+        let mut hosts = Vec::new();
+        let mut slots: Vec<u64> = Vec::new(); // each VRAM slot's address
+        let mut res = vec![-1i32; g.n_layer as usize * ne];
+        let mut mirror = vec![0u64; g.n_layer as usize * ne];
         let mut expert_bytes = 0u64;
+        let mut host_bytes = 0u64;
         for l in lb..le {
             let (tg, tu, td) = (m.t(l, Role::ExpGate), m.t(l, Role::ExpUp), m.t(l, Role::ExpDown));
             let (gb, ub, db) = ((tg.bytes as usize) / ne, (tu.bytes as usize) / ne, (td.bytes as usize) / ne);
@@ -428,42 +567,56 @@ impl<'g> Qwen<'g> {
                 return Err(err(format!("layer {l}: gate and up experts of different sizes")));
             }
             let blob = gb + ub + db;
-            let buf = DevBuf::new(gpu, blob * ne)?;
-            // a few experts at a time: read their three slices, then one upload
-            let per = 32usize;
-            let mut host = vec![0u8; blob * per];
-            for e0 in (0..ne).step_by(per) {
-                let n = per.min(ne - e0);
-                for i in 0..n {
-                    let e = e0 + i;
-                    let b = &mut host[i * blob..(i + 1) * blob];
-                    f.read_into(tg, (e * gb) as u64, &mut b[..gb]).map_err(|x| err(x.0))?;
-                    f.read_into(tu, (e * ub) as u64, &mut b[gb..gb + ub]).map_err(|x| err(x.0))?;
-                    f.read_into(td, (e * db) as u64, &mut b[gb + ub..]).map_err(|x| err(x.0))?;
+            let read = |e: usize, b: &mut [u8]| -> Result<()> {
+                f.read_into(tg, (e * gb) as u64, &mut b[..gb]).map_err(|x| err(x.0))?;
+                f.read_into(tu, (e * ub) as u64, &mut b[gb..gb + ub]).map_err(|x| err(x.0))?;
+                f.read_into(td, (e * db) as u64, &mut b[gb + ub..]).map_err(|x| err(x.0))
+            };
+            let hot: Vec<usize> = (0..ne).filter(|e| resident[l as usize * ne + e]).collect();
+            let cold: Vec<usize> = (0..ne).filter(|e| !resident[l as usize * ne + e]).collect();
+            if !hot.is_empty() {
+                let buf = DevBuf::new(gpu, blob * hot.len())?;
+                // a few experts at a time: read their three slices, then one upload
+                let per = 32usize;
+                let mut host = vec![0u8; blob * per];
+                for (c, group) in hot.chunks(per).enumerate() {
+                    for (i, e) in group.iter().enumerate() {
+                        read(*e, &mut host[i * blob..(i + 1) * blob])?;
+                    }
+                    buf.write(c * per * blob, &host[..group.len() * blob])?;
                 }
-                buf.write(e0 * blob, &host[..n * blob])?;
+                for (i, e) in hot.iter().enumerate() {
+                    res[l as usize * ne + e] = slots.len() as i32;
+                    slots.push(buf.ptr() as u64 + (i * blob) as u64);
+                }
+                expert_bytes += (blob * hot.len()) as u64;
+                experts.push(buf);
             }
-            expert_bytes += (blob * ne) as u64;
-            blobs.push((buf.ptr() as u64, blob as u64));
-            experts.push(buf);
-        }
-        // the residency table: slot (l - lb) * 512 + e, at cache_base + slot_off[slot]
-        let base = blobs.iter().map(|b| b.0).min().unwrap_or(0);
-        let mut slot_off = Vec::with_capacity(blobs.len() * ne);
-        for (p, blob) in &blobs {
-            for e in 0..ne as u64 {
-                slot_off.push(p - base + e * blob);
-            }
-        }
-        let mut res = vec![-1i32; g.n_layer as usize * ne];
-        for l in lb..le {
-            for e in 0..ne {
-                res[l as usize * ne + e] = ((l - lb) as usize * ne + e) as i32;
+            if !cold.is_empty() {
+                let mut hb = ns_core::HostBuf::new(gpu, blob * cold.len())?;
+                let base = hb.as_slice().as_ptr() as u64;
+                for (i, e) in cold.iter().enumerate() {
+                    read(*e, &mut hb.as_mut_slice()[i * blob..(i + 1) * blob])?;
+                    mirror[l as usize * ne + e] = base + (i * blob) as u64;
+                }
+                host_bytes += (blob * cold.len()) as u64;
+                hosts.push(hb);
             }
         }
+        // the residency table: slot k at cache_base + slot_off[k]
+        let base = slots.iter().copied().min().unwrap_or(0);
+        let slot_off: Vec<u64> = slots.iter().map(|p| p - base).collect();
         let d_res = DevBuf::new(gpu, res.len() * 4)?;
         // SAFETY: i32s as bytes
         d_res.write(0, unsafe { std::slice::from_raw_parts(res.as_ptr().cast::<u8>(), res.len() * 4) })?;
+        let d_mirror = if hosts.is_empty() {
+            None
+        } else {
+            let b = DevBuf::new(gpu, mirror.len() * 8)?;
+            // SAFETY: u64s as bytes
+            b.write(0, unsafe { std::slice::from_raw_parts(mirror.as_ptr().cast::<u8>(), mirror.len() * 8) })?;
+            Some(b)
+        };
 
         // ---- the edges
         let mut edges = ffi::Edges::default();
@@ -512,6 +665,8 @@ impl<'g> Qwen<'g> {
             slot_off: slot_off.as_ptr(),
             n_slots: slot_off.len() as i64,
             h_res: res.as_ptr(),
+            mirror: d_mirror.as_ref().map_or(std::ptr::null(), |b| b.ptr().cast()),
+            h_mirror: if d_mirror.is_some() { mirror.as_ptr() } else { std::ptr::null() },
         };
         let mut raw = std::ptr::null_mut();
         // SAFETY: the description's pointers live through the call (it copies them); the buffers outlive the stage.
@@ -520,10 +675,13 @@ impl<'g> Qwen<'g> {
         // SAFETY: out-pointers to locals.
         ffi::check(unsafe { (api.buffers)(raw, &mut hi, &mut ho, &mut hf) }, "the stage's hand-off")?;
         let (total, free) = gpu.memory()?;
-        log(format!("{}: layers {lb}-{} ({:.2} GiB dense, {:.2} GiB experts) in {:.1} s; {:.1} of {:.1} GiB free", gpu.name, le - 1, gib(weight_bytes),
-                    gib(expert_bytes), t0.elapsed().as_secs_f64(), gib(free.unwrap_or(0)), gib(total)));
-        Ok(Stage { gpu: gpu.clone(), raw, lb, le, hand_in: hi, hand_out: ho, hand_floats: hf, weight_bytes, expert_bytes, _dense: dense, _experts: experts,
-                   _d_res: d_res })
+        log(format!("{}: layers {lb}-{} ({:.2} GiB dense, {:.2} GiB experts{}) in {:.1} s; {:.1} of {:.1} GiB free", gpu.name, le - 1,
+                    gib(weight_bytes), gib(expert_bytes),
+                    if host_bytes > 0 { format!(", {:.2} GiB in pinned host memory", gib(host_bytes)) } else { String::new() },
+                    t0.elapsed().as_secs_f64(), gib(free.unwrap_or(0)), gib(total)));
+        let host_slots = mirror.iter().filter(|a| **a != 0).count();
+        Ok(Stage { gpu: gpu.clone(), raw, lb, le, hand_in: hi, hand_out: ho, hand_floats: hf, weight_bytes, expert_bytes, embd_ptr: edges.embd,
+                   vram_slots: slot_off.len(), host_slots, _dense: dense, _experts: experts, _hosts: hosts, _d_mirror: d_mirror, _d_res: d_res })
     }
 
     // ---- sessions
@@ -543,6 +701,21 @@ impl<'g> Qwen<'g> {
                 return Err(e);
             }
             states.push(s);
+        }
+        // its decode graphs recorded now (windows of 1..spec, the commit, the drafter's), not inside a decode round
+        let t0 = Instant::now();
+        for (st, x) in self.stages.iter().zip(&states) {
+            // SAFETY: a live stage and its new state.
+            if let Err(e) = ffi::check(unsafe { (self.api.state_warm)(st.raw, *x, spec() as i32) }, "recording a session's graphs") {
+                for s in states {
+                    // SAFETY: from state_new above.
+                    unsafe { (self.api.state_free)(s) };
+                }
+                return Err(e);
+            }
+        }
+        if profile() {
+            eprintln!("[qw session of {max_ctx}: graphs recorded in {:.0} ms]", t0.elapsed().as_secs_f64() * 1e3);
         }
         Ok(Session { states, pos: 0, max_ctx, prev: [-1, -1], open: None, alive: Arc::new(AtomicBool::new(true)) })
     }
@@ -612,6 +785,15 @@ impl<'g> Qwen<'g> {
 
     /// One window: `tokens` (1..8) at the session's position through every stage; logits of rows [from, T)
     fn window(&self, run: &mut Run, s: &mut Session, tokens: &[u32], from: usize) -> Result<Vec<f32>> {
+        Ok(self.window_raw(run, s, tokens, from, false)?.0)
+    }
+
+    /// One window, each row's argmax picked on the GPU (the logits stay there)
+    fn window_argmax(&self, run: &mut Run, s: &mut Session, tokens: &[u32]) -> Result<Vec<u32>> {
+        Ok(self.window_raw(run, s, tokens, tokens.len(), true)?.1.iter().map(|x| (*x).max(0) as u32).collect())
+    }
+
+    fn window_raw(&self, run: &mut Run, s: &mut Session, tokens: &[u32], from: usize, argmax: bool) -> Result<(Vec<f32>, Vec<i32>)> {
         let t = tokens.len();
         if t == 0 || t > MAX_WINDOW {
             return Err(err(format!("a window of {t} tokens")));
@@ -619,11 +801,14 @@ impl<'g> Qwen<'g> {
         if s.pos + t > s.max_ctx {
             return Err(err(format!("the session's context ({}) is full", s.max_ctx)));
         }
+        let t_ple = Instant::now();
         let mut prev = s.prev;
         let rows = self.table.rows(tokens, &mut prev);
         let ple = self.table.gather(&rows)?;
         let toks: Vec<i32> = tokens.iter().map(|x| *x as i32).collect();
         let mut logits = vec![0f32; t.saturating_sub(from) * self.vocab];
+        let mut ids = vec![0i32; if argmax { t } else { 0 }];
+        let mut marks = vec![Instant::now()];
         for (i, (st, x)) in self.stages.iter().zip(&s.states).enumerate() {
             if i > 0 {
                 let p = &self.stages[i - 1];
@@ -635,17 +820,25 @@ impl<'g> Qwen<'g> {
                 // SAFETY: both hand-off buffers hold MAX_WINDOW tokens; the staging is n bytes; the call waits.
                 let rc = unsafe { (lib.copy_peer)(st.gpu.raw(), st.hand_in.cast(), p.gpu.raw(), p.hand_out.cast(), n, run.staging.as_mut_ptr().cast()) };
                 ffi::check(rc, "the hand-off between GPUs")?;
+                marks.push(Instant::now());
             }
             let has_ple = st.lb <= 1 && 1 < st.le;
             let last = i + 1 == self.stages.len();
             // SAFETY: a live stage and its state; the token and row arrays hold t entries; logits hold (t - from) rows.
             let rc = unsafe {
                 (self.api.window)(st.raw, *x, t as i32, toks.as_ptr(), s.pos as i64, if has_ple { ple.as_ptr() } else { std::ptr::null() },
-                                  if last { from as i32 } else { t as i32 }, if last && from < t { logits.as_mut_ptr() } else { std::ptr::null_mut() })
+                                  if last { from as i32 } else { t as i32 }, if last && from < t { logits.as_mut_ptr() } else { std::ptr::null_mut() },
+                                  if last && argmax { ids.as_mut_ptr() } else { std::ptr::null_mut() })
             };
             ffi::check(rc, &format!("{}: a window at {}", st.gpu.name, s.pos))?;
+            marks.push(Instant::now());
         }
-        Ok(logits)
+        if profile() {
+            let parts: Vec<String> = marks.windows(2).map(|w| format!("{:.2}", (w[1] - w[0]).as_secs_f64() * 1e3)).collect();
+            eprintln!("[qw window T {t}: PLE {:.2} ms, then {} ms (stage / hand-off / stage)]", (marks[0] - t_ple).as_secs_f64() * 1e3, parts.join(" / "));
+        }
+        run.last_window = Some((s.uid(), s.pos, t));
+        Ok((logits, ids))
     }
 
     /// The last window's first `keep` tokens made permanent
@@ -694,7 +887,7 @@ impl<'g> Qwen<'g> {
             }
             // Strata's first chunk is short (256) when the prompt is longer than twice that: the same boundaries
             let t = if c0 == 0 && head > 512 && chunk > 256 { 256 } else { chunk.min(head - c0) };
-            self.prefill(&mut run, s, &tokens[c0..c0 + t])?;
+            self.prefill(&mut run, s, &tokens[c0..c0 + t], &tokens[c0 + 1..c0 + t + 1])?;
             c0 += t;
         }
         let mut last = Vec::new();
@@ -712,8 +905,9 @@ impl<'g> Qwen<'g> {
     }
 
     /// One prompt-path chunk through every stage, committed
-    fn prefill(&self, run: &mut Run, s: &mut Session, tokens: &[u32]) -> Result<()> {
+    fn prefill(&self, run: &mut Run, s: &mut Session, tokens: &[u32], next: &[u32]) -> Result<()> {
         let t = tokens.len();
+        run.last_window = None;
         let chunk = prompt_chunk().max(t);
         let mut prev = s.prev;
         let rows = self.table.rows(tokens, &mut prev);
@@ -740,6 +934,13 @@ impl<'g> Qwen<'g> {
             let rc = unsafe { (self.api.prefill)(st.raw, *x, t as i64, toks.as_ptr(), s.pos as i64, if has_ple { ple.as_ptr() } else { std::ptr::null() }) };
             ffi::check(rc, &format!("{}: a prompt chunk at {}", st.gpu.name, s.pos))?;
             r_prev = (r, Some(st));
+        }
+        if self.mtp {
+            // the draft layer's K/V for these cells: cell i pairs the final residual at i with the token at i + 1
+            let nx: Vec<i32> = next.iter().map(|x| *x as i32).collect();
+            let (st, x) = (self.stages.last().unwrap(), *s.states.last().unwrap());
+            // SAFETY: a live stage and its state; t next tokens; the prompt path's rows are this chunk's.
+            ffi::check(unsafe { (self.api.mtp_prefill)(st.raw, x, t as i64, s.pos as i64, nx.as_ptr()) }, "the draft layer's prompt K/V")?;
         }
         s.prev = prev;
         s.pos += t;
@@ -807,16 +1008,110 @@ impl<'g> Qwen<'g> {
     }
 
     pub fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler) -> Result<Vec<u32>> {
-        let logits = match d.logits.take() {
-            Some(l) => l,
-            None => {
+        if !(d.draft && self.mtp) {
+            if d.logits.is_none() && smp.greedy() {
+                // the pick on the GPU: the token's window, its argmax, committed
                 let t = d.next.take().ok_or_else(|| err("a decode step with nothing to feed"))?;
-                self.forward(s, &[t])?
+                let mut run = self.run.lock().unwrap();
+                self.flush(&mut run)?;
+                self.settle(&mut run, s)?;
+                if s.open.is_some() {
+                    return Err(err("a decode step on a session with an uncommitted verify pass"));
+                }
+                let y = self.window_argmax(&mut run, s, &[t])?[0];
+                self.commit(s, &[t], 1)?;
+                d.next = Some(y);
+                return Ok(vec![y]);
             }
+            let logits = match d.logits.take() {
+                Some(l) => l,
+                None => {
+                    let t = d.next.take().ok_or_else(|| err("a decode step with nothing to feed"))?;
+                    self.forward(s, &[t])?
+                }
+            };
+            let t = smp.sample(&logits);
+            d.next = Some(t);
+            return Ok(vec![t]);
+        }
+        // ---- with the draft layer (Strata's decode round): the token and the likely drafts as one window, its rows
+        // drawn in order while each draws the draft that follows it, the accepted prefix committed, the next drafts
+        let mut run = self.run.lock().unwrap();
+        self.flush(&mut run)?;
+        self.settle(&mut run, s)?;
+        if s.open.is_some() {
+            return Err(err("a decode step on a session with an uncommitted verify pass"));
+        }
+        if let Some(l) = d.logits.take() {
+            // the prompt's last token was its first window: draft from it
+            let t = smp.sample(&l);
+            d.next = Some(t);
+            self.draft_after(&mut run, s, d, &[t], s.pos.saturating_sub(1), 0)?;
+            return Ok(vec![t]);
+        }
+        let x = d.next.take().ok_or_else(|| err("a decode step with nothing to feed"))?;
+        let mut tw = 1;
+        while tw < spec() && tw - 1 < d.drafts.len() && d.probs[tw - 1] >= spec_min_p() {
+            tw += 1;
+        }
+        if s.pos + tw > s.max_ctx {
+            tw = 1;
+        }
+        let mut window = vec![x];
+        window.extend_from_slice(&d.drafts[..tw - 1]);
+        let p0 = s.pos;
+        let t0 = Instant::now();
+        let greedy = smp.greedy();
+        let (logits, picks) = if greedy { (Vec::new(), self.window_argmax(&mut run, s, &window)?) } else { (self.window(&mut run, s, &window, 0)?, Vec::new()) };
+        let t1 = Instant::now();
+        let mut out = Vec::with_capacity(tw);
+        for i in 0..tw {
+            let t = if greedy { picks[i] } else { smp.sample(&logits[i * self.vocab..(i + 1) * self.vocab]) };
+            out.push(t);
+            if i + 1 >= tw || window[i + 1] != t {
+                break;
+            }
+        }
+        let a = out.len() - 1;
+        let t2 = Instant::now();
+        self.commit(s, &window, a + 1)?;
+        let t3 = Instant::now();
+        d.drafted += (tw - 1) as u64;
+        d.accepted += a as u64;
+        d.next = Some(out[a]);
+        self.draft_after(&mut run, s, d, &out, p0, a)?;
+        if profile() {
+            let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
+            eprintln!("[qw round at {p0}: T {tw}, kept {}, window {:.2} ms, sample {:.2}, commit {:.2}, draft {:.2} ({} drafts)]", a + 1,
+                      ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, Instant::now()), d.drafts.len());
+        }
+        Ok(out)
+    }
+
+    /// The draft layer's round after the window just run (when it was this session's, at `p0`): the catch-up over
+    /// rows [0, a] (row t: the residual at p0 + t, then `tokens[t]`), then its drafts (none otherwise)
+    fn draft_after(&self, run: &mut Run, s: &mut Session, d: &mut Decoder, tokens: &[u32], p0: usize, a: usize) -> Result<()> {
+        d.drafts.clear();
+        d.probs.clear();
+        if run.last_window.is_none_or(|(u, q, t)| u != s.uid() || q != p0 || t <= a) {
+            return Ok(());
+        }
+        let toks: Vec<i32> = tokens.iter().map(|x| *x as i32).collect();
+        let mut drafts = vec![0i32; MAX_WINDOW];
+        let mut probs = vec![0f32; MAX_WINDOW];
+        let mut n = 0i32;
+        let (st, x) = (self.stages.last().unwrap(), *s.states.last().unwrap());
+        // SAFETY: a live stage, its state; a + 1 tokens; drafts and probs hold MAX_WINDOW entries.
+        let rc = unsafe {
+            (self.api.mtp_draft)(st.raw, x, toks.as_ptr(), p0 as i64, a as i32, (spec() - 1) as i32, spec_min_p(), drafts.as_mut_ptr(),
+                                 probs.as_mut_ptr(), &mut n)
         };
-        let t = smp.sample(&logits);
-        d.next = Some(t);
-        Ok(vec![t])
+        ffi::check(rc, "the draft layer")?;
+        for j in 0..n.max(0) as usize {
+            d.drafts.push(drafts[j].max(0) as u32);
+            d.probs.push(probs[j]);
+        }
+        Ok(())
     }
 
     // ---- checkpoints
@@ -871,7 +1166,7 @@ impl<'g> Qwen<'g> {
             .map(|st| {
                 let (total, free) = st.gpu.memory().unwrap_or((0, None));
                 GpuInfo { index: st.gpu.index, name: st.gpu.name.clone(), pci: st.gpu.pci.clone(), total, free, layers: (st.lb, st.le),
-                          expert_slots: ((st.le - st.lb) * self.m.g.n_expert) as usize, host_slots: 0 }
+                          expert_slots: st.vram_slots, host_slots: st.host_slots }
             })
             .collect()
     }

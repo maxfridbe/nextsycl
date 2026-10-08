@@ -42,7 +42,7 @@ pub fn kind() -> EngineKind {
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<ns_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {
-    Ok(Box::new(engine::Qwen::load(f, gpus, o.kv, log)?))
+    Ok(Box::new(engine::Qwen::load(f, gpus, o.kv, o.draft, log)?))
 }
 
 // ---- the contract's opaque handles over this engine's own types
@@ -64,7 +64,7 @@ impl SessionState for engine::Session {
 
 impl DecoderState for engine::Decoder {
     fn drafts(&self) -> (u64, u64) {
-        (0, 0)
+        (self.drafted, self.accepted)
     }
     fn pending(&mut self) -> Option<u32> {
         engine::Decoder::pending(self)
@@ -107,7 +107,7 @@ impl Engine for engine::Qwen<'_> {
         self.load_bytes
     }
     fn has_draft(&self) -> bool {
-        false
+        self.mtp
     }
     fn prefill_chunk(&self) -> usize {
         engine::prompt_chunk()
@@ -116,7 +116,7 @@ impl Engine for engine::Qwen<'_> {
         engine::MAX_WINDOW
     }
     fn cache_fingerprint(&self) -> String {
-        "qwen4exp kv=q8 nsqw1".into()
+        format!("qwen4exp kv=q8 mtp={} nsqw1", self.mtp)
     }
 
     fn session(&self, max_ctx: usize) -> Result<Session> {
@@ -149,11 +149,11 @@ impl Engine for engine::Qwen<'_> {
         engine::Qwen::forward_batch(self, &mut own, tokens)
     }
 
-    fn decoder(&self, logits: Vec<f32>, _draft: bool) -> Decoder {
-        Decoder::new(engine::Decoder { logits: Some(logits), next: None })
+    fn decoder(&self, logits: Vec<f32>, draft: bool) -> Decoder {
+        Decoder::new(engine::Decoder::new(Some(logits), None, draft))
     }
-    fn decoder_after(&self, next: u32, _draft: bool) -> Decoder {
-        Decoder::new(engine::Decoder { logits: None, next: Some(next) })
+    fn decoder_after(&self, next: u32, draft: bool) -> Decoder {
+        Decoder::new(engine::Decoder::new(None, Some(next), draft))
     }
     fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, _tap: Tap) -> Result<Vec<u32>> {
         let d = d.get_mut::<engine::Decoder>().ok_or_else(|| ns_core::Error("a decoder of another engine".into()))?;

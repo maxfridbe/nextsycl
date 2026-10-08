@@ -296,6 +296,9 @@ impl ns_runtime::Sampler for ServeSampler<'_> {
             self.lps.push_back(logprob_entry(self.tok, logits, token, k));
         }
     }
+    fn greedy(&self) -> bool {
+        self.temp <= 0.0 && self.k.is_none()
+    }
 }
 
 /// Prefixes shorter than this are read again rather than cached

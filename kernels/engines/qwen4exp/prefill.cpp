@@ -69,6 +69,7 @@ struct Pf {
     int32_t *ids, *slot_dev, *src_dev;
     uint16_t *Xs, *Hh, *sh_h;
     uint16_t *dq_gu[DQ], *dq_d[DQ];
+    uint8_t* blob_stage[DQ];   // a host-mirrored expert's blob, copied in before its dequant
     float *ple_emb, *ple_norm;
     uint16_t* gemm_scratch;
     void* gemm_ws;
@@ -126,7 +127,11 @@ void carve(Pf* p, Bump& o, size_t T, const SK::QsaShapes& s) {
     gdn_set(a, p, T);
     qsa_set(b, p, T, s);
     moe_set(c, p, T);
-    for (int i = 0; i < DQ; ++i) { p->dq_gu[i] = o.take<uint16_t>(1280 * N); p->dq_d[i] = o.take<uint16_t>(N * 640); }
+    for (int i = 0; i < DQ; ++i) {
+        p->dq_gu[i] = o.take<uint16_t>(1280 * N);
+        p->dq_d[i] = o.take<uint16_t>(N * 640);
+        p->blob_stage[i] = o.take<uint8_t>(2u << 20);   // a blob: at most 2 x 640 x 2560 IQ4_XS rows + down, < 2 MiB
+    }
     p->ple_emb = o.take<float>(T * N);
     p->ple_norm = o.take<float>((size_t) SK::NG_HC_DIM);
     p->gemm_scratch = o.take<uint16_t>((size_t) GEMM_SCRATCH);
@@ -150,6 +155,8 @@ namespace qw {
 void prefill_free(ns_qw* w) {
     try { free_pf(w); } catch (...) {}
 }
+float* prefill_rows(ns_qw* w) { return w->pf ? w->pf->R : nullptr; }
+int64_t prefill_cap(ns_qw* w) { return w->pf ? w->pf->T : 0; }
 }  // namespace qw
 
 extern "C" {
@@ -381,9 +388,18 @@ int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, i
                     const int32_t ne = p->cnt[(size_t) e];
                     if (ne == 0) continue;
                     const int32_t slot = w->h_res[(size_t) l * NE + e];
-                    if (slot < 0) return ns_fail("qwen: an expert not in this stage's VRAM");
-                    const uint8_t* blob = w->cache_base + w->h_slot_off[(size_t) slot];
                     const int q = (int) (j++ % DQ);
+                    const uint8_t* blob = nullptr;
+                    if (slot >= 0) {
+                        blob = w->cache_base + w->h_slot_off[(size_t) slot];
+                    } else {
+                        // in the host mirror: its blob into VRAM first (one copy at PCIe speed), then dequantized
+                        const uint64_t at = w->h_mirror.empty() ? 0 : w->h_mirror[(size_t) l * NE + e];
+                        if (at == 0) return ns_fail("qwen: an expert neither in VRAM nor in the host mirror");
+                        if (EL.bytes > (2u << 20)) return ns_fail("qwen: an expert blob past the staging slot");
+                        cs->memcpy(p->blob_stage[q], (const void*) at, EL.bytes);
+                        blob = p->blob_stage[q];
+                    }
                     SK::iq_dequant_gu_f16(v.gu_type, blob, blob + EL.up_off, NFF, N, p->dq_gu[q], cs);
                     SK::iq_dequant_f16(v.d_type, blob + EL.down_off, N * NFF, p->dq_d[q], cs);
                     const int64_t o0 = p->off[(size_t) e];

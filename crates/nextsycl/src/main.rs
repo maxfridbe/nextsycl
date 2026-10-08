@@ -60,7 +60,7 @@ in this process (inside the image: the kernels need the oneAPI runtime):
                  [--cache-dir DIR [--cache-disk-gib G (32)] [--cache-ttl-hours H (24)]: checkpoints pushed out of memory kept there]
                  [--max-tokens N (a request without max_tokens: N; default the rest of the context)]
                                 the server in the foreground (what start runs)
-  nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
+  nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH | --ids FILE [--ignore-eos] [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
                     [--expert-gib G] [--mirror-gib G] [--no-mtp]
   nextsycl info <model.gguf>    the architecture and geometry, every tensor checked by role, bytes by group
   nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
@@ -413,6 +413,9 @@ impl ns_runtime::Sampler for TempSampler<'_> {
     fn uniform(&mut self) -> f32 {
         self.rng.next_f32()
     }
+    fn greedy(&self) -> bool {
+        self.temp <= 0.0
+    }
 }
 
 /// `nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N]`
@@ -421,9 +424,14 @@ fn generate(args: &[String]) -> Result<(), String> {
     let e = |x: ns_core::Error| x.0;
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
     let model = args.get(1).ok_or("generate <model.gguf> --prompt ...")?;
-    let prompt = match opt("--prompt-file") {
-        Some(f) => std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?,
-        None => opt("--prompt").ok_or("--prompt TEXT or --prompt-file PATH")?,
+    // --ids FILE: the prompt as token ids (comma-separated, the chat template already in them - Strata's bench files)
+    let ids_file = opt("--ids");
+    // --ignore-eos: the full --max tokens whatever is generated (a bench's fixed output length)
+    let ignore_eos = args.iter().any(|a| a == "--ignore-eos");
+    let prompt = match (opt("--prompt-file"), &ids_file) {
+        (_, Some(_)) => String::new(),
+        (Some(f), None) => std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?,
+        (None, None) => opt("--prompt").ok_or("--prompt TEXT, --prompt-file PATH or --ids FILE")?,
     };
     let effort = ns_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|high|max")?;
     let max: usize = opt("--max").and_then(|v| v.parse().ok()).unwrap_or(256);
@@ -432,8 +440,13 @@ fn generate(args: &[String]) -> Result<(), String> {
     let gpus: Vec<usize> = opt("--gpu").unwrap_or_else(|| "0".into()).split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}: a GPU number"))).collect::<Result<_, _>>()?;
     let f = Gguf::open(Path::new(model)).map_err(|e| e.0)?;
     let tok = ns_tok::Tokenizer::from_gguf(&f)?;
-    let text = chat_of(&f)?(&[ns_tok::Message { role: "user", content: &prompt, reasoning: None }], effort);
-    let ids = tok.encode(&text);
+    let ids = match &ids_file {
+        Some(p) => std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?
+            .split([',', ' ', '\n']).filter(|v| !v.trim().is_empty())
+            .map(|v| v.trim().parse::<u32>().map_err(|_| format!("{p}: {v:?} is not a token id")))
+            .collect::<Result<Vec<u32>, String>>()?,
+        None => tok.encode(&chat_of(&f)?(&[ns_tok::Message { role: "user", content: &prompt, reasoning: None }], effort)),
+    };
     let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let expert_gib: Option<f64> = opt("--expert-gib").and_then(|v| v.parse().ok());
     let mirror_gib: Option<f64> = opt("--mirror-gib").and_then(|v| v.parse().ok());
@@ -460,7 +473,7 @@ fn generate(args: &[String]) -> Result<(), String> {
     let mut n = 0;
     'gen: while n < max {
         for next in eng.step(&mut sess, &mut dec, &mut draw, &mut none).map_err(e)? {
-            if tok.stop.contains(&next) || n >= max {
+            if (!ignore_eos && tok.stop.contains(&next)) || n >= max {
                 break 'gen;
             }
             n += 1;

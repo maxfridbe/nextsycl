@@ -110,35 +110,42 @@ impl Table {
     /// `rows` read and decoded: rows.len() x dim floats, in order
     pub fn gather(&self, rows: &[u32]) -> ns_core::Result<Vec<f32>> {
         let mut out = vec![0f32; rows.len() * self.dim];
-        let threads = rows.len().div_ceil(64).clamp(1, 32);
+        // a decode window's few rows inline; a prompt chunk's thousands over up to 32 threads
+        let threads = if rows.len() <= 128 { 1 } else { rows.len().div_ceil(64).clamp(1, 32) };
         let per = rows.len().div_ceil(threads);
         let err = std::sync::Mutex::new(None);
-        std::thread::scope(|sc| {
-            for (rs, os) in rows.chunks(per).zip(out.chunks_mut(per * self.dim)) {
-                let err = &err;
-                sc.spawn(move || {
-                    let mut buf = vec![0u8; self.row_bytes];
-                    for (r, o) in rs.iter().zip(os.chunks_mut(self.dim)) {
-                        if *r as u64 >= self.rows {
-                            *err.lock().unwrap() = Some(format!("PLE row {r} past the table's {}", self.rows));
-                            return;
-                        }
-                        if let Err(e) = self.file.read_exact_at(&mut buf, self.offset + *r as u64 * self.row_bytes as u64) {
-                            *err.lock().unwrap() = Some(format!("reading PLE row {r}: {e}"));
-                            return;
-                        }
-                        // split halves: qs[j] holds values j and j + 16 of its block of 32
-                        for (b, blk) in buf.chunks(18).enumerate() {
-                            let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-                            for j in 0..16 {
-                                o[b * 32 + j] = d * IQ4NL[(blk[2 + j] & 15) as usize] as f32;
-                                o[b * 32 + j + 16] = d * IQ4NL[(blk[2 + j] >> 4) as usize] as f32;
-                            }
-                        }
+        let work = |rs: &[u32], os: &mut [f32], err: &std::sync::Mutex<Option<String>>| {
+            let mut buf = vec![0u8; self.row_bytes];
+            for (r, o) in rs.iter().zip(os.chunks_mut(self.dim)) {
+                if *r as u64 >= self.rows {
+                    *err.lock().unwrap() = Some(format!("PLE row {r} past the table's {}", self.rows));
+                    return;
+                }
+                if let Err(e) = self.file.read_exact_at(&mut buf, self.offset + *r as u64 * self.row_bytes as u64) {
+                    *err.lock().unwrap() = Some(format!("reading PLE row {r}: {e}"));
+                    return;
+                }
+                // split halves: qs[j] holds values j and j + 16 of its block of 32
+                for (b, blk) in buf.chunks(18).enumerate() {
+                    let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                    for j in 0..16 {
+                        o[b * 32 + j] = d * IQ4NL[(blk[2 + j] & 15) as usize] as f32;
+                        o[b * 32 + j + 16] = d * IQ4NL[(blk[2 + j] >> 4) as usize] as f32;
                     }
-                });
+                }
             }
-        });
+        };
+        if threads == 1 {
+            work(rows, &mut out, &err);
+        } else {
+            std::thread::scope(|sc| {
+                for (rs, os) in rows.chunks(per).zip(out.chunks_mut(per * self.dim)) {
+                    let err = &err;
+                    let work = &work;
+                    sc.spawn(move || work(rs, os, err));
+                }
+            });
+        }
         if let Some(e) = err.into_inner().unwrap() {
             return Err(ns_core::Error(e));
         }

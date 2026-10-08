@@ -64,7 +64,10 @@ Every engine is held to the same checks: `spec-check` (verify passes equal one-t
   are the same architecture): Gated DeltaNet + QSA, hyper-connections, the hashed PLE, 512 experts, all in VRAM over
   the cards. Its glue (`kernels/engines/qwen4exp/qwen.cpp`) is the Strata port's verify window, a stage per GPU; its
   Rust side the memory plan, the PLE rows, sessions and checkpoints. It binds its own ABI from the library by name
-  (`ns_sys::Api::symbol`): an engine's symbols are not in the shared tables.
+  (`ns_sys::Api::symbol`): an engine's symbols are not in the shared tables. Its settings: `NS_QW_MTP` (Strata's MTP
+  runtime directory), `NS_QW_EXPERT_PROFILE` (its expert profile: which experts stay in VRAM on one card),
+  `NS_QW_CHUNK` (prompt chunk, 2048; Strata serves 4096), `NS_QW_SPEC` / `NS_QW_SPEC_MIN_P` (4 / 0.5),
+  `NS_QW_EAGER=1` (no graphs), `NS_QW_WINDOWS=1` (prompts through windows), `NS_QW_PROFILE=1` (round timings).
 
 ## What stays shared on purpose
 

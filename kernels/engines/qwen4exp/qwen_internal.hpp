@@ -11,6 +11,8 @@
 #include "strata/kernels/ngram.hpp"
 
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
 #include <vector>
 
 namespace qw {
@@ -49,6 +51,37 @@ struct Qsa {
     int32_t* idx_block_pos = nullptr;
 };
 
+using GraphExec = sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>;
+
+// NS_QW_EAGER=1: every launch as it runs, no graphs (the A/B)
+inline bool graphs_on() {
+    static const bool on = [] { const char* v = std::getenv("NS_QW_EAGER"); return !(v && v[0] == '1'); }();
+    return on;
+}
+
+// `body`'s work on q: recorded into `slot` the first time (a graph a window size and session: the session's state
+// pointers are in it), replayed after. Everything that varies between replays is read from device or pinned memory.
+template <class F> void run_graph(sycl::queue& q, std::unique_ptr<GraphExec>& slot, F&& body, bool launch = true) {
+    if (!graphs_on()) {
+        if (launch) body();
+        return;
+    }
+    if (!slot) {
+        namespace X = sycl::ext::oneapi::experimental;
+        X::command_graph<X::graph_state::modifiable> g(q.get_context(), q.get_device());
+        g.begin_recording(q);
+        try {
+            body();
+        } catch (...) {
+            g.end_recording(q);
+            throw;
+        }
+        g.end_recording(q);
+        slot = std::make_unique<GraphExec>(g.finalize());
+    }
+    if (launch) q.ext_oneapi_graph(*slot);
+}
+
 }  // namespace qw
 
 struct ns_qw_state {
@@ -58,10 +91,13 @@ struct ns_qw_state {
     uint64_t bytes = 0;
     float* gdn = nullptr;      // the stage's GDN layers, GDN_FLOATS each: [recurrent state | conv history]
     std::vector<qw::Qsa> qsa;  // the stage's QSA layers
+    qw::Qsa mtp;               // the draft layer's own K/V (the stage with the drafter; dense attention: no indexer)
     float* ple_hist = nullptr; // HS floats when the stage has the PLE layer
     // what save / load copy: [offset, bytes] of the fixed parts, and the per-cell parts (bytes a cell)
     struct Part { uint64_t off, fixed, per_cell; };
     std::vector<Part> parts;
+    // its graphs: the window a size, the commit, the drafter's round a catch-up size and its steps
+    std::unique_ptr<qw::GraphExec> win[qw::MAXT + 1], commit, mtp_round[qw::MAXT + 1], mtp_step[qw::MAXT + 1], mtp_pf[qw::MAXT + 1];
 };
 
 struct ns_qw {
@@ -100,6 +136,9 @@ struct ns_qw {
     // pinned staging (this GPU's context)
     int32_t* h_in = nullptr;   // tok | step | pos | commit
     float* h_ple = nullptr;
+    float* h_logits = nullptr;   // the last stage: the head's rows, read back after a window
+    int32_t* out_ids = nullptr;  // the rows' argmax (device), its scratch
+    uint8_t* arg_scratch = nullptr;
     uint32_t* h_plan_err = nullptr;
     // the last window, for its commit
     int last_t = 0;
@@ -107,11 +146,21 @@ struct ns_qw {
     ns_qw_state* last_st = nullptr;
     // the prompt path (prefill.cpp): its buffers, made on first use; the residency table on the host
     struct Pf* pf = nullptr;
+    // the MTP draft layer (mtp.cpp), on the last stage
+    struct Mtp* mtp = nullptr;
     std::vector<int32_t> h_res;
     std::vector<unsigned long long> h_slot_off;
+    const unsigned long long* mirror = nullptr;   // device: the host mirror's addresses (resident_plan_set_mirror)
+    std::vector<unsigned long long> h_mirror;
 };
 
 namespace qw {
 void prefill_free(ns_qw* w);   // prefill.cpp
+// the prompt path's residual rows (its final ones after a chunk on the last stage) and the chunk they hold; null / 0 before
+// the first prompt
+float* prefill_rows(ns_qw* w);
+int64_t prefill_cap(ns_qw* w);
+void mtp_free(ns_qw* w);       // mtp.cpp
+void mtp_warm(ns_qw* w, ns_qw_state* st);   // mtp.cpp: the drafter's graphs recorded
 }
 

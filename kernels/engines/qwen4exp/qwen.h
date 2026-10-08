@@ -78,6 +78,10 @@ typedef struct ns_qw_desc {
     const uint64_t* slot_off; /* host, n_slots */
     int64_t n_slots;
     const int32_t* h_res; /* host [n_layer * 512]: d_res's copy (the prompt path walks the experts on the host) */
+    /* experts not in VRAM: [n_layer * 512] addresses in this GPU's pinned host memory (0 = none), device (the plan
+     * kernel's) and host copies; null when every expert is in VRAM */
+    const uint64_t* mirror;
+    const uint64_t* h_mirror;
 } ns_qw_desc;
 
 int ns_qw_new(ns_gpu* g, const ns_qw_desc* d, ns_qw** out);
@@ -90,6 +94,8 @@ int ns_qw_buffers(ns_qw* w, float** hand_in, float** hand_out, size_t* hand_floa
 int ns_qw_state_new(ns_qw* w, int64_t max_cells, ns_qw_state** out);
 void ns_qw_state_free(ns_qw_state* st);
 int ns_qw_state_reset(ns_qw* w, ns_qw_state* st);
+/* the session's graphs (windows of 1..max_t, the commit, the drafter's) recorded now rather than on first use */
+int ns_qw_state_warm(ns_qw* w, ns_qw_state* st, int max_t);
 /* checkpoints: the state of a session at position pos, as bytes (save / load host memory) */
 int ns_qw_state_bytes(ns_qw_state* st, int64_t pos, uint64_t* bytes);
 int ns_qw_state_save(ns_qw* w, ns_qw_state* st, int64_t pos, void* host);
@@ -97,10 +103,11 @@ int ns_qw_state_load(ns_qw* w, ns_qw_state* st, int64_t pos, const void* host);
 int ns_qw_state_copy(ns_qw* w, ns_qw_state* dst, const ns_qw_state* src, int64_t pos);
 
 /* T (1..8) tokens at pos0.. through the stage's layers. ple_rows (host, T x 2560): the tokens' PLE rows, for the
- * stage with layer 1. On the last stage, logits rows [logits_from, T) are copied to logits_host (vocab floats a row).
+ * stage with layer 1. On the last stage, logits rows [logits_from, T) are copied to logits_host (vocab floats a row), and
+ * (argmax_host not null) each row's argmax to argmax_host, picked on the GPU (Strata's greedy pick: the lowest index wins).
  * The state's GDN layers and indexer are advanced only by ns_qw_commit (a one-token window commits itself). */
 int ns_qw_window(ns_qw* w, ns_qw_state* st, int T, const int32_t* tokens, int64_t pos0, const float* ple_rows,
-                 int logits_from, float* logits_host);
+                 int logits_from, float* logits_host, int32_t* argmax_host);
 /* the last window's first n_keep tokens made permanent */
 int ns_qw_commit(ns_qw* w, ns_qw_state* st, int n_keep);
 
@@ -110,4 +117,18 @@ int ns_qw_commit(ns_qw* w, ns_qw_state* st, int n_keep);
 int ns_qw_prefill_buffers(ns_qw* w, int64_t chunk, float** R);
 /* T tokens at pos0.. (committed: the state advances); ple_rows (host, T x 2560) for the stage with layer 1 */
 int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, int64_t pos0, const float* ple_rows);
+
+/* the MTP draft layer (mtp.cpp, Strata's MtpDrafter): on the last stage, from Strata's runtime directory (tools/mtp_rt.py:
+ * dense.txt / dense.bin / experts.bin / draft_vocab.bin); its own K/V lives in each session's state, so it is loaded
+ * before any session. embd: the token embedding on this stage's GPU (the drafter embeds its tokens). window: the cells
+ * it attends to (Strata's --mtp-window, 32768; 0 = all) */
+int ns_qw_mtp_load(ns_qw* w, const char* rt_dir, int max_t, int64_t window, int embd_type, const void* embd, size_t embd_row);
+/* the drafter's K/V for prompt cells [cell0, cell0 + n): the prompt path's final residual rows on this stage (its R from
+ * ns_qw_prefill_buffers, rows [0, n)), next_tokens (host) the token after each cell */
+int ns_qw_mtp_prefill(ns_qw* w, ns_qw_state* st, int64_t n, int64_t cell0, const int32_t* next_tokens);
+/* one round after the window just run on this stage (its final residual rows): the catch-up over rows [0, a] (row t pairs
+ * the residual at p + t with tokens[t], the token at p + t + 1), then drafts from row a while each is at least min_p
+ * likely (at most max_drafts); drafts / probs host, n_out the drafts made */
+int ns_qw_mtp_draft(ns_qw* w, ns_qw_state* st, const int32_t* tokens, int64_t p, int a, int max_drafts, float min_p,
+                    int32_t* drafts, float* probs, int* n_out);
 #endif
