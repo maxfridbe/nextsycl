@@ -49,20 +49,22 @@ Every engine is held to the same checks: `spec-check` (verify passes equal one-t
    geometry and the tensors by role, checked at load - copy GLM's pattern, not its roles), `src/engine.rs`,
    `src/lib.rs` (`impl Engine`, the opaque handles' `*State` traits, `pub fn kind() -> EngineKind`),
    `src/tools.rs` (`info`, and `kernels` if it has a kernel test).
-2. Its kernels in `kernels/engines/<arch>/` (`ns_<arch>_*` symbols, declared in `kernels/ns/ns.h` for now, bound in
-   ns-sys); reuse `kernels/ns` and `kernels/strata` where they fit.
+2. Its kernels in `kernels/engines/<arch>/` (`ns_<arch>_*` symbols in a header of their own there, included at the end
+   of `kernels/ns/ns.h`; bound by the engine's crate through `ns_sys::Api::symbol`, as qwen4exp's `ffi.rs`); reuse
+   `kernels/ns` and `kernels/strata` where they fit.
 3. Add `ns_<arch>::kind()` to `engines()` in `crates/nextsycl/src/main.rs` and the crate to the workspace.
-4. Its chat template in ns-tok if it is new.
+4. Its chat template (ns-tok) as `EngineKind::chat`, and its pre-tokenizer in ns-tok if it is new.
 5. Make `spec-check`, `batch-check` and `check` pass at short and long context before it is tuned; then tune it as
    its own thing.
 
-## Next models
+## The engines
 
-Strata's port serves the Qwen3.8-Flash-Next family on these cards (Coder IQ1_M, the IQ2_XS general model, Swift
-1.5): hybrid attention (Gated DeltaNet + gated full attention, QSA selection), many small experts, a per-layer
-embedding (PLE), an MTP draft layer. That is a separate engine here (`engines/qwen38next`), with its own memory plan
-(PLE rows, the expert store) and kernels - the Strata port's are in `kernels/strata` already (GDN, QSA, PLE, the
-grouped experts).
+- **glm5next** - GLM-5.3-Flash: KDA + MLA with a DSA indexer, 288 experts (VRAM / pinned host store), MTP.
+- **qwen4exp** - Qwen3.8-Flash-Next (Strata's family: the IQ2_XS general model; the Coder IQ1_M and Swift 1.5 files
+  are the same architecture): Gated DeltaNet + QSA, hyper-connections, the hashed PLE, 512 experts, all in VRAM over
+  the cards. Its glue (`kernels/engines/qwen4exp/qwen.cpp`) is the Strata port's verify window, a stage per GPU; its
+  Rust side the memory plan, the PLE rows, sessions and checkpoints. It binds its own ABI from the library by name
+  (`ns_sys::Api::symbol`): an engine's symbols are not in the shared tables.
 
 ## What stays shared on purpose
 

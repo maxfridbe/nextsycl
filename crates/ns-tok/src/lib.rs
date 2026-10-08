@@ -1,5 +1,5 @@
 //! Byte-level BPE (GPT-2 style) from a GGUF's `tokenizer.ggml.*`, as llama.cpp runs it for GLM's `glm4` / `glm5`
-//! pre-tokenizer: special tokens matched in the text first (longest first), the rest split by the pre-tokenizer
+//! and Qwen3.8's `qwen35` pre-tokenizers: special tokens matched in the text first (longest first), the rest split by the pre-tokenizer
 //! regex, each piece's bytes mapped to GPT-2's printable alphabet, then - `ignore_merges` - taken whole when the
 //! vocabulary has it, else merged by rank. No BOS token.
 
@@ -10,6 +10,10 @@ use ns_gguf::{Gguf, Value};
 
 /// llama.cpp's LLAMA_VOCAB_PRE_TYPE_CHATGLM4 (used for `glm4` and `glm5`)
 const GLM4_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN35 (src/llama-vocab.cpp; the pattern Strata's tokenizer transcribes): QWEN2's
+/// shape with combining marks (`\p{M}`) kept with their letters and out of the punctuation runs, single digits
+const QWEN35_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 pub struct Tokenizer {
     pub tokens: Vec<String>,
@@ -52,9 +56,11 @@ impl Tokenizer {
             return Err("only byte-level BPE (tokenizer.ggml.model gpt2) is read".into());
         }
         let pre = g.meta("tokenizer.ggml.pre").and_then(Value::as_str).unwrap_or("");
-        if !matches!(pre, "glm4" | "glm5" | "chatglm-bpe") {
-            return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4)"));
-        }
+        let split = match pre {
+            "glm4" | "glm5" | "chatglm-bpe" => GLM4_SPLIT,
+            "qwen35" => QWEN35_SPLIT,
+            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen35)")),
+        };
         let tokens = strs(g.meta("tokenizer.ggml.tokens"));
         let types: Vec<u64> = g.meta("tokenizer.ggml.token_type").and_then(Value::as_array).map(|a| a.iter().map(|x| x.as_u64().unwrap_or(1)).collect()).unwrap_or_default();
         let ids: HashMap<String, u32> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
@@ -73,7 +79,7 @@ impl Tokenizer {
         let byte_dec = byte_enc.iter().enumerate().map(|(b, c)| (*c, b as u8)).collect();
         let id_of = |k: &str| g.meta(k).and_then(Value::as_u64).map(|v| v as u32);
         let mut stop: Vec<u32> = ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"].iter().filter_map(|k| id_of(k)).collect();
-        for s in ["<|user|>", "<|observation|>", "<|endoftext|>"] {
+        for s in ["<|user|>", "<|observation|>", "<|endoftext|>", "<|im_end|>"] {
             if let Some(i) = ids.get(s) {
                 stop.push(*i);
             }
@@ -86,8 +92,9 @@ impl Tokenizer {
             ids,
             ranks,
             special,
-            split: Regex::new(GLM4_SPLIT).map_err(|e| e.to_string())?,
-            ignore_merges: pre != "chatglm-bpe",
+            split: Regex::new(split).map_err(|e| e.to_string())?,
+            // llama.cpp takes a piece the vocabulary has whole for GLM's (not the old chatglm-bpe); Qwen's merge by rank
+            ignore_merges: matches!(pre, "glm4" | "glm5"),
             byte_enc,
             byte_dec,
             stop,
@@ -231,9 +238,44 @@ pub fn glm_chat(messages: &[Message], effort: Effort) -> String {
     s
 }
 
+/// Qwen3.8-Flash-Next's chat template (ChatML), its text-only, tool-free path: an optional system turn, the turns
+/// (an assistant turn without its old thinking, as the template drops it), then `<|im_start|>assistant\n<think>\n`.
+/// The model has no effort levels: it thinks (the template's default `enable_thinking`).
+pub fn qwen_chat(messages: &[Message], _effort: Effort) -> String {
+    let mut s = String::new();
+    for m in messages {
+        match m.role {
+            "system" | "user" | "assistant" => {
+                s += "<|im_start|>";
+                s += m.role;
+                s += "\n";
+                s += if m.role == "assistant" { m.content.trim() } else { m.content };
+                s += "<|im_end|>\n";
+            }
+            _ => {}
+        }
+    }
+    s += "<|im_start|>assistant\n<think>\n";
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwens_template() {
+        let m = [Message { role: "user", content: "Hi", reasoning: None }];
+        assert_eq!(qwen_chat(&m, Effort::Low), "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n");
+    }
+
+    #[test]
+    fn qwens_split_keeps_marks_with_letters() {
+        let r = Regex::new(QWEN35_SPLIT).unwrap();
+        let t = "cafe\u{301} 12 x";
+        let parts: Vec<&str> = r.find_iter(t).map(|m| m.unwrap().as_str()).collect();
+        assert_eq!(parts, ["cafe\u{301}", " ", "1", "2", " x"]);
+    }
 
     #[test]
     fn the_byte_alphabet_is_gpt2s() {

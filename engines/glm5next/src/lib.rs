@@ -42,7 +42,7 @@ pub type ModelResult<T> = std::result::Result<T, Error>;
 /// This engine's registry entry
 pub fn kind() -> EngineKind {
     EngineKind { archs: &["glm5-next", "glm5next"], name: "GLM-5.3-Flash (KDA + MLA with a DSA indexer, 288 experts, MTP)", load, info: tools::info,
-                 kernels: Some(tools::kernels) }
+                 kernels: Some(tools::kernels), chat: ns_tok::glm_chat }
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<ns_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {

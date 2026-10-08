@@ -20,6 +20,8 @@ pub type Gpu = *mut c_void;
 
 #[allow(clippy::type_complexity)]
 pub struct Api {
+    /// the library's handle: an engine binds its own ABI from it (`symbol`)
+    handle: *mut c_void,
     pub last_error: unsafe extern "C" fn() -> *const c_char,
     pub version: unsafe extern "C" fn() -> *const c_char,
     pub gpu_count: unsafe extern "C" fn() -> c_int,
@@ -151,6 +153,7 @@ impl Api {
             }};
         }
         Ok(Api {
+            handle: h,
             last_error: sym!("ns_last_error"),
             version: sym!("ns_version"),
             gpu_count: sym!("ns_gpu_count"),
@@ -228,6 +231,14 @@ impl Api {
             moe_scratch_bytes: sym!("ns_moe_scratch_bytes"),
             moe_grouped: sym!("ns_moe_grouped"),
         })
+    }
+
+    /// A symbol of the library by name (null when it has none): an engine's own ABI (`kernels/engines/<arch>`) is
+    /// bound by its crate, not here.
+    pub fn symbol(&self, name: &str) -> *mut c_void {
+        let Ok(n) = CString::new(name) else { return std::ptr::null_mut() };
+        // SAFETY: a lookup in the handle the library was opened with; it stays open for the process.
+        unsafe { dlsym(self.handle, n.as_ptr()) }
     }
 
     /// The reason of the last failed call on this thread.

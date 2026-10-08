@@ -148,6 +148,9 @@ int ns_moe_fused_down(ns_gpu* g, const uint16_t* x, const void* w, float* out, i
 int ns_moe_esimd_gu_max(ns_gpu* g);
 int ns_moe_fused_gu_esimd(ns_gpu* g, const uint16_t* x, const void* w, float* out, int64_t M, int64_t N, int64_t K);
 
+/* ---- the engines' own ABIs */
+#include "../engines/qwen4exp/qwen.h"
+
 #ifdef __cplusplus
 }
 #endif

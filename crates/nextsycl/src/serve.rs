@@ -69,6 +69,8 @@ pub struct Server {
     /// the model's engine (engines/<arch>, chosen by the file's architecture)
     pub engine: Box<dyn Engine>,
     pub tok: Tokenizer,
+    /// the model's chat template (its engine's)
+    chat: ns_runtime::ChatFn,
     pub name: String,
     /// the largest session's context (a request must fit one)
     pub max_ctx: usize,
@@ -332,12 +334,12 @@ fn text_of(v: &Value) -> String {
 
 impl Server {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(engine: Box<dyn Engine>, tok: Tokenizer, name: String, slot_ctx: Vec<usize>, default_effort: Effort, cache: PromptCache,
+    pub fn new(engine: Box<dyn Engine>, tok: Tokenizer, chat: ns_runtime::ChatFn, name: String, slot_ctx: Vec<usize>, default_effort: Effort, cache: PromptCache,
                cors: Vec<String>, keep: usize, default_max: Option<usize>) -> Result<Server, String> {
         let tele = Telemetry::start(&engine.gpu_info().iter().map(|g| g.pci.clone()).collect::<Vec<_>>());
         let parallel = slot_ctx.len().max(1);
         let max_ctx = slot_ctx.iter().copied().max().unwrap_or(8192);
-        Ok(Server { engine, tok, name, max_ctx, slot_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
+        Ok(Server { engine, tok, chat, name, max_ctx, slot_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
                     inflight: AtomicU64::new(0), parallel, default_max, cache: Mutex::new(cache),
                     live_lens: Mutex::new(vec![0; parallel]), started: Instant::now(), running: Mutex::new(Default::default()),
                     done: Mutex::new(VecDeque::new()), next_id: AtomicU64::new(1), keep, tele, cors })
@@ -957,7 +959,7 @@ impl Server {
 
     fn chat(&self, s: &mut Conn, ask: &Ask, api: Api, cors: &str, via: &str, rid_out: &mut u64) -> Result<(), String> {
         let messages: Vec<Message> = ask.messages.iter().map(|(r, c, rc)| Message { role: r, content: c, reasoning: rc.as_deref() }).collect();
-        let ids = self.tok.encode(&ns_tok::glm_chat(&messages, ask.effort));
+        let ids = self.tok.encode(&(self.chat)(&messages, ask.effort));
         if ids.len() + 16 > self.max_ctx {
             return Err(format!("the prompt is {} tokens; the context is {}", ids.len(), self.max_ctx));
         }

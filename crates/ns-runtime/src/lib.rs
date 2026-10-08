@@ -253,6 +253,8 @@ pub trait Engine: Send + Sync {
 pub type LoadFn = for<'g> fn(&'g Gguf, &[Arc<Gpu>], &LoadOptions, &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>>;
 /// An engine's kernel test: the file, a GPU index
 pub type KernelsFn = fn(&std::path::Path, usize) -> std::result::Result<(), String>;
+/// An engine's chat template: the conversation as the prompt text to generate its next assistant turn
+pub type ChatFn = fn(&[ns_tok::Message], ns_tok::Effort) -> String;
 
 /// An engine's registry entry
 pub struct EngineKind {
@@ -266,6 +268,8 @@ pub struct EngineKind {
     pub info: fn(&Gguf) -> std::result::Result<String, String>,
     /// its kernels against an exact path on the file's own matrices (`nextsycl kernels`), when it has such a test
     pub kernels: Option<KernelsFn>,
+    /// its model's chat template
+    pub chat: ChatFn,
 }
 
 /// The entry of `kinds` serving `g`'s architecture

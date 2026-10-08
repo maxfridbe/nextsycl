@@ -134,6 +134,11 @@ impl Gpu {
         Ok(Arc::new(Gpu { api, raw, index, name, pci, up: std::sync::Mutex::new(Upload { ptr: up.cast(), len: UPLOAD_BYTES, off: 0 }) }))
     }
 
+    /// The library's handle of this GPU (`ns_gpu*`), for an engine's own ABI
+    pub fn raw(&self) -> *mut c_void {
+        self.raw
+    }
+
     /// The queue, for the imported kernels' `void* stream`.
     pub fn queue(&self) -> *mut c_void {
         // SAFETY: a live handle.

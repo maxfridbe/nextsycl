@@ -80,6 +80,7 @@ dependencies = [
  "ns-core",
  "ns-gguf",
  "ns-runtime",
+ "ns-tok",
 ]
 
 [[package]]
@@ -89,6 +90,7 @@ dependencies = [
  "ns-core",
  "ns-gguf",
  "ns-runtime",
+ "ns-tok",
 ]
 
 [[package]]
@@ -97,6 +99,7 @@ version = "0.0.0"
 dependencies = [
  "ns-core",
  "ns-gguf",
+ "ns-tok",
 ]
 
 [[package]]

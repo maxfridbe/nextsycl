@@ -169,9 +169,19 @@ of IQ2_XXS instead could win twice.
       in kernels/engines/glm5next; the server, the CLI and the prompt cache drive only `dyn Engine`. The same
       numbers before and after: spec-check (2 / 3 / 5 rows, short and long) and batch-check exact, llama.cpp
       parity 0.995209, generate's text identical
-- [ ] engines/qwen38next: Strata's Qwen3.8-Flash-Next family (Coder IQ1_M, IQ2_XS, Swift 1.5) - GDN + gated
-      attention, QSA, PLE, MTP; its kernels from kernels/strata
-- [ ] The chat templates by engine (ns-tok holds GLM's); the GLM-only kernels' declarations out of ns.h's shared part
+- [x] kernels/strata refreshed to the user's intel-arc-0.1.40 (3f37281): GLM unchanged (spec-check, batch-check
+      exact, parity 0.995209)
+- [x] engines/qwen4exp (the files say `qwen4exp`): Qwen3.8-Flash-Next IQ2_XS on both cards, every weight and expert
+      in VRAM (B70 layers 0-38, B65 39-47; 36.5 GiB, 4.7 s from the page cache). The glue
+      (kernels/engines/qwen4exp/qwen.cpp) is Strata's verify window (verify.cpp at 0.1.40) per stage, eager, all
+      experts planned on the device; the PLE rows hashed and read in Rust. spec-check 2 / 4 / 8 rows (short, 3K,
+      12K) and batch-check exact (max diff 0). Decode 37 tok/s, prompt 142 tok/s (8-token windows)
+- [x] The chat templates by engine (`EngineKind::chat`: glm_chat, qwen_chat); ns-tok's `qwen35` pre-tokenizer
+- [ ] qwen4exp: the prompt path (Strata's prefill.cpp: GEMM chunks, the grouped experts), then parity with
+      Strata's own output (its prefill + first window; a like-for-like run there needs the same path)
+- [ ] qwen4exp: MTP (Strata's draft layer from the base checkpoint, mtp/rt), the window graph captured, the split
+      by compute (the B65 has 9 layers), the Coder IQ1_M and Swift files
+- [ ] The GLM-only kernels' declarations out of ns.h's shared part
 
 ## 256K context (plan: docs/256k-context.md, 2026-10-07)
 
