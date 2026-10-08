@@ -765,6 +765,21 @@ impl Ops {
         let rc = unsafe { (self.a().moe_fused_gu)(self.raw(), x.ptr.cast(), w.ptr.cast::<u8>().add(w_at).cast(), out.fp(), m as i64, n as i64, k as i64) };
         self.ok(rc, "moe_fused_gu")
     }
+    /// The most rows `moe_fused_gu_esimd` takes on this GPU (0: none)
+    pub fn moe_esimd_gu_max(&self) -> usize {
+        // SAFETY: a live handle.
+        let r = unsafe { (self.a().moe_esimd_gu_max)(self.raw()) };
+        r.max(0) as usize
+    }
+    /// `moe_fused_gu` in ESIMD: m one of 32, 64, 128, 256
+    pub fn moe_fused_gu_esimd(&self, x: &DevBuf, w: &DevBuf, w_at: usize, out: &DevBuf, m: usize, n: usize, k: usize) -> Result<()> {
+        x.bounds(0, m * k * 2)?;
+        w.bounds(w_at, n * k / 256 * 66)?;
+        need!(out, m * n, "moe_fused_gu_esimd out");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.a().moe_fused_gu_esimd)(self.raw(), x.ptr.cast(), w.ptr.cast::<u8>().add(w_at).cast(), out.fp(), m as i64, n as i64, k as i64) };
+        self.ok(rc, "moe_fused_gu_esimd")
+    }
     /// An expert's down for m tokens (x [m, k] fp16, the activations): out [m, n] = x . w^T with w Q2_K (n rows of
     /// k), decoded inside the matrix-engine GEMM
     pub fn moe_fused_down(&self, x: &DevBuf, w: &DevBuf, w_at: usize, out: &DevBuf, m: usize, n: usize, k: usize) -> Result<()> {

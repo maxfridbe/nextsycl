@@ -131,7 +131,7 @@ the server:
 | prompt, 2K tokens (one chunk) | ~430 tokens/s |
 | prompt, 8K tokens | ~740 tokens/s |
 | prompt, 12K tokens | ~820 tokens/s |
-| prompt, 36-40K tokens | ~1,050-1,100 tokens/s |
+| prompt, 36-40K tokens | ~1,100 tokens/s |
 | prompt, 128K tokens | ~1,000 tokens/s (126 s) |
 | prompt, 253K tokens | ~930 tokens/s (272 s) |
 | decode, short context, MTP on | ~18-21 tokens/s (80-90% of drafts accepted) |

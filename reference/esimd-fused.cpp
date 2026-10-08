@@ -155,6 +155,93 @@ void fused_pipe(queue& q, const half* A, const block_iq2_xxs* W, float* C, int M
     });
 }
 
+// A work-group of T threads shares a 16-column slice of N: per 256-k block (one IQ2_XXS block a weight row) the
+// threads decode its 8 groups between them (16 B tiles in all) into local memory, then each loads every tile for its
+// own RM row tiles' dpas. The grid table in local memory; each row's group in one 8-byte gather (U64) or two 4-byte.
+template <int RM, int T, bool U64>
+void fused_wg(queue& q, const half* A, const block_iq2_xxs* W, float* C, int M, int N, int K, const uint32_t* grid32) {
+    constexpr int GRID = 2048, TILE = KS * EX * 2, BUF = 16 * TILE;   // bytes: the table, a B tile, a block's tiles
+    const int mblocks = M / (RC * RM * T);
+    q.parallel_for(nd_range<1>(range<1>(mblocks * (N / EX) * T), range<1>(T)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+        es::slm_init<GRID + 2 * BUF>();
+        const int t = it.get_local_id(0), g = it.get_group(0);
+        const int nt = g % (N / EX), mb = g / (N / EX);
+        const int n0 = nt * EX, m0 = (mb * T + t) * RC * RM;
+        // the table into local memory, the threads in turn
+        for (int o = t * 256; o < GRID; o += T * 256)
+            es::slm_block_store<uint32_t, 64>(o, es::block_load<uint32_t, 64>(grid32 + o / 4));
+        es::barrier();
+        es::simd<float, RC * EX> acc[RM];
+        for (int i = 0; i < RM; ++i) acc[i] = 0.f;
+        const uint32_t rb = (uint32_t) ((K / 256) * sizeof(block_iq2_xxs));
+        const uint8_t* wb = (const uint8_t*) W;
+        es::simd<uint32_t, EX> rows(0, 1);
+        rows = rows * rb + (uint32_t) (n0 * rb);
+        for (int kb = 0; kb < K; kb += 256) {
+            const uint32_t buf = GRID + ((kb / 256) % 2) * BUF;
+            const es::simd<uint32_t, EX> off = rows + (uint32_t) ((kb / 256) * sizeof(block_iq2_xxs));
+            es::simd<uint32_t, EX> dw = es::gather<uint32_t, EX>((const uint32_t*) wb, off);
+            es::simd<uint16_t, EX> dbits = dw & 0xffffu;
+            es::simd<half, EX> dh = dbits.template bit_cast_view<half>();
+            const es::simd<float, EX> d0 = dh;
+            for (int grp = t; grp < 8; grp += T) {
+                es::simd<uint32_t, EX> qx, qy;
+                if constexpr (U64) {
+                    es::simd<uint64_t, EX> qq = es::gather<uint64_t, EX>((const uint64_t*) wb, off + (uint32_t) (2 + 8 * grp));
+                    qx = es::simd<uint32_t, EX>(qq & 0xffffffffull);
+                    qy = es::simd<uint32_t, EX>(qq >> 32);
+                } else {
+                    qx = es::gather<uint32_t, EX>((const uint32_t*) wb, off + (uint32_t) (2 + 8 * grp));
+                    qy = es::gather<uint32_t, EX>((const uint32_t*) wb, off + (uint32_t) (6 + 8 * grp));
+                }
+                es::simd<float, EX> d = d0 * (0.5f + es::simd<float, EX>(qy >> 28)) * 0.25f;
+#pragma unroll
+                for (int hh = 0; hh < 2; ++hh) {
+                    es::simd<half, KS * EX> b;   // VNNI: (k, n) at (k / 2) * 32 + n * 2 + k % 2
+#pragma unroll
+                    for (int g2 = 0; g2 < 2; ++g2) {
+                        const int il = hh * 2 + g2;
+                        es::simd<uint32_t, EX> gi = (qx >> (8 * il)) & 0xffu;
+                        es::simd<uint32_t, EX> glo = es::slm_gather<uint32_t, EX>(gi * 8);
+                        es::simd<uint32_t, EX> ghi = es::slm_gather<uint32_t, EX>(gi * 8 + 4);
+                        es::simd<uint32_t, EX> s7 = (qy >> (7 * il)) & 127u;
+                        es::simd<uint32_t, EX> signs = s7 | ((es::cbit(s7) & 1u) << 7);
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            es::simd<uint32_t, EX> byte = ((j < 4 ? glo : ghi) >> (8 * (j % 4))) & 0xffu;
+                            es::simd<float, EX> v = d * es::simd<float, EX>(byte);
+                            v.merge(-v, ((signs >> j) & 1u) != 0);
+                            const int kk = g2 * 8 + j;
+                            b.template select<EX, 2>((kk / 2) * 32 + (kk % 2)) = v;
+                        }
+                    }
+                    const uint32_t at = buf + (uint32_t) ((2 * grp + hh) * TILE);
+                    es::slm_block_store<half, 128>(at, b.template select<128, 1>(0));
+                    es::slm_block_store<half, 128>(at + 256, b.template select<128, 1>(128));
+                }
+            }
+            es::barrier();
+#pragma unroll 4
+            for (int tile = 0; tile < 16; ++tile) {
+                const uint32_t at = buf + (uint32_t) (tile * TILE);
+                es::simd<half, KS * EX> b;
+                b.template select<128, 1>(0) = es::slm_block_load<half, 128>(at);
+                b.template select<128, 1>(128) = es::slm_block_load<half, 128>(at + 256);
+#pragma unroll
+                for (int i = 0; i < RM; ++i) {
+                    es::simd<half, RC * KS> a = es::load_2d<half, KS, RC>(A, (unsigned) (K * 2 - 1), (unsigned) (M - 1), (unsigned) (K * 2 - 1),
+                                                                          kb + tile * 16, m0 + i * RC);
+                    acc[i] = xmx::dpas<DEPTH, RC, float, float, half, half>(acc[i], b, a);
+                }
+            }
+        }
+        for (int i = 0; i < RM; ++i)
+#pragma unroll
+            for (int r = 0; r < RC; ++r)
+                es::block_store<float, EX>(C + (size_t) (m0 + i * RC + r) * N + n0, acc[i].template select<EX, 1>(r * EX));
+    });
+}
+
 inline void dq8(const block_iq2_xxs* b, int ib, int il, float* v) {
     const uint16_t* q2 = b->qs + 4 * ib;
     const uint8_t* aux8 = (const uint8_t*) q2;
@@ -213,9 +300,15 @@ int main(int argc, char** argv) {
         double md = 0, mx = 0; for (size_t i = 0; i < c1.size(); ++i) { md = std::max(md, (double) std::abs(c1[i] - c2[i])); mx = std::max(mx, (double) std::abs(c1[i])); }
         printf("  %28s   max |diff| %.1e of %.1e\n", "", md, mx);
     };
-    check("esimd RM=2 NB=1", [&] { fused_esimd<2, 1>(q, A, W, C2, M, N, K, grid); });
-    check("pipelined RM=1 NB=1", [&] { fused_pipe<1, 1>(q, A, W, C2, M, N, K, grid); });
-    check("pipelined RM=2 NB=1", [&] { fused_pipe<2, 1>(q, A, W, C2, M, N, K, grid); });
-    check("pipelined RM=4 NB=1", [&] { fused_pipe<4, 1>(q, A, W, C2, M, N, K, grid); });
-    if (M % 64 == 0) check("pipelined RM=8 NB=1", [&] { fused_pipe<8, 1>(q, A, W, C2, M, N, K, grid); });
+    // one work-group over all the rows, 16 a thread (RM = 2): every weight decoded once
+    auto one = [&](int m) {
+        switch (m / 16) {
+            case 2: fused_wg<2, 2, false>(q, A, W, C2, M, N, K, grid); break;
+            case 4: fused_wg<2, 4, false>(q, A, W, C2, M, N, K, grid); break;
+            case 8: fused_wg<2, 8, false>(q, A, W, C2, M, N, K, grid); break;
+            case 16: fused_wg<2, 16, false>(q, A, W, C2, M, N, K, grid); break;
+            default: fused_wg<2, 32, false>(q, A, W, C2, M, N, K, grid); break;
+        }
+    };
+    check("wg, one group (RM=2)", [&] { one(M); });
 }

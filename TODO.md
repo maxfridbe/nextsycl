@@ -98,9 +98,15 @@ of IQ2_XXS instead could win twice.
       tokens: best 181 / 278 / 402 us vs expand + oneMKL 318 / 244 / 242 and joint_matrix's fused 110 / 135 / 200.
       Few row tiles a thread: the decode dominates (each thread decodes its B tile for one dpas - RM=1 scales with
       the tokens: 1,372 us at 256); many: too few threads to hide the chain (gathered words -> gathered grid ->
-      decode -> dpas); the weights' 16 rows 1 KB apart are a scattered gather a step. Untried: the grid in local
-      memory, the words as one 8-byte gather, a work-group decoding a tile once into local memory for several
-      threads' dpas
+      decode -> dpas); the weights' 16 rows 1 KB apart are a scattered gather a step.
+- [x] The three: the grid in local memory, one 8-byte gather for a row's group (no gain over two 4-byte), and a
+      work-group sharing the decode - its threads split a 256-k block's 8 groups, write the B tiles into local
+      memory (two buffers, a barrier a block), each loads every tile for its own rows. One work-group over all of
+      an expert's rows (16 a thread) decodes every weight once: B70 103 / 117 / 157 us at 64 / 128 / 256 tokens
+      (joint_matrix 117 / 135 / 200), B65 165 / 213 / 327 (206 / 224 / -); past 256 (B70) or 128 (B65) expand +
+      oneMKL wins (512: 335 vs 294 on the B70). In the engine (fused.cpp, ns_moe_fused_gu_esimd; NS_ESIMD_MAX):
+      36K 1,052-1,063 -> 1,096-1,097 tok/s
+- [ ] The down projection (Q2_K) the same way; the B65's ESIMD past 128 tokens (decode-bound: its fewer units)
 - [x] The expansion itself: alone (reference/expand.cpp, 2048 x 4096, cold) IQ2_XXS took 67 us on a B70 and 100
       on a B65 a work-item 8 values of one block; two blocks a work-item (their grid loads overlap) 40 / 58 us,
       exact; bigger work-groups or 4 blocks no better; Q2_K (36-37 us) already at its bound. In the engine the gain

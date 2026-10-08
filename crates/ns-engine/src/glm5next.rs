@@ -139,6 +139,13 @@ fn chunked(tokens: &[u32], c: usize) -> Vec<&[u32]> {
     v
 }
 
+/// NS_ESIMD_MAX: a cap on the tokens of an expert the ESIMD gate | up takes (the GPU's own limit otherwise: 256 on a
+/// B70, 128 on a B65 - past them expanding + oneMKL wins); 0 = never
+fn esimd_max() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_ESIMD_MAX").ok().and_then(|v| v.parse().ok()))
+}
+
 /// The rows the fused kernel computes for n tokens: to 32, above 64 to 64 (its wide form)
 fn fused_rows(n: usize) -> usize {
     n.next_multiple_of(if n > 64 { 64 } else { 32 })
@@ -338,6 +345,8 @@ pub struct Part {
     /// Q8_1 of up to MMVQ_COLS rows of MAX_COLS
     q8: DevBuf,
     experts: Mutex<Store>,
+    /// the most tokens of an expert the ESIMD gate | up takes on this GPU (`Ops::moe_esimd_gu_max`)
+    esimd_gu: usize,
     /// the big arena kept (not lent to the experts) while a prompt is being read in groups between decode steps
     hold: std::sync::atomic::AtomicBool,
     /// the MTP block's eh_proj as its [embedding | hidden] halves, [n_embd, n_embd] each (on the part holding it)
@@ -763,7 +772,8 @@ impl Part {
         store.lend = lend;
         store.lent = lend > 0;
         let arena = Arena::on(if lend > 0 { small.view(0, small.len)? } else { big.view(0, big.len)? });
-        Ok(Part { ops, arena, big, small, biases: Mutex::new(HashMap::new()), layers, mats, vecs, scratch, x16, q8, experts: Mutex::new(store), hold: std::sync::atomic::AtomicBool::new(false), eh, expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes })
+        let esimd_gu = ops.moe_esimd_gu_max();
+        Ok(Part { ops, arena, big, small, biases: Mutex::new(HashMap::new()), layers, mats, vecs, scratch, x16, q8, esimd_gu, experts: Mutex::new(store), hold: std::sync::atomic::AtomicBool::new(false), eh, expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes })
     }
 
     /// The arena a pass of `t` tokens needs: the small one, or the big one - its memory then out of the expert store
@@ -2593,8 +2603,12 @@ impl<'g> Glm<'g> {
                 tb.write_async(0, &gtok.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 let wtb = p.arena.f32(total)?;
                 wtb.write_async(0, &gw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-                // rows for the fused kernel's padding (the rows past an expert's tokens are read, never used)
-                let nmax = fused_rows(by.values().map(|l| l.len()).max().unwrap_or(1));
+                // the ESIMD gate | up up to this many tokens on this GPU (NS_ESIMD_MAX caps it; 0 = never)
+                let esimd = esimd_max().map_or(p.esimd_gu, |m| m.min(p.esimd_gu));
+                let iq2 = parts.gate.2.code() == 16 && parts.up.2.code() == 16 && parts.up.0 == parts.gate.0 + parts.gate.1;
+                let esimd_rows = |n: usize| (n <= esimd && iq2).then(|| n.max(32).next_power_of_two());
+                // rows for the fused kernels' padding (the rows past an expert's tokens are read, never used)
+                let nmax = by.values().map(|l| fused_rows(l.len()).max(esimd_rows(l.len()).unwrap_or(0))).max().unwrap_or(32);
                 let xh = p.arena.bytes(nmax * d * 2)?;
                 let w16 = p.arena.bytes(2 * f * d * 2)?; // gate | up of one expert; down reuses the first half
                 let wu = w16.view(f * d * 2, f * d * 2)?;
@@ -2639,7 +2653,11 @@ impl<'g> Glm<'g> {
                     let m0 = if *host { self.lap(p, "MoE f16: host copy (wait)", h0) } else { h0 };
                     o.gather_f16(x, &toks, &xh, n, d)?;
                     let m1 = self.lap(p, "MoE f16: gather", m0);
-                    let m3 = if n <= fused_max() && parts.gate.2.code() == 16 && parts.up.2.code() == 16 && parts.up.0 == parts.gate.0 + parts.gate.1 {
+                    let m3 = if let Some(rows) = esimd_rows(n) {
+                        // gate | up decoded straight into the matrix units' operand, every weight once (fused.cpp)
+                        o.moe_fused_gu_esimd(&xh, buf, parts.gate.0, &gu, rows, 2 * f, d)?;
+                        self.lap(p, "MoE f16: esimd gate/up", m1)
+                    } else if n <= fused_max() && iq2 {
                         // few tokens: gate | up decoded inside the matrix-engine GEMM, no fp16 copy (fused.cpp)
                         o.moe_fused_gu(&xh, buf, parts.gate.0, &gu, fused_rows(n), 2 * f, d)?;
                         self.lap(p, "MoE f16: fused gate/up", m1)

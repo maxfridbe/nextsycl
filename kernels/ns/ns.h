@@ -144,6 +144,9 @@ int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n
  * out [M, N] float32 */
 int ns_moe_fused_gu(ns_gpu* g, const uint16_t* x, const void* w, float* out, int64_t M, int64_t N, int64_t K);
 int ns_moe_fused_down(ns_gpu* g, const uint16_t* x, const void* w, float* out, int64_t M, int64_t N, int64_t K);
+/* gate | up in ESIMD (fused.cpp): M one of 32, 64, 128, 256; ns_moe_esimd_gu_max: the most rows it takes on g */
+int ns_moe_esimd_gu_max(ns_gpu* g);
+int ns_moe_fused_gu_esimd(ns_gpu* g, const uint16_t* x, const void* w, float* out, int64_t M, int64_t N, int64_t K);
 
 #ifdef __cplusplus
 }
