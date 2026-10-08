@@ -88,8 +88,13 @@ of IQ2_XXS instead could win twice.
 - [x] The down projection (Q2_K: 16 k share a scale byte and a shift of 16 quant bytes, no table) the same way:
       alone 39-40 us at 64-128 tokens (B70); in the engine the down took 2.8 s of GPU time at 12K vs 3.3 expanded
       with NS_FUSED_DOWN_MAX=128 (the default; 2.9 at 64, 3.25 at 256), the same text
-- [ ] 2D block loads for A; the B fill (joint_matrix_apply, ~55 us of the 128-token call with plain fp16 weights) is
-      the gap to oneMKL's ceiling
+- [x] The B fill, other ways (plain fp16 weights, B70, 128 / 256 tokens: oneMKL 113 / 101 us, a direct block load of
+      B 125 / 123, the apply fill 170 / 148): get_wi_data element writes 159 / 149 - the same; apply without the
+      fill first is removed by the compiler (3 us: no work). With joint_matrix a register-filled B costs ~30-45 us
+      over a block load whatever the form, and B staged through local memory was 2-3x slower: fused decoding cannot
+      beat expand + oneMKL for the large experts this way
+- [ ] Fused decoding in ESIMD (xmx::dpas with B decoded straight into its register layout, no fill): the large
+      experts' gate/up on the B65 at 36K is ~3.9 s of expansion + ~4.0 of GEMM - up to ~11% of its stage
 - [x] The expansion itself: alone (reference/expand.cpp, 2048 x 4096, cold) IQ2_XXS took 67 us on a B70 and 100
       on a B65 a work-item 8 values of one block; two blocks a work-item (their grid loads overlap) 40 / 58 us,
       exact; bigger work-groups or 4 blocks no better; Q2_K (36-37 us) already at its bound. In the engine the gain
