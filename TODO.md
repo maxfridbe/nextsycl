@@ -243,7 +243,15 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
       filling VRAM by the profile at load won the first answer: decode's requests counted, saved at a stop
       (NS_EXPERT_PROFILE, ~/.cache/nextsycl/prompts/expert-profile.txt, older halved each save) - a new topic's first
       256 tokens 3,951 -> 3,561 swaps, 23.2-23.5 -> 24.0-24.6 tok/s
-- [ ] Decode: missed experts computed on the CPU beside the copies (Strata's CPU share); the card swap (To try)
+- [x] Decode: missed experts on the CPU (reference/cpu-expert: ggml's AVX2 IQ2_XXS / Q2_K dots in Rust, the token
+      quantized to int8 per 256, cosine 0.99997 to float). A 9950X, 8 threads of a spinning pool, the expert cold
+      from DRAM: 138 us an expert-token (a copy up ~270 us), 227 / 341 us for a 2 / 3-row verify pass. But the
+      ceiling is small: with every miss free (NS_FREE_MISSES=1, a measurement - wrong output) decode without MTP
+      goes 18.8-19.0 -> 21.3-21.6 tok/s, +13%: prefetch and the async swaps already hide most of the copies. A CPU
+      share would win a part of that (CPU-computed experts never come up, 8 cores spinning through decode) - not
+      built. The card swap has the same ceiling
+- [ ] Decode is GPU-bound now: the KDA input projections 6.2 ms a token (~3.6 GB of Q8_0 at ~330 GB/s, ~55% of the
+      cards' bandwidth), the experts' kernels, KDA 10.6 ms in all, MLA 4.9, the shared expert 2.2, the draft 2.5
 - [ ] Batch: the draft block in batches; per-request energy (concurrent requests share the counters - each counts
       both)
 

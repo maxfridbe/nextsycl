@@ -974,6 +974,16 @@ impl Part {
         }
         // this layer's other guesses stay resident, as any expert would
         c.prefetched.retain(|k, _| k.0 != l);
+        // NS_FREE_MISSES=1 (a measurement only: WRONG output): decode's misses read resident slots' weights instead -
+        // the speed decode would have with no copies
+        let mut free: HashMap<u64, usize> = HashMap::new();
+        if promote && !missing.is_empty() && std::env::var("NS_FREE_MISSES").is_ok_and(|v| v == "1") {
+            let order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vowner[i].is_some() && c.vused[i] != tick).take(missing.len()).collect();
+            for (ex, s) in missing.iter().zip(order) {
+                free.insert(*ex, s);
+            }
+            missing.clear();
+        }
         if !missing.is_empty() {
             let mut order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick && c.usable(i)).collect();
             order.sort_by_key(|&i| if c.vowner[i].is_none() { 0 } else { c.vused[i] + 1 });
@@ -992,7 +1002,7 @@ impl Part {
             }
         }
         let sb = c.slot_bytes;
-        let slots = need.iter().map(|ex| match c.loc[&(l, *ex)] {
+        let slots = need.iter().map(|ex| match free.get(ex).map(|&s| Loc::V(s)).unwrap_or(c.loc[&(l, *ex)]) {
             Loc::V(s) => {
                 let (ch, o) = c.vat(s);
                 Ok((c.vram[ch].view(o, sb)?, false))
