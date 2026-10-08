@@ -353,9 +353,9 @@ fn tokenize(model: &Path, text: &str) -> Result<(), String> {
 }
 
 /// A tiny deterministic generator for sampling (xorshift64*).
-struct Rng(u64);
+pub(crate) struct Rng(pub u64);
 impl Rng {
-    fn next_f32(&mut self) -> f32 {
+    pub(crate) fn next_f32(&mut self) -> f32 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
@@ -363,10 +363,11 @@ impl Rng {
     }
 }
 
-/// Greedy at temperature 0; else softmax(logits / temp) restricted to the smallest set of top tokens holding top_p.
-fn sample(logits: &[f32], temp: f32, top_p: f32, rng: &mut Rng) -> u32 {
+/// The distribution sampling draws from: softmax(logits / temp) over the 256 likeliest, restricted to the smallest set
+/// of top tokens holding top_p, normalized. None at temperature 0 (greedy).
+pub(crate) fn dist(logits: &[f32], temp: f32, top_p: f32) -> Option<Vec<(u32, f32)>> {
     if temp <= 0.0 {
-        return logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32);
+        return None;
     }
     // the 256 likeliest in order (higher logit first, then lower index - a stable sort's order): selected in linear
     // time, only they sorted - the whole vocabulary's sort (154,880) cost ~2.5 ms a token (decode at temperature 1.0
@@ -380,7 +381,7 @@ fn sample(logits: &[f32], temp: f32, top_p: f32, rng: &mut Rng) -> u32 {
     }
     idx.sort_by(by);
     let mx = logits[idx[0]];
-    let mut p: Vec<(usize, f32)> = idx.iter().take(256).map(|&i| (i, ((logits[i] - mx) / temp).exp())).collect();
+    let mut p: Vec<(u32, f32)> = idx.iter().map(|&i| (i as u32, ((logits[i] - mx) / temp).exp())).collect();
     let sum: f32 = p.iter().map(|x| x.1).sum();
     let mut acc = 0.0;
     let mut keep = p.len();
@@ -394,14 +395,46 @@ fn sample(logits: &[f32], temp: f32, top_p: f32, rng: &mut Rng) -> u32 {
     }
     p.truncate(keep);
     let total: f32 = p.iter().map(|x| x.1).sum();
-    let mut r = rng.next_f32() * total;
-    for (i, w) in &p {
-        r -= w;
-        if r <= 0.0 {
-            return *i as u32;
+    for x in p.iter_mut() {
+        x.1 /= total;
+    }
+    Some(p)
+}
+
+/// Greedy at temperature 0; else a token drawn from `dist`.
+pub(crate) fn sample(logits: &[f32], temp: f32, top_p: f32, rng: &mut Rng) -> u32 {
+    match dist(logits, temp, top_p) {
+        None => logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32),
+        Some(p) => {
+            let mut r = rng.next_f32();
+            for (i, w) in &p {
+                r -= w;
+                if r <= 0.0 {
+                    return *i;
+                }
+            }
+            p.last().map_or(0, |x| x.0)
         }
     }
-    p.last().map_or(0, |x| x.0 as u32)
+}
+
+/// A sampler for `Glm::step` at a temperature and top-p: speculative sampling of the drafts (ns-engine's Sampler)
+pub(crate) struct TempSampler<'a> {
+    pub temp: f32,
+    pub top_p: f32,
+    pub rng: &'a mut Rng,
+}
+
+impl ns_engine::glm5next::Sampler for TempSampler<'_> {
+    fn sample(&mut self, logits: &[f32]) -> u32 {
+        sample(logits, self.temp, self.top_p, self.rng)
+    }
+    fn dist(&mut self, logits: &[f32]) -> Option<Vec<(u32, f32)>> {
+        dist(logits, self.temp, self.top_p)
+    }
+    fn uniform(&mut self) -> f32 {
+        self.rng.next_f32()
+    }
 }
 
 /// `nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N]`
@@ -438,7 +471,7 @@ fn generate(args: &[String]) -> Result<(), String> {
     let logits = glm.feed(&mut sess, &ids, &mut none).map_err(e)?;
     let prefill = t0.elapsed().as_secs_f64();
     let mut rng = Rng(0x9E3779B97F4A7C15);
-    let mut draw = |l: &[f32]| sample(l, temp, top_p, &mut rng);
+    let mut draw = TempSampler { temp, top_p, rng: &mut rng };
     let mut dec = glm.decoder(logits, mtp);
     dec.set_context(&ids);
     let mut pending: Vec<u8> = Vec::new();

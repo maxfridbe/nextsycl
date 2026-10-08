@@ -265,6 +265,36 @@ fn read_group() -> usize {
     3 * ns_engine::glm5next::prefill_chunk()
 }
 
+/// The server's sampler for `Glm::step`: the request's temperature and top-p (speculative sampling of the drafts), each
+/// committed token's logprob entry noted in order when asked for
+struct ServeSampler<'a> {
+    temp: f32,
+    top_p: f32,
+    rng: &'a mut Rng,
+    tok: &'a Tokenizer,
+    k: Option<usize>,
+    lps: &'a mut VecDeque<Value>,
+}
+
+impl ns_engine::glm5next::Sampler for ServeSampler<'_> {
+    fn sample(&mut self, logits: &[f32]) -> u32 {
+        let y = sample(logits, self.temp, self.top_p, self.rng);
+        self.record(logits, y);
+        y
+    }
+    fn dist(&mut self, logits: &[f32]) -> Option<Vec<(u32, f32)>> {
+        crate::dist(logits, self.temp, self.top_p)
+    }
+    fn uniform(&mut self) -> f32 {
+        self.rng.next_f32()
+    }
+    fn record(&mut self, logits: &[f32], token: u32) {
+        if let Some(k) = self.k {
+            self.lps.push_back(logprob_entry(self.tok, logits, token, k));
+        }
+    }
+}
+
 /// Prefixes shorter than this are read again rather than cached
 const MIN_CHECKPOINT: usize = 64;
 
@@ -836,14 +866,7 @@ impl Server {
         }
         let (temp, top_p, k) = (a.job.temp, a.job.top_p, a.job.logprobs);
         let mut lps: VecDeque<Value> = VecDeque::new();
-        let tok = &self.tok;
-        let mut draw = |l: &[f32]| {
-            let y = sample(l, temp, top_p, rng);
-            if let Some(k) = k {
-                lps.push_back(logprob_entry(tok, l, y, k));
-            }
-            y
-        };
+        let mut draw = ServeSampler { temp, top_p, rng, tok: &self.tok, k, lps: &mut lps };
         let toks = self.glm.step(&mut slots[a.slot].sess, a.dec.as_mut().unwrap(), &mut draw, &mut *none).map_err(|e| e.0)?;
         for y in toks {
             let lp = lps.pop_front();

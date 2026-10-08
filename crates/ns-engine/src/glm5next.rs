@@ -212,6 +212,19 @@ pub fn ngram_k() -> usize {
     *V.get_or_init(|| std::env::var("NS_NGRAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(MAX_VERIFY - 1))
 }
 
+/// Speculative sampling at a temperature (NS_SPEC_SAMPLING=0: drafts are the draft block's argmax, accepted when the
+/// sampled token is them)
+fn spec_sampling() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_SPEC_SAMPLING").map_or(true, |v| v != "0"))
+}
+
+/// The draft distribution's temperature relative to the request's (NS_SPEC_DRAFT_TEMP, default 1.0)
+fn spec_draft_temp() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_SPEC_DRAFT_TEMP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0f32).max(0.01))
+}
+
 /// The most drafts a verify pass holds (a session's snapshot rows)
 fn max_drafts() -> usize {
     drafts().max(ngram_k())
@@ -547,12 +560,49 @@ pub struct Decoder {
     pub ng_drafted: u64,
     pub ng_accepted: u64,
     draft: Option<u32>,
+    /// the distribution the draft was sampled from (speculative sampling; None: the draft block's argmax)
+    draft_q: Option<Vec<(u32, f32)>>,
     /// a second draft, the draft block chained on its own output (NS_DRAFTS=2)
     draft2: Option<u32>,
     mtp: bool,
     /// drafts verified, and accepted
     pub drafted: u64,
     pub accepted: u64,
+}
+
+/// How `Glm::step` draws tokens. `sample` picks one from a row's logits (and records it - logprobs); with `dist`
+/// (the distribution `sample` draws from: temperature and top-p applied; None when greedy) and `uniform`, a draft is
+/// sampled from the draft block's own distribution and accepted with min(1, p/q) - speculative sampling: more drafts
+/// accepted when the model is unsure, what is committed distributed exactly as plain sampling. `record` notes a
+/// token chosen that way. A plain closure is a sampler without it (a draft accepted when the sampled token is it).
+pub trait Sampler {
+    fn sample(&mut self, logits: &[f32]) -> u32;
+    fn dist(&mut self, _logits: &[f32]) -> Option<Vec<(u32, f32)>> {
+        None
+    }
+    fn uniform(&mut self) -> f32 {
+        0.0
+    }
+    fn record(&mut self, _logits: &[f32], _token: u32) {}
+}
+
+impl<F: FnMut(&[f32]) -> u32> Sampler for F {
+    fn sample(&mut self, logits: &[f32]) -> u32 {
+        self(logits)
+    }
+}
+
+/// a token drawn from a distribution with a uniform `u`
+fn draw_from(d: &[(u32, f32)], u: f32) -> u32 {
+    let total: f32 = d.iter().map(|x| x.1).sum();
+    let mut r = u * total;
+    for &(t, w) in d {
+        r -= w;
+        if r <= 0.0 {
+            return t;
+        }
+    }
+    d.last().map_or(0, |x| x.0)
 }
 
 /// A conversation's tokens with a 3-gram index: `after[(a, b, c)]` is the position following that 3-gram's most recent
@@ -601,6 +651,7 @@ impl Decoder {
     /// The committed token not fed yet (the last step's), handed over - e.g. to a batch step - and the draft dropped
     pub fn pending(&mut self) -> Option<u32> {
         self.draft = None;
+        self.draft_q = None;
         self.draft2 = None;
         self.next.take()
     }
@@ -2496,19 +2547,19 @@ impl<'g> Glm<'g> {
 
     /// Generation from a prompt `feed` returned `logits` for; `mtp`: draft with the MTP block (when loaded).
     pub fn decoder(&self, logits: Vec<f32>, mtp: bool) -> Decoder {
-        Decoder { logits, next: None, look: None, ng_drafted: 0, ng_accepted: 0, draft: None, draft2: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
+        Decoder { logits, next: None, look: None, ng_drafted: 0, ng_accepted: 0, draft: None, draft_q: None, draft2: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
     }
 
     /// A decoder whose last committed token `next` is not fed yet (one handed over by `Decoder::pending`, or a batch
     /// step's): its first step feeds it
     pub fn decoder_after(&self, next: u32, mtp: bool) -> Decoder {
-        Decoder { logits: Vec::new(), next: Some(next), look: None, ng_drafted: 0, ng_accepted: 0, draft: None, draft2: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
+        Decoder { logits: Vec::new(), next: Some(next), look: None, ng_drafted: 0, ng_accepted: 0, draft: None, draft_q: None, draft2: None, mtp: mtp && self.mtp.is_some(), drafted: 0, accepted: 0 }
     }
 
     /// The next committed token(s): one, or two when a draft is accepted. `sample` draws a token from logits. With
     /// MTP a draft is accepted exactly when the token drawn for its position is the draft itself, so what is
     /// committed is distributed as plain sampling would be.
-    pub fn step(&self, sess: &mut Session, dec: &mut Decoder, sample: &mut dyn FnMut(&[f32]) -> u32, tap: Tap) -> Result<Vec<u32>> {
+    pub fn step(&self, sess: &mut Session, dec: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
         let fits = |k: usize| sess.pos + k <= sess.max_ctx;
         // prompt lookup: the tokens that followed the last 3 where they occurred before, ahead of the draft block's
         let ng: Vec<u32> = match (&dec.look, dec.next) {
@@ -2527,7 +2578,7 @@ impl<'g> Glm<'g> {
             let rows = self.forward_rows(sess, &toks, toks.len(), &mut *tap)?;
             let mut out = Vec::with_capacity(toks.len());
             for (i, r) in rows.iter().enumerate() {
-                let y = sample(r);
+                let y = smp.sample(r);
                 out.push(y);
                 if i < ng.len() {
                     dec.ng_drafted += 1;
@@ -2548,32 +2599,54 @@ impl<'g> Glm<'g> {
             (Some(x), Some(d), Some(d2)) if dec.mtp && fits(3) => {
                 // two drafts: [token, draft, draft2] verified in one pass, each accepted exactly
                 let rows = self.forward_rows(sess, &[x, d, d2], 3, &mut *tap)?;
-                let y0 = sample(&rows[0]);
+                let y0 = smp.sample(&rows[0]);
                 dec.drafted += 1;
                 if y0 != d {
                     self.rollback(sess, 1)?;
                     (vec![y0], y0)
                 } else {
                     dec.accepted += 1;
-                    let y1 = sample(&rows[1]);
+                    let y1 = smp.sample(&rows[1]);
                     dec.drafted += 1;
                     if y1 != d2 {
                         self.rollback(sess, 2)?;
                         (vec![d, y1], y1)
                     } else {
                         dec.accepted += 1;
-                        let y2 = sample(&rows[2]);
+                        let y2 = smp.sample(&rows[2]);
                         (vec![d, d2, y2], y2)
                     }
                 }
             }
+            (Some(x), Some(d), _) if dec.mtp && fits(2) && dec.draft_q.is_some() => {
+                // speculative sampling: the draft d ~ q kept with min(1, p(d) / q(d)), else a token from max(0, p - q)
+                let q = dec.draft_q.take().unwrap();
+                let rows = self.forward_rows(sess, &[x, d], 2, &mut *tap)?;
+                dec.drafted += 1;
+                let p = smp.dist(&rows[0]).unwrap_or_default();
+                let pd = p.iter().find(|e| e.0 == d).map_or(0.0, |e| e.1);
+                let qd = q.iter().find(|e| e.0 == d).map_or(0.0, |e| e.1).max(1e-30);
+                if smp.uniform() < (pd / qd).min(1.0) {
+                    dec.accepted += 1;
+                    smp.record(&rows[0], d);
+                    let y1 = smp.sample(&rows[1]);
+                    (vec![d, y1], y1)
+                } else {
+                    let qm: HashMap<u32, f32> = q.iter().copied().collect();
+                    let resid: Vec<(u32, f32)> = p.iter().map(|&(t, w)| (t, (w - qm.get(&t).copied().unwrap_or(0.0)).max(0.0))).filter(|e| e.1 > 0.0).collect();
+                    let y0 = if resid.is_empty() { draw_from(&p, smp.uniform()) } else { draw_from(&resid, smp.uniform()) };
+                    smp.record(&rows[0], y0);
+                    self.rollback(sess, 1)?;
+                    (vec![y0], y0)
+                }
+            }
             (Some(x), Some(d), _) if dec.mtp && fits(2) => {
                 let rows = self.forward_rows(sess, &[x, d], 2, &mut *tap)?;
-                let y0 = sample(&rows[0]);
+                let y0 = smp.sample(&rows[0]);
                 dec.drafted += 1;
                 if y0 == d {
                     dec.accepted += 1;
-                    let y1 = sample(&rows[1]);
+                    let y1 = smp.sample(&rows[1]);
                     (vec![d, y1], y1)
                 } else {
                     self.rollback(sess, 1)?;
@@ -2584,7 +2657,7 @@ impl<'g> Glm<'g> {
                 if let Some(x) = dec.next.take() {
                     dec.logits = self.forward(sess, &[x], &mut *tap)?;
                 }
-                let y = sample(&dec.logits);
+                let y = smp.sample(&dec.logits);
                 (vec![y], y)
             }
         }
@@ -2594,7 +2667,29 @@ impl<'g> Glm<'g> {
                 l.push(t);
             }
         }
-        dec.draft = if dec.mtp { self.mtp_run(&mut sess.mtp, tail, true, &mut *tap)?.map(|l| argmax(&l)) } else { None };
+        // the next draft: sampled from the draft block's distribution when the sampler gives one (and one draft a
+        // pass), else its argmax
+        dec.draft_q = None;
+        dec.draft = if dec.mtp {
+            match self.mtp_run(&mut sess.mtp, tail, true, &mut *tap)? {
+                Some(l) => match (drafts() == 1 && spec_sampling()).then(|| {
+                    // the draft block's distribution sharpened (its logits over NS_SPEC_DRAFT_TEMP): any q keeps what
+                    // is committed exact; a q nearer p accepts more
+                    let f = spec_draft_temp();
+                    if f == 1.0 { smp.dist(&l) } else { smp.dist(&l.iter().map(|x| x / f).collect::<Vec<f32>>()) }
+                }).flatten() {
+                    Some(q) if !q.is_empty() => {
+                        let d = draw_from(&q, smp.uniform());
+                        dec.draft_q = Some(q);
+                        Some(d)
+                    }
+                    _ => Some(argmax(&l)),
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
         dec.draft2 = match dec.draft {
             Some(d) if dec.mtp && drafts() >= 2 => self.mtp_chain(sess, d, &mut *tap)?.map(|l| argmax(&l)),
             _ => None,

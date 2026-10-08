@@ -271,8 +271,13 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
       of positions the next pool still needed. Now 8 slots, every row of a pass written: 2 / 3 / 5-row passes exact
       at short and long context. NS_DRAFTS=2 was affected too. Disk checkpoints of the old layout: fingerprint nsck2.
       spec-check: --rows R (2..5), --layers --at N --row k, tensors matched by name
-- [ ] Speculative sampling at a temperature: the draft sampled from the draft block's distribution, accepted with
-      min(1, p/q) - more accepted when the model is unsure, the output distributed exactly as now (2-row passes)
+- [x] Speculative sampling at a temperature (on; NS_SPEC_SAMPLING=0 for the argmax drafts): the draft sampled from
+      the draft block's distribution (the request's temperature and top-p), kept with min(1, p/q), else a token
+      from max(0, p - q) - what is committed is distributed exactly as plain sampling; greedy is unchanged (the
+      same text). Three prompts x temperature 0.7 / 1.0 x 384 tokens (docs/benchy/spec-sampling-2026-10-08.txt):
+      acceptance 61.6% -> 65.0%, 20.37 -> 20.59 tok/s on average; the free-running story most (54% -> 66% at 1.0),
+      a short poem at 0.7 lost (noisy). A sharper draft distribution (NS_SPEC_DRAFT_TEMP 0.5 / 0.25: 65.8% / 64.1%)
+      the same within the noise. The sampler is a trait now (ns-engine Sampler: sample, dist, uniform, record)
 - [ ] Decode is spread out now (per token: experts' kernels, KDA 10.6 ms, MLA 4.9, the draft 2.5, the shared expert
       2.2): no single kernel holds a big share. Levers left: more VRAM (fewer misses: <= 13%), MTP acceptance
 - [ ] Batch: the draft block in batches; per-request energy (concurrent requests share the counters - each counts
