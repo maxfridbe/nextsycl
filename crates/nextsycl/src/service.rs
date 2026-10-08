@@ -37,6 +37,34 @@ fn arg(raw: &[String], flag: &str, cfg: &Config, setting: &str, default: &str) -
 /// `nextsycl start [--gpu N ...] [--model PATH] [--port N] [--host H] [--ctx N] [--name ID] [--effort E]
 /// [--prompt-cache-mib N] [--no-mtp]`
 pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
+    // `nextsycl start <id>`: a registry entry (nextsycl models) - its file, GPUs, contexts, name and settings; the
+    // flags given beside it win
+    let mut raw: Vec<String> = raw.to_vec();
+    let mut entry_env: Vec<(String, String)> = Vec::new();
+    let mut entry_paths: Vec<PathBuf> = Vec::new();
+    if let Some(id) = raw.first().filter(|a| !a.starts_with("--")).cloned() {
+        let m = crate::models::find(cfg, &id)?.ok_or_else(|| format!("no model {id} (nextsycl models list)"))?;
+        if m["enabled"] == false {
+            return Err(format!("{id} is disabled (nextsycl models enable {id})"));
+        }
+        raw.remove(0);
+        let get = |k: &str| m.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        for (flag, key) in [("--model", "file"), ("--ctx", "ctx"), ("--name", "id")] {
+            if !raw.iter().any(|a| a == flag) {
+                raw.extend([flag.to_string(), get(key)]);
+            }
+        }
+        if !raw.iter().any(|a| a == "--gpu") {
+            for g in get("gpus").split(',').filter(|g| !g.is_empty()) {
+                raw.extend(["--gpu".to_string(), g.to_string()]);
+            }
+        }
+        if let Some(env) = m.get("env").and_then(|e| e.as_object()) {
+            entry_env = env.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect();
+        }
+        entry_paths = crate::models::paths(&m);
+    }
+    let raw = &raw[..];
     let ce = Ce::new(cfg)?;
     if ce.running(SERVER) {
         println!("the server is already running");
@@ -69,6 +97,19 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     args.extend(ce.gpu_args());
     args.extend(mount(&cfg.dist, "/app", true));
     args.extend(mount(&PathBuf::from(&models), "/models", true));
+    // a registry entry's files, at their own paths (its directory, read-only)
+    let mut seen = std::collections::BTreeSet::new();
+    for p in &entry_paths {
+        let d = if p.is_dir() { p.clone() } else { p.parent().map(PathBuf::from).unwrap_or_default() };
+        if !d.as_os_str().is_empty() && seen.insert(d.clone()) {
+            args.extend(mount(&d, &d.to_string_lossy(), true));
+        }
+    }
+    // NS_MOUNTS="host:inside,...": more read-only directories (another model folder, a draft layer, a profile)
+    for m in cfg.get("NS_MOUNTS").unwrap_or_default().split(',').filter(|m| !m.trim().is_empty()) {
+        let (host, inside) = m.trim().split_once(':').ok_or_else(|| format!("NS_MOUNTS: {m:?} is not host:inside"))?;
+        args.extend(mount(&PathBuf::from(host), inside, true));
+    }
     args.extend(mount(&sock_dir, SOCKET_DIR_IN, false));
     // the prompt cache's disk tier (NS_CACHE_DIR, default ~/.cache/nextsycl/prompts; NS_CACHE_DISK_GIB, default 32,
     // 0 = none): checkpoints pushed out of memory - a 256K prompt's is ~3.5 GiB
@@ -88,6 +129,16 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
         if let Some(v) = cfg.get(k) {
             args.extend(["-e".into(), format!("{k}={v}")]);
         }
+    }
+    // the qwen4exp engine's (its draft layer, expert profile, control vector, chunk: engines/qwen4exp)
+    for (k, v) in cfg.with_prefix("NS_QW_") {
+        if !entry_env.iter().any(|(e, _)| *e == k) {
+            args.extend(["-e".into(), format!("{k}={v}")]);
+        }
+    }
+    // a registry entry's own settings
+    for (k, v) in &entry_env {
+        args.extend(["-e".into(), format!("{k}={v}")]);
     }
     args.extend([ce.image.clone(), "bash".into(), "-c".into(),
                  "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; exec /app/nextsycl serve \"$@\"".into(), "nextsycl".into()]);

@@ -130,7 +130,7 @@ void carve(Pf* p, Bump& o, size_t T, const SK::QsaShapes& s) {
     for (int i = 0; i < DQ; ++i) {
         p->dq_gu[i] = o.take<uint16_t>(1280 * N);
         p->dq_d[i] = o.take<uint16_t>(N * 640);
-        p->blob_stage[i] = o.take<uint8_t>(2u << 20);   // a blob: at most 2 x 640 x 2560 IQ4_XS rows + down, < 2 MiB
+        p->blob_stage[i] = o.take<uint8_t>(4u << 20);   // a blob: the Coder's largest are 2.54 MiB
     }
     p->ple_emb = o.take<float>(T * N);
     p->ple_norm = o.take<float>((size_t) SK::NG_HC_DIM);
@@ -352,8 +352,8 @@ int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, i
                 gm.native(p->attn_h, v.o_type, v.o_w, p->bo, T, N, NH * HD);
             } else {
                 // ======================= MoE =======================
-                gm.bf16(p->mixed_bf, v.router, p->logits, T, NE, N);
-                P::route(p->logits, p->ids, p->wts, T, NE, cs);
+                gm.bf16(p->mixed_bf, v.router, p->logits, T, w->ne, N);
+                P::route(p->logits, p->ids, p->wts, T, w->ne, cs);
                 gm.native(p->mixed_h, v.sh_gate_type, v.sh_gate, p->sgate, T, NFF, N);
                 gm.native(p->mixed_h, v.sh_up_type, v.sh_up, p->sup, T, NFF, N);
                 P::swiglu_pair(p->sgate, p->sup, p->sh_h, T, cs);
@@ -365,12 +365,12 @@ int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, i
                 std::fill(p->cnt.begin(), p->cnt.end(), 0);
                 for (int64_t i = 0; i < T * K; ++i) {
                     const int32_t e = p->h_ids[(size_t) i];
-                    if (e < 0 || e >= NE) return ns_fail("qwen: a routed expert id out of range");
+                    if (e < 0 || e >= w->ne) return ns_fail("qwen: a routed expert id out of range");
                     ++p->cnt[(size_t) e];
                 }
                 int32_t r = 0;
-                for (int32_t e = 0; e < NE; ++e) { p->off[(size_t) e] = r; r += p->cnt[(size_t) e]; }
-                p->off[(size_t) NE] = r;
+                for (int32_t e = 0; e < w->ne; ++e) { p->off[(size_t) e] = r; r += p->cnt[(size_t) e]; }
+                p->off[(size_t) w->ne] = r;
                 std::vector<int32_t> fill(p->off.begin(), p->off.end() - 1);
                 for (int64_t i = 0; i < T * K; ++i) {
                     const int32_t e = p->h_ids[(size_t) i];
@@ -384,19 +384,19 @@ int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, i
                 // the routed experts in id order, from their VRAM blobs: dequantized to FP16, gate | up, SwiGLU, down
                 const SK::NativeExpertLayout EL = SK::native_expert_layout(v.gu_type, v.d_type, N, NFF);
                 size_t j = 0;
-                for (int32_t e = 0; e < NE; ++e) {
+                for (int32_t e = 0; e < w->ne; ++e) {
                     const int32_t ne = p->cnt[(size_t) e];
                     if (ne == 0) continue;
-                    const int32_t slot = w->h_res[(size_t) l * NE + e];
+                    const int32_t slot = w->h_res[(size_t) l * w->ne + e];
                     const int q = (int) (j++ % DQ);
                     const uint8_t* blob = nullptr;
                     if (slot >= 0) {
                         blob = w->cache_base + w->h_slot_off[(size_t) slot];
                     } else {
                         // in the host mirror: its blob into VRAM first (one copy at PCIe speed), then dequantized
-                        const uint64_t at = w->h_mirror.empty() ? 0 : w->h_mirror[(size_t) l * NE + e];
+                        const uint64_t at = w->h_mirror.empty() ? 0 : w->h_mirror[(size_t) l * w->ne + e];
                         if (at == 0) return ns_fail("qwen: an expert neither in VRAM nor in the host mirror");
-                        if (EL.bytes > (2u << 20)) return ns_fail("qwen: an expert blob past the staging slot");
+                        if (EL.bytes > (4u << 20)) return ns_fail("qwen: an expert blob past the staging slot");
                         cs->memcpy(p->blob_stage[q], (const void*) at, EL.bytes);
                         blob = p->blob_stage[q];
                     }
@@ -412,7 +412,8 @@ int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, i
             // ---- the write of this half, fused with the next half's norm when nothing else touches R in between (not
             // the stage's last half, not before the PLE block of layer 1)
             const int64_t nl = half == 0 ? l : l + 1;
-            const bool fuse = nl < w->le && !(half == 1 && nl == 1 && w->has_ple);
+            const bool steered = half == 1 && cvec_covers(w, l);
+            const bool fuse = nl < w->le && !(half == 1 && nl == 1 && w->has_ple) && !steered;
             if (fuse) {
                 const float* wnn = half == 0 ? v.hc_norm[1] : w->L[(size_t) (nl - w->lb)].hc_norm[0];
                 P::gr_write_norm_rs(p->R, p->bo, p->inj, HC, wnn, EPS, p->grs, p->xn16, T, cs, nullptr, D);
@@ -420,6 +421,7 @@ int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, i
             } else {
                 P::gr_write(p->R, p->bo, p->inj, HC, T, cs);
             }
+            if (steered) cvec_apply(w, p->R, l, T, D, nullptr, 0, nullptr, 0, false);
         }
     }
     cs->wait_and_throw();

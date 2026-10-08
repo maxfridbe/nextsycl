@@ -144,7 +144,7 @@ void window_body(ns_qw* w, ns_qw_state* st, int T) {
     float* xm = w->mixed;
     for (int64_t l = w->lb; l < w->le; ++l) {
         const ns_qw_layer& v = w->L[(size_t) (l - w->lb)];
-        bool pending = l > 0;
+        bool pending = l > 0 && !cvec_covers(w, l - 1);   // (a steered layer's write was applied with its vector)
         if (l == 1 && w->has_ple) {
             // the PLE block (Strata: verify.cpp pre(1), STRATA_PLE_BATCH's default form)
             float* normalized = (float*) (w->ple_scratch + ple_block_scratch_bytes());
@@ -258,12 +258,12 @@ void window_body(ns_qw* w, ns_qw_state* st, int T) {
         }
         gr_read_group(1, true, w->inj, w->inj2);
         // ---- the router: softmax over the experts, top 10, renormalized
-        bf16_gemv_fp32_mmvf_multi(w->mixed, N, v.router, w->logits, NE, N, NE, n, cs);
-        native_router_top10_multi_ne(w->logits, w->ids, w->w, n, (int) NE, cs);
+        bf16_gemv_fp32_mmvf_multi(w->mixed, N, v.router, w->logits, w->ne, N, w->ne, n, cs);
+        native_router_top10_multi_ne(w->logits, w->ids, w->w, n, (int) w->ne, cs);
         // an expert not in VRAM is read from its pinned host mirror over PCIe (the plan points at it), as Strata's
         // single-card serving does (its RAM mirror)
         resident_plan_set_mirror(w->mirror != nullptr ? w->d_res : nullptr, w->mirror);
-        resident_plan(w->ids, n * (int) K, (int) K, w->d_res + l * NE, (int) NE, w->cache_base, w->slot_off, 0, w->plan,
+        resident_plan(w->ids, n * (int) K, (int) K, w->d_res + l * w->ne, (int) w->ne, w->cache_base, w->slot_off, 0, w->plan,
                       (long long) MT * K, nullptr, 0, cs, w->h_plan_err);
         // ---- the shared expert, scaled by sigmoid(gate_inp_shexp . x)
         NativeSharedWeights nsw;
@@ -290,7 +290,12 @@ void window_body(ns_qw* w, ns_qw_state* st, int T) {
         }
         if (n > 1) native_moe_combine_multi(w->parts, w->w, w->shared, w->bo, N, K, n, cs);
         else native_moe_combine(w->parts, w->w, w->shared, w->bo, N, K, cs);
-        if (l == w->n_layer - 1) gr_write_multi(Rt(w, 0), w->bo, w->inj2, gs, Rt(w, 0), n, cs);   // (Strata: every n)
+        if (l == w->n_layer - 1) {
+            gr_write_multi(Rt(w, 0), w->bo, w->inj2, gs, Rt(w, 0), n, cs);   // (Strata: every n)
+            if (cvec_covers(w, l)) cvec_apply(w, Rt(w, 0), l, n, HC * N, nullptr, 0, nullptr, 0, false);
+        } else if (cvec_covers(w, l)) {
+            cvec_apply(w, Rt(w, 0), l, n, HC * N, w->bo, N, w->inj2, HC, true);
+        }
     }
     if (w->le < w->n_layer) {   // an earlier stage: hand the residual on, no head
         float* hout = w->hand_out;
@@ -353,6 +358,8 @@ int ns_qw_new(ns_gpu* g, const ns_qw_desc* d, ns_qw** out) {
     w->g = g;
     w->q = &g->q;
     w->lb = d->lb; w->le = d->le; w->n_layer = d->n_layer; w->max_cells = d->max_cells;
+    if (d->n_expert != 512 && d->n_expert != 256) return ns_fail("qwen: 512 or 256 experts a layer (the router's kernels)");
+    w->ne = d->n_expert;
     w->L.assign(d->layers, d->layers + (d->le - d->lb));
     w->E = d->edges;
     w->vocab = d->le == d->n_layer ? d->edges.vocab : 0;
@@ -374,9 +381,9 @@ int ns_qw_new(ns_gpu* g, const ns_qw_desc* d, ns_qw** out) {
     }
     w->d_res = d->d_res;
     w->cache_base = d->cache_base;
-    if (d->h_res != nullptr) w->h_res.assign(d->h_res, d->h_res + d->n_layer * NE);
+    if (d->h_res != nullptr) w->h_res.assign(d->h_res, d->h_res + d->n_layer * d->n_expert);
     w->mirror = (const unsigned long long*) d->mirror;
-    if (d->h_mirror != nullptr) w->h_mirror.assign(d->h_mirror, d->h_mirror + d->n_layer * NE);
+    if (d->h_mirror != nullptr) w->h_mirror.assign(d->h_mirror, d->h_mirror + d->n_layer * d->n_expert);
     Bump count;
     carve(w, count);
     w->arena = sycl::malloc_device(count.used + 64, g->dev, g->ctx);
@@ -410,6 +417,7 @@ void ns_qw_free(ns_qw* w) {
         w->q->wait();
         qw::prefill_free(w);
         qw::mtp_free(w);
+        qw::cvec_free(w);
         if (w->arena) sycl::free(w->arena, w->g->ctx);
         if (w->slot_off) sycl::free(w->slot_off, w->g->ctx);
         if (w->h_in) sycl::free(w->h_in, w->g->ctx);

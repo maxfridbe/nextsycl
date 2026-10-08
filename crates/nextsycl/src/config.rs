@@ -47,6 +47,17 @@ impl Config {
         std::env::var(name).ok().filter(|v| !v.is_empty()).or_else(|| self.files.get(name).cloned().filter(|v| !v.is_empty()))
     }
 
+    /// Every setting whose name starts with `prefix` (the environment's over the files'), as (name, value)
+    pub fn with_prefix(&self, prefix: &str) -> Vec<(String, String)> {
+        let mut m: BTreeMap<String, String> = self.files.iter().filter(|(k, v)| k.starts_with(prefix) && !v.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect();
+        for (k, v) in std::env::vars() {
+            if k.starts_with(prefix) && !v.is_empty() {
+                m.insert(k, v);
+            }
+        }
+        m.into_iter().collect()
+    }
+
     pub fn or(&self, name: &str, default: &str) -> String {
         self.get(name).unwrap_or_else(|| default.to_string())
     }

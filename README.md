@@ -10,9 +10,8 @@ the GPU reads them over PCIe. It runs on one card or splits the layers over seve
 **Qwen3.8-Flash-Next** (`qwen4exp`, `engines/qwen4exp`): Gated DeltaNet and QSA attention, hyper-connections, a
 hashed per-layer embedding and 512 experts, on the Strata SYCL port's kernels - every weight in VRAM over the two
 cards or on one with its cold experts in pinned host memory, the MTP draft layer, the window and the drafter as SYCL
-graphs; verify passes and batches bit-exact, greedy output with drafts equal to output without. On one Arc Pro B70,
-Strata's v1 bench (its own numbers on this card in brackets): 20 tokens 62-64 / 76-77 tok/s prompt / decode (60 / 70),
-2,185 795 / 80-87 (745 / 77), 8,000 1,180 / 82-89 (1,050 / 78), 40,000 1,254 / 70-75 (1,117 / 72).
+graphs; verify passes and batches bit-exact, greedy output with drafts equal to output without. Every model's speed at
+each context length: [Speed by model](#speed-by-model).
 
 ## What it does
 
@@ -135,6 +134,83 @@ TEMP and VRAM are the cards' package and memory temperatures, POWER each card's 
 ENERGY what both cards drew while the request ran (idle power included) - from the xe driver's sensors. `drafts` is
 MTP's accepted / proposed drafts; `reused` the prompt tokens the prompt cache or the live session already held.
 Every API answer carries the same energy as `usage.energy_wh` (here 0.448 Wh).
+
+## Models
+
+The models a machine serves are entries in one registry (`NS_REGISTRY`, a JSON file; default
+`~/.config/nextsycl/models.json`). An entry has the GGUF file (its first shard), the GPUs, the session contexts, the
+engine settings (`NS_QW_MTP`, `NS_QW_CVEC` and the like), whether it is offered, and what a client may send it
+(tools, background tasks). Its id is the model id clients see and the name the server answers under;
+`nextsycl start <id>` runs it.
+
+```sh
+nextsycl models list [--json]
+nextsycl models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M...]] [--set NAME=VALUE]...
+                    [--no-tools] [--no-tasks] [--disabled]
+nextsycl models download <id> <url | hf:org/repo/path/file.gguf> [--dir DIR] [add's options]   # every shard, resumable
+nextsycl models remove <id> [--files]        # --files deletes the GGUF shards too
+nextsycl models enable <id> | disable <id>
+nextsycl start <id>
+```
+
+```
+$ nextsycl models list
+ID                                           STATE        SIZE  GPUS     CONTEXT          TITLE
+glm-5.3-flash-uncensored                     enabled     89.9G  all      65536            GLM-5.3-Flash uncensored IQ2 · 64K context (both GPUs)
+glm-5.3-flash-uncensored-256k                enabled     89.9G  all      262144,32768     GLM-5.3-Flash uncensored IQ2 · 256K context + a 32K chat (both GPUs)
+qwen3.8-flash-next-coder-iq1_m               enabled     54.4G  0        131072,32768     Qwen3.8-Flash-Next Coder IQ1_M (coding; the B70, 128K + 32K)
+qwen3.8-flash-next-iq2_xs-uncensored         enabled     63.4G  0        131072,32768     Qwen3.8-Flash-Next IQ2_XS uncensored (refusal projection; the B70, 128K + 32K)
+swift-1.5-iq2_xs                             enabled     63.5G  0        131072,32768     Swift 1.5 IQ2_XS (short thinking; the B70, 128K + 32K)
+```
+
+A model switcher in front of the server (one model serves at a time) can read the registry for its list: an entry
+added or disabled shows at once. With `NS_STUDIO_MODES` set to a mode file (one mode a model, its start command
+`nextsycl start <id>`), every registry change rewrites that file's nextsycl entries (`"managed_by": "nextsycl"`) and
+leaves the others alone. `nextsycl start <id>` mounts the entry's files at the same paths in the container, so an
+entry can point anywhere on the machine.
+
+## Speed by model
+
+Benchy v1 through the server (`nextsycl bench --sizes 20,2185,8000,40000,128000 --parallel 1`; 256 greedy tokens a
+size, the prompt cache cleared before each), 8 October 2026. The Qwen3.8-Flash-Next family on one Arc Pro B70 (its
+cold experts in pinned host memory, the MTP draft layer); GLM-5.3-Flash on the B70 and an Arc Pro B65. Input tokens
+as each model's tokenizer counts them (Qwen 30 / 2,195 / 7,914 / 39,783 / 127,303; GLM 31 / 2,216 / 7,975 / 39,758 /
+127,196 / 248,342). Strata's rows are its own numbers on the same B70 (its INTEL_PERFORMANCE.md, benchy v1).
+
+Prompt read (PP), tokens/s:
+
+| Model | 20 | 2K | 8K | 40K | 128K | 250K |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next IQ2_XS | 83 | 788 | 1,154 | 1,227 | 1,210 | - |
+| IQ2_XS, refusal projection | 83 | 786 | 1,144 | 1,214 | 1,200 | - |
+| Qwen3.8-Flash-Next Coder IQ1_M | 80 | 935 | 1,386 | 1,492 | 1,469 | - |
+| Coder, refusal projection | 80 | 929 | 1,370 | 1,472 | 1,449 | - |
+| Swift 1.5 IQ2_XS | 83 | 781 | 1,145 | 1,216 | 1,201 | - |
+| GLM-5.3-Flash IQ2 (64K / 256K modes) | 27 | 456 | 759 | 1,108 | 1,134 | 1,026 |
+| Strata: IQ2_XS | 60 | 745 | 1,050 | 1,117 | - | - |
+| Strata: Coder IQ1_M | 57 | 875 | 1,285 | 1,392 | - | - |
+| Strata: Swift 1.5 | 59 | 742 | 1,046 | 1,108 | - | - |
+
+Decode (TG), tokens/s: warm (the same prompts a second time on one load), and in brackets the first pass after the
+model loads:
+
+| Model | 20 | 2K | 8K | 40K | 128K | 250K |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next IQ2_XS | 77.5 (68.0) | 83.0 (70.6) | 81.3 (68.8) | 75.9 (64.6) | 75.5 (66.5) | - |
+| IQ2_XS, refusal projection | 78.3 (72.5) | 84.7 (73.5) | 82.5 (71.2) | 77.8 (70.4) | 72.4 (65.9) | - |
+| Qwen3.8-Flash-Next Coder IQ1_M | 78.1 (71.3) | 77.5 (65.1) | 75.9 (67.5) | 77.2 (69.8) | 68.0 (62.6) | - |
+| Coder, refusal projection | 78.5 (76.3) | 78.3 (72.6) | 69.9 (65.4) | 76.2 (70.8) | 71.9 (67.1) | - |
+| Swift 1.5 IQ2_XS | 78.9 (66.5) | 85.3 (69.2) | 85.4 (72.9) | 82.1 (74.1) | 74.9 (64.5) | - |
+| GLM-5.3-Flash IQ2 (64K / 256K modes) | (18.8) | (18.2) | (18.7) | (18.1) | (18.7) | (16.9) |
+| Strata: IQ2_XS | 70.0 | 77.5 | 78.5 | 71.8 | - | - |
+| Strata: Coder IQ1_M | 77.3 | 74.6 | 71.9 | 67.6 | - | - |
+| Strata: Swift 1.5 | 77.1 | 74.8 | 75.5 | 63.1 | - | - |
+
+The prompt speeds are the warm pass's (the first pass reads the same, but for its very first request: ~49 tokens/s
+on the 20-token prompt). A model just loaded decodes 10-20% slower until it has run for a while - the same tokens and
+drafts as the warm pass, not its memory placement (it shows with every expert in VRAM too); open in `TODO.md`. The
+projection modes cost nothing measurable. Draft acceptance varies with the text (61-86% here), and decode with it. On two cards the Qwen models decode slower than on
+the B70 alone (Coder 2K 70.8 tok/s with the B70 first, 58.2 with the B65 first; `TODO.md`).
 
 ## Speed
 

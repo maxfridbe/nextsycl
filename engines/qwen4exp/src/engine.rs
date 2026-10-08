@@ -247,7 +247,6 @@ fn check_geometry(m: &Model) -> Result<()> {
         ("hidden", g.n_embd, 2560),
         ("streams", g.hc, 4),
         ("hc rank", g.hc_rank, 320),
-        ("experts", g.n_expert, 512),
         ("experts a token", g.n_expert_used, 10),
         ("expert FFN", g.ffn_expert, 640),
         ("shared FFN", g.ffn_shared, 640),
@@ -270,6 +269,9 @@ fn check_geometry(m: &Model) -> Result<()> {
     if !bad.is_empty() {
         return Err(err(format!("qwen4exp: this file's geometry is not the one the kernels are built for: {}", bad.join(", "))));
     }
+    if g.n_expert != 512 && g.n_expert != 256 {
+        return Err(err(format!("qwen4exp: {} experts a layer (the router's kernels take 512 or 256)", g.n_expert)));
+    }
     if (0..g.n_layer).any(|l| g.is_qsa(l) != (l % 4 == 3)) || g.ple_layers != [1] {
         return Err(err("qwen4exp: the kernels take QSA at every 4th layer (3, 7, ...) and the PLE at layer 1"));
     }
@@ -277,6 +279,84 @@ fn check_geometry(m: &Model) -> Result<()> {
         return Err(err(format!("qwen4exp: rope base {} (the kernels' default is 1e7; scaling is not wired yet)", g.rope_base)));
     }
     Ok(())
+}
+
+/// A control vector, Strata's --control-vector-scaled / --control-vector-layer-range / --cvec-mode / --cvec-dir as
+/// NS_QW_CVEC (path:scale, comma-separated), NS_QW_CVEC_LAYERS (first,last), NS_QW_CVEC_MODE (project | add),
+/// NS_QW_CVEC_DIR (per-layer | single:L): its directions (n_layer x 2560) and scales (n_layer), the mode; None without
+/// A control vector's tables: directions, scales, mode
+type CvecTables = (Vec<f32>, Vec<f32>, i32);
+
+fn load_cvec(nl: u64, n: usize, log: &mut dyn FnMut(String)) -> Result<Option<CvecTables>> {
+    let Some(spec) = std::env::var("NS_QW_CVEC").ok().filter(|v| !v.is_empty()) else { return Ok(None) };
+    let l = nl as usize;
+    let mut data = vec![0f32; l * n];
+    let mut have = vec![false; l];
+    for item in spec.split(',') {
+        let (path, scale) = match item.rsplit_once(':') {
+            Some((p, sc)) if sc.parse::<f32>().is_ok() => (p, sc.parse::<f32>().unwrap()),
+            _ => (item, 1.0),
+        };
+        let f = Gguf::open(std::path::Path::new(path)).map_err(|e| err(format!("{path}: {}", e.0)))?;
+        if f.architecture() != "controlvector" {
+            return Err(err(format!("{path}: not a control vector GGUF")));
+        }
+        let mut found = 0;
+        for t in &f.tensors {
+            let Some(layer) = t.name.strip_prefix("direction.").and_then(|x| x.parse::<usize>().ok()) else { continue };
+            if layer < 1 || layer >= l {
+                continue;
+            }
+            if t.ty != GType::F32 || t.elements() != n as u64 {
+                return Err(err(format!("{path}: {} must be {n} f32", t.name)));
+            }
+            let b = f.read(t).map_err(|e| err(e.0))?;
+            for (j, c) in b.chunks(4).enumerate() {
+                data[layer * n + j] += scale * f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+            have[layer] = true;
+            found += 1;
+        }
+        if found == 0 {
+            return Err(err(format!("{path}: no direction.<layer> tensors")));
+        }
+    }
+    let (mut first, mut last) = (1usize, l - 1);
+    if let Ok(r) = std::env::var("NS_QW_CVEC_LAYERS") {
+        let v: Vec<usize> = r.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if v.len() == 2 {
+            first = v[0].max(1);
+            last = v[1].min(l - 1);
+        }
+    }
+    let mode = if std::env::var("NS_QW_CVEC_MODE").is_ok_and(|m| m == "add") { 1 } else { 0 };
+    let single: Option<usize> = std::env::var("NS_QW_CVEC_DIR").ok().and_then(|d| d.strip_prefix("single:").and_then(|x| x.parse().ok()));
+    let mut dir = vec![0f32; l * n];
+    let mut sc = vec![0f32; l];
+    let mut steered = 0;
+    for layer in first..=last {
+        let src = if mode == 0 { single.unwrap_or(layer) } else { layer };
+        if src >= l || !have[src] {
+            continue;
+        }
+        let d = &data[src * n..(src + 1) * n];
+        if mode == 0 {
+            let nrm = d.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+            if nrm <= 0.0 {
+                continue;
+            }
+            sc[layer] = nrm as f32;
+            for j in 0..n {
+                dir[layer * n + j] = (d[j] as f64 / nrm) as f32;
+            }
+        } else {
+            sc[layer] = 1.0;
+            dir[layer * n..(layer + 1) * n].copy_from_slice(d);
+        }
+        steered += 1;
+    }
+    log(format!("qwen4exp: a control vector ({spec}), {} on {steered} layers in [{first}, {last}]", if mode == 0 { "projection" } else { "added" }));
+    Ok(Some((dir, sc, mode)))
 }
 
 /// Strata's expert profile (tools/make_profile.py: `STRP`, version, n_layers, n_expert, slots, n_ranked, then the
@@ -297,6 +377,82 @@ fn read_profile(path: &str, nl: u64, ne: usize) -> Result<Vec<(usize, usize)>> {
     })
     .filter(|(l, e)| (*l as u64) < nl && *e < ne)
     .collect())
+}
+
+/// The float form the kernels read a role in (Strata's tools/iq_pack.py FORM table); None: as stored (the quantized
+/// projections, served from the GGUF's own blocks)
+fn form(r: Role) -> Option<GType> {
+    use Role::*;
+    match r {
+        Router | ShGateInp | HcAttnDown | HcAttnUp | HcAttnInject | HcFfnDown | HcFfnUp | HcFfnInject | OutputHcDown | OutputHcUp | IdxK
+        | IdxQ | GdnAlpha | GdnBeta | PleKey | PleValue => Some(GType::BF16),
+        PleConv => Some(GType::F16),
+        QsaQNorm | QsaKNorm | HcAttnNorm | HcFfnNorm | OutputHcNorm | IdxQNorm | IdxKNorm | PleNormConv | PleNormKey | PleNormQuery | GdnA
+        | GdnConv | GdnDtBias | GdnNorm => Some(GType::F32),
+        _ => None,
+    }
+}
+
+/// A tensor's bytes in `want`'s form: as stored, or F32 -> BF16 when every value is exactly BF16 (Swift 1.5's routers),
+/// F32 -> F16 rounded (the PLE conv, as Strata's loader narrows it), F16 / BF16 -> F32 widened; anything else refused
+fn in_form(f: &Gguf, t: &Tensor, want: Option<GType>) -> Result<Vec<u8>> {
+    let b = f.read(t).map_err(|e| err(e.0))?;
+    let Some(want) = want else { return Ok(b) };
+    if t.ty == want {
+        return Ok(b);
+    }
+    let f32s = || b.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    match (t.ty, want) {
+        (GType::F32, GType::BF16) => {
+            let mut out = Vec::with_capacity(b.len() / 2);
+            for x in f32s() {
+                let bits = x.to_bits();
+                if bits & 0xffff != 0 {
+                    return Err(err(format!("{}: F32 values that are not BF16 (the kernels read BF16; converting would round)", t.name)));
+                }
+                out.extend_from_slice(&((bits >> 16) as u16).to_le_bytes());
+            }
+            Ok(out)
+        }
+        (GType::F32, GType::F16) => Ok(f32s().flat_map(|x| f32_to_f16(x).to_le_bytes()).collect()),
+        (GType::BF16, GType::F32) => Ok(b.chunks(2).flat_map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16).to_le_bytes()).collect()),
+        _ => Err(err(format!("{}: {} (the kernels read {})", t.name, t.ty.name(), want.name()))),
+    }
+}
+
+/// float -> half, round to nearest even (numpy's astype(float16))
+fn f32_to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let e = ((b >> 23) & 0xff) as i32;
+    let mut m = b & 0x7f_ffff;
+    if e == 255 {
+        return sign | 0x7c00 | if m != 0 { 0x200 } else { 0 };
+    }
+    let e16 = e - 127 + 15;
+    if e16 >= 31 {
+        return sign | 0x7c00;
+    }
+    if e16 <= 0 {
+        if e16 < -10 {
+            return sign;
+        }
+        m |= 0x80_0000;
+        let shift = (14 - e16) as u32;
+        let half = 1u32 << (shift - 1);
+        let rest = m & ((1u32 << shift) - 1);
+        let mut v = m >> shift;
+        if rest > half || (rest == half && v & 1 == 1) {
+            v += 1;
+        }
+        return sign | v as u16;
+    }
+    let rest = m & 0x1fff;
+    let mut v = ((e16 as u32) << 10) | (m >> 13);
+    if rest > 0x1000 || (rest == 0x1000 && v & 1 == 1) {
+        v += 1;
+    }
+    sign | v as u16
 }
 
 /// The bytes of layer `l`'s weights other than the routed experts
@@ -338,6 +494,9 @@ impl<'g> Qwen<'g> {
         };
         let margin: u64 = std::env::var("NS_VRAM_GUARD_GIB").ok().and_then(|v| v.parse::<f64>().ok()).map_or(1536 << 20, |g| (g * (1u64 << 30) as f64) as u64);
         let window_b: u64 = 128 << 20; // the window buffers (~60 MiB) and the GEMM scratch
+        let head_b = [Role::Output, Role::OutputHcNorm, Role::OutputHcDown, Role::OutputHcUp].iter().map(|r| m.t(0, *r).bytes).sum::<u64>();
+        let mtp_b: u64 = if draft && std::env::var("NS_QW_MTP").is_ok_and(|d| !d.is_empty()) { 1100 << 20 } else { 0 };
+        let prompt_b = prompt_chunk() as u64 * (420 << 10) + (128 << 20); // carve(): ~1.65 GiB at 4096, each stage its own
         let split_env: Option<Vec<u64>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
         let mut bounds = Vec::new();
         let mut lb = 0u64;
@@ -349,7 +508,7 @@ impl<'g> Qwen<'g> {
                 nl
             } else {
                 let (total, free) = gpu.memory()?;
-                let mut have = free.unwrap_or(total).saturating_sub(margin + window_b);
+                let mut have = free.unwrap_or(total).saturating_sub(margin + window_b + prompt_b);
                 if i == 0 {
                     have = have.saturating_sub(embd_b);
                 }
@@ -357,6 +516,13 @@ impl<'g> Qwen<'g> {
                 while le < nl && layer_b[le as usize] + state_b(lb, le + 1) - state_b(lb, le) <= have {
                     have -= layer_b[le as usize] + state_b(lb, le + 1) - state_b(lb, le);
                     le += 1;
+                }
+                // the whole model here: the head and the draft layer too, or the last layers go to the next GPU
+                if le == nl {
+                    while le > lb && head_b + mtp_b > have {
+                        le -= 1;
+                        have += layer_b[le as usize] + state_b(lb, le + 1) - state_b(lb, le);
+                    }
                 }
                 le
             };
@@ -374,15 +540,14 @@ impl<'g> Qwen<'g> {
         // GPU's pinned host memory, read by the expert kernels over PCIe (Strata's single-card RAM mirror)
         let ne = g.n_expert as usize;
         let mut resident = vec![true; nl as usize * ne];
-        if let (Some(&(lb, le)), Some(gpu)) = (bounds.last(), gpus.get(bounds.len() - 1)) {
+        // the last stage with layers (a model that fits the first GPU leaves the others none)
+        let last_i = bounds.iter().rposition(|b| b.1 > b.0).unwrap_or(0);
+        if let (Some(&(lb, le)), Some(gpu)) = (bounds.get(last_i), gpus.get(last_i)) {
             let (total, free) = gpu.memory()?;
             let mut have = free.unwrap_or(total).saturating_sub(margin + window_b + state_b(lb, le));
             if lb == 0 {
                 have = have.saturating_sub(embd_b);
             }
-            let head_b = [Role::Output, Role::OutputHcNorm, Role::OutputHcDown, Role::OutputHcUp].iter().map(|r| m.t(0, *r).bytes).sum::<u64>();
-            let mtp_b: u64 = if draft && std::env::var("NS_QW_MTP").is_ok_and(|d| !d.is_empty()) { 1100 << 20 } else { 0 };
-            let prompt_b = prompt_chunk() as u64 * (420 << 10) + (128 << 20); // carve(): ~1.65 GiB at 4096
             have = have.saturating_sub(head_b + mtp_b + prompt_b + (lb..le).map(|l| dense_bytes(&m, l)).sum::<u64>());
             let all: u64 = (lb..le).map(|l| m.expert_bytes(l) * g.n_expert).sum();
             if all > have {
@@ -432,6 +597,13 @@ impl<'g> Qwen<'g> {
                     stages.len(),
                     stages.iter().map(|s| format!("{} layers {}-{}", s.gpu.name, s.lb, s.le - 1)).collect::<Vec<_>>().join(", "),
                     gib(load_bytes), load_seconds));
+        // ---- a control vector, on every stage (before any session: its graphs hold where it applies)
+        if let Some((dir, sc, mode)) = load_cvec(nl, g.n_embd as usize, log)? {
+            for st in &stages {
+                // SAFETY: a live stage; dir and sc hold n_layer x 2560 and n_layer floats.
+                ffi::check(unsafe { (api.cvec_set)(st.raw, dir.as_ptr(), sc.as_ptr(), nl as i32, mode) }, "the control vector")?;
+            }
+        }
         // ---- the MTP draft layer (Strata's runtime directory: NS_QW_MTP), on the last stage beside the head
         let mut mtp = false;
         let mtp_dir = std::env::var("NS_QW_MTP").ok().filter(|d| !d.is_empty() && draft);
@@ -475,13 +647,18 @@ impl<'g> Qwen<'g> {
             let roles: Vec<Role> = m.roles(l).into_iter().filter(|r| !matches!(r, Role::ExpGate | Role::ExpUp | Role::ExpDown)).collect();
             let mut off = std::collections::HashMap::new();
             let mut at = 0usize;
+            // each tensor in the form the kernels read (Strata's iq_pack FORM: a file that stores one otherwise is
+            // converted where that is exact)
+            let mut bytes = Vec::with_capacity(roles.len());
             for r in &roles {
+                let b = in_form(f, m.t(l, *r), form(*r))?;
                 off.insert(*r, at);
-                at += (m.t(l, *r).bytes as usize + 255) & !255;
+                at += (b.len() + 255) & !255;
+                bytes.push(b);
             }
             let buf = DevBuf::new(gpu, at)?;
-            for r in &roles {
-                upload(f, m.t(l, *r), &buf, off[r])?;
+            for (r, b) in roles.iter().zip(&bytes) {
+                buf.write(off[r], b)?;
             }
             weight_bytes += at as u64;
             let p = |r: Role| ptr(&buf, &off, r);
@@ -541,11 +718,6 @@ impl<'g> Qwen<'g> {
                 x.ple_conv = p(Role::PleConv).cast();
             }
             // the kernels read these forms (GSQ-RCO stores them so; another converter's file would need converting)
-            for (r, want) in [(Role::Router, GType::BF16), (Role::HcAttnDown, GType::BF16), (Role::HcFfnNorm, GType::F32), (Role::ShGateInp, GType::BF16)] {
-                if m.t(l, r).ty != want {
-                    return Err(err(format!("{}: {} (the kernels read {})", m.t(l, r).name, m.t(l, r).ty.name(), want.name())));
-                }
-            }
             layers.push(x);
             dense.push(buf);
         }
@@ -657,6 +829,7 @@ impl<'g> Qwen<'g> {
             lb: lb as i64,
             le: le as i64,
             n_layer: g.n_layer as i64,
+            n_expert: g.n_expert as i64,
             max_cells: STAGE_CELLS,
             layers: layers.as_ptr(),
             edges,

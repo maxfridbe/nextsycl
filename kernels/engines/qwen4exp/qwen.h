@@ -68,6 +68,8 @@ typedef struct ns_qw_edges {
 
 typedef struct ns_qw_desc {
     int64_t lb, le, n_layer;
+    /* routed experts a layer (512; the Coder's 256) */
+    int64_t n_expert;
     /* the longest session this stage serves */
     int64_t max_cells;
     const ns_qw_layer* layers; /* le - lb of them */
@@ -117,6 +119,12 @@ int ns_qw_commit(ns_qw* w, ns_qw_state* st, int n_keep);
 int ns_qw_prefill_buffers(ns_qw* w, int64_t chunk, float** R);
 /* T tokens at pos0.. (committed: the state advances); ple_rows (host, T x 2560) for the stage with layer 1 */
 int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, int64_t pos0, const float* ple_rows);
+
+/* a control vector (cvec.cpp; Strata's --control-vector-scaled): dir n_layer x 2560 (project: unit directions;
+ * add: the offsets), s n_layer (project: the scale, add: 1; 0 = layer not steered), mode 0 project / 1 add. Set
+ * before any session (its graphs hold where it applies); enable switches it per request (on after set) */
+int ns_qw_cvec_set(ns_qw* w, const float* dir, const float* s, int n_layer, int mode);
+int ns_qw_cvec_enable(ns_qw* w, int on);
 
 /* the MTP draft layer (mtp.cpp, Strata's MtpDrafter): on the last stage, from Strata's runtime directory (tools/mtp_rt.py:
  * dense.txt / dense.bin / experts.bin / draft_vocab.bin); its own K/V lives in each session's state, so it is loaded

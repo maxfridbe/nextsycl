@@ -68,6 +68,17 @@ Every engine is held to the same checks: `spec-check` (verify passes equal one-t
   runtime directory), `NS_QW_EXPERT_PROFILE` (its expert profile: which experts stay in VRAM on one card),
   `NS_QW_CHUNK` (prompt chunk, 2048; Strata serves 4096), `NS_QW_SPEC` / `NS_QW_SPEC_MIN_P` (4 / 0.5),
   `NS_QW_EAGER=1` (no graphs), `NS_QW_WINDOWS=1` (prompts through windows), `NS_QW_PROFILE=1` (round timings).
+  The projection modes (llama.cpp's control vectors with the experimental-speed-projection package's
+  `--cvec-mode project --cvec-dir per-layer`, Strata's cvec kernel on the stage's own context, `cvec.cpp`):
+  `NS_QW_CVEC=<file.gguf>:<scale>`, `NS_QW_CVEC_LAYERS=4,44`, `NS_QW_CVEC_MODE=project|add`,
+  `NS_QW_CVEC_DIR=per-layer`. The Coder has 256 experts (the kernels take the count from the file); Swift's router is
+  F32 in the file and is converted to BF16 at load (exact).
+
+## The model registry
+
+`nextsycl models` (`crates/nextsycl/src/models.rs`) keeps what a machine serves: an entry's id, file, GPUs,
+contexts and engine settings, so an engine's settings (above) are given once, at `models add --set`, and
+`nextsycl start <id>` applies them. The README's Models section has the commands.
 
 ## What stays shared on purpose
 

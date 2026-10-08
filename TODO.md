@@ -191,9 +191,25 @@ of IQ2_XXS instead could win twice.
       Strata's expert profile, NS_QW_EXPERT_PROFILE), greedy picks on the GPU (Sampler::greedy). 20 / 2,185 / 8,000 /
       40,000 tokens: prompt 62 / 795 / 1,180 / 1,254 tok/s (Strata 60 / 745 / 1,050 / 1,117), decode 76 / 80-87 /
       82-89 / 70-75 (70 / 77 / 78 / 72). Two cards are slower (the B65 runs a layer at half the B70's speed)
-- [ ] qwen4exp: serve it (a chat mode, the prompt cache with the drafter's K/V), the Coder IQ1_M and Swift files,
-      sampled decoding's acceptance (drafts verified by drawing each row: exact, less accepted than Strata's coupled
-      sampling), the decode window's 4-row cost (28 ms in Strata, 32 here)
+- [x] qwen4exp served (2026-10-08): the chat template, the prompt cache (the drafter's K/V in the session state),
+      the Coder IQ1_M (256 experts: the count a parameter; its expert blobs to 2.5 MiB: 4 MiB staging) and Swift 1.5
+      (its F32 router converted to BF16 at load), the projection modes (Strata's cvec kernel, `cvec.cpp`; the same
+      text as Strata's). Strata no longer serves: the Open WebUI switcher and the H3 studio start nextsycl
+- [x] `nextsycl models` (list / add / download / remove / enable / disable): one registry the switcher and the
+      studio's mode file read
+- [ ] qwen4exp: sampled decoding's acceptance (drafts verified by drawing each row: exact, less accepted than
+      Strata's coupled sampling), tools (dropped today), the decode window's 4-row cost (28 ms in Strata, 32 here)
+- [ ] qwen4exp's first pass: a model just loaded decodes 10-20% slower than the same prompts run again on the same
+      load (IQ2_XS 2K-8K 69-71 vs 81-83 tok/s; the Coder 65-68 vs 76-78), with the same tokens and drafts accepted
+      and the GPU at 2.8 GHz. Not host memory: the Coder with every expert in VRAM (two cards) shows it too (57-62 vs
+      70-75). A kernel reading every expert once at load did not cure it reliably (tried, removed). Open
+- [ ] qwen4exp on one card leaves 6.2 GiB of the B70 free after load (16,415 of 24,576 IQ2_XS experts in VRAM; the
+      Coder keeps 2.5 GiB of experts in host memory though it fits the B70 whole with 4 GiB to spare): the budget
+      could take ~4 GiB more experts
+- [x] qwen4exp on both cards (every expert in VRAM; the split now leaves each stage its prompt buffers, and the head
+      and draft layer a card that takes every layer): slower than the B70 alone - Coder warm 2K / 8K / 40K 70.8 /
+      69.6 / 70.7 tok/s (B70 first) and 58.2 / 54.7 / 53.5 (B65 first) vs 77.5 / 75.9 / 77.2; IQ2_XS 70.6 / 68.5 /
+      66.8 vs 83.0 / 81.3 / 75.9. One card stays the default
 - [ ] The GLM-only kernels' declarations out of ns.h's shared part
 
 ## 256K context (plan: docs/256k-context.md, 2026-10-07)
@@ -359,5 +375,4 @@ already wrote comes out near-certain because the model copies it, not because it
 
 ## Later
 
-- [ ] qwen4exp (the Coder family) and a `--model` switch between runtimes (Strata does 75 tok/s on it today)
 - [ ] IQ3 variants of GLM (NOTES.md)

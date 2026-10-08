@@ -16,6 +16,7 @@ mod client;
 mod config;
 mod container;
 mod http;
+mod models;
 mod serve;
 mod service;
 mod telemetry;
@@ -32,7 +33,17 @@ pub const VERSION: &str = match option_env!("NS_VERSION") {
     None => "dev",
 };
 
-const USAGE: &str = "nextsycl - GLM-5.3-Flash on Intel Arc GPUs (Rust + SYCL)
+const USAGE: &str = "nextsycl - GLM-5.3-Flash and the Qwen3.8-Flash-Next family on Intel Arc GPUs (Rust + SYCL)
+
+the models (a registry, NS_REGISTRY; NS_STUDIO_MODES: the H3 studio's modes follow it):
+  nextsycl models [list] [--json]
+  nextsycl models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M...]] [--set NAME=VALUE]...
+                      [--no-tools] [--no-tasks] [--disabled]
+  nextsycl models download <id> <url | hf:org/repo/path/file.gguf> [--dir DIR] [add's options]
+                                every shard of a split file, resumed when run again; then added
+  nextsycl models remove <id> [--files]     --files: its GGUF shards deleted too
+  nextsycl models enable <id> | disable <id>
+  nextsycl start <id>           a registered model (its file, GPUs, contexts, settings; flags beside it win)
 
 the server (a container; the model stays loaded on the GPUs):
   nextsycl start [--gpu N ...] [--model PATH] [--port N] [--host H] [--ctx N | N,M,...] [--name ID] [--effort low|high|max]
@@ -60,7 +71,7 @@ in this process (inside the image: the kernels need the oneAPI runtime):
                  [--cache-dir DIR [--cache-disk-gib G (32)] [--cache-ttl-hours H (24)]: checkpoints pushed out of memory kept there]
                  [--max-tokens N (a request without max_tokens: N; default the rest of the context)]
                                 the server in the foreground (what start runs)
-  nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH | --ids FILE [--ignore-eos] [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
+  nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH | --ids FILE [--ignore-eos] [--ctx N] [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
                     [--expert-gib G] [--mirror-gib G] [--no-mtp]
   nextsycl info <model.gguf>    the architecture and geometry, every tensor checked by role, bytes by group
   nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
@@ -89,14 +100,17 @@ settings (environment, or NAME=value lines in nextsycl.conf beside the repositor
   NS_PARALLEL      requests decoded together, each with a session of its own (default 2; 1 = one at a time)
   NS_MAX_TOKENS    the tokens a request without max_tokens may make (default: to the end of the context)
   NS_SOCKET_DIR    where the control socket lives (default $XDG_RUNTIME_DIR/nextsycl)
-  NS_IMAGE, NS_CONTAINER_ENGINE   the image with the oneAPI runtime (localhost/h3-build) and podman / docker";
+  NS_IMAGE, NS_CONTAINER_ENGINE   the image with the oneAPI runtime (localhost/h3-build) and podman / docker
+  NS_MOUNTS        more read-only directories for the container, host:inside[,host:inside] (another model folder, ...)
+  NS_QW_*          the qwen4exp engine's settings, passed to the server (docs/engines.md): NS_QW_MTP (the draft
+                   layer), NS_QW_EXPERT_PROFILE, NS_QW_CVEC / _LAYERS / _MODE / _DIR (a control vector), NS_QW_CHUNK";
 
 fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
 }
 
 /// The engines this program has, one a model architecture (engines/<arch>)
-fn engines() -> Vec<EngineKind> {
+pub(crate) fn engines() -> Vec<EngineKind> {
     vec![ns_glm5next::kind(), ns_qwen4exp::kind()]
 }
 
@@ -452,12 +466,14 @@ fn generate(args: &[String]) -> Result<(), String> {
     let mirror_gib: Option<f64> = opt("--mirror-gib").and_then(|v| v.parse().ok());
     let mut log = |l: String| eprintln!("[{l}]");
     let mtp = !args.iter().any(|a| a == "--no-mtp");
+    // --ctx N: the session's context (default the prompt and --max: the server's sessions are larger)
+    let ctx = opt("--ctx").and_then(|v| v.parse().ok()).unwrap_or(ids.len() + max + 1).max(ids.len() + max + 1);
     let eng = load_engine(&f, &gs, LoadOptions { expert_bytes: expert_gib.map(|x| (x * (1u64 << 30) as f64) as usize),
                                                  mirror_bytes: mirror_gib.map(|x| (x * (1u64 << 30) as f64) as usize), draft: mtp,
-                                                 kv: (ids.len() + max + 1, 1) }, &mut log)?;
+                                                 kv: (ctx, 1) }, &mut log)?;
     eprintln!("[{} on {}, {} prompt tokens, loaded in {:.1} s]", f.meta("general.name").and_then(|v| v.as_str()).unwrap_or("?"),
               gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), ids.len(), eng.load_seconds());
-    let mut sess = eng.session(ids.len() + max + 1).map_err(e)?;
+    let mut sess = eng.session(ctx).map_err(e)?;
     let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
     let t0 = std::time::Instant::now();
     let logits = eng.feed(&mut sess, &ids, &mut none).map_err(e)?;
@@ -784,6 +800,7 @@ fn main() -> ExitCode {
     let rest = args.get(1..).unwrap_or(&[]);
     let r = match args.first().map(String::as_str) {
         Some("start") => service::start(&cfg, rest),
+        Some("models") => models::cmd(&cfg, rest),
         Some("stop") => service::stop(&cfg),
         Some("logs") => service::logs(&cfg, rest),
         Some("status") => client::status(rest),

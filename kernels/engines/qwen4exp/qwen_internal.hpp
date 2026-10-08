@@ -19,7 +19,7 @@ namespace qw {
 
 constexpr float EPS = 1e-6f;
 // the artifact's geometry, which the kernels are built for (the Rust side checks the file against it)
-constexpr int64_t N = 2560, HC = 4, HC_LR = 320, K = 10, NE = 512, NFF = 640;
+constexpr int64_t N = 2560, HC = 4, HC_LR = 320, K = 10, NE = 512, NFF = 640;   // NE: the most experts a layer (the buffers')
 constexpr int64_t S = 128, HK = 16, HV = 48, C = 2 * HK * S + HV * S, ZV = HV * S, DCONV = 4;
 constexpr int64_t NH = 24, NKV = 2, HD = 256, IQ = 4, ID = 128;
 constexpr int64_t GDN_FLOATS = S * HV * S + C * (DCONV - 1);
@@ -104,6 +104,7 @@ struct ns_qw {
     ns_gpu* g = nullptr;
     sycl::queue* q = nullptr;
     int64_t lb = 0, le = 0, n_layer = 0, max_cells = 0, vocab = 0;
+    int64_t ne = 512;   // routed experts a layer in this model
     std::vector<ns_qw_layer> L;   // le - lb
     ns_qw_edges E{};
     int64_t nG = 0, nQ = 0;       // the stage's GDN / QSA layers
@@ -148,6 +149,8 @@ struct ns_qw {
     struct Pf* pf = nullptr;
     // the MTP draft layer (mtp.cpp), on the last stage
     struct Mtp* mtp = nullptr;
+    // a control vector (cvec.cpp), on every stage
+    struct Cv* cv = nullptr;
     std::vector<int32_t> h_res;
     std::vector<unsigned long long> h_slot_off;
     const unsigned long long* mirror = nullptr;   // device: the host mirror's addresses (resident_plan_set_mirror)
@@ -162,5 +165,10 @@ float* prefill_rows(ns_qw* w);
 int64_t prefill_cap(ns_qw* w);
 void mtp_free(ns_qw* w);       // mtp.cpp
 void mtp_warm(ns_qw* w, ns_qw_state* st);   // mtp.cpp: the drafter's graphs recorded
+// cvec.cpp: layer l's FFN write is followed by the vector; the vector on T residual stacks (with the pending write first)
+bool cvec_covers(const ns_qw* w, int64_t l);
+void cvec_apply(ns_qw* w, float* R, int64_t layer, int64_t T, int64_t r_ld, const float* bo, int64_t bo_ld,
+                const float* inj, int64_t inj_ld, bool write);
+void cvec_free(ns_qw* w);
 }
 
