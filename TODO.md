@@ -250,8 +250,15 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
       goes 18.8-19.0 -> 21.3-21.6 tok/s, +13%: prefetch and the async swaps already hide most of the copies. A CPU
       share would win a part of that (CPU-computed experts never come up, 8 cores spinning through decode) - not
       built. The card swap has the same ceiling
-- [ ] Decode is GPU-bound now: the KDA input projections 6.2 ms a token (~3.6 GB of Q8_0 at ~330 GB/s, ~55% of the
-      cards' bandwidth), the experts' kernels, KDA 10.6 ms in all, MLA 4.9, the shared expert 2.2, the draft 2.5
+- [x] Decode's Q8_0 products (the KDA projections): Strata's wide32 kernel already has the aligned loads (load16_a2).
+      Measured alone (reference/mmvq-bw.cpp, 8192 x 4096, random weights, cold): B70 488 / 551 / 538 GB/s at 1 / 2 /
+      3 rows - 80-90% of its ~608; B65 374 / 384 / 356 (~62%: its fewer units' decode). Lifting the B65 to the
+      B70's share would save ~1-2% of decode: not pursued. (The ~330 GB/s seen in the profile was both cards and
+      all six projections, the small ones included.) Lesson: a constant fill is compressed by the GPU's memory -
+      bandwidth tests need random data; and ns_copy_to is queued - its host buffer must outlive it (a bench that
+      freed it faulted the B70, engine reset 4, recovered)
+- [ ] Decode is spread out now (per token: experts' kernels, KDA 10.6 ms, MLA 4.9, the draft 2.5, the shared expert
+      2.2): no single kernel holds a big share. Levers left: more VRAM (fewer misses: <= 13%), MTP acceptance
 - [ ] Batch: the draft block in batches; per-request energy (concurrent requests share the counters - each counts
       both)
 
