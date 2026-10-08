@@ -1,7 +1,8 @@
 # Imported kernels
 
-The SYCL kernels of the Strata Intel port, copied unchanged from Strata_B70 branch `up139-fix` at
-`79ad9d5aff716292602895b19860c7661bacc5ed` (2026-10-05; upstream PR #809, branch `intel-arc-0.1.39`). Only kernel
+The SYCL kernels of the Strata Intel port, copied unchanged from Strata_B70 branch `intel-arc-0.1.40` at
+`3f37281` (2026-10-06, the port refreshed to upstream 0.1.40; first imported from `up139-fix` 79ad9d5 and refreshed by a
+3-way merge, base = the previous import). Only kernel
 code: Strata's host runtime (loader, sessions, expert source, scheduler, server) is not here - nextsycl's is in
 Rust (`crates/`).
 
@@ -28,3 +29,5 @@ New code goes in `kernels/ns/`. The changes made here, each marked `nextsycl` in
 - `iq_kernels.dp.cpp`: multi-entry dots for IQ2_XXS (`Multi<16>`) and Q2_K (`Multi<10>`, a `custom` per-token dot),
   and 8-entry passes in the grouped expert kernels: GLM-5.3's expert formats decoded once per 8 tokens of a prompt
   chunk instead of once per token. Same arithmetic as the single-entry dots.
+- Since the 0.1.40 refresh: `native_expert_set_phase` sets upstream's `g_exp_phase` (its bench switch, the same
+  meaning), and the opt-in S26 grouped path (`STRATA_EXPERT_V2`, Qwen shapes only) runs the SwiGLU unclamped.
