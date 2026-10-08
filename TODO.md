@@ -257,6 +257,9 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
       all six projections, the small ones included.) Lesson: a constant fill is compressed by the GPU's memory -
       bandwidth tests need random data; and ns_copy_to is queued - its host buffer must outlive it (a bench that
       freed it faulted the B70, engine reset 4, recovered)
+- [x] Sampling at a temperature sorted the whole vocabulary (154,880) for its top 256 a token (~2.5 ms): now a linear
+      selection, then the 256 sorted (the same order, the same tokens - the drafts accepted matched exactly). Decode
+      at temperature 0.7 21.3-21.6 -> 22.7-23.0 tok/s, at 1.0 20.4-20.9 -> 21.6-22.2 (greedy 23.0-23.8)
 - [ ] Decode is spread out now (per token: experts' kernels, KDA 10.6 ms, MLA 4.9, the draft 2.5, the shared expert
       2.2): no single kernel holds a big share. Levers left: more VRAM (fewer misses: <= 13%), MTP acceptance
 - [ ] Batch: the draft block in batches; per-request energy (concurrent requests share the counters - each counts

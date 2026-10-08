@@ -368,8 +368,17 @@ fn sample(logits: &[f32], temp: f32, top_p: f32, rng: &mut Rng) -> u32 {
     if temp <= 0.0 {
         return logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32);
     }
+    // the 256 likeliest in order (higher logit first, then lower index - a stable sort's order): selected in linear
+    // time, only they sorted - the whole vocabulary's sort (154,880) cost ~2.5 ms a token (decode at temperature 1.0
+    // 20.6 tok/s vs greedy's 23.1)
+    let by = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then(a.cmp(b));
     let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]));
+    let k = 256.min(idx.len());
+    if k < idx.len() {
+        idx.select_nth_unstable_by(k - 1, by);
+        idx.truncate(k);
+    }
+    idx.sort_by(by);
     let mx = logits[idx[0]];
     let mut p: Vec<(usize, f32)> = idx.iter().take(256).map(|&i| (i, ((logits[i] - mx) / temp).exp())).collect();
     let sum: f32 = p.iter().map(|x| x.1).sum();
