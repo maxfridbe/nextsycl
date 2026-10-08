@@ -608,6 +608,18 @@ int ns_qw_state_copy(ns_qw* w, ns_qw_state* dst, const ns_qw_state* src, int64_t
 
 // ---- the window
 
+int ns_qw_set_sampling(ns_qw* w, float temperature, float top_p, int top_k, float min_p, unsigned long long seed) {
+    NS_TRY
+    w->s_temp = temperature > 0.0f ? temperature : 0.0f;
+    w->s_top_p = top_p > 0.0f && top_p <= 1.0f ? top_p : 1.0f;
+    w->s_top_k = top_k > 0 ? top_k : 64;
+    w->s_min_p = min_p > 0.0f ? min_p : 0.0f;
+    w->s_seed = seed;
+    qw::mtp_set_sampling(w);
+    return 0;
+    NS_CATCH
+}
+
 int ns_qw_window(ns_qw* w, ns_qw_state* st, int T, const int32_t* tokens, int64_t pos0, const float* ple_rows,
                  int logits_from, float* logits_host, int32_t* argmax_host) {
     NS_TRY
@@ -660,7 +672,18 @@ int ns_qw_window(ns_qw* w, ns_qw_state* st, int T, const int32_t* tokens, int64_
         std::memcpy(logits_host, w->h_logits, bytes);
     }
     if (w->le == w->n_layer && argmax_host != nullptr) {
-        if (argmax_rows_wanted()) {
+        if (w->s_temp > 0.0f) {
+            // a sampled request: row t is drawn as Philox(seed, pos0 + t) over the sampler chain - tied to the position
+            // it samples, so the coupled drafts (mtp.cpp) drew with the same uniform (Strata's verify window)
+            SamplerParams sp;
+            sp.top_k = w->s_top_k;
+            sp.top_p = w->s_top_p;
+            sp.min_p = w->s_min_p;
+            sp.temperature = w->s_temp;
+            sp.seed = w->s_seed;
+            sp.counter = (uint64_t) pos0;
+            sample_tokens(w->head_logits, T, (int) w->vocab, nullptr, 0, sp, w->out_ids, cs);
+        } else if (argmax_rows_wanted()) {
             argmax_rows(w->head_logits, T, (int) w->vocab, w->arg_scratch, w->out_ids, cs);
         } else {
             SamplerParams sp;

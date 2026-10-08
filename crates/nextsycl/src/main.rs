@@ -71,7 +71,7 @@ in this process (inside the image: the kernels need the oneAPI runtime):
                  [--cache-dir DIR [--cache-disk-gib G (32)] [--cache-ttl-hours H (24)]: checkpoints pushed out of memory kept there]
                  [--max-tokens N (a request without max_tokens: N; default the rest of the context)]
                                 the server in the foreground (what start runs)
-  nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH | --ids FILE [--ignore-eos] [--ctx N] [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N[,M]]
+  nextsycl generate <model.gguf> --prompt TEXT | --prompt-file PATH | --ids FILE [--ignore-eos] [--ctx N] [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--seed S] [--gpu N[,M]]
                     [--expert-gib G] [--mirror-gib G] [--no-mtp]
   nextsycl info <model.gguf>    the architecture and geometry, every tensor checked by role, bytes by group
   nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
@@ -415,6 +415,8 @@ pub(crate) struct TempSampler<'a> {
     pub temp: f32,
     pub top_p: f32,
     pub rng: &'a mut Rng,
+    /// draws on the GPU (Sampler::device) from this seed
+    pub seed: u64,
 }
 
 impl ns_runtime::Sampler for TempSampler<'_> {
@@ -429,6 +431,9 @@ impl ns_runtime::Sampler for TempSampler<'_> {
     }
     fn greedy(&self) -> bool {
         self.temp <= 0.0
+    }
+    fn device(&self) -> Option<ns_runtime::DeviceSampling> {
+        (self.temp > 0.0).then_some(ns_runtime::DeviceSampling { temperature: self.temp, top_p: self.top_p, seed: self.seed })
     }
 }
 
@@ -479,7 +484,8 @@ fn generate(args: &[String]) -> Result<(), String> {
     let logits = eng.feed(&mut sess, &ids, &mut none).map_err(e)?;
     let prefill = t0.elapsed().as_secs_f64();
     let mut rng = Rng(0x9E3779B97F4A7C15);
-    let mut draw = TempSampler { temp, top_p, rng: &mut rng };
+    let seed: u64 = opt("--seed").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let mut draw = TempSampler { temp, top_p, rng: &mut rng, seed };
     let mut dec = eng.decoder(logits, mtp);
     dec.set_context(&ids);
     let mut pending: Vec<u8> = Vec::new();

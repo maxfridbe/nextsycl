@@ -22,7 +22,10 @@ each context length: [Speed by model](#speed-by-model).
   --rows`), so greedy output with MTP equals greedy output without it. At a temperature the draft is sampled from
   the draft block's own distribution and kept with min(1, p/q) (speculative sampling): what is committed is
   distributed exactly as plain sampling, and more drafts are accepted when the model is unsure (61.6% -> 65.0% over
-  three prompts at 0.7 / 1.0). Prompt-lookup drafts (`NS_NGRAM`) are there too, exact, off: on this MoE a longer
+  three prompts at 0.7 / 1.0). Qwen3.8-Flash-Next draws a sampled request's tokens on the GPU (Philox(seed,
+  position), the top 64 tokens before top-p) and draws each draft from the draft layer with the uniform of the row
+  that will verify it (Strata's coupled draft sampling): 69-70% of drafts accepted at 0.7 / 1.0 instead of 60-64%,
+  the text exactly the draws, and the same `seed` the same text. Prompt-lookup drafts (`NS_NGRAM`) are there too, exact, off: on this MoE a longer
   verify pass costs nearly its rows (each brings its own experts).
 - **Long context, to 256K:** the DSA indexer past 2,048 tokens (each row attends to its top 512 pools of 4 tokens and
   its own unfinished pool), checked against llama.cpp; a context per session (`--ctx 262144,32768` / `NS_CTX`: one

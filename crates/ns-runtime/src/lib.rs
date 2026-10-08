@@ -34,6 +34,20 @@ pub trait Sampler {
     fn greedy(&self) -> bool {
         false
     }
+    /// Some: the draws may be made on the GPU instead of from `sample` - the chain with this temperature and top-p,
+    /// one uniform a position from `seed` (Philox), and nothing reads the logits (no logprobs). Same distribution,
+    /// other random numbers; an engine that does it can couple its drafts to the draws
+    fn device(&self) -> Option<DeviceSampling> {
+        None
+    }
+}
+
+/// A request's sampling as an engine may run it on the GPU (`Sampler::device`)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeviceSampling {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub seed: u64,
 }
 
 impl<F: FnMut(&[f32]) -> u32> Sampler for F {

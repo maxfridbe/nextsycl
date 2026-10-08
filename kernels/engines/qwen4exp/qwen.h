@@ -104,6 +104,10 @@ int ns_qw_state_save(ns_qw* w, ns_qw_state* st, int64_t pos, void* host);
 int ns_qw_state_load(ns_qw* w, ns_qw_state* st, int64_t pos, const void* host);
 int ns_qw_state_copy(ns_qw* w, ns_qw_state* dst, const ns_qw_state* src, int64_t pos);
 
+/* the request's sampler, on the last stage: temperature > 0 makes ns_qw_window's picks (argmax_host) draws of the
+ * chain (top_k <= 64, top_p, min_p, temperature) with Philox(seed, position), and the drafts coupled to those draws
+ * (drawn from the draft layer with the same chain and uniform); 0 = greedy */
+int ns_qw_set_sampling(ns_qw* w, float temperature, float top_p, int top_k, float min_p, unsigned long long seed);
 /* T (1..8) tokens at pos0.. through the stage's layers. ple_rows (host, T x 2560): the tokens' PLE rows, for the
  * stage with layer 1. On the last stage, logits rows [logits_from, T) are copied to logits_host (vocab floats a row), and
  * (argmax_host not null) each row's argmax to argmax_host, picked on the GPU (Strata's greedy pick: the lowest index wins).

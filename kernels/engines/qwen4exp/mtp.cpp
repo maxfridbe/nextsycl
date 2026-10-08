@@ -29,6 +29,7 @@
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/s_gemv.hpp"
+#include "strata/core/coupled_draft.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
 
@@ -80,6 +81,16 @@ struct Mtp {
     int32_t* h_in = nullptr;   // tok | step | pos | row
     int32_t* h_out = nullptr;
     float* h_prob = nullptr;
+    // coupled draft sampling (Strata's STRATA_SPEC_COUPLED, include/strata/core/coupled_draft.hpp): the request's
+    // sampler on the device (staged from pinned memory at each round), the penalty ring (no penalties here: all -1),
+    // the split sampler's scratch, token id -> draft-head index
+    bool coupled_ok = false;
+    SK::SamplerParams* cparams = nullptr;
+    SK::SamplerParams* h_cparams = nullptr;
+    int32_t* cring = nullptr;
+    int32_t* h_chist = nullptr;
+    void* cscratch = nullptr;
+    int32_t* dinv = nullptr;
 
     const Tensor* find(const char* name, const char* kind) const {
         for (const auto& t : tensors) if (t.name == name && t.kind == kind) return &t;
@@ -197,7 +208,7 @@ void front(ns_qw* w, ns_qw_state* st, Mtp* m, int T, int row0) {
 
 // the rest for row 0 at step row `step_row`: the attention from the q projection, the MLP, the final mixer, the head,
 // the draft and its probability (Strata: record_rest, argmax drafts)
-void rest(ns_qw* w, ns_qw_state* st, Mtp* m, int step_row) {
+void rest(ns_qw* w, ns_qw_state* st, Mtp* m, int step_row, int j, bool coupled) {
     sycl::queue* cs = w->q;
     const SK::QsaShapes& s = w->s;
     const SK::GrShapes gs{N, HC, HC_LR};
@@ -269,6 +280,13 @@ void rest(ns_qw* w, ns_qw_state* st, Mtp* m, int step_row) {
     }
     SK::native_quantize_q8_1(m->sample, m->xq, (int) N, T, cs);
     SK::native_mmvq(m->dhead_type, m->dhead, m->xq, m->head_logits, (int) N, (int) m->n_dvocab, T, cs);
+    if (coupled) {
+        // the draft drawn with the target's chain and the Philox draw of the row that will verify it (counter = this
+        // cell + 1, from its step record): token id and its probability straight into out_ids / probs
+        SK::coupled_draft_sample(m->head_logits, (int) m->n_dvocab, m->dvocab, m->dinv, (int) w->vocab, m->cparams, m->cring,
+                                 strata::core::kCoupledHistCap, j, m->step + step_row * 4, m->cscratch, m->out_ids, m->probs, cs);
+        return;
+    }
     if (SK::argmax_rows_wanted()) {
         SK::argmax_rows(m->head_logits, T, (int) m->n_dvocab, m->arg_scratch, m->out_ids, cs);
     } else {
@@ -284,7 +302,7 @@ void rest(ns_qw* w, ns_qw_state* st, Mtp* m, int step_row) {
 
 // the round on the device: its inputs from pinned memory, the window's final residual rows, the catch-up over T cells,
 // the rest for row a (staged in row_), the first draft
-void round_body(ns_qw* w, ns_qw_state* st, Mtp* m, int T) {
+void round_body(ns_qw* w, ns_qw_state* st, Mtp* m, int T, bool coupled) {
     sycl::queue* cs = w->q;
     const int max_t = m->max_t;
     const int ra = 2 * max_t - 1;
@@ -296,22 +314,24 @@ void round_body(ns_qw* w, ns_qw_state* st, Mtp* m, int T) {
         SK::copy_i32_from_mapped(m->step, h_step, (int64_t) 2 * max_t * 4, cs);
         SK::copy_i32_from_mapped(m->pos, h_pos, (int64_t) 2 * max_t * NH, cs);
         SK::copy_i32_from_mapped(m->row, h_row, 2, cs);
+        // a sampled request's chain, read by this round's draft steps (ns_qw_set_sampling wrote it, between rounds)
+        if (coupled) SK::coupled_draft_stage(m->h_cparams, m->h_chist, m->cparams, m->cring, strata::core::kCoupledHistCap, cs);
         cs->memcpy(m->Rin, w->R, (size_t) T * HCN * 4);
         front(w, st, m, T, 0);
         if (T > 1) {
             SK::copy_row_to_first(m->row, m->R, HCN, m->inj, HC, m->mixed, N, cs);
             SK::native_quantize_q8_1(m->mixed, m->xq, (int) N, 1, cs);
         }
-        rest(w, st, m, ra);
+        rest(w, st, m, ra, 0, coupled);
         SK::mtp_select(m->R, HCN, m->out_ids, m->row + 1, m->Rin, m->tok, m->out_dev, 0, cs, m->probs, m->prob_dev);
 }
 
 // chain step j on the device: one row from the previous step's residual and token
-void step_body(ns_qw* w, ns_qw_state* st, Mtp* m, int j) {
+void step_body(ns_qw* w, ns_qw_state* st, Mtp* m, int j, bool coupled) {
     sycl::queue* cs = w->q;
     const int row = m->max_t + j - 1;
             front(w, st, m, 1, row);
-            rest(w, st, m, row);
+            rest(w, st, m, row, j, coupled);
             SK::mtp_select(m->R, HCN, m->out_ids, m->row + 1, m->Rin, m->tok, m->out_dev, j, cs, m->probs, m->prob_dev);
 }
 
@@ -329,7 +349,9 @@ void free_mtp(ns_qw* w) {
     auto& ctx = w->g->ctx;
     for (void* p : {(void*) m->dense, (void*) m->experts, (void*) m->dhead, (void*) m->dvocab, m->arena})
         if (p) sycl::free(p, ctx);
-    for (void* p : {(void*) m->h_in, (void*) m->h_out, (void*) m->h_prob})
+    for (void* p : {(void*) m->h_in, (void*) m->h_out, (void*) m->h_prob, (void*) m->h_cparams, (void*) m->h_chist})
+        if (p) sycl::free(p, ctx);
+    for (void* p : {(void*) m->cparams, (void*) m->cring, m->cscratch, (void*) m->dinv})
         if (p) sycl::free(p, ctx);
     delete m;
     w->mtp = nullptr;
@@ -341,14 +363,30 @@ namespace qw {
 void mtp_free(ns_qw* w) {
     try { free_mtp(w); } catch (...) {}
 }
+void mtp_set_sampling(ns_qw* w) {
+    Mtp* m = w->mtp;
+    if (m == nullptr || !m->coupled_ok) return;
+    SK::SamplerParams sp;
+    sp.top_k = w->s_top_k;
+    sp.top_p = w->s_top_p;
+    sp.min_p = w->s_min_p;
+    sp.temperature = w->s_temp;
+    sp.seed = w->s_seed;
+    sp.greedy = w->s_temp <= 0.0f;
+    *m->h_cparams = sp;   // read by the next coupled round's stage (no round is in flight between calls)
+}
 void mtp_warm(ns_qw* w, ns_qw_state* st) {
     Mtp* m = w->mtp;
     if (m == nullptr || st->mtp.k_q == nullptr) return;
     for (int T = 1; T <= m->max_t; ++T) {
-        run_graph(*w->q, st->mtp_round[T], [&] { round_body(w, st, m, T); }, false);
+        run_graph(*w->q, st->mtp_round[T], [&] { round_body(w, st, m, T, false); }, false);
         run_graph(*w->q, st->mtp_pf[T], [&] { front(w, st, m, T, 0); }, false);
+        if (m->coupled_ok) run_graph(*w->q, st->mtp_round_c[T], [&] { round_body(w, st, m, T, true); }, false);
     }
-    for (int j = 1; j < m->max_t; ++j) run_graph(*w->q, st->mtp_step[j], [&] { step_body(w, st, m, j); }, false);
+    for (int j = 1; j < m->max_t; ++j) {
+        run_graph(*w->q, st->mtp_step[j], [&] { step_body(w, st, m, j, false); }, false);
+        if (m->coupled_ok) run_graph(*w->q, st->mtp_step_c[j], [&] { step_body(w, st, m, j, true); }, false);
+    }
 }
 }  // namespace qw
 
@@ -454,8 +492,28 @@ int ns_qw_mtp_load(ns_qw* w, const char* rt_dir, int max_t, int64_t window, int 
     m->h_out = (int32_t*) sycl::malloc_host(64, ctx);
     m->h_prob = (float*) sycl::malloc_host(64, ctx);
     if (!m->h_in || !m->h_out || !m->h_prob) return fail("pinned staging");
-    std::fprintf(stderr, "qwen mtp: draft layer loaded (%lld draft-head tokens, window %lld cells)\n", (long long) m->n_dvocab,
-                 (long long) m->window);
+    if (const size_t scratch = SK::coupled_draft_scratch_bytes((int) m->n_dvocab); scratch > 0) {
+        const int cap = strata::core::kCoupledHistCap;
+        m->cparams = sycl::malloc_device<SK::SamplerParams>(1, w->g->dev, ctx);
+        m->h_cparams = sycl::malloc_host<SK::SamplerParams>(1, ctx);
+        m->cring = sycl::malloc_device<int32_t>((size_t) cap + (size_t) max_t, w->g->dev, ctx);
+        m->h_chist = sycl::malloc_host<int32_t>((size_t) cap, ctx);
+        m->cscratch = sycl::malloc_device(scratch, w->g->dev, ctx);
+        m->dinv = sycl::malloc_device<int32_t>((size_t) w->vocab, w->g->dev, ctx);
+        if (!m->cparams || !m->h_cparams || !m->cring || !m->h_chist || !m->cscratch || !m->dinv)
+            return fail("the coupled draft sampler's buffers do not fit");
+        *m->h_cparams = SK::SamplerParams{};
+        std::fill(m->h_chist, m->h_chist + cap, -1);
+        q.memset(m->cring, 0xff, ((size_t) cap + (size_t) max_t) * 4);
+        std::vector<int32_t> sub((size_t) m->n_dvocab), inv((size_t) w->vocab, -1);
+        q.memcpy(sub.data(), m->dvocab, sub.size() * 4).wait();
+        for (size_t i = 0; i < sub.size(); ++i)
+            if (sub[i] >= 0 && sub[i] < w->vocab && inv[(size_t) sub[i]] < 0) inv[(size_t) sub[i]] = (int32_t) i;
+        q.memcpy(m->dinv, inv.data(), inv.size() * 4).wait();
+        m->coupled_ok = true;
+    }
+    std::fprintf(stderr, "qwen mtp: draft layer loaded (%lld draft-head tokens, window %lld cells%s)\n", (long long) m->n_dvocab,
+                 (long long) m->window, m->coupled_ok ? ", coupled draft sampling" : "");
     return 0;
     NS_CATCH
 }
@@ -517,7 +575,8 @@ int ns_qw_mtp_draft(ns_qw* w, ns_qw_state* st, const int32_t* tokens, int64_t p,
     // ---- the round: its inputs from pinned memory, the window's final residual rows (this stage ran it: its R), the
     // catch-up's front for T cells, the rest for row a (on row 0), the draft
     const int max_t = m->max_t;
-    run_graph(*cs, st->mtp_round[T], [&] { round_body(w, st, m, T); });
+    const bool coupled = m->coupled_ok && w->s_temp > 0.0f;
+    run_graph(*cs, coupled ? st->mtp_round_c[T] : st->mtp_round[T], [&] { round_body(w, st, m, T, coupled); });
     cs->memcpy(m->h_out, m->out_dev, 4);
     cs->memcpy(m->h_prob, m->prob_dev, 4);
     cs->wait_and_throw();
@@ -527,7 +586,7 @@ int ns_qw_mtp_draft(ns_qw* w, ns_qw_state* st, const int32_t* tokens, int64_t p,
     // ---- the chain, while the last draft is likely enough to be verified
     for (int j = 1; j < max_steps && probs[j - 1] >= min_p; ++j) {
         const int row = m->max_t + j - 1;
-        run_graph(*cs, st->mtp_step[j], [&] { step_body(w, st, m, j); });
+        run_graph(*cs, coupled ? st->mtp_step_c[j] : st->mtp_step[j], [&] { step_body(w, st, m, j, coupled); });
         cs->memcpy(m->h_out + j, m->out_dev + j, 4);
         cs->memcpy(m->h_prob + j, m->prob_dev + j, 4);
         cs->wait_and_throw();

@@ -98,6 +98,8 @@ struct ns_qw_state {
     std::vector<Part> parts;
     // its graphs: the window a size, the commit, the drafter's round a catch-up size and its steps
     std::unique_ptr<qw::GraphExec> win[qw::MAXT + 1], commit, mtp_round[qw::MAXT + 1], mtp_step[qw::MAXT + 1], mtp_pf[qw::MAXT + 1];
+    // the drafter's coupled-sampling variants (a sampled request: the draft drawn with the target's chain and draw)
+    std::unique_ptr<qw::GraphExec> mtp_round_c[qw::MAXT + 1], mtp_step_c[qw::MAXT + 1];
 };
 
 struct ns_qw {
@@ -151,6 +153,11 @@ struct ns_qw {
     struct Mtp* mtp = nullptr;
     // a control vector (cvec.cpp), on every stage
     struct Cv* cv = nullptr;
+    // a sampled request (ns_qw_set_sampling; the last stage): the window's rows drawn on the GPU, Philox(seed,
+    // position), and the drafts coupled to those draws; temperature 0 = greedy (argmax)
+    float s_temp = 0.0f, s_top_p = 1.0f, s_min_p = 0.0f;
+    int s_top_k = 64;
+    unsigned long long s_seed = 0;
     std::vector<int32_t> h_res;
     std::vector<unsigned long long> h_slot_off;
     const unsigned long long* mirror = nullptr;   // device: the host mirror's addresses (resident_plan_set_mirror)
@@ -165,6 +172,7 @@ float* prefill_rows(ns_qw* w);
 int64_t prefill_cap(ns_qw* w);
 void mtp_free(ns_qw* w);       // mtp.cpp
 void mtp_warm(ns_qw* w, ns_qw_state* st);   // mtp.cpp: the drafter's graphs recorded
+void mtp_set_sampling(ns_qw* w);   // mtp.cpp: the request's sampler for the coupled drafts
 // cvec.cpp: layer l's FFN write is followed by the vector; the vector on T residual stacks (with the pending write first)
 bool cvec_covers(const ns_qw* w, int64_t l);
 void cvec_apply(ns_qw* w, float* R, int64_t layer, int64_t T, int64_t r_ld, const float* bo, int64_t bo_ld,

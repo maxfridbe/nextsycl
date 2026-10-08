@@ -32,6 +32,13 @@ fn profile() -> bool {
     *P.get_or_init(|| std::env::var("NS_QW_PROFILE").is_ok_and(|v| v == "1"))
 }
 
+/// NS_QW_COUPLED=0: a sampled request's draws on the host from the logits, its drafts the draft layer's argmax
+/// (Strata's default); otherwise on the GPU with the drafts coupled to them (Strata's STRATA_SPEC_COUPLED=1)
+fn coupled() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("NS_QW_COUPLED").map_or(true, |v| v != "0"))
+}
+
 /// a draft goes into the window while at least this likely under the draft layer (Strata's --spec-min-p 0.5;
 /// NS_QW_SPEC_MIN_P)
 fn spec_min_p() -> f32 {
@@ -213,6 +220,8 @@ struct Run {
     staging: Vec<u8>,
     /// the last window run: (the session, its first position, its tokens) - the drafter reads its residual rows
     last_window: Option<(usize, usize, usize)>,
+    /// the sampler the last stage holds (None: greedy picks)
+    sampling: Option<ns_runtime::DeviceSampling>,
 }
 
 pub struct Qwen<'g> {
@@ -626,7 +635,7 @@ impl<'g> Qwen<'g> {
             log(format!("qwen4exp: the MTP draft layer from {dir} on {}", last.gpu.name));
         }
         Ok(Qwen { file: f, m, stages, table, api,
-                  run: Mutex::new(Run { open: None, next_id: 1, flushed: Vec::new(), staging: Vec::new(), last_window: None }), mtp,
+                  run: Mutex::new(Run { open: None, next_id: 1, flushed: Vec::new(), staging: Vec::new(), last_window: None, sampling: None }), mtp,
                   load_seconds, load_bytes, vocab })
     }
 
@@ -962,6 +971,21 @@ impl<'g> Qwen<'g> {
     }
 
     /// One window, each row's argmax picked on the GPU (the logits stay there)
+    /// The picks of the next windows: the argmax (None), or draws of the request's chain on the GPU, Philox(seed,
+    /// position), with the drafts coupled to them (ns_qw_set_sampling); set on the last stage when it changes
+    fn set_sampling(&self, run: &mut Run, want: Option<ns_runtime::DeviceSampling>) -> Result<()> {
+        if run.sampling == want {
+            return Ok(());
+        }
+        let last = self.stages.last().ok_or_else(|| err("no stages"))?;
+        let (t, p, seed) = want.map_or((0.0, 1.0, 0), |d| (d.temperature, d.top_p, d.seed));
+        // SAFETY: a live stage; no window or round is in flight (the run lock is held, the last call synced).
+        ffi::check(unsafe { (self.api.set_sampling)(last.raw, t, p, 64, 0.0, seed) }, "the sampler")?;
+        run.sampling = want;
+        Ok(())
+    }
+
+    /// The window's picks on the GPU: each row's argmax, or its draw (`set_sampling`)
     fn window_argmax(&self, run: &mut Run, s: &mut Session, tokens: &[u32]) -> Result<Vec<u32>> {
         Ok(self.window_raw(run, s, tokens, tokens.len(), true)?.1.iter().map(|x| (*x).max(0) as u32).collect())
     }
@@ -1181,11 +1205,15 @@ impl<'g> Qwen<'g> {
     }
 
     pub fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler) -> Result<Vec<u32>> {
+        // a sampled request with nothing reading the logits: its draws on the GPU too (and coupled drafts)
+        let dev = if smp.greedy() || !coupled() { None } else { smp.device() };
+        let on_gpu = smp.greedy() || dev.is_some();
         if !(d.draft && self.mtp) {
-            if d.logits.is_none() && smp.greedy() {
-                // the pick on the GPU: the token's window, its argmax, committed
+            if d.logits.is_none() && on_gpu {
+                // the pick on the GPU: the token's window, its argmax (or draw), committed
                 let t = d.next.take().ok_or_else(|| err("a decode step with nothing to feed"))?;
                 let mut run = self.run.lock().unwrap();
+                self.set_sampling(&mut run, dev)?;
                 self.flush(&mut run)?;
                 self.settle(&mut run, s)?;
                 if s.open.is_some() {
@@ -1215,6 +1243,7 @@ impl<'g> Qwen<'g> {
         if s.open.is_some() {
             return Err(err("a decode step on a session with an uncommitted verify pass"));
         }
+        self.set_sampling(&mut run, dev)?;
         if let Some(l) = d.logits.take() {
             // the prompt's last token was its first window: draft from it
             let t = smp.sample(&l);
@@ -1234,7 +1263,7 @@ impl<'g> Qwen<'g> {
         window.extend_from_slice(&d.drafts[..tw - 1]);
         let p0 = s.pos;
         let t0 = Instant::now();
-        let greedy = smp.greedy();
+        let greedy = on_gpu;
         let (logits, picks) = if greedy { (Vec::new(), self.window_argmax(&mut run, s, &window)?) } else { (self.window(&mut run, s, &window, 0)?, Vec::new()) };
         let t1 = Instant::now();
         let mut out = Vec::with_capacity(tw);

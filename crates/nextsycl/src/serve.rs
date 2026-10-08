@@ -115,6 +115,8 @@ struct Ask {
     logprobs: Option<usize>,
     /// LogProbChain: the logprobs also chained through the attention to this turn's own earlier tokens
     chain: bool,
+    /// the request's `seed`: the same seed and prompt give the same text where the engine draws on the GPU
+    seed: Option<u64>,
 }
 
 /// LogProbChain on one generated token's entry: for its token and each alternative, the logprob plus, over this
@@ -208,6 +210,8 @@ struct Job {
     logprobs: Option<usize>,
     /// LogProbChain: decoded one token a pass (no draft block), the attention captured
     chain: bool,
+    /// the draws' seed where the engine samples on the GPU (Sampler::device)
+    seed: u64,
     tx: mpsc::Sender<Ev>,
     /// the client went away: end it
     cancel: Arc<AtomicBool>,
@@ -273,6 +277,7 @@ fn read_group(chunk: usize) -> usize {
 struct ServeSampler<'a> {
     temp: f32,
     top_p: f32,
+    seed: u64,
     rng: &'a mut Rng,
     tok: &'a Tokenizer,
     k: Option<usize>,
@@ -299,6 +304,18 @@ impl ns_runtime::Sampler for ServeSampler<'_> {
     fn greedy(&self) -> bool {
         self.temp <= 0.0 && self.k.is_none()
     }
+    fn device(&self) -> Option<ns_runtime::DeviceSampling> {
+        (self.temp > 0.0 && self.k.is_none()).then_some(ns_runtime::DeviceSampling { temperature: self.temp, top_p: self.top_p, seed: self.seed })
+    }
+}
+
+/// A request's seed when it gives none: its id and the clock, mixed (splitmix64)
+fn fresh_seed(id: u64) -> u64 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let mut z = t ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Prefixes shorter than this are read again rather than cached
@@ -587,7 +604,7 @@ impl Server {
                      _ if chain => Some(req["top_logprobs"].as_u64().unwrap_or(5).min(20) as usize),
                      _ => None,
                  },
-                 chain })
+                 chain, seed: req["seed"].as_u64().or_else(|| req["seed"].as_i64().map(|s| s as u64)) })
     }
 
     // ------------------------------------------------------------------ the engine thread
@@ -873,7 +890,7 @@ impl Server {
         }
         let (temp, top_p, k) = (a.job.temp, a.job.top_p, a.job.logprobs);
         let mut lps: VecDeque<Value> = VecDeque::new();
-        let mut draw = ServeSampler { temp, top_p, rng, tok: &self.tok, k, lps: &mut lps };
+        let mut draw = ServeSampler { temp, top_p, seed: a.job.seed, rng, tok: &self.tok, k, lps: &mut lps };
         let toks = self.engine.step(&mut slots[a.slot].sess, a.dec.as_mut().unwrap(), &mut draw, &mut *none).map_err(|e| e.0)?;
         for y in toks {
             let lp = lps.pop_front();
@@ -994,7 +1011,8 @@ impl Server {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         self.inflight.fetch_add(1, Ordering::SeqCst);
-        self.queue.lock().unwrap().push_back(Job { id: rid, ids: ids.clone(), max, temp, top_p, logprobs: ask.logprobs, chain: ask.chain, tx,
+        self.queue.lock().unwrap().push_back(Job { id: rid, ids: ids.clone(), max, temp, top_p, logprobs: ask.logprobs, chain: ask.chain,
+                                                     seed: ask.seed.unwrap_or_else(|| fresh_seed(rid)), tx,
                                                    cancel: cancel.clone() });
         self.wake.notify_one();
         // its prompt read
