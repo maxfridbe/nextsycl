@@ -360,6 +360,14 @@ impl Server {
         loop {
             if STOP.load(Ordering::SeqCst) && self.inflight.load(Ordering::SeqCst) == 0 {
                 eprintln!("[stopping: no request running]");
+                // the experts decode asked for, for the next load's VRAM fill (NS_EXPERT_PROFILE)
+                if let Ok(p) = std::env::var("NS_EXPERT_PROFILE") {
+                    match self.glm.save_expert_profile(std::path::Path::new(&p)) {
+                        Ok(n) if n > 0 => eprintln!("[expert profile: {n} experts written to {p}]"),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[expert profile: writing {p} failed: {e}]"),
+                    }
+                }
                 // the checkpoints in memory onto the disk tier, for the next server
                 if let Ok(mut c) = self.cache.lock() {
                     let n = c.persist_all();

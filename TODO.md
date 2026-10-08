@@ -235,6 +235,15 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
 - [x] The disk tier outlives the server: a subdirectory per fingerprint (the model file and size, the cache's form,
       MTP), the tokens beside each file, a stop writing the checkpoints still in memory; unused for 24 h (or past
       32 GiB, least recently used first) removed. A 12K checkpoint from the 64K mode mounted by the 256K mode
+- [x] Decode, from Strata's lessons (2026-10-07): the GPUs are busy ~all of a decode (summed device time = the wall
+      time) - routing on the device or graph capture would save little; the misses' copies are the cost (~16
+      swaps a token). The q8 latent cache by default (~100 more experts in VRAM in the 2 x 64K server: benchy the
+      same or a little faster - docs/benchy/v1-2026-10-07-q8.md). Pinning experts by a usage profile LOST in
+      simulation (reference/expert-cache/pinning.py, the other topic's profile: 25% pinned +12% misses, 90% +140%);
+      filling VRAM by the profile at load won the first answer: decode's requests counted, saved at a stop
+      (NS_EXPERT_PROFILE, ~/.cache/nextsycl/prompts/expert-profile.txt, older halved each save) - a new topic's first
+      256 tokens 3,951 -> 3,561 swaps, 23.2-23.5 -> 24.0-24.6 tok/s
+- [ ] Decode: missed experts computed on the CPU beside the copies (Strata's CPU share); the card swap (To try)
 - [ ] Batch: the draft block in batches; per-request energy (concurrent requests share the counters - each counts
       both)
 

@@ -18,8 +18,8 @@ PCIe. It runs on one card or splits the layers over several.
   long session and a short one; default two of 64K). A 253K-token prompt reads in 271 s (933 tok/s) and decodes at
   ~15 tok/s at that depth; a follow-up on it restores its checkpoint in seconds. The model is trained to 1M tokens
   (no RoPE in its MLA); a passphrase is found at 10 / 50 / 90% of 32K-249K documents (`bench --needle`, 9 of 9). The
-  latent cache in fp16, or q8 with `NS_KV=q8` (544 bytes a token and layer instead of 1,024; the same needle
-  result). Plan and measurements: `docs/256k-context.md`.
+  latent cache in q8 (544 bytes a token and layer; `NS_KV=f16` for fp16's 1,024 - the same needle result, benchy
+  the same or a little faster with q8: `docs/benchy/v1-2026-10-07-q8.md`). Plan and measurements: `docs/256k-context.md`.
 - **A prompt path on the XMX units:** prompts are read in chunks of 6,144 tokens, with the experts, the dense
   matrices and MLA's attention in fp16 through oneMKL's half GEMMs, and the experts that live in host memory copied
   on a second queue while the previous ones compute.
@@ -143,7 +143,8 @@ the server:
 | load | ~18 s |
 
 About 60% of the experts fit in VRAM (plus ~380 slots a GPU lent by the prompt arena while decode runs); the rest sit
-in pinned host memory. At decode a missed expert is swapped in over PCIe (both directions at once, on two copy
+in pinned host memory. At load VRAM takes the experts decode asked for most in earlier runs first (the expert profile
+a stop saves beside the prompt cache). At decode a missed expert is swapped in over PCIe (both directions at once, on two copy
 queues, while the resident experts compute; the next layer's likely experts prefetched) - on these cards' x8 links
 those swaps are still the largest share of decode time (`TODO.md`). `--gpu all` puts the GPU that computes most last
 (it takes the head and the draft block); `NS_SPLIT` sets the layers per GPU. A prompt longer than a chunk (6,144

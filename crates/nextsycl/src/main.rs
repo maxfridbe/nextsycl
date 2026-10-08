@@ -81,7 +81,7 @@ settings (environment, or NAME=value lines in nextsycl.conf beside the repositor
   NS_CTX           tokens of context per session (default 65536), or one a session: 262144,32768 (one long, one short)
   NS_NAME          the model id clients see (glm-5.3-flash-uncensored)
   NS_EFFORT        default reasoning effort (low)        NS_NO_MTP=1   decode without the draft block
-  NS_KV            the latent cache's form: f16 (default) or q8 (544 bytes a token and layer instead of 1,024)
+  NS_KV            the latent cache's form: q8 (default, 544 bytes a token and layer) or f16 (1,024)
   NS_PROMPT_CACHE_MIB   host memory for the prompt cache's checkpoints (default 4096; 0 = off)
   NS_CACHE_DIR, NS_CACHE_DISK_GIB, NS_CACHE_TTL_HOURS   checkpoints pushed out of memory (and those in it at a stop)
                    on disk (default ~/.cache/nextsycl/prompts, 32 GiB - 0 = none, 24 h unused before removal)

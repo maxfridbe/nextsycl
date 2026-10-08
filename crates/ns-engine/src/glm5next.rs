@@ -66,11 +66,12 @@ fn pipeline() -> bool {
     *V.get_or_init(|| std::env::var("NS_PIPELINE").map_or(true, |v| v != "0"))
 }
 
-/// The MLA latent cache's form (NS_KV): f16 (default; 1,024 bytes a token and layer) or q8 (an fp16 scale a block of
-/// 32, int8 values: 544 bytes - docs/256k-context.md)
+/// The MLA latent cache's form (NS_KV): q8 (default: an fp16 scale a block of 32, int8 values - 544 bytes a token and
+/// layer) or f16 (1,024). q8 against f16: llama.cpp parity cosine 0.9952 vs 0.9964, the needle 9 of 9 to 249K, benchy
+/// the same or a little faster (its VRAM holds ~100 more experts) - docs/256k-context.md
 pub fn kv_q8() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("NS_KV").is_ok_and(|v| v == "q8"))
+    *V.get_or_init(|| std::env::var("NS_KV").map_or(true, |v| v != "f16"))
 }
 
 /// bytes of a latent row of `lat` values in the cache
@@ -144,6 +145,26 @@ fn chunked(tokens: &[u32], c: usize) -> Vec<&[u32]> {
 fn esimd_max() -> Option<usize> {
     static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_ESIMD_MAX").ok().and_then(|v| v.parse().ok()))
+}
+
+/// The expert profile (NS_EXPERT_PROFILE: "layer expert weight" lines), read once
+fn expert_profile() -> Option<&'static HashMap<(u64, u64), f64>> {
+    static V: std::sync::OnceLock<Option<HashMap<(u64, u64), f64>>> = std::sync::OnceLock::new();
+    V.get_or_init(|| std::env::var("NS_EXPERT_PROFILE").ok().and_then(|p| read_profile(std::path::Path::new(&p)))).as_ref()
+}
+
+fn read_profile(path: &std::path::Path) -> Option<HashMap<(u64, u64), f64>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut m = HashMap::new();
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        let mut it = line.split_whitespace();
+        if let (Some(l), Some(x), Some(w)) = (it.next(), it.next(), it.next()) {
+            if let (Ok(l), Ok(x), Ok(w)) = (l.parse(), x.parse(), w.parse()) {
+                m.insert((l, x), w);
+            }
+        }
+    }
+    Some(m)
 }
 
 /// The rows the fused kernel computes for n tokens: to 32, above 64 to 64 (its wide form)
@@ -301,6 +322,8 @@ struct Store {
     last_up: Option<i64>,
     /// experts swapped in ahead of their layer (`prefetch`), not yet asked for: their copy up's ticket
     prefetched: HashMap<(u64, u64), (i64, i64)>,
+    /// decode's requests per expert since load (`Glm::save_expert_profile`)
+    usage: HashMap<(u64, u64), u64>,
     /// the VRAM slots of its own (`base`), then `lend` more in the big arena's memory (the last of `vram`), which
     /// hold experts while no prompt chunk needs that arena (`lent`)
     base: usize,
@@ -695,8 +718,14 @@ impl Part {
                 have += k;
             }
         }
-        // what goes where at load: the part's experts in layer order, VRAM first, then host (all but the spare)
-        let all: Vec<(u64, u64)> = moe.iter().flat_map(|l| (0..m.g.n_expert).map(move |x| (*l, x))).collect();
+        // what goes where at load: the part's experts, VRAM first, then host (all but the spare) - the most used in
+        // the expert profile first (NS_EXPERT_PROFILE: earlier runs' decode requests), else in layer order. Simulated
+        // on a two-topic trace with the other topic's profile: the first tenth of an answer 1-27% fewer misses
+        // (reference/expert-cache/pinning.py; pinning those experts instead lost - the hot set follows the topic)
+        let mut all: Vec<(u64, u64)> = moe.iter().flat_map(|l| (0..m.g.n_expert).map(move |x| (*l, x))).collect();
+        if let Some(prof) = expert_profile() {
+            all.sort_by_key(|k| std::cmp::Reverse(prof.get(k).copied().unwrap_or(0.0) as u64)); // stable: ties in layer order
+        }
         let in_v: Vec<(u64, u64)> = all.iter().take(nv).copied().collect();
         let in_r: Vec<(u64, u64)> = all.iter().skip(nv).take(nr.saturating_sub(1)).copied().collect();
         let t0 = Instant::now();
@@ -756,7 +785,7 @@ impl Part {
             vowner[i] = Some(*k);
         }
         let store = Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree, tick: 0, hits: 0, misses: 0, from_host: 0, direct: 0,
-                            rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(), last_up: None, prefetched: HashMap::new(),
+                            rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(), last_up: None, prefetched: HashMap::new(), usage: HashMap::new(),
                             pf_issued: 0, pf_used: 0, base: nv, lend: 0, lent: false };
         // the big arena (prompt chunks) lends its memory to the store while decode runs on the small one
         let big = DevBuf::new(gpu, arena_bytes())?;
@@ -908,6 +937,11 @@ impl Part {
         }
         c.tick += 1;
         let tick = c.tick;
+        if promote {
+            for &x in need {
+                *c.usage.entry((l, x)).or_insert(0) += 1;
+            }
+        }
         // NS_TRACE_EXPERTS=FILE: every decode request for experts (GPU, tick, layer, experts), for offline policy studies
         if promote {
             if let Ok(f) = std::env::var("NS_TRACE_EXPERTS") {
@@ -2052,6 +2086,36 @@ impl<'g> Glm<'g> {
         let out = p.mm(l, Role::MlaOut, &oh, t)?;
         self.lap(p, "MLA: output projection", t_out);
         Ok(out)
+    }
+
+    /// The decode requests per expert since load blended into the profile at `path` (old weights halved: it follows
+    /// recent use) and written there - the next load fills VRAM with the most used first (NS_EXPERT_PROFILE)
+    pub fn save_expert_profile(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        let mut prof: HashMap<(u64, u64), f64> = read_profile(path).unwrap_or_default();
+        for v in prof.values_mut() {
+            *v *= 0.5;
+        }
+        let mut n = 0;
+        for p in &self.parts {
+            let c = p.experts.lock().unwrap();
+            for (k, u) in &c.usage {
+                *prof.entry(*k).or_insert(0.0) += *u as f64;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return Ok(0); // nothing decoded: the profile stays as it was
+        }
+        let mut v: Vec<_> = prof.into_iter().filter(|(_, w)| *w >= 0.5).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut out = String::from("# nextsycl expert profile: layer expert weight (decode requests, older halved each save)\n");
+        for ((l, x), w) in &v {
+            out += &format!("{l} {x} {w:.1}\n");
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(v.len())
     }
 
     /// Keeps each GPU's big arena out of the expert store (`on`) while a prompt is read in groups between other

@@ -79,6 +79,8 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     if let Some(d) = &cache_dir {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
         args.extend(mount(d, "/cache", false));
+        // the expert profile beside the checkpoints: decode's requests, the next load's VRAM fill order
+        args.extend(["-e".into(), "NS_EXPERT_PROFILE=/cache/expert-profile.txt".into()]);
     }
     args.extend(["-e".into(), "NEXTSYCL_LIB=/app/libnextsycl.so".into(), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // engine settings the server reads from its environment (NS_KV=q8: the latent cache in q8)
