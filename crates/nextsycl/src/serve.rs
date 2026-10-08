@@ -34,7 +34,7 @@
 //!     POST /server/shutdown        stop once no request runs (as SIGTERM)
 //!
 //! Up to `--parallel` requests (NS_PARALLEL, default 2) decode together: an engine thread owns that many sessions,
-//! reads a new request's prompt into a free one, and steps every active session at once (`Glm::forward_batch`: the
+//! reads a new request's prompt into a free one, and steps every active session at once (`Engine::forward_batch`: the
 //! weights read once for all of them; each row as its own pass would be) - one active request decodes alone, with
 //! the draft block. The rest wait in order. The prompt cache (cache.rs, --prompt-cache-mib) keeps the
 //! conversation state at three points of every prompt - the end of its first turn (a system prompt other
@@ -53,7 +53,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ns_engine::glm5next::{Decoder, Glm, Session};
+use ns_runtime::{Decoder, Engine, Session};
 
 use crate::cache::PromptCache;
 use crate::telemetry::Telemetry;
@@ -66,7 +66,8 @@ use crate::{sample, Rng};
 static STOP: AtomicBool = AtomicBool::new(false);
 
 pub struct Server {
-    pub glm: Glm<'static>,
+    /// the model's engine (engines/<arch>, chosen by the file's architecture)
+    pub engine: Box<dyn Engine>,
     pub tok: Tokenizer,
     pub name: String,
     /// the largest session's context (a request must fit one)
@@ -261,11 +262,11 @@ struct Reading {
 /// its speed over three; a 256K prompt read at once held every other request for 4.5 minutes). Read alone, a prompt goes
 /// to its end in one pipelined read, stopped at a chunk's end when a request arrives (groups of 8 alone had cost
 /// 8%: the pipeline drained at each)
-fn read_group() -> usize {
-    3 * ns_engine::glm5next::prefill_chunk()
+fn read_group(chunk: usize) -> usize {
+    3 * chunk
 }
 
-/// The server's sampler for `Glm::step`: the request's temperature and top-p (speculative sampling of the drafts), each
+/// The server's sampler for `Engine::step`: the request's temperature and top-p (speculative sampling of the drafts), each
 /// committed token's logprob entry noted in order when asked for
 struct ServeSampler<'a> {
     temp: f32,
@@ -276,7 +277,7 @@ struct ServeSampler<'a> {
     lps: &'a mut VecDeque<Value>,
 }
 
-impl ns_engine::glm5next::Sampler for ServeSampler<'_> {
+impl ns_runtime::Sampler for ServeSampler<'_> {
     fn sample(&mut self, logits: &[f32]) -> u32 {
         let y = sample(logits, self.temp, self.top_p, self.rng);
         self.record(logits, y);
@@ -331,12 +332,12 @@ fn text_of(v: &Value) -> String {
 
 impl Server {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(glm: Glm<'static>, tok: Tokenizer, name: String, slot_ctx: Vec<usize>, default_effort: Effort, cache: PromptCache,
+    pub fn new(engine: Box<dyn Engine>, tok: Tokenizer, name: String, slot_ctx: Vec<usize>, default_effort: Effort, cache: PromptCache,
                cors: Vec<String>, keep: usize, default_max: Option<usize>) -> Result<Server, String> {
-        let tele = Telemetry::start(&glm.gpu_info().iter().map(|g| g.pci.clone()).collect::<Vec<_>>());
+        let tele = Telemetry::start(&engine.gpu_info().iter().map(|g| g.pci.clone()).collect::<Vec<_>>());
         let parallel = slot_ctx.len().max(1);
         let max_ctx = slot_ctx.iter().copied().max().unwrap_or(8192);
-        Ok(Server { glm, tok, name, max_ctx, slot_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
+        Ok(Server { engine, tok, name, max_ctx, slot_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
                     inflight: AtomicU64::new(0), parallel, default_max, cache: Mutex::new(cache),
                     live_lens: Mutex::new(vec![0; parallel]), started: Instant::now(), running: Mutex::new(Default::default()),
                     done: Mutex::new(VecDeque::new()), next_id: AtomicU64::new(1), keep, tele, cors })
@@ -392,7 +393,7 @@ impl Server {
                 eprintln!("[stopping: no request running]");
                 // the experts decode asked for, for the next load's VRAM fill (NS_EXPERT_PROFILE)
                 if let Ok(p) = std::env::var("NS_EXPERT_PROFILE") {
-                    match self.glm.save_expert_profile(std::path::Path::new(&p)) {
+                    match self.engine.save_profile(std::path::Path::new(&p)) {
                         Ok(n) if n > 0 => eprintln!("[expert profile: {n} experts written to {p}]"),
                         Ok(_) => {}
                         Err(e) => eprintln!("[expert profile: writing {p} failed: {e}]"),
@@ -439,7 +440,7 @@ impl Server {
     /// a prompt with it: a status call never waits).
     fn status_json(&self) -> Value {
         let rd = self.tele.readings();
-        let gpus: Vec<Value> = self.glm.gpu_info().iter().enumerate().map(|(i, g)| {
+        let gpus: Vec<Value> = self.engine.gpu_info().iter().enumerate().map(|(i, g)| {
             let r = rd.get(i).copied().unwrap_or_default();
             json!({"index": g.index, "name": g.name, "pci": g.pci, "total": g.total, "free": g.free, "layers": [g.layers.0, g.layers.1],
                    "expert_slots": g.expert_slots, "host_slots": g.host_slots, "watts": r.watts, "temp_c": r.temp_c, "vram_temp_c": r.vram_c})
@@ -450,7 +451,7 @@ impl Server {
                                                              "disk": c.disk().map(|(n, b, g)| json!({"entries": n, "bytes": b, "budget": g}))}));
         let running: Vec<Value> = self.running.lock().unwrap().values().cloned().collect();
         json!({"model": self.name, "version": crate::VERSION, "uptime_seconds": self.started.elapsed().as_secs_f64(),
-               "context": self.max_ctx, "contexts": self.slot_ctx, "mtp": self.glm.mtp.is_some(), "parallel": self.parallel, "gpus": gpus,
+               "context": self.max_ctx, "contexts": self.slot_ctx, "mtp": self.engine.has_draft(), "parallel": self.parallel, "gpus": gpus,
                "busy": !running.is_empty(), "running": running.first().cloned(), "active": running,
                "waiting": self.queue.lock().unwrap().len(), "served": self.next_id.load(Ordering::Relaxed) - 1,
                "prompt_cache": cache, "stopping": STOP.load(Ordering::SeqCst)})
@@ -590,7 +591,7 @@ impl Server {
     /// and steps the active ones - alone with the draft block, or together in one batch pass.
     fn engine(&self) {
         let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
-        let mut slots: Vec<Slot> = match self.slot_ctx.iter().map(|&c| self.glm.session(c).map(|sess| Slot { sess, live: Vec::new() }))
+        let mut slots: Vec<Slot> = match self.slot_ctx.iter().map(|&c| self.engine.session(c).map(|sess| Slot { sess, live: Vec::new() }))
             .collect::<ns_core::Result<Vec<_>>>() {
             Ok(v) => v,
             Err(e) => {
@@ -609,13 +610,13 @@ impl Server {
             while active.len() < self.parallel {
                 let Some(mut job) = self.queue.lock().unwrap().pop_front() else { break };
                 let used: Vec<usize> = active.iter().map(|a| a.slot).collect();
-                let fits = |i: usize| slots[i].sess.max_ctx >= job.ids.len() + 16;
+                let fits = |i: usize| slots[i].sess.max_ctx() >= job.ids.len() + 16;
                 // among the free sessions it fits: the one holding the longest prefix of this prompt, then the
                 // smallest (a long session kept for the long prompts)
                 let slot = (0..slots.len()).filter(|i| !used.contains(i) && fits(*i))
                     .max_by_key(|&i| {
                         let l = &slots[i].live;
-                        (if l.len() < job.ids.len() && job.ids.starts_with(l) { l.len() + 1 } else { 0 }, std::cmp::Reverse(slots[i].sess.max_ctx))
+                        (if l.len() < job.ids.len() && job.ids.starts_with(l) { l.len() + 1 } else { 0 }, std::cmp::Reverse(slots[i].sess.max_ctx()))
                     });
                 let Some(slot) = slot else {
                     // only busy sessions fit it: it waits at the front
@@ -623,7 +624,7 @@ impl Server {
                     break;
                 };
                 // its tokens end at its session's context
-                job.max = job.max.min(slots[slot].sess.max_ctx - job.ids.len() - 1);
+                job.max = job.max.min(slots[slot].sess.max_ctx() - job.ids.len() - 1);
                 match self.begin_read(&mut slots[slot], &job.ids) {
                     Ok(rd) => {
                         active.push(Active { job, slot, dec: None, logits: None, pending: None, n: 0, committed: Vec::new(), accepted: 0,
@@ -648,13 +649,13 @@ impl Server {
                 // the decode share holds back long reads only: a prompt of a chunk or less reads at once (a second
                 // short request waited out the first one's window - 11 s to its first token)
                 let left = active[i].reading.as_ref().map_or(0, |r| active[i].job.ids.len() - r.at);
-                if active[i].reading.is_none() || (decoding && left > ns_engine::glm5next::prefill_chunk() && Instant::now() < read_after) {
+                if active[i].reading.is_none() || (decoding && left > self.engine.prefill_chunk() && Instant::now() < read_after) {
                     i += 1;
                     continue;
                 }
                 let g0 = Instant::now();
                 let a = &mut active[i];
-                let limit = if others { read_group() } else { usize::MAX };
+                let limit = if others { read_group(self.engine.prefill_chunk()) } else { usize::MAX };
                 let r = if a.job.cancel.load(Ordering::Relaxed) {
                     Err("client gone".to_string())
                 } else {
@@ -662,7 +663,7 @@ impl Server {
                 };
                 // the round's reading in all (a short prompt read after a long group must not shorten the share)
                 read_after = read_after.max(Instant::now()) + g0.elapsed();
-                if others && limit == read_group() && g0.elapsed() > last_group / 2 {
+                if others && limit == read_group(self.engine.prefill_chunk()) && g0.elapsed() > last_group / 2 {
                     last_group = g0.elapsed();
                 }
                 match r {
@@ -693,7 +694,7 @@ impl Server {
                 continue;
             }
             // the big arena stays with the prompts while one is being read
-            self.glm.hold_arena(active.iter().any(|a| a.reading.is_some()));
+            self.engine.hold_arena(active.iter().any(|a| a.reading.is_some()));
             // the ones still reading wait out this round's steps
             let mut readers: Vec<Active> = Vec::new();
             let mut i = 0;
@@ -754,11 +755,12 @@ impl Server {
                 if let Some(finish) = active[i].finish {
                     let mut a = active.remove(i);
                     if let Some(d) = a.dec.take() {
-                        a.accepted += d.accepted;
-                        a.drafted += d.drafted;
+                        let (dr, ac) = d.drafts();
+                        a.accepted += ac;
+                        a.drafted += dr;
                     }
                     let sl = &mut slots[a.slot];
-                    let fed = sl.sess.pos.saturating_sub(a.job.ids.len()).min(a.committed.len());
+                    let fed = sl.sess.pos().saturating_sub(a.job.ids.len()).min(a.committed.len());
                     sl.live = a.job.ids.clone();
                     sl.live.extend_from_slice(&a.committed[..fed]);
                     let _ = a.job.tx.send(Ev::End { finish, accepted: a.accepted, drafted: a.drafted });
@@ -785,12 +787,12 @@ impl Server {
         let cached = if cache.enabled() { cache.best(ids) } else { None };
         let (from, source) = match cached {
             Some((hit, len)) if len > live_len => {
-                cache.with(hit, |ck| self.glm.restore(&mut sl.sess, ck))?.map_err(|e| e.0)?;
+                cache.with(hit, &|r| self.engine.read_checkpoint(r), |ck| self.engine.restore(&mut sl.sess, ck))?.map_err(|e| e.0)?;
                 (len, if matches!(hit, crate::cache::Hit::Disk(_)) { "disk" } else { "cache" })
             }
             _ if live_len > 0 => (live_len, "live"),
             _ => {
-                self.glm.reset_session(&mut sl.sess).map_err(|e| e.0)?;
+                self.engine.reset_session(&mut sl.sess).map_err(|e| e.0)?;
                 (0, "none")
             }
         };
@@ -801,14 +803,14 @@ impl Server {
 
     /// Up to `limit` more of a prompt's tokens (a checkpoint saved at each stop passed): the last token's logits once
     /// it is read to its end
-    fn read_some(&self, sl: &mut Slot, ids: &[u32], rd: &mut Reading, limit: usize, none: ns_engine::Tap) -> Result<Option<Vec<f32>>, String> {
+    fn read_some(&self, sl: &mut Slot, ids: &[u32], rd: &mut Reading, limit: usize, none: ns_runtime::Tap) -> Result<Option<Vec<f32>>, String> {
         let mut budget = limit;
         while rd.at < ids.len() && budget > 0 {
             let stop = rd.stops.first().copied().unwrap_or(ids.len());
             let end = stop.min(rd.at.saturating_add(budget)).min(ids.len());
             // read alone (no limit), it stops at a chunk's end once another request waits
             let arrived = || limit == usize::MAX && !self.queue.lock().unwrap().is_empty();
-            let (fed, logits) = self.glm.feed_until(&mut sl.sess, &ids[rd.at..end], &arrived, &mut *none).map_err(|e| e.0)?;
+            let (fed, logits) = self.engine.feed_until(&mut sl.sess, &ids[rd.at..end], &arrived, &mut *none).map_err(|e| e.0)?;
             budget = budget.saturating_sub(fed);
             rd.at += fed;
             if rd.at < end {
@@ -818,7 +820,7 @@ impl Server {
                 rd.stops.remove(0);
                 let mut cache = self.cache.lock().unwrap();
                 if cache.enabled() && !cache.touch(&ids[..stop]) {
-                    let ck = self.glm.save(&sl.sess).map_err(|e| e.0)?;
+                    let ck = self.engine.save(&sl.sess).map_err(|e| e.0)?;
                     if cache.put(ids[..stop].to_vec(), ck) {
                         rd.saved += 1;
                     }
@@ -850,12 +852,12 @@ impl Server {
     }
 
     /// One request active: a step of its own, with the draft block (one token, or two with a draft accepted)
-    fn step_alone(&self, slots: &mut [Slot], active: &mut [Active], rng: &mut Rng, none: ns_engine::Tap) -> Result<(), String> {
+    fn step_alone(&self, slots: &mut [Slot], active: &mut [Active], rng: &mut Rng, none: ns_runtime::Tap) -> Result<(), String> {
         let Some(a) = active.iter_mut().find(|a| a.finish.is_none()) else { return Ok(()) };
         if a.dec.is_none() {
             let mut dec = match (a.logits.take(), a.pending.take()) {
-                (Some(l), _) => self.glm.decoder(l, true),
-                (None, Some(y)) => self.glm.decoder_after(y, true),
+                (Some(l), _) => self.engine.decoder(l, true),
+                (None, Some(y)) => self.engine.decoder_after(y, true),
                 (None, None) => return Err("a request without logits or a token to feed".into()),
             };
             // the conversation so far, for prompt-lookup drafts (NS_NGRAM)
@@ -867,7 +869,7 @@ impl Server {
         let (temp, top_p, k) = (a.job.temp, a.job.top_p, a.job.logprobs);
         let mut lps: VecDeque<Value> = VecDeque::new();
         let mut draw = ServeSampler { temp, top_p, rng, tok: &self.tok, k, lps: &mut lps };
-        let toks = self.glm.step(&mut slots[a.slot].sess, a.dec.as_mut().unwrap(), &mut draw, &mut *none).map_err(|e| e.0)?;
+        let toks = self.engine.step(&mut slots[a.slot].sess, a.dec.as_mut().unwrap(), &mut draw, &mut *none).map_err(|e| e.0)?;
         for y in toks {
             let lp = lps.pop_front();
             self.commit(a, y, lp);
@@ -877,11 +879,11 @@ impl Server {
 
     /// A LogProbChain request's step: one token (no draft block), the attention of the pass that made its logits
     /// captured, the token's entry chained through it
-    fn step_chain(&self, slots: &mut [Slot], a: &mut Active, rng: &mut Rng, none: ns_engine::Tap) -> Result<(), String> {
+    fn step_chain(&self, slots: &mut [Slot], a: &mut Active, rng: &mut Rng, none: ns_runtime::Tap) -> Result<(), String> {
         if a.dec.is_none() {
             a.dec = Some(match (a.logits.take(), a.pending.take()) {
-                (Some(l), _) => self.glm.decoder(l, false),
-                (None, Some(y)) => self.glm.decoder_after(y, false),
+                (Some(l), _) => self.engine.decoder(l, false),
+                (None, Some(y)) => self.engine.decoder_after(y, false),
                 (None, None) => return Err("a request without logits or a token to feed".into()),
             });
         }
@@ -893,10 +895,10 @@ impl Server {
             entry = Some(logprob_entry(tok, l, y, k));
             y
         };
-        self.glm.capture_attention(true);
-        let toks = self.glm.step(&mut slots[a.slot].sess, a.dec.as_mut().unwrap(), &mut draw, &mut *none);
-        let att = self.glm.take_attention();
-        self.glm.capture_attention(false);
+        self.engine.capture_attention(true);
+        let toks = self.engine.step(&mut slots[a.slot].sess, a.dec.as_mut().unwrap(), &mut draw, &mut *none);
+        let att = self.engine.take_attention();
+        self.engine.capture_attention(false);
         let toks = toks.map_err(|e| e.0)?;
         let mut e = entry.unwrap_or(Value::Null);
         if let Some(att) = &att {
@@ -910,7 +912,7 @@ impl Server {
     }
 
     /// Several active: a token each, one batch pass for all of them
-    fn step_together(&self, slots: &mut [Slot], active: &mut [Active], rng: &mut Rng, none: ns_engine::Tap) -> Result<(), String> {
+    fn step_together(&self, slots: &mut [Slot], active: &mut [Active], rng: &mut Rng, none: ns_runtime::Tap) -> Result<(), String> {
         // each one's next token: drawn from its logits, or the one its own steps committed and did not feed
         let mut feed: Vec<(usize, u32)> = Vec::new(); // (index in active, token)
         for (i, a) in active.iter_mut().enumerate() {
@@ -918,8 +920,9 @@ impl Server {
                 continue;
             }
             if let Some(mut d) = a.dec.take() {
-                a.accepted += d.accepted;
-                a.drafted += d.drafted;
+                let (dr, ac) = d.drafts();
+                a.accepted += ac;
+                a.drafted += dr;
                 a.pending = d.pending();
             }
             let y = match (a.logits.take(), a.pending.take()) {
@@ -943,7 +946,7 @@ impl Server {
         let want: Vec<usize> = feed.iter().map(|(i, _)| active[*i].slot).collect();
         let mut sess: Vec<&mut Session> = slots.iter_mut().enumerate().filter(|(si, _)| want.contains(si)).map(|(_, s)| &mut s.sess).collect();
         let toks: Vec<u32> = feed.iter().map(|(_, y)| *y).collect();
-        let logits = self.glm.forward_batch(&mut sess, &toks, &mut *none).map_err(|e| e.0)?;
+        let logits = self.engine.forward_batch(&mut sess, &toks, &mut *none).map_err(|e| e.0)?;
         for ((i, _), l) in feed.iter().zip(logits) {
             active[*i].logits = Some(l);
         }

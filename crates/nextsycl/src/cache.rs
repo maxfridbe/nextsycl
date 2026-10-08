@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use ns_engine::glm5next::Checkpoint;
+use ns_runtime::Checkpoint;
 
 struct Entry {
     tokens: Vec<u32>,
@@ -150,7 +150,7 @@ impl PromptCache {
     }
 
     pub fn bytes(&self) -> usize {
-        self.entries.iter().map(|e| e.ck.bytes).sum()
+        self.entries.iter().map(|e| e.ck.bytes()).sum()
     }
 
     /// (checkpoints, bytes, budget) on disk
@@ -160,7 +160,7 @@ impl PromptCache {
 
     /// (tokens, bytes, last use - higher is more recent, on disk) per entry, the most recently used first
     pub fn list(&self) -> Vec<(usize, usize, u64, bool)> {
-        let mut v: Vec<_> = self.entries.iter().map(|e| (e.tokens.len(), e.ck.bytes, e.used, false)).collect();
+        let mut v: Vec<_> = self.entries.iter().map(|e| (e.tokens.len(), e.ck.bytes(), e.used, false)).collect();
         if let Some(d) = &self.disk {
             v.extend(d.entries.iter().map(|e| (e.tokens.len(), e.bytes, e.used, true)));
         }
@@ -201,7 +201,8 @@ impl PromptCache {
     }
 
     /// `f` on the checkpoint at `hit` (from `best`, marked as used): in memory, or read from its file
-    pub fn with<R>(&mut self, hit: Hit, f: impl FnOnce(&Checkpoint) -> R) -> Result<R, String> {
+    /// (`read`: the engine's reader of its checkpoint files)
+    pub fn with<R>(&mut self, hit: Hit, read: &dyn Fn(&mut dyn std::io::Read) -> std::io::Result<Checkpoint>, f: impl FnOnce(&Checkpoint) -> R) -> Result<R, String> {
         self.clock += 1;
         match hit {
             Hit::Ram(i) => {
@@ -216,7 +217,7 @@ impl PromptCache {
                     let _ = f.set_modified(d.entries[i].touched);
                 }
                 let file = std::fs::File::open(&d.entries[i].path).map_err(|e| format!("{}: {e}", d.entries[i].path.display()))?;
-                let ck = Checkpoint::read_from(&mut std::io::BufReader::with_capacity(8 << 20, file)).map_err(|e| e.to_string())?;
+                let ck = read(&mut std::io::BufReader::with_capacity(8 << 20, file)).map_err(|e| e.to_string())?;
                 Ok(f(&ck))
             }
         }
@@ -241,12 +242,12 @@ impl PromptCache {
     /// disk tier). A checkpoint larger than the whole memory budget goes straight to disk (or is dropped).
     pub fn put(&mut self, tokens: Vec<u32>, ck: Checkpoint) -> bool {
         self.entries.retain(|e| e.tokens != tokens);
-        if ck.bytes > self.budget {
+        if ck.bytes() > self.budget {
             let c = self.clock + 1;
             self.clock = c;
             return self.spill(Entry { tokens, ck, used: c });
         }
-        while self.bytes() + ck.bytes > self.budget {
+        while self.bytes() + ck.bytes() > self.budget {
             let Some((i, _)) = self.entries.iter().enumerate().min_by_key(|(_, e)| e.used) else { break };
             let e = self.entries.swap_remove(i);
             self.evictions += 1;
@@ -266,10 +267,10 @@ impl PromptCache {
     /// An entry out of memory onto the disk tier (stale files and then the least recently used removed to make room)
     fn spill(&mut self, e: Entry) -> bool {
         let Some(d) = &mut self.disk else { return false };
-        if e.ck.bytes > d.budget || d.entries.iter().any(|x| x.tokens == e.tokens) {
+        if e.ck.bytes() > d.budget || d.entries.iter().any(|x| x.tokens == e.tokens) {
             return false;
         }
-        d.prune(e.ck.bytes);
+        d.prune(e.ck.bytes());
         d.next += 1;
         let path = d.dir.join(format!("{}.nsck", d.next));
         // the tokens' file last: a checkpoint without it is a half-written one
@@ -280,7 +281,7 @@ impl PromptCache {
         }).and_then(|_| write_tokens(&path, &e.tokens));
         match written {
             Ok(()) => {
-                d.entries.push(DiskEntry { tokens: e.tokens, path, bytes: e.ck.bytes, used: e.used, touched: std::time::SystemTime::now() });
+                d.entries.push(DiskEntry { tokens: e.tokens, path, bytes: e.ck.bytes(), used: e.used, touched: std::time::SystemTime::now() });
                 true
             }
             Err(err) => {

@@ -24,7 +24,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use ns_gguf::Gguf;
-use ns_model::glm5next::{Group, Model};
+use ns_runtime::{Engine, EngineKind, LoadOptions};
 
 /// yy.mmdd.### from git (version.sh), handed in by build.sh; "dev" for a build without it
 pub const VERSION: &str = match option_env!("NS_VERSION") {
@@ -95,53 +95,26 @@ fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
 }
 
+/// The engines this program has, one a model architecture (engines/<arch>)
+fn engines() -> Vec<EngineKind> {
+    vec![ns_glm5next::kind()]
+}
+
+/// The engine for `f`'s architecture, loaded on `gpus`
+fn load_engine<'g>(f: &'g Gguf, gpus: &[std::sync::Arc<ns_core::Gpu>], o: LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>, String> {
+    let kinds = engines();
+    let k = ns_runtime::kind_for(&kinds, f)?;
+    (k.load)(f, gpus, &o, log).map_err(|e| e.0)
+}
+
 fn info(path: &Path) -> Result<(), String> {
     let f = Gguf::open(path).map_err(|e| e.0)?;
     println!("file     : {} ({} file{}, {:.2} GiB of tensors, {} tensors)", path.display(), f.paths.len(), if f.paths.len() > 1 { "s" } else { "" },
              gib(f.total_bytes()), f.tensors.len());
-    let arch = ns_model::architecture(&f).map_err(|e| e.0)?;
-    println!("arch     : {arch} ({})", f.meta("general.name").and_then(|v| v.as_str()).unwrap_or("?"));
-    let m = Model::open(&f).map_err(|e| e.0)?;
-    let g = &m.g;
-    println!("scheme   : {:?} names", m.scheme);
-    println!("layers   : {} ({} dense, {} MoE; MLA at {:?}){}", g.n_layer, g.n_dense, g.n_layer - g.n_dense,
-             (0..g.n_layer).filter(|l| g.is_mla(*l)).collect::<Vec<_>>(), if g.n_mtp > 0 { format!(" + {} MTP block", g.n_mtp) } else { " - no MTP block".into() });
-    println!("width    : hidden {}, vocab {}, dense FFN {}", g.n_embd, g.n_vocab, g.ffn_dense);
-    println!("experts  : {} of {} per token + {} shared, FFN {}, scale {} {}, SwiGLU limit {}", g.n_expert_used, g.n_expert, g.n_expert_shared, g.ffn_expert,
-             g.expert_scale, if g.expert_norm { "(normalized)" } else { "" }, g.swiglu_limit);
-    println!("MLA      : {} heads of {}, q LoRA {}, kv LoRA {}; indexer {} heads of {}, top {}, pool {}", g.n_head, g.head_dim, g.q_lora, g.kv_lora,
-             g.idx_heads, g.idx_dim, g.idx_top_k, g.idx_pool);
-    println!("KDA      : {} heads of {}, conv {}, gate rank {}, gate floor {}", g.kda_heads, g.kda_dim, g.kda_conv, g.kda_rank, g.kda_gate_low);
-    println!("hc       : {} streams, {} Sinkhorn iterations, eps {:e}; rms eps {:e}", g.hc, g.hc_iters, g.hc_eps, g.rms_eps);
-
-    let errs = m.check();
-    if errs.is_empty() {
-        println!("check    : every tensor present with the shape the runtime needs, none left over");
-    } else {
-        println!("check    : {} problem{}", errs.len(), if errs.len() > 1 { "s" } else { "" });
-        for e in errs.iter().take(40) {
-            println!("  {e}");
-        }
-    }
-
-    println!("bytes    :");
-    let by = m.bytes();
-    let mut groups: std::collections::BTreeMap<Group, u64> = std::collections::BTreeMap::new();
-    for ((grp, ty), (b, n)) in &by {
-        *groups.entry(*grp).or_default() += b;
-        println!("  {:<10} {:<8} {:>8.2} GiB  {:>4} tensors", format!("{grp:?}"), ty.name(), gib(*b), n);
-    }
-    for (grp, b) in &groups {
-        println!("  {:<19} {:>8.2} GiB", format!("{grp:?}"), gib(*b));
-    }
-    let e = (g.n_dense..g.n_layer).map(|l| m.expert_bytes(l)).collect::<Vec<_>>();
-    let (lo, hi) = (e.iter().min().copied().unwrap_or(0), e.iter().max().copied().unwrap_or(0));
-    println!("expert   : {:.1}-{:.1} MiB each (gate + up + down), {:.2}-{:.2} GiB per layer; a token reads {:.2} GiB of routed experts",
-             lo as f64 / 1048576.0, hi as f64 / 1048576.0, gib(lo * g.n_expert), gib(hi * g.n_expert),
-             gib(e.iter().sum::<u64>() * g.n_expert_used));
-    if !errs.is_empty() {
-        return Err(format!("{} layout problem(s)", errs.len()));
-    }
+    let kinds = engines();
+    let k = ns_runtime::kind_for(&kinds, &f)?;
+    println!("engine   : {}", k.name);
+    print!("{}", (k.info)(&f)?);
     Ok(())
 }
 
@@ -269,8 +242,8 @@ fn check(model: &Path, dump: &Path, gpus: &[usize]) -> Result<(), String> {
     let mut log = |l: String| println!("load     : {l}");
     // one GPU: no host mirror (bring-up); several: the mirror as generate has it (a long prompt touches every expert)
     let mirror = if gs.len() == 1 { Some(0) } else { None };
-    let glm = ns_engine::glm5next::Glm::load(&f, &gs, None, mirror, false, (tokens.len() + 8, 2), &mut log).map_err(e)?;
-    println!("load     : {:.2} GiB in {:.1} s", gib(glm.load_bytes), glm.load_seconds);
+    let glm = load_engine(&f, &gs, LoadOptions { expert_bytes: None, mirror_bytes: mirror, draft: false, kv: (tokens.len() + 8, 2) }, &mut log)?;
+    println!("load     : {:.2} GiB in {:.1} s", gib(glm.load_bytes()), glm.load_seconds());
     println!("prompt   : {} tokens {:?}", tokens.len(), tokens);
     println!("{:<26} {:>10} {:>10} {:>10}", "tensor", "cosine", "rel err", "max diff");
     let mut worst: (f64, String) = (1.0, String::new());
@@ -278,7 +251,7 @@ fn check(model: &Path, dump: &Path, gpus: &[usize]) -> Result<(), String> {
     // a prompt longer than a chunk: all but the last chunk first, then the last one compared - its rows against the
     // reference's last rows (the dump holds the whole prompt when llama.cpp ran it as one ubatch)
     let total = tokens.len();
-    let last = total - (total - 1) % ns_engine::glm5next::prefill_chunk() - 1;
+    let last = total - (total - 1) % glm.prefill_chunk() - 1;
     let tc = total - last;
     let mut tap = |name: &str, b: &ns_core::DevBuf| -> ns_core::Result<()> {
         let Some(&n) = index.get(name) else { return Ok(()) };
@@ -319,7 +292,7 @@ fn check(model: &Path, dump: &Path, gpus: &[usize]) -> Result<(), String> {
     let word = |id: u32| vocab.and_then(|v| v.get(id as usize)).and_then(|v| v.as_str()).unwrap_or("?").replace('\u{120}', " ").to_string();
     println!("forward  : {:.1} s", t0.elapsed().as_secs_f64());
     // the same prompt incrementally: all but the last token, then the last alone (decode's path)
-    if tokens.len() > 1 && tokens.len() <= ns_engine::glm5next::prefill_chunk() {
+    if tokens.len() > 1 && tokens.len() <= glm.prefill_chunk() {
         let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
         let mut s2 = glm.session(tokens.len()).map_err(e)?;
         glm.forward(&mut s2, &tokens[..tokens.len() - 1], &mut none).map_err(e)?;
@@ -418,14 +391,14 @@ pub(crate) fn sample(logits: &[f32], temp: f32, top_p: f32, rng: &mut Rng) -> u3
     }
 }
 
-/// A sampler for `Glm::step` at a temperature and top-p: speculative sampling of the drafts (ns-engine's Sampler)
+/// A sampler for `Engine::step` at a temperature and top-p: speculative sampling of the drafts (ns-runtime's Sampler)
 pub(crate) struct TempSampler<'a> {
     pub temp: f32,
     pub top_p: f32,
     pub rng: &'a mut Rng,
 }
 
-impl ns_engine::glm5next::Sampler for TempSampler<'_> {
+impl ns_runtime::Sampler for TempSampler<'_> {
     fn sample(&mut self, logits: &[f32]) -> u32 {
         sample(logits, self.temp, self.top_p, self.rng)
     }
@@ -461,10 +434,11 @@ fn generate(args: &[String]) -> Result<(), String> {
     let mirror_gib: Option<f64> = opt("--mirror-gib").and_then(|v| v.parse().ok());
     let mut log = |l: String| eprintln!("[{l}]");
     let mtp = !args.iter().any(|a| a == "--no-mtp");
-    let glm = ns_engine::glm5next::Glm::load(&f, &gs, expert_gib.map(|x| (x * (1u64 << 30) as f64) as usize),
-                                                 mirror_gib.map(|x| (x * (1u64 << 30) as f64) as usize), mtp, (ids.len() + max + 1, 1), &mut log).map_err(e)?;
+    let glm = load_engine(&f, &gs, LoadOptions { expert_bytes: expert_gib.map(|x| (x * (1u64 << 30) as f64) as usize),
+                                                 mirror_bytes: mirror_gib.map(|x| (x * (1u64 << 30) as f64) as usize), draft: mtp,
+                                                 kv: (ids.len() + max + 1, 1) }, &mut log)?;
     eprintln!("[{} on {}, {} prompt tokens, loaded in {:.1} s]", f.meta("general.name").and_then(|v| v.as_str()).unwrap_or("?"),
-              gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), ids.len(), glm.load_seconds);
+              gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), ids.len(), glm.load_seconds());
     let mut sess = glm.session(ids.len() + max + 1).map_err(e)?;
     let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
     let t0 = std::time::Instant::now();
@@ -498,20 +472,16 @@ fn generate(args: &[String]) -> Result<(), String> {
     }
     println!("{}", String::from_utf8_lossy(&pending));
     let dt = t1.elapsed().as_secs_f64();
-    for (name, secs, calls) in glm.profile() {
-        eprintln!("[profile {name:<34} {secs:>7.2} s  {calls:>6} calls  {:>8.2} ms/token]", secs * 1000.0 / (n + 1) as f64);
+    for line in glm.report(n) {
+        eprintln!("{line}");
     }
-    eprintln!("[host waited {:.2} s for the routers' logits, chose the experts in {:.2} s]",
-              ns_engine::glm5next::ROUTER_WAIT_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9,
-              ns_engine::glm5next::ROUTE_HOST_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9);
-    for (i, (peak, spills)) in glm.arena_peaks().iter().enumerate() {
-        eprintln!("[arena {i}: peak {:.2} GiB, {spills} request(s) past it]", *peak as f64 / (1u64 << 30) as f64);
-    }
-    let (hits, misses, mirrored, direct, pf, pf_used) = glm.expert_stats();
-    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); drafts {} of {} accepted; experts: {hits} VRAM hits, {direct} read from host memory by prompt passes, {misses} swapped in ({mirrored} of them from host memory), {pf} prefetched ({pf_used} of them asked for)]",
-              ids.len(), ids.len() as f64 / prefill, n as f64 / dt.max(1e-9), dec.accepted, dec.drafted);
-    if dec.ng_drafted > 0 {
-        eprintln!("[prompt lookup: {} of {} drafts accepted]", dec.ng_accepted, dec.ng_drafted);
+    let x = glm.expert_stats();
+    let (drafted, accepted) = dec.drafts();
+    eprintln!("[prompt {} tokens in {prefill:.1} s ({:.1} tok/s); {n} generated in {dt:.1} s ({:.2} tok/s); drafts {accepted} of {drafted} accepted; experts: {} VRAM hits, {} read from host memory by prompt passes, {} swapped in ({} of them from host memory), {} prefetched ({} of them asked for)]",
+              ids.len(), ids.len() as f64 / prefill, n as f64 / dt.max(1e-9), x.vram_hits, x.read_direct, x.swapped_in, x.from_host, x.prefetched, x.prefetch_used);
+    let (ng_drafted, ng_accepted) = dec.lookup_drafts();
+    if ng_drafted > 0 {
+        eprintln!("[prompt lookup: {ng_accepted} of {ng_drafted} drafts accepted]");
     }
     Ok(())
 }
@@ -519,68 +489,10 @@ fn generate(args: &[String]) -> Result<(), String> {
 /// `nextsycl kernels <model.gguf> [--gpu N]`: each stored weight type of the file through the decode kernels against
 /// the exact path (expand to float32, multiply), on a real matrix of that type; and the decode kernel's rate.
 fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
-    use ns_core::{DevBuf, Ops};
-    use ns_model::glm5next::Role;
-    let e = |x: ns_core::Error| x.0;
     let f = Gguf::open(model).map_err(|e| e.0)?;
-    let m = Model::open(&f).map_err(|e| e.0)?;
-    let g = ns_core::Gpu::open(gpu).map_err(e)?;
-    let o = Ops { gpu: g.clone() };
-    println!("gpu: {}", g.name);
-    // one matrix per (type, role kind): routed experts' expert 0, else the whole matrix
-    let mut picks: Vec<(String, ns_gguf::GType, usize, usize, Vec<u8>)> = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for l in 0..m.g.n_layer {
-        for r in m.roles(l) {
-            let Some(t) = m.tensor(l, r) else { continue };
-            if t.shape.len() < 2 || t.ty == ns_gguf::GType::F32 || !seen.insert((t.ty, matches!(r, Role::ExpGate | Role::ExpUp | Role::ExpDown))) {
-                continue;
-            }
-            let (rows, cols) = (t.shape[t.shape.len() - 2] as usize, t.shape[t.shape.len() - 1] as usize);
-            let bytes = t.ty.bytes((rows * cols) as u64).unwrap_or(0) as usize;
-            let mut b = vec![0u8; bytes];
-            f.read_into(t, 0, &mut b).map_err(|e| e.0)?;
-            picks.push((t.name.clone(), t.ty, rows, cols, b));
-        }
-    }
-    let mut rng = Rng(12345);
-    println!("{:<34} {:<8} {:>12} {:>10} {:>10} {:>11}", "matrix", "type", "rows x cols", "1 col err", "4 col err", "1 col rate");
-    for (name, ty, rows, cols, bytes) in picks {
-        let w = DevBuf::new(&g, bytes.len()).map_err(e)?;
-        w.write(0, &bytes).map_err(e)?;
-        let wf = DevBuf::f32(&g, rows * cols).map_err(e)?;
-        o.dequant(ty.code(), &w, 0, bytes.len(), rows * cols, &wf).map_err(e)?;
-        if !o.mmvq_supported(ty.code()) {
-            println!("{name:<34} {:<8} {:>12} no decode kernel", ty.name(), format!("{rows}x{cols}"));
-            continue;
-        }
-        let mut errs = Vec::new();
-        let mut rate = 0.0;
-        for nc in [1usize, 4] {
-            let xs: Vec<f32> = (0..nc * cols).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
-            let x = DevBuf::from_f32(&g, &xs).map_err(e)?;
-            let yr = DevBuf::f32(&g, nc * rows).map_err(e)?;
-            o.gemm(nc, rows, cols, &x, &wf, &yr, false).map_err(e)?;
-            let q = DevBuf::new(&g, o.q8_1_bytes(cols, nc)).map_err(e)?;
-            o.quantize_q8_1((&x, 0), &q, cols, nc).map_err(e)?;
-            let y = DevBuf::f32(&g, nc * rows).map_err(e)?;
-            o.mmvq(ty.code(), (&w, 0), bytes.len(), &q, (&y, 0), cols, rows, nc).map_err(e)?;
-            let (_, rel, _) = compare(&y.to_f32().map_err(e)?, &yr.to_f32().map_err(e)?);
-            errs.push(rel);
-            if nc == 1 {
-                g.sync().map_err(e)?;
-                let n = 50;
-                let t0 = std::time::Instant::now();
-                for _ in 0..n {
-                    o.mmvq(ty.code(), (&w, 0), bytes.len(), &q, (&y, 0), cols, rows, 1).map_err(e)?;
-                }
-                g.sync().map_err(e)?;
-                rate = bytes.len() as f64 * n as f64 / t0.elapsed().as_secs_f64() / 1e9;
-            }
-        }
-        println!("{name:<34} {:<8} {:>12} {:>10.2e} {:>10.2e} {:>8.0} GB/s", ty.name(), format!("{rows}x{cols}"), errs[0], errs[1], rate);
-    }
-    Ok(())
+    let kinds = engines();
+    let k = ns_runtime::kind_for(&kinds, &f)?;
+    (k.kernels.ok_or(format!("{} has no kernel test", k.name))?)(model, gpu)
 }
 
 /// `nextsycl spec-check`: greedy decode one token at a time (the reference), then the same tokens as 2-row verify
@@ -606,7 +518,7 @@ fn batch_check(args: &[String]) -> Result<(), String> {
     let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let mut log = |l: String| eprintln!("[{l}]");
     let mtp = args.iter().any(|a| a == "--mtp"); // the draft block loaded (it is not used here; its experts take store slots)
-    let glm = ns_engine::glm5next::Glm::load(&f, &gs, None, None, mtp, (ctx, prompts.len() + 1), &mut log).map_err(e)?;
+    let glm = load_engine(&f, &gs, LoadOptions { expert_bytes: None, mirror_bytes: None, draft: mtp, kv: (ctx, prompts.len() + 1) }, &mut log)?;
     let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
     let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i) as u32;
     // alone: each conversation, one token a pass
@@ -631,7 +543,7 @@ fn batch_check(args: &[String]) -> Result<(), String> {
         solo_logits.push(ls);
     }
     // together
-    let mut sess: Vec<ns_engine::glm5next::Session> = Vec::new();
+    let mut sess: Vec<ns_runtime::Session> = Vec::new();
     let mut last: Vec<Vec<f32>> = Vec::new();
     for p in &ids {
         let mut s = glm.session(ctx).map_err(e)?;
@@ -652,7 +564,7 @@ fn batch_check(args: &[String]) -> Result<(), String> {
         }
         // each session takes the token its own run took, so the comparison stays aligned
         let feed: Vec<u32> = if solo { (0..ids.len()).map(|b| solo_toks[b][step]).collect() } else { toks.clone() };
-        let mut refs: Vec<&mut ns_engine::glm5next::Session> = sess.iter_mut().collect();
+        let mut refs: Vec<&mut ns_runtime::Session> = sess.iter_mut().collect();
         last = glm.forward_batch(&mut refs, &feed, &mut none).map_err(e)?;
         for (b, l) in last.iter().enumerate().filter(|_| solo) {
             let r = &solo_logits[b][step];
@@ -664,10 +576,10 @@ fn batch_check(args: &[String]) -> Result<(), String> {
     println!("{b} conversations, {n} tokens each: alone {:.2} tok/s (each, {:.1} s in all); together {:.2} tok/s in all ({:.2} each)",
              n as f64 * b as f64 / solo_s, solo_s, n as f64 * b as f64 / batch_s, n as f64 / batch_s);
     println!("greedy tokens different in {differ} of {} steps; the logits' largest difference {worst:.3e}", n * b);
-    let (hits, misses, _, _, pf, pf_used) = glm.expert_stats();
-    println!("experts (both runs): {hits} VRAM hits, {misses} swapped in, {pf} prefetched ({pf_used} asked for)");
-    for (name, secs, calls) in glm.profile() {
-        println!("[profile {name:<40} {secs:7.2} s {calls:>8} calls]");
+    let x = glm.expert_stats();
+    println!("experts (both runs): {} VRAM hits, {} swapped in, {} prefetched ({} asked for)", x.vram_hits, x.swapped_in, x.prefetched, x.prefetch_used);
+    for line in glm.report(n * b) {
+        println!("{line}");
     }
     Ok(())
 }
@@ -687,7 +599,7 @@ fn spec_check(args: &[String]) -> Result<(), String> {
     let ids = tok.encode(&ns_tok::glm_chat(&[ns_tok::Message { role: "user", content: &prompt, reasoning: None }], ns_tok::Effort::Low));
     let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let mut log = |l: String| eprintln!("[{l}]");
-    let glm = ns_engine::glm5next::Glm::load(&f, &gs, None, None, true, (ids.len() + n + 4, 2), &mut log).map_err(e)?;
+    let glm = load_engine(&f, &gs, LoadOptions { expert_bytes: None, mirror_bytes: None, draft: true, kv: (ids.len() + n + 4, 2) }, &mut log)?;
     let mut none = |_: &str, _: &ns_core::DevBuf| -> ns_core::Result<()> { Ok(()) };
     let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
     // the margin between the best two logits
@@ -724,7 +636,7 @@ fn spec_check(args: &[String]) -> Result<(), String> {
             Ok(())
         };
         // --rows R --row k: row k of an R-row pass against a one-token pass at its position (k one-token passes first)
-        let width: usize = opt("--rows").and_then(|v| v.parse().ok()).unwrap_or(2).clamp(2, ns_engine::glm5next::MAX_VERIFY);
+        let width: usize = opt("--rows").and_then(|v| v.parse().ok()).unwrap_or(2).clamp(2, glm.max_verify());
         let row: usize = opt("--row").and_then(|v| v.parse().ok()).unwrap_or(0).min(width - 1);
         for &t in &toks[..row] {
             glm.forward(&mut c, &[t], &mut none).map_err(e)?;
@@ -757,7 +669,11 @@ fn spec_check(args: &[String]) -> Result<(), String> {
     println!("{:>4} {:>4} {:>12} {:>10} {:>6} {:>8}", "pos", "row", "max |diff|", "max |ref|", "top1", "margin");
     let (mut worst, mut flips) = (0f32, 0);
     // --rows R: verify passes of R tokens (2 = one draft; up to 5 with NS_NGRAM=4's snapshots)
-    let width: usize = opt("--rows").and_then(|v| v.parse().ok()).unwrap_or(2).clamp(2, ns_engine::glm5next::MAX_VERIFY);
+    let asked: usize = opt("--rows").and_then(|v| v.parse().ok()).unwrap_or(2);
+    let width = asked.clamp(2, glm.max_verify().max(2));
+    if width < asked {
+        eprintln!("[--rows {asked}: this engine verifies {width} rows at most as configured (NS_NGRAM=4 or NS_DRAFTS=2 widen it)]");
+    }
     for i in 0..n + 1 - width {
         let rows = glm.forward_rows(&mut b, &toks[i..i + width], width, &mut none).map_err(e)?;
         for (r, (got, want)) in rows.iter().zip(&refs[i..i + width]).enumerate() {
@@ -821,8 +737,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     }
     // the attention reserve is per token: the sessions' tokens in all (a pool row each besides)
     let kv = (slot_ctx.iter().sum::<usize>() + 4 * slot_ctx.len(), 1);
-    let glm = ns_engine::glm5next::Glm::load(f, &gs, gib_opt("--expert-gib"), mirror, mtp, kv, &mut log).map_err(e)?;
-    eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds);
+    let glm = load_engine(f, &gs, LoadOptions { expert_bytes: gib_opt("--expert-gib"), mirror_bytes: mirror, draft: mtp, kv }, &mut log)?;
+    eprintln!("[{} loaded on {} in {:.1} s]", name, gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), glm.load_seconds());
     let cors: Vec<String> = opt("--cors").unwrap_or_default().split([',', ' ']).filter(|o| !o.is_empty()).map(String::from).collect();
     let keep: usize = opt("--keep-requests").and_then(|v| v.parse().ok()).unwrap_or(100);
     // what a request without max_tokens may make: --max-tokens N (0 or none: to the end of the context)
@@ -834,8 +750,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         let hours: f64 = opt("--cache-ttl-hours").and_then(|v| v.parse().ok()).unwrap_or(24.0);
         // what a checkpoint must match to fit these sessions: the model file, the cache's form, the draft block
         let size = std::fs::metadata(model).map_or(0, |m| m.len());
-        // nsck2: the indexer ring of 8 slots (nsck1's 4 restore wrong)
-        let fp = format!("{model} {size} kv={} mtp={} nsck2", if ns_engine::glm5next::kv_q8() { "q8" } else { "f16" }, mtp);
+        let fp = format!("{model} {size} {}", glm.cache_fingerprint());
         pc = pc.with_disk(std::path::PathBuf::from(dir), (g * (1u64 << 30) as f64) as usize, &fp,
                           std::time::Duration::from_secs_f64(hours.max(0.0) * 3600.0))?;
     }

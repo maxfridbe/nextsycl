@@ -1,9 +1,0 @@
-[package]
-name = "ns-model"
-description = "The architectures: their geometry from a file's metadata, their tensors by role, checked"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-ns-gguf.workspace = true

@@ -27,11 +27,14 @@ per prompt chunk and grouped by expert - and plans memory for two cards and this
 
 ```text
 kernels/strata/   the Strata SYCL port's kernels, imported unchanged (PROVENANCE.md, LICENSE)
-kernels/ns/       this project's kernels and the C ABI the Rust side calls (ns.h): new layer types, wrappers
+kernels/ns/       this project's shared kernels and the C ABI the Rust side calls (ns.h)
+kernels/engines/  each engine's own kernels (glm5next/)
 crates/ns-sys     the C ABI, loaded at run time (dlopen, like the H3 engine's h3-sys)
 crates/ns-gguf    GGUF v3: every tensor type the files use, split files, mmap; no ggml
-crates/ns-core    devices, buffers, the memory plan, expert store (VRAM cache / pinned RAM / NVMe), scheduler
-crates/ns-model   the model trait and the architectures: glm5next, then qwen4exp
+crates/ns-core    devices, buffers, the arena, the shared ops
+crates/ns-tok     the tokenizer and the chat templates
+crates/ns-runtime the contract the server drives: Engine, opaque sessions, samplers, the registry (docs/engines.md)
+engines/glm5next  GLM-5.3-Flash's engine: its model description, forward passes, expert store, decode loop
 crates/nextsycl   the command line and the OpenAI-compatible server
 reference/        Python only: dumps from llama.cpp (and ds4) for parity checks
 ```

@@ -20,7 +20,7 @@
 
 use ns_gguf::{GType, Gguf, Tensor, Value};
 
-use crate::{Error, Result};
+use crate::{Error, ModelResult as Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scheme {

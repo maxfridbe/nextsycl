@@ -2,10 +2,11 @@ We stand on the shoulders of giants.
 
 # nextsycl
 
-A Rust runtime for large hybrid-attention MoE models on Intel Arc GPUs, with SYCL kernels. First model:
-**GLM-5.3-Flash** (`glm5-next`): 45 layers of KDA and MLA attention with a DSA lightning indexer, 288 experts, and
-hyper-connections. The experts that do not fit the cards live in pinned host memory, and the GPU reads them over
-PCIe. It runs on one card or splits the layers over several.
+A Rust runtime for large hybrid-attention MoE models on Intel Arc GPUs, with SYCL kernels. Each model architecture
+has its own engine, tuned for it end to end, behind one small contract the server drives (`docs/engines.md`). First
+model: **GLM-5.3-Flash** (`glm5-next`, `engines/glm5next`): 45 layers of KDA and MLA attention with a DSA lightning
+indexer, 288 experts, and hyper-connections. The experts that do not fit the cards live in pinned host memory, and
+the GPU reads them over PCIe. It runs on one card or splits the layers over several.
 
 ## What it does
 
@@ -306,6 +307,8 @@ artifact.
 
 ## Docs
 
+- `docs/engines.md`: the layout - shared crates, the engine contract (`ns-runtime`), one engine a model
+  (`engines/<arch>`, its kernels in `kernels/engines/<arch>`) - and how to add a model.
 - `docs/glm5next.md`: the model's math, as this runtime computes it.
 - `docs/256k-context.md`: long context - memory a token, the measured scaling, what 256K takes and what is left.
 - `docs/benchy/`: every benchy run, the needle runs, the speculative-sampling sweep.

@@ -18,9 +18,9 @@ use std::time::Instant;
 
 use ns_core::{Arena, DevBuf, Error, Gpu, HostBuf, Ops, Result};
 use ns_gguf::{GType, Gguf};
-use ns_model::glm5next::{Model, Role, Scheme};
+use crate::model::{Model, Role, Scheme};
 
-use crate::Tap;
+use ns_runtime::{GpuInfo, Sampler, Tap};
 
 /// float32 values expanded per matrix chunk (128 MiB)
 const SCRATCH: usize = 32 << 20;
@@ -226,7 +226,7 @@ fn spec_draft_temp() -> f32 {
 }
 
 /// The most drafts a verify pass holds (a session's snapshot rows)
-fn max_drafts() -> usize {
+pub fn max_drafts() -> usize {
     drafts().max(ngram_k())
 }
 
@@ -461,18 +461,6 @@ struct MtpState {
     chain_pos: Option<usize>,
 }
 
-/// One GPU's share of the model (`Glm::gpu_info`).
-pub struct GpuInfo {
-    pub index: usize,
-    pub name: String,
-    pub pci: Option<String>,
-    pub total: u64,
-    pub free: Option<u64>,
-    pub layers: (u64, u64),
-    pub expert_slots: usize,
-    pub host_slots: usize,
-}
-
 /// A conversation's state at a position, in host memory (`Glm::save` / `Glm::restore`).
 pub struct Checkpoint {
     pub pos: usize,
@@ -568,28 +556,6 @@ pub struct Decoder {
     /// drafts verified, and accepted
     pub drafted: u64,
     pub accepted: u64,
-}
-
-/// How `Glm::step` draws tokens. `sample` picks one from a row's logits (and records it - logprobs); with `dist`
-/// (the distribution `sample` draws from: temperature and top-p applied; None when greedy) and `uniform`, a draft is
-/// sampled from the draft block's own distribution and accepted with min(1, p/q) - speculative sampling: more drafts
-/// accepted when the model is unsure, what is committed distributed exactly as plain sampling. `record` notes a
-/// token chosen that way. A plain closure is a sampler without it (a draft accepted when the sampled token is it).
-pub trait Sampler {
-    fn sample(&mut self, logits: &[f32]) -> u32;
-    fn dist(&mut self, _logits: &[f32]) -> Option<Vec<(u32, f32)>> {
-        None
-    }
-    fn uniform(&mut self) -> f32 {
-        0.0
-    }
-    fn record(&mut self, _logits: &[f32], _token: u32) {}
-}
-
-impl<F: FnMut(&[f32]) -> u32> Sampler for F {
-    fn sample(&mut self, logits: &[f32]) -> u32 {
-        self(logits)
-    }
 }
 
 /// a token drawn from a distribution with a uniform `u`

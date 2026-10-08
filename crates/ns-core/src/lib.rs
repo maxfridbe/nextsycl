@@ -331,7 +331,7 @@ impl DevBuf {
     }
 }
 
-/// The bring-up kernels of `kernels/ns/glm.cpp` on one GPU. Every buffer is float32 unless named otherwise; the
+/// The kernels on one GPU (`kernels/ns`, and the engines' own: `kernels/engines/<arch>`). Every buffer is float32 unless named otherwise; the
 /// sizes each kernel reads are checked against the buffers before the call.
 pub struct Ops {
     pub gpu: Arc<Gpu>,

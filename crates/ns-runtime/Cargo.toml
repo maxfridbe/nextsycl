@@ -1,6 +1,6 @@
 [package]
-name = "ns-engine"
-description = "The models' forward passes on the GPUs"
+name = "ns-runtime"
+description = "The contract between the server and the engines: the Engine trait, opaque sessions, samplers, the registry"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,4 +8,3 @@ license.workspace = true
 [dependencies]
 ns-core.workspace = true
 ns-gguf.workspace = true
-ns-model.workspace = true

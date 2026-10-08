@@ -27,7 +27,8 @@ else
 fi
 LINK+=(-fsycl-device-code-split=per_kernel -shared -qmkl=sequential)
 
-SRCS=${ONLY:-$(ls $S/src/kernels/*.dp.cpp $S/src/prefill/*.dp.cpp ns/*.cpp 2>/dev/null)}
+# the shared kernels (ns/), each engine's own (engines/<arch>/), the imported ones (strata/)
+SRCS=${ONLY:-$(ls $S/src/kernels/*.dp.cpp $S/src/prefill/*.dp.cpp ns/*.cpp engines/*/*.cpp 2>/dev/null)}
 echo "==> compiling $(echo $SRCS | wc -w) sources (AOT ${AOT:-none}, $JOBS at a time)"
 fail=0
 printf '%s\n' $SRCS | xargs -P "$JOBS" -I{} sh -c '

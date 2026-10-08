@@ -69,7 +69,7 @@ The prompt path expands each expert to fp16 (13.8 s of a 36K prompt) and oneMKL 
 oneMKL is bound by reading the 33.5 MB fp16 expert (92 us at 128 tokens, 94 at 256), so a kernel that reads the 2 MB
 of IQ2_XXS instead could win twice.
 
-- [x] joint_matrix (XMX) GEMMs on Xe2 measured (scratchpad, kept in kernels/ns/fused.cpp's notes): A and a col-major B
+- [x] joint_matrix (XMX) GEMMs on Xe2 measured (scratchpad, kept in kernels/engines/glm5next/fused.cpp's notes): A and a col-major B
       straight from global memory reach oneMKL (63-82 TFLOPS); staging B through local memory (any layout) or a
       global scratch is 2-3x slower; a B fragment filled in registers works - lane n holds column n's 16 k in order
       (probed by loading a known matrix; the coordinate form of joint_matrix_apply faulted the GPU)
@@ -161,6 +161,17 @@ of IQ2_XXS instead could win twice.
       chunks split evenly when the last is under half (8K: 711 -> 736); free VRAM >= 1.79 GiB at every chunk end
 - [ ] Fused gate/up: no gain from more column tiles a sub-group (NB 2: slower, NB 4: spills) or limits past 64 (128:
       the same 7.5 s, 192-256: 8.1)
+
+## Several models (docs/engines.md, 2026-10-08)
+
+- [x] The split: ns-runtime (the contract: Engine, opaque Session / Decoder / Checkpoint, Sampler, the registry by
+      architecture), engines/glm5next (GLM's model description + engine + tools, moved as they were), its kernels
+      in kernels/engines/glm5next; the server, the CLI and the prompt cache drive only `dyn Engine`. The same
+      numbers before and after: spec-check (2 / 3 / 5 rows, short and long) and batch-check exact, llama.cpp
+      parity 0.995209, generate's text identical
+- [ ] engines/qwen38next: Strata's Qwen3.8-Flash-Next family (Coder IQ1_M, IQ2_XS, Swift 1.5) - GDN + gated
+      attention, QSA, PLE, MTP; its kernels from kernels/strata
+- [ ] The chat templates by engine (ns-tok holds GLM's); the GLM-only kernels' declarations out of ns.h's shared part
 
 ## 256K context (plan: docs/256k-context.md, 2026-10-07)
 
@@ -277,7 +288,7 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
       same text). Three prompts x temperature 0.7 / 1.0 x 384 tokens (docs/benchy/spec-sampling-2026-10-08.txt):
       acceptance 61.6% -> 65.0%, 20.37 -> 20.59 tok/s on average; the free-running story most (54% -> 66% at 1.0),
       a short poem at 0.7 lost (noisy). A sharper draft distribution (NS_SPEC_DRAFT_TEMP 0.5 / 0.25: 65.8% / 64.1%)
-      the same within the noise. The sampler is a trait now (ns-engine Sampler: sample, dist, uniform, record)
+      the same within the noise. The sampler is a trait now (ns-runtime's Sampler: sample, dist, uniform, record)
 - [ ] Decode is spread out now (per token: experts' kernels, KDA 10.6 ms, MLA 4.9, the draft 2.5, the shared expert
       2.2): no single kernel holds a big share. Levers left: more VRAM (fewer misses: <= 13%), MTP acceptance
 - [ ] Batch: the draft block in batches; per-request energy (concurrent requests share the counters - each counts

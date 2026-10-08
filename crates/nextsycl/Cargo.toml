@@ -7,8 +7,8 @@ license.workspace = true
 
 [dependencies]
 ns-gguf.workspace = true
-ns-model.workspace = true
 ns-core.workspace = true
-ns-engine.workspace = true
+ns-runtime.workspace = true
+ns-glm5next.workspace = true
 ns-tok.workspace = true
 serde_json.workspace = true
