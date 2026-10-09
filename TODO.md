@@ -216,7 +216,7 @@ of IQ2_XXS instead could win twice.
       its front end (wfe/video), the tools; `nextsycl video start | serve | job | ps | inspect | cancel | rm |
       status | gpus | unload | logs | speech | scene | join | speechpct | plan | stop`; the catalog's minimax-h3
       entries; checked against H3's h3d (same spread, same speed)
-- [x] hardac1's production on nextsycl video (2026-10-09): nextsycl-video.service (the daemon) and
+- [x] The GPU box's production on nextsycl video (2026-10-09): nextsycl-video.service (the daemon) and
       nextsycl-video-studio.service (the studio on :8090, which also switches chat); h3-engine / h3-studio disabled
       (kept for a rollback); the H3 studio's state, clips, LLM modes and templates carried over
 - [ ] Video: dedupe against the foundation (its gguf / safetensors / tokenizer / LoRA readers -> crates/), the text
