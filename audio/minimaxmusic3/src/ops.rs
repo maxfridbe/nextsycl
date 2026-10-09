@@ -109,6 +109,11 @@ impl Ops {
         ffi::check(unsafe { (self.k.quant_rows)(self.g(), w, n as i64, k as i64, q.cast(), scale) }, "int8 rows")
     }
 
+    pub fn dequant_rows(&self, q: P, scale: *const f32, n: usize, k: usize, out: M) -> Result<()> {
+        // SAFETY: q [n, k] bytes, scale n floats, out [n, k] halfs.
+        ffi::check(unsafe { (self.k.dequant_rows)(self.g(), q.cast(), scale, n as i64, k as i64, out) }, "int8 rows to half")
+    }
+
     pub fn add(&self, x: *mut f32, y: *const f32, n: usize) -> Result<()> {
         // SAFETY: n floats each.
         ffi::check(unsafe { (self.k.add)(self.g(), x, y, n as i64) }, "add")
@@ -139,6 +144,22 @@ impl Ops {
         ffi::check(unsafe { (self.k.transpose)(self.g(), x, r as i64, c as i64, out) }, "transpose")
     }
 
+    /// A 1-D convolution on oneDNN: x [b, ci, l] -> out [b, co, lo], w [co, ci, k] (kept alive: its reordered copy is cached)
+    pub fn conv1d(&self, x: *const f32, b: usize, ci: usize, l: usize, w: &DevBuf, co: usize, k: usize, bias: *const f32, stride: usize, dil: usize,
+                  pad: usize, out: *mut f32, lo: usize) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        ffi::check(unsafe { (self.k.conv1d)(self.g(), x, b as i64, ci as i64, l as i64, w.fp(), co as i64, k as i64, bias, stride as i64, dil as i64,
+                                            pad as i64, out, lo as i64) }, "conv1d")
+    }
+
+    /// The transposed one: w [ci, co, k]
+    pub fn conv_transpose1d(&self, x: *const f32, b: usize, ci: usize, l: usize, w: &DevBuf, co: usize, k: usize, bias: *const f32, stride: usize,
+                            pad: usize, out: *mut f32, lo: usize) -> Result<()> {
+        // SAFETY: as conv1d.
+        ffi::check(unsafe { (self.k.conv_transpose1d)(self.g(), x, b as i64, ci as i64, l as i64, w.fp(), co as i64, k as i64, bias, stride as i64,
+                                                      pad as i64, out, lo as i64) }, "conv_transpose1d")
+    }
+
     pub fn tanh(&self, x: *mut f32, n: usize) -> Result<()> {
         // SAFETY: n floats.
         ffi::check(unsafe { (self.k.tanh)(self.g(), x, n as i64) }, "tanh")
@@ -154,20 +175,26 @@ pub struct Mat {
 }
 
 impl Mat {
-    /// out [m, n] f32 = x [m, k] f32 . W^T + bias: a few rows by the engine's own product (bound by reading W once),
-    /// more by oneDNN (half: x converted into `xh`, a half buffer of m * k; int8: activations quantized per row)
-    pub fn apply(&self, ops: &Ops, nsd: &Nsd, x: *const f32, m: usize, xh: Option<&DevBuf>, bias: P, out: *mut f32) -> Result<()> {
+    /// out [m, n] f32 = x [m, k] f32 . W^T + bias: a few rows by the engine's own product (bound by reading W once,
+    /// int8 weights against float activations), more by oneDNN's half GEMM (x converted into `xh`, a half buffer of
+    /// m * k; an int8 matrix first expanded to half in `wh`, n * k halfs - quantizing the activations too, oneDNN's
+    /// int8 path, loses Qwen3's outlier features)
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply(&self, ops: &Ops, nsd: &Nsd, x: *const f32, m: usize, xh: Option<&DevBuf>, wh: Option<&DevBuf>, bias: P, out: *mut f32) -> Result<()> {
         if m <= 8 {
             return ops.gemv(x, m, self.k, self, bias, out, self.n, false);
         }
-        match &self.scale {
-            None => {
-                let xh = xh.ok_or_else(|| Error("a half staging buffer for a wide product".into()))?;
-                ops.to_half(x, xh.ptr(), m * self.k)?;
-                nsd.linear(xh.ptr(), Dt::F16, m, self.k, self.w.ptr(), self.n, bias, out.cast(), Dt::F32)
+        let xh = xh.ok_or_else(|| Error("a half staging buffer for a wide product".into()))?;
+        ops.to_half(x, xh.ptr(), m * self.k)?;
+        let w = match &self.scale {
+            None => self.w.ptr(),
+            Some(s) => {
+                let wh = wh.ok_or_else(|| Error("a half matrix buffer for a wide int8 product".into()))?;
+                ops.dequant_rows(self.w.ptr(), s.fp(), self.n, self.k, wh.ptr())?;
+                wh.ptr()
             }
-            Some(s) => nsd.int8_linear(x.cast(), Dt::F32, m, self.k, self.w.ptr(), self.n, s.ptr(), self.n, bias, out.cast(), Dt::F32, 0),
-        }
+        };
+        nsd.linear(xh.ptr(), Dt::F16, m, self.k, w, self.n, bias, out.cast(), Dt::F32)
     }
 
     /// out [m, n] (f32 or half) = x [m, k] half . W^T + bias by oneDNN (half matrices only)

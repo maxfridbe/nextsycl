@@ -9,5 +9,6 @@ license.workspace = true
 nextsycl-core.workspace = true
 nextsycl-llm.workspace = true
 nextsycl-image.workspace = true
+nextsycl-audio.workspace = true
 nextsycl-tok.workspace = true
 serde_json.workspace = true

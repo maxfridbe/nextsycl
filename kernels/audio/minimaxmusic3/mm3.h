@@ -50,6 +50,8 @@ int ns_audio_mm3_to_half(ns_gpu* g, const float* x, void* out, int64_t n);
 int ns_audio_mm3_bf16_to_half(ns_gpu* g, const uint16_t* x, void* out, int64_t n);
 int ns_audio_mm3_bf16_to_float(ns_gpu* g, const uint16_t* x, float* out, int64_t n);
 int ns_audio_mm3_quant_rows(ns_gpu* g, const float* w, int64_t N, int64_t K, int8_t* q, float* scale);
+/* and back: out half [N, K] = q[r] * scale[r] (a wide product's matrix, for the half GEMM) */
+int ns_audio_mm3_dequant_rows(ns_gpu* g, const int8_t* q, const float* scale, int64_t N, int64_t K, void* out);
 /* x float32 += y float32 (n values) */
 int ns_audio_mm3_add(ns_gpu* g, float* x, const float* y, int64_t n);
 /* The flow transformer's input rows for both guidance passes: out float32 [2, L, 2 C + Cc] = [lat, 0, cond] (pass 0)
@@ -64,6 +66,13 @@ int ns_audio_mm3_blend(ns_gpu* g, float* x, const float* p, const float* q, int6
 int ns_audio_mm3_nearest_rows(ns_gpu* g, const float* x, int64_t C, int64_t Li, int64_t Lo, float* out);
 /* out [C, R] = x [R, C] transposed (float32) */
 int ns_audio_mm3_transpose(ns_gpu* g, const float* x, int64_t R, int64_t C, float* out);
+/* The decoder's convolutions on oneDNN (conv.cpp), as nsd_conv1d / nsd_conv_transpose1d: float32 signals [B, C, L];
+ * w [Co, Ci, K] (transposed: [Ci, Co, K]) - read once into oneDNN's layout and kept (keep it alive and unchanged);
+ * bias [Co] or NULL; out [B, Co, Lo] */
+int ns_audio_mm3_conv1d(ns_gpu* g, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K, const float* bias,
+                        int64_t stride, int64_t dil, int64_t pad, float* out, int64_t Lo);
+int ns_audio_mm3_conv_transpose1d(ns_gpu* g, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K,
+                                  const float* bias, int64_t stride, int64_t pad, float* out, int64_t Lo);
 /* x = tanh(x), in place (n values) */
 int ns_audio_mm3_tanh(ns_gpu* g, float* x, int64_t n);
 

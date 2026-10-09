@@ -46,6 +46,11 @@ pub struct Vocoder {
     conv_out: Conv,
 }
 
+/// NS_MM3_NSD_CONV=1: the shared plain-loop convolutions (exact float32, slow) instead of oneDNN's
+fn nsd_convs() -> bool {
+    std::env::var("NS_MM3_NSD_CONV").is_ok_and(|v| v == "1")
+}
+
 /// A weight-normed convolution's weight: g [n0, 1, 1] and v [n0, n1, k], normalized over all but the first axis
 fn fold(f: &Shards, p: &str) -> Result<(Vec<f32>, Vec<usize>)> {
     let g = f.f32(&format!("{p}.weight_g"))?;
@@ -106,7 +111,11 @@ impl Vocoder {
     fn conv(&self, ops: &Ops, nsd: &Nsd, x: &Sig, c: &Conv, dil: usize, pad: usize) -> Result<Sig> {
         let lo = x.l + 2 * pad - dil * (c.k - 1);
         let t = DevBuf::f32(&ops.gpu, 2 * c.co * lo)?;
-        nsd.conv1d(x.t.ptr(), 2, c.ci, x.l, c.w.ptr(), c.co, c.k, c.b.ptr(), 1, dil, pad, t.ptr(), lo)?;
+        if nsd_convs() {
+            nsd.conv1d(x.t.ptr(), 2, c.ci, x.l, c.w.ptr(), c.co, c.k, c.b.ptr(), 1, dil, pad, t.ptr(), lo)?;
+        } else {
+            ops.conv1d(x.t.fp(), 2, c.ci, x.l, &c.w, c.co, c.k, c.b.fp(), 1, dil, pad, t.fp(), lo)?;
+        }
         Ok(Sig { t, c: c.co, l: lo })
     }
 
@@ -130,7 +139,11 @@ impl Vocoder {
             let pad = s.div_ceil(2);
             let lo = (y.l - 1) * s + b.up.k - 2 * pad;
             let t = DevBuf::f32(&ops.gpu, 2 * b.up.co * lo)?;
-            nsd.conv_transpose1d(y.t.ptr(), 2, b.up.ci, y.l, b.up.w.ptr(), b.up.co, b.up.k, b.up.b.ptr(), s, pad, t.ptr(), lo)?;
+            if nsd_convs() {
+                nsd.conv_transpose1d(y.t.ptr(), 2, b.up.ci, y.l, b.up.w.ptr(), b.up.co, b.up.k, b.up.b.ptr(), s, pad, t.ptr(), lo)?;
+            } else {
+                ops.conv_transpose1d(y.t.fp(), 2, b.up.ci, y.l, &b.up.w, b.up.co, b.up.k, b.up.b.fp(), s, pad, t.fp(), lo)?;
+            }
             x = Sig { t, c: b.up.co, l: lo };
             for u in &b.units {
                 let y = self.snake(ops, nsd, &x, &u.a1)?;

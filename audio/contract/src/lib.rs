@@ -110,6 +110,51 @@ impl Audio {
     }
 }
 
+/// A WAV file's LIST INFO entries and its length in seconds (from the chunks ahead of its samples: what `Audio::wav`
+/// writes; only the head of the file is read)
+pub fn wav_info(path: &Path) -> std::result::Result<(Vec<(String, String)>, f64), String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut b = vec![0u8; 1 << 16];
+    let n = f.read(&mut b).map_err(|e| format!("{}: {e}", path.display()))?;
+    b.truncate(n);
+    if b.len() < 12 || &b[..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+        return Err(format!("{}: not a WAV file", path.display()));
+    }
+    let u32at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize;
+    let (mut info, mut rate, mut block, mut seconds) = (Vec::new(), 0usize, 0usize, 0f64);
+    let mut i = 12;
+    while i + 8 <= b.len() {
+        let (id, len) = (&b[i..i + 4], u32at(i + 4));
+        let body = i + 8;
+        match id {
+            b"fmt " if body + 16 <= b.len() => {
+                rate = u32at(body + 4);
+                block = u16::from_le_bytes([b[body + 12], b[body + 13]]) as usize;
+            }
+            b"LIST" if body + 4 <= b.len() && &b[body..body + 4] == b"INFO" => {
+                let mut j = body + 4;
+                while j + 8 <= (body + len).min(b.len()) {
+                    let (k, l) = (String::from_utf8_lossy(&b[j..j + 4]).into_owned(), u32at(j + 4));
+                    let end = (j + 8 + l).min(b.len());
+                    let text = String::from_utf8_lossy(&b[j + 8..end]).trim_end_matches('\0').to_string();
+                    info.push((k, text));
+                    j = j + 8 + l + (l & 1);
+                }
+            }
+            b"data" => {
+                if rate > 0 && block > 0 {
+                    seconds = len as f64 / (rate * block) as f64;
+                }
+                break;
+            }
+            _ => {}
+        }
+        i = body + len + (len & 1);
+    }
+    Ok((info, seconds))
+}
+
 /// A model's files by role (the engine says which it needs)
 pub type ModelFiles = BTreeMap<String, PathBuf>;
 
@@ -198,6 +243,12 @@ mod tests {
         assert_eq!(u32::from_le_bytes([w[d + 4], w[d + 5], w[d + 6], w[d + 7]]), 8);
         assert_eq!(i16::from_le_bytes([w[d + 10], w[d + 11]]), 32767);
         assert!(w.windows(4).any(|x| x == b"INAM"));
+        let p = std::env::temp_dir().join(format!("nsaudio-{}.wav", std::process::id()));
+        a.write_wav(&p, &[("INAM", "a song"), ("ICMT", "{\"seed\":7}")]).unwrap();
+        let (info, secs) = wav_info(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(info, vec![("INAM".to_string(), "a song".to_string()), ("ICMT".to_string(), "{\"seed\":7}".to_string())]);
+        assert!((secs - 2.0 / 44100.0).abs() < 1e-9);
     }
 
     #[test]

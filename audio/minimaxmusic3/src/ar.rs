@@ -105,6 +105,8 @@ pub struct Session {
     act: DevBuf,
     tmp: DevBuf,
     xh: DevBuf,
+    /// an int8 matrix expanded to half for the prompt's wide products (int8 only)
+    wh: Option<DevBuf>,
     part: DevBuf,
     out: DevBuf,
     /// the hidden state each frame starts from [2, HIDDEN]
@@ -225,6 +227,7 @@ impl Ar {
             act: DevBuf::f32(g, r * FFN)?,
             tmp: DevBuf::f32(g, r * HIDDEN)?,
             xh: DevBuf::new(g, r * FFN * 2)?,
+            wh: if self.int8 { Some(DevBuf::new(g, 2 * FFN * HIDDEN * 2)?) } else { None },
             part: DevBuf::f32(g, part)?,
             out: DevBuf::f32(g, r * HIDDEN)?,
             last: DevBuf::f32(g, 2 * HIDDEN)?,
@@ -242,7 +245,7 @@ impl Ar {
         if r <= 8 {
             return ops.gemv(x, r, m.k, m, nul(), into.fp(), m.n, true);
         }
-        m.apply(ops, nsd, x, r, Some(&s.xh), nul(), s.tmp.fp())?;
+        m.apply(ops, nsd, x, r, Some(&s.xh), s.wh.as_ref(), nul(), s.tmp.fp())?;
         ops.add(into.fp(), s.tmp.fp(), r * m.n)
     }
 
@@ -252,14 +255,14 @@ impl Ar {
         let r = 2 * n;
         for (li, l) in self.lm.iter().enumerate() {
             nsd.rms_norm_mod(s.x.ptr(), Dt::F32, r, HIDDEN, l.in_norm.ptr(), EPS, none(), none(), none(), s.hb.ptr(), Dt::F32)?;
-            l.qkv.apply(ops, nsd, s.hb.fp(), r, Some(&s.xh), nul(), s.qkv.fp())?;
+            l.qkv.apply(ops, nsd, s.hb.fp(), r, Some(&s.xh), s.wh.as_ref(), nul(), s.qkv.fp())?;
             ops.qk_norm_rope(s.qkv.fp(), QKV, r, n, HEADS, &l.q_norm, EPS, &self.inv_freq, p0)?;
             ops.qk_norm_rope(fp(&s.qkv, HEADS * HEAD), QKV, r, n, KV, &l.k_norm, EPS, &self.inv_freq, p0)?;
             ops.kv_store(fp(&s.qkv, HEADS * HEAD), fp(&s.qkv, (HEADS + KV) * HEAD), QKV, 2, n, KV, HEAD, s.t, p0, &s.k[li], &s.v[li])?;
             ops.attn(s.qkv.fp(), QKV, &s.k[li], &s.v[li], 2, n, HEADS, KV, HEAD, s.t, p0, s.att.fp(), s.part.fp())?;
             self.residual(ops, nsd, s, &l.o, s.att.fp(), r, &s.x)?;
             nsd.rms_norm_mod(s.x.ptr(), Dt::F32, r, HIDDEN, l.post_norm.ptr(), EPS, none(), none(), none(), s.hb.ptr(), Dt::F32)?;
-            l.gu.apply(ops, nsd, s.hb.fp(), r, Some(&s.xh), nul(), s.gu.fp())?;
+            l.gu.apply(ops, nsd, s.hb.fp(), r, Some(&s.xh), s.wh.as_ref(), nul(), s.gu.fp())?;
             nsd.swiglu(s.gu.ptr(), Dt::F32, r, FFN, s.act.ptr(), Dt::F32)?;
             self.residual(ops, nsd, s, &l.down, s.act.fp(), r, &s.x)?;
         }

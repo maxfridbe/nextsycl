@@ -367,6 +367,14 @@ int ns_audio_mm3_quant_rows(ns_gpu* g, const float* w, int64_t N, int64_t K, int
     NS_CATCH
 }
 
+int ns_audio_mm3_dequant_rows(ns_gpu* g, const int8_t* q, const float* scale, int64_t N, int64_t K, void* out) {
+    NS_TRY
+    half* o = (half*) out;
+    if (N > 0 && K > 0) g->q.parallel_for(sycl::range<1>((size_t) (N * K)), [=](sycl::id<1> i) { o[i] = (half) ((float) q[i] * scale[i / K]); });
+    return 0;
+    NS_CATCH
+}
+
 int ns_audio_mm3_add(ns_gpu* g, float* x, const float* y, int64_t n) {
     NS_TRY
     if (n > 0) g->q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { x[i] += y[i]; });

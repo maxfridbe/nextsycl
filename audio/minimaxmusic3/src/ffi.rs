@@ -21,6 +21,7 @@ pub struct Api {
     pub bf16_to_half: unsafe extern "C" fn(G, *const u16, M, i64) -> c_int,
     pub bf16_to_float: unsafe extern "C" fn(G, *const u16, *mut f32, i64) -> c_int,
     pub quant_rows: unsafe extern "C" fn(G, *const f32, i64, i64, *mut i8, *mut f32) -> c_int,
+    pub dequant_rows: unsafe extern "C" fn(G, *const i8, *const f32, i64, i64, M) -> c_int,
     pub add: unsafe extern "C" fn(G, *mut f32, *const f32, i64) -> c_int,
     pub dit_in: unsafe extern "C" fn(G, *const f32, *const f32, i64, i64, i64, *mut f32) -> c_int,
     pub cfg_step: unsafe extern "C" fn(G, *mut f32, *const f32, *const f32, i64, f32, f32) -> c_int,
@@ -28,6 +29,8 @@ pub struct Api {
     pub nearest_rows: unsafe extern "C" fn(G, *const f32, i64, i64, i64, *mut f32) -> c_int,
     pub transpose: unsafe extern "C" fn(G, *const f32, i64, i64, *mut f32) -> c_int,
     pub tanh: unsafe extern "C" fn(G, *mut f32, i64) -> c_int,
+    pub conv1d: unsafe extern "C" fn(G, *const f32, i64, i64, i64, *const f32, i64, i64, *const f32, i64, i64, i64, *mut f32, i64) -> c_int,
+    pub conv_transpose1d: unsafe extern "C" fn(G, *const f32, i64, i64, i64, *const f32, i64, i64, *const f32, i64, i64, *mut f32, i64) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -64,6 +67,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             bf16_to_half: sym!("ns_audio_mm3_bf16_to_half"),
             bf16_to_float: sym!("ns_audio_mm3_bf16_to_float"),
             quant_rows: sym!("ns_audio_mm3_quant_rows"),
+            dequant_rows: sym!("ns_audio_mm3_dequant_rows"),
             add: sym!("ns_audio_mm3_add"),
             dit_in: sym!("ns_audio_mm3_dit_in"),
             cfg_step: sym!("ns_audio_mm3_cfg_step"),
@@ -71,6 +75,8 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             nearest_rows: sym!("ns_audio_mm3_nearest_rows"),
             transpose: sym!("ns_audio_mm3_transpose"),
             tanh: sym!("ns_audio_mm3_tanh"),
+            conv1d: sym!("ns_audio_mm3_conv1d"),
+            conv_transpose1d: sym!("ns_audio_mm3_conv_transpose1d"),
         })
     })
     .as_ref()

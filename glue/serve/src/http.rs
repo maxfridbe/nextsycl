@@ -177,6 +177,7 @@ pub fn content_type(path: &str) -> &'static str {
         "webp" => "image/webp",
         "jpg" | "jpeg" => "image/jpeg",
         "mp4" => "video/mp4",
+        "wav" => "audio/wav",
         "woff2" => "font/woff2",
         _ => "application/octet-stream",
     }
@@ -186,9 +187,11 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         204 => "No Content",
+        206 => "Partial Content",
         400 => "Bad Request",
         404 => "Not Found",
         409 => "Conflict",
+        499 => "Client Closed Request",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     }

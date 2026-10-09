@@ -94,6 +94,9 @@ video (nextsycl video ...):
 audio (nextsycl audio ...):
   nextsycl audio gen \"<description>\" --lyrics TEXT | --lyrics-file FILE [--seconds N] [--seed N] [--out FILE]
                                 a song (MiniMax Music 3), in this process (inside the image)
+  nextsycl audio serve [MODEL] [--wfe] [--port 8087] [--host H] [--out DIR]
+                                the speech API (/v1/audio/speech: input = lyrics, instructions = description) in a
+                                container (nextsycl-audio); --wfe: the web page at /
   nextsycl audio check <dump dir> [--stages ar,dit,voc,chunks]    the engine against a reference's dumps
   nextsycl audio engines        the architectures this build serves
   nextsycl audio selftest [--gpu N]  the audio kernel library, an engine's own symbol, a kernel on the GPU
