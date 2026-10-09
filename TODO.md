@@ -207,11 +207,16 @@ of IQ2_XXS instead could win twice.
       arguments typed by the schema, held back from the stream; a weather round trip (call, result, answer) through
       the switcher, streamed and not
 - [ ] GLM-5.3's tool path (its template's <tool_call> form)
-- [ ] qwen4exp: the decode window's 4-row cost (28 ms in Strata, 32 here)
-- [ ] qwen4exp's first pass: a model just loaded decodes 10-20% slower than the same prompts run again on the same
-      load (IQ2_XS 2K-8K 69-71 vs 81-83 tok/s; the Coder 65-68 vs 76-78), with the same tokens and drafts accepted
-      and the GPU at 2.8 GHz. Not host memory: the Coder with every expert in VRAM (two cards) shows it too (57-62 vs
-      70-75). A kernel reading every expert once at load did not cure it reliably (tried, removed). Open
+- [ ] qwen4exp's decode window, 2 ms behind Strata's. The same 2,185 ids, greedy, fresh, 169 drafts accepted in
+      both: Strata 87 rounds in 3,182 ms (36.6 ms a round: its window ~28.7, commit 3.6, drafting 3.6; 80.4 tok/s);
+      here the window 30.5 on average (T=4 31-33, T=3 28, T=2 25, T=1 22), commit 0.8, drafting 3.1 - about 35 ms a
+      round, 79-86 tok/s. The window's 2 ms need a kernel-by-kernel profile of both
+- [x] qwen4exp's first pass (a model just loaded decoded 10-20% slower than the same text again): the PLE rows. A
+      window reads 16 rows a token (64 at T=4) from the 27 GiB table, hashed from the token's n-grams; read one after
+      another, the rows not in the page cache came off the SSD in turn (~6 ms a window) - and this box's page cache
+      cannot keep 63 GB of model. posix_fadvise(WILLNEED) on all of a window's rows first: with the files dropped
+      from the page cache 71.8 -> 83.9 tok/s (2K benchy ids), warm 86.0 / 86.1. NS_QW_PLE_PREFETCH=0 off. (Not the
+      IOMMU, not the GPU: an ns_touch of every expert at load was tried and removed)
 - [x] qwen4exp's VRAM on one card: 6.2 GiB free after the weights load, 1.2 GiB once the sessions (two, 128K + 32K),
       the draft layer and the prompt path's buffers are made and a 40K prompt has run - the planner's 1.5 GiB guard.
       Nothing left to give the experts (the Coder's 2.5 GiB in host memory are those buffers)

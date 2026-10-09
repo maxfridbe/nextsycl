@@ -188,11 +188,11 @@ Prompt read (PP), tokens/s:
 
 | Model | 20 | 2K | 8K | 40K | 128K | 250K |
 |---|---:|---:|---:|---:|---:|---:|
-| Qwen3.8-Flash-Next IQ2_XS | 83 | 788 | 1,154 | 1,227 | 1,210 | - |
-| IQ2_XS, refusal projection | 83 | 786 | 1,144 | 1,214 | 1,200 | - |
-| Qwen3.8-Flash-Next Coder IQ1_M | 80 | 935 | 1,386 | 1,492 | 1,469 | - |
-| Coder, refusal projection | 80 | 929 | 1,370 | 1,472 | 1,449 | - |
-| Swift 1.5 IQ2_XS | 83 | 781 | 1,145 | 1,216 | 1,201 | - |
+| Qwen3.8-Flash-Next IQ2_XS | 84 | 789 | 1,154 | 1,226 | 1,210 | - |
+| IQ2_XS, refusal projection | 83 | 786 | 1,143 | 1,212 | 1,199 | - |
+| Qwen3.8-Flash-Next Coder IQ1_M | 80 | 938 | 1,389 | 1,495 | 1,471 | - |
+| Coder, refusal projection | 80 | 930 | 1,371 | 1,473 | 1,450 | - |
+| Swift 1.5 IQ2_XS | 83 | 782 | 1,147 | 1,217 | 1,202 | - |
 | GLM-5.3-Flash IQ2 (64K / 256K modes) | 27 | 456 | 759 | 1,108 | 1,134 | 1,026 |
 | Strata: IQ2_XS | 60 | 745 | 1,050 | 1,117 | - | - |
 | Strata: Coder IQ1_M | 57 | 875 | 1,285 | 1,392 | - | - |
@@ -203,19 +203,20 @@ model loads:
 
 | Model | 20 | 2K | 8K | 40K | 128K | 250K |
 |---|---:|---:|---:|---:|---:|---:|
-| Qwen3.8-Flash-Next IQ2_XS | 77.5 (68.0) | 83.0 (70.6) | 81.3 (68.8) | 75.9 (64.6) | 75.5 (66.5) | - |
-| IQ2_XS, refusal projection | 78.3 (72.5) | 84.7 (73.5) | 82.5 (71.2) | 77.8 (70.4) | 72.4 (65.9) | - |
-| Qwen3.8-Flash-Next Coder IQ1_M | 78.1 (71.3) | 77.5 (65.1) | 75.9 (67.5) | 77.2 (69.8) | 68.0 (62.6) | - |
-| Coder, refusal projection | 78.5 (76.3) | 78.3 (72.6) | 69.9 (65.4) | 76.2 (70.8) | 71.9 (67.1) | - |
-| Swift 1.5 IQ2_XS | 78.9 (66.5) | 85.3 (69.2) | 85.4 (72.9) | 82.1 (74.1) | 74.9 (64.5) | - |
+| Qwen3.8-Flash-Next IQ2_XS | 77.2 (75.6) | 82.7 (78.3) | 81.2 (74.4) | 75.6 (72.2) | 75.5 (69.9) | - |
+| IQ2_XS, refusal projection | 78.3 (76.9) | 84.7 (77.6) | 82.5 (75.6) | 77.8 (72.0) | 72.3 (67.4) | - |
+| Qwen3.8-Flash-Next Coder IQ1_M | 78.0 (71.5) | 77.5 (71.0) | 75.9 (70.9) | 77.0 (71.3) | 67.9 (62.9) | - |
+| Coder, refusal projection | 78.4 (72.1) | 78.2 (72.0) | 69.8 (65.1) | 76.0 (70.8) | 71.6 (67.1) | - |
+| Swift 1.5 IQ2_XS | 79.3 (77.7) | 85.8 (79.7) | 86.1 (78.7) | 82.4 (78.3) | 75.2 (69.4) | - |
 | GLM-5.3-Flash IQ2 (64K / 256K modes) | (18.8) | (18.2) | (18.7) | (18.1) | (18.7) | (16.9) |
 | Strata: IQ2_XS | 70.0 | 77.5 | 78.5 | 71.8 | - | - |
 | Strata: Coder IQ1_M | 77.3 | 74.6 | 71.9 | 67.6 | - | - |
 | Strata: Swift 1.5 | 77.1 | 74.8 | 75.5 | 63.1 | - | - |
 
-The prompt speeds are the warm pass's (the first pass reads the same, but for its very first request: ~49 tokens/s
-on the 20-token prompt). A model just loaded decodes 10-20% slower until it has run for a while - the same tokens and
-drafts as the warm pass, not its memory placement (it shows with every expert in VRAM too); open in `TODO.md`. The
+The prompt speeds are the warm pass's (the first pass reads the same, but for its very first request: ~50 tokens/s
+on the 20-token prompt). A model just loaded decodes 2-9% slower than the warm pass on new text: each
+token's 16 per-layer-embedding rows come from a 27 GiB table in the file, and rows not in the page cache are read
+from the disk (asked for together a window: `docs/engines.md`, NS_QW_PLE_PREFETCH). The
 projection modes cost nothing measurable. Draft acceptance varies with the text (61-86% here), and decode with it. On two cards the Qwen models decode slower than on
 the B70 alone (Coder 2K 70.8 tok/s with the B70 first, 58.2 with the B65 first; `TODO.md`).
 

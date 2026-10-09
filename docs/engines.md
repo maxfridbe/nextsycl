@@ -67,7 +67,8 @@ Every engine is held to the same checks: `spec-check` (verify passes equal one-t
   (`ns_sys::Api::symbol`): an engine's symbols are not in the shared tables. Its settings: `NS_QW_MTP` (Strata's MTP
   runtime directory), `NS_QW_EXPERT_PROFILE` (its expert profile: which experts stay in VRAM on one card),
   `NS_QW_CHUNK` (prompt chunk, 2048; Strata serves 4096), `NS_QW_SPEC` / `NS_QW_SPEC_MIN_P` (4 / 0.5),
-  `NS_QW_EAGER=1` (no graphs), `NS_QW_WINDOWS=1` (prompts through windows), `NS_QW_PROFILE=1` (round timings), `NS_QW_COUPLED=0` (a sampled request's draws on
+  `NS_QW_EAGER=1` (no graphs), `NS_QW_WINDOWS=1` (prompts through windows), `NS_QW_PROFILE=1` (round timings), `NS_QW_PLE_PREFETCH=0` (a window's PLE rows read one after another, not asked of the
+  kernel together first), `NS_QW_COUPLED=0` (a sampled request's draws on
   the host, its drafts the draft layer's argmax; by default on the GPU with coupled drafts, `ns_qw_set_sampling`).
   The projection modes (llama.cpp's control vectors with the experimental-speed-projection package's
   `--cvec-mode project --cvec-dir per-layer`, Strata's cvec kernel on the stage's own context, `cvec.cpp`):

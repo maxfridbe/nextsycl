@@ -1,10 +1,24 @@
 //! The per-layer embedding's host half: a token's 16 table rows from its 2- and 3-gram (Strata's `ngram_rows`,
 //! src/kernels/ngram.cpp), read from the file and decoded (IQ4_NL, 160 values a row). The GPU half is the PLE block in
 //! the glue. Rows are read with `pread` from many threads (a prompt chunk reads 16 a token from a 27 GiB table: the
-//! page cache keeps what repeats).
+//! page cache keeps what repeats). A decode window's few rows are asked of the kernel all at once first
+//! (`posix_fadvise` WILLNEED: the reads of the rows not in the page cache go to the disk together), then read in
+//! turn: read one after another from the disk, a 4-token window's 64 rows cost ~6 ms of a ~30 ms window.
 
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
+
+extern "C" {
+    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+}
+const POSIX_FADV_WILLNEED: i32 = 3;
+
+/// NS_QW_PLE_PREFETCH=0: a window's rows read one after another without asking for them together first
+fn prefetch() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("NS_QW_PLE_PREFETCH").map_or(true, |v| v != "0"))
+}
 
 use ns_gguf::{GType, Gguf};
 
@@ -112,6 +126,13 @@ impl Table {
         let mut out = vec![0f32; rows.len() * self.dim];
         // a decode window's few rows inline; a prompt chunk's thousands over up to 32 threads
         let threads = if rows.len() <= 128 { 1 } else { rows.len().div_ceil(64).clamp(1, 32) };
+        if threads == 1 && prefetch() {
+            let fd = self.file.as_raw_fd();
+            for r in rows.iter().filter(|r| (**r as u64) < self.rows) {
+                // SAFETY: an open descriptor; advice only (a failure leaves the plain read)
+                unsafe { posix_fadvise(fd, (self.offset + *r as u64 * self.row_bytes as u64) as i64, self.row_bytes as i64, POSIX_FADV_WILLNEED) };
+            }
+        }
         let per = rows.len().div_ceil(threads);
         let err = std::sync::Mutex::new(None);
         let work = |rs: &[u32], os: &mut [f32], err: &std::sync::Mutex<Option<String>>| {
