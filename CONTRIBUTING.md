@@ -1,6 +1,6 @@
 # Contributing
 
-nextsycl welcomes new models - language, image and video - and work on the ones it has. Each model architecture
+nextsycl welcomes new models - language, image, video and audio - and work on the ones it has. Each model architecture
 is its own **engine**: a complete runtime for that model, free to be as specialised as it needs to be fast. This
 guide is how to port one, and the few rules every change follows.
 
@@ -12,7 +12,7 @@ guide is how to port one, and the few rules every change follows.
 2. **Third-party crates are fine** - anything that does not bring another GPU runtime (rule 1). Prefer a few
    well-known ones; say why in the pull request.
 3. **Keep the architecture** (`docs/architecture.md`):
-   - an engine is its own crate under its kind (`llm/<arch>`, `image/<arch>`, `video/<arch>`), with its kernels in
+   - an engine is its own crate under its kind (`llm/<arch>`, `image/<arch>`, `video/<arch>`, `audio/<arch>`), with its kernels in
      `kernels/<kind>/<arch>/`;
    - it depends only on the foundation (`crates/`) and its own kind's contract (`<kind>/contract`) - never on
      another kind, the glue (`glue/`) or the program (`cli/`);
@@ -34,17 +34,17 @@ cargo build --release # the Rust side alone builds anywhere (the kernels are loa
 ```
 
 A GPU is needed only to run: an Intel Arc (Xe2: B580 / B70 / B65), Level Zero, and the oneAPI runtime (in the
-build image). `nextsycl llm selftest` (and `image` / `video`) checks the whole path on your machine: the kind's
+build image). `nextsycl llm selftest` (and `image` / `video` / `audio`) checks the whole path on your machine: the kind's
 kernel library opens, an engine's own symbol binds, a kernel runs on the GPU and its result comes back right.
 
 ## Porting a model, step by step
 
 Each kind has a template that compiles, runs its example kernel to prove the path to the GPU, and fails with a
-clear message where the port begins: `llm/example`, `image/example`, `video/example`, with their kernels in
+clear message where the port begins: `llm/example`, `image/example`, `video/example`, `audio/example`, with their kernels in
 `kernels/<kind>/example/`. Every method of the contract is there with a comment saying what it must do.
 
 1. **Copy the template.** `cp -r llm/example llm/<arch>` and `cp -r kernels/llm/example kernels/llm/<arch>` (or
-   image / video). Rename the crate (`nextsycl-<kind>-<arch>`), `ARCH`, and the kernel symbols
+   image / video / audio). Rename the crate (`nextsycl-<kind>-<arch>`), `ARCH`, and the kernel symbols
    (`ns_<kind>_<arch>_*`). Add the crate to the workspace (`Cargo.toml`: `members` and `[workspace.dependencies]`).
    Keep its `selftest` working as you go: it is the quickest proof that your kernels are built and bound.
 2. **Describe the model.** Read the file's metadata and find every tensor by role, checked at load, so a wrong file

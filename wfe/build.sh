@@ -4,7 +4,7 @@
 # the result is dist/wfe/: each app's ES modules + index.html + style.css, the shared vendor/ and static/, which the
 # kind's server serves as they are (/ui/..., the page at /).
 #   ./build.sh [app...]    type-check + compile (default: every app)
-#   ./build.sh --check     also the image page's smoke test against a running server (NS_WFE=http://host:port)
+#   ./build.sh --check     also a page's smoke test against a running server (NS_WFE=http://host:port: an image or audio one)
 # video/ is the H3 studio's front end as it was (its server: nextsycl video serve).
 set -euo pipefail
 cd "$(dirname "$0")"

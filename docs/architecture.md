@@ -1,6 +1,6 @@
 # Architecture
 
-nextsycl runs language, image and video models on Intel Arc GPUs. Each **kind** of model has a contract - a Rust
+nextsycl runs language, image, video and audio models on Intel Arc GPUs. Each **kind** of model has a contract - a Rust
 trait its server and command line drive - and each model **architecture** has its own engine behind it: a complete
 runtime for that model on these GPUs, with its own kernels. There is no generic forward pass parameterised by a config:
 the speed here comes from decisions that only make sense for one model (GLM-5.3's KDA scan sized per card, its MLA
@@ -39,9 +39,16 @@ video/                     VIDEO
   h3         nextsycl-video-h3   MiniMax H3: H3's engine, jobs and mp4 writer
   example    nextsycl-video-example  a template
 
+audio/                     AUDIO
+  contract   nextsycl-audio      the contract: AudioEngine, AudioRequest (description, lyrics, length), Step, Audio
+                                 (a waveform; WAV with an INFO chunk), AudioKind
+  minimaxmusic3 nextsycl-audio-minimaxmusic3  MiniMax Music 3: the language model and depth decoder, the flow
+                                 transformer and its windows, the decoder, stage checks
+  example    nextsycl-audio-example  a template
+
 glue/                      WHAT MAKES ENGINES A PRODUCT (libraries too)
   models     nextsycl-models     the registry of what a machine serves, settings, the catalog of supported models
-  serve      nextsycl-serve      the servers: OpenAI-compatible APIs over a kind's contract (llm, image), the prompt
+  serve      nextsycl-serve      the servers: OpenAI-compatible APIs over a kind's contract (llm, image, audio), the prompt
                                  cache, telemetry; video: the daemon (queue, a worker process a GPU) and the studio
 
 cli/
@@ -50,9 +57,10 @@ cli/
 kernels/                   SYCL ONLY - one library a kind (dist/libnextsycl-<kind>.so)
   ns/                     the shared part, linked into every kind's library: GPUs, memory, queues, copies, tickets
   strata/                 the imported Strata kernels (MIT), linked into the llm library
-  diffusion/              the shared diffusion kernels (H3's, on oneDNN), linked into the image and video libraries;
+  diffusion/              the shared diffusion kernels (H3's, on oneDNN), linked into the image, video and audio libraries;
                           diffusion/flash: flash attention (ARK on sycl-tla) as libnextsycl-flash.so, loaded on use
-  llm/<arch>/  image/<arch>/  video/<arch>/   an engine's own kernels and its header (ns_<kind>_<arch>_* symbols)
+  llm/<arch>/  image/<arch>/  video/<arch>/  audio/<arch>/   an engine's own kernels and its header
+                          (ns_<kind>_<arch>_* symbols)
 ```
 
 ### The rules (checked by `cli/nextsycl/tests/architecture.rs` on every `cargo test`)
@@ -95,6 +103,10 @@ a strength), RGBA; `defaults()` for what a request leaves out; `Step` progress. 
 keyframes, an audio reference, the output path; progress by stage; `cancel` stops it at a step boundary;
 `unload` gives the GPUs back. The queue, the studio and the tools built on clips sit above the contract.
 
+**audio** (`nextsycl-audio`) - `generate(request, progress) -> Audio`: the description, the lyrics, a length limit,
+steps, guidance, seed; `defaults()` (with the longest it makes and its sample rate); progress by the engine's phases,
+and an error from `progress` cancels. Files by role, a sharded file as `<role>-1`, `<role>-2` ... (`shards`).
+
 ## Adding a model
 
 CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>/example` and
@@ -118,6 +130,19 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   `NS_QW_CVEC=<file.gguf>:<scale>`, `NS_QW_CVEC_LAYERS=4,44`, `NS_QW_CVEC_MODE=project|add`,
   `NS_QW_CVEC_DIR=per-layer`. The Coder has 256 experts (the kernels take the count from the file); Swift's router is
   F32 in the file and is converted to BF16 at load (exact).
+
+## The audio engines
+
+- **minimaxmusic3** - MiniMax Music 3 from its diffusers checkpoint (bf16 language model and depth decoder, f32 flow
+  transformer, condition encoder and decoder). Its kernels (`kernels/audio/minimaxmusic3`): a small-batch product
+  that reads a matrix once for up to 8 rows (half, or int8 with a scale a row against float activations), causal
+  attention against a half cache with 4 query heads a key head (split over the keys for one-row decode), Qwen3's
+  q / k norm with RoPE, the flow transformer's partial RoPE, the codebooks' embeddings, the frames' layer mix, the
+  sampler's step and overlap blend, and the decoder's 1-D convolutions on oneDNN (`conv.cpp`). The shared diffusion
+  kernels do the rest (norms, SwiGLU, the flow transformer's GEMMs and attention). Settings: `NS_MM3_INT8=1`
+  (`--opt-int8`: the language model and depth decoder in int8; a prompt's wide products expand them to half),
+  `NS_MM3_FPMATH` (the decoder's convolutions: strict float32 by default, or f16 / bf16 / tf32),
+  `NS_MM3_NSD_CONV=1` (the shared plain-loop convolutions instead).
 
 ## The model registry
 

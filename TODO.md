@@ -162,7 +162,7 @@ of IQ2_XXS instead could win twice.
 - [ ] Fused gate/up: no gain from more column tiles a sub-group (NB 2: slower, NB 4: spills) or limits past 64 (128:
       the same 7.5 s, 192-256: 8.1)
 
-## Kinds: language, image, video (docs/architecture.md, CONTRIBUTING.md, 2026-10-09)
+## Kinds: language, image, video, audio (docs/architecture.md, CONTRIBUTING.md, 2026-10-09)
 
 - [x] The layout by kind: the foundation (crates/: sys, core, gguf, tok, diffusion), each kind's contract and engines
       (llm/, image/, video/), the glue as libraries (glue/models: registry and settings; glue/serve: the servers,
@@ -221,6 +221,22 @@ of IQ2_XXS instead could win twice.
       (kept for a rollback); the H3 studio's state, clips, LLM modes and templates carried over
 - [ ] Video: dedupe against the foundation (its gguf / safetensors / tokenizer / LoRA readers -> crates/), the text
       encoder into crates/qwen3vl (the 32B GGUF form), the ESRGAN weights in the catalog
+- [x] The audio kind (2026-10-09): its contract (description, lyrics, length; a waveform out, WAV with an INFO chunk;
+      progress that cancels), template (audio/example + kernels), libnextsycl-audio.so, `nextsycl audio engines |
+      selftest | gen | check | serve`
+- [x] MiniMax Music 3 (audio/minimaxmusic3): the 8B language model and depth decoder (half; int8 opt-in), the
+      condition encoder, the 2.4B flow transformer over 200-frame windows with their overlap, the Flow-VAE decoder
+      (oneDNN convolutions); checked stage by stage against diffusers' own code on the same files
+      (reference/minimaxmusic3/ref.py: 51 forced frames 4e-4, 30 flow steps 1.2e-3, decoder 8e-7, three windows
+      stitched 3.6e-3). Served: the reference's /v1/audio/speech + the page (wfe/audio). B70: a minute of song in
+      118 s half, 89 s int8; B65 155 / 136 s
+- [ ] Music speed: the flow transformer in int8 ConvRot (as Qwen-Image's: ~1.4x on 36% of a song's time); the
+      frame's eight host round trips (draws on the GPU, the frame as one graph); the depth decoder's seven passes
+      read 8 GB a frame in half - int8 only, or a smaller form. Tried: the flow stage beside the frames on a second
+      queue of the same card (the card takes the two in turns: 118 -> 114.5 s; dropped)
+- [ ] Music: the two cards together as the reference runs (the language model on one, flow + decoder on the other,
+      the windows streamed between them) when chat is not on the B65; `audio start | stop | ps`; 32 kHz output (the
+      reference server resamples); the caption rewriter (MiniMax's music-caption-rewriter skill) as an option
 
 ## Several models (docs/engines.md, 2026-10-08)
 

@@ -57,7 +57,7 @@ async def audio(p, url, out):
     await pg.wait_for_selector("section.panel", timeout=60000)
     await pg.fill(".create textarea:not(.lyrics)", DESCRIPTION)
     await pg.fill("textarea.lyrics", LYRICS)
-    await pg.click("text=0:30")
+    await pg.click(".create .chip:text-is(\"0:30\")")
     await pg.wait_for_timeout(800)
     await pg.screenshot(path=f"{out}/audio-wfe-idle.png")
     await pg.click("#go")

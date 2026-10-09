@@ -1,6 +1,7 @@
 // The web front end's smoke test (H3's check.mjs, for nextsycl's apps): against a running server (NS_WFE, default
-// http://localhost:8086), fetch the page and every ES module it imports, check that each parses, then render the app
-// headlessly from a made-up state - App() must build a vnode tree with its panels, no DOM needed until patch().
+// http://localhost:8086 - the image page; an audio server's page works the same), fetch the page and every ES module
+// it imports, check that each parses, then render the app headlessly from a made-up state - App() must build a vnode
+// tree with its panels, no DOM needed until patch().
 import { mkdir, writeFile, rm } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -43,19 +44,28 @@ console.log(bad ? `${bad} modules failed to parse` : "all modules parse as ES mo
 
 globalThis.localStorage = { getItem: () => null, setItem: () => {} };
 globalThis.document = { getElementById: () => null };
-const { App } = await import(join(root, "image/src/components/App.js"));
-const { state } = await import(join(root, "image/src/state.js"));
+// the app the page loads: /ui/<app>/src/main.js
+const app = entry.split("/")[2];
+const { App } = await import(join(root, `${app}/src/components/App.js`));
+const { state } = await import(join(root, `${app}/src/state.js`));
 state.info = await (await fetch(base + "/api/info")).json();
 state.gpu = await (await fetch(base + "/api/gpu")).json();
-state.progress = { busy: true, picture: 1, pictures: 2, at: 12, of: 40, seconds: 8.4 };
 state.busy = true;
-state.form.loras = { [state.info.loras?.[0]?.id ?? "x"]: 1 };
-const pic = { url: "/v1/images/files/x.png", prompt: "a fox", seed: 7, steps: 40, width: 1024, height: 1024, loras: [], seconds: 17, wh: 1.3, created: 0 };
-state.results = [pic, { ...pic, seed: 8 }];
-state.history = [pic];
-state.zoom = pic;
+if (app === "audio") {
+  state.progress = { busy: true, phase: "tokens", at: 300, of: 750, seconds: 15.2 };
+  const song = { url: "/v1/audio/files/x.wav", prompt: "Genre: folk", lyrics: "[verse]\nla la", seed: 7, steps: 30, cfg: 1.7, seconds: 30, took: 60, wh: 3.6, created: 0 };
+  state.result = song;
+  state.history = [song, { ...song, seed: 8 }];
+} else {
+  state.progress = { busy: true, picture: 1, pictures: 2, at: 12, of: 40, seconds: 8.4 };
+  state.form.loras = { [state.info.loras?.[0]?.id ?? "x"]: 1 };
+  const pic = { url: "/v1/images/files/x.png", prompt: "a fox", seed: 7, steps: 40, width: 1024, height: 1024, loras: [], seconds: 17, wh: 1.3, created: 0 };
+  state.results = [pic, { ...pic, seed: 8 }];
+  state.history = [pic];
+  state.zoom = pic;
+}
 let panels = 0, nodes = 0;
 const walkTree = (n) => { nodes++; if (n.sel?.startsWith("section") && n.data?.class?.panel) panels++; for (const c of n.children ?? []) if (typeof c === "object" && c) walkTree(c); };
 walkTree(App());
-console.log(`rendered: ${nodes} nodes, ${panels} panels`);
+console.log(`${app}: rendered ${nodes} nodes, ${panels} panels`);
 if (bad || panels < 3) process.exit(1);

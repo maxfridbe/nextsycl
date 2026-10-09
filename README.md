@@ -2,7 +2,7 @@ We stand on the shoulders of giants.
 
 # nextsycl
 
-A Rust runtime for language, image and video models on Intel Arc GPUs, with SYCL kernels. Each kind of model has a
+A Rust runtime for language, image, video and audio models on Intel Arc GPUs, with SYCL kernels. Each kind of model has a
 contract its server and command line drive, and each model architecture its own engine behind it, tuned end to end -
 a library another program can use without the server (`docs/architecture.md`). New models are welcome:
 `CONTRIBUTING.md` walks through a port, from each kind's template engine. The language models today:
@@ -18,7 +18,11 @@ each context length: [Speed by model](#speed-by-model). **Qwen-Image 2.1**
 stage against the reference on the same quantized files; 1024x1024 in 40 steps takes 23.8 s on the B70 (16.5 s with
 int8 weights), 37.5 s on the B65. **MiniMax H3** (`video/h3`): text, pictures, a voice and other clips to video with
 sound - H3's SYCL engine moved in whole (its jobs, daemon, studio and tools as `nextsycl video ...`), with its own
-speed: a 896x672, 4.5 s clip in 87-95 s on the B70 (8 s a step), H3's 98 s.
+speed: a 896x672, 4.5 s clip in 87-95 s on the B70 (8 s a step), H3's 98 s. **MiniMax Music 3**
+(`audio/minimaxmusic3`): songs from lyrics and a description, up to six minutes of 44.1 kHz stereo - its 8B semantic
+language model, RVQ depth decoder, 2.4B flow-matching transformer and Flow-VAE decoder in SYCL, checked stage by stage
+against MiniMax's diffusers code on the same files; a minute of song in 89 s on the B70 with the language model in
+int8 (118 s in half).
 
 ## Supported models
 
@@ -62,6 +66,13 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `minimax-h3-q6k`, `-q4km` | the denoiser as a Q6_K / Q4_K_M GGUF: less of the card, longer clips | `video/h3` | 38.5 / 33.6 GiB | served by H3 |
 | `minimax-h3-q8` | the denoiser as a Q8_0 GGUF (a reference form) | `video/h3` | 43.0 GiB | listed |
 | `minimax-h3-realism-lora`, `-ref2v-turbo-lora`, `-lms-lora` | LoRAs: realism (people), ref2v in 4 steps, LMS | | | listed (realism: served by H3) |
+
+**Audio** (`nextsycl audio`: songs from lyrics and a description)
+
+| id | model | engine | size | status |
+|---|---|---|---|---|
+| `minimax-music3` | MiniMax Music 3: the 8B semantic language model and RVQ depth decoder (half on the card), the 2.4B flow transformer, the Flow-VAE decoder; up to 6 minutes, 44.1 kHz stereo | `minimaxmusic3` | 26.6 GiB | checked, served |
+| `minimax-music3-int8` | the same files, the language model and depth decoder in int8 at load: half the VRAM, 1.7x the frames a second | `minimaxmusic3` | 26.6 GiB | checked, served |
 
 ## What it does
 
@@ -205,7 +216,7 @@ engine settings (`NS_QW_MTP`, `NS_QW_CVEC` and the like), whether it is offered,
 nextsycl models list [--json]
 nextsycl models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M...]] [--set NAME=VALUE]...
                     [--no-tools] [--no-tasks] [--disabled]
-nextsycl models search [TEXT] [--kind llm|image|video|lora]   # the catalog of supported models
+nextsycl models search [TEXT] [--kind llm|image|video|audio|lora]   # the catalog of supported models
 nextsycl models pull <id>... [--dir DIR] [--from DIR]... [--verify] [--again]   # download (resumable), SHA-256, register
 nextsycl models remove <id> [--files]        # --files deletes the GGUF shards too
 nextsycl models enable <id> | disable <id>
@@ -235,7 +246,7 @@ Every engine declares the options it takes beyond its kind's common ones; any co
 `--opt-NAME VALUE` (or `--opt-NAME` alone for a switch), NAME the option or the variable it sets. At load they set
 those variables (what the engines and their kernels read; into the container too), per request they ride in the
 request (`"options": {NAME: value}` in an API body). An option the engine does not take is an error that lists those
-it does; `nextsycl llm engines`, `nextsycl image engines` show them all.
+it does; `nextsycl llm engines`, `nextsycl image engines`, `nextsycl audio engines` show them all.
 
 ```sh
 nextsycl image gen "a fox" --opt-int8 --opt-sigmas 1,0.9375,0.875,0.75,0.5,0.25     # int8 DiT, a 6-step schedule
@@ -356,6 +367,75 @@ nextsycl video stop [--web | --all]
   denoising step either way at 896x672, 4.5 s (19,191 tokens).
 
 ![the video studio](docs/screenshots/video-studio.webp)
+
+## Audio
+
+MiniMax Music 3 (`audio/minimaxmusic3`): a song from its lyrics and a description of it - genre, tempo and key, mood,
+the voice, the instruments, the arrangement.
+
+```sh
+nextsycl models pull minimax-music3 [--dir DIR] [--from DIR]   # --from: the checkpoint's directory, if downloaded
+nextsycl audio gen "Genre: indie folk. BPM: 84. Vocals: male lead, gentle. Arrangement: acoustic guitar, banjo." \
+                   --lyrics-file song.txt [--seconds 60] [--seed N] [--steps 30] [--cfg 1.7] [--out FILE|DIR] [--opt-int8 1]
+nextsycl audio serve [minimax-music3] [--wfe] [--port 8087] [--host H] [--out DIR] [--gpu N]
+nextsycl audio check <reference dump dir> [--stages ar,dit,voc,chunks] [--gpu N]
+nextsycl audio engines | selftest [--gpu N]
+```
+
+Lyrics take structure tags on lines of their own (`[intro]`, `[verse]`, `[pre-chorus]`, `[chorus]`, `[bridge]`,
+`[instrumental]`, `[solo]`, `[outro]`; text after a tag on its line is dropped, as the model was trained); no lyrics
+makes an instrumental. `--seconds` is a limit: the model ends a song when it is done. The WAV carries the description,
+the lyrics and the settings (its INFO chunk).
+
+- **The pipeline**, one card: the prompt in the checkpoint's template and its classifier-free twin; the language
+  model draws a semantic code a frame (25 a second, guidance 1.5, the best 50) and the depth decoder the seven residual
+  codes after it, two rows a frame on the engine's own small-batch products and cached attention, the draws on the
+  host; each frame's eight hidden states mixed into one conditioning row; the flow transformer makes the Flow-VAE
+  latents in 200-frame windows 100 apart (30 Euler steps, guidance 1.7), each blended into the previous over their
+  overlap; the decoder (DAC's, its convolutions on oneDNN) a window at a time, the overlaps cropped.
+- **Checked** against MiniMax's own diffusers code (`reference/minimaxmusic3/ref.py`, float32 on the CPU, the same
+  files), each stage from the reference's input: the prompt's tokens equal; the language model and the depth decoder
+  over 51 frames forced to the reference's codes rel 4e-4 (half; int8 2-3e-2, cosine 0.9997); the condition 2e-6; the
+  flow transformer's first velocity 1.4e-3 and the latents after 30 steps 1.2e-3; the decoder 8e-7; three windows
+  with their overlaps, stitched, 3.6e-3.
+- **The server** (`nextsycl audio serve`, the container `nextsycl-audio`): the reference server's endpoint - `POST
+  /v1/audio/speech` with `input` (the lyrics), `instructions` (the description), `seed`, `max_new_tokens` (frames,
+  25 a second) or `seconds`, and ours: `steps`, `cfg`, `options` - answering the WAV, or with `"response_format":
+  "url"` JSON with its link; `/api/progress` (the phase: prompt, tokens, flow, decode), `/api/cancel`,
+  `/api/history`, `/v1/audio/files/<f>` (byte ranges, for the player).
+
+```sh
+curl localhost:8087/v1/audio/speech -H 'content-type: application/json' -o song.wav -d '{"input": "[verse]\nCity
+  lights are calling out my name\n[chorus]\nTonight we run", "instructions": "Genre: funk pop. BPM: 112. Slap bass,
+  brass stabs. Vocals: confident male lead.", "seed": 11, "max_new_tokens": 1500}'
+```
+
+With `--wfe` the page at `/`: the description, the lyrics with the structure tags a click away, the length, the
+seed, the steps and guidance; the phase and its progress while a song is made, a cancel; each song with its player,
+settings, lyrics and the card's energy (`docs/screenshots/shoot.py audio http://localhost:8087 docs/screenshots`
+retakes these):
+
+| Idle | Composing | Done |
+|---|---|---|
+| ![idle](docs/screenshots/audio-wfe-idle.webp) | ![composing](docs/screenshots/audio-wfe-running.webp) | ![done](docs/screenshots/audio-wfe-done.webp) |
+
+<img src="docs/screenshots/audio-wfe-phone.webp" width="260" alt="the page at phone width">
+
+A minute of song (`nextsycl audio gen --seconds 60`, a pop-rock description and lyrics long enough not to end
+sooner, 30 steps; 2026-10-09), each card alone; its phases as `gen` reports them. VRAM: the card's use with the
+model loaded, and its peak over a 20 s song (the cache and the flow stage's buffers), through the server:
+
+| card, language model | 60 s of song | tokens (1,500 frames) | flow (14 windows x 30 steps) | decode | VRAM, loaded / peak |
+|---|---|---|---|---|---|
+| B70, half | 117.8 s | 71.8 s · 20.9 frames/s | 42.0 s · 0.10 s/step | 3.8 s | 19.4 / 22.7 GiB |
+| B70, int8 (`--opt-int8 1`) | 88.8 s | 42.7 s · 35.2 frames/s | 42.2 s | 3.8 s | 12.3 / 15.4 GiB |
+| B65, half | 154.8 s | 89.1 s · 16.8 frames/s | 60.7 s · 0.14 s/step | 4.8 s | the same |
+| B65, int8 | 136.2 s | 70.5 s · 21.3 frames/s | 60.7 s | 4.8 s | the same |
+
+Real time is 25 frames a second: the B70 composes faster than real time in int8. The language model's frame reads
+all of its weights and, seven times, the depth decoder's (14 GB and 8 GB a frame in half) - ~78% of the B70's
+memory bandwidth. A load takes 6 s with the files in the page cache (20 s from the disk). Running the flow stage
+beside the frames on a second queue of the same card was tried: the card takes the two in turns (114.5 s, not less).
 
 ## Speed by model
 
