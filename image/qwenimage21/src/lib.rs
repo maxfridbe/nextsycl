@@ -27,7 +27,7 @@ use std::time::Instant;
 use nextsycl_core::{DevBuf, Gpu};
 use nextsycl_diffusion::kernels::Nsd;
 use nextsycl_gguf::Gguf;
-use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, LoraUse, ModelFiles, Picture, Result, Sampler, Schedule, Step};
+use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, Picture, Result, Sampler, Schedule, Step};
 use nextsycl_qwen3vl::TextEncoder;
 
 pub const ARCH: &str = "qwen-image-2.1";
@@ -60,11 +60,20 @@ pub fn kind() -> ImageKind {
 
 fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn ImageEngine>> {
     let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?;
-    Ok(Box::new(QwenImage21::load(files, gpu, &o.merge_loras, log)?))
+    Ok(Box::new(QwenImage21::load(files, gpu, o, log)?))
+}
+
+/// A few-step model's (or LoRA's) sigma preset: `NS_QI_SIGMAS` (its nodes, from 1 down; 0 is appended) and
+/// `NS_QI_SIGMA_SHIFT` (`dynamic`: the size's exponential shift on them, as diffusers' pipeline does; `none`: as given)
+#[derive(Clone, Debug)]
+pub struct Preset {
+    pub nodes: Vec<f64>,
+    pub dynamic: bool,
 }
 
 pub struct QwenImage21 {
     pub nsd: Nsd,
+    pub preset: Option<Preset>,
     pub te: TextEncoder,
     pub dit: dit::Dit,
     pub vae: vae::Vae,
@@ -99,8 +108,26 @@ pub fn noise(seed: u64, n: usize) -> Vec<f32> {
 }
 
 impl QwenImage21 {
-    /// The model on `gpu`, `loras` merged into its DiT
-    pub fn load(files: &ModelFiles, gpu: &Arc<Gpu>, loras: &[LoraUse], log: &mut dyn FnMut(String)) -> Result<QwenImage21> {
+    /// The model on `gpu`, `o.merge_loras` merged into its DiT, its settings from `o` (`NS_QI_INT8`, the sigma preset)
+    pub fn load(files: &ModelFiles, gpu: &Arc<Gpu>, o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<QwenImage21> {
+        let loras = &o.merge_loras;
+        let preset = match o.setting("NS_QI_SIGMAS") {
+            Some(v) => {
+                let nodes: Vec<f64> = v.split(',').map(|x| x.trim().parse::<f64>()).collect::<std::result::Result<_, _>>()
+                    .map_err(|_| Error(format!("NS_QI_SIGMAS={v}: numbers from 1 down, comma separated")))?;
+                if nodes.is_empty() || nodes.windows(2).any(|w| w[0] <= w[1]) || nodes[0] > 1.0 || *nodes.last().unwrap() <= 0.0 {
+                    return Err(Error(format!("NS_QI_SIGMAS={v}: numbers from 1 down, comma separated")));
+                }
+                let dynamic = match o.setting("NS_QI_SIGMA_SHIFT").as_deref() {
+                    None | Some("dynamic") => true,
+                    Some("none") => false,
+                    Some(x) => return Err(Error(format!("NS_QI_SIGMA_SHIFT={x}: dynamic or none"))),
+                };
+                log(format!("sigmas: a {}-step preset {v} ({})", nodes.len(), if dynamic { "the size's shift" } else { "as given" }));
+                Some(Preset { nodes, dynamic })
+            }
+            None => None,
+        };
         let t0 = Instant::now();
         nextsycl_core::use_kind("image");
         // the xe driver has no out-of-memory error - an allocation past the card spills to host RAM and can take the
@@ -108,7 +135,7 @@ impl QwenImage21 {
         // activations of a 1024 x 1024 picture, 1.5 GiB kept free
         let f = Gguf::open(role(files, "transformer")?).map_err(|e| Error(e.0))?;
         let size = |r: &str| -> Result<u64> { std::fs::metadata(role(files, r)?).map(|m| m.len()).map_err(|e| Error(format!("{r}: {e}"))) };
-        let int8 = std::env::var("NS_QI_INT8").is_ok_and(|v| v == "1");
+        let int8 = o.setting("NS_QI_INT8").is_some_and(|v| v == "1");
         let dit_b: u64 = f.tensors.iter().map(|t| t.elements() * if int8 { 1 } else { 2 }).sum();
         let need = dit_b + size("text-encoder")? + size("vae")? + (5u64 << 30);
         let (total, free) = gpu.memory()?;
@@ -126,7 +153,7 @@ impl QwenImage21 {
         }
         let dit = dit::Dit::load(&f, &nsd, int8, &deltas, log)?;
         let vae = vae::Vae::load(role(files, "vae")?, &nsd, (LATENT_MEAN.to_vec(), LATENT_STD.to_vec()), log)?;
-        Ok(QwenImage21 { nsd, te, dit, vae, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64() })
+        Ok(QwenImage21 { nsd, preset, te, dit, vae, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64() })
     }
 
     /// The prompt's tokens (the whole chat turn) and how many lead the turn (the system's, dropped)
@@ -173,10 +200,21 @@ impl ImageEngine for QwenImage21 {
         ARCH
     }
     fn defaults(&self) -> Defaults {
-        Defaults { width: 1024, height: 1024, steps: 40, cfg: 1.0, sampler: Sampler::Euler, schedule: Schedule::Shift, shift: 0.0 }
+        let steps = self.preset.as_ref().map_or(40, |p| p.nodes.len() as u32);
+        Defaults { width: 1024, height: 1024, steps, cfg: 1.0, sampler: Sampler::Euler, schedule: Schedule::Shift, shift: 0.0 }
     }
     fn load_seconds(&self) -> f64 {
         self.load_s
+    }
+    fn samplers(&self) -> Vec<Sampler> {
+        vec![Sampler::Euler]
+    }
+    fn schedules(&self) -> Vec<Schedule> {
+        vec![Schedule::Shift]
+    }
+    /// distilled to run without it
+    fn guidance(&self) -> bool {
+        false
     }
     fn generate(&self, req: &ImageRequest, progress: &mut dyn FnMut(Step)) -> Result<Vec<Picture>> {
         let d = self.defaults();
@@ -199,7 +237,14 @@ impl ImageEngine for QwenImage21 {
         }
         let steps = req.steps.unwrap_or(d.steps) as usize;
         let hw = (h / 16, w / 16);
-        let sig = sched::sigmas(steps, hw.0 * hw.1);
+        let sig = match &self.preset {
+            Some(p) if steps == p.nodes.len() => sched::preset(&p.nodes, hw.0 * hw.1, p.dynamic),
+            Some(p) => {
+                return Err(Error(format!("this model runs its own {} sigmas (a few-step distill): {steps} steps is not one of its schedules",
+                                         p.nodes.len())))
+            }
+            None => sched::sigmas(steps, hw.0 * hw.1),
+        };
         let (embeds, tokens) = self.encode(&req.prompt)?;
         progress(Step { picture: 0, at: 0, of: steps as u32, seconds: t0.elapsed().as_secs_f64() });
         let mut out = Vec::new();

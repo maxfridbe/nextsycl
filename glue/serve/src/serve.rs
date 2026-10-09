@@ -202,7 +202,7 @@ enum Api {
 }
 
 /// The CORS header lines for a request from `origin`, when that origin may call
-fn cors_headers(origin: Option<&str>, allowed: &[String]) -> String {
+pub(crate) fn cors_headers(origin: Option<&str>, allowed: &[String]) -> String {
     let Some(o) = origin else { return String::new() };
     let loopback = ["http://localhost", "http://127.0.0.1", "http://[::1]"].iter()
         .any(|h| o == *h || o.strip_prefix(h).is_some_and(|rest| rest.starts_with(':')));

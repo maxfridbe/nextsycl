@@ -88,6 +88,8 @@ pub struct Request {
     pub path: String,
     /// the Origin header (a browser's request)
     pub origin: Option<String>,
+    /// the Host header (for absolute links in an answer)
+    pub host: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -102,6 +104,7 @@ pub fn read_request(stream: impl Read) -> Result<Request, String> {
     let path = target.split('?').next().unwrap_or("/").to_string();
     let mut length = 0usize;
     let mut origin = None;
+    let mut host = None;
     loop {
         let mut h = String::new();
         let n = r.read_line(&mut h).map_err(|e| e.to_string())?;
@@ -113,6 +116,8 @@ pub fn read_request(stream: impl Read) -> Result<Request, String> {
                 length = v.trim().parse().map_err(|_| "bad Content-Length")?;
             } else if k.trim().eq_ignore_ascii_case("origin") {
                 origin = Some(v.trim().to_string());
+            } else if k.trim().eq_ignore_ascii_case("host") {
+                host = Some(v.trim().to_string());
             }
         }
     }
@@ -121,7 +126,7 @@ pub fn read_request(stream: impl Read) -> Result<Request, String> {
     }
     let mut body = vec![0u8; length];
     r.read_exact(&mut body).map_err(|e| e.to_string())?;
-    Ok(Request { method, path, origin, body })
+    Ok(Request { method, path, origin, host, body })
 }
 
 fn reason(status: u16) -> &'static str {
@@ -134,6 +139,28 @@ fn reason(status: u16) -> &'static str {
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     }
+}
+
+/// An answer of raw bytes (a picture, a page)
+pub fn respond_bytes(mut w: impl Write, status: u16, content_type: &str, body: &[u8], headers: &str) {
+    let _ = write!(w, "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n",
+                   reason(status), body.len());
+    let _ = w.write_all(body);
+    let _ = w.flush();
+}
+
+/// Standard base64 (with padding)
+pub fn base64(b: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(b.len().div_ceil(3) * 4);
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        s.push(T[(n >> 18) as usize & 63] as char);
+        s.push(T[(n >> 12) as usize & 63] as char);
+        s.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        s.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    s
 }
 
 pub fn respond(w: impl Write, status: u16, body: &Value) {

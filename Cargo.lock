@@ -306,6 +306,7 @@ name = "nextsycl-serve"
 version = "0.0.0"
 dependencies = [
  "nextsycl-core",
+ "nextsycl-image",
  "nextsycl-llm",
  "nextsycl-tok",
  "serde_json",

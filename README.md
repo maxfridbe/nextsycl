@@ -198,8 +198,46 @@ into the DiT's matrices at load (PEFT, kohya and diffusers files; ~0.4 s, nothin
 named in the PNG. Checked against the reference with the same LoRA merged in PyTorch: the latents after 20 steps
 8.4e-4 off (without the LoRA, 3.3e-3).
 
-`gen` runs the engine in-process for now (the server path, `image serve | start | ps`, comes next); the PNG keeps the
+Few-step models: `qwen-image-2.1-turbo-q8` (Viggle's v0.3 distill merged into the transformer: 6 steps) and the
+LoRAs `qwen-image-2.1-turbo-lora`, `qwen-image-2.1-pruna-8step-lora`, `-5step-lora` each bring their own sigmas
+(`NS_QI_SIGMAS`, `NS_QI_SIGMA_SHIFT` in their registry settings). All checked against the reference run with the
+same files and schedules: turbo 6 steps 2.9e-3, Pruna 8 steps 2.2e-3, their images at most 2 / 4 of 255 off.
+On the B70 a turbo picture takes 3.2 s: 1024x768 in half, 1024x1024 with `NS_QI_INT8=1` (6 steps, the prompt and the VAE included).
+
+`gen` runs the engine in-process (the server path, `image serve | start | ps`, comes next); the PNG keeps the
 prompt, model, seed, size and steps. `check` compares each stage with the dumps of `reference/qwenimage21/ref.py`.
+
+### The image server and its web front end
+
+```sh
+nextsycl image serve qwen-image-2.1-q8 [--wfe] [--port 8086] [--host 0.0.0.0] [--gpu N] [--lora NAME[:SCALE]]...
+                     [--set NAME=VALUE]... [--out DIR] [--cors ORIGIN]
+```
+
+From the host it runs the build image as container `nextsycl-image` (the GPU, `dist/`, the registry, the model's and
+its LoRAs' files read-only, the output directory - default `~/.local/share/nextsycl/images` - writable) and serves:
+
+- `POST /v1/images/generations` - OpenAI's images API: `prompt`, `n`, `size`, `response_format` (`b64_json` or `url`),
+  `background: "transparent"` (RGBA); and ours: `steps`, `seed`, `sampler`, `schedule`, `shift`, `cfg`,
+  `negative_prompt`, `loras` (`["name:scale"]` or `[{name, scale}]` - another set reloads the model with them
+  merged, ~4 s; a few-step LoRA brings its own sigmas and steps). The answer's `nextsycl` field has the seconds, steps,
+  seed, LoRAs and the card's energy (Wh). Every picture is saved with its settings in the PNG.
+- `GET /v1/models`, `/health`, `/v1/images/files/<f>`, `/api/info` (the model, its defaults, samplers, schedules,
+  LoRAs), `/api/progress`, `/api/history`, `/api/gpu`.
+- `--wfe`: the web front end at `/` (`wfe/image`, built into `dist/wfe` by `./build.sh wfe`): H3's scheme - TSX on
+  vendored snabbdom, compiled offline by the vendored TypeScript, one state object, panels, H3's stylesheet - with
+  every option of a request, live progress (step, s/step, time left), the card's power, VRAM and temperatures, and
+  the pictures made (an earlier session's too, read back from the PNGs). `node wfe/check.mjs` smoke-tests a running
+  one (every module parses, the page renders headlessly).
+
+Screenshots for a quick look when debugging the page (`docs/screenshots/shoot.py image http://localhost:8086
+docs/screenshots` retakes them):
+
+| Idle | Running | Done |
+|---|---|---|
+| ![idle](docs/screenshots/image-wfe-idle.webp) | ![running](docs/screenshots/image-wfe-running.webp) | ![done](docs/screenshots/image-wfe-done.webp) |
+
+<img src="docs/screenshots/image-wfe-phone.webp" width="260" alt="the page at phone width">
 
 | Qwen-Image 2.1 Q8_0, one card | load | 512x512, 20 steps | 1024x1024, 40 steps |
 |---|---|---|---|

@@ -120,6 +120,30 @@
    "size": 11422654,
    "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
    "path": "qwen-image-2.1/tokenizer/tokenizer.json"
+  },
+  "qwen-image-21-turbo-q80": {
+   "url": "https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo/resolve/009a44a895ef85f7e643c80fdca9543795248867/Qwen-Image-2.1-viggle-turbo-v0.3-6step-Q8_0.gguf",
+   "size": 7687180448,
+   "sha256": "f3aaa3a00da202b1295bb2cb8dae0b15172c1e26aaeb805cdc1e4755bd94d64f",
+   "path": "qwen-image-2.1/diffusion_models/Qwen-Image-2.1-viggle-turbo-v0.3-6step-Q8_0.gguf"
+  },
+  "qwen-image-21-turbo-lora": {
+   "url": "https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo/resolve/009a44a895ef85f7e643c80fdca9543795248867/Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r128.safetensors",
+   "size": 679604800,
+   "sha256": "0c98591700346f9777051d4e6fa29aa94519abec0d85b1f1f672a2a3db8c94b3",
+   "path": "qwen-image-2.1/loras/Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r128.safetensors"
+  },
+  "qwen-image-21-pruna-8step": {
+   "url": "https://huggingface.co/PrunaAI/Pruna-Qwen-Image-2.1/resolve/113e63bb993001b3411eb3470b84fc444040cd7e/p_qwen_image_2.1_8step_v0.1.safetensors",
+   "size": 335606104,
+   "sha256": "f0865d68b02511a3a0ed232d9d1aa99cac3a94166f574b38bcbab1a7a297bb15",
+   "path": "qwen-image-2.1/loras/p_qwen_image_2.1_8step_v0.1.safetensors"
+  },
+  "qwen-image-21-pruna-5step": {
+   "url": "https://huggingface.co/PrunaAI/Pruna-Qwen-Image-2.1/resolve/113e63bb993001b3411eb3470b84fc444040cd7e/p_qwen_image_2.1_5step_v0.1.safetensors",
+   "size": 335606144,
+   "sha256": "021a6228a0fcd217275190b89072416a2f28548e8e18fe049531dc9b77ef89bd",
+   "path": "qwen-image-2.1/loras/p_qwen_image_2.1_5step_v0.1.safetensors"
   }
  },
  "models": [
@@ -257,7 +281,7 @@
    "id": "glm-5.3-flash-uncensored",
    "kind": "llm",
    "arch": "glm5-next",
-   "title": "GLM-5.3-Flash uncensored IQ2 \u00b7 64K context (both GPUs)",
+   "title": "GLM-5.3-Flash uncensored IQ2 · 64K context (both GPUs)",
    "about": "GLM-5.3-Flash uncensored, IQ2 imatrix with its MTP block (ds4 layout)",
    "files": {
     "model": "glm53-iq2-ds4"
@@ -272,7 +296,7 @@
    "id": "glm-5.3-flash-uncensored-128k",
    "kind": "llm",
    "arch": "glm5-next",
-   "title": "GLM-5.3-Flash uncensored IQ2 \u00b7 128K context + a 32K chat (both GPUs)",
+   "title": "GLM-5.3-Flash uncensored IQ2 · 128K context + a 32K chat (both GPUs)",
    "about": "GLM-5.3-Flash uncensored, IQ2 imatrix with its MTP block (ds4 layout)",
    "files": {
     "model": "glm53-iq2-ds4"
@@ -287,7 +311,7 @@
    "id": "glm-5.3-flash-uncensored-256k",
    "kind": "llm",
    "arch": "glm5-next",
-   "title": "GLM-5.3-Flash uncensored IQ2 \u00b7 256K context + a 32K chat (both GPUs)",
+   "title": "GLM-5.3-Flash uncensored IQ2 · 256K context + a 32K chat (both GPUs)",
    "about": "GLM-5.3-Flash uncensored, IQ2 imatrix with its MTP block (ds4 layout)",
    "files": {
     "model": "glm53-iq2-ds4"
@@ -314,6 +338,31 @@
    "env": {},
    "defaults": {
     "steps": 40,
+    "cfg": 1.0,
+    "sampler": "euler",
+    "schedule": "shift",
+    "size": "1024x1024"
+   }
+  },
+  {
+   "id": "qwen-image-2.1-turbo-q8",
+   "kind": "image",
+   "arch": "qwen-image-2.1",
+   "title": "Qwen-Image 2.1 Turbo Q8_0 (Viggle v0.3: 6 steps, no CFG; qwen-research license)",
+   "about": "Viggle's few-step distill merged into the base transformer in fp32, then Q8_0; the base model's text encoder and VAE; its 6 sigmas with the size's shift, no terminal stretch",
+   "files": {
+    "transformer": "qwen-image-21-turbo-q80",
+    "text-encoder": "qwen-image-21-te-int8",
+    "vae": "qwen-image-21-vae",
+    "tokenizer": "qwen-image-21-tokenizer"
+   },
+   "gpus": "0",
+   "env": {
+    "NS_QI_SIGMAS": "1,0.9375,0.875,0.75,0.5,0.25",
+    "NS_QI_SIGMA_SHIFT": "dynamic"
+   },
+   "defaults": {
+    "steps": 6,
     "cfg": 1.0,
     "sampler": "euler",
     "schedule": "shift",
@@ -419,6 +468,51 @@
     "lora": "qwen-image-21-uncensored-lora"
    },
    "env": {}
+  },
+  {
+   "id": "qwen-image-2.1-turbo-lora",
+   "kind": "lora",
+   "arch": "qwen-image-2.1",
+   "base": "qwen-image-2.1",
+   "title": "Qwen-Image 2.1 Turbo (Viggle v0.3, a 6-step LoRA, rank 128; qwen-research license)",
+   "about": "the few-step distill as a LoRA for the base model at scale 1.0; brings its 6-sigma preset",
+   "files": {
+    "lora": "qwen-image-21-turbo-lora"
+   },
+   "env": {
+    "NS_QI_SIGMAS": "1,0.9375,0.875,0.75,0.5,0.25",
+    "NS_QI_SIGMA_SHIFT": "dynamic"
+   }
+  },
+  {
+   "id": "qwen-image-2.1-pruna-8step-lora",
+   "kind": "lora",
+   "arch": "qwen-image-2.1",
+   "base": "qwen-image-2.1",
+   "title": "Qwen-Image 2.1 Pruna 8-step (a LoRA, v0.1; qwen-research license)",
+   "about": "Pruna's DMD few-step LoRA at scale 1.0, trained at 1K; brings its 8 sigmas, used as given (no shift)",
+   "files": {
+    "lora": "qwen-image-21-pruna-8step"
+   },
+   "env": {
+    "NS_QI_SIGMAS": "1,0.9333333,0.8571429,0.7692308,0.6666667,0.5454545,0.4,0.2222222",
+    "NS_QI_SIGMA_SHIFT": "none"
+   }
+  },
+  {
+   "id": "qwen-image-2.1-pruna-5step-lora",
+   "kind": "lora",
+   "arch": "qwen-image-2.1",
+   "base": "qwen-image-2.1",
+   "title": "Qwen-Image 2.1 Pruna 5-step (a LoRA, v0.1, faster, rougher; qwen-research license)",
+   "about": "Pruna's DMD few-step LoRA at scale 1.0, trained at 1K; brings its 5 sigmas, used as given (no shift)",
+   "files": {
+    "lora": "qwen-image-21-pruna-5step"
+   },
+   "env": {
+    "NS_QI_SIGMAS": "1,0.94,0.8571429,0.6666667,0.4",
+    "NS_QI_SIGMA_SHIFT": "none"
+   }
   }
  ]
 }

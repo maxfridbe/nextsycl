@@ -5,6 +5,7 @@ every stage the engine is checked against.
     python ref.py dit  --dit <transformer .gguf> --cfg DIR --out DIR --size 512 --steps 4 --seed 7
     python ref.py vae  --vae <vae .safetensors> --cfg DIR --out DIR
     python ref.py dit  ... --lora <LoRA .safetensors> [--lora-scale X]   (the LoRA merged into the DiT first)
+    python ref.py dit  ... --steps 6 --sigmas 1,0.9375,0.875,0.75,0.5,0.25 [--sigma-shift dynamic|none]   (a few-step preset)
 
 The stages run one at a time (each frees its weights) and talk through DIR:
   te:  tokens.json (ids, the image-pad mask), embeds.npy [S, 4096] - the last layer's hidden state before the final
@@ -126,6 +127,15 @@ def load_gguf_into(model, path):
     params = dict(model.named_parameters())
     seen = set()
     for t in GGUFReader(path).tensors:
+        if t.name.endswith(".img_mlp.gate_up.weight"):
+            # a fused gate | up (Viggle's turbo files): gate_layer's rows, then proj's
+            arr = np.asarray(dequantize(t.data, t.tensor_type), dtype=np.float32)
+            base = t.name[: -len("gate_up.weight")]
+            g, u = params[base + "gate_layer.weight"], params[base + "proj.weight"]
+            g.data.copy_(torch.from_numpy(arr[: g.shape[0]].reshape(g.shape)))
+            u.data.copy_(torch.from_numpy(arr[g.shape[0]:].reshape(u.shape)))
+            seen.update([base + "gate_layer.weight", base + "proj.weight"])
+            continue
         if t.name not in params:
             sys.exit(f"dit: {t.name} is not a parameter of the model")
         arr = np.asarray(dequantize(t.data, t.tensor_type), dtype=np.float32)
@@ -188,6 +198,12 @@ def run_dit(a):
     np.save(os.path.join(a.out, "noise.npy"), lat[0].numpy())
     sched = FlowMatchEulerDiscreteScheduler.from_config(FlowMatchEulerDiscreteScheduler.load_config(os.path.join(a.cfg, "scheduler")))
     sig = np.linspace(1.0, 1 / a.steps, a.steps)
+    if a.sigmas:
+        # a few-step model's own nodes: with the size's shift and no terminal stretch (Viggle's turbo scheduler) or
+        # used as given (Pruna's: no dynamic shifting, shift 1)
+        sig = np.array([float(x) for x in a.sigmas.split(",")])
+        over = {"shift_terminal": None} if a.sigma_shift == "dynamic" else {"use_dynamic_shifting": False, "shift": 1.0, "shift_terminal": None}
+        sched = FlowMatchEulerDiscreteScheduler.from_config({**sched.config, **over})
     mu = calculate_shift(n, sched.config.get("base_image_seq_len", 256), sched.config.get("max_image_seq_len", 4096),
                          sched.config.get("base_shift", 0.5), sched.config.get("max_shift", 1.15))
     timesteps, _ = retrieve_timesteps(sched, a.steps, "cpu", sigmas=sig, mu=mu)
@@ -298,6 +314,8 @@ if __name__ == "__main__":
     ap.add_argument("--out", required=True); ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--steps", type=int, default=4); ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--lora"); ap.add_argument("--lora-scale", type=float, default=1.0)
+    ap.add_argument("--sigmas", help="a few-step model's nodes, comma separated (--steps must match)")
+    ap.add_argument("--sigma-shift", choices=["dynamic", "none"], default="dynamic")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     {"te": run_te, "dit": run_dit, "vae": run_vae}[a.stage](a)

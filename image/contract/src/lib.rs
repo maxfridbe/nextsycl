@@ -79,6 +79,16 @@ pub type ModelFiles = BTreeMap<String, PathBuf>;
 pub struct LoadOptions {
     /// LoRAs merged into the weights at load (a preset's)
     pub merge_loras: Vec<LoraUse>,
+    /// settings by name (a registry entry's and its LoRAs' `env`): what the process environment would hold when the
+    /// engine is served; an engine reads a setting here first, then from the environment
+    pub settings: BTreeMap<String, String>,
+}
+
+impl LoadOptions {
+    /// A setting: from `settings`, else the environment
+    pub fn setting(&self, name: &str) -> Option<String> {
+        self.settings.get(name).cloned().or_else(|| std::env::var(name).ok())
+    }
 }
 
 /// The runtime one image architecture brings
@@ -89,6 +99,18 @@ pub trait ImageEngine: Send + Sync {
     /// whether it takes `ImageRequest::edit`
     fn edits(&self) -> bool {
         false
+    }
+    /// the samplers it runs (a request naming another is refused)
+    fn samplers(&self) -> Vec<Sampler> {
+        Sampler::ALL.to_vec()
+    }
+    /// the schedules it runs
+    fn schedules(&self) -> Vec<Schedule> {
+        Schedule::ALL.to_vec()
+    }
+    /// whether it takes guidance (cfg above 1, a negative prompt)
+    fn guidance(&self) -> bool {
+        true
     }
     /// seconds the load took
     fn load_seconds(&self) -> f64;

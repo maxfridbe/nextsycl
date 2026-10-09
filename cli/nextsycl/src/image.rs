@@ -9,7 +9,9 @@ use nextsycl_models::{config::Config, registry as models};
 use serde_json::Value;
 
 const USAGE: &str = "nextsycl image gen \"<prompt>\" [--model ID] [--size WxH | --aspect W:H] [--steps N] [--seed N] [--n N] [--sampler S]
-                   [--schedule S] [--lora NAME[:SCALE]]... [--out FILE|DIR] [--rgba] [--local] [--gpu N]
+                   [--schedule S] [--lora NAME[:SCALE]]... [--set NAME=VALUE]... [--out FILE|DIR] [--rgba] [--local] [--gpu N]
+nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora NAME[:SCALE]]... [--set NAME=VALUE]...
+                     [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl image check <dump dir> [--model ID] [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--gpu N]
 nextsycl image engines | selftest [--gpu N]";
 
@@ -36,6 +38,34 @@ fn model(cfg: &Config, id: Option<&str>) -> Result<(Value, ModelFiles), String> 
     Ok((m, files))
 }
 
+/// The load options: every `--lora` and the settings of the model's registry entry and of those LoRAs' entries (a
+/// few-step LoRA brings its sigma preset), then `--set NAME=VALUE`s
+fn options(cfg: &Config, m: &Value, args: &[String]) -> Result<nextsycl_image::LoadOptions, String> {
+    let merge_loras = loras(cfg, args)?;
+    let all = models::all(cfg)?;
+    let mut settings = std::collections::BTreeMap::new();
+    let mut take = |e: &Value| {
+        for (k, v) in e["env"].as_object().into_iter().flatten() {
+            if let Some(v) = v.as_str() {
+                settings.insert(k.clone(), v.to_string());
+            }
+        }
+    };
+    take(m);
+    for l in &merge_loras {
+        if let Some(e) = all.iter().find(|e| e["id"] == l.name.as_str()) {
+            take(e);
+        }
+    }
+    for (i, a) in args.iter().enumerate() {
+        if a == "--set" {
+            let (k, v) = args.get(i + 1).and_then(|x| x.split_once('=')).ok_or("--set NAME=VALUE")?;
+            settings.insert(k.to_string(), v.to_string());
+        }
+    }
+    Ok(nextsycl_image::LoadOptions { merge_loras, settings })
+}
+
 /// Every `--lora NAME[:SCALE]`: a registered LoRA's id or a file
 fn loras(cfg: &Config, args: &[String]) -> Result<Vec<LoraUse>, String> {
     let all = models::all(cfg)?;
@@ -60,7 +90,7 @@ fn load(cfg: &Config, args: &[String]) -> Result<(Value, Box<dyn nextsycl_image:
     let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
     let gpu = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
     let mut log = |s: String| eprintln!("{s}");
-    let o = nextsycl_image::LoadOptions { merge_loras: loras(cfg, args)? };
+    let o = options(cfg, &m, args)?;
     let e = (k.load)(&files, &[gpu], &o, &mut log).map_err(|e| e.0)?;
     Ok((m, e))
 }
@@ -149,10 +179,138 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
     let gpu: Arc<nextsycl_core::Gpu> = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
     let mut log = |s: String| eprintln!("{s}");
-    let e = nextsycl_image_qwenimage21::QwenImage21::load(&files, &gpu, &loras(cfg, args)?, &mut log).map_err(|e| e.0)?;
+    let e = nextsycl_image_qwenimage21::QwenImage21::load(&files, &gpu, &options(cfg, &m, args)?, &mut log).map_err(|e| e.0)?;
     let worst = nextsycl_image_qwenimage21::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?;
     println!("worst relative error {worst:.2e}");
     Ok(())
+}
+
+/// The LoRAs registered for the model's architecture
+fn loras_for(cfg: &Config, m: &Value) -> Result<Vec<Value>, String> {
+    Ok(models::all(cfg)?.into_iter().filter(|e| models::kind_of(e) == "lora" && e["arch"] == m["arch"] && e["enabled"] != false).collect())
+}
+
+/// Where pictures go: --out, NS_IMAGE_OUT, ~/.local/share/nextsycl/images
+fn out_dir(cfg: &Config, args: &[String]) -> PathBuf {
+    opt(args, "--out").map(PathBuf::from).or_else(|| cfg.get("NS_IMAGE_OUT").map(PathBuf::from)).unwrap_or_else(|| {
+        PathBuf::from(format!("{}/.local/share/nextsycl/images", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())))
+    })
+}
+
+/// `nextsycl image serve`: from the host, the build image as container `nextsycl-image` (the GPU, the program and its
+/// libraries, the registry, the model's and its LoRAs' files read-only, the output directory) running this command
+/// inside with `--here`; there, the engine loaded and served (nextsycl_serve::image)
+fn serve(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let id = args.first().filter(|a| !a.starts_with("--")).map(String::as_str).or_else(|| opt(args, "--model"));
+    let (m, files) = model(cfg, id)?;
+    let model_id = m["id"].as_str().unwrap_or("image").to_string();
+    let out = out_dir(cfg, args);
+    if args.iter().any(|a| a == "--here") {
+        return serve_here(cfg, &m, files, args, out);
+    }
+    use crate::container::{mount, Ce};
+    let ce = Ce::new(cfg)?;
+    ce.need_image()?;
+    for f in ["nextsycl", "libnextsycl-image.so"] {
+        if !cfg.dist.join(f).exists() {
+            return Err(format!("{}: not built yet (./build.sh)", cfg.dist.join(f).display()));
+        }
+    }
+    if args.iter().any(|a| a == "--wfe") && !cfg.dist.join("wfe/image/index.html").exists() {
+        return Err(format!("{}: the web front end is not built yet (./build.sh wfe)", cfg.dist.join("wfe").display()));
+    }
+    std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    const NAME: &str = "nextsycl-image";
+    if ce.running(NAME) {
+        return Err(format!("{NAME} is running already ({} stop {NAME})", ce.bin));
+    }
+    ce.remove(NAME);
+    // --init: the server is not PID 1, so a stop's SIGTERM ends it (PID 1 ignores signals it does not handle)
+    let mut a: Vec<String> = vec!["run".into(), "--rm".into(), "--init".into(), "--name".into(), NAME.into(), "--network".into(), "host".into(),
+                                  "--stop-timeout".into(), "120".into()];
+    a.extend(ce.user_args());
+    a.extend(ce.gpu_args());
+    a.extend(mount(&cfg.dist, "/app", true));
+    let reg = models::registry(cfg);
+    let mut dirs = std::collections::BTreeSet::new();
+    let mut paths = models::paths(&m);
+    for l in loras_for(cfg, &m)? {
+        paths.extend(models::paths(&l));
+    }
+    paths.push(reg.clone());
+    for p in paths {
+        let d = if p.is_dir() { p } else { p.parent().map(PathBuf::from).unwrap_or_default() };
+        if !d.as_os_str().is_empty() && d.exists() && dirs.insert(d.clone()) {
+            a.extend(mount(&d, &d.to_string_lossy(), true));
+        }
+    }
+    a.extend(mount(&out, &out.to_string_lossy(), false));
+    a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
+    // the engines' own settings from the configuration (NS_QI_INT8=1 ...)
+    for (k, v) in cfg.with_prefix("NS_QI_").into_iter().chain(cfg.with_prefix("NSD_")) {
+        a.extend(["-e".into(), format!("{k}={v}")]);
+    }
+    a.extend([ce.image.clone(), "bash".into(), "-c".into(),
+              "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; exec /app/nextsycl image serve \"$@\"".into(), "nextsycl".into()]);
+    a.push(model_id);
+    let mut it = args.iter().skip(if id.is_some() && !args.first().is_some_and(|x| x.starts_with("--")) { 1 } else { 0 });
+    while let Some(x) = it.next() {
+        if x == "--out" || x == "--model" {
+            it.next();
+            continue;
+        }
+        a.push(x.clone());
+    }
+    a.extend(["--out".into(), out.to_string_lossy().into_owned(), "--here".into()]);
+    let st = ce.cmd().args(&a).status().map_err(|e| e.to_string())?;
+    if st.success() { Ok(()) } else { Err(format!("the image server ended ({st})")) }
+}
+
+fn serve_here(cfg: &Config, m: &Value, files: ModelFiles, args: &[String], out: PathBuf) -> Result<(), String> {
+    use nextsycl_serve::image::{ImageServer, KnownLora};
+    nextsycl_core::use_kind("image");
+    let arch = m["arch"].as_str().unwrap_or("").to_string();
+    let ks = engines();
+    let load_fn = nextsycl_image::kind_for(&ks, &arch)?.load;
+    let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let gpu = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
+    let first = options(cfg, m, args)?;
+    let loras = loras_for(cfg, m)?;
+    let known: Vec<KnownLora> = loras.iter().filter_map(|l| Some(KnownLora {
+        id: l["id"].as_str()?.to_string(), path: PathBuf::from(l["file"].as_str()?), title: l["title"].as_str().unwrap_or("").to_string(),
+    })).collect();
+    // the settings without any LoRA's: a reload adds those of the LoRAs it merges
+    let mut base = first.clone();
+    base.merge_loras.clear();
+    let lora_env: Vec<(String, Vec<(String, String)>)> = loras.iter().map(|l| (
+        l["id"].as_str().unwrap_or("").to_string(),
+        l["env"].as_object().into_iter().flatten().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect(),
+    )).collect();
+    for (id, env) in &lora_env {
+        if first.merge_loras.iter().all(|u| &u.name != id) {
+            for (k, _) in env {
+                if !m["env"].get(k.as_str()).is_some() && !args.iter().any(|a| a.starts_with(&format!("{k}="))) {
+                    base.settings.remove(k);
+                }
+            }
+        }
+    }
+    let g = gpu.clone();
+    let loader: nextsycl_serve::image::Loader = Box::new(move |use_: &[LoraUse], log: &mut dyn FnMut(String)| {
+        let mut o = base.clone();
+        o.merge_loras = use_.to_vec();
+        for u in use_ {
+            if let Some((_, env)) = lora_env.iter().find(|(id, _)| *id == u.name) {
+                o.settings.extend(env.iter().cloned());
+            }
+        }
+        load_fn(&files, std::slice::from_ref(&g), &o, log).map_err(|e| e.0)
+    });
+    let wfe = args.iter().any(|a| a == "--wfe").then(|| cfg.dist.join("wfe"));
+    let cors: Vec<String> = opt(args, "--cors").or(cfg.get("NS_CORS").as_deref()).map(|c| c.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default();
+    let addr = format!("{}:{}", opt(args, "--host").unwrap_or("127.0.0.1"), opt(args, "--port").unwrap_or("8086"));
+    let srv = ImageServer::new(m["id"].as_str().unwrap_or("image").to_string(), gpu, loader, first.merge_loras, known, Some(out), wfe, cors)?;
+    std::sync::Arc::new(srv).run(&addr)
 }
 
 /// `nextsycl image <command>`
@@ -166,6 +324,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("selftest") => selftest(rest),
         Some("gen") => gen(cfg, rest),
         Some("check") => check(cfg, rest),
+        Some("serve") => serve(cfg, rest),
         _ => Err(USAGE.into()),
     }
 }

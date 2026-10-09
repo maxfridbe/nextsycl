@@ -4,3 +4,4 @@ __pycache__/
 nextsycl.conf
 dist/
 benchy-results/
+wfe/build/

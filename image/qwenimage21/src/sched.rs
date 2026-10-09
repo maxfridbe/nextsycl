@@ -24,6 +24,15 @@ pub fn sigmas(steps: usize, tokens: usize) -> Vec<f32> {
     out
 }
 
+/// A few-step model's own nodes (`nodes`, from 1 down), then 0: with the image size's exponential shift
+/// (`dynamic`, as diffusers' pipeline applies it to `sigmas=` - Viggle's turbo) or exactly as given (Pruna's)
+pub fn preset(nodes: &[f64], tokens: usize, dynamic: bool) -> Vec<f32> {
+    let e = mu(tokens).exp();
+    let mut out: Vec<f32> = nodes.iter().map(|&t| if dynamic { e / (e + (1.0 / t - 1.0)) } else { t } as f32).collect();
+    out.push(0.0);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -33,5 +42,14 @@ mod tests {
         assert!((s[19] - 0.02).abs() < 1e-6);
         assert_eq!(s[20], 0.0);
         assert!(s.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    fn a_preset_keeps_its_nodes_or_shifts_them() {
+        let n = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25];
+        assert_eq!(super::preset(&n, 4096, false), vec![1.0, 0.9375, 0.875, 0.75, 0.5, 0.25, 0.0]);
+        let s = super::preset(&n, 4096, true);
+        assert_eq!(s[0], 1.0);
+        assert!(s[5] > 0.25 && s[6] == 0.0, "a large image shifts toward noise: {s:?}");
     }
 }

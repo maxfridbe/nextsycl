@@ -37,17 +37,36 @@ impl Picture {
         Ok(Picture { width: w, height: h, channels, data })
     }
 
+    /// A PNG's tEXt chunks (the settings `write_png` stored), without decoding its pixels
+    pub fn png_text(path: &Path) -> Result<Vec<(String, String)>, String> {
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let r = png::Decoder::new(std::io::BufReader::new(file)).read_info().map_err(|e| format!("{}: {e}", path.display()))?;
+        let info = r.info();
+        Ok(info.uncompressed_latin1_text.iter().map(|t| (t.keyword.clone(), t.text.clone())).collect())
+    }
+
     /// Write as PNG, with `text` as tEXt chunks (the prompt, seed, steps... that made it)
     pub fn write_png(&self, path: &Path, text: &[(&str, String)]) -> Result<(), String> {
         let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), self.width, self.height);
+        self.encode_png(std::io::BufWriter::new(file), text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// The PNG's bytes (as `write_png` writes them)
+    pub fn png_bytes(&self, text: &[(&str, String)]) -> Result<Vec<u8>, String> {
+        let mut v = Vec::new();
+        self.encode_png(&mut v, text)?;
+        Ok(v)
+    }
+
+    fn encode_png(&self, out: impl std::io::Write, text: &[(&str, String)]) -> Result<(), String> {
+        let mut enc = png::Encoder::new(out, self.width, self.height);
         enc.set_color(if self.channels == 4 { png::ColorType::Rgba } else { png::ColorType::Rgb });
         enc.set_depth(png::BitDepth::Eight);
         for (k, v) in text {
             enc.add_text_chunk(k.to_string(), v.clone()).map_err(|e| e.to_string())?;
         }
-        let mut w = enc.write_header().map_err(|e| format!("{}: {e}", path.display()))?;
-        w.write_image_data(&self.data).map_err(|e| format!("{}: {e}", path.display()))
+        let mut w = enc.write_header().map_err(|e| e.to_string())?;
+        w.write_image_data(&self.data).map_err(|e| e.to_string())
     }
 }
 

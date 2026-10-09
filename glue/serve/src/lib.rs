@@ -1,9 +1,10 @@
 //! nextsycl-serve: what turns an engine into a service - an OpenAI-compatible HTTP API (and a control socket) over a
 //! kind's engine contract, the prompt cache, the GPUs' telemetry. It knows engines only through their kind's trait
-//! (`nextsycl_llm::Engine`), never one engine.
+//! (`nextsycl_llm::Engine`, `nextsycl_image::ImageEngine` in `image`), never one engine.
 
 pub mod cache;
 pub mod http;
+pub mod image;
 pub mod serve;
 pub mod telemetry;
 

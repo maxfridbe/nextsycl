@@ -200,7 +200,13 @@ of IQ2_XXS instead could win twice.
 - [x] LoRAs merged at load (nextsycl-diffusion's `lora`: PEFT / kohya / diffusers files; W += s B A on the GPU before
       half or int8; `--lora NAME[:SCALE]`): the uncensored LoRA checked against ref.py `--lora` (20 steps 8.4e-4;
       without it 3.3e-3)
-- [ ] LoRAs per request as a side path (a server keeps one model loaded); Qwen-Image (20B) with the Lightning LoRAs
+- [x] Few-step Qwen-Image 2.1 (its "Lightning"): Viggle's turbo (the merged Q8_0, its fused gate_up, and the LoRA)
+      and Pruna's 8 / 5-step LoRAs, their sigma presets in the catalog; LoRAs into the small linears too (the
+      timestep and modulation ones); checked against the reference (turbo 2.9e-3, Pruna 2.2e-3 after all steps)
+- [x] `nextsycl image serve` (OpenAI images API, files, history, progress, GPU; LoRAs by request = a reload) and
+      `--wfe` (wfe/image: TSX on vendored snabbdom, H3's scheme; README screenshots, docs/screenshots/shoot.py)
+- [ ] LoRAs per request as a side path (no reload); `image start | stop | ps`; the switcher's images route; edits;
+      Qwen-Image (20B) and lightx2v's Lightning LoRAs
 - [ ] H3 into video/ (copied from its committed sycl-port branch): `nextsycl video ...` for all its commands
 
 ## Several models (docs/engines.md, 2026-10-08)

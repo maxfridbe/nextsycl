@@ -161,16 +161,9 @@ impl Dit {
         // a block matrix (one or more stored matrices stacked by rows): its LoRA updates merged in float32 on the GPU
         // (W += B . A; B's rows reordered as the matrix's are), then half, or rotated along its inputs (W . H, a GEMM
         // on the matrix engine) and quantized per row
-        let big = |names: &[&str], perm: &[bool]| -> Result<Mat> {
-            let rows: Vec<usize> = names.iter().map(|nm| tensor(nm).map(|t| t.shape[0] as usize)).collect::<Result<_>>()?;
-            let n: usize = rows.iter().sum();
-            let keys: Vec<String> = names.iter().map(|nm| lora::key(nm.strip_suffix(".weight").unwrap_or(nm))).collect();
-            let has_lora = keys.iter().any(|k| by_key.contains_key(k));
-            if !int8 && !has_lora {
-                return Ok(Mat { w: load_rows(names, perm, Dt::F16)?, scale: None, n });
-            }
-            let w = load_rows(names, perm, Dt::F32)?;
-            let k = w.floats() / n;
+        // the LoRA updates of a float32 matrix [rows stacked, k] in place: W += B . A per part (B's rows reordered as
+        // the part's are)
+        let merge = |w: &DevBuf, keys: &[String], rows: &[usize], perm: &[bool], k: usize| -> Result<()> {
             let mut off = 0;
             for (i, key) in keys.iter().enumerate() {
                 for d in by_key.get(key).into_iter().flatten() {
@@ -193,6 +186,25 @@ impl Dit {
                 }
                 off += rows[i];
             }
+            Ok(())
+        };
+        // `parts`: the matrices a LoRA names, with their rows, when they differ from the stored ones (a fused gate_up
+        // holds gate_layer's rows, then proj's)
+        let big = |names: &[&str], perm: &[bool], parts: Option<&[(&str, usize)]>| -> Result<Mat> {
+            let (keys, rows, perm): (Vec<String>, Vec<usize>, Vec<bool>) = match parts {
+                Some(p) => (p.iter().map(|(nm, _)| lora::key(nm)).collect(), p.iter().map(|(_, r)| *r).collect(), vec![false; p.len()]),
+                None => (names.iter().map(|nm| lora::key(nm.strip_suffix(".weight").unwrap_or(nm))).collect(),
+                         names.iter().map(|nm| tensor(nm).map(|t| t.shape[0] as usize)).collect::<Result<_>>()?, perm.to_vec()),
+            };
+            let n: usize = rows.iter().sum();
+            let has_lora = keys.iter().any(|k| by_key.contains_key(k));
+            let stored_perm: Vec<bool> = if parts.is_some() { vec![false; names.len()] } else { perm.clone() };
+            if !int8 && !has_lora {
+                return Ok(Mat { w: load_rows(names, &stored_perm, Dt::F16)?, scale: None, n });
+            }
+            let w = load_rows(names, &stored_perm, Dt::F32)?;
+            let k = w.floats() / n;
+            merge(&w, &keys, &rows, &perm, k)?;
             if !int8 {
                 let h = DevBuf::new(&gpu, n * k * 2)?;
                 // SAFETY: n x k values each way.
@@ -209,16 +221,28 @@ impl Dit {
             nsd.wait()?;
             Ok(Mat { w: q, scale: Some(scale), n })
         };
-        let single = |name: &str| load_rows(&[name], &[false], Dt::F32);
-        // a vector (norm weights) as float32, permuted like q / k when asked
-        let vector = |name: &str, permute: bool| -> Result<DevBuf> {
+        // a small linear, float32, its LoRA updates merged (a few-step LoRA adapts the timestep and modulation ones)
+        let single = |name: &str| -> Result<DevBuf> {
+            let w = load_rows(&[name], &[false], Dt::F32)?;
+            let rows = tensor(name)?.shape[0] as usize;
+            merge(&w, &[lora::key(name.strip_suffix(".weight").unwrap_or(name))], &[rows], &[false], w.floats() / rows)?;
+            Ok(w)
+        };
+        // a vector (norm weights) as float32 on the host, whatever its stored type (BF16 in the base file, F32 in
+        // Viggle's turbo files)
+        let host_vec = |name: &str| -> Result<Vec<f32>> {
             let t = tensor(name)?;
             let b = f.read(t).map_err(ge)?;
-            let v: Vec<f32> = match t.ty {
+            Ok(match t.ty {
                 GType::BF16 => b.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect(),
                 GType::F32 => b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                GType::F16 => b.chunks_exact(2).map(|c| nextsycl_gguf::safetensors::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
                 other => return Err(Error(format!("{name}: a {} vector", other.name()))),
-            };
+            })
+        };
+        // ... on the GPU, permuted like q / k when asked
+        let vector = |name: &str, permute: bool| -> Result<DevBuf> {
+            let v = host_vec(name)?;
             let v = if permute { (0..v.len()).map(|j| v[rope_perm(j)]).collect() } else { v };
             DevBuf::from_f32(&gpu, &v)
         };
@@ -227,28 +251,23 @@ impl Dit {
         for i in 0..n_blocks {
             let p = format!("transformer_blocks.{i}.");
             blocks.push(Block {
-                qkv: big(&[&format!("{p}attn.to_q.weight"), &format!("{p}attn.to_k.weight"), &format!("{p}attn.to_v.weight")], &[true, true, false])?,
-                out: big(&[&format!("{p}attn.to_out.0.weight")], &[false])?,
-                gp: big(&[&format!("{p}img_mlp.gate_layer.weight"), &format!("{p}img_mlp.proj.weight")], &[false, false])?,
-                down: big(&[&format!("{p}img_mlp.out.weight")], &[false])?,
+                qkv: big(&[&format!("{p}attn.to_q.weight"), &format!("{p}attn.to_k.weight"), &format!("{p}attn.to_v.weight")], &[true, true, false], None)?,
+                out: big(&[&format!("{p}attn.to_out.0.weight")], &[false], None)?,
+                // the MLP's gate and up rows: two matrices, or one fused (`gate_up`, as Viggle's turbo files store them)
+                gp: if f.tensor(&format!("{p}img_mlp.gate_up.weight")).is_some() {
+                    let (g, u) = (format!("{p}img_mlp.gate_layer"), format!("{p}img_mlp.proj"));
+                    big(&[&format!("{p}img_mlp.gate_up.weight")], &[false], Some(&[(g.as_str(), FFN), (u.as_str(), FFN)]))?
+                } else {
+                    big(&[&format!("{p}img_mlp.gate_layer.weight"), &format!("{p}img_mlp.proj.weight")], &[false, false], None)?
+                },
+                down: big(&[&format!("{p}img_mlp.out.weight")], &[false], None)?,
                 norm_q: vector(&format!("{p}attn.norm_q.weight"), true)?,
                 norm_k: vector(&format!("{p}attn.norm_k.weight"), true)?,
             });
         }
-        let merged = merged.into_inner();
-        let missed: std::collections::BTreeSet<&str> = loras.iter().filter(|d| !merged.contains(&lora::key(&d.target))).map(|d| d.target.as_str()).collect();
-        if !missed.is_empty() {
-            let few: Vec<&str> = missed.iter().take(4).copied().collect();
-            return Err(Error(format!("LoRA modules this engine does not merge ({} of them): {}", missed.len(), few.join(", "))));
-        }
-        if !loras.is_empty() {
-            log(format!("qwen-image 2.1: {} LoRA updates merged into {} matrices", loras.len(), merged.len()));
-        }
         // the text norm stores (scale - 1): the kernel multiplies by its weight
         let tn = {
-            let t = tensor("txt_in.text_norm.weight")?;
-            let b = f.read(t).map_err(ge)?;
-            let v: Vec<f32> = b.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) + 1.0).collect();
+            let v: Vec<f32> = host_vec("txt_in.text_norm.weight")?.iter().map(|x| x + 1.0).collect();
             DevBuf::from_f32(&gpu, &v)?
         };
         let dit = Dit {
@@ -265,6 +284,15 @@ impl Dit {
             norm_out: single("norm_out.linear.weight")?,
             proj_out: single("proj_out.weight")?,
         };
+        let merged = merged.borrow().clone();
+        let missed: std::collections::BTreeSet<&str> = loras.iter().filter(|d| !merged.contains(&lora::key(&d.target))).map(|d| d.target.as_str()).collect();
+        if !missed.is_empty() {
+            let few: Vec<&str> = missed.iter().take(4).copied().collect();
+            return Err(Error(format!("LoRA modules this engine does not merge ({} of them): {}", missed.len(), few.join(", "))));
+        }
+        if !loras.is_empty() {
+            log(format!("qwen-image 2.1: {} LoRA updates merged into {} matrices", loras.len(), merged.len()));
+        }
         log(format!("qwen-image 2.1: {n_blocks} blocks on {} ({}) in {:.1} s", gpu.name, if int8 { "int8 ConvRot" } else { "half" }, t0.elapsed().as_secs_f64()));
         Ok(dit)
     }

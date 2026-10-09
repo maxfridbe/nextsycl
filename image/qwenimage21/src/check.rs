@@ -84,7 +84,10 @@ pub fn run(m: &QwenImage21, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Str
     let n = hw.0 * hw.1;
     if stages.contains(&"dit") || stages.contains(&"steps") {
         let (_, sig_ref) = read_npy(&dir.join("sigmas.npy"))?;
-        let sig = sched::sigmas(steps, n);
+        let sig = match &m.preset {
+            Some(p) => sched::preset(&p.nodes, n, p.dynamic),
+            None => sched::sigmas(steps, n),
+        };
         worst = worst.max(line("sigmas", &sig, &sig_ref, log));
         let e = DevBuf::from_f32(gpu, &embeds)?;
         let (_, noise) = read_npy(&dir.join("noise.npy"))?;
