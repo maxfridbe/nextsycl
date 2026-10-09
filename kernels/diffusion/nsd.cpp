@@ -147,7 +147,7 @@ struct Ctx {
     float* gn = nullptr; size_t gn_cap = 0;        // group norm: partial sums, then (mean, 1 / std) per group
     bool rotq_fused = true;
     bool poison = false;
-    // attention through libh3sage.so (kernels/sage.cpp), loaded on first use; NSD_ATTN=onednn: oneDNN's fused kernel
+    // attention through libnextsycl-flash.so's Sage entry (H3's sage.cpp), loaded on first use; NSD_ATTN=onednn: oneDNN's fused kernel
     bool sage_want = true;
     int64_t sage_min_s = 8192;                     // shorter sequences stay on oneDNN (NSD_SAGE_MIN_S): there the
                                                    // quantize pass and the call cost more than int8 saves
@@ -1835,7 +1835,7 @@ static bool attention_fused_batch(Ctx& c, const void* q, const void* k, const vo
 }
 
 // Form 0 (the default; NSD_ATTN=onednn skips it): SageAttention v1 - q and k quantized to int8 here, the attention by Intel's ARK kernel on
-// sycl-tla in libh3sage.so (kernels/sage.cpp), v and the result in half. k's mean over the sequence is taken out
+// sycl-tla in libnextsycl-flash.so (diffusion/flash: H3's kernels/sage.cpp entry), v and the result in half. k's mean over the sequence is taken out
 // before quantizing: it adds the same amount to every score of a row, which the softmax ignores, and what is left
 // quantizes far better. One scale per head per kSageBlock rows. Whole sequence in one call: the kernel keeps its
 // score tiles in registers, so memory does not grow with S^2.
@@ -1844,7 +1844,8 @@ constexpr int kSageBlock = 64;
 static bool sage_load(Ctx& c) {
     if (c.sage_state) return c.sage_state > 0;
     c.sage_state = -1;
-    std::string path = "libh3sage.so";
+    // nextsycl: H3's SageAttention entry lives in libnextsycl-flash.so (diffusion/flash) as nsflash_sage_square
+    std::string path = "libnextsycl-flash.so";
     Dl_info me;
     if (dladdr((void*) &sage_load, &me) && me.dli_fname) {     // beside this library
         std::string self = me.dli_fname;
@@ -1853,9 +1854,9 @@ static bool sage_load(Ctx& c) {
     }
     void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!h) { std::fprintf(stderr, "h3sycl: no SageAttention (%s); attention on oneDNN's kernel\n", dlerror()); return false; }
-    c.sage_fn = (decltype(c.sage_fn)) dlsym(h, "h3sage_attention");
-    c.sage_err = (decltype(c.sage_err)) dlsym(h, "h3sage_error");
-    if (!c.sage_fn || !c.sage_err) { std::fprintf(stderr, "h3sycl: %s lacks h3sage_attention; attention stays on oneDNN\n", path.c_str()); return false; }
+    c.sage_fn = (decltype(c.sage_fn)) dlsym(h, "nsflash_sage_square");
+    c.sage_err = (decltype(c.sage_err)) dlsym(h, "nsflash_error");
+    if (!c.sage_fn || !c.sage_err) { std::fprintf(stderr, "h3sycl: %s lacks nsflash_sage_square; attention stays on oneDNN\n", path.c_str()); return false; }
     std::fprintf(stderr, "h3sycl: attention: SageAttention v1 (int8 q, k) from %s\n", path.c_str());
     c.sage_state = 1;
     return true;

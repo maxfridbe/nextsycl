@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 pub use nextsycl_core::options::Given;
@@ -127,6 +128,30 @@ pub trait VideoEngine: Send + Sync {
     fn report(&self) -> Vec<String> {
         Vec::new()
     }
+    /// The jobs it runs beyond a clip from a request (H3: generate, encode, decode, denoise, check-block,
+    /// bench-blocks): their kinds - what `nextsycl video job <kind>` and the daemon's queue take
+    fn jobs(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// One job: a JSON spec (`{"kind": ..., its keys}`) in, a JSON value out; it logs, reports progress and looks
+    /// at the cancel flag between its steps (never inside one: a GPU process stopped inside a kernel can leave the
+    /// driver stuck)
+    fn run_job(&self, spec: &serde_json::Value, ctl: &mut JobCtl) -> Result<serde_json::Value> {
+        let _ = ctl;
+        Err(Error(format!("{}: no jobs ({:?})", self.arch(), spec.get("kind"))))
+    }
+    /// what it holds on its GPU: (bytes in use, its cap, the card's free bytes when the driver says)
+    fn device_stats(&self) -> Option<(u64, u64, Option<u64>)> {
+        None
+    }
+}
+
+/// How a running job talks back
+pub struct JobCtl<'a> {
+    pub log: &'a mut dyn FnMut(String),
+    pub cancel: &'a AtomicBool,
+    /// (done, total), e.g. blocks or steps
+    pub progress: Option<&'a mut dyn FnMut(usize, usize)>,
 }
 
 /// How an engine loads: its files, its GPUs, the options, a log

@@ -62,4 +62,36 @@ int nsflash_attention(void* queue, const void* q, const void* k, const void* v, 
     return -1;
 }
 
+// H3's SageAttention v1 entry (kernels/sage.cpp of the H3 studio, as it was: libh3sage.so's h3sage_attention): q and
+// k int8 [H, S, D] packed (one scale per head per `block` rows, k less its mean), v and out half [H, S, D]. The
+// diffusion kernels' default attention for long sequences (nsd.cpp, attention_sage).
+int nsflash_sage_square(void* queue, const int8_t* q, const int8_t* k, const void* v, void* out, const float* qscale,
+                        const float* kscale, int block, int64_t S, int64_t H, int64_t D, float scale) try {
+    if (D != 64 && D != 128) { g_err = "nsflash: head size " + std::to_string(D) + " (64 or 128 only)"; return -1; }
+    if (block <= 0 || block % 64 != 0) { g_err = "nsflash: the scale block must be a multiple of 64"; return -1; }
+    if (S <= 0 || H <= 0 || S > INT32_MAX / D / H) { g_err = "nsflash: sequence out of range"; return -1; }
+    auto* qu = static_cast<sycl::queue*>(queue);
+    if (g_default != qu) {
+        compat::set_default_queue(*qu);
+        g_default = qu;
+    }
+    ark::detail::Options o;
+    o.q = q; o.k = k; o.v = v; o.o = out;
+    o.scale_block_size = block;
+    o.qscale = qscale; o.kscale = kscale;
+    o.batch = 1;
+    o.num_heads_q = o.num_heads_kv = (int) H;
+    o.seq_len_qo = o.seq_len_kv = (int) S;
+    o.head_size_qk = o.head_size_vo = (int) D;
+    o.softmax_scale = scale;
+    o.is_causal = false;
+    const int rc = D == 128 ? ark::detail::launch_sage_prefill_kernel_128<cute::int8_t, cute::int8_t, cute::half_t>(o)
+                            : ark::detail::launch_sage_prefill_kernel_64<cute::int8_t, cute::int8_t, cute::half_t>(o);
+    if (rc != 0) { g_err = "nsflash: the sage kernel refused the problem"; return -1; }
+    return 0;
+} catch (const std::exception& e) {
+    g_err = std::string("nsflash: ") + e.what();
+    return -1;
+}
+
 }  // extern "C"

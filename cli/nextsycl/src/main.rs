@@ -14,6 +14,7 @@ mod bench;
 mod client;
 mod container;
 mod image;
+mod video;
 mod service;
 
 use nextsycl_llm::sampling::{dist, sample, Rng};
@@ -788,10 +789,6 @@ fn llm(cfg: &nextsycl_models::Config, args: &[String]) -> Result<(), String> {
     }
 }
 
-/// The video engines this program has (video/<arch>)
-fn video_engines() -> Vec<nextsycl_video::VideoKind> {
-    vec![nextsycl_video_example::kind()]
-}
 
 /// `nextsycl <kind> selftest [--gpu N]`: the kind's kernel library opens, an engine's own symbol binds, a kernel runs
 /// on the GPU and its result comes back right (the kind's template engine's kernel)
@@ -833,17 +830,6 @@ fn llm_options(k: &EngineKind) -> Vec<nextsycl_core::EngineOption> {
     k.options.iter().chain(nextsycl_llm::COMMON_OPTIONS).copied().collect()
 }
 
-/// `nextsycl video <command>`: the video commands - for now the engines; H3's commands move here next
-fn video(args: &[String]) -> Result<(), String> {
-    match args.first().map(String::as_str) {
-        Some("engines") => {
-            list_engines(video_engines().iter().map(|k| (k.archs.join(", "), k.name, k.options.to_vec())));
-            Ok(())
-        }
-        Some("selftest") => selftest("video", &args[1..], nextsycl_video_example::selftest),
-        _ => Err("nextsycl video engines | selftest   (gen, serve, start, ... come with the H3 engine: CONTRIBUTING.md)".into()),
-    }
-}
 
 extern "C" {
     fn signal(sig: i32, handler: usize) -> usize;
@@ -863,7 +849,7 @@ fn main() -> ExitCode {
     let r = match args.first().map(String::as_str) {
         Some("llm") => llm(&cfg, &args[1..]),
         Some("image") => image::cmd(&cfg, &args[1..], |r| selftest("image", r, nextsycl_image_example::selftest)),
-        Some("video") => video(&args[1..]),
+        Some("video") => video::cmd(&cfg, &args[1..], |r| selftest("video", r, nextsycl_video_example::selftest)),
         // the llm commands' names from before the kinds (nextsycl start = nextsycl llm start, ...)
         Some("start") => service::start(&cfg, rest),
         Some("models") => models::cmd(&cfg, rest, &|g: &Gguf| nextsycl_llm::kind_for(&engines(), g).map(|k| k.name.to_string())),

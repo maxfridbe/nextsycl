@@ -1,0 +1,13 @@
+[package]
+name = "nextsycl-video-h3"
+description = "MiniMax H3 on Intel Arc (SYCL): text, pictures, a voice and other clips to video with sound - H3's engine and jobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-video.workspace = true
+serde_json.workspace = true
+fancy-regex = "0.14"
+unicode-normalization = "0.1"

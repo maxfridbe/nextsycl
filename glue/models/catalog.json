@@ -144,6 +144,90 @@
    "size": 335606144,
    "sha256": "021a6228a0fcd217275190b89072416a2f28548e8e18fe049531dc9b77ef89bd",
    "path": "qwen-image-2.1/loras/p_qwen_image_2.1_5step_v0.1.safetensors"
+  },
+  "h3-denoiser-int8": {
+   "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+   "size": 20970379616,
+   "sha256": "e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a",
+   "path": "minimax-h3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+  },
+  "h3-denoiser-q6k": {
+   "url": "https://huggingface.co/unsloth/MiniMax-H3-GGUF/resolve/d629413c2e5b51b38c453668b75ca3b06ca92703/minimax_h3_fl2va_pruned-Q6_K.gguf",
+   "size": 16586784864,
+   "sha256": "cf9453a5654833fbf4e432d71ae53ad2f58ff8f735aa64d4770f1e182c0a5868",
+   "path": "minimax-h3/diffusion_models/minimax_h3_fl2va_pruned-Q6_K.gguf"
+  },
+  "h3-denoiser-q8": {
+   "url": "https://huggingface.co/unsloth/MiniMax-H3-GGUF/resolve/d629413c2e5b51b38c453668b75ca3b06ca92703/minimax_h3_fl2va_pruned-Q8_0.gguf",
+   "size": 21437786208,
+   "sha256": "1c77759fd30e4b41dd4fb341d684518177f544428c6186fd9f5fd96f8ebf55d4",
+   "path": "minimax-h3/diffusion_models/minimax_h3_fl2va_pruned-Q8_0.gguf"
+  },
+  "h3-denoiser-q4km": {
+   "url": "https://huggingface.co/woodfireind/MiniMax-H3-GGUF-MiniStack/resolve/623a187b0db0042046195c96e499678cea12e555/diffusion_models/MiniMax-H3-FL2VA-pruned-Q4_K_M.gguf",
+   "size": 11378532064,
+   "sha256": "51783047a6be43c9fcedc3c0a1746480dac867839ba1ad2e1c698da9d7058201",
+   "path": "minimax-h3/diffusion_models/MiniMax-H3-FL2VA-pruned-Q4_K_M.gguf"
+  },
+  "h3-te-32b-q4km": {
+   "url": "https://huggingface.co/unsloth/MiniMax-H3-GGUF/resolve/d629413c2e5b51b38c453668b75ca3b06ca92703/qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
+   "size": 18218065024,
+   "sha256": "11e6efe70a57ce7f4838c47bdbd1a1c4b8ce10e2b7747f1b065990b70f4b05fc",
+   "path": "minimax-h3/text_encoders/qwen3vl_32b_minimax_h3-Q4_K_M.gguf"
+  },
+  "h3-vae": {
+   "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/vae/minimax_h3_video_vae_fp16.safetensors",
+   "size": 5207808496,
+   "sha256": "7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522",
+   "path": "minimax-h3/vae/minimax_h3_video_vae_fp16.safetensors"
+  },
+  "h3-audio-vae": {
+   "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/vae/minimax_h3_audio_vae_fp32.safetensors",
+   "size": 605254808,
+   "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
+   "path": "minimax-h3/vae/minimax_h3_audio_vae_fp32.safetensors"
+  },
+  "h3-upscaler": {
+   "url": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/3f941d5d182014dd5c0a5e16330420ee2d4aa0c6/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
+   "size": 690592992,
+   "sha256": "4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6",
+   "path": "minimax-h3/upscaler/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"
+  },
+  "h3-tokenizer-vocab": {
+   "url": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/08ff3c11b3a85eb07c2c06f21cb378ac2e086840/comfy/text_encoders/qwen25_tokenizer/vocab.json",
+   "size": 2776833,
+   "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+   "path": "minimax-h3/tokenizer/vocab.json"
+  },
+  "h3-tokenizer-merges": {
+   "url": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/08ff3c11b3a85eb07c2c06f21cb378ac2e086840/comfy/text_encoders/qwen25_tokenizer/merges.txt",
+   "size": 1671853,
+   "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+   "path": "minimax-h3/tokenizer/merges.txt"
+  },
+  "h3-tokenizer-config": {
+   "url": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/08ff3c11b3a85eb07c2c06f21cb378ac2e086840/comfy/text_encoders/qwen25_tokenizer/tokenizer_config.json",
+   "size": 8018,
+   "sha256": "49292bd4a58a43382bf01311bc3ed7a151a7f16fe07d155e900ea1af281555db",
+   "path": "minimax-h3/tokenizer/tokenizer_config.json"
+  },
+  "h3-lora-realism": {
+   "url": "https://huggingface.co/fal/MiniMax-H3-Realism-People-LoRA/resolve/039cc8579d7aa357a882d7f4111b25da4f72dccc/h3-realism-people-t2v-i2v-r2v.safetensors",
+   "size": 131229656,
+   "sha256": "acc529601d2da117fb81179e76c56e488a3beab1171659d305f04fa3655b787e",
+   "path": "minimax-h3/loras/h3-realism-people-t2v-i2v-r2v.safetensors"
+  },
+  "h3-lora-ref2v-turbo": {
+   "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+   "size": 1956193000,
+   "sha256": "5b9ab5ade15d0775676d01a907268a69a1468dc6033b3b0d3ded5502f3ebb84c",
+   "path": "minimax-h3/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+  },
+  "h3-lora-lms": {
+   "url": "https://huggingface.co/Alissonerdx/Minimax-H3-ComfyUI/resolve/849fb3d4f434f2e9b4a4d4f7253471bf5e6719f9/loras/minimax_h3_lms_v1.0_r64.safetensors",
+   "size": 1239664536,
+   "sha256": "16f3195bc6bffa431c0598dc2031e520ba058b4fcbc9f104db9e3fdfdeacf60c",
+   "path": "minimax-h3/loras/minimax_h3_lms_v1.0_r64.safetensors"
   }
  },
  "models": [
@@ -513,6 +597,138 @@
     "NS_QI_SIGMAS": "1,0.94,0.8571429,0.6666667,0.4",
     "NS_QI_SIGMA_SHIFT": "none"
    }
+  },
+  {
+   "id": "minimax-h3",
+   "kind": "video",
+   "arch": "minimax-h3",
+   "title": "MiniMax H3 (int8 ConvRot denoiser: the fastest; text, pictures, a voice to video with sound)",
+   "about": "the 50-block FL2VA DiT in ComfyUI's int8 ConvRot (int8 GEMMs), the Qwen3-VL 32B text encoder (Q4_K_M), video and audio VAEs, the latent upscaler",
+   "files": {
+    "denoiser": "h3-denoiser-int8",
+    "text-encoder": "h3-te-32b-q4km",
+    "tokenizer": "h3-tokenizer-vocab",
+    "tokenizer-merges": "h3-tokenizer-merges",
+    "tokenizer-config": "h3-tokenizer-config",
+    "vae": "h3-vae",
+    "audio-vae": "h3-audio-vae",
+    "upscaler": "h3-upscaler"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "steps": 8,
+    "seconds": 2.0,
+    "size": "384x288"
+   }
+  },
+  {
+   "id": "minimax-h3-q6k",
+   "kind": "video",
+   "arch": "minimax-h3",
+   "title": "MiniMax H3 Q6_K (the denoiser in 15.4 GiB: longer clips fit)",
+   "about": "the denoiser as a Q6_K GGUF (expanded to bf16 a matrix at a time)",
+   "files": {
+    "denoiser": "h3-denoiser-q6k",
+    "text-encoder": "h3-te-32b-q4km",
+    "tokenizer": "h3-tokenizer-vocab",
+    "tokenizer-merges": "h3-tokenizer-merges",
+    "tokenizer-config": "h3-tokenizer-config",
+    "vae": "h3-vae",
+    "audio-vae": "h3-audio-vae",
+    "upscaler": "h3-upscaler"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "steps": 8,
+    "seconds": 2.0,
+    "size": "384x288"
+   }
+  },
+  {
+   "id": "minimax-h3-q4km",
+   "kind": "video",
+   "arch": "minimax-h3",
+   "title": "MiniMax H3 Q4_K_M (the denoiser in 10.6 GiB: the longest clips)",
+   "about": "the denoiser as a Q4_K_M GGUF",
+   "files": {
+    "denoiser": "h3-denoiser-q4km",
+    "text-encoder": "h3-te-32b-q4km",
+    "tokenizer": "h3-tokenizer-vocab",
+    "tokenizer-merges": "h3-tokenizer-merges",
+    "tokenizer-config": "h3-tokenizer-config",
+    "vae": "h3-vae",
+    "audio-vae": "h3-audio-vae",
+    "upscaler": "h3-upscaler"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "steps": 8,
+    "seconds": 2.0,
+    "size": "384x288"
+   }
+  },
+  {
+   "id": "minimax-h3-q8",
+   "kind": "video",
+   "arch": "minimax-h3",
+   "title": "MiniMax H3 Q8_0 (a reference form)",
+   "about": "the denoiser as a Q8_0 GGUF",
+   "files": {
+    "denoiser": "h3-denoiser-q8",
+    "text-encoder": "h3-te-32b-q4km",
+    "tokenizer": "h3-tokenizer-vocab",
+    "tokenizer-merges": "h3-tokenizer-merges",
+    "tokenizer-config": "h3-tokenizer-config",
+    "vae": "h3-vae",
+    "audio-vae": "h3-audio-vae",
+    "upscaler": "h3-upscaler"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "steps": 8,
+    "seconds": 2.0,
+    "size": "384x288"
+   }
+  },
+  {
+   "id": "minimax-h3-realism-lora",
+   "kind": "lora",
+   "arch": "minimax-h3",
+   "base": "minimax-h3",
+   "title": "MiniMax H3 realism, people (fal; trigger r34l1sm, strength ~0.5)",
+   "about": "photographic people for text, image and reference to video",
+   "files": {
+    "lora": "h3-lora-realism"
+   },
+   "env": {}
+  },
+  {
+   "id": "minimax-h3-ref2v-turbo-lora",
+   "kind": "lora",
+   "arch": "minimax-h3",
+   "base": "minimax-h3",
+   "title": "MiniMax H3 ref2v turbo, 4 steps (Comfy-Org)",
+   "about": "reference-to-video in 4 steps",
+   "files": {
+    "lora": "h3-lora-ref2v-turbo"
+   },
+   "env": {}
+  },
+  {
+   "id": "minimax-h3-lms-lora",
+   "kind": "lora",
+   "arch": "minimax-h3",
+   "base": "minimax-h3",
+   "title": "MiniMax H3 LMS v1.0, rank 64 (Alissonerdx)",
+   "about": "a LoRA published as minimax_h3_lms_v1.0_r64",
+   "files": {
+    "lora": "h3-lora-lms"
+   },
+   "env": {}
   }
  ]
 }

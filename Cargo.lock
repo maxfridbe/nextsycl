@@ -188,6 +188,7 @@ dependencies = [
  "nextsycl-tok",
  "nextsycl-video",
  "nextsycl-video-example",
+ "nextsycl-video-h3",
  "serde_json",
 ]
 
@@ -331,6 +332,7 @@ version = "0.0.0"
 dependencies = [
  "nextsycl-core",
  "nextsycl-diffusion",
+ "serde_json",
 ]
 
 [[package]]
@@ -339,6 +341,17 @@ version = "0.0.0"
 dependencies = [
  "nextsycl-core",
  "nextsycl-video",
+]
+
+[[package]]
+name = "nextsycl-video-h3"
+version = "0.0.0"
+dependencies = [
+ "fancy-regex",
+ "nextsycl-core",
+ "nextsycl-video",
+ "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -460,6 +473,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -470,6 +489,15 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "version_check"

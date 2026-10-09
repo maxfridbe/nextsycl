@@ -1,0 +1,363 @@
+{
+ "bakery.txt": {
+  "text": "integrated_multimodal_description: [Shot 1] Live-action, cinematic, a medium-wide shot frames a baker opening the shutters of a small street bakery before sunrise. The camera pushes in with small amplitude at slow speed as the middle-aged baker with a calm, slightly raspy voice (S1) places a fresh loaf on the wooden counter and says: <d>[English] First batch of the morning.</d>\n\noverall_soundscape: Wooden shutters scrape open over a quiet street as trays clink softly inside the bakery. The doorbell rings once, followed by light footsteps.\n\nnon_diegetic_music: A soft acoustic-guitar pattern at a moderate tempo.",
+  "ids": [
+   396,
+   47172,
+   26290,
+   318,
+   57597,
+   11448,
+   25,
+   508,
+   36402,
+   220,
+   16,
+   60,
+   11158,
+   25059,
+   11,
+   64665,
+   11,
+   264,
+   11051,
+   24472,
+   6552,
+   14087,
+   264,
+   75828,
+   8568,
+   279,
+   9311,
+   5045,
+   315,
+   264,
+   2613,
+   8592,
+   65144,
+   1573,
+   63819,
+   13,
+   576,
+   6249,
+   40702,
+   304,
+   448,
+   2613,
+   44109,
+   518,
+   6301,
+   4628,
+   438,
+   279,
+   6149,
+   56759,
+   75828,
+   448,
+   264,
+   19300,
+   11,
+   10078,
+   49910,
+   3288,
+   7743,
+   320,
+   50,
+   16,
+   8,
+   7482,
+   264,
+   7722,
+   76148,
+   389,
+   279,
+   22360,
+   5546,
+   323,
+   2727,
+   25,
+   220,
+   151669,
+   58,
+   22574,
+   60,
+   5512,
+   7162,
+   315,
+   279,
+   6556,
+   13,
+   151670,
+   271,
+   74455,
+   643,
+   3095,
+   5330,
+   25,
+   62492,
+   9311,
+   5045,
+   57128,
+   1787,
+   916,
+   264,
+   11340,
+   8592,
+   438,
+   91725,
+   1185,
+   766,
+   56050,
+   4766,
+   279,
+   65144,
+   13,
+   576,
+   6006,
+   17250,
+   24544,
+   3055,
+   11,
+   8110,
+   553,
+   3100,
+   59702,
+   382,
+   6280,
+   61588,
+   35224,
+   61863,
+   25,
+   362,
+   8413,
+   44066,
+   2371,
+   34746,
+   5383,
+   518,
+   264,
+   23193,
+   23230,
+   13
+  ]
+ },
+ "case.0": {
+  "text": "Hello world",
+  "ids": [
+   9707,
+   1879
+  ]
+ },
+ "case.1": {
+  "text": "  leading spaces",
+  "ids": [
+   220,
+   6388,
+   12621
+  ]
+ },
+ "case.2": {
+  "text": "trailing spaces   ",
+  "ids": [
+   376,
+   14277,
+   12621,
+   262
+  ]
+ },
+ "case.3": {
+  "text": "tabs\tand\nnewlines\n\n\nend",
+  "ids": [
+   30993,
+   52477,
+   198,
+   931,
+   7969,
+   1406,
+   408
+  ]
+ },
+ "case.4": {
+  "text": "12345678 3.14159 1,000,000",
+  "ids": [
+   16,
+   17,
+   18,
+   19,
+   20,
+   21,
+   22,
+   23,
+   220,
+   18,
+   13,
+   16,
+   19,
+   16,
+   20,
+   24,
+   220,
+   16,
+   11,
+   15,
+   15,
+   15,
+   11,
+   15,
+   15,
+   15
+  ]
+ },
+ "case.5": {
+  "text": "don't won't I'm you're they've we'll he'd",
+  "ids": [
+   15007,
+   944,
+   2765,
+   944,
+   358,
+   2776,
+   498,
+   2299,
+   807,
+   3003,
+   582,
+   3278,
+   566,
+   4172
+  ]
+ },
+ "case.6": {
+  "text": "DON'T SHOUT",
+  "ids": [
+   84641,
+   17323,
+   6434,
+   3656
+  ]
+ },
+ "case.7": {
+  "text": "!!!??? ... --- ***",
+  "ids": [
+   12069,
+   33015,
+   2503,
+   12448,
+   17160
+  ]
+ },
+ "case.8": {
+  "text": "émigré naïve café",
+  "ids": [
+   16647,
+   5233,
+   963,
+   94880,
+   586,
+   51950
+  ]
+ },
+ "case.9": {
+  "text": "日本語のテキスト",
+  "ids": [
+   101059,
+   102819,
+   15767,
+   56833,
+   61803,
+   70534
+  ]
+ },
+ "case.10": {
+  "text": "Привет, мир",
+  "ids": [
+   53645,
+   26991,
+   8178,
+   11,
+   137144
+  ]
+ },
+ "case.11": {
+  "text": "مرحبا بالعالم",
+  "ids": [
+   124122,
+   29825,
+   124671,
+   124476,
+   129634
+  ]
+ },
+ "case.12": {
+  "text": "emoji 🎬🎥 here",
+  "ids": [
+   37523,
+   11162,
+   236,
+   105,
+   145794,
+   1588
+  ]
+ },
+ "case.13": {
+  "text": "<d>tagged</d> <|caption_start|>cap<|caption_end|>",
+  "ids": [
+   151669,
+   4578,
+   3556,
+   151670,
+   220,
+   151674,
+   11346,
+   151675
+  ]
+ },
+ "case.14": {
+  "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "ids": [
+   44102,
+   44102,
+   44102,
+   44102,
+   44102,
+   44102,
+   4146
+  ]
+ },
+ "case.15": {
+  "text": "a\r\nb",
+  "ids": [
+   64,
+   319,
+   65
+  ]
+ },
+ "case.16": {
+  "text": "   ",
+  "ids": [
+   262
+  ]
+ },
+ "case.17": {
+  "text": "line one.\nLine two!\n",
+  "ids": [
+   1056,
+   825,
+   624,
+   2460,
+   1378,
+   4894
+  ]
+ },
+ "case.18": {
+  "text": "<Picture 1>: ",
+  "ids": [
+   21604,
+   3826,
+   220,
+   16,
+   26818,
+   220
+  ]
+ }
+}
