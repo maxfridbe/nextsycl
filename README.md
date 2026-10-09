@@ -210,7 +210,7 @@ Its cost against the reference: velocity 5.8e-3 (half 3e-4), the latents after 2
 
 Where a 1024x1024 step goes on the B70 (`NS_QI_PROFILE=1`), half: the DiT's linears through oneDNN at 150-170
 TFLOPS (~60%), attention (oneDNN's fused SDPA read in place, ~55 TFLOPS) ~22%. With int8 the linears drop to ~37%
-and attention is the largest part (~27%). The VAE adds 0.5 s a picture.
+and attention is the largest part (~27%). The VAE adds 0.7 s a picture (0.45 s of it its 3x3 convolutions).
 
 ## Speed by model
 

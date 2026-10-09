@@ -188,7 +188,7 @@ of IQ2_XXS instead could win twice.
       work-group a row (1.69 -> 0.37 ms a call); prefix + block attention read in place through strides (5.9 -> 5.2 ms)
 - [x] Qwen-Image speed, round 2 (B70, 1024x1024, 40 steps): `NS_QI_INT8=1` int8 ConvRot block matrices (rotated and
       quantized per row at load; 26.5 -> 18.5 s, PSNR 39.2 dB against half); the linears' outputs half before the
-      gated add; the VAE's single-head attention (D 1152) as two GEMMs + a softmax (228 -> ~10 ms). Half: 25.7 s
+      gated add; the VAE's single-head attention (D 1152) as two GEMMs + a softmax (228 -> 35 ms). Half: 25.7 s
 - [ ] Qwen-Image speed, next: attention (~5 ms a block at 4k tokens, ~55 TFLOPS: a flash kernel of our own); the
       VAE's 3x3 convolutions (0.45 s a picture)
 - [ ] Qwen-Image 2.1 Q6_K / Q4_K_M: the dequant reads Q4_K / Q6_K; Q4_K_M also has Q5_K tensors
