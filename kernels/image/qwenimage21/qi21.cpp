@@ -6,6 +6,7 @@
 #include "qi21.h"
 
 #include <sycl/sycl.hpp>
+#include <limits>
 
 namespace {
 using half = sycl::half;
@@ -46,6 +47,43 @@ int ns_image_qi21_ln_mod(ns_gpu* g, const float* x, int64_t M, int64_t C, float 
             const int64_t i = (int64_t) j * WG + l;
             if (i < C) o[r * C + i] = (half) ((v[j] - mean) * inv * (scale ? 1.0f + scale[i] : 1.0f));
         }
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_image_qi21_quant_rows(ns_gpu* g, const float* w, int64_t N, int64_t K, int8_t* q, float* scale) {
+    NS_TRY
+    constexpr int WG = 256;
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) N * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+        const size_t r = it.get_group(0);
+        const int64_t l = (int64_t) it.get_local_id(0);
+        const float* row = w + r * K;
+        float m = 0.0f;
+        for (int64_t i = l; i < K; i += WG) m = sycl::fmax(m, sycl::fabs(row[i]));
+        const float s = sycl::fmax(sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>()) / 127.0f, 1e-30f);
+        for (int64_t i = l; i < K; i += WG) q[r * K + i] = (int8_t) sycl::clamp(sycl::rint(row[i] / s), -127.0f, 127.0f);
+        if (l == 0) scale[r] = s;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_image_qi21_softmax_rows(ns_gpu* g, const float* x, int64_t M, int64_t N, float scale, void* out) {
+    NS_TRY
+    constexpr int WG = 256;
+    half* o = (half*) out;
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) M * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+        const size_t r = it.get_group(0);
+        const int64_t l = (int64_t) it.get_local_id(0);
+        const float* row = x + r * N;
+        float m = -std::numeric_limits<float>::infinity();
+        for (int64_t i = l; i < N; i += WG) m = sycl::fmax(m, row[i] * scale);
+        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+        float s = 0.0f;
+        for (int64_t i = l; i < N; i += WG) s += sycl::exp(row[i] * scale - m);
+        const float inv = 1.0f / sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+        for (int64_t i = l; i < N; i += WG) o[r * N + i] = (half) (sycl::exp(row[i] * scale - m) * inv);
     });
     return 0;
     NS_CATCH

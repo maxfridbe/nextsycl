@@ -106,11 +106,12 @@ impl QwenImage21 {
         let t0 = Instant::now();
         nextsycl_core::use_kind("image");
         // the xe driver has no out-of-memory error - an allocation past the card spills to host RAM and can take the
-        // machine down - so the plan is checked first: the DiT in half, the encoder and VAE as stored, the
+        // machine down - so the plan is checked first: the DiT in half (int8: a byte a weight), the encoder and VAE as stored, the
         // activations of a 1024 x 1024 picture, 1.5 GiB kept free
         let f = Gguf::open(role(files, "transformer")?).map_err(|e| Error(e.0))?;
         let size = |r: &str| -> Result<u64> { std::fs::metadata(role(files, r)?).map(|m| m.len()).map_err(|e| Error(format!("{r}: {e}"))) };
-        let dit_b: u64 = f.tensors.iter().map(|t| t.elements() * 2).sum();
+        let int8 = std::env::var("NS_QI_INT8").is_ok_and(|v| v == "1");
+        let dit_b: u64 = f.tensors.iter().map(|t| t.elements() * if int8 { 1 } else { 2 }).sum();
         let need = dit_b + size("text-encoder")? + size("vae")? + (5u64 << 30);
         let (total, free) = gpu.memory()?;
         let free = free.unwrap_or(total);
@@ -119,7 +120,7 @@ impl QwenImage21 {
         }
         let nsd = Nsd::new(gpu)?;
         let te = TextEncoder::load(role(files, "text-encoder")?, role(files, "tokenizer")?, gpu, log)?;
-        let dit = dit::Dit::load(&f, &nsd, log)?;
+        let dit = dit::Dit::load(&f, &nsd, int8, log)?;
         let vae = vae::Vae::load(role(files, "vae")?, &nsd, (LATENT_MEAN.to_vec(), LATENT_STD.to_vec()), log)?;
         Ok(QwenImage21 { nsd, te, dit, vae, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64() })
     }

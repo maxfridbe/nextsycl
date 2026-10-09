@@ -262,18 +262,40 @@ impl Vae {
         Ok((out, w, h))
     }
 
-    /// The middle's attention: x + proj(attention(qkv(norm(x)))), one head of every channel over every pixel
+    /// The middle's attention: x + proj(attention(qkv(norm(x)))), one head of every channel over every pixel - as two
+    /// GEMMs and a softmax (one head of 1,152 features is past the fused kernel), a block of query rows at a time.
+    /// v is made transposed (W_v . norm(x)^T): the second GEMM reads it as its weights; its bias is added after
+    /// (each row of weights sums to 1).
     fn attention(&self, nsd: &Nsd, x: DevBuf, h: usize, w: usize) -> Result<DevBuf> {
         let gpu = &self.gpu;
+        let k = ffi::api()?;
         let (px, c) = (h * w, self.conv_in.co);
         let n = DevBuf::new(gpu, px * c * 2)?;
         nsd.rms_norm_mod(x.ptr(), Dt::F16, px, c, self.att_norm.ptr(), EPS, none(), none(), none(), n.ptr(), Dt::F16)?;
-        let qkv = DevBuf::new(gpu, px * 3 * c * 2)?;
-        nsd.linear(n.ptr(), Dt::F16, px, c, self.att_qkv.ptr(), 3 * c, self.att_qkv_b.ptr(), qkv.ptr(), Dt::F16)?;
-        let at = |i: usize| -> *const std::ffi::c_void { qkv.ptr().cast::<u16>().wrapping_add(i * c).cast() };
-        let o = DevBuf::new(gpu, px * c * 2)?;
+        let wpart = |i: usize| -> *const std::ffi::c_void { self.att_qkv.ptr().cast::<u16>().wrapping_add(i * c * c).cast() };
+        let bpart = |i: usize| -> *const std::ffi::c_void { self.att_qkv_b.fp().wrapping_add(i * c).cast() };
+        let (q, kk, vt) = (DevBuf::new(gpu, px * c * 2)?, DevBuf::new(gpu, px * c * 2)?, DevBuf::new(gpu, c * px * 2)?);
+        nsd.linear(n.ptr(), Dt::F16, px, c, wpart(0), c, bpart(0), q.ptr(), Dt::F16)?;
+        nsd.linear(n.ptr(), Dt::F16, px, c, wpart(1), c, bpart(1), kk.ptr(), Dt::F16)?;
+        nsd.linear(wpart(2), Dt::F16, c, c, n.ptr(), px, none(), vt.ptr(), Dt::F16)?;
         prof::mark(nsd, "vae att qkv")?;
-        nsd.attention(at(0), at(1), at(2), Dt::F16, px, 1, c, 3 * c, o.ptr(), Dt::F16)?;
+        // query rows a block at a time: the block's scores float32 [rows, px] under ~256 MiB
+        let rows_max = ((256usize << 20) / (px * 4)).clamp(1, px);
+        let scores = DevBuf::f32(gpu, rows_max * px)?;
+        let probs = DevBuf::new(gpu, rows_max * px * 2)?;
+        let o = DevBuf::new(gpu, px * c * 2)?;
+        let scale = 1.0 / (c as f32).sqrt();
+        let mut r0 = 0;
+        while r0 < px {
+            let rows = rows_max.min(px - r0);
+            let qa: *const std::ffi::c_void = q.ptr().cast::<u16>().wrapping_add(r0 * c).cast();
+            nsd.linear(qa, Dt::F16, rows, c, kk.ptr(), px, none(), scores.ptr(), Dt::F32)?;
+            // SAFETY: scores holds rows x px floats, probs as many halves.
+            ffi::check(unsafe { (k.softmax_rows)(gpu.raw(), scores.fp(), rows as i64, px as i64, scale, probs.ptr()) }, "softmax")?;
+            let oa: *mut std::ffi::c_void = o.ptr().cast::<u16>().wrapping_add(r0 * c).cast();
+            nsd.linear(probs.ptr(), Dt::F16, rows, px, vt.ptr(), c, bpart(2), oa, Dt::F16)?;
+            r0 += rows;
+        }
         prof::mark(nsd, "vae attention")?;
         nsd.linear(o.ptr(), Dt::F16, px, c, self.att_proj.ptr(), c, self.att_proj_b.ptr(), n.ptr(), Dt::F16)?;
         nsd.gate_add(x.ptr(), Dt::F16, px, c, n.ptr(), Dt::F16, none(), none())?;

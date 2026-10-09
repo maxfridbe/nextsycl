@@ -34,19 +34,42 @@ const EPS: f32 = 1e-6;
 /// RoPE: the frame, height and width axes' features (pairs: 8, 28, 28)
 const AXES: [usize; 3] = [16, 56, 56];
 
-/// One block's weights (half)
+/// The ConvRot group: int8 matrices are rotated by the normalized 256 x 256 Hadamard matrix along their inputs
+const GROUP: usize = 256;
+
+/// A block's matrix [n, k]: half, or int8 (ConvRot, a scale per row) - the activations then quantized per row on
+/// the fly (`NS_QI_INT8=1`: the card's int8 rate, twice its half one, at some cost in accuracy)
+struct Mat {
+    w: DevBuf,
+    scale: Option<DevBuf>,
+    n: usize,
+}
+
+impl Mat {
+    /// out [m, n] = x [m, k] (half) . W^T
+    fn apply(&self, nsd: &Nsd, x: *const std::ffi::c_void, m: usize, k: usize, out: *mut std::ffi::c_void, out_dt: Dt) -> Result<()> {
+        match &self.scale {
+            None => nsd.linear(x, Dt::F16, m, k, self.w.ptr(), self.n, none(), out, out_dt),
+            Some(s) => nsd.int8_linear(x, Dt::F16, m, k, self.w.ptr(), self.n, s.ptr(), self.n, none(), out, out_dt, GROUP),
+        }
+    }
+}
+
+/// One block's weights
 struct Block {
-    qkv: DevBuf,
-    out: DevBuf,
+    qkv: Mat,
+    out: Mat,
     /// gate | proj rows (SwiGLU reads them as one product)
-    gp: DevBuf,
-    down: DevBuf,
+    gp: Mat,
+    down: Mat,
     norm_q: DevBuf,
     norm_k: DevBuf,
 }
 
 pub struct Dit {
     gpu: Arc<Gpu>,
+    /// the block matrices are int8
+    pub int8: bool,
     blocks: Vec<Block>,
     // the small linears, float32
     img_in: DevBuf,
@@ -80,7 +103,8 @@ fn ge(e: nextsycl_gguf::Error) -> Error {
 }
 
 impl Dit {
-    pub fn load(f: &Gguf, nsd: &Nsd, log: &mut dyn FnMut(String)) -> Result<Dit> {
+    /// The weights from `f`; `int8`: the block matrices as int8 ConvRot (else half)
+    pub fn load(f: &Gguf, nsd: &Nsd, int8: bool, log: &mut dyn FnMut(String)) -> Result<Dit> {
         let gpu = nsd.gpu.clone();
         let t0 = std::time::Instant::now();
         let tensor = |name: &str| f.tensor(name).ok_or_else(|| Error(format!("{}: no tensor {name}", f.paths[0].display())));
@@ -123,7 +147,25 @@ impl Dit {
             nsd.wait()?;
             Ok(out)
         };
-        let half = |name: &str| load_rows(&[name], &[false], Dt::F16);
+        let k8 = ffi::api()?;
+        let had = DevBuf::from_f32(&gpu, &nextsycl_qwen3vl::hadamard(GROUP))?;
+        // a block matrix: half, or rotated along its inputs (W . H, a GEMM on the matrix engine) and quantized per row
+        let big = |names: &[&str], perm: &[bool]| -> Result<Mat> {
+            let n: usize = names.iter().map(|nm| tensor(nm).map(|t| t.shape[0] as usize)).sum::<Result<usize>>()?;
+            if !int8 {
+                return Ok(Mat { w: load_rows(names, perm, Dt::F16)?, scale: None, n });
+            }
+            let w = load_rows(names, perm, Dt::F32)?;
+            let k = w.floats() / n;
+            let rot = DevBuf::f32(&gpu, n * k)?;
+            nsd.linear(w.ptr(), Dt::F32, n * k / GROUP, GROUP, had.ptr(), GROUP, none(), rot.ptr(), Dt::F32)?;
+            let q = DevBuf::new(&gpu, n * k)?;
+            let scale = DevBuf::f32(&gpu, n)?;
+            // SAFETY: rot holds n x k floats, q n x k bytes, scale n floats.
+            ffi::check(unsafe { (k8.quant_rows)(gpu.raw(), rot.fp(), n as i64, k as i64, q.ptr().cast(), scale.fp()) }, "int8 weights")?;
+            nsd.wait()?;
+            Ok(Mat { w: q, scale: Some(scale), n })
+        };
         let single = |name: &str| load_rows(&[name], &[false], Dt::F32);
         // a vector (norm weights) as float32, permuted like q / k when asked
         let vector = |name: &str, permute: bool| -> Result<DevBuf> {
@@ -142,11 +184,10 @@ impl Dit {
         for i in 0..n_blocks {
             let p = format!("transformer_blocks.{i}.");
             blocks.push(Block {
-                qkv: load_rows(&[&format!("{p}attn.to_q.weight"), &format!("{p}attn.to_k.weight"), &format!("{p}attn.to_v.weight")],
-                               &[true, true, false], Dt::F16)?,
-                out: half(&format!("{p}attn.to_out.0.weight"))?,
-                gp: load_rows(&[&format!("{p}img_mlp.gate_layer.weight"), &format!("{p}img_mlp.proj.weight")], &[false, false], Dt::F16)?,
-                down: half(&format!("{p}img_mlp.out.weight"))?,
+                qkv: big(&[&format!("{p}attn.to_q.weight"), &format!("{p}attn.to_k.weight"), &format!("{p}attn.to_v.weight")], &[true, true, false])?,
+                out: big(&[&format!("{p}attn.to_out.0.weight")], &[false])?,
+                gp: big(&[&format!("{p}img_mlp.gate_layer.weight"), &format!("{p}img_mlp.proj.weight")], &[false, false])?,
+                down: big(&[&format!("{p}img_mlp.out.weight")], &[false])?,
                 norm_q: vector(&format!("{p}attn.norm_q.weight"), true)?,
                 norm_k: vector(&format!("{p}attn.norm_k.weight"), true)?,
             });
@@ -160,6 +201,7 @@ impl Dit {
         };
         let dit = Dit {
             gpu: gpu.clone(),
+            int8,
             blocks,
             img_in: single("img_in.weight")?,
             txt_norm: tn,
@@ -171,7 +213,7 @@ impl Dit {
             norm_out: single("norm_out.linear.weight")?,
             proj_out: single("proj_out.weight")?,
         };
-        log(format!("qwen-image 2.1: {n_blocks} blocks on {} (half) in {:.1} s", gpu.name, t0.elapsed().as_secs_f64()));
+        log(format!("qwen-image 2.1: {n_blocks} blocks on {} ({}) in {:.1} s", gpu.name, if int8 { "int8 ConvRot" } else { "half" }, t0.elapsed().as_secs_f64()));
         Ok(dit)
     }
 
@@ -246,13 +288,13 @@ impl Dit {
         // SAFETY: x holds m x 4096 floats, h as many halves; the scale row 4096 floats.
         ffi::check(unsafe { (k.ln_mod)(self.gpu.raw(), x.fp(), m as i64, DIM as i64, EPS, off(&md[2]), h.ptr()) }, "norm + modulate")?;
         prof::mark(nsd, "norm + modulate")?;
-        nsd.linear(h.ptr(), Dt::F16, m, DIM, b.gp.ptr(), 2 * FFN, none(), gp.ptr(), Dt::F16)?;
+        b.gp.apply(nsd, h.ptr(), m, DIM, gp.ptr(), Dt::F16)?;
         prof::mark(nsd, "gate|up linear")?;
         nsd.swiglu(gp.ptr(), Dt::F16, m, FFN, act.ptr(), Dt::F16)?;
         prof::mark(nsd, "swiglu")?;
-        nsd.linear(act.ptr(), Dt::F16, m, FFN, b.down.ptr(), DIM, none(), o.ptr(), Dt::F32)?;
+        b.down.apply(nsd, act.ptr(), m, FFN, o.ptr(), Dt::F16)?;
         prof::mark(nsd, "down linear")?;
-        nsd.gate_add(x.ptr(), Dt::F32, m, DIM, o.ptr(), Dt::F32, zeros.ptr(), off(&md[3]).cast())?;
+        nsd.gate_add(x.ptr(), Dt::F32, m, DIM, o.ptr(), Dt::F16, zeros.ptr(), off(&md[3]).cast())?;
         prof::mark(nsd, "gate add")
     }
 
@@ -279,14 +321,14 @@ impl Dit {
         // positions: the text's index on all three axes
         let idx: Vec<[i64; 3]> = (0..t as i64).map(|p| [p, p, p]).collect();
         let cs = self.rope_table(&idx)?;
-        let (h, qkv, att, o) = (DevBuf::new(gpu, t * DIM * 2)?, DevBuf::new(gpu, t * 3 * DIM * 2)?, DevBuf::new(gpu, t * DIM * 2)?, DevBuf::f32(gpu, t * DIM)?);
+        let (h, qkv, att, o) = (DevBuf::new(gpu, t * DIM * 2)?, DevBuf::new(gpu, t * 3 * DIM * 2)?, DevBuf::new(gpu, t * DIM * 2)?, DevBuf::new(gpu, t * DIM * 2)?);
         let (gp, act) = (DevBuf::new(gpu, t * 2 * FFN * 2)?, DevBuf::new(gpu, t * FFN * 2)?);
         let mut kv = Vec::with_capacity(self.blocks.len());
         let off = |buf: &DevBuf| -> *const f32 { buf.fp().wrapping_add(DIM) }; // the t = 0 row
         for b in &self.blocks {
             // SAFETY: x holds t x 4096 floats, h as many halves; the scale row 4096 floats.
             ffi::check(unsafe { (k.ln_mod)(gpu.raw(), x.fp(), t as i64, DIM as i64, EPS, off(&md[0]), h.ptr()) }, "norm + modulate")?;
-            nsd.linear(h.ptr(), Dt::F16, t, DIM, b.qkv.ptr(), 3 * DIM, none(), qkv.ptr(), Dt::F16)?;
+            b.qkv.apply(nsd, h.ptr(), t, DIM, qkv.ptr(), Dt::F16)?;
             let half_at = |buf: &DevBuf, n: usize| -> *mut std::ffi::c_void { buf.ptr().cast::<u16>().wrapping_add(n).cast() };
             nsd.rms_rope(qkv.ptr(), Dt::F16, t, HEADS, HEAD, 3 * DIM, b.norm_q.ptr(), EPS, cs.ptr(), HEAD)?;
             nsd.rms_rope(half_at(&qkv, DIM), Dt::F16, t, HEADS, HEAD, 3 * DIM, b.norm_k.ptr(), EPS, cs.ptr(), HEAD)?;
@@ -295,8 +337,8 @@ impl Dit {
             let keep = DevBuf::new(gpu, t * 3 * DIM * 2)?;
             keep.copy_within(0, &qkv, 0, t * 3 * DIM * 2)?;
             kv.push(keep);
-            nsd.linear(att.ptr(), Dt::F16, t, DIM, b.out.ptr(), DIM, none(), o.ptr(), Dt::F32)?;
-            nsd.gate_add(x.ptr(), Dt::F32, t, DIM, o.ptr(), Dt::F32, zeros.ptr(), off(&md[1]).cast())?;
+            b.out.apply(nsd, att.ptr(), t, DIM, o.ptr(), Dt::F16)?;
+            nsd.gate_add(x.ptr(), Dt::F32, t, DIM, o.ptr(), Dt::F16, zeros.ptr(), off(&md[1]).cast())?;
             self.block_ffn(nsd, b, &x, t, &md, 1, &zeros, &h, &gp, &act, &o)?;
         }
         nsd.wait()?;
@@ -323,7 +365,8 @@ impl Dit {
         // [the text's q|k|v | the image's], one layer at a time
         let all = DevBuf::new(gpu, (tt + n) * 3 * DIM * 2)?;
         let att = DevBuf::new(gpu, n * DIM * 2)?;
-        let o = DevBuf::f32(gpu, n * DIM)?;
+        // the linears' outputs before their gated add: half
+        let o = DevBuf::new(gpu, n * DIM * 2)?;
         let (gp, act) = (DevBuf::new(gpu, n * 2 * FFN * 2)?, DevBuf::new(gpu, n * FFN * 2)?);
         let half_at = |buf: &DevBuf, at: usize| -> *mut std::ffi::c_void { buf.ptr().cast::<u16>().wrapping_add(at).cast() };
         let img = tt * 3 * DIM; // the image's first row in `all`, in halves
@@ -334,7 +377,7 @@ impl Dit {
             // SAFETY: x holds n x 4096 floats, h as many halves; the scale row 4096 floats.
             ffi::check(unsafe { (k.ln_mod)(gpu.raw(), x.fp(), n as i64, DIM as i64, EPS, md[0].fp(), h.ptr()) }, "norm + modulate")?;
             prof::mark(nsd, "norm + modulate")?;
-            nsd.linear(h.ptr(), Dt::F16, n, DIM, b.qkv.ptr(), 3 * DIM, none(), half_at(&all, img), Dt::F16)?;
+            b.qkv.apply(nsd, h.ptr(), n, DIM, half_at(&all, img), Dt::F16)?;
             prof::mark(nsd, "qkv linear")?;
             nsd.rms_rope(half_at(&all, img), Dt::F16, n, HEADS, HEAD, 3 * DIM, b.norm_q.ptr(), EPS, cs.ptr(), HEAD)?;
             nsd.rms_rope(half_at(&all, img + DIM), Dt::F16, n, HEADS, HEAD, 3 * DIM, b.norm_k.ptr(), EPS, cs.ptr(), HEAD)?;
@@ -342,9 +385,9 @@ impl Dit {
             nsd.attention_qk(half_at(&all, img), n, 3 * DIM, half_at(&all, DIM), half_at(&all, 2 * DIM), tt + n, 3 * DIM, Dt::F16, HEADS, HEAD,
                              att.ptr(), Dt::F16)?;
             prof::mark(nsd, "attention")?;
-            nsd.linear(att.ptr(), Dt::F16, n, DIM, b.out.ptr(), DIM, none(), o.ptr(), Dt::F32)?;
+            b.out.apply(nsd, att.ptr(), n, DIM, o.ptr(), Dt::F16)?;
             prof::mark(nsd, "out linear")?;
-            nsd.gate_add(x.ptr(), Dt::F32, n, DIM, o.ptr(), Dt::F32, zeros.ptr(), md[1].ptr())?;
+            nsd.gate_add(x.ptr(), Dt::F32, n, DIM, o.ptr(), Dt::F16, zeros.ptr(), md[1].ptr())?;
             prof::mark(nsd, "gate add")?;
             self.block_ffn(nsd, b, &x, n, &md, 0, &zeros, &h, &gp, &act, &o)?;
             if bi == 0 {
