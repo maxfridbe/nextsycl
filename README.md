@@ -13,8 +13,10 @@ the GPU reads them over PCIe. It runs on one card or splits the layers over seve
 hashed per-layer embedding and 512 experts, on the Strata SYCL port's kernels - every weight in VRAM over the two
 cards or on one with its cold experts in pinned host memory, the MTP draft layer, the window and the drafter as SYCL
 graphs; verify passes and batches bit-exact, greedy output with drafts equal to output without. Every model's speed at
-each context length: [Speed by model](#speed-by-model). Image (Qwen-Image 2.1) and video (MiniMax H3) engines come
-next; their contracts and templates are in place.
+each context length: [Speed by model](#speed-by-model). **Qwen-Image 2.1**
+(`image/qwenimage21`): text to image, its Qwen3-VL text encoder, 7B DiT and RGBA VAE all in SYCL, checked stage by
+stage against the reference on the same quantized files; 1024x1024 in 40 steps takes 44 s on the B65. The video
+engine (MiniMax H3) comes next.
 
 ## What it does
 
@@ -77,7 +79,7 @@ next; their contracts and templates are in place.
 ```sh
 ./build.sh                          # the kernel libraries and the program, in a container with oneAPI (podman)
 echo "NS_MODELS=$HOME/models" > nextsycl.conf
-dist/nextsycl models add glm ~/models/GLM-5.3-Flash-IQ2.gguf --gpu all   # register a model (or models download)
+dist/nextsycl models add glm ~/models/GLM-5.3-Flash-IQ2.gguf --gpu all   # register a model (or models pull <id> from the catalog)
 dist/nextsycl llm start glm         # load it; the OpenAI API on 127.0.0.1:8085
 dist/nextsycl llm status            # live: the GPUs, the request running, the prompt cache
 dist/nextsycl llm inspect 4         # one request as JSON (settings, timings, previews; NS_KEEP_REQUESTS are kept)
@@ -158,7 +160,8 @@ engine settings (`NS_QW_MTP`, `NS_QW_CVEC` and the like), whether it is offered,
 nextsycl models list [--json]
 nextsycl models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M...]] [--set NAME=VALUE]...
                     [--no-tools] [--no-tasks] [--disabled]
-nextsycl models download <id> <url | hf:org/repo/path/file.gguf> [--dir DIR] [add's options]   # every shard, resumable
+nextsycl models search [TEXT] [--kind llm|image|video|lora]   # the catalog of supported models
+nextsycl models pull <id>... [--dir DIR] [--from DIR]... [--verify] [--again]   # download (resumable), SHA-256, register
 nextsycl models remove <id> [--files]        # --files deletes the GGUF shards too
 nextsycl models enable <id> | disable <id>
 nextsycl llm start <id>
@@ -180,6 +183,22 @@ added or disabled shows at once. With `NS_STUDIO_MODES` set to a mode file (one 
 `nextsycl llm start <id>`), every registry change rewrites that file's nextsycl entries (`"managed_by": "nextsycl"`) and
 leaves the others alone. `nextsycl llm start <id>` mounts the entry's files at the same paths in the container, so an
 entry can point anywhere on the machine.
+
+## Images
+
+```sh
+nextsycl models pull qwen-image-2.1-q8
+nextsycl image gen "a red fox in fresh snow, morning light" [--model ID] [--size WxH | --aspect 16:9] [--steps N]
+                   [--seed N] [--n N] [--out FILE|DIR] [--rgba] [--gpu N]
+nextsycl image check <reference dump dir> [--stages te,dit,steps,vae] [--gpu N]
+```
+
+`gen` runs the engine in-process for now (the server path, `image serve | start | ps`, comes next); the PNG keeps the
+prompt, model, seed, size and steps. `check` compares each stage with the dumps of `reference/qwenimage21/ref.py`.
+
+| Qwen-Image 2.1 Q8_0, one card | load | 512x512, 20 steps | 1024x1024, 40 steps |
+|---|---|---|---|
+| B65 | 7 s (page cache) | 5.9 s (0.29 s / step) | 44 s (1.07 s / step) |
 
 ## Speed by model
 

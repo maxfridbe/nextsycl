@@ -173,9 +173,19 @@ of IQ2_XXS instead could win twice.
       in nextsycl-diffusion; a template engine of each kind (llm/example, image/example, video/example) with its own
       kernel, and `nextsycl <kind> selftest`
 - [x] `nextsycl llm ...` (the old top-level names still work); `nextsycl image|video engines | selftest`
-- [ ] The catalog of supported models and `nextsycl models search | pull` (download goes)
-- [ ] Qwen-Image 2.1 (image/qwenimage21): its DiT, VAE and text encoder in SYCL, checked against the reference;
-      the samplers and schedules; `nextsycl image gen | edit | start | serve | ps | inspect | bench`; the images API
+- [x] The catalog of supported models (glue/models/catalog.json: direct HF links, sizes, SHA-256) and
+      `nextsycl models search | pull` (resumes, checks SHA-256, hard-links equal files, `--from` adopts copies)
+- [ ] The catalog's files mirrored somewhere of our own (a backup of the links)
+- [x] Qwen-Image 2.1 (image/qwenimage21) on SYCL: the Qwen3-VL text encoder in int8 ConvRot (crates/qwen3vl, shared),
+      the DiT from the Q8_0 GGUF in half (the text's K/V once a prompt, image rows each step), the RGBA VAE; the
+      diffusion kernels (kernels/diffusion = H3's h3sycl.cpp, oneDNN). `nextsycl image check` against
+      reference/qwenimage21/ref.py run on the same quantized files: text encoder layer 0 rel 2.8e-3 (36 layers:
+      cosine 0.998, int8 activation rounding compounding), DiT block 0 / velocity 2e-4 / 3e-4, 20 Euler steps 2.1e-3,
+      VAE max 3 / 255. `nextsycl image gen` (in-process): 1024x1024, 40 steps in 44 s on the B65 (1.07 s / step)
+- [ ] Qwen-Image 2.1: the samplers and schedules past Euler + its shift; guidance (cfg, negative); edit;
+      `nextsycl image start | serve | ps | inspect | bench` and the images API through the switcher; speed (the
+      step is DiT linears in half through oneDNN; the VAE's mid attention falls back to the split form at D 1152)
+- [ ] Qwen-Image 2.1 Q6_K / Q4_K_M: the dequant reads Q4_K / Q6_K; Q4_K_M also has Q5_K tensors
 - [ ] LoRAs: presets merged at load, per-request ones as a side path; Qwen-Image (20B) with the Lightning LoRAs
 - [ ] H3 into video/ (copied from its committed sycl-port branch): `nextsycl video ...` for all its commands
 

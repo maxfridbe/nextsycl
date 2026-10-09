@@ -1,0 +1,424 @@
+{
+ "about": "The models nextsycl serves, with their files: direct links pinned to a revision, each with its size and SHA-256 (nextsycl models search | pull).",
+ "files": {
+  "qwen38-iq2xs-1": {
+   "url": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+   "size": 39225954592,
+   "sha256": "92cee27ae5bbadcd732416a0f7a7f0acc092399dbbe8f5a5efa707c2ec0a49d7",
+   "path": "qwen3.8-flash-next/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf"
+  },
+  "qwen38-iq2xs-2": {
+   "url": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+   "size": 28800138432,
+   "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113",
+   "path": "qwen3.8-flash-next/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf"
+  },
+  "qwen38-coder-iq1m-1": {
+   "url": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/5348543e0147355ac9cbcb031184a3546350988e/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+   "size": 29608446496,
+   "sha256": "e11083ba855e7666b48ea3f2db6a9c3a20c18751a012cc24f948de91b7087fad",
+   "path": "qwen3.8-flash-next-coder/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
+  },
+  "qwen38-coder-iq1m-2": {
+   "url": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/5348543e0147355ac9cbcb031184a3546350988e/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+   "size": 28800138432,
+   "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113",
+   "path": "qwen3.8-flash-next-coder/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
+  },
+  "swift15-iq2xs-1": {
+   "url": "https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/b22d729eae29b5796f76fb70f91aef549b9fc52c/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+   "size": 39788473344,
+   "sha256": "ca3b302d3d1eb6eddce3ea4acc79854e6cc5fdc0583e374a6a8b6bb67327743b",
+   "path": "swift-1.5/IQ2_XS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf"
+  },
+  "swift15-iq2xs-2": {
+   "url": "https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/b22d729eae29b5796f76fb70f91aef549b9fc52c/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+   "size": 28363693824,
+   "sha256": "e4996a6de18fd49c58d9a0040fcfd73787db6407c51973f29884bee7b14c9dbb",
+   "path": "swift-1.5/IQ2_XS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf"
+  },
+  "glm53-iq2-ds4": {
+   "url": "https://huggingface.co/DogContext/GLM-5.3-Flash-Uncensored-Q2-ds4/resolve/235989b3a2f4ede83c05c9bdb29130ea3f77e3bb/GLM-5.3-Flash-Uncensored-IQ2-imatrix-MTP-ds4.gguf",
+   "size": 96505818432,
+   "sha256": "1b3a7d5c36d507bbcb7c99995740772114c5d0ec628a68b8263237b883f98e4e",
+   "path": "glm53-iq2/GLM-5.3-Flash-Uncensored-IQ2-imatrix-MTP-ds4.gguf"
+  },
+  "strata-expert-profile": {
+   "url": "https://raw.githubusercontent.com/Niko1221/Strata/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/data/expert-profile.bin",
+   "size": 196632,
+   "sha256": "8f59b4aa8873209dff11c11e37bcda9529a1335b724a1afeea37bf6388975baf",
+   "path": "strata-data/expert-profile.bin"
+  },
+  "strata-expert-profile-coder": {
+   "url": "https://raw.githubusercontent.com/Niko1221/Strata/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/data/expert-profile-coder.bin",
+   "size": 98328,
+   "sha256": "a514661124d5305effe9c1bcecff7dc069af398b2b19ff9d11628a2cad0a8915",
+   "path": "strata-data/expert-profile-coder.bin"
+  },
+  "qwen38-speed-projection": {
+   "url": "https://raw.githubusercontent.com/Niko1221/Strata/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/data/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf",
+   "size": 483520,
+   "sha256": "ef0724c5b79297e481017be85769832bc26eb220c984ecba2b0e1b0c8426312b",
+   "path": "strata-data/Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
+  },
+  "qwen-image-21-te-int8": {
+   "url": "https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF/resolve/6b34e59458d3eb7ba6a6f86a116aed5253dc02c3/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+   "size": 9350798360,
+   "sha256": "8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f",
+   "path": "qwen-image-2.1/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
+  },
+  "qwen-image-21-vae": {
+   "url": "https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF/resolve/6b34e59458d3eb7ba6a6f86a116aed5253dc02c3/vae/qwen_image_2.1_vae_bf16.safetensors",
+   "size": 675509688,
+   "sha256": "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9",
+   "path": "qwen-image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors"
+  },
+  "qwen-image-21-uncensored-lora": {
+   "url": "https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF/resolve/6b34e59458d3eb7ba6a6f86a116aed5253dc02c3/qwen-image-2.1-uncensored-lora.safetensors",
+   "size": 33586704,
+   "sha256": "00ee2cb7f00a37b097640c1880ed0d17e368e30599f34bb348fee0e8c2cc4ca1",
+   "path": "qwen-image-2.1/loras/qwen-image-2.1-uncensored-lora.safetensors"
+  },
+  "qwen-image-21-q80": {
+   "url": "https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF/resolve/4db8efdbe3426175988fca2ac50670f35ccb7ec9/qwen-image-2.1-Q8_0.gguf",
+   "size": 7591557792,
+   "sha256": "9a7ec02f4c9d5cf5b78e8efa6ccd81ec0c35a898defbf8e77ac7c02a32fe0d7e",
+   "path": "qwen-image-2.1/diffusion_models/qwen-image-2.1-Q8_0.gguf"
+  },
+  "qwen-image-21-q6k": {
+   "url": "https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF/resolve/4db8efdbe3426175988fca2ac50670f35ccb7ec9/qwen-image-2.1-Q6_K.gguf",
+   "size": 5876556448,
+   "sha256": "a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9",
+   "path": "qwen-image-2.1/diffusion_models/qwen-image-2.1-Q6_K.gguf"
+  },
+  "qwen-image-21-q4km": {
+   "url": "https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF/resolve/4db8efdbe3426175988fca2ac50670f35ccb7ec9/qwen-image-2.1-Q4_K_M.gguf",
+   "size": 4604557984,
+   "sha256": "833439e91bc1152d28f37aa198c7f6f4218b7de95754c2f7a318a2422ab4b2f8",
+   "path": "qwen-image-2.1/diffusion_models/qwen-image-2.1-Q4_K_M.gguf"
+  },
+  "qwen-image-21-uc-q80": {
+   "url": "https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF/resolve/6b34e59458d3eb7ba6a6f86a116aed5253dc02c3/qwen-image-2.1-UC-Q8_0.gguf",
+   "size": 7591557920,
+   "sha256": "cde456c72ea3ecebfc1be783300e972711d875e0c5f1bed33d42b66b156affa8",
+   "path": "qwen-image-2.1/diffusion_models/qwen-image-2.1-UC-Q8_0.gguf"
+  },
+  "qwen-image-21-uc-q6k": {
+   "url": "https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF/resolve/6b34e59458d3eb7ba6a6f86a116aed5253dc02c3/qwen-image-2.1-UC-Q6_K.gguf",
+   "size": 5876556576,
+   "sha256": "e14bb312109333b3d73b92ad9b9ac8b29b51f2edca1e7b86d1af1981bf1c4ee3",
+   "path": "qwen-image-2.1/diffusion_models/qwen-image-2.1-UC-Q6_K.gguf"
+  },
+  "qwen-image-21-uc-q4km": {
+   "url": "https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF/resolve/6b34e59458d3eb7ba6a6f86a116aed5253dc02c3/qwen-image-2.1-UC-Q4_K_M.gguf",
+   "size": 4604558112,
+   "sha256": "e79c8a009f2ecbdb6c70fd663d9aea9ee304a0d91f347e4169a756b8ad141b41",
+   "path": "qwen-image-2.1/diffusion_models/qwen-image-2.1-UC-Q4_K_M.gguf"
+  },
+  "qwen-image-21-tokenizer": {
+   "url": "https://huggingface.co/Qwen/Qwen-Image-2.1/resolve/b3179ad355be050328e483a9dfdd9e60cd62adfa/processor/tokenizer.json",
+   "size": 11422654,
+   "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+   "path": "qwen-image-2.1/tokenizer/tokenizer.json"
+  }
+ },
+ "models": [
+  {
+   "id": "qwen3.8-flash-next-iq2_xs",
+   "kind": "llm",
+   "arch": "qwen4exp",
+   "title": "Qwen3.8-Flash-Next IQ2_XS (general; the B70, 128K + 32K)",
+   "about": "the original model, GSQ-RCO IQ2_XS by ISTA-DASLab",
+   "files": {
+    "model": "qwen38-iq2xs-1",
+    "shard-2": "qwen38-iq2xs-2",
+    "expert-profile": "strata-expert-profile"
+   },
+   "local": {
+    "mtp": "Qwen3.8-Flash-Next's MTP draft layer as Strata's runtime directory (tools/mtp_fetch.py, mtp_pack.py, mtp_rt.py in Strata's setup; ~0.8 GB): about 2x faster answers. Without it the model runs without drafts."
+   },
+   "gpus": "0",
+   "ctx": "131072,32768",
+   "env": {
+    "NS_QW_CHUNK": "4096",
+    "NS_QW_EXPERT_PROFILE": "{expert-profile}",
+    "NS_QW_MTP": "{mtp}"
+   },
+   "tools": true,
+   "tasks": true
+  },
+  {
+   "id": "qwen3.8-flash-next-iq2_xs-uncensored",
+   "kind": "llm",
+   "arch": "qwen4exp",
+   "title": "Qwen3.8-Flash-Next IQ2_XS uncensored (refusal projection; the B70, 128K + 32K)",
+   "about": "IQ2_XS with Strata's experimental speed projection (a control vector) removing refusals",
+   "files": {
+    "model": "qwen38-iq2xs-1",
+    "shard-2": "qwen38-iq2xs-2",
+    "expert-profile": "strata-expert-profile",
+    "speed-projection": "qwen38-speed-projection"
+   },
+   "local": {
+    "mtp": "Qwen3.8-Flash-Next's MTP draft layer as Strata's runtime directory (tools/mtp_fetch.py, mtp_pack.py, mtp_rt.py in Strata's setup; ~0.8 GB): about 2x faster answers. Without it the model runs without drafts."
+   },
+   "gpus": "0",
+   "ctx": "131072,32768",
+   "env": {
+    "NS_QW_CHUNK": "4096",
+    "NS_QW_EXPERT_PROFILE": "{expert-profile}",
+    "NS_QW_MTP": "{mtp}",
+    "NS_QW_CVEC": "{speed-projection}:1.0",
+    "NS_QW_CVEC_LAYERS": "4,44",
+    "NS_QW_CVEC_MODE": "project",
+    "NS_QW_CVEC_DIR": "per-layer"
+   },
+   "tools": true,
+   "tasks": true
+  },
+  {
+   "id": "qwen3.8-flash-next-coder-iq1_m",
+   "kind": "llm",
+   "arch": "qwen4exp",
+   "title": "Qwen3.8-Flash-Next Coder IQ1_M (coding; the B70, 128K + 32K)",
+   "about": "ISTA-DASLab's coding version: half the experts, kept for code and tools",
+   "files": {
+    "model": "qwen38-coder-iq1m-1",
+    "shard-2": "qwen38-coder-iq1m-2",
+    "expert-profile": "strata-expert-profile-coder"
+   },
+   "local": {
+    "mtp": "Qwen3.8-Flash-Next's MTP draft layer as Strata's runtime directory (tools/mtp_fetch.py, mtp_pack.py, mtp_rt.py in Strata's setup; ~0.8 GB): about 2x faster answers. Without it the model runs without drafts."
+   },
+   "gpus": "0",
+   "ctx": "131072,32768",
+   "env": {
+    "NS_QW_CHUNK": "4096",
+    "NS_QW_EXPERT_PROFILE": "{expert-profile}",
+    "NS_QW_MTP": "{mtp}"
+   },
+   "tools": true,
+   "tasks": true
+  },
+  {
+   "id": "qwen3.8-flash-next-coder-iq1_m-uncensored",
+   "kind": "llm",
+   "arch": "qwen4exp",
+   "title": "Qwen3.8-Flash-Next Coder IQ1_M uncensored (refusal projection; the B70, 128K + 32K)",
+   "about": "the Coder with the speed projection",
+   "files": {
+    "model": "qwen38-coder-iq1m-1",
+    "shard-2": "qwen38-coder-iq1m-2",
+    "expert-profile": "strata-expert-profile-coder",
+    "speed-projection": "qwen38-speed-projection"
+   },
+   "local": {
+    "mtp": "Qwen3.8-Flash-Next's MTP draft layer as Strata's runtime directory (tools/mtp_fetch.py, mtp_pack.py, mtp_rt.py in Strata's setup; ~0.8 GB): about 2x faster answers. Without it the model runs without drafts."
+   },
+   "gpus": "0",
+   "ctx": "131072,32768",
+   "env": {
+    "NS_QW_CHUNK": "4096",
+    "NS_QW_EXPERT_PROFILE": "{expert-profile}",
+    "NS_QW_MTP": "{mtp}",
+    "NS_QW_CVEC": "{speed-projection}:1.0",
+    "NS_QW_CVEC_LAYERS": "4,44",
+    "NS_QW_CVEC_MODE": "project",
+    "NS_QW_CVEC_DIR": "per-layer"
+   },
+   "tools": true,
+   "tasks": true
+  },
+  {
+   "id": "swift-1.5-iq2_xs",
+   "kind": "llm",
+   "arch": "qwen4exp",
+   "title": "Swift 1.5 IQ2_XS (short thinking; the B70, 128K + 32K)",
+   "about": "UkisAI's fine-tune: much shorter thinking",
+   "files": {
+    "model": "swift15-iq2xs-1",
+    "shard-2": "swift15-iq2xs-2",
+    "expert-profile": "strata-expert-profile"
+   },
+   "local": {
+    "mtp": "Qwen3.8-Flash-Next's MTP draft layer as Strata's runtime directory (tools/mtp_fetch.py, mtp_pack.py, mtp_rt.py in Strata's setup; ~0.8 GB): about 2x faster answers. Without it the model runs without drafts."
+   },
+   "gpus": "0",
+   "ctx": "131072,32768",
+   "env": {
+    "NS_QW_CHUNK": "4096",
+    "NS_QW_EXPERT_PROFILE": "{expert-profile}",
+    "NS_QW_MTP": "{mtp}"
+   },
+   "tools": true,
+   "tasks": true
+  },
+  {
+   "id": "glm-5.3-flash-uncensored",
+   "kind": "llm",
+   "arch": "glm5-next",
+   "title": "GLM-5.3-Flash uncensored IQ2 \u00b7 64K context (both GPUs)",
+   "about": "GLM-5.3-Flash uncensored, IQ2 imatrix with its MTP block (ds4 layout)",
+   "files": {
+    "model": "glm53-iq2-ds4"
+   },
+   "gpus": "all",
+   "ctx": "65536",
+   "env": {},
+   "tools": false,
+   "tasks": false
+  },
+  {
+   "id": "glm-5.3-flash-uncensored-128k",
+   "kind": "llm",
+   "arch": "glm5-next",
+   "title": "GLM-5.3-Flash uncensored IQ2 \u00b7 128K context + a 32K chat (both GPUs)",
+   "about": "GLM-5.3-Flash uncensored, IQ2 imatrix with its MTP block (ds4 layout)",
+   "files": {
+    "model": "glm53-iq2-ds4"
+   },
+   "gpus": "all",
+   "ctx": "131072,32768",
+   "env": {},
+   "tools": false,
+   "tasks": false
+  },
+  {
+   "id": "glm-5.3-flash-uncensored-256k",
+   "kind": "llm",
+   "arch": "glm5-next",
+   "title": "GLM-5.3-Flash uncensored IQ2 \u00b7 256K context + a 32K chat (both GPUs)",
+   "about": "GLM-5.3-Flash uncensored, IQ2 imatrix with its MTP block (ds4 layout)",
+   "files": {
+    "model": "glm53-iq2-ds4"
+   },
+   "gpus": "all",
+   "ctx": "262144,32768",
+   "env": {},
+   "tools": false,
+   "tasks": false
+  },
+  {
+   "id": "qwen-image-2.1-q8",
+   "kind": "image",
+   "arch": "qwen-image-2.1",
+   "title": "Qwen-Image 2.1 Q8_0 (text to image, edit, RGBA)",
+   "about": "Qwen's 7B single-stream DiT, Q8_0 (GGUF by abenzerps), the Qwen3-VL 8B text encoder in int8, the 64-channel VAE",
+   "files": {
+    "transformer": "qwen-image-21-q80",
+    "text-encoder": "qwen-image-21-te-int8",
+    "vae": "qwen-image-21-vae",
+    "tokenizer": "qwen-image-21-tokenizer"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "steps": 40,
+    "cfg": 1.0,
+    "sampler": "euler",
+    "schedule": "shift",
+    "size": "1024x1024"
+   }
+  },
+  {
+   "id": "qwen-image-2.1-q6k",
+   "kind": "image",
+   "arch": "qwen-image-2.1",
+   "title": "Qwen-Image 2.1 Q6_K",
+   "about": "Qwen-Image 2.1 at Q6_K",
+   "files": {
+    "transformer": "qwen-image-21-q6k",
+    "text-encoder": "qwen-image-21-te-int8",
+    "vae": "qwen-image-21-vae",
+    "tokenizer": "qwen-image-21-tokenizer"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "steps": 40,
+    "cfg": 1.0,
+    "sampler": "euler",
+    "schedule": "shift",
+    "size": "1024x1024"
+   }
+  },
+  {
+   "id": "qwen-image-2.1-q4km",
+   "kind": "image",
+   "arch": "qwen-image-2.1",
+   "title": "Qwen-Image 2.1 Q4_K_M",
+   "about": "Qwen-Image 2.1 at Q4_K_M (its packager's recommendation)",
+   "files": {
+    "transformer": "qwen-image-21-q4km",
+    "text-encoder": "qwen-image-21-te-int8",
+    "vae": "qwen-image-21-vae",
+    "tokenizer": "qwen-image-21-tokenizer"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "steps": 40,
+    "cfg": 1.0,
+    "sampler": "euler",
+    "schedule": "shift",
+    "size": "1024x1024"
+   }
+  },
+  {
+   "id": "qwen-image-2.1-uncensored-q8",
+   "kind": "image",
+   "arch": "qwen-image-2.1",
+   "title": "Qwen-Image 2.1 uncensored Q8_0",
+   "about": "Qwen-Image 2.1 without its safety tuning, Q8_0",
+   "files": {
+    "transformer": "qwen-image-21-uc-q80",
+    "text-encoder": "qwen-image-21-te-int8",
+    "vae": "qwen-image-21-vae",
+    "tokenizer": "qwen-image-21-tokenizer"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "steps": 40,
+    "cfg": 1.0,
+    "sampler": "euler",
+    "schedule": "shift",
+    "size": "1024x1024"
+   }
+  },
+  {
+   "id": "qwen-image-2.1-uncensored-q4km",
+   "kind": "image",
+   "arch": "qwen-image-2.1",
+   "title": "Qwen-Image 2.1 uncensored Q4_K_M",
+   "about": "Qwen-Image 2.1 without its safety tuning, Q4_K_M",
+   "files": {
+    "transformer": "qwen-image-21-uc-q4km",
+    "text-encoder": "qwen-image-21-te-int8",
+    "vae": "qwen-image-21-vae",
+    "tokenizer": "qwen-image-21-tokenizer"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "steps": 40,
+    "cfg": 1.0,
+    "sampler": "euler",
+    "schedule": "shift",
+    "size": "1024x1024"
+   }
+  },
+  {
+   "id": "qwen-image-2.1-uncensored-lora",
+   "kind": "lora",
+   "arch": "qwen-image-2.1",
+   "base": "qwen-image-2.1",
+   "title": "Qwen-Image 2.1 uncensored (a LoRA for the base model)",
+   "about": "the uncensored change as a LoRA (scale 1.0)",
+   "files": {
+    "lora": "qwen-image-21-uncensored-lora"
+   },
+   "env": {}
+  }
+ ]
+}

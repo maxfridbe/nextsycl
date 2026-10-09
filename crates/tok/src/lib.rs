@@ -51,6 +51,61 @@ fn strs(v: Option<&Value>) -> Vec<String> {
 }
 
 impl Tokenizer {
+    /// A Hugging Face `tokenizer.json` (byte-level BPE: its vocabulary, merges, added tokens and the pre-tokenizer's
+    /// split pattern) - the text encoders of image and video models ship it so (Qwen3-VL's)
+    pub fn from_hf_json(path: &std::path::Path) -> Result<Tokenizer, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let model = &j["model"];
+        if model["type"].as_str() != Some("BPE") {
+            return Err(format!("{}: only BPE tokenizers are read", path.display()));
+        }
+        let vocab = model["vocab"].as_object().ok_or("tokenizer.json: no model.vocab")?;
+        let mut ids: HashMap<String, u32> = vocab.iter().filter_map(|(t, i)| Some((t.clone(), i.as_u64()? as u32))).collect();
+        let mut special: Vec<(String, u32)> = Vec::new();
+        for a in j["added_tokens"].as_array().into_iter().flatten() {
+            if let (Some(c), Some(i)) = (a["content"].as_str(), a["id"].as_u64()) {
+                ids.insert(c.to_string(), i as u32);
+                special.push((c.to_string(), i as u32));
+            }
+        }
+        special.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
+        let n = ids.values().copied().max().map_or(0, |m| m as usize + 1);
+        let mut tokens = vec![String::new(); n];
+        for (t, i) in &ids {
+            tokens[*i as usize] = t.clone();
+        }
+        let ranks = model["merges"].as_array().into_iter().flatten().enumerate().filter_map(|(r, m)| {
+            let (a, b) = match m {
+                serde_json::Value::String(s) => s.split_once(' ').map(|(a, b)| (a.to_string(), b.to_string()))?,
+                serde_json::Value::Array(p) => (p.first()?.as_str()?.to_string(), p.get(1)?.as_str()?.to_string()),
+                _ => return None,
+            };
+            Some(((a, b), r))
+        }).collect();
+        // the first Split pre-tokenizer's pattern (Qwen's: case-insensitive contractions, letters, single digits...)
+        let pattern = j["pre_tokenizer"]["pretokenizers"].as_array().into_iter().flatten()
+            .chain(std::iter::once(&j["pre_tokenizer"]))
+            .find_map(|p| (p["type"] == "Split").then(|| p["pattern"]["Regex"].as_str()).flatten())
+            .ok_or("tokenizer.json: no Split pre-tokenizer pattern")?;
+        let byte_enc = byte_alphabet();
+        let byte_dec = byte_enc.iter().enumerate().map(|(b, c)| (*c, b as u8)).collect();
+        let mut stop: Vec<u32> = ["<|endoftext|>", "<|im_end|>"].iter().filter_map(|s| ids.get(*s).copied()).collect();
+        stop.sort();
+        Ok(Tokenizer {
+            eos: ids.get("<|im_end|>").copied(),
+            tokens,
+            ids,
+            ranks,
+            special,
+            split: Regex::new(pattern).map_err(|e| e.to_string())?,
+            ignore_merges: model["ignore_merges"].as_bool().unwrap_or(false),
+            byte_enc,
+            byte_dec,
+            stop,
+        })
+    }
+
     pub fn from_gguf(g: &Gguf) -> Result<Tokenizer, String> {
         if g.meta("tokenizer.ggml.model").and_then(Value::as_str) != Some("gpt2") {
             return Err("only byte-level BPE (tokenizer.ggml.model gpt2) is read".into());
@@ -437,5 +492,20 @@ mod tests {
     fn the_template() {
         let m = [Message { role: "user", content: "Hi", ..Default::default() }];
         assert_eq!(glm_chat(&m, Effort::Low, &[]), "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Hi<|assistant|><think>");
+    }
+}
+
+#[cfg(test)]
+mod hf_json_tests {
+    /// Qwen3-VL's tokenizer.json against the ids the reference pipeline made (NS_TEST_QWEN_TOKENIZER: the file,
+    /// NS_TEST_QWEN_TOKENS: the reference's tokens.json); skipped without them
+    #[test]
+    fn qwen3vl_tokens_match_the_reference() {
+        let (Ok(tj), Ok(refj)) = (std::env::var("NS_TEST_QWEN_TOKENIZER"), std::env::var("NS_TEST_QWEN_TOKENS")) else { return };
+        let t = super::Tokenizer::from_hf_json(std::path::Path::new(&tj)).unwrap();
+        let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(refj).unwrap()).unwrap();
+        let want: Vec<u32> = r["ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        let text = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n<|im_start|>user\nA red fox sitting in fresh snow, morning light, photograph<|im_end|>\n<|im_start|>assistant\n";
+        assert_eq!(t.encode(text), want);
     }
 }

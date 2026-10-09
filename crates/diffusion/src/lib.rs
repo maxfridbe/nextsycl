@@ -6,7 +6,10 @@
 //! - `sigmas`: the noise levels of a schedule (flow matching: 1 = noise, 0 = image), computed on the host.
 //! - `LoraUse`: a LoRA file and its scale, merged at load (a preset) or applied per request.
 //! - `Picture`: 8-bit RGB / RGBA pixels, read from and written to PNG.
+//! - `kernels`: the shared diffusion kernels (kernels/diffusion, H3's) on a GPU - linears (int8 ConvRot too), norms,
+//!   RoPE, attention, convolutions - for the engines and the text encoders to compose.
 
+pub mod kernels;
 pub mod picture;
 pub mod schedule;
 

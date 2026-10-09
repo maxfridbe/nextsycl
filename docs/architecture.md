@@ -16,10 +16,11 @@ crates/                    THE FOUNDATION - every kind uses it, it knows no kind
   sys        nextsycl-sys        the kernel libraries' shared C ABI (kernels/ns/ns.h), opened at run time
   core       nextsycl-core       GPUs (one SYCL context each), device / host buffers, arenas, copies; which kind's
                                  kernel library this process uses (use_kind)
-  gguf       nextsycl-gguf       the GGUF file format
+  gguf       nextsycl-gguf       the GGUF and safetensors file formats
   tok        nextsycl-tok        tokenizers and chat templates
   diffusion  nextsycl-diffusion  what every diffusion engine shares: samplers and schedules by name, the sigma
-                                 schedules, LoRA references, pictures (PNG)
+                                 schedules, LoRA references, pictures (PNG); the diffusion kernels' bindings (Nsd)
+  qwen3vl    nextsycl-qwen3vl    the Qwen3-VL text tower (int8 ConvRot): a text encoder image and video engines share
 
 llm/                       LANGUAGE MODELS
   contract   nextsycl-llm        the contract: Engine, Session / Decoder / Checkpoint, Sampler, EngineKind; host sampling
@@ -29,6 +30,7 @@ llm/                       LANGUAGE MODELS
 
 image/                     IMAGES
   contract   nextsycl-image      the contract: ImageEngine, ImageRequest (+ Edit), Step, ImageKind
+  qwenimage21 nextsycl-image-qwenimage21  Qwen-Image 2.1: DiT, VAE, pipeline, stage checks
   example    nextsycl-image-example  a template
 
 video/                     VIDEO
@@ -45,6 +47,7 @@ cli/
 kernels/                   SYCL ONLY - one library a kind (dist/libnextsycl-<kind>.so)
   ns/                     the shared part, linked into every kind's library: GPUs, memory, queues, copies, tickets
   strata/                 the imported Strata kernels (MIT), linked into the llm library
+  diffusion/              the shared diffusion kernels (H3's, on oneDNN), linked into the image and video libraries
   llm/<arch>/  image/<arch>/  video/<arch>/   an engine's own kernels and its header (ns_<kind>_<arch>_* symbols)
 ```
 

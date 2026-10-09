@@ -6,4 +6,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nextsycl-core.workspace = true
 png = "0.17"

@@ -15,6 +15,7 @@ nextsycl-tok.workspace = true
 nextsycl-llm-example.workspace = true
 nextsycl-image.workspace = true
 nextsycl-image-example.workspace = true
+nextsycl-image-qwenimage21.workspace = true
 nextsycl-video.workspace = true
 nextsycl-video-example.workspace = true
 nextsycl-models.workspace = true

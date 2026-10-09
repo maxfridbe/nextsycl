@@ -11,7 +11,10 @@
 //!   nextsycl models list [--json]
 //!   nextsycl models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M...]] [--set NAME=VALUE]...
 //!                       [--no-tools] [--no-tasks] [--disabled]
-//!   nextsycl models download <id> <url | hf:org/repo/path/file.gguf> [--dir DIR] [add's options]
+//!   nextsycl models search [TEXT] [--kind llm|image|video|lora]     the catalog of supported models
+//!   nextsycl models pull <id>... [--dir DIR] [--from DIR]... [--verify] [--again]
+//!                                           a catalog model's files downloaded (or linked), checked, registered
+//!   nextsycl models pull <id> <url | hf:org/repo/path/file.gguf> [--dir DIR] [add's options]   a file outside it
 //!   nextsycl models remove <id> [--files]      (--files: the model's GGUF shards are deleted too)
 //!   nextsycl models enable <id> | disable <id>
 //! ```
@@ -61,6 +64,11 @@ fn save(cfg: &Config, path: &Path, models: &[Value]) -> Result<(), String> {
     sync_modes(cfg, models)
 }
 
+/// Every entry
+pub fn all(cfg: &Config) -> Result<Vec<Value>, String> {
+    load(&registry(cfg))
+}
+
 /// The entry `id`
 pub fn find(cfg: &Config, id: &str) -> Result<Option<Value>, String> {
     Ok(load(&registry(cfg))?.into_iter().find(|m| m["id"] == id))
@@ -86,6 +94,8 @@ fn shards(first: &Path) -> Vec<PathBuf> {
 /// container must see, at the same paths
 pub fn paths(m: &Value) -> Vec<PathBuf> {
     let mut v = vec![PathBuf::from(s(m, "file"))];
+    // an entry of several files (pulled from the catalog: by role)
+    v.extend(m["files"].as_object().into_iter().flatten().filter_map(|(_, p)| p.as_str()).map(PathBuf::from));
     if let Some(env) = m.get("env").and_then(Value::as_object) {
         for val in env.values().filter_map(Value::as_str) {
             for part in val.split(',') {
@@ -102,8 +112,19 @@ pub fn paths(m: &Value) -> Vec<PathBuf> {
     v
 }
 
+/// Every file of an entry: its file's shards, and the files it lists by role
+fn files_of(m: &Value) -> Vec<PathBuf> {
+    let mut v = shards(Path::new(&s(m, "file")));
+    for p in m["files"].as_object().into_iter().flatten().filter_map(|(_, p)| p.as_str()).map(PathBuf::from) {
+        if !v.contains(&p) {
+            v.push(p);
+        }
+    }
+    v
+}
+
 fn bytes_of(m: &Value) -> u64 {
-    shards(Path::new(&s(m, "file"))).iter().filter_map(|p| std::fs::metadata(p).ok()).map(|x| x.len()).sum()
+    files_of(m).iter().filter_map(|p| std::fs::metadata(p).ok()).map(|x| x.len()).sum()
 }
 
 /// `nextsycl models ...`
@@ -114,7 +135,7 @@ pub fn cmd(cfg: &Config, raw: &[String], describe: Describe) -> Result<(), Strin
     let flag = |k: &str| raw.iter().any(|a| a == k);
     let pos: Vec<&String> = {
         // the positional arguments: those that are not an option or an option's value
-        let with_value = ["--title", "--gpu", "--ctx", "--set", "--dir"];
+        let with_value = ["--title", "--gpu", "--ctx", "--set", "--dir", "--from", "--kind"];
         let mut v = Vec::new();
         let mut i = 1;
         while i < raw.len() {
@@ -157,6 +178,30 @@ pub fn cmd(cfg: &Config, raw: &[String], describe: Describe) -> Result<(), Strin
             println!("added {id}");
             Ok(())
         }
+        Some("search") => crate::catalog::search(cfg, &models, pos.first().map(|s| s.as_str()), opt("--kind").as_deref()),
+        // a catalog model (or several), or `pull <id> <url | hf:org/repo/path/file.gguf>` for a file outside it
+        Some("pull") if pos.len() == 2 && (pos[1].starts_with("hf:") || pos[1].contains("://")) => {
+            cmd(cfg, &[&["download".to_string()][..], &raw[1..]].concat(), describe)
+        }
+        Some("pull") => {
+            if pos.is_empty() {
+                return Err("nextsycl models pull <id>... [--dir DIR] [--from DIR]... [--verify] [--again]   (nextsycl models search)".into());
+            }
+            let ids: Vec<String> = pos.iter().map(|s| s.to_string()).collect();
+            for e in crate::catalog::pull(cfg, &models, &ids, raw)? {
+                let id = s(&e, "id");
+                if kind_of(&e) == "llm" {
+                    // the file is one this program serves
+                    let g = nextsycl_gguf::Gguf::open(Path::new(&s(&e, "file"))).map_err(|x| x.0)?;
+                    describe(&g)?;
+                }
+                models.retain(|m| m["id"] != id.as_str());
+                models.push(e);
+                save(cfg, &path, &models)?;
+                println!("registered {id}");
+            }
+            Ok(())
+        }
         Some("download") => {
             let (id, src) = match (pos.first(), pos.get(1)) {
                 (Some(i), Some(u)) => ((*i).clone(), (*u).clone()),
@@ -197,7 +242,9 @@ pub fn cmd(cfg: &Config, raw: &[String], describe: Describe) -> Result<(), Strin
             let i = models.iter().position(|m| m["id"] == id.as_str()).ok_or_else(|| format!("no model {id}"))?;
             let m = models.remove(i);
             if flag("--files") {
-                for p in shards(Path::new(&s(&m, "file"))) {
+                // a file another entry still uses stays
+                let kept: Vec<PathBuf> = models.iter().flat_map(files_of).collect();
+                for p in files_of(&m).into_iter().filter(|p| !kept.contains(p)) {
                     match std::fs::remove_file(&p) {
                         Ok(()) => println!("deleted {}", p.display()),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -271,7 +318,8 @@ fn sync_modes(cfg: &Config, models: &[Value]) -> Result<(), String> {
     let ids: Vec<String> = models.iter().map(|m| s(m, "id")).collect();
     let mut modes: Vec<Value> = d["modes"].as_array().cloned().unwrap_or_default();
     modes.retain(|m| m["managed_by"] != "nextsycl" && !ids.contains(&s(m, "name")));
-    for m in models.iter().filter(|m| m["enabled"] != false) {
+    // the studio's chat modes: the language models
+    for m in models.iter().filter(|m| m["enabled"] != false && kind_of(m) == "llm") {
         modes.push(json!({
             "name": s(m, "id"),
             "title": format!("{} (nextsycl)", s(m, "title")),

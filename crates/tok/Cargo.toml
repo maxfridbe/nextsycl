@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 nextsycl-gguf.workspace = true
 fancy-regex = "0.14"
+serde_json.workspace = true

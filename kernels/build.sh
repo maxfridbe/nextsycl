@@ -29,11 +29,19 @@ else
 fi
 LINK+=(-fsycl-device-code-split=per_kernel -shared -qmkl=sequential)
 
+# the diffusion kernels (diffusion/: H3's, shared by the image and video engines) and those engines' own are built as
+# H3 builds them - its flags, oneDNN (the build image's /opt/onednn, H3's patched 3.12) - so their numerics are H3's;
+# only the image and video libraries link oneDNN
+DNNL=${DNNL:-/opt/onednn}
+DIFFFLAGS=(-fsycl -std=c++20 -O3 -fPIC -Wno-unused-parameter -Wno-unused-variable -Wno-deprecated-declarations -I"$DNNL/include" -Ins -Idiffusion)
+[ -f "$DNNL/H3_SDPA_NO_FALLBACK" ] && DIFFFLAGS+=(-DNSD_SDPA_NO_FALLBACK)
+[ -n "$AOT" ] && DIFFFLAGS+=(-fsycl-targets=spir64_gen)
+
 # the sources: the shared part (ns/), the imported Strata kernels (strata/), and one directory a kind holding one
 # directory an engine (llm/<arch>/, image/<arch>/, video/<arch>/)
 KINDS="llm image video"
 all_sources() {
-  ls $S/src/kernels/*.dp.cpp $S/src/prefill/*.dp.cpp ns/*.cpp 2>/dev/null
+  ls $S/src/kernels/*.dp.cpp $S/src/prefill/*.dp.cpp ns/*.cpp diffusion/*.cpp 2>/dev/null
   for k in $KINDS; do ls $k/*/*.cpp 2>/dev/null; done
 }
 SRCS=${ONLY:-$(all_sources)}
@@ -41,7 +49,8 @@ echo "==> compiling $(echo $SRCS | wc -w) sources (AOT ${AOT:-none}, $JOBS at a 
 fail=0
 printf '%s\n' $SRCS | xargs -P "$JOBS" -I{} sh -c '
   o="'$OBJ'/$(echo {} | tr / _).o"
-  if icpx '"${CXXFLAGS[*]}"' -c {} -o "$o" 2> "$o.log"; then echo "ok   {}"; else echo "FAIL {}"; fi' | sort | tee "$OBJ/compile.txt"
+  case {} in diffusion/*|image/*|video/*) f="'"${DIFFFLAGS[*]}"'" ;; *) f="'"${CXXFLAGS[*]}"'" ;; esac
+  if icpx $f -c {} -o "$o" 2> "$o.log"; then echo "ok   {}"; else echo "FAIL {}"; fi' | sort | tee "$OBJ/compile.txt"
 grep -q '^FAIL' "$OBJ/compile.txt" && fail=1
 if [ "$fail" = 1 ]; then
   echo "==> failures (first lines of each log):"
@@ -60,10 +69,18 @@ done
 # running server keeps the library it mapped (writing over a mapped library in place would change the code under it)
 for k in $KINDS; do
   objs="$(ls "$OBJ"/ns_*.o) $(ls "$OBJ"/${k}_*.o 2>/dev/null || true)"
-  [ "$k" = llm ] && objs="$objs $(ls "$OBJ"/strata_*.o)"
+  extra=()
+  if [ "$k" = llm ]; then
+    objs="$objs $(ls "$OBJ"/strata_*.o)"
+  else
+    objs="$objs $(ls "$OBJ"/diffusion_*.o)"
+    extra=(-L"$DNNL/lib" -ldnnl -Wl,-rpath,'$ORIGIN')
+  fi
   echo "==> linking libnextsycl-$k.so"
-  icpx "${LINK[@]}" $objs -o "$OUT/.libnextsycl-$k.so.new" && mv -f "$OUT/.libnextsycl-$k.so.new" "$OUT/libnextsycl-$k.so"
+  icpx "${LINK[@]}" $objs "${extra[@]}" -o "$OUT/.libnextsycl-$k.so.new" && mv -f "$OUT/.libnextsycl-$k.so.new" "$OUT/libnextsycl-$k.so"
 done
+# oneDNN beside the image and video libraries (they find it there: rpath $ORIGIN)
+cp -L "$DNNL/lib/libdnnl.so.3" "$OUT/.libdnnl.so.3.new" && mv -f "$OUT/.libdnnl.so.3.new" "$OUT/libdnnl.so.3"
 # the name before the split (libnextsycl.so = the llm library), for runners and services that still name it
 ln -sf libnextsycl-llm.so "$OUT/libnextsycl.so"
 ls -la "$OUT"/libnextsycl*.so

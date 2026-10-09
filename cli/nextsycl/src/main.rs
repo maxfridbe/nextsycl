@@ -13,6 +13,7 @@
 mod bench;
 mod client;
 mod container;
+mod image;
 mod service;
 
 use nextsycl_llm::sampling::{dist, sample, Rng};
@@ -37,8 +38,12 @@ every kind:
   nextsycl models [list] [--json]           the registry (NS_REGISTRY): every model this machine serves, its kind
   nextsycl models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M...]] [--set NAME=VALUE]...
                       [--no-tools] [--no-tasks] [--disabled]
-  nextsycl models download <id> <url | hf:org/repo/path/file.gguf> [--dir DIR] [add's options]
-                                every shard of a split file, resumed when run again; then added
+  nextsycl models search [TEXT] [--kind llm|image|video|lora]     the catalog of supported models
+  nextsycl models pull <id>... [--dir DIR] [--from DIR]... [--verify] [--again]
+                                its files downloaded (resumed when run again; each checked by SHA-256) or linked
+                                (the same file already here; --from DIR: copies elsewhere on the machine), registered
+  nextsycl models pull <id> <url | hf:org/repo/path/file.gguf> [--dir DIR] [add's options]
+                                a file outside the catalog (every shard of a split file); then added
   nextsycl models remove <id> [--files]     --files: its files deleted too
   nextsycl models enable <id> | disable <id>
   nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
@@ -777,11 +782,6 @@ fn llm(cfg: &nextsycl_models::Config, args: &[String]) -> Result<(), String> {
     }
 }
 
-/// The image engines this program has (image/<arch>)
-fn image_engines() -> Vec<nextsycl_image::ImageKind> {
-    vec![nextsycl_image_example::kind()]
-}
-
 /// The video engines this program has (video/<arch>)
 fn video_engines() -> Vec<nextsycl_video::VideoKind> {
     vec![nextsycl_video_example::kind()]
@@ -802,19 +802,6 @@ fn list_engines(rows: impl Iterator<Item = (String, &'static str)>) {
     println!("{:<24} ENGINE", "ARCHITECTURE");
     for (a, n) in rows {
         println!("{a:<24} {n}");
-    }
-}
-
-/// `nextsycl image <command>`: the image commands - for now the engines; `gen`, `edit`, `start`... come with the first
-/// image engine
-fn image(args: &[String]) -> Result<(), String> {
-    match args.first().map(String::as_str) {
-        Some("engines") => {
-            list_engines(image_engines().iter().map(|k| (k.archs.join(", "), k.name)));
-            Ok(())
-        }
-        Some("selftest") => selftest("image", &args[1..], nextsycl_image_example::selftest),
-        _ => Err("nextsycl image engines | selftest   (gen, edit, start, serve, ... come with the first image engine: CONTRIBUTING.md)".into()),
     }
 }
 
@@ -845,7 +832,7 @@ fn main() -> ExitCode {
     let rest = args.get(1..).unwrap_or(&[]);
     let r = match args.first().map(String::as_str) {
         Some("llm") => llm(&cfg, &args[1..]),
-        Some("image") => image(&args[1..]),
+        Some("image") => image::cmd(&cfg, &args[1..], |r| selftest("image", r, nextsycl_image_example::selftest)),
         Some("video") => video(&args[1..]),
         // the llm commands' names from before the kinds (nextsycl start = nextsycl llm start, ...)
         Some("start") => service::start(&cfg, rest),
