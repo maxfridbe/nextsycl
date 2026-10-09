@@ -211,7 +211,14 @@ of IQ2_XXS instead could win twice.
       per-request ones. qwen4exp, glm5next and Qwen-Image declare theirs
 - [ ] LoRAs per request as a side path (no reload); `image start | stop | ps`; the switcher's images route; edits;
       Qwen-Image (20B) and lightx2v's Lightning LoRAs
-- [ ] H3 into video/ (copied from its committed sycl-port branch): `nextsycl video ...` for all its commands
+- [x] H3 into video/ (from the deployed H3 studio, newer than its sycl-port branch): the engine (video/h3) and its
+      jobs on libnextsycl-video.so, the daemon (glue/serve video::daemon), the studio (glue/serve video::studio) and
+      its front end (wfe/video), the tools; `nextsycl video start | serve | job | ps | inspect | cancel | rm |
+      status | gpus | unload | logs | speech | scene | join | speechpct | plan | stop`; the catalog's minimax-h3
+      entries; checked against H3's h3d (same spread, same speed)
+- [ ] Switch hardac1's production (h3-engine / h3-studio on :8090, which also switches chat) to nextsycl video
+- [ ] Video: dedupe against the foundation (its gguf / safetensors / tokenizer / LoRA readers -> crates/), the text
+      encoder into crates/qwen3vl (the 32B GGUF form), the ESRGAN weights in the catalog
 
 ## Several models (docs/engines.md, 2026-10-08)
 

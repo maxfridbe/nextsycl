@@ -13,6 +13,11 @@
 //!   NS_VIDEO_IDLE         seconds without a job before an engine unloads; 0 = never (default 600)
 //!   NS_VIDEO_GPU_LOCK     a lock file shared with the GPU's other users
 //!   NS_VIDEO_LLM_SWITCHER a front end's model switcher URL: its model stops before loading, comes back after
+//!   NS_VIDEO_MODELS_DIR   a directory seen as /models in the container: what clips, templates and scene files name
+//!                         as /models/... (the pixel upscalers, LoRAs - H3's paths)
+//!   the studio (`serve`):  NS_VIDEO_LISTEN, NS_VIDEO_PORT (127.0.0.1, 8095), NS_VIDEO_STUDIO_DIR (its queue and
+//!                         state, ~/.local/share/nextsycl/studio), NS_VIDEO_LLM_MODES (the language models it
+//!                         switches), NS_VIDEO_GPUSTAT (/run/gpustat.json), NS_VIDEO_TEMPLATES
 //! ```
 
 use std::path::PathBuf;
@@ -136,6 +141,9 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
         }
     }
     args.extend(mount(&out, &out.to_string_lossy(), false));
+    if let Some(m) = cfg.get("NS_VIDEO_MODELS_DIR") {
+        args.extend(mount(&PathBuf::from(m), "/models", true));
+    }
     args.extend(mount(&sock_dir, SOCKET_DIR_IN, false));
     let mut daemon_args: Vec<String> = vec!["--socket".into(), format!("{SOCKET_DIR_IN}/video.sock"), "--model".into(), id.clone(),
                                            "--idle".into(), cfg.or("NS_VIDEO_IDLE", "600")];
@@ -236,4 +244,153 @@ pub fn logs(cfg: &Config) -> Result<(), String> {
     } else {
         Err(format!("no log for {ENGINE} (is it running?)"))
     }
+}
+
+// ---- the studio: the web front end and its clip queue, a host process -------------------------------------------
+
+/// The studio's process files: its pid, where it listens, its log - beside the daemon's socket
+fn studio_files(cfg: &Config) -> (PathBuf, PathBuf, PathBuf) {
+    let d = cfg.socket_dir();
+    (d.join("studio.pid"), d.join("studio.listen"), d.join("studio.log"))
+}
+
+pub fn studio_pid(cfg: &Config) -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(studio_files(cfg).0).ok()?.trim().parse().ok()?;
+    let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    String::from_utf8_lossy(&cmd).contains("studio").then_some(pid)
+}
+
+/// "studio: http://..." or "not running", under status
+pub fn web_line(cfg: &Config) -> String {
+    if studio_pid(cfg).is_none() {
+        return "studio: not running (nextsycl video serve)".into();
+    }
+    let listen = std::fs::read_to_string(studio_files(cfg).1).unwrap_or_default();
+    let shown = match listen.split_once(':') {
+        Some(("0.0.0.0", port)) => format!("{}:{port}", std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim()),
+        _ => listen,
+    };
+    format!("studio: http://{shown}/")
+}
+
+/// The front end's denoiser names for the daemon's models (INT8 -> minimax-h3, Q6_K -> minimax-h3-q6k, ...)
+pub fn engine_names(cfg: &Config) -> Vec<(String, String)> {
+    let mut ids: Vec<String> = cfg.get("NS_VIDEO_MODEL").into_iter().collect();
+    ids.extend(cfg.or("NS_VIDEO_ENGINES", "").split_whitespace().map(String::from));
+    if ids.is_empty() {
+        if let Ok((m, _)) = super::model(cfg, None) {
+            ids.push(m["id"].as_str().unwrap_or("").to_string());
+        }
+    }
+    ids.into_iter().map(|id| {
+        let q = match id.rsplit('-').next().unwrap_or("") {
+            "q6k" => "Q6_K",
+            "q4km" => "Q4_K_M",
+            "q8" => "Q8_0",
+            _ => "INT8",
+        };
+        (q.to_string(), id)
+    }).collect()
+}
+
+/// `nextsycl video serve [--bind ADDR] [--port N]`: the studio, as a host process of its own (setsid: it outlives
+/// this command). On the host, not in a container: the language models it switches (NS_VIDEO_LLM_MODES) are the
+/// host's own programs.
+pub fn serve(cfg: &Config, raw: &[String]) -> Result<(), String> {
+    let bind = super::opt(raw, "--bind").map(str::to_string).unwrap_or_else(|| cfg.or("NS_VIDEO_LISTEN", "127.0.0.1"));
+    let port: u16 = super::opt(raw, "--port").map(str::to_string).unwrap_or_else(|| cfg.or("NS_VIDEO_PORT", "8095")).parse()
+        .map_err(|_| "--port: not a port")?;
+    if studio_pid(cfg).is_some() {
+        println!("the studio is already running ({})", web_line(cfg));
+        return Ok(());
+    }
+    if !cfg.dist.join("wfe/video/index.html").exists() {
+        return Err(format!("{}: the front end is not built yet (./build.sh wfe)", cfg.dist.join("wfe").display()));
+    }
+    let sock_dir = cfg.socket_dir();
+    std::fs::create_dir_all(&sock_dir).map_err(|e| e.to_string())?;
+    let listen = if bind.contains(':') && !bind.starts_with('[') { format!("[{bind}]:{port}") } else { format!("{bind}:{port}") };
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = cfg.get("NS_VIDEO_STUDIO_DIR").unwrap_or_else(|| format!("{home}/.local/share/nextsycl/studio"));
+    let out = out_dir(cfg);
+    std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let (pidf, listenf, logf) = studio_files(cfg);
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut c = std::process::Command::new("setsid");
+    c.arg(exe).args(["video", "studio", "--listen", &listen, "--socket"]).arg(socket(cfg)).arg("--ui").arg(cfg.dist.join("wfe"))
+        .arg("--out").arg(&out).args(["--dir", &dir, "--gpustat", &cfg.or("NS_VIDEO_GPUSTAT", "/run/gpustat.json"), "--logs", &format!("{dir}/logs")]);
+    if let Some(t) = cfg.get("NS_VIDEO_TEMPLATES") {
+        c.args(["--templates", &t]);
+    }
+    if let Some(m) = cfg.get("NS_VIDEO_LLM_MODES") {
+        c.args(["--llm-modes", &m]);
+    }
+    for (q, id) in engine_names(cfg) {
+        c.args(["--engine-name", &format!("{q}={id}")]);
+    }
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(&logf).map_err(|e| format!("{}: {e}", logf.display()))?;
+    let child = c.stdin(Stdio::null()).stdout(log.try_clone().map_err(|e| e.to_string())?).stderr(log).spawn().map_err(|e| e.to_string())?;
+    std::fs::write(&pidf, format!("{}\n", child.id())).map_err(|e| e.to_string())?;
+    std::fs::write(&listenf, &listen).map_err(|e| e.to_string())?;
+    let reach = match bind.as_str() {
+        "0.0.0.0" => format!("127.0.0.1:{port}"),
+        "::" | "[::]" => format!("[::1]:{port}"),
+        _ => listen.clone(),
+    };
+    wait_until("the studio", 20, || std::net::TcpStream::connect(&reach).is_ok())?;
+    // setsid forks: the studio's own pid is the listener's
+    if let Ok(o) = std::process::Command::new("pgrep").args(["-f", &format!("video studio --listen {listen}")]).output() {
+        if let Some(p) = String::from_utf8_lossy(&o.stdout).lines().last() {
+            std::fs::write(&pidf, format!("{p}\n")).map_err(|e| e.to_string())?;
+        }
+    }
+    println!("{}", web_line(cfg));
+    Ok(())
+}
+
+/// The studio's own process (`serve` starts it): its options as `sycl-h3 studio` took them
+pub fn studio(raw: &[String]) -> Result<(), String> {
+    use nextsycl_serve::video::studio;
+    let need = |k: &str| super::opt(raw, k).map(str::to_string).ok_or_else(|| format!("studio needs {k}"));
+    let dir = PathBuf::from(need("--dir")?);
+    let out = need("--out")?;
+    let engines = repeated(raw, "--engine-name").iter().filter_map(|e| e.split_once('=').map(|(q, i)| (q.to_string(), i.to_string()))).collect();
+    studio::run(studio::Options {
+        listen: need("--listen")?,
+        socket: need("--socket")?.into(),
+        ui: need("--ui")?.into(),
+        out: out.clone().into(),
+        // the clips' directory is mounted at its own path in the daemon's container: the same path both sides
+        out_in: out,
+        logs: super::opt(raw, "--logs").map(PathBuf::from).unwrap_or_else(|| dir.join("logs")),
+        dir,
+        templates: super::opt(raw, "--templates").map(PathBuf::from),
+        gpustat: super::opt(raw, "--gpustat").unwrap_or("/run/gpustat.json").into(),
+        llm_modes: super::opt(raw, "--llm-modes").map(PathBuf::from),
+        engines,
+    })
+    .map_err(|e| e.0)
+}
+
+/// `nextsycl video stop --web | --all`: the studio (gracefully)
+pub fn stop_web(cfg: &Config) {
+    match studio_pid(cfg) {
+        Some(pid) => {
+            let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+            let t0 = Instant::now();
+            while studio_pid(cfg).is_some() && t0.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let _ = std::fs::remove_file(studio_files(cfg).0);
+            println!("studio: stopped");
+        }
+        None => println!("studio: not running"),
+    }
+}
+
+/// `nextsycl video logs --web`: the studio's log, followed
+pub fn logs_web(cfg: &Config) -> Result<(), String> {
+    let f = studio_files(cfg).2;
+    let st = std::process::Command::new("tail").args(["-n", "60", "-f"]).arg(&f).status().map_err(|e| e.to_string())?;
+    if st.success() { Ok(()) } else { Err(format!("no log at {}", f.display())) }
 }

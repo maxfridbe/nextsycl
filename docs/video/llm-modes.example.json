@@ -1,0 +1,23 @@
+{
+ "default": "chat",
+ "modes": [
+  {
+   "name": "chat",
+   "title": "A chat model on port 8000",
+   "url": "http://127.0.0.1:8000",
+   "health": "/health",
+   "up_codes": [200, 503],
+   "start": "bash /path/to/start-chat-model.sh",
+   "stop": "docker stop -t 120 chat-model; docker rm -f chat-model"
+  },
+  {
+   "name": "coder",
+   "title": "A coding model on port 8085",
+   "url": "http://127.0.0.1:8085",
+   "health": "/v1/models",
+   "model": "my-coder-model\"",
+   "start": "/path/to/start-coder.sh",
+   "stop": "fuser -k 8085/tcp"
+  }
+ ]
+}

@@ -3,7 +3,9 @@
 //! the daemon's queue; `worker` is the per-GPU process the daemon starts.
 
 pub mod client;
+pub mod plan;
 pub mod service;
+pub mod tools;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -14,12 +16,16 @@ use serde_json::{json, Value};
 
 const USAGE: &str = "the service (the daemon in its container; models are registry ids):
 nextsycl video start [--model ID] [--engine ID]... [--all | --gpu N ...] [--shared-gpu N ...]
-nextsycl video stop | status [--no-stream] | logs | gpus | unload [--gpu N]
+nextsycl video serve [--bind ADDR] [--port N]   the studio: the web front end and its clip queue (default :8095)
+nextsycl video stop [--web | --all] | status [--no-stream] | logs [--web] | gpus | unload [--gpu N]
 the jobs:
 nextsycl video job <kind> [--KEY VALUE]... [--engine ID] [--gpu N] [-f]   queue one (-f: follow its log)
 nextsycl video job <kind> [--model ID] [--KEY VALUE]... [--json SPEC|@FILE] [--gpu N] --here
                     a job in this process instead: load, run, print its result (kinds: nextsycl video engines)
 nextsycl video ps [-a] | inspect <id> | cancel <id>... | rm <id>...
+the studio's tools (they talk to it as the front end does):
+nextsycl video speech <text file> [options] | scene <scene.json> [options] | join <prefix> [options] | speechpct <clip>...
+nextsycl video plan measure [--gpu N ...] [--engine NAME ...] [--tokens 2048,...] [--no-clip] | plan show
 nextsycl video engines | selftest [--gpu N]
 in the service's container: nextsycl video daemon --socket PATH --model ID [--engine ID]... [--gpu N]... [--shared-gpu N]...
                     [--idle S] [--gpu-lock FILE] [--llm-switcher URL] [--threads N];  nextsycl video worker --gpu N --model ID";
@@ -333,9 +339,26 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("selftest") => selftest(rest),
         Some("gpus") => service::gpus(cfg, rest),
         Some("start") => service::start(cfg, rest),
-        Some("stop") => service::stop(cfg),
+        Some("stop") => {
+            let (web, all) = (rest.iter().any(|a| a == "--web"), rest.iter().any(|a| a == "--all"));
+            if web || all {
+                service::stop_web(cfg);
+            }
+            if !web || all {
+                service::stop(cfg)?;
+            }
+            Ok(())
+        }
+        Some("logs") if rest.iter().any(|a| a == "--web") => service::logs_web(cfg),
         Some("logs") => service::logs(cfg),
-        Some("status") => client::status(rest, &|| String::new()),
+        Some("serve") => service::serve(cfg, rest),
+        Some("speech") => tools::speech(cfg, rest).map_err(|e| e.0),
+        Some("scene") => tools::scene(cfg, rest).map_err(|e| e.0),
+        Some("join") => tools::join(cfg, rest).map_err(|e| e.0),
+        Some("speechpct") => tools::speechpct(rest).map_err(|e| e.0),
+        Some("plan") => plan::run(cfg, rest).map_err(|e| e.0),
+        Some("studio") => service::studio(rest),
+        Some("status") => client::status(rest, &|| service::web_line(cfg) + "\n"),
         Some("ps") => client::ps(rest),
         Some("inspect") => client::inspect(rest),
         Some("cancel") => client::cancel(rest),

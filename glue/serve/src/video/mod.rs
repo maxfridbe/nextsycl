@@ -3,3 +3,4 @@
 
 pub mod daemon;
 pub mod signals;
+pub mod studio;

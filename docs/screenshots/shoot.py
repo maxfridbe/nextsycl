@@ -4,6 +4,7 @@ install chromium); the page renders through requestAnimationFrame, so a plain he
 blank - this waits for the panels.
 
     python shoot.py image http://localhost:8086 docs/screenshots   # idle, running, done; desktop and phone widths
+    python shoot.py video http://localhost:8095 docs/screenshots   # the studio (nextsycl video serve)
 
 Written as PNG, kept in the repository as WebP (quality 82: a tenth of the size).
 """
@@ -39,13 +40,26 @@ async def image(p, url, out):
     return errors
 
 
+async def video(p, url, out):
+    b = await p.chromium.launch()
+    pg = await b.new_page(viewport={"width": 1300, "height": 1100})
+    errors = []
+    pg.on("pageerror", lambda e: errors.append(str(e)))
+    await pg.goto(url)
+    await pg.wait_for_selector("section.panel", timeout=60000)
+    await pg.wait_for_timeout(2500)
+    await pg.screenshot(path=f"{out}/video-studio.png", full_page=True)
+    await b.close()
+    return errors
+
+
 async def main(kind, url, out):
     async with async_playwright() as p:
-        errors = await {"image": image}[kind](p, url, out)
+        errors = await {"image": image, "video": video}[kind](p, url, out)
     try:
         import glob
         from PIL import Image
-        for f in glob.glob(f"{out}/{kind}-wfe-*.png"):
+        for f in glob.glob(f"{out}/{kind}-*.png"):
             Image.open(f).convert("RGB").save(f[:-4] + ".webp", quality=82, method=6)
     except ImportError:
         print("no Pillow: the PNGs stay")

@@ -1,0 +1,14 @@
+{
+ "narrator": {
+  "rate": 3.4,
+  "realism": 0.5,
+  "who": "a calm middle-aged man with short grey hair and a neatly trimmed beard, wearing a dark wool jacket over a white shirt, seated in a leather armchair in a quiet library, tall shelves of old books behind him, lit by a warm reading lamp whose level and colour stay exactly the same from the first frame to the last.",
+  "frame": "The framing is a medium shot, his head and shoulders filling the frame with the shelves behind him, and that exact shot size and camera position hold from the first frame to the last.",
+  "voice": "the man with a warm, unhurried, resonant baritone, in a measured storytelling cadence (S1)",
+  "look": "He looks directly into the camera with a warm, calm expression, blinking naturally every few seconds the way a person does, speaking aloud on camera with his lips clearly forming every word as he talks,",
+  "pause": "He glances down for a moment and takes a short, soft breath in, then lifts his eyes back to the camera and speaks aloud on camera, blinking naturally every few seconds, his lips clearly forming every word as he talks,",
+  "tilt": "As the line ends he tilts his head a few degrees to one side with a faint smile, his eyes still on the camera, as the shot ends.",
+  "hold": "He holds his gaze on the camera, otherwise still, as the shot ends.",
+  "sound": "His voice, the faint creak of the armchair and the quiet of the room."
+ }
+}

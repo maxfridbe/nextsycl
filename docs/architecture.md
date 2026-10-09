@@ -34,12 +34,15 @@ image/                     IMAGES
   example    nextsycl-image-example  a template
 
 video/                     VIDEO
-  contract   nextsycl-video      the contract: VideoEngine, VideoRequest (+ Keyframe), Progress, Clip, VideoKind
+  contract   nextsycl-video      the contract: VideoEngine (generate; jobs / run_job), VideoRequest (+ Keyframe),
+                                 Progress, Clip, VideoKind
+  h3         nextsycl-video-h3   MiniMax H3: H3's engine, jobs and mp4 writer
   example    nextsycl-video-example  a template
 
 glue/                      WHAT MAKES ENGINES A PRODUCT (libraries too)
   models     nextsycl-models     the registry of what a machine serves, settings, the catalog of supported models
-  serve      nextsycl-serve      the servers: OpenAI-compatible APIs over a kind's contract, the prompt cache, telemetry
+  serve      nextsycl-serve      the servers: OpenAI-compatible APIs over a kind's contract (llm, image), the prompt
+                                 cache, telemetry; video: the daemon (queue, a worker process a GPU) and the studio
 
 cli/
   nextsycl   nextsycl            the program: argument parsing and output; lists the engines it has, by kind

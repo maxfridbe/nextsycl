@@ -16,7 +16,9 @@ graphs; verify passes and batches bit-exact, greedy output with drafts equal to 
 each context length: [Speed by model](#speed-by-model). **Qwen-Image 2.1**
 (`image/qwenimage21`): text to image, its Qwen3-VL text encoder, 7B DiT and RGBA VAE all in SYCL, checked stage by
 stage against the reference on the same quantized files; 1024x1024 in 40 steps takes 23.8 s on the B70 (16.5 s with
-int8 weights), 37.5 s on the B65. The video engine (MiniMax H3) comes next.
+int8 weights), 37.5 s on the B65. **MiniMax H3** (`video/h3`): text, pictures, a voice and other clips to video with
+sound - H3's SYCL engine moved in whole (its jobs, daemon, studio and tools as `nextsycl video ...`), with its own
+speed: a 896x672, 4.5 s clip in 87-95 s on the B70 (8 s a step), H3's 98 s.
 
 ## Supported models
 
@@ -52,8 +54,14 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `qwen-image-2.1-pruna-8step-lora` | Pruna's 8-step distill (brings its sigmas) | checked |
 | `qwen-image-2.1-pruna-5step-lora` | Pruna's 5-step distill | listed |
 
-**Video** (`nextsycl video`): MiniMax H3, text / image / audio to video (its own SYCL engine, `sycl-h3`) - moving in
-next.
+**Video** (`nextsycl video`: text, pictures, a voice and other clips to video with sound)
+
+| id | model | engine | size | status |
+|---|---|---|---|---|
+| `minimax-h3` | MiniMax H3: the 50-block FL2VA DiT in int8 ConvRot (the fastest), the Qwen3-VL 32B text encoder (Q4_K_M), video and audio VAEs, the latent upscaler | `video/h3` | 42.6 GiB | served (H3's own engine moved in; checked against it) |
+| `minimax-h3-q6k`, `-q4km` | the denoiser as a Q6_K / Q4_K_M GGUF: less of the card, longer clips | `video/h3` | 38.5 / 33.6 GiB | served by H3 |
+| `minimax-h3-q8` | the denoiser as a Q8_0 GGUF (a reference form) | `video/h3` | 43.0 GiB | listed |
+| `minimax-h3-realism-lora`, `-ref2v-turbo-lora`, `-lms-lora` | LoRAs: realism (people), ref2v in 4 steps, LMS | | | listed (realism: served by H3) |
 
 ## What it does
 
@@ -316,6 +324,38 @@ Its cost against the reference: velocity 5.8e-3 (half 3e-4), the latents after 2
 Where a 1024x1024 step goes on the B70 (`NS_QI_PROFILE=1`), int8: the block matrices ~50%, attention ~16% (ARK's
 flash kernel on sycl-tla, `libnextsycl-flash.so`: 2.5 ms a block at 4k tokens, ~110 TFLOPS - oneDNN's fused SDPA
 took 5.0; `NSD_FLASH=0` goes back to it), norms, gates, SwiGLU and RoPE ~16%. The VAE adds 0.7 s a picture (0.45 s of it its 3x3 convolutions).
+
+## Video
+
+MiniMax H3's engine, daemon, studio and tools (the sycl-h3 studio) as `nextsycl video`:
+
+```sh
+nextsycl models pull minimax-h3 [--dir DIR] [--from DIR]      # --from: adopt copies already on the machine
+nextsycl video start [--model ID] [--engine ID]... [--gpu N ...] [--shared-gpu N ...]   # the daemon, in its container
+nextsycl video serve [--bind ADDR] [--port N]                   # the studio: H3's web front end and clip queue
+nextsycl video job generate --prompt "..." --width 768 --height 576 --seconds 5 --steps 8 --out DIR/clip.mp4 [-f]
+nextsycl video ps [-a] | inspect ID | cancel ID... | rm ID... | status | gpus | unload [--gpu N] | logs [--web]
+nextsycl video speech FILE --character NAME | scene SCENE.json | join PREFIX | speechpct CLIP... | plan measure
+nextsycl video job <kind> ... --here                            # a job in this process (load, run, exit)
+nextsycl video stop [--web | --all]
+```
+
+- **The engine** (`video/h3`, the `VideoEngine` contract): H3's h3-core, its jobs (generate, encode, decode,
+  denoise, check-block, bench-blocks) and mp4 writer, on the diffusion kernels of `libnextsycl-video.so` (H3's under
+  the `nsd_` prefix; SageAttention from `libnextsycl-flash.so`). Its options: `nextsycl video engines`.
+- **The daemon** (`glue/serve` video::daemon): H3's queue, one worker process a GPU slot (it loads on the first
+  job, unloads after `NS_VIDEO_IDLE`), the card lock and the front end's model switch for a GPU shared with chat.
+- **The studio** (`video serve`, a host process): H3's front end (`wfe/video`, TSX on snabbdom) and its legacy API,
+  the clip queue, projects, scenes, films, the language-model switch (`NS_VIDEO_LLM_MODES`).
+- Settings: `NS_VIDEO_MODEL`, `NS_VIDEO_ENGINES`, `NS_VIDEO_OUT`, `NS_VIDEO_GPUS`, `NS_VIDEO_SHARED_GPUS`,
+  `NS_VIDEO_IDLE`, `NS_VIDEO_GPU_LOCK`, `NS_VIDEO_LLM_SWITCHER`, `NS_VIDEO_MODELS_DIR` (seen as /models: H3's paths
+  in scene files, the pixel upscalers), `NS_VIDEO_LISTEN` / `_PORT`, `NS_VIDEO_STUDIO_DIR`, `NS_VIDEO_LLM_MODES`,
+  `NS_VIDEO_TEMPLATES`, `NS_VIDEO_CHARACTERS` (`docs/video/characters.example.json`).
+- Checked against H3's own `h3d` on the B70, the same clip: the latents differ from H3's by as much as two H3 runs
+  differ from each other (cosine 0.996 - H3 is not bit-reproducible run to run), the frames the same scene; 8.0 s a
+  denoising step either way at 896x672, 4.5 s (19,191 tokens).
+
+![the video studio](docs/screenshots/video-studio.webp)
 
 ## Speed by model
 

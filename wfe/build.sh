@@ -4,7 +4,8 @@
 # the result is dist/wfe/: each app's ES modules + index.html + style.css, the shared vendor/ and static/, which the
 # kind's server serves as they are (/ui/..., the page at /).
 #   ./build.sh [app...]    type-check + compile (default: every app)
-#   ./build.sh --check     also the smoke test against a running server (NS_WFE=http://host:port, app image)
+#   ./build.sh --check     also the image page's smoke test against a running server (NS_WFE=http://host:port)
+# video/ is the H3 studio's front end as it was (its server: nextsycl video serve).
 set -euo pipefail
 cd "$(dirname "$0")"
 NODE="${NODE:-$(command -v node || echo "$HOME/.local/bin/node")}"
@@ -13,7 +14,7 @@ TSC="vendor/typescript/tsc.js"
 OUT=../dist/wfe
 check=0; apps=()
 for a in "$@"; do [ "$a" = "--check" ] && check=1 || apps+=("$a"); done
-[ ${#apps[@]} -eq 0 ] && apps=(image)
+[ ${#apps[@]} -eq 0 ] && apps=(image video)
 mkdir -p "$OUT/vendor" "$OUT/static"
 rm -rf build
 for app in "${apps[@]}"; do
