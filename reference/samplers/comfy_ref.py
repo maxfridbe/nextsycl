@@ -25,7 +25,9 @@ import scipy.integrate
 import scipy.stats
 import torch
 
-COMFY = sys.argv[1] if len(sys.argv) > 1 else "/var/mnt/2TBSSD/minimaxh3/repo/vendor/ComfyUI"
+if len(sys.argv) < 2:
+    sys.exit("comfy_ref.py /path/to/ComfyUI > expected.txt")
+COMFY = sys.argv[1]
 N = 16  # latent size
 
 
