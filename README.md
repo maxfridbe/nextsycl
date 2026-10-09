@@ -189,9 +189,14 @@ entry can point anywhere on the machine.
 ```sh
 nextsycl models pull qwen-image-2.1-q8
 nextsycl image gen "a red fox in fresh snow, morning light" [--model ID] [--size WxH | --aspect 16:9] [--steps N]
-                   [--seed N] [--n N] [--out FILE|DIR] [--rgba] [--gpu N]
-nextsycl image check <reference dump dir> [--stages te,dit,steps,vae] [--gpu N]
+                   [--seed N] [--n N] [--lora NAME[:SCALE]]... [--out FILE|DIR] [--rgba] [--gpu N]
+nextsycl image check <reference dump dir> [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--gpu N]
 ```
+
+`--lora` takes a registered LoRA (`nextsycl models pull qwen-image-2.1-uncensored-lora`) or a file; it is merged
+into the DiT's matrices at load (PEFT, kohya and diffusers files; ~0.4 s, nothing a step), half or int8 alike, and
+named in the PNG. Checked against the reference with the same LoRA merged in PyTorch: the latents after 20 steps
+8.4e-4 off (without the LoRA, 3.3e-3).
 
 `gen` runs the engine in-process for now (the server path, `image serve | start | ps`, comes next); the PNG keeps the
 prompt, model, seed, size and steps. `check` compares each stage with the dumps of `reference/qwenimage21/ref.py`.

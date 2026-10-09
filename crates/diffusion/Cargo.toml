@@ -7,4 +7,5 @@ license.workspace = true
 
 [dependencies]
 nextsycl-core.workspace = true
+nextsycl-gguf.workspace = true
 png = "0.17"

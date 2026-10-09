@@ -197,7 +197,10 @@ of IQ2_XXS instead could win twice.
 - [ ] Qwen-Image speed, next: the small passes (norm + modulate, gate add, SwiGLU, RMS + RoPE: ~1.7 ms a block,
       ~13%) fused into fewer; the VAE's 3x3 convolutions (0.45 s a picture)
 - [ ] Qwen-Image 2.1 Q6_K / Q4_K_M: the dequant reads Q4_K / Q6_K; Q4_K_M also has Q5_K tensors
-- [ ] LoRAs: presets merged at load, per-request ones as a side path; Qwen-Image (20B) with the Lightning LoRAs
+- [x] LoRAs merged at load (nextsycl-diffusion's `lora`: PEFT / kohya / diffusers files; W += s B A on the GPU before
+      half or int8; `--lora NAME[:SCALE]`): the uncensored LoRA checked against ref.py `--lora` (20 steps 8.4e-4;
+      without it 3.3e-3)
+- [ ] LoRAs per request as a side path (a server keeps one model loaded); Qwen-Image (20B) with the Lightning LoRAs
 - [ ] H3 into video/ (copied from its committed sycl-port branch): `nextsycl video ...` for all its commands
 
 ## Several models (docs/engines.md, 2026-10-08)

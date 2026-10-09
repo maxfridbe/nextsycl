@@ -27,7 +27,7 @@ use std::time::Instant;
 use nextsycl_core::{DevBuf, Gpu};
 use nextsycl_diffusion::kernels::Nsd;
 use nextsycl_gguf::Gguf;
-use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, Picture, Result, Sampler, Schedule, Step};
+use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, LoraUse, ModelFiles, Picture, Result, Sampler, Schedule, Step};
 use nextsycl_qwen3vl::TextEncoder;
 
 pub const ARCH: &str = "qwen-image-2.1";
@@ -59,11 +59,8 @@ pub fn kind() -> ImageKind {
 }
 
 fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn ImageEngine>> {
-    if !o.merge_loras.is_empty() {
-        return Err(Error(format!("{ARCH}: LoRAs are not merged yet")));
-    }
     let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?;
-    Ok(Box::new(QwenImage21::load(files, gpu, log)?))
+    Ok(Box::new(QwenImage21::load(files, gpu, &o.merge_loras, log)?))
 }
 
 pub struct QwenImage21 {
@@ -102,7 +99,8 @@ pub fn noise(seed: u64, n: usize) -> Vec<f32> {
 }
 
 impl QwenImage21 {
-    pub fn load(files: &ModelFiles, gpu: &Arc<Gpu>, log: &mut dyn FnMut(String)) -> Result<QwenImage21> {
+    /// The model on `gpu`, `loras` merged into its DiT
+    pub fn load(files: &ModelFiles, gpu: &Arc<Gpu>, loras: &[LoraUse], log: &mut dyn FnMut(String)) -> Result<QwenImage21> {
         let t0 = Instant::now();
         nextsycl_core::use_kind("image");
         // the xe driver has no out-of-memory error - an allocation past the card spills to host RAM and can take the
@@ -120,7 +118,13 @@ impl QwenImage21 {
         }
         let nsd = Nsd::new(gpu)?;
         let te = TextEncoder::load(role(files, "text-encoder")?, role(files, "tokenizer")?, gpu, log)?;
-        let dit = dit::Dit::load(&f, &nsd, int8, log)?;
+        let mut deltas = Vec::new();
+        for l in loras {
+            let d = nextsycl_diffusion::lora::read(&l.path, l.scale).map_err(Error)?;
+            log(format!("LoRA {} x {}: {} matrices, rank {}", l.name, l.scale, d.len(), d.first().map_or(0, |x| x.r)));
+            deltas.extend(d);
+        }
+        let dit = dit::Dit::load(&f, &nsd, int8, &deltas, log)?;
         let vae = vae::Vae::load(role(files, "vae")?, &nsd, (LATENT_MEAN.to_vec(), LATENT_STD.to_vec()), log)?;
         Ok(QwenImage21 { nsd, te, dit, vae, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64() })
     }

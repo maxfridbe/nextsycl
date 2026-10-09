@@ -31,6 +31,7 @@ struct Api {
     wait: unsafe extern "C" fn(M) -> c_int,
     int8_linear: unsafe extern "C" fn(M, P, c_int, i64, i64, *const i8, i64, *const f32, i64, *const f32, M, c_int, c_int) -> c_int,
     linear: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M, c_int) -> c_int,
+    linear_acc: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M) -> c_int,
     dequant: unsafe extern "C" fn(M, P, c_int, i64, M, c_int) -> c_int,
     rms_norm_mod: unsafe extern "C" fn(M, P, c_int, i64, i64, *const f32, f32, *const i32, *const f32, *const f32, M, c_int) -> c_int,
     layer_norm: unsafe extern "C" fn(M, P, c_int, i64, i64, *const f32, *const f32, f32, M, c_int) -> c_int,
@@ -72,6 +73,7 @@ fn api() -> Result<&'static Api> {
             wait: sym!("nsd_wait"),
             int8_linear: sym!("nsd_int8_linear"),
             linear: sym!("nsd_linear"),
+            linear_acc: sym!("nsd_linear_acc"),
             dequant: sym!("nsd_dequant"),
             rms_norm_mod: sym!("nsd_rms_norm_mod"),
             layer_norm: sym!("nsd_layer_norm"),
@@ -147,6 +149,13 @@ impl Nsd {
     pub fn linear(&self, x: P, dt: Dt, m: usize, k: usize, w: P, n: usize, bias: P, out: M, out_dt: Dt) -> Result<()> {
         // SAFETY: the caller's buffers hold the sizes named.
         self.ok(unsafe { (self.k.linear)(self.ctx, x, dt as c_int, m as i64, k as i64, w, n as i64, bias.cast(), out, out_dt as c_int) }, "linear")
+    }
+
+    /// out [M, N] += x [M, K] . W^T, all in `dt` (a LoRA's update merged into a matrix: x = B, W = A^T)
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_acc(&self, x: P, dt: Dt, m: usize, k: usize, w: P, n: usize, out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.linear_acc)(self.ctx, x, dt as c_int, m as i64, k as i64, w, n as i64, std::ptr::null(), out) }, "linear (accumulate)")
     }
 
     /// `n` values of GGUF type `qtype` (8 Q8_0, 12 Q4_K, 14 Q6_K, 30 BF16) into `out_dt`

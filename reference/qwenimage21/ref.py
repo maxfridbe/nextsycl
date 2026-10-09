@@ -4,6 +4,7 @@ every stage the engine is checked against.
     python ref.py te   --te <qwen3vl int8_convrot.safetensors> --cfg <Qwen-Image-2.1 dir> --prompt TEXT --out DIR
     python ref.py dit  --dit <transformer .gguf> --cfg DIR --out DIR --size 512 --steps 4 --seed 7
     python ref.py vae  --vae <vae .safetensors> --cfg DIR --out DIR
+    python ref.py dit  ... --lora <LoRA .safetensors> [--lora-scale X]   (the LoRA merged into the DiT first)
 
 The stages run one at a time (each frees its weights) and talk through DIR:
   te:  tokens.json (ids, the image-pad mask), embeds.npy [S, 4096] - the last layer's hidden state before the final
@@ -137,6 +138,30 @@ def load_gguf_into(model, path):
         sys.exit(f"dit: parameters the file does not have: {missing[:5]}")
 
 
+def merge_lora(model, path, strength):
+    """W += strength * (alpha / r) * B @ A for every pair in a PEFT / kohya / diffusers LoRA file"""
+    import re
+    h, base = st_header(path)
+    params = dict(model.named_parameters())
+    pairs = {}
+    for name in h:
+        m = re.match(r"(.*)\.(lora_A(?:\.default)?|lora_down|lora\.down|lora_B(?:\.default)?|lora_up|lora\.up|alpha)(?:\.weight)?$", name)
+        if not m:
+            sys.exit(f"lora: {name}?")
+        mod, part = m.group(1), m.group(2)
+        for p in ("base_model.model.", "diffusion_model.", "transformer."):
+            mod = mod[len(p):] if mod.startswith(p) else mod
+        kind = "a" if part.startswith(("lora_A", "lora_down", "lora.down")) else "b" if part != "alpha" else "alpha"
+        pairs.setdefault(mod, {})[kind] = name
+    for mod, d in pairs.items():
+        A = st_tensor(path, h, base, d["a"]).float()
+        B = st_tensor(path, h, base, d["b"]).float()
+        scale = strength * (float(st_tensor(path, h, base, d["alpha"]).float()) / A.shape[0] if "alpha" in d else 1.0)
+        p = params[mod + ".weight"]
+        p.data += scale * (B @ A)
+    print(f"lora: {len(pairs)} matrices merged from {path} at {strength}")
+
+
 def run_dit(a):
     from diffusers import FlowMatchEulerDiscreteScheduler, QwenImage21Transformer2DModel
     from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_shift, retrieve_timesteps
@@ -151,6 +176,8 @@ def run_dit(a):
     model.time_text_embed.time_proj = fresh.time_text_embed.time_proj
     del fresh
     load_gguf_into(model, a.dit)
+    if a.lora:
+        merge_lora(model, a.lora, a.lora_scale)
     model = model.eval()
     emb = torch.from_numpy(np.load(os.path.join(a.out, "embeds.npy")))[None]
     toks = json.load(open(os.path.join(a.out, "tokens.json")))
@@ -270,6 +297,7 @@ if __name__ == "__main__":
     ap.add_argument("--prompt", default="A red fox sitting in fresh snow, morning light, photograph")
     ap.add_argument("--out", required=True); ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--steps", type=int, default=4); ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--lora"); ap.add_argument("--lora-scale", type=float, default=1.0)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     {"te": run_te, "dit": run_dit, "vae": run_vae}[a.stage](a)

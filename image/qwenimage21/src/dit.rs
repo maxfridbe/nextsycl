@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use nextsycl_core::{DevBuf, Error, Gpu, Result};
 use nextsycl_diffusion::kernels::{none, Dt, Nsd};
+use nextsycl_diffusion::lora::{self, Delta};
 use nextsycl_gguf::{GType, Gguf};
 
 use crate::{ffi, prof};
@@ -104,7 +105,8 @@ fn ge(e: nextsycl_gguf::Error) -> Error {
 
 impl Dit {
     /// The weights from `f`; `int8`: the block matrices as int8 ConvRot (else half)
-    pub fn load(f: &Gguf, nsd: &Nsd, int8: bool, log: &mut dyn FnMut(String)) -> Result<Dit> {
+    /// `loras`: updates merged into the block matrices at load (one that matches no block matrix is an error)
+    pub fn load(f: &Gguf, nsd: &Nsd, int8: bool, loras: &[Delta], log: &mut dyn FnMut(String)) -> Result<Dit> {
         let gpu = nsd.gpu.clone();
         let t0 = std::time::Instant::now();
         let tensor = |name: &str| f.tensor(name).ok_or_else(|| Error(format!("{}: no tensor {name}", f.paths[0].display())));
@@ -150,13 +152,54 @@ impl Dit {
         let k8 = ffi::api()?;
         let had = DevBuf::from_f32(&gpu, &nextsycl_qwen3vl::hadamard(GROUP))?;
         // a block matrix: half, or rotated along its inputs (W . H, a GEMM on the matrix engine) and quantized per row
+        // the LoRA updates by module key, and which modules took one
+        let by_key: std::collections::BTreeMap<String, Vec<&Delta>> = loras.iter().fold(Default::default(), |mut m, d| {
+            m.entry(lora::key(&d.target)).or_default().push(d);
+            m
+        });
+        let merged = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        // a block matrix (one or more stored matrices stacked by rows): its LoRA updates merged in float32 on the GPU
+        // (W += B . A; B's rows reordered as the matrix's are), then half, or rotated along its inputs (W . H, a GEMM
+        // on the matrix engine) and quantized per row
         let big = |names: &[&str], perm: &[bool]| -> Result<Mat> {
-            let n: usize = names.iter().map(|nm| tensor(nm).map(|t| t.shape[0] as usize)).sum::<Result<usize>>()?;
-            if !int8 {
+            let rows: Vec<usize> = names.iter().map(|nm| tensor(nm).map(|t| t.shape[0] as usize)).collect::<Result<_>>()?;
+            let n: usize = rows.iter().sum();
+            let keys: Vec<String> = names.iter().map(|nm| lora::key(nm.strip_suffix(".weight").unwrap_or(nm))).collect();
+            let has_lora = keys.iter().any(|k| by_key.contains_key(k));
+            if !int8 && !has_lora {
                 return Ok(Mat { w: load_rows(names, perm, Dt::F16)?, scale: None, n });
             }
             let w = load_rows(names, perm, Dt::F32)?;
             let k = w.floats() / n;
+            let mut off = 0;
+            for (i, key) in keys.iter().enumerate() {
+                for d in by_key.get(key).into_iter().flatten() {
+                    if d.n != rows[i] || d.k != k {
+                        return Err(Error(format!("LoRA {}: {}x{}, the matrix is {}x{k}", d.target, d.n, d.k, rows[i])));
+                    }
+                    let b: Vec<f32> = if perm[i] {
+                        (0..d.n).flat_map(|row| {
+                            let src = (row / HEAD) * HEAD + rope_perm(row % HEAD);
+                            d.b[src * d.r..(src + 1) * d.r].iter().copied()
+                        }).collect()
+                    } else {
+                        d.b.clone()
+                    };
+                    let at: Vec<f32> = (0..d.k).flat_map(|c| (0..d.r).map(move |j| (c, j))).map(|(c, j)| d.a[j * d.k + c]).collect();
+                    let (bd, ad) = (DevBuf::from_f32(&gpu, &b)?, DevBuf::from_f32(&gpu, &at)?);
+                    nsd.linear_acc(bd.ptr(), Dt::F32, d.n, d.r, ad.ptr(), k, w.fp().wrapping_add(off * k).cast())?;
+                    nsd.wait()?;
+                    merged.borrow_mut().insert(key.clone());
+                }
+                off += rows[i];
+            }
+            if !int8 {
+                let h = DevBuf::new(&gpu, n * k * 2)?;
+                // SAFETY: n x k values each way.
+                ffi::check(unsafe { (k8.to_half)(gpu.raw(), w.fp(), h.ptr(), (n * k) as i64) }, "to half")?;
+                nsd.wait()?;
+                return Ok(Mat { w: h, scale: None, n });
+            }
             let rot = DevBuf::f32(&gpu, n * k)?;
             nsd.linear(w.ptr(), Dt::F32, n * k / GROUP, GROUP, had.ptr(), GROUP, none(), rot.ptr(), Dt::F32)?;
             let q = DevBuf::new(&gpu, n * k)?;
@@ -191,6 +234,15 @@ impl Dit {
                 norm_q: vector(&format!("{p}attn.norm_q.weight"), true)?,
                 norm_k: vector(&format!("{p}attn.norm_k.weight"), true)?,
             });
+        }
+        let merged = merged.into_inner();
+        let missed: std::collections::BTreeSet<&str> = loras.iter().filter(|d| !merged.contains(&lora::key(&d.target))).map(|d| d.target.as_str()).collect();
+        if !missed.is_empty() {
+            let few: Vec<&str> = missed.iter().take(4).copied().collect();
+            return Err(Error(format!("LoRA modules this engine does not merge ({} of them): {}", missed.len(), few.join(", "))));
+        }
+        if !loras.is_empty() {
+            log(format!("qwen-image 2.1: {} LoRA updates merged into {} matrices", loras.len(), merged.len()));
         }
         // the text norm stores (scale - 1): the kernel multiplies by its weight
         let tn = {

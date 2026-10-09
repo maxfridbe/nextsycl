@@ -4,13 +4,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nextsycl_image::{ImageRequest, ModelFiles, Sampler, Schedule};
+use nextsycl_image::{ImageRequest, LoraUse, ModelFiles, Sampler, Schedule};
 use nextsycl_models::{config::Config, registry as models};
 use serde_json::Value;
 
 const USAGE: &str = "nextsycl image gen \"<prompt>\" [--model ID] [--size WxH | --aspect W:H] [--steps N] [--seed N] [--n N] [--sampler S]
-                   [--schedule S] [--out FILE|DIR] [--rgba] [--local] [--gpu N]
-nextsycl image check <dump dir> [--model ID] [--stages te,dit,steps,vae] [--gpu N]
+                   [--schedule S] [--lora NAME[:SCALE]]... [--out FILE|DIR] [--rgba] [--local] [--gpu N]
+nextsycl image check <dump dir> [--model ID] [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--gpu N]
 nextsycl image engines | selftest [--gpu N]";
 
 /// The image engines this program has (image/<arch>)
@@ -36,6 +36,21 @@ fn model(cfg: &Config, id: Option<&str>) -> Result<(Value, ModelFiles), String> 
     Ok((m, files))
 }
 
+/// Every `--lora NAME[:SCALE]`: a registered LoRA's id or a file
+fn loras(cfg: &Config, args: &[String]) -> Result<Vec<LoraUse>, String> {
+    let all = models::all(cfg)?;
+    let find = |n: &str| -> Option<PathBuf> {
+        all.iter()
+            .find(|m| m["id"] == n && models::kind_of(m) == "lora")
+            .and_then(|m| m["file"].as_str().map(PathBuf::from))
+            .or_else(|| Path::new(n).is_file().then(|| PathBuf::from(n)))
+    };
+    args.iter().enumerate().filter(|(_, a)| *a == "--lora").map(|(i, _)| {
+        let v = args.get(i + 1).ok_or("--lora NAME[:SCALE]")?;
+        LoraUse::parse(v, &find)
+    }).collect()
+}
+
 fn load(cfg: &Config, args: &[String]) -> Result<(Value, Box<dyn nextsycl_image::ImageEngine>), String> {
     nextsycl_core::use_kind("image");
     let (m, files) = model(cfg, opt(args, "--model"))?;
@@ -45,7 +60,8 @@ fn load(cfg: &Config, args: &[String]) -> Result<(Value, Box<dyn nextsycl_image:
     let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
     let gpu = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
     let mut log = |s: String| eprintln!("{s}");
-    let e = (k.load)(&files, &[gpu], &Default::default(), &mut log).map_err(|e| e.0)?;
+    let o = nextsycl_image::LoadOptions { merge_loras: loras(cfg, args)? };
+    let e = (k.load)(&files, &[gpu], &o, &mut log).map_err(|e| e.0)?;
     Ok((m, e))
 }
 
@@ -111,8 +127,10 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
             Some(o) => o.with_file_name(format!("{}-{}.png", o.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), i + 1)),
             None => PathBuf::from(name),
         };
+        let lora_list: Vec<String> = loras(cfg, args)?.iter().map(|l| format!("{}:{}", l.name, l.scale)).collect();
         let meta = [("prompt", prompt.clone()), ("model", id.to_string()), ("seed", (seed + i as u64).to_string()),
-                    ("size", format!("{}x{}", p.width, p.height)), ("steps", req.steps.unwrap_or(d.steps).to_string())];
+                    ("size", format!("{}x{}", p.width, p.height)), ("steps", req.steps.unwrap_or(d.steps).to_string()),
+                    ("loras", lora_list.join(","))];
         p.write_png(&path, &meta)?;
         saved.push(path.display().to_string());
     }
@@ -131,7 +149,7 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
     let gpu: Arc<nextsycl_core::Gpu> = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
     let mut log = |s: String| eprintln!("{s}");
-    let e = nextsycl_image_qwenimage21::QwenImage21::load(&files, &gpu, &mut log).map_err(|e| e.0)?;
+    let e = nextsycl_image_qwenimage21::QwenImage21::load(&files, &gpu, &loras(cfg, args)?, &mut log).map_err(|e| e.0)?;
     let worst = nextsycl_image_qwenimage21::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?;
     println!("worst relative error {worst:.2e}");
     Ok(())

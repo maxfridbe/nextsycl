@@ -203,6 +203,7 @@ name = "nextsycl-diffusion"
 version = "0.0.0"
 dependencies = [
  "nextsycl-core",
+ "nextsycl-gguf",
  "png",
 ]
 
