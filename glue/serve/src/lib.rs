@@ -7,6 +7,7 @@ pub mod http;
 pub mod image;
 pub mod serve;
 pub mod telemetry;
+pub mod video;
 
 pub use serve::Server;
 

@@ -11,16 +11,18 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-/// Where the server's control socket is.
+/// Where a server is: a Unix socket (the control sockets), or `host:port`
 #[derive(Clone, Debug)]
 pub enum Target {
     Unix(PathBuf),
+    Tcp(String),
 }
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Target::Unix(p) => write!(f, "{}", p.display()),
+            Target::Tcp(a) => f.write_str(a),
         }
     }
 }
@@ -35,6 +37,7 @@ impl Conn {
     pub fn connect(t: &Target) -> std::io::Result<Conn> {
         Ok(match t {
             Target::Unix(p) => Conn::Unix(UnixStream::connect(p)?),
+            Target::Tcp(a) => Conn::Tcp(TcpStream::connect(a)?),
         })
     }
     pub fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
@@ -86,6 +89,10 @@ pub struct Request {
     pub method: String,
     /// the path without the query
     pub path: String,
+    /// the path with the query, as received
+    pub target: String,
+    /// the request line and headers exactly as received (for passing the request on: `forward`)
+    pub head: Vec<u8>,
     /// the Origin header (a browser's request)
     pub origin: Option<String>,
     /// the Host header (for absolute links in an answer)
@@ -102,12 +109,14 @@ pub fn read_request(stream: impl Read) -> Result<Request, String> {
     let method = parts.next().ok_or("empty request")?.to_string();
     let target = parts.next().ok_or("no path in the request")?.to_string();
     let path = target.split('?').next().unwrap_or("/").to_string();
+    let mut head = line.clone().into_bytes();
     let mut length = 0usize;
     let mut origin = None;
     let mut host = None;
     loop {
         let mut h = String::new();
         let n = r.read_line(&mut h).map_err(|e| e.to_string())?;
+        head.extend_from_slice(h.as_bytes());
         if n == 0 || h == "\r\n" || h == "\n" {
             break;
         }
@@ -126,7 +135,51 @@ pub fn read_request(stream: impl Read) -> Result<Request, String> {
     }
     let mut body = vec![0u8; length];
     r.read_exact(&mut body).map_err(|e| e.to_string())?;
-    Ok(Request { method, path, origin, host, body })
+    Ok(Request { method, path, target, head, origin, host, body })
+}
+
+impl Request {
+    /// The body as JSON (null when empty)
+    pub fn json(&self) -> Result<Value, String> {
+        if self.body.is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_slice(&self.body).map_err(|e| format!("the body is not JSON: {e}"))
+    }
+}
+
+/// Passes a request on to `upstream` unchanged and copies the answer back as it arrives (long polls and file downloads
+/// work)
+pub fn forward(mut client: impl Write, upstream: &Target, req: &Request) -> Result<(), String> {
+    let mut up = Conn::connect(upstream).map_err(|e| format!("{upstream} does not answer ({e})"))?;
+    up.write_all(&req.head).and_then(|_| up.write_all(&req.body)).and_then(|_| up.flush()).map_err(|e| e.to_string())?;
+    std::io::copy(&mut up, &mut client).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `http://host:port/path` -> (`host:port`, `/path`); plain http only
+pub fn split_url(url: &str) -> Result<(String, String), String> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| format!("{url}: only http:// URLs"))?;
+    let (host, path) = rest.split_once('/').map_or((rest, "/".to_string()), |(h, p)| (h, format!("/{p}")));
+    let host = if host.contains(':') { host.to_string() } else { format!("{host}:80") };
+    Ok((host, path))
+}
+
+/// A front-end file's content type, by its extension
+pub fn content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "jpg" | "jpeg" => "image/jpeg",
+        "mp4" => "video/mp4",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
 }
 
 fn reason(status: u16) -> &'static str {
