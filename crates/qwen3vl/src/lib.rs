@@ -17,6 +17,8 @@
 //! Text-only prompts: the three M-RoPE axes carry the same position, so the rotation is plain RoPE. Images in the
 //! prompt (an edit's reference pictures through the vision tower) are not read yet.
 
+pub mod vision;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -48,6 +50,8 @@ struct Layer {
 }
 
 pub struct TextEncoder {
+    /// the vision tower, when the file has it (`model.visual.*`): pictures in the prompt
+    pub vision: Option<vision::Vision>,
     file: SafeTensors,
     pub tok: Tokenizer,
     gpu: Arc<Gpu>,
@@ -145,7 +149,8 @@ impl TextEncoder {
         }
         log(format!("qwen3vl: {n_layer} layers ({hidden} wide, {heads} / {kv_heads} heads, {ffn} ffn) on {} in {:.1} s", gpu.name,
                     t0.elapsed().as_secs_f64()));
-        Ok(TextEncoder { file: st, tok, gpu: gpu.clone(), layers, hidden, heads, kv_heads, ffn, theta: 5_000_000.0, hadamard: hadamard(GROUP) })
+        let vision = if st.tensor("model.visual.patch_embed.proj.weight").is_some() { Some(vision::Vision::load(&st, gpu, log)?) } else { None };
+        Ok(TextEncoder { vision, file: st, tok, gpu: gpu.clone(), layers, hidden, heads, kv_heads, ffn, theta: 5_000_000.0, hadamard: hadamard(GROUP) })
     }
 
     /// The tokens' embedding rows, dequantized and un-rotated, float32 [S, hidden] on the host
@@ -183,29 +188,94 @@ impl TextEncoder {
 
     /// The hidden state after the first `n` layers (a check of the layers one by one)
     pub fn encode_layers(&self, nsd: &Nsd, ids: &[u32], n: usize) -> Result<DevBuf> {
+        self.encode_seen(nsd, ids, &[], n)
+    }
+
+    /// Each token's (time, height, width) position (transformers' get_rope_index): text tokens advance one on all
+    /// three axes; a picture's run of `<|image_pad|>` tokens (its merged grid, row by row) sits at the run's start
+    /// plus its row and column, and the next text starts past the larger side
+    pub fn positions(ids: &[u32], pad: u32, grids: &[(usize, usize)]) -> Result<Vec<[i64; 3]>> {
+        let mut out = Vec::with_capacity(ids.len());
+        let (mut p, mut i, mut g) = (0i64, 0usize, 0usize);
+        while i < ids.len() {
+            if ids[i] != pad {
+                out.push([p, p, p]);
+                p += 1;
+                i += 1;
+                continue;
+            }
+            let (gh, gw) = *grids.get(g).ok_or_else(|| Error("more pictures in the prompt than were given".into()))?;
+            let (lh, lw) = (gh / vision::MERGE, gw / vision::MERGE);
+            for r in 0..lh {
+                for c in 0..lw {
+                    if ids.get(i) != Some(&pad) {
+                        return Err(Error(format!("picture {g}: its run of image tokens is shorter than its {lh} x {lw} grid")));
+                    }
+                    out.push([p, p + r as i64, p + c as i64]);
+                    i += 1;
+                }
+            }
+            p += lh.max(lw) as i64;
+            g += 1;
+        }
+        Ok(out)
+    }
+
+    /// The hidden state after `n` layers for `ids` with pictures in it: `seen` (the vision tower's, in the order of
+    /// their `<|image_pad|>` runs) at their tokens, Qwen3-VL's interleaved M-RoPE (24 / 20 / 20 pairs: t, then h and w
+    /// on every third pair from the second), the deepstack features added after the first layers
+    pub fn encode_seen(&self, nsd: &Nsd, ids: &[u32], seen: &[&vision::Seen], n: usize) -> Result<DevBuf> {
         let s = ids.len();
         let (d, h, kv, f) = (self.hidden, self.heads, self.kv_heads, self.ffn);
         let qkv_w = (h + 2 * kv) * HEAD;
         let gpu = &self.gpu;
         let x = upload_f32(gpu, &self.embed(ids)?)?;
+        let pad = self.tok.id("<|image_pad|>").unwrap_or(u32::MAX);
+        // each picture's rows: the start of its run of image tokens
+        let mut runs = Vec::new();
+        let mut i = 0;
+        while i < s {
+            if ids[i] == pad {
+                let st = i;
+                while i < s && ids[i] == pad {
+                    i += 1;
+                }
+                runs.push((st, i - st));
+            } else {
+                i += 1;
+            }
+        }
+        if runs.len() != seen.len() || runs.iter().zip(seen).any(|((_, len), v)| *len != v.n) {
+            return Err(Error(format!("the prompt holds {} picture runs {:?}; {} pictures were seen", runs.len(), runs.iter().map(|r| r.1).collect::<Vec<_>>(),
+                                     seen.len())));
+        }
+        for ((st, len), v) in runs.iter().zip(seen) {
+            x.copy_within(st * d * 4, &v.tokens, 0, len * d * 4)?;
+        }
+        let pos = if seen.is_empty() {
+            (0..s as i64).map(|p| [p, p, p]).collect()
+        } else {
+            Self::positions(ids, pad, &seen.iter().map(|v| v.grid).collect::<Vec<_>>())?
+        };
         let hb = DevBuf::f32(gpu, s * d)?;
         let qkv = DevBuf::f32(gpu, s * qkv_w)?;
         let att = DevBuf::f32(gpu, s * h * HEAD)?;
         let o = DevBuf::f32(gpu, s * d)?;
         let gu = DevBuf::f32(gpu, s * 2 * f)?;
         let act = DevBuf::f32(gpu, s * f)?;
-        // (cos, sin) per token and pair (i, 64 + i)
+        // (cos, sin) per token and pair (i, 64 + i); pair i's axis: interleaved M-RoPE (the three agree on text)
         let mut cs = vec![0f32; s * HEAD];
-        for p in 0..s {
+        for (t, p) in pos.iter().enumerate() {
             for i in 0..HEAD / 2 {
-                let a = p as f64 / self.theta.powf(2.0 * i as f64 / HEAD as f64);
-                cs[p * HEAD + 2 * i] = a.cos() as f32;
-                cs[p * HEAD + 2 * i + 1] = a.sin() as f32;
+                let axis = if i < 60 && i % 3 == 1 { 1 } else if i < 60 && i % 3 == 2 { 2 } else { 0 };
+                let a = p[axis] as f64 / self.theta.powf(2.0 * i as f64 / HEAD as f64);
+                cs[t * HEAD + 2 * i] = a.cos() as f32;
+                cs[t * HEAD + 2 * i + 1] = a.sin() as f32;
             }
         }
         let cs = upload_f32(gpu, &cs)?;
         let f32p = |b: &DevBuf, at: usize| -> *mut std::ffi::c_void { b.fp().wrapping_add(at).cast() };
-        for l in self.layers.iter().take(n) {
+        for (li, l) in self.layers.iter().take(n).enumerate() {
             nsd.rms_norm_mod(x.ptr(), Dt::F32, s, d, l.in_norm.ptr(), EPS, none(), none(), none(), hb.ptr(), Dt::F32)?;
             nsd.int8_linear(hb.ptr(), Dt::F32, s, d, l.qkv.ptr(), qkv_w, l.qkv_s.ptr(), qkv_w, none(), qkv.ptr(), Dt::F32, GROUP)?;
             nsd.rms_rope(qkv.ptr(), Dt::F32, s, h, HEAD, qkv_w, l.q_norm.ptr(), EPS, cs.ptr(), HEAD)?;
@@ -218,6 +288,12 @@ impl TextEncoder {
             nsd.swiglu(gu.ptr(), Dt::F32, s, f, act.ptr(), Dt::F32)?;
             nsd.int8_linear(act.ptr(), Dt::F32, s, f, l.down.ptr(), d, l.down_s.ptr(), d, none(), o.ptr(), Dt::F32, GROUP)?;
             nsd.gate_add(x.ptr(), Dt::F32, s, d, o.ptr(), Dt::F32, none(), none())?;
+            // deepstack: the pictures' features of this depth added at their tokens
+            for ((st, len), v) in runs.iter().zip(seen) {
+                if let Some(ds) = v.deep.get(li) {
+                    nsd.gate_add(f32p(&x, st * d), Dt::F32, *len, d, ds.ptr(), Dt::F32, none(), none())?;
+                }
+            }
         }
         nsd.wait()?;
         Ok(x)

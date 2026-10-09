@@ -52,16 +52,45 @@ struct Up {
     ci: usize,
 }
 
+/// The middle's attention block: one head of every channel
+struct Att {
+    norm: DevBuf,
+    qkv: DevBuf,
+    qkv_b: DevBuf,
+    proj: DevBuf,
+    proj_b: DevBuf,
+}
+
+/// An encoder down block: resnets, then (blocks 0-3) the zero-padded stride-2 conv; its input's average shortcut
+/// (2x2 in space, and (blocks 1-3) a zero frame in time) added
+struct Down {
+    resnets: Vec<Resnet>,
+    resample: Option<Conv>,
+    ft: i32,
+    ci: usize,
+    co: usize,
+}
+
+/// The encoder (edits: the condition pictures to latents): RGBA [H, W, 4] in [-1, 1] -> conv_in (96) -> 5 down blocks
+/// (96, 192, 384, 768, 768; 16x down) -> middle (resnet, attention, resnet) -> rms norm, silu, 3x3 conv (128) ->
+/// 1x1 conv; the mean is the first 64 channels
+struct Encoder {
+    conv_in: Conv,
+    downs: Vec<Down>,
+    mid: [Resnet; 2],
+    att: Att,
+    out_norm: DevBuf,
+    head: Conv,
+    quant: Conv,
+}
+
 pub struct Vae {
     gpu: Arc<Gpu>,
     post_quant: Conv,
     conv_in: Conv,
     mid: [Resnet; 2],
-    att_norm: DevBuf,
-    att_qkv: DevBuf,
-    att_qkv_b: DevBuf,
-    att_proj: DevBuf,
-    att_proj_b: DevBuf,
+    att: Att,
+    enc: Option<Encoder>,
     ups: Vec<Up>,
     out_norm: DevBuf,
     conv_out: Conv,
@@ -142,8 +171,36 @@ impl Vae {
             };
             ups.push(up);
         }
-        let (att_qkv, _) = half("decoder.middle.1.to_qkv.weight")?;
-        let (att_proj, _) = half("decoder.middle.1.proj.weight")?;
+        let att = |p: &str| -> Result<Att> {
+            Ok(Att { norm: vec(&format!("{p}.norm.gamma"))?, qkv: half(&format!("{p}.to_qkv.weight"))?.0, qkv_b: vec(&format!("{p}.to_qkv.bias"))?,
+                     proj: half(&format!("{p}.proj.weight"))?.0, proj_b: vec(&format!("{p}.proj.bias"))? })
+        };
+        // the encoder, when the file has it
+        let enc = if st.tensor("encoder.conv1.weight").is_some() {
+            let mut downs = Vec::new();
+            for i in 0.. {
+                let p = format!("encoder.downsamples.{i}.downsamples");
+                if st.tensor(&format!("{p}.0.residual.0.gamma")).is_none() {
+                    break;
+                }
+                let resnets = (0..2).map(|j| resnet(&format!("{p}.{j}"))).collect::<Result<Vec<_>>>()?;
+                let (ci, co) = (resnets[0].conv1.ci, resnets[1].conv2.co);
+                let resample = if st.tensor(&format!("{p}.2.resample.1.weight")).is_some() { Some(conv(&format!("{p}.2.resample.1"))?) } else { None };
+                let ft = if st.tensor(&format!("{p}.2.time_conv.weight")).is_some() { 2 } else { 1 };
+                downs.push(Down { resnets, resample, ft, ci, co });
+            }
+            Some(Encoder {
+                conv_in: conv("encoder.conv1")?,
+                downs,
+                mid: [resnet("encoder.middle.0")?, resnet("encoder.middle.2")?],
+                att: att("encoder.middle.1")?,
+                out_norm: vec("encoder.head.0.gamma")?,
+                head: conv("encoder.head.2")?,
+                quant: conv("conv1")?,
+            })
+        } else {
+            None
+        };
         let post_quant = conv("conv2")?;
         let z = post_quant.ci;
         let (mean, std) = stats(file).unwrap_or(latent_stats);
@@ -155,11 +212,8 @@ impl Vae {
             post_quant,
             conv_in: conv("decoder.conv1")?,
             mid: [resnet("decoder.middle.0")?, resnet("decoder.middle.2")?],
-            att_norm: vec("decoder.middle.1.norm.gamma")?,
-            att_qkv,
-            att_qkv_b: vec("decoder.middle.1.to_qkv.bias")?,
-            att_proj,
-            att_proj_b: vec("decoder.middle.1.proj.bias")?,
+            att: att("decoder.middle.1")?,
+            enc,
             ups,
             out_norm: vec("decoder.head.0.gamma")?,
             conv_out: conv("decoder.head.2")?,
@@ -219,7 +273,7 @@ impl Vae {
         let x = self.conv(nsd, &self.post_quant, &x, h, w)?;
         let x = self.conv(nsd, &self.conv_in, &x, h, w)?;
         let x = self.resnet(nsd, &self.mid[0], x, h, w)?;
-        let x = self.attention(nsd, x, h, w)?;
+        let x = self.attention(nsd, &self.att, x, h, w, self.conv_in.co)?;
         let mut x = self.resnet(nsd, &self.mid[1], x, h, w)?;
         let (mut h, mut w) = (h, w);
         for up in &self.ups {
@@ -266,14 +320,14 @@ impl Vae {
     /// GEMMs and a softmax (one head of 1,152 features is past the fused kernel), a block of query rows at a time.
     /// v is made transposed (W_v . norm(x)^T): the second GEMM reads it as its weights; its bias is added after
     /// (each row of weights sums to 1).
-    fn attention(&self, nsd: &Nsd, x: DevBuf, h: usize, w: usize) -> Result<DevBuf> {
+    fn attention(&self, nsd: &Nsd, a: &Att, x: DevBuf, h: usize, w: usize, c: usize) -> Result<DevBuf> {
         let gpu = &self.gpu;
         let k = ffi::api()?;
-        let (px, c) = (h * w, self.conv_in.co);
+        let px = h * w;
         let n = DevBuf::new(gpu, px * c * 2)?;
-        nsd.rms_norm_mod(x.ptr(), Dt::F16, px, c, self.att_norm.ptr(), EPS, none(), none(), none(), n.ptr(), Dt::F16)?;
-        let wpart = |i: usize| -> *const std::ffi::c_void { self.att_qkv.ptr().cast::<u16>().wrapping_add(i * c * c).cast() };
-        let bpart = |i: usize| -> *const std::ffi::c_void { self.att_qkv_b.fp().wrapping_add(i * c).cast() };
+        nsd.rms_norm_mod(x.ptr(), Dt::F16, px, c, a.norm.ptr(), EPS, none(), none(), none(), n.ptr(), Dt::F16)?;
+        let wpart = |i: usize| -> *const std::ffi::c_void { a.qkv.ptr().cast::<u16>().wrapping_add(i * c * c).cast() };
+        let bpart = |i: usize| -> *const std::ffi::c_void { a.qkv_b.fp().wrapping_add(i * c).cast() };
         let (q, kk, vt) = (DevBuf::new(gpu, px * c * 2)?, DevBuf::new(gpu, px * c * 2)?, DevBuf::new(gpu, c * px * 2)?);
         nsd.linear(n.ptr(), Dt::F16, px, c, wpart(0), c, bpart(0), q.ptr(), Dt::F16)?;
         nsd.linear(n.ptr(), Dt::F16, px, c, wpart(1), c, bpart(1), kk.ptr(), Dt::F16)?;
@@ -297,9 +351,63 @@ impl Vae {
             r0 += rows;
         }
         prof::mark(nsd, "vae attention")?;
-        nsd.linear(o.ptr(), Dt::F16, px, c, self.att_proj.ptr(), c, self.att_proj_b.ptr(), n.ptr(), Dt::F16)?;
+        nsd.linear(o.ptr(), Dt::F16, px, c, a.proj.ptr(), c, a.proj_b.ptr(), n.ptr(), Dt::F16)?;
         nsd.gate_add(x.ptr(), Dt::F16, px, c, n.ptr(), Dt::F16, none(), none())?;
         nsd.wait()?;
         Ok(x)
+    }
+
+    /// Normalized latents float32 [h * w, z] (h = H / 16) of a picture: RGBA float32 [H, W, 4] in [-1, 1]
+    pub fn encode(&self, nsd: &Nsd, rgba: &[f32], hh: usize, ww: usize) -> Result<Vec<f32>> {
+        let e = self.enc.as_ref().ok_or_else(|| Error("this VAE file has no encoder (edits need it)".into()))?;
+        let gpu = &self.gpu;
+        let k = ffi::api()?;
+        let xf = DevBuf::from_f32(gpu, rgba)?;
+        let x = DevBuf::new(gpu, rgba.len() * 2)?;
+        // SAFETY: H x W x 4 values each way.
+        ffi::check(unsafe { (k.to_half)(gpu.raw(), xf.fp(), x.ptr(), rgba.len() as i64) }, "to half")?;
+        let mut x = self.conv(nsd, &e.conv_in, &x, hh, ww)?;
+        let (mut h, mut w) = (hh, ww);
+        for d in &e.downs {
+            let keep = DevBuf::new(gpu, h * w * d.ci * 2)?;
+            keep.copy_within(0, &x, 0, h * w * d.ci * 2)?;
+            for r in &d.resnets {
+                x = self.resnet(nsd, r, x, h, w)?;
+            }
+            match &d.resample {
+                Some(c) => {
+                    let p = DevBuf::new(gpu, (h + 1) * (w + 1) * c.ci * 2)?;
+                    // SAFETY: x holds h x w x ci halves, p (h + 1) x (w + 1) x ci.
+                    ffi::check(unsafe { (k.pad_br)(gpu.raw(), x.ptr(), h as i64, w as i64, c.ci as i64, p.ptr()) }, "pad")?;
+                    let out = DevBuf::new(gpu, (h / 2) * (w / 2) * c.co * 2)?;
+                    nsd.conv3d_ex(p.ptr(), Dt::F16, (1, h + 1, w + 1), c.ci, c.w.ptr(), c.co, (1, 3, 3), (1, 2, 2), c.b.ptr(), out.ptr())?;
+                    // SAFETY: keep holds h x w x ci halves, out (h / 2) x (w / 2) x co.
+                    ffi::check(unsafe { (k.avg_down_add)(gpu.raw(), keep.ptr(), h as i64, w as i64, d.ci as i64, d.co as i64, d.ft, out.ptr()) }, "shortcut")?;
+                    nsd.wait()?;
+                    x = out;
+                    h /= 2;
+                    w /= 2;
+                }
+                None => {
+                    // the shortcut at one-to-one: the block's input
+                    nsd.gate_add(x.ptr(), Dt::F16, h * w, d.co, keep.ptr(), Dt::F16, none(), none())?;
+                    nsd.wait()?;
+                }
+            }
+        }
+        let x = self.resnet(nsd, &e.mid[0], x, h, w)?;
+        let x = self.attention(nsd, &e.att, x, h, w, e.mid[0].conv2.co)?;
+        let x = self.resnet(nsd, &e.mid[1], x, h, w)?;
+        let a = self.norm_silu(nsd, &x, h * w, e.head.ci, &e.out_norm)?;
+        let x = self.conv(nsd, &e.head, &a, h, w)?;
+        let x = self.conv(nsd, &e.quant, &x, h, w)?;
+        let zc = e.quant.co;
+        let f = DevBuf::f32(gpu, h * w * zc)?;
+        // SAFETY: h x w x zc values each way.
+        ffi::check(unsafe { (k.to_float)(gpu.raw(), x.ptr(), f.fp(), (h * w * zc) as i64) }, "to float")?;
+        gpu.sync()?;
+        let all = f.to_f32()?;
+        let z = self.z;
+        Ok((0..h * w).flat_map(|p| (0..z).map(move |c| (p, c))).map(|(p, c)| (all[p * zc + c] - self.mean[c]) / self.std[c]).collect())
     }
 }

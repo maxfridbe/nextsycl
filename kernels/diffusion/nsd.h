@@ -108,6 +108,9 @@ int nsd_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const voi
 int nsd_dequant(void* ctx, const void* src, int qtype, int64_t n, void* out, int out_dt);
 int nsd_attention_causal(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t L, int64_t Hq, int64_t Hkv, int64_t D,
                          int64_t qs, int64_t kvs, void* out);
+/* nextsycl: causal attention for query rows [row0, row0 + rows) only (row i over keys [0, i]); out [rows, Hq * D] */
+int nsd_attention_causal_rows(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t row0, int64_t rows, int64_t Hq,
+                              int64_t Hkv, int64_t D, int64_t qs, int64_t kvs, void* out);
 /* The latent upscaler's operations, on channels-last volumes [T, H, W, C] in a 16-bit type `dt`.
  * conv3d: a k x k x k convolution (k odd, zero padding k / 2), w [Co, Ci, k, k, k] in dt (reordered once per buffer:
  *   keep it alive and unchanged), bias float32 [Co] or NULL; out [T, H, W, Co].
@@ -174,6 +177,11 @@ int nsd_rms_norm_mod(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, c
  * cs float32 [M, rot_dim/2, 2] holds (cos, sin) per token and pair. Features from rot_dim on are only normalized. */
 int nsd_rms_rope(void* ctx, void* x, int x_dt, int64_t M, int64_t H, int64_t D, int64_t stride, const float* weight,
                  float eps, const float* cs, int rot_dim);
+
+/* nextsycl: RoPE alone (no norm), in place, as nsd_rms_rope without its norm; cs float32 [M, rot_dim/2, 2] */
+int nsd_rope(void* ctx, void* x, int x_dt, int64_t M, int64_t H, int64_t D, int64_t stride, const float* cs, int rot_dim);
+/* nextsycl: GELU in place over n values: exact (erf, mode 0) or the tanh approximation (mode 1) */
+int nsd_gelu(void* ctx, void* x, int x_dt, int64_t n, int mode);
 
 /* The gated activation between an MLP's two linears: out[r, i] = silu(x[r, i]) * x[r, C + i].
  * x [M, 2 * C], out [M, C]. */

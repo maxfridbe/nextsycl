@@ -86,8 +86,11 @@ pub struct Dit {
 
 /// The text's state every step reads: each layer's q | k | v rows of the text (k with its RoPE), half
 pub struct Prefix {
+    /// rows: the text's, and the condition pictures' latents
     pub tokens: usize,
     kv: Vec<DevBuf>,
+    /// the frame position the target picture takes (after the text and the pictures)
+    pub frame: i64,
 }
 
 /// q / k row order: pair (2i, 2i + 1) -> (i, 64 + i)
@@ -380,12 +383,20 @@ impl Dit {
 
     /// The text's pass through every block (once a prompt): `embeds` float32 [T, 3584 or 4096] -> each layer's q|k|v
     pub fn prefix(&self, nsd: &Nsd, embeds: &DevBuf, tokens: usize, context_dim: usize) -> Result<Prefix> {
+        self.prefix_with(nsd, embeds, tokens, context_dim, &[], &[])
+    }
+
+    /// The prefix of an edit: the text (`pads`: which of its tokens are `<|image_pad|>` slots - each stands for 2 x 2
+    /// latents) with the condition pictures' latents (`conds`: float32 [h * w, 64] and (h, w), in the order of their
+    /// slot runs) put in their slots. Block-causal: the text is causal, each picture's latents attend to everything
+    /// before and to each other. Positions: text advances one on all three axes; a picture sits at the next frame
+    /// with its rows and columns centred on zero, and the next text starts past its larger side. All at t = 0.
+    pub fn prefix_with(&self, nsd: &Nsd, embeds: &DevBuf, tokens: usize, context_dim: usize, pads: &[bool], conds: &[(&DevBuf, (usize, usize))])
+                       -> Result<Prefix> {
         let gpu = &self.gpu;
         let k = ffi::api()?;
         let t = tokens;
         let md = self.modulation(nsd, 0.0)?;
-        let zeros = DevBuf::new(gpu, t.max(1) * 4)?;
-        zeros.fill(0)?;
         // txt_in: zero-centred RMS norm, linear, gelu (tanh), linear
         let hn = DevBuf::f32(gpu, t * context_dim)?;
         nsd.rms_norm_mod(embeds.ptr(), Dt::F32, t, context_dim, self.txt_norm.ptr(), EPS, none(), none(), none(), hn.ptr(), Dt::F32)?;
@@ -396,33 +407,91 @@ impl Dit {
         ffi::check(unsafe { (k.to_half)(gpu.raw(), h1.fp(), h1h.ptr(), (t * DIM) as i64) }, "to half")?;
         ffi::check(unsafe { (k.gelu_tanh)(gpu.raw(), h1h.ptr(), (t * DIM) as i64) }, "gelu")?;
         ffi::check(unsafe { (k.to_float)(gpu.raw(), h1h.ptr(), h1.fp(), (t * DIM) as i64) }, "to float")?;
-        let x = DevBuf::f32(gpu, t * DIM)?;
-        nsd.linear(h1.ptr(), Dt::F32, t, DIM, self.txt_in2.ptr(), DIM, none(), x.ptr(), Dt::F32)?;
-        // positions: the text's index on all three axes
-        let idx: Vec<[i64; 3]> = (0..t as i64).map(|p| [p, p, p]).collect();
+        let xt = DevBuf::f32(gpu, t * DIM)?;
+        nsd.linear(h1.ptr(), Dt::F32, t, DIM, self.txt_in2.ptr(), DIM, none(), xt.ptr(), Dt::F32)?;
+        // the joint rows: (start in x, rows, text?) segments, their positions; the text's rows and the pictures' latents
+        let mut segs: Vec<(usize, usize, bool)> = Vec::new();
+        let mut idx: Vec<[i64; 3]> = Vec::new();
+        let mut pos = 0i64;
+        let mut copies: Vec<(usize, usize, Option<usize>, usize)> = Vec::new(); // (dst row, src row, picture, rows)
+        let (mut i, mut c) = (0usize, 0usize);
+        while i < t {
+            let row = idx.len();
+            if pads.get(i).copied().unwrap_or(false) {
+                let (_, (ch, cw)) = *conds.get(c).ok_or_else(|| Error("more picture slots in the prompt than pictures".into()))?;
+                let slots = (ch * cw) / 4;
+                if pads.len() < i + slots || !pads[i..i + slots].iter().all(|p| *p) {
+                    return Err(Error(format!("picture {c}: {slots} slots expected in the prompt")));
+                }
+                for n in 0..ch * cw {
+                    let (r, q) = ((n / cw) as i64, (n % cw) as i64);
+                    idx.push([pos, r - (ch as i64 - ch as i64 / 2), q - (cw as i64 - cw as i64 / 2)]);
+                }
+                copies.push((row, 0, Some(c), ch * cw));
+                segs.push((row, ch * cw, false));
+                pos += ch.max(cw) as i64;
+                i += slots;
+                c += 1;
+            } else {
+                let st = i;
+                while i < t && !pads.get(i).copied().unwrap_or(false) {
+                    idx.push([pos, pos, pos]);
+                    pos += 1;
+                    i += 1;
+                }
+                copies.push((row, st, None, i - st));
+                segs.push((row, i - st, true));
+            }
+        }
+        if c != conds.len() {
+            return Err(Error(format!("{} pictures for {c} slot runs in the prompt", conds.len())));
+        }
+        let p = idx.len();
+        let x = DevBuf::f32(gpu, p * DIM)?;
+        for (dst, src, pic, rows) in &copies {
+            match pic {
+                None => x.copy_within(dst * DIM * 4, &xt, src * DIM * 4, rows * DIM * 4)?,
+                Some(ci) => nsd.linear(conds[*ci].0.ptr(), Dt::F32, *rows, LATENT, self.img_in.ptr(), DIM, none(), x.fp().wrapping_add(dst * DIM).cast(), Dt::F32)?,
+            }
+        }
+        let zeros = DevBuf::new(gpu, p.max(1) * 4)?;
+        zeros.fill(0)?;
         let cs = self.rope_table(&idx)?;
-        let (h, qkv, att, o) = (DevBuf::new(gpu, t * DIM * 2)?, DevBuf::new(gpu, t * 3 * DIM * 2)?, DevBuf::new(gpu, t * DIM * 2)?, DevBuf::new(gpu, t * DIM * 2)?);
-        let (gp, act) = (DevBuf::new(gpu, t * 2 * FFN * 2)?, DevBuf::new(gpu, t * FFN * 2)?);
+        let (h, qkv, att, o) = (DevBuf::new(gpu, p * DIM * 2)?, DevBuf::new(gpu, p * 3 * DIM * 2)?, DevBuf::new(gpu, p * DIM * 2)?, DevBuf::new(gpu, p * DIM * 2)?);
+        let (gp, act) = (DevBuf::new(gpu, p * 2 * FFN * 2)?, DevBuf::new(gpu, p * FFN * 2)?);
         let mut kv = Vec::with_capacity(self.blocks.len());
         let off = |buf: &DevBuf| -> *const f32 { buf.fp().wrapping_add(DIM) }; // the t = 0 row
+        let half_at = |buf: &DevBuf, n: usize| -> *mut std::ffi::c_void { buf.ptr().cast::<u16>().wrapping_add(n).cast() };
+        let text_only = segs.len() == 1 && segs[0].2;
         for b in &self.blocks {
-            // SAFETY: x holds t x 4096 floats, h as many halves; the scale row 4096 floats.
-            ffi::check(unsafe { (k.ln_mod)(gpu.raw(), x.fp(), t as i64, DIM as i64, EPS, off(&md[0]), h.ptr()) }, "norm + modulate")?;
-            b.qkv.apply(nsd, h.ptr(), t, DIM, qkv.ptr(), Dt::F16)?;
-            let half_at = |buf: &DevBuf, n: usize| -> *mut std::ffi::c_void { buf.ptr().cast::<u16>().wrapping_add(n).cast() };
-            nsd.rms_rope(qkv.ptr(), Dt::F16, t, HEADS, HEAD, 3 * DIM, b.norm_q.ptr(), EPS, cs.ptr(), HEAD)?;
-            nsd.rms_rope(half_at(&qkv, DIM), Dt::F16, t, HEADS, HEAD, 3 * DIM, b.norm_k.ptr(), EPS, cs.ptr(), HEAD)?;
-            nsd.attention_causal(qkv.ptr(), half_at(&qkv, DIM), half_at(&qkv, 2 * DIM), Dt::F16, t, HEADS, HEADS, HEAD, 3 * DIM, 3 * DIM, att.ptr())?;
-            // the layer's text q|k|v, kept for every step
-            let keep = DevBuf::new(gpu, t * 3 * DIM * 2)?;
-            keep.copy_within(0, &qkv, 0, t * 3 * DIM * 2)?;
+            // SAFETY: x holds p x 4096 floats, h as many halves; the scale row 4096 floats.
+            ffi::check(unsafe { (k.ln_mod)(gpu.raw(), x.fp(), p as i64, DIM as i64, EPS, off(&md[0]), h.ptr()) }, "norm + modulate")?;
+            b.qkv.apply(nsd, h.ptr(), p, DIM, qkv.ptr(), Dt::F16)?;
+            nsd.rms_rope(qkv.ptr(), Dt::F16, p, HEADS, HEAD, 3 * DIM, b.norm_q.ptr(), EPS, cs.ptr(), HEAD)?;
+            nsd.rms_rope(half_at(&qkv, DIM), Dt::F16, p, HEADS, HEAD, 3 * DIM, b.norm_k.ptr(), EPS, cs.ptr(), HEAD)?;
+            if text_only {
+                nsd.attention_causal(qkv.ptr(), half_at(&qkv, DIM), half_at(&qkv, 2 * DIM), Dt::F16, p, HEADS, HEADS, HEAD, 3 * DIM, 3 * DIM, att.ptr())?;
+            } else {
+                for (st, n, text) in &segs {
+                    let out = half_at(&att, st * DIM);
+                    if *text {
+                        nsd.attention_causal_rows(qkv.ptr(), half_at(&qkv, DIM), half_at(&qkv, 2 * DIM), Dt::F16, *st, *n, HEADS, HEADS, HEAD, 3 * DIM, 3 * DIM, out)?;
+                    } else {
+                        nsd.attention_qk(half_at(&qkv, st * 3 * DIM), *n, 3 * DIM, half_at(&qkv, DIM), half_at(&qkv, 2 * DIM), st + n, 3 * DIM, Dt::F16, HEADS, HEAD, out,
+                                         Dt::F16)?;
+                    }
+                }
+            }
+            // the layer's prefix q|k|v, kept for every step
+            let keep = DevBuf::new(gpu, p * 3 * DIM * 2)?;
+            keep.copy_within(0, &qkv, 0, p * 3 * DIM * 2)?;
             kv.push(keep);
-            b.out.apply(nsd, att.ptr(), t, DIM, o.ptr(), Dt::F16)?;
-            nsd.gate_add(x.ptr(), Dt::F32, t, DIM, o.ptr(), Dt::F16, zeros.ptr(), off(&md[1]).cast())?;
-            self.block_ffn(nsd, b, &x, t, &md, 1, &zeros, &h, &gp, &act, &o)?;
+            b.out.apply(nsd, att.ptr(), p, DIM, o.ptr(), Dt::F16)?;
+            nsd.gate_add(x.ptr(), Dt::F32, p, DIM, o.ptr(), Dt::F16, zeros.ptr(), off(&md[1]).cast())?;
+            self.block_ffn(nsd, b, &x, p, &md, 1, &zeros, &h, &gp, &act, &o)?;
         }
         nsd.wait()?;
-        Ok(Prefix { tokens: t, kv })
+        Ok(Prefix { tokens: p, kv, frame: pos })
     }
 
     /// The velocity for latents `lat` (float32 [hw.0 * hw.1, 64]) at sigma `t`, after the text `pre`: float32 [N, 64].
@@ -439,7 +508,7 @@ impl Dit {
         nsd.linear(lat.ptr(), Dt::F32, n, LATENT, self.img_in.ptr(), DIM, none(), x.ptr(), Dt::F32)?;
         // positions: the frame after the text; height and width centred on zero, row-major
         let (hh, ww) = (hw.0 as i64, hw.1 as i64);
-        let idx: Vec<[i64; 3]> = (0..n as i64).map(|i| [tt as i64, i / ww - (hh - hh / 2), i % ww - (ww - ww / 2)]).collect();
+        let idx: Vec<[i64; 3]> = (0..n as i64).map(|i| [pre.frame, i / ww - (hh - hh / 2), i % ww - (ww - ww / 2)]).collect();
         let cs = self.rope_table(&idx)?;
         let h = DevBuf::new(gpu, n * DIM * 2)?;
         // [the text's q|k|v | the image's], one layer at a time

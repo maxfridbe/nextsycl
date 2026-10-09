@@ -928,6 +928,35 @@ int nsd_attention_causal(void* ctx, const void* q, const void* k, const void* v,
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
+// nextsycl: causal attention for query rows [row0, row0 + rows) only: query row i attends to keys [0, i] (a text run
+// that follows earlier rows - a picture's block - in a block-causal sequence); out [rows, Hq * D] in dt
+int nsd_attention_causal_rows(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t row0, int64_t rows, int64_t Hq,
+                              int64_t Hkv, int64_t D, int64_t qs, int64_t kvs, void* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (rows <= 0) return 0;
+    if (D > 256 || Hq % Hkv != 0) { g_err = "nsd_attention_causal_rows: D <= 256, Hq a multiple of Hkv"; return -1; }
+    const int64_t wg = D <= 64 ? 64 : (D <= 128 ? 128 : 256);
+    const float scale = 1.0f / sycl::sqrt((float) D);
+    c.q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (Hq * rows * wg)), sycl::range<1>((size_t) wg)), [=](sycl::nd_item<1> it) {
+        const int64_t hi = it.get_group(0), h = hi / rows, r = hi % rows, i = row0 + r, d = it.get_local_id(0);
+        const int64_t g = h / (Hq / Hkv);
+        const float qd = d < D ? load(q, dt, (size_t) (i * qs + h * D + d)) : 0.0f;
+        float m = -INFINITY, l = 0.0f, acc = 0.0f;
+        for (int64_t j = 0; j <= i; ++j) {
+            const float kd = d < D ? load(k, dt, (size_t) (j * kvs + g * D + d)) : 0.0f;
+            const float sc = sycl::reduce_over_group(it.get_group(), qd * kd, sycl::plus<float>()) * scale;
+            const float mn = sycl::fmax(m, sc);
+            const float a = sycl::exp(m - mn), e = sycl::exp(sc - mn);
+            const float vd = d < D ? load(v, dt, (size_t) (j * kvs + g * D + d)) : 0.0f;
+            acc = acc * a + e * vd;
+            l = l * a + e;
+            m = mn;
+        }
+        if (d < D) store(out, dt, (size_t) (r * Hq * D + h * D + d), acc / l);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
 // ---- the latent upscaler: channels-last volumes [T, H, W, C], 16-bit
 
 int nsd_conv3d(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co, int64_t k,
@@ -1300,6 +1329,36 @@ int nsd_layer_norm(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, con
         if (weight) v *= weight[i];
         if (bias) v += bias[i];
         store(out, out_dt, r * C + i, v);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// nextsycl: RoPE alone (no norm), in place: pairs (i, rot/2 + i) of each head rotated by the row's (cos, sin)
+int nsd_rope(void* ctx, void* x, int x_dt, int64_t M, int64_t H, int64_t D, int64_t stride, const float* cs, int rot_dim) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || H <= 0 || D <= 0) return 0;
+    if (rot_dim <= 0 || rot_dim > D || rot_dim % 2 != 0) { g_err = "nsd_rope: rot_dim must be even and at most D"; return -1; }
+    const int64_t hr = rot_dim / 2;
+    c.q.parallel_for(sycl::range<1>((size_t) (M * H * hr)), [=](sycl::id<1> id) {
+        const int64_t i = id[0] % hr, h = (id[0] / hr) % H, r = id[0] / (hr * H);
+        const size_t base = (size_t) (r * stride + h * D);
+        const float co = cs[(r * hr + i) * 2], si = cs[(r * hr + i) * 2 + 1];
+        const float a = load(x, x_dt, base + i), b = load(x, x_dt, base + hr + i);
+        store(x, x_dt, base + i, a * co - b * si);
+        store(x, x_dt, base + hr + i, b * co + a * si);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// nextsycl: GELU in place over n values: exact (erf, mode 0) or the tanh approximation (mode 1)
+int nsd_gelu(void* ctx, void* x, int x_dt, int64_t n, int mode) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (n <= 0) return 0;
+    c.q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+        const float v = load(x, x_dt, i[0]);
+        const float g = mode == 1 ? 0.5f * v * (1.0f + sycl::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)))
+                                  : 0.5f * v * (1.0f + sycl::erf(v * 0.7071067811865476f));
+        store(x, x_dt, i[0], g);
     });
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }

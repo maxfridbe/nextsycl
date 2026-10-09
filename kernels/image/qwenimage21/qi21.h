@@ -33,6 +33,14 @@ int ns_image_qi21_up2(ns_gpu* g, const void* x, int64_t H, int64_t W, int64_t C,
  * (y, x) reading input channel (o * F + t * 4 + (y % 2) * 2 + (x % 2)) / R, F = ft * 4 (ft 1 or 2 time duplicates;
  * t = ft - 1, the frame a first chunk keeps), R = Co * F / Ci */
 int ns_image_qi21_dupup_add(ns_gpu* g, const void* x, int64_t H, int64_t W, int64_t Ci, int64_t Co, int ft, void* out);
+/* The VAE encoder's: out [H + 1, W + 1, C] half = x [H, W, C] half with a zero row below and a zero column right (the
+ * stride-2 convolution's padding) */
+int ns_image_qi21_pad_br(ns_gpu* g, const void* x, int64_t H, int64_t W, int64_t C, void* out);
+/* The down blocks' average shortcut (diffusers' AvgDown3D on one frame): out [H/2, W/2, Co] += the mean over each
+ * group of G = Ci * F / Co values of x [H, W, Ci] laid out (c, t, hs, ws), F = ft * 4; with ft 2 the t = 0 values are
+ * the zero frame padded in front (one frame) */
+int ns_image_qi21_avg_down_add(ns_gpu* g, const void* x, int64_t H, int64_t W, int64_t Ci, int64_t Co, int ft, void* out);
+/* x float32 [H, W, 4] in [-1, 1] -> half (the encoder's input) is ns_image_qi21_to_half */
 /* rgba [H, W, 4] uint8 from x [H, W, 4] half in [-1, 1]: clamped, (x / 2 + 0.5) * 255 rounded */
 int ns_image_qi21_to_rgba8(ns_gpu* g, const void* x, int64_t H, int64_t W, uint8_t* rgba);
 

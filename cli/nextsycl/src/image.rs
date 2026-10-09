@@ -8,7 +8,8 @@ use nextsycl_image::{ImageRequest, LoraUse, ModelFiles, Sampler, Schedule};
 use nextsycl_models::{config::Config, registry as models};
 use serde_json::Value;
 
-const USAGE: &str = "nextsycl image gen \"<prompt>\" [--model ID] [--size WxH | --aspect W:H] [--steps N] [--seed N] [--n N] [--sampler S]
+const USAGE: &str = "nextsycl image edit \"<instructions>\" --image PICTURE [--image REFERENCE]... [gen's options]
+nextsycl image gen \"<prompt>\" [--model ID] [--size WxH | --aspect W:H] [--steps N] [--seed N] [--n N] [--sampler S]
                    [--schedule S] [--lora NAME[:SCALE]]... [--set NAME=VALUE]... [--out FILE|DIR] [--rgba] [--local] [--gpu N]
 nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora NAME[:SCALE]]... [--set NAME=VALUE]...
                      [--wfe] [--out DIR] [--cors ORIGIN]
@@ -120,24 +121,45 @@ fn size(args: &[String], d: (u32, u32)) -> Result<(u32, u32), String> {
 }
 
 fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
+    gen_or_edit(cfg, args, false)
+}
+
+/// `nextsycl image edit "<instructions>" --image P [--image R]...`: the first picture changed as described, the others
+/// as references ("put the hat from picture 2 on the fox")
+fn edit(cfg: &Config, args: &[String]) -> Result<(), String> {
+    gen_or_edit(cfg, args, true)
+}
+
+fn gen_or_edit(cfg: &Config, args: &[String], editing: bool) -> Result<(), String> {
     let prompt = args.first().filter(|p| !p.starts_with("--")).ok_or(USAGE)?.clone();
+    let pics: Vec<nextsycl_image::Picture> = args.iter().enumerate().filter(|(_, a)| *a == "--image")
+        .map(|(i, _)| args.get(i + 1).ok_or("--image PICTURE".to_string()).and_then(|p| nextsycl_image::Picture::read_png(Path::new(p))))
+        .collect::<Result<_, _>>()?;
+    if editing && pics.is_empty() {
+        return Err("image edit: --image PICTURE (a PNG)".into());
+    }
     // the server path comes with `image serve`; until then every generation runs here
     let (m, e) = load(cfg, args)?;
     let d = e.defaults();
+    // an edit's size: its picture's aspect unless one is given
+    let given = opt(args, "--size").is_some() || opt(args, "--aspect").is_some();
     let (width, height) = size(args, (d.width, d.height))?;
     let seed: u64 = opt(args, "--seed").map(|s| s.parse().map_err(|_| "--seed N")).transpose()?.unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_nanos() as u64 % 100_000).unwrap_or(0)
     });
     let req = ImageRequest {
         prompt: prompt.clone(),
-        width: Some(width),
-        height: Some(height),
+        width: (!editing || given).then_some(width),
+        height: (!editing || given).then_some(height),
         steps: opt(args, "--steps").map(|s| s.parse().map_err(|_| "--steps N")).transpose()?,
         seed,
         n: opt(args, "--n").map(|s| s.parse().map_err(|_| "--n N")).transpose()?.unwrap_or(1),
         sampler: opt(args, "--sampler").map(|s| Sampler::parse(s).ok_or(format!("--sampler: {s}?"))).transpose()?,
         schedule: opt(args, "--schedule").map(|s| Schedule::parse(s).ok_or(format!("--schedule: {s}?"))).transpose()?,
         rgba: args.iter().any(|a| a == "--rgba"),
+        negative: opt(args, "--negative").map(str::to_string),
+        cfg: opt(args, "--cfg").map(|s| s.parse().map_err(|_| "--cfg X")).transpose()?,
+        edit: editing.then(|| nextsycl_image::Edit { image: pics[0].clone(), refs: pics[1..].to_vec(), mask: None, strength: 1.0 }),
         ..Default::default()
     };
     let t0 = std::time::Instant::now();
@@ -167,12 +189,19 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         let lora_list: Vec<String> = loras(cfg, args)?.iter().map(|l| format!("{}:{}", l.name, l.scale)).collect();
         let meta = [("prompt", prompt.clone()), ("model", id.to_string()), ("seed", (seed + i as u64).to_string()),
                     ("size", format!("{}x{}", p.width, p.height)), ("steps", req.steps.unwrap_or(d.steps).to_string()),
+                    ("edit", if editing { format!("{} picture(s)", pics.len()) } else { String::new() }),
                     ("loras", lora_list.join(","))];
         p.write_png(&path, &meta)?;
         saved.push(path.display().to_string());
     }
-    println!("saved {}  ({}x{}, {:.1} s, settings in the PNG)", saved.join(", "), width, height, t0.elapsed().as_secs_f64());
+    let (pw, ph) = pics_size(&saved);
+    println!("saved {}  ({pw}x{ph}, {:.1} s, settings in the PNG)", saved.join(", "), t0.elapsed().as_secs_f64());
     Ok(())
+}
+
+/// The first saved picture's size
+fn pics_size(saved: &[String]) -> (u32, u32) {
+    saved.first().and_then(|p| nextsycl_image::Picture::read_png(Path::new(p)).ok()).map_or((0, 0), |p| (p.width, p.height))
 }
 
 fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
@@ -182,7 +211,7 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     if m["arch"] != nextsycl_image_qwenimage21::ARCH {
         return Err(format!("check knows {} only", nextsycl_image_qwenimage21::ARCH));
     }
-    let stages: Vec<&str> = opt(args, "--stages").unwrap_or("te,dit,vae").split(',').collect();
+    let stages: Vec<&str> = opt(args, "--stages").unwrap_or("te,dit,vae").split(',').collect(); // + edit-pre, edit-te, edit-vae, edit-dit
     let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
     let gpu: Arc<nextsycl_core::Gpu> = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
     let mut log = |s: String| eprintln!("{s}");
@@ -332,6 +361,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         }
         Some("selftest") => selftest(rest),
         Some("gen") => gen(cfg, rest),
+        Some("edit") => edit(cfg, rest),
         Some("check") => check(cfg, rest),
         Some("serve") => serve(cfg, rest),
         _ => Err(USAGE.into()),

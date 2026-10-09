@@ -109,6 +109,20 @@ fn role<'f>(files: &'f ModelFiles, r: &str) -> Result<&'f Path> {
     files.get(r).map(|p| p.as_path()).ok_or_else(|| Error(format!("{ARCH}: no {r} file")))
 }
 
+/// The pipeline's calculate_dimensions: `area` at aspect `ratio` (width / height), sides rounded to multiples of 32
+/// (Python's round: halves to even)
+pub fn dims(area: f64, ratio: f64) -> (usize, usize) {
+    let w = (area * ratio).sqrt();
+    let h = w / ratio;
+    let r = |x: f64| -> usize {
+        let q = x / 32.0;
+        let f = q.floor();
+        let n = if (q - f - 0.5).abs() < 1e-12 { if f as i64 % 2 == 0 { f } else { f + 1.0 } } else { q.round() };
+        (n as usize).max(1) * 32
+    };
+    (r(w), r(h))
+}
+
 /// A seeded standard-normal draw (splitmix64, Box-Muller): the starting noise
 pub fn noise(seed: u64, n: usize) -> Vec<f32> {
     let mut s = seed;
@@ -186,16 +200,149 @@ impl QwenImage21 {
         Ok((out, t))
     }
 
+    /// Denoise with any of the shared samplers (nextsycl_diffusion::samplers: ComfyUI's, on the host): the latents
+    /// come back each model call, the x0 prediction is x - sigma v (v with true guidance when `neg` is given). `x`:
+    /// the starting noise [h * w, 64] (scaled to the first sigma here); returns the latents at the last sigma.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn denoise_sampled(&self, embeds: &DevBuf, tokens: usize, pads: &[bool], neg: Option<(&DevBuf, usize, &[bool], f32)>,
+                           conds: &[(&DevBuf, (usize, usize))], x: Vec<f32>, hw: (usize, usize), sigmas: &[f32], sampler: Sampler, seed: u64,
+                           each: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
+        let k = ffi::api()?;
+        let gpu = &self.nsd.gpu;
+        let pre = self.dit.prefix_with(&self.nsd, embeds, tokens, self.te.hidden, pads, conds)?;
+        let npre = neg.map(|(e, t, np, s)| Ok::<_, Error>((self.dit.prefix_with(&self.nsd, e, t, self.te.hidden, np, conds)?, s))).transpose()?;
+        let n = hw.0 * hw.1 * dit::LATENT;
+        let lat = DevBuf::f32(gpu, n)?;
+        let mut failed: Option<Error> = None;
+        let mut model = |x: &[f32], sigma: f32| -> std::result::Result<Vec<f32>, String> {
+            let run = || -> Result<Vec<f32>> {
+                lat.write(0, &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                let mut v = self.dit.velocity(&self.nsd, &pre, &lat, hw, sigma, None)?;
+                if let Some((np, scale)) = &npre {
+                    let vn = self.dit.velocity(&self.nsd, np, &lat, hw, sigma, None)?;
+                    // SAFETY: n floats each.
+                    ffi::check(unsafe { (k.axpy)(gpu.raw(), v.fp(), vn.fp(), n as i64, -1.0) }, "guidance")?;
+                    ffi::check(unsafe { (k.axpy)(gpu.raw(), vn.fp(), v.fp(), n as i64, *scale) }, "guidance")?;
+                    v = vn;
+                }
+                let v = v.to_f32()?;
+                Ok(x.iter().zip(&v).map(|(a, b)| a - sigma * b).collect())
+            };
+            run().map_err(|e| e.0)
+        };
+        // the samplers' own draws: a stream a call, from the seed (apart from the starting noise's)
+        let mut draw = 0u64;
+        let mut noise_fn = |m: usize| -> Vec<f32> {
+            draw += 1;
+            noise(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(draw), m)
+        };
+        let start: Vec<f32> = x.iter().map(|v| v * sigmas[0]).collect();
+        let mut step = |i: usize| {
+            if failed.is_none() {
+                if let Err(e) = each(i) {
+                    failed = Some(e);
+                }
+            }
+        };
+        let out = nextsycl_diffusion::samplers::sample(sampler, &mut model, start, sigmas, &mut noise_fn, &mut step).map_err(Error)?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        // ComfyUI's inverse noise scaling for a schedule that stops above 0
+        let last = *sigmas.last().unwrap_or(&0.0);
+        Ok(if last > 0.0 { out.iter().map(|v| v / (1.0 - last)).collect() } else { out })
+    }
+
+    /// An edit's pictures: each resized to the output area at its own aspect (multiples of 32, PIL's Lanczos), seen by
+    /// the vision tower over white, and encoded by the VAE (RGBA in [-1, 1]): (what the text encoder takes, the
+    /// latents and their size)
+    #[allow(clippy::type_complexity)]
+    pub fn pictures(&self, pics: &[Picture], area: usize) -> Result<(Vec<nextsycl_qwen3vl::vision::Seen>, Vec<(DevBuf, (usize, usize))>)> {
+        let vis = self.te.vision.as_ref().ok_or_else(|| Error(format!("{ARCH}: the text encoder's file has no vision tower (edits need it)")))?;
+        let mut seen = Vec::new();
+        let mut lats = Vec::new();
+        for p in pics {
+            let (w, h) = dims(area as f64, p.width as f64 / p.height as f64);
+            let r = p.rgba().resize_lanczos(w as u32, h as u32);
+            let rgb: Vec<f32> = r.data.chunks_exact(4).flat_map(|c| {
+                let a = c[3] as f32 / 255.0;
+                [0, 1, 2].map(|i| (c[i] as f32 * a + 255.0 * (1.0 - a)).round())
+            }).collect();
+            seen.push(vis.see(&self.nsd, &rgb, h, w)?);
+            let px: Vec<f32> = r.data.iter().map(|v| *v as f32 / 255.0 * 2.0 - 1.0).collect();
+            let l = self.vae.encode(&self.nsd, &px, h, w)?;
+            lats.push((DevBuf::from_f32(&self.nsd.gpu, &l)?, (h / 16, w / 16)));
+        }
+        Ok((seen, lats))
+    }
+
+    /// An edit's prompt with its pictures: (the text's embedding after the system turn, its tokens, which of them are
+    /// picture slots)
+    pub fn encode_edit(&self, prompt: &str, seen: &[nextsycl_qwen3vl::vision::Seen]) -> Result<(DevBuf, usize, Vec<bool>)> {
+        let ids = self.edit_ids(prompt, &seen.iter().map(|v| v.n).collect::<Vec<_>>())?;
+        let pad = self.te.tok.id("<|image_pad|>").ok_or_else(|| Error("the tokenizer has no <|image_pad|>".into()))?;
+        let drop = self.te.tokenize(SYSTEM).len();
+        let refs: Vec<&nextsycl_qwen3vl::vision::Seen> = seen.iter().collect();
+        let all = self.te.encode_seen(&self.nsd, &ids, &refs, usize::MAX)?;
+        let t = ids.len() - drop;
+        let d = self.te.hidden;
+        let out = DevBuf::f32(&self.nsd.gpu, t * d)?;
+        out.copy_within(0, &all, drop * d * 4, t * d * 4)?;
+        self.nsd.gpu.sync()?;
+        Ok((out, t, ids[drop..].iter().map(|i| *i == pad).collect()))
+    }
+
+    /// An edit prompt's ids: the template with a slot a picture, each slot's `<|image_pad|>` expanded to the picture's
+    /// `tokens[k]` merged tokens
+    pub fn edit_ids(&self, prompt: &str, tokens: &[usize]) -> Result<Vec<u32>> {
+        let slots: Vec<String> = (1..=tokens.len()).map(|i| format!("<image{i}><|vision_start|><|image_pad|><|vision_end|>")).collect();
+        let prompt = if prompt.is_empty() { " " } else { prompt };
+        let text = format!("{SYSTEM}<|im_start|>user\n{}{prompt}<|im_end|>\n<|im_start|>assistant\n", slots.join(" "));
+        let pad = self.te.tok.id("<|image_pad|>").ok_or_else(|| Error("the tokenizer has no <|image_pad|>".into()))?;
+        // each picture's one placeholder expanded to its merged tokens
+        let mut ids = Vec::new();
+        let mut k = 0;
+        for id in self.te.tokenize(&text) {
+            if id == pad {
+                let n = *tokens.get(k).ok_or_else(|| Error("more picture slots than pictures".into()))?;
+                ids.extend(std::iter::repeat_n(pad, n));
+                k += 1;
+            } else {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
     /// Denoise `lat` (float32 [h * w, 64], the noise, in place) over `sigmas` after the text `embeds`
     #[allow(clippy::too_many_arguments)]
     pub fn denoise(&self, embeds: &DevBuf, tokens: usize, lat: &DevBuf, hw: (usize, usize), sigmas: &[f32], each: &mut dyn FnMut(usize, &DevBuf) -> Result<()>)
                    -> Result<()> {
+        self.denoise_cfg(embeds, tokens, &[], None, &[], lat, hw, sigmas, each)
+    }
+
+    /// `denoise` with true classifier-free guidance when `neg` is given: (the negative prompt's embedding, its tokens,
+    /// its picture slots, the scale) - two passes a step, v = v_neg + scale (v - v_neg), as the pipeline's
+    /// true_cfg_scale - and an edit's condition pictures: `pads` (the prompt's picture slots) and `conds` (their
+    /// latents and latent sizes)
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn denoise_cfg(&self, embeds: &DevBuf, tokens: usize, pads: &[bool], neg: Option<(&DevBuf, usize, &[bool], f32)>, conds: &[(&DevBuf, (usize, usize))],
+                       lat: &DevBuf, hw: (usize, usize), sigmas: &[f32], each: &mut dyn FnMut(usize, &DevBuf) -> Result<()>) -> Result<()> {
         let k = ffi::api()?;
-        let pre = self.dit.prefix(&self.nsd, embeds, tokens, self.te.hidden)?;
+        let pre = self.dit.prefix_with(&self.nsd, embeds, tokens, self.te.hidden, pads, conds)?;
+        let npre = neg.map(|(e, t, np, s)| Ok::<_, Error>((self.dit.prefix_with(&self.nsd, e, t, self.te.hidden, np, conds)?, s))).transpose()?;
         let n = hw.0 * hw.1 * dit::LATENT;
         for i in 0..sigmas.len() - 1 {
             prof::reset_clock(&self.nsd)?;
-            let v = self.dit.velocity(&self.nsd, &pre, lat, hw, sigmas[i], None)?;
+            let mut v = self.dit.velocity(&self.nsd, &pre, lat, hw, sigmas[i], None)?;
+            if let Some((np, scale)) = &npre {
+                let vn = self.dit.velocity(&self.nsd, np, lat, hw, sigmas[i], None)?;
+                // v - v_neg, then v_neg + scale (v - v_neg)
+                // SAFETY: n floats each.
+                ffi::check(unsafe { (k.axpy)(self.nsd.gpu.raw(), v.fp(), vn.fp(), n as i64, -1.0) }, "guidance")?;
+                ffi::check(unsafe { (k.axpy)(self.nsd.gpu.raw(), vn.fp(), v.fp(), n as i64, *scale) }, "guidance")?;
+                v = vn;
+            }
             // SAFETY: n floats each.
             ffi::check(unsafe { (k.axpy)(self.nsd.gpu.raw(), lat.fp(), v.fp(), n as i64, sigmas[i + 1] - sigmas[i]) }, "euler step")?;
             self.nsd.gpu.sync()?;
@@ -216,15 +363,20 @@ impl ImageEngine for QwenImage21 {
     fn load_seconds(&self) -> f64 {
         self.load_s
     }
+    /// a picture (and references) with instructions: the condition pictures through the vision tower and the VAE
+    fn edits(&self) -> bool {
+        true
+    }
+    /// every shared sampler (Euler on the model's schedule stays on the GPU; the others step on the host)
     fn samplers(&self) -> Vec<Sampler> {
-        vec![Sampler::Euler]
+        Sampler::ALL.to_vec()
     }
     fn schedules(&self) -> Vec<Schedule> {
-        vec![Schedule::Shift]
+        Schedule::ALL.to_vec()
     }
-    /// distilled to run without it
+    /// true guidance: a scale above 1 with a negative prompt (off by default: one pass a step)
     fn guidance(&self) -> bool {
-        false
+        true
     }
     fn options(&self) -> &'static [EngineOption] {
         OPTIONS
@@ -239,19 +391,33 @@ impl ImageEngine for QwenImage21 {
     fn generate(&self, req: &ImageRequest, progress: &mut dyn FnMut(Step)) -> Result<Vec<Picture>> {
         let d = self.defaults();
         let t0 = Instant::now();
-        if req.edit.is_some() {
-            return Err(Error(format!("{ARCH}: edits are not ported yet")));
+        // an edit: the picture and its references (the pipeline's condition images, in order); the output takes the
+        // last one's aspect at the model's area unless a size is given
+        let pics: Vec<Picture> = match &req.edit {
+            Some(e) => {
+                if e.mask.is_some() {
+                    return Err(Error(format!("{ARCH}: masks are not part of this model's edits (describe the change instead)")));
+                }
+                std::iter::once(e.image.clone()).chain(e.refs.iter().cloned()).collect()
+            }
+            None => Vec::new(),
+        };
+        // true guidance: a scale above 1 with a negative prompt (as the pipeline: either alone does nothing)
+        let cfg = req.cfg.unwrap_or(1.0);
+        if cfg > 1.0 && req.negative.is_none() {
+            return Err(Error(format!("{ARCH}: guidance {cfg} needs a negative prompt (the model's true_cfg_scale)")));
         }
-        if req.cfg.is_some_and(|c| c != 1.0) || req.negative.is_some() {
-            return Err(Error(format!("{ARCH}: guidance (cfg, a negative prompt) is not ported yet: the model is distilled to run without it")));
-        }
-        if req.sampler.is_some_and(|s| s != Sampler::Euler) {
-            return Err(Error(format!("{ARCH}: only the euler sampler so far")));
-        }
+        let sampler = req.sampler.unwrap_or(Sampler::Euler);
+        let schedule = req.schedule.unwrap_or(Schedule::Shift);
         if !req.loras.is_empty() {
             return Err(Error(format!("{ARCH}: LoRAs are not ported yet")));
         }
-        let (w, h) = (req.width.unwrap_or(d.width) as usize, req.height.unwrap_or(d.height) as usize);
+        let area = (d.width * d.height) as usize;
+        let (dw, dh) = match pics.last() {
+            Some(p) => dims(area as f64, p.width as f64 / p.height as f64),
+            None => (d.width as usize, d.height as usize),
+        };
+        let (w, h) = (req.width.map_or(dw, |v| v as usize), req.height.map_or(dh, |v| v as usize));
         if w % 16 != 0 || h % 16 != 0 {
             return Err(Error(format!("{w}x{h}: the sides are multiples of 16")));
         }
@@ -265,6 +431,11 @@ impl ImageEngine for QwenImage21 {
             _ => steps,
         };
         let sig = match preset {
+            // another schedule than the model's own: ComfyUI's, at the shift the model's would use for this size
+            _ if schedule != Schedule::Shift => {
+                let shift = req.shift.filter(|s| *s > 0.0).unwrap_or_else(|| sched::mu(hw.0 * hw.1).exp() as f32);
+                nextsycl_diffusion::samplers::sigmas_for(sampler, schedule, steps as u32, shift)
+            }
             Some(p) if steps == p.nodes.len() => sched::preset(&p.nodes, hw.0 * hw.1, p.dynamic),
             Some(p) => {
                 return Err(Error(format!("this model runs its own {} sigmas (a few-step distill): {steps} steps is not one of its schedules",
@@ -272,15 +443,54 @@ impl ImageEngine for QwenImage21 {
             }
             None => sched::sigmas(steps, hw.0 * hw.1),
         };
-        let (embeds, tokens) = self.encode(&req.prompt)?;
+        let (seen, lats) = if pics.is_empty() { (Vec::new(), Vec::new()) } else { self.pictures(&pics, area)? };
+        let encode = |p: &str| -> Result<(DevBuf, usize, Vec<bool>)> {
+            if seen.is_empty() {
+                let (e, t) = self.encode(if p.is_empty() { " " } else { p })?;
+                Ok((e, t, Vec::new()))
+            } else {
+                self.encode_edit(p, &seen)
+            }
+        };
+        let (embeds, tokens, pads) = encode(&req.prompt)?;
+        let negative = match (&req.negative, cfg > 1.0) {
+            (Some(np), true) => Some(encode(np)?),
+            _ => None,
+        };
+        let conds: Vec<(&DevBuf, (usize, usize))> = lats.iter().map(|(b, s)| (b, *s)).collect();
+        if let Ok(dir) = std::env::var("NS_QI_DUMP") {
+            // what the denoiser is given (a debugging aid): raw float32 files
+            let raw = |name: &str, v: &[f32]| { let _ = std::fs::write(format!("{dir}/{name}"), v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()); };
+            raw("embeds.f32", &embeds.to_f32()?);
+            raw("pads.f32", &pads.iter().map(|p| *p as u8 as f32).collect::<Vec<_>>());
+            for (i, (b, _)) in lats.iter().enumerate() {
+                raw(&format!("cond{i}.f32"), &b.to_f32()?);
+            }
+        }
         progress(Step { picture: 0, at: 0, of: steps as u32, seconds: t0.elapsed().as_secs_f64() });
         let mut out = Vec::new();
         for p in 0..req.n.max(1) {
-            let lat = DevBuf::from_f32(&self.nsd.gpu, &noise(req.seed + p as u64, hw.0 * hw.1 * dit::LATENT))?;
-            self.denoise(&embeds, tokens, &lat, hw, &sig, &mut |i, _| {
-                progress(Step { picture: p, at: i as u32 + 1, of: steps as u32, seconds: t0.elapsed().as_secs_f64() });
-                Ok(())
-            })?;
+            let nz = noise(req.seed + p as u64, hw.0 * hw.1 * dit::LATENT);
+            if let Ok(dir) = std::env::var("NS_QI_DUMP") {
+                let _ = std::fs::write(format!("{dir}/noise.f32"), nz.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+            }
+            let neg = negative.as_ref().map(|(e, t, np)| (e, *t, np.as_slice(), cfg));
+            let of = (sig.len() - 1) as u32;
+            let lat = if sampler == Sampler::Euler && schedule == Schedule::Shift {
+                // the model's own path: Euler on the GPU
+                let lat = DevBuf::from_f32(&self.nsd.gpu, &nz)?;
+                self.denoise_cfg(&embeds, tokens, &pads, neg, &conds, &lat, hw, &sig, &mut |i, _| {
+                    progress(Step { picture: p, at: i as u32 + 1, of, seconds: t0.elapsed().as_secs_f64() });
+                    Ok(())
+                })?;
+                lat
+            } else {
+                let out = self.denoise_sampled(&embeds, tokens, &pads, neg, &conds, nz, hw, &sig, sampler, req.seed + p as u64, &mut |i| {
+                    progress(Step { picture: p, at: i as u32 + 1, of, seconds: t0.elapsed().as_secs_f64() });
+                    Ok(())
+                })?;
+                DevBuf::from_f32(&self.nsd.gpu, &out)?
+            };
             let tv = Instant::now();
             let (rgba, pw, ph) = self.vae.decode(&self.nsd, &lat.to_f32()?, hw.0, hw.1)?;
             if prof::on() {

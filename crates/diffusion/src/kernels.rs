@@ -37,11 +37,15 @@ struct Api {
     layer_norm: unsafe extern "C" fn(M, P, c_int, i64, i64, *const f32, *const f32, f32, M, c_int) -> c_int,
     rms_rope: unsafe extern "C" fn(M, M, c_int, i64, i64, i64, i64, *const f32, f32, *const f32, c_int) -> c_int,
     swiglu: unsafe extern "C" fn(M, P, c_int, i64, i64, M, c_int) -> c_int,
+    rope: unsafe extern "C" fn(M, M, c_int, i64, i64, i64, i64, *const f32, c_int) -> c_int,
+    gelu: unsafe extern "C" fn(M, M, c_int, i64, c_int) -> c_int,
     gate_add: unsafe extern "C" fn(M, M, c_int, i64, i64, P, c_int, *const i32, *const f32) -> c_int,
     attention: unsafe extern "C" fn(M, P, P, P, c_int, i64, i64, i64, i64, M, c_int) -> c_int,
     attention_causal: unsafe extern "C" fn(M, P, P, P, c_int, i64, i64, i64, i64, i64, i64, M) -> c_int,
+    attention_causal_rows: unsafe extern "C" fn(M, P, P, P, c_int, i64, i64, i64, i64, i64, i64, i64, M) -> c_int,
     attention_qk: unsafe extern "C" fn(M, P, i64, i64, P, P, i64, i64, c_int, i64, i64, M, c_int) -> c_int,
     conv2d: unsafe extern "C" fn(M, P, c_int, i64, i64, i64, i64, P, i64, i64, *const f32, M) -> c_int,
+    conv3d_ex: unsafe extern "C" fn(M, P, c_int, i64, i64, i64, i64, P, i64, i64, i64, i64, i64, i64, i64, *const f32, M) -> c_int,
     attention_batch: unsafe extern "C" fn(M, P, P, P, c_int, i64, i64, i64, i64, i64, M, c_int) -> c_int,
     conv1d: unsafe extern "C" fn(M, *const f32, i64, i64, i64, *const f32, i64, i64, *const f32, i64, i64, i64, *mut f32, i64) -> c_int,
     conv_transpose1d: unsafe extern "C" fn(M, *const f32, i64, i64, i64, *const f32, i64, i64, *const f32, i64, i64, *mut f32, i64) -> c_int,
@@ -83,11 +87,15 @@ fn api() -> Result<&'static Api> {
             layer_norm: sym!("nsd_layer_norm"),
             rms_rope: sym!("nsd_rms_rope"),
             swiglu: sym!("nsd_swiglu"),
+            rope: sym!("nsd_rope"),
+            gelu: sym!("nsd_gelu"),
             gate_add: sym!("nsd_gate_add"),
             attention: sym!("nsd_attention"),
             attention_causal: sym!("nsd_attention_causal"),
+            attention_causal_rows: sym!("nsd_attention_causal_rows"),
             attention_qk: sym!("nsd_attention_qk"),
             conv2d: sym!("nsd_conv2d"),
+            conv3d_ex: sym!("nsd_conv3d_ex"),
             attention_batch: sym!("nsd_attention_batch"),
             conv1d: sym!("nsd_conv1d"),
             conv_transpose1d: sym!("nsd_conv_transpose1d"),
@@ -194,6 +202,19 @@ impl Nsd {
         self.ok(unsafe { (self.k.rms_rope)(self.ctx, x, dt as c_int, m as i64, h as i64, d as i64, stride as i64, weight.cast(), eps, cs.cast(), rot as c_int) }, "rms + rope")
     }
 
+    /// RoPE alone (no norm) on pairs (i, rot/2 + i) of each head, in place; cs (cos, sin) per row and pair
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope(&self, x: M, dt: Dt, m: usize, h: usize, d: usize, stride: usize, cs: P, rot: usize) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.rope)(self.ctx, x, dt as c_int, m as i64, h as i64, d as i64, stride as i64, cs.cast(), rot as c_int) }, "rope")
+    }
+
+    /// GELU in place over n values: exact (`tanh` false: erf) or the tanh approximation
+    pub fn gelu(&self, x: M, dt: Dt, n: usize, tanh: bool) -> Result<()> {
+        // SAFETY: x holds n values.
+        self.ok(unsafe { (self.k.gelu)(self.ctx, x, dt as c_int, n as i64, tanh as c_int) }, "gelu")
+    }
+
     /// out [M, C] = silu(x[:, :C]) * x[:, C:]
     pub fn swiglu(&self, x: P, x_dt: Dt, m: usize, c: usize, out: M, out_dt: Dt) -> Result<()> {
         // SAFETY: x holds [M, 2C], out [M, C].
@@ -222,6 +243,15 @@ impl Nsd {
                 "causal attention")
     }
 
+    /// Causal attention for query rows [row0, row0 + rows) only (row i over keys [0, i]); out [rows, Hq * D] in dt
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_causal_rows(&self, q: P, k: P, v: P, dt: Dt, row0: usize, rows: usize, hq: usize, hkv: usize, d: usize, qs: usize, kvs: usize,
+                                 out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.attention_causal_rows)(self.ctx, q, k, v, dt as c_int, row0 as i64, rows as i64, hq as i64, hkv as i64, d as i64, qs as i64,
+                                                         kvs as i64, out) }, "causal attention (rows)")
+    }
+
     /// Sq query rows over Skv key / value rows, no mask; out [Sq, H * D]
     #[allow(clippy::too_many_arguments)]
     pub fn attention_qk(&self, q: P, sq: usize, qs: usize, k: P, v: P, skv: usize, kvs: usize, dt: Dt, h: usize, d: usize, out: M, out_dt: Dt) -> Result<()> {
@@ -235,6 +265,17 @@ impl Nsd {
     pub fn conv2d(&self, x: P, dt: Dt, n: usize, h: usize, w_: usize, ci: usize, w: P, co: usize, k: usize, bias: P, out: M) -> Result<()> {
         // SAFETY: the caller's buffers hold the sizes named.
         self.ok(unsafe { (self.k.conv2d)(self.ctx, x, dt as c_int, n as i64, h as i64, w_ as i64, ci as i64, w, co as i64, k as i64, bias.cast(), out) }, "conv2d")
+    }
+
+    /// A strided convolution without padding on a channels-last volume x [T, H, W, Ci] in `dt`: w [Co, Ci, kt, kh, kw]
+    /// in `dt` (reordered once a buffer: keep it alive and unchanged), bias float32 [Co] or null; out [To, Ho, Wo, Co],
+    /// To = (T - kt) / st + 1 and so on
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv3d_ex(&self, x: P, dt: Dt, thw: (usize, usize, usize), ci: usize, w: P, co: usize, k: (usize, usize, usize), s: (usize, usize, usize),
+                     bias: P, out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.conv3d_ex)(self.ctx, x, dt as c_int, thw.0 as i64, thw.1 as i64, thw.2 as i64, ci as i64, w, co as i64, k.0 as i64, k.1 as i64,
+                                             k.2 as i64, s.0 as i64, s.1 as i64, s.2 as i64, bias.cast(), out) }, "conv3d (strided)")
     }
 
     /// B independent sequences of S rows each (sequence b's rows from row b * S of q, k, v and out), full attention

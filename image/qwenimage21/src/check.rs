@@ -77,6 +77,53 @@ pub fn run(m: &QwenImage21, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Str
         log(format!("te: {} tokens in {:.0} ms", ids.len(), t0.elapsed().as_secs_f64() * 1e3));
         worst = worst.max(line("te embeds", &all[drop * d..], &embeds, log));
     }
+    if stages.contains(&"edit-te") {
+        let vis = m.te.vision.as_ref().ok_or_else(|| Error("the text encoder's file has no vision tower".into()))?;
+        // the processor's patches, from the reference's resized picture (opaque here: over white is itself)
+        let (shape, rgba) = read_npy(&dir.join("cond_rgba.npy"))?;
+        let (hh, ww) = (shape[0], shape[1]);
+        let rgb: Vec<f32> = rgba.chunks_exact(4).flat_map(|p| {
+            let a = p[3] / 255.0;
+            [p[0] * a + 255.0 * (1.0 - a), p[1] * a + 255.0 * (1.0 - a), p[2] * a + 255.0 * (1.0 - a)]
+        }).collect();
+        let (px, grid) = nextsycl_qwen3vl::vision::patches(&rgb, hh, ww)?;
+        let (_, want_px) = read_npy(&dir.join("pixel_values.npy"))?;
+        worst = worst.max(line("patches", &px, &want_px, log));
+        let t0 = std::time::Instant::now();
+        let seen = vis.see_patches(&m.nsd, &want_px, grid)?;
+        log(format!("vision: {} patches in {:.0} ms", grid.0 * grid.1, t0.elapsed().as_secs_f64() * 1e3));
+        let (_, merged) = read_npy(&dir.join("vis_merged.npy"))?;
+        worst = worst.max(line("vision tokens", &seen.tokens.to_f32()?, &merged, log));
+        let (_, deep) = read_npy(&dir.join("vis_deep.npy"))?;
+        let per = merged.len();
+        for (i, ds) in seen.deep.iter().enumerate() {
+            worst = worst.max(line(&format!("deepstack {i}"), &ds.to_f32()?, &deep[i * per..(i + 1) * per], log));
+        }
+        let pad = m.te.tok.id("<|image_pad|>").unwrap_or(0);
+        if let Ok(pr) = std::env::var("NS_CHECK_PROMPT") {
+            let mine = m.edit_ids(&pr, &[seen.n])?;
+            log(format!("edit ids: {} here, {} in the reference{}", mine.len(), ids.len(), if mine == ids { " - the same" } else { " - DIFFERENT" }));
+            if mine != ids {
+                let at = mine.iter().zip(&ids).position(|(a, b)| a != b).unwrap_or(0);
+                log(format!("  first difference at {at}: {:?} vs {:?}", &mine[at..(at + 8).min(mine.len())], &ids[at..(at + 8).min(ids.len())]));
+                worst = f64::INFINITY;
+            }
+        }
+        let pos: Vec<f32> = nextsycl_qwen3vl::TextEncoder::positions(&ids, pad, &[grid])?.iter().flat_map(|p| p.iter().map(|x| *x as f32)).collect();
+        let (_, want_pos) = read_npy(&dir.join("positions.npy"))?;
+        worst = worst.max(line("positions", &pos, &want_pos, log));
+        if let Ok((_, l0)) = read_npy(&dir.join("te_layer0.npy")) {
+            worst = worst.max(line("te layer 0", &m.te.encode_seen(&m.nsd, &ids, &[&seen], 1)?.to_f32()?, &l0, log));
+        }
+        let all = m.te.encode_seen(&m.nsd, &ids, &[&seen], usize::MAX)?.to_f32()?;
+        let d = m.te.hidden;
+        let got = &all[drop * d..];
+        line("te embeds", got, &embeds, log);
+        // the denoiser reads the text's rows only (the picture's are replaced by its latents)
+        let text: Vec<usize> = ids[drop..].iter().enumerate().filter(|(_, t)| **t != pad).map(|(i, _)| i).collect();
+        let pick = |v: &[f32]| -> Vec<f32> { text.iter().flat_map(|i| v[i * d..(i + 1) * d].iter().copied()).collect() };
+        worst = worst.max(line("te text rows", &pick(got), &pick(&embeds), log));
+    }
     let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("dit.json")).unwrap_or_else(|_| "{}".into())).unwrap_or_default();
     let size = meta["size"].as_u64().unwrap_or(512) as usize;
     let steps = meta["steps"].as_u64().unwrap_or(20) as usize;
@@ -114,6 +161,67 @@ pub fn run(m: &QwenImage21, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Str
             })?;
             log(format!("dit: {steps} steps in {:.1} s", t0.elapsed().as_secs_f64()));
         }
+    }
+    if stages.contains(&"edit-dit") {
+        // the denoiser with the condition picture in its slots: the reference's embeddings and latents in
+        let pads: Vec<bool> = toks["image_pad"].as_array().map(|a| a.iter().map(|x| x.as_u64() == Some(1)).collect()).unwrap_or_default();
+        let (h, w) = (toks["h"].as_u64().unwrap_or(512) as usize / 16, toks["w"].as_u64().unwrap_or(512) as usize / 16);
+        let raw = |f: String| -> Result<Vec<f32>> {
+            Ok(std::fs::read(&f).map_err(|e| Error(format!("{f}: {e}")))?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        };
+        let (_, cl) = read_npy(&dir.join("cond_latents.npy"))?;
+        let cl = match std::env::var("NS_CHECK_COND") { Ok(f) => raw(f)?, Err(_) => cl };
+        let cond = DevBuf::from_f32(gpu, &cl)?;
+        // NS_CHECK_EMBEDS: raw float32 embeddings to use instead of the reference's (the engine's own, to see their effect)
+        let embeds = match std::env::var("NS_CHECK_EMBEDS") {
+            Ok(f) => std::fs::read(&f).map_err(|e| Error(format!("{f}: {e}")))?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            Err(_) => embeds.clone(),
+        };
+        let e = DevBuf::from_f32(gpu, &embeds)?;
+        let (_, noise) = read_npy(&dir.join("noise.npy"))?;
+        let noise = match std::env::var("NS_CHECK_NOISE") { Ok(f) => raw(f)?, Err(_) => noise };
+        let (_, sig_ref) = read_npy(&dir.join("sigmas.npy"))?;
+        let mine = sched::sigmas(sig_ref.len() - 1, h * w);
+        line("edit sigmas", &mine, &sig_ref, log);
+        log(format!("  here {:?}\n  ref  {:?}", &mine[..4.min(mine.len())], &sig_ref[..4.min(sig_ref.len())]));
+        let lat = DevBuf::from_f32(gpu, &noise)?;
+        let t0 = std::time::Instant::now();
+        let pre = m.dit.prefix_with(&m.nsd, &e, tokens, embeds.len() / tokens, &pads, &[(&cond, (h, w))])?;
+        log(format!("dit: the prefix (text + the picture's {} latents: {} rows) in {:.0} ms", h * w, pre.tokens, t0.elapsed().as_secs_f64() * 1e3));
+        let v = m.dit.velocity(&m.nsd, &pre, &lat, (h, w), sig_ref[0], None)?;
+        let (_, v0) = read_npy(&dir.join("v0.npy"))?;
+        worst = worst.max(line("edit velocity 0", &v.to_f32()?, &v0, log));
+        let lat = DevBuf::from_f32(gpu, &noise)?;
+        let t0 = std::time::Instant::now();
+        m.denoise_cfg(&e, tokens, &pads, None, &[(&cond, (h, w))], &lat, (h, w), &sig_ref, &mut |i, l| {
+            let (_, want) = read_npy(&dir.join(format!("latents_{i}.npy")))?;
+            worst = worst.max(line(&format!("edit latents {i}"), &l.to_f32()?, &want, log));
+            Ok(())
+        })?;
+        log(format!("dit: {} steps in {:.1} s", sig_ref.len() - 1, t0.elapsed().as_secs_f64()));
+        let (rgba, pw, ph) = m.vae.decode(&m.nsd, &lat.to_f32()?, h, w)?;
+        let (_, img) = read_npy(&dir.join("image.npy"))?;
+        let want: Vec<f32> = img.iter().map(|x| ((x / 2.0 + 0.5).clamp(0.0, 1.0) * 255.0).round()).collect();
+        worst = worst.max(line("edit image", &rgba.iter().map(|x| *x as f32).collect::<Vec<_>>(), &want, log));
+        let pic = nextsycl_image::Picture { width: pw as u32, height: ph as u32, channels: 4, data: rgba };
+        pic.write_png(&dir.join("nextsycl.png"), &[]).map_err(Error)?;
+    }
+    if stages.contains(&"edit-pre") {
+        // the pipeline's preprocessing: the picture resized (PIL's Lanczos) to the reference's size
+        let (shape, want) = read_npy(&dir.join("cond_rgba.npy"))?;
+        let src = std::env::var("NS_CHECK_PICTURE").map_err(|_| Error("edit-pre: NS_CHECK_PICTURE=<the original picture>".into()))?;
+        let p = nextsycl_image::Picture::read_png(Path::new(&src)).map_err(Error)?.rgba().resize_lanczos(shape[1] as u32, shape[0] as u32);
+        worst = worst.max(line("resized", &p.data.iter().map(|x| *x as f32).collect::<Vec<_>>(), &want, log));
+    }
+    if stages.contains(&"edit-vae") {
+        // an edit's condition picture through the VAE's encoder
+        let (shape, rgba) = read_npy(&dir.join("vae_in.npy"))?;
+        let (hh, ww) = (shape[0], shape[1]);
+        let t0 = std::time::Instant::now();
+        let got = m.vae.encode(&m.nsd, &rgba, hh, ww)?;
+        log(format!("vae encoder: {ww}x{hh} in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3));
+        let (_, want) = read_npy(&dir.join("cond_latents.npy"))?;
+        worst = worst.max(line("cond latents", &got, &want, log));
     }
     if stages.contains(&"vae") {
         let (_, lat) = read_npy(&dir.join(format!("latents_{}.npy", steps - 1)))?;

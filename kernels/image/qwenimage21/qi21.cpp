@@ -176,4 +176,37 @@ int ns_image_qi21_to_rgba8(ns_gpu* g, const void* x, int64_t H, int64_t W, uint8
     NS_CATCH
 }
 
+int ns_image_qi21_pad_br(ns_gpu* g, const void* x, int64_t H, int64_t W, int64_t C, void* out) {
+    NS_TRY
+    const half* xi = (const half*) x;
+    half* o = (half*) out;
+    const int64_t Wo = W + 1;
+    g->q.parallel_for(sycl::range<1>((size_t) ((H + 1) * Wo * C)), [=](sycl::id<1> id) {
+        const int64_t c = id[0] % C, xx = (id[0] / C) % Wo, y = id[0] / (C * Wo);
+        o[id[0]] = (y < H && xx < W) ? xi[(y * W + xx) * C + c] : (half) 0.0f;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_image_qi21_avg_down_add(ns_gpu* g, const void* x, int64_t H, int64_t W, int64_t Ci, int64_t Co, int ft, void* out) {
+    NS_TRY
+    const half* xi = (const half*) x;
+    half* o = (half*) out;
+    const int64_t F = (int64_t) ft * 4, G = Ci * F / Co, Ho = H / 2, Wo = W / 2;
+    if (Ci * F % Co != 0) return ns_fail("ns_image_qi21_avg_down_add: Ci * F not a multiple of Co");
+    g->q.parallel_for(sycl::range<1>((size_t) (Ho * Wo * Co)), [=](sycl::id<1> id) {
+        const int64_t oc = id[0] % Co, xx = (id[0] / Co) % Wo, y = id[0] / (Co * Wo);
+        float s = 0.0f;
+        for (int64_t gi = 0; gi < G; ++gi) {
+            const int64_t j = oc * G + gi, c = j / F, r = j % F, t = r / 4, hs = (r % 4) / 2, ws = r % 2;
+            if (ft == 2 && t == 0) continue;
+            s += (float) xi[((2 * y + hs) * W + 2 * xx + ws) * Ci + c];
+        }
+        o[id[0]] = (half) ((float) o[id[0]] + s / (float) G);
+    });
+    return 0;
+    NS_CATCH
+}
+
 }  // extern "C"

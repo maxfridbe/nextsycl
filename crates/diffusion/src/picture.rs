@@ -87,3 +87,91 @@ mod tests {
         assert_eq!(p, q);
     }
 }
+
+/// PIL's Lanczos-3 kernel
+fn lanczos(x: f64) -> f64 {
+    let sinc = |x: f64| if x == 0.0 { 1.0 } else { (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x) };
+    if x.abs() < 3.0 { sinc(x) * sinc(x / 3.0) } else { 0.0 }
+}
+
+/// PIL's 8-bit resampling coefficients for one axis (ImagingResample: support 3 x the scale when shrinking, fixed point
+/// with 22 fraction bits): for each output position its first input index and weights
+fn coeffs(inp: usize, out: usize) -> Vec<(usize, Vec<i64>)> {
+    const BITS: u32 = 22;
+    let scale = inp as f64 / out as f64;
+    let fs = scale.max(1.0);
+    let support = 3.0 * fs;
+    (0..out).map(|xx| {
+        let center = (xx as f64 + 0.5) * scale;
+        let xmin = ((center - support + 0.5) as i64).max(0) as usize;
+        let xmax = ((center + support + 0.5) as i64).min(inp as i64) as usize - xmin;
+        let w: Vec<f64> = (0..xmax).map(|x| lanczos((x as f64 + xmin as f64 - center + 0.5) / fs)).collect();
+        let total: f64 = w.iter().sum();
+        let k = w.iter().map(|v| {
+            let v = if total != 0.0 { v / total } else { *v } * (1u64 << BITS) as f64;
+            if v < 0.0 { (v - 0.5) as i64 } else { (v + 0.5) as i64 }
+        }).collect();
+        (xmin, k)
+    }).collect()
+}
+
+impl Picture {
+    /// Resized to `w` x `h` as PIL's Image.resize with LANCZOS does it (8 bits a channel: the horizontal pass first,
+    /// rounded to bytes, then the vertical one)
+    pub fn resize_lanczos(&self, w: u32, h: u32) -> Picture {
+        let (iw, ih, c) = (self.width as usize, self.height as usize, self.channels as usize);
+        let (w, h) = (w as usize, h as usize);
+        if (w, h) == (iw, ih) {
+            return self.clone();
+        }
+        let clip = |v: i64| ((v + (1 << 21)) >> 22).clamp(0, 255) as u8;
+        // horizontal
+        let mut tmp = vec![0u8; ih * w * c];
+        let hc = coeffs(iw, w);
+        for y in 0..ih {
+            for (x, (x0, k)) in hc.iter().enumerate() {
+                for ch in 0..c {
+                    let s: i64 = k.iter().enumerate().map(|(i, kv)| kv * self.data[(y * iw + x0 + i) * c + ch] as i64).sum();
+                    tmp[(y * w + x) * c + ch] = clip(s);
+                }
+            }
+        }
+        let mut out = vec![0u8; h * w * c];
+        let vc = coeffs(ih, h);
+        for (y, (y0, k)) in vc.iter().enumerate() {
+            for x in 0..w {
+                for ch in 0..c {
+                    let s: i64 = k.iter().enumerate().map(|(i, kv)| kv * tmp[((y0 + i) * w + x) * c + ch] as i64).sum();
+                    out[(y * w + x) * c + ch] = clip(s);
+                }
+            }
+        }
+        Picture { width: w as u32, height: h as u32, channels: self.channels, data: out }
+    }
+
+    /// As RGBA (an opaque alpha added to RGB)
+    pub fn rgba(&self) -> Picture {
+        match self.channels {
+            4 => self.clone(),
+            3 => Picture { width: self.width, height: self.height, channels: 4, data: self.data.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect() },
+            1 => Picture { width: self.width, height: self.height, channels: 4, data: self.data.iter().flat_map(|v| [*v, *v, *v, 255]).collect() },
+            _ => Picture { width: self.width, height: self.height, channels: 4, data: self.data.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect() },
+        }
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+
+    #[test]
+    fn lanczos_keeps_flat_colour_and_size() {
+        let p = Picture { width: 7, height: 5, channels: 3, data: vec![200; 7 * 5 * 3] };
+        let r = p.resize_lanczos(3, 2);
+        assert_eq!((r.width, r.height), (3, 2));
+        assert!(r.data.iter().all(|v| *v == 200));
+        let u = p.resize_lanczos(14, 10);
+        assert!(u.data.iter().all(|v| *v == 200));
+    }
+}
+

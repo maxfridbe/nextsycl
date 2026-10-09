@@ -4,6 +4,10 @@ every stage the engine is checked against.
     python ref.py te   --te <qwen3vl int8_convrot.safetensors> --cfg <Qwen-Image-2.1 dir> --prompt TEXT --out DIR
     python ref.py dit  --dit <transformer .gguf> --cfg DIR --out DIR --size 512 --steps 4 --seed 7
     python ref.py vae  --vae <vae .safetensors> --cfg DIR --out DIR
+    python ref.py edit-te  --te <...> --cfg DIR --image PIC --prompt TEXT --size 512 --out DIR   (an edit: the picture's
+                           preprocessing, the vision tower, the text encoder with the picture)
+    python ref.py edit-vae --vae <...> --cfg DIR --out DIR       (the picture through the VAE's encoder)
+    python ref.py edit-dit --dit <...> --cfg DIR --out DIR --steps 4 --seed 7   (the denoiser with the condition)
     python ref.py dit  ... --lora <LoRA .safetensors> [--lora-scale X]   (the LoRA merged into the DiT first)
     python ref.py dit  ... --steps 6 --sigmas 1,0.9375,0.875,0.75,0.5,0.25 [--sigma-shift dynamic|none]   (a few-step preset)
 
@@ -231,6 +235,36 @@ def run_dit(a):
 
 
 # ------------------------------------------------------------------------------------------------ VAE
+def vae_enc_name(n):
+    """The original (Wan / ComfyUI) name of an encoder tensor -> diffusers' (None: the decoder's)"""
+    import re
+    if n.startswith("conv1."):
+        return "quant_conv." + n[len("conv1."):]
+    if not n.startswith("encoder."):
+        return None
+    n = n.replace("encoder.conv1.", "encoder.conv_in.")
+    n = n.replace("encoder.head.0.", "encoder.norm_out.").replace("encoder.head.2.", "encoder.conv_out.")
+    res = {"0": "norm1.gamma", "2": "conv1", "3": "norm2.gamma", "6": "conv2"}
+    m = re.match(r"encoder\.middle\.([02])\.residual\.(\d)(.*)", n)
+    if m:
+        part = res[m.group(2)]
+        return f"encoder.mid_block.resnets.{'0' if m.group(1) == '0' else '1'}." + (part if part.endswith("gamma") else part + m.group(3))
+    m = re.match(r"encoder\.middle\.1\.(.*)", n)
+    if m:
+        return "encoder.mid_block.attentions.0." + m.group(1)
+    m = re.match(r"encoder\.downsamples\.(\d)\.downsamples\.(\d)\.residual\.(\d)(.*)", n)
+    if m:
+        part = res[m.group(3)]
+        return f"encoder.down_blocks.{m.group(1)}.resnets.{m.group(2)}." + (part if part.endswith("gamma") else part + m.group(4))
+    m = re.match(r"encoder\.downsamples\.(\d)\.downsamples\.(\d)\.shortcut(.*)", n)
+    if m:
+        return f"encoder.down_blocks.{m.group(1)}.resnets.{m.group(2)}.conv_shortcut{m.group(3)}"
+    m = re.match(r"encoder\.downsamples\.(\d)\.downsamples\.2\.(resample|time_conv)(.*)", n)
+    if m:
+        return f"encoder.down_blocks.{m.group(1)}.downsampler.{m.group(2)}{m.group(3)}"
+    return n
+
+
 def vae_name(n):
     """The original (Wan / ComfyUI) name of a decoder tensor -> diffusers' (None: the encoder's, not needed)"""
     import re
@@ -268,7 +302,8 @@ def vae_name(n):
     return n
 
 
-def run_vae(a):
+def load_vae(a, part):
+    """The VAE's `part` ("decoder" or "encoder") from the file, float32"""
     from diffusers import AutoencoderKLQwenImage21
 
     vcfg = AutoencoderKLQwenImage21.load_config(os.path.join(a.cfg, "vae"))
@@ -278,8 +313,9 @@ def run_vae(a):
     params = dict(vae.named_parameters())
     h, base = st_header(a.vae)
     done = set()
+    naming = vae_name if part == "decoder" else vae_enc_name
     for name in h:
-        tgt = vae_name(name)
+        tgt = naming(name)
         if tgt is None:
             continue
         if tgt not in params:
@@ -288,13 +324,19 @@ def run_vae(a):
         p = params[tgt]
         p.data.copy_(t.reshape(p.shape))
         done.add(tgt)
-    missing = [n for n in params if n not in done and (n.startswith("decoder") or n.startswith("post_quant"))]
+    want = ("decoder", "post_quant") if part == "decoder" else ("encoder", "quant_conv")
+    missing = [n for n in params if n not in done and n.startswith(want)]
     if missing:
-        sys.exit(f"vae: decoder parameters the file does not have: {missing[:5]}")
+        sys.exit(f"vae: {part} parameters the file does not have: {missing[:5]}")
+    return vae, vcfg
+
+
+def run_vae(a):
+    vae, vcfg = load_vae(a, "decoder")
     meta = json.load(open(os.path.join(a.out, "dit.json")))
-    hw = meta["size"] // 16
+    hh, ww = meta.get("h", meta["size"] // 16), meta.get("w", meta["size"] // 16)
     lat = torch.from_numpy(np.load(os.path.join(a.out, f"latents_{meta['steps'] - 1}.npy")))
-    lat = lat.transpose(0, 1).reshape(1, 64, 1, hw, hw)
+    lat = lat.transpose(0, 1).reshape(1, 64, 1, hh, ww)
     mean = torch.tensor(vcfg["latents_mean"]).view(1, 64, 1, 1, 1)
     std = torch.tensor(vcfg["latents_std"]).view(1, 64, 1, 1, 1)
     img = vae.decode(lat * std + mean, return_dict=False)[0][:, :, 0]  # [1, 4, H, W] in [-1, 1]
@@ -306,9 +348,194 @@ def run_vae(a):
     print(f"vae: image {arr.shape}")
 
 
+# ------------------------------------------------------------------------------------------------ edits
+def edit_inputs(a):
+    """The pipeline's preprocessing of the condition image: the size (output_resolution^2 at its aspect, multiples of
+    32), the resized RGBA picture, the processor's patches"""
+    from PIL import Image
+    from diffusers.image_processor import VaeImageProcessor
+    from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_dimensions
+    img = Image.open(a.image)
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    w, h, _ = calculate_dimensions(a.size * a.size, img.size[0] / img.size[1])
+    ip = VaeImageProcessor(vae_scale_factor=16, vae_latent_channels=64)
+    resized = ip.resize(img, width=w, height=h)
+    vae_in = ip.preprocess(img, width=w, height=h)  # [1, 4, h, w] in [-1, 1]
+    return img, resized, vae_in, w, h
+
+
+def run_edit_te(a):
+    from comfy_kitchen.backends.eager import quantization as ck
+    from PIL import Image
+    from transformers import AutoProcessor
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel, Qwen3VLVisionModel
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+    img, resized, vae_in, w, h = edit_inputs(a)
+    np.save(os.path.join(a.out, "cond_rgba.npy"), np.asarray(resized, dtype=np.float32))
+    np.save(os.path.join(a.out, "vae_in.npy"), vae_in[0].permute(1, 2, 0).numpy())
+    # the vision encoder sees the picture over white
+    white = Image.new("RGB", resized.size, (255, 255, 255))
+    white.paste(resized, mask=resized.getchannel("A"))
+    proc = AutoProcessor.from_pretrained(os.path.join(a.cfg, "processor"))
+    sysp = "Comprehend and analyze the provided prompt."
+    text = (f"<|im_start|>system\n{sysp}<|im_end|>\n<|im_start|>user\n<image1><|vision_start|><|image_pad|><|vision_end|>{a.prompt}"
+            f"<|im_end|>\n<|im_start|>assistant\n")
+    inp = proc(text=[text], images=[white], padding=True, padding_side="left", return_tensors="pt")
+    ids = inp.input_ids[0].tolist()
+    grid = inp.image_grid_thw[0].tolist()
+    np.save(os.path.join(a.out, "pixel_values.npy"), inp.pixel_values.float().numpy())
+    cfgj = json.load(open(os.path.join(a.cfg, "text_encoder", "config.json")))
+    conf = Qwen3VLConfig(**cfgj)
+    # the vision tower: bf16 in the file, float32 here
+    vis = Qwen3VLVisionModel._from_config(conf.vision_config).float().eval()
+    hdr, base = st_header(a.te)
+    params = dict(vis.named_parameters())
+    for name in hdr:
+        if name.startswith("model.visual."):
+            params[name[len("model.visual."):]].data.copy_(st_tensor(a.te, hdr, base, name).float().reshape(params[name[len("model.visual."):]].shape))
+    vo = vis(inp.pixel_values.float(), grid_thw=inp.image_grid_thw)
+    merged = vo.pooler_output
+    deep = vo.deepstack_features
+    np.save(os.path.join(a.out, "vis_merged.npy"), merged.numpy())
+    np.save(os.path.join(a.out, "vis_deep.npy"), torch.stack(deep).numpy())
+    # M-RoPE positions as the model computes them
+    with torch.device("meta"):
+        shell = Qwen3VLModel(conf)
+    pos, _ = shell.get_rope_index(inp.input_ids, inp.mm_token_type_ids, image_grid_thw=inp.image_grid_thw, attention_mask=inp.attention_mask)
+    pos = pos[:, 0, :].T.contiguous()  # [S, 3]
+    np.save(os.path.join(a.out, "positions.npy"), pos.numpy().astype(np.float32))
+    pad = proc.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    vis_mask = torch.tensor([i == pad for i in ids])
+    x = lm_forward(a, ck, ids, pos, vis_mask, merged, deep)
+    drop = len(proc.tokenizer(f"<|im_start|>system\n{sysp}<|im_end|>\n")["input_ids"])
+    json.dump({"ids": ids, "drop": drop, "image_pad": [int(i == pad) for i in ids[drop:]], "grid": grid, "w": w, "h": h},
+              open(os.path.join(a.out, "tokens.json"), "w"))
+    np.save(os.path.join(a.out, "embeds.npy"), x[drop:].numpy())
+    print(f"edit te: {len(ids)} tokens, grid {grid}, {w}x{h}")
+
+
+def lm_forward(a, ck, ids, pos, vis_mask, merged, deep):
+    """The int8 ConvRot language model (comfy-kitchen's ops) with the image: its embeddings at the image slots,
+    interleaved M-RoPE (sections 24, 20, 20), deepstack added after layers 0-2"""
+    cfg = json.load(open(os.path.join(a.cfg, "text_encoder", "config.json")))
+    tc = cfg.get("text_config", cfg)
+    L, D, H, KV, HD = tc["num_hidden_layers"], tc["hidden_size"], tc["num_attention_heads"], tc["num_key_value_heads"], tc["head_dim"]
+    eps, theta = tc["rms_norm_eps"], tc["rope_theta"]
+    h, base = st_header(a.te)
+    W = lambda n: st_tensor(a.te, h, base, n)
+    lin = lambda x, name: ck.int8_linear(x, W(name + ".weight"), W(name + ".weight_scale"), out_dtype=torch.float32, convrot=True, convrot_groupsize=256)
+    rms = lambda x, w: x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
+    idx = torch.tensor(ids)
+    q = torch.nn.functional.embedding(idx, W("model.embed_tokens.weight")).float() * torch.nn.functional.embedding(idx, W("model.embed_tokens.weight_scale"))
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
+    x = _rotate_weight(q, _build_hadamard(256), 256)
+    x[vis_mask] = merged
+    S = x.shape[0]
+    inv = 1.0 / (theta ** (torch.arange(0, HD, 2, dtype=torch.float) / HD))
+    fr = pos.float()[:, :, None] * inv  # [S, 3, 64]
+    f = fr[:, 0].clone()
+    f[:, 1:60:3] = fr[:, 1, 1:60:3]
+    f[:, 2:60:3] = fr[:, 2, 2:60:3]
+    cos, sin = torch.cos(f), torch.sin(f)
+
+    def rope(t):
+        t1, t2 = t[..., : HD // 2], t[..., HD // 2:]
+        c, s_ = cos[:, None, :], sin[:, None, :]
+        return torch.cat([t1 * c - t2 * s_, t2 * c + t1 * s_], dim=-1)
+
+    mask = torch.full((S, S), float("-inf")).triu(1)
+    for l in range(L):
+        p = f"model.layers.{l}."
+        hh = rms(x, W(p + "input_layernorm.weight"))
+        qq = lin(hh, p + "self_attn.q_proj").view(S, H, HD)
+        k = lin(hh, p + "self_attn.k_proj").view(S, KV, HD)
+        v = lin(hh, p + "self_attn.v_proj").view(S, KV, HD)
+        qq = rope(rms(qq, W(p + "self_attn.q_norm.weight")))
+        k = rope(rms(k, W(p + "self_attn.k_norm.weight")))
+        k = k.repeat_interleave(H // KV, dim=1)
+        v = v.repeat_interleave(H // KV, dim=1)
+        att = torch.einsum("qhd,khd->hqk", qq, k) / math.sqrt(HD) + mask
+        o = torch.einsum("hqk,khd->qhd", att.softmax(-1), v).reshape(S, H * HD)
+        x = x + lin(o, p + "self_attn.o_proj")
+        hh = rms(x, W(p + "post_attention_layernorm.weight"))
+        x = x + lin(torch.nn.functional.silu(lin(hh, p + "mlp.gate_proj")) * lin(hh, p + "mlp.up_proj"), p + "mlp.down_proj")
+        if l < len(deep):
+            x[vis_mask] = x[vis_mask] + deep[l]
+        if l == 0:
+            np.save(os.path.join(a.out, "te_layer0.npy"), x.numpy())
+    return x
+
+
+def run_edit_vae(a):
+    vae, vcfg = load_vae(a, "encoder")
+    x = torch.from_numpy(np.load(os.path.join(a.out, "vae_in.npy"))).permute(2, 0, 1)[None, :, None]
+    lat = vae.encode(x).latent_dist.mode()  # the mean (argmax)
+    mean = torch.tensor(vcfg["latents_mean"]).view(1, 64, 1, 1, 1)
+    std = torch.tensor(vcfg["latents_std"]).view(1, 64, 1, 1, 1)
+    lat = (lat - mean) / std
+    _, c, _, hh, ww = lat.shape
+    np.save(os.path.join(a.out, "cond_latents.npy"), lat.view(c, hh * ww).T.contiguous().numpy())
+    print(f"edit vae: latents {hh}x{ww}")
+
+
+def run_edit_dit(a):
+    from diffusers import FlowMatchEulerDiscreteScheduler, QwenImage21Transformer2DModel
+    from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_shift, retrieve_timesteps
+    from diffusers.models.transformers.transformer_qwenimage21 import QwenImage21KVCache
+
+    cfg = QwenImage21Transformer2DModel.load_config(os.path.join(a.cfg, "transformer"))
+    with torch.device("meta"):
+        model = QwenImage21Transformer2DModel.from_config(cfg)
+    model = model.to_empty(device="cpu").float()
+    fresh = QwenImage21Transformer2DModel.from_config({**cfg, "num_layers": 1})
+    model.pos_embed = fresh.pos_embed
+    model.time_text_embed.time_proj = fresh.time_text_embed.time_proj
+    del fresh
+    load_gguf_into(model, a.dit)
+    model = model.eval()
+    emb = torch.from_numpy(np.load(os.path.join(a.out, "embeds.npy")))[None]
+    toks = json.load(open(os.path.join(a.out, "tokens.json")))
+    cond = torch.from_numpy(np.load(os.path.join(a.out, "cond_latents.npy")))[None]
+    ch, cw = toks["h"] // 16, toks["w"] // 16
+    # the target at the condition's size (the pipeline's default)
+    hh, ww = ch, cw
+    n = hh * ww
+    g = torch.Generator().manual_seed(a.seed)
+    lat = torch.randn((1, 64, hh, ww), generator=g, dtype=torch.float32).view(1, 64, n).transpose(1, 2).contiguous()
+    if a.noise:
+        # given noise (raw float32 [n, 64]: the engine's own draw)
+        lat = torch.from_numpy(np.fromfile(a.noise, dtype=np.float32).reshape(1, n, 64))
+    np.save(os.path.join(a.out, "noise.npy"), lat[0].numpy())
+    sched = FlowMatchEulerDiscreteScheduler.from_config(FlowMatchEulerDiscreteScheduler.load_config(os.path.join(a.cfg, "scheduler")))
+    sig = np.linspace(1.0, 1 / a.steps, a.steps)
+    mu = calculate_shift(n, sched.config.get("base_image_seq_len", 256), sched.config.get("max_image_seq_len", 4096),
+                         sched.config.get("base_shift", 0.5), sched.config.get("max_shift", 1.15))
+    timesteps, _ = retrieve_timesteps(sched, a.steps, "cpu", sigmas=sig, mu=mu)
+    np.save(os.path.join(a.out, "sigmas.npy"), sched.sigmas.numpy())
+    img_mask = torch.tensor(toks["image_pad"] + [1] * (n // 4), dtype=torch.bool)[None]
+    shapes = [[(1, ch, cw), (1, hh, ww)]]
+    cache = QwenImage21KVCache(len(model.transformer_blocks))
+    sched.set_begin_index(0)
+    for i, t in enumerate(timesteps):
+        x = torch.cat([cond, lat], dim=1)
+        v = model(hidden_states=x, timestep=(t.expand(1) / 1000).float(), encoder_hidden_states=emb, img_shapes=shapes,
+                  img_mask=img_mask, kv_cache=cache, kv_cache_mode="extract" if i == 0 else "cached", return_dict=False)[0]
+        v = v[:, -n:]
+        if i == 0:
+            np.save(os.path.join(a.out, "v0.npy"), v[0].numpy())
+        lat = sched.step(v, t, lat, return_dict=False)[0]
+        np.save(os.path.join(a.out, f"latents_{i}.npy"), lat[0].numpy())
+        print(f"edit dit: step {i + 1}/{a.steps}", flush=True)
+    json.dump({"size": a.size, "h": hh, "w": ww, "steps": a.steps, "seed": a.seed, "mu": mu}, open(os.path.join(a.out, "dit.json"), "w"))
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("stage", choices=["te", "dit", "vae"])
+    ap.add_argument("stage", choices=["te", "dit", "vae", "edit-te", "edit-vae", "edit-dit"])
+    ap.add_argument("--image", help="the condition picture (edit stages)")
+    ap.add_argument("--noise", help="raw float32 starting latents [n, 64] (edit-dit), instead of the seed's")
     ap.add_argument("--te"); ap.add_argument("--dit"); ap.add_argument("--vae"); ap.add_argument("--cfg", required=True)
     ap.add_argument("--prompt", default="A red fox sitting in fresh snow, morning light, photograph")
     ap.add_argument("--out", required=True); ap.add_argument("--size", type=int, default=512)
@@ -318,4 +545,4 @@ if __name__ == "__main__":
     ap.add_argument("--sigma-shift", choices=["dynamic", "none"], default="dynamic")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    {"te": run_te, "dit": run_dit, "vae": run_vae}[a.stage](a)
+    {"te": run_te, "dit": run_dit, "vae": run_vae, "edit-te": run_edit_te, "edit-vae": run_edit_vae, "edit-dit": run_edit_dit}[a.stage](a)
