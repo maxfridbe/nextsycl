@@ -24,6 +24,9 @@ language model, RVQ depth decoder, 2.4B flow-matching transformer and Flow-VAE d
 against MiniMax's diffusers code on the same files; a minute of song in 89 s on the B70 with the language model in
 int8 (118 s in half).
 
+A skill for porting to SYCL on Arc - the safety rules, migration traps, parity method, profiling and what made
+things fast, learned on these ports: [skills/sycl-porting/SKILL.md](skills/sycl-porting/SKILL.md).
+
 ## Supported models
 
 What `nextsycl models search` lists and `nextsycl models pull <id>` installs (direct links, sizes and SHA-256 in
