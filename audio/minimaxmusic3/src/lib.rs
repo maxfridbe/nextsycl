@@ -55,7 +55,8 @@ const CROP_RIGHT: usize = 344 - 86;
 
 /// The options it takes (`--opt-NAME`: at load the variable named)
 pub const OPTIONS: &[EngineOption] = &[
-    EngineOption { name: "int8", env: "NS_MM3_INT8", value: "0|1", help: "the language model and depth decoder in int8 (half the VRAM, ~1.8x the frames a second)", at: At::Load },
+    EngineOption { name: "int8", env: "NS_MM3_INT8", value: "0|1", help: "the language model and depth decoder in int8 (half the VRAM, ~1.7x the frames a second)", at: At::Load },
+    EngineOption { name: "dit-int8", env: "NS_MM3_DIT_INT8", value: "0|1", help: "the flow transformer's block matrices in int8 ConvRot (the card's int8 rate)", at: At::Load },
 ];
 
 /// This engine's registry entry
@@ -119,7 +120,8 @@ impl MiniMaxMusic3 {
             return Err(Error(format!("{}: not MiniMax Music 3's tokenizer (no <|audio_start|> at 151669)", tok_path(files))));
         }
         let ar = Ar::load(&ops, Shards::open(&lm)?, &Shards::open(&depth)?, int8, log)?;
-        let flow = Flow::load(&ops, &Shards::open(&cond)?, &Shards::open(&tr)?, log)?;
+        let dit_int8 = o.setting("NS_MM3_DIT_INT8").is_some_and(|v| v == "1");
+        let flow = Flow::load(&ops, &nsd, &Shards::open(&cond)?, &Shards::open(&tr)?, dit_int8, log)?;
         let voc = Vocoder::load(&ops, &Shards::open(&voc)?)?;
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();

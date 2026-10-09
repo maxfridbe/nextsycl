@@ -219,6 +219,7 @@ dependencies = [
  "nextsycl-core",
  "nextsycl-diffusion",
  "nextsycl-gguf",
+ "nextsycl-qwen3vl",
  "nextsycl-tok",
  "serde_json",
 ]

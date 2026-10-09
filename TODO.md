@@ -230,7 +230,8 @@ of IQ2_XXS instead could win twice.
       (reference/minimaxmusic3/ref.py: 51 forced frames 4e-4, 30 flow steps 1.2e-3, decoder 8e-7, three windows
       stitched 3.6e-3). Served: the reference's /v1/audio/speech + the page (wfe/audio). B70: a minute of song in
       118 s half, 89 s int8; B65 155 / 136 s
-- [ ] Music speed: the flow transformer in int8 ConvRot (as Qwen-Image's: ~1.4x on 36% of a song's time); the
+- [x] Music: the flow transformer in int8 ConvRot (`--opt-dit-int8`): flow 42 -> 33.5 s a minute of song, rel 8.6e-3
+- [ ] Music speed: the
       frame's eight host round trips (draws on the GPU, the frame as one graph); the depth decoder's seven passes
       read 8 GB a frame in half - int8 only, or a smaller form. Tried: the flow stage beside the frames on a second
       queue of the same card (the card takes the two in turns: 118 -> 114.5 s; dropped)

@@ -172,7 +172,12 @@ pub struct Mat {
     pub scale: Option<DevBuf>,
     pub n: usize,
     pub k: usize,
+    /// int8 ConvRot: the rows were rotated by the normalized Hadamard matrix in groups of this many inputs (0: none)
+    pub group: usize,
 }
+
+/// ConvRot's group: 256 inputs
+pub const GROUP: usize = 256;
 
 impl Mat {
     /// out [m, n] f32 = x [m, k] f32 . W^T + bias: a few rows by the engine's own product (bound by reading W once,
@@ -197,12 +202,14 @@ impl Mat {
         nsd.linear(xh.ptr(), Dt::F16, m, self.k, w, self.n, bias, out.cast(), Dt::F32)
     }
 
-    /// out [m, n] (f32 or half) = x [m, k] half . W^T + bias by oneDNN (half matrices only)
+    /// out [m, n] (f32 or half) = x [m, k] half . W^T + bias by oneDNN: a half matrix, or an int8 ConvRot one (the
+    /// activations rotated and quantized per row on the fly, the card's int8 rate)
     pub fn apply_half(&self, nsd: &Nsd, xh: P, m: usize, bias: P, out: M, out_dt: Dt) -> Result<()> {
-        if self.scale.is_some() {
-            return Err(Error("apply_half: a half matrix".into()));
+        match &self.scale {
+            None => nsd.linear(xh, Dt::F16, m, self.k, self.w.ptr(), self.n, bias, out, out_dt),
+            Some(s) if self.group > 0 => nsd.int8_linear(xh, Dt::F16, m, self.k, self.w.ptr(), self.n, s.ptr(), self.n, bias, out, out_dt, self.group),
+            Some(_) => Err(Error("apply_half: a half or ConvRot matrix".into())),
         }
-        nsd.linear(xh, Dt::F16, m, self.k, self.w.ptr(), self.n, bias, out, out_dt)
     }
 
     pub fn bytes(&self) -> usize {
@@ -315,7 +322,38 @@ impl Shards {
             ops.gpu.sync()?;
             row += r1 - r0;
         }
-        Ok(Mat { w, scale, n, k })
+        Ok(Mat { w, scale, n, k, group: 0 })
+    }
+
+    /// `mat`'s rows as int8 ConvRot: float32 on the GPU, rotated along their inputs by the normalized Hadamard
+    /// matrix `had` [GROUP, GROUP] (W . H, a GEMM), quantized per row
+    pub fn mat_convrot(&self, ops: &Ops, nsd: &Nsd, parts: &[(&str, usize, usize)], had: &DevBuf) -> Result<Mat> {
+        let gpu = &ops.gpu;
+        let mut k = 0;
+        let mut n = 0;
+        let mut biggest = 0;
+        for (name, r0, r1) in parts {
+            k = self.shape(name)?.iter().skip(1).product();
+            n += r1 - r0;
+            biggest = biggest.max((r1 - r0) * k);
+        }
+        if k % GROUP != 0 {
+            return Err(Error(format!("{}: {k} inputs, not a multiple of {GROUP}", parts[0].0)));
+        }
+        let f = DevBuf::f32(gpu, n * k)?;
+        let stage = DevBuf::new(gpu, biggest * 2)?;
+        let mut row = 0;
+        for (name, r0, r1) in parts {
+            self.rows_to(ops, name, *r0, *r1, &stage, &f, row * k)?;
+            row += r1 - r0;
+        }
+        let rot = DevBuf::f32(gpu, n * k)?;
+        nsd.linear(f.ptr(), Dt::F32, n * k / GROUP, GROUP, had.ptr(), GROUP, none(), rot.ptr(), Dt::F32)?;
+        let w = DevBuf::new(gpu, n * k)?;
+        let scale = DevBuf::f32(gpu, n)?;
+        ops.quant_rows(rot.fp(), n, k, w.ptr(), scale.fp())?;
+        gpu.sync()?;
+        Ok(Mat { w, scale: Some(scale), n, k, group: GROUP })
     }
 
     /// A whole tensor as a matrix

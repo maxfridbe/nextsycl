@@ -11,5 +11,6 @@ nextsycl-diffusion.workspace = true
 nextsycl-gguf.workspace = true
 nextsycl-tok.workspace = true
 nextsycl-audio.workspace = true
+nextsycl-qwen3vl.workspace = true
 fancy-regex = "0.14"
 serde_json.workspace = true

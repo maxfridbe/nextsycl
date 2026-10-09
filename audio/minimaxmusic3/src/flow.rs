@@ -90,7 +90,12 @@ pub struct Work {
 }
 
 impl Flow {
-    pub fn load(ops: &Ops, cond: &Shards, tr: &Shards, log: &mut dyn FnMut(String)) -> Result<Flow> {
+    /// `int8`: the blocks' matrices as int8 ConvRot (else half)
+    pub fn load(ops: &Ops, nsd: &Nsd, cond: &Shards, tr: &Shards, int8: bool, log: &mut dyn FnMut(String)) -> Result<Flow> {
+        let had = DevBuf::from_f32(&ops.gpu, &nextsycl_qwen3vl::hadamard(crate::ops::GROUP))?;
+        let mat = |parts: &[(&str, usize, usize)]| -> Result<Mat> {
+            if int8 { tr.mat_convrot(ops, nsd, parts, &had) } else { tr.mat(ops, parts, false) }
+        };
         let t0 = std::time::Instant::now();
         let logits = cond.f32("layer_weight_logits")?;
         let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -116,11 +121,11 @@ impl Flow {
                 n1b: tr.dev_f32(ops, &n("norm1.bias"))?,
                 n2w: tr.dev_f32(ops, &n("norm2.weight"))?,
                 n2b: tr.dev_f32(ops, &n("norm2.bias"))?,
-                qkv: tr.mat(ops, &[(&n("attn.to_q.weight"), 0, DIM), (&n("attn.to_k.weight"), 0, DIM), (&n("attn.to_v.weight"), 0, DIM)], false)?,
-                o: tr.mat1(ops, &n("attn.to_out.0.weight"), false)?,
-                ff_in: tr.mat(ops, &[(&n("ff_in.weight"), FF, 2 * FF), (&n("ff_in.weight"), 0, FF)], false)?,
+                qkv: mat(&[(&n("attn.to_q.weight"), 0, DIM), (&n("attn.to_k.weight"), 0, DIM), (&n("attn.to_v.weight"), 0, DIM)])?,
+                o: mat(&[(&n("attn.to_out.0.weight"), 0, DIM)])?,
+                ff_in: mat(&[(&n("ff_in.weight"), FF, 2 * FF), (&n("ff_in.weight"), 0, FF)])?,
                 ff_in_b: DevBuf::from_f32(&ops.gpu, &fib)?,
-                ff_out: tr.mat1(ops, &n("ff_out.weight"), false)?,
+                ff_out: mat(&[(&n("ff_out.weight"), 0, DIM)])?,
                 ff_out_b: tr.dev_f32(ops, &n("ff_out.bias"))?,
             };
             bytes += blk.qkv.bytes() + blk.o.bytes() + blk.ff_in.bytes() + blk.ff_out.bytes();
@@ -149,7 +154,8 @@ impl Flow {
             bytes,
         };
         ops.gpu.sync()?;
-        log(format!("flow transformer (half, {:.1} GiB) in {:.0} s", bytes as f64 / (1u64 << 30) as f64, t0.elapsed().as_secs_f64()));
+        log(format!("flow transformer ({}, {:.1} GiB) in {:.0} s", if int8 { "int8 ConvRot" } else { "half" }, bytes as f64 / (1u64 << 30) as f64,
+                    t0.elapsed().as_secs_f64()));
         Ok(f)
     }
 
