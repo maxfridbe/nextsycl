@@ -15,8 +15,45 @@ cards or on one with its cold experts in pinned host memory, the MTP draft layer
 graphs; verify passes and batches bit-exact, greedy output with drafts equal to output without. Every model's speed at
 each context length: [Speed by model](#speed-by-model). **Qwen-Image 2.1**
 (`image/qwenimage21`): text to image, its Qwen3-VL text encoder, 7B DiT and RGBA VAE all in SYCL, checked stage by
-stage against the reference on the same quantized files; 1024x1024 in 40 steps takes 24.1 s on the B70 (16.9 s with int8 weights), 44 s on the B65. The video
-engine (MiniMax H3) comes next.
+stage against the reference on the same quantized files; 1024x1024 in 40 steps takes 23.8 s on the B70 (16.5 s with
+int8 weights), 37.5 s on the B65. The video engine (MiniMax H3) comes next.
+
+## Supported models
+
+What `nextsycl models search` lists and `nextsycl models pull <id>` installs (direct links, sizes and SHA-256 in
+`glue/models/catalog.json`). **Checked**: compared stage by stage with a reference run on the same files. **Served**:
+running in daily use here, with its speed measured. **Listed**: in the catalog, not yet run on this machine.
+
+**Language** (`nextsycl llm`)
+
+| id | model | engine | size | status |
+|---|---|---|---|---|
+| `glm-5.3-flash-uncensored`, `-128k`, `-256k` | GLM-5.3-Flash uncensored IQ2, 64K / 128K / 256K context | `glm5next` | 89.9 GiB | checked (llama.cpp), served on both cards |
+| `qwen3.8-flash-next-iq2_xs` | Qwen3.8-Flash-Next IQ2_XS | `qwen4exp` | 63.4 GiB | served (verify passes and batches exact) |
+| `qwen3.8-flash-next-iq2_xs-uncensored` | the same with the refusal projection (a control vector) | `qwen4exp` | 63.4 GiB | served |
+| `qwen3.8-flash-next-coder-iq1_m`, `-uncensored` | Qwen3.8-Flash-Next Coder IQ1_M | `qwen4exp` | 54.4 GiB | served |
+| `swift-1.5-iq2_xs` | Swift 1.5 IQ2_XS (short thinking) | `qwen4exp` | 63.5 GiB | served |
+
+**Image** (`nextsycl image`; sizes with the text encoder, VAE and tokenizer)
+
+| id | model | engine | size | status |
+|---|---|---|---|---|
+| `qwen-image-2.1-q8` | Qwen-Image 2.1 Q8_0: text to image, RGBA | `qwenimage21` | 16.4 GiB | checked, served |
+| `qwen-image-2.1-turbo-q8` | Qwen-Image 2.1 Turbo (Viggle v0.3 merged): 6 steps | `qwenimage21` | 16.5 GiB | checked |
+| `qwen-image-2.1-q6k`, `-uncensored-q8` | Qwen-Image 2.1 Q6_K; the uncensored model in Q8_0 | `qwenimage21` | 14.8 / 16.4 GiB | listed |
+| `qwen-image-2.1-q4km`, `-uncensored-q4km` | Q4_K_M | `qwenimage21` | 13.6 GiB | listed (needs Q5_K in the dequant) |
+
+**LoRAs** for Qwen-Image 2.1 (`--lora NAME[:SCALE]`, merged at load)
+
+| id | what | status |
+|---|---|---|
+| `qwen-image-2.1-uncensored-lora` | the uncensored change, rank 16 | checked |
+| `qwen-image-2.1-turbo-lora` | Viggle's 6-step turbo, rank 128 (brings its sigmas) | served |
+| `qwen-image-2.1-pruna-8step-lora` | Pruna's 8-step distill (brings its sigmas) | checked |
+| `qwen-image-2.1-pruna-5step-lora` | Pruna's 5-step distill | listed |
+
+**Video** (`nextsycl video`): MiniMax H3, text / image / audio to video (its own SYCL engine, `sycl-h3`) - moving in
+next.
 
 ## What it does
 
@@ -253,11 +290,22 @@ docs/screenshots` retakes them):
 
 <img src="docs/screenshots/image-wfe-phone.webp" width="260" alt="the page at phone width">
 
-| Qwen-Image 2.1 Q8_0, one card | load | 512x512, 20 steps | 1024x1024, 40 steps |
-|---|---|---|---|
-| B70, `NS_QI_INT8=1` | 7 s (page cache) | 1.8 s | 16.9 s (0.40 s / step) |
-| B70, half | 6 s (page cache) | 2.6 s | 24.1 s (0.58 s / step) |
-| B65, half | 7 s (page cache) | 5.9 s | 44 s (1.07 s / step) |
+The stock model (`qwen-image-2.1-q8`, 40 steps, Euler, one picture) on each card alone, through the server
+(`nextsycl image serve` timed by a client of its API, 2026-10-09). Each cell:
+the request's time end to end (prompt, 40 steps, VAE, PNG) · one step of the DiT (from a 40-step and a 1-step run,
+after a warm-up at that size) · the card's energy for the picture (its sensor). Load: start to the first `/health`
+answer, files in the page cache.
+
+| card, weights | load | 512×512 | 768×768 | 1024×768 | 1024×1024 | 1536×1536 |
+|---|---|---|---|---|---|---|
+| B70, half | 6.5 s | 5.4 s · 0.13 s/step · 0.41 Wh | 13.0 s · 0.32 s/step · 1.00 Wh | 17.4 s · 0.43 s/step · 1.33 Wh | 23.8 s · 0.59 s/step · 1.81 Wh | 62.1 s · 1.54 s/step · 4.74 Wh |
+| B70, int8 (`--opt-int8`) | 7.5 s | 3.6 s · 0.09 s/step · 0.27 Wh | 8.8 s · 0.22 s/step · 0.67 Wh | 11.8 s · 0.29 s/step · 0.90 Wh | 16.5 s · 0.41 s/step · 1.26 Wh | 45.3 s · 1.12 s/step · 3.46 Wh |
+| B65, half | 7.0 s | 8.5 s · 0.21 s/step · 0.47 Wh | 19.9 s · 0.49 s/step · 1.10 Wh | 27.1 s · 0.67 s/step · 1.50 Wh | 37.5 s · 0.93 s/step · 2.08 Wh | 98.4 s · 2.44 s/step · 5.46 Wh |
+| B65, int8 (`--opt-int8`) | 7.5 s | 5.6 s · 0.14 s/step · 0.30 Wh | 13.2 s · 0.32 s/step · 0.72 Wh | 17.9 s · 0.44 s/step · 0.99 Wh | 25.0 s · 0.61 s/step · 1.38 Wh | 69.1 s · 1.70 s/step · 3.83 Wh |
+
+Outside the steps a picture costs 0.1-0.5 s on the B70 and 0.2-1.0 s on the B65 (the prompt, the VAE, the PNG). The
+B65 takes ~1.6x the B70's time in half and ~1.5x in int8; int8 is 1.4-1.5x faster than half on either card. The few-step
+turbo model (`qwen-image-2.1-turbo-q8`, 6 steps) makes 1024×1024 in 3.2 s on the B70.
 
 `NS_QI_INT8=1` (opt-in, in the environment or a registry entry's settings) keeps the DiT's block matrices as int8
 ConvRot - each Q8_0 matrix rotated by the 256 x 256 Hadamard matrix along its inputs and quantized per row at load,

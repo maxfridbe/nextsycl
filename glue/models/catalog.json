@@ -326,7 +326,7 @@
    "id": "qwen-image-2.1-q8",
    "kind": "image",
    "arch": "qwen-image-2.1",
-   "title": "Qwen-Image 2.1 Q8_0 (text to image, edit, RGBA)",
+   "title": "Qwen-Image 2.1 Q8_0 (text to image, RGBA)",
    "about": "Qwen's 7B single-stream DiT, Q8_0 (GGUF by abenzerps), the Qwen3-VL 8B text encoder in int8, the 64-channel VAE",
    "files": {
     "transformer": "qwen-image-21-q80",
