@@ -10,7 +10,7 @@ pub mod sampling;
 use std::any::Any;
 use std::sync::Arc;
 
-pub use nextsycl_core::{DevBuf, Error, Gpu, Result};
+pub use nextsycl_core::{DevBuf, Error, Gpu, Result, At, EngineOption};
 use nextsycl_gguf::Gguf;
 
 /// Called with a tensor's name (llama.cpp's graph names: `attn_norm-3`, `l_out-44`, ...) and its float32 values on
@@ -293,7 +293,16 @@ pub struct EngineKind {
     pub kernels: Option<KernelsFn>,
     /// its model's chat template
     pub chat: ChatFn,
+    /// the options it takes beyond the common ones (`--opt-NAME`: nextsycl_core::options)
+    pub options: &'static [EngineOption],
 }
+
+/// Options every language engine's runtime reads (the shared loaders and guards), offered beside an engine's own
+pub const COMMON_OPTIONS: &[EngineOption] = &[
+    EngineOption { name: "split", env: "NS_SPLIT", value: "A,B,...", help: "layers on each GPU but the last (else even by count)", at: At::Load },
+    EngineOption { name: "vram-guard-gib", env: "NS_VRAM_GUARD_GIB", value: "GIB", help: "refuse a load that would leave less VRAM free than this", at: At::Load },
+    EngineOption { name: "profile", env: "NS_PROFILE", value: "1|gpu", help: "time the passes by part (gpu: device timestamps)", at: At::Load },
+];
 
 /// The entry of `kinds` serving `g`'s architecture
 pub fn kind_for<'k>(kinds: &'k [EngineKind], g: &Gguf) -> std::result::Result<&'k EngineKind, String> {

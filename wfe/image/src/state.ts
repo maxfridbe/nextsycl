@@ -27,7 +27,7 @@ export const state: AppState = {
   history: [],
   form: {
     prompt: "", negative: "", width: 1024, height: 1024, steps: null, n: 1, seed: null,
-    sampler: "", schedule: "", cfg: null, shift: null, rgba: false, loras: {},
+    sampler: "", schedule: "", cfg: null, shift: null, rgba: false, loras: {}, options: {},
   },
   results: [],
   zoom: null,
@@ -93,5 +93,5 @@ export function saveForm(): void {
 export function restorePreferences(): void {
   state.panels = load<Record<string, boolean>>("nsimg.panels", {});
   const f = load<Partial<Form> | null>("nsimg.form", null);
-  if (f) state.form = { ...state.form, ...f, loras: { ...(f.loras ?? {}) } };
+  if (f) state.form = { ...state.form, ...f, loras: { ...(f.loras ?? {}) }, options: { ...(f.options ?? {}) } };
 }

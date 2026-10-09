@@ -125,6 +125,12 @@ pub(crate) fn engines() -> Vec<EngineKind> {
 fn load_engine<'g>(f: &'g Gguf, gpus: &[std::sync::Arc<nextsycl_core::Gpu>], o: LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>, String> {
     let kinds = engines();
     let k = nextsycl_llm::kind_for(&kinds, f)?;
+    // the --opt-NAMEs: the variables the engine and its kernels read, set before it loads (no other thread reads the
+    // environment yet: the server's start after the load)
+    for (var, v) in opt_env(&llm_options(k), nextsycl_core::At::Load, k.name)? {
+        log(format!("option {var}={v}"));
+        std::env::set_var(var, v);
+    }
     (k.load)(f, gpus, &o, log).map_err(|e| e.0)
 }
 
@@ -761,7 +767,7 @@ fn llm(cfg: &nextsycl_models::Config, args: &[String]) -> Result<(), String> {
             None => Err("nextsycl llm serve <model>".into()),
         },
         Some("engines") => {
-            list_engines(engines().iter().map(|k| (k.archs.join(", "), k.name)));
+            list_engines(engines().iter().map(|k| (k.archs.join(", "), k.name, llm_options(k))));
             Ok(())
         }
         Some("selftest") => selftest("llm", rest, nextsycl_llm_example::selftest),
@@ -798,18 +804,40 @@ fn selftest(kind: &'static str, args: &[String], run: fn(&std::sync::Arc<nextsyc
     Ok(())
 }
 
-fn list_engines(rows: impl Iterator<Item = (String, &'static str)>) {
+/// The --opt-NAME [VALUE]s given on this command line
+pub(crate) static ENGINE_OPTS: std::sync::OnceLock<nextsycl_core::options::Given> = std::sync::OnceLock::new();
+
+pub(crate) fn engine_opts() -> &'static nextsycl_core::options::Given {
+    ENGINE_OPTS.get_or_init(Default::default)
+}
+
+/// The variables the --opt-NAMEs set for an engine that takes `declared` (an error lists its options)
+pub(crate) fn opt_env(declared: &[nextsycl_core::EngineOption], at: nextsycl_core::At, engine: &str) -> Result<Vec<(String, String)>, String> {
+    nextsycl_core::options::resolve(engine_opts(), declared, at, engine)
+}
+
+/// The engines and, under each, the options it takes (`--opt-NAME`)
+fn list_engines(rows: impl Iterator<Item = (String, &'static str, Vec<nextsycl_core::EngineOption>)>) {
     println!("{:<24} ENGINE", "ARCHITECTURE");
-    for (a, n) in rows {
+    for (a, n, opts) in rows {
         println!("{a:<24} {n}");
+        if !opts.is_empty() {
+            println!("{}", nextsycl_core::options::usage(&opts));
+        }
     }
+    println!("\n--opt-NAME VALUE on any command (or NAME the variable it sets) reaches the engine; `options` in an API request too");
+}
+
+/// An llm engine's options and the runtime's common ones
+fn llm_options(k: &EngineKind) -> Vec<nextsycl_core::EngineOption> {
+    k.options.iter().chain(nextsycl_llm::COMMON_OPTIONS).copied().collect()
 }
 
 /// `nextsycl video <command>`: the video commands - for now the engines; H3's commands move here next
 fn video(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("engines") => {
-            list_engines(video_engines().iter().map(|k| (k.archs.join(", "), k.name)));
+            list_engines(video_engines().iter().map(|k| (k.archs.join(", "), k.name, k.options.to_vec())));
             Ok(())
         }
         Some("selftest") => selftest("video", &args[1..], nextsycl_video_example::selftest),
@@ -827,6 +855,8 @@ fn main() -> ExitCode {
     // SAFETY: SIGPIPE (13) back to its default action (0), before any thread starts.
     unsafe { signal(13, 0) };
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // every --opt-NAME [VALUE]: the engine's own options, checked and forwarded where it loads (nextsycl_core::options)
+    let _ = ENGINE_OPTS.set(nextsycl_core::options::given(&args));
     let cfg = config::Config::load();
     let _ = client::SERVER.set(http::Target::Unix(cfg.socket()));
     let rest = args.get(1..).unwrap_or(&[]);

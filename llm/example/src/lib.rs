@@ -27,7 +27,9 @@ pub const ARCH: &str = "example";
 
 /// This engine's registry entry (the program lists it in `engines()`)
 pub fn kind() -> EngineKind {
-    EngineKind { archs: &[ARCH], name: "Example (a template engine: nothing ported)", load, info, kernels: None, chat: nextsycl_tok::qwen_chat }
+    EngineKind { archs: &[ARCH], name: "Example (a template engine: nothing ported)", load, info, kernels: None, chat: nextsycl_tok::qwen_chat,
+                 // the options it takes beyond the common ones (`--opt-NAME`), each with the variable it sets
+                 options: &[] }
 }
 
 /// `nextsycl llm info`: the file's architecture and geometry, checked, without a GPU

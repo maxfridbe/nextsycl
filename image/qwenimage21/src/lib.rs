@@ -27,7 +27,7 @@ use std::time::Instant;
 use nextsycl_core::{DevBuf, Gpu};
 use nextsycl_diffusion::kernels::Nsd;
 use nextsycl_gguf::Gguf;
-use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, Picture, Result, Sampler, Schedule, Step};
+use nextsycl_image::{At, Defaults, EngineOption, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, Picture, Result, Sampler, Schedule, Step};
 use nextsycl_qwen3vl::TextEncoder;
 
 pub const ARCH: &str = "qwen-image-2.1";
@@ -53,9 +53,32 @@ const LATENT_STD: [f32; 64] = [
     4.055, 5.5614, 4.2963, 4.408, 3.4959, 3.8747, 3.7608, 3.5735, 3.149, 3.7662, 3.6746, 3.4563, 3.8161,
 ];
 
+/// The options it takes (`--opt-NAME`: at load the variable named; per request a field of the request's `options`)
+pub const OPTIONS: &[EngineOption] = &[
+    EngineOption { name: "int8", env: "NS_QI_INT8", value: "0|1", help: "the DiT's block matrices in int8 ConvRot (~1.4x a step, half the VRAM)", at: At::Load },
+    EngineOption { name: "sigmas", env: "NS_QI_SIGMAS", value: "1,X,...", help: "the noise levels from 1 down (a few-step model's own; its step count)", at: At::Both },
+    EngineOption { name: "sigma-shift", env: "NS_QI_SIGMA_SHIFT", value: "dynamic|none", help: "the size's shift on those levels, or as given", at: At::Both },
+];
+
 /// This engine's registry entry
 pub fn kind() -> ImageKind {
-    ImageKind { archs: &[ARCH], name: "Qwen-Image 2.1 (7B single-stream DiT, Qwen3-VL text encoder, RGBA VAE)", roles: ROLES, load }
+    ImageKind { archs: &[ARCH], name: "Qwen-Image 2.1 (7B single-stream DiT, Qwen3-VL text encoder, RGBA VAE)", roles: ROLES, load, options: OPTIONS }
+}
+
+/// A sigma preset from its two settings (each `None`: not given)
+fn preset_of(sigmas: Option<String>, shift: Option<String>) -> Result<Option<Preset>> {
+    let Some(v) = sigmas else { return Ok(None) };
+    let bad = || Error(format!("sigmas {v}: numbers from 1 down, comma separated"));
+    let nodes: Vec<f64> = v.split(',').map(|x| x.trim().parse::<f64>()).collect::<std::result::Result<_, _>>().map_err(|_| bad())?;
+    if nodes.is_empty() || nodes.windows(2).any(|w| w[0] <= w[1]) || nodes[0] > 1.0 || *nodes.last().unwrap() <= 0.0 {
+        return Err(bad());
+    }
+    let dynamic = match shift.as_deref() {
+        None | Some("dynamic") => true,
+        Some("none") => false,
+        Some(x) => return Err(Error(format!("sigma-shift {x}: dynamic or none"))),
+    };
+    Ok(Some(Preset { nodes, dynamic }))
 }
 
 fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn ImageEngine>> {
@@ -111,23 +134,10 @@ impl QwenImage21 {
     /// The model on `gpu`, `o.merge_loras` merged into its DiT, its settings from `o` (`NS_QI_INT8`, the sigma preset)
     pub fn load(files: &ModelFiles, gpu: &Arc<Gpu>, o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<QwenImage21> {
         let loras = &o.merge_loras;
-        let preset = match o.setting("NS_QI_SIGMAS") {
-            Some(v) => {
-                let nodes: Vec<f64> = v.split(',').map(|x| x.trim().parse::<f64>()).collect::<std::result::Result<_, _>>()
-                    .map_err(|_| Error(format!("NS_QI_SIGMAS={v}: numbers from 1 down, comma separated")))?;
-                if nodes.is_empty() || nodes.windows(2).any(|w| w[0] <= w[1]) || nodes[0] > 1.0 || *nodes.last().unwrap() <= 0.0 {
-                    return Err(Error(format!("NS_QI_SIGMAS={v}: numbers from 1 down, comma separated")));
-                }
-                let dynamic = match o.setting("NS_QI_SIGMA_SHIFT").as_deref() {
-                    None | Some("dynamic") => true,
-                    Some("none") => false,
-                    Some(x) => return Err(Error(format!("NS_QI_SIGMA_SHIFT={x}: dynamic or none"))),
-                };
-                log(format!("sigmas: a {}-step preset {v} ({})", nodes.len(), if dynamic { "the size's shift" } else { "as given" }));
-                Some(Preset { nodes, dynamic })
-            }
-            None => None,
-        };
+        let preset = preset_of(o.setting("NS_QI_SIGMAS"), o.setting("NS_QI_SIGMA_SHIFT"))?;
+        if let Some(p) = &preset {
+            log(format!("sigmas: a {}-step preset ({})", p.nodes.len(), if p.dynamic { "the size's shift" } else { "as given" }));
+        }
         let t0 = Instant::now();
         nextsycl_core::use_kind("image");
         // the xe driver has no out-of-memory error - an allocation past the card spills to host RAM and can take the
@@ -216,6 +226,16 @@ impl ImageEngine for QwenImage21 {
     fn guidance(&self) -> bool {
         false
     }
+    fn options(&self) -> &'static [EngineOption] {
+        OPTIONS
+    }
+    fn steps_for(&self, req: &ImageRequest) -> u32 {
+        match (req.steps, req.extra.get("sigmas")) {
+            (Some(s), _) => s,
+            (None, Some(v)) => v.split(',').count() as u32,
+            (None, None) => self.defaults().steps,
+        }
+    }
     fn generate(&self, req: &ImageRequest, progress: &mut dyn FnMut(Step)) -> Result<Vec<Picture>> {
         let d = self.defaults();
         let t0 = Instant::now();
@@ -237,7 +257,14 @@ impl ImageEngine for QwenImage21 {
         }
         let steps = req.steps.unwrap_or(d.steps) as usize;
         let hw = (h / 16, w / 16);
-        let sig = match &self.preset {
+        // a request's own sigmas win over the model's preset
+        let mine = preset_of(req.extra.get("sigmas").cloned(), req.extra.get("sigma-shift").cloned())?;
+        let preset = mine.as_ref().or(self.preset.as_ref());
+        let steps = match (&mine, req.steps) {
+            (Some(p), None) => p.nodes.len(),
+            _ => steps,
+        };
+        let sig = match preset {
             Some(p) if steps == p.nodes.len() => sched::preset(&p.nodes, hw.0 * hw.1, p.dynamic),
             Some(p) => {
                 return Err(Error(format!("this model runs its own {} sigmas (a few-step distill): {steps} steps is not one of its schedules",

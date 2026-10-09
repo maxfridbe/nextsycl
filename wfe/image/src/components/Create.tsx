@@ -159,6 +159,22 @@ export function Create() {
             <input attrs={{ type: "checkbox" }} props={{ checked: f.rgba }} on={{ change: () => set("rgba", !f.rgba) }} /> transparent (RGBA)
           </label>
         </div>
+        {(info?.options ?? []).length
+          ? <div class="row">
+              {(info?.options ?? []).map((o) => (
+                <label attrs={{ title: o.help }}>{o.name}
+                  <input
+                    attrs={{ type: "text", placeholder: o.value || "on" }}
+                    props={{ value: f.options[o.name] ?? "" }}
+                    on={{ change: (e: Event) => {
+                      state.form.options[o.name] = (e.target as HTMLInputElement).value;
+                      saveForm(); render();
+                    } }}
+                  />
+                </label>
+              ))}
+            </div>
+          : null}
       </Section>
       <Section id="loras" title={`LoRAs (${Object.keys(f.loras).length} on)`}>
         <Loras />

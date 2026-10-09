@@ -4,7 +4,8 @@
 //! ```text
 //!   POST /v1/images/generations   OpenAI's body - prompt, n, size, response_format (b64_json | url), background
 //!                                 (transparent: RGBA) - and ours: steps, seed, sampler, schedule, shift, cfg,
-//!                                 negative_prompt, loras ["name:scale" | {name, scale}]
+//!                                 negative_prompt, loras ["name:scale" | {name, scale}], options {NAME: value} (the
+//!                                 engine's own: /api/info lists them)
 //!   GET  /v1/images/files/<f>     a picture made here (saved in the output directory)
 //!   GET  /v1/models, /health
 //!   GET  /api/info                the model, its defaults, samplers, schedules, the LoRAs it can take
@@ -213,8 +214,8 @@ impl ImageServer {
 
     fn info(&self) -> Value {
         let g = self.engine.lock();
-        let (arch, d, edits, loaded, samplers, schedules, guidance) = match g.as_ref().ok().and_then(|g| {
-            g.as_ref().map(|(e, l)| (e.arch(), e.defaults(), e.edits(), l.clone(), e.samplers(), e.schedules(), e.guidance()))
+        let (arch, d, edits, loaded, samplers, schedules, guidance, opts) = match g.as_ref().ok().and_then(|g| {
+            g.as_ref().map(|(e, l)| (e.arch(), e.defaults(), e.edits(), l.clone(), e.samplers(), e.schedules(), e.guidance(), e.options()))
         }) {
             Some(x) => x,
             None => return json!({"model": self.model, "loading": true}),
@@ -226,6 +227,8 @@ impl ImageServer {
                          "schedule": d.schedule.name(), "shift": d.shift},
             "samplers": samplers.iter().map(|s| s.name()).collect::<Vec<_>>(),
             "schedules": schedules.iter().map(|s| s.name()).collect::<Vec<_>>(),
+            "options": opts.iter().filter(|o| o.at != nextsycl_core::At::Load)
+                .map(|o| json!({"name": o.name, "value": o.value, "help": o.help})).collect::<Vec<_>>(),
             "loras": self.loras_known.iter().map(|k| json!({"id": k.id, "title": k.title,
                 "loaded": loaded.iter().find(|l| l.name == k.id).map(|l| l.scale)})).collect::<Vec<_>>(),
             "saves": self.out_dir.is_some(),
@@ -309,7 +312,11 @@ impl ImageServer {
             loras: Vec::new(),
             edit: None,
             rgba: b["background"].as_str() == Some("transparent") || b["rgba"].as_bool() == Some(true),
+            extra: Default::default(),
         };
+        // the engine's own options for this request ("options": {NAME: value}), checked against what it declares
+        let given: nextsycl_core::options::Given = b["options"].as_object().into_iter().flatten()
+            .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect();
         let url = b["response_format"].as_str() == Some("url");
         if url && self.out_dir.is_none() {
             return Err(bad("response_format url: this server keeps no files (start it with an output directory)".into()));
@@ -338,8 +345,12 @@ impl ImageServer {
             }
         }
         let (engine, loras) = g.as_ref().ok_or((503, "the engine is not loaded (a reload failed)".to_string()))?;
-        let d = engine.defaults();
-        let steps = req.steps.unwrap_or(d.steps);
+        let mut req = req;
+        if !given.is_empty() {
+            nextsycl_core::options::resolve(&given, engine.options(), nextsycl_core::At::Request, &self.model).map_err(bad)?;
+            req.extra = nextsycl_core::options::by_name(&given, engine.options());
+        }
+        let steps = engine.steps_for(&req);
         let p = &self.progress;
         let pics = engine.generate(&req, &mut |st| {
             *p.lock().unwrap() = json!({"busy": true, "prompt": prompt, "picture": st.picture + 1, "pictures": n, "at": st.at, "of": st.of,

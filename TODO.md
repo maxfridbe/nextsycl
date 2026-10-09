@@ -205,6 +205,10 @@ of IQ2_XXS instead could win twice.
       timestep and modulation ones); checked against the reference (turbo 2.9e-3, Pruna 2.2e-3 after all steps)
 - [x] `nextsycl image serve` (OpenAI images API, files, history, progress, GPU; LoRAs by request = a reload) and
       `--wfe` (wfe/image: TSX on vendored snabbdom, H3's scheme; README screenshots, docs/screenshots/shoot.py)
+- [x] Engine options: `--opt-NAME` on every command and `options` in API requests, declared per engine
+      (`EngineOption` in nextsycl-core: name, variable, value, help, load / request), checked (a typo lists them),
+      forwarded as variables in-process and into containers; `<kind> engines` lists them; the image page shows the
+      per-request ones. qwen4exp, glm5next and Qwen-Image declare theirs
 - [ ] LoRAs per request as a side path (no reload); `image start | stop | ps`; the switcher's images route; edits;
       Qwen-Image (20B) and lightx2v's Lightning LoRAs
 - [ ] H3 into video/ (copied from its committed sycl-port branch): `nextsycl video ...` for all its commands

@@ -184,6 +184,20 @@ added or disabled shows at once. With `NS_STUDIO_MODES` set to a mode file (one 
 leaves the others alone. `nextsycl llm start <id>` mounts the entry's files at the same paths in the container, so an
 entry can point anywhere on the machine.
 
+## Engine options: `--opt-NAME`
+
+Every engine declares the options it takes beyond its kind's common ones; any command forwards them to it:
+`--opt-NAME VALUE` (or `--opt-NAME` alone for a switch), NAME the option or the variable it sets. At load they set
+those variables (what the engines and their kernels read; into the container too), per request they ride in the
+request (`"options": {NAME: value}` in an API body). An option the engine does not take is an error that lists those
+it does; `nextsycl llm engines`, `nextsycl image engines` show them all.
+
+```sh
+nextsycl image gen "a fox" --opt-int8 --opt-sigmas 1,0.9375,0.875,0.75,0.5,0.25     # int8 DiT, a 6-step schedule
+nextsycl llm start qwen3.8-flash-next-iq2_xs --opt-chunk 4096 --opt-spec 4
+curl localhost:8086/v1/images/generations -d '{"prompt": "a fox", "options": {"sigmas": "1,0.75,0.5,0.25"}}'
+```
+
 ## Images
 
 ```sh

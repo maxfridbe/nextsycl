@@ -13,6 +13,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use nextsycl_gguf::Gguf;
+use nextsycl_llm::{At, EngineOption};
 use nextsycl_llm::{Checkpoint, CheckpointState, Decoder, DecoderState, Engine, EngineKind, GpuInfo, LoadOptions, Result, Sampler, Session,
                  SessionState, Tap};
 
@@ -35,10 +36,27 @@ impl From<&str> for Error {
 
 pub type ModelResult<T> = std::result::Result<T, Error>;
 
+/// The options it takes (`--opt-NAME`; each sets the variable named, which the engine and its kernels read at load)
+pub const OPTIONS: &[EngineOption] = &[
+    EngineOption { name: "mtp", env: "NS_QW_MTP", value: "DIR", help: "the MTP draft layer (Strata's runtime directory)", at: At::Load },
+    EngineOption { name: "spec", env: "NS_QW_SPEC", value: "N", help: "the speculative window: the token and up to N - 1 drafts (Strata's --spec)", at: At::Load },
+    EngineOption { name: "spec-min-p", env: "NS_QW_SPEC_MIN_P", value: "P", help: "a draft enters the window while at least this likely (default 0.5)", at: At::Load },
+    EngineOption { name: "coupled", env: "NS_QW_COUPLED", value: "0|1", help: "sampled drafts coupled to the sampled token, on the GPU (Strata's STRATA_SPEC_COUPLED)", at: At::Load },
+    EngineOption { name: "cvec", env: "NS_QW_CVEC", value: "FILE:SCALE", help: "a control vector (the refusal projection, the speed projection)", at: At::Load },
+    EngineOption { name: "cvec-mode", env: "NS_QW_CVEC_MODE", value: "project|add", help: "how the control vector applies", at: At::Load },
+    EngineOption { name: "cvec-dir", env: "NS_QW_CVEC_DIR", value: "per-layer|single:L", help: "each layer's own direction, or layer L's for all", at: At::Load },
+    EngineOption { name: "cvec-layers", env: "NS_QW_CVEC_LAYERS", value: "FIRST,LAST", help: "the layers it steers", at: At::Load },
+    EngineOption { name: "chunk", env: "NS_QW_CHUNK", value: "TOKENS", help: "a prompt chunk's tokens (default 2048; ~0.4 MiB a token on each GPU)", at: At::Load },
+    EngineOption { name: "windows", env: "NS_QW_WINDOWS", value: "0|1", help: "a prompt read in decode windows instead of chunks (a check)", at: At::Load },
+    EngineOption { name: "expert-profile", env: "NS_QW_EXPERT_PROFILE", value: "FILE", help: "which experts fill VRAM first when not all fit", at: At::Load },
+    EngineOption { name: "ple-prefetch", env: "NS_QW_PLE_PREFETCH", value: "0|1", help: "ask for a window's per-layer embedding rows together (default 1)", at: At::Load },
+    EngineOption { name: "qw-profile", env: "NS_QW_PROFILE", value: "", help: "each decode round's time by part, on stderr (costs ~9%)", at: At::Load },
+];
+
 /// This engine's registry entry
 pub fn kind() -> EngineKind {
     EngineKind { archs: &["qwen4exp"], name: "Qwen3.8-Flash-Next (Gated DeltaNet + QSA, hyper-connections, PLE, 512 experts)", load, info: tools::info,
-                 kernels: None, chat: nextsycl_tok::qwen_chat }
+                 kernels: None, chat: nextsycl_tok::qwen_chat, options: OPTIONS }
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {

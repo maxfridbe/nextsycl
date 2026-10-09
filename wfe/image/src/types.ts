@@ -28,6 +28,8 @@ export interface Info {
   samplers?: string[];
   schedules?: string[];
   loras?: LoraInfo[];
+  /** the engine's own per-request options (sent as `options`) */
+  options?: { name: string; value: string; help: string }[];
   saves?: boolean;
 }
 
@@ -87,4 +89,6 @@ export interface Form {
   rgba: boolean;
   /** id -> scale, for the LoRAs ticked */
   loras: Record<string, number>;
+  /** the engine's own options, by name (empty: not sent) */
+  options: Record<string, string>;
 }

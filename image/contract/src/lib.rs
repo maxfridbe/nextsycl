@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub use nextsycl_core::{Error, Gpu, Result};
+pub use nextsycl_core::options::Given;
+pub use nextsycl_core::{At, EngineOption, Error, Gpu, Result};
 pub use nextsycl_diffusion::{LoraUse, Picture, Sampler, Schedule};
 
 /// One generation: the prompt and its settings. `None` fields take the engine's defaults.
@@ -33,6 +34,9 @@ pub struct ImageRequest {
     pub edit: Option<Edit>,
     /// keep an alpha channel (models that make transparency)
     pub rgba: bool,
+    /// the engine's own options for this request, by name (`--opt-NAME`, an API request's `options`), checked
+    /// against those it declares for requests
+    pub extra: Given,
 }
 
 /// What an edit starts from
@@ -112,6 +116,14 @@ pub trait ImageEngine: Send + Sync {
     fn guidance(&self) -> bool {
         true
     }
+    /// the options it takes beyond the request's fields (its kind's `options`)
+    fn options(&self) -> &'static [EngineOption] {
+        &[]
+    }
+    /// the steps a request runs (its own, else the defaults; an engine whose options change it says so)
+    fn steps_for(&self, req: &ImageRequest) -> u32 {
+        req.steps.unwrap_or(self.defaults().steps)
+    }
     /// seconds the load took
     fn load_seconds(&self) -> f64;
     /// make the request's pictures, reporting each step
@@ -134,6 +146,9 @@ pub struct ImageKind {
     /// the file roles it needs
     pub roles: &'static [&'static str],
     pub load: LoadFn,
+    /// the options it takes (`--opt-NAME`: nextsycl_core::options) - at load as the variables they name (in
+    /// `LoadOptions::settings` too), per request in `ImageRequest::extra`
+    pub options: &'static [EngineOption],
 }
 
 /// The entry of `kinds` serving `arch`

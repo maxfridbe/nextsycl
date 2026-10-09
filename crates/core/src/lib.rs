@@ -4,7 +4,10 @@
 use std::ffi::{c_char, c_void};
 use std::sync::{Arc, OnceLock};
 
+pub mod options;
+
 pub use nextsycl_sys::Api;
+pub use options::{At, EngineOption};
 
 #[derive(Debug)]
 pub struct Error(pub String);

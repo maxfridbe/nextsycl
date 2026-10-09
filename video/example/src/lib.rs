@@ -28,7 +28,9 @@ pub const ROLES: &[&str] = &["denoiser", "text-encoder", "vae"];
 
 /// This engine's registry entry
 pub fn kind() -> VideoKind {
-    VideoKind { archs: &[ARCH], name: "Example (a template video engine: nothing ported)", roles: ROLES, load }
+    VideoKind { archs: &[ARCH], name: "Example (a template video engine: nothing ported)", roles: ROLES, load,
+                // the options a port takes beyond the request's fields (`--opt-NAME`), each with the variable it sets
+                options: &[] }
 }
 
 /// The path to the GPU, end to end: this kind's kernel library, this engine's own symbol, a kernel run on `gpu` and

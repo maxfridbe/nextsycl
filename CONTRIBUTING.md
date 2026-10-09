@@ -59,12 +59,17 @@ clear message where the port begins: `llm/example`, `image/example`, `video/exam
    hold exactly. For image / video: compare the latents step by step and the final picture or frames.
 5. **Fill in the contract.** Sessions, decode and checkpoints (llm), or the sampler loop over
    `nextsycl_diffusion::sigmas` and the decode (image / video) - the template's comments say what each method owes.
-6. **Register it.** Add `nextsycl_<kind>_<arch>::kind()` to the program's list of that kind
-   (`cli/nextsycl/src/main.rs`: `engines()`, `image_engines()`, `video_engines()`). `nextsycl <kind> engines`
+6. **Declare its options.** Anything the engine reads beyond its kind's common settings - a draft layer, a chunk
+   size, a schedule, a debug switch - goes in its kind's `options` (`EngineOption`: a name, the environment variable
+   it sets, what the value looks like, a line of help, when it applies). The program then forwards
+   `--opt-NAME VALUE` from every command (and an API request's `"options"`) to it, rejects a typo with the list,
+   and shows them under `nextsycl <kind> engines` - no change to the command line for a new architecture.
+7. **Register it.** Add `nextsycl_<kind>_<arch>::kind()` to the program's list of that kind
+   (`cli/nextsycl/src/main.rs`: `engines()`, `video_engines()`; `cli/nextsycl/src/image.rs`: `engines()`). `nextsycl <kind> engines`
    lists it.
-7. **Then make it fast** - as its own thing: graphs, fused kernels, its own memory plan. Measure with the kind's
+8. **Then make it fast** - as its own thing: graphs, fused kernels, its own memory plan. Measure with the kind's
    bench before and after (`nextsycl llm bench`, ...), and quote both in the pull request.
-8. **Document it**: its settings and numbers in `docs/architecture.md` (its engine section) and the README's speed
+9. **Document it**: its settings and numbers in `docs/architecture.md` (its engine section) and the README's speed
    tables; a catalog entry when its files are public.
 
 ## Code style

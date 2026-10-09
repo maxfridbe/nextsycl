@@ -63,6 +63,13 @@ fn options(cfg: &Config, m: &Value, args: &[String]) -> Result<nextsycl_image::L
             settings.insert(k.to_string(), v.to_string());
         }
     }
+    // the --opt-NAMEs the engine takes at load, by the variables they name (an unknown one: its options listed)
+    let arch = m["arch"].as_str().unwrap_or("");
+    let ks = engines();
+    let k = nextsycl_image::kind_for(&ks, arch)?;
+    for (var, v) in super::opt_env(k.options, nextsycl_core::At::Load, k.name)? {
+        settings.insert(var, v);
+    }
     Ok(nextsycl_image::LoadOptions { merge_loras, settings })
 }
 
@@ -209,6 +216,8 @@ fn serve(cfg: &Config, args: &[String]) -> Result<(), String> {
         return serve_here(cfg, &m, files, args, out);
     }
     use crate::container::{mount, Ce};
+    // the engine options checked here, before a container starts (they travel inside with the other arguments)
+    options(cfg, &m, args)?;
     let ce = Ce::new(cfg)?;
     ce.need_image()?;
     for f in ["nextsycl", "libnextsycl-image.so"] {
@@ -318,7 +327,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
     let rest = args.get(1..).unwrap_or(&[]);
     match args.first().map(String::as_str) {
         Some("engines") => {
-            super::list_engines(engines().iter().map(|k| (k.archs.join(", "), k.name)));
+            super::list_engines(engines().iter().map(|k| (k.archs.join(", "), k.name, k.options.to_vec())));
             Ok(())
         }
         Some("selftest") => selftest(rest),

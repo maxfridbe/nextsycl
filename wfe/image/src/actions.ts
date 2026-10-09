@@ -68,6 +68,9 @@ function body(): Record<string, unknown> {
   if (f.sampler && f.sampler !== d?.sampler) b.sampler = f.sampler;
   if (f.schedule && f.schedule !== d?.schedule) b.schedule = f.schedule;
   if (f.rgba) b.background = "transparent";
+  const opts = Object.fromEntries(Object.entries(f.options).filter(([k, v]) =>
+    v.trim() !== "" && (state.info?.options ?? []).some((o) => o.name === k)));
+  if (Object.keys(opts).length) b.options = opts;
   if ((state.info?.loras ?? []).length) b.loras = Object.entries(f.loras).map(([name, scale]) => ({ name, scale }));
   return b;
 }

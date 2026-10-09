@@ -51,6 +51,7 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
     let mut raw: Vec<String> = raw.to_vec();
     let mut entry_env: Vec<(String, String)> = Vec::new();
     let mut entry_paths: Vec<PathBuf> = Vec::new();
+    let mut entry_arch = String::new();
     if let Some(id) = raw.first().filter(|a| !a.starts_with("--")).cloned() {
         let m = nextsycl_models::registry::find(cfg, &id)?.ok_or_else(|| format!("no model {id} (nextsycl models list)"))?;
         if m["enabled"] == false {
@@ -72,6 +73,7 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
             entry_env = env.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect();
         }
         entry_paths = nextsycl_models::registry::paths(&m);
+        entry_arch = get("arch");
     }
     let raw = &raw[..];
     let ce = Ce::new(cfg)?;
@@ -149,6 +151,15 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
     // a registry entry's own settings
     for (k, v) in &entry_env {
         args.extend(["-e".into(), format!("{k}={v}")]);
+    }
+    // the --opt-NAMEs, checked against the entry's engine (by its architecture) and passed as the variables they set
+    if !crate::engine_opts().is_empty() {
+        let kinds = crate::engines();
+        let k = kinds.iter().find(|k| k.archs.contains(&entry_arch.as_str()))
+            .ok_or_else(|| format!("--opt-...: which engine takes them? (no registry entry, or its arch {entry_arch:?} has none here)"))?;
+        for (var, v) in crate::opt_env(&crate::llm_options(k), nextsycl_core::At::Load, k.name)? {
+            args.extend(["-e".into(), format!("{var}={v}")]);
+        }
     }
     args.extend([ce.image.clone(), "bash".into(), "-c".into(),
                  "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; exec /app/nextsycl llm serve \"$@\"".into(), "nextsycl".into()]);

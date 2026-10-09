@@ -27,7 +27,9 @@ pub const ROLES: &[&str] = &["transformer", "text-encoder", "vae"];
 
 /// This engine's registry entry
 pub fn kind() -> ImageKind {
-    ImageKind { archs: &[ARCH], name: "Example (a template image engine: nothing ported)", roles: ROLES, load }
+    ImageKind { archs: &[ARCH], name: "Example (a template image engine: nothing ported)", roles: ROLES, load,
+                // the options a port takes beyond the request's fields (`--opt-NAME`), each with the variable it sets
+                options: &[] }
 }
 
 /// The path to the GPU, end to end: this kind's kernel library, this engine's own symbol, a kernel run on `gpu` and

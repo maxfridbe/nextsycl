@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub use nextsycl_core::{Error, Gpu, Result};
+pub use nextsycl_core::options::Given;
+pub use nextsycl_core::{At, EngineOption, Error, Gpu, Result};
 pub use nextsycl_diffusion::{LoraUse, Picture, Sampler, Schedule};
 
 /// One clip: the prompt and its settings. `None` fields take the engine's defaults.
@@ -35,6 +36,9 @@ pub struct VideoRequest {
     pub audio_ref: Option<PathBuf>,
     /// where the clip goes (an .mp4)
     pub out: PathBuf,
+    /// the engine's own options for this clip, by name (`--opt-NAME`, an API request's `options`), checked against
+    /// those it declares for requests
+    pub extra: Given,
 }
 
 /// A picture the clip passes through, at a time
@@ -92,6 +96,16 @@ pub type ModelFiles = BTreeMap<String, PathBuf>;
 pub struct LoadOptions {
     /// LoRAs merged into the weights at load (a preset's)
     pub merge_loras: Vec<LoraUse>,
+    /// settings by variable name (a registry entry's `env`, the `--opt-NAME`s given): what the environment would
+    /// hold when served; an engine reads a setting here first, then from the environment
+    pub settings: std::collections::BTreeMap<String, String>,
+}
+
+impl LoadOptions {
+    /// A setting: from `settings`, else the environment
+    pub fn setting(&self, name: &str) -> Option<String> {
+        self.settings.get(name).cloned().or_else(|| std::env::var(name).ok())
+    }
 }
 
 /// The runtime one video architecture brings
@@ -99,6 +113,10 @@ pub trait VideoEngine: Send + Sync {
     fn arch(&self) -> &'static str;
     fn defaults(&self) -> Defaults;
     fn load_seconds(&self) -> f64;
+    /// the options it takes beyond the request's fields (its kind's `options`)
+    fn options(&self) -> &'static [EngineOption] {
+        &[]
+    }
     /// make the clip, reporting progress; `cancel()` true stops it at the next step boundary
     fn generate(&self, req: &VideoRequest, progress: &mut dyn FnMut(Progress), cancel: &dyn Fn() -> bool) -> Result<Clip>;
     /// give the GPUs' memory back (the next clip loads again)
@@ -121,6 +139,9 @@ pub struct VideoKind {
     /// the file roles it needs
     pub roles: &'static [&'static str],
     pub load: LoadFn,
+    /// the options it takes (`--opt-NAME`: nextsycl_core::options) - at load as the variables they name (in
+    /// `LoadOptions::settings` too), per clip in `VideoRequest::extra`
+    pub options: &'static [EngineOption],
 }
 
 /// The entry of `kinds` serving `arch`

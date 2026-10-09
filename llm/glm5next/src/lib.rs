@@ -13,6 +13,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use nextsycl_gguf::Gguf;
+use nextsycl_llm::{At, EngineOption};
 use nextsycl_llm::{Checkpoint, CheckpointState, Decoder, DecoderState, Engine, EngineKind, ExpertStats, GpuInfo, LoadOptions, Result, Sampler,
                  Session, SessionState, Tap};
 
@@ -41,10 +42,25 @@ impl From<&str> for Error {
 
 pub type ModelResult<T> = std::result::Result<T, Error>;
 
+/// The options it takes (`--opt-NAME`; each sets the variable named, which the engine reads at load)
+pub const OPTIONS: &[EngineOption] = &[
+    EngineOption { name: "kv", env: "NS_KV", value: "q8|f16", help: "the latent cache's type (default q8)", at: At::Load },
+    EngineOption { name: "prefill-chunk", env: "NS_PREFILL_CHUNK", value: "TOKENS", help: "a prompt chunk's tokens", at: At::Load },
+    EngineOption { name: "pipeline", env: "NS_PIPELINE", value: "0|1", help: "a long prompt's chunks pipelined over two GPUs (default 1)", at: At::Load },
+    EngineOption { name: "drafts", env: "NS_DRAFTS", value: "1|2", help: "drafts a verify pass checks", at: At::Load },
+    EngineOption { name: "ngram", env: "NS_NGRAM", value: "K", help: "up to K tokens drafted from the context's repeats (0: the draft block)", at: At::Load },
+    EngineOption { name: "spec-sampling", env: "NS_SPEC_SAMPLING", value: "0|1", help: "speculative sampling at a temperature (0: argmax drafts)", at: At::Load },
+    EngineOption { name: "spec-draft-temp", env: "NS_SPEC_DRAFT_TEMP", value: "X", help: "the draft distribution's temperature relative to the request's", at: At::Load },
+    EngineOption { name: "prefetch", env: "NS_PREFETCH", value: "N", help: "experts swapped in ahead of their layer (default 8; 0 none)", at: At::Load },
+    EngineOption { name: "lend", env: "NS_LEND", value: "0|1", help: "the prompt arena holds experts while no chunk needs it (default 1)", at: At::Load },
+    EngineOption { name: "expert-profile", env: "NS_EXPERT_PROFILE", value: "FILE", help: "which experts fill VRAM first", at: At::Load },
+    EngineOption { name: "arena-mib", env: "NS_ARENA_MIB", value: "MIB", help: "the prompt path's temporaries", at: At::Load },
+];
+
 /// This engine's registry entry
 pub fn kind() -> EngineKind {
     EngineKind { archs: &["glm5-next", "glm5next"], name: "GLM-5.3-Flash (KDA + MLA with a DSA indexer, 288 experts, MTP)", load, info: tools::info,
-                 kernels: Some(tools::kernels), chat: nextsycl_tok::glm_chat }
+                 kernels: Some(tools::kernels), chat: nextsycl_tok::glm_chat, options: OPTIONS }
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {
