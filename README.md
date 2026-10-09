@@ -15,7 +15,7 @@ cards or on one with its cold experts in pinned host memory, the MTP draft layer
 graphs; verify passes and batches bit-exact, greedy output with drafts equal to output without. Every model's speed at
 each context length: [Speed by model](#speed-by-model). **Qwen-Image 2.1**
 (`image/qwenimage21`): text to image, its Qwen3-VL text encoder, 7B DiT and RGBA VAE all in SYCL, checked stage by
-stage against the reference on the same quantized files; 1024x1024 in 40 steps takes 44 s on the B65. The video
+stage against the reference on the same quantized files; 1024x1024 in 40 steps takes 26.5 s on the B70, 44 s on the B65. The video
 engine (MiniMax H3) comes next.
 
 ## What it does
@@ -198,7 +198,12 @@ prompt, model, seed, size and steps. `check` compares each stage with the dumps 
 
 | Qwen-Image 2.1 Q8_0, one card | load | 512x512, 20 steps | 1024x1024, 40 steps |
 |---|---|---|---|
+| B70 | 6 s (page cache) | 2.8 s (20 steps) | 26.5 s (0.63 s / step) |
 | B65 | 7 s (page cache) | 5.9 s (0.29 s / step) | 44 s (1.07 s / step) |
+
+Where a 1024x1024 step goes on the B70 (`NS_QI_PROFILE=1`): the DiT's linears in half through oneDNN at 150-170
+TFLOPS (~60% of the step), attention (oneDNN's fused SDPA read in place, ~55 TFLOPS) ~22%, norms, gates and the
+rest ~10%; the VAE adds 0.9 s a picture.
 
 ## Speed by model
 

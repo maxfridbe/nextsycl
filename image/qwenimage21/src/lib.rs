@@ -16,6 +16,7 @@
 pub mod check;
 pub mod dit;
 mod ffi;
+pub mod prof;
 pub mod sched;
 pub mod vae;
 
@@ -151,6 +152,7 @@ impl QwenImage21 {
         let pre = self.dit.prefix(&self.nsd, embeds, tokens, self.te.hidden)?;
         let n = hw.0 * hw.1 * dit::LATENT;
         for i in 0..sigmas.len() - 1 {
+            prof::reset_clock(&self.nsd)?;
             let v = self.dit.velocity(&self.nsd, &pre, lat, hw, sigmas[i], None)?;
             // SAFETY: n floats each.
             ffi::check(unsafe { (k.axpy)(self.nsd.gpu.raw(), lat.fp(), v.fp(), n as i64, sigmas[i + 1] - sigmas[i]) }, "euler step")?;
@@ -202,7 +204,12 @@ impl ImageEngine for QwenImage21 {
                 progress(Step { picture: p, at: i as u32 + 1, of: steps as u32, seconds: t0.elapsed().as_secs_f64() });
                 Ok(())
             })?;
+            let tv = Instant::now();
             let (rgba, pw, ph) = self.vae.decode(&self.nsd, &lat.to_f32()?, hw.0, hw.1)?;
+            if prof::on() {
+                eprintln!("\nvae: {:.2} s", tv.elapsed().as_secs_f64());
+                prof::report(&mut |l| eprintln!("{l}"));
+            }
             let pic = if req.rgba {
                 Picture { width: pw as u32, height: ph as u32, channels: 4, data: rgba }
             } else {

@@ -11,8 +11,9 @@ extern "C" {
 
 typedef struct ns_gpu ns_gpu;
 
-/* x [M, C] half *= (1 + scale[c]), in place; scale float32 [C] (the shared modulation's scale for these rows) */
-int ns_image_qi21_modulate(ns_gpu* g, void* x, int64_t M, int64_t C, const float* scale);
+/* out [M, C] half = layernorm(x [M, C] float32, no affine, eps) * (1 + scale[c]); scale float32 [C] or NULL (plain
+ * layernorm). One work-group a row: the row read once into registers, mean and variance by group reductions. */
+int ns_image_qi21_ln_mod(ns_gpu* g, const float* x, int64_t M, int64_t C, float eps, const float* scale, void* out);
 /* x half, in place: gelu (tanh approximation) | silu */
 int ns_image_qi21_gelu_tanh(ns_gpu* g, void* x, int64_t n);
 int ns_image_qi21_silu(ns_gpu* g, void* x, int64_t n);

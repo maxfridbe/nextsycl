@@ -8,7 +8,7 @@ type M = *mut c_void;
 type P = *const c_void;
 
 pub struct Api {
-    pub modulate: unsafe extern "C" fn(G, M, i64, i64, *const f32) -> c_int,
+    pub ln_mod: unsafe extern "C" fn(G, *const f32, i64, i64, f32, *const f32, M) -> c_int,
     pub gelu_tanh: unsafe extern "C" fn(G, M, i64) -> c_int,
     pub silu: unsafe extern "C" fn(G, M, i64) -> c_int,
     pub axpy: unsafe extern "C" fn(G, *mut f32, *const f32, i64, f32) -> c_int,
@@ -41,7 +41,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             }};
         }
         Ok(Api {
-            modulate: sym!("ns_image_qi21_modulate"),
+            ln_mod: sym!("ns_image_qi21_ln_mod"),
             gelu_tanh: sym!("ns_image_qi21_gelu_tanh"),
             silu: sym!("ns_image_qi21_silu"),
             axpy: sym!("ns_image_qi21_axpy"),

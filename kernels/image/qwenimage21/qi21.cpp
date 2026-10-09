@@ -1,5 +1,5 @@
 // qi21.cpp: the Qwen-Image 2.1 engine's own small kernels - what the shared diffusion kernels (nsd) do not have:
-// the modulation's (1 + scale), the activations in place, the sampler's step, the VAE's upsampling and shortcut, the
+// the norm with the modulation's (1 + scale), the activations in place, the sampler's step, the VAE's upsampling and shortcut, the
 // picture's bytes. Elementwise, on the GPU's queue.
 #include "ns.h"
 #include "ns_internal.hpp"
@@ -13,11 +13,39 @@ using half = sycl::half;
 
 extern "C" {
 
-int ns_image_qi21_modulate(ns_gpu* g, void* x, int64_t M, int64_t C, const float* scale) {
+int ns_image_qi21_ln_mod(ns_gpu* g, const float* x, int64_t M, int64_t C, float eps, const float* scale, void* out) {
     NS_TRY
-    half* p = (half*) x;
-    g->q.parallel_for(sycl::range<1>((size_t) (M * C)), [=](sycl::id<1> i) {
-        p[i] = (half) ((float) p[i] * (1.0f + scale[i % C]));
+    constexpr int WG = 256, PER = 32;            // a row of up to 8,192 values held in registers
+    if (C > (int64_t) WG * PER) {
+        return ns_fail("ns_image_qi21_ln_mod: rows longer than 8192");
+    }
+    half* o = (half*) out;
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) M * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+        const size_t r = it.get_group(0);
+        const int l = (int) it.get_local_id(0);
+        const float* row = x + r * C;
+        float v[PER];
+        float s = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; ++j) {
+            const int64_t i = (int64_t) j * WG + l;
+            v[j] = i < C ? row[i] : 0.0f;
+            s += v[j];
+        }
+        const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
+        float s2 = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; ++j) {
+            const int64_t i = (int64_t) j * WG + l;
+            const float d = i < C ? v[j] - mean : 0.0f;
+            s2 += d * d;
+        }
+        const float inv = sycl::rsqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps);
+#pragma unroll
+        for (int j = 0; j < PER; ++j) {
+            const int64_t i = (int64_t) j * WG + l;
+            if (i < C) o[r * C + i] = (half) ((v[j] - mean) * inv * (scale ? 1.0f + scale[i] : 1.0f));
+        }
     });
     return 0;
     NS_CATCH

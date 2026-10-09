@@ -23,7 +23,7 @@ use nextsycl_core::{DevBuf, Error, Gpu, Result};
 use nextsycl_diffusion::kernels::{none, Dt, Nsd};
 use nextsycl_gguf::{GType, Gguf};
 
-use crate::ffi;
+use crate::{ffi, prof};
 
 pub const DIM: usize = 4096;
 pub const HEADS: usize = 32;
@@ -243,13 +243,17 @@ impl Dit {
                  act: &DevBuf, o: &DevBuf) -> Result<()> {
         let k = ffi::api()?;
         let off = |buf: &DevBuf| -> *const f32 { buf.fp().wrapping_add(row * DIM) };
-        nsd.layer_norm(x.ptr(), Dt::F32, m, DIM, none(), none(), EPS, h.ptr(), Dt::F16)?;
-        // SAFETY: h holds m x 4096 halves; the scale row 4096 floats.
-        ffi::check(unsafe { (k.modulate)(self.gpu.raw(), h.ptr(), m as i64, DIM as i64, off(&md[2])) }, "modulate")?;
+        // SAFETY: x holds m x 4096 floats, h as many halves; the scale row 4096 floats.
+        ffi::check(unsafe { (k.ln_mod)(self.gpu.raw(), x.fp(), m as i64, DIM as i64, EPS, off(&md[2]), h.ptr()) }, "norm + modulate")?;
+        prof::mark(nsd, "norm + modulate")?;
         nsd.linear(h.ptr(), Dt::F16, m, DIM, b.gp.ptr(), 2 * FFN, none(), gp.ptr(), Dt::F16)?;
+        prof::mark(nsd, "gate|up linear")?;
         nsd.swiglu(gp.ptr(), Dt::F16, m, FFN, act.ptr(), Dt::F16)?;
+        prof::mark(nsd, "swiglu")?;
         nsd.linear(act.ptr(), Dt::F16, m, FFN, b.down.ptr(), DIM, none(), o.ptr(), Dt::F32)?;
-        nsd.gate_add(x.ptr(), Dt::F32, m, DIM, o.ptr(), Dt::F32, zeros.ptr(), off(&md[3]).cast())
+        prof::mark(nsd, "down linear")?;
+        nsd.gate_add(x.ptr(), Dt::F32, m, DIM, o.ptr(), Dt::F32, zeros.ptr(), off(&md[3]).cast())?;
+        prof::mark(nsd, "gate add")
     }
 
     /// The text's pass through every block (once a prompt): `embeds` float32 [T, 3584 or 4096] -> each layer's q|k|v
@@ -280,9 +284,8 @@ impl Dit {
         let mut kv = Vec::with_capacity(self.blocks.len());
         let off = |buf: &DevBuf| -> *const f32 { buf.fp().wrapping_add(DIM) }; // the t = 0 row
         for b in &self.blocks {
-            nsd.layer_norm(x.ptr(), Dt::F32, t, DIM, none(), none(), EPS, h.ptr(), Dt::F16)?;
-            // SAFETY: h holds t x 4096 halves; the scale row 4096 floats.
-            ffi::check(unsafe { (k.modulate)(gpu.raw(), h.ptr(), t as i64, DIM as i64, off(&md[0])) }, "modulate")?;
+            // SAFETY: x holds t x 4096 floats, h as many halves; the scale row 4096 floats.
+            ffi::check(unsafe { (k.ln_mod)(gpu.raw(), x.fp(), t as i64, DIM as i64, EPS, off(&md[0]), h.ptr()) }, "norm + modulate")?;
             nsd.linear(h.ptr(), Dt::F16, t, DIM, b.qkv.ptr(), 3 * DIM, none(), qkv.ptr(), Dt::F16)?;
             let half_at = |buf: &DevBuf, n: usize| -> *mut std::ffi::c_void { buf.ptr().cast::<u16>().wrapping_add(n).cast() };
             nsd.rms_rope(qkv.ptr(), Dt::F16, t, HEADS, HEAD, 3 * DIM, b.norm_q.ptr(), EPS, cs.ptr(), HEAD)?;
@@ -324,18 +327,25 @@ impl Dit {
         let (gp, act) = (DevBuf::new(gpu, n * 2 * FFN * 2)?, DevBuf::new(gpu, n * FFN * 2)?);
         let half_at = |buf: &DevBuf, at: usize| -> *mut std::ffi::c_void { buf.ptr().cast::<u16>().wrapping_add(at).cast() };
         let img = tt * 3 * DIM; // the image's first row in `all`, in halves
+        prof::mark(nsd, "step setup")?;
         for (bi, b) in self.blocks.iter().enumerate() {
             all.copy_within(0, &pre.kv[bi], 0, tt * 3 * DIM * 2)?;
-            nsd.layer_norm(x.ptr(), Dt::F32, n, DIM, none(), none(), EPS, h.ptr(), Dt::F16)?;
-            // SAFETY: h holds n x 4096 halves; the scale row 4096 floats.
-            ffi::check(unsafe { (k.modulate)(gpu.raw(), h.ptr(), n as i64, DIM as i64, md[0].fp()) }, "modulate")?;
+            prof::mark(nsd, "prefix copy")?;
+            // SAFETY: x holds n x 4096 floats, h as many halves; the scale row 4096 floats.
+            ffi::check(unsafe { (k.ln_mod)(gpu.raw(), x.fp(), n as i64, DIM as i64, EPS, md[0].fp(), h.ptr()) }, "norm + modulate")?;
+            prof::mark(nsd, "norm + modulate")?;
             nsd.linear(h.ptr(), Dt::F16, n, DIM, b.qkv.ptr(), 3 * DIM, none(), half_at(&all, img), Dt::F16)?;
+            prof::mark(nsd, "qkv linear")?;
             nsd.rms_rope(half_at(&all, img), Dt::F16, n, HEADS, HEAD, 3 * DIM, b.norm_q.ptr(), EPS, cs.ptr(), HEAD)?;
             nsd.rms_rope(half_at(&all, img + DIM), Dt::F16, n, HEADS, HEAD, 3 * DIM, b.norm_k.ptr(), EPS, cs.ptr(), HEAD)?;
+            prof::mark(nsd, "rms + rope")?;
             nsd.attention_qk(half_at(&all, img), n, 3 * DIM, half_at(&all, DIM), half_at(&all, 2 * DIM), tt + n, 3 * DIM, Dt::F16, HEADS, HEAD,
                              att.ptr(), Dt::F16)?;
+            prof::mark(nsd, "attention")?;
             nsd.linear(att.ptr(), Dt::F16, n, DIM, b.out.ptr(), DIM, none(), o.ptr(), Dt::F32)?;
+            prof::mark(nsd, "out linear")?;
             nsd.gate_add(x.ptr(), Dt::F32, n, DIM, o.ptr(), Dt::F32, zeros.ptr(), md[1].ptr())?;
+            prof::mark(nsd, "gate add")?;
             self.block_ffn(nsd, b, &x, n, &md, 0, &zeros, &h, &gp, &act, &o)?;
             if bi == 0 {
                 if let Some(keep) = block0 {
@@ -344,15 +354,14 @@ impl Dit {
             }
         }
         // the output norm: layernorm * (1 + scale), then the projection to 64 latent channels
-        let xn = DevBuf::f32(gpu, n * DIM)?;
-        nsd.layer_norm(x.ptr(), Dt::F32, n, DIM, none(), none(), EPS, xn.ptr(), Dt::F32)?;
         let xh = DevBuf::new(gpu, n * DIM * 2)?;
+        let xn = DevBuf::f32(gpu, n * DIM)?;
         // SAFETY: n x 4096 values each way; the scale row 4096 floats.
-        ffi::check(unsafe { (k.to_half)(gpu.raw(), xn.fp(), xh.ptr(), (n * DIM) as i64) }, "to half")?;
-        ffi::check(unsafe { (k.modulate)(gpu.raw(), xh.ptr(), n as i64, DIM as i64, md[4].fp()) }, "modulate")?;
+        ffi::check(unsafe { (k.ln_mod)(gpu.raw(), x.fp(), n as i64, DIM as i64, EPS, md[4].fp(), xh.ptr()) }, "norm + modulate")?;
         ffi::check(unsafe { (k.to_float)(gpu.raw(), xh.ptr(), xn.fp(), (n * DIM) as i64) }, "to float")?;
         let v = DevBuf::f32(gpu, n * LATENT)?;
         nsd.linear(xn.ptr(), Dt::F32, n, DIM, self.proj_out.ptr(), LATENT, none(), v.ptr(), Dt::F32)?;
+        prof::mark(nsd, "output")?;
         nsd.wait()?;
         Ok(v)
     }

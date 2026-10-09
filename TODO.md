@@ -183,8 +183,13 @@ of IQ2_XXS instead could win twice.
       cosine 0.998, int8 activation rounding compounding), DiT block 0 / velocity 2e-4 / 3e-4, 20 Euler steps 2.1e-3,
       VAE max 3 / 255. `nextsycl image gen` (in-process): 1024x1024, 40 steps in 44 s on the B65 (1.07 s / step)
 - [ ] Qwen-Image 2.1: the samplers and schedules past Euler + its shift; guidance (cfg, negative); edit;
-      `nextsycl image start | serve | ps | inspect | bench` and the images API through the switcher; speed (the
-      step is DiT linears in half through oneDNN; the VAE's mid attention falls back to the split form at D 1152)
+      `nextsycl image start | serve | ps | inspect | bench` and the images API through the switcher
+- [x] Qwen-Image speed, round 1 (B70, 1024x1024, 40 steps 30.0 -> 26.5 s): layernorm + modulation fused, one
+      work-group a row (1.69 -> 0.37 ms a call); prefix + block attention read in place through strides (5.9 -> 5.2 ms)
+- [ ] Qwen-Image speed, next: the linears are at ~88% of the B70's half peak - int8 (XMX 2x) with per-row
+      activation scales is the big lever, at some quality cost; attention ~55 TFLOPS (a flash kernel of our own);
+      gate add folded into the out / down linears; the VAE's single-head attention (D 1152) as two GEMMs (226 ms
+      in the split form)
 - [ ] Qwen-Image 2.1 Q6_K / Q4_K_M: the dequant reads Q4_K / Q6_K; Q4_K_M also has Q5_K tensors
 - [ ] LoRAs: presets merged at load, per-request ones as a side path; Qwen-Image (20B) with the Lightning LoRAs
 - [ ] H3 into video/ (copied from its committed sycl-port branch): `nextsycl video ...` for all its commands

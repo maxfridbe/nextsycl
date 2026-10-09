@@ -112,6 +112,9 @@ struct Ctx {
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, Sdpa> sdpa;
     // nsd_attention_batch: (B, S, H, D, stride, in place) -> its compiled partition
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, bool>, Sdpa> sdpa_b;
+    // nextsycl: prefix + block attention read in place through strides, by (rows, Skv, H, D, qs, kvs)
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>, Sdpa> sdpa_qk;
+    bool sdpa_qk_direct_ok = true;
     bool sdpa_direct_ok = true;                    // false once oneDNN has refused the strided (copy-free) form
     float sdpa_scale = 0.0f;                       // 1 / sqrt(D): a host scalar oneDNN reads when the kernel runs
     bool sdpa_ok = true;                           // false once oneDNN has refused the fused form
@@ -1600,9 +1603,73 @@ static int attention_split(Ctx& c, const void* q, const void* k, const void* v, 
 // nextsycl: Sq query rows over Skv key / value rows (a cached prefix and the rows' own block), the same fused graph
 // a chunk of query rows at a time; q rows qs apart, k / v rows kvs apart, out [Sq, H * D]. No split fallback: an error
 // when oneDNN refuses the pattern.
+// nextsycl: the fused graph over q, k, v in their token-order buffers (rows qs / kvs apart, heads D apart) and out
+// [rows, H * D] in token order - no copies by head
+static Ctx::Sdpa& sdpa_qk_for(Ctx& c, int64_t rows, int64_t Skv, int64_t H, int64_t D, int64_t qs, int64_t kvs) {
+    auto key = std::make_tuple(rows, Skv, H, D, qs, kvs);
+    auto it = c.sdpa_qk.find(key);
+    if (it != c.sdpa_qk.end()) return it->second;
+    using namespace dnnl::graph;
+    using lt = logical_tensor;
+    const auto f16 = lt::data_type::f16, f32 = lt::data_type::f32;
+    const auto strided = lt::layout_type::strided;
+    size_t id = 0;
+    lt q(id++, f16, lt::dims {1, H, rows, D}, lt::dims {rows * qs, D, qs, 1});
+    lt k(id++, f16, lt::dims {1, H, Skv, D}, lt::dims {Skv * kvs, D, kvs, 1});
+    lt scale(id++, f32, lt::dims {}, strided, lt::property_type::host_scalar);
+    lt v(id++, f16, lt::dims {1, H, Skv, D}, lt::dims {Skv * kvs, D, kvs, 1});
+    lt score(id++, f32, lt::dims {1, H, rows, Skv}, strided), scaled(id++, f32, lt::dims {1, H, rows, Skv}, strided);
+    lt probs(id++, f16, lt::dims {1, H, rows, Skv}, strided);
+    lt out(id++, f16, lt::dims {1, H, rows, D}, lt::dims {rows * H * D, D, H * D, 1});
+    op bmm1(id++, op::kind::MatMul, {q, k}, {score}, "scores");
+    bmm1.set_attr<bool>(op::attr::transpose_b, true);
+    op mul(id++, op::kind::Multiply, {score, scale}, {scaled}, "scale");
+    op sm(id++, op::kind::SoftMax, {scaled}, {probs}, "softmax");
+    sm.set_attr<int64_t>(op::attr::axis, -1);
+    sm.set_attr<std::string>(op::attr::mode, "inf_as_zero");
+    op bmm2(id++, op::kind::MatMul, {probs, v}, {out}, "values");
+    graph g(dnnl::engine::kind::gpu);
+    g.add_op(bmm1); g.add_op(mul); g.add_op(sm); g.add_op(bmm2);
+    g.finalize();
+    auto parts = g.get_partitions();
+    if (parts.size() != 1 || !parts[0].is_supported())
+        throw std::runtime_error("oneDNN did not take the strided attention as one partition");
+    const lt mine[4] = {q, k, scale, v};
+    Ctx::Sdpa sd;
+    for (const auto& port : parts[0].get_input_ports())
+        for (int i = 0; i < 4; ++i)
+            if (mine[i].get_id() == port.get_id()) { sd.in.push_back(mine[i]); sd.slot.push_back(i); }
+    if (sd.in.size() != 4) throw std::runtime_error("oneDNN's strided attention partition has unexpected inputs");
+    sd.cp = parts[0].compile(sd.in, {out}, c.eng);
+    sd.out = sd.cp.query_logical_tensor(out.get_id());
+    return c.sdpa_qk.emplace(key, std::move(sd)).first->second;
+}
+
 static void attention_fused_qk(Ctx& c, const void* q, int64_t Sq, int64_t qs, const void* k, const void* v, int64_t Skv,
                                int64_t kvs, int dt, int64_t H, int64_t D, void* out, int out_dt) {
     sycl::queue& qu = c.q;
+    c.sdpa_scale = 1.0f / std::sqrt((float) D);
+    if (dt == NSD_F16 && out_dt == NSD_F16 && c.sdpa_qk_direct_ok) {
+        try {
+            const int64_t rows_max = std::min<int64_t>(Sq, c.attn_rows);
+            for (int64_t r0 = 0; r0 < Sq; r0 += rows_max) {
+                const int64_t rows = std::min(rows_max, Sq - r0);
+                Ctx::Sdpa& sd = sdpa_qk_for(c, rows, Skv, H, D, qs, kvs);
+                void* const handles[4] = {(char*) q + (size_t) r0 * qs * 2, (void*) k, nullptr, (void*) v};
+                std::vector<dnnl::graph::tensor> in;
+                for (size_t i = 0; i < sd.in.size(); ++i) {
+                    if (sd.slot[i] == 2) in.push_back(dnnl::graph::tensor::make_scalar_tensor(sd.in[i], &c.sdpa_scale));
+                    else in.emplace_back(sd.in[i], c.eng, handles[sd.slot[i]]);
+                }
+                sd.cp.execute(c.strm, in, {dnnl::graph::tensor(sd.out, c.eng, (char*) out + (size_t) r0 * H * D * 2)});
+            }
+            return;
+        } catch (const std::exception& e) {
+            // nothing was queued for a chunk that failed to compile; the chunks before it are redone below
+            c.sdpa_qk_direct_ok = false;
+            std::fprintf(stderr, "nsd: the strided attention is not available (%s); copying by head\n", e.what());
+        }
+    }
     const int64_t rows_max = std::min<int64_t>(Sq, c.attn_rows);
     sdpa_for(c, rows_max, Skv, H, D);
     const size_t n = (size_t) Skv * H * D;

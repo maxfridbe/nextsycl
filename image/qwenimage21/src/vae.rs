@@ -21,7 +21,7 @@ use nextsycl_core::{DevBuf, Error, Gpu, Result};
 use nextsycl_diffusion::kernels::{none, Dt, Nsd};
 use nextsycl_gguf::safetensors::SafeTensors;
 
-use crate::ffi;
+use crate::{ffi, prof};
 
 /// F.normalize's floor, as an epsilon on the mean square: never reached by real activations
 const EPS: f32 = 1e-24;
@@ -174,6 +174,7 @@ impl Vae {
     fn conv(&self, nsd: &Nsd, c: &Conv, x: &DevBuf, h: usize, w: usize) -> Result<DevBuf> {
         let out = DevBuf::new(&self.gpu, h * w * c.co * 2)?;
         nsd.conv2d(x.ptr(), Dt::F16, 1, h, w, c.ci, c.w.ptr(), c.co, c.k, c.b.ptr(), out.ptr())?;
+        prof::mark(nsd, if c.k == 1 { "vae conv 1x1" } else { "vae conv 3x3" })?;
         Ok(out)
     }
 
@@ -184,6 +185,7 @@ impl Vae {
         nsd.rms_norm_mod(x.ptr(), Dt::F16, px, c, gamma.ptr(), EPS, none(), none(), none(), out.ptr(), Dt::F16)?;
         // SAFETY: px x c halves.
         ffi::check(unsafe { (k.silu)(self.gpu.raw(), out.ptr(), (px * c) as i64) }, "silu")?;
+        prof::mark(nsd, "vae norm + silu")?;
         Ok(out)
     }
 
@@ -208,6 +210,7 @@ impl Vae {
         let gpu = &self.gpu;
         let k = ffi::api()?;
         let z = self.z;
+        prof::reset_clock(nsd)?;
         let zl: Vec<f32> = lat.iter().enumerate().map(|(i, v)| v * self.std[i % z] + self.mean[i % z]).collect();
         let zf = DevBuf::from_f32(gpu, &zl)?;
         let x = DevBuf::new(gpu, zl.len() * 2)?;
@@ -237,6 +240,7 @@ impl Vae {
                 let u = DevBuf::new(gpu, 4 * h * w * c.ci * 2)?;
                 // SAFETY: x holds h x w x ci halves, u four times that.
                 ffi::check(unsafe { (k.up2)(gpu.raw(), x.ptr(), h as i64, w as i64, c.ci as i64, u.ptr()) }, "upsample")?;
+                prof::mark(nsd, "vae up 2x")?;
                 x = self.conv(nsd, c, &u, 2 * h, 2 * w)?;
                 // SAFETY: inp holds h x w x ci halves, x 2h x 2w x co.
                 ffi::check(unsafe { (k.dupup_add)(gpu.raw(), inp.ptr(), h as i64, w as i64, up.ci as i64, co as i64, ft, x.ptr()) }, "shortcut")?;
@@ -268,7 +272,9 @@ impl Vae {
         nsd.linear(n.ptr(), Dt::F16, px, c, self.att_qkv.ptr(), 3 * c, self.att_qkv_b.ptr(), qkv.ptr(), Dt::F16)?;
         let at = |i: usize| -> *const std::ffi::c_void { qkv.ptr().cast::<u16>().wrapping_add(i * c).cast() };
         let o = DevBuf::new(gpu, px * c * 2)?;
+        prof::mark(nsd, "vae att qkv")?;
         nsd.attention(at(0), at(1), at(2), Dt::F16, px, 1, c, 3 * c, o.ptr(), Dt::F16)?;
+        prof::mark(nsd, "vae attention")?;
         nsd.linear(o.ptr(), Dt::F16, px, c, self.att_proj.ptr(), c, self.att_proj_b.ptr(), n.ptr(), Dt::F16)?;
         nsd.gate_add(x.ptr(), Dt::F16, px, c, n.ptr(), Dt::F16, none(), none())?;
         nsd.wait()?;
