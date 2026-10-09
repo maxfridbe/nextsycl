@@ -9,3 +9,5 @@ license.workspace = true
 nextsycl-core.workspace = true
 nextsycl-gguf.workspace = true
 png = "0.17"
+# reading pictures people upload for edits (JPEG and WebP besides PNG); CPU decoders only
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

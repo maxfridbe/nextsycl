@@ -17,6 +17,18 @@ impl Picture {
         Picture { width, height, channels, data: vec![0; width as usize * height as usize * channels as usize] }
     }
 
+    /// A picture from a file's bytes: PNG, JPEG or WebP (8-bit RGB, or RGBA when it has alpha)
+    pub fn decode(bytes: &[u8]) -> Result<Picture, String> {
+        let img = image::load_from_memory(bytes).map_err(|e| format!("not a picture this reads (PNG, JPEG, WebP): {e}"))?;
+        Ok(if img.color().has_alpha() {
+            let r = img.to_rgba8();
+            Picture { width: r.width(), height: r.height(), channels: 4, data: r.into_raw() }
+        } else {
+            let r = img.to_rgb8();
+            Picture { width: r.width(), height: r.height(), channels: 3, data: r.into_raw() }
+        })
+    }
+
     /// A PNG file (any bit depth and color type; 16-bit is reduced to 8, grey and palette expanded)
     pub fn read_png(path: &Path) -> Result<Picture, String> {
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;

@@ -31,6 +31,8 @@ export interface Info {
   /** the engine's own per-request options (sent as `options`) */
   options?: { name: string; value: string; help: string }[];
   saves?: boolean;
+  /** the most pictures an edit takes */
+  max_pictures?: number;
 }
 
 export interface Progress {
@@ -64,12 +66,14 @@ export interface Picture {
   loras: string[];
   seconds: number;
   wh?: number | null;
+  /** the pictures it was made from (an edit) */
+  pictures?: number;
   created: number;
 }
 
 export interface GenAnswer {
   created: number;
-  data: { url?: string; b64_json?: string; seed: number; revised_prompt: string }[];
+  data: { url?: string; b64_json?: string; seed: number; revised_prompt: string; width?: number; height?: number }[];
   nextsycl: { seconds: number; steps: number; seed: number; loras: string[]; wh: number | null };
 }
 
@@ -91,4 +95,12 @@ export interface Form {
   loras: Record<string, number>;
   /** the engine's own options, by name (empty: not sent) */
   options: Record<string, string>;
+}
+
+/** A picture given to an edit: a data: URL and its size */
+export interface Given {
+  url: string;
+  name: string;
+  w: number;
+  h: number;
 }

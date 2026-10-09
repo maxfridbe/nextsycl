@@ -13,9 +13,10 @@ export const api = {
   gpu: () => getJSON<Gpu>("/api/gpu"),
   history: async () => (await getJSON<{ data: Picture[] }>("/api/history")).data,
 
-  /** OpenAI's images endpoint, with our fields; an error carries the server's message. */
-  async generate(body: Record<string, unknown>): Promise<GenAnswer> {
-    const r = await fetch("/v1/images/generations", {
+  /** OpenAI's images endpoint (an edit: the edits one, its pictures as data URLs), with our fields; an error carries
+   *  the server's message. */
+  async generate(body: Record<string, unknown>, edit = false): Promise<GenAnswer> {
+    const r = await fetch(edit ? "/v1/images/edits" : "/v1/images/generations", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),

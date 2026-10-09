@@ -161,3 +161,5 @@ figure.pic .acts .tbtn{margin-left:0;text-decoration:none}
   .pics.one{grid-template-columns:1fr}
   .lora{grid-template-columns:auto 1fr 70px}
 }
+.drop{border:1px dashed #2a2f3a;border-radius:8px;padding:8px;margin:6px 0}
+.drop .pics.small figure.pic img{cursor:default}

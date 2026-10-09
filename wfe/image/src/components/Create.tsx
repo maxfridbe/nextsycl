@@ -1,7 +1,7 @@
 /** The request, every option the engine has: prompt, negative, size (aspect presets), steps, pictures, seed, the
  *  sampler and schedule, guidance, shift, transparency, LoRAs. Each field writes straight into state.form. */
 import { jsx } from "../jsx.js";
-import { generate, randomSeed, setAspect } from "../actions.js";
+import { addPicture, generate, movePicture, randomSeed, removePicture, setAspect } from "../actions.js";
 import { panelOpen, render, saveForm, state, togglePanel } from "../state.js";
 import type { Form } from "../types.js";
 import { ASPECTS, clamp, r16 } from "../util.js";
@@ -90,6 +90,54 @@ function Loras() {
   );
 }
 
+/** An edit's pictures: added from files (or dropped here, or "edit" on a picture made here); the first is the one
+ *  changed, the others are references the instructions can name ("the coat from picture 2"). */
+function Pictures() {
+  const list = state.pictures;
+  const max = state.info?.max_pictures ?? 8;
+  const add = (files: FileList | null | undefined) => {
+    for (const f of Array.from(files ?? [])) void addPicture(f, f.name);
+  };
+  return (
+    <div
+      class="drop"
+      on={{
+        dragover: (e: DragEvent) => e.preventDefault(),
+        drop: (e: DragEvent) => { e.preventDefault(); add(e.dataTransfer?.files); },
+      }}
+    >
+      <div class="pics small">
+        {list.map((p, i) => (
+          <figure class="pic">
+            <img attrs={{ src: p.url, alt: p.name }} />
+            <figcaption>
+              <span class="cap" attrs={{ title: p.name }}>{i === 0 ? "picture 1 (changed)" : `picture ${i + 1}`} · {p.w}×{p.h}</span>
+              <span class="acts">
+                <button type="button" class="tbtn" attrs={{ title: "earlier", disabled: i === 0 }} on={{ click: () => movePicture(i, -1) }}>↑</button>
+                <button type="button" class="tbtn" attrs={{ title: "later", disabled: i === list.length - 1 }} on={{ click: () => movePicture(i, 1) }}>↓</button>
+                <button type="button" class="tbtn" attrs={{ title: "remove" }} on={{ click: () => removePicture(i) }}>×</button>
+              </span>
+            </figcaption>
+          </figure>
+        ))}
+      </div>
+      <div class="row">
+        <label class="inline">
+          <input attrs={{ type: "file", accept: "image/png,image/jpeg,image/webp", multiple: true, disabled: list.length >= max }}
+                 on={{ change: (e: Event) => { add((e.target as HTMLInputElement).files); (e.target as HTMLInputElement).value = ""; } }} />
+        </label>
+        {list.length
+          ? <label class="inline">
+              <input attrs={{ type: "checkbox" }} props={{ checked: state.sizeFromPictures }}
+                     on={{ change: () => { state.sizeFromPictures = !state.sizeFromPictures; render(); } }} /> size from the pictures
+            </label>
+          : null}
+      </div>
+      <div class="hint">{`Drop pictures here or pick files (up to ${max}). With pictures the prompt becomes instructions: the first picture is changed, the others are references - name them ("put the hat from picture 2 on the fox in picture 1").`}</div>
+    </div>
+  );
+}
+
 /** A sub-section that opens and closes like a panel (its flag in state, not the DOM's). */
 function Section(props: { id: string; title: string; children?: unknown }) {
   const open = panelOpen(props.id);
@@ -150,7 +198,8 @@ export function Create() {
       <Section id="sampling" title={`Sampling (${f.sampler || "—"} · ${f.schedule || "—"})`}>
         <div class="row">
           <label>sampler {select("sampler", info?.samplers ?? [])}</label>
-          <label>schedule {select("schedule", info?.schedules ?? [])}</label>
+          <label attrs={{ title: "karras, exponential and polyexponential crowd the steps at the clean end: flow models want shift, simple, beta or normal" }}>
+            schedule {select("schedule", info?.schedules ?? [])}</label>
           {info?.guidance === false
             ? null
             : <label>guidance (cfg) {num("cfg", { min: 1, max: 20, step: 0.1, placeholder: d ? String(d.cfg) : "", nullable: true })}</label>}
@@ -176,12 +225,17 @@ export function Create() {
             </div>
           : null}
       </Section>
+      {info?.edits
+        ? <Section id="pictures" title={`Pictures (${state.pictures.length ? `${state.pictures.length}: an edit` : "none: a new picture"})`}>
+            <Pictures />
+          </Section>
+        : null}
       <Section id="loras" title={`LoRAs (${Object.keys(f.loras).length} on)`}>
         <Loras />
       </Section>
       <div class="row">
         <button type="button" attrs={{ id: "go", disabled: !ready || state.busy || !f.prompt.trim() }} on={{ click: () => void generate() }}>
-          <span class="i" props={{ innerHTML: "&#xf0d0;" }} />{state.busy ? "Generating…" : "Generate"}
+          <span class="i" props={{ innerHTML: "&#xf0d0;" }} />{state.busy ? "Generating…" : state.pictures.length ? "Edit" : "Generate"}
         </button>
       </div>
     </div>

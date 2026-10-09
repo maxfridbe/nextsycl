@@ -182,8 +182,11 @@ of IQ2_XXS instead could win twice.
       reference/qwenimage21/ref.py run on the same quantized files: text encoder layer 0 rel 2.8e-3 (36 layers:
       cosine 0.998, int8 activation rounding compounding), DiT block 0 / velocity 2e-4 / 3e-4, 20 Euler steps 2.1e-3,
       VAE max 3 / 255. `nextsycl image gen` (in-process): 1024x1024, 40 steps in 44 s on the B65 (1.07 s / step)
-- [ ] Qwen-Image 2.1: the samplers and schedules past Euler + its shift; guidance (cfg, negative); edit;
-      `nextsycl image start | serve | ps | inspect | bench` and the images API through the switcher
+- [x] Qwen-Image 2.1: edits and compositions (up to 8 pictures: the vision tower, the VAE encoder, the block-causal
+      prefix; checked at 512 and 1024), true guidance, ComfyUI's 29 samplers and 9 schedulers (crates/diffusion
+      samplers.rs, checked against ComfyUI's code); /v1/images/edits (multipart / JSON) and the page's Pictures
+- [ ] Qwen-Image: `image start | ps | inspect | bench` and the images API through the switcher; the sampler suite for
+      the video engine; Qwen3.8-Flash-Next's own vision input for chat (transformers has qwen4_exp's vision tower)
 - [x] Qwen-Image speed, round 1 (B70, 1024x1024, 40 steps 30.0 -> 26.5 s): layernorm + modulation fused, one
       work-group a row (1.69 -> 0.37 ms a call); prefix + block attention read in place through strides (5.9 -> 5.2 ms)
 - [x] Qwen-Image speed, round 2 (B70, 1024x1024, 40 steps): `NS_QI_INT8=1` int8 ConvRot block matrices (rotated and

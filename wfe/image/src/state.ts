@@ -1,5 +1,5 @@
 /** The whole client state in one object (H3's scheme). Components read it; actions mutate it and call render(). */
-import type { Form, Gpu, Info, Picture, Progress } from "./types.js";
+import type { Form, Given, Gpu, Info, Picture, Progress } from "./types.js";
 
 export interface AppState {
   info: Info | null;
@@ -11,6 +11,10 @@ export interface AppState {
   results: Picture[];
   /** the picture opened large */
   zoom: Picture | null;
+  /** an edit's pictures: the first is changed, the others are references (not kept across a reload: they are big) */
+  pictures: Given[];
+  /** an edit's size follows its pictures (the last one's aspect) */
+  sizeFromPictures: boolean;
   busy: boolean;
   /** seconds since the click, while a request runs */
   started: number | null;
@@ -31,6 +35,8 @@ export const state: AppState = {
   },
   results: [],
   zoom: null,
+  pictures: [],
+  sizeFromPictures: true,
   busy: false,
   started: null,
   status: "idle",

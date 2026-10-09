@@ -6,6 +6,10 @@
 //!                                 (transparent: RGBA) - and ours: steps, seed, sampler, schedule, shift, cfg,
 //!                                 negative_prompt, loras ["name:scale" | {name, scale}], options {NAME: value} (the
 //!                                 engine's own: /api/info lists them)
+//!   POST /v1/images/edits         OpenAI's form (multipart: image / image[] files - the picture to change, then
+//!                                 references -, prompt, the fields above) or JSON with `images`: [base64 or data
+//!                                 URLs]; the instructions name the pictures ("the hat from picture 2"); the size
+//!                                 follows the last picture's aspect unless one is given
 //!   GET  /v1/images/files/<f>     a picture made here (saved in the output directory)
 //!   GET  /v1/models, /health
 //!   GET  /api/info                the model, its defaults, samplers, schedules, the LoRAs it can take
@@ -91,9 +95,70 @@ fn earlier(dir: &std::path::Path) -> VecDeque<Value> {
                     "seed": num("seed"), "steps": num("steps"), "width": w.parse::<u32>().ok()?, "height": h.parse::<u32>().ok()?,
                     "loras": text.get("loras").map(|l| l.split(',').filter(|x| !x.is_empty()).collect::<Vec<_>>()).unwrap_or_default(),
                     "seconds": text.get("seconds").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0),
+                    "pictures": num("pictures"),
                     "wh": text.get("wh").and_then(|v| v.parse::<f64>().ok()),
                     "created": t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)}))
     }).collect()
+}
+
+/// The most pictures an edit takes (each is a block of the denoiser's prefix: memory and time grow with them)
+const MAX_PICTURES: usize = 8;
+
+/// An edit request's fields (as the JSON body a generation takes) and its pictures: OpenAI's multipart form (image /
+/// image[] files, the other fields as text; `options` and `loras` as JSON text), or JSON with `images` (or `image`):
+/// base64 / data URLs
+fn edit_body(req: &http::Request) -> Result<(Value, Vec<nextsycl_image::Picture>), String> {
+    let ct = http::header(&req.head, "content-type").unwrap_or_default();
+    let mut pics = Vec::new();
+    let body = if ct.to_ascii_lowercase().starts_with("multipart/form-data") {
+        let boundary = ct.split(';').map(str::trim).find_map(|a| a.strip_prefix("boundary=")).ok_or("multipart without a boundary")?.trim_matches('"');
+        let mut b = serde_json::Map::new();
+        for p in http::multipart(&req.body, boundary)? {
+            let name = p.name.trim_end_matches("[]");
+            if name == "mask" {
+                if !p.data.is_empty() {
+                    return Err("masks are not part of this model's edits (describe the change instead)".into());
+                }
+                continue;
+            }
+            if name == "image" || name.starts_with("image_") {
+                pics.push(nextsycl_image::Picture::decode(&p.data).map_err(|e| format!("{}: {e}", p.filename.as_deref().unwrap_or(name)))?);
+                continue;
+            }
+            let text = String::from_utf8_lossy(&p.data).to_string();
+            let v = match name {
+                "options" | "loras" => serde_json::from_str(&text).map_err(|e| format!("{name}: {e}"))?,
+                "prompt" | "negative_prompt" => Value::String(text),
+                _ => match (text.trim().parse::<u64>(), text.trim().parse::<f64>()) {
+                    (Ok(i), _) => json!(i),
+                    (_, Ok(x)) => json!(x),
+                    _ => Value::String(text),
+                },
+            };
+            b.insert(name.to_string(), v);
+        }
+        Value::Object(b)
+    } else {
+        let v: Value = serde_json::from_slice(&req.body).map_err(|e| format!("the body is not JSON or a multipart form: {e}"))?;
+        let list: Vec<&str> = match (&v["images"], &v["image"]) {
+            (Value::Array(a), _) => a.iter().filter_map(Value::as_str).collect(),
+            (_, Value::String(s)) => vec![s.as_str()],
+            (_, Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        for (i, s) in list.iter().enumerate() {
+            let bytes = http::unbase64(s).map_err(|e| format!("images[{i}]: {e}"))?;
+            pics.push(nextsycl_image::Picture::decode(&bytes).map_err(|e| format!("images[{i}]: {e}"))?);
+        }
+        v
+    };
+    if pics.is_empty() {
+        return Err("an edit needs a picture (image, image[] or images)".into());
+    }
+    if pics.len() > MAX_PICTURES {
+        return Err(format!("{} pictures: at most {MAX_PICTURES}", pics.len()));
+    }
+    Ok((body, pics))
 }
 
 impl ImageServer {
@@ -162,12 +227,19 @@ impl ImageServer {
                     Err(e) => return http::respond_with(&mut s, 400, &err(format!("the body is not JSON: {e}")), &cors),
                 };
                 let base = req.host.as_deref().map(|h| format!("http://{h}")).unwrap_or_default();
-                match self.generate(&body, &base) {
+                match self.generate(&body, &base, Vec::new()) {
                     Ok(v) => http::respond_with(&mut s, 200, &v, &cors),
                     Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
                 }
             }
-            ("POST", "/v1/images/edits") => http::respond_with(&mut s, 400, &err("edits are not served yet"), &cors),
+            ("POST", "/v1/images/edits") | ("POST", "/images/edits") => {
+                let base = req.host.as_deref().map(|h| format!("http://{h}")).unwrap_or_default();
+                let r = edit_body(&req).map_err(|m| (400u16, m)).and_then(|(body, pics)| self.generate(&body, &base, pics));
+                match r {
+                    Ok(v) => http::respond_with(&mut s, 200, &v, &cors),
+                    Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
+                }
+            }
             _ => http::respond_with(&mut s, 404, &err(format!("no route {} {}", req.method, req.path)), &cors),
         }
     }
@@ -222,7 +294,7 @@ impl ImageServer {
         };
         drop(g);
         json!({
-            "model": self.model, "arch": arch, "edits": edits, "guidance": guidance,
+            "model": self.model, "arch": arch, "edits": edits, "guidance": guidance, "max_pictures": MAX_PICTURES,
             "defaults": {"width": d.width, "height": d.height, "steps": d.steps, "cfg": d.cfg, "sampler": d.sampler.name(),
                          "schedule": d.schedule.name(), "shift": d.shift},
             "samplers": samplers.iter().map(|s| s.name()).collect::<Vec<_>>(),
@@ -271,7 +343,7 @@ impl ImageServer {
         Ok(Some(out))
     }
 
-    fn generate(&self, b: &Value, base: &str) -> Result<Value, (u16, String)> {
+    fn generate(&self, b: &Value, base: &str, pics: Vec<nextsycl_image::Picture>) -> Result<Value, (u16, String)> {
         let bad = |m: String| (400u16, m);
         if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model && *m != "dall-e-3" && *m != "dall-e-2" && *m != "gpt-image-1") {
             return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
@@ -310,7 +382,7 @@ impl ImageServer {
             schedule,
             shift: num(&["shift"]).map(|v| v as f32),
             loras: Vec::new(),
-            edit: None,
+            edit: (!pics.is_empty()).then(|| nextsycl_image::Edit { image: pics[0].clone(), refs: pics[1..].to_vec(), mask: None, strength: 1.0 }),
             rgba: b["background"].as_str() == Some("transparent") || b["rgba"].as_bool() == Some(true),
             extra: Default::default(),
         };
@@ -321,6 +393,13 @@ impl ImageServer {
         if url && self.out_dir.is_none() {
             return Err(bad("response_format url: this server keeps no files (start it with an output directory)".into()));
         }
+        if req.edit.is_some() {
+            let edits = self.engine.lock().map(|g| g.as_ref().is_some_and(|(e, _)| e.edits())).unwrap_or(false);
+            if !edits {
+                return Err(bad(format!("{} does not take pictures (edits)", self.model)));
+            }
+        }
+        let n_pics = pics.len();
         // one request at a time
         self.waiting.fetch_add(1, Ordering::Relaxed);
         let mut g = self.engine.lock().unwrap_or_else(|p| p.into_inner());
@@ -370,9 +449,10 @@ impl ImageServer {
             let s = seed + i as u64;
             let meta = [("prompt", prompt.clone()), ("model", self.model.clone()), ("seed", s.to_string()),
                         ("size", format!("{}x{}", pic.width, pic.height)), ("steps", steps.to_string()), ("loras", lora_txt.join(",")),
-                        ("seconds", format!("{seconds:.2}")), ("wh", wh.map(|w| format!("{:.3}", w / pics.len() as f64)).unwrap_or_default())];
+                        ("seconds", format!("{seconds:.2}")), ("wh", wh.map(|w| format!("{:.3}", w / pics.len() as f64)).unwrap_or_default()),
+                        ("pictures", if n_pics > 0 { n_pics.to_string() } else { String::new() })];
             let png = pic.png_bytes(&meta).map_err(|e| (500u16, e))?;
-            let mut item = json!({"revised_prompt": prompt, "seed": s});
+            let mut item = json!({"revised_prompt": prompt, "seed": s, "width": pic.width, "height": pic.height});
             if let Some(dir) = &self.out_dir {
                 let name = format!("{}-{}-{s}.png", now(), self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"));
                 std::fs::write(dir.join(&name), &png).map_err(|e| (500u16, format!("{}: {e}", dir.display())))?;
@@ -380,7 +460,7 @@ impl ImageServer {
                 let mut h = self.history.lock().unwrap();
                 h.push_front(json!({"url": format!("/v1/images/files/{name}"), "prompt": prompt, "seed": s, "steps": steps,
                                     "width": pic.width, "height": pic.height, "loras": lora_txt, "seconds": seconds,
-                                    "wh": wh.map(|w| w / pics.len() as f64), "created": now()}));
+                                    "wh": wh.map(|w| w / pics.len() as f64), "pictures": n_pics, "created": now()}));
                 h.truncate(200);
                 if url {
                     item["url"] = json!(link);

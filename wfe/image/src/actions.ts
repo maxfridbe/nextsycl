@@ -43,6 +43,50 @@ export function reuse(p: Picture): void {
   render();
 }
 
+/** A file (or blob) as an edit's picture: read as a data: URL, its size from the decoded image. */
+export async function addPicture(blob: Blob, name: string): Promise<void> {
+  const max = state.info?.max_pictures ?? 8;
+  if (state.pictures.length >= max) {
+    state.error = `at most ${max} pictures`;
+    render();
+    return;
+  }
+  const url = await new Promise<string>((ok, fail) => {
+    const r = new FileReader();
+    r.onload = () => ok(String(r.result));
+    r.onerror = () => fail(r.error);
+    r.readAsDataURL(blob);
+  });
+  const size = await new Promise<[number, number]>((ok) => {
+    const im = new Image();
+    im.onload = () => ok([im.naturalWidth, im.naturalHeight]);
+    im.onerror = () => ok([0, 0]);
+    im.src = url;
+  });
+  state.pictures.push({ url, name, w: size[0], h: size[1] });
+  render();
+}
+
+/** A picture made here, as an edit's picture. */
+export async function editPicture(p: Picture): Promise<void> {
+  const b = await (await fetch(p.url)).blob();
+  await addPicture(b, p.url.split("/").pop() ?? "picture.png");
+  state.panels["create"] = true;
+}
+
+export function movePicture(i: number, by: number): void {
+  const j = i + by;
+  if (j < 0 || j >= state.pictures.length) return;
+  const [p] = state.pictures.splice(i, 1);
+  if (p) state.pictures.splice(j, 0, p);
+  render();
+}
+
+export function removePicture(i: number): void {
+  state.pictures.splice(i, 1);
+  render();
+}
+
 export async function refreshHistory(): Promise<void> {
   try {
     state.history = await api.history();
@@ -55,9 +99,12 @@ export async function refreshHistory(): Promise<void> {
 function body(): Record<string, unknown> {
   const f = state.form;
   const d = state.info?.defaults;
+  const editing = state.pictures.length > 0;
   const b: Record<string, unknown> = {
-    model: state.info?.model, prompt: f.prompt.trim(), size: `${f.width}x${f.height}`, n: f.n, response_format: "url",
+    model: state.info?.model, prompt: f.prompt.trim(), n: f.n, response_format: "url",
   };
+  if (!editing || !state.sizeFromPictures) b.size = `${f.width}x${f.height}`;
+  if (editing) b.images = state.pictures.map((p) => p.url);
   if (f.steps) b.steps = f.steps;
   if (f.seed !== null) b.seed = f.seed;
   if (state.info?.guidance !== false) {
@@ -85,10 +132,10 @@ export async function generate(): Promise<void> {
   render();
   try {
     const b = body();
-    const j = await api.generate(b);
+    const j = await api.generate(b, state.pictures.length > 0);
     const f = state.form;
     state.results = j.data.filter((d) => d.url).map((d) => ({
-      url: d.url as string, prompt: d.revised_prompt, seed: d.seed, steps: j.nextsycl.steps, width: f.width, height: f.height,
+      url: d.url as string, prompt: d.revised_prompt, seed: d.seed, steps: j.nextsycl.steps, width: d.width ?? f.width, height: d.height ?? f.height,
       loras: j.nextsycl.loras, seconds: j.nextsycl.seconds, wh: j.nextsycl.wh, created: j.created,
     }));
     const wh = j.nextsycl.wh != null ? ` · ${j.nextsycl.wh.toFixed(2)} Wh` : "";

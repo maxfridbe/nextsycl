@@ -1,12 +1,12 @@
 /** Pictures: the last request's, large; the session's, a grid; one opened over the page. */
 import { jsx } from "../jsx.js";
-import { reuse } from "../actions.js";
+import { editPicture, reuse } from "../actions.js";
 import { render, state } from "../state.js";
 import type { Picture } from "../types.js";
 import { fmtT } from "../util.js";
 
 function meta(p: Picture): string {
-  return `seed ${p.seed} · ${p.steps} steps · ${p.width}×${p.height} · ${fmtT(p.seconds)}` +
+  return `${p.pictures ? `edit of ${p.pictures} · ` : ""}seed ${p.seed} · ${p.steps} steps · ${p.width}×${p.height} · ${fmtT(p.seconds)}` +
     (p.loras.length ? ` · ${p.loras.join(", ")}` : "");
 }
 
@@ -19,6 +19,9 @@ function Card(props: { p: Picture; big: boolean }) {
         <span class="cap" attrs={{ title: p.prompt }}>{props.big ? meta(p) : p.prompt}</span>
         <span class="acts">
           <button type="button" class="tbtn" attrs={{ title: "use this prompt and seed again" }} on={{ click: () => reuse(p) }}>reuse</button>
+          {state.info?.edits
+            ? <button type="button" class="tbtn" attrs={{ title: "add this picture to an edit" }} on={{ click: () => void editPicture(p) }}>edit</button>
+            : null}
           <a class="tbtn" attrs={{ href: p.url, download: p.url.split("/").pop() ?? "picture.png" }}>save</a>
         </span>
       </figcaption>

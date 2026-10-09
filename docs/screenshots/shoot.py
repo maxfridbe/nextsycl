@@ -3,13 +3,15 @@ look at what a page should show when debugging it. Needs playwright (pip install
 install chromium); the page renders through requestAnimationFrame, so a plain headless browser screenshot comes out
 blank - this waits for the panels.
 
-    python shoot.py image http://localhost:8086 docs/screenshots   # idle, running, done; desktop and phone widths
+    python shoot.py image http://localhost:8086 docs/screenshots   # idle, running, done; desktop and phone widths;
+                                                                   # NS_SHOT_PICTURES=a.png,b.png: an edit too
     python shoot.py audio http://localhost:8087 docs/screenshots   # idle, composing, done; desktop and phone widths
     python shoot.py video http://localhost:8095 docs/screenshots   # the studio (nextsycl video serve)
 
 Written as PNG, kept in the repository as WebP (quality 82: a tenth of the size).
 """
 import asyncio
+import os
 import sys
 
 from playwright.async_api import async_playwright
@@ -37,6 +39,20 @@ async def image(p, url, out):
     await pg.set_viewport_size({"width": 390, "height": 844})
     await pg.wait_for_timeout(800)
     await pg.screenshot(path=f"{out}/image-wfe-phone.png", full_page=False)
+    # an edit: two pictures (NS_SHOT_PICTURES: two files, comma separated), instructions naming them
+    pics = os.environ.get("NS_SHOT_PICTURES")
+    if pics:
+        await pg.set_viewport_size({"width": 1400, "height": 1000})
+        if not await pg.is_visible(".drop"):
+            await pg.click("text=Pictures")
+        await pg.set_input_files(".drop input[type=file]", pics.split(","))
+        await pg.wait_for_function("document.querySelectorAll('.drop figure.pic').length >= 2", timeout=30000)
+        await pg.fill("textarea", "Place the fox from picture 1 on the rocks in front of the lighthouse from picture 2, at dusk")
+        await pg.click("#go")
+        await pg.wait_for_function("document.querySelector('#go') && document.querySelector('#go').textContent.includes('Edit')", timeout=600000)
+        await pg.wait_for_selector("figure.pic.big", timeout=600000)
+        await pg.wait_for_timeout(1500)
+        await pg.screenshot(path=f"{out}/image-wfe-edit.png", full_page=True)
     await b.close()
     return errors
 

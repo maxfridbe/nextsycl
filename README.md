@@ -47,7 +47,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 
 | id | model | engine | size | status |
 |---|---|---|---|---|
-| `qwen-image-2.1-q8` | Qwen-Image 2.1 Q8_0: text to image, RGBA | `qwenimage21` | 16.4 GiB | checked, served |
+| `qwen-image-2.1-q8` | Qwen-Image 2.1 Q8_0: text to image (RGBA), edits and compositions of up to 8 pictures | `qwenimage21` | 16.4 GiB | checked, served |
 | `qwen-image-2.1-turbo-q8` | Qwen-Image 2.1 Turbo (Viggle v0.3 merged): 6 steps | `qwenimage21` | 16.5 GiB | checked |
 | `qwen-image-2.1-q6k`, `-uncensored-q8` | Qwen-Image 2.1 Q6_K; the uncensored model in Q8_0 | `qwenimage21` | 14.8 / 16.4 GiB | listed |
 | `qwen-image-2.1-q4km`, `-uncensored-q4km` | Q4_K_M | `qwenimage21` | 13.6 GiB | listed (needs Q5_K in the dequant) |
@@ -283,9 +283,35 @@ curl localhost:8086/v1/images/generations -d '{"prompt": "a fox", "options": {"s
 ```sh
 nextsycl models pull qwen-image-2.1-q8
 nextsycl image gen "a red fox in fresh snow, morning light" [--model ID] [--size WxH | --aspect 16:9] [--steps N]
-                   [--seed N] [--n N] [--lora NAME[:SCALE]]... [--out FILE|DIR] [--rgba] [--gpu N]
-nextsycl image check <reference dump dir> [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--gpu N]
+                   [--seed N] [--n N] [--sampler S] [--schedule S] [--shift X] [--cfg X --negative TEXT]
+                   [--lora NAME[:SCALE]]... [--out FILE|DIR] [--rgba] [--gpu N]
+nextsycl image edit "put a red knitted scarf on the fox" --image fox.png [--image ref.png]... [gen's options]
+nextsycl image check <reference dump dir> [--stages te,dit,steps,vae | edit-pre,edit-te,edit-vae,edit-dit] [--gpu N]
 ```
+
+**Edits and compositions.** Give the model pictures and the prompt becomes instructions: the first picture is the one
+changed, the others are references the instructions name ("place the fox from picture 1 in front of the lighthouse
+from picture 2"), up to 8. As Qwen-Image 2.1's pipeline does it: each picture resized (PIL's Lanczos, exactly) to
+the output area at its aspect; seen by Qwen3-VL's vision tower (27 blocks, deepstack features into the first three
+text layers) inside the prompt; encoded by the VAE's encoder, its latents put in the denoiser's sequence where the
+prompt has the picture's slots (block-causal: text causal, each picture's block with itself and all before it). The
+output takes the last picture's aspect unless a size is given. Checked against the pipeline's code at 512 and 1024
+(`reference/qwenimage21/ref.py edit-*`): patches and positions exact, the vision tokens 2e-3, the VAE encoder 2e-3,
+the denoiser 4e-4 over 12 steps, the picture within 6/255. An edit at 1024x1024 takes ~31 s on the B70 (40 steps;
+the prefix of text and one 1024 picture is 4,119 tokens, computed once). Guidance: `--cfg` above 1 with
+`--negative` (two passes a step; the pictures in both).
+
+**Samplers and schedules.** ComfyUI's: 29 samplers (euler, euler_ancestral, heun, heunpp2, dpm_2, dpm_2_ancestral,
+lms, dpmpp_2s_ancestral, dpmpp_sde, dpmpp_2m, dpmpp_2m_sde, dpmpp_2m_sde_heun, dpmpp_3m_sde, ddpm, lcm, ipndm,
+ipndm_v, deis, res_multistep, res_multistep_ancestral, gradient_estimation, er_sde, seeds_2, seeds_3,
+exp_heun_2_x0, exp_heun_2_x0_sde, ddim, uni_pc, uni_pc_bh2) and their schedulers (simple, sgm_uniform, karras,
+exponential, ddim_uniform, beta, normal, linear_quadratic, kl_optimal) besides the model's own (`shift`), ported from
+ComfyUI's code with its flow-model paths (`crates/diffusion` samplers.rs; `reference/samplers` runs ComfyUI's own
+code: every sampler within 1.1e-6, every schedule within 8.3e-7). Euler on the model's schedule runs on the GPU
+alone; the others step on the host (the latents, 1 MB at 1024x1024, cross each call). The ComfyUI schedules take the
+model's own shift for the size unless `--shift` is given. Karras and exponential crowd the steps at the clean end,
+which flow models handle badly - shift, simple, beta or normal suit them. The SDE samplers draw plain normals where
+ComfyUI uses a Brownian tree: a seed gives another picture than ComfyUI's, equally valid.
 
 `--lora` takes a registered LoRA (`nextsycl models pull qwen-image-2.1-uncensored-lora`) or a file; it is merged
 into the DiT's matrices at load (PEFT, kohya and diffusers files; ~0.4 s, nothing a step), half or int8 alike, and
@@ -330,6 +356,19 @@ docs/screenshots` retakes them):
 | Idle | Running | Done |
 |---|---|---|
 | ![idle](docs/screenshots/image-wfe-idle.webp) | ![running](docs/screenshots/image-wfe-running.webp) | ![done](docs/screenshots/image-wfe-done.webp) |
+
+An edit - two pictures composed by the instructions (the page's Pictures section; "edit" on any picture made here
+adds it):
+
+![an edit](docs/screenshots/image-wfe-edit.webp)
+
+The API: `POST /v1/images/edits` takes OpenAI's multipart form (`image` / `image[]` files, `prompt` and the other
+fields) or JSON with `images` (base64 or data URLs):
+
+```sh
+curl localhost:8086/v1/images/edits -F "image[]=@fox.png" -F "image[]=@lighthouse.png" \
+     -F "prompt=Place the fox from picture 1 in front of the lighthouse from picture 2" -F response_format=url
+```
 
 <img src="docs/screenshots/image-wfe-phone.webp" width="260" alt="the page at phone width">
 
