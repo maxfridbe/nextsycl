@@ -308,7 +308,7 @@ impl Daemon {
             self.acquire_hooks(k, cancel)?;
         }
         let _ = model; // the worker finds the file by the id
-        let spawned = Command::new(std::env::current_exe().map_err(|e| Error(e.to_string()))?)
+        let spawned = Command::new(program()?)
             .args(["video", "worker", "--gpu", &gpu.to_string(), "--model", &engine])
             .args(["--threads", &self.opts.threads.to_string()])
             .stdin(Stdio::piped())
@@ -720,11 +720,19 @@ impl Daemon {
     }
 }
 
+/// This program, to start workers with: the path it was started by (a rebuild renames a new binary over it, which the
+/// next worker then runs; `current_exe` would name the replaced file, deleted - "No such file or directory")
+fn program() -> Result<PathBuf> {
+    match std::env::args_os().next().map(PathBuf::from) {
+        Some(p) if p.is_absolute() && p.exists() => Ok(p),
+        _ => std::env::current_exe().map_err(|e| Error(e.to_string())),
+    }
+}
+
 /// The GPUs there are, asked of a short-lived `nextsycl video gpus --json` (the daemon itself does not start the GPU
 /// runtime)
 fn list_gpus() -> Result<Vec<Value>> {
-    let exe = std::env::current_exe().map_err(|e| Error(e.to_string()))?;
-    let out = Command::new(exe).args(["video", "gpus", "--json"]).stderr(Stdio::inherit()).output().map_err(|e| Error(e.to_string()))?;
+    let out = Command::new(program()?).args(["video", "gpus", "--json"]).stderr(Stdio::inherit()).output().map_err(|e| Error(e.to_string()))?;
     if !out.status.success() {
         return Err(Error("cannot list the GPUs (nextsycl video gpus failed)".into()));
     }

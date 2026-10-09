@@ -517,8 +517,12 @@ pub fn run(o: Options) -> http::Result<()> {
     // a job that was running when the studio stopped: follow it again if the engine still knows it
     if let Some(rec) = runner::recover(&o.dir) {
         if let Some(id) = rec["id"].as_str().and_then(|i| i.parse::<u64>().ok()) {
+            // a clip already saved is nothing to follow: restored as the current job, with no engine state to show,
+            // it read as "waiting for the engine" until the next clip (2026-10-09)
             let saved = o.out.join(format!("{}.json", s(&rec, "name"))).exists();
-            st.job = Some(Job { energy0: rec["energy0"].as_f64(), rec, engine_id: id, saved, stall: (0, now()), finished: saved, last: Value::Null });
+            if !saved {
+                st.job = Some(Job { energy0: rec["energy0"].as_f64(), rec, engine_id: id, saved, stall: (0, now()), finished: false, last: Value::Null });
+            }
         }
     }
     let studio = Arc::new(Studio {
