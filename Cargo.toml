@@ -1,7 +1,15 @@
 [workspace]
 resolver = "2"
-# shared crates, the contract (ns-runtime), one engine a model architecture (engines/), the program
-members = ["crates/ns-sys", "crates/ns-core", "crates/ns-gguf", "crates/ns-tok", "crates/ns-runtime", "engines/glm5next", "engines/qwen4exp", "crates/nextsycl"]
+# the layout (docs/architecture.md): the shared foundation (crates/), one group a kind - its contract and one engine
+# crate an architecture (llm/, image/, video/) -, the glue that makes them a service (glue/), the program (cli/)
+members = [
+    "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion",
+    "llm/contract", "llm/glm5next", "llm/qwen4exp", "llm/example",
+    "image/contract", "image/example",
+    "video/contract", "video/example",
+    "glue/models", "glue/serve",
+    "cli/nextsycl",
+]
 
 [workspace.package]
 version = "0.0.0"  # the release version is yy.mmdd.### from git (version.sh), handed in as NS_VERSION
@@ -9,12 +17,21 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-ns-gguf = { path = "crates/ns-gguf" }
-ns-core = { path = "crates/ns-core" }
-ns-runtime = { path = "crates/ns-runtime" }
-ns-glm5next = { path = "engines/glm5next" }
-ns-qwen4exp = { path = "engines/qwen4exp" }
-ns-tok = { path = "crates/ns-tok" }
+nextsycl-sys = { path = "crates/sys" }
+nextsycl-core = { path = "crates/core" }
+nextsycl-gguf = { path = "crates/gguf" }
+nextsycl-tok = { path = "crates/tok" }
+nextsycl-diffusion = { path = "crates/diffusion" }
+nextsycl-llm = { path = "llm/contract" }
+nextsycl-llm-glm5next = { path = "llm/glm5next" }
+nextsycl-llm-qwen4exp = { path = "llm/qwen4exp" }
+nextsycl-llm-example = { path = "llm/example" }
+nextsycl-image = { path = "image/contract" }
+nextsycl-image-example = { path = "image/example" }
+nextsycl-video = { path = "video/contract" }
+nextsycl-video-example = { path = "video/example" }
+nextsycl-models = { path = "glue/models" }
+nextsycl-serve = { path = "glue/serve" }
 serde_json = "1"
 
 [profile.release]

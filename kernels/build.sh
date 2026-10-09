@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# kernels/build.sh: libnextsycl.so from kernels/strata (the imported SYCL kernels) and kernels/ns (this project's,
-# with the C ABI). Runs inside the build image (oneAPI 2026.1); ../build.sh starts it there.
+# kernels/build.sh: the kernel libraries, one a kind - libnextsycl-llm.so, libnextsycl-image.so, libnextsycl-video.so -
+# each the shared part (kernels/ns: GPUs, memory, copies, the C ABI's core) and that kind's engines
+# (kernels/<kind>/<arch>; llm also kernels/strata, the imported Strata kernels). Runs inside the build image (oneAPI
+# 2026.1); ../build.sh starts it there.
 #   AOT=bmg-g31 (default: the Arc Pro B70 / B65 die; "" = SPIR-V, JIT at first use)   JOBS=8   ONLY="a.dp.cpp b..."
 set -eo pipefail
 # setvars.sh reads unset variables: sourced before `set -u`, which would end this script silently
@@ -27,8 +29,14 @@ else
 fi
 LINK+=(-fsycl-device-code-split=per_kernel -shared -qmkl=sequential)
 
-# the shared kernels (ns/), each engine's own (engines/<arch>/), the imported ones (strata/)
-SRCS=${ONLY:-$(ls $S/src/kernels/*.dp.cpp $S/src/prefill/*.dp.cpp ns/*.cpp engines/*/*.cpp 2>/dev/null)}
+# the sources: the shared part (ns/), the imported Strata kernels (strata/), and one directory a kind holding one
+# directory an engine (llm/<arch>/, image/<arch>/, video/<arch>/)
+KINDS="llm image video"
+all_sources() {
+  ls $S/src/kernels/*.dp.cpp $S/src/prefill/*.dp.cpp ns/*.cpp 2>/dev/null
+  for k in $KINDS; do ls $k/*/*.cpp 2>/dev/null; done
+}
+SRCS=${ONLY:-$(all_sources)}
 echo "==> compiling $(echo $SRCS | wc -w) sources (AOT ${AOT:-none}, $JOBS at a time)"
 fail=0
 printf '%s\n' $SRCS | xargs -P "$JOBS" -I{} sh -c '
@@ -42,13 +50,20 @@ if [ "$fail" = 1 ]; then
   done
   [ -n "${LINK_ANYWAY:-}" ] || exit 1
 fi
-echo "==> linking libnextsycl.so"
 # objects of sources that are gone (moved or removed) would link twice or stale: only the current sources' objects
-ALL=$(ls $S/src/kernels/*.dp.cpp $S/src/prefill/*.dp.cpp ns/*.cpp engines/*/*.cpp 2>/dev/null)
+ALL=$(all_sources)
 for o in "$OBJ"/*.o; do
   printf '%s\n' $ALL | tr / _ | sed 's/$/.o/' | grep -qx "$(basename "$o")" || rm -f "$o" "$o.log"
 done
-# linked beside it, then renamed over it: a running server keeps the library it mapped (writing over a mapped
-# library in place would change the code under it)
-icpx "${LINK[@]}" "$OBJ"/*.o -o "$OUT/.libnextsycl.so.new" && mv -f "$OUT/.libnextsycl.so.new" "$OUT/libnextsycl.so"
-ls -la "$OUT/libnextsycl.so"
+# one library a kind: the shared part and that kind's engines (llm also the Strata kernels its engines use), so a
+# program of one kind never loads another kind's code. Each is linked beside its old self, then renamed over it: a
+# running server keeps the library it mapped (writing over a mapped library in place would change the code under it)
+for k in $KINDS; do
+  objs="$(ls "$OBJ"/ns_*.o) $(ls "$OBJ"/${k}_*.o 2>/dev/null || true)"
+  [ "$k" = llm ] && objs="$objs $(ls "$OBJ"/strata_*.o)"
+  echo "==> linking libnextsycl-$k.so"
+  icpx "${LINK[@]}" $objs -o "$OUT/.libnextsycl-$k.so.new" && mv -f "$OUT/.libnextsycl-$k.so.new" "$OUT/libnextsycl-$k.so"
+done
+# the name before the split (libnextsycl.so = the llm library), for runners and services that still name it
+ln -sf libnextsycl-llm.so "$OUT/libnextsycl.so"
+ls -la "$OUT"/libnextsycl*.so

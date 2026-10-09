@@ -1,0 +1,9 @@
+[package]
+name = "nextsycl-diffusion"
+description = "What every diffusion engine (image, video) shares: samplers and schedules by name, the sigma schedules, LoRA references, pictures"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+png = "0.17"

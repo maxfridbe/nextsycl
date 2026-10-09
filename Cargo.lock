@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -27,6 +33,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
+name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+
+[[package]]
+name = "cfg-if"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
+name = "crc32fast"
+version = "1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -35,6 +62,26 @@ dependencies = [
  "bit-set",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "fdeflate"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
+dependencies = [
+ "simd-adler32",
+]
+
+[[package]]
+name = "flate2"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide 0.9.1",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -50,68 +97,175 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+ "simd-adler32",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+ "simd-adler32",
+]
+
+[[package]]
 name = "nextsycl"
 version = "0.0.0"
 dependencies = [
- "ns-core",
- "ns-gguf",
- "ns-glm5next",
- "ns-qwen4exp",
- "ns-runtime",
- "ns-tok",
+ "nextsycl-core",
+ "nextsycl-gguf",
+ "nextsycl-image",
+ "nextsycl-image-example",
+ "nextsycl-llm",
+ "nextsycl-llm-example",
+ "nextsycl-llm-glm5next",
+ "nextsycl-llm-qwen4exp",
+ "nextsycl-models",
+ "nextsycl-serve",
+ "nextsycl-tok",
+ "nextsycl-video",
+ "nextsycl-video-example",
  "serde_json",
 ]
 
 [[package]]
-name = "ns-core"
+name = "nextsycl-core"
 version = "0.0.0"
 dependencies = [
- "ns-sys",
+ "nextsycl-sys",
 ]
 
 [[package]]
-name = "ns-gguf"
-version = "0.0.0"
-
-[[package]]
-name = "ns-glm5next"
+name = "nextsycl-diffusion"
 version = "0.0.0"
 dependencies = [
- "ns-core",
- "ns-gguf",
- "ns-runtime",
- "ns-tok",
+ "png",
 ]
 
 [[package]]
-name = "ns-qwen4exp"
+name = "nextsycl-gguf"
+version = "0.0.0"
+
+[[package]]
+name = "nextsycl-image"
 version = "0.0.0"
 dependencies = [
- "ns-core",
- "ns-gguf",
- "ns-runtime",
- "ns-tok",
+ "nextsycl-core",
+ "nextsycl-diffusion",
 ]
 
 [[package]]
-name = "ns-runtime"
+name = "nextsycl-image-example"
 version = "0.0.0"
 dependencies = [
- "ns-core",
- "ns-gguf",
- "ns-tok",
+ "nextsycl-core",
+ "nextsycl-image",
 ]
 
 [[package]]
-name = "ns-sys"
+name = "nextsycl-llm"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-gguf",
+ "nextsycl-tok",
+]
+
+[[package]]
+name = "nextsycl-llm-example"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-gguf",
+ "nextsycl-llm",
+ "nextsycl-tok",
+]
+
+[[package]]
+name = "nextsycl-llm-glm5next"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-gguf",
+ "nextsycl-llm",
+ "nextsycl-tok",
+]
+
+[[package]]
+name = "nextsycl-llm-qwen4exp"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-gguf",
+ "nextsycl-llm",
+ "nextsycl-tok",
+]
+
+[[package]]
+name = "nextsycl-models"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-gguf",
+ "serde_json",
+]
+
+[[package]]
+name = "nextsycl-serve"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-llm",
+ "nextsycl-tok",
+ "serde_json",
+]
+
+[[package]]
+name = "nextsycl-sys"
 version = "0.0.0"
 
 [[package]]
-name = "ns-tok"
+name = "nextsycl-tok"
 version = "0.0.0"
 dependencies = [
  "fancy-regex",
- "ns-gguf",
+ "nextsycl-gguf",
+]
+
+[[package]]
+name = "nextsycl-video"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+]
+
+[[package]]
+name = "nextsycl-video-example"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-video",
+]
+
+[[package]]
+name = "png"
+version = "0.17.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
+dependencies = [
+ "bitflags",
+ "crc32fast",
+ "fdeflate",
+ "flate2",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]
@@ -192,6 +346,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
 name = "syn"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -207,6 +367,12 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

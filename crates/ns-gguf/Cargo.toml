@@ -1,8 +1,0 @@
-[package]
-name = "ns-gguf"
-description = "GGUF v3: the header, every metadata value, the tensor directory; split files. No ggml."
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]

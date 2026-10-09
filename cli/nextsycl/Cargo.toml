@@ -1,0 +1,22 @@
+[package]
+name = "nextsycl"
+description = "The command line: info, check, generate, serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-gguf.workspace = true
+nextsycl-core.workspace = true
+nextsycl-llm.workspace = true
+nextsycl-llm-glm5next.workspace = true
+nextsycl-llm-qwen4exp.workspace = true
+nextsycl-tok.workspace = true
+nextsycl-llm-example.workspace = true
+nextsycl-image.workspace = true
+nextsycl-image-example.workspace = true
+nextsycl-video.workspace = true
+nextsycl-video-example.workspace = true
+nextsycl-models.workspace = true
+nextsycl-serve.workspace = true
+serde_json.workspace = true

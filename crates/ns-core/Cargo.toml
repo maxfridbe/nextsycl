@@ -1,9 +1,0 @@
-[package]
-name = "ns-core"
-description = "GPUs, their memory and copies; the memory plan; the expert store (to come)"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-ns-sys = { path = "../ns-sys" }

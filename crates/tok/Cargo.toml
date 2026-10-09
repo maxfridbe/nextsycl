@@ -1,0 +1,10 @@
+[package]
+name = "nextsycl-tok"
+description = "Byte-level BPE from a GGUF's vocabulary (GPT-2 style; GLM's glm4 pre-tokenizer), and the chat templates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-gguf.workspace = true
+fancy-regex = "0.14"

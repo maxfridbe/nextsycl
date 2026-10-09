@@ -1,8 +1,0 @@
-[package]
-name = "ns-sys"
-description = "Raw bindings to libnextsycl (kernels/ns/ns.h), loaded at run time"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]

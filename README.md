@@ -2,16 +2,19 @@ We stand on the shoulders of giants.
 
 # nextsycl
 
-A Rust runtime for large hybrid-attention MoE models on Intel Arc GPUs, with SYCL kernels. Each model architecture
-has its own engine, tuned for it end to end, behind one small contract the server drives (`docs/engines.md`). First
-model: **GLM-5.3-Flash** (`glm5-next`, `engines/glm5next`): 45 layers of KDA and MLA attention with a DSA lightning
+A Rust runtime for language, image and video models on Intel Arc GPUs, with SYCL kernels. Each kind of model has a
+contract its server and command line drive, and each model architecture its own engine behind it, tuned end to end -
+a library another program can use without the server (`docs/architecture.md`). New models are welcome:
+`CONTRIBUTING.md` walks through a port, from each kind's template engine. The language models today:
+**GLM-5.3-Flash** (`glm5-next`, `llm/glm5next`): 45 layers of KDA and MLA attention with a DSA lightning
 indexer, 288 experts, and hyper-connections. The experts that do not fit the cards live in pinned host memory, and
-the GPU reads them over PCIe. It runs on one card or splits the layers over several. Second model:
-**Qwen3.8-Flash-Next** (`qwen4exp`, `engines/qwen4exp`): Gated DeltaNet and QSA attention, hyper-connections, a
+the GPU reads them over PCIe. It runs on one card or splits the layers over several. And
+**Qwen3.8-Flash-Next** (`qwen4exp`, `llm/qwen4exp`): Gated DeltaNet and QSA attention, hyper-connections, a
 hashed per-layer embedding and 512 experts, on the Strata SYCL port's kernels - every weight in VRAM over the two
 cards or on one with its cold experts in pinned host memory, the MTP draft layer, the window and the drafter as SYCL
 graphs; verify passes and batches bit-exact, greedy output with drafts equal to output without. Every model's speed at
-each context length: [Speed by model](#speed-by-model).
+each context length: [Speed by model](#speed-by-model). Image (Qwen-Image 2.1) and video (MiniMax H3) engines come
+next; their contracts and templates are in place.
 
 ## What it does
 
@@ -46,7 +49,7 @@ each context length: [Speed by model](#speed-by-model).
   a 256K prompt's checkpoint is ~3.5 GiB, mounted again in seconds instead of re-reading the prompt for minutes.
   The files outlive the server (another context size of the same model and cache form takes them); one unused for
   `NS_CACHE_TTL_HOURS` (24) is removed, and past the size budget the least recently used go first.
-- **An OpenAI-compatible server** with streaming and the thinking split out, run as a service: `nextsycl start`,
+- **An OpenAI-compatible server** with streaming and the thinking split out, run as a service: `nextsycl llm start`,
   `stop`, `status`, `ps`, `cache`, `chat`, `logs`, over a control socket.
 - **Tool calls (Qwen3.8-Flash-Next):** OpenAI's `tools` go into the model's own template (its `<tools>` list and
   `<tool_call><function=..><parameter=..>` format); the answer's calls come back as `tool_calls`, each argument typed
@@ -64,7 +67,7 @@ each context length: [Speed by model](#speed-by-model).
 - **LogProbChain** (`logprob_chain: true`, experimental): each answer token's logprob also chained through the attention
   to the turn's own earlier tokens - an answer that only repeats its thinking counts only as sure as the thinking was
   (below).
-- **A record of each request:** `nextsycl inspect <id>` prints one as JSON (settings, timings, previews of the prompt
+- **A record of each request:** `nextsycl llm inspect <id>` prints one as JSON (settings, timings, previews of the prompt
   and the answer); the server keeps the last `NS_KEEP_REQUESTS` (100).
 - **`POST /api/chat` for web pages:** the same chat as JSON lines (`{"thinking": ...}`, `{"content": ...}`, then a
   `{"done": true, ...}` line with the timings), with CORS for loopback pages and the origins in `NS_CORS`.
@@ -72,13 +75,14 @@ each context length: [Speed by model](#speed-by-model).
 ## Quick start
 
 ```sh
-./build.sh                      # the kernel library and the program, in a container with oneAPI (podman)
+./build.sh                          # the kernel libraries and the program, in a container with oneAPI (podman)
 echo "NS_MODELS=$HOME/models" > nextsycl.conf
-dist/nextsycl start             # loads the model on every GPU; the OpenAI API on 127.0.0.1:8085
-dist/nextsycl status            # live: the GPUs, the request running, the prompt cache
-dist/nextsycl inspect 4         # one request as JSON (settings, timings, previews; NS_KEEP_REQUESTS are kept)
-dist/nextsycl chat "Hello"
-dist/nextsycl stop
+dist/nextsycl models add glm ~/models/GLM-5.3-Flash-IQ2.gguf --gpu all   # register a model (or models download)
+dist/nextsycl llm start glm         # load it; the OpenAI API on 127.0.0.1:8085
+dist/nextsycl llm status            # live: the GPUs, the request running, the prompt cache
+dist/nextsycl llm inspect 4         # one request as JSON (settings, timings, previews; NS_KEEP_REQUESTS are kept)
+dist/nextsycl llm chat "Hello"
+dist/nextsycl llm stop
 ```
 
 `dist/nextsycl help` lists every command and setting.
@@ -87,7 +91,7 @@ What the commands show during and after a chat (GLM-5.3-Flash IQ2 on an Arc Pro 
 last):
 
 ```
-$ nextsycl status
+$ nextsycl llm status
 glm-5.3-flash-uncensored - up 1m44s, context 65536, MTP on, 2 request(s) served
 
 GPU  CARD                      VRAM USED      FREE   LAYERS EXPERTS VRAM/HOST   TEMP   VRAM   POWER
@@ -98,12 +102,12 @@ GPU  CARD                      VRAM USED      FREE   LAYERS EXPERTS VRAM/HOST   
 request #2 (socket): generating, prompt 23 tokens, 0 reused (none), 166 / 400 generated at 20.5 tok/s, 9s, 1565 J so far
 prompt cache: (busy)
 
-$ nextsycl ps
+$ nextsycl llm ps
 ID     VIA     STATE        PROMPT           REUSED    READ  GENERATED   TOK/S    ENERGY  AVG W FINISH       AGO
 #2     socket  done             23           0 none    0.8s        169    20.2    1613 J    175 stop         34s
 #1     socket  done             20           0 none    1.1s        195    19.5    1903 J    171 stop       2m08s
 
-$ nextsycl inspect 2
+$ nextsycl llm inspect 2
 {
   "answer": {
     "chars": 873,
@@ -148,7 +152,7 @@ The models a machine serves are entries in one registry (`NS_REGISTRY`, a JSON f
 `~/.config/nextsycl/models.json`). An entry has the GGUF file (its first shard), the GPUs, the session contexts, the
 engine settings (`NS_QW_MTP`, `NS_QW_CVEC` and the like), whether it is offered, and what a client may send it
 (tools, background tasks). Its id is the model id clients see and the name the server answers under;
-`nextsycl start <id>` runs it.
+`nextsycl llm start <id>` runs it.
 
 ```sh
 nextsycl models list [--json]
@@ -157,7 +161,8 @@ nextsycl models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M
 nextsycl models download <id> <url | hf:org/repo/path/file.gguf> [--dir DIR] [add's options]   # every shard, resumable
 nextsycl models remove <id> [--files]        # --files deletes the GGUF shards too
 nextsycl models enable <id> | disable <id>
-nextsycl start <id>
+nextsycl llm start <id>
+nextsycl llm serve <id>                      # the same in the foreground, its log here
 ```
 
 ```
@@ -172,13 +177,13 @@ swift-1.5-iq2_xs                             enabled     63.5G  0        131072,
 
 A model switcher in front of the server (one model serves at a time) can read the registry for its list: an entry
 added or disabled shows at once. With `NS_STUDIO_MODES` set to a mode file (one mode a model, its start command
-`nextsycl start <id>`), every registry change rewrites that file's nextsycl entries (`"managed_by": "nextsycl"`) and
-leaves the others alone. `nextsycl start <id>` mounts the entry's files at the same paths in the container, so an
+`nextsycl llm start <id>`), every registry change rewrites that file's nextsycl entries (`"managed_by": "nextsycl"`) and
+leaves the others alone. `nextsycl llm start <id>` mounts the entry's files at the same paths in the container, so an
 entry can point anywhere on the machine.
 
 ## Speed by model
 
-Benchy v1 through the server (`nextsycl bench --sizes 20,2185,8000,40000,128000 --parallel 1`; 256 greedy tokens a
+Benchy v1 through the server (`nextsycl llm bench --sizes 20,2185,8000,40000,128000 --parallel 1`; 256 greedy tokens a
 size, the prompt cache cleared before each), 8 October 2026. The Qwen3.8-Flash-Next family on one Arc Pro B70 (its
 cold experts in pinned host memory, the MTP draft layer); GLM-5.3-Flash on the B70 and an Arc Pro B65. Input tokens
 as each model's tokenizer counts them (Qwen 30 / 2,195 / 7,914 / 39,783 / 127,303; GLM 31 / 2,216 / 7,975 / 39,758 /
@@ -216,7 +221,7 @@ model loads:
 The prompt speeds are the warm pass's (the first pass reads the same, but for its very first request: ~50 tokens/s
 on the 20-token prompt). A model just loaded decodes 2-9% slower than the warm pass on new text: each
 token's 16 per-layer-embedding rows come from a 27 GiB table in the file, and rows not in the page cache are read
-from the disk (asked for together a window: `docs/engines.md`, NS_QW_PLE_PREFETCH). The
+from the disk (asked for together a window: `docs/architecture.md`, NS_QW_PLE_PREFETCH). The
 projection modes cost nothing measurable. Draft acceptance varies with the text (61-86% here), and decode with it. On two cards the Qwen models decode slower than on
 the B70 alone (Coder 2K 70.8 tok/s with the B70 first, 58.2 with the B65 first; `TODO.md`).
 
@@ -254,7 +259,7 @@ chunk n.
 
 ## Benchy
 
-`nextsycl bench` runs Strata's benchy v1 (its prompts as text in `bench/v1`) against the running server, and sends
+`nextsycl llm bench` runs Strata's benchy v1 (its prompts as text in `bench/v1`) against the running server, and sends
 several requests at once. The latest run, `docs/benchy/v1-2026-10-07-q8.md` (B65 + B70, the B70 last; prompt chunks of
 6,144, the q8 latent cache, the GPUs in a pipeline for prompts over a chunk):
 
@@ -323,9 +328,9 @@ Requests with it decode one token a pass (no draft block), a few small reads a l
   0 difference (greedy output with MTP equals greedy output without); `--layers [--at N] [--row k]` compares every
   named step of one row against a one-token pass, to find where they part. Check a long prompt too (past 2,048
   tokens the indexer runs: the 3-row drift it found lived there).
-- `nextsycl bench --needle [--sizes 32768,131072,250000] [--depths 10,50,90]`: a passphrase placed at each depth of
+- `nextsycl llm bench --needle [--sizes 32768,131072,250000] [--depths 10,50,90]`: a passphrase placed at each depth of
   a long document, asked for at the end - can the running server find it (its context must hold the size).
-- `NS_PROFILE=1 nextsycl generate ...`: seconds per section, the GPU synced at each boundary; `NS_PROFILE=gpu`: device
+- `NS_PROFILE=1 nextsycl llm generate ...`: seconds per section, the GPU synced at each boundary; `NS_PROFILE=gpu`: device
   timestamps instead (no syncs - the honest view of decode, where sections are tens of microseconds).
 - `NS_PIPE_TRACE=1`: each pipeline stage's time a chunk and the GPUs' free VRAM; `NS_VRAM_GUARD_GIB=G`: a prompt read
   stops with an error before a GPU has less than G free.
@@ -392,13 +397,14 @@ What measuring this runtime on two Arc cards taught, most of it the hard way:
 The version is `yy.mmdd.###`: the commit's date (UTC), then its number among that day's commits, from git
 (`./version.sh`; `nextsycl version` prints the one built in). Every push to `main` is built and tested by
 `.github/workflows/build.yml` and published as a release `v<version>` with `nextsycl-<version>-linux-x86_64.tar.gz`
-(the program, `libnextsycl.so`, `ns.h`, the docs). Other branches and pull requests keep the tarball as a workflow
+(the program, the kernel libraries `libnextsycl-<kind>.so`, `ns.h`, the docs). Other branches and pull requests keep the tarball as a workflow
 artifact.
 
 ## Docs
 
-- `docs/engines.md`: the layout - shared crates, the engine contract (`ns-runtime`), one engine a model
-  (`engines/<arch>`, its kernels in `kernels/engines/<arch>`) - and how to add a model.
+- `docs/architecture.md`: the layout - the foundation crates, each kind's contract and engines (`<kind>/<arch>`, their
+  kernels in `kernels/<kind>/<arch>`), the glue, the program - its rules, and the engines' settings.
+- `CONTRIBUTING.md`: porting a model from a kind's template, the rules (SYCL only; the layers), building, checking.
 - `docs/glm5next.md`: the model's math, as this runtime computes it.
 - `docs/256k-context.md`: long context - memory a token, the measured scaling, what 256K takes and what is left.
 - `docs/benchy/`: every benchy run, the needle runs, the speculative-sampling sweep.

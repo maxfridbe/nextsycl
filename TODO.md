@@ -162,6 +162,23 @@ of IQ2_XXS instead could win twice.
 - [ ] Fused gate/up: no gain from more column tiles a sub-group (NB 2: slower, NB 4: spills) or limits past 64 (128:
       the same 7.5 s, 192-256: 8.1)
 
+## Kinds: language, image, video (docs/architecture.md, CONTRIBUTING.md, 2026-10-09)
+
+- [x] The layout by kind: the foundation (crates/: sys, core, gguf, tok, diffusion), each kind's contract and engines
+      (llm/, image/, video/), the glue as libraries (glue/models: registry and settings; glue/serve: the servers,
+      prompt cache, telemetry), the program (cli/nextsycl); crates renamed nextsycl-*; one kernel library a kind
+      (libnextsycl-llm|image|video.so; libnextsycl.so a link to the llm one); the architecture's rules as tests
+- [x] The image contract (ImageEngine: request, edit, defaults, steps) and the video contract (VideoEngine: clip
+      request, keyframes, stages, cancel, unload); samplers / schedules / sigmas / LoRA references / pictures shared
+      in nextsycl-diffusion; a template engine of each kind (llm/example, image/example, video/example) with its own
+      kernel, and `nextsycl <kind> selftest`
+- [x] `nextsycl llm ...` (the old top-level names still work); `nextsycl image|video engines | selftest`
+- [ ] The catalog of supported models and `nextsycl models search | pull` (download goes)
+- [ ] Qwen-Image 2.1 (image/qwenimage21): its DiT, VAE and text encoder in SYCL, checked against the reference;
+      the samplers and schedules; `nextsycl image gen | edit | start | serve | ps | inspect | bench`; the images API
+- [ ] LoRAs: presets merged at load, per-request ones as a side path; Qwen-Image (20B) with the Lightning LoRAs
+- [ ] H3 into video/ (copied from its committed sycl-port branch): `nextsycl video ...` for all its commands
+
 ## Several models (docs/engines.md, 2026-10-08)
 
 - [x] The split: ns-runtime (the contract: Engine, opaque Session / Decoder / Checkpoint, Sampler, the registry by

@@ -70,7 +70,8 @@ jobs:
         run: |
           name="nextsycl-$NS_VERSION-linux-x86_64"
           mkdir -p "pkg/$name"
-          cp dist/nextsycl dist/libnextsycl.so kernels/ns/ns.h README.md "pkg/$name/"
+          cp dist/nextsycl dist/libnextsycl-*.so kernels/ns/ns.h README.md CONTRIBUTING.md "pkg/$name/"
+          ln -s libnextsycl-llm.so "pkg/$name/libnextsycl.so"
           cp -r docs "pkg/$name/"
           echo "$NS_VERSION" > "pkg/$name/VERSION"
           tar -C pkg -czf "$name.tar.gz" "$name"

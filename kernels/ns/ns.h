@@ -53,10 +53,6 @@ int ns_sync(ns_gpu* g);
  * context, so it is pinned for at most one of the two copies; plain memory works for both, slower); waits */
 int ns_copy_peer(ns_gpu* to, void* dst, ns_gpu* from, const void* src, size_t bytes, void* staging);
 
-/* ---- the engines' own ABIs */
-#include "../engines/glm5next/glm.h"
-#include "../engines/qwen4exp/qwen.h"
-
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-serve"
+description = "The servers: an OpenAI-compatible API over a kind's engine, the prompt cache, telemetry, the HTTP plumbing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-llm.workspace = true
+nextsycl-tok.workspace = true
+serde_json.workspace = true

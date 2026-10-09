@@ -1,0 +1,10 @@
+[package]
+name = "nextsycl-video"
+description = "The video engines' contract: a clip request, a clip out, the progress, the registry entry an engine provides"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true

@@ -11,8 +11,11 @@ case "$what" in
   kernels) run "kernels/build.sh" ;;
   rust) run "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; cargo build --release && mkdir -p dist && cp target/release/nextsycl dist/.nextsycl.new && mv -f dist/.nextsycl.new dist/nextsycl" ;;
   all) "$0" kernels && "$0" rust ;;
-  # the lints as errors and the unit tests (no GPU needed)
-  test) run "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; cargo clippy --release --all-targets -- -D warnings && cargo test --release" ;;
+  # the lints as errors, the unit tests and the architecture's rules (cli/nextsycl/tests/architecture.rs; no GPU
+  # needed), and the kernel libraries linked against no GPU runtime but SYCL's (CONTRIBUTING.md)
+  test) run "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; cargo clippy --release --all-targets -- -D warnings && cargo test --release \
+             && for l in dist/libnextsycl-*.so; do [ -e \"\$l\" ] || continue; \
+                  if ldd \"\$l\" | grep -Ei 'libcuda|libcudart|libvulkan|libamdhip|libhip|libMetal'; then echo \"\$l: another GPU runtime\"; exit 1; fi; done" ;;
   image) podman build -t localhost/nextsycl-build container/ ;;
   *) echo "build.sh [kernels|rust|all|test|image]"; exit 2 ;;
 esac

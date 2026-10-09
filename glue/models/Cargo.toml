@@ -1,0 +1,10 @@
+[package]
+name = "nextsycl-models"
+description = "The models a machine serves: the registry, the catalog of supported models, settings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-gguf.workspace = true
+serde_json.workspace = true

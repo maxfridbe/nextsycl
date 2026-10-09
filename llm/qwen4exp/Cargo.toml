@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-llm-qwen4exp"
+description = "Qwen3.8-Flash-Next (qwen4exp): its model description and its engine - on the Strata SYCL kernels, tuned for it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-llm.workspace = true
+nextsycl-tok.workspace = true
