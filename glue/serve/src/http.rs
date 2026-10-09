@@ -157,6 +157,41 @@ pub fn forward(mut client: impl Write, upstream: &Target, req: &Request) -> Resu
     Ok(())
 }
 
+/// `forward` with another body: the request's head with its Content-Length set to `body`'s and the connection to
+/// close (the answer is then copied back as it arrives - streamed answers included - until upstream closes)
+pub fn forward_body(mut client: impl Write, upstream: &Target, req: &Request, body: &[u8]) -> Result<(), String> {
+    let head = String::from_utf8_lossy(&req.head);
+    let mut lines = head.split("\r\n").filter(|l| !l.is_empty());
+    let mut out = format!("{}\r\n", lines.next().unwrap_or(""));
+    for l in lines {
+        let k = l.split(':').next().unwrap_or("").trim();
+        if ["content-length", "connection", "transfer-encoding"].iter().any(|h| k.eq_ignore_ascii_case(h)) {
+            continue;
+        }
+        out.push_str(l);
+        out.push_str("\r\n");
+    }
+    out.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()));
+    let mut up = Conn::connect(upstream).map_err(|e| format!("{upstream} does not answer ({e})"))?;
+    up.write_all(out.as_bytes()).and_then(|_| up.write_all(body)).and_then(|_| up.flush()).map_err(|e| e.to_string())?;
+    std::io::copy(&mut up, &mut client).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `call` with a read timeout of `secs`
+pub fn call_for(t: &Target, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, String> {
+    let (status, mut r) = send(t, method, path, body)?;
+    r.get_ref().set_read_timeout(Some(Duration::from_secs(secs))).map_err(|e| e.to_string())?;
+    let mut all = String::new();
+    r.read_to_string(&mut all).map_err(|e| e.to_string())?;
+    let v: Value = if all.trim().is_empty() { Value::Null } else { serde_json::from_str(&all).map_err(|e| format!("the answer is not JSON: {e}"))? };
+    if status == 200 {
+        Ok(v)
+    } else {
+        Err(v["error"]["message"].as_str().or_else(|| v["error"].as_str()).unwrap_or("request failed").to_string())
+    }
+}
+
 /// `http://host:port/path` -> (`host:port`, `/path`); plain http only
 pub fn split_url(url: &str) -> Result<(String, String), String> {
     let rest = url.strip_prefix("http://").ok_or_else(|| format!("{url}: only http:// URLs"))?;
@@ -253,14 +288,5 @@ pub fn send(t: &Target, method: &str, path: &str, body: Option<&Value>) -> Resul
 
 /// One request; the JSON answer, or an error carrying the answer's message.
 pub fn call(t: &Target, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
-    let (status, mut r) = send(t, method, path, body)?;
-    r.get_ref().set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
-    let mut all = String::new();
-    r.read_to_string(&mut all).map_err(|e| e.to_string())?;
-    let v: Value = if all.trim().is_empty() { Value::Null } else { serde_json::from_str(&all).map_err(|e| format!("the answer is not JSON: {e}"))? };
-    if status == 200 {
-        Ok(v)
-    } else {
-        Err(v["error"]["message"].as_str().or_else(|| v["error"].as_str()).unwrap_or("request failed").to_string())
-    }
+    call_for(t, method, path, body, 60)
 }

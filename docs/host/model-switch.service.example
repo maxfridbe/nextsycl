@@ -1,0 +1,15 @@
+# /etc/systemd/system/model-switch.service - one OpenAI endpoint for a chat front end (Open WebUI) over the one model
+# server that runs at a time; swaps through the video studio's llm.mode (it knows when a render holds a card)
+[Unit]
+Description=Model switcher (nextsycl switch, :8001 -> :8085)
+After=network.target nextsycl-video-studio.service
+
+[Service]
+User=you
+Environment=NS_REGISTRY=/var/lib/nextsycl/models.json
+ExecStart=/bin/sh -c "exec /path/to/nextsycl/dist/nextsycl switch --port 8001 --upstream 127.0.0.1:8085 --studio http://127.0.0.1:8090/rpc/llm.mode"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

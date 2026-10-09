@@ -234,6 +234,11 @@ of IQ2_XXS instead could win twice.
       frame's eight host round trips (draws on the GPU, the frame as one graph); the depth decoder's seven passes
       read 8 GB a frame in half - int8 only, or a smaller form. Tried: the flow stage beside the frames on a second
       queue of the same card (the card takes the two in turns: 118 -> 114.5 s; dropped)
+- [x] The last Python on the serving path ported (2026-10-09): the model switcher (`nextsycl switch`, glue/serve
+      switch.rs) and the GPU telemetry sampler (`nextsycl gpustat`, gpustat.rs), checked side by side with the scripts
+      (the same JSON field for field; models list, aliases, plain and streamed answers) and in service on the GPU box
+      (the Python units kept as *.bak-python). What is left outside Rust + SYCL there: the chat front end (Open WebUI,
+      third-party), and dev tools (reference/ dumpers, the screenshot script, the page smoke test)
 - [ ] Music: the two cards together as the reference runs (the language model on one, flow + decoder on the other,
       the windows streamed between them) when chat is not on the B65; `audio start | stop | ps`; 32 kHz output (the
       reference server resamples); the caption rewriter (MiniMax's music-caption-rewriter skill) as an option

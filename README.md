@@ -243,6 +243,27 @@ added or disabled shows at once. With `NS_STUDIO_MODES` set to a mode file (one 
 leaves the others alone. `nextsycl llm start <id>` mounts the entry's files at the same paths in the container, so an
 entry can point anywhere on the machine.
 
+## Host services
+
+Two small services sit beside the model servers, both in the program (no Python on the serving path):
+
+```sh
+nextsycl switch [--port 8001] [--upstream 127.0.0.1:8085] [--studio http://127.0.0.1:8090/rpc/llm.mode] [--alias OLD=NEW]...
+nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once]     # as root
+```
+
+- **`switch`**: one OpenAI endpoint for a chat front end over the one model server that runs at a time. It lists the
+  registry's enabled chat models (read on every request); a request naming another model asks the video studio to
+  swap (`llm.mode`: it knows when a render holds a card), waits until the server answers as that model, and passes the
+  request through, streamed answers included. The loaded model is not swapped out while it answers or within 90 s of
+  its last request (that request gets a 409 naming it). Per entry: `tools: false` drops tool definitions, `tasks:
+  false` declines a front end's background tasks. `--alias` keeps old model ids working.
+- **`gpustat`**: the card's telemetry every few seconds into a JSON file the pages read: VRAM used (the DRM clients'
+  `drm-resident-vram0` in /proc/*/fdinfo - root only) and total, busy %, power over a 15 s window, the power cap,
+  temperatures, fan, the PCIe link it trained at and what the card and slot could do.
+
+Example units: `docs/host/*.service.example`.
+
 ## Engine options: `--opt-NAME`
 
 Every engine declares the options it takes beyond its kind's common ones; any command forwards them to it:

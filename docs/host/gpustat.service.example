@@ -1,0 +1,11 @@
+# /etc/systemd/system/gpustat.service - GPU telemetry for pages' GPU pills (root: VRAM comes from /proc/*/fdinfo)
+[Unit]
+Description=GPU telemetry (nextsycl gpustat) -> /run/gpustat.json
+
+[Service]
+ExecStart=/bin/sh -c "exec /path/to/nextsycl/dist/nextsycl gpustat --out /run/gpustat.json --interval 3"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

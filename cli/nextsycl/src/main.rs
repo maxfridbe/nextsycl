@@ -14,6 +14,7 @@ mod bench;
 mod client;
 mod container;
 mod audio;
+mod host;
 mod image;
 mod video;
 mod service;
@@ -49,6 +50,12 @@ every kind:
   nextsycl models remove <id> [--files]     --files: its files deleted too
   nextsycl models enable <id> | disable <id>
   nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
+  nextsycl switch [--port 8001] [--upstream 127.0.0.1:8085] [--studio URL] [--alias OLD=NEW]...
+                                the chat front end's model switcher: every registered chat model on one endpoint,
+                                a swap (through the studio's llm.mode) when a request names another
+  nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once]
+                                GPU telemetry (VRAM from the DRM clients, busy %, power, temperatures, the PCIe link)
+                                into a JSON file, as root
   nextsycl version
 
 language models (nextsycl llm ...; the names without `llm` still work):
@@ -883,6 +890,8 @@ fn main() -> ExitCode {
         }
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),
         Some("gpus") => gpus(),
+        Some("switch") => host::switch(rest),
+        Some("gpustat") => host::gpustat(rest),
         Some("tokenize") if args.len() == 3 => tokenize(Path::new(&args[1]), &args[2]),
         Some("generate") => generate(&args),
         Some("serve") => serve_cmd(&args),

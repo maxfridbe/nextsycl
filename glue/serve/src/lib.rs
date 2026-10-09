@@ -5,9 +5,11 @@
 
 pub mod audio;
 pub mod cache;
+pub mod gpustat;
 pub mod http;
 pub mod image;
 pub mod serve;
+pub mod switch;
 pub mod telemetry;
 pub mod video;
 
