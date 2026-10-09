@@ -464,7 +464,7 @@ fn generate(args: &[String]) -> Result<(), String> {
             .split([',', ' ', '\n']).filter(|v| !v.trim().is_empty())
             .map(|v| v.trim().parse::<u32>().map_err(|_| format!("{p}: {v:?} is not a token id")))
             .collect::<Result<Vec<u32>, String>>()?,
-        None => tok.encode(&chat_of(&f)?(&[ns_tok::Message { role: "user", content: &prompt, reasoning: None }], effort)),
+        None => tok.encode(&chat_of(&f)?(&[ns_tok::Message { role: "user", content: &prompt, ..Default::default() }], effort, &[])),
     };
     let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let expert_gib: Option<f64> = opt("--expert-gib").and_then(|v| v.parse().ok());
@@ -553,7 +553,7 @@ fn batch_check(args: &[String]) -> Result<(), String> {
     let tok = ns_tok::Tokenizer::from_gguf(&f)?;
     let chat = chat_of(&f)?;
     let ids: Vec<Vec<u32>> = prompts.iter()
-        .map(|p| tok.encode(&chat(&[ns_tok::Message { role: "user", content: p, reasoning: None }], ns_tok::Effort::Low)))
+        .map(|p| tok.encode(&chat(&[ns_tok::Message { role: "user", content: p, ..Default::default() }], ns_tok::Effort::Low, &[])))
         .collect();
     let ctx = ids.iter().map(|v| v.len()).max().unwrap_or(0) + n + 8;
     let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
@@ -637,7 +637,7 @@ fn spec_check(args: &[String]) -> Result<(), String> {
     let gpus: Vec<usize> = opt("--gpu").unwrap_or_else(|| "0,1".into()).split(',').map(|v| v.trim().parse().map_err(|_| format!("--gpu {v}"))).collect::<Result<_, _>>()?;
     let f = Gguf::open(Path::new(model)).map_err(|e| e.0)?;
     let tok = ns_tok::Tokenizer::from_gguf(&f)?;
-    let ids = tok.encode(&chat_of(&f)?(&[ns_tok::Message { role: "user", content: &prompt, reasoning: None }], ns_tok::Effort::Low));
+    let ids = tok.encode(&chat_of(&f)?(&[ns_tok::Message { role: "user", content: &prompt, ..Default::default() }], ns_tok::Effort::Low, &[]));
     let gs: Vec<std::sync::Arc<ns_core::Gpu>> = gpus.iter().map(|i| ns_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let mut log = |l: String| eprintln!("[{l}]");
     let eng = load_engine(&f, &gs, LoadOptions { expert_bytes: None, mirror_bytes: None, draft: true, kv: (ids.len() + n + 4, 2) }, &mut log)?;

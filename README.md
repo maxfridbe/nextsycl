@@ -48,6 +48,10 @@ each context length: [Speed by model](#speed-by-model).
   `NS_CACHE_TTL_HOURS` (24) is removed, and past the size budget the least recently used go first.
 - **An OpenAI-compatible server** with streaming and the thinking split out, run as a service: `nextsycl start`,
   `stop`, `status`, `ps`, `cache`, `chat`, `logs`, over a control socket.
+- **Tool calls (Qwen3.8-Flash-Next):** OpenAI's `tools` go into the model's own template (its `<tools>` list and
+  `<tool_call><function=..><parameter=..>` format); the answer's calls come back as `tool_calls`, each argument typed
+  by the tool's schema, with `finish_reason: "tool_calls"`, streamed or not; `tool` messages and earlier calls are
+  written back in the template's form. The text before a call streams as it comes. GLM-5.3 takes no tools yet.
 - **Energy and logprobs in every answer:** `usage.energy_wh` (and `energy_wh` on `/api/chat`'s last line) - the watt-hours
   both cards drew for the request; `logprobs: true` (+ `top_logprobs`, up to 20) returns each answer token's
   log-probability and the likeliest alternatives, as OpenAI's `choices[0].logprobs.content`, streamed or not.

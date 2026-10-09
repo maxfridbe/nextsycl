@@ -202,7 +202,12 @@ of IQ2_XXS instead could win twice.
       the row that verifies it. 18 requests (3 prompts x 3 seeds, 400 tokens), host draws vs coupled: 0.7 63.6% ->
       68.9% of drafts accepted, 56.6 -> 59.6 tok/s; 1.0 59.9% -> 70.1%, 55.4 -> 58.7. Greedy unchanged (the same
       text); a request's `seed` replays its text. NS_QW_COUPLED=0: the host draws
-- [ ] qwen4exp: tools (dropped today), the decode window's 4-row cost (28 ms in Strata, 32 here)
+- [x] Tool calls on Qwen3.8-Flash-Next: the template's tool path (ns_tok::qwen_chat with the request's tools, the
+      `tool` role, earlier calls), the calls parsed out of the answer (qwen_tool_calls) into OpenAI's tool_calls,
+      arguments typed by the schema, held back from the stream; a weather round trip (call, result, answer) through
+      the switcher, streamed and not
+- [ ] GLM-5.3's tool path (its template's <tool_call> form)
+- [ ] qwen4exp: the decode window's 4-row cost (28 ms in Strata, 32 here)
 - [ ] qwen4exp's first pass: a model just loaded decodes 10-20% slower than the same prompts run again on the same
       load (IQ2_XS 2K-8K 69-71 vs 81-83 tok/s; the Coder 65-68 vs 76-78), with the same tokens and drafts accepted
       and the GPU at 2.8 GHz. Not host memory: the Coder with every expert in VRAM (two cards) shows it too (57-62 vs

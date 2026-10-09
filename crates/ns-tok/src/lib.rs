@@ -199,16 +199,27 @@ impl Effort {
 }
 
 /// One message of a conversation.
+#[derive(Default)]
 pub struct Message<'a> {
     pub role: &'a str,
     pub content: &'a str,
     /// an assistant turn's thinking, when kept
     pub reasoning: Option<&'a str>,
+    /// an assistant turn's tool calls
+    pub calls: &'a [ToolCall],
+}
+
+/// A tool call of an assistant turn: the function and its arguments, each value as the template writes it (a string
+/// as itself, anything else as JSON)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ToolCall {
+    pub name: String,
+    pub args: Vec<(String, String)>,
 }
 
 /// GLM-5.3's chat template (`tokenizer.chat_template`), its text-only, tool-free path: `[gMASK]<sop>`, the effort
 /// line, the turns, then `<|assistant|><think>` to generate.
-pub fn glm_chat(messages: &[Message], effort: Effort) -> String {
+pub fn glm_chat(messages: &[Message], effort: Effort, _tools: &[String]) -> String {
     let mut s = String::from("[gMASK]<sop>");
     s += match effort {
         Effort::Low => "<|system|>Reasoning Effort: Low",
@@ -238,19 +249,76 @@ pub fn glm_chat(messages: &[Message], effort: Effort) -> String {
     s
 }
 
-/// Qwen3.8-Flash-Next's chat template (ChatML), its text-only, tool-free path: an optional system turn, the turns
-/// (an assistant turn without its old thinking, as the template drops it), then `<|im_start|>assistant\n<think>\n`.
-/// The model has no effort levels: it thinks (the template's default `enable_thinking`).
-pub fn qwen_chat(messages: &[Message], _effort: Effort) -> String {
+/// Qwen3.8-Flash-Next's chat template (ChatML): an optional system turn, the turns (an assistant turn without its old
+/// thinking, as the template drops it), then `<|im_start|>assistant\n<think>\n`. The model has no effort levels: it
+/// thinks (the template's default `enable_thinking`). With `tools` (each a tool's JSON as the template's `tojson`
+/// writes it) the template's tool path: a system turn listing them with the call format (the leading system messages
+/// merged after it), an assistant turn's calls as `<tool_call><function=..><parameter=..>` blocks, and the `tool`
+/// messages as `<tool_response>` blocks in one user turn.
+pub fn qwen_chat(messages: &[Message], _effort: Effort, tools: &[String]) -> String {
     let mut s = String::new();
-    for m in messages {
+    let mut first = 0;
+    if !tools.is_empty() {
+        let mut sys = Vec::new();
+        while first < messages.len() && matches!(messages[first].role, "system" | "developer") {
+            let c = messages[first].content.trim();
+            if !c.is_empty() {
+                sys.push(c);
+            }
+            first += 1;
+        }
+        s += "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for t in tools {
+            s += "\n";
+            s += t;
+        }
+        s += "\n</tools>";
+        s += QWEN_TOOL_FORMAT;
+        if !sys.is_empty() {
+            s += "\n\n";
+            s += &sys.join("\n");
+        }
+        s += "<|im_end|>\n";
+    }
+    let ms = &messages[first..];
+    for (k, m) in ms.iter().enumerate() {
         match m.role {
-            "system" | "user" | "assistant" => {
+            "system" | "user" => {
                 s += "<|im_start|>";
                 s += m.role;
                 s += "\n";
-                s += if m.role == "assistant" { m.content.trim() } else { m.content };
+                s += m.content;
                 s += "<|im_end|>\n";
+            }
+            "assistant" => {
+                s += "<|im_start|>assistant\n";
+                let c = m.content.trim();
+                s += c;
+                for (i, call) in m.calls.iter().enumerate() {
+                    s += if i > 0 { "\n<tool_call>\n<function=" } else if c.is_empty() { "<tool_call>\n<function=" } else { "\n\n<tool_call>\n<function=" };
+                    s += &call.name;
+                    s += ">\n";
+                    for (k, v) in &call.args {
+                        s += "<parameter=";
+                        s += k;
+                        s += ">\n";
+                        s += v;
+                        s += "\n</parameter>\n";
+                    }
+                    s += "</function>\n</tool_call>";
+                }
+                s += "<|im_end|>\n";
+            }
+            "tool" => {
+                if k == 0 || ms[k - 1].role != "tool" {
+                    s += "<|im_start|>user";
+                }
+                s += "\n<tool_response>\n";
+                s += m.content.trim();
+                s += "\n</tool_response>";
+                if k + 1 == ms.len() || ms[k + 1].role != "tool" {
+                    s += "<|im_end|>\n";
+                }
             }
             _ => {}
         }
@@ -259,14 +327,82 @@ pub fn qwen_chat(messages: &[Message], _effort: Effort) -> String {
     s
 }
 
+/// The template's call-format instructions after the tool list
+const QWEN_TOOL_FORMAT: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+
+/// The tool calls in a Qwen answer (`<tool_call><function=NAME><parameter=P>\nvalue\n</parameter>...`): the text
+/// before the first call, and each call's name and raw parameter values (a value's single leading and trailing
+/// newline dropped, as the template writes them)
+pub fn qwen_tool_calls(answer: &str) -> (String, Vec<ToolCall>) {
+    let Some(start) = answer.find("<tool_call>") else { return (answer.to_string(), Vec::new()) };
+    let mut calls = Vec::new();
+    let mut rest = &answer[start..];
+    while let Some(i) = rest.find("<tool_call>") {
+        let body_start = i + "<tool_call>".len();
+        let end = rest[body_start..].find("</tool_call>").map_or(rest.len(), |e| body_start + e);
+        let body = &rest[body_start..end];
+        if let Some(f) = body.find("<function=") {
+            let after = &body[f + "<function=".len()..];
+            if let Some(gt) = after.find('>') {
+                let name = after[..gt].trim().to_string();
+                let mut args = Vec::new();
+                let mut p = &after[gt + 1..];
+                while let Some(a) = p.find("<parameter=") {
+                    let q = &p[a + "<parameter=".len()..];
+                    let Some(gt) = q.find('>') else { break };
+                    let key = q[..gt].trim().to_string();
+                    let v = &q[gt + 1..];
+                    let close = v.find("</parameter>").or_else(|| v.find("<parameter=")).or_else(|| v.find("</function>")).unwrap_or(v.len());
+                    let mut val = &v[..close];
+                    val = val.strip_prefix('\n').unwrap_or(val);
+                    val = val.strip_suffix('\n').unwrap_or(val);
+                    args.push((key, val.to_string()));
+                    p = &v[close..];
+                }
+                if !name.is_empty() {
+                    calls.push(ToolCall { name, args });
+                }
+            }
+        }
+        rest = &rest[(end + "</tool_call>".len()).min(rest.len())..];
+    }
+    (answer[..start].trim_end().to_string(), calls)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn qwens_template() {
-        let m = [Message { role: "user", content: "Hi", reasoning: None }];
-        assert_eq!(qwen_chat(&m, Effort::Low), "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n");
+        let m = [Message { role: "user", content: "Hi", ..Default::default() }];
+        assert_eq!(qwen_chat(&m, Effort::Low, &[]), "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n");
+    }
+
+    #[test]
+    fn qwens_tool_turns() {
+        let calls = [ToolCall { name: "get_weather".into(), args: vec![("city".into(), "Paris".into()), ("days".into(), "3".into())] }];
+        let m = [Message { role: "system", content: "Be brief.", ..Default::default() },
+                 Message { role: "user", content: "Weather?", ..Default::default() },
+                 Message { role: "assistant", content: "", calls: &calls, ..Default::default() },
+                 Message { role: "tool", content: "sunny", ..Default::default() }];
+        let s = qwen_chat(&m, Effort::Low, &["{\"type\": \"function\"}".to_string()]);
+        assert!(s.starts_with("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\"}\n</tools>"));
+        assert!(s.contains("</IMPORTANT>\n\nBe brief.<|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n"));
+        assert!(s.contains("<|im_start|>assistant\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>\n"));
+        assert!(s.ends_with("<|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"));
+    }
+
+    #[test]
+    fn qwens_tool_calls_parse() {
+        let a = "Let me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=note>\ntwo\nlines\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=now>\n</function>\n</tool_call>";
+        let (text, calls) = qwen_tool_calls(a);
+        assert_eq!(text, "Let me check.");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].args, vec![("city".to_string(), "Paris".to_string()), ("note".to_string(), "two\nlines".to_string())]);
+        assert_eq!(calls[1], ToolCall { name: "now".into(), args: vec![] });
+        assert_eq!(qwen_tool_calls("plain"), ("plain".to_string(), vec![]));
     }
 
     #[test]
@@ -299,7 +435,7 @@ mod tests {
 
     #[test]
     fn the_template() {
-        let m = [Message { role: "user", content: "Hi", reasoning: None }];
-        assert_eq!(glm_chat(&m, Effort::Low), "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Hi<|assistant|><think>");
+        let m = [Message { role: "user", content: "Hi", ..Default::default() }];
+        assert_eq!(glm_chat(&m, Effort::Low, &[]), "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Hi<|assistant|><think>");
     }
 }

@@ -58,7 +58,7 @@ use ns_runtime::{Decoder, Engine, Session};
 use crate::cache::PromptCache;
 use crate::telemetry::Telemetry;
 use crate::http::{self, Conn};
-use ns_tok::{Effort, Message, Tokenizer};
+use ns_tok::{Effort, Message, Tokenizer, ToolCall};
 use serde_json::{json, Value};
 
 use crate::{sample, Rng};
@@ -104,8 +104,18 @@ pub struct Server {
 }
 
 /// A chat request, from either API.
+/// One message of a request: its role, text, kept thinking, and an assistant turn's tool calls
+struct Msg {
+    role: String,
+    content: String,
+    reasoning: Option<String>,
+    calls: Vec<ToolCall>,
+}
+
 struct Ask {
-    messages: Vec<(String, String, Option<String>)>,
+    messages: Vec<Msg>,
+    /// OpenAI's `tools` (functions the model may call; none when `tool_choice` is "none")
+    tools: Vec<Value>,
     effort: Effort,
     max: Option<usize>,
     temp: f32,
@@ -344,6 +354,72 @@ fn preview(s: &str) -> String {
 }
 
 /// A message's text: a string, or the text parts of a list.
+/// An assistant message's tool calls (OpenAI's `tool_calls`: each `function` with its `arguments`, a JSON string or an
+/// object), each value as the chat template writes it: a string as itself, anything else as JSON
+fn calls_of(v: &Value) -> Vec<ToolCall> {
+    v.as_array().map_or_else(Vec::new, |a| a.iter().filter_map(|c| {
+        let f = if c["function"].is_object() { &c["function"] } else { c };
+        let name = f["name"].as_str()?.to_string();
+        let args = match &f["arguments"] {
+            Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+            x => x.clone(),
+        };
+        let args = args.as_object().map_or_else(Vec::new, |o| o.iter().map(|(k, v)| {
+            (k.clone(), match v { Value::String(s) => s.clone(), x => py_json(x) })
+        }).collect());
+        Some(ToolCall { name, args })
+    }).collect())
+}
+
+/// JSON as the chat templates' `tojson` writes it (Python's json.dumps: ", " and ": ", non-ASCII as is)
+fn py_json(v: &Value) -> String {
+    match v {
+        Value::Array(a) => format!("[{}]", a.iter().map(py_json).collect::<Vec<_>>().join(", ")),
+        Value::Object(o) => format!("{{{}}}", o.iter().map(|(k, v)| format!("{}: {}", Value::String(k.clone()), py_json(v))).collect::<Vec<_>>().join(", ")),
+        x => x.to_string(),
+    }
+}
+
+/// A call's arguments as a JSON object: each value by its parameter's type in the tool's schema (a string as given;
+/// numbers, booleans, objects and arrays parsed, a value that does not parse kept as a string)
+fn typed_args(tools: &[Value], c: &ToolCall) -> Value {
+    let props = tools.iter().map(|t| if t["function"].is_object() { &t["function"] } else { t })
+        .find(|f| f["name"].as_str() == Some(&c.name)).map(|f| &f["parameters"]["properties"]);
+    let mut o = serde_json::Map::new();
+    for (k, raw) in &c.args {
+        let ty = props.and_then(|p| p[k]["type"].as_str()).unwrap_or("string");
+        let v = if ty == "string" { Value::String(raw.clone()) } else { serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.clone())) };
+        o.insert(k.clone(), v);
+    }
+    Value::Object(o)
+}
+
+/// The end of `text` that can go out now (from `sent`): up to a "<tool_call>", short of any tail that could be its
+/// start, and short of trailing whitespace (the blank line before a call is not the answer's)
+fn safe_end(text: &str, sent: usize) -> usize {
+    const MARK: &str = "<tool_call>";
+    let mut end = text.find(MARK).unwrap_or(text.len());
+    if end == text.len() {
+        for k in (1..MARK.len()).rev() {
+            if text.len() >= k && text.is_char_boundary(text.len() - k) && MARK.starts_with(&text[text.len() - k..]) {
+                end = text.len() - k;
+                break;
+            }
+        }
+    }
+    text[..end].trim_end().len().max(sent)
+}
+
+/// The assistant message of a non-streamed answer: its text (null when it is only tool calls), its thinking, its calls
+fn message_json(text: &str, reasoning: &str, calls: &[Value]) -> Value {
+    let mut m = json!({"role": "assistant", "content": if text.is_empty() && !calls.is_empty() { Value::Null } else { json!(text) },
+                       "reasoning_content": reasoning});
+    if !calls.is_empty() {
+        m["tool_calls"] = json!(calls.iter().map(|c| { let mut c = c.clone(); c.as_object_mut().map(|o| o.remove("index")); c }).collect::<Vec<_>>());
+    }
+    m
+}
+
 fn text_of(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -581,9 +657,16 @@ impl Server {
     /// A request's body as an `Ask` (OpenAI's fields, or /api/chat's).
     fn ask(&self, req: &Value, api: Api) -> Result<Ask, String> {
         let thinking_key = if api == Api::Lines { "thinking" } else { "reasoning_content" };
-        let messages = req["messages"].as_array().ok_or("messages are required")?.iter().map(|m| {
-            (m["role"].as_str().unwrap_or("user").to_string(), text_of(&m["content"]), m[thinking_key].as_str().map(str::to_string))
+        let messages = req["messages"].as_array().ok_or("messages are required")?.iter().map(|m| Msg {
+            role: m["role"].as_str().unwrap_or("user").to_string(),
+            content: text_of(&m["content"]),
+            reasoning: m[thinking_key].as_str().map(str::to_string),
+            calls: calls_of(&m["tool_calls"]),
         }).collect();
+        let tools = match (api, req["tool_choice"].as_str()) {
+            (Api::OpenAi, Some("none")) | (Api::Lines, _) => Vec::new(),
+            _ => req["tools"].as_array().cloned().unwrap_or_default(),
+        };
         let effort = match api {
             Api::Lines => req["effort"].as_str(),
             Api::OpenAi => req["reasoning_effort"].as_str().or_else(|| req["chat_template_kwargs"]["reasoning_effort"].as_str()),
@@ -593,7 +676,7 @@ impl Server {
             None => self.default_effort,
         };
         let chain = req["logprob_chain"].as_bool().or_else(|| req["LogProbChain"].as_bool()).unwrap_or(false);
-        Ok(Ask { messages, effort,
+        Ok(Ask { messages, tools, effort,
                  max: req["max_tokens"].as_u64().or_else(|| req["max_completion_tokens"].as_u64()).map(|n| n as usize),
                  temp: req["temperature"].as_f64().unwrap_or(1.0) as f32,
                  top_p: req["top_p"].as_f64().unwrap_or(0.95) as f32,
@@ -978,8 +1061,10 @@ impl Server {
     // ------------------------------------------------------------------ a request's thread
 
     fn chat(&self, s: &mut Conn, ask: &Ask, api: Api, cors: &str, via: &str, rid_out: &mut u64) -> Result<(), String> {
-        let messages: Vec<Message> = ask.messages.iter().map(|(r, c, rc)| Message { role: r, content: c, reasoning: rc.as_deref() }).collect();
-        let ids = self.tok.encode(&(self.chat)(&messages, ask.effort));
+        let messages: Vec<Message> = ask.messages.iter()
+            .map(|m| Message { role: &m.role, content: &m.content, reasoning: m.reasoning.as_deref(), calls: &m.calls }).collect();
+        let tools: Vec<String> = ask.tools.iter().map(py_json).collect();
+        let ids = self.tok.encode(&(self.chat)(&messages, ask.effort, &tools));
         if ids.len() + 16 > self.max_ctx {
             return Err(format!("the prompt is {} tokens; the context is {}", ids.len(), self.max_ctx));
         }
@@ -995,14 +1080,14 @@ impl Server {
             Effort::High => "high",
             Effort::Max => "max",
         };
-        let last_user = ask.messages.iter().rev().find(|m| m.0 == "user").map_or("", |m| m.1.as_str());
+        let last_user = ask.messages.iter().rev().find(|m| m.role == "user").map_or("", |m| m.content.as_str());
         self.running.lock().unwrap().insert(rid, json!({"id": rid, "via": via, "state": "waiting", "started": now(), "prompt_tokens": ids.len(),
                                                     "max_tokens": max, "generated": 0, "model": self.name,
                                                     "api": if api == Api::Lines { "/api/chat" } else { "/v1/chat/completions" },
                                                     "settings": {"effort": effort, "temperature": round4(temp), "top_p": round4(top_p), "stream": stream,
                                                                  "max_tokens": max},
                                                     "messages": ask.messages.len(),
-                                                    "prompt_chars": ask.messages.iter().map(|m| m.1.len()).sum::<usize>(),
+                                                    "prompt_chars": ask.messages.iter().map(|m| m.content.len()).sum::<usize>(),
                                                     "last_user": preview(last_user)}));
         // the cards' energy counters at the start: the request's energy is their rise (other requests running at the
         // same time draw on the same counters)
@@ -1069,6 +1154,10 @@ impl Server {
         let t1 = Instant::now();
         let (mut lp_all, mut lp_pending): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
         let mut gone = false;
+        // with tools: the answer is streamed up to a tool call (and no part of "<tool_call>" before it is certain);
+        // the calls go out at the end, parsed
+        let tools_on = !ask.tools.is_empty();
+        let mut sent = 0usize;
         let (finish, accepted, drafted) = loop {
             let (next, lp) = match rx.recv() {
                 Ok(Ev::Tok(y, lp)) => (y, lp),
@@ -1119,6 +1208,15 @@ impl Server {
                 content.push_str(&piece);
                 parts.push((false, piece));
             }
+            if tools_on {
+                // the content parts: only what is certainly not a tool call
+                parts.retain(|p| p.0);
+                let safe = safe_end(&content, sent);
+                if safe > sent {
+                    parts.push((false, content[sent..safe].to_string()));
+                    sent = safe;
+                }
+            }
             if stream {
                 for (is_r, p) in parts {
                     let l = if is_r { Vec::new() } else { std::mem::take(&mut lp_pending) };
@@ -1153,6 +1251,23 @@ impl Server {
             self.remember(row);
         }
         let finish = if finish == "client gone" { "stop" } else { finish };
+        // the answer's tool calls (Qwen's <tool_call> blocks), as OpenAI's tool_calls
+        let (text, calls) = if tools_on { ns_tok::qwen_tool_calls(content.trim()) } else { (content.trim().to_string(), Vec::new()) };
+        let tool_calls: Vec<Value> = calls.iter().enumerate().map(|(i, c)| json!({
+            "index": i, "id": format!("call_{rid}_{i}"), "type": "function",
+            "function": {"name": c.name, "arguments": typed_args(&ask.tools, c).to_string()}})).collect();
+        let finish = if tool_calls.is_empty() { finish } else { "tool_calls" };
+        if tools_on && stream && api == Api::OpenAi {
+            // what was held back of the text before the calls (or all of it, when there were none)
+            let rest_end = if tool_calls.is_empty() { content.len() } else { content.find("<tool_call>").unwrap_or(content.len()) };
+            let rest = if rest_end > sent { content[sent..rest_end].trim_end().to_string() } else { String::new() };
+            if !rest.is_empty() {
+                emit(s, false, rest, std::mem::take(&mut lp_pending));
+            }
+            if !tool_calls.is_empty() {
+                send(s, json!({"tool_calls": tool_calls}), None);
+            }
+        }
         if api == Api::Lines {
             let mut end = json!({"done": true, "finish": finish, "model": self.name, "prompt_tokens": ids.len(), "reused": from, "generated": n,
                                  "read_seconds": prefill, "generate_seconds": dt, "tok_s": n as f64 / dt.max(1e-9), "energy_wh": wh});
@@ -1179,8 +1294,7 @@ impl Server {
                                                                       "choices": [], "usage": usage}));
         } else {
             http::respond_with(s, 200, &json!({"id": id, "object": "chat.completion", "created": now(), "model": self.name,
-                                    "choices": [{"index": 0, "message": {"role": "assistant", "content": content.trim(),
-                                                 "reasoning_content": reasoning.trim()}, "finish_reason": finish,
+                                    "choices": [{"index": 0, "message": message_json(&text, reasoning.trim(), &tool_calls), "finish_reason": finish,
                                                  "logprobs": if lp_on { json!({"content": lp_all}) } else { Value::Null }}],
                                     "usage": usage,
                                     "timings": {"prompt_n": ids.len() - from, "prompt_ms": prefill * 1000.0, "predicted_n": n,
@@ -1193,6 +1307,37 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::cors_headers;
+    use super::{calls_of, py_json, safe_end, typed_args};
+    use serde_json::json;
+
+    #[test]
+    fn tool_call_text_is_held_back() {
+        assert_eq!(safe_end("Hello <tool", 0), 5);
+        assert_eq!(safe_end("Hello <tool_call>\n<function=f>", 0), 5);
+        assert_eq!(safe_end("a < b", 0), 5);
+        assert_eq!(safe_end("Hello <", 3), 5);
+        assert_eq!(safe_end("x<tool_call>", 5), 5);
+        assert_eq!(safe_end("Line one.\n\n", 0), 9);
+        assert_eq!(safe_end("Line one.\n\nTwo", 0), 14);
+    }
+
+    #[test]
+    fn tool_arguments_follow_the_schema() {
+        let tools = [json!({"type": "function", "function": {"name": "f", "parameters": {"properties": {
+            "city": {"type": "string"}, "days": {"type": "integer"}, "opts": {"type": "object"}}}}})];
+        let c = ns_tok::ToolCall { name: "f".into(), args: vec![("city".into(), "42".into()), ("days".into(), "3".into()),
+                                                                   ("opts".into(), "{\"a\": 1}".into()), ("other".into(), "x".into())] };
+        assert_eq!(typed_args(&tools, &c), json!({"city": "42", "days": 3, "opts": {"a": 1}, "other": "x"}));
+    }
+
+    #[test]
+    fn calls_of_reads_openai_tool_calls() {
+        let v = json!([{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{\"city\": \"Paris\", \"days\": 3}"}}]);
+        let c = calls_of(&v);
+        assert_eq!(c[0].name, "f");
+        assert_eq!(c[0].args, vec![("city".to_string(), "Paris".to_string()), ("days".to_string(), "3".to_string())]);
+        assert_eq!(py_json(&json!({"a": [1, "x"], "b": {"c": true}})), "{\"a\": [1, \"x\"], \"b\": {\"c\": true}}");
+    }
 
     #[test]
     fn cors_lets_loopback_and_named_origins_in() {

@@ -273,7 +273,9 @@ pub type LoadFn = for<'g> fn(&'g Gguf, &[Arc<Gpu>], &LoadOptions, &mut dyn FnMut
 /// An engine's kernel test: the file, a GPU index
 pub type KernelsFn = fn(&std::path::Path, usize) -> std::result::Result<(), String>;
 /// An engine's chat template: the conversation as the prompt text to generate its next assistant turn
-pub type ChatFn = fn(&[ns_tok::Message], ns_tok::Effort) -> String;
+/// A model's chat template: the messages, the effort, and the request's tools (each tool's JSON; a template without a
+/// tool path ignores them)
+pub type ChatFn = fn(&[ns_tok::Message], ns_tok::Effort, &[String]) -> String;
 
 /// An engine's registry entry
 pub struct EngineKind {
