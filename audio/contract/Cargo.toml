@@ -1,0 +1,9 @@
+[package]
+name = "nextsycl-audio"
+description = "The audio engines' contract: a request, a waveform out, the progress, the registry entry an engine provides"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true

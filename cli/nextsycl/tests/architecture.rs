@@ -99,7 +99,7 @@ fn own_kernels_include_no_other_runtime() {
     const OTHERS: &[&str] = &["cuda", "vulkan", "CL/", "hip/", "Metal/", "level_zero/"];
     let k = root().join("kernels");
     let mut dirs = vec![k.join("ns")];
-    for kind in ["llm", "image", "video"] {
+    for kind in ["llm", "image", "video", "audio"] {
         if let Ok(rd) = std::fs::read_dir(k.join(kind)) {
             dirs.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
         }

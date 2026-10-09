@@ -30,7 +30,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 static API: OnceLock<std::result::Result<Api, String>> = OnceLock::new();
 static KIND: OnceLock<&'static str> = OnceLock::new();
 
-/// The kind whose kernel library this process uses ("llm", "image", "video"; `libnextsycl-<kind>.so`), set before the
+/// The kind whose kernel library this process uses ("llm", "image", "video", "audio"; `libnextsycl-<kind>.so`), set before the
 /// first GPU call - a process runs one kind. The default is "llm". False when the library was chosen already.
 pub fn use_kind(kind: &'static str) -> bool {
     KIND.set(kind).is_ok() && API.get().is_none()

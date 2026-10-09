@@ -13,6 +13,7 @@
 mod bench;
 mod client;
 mod container;
+mod audio;
 mod image;
 mod video;
 mod service;
@@ -33,13 +34,13 @@ pub const VERSION: &str = match option_env!("NS_VERSION") {
     None => "dev",
 };
 
-const USAGE: &str = "nextsycl - language, image and video models on Intel Arc GPUs (Rust + SYCL)
+const USAGE: &str = "nextsycl - language, image, video and audio models on Intel Arc GPUs (Rust + SYCL)
 
 every kind:
   nextsycl models [list] [--json]           the registry (NS_REGISTRY): every model this machine serves, its kind
   nextsycl models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M...]] [--set NAME=VALUE]...
                       [--no-tools] [--no-tasks] [--disabled]
-  nextsycl models search [TEXT] [--kind llm|image|video|lora]     the catalog of supported models
+  nextsycl models search [TEXT] [--kind llm|image|video|audio|lora]     the catalog of supported models
   nextsycl models pull <id>... [--dir DIR] [--from DIR]... [--verify] [--again]
                                 its files downloaded (resumed when run again; each checked by SHA-256) or linked
                                 (the same file already here; --from DIR: copies elsewhere on the machine), registered
@@ -89,6 +90,13 @@ images (nextsycl image ...):
 video (nextsycl video ...):
   nextsycl video engines        the architectures this build serves (H3's commands move here)
   nextsycl video selftest [--gpu N]  the video kernel library, an engine's own symbol, a kernel on the GPU
+
+audio (nextsycl audio ...):
+  nextsycl audio gen \"<description>\" --lyrics TEXT | --lyrics-file FILE [--seconds N] [--seed N] [--out FILE]
+                                a song (MiniMax Music 3), in this process (inside the image)
+  nextsycl audio check <dump dir> [--stages ar,dit,voc,chunks]    the engine against a reference's dumps
+  nextsycl audio engines        the architectures this build serves
+  nextsycl audio selftest [--gpu N]  the audio kernel library, an engine's own symbol, a kernel on the GPU
 
 settings (environment, or NAME=value lines in nextsycl.conf beside the repository or ~/.config/nextsycl.conf):
   NS_MODELS        host directory with the model files, seen as /models                  (required for start)
@@ -850,6 +858,7 @@ fn main() -> ExitCode {
         Some("llm") => llm(&cfg, &args[1..]),
         Some("image") => image::cmd(&cfg, &args[1..], |r| selftest("image", r, nextsycl_image_example::selftest)),
         Some("video") => video::cmd(&cfg, &args[1..], |r| selftest("video", r, nextsycl_video_example::selftest)),
+        Some("audio") => audio::cmd(&cfg, &args[1..], |r| selftest("audio", r, nextsycl_audio_example::selftest)),
         // the llm commands' names from before the kinds (nextsycl start = nextsycl llm start, ...)
         Some("start") => service::start(&cfg, rest),
         Some("models") => models::cmd(&cfg, rest, &|g: &Gguf| nextsycl_llm::kind_for(&engines(), g).map(|k| k.name.to_string())),

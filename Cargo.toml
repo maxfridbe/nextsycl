@@ -7,6 +7,7 @@ members = [
     "llm/contract", "llm/glm5next", "llm/qwen4exp", "llm/example",
     "image/contract", "image/example", "image/qwenimage21",
     "video/contract", "video/example", "video/h3",
+    "audio/contract", "audio/example", "audio/minimaxmusic3",
     "glue/models", "glue/serve",
     "cli/nextsycl",
 ]
@@ -33,6 +34,9 @@ nextsycl-image-qwenimage21 = { path = "image/qwenimage21" }
 nextsycl-video = { path = "video/contract" }
 nextsycl-video-example = { path = "video/example" }
 nextsycl-video-h3 = { path = "video/h3" }
+nextsycl-audio = { path = "audio/contract" }
+nextsycl-audio-example = { path = "audio/example" }
+nextsycl-audio-minimaxmusic3 = { path = "audio/minimaxmusic3" }
 nextsycl-models = { path = "glue/models" }
 nextsycl-serve = { path = "glue/serve" }
 serde_json = "1"

@@ -1,0 +1,10 @@
+[package]
+name = "nextsycl-audio-example"
+description = "A template audio engine: every part of the contract in place, nothing ported - copy it to port a model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-audio.workspace = true

@@ -276,7 +276,7 @@ mod tests {
         for m in v["models"].as_array().unwrap() {
             let id = s(m, "id");
             assert!(ids.insert(id.clone()), "{id} twice");
-            assert!(["llm", "image", "video", "lora"].contains(&s(m, "kind").as_str()), "{id}: a kind");
+            assert!(["llm", "image", "video", "audio", "lora"].contains(&s(m, "kind").as_str()), "{id}: a kind");
             for (role, key) in m["files"].as_object().unwrap() {
                 assert!(files.contains_key(key.as_str().unwrap()), "{id}: {role} names no file");
             }

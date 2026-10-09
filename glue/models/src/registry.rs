@@ -11,7 +11,7 @@
 //!   nextsycl models list [--json]
 //!   nextsycl models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M...]] [--set NAME=VALUE]...
 //!                       [--no-tools] [--no-tasks] [--disabled]
-//!   nextsycl models search [TEXT] [--kind llm|image|video|lora]     the catalog of supported models
+//!   nextsycl models search [TEXT] [--kind llm|image|video|audio|lora]     the catalog of supported models
 //!   nextsycl models pull <id>... [--dir DIR] [--from DIR]... [--verify] [--again]
 //!                                           a catalog model's files downloaded (or linked), checked, registered
 //!   nextsycl models pull <id> <url | hf:org/repo/path/file.gguf> [--dir DIR] [add's options]   a file outside it
@@ -30,7 +30,7 @@ use crate::config::Config;
 /// The program passes its engines' check, so this crate depends on no engine.
 pub type Describe<'a> = &'a dyn Fn(&nextsycl_gguf::Gguf) -> Result<String, String>;
 
-/// An entry's kind: "llm", "image", "video" or "lora" (entries from before kinds are llm)
+/// An entry's kind: "llm", "image", "video", "audio" or "lora" (entries from before kinds are llm)
 pub fn kind_of(m: &Value) -> &str {
     m.get("kind").and_then(|v| v.as_str()).unwrap_or("llm")
 }

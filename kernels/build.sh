@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# kernels/build.sh: the kernel libraries, one a kind - libnextsycl-llm.so, libnextsycl-image.so, libnextsycl-video.so -
+# kernels/build.sh: the kernel libraries, one a kind - libnextsycl-llm.so, libnextsycl-image.so, libnextsycl-video.so,
+# libnextsycl-audio.so -
 # each the shared part (kernels/ns: GPUs, memory, copies, the C ABI's core) and that kind's engines
 # (kernels/<kind>/<arch>; llm also kernels/strata, the imported Strata kernels). Runs inside the build image (oneAPI
 # 2026.1); ../build.sh starts it there.
@@ -31,7 +32,7 @@ LINK+=(-fsycl-device-code-split=per_kernel -shared -qmkl=sequential)
 
 # the diffusion kernels (diffusion/: H3's, shared by the image and video engines) and those engines' own are built as
 # H3 builds them - its flags, oneDNN (the build image's /opt/onednn, H3's patched 3.12) - so their numerics are H3's;
-# only the image and video libraries link oneDNN
+# only the image, video and audio libraries link oneDNN
 DNNL=${DNNL:-/opt/onednn}
 DIFFFLAGS=(-fsycl -std=c++20 -O3 -fPIC -Wno-unused-parameter -Wno-unused-variable -Wno-deprecated-declarations -I"$DNNL/include" -Ins -Idiffusion)
 [ -f "$DNNL/H3_SDPA_NO_FALLBACK" ] && DIFFFLAGS+=(-DNSD_SDPA_NO_FALLBACK)
@@ -39,7 +40,7 @@ DIFFFLAGS=(-fsycl -std=c++20 -O3 -fPIC -Wno-unused-parameter -Wno-unused-variabl
 
 # the sources: the shared part (ns/), the imported Strata kernels (strata/), and one directory a kind holding one
 # directory an engine (llm/<arch>/, image/<arch>/, video/<arch>/)
-KINDS="llm image video"
+KINDS="llm image video audio"
 all_sources() {
   ls $S/src/kernels/*.dp.cpp $S/src/prefill/*.dp.cpp ns/*.cpp diffusion/*.cpp 2>/dev/null
   for k in $KINDS; do ls $k/*/*.cpp 2>/dev/null; done
@@ -49,7 +50,7 @@ echo "==> compiling $(echo $SRCS | wc -w) sources (AOT ${AOT:-none}, $JOBS at a 
 fail=0
 printf '%s\n' $SRCS | xargs -P "$JOBS" -I{} sh -c '
   o="'$OBJ'/$(echo {} | tr / _).o"
-  case {} in diffusion/*|image/*|video/*) f="'"${DIFFFLAGS[*]}"'" ;; *) f="'"${CXXFLAGS[*]}"'" ;; esac
+  case {} in diffusion/*|image/*|video/*|audio/*) f="'"${DIFFFLAGS[*]}"'" ;; *) f="'"${CXXFLAGS[*]}"'" ;; esac
   if icpx $f -c {} -o "$o" 2> "$o.log"; then echo "ok   {}"; else echo "FAIL {}"; fi' | sort | tee "$OBJ/compile.txt"
 grep -q '^FAIL' "$OBJ/compile.txt" && fail=1
 if [ "$fail" = 1 ]; then
@@ -98,7 +99,7 @@ else
        -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate \
        -o "$OUT/.libnextsycl-flash.so.new" && mv -f "$OUT/.libnextsycl-flash.so.new" "$OUT/libnextsycl-flash.so"
 fi
-# oneDNN beside the image and video libraries (they find it there: rpath $ORIGIN)
+# oneDNN beside the image, video and audio libraries (they find it there: rpath $ORIGIN)
 cp -L "$DNNL/lib/libdnnl.so.3" "$OUT/.libdnnl.so.3.new" && mv -f "$OUT/.libdnnl.so.3.new" "$OUT/libdnnl.so.3"
 # the name before the split (libnextsycl.so = the llm library), for runners and services that still name it
 ln -sf libnextsycl-llm.so "$OUT/libnextsycl.so"

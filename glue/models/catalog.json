@@ -228,6 +228,66 @@
    "size": 1239664536,
    "sha256": "16f3195bc6bffa431c0598dc2031e520ba058b4fcbc9f104db9e3fdfdeacf60c",
    "path": "minimax-h3/loras/minimax_h3_lms_v1.0_r64.safetensors"
+  },
+  "mm3-lm-1": {
+   "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/resolve/fbdf52fbaaca799592917417eb05f1899f1255ec/language_model/model-00001-of-00004.safetensors",
+   "size": 4910103856,
+   "sha256": "1e95924a158b45b67cfad04fa0f0a352e5a263e69338734d7c1d558be776cc98",
+   "path": "minimax-music3/language_model/model-00001-of-00004.safetensors"
+  },
+  "mm3-lm-2": {
+   "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/resolve/fbdf52fbaaca799592917417eb05f1899f1255ec/language_model/model-00002-of-00004.safetensors",
+   "size": 4915960352,
+   "sha256": "fde2d335eef7eafa268d35e53d4b040ee51d2f3fa727f9855b4c97d88a2892da",
+   "path": "minimax-music3/language_model/model-00002-of-00004.safetensors"
+  },
+  "mm3-lm-3": {
+   "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/resolve/fbdf52fbaaca799592917417eb05f1899f1255ec/language_model/model-00003-of-00004.safetensors",
+   "size": 4983068496,
+   "sha256": "6549a831637ab678a573047e7fa8fdf966998c4f45330e6eb7573d67f7b9b4c6",
+   "path": "minimax-music3/language_model/model-00003-of-00004.safetensors"
+  },
+  "mm3-lm-4": {
+   "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/resolve/fbdf52fbaaca799592917417eb05f1899f1255ec/language_model/model-00004-of-00004.safetensors",
+   "size": 2359864688,
+   "sha256": "a1c9865f357b64d3ae9f428fb98a844831e5a0aee9ed17b19bd7f7be32b964a9",
+   "path": "minimax-music3/language_model/model-00004-of-00004.safetensors"
+  },
+  "mm3-transformer-1": {
+   "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/resolve/fbdf52fbaaca799592917417eb05f1899f1255ec/transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+   "size": 4959921384,
+   "sha256": "1943baebe93b5d5a57e9e1f603d9cef51a73a55e7a42f52913932dc06dcf10f0",
+   "path": "minimax-music3/transformer/diffusion_pytorch_model-00001-of-00002.safetensors"
+  },
+  "mm3-transformer-2": {
+   "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/resolve/fbdf52fbaaca799592917417eb05f1899f1255ec/transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+   "size": 4767750800,
+   "sha256": "b2f9e29d241e107e5a281f8b369d6db48eee983917df966c56d7b8dd0bd482c2",
+   "path": "minimax-music3/transformer/diffusion_pytorch_model-00002-of-00002.safetensors"
+  },
+  "mm3-depth": {
+   "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/resolve/fbdf52fbaaca799592917417eb05f1899f1255ec/rvq_depth_decoder/diffusion_pytorch_model.safetensors",
+   "size": 1292055248,
+   "sha256": "80e86ab006bb5c8d4f223205045035a1c77b2bb9c3be9a86d7e740bbafe5ddf0",
+   "path": "minimax-music3/rvq_depth_decoder/diffusion_pytorch_model.safetensors"
+  },
+  "mm3-condition": {
+   "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/resolve/fbdf52fbaaca799592917417eb05f1899f1255ec/condition_encoder/diffusion_pytorch_model.safetensors",
+   "size": 100671852,
+   "sha256": "83179c5eaa9a68a370affe0c1b96c2179f659ea4175666b31071490a202c2a4d",
+   "path": "minimax-music3/condition_encoder/diffusion_pytorch_model.safetensors"
+  },
+  "mm3-vocoder": {
+   "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/resolve/fbdf52fbaaca799592917417eb05f1899f1255ec/vocoder/diffusion_pytorch_model.safetensors",
+   "size": 216695272,
+   "sha256": "daf0bf0560ea978ce7b5ec3e82f420a44429efef18bdfbe3c714d55ceffbe934",
+   "path": "minimax-music3/vocoder/diffusion_pytorch_model.safetensors"
+  },
+  "mm3-tokenizer": {
+   "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/resolve/fbdf52fbaaca799592917417eb05f1899f1255ec/tokenizer/tokenizer.json",
+   "size": 11423801,
+   "sha256": "b1537fa9e59a537276ecbc2e12d0438edff635a1f4a4948e679774b5feb3e610",
+   "path": "minimax-music3/tokenizer/tokenizer.json"
   }
  },
  "models": [
@@ -729,6 +789,60 @@
     "lora": "h3-lora-lms"
    },
    "env": {}
+  },
+  {
+   "id": "minimax-music3",
+   "kind": "audio",
+   "arch": "minimax-music3",
+   "title": "MiniMax Music 3 (songs from lyrics and a description, up to 6 minutes, 44.1 kHz stereo)",
+   "about": "the 8B semantic language model (Qwen3-8B's shape) and RVQ depth decoder, the 2.4B flow-matching transformer, the Flow-VAE decoder (MiniMax's diffusers checkpoint)",
+   "files": {
+    "language-model-1": "mm3-lm-1",
+    "language-model-2": "mm3-lm-2",
+    "language-model-3": "mm3-lm-3",
+    "language-model-4": "mm3-lm-4",
+    "depth-decoder": "mm3-depth",
+    "transformer-1": "mm3-transformer-1",
+    "transformer-2": "mm3-transformer-2",
+    "condition-encoder": "mm3-condition",
+    "vocoder": "mm3-vocoder",
+    "tokenizer": "mm3-tokenizer"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "seconds": 60.0,
+    "steps": 30,
+    "cfg": 1.7
+   }
+  },
+  {
+   "id": "minimax-music3-int8",
+   "kind": "audio",
+   "arch": "minimax-music3",
+   "title": "MiniMax Music 3, its language model in int8 (half the VRAM, faster frames)",
+   "about": "the 8B semantic language model (Qwen3-8B's shape) and RVQ depth decoder, the 2.4B flow-matching transformer, the Flow-VAE decoder (MiniMax's diffusers checkpoint)",
+   "files": {
+    "language-model-1": "mm3-lm-1",
+    "language-model-2": "mm3-lm-2",
+    "language-model-3": "mm3-lm-3",
+    "language-model-4": "mm3-lm-4",
+    "depth-decoder": "mm3-depth",
+    "transformer-1": "mm3-transformer-1",
+    "transformer-2": "mm3-transformer-2",
+    "condition-encoder": "mm3-condition",
+    "vocoder": "mm3-vocoder",
+    "tokenizer": "mm3-tokenizer"
+   },
+   "gpus": "0",
+   "env": {
+    "NS_MM3_INT8": "1"
+   },
+   "defaults": {
+    "seconds": 60.0,
+    "steps": 30,
+    "cfg": 1.7
+   }
   }
  ]
 }

@@ -1,0 +1,15 @@
+[package]
+name = "nextsycl-audio-minimaxmusic3"
+description = "MiniMax Music 3: its 8B semantic language model, RVQ depth decoder, 2.4B flow transformer and Flow-VAE decoder on Intel Arc (SYCL)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
+nextsycl-audio.workspace = true
+fancy-regex = "0.14"
+serde_json.workspace = true
