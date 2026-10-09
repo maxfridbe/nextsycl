@@ -15,7 +15,7 @@ cards or on one with its cold experts in pinned host memory, the MTP draft layer
 graphs; verify passes and batches bit-exact, greedy output with drafts equal to output without. Every model's speed at
 each context length: [Speed by model](#speed-by-model). **Qwen-Image 2.1**
 (`image/qwenimage21`): text to image, its Qwen3-VL text encoder, 7B DiT and RGBA VAE all in SYCL, checked stage by
-stage against the reference on the same quantized files; 1024x1024 in 40 steps takes 25.7 s on the B70 (18.5 s with int8 weights), 44 s on the B65. The video
+stage against the reference on the same quantized files; 1024x1024 in 40 steps takes 24.1 s on the B70 (16.9 s with int8 weights), 44 s on the B65. The video
 engine (MiniMax H3) comes next.
 
 ## What it does
@@ -198,8 +198,8 @@ prompt, model, seed, size and steps. `check` compares each stage with the dumps 
 
 | Qwen-Image 2.1 Q8_0, one card | load | 512x512, 20 steps | 1024x1024, 40 steps |
 |---|---|---|---|
-| B70, `NS_QI_INT8=1` | 7 s (page cache) | 1.8 s | 18.5 s (0.43 s / step) |
-| B70, half | 6 s (page cache) | 2.7 s | 25.7 s (0.61 s / step) |
+| B70, `NS_QI_INT8=1` | 7 s (page cache) | 1.8 s | 16.9 s (0.40 s / step) |
+| B70, half | 6 s (page cache) | 2.6 s | 24.1 s (0.58 s / step) |
 | B65, half | 7 s (page cache) | 5.9 s | 44 s (1.07 s / step) |
 
 `NS_QI_INT8=1` (opt-in, in the environment or a registry entry's settings) keeps the DiT's block matrices as int8
@@ -208,9 +208,9 @@ the activations quantized per row on the fly - on the card's int8 rate, twice it
 Its cost against the reference: velocity 5.8e-3 (half 3e-4), the latents after 20 steps 1.8e-2 (cosine 0.9998); the
 1024x1024 fox against half's: PSNR 39.2 dB, mean pixel difference 0.57.
 
-Where a 1024x1024 step goes on the B70 (`NS_QI_PROFILE=1`), half: the DiT's linears through oneDNN at 150-170
-TFLOPS (~60%), attention (oneDNN's fused SDPA read in place, ~55 TFLOPS) ~22%. With int8 the linears drop to ~37%
-and attention is the largest part (~27%). The VAE adds 0.7 s a picture (0.45 s of it its 3x3 convolutions).
+Where a 1024x1024 step goes on the B70 (`NS_QI_PROFILE=1`), int8: the block matrices ~50%, attention ~16% (ARK's
+flash kernel on sycl-tla, `libnextsycl-flash.so`: 2.5 ms a block at 4k tokens, ~110 TFLOPS - oneDNN's fused SDPA
+took 5.0; `NSD_FLASH=0` goes back to it), norms, gates, SwiGLU and RoPE ~16%. The VAE adds 0.7 s a picture (0.45 s of it its 3x3 convolutions).
 
 ## Speed by model
 

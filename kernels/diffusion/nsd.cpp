@@ -115,6 +115,12 @@ struct Ctx {
     // nextsycl: prefix + block attention read in place through strides, by (rows, Skv, H, D, qs, kvs)
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>, Sdpa> sdpa_qk;
     bool sdpa_qk_direct_ok = true;
+    // nextsycl: flash attention from libnextsycl-flash.so (diffusion/flash), for prefix + block attention in half;
+    // NSD_FLASH=0: oneDNN's kernel
+    int flash_state = 0;                           // 0 not loaded yet, 1 ready, -1 unavailable
+    int (*flash_fn)(void*, const void*, const void*, const void*, void*, int64_t, int64_t, int64_t, int64_t, int64_t,
+                    int64_t, int64_t, float) = nullptr;
+    const char* (*flash_err)() = nullptr;
     bool sdpa_direct_ok = true;                    // false once oneDNN has refused the strided (copy-free) form
     float sdpa_scale = 0.0f;                       // 1 / sqrt(D): a host scalar oneDNN reads when the kernel runs
     bool sdpa_ok = true;                           // false once oneDNN has refused the fused form
@@ -1645,10 +1651,36 @@ static Ctx::Sdpa& sdpa_qk_for(Ctx& c, int64_t rows, int64_t Skv, int64_t H, int6
     return c.sdpa_qk.emplace(key, std::move(sd)).first->second;
 }
 
+// nextsycl: libnextsycl-flash.so beside this library, loaded once
+static bool flash_load(Ctx& c) {
+    if (c.flash_state) return c.flash_state > 0;
+    c.flash_state = -1;
+    if (const char* e = std::getenv("NSD_FLASH"); e && std::strcmp(e, "0") == 0) return false;
+    std::string path = "libnextsycl-flash.so";
+    Dl_info me;
+    if (dladdr((void*) &flash_load, &me) && me.dli_fname) {
+        std::string self = me.dli_fname;
+        const size_t slash = self.rfind('/');
+        if (slash != std::string::npos) path = self.substr(0, slash + 1) + path;
+    }
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) { std::fprintf(stderr, "nsd: no flash attention (%s); oneDNN's kernel\n", dlerror()); return false; }
+    c.flash_fn = (decltype(c.flash_fn)) dlsym(h, "nsflash_attention");
+    c.flash_err = (decltype(c.flash_err)) dlsym(h, "nsflash_error");
+    if (!c.flash_fn || !c.flash_err) { std::fprintf(stderr, "nsd: %s lacks nsflash_attention; oneDNN's kernel\n", path.c_str()); return false; }
+    c.flash_state = 1;
+    return true;
+}
+
 static void attention_fused_qk(Ctx& c, const void* q, int64_t Sq, int64_t qs, const void* k, const void* v, int64_t Skv,
                                int64_t kvs, int dt, int64_t H, int64_t D, void* out, int out_dt) {
     sycl::queue& qu = c.q;
     c.sdpa_scale = 1.0f / std::sqrt((float) D);
+    if (dt == NSD_F16 && out_dt == NSD_F16 && (D == 64 || D == 128) && flash_load(c)) {
+        if (c.flash_fn(&qu, q, k, v, out, Sq, Skv, H, D, qs, kvs, H * D, c.sdpa_scale) == 0) return;
+        std::fprintf(stderr, "nsd: flash attention refused (%s); oneDNN's kernel from here on\n", c.flash_err());
+        c.flash_state = -1;
+    }
     if (dt == NSD_F16 && out_dt == NSD_F16 && c.sdpa_qk_direct_ok) {
         try {
             const int64_t rows_max = std::min<int64_t>(Sq, c.attn_rows);

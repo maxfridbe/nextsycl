@@ -47,7 +47,8 @@ cli/
 kernels/                   SYCL ONLY - one library a kind (dist/libnextsycl-<kind>.so)
   ns/                     the shared part, linked into every kind's library: GPUs, memory, queues, copies, tickets
   strata/                 the imported Strata kernels (MIT), linked into the llm library
-  diffusion/              the shared diffusion kernels (H3's, on oneDNN), linked into the image and video libraries
+  diffusion/              the shared diffusion kernels (H3's, on oneDNN), linked into the image and video libraries;
+                          diffusion/flash: flash attention (ARK on sycl-tla) as libnextsycl-flash.so, loaded on use
   llm/<arch>/  image/<arch>/  video/<arch>/   an engine's own kernels and its header (ns_<kind>_<arch>_* symbols)
 ```
 

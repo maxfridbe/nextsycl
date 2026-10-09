@@ -79,6 +79,25 @@ for k in $KINDS; do
   echo "==> linking libnextsycl-$k.so"
   icpx "${LINK[@]}" $objs "${extra[@]}" -o "$OUT/.libnextsycl-$k.so.new" && mv -f "$OUT/.libnextsycl-$k.so.new" "$OUT/libnextsycl-$k.so"
 done
+# flash attention (diffusion/flash/flash.cpp -> libnextsycl-flash.so, loaded by the diffusion kernels on first use):
+# ARK's kernel on sycl-tla, with the flags sycl-tla wants; skipped when the build image lacks the headers or the
+# library is newer than its source (a compile of minutes)
+TLA=${NS_SYCL_TLA:-/opt/sycl-tla} ARK=${NS_ARK:-/opt/ark/auto_round_kernel}
+if [ ! -f "$ARK/wrapper/include/sycl_tla_sdpa.hpp" ]; then
+  echo "==> flash: skipped (no sycl-tla / ARK headers in this image)"
+elif [ "$OUT/libnextsycl-flash.so" -nt diffusion/flash/flash.cpp ]; then
+  echo "==> flash: up to date"
+else
+  echo "==> flash: libnextsycl-flash.so (sycl-tla, compiled ahead for ${AOT:-bmg-g31}; a few minutes)"
+  icpx -O3 -fsycl -fPIC -shared -std=c++17 -fno-sycl-instrument-device-code -w \
+       -DARK_XPU=1 -DARK_SYCL_TLA=1 -DCUTLASS_ENABLE_SYCL=1 -DSYCL_INTEL_TARGET=1 \
+       -isystem "$TLA/include" -isystem "$TLA/applications" -isystem "$TLA/tools/util/include" \
+       -isystem "$TLA/examples/common" -isystem "$TLA/examples/06_bmg_flash_attention" \
+       -I"$ARK/wrapper/include" -I"$ARK/bestla" diffusion/flash/flash.cpp \
+       -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen "-device ${AOT:-bmg-g31}" -Xspirv-translator \
+       -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate \
+       -o "$OUT/.libnextsycl-flash.so.new" && mv -f "$OUT/.libnextsycl-flash.so.new" "$OUT/libnextsycl-flash.so"
+fi
 # oneDNN beside the image and video libraries (they find it there: rpath $ORIGIN)
 cp -L "$DNNL/lib/libdnnl.so.3" "$OUT/.libdnnl.so.3.new" && mv -f "$OUT/.libdnnl.so.3.new" "$OUT/libdnnl.so.3"
 # the name before the split (libnextsycl.so = the llm library), for runners and services that still name it
