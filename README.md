@@ -855,3 +855,5 @@ artifact.
 - `PLAN.md`, `TODO.md`, `NOTES.md`: where it is going, what is next, the files tried.
 
 MIT licensed, as the kernels it imports.
+
+<script type="text/javascript" src="https://cdnjs.buymeacoffee.com/1.0.0/button.prod.min.js" data-name="bmc-button" data-slug="maxfridbe" data-color="#BD5FFF" data-emoji=""  data-font="Comic" data-text="Buy me a cup of tokens" data-outline-color="#000000" data-font-color="#ffffff" data-coffee-color="#FFDD00" ></script>
