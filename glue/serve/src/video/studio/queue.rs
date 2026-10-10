@@ -164,8 +164,21 @@ impl Studio {
         if !CHAIN_MODES.iter().any(|(m, _)| *m == chain_mode) {
             return Err(RpcError::param("chain_mode must be one of video, png, latent, none"));
         }
+        // the sampler and schedule by ComfyUI's names (none: the engine's own Euler on its shifted schedule)
+        let named = |k: &str, ok: &dyn Fn(&str) -> bool, names: &str| -> Result<Value, RpcError> {
+            match p.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()) {
+                None => Ok(Value::Null),
+                Some(v) if ok(v) => Ok(json!(v)),
+                Some(v) => Err(RpcError::param(&format!("{k} {v}? ({names})"))),
+            }
+        };
+        let sampler = named("sampler", &|v| nextsycl_diffusion::Sampler::parse(v).is_some(), &nextsycl_diffusion::samplers::NAMES.join(", "))?;
+        let schedule = named("schedule", &|v| nextsycl_diffusion::Schedule::parse(v).is_some(),
+                             &nextsycl_diffusion::Schedule::ALL.iter().map(|s| s.name()).collect::<Vec<_>>().join(", "))?;
         let mut it = Map::new();
         it.insert("prompt".into(), json!(prompt));
+        it.insert("sampler".into(), sampler);
+        it.insert("schedule".into(), schedule);
         it.insert("seconds".into(), num(p, "seconds", 10.0, 1.0, 15.1, false)?);
         it.insert("steps".into(), num(p, "steps", 10.0, 1.0, 40.0, true)?);
         it.insert("seed".into(), num(p, "seed", 0.0, -2147483648.0, 2147483648.0, true)?);

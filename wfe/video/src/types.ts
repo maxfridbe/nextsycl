@@ -35,6 +35,9 @@ export interface GenerateRequest {
   camera?: string | null;
   upscale?: number;
   upscaler?: string;
+  /** ComfyUI's sampler and schedule names (none: Euler on the shifted schedule) */
+  sampler?: string | null;
+  schedule?: string | null;
   loras?: string[];
   project?: string;
   batch?: string;
@@ -193,6 +196,9 @@ export interface Plan {
   margin_gib: number;
   step_a: number;
   step_b: number;
+  /** the sampler and schedule names the engine takes */
+  samplers?: string[];
+  schedules?: string[];
   chain_modes: Record<string, string>;
   /** keyed "<engine>|<W>x<H>|<seconds>" - cells this box has actually run */
   measured: Record<string, MeasuredCell | undefined>;

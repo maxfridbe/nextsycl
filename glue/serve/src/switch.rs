@@ -9,6 +9,9 @@
 //! last request through here - that request gets a 409 naming the loaded model. Per-model switches from the
 //! registry: `tools: false` drops a request's tool definitions, `tasks: false` declines Open WebUI's background
 //! tasks ("### Task:" prompts). The log carries sizes only, never content.
+//!
+//! With an image server (`images`), the images API (`/v1/images/...`: generations, edits, files) goes to it and its
+//! model is listed beside the chat ones while it answers - one base URL for a front end's chat and pictures.
 
 use std::collections::HashMap;
 use std::net::TcpListener;
@@ -43,6 +46,8 @@ pub struct Switch {
     /// how long a swap may take (a render can hold the card longer than a load)
     pub wait: Duration,
     pub in_use: Duration,
+    /// the image server (`nextsycl image start`), when there is one
+    pub images: Option<Target>,
     swap: Mutex<()>,
     last_use: Mutex<HashMap<String, Instant>>,
 }
@@ -60,7 +65,7 @@ impl Switch {
     pub fn new(models: Models, aliases: HashMap<String, String>, upstream: Target, studio_url: &str, wait: Duration, in_use: Duration)
                -> Result<Switch, String> {
         let (host, path) = http::split_url(studio_url)?;
-        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()) })
+        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, images: None, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()) })
     }
 
     pub fn run(self: Arc<Self>, addr: &str) -> Result<(), String> {
@@ -146,12 +151,27 @@ impl Switch {
             Ok(r) => r,
             Err(e) => return http::respond(&mut s, 400, &json!({"error": {"message": e}})),
         };
+        if let Some(img) = self.images.as_ref().filter(|_| req.path.starts_with("/v1/images/") || req.path.starts_with("/images/")) {
+            eprintln!("images: {} {} ({} bytes)", req.method, req.path.split('?').next().unwrap_or(""), req.body.len());
+            if let Err(e) = http::forward(&mut s, img, &req) {
+                eprintln!("  passing it on: {e}");
+                if e.contains("does not answer") {
+                    http::respond(&mut s, 502, &json!({"error": {"message": "the image server is not running (nextsycl image start)"}}));
+                }
+            }
+            return;
+        }
         if req.method == "GET" && req.path.trim_end_matches('/').ends_with("/models") {
             let models = (self.models)();
             let cur = self.loaded();
             let on = cur.as_deref().and_then(|c| self.served(c, &models));
-            let data: Vec<Value> = models.iter().map(|m| json!({"id": m.id, "object": "model", "owned_by": "nextsycl", "name": m.title,
-                                                                 "loaded": on.as_deref() == Some(m.id.as_str())})).collect();
+            let mut data: Vec<Value> = models.iter().map(|m| json!({"id": m.id, "object": "model", "owned_by": "nextsycl", "name": m.title,
+                                                                     "loaded": on.as_deref() == Some(m.id.as_str())})).collect();
+            // the image server's model, while it answers
+            if let Some(v) = self.images.as_ref().and_then(|t| http::call_for(t, "GET", "/v1/models", None, 2).ok()) {
+                data.extend(v["data"].as_array().into_iter().flatten().map(|m| json!({"id": m["id"], "object": "model", "owned_by": "nextsycl",
+                                                                                      "name": m["id"], "loaded": true, "kind": "image"})));
+            }
             return http::respond(&mut s, 200, &json!({"object": "list", "data": data}));
         }
         if req.method != "POST" {

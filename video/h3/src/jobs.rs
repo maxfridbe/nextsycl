@@ -768,6 +768,9 @@ pub struct ClipSpec<'a> {
     pub seconds: f64,
     pub seed: u64,
     pub steps: usize,
+    /// the sampler and the schedule (Euler on H3's own shifted schedule by default; the others are ComfyUI's)
+    pub sampler: nextsycl_diffusion::Sampler,
+    pub schedule: nextsycl_diffusion::Schedule,
     pub te: TeFiles<'a>,
     pub vaes: Vaes<'a>,
     /// LoRAs and their strengths (they stack)
@@ -1025,7 +1028,15 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     }
     let n_v = 24 * shape.t * shape.h * shape.w;
     let (noise_v, noise_a) = crate::noise::clip_noise(c.seed, n_v, 32 * 2 * shape.audio_t);
-    let sigmas = denoiser::sigmas(c.steps, schedule.shift_video);
+    // H3's own schedule (the video shift), or one of ComfyUI's at that shift
+    let sigmas = if c.schedule == nextsycl_diffusion::Schedule::Shift {
+        denoiser::sigmas(c.steps, schedule.shift_video)
+    } else {
+        nextsycl_diffusion::samplers::sigmas_for(c.sampler, c.schedule, c.steps as u32, schedule.shift_video)
+    };
+    if c.sampler != nextsycl_diffusion::Sampler::Euler || c.schedule != nextsycl_diffusion::Schedule::Shift {
+        ctl.say(format!("sampler: {} on the {} schedule ({} levels)", c.sampler.name(), c.schedule.name(), sigmas.len()));
+    }
     ctl.say(format!("tokens : {} in the denoiser", d.tokens()));
     let nblocks = e.model.blocks.len();
     let steps = c.steps;
@@ -1036,7 +1047,7 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         let mut progress = ctl.progress.take();
         let mut times = Vec::new();
         let mut t_step = Instant::now();
-        let r = denoiser::sample_masked(&mut d, &noise_v, &noise_a, &sigmas, inpaint.as_ref(), &mut |_, _, _| {
+        let r = denoiser::sample_with(&mut d, c.sampler, &noise_v, &noise_a, &sigmas, inpaint.as_ref(), c.seed, &mut |_, _, _| {
             times.push(t_step.elapsed().as_secs_f64());
             t_step = Instant::now();
             Ok(())
@@ -1122,6 +1133,14 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                 seconds: n("seconds").unwrap_or(2.0),
                 seed: n("seed").unwrap_or(0.0) as u64,
                 steps: n("steps").unwrap_or(8.0) as usize,
+                sampler: match s("sampler") {
+                    Some(x) => nextsycl_diffusion::Sampler::parse(x).ok_or_else(|| Error(format!("sampler {x}? ({})", nextsycl_diffusion::samplers::NAMES.join(", "))))?,
+                    None => nextsycl_diffusion::Sampler::Euler,
+                },
+                schedule: match s("schedule") {
+                    Some(x) => nextsycl_diffusion::Schedule::parse(x).ok_or_else(|| Error(format!("schedule {x}?")))?,
+                    None => nextsycl_diffusion::Schedule::Shift,
+                },
                 te: TeFiles {
                     te: Path::new(s("te").unwrap_or("/models/teacher/qwen3vl_32b_minimax_h3-Q4_K_M.gguf")),
                     tokenizer: Path::new(s("tokenizer").unwrap_or("/app/tokenizer")),

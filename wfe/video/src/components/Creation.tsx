@@ -20,6 +20,9 @@ interface Form {
   upscale: number;
   /** "latent" (default), or an ESRGAN-type network on the decoded frames */
   upscaler: string;
+  /** "" = the engine's own Euler / shifted schedule */
+  sampler: string;
+  schedule: string;
   chain: boolean;
 }
 
@@ -40,6 +43,8 @@ export const form: Form = {
   engine: "INT8",
   upscale: 1.5,
   upscaler: "esrgan-general",
+  sampler: "",
+  schedule: "",
   chain: false,
 };
 
@@ -55,6 +60,8 @@ export function useSettings(j: GenerateRequest): void {
   if (j.engine) form.engine = j.engine === "Q8_0" ? "INT8" : j.engine;
   if (j.upscale) form.upscale = j.upscale;
   form.upscaler = j.upscaler ?? "esrgan-general";
+  form.sampler = j.sampler ?? "";
+  form.schedule = j.schedule ?? "";
   form.label = j.label ?? "";
   form.chain = !!j.first_frame;
   navigate({ tab: "create" });
@@ -76,6 +83,8 @@ async function generate(queue: boolean): Promise<void> {
     chain_mode: "png",
     queue,
   };
+  if (form.sampler) body.sampler = form.sampler;
+  if (form.schedule) body.schedule = form.schedule;
   if (form.chain) body.first_frame = "prev";
   try {
     await rpc("generate", body);
@@ -96,6 +105,17 @@ const num = (
       attrs={{ type: "number", min, max, step, value: String(form[key]) }}
       on={{ input: (e: Event) => { form[key] = Number((e.target as HTMLInputElement).value); render(); } }}
     />
+  </label>
+);
+
+/** A select over the plan's names, "" first (the engine's default) */
+const named = (label: string, key: "sampler" | "schedule", names: string[] | undefined, dflt: string, title: string) => (
+  <label attrs={{ title }}>
+    {label}
+    <select on={{ change: (e: Event) => { form[key] = (e.target as HTMLSelectElement).value; render(); } }}>
+      <option attrs={{ value: "", selected: form[key] === "" }}>{dflt}</option>
+      {(names ?? []).map((n) => <option attrs={{ value: n, selected: form[key] === n }}>{n}</option>)}
+    </select>
   </label>
 );
 
@@ -123,6 +143,10 @@ export function Creation() {
             <option attrs={{ value: "latent", selected: form.upscaler === "latent" }}>latent (slowest, most natural texture)</option>
           </select>
         </label>
+        {named("sampler", "sampler", state.plan?.samplers, "euler (default)",
+          "ComfyUI's samplers on the flow model. euler is the distilled default; ancestral and sde samplers add fresh noise each step; the multistep ones (dpmpp_2m, uni_pc) reuse earlier steps. Some take two or three model calls a step.")}
+        {named("schedule", "schedule", state.plan?.schedules, "shifted (default)",
+          "The sigma schedule. shifted is the model's own; karras and exponential suit noise-prediction models and do poorly here.")}
         <label>
           encoder
           <select on={{ change: (e: Event) => { form.te = (e.target as HTMLSelectElement).value as "teacher" | "student"; render(); } }}>

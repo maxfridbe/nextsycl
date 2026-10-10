@@ -401,6 +401,7 @@ version = "0.0.0"
 dependencies = [
  "nextsycl-audio",
  "nextsycl-core",
+ "nextsycl-diffusion",
  "nextsycl-image",
  "nextsycl-llm",
  "nextsycl-tok",
@@ -443,6 +444,7 @@ version = "0.0.0"
 dependencies = [
  "fancy-regex",
  "nextsycl-core",
+ "nextsycl-diffusion",
  "nextsycl-video",
  "serde_json",
  "unicode-normalization",

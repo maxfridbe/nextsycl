@@ -196,6 +196,12 @@ impl VideoEngine for H3 {
         if let Some(u) = req.upscale.filter(|u| *u > 1.0) {
             spec["upscale"] = json!(u);
         }
+        if let Some(x) = req.sampler {
+            spec["sampler"] = json!(x.name());
+        }
+        if let Some(x) = req.schedule {
+            spec["schedule"] = json!(x.name());
+        }
         if !req.loras.is_empty() {
             spec["lora"] = json!(req.loras.iter().map(|l| format!("{}:{}", l.path.display(), l.scale)).collect::<Vec<_>>().join(","));
         }

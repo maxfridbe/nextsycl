@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 nextsycl-core.workspace = true
 nextsycl-video.workspace = true
+nextsycl-diffusion.workspace = true
 serde_json.workspace = true
 fancy-regex = "0.14"
 unicode-normalization = "0.1"

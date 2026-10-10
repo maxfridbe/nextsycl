@@ -19,7 +19,7 @@ fn secs(args: &[String], k: &str, d: f64) -> Result<Duration, String> {
 }
 
 /// `nextsycl switch [--host 0.0.0.0] [--port 8001] [--upstream 127.0.0.1:8085] [--studio URL] [--wait 420]
-/// [--in-use 90] [--alias OLD=NEW]...`
+/// [--in-use 90] [--alias OLD=NEW]... [--images 127.0.0.1:8086]`
 pub fn switch(args: &[String]) -> Result<(), String> {
     // the same settings, the closure's own (the registry is read on every request)
     let cfg = Config::load();
@@ -43,7 +43,8 @@ pub fn switch(args: &[String]) -> Result<(), String> {
     }
     let upstream = Target::Tcp(opt(args, "--upstream").unwrap_or("127.0.0.1:8085").to_string());
     let studio = opt(args, "--studio").unwrap_or("http://127.0.0.1:8090/rpc/llm.mode");
-    let sw = Switch::new(list, aliases, upstream, studio, secs(args, "--wait", 420.0)?, secs(args, "--in-use", 90.0)?)?;
+    let mut sw = Switch::new(list, aliases, upstream, studio, secs(args, "--wait", 420.0)?, secs(args, "--in-use", 90.0)?)?;
+    sw.images = opt(args, "--images").map(|a| Target::Tcp(a.to_string()));
     let addr = format!("{}:{}", opt(args, "--host").unwrap_or("0.0.0.0"), opt(args, "--port").unwrap_or("8001"));
     std::sync::Arc::new(sw).run(&addr)
 }

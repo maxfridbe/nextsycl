@@ -707,41 +707,9 @@ pub fn sample_masked(
     let scale = d.schedule.audio_scale;
     let mut xv: Vec<f32> = noise_v.iter().map(|n| n * s0).collect();
     let mut xa: Vec<f32> = noise_a.iter().map(|n| n * s0).collect();
-    // the source in the sampler's space (the audio carried x audio_scale)
-    let li_a: Vec<f32> = inpaint.map(|p| p.source_a.iter().map(|v| v * scale).collect()).unwrap_or_default();
     for i in 0..sigmas.len() - 1 {
         let (s, next) = (sigmas[i], sigmas[i + 1]);
-        let (dv, da) = match (inpaint, &d.masks) {
-            (Some(p), Some(m)) => {
-                // the kept parts put back almost clean: 0.999 source + 0.001 noise (video), the audio rescaled
-                // for the model to see it clean; inside a partly generated token the kept pixels follow x
-                let aug = crate::layout::VISUAL_COND_TIMESTEP as f32;
-                let (n, at) = (m.video_px.len(), p.mask_a.len());
-                let xv2: Vec<f32> = (0..xv.len())
-                    .map(|j| {
-                        let (mk, tok) = (p.mask_v[j % n], m.video_px[j % n]);
-                        let mut inj = aug * p.source_v[j] + (1.0 - aug) * noise_v[j];
-                        if mk < 1.0 {
-                            let wgt = ((tok - mk) / (1.0 - mk).max(1e-6)).clamp(0.0, 1.0);
-                            inj += wgt * (xv[j] - inj);
-                        }
-                        xv[j] * mk + inj * (1.0 - mk)
-                    })
-                    .collect();
-                let sigma_v = s.max(1e-6);
-                let sigma_a = time_shift_sigma(sigma_v as f64, d.schedule.shift_video as f64, d.schedule.shift_audio as f64) as f32;
-                let factor = (sigma_v / sigma_a) / scale;
-                let xa2: Vec<f32> = (0..xa.len()).map(|j| {
-                    let mk = p.mask_a[j % at];
-                    xa[j] * mk + li_a[j] * factor * (1.0 - mk)
-                }).collect();
-                let (dv, da) = d.denoised(&xv2, &xa2, s, &mut |b| between(i, b))?;
-                let dv = (0..dv.len()).map(|j| dv[j] * p.mask_v[j % n] + p.source_v[j] * (1.0 - p.mask_v[j % n])).collect::<Vec<f32>>();
-                let da = (0..da.len()).map(|j| da[j] * p.mask_a[j % at] + li_a[j] * (1.0 - p.mask_a[j % at])).collect::<Vec<f32>>();
-                (dv, da)
-            }
-            _ => d.denoised(&xv, &xa, s, &mut |b| between(i, b))?,
-        };
+        let (dv, da) = estimate(d, &xv, &xa, s, inpaint, noise_v, &mut |b| between(i, b))?;
         on_step(i, &dv, &da)?;
         for (x, dn) in xv.iter_mut().zip(&dv).chain(xa.iter_mut().zip(&da)) {
             let slope = (*x - dn) / s;
@@ -749,6 +717,100 @@ pub fn sample_masked(
         }
     }
     xa.iter_mut().for_each(|x| *x /= scale);
+    Ok((xv, xa))
+}
+
+/// The denoised estimates at (x, sigma), as the sampler sees them; with a masked run the kept parts put back (as
+/// ComfyUI's inpainting wrapper does around the model) before the model and in its estimates
+fn estimate(d: &mut Denoiser, xv: &[f32], xa: &[f32], s: f32, inpaint: Option<&Inpaint>, noise_v: &[f32], between: Between)
+            -> Result<(Vec<f32>, Vec<f32>)> {
+    let scale = d.schedule.audio_scale;
+    match (inpaint, &d.masks) {
+        (Some(p), Some(m)) => {
+            // the source in the sampler's space (the audio carried x audio_scale)
+            let li_a: Vec<f32> = p.source_a.iter().map(|v| v * scale).collect();
+            // the kept parts put back almost clean: 0.999 source + 0.001 noise (video), the audio rescaled for the
+            // model to see it clean; inside a partly generated token the kept pixels follow x
+            let aug = crate::layout::VISUAL_COND_TIMESTEP as f32;
+            let (n, at) = (m.video_px.len(), p.mask_a.len());
+            let xv2: Vec<f32> = (0..xv.len())
+                .map(|j| {
+                    let (mk, tok) = (p.mask_v[j % n], m.video_px[j % n]);
+                    let mut inj = aug * p.source_v[j] + (1.0 - aug) * noise_v[j];
+                    if mk < 1.0 {
+                        let wgt = ((tok - mk) / (1.0 - mk).max(1e-6)).clamp(0.0, 1.0);
+                        inj += wgt * (xv[j] - inj);
+                    }
+                    xv[j] * mk + inj * (1.0 - mk)
+                })
+                .collect();
+            let sigma_v = s.max(1e-6);
+            let sigma_a = time_shift_sigma(sigma_v as f64, d.schedule.shift_video as f64, d.schedule.shift_audio as f64) as f32;
+            let factor = (sigma_v / sigma_a) / scale;
+            let xa2: Vec<f32> = (0..xa.len()).map(|j| {
+                let mk = p.mask_a[j % at];
+                xa[j] * mk + li_a[j] * factor * (1.0 - mk)
+            }).collect();
+            let (dv, da) = d.denoised(&xv2, &xa2, s, between)?;
+            let dv = (0..dv.len()).map(|j| dv[j] * p.mask_v[j % n] + p.source_v[j] * (1.0 - p.mask_v[j % n])).collect::<Vec<f32>>();
+            let da = (0..da.len()).map(|j| da[j] * p.mask_a[j % at] + li_a[j] * (1.0 - p.mask_a[j % at])).collect::<Vec<f32>>();
+            Ok((dv, da))
+        }
+        _ => d.denoised(xv, xa, s, between),
+    }
+}
+
+/// `sample_masked` with any of the shared samplers (ComfyUI's, nextsycl_diffusion::samplers): the video and the
+/// carried audio stepped as one vector; `seed` seeds the stochastic samplers' draws. Euler takes the path above.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_with(
+    d: &mut Denoiser,
+    sampler: nextsycl_diffusion::Sampler,
+    noise_v: &[f32],
+    noise_a: &[f32],
+    sigmas: &[f32],
+    inpaint: Option<&Inpaint>,
+    seed: u64,
+    on_step: OnStep,
+    between: &mut dyn FnMut(usize, usize) -> Result<()>,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    if sampler == nextsycl_diffusion::Sampler::Euler {
+        return sample_masked(d, noise_v, noise_a, sigmas, inpaint, on_step, between);
+    }
+    let scale = d.schedule.audio_scale;
+    let nv = noise_v.len();
+    let s0 = sigmas[0];
+    let x: Vec<f32> = noise_v.iter().chain(noise_a).map(|n| n * s0).collect();
+    let step = std::cell::Cell::new(0usize);
+    let last = std::cell::RefCell::new((Vec::new(), Vec::new()));
+    let failed = std::cell::RefCell::new(None::<Error>);
+    let mut model = |x: &[f32], s: f32| -> std::result::Result<Vec<f32>, String> {
+        let i = step.get();
+        let (dv, da) = estimate(d, &x[..nv], &x[nv..], s, inpaint, noise_v, &mut |b| between(i, b)).map_err(|e| e.0)?;
+        let out = dv.iter().chain(&da).copied().collect();
+        *last.borrow_mut() = (dv, da);
+        Ok(out)
+    };
+    let mut rng = crate::rng::Rng::new(seed ^ 0x5eed_5a3d);
+    let mut noise = |m: usize| -> Vec<f32> { (0..m).map(|_| rng.normal()).collect() };
+    let mut progress = |i: usize| {
+        step.set(i + 1);
+        if failed.borrow().is_none() {
+            let l = last.borrow();
+            if let Err(e) = on_step(i, &l.0, &l.1) {
+                *failed.borrow_mut() = Some(e);
+            }
+        }
+    };
+    let out = nextsycl_diffusion::samplers::sample(sampler, &mut model, x, sigmas, &mut noise, &mut progress).map_err(Error);
+    if let Some(e) = failed.into_inner() {
+        return Err(e);
+    }
+    let out = out?;
+    let lastsig = *sigmas.last().unwrap_or(&0.0);
+    let k = if lastsig > 0.0 { 1.0 / (1.0 - lastsig) } else { 1.0 };
+    let xv = out[..nv].iter().map(|v| v * k).collect();
+    let xa = out[nv..].iter().map(|v| v * k / scale).collect();
     Ok((xv, xa))
 }
 

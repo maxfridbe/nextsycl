@@ -11,10 +11,10 @@ use super::runner::snap_seconds;
 use super::{now, pyround, RpcError, Studio};
 
 /// The keys a scene file may lift into its defaults.
-const SCENE_DEFAULTABLE: [&str; 23] = [
+const SCENE_DEFAULTABLE: [&str; 25] = [
     "steps", "seed", "te", "engine", "width", "height", "chain_mode", "upscale", "first_frame", "last_frame", "exposure_ref", "first_audio",
     "first_audio_s", "cond_noise_aug", "loras", "ref_images", "ref_audios", "ref_image_size", "guide_clip", "shift_video", "shift_audio", "source",
-    "regen",
+    "regen", "sampler", "schedule",
 ];
 
 pub const CANVASES: [(i64, i64, &str, &str); 10] = [
@@ -350,7 +350,9 @@ impl Studio {
                "defaults": {"seconds": 10, "steps": 10, "width": 768, "height": 576, "engine": "INT8"},
                "cap_gib": 30.3, "gib_per_token": 1.64e-4, "margin_gib": 0.8, "step_a": a, "step_b": b, "gpus": gpus,
                "chain_modes": super::queue::CHAIN_MODES.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<Map<String, Value>>(),
-               "measured": {}})
+               "measured": {},
+               "samplers": nextsycl_diffusion::samplers::NAMES,
+               "schedules": nextsycl_diffusion::Schedule::ALL.iter().map(|s| s.name()).collect::<Vec<_>>()})
     }
 
     pub fn templates(&self) -> Vec<Value> {

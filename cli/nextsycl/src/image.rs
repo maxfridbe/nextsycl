@@ -13,6 +13,7 @@ nextsycl image gen \"<prompt>\" [--model ID] [--size WxH | --aspect W:H] [--step
                    [--schedule S] [--lora NAME[:SCALE]]... [--set NAME=VALUE]... [--out FILE|DIR] [--rgba] [--local] [--gpu N]
 nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora NAME[:SCALE]]... [--set NAME=VALUE]...
                      [--wfe] [--out DIR] [--cors ORIGIN]
+nextsycl image start [serve's options]   (in the background) | ps | logs [-f] | stop
 nextsycl image check <dump dir> [--model ID] [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--gpu N]
 nextsycl image engines | selftest [--gpu N]";
 
@@ -236,7 +237,61 @@ fn out_dir(cfg: &Config, args: &[String]) -> PathBuf {
 /// `nextsycl image serve`: from the host, the build image as container `nextsycl-image` (the GPU, the program and its
 /// libraries, the registry, the model's and its LoRAs' files read-only, the output directory) running this command
 /// inside with `--here`; there, the engine loaded and served (nextsycl_serve::image)
+/// The image server's container (`image serve` in the foreground, `image start` in the background)
+const SERVER: &str = "nextsycl-image";
+
 fn serve(cfg: &Config, args: &[String]) -> Result<(), String> {
+    run(cfg, args, false)
+}
+
+/// `image start`: `serve` in the background - its port on the container (for `ps`), ready when it answers /health
+fn start(cfg: &Config, args: &[String]) -> Result<(), String> {
+    run(cfg, args, true)?;
+    let port = opt(args, "--port").unwrap_or("8086");
+    let t0 = std::time::Instant::now();
+    let ce = crate::container::Ce::new(cfg)?;
+    loop {
+        if nextsycl_serve::http::call_for(&nextsycl_serve::http::Target::Tcp(format!("127.0.0.1:{port}")), "GET", "/health", None, 4).is_ok() {
+            println!("{SERVER} is up on port {port} ({:.0} s): {} image ps | logs | stop", t0.elapsed().as_secs_f64(), std::env::args().next().unwrap_or("nextsycl".into()));
+            return Ok(());
+        }
+        if !ce.running(SERVER) {
+            return Err(format!("{SERVER} ended while loading: {} image logs", std::env::args().next().unwrap_or("nextsycl".into())));
+        }
+        if t0.elapsed().as_secs() > 600 {
+            return Err(format!("{SERVER} did not answer in 10 minutes (image logs)"));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// The running server's address (from its container's label)
+fn server_addr(cfg: &Config) -> Result<String, String> {
+    let ce = crate::container::Ce::new(cfg)?;
+    if !ce.running(SERVER) {
+        return Err(format!("{SERVER} is not running (image start)"));
+    }
+    let o = ce.cmd().args(["container", "inspect", "-f", "{{index .Config.Labels \"nextsycl.port\"}}", SERVER]).output().map_err(|e| e.to_string())?;
+    let port = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    Ok(format!("127.0.0.1:{}", if port.is_empty() || port.contains("no value") { "8086" } else { &port }))
+}
+
+/// `image ps`: the model, what is generating (step of steps) and how many wait
+fn ps(cfg: &Config) -> Result<(), String> {
+    use nextsycl_serve::http::{call_for, Target};
+    let t = Target::Tcp(server_addr(cfg)?);
+    let info = call_for(&t, "GET", "/api/info", None, 10)?;
+    let p = call_for(&t, "GET", "/api/progress", None, 10)?;
+    let loras: Vec<String> = info["loras"].as_array().into_iter().flatten().filter(|l| !l["loaded"].is_null())
+        .map(|l| format!("{}:{}", l["id"].as_str().unwrap_or("?"), l["loaded"])).collect();
+    println!("{} ({}){}{}", info["model"].as_str().unwrap_or("?"), info["arch"].as_str().unwrap_or("loading"),
+             if loras.is_empty() { String::new() } else { format!(", LoRAs {}", loras.join(" ")) },
+             if info["loading"] == true { ", loading" } else { "" });
+    println!("{}", serde_json::to_string_pretty(&p).unwrap_or_default());
+    Ok(())
+}
+
+fn run(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     let id = args.first().filter(|a| !a.starts_with("--")).map(String::as_str).or_else(|| opt(args, "--model"));
     let (m, files) = model(cfg, id)?;
     let model_id = m["id"].as_str().unwrap_or("image").to_string();
@@ -258,14 +313,15 @@ fn serve(cfg: &Config, args: &[String]) -> Result<(), String> {
         return Err(format!("{}: the web front end is not built yet (./build.sh wfe)", cfg.dist.join("wfe").display()));
     }
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
-    const NAME: &str = "nextsycl-image";
+    const NAME: &str = SERVER;
     if ce.running(NAME) {
         return Err(format!("{NAME} is running already ({} stop {NAME})", ce.bin));
     }
     ce.remove(NAME);
     // --init: the server is not PID 1, so a stop's SIGTERM ends it (PID 1 ignores signals it does not handle)
-    let mut a: Vec<String> = vec!["run".into(), "--rm".into(), "--init".into(), "--name".into(), NAME.into(), "--network".into(), "host".into(),
-                                  "--stop-timeout".into(), "120".into()];
+    let mut a: Vec<String> = vec!["run".into(), if detach { "-d".into() } else { "--rm".into() }, "--init".into(), "--name".into(), NAME.into(),
+                                  "--network".into(), "host".into(), "--stop-timeout".into(), "120".into(),
+                                  "--label".into(), format!("nextsycl.port={}", opt(args, "--port").unwrap_or("8086"))];
     a.extend(ce.user_args());
     a.extend(ce.gpu_args());
     a.extend(mount(&cfg.dist, "/app", true));
@@ -300,8 +356,12 @@ fn serve(cfg: &Config, args: &[String]) -> Result<(), String> {
         a.push(x.clone());
     }
     a.extend(["--out".into(), out.to_string_lossy().into_owned(), "--here".into()]);
-    let st = ce.cmd().args(&a).status().map_err(|e| e.to_string())?;
-    if st.success() { Ok(()) } else { Err(format!("the image server ended ({st})")) }
+    let st = if detach { ce.cmd().args(&a).stdout(std::process::Stdio::null()).status() } else { ce.cmd().args(&a).status() }.map_err(|e| e.to_string())?;
+    match (st.success(), detach) {
+        (true, _) => Ok(()),
+        (false, true) => Err(format!("{} run failed ({st})", ce.bin)),
+        (false, false) => Err(format!("the image server ended ({st})")),
+    }
 }
 
 fn serve_here(cfg: &Config, m: &Value, files: ModelFiles, args: &[String], out: PathBuf) -> Result<(), String> {
@@ -364,6 +424,42 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("edit") => edit(cfg, rest),
         Some("check") => check(cfg, rest),
         Some("serve") => serve(cfg, rest),
+        Some("start") => start(cfg, rest),
+        Some("ps") => ps(cfg),
+        Some("stop") => {
+            let ce = crate::container::Ce::new(cfg)?;
+            if !ce.running(SERVER) {
+                return Err(format!("{SERVER} is not running"));
+            }
+            // the picture being made (and those waiting) finish first: a stop never ends the engine mid-kernel
+            if let Ok(addr) = server_addr(cfg) {
+                let t = nextsycl_serve::http::Target::Tcp(addr);
+                let t0 = std::time::Instant::now();
+                while let Ok(p) = nextsycl_serve::http::call_for(&t, "GET", "/api/progress", None, 10) {
+                    if p["busy"] != true && p["waiting"].as_u64().unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if t0.elapsed().as_secs() == 0 {
+                        println!("waiting for the pictures in progress");
+                    }
+                    if t0.elapsed().as_secs() > 1800 {
+                        return Err("still busy after 30 minutes; not stopped".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+            ce.stop(SERVER, 120);
+            ce.remove(SERVER);
+            println!("{SERVER} stopped");
+            Ok(())
+        }
+        Some("logs") => {
+            let ce = crate::container::Ce::new(cfg)?;
+            let mut a = vec!["logs".to_string()];
+            a.extend(rest.iter().cloned());
+            a.push(SERVER.into());
+            ce.cmd().args(&a).status().map_err(|e| e.to_string()).map(|_| ())
+        }
         _ => Err(USAGE.into()),
     }
 }

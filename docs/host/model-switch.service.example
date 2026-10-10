@@ -7,7 +7,7 @@ After=network.target nextsycl-video-studio.service
 [Service]
 User=you
 Environment=NS_REGISTRY=/var/lib/nextsycl/models.json
-ExecStart=/bin/sh -c "exec /path/to/nextsycl/dist/nextsycl switch --port 8001 --upstream 127.0.0.1:8085 --studio http://127.0.0.1:8090/rpc/llm.mode"
+ExecStart=/bin/sh -c "exec /path/to/nextsycl/dist/nextsycl switch --port 8001 --upstream 127.0.0.1:8085 --studio http://127.0.0.1:8090/rpc/llm.mode --images 127.0.0.1:8086"
 Restart=always
 RestartSec=5
 

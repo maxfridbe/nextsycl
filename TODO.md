@@ -185,8 +185,14 @@ of IQ2_XXS instead could win twice.
 - [x] Qwen-Image 2.1: edits and compositions (up to 8 pictures: the vision tower, the VAE encoder, the block-causal
       prefix; checked at 512 and 1024), true guidance, ComfyUI's 29 samplers and 9 schedulers (crates/diffusion
       samplers.rs, checked against ComfyUI's code); /v1/images/edits (multipart / JSON) and the page's Pictures
-- [ ] Qwen-Image: `image start | ps | inspect | bench` and the images API through the switcher; the sampler suite for
-      the video engine; Qwen3.8-Flash-Next's own vision input for chat (transformers has qwen4_exp's vision tower)
+- [x] `image start | ps | logs | stop` (the server's container in the background; a stop waits for the pictures in
+      progress) and the images API through the switcher (`--images`: /v1/images/* passed on, its model listed);
+      ComfyUI's samplers and schedules in the video engine (`sampler` / `schedule` in a job, the studio's Create form)
+- [ ] Qwen3.8-Flash-Next's own vision input for chat (transformers has qwen4_exp's vision tower); `image inspect | bench`
+- [ ] H3's other modes (ComfyUI nodes_minimax_h3.py): Ref2VA (the ref2va DiT, up to 9 reference pictures through the
+      text encoder's vision tower + their latents, 3 reference videos with soundtracks, 3 sounds), the Fun ControlNet
+      Union patch (canny / depth / HED / MLSD / pose control videos; masked inpainting with a source video), the
+      effect embeddings (bullet_time, four_seasons ...)
 - [x] Qwen-Image speed, round 1 (B70, 1024x1024, 40 steps 30.0 -> 26.5 s): layernorm + modulation fused, one
       work-group a row (1.69 -> 0.37 ms a call); prefix + block attention read in place through strides (5.9 -> 5.2 ms)
 - [x] Qwen-Image speed, round 2 (B70, 1024x1024, 40 steps): `NS_QI_INT8=1` int8 ConvRot block matrices (rotated and
