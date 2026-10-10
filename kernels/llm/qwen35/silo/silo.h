@@ -17,6 +17,20 @@ typedef struct ns_gpu ns_gpu;
 int ns_q35_mmvq_supported(int type, int64_t n_in);
 int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 
+/* Prompt attention (attn.cpp; the engine's own is ns_q35_attn): flash attention on XMX. out [T, Hq x 256] = softmax(q k^T
+ * / 16) v for rows q [T, Hq x 256] (qs floats apart) at positions p0.., causal, against the half caches [Hkv][cap][256].
+ * Covers more than 8 rows, heads of 256, 6 query heads a key head */
+int ns_q35_attn_prompt_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t D);
+int ns_q35_attn_prompt(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
+                       int64_t cap, int64_t p0, float* out);
+/* Decode attention (attn.cpp): 1..8 rows (each at its own position p0 + t), the same cache and output as above; a lane
+ * a key for the scores, the keys split over ~512 work-groups, merged through `scratch` (ns_q35_attn_decode_scratch
+ * floats; 0: none) */
+int ns_q35_attn_decode_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t D);
+int64_t ns_q35_attn_decode_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0);
+int ns_q35_attn_decode(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
+                       int64_t cap, int64_t p0, float* out, float* scratch);
+
 #ifdef __cplusplus
 }
 #endif

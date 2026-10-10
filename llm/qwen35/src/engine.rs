@@ -470,7 +470,35 @@ impl<'g> Qwen35<'g> {
             self.op("kv store", none, 12 * t * hk * d, 0,
                     || (k.kv_store)(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64, p0 as i64,
                                     kc.ptr(), vc.ptr()))?;
-            let sc = (k.attn_scratch)(t as i64, hq as i64, d as i64, p0 as i64) as usize;
+            let silo = self.silo.filter(|s| (s.attn_prompt_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0);
+            if let Some(s) = silo {
+                // the silo's flash attention (prompt rows): each key read once a work-group of 8 rows x 6 heads
+                // each block of 8 rows reads K and V (half) up to its last row's key, once for the 6 heads
+                let nb = t.div_ceil(8);
+                let block_keys = nb * p0 + 8 * nb * (nb + 1) / 2;
+                self.op("attention silo", none, block_keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
+                        || (s.attn_prompt)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
+                                           p0 as i64, att.fp()))?;
+                self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
+                        || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
+                let out = self.arena.f32(t * g.n_embd)?;
+                self.matmul("o", &a.o, &att, t, &out)?;
+                return Ok(out);
+            }
+            if let Some(s) = self.silo.filter(|s| (s.attn_decode_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
+                // the silo's decode attention: a lane a key for the scores, the keys over ~512 work-groups
+                let sc = (s.attn_decode_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
+                let part = if sc > 0 { Some(self.arena.f32(sc)?) } else { None };
+                self.op("attention silo", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
+                        || (s.attn_decode)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
+                                           p0 as i64, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+                self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
+                        || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
+                let out = self.arena.f32(t * g.n_embd)?;
+                self.matmul("o", &a.o, &att, t, &out)?;
+                return Ok(out);
+            }
+            let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
             let part = if sc > 0 { Some(self.arena.f32(sc)?) } else { None };
             self.op("attention", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
                     || (k.attn)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64,

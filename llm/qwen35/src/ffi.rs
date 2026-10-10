@@ -30,7 +30,7 @@ pub struct Api {
     // q35.h
     pub qk_norm_rope: unsafe extern "C" fn(G, *const f32, i64, i64, *mut f32, i64, i64, i64, i64, *const f32, f32, i64, f32, i64) -> c_int,
     pub kv_store: unsafe extern "C" fn(G, *const f32, i64, *const f32, i64, i64, i64, i64, i64, i64, M, M) -> c_int,
-    pub attn_scratch: unsafe extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub attn_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64,
     pub attn: unsafe extern "C" fn(G, *const f32, i64, P, P, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
     pub gate_mul: unsafe extern "C" fn(G, *mut f32, *const f32, i64, i64, i64, i64) -> c_int,
     pub gdn_gates: unsafe extern "C" fn(G, *const f32, *mut f32, *const f32, *const f32, *mut f32, i64, i64, i64) -> c_int,
@@ -107,6 +107,11 @@ pub struct Silo {
     pub path: std::path::PathBuf,
     pub mmvq_supported: unsafe extern "C" fn(c_int, i64) -> c_int,
     pub mmvq: unsafe extern "C" fn(G, c_int, P, P, *mut f32, i64, i64, i64) -> c_int,
+    pub attn_prompt_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
+    pub attn_prompt: unsafe extern "C" fn(G, *const f32, i64, P, P, i64, i64, i64, i64, i64, i64, *mut f32) -> c_int,
+    pub attn_decode_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
+    pub attn_decode_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64,
+    pub attn_decode: unsafe extern "C" fn(G, *const f32, i64, P, P, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
 }
 
 /// The silo (None: the shared kernels for everything)
@@ -127,7 +132,16 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
                 }
             }};
         }
-        Ok(Some(Silo { path: lib.path.clone(), mmvq_supported: sym!("ns_q35_mmvq_supported"), mmvq: sym!("ns_q35_mmvq") }))
+        Ok(Some(Silo {
+            path: lib.path.clone(),
+            mmvq_supported: sym!("ns_q35_mmvq_supported"),
+            mmvq: sym!("ns_q35_mmvq"),
+            attn_prompt_supported: sym!("ns_q35_attn_prompt_supported"),
+            attn_prompt: sym!("ns_q35_attn_prompt"),
+            attn_decode_supported: sym!("ns_q35_attn_decode_supported"),
+            attn_decode_scratch: sym!("ns_q35_attn_decode_scratch"),
+            attn_decode: sym!("ns_q35_attn_decode"),
+        }))
     })
     .as_ref()
     .map(|s| s.as_ref())

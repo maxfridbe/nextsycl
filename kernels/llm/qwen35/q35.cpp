@@ -15,18 +15,25 @@ constexpr int SG = 16;
 // ---- cached causal attention (the MiniMax Music engine's, mm3.cpp): a work-group per (row, key head, split of the
 // keys), NSG sub-groups taking the split's keys in turn, each lane DL features of the G query heads that share the key
 // head; the sub-groups' (max, sum, weighted values) merged in local memory, the splits (decode) by a second kernel
-constexpr int64_t KB = 256;
 constexpr int NSG_A = 4;
 
-int64_t splits(int64_t S, int64_t kv) {
-    return S == 1 && kv > KB ? (kv + KB - 1) / KB : 1;
+// a decode row's keys a split: enough splits that the card has ~512 work-groups (key heads x splits) whatever the
+// context - a fixed 256 left 36 work-groups at 2K (8% of the bandwidth) - at least 32 keys each; prompt rows one split
+int64_t split_keys(int64_t S, int64_t kv, int64_t Hkv) {
+    if (S != 1) return kv;
+    const int64_t want = (kv * Hkv + 511) / 512;
+    return sycl::max<int64_t>(32, (want + 31) / 32 * 32);
+}
+int64_t splits(int64_t S, int64_t kv, int64_t Hkv) {
+    const int64_t kb = split_keys(S, kv, Hkv);
+    return kv > kb ? (kv + kb - 1) / kb : 1;
 }
 
 template <int DL, int G>
 void attn(sycl::queue& q, const float* qp, int64_t qs, const half* kc, const half* vc, int64_t S, int64_t Hq, int64_t Hkv, int64_t T, int64_t p0,
           float* out, float* part) {
     constexpr int D = SG * DL, WG = SG * NSG_A;
-    const int64_t ns = splits(S, p0 + S);
+    const int64_t ns = splits(S, p0 + S, Hkv), KB = split_keys(S, p0 + S, Hkv);
     const float scale = 1.0f / sycl::sqrt((float) D);
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm(sycl::range<1>((size_t) NSG_A * G * (D + 2)), h);
@@ -184,8 +191,8 @@ int ns_q35_kv_store(ns_gpu* g, const float* k, int64_t ks, const float* v, int64
     NS_CATCH
 }
 
-int64_t ns_q35_attn_scratch(int64_t T, int64_t Hq, int64_t D, int64_t p0) {
-    const int64_t ns = splits(T, p0 + T);
+int64_t ns_q35_attn_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0) {
+    const int64_t ns = splits(T, p0 + T, Hkv);
     return ns > 1 ? T * Hq * ns * (D + 2) : 0;
 }
 
@@ -194,7 +201,7 @@ int ns_q35_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, const voi
     NS_TRY
     if (T <= 0) return 0;
     if (p0 + T > cap) return ns_fail("ns_q35_attn: past the cache's capacity");
-    if (ns_q35_attn_scratch(T, Hq, D, p0) > 0 && !scratch) return ns_fail("ns_q35_attn: no scratch");
+    if (ns_q35_attn_scratch(T, Hq, Hkv, D, p0) > 0 && !scratch) return ns_fail("ns_q35_attn: no scratch");
     const half* k = (const half*) kc;
     const half* v = (const half*) vc;
     if (D == 256 && Hq == 6 * Hkv) attn<16, 6>(g->q, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);

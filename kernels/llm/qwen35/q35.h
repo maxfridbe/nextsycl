@@ -20,8 +20,8 @@ int ns_q35_qk_norm_rope(ns_gpu* g, const float* src, int64_t ss, int64_t hs, flo
 /* The cache [Hkv][cap][D] half: rows k [T, Hkv x D] (ks floats apart) and v (vs apart) at positions p0.. */
 int ns_q35_kv_store(ns_gpu* g, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
                     void* kc, void* vc);
-/* Floats of scratch ns_q35_attn needs for T rows of Hq heads x D at positions p0.. (0: none) */
-int64_t ns_q35_attn_scratch(int64_t T, int64_t Hq, int64_t D, int64_t p0);
+/* Floats of scratch ns_q35_attn needs for T rows of Hq heads (Hkv key heads) x D at positions p0.. (0: none) */
+int64_t ns_q35_attn_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0);
 /* Causal attention of rows q [T, Hq x D] (qs floats apart) at positions p0.. against the cache (D 256, Hq / Hkv 6 or
  * 1..8): out [T, Hq x D] */
 int ns_q35_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
