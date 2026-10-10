@@ -69,6 +69,17 @@ pub fn all(cfg: &Config) -> Result<Vec<Value>, String> {
     load(&registry(cfg))
 }
 
+/// Changes the entry `id` (and keeps the studio's chat modes in step): the entry as saved
+pub fn update(cfg: &Config, id: &str, f: impl FnOnce(&mut Value)) -> Result<Value, String> {
+    let path = registry(cfg);
+    let mut models = load(&path)?;
+    let m = models.iter_mut().find(|m| m["id"] == id).ok_or_else(|| format!("no model {id} (nextsycl models list)"))?;
+    f(m);
+    let out = m.clone();
+    save(cfg, &path, &models)?;
+    Ok(out)
+}
+
 /// The entry `id`
 pub fn find(cfg: &Config, id: &str) -> Result<Option<Value>, String> {
     Ok(load(&registry(cfg))?.into_iter().find(|m| m["id"] == id))

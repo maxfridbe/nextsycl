@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 nextsycl-core.workspace = true
 nextsycl-diffusion.workspace = true
+nextsycl-models.workspace = true
 nextsycl-llm.workspace = true
 nextsycl-image.workspace = true
 nextsycl-audio.workspace = true

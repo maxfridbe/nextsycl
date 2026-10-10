@@ -250,23 +250,37 @@ entry can point anywhere on the machine.
 Three small services sit beside the model servers, all in the program (no Python on the serving path):
 
 ```sh
-nextsycl serve [--port 8000] [--host 0.0.0.0] [--serve-host 0.0.0.0]
+nextsycl serve [--port 8000] [--host 0.0.0.0] [--serve-host 0.0.0.0] [--idle-minutes 10]
 nextsycl switch [--port 8001] [--upstream 127.0.0.1:8085] [--studio http://127.0.0.1:8090/rpc/llm.mode] [--alias OLD=NEW]...
                 [--images 127.0.0.1:8086]
 nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once]     # as root
 ```
 
-- **`serve`**: the box at a glance. A card per GPU: VRAM split by the processes holding it (each named - `llm serve
-  <model>`, `image serve`, a video worker, or the program - and the model by its registry id), busy %, power,
-  temperatures, the PCIe link. Every service: up or not, its model and what it is doing, its port and API, a link to
-  its page (Open WebUI, the image and music pages, the video studio). The controls: start the image or music server
-  with a model on a GPU (a card another engine holds is refused unless you say "start anyway" - two engines on one
-  card spill VRAM), stop it (after the requests in progress), and pick the chat model through the video studio's
-  `llm.mode` ("no chat model" frees its card). Each action's output shows below. Ports from the settings (`NS_PORT`,
-  `NS_SWITCH_PORT`, `NS_IMAGE_PORT`, `NS_AUDIO_PORT`, `NS_VIDEO_PORT`, `NS_CHAT_UI_PORT`); `nextsycl serve FILE`
-  still runs the language-model server as before.
+- **`serve`** (:8000, `docs/host/nextsycl-serve.service.example`): the front door.
+  - **The page**: every GPU's memory by process, and below it, hatched, what the enabled models are vouched for (as
+    seen while they ran, else an estimate from their files; chat models and video engines count once a card - one
+    runs at a time - and an overbooked card is flagged: whichever loads first holds it). Every registered model by
+    kind: enable it on its GPU(s), start it now (the button spins until it answers), stop it, disable it, its page.
+  - **Enabled** models load on their first request - an API call, their page, Open WebUI through the switcher - and
+    unload after `NS_IDLE_MINUTES` (10) without one (the image and music servers exit, `--idle-exit`; the switcher
+    sets the chat mode to none; the video daemon's workers let their card go), staying enabled. A load waits for its
+    card to have the model's memory free plus 1.5 GiB (past the card the xe driver spills into host memory) and
+    answers 409 when it does not come free. **Disabled**: unloaded, gone from Open WebUI's list and from the API.
+    The registry's `enabled` and `gpus` are the state (`nextsycl models enable|disable` agree); the enabled video
+    models are the video daemon's engines (serve starts, restarts and stops it).
+  - **The API**, behind `Authorization: Bearer <token>` (`NS_API_TOKEN`, else one made and kept in `serve.json`
+    beside the registry; the page's API tab shows it): `POST /rpc/<kind>.<method>` - H3's rules: POST only, fixed
+    routes, every variable in the JSON body, no path variables or query strings, `{"ok": true, "result": ...}` /
+    `{"ok": false, "error": {"code", "message"}}` - for `system` (state, models, enable, disable, load, unload),
+    `llm` (chat, models), `image` (generate, edit, info, progress, history), `audio` (generate, info, progress,
+    history, cancel), `video` (the studio's: generate, status, wait, queue.*, jobs.*, upload ...), each kind with
+    `describePromptGuideMD {model}`; and the OpenAI-compatible `/v1/models`, `/v1/chat/completions`,
+    `/v1/images/generations|edits`, `/v1/audio/speech` and the files they link. `GET /openapi.yml` describes the
+    kinds that have an enabled model (enabling one adds its methods); the API tab lists them with a curl each.
+    `/api/...` is the page's own.
 
-  ![nextsycl serve: the GPUs and the services](docs/screenshots/home-desktop.webp)
+  ![nextsycl serve: the GPUs, the models](docs/screenshots/home-desktop.webp)
+  ![nextsycl serve: the API tab](docs/screenshots/home-api.webp)
 
 - **`switch`**: one OpenAI endpoint for a chat front end over the one model server that runs at a time. It lists the
   registry's enabled chat models (read on every request); a request naming another model asks the video studio to
@@ -351,6 +365,7 @@ prompt, model, seed, size and steps. `check` compares each stage with the dumps 
 nextsycl image serve qwen-image-2.1-q8 [--wfe] [--port 8086] [--host 0.0.0.0] [--gpu N] [--lora NAME[:SCALE]]...
                      [--set NAME=VALUE]... [--out DIR] [--cors ORIGIN]
 nextsycl image start ...      # the same in the background (ready when it answers); image ps | logs [-f] | stop
+                              # --idle-exit SECONDS: the server ends after that long without work
 ```
 
 From the host it runs the build image as container `nextsycl-image` (the GPU, `dist/`, the registry, the model's and

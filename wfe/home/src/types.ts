@@ -1,10 +1,9 @@
-/** /api/state (glue/serve/src/home.rs). */
+/** /api/state and /api/spec (glue/serve/src/home). */
 
 export interface Proc {
   pid: number;
   vram_mb: number;
   program: string;
-  /** a nextsycl command: its kind, command, model, port and GPUs */
   kind?: string;
   command?: string;
   model?: string | null;
@@ -12,6 +11,8 @@ export interface Proc {
   gpus?: string[];
   args?: string;
 }
+
+export interface Vouched { model: string; kind: string; mb: number; measured: boolean; state: string; of?: number }
 
 export interface Card {
   index: number;
@@ -24,38 +25,29 @@ export interface Card {
   power_cap_w: number | null;
   temp_pkg: number | null;
   temp_vram: number | null;
-  freq_mhz: number | null;
   pcie: { cur: { gen: number | null; width: number } } | null;
   procs: Proc[];
+  vouched: Vouched[];
+  vouched_mb: number;
+  overbooked: boolean;
 }
 
-export interface ChatModes {
-  mode: string | null;
-  choices: Record<string, string> | null;
-  starting: string | null;
-  up: boolean | null;
-}
+export type ModelState = "disabled" | "unloaded" | "loading" | "loaded" | "busy" | "ready";
 
-export interface Service {
+export interface Model {
   id: string;
-  kind?: string;
-  title: string;
-  what: string;
-  port: number;
-  up: boolean;
-  model?: string | null;
-  detail?: string | null;
-  busy?: boolean | null;
-  waiting?: number | null;
-  /** the server has its web page (started with --wfe) */
-  page?: boolean | null;
-  link?: string;
-  api?: string;
-  startable?: boolean;
-  chat?: ChatModes | null;
+  kind: "llm" | "image" | "audio" | "video";
+  title: string | null;
+  arch: string | null;
+  enabled: boolean;
+  gpus: number[];
+  state: ModelState;
+  vouch_mb: Record<string, number>;
+  measured: boolean;
+  page: number;
 }
 
-export interface Model { id: string; title: string | null; kind: string; gpus: string | null }
+export interface Service { id: string; title: string; what: string; port: number; up: boolean; detail?: string | null; link?: string; api?: string }
 
 export interface Run { id: number; label: string; started: number; rc: number | null; out: string }
 
@@ -63,8 +55,23 @@ export interface State {
   ts: number;
   host: { mem_total_mb: number; mem_avail_mb: number; load1: number | null; cpus: number };
   cards: Card[];
-  services: Service[];
   models: Model[];
+  services: Service[];
   runs: Run[];
-  gpustat: { pci: string; age: number | null } | null;
+  idle_minutes: number;
+  ports: { video: number; chat_ui: number };
+}
+
+export interface Operation {
+  tags: string[];
+  operationId?: string;
+  summary: string;
+  requestBody?: { content: { "application/json": { example?: unknown; schema?: { properties?: Record<string, { type: string; description?: string; enum?: string[] }>; required?: string[] } } } };
+  parameters?: unknown[];
+  "x-curl"?: string;
+}
+
+export interface Spec {
+  token: string;
+  spec: { info: { description: string; version: string }; servers: { url: string }[]; paths: Record<string, Record<string, Operation>> };
 }

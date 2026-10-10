@@ -38,7 +38,8 @@ pub struct Mode {
 }
 
 pub struct Llm {
-    modes: Vec<Mode>,
+    /// the modes file (read on every use: `nextsycl models` and `nextsycl serve` rewrite it as models are enabled)
+    config: Option<PathBuf>,
     default: String,
     file: PathBuf,
     logs: PathBuf,
@@ -62,9 +63,13 @@ fn get(url: &str) -> Option<(u16, String)> {
 }
 
 impl Llm {
-    pub fn load(config: Option<PathBuf>, dir: &std::path::Path, logs: PathBuf) -> Llm {
-        let v: Value = config.as_ref().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(json!({}));
-        let modes = v["modes"]
+    fn read(config: Option<&PathBuf>) -> Value {
+        config.and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(json!({}))
+    }
+
+    /// The modes as the file says now
+    fn modes(&self) -> Vec<Mode> {
+        Self::read(self.config.as_ref())["modes"]
             .as_array()
             .map(|a| {
                 a.iter()
@@ -82,9 +87,13 @@ impl Llm {
                     })
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    pub fn load(config: Option<PathBuf>, dir: &std::path::Path, logs: PathBuf) -> Llm {
+        let v = Self::read(config.as_ref());
         Llm {
-            modes,
+            config,
             default: v["default"].as_str().unwrap_or("none").to_string(),
             file: dir.join("llm-mode"),
             logs,
@@ -94,8 +103,8 @@ impl Llm {
         }
     }
 
-    fn mode(&self, name: &str) -> Option<&Mode> {
-        self.modes.iter().find(|m| m.name == name)
+    fn mode(&self, name: &str) -> Option<Mode> {
+        self.modes().into_iter().find(|m| m.name == name)
     }
 
     /// The selected mode (`none` when nothing is configured).
@@ -121,10 +130,11 @@ impl Llm {
             }
         }
         let mode = self.selected();
-        let running: Vec<String> = self.modes.iter().filter(|m| self.up(m)).map(|m| m.name.clone()).collect();
+        let modes = self.modes();
+        let running: Vec<String> = modes.iter().filter(|m| self.up(m)).map(|m| m.name.clone()).collect();
         let v = json!({"mode": mode, "up": running.contains(&mode), "running": running, "starting": *self.starting.lock().unwrap(),
-                       "choices": self.modes.iter().map(|m| (m.name.clone(), json!(m.title))).collect::<serde_json::Map<String, Value>>(),
-                       "urls": self.modes.iter().map(|m| (m.name.clone(), json!(m.url))).collect::<serde_json::Map<String, Value>>(),
+                       "choices": modes.iter().map(|m| (m.name.clone(), json!(m.title))).collect::<serde_json::Map<String, Value>>(),
+                       "urls": modes.iter().map(|m| (m.name.clone(), json!(m.url))).collect::<serde_json::Map<String, Value>>(),
                        "url": self.mode(&mode).map(|m| m.url.clone())});
         *self.cache.lock().unwrap() = Some((now(), v.clone()));
         v
@@ -137,7 +147,7 @@ impl Llm {
     }
 
     fn start(&'static self, name: String, why: &str) {
-        let Some(m) = self.mode(&name).cloned() else { return };
+        let Some(m) = self.mode(&name) else { return };
         {
             let mut st = self.starting.lock().unwrap();
             if st.is_some() || self.up(&m) {
@@ -179,7 +189,7 @@ impl Llm {
     pub fn set(&'static self, studio: &Studio, want: Option<&str>) -> Result<Value, RpcError> {
         let Some(want) = want else { return Ok(self.status()) };
         if want != "none" && self.mode(want).is_none() {
-            let names: Vec<&str> = self.modes.iter().map(|m| m.name.as_str()).collect();
+            let names: Vec<String> = self.modes().into_iter().map(|m| m.name).collect();
             return Err(RpcError::param(&format!("mode must be one of {names:?} or none")));
         }
         let cur = self.selected();
@@ -190,7 +200,7 @@ impl Llm {
             return Ok(self.status()); // the starter sees the new selection and hands over
         }
         // stop everything but the wanted model; start it only when the engine does not hold the card
-        for m in &self.modes {
+        for m in &self.modes() {
             if m.name != want && (want == "none" || want != cur || self.up(m)) {
                 Self::sh(&m.stop);
             }
@@ -219,7 +229,7 @@ impl Llm {
         g.1 = now();
         drop(g);
         let mode = self.selected();
-        if mode != "none" && self.mode(&mode).is_some_and(|m| !self.up(m)) {
+        if mode != "none" && self.mode(&mode).is_some_and(|m| !self.up(&m)) {
             let why = if first { format!("the studio started and {mode} is down") } else { format!("GPU idle {} min and {mode} is down", ((now() - since) / 60.0) as u64) };
             self.start(mode.clone(), &why);
         }

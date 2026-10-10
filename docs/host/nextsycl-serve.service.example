@@ -1,0 +1,22 @@
+# /etc/systemd/system/nextsycl-serve.service - the front door (nextsycl serve, :8000): the GPUs and the models,
+# enabling and loading them, one API (/rpc, /v1, /openapi.yml). Runs as the user whose rootless containers the kinds'
+# servers are; it starts and stops the video daemon as the enabled video models say (so nextsycl-video.service is
+# not needed beside it).
+[Unit]
+Description=nextsycl serve (:8000) - GPUs, models, the API
+After=network-online.target user@1000.service nextsycl-video-studio.service
+Wants=user@1000.service
+
+[Service]
+User=you
+Environment=XDG_RUNTIME_DIR=/run/user/1000 HOME=/home/you NS_REGISTRY=/var/lib/nextsycl/models.json
+WorkingDirectory=/path/to/nextsycl
+# (through sh: SELinux on Fedora Atomic lets a service run binaries under home only that way)
+ExecStart=/bin/sh -c "exec /path/to/nextsycl/dist/nextsycl serve --port 8000"
+# the servers it started are containers of their own: they stay up across a restart of this page
+KillMode=process
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

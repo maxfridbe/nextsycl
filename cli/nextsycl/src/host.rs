@@ -19,7 +19,7 @@ fn secs(args: &[String], k: &str, d: f64) -> Result<Duration, String> {
 }
 
 /// `nextsycl switch [--host 0.0.0.0] [--port 8001] [--upstream 127.0.0.1:8085] [--studio URL] [--wait 420]
-/// [--in-use 90] [--alias OLD=NEW]... [--images 127.0.0.1:8086]`
+/// [--in-use 90] [--alias OLD=NEW]... [--images 127.0.0.1:8086] [--idle-minutes 10]`
 pub fn switch(args: &[String]) -> Result<(), String> {
     // the same settings, the closure's own (the registry is read on every request)
     let cfg = Config::load();
@@ -45,13 +45,18 @@ pub fn switch(args: &[String]) -> Result<(), String> {
     let studio = opt(args, "--studio").unwrap_or("http://127.0.0.1:8090/rpc/llm.mode");
     let mut sw = Switch::new(list, aliases, upstream, studio, secs(args, "--wait", 420.0)?, secs(args, "--in-use", 90.0)?)?;
     sw.images = opt(args, "--images").map(|a| Target::Tcp(a.to_string()));
+    // the same idle time as the front door's (NS_IDLE_MINUTES), unless given
+    let idle = opt(args, "--idle-minutes").map(str::to_string).or_else(|| Config::load().get("NS_IDLE_MINUTES"));
+    sw.idle = idle.map(|v| v.parse::<f64>().map_err(|_| "--idle-minutes N")).transpose()?.filter(|m| *m > 0.0)
+        .map(|m| Duration::from_secs_f64(m * 60.0));
     let addr = format!("{}:{}", opt(args, "--host").unwrap_or("0.0.0.0"), opt(args, "--port").unwrap_or("8001"));
     std::sync::Arc::new(sw).run(&addr)
 }
 
-/// `nextsycl serve [--host 0.0.0.0] [--port 8000] [--serve-host 0.0.0.0]`: the GPUs and the services, with links and
-/// controls (nextsycl_serve::home). Ports from the settings: NS_PORT, NS_SWITCH_PORT, NS_IMAGE_PORT, NS_AUDIO_PORT,
-/// NS_VIDEO_PORT, NS_CHAT_UI_PORT.
+/// `nextsycl serve [--host 0.0.0.0] [--port 8000] [--serve-host 0.0.0.0] [--idle-minutes 10]`: the front door - the GPUs
+/// and the models, enabling and loading them, one API for all (nextsycl_serve::home). Ports from the settings:
+/// NS_PORT, NS_SWITCH_PORT, NS_IMAGE_PORT, NS_AUDIO_PORT, NS_VIDEO_PORT, NS_CHAT_UI_PORT; the API's token NS_API_TOKEN
+/// (else one made and kept beside the registry); NS_IDLE_MINUTES.
 pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
     use nextsycl_serve::home::{Home, Options, Ports};
     let port = |k: &str, d: u16| cfg.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
@@ -59,7 +64,7 @@ pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
     if !wfe.join("home/index.html").exists() {
         return Err(format!("{}: the page is not built yet (./build.sh wfe)", wfe.display()));
     }
-    let c2 = Config::load();
+    let idle = opt(args, "--idle-minutes").map(str::to_string).or_else(|| cfg.get("NS_IDLE_MINUTES")).map_or(Ok(10), |v| v.parse::<u64>().map_err(|_| "--idle-minutes N"))?;
     let o = Options {
         wfe,
         exe: std::env::current_exe().map_err(|e| e.to_string())?,
@@ -68,10 +73,11 @@ pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
             video: port("NS_VIDEO_PORT", 8090), chat_ui: port("NS_CHAT_UI_PORT", 8080),
         },
         serve_host: opt(args, "--serve-host").unwrap_or("0.0.0.0").to_string(),
-        models: Box::new(move || nextsycl_serve::home::with_kinds(models::all(&c2).unwrap_or_default(), |m| models::kind_of(m).to_string())),
+        cfg: Config::load(),
+        idle_minutes: idle,
     };
-    let addr = format!("{}:{}", opt(args, "--host").unwrap_or("0.0.0.0"), opt(args, "--port").or(cfg.get("NS_SERVE_PORT").as_deref()).unwrap_or("8000"));
-    Home::new(o).run(&addr)
+    let addr = format!("{}:{}", opt(args, "--host").unwrap_or("0.0.0.0"), opt(args, "--port").map(str::to_string).or_else(|| cfg.get("NS_SERVE_PORT")).unwrap_or("8000".into()));
+    Home::new(o)?.run(&addr)
 }
 
 /// `nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--power-window 15] [--pci ADDR] [--vram-mb N] [--once]`

@@ -353,7 +353,8 @@ fn serve_here(cfg: &Config, m: &Value, files: ModelFiles, args: &[String], out: 
     let wfe = args.iter().any(|a| a == "--wfe").then(|| cfg.dist.join("wfe"));
     let cors: Vec<String> = opt(args, "--cors").or(cfg.get("NS_CORS").as_deref()).map(|c| c.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default();
     let addr = format!("{}:{}", opt(args, "--host").unwrap_or("127.0.0.1"), opt(args, "--port").unwrap_or("8086"));
-    let srv = ImageServer::new(m["id"].as_str().unwrap_or("image").to_string(), gpu, loader, first.merge_loras, known, Some(out), wfe, cors)?;
+    let mut srv = ImageServer::new(m["id"].as_str().unwrap_or("image").to_string(), gpu, loader, first.merge_loras, known, Some(out), wfe, cors)?;
+    srv.idle = crate::served::idle_exit(args)?;
     std::sync::Arc::new(srv).run(&addr)
 }
 

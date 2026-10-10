@@ -47,6 +47,8 @@ pub struct AudioServer {
     waiting: AtomicUsize,
     cancel: AtomicBool,
     history: Mutex<VecDeque<Value>>,
+    /// ends the process after an idle stretch (`--idle-exit`; none: never)
+    pub idle: Option<&'static crate::idle::Idle>,
 }
 
 /// A float32 setting as JSON without its binary tail (1.7, not 1.7000000476837158)
@@ -120,12 +122,18 @@ impl AudioServer {
         let tele = Telemetry::start(std::slice::from_ref(&gpu.pci));
         let history = Mutex::new(out_dir.as_deref().map(earlier).unwrap_or_default());
         Ok(AudioServer { model, out_dir, wfe, cors, gpu, tele, engine: Mutex::new(engine), progress: Mutex::new(json!({"busy": false})),
-                         waiting: AtomicUsize::new(0), cancel: AtomicBool::new(false), history })
+                         idle: None, waiting: AtomicUsize::new(0), cancel: AtomicBool::new(false), history })
     }
 
     /// Answers on `addr` until the process ends
     pub fn run(self: Arc<Self>, addr: &str) -> Result<(), String> {
         let l = TcpListener::bind(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+        if let Some(i) = self.idle {
+            let me = self.clone();
+            i.watch("nextsycl audio", Box::new(move || {
+                me.waiting.load(Ordering::Relaxed) > 0 || me.progress.lock().map(|p| p["busy"] == true).unwrap_or(true)
+            }));
+        }
         eprintln!("nextsycl audio: {} on http://{addr}/v1/audio/speech{}", self.model,
                   if self.wfe.is_some() { format!(" and http://{addr}/ (the web front end)") } else { String::new() });
         for c in l.incoming().flatten() {
@@ -137,6 +145,13 @@ impl AudioServer {
 
     fn handle(&self, mut s: Conn) {
         let req = match http::read_request(&mut s) {
+            Ok(r) if r.method == "POST" || r.path == "/" => {
+                // work (a request, a page opened) keeps the server; the page's polling does not
+                if let Some(i) = self.idle {
+                    i.touch();
+                }
+                r
+            }
             Ok(r) => r,
             Err(e) => return http::respond(&mut s, 400, &err(e)),
         };

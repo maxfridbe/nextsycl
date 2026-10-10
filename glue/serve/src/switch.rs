@@ -10,6 +10,9 @@
 //! registry: `tools: false` drops a request's tool definitions, `tasks: false` declines Open WebUI's background
 //! tasks ("### Task:" prompts). The log carries sizes only, never content.
 //!
+//! With `idle`, the loaded model is unloaded (the studio's llm.mode "none") once nothing has asked for it that long
+//! and it is not answering; the next request loads it again.
+//!
 //! With an image server (`images`), the images API (`/v1/images/...`: generations, edits, files) goes to it and its
 //! model is listed beside the chat ones while it answers - one base URL for a front end's chat and pictures.
 
@@ -48,6 +51,8 @@ pub struct Switch {
     pub in_use: Duration,
     /// the image server (`nextsycl image start`), when there is one
     pub images: Option<Target>,
+    /// unload the chat model after this long without a request
+    pub idle: Option<Duration>,
     swap: Mutex<()>,
     last_use: Mutex<HashMap<String, Instant>>,
 }
@@ -65,17 +70,43 @@ impl Switch {
     pub fn new(models: Models, aliases: HashMap<String, String>, upstream: Target, studio_url: &str, wait: Duration, in_use: Duration)
                -> Result<Switch, String> {
         let (host, path) = http::split_url(studio_url)?;
-        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, images: None, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()) })
+        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, images: None, idle: None, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()) })
     }
 
     pub fn run(self: Arc<Self>, addr: &str) -> Result<(), String> {
         let l = TcpListener::bind(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+        if let Some(idle) = self.idle {
+            let me = self.clone();
+            std::thread::spawn(move || me.unload_idle(idle));
+        }
         eprintln!("model switch on {addr} -> {}, swaps via http://{}{}", self.upstream, self.studio.0, self.studio.1);
         for c in l.incoming().flatten() {
             let me = self.clone();
             std::thread::spawn(move || me.handle(Conn::Tcp(c)));
         }
         Ok(())
+    }
+
+    /// Every 30 s: the loaded model unloaded when nobody has asked for it for `idle` (a model loaded from elsewhere
+    /// counts from when it was first seen here), unless it is answering or a swap runs
+    fn unload_idle(&self, idle: Duration) {
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            let models = (self.models)();
+            let Some(on) = self.loaded().and_then(|c| self.served(&c, &models)) else { continue };
+            let since = *self.last_use.lock().unwrap().entry(on.clone()).or_insert_with(Instant::now);
+            if since.elapsed() < idle || self.busy() {
+                continue;
+            }
+            let Ok(_g) = self.swap.try_lock() else { continue };
+            eprintln!("{on}: idle for {} min - unloading (the next request loads it again)", idle.as_secs() / 60);
+            match self.studio(Some("none")) {
+                Ok(_) => {
+                    self.last_use.lock().unwrap().remove(&on);
+                }
+                Err(e) => eprintln!("  the studio's llm.mode: {e}"),
+            }
+        }
     }
 
     /// The studio's llm.mode: its state, or (with a mode) a swap to it

@@ -44,3 +44,28 @@
  .brand{display:flex;align-items:center;gap:14px;flex-wrap:wrap} .brand img{height:76px;width:auto;margin:-8px 0 -8px -14px}
  .brand .host{font-size:15px;font-weight:500;color:#94a3b8}
  @media (max-width:640px){ .brand img{height:60px} }
+ .tabs{display:flex;gap:6px;margin:0 0 12px} .tab{background:#181b22;border:1px solid #2a2f3a;color:#9ca3af} .tab.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+ .meter.vouch{height:6px;background:transparent;border:1px dashed #2a2f3a}
+ .hatch{background:repeating-linear-gradient(45deg,var(--c,#64748b) 0 3px,transparent 3px 7px)!important;opacity:.75}
+ .hatch.live{opacity:1}
+ .card.over{border-color:#b45309}
+ .procs li.dim{opacity:.75} .procs .sw.hatch{border:1px solid var(--c)}
+ .kind{margin:6px 0 14px} .kind h4{margin:6px 0;font-size:14px;display:flex;align-items:center;gap:6px}
+ .mrow{display:grid;grid-template-columns:18px minmax(160px,1fr) 150px auto;gap:6px 12px;align-items:center;padding:7px 0;border-top:1px solid #222733}
+ .mrow.off .name{color:#94a3b8} .mname .name{font-weight:600;font-size:14px} .mname .sub{color:#6b7280;font-size:12px;overflow-wrap:anywhere}
+ .tag{font-size:11px;padding:2px 8px;border-radius:999px;background:#1f2937;color:#cbd5e1;white-space:nowrap}
+ .tag.loaded,.tag.ready{background:#064e3b;color:#a7f3d0} .tag.busy,.tag.loading{background:#78350f;color:#fde68a} .tag.disabled{background:#111827;color:#6b7280}
+ .acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;align-items:center}
+ .gpus{display:inline-flex;gap:4px} .gpu{font-size:11px;border:1px solid #2f3646;border-radius:6px;padding:3px 6px;color:#9ca3af;cursor:pointer;display:inline-flex;gap:4px;align-items:center}
+ .gpu.on{border-color:#3b82f6;color:#e5e7eb} .gpu input{margin:0}
+ .spin{display:inline-block;width:11px;height:11px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:sp .8s linear infinite;margin-right:6px;vertical-align:-1px}
+ @keyframes sp{to{transform:rotate(360deg)}}
+ button.small{padding:3px 8px;font-size:12px}
+ code{font-family:ui-monospace,monospace;font-size:12px;background:#0c0e13;border:1px solid #222733;border-radius:4px;padding:1px 5px}
+ code.token{font-size:13px;color:#fde68a}
+ .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 8px}
+ .op{border-top:1px solid #222733;padding:8px 0} .ophead{font-size:13px} .route{color:#93c5fd}
+ .verb{font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;background:#1e3a8a;color:#bfdbfe} .verb.get{background:#064e3b;color:#a7f3d0}
+ .fields{display:flex;flex-wrap:wrap;gap:4px 12px;margin:5px 0;font-size:12px}
+ .curl{display:flex;gap:8px;align-items:flex-start} .curl pre{flex:1;margin:4px 0 0;background:#0c0e13;color:#cbd5e1;padding:8px;border-radius:6px;font-size:11px;white-space:pre-wrap;word-break:break-all}
+ @media (max-width:640px){ .mrow{grid-template-columns:18px 1fr} .mrow .mstate,.mrow .acts{grid-column:1 / -1} .mrow .acts{justify-content:flex-start} }

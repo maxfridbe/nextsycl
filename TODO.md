@@ -191,6 +191,9 @@ of IQ2_XXS instead could win twice.
 - [x] `nextsycl serve`: the box at a glance (glue/serve home, wfe/home): every GPU's VRAM by process, the services with
       their links, start / stop image and music servers on a GPU (a held card refused unless forced), the chat model
       through llm.mode; `audio start | ps | logs | stop` (cli served.rs, shared with image)
+- [x] The front door (:8000, a service): models enabled per GPU, load on demand, idle unload (image / music
+      --idle-exit, the switcher's idle, video workers), VRAM vouching; /rpc/<kind>.<method> + /v1 behind a bearer
+      token, /openapi.yml, describePromptGuideMD; the API tab
 - [ ] Qwen3.8-Flash-Next's own vision input for chat (transformers has qwen4_exp's vision tower); `image inspect | bench`
 - [x] H3's other modes (ComfyUI nodes_minimax_h3.py): Ref2VA (the vision tower in the text encoder, references in the
       denoiser, the ref2va model), keyframe pictures to the text encoder, the effect embeddings, the Fun ControlNet

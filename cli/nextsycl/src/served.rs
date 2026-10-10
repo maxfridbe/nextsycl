@@ -22,6 +22,17 @@ fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
     args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
 
+/// `--idle-exit SECONDS`: the server ends after that long without work (none: never)
+pub fn idle_exit(args: &[String]) -> Result<Option<&'static nextsycl_serve::idle::Idle>, String> {
+    match opt(args, "--idle-exit") {
+        None => Ok(None),
+        Some(v) => {
+            let s: u64 = v.parse().map_err(|_| format!("--idle-exit {v}: seconds"))?;
+            Ok((s > 0).then(|| &*Box::leak(Box::new(nextsycl_serve::idle::Idle::new(Some(std::time::Duration::from_secs(s)))))))
+        }
+    }
+}
+
 fn me() -> String {
     std::env::args().next().unwrap_or_else(|| "nextsycl".into())
 }

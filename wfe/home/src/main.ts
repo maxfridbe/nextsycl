@@ -7,18 +7,20 @@ import { propsModule } from "../../vendor/snabbdom/modules/props.js";
 import { styleModule } from "../../vendor/snabbdom/modules/style.js";
 import type { VNode } from "../../vendor/snabbdom/vnode.js";
 import { App } from "./components/App.js";
-import type { State } from "./types.js";
+import type { Spec, State } from "./types.js";
 
 export const ui = {
   state: null as State | null,
+  spec: null as Spec | null,
   error: null as string | null,
-  /** per startable kind: the model and GPU picked */
-  pick: {} as Record<string, { model: string; gpu: number }>,
-  /** a refusal that can be overridden (a card in use): the kind it was for */
-  conflict: null as { kind: string; message: string } | null,
+  tab: (() => { try { return localStorage.getItem("ns-tab") ?? "status"; } catch { return "status"; } })() as "status" | "api",
+  /** per model: the GPUs picked before enabling */
+  pick: {} as Record<string, number[]>,
+  /** per model: an action under way from this page (its button spins until the state says it is done) */
+  pending: {} as Record<string, { what: string; since: number }>,
   /** the run whose output is open */
   openRun: null as number | null,
-  sending: false,
+  copied: null as string | null,
 };
 
 const patch = init([attributesModule, propsModule, classModule, styleModule, eventListenersModule]);
@@ -34,38 +36,93 @@ export function render(): void {
   });
 }
 
+/** An action is done when the state shows its result (or after 20 min) */
+function settle(): void {
+  const st = ui.state;
+  if (!st) return;
+  for (const [id, p] of Object.entries(ui.pending)) {
+    const m = st.models.find((x) => x.id === id);
+    const done = !m || Date.now() - p.since > 1_200_000
+      || (p.what === "load" && ["loaded", "busy", "ready"].includes(m.state))
+      || (p.what === "unload" && !["loaded", "busy", "loading"].includes(m.state))
+      || (p.what === "enable" && m.enabled) || (p.what === "disable" && !m.enabled);
+    // a failed load shows in the actions: stop spinning
+    const failed = p.what === "load" && m && m.state === "unloaded" && Date.now() - p.since > 8000
+      && st.runs.some((r) => r.label === `load ${id}` && r.started * 1000 > p.since && r.rc !== null && r.rc !== 0);
+    if (done || failed) delete ui.pending[id];
+  }
+}
+
 async function poll(): Promise<void> {
   try {
     const r = await fetch("/api/state");
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     ui.state = (await r.json()) as State;
     ui.error = null;
+    settle();
   } catch (e) {
     ui.error = `nextsycl serve does not answer (${String(e)})`;
   }
   render();
-  const running = ui.state?.runs.some((x) => x.rc === null);
-  setTimeout(() => void poll(), running ? 1000 : 2500);
+  const busy = Object.keys(ui.pending).length > 0 || ui.state?.runs.some((x) => x.rc === null);
+  setTimeout(() => void poll(), busy ? 1000 : 2500);
 }
 
-/** start / stop a kind's server, or pick the chat model ("none": no chat, its card free) */
-export async function act(body: Record<string, unknown>): Promise<void> {
-  ui.sending = true;
-  ui.conflict = null;
-  render();
+export async function loadSpec(): Promise<void> {
   try {
-    const r = await fetch("/api/action", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    const j = (await r.json()) as { run?: number; error?: string };
-    if (r.status === 409 && typeof body.kind === "string") ui.conflict = { kind: body.kind, message: j.error ?? "in use" };
-    else if (!r.ok) ui.error = j.error ?? `HTTP ${r.status}`;
-    else if (j.run) ui.openRun = j.run;
+    const r = await fetch("/api/spec");
+    ui.spec = (await r.json()) as Spec;
   } catch (e) {
     ui.error = String(e);
   }
-  ui.sending = false;
+  render();
+}
+
+/** enable / disable / load / unload a model; its button spins until the state shows the result */
+export async function act(what: string, model: string, extra: Record<string, unknown> = {}): Promise<void> {
+  ui.pending[model] = { what, since: Date.now() };
+  render();
+  try {
+    const r = await fetch("/api/action", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ do: what, model, ...extra }),
+    });
+    const j = (await r.json()) as { error?: string };
+    if (!r.ok) {
+      ui.error = j.error ?? `HTTP ${r.status}`;
+      delete ui.pending[model];
+    }
+    if (what === "enable" || what === "disable") void loadSpec();
+  } catch (e) {
+    ui.error = String(e);
+    delete ui.pending[model];
+  }
   render();
   void poll();
 }
 
+export function setTab(t: "status" | "api"): void {
+  ui.tab = t;
+  try { localStorage.setItem("ns-tab", t); } catch { /* no storage */ }
+  if (t === "api" && !ui.spec) void loadSpec();
+  render();
+}
+
+export async function copy(text: string, key: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const t = document.createElement("textarea");
+    t.value = text;
+    document.body.appendChild(t);
+    t.select();
+    document.execCommand("copy");
+    t.remove();
+  }
+  ui.copied = key;
+  render();
+  setTimeout(() => { if (ui.copied === key) { ui.copied = null; render(); } }, 1500);
+}
+
 render();
 void poll();
+if (ui.tab === "api") void loadSpec();
