@@ -49,8 +49,10 @@ export function Speak() {
         : null}
       {sp.design || sp.instructions
         ? <div>
-            <div class="lab">{sp.design ? "the voice" : "how to say it"}
-              <span class="hint">{sp.design ? "who speaks: age, gender, timbre, pace, emotion, accent" : "optional: the mood, the pace, the delivery"}</span>
+            <div class="lab">{sp.requires === "instructions" ? "the voice" : sp.design ? "the voice, or the style" : "how to say it"}
+              <span class="hint">{sp.requires === "instructions" ? "who speaks: age, gender, timbre, pace, emotion, accent"
+                : sp.design ? "optional: a voice to make up (who speaks: age, gender, timbre, pace), or with a cloned voice its style"
+                : "optional: the mood, the pace, the delivery"}</span>
             </div>
             {area("instructions", "", sp.design
               ? "A calm elderly woman with a soft, slightly raspy voice, speaking slowly and warmly."
@@ -61,7 +63,7 @@ export function Speak() {
         ? <div>
             {state.voices.length
               ? <div>
-                  <div class="lab">a saved voice <span class="hint">or a recording below</span></div>
+                  <div class="lab">a saved voice <span class="hint">{sp.requires === "reference" ? "or a recording below" : "optional: or a recording below"}</span></div>
                   <span class="chips">
                     {state.voices.map((v) => (
                       <span class="vchip">
@@ -98,12 +100,14 @@ export function Speak() {
           </div>
         : null}
       <div class="row">
-        <label>language
-          <select on={{ change: (e: Event) => set("language", (e.target as HTMLSelectElement).value) }}>
-            <option attrs={{ value: "" }} props={{ selected: f.language === "" }}>auto</option>
-            {sp.languages.map((l) => <option attrs={{ value: l }} props={{ selected: f.language === l }}>{pretty(l)}</option>)}
-          </select>
-        </label>
+        {sp.languages.length
+          ? <label>language
+              <select on={{ change: (e: Event) => set("language", (e.target as HTMLSelectElement).value) }}>
+                <option attrs={{ value: "" }} props={{ selected: f.language === "" }}>auto</option>
+                {sp.languages.map((l) => <option attrs={{ value: l }} props={{ selected: f.language === l }}>{pretty(l)}</option>)}
+              </select>
+            </label>
+          : null}
         <label>at most (s)
           <input attrs={{ type: "number", min: 1, max, step: 1 }} props={{ value: String(f.seconds) }}
                  on={{ change: (e: Event) => { const x = Number((e.target as HTMLInputElement).value); if (x > 0) { state.form.seconds = Math.min(x, max); saveForm(); } render(); } }} />

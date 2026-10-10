@@ -266,6 +266,11 @@ impl AudioEngine for Qwen3Tts {
             clone: kind == "base" && self.speaker.is_some(),
             clone_needs_text: false,
             clone_takes_text: kind == "base" && self.encoder.is_some(),
+            requires: Some(match kind {
+                "custom_voice" => "voice",
+                "voice_design" => "instructions",
+                _ => "reference",
+            }),
         })
     }
     fn options(&self) -> &'static [EngineOption] {

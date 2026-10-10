@@ -27,6 +27,9 @@ pub struct Tokenizer {
     special: Vec<(String, u32)>,
     split: Regex,
     ignore_merges: bool,
+    /// SentencePiece-style BPE (a Llama tokenizer.json: no pre-tokenizer, "▁" for spaces and ahead of the text, merges
+    /// over the whole text, unknown characters as their bytes' <0xNN> tokens) instead of GPT-2's byte-level one
+    sentencepiece: bool,
     byte_enc: [char; 256],
     byte_dec: HashMap<char, u8>,
     pub eos: Option<u32>,
@@ -87,11 +90,17 @@ impl Tokenizer {
             };
             Some(((a, b), r))
         }).collect();
+        // SentencePiece's shape: a normalizer that puts "▁" ahead of the text, no pre-tokenizer, byte fallback
+        let sentencepiece = j["pre_tokenizer"].is_null() && model["byte_fallback"] == true
+            && j["normalizer"].to_string().contains("\"Prepend\"");
         // the first Split pre-tokenizer's pattern (Qwen's: case-insensitive contractions, letters, single digits...)
-        let pattern = j["pre_tokenizer"]["pretokenizers"].as_array().into_iter().flatten()
-            .chain(std::iter::once(&j["pre_tokenizer"]))
-            .find_map(|p| (p["type"] == "Split").then(|| p["pattern"]["Regex"].as_str()).flatten())
-            .ok_or("tokenizer.json: no Split pre-tokenizer pattern")?;
+        let pattern = match sentencepiece {
+            true => ".+",
+            false => j["pre_tokenizer"]["pretokenizers"].as_array().into_iter().flatten()
+                .chain(std::iter::once(&j["pre_tokenizer"]))
+                .find_map(|p| (p["type"] == "Split").then(|| p["pattern"]["Regex"].as_str()).flatten())
+                .ok_or("tokenizer.json: no Split pre-tokenizer pattern")?,
+        };
         let byte_enc = byte_alphabet();
         let byte_dec = byte_enc.iter().enumerate().map(|(b, c)| (*c, b as u8)).collect();
         let mut stop: Vec<u32> = ["<|endoftext|>", "<|im_end|>"].iter().filter_map(|s| ids.get(*s).copied()).collect();
@@ -104,6 +113,7 @@ impl Tokenizer {
             special,
             split: Regex::new(pattern).map_err(|e| e.to_string())?,
             ignore_merges: model["ignore_merges"].as_bool().unwrap_or(false),
+            sentencepiece,
             byte_enc,
             byte_dec,
             stop,
@@ -145,6 +155,7 @@ impl Tokenizer {
             special,
             split: Regex::new(QWEN2_SPLIT).map_err(|e| e.to_string())?,
             ignore_merges: false,
+            sentencepiece: false,
             byte_enc,
             byte_dec,
             stop,
@@ -195,6 +206,7 @@ impl Tokenizer {
             split: Regex::new(split).map_err(|e| e.to_string())?,
             // llama.cpp takes a piece the vocabulary has whole for GLM's (not the old chatglm-bpe); Qwen's merge by rank
             ignore_merges: matches!(pre, "glm4" | "glm5"),
+            sentencepiece: false,
             byte_enc,
             byte_dec,
             stop,
@@ -228,6 +240,22 @@ impl Tokenizer {
     }
 
     fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
+        if self.sentencepiece {
+            if text.is_empty() {
+                return;
+            }
+            let t = format!("\u{2581}{}", text.replace(' ', "\u{2581}"));
+            let mut parts = Vec::new();
+            self.bpe_parts(&t, &mut parts);
+            for p in parts {
+                match self.ids.get(&p) {
+                    Some(id) => out.push(*id),
+                    // byte fallback
+                    None => out.extend(p.bytes().filter_map(|b| self.ids.get(&format!("<0x{b:02X}>")).copied())),
+                }
+            }
+            return;
+        }
         for m in self.split.find_iter(text).flatten() {
             let piece: String = m.as_str().bytes().map(|b| self.byte_enc[b as usize]).collect();
             if self.ignore_merges {
@@ -238,6 +266,20 @@ impl Tokenizer {
             }
             self.bpe(&piece, out);
         }
+    }
+
+    /// Merges by rank over a piece's characters: the parts left
+    fn bpe_parts(&self, piece: &str, out: &mut Vec<String>) {
+        let mut parts: Vec<String> = piece.chars().map(|c| c.to_string()).collect();
+        loop {
+            let best = (0..parts.len().saturating_sub(1))
+                .filter_map(|i| self.ranks.get(&(parts[i].clone(), parts[i + 1].clone())).map(|r| (*r, i)))
+                .min();
+            let Some((_, i)) = best else { break };
+            let joined = format!("{}{}", parts[i], parts[i + 1]);
+            parts.splice(i..i + 2, [joined]);
+        }
+        out.extend(parts);
     }
 
     /// Merges by rank: repeatedly join the adjacent pair with the lowest merge rank.

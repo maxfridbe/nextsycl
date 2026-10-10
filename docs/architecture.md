@@ -46,6 +46,8 @@ audio/                     AUDIO
                                  transformer and its windows, the decoder, stage checks
   qwen3tts   nextsycl-audio-qwen3tts  Qwen3-TTS: the prompt per voice kind, the talker and code predictor, the 12 Hz
                                  codec's decoder and encoder, the speaker encoder (host), stage checks
+  voxcpm2    nextsycl-audio-voxcpm2  VoxCPM2: MiniCPM4 language models, the local encoder and flow-matching DiT,
+                                 AudioVAE V2, a .pth reader, stage checks
   example    nextsycl-audio-example  a template
 
 glue/                      WHAT MAKES ENGINES A PRODUCT (libraries too)

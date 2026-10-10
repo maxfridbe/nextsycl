@@ -37,6 +37,8 @@ export interface Speech {
   clone_needs_text: boolean;
   /** a transcript of the recording makes a closer clone */
   clone_takes_text?: boolean;
+  /** what a request must carry besides the text */
+  requires?: "voice" | "instructions" | "reference" | null;
 }
 
 export interface Progress {

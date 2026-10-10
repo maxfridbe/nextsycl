@@ -23,6 +23,7 @@ nextsycl-audio.workspace = true
 nextsycl-audio-example.workspace = true
 nextsycl-audio-minimaxmusic3.workspace = true
 nextsycl-audio-qwen3tts.workspace = true
+nextsycl-audio-voxcpm2.workspace = true
 nextsycl-models.workspace = true
 nextsycl-serve.workspace = true
 serde_json.workspace = true

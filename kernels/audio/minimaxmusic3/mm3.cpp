@@ -221,8 +221,9 @@ int ns_audio_mm3_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, con
     const half* v = (const half*) vc;
     if (D == 128 && Hq == 4 * Hkv) attn<8, 4>(g->q, q, qs, k, v, B, S, Hq, Hkv, T, p0, out, part);
     else if (D == 128 && Hq == 2 * Hkv) attn<8, 2>(g->q, q, qs, k, v, B, S, Hq, Hkv, T, p0, out, part);
+    else if (D == 128 && Hq == 8 * Hkv) attn<8, 8>(g->q, q, qs, k, v, B, S, Hq, Hkv, T, p0, out, part);
     else if (D == 256 && Hq == Hkv) attn<16, 1>(g->q, q, qs, k, v, B, S, Hq, Hkv, T, p0, out, part);
-    else return ns_fail("ns_audio_mm3_attn: D 128 with 4 or 2 query heads a key head, or D 256 with one");
+    else return ns_fail("ns_audio_mm3_attn: D 128 with 8, 4 or 2 query heads a key head, or D 256 with one");
     return 0;
     NS_CATCH
 }

@@ -7,7 +7,7 @@ members = [
     "llm/contract", "llm/glm5next", "llm/qwen4exp", "llm/example",
     "image/contract", "image/example", "image/qwenimage21",
     "video/contract", "video/example", "video/h3",
-    "audio/contract", "audio/example", "audio/minimaxmusic3", "audio/qwen3tts",
+    "audio/contract", "audio/example", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2",
     "glue/models", "glue/serve",
     "cli/nextsycl",
 ]
@@ -38,6 +38,7 @@ nextsycl-audio = { path = "audio/contract" }
 nextsycl-audio-example = { path = "audio/example" }
 nextsycl-audio-minimaxmusic3 = { path = "audio/minimaxmusic3" }
 nextsycl-audio-qwen3tts = { path = "audio/qwen3tts" }
+nextsycl-audio-voxcpm2 = { path = "audio/voxcpm2" }
 nextsycl-models = { path = "glue/models" }
 nextsycl-serve = { path = "glue/serve" }
 serde_json = "1"

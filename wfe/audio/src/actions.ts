@@ -106,9 +106,9 @@ export function canGo(): boolean {
   const sp = state.info?.speech;
   if (!sp) return !!f.prompt.trim();
   if (!f.text.trim()) return false;
-  if (sp.voices.length && !f.voice) return false;
-  if (sp.design && !f.instructions.trim()) return false;
-  if (sp.clone && !f.refAudio && !state.voices.some((v) => v.name === f.voice)) return false;
+  if (sp.requires === "voice" && !f.voice) return false;
+  if (sp.requires === "instructions" && !f.instructions.trim()) return false;
+  if (sp.requires === "reference" && !f.refAudio && !state.voices.some((v) => v.name === f.voice)) return false;
   return true;
 }
 
@@ -121,7 +121,7 @@ function body(): Record<string, unknown> {
     : { model: state.info?.model, instructions: f.prompt.trim(), input: f.lyrics.trim(), seconds: f.seconds, response_format: "url" };
   if (sp) {
     if (sp.voices.length && f.voice) b.voice = f.voice;
-    if (f.language) b.language = f.language;
+    if (f.language && sp.languages.length) b.language = f.language;
     if ((sp.instructions || sp.design) && f.instructions.trim()) b.instructions = f.instructions.trim();
     if (sp.clone && !sp.voices.length && state.voices.some((v) => v.name === f.voice)) b.voice = f.voice;
     else if (sp.clone && f.refAudio) {

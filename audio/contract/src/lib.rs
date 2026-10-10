@@ -62,6 +62,9 @@ pub struct Speech {
     pub clone_needs_text: bool,
     /// whether a transcript of the recording makes a closer clone
     pub clone_takes_text: bool,
+    /// what a request must carry: "voice" (a built-in one), "instructions" (the voice to make up), "reference" (a
+    /// recording, or a saved voice); none: nothing besides the text
+    pub requires: Option<&'static str>,
 }
 
 /// The engine's own defaults, shown by `engines` and used for the request's `None` fields

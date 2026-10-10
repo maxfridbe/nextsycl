@@ -84,6 +84,8 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `qwen3-tts-custom` | Qwen3-TTS 12 Hz 1.7B CustomVoice: nine built-in voices, styled by an instruction; 10 languages, 24 kHz | `qwen3tts` | 4.5 GiB | checked, served |
 | `qwen3-tts-design` | Qwen3-TTS VoiceDesign: a voice made up from a description | `qwen3tts` | 4.5 GiB | checked, served |
 | `qwen3-tts-base` | Qwen3-TTS Base: a voice cloned from a recording (its x-vector; with its transcript, in context) | `qwen3tts` | 4.5 GiB | checked, served |
+| `voxcpm2` | VoxCPM2 2B: speech in 30 languages at 48 kHz - plain, designed from a description, cloned (with a transcript: continued); MiniCPM4 language models, a local flow-matching DiT, AudioVAE V2 | `voxcpm2` | 4.6 GiB | checked, served |
+| `voxcpm2-int8` | the same files, the language models in int8 at load | `voxcpm2` | 4.6 GiB | checked, served |
 
 ## What it does
 
@@ -624,6 +626,37 @@ on the API, chips and "save voice" buttons on the page.
   data: URL), `ref_text`, `seconds` (the most), `seed`, `options` (`greedy`, `temperature`, `top-k`, `streaming`).
   The page takes the text, the voice (chips), the description or instruction, a recording to clone and its
   transcript, the language.
+
+### VoxCPM2
+
+VoxCPM2 (`audio/voxcpm2`, OpenBMB's 2B checkpoint): tokenizer-free speech in 30 languages at 48 kHz. No audio tokens:
+each step makes a patch of four AudioVAE latents by flow matching (a 12-layer local DiT, 10 Euler steps, guidance 2.0
+with CFG-zero*), conditioned on a MiniCPM4 base language model (28 layers; its outputs at audio positions through a
+scalar quantizer) and a residual one (8 layers), the patch fed back through a 12-layer local encoder; a stop head ends
+it. A description in `instructions` designs the voice (put in parentheses ahead of the text, as the model was
+trained); a recording is the reference (isolated by its own tokens); with its transcript also the prompt it continues
+(the "ultimate" clone).
+
+```sh
+nextsycl models pull voxcpm2
+nextsycl audio gen "Bonjour à tous." --model voxcpm2 [--instructions "A cheerful young French woman"] [--ref-audio r.mp3 [--ref-text "..."]]
+                   [--voice SAVED] [--steps 10] [--cfg 2] [--seed N] [--opt-int8 1]
+nextsycl audio check <reference dump dir> --model voxcpm2 [--stages prompt,prefill,patches,vae]
+```
+
+- **Ported**: the two language models and the local transformers on the music engine's kernels (attention now also 8
+  query heads a key head) and this engine's (`kernels/audio/voxcpm2`: the long-RoPE table, attention within short
+  groups of rows, Snake, the dilated causal depthwise convolution); AudioVAE V2 (weight-normalized causal convolutions,
+  the 48 kHz sample-rate conditioning) on oneDNN; its weights from `audiovae.pth` read by a small ZIP + pickle reader
+  (`pth.rs`: no Python); the tokenizer's SentencePiece-style BPE (byte fallback, Chinese words split into characters as
+  the reference does).
+- **Checked** against voxcpm's own code (`reference/voxcpm2/ref.py`, float32 on the CPU, its noise recorded): prompt
+  tokens identical (plain, design, clone); the recording's latents rel 1.6e-6; both language models' prefill 4e-4 to
+  1e-3; each patch from the reference's history and noise 1e-3 to 4e-2 (cos 0.99996+); the VAE 1.3e-6 to 2.8e-6.
+  Run free, the half-precision differences grow through the quantizer and the guidance until a run takes another
+  (equally valid) path - as two runs of the reference in two precisions do. Every mode's speech transcribes word for
+  word (Whisper; Chinese and French too); a clone is 0.98 like its recording, another voice 0.92.
+- **Speed** (B70, 2026-10-10): 22 patches a second (6.25 is real time): 9.9 s of speech in 3.2 s, the decoder 0.4 s.
 
 ## Speed by model
 

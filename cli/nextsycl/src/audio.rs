@@ -25,7 +25,7 @@ nextsycl audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextsycl_audio::AudioKind> {
-    vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_example::kind()]
+    vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_voxcpm2::kind(), nextsycl_audio_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -37,7 +37,9 @@ fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
 fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
     if let Some(d) = opt(args, "--dir") {
         let dir = Path::new(d);
-        let (arch, files) = if dir.join("speech_tokenizer").is_dir() {
+        let (arch, files) = if dir.join("audiovae.pth").exists() {
+            (nextsycl_audio_voxcpm2::ARCH, nextsycl_audio_voxcpm2::files_in(dir).map_err(|e| e.0)?)
+        } else if dir.join("speech_tokenizer").is_dir() {
             (nextsycl_audio_qwen3tts::ARCH, nextsycl_audio_qwen3tts::files_in(dir).map_err(|e| e.0)?)
         } else {
             (nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_minimaxmusic3::files_in(dir).map_err(|e| e.0)?)
@@ -148,7 +150,11 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
     };
     let t0 = std::time::Instant::now();
     // frames a second of sound: speech 12.5, songs 25
-    let fps = if e.speech().is_some() { 12.5 } else { 25.0 };
+    let fps = match e.arch() {
+        "voxcpm2" => 6.25,
+        _ if e.speech().is_some() => 12.5,
+        _ => 25.0,
+    };
     let mut phase = "";
     let mut mark = 0f64;
     // each phase's time (the time up to a report is its phase's) and its last count, in the order first seen
@@ -215,12 +221,16 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,codec").split(',').collect();
         let e = nextsycl_audio_qwen3tts::Qwen3Tts::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_qwen3tts::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_voxcpm2::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,prefill,patches,vae").split(',').collect();
+        let e = nextsycl_audio_voxcpm2::VoxCpm2::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_voxcpm2::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else if m["arch"] == nextsycl_audio_minimaxmusic3::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("ar,dit,voc").split(',').collect();
         let e = nextsycl_audio_minimaxmusic3::MiniMaxMusic3::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_minimaxmusic3::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH));
+        return Err(format!("check knows {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH, nextsycl_audio_voxcpm2::ARCH));
     };
     println!("worst relative error {worst:.2e}");
     Ok(())
@@ -291,7 +301,7 @@ fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     a.extend(mount(&out, &out.to_string_lossy(), false));
     a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engines' own settings from the configuration (NS_MM3_INT8=1 ...)
-    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NSD_")) {
+    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NS_VCP_")).chain(cfg.with_prefix("NSD_")) {
         a.extend(["-e".into(), format!("{k}={v}")]);
     }
     a.extend([ce.image.clone(), "bash".into(), "-c".into(),

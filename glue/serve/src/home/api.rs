@@ -80,7 +80,7 @@ pub const METHODS: &[Method] = &[
                        ("input", "string", "the lyrics, [verse] / [chorus] tags on lines of their own (empty: instrumental)", false),
                        ("seconds", "number", "", false), ("seed", "integer", "", false), ("steps", "integer", "", false), ("cfg", "number", "", false)],
              example: r#"{"model": "minimax-music3", "instructions": "warm acoustic folk, 90 BPM, a soft male voice", "input": "[verse]\nRiver runs slow tonight\n[chorus]\nCarry me home", "seconds": 60}"# },
-    Method { kind: "audio", name: "speak", summary: "Speech from text (a speech model: Qwen3-TTS); the answer links the WAV",
+    Method { kind: "audio", name: "speak", summary: "Speech from text (a speech model: Qwen3-TTS, VoxCPM2); the answer links the WAV",
              fields: &[MODEL_OPT, ("input", "string", "the text to say", true),
                        ("voice", "string", "a built-in voice (audio.info lists them) or a saved one (audio.voices.list: spoken by a model that clones)", false),
                        ("language", "string", "english, chinese, japanese ... or auto (default)", false),
@@ -147,6 +147,7 @@ fn guide(kind: &str, arch: &str) -> &'static str {
         ("video", _) => include_str!("guides/minimax-h3.md"),
         ("image", _) => include_str!("guides/qwen-image-2.1.md"),
         ("audio", "qwen3-tts") => include_str!("guides/qwen3-tts.md"),
+        ("audio", "voxcpm2") => include_str!("guides/voxcpm2.md"),
         ("audio", _) => include_str!("guides/minimax-music3.md"),
         _ => include_str!("guides/chat.md"),
     }

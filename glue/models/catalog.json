@@ -427,6 +427,30 @@
    "size": 682293092,
    "sha256": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
    "path": "qwen3-tts/speech_tokenizer/model.safetensors"
+  },
+  "vcp2-model": {
+   "url": "https://huggingface.co/openbmb/VoxCPM2/resolve/32279effe8c19989596f05d353d1447f51d9e915/model.safetensors",
+   "size": 4580080592,
+   "sha256": "f7f964cfa9da23653baec6e6f7750719977ad944ed9f95fe52fe3a620506891d",
+   "path": "voxcpm2/model.safetensors"
+  },
+  "vcp2-config": {
+   "url": "https://huggingface.co/openbmb/VoxCPM2/resolve/32279effe8c19989596f05d353d1447f51d9e915/config.json",
+   "size": 4336,
+   "sha256": "405f0dcd92f7feba6011ed4eac5c8d4f74cba9712f07fd5cfa3063bbdd95402c",
+   "path": "voxcpm2/config.json"
+  },
+  "vcp2-tokenizer": {
+   "url": "https://huggingface.co/openbmb/VoxCPM2/resolve/32279effe8c19989596f05d353d1447f51d9e915/tokenizer.json",
+   "size": 3676772,
+   "sha256": "f8984687e4a92a3503d521396d454b7d68e9fdaab2a0288eb3536c7c1aa4bc20",
+   "path": "voxcpm2/tokenizer.json"
+  },
+  "vcp2-vae": {
+   "url": "https://huggingface.co/openbmb/VoxCPM2/resolve/32279effe8c19989596f05d353d1447f51d9e915/audiovae.pth",
+   "size": 376951122,
+   "sha256": "94b5d51e107e0507d4acc976cfdadb64edd6fd06d1f751dadbf2fd1594274bf1",
+   "path": "voxcpm2/audiovae.pth"
   }
  },
  "models": [
@@ -1132,6 +1156,56 @@
     "seconds": 60.0
    },
    "speech": [
+    "clone"
+   ]
+  },
+  {
+   "id": "voxcpm2",
+   "title": "VoxCPM2 (speech in 30 languages at 48 kHz: voices designed from a description or cloned from a recording)",
+   "env": {},
+   "kind": "audio",
+   "arch": "voxcpm2",
+   "about": "VoxCPM2: MiniCPM4 base (28 layers) and residual (8) language models, a local encoder and a local flow-matching DiT (12 layers each), AudioVAE V2 (16 kHz in, 48 kHz out) - OpenBMB's checkpoint",
+   "files": {
+    "model": "vcp2-model",
+    "config": "vcp2-config",
+    "tokenizer": "vcp2-tokenizer",
+    "vae": "vcp2-vae"
+   },
+   "gpus": "0",
+   "defaults": {
+    "seconds": 60.0,
+    "steps": 10,
+    "cfg": 2.0
+   },
+   "speech": [
+    "design",
+    "clone"
+   ]
+  },
+  {
+   "id": "voxcpm2-int8",
+   "title": "VoxCPM2, its language models in int8 (less VRAM, faster)",
+   "env": {
+    "NS_VCP_INT8": "1"
+   },
+   "kind": "audio",
+   "arch": "voxcpm2",
+   "about": "VoxCPM2: MiniCPM4 base (28 layers) and residual (8) language models, a local encoder and a local flow-matching DiT (12 layers each), AudioVAE V2 (16 kHz in, 48 kHz out) - OpenBMB's checkpoint",
+   "files": {
+    "model": "vcp2-model",
+    "config": "vcp2-config",
+    "tokenizer": "vcp2-tokenizer",
+    "vae": "vcp2-vae"
+   },
+   "gpus": "0",
+   "defaults": {
+    "seconds": 60.0,
+    "steps": 10,
+    "cfg": 2.0
+   },
+   "speech": [
+    "design",
     "clone"
    ]
   }

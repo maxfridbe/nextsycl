@@ -262,6 +262,11 @@ of IQ2_XXS instead could win twice.
       audio server, `audio.speak` and the page. B70: 70 frames/s half, 93 int8 (5.6x / 7.4x real time)
 - [x] Qwen3-TTS: the in-context clone (`ref_text`: the recording's codes from the codec's Mimi encoder - 1,152 of
       1,152 codes as the reference's - as the prompt's example)
+- [x] VoxCPM2 (audio/voxcpm2, 2026-10-10): plain / designed / cloned / continued speech at 48 kHz; MiniCPM4 LMs, the
+      local encoder and flow-matching DiT, AudioVAE V2 from its .pth; checked (teacher-forced patches 1e-3..4e-2, VAE 1e-6)
+- [ ] VoxCPM2 speed: the DiT's 9 evaluations a patch as one graph with the Euler update on the GPU (host round trips
+      now); batch the guided and unguided rows through the products already, fuse the local attention; streamed answers
+- [x] Saved voices (2026-10-10): clone from WAV / MP3 / FLAC / Ogg / M4A, design through the voice-design model, speak by name
 - [ ] Qwen3-TTS: the draws on the GPU / the frame as one graph (16 host round trips a frame now); streamed answers
       (the codec chunk by chunk as frames come); the 0.6B checkpoints
 - [ ] Music: the two cards together as the reference runs (the language model on one, flow + decoder on the other,

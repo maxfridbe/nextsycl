@@ -1,0 +1,14 @@
+[package]
+name = "nextsycl-audio-voxcpm2"
+description = "VoxCPM2 on Intel Arc (SYCL): tokenizer-free speech in 30 languages at 48 kHz - voices designed from a description, cloned from a recording, or continued from one; MiniCPM4 language models, a local flow-matching DiT, AudioVAE V2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
+nextsycl-audio.workspace = true
+serde_json.workspace = true
