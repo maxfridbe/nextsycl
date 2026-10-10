@@ -464,6 +464,12 @@
    "sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
    "path": "qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_M.gguf"
   },
+  "q27-mtp": {
+   "url": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
+   "size": 1369590656,
+   "sha256": "50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e",
+   "path": "qwen3.8-27b/MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
+  },
   "q27-q3": {
    "url": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q3_K_XL.gguf",
    "size": 13146393504,
@@ -1234,7 +1240,8 @@
    "title": "Qwen3.8-27B Q8_0 (8-bit; the B70, 32K)",
    "about": "Qwen's dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth's GGUF - the most faithful; 27 GiB",
    "files": {
-    "model": "q27-q8"
+    "model": "q27-q8",
+    "mtp": "q27-mtp"
    },
    "gpus": "0",
    "ctx": "32768",
@@ -1249,7 +1256,8 @@
    "title": "Qwen3.8-27B UD-Q4_K_M (4-bit; the B70, 128K + 32K)",
    "about": "Qwen's dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth's GGUF - Unsloth's dynamic 4-bit; 15 GiB",
    "files": {
-    "model": "q27-q4"
+    "model": "q27-q4",
+    "mtp": "q27-mtp"
    },
    "gpus": "0",
    "ctx": "131072,32768",
@@ -1264,7 +1272,8 @@
    "title": "Qwen3.8-27B UD-Q3_K_XL (3-bit; the B70, 128K + 32K)",
    "about": "Qwen's dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth's GGUF - Unsloth's dynamic 3-bit; 12 GiB",
    "files": {
-    "model": "q27-q3"
+    "model": "q27-q3",
+    "mtp": "q27-mtp"
    },
    "gpus": "0",
    "ctx": "131072,32768",

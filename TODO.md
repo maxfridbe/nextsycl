@@ -270,9 +270,9 @@ of IQ2_XXS instead could win twice.
 - [x] Silos (2026-10-10): a model's tuned kernels in `kernels/<kind>/<arch>/silo/` -> `dist/silo/libnextsycl-<arch>.so`,
       opened by the engine at load, the shared kernels for what it does not cover or without it (CONTRIBUTING.md
       rule 5); qwen35's decode products the first (Q4 decode 17.7 -> 22.5-23.5 tok/s at 2K, Q3 12.3 -> 20.4)
-- [ ] Qwen3.8-27B: the prompt pass's attention tiled (flash-style, XMX): 40K prompts read at ~80 tok/s now
-- [ ] Qwen3.8-27B: the MTP draft layer (verify passes need the recurrent states' snapshots: kda_scan / conv_silu
-      already keep them), the vision tower (mmproj: pictures in chat), two cards
+- [x] Qwen3.8-27B MTP (2026-10-10): the draft block from the MTP file, 3 chained drafts a step, DeltaNet snapshots
+      for rollback; verify rows exact (spec-check 0 difference); decode at 2K 26 -> 43 tok/s (Q4), 18.5 -> 41.8 (Q8)
+- [ ] Qwen3.8-27B: the vision tower (mmproj: pictures in chat), two cards
 - [ ] Qwen3.8-27B decode: ~10 ms a token outside the products (launches; graphs), alpha / beta as one product,
       Q6_K head (2 ms), IQ3_XXS / IQ2_S in the silo (the Q3 file's remaining slow types)
 - [ ] VoxCPM2 speed: the DiT's 9 evaluations a patch as one graph with the Euler update on the GPU (host round trips

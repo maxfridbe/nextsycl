@@ -9,6 +9,13 @@
 //!   per layer:  h = attn_norm(x);  x += linear(h) or full(h);  x += ffn(post_attention_norm(x))
 //!   logits = output(output_norm(x))
 //! ```
+//!
+//! MTP (the GGUF's `MTP/` file: its block `layers`): a draft block that reads a position's normed hidden state h with
+//! the token that follows it and predicts the one after - eh_proj(enorm(embed(x_p)) | hnorm(h_{p-1})), a gated
+//! full-attention layer with its own cache, a SwiGLU, its head norm and head. It runs behind every pass over that
+//! pass's rows (so its cache follows the conversation); `step` drafts `NS_Q35_DRAFTS` tokens (the block chained on its
+//! own normed output), verifies [token, drafts] in one pass and keeps the longest prefix the sampled tokens match - a
+//! rejected row's DeltaNet states come back from the pass's snapshots.
 
 use std::ffi::c_int;
 use std::sync::{Arc, Mutex};
@@ -139,8 +146,21 @@ pub struct Session {
     pub pos: usize,
     pub max_ctx: usize,
     layers: Vec<LState>,
-    /// rows of the last forward pass (a rollback within them is not supported: no snapshots)
+    /// rows of the last forward pass
     last_rows: usize,
+    /// which session (the engine's snapshots name the one they belong to)
+    id: u64,
+    /// the draft block's cache and inputs (MTP loaded)
+    mtp: Option<MtpState>,
+}
+
+/// A session's draft block state: its cache ([kv heads][max_ctx][256] half), the normed hidden state of the last
+/// position fed (the next token pairs with it), and the block's own normed output (a chained draft pairs with it)
+struct MtpState {
+    k: DevBuf,
+    v: DevBuf,
+    pending: DevBuf,
+    chain: DevBuf,
 }
 
 enum LState {
@@ -198,18 +218,68 @@ impl Checkpoint {
 pub struct Decoder {
     logits: Option<Vec<f32>>,
     next: Option<u32>,
+    /// draft with the MTP block
+    mtp: bool,
+    /// the drafts for the positions after `next`
+    drafts: Vec<u32>,
+    pub drafted: u64,
+    pub accepted: u64,
 }
 
 impl Decoder {
-    pub fn new(logits: Vec<f32>) -> Decoder {
-        Decoder { logits: Some(logits), next: None }
+    pub fn new(logits: Vec<f32>, mtp: bool) -> Decoder {
+        Decoder { logits: Some(logits), next: None, mtp, drafts: Vec::new(), drafted: 0, accepted: 0 }
     }
-    pub fn after(next: u32) -> Decoder {
-        Decoder { logits: None, next: Some(next) }
+    pub fn after(next: u32, mtp: bool) -> Decoder {
+        Decoder { logits: None, next: Some(next), mtp, drafts: Vec::new(), drafted: 0, accepted: 0 }
     }
     pub fn pending(&mut self) -> Option<u32> {
+        self.drafts.clear();
         self.next.take()
     }
+}
+
+/// The MTP draft block (its own file: block `layers`, its token embedding and head)
+struct Mtp {
+    file: Box<Gguf>,
+    embd: Tensor,
+    vocab: usize,
+    /// eh_proj's columns for the embedding and for the hidden state (split at load: two products, no concatenation)
+    eh_e: Mat,
+    eh_h: Mat,
+    enorm: DevBuf,
+    hnorm: DevBuf,
+    head_norm: DevBuf,
+    attn_norm: DevBuf,
+    post_norm: DevBuf,
+    attn: Full,
+    gate: Mat,
+    up: Mat,
+    down: Mat,
+    output: Mat,
+}
+
+/// Each DeltaNet layer's state after each row of a verify pass but the last (its recurrence [rows-1][48][128][128],
+/// its conv inputs [rows-1][3][channels]), and whose pass they are (session, first position, rows)
+struct Snaps {
+    layers: Vec<(DevBuf, DevBuf)>,
+    of: Option<(u64, usize, usize)>,
+}
+
+/// NS_Q35_DRAFTS: tokens drafted a step (0: none; at most 7 - a verify pass is at most 8 rows)
+fn draft_count() -> usize {
+    std::env::var("NS_Q35_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(3).min(7)
+}
+
+/// NS_Q35_MTP: the draft block's file; else an `MTP/` folder beside the model's file holding one
+fn mtp_path(f: &Gguf) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("NS_Q35_MTP") {
+        return Some(p.into());
+    }
+    let dir = f.paths.first()?.parent()?.join("MTP");
+    let mut v: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "gguf")).collect();
+    v.sort();
+    v.into_iter().next()
 }
 
 pub struct Qwen35<'g> {
@@ -230,6 +300,15 @@ pub struct Qwen35<'g> {
     /// the largest matrix expanded to half (a prompt chunk's products)
     w16: DevBuf,
     work: Mutex<()>,
+    /// the draft block (loaded with drafts on and its file found)
+    mtp: Option<Mtp>,
+    /// drafts a step
+    drafts: usize,
+    /// the verify passes' DeltaNet snapshots (under `work`)
+    snaps: Mutex<Snaps>,
+    /// the normed hidden states of the last pass's rows (up to 8: a rollback's pending state)
+    vh: DevBuf,
+    next_id: std::sync::atomic::AtomicU64,
     /// NS_Q35_PROFILE=1: every kernel timed on the device, with its bytes and arithmetic (probe.rs)
     probe: Option<Probe>,
     load_s: f64,
@@ -251,7 +330,7 @@ fn arena_bytes(g: &Geometry, chunk: usize) -> usize {
 const SESSION_ROOM: u64 = 5 << 29;
 
 impl<'g> Qwen35<'g> {
-    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], log: &mut dyn FnMut(String)) -> Result<Qwen35<'g>> {
+    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], draft: bool, log: &mut dyn FnMut(String)) -> Result<Qwen35<'g>> {
         let t0 = Instant::now();
         let gpu = gpus.first().cloned().ok_or_else(|| e("no GPU"))?;
         if gpus.len() > 1 {
@@ -273,11 +352,26 @@ impl<'g> Qwen35<'g> {
         let free = free.unwrap_or(total);
         // the prompt chunk: 2,048 rows (each matrix expanded to half once for them: 8K prompts 760 -> 1,100 tok/s against
         // 512) when they leave room for a session, else 1,024, else 512
-        let fixed = weights + w16_bytes as u64 + (1536 << 20);
+        // the draft block: its file's tensors but its token embedding (rows read from the file), its snapshots
+        let drafts = if draft { draft_count() } else { 0 };
+        let mfile = match (drafts > 0).then(|| mtp_path(f)).flatten() {
+            Some(p) => match Gguf::open(&p) {
+                Ok(m) => Some(Box::new(m)),
+                Err(x) => {
+                    log(format!("qwen35: the MTP file {} does not open ({}); no drafts", p.display(), x.0));
+                    None
+                }
+            },
+            None => None,
+        };
+        let snap_bytes = (g.layers - (0..g.layers).filter(|l| g.full(*l)).count()) * drafts * (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4;
+        let mtp_bytes = mfile.as_ref().map_or(0, |m| m.tensors.iter().filter(|t| t.name != "token_embd.weight").map(|t| t.bytes).sum::<u64>() + snap_bytes as u64);
+        let fixed = weights + mtp_bytes + w16_bytes as u64 + (1536 << 20);
         let chunk = chunk_setting().unwrap_or_else(|| {
             [2048, 1024].into_iter().find(|c| fixed + arena_bytes(&g, *c) as u64 + SESSION_ROOM <= free).unwrap_or(512)
         });
-        let arena_bytes = arena_bytes(&g, chunk);
+        // the draft block's pass behind a chunk's: its inputs and outputs beside the main pass's
+        let arena_bytes = arena_bytes(&g, chunk) + if mfile.is_some() { chunk * 8 * g.n_embd * 4 } else { 0 };
         let need = fixed + arena_bytes as u64;
         if need > free {
             return Err(e(format!("{} needs about {:.1} GiB on {} ({:.1} GiB of weights); {:.1} GiB are free", f.architecture(),
@@ -337,6 +431,23 @@ impl<'g> Qwen35<'g> {
         }
         let output_norm = vec_mat(f, &gpu, k, "output_norm.weight", &mut loaded)?.buf;
         let output = vec_mat(f, &gpu, k, if f.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" }, &mut loaded)?;
+        let mtp = match mfile {
+            Some(m) => Some(load_mtp(m, &g, &gpu, k, &mut loaded)?),
+            None => None,
+        };
+        let drafts = if mtp.is_some() { drafts } else { 0 };
+        let mut snap_layers = Vec::new();
+        if drafts > 0 {
+            for _ in (0..g.layers).filter(|l| !g.full(*l)) {
+                snap_layers.push((DevBuf::f32(&gpu, drafts * g.v_heads * g.state * g.state)?, DevBuf::f32(&gpu, drafts * (g.conv - 1) * g.conv_dim())?));
+            }
+        }
+        log(match &mtp {
+            Some(_) => format!("qwen35: MTP drafts ({drafts} a step)"),
+            None if draft => "qwen35: no MTP file (NS_Q35_MTP or an MTP/ folder beside the model): no drafts".into(),
+            None => "qwen35: drafts off".into(),
+        });
+        let vh = DevBuf::f32(&gpu, 8 * g.n_embd)?;
         gpu.sync()?;
         let w16 = DevBuf::new(&gpu, w16_bytes)?;
         let arena = Arena::new(&gpu, arena_bytes)?;
@@ -344,7 +455,8 @@ impl<'g> Qwen35<'g> {
         log(format!("qwen35: {} layers of {} ({} full attention), {:.1} GiB on {} in {load_s:.0} s; prompt chunks of {chunk}", g.layers, g.n_embd,
                     (0..g.layers).filter(|l| g.full(*l)).count(), loaded as f64 / (1u64 << 30) as f64, gpu.name));
         let probe = Probe::new(gpu.raw())?;
-        Ok(Qwen35 { g, file: f, gpu, k, silo, layers, output_norm, output, embd, chunk, arena, w16, work: Mutex::new(()), probe, load_s, load_bytes: loaded })
+        Ok(Qwen35 { g, file: f, gpu, k, silo, layers, output_norm, output, embd, chunk, arena, w16, work: Mutex::new(()), mtp, drafts,
+                    snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), probe, load_s, load_bytes: loaded })
     }
 
     /// A kernel call (its return code checked): timed on the device with NS_Q35_PROFILE=1, with the bytes it moves
@@ -456,7 +568,7 @@ impl<'g> Qwen35<'g> {
 
     /// The RMS norm into y; for decode rows with the silo also y's Q8_1 blocks (the products after it read them)
     fn norm(&self, x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, c: usize) -> Result<Option<DevBuf>> {
-        let Some(s) = self.silo.filter(|_| rows <= 8 && c % 256 == 0) else {
+        let Some(s) = self.silo.filter(|_| rows <= 8 && c.is_multiple_of(256)) else {
             self.rms(x, w, y, rows, c)?;
             return Ok(None);
         };
@@ -482,21 +594,26 @@ impl<'g> Qwen35<'g> {
 
     /// The tokens' embeddings [t, n_embd] (their rows read from the file, expanded on the GPU)
     fn embed(&self, tokens: &[u32]) -> Result<DevBuf> {
+        self.embed_from(self.file, &self.embd, self.g.vocab, tokens)
+    }
+
+    /// Rows of a token embedding kept in its file
+    fn embed_from(&self, file: &Gguf, embd: &Tensor, vocab: usize, tokens: &[u32]) -> Result<DevBuf> {
         let g = &self.g;
-        let row = self.embd.ty.bytes(g.n_embd as u64).ok_or_else(|| e("the embedding's row size"))? as usize;
+        let row = embd.ty.bytes(g.n_embd as u64).ok_or_else(|| e("the embedding's row size"))? as usize;
         let mut raw = vec![0u8; tokens.len() * row];
         for (i, t) in tokens.iter().enumerate() {
-            if *t as usize >= g.vocab {
-                return Err(e(format!("token {t} past the vocabulary ({})", g.vocab)));
+            if *t as usize >= vocab {
+                return Err(e(format!("token {t} past the vocabulary ({vocab})")));
             }
-            self.file.read_into(&self.embd, *t as u64 * row as u64, &mut raw[i * row..(i + 1) * row]).map_err(|x| e(x.0))?;
+            file.read_into(embd, *t as u64 * row as u64, &mut raw[i * row..(i + 1) * row]).map_err(|x| e(x.0))?;
         }
         let src = self.arena.bytes(raw.len())?;
         src.write(0, &raw)?;
         let x = self.arena.f32(tokens.len() * g.n_embd)?;
         // SAFETY: the rows' blocks -> float32.
         self.op("dequant", String::new, raw.len() + 4 * tokens.len() * g.n_embd, 0,
-                || unsafe { (self.k.dequant)(self.raw(), self.embd.ty.code() as i32, src.ptr(), tokens.len() * g.n_embd, x.fp()) })?;
+                || unsafe { (self.k.dequant)(self.raw(), embd.ty.code() as i32, src.ptr(), tokens.len() * g.n_embd, x.fp()) })?;
         Ok(x)
     }
 
@@ -570,7 +687,9 @@ impl<'g> Qwen35<'g> {
     }
 
     /// A DeltaNet layer on h [t, n_embd]: its output [t, n_embd]
-    fn linear(&self, a: &Linear, s: &DevBuf, conv: &DevBuf, h: &DevBuf, hq8: Option<&DevBuf>, t: usize) -> Result<DevBuf> {
+    /// `snap`: where the state after each row but the last goes (a verify pass's: its recurrence's, its conv's)
+    #[allow(clippy::too_many_arguments)]
+    fn linear(&self, a: &Linear, s: &DevBuf, conv: &DevBuf, h: &DevBuf, hq8: Option<&DevBuf>, t: usize, snap: Option<(&DevBuf, &DevBuf)>) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hv, hk, d, cd) = (g.v_heads, g.k_heads, g.state, g.conv_dim());
         let qkv = self.arena.f32(t * cd)?;
@@ -607,7 +726,7 @@ impl<'g> Qwen35<'g> {
             self.op("gates", none, 4 * (3 * t * hv + 2 * hv) + 4 * thd, 20 * t * hv,
                     || (k.gdn_gates)(self.raw(), alpha.fp(), beta.fp(), a.dt.fp(), a.a.fp(), eg.fp(), t as i64, hv as i64, d as i64))?;
             self.op("conv silu", none, 4 * (2 * t * cd + 2 * (g.conv - 1) * cd + g.conv * cd), 2 * g.conv * t * cd + 4 * t * cd,
-                    || (k.conv_silu)(self.raw(), qkv.fp(), conv.fp(), a.conv.fp(), co.fp(), t as i64, cd as i64, g.conv as i32, std::ptr::null_mut()))?;
+                    || (k.conv_silu)(self.raw(), qkv.fp(), conv.fp(), a.conv.fp(), co.fp(), t as i64, cd as i64, g.conv as i32, snap.map_or(std::ptr::null_mut(), |x| x.1.fp())))?;
             self.op("expand q", none, 4 * t * hk * d + 4 * thd, 0, || (k.expand)(self.raw(), co.fp(), cd as i64, q.fp(), t as i64, hk as i64, hv as i64, d as i64))?;
             self.op("expand k", none, 4 * t * hk * d + 4 * thd, 0,
                     || (k.expand)(self.raw(), co.fp().add(qd as usize), cd as i64, kk.fp(), t as i64, hk as i64, hv as i64, d as i64))?;
@@ -617,7 +736,7 @@ impl<'g> Qwen35<'g> {
             // the state [hv][d][d] read and written once, each row's q, k, v, decay in and output out; per row and head
             // the state decayed, read against k, updated, read against q: ~8 d^2
             self.op("delta rule", none, 8 * hv * d * d + 4 * (5 * thd + t * hv), 8 * t * hv * d * d,
-                    || (k.kda_scan)(self.raw(), q.fp(), kk.fp(), v.fp(), eg.fp(), beta.fp(), s.fp(), o.fp(), t as i64, hv as i64, d as i64, std::ptr::null_mut()))?;
+                    || (k.kda_scan)(self.raw(), q.fp(), kk.fp(), v.fp(), eg.fp(), beta.fp(), s.fp(), o.fp(), t as i64, hv as i64, d as i64, snap.map_or(std::ptr::null_mut(), |x| x.0.fp())))?;
             self.op("gated norm", none, 4 * (3 * t * g.inner + d), 10 * t * g.inner,
                     || (k.gdn_out)(self.raw(), o.fp(), z.fp(), g.inner as i64, a.norm.fp(), y.fp(), t as i64, hv as i64, d as i64, g.eps))?;
         }
@@ -629,6 +748,12 @@ impl<'g> Qwen35<'g> {
     /// One pass of at most a chunk: the last `n_out` rows' logits
     fn pass(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
         let _w = self.work.lock().unwrap();
+        self.pass_in(s, tokens, n_out, tap)
+    }
+
+    /// `pass` with the work lock held: a verify pass (2 ..= drafts + 1 rows, drafts on) keeps the DeltaNet
+    /// snapshots; with MTP the draft block runs over the rows behind it
+    fn pass_in(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
         let g = &self.g;
         let t = tokens.len();
         if t == 0 {
@@ -642,12 +767,16 @@ impl<'g> Qwen35<'g> {
         }
         self.arena.reset();
         let p0 = s.pos;
+        let mut snaps = self.snaps.lock().unwrap();
+        let snapping = (2..=self.drafts + 1).contains(&t) && !snaps.layers.is_empty();
+        snaps.of = None;
         self.phase("embed");
         let x = self.embed(tokens)?;
         let h = self.arena.f32(t * g.n_embd)?;
         let ffn_g = self.arena.f32(t * g.n_ff)?;
         let ffn_u = self.arena.f32(t * g.n_ff)?;
         let ffn = self.arena.f32(t * g.n_embd)?;
+        let mut li = 0;
         // the arena past this point is the layer's own, made again each layer
         for (l, (ly, st)) in self.layers.iter().zip(s.layers.iter()).enumerate() {
             let mark = self.arena.mark();
@@ -655,7 +784,11 @@ impl<'g> Qwen35<'g> {
             let hq8 = self.norm(&x, &ly.attn_norm, &h, t, g.n_embd)?;
             let out = match (st, &ly.full, &ly.linear) {
                 (LState::Full { k, v }, Some(a), _) => self.full(a, k, v, s.max_ctx, &h, hq8.as_ref(), t, p0)?,
-                (LState::Linear { s: rs, conv }, _, Some(a)) => self.linear(a, rs, conv, &h, hq8.as_ref(), t)?,
+                (LState::Linear { s: rs, conv }, _, Some(a)) => {
+                    let sn = snapping.then(|| (&snaps.layers[li].0, &snaps.layers[li].1));
+                    li += 1;
+                    self.linear(a, rs, conv, &h, hq8.as_ref(), t, sn)?
+                }
                 _ => return Err(e(format!("layer {l}: its state and its weights disagree"))),
             };
             self.add(&x, &out, t * g.n_embd)?;
@@ -672,15 +805,45 @@ impl<'g> Qwen35<'g> {
             tap(&format!("l_out-{l}"), &x)?;
             self.arena.rewind(mark);
         }
+        if snapping {
+            snaps.of = Some((s.id, p0, t));
+        }
+        drop(snaps);
         s.pos += t;
         s.last_rows = t;
-        // the last rows through the output norm and head
+        // the output norm: the last rows' for the head; every row's with MTP (the draft block reads them)
         let n = n_out.clamp(1, t);
-        let last = x.view((t - n) * g.n_embd * 4, n * g.n_embd * 4)?;
-        let normed = self.arena.f32(n * g.n_embd)?;
+        let ne = g.n_embd;
         self.phase("head");
-        let nq8 = self.norm(&last, &self.output_norm, &normed, n, g.n_embd)?;
-        tap("result_norm", &normed)?;
+        let (normed, nq8) = if let Some(ms) = s.mtp.as_ref().filter(|_| self.mtp.is_some()) {
+            let all = self.arena.f32(t * ne)?;
+            let q = self.norm(&x, &self.output_norm, &all, t, ne)?;
+            tap("result_norm", &all.view((t - n) * ne * 4, n * ne * 4)?)?;
+            // the rows kept for a rollback; the draft block over this pass's rows: row i pairs token i with the hidden
+            // state before it (the pending one, then this pass's)
+            self.vh.copy_within(0, &all, 0, t.min(8) * ne * 4)?;
+            self.phase("mtp");
+            let hs = self.arena.f32(t * ne)?;
+            hs.copy_within(0, &ms.pending, 0, ne * 4)?;
+            if t > 1 {
+                hs.copy_within(ne * 4, &all, 0, (t - 1) * ne * 4)?;
+            }
+            self.mtp_rows(ms, tokens, &hs, p0, s.max_ctx, false)?;
+            ms.pending.copy_within(0, &all, (t - 1) * ne * 4, ne * 4)?;
+            self.phase("head");
+            let q8row = q.as_ref().map(|_| unsafe { (self.k.q8_1_bytes)(ne as i64, 1) });
+            let qv = match (&q, q8row) {
+                (Some(q), Some(rb)) => Some(q.view((t - n) * rb, n * rb)?),
+                _ => None,
+            };
+            (all.view((t - n) * ne * 4, n * ne * 4)?, qv)
+        } else {
+            let last = x.view((t - n) * ne * 4, n * ne * 4)?;
+            let normed = self.arena.f32(n * ne)?;
+            let q = self.norm(&last, &self.output_norm, &normed, n, ne)?;
+            tap("result_norm", &normed)?;
+            (normed, q)
+        };
         let logits = self.arena.f32(n * self.output.rows)?;
         self.matmul("output", &self.output, &normed, nq8.as_ref(), n, &logits)?;
         let all = logits.to_f32()?;
@@ -690,12 +853,107 @@ impl<'g> Qwen35<'g> {
         Ok(all.chunks(self.output.rows).map(|c| c.to_vec()).collect())
     }
 
+    /// The draft block over `tokens` at positions p0.. (row i: token i with hidden state hs[i]): its cache written
+    /// there; with `head`, the last row's logits (and its normed output kept for a chained draft)
+    fn mtp_rows(&self, ms: &MtpState, tokens: &[u32], hs: &DevBuf, p0: usize, cap: usize, head: bool) -> Result<Option<Vec<f32>>> {
+        let Some(m) = &self.mtp else { return Ok(None) };
+        let g = &self.g;
+        let (t, ne) = (tokens.len(), g.n_embd);
+        let emb = self.embed_from(&m.file, &m.embd, m.vocab, tokens)?;
+        let en = self.arena.f32(t * ne)?;
+        self.rms(&emb, &m.enorm, &en, t, ne)?;
+        let hn = self.arena.f32(t * ne)?;
+        self.rms(hs, &m.hnorm, &hn, t, ne)?;
+        // eh_proj . [en | hn] = W_e . en + W_h . hn
+        let cur = self.arena.f32(t * ne)?;
+        self.matmul("mtp eh e", &m.eh_e, &en, None, t, &cur)?;
+        let tmp = self.arena.f32(t * ne)?;
+        self.matmul("mtp eh h", &m.eh_h, &hn, None, t, &tmp)?;
+        self.add(&cur, &tmp, t * ne)?;
+        let h = self.arena.f32(t * ne)?;
+        let hq8 = self.norm(&cur, &m.attn_norm, &h, t, ne)?;
+        let att = self.full(&m.attn, &ms.k, &ms.v, cap, &h, hq8.as_ref(), t, p0)?;
+        self.add(&cur, &att, t * ne)?;
+        let hq8 = self.norm(&cur, &m.post_norm, &h, t, ne)?;
+        let fg = self.arena.f32(t * g.n_ff)?;
+        let fu = self.arena.f32(t * g.n_ff)?;
+        self.matmul("mtp gate", &m.gate, &h, hq8.as_ref(), t, &fg)?;
+        self.matmul("mtp up", &m.up, &h, hq8.as_ref(), t, &fu)?;
+        let nf = t * g.n_ff;
+        // SAFETY: n floats each.
+        self.op("swiglu", String::new, 12 * nf, 6 * nf, || unsafe { (self.k.swiglu_clamp)(self.raw(), fg.fp(), fu.fp(), fg.fp(), nf as i64, f32::INFINITY) })?;
+        self.matmul("mtp down", &m.down, &fg, None, t, &tmp)?;
+        self.add(&cur, &tmp, t * ne)?;
+        if !head {
+            return Ok(None);
+        }
+        let last = cur.view((t - 1) * ne * 4, ne * 4)?;
+        let hn2 = self.arena.f32(ne)?;
+        let q = self.norm(&last, &m.head_norm, &hn2, 1, ne)?;
+        ms.chain.copy_within(0, &hn2, 0, ne * 4)?;
+        let logits = self.arena.f32(m.output.rows)?;
+        self.matmul("mtp head", &m.output, &hn2, q.as_ref(), 1, &logits)?;
+        Ok(Some(logits.to_f32()?))
+    }
+
+    /// Drafts for the positions after `tail` (committed at s.pos, not fed): the draft block on (the last fed
+    /// position's hidden state, tail), then chained on its own normed output and each draft
+    fn draft_in(&self, s: &Session, tail: u32) -> Result<Vec<u32>> {
+        let Some(ms) = &s.mtp else { return Ok(Vec::new()) };
+        let k = self.drafts.min(s.max_ctx.saturating_sub(s.pos + 1));
+        let mut out = Vec::with_capacity(k);
+        let mut tok = tail;
+        for i in 0..k {
+            self.arena.reset();
+            self.phase("mtp draft");
+            let hs = if i == 0 { &ms.pending } else { &ms.chain };
+            let Some(l) = self.mtp_rows(ms, &[tok], hs, s.pos + i, s.max_ctx, true)? else { break };
+            tok = argmax(&l);
+            out.push(tok);
+        }
+        Ok(out)
+    }
+
+    /// Back to the first `keep` rows of the session's last pass: its DeltaNet states from the pass's snapshots, the
+    /// attention caches and the draft block's cache simply rewritten later
+    fn rollback_in(&self, s: &mut Session, keep: usize) -> Result<()> {
+        if keep == s.last_rows {
+            return Ok(());
+        }
+        let mut snaps = self.snaps.lock().unwrap();
+        let Some((id, p0, rows)) = snaps.of else {
+            return Err(e("qwen35: a rollback needs the last pass's snapshots (a verify pass of 2 ..= drafts + 1 rows, drafts on)"));
+        };
+        if id != s.id || p0 + rows != s.pos || keep == 0 || keep >= rows {
+            return Err(e(format!("qwen35: a rollback to {keep} of a pass of {rows} rows at {p0} (session {id}); this session is at {}", s.pos)));
+        }
+        let g = &self.g;
+        let (sb, cb) = (g.v_heads * g.state * g.state * 4, (g.conv - 1) * g.conv_dim() * 4);
+        let mut li = 0;
+        for st in &s.layers {
+            if let LState::Linear { s: rs, conv } = st {
+                let (ss, cs) = &snaps.layers[li];
+                rs.copy_within(0, ss, (keep - 1) * sb, sb)?;
+                conv.copy_within(0, cs, (keep - 1) * cb, cb)?;
+                li += 1;
+            }
+        }
+        if let Some(ms) = &s.mtp {
+            ms.pending.copy_within(0, &self.vh, (keep - 1) * g.n_embd * 4, g.n_embd * 4)?;
+        }
+        snaps.of = None;
+        s.pos = p0 + keep;
+        s.last_rows = keep;
+        Ok(())
+    }
+
     pub fn session(&self, max_ctx: usize) -> Result<Session> {
         let g = &self.g;
         // the caches and states, checked against what is free first: past the card the xe driver spills into host
         // memory (no out-of-memory error) and can take the machine down
         let full = (0..g.layers).filter(|l| g.full(*l)).count();
-        let need = (full * 2 * g.heads_kv * max_ctx * g.head * 2 + (g.layers - full) * (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64;
+        let mtp_kv = if self.mtp.is_some() { 2 * g.heads_kv * max_ctx * g.head * 2 } else { 0 };
+        let need = (full * 2 * g.heads_kv * max_ctx * g.head * 2 + mtp_kv + (g.layers - full) * (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64;
         let (total, free) = self.gpu.memory()?;
         let free = free.unwrap_or(total);
         if need + (1536 << 20) > free {
@@ -715,7 +973,18 @@ impl<'g> Qwen35<'g> {
                 LState::Linear { s, conv }
             });
         }
-        Ok(Session { pos: 0, max_ctx, layers, last_rows: 0 })
+        let mtp = match &self.mtp {
+            Some(_) => {
+                let n = g.heads_kv * max_ctx * g.head * 2;
+                let ms = MtpState { k: DevBuf::new(&self.gpu, n)?, v: DevBuf::new(&self.gpu, n)?, pending: DevBuf::f32(&self.gpu, g.n_embd)?,
+                                    chain: DevBuf::f32(&self.gpu, g.n_embd)? };
+                ms.pending.fill(0)?;
+                Some(ms)
+            }
+            None => None,
+        };
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Session { pos: 0, max_ctx, layers, last_rows: 0, id, mtp })
     }
 
     pub fn reset_session(&self, s: &mut Session) -> Result<()> {
@@ -724,6 +993,9 @@ impl<'g> Qwen35<'g> {
                 s.fill(0)?;
                 conv.fill(0)?;
             }
+        }
+        if let Some(ms) = &s.mtp {
+            ms.pending.fill(0)?;
         }
         s.pos = 0;
         s.last_rows = 0;
@@ -751,6 +1023,14 @@ impl<'g> Qwen35<'g> {
                 _ => return Err(e("sessions of other shapes")),
             }
         }
+        if let (Some(d), Some(sm)) = (&dst.mtp, &src.mtp) {
+            for h in 0..g.heads_kv {
+                let n = src.pos * g.head * 2;
+                d.k.copy_within(h * dst.max_ctx * g.head * 2, &sm.k, h * src.max_ctx * g.head * 2, n)?;
+                d.v.copy_within(h * dst.max_ctx * g.head * 2, &sm.v, h * src.max_ctx * g.head * 2, n)?;
+            }
+            d.pending.copy_within(0, &sm.pending, 0, g.n_embd * 4)?;
+        }
         dst.pos = src.pos;
         dst.last_rows = 0;
         Ok(())
@@ -774,10 +1054,16 @@ impl<'g> Qwen35<'g> {
     }
 
     pub fn rollback(&self, s: &mut Session, keep: usize) -> Result<()> {
-        if keep == s.last_rows {
-            return Ok(());
-        }
-        Err(e("qwen35: a rollback inside a pass needs the recurrent states' snapshots (verify passes are off without a draft model)"))
+        let _w = self.work.lock().unwrap();
+        self.rollback_in(s, keep)
+    }
+
+    pub fn has_draft(&self) -> bool {
+        self.drafts > 0
+    }
+
+    pub fn max_verify(&self) -> usize {
+        self.drafts + 1
     }
 
     pub fn forward_batch(&self, sessions: &mut [&mut Session], tokens: &[u32], tap: Tap) -> Result<Vec<Vec<f32>>> {
@@ -788,15 +1074,46 @@ impl<'g> Qwen35<'g> {
         Ok(out)
     }
 
+    /// The next committed token(s). With drafts: [token, drafts] in one pass, each row's token drawn as plain
+    /// sampling would draw it, the drafts kept while they match (what is committed is distributed as without drafts)
     pub fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
-        let logits = match (d.logits.take(), d.next.take()) {
-            (Some(l), _) => l,
-            (None, Some(x)) => self.pass(s, &[x], 1, tap)?.pop().unwrap_or_default(),
+        let _w = self.work.lock().unwrap();
+        let drafting = d.mtp && self.drafts > 0 && s.mtp.is_some();
+        let out = match (d.logits.take(), d.next.take()) {
+            (Some(l), _) => vec![smp.sample(&l)],
+            (None, Some(x)) => {
+                let mut rows = vec![x];
+                if drafting {
+                    rows.extend(d.drafts.iter().take(s.max_ctx.saturating_sub(s.pos + 1)));
+                }
+                d.drafts.clear();
+                let logits = self.pass_in(s, &rows, rows.len(), tap)?;
+                let mut out = Vec::with_capacity(rows.len());
+                for (i, l) in logits.iter().enumerate() {
+                    let y = smp.sample(l);
+                    out.push(y);
+                    if i + 1 < rows.len() {
+                        d.drafted += 1;
+                        if y == rows[i + 1] {
+                            d.accepted += 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if out.len() < rows.len() {
+                    self.rollback_in(s, out.len())?;
+                }
+                out
+            }
             (None, None) => return Err(e("a decoder with nothing to draw from")),
         };
-        let y = smp.sample(&logits);
-        d.next = Some(y);
-        Ok(vec![y])
+        let tail = *out.last().unwrap();
+        d.next = Some(tail);
+        if drafting {
+            d.drafts = self.draft_in(s, tail)?;
+        }
+        Ok(out)
     }
 
     pub fn save(&self, s: &Session) -> Result<Checkpoint> {
@@ -822,6 +1139,19 @@ impl<'g> Qwen35<'g> {
                     }
                 }
             }
+        }
+        if let Some(ms) = &s.mtp {
+            for c in [&ms.k, &ms.v] {
+                let mut b = vec![0u8; g.heads_kv * s.pos * g.head * 2];
+                for h in 0..g.heads_kv {
+                    let n = s.pos * g.head * 2;
+                    c.read(h * s.max_ctx * g.head * 2, &mut b[h * n..(h + 1) * n])?;
+                }
+                bufs.push(b);
+            }
+            let mut b = vec![0u8; g.n_embd * 4];
+            ms.pending.read(0, &mut b)?;
+            bufs.push(b);
         }
         let bytes = bufs.iter().map(|b| b.len()).sum();
         Ok(Checkpoint { pos: s.pos, bufs, bytes })
@@ -858,6 +1188,20 @@ impl<'g> Qwen35<'g> {
                 }
             }
         }
+        if let Some(ms) = &s.mtp {
+            for c in [&ms.k, &ms.v] {
+                let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's cache"))?;
+                let n = ck.pos * g.head * 2;
+                if b.len() != g.heads_kv * n {
+                    return Err(e("a checkpoint of another shape"));
+                }
+                for h in 0..g.heads_kv {
+                    c.write(h * s.max_ctx * g.head * 2, &b[h * n..(h + 1) * n])?;
+                }
+            }
+            let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's state"))?;
+            ms.pending.write(0, b)?;
+        }
         s.pos = ck.pos;
         s.last_rows = 0;
         Ok(())
@@ -891,4 +1235,50 @@ fn vec_mat(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, name: &str, loaded: &mut u64)
     let buf = DevBuf::new(gpu, raw.len())?;
     buf.write(0, &raw)?;
     Ok(Mat { buf, ty: t.ty, rows, cols })
+}
+
+fn argmax(l: &[f32]) -> u32 {
+    let mut best = (0usize, f32::NEG_INFINITY);
+    for (i, &v) in l.iter().enumerate() {
+        if v > best.1 {
+            best = (i, v);
+        }
+    }
+    best.0 as u32
+}
+
+/// The draft block from its file: block `layers` (eh_proj split into its embedding and hidden-state columns on the
+/// host), its head norm and head; its token embedding stays in the file
+fn load_mtp(m: Box<Gguf>, g: &Geometry, gpu: &Arc<Gpu>, k: &ffi::Api, loaded: &mut u64) -> Result<Mtp> {
+    let l = g.layers;
+    let f: &Gguf = &m;
+    let n = |s: &str| format!("blk.{l}.{s}.weight");
+    let mut read = |name: &str| -> Result<Mat> { vec_mat(f, gpu, k, name, loaded) };
+    let attn = Full { q: read(&n("attn_q"))?, k: read(&n("attn_k"))?, v: read(&n("attn_v"))?, o: read(&n("attn_output"))?,
+                      q_norm: read(&n("attn_q_norm"))?.buf, k_norm: read(&n("attn_k_norm"))?.buf };
+    let (enorm, hnorm, head_norm) = (read(&n("nextn.enorm"))?.buf, read(&n("nextn.hnorm"))?.buf, read(&n("nextn.shared_head_norm"))?.buf);
+    let (attn_norm, post_norm) = (read(&n("attn_norm"))?.buf, read(&n("post_attention_norm"))?.buf);
+    let (gate, up, down) = (read(&n("ffn_gate"))?, read(&n("ffn_up"))?, read(&n("ffn_down"))?);
+    let output = read(if f.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" })?;
+    // eh_proj [n_embd, 2 n_embd]: each row's first half of blocks multiplies the embedding, the second the hidden state
+    let t = f.tensor(&n("nextn.eh_proj")).ok_or_else(|| e("the MTP file has no nextn.eh_proj"))?;
+    let (rows, cols) = (t.shape[0] as usize, t.shape[1..].iter().product::<u64>() as usize);
+    if cols != 2 * g.n_embd || matches!(t.ty, GType::F32 | GType::F16 | GType::BF16) {
+        return Err(e("nextn.eh_proj: a quantized [n_embd, 2 n_embd] matrix"));
+    }
+    let raw = f.read(t).map_err(|x| e(x.0))?;
+    *loaded += raw.len() as u64;
+    let (rb, hb) = (t.ty.bytes(cols as u64).unwrap_or(0) as usize, t.ty.bytes(g.n_embd as u64).unwrap_or(0) as usize);
+    let (mut ea, mut ha) = (Vec::with_capacity(rows * hb), Vec::with_capacity(rows * hb));
+    for r in 0..rows {
+        ea.extend_from_slice(&raw[r * rb..r * rb + hb]);
+        ha.extend_from_slice(&raw[r * rb + hb..(r + 1) * rb]);
+    }
+    let (be, bh) = (DevBuf::new(gpu, ea.len())?, DevBuf::new(gpu, ha.len())?);
+    be.write(0, &ea)?;
+    bh.write(0, &ha)?;
+    let embd = f.tensor("token_embd.weight").ok_or_else(|| e("the MTP file has no token_embd.weight"))?.clone();
+    let vocab = embd.shape[0] as usize;
+    Ok(Mtp { eh_e: Mat { buf: be, ty: t.ty, rows, cols: g.n_embd }, eh_h: Mat { buf: bh, ty: t.ty, rows, cols: g.n_embd }, enorm, hnorm, head_norm,
+             attn_norm, post_norm, attn, gate, up, down, output, embd, vocab, file: m })
 }

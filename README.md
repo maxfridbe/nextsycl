@@ -684,13 +684,17 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   | UD-Q4_K_M | 62 / 25.1 | 1,151 / 25.0 | 1,100 / 24.3 | 524 / 19.4 |
   | UD-Q3_K_XL | 61 / 22.5 | 1,149 / 22.3 | 1,099 / 20.2 | 524 / 17.8 |
 
+  With MTP (the file's draft block, `MTP/` beside the model: 3 drafts a step, ~84% accepted, the same tokens as
+  without) decode at 2,185 is UD-Q4_K_M 43.3 tok/s (26.2 without), UD-Q3_K_XL 41.9 (22.3), Q8_0 41.8 (18.5); Q4 at
+  20 / 8,000 tokens 46.8 / 37.1. Prompts read ~3% slower (the draft block follows every pass). `--no-mtp` turns it off.
+
   Most of it is the engine's silo (`kernels/llm/qwen35/silo`, kernels tuned for this model): its decode products for
   the types these files hold, flash attention on XMX for prompts and a lane-a-key decode attention, its weight
   expansion to half, a norm that hands the products their Q8_1 blocks; prompt chunks of 2,048. With the shared
   kernels alone (`NS_SILO=0`) UD-Q4_K_M reads 2,185 tokens at 441 tok/s and decodes at 18.5 - the same tokens either
   way. Q8_0 decode is bandwidth-bound (27 GiB a token). `NS_PROFILE=gpu NS_Q35_PROFILE=1` times every kernel.
   Sessions check their cache against the free VRAM before allocating (1.5 GiB spare).
-- Not yet: the MTP draft layer (the GGUF's `MTP/` file), pictures (the vision tower: `mmproj`), verify passes.
+- Not yet: pictures (the vision tower: `mmproj`).
 
 ## Speed by model
 

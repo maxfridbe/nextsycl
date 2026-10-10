@@ -20,6 +20,8 @@ pub const ARCH: &str = "qwen35";
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "chunk", env: "NS_Q35_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 2048 when it fits beside the weights and a session, else 1024 or 512)", at: At::Load },
+    EngineOption { name: "mtp", env: "NS_Q35_MTP", value: "FILE", help: "the MTP draft block's GGUF (default: the one in an MTP/ folder beside the model)", at: At::Load },
+    EngineOption { name: "drafts", env: "NS_Q35_DRAFTS", value: "N", help: "tokens drafted a step with MTP (default 3, at most 7; 0: none)", at: At::Load },
 ];
 
 pub fn kind() -> EngineKind {
@@ -35,8 +37,8 @@ fn info(f: &Gguf) -> std::result::Result<String, String> {
                g.layers - full, g.k_heads, g.v_heads, g.state, g.n_ff, g.vocab, g.ctx))
 }
 
-fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], _o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {
-    Ok(Box::new(engine::Qwen35::load(f, gpus, log)?))
+fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {
+    Ok(Box::new(engine::Qwen35::load(f, gpus, o.draft, log)?))
 }
 
 impl SessionState for engine::Session {
@@ -56,7 +58,7 @@ impl SessionState for engine::Session {
 
 impl DecoderState for engine::Decoder {
     fn drafts(&self) -> (u64, u64) {
-        (0, 0)
+        (self.drafted, self.accepted)
     }
     fn pending(&mut self) -> Option<u32> {
         engine::Decoder::pending(self)
@@ -99,16 +101,17 @@ impl Engine for engine::Qwen35<'_> {
         engine::Qwen35::load_bytes(self)
     }
     fn has_draft(&self) -> bool {
-        false
+        engine::Qwen35::has_draft(self)
     }
     fn prefill_chunk(&self) -> usize {
         engine::Qwen35::prefill_chunk(self)
     }
     fn max_verify(&self) -> usize {
-        1
+        engine::Qwen35::max_verify(self)
     }
     fn cache_fingerprint(&self) -> String {
-        "qwen35 f16-kv nsq35-1".into()
+        // checkpoints hold the draft block's cache too when it is loaded
+        if self.has_draft() { "qwen35 f16-kv nsq35-1 mtp".into() } else { "qwen35 f16-kv nsq35-1".into() }
     }
     fn session(&self, max_ctx: usize) -> Result<Session> {
         Ok(Session::new(engine::Qwen35::session(self, max_ctx)?))
@@ -142,11 +145,11 @@ impl Engine for engine::Qwen35<'_> {
         }
         engine::Qwen35::forward_batch(self, &mut own, tokens, tap)
     }
-    fn decoder(&self, logits: Vec<f32>, _draft: bool) -> Decoder {
-        Decoder::new(engine::Decoder::new(logits))
+    fn decoder(&self, logits: Vec<f32>, draft: bool) -> Decoder {
+        Decoder::new(engine::Decoder::new(logits, draft))
     }
-    fn decoder_after(&self, next: u32, _draft: bool) -> Decoder {
-        Decoder::new(engine::Decoder::after(next))
+    fn decoder_after(&self, next: u32, draft: bool) -> Decoder {
+        Decoder::new(engine::Decoder::after(next, draft))
     }
     fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
         let d = d.get_mut::<engine::Decoder>().ok_or_else(|| nextsycl_core::Error("a decoder of another engine".into()))?;

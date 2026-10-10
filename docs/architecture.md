@@ -154,6 +154,12 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   and arithmetic: time, GB/s and TFLOP/s against the card's ceilings by phase and kernel, decode and prompt passes apart,
   and the device time between kernels - `llm/qwen35/src/probe.rs`), `NS_Q35_MMVQ_ROWS`
   (rows a sub-group, every silo type) and `NS_Q35_MMVQ_GROUPS` (work-groups of the kernels with a table, 512).
+  MTP: the draft block (the GGUF's `MTP/` file, `NS_Q35_MTP`) reads each position's normed hidden state with the token
+  after it (eh_proj split into its two halves at load), a gated full-attention layer with its own cache, a SwiGLU,
+  its head; it runs behind every pass over that pass's rows. `step` drafts `NS_Q35_DRAFTS` (3) tokens chained on the
+  block's own output, verifies them in one pass, keeps what the sampled tokens match and rolls the DeltaNet states back
+  from the pass's snapshots (`spec-check`: verify rows bit for bit the one-token decode's - the decode attention splits
+  each row's keys as a one-row pass at that position would).
 
 ## The audio engines
 

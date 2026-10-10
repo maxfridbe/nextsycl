@@ -18,6 +18,7 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
 
 namespace {
@@ -234,8 +235,10 @@ template <int G>
 void attn_decode(sycl::queue& queue, const float* q, int64_t qs, const half* kc, const half* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
                  int64_t p0, float* out, float* part) {
     constexpr int WG = NSG_D * SG, DL = D / SG;
-    // the longest row's splits for all rows (a shorter row's last splits are empty)
-    const int64_t ns = dec_splits(p0 + T, Hkv), kb = dec_split(p0 + T, Hkv);
+    // each row splits its keys as a one-row pass at its position would (a verify row's result is bit for bit the
+    // decode's); the grid has the most splits any row has, a row's further work-groups do nothing
+    int64_t ns = 1;
+    for (int64_t r = 0; r < T; ++r) ns = std::max(ns, dec_splits(p0 + r + 1, Hkv));
     const float qscale = 1.0f / sycl::sqrt((float) D) * 1.4426950408889634f;
     queue.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> qsl(sycl::range<1>(G * D), h);
@@ -248,7 +251,9 @@ void attn_decode(sycl::queue& queue, const float* q, int64_t qs, const half* kc,
             const int64_t sp = gi % ns;
             gi /= ns;
             const int64_t hk = gi % Hkv, r = gi / Hkv;
-            const int64_t kv_end = p0 + r + 1, j0 = sp * kb, j1 = sycl::min(kv_end, (sp + 1) * kb);
+            const int64_t kv_end = p0 + r + 1, kb = dec_split(kv_end, Hkv), nsr = (kv_end + kb - 1) / kb;
+            if (sp >= nsr) return;   // the whole work-group: past this row's splits
+            const int64_t j0 = sp * kb, j1 = sycl::min(kv_end, (sp + 1) * kb);
             for (int i = tid; i < G * D; i += WG) qsl[i] = q[r * qs + hk * G * D + i] * qscale;
             sycl::group_barrier(it.get_group());
             float m[G], l[G], acc[G][DL];
@@ -338,7 +343,7 @@ void attn_decode(sycl::queue& queue, const float* q, int64_t qs, const half* kc,
                     }
                 }
                 const int64_t hq = hk * G + g;
-                if (ns == 1) {
+                if (nsr == 1) {
                     out[r * Hq * D + hq * D + d] = Ls > 0.0f ? A / Ls : 0.0f;
                 } else {
                     float* pp = part + ((r * Hq + hq) * ns + sp) * (D + 2);
@@ -354,12 +359,14 @@ void attn_decode(sycl::queue& queue, const float* q, int64_t qs, const half* kc,
     if (ns > 1) {   // the splits merged (their maxima in log2 units)
         queue.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * Hq) * D), sycl::range<1>(D)), [=](sycl::nd_item<1> it) {
             const int64_t rh = it.get_group(0), d = it.get_local_id(0);
+            const int64_t nsr = dec_splits(p0 + rh / Hq + 1, Hkv);
+            if (nsr == 1) return;   // written by the first kernel
             const float* pp = part + rh * ns * (D + 2);
             float mx = -INFINITY;
-            for (int64_t k = 0; k < ns; ++k) mx = sycl::fmax(mx, pp[k * (D + 2) + D]);
+            for (int64_t k = 0; k < nsr; ++k) mx = sycl::fmax(mx, pp[k * (D + 2) + D]);
             float Ls = 0.0f, A = 0.0f;
             if (mx != -INFINITY) {
-                for (int64_t k = 0; k < ns; ++k) {
+                for (int64_t k = 0; k < nsr; ++k) {
                     const float e = sycl::exp2(pp[k * (D + 2) + D] - mx);
                     Ls += pp[k * (D + 2) + D + 1] * e;
                     A += pp[k * (D + 2) + d] * e;
@@ -391,7 +398,8 @@ int ns_q35_attn_decode_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh)
 }
 
 int64_t ns_q35_attn_decode_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh, int64_t p0) {
-    const int64_t ns = dec_splits(p0 + T, Hkv);
+    int64_t ns = 1;
+    for (int64_t r = 0; r < T; ++r) ns = std::max(ns, dec_splits(p0 + r + 1, Hkv));
     return ns > 1 ? T * Hq * ns * (Dh + 2) : 0;
 }
 
