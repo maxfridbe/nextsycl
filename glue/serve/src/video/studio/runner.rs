@@ -168,7 +168,12 @@ impl Studio {
                 spec[key] = json!(r.iter().filter_map(|x| x.as_str()).map(|f| format!("{}/{f}", self.out_in)).collect::<Vec<_>>().join(","));
             }
         }
-        for k in ["ref_image_size", "ref_video_sound", "te_pictures"] {
+        for k in ["control_video", "control_mask", "control_source"] {
+            if let Some(f) = item[k].as_str() {
+                spec[k] = json!(format!("{}/{f}", self.out_in));
+            }
+        }
+        for k in ["ref_image_size", "ref_video_sound", "te_pictures", "control_strength", "control_start", "control_end"] {
             if !item[k].is_null() {
                 spec[k] = item[k].clone();
             }

@@ -30,6 +30,10 @@ interface Form {
   refAudios: string[];
   refVideoSound: boolean;
   refImageMax: boolean;
+  controlVideo: string;
+  controlMask: string;
+  controlSource: string;
+  controlStrength: number;
 }
 
 export const form: Form = {
@@ -57,6 +61,10 @@ export const form: Form = {
   refAudios: [],
   refVideoSound: true,
   refImageMax: false,
+  controlVideo: "",
+  controlMask: "",
+  controlSource: "",
+  controlStrength: 1,
 };
 
 /** Fill the form from an existing job - the "use these settings" path. */
@@ -78,6 +86,10 @@ export function useSettings(j: GenerateRequest): void {
   form.refAudios = j.ref_audios ?? [];
   form.refVideoSound = j.ref_video_sound ?? true;
   form.refImageMax = j.ref_image_size === "max";
+  form.controlVideo = j.control_video ?? "";
+  form.controlMask = j.control_mask ?? "";
+  form.controlSource = j.control_source ?? "";
+  form.controlStrength = j.control_strength ?? 1;
   form.label = j.label ?? "";
   form.chain = !!j.first_frame;
   navigate({ tab: "create" });
@@ -108,6 +120,12 @@ async function generate(queue: boolean): Promise<void> {
   }
   if (form.refAudios.length) body.ref_audios = form.refAudios;
   if (form.refImages.length && form.refImageMax) body.ref_image_size = "max";
+  if (form.controlVideo) body.control_video = form.controlVideo;
+  if (form.controlMask) {
+    body.control_mask = form.controlMask;
+    if (form.controlSource) body.control_source = form.controlSource;
+  }
+  if (form.controlVideo || form.controlMask) body.control_strength = form.controlStrength;
   if (form.chain) body.first_frame = "prev";
   try {
     await rpc("generate", body);
@@ -237,6 +255,59 @@ function References() {
   );
 }
 
+type ControlKey = "controlVideo" | "controlMask" | "controlSource";
+
+async function setControl(key: ControlKey, files: FileList | null): Promise<void> {
+  const f = files?.[0];
+  if (!f) return;
+  try {
+    const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
+    const j = (await r.json()) as { ok: boolean; name?: string; error?: string };
+    if (!j.ok || !j.name) throw new Error(j.error ?? `HTTP ${r.status}`);
+    form[key] = j.name;
+    state.error = null;
+  } catch (e) {
+    state.error = `${f.name}: ${String(e)}`;
+  }
+  render();
+}
+
+function ControlNet() {
+  const pick = (key: ControlKey, label: string, accept: string, title: string) => (
+    <span class="ref" attrs={{ title }}>
+      <label class="tbtn">
+        <span class="i" props={{ innerHTML: "&#xf093;" }} />{label}
+        <input attrs={{ type: "file", accept, style: "display:none" }}
+          on={{ change: (e: Event) => void setControl(key, (e.target as HTMLInputElement).files) }} />
+      </label>
+      {form[key]
+        ? <span> <span class="hint">{form[key].replace(/^ref_\d+_/, "")}</span>
+            <a attrs={{ href: "#", title: "remove" }} on={{ click: (e: Event) => { e.preventDefault(); form[key] = ""; render(); } }}> ✕</a></span>
+        : null}
+    </span>
+  );
+  return (
+    <div>
+      <div class="refs">
+        {pick("controlVideo", "control video", "video/*,image/*", "canny / depth / HED / MLSD / pose frames, made beforehand: the clip follows them")}
+        {pick("controlMask", "mask", "video/*,image/*", "white = regenerate (a picture holds for the whole clip)")}
+        {form.controlMask ? pick("controlSource", "source video", "video/*", "the video behind the mask: kept where the mask is black") : null}
+      </div>
+      {form.controlVideo || form.controlMask
+        ? <div class="row">
+            <label attrs={{ title: "how hard the control steers (1 = as trained)" }}>
+              strength
+              <input attrs={{ type: "number", min: 0, max: 3, step: 0.05, value: String(form.controlStrength) }}
+                on={{ input: (e: Event) => { form.controlStrength = Number((e.target as HTMLInputElement).value); } }} />
+            </label>
+          </div>
+        : null}
+      <div class="hint">The Fun ControlNet-Union on the text/image-to-video denoiser (not with references). The clip's canvas and
+        length are the control's: pick a canvas of its aspect.</div>
+    </div>
+  );
+}
+
 /** A select over the plan's names, "" first (the engine's default) */
 const named = (label: string, key: "sampler" | "schedule", names: string[] | undefined, dflt: string, title: string) => (
   <label attrs={{ title }}>
@@ -307,6 +378,15 @@ export function Creation() {
         hint={refTags().length ? refTags().map((t) => t.tag).join(" · ") : "pictures, clips, sounds the prompt names"}
       >
         <References />
+      </Panel>
+      <Panel
+        id="control"
+        icon="&#xf1de;"
+        title="Control"
+        hint={form.controlVideo || form.controlMask ? [form.controlVideo ? "control video" : "", form.controlMask ? "mask" : ""].filter((x) => x).join(" + ")
+          : "a pose / depth / edge video to follow, or a region to regenerate"}
+      >
+        <ControlNet />
       </Panel>
       <Panel
         id="canvas"

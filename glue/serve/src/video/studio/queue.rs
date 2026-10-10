@@ -271,6 +271,24 @@ impl Studio {
         for k in ["ref_video_sound", "te_pictures"] {
             it.insert(k.into(), p.get(k).filter(|v| v.is_boolean()).cloned().unwrap_or(Value::Null));
         }
+        // the ControlNet: a control video, a mask over a source; files beside the clips
+        for k in ["control_video", "control_mask", "control_source"] {
+            let v = p.get(k).and_then(|v| v.as_str()).map(basename).filter(|v| !v.is_empty());
+            if let Some(f) = &v {
+                if !self.out.join(f).exists() {
+                    return Err(RpcError::not_found(&format!("{k} {f} not found in out/")));
+                }
+            }
+            it.insert(k.into(), v.map_or(Value::Null, |f| json!(f)));
+        }
+        if !it["control_video"].is_null() || !it["control_mask"].is_null() {
+            if it["engine"] == "REF2VA" {
+                return Err(RpcError::param("the ControlNet steers the text/image-to-video denoiser, not Ref2VA: references and control do not mix"));
+            }
+            it.insert("control_strength".into(), num(p, "control_strength", 1.0, 0.0, 10.0, false)?);
+            it.insert("control_start".into(), num(p, "control_start", 0.0, 0.0, 1.0, false)?);
+            it.insert("control_end".into(), num(p, "control_end", 1.0, 0.0, 1.0, false)?);
+        }
         let ris = p.get("ref_image_size").and_then(|v| v.as_str()).filter(|v| *v == "match" || *v == "max");
         it.insert("ref_image_size".into(), ris.map_or(Value::Null, |v| json!(v)));
         Ok(Value::Object(it))

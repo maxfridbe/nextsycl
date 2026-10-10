@@ -48,6 +48,12 @@ export interface GenerateRequest {
   ref_image_size?: "match" | "max" | null;
   /** the keyframe pictures shown to the text encoder too (default on) */
   te_pictures?: boolean | null;
+  /** the Fun ControlNet: a control video (canny / depth / HED / MLSD / pose frames), a mask (white: regenerate) over
+   *  a source video; files in the studio's output directory */
+  control_video?: string | null;
+  control_mask?: string | null;
+  control_source?: string | null;
+  control_strength?: number | null;
   project?: string;
   batch?: string;
   queue?: boolean;

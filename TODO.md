@@ -192,10 +192,11 @@ of IQ2_XXS instead could win twice.
       their links, start / stop image and music servers on a GPU (a held card refused unless forced), the chat model
       through llm.mode; `audio start | ps | logs | stop` (cli served.rs, shared with image)
 - [ ] Qwen3.8-Flash-Next's own vision input for chat (transformers has qwen4_exp's vision tower); `image inspect | bench`
-- [ ] H3's other modes (ComfyUI nodes_minimax_h3.py): Ref2VA (the ref2va DiT, up to 9 reference pictures through the
-      text encoder's vision tower + their latents, 3 reference videos with soundtracks, 3 sounds), the Fun ControlNet
-      Union patch (canny / depth / HED / MLSD / pose control videos; masked inpainting with a source video), the
-      effect embeddings (bullet_time, four_seasons ...)
+- [x] H3's other modes (ComfyUI nodes_minimax_h3.py): Ref2VA (the vision tower in the text encoder, references in the
+      denoiser, the ref2va model), keyframe pictures to the text encoder, the effect embeddings, the Fun ControlNet
+      Union 2.0 (control videos, masked inpainting); the studio's References and Control panels, its uploads
+- [ ] H3: several guides at once (ComfyUI chains MiniMaxH3AddGuide: "multiframe reference"); built-in control
+      preprocessors (canny at least; depth / pose need networks); the ref2v turbo LoRA's 4 steps in the studio
 - [x] Qwen-Image speed, round 1 (B70, 1024x1024, 40 steps 30.0 -> 26.5 s): layernorm + modulation fused, one
       work-group a row (1.69 -> 0.37 ms a call); prefix + block attention read in place through strides (5.9 -> 5.2 ms)
 - [x] Qwen-Image speed, round 2 (B70, 1024x1024, 40 steps): `NS_QI_INT8=1` int8 ConvRot block matrices (rotated and

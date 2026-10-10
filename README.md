@@ -452,6 +452,19 @@ nextsycl video stop [--web | --all]
   differ from each other (cosine 0.996 - H3 is not bit-reproducible run to run), the frames the same scene; 8.0 s a
   denoising step either way at 896x672, 4.5 s (19,191 tokens).
 
+What a clip can be made from (ComfyUI's H3 nodes, each checked against them where noted):
+
+| Mode | How | Keys (job spec; the studio's form has each) |
+|---|---|---|
+| text to video+audio | the prompt | `prompt` |
+| image to video, first / last frame, both | keyframes pinned at frame 0 / the last frame; their pictures shown to the text encoder too (`<Picture i>`, as ComfyUI's image-to-video node) | `first_frame`, `last_frame`, `te_pictures` |
+| motion guide, clip continuation | a clip's last frames anchored at a frame; the last latent of the clip before | `guide_clip`, `first_latent`, `first_audio` |
+| references (Ref2VA) | up to 9 pictures, 3 clips (their sound too) and 3 sounds named `<Picture i>`, `<Video k>`, `<Audio j>` in the prompt; the Ref2VA denoiser (`minimax-h3-ref2va`). The 32B text encoder's vision tower (`visual.*`, range-fetched from the bf16 file) runs from crates/qwen3vl - checked against ComfyUI: cosine 0.99994 | `ref_images`, `ref_videos`, `ref_audio`, `ref_image_size` |
+| effects | Comfy-Org's ten embeddings: `embedding:minimaxh3_bullet_time` in the prompt (ComfyUI's splitting; cosine 0.999999) | `embeddings` (from the model's roles) |
+| ControlNet (Fun ControlNet-Union 2.0) | a control video - canny, depth, HED, MLSD or pose frames, made beforehand - the clip follows | `control_video`, `control_strength`, `control_start`, `control_end` |
+| video inpainting | a mask (white: regenerate; a picture or a video) over a source video, through the same ControlNet | `control_mask`, `control_source` |
+| regenerate a stretch / box, extend | a clip's latents kept outside the seconds and box asked for | `source`, `regen`, `regen_box` |
+
 ![the video studio](docs/screenshots/video-studio.webp)
 
 ## Audio

@@ -11,10 +11,11 @@ use super::runner::snap_seconds;
 use super::{now, pyround, RpcError, Studio};
 
 /// The keys a scene file may lift into its defaults.
-const SCENE_DEFAULTABLE: [&str; 28] = [
+const SCENE_DEFAULTABLE: [&str; 34] = [
     "steps", "seed", "te", "engine", "width", "height", "chain_mode", "upscale", "first_frame", "last_frame", "exposure_ref", "first_audio",
     "first_audio_s", "cond_noise_aug", "loras", "ref_images", "ref_audios", "ref_image_size", "guide_clip", "shift_video", "shift_audio", "source",
-    "regen", "sampler", "schedule", "ref_videos", "ref_video_sound", "te_pictures",
+    "regen", "sampler", "schedule", "ref_videos", "ref_video_sound", "te_pictures", "control_video", "control_mask", "control_source",
+    "control_strength", "control_start", "control_end",
 ];
 
 pub const CANVASES: [(i64, i64, &str, &str); 10] = [
