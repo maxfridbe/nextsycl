@@ -188,6 +188,9 @@ of IQ2_XXS instead could win twice.
 - [x] `image start | ps | logs | stop` (the server's container in the background; a stop waits for the pictures in
       progress) and the images API through the switcher (`--images`: /v1/images/* passed on, its model listed);
       ComfyUI's samplers and schedules in the video engine (`sampler` / `schedule` in a job, the studio's Create form)
+- [x] `nextsycl serve`: the box at a glance (glue/serve home, wfe/home): every GPU's VRAM by process, the services with
+      their links, start / stop image and music servers on a GPU (a held card refused unless forced), the chat model
+      through llm.mode; `audio start | ps | logs | stop` (cli served.rs, shared with image)
 - [ ] Qwen3.8-Flash-Next's own vision input for chat (transformers has qwen4_exp's vision tower); `image inspect | bench`
 - [ ] H3's other modes (ComfyUI nodes_minimax_h3.py): Ref2VA (the ref2va DiT, up to 9 reference pictures through the
       text encoder's vision tower + their latents, 3 reference videos with soundtracks, 3 sounds), the Fun ControlNet

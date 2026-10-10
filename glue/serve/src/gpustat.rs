@@ -41,17 +41,26 @@ fn num(p: impl AsRef<Path>) -> Option<i64> {
 
 /// The first Intel GPU on the xe driver (it has tile*/gt*), as a PCI address
 pub fn find_card() -> Option<String> {
-    let mut cards: Vec<PathBuf> = std::fs::read_dir("/sys/class/drm").ok()?.flatten().map(|e| e.path())
+    find_cards().into_iter().next()
+}
+
+/// Every Intel GPU on the xe driver, by PCI address (the order Level Zero numbers them in)
+pub fn find_cards() -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten().map(|e| e.path())
         .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("card") && n[4..].chars().all(|c| c.is_ascii_digit())))
+        .map(|c| c.join("device"))
+        .filter(|d| {
+            rd(d.join("vendor")).as_deref() == Some("0x8086")
+                && std::fs::read_dir(d).into_iter().flatten().flatten().any(|e| {
+                    e.file_name().to_string_lossy().starts_with("tile") && std::fs::read_dir(e.path()).into_iter().flatten().flatten()
+                        .any(|g| g.file_name().to_string_lossy().starts_with("gt"))
+                })
+        })
+        .filter_map(|d| std::fs::canonicalize(d).ok()?.file_name().map(|n| n.to_string_lossy().into_owned()))
         .collect();
-    cards.sort();
-    cards.into_iter().map(|c| c.join("device")).find(|d| {
-        rd(d.join("vendor")).as_deref() == Some("0x8086")
-            && std::fs::read_dir(d).into_iter().flatten().flatten().any(|e| {
-                e.file_name().to_string_lossy().starts_with("tile") && std::fs::read_dir(e.path()).into_iter().flatten().flatten()
-                    .any(|g| g.file_name().to_string_lossy().starts_with("gt"))
-            })
-    }).and_then(|d| std::fs::canonicalize(d).ok()).and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// The largest BAR in MiB
@@ -123,6 +132,7 @@ fn pcie(pci: &str) -> Value {
 /// A DRM client: its VRAM and cycle counters
 #[derive(Clone, Copy, Default)]
 struct Client {
+    pid: u32,
     vram_kb: u64,
     cycles: u64,
     total: u64,
@@ -149,6 +159,7 @@ fn clients(pci: &str) -> HashMap<String, Client> {
             }
             let n = |k: &str| kv.get(k).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
             res.insert(cid.to_string(), Client {
+                pid: pid.to_string_lossy().parse().unwrap_or(0),
                 vram_kb: n("drm-resident-vram0"),
                 cycles: n("drm-cycles-rcs").max(n("drm-cycles-ccs")),
                 total: n("drm-total-cycles-rcs").max(n("drm-total-cycles-ccs")),
@@ -162,57 +173,85 @@ fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
 
-/// Samples until the process ends (or once)
-pub fn run(o: Options) -> Result<(), String> {
-    let pci = o.pci.clone().or_else(find_card).ok_or("no Intel GPU on the xe driver (--pci ADDR)")?;
-    let dev = rd(format!("/sys/bus/pci/devices/{pci}/device")).unwrap_or_default().trim_start_matches("0x").to_string();
-    let name = card_name(&pci, &dev);
-    let total_mb = o.vram_mb.unwrap_or_else(|| bar_mb(&pci));
-    let h = hwmon(&pci);
-    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let mut prev: HashMap<String, Client> = HashMap::new();
-    let mut ring: VecDeque<(Instant, i64, i64)> = VecDeque::new();
-    let (mut link, mut link_t) = (pcie(&pci), Instant::now());
-    loop {
+/// One card's sampler: busy % and power need the previous sample
+pub struct Card {
+    pub pci: String,
+    pub name: String,
+    total_mb: u64,
+    h: Option<PathBuf>,
+    prev: HashMap<String, Client>,
+    ring: VecDeque<(Instant, i64, i64)>,
+    link: (Value, Instant),
+}
+
+impl Card {
+    pub fn open(pci: &str, vram_mb: Option<u64>) -> Card {
+        let dev = rd(format!("/sys/bus/pci/devices/{pci}/device")).unwrap_or_default().trim_start_matches("0x").to_string();
+        Card {
+            pci: pci.to_string(), name: card_name(pci, &dev), total_mb: vram_mb.unwrap_or_else(|| bar_mb(pci)), h: hwmon(pci),
+            prev: HashMap::new(), ring: VecDeque::new(), link: (pcie(pci), Instant::now()),
+        }
+    }
+
+    /// A reading (the gpustat file's fields) and the VRAM each process holds on the card, in MiB
+    pub fn sample(&mut self, power_window: Duration) -> (Value, Vec<(u32, u64)>) {
         let now = Instant::now();
-        let cl = clients(&pci);
+        let cl = clients(&self.pci);
         let busy: f64 = cl.iter().filter_map(|(id, c)| {
-            let p = prev.get(id)?;
+            let p = self.prev.get(id)?;
             (c.total > p.total).then(|| (c.cycles.saturating_sub(p.cycles)) as f64 / (c.total - p.total) as f64 * 100.0)
         }).fold(0.0, |a, b| a + b); // (an empty f64 sum is -0.0)
+        let h = self.h.clone();
         let energy = |i: u32| h.as_ref().and_then(|h| num(h.join(format!("energy{i}_input")))).unwrap_or(0);
         let (e, e2) = (energy(1), energy(2));
-        ring.push_back((now, e, e2));
-        while ring.len() > 2 && now - ring[1].0 >= o.power_window {
-            ring.pop_front();
+        self.ring.push_back((now, e, e2));
+        while self.ring.len() > 2 && now - self.ring[1].0 >= power_window {
+            self.ring.pop_front();
         }
-        let (t0, ea, eb) = ring[0];
+        let (t0, ea, eb) = self.ring[0];
         let span = (now - t0).as_secs_f64();
         let watts = |a: i64, b: i64| (span >= 2.5 && b >= a).then(|| round1((b - a) as f64 / 1e6 / span));
-        if now - link_t > Duration::from_secs(30) {
+        if now - self.link.1 > Duration::from_secs(30) {
             // the link can retrain (power saving, errors)
-            (link, link_t) = (pcie(&pci), now);
+            self.link = (pcie(&self.pci), now);
         }
         let t = h.as_deref().map(temps).unwrap_or_default();
         let vram_max = t.iter().filter(|(k, _)| k.starts_with("vram_ch_")).map(|(_, v)| *v).reduce(f64::max);
         let cap = h.as_ref().and_then(|h| num(h.join("power1_cap"))).filter(|c| *c > 0).map(|c| (c as f64 / 1e6).round() as i64);
-        let freq = num(format!("/sys/bus/pci/devices/{pci}/tile0/gt0/freq0/act_freq"));
+        let freq = num(format!("/sys/bus/pci/devices/{}/tile0/gt0/freq0/act_freq", self.pci));
         let load1 = rd("/proc/loadavg").and_then(|l| l.split_whitespace().next()?.parse::<f64>().ok()).unwrap_or(0.0);
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
         let out = json!({
-            "name": name, "pci": pci, "ts": ts,
-            "vram_used_mb": cl.values().map(|c| c.vram_kb).sum::<u64>() / 1024, "vram_total_mb": total_mb,
+            "name": self.name, "pci": self.pci, "ts": ts,
+            "vram_used_mb": cl.values().map(|c| c.vram_kb).sum::<u64>() / 1024, "vram_total_mb": self.total_mb,
             "busy_pct": round1(busy.min(100.0)),
             "temp_pkg": t.get("pkg"), "temp_vram": t.get("vram"),
             "power_w": watts(ea, e), "pkg_power_w": watts(eb, e2), "power_cap_w": cap,
             "temp_vram_max": vram_max, "temp_pcie": t.get("pcie"), "temp_mctrl": t.get("mctrl"),
-            "pcie": link,
-            "host_load1": load1, "host_cpus": cpus,
+            "pcie": self.link.0,
+            "host_load1": load1, "host_cpus": std::thread::available_parallelism().map_or(1, |n| n.get()),
             // the card's cumulative energy (hwmon energy1, "card", microjoules)
             "energy_j": round1(e as f64 / 1e6),
             "fan_rpm": h.as_ref().map(|h| num(h.join("fan1_input")).unwrap_or(0)),
             "freq_mhz": freq,
         });
+        let mut by_pid: HashMap<u32, u64> = HashMap::new();
+        for c in cl.values() {
+            *by_pid.entry(c.pid).or_default() += c.vram_kb;
+        }
+        self.prev = cl;
+        let mut procs: Vec<(u32, u64)> = by_pid.into_iter().map(|(p, kb)| (p, kb / 1024)).collect();
+        procs.sort_by_key(|p| std::cmp::Reverse(p.1));
+        (out, procs)
+    }
+}
+
+/// Samples until the process ends (or once)
+pub fn run(o: Options) -> Result<(), String> {
+    let pci = o.pci.clone().or_else(find_card).ok_or("no Intel GPU on the xe driver (--pci ADDR)")?;
+    let mut card = Card::open(&pci, o.vram_mb);
+    loop {
+        let (out, _) = card.sample(o.power_window);
         if o.once {
             println!("{out}");
             return Ok(());
@@ -223,7 +262,6 @@ pub fn run(o: Options) -> Result<(), String> {
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
             std::fs::rename(&tmp, &o.out)
         }).map_err(|e| format!("{}: {e}", o.out.display()))?;
-        prev = cl;
         std::thread::sleep(o.interval);
     }
 }

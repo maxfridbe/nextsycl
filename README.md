@@ -245,19 +245,35 @@ entry can point anywhere on the machine.
 
 ## Host services
 
-Two small services sit beside the model servers, both in the program (no Python on the serving path):
+Three small services sit beside the model servers, all in the program (no Python on the serving path):
 
 ```sh
+nextsycl serve [--port 8000] [--host 0.0.0.0] [--serve-host 0.0.0.0]
 nextsycl switch [--port 8001] [--upstream 127.0.0.1:8085] [--studio http://127.0.0.1:8090/rpc/llm.mode] [--alias OLD=NEW]...
+                [--images 127.0.0.1:8086]
 nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once]     # as root
 ```
+
+- **`serve`**: the box at a glance. A card per GPU: VRAM split by the processes holding it (each named - `llm serve
+  <model>`, `image serve`, a video worker, or the program - and the model by its registry id), busy %, power,
+  temperatures, the PCIe link. Every service: up or not, its model and what it is doing, its port and API, a link to
+  its page (Open WebUI, the image and music pages, the video studio). The controls: start the image or music server
+  with a model on a GPU (a card another engine holds is refused unless you say "start anyway" - two engines on one
+  card spill VRAM), stop it (after the requests in progress), and pick the chat model through the video studio's
+  `llm.mode` ("no chat model" frees its card). Each action's output shows below. Ports from the settings (`NS_PORT`,
+  `NS_SWITCH_PORT`, `NS_IMAGE_PORT`, `NS_AUDIO_PORT`, `NS_VIDEO_PORT`, `NS_CHAT_UI_PORT`); `nextsycl serve FILE`
+  still runs the language-model server as before.
+
+  ![nextsycl serve: the GPUs and the services](docs/screenshots/home-desktop.webp)
 
 - **`switch`**: one OpenAI endpoint for a chat front end over the one model server that runs at a time. It lists the
   registry's enabled chat models (read on every request); a request naming another model asks the video studio to
   swap (`llm.mode`: it knows when a render holds a card), waits until the server answers as that model, and passes the
   request through, streamed answers included. The loaded model is not swapped out while it answers or within 90 s of
   its last request (that request gets a 409 naming it). Per entry: `tools: false` drops tool definitions, `tasks:
-  false` declines a front end's background tasks. `--alias` keeps old model ids working.
+  false` declines a front end's background tasks. `--alias` keeps old model ids working. `--images`: the images API
+  (`/v1/images/...`) goes to the image server and its model is listed while it runs - one base URL for chat and
+  pictures.
 - **`gpustat`**: the card's telemetry every few seconds into a JSON file the pages read: VRAM used (the DRM clients'
   `drm-resident-vram0` in /proc/*/fdinfo - root only) and total, busy %, power over a 15 s window, the power cap,
   temperatures, fan, the PCIe link it trained at and what the card and slot could do.
@@ -332,6 +348,7 @@ prompt, model, seed, size and steps. `check` compares each stage with the dumps 
 ```sh
 nextsycl image serve qwen-image-2.1-q8 [--wfe] [--port 8086] [--host 0.0.0.0] [--gpu N] [--lora NAME[:SCALE]]...
                      [--set NAME=VALUE]... [--out DIR] [--cors ORIGIN]
+nextsycl image start ...      # the same in the background (ready when it answers); image ps | logs [-f] | stop
 ```
 
 From the host it runs the build image as container `nextsycl-image` (the GPU, `dist/`, the registry, the model's and
@@ -421,6 +438,10 @@ nextsycl video stop [--web | --all]
   job, unloads after `NS_VIDEO_IDLE`), the card lock and the front end's model switch for a GPU shared with chat.
 - **The studio** (`video serve`, a host process): H3's front end (`wfe/video`, TSX on snabbdom) and its legacy API,
   the clip queue, projects, scenes, films, the language-model switch (`NS_VIDEO_LLM_MODES`).
+- **Samplers**: a job's `sampler` and `schedule` take ComfyUI's names (`--sampler euler_ancestral`, `dpmpp_2m`,
+  `uni_pc` ...; the same 29 samplers and 10 schedules as the image engine); without them, Euler on H3's own shifted
+  schedule. The studio's Create form has both. A 3 s 768x576 clip, 8 steps on the B70 takes 46-52 s with euler,
+  euler_ancestral or dpmpp_2m alike (one model call a step; heun-type samplers take two or three).
 - Settings: `NS_VIDEO_MODEL`, `NS_VIDEO_ENGINES`, `NS_VIDEO_OUT`, `NS_VIDEO_GPUS`, `NS_VIDEO_SHARED_GPUS`,
   `NS_VIDEO_IDLE`, `NS_VIDEO_GPU_LOCK`, `NS_VIDEO_LLM_SWITCHER`, `NS_VIDEO_MODELS_DIR` (seen as /models: H3's paths
   in scene files, the pixel upscalers), `NS_VIDEO_LISTEN` / `_PORT`, `NS_VIDEO_STUDIO_DIR`, `NS_VIDEO_LLM_MODES`,

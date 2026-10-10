@@ -49,6 +49,31 @@ pub fn switch(args: &[String]) -> Result<(), String> {
     std::sync::Arc::new(sw).run(&addr)
 }
 
+/// `nextsycl serve [--host 0.0.0.0] [--port 8000] [--serve-host 0.0.0.0]`: the GPUs and the services, with links and
+/// controls (nextsycl_serve::home). Ports from the settings: NS_PORT, NS_SWITCH_PORT, NS_IMAGE_PORT, NS_AUDIO_PORT,
+/// NS_VIDEO_PORT, NS_CHAT_UI_PORT.
+pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
+    use nextsycl_serve::home::{Home, Options, Ports};
+    let port = |k: &str, d: u16| cfg.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let wfe = cfg.dist.join("wfe");
+    if !wfe.join("home/index.html").exists() {
+        return Err(format!("{}: the page is not built yet (./build.sh wfe)", wfe.display()));
+    }
+    let c2 = Config::load();
+    let o = Options {
+        wfe,
+        exe: std::env::current_exe().map_err(|e| e.to_string())?,
+        ports: Ports {
+            llm: port("NS_PORT", 8085), switch: port("NS_SWITCH_PORT", 8001), image: port("NS_IMAGE_PORT", 8086), audio: port("NS_AUDIO_PORT", 8087),
+            video: port("NS_VIDEO_PORT", 8090), chat_ui: port("NS_CHAT_UI_PORT", 8080),
+        },
+        serve_host: opt(args, "--serve-host").unwrap_or("0.0.0.0").to_string(),
+        models: Box::new(move || nextsycl_serve::home::with_kinds(models::all(&c2).unwrap_or_default(), |m| models::kind_of(m).to_string())),
+    };
+    let addr = format!("{}:{}", opt(args, "--host").unwrap_or("0.0.0.0"), opt(args, "--port").or(cfg.get("NS_SERVE_PORT").as_deref()).unwrap_or("8000"));
+    Home::new(o).run(&addr)
+}
+
 /// `nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--power-window 15] [--pci ADDR] [--vram-mb N] [--once]`
 pub fn gpustat(args: &[String]) -> Result<(), String> {
     nextsycl_serve::gpustat::run(nextsycl_serve::gpustat::Options {

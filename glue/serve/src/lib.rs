@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod cache;
 pub mod gpustat;
+pub mod home;
 pub mod http;
 pub mod image;
 pub mod serve;

@@ -221,7 +221,7 @@ impl AudioServer {
         };
         let d = e.defaults();
         json!({
-            "model": self.model, "arch": e.arch(), "lyrics": e.lyrics(),
+            "model": self.model, "arch": e.arch(), "lyrics": e.lyrics(), "wfe": self.wfe.is_some(),
             "defaults": {"seconds": f(d.seconds), "max_seconds": f(d.max_seconds), "steps": d.steps, "cfg": f(d.cfg), "rate": d.rate},
             "options": e.options().iter().filter(|o| o.at != nextsycl_core::At::Load)
                 .map(|o| json!({"name": o.name, "value": o.value, "help": o.help})).collect::<Vec<_>>(),

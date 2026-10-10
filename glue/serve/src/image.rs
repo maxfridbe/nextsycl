@@ -303,7 +303,7 @@ impl ImageServer {
                 .map(|o| json!({"name": o.name, "value": o.value, "help": o.help})).collect::<Vec<_>>(),
             "loras": self.loras_known.iter().map(|k| json!({"id": k.id, "title": k.title,
                 "loaded": loaded.iter().find(|l| l.name == k.id).map(|l| l.scale)})).collect::<Vec<_>>(),
-            "saves": self.out_dir.is_some(),
+            "saves": self.out_dir.is_some(), "wfe": self.wfe.is_some(),
         })
     }
 

@@ -11,6 +11,7 @@ use serde_json::Value;
 const USAGE: &str = "nextsycl audio gen \"<description>\" [--lyrics TEXT | --lyrics-file FILE] [--model ID | --dir DIR] [--seconds N] [--steps N]
                    [--cfg X] [--seed N] [--set NAME=VALUE]... [--out FILE|DIR] [--gpu N]
 nextsycl audio serve [MODEL] [--port 8087] [--host 127.0.0.1] [--gpu N] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
+nextsycl audio start [serve's options]   (in the background) | ps | logs [-f] | stop
 nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks] [--gpu N]
 nextsycl audio engines | selftest [--gpu N]";
 
@@ -169,6 +170,9 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The music server's container (`audio serve` in the foreground, `audio start` in the background)
+const SERVED: crate::served::Served = crate::served::Served { name: "nextsycl-audio", kind: "audio", port: "8087" };
+
 /// Where songs go: --out, NS_AUDIO_OUT, ~/.local/share/nextsycl/audio
 fn out_dir(cfg: &Config, args: &[String]) -> PathBuf {
     opt(args, "--out").map(PathBuf::from).or_else(|| cfg.get("NS_AUDIO_OUT").map(PathBuf::from)).unwrap_or_else(|| {
@@ -179,7 +183,7 @@ fn out_dir(cfg: &Config, args: &[String]) -> PathBuf {
 /// `nextsycl audio serve`: from the host, the build image as container `nextsycl-audio` (the GPU, the program and its
 /// libraries, the registry, the model's files read-only, the output directory) running this command inside with
 /// `--here`; there, the engine loaded and served (nextsycl_serve::audio)
-fn serve(cfg: &Config, args: &[String]) -> Result<(), String> {
+fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     let id = args.first().filter(|a| !a.starts_with("--")).map(String::as_str);
     let mut margs = args.to_vec();
     if let Some(i) = id {
@@ -205,14 +209,13 @@ fn serve(cfg: &Config, args: &[String]) -> Result<(), String> {
         return Err(format!("{}: the web front end is not built yet (./build.sh wfe)", cfg.dist.join("wfe").display()));
     }
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
-    const NAME: &str = "nextsycl-audio";
+    const NAME: &str = SERVED.name;
     if ce.running(NAME) {
         return Err(format!("{NAME} is running already ({} stop {NAME})", ce.bin));
     }
     ce.remove(NAME);
     // --init: the server is not PID 1, so a stop's SIGTERM ends it (PID 1 ignores signals it does not handle)
-    let mut a: Vec<String> = vec!["run".into(), "--rm".into(), "--init".into(), "--name".into(), NAME.into(), "--network".into(), "host".into(),
-                                  "--stop-timeout".into(), "120".into()];
+    let mut a = SERVED.run_args(detach, args);
     a.extend(ce.user_args());
     a.extend(ce.gpu_args());
     a.extend(mount(&cfg.dist, "/app", true));
@@ -249,8 +252,7 @@ fn serve(cfg: &Config, args: &[String]) -> Result<(), String> {
         a.push(x.clone());
     }
     a.extend(["--out".into(), out.to_string_lossy().into_owned(), "--here".into()]);
-    let st = ce.cmd().args(&a).status().map_err(|e| e.to_string())?;
-    if st.success() { Ok(()) } else { Err(format!("the audio server ended ({st})")) }
+    SERVED.launch(&ce, &a, detach)
 }
 
 fn serve_here(m: &Value, files: ModelFiles, args: &[String], out: PathBuf, cfg: &Config) -> Result<(), String> {
@@ -279,7 +281,11 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("selftest") => selftest(rest),
         Some("gen") => gen(cfg, rest),
         Some("check") => check(cfg, rest),
-        Some("serve") => serve(cfg, rest),
+        Some("serve") => serve(cfg, rest, false),
+        Some("start") => SERVED.start(cfg, rest, |d| serve(cfg, rest, d)),
+        Some("ps") => SERVED.ps(cfg),
+        Some("stop") => SERVED.stop(cfg),
+        Some("logs") => SERVED.logs(cfg, rest),
         _ => Err(USAGE.into()),
     }
 }

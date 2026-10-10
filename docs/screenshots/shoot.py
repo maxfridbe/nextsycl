@@ -7,6 +7,7 @@ blank - this waits for the panels.
                                                                    # NS_SHOT_PICTURES=a.png,b.png: an edit too
     python shoot.py audio http://localhost:8087 docs/screenshots   # idle, composing, done; desktop and phone widths
     python shoot.py video http://localhost:8095 docs/screenshots   # the studio (nextsycl video serve)
+    python shoot.py home http://localhost:8000 docs/screenshots    # the box at a glance (nextsycl serve); phone too
 
 Written as PNG, kept in the repository as WebP (quality 82: a tenth of the size).
 """
@@ -103,9 +104,25 @@ async def video(p, url, out):
     return errors
 
 
+async def home(p, url, out):
+    b = await p.chromium.launch()
+    pg = await b.new_page(viewport={"width": 1200, "height": 900})
+    errors = []
+    pg.on("pageerror", lambda e: errors.append(str(e)))
+    await pg.goto(url)
+    await pg.wait_for_selector(".svc", timeout=30000)
+    await pg.wait_for_timeout(3000)
+    await pg.screenshot(path=f"{out}/home-desktop.png", full_page=True)
+    await pg.set_viewport_size({"width": 390, "height": 844})
+    await pg.wait_for_timeout(800)
+    await pg.screenshot(path=f"{out}/home-phone.png", full_page=True)
+    await b.close()
+    return errors
+
+
 async def main(kind, url, out):
     async with async_playwright() as p:
-        errors = await {"image": image, "audio": audio, "video": video}[kind](p, url, out)
+        errors = await {"image": image, "audio": audio, "video": video, "home": home}[kind](p, url, out)
     try:
         import glob
         from PIL import Image

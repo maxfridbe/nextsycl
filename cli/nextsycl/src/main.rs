@@ -18,6 +18,7 @@ mod host;
 mod image;
 mod video;
 mod service;
+mod served;
 
 use nextsycl_llm::sampling::{dist, sample, Rng};
 use nextsycl_models::{config, registry as models};
@@ -894,7 +895,9 @@ fn main() -> ExitCode {
         Some("gpustat") => host::gpustat(rest),
         Some("tokenize") if args.len() == 3 => tokenize(Path::new(&args[1]), &args[2]),
         Some("generate") => generate(&args),
-        Some("serve") => serve_cmd(&args),
+        // `serve FILE` (the llm server's old name), else the box at a glance
+        Some("serve") if args.get(1).is_some_and(|a| Path::new(a).exists()) => serve_cmd(&args),
+        Some("serve") => host::home(&cfg, rest),
         Some("spec-check") => spec_check(&args),
         Some("batch-check") => batch_check(&args),
         Some("kernels") if args.len() >= 2 => {
