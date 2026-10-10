@@ -23,7 +23,8 @@ export const state: AppState = {
   progress: null,
   gpu: null,
   history: [],
-  form: { prompt: "", lyrics: "", seconds: 60, steps: null, cfg: null, seed: null, options: {} },
+  form: { prompt: "", lyrics: "", seconds: 60, steps: null, cfg: null, seed: null, options: {}, text: "", voice: "", language: "", instructions: "",
+          refAudio: "", refName: "", refText: "" },
   result: null,
   busy: false,
   status: "idle",
@@ -81,7 +82,8 @@ export function togglePanel(id: string): void {
 
 /** The form survives a reload (the description, the lyrics, every setting). */
 export function saveForm(): void {
-  save("nsaud.form", state.form);
+  // a recording is too big to keep
+  save("nsaud.form", { ...state.form, refAudio: "", refName: "" });
 }
 
 export function restorePreferences(): void {

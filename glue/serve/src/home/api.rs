@@ -80,10 +80,20 @@ pub const METHODS: &[Method] = &[
                        ("input", "string", "the lyrics, [verse] / [chorus] tags on lines of their own (empty: instrumental)", false),
                        ("seconds", "number", "", false), ("seed", "integer", "", false), ("steps", "integer", "", false), ("cfg", "number", "", false)],
              example: r#"{"model": "minimax-music3", "instructions": "warm acoustic folk, 90 BPM, a soft male voice", "input": "[verse]\nRiver runs slow tonight\n[chorus]\nCarry me home", "seconds": 60}"# },
-    Method { kind: "audio", name: "info", summary: "The model's defaults, limits and options", fields: &[MODEL_OPT], example: "{}" },
+    Method { kind: "audio", name: "speak", summary: "Speech from text (a speech model: Qwen3-TTS); the answer links the WAV",
+             fields: &[MODEL_OPT, ("input", "string", "the text to say", true),
+                       ("voice", "string", "a built-in voice (the CustomVoice model: audio.info lists them)", false),
+                       ("language", "string", "english, chinese, japanese ... or auto (default)", false),
+                       ("instructions", "string", "how to say it (CustomVoice), or the voice to make up (VoiceDesign)", false),
+                       ("ref_audio", "string", "a recording of the voice to clone, WAV as base64 or a data: URL (the Base model)", false),
+                       ("ref_text", "string", "what the recording says", false),
+                       ("seconds", "number", "the most to make", false), ("seed", "integer", "", false),
+                       ("options", "object", "the engine's own: greedy, temperature, top-k, streaming", false)],
+             example: r#"{"model": "qwen3-tts-custom", "input": "Good morning. The bread is still warm.", "voice": "ryan", "language": "english", "instructions": "cheerful, a little hurried"}"# },
+    Method { kind: "audio", name: "info", summary: "The model's defaults, limits and options (a speech model: its voices and languages)", fields: &[MODEL_OPT], example: "{}" },
     Method { kind: "audio", name: "progress", summary: "The request running: its phase and how far", fields: &[], example: "{}" },
-    Method { kind: "audio", name: "history", summary: "The songs made, newest first", fields: &[], example: "{}" },
-    Method { kind: "audio", name: "cancel", summary: "Stop the song being made (between steps)", fields: &[], example: "{}" },
+    Method { kind: "audio", name: "history", summary: "The songs and speech made, newest first", fields: &[], example: "{}" },
+    Method { kind: "audio", name: "cancel", summary: "Stop the sound being made (between steps or frames)", fields: &[], example: "{}" },
     Method { kind: "audio", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "minimax-music3"}"# },
 
     Method { kind: "video", name: "generate", summary: "Queue a clip (the studio's generate: every key of the studio's form)",
@@ -122,6 +132,7 @@ fn guide(kind: &str, arch: &str) -> &'static str {
     match (kind, arch) {
         ("video", _) => include_str!("guides/minimax-h3.md"),
         ("image", _) => include_str!("guides/qwen-image-2.1.md"),
+        ("audio", "qwen3-tts") => include_str!("guides/qwen3-tts.md"),
         ("audio", _) => include_str!("guides/minimax-music3.md"),
         _ => include_str!("guides/chat.md"),
     }
@@ -270,7 +281,18 @@ impl Home {
                 let path = if m.name == "edit" { "/v1/images/edits" } else { "/v1/images/generations" };
                 call_for(&t, "POST", path, Some(&body), 3600).map_err(|e| (502, e))
             }
-            ("audio", "generate") => {
+            ("audio", "generate" | "speak") => {
+                let mut b = b.clone();
+                if m.name == "speak" && b["model"].as_str().is_none_or(str::is_empty) {
+                    // a speech model: the loaded one, else the first enabled
+                    let speech: Vec<String> = all.iter().filter(|x| registry::kind_of(x) == "audio" && x["enabled"] != false && s(x, "arch") == "qwen3-tts")
+                        .map(|x| s(x, "id")).collect();
+                    let loaded = call_for(&self.target("audio"), "GET", "/api/info", None, 2).ok().map(|i| s(&i, "model"));
+                    let id = loaded.filter(|l| speech.contains(l)).or_else(|| speech.first().cloned())
+                        .ok_or_else(|| (409, "no speech model is enabled (system.enable qwen3-tts-custom ...)".to_string()))?;
+                    b["model"] = json!(id);
+                }
+                let b = &b;
                 let id = self.pick("audio", b, &all)?;
                 let t = self.ensure(&id)?;
                 let mut body = b.clone();
@@ -422,7 +444,8 @@ impl Home {
                 "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "PNG"}}}}));
         }
         if on.contains(&"audio") {
-            paths.insert("/v1/audio/speech".into(), json!({"post": oa("A song (input: the lyrics, instructions: the music; response_format wav or url)",
+            paths.insert("/v1/audio/speech".into(), json!({"post": oa("A song (input: the lyrics, instructions: the music) or speech (input: the text; voice, \
+                language, instructions, ref_audio, ref_text); response_format wav or url",
                 json!({"model": ids("audio").first(), "instructions": "warm folk", "input": "[verse]\nRiver runs slow", "response_format": "url"}))}));
             paths.insert("/v1/audio/files/{name}".into(), json!({"get": {"tags": ["openai"], "summary": "A song an answer links",
                 "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "WAV"}}}}));

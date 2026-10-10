@@ -9,28 +9,35 @@ use nextsycl_models::{config::Config, registry as models};
 use serde_json::Value;
 
 const USAGE: &str = "nextsycl audio gen \"<description>\" [--lyrics TEXT | --lyrics-file FILE] [--model ID | --dir DIR] [--seconds N] [--steps N]
-                   [--cfg X] [--seed N] [--set NAME=VALUE]... [--out FILE|DIR] [--gpu N]
+                   [--cfg X] [--seed N] [--set NAME=VALUE]... [--opt-NAME VALUE]... [--out FILE|DIR] [--gpu N]
+nextsycl audio gen \"<text to say>\" --model qwen3-tts-... [--voice NAME] [--language L] [--instructions TEXT]
+                   [--ref-audio FILE.wav [--ref-text TEXT]] [--seconds N] [--seed N] [--out FILE|DIR]   (speech)
 nextsycl audio serve [MODEL] [--port 8087] [--host 127.0.0.1] [--gpu N] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl audio start [serve's options]   (in the background) | ps | logs [-f] | stop
-nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks] [--gpu N]
+nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec] [--gpu N]
 nextsycl audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextsycl_audio::AudioKind> {
-    vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_example::kind()]
+    vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
     args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
 
-/// The registered audio model `id` (or the first one), or `--dir`: a MiniMax Music 3 checkpoint's directory as
-/// downloaded (its diffusers layout): (entry, files by role)
+/// The registered audio model `id` (or the first one), or `--dir`: a checkpoint's directory as downloaded (MiniMax
+/// Music 3's diffusers layout, or Qwen3-TTS's: its config.json and speech_tokenizer/): (entry, files by role)
 fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
     if let Some(d) = opt(args, "--dir") {
-        let files = nextsycl_audio_minimaxmusic3::files_in(Path::new(d)).map_err(|e| e.0)?;
-        let id = Path::new(d).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        return Ok((serde_json::json!({"id": id, "kind": "audio", "arch": nextsycl_audio_minimaxmusic3::ARCH, "env": {}}), files));
+        let dir = Path::new(d);
+        let (arch, files) = if dir.join("speech_tokenizer").is_dir() {
+            (nextsycl_audio_qwen3tts::ARCH, nextsycl_audio_qwen3tts::files_in(dir).map_err(|e| e.0)?)
+        } else {
+            (nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_minimaxmusic3::files_in(dir).map_err(|e| e.0)?)
+        };
+        let id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        return Ok((serde_json::json!({"id": id, "kind": "audio", "arch": arch, "env": {}}), files));
     }
     let all = models::all(cfg)?;
     let m = match opt(args, "--model") {
@@ -92,6 +99,18 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
     let seed: u64 = num(args, "--seed")?.unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_nanos() as u64 % 100_000).unwrap_or(0)
     });
+    let reference = match opt(args, "--ref-audio") {
+        Some(f) => {
+            let b = std::fs::read(f).map_err(|e| format!("{f}: {e}"))?;
+            let (samples, rate) = nextsycl_audio::decode_wav(&b).map_err(|e| format!("{f}: {e}"))?;
+            Some(nextsycl_audio::Reference { samples, rate, text: opt(args, "--ref-text").map(str::to_string) })
+        }
+        None => None,
+    };
+    // the request's own --opt-NAMEs (those taken at load went into the load options)
+    let given: nextsycl_core::options::Given = nextsycl_core::options::given(args).into_iter()
+        .filter(|(n, _)| k.options.iter().any(|o| (o.name == n.as_str() || o.env == n.as_str()) && o.at != nextsycl_core::At::Load)).collect();
+    nextsycl_core::options::resolve(&given, k.options, nextsycl_core::At::Request, k.name)?;
     let req = AudioRequest {
         prompt: prompt.clone(),
         lyrics: lyrics.clone(),
@@ -99,9 +118,15 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         steps: num(args, "--steps")?,
         cfg: num(args, "--cfg")?,
         seed,
-        extra: nextsycl_core::options::Given::default(),
+        extra: nextsycl_core::options::by_name(&given, k.options),
+        voice: opt(args, "--voice").map(str::to_string),
+        language: opt(args, "--language").map(str::to_string),
+        instructions: opt(args, "--instructions").map(str::to_string),
+        reference,
     };
     let t0 = std::time::Instant::now();
+    // frames a second of sound: speech 12.5, songs 25
+    let fps = if e.speech().is_some() { 12.5 } else { 25.0 };
     let mut phase = "";
     let mut mark = 0f64;
     // each phase's time (the time up to a report is its phase's) and its last count, in the order first seen
@@ -124,7 +149,7 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         last = s.seconds;
         let rate = if s.phase == "tokens" && s.seconds > mark { s.at as f64 / (s.seconds - mark) } else { 0.0 };
         match s.phase {
-            "tokens" => eprint!("\rtokens {}/{} ({:.1} s of sound)  {rate:.1} frames/s  {:.0} s   ", s.at, s.of, s.at as f64 / 25.0, s.seconds),
+            "tokens" => eprint!("\rtokens {}/{} ({:.1} s of sound)  {rate:.1} frames/s  {:.0} s   ", s.at, s.of, s.at as f64 / fps, s.seconds),
             _ => eprint!("\r{} {}/{}  {:.0} s   ", s.phase, s.at, s.of, s.seconds),
         }
         Ok(())
@@ -147,7 +172,11 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         Some(o) => o,
         None => PathBuf::from(name),
     };
-    let comment = format!("model {id}, seed {seed}, steps {}, cfg {}", req.steps.unwrap_or(e.defaults().steps), req.cfg.unwrap_or(e.defaults().cfg));
+    let comment = match e.speech() {
+        Some(_) => format!("model {id}, seed {seed}, voice {}, language {}, instructions {}", req.voice.as_deref().unwrap_or("-"),
+                           req.language.as_deref().unwrap_or("auto"), req.instructions.as_deref().unwrap_or("-")),
+        None => format!("model {id}, seed {seed}, steps {}, cfg {}", req.steps.unwrap_or(e.defaults().steps), req.cfg.unwrap_or(e.defaults().cfg)),
+    };
     let lyr = lyrics.unwrap_or_default();
     audio.write_wav(&path, &[("INAM", &prompt), ("ICMT", &comment), ("ILYR", &lyr)])?;
     println!("saved {}  ({:.1} s of sound in {:.1} s)", path.display(), audio.seconds(), t0.elapsed().as_secs_f64());
@@ -158,14 +187,19 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let dir = Path::new(args.first().filter(|a| !a.starts_with("--")).ok_or(USAGE)?);
     nextsycl_core::use_kind("audio");
     let (m, files) = model(cfg, args)?;
-    if m["arch"] != nextsycl_audio_minimaxmusic3::ARCH {
-        return Err(format!("check knows {} only", nextsycl_audio_minimaxmusic3::ARCH));
-    }
-    let stages: Vec<&str> = opt(args, "--stages").unwrap_or("ar,dit,voc").split(',').collect();
     let g = gpu(args)?;
     let mut log = |s: String| eprintln!("{s}");
-    let e = nextsycl_audio_minimaxmusic3::MiniMaxMusic3::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
-    let worst = nextsycl_audio_minimaxmusic3::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?;
+    let worst = if m["arch"] == nextsycl_audio_qwen3tts::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,codec").split(',').collect();
+        let e = nextsycl_audio_qwen3tts::Qwen3Tts::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_qwen3tts::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_minimaxmusic3::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("ar,dit,voc").split(',').collect();
+        let e = nextsycl_audio_minimaxmusic3::MiniMaxMusic3::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_minimaxmusic3::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else {
+        return Err(format!("check knows {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH));
+    };
     println!("worst relative error {worst:.2e}");
     Ok(())
 }
@@ -235,7 +269,7 @@ fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     a.extend(mount(&out, &out.to_string_lossy(), false));
     a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engines' own settings from the configuration (NS_MM3_INT8=1 ...)
-    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NSD_")) {
+    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NSD_")) {
         a.extend(["-e".into(), format!("{k}={v}")]);
     }
     a.extend([ce.image.clone(), "bash".into(), "-c".into(),

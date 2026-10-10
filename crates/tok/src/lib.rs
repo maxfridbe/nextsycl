@@ -15,6 +15,10 @@ const GLM4_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[
 /// shape with combining marks (`\p{M}`) kept with their letters and out of the punctuation runs, single digits
 const QWEN35_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// transformers' Qwen2Tokenizer (the slow one, from vocab.json and merges.txt): case-insensitive contractions,
+/// letters, single digits
+const QWEN2_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 pub struct Tokenizer {
     pub tokens: Vec<String>,
     ids: HashMap<String, u32>,
@@ -100,6 +104,47 @@ impl Tokenizer {
             special,
             split: Regex::new(pattern).map_err(|e| e.to_string())?,
             ignore_merges: model["ignore_merges"].as_bool().unwrap_or(false),
+            byte_enc,
+            byte_dec,
+            stop,
+        })
+    }
+
+    /// Qwen2Tokenizer's files: `vocab.json`, `merges.txt` (one merge a line after the `#version` header) and
+    /// `tokenizer_config.json`'s added tokens (matched as they are). That tokenizer NFC-normalizes the text first: the
+    /// caller does so (this crate has no Unicode tables).
+    pub fn from_vocab_merges(dir: &std::path::Path) -> Result<Tokenizer, String> {
+        let read = |f: &str| std::fs::read_to_string(dir.join(f)).map_err(|e| format!("{}: {e}", dir.join(f).display()));
+        let vocab: serde_json::Value = serde_json::from_str(&read("vocab.json")?).map_err(|e| format!("vocab.json: {e}"))?;
+        let mut ids: HashMap<String, u32> = vocab.as_object().ok_or("vocab.json: not an object")?.iter()
+            .filter_map(|(t, i)| Some((t.clone(), i.as_u64()? as u32))).collect();
+        let conf: serde_json::Value = serde_json::from_str(&read("tokenizer_config.json")?).map_err(|e| format!("tokenizer_config.json: {e}"))?;
+        let mut special: Vec<(String, u32)> = conf["added_tokens_decoder"].as_object().into_iter().flatten()
+            .filter_map(|(i, t)| Some((t["content"].as_str()?.to_string(), i.parse::<u32>().ok()?))).collect();
+        for (c, i) in &special {
+            ids.insert(c.clone(), *i);
+        }
+        special.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
+        let n = ids.values().copied().max().map_or(0, |m| m as usize + 1);
+        let mut tokens = vec![String::new(); n];
+        for (t, i) in &ids {
+            tokens[*i as usize] = t.clone();
+        }
+        let merges = read("merges.txt")?;
+        let ranks = merges.lines().filter(|l| !l.starts_with("#version") && !l.is_empty()).enumerate()
+            .filter_map(|(r, l)| l.split_once(' ').map(|(a, b)| ((a.to_string(), b.to_string()), r))).collect();
+        let byte_enc = byte_alphabet();
+        let byte_dec = byte_enc.iter().enumerate().map(|(b, c)| (*c, b as u8)).collect();
+        let mut stop: Vec<u32> = ["<|endoftext|>", "<|im_end|>"].iter().filter_map(|s| ids.get(*s).copied()).collect();
+        stop.sort();
+        Ok(Tokenizer {
+            eos: ids.get("<|im_end|>").copied(),
+            tokens,
+            ids,
+            ranks,
+            special,
+            split: Regex::new(QWEN2_SPLIT).map_err(|e| e.to_string())?,
+            ignore_merges: false,
             byte_enc,
             byte_dec,
             stop,

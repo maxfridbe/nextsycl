@@ -31,8 +31,8 @@ struct Prim {
 struct Dnn {
     dnnl::engine eng;
     dnnl::stream st;
-    // (transposed, B, Ci, L, Co, K, stride, dil, pad) -> the primitive
-    std::map<std::tuple<int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>, Prim> prims;
+    // (transposed, B, Ci, L, Co, K, stride, dil, left pad, right pad) -> the primitive
+    std::map<std::tuple<int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>, Prim> prims;
     // (weight pointer, primitive key's transposed / Ci / Co / K) -> the weight in the primitive's layout
     std::map<std::tuple<const void*, int, int64_t, int64_t, int64_t>, memory> weights;
 };
@@ -65,9 +65,9 @@ memory mem(const memory::desc& md, const dnnl::engine& eng, const void* p) {
 }
 
 int run(ns_gpu* g, bool tr, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K, const float* bias,
-        int64_t stride, int64_t dil, int64_t pad, float* out, int64_t Lo) {
+        int64_t stride, int64_t dil, int64_t pl, int64_t pr, float* out, int64_t Lo) {
     Dnn& d = dnn(g);
-    auto key = std::make_tuple((int) tr, B, Ci, L, Co, K, stride, dil, pad);
+    auto key = std::make_tuple((int) tr, B, Ci, L, Co, K, stride, dil, pl, pr);
     auto it = d.prims.find(key);
     if (it == d.prims.end()) {
         memory::desc src({B, Ci, L}, memory::data_type::f32, tag::ncw);
@@ -76,17 +76,17 @@ int run(ns_gpu* g, bool tr, const float* x, int64_t B, int64_t Ci, int64_t L, co
         memory::desc bmd({Co}, memory::data_type::f32, tag::a);
         dnnl::primitive_attr attr;
         attr.set_fpmath_mode(fpmath());
-        Prim pr;
+        Prim made;
         if (!tr) {
             auto pd = dnnl::convolution_forward::primitive_desc(d.eng, dnnl::prop_kind::forward_inference, dnnl::algorithm::convolution_direct, src, wany,
-                                                                bias ? bmd : memory::desc(), dst, {stride}, {dil - 1}, {pad}, {pad}, attr);
-            pr = Prim{dnnl::convolution_forward(pd), pd.src_desc(), pd.weights_desc(), pd.dst_desc()};
+                                                                bias ? bmd : memory::desc(), dst, {stride}, {dil - 1}, {pl}, {pr}, attr);
+            made = Prim{dnnl::convolution_forward(pd), pd.src_desc(), pd.weights_desc(), pd.dst_desc()};
         } else {
             auto pd = dnnl::deconvolution_forward::primitive_desc(d.eng, dnnl::prop_kind::forward_inference, dnnl::algorithm::deconvolution_direct, src,
-                                                                  wany, bias ? bmd : memory::desc(), dst, {stride}, {pad}, {pad}, attr);
-            pr = Prim{dnnl::deconvolution_forward(pd), pd.src_desc(), pd.weights_desc(), pd.dst_desc()};
+                                                                  wany, bias ? bmd : memory::desc(), dst, {stride}, {pl}, {pr}, attr);
+            made = Prim{dnnl::deconvolution_forward(pd), pd.src_desc(), pd.weights_desc(), pd.dst_desc()};
         }
-        it = d.prims.emplace(key, pr).first;
+        it = d.prims.emplace(key, made).first;
     }
     Prim& p = it->second;
     if (p.src != memory::desc({B, Ci, L}, memory::data_type::f32, tag::ncw) || p.dst != memory::desc({B, Co, Lo}, memory::data_type::f32, tag::ncw)) {
@@ -115,7 +115,7 @@ int ns_audio_mm3_conv1d(ns_gpu* g, const float* x, int64_t B, int64_t Ci, int64_
                         int64_t stride, int64_t dil, int64_t pad, float* out, int64_t Lo) {
     NS_TRY
     if (B <= 0 || Lo <= 0) return 0;
-    return run(g, false, x, B, Ci, L, w, Co, K, bias, stride, dil, pad, out, Lo);
+    return run(g, false, x, B, Ci, L, w, Co, K, bias, stride, dil, pad, pad, out, Lo);
     } catch (const dnnl::error& e) { return ns_fail(std::string("oneDNN: ") + e.what());
     NS_CATCH
 }
@@ -124,7 +124,16 @@ int ns_audio_mm3_conv_transpose1d(ns_gpu* g, const float* x, int64_t B, int64_t 
                                   const float* bias, int64_t stride, int64_t pad, float* out, int64_t Lo) {
     NS_TRY
     if (B <= 0 || Lo <= 0) return 0;
-    return run(g, true, x, B, Ci, L, w, Co, K, bias, stride, 1, pad, out, Lo);
+    return run(g, true, x, B, Ci, L, w, Co, K, bias, stride, 1, pad, pad, out, Lo);
+    } catch (const dnnl::error& e) { return ns_fail(std::string("oneDNN: ") + e.what());
+    NS_CATCH
+}
+
+int ns_audio_mm3_conv1d_lr(ns_gpu* g, int transposed, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K,
+                           const float* bias, int64_t stride, int64_t dil, int64_t pad_l, int64_t pad_r, float* out, int64_t Lo) {
+    NS_TRY
+    if (B <= 0 || Lo <= 0) return 0;
+    return run(g, transposed != 0, x, B, Ci, L, w, Co, K, bias, stride, transposed ? 1 : dil, pad_l, pad_r, out, Lo);
     } catch (const dnnl::error& e) { return ns_fail(std::string("oneDNN: ") + e.what());
     NS_CATCH
 }

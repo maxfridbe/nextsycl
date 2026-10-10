@@ -29,12 +29,14 @@ export function Progress() {
   let extra = "";
   if (phase === "prompt") stage = "reading the prompt";
   else if (phase === "tokens") {
-    stage = `composing: ${mss(at / 25)} of up to ${mss(of / 25)}`;
+    const fps = state.info?.speech ? 12.5 : 25;
+    stage = `${state.info?.speech ? "speaking" : "composing"}: ${mss(at / fps)} of up to ${mss(of / fps)}`;
     extra = "the language model, a frame at a time";
   } else if (phase === "flow") {
     stage = `rendering the sound: step ${at}/${of}`;
   } else if (phase === "decode") stage = `decoding window ${at}/${of}`;
-  const idx = PHASES.indexOf(phase);
+  const phases = state.info?.speech ? PHASES.filter((x) => x !== "flow") : PHASES;
+  const idx = phases.indexOf(phase);
   return (
     <div class="clipprog">
       <div class="bar"><div class="fill" style={{ width: `${Math.max(pct, 2)}%` }} /></div>
@@ -43,7 +45,7 @@ export function Progress() {
         <span class="hint">{`${pct}%${secs !== null ? ` · ${fmtT(secs)} elapsed` : ""}${extra ? ` · ${extra}` : ""}`}</span>
       </div>
       <div class="phase">
-        {PHASES.map((x, i) => <span class={{ on: i === idx, done: idx > i }}>{x}</span>)}
+        {phases.map((x, i) => <span class={{ on: i === idx, done: idx > i }}>{x}</span>)}
       </div>
     </div>
   );

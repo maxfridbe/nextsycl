@@ -21,6 +21,20 @@ export interface Info {
   options?: { name: string; value: string; help: string }[];
   report?: string[];
   saves?: boolean;
+  /** a speech engine: its voices and what it takes (none: songs) */
+  speech?: Speech | null;
+}
+
+export interface Speech {
+  voices: string[];
+  languages: string[];
+  /** styles the read by instructions */
+  instructions: boolean;
+  /** makes the voice from instructions alone */
+  design: boolean;
+  /** clones a recording */
+  clone: boolean;
+  clone_needs_text: boolean;
 }
 
 export interface Progress {
@@ -59,6 +73,11 @@ export interface Song {
   wh?: number | null;
   model?: string;
   created: number;
+  /** speech: the voice, language, instructions, whether it was cloned */
+  voice?: string | null;
+  language?: string | null;
+  instructions?: string | null;
+  cloned?: boolean;
 }
 
 export interface GenAnswer {
@@ -77,4 +96,13 @@ export interface Form {
   seed: number | null;
   /** the engine's own options, by name (empty: not sent) */
   options: Record<string, string>;
+  /** speech: the text to say, the voice, the language ("" auto), how to say it / the voice to make up */
+  text: string;
+  voice: string;
+  language: string;
+  instructions: string;
+  /** speech: the recording to clone (not kept across reloads) and its transcript */
+  refAudio: string;
+  refName: string;
+  refText: string;
 }

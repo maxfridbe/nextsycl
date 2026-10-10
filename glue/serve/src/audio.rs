@@ -2,9 +2,12 @@
 //! audio engine (`nextsycl_audio::AudioEngine`), and with `wfe` a web page that drives it with every option it has.
 //!
 //! ```text
-//!   POST /v1/audio/speech         {input: the lyrics, instructions: the description, seed, max_new_tokens (frames,
-//!                                 25 a second) | seconds, response_format: wav (the file) | url (JSON with its link)}
-//!                                 and ours: steps, cfg, options {NAME: value} (the engine's own: /api/info)
+//!   POST /v1/audio/speech         a song: {input: the lyrics, instructions: the description, seed, max_new_tokens
+//!                                 (frames, 25 a second) | seconds, response_format: wav (the file) | url (JSON with its
+//!                                 link)} and ours: steps, cfg, options {NAME: value} (the engine's own: /api/info);
+//!                                 speech: {input: the text, voice, language, instructions (its style; a designed
+//!                                 voice's description), ref_audio (base64 WAV / data URL: a voice to clone),
+//!                                 ref_text, seconds (the most), seed, response_format, options}
 //!   GET  /v1/audio/files/<f>      a song made here (saved in the output directory; byte ranges for seeking)
 //!   POST /api/cancel              stops the request running (between frames or steps)
 //!   GET  /v1/models, /health
@@ -237,6 +240,8 @@ impl AudioServer {
         let d = e.defaults();
         json!({
             "model": self.model, "arch": e.arch(), "lyrics": e.lyrics(), "wfe": self.wfe.is_some(),
+            "speech": e.speech().map(|sp| json!({"voices": sp.voices, "languages": sp.languages, "instructions": sp.instructions, "design": sp.design,
+                                                 "clone": sp.clone, "clone_needs_text": sp.clone_needs_text})),
             "defaults": {"seconds": f(d.seconds), "max_seconds": f(d.max_seconds), "steps": d.steps, "cfg": f(d.cfg), "rate": d.rate},
             "options": e.options().iter().filter(|o| o.at != nextsycl_core::At::Load)
                 .map(|o| json!({"name": o.name, "value": o.value, "help": o.help})).collect::<Vec<_>>(),
@@ -263,12 +268,10 @@ impl AudioServer {
     /// Runs a request: (JSON for response_format url, else none) and the WAV's bytes
     fn generate(&self, b: &Value, base: &str) -> Result<(Option<Value>, Vec<u8>), (u16, String)> {
         let bad = |m: String| (400u16, m);
-        if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model && *m != "MiniMaxAI/MiniMax-Music3") {
+        if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model && *m != "MiniMaxAI/MiniMax-Music3" && !m.starts_with("Qwen/Qwen3-TTS")) {
             return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
         }
-        let prompt = ["instructions", "prompt", "description"].iter().find_map(|k| b[*k].as_str()).filter(|p| !p.trim().is_empty())
-            .ok_or_else(|| bad("instructions (the music's description): required".into()))?.to_string();
-        let lyrics = ["input", "lyrics"].iter().find_map(|k| b[*k].as_str()).filter(|p| !p.trim().is_empty()).map(str::to_string);
+        let text = |k: &[&str]| k.iter().find_map(|k| b[*k].as_str()).filter(|p| !p.trim().is_empty()).map(str::to_string);
         let format = b["response_format"].as_str().unwrap_or("wav");
         if !["wav", "url"].contains(&format) {
             return Err(bad(format!("response_format {format}: wav or url")));
@@ -277,16 +280,39 @@ impl AudioServer {
             return Err(bad("response_format url: this server keeps no files (start it with an output directory)".into()));
         }
         if b.get("stream").and_then(Value::as_bool) == Some(true) {
-            return Err(bad("stream: not served (a song is made whole)".into()));
+            return Err(bad("stream: not served (the sound is made whole)".into()));
         }
         let num = |k: &[&str]| k.iter().find_map(|k| b[*k].as_f64());
         let seed = match &b["seed"] {
             Value::Number(x) => x.as_u64().ok_or_else(|| bad("seed: a whole number".into()))?,
             _ => SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos() as u64 % 1_000_000).unwrap_or(7),
         };
-        let seconds = num(&["seconds", "duration", "audio_duration"]).or_else(|| num(&["max_new_tokens"]).map(|f| f / 25.0)).map(|v| v as f32);
         let given: nextsycl_core::options::Given = b["options"].as_object().into_iter().flatten()
             .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect();
+        // a recording to clone: base64 WAV or a data URL
+        let reference = match text(&["ref_audio", "reference_audio"]) {
+            Some(a) => {
+                let wav = http::unbase64(&a).map_err(|e| bad(format!("ref_audio: {e}")))?;
+                let (samples, rate) = nextsycl_audio::decode_wav(&wav).map_err(|e| bad(format!("ref_audio: {e}")))?;
+                Some(nextsycl_audio::Reference { samples, rate, text: text(&["ref_text", "reference_text"]) })
+            }
+            None => None,
+        };
+        // one request at a time
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        let speech = engine.speech().is_some();
+        // speech: input is the text to say, instructions its style or voice; a song: input the lyrics, instructions
+        // the music
+        let (prompt, lyrics, instructions) = if speech {
+            (text(&["input", "text"]).ok_or_else(|| bad("input (the text to say): required".into()))?, None, text(&["instructions"]))
+        } else {
+            let p = text(&["instructions", "prompt", "description"]).ok_or_else(|| bad("instructions (the music's description): required".into()))?;
+            (p, text(&["input", "lyrics"]), None)
+        };
+        let frames_per_s = if speech { 12.5 } else { 25.0 };
+        let seconds = num(&["seconds", "duration", "audio_duration"]).or_else(|| num(&["max_new_tokens"]).map(|f| f / frames_per_s)).map(|v| v as f32);
         let mut req = AudioRequest {
             prompt: prompt.clone(),
             lyrics: lyrics.clone(),
@@ -295,11 +321,11 @@ impl AudioServer {
             cfg: num(&["cfg", "guidance_scale"]).map(|v| v as f32),
             seed,
             extra: Default::default(),
+            voice: text(&["voice", "speaker"]),
+            language: text(&["language"]),
+            instructions: instructions.clone(),
+            reference,
         };
-        // one request at a time
-        self.waiting.fetch_add(1, Ordering::Relaxed);
-        let engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
-        self.waiting.fetch_sub(1, Ordering::Relaxed);
         if !given.is_empty() {
             nextsycl_core::options::resolve(&given, engine.options(), nextsycl_core::At::Request, &self.model).map_err(bad)?;
             req.extra = nextsycl_core::options::by_name(&given, engine.options());
@@ -330,6 +356,14 @@ impl AudioServer {
         };
         let created = now();
         let meta = json!({"model": self.model, "seed": seed, "steps": steps, "cfg": f(cfg), "took": took, "wh": wh, "created": created}).to_string();
+        let mut meta: Value = serde_json::from_str(&meta).unwrap_or_default();
+        if speech {
+            meta["voice"] = json!(req.voice);
+            meta["language"] = json!(req.language);
+            meta["instructions"] = json!(instructions);
+            meta["cloned"] = json!(req.reference.is_some());
+        }
+        let meta = meta.to_string();
         let wav = audio.wav(&[("INAM", &prompt), ("ILYR", lyrics.as_deref().unwrap_or("")), ("ICMT", &meta)]);
         let mut answer = None;
         if let Some(dir) = &self.out_dir {

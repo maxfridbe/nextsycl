@@ -73,6 +73,10 @@ int ns_audio_mm3_conv1d(ns_gpu* g, const float* x, int64_t B, int64_t Ci, int64_
                         int64_t stride, int64_t dil, int64_t pad, float* out, int64_t Lo);
 int ns_audio_mm3_conv_transpose1d(ns_gpu* g, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K,
                                   const float* bias, int64_t stride, int64_t pad, float* out, int64_t Lo);
+/* Either, padded pad_l ahead and pad_r behind (a causal convolution: (K - 1) * dil ahead, none behind; a transposed one
+ * trimmed: pad_r cut from the end); dil is 1 for a transposed one */
+int ns_audio_mm3_conv1d_lr(ns_gpu* g, int transposed, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K,
+                           const float* bias, int64_t stride, int64_t dil, int64_t pad_l, int64_t pad_r, float* out, int64_t Lo);
 /* x = tanh(x), in place (n values) */
 int ns_audio_mm3_tanh(ns_gpu* g, float* x, int64_t n);
 

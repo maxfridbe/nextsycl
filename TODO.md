@@ -256,6 +256,13 @@ of IQ2_XXS instead could win twice.
       (the same JSON field for field; models list, aliases, plain and streamed answers) and in service on the GPU box
       (the Python units kept as *.bak-python). What is left outside Rust + SYCL there: the chat front end (Open WebUI,
       third-party), and dev tools (reference/ dumpers, the screenshot script, the page smoke test)
+- [x] Qwen3-TTS (audio/qwen3tts, 2026-10-09): CustomVoice (nine voices + instruction), VoiceDesign, Base x-vector
+      clone; the talker and code predictor on the music engine's kernels, the 12 Hz codec's decoder, the ECAPA speaker
+      encoder on the host; checked against qwen-tts (greedy frames identical, codec 1e-6..1.7e-3); served through the
+      audio server, `audio.speak` and the page. B70: 70 frames/s half, 93 int8 (5.6x / 7.4x real time)
+- [ ] Qwen3-TTS: the in-context clone (`ref_text`: the recording's codes from the speech tokenizer's Mimi encoder as
+      the prompt's example); the draws on the GPU / the frame as one graph (16 host round trips a frame now); streamed
+      answers (the codec chunk by chunk as frames come)
 - [ ] Music: the two cards together as the reference runs (the language model on one, flow + decoder on the other,
       the windows streamed between them) when chat is not on the B65; `audio start | stop | ps`; 32 kHz output (the
       reference server resamples); the caption rewriter (MiniMax's music-caption-rewriter skill) as an option

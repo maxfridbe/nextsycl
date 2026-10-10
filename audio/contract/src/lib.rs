@@ -27,6 +27,39 @@ pub struct AudioRequest {
     /// the engine's own options for this request, by name (`--opt-NAME`, an API request's `options`), checked
     /// against those it declares for requests
     pub extra: Given,
+    /// speech (an engine whose `speech` is Some; `prompt` is then the text to say): a built-in voice
+    pub voice: Option<String>,
+    /// speech: the language of the text ("auto" or None: the engine's guess)
+    pub language: Option<String>,
+    /// speech: how to say it, or the voice to make up (a designed voice)
+    pub instructions: Option<String>,
+    /// speech: a recording whose voice to speak in (a clone)
+    pub reference: Option<Reference>,
+}
+
+/// A recording to clone a voice from: mono samples, their rate, and what is said in it (a transcript makes a
+/// closer clone; without one only the voice's timbre is taken)
+#[derive(Clone, Debug, Default)]
+pub struct Reference {
+    pub samples: Vec<f32>,
+    pub rate: u32,
+    pub text: Option<String>,
+}
+
+/// What a speech engine takes
+#[derive(Clone, Debug, Default)]
+pub struct Speech {
+    /// its built-in voices (`AudioRequest::voice`)
+    pub voices: Vec<String>,
+    /// the languages it speaks (besides "auto")
+    pub languages: Vec<String>,
+    /// whether it styles the speech by `instructions`
+    pub instructions: bool,
+    /// whether it makes a voice from `instructions` alone (no built-in voice, no recording)
+    pub design: bool,
+    /// whether it clones a `reference` recording (and whether it needs the recording's transcript)
+    pub clone: bool,
+    pub clone_needs_text: bool,
 }
 
 /// The engine's own defaults, shown by `engines` and used for the request's `None` fields
@@ -110,6 +143,55 @@ impl Audio {
     }
 }
 
+/// A WAV file's samples (PCM 8 / 16 / 24 / 32-bit or float 32 / 64; the channels mixed to mono) and their rate
+pub fn decode_wav(b: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
+    if b.len() < 12 || &b[..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+        return Err("not a WAV file".into());
+    }
+    let u16at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as usize;
+    let u32at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize;
+    let (mut fmt, mut ch, mut rate, mut bits) = (0, 0, 0, 0);
+    let mut i = 12;
+    while i + 8 <= b.len() {
+        let (id, len) = (&b[i..i + 4], u32at(i + 4));
+        let body = i + 8;
+        match id {
+            b"fmt " if body + 16 <= b.len() => {
+                fmt = u16at(body);
+                ch = u16at(body + 2);
+                rate = u32at(body + 4);
+                bits = u16at(body + 14);
+                // WAVE_FORMAT_EXTENSIBLE: the sub-format's first two bytes
+                if fmt == 0xFFFE && body + 26 <= b.len() {
+                    fmt = u16at(body + 24);
+                }
+            }
+            b"data" => {
+                if ch == 0 || rate == 0 {
+                    return Err("no fmt chunk ahead of the samples".into());
+                }
+                let end = (body + len).min(b.len());
+                let d = &b[body..end];
+                let one: fn(&[u8]) -> f32 = match (fmt, bits) {
+                    (1, 8) => |c| (c[0] as f32 - 128.0) / 128.0,
+                    (1, 16) => |c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0,
+                    (1, 24) => |c| (i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8) as f32 / 8_388_608.0,
+                    (1, 32) => |c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2_147_483_648.0,
+                    (3, 32) => |c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                    (3, 64) => |c| f64::from_le_bytes(c.try_into().expect("8 bytes")) as f32,
+                    _ => return Err(format!("format {fmt} at {bits} bits: PCM or float expected")),
+                };
+                let w = bits / 8;
+                let samples = d.chunks_exact(w * ch).map(|f| f.chunks_exact(w).map(one).sum::<f32>() / ch as f32).collect();
+                return Ok((samples, rate as u32));
+            }
+            _ => {}
+        }
+        i = body + len + (len & 1);
+    }
+    Err("no data chunk".into())
+}
+
 /// A WAV file's LIST INFO entries and its length in seconds (from the chunks ahead of its samples: what `Audio::wav`
 /// writes; only the head of the file is read)
 pub fn wav_info(path: &Path) -> std::result::Result<(Vec<(String, String)>, f64), String> {
@@ -182,6 +264,10 @@ pub trait AudioEngine: Send + Sync {
     fn lyrics(&self) -> bool {
         false
     }
+    /// a speech engine's voices and abilities (None: not speech - songs, sounds)
+    fn speech(&self) -> Option<Speech> {
+        None
+    }
     /// the options it takes beyond the request's fields (its kind's `options`)
     fn options(&self) -> &'static [EngineOption] {
         &[]
@@ -248,6 +334,11 @@ mod tests {
         let (info, secs) = wav_info(&p).unwrap();
         std::fs::remove_file(&p).ok();
         assert_eq!(info, vec![("INAM".to_string(), "a song".to_string()), ("ICMT".to_string(), "{\"seed\":7}".to_string())]);
+        // and back: the two channels mixed
+        let (s, rate) = decode_wav(&w).unwrap();
+        assert_eq!(rate, 44100);
+        assert_eq!(s.len(), 2);
+        assert!((s[0] - 0.5).abs() < 1e-3 && (s[1] + 0.25).abs() < 1e-3);
         assert!((secs - 2.0 / 44100.0).abs() < 1e-9);
     }
 

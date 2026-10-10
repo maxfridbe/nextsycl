@@ -6,6 +6,7 @@ import { Create } from "./Create.js";
 import { Panel } from "./Panel.js";
 import { Progress } from "./Progress.js";
 import { SongCard, Songs } from "./Songs.js";
+import { Speak } from "./Speak.js";
 import { Stats } from "./Stats.js";
 
 function GpuPill() {
@@ -34,13 +35,13 @@ export function App() {
   return (
     <div id="app">
       <div class="top">
-        <h1><span class="i" props={{ innerHTML: "&#xf001;" }} /> {title}</h1>
+        <h1><span class="i" props={{ innerHTML: info?.speech ? "&#xf130;" : "&#xf001;" }} /> {title}</h1>
         <GpuPill />
       </div>
       <Stats />
       {state.error && !state.busy ? <pre class="err">{state.error}</pre> : null}
       <Panel id="create" icon="&#xf040;" title="Create" hint={info?.arch ?? "connecting…"}>
-        <Create />
+        {info?.speech ? <Speak /> : <Create />}
       </Panel>
       <Progress />
       {state.result
@@ -48,7 +49,7 @@ export function App() {
             <SongCard s={state.result} big={true} />
           </Panel>
         : null}
-      <Panel id="songs" icon="&#xf1da;" title="Songs" hint={`${state.history.length} made here, newest first`}>
+      <Panel id="songs" icon="&#xf1da;" title={info?.speech ? "Speech" : "Songs"} hint="made here, newest first">
         <Songs />
       </Panel>
     </div>

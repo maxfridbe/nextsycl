@@ -6,8 +6,11 @@ import type { Song } from "../types.js";
 import { fmtT, mss } from "../util.js";
 
 function meta(s: Song): string {
+  const who = s.cloned ? "cloned voice · " : s.voice ? `${s.voice} · ` : "";
+  const lang = s.language ? `${s.language} · ` : "";
   const rt = s.took ? ` · made in ${fmtT(s.took)} (${(s.seconds / s.took).toFixed(2)}×)` : "";
-  return `${mss(s.seconds)} · seed ${s.seed}${s.steps ? ` · ${s.steps} steps` : ""}${s.cfg ? ` · cfg ${+s.cfg.toFixed(2)}` : ""}${rt}` +
+  const music = s.cloned === undefined;
+  return `${who}${lang}${mss(s.seconds)} · seed ${s.seed}${music && s.steps ? ` · ${s.steps} steps` : ""}${music && s.cfg ? ` · cfg ${+s.cfg.toFixed(2)}` : ""}${rt}` +
     (s.wh != null ? ` · ${s.wh.toFixed(2)} Wh` : "");
 }
 
@@ -17,6 +20,7 @@ export function SongCard(props: { s: Song; big: boolean }) {
   return (
     <div class={{ song: true, big: props.big }}>
       <div class="desc" attrs={{ title: s.prompt }}>{s.prompt}</div>
+      {s.instructions ? <div class="hint" attrs={{ title: s.instructions }}>{s.instructions}</div> : null}
       <audio attrs={{ src: s.url, controls: true, preload: props.big ? "auto" : "none" }} />
       <div class="meta">
         <span>{meta(s)}</span>
@@ -34,6 +38,9 @@ export function SongCard(props: { s: Song; big: boolean }) {
 }
 
 export function Songs() {
-  if (!state.history.length) return <div class="hint">Nothing made yet. Ctrl+Enter in a text box generates.</div>;
-  return <div class="songs">{state.history.map((s) => <SongCard s={s} big={false} />)}</div>;
+  // a speech server lists its speech, a song server its songs (they share the output directory)
+  const speech = !!state.info?.speech;
+  const list = state.history.filter((s) => (s.cloned !== undefined) === speech);
+  if (!list.length) return <div class="hint">Nothing made yet. Ctrl+Enter in a text box generates.</div>;
+  return <div class="songs">{list.map((s) => <SongCard s={s} big={false} />)}</div>;
 }

@@ -367,6 +367,66 @@
    "size": 921720,
    "sha256": "3830e6ab9d7b95965f5497a6691bd92e33f8bf7a62bafb7b2331b268ff98aa00",
    "path": "minimax-h3/embeddings/minimaxh3_truman_show.safetensors"
+  },
+  "q3t-custom-model": {
+   "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/model.safetensors",
+   "size": 3833402552,
+   "sha256": "38b1d5971bdbd982b561cccec982669a53b0537c3cf5e9bd4778ed07bb2f5137",
+   "path": "qwen3-tts/custom/model.safetensors"
+  },
+  "q3t-custom-config": {
+   "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/config.json",
+   "size": 4908,
+   "sha256": "17a07f527a1c25ea30b4e023a184482a23d3e279d697b1dc81b1bde498d29cf9",
+   "path": "qwen3-tts/custom/config.json"
+  },
+  "q3t-design-model": {
+   "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/5ecdb67327fd37bb2e042aab12ff7391903235d3/model.safetensors",
+   "size": 3833402552,
+   "sha256": "391e8db219f292c515297cdceeb43e4eae67cdde35fa57e79a6a8a532fca0522",
+   "path": "qwen3-tts/design/model.safetensors"
+  },
+  "q3t-design-config": {
+   "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/5ecdb67327fd37bb2e042aab12ff7391903235d3/config.json",
+   "size": 4421,
+   "sha256": "aecd2cc4c1fe9edef1cb7ca7c401685a43879ad43f3f9e883f1c6760b61731e0",
+   "path": "qwen3-tts/design/config.json"
+  },
+  "q3t-base-model": {
+   "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/fd4b254389122332181a7c3db7f27e918eec64e3/model.safetensors",
+   "size": 3857413744,
+   "sha256": "38fc7fc51c5e776e840414b6fd443962e9411b9654888fd7913e4da643cb857c",
+   "path": "qwen3-tts/base/model.safetensors"
+  },
+  "q3t-base-config": {
+   "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/fd4b254389122332181a7c3db7f27e918eec64e3/config.json",
+   "size": 4494,
+   "sha256": "b4f01752d15a488abde3e1ab44723ae4f4b9e68a4037257b098b3737893cc1f9",
+   "path": "qwen3-tts/base/config.json"
+  },
+  "q3t-vocab": {
+   "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/vocab.json",
+   "size": 2776833,
+   "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+   "path": "qwen3-tts/tokenizer/vocab.json"
+  },
+  "q3t-merges": {
+   "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/merges.txt",
+   "size": 1671839,
+   "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+   "path": "qwen3-tts/tokenizer/merges.txt"
+  },
+  "q3t-tokenizer-config": {
+   "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/tokenizer_config.json",
+   "size": 7344,
+   "sha256": "dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670",
+   "path": "qwen3-tts/tokenizer/tokenizer_config.json"
+  },
+  "q3t-codec": {
+   "url": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/speech_tokenizer/model.safetensors",
+   "size": 682293092,
+   "sha256": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
+   "path": "qwen3-tts/speech_tokenizer/model.safetensors"
   }
  },
  "models": [
@@ -1004,6 +1064,66 @@
     "seconds": 60.0,
     "steps": 30,
     "cfg": 1.7
+   }
+  },
+  {
+   "id": "qwen3-tts-custom",
+   "kind": "audio",
+   "arch": "qwen3-tts",
+   "title": "Qwen3-TTS CustomVoice (speech in nine built-in voices, styled by an instruction; 10 languages, 24 kHz)",
+   "about": "Qwen3-TTS 12 Hz 1.7B: the talker (a 28-layer Qwen3 of 2,048) and its 5-layer code predictor, the 12 Hz codec's decoder (Qwen's checkpoint)",
+   "files": {
+    "model": "q3t-custom-model",
+    "config": "q3t-custom-config",
+    "vocab": "q3t-vocab",
+    "merges": "q3t-merges",
+    "tokenizer-config": "q3t-tokenizer-config",
+    "codec": "q3t-codec"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "seconds": 60.0
+   }
+  },
+  {
+   "id": "qwen3-tts-design",
+   "kind": "audio",
+   "arch": "qwen3-tts",
+   "title": "Qwen3-TTS VoiceDesign (speech in a voice made up from a description; 10 languages, 24 kHz)",
+   "about": "Qwen3-TTS 12 Hz 1.7B: the talker (a 28-layer Qwen3 of 2,048) and its 5-layer code predictor, the 12 Hz codec's decoder (Qwen's checkpoint)",
+   "files": {
+    "model": "q3t-design-model",
+    "config": "q3t-design-config",
+    "vocab": "q3t-vocab",
+    "merges": "q3t-merges",
+    "tokenizer-config": "q3t-tokenizer-config",
+    "codec": "q3t-codec"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "seconds": 60.0
+   }
+  },
+  {
+   "id": "qwen3-tts-base",
+   "kind": "audio",
+   "arch": "qwen3-tts",
+   "title": "Qwen3-TTS Base (speech in a voice cloned from a recording; 10 languages, 24 kHz)",
+   "about": "Qwen3-TTS 12 Hz 1.7B: the talker (a 28-layer Qwen3 of 2,048) and its 5-layer code predictor, the 12 Hz codec's decoder (Qwen's checkpoint), and the speaker encoder (ECAPA x-vector)",
+   "files": {
+    "model": "q3t-base-model",
+    "config": "q3t-base-config",
+    "vocab": "q3t-vocab",
+    "merges": "q3t-merges",
+    "tokenizer-config": "q3t-tokenizer-config",
+    "codec": "q3t-codec"
+   },
+   "gpus": "0",
+   "env": {},
+   "defaults": {
+    "seconds": 60.0
    }
   }
  ]
