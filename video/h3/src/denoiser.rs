@@ -401,6 +401,20 @@ pub struct Denoiser<'a> {
     cond_t: (f64, f64),
     /// a masked run's token masks
     pub masks: Option<RowMasks>,
+    /// a ControlNet and what it runs on (`set_control`)
+    control: Option<ControlRun<'a>>,
+}
+
+/// A ControlNet's per-clip state: its hint rows per video-like segment, the audio rows it leaves alone, and the
+/// buffers of its stream
+struct ControlRun<'a> {
+    net: &'a crate::control::Control,
+    rows: Vec<(usize, Tensor)>,
+    audio: Vec<(usize, usize)>,
+    zeros: Tensor,
+    stream: Tensor,
+    c: Tensor,
+    skip: Tensor,
 }
 
 impl<'a> Denoiser<'a> {
@@ -503,7 +517,49 @@ impl<'a> Denoiser<'a> {
             cond_rows,
             cond_t: (cond.visual_aug as f64, cond.audio_aug as f64),
             masks: None,
+            control: None,
         })
+    }
+
+    /// A ControlNet on this clip: `hint` [channels, T, H, W] on the target's latent grid (its channels padded with
+    /// zeros to the net's 49); the conditioning rows get zero hints
+    pub fn set_control(&mut self, net: &'a crate::control::Control, hint: &[f32], channels: usize) -> Result<()> {
+        let sh = self.shape;
+        if hint.len() != channels * sh.t * sh.h * sh.w || channels > net.in_dim {
+            return Err(Error(format!("a control hint of {} values, {channels} channels, for a {} x {} x {} latent (at most {})", hint.len(), sh.t, sh.h, sh.w,
+                                     net.in_dim)));
+        }
+        let dev = self.x.buf.device().clone();
+        let cols = net.in_dim * 4;
+        let mut rows = Vec::new();
+        for seg in self.layout.segments.iter().filter(|s| matches!(s.kind, Kind::Cond | Kind::RefImg | Kind::Video)) {
+            let n = seg.stop - seg.start;
+            let mut r = vec![0f32; n * cols];
+            if seg.kind == Kind::Video {
+                // channel-major patches: the hint's channels first, the rest of the 49 zero
+                let p = patchify(hint, channels, sh.t, sh.h, sh.w);
+                let w = channels * 4;
+                for i in 0..n {
+                    r[i * cols..i * cols + w].copy_from_slice(&p[i * w..(i + 1) * w]);
+                }
+            }
+            rows.push((seg.start, Tensor::from_bytes(&dev, DType::F32, &[n, cols], &f32_bytes(&r))?));
+        }
+        let audio: Vec<(usize, usize)> = self.layout.segments.iter().filter(|s| matches!(s.kind, Kind::Audio | Kind::CondAudio | Kind::RefAudio))
+            .map(|s| (s.start, s.stop - s.start)).collect();
+        let longest = audio.iter().map(|a| a.1).max().unwrap_or(1).max(1);
+        let hidden = self.blocks.cfg.hidden;
+        let s = self.layout.tokens();
+        self.control = Some(ControlRun {
+            net,
+            rows,
+            audio,
+            zeros: Tensor::from_bytes(&dev, DType::BF16, &[longest, hidden], &vec![0u8; longest * hidden * 2])?,
+            stream: Tensor::new(&dev, DType::BF16, &[s, hidden])?,
+            c: Tensor::new(&dev, DType::BF16, &[s, hidden])?,
+            skip: Tensor::new(&dev, DType::BF16, &[s, hidden])?,
+        });
+        Ok(())
     }
 
     pub fn tokens(&self) -> usize {
@@ -602,10 +658,28 @@ impl<'a> Denoiser<'a> {
             self.x.copy_rows(*start, rows, 0, rows.shape[0])?;
         }
 
+        // the ControlNet, where it acts at this noise level: its own tables for the same rows and positions
+        let control = self.control.as_ref().filter(|c| c.net.active(sigma));
+        let cstep = match control {
+            Some(c) => {
+                c.stream.copy_rows(0, &self.x, 0, self.layout.tokens())?; // the stream before block 0
+                Some(Step::new(&dev, &c.net.blocks, &ts.rows, &self.layout.positions, &o.inv_freq, &t_emb)?)
+            }
+            None => None,
+        };
         for i in 0..self.blocks.blocks.len() {
             between(i)?;
             let lora = self.lora.and_then(|l| l.blocks.get(i));
             self.blocks.block(i, &self.x, &step, &self.scratch, lora, None)?;
+            if let (Some(c), Some(cs)) = (control, cstep.as_ref()) {
+                if let Some(k) = c.net.at.iter().position(|l| *l == i) {
+                    if k == 0 {
+                        let rows: Vec<(usize, &Tensor)> = c.rows.iter().map(|(a, t)| (*a, t)).collect();
+                        c.net.start(&c.stream, &c.c, &rows)?;
+                    }
+                    c.net.step(k, &c.stream, &self.x, &c.skip, cs, &self.scratch, (&c.audio, &c.zeros))?;
+                }
+            }
         }
 
         // final layer, per stream, in chunks of rows

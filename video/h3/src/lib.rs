@@ -8,6 +8,7 @@
 //! (`run_job`: generate, encode, decode, denoise, check-block, bench-blocks) for the daemon and `nextsycl video job`.
 
 pub mod audio;
+pub mod control;
 pub mod denoiser;
 pub mod device;
 pub mod dit;
@@ -84,11 +85,11 @@ use serde_json::{json, Value};
 pub const ARCH: &str = "minimax-h3";
 
 /// The files it takes, by role (the denoiser at load; the others go into each job, where a job does not name its own)
-pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "audio-vae", "vision"];
+pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "audio-vae", "vision", "controlnet"];
 
 /// A role and the job key it fills
 const ROLE_KEYS: &[(&str, &str)] = &[("text-encoder", "te"), ("tokenizer", "tokenizer"), ("vae", "vae"), ("audio-vae", "audio_vae"),
-                                     ("upscaler", "upscaler"), ("pixel-upscaler", "pixel_upscaler"), ("vision", "te_visual")];
+                                     ("upscaler", "upscaler"), ("pixel-upscaler", "pixel_upscaler"), ("vision", "te_visual"), ("controlnet", "controlnet")];
 
 /// The options it takes (`--opt-NAME`): at load the variables they set; per request the generate job's own keys
 pub const OPTIONS: &[EngineOption] = &[

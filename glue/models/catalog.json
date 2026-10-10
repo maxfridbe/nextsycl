@@ -762,7 +762,8 @@
     "embedding-kiss-camera": "h3-embedding-kiss-camera",
     "embedding-spiral-ascent": "h3-embedding-spiral-ascent",
     "embedding-storm-magic": "h3-embedding-storm-magic",
-    "embedding-truman-show": "h3-embedding-truman-show"
+    "embedding-truman-show": "h3-embedding-truman-show",
+    "controlnet": "h3-controlnet-union-int8"
    },
    "gpus": "0",
    "env": {},
@@ -832,7 +833,8 @@
     "embedding-kiss-camera": "h3-embedding-kiss-camera",
     "embedding-spiral-ascent": "h3-embedding-spiral-ascent",
     "embedding-storm-magic": "h3-embedding-storm-magic",
-    "embedding-truman-show": "h3-embedding-truman-show"
+    "embedding-truman-show": "h3-embedding-truman-show",
+    "controlnet": "h3-controlnet-union-int8"
    },
    "gpus": "0",
    "env": {},
@@ -867,7 +869,8 @@
     "embedding-kiss-camera": "h3-embedding-kiss-camera",
     "embedding-spiral-ascent": "h3-embedding-spiral-ascent",
     "embedding-storm-magic": "h3-embedding-storm-magic",
-    "embedding-truman-show": "h3-embedding-truman-show"
+    "embedding-truman-show": "h3-embedding-truman-show",
+    "controlnet": "h3-controlnet-union-int8"
    },
    "gpus": "0",
    "env": {},
@@ -902,7 +905,8 @@
     "embedding-kiss-camera": "h3-embedding-kiss-camera",
     "embedding-spiral-ascent": "h3-embedding-spiral-ascent",
     "embedding-storm-magic": "h3-embedding-storm-magic",
-    "embedding-truman-show": "h3-embedding-truman-show"
+    "embedding-truman-show": "h3-embedding-truman-show",
+    "controlnet": "h3-controlnet-union-int8"
    },
    "gpus": "0",
    "env": {},

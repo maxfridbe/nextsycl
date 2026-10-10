@@ -865,6 +865,17 @@ pub struct ClipInputs<'a> {
     /// the keyframe pictures also shown to the text encoder as `<Picture i>` (as ComfyUI's image-to-video node does;
     /// off: the latents alone, as before)
     pub te_pictures: bool,
+    /// the Fun ControlNet-Union patch, and what it steers by: a control video (canny / depth / HED / MLSD / pose
+    /// frames), and/or a mask video (white: regenerate) over a source video; its strength and the stretch of the
+    /// schedule it acts on (start, end as fractions: 0, 1 = all of it)
+    pub controlnet: Option<&'a Path>,
+    pub control_video: Option<&'a Path>,
+    pub control_mask: Option<&'a Path>,
+    pub control_source: Option<&'a Path>,
+    pub control_strength: f32,
+    pub control_range: (f32, f32),
+    /// the patch masks pixels after normalizing them (its `inpaint_masked_pixel_mode`)
+    pub control_post_norm: bool,
     /// a masked run: a previous clip's `.latents.safetensors`; the parts not regenerated are kept from it (a source
     /// shorter than the clip is extended)
     pub source: Option<&'a Path>,
@@ -1021,6 +1032,65 @@ fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frame
         }
     }
     Ok((kfs, pictures.into_inner()))
+}
+
+/// A video's frames at the model's 24 fps fitted to `n` (the last repeated when it is shorter), at the clip's size
+fn frames_for(p: &Path, (w, h, n): (usize, usize, usize)) -> Result<Vec<f32>> {
+    let (px, got) = crate::media::read_frames_at(p, w, h, crate::media::Fit::Cover, Some((24.0, n)))?;
+    if got == 0 {
+        return Err(Error(format!("{}: no frames", p.display())));
+    }
+    let f = w * h * 3;
+    Ok((0..n).flat_map(|i| px[i.min(got - 1) * f..(i.min(got - 1) + 1) * f].to_vec()).collect())
+}
+
+/// The ControlNet's hint on the clip's latent grid, [channels, T, H, W]: the control video's latent (24 channels);
+/// with a mask, also the visibility (1) and the source with the masked part blacked out (24) - zeros for what is not
+/// given (ComfyUI's MiniMaxH3FunControlPatch.prepare_control_latent)
+fn clip_control_hint(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (usize, usize, usize), shape: Shape, ctl: &mut Ctl)
+                     -> Result<Option<(Vec<f32>, usize)>> {
+    if inp.control_video.is_none() && inp.control_mask.is_none() {
+        return Ok(None);
+    }
+    let venc = crate::venc::VideoEncoder::load(dev, &Checkpoint::open(vaes.video)?)?;
+    let n_lat = 24 * shape.t * shape.h * shape.w;
+    let encode = |px: &[f32], what: &str, ctl: &mut Ctl| -> Result<Vec<f32>> {
+        let (z, vt) = venc.encode(px, frames, h, w, &mut || ctl.check())?;
+        if vt != shape.t || z.len() != n_lat {
+            return Err(Error(format!("the {what}'s latent is {vt} frames, the clip's {}", shape.t)));
+        }
+        Ok(z)
+    };
+    let control = match inp.control_video {
+        Some(p) => {
+            ctl.say(format!("control: {} as the control video", p.display()));
+            Some(encode(&frames_for(p, (w, h, frames))?, "control video", ctl)?)
+        }
+        None => None,
+    };
+    let Some(mp) = inp.control_mask else {
+        return Ok(control.map(|z| (z, 24)));
+    };
+    // the mask: white (above half) regenerates; per pixel, every frame
+    let m = frames_for(mp, (w, h, frames))?;
+    let vis: Vec<f32> = m.chunks_exact(3).map(|p| if (p[0] + p[1] + p[2]) / 3.0 > 0.5 { 0.0 } else { 1.0 }).collect();
+    let mut source = match inp.control_source {
+        Some(p) => frames_for(p, (w, h, frames))?,
+        None => vec![0f32; frames * w * h * 3],
+    };
+    // the masked pixels: zero after the [-1, 1] normalization - mid grey - for a patch that says "post_norm" (the 2.0
+    // file); black as ComfyUI's node does otherwise
+    let fill = if inp.control_post_norm { 0.5 } else { 0.0 };
+    source.iter_mut().enumerate().for_each(|(i, v)| *v = *v * vis[i / 3] + fill * (1.0 - vis[i / 3]));
+    let kept = (vis.iter().map(|v| *v as f64).sum::<f64>() / vis.len() as f64) as f32;
+    ctl.say(format!("control: mask {} over {} (regenerating {:.0}% of the pixels)", mp.display(),
+                    inp.control_source.map_or("nothing (black)".into(), |p| p.display().to_string()), (1.0 - kept) * 100.0));
+    let masked = encode(&source, "masked source", ctl)?;
+    let vis_lat = crate::control::trilinear(&vis, (frames, h, w), (shape.t, shape.h, shape.w));
+    let mut hint = control.unwrap_or_else(|| vec![0f32; n_lat]);
+    hint.extend(vis_lat);
+    hint.extend(masked);
+    Ok(Some((hint, 49)))
 }
 
 const CANVAS_MULTIPLE: usize = 32;
@@ -1198,10 +1268,36 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         schedule.shift_audio = sa;
     }
     let inpaint = clip_inpaint(&c.inputs, shape)?;
+    // the ControlNet: its hint, and its blocks beside the denoiser's
+    let hint = clip_control_hint(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), shape, ctl)?;
+    let control = match (&hint, c.inputs.controlnet) {
+        (None, _) => None,
+        (Some(_), None) => return Err(Error("a control video or mask needs the ControlNet patch (\"controlnet\": its file)".into())),
+        (Some(_), Some(p)) => {
+            let t0 = Instant::now();
+            // a fraction of the schedule -> a noise level on the video's shifted schedule (ComfyUI percent_to_sigma)
+            let at = |f: f32| -> f32 {
+                let s = schedule.shift_video;
+                match f {
+                    f if f <= 0.0 => 1.0,
+                    f if f >= 1.0 => 0.0,
+                    f => s * (1.0 - f) / (1.0 + (s - 1.0) * (1.0 - f)),
+                }
+            };
+            let net = crate::control::Control::load(&e.dev, &Checkpoint::open(p)?, e.model.cfg, c.inputs.control_strength,
+                                                    (at(c.inputs.control_range.0), at(c.inputs.control_range.1)), e.threads)?;
+            ctl.say(format!("control: {} blocks after layers {:?}, strength {}, loaded in {:.1} s", net.at.len(), net.at, c.inputs.control_strength,
+                            t0.elapsed().as_secs_f64()));
+            Some(net)
+        }
+    };
     // vision blocks run on the video tables (tag 0), the rest on the text ones
     let tags = presented.has_vision().then(|| presented.tags.clone());
     let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule, &cond)?;
     d.lora = lora.as_ref();
+    if let (Some(net), Some((h, ch))) = (control.as_ref(), hint.as_ref()) {
+        d.set_control(net, h, *ch)?;
+    }
     if let Some(p) = &inpaint {
         let gen_v = p.mask_v.iter().filter(|m| **m > 0.0).count() as f64 / p.mask_v.len() as f64;
         let gen_a = p.mask_a.iter().filter(|m| **m > 0.0).count() as f64 / p.mask_a.len() as f64;
@@ -1371,6 +1467,14 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     ref_videos: s("ref_videos").map(|r| r.split(',').filter(|x| !x.is_empty()).map(Path::new).take(3).collect()).unwrap_or_default(),
                     ref_video_sound: spec.get("ref_video_sound").and_then(Value::as_bool).unwrap_or(true),
                     te_pictures: spec.get("te_pictures").and_then(Value::as_bool).unwrap_or(true),
+                    controlnet: s("controlnet").map(Path::new),
+                    control_video: s("control_video").map(Path::new),
+                    control_mask: s("control_mask").map(Path::new),
+                    control_source: s("control_source").map(Path::new),
+                    control_strength: n("control_strength").unwrap_or(1.0) as f32,
+                    control_range: (n("control_start").unwrap_or(0.0) as f32, n("control_end").unwrap_or(1.0) as f32),
+                    control_post_norm: s("controlnet").and_then(|p| Checkpoint::open(Path::new(p)).ok())
+                        .is_some_and(|ck| ck.metadata.get("inpaint_masked_pixel_mode").is_some_and(|m| m == "post_norm")),
                     source: s("source").map(Path::new),
                     regen: s("regen").and_then(|r| {
                         let (a, b) = r.split_once('-')?;

@@ -123,8 +123,8 @@ pub(crate) fn host(ck: &Checkpoint, name: &str) -> Result<Vec<f32>> {
 
 impl Block {
     /// `big`: the int8 weights and their scales, already on the device (see `Blocks::load`).
-    fn assemble(dev: &Arc<Device>, ck: &Checkpoint, index: usize, big: &mut BTreeMap<String, Tensor>) -> Result<Block> {
-        let p = format!("blocks.{index}");
+    fn assemble(dev: &Arc<Device>, ck: &Checkpoint, prefix: &str, index: usize, big: &mut BTreeMap<String, Tensor>) -> Result<Block> {
+        let p = format!("{prefix}.{index}");
         let mut linear = |l: &str| -> Result<Weight> {
             let name = format!("{p}.{l}");
             let mut take = |k: String| big.remove(&k).ok_or_else(|| Error(format!("{k} was not loaded")));
@@ -294,18 +294,24 @@ impl Blocks {
     pub fn load(dev: &Arc<Device>, ck: &Checkpoint, count: Option<usize>, threads: usize) -> Result<Blocks> {
         let mut cfg = Config::from_checkpoint(ck)?;
         cfg.blocks = count.unwrap_or(cfg.blocks).min(cfg.blocks);
+        Self::load_from(dev, ck, "blocks", cfg, threads)
+    }
+
+    /// `cfg.blocks` blocks under `prefix` (`blocks`; a ControlNet's `control_blocks`), shaped as `cfg` says
+    pub fn load_from(dev: &Arc<Device>, ck: &Checkpoint, prefix: &str, cfg: Config, threads: usize) -> Result<Blocks> {
         let n = cfg.blocks;
+        let lead = format!("{prefix}.");
         let wanted = |name: &str| -> bool {
-            let Some(rest) = name.strip_prefix("blocks.") else { return false };
+            let Some(rest) = name.strip_prefix(lead.as_str()) else { return false };
             let Some((idx, tail)) = rest.split_once('.') else { return false };
             idx.parse::<usize>().is_ok_and(|i| i < n) && LINEARS.iter().any(|l| tail == format!("{l}.weight") || tail == format!("{l}.weight_scale"))
         };
         let mut loaded = load::load(dev, ck, threads, wanted).ctx("loading the denoiser's weights")?;
         let mut blocks = Vec::with_capacity(n);
         for i in 0..n {
-            blocks.push(Block::assemble(dev, ck, i, &mut loaded.tensors).ctx(format!("block {i}"))?);
+            blocks.push(Block::assemble(dev, ck, prefix, i, &mut loaded.tensors).ctx(format!("block {i}"))?);
         }
-        let kquant = ck.kquant_of("blocks.0.mlp.fc1.weight");
+        let kquant = ck.kquant_of(&format!("{prefix}.0.mlp.fc1.weight"));
         let wbuf = match kquant {
             Some(_) => {
                 let most = blocks.iter().flat_map(|b| [&b.qkv, &b.out_proj, &b.fc1, &b.fc2]).map(|w| { let (n, k) = w.size(); n * k }).max().unwrap_or(0);
