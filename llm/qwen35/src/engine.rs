@@ -10,6 +10,7 @@
 //!   logits = output(output_norm(x))
 //! ```
 
+use std::ffi::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -18,6 +19,7 @@ use nextsycl_gguf::{GType, Gguf, Tensor};
 use nextsycl_llm::{Error, GpuInfo, Result, Sampler, Tap};
 
 use crate::ffi;
+use crate::probe::Probe;
 
 fn e(x: impl std::fmt::Display) -> Error {
     Error(x.to_string())
@@ -208,9 +210,6 @@ impl Decoder {
     }
 }
 
-/// NS_Q35_PROFILE=2's table: by product (type and shape), its seconds, calls and weight bytes
-type ProductTimes = std::collections::BTreeMap<String, (f64, u64, u64)>;
-
 pub struct Qwen35<'g> {
     pub g: Geometry,
     file: &'g Gguf,
@@ -229,11 +228,8 @@ pub struct Qwen35<'g> {
     /// the largest matrix expanded to half (a prompt chunk's products)
     w16: DevBuf,
     work: Mutex<()>,
-    /// NS_Q35_PROFILE=1: seconds and calls by phase (each phase ends with a sync, so the sum is above a pass's time)
-    profile: Option<Mutex<std::collections::BTreeMap<&'static str, (f64, u64)>>>,
-    /// NS_Q35_PROFILE=2: also each decode product alone (drained before and after): seconds, calls and weight bytes by
-    /// type and shape
-    mm_profile: Option<Mutex<ProductTimes>>,
+    /// NS_Q35_PROFILE=1: every kernel timed on the device, with its bytes and arithmetic (probe.rs)
+    probe: Option<Probe>,
     load_s: f64,
     load_bytes: u64,
 }
@@ -318,41 +314,35 @@ impl<'g> Qwen35<'g> {
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("qwen35: {} layers of {} ({} full attention), {:.1} GiB on {} in {load_s:.0} s", g.layers, g.n_embd,
                     (0..g.layers).filter(|l| g.full(*l)).count(), loaded as f64 / (1u64 << 30) as f64, gpu.name));
-        let level = std::env::var("NS_Q35_PROFILE").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
-        let profile = (level >= 1).then(|| Mutex::new(Default::default()));
-        let mm_profile = (level >= 2).then(|| Mutex::new(Default::default()));
-        Ok(Qwen35 { g, file: f, gpu, k, silo, layers, output_norm, output, embd, chunk, arena, w16, work: Mutex::new(()), profile, mm_profile, load_s,
-                    load_bytes: loaded })
+        let probe = Probe::new(gpu.raw())?;
+        Ok(Qwen35 { g, file: f, gpu, k, silo, layers, output_norm, output, embd, chunk, arena, w16, work: Mutex::new(()), probe, load_s, load_bytes: loaded })
     }
 
-    /// With NS_Q35_PROFILE: the GPU drained and the time since `t0` charged to `name`; the new start
-    fn lap(&self, name: &'static str, t0: Instant) -> Instant {
-        if let Some(p) = &self.profile {
-            let _ = self.gpu.sync();
-            let mut m = p.lock().unwrap();
-            let e = m.entry(name).or_insert((0.0, 0));
-            e.0 += t0.elapsed().as_secs_f64();
-            e.1 += 1;
-            return Instant::now();
-        }
-        t0
+    /// A kernel call (its return code checked): timed on the device with NS_Q35_PROFILE=1, with the bytes it moves
+    /// and the arithmetic it does
+    fn op(&self, name: &'static str, key: impl FnOnce() -> String, bytes: usize, flops: usize, f: impl FnOnce() -> c_int) -> Result<()> {
+        let rc = self.op_rc(name, key, bytes, flops, f)?;
+        ffi::check(rc, name)
     }
 
-    /// The profile's lines (`report`)
-    pub fn profile_lines(&self, tokens: usize) -> Vec<String> {
-        let Some(p) = &self.profile else { return Vec::new() };
-        let m = p.lock().unwrap();
-        let total: f64 = m.values().map(|v| v.0).sum();
-        let mut v: Vec<String> = m.iter().map(|(n, (s, c))| format!("[profile {n:<14} {s:>7.2} s {c:>7} calls {:>7.2} ms/token {:>5.1}%]",
-                                                                    s * 1000.0 / tokens.max(1) as f64, 100.0 * s / total.max(1e-9))).collect();
-        v.push(format!("[profile total {total:.2} s]"));
-        if let Some(mm) = &self.mm_profile {
-            for (n, (s, c, b)) in mm.lock().unwrap().iter() {
-                v.push(format!("[profile product {n:<26} {:>7.2} ms/token {:>6} calls {:>6.1} us each {:>5.0} GB/s]", s * 1000.0 / tokens.max(1) as f64, c,
-                               s * 1e6 / (*c).max(1) as f64, *b as f64 / s.max(1e-12) / 1e9));
-            }
+    /// `op`, its return code left to the caller
+    fn op_rc(&self, name: &'static str, key: impl FnOnce() -> String, bytes: usize, flops: usize, f: impl FnOnce() -> c_int) -> Result<c_int> {
+        match &self.probe {
+            Some(p) => p.op(name, key(), bytes as u64, flops as u64, f),
+            None => Ok(f()),
         }
-        v
+    }
+
+    /// What the next kernels are part of (the probe's grouping)
+    fn phase(&self, p: &'static str) {
+        if let Some(pr) = &self.probe {
+            pr.phase(p);
+        }
+    }
+
+    /// The probe's tables (`report`)
+    pub fn profile_lines(&self) -> Vec<String> {
+        self.probe.as_ref().map_or_else(Vec::new, |p| p.lines())
     }
 
     pub fn load_seconds(&self) -> f64 {
@@ -369,67 +359,67 @@ impl<'g> Qwen35<'g> {
         self.gpu.raw()
     }
 
-    /// y [t, w.rows] = x [t, w.cols] . W^T
-    fn matmul(&self, w: &Mat, x: &DevBuf, t: usize, y: &DevBuf) -> Result<()> {
+    /// y [t, w.rows] = x [t, w.cols] . W^T; `role` names it in the probe
+    fn matmul(&self, role: &'static str, w: &Mat, x: &DevBuf, t: usize, y: &DevBuf) -> Result<()> {
         let k = self.k;
         let (n, kk) = (w.rows as i64, w.cols as i64);
+        let (rows, cols) = (w.rows, w.cols);
+        let key = || format!("{role} {} {rows}x{cols}", w.ty.name());
+        let wb = w.ty.bytes((rows * cols) as u64).unwrap_or(0) as usize;
+        let flops = 2 * t * rows * cols;
         if w.ty == GType::F32 {
             // SAFETY: x [t, cols], the matrix [rows, cols] float32, y [t, rows].
-            return ffi::check(unsafe { (k.gemm)(self.raw(), t as i64, n, kk, x.fp(), kk, w.buf.fp(), y.fp(), n, 0) }, "gemm");
+            return self.op("gemm", key, 4 * (t * cols + rows * cols + t * rows), flops,
+                           || unsafe { (k.gemm)(self.raw(), t as i64, n, kk, x.fp(), kk, w.buf.fp(), y.fp(), n, 0) });
         }
         // SAFETY: arithmetic only.
         let mmvq = unsafe { (k.mmvq_supported)(w.ty.code() as i32) } != 0;
         if t <= 8 && mmvq {
             // SAFETY: arithmetic only.
-            let qb = self.arena.bytes(unsafe { (k.q8_1_bytes)(kk, t as i64) })?;
-            // SAFETY: x [t, cols] float32 -> its Q8_1 blocks; the matrix in its blocks; y [t, rows].
-            ffi::check(unsafe { (k.quantize_q8_1)(self.raw(), x.fp(), qb.ptr(), kk, t as i64) }, "quantize")?;
-            let t0 = self.mm_profile.as_ref().map(|_| self.gpu.sync().map(|_| Instant::now())).transpose()?;
+            let q8 = unsafe { (k.q8_1_bytes)(kk, t as i64) };
+            let qb = self.arena.bytes(q8)?;
+            // SAFETY: x [t, cols] float32 -> its Q8_1 blocks.
+            self.op("quantize", key, 4 * t * cols + q8, 0, || unsafe { (k.quantize_q8_1)(self.raw(), x.fp(), qb.ptr(), kk, t as i64) })?;
             // the silo's product for the types it covers (kernels/llm/qwen35/silo), the shared one otherwise
             // SAFETY: arithmetic only.
-            let f = match self.silo {
-                Some(s) if unsafe { (s.mmvq_supported)(w.ty.code() as i32, kk) } != 0 => s.mmvq,
-                _ => k.mmvq,
+            let (f, name) = match self.silo {
+                Some(s) if unsafe { (s.mmvq_supported)(w.ty.code() as i32, kk) } != 0 => (s.mmvq, "mmvq silo"),
+                _ => (k.mmvq, "mmvq"),
             };
-            // SAFETY: as above.
-            ffi::check(unsafe { f(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.ptr(), y.fp(), kk, n, t as i64) }, "mmvq")?;
-            if let (Some(mm), Some(t0)) = (&self.mm_profile, t0) {
-                self.gpu.sync()?;
-                let mut m = mm.lock().unwrap();
-                let e = m.entry(format!("{} {}x{}", w.ty.name(), w.rows, w.cols)).or_insert((0.0, 0, 0));
-                e.0 += t0.elapsed().as_secs_f64();
-                e.1 += 1;
-                e.2 += w.ty.bytes((w.rows * w.cols) as u64).unwrap_or(0);
-            }
-            return Ok(());
+            // SAFETY: the matrix in its blocks, x's Q8_1 blocks, y [t, rows].
+            return self.op(name, key, wb + q8 + 4 * t * rows, flops,
+                           || unsafe { f(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.ptr(), y.fp(), kk, n, t as i64) });
         }
         // the matrix expanded to half (directly, or through float32), x to half, then the half product
-        let elems = w.rows * w.cols;
+        let elems = rows * cols;
         if elems * 2 > self.w16.len {
-            return Err(e(format!("a {}x{} matrix past the half buffer", w.rows, w.cols)));
+            return Err(e(format!("a {rows}x{cols} matrix past the half buffer")));
         }
-        // SAFETY: the matrix's blocks -> rows x cols halfs in w16.
-        let rc = unsafe { (k.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems as i64, self.w16.ptr().cast()) };
+        // SAFETY: the matrix's blocks -> rows x cols halfs in w16 (non-zero: a type it does not expand directly)
+        let rc = self.op_rc("dequant f16", key, wb + 2 * elems, 0,
+                            || unsafe { (k.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems as i64, self.w16.ptr().cast()) })?;
         if rc != 0 {
             let f = self.arena.f32(elems)?;
             // SAFETY: the blocks -> float32, then -> half.
-            ffi::check(unsafe { (k.dequant)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems, f.fp()) }, "dequant")?;
-            ffi::check(unsafe { (k.to_f16)(self.raw(), f.fp(), self.w16.ptr().cast(), elems as i64) }, "to half")?;
+            self.op("dequant", key, wb + 4 * elems, 0, || unsafe { (k.dequant)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems, f.fp()) })?;
+            self.op("to half", key, 6 * elems, 0, || unsafe { (k.to_f16)(self.raw(), f.fp(), self.w16.ptr().cast(), elems as i64) })?;
         }
-        let xh = self.arena.bytes(t * w.cols * 2)?;
+        let xh = self.arena.bytes(t * cols * 2)?;
         // SAFETY: x [t, cols] -> half; then y [t, rows] = xh . w16^T.
-        ffi::check(unsafe { (k.to_f16)(self.raw(), x.fp(), xh.ptr().cast(), (t * w.cols) as i64) }, "to half")?;
-        ffi::check(unsafe { (k.gemm_f16)(self.raw(), t as i64, n, kk, xh.ptr().cast(), kk, self.w16.ptr().cast(), y.fp(), n, 0) }, "gemm f16")
+        self.op("x to half", key, 6 * t * cols, 0, || unsafe { (k.to_f16)(self.raw(), x.fp(), xh.ptr().cast(), (t * cols) as i64) })?;
+        self.op("gemm f16", key, 2 * t * cols + 2 * elems + 4 * t * rows, flops,
+                || unsafe { (k.gemm_f16)(self.raw(), t as i64, n, kk, xh.ptr().cast(), kk, self.w16.ptr().cast(), y.fp(), n, 0) })
     }
 
     fn rms(&self, x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, c: usize) -> Result<()> {
         // SAFETY: x and y [rows, c], w c floats.
-        ffi::check(unsafe { (self.k.rms_norm)(self.raw(), x.fp(), w.fp(), y.fp(), rows as i64, c as i64, self.g.eps) }, "rms norm")
+        self.op("rms norm", String::new, 8 * rows * c + 4 * c, 4 * rows * c,
+                || unsafe { (self.k.rms_norm)(self.raw(), x.fp(), w.fp(), y.fp(), rows as i64, c as i64, self.g.eps) })
     }
 
     fn add(&self, y: &DevBuf, x: &DevBuf, n: usize) -> Result<()> {
         // SAFETY: n floats each.
-        ffi::check(unsafe { (self.k.add)(self.raw(), y.fp(), x.fp(), n as i64) }, "add")
+        self.op("add", String::new, 12 * n, n, || unsafe { (self.k.add)(self.raw(), y.fp(), x.fp(), n as i64) })
     }
 
     /// The tokens' embeddings [t, n_embd] (their rows read from the file, expanded on the GPU)
@@ -447,7 +437,8 @@ impl<'g> Qwen35<'g> {
         src.write(0, &raw)?;
         let x = self.arena.f32(tokens.len() * g.n_embd)?;
         // SAFETY: the rows' blocks -> float32.
-        ffi::check(unsafe { (self.k.dequant)(self.raw(), self.embd.ty.code() as i32, src.ptr(), tokens.len() * g.n_embd, x.fp()) }, "embedding")?;
+        self.op("dequant", String::new, raw.len() + 4 * tokens.len() * g.n_embd, 0,
+                || unsafe { (self.k.dequant)(self.raw(), self.embd.ty.code() as i32, src.ptr(), tokens.len() * g.n_embd, x.fp()) })?;
         Ok(x)
     }
 
@@ -459,28 +450,36 @@ impl<'g> Qwen35<'g> {
         let qf = self.arena.f32(t * hq * 2 * d)?;
         let kr = self.arena.f32(t * hk * d)?;
         let vr = self.arena.f32(t * hk * d)?;
-        self.matmul(&a.q, h, t, &qf)?;
-        self.matmul(&a.k, h, t, &kr)?;
-        self.matmul(&a.v, h, t, &vr)?;
+        self.matmul("q", &a.q, h, t, &qf)?;
+        self.matmul("k", &a.k, h, t, &kr)?;
+        self.matmul("v", &a.v, h, t, &vr)?;
         let q = self.arena.f32(t * hq * d)?;
         let kn = self.arena.f32(t * hk * d)?;
         let att = self.arena.f32(t * hq * d)?;
+        let none = String::new;
+        // the keys the rows see in all (causal): what attention reads and multiplies
+        let keys = t * p0 + t * (t + 1) / 2;
         // SAFETY: the rows and caches as named in q35.h.
         unsafe {
-            ffi::check((k.qk_norm_rope)(self.raw(), qf.fp(), (hq * 2 * d) as i64, (2 * d) as i64, q.fp(), (hq * d) as i64, t as i64, hq as i64, d as i64,
-                                        a.q_norm.fp(), g.eps, g.n_rot as i64, g.theta, p0 as i64), "q norm + rope")?;
-            ffi::check((k.qk_norm_rope)(self.raw(), kr.fp(), (hk * d) as i64, d as i64, kn.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64,
-                                        a.k_norm.fp(), g.eps, g.n_rot as i64, g.theta, p0 as i64), "k norm + rope")?;
-            ffi::check((k.kv_store)(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64, p0 as i64,
-                                    kc.ptr(), vc.ptr()), "kv store")?;
+            self.op("q norm rope", none, 8 * t * hq * d, 10 * t * hq * d,
+                    || (k.qk_norm_rope)(self.raw(), qf.fp(), (hq * 2 * d) as i64, (2 * d) as i64, q.fp(), (hq * d) as i64, t as i64, hq as i64, d as i64,
+                                        a.q_norm.fp(), g.eps, g.n_rot as i64, g.theta, p0 as i64))?;
+            self.op("k norm rope", none, 8 * t * hk * d, 10 * t * hk * d,
+                    || (k.qk_norm_rope)(self.raw(), kr.fp(), (hk * d) as i64, d as i64, kn.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64,
+                                        a.k_norm.fp(), g.eps, g.n_rot as i64, g.theta, p0 as i64))?;
+            self.op("kv store", none, 12 * t * hk * d, 0,
+                    || (k.kv_store)(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64, p0 as i64,
+                                    kc.ptr(), vc.ptr()))?;
             let sc = (k.attn_scratch)(t as i64, hq as i64, d as i64, p0 as i64) as usize;
             let part = if sc > 0 { Some(self.arena.f32(sc)?) } else { None };
-            ffi::check((k.attn)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64,
-                                att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())), "attention")?;
-            ffi::check((k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64), "output gate")?;
+            self.op("attention", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
+                    || (k.attn)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64,
+                                att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+            self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
+                    || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
         }
         let out = self.arena.f32(t * g.n_embd)?;
-        self.matmul(&a.o, &att, t, &out)?;
+        self.matmul("o", &a.o, &att, t, &out)?;
         Ok(out)
     }
 
@@ -492,10 +491,10 @@ impl<'g> Qwen35<'g> {
         let z = self.arena.f32(t * g.inner)?;
         let beta = self.arena.f32(t * hv)?;
         let alpha = self.arena.f32(t * hv)?;
-        self.matmul(&a.qkv, h, t, &qkv)?;
-        self.matmul(&a.z, h, t, &z)?;
-        self.matmul(&a.beta, h, t, &beta)?;
-        self.matmul(&a.alpha, h, t, &alpha)?;
+        self.matmul("qkv", &a.qkv, h, t, &qkv)?;
+        self.matmul("z", &a.z, h, t, &z)?;
+        self.matmul("beta", &a.beta, h, t, &beta)?;
+        self.matmul("alpha", &a.alpha, h, t, &alpha)?;
         let eg = self.arena.f32(t * hv * d)?;
         let co = self.arena.f32(t * cd)?;
         let q = self.arena.f32(t * hv * d)?;
@@ -504,21 +503,29 @@ impl<'g> Qwen35<'g> {
         let o = self.arena.f32(t * hv * d)?;
         let y = self.arena.f32(t * g.inner)?;
         let qd = (hk * d) as i64;
+        let none = String::new;
+        let thd = t * hv * d;
         // SAFETY: the buffers as named in glm.h / q35.h.
         unsafe {
-            ffi::check((k.gdn_gates)(self.raw(), alpha.fp(), beta.fp(), a.dt.fp(), a.a.fp(), eg.fp(), t as i64, hv as i64, d as i64), "gates")?;
-            ffi::check((k.conv_silu)(self.raw(), qkv.fp(), conv.fp(), a.conv.fp(), co.fp(), t as i64, cd as i64, g.conv as i32, std::ptr::null_mut()), "conv")?;
-            ffi::check((k.expand)(self.raw(), co.fp(), cd as i64, q.fp(), t as i64, hk as i64, hv as i64, d as i64), "q heads")?;
-            ffi::check((k.expand)(self.raw(), co.fp().add(qd as usize), cd as i64, kk.fp(), t as i64, hk as i64, hv as i64, d as i64), "k heads")?;
-            ffi::check((k.expand)(self.raw(), co.fp().add(2 * qd as usize), cd as i64, v.fp(), t as i64, hv as i64, hv as i64, d as i64), "v heads")?;
-            ffi::check((k.l2_norm)(self.raw(), q.fp(), (t * hv) as i64, d as i64, g.eps), "q l2")?;
-            ffi::check((k.l2_norm)(self.raw(), kk.fp(), (t * hv) as i64, d as i64, g.eps), "k l2")?;
-            ffi::check((k.kda_scan)(self.raw(), q.fp(), kk.fp(), v.fp(), eg.fp(), beta.fp(), s.fp(), o.fp(), t as i64, hv as i64, d as i64, std::ptr::null_mut()),
-                       "delta rule")?;
-            ffi::check((k.gdn_out)(self.raw(), o.fp(), z.fp(), g.inner as i64, a.norm.fp(), y.fp(), t as i64, hv as i64, d as i64, g.eps), "gated norm")?;
+            self.op("gates", none, 4 * (3 * t * hv + 2 * hv) + 4 * thd, 20 * t * hv,
+                    || (k.gdn_gates)(self.raw(), alpha.fp(), beta.fp(), a.dt.fp(), a.a.fp(), eg.fp(), t as i64, hv as i64, d as i64))?;
+            self.op("conv silu", none, 4 * (2 * t * cd + 2 * (g.conv - 1) * cd + g.conv * cd), 2 * g.conv * t * cd + 4 * t * cd,
+                    || (k.conv_silu)(self.raw(), qkv.fp(), conv.fp(), a.conv.fp(), co.fp(), t as i64, cd as i64, g.conv as i32, std::ptr::null_mut()))?;
+            self.op("expand q", none, 4 * t * hk * d + 4 * thd, 0, || (k.expand)(self.raw(), co.fp(), cd as i64, q.fp(), t as i64, hk as i64, hv as i64, d as i64))?;
+            self.op("expand k", none, 4 * t * hk * d + 4 * thd, 0,
+                    || (k.expand)(self.raw(), co.fp().add(qd as usize), cd as i64, kk.fp(), t as i64, hk as i64, hv as i64, d as i64))?;
+            self.op("expand v", none, 8 * thd, 0, || (k.expand)(self.raw(), co.fp().add(2 * qd as usize), cd as i64, v.fp(), t as i64, hv as i64, hv as i64, d as i64))?;
+            self.op("l2 q", none, 8 * thd, 3 * thd, || (k.l2_norm)(self.raw(), q.fp(), (t * hv) as i64, d as i64, g.eps))?;
+            self.op("l2 k", none, 8 * thd, 3 * thd, || (k.l2_norm)(self.raw(), kk.fp(), (t * hv) as i64, d as i64, g.eps))?;
+            // the state [hv][d][d] read and written once, each row's q, k, v, decay in and output out; per row and head
+            // the state decayed, read against k, updated, read against q: ~8 d^2
+            self.op("delta rule", none, 8 * hv * d * d + 4 * (5 * thd + t * hv), 8 * t * hv * d * d,
+                    || (k.kda_scan)(self.raw(), q.fp(), kk.fp(), v.fp(), eg.fp(), beta.fp(), s.fp(), o.fp(), t as i64, hv as i64, d as i64, std::ptr::null_mut()))?;
+            self.op("gated norm", none, 4 * (3 * t * g.inner + d), 10 * t * g.inner,
+                    || (k.gdn_out)(self.raw(), o.fp(), z.fp(), g.inner as i64, a.norm.fp(), y.fp(), t as i64, hv as i64, d as i64, g.eps))?;
         }
         let out = self.arena.f32(t * g.n_embd)?;
-        self.matmul(&a.out, &y, t, &out)?;
+        self.matmul("out", &a.out, &y, t, &out)?;
         Ok(out)
     }
 
@@ -538,9 +545,8 @@ impl<'g> Qwen35<'g> {
         }
         self.arena.reset();
         let p0 = s.pos;
-        let mut tp = Instant::now();
+        self.phase("embed");
         let x = self.embed(tokens)?;
-        tp = self.lap("embed", tp);
         let h = self.arena.f32(t * g.n_embd)?;
         let ffn_g = self.arena.f32(t * g.n_ff)?;
         let ffn_u = self.arena.f32(t * g.n_ff)?;
@@ -548,29 +554,24 @@ impl<'g> Qwen35<'g> {
         // the arena past this point is the layer's own, made again each layer
         for (l, (ly, st)) in self.layers.iter().zip(s.layers.iter()).enumerate() {
             let mark = self.arena.mark();
+            self.phase(if ly.full.is_some() { "attention" } else { "deltanet" });
             self.rms(&x, &ly.attn_norm, &h, t, g.n_embd)?;
             let out = match (st, &ly.full, &ly.linear) {
-                (LState::Full { k, v }, Some(a), _) => {
-                    let o = self.full(a, k, v, s.max_ctx, &h, t, p0)?;
-                    tp = self.lap("full attention", tp);
-                    o
-                }
-                (LState::Linear { s: rs, conv }, _, Some(a)) => {
-                    let o = self.linear(a, rs, conv, &h, t)?;
-                    tp = self.lap("deltanet", tp);
-                    o
-                }
+                (LState::Full { k, v }, Some(a), _) => self.full(a, k, v, s.max_ctx, &h, t, p0)?,
+                (LState::Linear { s: rs, conv }, _, Some(a)) => self.linear(a, rs, conv, &h, t)?,
                 _ => return Err(e(format!("layer {l}: its state and its weights disagree"))),
             };
             self.add(&x, &out, t * g.n_embd)?;
+            self.phase("ffn");
             self.rms(&x, &ly.post_norm, &h, t, g.n_embd)?;
-            self.matmul(&ly.gate, &h, t, &ffn_g)?;
-            self.matmul(&ly.up, &h, t, &ffn_u)?;
+            self.matmul("gate", &ly.gate, &h, t, &ffn_g)?;
+            self.matmul("up", &ly.up, &h, t, &ffn_u)?;
+            let nf = t * g.n_ff;
             // SAFETY: n floats each.
-            ffi::check(unsafe { (self.k.swiglu_clamp)(self.raw(), ffn_g.fp(), ffn_u.fp(), ffn_g.fp(), (t * g.n_ff) as i64, f32::INFINITY) }, "swiglu")?;
-            self.matmul(&ly.down, &ffn_g, t, &ffn)?;
+            self.op("swiglu", String::new, 12 * nf, 6 * nf,
+                    || unsafe { (self.k.swiglu_clamp)(self.raw(), ffn_g.fp(), ffn_u.fp(), ffn_g.fp(), nf as i64, f32::INFINITY) })?;
+            self.matmul("down", &ly.down, &ffn_g, t, &ffn)?;
             self.add(&x, &ffn, t * g.n_embd)?;
-            tp = self.lap("ffn", tp);
             tap(&format!("l_out-{l}"), &x)?;
             self.arena.rewind(mark);
         }
@@ -580,13 +581,15 @@ impl<'g> Qwen35<'g> {
         let n = n_out.clamp(1, t);
         let last = x.view((t - n) * g.n_embd * 4, n * g.n_embd * 4)?;
         let normed = self.arena.f32(n * g.n_embd)?;
+        self.phase("head");
         self.rms(&last, &self.output_norm, &normed, n, g.n_embd)?;
         tap("result_norm", &normed)?;
         let logits = self.arena.f32(n * self.output.rows)?;
-        self.matmul(&self.output, &normed, n, &logits)?;
-        tp = self.lap("head", tp);
+        self.matmul("output", &self.output, &normed, n, &logits)?;
         let all = logits.to_f32()?;
-        self.lap("read logits", tp);
+        if let Some(p) = &self.probe {
+            p.settle(t)?;
+        }
         Ok(all.chunks(self.output.rows).map(|c| c.to_vec()).collect())
     }
 

@@ -4,7 +4,8 @@
 // GB/s of weights read, 8 matrices rotated (past the L2), random blocks (the arithmetic does not depend on them).
 // `mmvq_types GPU NCOLS [check][own]`: check - random activations instead, and each product's output summarized (sum,
 // sum of |y|, y[0], y[n_out-1]), to compare two runs; own - the qwen35 engine's own kernels (ns_q35_mmvq) where they
-// cover the type (its silo), the shared ones (ns_mmvq) otherwise.
+// cover the type (its silo), the shared ones (ns_mmvq) otherwise; peaks - the card's practical ceilings instead (a
+// device copy's bandwidth, oneMKL's half GEMM at a prompt chunk's shapes).
 #include "ns.h"
 #include <chrono>
 #include <cstdio>
@@ -17,6 +18,7 @@ int ns_mmvq_supported(int type);
 int ns_quantize_q8_1(ns_gpu* g, const float* x, void* q8_1, int64_t n_in, int64_t ncols);
 int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 int ns_q35_mmvq_supported(int type, int64_t n_in);
+int ns_gemm_f16(ns_gpu* g, int64_t T, int64_t N, int64_t K, const uint16_t* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int acc);
 int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 }
 struct T { int id; const char* name; int elems; int bytes; };
@@ -42,6 +44,38 @@ int main(int argc, char** argv) {
     }
     void* q; ns_alloc(g, ns_q8_1_bytes(17408, 8), &q);
     float* y; ns_alloc(g, 17408 * 8 * 4, (void**) &y);
+    if (mode.find("peaks") != std::string::npos) {   // the card's practical ceilings: a device copy, oneMKL's half GEMM
+        const size_t n = size_t(1) << 30;
+        void *a, *b; ns_alloc(g, n, &a); ns_alloc(g, n, &b);
+        std::vector<unsigned char> h(n);
+        unsigned long long r = 0x9e3779b97f4a7c15ull;
+        for (auto& v : h) { r ^= r << 13; r ^= r >> 7; r ^= r << 17; v = (unsigned char) r; }
+        ns_copy_to(g, a, h.data(), n);
+        ns_sync(g);
+        for (int i = 0; i < 2; ++i) ns_copy_dev(g, b, a, n);
+        ns_sync(g);
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 10; ++i) ns_copy_dev(g, b, a, n);
+        ns_sync(g);
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 10;
+        printf("device copy 1 GiB: %.0f GB/s (read + write)\n", 2.0 * n / s / 1e9);
+        const int64_t shapes[][3] = {{4096, 4096, 4096}, {512, 17408, 5120}, {512, 5120, 17408}, {512, 10240, 5120}};
+        for (auto& sh : shapes) {
+            const int64_t T = sh[0], N = sh[1], K = sh[2];
+            ns_fill(g, a, 0x11, T * K * 2); ns_fill(g, b, 0x11, N * K * 2);
+            float* y; ns_alloc(g, T * N * 4, (void**) &y);
+            for (int i = 0; i < 2; ++i) ns_gemm_f16(g, T, N, K, (uint16_t*) a, K, (uint16_t*) b, y, N, 0);
+            ns_sync(g);
+            auto t1 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 10; ++i) ns_gemm_f16(g, T, N, K, (uint16_t*) a, K, (uint16_t*) b, y, N, 0);
+            ns_sync(g);
+            const double sg = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() / 10;
+            printf("gemm f16 %lldx%lldx%lld: %.1f TFLOP/s (%.2f ms)\n", (long long) T, (long long) N, (long long) K, 2.0 * T * N * K / sg / 1e12, sg * 1e3);
+            ns_free(g, y);
+        }
+        ns_free(g, a); ns_free(g, b);
+        return 0;
+    }
     {   // the cost of a launch: 2,000 tiny products back to back (Q8_0, 64 x 256)
         void* w; ns_alloc(g, 64 * 8 * 34, &w);
         ns_fill(g, w, 0, 64 * 8 * 34);

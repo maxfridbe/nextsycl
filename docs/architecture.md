@@ -150,7 +150,9 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   (Q3_K, Q4_K, Q5_K, IQ4_NL, IQ3_S, IQ4_XS), started from Strata's wide kernels and tuned for its shapes - scales from
   one aligned load, the IQ4 codebook and IQ3_S grid in local memory - 1.3-4.3x Strata's per type on the B70 and the
   same results; Q8_0 / Q6_K and the rest go to the shared ones. Settings: `NS_Q35_CHUNK` (prompt rows a pass, 512),
-  `NS_Q35_PROFILE=1` (time by phase) / `=2` (and each decode product alone, with its GB/s), `NS_Q35_MMVQ_ROWS`
+  `NS_Q35_PROFILE=1` with `NS_PROFILE=gpu` (every kernel timed on the device between queue timestamps, with its bytes
+  and arithmetic: time, GB/s and TFLOP/s against the card's ceilings by phase and kernel, decode and prompt passes apart,
+  and the device time between kernels - `llm/qwen35/src/probe.rs`), `NS_Q35_MMVQ_ROWS`
   (rows a sub-group, every silo type) and `NS_Q35_MMVQ_GROUPS` (work-groups of the kernels with a table, 512).
 
 ## The audio engines

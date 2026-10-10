@@ -6,6 +6,7 @@
 
 pub mod engine;
 mod ffi;
+mod probe;
 
 use std::any::Any;
 use std::sync::Arc;
@@ -164,7 +165,7 @@ impl Engine for engine::Qwen35<'_> {
     fn gpu_info(&self) -> Vec<GpuInfo> {
         engine::Qwen35::gpu_info(self)
     }
-    fn report(&self, tokens: usize) -> Vec<String> {
-        engine::Qwen35::profile_lines(self, tokens)
+    fn report(&self, _tokens: usize) -> Vec<String> {
+        engine::Qwen35::profile_lines(self)
     }
 }
