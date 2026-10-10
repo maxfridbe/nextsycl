@@ -75,3 +75,23 @@ export interface Spec {
   token: string;
   spec: { info: { description: string; version: string }; servers: { url: string }[]; paths: Record<string, Record<string, Operation>> };
 }
+
+export interface SettingRow {
+  name: string;
+  group?: string;
+  default?: string;
+  what: string;
+  readers: string[];
+  file: string | null;
+  env?: string | null;
+}
+
+export interface Config {
+  path: string;
+  text: string;
+  settings: SettingRow[];
+  other: SettingRow[];
+  prefixes: { prefix: string; what: string; readers: string[] }[];
+}
+
+export interface ConfigSaved { changed: string[]; restart: string[]; note?: string | null }

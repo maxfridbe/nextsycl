@@ -278,9 +278,16 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     `/v1/images/generations|edits`, `/v1/audio/speech` and the files they link. `GET /openapi.yml` describes the
     kinds that have an enabled model (enabling one adds its methods); the API tab lists them with a curl each.
     `/api/...` is the page's own.
+  - **The settings** (the Config tab; `system.config`, `system.configSet {set: {NAME: value | null}} | {text}`,
+    `system.restart {service}`): `nextsycl.conf` as every setting the program reads - what it does, its default,
+    what reads it - or as the file itself. A save keeps the file's comments and order, keeps a copy
+    (`nextsycl.conf.bak-<time>`, the last 10), and lists what has to restart to see the change, a button each (this
+    page, the switcher, the studio, the video daemon, the image and music servers, the chat model). A setting in a
+    service's environment wins over the file and is marked.
 
   ![nextsycl serve: the GPUs, the models](docs/screenshots/home-desktop.webp)
   ![nextsycl serve: the API tab](docs/screenshots/home-api.webp)
+  ![nextsycl serve: the settings](docs/screenshots/home-config.webp)
 
 - **`switch`**: one OpenAI endpoint for a chat front end over the one model server that runs at a time. It lists the
   registry's enabled chat models (read on every request); a request naming another model asks the video studio to

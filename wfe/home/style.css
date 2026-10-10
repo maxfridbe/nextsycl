@@ -69,3 +69,9 @@
  .fields{display:flex;flex-wrap:wrap;gap:4px 12px;margin:5px 0;font-size:12px}
  .curl{display:flex;gap:8px;align-items:flex-start} .curl pre{flex:1;margin:4px 0 0;background:#0c0e13;color:#cbd5e1;padding:8px;border-radius:6px;font-size:11px;white-space:pre-wrap;word-break:break-all}
  @media (max-width:640px){ .mrow{grid-template-columns:18px 1fr} .mrow .mstate,.mrow .acts{grid-column:1 / -1} .mrow .acts{justify-content:flex-start} }
+ .srow{display:grid;grid-template-columns:minmax(200px,260px) minmax(160px,1fr) 2fr;gap:6px 12px;align-items:center;padding:5px 0;border-top:1px solid #222733}
+ .srow.edited input{border-color:#f59e0b} .srow.env input{opacity:.6} .sname{display:flex;gap:6px;align-items:center;flex-wrap:wrap} .swhat{font-size:12px;color:#cbd5e1}
+ .srow input[type=text]{background:#0c0e13;color:#eee;border:1px solid #2f3646;border-radius:6px;padding:5px 8px;font:12px ui-monospace,monospace;width:100%;box-sizing:border-box}
+ textarea.conf{width:100%;min-height:60vh;background:#0c0e13;color:#e5e7eb;border:1px solid #2f3646;border-radius:8px;padding:10px;font:12px/1.5 ui-monospace,monospace;box-sizing:border-box}
+ .saved{background:#0f1a14;border:1px solid #14532d;border-radius:8px;padding:8px 10px;margin:4px 0 10px;font-size:13px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+ @media (max-width:640px){ .srow{grid-template-columns:1fr} }

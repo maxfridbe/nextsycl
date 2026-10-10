@@ -4,6 +4,7 @@ import { jsx } from "../jsx.js";
 import { act, render, setTab, ui } from "../main.js";
 import type { Card, Model, Proc, Service } from "../types.js";
 import { Api } from "./Api.js";
+import { ConfigView } from "./Config.js";
 
 const gib = (mb: number) => (mb / 1024).toFixed(1);
 const short = (n: string) => n.replace("Intel(R) Arc(TM) ", "").replace(" Graphics", "");
@@ -231,9 +232,10 @@ export function App() {
       <div class="tabs">
         <button class={{ tab: true, on: ui.tab === "status" }} on={{ click: () => setTab("status") }}>Status</button>
         <button class={{ tab: true, on: ui.tab === "api" }} on={{ click: () => setTab("api") }}>API</button>
+        <button class={{ tab: true, on: ui.tab === "config" }} on={{ click: () => setTab("config") }}>Config</button>
       </div>
       {ui.error ? <pre class="err" on={{ click: () => { ui.error = null; render(); } }}>{ui.error}</pre> : null}
-      {ui.tab === "api" ? <Api /> : <Status />}
+      {ui.tab === "api" ? <Api /> : ui.tab === "config" ? <ConfigView /> : <Status />}
     </div>
   );
 }

@@ -19,6 +19,7 @@
 //! llm.mode, which owns the chat card.
 
 mod api;
+mod config;
 mod life;
 mod yaml;
 
@@ -270,6 +271,7 @@ impl Home {
             }
             ("GET", "/openapi.json") => http::respond(&mut s, 200, &self.openapi(&req)),
             ("GET", "/api/state") => http::respond(&mut s, 200, &self.state()),
+            ("GET", "/api/config") => http::respond(&mut s, 200, &self.config()),
             ("GET", "/api/spec") => http::respond(&mut s, 200, &json!({"token": self.token, "spec": self.openapi(&req)})),
             ("GET", p) if p.starts_with("/api/runs/") => {
                 let id: u64 = p["/api/runs/".len()..].parse().unwrap_or(0);
@@ -432,7 +434,9 @@ impl Home {
                 Ok(json!({"model": model, "loading": true}))
             }
             "unload" => self.unload(&model).map(|_| json!({"model": model, "loaded": false})),
-            other => Err((400, format!("no action {other:?} (enable, disable, load, unload)"))),
+            "config" => self.config_set(b),
+            "restart" => self.restart(b["service"].as_str().unwrap_or("")),
+            other => Err((400, format!("no action {other:?} (enable, disable, load, unload, config, restart)"))),
         }
     }
 }

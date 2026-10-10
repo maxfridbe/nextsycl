@@ -43,6 +43,16 @@ impl Config {
         Config { files, dist }
     }
 
+    /// The settings file beside the repository (dist/../nextsycl.conf): the one `nextsycl serve` edits
+    pub fn file(&self) -> PathBuf {
+        self.dist.join("../nextsycl.conf")
+    }
+
+    /// Whether the environment sets `name` (it wins over the files)
+    pub fn from_env(&self, name: &str) -> bool {
+        std::env::var(name).is_ok_and(|v| !v.is_empty())
+    }
+
     pub fn get(&self, name: &str) -> Option<String> {
         std::env::var(name).ok().filter(|v| !v.is_empty()).or_else(|| self.files.get(name).cloned().filter(|v| !v.is_empty()))
     }

@@ -44,6 +44,13 @@ pub const METHODS: &[Method] = &[
              fields: &[MODEL, ("wait", "boolean", "answer when it has loaded (default: at once, loading in the background)", false)],
              example: r#"{"model": "minimax-music3", "wait": true}"# },
     Method { kind: "system", name: "unload", summary: "Unload a model now (it stays enabled)", fields: &[MODEL], example: r#"{"model": "minimax-music3"}"# },
+    Method { kind: "system", name: "config", summary: "The settings file (nextsycl.conf): its text, every setting the program reads (value, default, what reads it), the file's others",
+             fields: &[], example: "{}" },
+    Method { kind: "system", name: "configSet", summary: "Change settings (the file copied first): set {NAME: value, NAME: null to remove} or text (the whole file); answers what changed and what must restart",
+             fields: &[("set", "object", "{NAME: value | null}", false), ("text", "string", "the whole file instead", false)],
+             example: r#"{"set": {"NS_IDLE_MINUTES": "15"}}"# },
+    Method { kind: "system", name: "restart", summary: "Restart what reads the settings: serve, switch, studio, video, image, audio or llm",
+             fields: &[("service", "string", "serve | switch | studio | video | image | audio | llm", true)], example: r#"{"service": "switch"}"# },
 
     Method { kind: "llm", name: "chat", summary: "A chat completion (OpenAI's body; stream is ignored - use /v1/chat/completions to stream)",
              fields: &[("model", "string", "a chat model's id", true), ("messages", "object[]", "[{role, content}]", true),
@@ -231,6 +238,9 @@ impl Home {
             ("system", "load") if b["wait"] == true => self.load(&model()).map(|_| json!({"model": model(), "loaded": true})),
             ("system", "load") => self.load_async(&model()).map(|_| json!({"model": model(), "loading": true})),
             ("system", "unload") => self.unload(&model()).map(|_| json!({"model": model(), "loaded": false})),
+            ("system", "config") => Ok(self.config()),
+            ("system", "configSet") => self.config_set(b),
+            ("system", "restart") => self.restart(&s(b, "service")),
             (k, "describePromptGuideMD") => {
                 let e = all.iter().find(|x| x["id"] == model().as_str()).ok_or_else(|| (404, format!("no model {}", model())))?;
                 if registry::kind_of(e) != k {

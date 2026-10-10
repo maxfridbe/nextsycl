@@ -7,13 +7,23 @@ import { propsModule } from "../../vendor/snabbdom/modules/props.js";
 import { styleModule } from "../../vendor/snabbdom/modules/style.js";
 import type { VNode } from "../../vendor/snabbdom/vnode.js";
 import { App } from "./components/App.js";
-import type { Spec, State } from "./types.js";
+import type { Config, ConfigSaved, Spec, State } from "./types.js";
 
 export const ui = {
   state: null as State | null,
   spec: null as Spec | null,
   error: null as string | null,
-  tab: (() => { try { return localStorage.getItem("ns-tab") ?? "status"; } catch { return "status"; } })() as "status" | "api",
+  tab: (() => { try { return localStorage.getItem("ns-tab") ?? "status"; } catch { return "status"; } })() as Tab,
+  config: null as Config | null,
+  /** settings edited and not saved: name -> value ("" removes it) */
+  edits: {} as Record<string, string>,
+  /** the raw file being edited (the File view), or null */
+  raw: null as string | null,
+  newName: "",
+  newValue: "",
+  saved: null as ConfigSaved | null,
+  /** restarts under way, by service */
+  restarting: {} as Record<string, boolean>,
   /** per model: the GPUs picked before enabling */
   pick: {} as Record<string, number[]>,
   /** per model: an action under way from this page (its button spins until the state says it is done) */
@@ -100,10 +110,57 @@ export async function act(what: string, model: string, extra: Record<string, unk
   void poll();
 }
 
-export function setTab(t: "status" | "api"): void {
+export type Tab = "status" | "api" | "config";
+
+export async function loadConfig(): Promise<void> {
+  try {
+    ui.config = (await (await fetch("/api/config")).json()) as Config;
+  } catch (e) {
+    ui.error = String(e);
+  }
+  render();
+}
+
+/** Save the edited settings (or the raw file); the answer says what to restart */
+export async function saveConfig(raw: boolean): Promise<void> {
+  const body = raw ? { do: "config", text: ui.raw ?? "" }
+    : { do: "config", set: Object.fromEntries(Object.entries(ui.edits).map(([k, v]) => [k, v.trim() === "" ? null : v])) };
+  try {
+    const r = await fetch("/api/action", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const j = (await r.json()) as ConfigSaved & { error?: string };
+    if (!r.ok) throw new Error(j.error ?? `HTTP ${r.status}`);
+    ui.saved = j;
+    ui.edits = {};
+    ui.raw = null;
+    ui.error = null;
+  } catch (e) {
+    ui.error = String(e);
+  }
+  await loadConfig();
+}
+
+export async function restartService(service: string): Promise<void> {
+  ui.restarting[service] = true;
+  render();
+  try {
+    const r = await fetch("/api/action", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ do: "restart", service }) });
+    const j = (await r.json()) as { error?: string };
+    if (!r.ok) throw new Error(j.error ?? `HTTP ${r.status}`);
+    if (ui.saved) ui.saved.restart = ui.saved.restart.filter((x) => x !== service);
+  } catch (e) {
+    // this page restarting itself drops the connection: that is the answer
+    if (service !== "serve") ui.error = `restart ${service}: ${String(e)}`;
+  }
+  // give a restarted service a moment before the next poll
+  setTimeout(() => { delete ui.restarting[service]; render(); }, service === "serve" ? 4000 : 1500);
+  render();
+}
+
+export function setTab(t: Tab): void {
   ui.tab = t;
   try { localStorage.setItem("ns-tab", t); } catch { /* no storage */ }
   if (t === "api" && !ui.spec) void loadSpec();
+  if (t === "config") void loadConfig();
   render();
 }
 
@@ -126,3 +183,4 @@ export async function copy(text: string, key: string): Promise<void> {
 render();
 void poll();
 if (ui.tab === "api") void loadSpec();
+if (ui.tab === "config") void loadConfig();
