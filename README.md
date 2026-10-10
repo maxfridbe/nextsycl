@@ -4,6 +4,16 @@ We stand on the shoulders of giants.
 
 # nextsycl
 
+- **No CUDA, no PyTorch, no Vulkan** - SYCL only, optimized for Intel Arc
+- **No Python**
+- **No Node**
+- **Every useful model, optimized**
+- **Silo architecture** - only do what is best for model X ([CONTRIBUTING.md](CONTRIBUTING.md) rule 5)
+- **Test driven** - nothing is committed until it beats the base, with the same results
+- **A single API control plane** - the front door on :8000
+- **A Docker-style CLI** - `nextsycl <kind> start | stop | ps | logs | ...`
+- **A porting methodology** - [CONTRIBUTING.md](CONTRIBUTING.md) and [the SYCL porting skill](skills/sycl-porting/SKILL.md)
+
 A Rust runtime for language, image, video and audio models on Intel Arc GPUs, with SYCL kernels. Each kind of model has a
 contract its server and command line drive, and each model architecture its own engine behind it, tuned end to end -
 a library another program can use without the server (`docs/architecture.md`). New models are welcome:
