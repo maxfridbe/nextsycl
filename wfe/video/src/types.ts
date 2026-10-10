@@ -39,6 +39,15 @@ export interface GenerateRequest {
   sampler?: string | null;
   schedule?: string | null;
   loras?: string[];
+  /** references (Ref2VA): files in the studio's output directory, named in the prompt as <Picture i>, <Video k>,
+   *  <Audio j> (a clip's own sound takes the next <Audio j> before its <Video k>) */
+  ref_images?: string[] | null;
+  ref_videos?: string[] | null;
+  ref_audios?: string[] | null;
+  ref_video_sound?: boolean | null;
+  ref_image_size?: "match" | "max" | null;
+  /** the keyframe pictures shown to the text encoder too (default on) */
+  te_pictures?: boolean | null;
   project?: string;
   batch?: string;
   queue?: boolean;

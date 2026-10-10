@@ -11,10 +11,10 @@ use super::runner::snap_seconds;
 use super::{now, pyround, RpcError, Studio};
 
 /// The keys a scene file may lift into its defaults.
-const SCENE_DEFAULTABLE: [&str; 25] = [
+const SCENE_DEFAULTABLE: [&str; 28] = [
     "steps", "seed", "te", "engine", "width", "height", "chain_mode", "upscale", "first_frame", "last_frame", "exposure_ref", "first_audio",
     "first_audio_s", "cond_noise_aug", "loras", "ref_images", "ref_audios", "ref_image_size", "guide_clip", "shift_video", "shift_audio", "source",
-    "regen", "sampler", "schedule",
+    "regen", "sampler", "schedule", "ref_videos", "ref_video_sound", "te_pictures",
 ];
 
 pub const CANVASES: [(i64, i64, &str, &str); 10] = [
@@ -317,10 +317,12 @@ impl Studio {
     /// The denoisers the engine daemon has (its `--model`, INT8, and the GGUF forms of its `--engine`s), in the legacy
     /// shape, by the front end's names; INT8 alone when the daemon does not answer.
     pub fn engines(&self) -> Vec<Value> {
-        let listed: Vec<Value> = super::http::call(&super::http::Target::Unix(self.socket.clone()), "GET", "/engine/status", None)
+        let raw: Vec<Value> = super::http::call(&super::http::Target::Unix(self.socket.clone()), "GET", "/engine/status", None)
             .ok()
             .and_then(|v| v["engines"].as_array().cloned())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        super::queue::learn_engines(&raw.iter().filter_map(|e| e["name"].as_str().map(str::to_string)).collect::<Vec<_>>());
+        let listed: Vec<Value> = raw
             .iter()
             .filter_map(|e| {
                 let path = e["path"].as_str()?;

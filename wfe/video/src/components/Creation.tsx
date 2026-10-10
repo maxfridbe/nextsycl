@@ -24,6 +24,12 @@ interface Form {
   sampler: string;
   schedule: string;
   chain: boolean;
+  /** uploaded references (names in the studio's output directory) */
+  refImages: string[];
+  refVideos: string[];
+  refAudios: string[];
+  refVideoSound: boolean;
+  refImageMax: boolean;
 }
 
 export const form: Form = {
@@ -46,6 +52,11 @@ export const form: Form = {
   sampler: "",
   schedule: "",
   chain: false,
+  refImages: [],
+  refVideos: [],
+  refAudios: [],
+  refVideoSound: true,
+  refImageMax: false,
 };
 
 /** Fill the form from an existing job - the "use these settings" path. */
@@ -62,6 +73,11 @@ export function useSettings(j: GenerateRequest): void {
   form.upscaler = j.upscaler ?? "esrgan-general";
   form.sampler = j.sampler ?? "";
   form.schedule = j.schedule ?? "";
+  form.refImages = j.ref_images ?? [];
+  form.refVideos = j.ref_videos ?? [];
+  form.refAudios = j.ref_audios ?? [];
+  form.refVideoSound = j.ref_video_sound ?? true;
+  form.refImageMax = j.ref_image_size === "max";
   form.label = j.label ?? "";
   form.chain = !!j.first_frame;
   navigate({ tab: "create" });
@@ -85,6 +101,13 @@ async function generate(queue: boolean): Promise<void> {
   };
   if (form.sampler) body.sampler = form.sampler;
   if (form.schedule) body.schedule = form.schedule;
+  if (form.refImages.length) body.ref_images = form.refImages;
+  if (form.refVideos.length) {
+    body.ref_videos = form.refVideos;
+    body.ref_video_sound = form.refVideoSound;
+  }
+  if (form.refAudios.length) body.ref_audios = form.refAudios;
+  if (form.refImages.length && form.refImageMax) body.ref_image_size = "max";
   if (form.chain) body.first_frame = "prev";
   try {
     await rpc("generate", body);
@@ -107,6 +130,91 @@ const num = (
     />
   </label>
 );
+
+type RefKind = "refImages" | "refVideos" | "refAudios";
+const REF_MAX: Record<RefKind, number> = { refImages: 9, refVideos: 3, refAudios: 3 };
+const REF_ACCEPT: Record<RefKind, string> = { refImages: "image/*", refVideos: "video/*", refAudios: "audio/*" };
+
+/** Files to the studio (POST /api/upload), each kept by the name it answers with */
+async function addRefs(kind: RefKind, files: FileList | null): Promise<void> {
+  for (const f of Array.from(files ?? [])) {
+    if (form[kind].length >= REF_MAX[kind]) break;
+    try {
+      const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
+      const j = (await r.json()) as { ok: boolean; name?: string; error?: string };
+      if (!j.ok || !j.name) throw new Error(j.error ?? `HTTP ${r.status}`);
+      form[kind] = [...form[kind], j.name];
+      state.error = null;
+    } catch (e) {
+      state.error = `${f.name}: ${String(e)}`;
+    }
+    render();
+  }
+}
+
+/** The tags the prompt names the references by, in the order the encoder is shown them */
+function refTags(): { kind: RefKind; i: number; tag: string }[] {
+  const out: { kind: RefKind; i: number; tag: string }[] = [];
+  form.refImages.forEach((_, i) => out.push({ kind: "refImages", i, tag: `<Picture ${i + 1}>` }));
+  let audio = 0;
+  form.refVideos.forEach((_, i) => {
+    if (form.refVideoSound) audio += 1;
+    out.push({ kind: "refVideos", i, tag: `<Video ${i + 1}>${form.refVideoSound ? ` + <Audio ${audio}>` : ""}` });
+  });
+  form.refAudios.forEach((_, i) => out.push({ kind: "refAudios", i, tag: `<Audio ${audio + i + 1}>` }));
+  return out;
+}
+
+function References() {
+  const add = (kind: RefKind, label: string) => (
+    <label class="tbtn" attrs={{ title: `up to ${REF_MAX[kind]}` }}>
+      <span class="i" props={{ innerHTML: "&#xf067;" }} />{label}
+      <input
+        attrs={{ type: "file", accept: REF_ACCEPT[kind], multiple: true, style: "display:none" }}
+        on={{ change: (e: Event) => void addRefs(kind, (e.target as HTMLInputElement).files) }}
+      />
+    </label>
+  );
+  const tags = refTags();
+  const files: Record<RefKind, string[]> = { refImages: form.refImages, refVideos: form.refVideos, refAudios: form.refAudios };
+  return (
+    <div>
+      <div class="row">
+        {add("refImages", "picture")}
+        {add("refVideos", "clip")}
+        {add("refAudios", "sound")}
+        {form.refVideos.length
+          ? <label class="inline"><input attrs={{ type: "checkbox", checked: form.refVideoSound }}
+              on={{ change: (e: Event) => { form.refVideoSound = (e.target as HTMLInputElement).checked; render(); } }} />clips bring their sound</label>
+          : null}
+        {form.refImages.length
+          ? <label class="inline" attrs={{ title: "2048-pixel short side instead of the clip's area: a closer likeness, several times the tokens" }}>
+              <input attrs={{ type: "checkbox", checked: form.refImageMax }}
+                on={{ change: (e: Event) => { form.refImageMax = (e.target as HTMLInputElement).checked; render(); } }} />full-size pictures</label>
+          : null}
+      </div>
+      {tags.length
+        ? <div class="refs">
+            {tags.map((t) => (
+              <span class="ref" attrs={{ title: files[t.kind][t.i] ?? "" }}>
+                <a attrs={{ href: "#", title: "add the tag to the prompt" }}
+                  on={{ click: (e: Event) => { e.preventDefault(); form.prompt = `${form.prompt}${form.prompt.endsWith(" ") ? "" : " "}${t.tag.split(" + ")[0]}`; render(); } }}>
+                  {t.tag}
+                </a>{" "}
+                <span class="hint">{(files[t.kind][t.i] ?? "").replace(/^ref_\d+_/, "")}</span>
+                <a attrs={{ href: "#", title: "remove" }}
+                  on={{ click: (e: Event) => { e.preventDefault(); form[t.kind] = form[t.kind].filter((_, j) => j !== t.i); render(); } }}> ✕</a>
+              </span>
+            ))}
+          </div>
+        : null}
+      <div class="hint">
+        Name them in the prompt by their tags ("the dancer from &lt;Picture 1&gt; moves as in &lt;Video 1&gt;, speaking in the
+        voice of &lt;Audio 1&gt;"). Pictures and clips switch the clip to the Ref2VA denoiser.
+      </div>
+    </div>
+  );
+}
 
 /** A select over the plan's names, "" first (the engine's default) */
 const named = (label: string, key: "sampler" | "schedule", names: string[] | undefined, dflt: string, title: string) => (
@@ -169,6 +277,14 @@ export function Creation() {
           chain from previous clip
         </label>
       </div>
+      <Panel
+        id="refs"
+        icon="&#xf03e;"
+        title="References"
+        hint={refTags().length ? refTags().map((t) => t.tag).join(" · ") : "pictures, clips, sounds the prompt names"}
+      >
+        <References />
+      </Panel>
       <Panel
         id="canvas"
         icon="&#xf0b2;"

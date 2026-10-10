@@ -136,14 +136,53 @@ pub fn engine_name(e: Option<&str>) -> String {
 /// (`--model`, `--engine`), set once by the studio's start
 pub static ENGINES: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
 
+/// Models the daemon lists that the start did not name (named by their suffix: `quant_of`)
+static LEARNED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The daemon's model ids, as it lists them: any the start did not name join under their suffix's name
+pub fn learn_engines(ids: &[String]) {
+    let mut l = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+    for id in ids {
+        let named = ENGINES.get().is_some_and(|m| m.iter().any(|(_, i)| i == id)) || l.iter().any(|(_, i)| i == id);
+        let q = quant_of(id).to_string();
+        if !named && !ENGINES.get().is_some_and(|m| m.iter().any(|(n, _)| *n == q)) {
+            l.push((q, id.clone()));
+        }
+    }
+}
+
+/// Every name -> id pair: the start's, then the learned ones
+fn engine_pairs() -> Vec<(String, String)> {
+    let mut v = ENGINES.get().cloned().unwrap_or_default();
+    v.extend(LEARNED.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+    v
+}
+
+/// The front end's name for a model id: by its suffix (minimax-h3 -> INT8, -q6k -> Q6_K, -q4km -> Q4_K_M, -q8 -> Q8_0,
+/// -ref2va -> REF2VA)
+pub fn quant_of(id: &str) -> &'static str {
+    match id.rsplit('-').next().unwrap_or("") {
+        "q6k" => "Q6_K",
+        "q4km" => "Q4_K_M",
+        "q8" => "Q8_0",
+        "ref2va" => "REF2VA",
+        _ => "INT8",
+    }
+}
+
+/// Whether the daemon has a model of that front-end name
+pub fn engine_known(name: &str) -> bool {
+    engine_pairs().iter().any(|(q, _)| q == name)
+}
+
 /// A front-end name -> the daemon's model id (an unknown name passes as it is)
 pub fn engine_id(name: &str) -> String {
-    ENGINES.get().and_then(|m| m.iter().find(|(q, _)| q == name)).map_or_else(|| name.to_string(), |(_, id)| id.clone())
+    engine_pairs().into_iter().find(|(q, _)| q == name).map_or_else(|| name.to_string(), |(_, id)| id)
 }
 
 /// A daemon's model id -> the front end's name
 pub fn engine_quant(id: &str) -> String {
-    ENGINES.get().and_then(|m| m.iter().find(|(_, i)| i == id)).map_or_else(|| id.to_string(), |(q, _)| q.clone())
+    engine_pairs().into_iter().find(|(_, i)| i == id).map_or_else(|| id.to_string(), |(q, _)| q)
 }
 
 impl Studio {
@@ -212,7 +251,7 @@ impl Studio {
             json!(b)
         };
         it.insert("first_frame".into(), ff);
-        for (k, max, what) in [("ref_images", 9, "ref_image"), ("ref_audios", 3, "ref_audio")] {
+        for (k, max, what) in [("ref_images", 9, "ref_image"), ("ref_videos", 3, "ref_video"), ("ref_audios", 3, "ref_audio")] {
             let list: Vec<String> = p.get(k).and_then(|v| v.as_array()).map(|a| a.iter().take(max).filter_map(|x| x.as_str()).map(basename).collect()).unwrap_or_default();
             for f in &list {
                 if !self.out.join(f).exists() {
@@ -221,8 +260,16 @@ impl Studio {
             }
             it.insert(k.into(), if list.is_empty() { Value::Null } else { json!(list) });
         }
-        if it["ref_images"].is_array() {
-            return Err(RpcError::param("reference images need the text encoder's vision tower, which the 32B checkpoint in use lacks; use first_frame for identity"));
+        // pictures and clips as references: the Ref2VA denoiser, the one trained for them
+        if it["ref_images"].is_array() || it["ref_videos"].is_array() {
+            let _ = self.engines(); // the daemon's list (a model added since the studio started)
+            if !engine_known("REF2VA") {
+                return Err(RpcError::param("reference pictures and clips need the Ref2VA denoiser (nextsycl models pull minimax-h3-ref2va, then add it to NS_VIDEO_ENGINES)"));
+            }
+            it.insert("engine".into(), json!("REF2VA"));
+        }
+        for k in ["ref_video_sound", "te_pictures"] {
+            it.insert(k.into(), p.get(k).filter(|v| v.is_boolean()).cloned().unwrap_or(Value::Null));
         }
         let ris = p.get("ref_image_size").and_then(|v| v.as_str()).filter(|v| *v == "match" || *v == "max");
         it.insert("ref_image_size".into(), ris.map_or(Value::Null, |v| json!(v)));

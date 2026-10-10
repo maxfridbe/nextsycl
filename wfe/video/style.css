@@ -230,3 +230,7 @@ table.pick.heat th.rh .dim{color:#9ca3af;font-weight:400;font-size:12px}
 .picksum .i{color:#22c55e}.picksum.bad .i{color:#ef4444}
 .picksum .vbar{display:inline-block;width:160px;height:6px;background:#1f232c;border-radius:3px;margin:0 6px;overflow:hidden}
 .picksum .vbar span{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#22c55e)}
+/* references: their tags (click: into the prompt) and file names */
+.refs{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.refs .ref{background:#181b22;border:1px solid #2a2f3a;border-radius:6px;padding:3px 8px;font-size:12px}
+label.tbtn{cursor:pointer;display:inline-flex;align-items:center}

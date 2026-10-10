@@ -305,6 +305,23 @@ impl Studio {
         std::fs::read(self.out.join(format!("{name}.json"))).ok().and_then(|b| serde_json::from_slice(&b).ok())
     }
 
+    /// A reference file into the output directory as `ref_<seconds>_<name>`: pictures, clips and sounds only
+    fn upload(&self, name: &str, body: &[u8]) -> Result<String, String> {
+        const KINDS: [&str; 13] = ["png", "jpg", "jpeg", "webp", "mp4", "mov", "webm", "mkv", "wav", "mp3", "flac", "m4a", "ogg"];
+        let clean: String = name.rsplit('/').next().unwrap_or("").chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+        let ext = clean.rsplit('.').next().unwrap_or("").to_lowercase();
+        if !clean.contains('.') || !KINDS.contains(&ext.as_str()) {
+            return Err(format!("{name}: a picture, clip or sound ({})", KINDS.join(", ")));
+        }
+        if body.is_empty() {
+            return Err("an empty file".into());
+        }
+        let stem: String = clean.chars().take(60).collect();
+        let out = format!("ref_{}_{stem}", now() as u64);
+        std::fs::write(self.out.join(&out), body).map_err(|e| format!("{out}: {e}"))?;
+        Ok(out)
+    }
+
     fn route(&self, stream: &TcpStream, req: http::Request) -> http::Result<()> {
         let path = req.path.clone();
         let query = req.target.split_once('?').map(|q| q.1.to_string()).unwrap_or_default();
@@ -331,6 +348,13 @@ impl Studio {
                 return match r {
                     Ok(v) => http::respond(stream, 200, &json!({"ok": true, "result": v})),
                     Err(e) => http::respond(stream, e.http, &json!({"ok": false, "error": {"code": e.code, "message": e.message}})),
+                };
+            }
+            if path == "/api/upload" {
+                // a reference picture, clip or sound, saved beside the clips (references are named by file there)
+                return match self.upload(&qv("name"), &req.body) {
+                    Ok(name) => http::respond(stream, 200, &json!({"ok": true, "name": name})),
+                    Err(e) => http::respond(stream, 400, &json!({"ok": false, "error": e})),
                 };
             }
             let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));

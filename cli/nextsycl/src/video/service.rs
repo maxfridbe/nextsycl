@@ -282,15 +282,7 @@ pub fn engine_names(cfg: &Config) -> Vec<(String, String)> {
             ids.push(m["id"].as_str().unwrap_or("").to_string());
         }
     }
-    ids.into_iter().map(|id| {
-        let q = match id.rsplit('-').next().unwrap_or("") {
-            "q6k" => "Q6_K",
-            "q4km" => "Q4_K_M",
-            "q8" => "Q8_0",
-            _ => "INT8",
-        };
-        (q.to_string(), id)
-    }).collect()
+    ids.into_iter().map(|id| (nextsycl_serve::video::studio::queue::quant_of(&id).to_string(), id)).collect()
 }
 
 /// `nextsycl video serve [--bind ADDR] [--port N]`: the studio, as a host process of its own (setsid: it outlives

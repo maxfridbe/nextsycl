@@ -163,8 +163,15 @@ impl Studio {
         if let Some(ls) = item["loras"].as_array().filter(|a| !a.is_empty()) {
             spec["lora"] = json!(ls.iter().filter_map(|l| l.as_str()).collect::<Vec<_>>().join(","));
         }
-        if let Some(r) = item["ref_audios"].as_array() {
-            spec["ref_audio"] = json!(r.iter().filter_map(|x| x.as_str()).map(|f| format!("{}/{f}", self.out_in)).collect::<Vec<_>>().join(","));
+        for (k, key) in [("ref_audios", "ref_audio"), ("ref_images", "ref_images"), ("ref_videos", "ref_videos")] {
+            if let Some(r) = item[k].as_array() {
+                spec[key] = json!(r.iter().filter_map(|x| x.as_str()).map(|f| format!("{}/{f}", self.out_in)).collect::<Vec<_>>().join(","));
+            }
+        }
+        for k in ["ref_image_size", "ref_video_sound", "te_pictures"] {
+            if !item[k].is_null() {
+                spec[k] = item[k].clone();
+            }
         }
         (spec, resolved)
     }

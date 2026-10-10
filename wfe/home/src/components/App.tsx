@@ -162,7 +162,10 @@ export function App() {
   return (
     <div id="app">
       <div class="top">
-        <h1><span class="i" props={{ innerHTML: "&#xf108;" }} /> nextsycl on {location.hostname}</h1>
+        <h1 class="brand">
+          <img attrs={{ src: "/static/logo.svg", alt: "nextsycl" }} />
+          <span class="host">on {location.hostname}</span>
+        </h1>
         {h
           ? <div class="pill">
               <span>RAM <b>{gib(h.mem_total_mb - h.mem_avail_mb)}</b> / {gib(h.mem_total_mb)} GiB</span>

@@ -41,3 +41,6 @@
   body{padding:12px} .cards{grid-template-columns:1fr}
   .svc{grid-template-columns:18px 1fr} .svc .state,.svc .acts{grid-column:1 / -1} .svc .acts{justify-content:flex-start}
  }
+ .brand{display:flex;align-items:center;gap:14px;flex-wrap:wrap} .brand img{height:76px;width:auto;margin:-8px 0 -8px -14px}
+ .brand .host{font-size:15px;font-weight:500;color:#94a3b8}
+ @media (max-width:640px){ .brand img{height:60px} }

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 160" width="520" height="160">
+  <defs>
+    <linearGradient id="opt4-gradN" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ec4899"/>
+      <stop offset="50%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+  </defs>
+  <!-- a dark card behind it: the white lettering reads on light pages too (the README) -->
+  <rect x="0" y="0" width="520" height="160" rx="18" fill="#0b1020"/>
+
+  <!-- Left Icon: Aperture / Swiss Gear composed of 4 folding dynamic blades -->
+  <g transform="translate(24, 15)">
+    <!-- Outer precision calibration tick ring -->
+    <circle cx="65" cy="65" r="56" fill="none" stroke="#1e293b" stroke-width="2" stroke-dasharray="4 6"/>
+    <!-- 4 Curved overlapping blades representing the 4 runtime facets -->
+    <!-- Blade 1: Video (top left arc) -->
+    <path d="M 65 15 C 95 15 115 35 115 65 L 90 65 C 90 48 80 40 65 40 Z" fill="#ec4899"/>
+    <!-- Blade 2: Chat (top right arc) -->
+    <path d="M 115 65 C 115 95 95 115 65 115 L 65 90 C 80 90 90 80 90 65 Z" fill="#06b6d4"/>
+    <!-- Blade 3: Image (bottom right arc) -->
+    <path d="M 65 115 C 35 115 15 95 15 65 L 40 65 C 40 80 50 90 65 90 Z" fill="#f59e0b"/>
+    <!-- Blade 4: Music (bottom left arc) -->
+    <path d="M 15 65 C 15 35 35 15 65 15 L 65 40 C 50 40 40 50 40 65 Z" fill="#8b5cf6"/>
+    <!-- Center hub: 'N' Monogram core in the aperture center -->
+    <circle cx="65" cy="65" r="22" fill="#020617" stroke="#2dd4bf" stroke-width="2.5"/>
+    <!-- Stylized N in center -->
+    <path d="M 57 74 L 57 56 L 62 56 L 70 69 L 70 56 L 74 56 L 74 74 L 69 74 L 61 61 L 61 74 Z" fill="#ffffff"/>
+    <!-- Swiss red locator dot -->
+    <circle cx="65" cy="18" r="3" fill="#ef4444"/>
+  </g>
+
+  <!-- Typography: NEXT SYCL -->
+  <g transform="translate(170, 42)">
+    <text x="0" y="44" font-family="'Inter', sans-serif" font-size="46" font-weight="900" fill="#ffffff" letter-spacing="-1">NEXT</text>
+    <text x="138" y="44" font-family="'JetBrains Mono', monospace" font-size="46" font-weight="700" fill="url(#opt4-gradN)" letter-spacing="0">SYCL</text>
+    <text x="2" y="68" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="500" fill="#94a3b8" letter-spacing="3">THE SWISS-ARMY COMPUTE ENGINE</text>
+    <!-- Tool pills -->
+    <g transform="translate(2, 82)">
+      <text x="0" y="10" font-family="'Inter', sans-serif" font-size="10" font-weight="600" fill="#cbd5e1"><tspan fill="#ec4899">V</tspan>IDEO • <tspan fill="#06b6d4">C</tspan>HAT • <tspan fill="#f59e0b">I</tspan>MAGE • <tspan fill="#8b5cf6">M</tspan>USIC</text>
+    </g>
+  </g>
+</svg>

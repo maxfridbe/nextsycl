@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo-card.svg" alt="nextsycl - the swiss-army compute engine: video, chat, image, music" width="520"></p>
+
 We stand on the shoulders of giants.
 
 # nextsycl
