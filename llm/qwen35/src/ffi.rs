@@ -112,6 +112,8 @@ pub struct Silo {
     pub attn_decode_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
     pub attn_decode_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64,
     pub attn_decode: unsafe extern "C" fn(G, *const f32, i64, P, P, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
+    pub dequant_f16_supported: unsafe extern "C" fn(c_int) -> c_int,
+    pub dequant_f16: unsafe extern "C" fn(G, c_int, P, i64, *mut u16) -> c_int,
 }
 
 /// The silo (None: the shared kernels for everything)
@@ -141,6 +143,8 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             attn_decode_supported: sym!("ns_q35_attn_decode_supported"),
             attn_decode_scratch: sym!("ns_q35_attn_decode_scratch"),
             attn_decode: sym!("ns_q35_attn_decode"),
+            dequant_f16_supported: sym!("ns_q35_dequant_f16_supported"),
+            dequant_f16: sym!("ns_q35_dequant_f16"),
         }))
     })
     .as_ref()

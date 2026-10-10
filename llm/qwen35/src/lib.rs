@@ -19,7 +19,7 @@ use nextsycl_llm::{Checkpoint, CheckpointState, Decoder, DecoderState, Engine, E
 pub const ARCH: &str = "qwen35";
 
 pub const OPTIONS: &[EngineOption] = &[
-    EngineOption { name: "chunk", env: "NS_Q35_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 512)", at: At::Load },
+    EngineOption { name: "chunk", env: "NS_Q35_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 2048 when it fits beside the weights and a session, else 1024 or 512)", at: At::Load },
 ];
 
 pub fn kind() -> EngineKind {

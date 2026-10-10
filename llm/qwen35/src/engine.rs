@@ -234,9 +234,19 @@ pub struct Qwen35<'g> {
     load_bytes: u64,
 }
 
-fn chunk_size() -> usize {
-    std::env::var("NS_Q35_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|v| *v >= 16).unwrap_or(512)
+/// NS_Q35_CHUNK when set; otherwise chosen at load (`Qwen35::load`: 2,048 rows when they fit)
+fn chunk_setting() -> Option<usize> {
+    std::env::var("NS_Q35_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|v| *v >= 16)
 }
+
+/// A prompt chunk's work memory (the arena) for `chunk` rows
+fn arena_bytes(g: &Geometry, chunk: usize) -> usize {
+    chunk * (4 * g.n_embd + 2 * g.n_ff + g.conv_dim() + g.inner + 4 * g.v_heads * g.state + g.heads * 2 * g.head + 3 * g.heads * g.head) * 4
+        + chunk * g.n_ff.max(g.conv_dim()) * 2 + 8 * g.vocab * 4 + (64 << 20)
+}
+
+/// Room kept for a session when the chunk is chosen (a 32K context's cache on the 27B is 2 GiB)
+const SESSION_ROOM: u64 = 5 << 29;
 
 impl<'g> Qwen35<'g> {
     pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], log: &mut dyn FnMut(String)) -> Result<Qwen35<'g>> {
@@ -256,13 +266,17 @@ impl<'g> Qwen35<'g> {
         // no out-of-memory error: past the card it spills to host memory)
         let embd = f.tensor("token_embd.weight").ok_or_else(|| e("no token_embd.weight"))?.clone();
         let weights: u64 = f.tensors.iter().filter(|t| t.name != "token_embd.weight" && !t.name.starts_with(&format!("blk.{}.", g.layers))).map(|t| t.bytes).sum();
-        let chunk = chunk_size();
         let w16_bytes = [g.n_ff * g.n_embd, g.heads * 2 * g.head * g.n_embd, g.conv_dim() * g.n_embd].into_iter().max().unwrap_or(0) * 2;
-        let arena_bytes = chunk * (4 * g.n_embd + 2 * g.n_ff + g.conv_dim() + g.inner + 4 * g.v_heads * g.state + g.heads * 2 * g.head + 3 * g.heads * g.head) * 4
-            + chunk * g.n_ff.max(g.conv_dim()) * 2 + 8 * g.vocab * 4 + (64 << 20);
         let (total, free) = gpu.memory()?;
         let free = free.unwrap_or(total);
-        let need = weights + w16_bytes as u64 + arena_bytes as u64 + (1536 << 20);
+        // the prompt chunk: 2,048 rows (each matrix expanded to half once for them: 8K prompts 760 -> 1,100 tok/s against
+        // 512) when they leave room for a session, else 1,024, else 512
+        let fixed = weights + w16_bytes as u64 + (1536 << 20);
+        let chunk = chunk_setting().unwrap_or_else(|| {
+            [2048, 1024].into_iter().find(|c| fixed + arena_bytes(&g, *c) as u64 + SESSION_ROOM <= free).unwrap_or(512)
+        });
+        let arena_bytes = arena_bytes(&g, chunk);
+        let need = fixed + arena_bytes as u64;
         if need > free {
             return Err(e(format!("{} needs about {:.1} GiB on {} ({:.1} GiB of weights); {:.1} GiB are free", f.architecture(),
                                  need as f64 / (1u64 << 30) as f64, gpu.name, weights as f64 / (1u64 << 30) as f64, free as f64 / (1u64 << 30) as f64)));
@@ -312,7 +326,7 @@ impl<'g> Qwen35<'g> {
         let w16 = DevBuf::new(&gpu, w16_bytes)?;
         let arena = Arena::new(&gpu, arena_bytes)?;
         let load_s = t0.elapsed().as_secs_f64();
-        log(format!("qwen35: {} layers of {} ({} full attention), {:.1} GiB on {} in {load_s:.0} s", g.layers, g.n_embd,
+        log(format!("qwen35: {} layers of {} ({} full attention), {:.1} GiB on {} in {load_s:.0} s; prompt chunks of {chunk}", g.layers, g.n_embd,
                     (0..g.layers).filter(|l| g.full(*l)).count(), loaded as f64 / (1u64 << 30) as f64, gpu.name));
         let probe = Probe::new(gpu.raw())?;
         Ok(Qwen35 { g, file: f, gpu, k, silo, layers, output_norm, output, embd, chunk, arena, w16, work: Mutex::new(()), probe, load_s, load_bytes: loaded })
@@ -395,9 +409,15 @@ impl<'g> Qwen35<'g> {
         if elems * 2 > self.w16.len {
             return Err(e(format!("a {rows}x{cols} matrix past the half buffer")));
         }
-        // SAFETY: the matrix's blocks -> rows x cols halfs in w16 (non-zero: a type it does not expand directly)
-        let rc = self.op_rc("dequant f16", key, wb + 2 * elems, 0,
-                            || unsafe { (k.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems as i64, self.w16.ptr().cast()) })?;
+        // SAFETY: the matrix's blocks -> rows x cols halfs in w16 (non-zero: a type it does not expand directly) - the
+        // silo's expansion for the types it covers
+        let rc = match self.silo {
+            Some(s) if unsafe { (s.dequant_f16_supported)(w.ty.code() as i32) } != 0 => self.op_rc("dequant f16 silo", key, wb + 2 * elems, 0, || unsafe {
+                (s.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems as i64, self.w16.ptr().cast())
+            })?,
+            _ => self.op_rc("dequant f16", key, wb + 2 * elems, 0,
+                            || unsafe { (k.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems as i64, self.w16.ptr().cast()) })?,
+        };
         if rc != 0 {
             let f = self.arena.f32(elems)?;
             // SAFETY: the blocks -> float32, then -> half.

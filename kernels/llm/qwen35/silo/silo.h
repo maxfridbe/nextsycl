@@ -30,6 +30,10 @@ int ns_q35_attn_decode_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t D);
 int64_t ns_q35_attn_decode_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0);
 int ns_q35_attn_decode(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
                        int64_t cap, int64_t p0, float* out, float* scratch);
+/* Weights to half for a prompt pass's GEMMs (dequant.cpp; the shared one is ns_dequant_f16): n values (a multiple of
+ * 256) of a stored matrix into dst. Covers Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ3_S, IQ4_XS */
+int ns_q35_dequant_f16_supported(int type);
+int ns_q35_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
 
 #ifdef __cplusplus
 }

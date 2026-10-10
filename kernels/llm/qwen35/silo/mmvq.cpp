@@ -16,6 +16,7 @@
 #include "ns.h"
 #include "ns_internal.hpp"
 #include "silo.h"
+#include "common.hpp"
 
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
@@ -29,6 +30,7 @@
 #include "ggml-common.h"
 
 namespace {
+using namespace q35silo;
 constexpr int QK = 256, Q8K = 32, WARPS = 4, WARP = 32;
 
 struct Q81Block { sycl::half2 ds; int8_t qs[32]; };
@@ -48,35 +50,7 @@ inline sycl::int4 ld_q8_16(const Q81Block* b, int half) {   // Q8_1 qs is 4-byte
     const int* q = reinterpret_cast<const int*>(b->qs) + 4 * half;
     return sycl::int4(q[0], q[1], q[2], q[3]);
 }
-// 16 bytes at a 2-byte aligned address from aligned 16-byte loads (Strata's load16_a2): the second chunk only when
-// the address is unaligned, so it never reads past an allocation's last chunk
-inline sycl::int4 load16_a2(const void* p) {
-    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
-    const sycl::int4* q = reinterpret_cast<const sycl::int4*>(a & ~uintptr_t(15));
-    const int k = int(a >> 2) & 3;
-    const bool half = (a & 2) != 0;
-    const sycl::int4 lo = q[0], hi = (a & 15) ? q[1] : lo;
-    const uint32_t d[8] = {(uint32_t) lo.x(), (uint32_t) lo.y(), (uint32_t) lo.z(), (uint32_t) lo.w(),
-                           (uint32_t) hi.x(), (uint32_t) hi.y(), (uint32_t) hi.z(), (uint32_t) hi.w()};
-    uint32_t w[5];
-#pragma unroll
-    for (int i = 0; i < 5; ++i) w[i] = k == 0 ? d[i] : k == 1 ? d[i + 1] : k == 2 ? d[i + 2] : d[(i + 3) & 7];
-    uint32_t o[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) o[i] = half ? (w[i] >> 16) | (w[i + 1] << 16) : w[i];
-    return sycl::int4((int) o[0], (int) o[1], (int) o[2], (int) o[3]);
-}
-
 // ---- Q4_K / Q5_K: lane g = sub-block pair 2 (g >> 1), half g & 1 - 32 quants of two sub-blocks
-// get_scale_min_k4 from the 12 scale bytes held in three words
-inline int k4_byte(const uint32_t sc[3], int i) { return int((sc[i >> 2] >> (8 * (i & 3))) & 0xff); }
-inline void k4_scale_min(const uint32_t sc[3], int j, float& s, float& m) {
-    if (j < 4) { s = (float) (k4_byte(sc, j) & 63); m = (float) (k4_byte(sc, j + 4) & 63); }
-    else {
-        s = (float) ((k4_byte(sc, j + 4) & 0xF) | ((k4_byte(sc, j - 4) >> 6) << 4));
-        m = (float) ((k4_byte(sc, j + 4) >> 4) | ((k4_byte(sc, j) >> 6) << 4));
-    }
-}
 // a Q4_K / Q5_K block's first 16 bytes (16-byte aligned: 144 and 176 are multiples of 16): dm, then the scales
 inline void k4_head(const void* b, int sb, float& dl, float& ml, float& dh, float& mh) {
     const sycl::int4 hd = *reinterpret_cast<const sycl::int4*>(b);

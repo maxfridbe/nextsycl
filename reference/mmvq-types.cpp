@@ -8,6 +8,8 @@
 // device copy's bandwidth, oneMKL's half GEMM at a prompt chunk's shapes).
 #include "ns.h"
 #include <chrono>
+#include <cmath>
+#include <sycl/sycl.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -18,6 +20,10 @@ int ns_mmvq_supported(int type);
 int ns_quantize_q8_1(ns_gpu* g, const float* x, void* q8_1, int64_t n_in, int64_t ncols);
 int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 int ns_q35_mmvq_supported(int type, int64_t n_in);
+int ns_q35_dequant_f16_supported(int type);
+int ns_q35_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
+int ns_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
+int ns_dequant(ns_gpu* g, int type, const void* src, size_t n, float* dst);
 int ns_gemm_f16(ns_gpu* g, int64_t T, int64_t N, int64_t K, const uint16_t* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int acc);
 int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 }
@@ -44,6 +50,54 @@ int main(int argc, char** argv) {
     }
     void* q; ns_alloc(g, ns_q8_1_bytes(17408, 8), &q);
     float* y; ns_alloc(g, 17408 * 8 * 4, (void**) &y);
+    if (mode.find("deq") != std::string::npos) {   // the silo's weight expansion to half against the shared ones, and its speed
+        const int64_t n = 17408 * 5120;
+        const T tt[] = {{8, "Q8_0", 32, 34}, {11, "Q3_K", 256, 110}, {12, "Q4_K", 256, 144}, {13, "Q5_K", 256, 176}, {14, "Q6_K", 256, 210},
+                        {20, "IQ4_NL", 32, 18}, {21, "IQ3_S", 256, 110}, {23, "IQ4_XS", 256, 136}};
+        for (const T& t : tt) {
+            const size_t wb = (size_t) n / t.elems * t.bytes;
+            std::vector<unsigned char> h(wb);
+            unsigned long long r = 0x9e3779b97f4a7c15ull;
+            for (auto& b : h) { r ^= r << 13; r ^= r >> 7; r ^= r << 17; b = (unsigned char) (r & 0x3f); }   // small halves: no inf / nan
+            void* w; ns_alloc(g, wb, &w);
+            ns_copy_to(g, w, h.data(), wb);
+            uint16_t *a, *b; ns_alloc(g, n * 2, (void**) &a); ns_alloc(g, n * 2, (void**) &b);
+            float* f; ns_alloc(g, n * 4, (void**) &f);
+            ns_sync(g);
+            const bool via32 = t.id == 8 || (t.id >= 11 && t.id <= 14);
+            int rc = via32 ? ns_dequant(g, t.id, w, n, f) : ns_dequant_f16(g, t.id, w, n, b);
+            if (rc) { printf("%-8s reference: %s\n", t.name, ns_last_error()); continue; }
+            if (ns_q35_dequant_f16(g, t.id, w, n, a)) { printf("%-8s silo: %s\n", t.name, ns_last_error()); continue; }
+            std::vector<uint16_t> ha(n), hb(n);
+            std::vector<float> hf(via32 ? n : 0);
+            ns_copy_from(g, ha.data(), a, n * 2);
+            if (via32) ns_copy_from(g, hf.data(), f, n * 4); else ns_copy_from(g, hb.data(), b, n * 2);
+            ns_sync(g);
+            auto h2f = [](uint16_t v) { return (float) sycl::bit_cast<sycl::half>(v); };
+            int64_t bad = 0, first = -1;
+            for (int64_t i = 0; i < n; ++i) {
+                const float x = h2f(ha[i]), y = via32 ? (float) (sycl::half) hf[i] : h2f(hb[i]);
+                if (!(std::fabs(x - y) <= 1e-3f * std::fmax(1.0f, std::fabs(y)))) { if (first < 0) first = i; ++bad; }
+            }
+            for (int i = 0; i < 3; ++i) ns_q35_dequant_f16(g, t.id, w, n, a);
+            ns_sync(g);
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 10; ++i) ns_q35_dequant_f16(g, t.id, w, n, a);
+            ns_sync(g);
+            const double s1 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 10;
+            double s0 = 0;
+            if (!via32 || t.id != 14) {
+                t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < 10; ++i) ns_dequant_f16(g, t.id, w, n, b);
+                ns_sync(g);
+                s0 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 10;
+            }
+            printf("%-8s %lld of %lld differ (first %lld)  silo %.0f GB/s  shared f16 %.0f GB/s\n", t.name, (long long) bad, (long long) n, (long long) first,
+                   (wb + n * 2) / s1 / 1e9, s0 > 0 ? (wb + n * 2) / s0 / 1e9 : 0.0);
+            ns_free(g, w); ns_free(g, a); ns_free(g, b); ns_free(g, f);
+        }
+        return 0;
+    }
     if (mode.find("peaks") != std::string::npos) {   // the card's practical ceilings: a device copy, oneMKL's half GEMM
         const size_t n = size_t(1) << 30;
         void *a, *b; ns_alloc(g, n, &a); ns_alloc(g, n, &b);
