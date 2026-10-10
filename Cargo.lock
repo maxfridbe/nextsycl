@@ -237,6 +237,7 @@ dependencies = [
  "nextsycl-audio",
  "nextsycl-audio-example",
  "nextsycl-audio-minimaxmusic3",
+ "nextsycl-audio-qwen3tts",
  "nextsycl-core",
  "nextsycl-gguf",
  "nextsycl-image",
@@ -282,6 +283,19 @@ dependencies = [
  "nextsycl-qwen3vl",
  "nextsycl-tok",
  "serde_json",
+]
+
+[[package]]
+name = "nextsycl-audio-qwen3tts"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-audio",
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-tok",
+ "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]
