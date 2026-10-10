@@ -3,7 +3,7 @@ import { jsx } from "../jsx.js";
 import { copy, ui } from "../main.js";
 import type { Operation } from "../types.js";
 
-const KIND_TITLE: Record<string, string> = { system: "System", llm: "Chat", image: "Images", audio: "Music", video: "Video", openai: "OpenAI-compatible" };
+const KIND_TITLE: Record<string, string> = { system: "System", llm: "Chat", image: "Images", audio: "Audio", video: "Video", openai: "OpenAI-compatible" };
 
 function curlOf(path: string, method: string, op: Operation, base: string, token: string): string {
   if (op["x-curl"]) return op["x-curl"];

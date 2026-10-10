@@ -6,7 +6,7 @@ import type { SettingRow } from "../types.js";
 
 const READER: Record<string, string> = {
   serve: "this page", switch: "the model switch", studio: "the video studio", video: "the video daemon", llm: "the chat server",
-  image: "the image server", audio: "the music server", cli: "the command line (next run)",
+  image: "the image server", audio: "the audio server", cli: "the command line (next run)",
 };
 
 function Row(s: SettingRow, extra = false) {

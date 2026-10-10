@@ -3,7 +3,7 @@
 //! one added at the end, a removed one dropped), a copy of the file before each save (`nextsycl.conf.bak-<time>`,
 //! the last 10 kept). The environment wins over the file (a service's `Environment=`): such a setting shows as set
 //! there. What reads a changed setting has to restart to see it: `restart` does that for this page, the switcher,
-//! the studio, the video daemon and the image and music servers.
+//! the studio, the video daemon and the image and audio servers.
 
 use serde_json::{json, Map, Value};
 
@@ -37,7 +37,7 @@ pub const SETTINGS: &[Setting] = &[
     st("NS_IDLE_MINUTES", "front door", "10", "an enabled model unloads after this long without a request (0: never)", &["serve", "switch"]),
     st("NS_SWITCH_PORT", "front door", "8001", "the model switcher's port (Open WebUI's endpoint)", &["serve"]),
     st("NS_IMAGE_PORT", "front door", "8086", "the image server's port", &["serve"]),
-    st("NS_AUDIO_PORT", "front door", "8087", "the music server's port", &["serve"]),
+    st("NS_AUDIO_PORT", "front door", "8087", "the audio server's port", &["serve"]),
     st("NS_CHAT_UI_PORT", "front door", "8080", "Open WebUI's port (a link)", &["serve"]),
     st("NS_HOST", "chat", "127.0.0.1", "the chat server's address (0.0.0.0: the network)", &["llm"]),
     st("NS_PORT", "chat", "8085", "the chat server's port", &["llm", "serve", "switch"]),
@@ -57,7 +57,7 @@ pub const SETTINGS: &[Setting] = &[
     st("NS_VRAM_GUARD_GIB", "chat", "", "VRAM the chat server leaves free", &["llm"]),
     st("NS_STUDIO_MODES", "chat", "", "the studio's chat modes file, kept in step with the registry", &["cli", "serve"]),
     st("NS_IMAGE_OUT", "images", "~/.local/share/nextsycl/images", "where pictures are saved", &["image"]),
-    st("NS_AUDIO_OUT", "music", "~/.local/share/nextsycl/audio", "where songs are saved", &["audio"]),
+    st("NS_AUDIO_OUT", "audio", "~/.local/share/nextsycl/audio", "where songs, speech and saved voices are kept", &["audio"]),
     st("NS_VIDEO_MODEL", "video", "", "the video daemon's default model (serve: the enabled video models decide)", &["video"]),
     st("NS_VIDEO_ENGINES", "video", "", "the video daemon's other models (serve: the enabled video models decide)", &["video"]),
     st("NS_VIDEO_GPUS", "video", "", "the video daemon's GPUs (serve: the enabled video models' GPUs)", &["video"]),
@@ -82,7 +82,7 @@ pub const PREFIXES: &[(&str, &str, &[&str])] = &[
     ("NS_QW_", "the qwen4exp chat engine's settings (docs/engines.md)", &["llm"]),
     ("NS_QI_", "the Qwen-Image engine's settings", &["image"]),
     ("NS_MM3_", "the MiniMax Music engine's settings", &["audio"]),
-    ("NSD_", "the diffusion kernels' settings (image, music, video)", &["image", "audio", "video"]),
+    ("NSD_", "the diffusion kernels' settings (image, audio, video)", &["image", "audio", "video"]),
     ("H3_", "the H3 engine's settings", &["video"]),
 ];
 

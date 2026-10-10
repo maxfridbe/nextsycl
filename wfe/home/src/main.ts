@@ -101,7 +101,9 @@ export async function act(what: string, model: string, extra: Record<string, unk
       ui.error = j.error ?? `HTTP ${r.status}`;
       delete ui.pending[model];
     }
-    if (what === "enable" || what === "disable") void loadSpec();
+    // a change of cards is done when answered (an unload it needed was made before)
+    if (r.ok && what === "gpus") delete ui.pending[model];
+    if (what === "enable" || what === "disable" || what === "gpus") void loadSpec();
   } catch (e) {
     ui.error = String(e);
     delete ui.pending[model];

@@ -223,6 +223,46 @@ impl Home {
         Ok(s(&m, "title"))
     }
 
+    /// The cards an enabled (or disabled) model may use, changed in place - more than fit is allowed (the card is
+    /// shown overbooked: the first model to load holds it). A loaded model whose card is taken away unloads (after
+    /// the requests it is answering): its next request loads it on the new cards.
+    pub(crate) fn set_gpus(self: &Arc<Self>, id: &str, gpus: Option<&Value>) -> Result<Value, (u16, String)> {
+        let m = self.entry(id)?;
+        let n = self.ncards();
+        let g: Vec<usize> = gpus.and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(|g| g as usize).collect()).unwrap_or_default();
+        if g.is_empty() || g.iter().any(|x| *x >= n) {
+            return Err((400, format!("gpus {g:?}: one or more of 0..{}", n - 1)));
+        }
+        let kind = registry::kind_of(&m).to_string();
+        if matches!(kind.as_str(), "image" | "audio") && g.len() > 1 {
+            return Err((400, format!("{id} runs on one card")));
+        }
+        let old = self.gpus_of(&m);
+        let mut g = g;
+        g.sort();
+        g.dedup();
+        if old == g {
+            return Ok(json!({"model": id, "gpus": g, "changed": false}));
+        }
+        // a loaded model leaves the cards it was on (it reloads on the new ones at its next request)
+        let state = self.model_states(std::slice::from_ref(&m), &json!([])).first().map(|x| s(x, "state")).unwrap_or_default();
+        if m["enabled"] != false && matches!(state.as_str(), "loaded" | "busy" | "loading") && kind != "video" {
+            self.unload(id)?;
+        }
+        registry::update(&self.o.cfg, id, |e| e["gpus"] = json!(g.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","))).map_err(|e| (500, e))?;
+        if kind == "video" && m["enabled"] != false {
+            let me = self.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = me.video_apply(false) {
+                    let (rid, log) = me.new_run("video: apply the enabled models' cards".into());
+                    let _ = std::fs::write(log, e);
+                    me.finish(rid, 1);
+                }
+            });
+        }
+        Ok(json!({"model": id, "gpus": g, "changed": true, "was": old}))
+    }
+
     /// Disable `id`: unloaded first (after the requests it is answering); a video model while a clip renders only
     /// with `force` (the clip stops at its next step)
     pub(crate) fn disable(self: &Arc<Self>, id: &str, force: bool) -> Result<(), (u16, String)> {

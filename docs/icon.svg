@@ -11,7 +11,7 @@
     <path d="M 115 65 C 115 95 95 115 65 115 L 65 90 C 80 90 90 80 90 65 Z" fill="#06b6d4"/>
     <!-- Blade 3: Image (bottom right arc) -->
     <path d="M 65 115 C 35 115 15 95 15 65 L 40 65 C 40 80 50 90 65 90 Z" fill="#f59e0b"/>
-    <!-- Blade 4: Music (bottom left arc) -->
+    <!-- Blade 4: Audio (bottom left arc) -->
     <path d="M 15 65 C 15 35 35 15 65 15 L 65 40 C 50 40 40 50 40 65 Z" fill="#8b5cf6"/>
     <!-- Center hub: 'N' Monogram core in the aperture center -->
     <circle cx="65" cy="65" r="22" fill="#020617" stroke="#2dd4bf" stroke-width="2.5"/>

@@ -16,7 +16,7 @@ const color = (k?: string) => COLORS[k ?? ""] ?? "#64748b";
 const KINDS: { kind: Model["kind"]; title: string; icon: string }[] = [
   { kind: "llm", title: "Chat", icon: "&#xf086;" },
   { kind: "image", title: "Images", icon: "&#xf03e;" },
-  { kind: "audio", title: "Music", icon: "&#xf001;" },
+  { kind: "audio", title: "Audio", icon: "&#xf001;" },
   { kind: "video", title: "Video", icon: "&#xf03d;" },
 ];
 
@@ -77,17 +77,35 @@ const STATE_TEXT: Record<string, string> = {
 
 function GpuPicker(m: Model) {
   const cards = ui.state?.cards ?? [];
-  const pick = (ui.pick[m.id] ??= [...m.gpus]);
+  // an enabled model's cards are its own (changed at once); a disabled one's are what enable will offer
+  const pick = m.enabled ? m.gpus : (ui.pick[m.id] ??= [...m.gpus]);
   const single = m.kind === "image" || m.kind === "audio";
+  const loaded = ["loaded", "busy", "loading"].includes(m.state);
   return (
-    <span class="gpus" attrs={{ title: single ? "the card it loads on" : "the cards it may use" }}>
+    <span class="gpus" attrs={{ title: (single ? "the card it loads on" : "the cards it may use")
+      + (m.enabled ? " - click to change (more than fit is allowed; a loaded model moved off its card unloads)" : "") }}>
       {cards.map((c) => (
         <label class={{ gpu: true, on: pick.includes(c.index) }}>
-          <input attrs={{ type: single ? "radio" : "checkbox", name: `g-${m.id}`, checked: pick.includes(c.index), disabled: m.enabled }}
+          <input attrs={{ type: single ? "radio" : "checkbox", name: `g-${m.id}`, disabled: !!ui.pending[m.id] }} props={{ checked: pick.includes(c.index) }}
             on={{ change: (e: Event) => {
               const on = (e.target as HTMLInputElement).checked;
-              ui.pick[m.id] = single ? [c.index] : on ? [...new Set([...pick, c.index])].sort() : pick.filter((g) => g !== c.index);
-              render();
+              const next = single ? [c.index] : on ? [...new Set([...pick, c.index])].sort() : pick.filter((g) => g !== c.index);
+              if (!next.length) {
+                (e.target as HTMLInputElement).checked = true;
+                ui.error = `${m.id}: a model needs at least one card (disable it instead)`;
+                render();
+                return;
+              }
+              if (!m.enabled) {
+                ui.pick[m.id] = next;
+                render();
+                return;
+              }
+              if (loaded && pick.some((g) => !next.includes(g)) && !window.confirm(`${m.id} is loaded on GPU ${pick.join(", ")}: it unloads now and loads on GPU ${next.join(", ")} at its next request.`)) {
+                render();
+                return;
+              }
+              void act("gpus", m.id, { gpus: next });
             } }} />
           {short(c.name).replace("Pro ", "")}
         </label>

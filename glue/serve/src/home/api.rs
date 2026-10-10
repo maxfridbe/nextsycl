@@ -38,6 +38,9 @@ pub const METHODS: &[Method] = &[
     Method { kind: "system", name: "enable", summary: "Offer a model on GPU(s): it loads on its first request and unloads when idle; chat models join Open WebUI's list",
              fields: &[MODEL, ("gpus", "integer[]", "the cards (default: as registered); several for a model that spans cards", false)],
              example: r#"{"model": "qwen-image-2.1-q8", "gpus": [0]}"# },
+    Method { kind: "system", name: "gpus", summary: "Change the cards a model may use (enabled or not); more than fit is allowed (the card shows overbooked). A loaded model moved off its card unloads: its next request loads it on the new cards",
+             fields: &[MODEL, ("gpus", "integer[]", "the cards: one for image and audio models, one or more for chat and video", true)],
+             example: r#"{"model": "qwen3.8-27b-q4", "gpus": [0, 1]}"# },
     Method { kind: "system", name: "disable", summary: "Withdraw a model: unloaded (after the requests it is answering), off Open WebUI's list and this spec",
              fields: &[MODEL, ("force", "boolean", "a video model while a clip renders: stop the clip at its next step", false)], example: r#"{"model": "qwen-image-2.1-q8"}"# },
     Method { kind: "system", name: "load", summary: "Load an enabled model now (otherwise its first request does)",
@@ -328,6 +331,7 @@ impl Home {
                 Ok(json!({"models": self.model_states(&all, &cards)}))
             }
             ("system", "enable") => self.enable(&model(), b.get("gpus")).map(|t| json!({"model": model(), "title": t, "enabled": true})),
+            ("system", "gpus") => self.set_gpus(&model(), b.get("gpus")),
             ("system", "disable") => self.disable(&model(), b["force"] == true).map(|_| json!({"model": model(), "enabled": false})),
             ("system", "load") if b["wait"] == true => self.load(&model()).map(|_| json!({"model": model(), "loaded": true})),
             ("system", "load") => self.load_async(&model()).map(|_| json!({"model": model(), "loading": true})),

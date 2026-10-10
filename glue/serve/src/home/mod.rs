@@ -5,7 +5,7 @@
 //!   enable it on GPU(s), start (load now: the button spins until it answers) and stop (unload), its page, its state;
 //!   an API tab with the bearer token and a curl for every method.
 //! - **Enabled models** load on their first request (an API call here, its page, Open WebUI through the switcher) and
-//!   unload after `idle_minutes` without one (the image and music servers exit, the switcher sets the chat mode to
+//!   unload after `idle_minutes` without one (the image and audio servers exit, the switcher sets the chat mode to
 //!   none, the video daemon's workers let their card go); they stay enabled. Disabled: unloaded, gone from Open WebUI's
 //!   list (the switcher lists enabled chat models) and from the API spec. The registry's `enabled` and `gpus` are the
 //!   state, so `nextsycl models enable|disable` and this page agree. Video: enabled models = the daemon's engines.
@@ -428,6 +428,7 @@ impl Home {
         match b["do"].as_str().unwrap_or("") {
             "enable" => self.enable(&model, b.get("gpus")).map(|m| json!({"model": m})),
             "disable" => self.disable(&model, b["force"] == true).map(|_| json!({"model": model, "enabled": false})),
+            "gpus" => self.set_gpus(&model, b.get("gpus")),
             "load" => {
                 self.load_async(&model)?;
                 Ok(json!({"model": model, "loading": true}))
@@ -435,7 +436,7 @@ impl Home {
             "unload" => self.unload(&model).map(|_| json!({"model": model, "loaded": false})),
             "config" => self.config_set(b),
             "restart" => self.restart(b["service"].as_str().unwrap_or("")),
-            other => Err((400, format!("no action {other:?} (enable, disable, load, unload, config, restart)"))),
+            other => Err((400, format!("no action {other:?} (enable, disable, gpus, load, unload, config, restart)"))),
         }
     }
 }
