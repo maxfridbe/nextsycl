@@ -4,6 +4,8 @@ We stand on the shoulders of giants.
 
 # nextsycl
 
+- **A curated Ollama for everything a local machine needs** - chat, images, video, music and speech
+- **Use our kernels for your engine** - every engine is a library, its kernels SYCL you can build on
 - **No CUDA, no PyTorch, no Vulkan** - SYCL only, optimized for Intel Arc
 - **No Python**
 - **No Node**
