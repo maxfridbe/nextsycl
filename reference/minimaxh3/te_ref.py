@@ -3,6 +3,7 @@
 ComfyUI's image-to-video presentation ("<Picture i>: " <vision block> ... <prompt>).
 
     python te_ref.py --te TE.gguf --visual VISUAL.safetensors --picture a.png [--picture b.png] --prompt "..." --out dump.safetensors
+                     [--embeddings DIR]   (`embedding:NAME` in the prompt)
 
 Pictures are taken at their own size (sides multiples of 32, so neither side resizes them). Runs where ComfyUI and
 ComfyUI-GGUF import - the H3 reference image: ComfyUI at /comfy, ComfyUI-GGUF at /pkgs/comfyui_gguf (or --comfy,
@@ -40,6 +41,7 @@ def main():
     ap.add_argument("--picture", action="append", default=[])
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--embeddings", default=None, help="the directory `embedding:NAME` in the prompt reads from")
     ap.add_argument("--comfy", default="/comfy")
     ap.add_argument("--pkgs", default="/pkgs")
     a = ap.parse_args()
@@ -78,7 +80,7 @@ def main():
 
     clip = comfy.sd.CLIP(no_init=True)
     clip.cond_stage_model = te
-    clip.tokenizer = mmte.MiniMaxH3Tokenizer()
+    clip.tokenizer = mmte.MiniMaxH3Tokenizer(embedding_directory=a.embeddings)
     dev = mm.get_torch_device()
     clip.patcher = comfy.model_patcher.ModelPatcher(te, load_device=dev, offload_device=torch.device("cpu"))
     clip.layer_idx = None

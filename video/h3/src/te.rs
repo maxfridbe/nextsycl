@@ -174,7 +174,9 @@ impl TextEncoder {
     /// The conditioning for `tokens`: [tokens, hidden] float32. `tick(layer)` before each layer. `vision`: the vision
     /// blocks among the tokens (their rows replace the placeholders' embeddings, their deepstack features are added
     /// after the first layers, and every token takes its M-RoPE position).
-    pub fn encode(&self, dev: &Arc<Device>, tokens: &[u32], vision: &[crate::vision::Seen], threads: usize, tick: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
+    /// `embeds`: rows [n, hidden] that replace the input of the tokens from their index (`embedding:NAME`).
+    pub fn encode(&self, dev: &Arc<Device>, tokens: &[u32], vision: &[crate::vision::Seen], embeds: &[(usize, Vec<f32>)], threads: usize,
+                  tick: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
         let l = tokens.len();
         let (c, hq, hkv, ffn) = (self.hidden, self.heads, self.kv_heads, self.ffn);
         let (wq, wkv) = (hq * HEAD_DIM, hkv * HEAD_DIM);
@@ -199,6 +201,12 @@ impl TextEncoder {
                 return Err(Error(format!("a vision block of {} values for {n} tokens of {c} at {} (of {l})", v.tokens.len(), v.at)));
             }
             x0[v.at * c..(v.at + n) * c].copy_from_slice(&v.tokens);
+        }
+        for (at, rows) in embeds {
+            if rows.len() % c != 0 || at * c + rows.len() > l * c {
+                return Err(Error(format!("an embedding of {} values at token {at} (of {l}, {c} wide)", rows.len())));
+            }
+            x0[at * c..at * c + rows.len()].copy_from_slice(rows);
         }
         // deepstack: per depth, the blocks' features at their rows (zero elsewhere), added after that layer
         let depths = vision.iter().map(|v| v.deep.len()).max().unwrap_or(0);

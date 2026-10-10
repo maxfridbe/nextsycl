@@ -711,6 +711,8 @@ pub struct TeFiles<'a> {
     pub te: &'a Path,
     pub tokenizer: &'a Path,
     pub visual: Option<&'a Path>,
+    /// where `embedding:NAME` finds its rows (the effect embeddings)
+    pub embeddings: Option<&'a Path>,
 }
 
 /// A prompt -> the denoiser's text conditioning: the tokenizer and the text encoder, streamed layer by layer.
@@ -783,7 +785,7 @@ pub fn encode_presentation(dev: &Arc<Device>, threads: usize, labels: &[String],
 pub fn encode_pieces(dev: &Arc<Device>, threads: usize, pieces: &[Piece], files: &TeFiles, ctl: &mut Ctl) -> Result<(Vec<f32>, crate::vision::Presented, usize, f64)> {
     let (te, tokenizer) = (files.te, files.tokenizer);
     let tok = crate::tokenizer::Tokenizer::load(tokenizer)?;
-    let presented = crate::vision::present(pieces, &tok, files.visual, dev.index, &mut |l| ctl.say(l))?;
+    let presented = crate::vision::present(pieces, &tok, files.visual, files.embeddings, dev.index, &mut |l| ctl.say(l))?;
     let ids = &presented.ids;
     ctl.say(format!("prompt : {} tokens{}", ids.len(), if presented.has_vision() {
         format!(" ({} in {} vision blocks)", presented.seen.iter().map(|s| s.grid.0 * s.grid.1 + 2).sum::<usize>(), presented.seen.len())
@@ -796,7 +798,7 @@ pub fn encode_pieces(dev: &Arc<Device>, threads: usize, pieces: &[Piece], files:
     let cancel = ctl.cancel;
     let layers = enc.layers;
     let mut progress = ctl.progress.take();
-    let r = enc.encode(dev, ids, &presented.seen, threads, &mut |i| {
+    let r = enc.encode(dev, ids, &presented.seen, &presented.embeds, threads, &mut |i| {
         if cancel.load(Ordering::Relaxed) {
             return Err(Error("cancelled".into()));
         }
@@ -1325,6 +1327,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     te: Path::new(s("te").unwrap_or("/models/teacher/qwen3vl_32b_minimax_h3-Q4_K_M.gguf")),
                     tokenizer: Path::new(s("tokenizer").unwrap_or("/app/tokenizer")),
                     visual: s("te_visual").map(Path::new).filter(|p| p.exists()),
+                    embeddings: s("embeddings").map(Path::new).filter(|p| p.is_dir()),
                 },
                 vaes: Vaes {
                     video: Path::new(s("vae").unwrap_or("/models/Comfy-Org-MiniMax-H3/vae/minimax_h3_video_vae_fp16.safetensors")),
@@ -1405,7 +1408,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
             let te = s("te").ok_or("encode needs \"te\": the text encoder's GGUF file")?;
             let tokenizer = s("tokenizer").unwrap_or("/app/tokenizer");
             let pictures: Vec<&Path> = s("pictures").map(|r| r.split(',').filter(|x| !x.is_empty()).map(Path::new).collect()).unwrap_or_default();
-            let files = TeFiles { te: Path::new(te), tokenizer: Path::new(tokenizer), visual: s("te_visual").map(Path::new) };
+            let files = TeFiles { te: Path::new(te), tokenizer: Path::new(tokenizer), visual: s("te_visual").map(Path::new), embeddings: s("embeddings").map(Path::new) };
             encode_with(&e.dev, e.threads, &pictures, &prompt, &files, s("out").map(Path::new), s("check").map(Path::new), ctl)
         }
         other => Err(Error(format!("unknown job kind {other:?} (known: bench-blocks, check-block, denoise, decode, encode, generate)"))),

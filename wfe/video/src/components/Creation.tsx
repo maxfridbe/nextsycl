@@ -131,6 +131,27 @@ const num = (
   </label>
 );
 
+/** Comfy-Org's effect embeddings for H3 (the model's files: `embedding:NAME` in the prompt stands for their rows) */
+const EFFECTS = ["art_is_explosion", "blooming_flowers", "bullet_time", "dark_magic", "fire_breath", "four_seasons", "kiss_camera",
+                 "spiral_ascent", "storm_magic", "truman_show"];
+
+function EffectPicker() {
+  return (
+    <label attrs={{ title: "an effect embedding: inserted into the prompt as embedding:NAME, where the effect should happen" }}>
+      effect
+      <select on={{ change: (e: Event) => {
+        const el = e.target as HTMLSelectElement;
+        if (el.value) form.prompt = `${form.prompt}${form.prompt.endsWith(" ") ? "" : " "}embedding:minimaxh3_${el.value} `;
+        el.value = "";
+        render();
+      } }}>
+        <option attrs={{ value: "", selected: true }}>insert…</option>
+        {EFFECTS.map((n) => <option attrs={{ value: n }}>{n.replace(/_/g, " ")}</option>)}
+      </select>
+    </label>
+  );
+}
+
 type RefKind = "refImages" | "refVideos" | "refAudios";
 const REF_MAX: Record<RefKind, number> = { refImages: 9, refVideos: 3, refAudios: 3 };
 const REF_ACCEPT: Record<RefKind, string> = { refImages: "image/*", refVideos: "video/*", refAudios: "audio/*" };
@@ -232,8 +253,9 @@ export function Creation() {
     <div class="create">
       <textarea
         attrs={{ spellcheck: false }}
+        props={{ value: form.prompt }}
         on={{ input: (e: Event) => { form.prompt = (e.target as HTMLTextAreaElement).value; } }}
-      >{form.prompt}</textarea>
+      />
       <div class="hint">
         Dialogue: <code>{"(S1) says: <d>[English] line</d>"}</code> · no negations (cfg is 1.0,
         so every word renders) · 4–15 s per clip
@@ -251,6 +273,7 @@ export function Creation() {
             <option attrs={{ value: "latent", selected: form.upscaler === "latent" }}>latent (slowest, most natural texture)</option>
           </select>
         </label>
+        <EffectPicker />
         {named("sampler", "sampler", state.plan?.samplers, "euler (default)",
           "ComfyUI's samplers on the flow model. euler is the distilled default; ancestral and sde samplers add fresh noise each step; the multistep ones (dpmpp_2m, uni_pc) reuse earlier steps. Some take two or three model calls a step.")}
         {named("schedule", "schedule", state.plan?.schedules, "shifted (default)",

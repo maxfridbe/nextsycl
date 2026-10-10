@@ -53,11 +53,84 @@ pub struct Seen {
     pub deep: Vec<Vec<f32>>,
 }
 
-/// The ids, the denoiser's modality tag per id, and the vision blocks
+/// The ids, the denoiser's modality tag per id, the vision blocks, and the embeddings' rows (`embedding:NAME` in the
+/// text: rows of the encoder's input [n, hidden] that stand in for tokens)
 pub struct Presented {
     pub ids: Vec<u32>,
     pub tags: Vec<i32>,
     pub seen: Vec<Seen>,
+    pub embeds: Vec<(usize, Vec<f32>)>,
+}
+
+/// A text piece split as ComfyUI's tokenizer splits it (sd1_clip.SDTokenizer): at every `embedding:` that follows
+/// white space; an embedding's name is the next word (cut at `<` or `[`, retried without trailing commas), and the
+/// words after it are text again (joined by single spaces)
+enum Seg {
+    Text(String),
+    Embed(Vec<f32>, String),
+}
+
+const EMBEDDING: &str = "embedding:";
+
+/// An embedding by name from the directory: `NAME`, `NAME.safetensors`; its rows for the 32B encoder (key
+/// `qwen3vl_32b`, [n, 5120]) as float32
+fn load_embed(dir: &Path, name: &str) -> Option<Vec<f32>> {
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return None;
+    }
+    let p = [dir.join(name), dir.join(format!("{name}.safetensors"))].into_iter().find(|p| p.is_file())?;
+    let st = nextsycl_gguf::safetensors::SafeTensors::open(&p).ok()?;
+    let key = if st.tensor("qwen3vl_32b").is_some() { "qwen3vl_32b".to_string() } else { st.tensors.first()?.name.clone() };
+    st.f32(&key).ok()
+}
+
+fn split_embeddings(text: &str, dir: Option<&Path>, log: &mut dyn FnMut(String)) -> Vec<Seg> {
+    let Some(dir) = dir else { return vec![Seg::Text(text.to_string())] };
+    // split before each `embedding:` preceded by white space (the white space stays with the text before it)
+    let mut words = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while let Some(off) = text[i..].find(EMBEDDING) {
+        let at = i + off;
+        if at > 0 && text[..at].chars().next_back().is_some_and(char::is_whitespace) {
+            words.push(&text[start..at]);
+            start = at;
+        }
+        i = at + EMBEDDING.len();
+    }
+    words.push(&text[start..]);
+    let mut out = Vec::new();
+    for w in words.into_iter().filter(|w| !w.is_empty()) {
+        let Some(rest) = w.strip_prefix(EMBEDDING) else {
+            out.push(Seg::Text(w.to_string()));
+            continue;
+        };
+        let rest = rest.trim_matches('\n');
+        let mut parts = rest.split_whitespace();
+        let mut name = parts.next().unwrap_or("").to_string();
+        let mut leftover = parts.collect::<Vec<_>>().join(" ");
+        if let Some(b) = name.find(['<', '[']) {
+            leftover = format!("{}{}", &name[b..], if leftover.is_empty() { String::new() } else { format!(" {leftover}") });
+            name.truncate(b);
+        }
+        let mut embed = load_embed(dir, &name);
+        if embed.is_none() {
+            let stripped = name.trim_matches(',');
+            if stripped.len() < name.len() {
+                embed = load_embed(dir, stripped);
+                leftover = format!("{} {leftover}", &name[stripped.len()..]);
+                name = stripped.to_string();
+            }
+        }
+        match embed {
+            Some(e) => out.push(Seg::Embed(e, name)),
+            None => log(format!("prompt : embedding:{name} does not exist, ignoring")),
+        }
+        if !leftover.is_empty() {
+            out.push(Seg::Text(leftover));
+        }
+    }
+    out
 }
 
 impl Presented {
@@ -68,17 +141,32 @@ impl Presented {
 
 /// The pieces as ids (each text piece tokenized on its own, as the reference does), the vision blocks through the
 /// tower (`visual`: its file; `gpu`: the card)
-pub fn present(pieces: &[Piece], tok: &crate::tokenizer::Tokenizer, visual: Option<&Path>, gpu: usize, log: &mut dyn FnMut(String)) -> Result<Presented> {
+pub fn present(pieces: &[Piece], tok: &crate::tokenizer::Tokenizer, visual: Option<&Path>, embeddings: Option<&Path>, gpu: usize,
+               log: &mut dyn FnMut(String)) -> Result<Presented> {
     let mut ids = Vec::new();
     let mut tags = Vec::new();
     let mut blocks: Vec<(usize, &Frames)> = Vec::new();
+    let mut embeds = Vec::new();
     for p in pieces {
         match p {
             Piece::Text(s) if s.is_empty() => {}
             Piece::Text(s) => {
-                let t = tok.encode(s)?;
-                tags.extend(std::iter::repeat_n(1, t.len()));
-                ids.extend(t);
+                for seg in split_embeddings(s, embeddings, log) {
+                    match seg {
+                        Seg::Text(t) => {
+                            let t = tok.encode(&t)?;
+                            tags.extend(std::iter::repeat_n(1, t.len()));
+                            ids.extend(t);
+                        }
+                        Seg::Embed(rows, name) => {
+                            let n = rows.len() / 5120;
+                            log(format!("prompt : embedding:{name} = {n} rows"));
+                            embeds.push((ids.len(), rows));
+                            ids.extend(std::iter::repeat_n(PAD, n));
+                            tags.extend(std::iter::repeat_n(1, n));
+                        }
+                    }
+                }
             }
             Piece::Vision(f) => {
                 if !f.h.is_multiple_of(PATCH * MERGE) || !f.w.is_multiple_of(PATCH * MERGE) || f.frames.is_empty() || f.frames.len() > 2 {
@@ -118,7 +206,7 @@ pub fn present(pieces: &[Piece], tok: &crate::tokenizer::Tokenizer, visual: Opti
         log(format!("vision : {} block(s) through the tower in {:.1} s ({} tokens)", seen.len(), t0.elapsed().as_secs_f64(),
                     seen.iter().map(|s| s.grid.0 * s.grid.1).sum::<usize>()));
     }
-    Ok(Presented { ids, tags, seen })
+    Ok(Presented { ids, tags, seen, embeds })
 }
 
 /// Each id's (time, height, width) position: text counts on; a vision block's tokens share the time of its first
@@ -182,6 +270,28 @@ mod tests {
         assert_eq!(p[8], [3.0, 4.0, 5.0]);
         assert_eq!(p[9], [6.0, 6.0, 6.0]);
         assert_eq!(p[10], [7.0, 7.0, 7.0]);
+    }
+
+    #[test]
+    fn embeddings_split_as_comfyui_does() {
+        let dir = std::env::temp_dir().join(format!("h3-emb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows: Vec<f32> = (0..2 * 5120).map(|i| i as f32).collect();
+        let t = std::collections::BTreeMap::from([("qwen3vl_32b".to_string(), (vec![2, 5120], rows))]);
+        crate::safetensors::write_f32(&dir.join("e1.safetensors"), &t, &std::collections::BTreeMap::new()).unwrap();
+        let show = |text: &str| -> Vec<String> {
+            split_embeddings(text, Some(&dir), &mut |_| {}).into_iter().map(|s| match s {
+                Seg::Text(t) => format!("T[{t}]"),
+                Seg::Embed(r, n) => format!("E[{n}:{}]", r.len() / 5120),
+            }).collect()
+        };
+        assert_eq!(show("a fox embedding:e1 runs  far"), ["T[a fox ]", "E[e1:2]", "T[runs far]"]);
+        assert_eq!(show("embedding:e1, then"), ["E[e1:2]", "T[, then]"]);
+        assert_eq!(show("x embedding:e1<b> y"), ["T[x ]", "E[e1:2]", "T[<b> y]"]);
+        // not after white space: plain text; an unknown name: left out
+        assert_eq!(show("x,embedding:e1 y"), ["T[x,embedding:e1 y]"]);
+        assert_eq!(show("x embedding:nope y"), ["T[x ]", "T[y]"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

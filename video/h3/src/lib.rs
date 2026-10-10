@@ -156,6 +156,12 @@ impl H3 {
                     m.insert((*key).into(), json!(p));
                 }
             }
+            // the effect embeddings (roles embedding-NAME): `embedding:NAME` in a prompt finds them in their directory
+            if !m.contains_key("embeddings") {
+                if let Some(d) = self.files.iter().find(|(r, _)| r.starts_with("embedding")).and_then(|(_, p)| p.parent()) {
+                    m.insert("embeddings".into(), json!(d));
+                }
+            }
         }
         s
     }
