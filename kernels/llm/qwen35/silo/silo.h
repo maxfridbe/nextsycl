@@ -34,6 +34,9 @@ int ns_q35_attn_decode(ns_gpu* g, const float* q, int64_t qs, const void* kc, co
  * 256) of a stored matrix into dst. Covers Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ3_S, IQ4_XS */
 int ns_q35_dequant_f16_supported(int type);
 int ns_q35_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
+/* RMS norm with the Q8_1 blocks of its output (norm.cpp; for decode rows): y [rows, C] = x / rms(x) * w (y may be null),
+ * q8_1 the blocks of y as ns_quantize_q8_1 makes them (column r at r x C / 32); C a multiple of 256 */
+int ns_q35_rms_q8(ns_gpu* g, const float* x, const float* w, float* y, void* q8_1, int64_t rows, int64_t C, float eps);
 
 #ifdef __cplusplus
 }

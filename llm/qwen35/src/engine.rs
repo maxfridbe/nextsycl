@@ -114,6 +114,8 @@ struct Linear {
     z: Mat,
     beta: Mat,
     alpha: Mat,
+    /// alpha's rows then beta's in one matrix (both the same block type): one decode product for a row, not two
+    ab: Option<Mat>,
     conv: DevBuf,
     dt: DevBuf,
     a: DevBuf,
@@ -300,6 +302,7 @@ impl<'g> Qwen35<'g> {
                     z: read(&n("attn_gate"))?,
                     beta: read(&n("ssm_beta"))?,
                     alpha: read(&n("ssm_alpha"))?,
+                    ab: None,
                     conv: read(&n("ssm_conv1d"))?.buf,
                     dt: read(&format!("blk.{l}.ssm_dt.bias"))?.buf,
                     a: read(&format!("blk.{l}.ssm_a"))?.buf,
@@ -318,6 +321,18 @@ impl<'g> Qwen35<'g> {
             });
             if l % 16 == 15 {
                 log(format!("qwen35: layer {} of {} ({:.1} GiB, {:.0} s)", l + 1, g.layers, loaded as f64 / (1u64 << 30) as f64, t0.elapsed().as_secs_f64()));
+            }
+        }
+        // alpha and beta stacked (their bytes one after the other) where they share a block type
+        for ly in layers.iter_mut() {
+            if let Some(a) = ly.linear.as_mut() {
+                if a.alpha.ty == a.beta.ty && a.alpha.cols == a.beta.cols && a.alpha.ty != GType::F32 {
+                    let (na, nb) = (a.alpha.buf.len, a.beta.buf.len);
+                    let buf = DevBuf::new(&gpu, na + nb)?;
+                    buf.copy_within(0, &a.alpha.buf, 0, na)?;
+                    buf.copy_within(na, &a.beta.buf, 0, nb)?;
+                    a.ab = Some(Mat { buf, ty: a.alpha.ty, rows: a.alpha.rows + a.beta.rows, cols: a.alpha.cols });
+                }
             }
         }
         let output_norm = vec_mat(f, &gpu, k, "output_norm.weight", &mut loaded)?.buf;
@@ -374,7 +389,8 @@ impl<'g> Qwen35<'g> {
     }
 
     /// y [t, w.rows] = x [t, w.cols] . W^T; `role` names it in the probe
-    fn matmul(&self, role: &'static str, w: &Mat, x: &DevBuf, t: usize, y: &DevBuf) -> Result<()> {
+    /// `xq`: x's Q8_1 blocks when the norm made them (decode rows), so the product does not quantize x again
+    fn matmul(&self, role: &'static str, w: &Mat, x: &DevBuf, xq: Option<&DevBuf>, t: usize, y: &DevBuf) -> Result<()> {
         let k = self.k;
         let (n, kk) = (w.rows as i64, w.cols as i64);
         let (rows, cols) = (w.rows, w.cols);
@@ -391,9 +407,16 @@ impl<'g> Qwen35<'g> {
         if t <= 8 && mmvq {
             // SAFETY: arithmetic only.
             let q8 = unsafe { (k.q8_1_bytes)(kk, t as i64) };
-            let qb = self.arena.bytes(q8)?;
-            // SAFETY: x [t, cols] float32 -> its Q8_1 blocks.
-            self.op("quantize", key, 4 * t * cols + q8, 0, || unsafe { (k.quantize_q8_1)(self.raw(), x.fp(), qb.ptr(), kk, t as i64) })?;
+            let own;
+            let qb = match xq {
+                Some(q) => q,
+                None => {
+                    own = self.arena.bytes(q8)?;
+                    // SAFETY: x [t, cols] float32 -> its Q8_1 blocks.
+                    self.op("quantize", key, 4 * t * cols + q8, 0, || unsafe { (k.quantize_q8_1)(self.raw(), x.fp(), own.ptr(), kk, t as i64) })?;
+                    &own
+                }
+            };
             // the silo's product for the types it covers (kernels/llm/qwen35/silo), the shared one otherwise
             // SAFETY: arithmetic only.
             let (f, name) = match self.silo {
@@ -431,6 +454,21 @@ impl<'g> Qwen35<'g> {
                 || unsafe { (k.gemm_f16)(self.raw(), t as i64, n, kk, xh.ptr().cast(), kk, self.w16.ptr().cast(), y.fp(), n, 0) })
     }
 
+    /// The RMS norm into y; for decode rows with the silo also y's Q8_1 blocks (the products after it read them)
+    fn norm(&self, x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, c: usize) -> Result<Option<DevBuf>> {
+        let Some(s) = self.silo.filter(|_| rows <= 8 && c % 256 == 0) else {
+            self.rms(x, w, y, rows, c)?;
+            return Ok(None);
+        };
+        // SAFETY: arithmetic only.
+        let q8 = unsafe { (self.k.q8_1_bytes)(c as i64, rows as i64) };
+        let qb = self.arena.bytes(q8)?;
+        // SAFETY: x and y [rows, c], w c floats, qb rows x c / 32 Q8_1 blocks.
+        self.op("rms norm q8", String::new, 12 * rows * c + 4 * c + q8, 6 * rows * c,
+                || unsafe { (s.rms_q8)(self.raw(), x.fp(), w.fp(), y.fp(), qb.ptr(), rows as i64, c as i64, self.g.eps) })?;
+        Ok(Some(qb))
+    }
+
     fn rms(&self, x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, c: usize) -> Result<()> {
         // SAFETY: x and y [rows, c], w c floats.
         self.op("rms norm", String::new, 8 * rows * c + 4 * c, 4 * rows * c,
@@ -464,15 +502,15 @@ impl<'g> Qwen35<'g> {
 
     /// A full-attention layer on h [t, n_embd]: its output [t, n_embd]
     #[allow(clippy::too_many_arguments)]
-    fn full(&self, a: &Full, kc: &DevBuf, vc: &DevBuf, cap: usize, h: &DevBuf, t: usize, p0: usize) -> Result<DevBuf> {
+    fn full(&self, a: &Full, kc: &DevBuf, vc: &DevBuf, cap: usize, h: &DevBuf, hq8: Option<&DevBuf>, t: usize, p0: usize) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hq, hk, d) = (g.heads, g.heads_kv, g.head);
         let qf = self.arena.f32(t * hq * 2 * d)?;
         let kr = self.arena.f32(t * hk * d)?;
         let vr = self.arena.f32(t * hk * d)?;
-        self.matmul("q", &a.q, h, t, &qf)?;
-        self.matmul("k", &a.k, h, t, &kr)?;
-        self.matmul("v", &a.v, h, t, &vr)?;
+        self.matmul("q", &a.q, h, hq8, t, &qf)?;
+        self.matmul("k", &a.k, h, hq8, t, &kr)?;
+        self.matmul("v", &a.v, h, hq8, t, &vr)?;
         let q = self.arena.f32(t * hq * d)?;
         let kn = self.arena.f32(t * hk * d)?;
         let att = self.arena.f32(t * hq * d)?;
@@ -502,7 +540,7 @@ impl<'g> Qwen35<'g> {
                 self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
                         || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
                 let out = self.arena.f32(t * g.n_embd)?;
-                self.matmul("o", &a.o, &att, t, &out)?;
+                self.matmul("o", &a.o, &att, None, t, &out)?;
                 return Ok(out);
             }
             if let Some(s) = self.silo.filter(|s| (s.attn_decode_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
@@ -515,7 +553,7 @@ impl<'g> Qwen35<'g> {
                 self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
                         || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
                 let out = self.arena.f32(t * g.n_embd)?;
-                self.matmul("o", &a.o, &att, t, &out)?;
+                self.matmul("o", &a.o, &att, None, t, &out)?;
                 return Ok(out);
             }
             let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
@@ -527,22 +565,33 @@ impl<'g> Qwen35<'g> {
                     || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
         }
         let out = self.arena.f32(t * g.n_embd)?;
-        self.matmul("o", &a.o, &att, t, &out)?;
+        self.matmul("o", &a.o, &att, None, t, &out)?;
         Ok(out)
     }
 
     /// A DeltaNet layer on h [t, n_embd]: its output [t, n_embd]
-    fn linear(&self, a: &Linear, s: &DevBuf, conv: &DevBuf, h: &DevBuf, t: usize) -> Result<DevBuf> {
+    fn linear(&self, a: &Linear, s: &DevBuf, conv: &DevBuf, h: &DevBuf, hq8: Option<&DevBuf>, t: usize) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hv, hk, d, cd) = (g.v_heads, g.k_heads, g.state, g.conv_dim());
         let qkv = self.arena.f32(t * cd)?;
         let z = self.arena.f32(t * g.inner)?;
-        let beta = self.arena.f32(t * hv)?;
-        let alpha = self.arena.f32(t * hv)?;
-        self.matmul("qkv", &a.qkv, h, t, &qkv)?;
-        self.matmul("z", &a.z, h, t, &z)?;
-        self.matmul("beta", &a.beta, h, t, &beta)?;
-        self.matmul("alpha", &a.alpha, h, t, &alpha)?;
+        self.matmul("qkv", &a.qkv, h, hq8, t, &qkv)?;
+        self.matmul("z", &a.z, h, hq8, t, &z)?;
+        // one row: alpha and beta from their stacked matrix in one product
+        let (alpha, beta) = match &a.ab {
+            Some(ab) if t == 1 => {
+                let both = self.arena.f32(2 * hv)?;
+                self.matmul("alpha beta", ab, h, hq8, t, &both)?;
+                (both.view(0, hv * 4)?, both.view(hv * 4, hv * 4)?)
+            }
+            _ => {
+                let beta = self.arena.f32(t * hv)?;
+                let alpha = self.arena.f32(t * hv)?;
+                self.matmul("beta", &a.beta, h, hq8, t, &beta)?;
+                self.matmul("alpha", &a.alpha, h, hq8, t, &alpha)?;
+                (alpha, beta)
+            }
+        };
         let eg = self.arena.f32(t * hv * d)?;
         let co = self.arena.f32(t * cd)?;
         let q = self.arena.f32(t * hv * d)?;
@@ -573,7 +622,7 @@ impl<'g> Qwen35<'g> {
                     || (k.gdn_out)(self.raw(), o.fp(), z.fp(), g.inner as i64, a.norm.fp(), y.fp(), t as i64, hv as i64, d as i64, g.eps))?;
         }
         let out = self.arena.f32(t * g.n_embd)?;
-        self.matmul("out", &a.out, &y, t, &out)?;
+        self.matmul("out", &a.out, &y, None, t, &out)?;
         Ok(out)
     }
 
@@ -603,22 +652,22 @@ impl<'g> Qwen35<'g> {
         for (l, (ly, st)) in self.layers.iter().zip(s.layers.iter()).enumerate() {
             let mark = self.arena.mark();
             self.phase(if ly.full.is_some() { "attention" } else { "deltanet" });
-            self.rms(&x, &ly.attn_norm, &h, t, g.n_embd)?;
+            let hq8 = self.norm(&x, &ly.attn_norm, &h, t, g.n_embd)?;
             let out = match (st, &ly.full, &ly.linear) {
-                (LState::Full { k, v }, Some(a), _) => self.full(a, k, v, s.max_ctx, &h, t, p0)?,
-                (LState::Linear { s: rs, conv }, _, Some(a)) => self.linear(a, rs, conv, &h, t)?,
+                (LState::Full { k, v }, Some(a), _) => self.full(a, k, v, s.max_ctx, &h, hq8.as_ref(), t, p0)?,
+                (LState::Linear { s: rs, conv }, _, Some(a)) => self.linear(a, rs, conv, &h, hq8.as_ref(), t)?,
                 _ => return Err(e(format!("layer {l}: its state and its weights disagree"))),
             };
             self.add(&x, &out, t * g.n_embd)?;
             self.phase("ffn");
-            self.rms(&x, &ly.post_norm, &h, t, g.n_embd)?;
-            self.matmul("gate", &ly.gate, &h, t, &ffn_g)?;
-            self.matmul("up", &ly.up, &h, t, &ffn_u)?;
+            let hq8 = self.norm(&x, &ly.post_norm, &h, t, g.n_embd)?;
+            self.matmul("gate", &ly.gate, &h, hq8.as_ref(), t, &ffn_g)?;
+            self.matmul("up", &ly.up, &h, hq8.as_ref(), t, &ffn_u)?;
             let nf = t * g.n_ff;
             // SAFETY: n floats each.
             self.op("swiglu", String::new, 12 * nf, 6 * nf,
                     || unsafe { (self.k.swiglu_clamp)(self.raw(), ffn_g.fp(), ffn_u.fp(), ffn_g.fp(), nf as i64, f32::INFINITY) })?;
-            self.matmul("down", &ly.down, &ffn_g, t, &ffn)?;
+            self.matmul("down", &ly.down, &ffn_g, None, t, &ffn)?;
             self.add(&x, &ffn, t * g.n_embd)?;
             tap(&format!("l_out-{l}"), &x)?;
             self.arena.rewind(mark);
@@ -630,10 +679,10 @@ impl<'g> Qwen35<'g> {
         let last = x.view((t - n) * g.n_embd * 4, n * g.n_embd * 4)?;
         let normed = self.arena.f32(n * g.n_embd)?;
         self.phase("head");
-        self.rms(&last, &self.output_norm, &normed, n, g.n_embd)?;
+        let nq8 = self.norm(&last, &self.output_norm, &normed, n, g.n_embd)?;
         tap("result_norm", &normed)?;
         let logits = self.arena.f32(n * self.output.rows)?;
-        self.matmul("output", &self.output, &normed, n, &logits)?;
+        self.matmul("output", &self.output, &normed, nq8.as_ref(), n, &logits)?;
         let all = logits.to_f32()?;
         if let Some(p) = &self.probe {
             p.settle(t)?;
