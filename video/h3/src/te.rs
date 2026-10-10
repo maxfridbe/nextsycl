@@ -171,8 +171,10 @@ impl TextEncoder {
             .collect::<Result<Vec<Vec<f32>>>>()
     }
 
-    /// The conditioning for `tokens`: [tokens, hidden] float32. `tick(layer)` before each layer.
-    pub fn encode(&self, dev: &Arc<Device>, tokens: &[u32], threads: usize, tick: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
+    /// The conditioning for `tokens`: [tokens, hidden] float32. `tick(layer)` before each layer. `vision`: the vision
+    /// blocks among the tokens (their rows replace the placeholders' embeddings, their deepstack features are added
+    /// after the first layers, and every token takes its M-RoPE position).
+    pub fn encode(&self, dev: &Arc<Device>, tokens: &[u32], vision: &[crate::vision::Seen], threads: usize, tick: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
         let l = tokens.len();
         let (c, hq, hkv, ffn) = (self.hidden, self.heads, self.kv_heads, self.ffn);
         let (wq, wkv) = (hq * HEAD_DIM, hkv * HEAD_DIM);
@@ -191,11 +193,33 @@ impl TextEncoder {
             f.read_exact_at(&mut row, emb.offset + (*t as u64) * (c as u64 * 2)).ctx("reading the token embedding")?;
             x0.extend(row.chunks_exact(2).map(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]]))));
         }
+        for v in vision {
+            let n = v.grid.0 * v.grid.1;
+            if v.tokens.len() != n * c || v.at + n > l {
+                return Err(Error(format!("a vision block of {} values for {n} tokens of {c} at {} (of {l})", v.tokens.len(), v.at)));
+            }
+            x0[v.at * c..(v.at + n) * c].copy_from_slice(&v.tokens);
+        }
+        // deepstack: per depth, the blocks' features at their rows (zero elsewhere), added after that layer
+        let depths = vision.iter().map(|v| v.deep.len()).max().unwrap_or(0);
+        let deep: Vec<Tensor> = (0..depths)
+            .map(|k| {
+                let mut d = vec![0f32; l * c];
+                for v in vision.iter().filter(|v| v.deep.len() > k) {
+                    d[v.at * c..v.at * c + v.deep[k].len()].copy_from_slice(&v.deep[k]);
+                }
+                Tensor::from_bytes(dev, DType::F16, &[l, c], &f16_bytes(&d))
+            })
+            .collect::<Result<_>>()?;
         let dt = DType::F16;
         let x = Tensor::from_bytes(dev, dt, &[l, c], &f16_bytes(&x0))?;
-        // rotary table: position p, pair j -> angle p / theta^(2j / 128)
-        let inv: Vec<f32> = (0..HEAD_DIM / 2).map(|j| 1.0 / THETA.powf((2 * j) as f32 / HEAD_DIM as f32)).collect();
-        let cs: Vec<f32> = (0..l).flat_map(|p| inv.iter().flat_map(move |f| [(p as f32 * f).cos(), (p as f32 * f).sin()])).collect();
+        // rotary table: position p, pair j -> angle p / theta^(2j / 128); with vision blocks, Qwen3-VL's M-RoPE
+        let cs: Vec<f32> = if vision.is_empty() {
+            let inv: Vec<f32> = (0..HEAD_DIM / 2).map(|j| 1.0 / THETA.powf((2 * j) as f32 / HEAD_DIM as f32)).collect();
+            (0..l).flat_map(|p| inv.iter().flat_map(move |f| [(p as f32 * f).cos(), (p as f32 * f).sin()])).collect()
+        } else {
+            crate::vision::rope_table(&crate::vision::positions(l, vision), HEAD_DIM, THETA)
+        };
         let cs = Tensor::from_bytes(dev, DType::F32, &[l, HEAD_DIM / 2, 2], &cs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
 
         let h = Tensor::new(dev, dt, &[l, c])?;
@@ -357,6 +381,9 @@ impl TextEncoder {
                 expand(blob, e(6).1, e(6).0, 0)?;
                 lin(&act, c, ffn, &o)?;
                 ops::add(&x, &o)?;
+                if let Some(d) = deep.get(i) {
+                    ops::add(&x, d)?;
+                }
                 dev.wait()?; // this layer's buffer takes layer i + 2
             }
             drop(rx);

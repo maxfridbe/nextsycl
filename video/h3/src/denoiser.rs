@@ -345,8 +345,29 @@ pub struct Conditions {
     pub audio_aug: f32,
     /// the sampling seed (the augmentation noise is drawn from it, as the reference does)
     pub seed: u64,
-    /// reference audio (a voice): normalized latents [32, 2, rt] and rt, in `<Audio j>` order
-    pub ref_audio: Vec<(Vec<f32>, usize)>,
+    /// the references (ref2va), in the order the prompt presents them
+    pub refs: Vec<RefIn>,
+}
+
+/// A reference's normalized latents
+pub enum RefIn {
+    /// a sound (a voice): [32, 2, t]
+    Audio { latent: Vec<f32>, t: usize },
+    /// a picture: [24, 1, h, w] at its own size
+    Image { latent: Vec<f32>, h: usize, w: usize },
+    /// a clip: [24, t, h, w], and its sound [32, 2, rt] when it brings one
+    Video { latent: Vec<f32>, t: usize, h: usize, w: usize, audio: Option<(Vec<f32>, usize)> },
+}
+
+impl RefIn {
+    fn block(&self) -> crate::layout::RefBlock {
+        use crate::layout::RefBlock;
+        match self {
+            RefIn::Audio { t, .. } => RefBlock::Audio { t: *t },
+            RefIn::Image { h, w, .. } => RefBlock::Image { h: *h, w: *w },
+            RefIn::Video { t, h, w, audio, .. } => RefBlock::Video { t: *t, h: *h, w: *w, audio_t: audio.as_ref().map_or(0, |a| a.1) },
+        }
+    }
 }
 
 impl Default for Conditions {
@@ -356,7 +377,7 @@ impl Default for Conditions {
             visual_aug: crate::layout::VISUAL_COND_TIMESTEP as f32,
             audio_aug: crate::layout::AUDIO_COND_TIMESTEP as f32,
             seed: 0,
-            ref_audio: Vec::new(),
+            refs: Vec::new(),
         }
     }
 }
@@ -393,7 +414,7 @@ impl<'a> Denoiser<'a> {
             .iter()
             .map(|k| crate::layout::Keyframe { frame_index: k.frame_index as f64, video_latent_t: k.video.as_ref().map(|v| v.1), audio_latent_t: k.audio.as_ref().map(|a| a.1) })
             .collect();
-        let refs: Vec<crate::layout::RefBlock> = cond.ref_audio.iter().map(|(_, t)| crate::layout::RefBlock::Audio { t: *t }).collect();
+        let refs: Vec<crate::layout::RefBlock> = cond.refs.iter().map(RefIn::block).collect();
         let layout = Layout::new(text.shape[0], shape.t, shape.h, shape.w, shape.audio_t, &kfs, &refs)?;
         // the keyframes' rows: patches (or stereo rows) through the projections once, the augmentation noise drawn
         // from the seed afresh for every keyframe (the reference restarts the same stream each time; audio rows
@@ -414,7 +435,7 @@ impl<'a> Denoiser<'a> {
                 }
                 rows
             };
-            let mut segs = layout.segments.iter().filter(|s| matches!(s.kind, Kind::Cond | Kind::CondAudio | Kind::RefAudio));
+            let mut segs = layout.segments.iter().filter(|s| matches!(s.kind, Kind::Cond | Kind::CondAudio | Kind::RefAudio | Kind::RefImg));
             for k in &cond.keyframes {
                 if let Some((v, vt)) = &k.video {
                     if v.len() != outer.video_c * vt * shape.h * shape.w {
@@ -433,13 +454,32 @@ impl<'a> Denoiser<'a> {
                     cond_rows.push((s.start, embed(rows, &outer.audio_patch)?));
                 }
             }
-            for (a, rt) in &cond.ref_audio {
-                if *rt == 0 {
-                    continue;
+            // the references in order (a clip's sound before its pictures), each with the same augmentation
+            let sound = |a: &[f32], rt: usize, s: &crate::layout::Segment| -> Result<(usize, Tensor)> {
+                if a.len() != outer.audio_c * 2 * rt {
+                    return Err(Error(format!("a reference sound of {} values for {} x 2 x {rt}", a.len(), outer.audio_c)));
                 }
-                let s = segs.next().ok_or("reference rows missing from the layout")?;
-                let rows = aug(pack_audio(a, outer.audio_c, *rt), cond.audio_aug, cond.seed + 1);
-                cond_rows.push((s.start, embed(rows, &outer.audio_patch)?));
+                Ok((s.start, embed(aug(pack_audio(a, outer.audio_c, rt), cond.audio_aug, cond.seed + 1), &outer.audio_patch)?))
+            };
+            let picture = |v: &[f32], (t, h, w): (usize, usize, usize), s: &crate::layout::Segment| -> Result<(usize, Tensor)> {
+                if v.len() != outer.video_c * t * h * w {
+                    return Err(Error(format!("a reference of {} values for {} x {t} x {h} x {w}", v.len(), outer.video_c)));
+                }
+                Ok((s.start, embed(aug(patchify(v, outer.video_c, t, h, w), cond.visual_aug, cond.seed), &outer.video_patch)?))
+            };
+            for r in &cond.refs {
+                let mut next = || segs.next().ok_or_else(|| Error("reference rows missing from the layout".into()));
+                match r {
+                    RefIn::Audio { latent, t } if *t > 0 => cond_rows.push(sound(latent, *t, next()?)?),
+                    RefIn::Audio { .. } => {}
+                    RefIn::Image { latent, h, w } => cond_rows.push(picture(latent, (1, *h, *w), next()?)?),
+                    RefIn::Video { latent, t, h, w, audio } => {
+                        if let Some((a, rt)) = audio.as_ref().filter(|a| a.1 > 0) {
+                            cond_rows.push(sound(a, *rt, next()?)?);
+                        }
+                        cond_rows.push(picture(latent, (*t, *h, *w), next()?)?);
+                    }
+                }
             }
         }
         if text.dtype != DType::BF16 || text.shape[1] != cfg.hidden {

@@ -6,7 +6,8 @@
 //! picture at another resolution lands on the same coordinates); audio rows sit at height 0 and at the two ends of
 //! the width axis, one end per stereo channel.
 //!
-//! Reference pictures / clips ("ref2va") pack between the text and the targets and are not ported yet.
+//! References ("ref2va": pictures, clips, sounds the prompt names) pack between the keyframes and the targets: they
+//! take the time axis right after the text, and the targets start after them.
 
 use crate::{Error, Result};
 
@@ -25,8 +26,10 @@ pub enum Kind {
     Cond,
     /// Audio rows of a keyframe.
     CondAudio,
-    /// Audio rows of a reference (a voice to speak in: `<Audio j>` in the prompt).
+    /// Audio rows of a reference (a voice to speak in: `<Audio j>` in the prompt, or a reference clip's sound).
     RefAudio,
+    /// Video rows of a reference picture or clip (`<Picture i>`, `<Video k>`).
+    RefImg,
     Audio,
     Video,
 }
@@ -35,7 +38,7 @@ impl Kind {
     /// Which of a timestep's three table rows the kind uses: video-like 0, text 1, audio-like 2.
     pub fn modality(self) -> i32 {
         match self {
-            Kind::Video | Kind::Cond => 0,
+            Kind::Video | Kind::Cond | Kind::RefImg => 0,
             Kind::Text => 1,
             Kind::Audio | Kind::CondAudio | Kind::RefAudio => 2,
         }
@@ -51,13 +54,17 @@ pub struct Keyframe {
     pub audio_latent_t: Option<usize>,
 }
 
-/// A reference the prompt refers to (ref2va), packed between the text and the targets. Reference pictures and
-/// videos also go through the text encoder's vision tower, which the 32B checkpoint in use cannot run; audio
-/// references never enter the text encoder (the prompt carries only their `<Audio j>` label).
+/// A reference the prompt refers to (ref2va), packed between the text and the targets. Pictures and clips also go
+/// through the text encoder's vision tower; sounds never enter the text encoder (the prompt carries only their
+/// `<Audio j>` label).
 #[derive(Clone, Copy, Debug)]
 pub enum RefBlock {
     /// `t` audio latent frames
     Audio { t: usize },
+    /// a picture's latent, `h` x `w` latent pixels (its own size, not the clip's)
+    Image { h: usize, w: usize },
+    /// a clip's latent (`t` latent frames of `h` x `w`) and its sound's `audio_t` latent frames (0: none)
+    Video { t: usize, h: usize, w: usize, audio_t: usize },
 }
 
 impl RefBlock {
@@ -65,8 +72,17 @@ impl RefBlock {
     fn span(&self) -> f64 {
         match self {
             RefBlock::Audio { t } => *t as f64,
+            RefBlock::Image { .. } => 1.0,
+            RefBlock::Video { t, audio_t, .. } => (*audio_t as f64).max((0..*t).map(|k| FRAME_RESCALE * FRAME_PER_TOKEN[k % 5]).sum()),
         }
     }
+}
+
+/// A frame's 2x2-patch rows on the area-normalized grid: (height, width) per row, and the width axis' ends
+fn frame_grid(h: usize, w: usize) -> (Vec<(f64, f64)>, (f64, f64)) {
+    let sqrt_area = ((h * w) as f64).sqrt();
+    let (hs, ws) = (axis(h, sqrt_area), axis(w, sqrt_area));
+    (hs.iter().flat_map(|a| ws.iter().map(move |b| (*a, *b))).collect(), (ws[0], ws[ws.len() - 1]))
 }
 
 /// `[start, stop)` rows of one kind.
@@ -111,10 +127,7 @@ impl Layout {
         if !latent_h.is_multiple_of(2) || !latent_w.is_multiple_of(2) || latent_h == 0 || latent_w == 0 {
             return Err(Error(format!("the video latent must have even height and width, got {latent_h} x {latent_w}")));
         }
-        let sqrt_area = ((latent_h * latent_w) as f64).sqrt();
-        let (hs, ws) = (axis(latent_h, sqrt_area), axis(latent_w, sqrt_area));
-        let frame: Vec<(f64, f64)> = hs.iter().flat_map(|h| ws.iter().map(move |w| (*h, *w))).collect();
-        let (w_low, w_high) = (ws[0], ws[ws.len() - 1]);
+        let (frame, (w_low, w_high)) = frame_grid(latent_h, latent_w);
 
         let mut segments = Vec::new();
         let mut positions = Vec::new();
@@ -123,21 +136,23 @@ impl Layout {
             segments.push(Segment { start: *row, stop: *row + n, kind });
             *row += n;
         };
-        let video = |positions: &mut Vec<f64>, vt: usize, origin: f64| {
+        let video_on = |positions: &mut Vec<f64>, frame: &[(f64, f64)], vt: usize, origin: f64| {
             for t in video_times(vt, origin) {
-                for (h, w) in &frame {
+                for (h, w) in frame {
                     positions.extend_from_slice(&[t, *h, *w]);
                 }
             }
         };
+        let video = |positions: &mut Vec<f64>, vt: usize, origin: f64| video_on(positions, &frame, vt, origin);
         // channel-major: every frame of the left channel, then every frame of the right
-        let audio = |positions: &mut Vec<f64>, at: usize, origin: f64| {
+        let audio_on = |positions: &mut Vec<f64>, at: usize, origin: f64, (w_low, w_high): (f64, f64)| {
             for w in [w_low, w_high] {
                 for i in 0..at {
                     positions.extend_from_slice(&[origin + i as f64, 0.0, w]);
                 }
             }
         };
+        let audio = |positions: &mut Vec<f64>, at: usize, origin: f64| audio_on(positions, at, origin, (w_low, w_high));
 
         for i in 0..text_len {
             positions.extend_from_slice(&[i as f64, 0.0, 0.0]);
@@ -164,6 +179,23 @@ impl Layout {
                         audio(&mut positions, *t, rc);
                         push(Kind::RefAudio, t * 2, &mut row);
                     }
+                }
+                RefBlock::Image { h, w } => {
+                    let (f, _) = frame_grid(*h, *w);
+                    for (a, b) in &f {
+                        positions.extend_from_slice(&[rc, *a, *b]);
+                    }
+                    push(Kind::RefImg, f.len(), &mut row);
+                }
+                RefBlock::Video { t, h, w, audio_t } => {
+                    // its sound's rows first, on its own width axis' ends, both from the same origin
+                    let (f, ends) = frame_grid(*h, *w);
+                    if *audio_t > 0 {
+                        audio_on(&mut positions, *audio_t, rc, ends);
+                        push(Kind::RefAudio, audio_t * 2, &mut row);
+                    }
+                    video_on(&mut positions, &f, *t, rc);
+                    push(Kind::RefImg, t * f.len(), &mut row);
                 }
             }
             rc += r.span();
@@ -219,7 +251,7 @@ impl Timesteps {
         let of = |kind: Kind| match kind {
             Kind::Text | Kind::Video => t_v,
             Kind::Audio => t_a,
-            Kind::Cond => t_v.max(visual_cond),
+            Kind::Cond | Kind::RefImg => t_v.max(visual_cond),
             Kind::CondAudio | Kind::RefAudio => t_a.max(audio_cond),
         };
         let mut values = vec![t_v, t_a];
@@ -292,6 +324,37 @@ mod tests {
         assert_eq!(ts.values, vec![0.0]);
         let want: Vec<i32> = fx.read("mod_rows").unwrap().chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
         assert_eq!(ts.rows, want);
+    }
+
+    /// References and keyframes against ComfyUI's PackedLayout (tests/data/layout_refs.json: its segments and
+    /// positions for pictures at their own sizes, a clip with and without sound, a sound, keyframes beside them)
+    #[test]
+    fn references_match_comfyui() {
+        let raw = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/layout_refs.json")).unwrap();
+        let cases: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for c in cases.as_array().unwrap() {
+            let u = |v: &serde_json::Value| v.as_u64().unwrap() as usize;
+            let kfs: Vec<Keyframe> = c["keyframes"].as_array().unwrap().iter().map(|k| Keyframe {
+                frame_index: k["index"].as_f64().unwrap(), video_latent_t: k["vt"].as_u64().map(|v| v as usize), audio_latent_t: k["rt"].as_u64().map(|v| v as usize),
+            }).collect();
+            let refs: Vec<RefBlock> = c["refs"].as_array().unwrap().iter().map(|r| match r["kind"].as_str().unwrap() {
+                "audio" => RefBlock::Audio { t: u(&r["ref_audio_t"]) },
+                "image" => RefBlock::Image { h: u(&r["latent_h"]), w: u(&r["latent_w"]) },
+                _ => RefBlock::Video { t: u(&r["latent_t"]), h: u(&r["latent_h"]), w: u(&r["latent_w"]), audio_t: u(&r["ref_audio_t"]) },
+            }).collect();
+            let l = Layout::new(u(&c["text"]), u(&c["lt"]), u(&c["lh"]), u(&c["lw"]), u(&c["at"]), &kfs, &refs).unwrap();
+            let kind = |k: &str| match k {
+                "text" => Kind::Text, "cond" => Kind::Cond, "cond_audio" => Kind::CondAudio, "ref_img" => Kind::RefImg,
+                "ref_audio" => Kind::RefAudio, "audio" => Kind::Audio, _ => Kind::Video,
+            };
+            let want: Vec<Segment> = c["segments"].as_array().unwrap().iter()
+                .map(|s| Segment { start: u(&s[0]), stop: u(&s[1]), kind: kind(s[2].as_str().unwrap()) }).collect();
+            assert_eq!(l.segments, want, "{}", c["name"]);
+            let pos: Vec<f64> = c["positions"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+            assert_eq!(l.positions.len(), pos.len(), "{}", c["name"]);
+            let worst = l.positions.iter().zip(&pos).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            assert!(worst < 1e-9, "{}: positions differ by {worst}", c["name"]);
+        }
     }
 
     #[test]

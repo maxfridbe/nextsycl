@@ -30,6 +30,7 @@ pub mod tokenizer;
 pub mod upscale;
 pub mod venc;
 pub mod vae;
+pub mod vision;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -83,11 +84,11 @@ use serde_json::{json, Value};
 pub const ARCH: &str = "minimax-h3";
 
 /// The files it takes, by role (the denoiser at load; the others go into each job, where a job does not name its own)
-pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "audio-vae"];
+pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "audio-vae", "vision"];
 
 /// A role and the job key it fills
 const ROLE_KEYS: &[(&str, &str)] = &[("text-encoder", "te"), ("tokenizer", "tokenizer"), ("vae", "vae"), ("audio-vae", "audio_vae"),
-                                     ("upscaler", "upscaler"), ("pixel-upscaler", "pixel_upscaler")];
+                                     ("upscaler", "upscaler"), ("pixel-upscaler", "pixel_upscaler"), ("vision", "te_visual")];
 
 /// The options it takes (`--opt-NAME`): at load the variables they set; per request the generate job's own keys
 pub const OPTIONS: &[EngineOption] = &[

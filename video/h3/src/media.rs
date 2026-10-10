@@ -90,10 +90,22 @@ fn scale_filter(w: usize, h: usize, fit: Fit) -> String {
 
 /// Every frame of a picture or video, fitted to w x h: [frames, h, w, 3] in [0, 1], and the frame count.
 pub fn read_frames(path: &Path, w: usize, h: usize, fit: Fit) -> Result<(Vec<f32>, usize)> {
-    let out = Command::new("ffmpeg")
-        .args(["-loglevel", "error", "-i"])
-        .arg(path)
-        .args(["-vf", &scale_filter(w, h, fit), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+    read_frames_at(path, w, h, fit, None)
+}
+
+/// The same at a frame rate (a reference clip at the model's 24 fps), at most `max` frames from the start
+pub fn read_frames_at(path: &Path, w: usize, h: usize, fit: Fit, fps: Option<(f64, usize)>) -> Result<(Vec<f32>, usize)> {
+    let vf = match fps {
+        Some((r, _)) => format!("fps={r},{}", scale_filter(w, h, fit)),
+        None => scale_filter(w, h, fit),
+    };
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-loglevel", "error", "-i"]).arg(path).args(["-vf", &vf]);
+    if let Some((_, max)) = fps {
+        cmd.args(["-frames:v", &max.to_string()]);
+    }
+    let out = cmd
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
         .output()
         .ctx("starting ffmpeg")?;
     if !out.status.success() || out.stdout.is_empty() {
@@ -102,6 +114,22 @@ pub fn read_frames(path: &Path, w: usize, h: usize, fit: Fit) -> Result<(Vec<f32
     let frame = w * h * 3;
     let n = out.stdout.len() / frame;
     Ok((out.stdout[..n * frame].iter().map(|b| *b as f32 / 255.0).collect(), n))
+}
+
+/// A picture's or video's size in pixels (width, height)
+pub fn size(path: &Path) -> Result<(usize, usize)> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x"])
+        .arg(path)
+        .output()
+        .ctx("starting ffprobe")?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let (w, h) = s.trim().lines().next().and_then(|l| l.split_once('x')).ok_or_else(|| Error(format!("{}: ffprobe found no picture ({})", path.display(),
+                                                                                                    String::from_utf8_lossy(&out.stderr).trim())))?;
+    match (w.trim().parse(), h.trim().parse()) {
+        (Ok(w), Ok(h)) => Ok((w, h)),
+        _ => Err(Error(format!("{}: a picture of size {}?", path.display(), s.trim()))),
+    }
 }
 
 /// The last `n` frames of a picture or video (fewer if it has fewer): [frames, h, w, 3].

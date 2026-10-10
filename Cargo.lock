@@ -445,6 +445,8 @@ dependencies = [
  "fancy-regex",
  "nextsycl-core",
  "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-qwen3vl",
  "nextsycl-video",
  "serde_json",
  "unicode-normalization",

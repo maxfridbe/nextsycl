@@ -1,5 +1,6 @@
 //! Qwen3-VL's vision tower: pictures to the language model's image tokens (transformers' Qwen3VLVisionModel), from
-//! the bf16 tensors in the same file as the text tower (`model.visual.*`), float32 on the GPU.
+//! the bf16 tensors in the same file as the text tower (`model.visual.*`; MiniMax H3's 32B: `visual.*` in a file of
+//! its own), float32 on the GPU. The 8B and the 32B towers are the same but for the merger's output width.
 //!
 //! ```text
 //!   picture (RGB, sides multiples of 32) -> 16 x 16 patches, each twice in time (3 x 2 x 16 x 16 = 1,536 values,
@@ -85,7 +86,12 @@ fn ge(e: nextsycl_gguf::Error) -> Error {
 /// The processor's patches of a picture: RGB float32 [H, W, 3] in 0..255 (sides multiples of 32) -> [n, 1,536] in
 /// merge-block order (block row, block column, row in block, column in block), each patch (channel, time, y, x)
 pub fn patches(rgb: &[f32], h: usize, w: usize) -> Result<(Vec<f32>, (usize, usize))> {
-    if !h.is_multiple_of(PATCH * MERGE) || !w.is_multiple_of(PATCH * MERGE) || rgb.len() != h * w * 3 {
+    patches_frames(&[rgb, rgb], h, w)
+}
+
+/// The same for two frames filling the patches' two time steps (a video's frame pair; a picture is its own pair)
+pub fn patches_frames(frames: &[&[f32]; TEMPORAL], h: usize, w: usize) -> Result<(Vec<f32>, (usize, usize))> {
+    if !h.is_multiple_of(PATCH * MERGE) || !w.is_multiple_of(PATCH * MERGE) || frames.iter().any(|f| f.len() != h * w * 3) {
         return Err(Error(format!("a {w}x{h} picture: the vision tower takes sides that are multiples of {}", PATCH * MERGE)));
     }
     let (gh, gw) = (h / PATCH, w / PATCH);
@@ -96,7 +102,7 @@ pub fn patches(rgb: &[f32], h: usize, w: usize) -> Result<(Vec<f32>, (usize, usi
                 for ic in 0..MERGE {
                     let (py, px) = ((br * MERGE + ir) * PATCH, (bc * MERGE + ic) * PATCH);
                     for c in 0..3 {
-                        for _t in 0..TEMPORAL {
+                        for rgb in frames {
                             for y in 0..PATCH {
                                 for x in 0..PATCH {
                                     out.push((rgb[((py + y) * w + px + x) * 3 + c] / 255.0 - 0.5) / 0.5);
@@ -137,13 +143,18 @@ fn taps(i: usize, n: usize, side: usize) -> (usize, usize, f32) {
 impl Vision {
     /// The tower from the text encoder's file (`model.visual.*`)
     pub fn load(st: &SafeTensors, gpu: &Arc<Gpu>, log: &mut dyn FnMut(String)) -> Result<Vision> {
+        Self::load_from(st, "model.visual.", gpu, log)
+    }
+
+    /// The tower from the tensors under `prefix` (`visual.` in H3's file of the 32B tower alone)
+    pub fn load_from(st: &SafeTensors, prefix: &str, gpu: &Arc<Gpu>, log: &mut dyn FnMut(String)) -> Result<Vision> {
         let t0 = std::time::Instant::now();
-        let up = |n: &str| -> Result<DevBuf> { DevBuf::from_f32(gpu, &st.f32(&format!("model.visual.{n}")).map_err(ge)?) };
-        let shape = |n: &str| -> Result<Vec<u64>> { Ok(st.need(&format!("model.visual.{n}")).map_err(ge)?.shape.clone()) };
+        let up = |n: &str| -> Result<DevBuf> { DevBuf::from_f32(gpu, &st.f32(&format!("{prefix}{n}")).map_err(ge)?) };
+        let shape = |n: &str| -> Result<Vec<u64>> { Ok(st.need(&format!("{prefix}{n}")).map_err(ge)?.shape.clone()) };
         let hidden = shape("patch_embed.proj.bias")?[0] as usize;
         let ffn = shape("blocks.0.mlp.linear_fc1.bias")?[0] as usize;
         let out = shape("merger.linear_fc2.bias")?[0] as usize;
-        let n_blocks = (0..).take_while(|i| st.tensor(&format!("model.visual.blocks.{i}.norm1.weight")).is_some()).count();
+        let n_blocks = (0..).take_while(|i| st.tensor(&format!("{prefix}blocks.{i}.norm1.weight")).is_some()).count();
         let mut blocks = Vec::with_capacity(n_blocks);
         for i in 0..n_blocks {
             let p = |s: &str| format!("blocks.{i}.{s}");
@@ -163,16 +174,16 @@ impl Vision {
                 fc2: up(&format!("{p}.linear_fc2.weight"))?, fc2_b: up(&format!("{p}.linear_fc2.bias"))?,
             })
         };
-        let n_deep = (0..).take_while(|i| st.tensor(&format!("model.visual.deepstack_merger_list.{i}.norm.weight")).is_some()).count();
+        let n_deep = (0..).take_while(|i| st.tensor(&format!("{prefix}deepstack_merger_list.{i}.norm.weight")).is_some()).count();
         let deep = (0..n_deep).map(|i| merger(&format!("deepstack_merger_list.{i}"), true)).collect::<Result<Vec<_>>>()?;
         // the config's deepstack_visual_indexes (Qwen3-VL 8B: 8, 16, 24; the file does not carry them)
         let deep_at: Vec<usize> = DEEP_AT.iter().copied().take(n_deep).collect();
         if n_deep != DEEP_AT.len() || n_blocks <= DEEP_AT[DEEP_AT.len() - 1] {
             return Err(Error(format!("the vision tower: {n_blocks} blocks, {n_deep} deepstack mergers - not Qwen3-VL 8B's 27 and 3")));
         }
-        let pos = st.f32("model.visual.pos_embed.weight").map_err(ge)?;
+        let pos = st.f32(&format!("{prefix}pos_embed.weight")).map_err(ge)?;
         let side = ((pos.len() / hidden) as f64).sqrt() as usize;
-        let pw = st.f32("model.visual.patch_embed.proj.weight").map_err(ge)?;
+        let pw = st.f32(&format!("{prefix}patch_embed.proj.weight")).map_err(ge)?;
         if pw.len() != hidden * PATCH_IN {
             return Err(Error(format!("the vision tower's patch embedding is {} values, not {hidden} x {PATCH_IN}", pw.len())));
         }

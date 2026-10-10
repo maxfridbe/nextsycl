@@ -158,10 +158,15 @@ fn fetch(cat: &Catalog, root: &Path, key: &str, f: &Value, from: &[PathBuf], ver
     let part = target.with_file_name(format!("{name}.part"));
     let url = s(f, "url");
     println!("  {key}: downloading {:.2} GiB\n    {url}", gib(size));
-    let st = Command::new("curl").args(["-fL", "-C", "-", "--retry", "5", "--retry-delay", "5", "-o"]).arg(&part).arg(&url).status()
-        .map_err(|e| format!("curl: {e}"))?;
-    if !st.success() {
-        return Err(format!("{url}: the download failed (run pull again: it resumes)"));
+    if let Some(prefix) = f["tensors"].as_str() {
+        // a part of a larger safetensors file: its header, then only the tensors under `prefix`, by byte range
+        fetch_tensors(&url, prefix, &part)?;
+    } else {
+        let st = Command::new("curl").args(["-fL", "-C", "-", "--retry", "5", "--retry-delay", "5", "-o"]).arg(&part).arg(&url).status()
+            .map_err(|e| format!("curl: {e}"))?;
+        if !st.success() {
+            return Err(format!("{url}: the download failed (run pull again: it resumes)"));
+        }
     }
     let got = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
     if got != size {
@@ -176,6 +181,59 @@ fn fetch(cat: &Catalog, root: &Path, key: &str, f: &Value, from: &[PathBuf], ver
     println!("ok");
     std::fs::rename(&part, &target).map_err(|e| format!("{}: {e}", target.display()))?;
     Ok(target)
+}
+
+/// Bytes [a, b) of a URL
+fn range(url: &str, a: u64, b: u64) -> Result<Vec<u8>, String> {
+    let o = Command::new("curl").args(["-fsL", "--retry", "5", "--retry-delay", "5", "-r", &format!("{a}-{}", b - 1)]).arg(url).output()
+        .map_err(|e| format!("curl: {e}"))?;
+    if !o.status.success() || o.stdout.len() as u64 != b - a {
+        return Err(format!("{url}: bytes {a}-{b}: the download failed ({} bytes)", o.stdout.len()));
+    }
+    Ok(o.stdout)
+}
+
+/// The tensors of a remote safetensors file whose names start with `prefix`, as a safetensors file of their own (the
+/// header rewritten - compact, keys sorted - the data in the source's order, read in 64 MiB ranges); the same bytes
+/// every time, so its SHA-256 can be in the catalog
+fn fetch_tensors(url: &str, prefix: &str, out: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let n = u64::from_le_bytes(range(url, 0, 8)?.try_into().map_err(|_| "a short header")?);
+    let head: Value = serde_json::from_slice(&range(url, 8, 8 + n)?).map_err(|e| format!("{url}: its header: {e}"))?;
+    let mut keep: Vec<(String, Value)> = head.as_object().into_iter().flatten()
+        .filter(|(k, _)| k.as_str() != "__metadata__" && k.starts_with(prefix)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    if keep.is_empty() {
+        return Err(format!("{url}: no tensor starts with {prefix}"));
+    }
+    let off = |v: &Value, i: usize| v["data_offsets"][i].as_u64().unwrap_or(0);
+    keep.sort_by_key(|(_, v)| off(v, 0));
+    let mut new = Map::new();
+    let mut at = 0u64;
+    for (k, v) in &keep {
+        let len = off(v, 1) - off(v, 0);
+        new.insert(k.clone(), serde_json::json!({"dtype": v["dtype"], "shape": v["shape"], "data_offsets": [at, at + len]}));
+        at += len;
+    }
+    if let Some(m) = head.get("__metadata__") {
+        new.insert("__metadata__".into(), m.clone());
+    }
+    // the header compact with its keys sorted (serde_json's map), padded to 8 bytes
+    let mut h = serde_json::to_string(&Value::Object(new)).map_err(|e| e.to_string())?;
+    while h.len() % 8 != 0 {
+        h.push(' ');
+    }
+    let mut f = std::fs::File::create(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    f.write_all(&(h.len() as u64).to_le_bytes()).and_then(|_| f.write_all(h.as_bytes())).map_err(|e| e.to_string())?;
+    let base = 8 + n;
+    for (_, v) in &keep {
+        let (mut a, b) = (off(v, 0), off(v, 1));
+        while a < b {
+            let e = b.min(a + (64 << 20));
+            f.write_all(&range(url, base + a, base + e)?).map_err(|e| e.to_string())?;
+            a = e;
+        }
+    }
+    Ok(())
 }
 
 /// The registry entry a pulled model gets. `local`: the made-locally parts found (role -> path)

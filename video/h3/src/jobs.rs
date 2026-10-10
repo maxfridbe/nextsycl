@@ -14,7 +14,8 @@ use crate::device::{Device, Tensor};
 use crate::dtype::{f32_to_bf16, DType};
 use crate::rng::Rng;
 use crate::safetensors::Checkpoint;
-use crate::denoiser::{self, Conditions, Denoiser, KeyframeIn, Outer, Schedule, Shape, TextRefiner};
+use crate::denoiser::{self, Conditions, Denoiser, KeyframeIn, Outer, RefIn, Schedule, Shape, TextRefiner};
+use crate::vision::{Frames, Piece};
 use crate::{dit, reference, Error, Result};
 use serde_json::{json, Value};
 
@@ -372,15 +373,39 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
     if let Some(list) = dump.metadata.get("ref_list") {
         let list: Value = serde_json::from_str(list).map_err(|e| Error(format!("ref_list: {e}")))?;
         for (i, r) in list.as_array().ok_or("ref_list is not a list")?.iter().enumerate() {
-            match r["kind"].as_str() {
-                Some("audio") => {
-                    let a = f32s(&format!("ref.{i}.audio"))?;
-                    let t = dump.get(&format!("ref.{i}.audio"))?.shape[3];
-                    ctl.say(format!("ref {i}  : audio, {t} latent frames"));
-                    cond.ref_audio.push((a, t));
+            let audio = |i: usize| -> Result<Option<(Vec<f32>, usize)>> {
+                let k = format!("ref.{i}.audio");
+                if !dump.entries.contains_key(&k) {
+                    return Ok(None);
                 }
-                other => return Err(Error(format!("reference {i}: {other:?} references are not supported (the text encoder in use has no vision tower)"))),
-            }
+                Ok(Some((f32s(&k)?, dump.get(&k)?.shape[3])))
+            };
+            let video = |i: usize| -> Result<(Vec<f32>, [usize; 3])> {
+                let k = format!("ref.{i}.video");
+                let sh = &dump.get(&k)?.shape; // [1, 24, t, h, w]
+                Ok((f32s(&k)?, [sh[2], sh[3], sh[4]]))
+            };
+            let r = match r["kind"].as_str() {
+                Some("audio") => {
+                    let (latent, t) = audio(i)?.ok_or("an audio reference without its latent")?;
+                    RefIn::Audio { latent, t }
+                }
+                Some("image") => {
+                    let (latent, [_, h, w]) = video(i)?;
+                    RefIn::Image { latent, h, w }
+                }
+                Some("video" | "video_audio") => {
+                    let (latent, [t, h, w]) = video(i)?;
+                    RefIn::Video { latent, t, h, w, audio: audio(i)? }
+                }
+                other => return Err(Error(format!("reference {i}: a {other:?} reference?"))),
+            };
+            ctl.say(format!("ref {i}  : {}", match &r {
+                RefIn::Audio { t, .. } => format!("audio, {t} latent frames"),
+                RefIn::Image { h, w, .. } => format!("picture, {w}x{h} latent"),
+                RefIn::Video { t, h, w, audio, .. } => format!("clip, {t} x {w}x{h} latent{}", audio.as_ref().map_or(String::new(), |a| format!(" + {} audio frames", a.1))),
+            }));
+            cond.refs.push(r);
         }
     }
     let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule, &cond)?;
@@ -680,18 +705,38 @@ pub fn check_encoders(dev: &Arc<Device>, vae: &Path, audio_vae: &Path, dump_path
     Ok(Value::Object(report))
 }
 
-/// The text encoder's files: its GGUF weights and the tokenizer's directory.
+/// The text encoder's files: its GGUF weights, the tokenizer's directory, and its vision tower (pictures and clips in
+/// the prompt need it).
 pub struct TeFiles<'a> {
     pub te: &'a Path,
     pub tokenizer: &'a Path,
+    pub visual: Option<&'a Path>,
 }
 
 /// A prompt -> the denoiser's text conditioning: the tokenizer and the text encoder, streamed layer by layer.
 /// `check`: a run dump whose `context` is the reference's conditioning for the same prompt. `out`: a `.safetensors`
 /// with `context` [1, L, 5120] and `token_tags`.
 pub fn encode(dev: &Arc<Device>, threads: usize, prompt: &str, files: &TeFiles, out: Option<&Path>, check: Option<&Path>, ctl: &mut Ctl) -> Result<Value> {
+    encode_with(dev, threads, &[], prompt, files, out, check, ctl)
+}
+
+/// The same with pictures ahead of the prompt (`<Picture i>: ` and each picture at its own size, sides rounded to 32),
+/// as the image-to-video presentation shows its keyframes
+#[allow(clippy::too_many_arguments)]
+pub fn encode_with(dev: &Arc<Device>, threads: usize, pictures: &[&Path], prompt: &str, files: &TeFiles, out: Option<&Path>, check: Option<&Path>,
+                   ctl: &mut Ctl) -> Result<Value> {
     let t_all = Instant::now();
-    let (ctx, ids, hidden, secs) = encode_prompt(dev, threads, prompt, files, ctl)?;
+    let mut pieces = Vec::new();
+    for (i, p) in pictures.iter().enumerate() {
+        let (pw, ph) = crate::media::size(p)?;
+        let (w, h) = (round32(pw as f64), round32(ph as f64));
+        let (px, _) = crate::media::read_frames_tail(p, 1, w, h, crate::media::Fit::Stretch)?;
+        pieces.push(Piece::Text(format!("<Picture {}>: ", i + 1)));
+        pieces.push(Piece::Vision(Frames { frames: vec![px], w, h }));
+    }
+    pieces.push(Piece::Text(prompt.to_string()));
+    let (ctx, presented, hidden, secs) = encode_pieces(dev, threads, &pieces, files, ctl)?;
+    let ids = presented.ids.clone();
     let mut report = json!({"tokens": ids.len(), "seconds": secs});
     if let Some(c) = check {
         let d = Checkpoint::open(c)?;
@@ -711,7 +756,7 @@ pub fn encode(dev: &Arc<Device>, threads: usize, prompt: &str, files: &TeFiles, 
     if let Some(o) = out {
         let mut t = BTreeMap::new();
         t.insert("context".to_string(), (vec![1, ids.len(), hidden], ctx));
-        t.insert("token_tags".to_string(), (vec![ids.len()], vec![1.0; ids.len()]));
+        t.insert("token_tags".to_string(), (vec![ids.len()], presented.tags.iter().map(|t| *t as f32).collect()));
         crate::safetensors::write_f32(o, &t, &BTreeMap::from([("prompt".to_string(), prompt.to_string())]))?;
         ctl.say(format!("written: {}", o.display()));
     }
@@ -727,24 +772,31 @@ pub fn encode_prompt(dev: &Arc<Device>, threads: usize, prompt: &str, files: &Te
 /// The same with labels ahead of the prompt (`<Audio 1>: ` per reference audio): the reference tokenizes every
 /// piece of the presentation on its own and joins the ids.
 pub fn encode_presentation(dev: &Arc<Device>, threads: usize, labels: &[String], prompt: &str, files: &TeFiles, ctl: &mut Ctl) -> Result<(Vec<f32>, Vec<u32>, usize, f64)> {
+    let mut pieces: Vec<Piece> = labels.iter().map(|l| Piece::Text(l.clone())).collect();
+    pieces.push(Piece::Text(prompt.to_string()));
+    let (ctx, p, hidden, secs) = encode_pieces(dev, threads, &pieces, files, ctl)?;
+    Ok((ctx, p.ids, hidden, secs))
+}
+
+/// The presentation's pieces - text, and pictures through the vision tower - to the conditioning: (conditioning
+/// [L, hidden], what was presented: ids, modality tags, vision blocks; hidden, seconds)
+pub fn encode_pieces(dev: &Arc<Device>, threads: usize, pieces: &[Piece], files: &TeFiles, ctl: &mut Ctl) -> Result<(Vec<f32>, crate::vision::Presented, usize, f64)> {
     let (te, tokenizer) = (files.te, files.tokenizer);
     let tok = crate::tokenizer::Tokenizer::load(tokenizer)?;
-    let mut ids = Vec::new();
-    for l in labels {
-        ids.extend(tok.encode(l)?);
-    }
-    ids.extend(tok.encode(prompt)?);
-    if ids.is_empty() {
-        ids.push(151643); // the reference encodes an empty prompt as one pad token
-    }
-    ctl.say(format!("prompt : {} tokens", ids.len()));
+    let presented = crate::vision::present(pieces, &tok, files.visual, dev.index, &mut |l| ctl.say(l))?;
+    let ids = &presented.ids;
+    ctl.say(format!("prompt : {} tokens{}", ids.len(), if presented.has_vision() {
+        format!(" ({} in {} vision blocks)", presented.seen.iter().map(|s| s.grid.0 * s.grid.1 + 2).sum::<usize>(), presented.seen.len())
+    } else {
+        String::new()
+    }));
     let enc = crate::te::TextEncoder::open(te)?;
     ctl.say(format!("te     : {} layers, hidden {}, {} query / {} key-value heads ({})", enc.layers, enc.hidden, enc.heads, enc.kv_heads, te.display()));
     let t0 = Instant::now();
     let cancel = ctl.cancel;
     let layers = enc.layers;
     let mut progress = ctl.progress.take();
-    let r = enc.encode(dev, &ids, threads, &mut |i| {
+    let r = enc.encode(dev, ids, &presented.seen, threads, &mut |i| {
         if cancel.load(Ordering::Relaxed) {
             return Err(Error("cancelled".into()));
         }
@@ -757,7 +809,7 @@ pub fn encode_presentation(dev: &Arc<Device>, threads: usize, labels: &[String],
     let ctx = r?;
     let secs = t0.elapsed().as_secs_f64();
     ctl.say(format!("encoded: {} x {} in {secs:.1} s (layers from {})", ids.len(), enc.hidden, enc.source.lock().map(|s| s.clone()).unwrap_or_default()));
-    Ok((ctx, ids, enc.hidden, secs))
+    Ok((ctx, presented, enc.hidden, secs))
 }
 
 /// What a `generate` job makes: the prompt, the canvas, the length, the sampling, the files it reads.
@@ -798,6 +850,19 @@ pub struct ClipInputs<'a> {
     pub shift: Option<(f32, f32)>,
     /// reference audio, a voice to speak in: `<Audio 1>`, `<Audio 2>` ... in the prompt (up to 3)
     pub ref_audio: Vec<&'a Path>,
+    /// reference pictures (identity, a look): `<Picture 1>` ... in the prompt (up to 9) - with references the clip is
+    /// ref2va (the ref2va denoiser is the one trained for it)
+    pub ref_images: Vec<&'a Path>,
+    /// reference pictures at the reference pipeline's 2048-pixel short side instead of the clip's area (closer
+    /// likeness, several times the tokens)
+    pub ref_image_max: bool,
+    /// reference clips (motion, a performance): `<Video 1>` ... (up to 3), 24 fps, their own sound as `<Audio j>`
+    /// unless `ref_video_sound` is off
+    pub ref_videos: Vec<&'a Path>,
+    pub ref_video_sound: bool,
+    /// the keyframe pictures also shown to the text encoder as `<Picture i>` (as ComfyUI's image-to-video node does;
+    /// off: the latents alone, as before)
+    pub te_pictures: bool,
     /// a masked run: a previous clip's `.latents.safetensors`; the parts not regenerated are kept from it (a source
     /// shorter than the clip is extended)
     pub source: Option<&'a Path>,
@@ -865,8 +930,9 @@ fn clip_inpaint(inp: &ClipInputs, shape: Shape) -> Result<Option<denoiser::Inpai
 
 /// The video keyframes and audio keyframe of a clip, encoded (the encoders loaded only when a picture or sound
 /// needs them).
-fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (usize, usize, usize), ctl: &mut Ctl) -> Result<Vec<KeyframeIn>> {
+fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (usize, usize, usize), ctl: &mut Ctl) -> Result<(Vec<KeyframeIn>, Vec<Frames>)> {
     let mut kfs: Vec<KeyframeIn> = Vec::new();
+    let pictures = std::cell::RefCell::new(Vec::new());
     let needs_venc = inp.first_frame.is_some() || inp.last_frame.is_some() || !inp.guides.is_empty();
     let venc = match needs_venc {
         true => Some(crate::venc::VideoEncoder::load(dev, &Checkpoint::open(vaes.video)?)?),
@@ -889,6 +955,7 @@ fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frame
         }
         let (z, vt) = venc.as_ref().expect("encoder loaded").encode(&px, 1, h, w, &mut || Ok(()))?;
         ctl.say(format!("keyframe: {what} {} at frame {index}", path.display()));
+        pictures.borrow_mut().push(Frames { frames: vec![px], w, h });
         Ok(KeyframeIn { frame_index: index, video: Some((z, vt)), audio: None })
     };
     if let Some(p) = inp.first_latent {
@@ -951,7 +1018,112 @@ fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frame
             None => kfs.push(KeyframeIn { frame_index: 0, video: None, audio: Some((z, rt)) }),
         }
     }
-    Ok(kfs)
+    Ok((kfs, pictures.into_inner()))
+}
+
+const CANVAS_MULTIPLE: usize = 32;
+
+fn round32(x: f64) -> usize {
+    ((x / CANVAS_MULTIPLE as f64).round() as usize * CANVAS_MULTIPLE).max(CANVAS_MULTIPLE)
+}
+
+/// A reference clip's canvas: a 768 short side within 768 x 1344 pixels, each side to a multiple of 32 (ComfyUI's
+/// adapt_canvas); a smaller clip keeps its own size
+fn ref_clip_canvas(vw: usize, vh: usize) -> (usize, usize) {
+    let ratio = vw as f64 / vh as f64;
+    let (mut w, mut h) = if ratio >= 1.0 { (768.0 * ratio, 768.0) } else { (768.0, 768.0 / ratio) };
+    let max = 768.0 * 1344.0;
+    if w * h > max {
+        let s = (max / (w * h)).sqrt();
+        (w, h) = (w * s, h * s);
+    }
+    let (cw, ch) = (round32(w), round32(h));
+    if vw * vh < cw * ch {
+        (round32(vw as f64), round32(vh as f64))
+    } else {
+        (cw, ch)
+    }
+}
+
+/// The references (ref2va, ComfyUI's MiniMaxH3ReferenceToVideo): their pieces of the presentation - pictures first,
+/// then clips (a clip's sound labelled `<Audio j>` right before its `<Video k>`), then sounds - and their latents in
+/// the same order
+fn clip_refs(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (usize, usize, usize), ctl: &mut Ctl) -> Result<(Vec<Piece>, Vec<RefIn>)> {
+    let (mut pieces, mut refs) = (Vec::new(), Vec::new());
+    if inp.ref_images.is_empty() && inp.ref_videos.is_empty() && inp.ref_audio.is_empty() {
+        return Ok((pieces, refs));
+    }
+    let venc = match inp.ref_images.is_empty() && inp.ref_videos.is_empty() {
+        true => None,
+        false => Some(crate::venc::VideoEncoder::load(dev, &Checkpoint::open(vaes.video)?)?),
+    };
+    let aenc = std::cell::OnceCell::new();
+    let audio_enc = || -> Result<&crate::audio::AudioEncoder> {
+        if aenc.get().is_none() {
+            let ck = Checkpoint::open(vaes.audio.ok_or("reference sound needs the audio decoder's checkpoint (audio_vae)")?)?;
+            let _ = aenc.set(crate::audio::AudioEncoder::load(dev, &ck)?);
+        }
+        Ok(aenc.get().expect("set above"))
+    };
+    let rate = crate::audio::SAMPLE_RATE;
+    let (mut n_audio, mut n_video) = (0, 0);
+    for (i, p) in inp.ref_images.iter().enumerate() {
+        let (pw, ph) = crate::media::size(p)?;
+        let scale = if inp.ref_image_max { (2048.0 / pw.min(ph) as f64).min(1.0) } else { ((w * h) as f64 / (pw * ph) as f64).sqrt().min(1.0) };
+        let (tw, th) = (round32(pw as f64 * scale), round32(ph as f64 * scale));
+        let (px, _) = crate::media::read_frames_tail(p, 1, tw, th, crate::media::Fit::Stretch)?;
+        let (z, _) = venc.as_ref().expect("loaded for pictures").encode(&px, 1, th, tw, &mut || ctl.check())?;
+        ctl.say(format!("ref    : <Picture {}> = {} ({tw}x{th})", i + 1, p.display()));
+        pieces.push(Piece::Text(format!("<Picture {}>: ", i + 1)));
+        pieces.push(Piece::Vision(Frames { frames: vec![px], w: tw, h: th }));
+        refs.push(RefIn::Image { latent: z, h: th / 16, w: tw / 16 });
+    }
+    for p in &inp.ref_videos {
+        let (vw, vh) = crate::media::size(p)?;
+        let (cw, ch) = ref_clip_canvas(vw, vh);
+        let (px, got) = crate::media::read_frames_at(p, cw, ch, crate::media::Fit::Stretch, Some((24.0, frames)))?;
+        if got < 5 {
+            return Err(Error(format!("{}: a reference clip needs 5 frames at least (~0.2 s at 24 fps)", p.display())));
+        }
+        let mut n = got;
+        while n % 17 != 5 {
+            n -= 1;
+        }
+        let fsz = cw * ch * 3;
+        let sound = if inp.ref_video_sound { crate::media::read_audio_tail(p, 0.0, rate).ok().filter(|c| !c[0].is_empty()) } else { None };
+        let audio = match sound {
+            Some(chans) => {
+                n_audio += 1;
+                pieces.push(Piece::Text(format!("<Audio {n_audio}>: ")));
+                Some(audio_enc()?.encode(&chans)?)
+            }
+            None => None,
+        };
+        n_video += 1;
+        pieces.push(Piece::Text(format!("<Video {n_video}>: ")));
+        // the encoder sees it at 2 fps, two frames a block (an odd last one repeated), each block labelled with its
+        // middle time
+        let picks: Vec<usize> = (0..n).step_by(12).collect();
+        for (j, pair) in picks.chunks(2).enumerate() {
+            let (a, b) = (pair[0], *pair.last().expect("non-empty"));
+            let t = if pair.len() == 2 { (2 * j) as f64 / 2.0 + 0.25 } else { (2 * j) as f64 / 2.0 };
+            pieces.push(Piece::Text(format!("<{t:.1} seconds>")));
+            pieces.push(Piece::Vision(Frames { frames: vec![px[a * fsz..(a + 1) * fsz].to_vec(), px[b * fsz..(b + 1) * fsz].to_vec()], w: cw, h: ch }));
+        }
+        let (z, vt) = venc.as_ref().expect("loaded for clips").encode(&px[..n * fsz], n, ch, cw, &mut || ctl.check())?;
+        ctl.say(format!("ref    : <Video {n_video}> = {} ({cw}x{ch}, {n} frames{})", p.display(),
+                        audio.as_ref().map_or(String::new(), |a| format!(", its sound as <Audio {n_audio}>: {} latent frames", a.1))));
+        refs.push(RefIn::Video { latent: z, t: vt, h: ch / 16, w: cw / 16, audio });
+    }
+    for p in &inp.ref_audio {
+        let chans = crate::media::read_audio_tail(p, 0.0, rate)?;
+        let (z, t) = audio_enc()?.encode(&chans)?;
+        n_audio += 1;
+        ctl.say(format!("ref    : <Audio {n_audio}> = {} ({:.1} s, {t} latent frames)", p.display(), chans[0].len() as f64 / rate as f64));
+        pieces.push(Piece::Text(format!("<Audio {n_audio}>: ")));
+        refs.push(RefIn::Audio { latent: z, t });
+    }
+    Ok((pieces, refs))
 }
 
 /// The model's frame grid: frames at 24 fps snapped up to 17k + 5; (frames, video latent frames, audio latent frames).
@@ -974,8 +1146,28 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     let (frames, lt, at) = temporal_shape(c.seconds);
     let shape = Shape { t: lt, h: c.height / 16, w: c.width / 16, audio_t: at };
     ctl.say(format!("clip   : {}x{}, {frames} frames ({:.2} s), {} steps, seed {}", c.width, c.height, frames as f64 / 24.0, c.steps, c.seed));
-    let labels: Vec<String> = (1..=c.inputs.ref_audio.len()).map(|j| format!("<Audio {j}>: ")).collect();
-    let (ctx, ids, hidden, te_secs) = encode_presentation(&e.dev, e.threads, &labels, &c.prompt, &c.te, ctl)?;
+    // the keyframes and the references first (their pictures are part of the prompt's presentation)
+    let mut cond = Conditions { seed: c.seed, ..Conditions::default() };
+    if let Some(a) = c.inputs.cond_noise_aug {
+        cond.visual_aug = a;
+    }
+    let (keyframes, kf_pictures) = clip_keyframes(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), ctl)?;
+    cond.keyframes = keyframes;
+    let (mut pieces, refs) = clip_refs(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), ctl)?;
+    cond.refs = refs;
+    if pieces.is_empty() && c.inputs.te_pictures && !kf_pictures.is_empty() {
+        if c.te.visual.is_some() {
+            for (i, f) in kf_pictures.into_iter().enumerate() {
+                pieces.push(Piece::Text(format!("<Picture {}>: ", i + 1)));
+                pieces.push(Piece::Vision(f));
+            }
+        } else {
+            ctl.say("vision : no vision tower file (te_visual): the keyframes' pictures reach the denoiser only".to_string());
+        }
+    }
+    pieces.push(Piece::Text(c.prompt.clone()));
+    let (ctx, presented, hidden, te_secs) = encode_pieces(&e.dev, e.threads, &pieces, &c.te, ctl)?;
+    let ids = &presented.ids;
     ctl.check()?;
     let mut lora: Option<crate::lora::LoraSet> = None;
     for (p, strength) in &c.lora {
@@ -1003,22 +1195,10 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         schedule.shift_video = sv;
         schedule.shift_audio = sa;
     }
-    let mut cond = Conditions { seed: c.seed, ..Conditions::default() };
-    if let Some(a) = c.inputs.cond_noise_aug {
-        cond.visual_aug = a;
-    }
-    cond.keyframes = clip_keyframes(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), ctl)?;
-    if !c.inputs.ref_audio.is_empty() {
-        let aenc = crate::audio::AudioEncoder::load(&e.dev, &Checkpoint::open(c.vaes.audio.ok_or("reference audio needs the audio decoder's checkpoint (audio_vae)")?)?)?;
-        for (j, p) in c.inputs.ref_audio.iter().enumerate() {
-            let chans = crate::media::read_audio_tail(p, 0.0, crate::audio::SAMPLE_RATE)?;
-            let (z, t) = aenc.encode(&chans)?;
-            ctl.say(format!("ref    : <Audio {}> = {} ({:.1} s, {t} latent frames)", j + 1, p.display(), chans[0].len() as f64 / crate::audio::SAMPLE_RATE as f64));
-            cond.ref_audio.push((z, t));
-        }
-    }
     let inpaint = clip_inpaint(&c.inputs, shape)?;
-    let mut d = Denoiser::new(&e.model, &e.outer, text, None, shape, schedule, &cond)?;
+    // vision blocks run on the video tables (tag 0), the rest on the text ones
+    let tags = presented.has_vision().then(|| presented.tags.clone());
+    let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule, &cond)?;
     d.lora = lora.as_ref();
     if let Some(p) = &inpaint {
         let gen_v = p.mask_v.iter().filter(|m| **m > 0.0).count() as f64 / p.mask_v.len() as f64;
@@ -1144,6 +1324,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                 te: TeFiles {
                     te: Path::new(s("te").unwrap_or("/models/teacher/qwen3vl_32b_minimax_h3-Q4_K_M.gguf")),
                     tokenizer: Path::new(s("tokenizer").unwrap_or("/app/tokenizer")),
+                    visual: s("te_visual").map(Path::new).filter(|p| p.exists()),
                 },
                 vaes: Vaes {
                     video: Path::new(s("vae").unwrap_or("/models/Comfy-Org-MiniMax-H3/vae/minimax_h3_video_vae_fp16.safetensors")),
@@ -1182,6 +1363,11 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                         (v, a) => Some((v.unwrap_or(12.0) as f32, a.unwrap_or(3.0) as f32)),
                     },
                     ref_audio: s("ref_audio").map(|r| r.split(',').map(Path::new).take(3).collect()).unwrap_or_default(),
+                    ref_images: s("ref_images").map(|r| r.split(',').filter(|x| !x.is_empty()).map(Path::new).take(9).collect()).unwrap_or_default(),
+                    ref_image_max: s("ref_image_size") == Some("max"),
+                    ref_videos: s("ref_videos").map(|r| r.split(',').filter(|x| !x.is_empty()).map(Path::new).take(3).collect()).unwrap_or_default(),
+                    ref_video_sound: spec.get("ref_video_sound").and_then(Value::as_bool).unwrap_or(true),
+                    te_pictures: spec.get("te_pictures").and_then(Value::as_bool).unwrap_or(true),
                     source: s("source").map(Path::new),
                     regen: s("regen").and_then(|r| {
                         let (a, b) = r.split_once('-')?;
@@ -1218,7 +1404,9 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
             };
             let te = s("te").ok_or("encode needs \"te\": the text encoder's GGUF file")?;
             let tokenizer = s("tokenizer").unwrap_or("/app/tokenizer");
-            encode(&e.dev, e.threads, &prompt, &TeFiles { te: Path::new(te), tokenizer: Path::new(tokenizer) }, s("out").map(Path::new), s("check").map(Path::new), ctl)
+            let pictures: Vec<&Path> = s("pictures").map(|r| r.split(',').filter(|x| !x.is_empty()).map(Path::new).collect()).unwrap_or_default();
+            let files = TeFiles { te: Path::new(te), tokenizer: Path::new(tokenizer), visual: s("te_visual").map(Path::new) };
+            encode_with(&e.dev, e.threads, &pictures, &prompt, &files, s("out").map(Path::new), s("check").map(Path::new), ctl)
         }
         other => Err(Error(format!("unknown job kind {other:?} (known: bench-blocks, check-block, denoise, decode, encode, generate)"))),
     }

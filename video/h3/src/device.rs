@@ -23,6 +23,8 @@ pub struct GpuInfo {
 pub struct Device {
     pub(crate) api: Api,
     pub(crate) ctx: *mut c_void,
+    /// the GPU's index in `list()` (the vision tower opens the same card in a context of its own)
+    pub index: usize,
 }
 
 // SAFETY: the context is a SYCL queue plus state guarded inside the library (h3sycl.h: the copy and allocation
@@ -60,7 +62,7 @@ impl Device {
         if ctx.is_null() {
             return Err(Error(format!("GPU {index}: {}", api.error())));
         }
-        Ok(Arc::new(Device { api, ctx }))
+        Ok(Arc::new(Device { api, ctx, index }))
     }
 
     /// Opens the first GPU.
@@ -71,7 +73,7 @@ impl Device {
         if ctx.is_null() {
             return Err(Error(format!("no usable GPU: {}", api.error())));
         }
-        Ok(Arc::new(Device { api, ctx }))
+        Ok(Arc::new(Device { api, ctx, index: 0 }))
     }
 
     pub fn name(&self) -> String {
