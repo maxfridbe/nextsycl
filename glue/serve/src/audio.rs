@@ -185,6 +185,21 @@ impl AudioServer {
                 http::respond_with(&mut s, 200, &json!({"cancelled": busy}), &cors)
             }
             ("GET", p) if p.starts_with("/v1/audio/files/") => self.file(&mut s, &p["/v1/audio/files/".len()..], &req.head, &cors),
+            ("GET", "/api/voices") => http::respond_with(&mut s, 200, &json!({"data": self.voices().map(|l| l.list()).unwrap_or_default()}), &cors),
+            ("GET", p) if p.starts_with("/v1/audio/voices/") => {
+                let name = p["/v1/audio/voices/".len()..].trim_end_matches(".wav");
+                match self.voices().and_then(|l| l.sample_path(name)).and_then(|p| std::fs::read(p).ok()) {
+                    Some(b) => http::respond_bytes(&mut s, 200, "audio/wav", &b, &format!("{cors}Cache-Control: no-cache\r\n")),
+                    None => http::respond_with(&mut s, 404, &err(format!("no saved voice {name}")), &cors),
+                }
+            }
+            ("POST", "/api/voices/add") | ("POST", "/api/voices/remove") => {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                match self.voice_op(&req.path, &body) {
+                    Ok(v) => http::respond_with(&mut s, 200, &v, &cors),
+                    Err(m) => http::respond_with(&mut s, 400, &err(m), &cors),
+                }
+            }
             ("POST", "/v1/audio/speech") | ("POST", "/audio/speech") => {
                 let body: Value = match serde_json::from_slice(&req.body) {
                     Ok(v) => v,
@@ -265,6 +280,46 @@ impl AudioServer {
         }
     }
 
+    /// The saved voices (beside the output directory; none without one)
+    fn voices(&self) -> Option<crate::voices::Library> {
+        self.out_dir.as_deref().map(crate::voices::Library::of)
+    }
+
+    /// Save a voice - a recording sent (base64 / a data: URL, any format) or a file made here - or remove one
+    fn voice_op(&self, path: &str, b: &Value) -> Result<Value, String> {
+        let lib = self.voices().ok_or("this server keeps no files (start it with an output directory)")?;
+        let name = b["name"].as_str().unwrap_or("");
+        if path.ends_with("/remove") {
+            lib.remove(name)?;
+            return Ok(json!({"removed": name}));
+        }
+        let s = |k: &str| b[k].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+        let (bytes, from, made) = match (s("sample"), s("file")) {
+            (Some(a), _) => (http::unbase64(&a).map_err(|e| format!("sample: {e}"))?, "a recording", Value::Null),
+            (None, Some(f)) => {
+                // a file made here: what it says, the voice's description (a designed one's instructions), its language
+                let f = f.rsplit('/').next().unwrap_or(&f).to_string();
+                let dir = self.out_dir.as_ref().expect("checked above");
+                if f.contains("..") || !f.ends_with(".wav") {
+                    return Err(format!("file {f}: a WAV made here"));
+                }
+                let p = dir.join(&f);
+                (std::fs::read(&p).map_err(|e| format!("{f}: {e}"))?, "made here", entry(&p, 0).unwrap_or_default())
+            }
+            _ => return Err("sample (a recording, base64 or a data: URL) or file (a WAV made here)".into()),
+        };
+        let m = |k: &str| made[k].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+        let text = s("text").or_else(|| m("prompt"));
+        let description = s("description").or_else(|| m("instructions").filter(|_| made["cloned"] == false && made["voice"].is_null()));
+        let language = s("language").or_else(|| m("language"));
+        let kind = if description.is_some() && from == "made here" { "design" } else { "clone" };
+        let from = match m("model") {
+            Some(model) => format!("{from} ({model})"),
+            None => from.to_string(),
+        };
+        lib.add(name, &bytes, text.as_deref(), description.as_deref(), language.as_deref(), kind, &from, b["replace"] == true)
+    }
+
     /// Runs a request: (JSON for response_format url, else none) and the WAV's bytes
     fn generate(&self, b: &Value, base: &str) -> Result<(Option<Value>, Vec<u8>), (u16, String)> {
         let bad = |m: String| (400u16, m);
@@ -313,6 +368,7 @@ impl AudioServer {
         };
         let frames_per_s = if speech { 12.5 } else { 25.0 };
         let seconds = num(&["seconds", "duration", "audio_duration"]).or_else(|| num(&["max_new_tokens"]).map(|f| f / frames_per_s)).map(|v| v as f32);
+        let mut saved: Option<String> = None;
         let mut req = AudioRequest {
             prompt: prompt.clone(),
             lyrics: lyrics.clone(),
@@ -326,6 +382,25 @@ impl AudioServer {
             instructions: instructions.clone(),
             reference,
         };
+        // a saved voice: its recording and transcript as the reference, for a model that clones
+        if let (Some(sp), Some(v)) = (engine.speech(), req.voice.clone()) {
+            if !sp.voices.iter().any(|x| x.eq_ignore_ascii_case(&v)) {
+                let lib = self.voices().ok_or_else(|| bad(format!("voice {v}: not a built-in one, and this server keeps no saved voices")))?;
+                if lib.get(&v).is_none() {
+                    let mut known = sp.voices.clone();
+                    known.extend(lib.list().iter().filter_map(|x| x["name"].as_str().map(str::to_string)));
+                    return Err(bad(format!("voice {v}: none such ({})", known.join(", "))));
+                }
+                if !sp.clone {
+                    return Err(bad(format!("voice {v} is a saved voice: speak it with a model that clones (qwen3-tts-base)")));
+                }
+                if req.reference.is_none() {
+                    req.reference = Some(lib.reference(&v).map_err(bad)?);
+                }
+                req.voice = None;
+                saved = Some(v);
+            }
+        }
         if !given.is_empty() {
             nextsycl_core::options::resolve(&given, engine.options(), nextsycl_core::At::Request, &self.model).map_err(bad)?;
             req.extra = nextsycl_core::options::by_name(&given, engine.options());
@@ -358,7 +433,7 @@ impl AudioServer {
         let meta = json!({"model": self.model, "seed": seed, "steps": steps, "cfg": f(cfg), "took": took, "wh": wh, "created": created}).to_string();
         let mut meta: Value = serde_json::from_str(&meta).unwrap_or_default();
         if speech {
-            meta["voice"] = json!(req.voice);
+            meta["voice"] = json!(req.voice.clone().or(saved));
             meta["language"] = json!(req.language);
             meta["instructions"] = json!(instructions);
             meta["cloned"] = json!(req.reference.is_some());

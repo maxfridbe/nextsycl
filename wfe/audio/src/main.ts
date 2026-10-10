@@ -7,7 +7,7 @@ import { eventListenersModule } from "../../vendor/snabbdom/modules/eventlistene
 import { propsModule } from "../../vendor/snabbdom/modules/props.js";
 import { styleModule } from "../../vendor/snabbdom/modules/style.js";
 import type { VNode } from "../../vendor/snabbdom/vnode.js";
-import { refreshHistory } from "./actions.js";
+import { refreshHistory, refreshVoices } from "./actions.js";
 import { api } from "./api.js";
 import { App } from "./components/App.js";
 import { onRender, render, restorePreferences, state } from "./state.js";
@@ -71,3 +71,4 @@ void pollInfo();
 void pollProgress();
 void pollGpu();
 void refreshHistory();
+void refreshVoices();

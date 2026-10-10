@@ -82,7 +82,7 @@ pub const METHODS: &[Method] = &[
              example: r#"{"model": "minimax-music3", "instructions": "warm acoustic folk, 90 BPM, a soft male voice", "input": "[verse]\nRiver runs slow tonight\n[chorus]\nCarry me home", "seconds": 60}"# },
     Method { kind: "audio", name: "speak", summary: "Speech from text (a speech model: Qwen3-TTS); the answer links the WAV",
              fields: &[MODEL_OPT, ("input", "string", "the text to say", true),
-                       ("voice", "string", "a built-in voice (the CustomVoice model: audio.info lists them)", false),
+                       ("voice", "string", "a built-in voice (audio.info lists them) or a saved one (audio.voices.list: spoken by a model that clones)", false),
                        ("language", "string", "english, chinese, japanese ... or auto (default)", false),
                        ("instructions", "string", "how to say it (CustomVoice), or the voice to make up (VoiceDesign)", false),
                        ("ref_audio", "string", "a recording of the voice to clone, WAV as base64 or a data: URL (the Base model)", false),
@@ -90,6 +90,20 @@ pub const METHODS: &[Method] = &[
                        ("seconds", "number", "the most to make", false), ("seed", "integer", "", false),
                        ("options", "object", "the engine's own: greedy, temperature, top-k, streaming", false)],
              example: r#"{"model": "qwen3-tts-custom", "input": "Good morning. The bread is still warm.", "voice": "ryan", "language": "english", "instructions": "cheerful, a little hurried"}"# },
+    Method { kind: "audio", name: "voices.list", summary: "The saved voices (cloned or designed): name, what the sample says, its description, length; sample: its WAV",
+             fields: &[], example: "{}" },
+    Method { kind: "audio", name: "voices.add", summary: "Save a voice cloned from a recording (WAV, MP3, FLAC, Ogg, M4A; 3-15 s of one speaker is best)",
+             fields: &[("name", "string", "lowercase letters, digits, - and _", true), ("sample", "string", "the recording, base64 or a data: URL", true),
+                       ("text", "string", "what the recording says (a closer clone)", false), ("description", "string", "", false),
+                       ("language", "string", "", false), ("replace", "boolean", "over a voice of that name", false)],
+             example: r#"{"name": "grandpa", "sample": "data:audio/mpeg;base64,SUQzBAAAAA...", "text": "Well, back in my day we walked to school."}"# },
+    Method { kind: "audio", name: "voices.design", summary: "Make up a voice from a description (the voice-design model reads a sample) and save it",
+             fields: &[("name", "string", "", true), ("instructions", "string", "the voice: age, gender, timbre, pace, emotion, accent", true),
+                       ("text", "string", "what the sample says (default: a ten-second line in the language)", false), ("language", "string", "", false),
+                       ("seed", "integer", "another seed, another speaker of that kind", false), ("model", "string", "a voice-design model", false),
+                       ("replace", "boolean", "", false)],
+             example: r#"{"name": "narrator", "instructions": "A deep, warm male narrator in his fifties, unhurried, a slight rasp.", "language": "english"}"# },
+    Method { kind: "audio", name: "voices.remove", summary: "Delete a saved voice", fields: &[("name", "string", "", true)], example: r#"{"name": "narrator"}"# },
     Method { kind: "audio", name: "info", summary: "The model's defaults, limits and options (a speech model: its voices and languages)", fields: &[MODEL_OPT], example: "{}" },
     Method { kind: "audio", name: "progress", summary: "The request running: its phase and how far", fields: &[], example: "{}" },
     Method { kind: "audio", name: "history", summary: "The songs and speech made, newest first", fields: &[], example: "{}" },
@@ -223,6 +237,74 @@ impl Home {
             .ok_or_else(|| (409, format!("no {kind} model is enabled (system.enable)")))
     }
 
+    /// The saved voices (beside the audio server's output: NS_AUDIO_OUT)
+    pub(crate) fn voices(&self) -> crate::voices::Library {
+        let out = self.o.cfg.get("NS_AUDIO_OUT").unwrap_or_else(|| format!("{}/.local/share/nextsycl/audio", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())));
+        crate::voices::Library::of(std::path::Path::new(&out))
+    }
+
+    /// The speech model for a request that names none (or names one not registered): one that clones for a saved
+    /// voice or a recording, the built-in voices' for a voice, the voice-design one for instructions alone; the
+    /// loaded one first
+    fn speech_model(&self, b: &Value, all: &[Value]) -> Result<String, Fail> {
+        if b["model"].as_str().is_some_and(|m| all.iter().any(|x| x["id"] == m)) {
+            return self.pick("audio", b, all);
+        }
+        let voice = s(b, "voice");
+        let need = if !s(b, "ref_audio").is_empty() || (!voice.is_empty() && self.voices().get(&voice).is_some()) {
+            "clone"
+        } else if !voice.is_empty() {
+            "voices"
+        } else if !s(b, "instructions").is_empty() {
+            "design"
+        } else {
+            ""
+        };
+        let can: Vec<String> = all.iter()
+            .filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false)
+            .filter(|m| m["speech"].as_array().is_some_and(|a| need.is_empty() || a.iter().any(|x| x == need)))
+            .map(|m| s(m, "id")).collect();
+        let loaded = call_for(&self.target("audio"), "GET", "/api/info", None, 2).ok().map(|i| s(&i, "model"));
+        loaded.filter(|l| can.contains(l)).or_else(|| can.first().cloned()).ok_or_else(|| {
+            (409, match need {
+                "clone" => "no enabled speech model clones a voice (system.enable qwen3-tts-base)".to_string(),
+                "design" => "no enabled speech model designs a voice (system.enable qwen3-tts-design)".to_string(),
+                "voices" => "no enabled speech model has built-in voices (system.enable qwen3-tts-custom)".to_string(),
+                _ => "no speech model is enabled (system.enable qwen3-tts-custom ...)".to_string(),
+            })
+        })
+    }
+
+    /// audio.voices.design: the voice-design model reads a sample in the voice described, which is saved
+    fn design_voice(self: &Arc<Self>, b: &Value, all: &[Value]) -> Result<Value, Fail> {
+        let name = s(b, "name");
+        crate::voices::check_name(&name).map_err(|e| (400, e))?;
+        let lib = self.voices();
+        if lib.get(&name).is_some() && b["replace"] != true {
+            return Err((409, format!("a voice {name:?} exists already (replace: true)")));
+        }
+        let lang = b["language"].as_str().filter(|l| !l.is_empty());
+        let text = b["text"].as_str().filter(|t| !t.trim().is_empty()).map(str::to_string)
+            .or_else(|| crate::voices::design_text(lang).map(str::to_string))
+            .ok_or_else(|| (400, format!("text: what the sample says (no default line in {})", lang.unwrap_or("that language"))))?;
+        let id = self.speech_model(&json!({"model": b["model"], "instructions": s(b, "instructions")}), all)?;
+        let t = self.ensure(&id)?;
+        let mut q = json!({"model": id, "input": text, "instructions": s(b, "instructions"), "response_format": "url"});
+        for k in ["language", "seed", "options"] {
+            if b.get(k).is_some_and(|v| !v.is_null()) {
+                q[k] = b[k].clone();
+            }
+        }
+        let r = call_for(&t, "POST", "/v1/audio/speech", Some(&q), 600).map_err(|e| (502, e))?;
+        let url = r["data"][0]["url"].as_str().ok_or_else(|| (502, format!("the speech server answered {r}")))?;
+        let file = lib.dir.parent().map(|d| d.join(url.rsplit('/').next().unwrap_or(""))).unwrap_or_default();
+        let bytes = std::fs::read(&file).map_err(|e| (500, format!("{}: {e}", file.display())))?;
+        let seed = r["nextsycl"]["seed"].clone();
+        let v = lib.add(&name, &bytes, Some(&text), Some(&s(b, "instructions")), lang, "design", &format!("designed by {id}, seed {seed}"), b["replace"] == true)
+            .map_err(|e| (400, e))?;
+        Ok(json!({"voice": v, "sample": format!("http://nextsycl/v1/audio/voices/{name}.wav"), "seed": seed}))
+    }
+
     fn rpc(self: &Arc<Self>, name: &str, b: &Value) -> Result<Value, Fail> {
         let Some(m) = METHODS.iter().find(|m| format!("{}.{}", m.kind, m.name) == name) else {
             return Err((404, format!("no method {name} (GET /openapi.yml)")));
@@ -283,14 +365,8 @@ impl Home {
             }
             ("audio", "generate" | "speak") => {
                 let mut b = b.clone();
-                if m.name == "speak" && b["model"].as_str().is_none_or(str::is_empty) {
-                    // a speech model: the loaded one, else the first enabled
-                    let speech: Vec<String> = all.iter().filter(|x| registry::kind_of(x) == "audio" && x["enabled"] != false && s(x, "arch") == "qwen3-tts")
-                        .map(|x| s(x, "id")).collect();
-                    let loaded = call_for(&self.target("audio"), "GET", "/api/info", None, 2).ok().map(|i| s(&i, "model"));
-                    let id = loaded.filter(|l| speech.contains(l)).or_else(|| speech.first().cloned())
-                        .ok_or_else(|| (409, "no speech model is enabled (system.enable qwen3-tts-custom ...)".to_string()))?;
-                    b["model"] = json!(id);
+                if m.name == "speak" {
+                    b["model"] = json!(self.speech_model(&b, &all)?);
                 }
                 let b = &b;
                 let id = self.pick("audio", b, &all)?;
@@ -314,6 +390,22 @@ impl Home {
             ("image" | "audio", "progress") => Ok(call_for(&t, "GET", "/api/progress", None, 5).unwrap_or(json!({"busy": false, "loaded": false}))),
             ("image" | "audio", "history") => Ok(call_for(&t, "GET", "/api/history", None, 10).unwrap_or(json!({"data": []}))),
             ("audio", "cancel") => call_for(&t, "POST", "/api/cancel", Some(&json!({})), 10).map_err(|e| (502, e)),
+            ("audio", "voices.list") => {
+                let list: Vec<Value> = self.voices().list().into_iter().map(|mut v| {
+                    v["sample"] = json!(format!("http://nextsycl/v1/audio/voices/{}.wav", s(&v, "name")));
+                    v
+                }).collect();
+                Ok(json!({"voices": list}))
+            }
+            ("audio", "voices.remove") => self.voices().remove(&s(b, "name")).map(|_| json!({"removed": s(b, "name")})).map_err(|e| (404, e)),
+            ("audio", "voices.add") => {
+                let bytes = http::unbase64(&s(b, "sample")).map_err(|e| (400, format!("sample: {e}")))?;
+                let o = |k: &str| b[k].as_str().filter(|x| !x.trim().is_empty());
+                let v = self.voices().add(&s(b, "name"), &bytes, o("text"), o("description"), o("language"), "clone", "a recording", b["replace"] == true)
+                    .map_err(|e| (400, e))?;
+                Ok(json!({"voice": v, "sample": format!("http://nextsycl/v1/audio/voices/{}.wav", s(b, "name"))}))
+            }
+            ("audio", "voices.design") => self.design_voice(b, &all),
             ("video", "upload") => {
                 let data = http::unbase64(&s(b, "data")).map_err(|e| (400, format!("data: {e}")))?;
                 let r = self.studio_upload(&s(b, "name"), &data)?;
@@ -373,12 +465,29 @@ impl Home {
                 };
                 // OpenAI's own names (dall-e-3, tts-1 ...) mean "the kind's model"
                 let named = named.filter(|n| all.iter().any(|m| m["id"] == n.as_str()));
-                let id = self.pick(kind, &json!({"model": named}), &all)?;
+                // speech with a voice or a recording and no model of ours named: the speech model for it
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let has = |k: &str| body[k].as_str().is_some_and(|v| !v.is_empty());
+                let id = if kind == "audio" && named.is_none() && (has("voice") || has("ref_audio")) {
+                    self.speech_model(&body, &all)?
+                } else {
+                    self.pick(kind, &json!({"model": named}), &all)?
+                };
                 let t = self.ensure(&id)?;
                 pass(s, &t)
             }
             ("GET", p) if p.starts_with("/v1/images/files/") => pass(s, &self.target("image")),
             ("GET", p) if p.starts_with("/v1/audio/files/") => pass(s, &self.target("audio")),
+            ("GET", p) if p.starts_with("/v1/audio/voices/") => {
+                let name = p["/v1/audio/voices/".len()..].trim_end_matches(".wav");
+                match self.voices().sample_path(name).and_then(|f| std::fs::read(f).ok()) {
+                    Some(b) => {
+                        http::respond_bytes(s, 200, "audio/wav", &b, "Cache-Control: no-cache\r\n");
+                        Ok(())
+                    }
+                    None => Err((404, format!("no saved voice {name}"))),
+                }
+            }
             (m, p) => Err((404, format!("no route {m} {p} (GET /openapi.yml)"))),
         }
     }

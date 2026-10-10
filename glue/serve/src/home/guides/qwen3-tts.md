@@ -33,6 +33,13 @@ voice's timbre is taken from it (its x-vector). With `ref_text` - exactly what t
 hears the recording itself (its codec frames) and continues it: a closer clone, the delivery too. The words to say
 can be anything, in any of the languages.
 
+## Saved voices
+Keep a voice by name and say `"voice": "NAME"` to `audio.speak` (no model needed: a model that clones takes it):
+- `audio.voices.add` `{name, sample, text}` - cloned from a recording (WAV, MP3, FLAC, Ogg, M4A), with what it says;
+- `audio.voices.design` `{name, instructions, language, seed}` - the voice-design model reads a ten-second line in
+  the voice described, and that recording is kept (with its text: the closer, in-context clone). Try a few seeds;
+- `audio.voices.list`, `audio.voices.remove`. The command line: `nextsycl audio voice add|design|list|rm`.
+
 ## Settings
 `seed` repeats a read. `options`: `temperature` (0.9; lower is steadier, flatter), `top-k` (50), `greedy` (1: always
 the likeliest - can loop on long texts), `streaming` (1: the text fed as it is spoken).

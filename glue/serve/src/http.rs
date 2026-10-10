@@ -345,9 +345,14 @@ pub fn respond_with(mut w: impl Write, status: u16, body: &Value, headers: &str)
 
 /// Sends one request; the connection with the answer's status line and headers read, for streaming the body.
 pub fn send(t: &Target, method: &str, path: &str, body: Option<&Value>) -> Result<(u16, BufReader<Conn>), String> {
+    send_with(t, method, path, body, "")
+}
+
+/// `send` with more header lines (each ending in \r\n)
+pub fn send_with(t: &Target, method: &str, path: &str, body: Option<&Value>, headers: &str) -> Result<(u16, BufReader<Conn>), String> {
     let mut s = Conn::connect(t).map_err(|e| format!("nothing answers at {t} ({e})"))?;
     let text = body.map(|b| serde_json::to_vec(b).unwrap()).unwrap_or_default();
-    write!(s, "{method} {path} HTTP/1.1\r\nHost: nextsycl\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", text.len())
+    write!(s, "{method} {path} HTTP/1.1\r\nHost: nextsycl\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", text.len())
         .and_then(|_| s.write_all(&text))
         .map_err(|e| e.to_string())?;
     let mut r = BufReader::new(s);
@@ -361,6 +366,20 @@ pub fn send(t: &Target, method: &str, path: &str, body: Option<&Value>) -> Resul
         }
     }
     Ok((status, r))
+}
+
+/// A method of the front door's API (`POST /rpc/<name>` with its bearer token): its result, or the error's message
+pub fn rpc(t: &Target, token: &str, name: &str, body: &Value, secs: u64) -> Result<Value, String> {
+    let (_, mut r) = send_with(t, "POST", &format!("/rpc/{name}"), Some(body), &format!("Authorization: Bearer {token}\r\n"))?;
+    r.get_ref().set_read_timeout(Some(Duration::from_secs(secs))).map_err(|e| e.to_string())?;
+    let mut all = String::new();
+    r.read_to_string(&mut all).map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&all).map_err(|e| format!("the answer is not JSON: {e}"))?;
+    if v["ok"] == true {
+        Ok(v["result"].clone())
+    } else {
+        Err(v["error"]["message"].as_str().unwrap_or("the call failed").to_string())
+    }
 }
 
 /// One request; the JSON answer, or an error carrying the answer's message.

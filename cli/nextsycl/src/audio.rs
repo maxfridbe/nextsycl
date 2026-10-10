@@ -14,6 +14,12 @@ nextsycl audio gen \"<text to say>\" --model qwen3-tts-... [--voice NAME] [--lan
                    [--ref-audio FILE.wav [--ref-text TEXT]] [--seconds N] [--seed N] [--out FILE|DIR]   (speech)
 nextsycl audio serve [MODEL] [--port 8087] [--host 127.0.0.1] [--gpu N] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl audio start [serve's options]   (in the background) | ps | logs [-f] | stop
+nextsycl audio voice list                                   the saved voices (spoken by name: --voice NAME, \"voice\": NAME)
+nextsycl audio voice add NAME --sample FILE [--text \"what it says\"] [--description D] [--language L] [--replace]
+                   a voice cloned from a recording (WAV, MP3, FLAC, Ogg, M4A; 3-15 s of one speaker)
+nextsycl audio voice design NAME --instructions \"the voice\" [--text \"what the sample says\"] [--language L] [--seed N] [--replace]
+                   a voice made up from a description (the front door's voice-design model reads a sample)
+nextsycl audio voice rm NAME            (addvoice / clonevoice NAME ... = voice add; designvoice = voice design)
 nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec] [--gpu N]
 nextsycl audio engines | selftest [--gpu N]";
 
@@ -99,13 +105,29 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
     let seed: u64 = num(args, "--seed")?.unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_nanos() as u64 % 100_000).unwrap_or(0)
     });
+    let mut voice = opt(args, "--voice").map(str::to_string);
     let reference = match opt(args, "--ref-audio") {
         Some(f) => {
             let b = std::fs::read(f).map_err(|e| format!("{f}: {e}"))?;
-            let (samples, rate) = nextsycl_audio::decode_wav(&b).map_err(|e| format!("{f}: {e}"))?;
+            let (samples, rate) = nextsycl_audio::decode_audio(&b).map_err(|e| format!("{f}: {e}"))?;
             Some(nextsycl_audio::Reference { samples, rate, text: opt(args, "--ref-text").map(str::to_string) })
         }
-        None => None,
+        // a saved voice: its recording and transcript (for a model that clones)
+        None => match (&voice, e.speech()) {
+            (Some(v), Some(sp)) if !sp.voices.iter().any(|x| x.eq_ignore_ascii_case(v)) => {
+                let lib = nextsycl_serve::voices::Library::of(&out_dir(cfg, &[]));
+                if lib.get(v).is_none() {
+                    return Err(format!("voice {v}: not one of the model's ({}) nor a saved one (nextsycl audio voice list)", sp.voices.join(", ")));
+                }
+                if !sp.clone {
+                    return Err(format!("voice {v} is a saved voice: speak it with a model that clones (--model qwen3-tts-base)"));
+                }
+                let r = lib.reference(v)?;
+                voice = None;
+                Some(r)
+            }
+            _ => None,
+        },
     };
     // the request's own --opt-NAMEs (those taken at load went into the load options)
     let given: nextsycl_core::options::Given = nextsycl_core::options::given(args).into_iter()
@@ -119,7 +141,7 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         cfg: num(args, "--cfg")?,
         seed,
         extra: nextsycl_core::options::by_name(&given, k.options),
-        voice: opt(args, "--voice").map(str::to_string),
+        voice: voice.clone(),
         language: opt(args, "--language").map(str::to_string),
         instructions: opt(args, "--instructions").map(str::to_string),
         reference,
@@ -305,6 +327,69 @@ fn serve_here(m: &Value, files: ModelFiles, args: &[String], out: PathBuf, cfg: 
     Arc::new(srv).run(&addr)
 }
 
+/// `nextsycl audio voice ...`: the saved voices (beside the audio output: list, add and remove here; design through
+/// the front door, whose voice-design model reads the sample)
+fn voice(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let lib = nextsycl_serve::voices::Library::of(&out_dir(cfg, args));
+    let name = args.get(1).filter(|a| !a.starts_with("--")).map(String::as_str).or_else(|| opt(args, "--name")).unwrap_or("");
+    let replace = args.iter().any(|a| a == "--replace");
+    match args.first().map(String::as_str) {
+        Some("list" | "ls") | None => {
+            let list = lib.list();
+            if list.is_empty() {
+                println!("no saved voices ({}); nextsycl audio voice add NAME --sample FILE", lib.dir.display());
+            }
+            for v in list {
+                let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
+                println!("{:<16} {:<6} {:>5.1} s  {}{}", s("name"), s("kind"), v["seconds"].as_f64().unwrap_or(0.0),
+                         if s("description").is_empty() { String::new() } else { format!("{} - ", s("description")) },
+                         if s("text").is_empty() { "(no transcript: an x-vector clone)".into() } else { format!("\"{}\"", s("text")) });
+            }
+            Ok(())
+        }
+        Some("add") => {
+            let f = opt(args, "--sample").ok_or("--sample FILE: the recording to clone")?;
+            let b = std::fs::read(f).map_err(|e| format!("{f}: {e}"))?;
+            let v = lib.add(name, &b, opt(args, "--text"), opt(args, "--description"), opt(args, "--language"), "clone",
+                            &format!("a recording ({})", Path::new(f).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()), replace)?;
+            println!("saved voice {name}: {:.1} s at {} Hz{}", v["seconds"].as_f64().unwrap_or(0.0), v["rate"],
+                     if v["text"].is_null() { " (no --text: cloned from its timbre alone; with the transcript the clone is closer)" } else { "" });
+            Ok(())
+        }
+        Some("design") => {
+            // through the front door: it loads the voice-design model and saves what it reads
+            let ins = opt(args, "--instructions").or_else(|| opt(args, "--description")).ok_or("--instructions \"the voice: age, gender, timbre, pace ...\"")?;
+            let mut b = serde_json::json!({"name": name, "instructions": ins, "replace": replace});
+            for (k, f) in [("text", "--text"), ("language", "--language"), ("model", "--model")] {
+                if let Some(v) = opt(args, f) {
+                    b[k] = serde_json::json!(v);
+                }
+            }
+            if let Some(n) = num::<u64>(args, "--seed")? {
+                b["seed"] = serde_json::json!(n);
+            }
+            let reg = models::registry(cfg);
+            let token = cfg.get("NS_API_TOKEN").or_else(|| {
+                std::fs::read_to_string(reg.with_file_name("serve.json")).ok()
+                    .and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["token"].as_str().map(str::to_string))
+            }).ok_or("the front door's token (NS_API_TOKEN, or serve.json beside the registry): is nextsycl serve running?")?;
+            let port = cfg.get("NS_SERVE_PORT").unwrap_or_else(|| "8000".into());
+            let t = nextsycl_serve::http::Target::Tcp(format!("127.0.0.1:{port}"));
+            eprintln!("designing {name} through the front door (:{port}) ...");
+            let r = nextsycl_serve::http::rpc(&t, &token, "audio.voices.design", &b, 900)?;
+            println!("saved voice {name}: {:.1} s, seed {}  - \"{}\"", r["voice"]["seconds"].as_f64().unwrap_or(0.0), r["seed"],
+                     r["voice"]["text"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        Some("rm" | "remove" | "delete") => {
+            lib.remove(name)?;
+            println!("removed voice {name}");
+            Ok(())
+        }
+        _ => Err(USAGE.into()),
+    }
+}
+
 /// `nextsycl audio <command>`
 pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result<(), String>) -> Result<(), String> {
     let rest = args.get(1..).unwrap_or(&[]);
@@ -316,6 +401,9 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("selftest") => selftest(rest),
         Some("gen") => gen(cfg, rest),
         Some("check") => check(cfg, rest),
+        Some("voice" | "voices") => voice(cfg, rest),
+        Some("addvoice" | "clonevoice") => voice(cfg, &[&["add".to_string()], rest].concat()),
+        Some("designvoice") => voice(cfg, &[&["design".to_string()], rest].concat()),
         Some("serve") => serve(cfg, rest, false),
         Some("start") => SERVED.start(cfg, rest, |d| serve(cfg, rest, d)),
         Some("ps") => SERVED.ps(cfg),

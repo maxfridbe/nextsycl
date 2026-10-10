@@ -2,7 +2,7 @@
  *  recording - whichever the model does), the language, the most to make, the seed; under Advanced the engine's own
  *  options. Each field writes straight into state.form. */
 import { jsx } from "../jsx.js";
-import { canGo, cancel, generate, pickReference, randomSeed } from "../actions.js";
+import { canGo, cancel, deleteVoice, generate, pickReference, randomSeed, saveVoice } from "../actions.js";
 import { panelOpen, render, saveForm, state, togglePanel } from "../state.js";
 
 type Text = "text" | "instructions" | "refText" | "voice" | "language";
@@ -59,21 +59,42 @@ export function Speak() {
         : null}
       {sp.clone
         ? <div>
-            <div class="lab">the voice to clone <span class="hint">3-15 s of one person speaking clearly (WAV)</span></div>
-            <div class="row">
-              <input attrs={{ type: "file", accept: "audio/wav,audio/x-wav,.wav" }}
-                     on={{ change: (e: Event) => pickReference((e.target as HTMLInputElement).files?.[0] ?? null) }} />
-              {f.refAudio ? <audio attrs={{ src: f.refAudio, controls: true, preload: "auto" }} /> : null}
-              {f.refAudio ? <span class="hint">{f.refName}</span> : null}
-            </div>
-            {sp.clone_needs_text || sp.clone_takes_text
+            {state.voices.length
               ? <div>
-                  <div class="lab">what the recording says
-                    <span class="hint">{sp.clone_needs_text ? "required" : "optional: with it the clone continues the recording itself - a closer voice"}</span>
-                  </div>
-                  {area("refText", "", "Good morning. The bread is still warm and the coffee is ready.")}
+                  <div class="lab">a saved voice <span class="hint">or a recording below</span></div>
+                  <span class="chips">
+                    {state.voices.map((v) => (
+                      <span class="vchip">
+                        <button type="button" class={{ chip: true, on: f.voice === v.name }} attrs={{ title: v.description ?? v.text ?? "" }}
+                                on={{ click: () => set("voice", f.voice === v.name ? "" : v.name) }}>{v.name}{v.kind === "design" ? " ✦" : ""}</button>
+                        <button type="button" class="tbtn x" attrs={{ title: `delete ${v.name}` }} on={{ click: () => void deleteVoice(v.name) }}>×</button>
+                      </span>
+                    ))}
+                  </span>
                 </div>
               : null}
+            {state.voices.some((v) => v.name === f.voice)
+              ? <div class="row"><audio attrs={{ src: `/v1/audio/voices/${f.voice}.wav`, controls: true, preload: "none" }} /></div>
+              : <div>
+                  <div class="lab">the voice to clone <span class="hint">3-15 s of one person speaking clearly (WAV, MP3, FLAC, Ogg, M4A)</span></div>
+                  <div class="row">
+                    <input attrs={{ type: "file", accept: "audio/*,.wav,.mp3,.flac,.ogg,.m4a" }}
+                           on={{ change: (e: Event) => pickReference((e.target as HTMLInputElement).files?.[0] ?? null) }} />
+                    {f.refAudio ? <audio attrs={{ src: f.refAudio, controls: true, preload: "auto" }} /> : null}
+                    {f.refAudio ? <span class="hint">{f.refName}</span> : null}
+                    {f.refAudio
+                      ? <button type="button" class="tbtn" on={{ click: () => void saveVoice({ sample: f.refAudio, text: f.refText }) }}>save as voice…</button>
+                      : null}
+                  </div>
+                  {sp.clone_needs_text || sp.clone_takes_text
+                    ? <div>
+                        <div class="lab">what the recording says
+                          <span class="hint">{sp.clone_needs_text ? "required" : "optional: with it the clone continues the recording itself - a closer voice"}</span>
+                        </div>
+                        {area("refText", "", "Good morning. The bread is still warm and the coffee is ready.")}
+                      </div>
+                    : null}
+                </div>}
           </div>
         : null}
       <div class="row">

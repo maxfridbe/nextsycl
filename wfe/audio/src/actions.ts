@@ -33,6 +33,47 @@ export function addTag(tag: string): void {
   render();
 }
 
+export async function refreshVoices(): Promise<void> {
+  try {
+    state.voices = await api.voices();
+    render();
+  } catch {
+    /* a server without an output directory */
+  }
+}
+
+/** Ask for a name and save a voice: the recording picked (with its transcript), or a file made here. */
+export async function saveVoice(from: { sample?: string; text?: string; file?: string; description?: string | null }): Promise<void> {
+  const name = (window.prompt("Save this voice as (lowercase letters, digits, - and _):") ?? "").trim();
+  if (!name) return;
+  try {
+    const body: Record<string, unknown> = { name };
+    if (from.sample) body.sample = from.sample;
+    if (from.file) body.file = from.file;
+    if (from.text) body.text = from.text;
+    if (from.description) body.description = from.description;
+    const v = await api.addVoice(body);
+    state.status = `saved voice ${v.name} (${v.seconds.toFixed(1)} s)`;
+    state.error = null;
+    await refreshVoices();
+  } catch (e) {
+    state.error = e instanceof Error ? e.message : String(e);
+    render();
+  }
+}
+
+export async function deleteVoice(name: string): Promise<void> {
+  if (!window.confirm(`Delete the saved voice ${name}?`)) return;
+  try {
+    await api.removeVoice(name);
+    if (state.form.voice === name) state.form.voice = "";
+    await refreshVoices();
+  } catch (e) {
+    state.error = e instanceof Error ? e.message : String(e);
+    render();
+  }
+}
+
 export async function refreshHistory(): Promise<void> {
   try {
     state.history = await api.history();
@@ -67,7 +108,7 @@ export function canGo(): boolean {
   if (!f.text.trim()) return false;
   if (sp.voices.length && !f.voice) return false;
   if (sp.design && !f.instructions.trim()) return false;
-  if (sp.clone && !f.refAudio) return false;
+  if (sp.clone && !f.refAudio && !state.voices.some((v) => v.name === f.voice)) return false;
   return true;
 }
 
@@ -82,7 +123,8 @@ function body(): Record<string, unknown> {
     if (sp.voices.length && f.voice) b.voice = f.voice;
     if (f.language) b.language = f.language;
     if ((sp.instructions || sp.design) && f.instructions.trim()) b.instructions = f.instructions.trim();
-    if (sp.clone && f.refAudio) {
+    if (sp.clone && !sp.voices.length && state.voices.some((v) => v.name === f.voice)) b.voice = f.voice;
+    else if (sp.clone && f.refAudio) {
       b.ref_audio = f.refAudio;
       if (f.refText.trim()) b.ref_text = f.refText.trim();
     }

@@ -108,3 +108,15 @@ export interface Form {
   refName: string;
   refText: string;
 }
+
+/** A saved voice (the server's voices library). */
+export interface SavedVoice {
+  name: string;
+  /** what the sample says (none: an x-vector clone) */
+  text?: string | null;
+  description?: string | null;
+  language?: string | null;
+  kind: "clone" | "design";
+  seconds: number;
+  created: number;
+}

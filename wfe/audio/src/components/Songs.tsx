@@ -1,6 +1,6 @@
 /** Songs: the last request's, open; the ones made here, a list - each with its player, settings and lyrics. */
 import { jsx } from "../jsx.js";
-import { reuse } from "../actions.js";
+import { reuse, saveVoice } from "../actions.js";
 import { render, state } from "../state.js";
 import type { Song } from "../types.js";
 import { fmtT, mss } from "../util.js";
@@ -29,6 +29,10 @@ export function SongCard(props: { s: Song; big: boolean }) {
             ? <button type="button" class="tbtn" on={{ click: () => { state.shown[s.url] = !shown; render(); } }}>{shown ? "hide lyrics" : "lyrics"}</button>
             : null}
           <button type="button" class="tbtn" attrs={{ title: "use this description, lyrics and seed again" }} on={{ click: () => reuse(s) }}>reuse</button>
+          {s.cloned !== undefined && state.info?.speech
+            ? <button type="button" class="tbtn" attrs={{ title: "keep this voice by name: any model that clones speaks it" }}
+                      on={{ click: () => void saveVoice({ file: s.url, description: s.instructions }) }}>save voice…</button>
+            : null}
           <a class="tbtn" attrs={{ href: s.url, download: s.url.split("/").pop() ?? "song.wav" }}>save</a>
         </span>
       </div>

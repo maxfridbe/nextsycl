@@ -1084,7 +1084,10 @@
    "env": {},
    "defaults": {
     "seconds": 60.0
-   }
+   },
+   "speech": [
+    "voices"
+   ]
   },
   {
    "id": "qwen3-tts-design",
@@ -1104,7 +1107,10 @@
    "env": {},
    "defaults": {
     "seconds": 60.0
-   }
+   },
+   "speech": [
+    "design"
+   ]
   },
   {
    "id": "qwen3-tts-base",
@@ -1124,7 +1130,10 @@
    "env": {},
    "defaults": {
     "seconds": 60.0
-   }
+   },
+   "speech": [
+    "clone"
+   ]
   }
  ]
 }

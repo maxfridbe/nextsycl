@@ -585,7 +585,19 @@ nextsycl audio gen "The lighthouse keeper counted the ships." --model qwen3-tts-
 nextsycl audio gen "I never thought the garden would grow this fast." --model qwen3-tts-base --ref-audio voice.wav \
                    [--ref-text "what the recording says"]
 nextsycl audio check <reference dump dir> --model qwen3-tts-custom [--stages prompt,frames,codec]
+
+# saved voices: kept by name, spoken by any model that clones (--voice NAME, "voice": "NAME")
+nextsycl audio voice add grandpa --sample grandpa.mp3 --text "Well, back in my day we walked to school."
+nextsycl audio voice design narrator --instructions "A deep, warm male narrator in his fifties, unhurried." [--seed N]
+nextsycl audio voice list | rm NAME
+nextsycl audio gen "Chapter one." --model qwen3-tts-base --voice narrator
 ```
+
+A **saved voice** is a recording and what it says, in `<audio output>/voices/<name>/`: cloned from a sample (WAV,
+MP3, FLAC, Ogg Vorbis or M4A, decoded by symphonia), or designed - the front door has the voice-design model read a
+ten-second line in the voice described and keeps that. A request naming it (`audio.speak`, `/v1/audio/speech`) with
+no model goes to an enabled model that clones, as an in-context clone; `audio.voices.add | design | list | remove`
+on the API, chips and "save voice" buttons on the page.
 
 - **The pipeline**, one card: the prompt as qwen-tts builds it (projected text tokens plus codec control tokens: the
   language, the speaker's row - a built-in voice's embedding or the recording's x-vector - and the instruction ahead);

@@ -194,6 +194,55 @@ pub fn decode_wav(b: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
     Err("no data chunk".into())
 }
 
+/// A recording's samples (the channels mixed to mono) and their rate: WAV here, MP3 / FLAC / Ogg Vorbis / M4A (AAC)
+/// through symphonia
+pub fn decode_audio(b: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
+    if b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WAVE" {
+        if let Ok(r) = decode_wav(b) {
+            return Ok(r);
+        }
+    }
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::errors::Error as E;
+    let mss = symphonia::core::io::MediaSourceStream::new(Box::new(std::io::Cursor::new(b.to_vec())), Default::default());
+    let probed = symphonia::default::get_probe()
+        .format(&Default::default(), mss, &Default::default(), &Default::default())
+        .map_err(|e| format!("not a recording this reads (WAV, MP3, FLAC, Ogg Vorbis, M4A): {e}"))?;
+    let mut format = probed.format;
+    let track = format.default_track().ok_or("no audio track")?;
+    let (id, mut rate) = (track.id, track.codec_params.sample_rate.unwrap_or(0));
+    let mut dec = symphonia::default::get_codecs().make(&track.codec_params, &Default::default()).map_err(|e| format!("its codec: {e}"))?;
+    let mut out = Vec::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(E::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(E::ResetRequired) => break,
+            Err(e) => return Err(format!("reading it: {e}")),
+        };
+        if packet.track_id() != id {
+            continue;
+        }
+        match dec.decode(&packet) {
+            Ok(buf) => {
+                let spec = *buf.spec();
+                rate = spec.rate;
+                let ch = spec.channels.count().max(1);
+                let mut sb = SampleBuffer::<f32>::new(buf.capacity() as u64, spec);
+                sb.copy_interleaved_ref(buf);
+                out.extend(sb.samples().chunks_exact(ch).map(|f| f.iter().sum::<f32>() / ch as f32));
+            }
+            // a damaged frame: skipped, as players do
+            Err(E::DecodeError(_)) => continue,
+            Err(e) => return Err(format!("decoding it: {e}")),
+        }
+    }
+    if out.is_empty() || rate == 0 {
+        return Err("no samples in it".into());
+    }
+    Ok((out, rate))
+}
+
 /// A WAV file's LIST INFO entries and its length in seconds (from the chunks ahead of its samples: what `Audio::wav`
 /// writes; only the head of the file is read)
 pub fn wav_info(path: &Path) -> std::result::Result<(Vec<(String, String)>, f64), String> {
