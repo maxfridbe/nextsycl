@@ -680,14 +680,15 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
 
   | File | 20 | 2,185 | 8,000 | 40,000 |
   |---|---:|---:|---:|---:|
-  | Q8_0 | 44 / 17.6 | 458 / 16.6 | 284 / 16.0 | 81 / 11.3 |
-  | UD-Q4_K_M | 35 / 24.5 | 422 / 22.5 | 271 / 21.4 | 79 / 14.1 |
-  | UD-Q3_K_XL | 33 / 21.1 | 540 / 20.4 | 301 / 18.8 | 82 / 13.0 |
+  | Q8_0 | 58 / 18.0 | 1,003 / 17.9 | 1,095 / 17.0 | 522 / 14.9 |
+  | UD-Q4_K_M | 62 / 25.1 | 1,151 / 25.0 | 1,100 / 24.3 | 524 / 19.4 |
+  | UD-Q3_K_XL | 61 / 22.5 | 1,149 / 22.3 | 1,099 / 20.2 | 524 / 17.8 |
 
-  Decode comes from the engine's silo (`kernels/llm/qwen35/silo`: its own decode products for the types these files
-  hold): with the shared kernels alone (`NS_SILO=0`) UD-Q4_K_M decodes 18.8 / 17.7 / 17.1 and UD-Q3_K_XL 12.3 at
-  2,185 - the same tokens either way. Q8_0 is bandwidth-bound on the shared Q8_0 product (~490 GB/s). Long prompts
-  are slow: the prompt pass's attention is not tiled yet (each row reads every key), the next thing to fix.
+  Most of it is the engine's silo (`kernels/llm/qwen35/silo`, kernels tuned for this model): its decode products for
+  the types these files hold, flash attention on XMX for prompts and a lane-a-key decode attention, its weight
+  expansion to half, a norm that hands the products their Q8_1 blocks; prompt chunks of 2,048. With the shared
+  kernels alone (`NS_SILO=0`) UD-Q4_K_M reads 2,185 tokens at 441 tok/s and decodes at 18.5 - the same tokens either
+  way. Q8_0 decode is bandwidth-bound (27 GiB a token). `NS_PROFILE=gpu NS_Q35_PROFILE=1` times every kernel.
   Sessions check their cache against the free VRAM before allocating (1.5 GiB spare).
 - Not yet: the MTP draft layer (the GGUF's `MTP/` file), pictures (the vision tower: `mmproj`), verify passes.
 
