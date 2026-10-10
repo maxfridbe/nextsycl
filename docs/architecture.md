@@ -26,6 +26,7 @@ llm/                       LANGUAGE MODELS
   contract   nextsycl-llm        the contract: Engine, Session / Decoder / Checkpoint, Sampler, EngineKind; host sampling
   glm5next   nextsycl-llm-glm5next   GLM-5.3-Flash
   qwen4exp   nextsycl-llm-qwen4exp   the Qwen3.8-Flash-Next family (IQ2_XS, Coder IQ1_M, Swift 1.5)
+  qwen35     nextsycl-llm-qwen35     dense Qwen3.5 / Qwen3.8 (Qwen3.8-27B): gated DeltaNet + gated full attention
   example    nextsycl-llm-example    a template: the contract filled with documented stubs
 
 image/                     IMAGES

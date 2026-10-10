@@ -420,4 +420,15 @@ impl Arena {
     pub fn reset(&self) {
         *self.off.lock().unwrap() = 0;
     }
+    /// The offset now, to hand back what is taken after it (`rewind`)
+    pub fn mark(&self) -> usize {
+        *self.off.lock().unwrap()
+    }
+    /// Everything taken since `mark` free again (the caller uses none of it after: the queue is in order)
+    pub fn rewind(&self, mark: usize) {
+        let mut off = self.off.lock().unwrap();
+        if mark < *off {
+            *off = mark;
+        }
+    }
 }

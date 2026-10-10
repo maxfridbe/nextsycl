@@ -264,6 +264,11 @@ of IQ2_XXS instead could win twice.
       1,152 codes as the reference's - as the prompt's example)
 - [x] VoxCPM2 (audio/voxcpm2, 2026-10-10): plain / designed / cloned / continued speech at 48 kHz; MiniCPM4 LMs, the
       local encoder and flow-matching DiT, AudioVAE V2 from its .pth; checked (teacher-forced patches 1e-3..4e-2, VAE 1e-6)
+- [x] Qwen3.8-27B (llm/qwen35, 2026-10-10): the dense qwen35 graph (gated DeltaNet + gated full attention, dense
+      SwiGLU) on the shared products / KDA scan and its own attention and gates; checked against llama.cpp on Q8_0
+      (cosine >= 0.99993 every layer, same next token); served as qwen3.8-27b-q8 / -q4 / -q3 (tools, reasoning)
+- [ ] Qwen3.8-27B: the MTP draft layer (verify passes need the recurrent states' snapshots: kda_scan / conv_silu
+      already keep them), the vision tower (mmproj: pictures in chat), the Q3_K products' speed, two cards
 - [ ] VoxCPM2 speed: the DiT's 9 evaluations a patch as one graph with the Euler update on the GPU (host round trips
       now); batch the guided and unguided rows through the products already, fuse the local attention; streamed answers
 - [x] Saved voices (2026-10-10): clone from WAV / MP3 / FLAC / Ogg / M4A, design through the voice-design model, speak by name

@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-llm-qwen35"
+description = "Dense Qwen3.5 / Qwen3.8 (qwen35: Qwen3.8-27B ...): gated DeltaNet and gated full attention, a dense SwiGLU - its model description and its engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-llm.workspace = true
+nextsycl-tok.workspace = true

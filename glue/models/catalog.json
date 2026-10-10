@@ -451,6 +451,24 @@
    "size": 376951122,
    "sha256": "94b5d51e107e0507d4acc976cfdadb64edd6fd06d1f751dadbf2fd1594274bf1",
    "path": "voxcpm2/audiovae.pth"
+  },
+  "q27-q8": {
+   "url": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-Q8_0.gguf",
+   "size": 29047086048,
+   "sha256": "a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348",
+   "path": "qwen3.8-27b/Qwen3.8-27B-Q8_0.gguf"
+  },
+  "q27-q4": {
+   "url": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf",
+   "size": 16464440224,
+   "sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+   "path": "qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_M.gguf"
+  },
+  "q27-q3": {
+   "url": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q3_K_XL.gguf",
+   "size": 13146393504,
+   "sha256": "8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e",
+   "path": "qwen3.8-27b/Qwen3.8-27B-UD-Q3_K_XL.gguf"
   }
  },
  "models": [
@@ -1208,6 +1226,51 @@
     "design",
     "clone"
    ]
+  },
+  {
+   "id": "qwen3.8-27b-q8",
+   "kind": "llm",
+   "arch": "qwen35",
+   "title": "Qwen3.8-27B Q8_0 (8-bit; the B70, 32K)",
+   "about": "Qwen's dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth's GGUF - the most faithful; 27 GiB",
+   "files": {
+    "model": "q27-q8"
+   },
+   "gpus": "0",
+   "ctx": "32768",
+   "env": {},
+   "tools": true,
+   "tasks": true
+  },
+  {
+   "id": "qwen3.8-27b-q4",
+   "kind": "llm",
+   "arch": "qwen35",
+   "title": "Qwen3.8-27B UD-Q4_K_M (4-bit; the B70, 128K + 32K)",
+   "about": "Qwen's dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth's GGUF - Unsloth's dynamic 4-bit; 15 GiB",
+   "files": {
+    "model": "q27-q4"
+   },
+   "gpus": "0",
+   "ctx": "131072,32768",
+   "env": {},
+   "tools": true,
+   "tasks": true
+  },
+  {
+   "id": "qwen3.8-27b-q3",
+   "kind": "llm",
+   "arch": "qwen35",
+   "title": "Qwen3.8-27B UD-Q3_K_XL (3-bit; the B70, 128K + 32K)",
+   "about": "Qwen's dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth's GGUF - Unsloth's dynamic 3-bit; 12 GiB",
+   "files": {
+    "model": "q27-q3"
+   },
+   "gpus": "0",
+   "ctx": "131072,32768",
+   "env": {},
+   "tools": true,
+   "tasks": true
   }
  ]
 }

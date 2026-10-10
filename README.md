@@ -47,6 +47,9 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `qwen3.8-flash-next-iq2_xs-uncensored` | the same with the refusal projection (a control vector) | `qwen4exp` | 63.4 GiB | served |
 | `qwen3.8-flash-next-coder-iq1_m`, `-uncensored` | Qwen3.8-Flash-Next Coder IQ1_M | `qwen4exp` | 54.4 GiB | served |
 | `swift-1.5-iq2_xs` | Swift 1.5 IQ2_XS (short thinking) | `qwen4exp` | 63.5 GiB | served |
+| `qwen3.8-27b-q8` | Qwen3.8-27B Q8_0 (dense: gated DeltaNet + gated full attention), 32K | `qwen35` | 27.1 GiB | checked (llama.cpp), served |
+| `qwen3.8-27b-q4` | Qwen3.8-27B UD-Q4_K_M, 128K + 32K | `qwen35` | 15.3 GiB | checked (llama.cpp), served |
+| `qwen3.8-27b-q3` | Qwen3.8-27B UD-Q3_K_XL, 128K + 32K | `qwen35` | 12.2 GiB | served |
 
 **Image** (`nextsycl image`; sizes with the text encoder, VAE and tokenizer)
 
@@ -657,6 +660,25 @@ nextsycl audio check <reference dump dir> --model voxcpm2 [--stages prompt,prefi
   (equally valid) path - as two runs of the reference in two precisions do. Every mode's speech transcribes word for
   word (Whisper; Chinese and French too); a clone is 0.98 like its recording, another voice 0.92.
 - **Speed** (B70, 2026-10-10): 22 patches a second (6.25 is real time): 9.9 s of speech in 3.2 s, the decoder 0.4 s.
+
+### Qwen3.8-27B (dense)
+
+`qwen35` (`llm/qwen35`, `kernels/llm/qwen35`): Qwen's dense Qwen3.8 / Qwen3.5 family as llama.cpp's `qwen35` graph has
+it - 64 layers, three of every four gated DeltaNet (the conv + SiLU, the delta-rule recurrence, a SiLU-gated norm),
+the fourth gated full attention (24 / 4 heads of 256, a sigmoid gate a head in the query projection, q / k norms,
+rotary positions on 64 of the 256 features at theta 1e7), each with a dense SwiGLU of 17,408. The weights stay in
+their GGUF blocks: decode multiplies them through the Q8_1 products (the same as GLM's and Qwen3.8-Flash-Next's), a
+prompt chunk expands each matrix to half for the GEMM; the delta-rule scan, conv, norms and SwiGLU are the glm5next
+engine's kernels (GDN is KDA with one decay a head), the attention and the gates this engine's.
+
+- **Checked** against llama.cpp (CPU, the same Q8_0 file, `reference/llama-dump`): every layer's output cosine
+  0.99993 or better, the final norm 0.99993, the same next token at the same logit; decoding the last token alone
+  after the rest agrees with the whole prompt at once (0.99997). The greedy continuation of a prompt agrees with
+  llama.cpp's until two candidates sit within 1% of each other.
+- **Speed** (one B70, 2026-10-10, 64 greedy tokens after a short prompt): Q8_0 18.0 tok/s (~490 GB/s of weights:
+  bandwidth-bound), UD-Q4_K_M 19.1, UD-Q3_K_XL 13.3 (its Q3_K products are the slow part). Sessions check their
+  cache against the free VRAM before allocating (1.5 GiB spare).
+- Not yet: the MTP draft layer (the GGUF's `MTP/` file), pictures (the vision tower: `mmproj`), verify passes.
 
 ## Speed by model
 

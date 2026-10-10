@@ -4,7 +4,7 @@ resolver = "2"
 # crate an architecture (llm/, image/, video/) -, the glue that makes them a service (glue/), the program (cli/)
 members = [
     "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl",
-    "llm/contract", "llm/glm5next", "llm/qwen4exp", "llm/example",
+    "llm/contract", "llm/glm5next", "llm/qwen4exp", "llm/qwen35", "llm/example",
     "image/contract", "image/example", "image/qwenimage21",
     "video/contract", "video/example", "video/h3",
     "audio/contract", "audio/example", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2",
@@ -27,6 +27,7 @@ nextsycl-qwen3vl = { path = "crates/qwen3vl" }
 nextsycl-llm = { path = "llm/contract" }
 nextsycl-llm-glm5next = { path = "llm/glm5next" }
 nextsycl-llm-qwen4exp = { path = "llm/qwen4exp" }
+nextsycl-llm-qwen35 = { path = "llm/qwen35" }
 nextsycl-llm-example = { path = "llm/example" }
 nextsycl-image = { path = "image/contract" }
 nextsycl-image-example = { path = "image/example" }

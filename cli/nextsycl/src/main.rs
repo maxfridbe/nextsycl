@@ -138,7 +138,7 @@ fn gib(b: u64) -> f64 {
 
 /// The llm engines this program has, one a model architecture (llm/<arch>)
 pub(crate) fn engines() -> Vec<EngineKind> {
-    vec![nextsycl_llm_glm5next::kind(), nextsycl_llm_qwen4exp::kind(), nextsycl_llm_example::kind()]
+    vec![nextsycl_llm_glm5next::kind(), nextsycl_llm_qwen4exp::kind(), nextsycl_llm_qwen35::kind(), nextsycl_llm_example::kind()]
 }
 
 /// The engine for `f`'s architecture, loaded on `gpus`
