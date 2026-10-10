@@ -183,7 +183,7 @@ impl Home {
         let file: Vec<(String, String)> = entries(&text);
         let in_file = |k: &str| file.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         let settings: Vec<Value> = SETTINGS.iter().map(|s| {
-            let env = self.o.cfg.from_env(s.name);
+            let env = self.o.cfg.in_env(s.name);
             json!({"name": s.name, "group": s.group, "default": s.default, "what": s.what, "readers": s.readers,
                    "file": in_file(s.name), "env": env.then(|| std::env::var(s.name).unwrap_or_default())})
         }).collect();
@@ -236,7 +236,7 @@ impl Home {
         let mut restart: Vec<&str> = changed.iter().flat_map(|k| readers(k)).collect();
         restart.sort();
         restart.dedup();
-        let env: Vec<&String> = changed.iter().filter(|k| self.o.cfg.from_env(k)).collect();
+        let env: Vec<&String> = changed.iter().filter(|k| self.o.cfg.in_env(k)).collect();
         Ok(json!({"changed": changed, "restart": restart, "path": path,
                   "note": if env.is_empty() { Value::Null } else { json!(format!("{env:?} are set in this service's environment, which wins over the file")) }}))
     }

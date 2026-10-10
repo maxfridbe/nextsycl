@@ -1,20 +1,51 @@
-# The build image of nextsycl: Intel's SYCL compiler and oneMKL (the kernel library) and Rust (the runtime). Everything
-# is built inside it, so the host needs podman only; it also runs the server (nextsycl start).
+# The build image of nextsycl: Intel's SYCL compiler and oneMKL (the kernel library), oneDNN 3.12 (the diffusion
+# kernels: image, video, audio), Rust (the runtime), node (the web front ends' TypeScript compiler). Everything is
+# built inside it, so the host needs podman only; it also runs the servers (nextsycl start, image / audio / video).
 #
 # The base is a public image with the oneAPI 2026 compiler and the Level Zero driver stack for Xe2 (Arc B-series)
-# already set up (the same base as the H3 engine's image).
+# already set up (the same base as the H3 engine's image, whose layers these follow).
 ARG BASE=ghcr.io/snailium/llama.cpp-sycl-intel-b70/llama-sycl-b70:stable
 FROM ${BASE}
 
 RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-      build-essential ca-certificates curl git \
+      build-essential ca-certificates cmake curl git nodejs \
     && rm -rf /var/lib/apt/lists/*
+
+# oneDNN from source, GPU only, into /opt/onednn (kernels/build.sh: DNNL). Not the oneAPI package (3.11): the fused
+# attention kernel for this card exists from 3.12 on, and one small patch (onednn-sdpa-no-fallback.patch) makes a
+# pattern that kernel does not take an error instead of a silent fallback that puts the whole score table in device
+# memory. The compiler needs 2-3 GB a job on some files; ONEDNN_JOBS=4 fits a 16 GB machine.
+ARG ONEDNN=v3.12
+ARG ONEDNN_JOBS=4
+COPY onednn-sdpa-no-fallback.patch /tmp/
+RUN git clone -q --depth 1 -b ${ONEDNN} https://github.com/uxlfoundation/oneDNN.git /tmp/onednn \
+    && git -C /tmp/onednn apply /tmp/onednn-sdpa-no-fallback.patch \
+    && bash -c 'source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; \
+         cmake -S /tmp/onednn -B /tmp/onednn/build -DCMAKE_BUILD_TYPE=Release \
+               -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+               -DDNNL_CPU_RUNTIME=NONE -DDNNL_GPU_RUNTIME=SYCL -DDNNL_GPU_VENDOR=INTEL -DONEDNN_BUILD_GRAPH=ON \
+               -DDNNL_BUILD_TESTS=OFF -DDNNL_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX=/opt/onednn >/dev/null \
+         && make -C /tmp/onednn/build -j ${ONEDNN_JOBS} install >/tmp/onednn-build.log 2>&1 \
+         || { tail -40 /tmp/onednn-build.log; exit 1; }' \
+    && touch /opt/onednn/H3_SDPA_NO_FALLBACK \
+    && rm -rf /tmp/onednn /tmp/onednn-build.log /tmp/onednn-sdpa-no-fallback.patch
 
 # Rust, for every user id the container may run as; crates are fetched into the mounted source tree's target/
 ARG RUST=1.97.1
 ENV RUSTUP_HOME=/opt/rust/rustup PATH=/opt/rust/cargo/bin:$PATH
 RUN curl -sSf https://sh.rustup.rs | CARGO_HOME=/opt/rust/cargo sh -s -- -y --profile minimal --default-toolchain ${RUST} -c clippy \
     && chmod -R a+rX /opt/rust
+
+# The flash attention library (kernels/diffusion/flash -> libnextsycl-flash.so; kernels/build.sh skips it without
+# these): Intel's ARK attention kernels (intel/auto-round, Apache 2.0) and sycl-tla, the CUTLASS-for-SYCL headers they
+# are written in - header-only, pinned to the commits ARK's own build uses.
+ARG SYCL_TLA=370062135a385117d34096109a7d3fd82eb49a4c
+ARG AUTO_ROUND=6afaecdbe4092dc803f3e91026fe81a65b64b372
+RUN mkdir -p /opt/sycl-tla /opt/ark \
+    && curl -sSfL https://codeload.github.com/luoyu-intel/sycl-tla/tar.gz/${SYCL_TLA} | tar -xz -C /opt/sycl-tla --strip-components=1 \
+    && curl -sSfL https://codeload.github.com/intel/auto-round/tar.gz/${AUTO_ROUND} \
+       | tar -xz -C /opt/ark --strip-components=3 --wildcards '*/auto_round_extension/ark/LICENSE' '*/auto_round_extension/ark/auto_round_kernel/*' \
+    && test -f /opt/ark/auto_round_kernel/wrapper/include/sycl_tla_sdpa.hpp
 
 ENV ZES_ENABLE_SYSMAN=1
 WORKDIR /src

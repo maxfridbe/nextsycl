@@ -404,7 +404,6 @@ dependencies = [
  "nextsycl-diffusion",
  "nextsycl-image",
  "nextsycl-llm",
- "nextsycl-models",
  "nextsycl-tok",
  "serde_json",
 ]

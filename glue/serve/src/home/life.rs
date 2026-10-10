@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use super::{now, Home};
 use crate::http::{call_for, Target};
-use nextsycl_models::registry;
+use super::registry;
 
 /// Memory to keep free on a card beyond a model's (the xe driver has no out-of-memory: past the card it spills)
 const MARGIN_MB: u64 = 1536;

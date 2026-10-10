@@ -1,0 +1,18 @@
+--- a/src/graph/backend/dnnl/kernels/sdp.hpp
++++ b/src/graph/backend/dnnl/kernels/sdp.hpp
+@@ -76,6 +76,15 @@
+         }
+
+         if (ret != status::success) {
++            // H3 engine: with _ONEDNN_GRAPH_SDPA_NO_FALLBACK=1, a pattern the fused GPU kernel does not take is
++            // an error instead of a silent fallback. The fallback holds the whole [heads, queries, keys] score
++            // table in device memory (30 GiB at 16.5k tokens), and the xe driver has no out-of-memory error: the
++            // caller must be able to rely on "fused, or told otherwise".
++            if (ekind == engine_kind::gpu
++                    && graph::utils::getenv_int_internal(
++                               "GRAPH_SDPA_NO_FALLBACK", 0)
++                            > 0)
++                return ret;
+             kernel = std::make_shared<larger_partition_kernel_t>();
+             ret = kernel->compile_impl(part, g_engine, inputs, outputs);
+         }

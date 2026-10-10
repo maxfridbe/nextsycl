@@ -17,7 +17,7 @@ use serde_json::{json, Map, Value};
 use super::life::s;
 use super::{now, Home};
 use crate::http::{self, call_for, Conn, Request};
-use nextsycl_models::registry;
+use super::registry;
 
 /// One method: its kind and name, what it does, its body's fields (name, JSON type, description, required) and an
 /// example body

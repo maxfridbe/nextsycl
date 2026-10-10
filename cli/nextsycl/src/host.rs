@@ -57,6 +57,30 @@ pub fn switch(args: &[String]) -> Result<(), String> {
 /// and the models, enabling and loading them, one API for all (nextsycl_serve::home). Ports from the settings:
 /// NS_PORT, NS_SWITCH_PORT, NS_IMAGE_PORT, NS_AUDIO_PORT, NS_VIDEO_PORT, NS_CHAT_UI_PORT; the API's token NS_API_TOKEN
 /// (else one made and kept beside the registry); NS_IDLE_MINUTES.
+/// The registry and the settings for the front door (nextsycl-models', which the glue may not depend on)
+struct Store(Config);
+
+impl nextsycl_serve::home::registry::Store for Store {
+    fn models(&self) -> Result<Vec<serde_json::Value>, String> {
+        models::all(&self.0)
+    }
+    fn update(&self, id: &str, f: &mut dyn FnMut(&mut serde_json::Value)) -> Result<serde_json::Value, String> {
+        models::update(&self.0, id, f)
+    }
+    fn registry_file(&self) -> PathBuf {
+        models::registry(&self.0)
+    }
+    fn get(&self, name: &str) -> Option<String> {
+        self.0.get(name)
+    }
+    fn in_env(&self, name: &str) -> bool {
+        self.0.from_env(name)
+    }
+    fn file(&self) -> PathBuf {
+        self.0.file()
+    }
+}
+
 pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
     use nextsycl_serve::home::{Home, Options, Ports};
     let port = |k: &str, d: u16| cfg.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
@@ -73,7 +97,7 @@ pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
             video: port("NS_VIDEO_PORT", 8090), chat_ui: port("NS_CHAT_UI_PORT", 8080),
         },
         serve_host: opt(args, "--serve-host").unwrap_or("0.0.0.0").to_string(),
-        cfg: Config::load(),
+        cfg: Box::new(Store(Config::load())),
         idle_minutes: idle,
     };
     let addr = format!("{}:{}", opt(args, "--host").unwrap_or("0.0.0.0"), opt(args, "--port").map(str::to_string).or_else(|| cfg.get("NS_SERVE_PORT")).unwrap_or("8000".into()));

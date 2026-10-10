@@ -21,6 +21,7 @@
 mod api;
 mod config;
 mod life;
+pub mod registry;
 mod yaml;
 
 use std::collections::BTreeMap;
@@ -33,8 +34,6 @@ use serde_json::{json, Value};
 
 use crate::gpustat::{find_cards, Card};
 use crate::http::{self, call_for, Conn, Target};
-use nextsycl_models::config::Config;
-use nextsycl_models::registry;
 
 /// Where the services listen (this box's settings)
 #[derive(Clone, Debug)]
@@ -56,8 +55,8 @@ pub struct Options {
     pub ports: Ports,
     /// the address servers started from here listen on (their pages are linked from other machines)
     pub serve_host: String,
-    /// the settings (the registry, the token)
-    pub cfg: Config,
+    /// the registry and the settings (the program's: home::registry::Store)
+    pub cfg: Box<dyn registry::Store>,
     /// unload an enabled model after this many minutes without a request (0: never)
     pub idle_minutes: u64,
 }
