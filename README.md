@@ -47,9 +47,9 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `qwen3.8-flash-next-iq2_xs-uncensored` | the same with the refusal projection (a control vector) | `qwen4exp` | 63.4 GiB | served |
 | `qwen3.8-flash-next-coder-iq1_m`, `-uncensored` | Qwen3.8-Flash-Next Coder IQ1_M | `qwen4exp` | 54.4 GiB | served |
 | `swift-1.5-iq2_xs` | Swift 1.5 IQ2_XS (short thinking) | `qwen4exp` | 63.5 GiB | served |
-| `qwen3.8-27b-q8` | Qwen3.8-27B Q8_0 (dense: gated DeltaNet + gated full attention), 32K | `qwen35` | 27.1 GiB | checked (llama.cpp), served |
-| `qwen3.8-27b-q4` | Qwen3.8-27B UD-Q4_K_M, 128K + 32K | `qwen35` | 15.3 GiB | checked (llama.cpp), served |
-| `qwen3.8-27b-q3` | Qwen3.8-27B UD-Q3_K_XL, 128K + 32K | `qwen35` | 12.2 GiB | served |
+| `qwen3.8-27b-q8` | Qwen3.8-27B Q8_0 (dense: gated DeltaNet + gated full attention), 32K, MTP drafts | `qwen35` | 28.4 GiB | checked (llama.cpp), served (verify passes exact) |
+| `qwen3.8-27b-q4` | Qwen3.8-27B UD-Q4_K_M, 128K + 32K, MTP drafts | `qwen35` | 16.6 GiB | checked (llama.cpp), served (verify passes exact) |
+| `qwen3.8-27b-q3` | Qwen3.8-27B UD-Q3_K_XL, 128K + 32K, MTP drafts | `qwen35` | 13.5 GiB | served |
 
 **Image** (`nextsycl image`; sizes with the text encoder, VAE and tokenizer)
 
@@ -104,6 +104,13 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
   that will verify it (Strata's coupled draft sampling): 69-70% of drafts accepted at 0.7 / 1.0 instead of 60-64%,
   the text exactly the draws, and the same `seed` the same text. Prompt-lookup drafts (`NS_NGRAM`) are there too, exact, off: on this MoE a longer
   verify pass costs nearly its rows (each brings its own experts).
+- **MTP on the dense Qwen3.8-27B too:** its MTP file's draft block proposes 3 tokens a step (chained on its own
+  output), one pass verifies them, the DeltaNet states roll back from the pass's snapshots - decode about doubles
+  (26 -> 43-49 tok/s on the 4-bit file, 18.5 -> 42 on Q8_0), the same tokens as without (`spec-check`: 0 difference).
+- **Kernels tuned per model, in silos:** the shared kernels (`kernels/ns`, Strata's, the diffusion ones) stay as the
+  engines on them were tuned; a model's faster versions live in its silo (`kernels/<kind>/<arch>/silo/`, its own
+  library `dist/silo/libnextsycl-<arch>.so`), which its engine opens at load and uses for what they cover - the
+  shared kernels for the rest, or for everything with `NS_SILO=0` (CONTRIBUTING.md rule 5).
 - **Long context, to 256K:** the DSA indexer past 2,048 tokens (each row attends to its top 512 pools of 4 tokens and
   its own unfinished pool), checked against llama.cpp; a context per session (`--ctx 262144,32768` / `NS_CTX`: one
   long session and a short one; default two of 64K). A 253K-token prompt reads in 249 s (~1,020 tok/s) and decodes at
@@ -676,7 +683,7 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   after the rest agrees with the whole prompt at once (0.99997). The greedy continuation of a prompt agrees with
   llama.cpp's until two candidates sit within 1% of each other.
 - **Speed** (one B70, 2026-10-10; `llm generate --ids` of the benchy v1 prompts, 128 greedy tokens), prompt read /
-  decode, tokens/s:
+  decode, tokens/s - first without drafts (`--no-mtp`):
 
   | File | 20 | 2,185 | 8,000 | 40,000 |
   |---|---:|---:|---:|---:|
@@ -684,16 +691,29 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   | UD-Q4_K_M | 62 / 25.1 | 1,151 / 25.0 | 1,100 / 24.3 | 524 / 19.4 |
   | UD-Q3_K_XL | 61 / 22.5 | 1,149 / 22.3 | 1,099 / 20.2 | 524 / 17.8 |
 
-  With MTP (the file's draft block, `MTP/` beside the model: 3 drafts a step, ~84% accepted, the same tokens as
-  without) decode at 2,185 is UD-Q4_K_M 43.3 tok/s (26.2 without), UD-Q3_K_XL 41.9 (22.3), Q8_0 41.8 (18.5); Q4 at
-  20 / 8,000 tokens 46.8 / 37.1. Prompts read ~3% slower (the draft block follows every pass). `--no-mtp` turns it off.
+  With MTP (the default), decode:
 
-  Most of it is the engine's silo (`kernels/llm/qwen35/silo`, kernels tuned for this model): its decode products for
-  the types these files hold, flash attention on XMX for prompts and a lane-a-key decode attention, its weight
-  expansion to half, a norm that hands the products their Q8_1 blocks; prompt chunks of 2,048. With the shared
-  kernels alone (`NS_SILO=0`) UD-Q4_K_M reads 2,185 tokens at 441 tok/s and decodes at 18.5 - the same tokens either
-  way. Q8_0 decode is bandwidth-bound (27 GiB a token). `NS_PROFILE=gpu NS_Q35_PROFILE=1` times every kernel.
-  Sessions check their cache against the free VRAM before allocating (1.5 GiB spare).
+  | File | 20 | 2,185 | 8,000 | a coding answer |
+  |---|---:|---:|---:|---:|
+  | Q8_0 | - | 41.8 | - | - |
+  | UD-Q4_K_M | 46.8 | 43.3 | 37.1 | 48.8 |
+  | UD-Q3_K_XL | - | 41.9 | - | - |
+
+  84-89% of the drafts accepted; prompts read ~3% slower (the draft block follows every pass). With the shared
+  kernels alone (`NS_SILO=0`, no drafts) UD-Q4_K_M reads 2,185 tokens at 441 tok/s and decodes at 18.5.
+- **MTP:** the draft block (block 64 of the MTP file - `MTP/` beside the model, the catalog's `q27-mtp`, or
+  `NS_Q35_MTP`) reads each position's normed hidden state with the token after it. It runs behind every pass over
+  that pass's rows, so its cache follows the conversation; `step` drafts `NS_Q35_DRAFTS` tokens (3: 2 is as fast, 4
+  and 5 slower), verifies [token, drafts] in one pass and keeps what the sampled tokens match, so what is committed
+  is distributed as plain sampling. Verify rows are bit for bit the one-token decode's (`spec-check --rows 2..4`).
+  `--no-mtp` turns it off. Q8_0 with MTP fits its catalog 32K context, not 40K.
+- **Its silo** (`kernels/llm/qwen35/silo`, kernels tuned for this model): decode products for the types these files
+  hold (Q4_K 507 GB/s against Strata's 366, IQ4_XS ~490 / 361, Q5_K 525 / 415, Q3_K 380 / 89, IQ3_S 439 / 118 - the
+  same outputs), flash attention on XMX for prompts, a decode attention with a lane a key over ~512 work-groups, the
+  weight expansion to half at ~300 GB/s for every type (Q6_K's went through float32 at 13-15), a norm that hands the
+  products their Q8_1 blocks; prompt chunks of 2,048 when they fit. `NS_PROFILE=gpu NS_Q35_PROFILE=1` times every
+  kernel on the device against the card's ceilings. Sessions check their cache against the free VRAM before
+  allocating (1.5 GiB spare).
 - Not yet: pictures (the vision tower: `mmproj`).
 
 ## Speed by model
@@ -894,6 +914,19 @@ What measuring this runtime on two Arc cards taught, most of it the hard way:
   faulted the GPU); the host never waits on a queue's events (Level Zero v2 deadlocks - order on the device).
 - **A long prompt must not hold the others.** Read it in chunks that stop for a newcomer, share the GPUs by time
   with those decoding, and keep its checkpoint (on disk) so the follow-up is seconds, not minutes.
+
+- **Tune for one model in its own silo.** Speeding the 27B by editing Strata's shared kernels would have moved the
+  engines tuned on them; the same changes as the 27B's own library (`kernels/llm/qwen35/silo`) gave it 1.3-4.3x per
+  type and left the others bit for bit as they were (re-benched).
+- **On Xe2, small loads are slow.** One- and two-byte global loads cost more than the arithmetic: the same IQ3_S
+  kernel ran at 132 GB/s with them and 439 with aligned 16-byte loads and selects; 32-bit integer multiplies are slow
+  too (a table instead). Codebooks belong in local memory, indexed by a whole byte.
+- **Measure utilisation, not time.** A per-kernel profile against the card's ceilings (bytes and flops per kernel,
+  device timestamps) showed decode attention at 8% of the bandwidth (36 work-groups on 256 engines), a norm walking
+  its row on one core (22 us for 20 KB) and Q6_K's prompt expansion at 13 GB/s - none of it visible in the phase times.
+- **Make the draft path exact first.** The decode attention sized its splits from the longest row; a verify row then
+  summed its keys in another order than the one-token decode. Splitting each row as a one-row pass would made
+  `spec-check` 0, and with it MTP's output the same text as without.
 
 ## Standing on
 
