@@ -41,6 +41,19 @@ pub fn api() -> Result<&'static Api> {
     API.get_or_init(|| Api::load(KIND.get().copied().unwrap_or("llm"))).as_ref().map_err(|e| Error(e.clone()))
 }
 
+/// A model's silo (`kernels/<kind>/<arch>/silo/`: its tuned kernels, `dist/silo/libnextsycl-<arch>.so`), opened on
+/// the first ask and kept: None when there is none (or NS_SILO=0) - the engine then uses the shared kernels
+pub fn silo(arch: &str) -> Result<Option<&'static nextsycl_sys::Silo>> {
+    static SILOS: std::sync::Mutex<Vec<(String, Option<&'static nextsycl_sys::Silo>)>> = std::sync::Mutex::new(Vec::new());
+    let mut m = SILOS.lock().unwrap();
+    if let Some((_, s)) = m.iter().find(|(a, _)| a == arch) {
+        return Ok(*s);
+    }
+    let s = api()?.silo(arch).map_err(Error)?.map(|s| &*Box::leak(Box::new(s)));
+    m.push((arch.to_string(), s));
+    Ok(s)
+}
+
 fn check(api: &Api, rc: i32, what: &str) -> Result<()> {
     if rc == 0 {
         Ok(())

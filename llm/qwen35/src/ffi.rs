@@ -101,3 +101,35 @@ pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
     let why = nextsycl_core::api().map(|a| a.error()).unwrap_or_default();
     Err(nextsycl_core::Error(format!("{what}: {why}")))
 }
+
+/// The silo's kernels (kernels/llm/qwen35/silo/silo.h, dist/silo/libnextsycl-qwen35.so), when it is there
+pub struct Silo {
+    pub path: std::path::PathBuf,
+    pub mmvq_supported: unsafe extern "C" fn(c_int, i64) -> c_int,
+    pub mmvq: unsafe extern "C" fn(G, c_int, P, P, *mut f32, i64, i64, i64) -> c_int,
+}
+
+/// The silo (None: the shared kernels for everything)
+pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
+    static SILO: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    SILO.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo(crate::ARCH).map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in silo.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo { path: lib.path.clone(), mmvq_supported: sym!("ns_q35_mmvq_supported"), mmvq: sym!("ns_q35_mmvq") }))
+    })
+    .as_ref()
+    .map(|s| s.as_ref())
+    .map_err(|e| nextsycl_core::Error(e.clone()))
+}

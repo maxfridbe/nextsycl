@@ -208,11 +208,16 @@ impl Decoder {
     }
 }
 
+/// NS_Q35_PROFILE=2's table: by product (type and shape), its seconds, calls and weight bytes
+type ProductTimes = std::collections::BTreeMap<String, (f64, u64, u64)>;
+
 pub struct Qwen35<'g> {
     pub g: Geometry,
     file: &'g Gguf,
     gpu: Arc<Gpu>,
     k: &'static ffi::Api,
+    /// the silo's tuned kernels (kernels/llm/qwen35/silo), None: the shared ones throughout
+    silo: Option<&'static ffi::Silo>,
     layers: Vec<Layer>,
     output_norm: DevBuf,
     output: Mat,
@@ -224,6 +229,11 @@ pub struct Qwen35<'g> {
     /// the largest matrix expanded to half (a prompt chunk's products)
     w16: DevBuf,
     work: Mutex<()>,
+    /// NS_Q35_PROFILE=1: seconds and calls by phase (each phase ends with a sync, so the sum is above a pass's time)
+    profile: Option<Mutex<std::collections::BTreeMap<&'static str, (f64, u64)>>>,
+    /// NS_Q35_PROFILE=2: also each decode product alone (drained before and after): seconds, calls and weight bytes by
+    /// type and shape
+    mm_profile: Option<Mutex<ProductTimes>>,
     load_s: f64,
     load_bytes: u64,
 }
@@ -241,6 +251,11 @@ impl<'g> Qwen35<'g> {
         }
         let g = Geometry::read(f).map_err(e)?;
         let k = ffi::api()?;
+        let silo = ffi::silo()?;
+        log(match silo {
+            Some(s) => format!("qwen35: tuned kernels from its silo {}", s.path.display()),
+            None => "qwen35: no silo - the shared kernels".into(),
+        });
         // the plan: every tensor but the token embedding, a prompt chunk's work, 1.5 GiB to spare (the xe driver has
         // no out-of-memory error: past the card it spills to host memory)
         let embd = f.tensor("token_embd.weight").ok_or_else(|| e("no token_embd.weight"))?.clone();
@@ -303,7 +318,41 @@ impl<'g> Qwen35<'g> {
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("qwen35: {} layers of {} ({} full attention), {:.1} GiB on {} in {load_s:.0} s", g.layers, g.n_embd,
                     (0..g.layers).filter(|l| g.full(*l)).count(), loaded as f64 / (1u64 << 30) as f64, gpu.name));
-        Ok(Qwen35 { g, file: f, gpu, k, layers, output_norm, output, embd, chunk, arena, w16, work: Mutex::new(()), load_s, load_bytes: loaded })
+        let level = std::env::var("NS_Q35_PROFILE").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        let profile = (level >= 1).then(|| Mutex::new(Default::default()));
+        let mm_profile = (level >= 2).then(|| Mutex::new(Default::default()));
+        Ok(Qwen35 { g, file: f, gpu, k, silo, layers, output_norm, output, embd, chunk, arena, w16, work: Mutex::new(()), profile, mm_profile, load_s,
+                    load_bytes: loaded })
+    }
+
+    /// With NS_Q35_PROFILE: the GPU drained and the time since `t0` charged to `name`; the new start
+    fn lap(&self, name: &'static str, t0: Instant) -> Instant {
+        if let Some(p) = &self.profile {
+            let _ = self.gpu.sync();
+            let mut m = p.lock().unwrap();
+            let e = m.entry(name).or_insert((0.0, 0));
+            e.0 += t0.elapsed().as_secs_f64();
+            e.1 += 1;
+            return Instant::now();
+        }
+        t0
+    }
+
+    /// The profile's lines (`report`)
+    pub fn profile_lines(&self, tokens: usize) -> Vec<String> {
+        let Some(p) = &self.profile else { return Vec::new() };
+        let m = p.lock().unwrap();
+        let total: f64 = m.values().map(|v| v.0).sum();
+        let mut v: Vec<String> = m.iter().map(|(n, (s, c))| format!("[profile {n:<14} {s:>7.2} s {c:>7} calls {:>7.2} ms/token {:>5.1}%]",
+                                                                    s * 1000.0 / tokens.max(1) as f64, 100.0 * s / total.max(1e-9))).collect();
+        v.push(format!("[profile total {total:.2} s]"));
+        if let Some(mm) = &self.mm_profile {
+            for (n, (s, c, b)) in mm.lock().unwrap().iter() {
+                v.push(format!("[profile product {n:<26} {:>7.2} ms/token {:>6} calls {:>6.1} us each {:>5.0} GB/s]", s * 1000.0 / tokens.max(1) as f64, c,
+                               s * 1e6 / (*c).max(1) as f64, *b as f64 / s.max(1e-12) / 1e9));
+            }
+        }
+        v
     }
 
     pub fn load_seconds(&self) -> f64 {
@@ -335,7 +384,24 @@ impl<'g> Qwen35<'g> {
             let qb = self.arena.bytes(unsafe { (k.q8_1_bytes)(kk, t as i64) })?;
             // SAFETY: x [t, cols] float32 -> its Q8_1 blocks; the matrix in its blocks; y [t, rows].
             ffi::check(unsafe { (k.quantize_q8_1)(self.raw(), x.fp(), qb.ptr(), kk, t as i64) }, "quantize")?;
-            return ffi::check(unsafe { (k.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.ptr(), y.fp(), kk, n, t as i64) }, "mmvq");
+            let t0 = self.mm_profile.as_ref().map(|_| self.gpu.sync().map(|_| Instant::now())).transpose()?;
+            // the silo's product for the types it covers (kernels/llm/qwen35/silo), the shared one otherwise
+            // SAFETY: arithmetic only.
+            let f = match self.silo {
+                Some(s) if unsafe { (s.mmvq_supported)(w.ty.code() as i32, kk) } != 0 => s.mmvq,
+                _ => k.mmvq,
+            };
+            // SAFETY: as above.
+            ffi::check(unsafe { f(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.ptr(), y.fp(), kk, n, t as i64) }, "mmvq")?;
+            if let (Some(mm), Some(t0)) = (&self.mm_profile, t0) {
+                self.gpu.sync()?;
+                let mut m = mm.lock().unwrap();
+                let e = m.entry(format!("{} {}x{}", w.ty.name(), w.rows, w.cols)).or_insert((0.0, 0, 0));
+                e.0 += t0.elapsed().as_secs_f64();
+                e.1 += 1;
+                e.2 += w.ty.bytes((w.rows * w.cols) as u64).unwrap_or(0);
+            }
+            return Ok(());
         }
         // the matrix expanded to half (directly, or through float32), x to half, then the half product
         let elems = w.rows * w.cols;
@@ -472,7 +538,9 @@ impl<'g> Qwen35<'g> {
         }
         self.arena.reset();
         let p0 = s.pos;
+        let mut tp = Instant::now();
         let x = self.embed(tokens)?;
+        tp = self.lap("embed", tp);
         let h = self.arena.f32(t * g.n_embd)?;
         let ffn_g = self.arena.f32(t * g.n_ff)?;
         let ffn_u = self.arena.f32(t * g.n_ff)?;
@@ -482,8 +550,16 @@ impl<'g> Qwen35<'g> {
             let mark = self.arena.mark();
             self.rms(&x, &ly.attn_norm, &h, t, g.n_embd)?;
             let out = match (st, &ly.full, &ly.linear) {
-                (LState::Full { k, v }, Some(a), _) => self.full(a, k, v, s.max_ctx, &h, t, p0)?,
-                (LState::Linear { s: rs, conv }, _, Some(a)) => self.linear(a, rs, conv, &h, t)?,
+                (LState::Full { k, v }, Some(a), _) => {
+                    let o = self.full(a, k, v, s.max_ctx, &h, t, p0)?;
+                    tp = self.lap("full attention", tp);
+                    o
+                }
+                (LState::Linear { s: rs, conv }, _, Some(a)) => {
+                    let o = self.linear(a, rs, conv, &h, t)?;
+                    tp = self.lap("deltanet", tp);
+                    o
+                }
                 _ => return Err(e(format!("layer {l}: its state and its weights disagree"))),
             };
             self.add(&x, &out, t * g.n_embd)?;
@@ -494,6 +570,7 @@ impl<'g> Qwen35<'g> {
             ffi::check(unsafe { (self.k.swiglu_clamp)(self.raw(), ffn_g.fp(), ffn_u.fp(), ffn_g.fp(), (t * g.n_ff) as i64, f32::INFINITY) }, "swiglu")?;
             self.matmul(&ly.down, &ffn_g, t, &ffn)?;
             self.add(&x, &ffn, t * g.n_embd)?;
+            tp = self.lap("ffn", tp);
             tap(&format!("l_out-{l}"), &x)?;
             self.arena.rewind(mark);
         }
@@ -507,7 +584,9 @@ impl<'g> Qwen35<'g> {
         tap("result_norm", &normed)?;
         let logits = self.arena.f32(n * self.output.rows)?;
         self.matmul(&self.output, &normed, n, &logits)?;
+        tp = self.lap("head", tp);
         let all = logits.to_f32()?;
+        self.lap("read logits", tp);
         Ok(all.chunks(self.output.rows).map(|c| c.to_vec()).collect())
     }
 

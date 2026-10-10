@@ -675,9 +675,20 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   0.99993 or better, the final norm 0.99993, the same next token at the same logit; decoding the last token alone
   after the rest agrees with the whole prompt at once (0.99997). The greedy continuation of a prompt agrees with
   llama.cpp's until two candidates sit within 1% of each other.
-- **Speed** (one B70, 2026-10-10, 64 greedy tokens after a short prompt): Q8_0 18.0 tok/s (~490 GB/s of weights:
-  bandwidth-bound), UD-Q4_K_M 19.1, UD-Q3_K_XL 13.3 (its Q3_K products are the slow part). Sessions check their
-  cache against the free VRAM before allocating (1.5 GiB spare).
+- **Speed** (one B70, 2026-10-10; `llm generate --ids` of the benchy v1 prompts, 128 greedy tokens), prompt read /
+  decode, tokens/s:
+
+  | File | 20 | 2,185 | 8,000 | 40,000 |
+  |---|---:|---:|---:|---:|
+  | Q8_0 | 44 / 17.6 | 458 / 16.6 | 284 / 16.0 | 81 / 11.3 |
+  | UD-Q4_K_M | 35 / 24.5 | 422 / 22.5 | 271 / 21.4 | 79 / 14.1 |
+  | UD-Q3_K_XL | 33 / 21.1 | 540 / 20.4 | 301 / 18.8 | 82 / 13.0 |
+
+  Decode comes from the engine's silo (`kernels/llm/qwen35/silo`: its own decode products for the types these files
+  hold): with the shared kernels alone (`NS_SILO=0`) UD-Q4_K_M decodes 18.8 / 17.7 / 17.1 and UD-Q3_K_XL 12.3 at
+  2,185 - the same tokens either way. Q8_0 is bandwidth-bound on the shared Q8_0 product (~490 GB/s). Long prompts
+  are slow: the prompt pass's attention is not tiled yet (each row reads every key), the next thing to fix.
+  Sessions check their cache against the free VRAM before allocating (1.5 GiB spare).
 - Not yet: the MTP draft layer (the GGUF's `MTP/` file), pictures (the vision tower: `mmproj`), verify passes.
 
 ## Speed by model

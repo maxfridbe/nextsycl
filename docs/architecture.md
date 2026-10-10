@@ -66,6 +66,8 @@ kernels/                   SYCL ONLY - one library a kind (dist/libnextsycl-<kin
                           diffusion/flash: flash attention (ARK on sycl-tla) as libnextsycl-flash.so, loaded on use
   llm/<arch>/  image/<arch>/  video/<arch>/  audio/<arch>/   an engine's own kernels and its header
                           (ns_<kind>_<arch>_* symbols)
+  <kind>/<arch>/silo/     the engine's silo: kernels tuned for that model alone, replacing shared ones for what they
+                          cover - their own library, dist/silo/libnextsycl-<arch>.so, opened by the engine at load
 ```
 
 ### The rules (checked by `cli/nextsycl/tests/architecture.rs` on every `cargo test`)
@@ -80,6 +82,13 @@ kernels/                   SYCL ONLY - one library a kind (dist/libnextsycl-<kin
 - **One library a kind.** A process of one kind (`nextsycl_core::use_kind`, default llm) opens only that kind's
   kernel library: an llm server never loads image or video code. An engine binds its own symbols by name
   (`nextsycl_sys::Api::symbol`, in its `ffi.rs`); the shared tables hold only `ns.h`.
+- **Tuning lives in silos** (CONTRIBUTING.md rule 5). The shared kernels (`kernels/ns`, `kernels/strata`,
+  `kernels/diffusion`, an engine's kernels another engine calls) stay as the engines on them were tuned; a model's
+  faster version of one goes in its silo, `kernels/<kind>/<arch>/silo/`, built as `dist/silo/libnextsycl-<arch>.so`
+  (no shared part inside: its undefined symbols resolve against the kind's library, opened first). The engine opens
+  it at load (`nextsycl_core::silo(ARCH)`, once a process; `NS_SILO=0` or `NS_SILO_DIR` to change where), binds its
+  symbols by name, asks each op's `_supported` per call and falls back to the shared kernel otherwise - with no
+  silo file it runs on the shared kernels alone, just slower. Its load log says which.
 
 ## The kinds' contracts
 
@@ -135,6 +144,14 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   `NS_QW_CVEC=<file.gguf>:<scale>`, `NS_QW_CVEC_LAYERS=4,44`, `NS_QW_CVEC_MODE=project|add`,
   `NS_QW_CVEC_DIR=per-layer`. The Coder has 256 experts (the kernels take the count from the file); Swift's router is
   F32 in the file and is converted to BF16 at load (exact).
+- **qwen35** - dense Qwen3.5 / Qwen3.8 (Qwen3.8-27B): gated DeltaNet (glm5next's conv, L2 norm and delta-rule scan)
+  and gated full attention (its own, `kernels/llm/qwen35/q35.cpp`), a dense SwiGLU; the weights in their GGUF blocks.
+  The first engine with a **silo** (`kernels/llm/qwen35/silo/`): its decode products for the types its files hold
+  (Q3_K, Q4_K, Q5_K, IQ4_NL, IQ3_S, IQ4_XS), started from Strata's wide kernels and tuned for its shapes - scales from
+  one aligned load, the IQ4 codebook and IQ3_S grid in local memory - 1.3-4.3x Strata's per type on the B70 and the
+  same results; Q8_0 / Q6_K and the rest go to the shared ones. Settings: `NS_Q35_CHUNK` (prompt rows a pass, 512),
+  `NS_Q35_PROFILE=1` (time by phase) / `=2` (and each decode product alone, with its GB/s), `NS_Q35_MMVQ_ROWS`
+  (rows a sub-group, every silo type) and `NS_Q35_MMVQ_GROUPS` (work-groups of the kernels with a table, 512).
 
 ## The audio engines
 

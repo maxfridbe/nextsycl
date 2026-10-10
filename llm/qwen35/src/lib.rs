@@ -164,4 +164,7 @@ impl Engine for engine::Qwen35<'_> {
     fn gpu_info(&self) -> Vec<GpuInfo> {
         engine::Qwen35::gpu_info(self)
     }
+    fn report(&self, tokens: usize) -> Vec<String> {
+        engine::Qwen35::profile_lines(self, tokens)
+    }
 }

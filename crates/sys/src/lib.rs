@@ -23,6 +23,8 @@ pub type Gpu = *mut c_void;
 pub struct Api {
     /// the library's handle: an engine binds its own ABI from it (`symbol`)
     handle: *mut c_void,
+    /// where it was opened from: the silos are in `silo/` beside it
+    path: PathBuf,
     pub last_error: unsafe extern "C" fn() -> *const c_char,
     pub version: unsafe extern "C" fn() -> *const c_char,
     pub gpu_count: unsafe extern "C" fn() -> c_int,
@@ -100,6 +102,7 @@ impl Api {
         }
         Ok(Api {
             handle: h,
+            path: path.to_path_buf(),
             last_error: sym!("ns_last_error"),
             version: sym!("ns_version"),
             gpu_count: sym!("ns_gpu_count"),
@@ -136,9 +139,51 @@ impl Api {
         unsafe { dlsym(self.handle, n.as_ptr()) }
     }
 
+    /// A model's silo (`<the library's directory>/silo/libnextsycl-<arch>.so`, or `NS_SILO_DIR`): kernels tuned for
+    /// that one model, built from `kernels/<kind>/<arch>/silo/`, opened on demand. None when there is none or
+    /// `NS_SILO=0` (the shared kernels then); an error when the file is there but does not open.
+    pub fn silo(&self, arch: &str) -> Result<Option<Silo>, String> {
+        if std::env::var("NS_SILO").is_ok_and(|v| v == "0") {
+            return Ok(None);
+        }
+        let dir = std::env::var_os("NS_SILO_DIR").map(PathBuf::from)
+                                                  .unwrap_or_else(|| self.path.parent().unwrap_or(Path::new(".")).join("silo"));
+        let path = dir.join(format!("libnextsycl-{arch}.so"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let c = CString::new(path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
+        // SAFETY: dlopen with a valid C string; the handle is checked. Its undefined symbols (the shared part's
+        // ns_fail ...) resolve against the kind's library, opened RTLD_GLOBAL before it.
+        let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+        if h.is_null() {
+            return Err(format!("{}: {}", path.display(), dl_error()));
+        }
+        Ok(Some(Silo { handle: h, path }))
+    }
+
     /// The reason of the last failed call on this thread.
     pub fn error(&self) -> String {
         // SAFETY: ns_last_error returns a C string owned by the library, valid until the next call on this thread.
         unsafe { CStr::from_ptr((self.last_error)()) }.to_string_lossy().into_owned()
+    }
+}
+
+/// A model's silo library (`Api::silo`): its tuned kernels, bound by the engine by name
+pub struct Silo {
+    handle: *mut c_void,
+    pub path: PathBuf,
+}
+
+// SAFETY: a handle to a library that stays loaded for the process's life.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+impl Silo {
+    /// A symbol of the silo by name (null when it has none)
+    pub fn symbol(&self, name: &str) -> *mut c_void {
+        let Ok(n) = CString::new(name) else { return std::ptr::null_mut() };
+        // SAFETY: a lookup in the silo's handle; it stays open for the process.
+        unsafe { dlsym(self.handle, n.as_ptr()) }
     }
 }

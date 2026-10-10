@@ -43,7 +43,7 @@ DIFFFLAGS=(-fsycl -std=c++20 -O3 -fPIC -Wno-unused-parameter -Wno-unused-variabl
 KINDS="llm image video audio"
 all_sources() {
   ls $S/src/kernels/*.dp.cpp $S/src/prefill/*.dp.cpp ns/*.cpp diffusion/*.cpp 2>/dev/null
-  for k in $KINDS; do ls $k/*/*.cpp 2>/dev/null; done
+  for k in $KINDS; do ls $k/*/*.cpp $k/*/silo/*.cpp 2>/dev/null || true; done   # a kind may have no silo
 }
 SRCS=${ONLY:-$(all_sources)}
 echo "==> compiling $(echo $SRCS | wc -w) sources (AOT ${AOT:-none}, $JOBS at a time)"
@@ -69,7 +69,7 @@ done
 # program of one kind never loads another kind's code. Each is linked beside its old self, then renamed over it: a
 # running server keeps the library it mapped (writing over a mapped library in place would change the code under it)
 for k in $KINDS; do
-  objs="$(ls "$OBJ"/ns_*.o) $(ls "$OBJ"/${k}_*.o 2>/dev/null || true)"
+  objs="$(ls "$OBJ"/ns_*.o) $(ls "$OBJ"/${k}_*.o 2>/dev/null | grep -v '_silo_' || true)"
   extra=()
   if [ "$k" = llm ]; then
     objs="$objs $(ls "$OBJ"/strata_*.o)"
@@ -79,6 +79,17 @@ for k in $KINDS; do
   fi
   echo "==> linking libnextsycl-$k.so"
   icpx "${LINK[@]}" $objs "${extra[@]}" -o "$OUT/.libnextsycl-$k.so.new" && mv -f "$OUT/.libnextsycl-$k.so.new" "$OUT/libnextsycl-$k.so"
+done
+# the silos: a model's kernels tuned for it alone (kernels/<kind>/<arch>/silo/) in their own library,
+# dist/silo/libnextsycl-<arch>.so, which its engine opens at load (falling back to the shared kernels without it).
+# Its undefined symbols (the shared part's) resolve against the kind's library, loaded before it.
+mkdir -p "$OUT/silo"
+for d in $(ls -d */*/silo 2>/dev/null); do
+  arch=$(basename "$(dirname "$d")")
+  objs=$(ls "$OBJ"/$(echo "$d" | tr / _)_*.o 2>/dev/null || true)
+  [ -n "$objs" ] || continue
+  echo "==> linking silo/libnextsycl-$arch.so"
+  icpx "${LINK[@]}" $objs -o "$OUT/silo/.libnextsycl-$arch.so.new" && mv -f "$OUT/silo/.libnextsycl-$arch.so.new" "$OUT/silo/libnextsycl-$arch.so"
 done
 # flash attention (diffusion/flash/flash.cpp -> libnextsycl-flash.so, loaded by the diffusion kernels on first use):
 # ARK's kernel on sycl-tla, with the flags sycl-tla wants; skipped when the build image lacks the headers or the

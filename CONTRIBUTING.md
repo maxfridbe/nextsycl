@@ -21,6 +21,14 @@ guide is how to port one, and the few rules every change follows.
      by name (its `ffi.rs`) - never added to the shared `kernels/ns/ns.h`.
 4. **Exact before fast.** An engine is checked against a reference (the model's own implementation, or llama.cpp
    for an llm) before it is tuned, and every speed claim comes with the measurement that made it.
+5. **Tune in the model's silo, never in the shared kernels.** The shared kernels (`kernels/ns`, `kernels/strata`,
+   `kernels/diffusion`, and one engine's kernels another engine calls) are tuned for the engines already on them;
+   changing one to speed up another model can slow or break those. A kernel tuned for one model goes in that model's
+   **silo**, `kernels/<kind>/<arch>/silo/` - its own library, `dist/silo/libnextsycl-<arch>.so`, which the engine
+   opens at load (`nextsycl_core::silo(ARCH)`) and calls for what it covers (each silo op has a `_supported` check),
+   the shared kernel for everything else; without the file (or with `NS_SILO=0`) the engine runs on the shared
+   kernels alone. Start a silo kernel as a copy of the shared one, then change the copy. A change to a shared kernel
+   itself (a bug fix, a new type) re-runs every engine that calls it - its check and its bench - before it lands.
 
 Rules 1 and 3 are checked by `cargo test` (`cli/nextsycl/tests/architecture.rs`) and `./build.sh test` (the kernel
 libraries link against no other runtime); CI runs both.
@@ -67,8 +75,10 @@ clear message where the port begins: `llm/example`, `image/example`, `video/exam
 7. **Register it.** Add `nextsycl_<kind>_<arch>::kind()` to the program's list of that kind
    (`cli/nextsycl/src/main.rs`: `engines()`, `video_engines()`; `cli/nextsycl/src/image.rs`: `engines()`). `nextsycl <kind> engines`
    lists it.
-8. **Then make it fast** - as its own thing: graphs, fused kernels, its own memory plan. Measure with the kind's
-   bench before and after (`nextsycl llm bench`, ...), and quote both in the pull request.
+8. **Then make it fast** - as its own thing: graphs, fused kernels, its own memory plan, and kernels tuned for its
+   shapes in its silo (rule 5: `kernels/<kind>/<arch>/silo/`, never by editing the shared ones). Check that the silo
+   gives the same results as the shared kernel (same outputs, the same greedy text with `NS_SILO=0` and without), and
+   measure with the kind's bench before and after (`nextsycl llm bench`, ...); quote both in the pull request.
 9. **Document it**: its settings and numbers in `docs/architecture.md` (its engine section) and the README's speed
    tables; a catalog entry when its files are public.
 

@@ -267,8 +267,14 @@ of IQ2_XXS instead could win twice.
 - [x] Qwen3.8-27B (llm/qwen35, 2026-10-10): the dense qwen35 graph (gated DeltaNet + gated full attention, dense
       SwiGLU) on the shared products / KDA scan and its own attention and gates; checked against llama.cpp on Q8_0
       (cosine >= 0.99993 every layer, same next token); served as qwen3.8-27b-q8 / -q4 / -q3 (tools, reasoning)
+- [x] Silos (2026-10-10): a model's tuned kernels in `kernels/<kind>/<arch>/silo/` -> `dist/silo/libnextsycl-<arch>.so`,
+      opened by the engine at load, the shared kernels for what it does not cover or without it (CONTRIBUTING.md
+      rule 5); qwen35's decode products the first (Q4 decode 17.7 -> 22.5-23.5 tok/s at 2K, Q3 12.3 -> 20.4)
+- [ ] Qwen3.8-27B: the prompt pass's attention tiled (flash-style, XMX): 40K prompts read at ~80 tok/s now
 - [ ] Qwen3.8-27B: the MTP draft layer (verify passes need the recurrent states' snapshots: kda_scan / conv_silu
-      already keep them), the vision tower (mmproj: pictures in chat), the Q3_K products' speed, two cards
+      already keep them), the vision tower (mmproj: pictures in chat), two cards
+- [ ] Qwen3.8-27B decode: ~10 ms a token outside the products (launches; graphs), alpha / beta as one product,
+      Q6_K head (2 ms), IQ3_XXS / IQ2_S in the silo (the Q3 file's remaining slow types)
 - [ ] VoxCPM2 speed: the DiT's 9 evaluations a patch as one graph with the Euler update on the GPU (host round trips
       now); batch the guided and unguided rows through the products already, fuse the local attention; streamed answers
 - [x] Saved voices (2026-10-10): clone from WAV / MP3 / FLAC / Ogg / M4A, design through the voice-design model, speak by name
