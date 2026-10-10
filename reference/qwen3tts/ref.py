@@ -97,10 +97,10 @@ def main():
         items = tts.create_voice_clone_prompt(ref_audio=a.ref_audio, ref_text=a.ref_text, x_vector_only_mode=a.xvec)
         np.save(os.path.join(a.out, "spk.npy"), items[0].ref_spk_embedding.float().numpy())
         if items[0].ref_code is not None:
-            np.save(os.path.join(a.out, "ref_codes.npy"), items[0].ref_code.numpy())
+            np.save(os.path.join(a.out, "ref_codes.npy"), np.ascontiguousarray(items[0].ref_code.numpy()))
         wavs, sr = tts.generate_voice_clone(text=a.text, language=a.language, voice_clone_prompt=items, **gen)
     for k, v in seen.items():
-        np.save(os.path.join(a.out, f"{k}.npy"), v)
+        np.save(os.path.join(a.out, f"{k}.npy"), np.ascontiguousarray(v))
     sf.write(os.path.join(a.out, "speech.wav"), wavs[0], sr)
     np.save(os.path.join(a.out, "speech.npy"), np.asarray(wavs[0], dtype=np.float32))
     print(f"{len(wavs[0]) / sr:.2f} s of speech, {seen['codes'].shape[0]} frames; prefill {seen['prefill'].shape}")

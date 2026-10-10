@@ -16,6 +16,7 @@
 
 pub mod check;
 pub mod codec;
+pub mod encoder;
 mod ffi;
 pub mod ops;
 pub mod prompt;
@@ -33,6 +34,7 @@ use nextsycl_diffusion::kernels::Nsd;
 use nextsycl_tok::Tokenizer;
 
 use crate::codec::Codec;
+use crate::encoder::Encoder;
 use crate::ops::{Ops, Shards};
 use crate::prompt::{Config, Spec, Voice};
 use crate::sample::{Draw, Rng};
@@ -73,6 +75,8 @@ pub struct Qwen3Tts {
     pub talker: Talker,
     pub codec: Codec,
     pub speaker: Option<Speaker>,
+    /// the codec's encoder (the Base checkpoint: a recording's codes for the in-context clone)
+    pub encoder: Option<Encoder>,
     /// the model's tensors (its text embedding is read from here, a row a token)
     pub weights: Shards,
     int8: bool,
@@ -124,11 +128,13 @@ impl Qwen3Tts {
         let weights = Shards::open(&[model])?;
         let talker = Talker::load(&ops, &weights, int8, log)?;
         let speaker = if weights.find("speaker_encoder.fc.weight").is_ok() { Some(Speaker::load(&weights)?) } else { None };
-        let codec = Codec::load(&ops, &Shards::open(&[codec])?)?;
+        let codec_f = Shards::open(&[codec])?;
+        let codec = Codec::load(&ops, &codec_f)?;
+        let encoder = if speaker.is_some() { Some(Encoder::load(&ops, &codec_f)?) } else { None };
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("{ARCH} ({}) on {} in {load_s:.0} s", conf.kind, gpu.name));
-        Ok(Qwen3Tts { ops, nsd, tok, conf, talker, codec, speaker, weights, int8, loaded: Instant::now(), load_s })
+        Ok(Qwen3Tts { ops, nsd, tok, conf, talker, codec, speaker, encoder, weights, int8, loaded: Instant::now(), load_s })
     }
 
     /// What the request asks for, checked against what this checkpoint does
@@ -153,8 +159,12 @@ impl Qwen3Tts {
                 let wav = speaker::resample(&r.samples, r.rate);
                 let x = sp.embed(&wav)?;
                 match r.text.as_deref().filter(|t| !t.trim().is_empty()) {
-                    // the in-context clone needs the recording's codes (the codec's encoder): not here yet
-                    Some(_) => return Err(Error("a reference transcript (in-context cloning) is not supported yet: send the recording alone".into())),
+                    // with its transcript: the recording's codes as the example the talker continues
+                    Some(text) => {
+                        let enc = self.encoder.as_ref().ok_or_else(|| Error("this checkpoint has no codec encoder".into()))?;
+                        let codes = enc.encode(&self.ops, &self.nsd, &wav)?;
+                        Voice::InContext { spk: x, text: text.to_string(), codes }
+                    }
                     None => Voice::XVector(x),
                 }
             }
@@ -179,7 +189,8 @@ impl Qwen3Tts {
         let h = t.lm.hidden;
         let l = p.rows.len() / h;
         t.prefill(ops, nsd, &ss, &p.rows)?;
-        if let Some(k) = keep {
+        let mut keep = keep;
+        if let Some(k) = keep.as_deref_mut() {
             k.push(p.rows.clone());
             k.push(t.logits0(ops, &ss)?);
         }
@@ -204,6 +215,11 @@ impl Qwen3Tts {
             progress(Step { phase: "tokens", at: codes.len() as u32, of: max as u32, seconds: t0.elapsed().as_secs_f64() })?;
         }
         ops.gpu.sync()?;
+        if let Some(k) = keep {
+            // a forced run's disagreements, for a check
+            let m = ss.misses.get();
+            k.push(vec![m[0] as f32, m[1] as f32]);
+        }
         if codes.is_empty() {
             return Err(Error("the model ended the speech before its first frame".into()));
         }
@@ -249,6 +265,7 @@ impl AudioEngine for Qwen3Tts {
             design: kind == "voice_design",
             clone: kind == "base" && self.speaker.is_some(),
             clone_needs_text: false,
+            clone_takes_text: kind == "base" && self.encoder.is_some(),
         })
     }
     fn options(&self) -> &'static [EngineOption] {
@@ -269,7 +286,17 @@ impl AudioEngine for Qwen3Tts {
         progress(Step { phase: "prompt", at: 0, of: 1, seconds: 0.0 })?;
         let codes = self.frames(&s, &d, max, req.seed, t0, progress, None, None)?;
         progress(Step { phase: "decode", at: 0, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
-        let samples = self.codec.decode(&self.ops, &self.nsd, &codes)?;
+        let samples = match &s.voice {
+            // as qwen-tts: the recording's codes decoded ahead of the new ones (the codec's context), then the
+            // recording's share of the samples cut off
+            Voice::InContext { codes: rc, .. } => {
+                let all: Vec<Vec<i32>> = rc.iter().chain(&codes).cloned().collect();
+                let wav = self.codec.decode(&self.ops, &self.nsd, &all)?;
+                let cut = (rc.len() as f64 / all.len().max(1) as f64 * wav.len() as f64) as usize;
+                wav[cut.min(wav.len())..].to_vec()
+            }
+            _ => self.codec.decode(&self.ops, &self.nsd, &codes)?,
+        };
         progress(Step { phase: "decode", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
         Ok(Audio { rate: codec::RATE, channels: 1, samples })
     }

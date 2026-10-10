@@ -35,6 +35,8 @@ export interface Speech {
   /** clones a recording */
   clone: boolean;
   clone_needs_text: boolean;
+  /** a transcript of the recording makes a closer clone */
+  clone_takes_text?: boolean;
 }
 
 export interface Progress {

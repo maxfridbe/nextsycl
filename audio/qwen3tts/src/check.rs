@@ -24,9 +24,7 @@ pub fn read_npy(path: &Path) -> Result<(Vec<usize>, Vec<f64>)> {
     }
     let (hl, at) = if b[6] == 1 { (u16::from_le_bytes([b[8], b[9]]) as usize, 10) } else { (u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as usize, 12) };
     let head = String::from_utf8_lossy(&b[at..at + hl]).to_string();
-    if head.contains("'fortran_order': True") {
-        return Err(Error(format!("{}: Fortran order", path.display())));
-    }
+    let fortran = head.contains("'fortran_order': True");
     let shape: Vec<usize> = head.split("'shape': (").nth(1).and_then(|s| s.split(')').next())
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
     let d = &b[at + hl..];
@@ -39,6 +37,11 @@ pub fn read_npy(path: &Path) -> Result<(Vec<usize>, Vec<f64>)> {
     } else {
         return Err(Error(format!("{}: {head} (float32, int32 or int64 expected)", path.display())));
     };
+    if fortran {
+        // column-major: back to rows (2-D; anything else is not expected)
+        let [r, c] = shape[..] else { return Err(Error(format!("{}: a Fortran-order array of {} dimensions", path.display(), shape.len()))) };
+        return Ok((shape, (0..r * c).map(|i| v[(i % c) * r + i / c]).collect()));
+    }
     Ok((shape, v))
 }
 
@@ -84,11 +87,19 @@ pub fn spec_of(dir: &Path) -> Result<Spec> {
         Some("design") => Voice::Described,
         Some("clone") => {
             let (_, v) = read_npy(&dir.join("spk.npy"))?;
-            Voice::XVector(v.iter().map(|x| *x as f32).collect())
+            let spk: Vec<f32> = v.iter().map(|x| *x as f32).collect();
+            match s("ref_text").filter(|_| r["xvec"] != true) {
+                Some(text) => {
+                    let (shape, c) = read_npy(&dir.join("ref_codes.npy"))?;
+                    let codes = c.chunks(shape.get(1).copied().unwrap_or(16)).map(|f| f.iter().map(|x| *x as i32).collect()).collect();
+                    Voice::InContext { spk, text, codes }
+                }
+                None => Voice::XVector(spk),
+            }
         }
         m => return Err(Error(format!("request.json: mode {m:?}"))),
     };
-    let streaming = r["non_streaming_mode"].as_bool().map(|n| !n).unwrap_or(matches!(voice, Voice::XVector(_)));
+    let streaming = r["non_streaming_mode"].as_bool().map(|n| !n).unwrap_or(matches!(voice, Voice::XVector(_) | Voice::InContext { .. }));
     Ok(Spec { text: s("text").unwrap_or_default(), language: s("language"), instruct: s("instruct"), voice, streaming })
 }
 
@@ -102,17 +113,31 @@ pub fn run(e: &Qwen3Tts, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String
     };
     if stages.contains(&"prompt") || stages.contains(&"frames") {
         let spec = spec_of(dir)?;
-        if let Voice::XVector(x) = &spec.voice {
+        if let Voice::XVector(x) | Voice::InContext { spk: x, .. } = &spec.voice {
             // the recording's embedding here too, against the reference's
             if let (Some(sp), Ok(wav)) = (&e.speaker, read_wav(&dir.join("ref.wav"))) {
                 let got = sp.embed(&crate::speaker::resample(&wav, crate::speaker::RATE))?;
                 report(log, &mut worst, "speaker embedding", &got, x);
             }
         }
+        if let (Voice::InContext { codes, .. }, Some(enc), Ok(wav)) = (&spec.voice, &e.encoder, read_wav(&dir.join("ref.wav"))) {
+            // and its codes (the codec's encoder), frame by frame and codebook by codebook
+            let got = enc.encode(&e.ops, &e.nsd, &wav)?;
+            let same: usize = got.iter().zip(codes).map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x == y).count()).sum();
+            let firsts = got.iter().zip(codes).filter(|(a, b)| a[0] == b[0]).count();
+            log(format!("{:<24} {} frames here, {} in the reference; {same} of {} codes agree, {firsts} first codes", "recording's codes",
+                        got.len(), codes.len(), codes.len() * 16));
+        }
         let mut d = e.drawing(&Default::default())?;
         d.talker = Draw::GREEDY;
         d.predictor = Draw::GREEDY;
         d.repetition_penalty = 1.0;
+        // an in-context clone's dump: the recording's codes ahead of the generated ones (what the codec decoded)
+        let lead = match &spec.voice {
+            Voice::InContext { codes, .. } if codes_ref.as_ref().is_some_and(|r| r.starts_with(codes)) => codes.len(),
+            _ => 0,
+        };
+        let codes_ref = codes_ref.as_ref().map(|r| r[lead..].to_vec());
         let max = codes_ref.as_ref().map_or(200, |c| c.len() + 8);
         let mut keep = Vec::new();
         let greedy = stages.contains(&"frames");
@@ -126,13 +151,26 @@ pub fn run(e: &Qwen3Tts, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String
                 let firsts = got.iter().zip(r).filter(|(a, b)| a[0] == b[0]).count();
                 log(format!("{:<24} {} here, {} in the reference; {same} identical, {firsts} first codes agree; first difference at {}", "frames (greedy)",
                             got.len(), r.len(), first.map_or("none".into(), |f| f.to_string())));
+                // the reference's frames forced: where the model here would have chosen otherwise, each frame on its own
+                let mut k2 = Vec::new();
+                e.frames(&spec, &d, r.len() + 1, 0, t0, &mut |_| Ok(()), Some(r), Some(&mut k2))?;
+                let m = &k2[2];
+                log(format!("{:<24} first codes {} of {} frames differ, the other codes {} of {}", "frames (forced)", m[0], r.len(), m[1],
+                            r.len() * 15));
             }
         }
     }
     if stages.contains(&"codec") {
         let codes = codes_ref.ok_or_else(|| Error(format!("{}: no codes.npy", dir.display())))?;
         let t = Instant::now();
-        let got = e.codec.decode(&e.ops, &e.nsd, &codes)?;
+        let mut got = e.codec.decode(&e.ops, &e.nsd, &codes)?;
+        // an in-context clone's: the recording's share cut off, as the reference does
+        if let Ok(Voice::InContext { codes: rc, .. }) = spec_of(dir).map(|s| s.voice) {
+            if codes.starts_with(&rc) {
+                let cut = (rc.len() as f64 / codes.len() as f64 * got.len() as f64) as usize;
+                got.drain(..cut);
+            }
+        }
         log(format!("codec: {} frames to {:.2} s in {:.2} s", codes.len(), got.len() as f64 / crate::codec::RATE as f64, t.elapsed().as_secs_f64()));
         let wav = match read_npy(&dir.join("speech.npy")) {
             Ok((_, v)) => v.into_iter().map(|x| x as f32).collect(),

@@ -190,6 +190,8 @@ pub struct Session {
     th: DevBuf,
     tp: DevBuf,
     rows: usize,
+    /// a forced run's disagreements: frames whose first code / whose other codes the model would not have taken
+    pub misses: std::cell::Cell<[usize; 2]>,
 }
 
 /// What a frame's draws follow
@@ -253,6 +255,7 @@ impl Talker {
             th: DevBuf::f32(g, prompt.max(2) * h)?,
             tp: DevBuf::f32(g, prompt.max(2) * h)?,
             rows: prompt.max(2),
+            misses: std::cell::Cell::new([0, 0]),
         })
     }
 
@@ -330,7 +333,13 @@ impl Talker {
             l0[d.eos as usize] = f32::NEG_INFINITY;
         }
         let c0 = match force {
-            Some(f) => f[0],
+            Some(f) => {
+                if f[0] != d.eos && sample::pick(&l0, Draw::GREEDY, rng) as i32 != f[0] {
+                    let m = s.misses.get();
+                    s.misses.set([m[0] + 1, m[1]]);
+                }
+                f[0]
+            }
             None => sample::pick(&l0, d.talker, rng) as i32,
         };
         if c0 == d.eos {
@@ -348,7 +357,13 @@ impl Talker {
             let m = &self.heads[g - 1];
             ops.gemv(fp(&s.pred.out, row * ph), 1, ph, m, nul(), s.logits.fp(), m.n, false)?;
             let code = match force {
-                Some(f) => f[g],
+                Some(f) => {
+                    if sample::pick(&s.logits.to_f32()?[..m.n], Draw::GREEDY, rng) as i32 != f[g] {
+                        let m = s.misses.get();
+                        s.misses.set([m[0], m[1] + 1]);
+                    }
+                    f[g]
+                }
                 None => sample::pick(&s.logits.to_f32()?[..m.n], d.predictor, rng) as i32,
             };
             codes.push(code);

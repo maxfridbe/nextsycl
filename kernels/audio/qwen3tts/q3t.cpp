@@ -102,6 +102,13 @@ int ns_audio_q3t_silu(ns_gpu* g, float* x, int64_t n) {
     NS_CATCH
 }
 
+int ns_audio_q3t_elu(ns_gpu* g, const float* x, int64_t n, float* out) {
+    NS_TRY
+    if (n > 0) g->q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { const float v = x[i]; out[i] = v > 0.0f ? v : sycl::expm1(v); });
+    return 0;
+    NS_CATCH
+}
+
 int ns_audio_q3t_clamp(ns_gpu* g, float* x, int64_t n, float lo, float hi) {
     NS_TRY
     if (n > 0) g->q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { x[i] = sycl::clamp(x[i], lo, hi); });

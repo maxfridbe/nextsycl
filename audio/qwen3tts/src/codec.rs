@@ -27,12 +27,12 @@ const WINDOW: usize = 72;
 const HEADS: usize = 16;
 const HEAD: usize = 64;
 
-struct Conv {
-    w: DevBuf,
-    b: Option<DevBuf>,
-    ci: usize,
-    co: usize,
-    k: usize,
+pub(crate) struct Conv {
+    pub w: DevBuf,
+    pub b: Option<DevBuf>,
+    pub ci: usize,
+    pub co: usize,
+    pub k: usize,
 }
 
 struct Snake {
@@ -67,11 +67,11 @@ struct Next {
 }
 
 /// A float32 linear layer [n, k] (+ bias)
-struct Lin {
-    w: DevBuf,
-    b: Option<DevBuf>,
-    n: usize,
-    k: usize,
+pub(crate) struct Lin {
+    pub w: DevBuf,
+    pub b: Option<DevBuf>,
+    pub n: usize,
+    pub k: usize,
 }
 
 struct Layer {
@@ -104,7 +104,7 @@ pub struct Codec {
     pub groups: usize,
 }
 
-fn lin(ops: &Ops, f: &Shards, name: &str, bias: bool) -> Result<Lin> {
+pub(crate) fn lin(ops: &Ops, f: &Shards, name: &str, bias: bool) -> Result<Lin> {
     let s = f.shape(&format!("{name}.weight"))?;
     Ok(Lin {
         w: f.dev_f32(ops, &format!("{name}.weight"))?,
@@ -115,7 +115,7 @@ fn lin(ops: &Ops, f: &Shards, name: &str, bias: bool) -> Result<Lin> {
 }
 
 /// Linear layers stacked by rows (a fused q/k/v, gate/up)
-fn stack(ops: &Ops, f: &Shards, names: &[String]) -> Result<Lin> {
+pub(crate) fn stack(ops: &Ops, f: &Shards, names: &[String]) -> Result<Lin> {
     let mut v = Vec::new();
     let mut k = 0;
     for n in names {
@@ -125,7 +125,7 @@ fn stack(ops: &Ops, f: &Shards, names: &[String]) -> Result<Lin> {
     Ok(Lin { n: v.len() / k, k, w: DevBuf::from_f32(&ops.gpu, &v)?, b: None })
 }
 
-fn conv(ops: &Ops, f: &Shards, name: &str, transposed: bool, bias: bool) -> Result<Conv> {
+pub(crate) fn conv(ops: &Ops, f: &Shards, name: &str, transposed: bool, bias: bool) -> Result<Conv> {
     let s = f.shape(&format!("{name}.weight"))?;
     let (ci, co) = if transposed { (s[0], s[1]) } else { (s[1], s[0]) };
     Ok(Conv {
@@ -142,13 +142,13 @@ fn snake(ops: &Ops, f: &Shards, name: &str) -> Result<Snake> {
 }
 
 impl Lin {
-    fn apply(&self, nsd: &Nsd, x: *const f32, m: usize, out: *mut f32) -> Result<()> {
+    pub(crate) fn apply(&self, nsd: &Nsd, x: *const f32, m: usize, out: *mut f32) -> Result<()> {
         nsd.linear(x.cast(), Dt::F32, m, self.k, self.w.ptr(), self.n, self.b.as_ref().map_or(none(), |b| b.ptr()), out.cast(), Dt::F32)
     }
 }
 
 impl Conv {
-    fn bias(&self) -> *const f32 {
+    pub(crate) fn bias(&self) -> *const f32 {
         self.b.as_ref().map_or(std::ptr::null(), |b| b.fp())
     }
 }

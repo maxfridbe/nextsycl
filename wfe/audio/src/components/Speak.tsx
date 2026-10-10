@@ -66,7 +66,14 @@ export function Speak() {
               {f.refAudio ? <audio attrs={{ src: f.refAudio, controls: true, preload: "auto" }} /> : null}
               {f.refAudio ? <span class="hint">{f.refName}</span> : null}
             </div>
-            {sp.clone_needs_text ? area("refText", "", "what the recording says") : null}
+            {sp.clone_needs_text || sp.clone_takes_text
+              ? <div>
+                  <div class="lab">what the recording says
+                    <span class="hint">{sp.clone_needs_text ? "required" : "optional: with it the clone continues the recording itself - a closer voice"}</span>
+                  </div>
+                  {area("refText", "", "Good morning. The bread is still warm and the coffee is ready.")}
+                </div>
+              : null}
           </div>
         : null}
       <div class="row">

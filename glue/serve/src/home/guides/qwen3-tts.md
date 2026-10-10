@@ -28,9 +28,10 @@ every language; its own is its most natural. `instructions` styles the read:
 The same description with another `seed` gives another speaker of that kind.
 
 ## Cloned voices (`qwen3-tts-base`)
-`ref_audio`: 3-15 s of one person speaking clearly, little noise or music (WAV, base64 or a data: URL). The voice's
-timbre is taken from it; the words can be anything, in any of the languages. (`ref_text`, the recording's transcript,
-is for the closer in-context clone - not served yet.)
+`ref_audio`: 3-15 s of one person speaking clearly, little noise or music (WAV, base64 or a data: URL). Alone, the
+voice's timbre is taken from it (its x-vector). With `ref_text` - exactly what the recording says - the model also
+hears the recording itself (its codec frames) and continues it: a closer clone, the delivery too. The words to say
+can be anything, in any of the languages.
 
 ## Settings
 `seed` repeats a read. `options`: `temperature` (0.9; lower is steadier, flatter), `top-k` (50), `greedy` (1: always

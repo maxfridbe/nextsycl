@@ -86,7 +86,7 @@ pub const METHODS: &[Method] = &[
                        ("language", "string", "english, chinese, japanese ... or auto (default)", false),
                        ("instructions", "string", "how to say it (CustomVoice), or the voice to make up (VoiceDesign)", false),
                        ("ref_audio", "string", "a recording of the voice to clone, WAV as base64 or a data: URL (the Base model)", false),
-                       ("ref_text", "string", "what the recording says", false),
+                       ("ref_text", "string", "what the recording says: the closer, in-context clone", false),
                        ("seconds", "number", "the most to make", false), ("seed", "integer", "", false),
                        ("options", "object", "the engine's own: greedy, temperature, top-k, streaming", false)],
              example: r#"{"model": "qwen3-tts-custom", "input": "Good morning. The bread is still warm.", "voice": "ryan", "language": "english", "instructions": "cheerful, a little hurried"}"# },

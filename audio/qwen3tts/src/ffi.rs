@@ -31,6 +31,7 @@ pub struct Api {
     pub scale_add: unsafe extern "C" fn(G, *mut f32, *const f32, *const f32, i64, i64) -> c_int,
     pub silu: unsafe extern "C" fn(G, *mut f32, i64) -> c_int,
     pub clamp: unsafe extern "C" fn(G, *mut f32, i64, f32, f32) -> c_int,
+    pub elu: unsafe extern "C" fn(G, *const f32, i64, *mut f32) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -75,6 +76,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             scale_add: sym!("ns_audio_q3t_scale_add"),
             silu: sym!("ns_audio_q3t_silu"),
             clamp: sym!("ns_audio_q3t_clamp"),
+            elu: sym!("ns_audio_q3t_elu"),
         })
     })
     .as_ref()

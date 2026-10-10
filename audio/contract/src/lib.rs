@@ -60,6 +60,8 @@ pub struct Speech {
     /// whether it clones a `reference` recording (and whether it needs the recording's transcript)
     pub clone: bool,
     pub clone_needs_text: bool,
+    /// whether a transcript of the recording makes a closer clone
+    pub clone_takes_text: bool,
 }
 
 /// The engine's own defaults, shown by `engines` and used for the request's `None` fields

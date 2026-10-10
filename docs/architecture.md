@@ -45,7 +45,7 @@ audio/                     AUDIO
   minimaxmusic3 nextsycl-audio-minimaxmusic3  MiniMax Music 3: the language model and depth decoder, the flow
                                  transformer and its windows, the decoder, stage checks
   qwen3tts   nextsycl-audio-qwen3tts  Qwen3-TTS: the prompt per voice kind, the talker and code predictor, the 12 Hz
-                                 codec's decoder, the speaker encoder (host), stage checks
+                                 codec's decoder and encoder, the speaker encoder (host), stage checks
   example    nextsycl-audio-example  a template
 
 glue/                      WHAT MAKES ENGINES A PRODUCT (libraries too)
@@ -149,7 +149,8 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   tokenizer's vocab.json / merges.txt). The language models run on the MiniMax Music engine's kernels (the same Qwen3
   layer shapes; its attention also takes 2 query heads a key head, its convolutions a left / right padding each:
   `ns_audio_mm3_conv1d_lr`); its own (`kernels/audio/qwen3tts`) are the codec's: SnakeBeta, the depthwise causal
-  convolution, attention over a 72-frame causal window, float32 RoPE, layer-scaled residuals. The text embedding stays
+  convolution, attention over a causal window, float32 RoPE, layer-scaled residuals, ELU (the encoder's); the
+  encoder's strided causal convolutions go through `ns_audio_mm3_conv1d_lr` too. The text embedding stays
   on disk (a row read a token). Settings: `NS_Q3T_INT8=1` (`--opt-int8`).
 
 ## The model registry

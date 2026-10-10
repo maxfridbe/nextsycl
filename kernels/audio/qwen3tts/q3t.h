@@ -1,5 +1,5 @@
 /* q3t.h: the Qwen3-TTS engine's own kernels (the language models' decode shares the MiniMax Music engine's mm3
- * kernels): the 12 Hz codec decoder's SnakeBeta, depthwise causal convolution, sliding-window attention, rotary
+ * kernels): the 12 Hz codec's - its decoder's SnakeBeta, depthwise causal convolution, sliding-window attention, rotary
  * positions in float32 and layer-scaled residuals; small element-wise helpers. Float32 on the device; 0 or -1 (the
  * reason: ns_last_error). */
 #pragma once
@@ -24,6 +24,8 @@ int ns_audio_q3t_rope(ns_gpu* g, float* x, int64_t xs, int64_t L, int64_t H, int
 int ns_audio_q3t_scale_add(ns_gpu* g, float* x, const float* y, const float* scale, int64_t R, int64_t C);
 /* x = x * sigmoid(x) over n */
 int ns_audio_q3t_silu(ns_gpu* g, float* x, int64_t n);
+/* out = ELU(x) (alpha 1: x, or e^x - 1 below zero) over n; out may be x */
+int ns_audio_q3t_elu(ns_gpu* g, const float* x, int64_t n, float* out);
 /* x = clamp(x, lo, hi) over n */
 int ns_audio_q3t_clamp(ns_gpu* g, float* x, int64_t n, float lo, float hi);
 

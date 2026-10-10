@@ -158,6 +158,25 @@ impl Ops {
         ffi::check(unsafe { (self.k.silu)(self.g(), x, n as i64) }, "silu")
     }
 
+    pub fn elu(&self, x: *const f32, n: usize, out: *mut f32) -> Result<()> {
+        // SAFETY: n floats each.
+        ffi::check(unsafe { (self.k.elu)(self.g(), x, n as i64, out) }, "elu")
+    }
+
+    /// A strided causal convolution as Mimi's: (k - stride) zeros ahead, behind as many as the last window needs;
+    /// out [b, co, ceil(l / stride)]; its length returned
+    pub fn conv_strided(&self, x: *const f32, b: usize, ci: usize, l: usize, w: &DevBuf, co: usize, k: usize, bias: *const f32, stride: usize, out: *mut f32)
+                        -> Result<usize> {
+        let pt = k - stride;
+        let frames = (l + pt).saturating_sub(k).div_ceil(stride);
+        let extra = frames * stride + k - pt - l;
+        let lo = frames + 1;
+        // SAFETY: as conv_causal.
+        ffi::check(unsafe { (self.k.conv1d_lr)(self.g(), 0, x, b as i64, ci as i64, l as i64, w.fp(), co as i64, k as i64, bias, stride as i64, 1,
+                                               pt as i64, extra as i64, out, lo as i64) }, "conv1d")?;
+        Ok(lo)
+    }
+
     pub fn clamp(&self, x: *mut f32, n: usize, lo: f32, hi: f32) -> Result<()> {
         // SAFETY: n floats.
         ffi::check(unsafe { (self.k.clamp)(self.g(), x, n as i64, lo, hi) }, "clamp")

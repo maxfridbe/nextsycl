@@ -26,7 +26,8 @@ language model, RVQ depth decoder, 2.4B flow-matching transformer and Flow-VAE d
 against MiniMax's diffusers code on the same files; a minute of song in 89 s on the B70 with the language model in
 int8 (118 s in half). **Qwen3-TTS** (`audio/qwen3tts`): speech in ten languages - nine built-in voices styled by an
 instruction, voices made up from a description, voices cloned from a recording - its talker, code predictor, 12 Hz
-codec and speaker encoder in SYCL, greedy frames identical to qwen-tts' own code; 33 s of speech in 7.7 s on the B70.
+codec (decoder and encoder) and speaker encoder in SYCL, checked against qwen-tts' own code; 33 s of speech in 7.7 s
+on the B70.
 
 A skill for porting to SYCL on Arc - the safety rules, migration traps, parity method, profiling and what made
 things fast, learned on these ports: [skills/sycl-porting/SKILL.md](skills/sycl-porting/SKILL.md).
@@ -82,7 +83,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `minimax-music3-int8` | the same files, the language model and depth decoder in int8 at load: half the VRAM, 1.7x the frames a second | `minimaxmusic3` | 26.6 GiB | checked, served |
 | `qwen3-tts-custom` | Qwen3-TTS 12 Hz 1.7B CustomVoice: nine built-in voices, styled by an instruction; 10 languages, 24 kHz | `qwen3tts` | 4.5 GiB | checked, served |
 | `qwen3-tts-design` | Qwen3-TTS VoiceDesign: a voice made up from a description | `qwen3tts` | 4.5 GiB | checked, served |
-| `qwen3-tts-base` | Qwen3-TTS Base: a voice cloned from a recording (its x-vector; the in-context clone with a transcript next) | `qwen3tts` | 4.5 GiB | checked, served |
+| `qwen3-tts-base` | Qwen3-TTS Base: a voice cloned from a recording (its x-vector; with its transcript, in context) | `qwen3tts` | 4.5 GiB | checked, served |
 
 ## What it does
 
@@ -573,7 +574,7 @@ Qwen3-TTS (`audio/qwen3tts`, the 12 Hz 1.7B checkpoints): text to speech in Chin
 French, Russian, Portuguese, Spanish and Italian, 24 kHz mono. One engine, three checkpoints: **CustomVoice** (nine
 built-in voices - `vivian`, `serena`, `uncle_fu`, `dylan`, `eric`, `ryan`, `aiden`, `ono_anna`, `sohee` - and an
 instruction for the read), **VoiceDesign** (the voice made up from a description), **Base** (the voice of a
-recording).
+recording: its x-vector alone, or with its transcript the recording itself as the example the model continues).
 
 ```sh
 nextsycl models pull qwen3-tts-custom qwen3-tts-design qwen3-tts-base
@@ -581,7 +582,8 @@ nextsycl audio gen "Good morning. The bread is still warm." --model qwen3-tts-cu
                    [--instructions "cheerful, a little hurried"] [--seed N] [--out FILE|DIR] [--opt-int8 1]
 nextsycl audio gen "The lighthouse keeper counted the ships." --model qwen3-tts-design \
                    --instructions "A calm elderly woman with a soft, slightly raspy voice, speaking slowly."
-nextsycl audio gen "I never thought the garden would grow this fast." --model qwen3-tts-base --ref-audio voice.wav
+nextsycl audio gen "I never thought the garden would grow this fast." --model qwen3-tts-base --ref-audio voice.wav \
+                   [--ref-text "what the recording says"]
 nextsycl audio check <reference dump dir> --model qwen3-tts-custom [--stages prompt,frames,codec]
 ```
 
@@ -591,19 +593,25 @@ nextsycl audio check <reference dump dir> --model qwen3-tts-custom [--stages pro
   of 1,024) the other fifteen, each frame fed back with the next text token (the MiniMax Music engine's small-batch
   products and cached attention, the draws on the host); the codec's decoder (an 8-layer windowed transformer,
   ConvNeXt upsampling, SnakeBeta convolution blocks on oneDNN) turns 16 codes a frame into 1,920 samples. The speaker
-  encoder (ECAPA-TDNN on a 128-band log mel) runs on the host.
+  encoder (ECAPA-TDNN on a 128-band log mel) runs on the host. The in-context clone encodes the recording with the
+  codec's encoder (Mimi's: SEANet convolutions, an 8-layer causal transformer, split-RVQ nearest codes) and puts its
+  frames under the reference transcript's tokens; the recording's frames are decoded ahead of the new ones and cut
+  off, as qwen-tts does.
 - **Checked** against qwen-tts' own code (`reference/qwen3tts/ref.py`, float32 on the CPU, the same files): the prompt
   rows rel 9e-5 to 2e-4, the first frame's logits 3e-4 to 8e-4; greedy frames identical to the reference's (VoiceDesign
   46 of 46, a clone 59 of 59; CustomVoice all 16 codes through frame 143 and 2,046 of 2,047 first codes, half-precision
-  drift after); the codec 1e-6 to 1.7e-3; the clone's speaker embedding 8e-7. Every mode's speech transcribes word for
-  word (Whisper).
+  drift after); with the reference's frames forced, the first code differs in 0 of 2,047 frames and the others in 1 of
+  30,705 (a near tie - the greedy runs part there); the codec 1e-6 to 1.7e-3; the clone's speaker embedding 8e-7; the
+  recording's codes from the encoder 1,152 of 1,152. Every mode's speech transcribes word for word (Whisper); a clone
+  is 0.990 (x-vector) / 0.992 (in context) like its recording by the speaker encoder's cosine, another voice 0.943.
 - **Speed** (B70, a 90-word paragraph, `ryan`; 2026-10-09): 33.2 s of speech in 7.7 s - 415 frames at 70 frames/s
   (5.6x real time), the codec 1.7 s; with `--opt-int8 1` 93 frames/s. A short sentence answers in under 2 s; a model
   loads in a second or two from the page cache.
 - **Served** by the same audio server (`nextsycl audio serve qwen3-tts-custom --wfe`) and `:8000`'s `audio.speak`:
   `/v1/audio/speech` with `input` (the text), `voice`, `language`, `instructions`, `ref_audio` (a WAV, base64 or a
-  data: URL), `seconds` (the most), `seed`, `options` (`greedy`, `temperature`, `top-k`, `streaming`). The page takes
-  the text, the voice (chips), the description or instruction, a recording to clone, the language.
+  data: URL), `ref_text`, `seconds` (the most), `seed`, `options` (`greedy`, `temperature`, `top-k`, `streaming`).
+  The page takes the text, the voice (chips), the description or instruction, a recording to clone and its
+  transcript, the language.
 
 ## Speed by model
 
