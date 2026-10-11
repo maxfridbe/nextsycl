@@ -694,25 +694,19 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   0.99993 or better, the final norm 0.99993, the same next token at the same logit; decoding the last token alone
   after the rest agrees with the whole prompt at once (0.99997). The greedy continuation of a prompt agrees with
   llama.cpp's until two candidates sit within 1% of each other.
-- **Speed** (one B70, 2026-10-10; `llm generate --ids` of the benchy v1 prompts, 128 greedy tokens), prompt read /
-  decode, tokens/s - first without drafts (`--no-mtp`):
+- **Speed** (one B70, 2026-10-11; `llm generate --ids` of the benchy v1 prompts, 128 greedy tokens, MTP on - the
+  default), prompt read / decode, tokens/s:
 
-  | File | 20 | 2,185 | 8,000 | 40,000 |
-  |---|---:|---:|---:|---:|
-  | Q8_0 | 58 / 18.0 | 1,003 / 17.9 | 1,095 / 17.0 | 522 / 14.9 |
-  | UD-Q4_K_M | 62 / 25.1 | 1,151 / 25.0 | 1,100 / 24.3 | 524 / 19.4 |
-  | UD-Q3_K_XL | 61 / 22.5 | 1,149 / 22.3 | 1,099 / 20.2 | 524 / 17.8 |
+  | File | 20 | 2,185 | 8,000 | 40,000 | 2,185 without MTP |
+  |---|---:|---:|---:|---:|---:|
+  | Q8_0 | 35 / 47.5 | 978 / 42.6 | 918 / 35.9 | (32K context) | 1,132 / 18.5 |
+  | UD-Q4_K_M | 60 / 59.6 | 1,136 / 54.0 | 1,075 / 48.8 | 502 / 36.1 | 1,151 / 27.3 |
+  | UD-Q3_K_XL | 60 / 61.3 | 1,134 / 55.7 | 1,073 / 53.1 | 502 / 34.0 | 1,150 / 29.1 |
 
-  With MTP (the default), decode:
-
-  | File | 20 | 2,185 | 8,000 | a coding answer |
-  |---|---:|---:|---:|---:|
-  | Q8_0 | - | 41.8 | - | - |
-  | UD-Q4_K_M | 46.8 | 43.3 | 37.1 | 48.8 |
-  | UD-Q3_K_XL | - | 41.9 | - | - |
-
-  84-89% of the drafts accepted; prompts read ~3% slower (the draft block follows every pass). With the shared
-  kernels alone (`NS_SILO=0`, no drafts) UD-Q4_K_M reads 2,185 tokens at 441 tok/s and decodes at 18.5.
+  A coding answer (400 tokens) decodes at 61 tok/s on UD-Q4_K_M and UD-Q3_K_XL. 84-89% of the drafts are accepted;
+  prompts read a little slower with MTP (the draft block follows every pass; Q8_0's chunks are 1,024 rows beside it).
+  Q8_0 decode is bandwidth-bound (27 GiB a token). With the shared kernels alone (`NS_SILO=0`, no drafts) UD-Q4_K_M
+  reads 2,185 tokens at 441 tok/s and decodes at 18.5.
 - **MTP:** the draft block (block 64 of the MTP file - `MTP/` beside the model, the catalog's `q27-mtp`, or
   `NS_Q35_MTP`) reads each position's normed hidden state with the token after it. It runs behind every pass over
   that pass's rows, so its cache follows the conversation; `step` drafts `NS_Q35_DRAFTS` tokens (3: 2 is as fast, 4
