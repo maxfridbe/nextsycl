@@ -13,9 +13,16 @@ extern "C" {
 typedef struct ns_gpu ns_gpu;
 
 /* Decode products (mmvq.cpp; the shared one is ns_mmvq): y [ncols, n_out] = W [n_out, n_in] (ggml type, stored
- * blocks) . x (Q8_1, ncols 1..8). Covers Q3_K, Q4_K, Q5_K, IQ4_NL, IQ3_S, IQ4_XS at a width of whole blocks */
+ * blocks) . x (ncols 1..8, the split Q8_1 layout below). Covers Q3_K, Q4_K, Q5_K, IQ4_NL, IQ3_S, IQ4_XS at a width of
+ * whole blocks */
 int ns_q35_mmvq_supported(int type, int64_t n_in);
-int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+/* The silo's split Q8_1 layout: a column's quants [ncols][n_in] int8 (16-byte aligned, contiguous), then the blocks'
+ * scales [ncols][n_in / 32] half - from standard Q8_1 blocks (column j's at j x n_in / 32) */
+int ns_q35_q8_split(ns_gpu* g, const void* q8_1, void* xs, int64_t n_in, int64_t ncols);
+size_t ns_q35_q8_split_bytes(int64_t n_in, int64_t ncols);
+/* x [ncols, n_in] float32 -> its Q8_1 blocks (nullable; ns_quantize_q8_1's bits) and the split layout, one launch */
+int ns_q35_quantize_q8(ns_gpu* g, const float* x, void* q8_1, void* xs, int64_t n_in, int64_t ncols);
+int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const void* x_split, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 
 /* Prompt attention (attn.cpp; the engine's own is ns_q35_attn): flash attention on XMX. out [T, Hq x 256] = softmax(q k^T
  * / 16) v for rows q [T, Hq x 256] (qs floats apart) at positions p0.., causal, against the half caches [Hkv][cap][256].
@@ -35,8 +42,9 @@ int ns_q35_attn_decode(ns_gpu* g, const float* q, int64_t qs, const void* kc, co
 int ns_q35_dequant_f16_supported(int type);
 int ns_q35_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
 /* RMS norm with the Q8_1 blocks of its output (norm.cpp; for decode rows): y [rows, C] = x / rms(x) * w (y may be null),
- * q8_1 the blocks of y as ns_quantize_q8_1 makes them (column r at r x C / 32); C a multiple of 256 */
-int ns_q35_rms_q8(ns_gpu* g, const float* x, const float* w, float* y, void* q8_1, int64_t rows, int64_t C, float eps);
+ * q8_1 the blocks of y as ns_quantize_q8_1 makes them (column r at r x C / 32), xs (nullable) the same in the split
+ * layout; C a multiple of 256 */
+int ns_q35_rms_q8(ns_gpu* g, const float* x, const float* w, float* y, void* q8_1, void* xs, int64_t rows, int64_t C, float eps);
 
 #ifdef __cplusplus
 }

@@ -20,12 +20,13 @@ int ns_mmvq_supported(int type);
 int ns_quantize_q8_1(ns_gpu* g, const float* x, void* q8_1, int64_t n_in, int64_t ncols);
 int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 int ns_q35_mmvq_supported(int type, int64_t n_in);
+int ns_q35_q8_split(ns_gpu* g, const void* q8_1, void* xs, int64_t n_in, int64_t ncols);
 int ns_q35_dequant_f16_supported(int type);
 int ns_q35_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
 int ns_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
 int ns_dequant(ns_gpu* g, int type, const void* src, size_t n, float* dst);
 int ns_gemm_f16(ns_gpu* g, int64_t T, int64_t N, int64_t K, const uint16_t* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int acc);
-int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const void* x_split, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 }
 struct T { int id; const char* name; int elems; int bytes; };
 int main(int argc, char** argv) {
@@ -49,6 +50,7 @@ int main(int argc, char** argv) {
         ns_copy_to(g, x, hx.data(), hx.size() * 4);
     }
     void* q; ns_alloc(g, ns_q8_1_bytes(17408, 8), &q);
+    void* qsplit; ns_alloc(g, 17408 * 8 * 2, &qsplit);   // the silo's split layout of q
     float* y; ns_alloc(g, 17408 * 8 * 4, (void**) &y);
     if (mode.find("deq") != std::string::npos) {   // the silo's weight expansion to half against the shared ones, and its speed
         const int64_t n = 17408 * 5120;
@@ -158,9 +160,14 @@ int main(int argc, char** argv) {
             for (int e = 0; e < NE; ++e) ns_copy_to(g, (char*) w + wb * e, h.data(), wb);
             ns_sync(g);
             ns_quantize_q8_1(g, x, q, n_in, ncols);
-            auto mm = own && ns_q35_mmvq_supported(t.id, n_in) ? ns_q35_mmvq : ns_mmvq;
+            const bool silo = own && ns_q35_mmvq_supported(t.id, n_in);
+            if (silo) ns_q35_q8_split(g, q, qsplit, n_in, ncols);
+            auto mm = [&](ns_gpu* g_, int ty, const void* w_, void*, float* y_, int64_t ni, int64_t no, int64_t nc) {
+                return silo ? ns_q35_mmvq(g_, ty, w_, q, qsplit, y_, ni, no, nc) : ns_mmvq(g_, ty, w_, q, y_, ni, no, nc);
+            };
+            void* xin = q;
             if (check) {
-                mm(g, t.id, w, q, y, n_in, n_out, ncols);
+                mm(g, t.id, w, xin, y, n_in, n_out, ncols);
                 std::vector<float> hy((size_t) n_out * ncols);
                 ns_copy_from(g, hy.data(), y, hy.size() * 4);
                 ns_sync(g);
@@ -171,11 +178,11 @@ int main(int argc, char** argv) {
                 ns_free(g, w);
                 continue;
             }
-            for (int i = 0; i < 4; ++i) mm(g, t.id, (char*) w + wb * (i % NE), q, y, n_in, n_out, ncols);
+            for (int i = 0; i < 4; ++i) mm(g, t.id, (char*) w + wb * (i % NE), xin, y, n_in, n_out, ncols);
             ns_sync(g);
             const int R = 100;
             auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < R; ++i) mm(g, t.id, (char*) w + wb * (i % NE), q, y, n_in, n_out, ncols);
+            for (int i = 0; i < R; ++i) mm(g, t.id, (char*) w + wb * (i % NE), xin, y, n_in, n_out, ncols);
             ns_sync(g);
             const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / R;
             printf("   %5.0f (%6.1f)    ", wb / sec / 1e9, sec * 1e6);

@@ -105,7 +105,10 @@ pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
 pub struct Silo {
     pub path: std::path::PathBuf,
     pub mmvq_supported: unsafe extern "C" fn(c_int, i64) -> c_int,
-    pub mmvq: unsafe extern "C" fn(G, c_int, P, P, *mut f32, i64, i64, i64) -> c_int,
+    /// (w, x as Q8_1 blocks, x in the split layout, y, ...)
+    pub mmvq: unsafe extern "C" fn(G, c_int, P, P, P, *mut f32, i64, i64, i64) -> c_int,
+    pub q8_split_bytes: unsafe extern "C" fn(i64, i64) -> usize,
+    pub quantize_q8: unsafe extern "C" fn(G, *const f32, M, M, i64, i64) -> c_int,
     pub attn_prompt_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
     pub attn_prompt: unsafe extern "C" fn(G, *const f32, i64, P, P, i64, i64, i64, i64, i64, i64, *mut f32) -> c_int,
     pub attn_decode_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
@@ -113,7 +116,7 @@ pub struct Silo {
     pub attn_decode: unsafe extern "C" fn(G, *const f32, i64, P, P, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
     pub dequant_f16_supported: unsafe extern "C" fn(c_int) -> c_int,
     pub dequant_f16: unsafe extern "C" fn(G, c_int, P, i64, *mut u16) -> c_int,
-    pub rms_q8: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, M, i64, i64, f32) -> c_int,
+    pub rms_q8: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, M, M, i64, i64, f32) -> c_int,
 }
 
 /// The silo (None: the shared kernels for everything)
@@ -138,6 +141,8 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             path: lib.path.clone(),
             mmvq_supported: sym!("ns_q35_mmvq_supported"),
             mmvq: sym!("ns_q35_mmvq"),
+            q8_split_bytes: sym!("ns_q35_q8_split_bytes"),
+            quantize_q8: sym!("ns_q35_quantize_q8"),
             attn_prompt_supported: sym!("ns_q35_attn_prompt_supported"),
             attn_prompt: sym!("ns_q35_attn_prompt"),
             attn_decode_supported: sym!("ns_q35_attn_decode_supported"),

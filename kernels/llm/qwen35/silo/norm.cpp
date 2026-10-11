@@ -21,10 +21,12 @@ struct Q81 {
 
 extern "C" {
 
-int ns_q35_rms_q8(ns_gpu* g, const float* x, const float* w, float* y, void* q8_1, int64_t rows, int64_t C, float eps) {
+int ns_q35_rms_q8(ns_gpu* g, const float* x, const float* w, float* y, void* q8_1, void* xs, int64_t rows, int64_t C, float eps) {
     NS_TRY
     if (C % WG != 0) return ns_fail("ns_q35_rms_q8: rows of a multiple of 256");
     Q81* q = static_cast<Q81*>(q8_1);
+    int8_t* xq = static_cast<int8_t*>(xs);   // the split layout (nullable): quants [rows][C], then scales [rows][C / 32]
+    sycl::half* xd = xq ? reinterpret_cast<sycl::half*>(xq + rows * C) : nullptr;
     const int64_t slices = C / WG;
     g->q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> part(sycl::range<1>(NSG), h);
@@ -54,8 +56,14 @@ int ns_q35_rms_q8(ns_gpu* g, const float* x, const float* w, float* y, void* q8_
             }
             const float d = strata::kernels::q8_1_finite(amax / 127.0f);
             Q81* b = q + (r * C + c) / 32;
-            b->qs[lane] = strata::kernels::q8_1_quant(v, d, amax);
-            if (lane == 0) b->ds = strata::kernels::q8_1_ds(d, sum);
+            const int8_t qv = strata::kernels::q8_1_quant(v, d, amax);
+            const sycl::half2 ds = strata::kernels::q8_1_ds(d, sum);
+            b->qs[lane] = qv;
+            if (lane == 0) b->ds = ds;
+            if (xq) {
+                xq[r * C + c] = qv;
+                if (lane == 0) xd[(r * C + c) / 32] = ds[0];
+            }
         });
     });
     return 0;

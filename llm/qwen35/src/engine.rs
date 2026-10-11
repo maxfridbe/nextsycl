@@ -99,6 +99,12 @@ impl Geometry {
     }
 }
 
+/// A decode row set's Q8_1 forms: the blocks (the shared products'), and the silo's split layout when the silo made it
+pub struct Q8 {
+    std: DevBuf,
+    split: Option<DevBuf>,
+}
+
 /// A matrix [rows (outputs), cols (inputs)]: its stored blocks, or float32 (small or unquantized tensors)
 pub struct Mat {
     pub buf: DevBuf,
@@ -501,8 +507,8 @@ impl<'g> Qwen35<'g> {
     }
 
     /// y [t, w.rows] = x [t, w.cols] . W^T; `role` names it in the probe
-    /// `xq`: x's Q8_1 blocks when the norm made them (decode rows), so the product does not quantize x again
-    fn matmul(&self, role: &'static str, w: &Mat, x: &DevBuf, xq: Option<&DevBuf>, t: usize, y: &DevBuf) -> Result<()> {
+    /// `xq`: x's Q8_1 forms when the norm made them (decode rows), so the product does not quantize x again
+    fn matmul(&self, role: &'static str, w: &Mat, x: &DevBuf, xq: Option<&Q8>, t: usize, y: &DevBuf) -> Result<()> {
         let k = self.k;
         let (n, kk) = (w.rows as i64, w.cols as i64);
         let (rows, cols) = (w.rows, w.cols);
@@ -519,25 +525,27 @@ impl<'g> Qwen35<'g> {
         if t <= 8 && mmvq {
             // SAFETY: arithmetic only.
             let q8 = unsafe { (k.q8_1_bytes)(kk, t as i64) };
+            // the silo's product for the types it covers (kernels/llm/qwen35/silo; it reads the split layout too), the
+            // shared one otherwise
+            // SAFETY: arithmetic only.
+            let silo = self.silo.filter(|s| unsafe { (s.mmvq_supported)(w.ty.code() as i32, kk) } != 0);
             let own;
             let qb = match xq {
                 Some(q) => q,
                 None => {
-                    own = self.arena.bytes(q8)?;
-                    // SAFETY: x [t, cols] float32 -> its Q8_1 blocks.
-                    self.op("quantize", key, 4 * t * cols + q8, 0, || unsafe { (k.quantize_q8_1)(self.raw(), x.fp(), own.ptr(), kk, t as i64) })?;
+                    own = self.quantize(x, cols, t, silo.is_some(), &key)?;
                     &own
                 }
             };
-            // the silo's product for the types it covers (kernels/llm/qwen35/silo), the shared one otherwise
-            // SAFETY: arithmetic only.
-            let (f, name) = match self.silo {
-                Some(s) if unsafe { (s.mmvq_supported)(w.ty.code() as i32, kk) } != 0 => (s.mmvq, "mmvq silo"),
-                _ => (k.mmvq, "mmvq"),
+            return match (silo, &qb.split) {
+                (Some(s), Some(sp)) => self.op("mmvq silo", key, wb + q8 + 4 * t * rows, flops, || unsafe {
+                    // SAFETY: the matrix in its blocks, x in both forms, y [t, rows].
+                    (s.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.std.ptr(), sp.ptr(), y.fp(), kk, n, t as i64)
+                }),
+                // SAFETY: the matrix in its blocks, x's Q8_1 blocks, y [t, rows].
+                _ => self.op("mmvq", key, wb + q8 + 4 * t * rows, flops,
+                             || unsafe { (k.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.std.ptr(), y.fp(), kk, n, t as i64) }),
             };
-            // SAFETY: the matrix in its blocks, x's Q8_1 blocks, y [t, rows].
-            return self.op(name, key, wb + q8 + 4 * t * rows, flops,
-                           || unsafe { f(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.ptr(), y.fp(), kk, n, t as i64) });
         }
         // the matrix expanded to half (directly, or through float32), x to half, then the half product
         let elems = rows * cols;
@@ -566,19 +574,39 @@ impl<'g> Qwen35<'g> {
                 || unsafe { (k.gemm_f16)(self.raw(), t as i64, n, kk, xh.ptr().cast(), kk, self.w16.ptr().cast(), y.fp(), n, 0) })
     }
 
-    /// The RMS norm into y; for decode rows with the silo also y's Q8_1 blocks (the products after it read them)
-    fn norm(&self, x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, c: usize) -> Result<Option<DevBuf>> {
+    /// The RMS norm into y; for decode rows with the silo also y's Q8_1 forms (the products after it read them)
+    fn norm(&self, x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, c: usize) -> Result<Option<Q8>> {
         let Some(s) = self.silo.filter(|_| rows <= 8 && c.is_multiple_of(256)) else {
             self.rms(x, w, y, rows, c)?;
             return Ok(None);
         };
         // SAFETY: arithmetic only.
-        let q8 = unsafe { (self.k.q8_1_bytes)(c as i64, rows as i64) };
-        let qb = self.arena.bytes(q8)?;
-        // SAFETY: x and y [rows, c], w c floats, qb rows x c / 32 Q8_1 blocks.
-        self.op("rms norm q8", String::new, 12 * rows * c + 4 * c + q8, 6 * rows * c,
-                || unsafe { (s.rms_q8)(self.raw(), x.fp(), w.fp(), y.fp(), qb.ptr(), rows as i64, c as i64, self.g.eps) })?;
-        Ok(Some(qb))
+        let (q8, sb) = unsafe { ((self.k.q8_1_bytes)(c as i64, rows as i64), (s.q8_split_bytes)(c as i64, rows as i64)) };
+        let (qb, sp) = (self.arena.bytes(q8)?, self.arena.bytes(sb)?);
+        // SAFETY: x and y [rows, c], w c floats, qb rows x c / 32 Q8_1 blocks, sp the split layout.
+        self.op("rms norm q8", String::new, 12 * rows * c + 4 * c + q8 + sb, 6 * rows * c,
+                || unsafe { (s.rms_q8)(self.raw(), x.fp(), w.fp(), y.fp(), qb.ptr(), sp.ptr(), rows as i64, c as i64, self.g.eps) })?;
+        Ok(Some(Q8 { std: qb, split: Some(sp) }))
+    }
+
+    /// x [t, cols] -> its Q8_1 forms: with `split` (a silo product) the silo's quantization, both layouts in one launch
+    fn quantize(&self, x: &DevBuf, cols: usize, t: usize, split: bool, key: &dyn Fn() -> String) -> Result<Q8> {
+        let k = self.k;
+        // SAFETY: arithmetic only.
+        let q8 = unsafe { (k.q8_1_bytes)(cols as i64, t as i64) };
+        let std = self.arena.bytes(q8)?;
+        if let Some(s) = self.silo.filter(|_| split) {
+            // SAFETY: arithmetic only.
+            let sb = unsafe { (s.q8_split_bytes)(cols as i64, t as i64) };
+            let sp = self.arena.bytes(sb)?;
+            // SAFETY: x [t, cols] float32 -> its Q8_1 blocks and the split layout.
+            self.op("quantize", key, 4 * t * cols + q8 + sb, 0,
+                    || unsafe { (s.quantize_q8)(self.raw(), x.fp(), std.ptr(), sp.ptr(), cols as i64, t as i64) })?;
+            return Ok(Q8 { std, split: Some(sp) });
+        }
+        // SAFETY: x [t, cols] float32 -> its Q8_1 blocks.
+        self.op("quantize", key, 4 * t * cols + q8, 0, || unsafe { (k.quantize_q8_1)(self.raw(), x.fp(), std.ptr(), cols as i64, t as i64) })?;
+        Ok(Q8 { std, split: None })
     }
 
     fn rms(&self, x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, c: usize) -> Result<()> {
@@ -619,7 +647,7 @@ impl<'g> Qwen35<'g> {
 
     /// A full-attention layer on h [t, n_embd]: its output [t, n_embd]
     #[allow(clippy::too_many_arguments)]
-    fn full(&self, a: &Full, kc: &DevBuf, vc: &DevBuf, cap: usize, h: &DevBuf, hq8: Option<&DevBuf>, t: usize, p0: usize) -> Result<DevBuf> {
+    fn full(&self, a: &Full, kc: &DevBuf, vc: &DevBuf, cap: usize, h: &DevBuf, hq8: Option<&Q8>, t: usize, p0: usize) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hq, hk, d) = (g.heads, g.heads_kv, g.head);
         let qf = self.arena.f32(t * hq * 2 * d)?;
@@ -689,7 +717,7 @@ impl<'g> Qwen35<'g> {
     /// A DeltaNet layer on h [t, n_embd]: its output [t, n_embd]
     /// `snap`: where the state after each row but the last goes (a verify pass's: its recurrence's, its conv's)
     #[allow(clippy::too_many_arguments)]
-    fn linear(&self, a: &Linear, s: &DevBuf, conv: &DevBuf, h: &DevBuf, hq8: Option<&DevBuf>, t: usize, snap: Option<(&DevBuf, &DevBuf)>) -> Result<DevBuf> {
+    fn linear(&self, a: &Linear, s: &DevBuf, conv: &DevBuf, h: &DevBuf, hq8: Option<&Q8>, t: usize, snap: Option<(&DevBuf, &DevBuf)>) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hv, hk, d, cd) = (g.v_heads, g.k_heads, g.state, g.conv_dim());
         let qkv = self.arena.f32(t * cd)?;
@@ -831,12 +859,9 @@ impl<'g> Qwen35<'g> {
             self.mtp_rows(ms, tokens, &hs, p0, s.max_ctx, false)?;
             ms.pending.copy_within(0, &all, (t - 1) * ne * 4, ne * 4)?;
             self.phase("head");
-            let q8row = q.as_ref().map(|_| unsafe { (self.k.q8_1_bytes)(ne as i64, 1) });
-            let qv = match (&q, q8row) {
-                (Some(q), Some(rb)) => Some(q.view((t - n) * rb, n * rb)?),
-                _ => None,
-            };
-            (all.view((t - n) * ne * 4, n * ne * 4)?, qv)
+            // the head reads the rows' Q8_1 forms when it takes them all; fewer rows (a short prompt's last) it quantizes
+            // itself (the split layout does not slice by rows)
+            (all.view((t - n) * ne * 4, n * ne * 4)?, if n == t { q } else { None })
         } else {
             let last = x.view((t - n) * ne * 4, n * ne * 4)?;
             let normed = self.arena.f32(n * ne)?;

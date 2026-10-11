@@ -17,6 +17,7 @@
 #include "ns_internal.hpp"
 #include "silo.h"
 #include "common.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
@@ -46,9 +47,22 @@ inline int dp4a(int a, int b, int c) { return dpct::dp4a(a, b, c); }   // signed
 inline int dp4a4(const sycl::int4 a, const sycl::int4 b, int acc) {
     acc = dp4a(a.x(), b.x(), acc); acc = dp4a(a.y(), b.y(), acc); acc = dp4a(a.z(), b.z(), acc); return dp4a(a.w(), b.w(), acc);
 }
-inline sycl::int4 ld_q8_16(const Q81Block* b, int half) {   // Q8_1 qs is 4-byte aligned
+// The activations in the silo's split Q8_1 layout (silo.h: ns_q35_q8_split): a column's quants contiguous and
+// 16-byte aligned, its scales apart - one 16-byte load for 16 quants (Q8_1's 36-byte blocks leave them 4-byte
+// aligned: four loads). `XA` is one column: block b's quants at qs + 32 b, its scale d[b].
+struct XA {
+    const int8_t* qs;
+    const sycl::half* d;
+    sycl::int4 q16(int b, int half) const { return *reinterpret_cast<const sycl::int4*>(qs + 32 * b + 16 * half); }
+    float dd(int b) const { return (float) d[b]; }
+};
+inline sycl::int4 ld_q8_16(const Q81Block* b, int half) {   // standard Q8_1: qs is 4-byte aligned, four loads
     const int* q = reinterpret_cast<const int*>(b->qs) + 4 * half;
     return sycl::int4(q[0], q[1], q[2], q[3]);
+}
+// column j of `ncols` columns of n_in values in the split layout at xs
+inline XA xcol(const int8_t* xs, int n_in, int ncols, int j) {
+    return XA{xs + std::size_t(j) * n_in, reinterpret_cast<const sycl::half*>(xs + std::size_t(ncols) * n_in) + std::size_t(j) * (n_in / 32)};
 }
 // ---- Q4_K / Q5_K: lane g = sub-block pair 2 (g >> 1), half g & 1 - 32 quants of two sub-blocks
 // a Q4_K / Q5_K block's first 16 bytes (16-byte aligned: 144 and 176 are multiples of 16): dm, then the scales
@@ -61,6 +75,7 @@ inline void k4_head(const void* b, int sb, float& dl, float& ml, float& dh, floa
 }
 struct WideQ4K {
     using Block = Q4KBlock;
+    static constexpr bool SPLIT = true;   // reads the split activations (B70: 1 column +4-8%, 4 columns +8%)
     static constexpr int ROWS = 1;   // with the head load: 1 row 507/470/488 GB/s, 2 rows 490/411/466 (before it 2 rows won)
     static constexpr int LUT = 0;
     static uint32_t lut(int) { return 0; }
@@ -75,12 +90,12 @@ struct WideQ4K {
     }
     // the activations of lane g's quants (shared by the sub-group's rows) and their sums (the mins' term)
     struct X { sycl::int4 ua, uc; float da, dc; int sa, sc; };
-    static X xload(int g, const Q81Block* xb) {
+    static X xload(int g, const XA& xa, int b0) {   // b0 = the 256-block's first 32-block
         X v; const int sb = 2 * (g >> 1), half = g & 1;
-        const Q81Block* a = xb + sb; const Q81Block* c = xb + sb + 1;
+        const int a = b0 + sb, c = b0 + sb + 1;
         const sycl::int4 ones(0x01010101, 0x01010101, 0x01010101, 0x01010101);
-        v.ua = ld_q8_16(a, half); v.uc = ld_q8_16(c, half);
-        v.da = (float) a->ds[0]; v.dc = (float) c->ds[0];
+        v.ua = xa.q16(a, half); v.uc = xa.q16(c, half);
+        v.da = xa.dd(a); v.dc = xa.dd(c);
         v.sa = dp4a4(ones, v.ua, 0); v.sc = dp4a4(ones, v.uc, 0);
         return v;
     }
@@ -91,6 +106,7 @@ struct WideQ4K {
 };
 struct WideQ5K {
     using Block = Q5KBlock;
+    static constexpr bool SPLIT = true;
     static constexpr int ROWS = 1;   // 2 rows: 484 against 525 (the high bits' arithmetic twice)
     static constexpr int LUT = 0;
     static uint32_t lut(int) { return 0; }
@@ -108,7 +124,7 @@ struct WideQ5K {
         return r;
     }
     using X = WideQ4K::X;
-    static X xload(int g, const Q81Block* xb) { return WideQ4K::xload(g, xb); }
+    static X xload(int g, const XA& xa, int b0) { return WideQ4K::xload(g, xa, b0); }
     static float dot(const W& r, const X& v) { return WideQ4K::dot(r, v); }
 };
 
@@ -126,6 +142,7 @@ inline void iq4_tab4(const uint32_t* tab, uint32_t v, int& lo, int& hi) {
 // lane g = sub-block g: 16 bytes, 32 quants
 struct WideIQ4XS {
     using Block = IQ4XSBlock;
+    static constexpr bool SPLIT = true;
     static constexpr int ROWS = 1;   // 2 rows: 454 against 481
     static constexpr int LUT = 256;
     static uint32_t lut(int i) { return iq4_tab_entry(i); }
@@ -147,10 +164,7 @@ struct WideIQ4XS {
         return r;
     }
     struct X { sycl::int4 u0, u1; float d; };
-    static X xload(int g, const Q81Block* xb) {
-        const Q81Block* a = xb + g;
-        return X{ld_q8_16(a, 0), ld_q8_16(a, 1), (float) a->ds[0]};
-    }
+    static X xload(int g, const XA& xa, int b0) { return X{xa.q16(b0 + g, 0), xa.q16(b0 + g, 1), xa.dd(b0 + g)}; }
     static float dot(const W& r, const X& v) { return r.d * v.d * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)); }
 };
 
@@ -159,6 +173,7 @@ struct WideIQ4XS {
 // hmask bit << 2, less 4 (ggml's -4 where the bit is clear): 4 x the activations' sums taken off a sub-block
 struct WideQ3K {
     using Block = Q3KBlock;
+    static constexpr bool SPLIT = false;   // the standard blocks: the split layout measured 7-9% slower here
     static constexpr int ROWS = 1;   // 1 row 381/357/367 GB/s, 2 rows 384/310/363
     static constexpr int LUT = 0;
     static uint32_t lut(int) { return 0; }
@@ -205,6 +220,7 @@ struct WideQ3K {
 inline uint32_t sign_mask4(uint32_t b) { return ((b * 0x00204081u) & 0x01010101u) * 0xffu; }   // bit i -> 0xff in byte i
 struct WideIQ3S {
     using Block = block_iq3_s;
+    static constexpr bool SPLIT = false;   // the standard blocks (split: 7% slower at one column)
     static constexpr int ROWS = 1;
     static constexpr int LUT = 512 + 16;   // the grid, then the 16 sign masks of four bits (32-bit multiplies are slow)
     static uint32_t lut(int i) { return i < 512 ? iq3s_grid[i] : sign_mask4(uint32_t(i - 512)); }
@@ -231,7 +247,10 @@ struct WideIQ3S {
         return r;
     }
     using X = WideIQ4XS::X;
-    static X xload(int g, const Q81Block* xb) { return WideIQ4XS::xload(g, xb); }
+    static X xload(int g, const Q81Block* xb) {
+        const Q81Block* a = xb + g;
+        return X{ld_q8_16(a, 0), ld_q8_16(a, 1), (float) a->ds[0]};
+    }
     static float dot(const W& r, const X& v) { return WideIQ4XS::dot(r, v); }
 };
 
@@ -246,16 +265,19 @@ int rows_override() {   // NS_Q35_MMVQ_ROWS=1|2|4: every 256-block type's rows a
 
 // 256-blocks: 8 lanes a block, 4 blocks a sub-group step, R rows a sub-group sharing each lane's activations
 template <typename F, int NCOLS, int R>
-void wide_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y, int n_in, int n_out,
+void wide_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ xq, const int8_t* __restrict__ x, float* __restrict__ y, int n_in, int n_out,
                  uint32_t* tab, const sycl::nd_item<3>& item) {
     const int lane = int(item.get_local_id(2)), warp = int(item.get_local_id(1));
     if constexpr (F::LUT > 0) {
         for (int i = warp * WARP + lane; i < F::LUT; i += WARPS * WARP) tab[i] = F::lut(i);
         sycl::group_barrier(item.get_group());
     }
-    const int blocks_per_row = n_in / QK, x_stride = n_in / Q8K;
+    const int blocks_per_row = n_in / QK;
     const int g = lane & 7, sub = lane >> 3;
     auto sg = item.get_sub_group();
+    XA xa[NCOLS];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) xa[j] = xcol(x, n_in, NCOLS, j);
     for (int row0 = (int(item.get_group(2)) * WARPS + warp) * R; row0 < n_out; row0 += int(item.get_group_range(2)) * WARPS * R) {
         const typename F::Block* wr[R];
 #pragma unroll
@@ -267,7 +289,9 @@ void wide_kernel(const typename F::Block* __restrict__ w, const Q81Block* __rest
             for (int r = 0; r < R; ++r) wv[r] = F::load(wr[r] + kbx, g, tab);
 #pragma unroll
             for (int j = 0; j < NCOLS; ++j) {
-                const typename F::X xv = F::xload(g, x + std::size_t(j) * x_stride + kbx * (QK / Q8K));
+                typename F::X xv;
+                if constexpr (F::SPLIT) xv = F::xload(g, xa[j], kbx * (QK / Q8K));
+                else xv = F::xload(g, xq + std::size_t(j) * (n_in / Q8K) + kbx * (QK / Q8K));
 #pragma unroll
                 for (int r = 0; r < R; ++r) acc[r][j] += F::dot(wv[r], xv);
             }
@@ -284,52 +308,56 @@ void wide_kernel(const typename F::Block* __restrict__ w, const Q81Block* __rest
     }
 }
 template <typename F, int NCOLS, int R>
-void launch(sycl::queue& q, const void* weights, const void* xq, float* y, int n_in, int n_out) {
+void launch(sycl::queue& q, const void* weights, const void* xstd, const void* xs, float* y, int n_in, int n_out) {
     const auto* w = static_cast<const typename F::Block*>(weights);
-    const auto* x = static_cast<const Q81Block*>(xq);
+    const auto* xq = static_cast<const Q81Block*>(xstd);
+    const auto* x = static_cast<const int8_t*>(xs);
     unsigned blocks = unsigned((std::size_t(n_out) + WARPS * R - 1) / (WARPS * R));
     if (F::LUT > 0) blocks = std::min(blocks, unsigned(lut_groups()));
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
         h.parallel_for(sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
                        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(32)]] {
-                           wide_kernel<F, NCOLS, R>(w, x, y, n_in, n_out, tab.template get_multi_ptr<sycl::access::decorated::no>().get(), it);
+                           wide_kernel<F, NCOLS, R>(w, xq, x, y, n_in, n_out, tab.template get_multi_ptr<sycl::access::decorated::no>().get(), it);
                        });
     });
 }
 template <typename F, int R>
-void launch_cols(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out, int ncols) {
+void launch_cols(sycl::queue& q, const void* w, const void* xq, const void* x, float* y, int n_in, int n_out, int ncols) {
     switch (ncols) {
-        case 1: launch<F, 1, R>(q, w, x, y, n_in, n_out); return;
-        case 2: launch<F, 2, R>(q, w, x, y, n_in, n_out); return;
-        case 3: launch<F, 3, R>(q, w, x, y, n_in, n_out); return;
-        case 4: launch<F, 4, R>(q, w, x, y, n_in, n_out); return;
-        case 5: launch<F, 5, R>(q, w, x, y, n_in, n_out); return;
-        case 6: launch<F, 6, R>(q, w, x, y, n_in, n_out); return;
-        case 7: launch<F, 7, R>(q, w, x, y, n_in, n_out); return;
-        default: launch<F, 8, R>(q, w, x, y, n_in, n_out); return;
+        case 1: launch<F, 1, R>(q, w, xq, x, y, n_in, n_out); return;
+        case 2: launch<F, 2, R>(q, w, xq, x, y, n_in, n_out); return;
+        case 3: launch<F, 3, R>(q, w, xq, x, y, n_in, n_out); return;
+        case 4: launch<F, 4, R>(q, w, xq, x, y, n_in, n_out); return;
+        case 5: launch<F, 5, R>(q, w, xq, x, y, n_in, n_out); return;
+        case 6: launch<F, 6, R>(q, w, xq, x, y, n_in, n_out); return;
+        case 7: launch<F, 7, R>(q, w, xq, x, y, n_in, n_out); return;
+        default: launch<F, 8, R>(q, w, xq, x, y, n_in, n_out); return;
     }
 }
 template <typename F>
-void wide(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out, int ncols) {
+void wide(sycl::queue& q, const void* w, const void* xq, const void* x, float* y, int n_in, int n_out, int ncols) {
     // past 4 columns two rows would hold 2 x 8 accumulators and 8 activation sets: one row there; 3-4 columns (a
     // verify pass) two rows sharing each lane's activations (B70, 4 columns, GB/s: Q4_K 270 -> 344, IQ4_XS 331 -> 406,
     // Q5_K 316 -> 377; at 2 columns it is mixed). Rows never change a column's arithmetic: verify rows stay exact.
     const int r = ncols > 4 ? 1 : rows_override() ? rows_override() : ncols >= 3 ? 2 : F::ROWS;
-    if (r >= 4) launch_cols<F, 4>(q, w, x, y, n_in, n_out, ncols);
-    else if (r == 2) launch_cols<F, 2>(q, w, x, y, n_in, n_out, ncols);
-    else launch_cols<F, 1>(q, w, x, y, n_in, n_out, ncols);
+    if (r >= 4) launch_cols<F, 4>(q, w, xq, x, y, n_in, n_out, ncols);
+    else if (r == 2) launch_cols<F, 2>(q, w, xq, x, y, n_in, n_out, ncols);
+    else launch_cols<F, 1>(q, w, xq, x, y, n_in, n_out, ncols);
 }
 
 // ---- IQ4_NL (18-byte blocks of 32, 2-byte aligned): one lane a block (its 16 bytes = 32 nibbles), 32 blocks a step
 template <int NCOLS>
-void iq4nl_kernel(const IQ4NLBlock* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y, int n_in, int n_out, uint32_t* tab,
+void iq4nl_kernel(const IQ4NLBlock* __restrict__ w, const int8_t* __restrict__ x, float* __restrict__ y, int n_in, int n_out, uint32_t* tab,
                   const sycl::nd_item<3>& item) {
     const int lane = int(item.get_local_id(2)), warp = int(item.get_local_id(1));
     for (int i = warp * WARP + lane; i < 256; i += WARPS * WARP) tab[i] = iq4_tab_entry(i);
     sycl::group_barrier(item.get_group());
     const int blocks_per_row = n_in / 32;
     auto sg = item.get_sub_group();
+    XA xa[NCOLS];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) xa[j] = xcol(x, n_in, NCOLS, j);
     for (int row = int(item.get_group(2)) * WARPS + warp; row < n_out; row += int(item.get_group_range(2)) * WARPS) {
         const IQ4NLBlock* wr = w + std::size_t(row) * blocks_per_row;
         float acc[NCOLS] = {};
@@ -343,8 +371,7 @@ void iq4nl_kernel(const IQ4NLBlock* __restrict__ w, const Q81Block* __restrict__
             const float d = (float) wr[kb].d;
 #pragma unroll
             for (int j = 0; j < NCOLS; ++j) {
-                const Q81Block* xb = x + std::size_t(j) * blocks_per_row + kb;
-                acc[j] += d * (float) xb->ds[0] * (float) dp4a4(h4, ld_q8_16(xb, 1), dp4a4(l4, ld_q8_16(xb, 0), 0));
+                acc[j] += d * xa[j].dd(kb) * (float) dp4a4(h4, xa[j].q16(kb, 1), dp4a4(l4, xa[j].q16(kb, 0), 0));
             }
         }
 #pragma unroll
@@ -359,7 +386,7 @@ void iq4nl_kernel(const IQ4NLBlock* __restrict__ w, const Q81Block* __restrict__
 template <int NCOLS>
 void launch_iq4nl(sycl::queue& q, const void* weights, const void* xq, float* y, int n_in, int n_out) {
     const auto* w = static_cast<const IQ4NLBlock*>(weights);
-    const auto* x = static_cast<const Q81Block*>(xq);
+    const auto* x = static_cast<const int8_t*>(xq);
     const unsigned blocks = std::min(unsigned((std::size_t(n_out) + WARPS - 1) / WARPS), unsigned(lut_groups()));
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(256), h);
@@ -385,6 +412,59 @@ void iq4nl(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int
 
 extern "C" {
 
+// standard Q8_1 blocks (column j's at j x n_in / 32) -> the split layout: quants [ncols][n_in], then scales
+// [ncols][n_in / 32] (half)
+int ns_q35_q8_split(ns_gpu* g, const void* q8_1, void* xs, int64_t n_in, int64_t ncols) {
+    NS_TRY
+    const int64_t nb = ncols * (n_in / 32);
+    const auto* src = static_cast<const Q81Block*>(q8_1);
+    int8_t* qs = static_cast<int8_t*>(xs);
+    sycl::half* d = reinterpret_cast<sycl::half*>(qs + ncols * n_in);
+    g->q.parallel_for(sycl::range<1>((size_t) nb * 8), [=](sycl::id<1> i) {   // 8 work-items a block, 4 quants each
+        const int64_t b = i[0] / 8, k = i[0] % 8;
+        reinterpret_cast<int*>(qs + b * 32)[k] = reinterpret_cast<const int*>(src[b].qs)[k];
+        if (k == 0) d[b] = src[b].ds[0];
+    });
+    return 0;
+    NS_CATCH
+}
+
+// x [ncols, n_in] float32 -> its Q8_1 blocks (q8_1, nullable: Strata's quantize_q8_1, the same bits) and the split
+// layout (xs) in one launch: a sub-group of 32 a block
+int ns_q35_quantize_q8(ns_gpu* g, const float* x, void* q8_1, void* xs, int64_t n_in, int64_t ncols) {
+    NS_TRY
+    const int64_t n = ncols * n_in;
+    auto* q = static_cast<Q81Block*>(q8_1);
+    int8_t* qs = static_cast<int8_t*>(xs);
+    sycl::half* d = reinterpret_cast<sycl::half*>(qs + n);
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((n + 255) / 256 * 256)), sycl::range<1>(256)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+        auto sg = it.get_sub_group();
+        const int64_t i = it.get_global_id(0);
+        const float v = i < n ? x[i] : 0.0f;
+        float amax = sycl::fabs(v), sum = v;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
+            sum += sycl::permute_group_by_xor(sg, sum, o);
+        }
+        if (i >= n) return;
+        const float dd = strata::kernels::q8_1_finite(amax / 127.0f);
+        const int8_t qv = strata::kernels::q8_1_quant(v, dd, amax);
+        const int64_t b = i / 32, l = i % 32;
+        qs[i] = qv;
+        const sycl::half2 ds = strata::kernels::q8_1_ds(dd, sum);
+        if (l == 0) d[b] = ds[0];
+        if (q) {
+            q[b].qs[l] = qv;
+            if (l == 0) q[b].ds = ds;
+        }
+    });
+    return 0;
+    NS_CATCH
+}
+
+size_t ns_q35_q8_split_bytes(int64_t n_in, int64_t ncols) { return (size_t) (ncols * n_in + ncols * (n_in / 32) * 2); }
+
 int ns_q35_mmvq_supported(int type, int64_t n_in) {
     switch (type) {
         case 11: case 12: case 13: case 21: case 23: return n_in % QK == 0;
@@ -393,18 +473,18 @@ int ns_q35_mmvq_supported(int type, int64_t n_in) {
     }
 }
 
-int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
+int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const void* x_split, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
     NS_TRY
     if (ncols < 1 || ncols > 8) return ns_fail("ns_q35_mmvq: 1..8 columns");
     if (!ns_q35_mmvq_supported(type, n_in)) return ns_fail("ns_q35_mmvq: ggml type " + std::to_string(type) + " at this width is not its own");
     const int ni = (int) n_in, no = (int) n_out, nc = (int) ncols;
     switch (type) {
-        case 11: wide<WideQ3K>(g->q, w, x_q8_1, y, ni, no, nc); break;
-        case 12: wide<WideQ4K>(g->q, w, x_q8_1, y, ni, no, nc); break;
-        case 13: wide<WideQ5K>(g->q, w, x_q8_1, y, ni, no, nc); break;
-        case 20: iq4nl(g->q, w, x_q8_1, y, ni, no, nc); break;
-        case 21: wide<WideIQ3S>(g->q, w, x_q8_1, y, ni, no, nc); break;
-        case 23: wide<WideIQ4XS>(g->q, w, x_q8_1, y, ni, no, nc); break;
+        case 11: wide<WideQ3K>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
+        case 12: wide<WideQ4K>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
+        case 13: wide<WideQ5K>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
+        case 20: iq4nl(g->q, w, x_split, y, ni, no, nc); break;
+        case 21: wide<WideIQ3S>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
+        case 23: wide<WideIQ4XS>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
     }
     return 0;
     NS_CATCH
