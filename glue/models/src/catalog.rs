@@ -175,6 +175,15 @@ pub fn search(cfg: &Config, installed: &[Value], text: Option<&str>, kind: Optio
     Ok(())
 }
 
+/// The file a path names, through a symbolic link (one to another filesystem, from `pull`): a container sees the
+/// directories it is given, not where a link inside them points
+fn real(p: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+        return p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    }
+    p.to_path_buf()
+}
+
 /// The silo a card's model runs on (its tuned kernels: dist/silo/libnextsycl-<name>.so): its card's `silo`, else its
 /// architecture's when one is built; `-` the shared kernels; "(not built)" a silo the card names that is not there
 pub fn silo_of(cfg: &Config, m: &Value) -> String {
@@ -238,7 +247,7 @@ fn fetch(cat: &Catalog, root: &Path, key: &str, f: &Value, from: &[PathBuf], ver
             return Err(format!("{}: not the file the catalog names (SHA-256 differs)", target.display()));
         }
         println!("  {key}: have it ({})", target.display());
-        return Ok(target);
+        return Ok(real(&target));
     }
     if let Some(d) = target.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -253,10 +262,11 @@ fn fetch(cat: &Catalog, root: &Path, key: &str, f: &Value, from: &[PathBuf], ver
         }
         let _ = std::fs::remove_file(&target);
         if std::fs::hard_link(&src, &target).is_err() {
+            // another filesystem: a symbolic link, and the registry names the file itself
             std::os::unix::fs::symlink(&src, &target).map_err(|e| format!("{}: {e}", target.display()))?;
         }
         println!("  {key}: linked from {}", src.display());
-        return Ok(target);
+        return Ok(real(&target));
     }
     let part = target.with_file_name(format!("{name}.part"));
     let url = s(f, "url");
