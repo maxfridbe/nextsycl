@@ -31,9 +31,9 @@ int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const vo
 int ns_q35_attn_prompt_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t D);
 int ns_q35_attn_prompt(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
                        int64_t cap, int64_t p0, float* out);
-/* Decode attention (attn.cpp): 1..8 rows (each at its own position p0 + t), the same cache and output as above; a lane
- * a key for the scores, the keys split over ~512 work-groups, merged through `scratch` (ns_q35_attn_decode_scratch
- * floats; 0: none) */
+/* Decode attention (attn.cpp): 1..8 rows (each at its own position p0 + t), the same cache and output as above; the
+ * flash kernel on XMX with the keys split over ~512 work-groups, merged through `scratch` (ns_q35_attn_decode_scratch
+ * floats; 0: none); a row's result is the same whatever rows share its pass */
 int ns_q35_attn_decode_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t D);
 int64_t ns_q35_attn_decode_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0);
 int ns_q35_attn_decode(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
