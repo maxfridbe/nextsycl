@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# build.sh [kernels|rust|wfe|all|test|image]: builds in the oneAPI image (NS_IMAGE, default localhost/h3-build; ./build.sh
-# image makes localhost/nextsycl-build from container/Containerfile), so the host needs only podman. Output in dist/.
+# build.sh [kernels|rust|wfe|all|test|image]: builds in the oneAPI image (NS_IMAGE, default localhost/nextsycl-build:
+# ./build.sh image makes it from container/Containerfile, and the first build does when it is not there), so the
+# host needs only podman. Output in dist/.
 set -euo pipefail
 cd "$(dirname "$0")"
-IMAGE=${NS_IMAGE:-localhost/h3-build}
+# NS_IMAGE from the environment, else from nextsycl.conf (the program's settings file), else the default
+[ -z "${NS_IMAGE:-}" ] && [ -f nextsycl.conf ] && NS_IMAGE=$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?NS_IMAGE=["'"'"']\?\([^"'"'"']*\)["'"'"']\?[[:space:]]*$/\2/p' nextsycl.conf | head -1)
+IMAGE=${NS_IMAGE:-localhost/nextsycl-build}
 what=${1:-all}
+if [ "$what" != image ] && ! podman image exists "$IMAGE"; then
+  if [ -n "${NS_IMAGE:-}" ]; then echo "build.sh: no image $IMAGE (NS_IMAGE)"; exit 1; fi
+  echo "build.sh: no $IMAGE yet - building it first (./build.sh image; ~10 min and a ~9 GB base image)"
+  podman build -t "$IMAGE" container/
+fi
 run() { podman run --rm --security-opt label=disable -e AOT -e JOBS -e ONLY -e LINK_ANYWAY -v "$PWD:/src" -w /src \
           -e CARGO_HOME=/src/target/cargo-home -e NS_VERSION="${NS_VERSION:-$(./version.sh)}" "$IMAGE" bash -c "$1"; }
 case "$what" in

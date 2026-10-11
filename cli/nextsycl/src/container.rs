@@ -36,7 +36,7 @@ impl Ce {
             None if found("docker") => "docker".into(),
             None => return Err("need podman (or docker) on PATH".into()),
         };
-        Ok(Ce { bin, image: cfg.or("NS_IMAGE", "localhost/h3-build") })
+        Ok(Ce { bin, image: cfg.or("NS_IMAGE", "localhost/nextsycl-build") })
     }
 
     pub fn cmd(&self) -> Command {
@@ -56,7 +56,7 @@ impl Ce {
         if ok {
             Ok(())
         } else {
-            Err(format!("the image {} is not there (NS_IMAGE: an image with the oneAPI runtime, as ./build.sh uses)", self.image))
+            Err(format!("the image {} is not there (./build.sh image makes it; NS_IMAGE names another with the oneAPI runtime)", self.image))
         }
     }
 

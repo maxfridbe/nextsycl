@@ -28,7 +28,7 @@ pub const SETTINGS: &[Setting] = &[
     st("NS_REGISTRY", "box", "~/.config/nextsycl/models.json", "the model registry (nextsycl models)", &["serve", "switch", "studio", "llm", "image", "audio", "video"]),
     st("NS_MODEL_CARDS", "box", "model-cards beside the program, else in the repository", "the model cards: the models nextsycl models search | pull offer, their prompt guides", &["cli", "serve"]),
     st("NS_SOCKET_DIR", "box", "$XDG_RUNTIME_DIR/nextsycl", "where the control sockets live", &["serve", "llm", "video", "studio"]),
-    st("NS_IMAGE", "box", "localhost/h3-build", "the container image with the oneAPI runtime", &["llm", "image", "audio", "video"]),
+    st("NS_IMAGE", "box", "localhost/nextsycl-build", "the container image with the oneAPI runtime", &["llm", "image", "audio", "video"]),
     st("NS_CONTAINER_ENGINE", "box", "podman", "podman or docker", &["llm", "image", "audio", "video"]),
     st("NS_MOUNTS", "box", "", "more read-only directories for the containers, host:inside[,...]", &["llm"]),
     st("NS_CORS", "box", "", "web pages that may call the servers from a browser, beyond the loopback ones", &["llm", "image", "audio"]),

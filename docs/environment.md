@@ -24,7 +24,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NEXTSYCL_LIB` | the library beside the executable, else dist/ of the working directory | the kind's kernel library to load (a `libnextsycl-<kind>.so` path) | runtime (every kind) |
 | `NS_CONTAINER_ENGINE` | podman, else docker (whichever is on PATH) | the container program | cli (llm, image, audio, video start) |
 | `NS_DIST` | the program's own directory | dist/: where the program, the kernel libraries and wfe/ are looked for; nextsycl.conf is read from its parent | cli, serve |
-| `NS_IMAGE` | localhost/h3-build | the container image with the oneAPI runtime the servers run in; build.sh builds in it too | cli (llm, image, audio, video start), build (build.sh) |
+| `NS_IMAGE` | localhost/nextsycl-build (`./build.sh image`) | the container image with the oneAPI runtime the servers run in; build.sh builds in it too | cli (llm, image, audio, video start), build (build.sh) |
 | `NS_MODELS` | none (llm start fails: set it) | host directory with the model files, mounted as /models in the containers; `models pull` puts files there | cli (llm, image, audio, video start; models pull) |
 | `NS_MOUNTS` | none | more read-only mounts for the chat server's container, `host:inside[,...]` (another model folder, a draft layer, a profile) | cli (llm start) |
 | `NS_SILO` | silos on | 0: no model silo, every model on the shared kernels (the A/B for a silo) | runtime (every kind) |

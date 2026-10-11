@@ -127,7 +127,7 @@ settings (environment, or NAME=value lines in nextsycl.conf beside the repositor
   NS_PARALLEL      requests decoded together, each with a session of its own (default 2; 1 = one at a time)
   NS_MAX_TOKENS    the tokens a request without max_tokens may make (default: to the end of the context)
   NS_SOCKET_DIR    where the control socket lives (default $XDG_RUNTIME_DIR/nextsycl)
-  NS_IMAGE, NS_CONTAINER_ENGINE   the image with the oneAPI runtime (localhost/h3-build) and podman / docker
+  NS_IMAGE, NS_CONTAINER_ENGINE   the image with the oneAPI runtime (localhost/nextsycl-build: ./build.sh image) and podman / docker
   NS_MOUNTS        more read-only directories for the container, host:inside[,host:inside] (another model folder, ...)
   NS_QW_*          the qwen4exp engine's settings, passed to the server (docs/engines.md): NS_QW_MTP (the draft
                    layer), NS_QW_EXPERT_PROFILE, NS_QW_CVEC / _LAYERS / _MODE / _DIR (a control vector), NS_QW_CHUNK";
