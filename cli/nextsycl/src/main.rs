@@ -863,6 +863,16 @@ fn main() -> ExitCode {
     // every --opt-NAME [VALUE]: the engine's own options, checked and forwarded where it loads (nextsycl_core::options)
     let _ = ENGINE_OPTS.set(nextsycl_core::options::given(&args));
     let cfg = config::Config::load();
+    // a command that runs the kernels here, on a host without oneAPI: the same command inside the image
+    if let Some(r) = container::rerun_in_image(&cfg, &args) {
+        return match r {
+            Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+            Err(e) => {
+                eprintln!("nextsycl: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let _ = client::SERVER.set(http::Target::Unix(cfg.socket()));
     let rest = args.get(1..).unwrap_or(&[]);
     let r = match args.first().map(String::as_str) {

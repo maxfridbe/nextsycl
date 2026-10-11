@@ -25,6 +25,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_CONTAINER_ENGINE` | podman, else docker (whichever is on PATH) | the container program | cli (llm, image, audio, video start) |
 | `NS_DIST` | the program's own directory | dist/: where the program, the kernel libraries and wfe/ are looked for; nextsycl.conf is read from its parent | cli, serve |
 | `NS_IMAGE` | localhost/nextsycl-build (`./build.sh image`) | the container image with the oneAPI runtime the servers run in; build.sh builds in it too | cli (llm, image, audio, video start), build (build.sh) |
+| `NS_IN_IMAGE` | unset | set inside the image when the program re-runs a GPU command there (a host without oneAPI: `gpus`, `llm generate`, the selftests ...); set, the command runs in this process | cli |
 | `NS_MODELS` | none (llm start fails: set it) | host directory with the model files, mounted as /models in the containers; `models pull` puts files there | cli (llm, image, audio, video start; models pull) |
 | `NS_MOUNTS` | none | more read-only mounts for the chat server's container, `host:inside[,...]` (another model folder, a draft layer, a profile) | cli (llm start) |
 | `NS_SILO` | silos on | 0: no model silo, every model on the shared kernels (the A/B for a silo) | runtime (every kind) |
@@ -400,6 +401,7 @@ Read by `build.sh`, `kernels/build.sh`, `wfe/build.sh` and the scripts beside th
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
+| `ONEAPI_DEVICE_SELECTOR` | level_zero:* when the program re-runs a command in the image | which devices the SYCL runtime offers (oneAPI's own variable) | cli, the oneAPI runtime |
 | `HOME` | /tmp | the base of the default paths (~/.config/nextsycl.conf, the registry, the output and cache directories) | cli, serve, models |
 | `USER` | empty | whose processes `restart` looks for (pgrep -u) | serve |
 | `XDG_RUNTIME_DIR` | /tmp | the base of the socket directory (nextsycl/) and the front door's run logs (nextsycl-serve/) | cli, serve |
