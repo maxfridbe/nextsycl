@@ -81,6 +81,8 @@ inline void k4_head(const void* b, int sb, float& dl, float& ml, float& dh, floa
 struct WideQ4K {
     using Block = Q4KBlock;
     static constexpr bool SPLIT = true;   // reads the split activations (B70: 1 column +4-8%, 4 columns +8%)
+    static constexpr int ROWS_MULTI = 1;  // rows a sub-group at 3-4 columns (with the precomputed sums one wins: 4 columns
+                                          // 419 / 398 / 416 GB/s against two rows' 410 / 356 / 395)
     static constexpr int ROWS = 1;   // with the head load: 1 row 507/470/488 GB/s, 2 rows 490/411/466 (before it 2 rows won)
     static constexpr int LUT = 0;
     static uint32_t lut(int) { return 0; }
@@ -111,6 +113,7 @@ struct WideQ4K {
 struct WideQ5K {
     using Block = Q5KBlock;
     static constexpr bool SPLIT = true;
+    static constexpr int ROWS_MULTI = 1;  // 4 columns: 478 / 442 / 458 against 439 / 369 / 421
     static constexpr int ROWS = 1;   // 2 rows: 484 against 525 (the high bits' arithmetic twice)
     static constexpr int LUT = 0;
     static uint32_t lut(int) { return 0; }
@@ -147,6 +150,7 @@ inline void iq4_tab4(const uint32_t* tab, uint32_t v, int& lo, int& hi) {
 struct WideIQ4XS {
     using Block = IQ4XSBlock;
     static constexpr bool SPLIT = true;
+    static constexpr int ROWS_MULTI = 2;  // 4 columns: 434 / 416 / 425 against one row's 395 / 410 / 382
     static constexpr int ROWS = 1;   // 2 rows: 454 against 481
     static constexpr int LUT = 256;
     static uint32_t lut(int i) { return iq4_tab_entry(i); }
@@ -178,6 +182,7 @@ struct WideIQ4XS {
 struct WideQ3K {
     using Block = Q3KBlock;
     static constexpr bool SPLIT = false;   // the standard blocks: the split layout measured 7-9% slower here
+    static constexpr int ROWS_MULTI = 2;
     static constexpr int ROWS = 1;   // 1 row 381/357/367 GB/s, 2 rows 384/310/363
     static constexpr int LUT = 0;
     static uint32_t lut(int) { return 0; }
@@ -225,6 +230,7 @@ inline uint32_t sign_mask4(uint32_t b) { return ((b * 0x00204081u) & 0x01010101u
 struct WideIQ3S {
     using Block = block_iq3_s;
     static constexpr bool SPLIT = false;   // the standard blocks (split: 7% slower at one column)
+    static constexpr int ROWS_MULTI = 2;
     static constexpr int ROWS = 1;
     static constexpr int LUT = 512 + 16;   // the grid, then the 16 sign masks of four bits (32-bit multiplies are slow)
     static uint32_t lut(int i) { return i < 512 ? iq3s_grid[i] : sign_mask4(uint32_t(i - 512)); }
@@ -344,7 +350,7 @@ void wide(sycl::queue& q, const void* w, const void* xq, const void* x, float* y
     // past 4 columns two rows would hold 2 x 8 accumulators and 8 activation sets: one row there; 3-4 columns (a
     // verify pass) two rows sharing each lane's activations (B70, 4 columns, GB/s: Q4_K 270 -> 344, IQ4_XS 331 -> 406,
     // Q5_K 316 -> 377; at 2 columns it is mixed). Rows never change a column's arithmetic: verify rows stay exact.
-    const int r = ncols > 4 ? 1 : rows_override() ? rows_override() : ncols >= 3 ? 2 : F::ROWS;
+    const int r = ncols > 4 ? 1 : rows_override() ? rows_override() : ncols >= 3 ? F::ROWS_MULTI : F::ROWS;
     if (r >= 4) launch_cols<F, 4>(q, w, xq, x, y, n_in, n_out, ncols);
     else if (r == 2) launch_cols<F, 2>(q, w, xq, x, y, n_in, n_out, ncols);
     else launch_cols<F, 1>(q, w, xq, x, y, n_in, n_out, ncols);
