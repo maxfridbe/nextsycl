@@ -170,6 +170,9 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 
 ## Quick start
 
+New to it, on an Arc Pro B70? [B70_Startup_guide.md](B70_Startup_guide.md) goes from a fresh clone to chat,
+pictures, speech, songs and video, with what each step takes.
+
 ```sh
 ./build.sh                          # the kernel libraries and the program, in a container with oneAPI (podman)
 echo "NS_MODELS=$HOME/models" > nextsycl.conf
@@ -973,6 +976,7 @@ artifact.
 
 ## Docs
 
+- `B70_Startup_guide.md`: installing on an Arc Pro B70, step by step, as run on a fresh clone (times and outputs).
 - `docs/architecture.md`: the layout - the foundation crates, each kind's contract and engines (`<kind>/<arch>`, their
   kernels in `kernels/<kind>/<arch>`), the glue, the program - its rules, and the engines' settings.
 - `docs/environment.md`: every environment variable and nextsycl.conf setting - its default, what it does, what reads it.

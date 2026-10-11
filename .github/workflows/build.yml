@@ -70,8 +70,10 @@ jobs:
         run: |
           name="nextsycl-$NS_VERSION-linux-x86_64"
           mkdir -p "pkg/$name"
-          cp dist/nextsycl dist/libnextsycl-*.so kernels/ns/ns.h README.md CONTRIBUTING.md "pkg/$name/"
-          cp -r model-cards "pkg/$name/"
+          cp dist/nextsycl dist/libnextsycl-*.so kernels/ns/ns.h README.md CONTRIBUTING.md B70_Startup_guide.md "pkg/$name/"
+          # the diffusion kernels' oneDNN, the models' silos (the 27B's cards require theirs), the web pages, the cards
+          cp -a dist/libdnnl.so* "pkg/$name/"
+          cp -r dist/silo dist/wfe model-cards "pkg/$name/"
           ln -s libnextsycl-llm.so "pkg/$name/libnextsycl.so"
           cp -r docs "pkg/$name/"
           echo "$NS_VERSION" > "pkg/$name/VERSION"
