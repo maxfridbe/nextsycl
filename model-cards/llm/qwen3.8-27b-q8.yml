@@ -10,6 +10,9 @@ ctx: '32768'
 tools: true
 tasks: true
 env: {}
+silo:                   # its tuned kernels: kernels/llm/qwen35/silo (dist/silo/libnextsycl-qwen35.so)
+  name: qwen35
+  required: true        # no load on the shared kernels alone (2-4x slower decode)
 files:
   model:
     key: q27-q8

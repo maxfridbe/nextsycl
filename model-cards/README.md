@@ -19,6 +19,9 @@ ctx: 131072,32768               # llm: each session's context
 tools: true                     # llm: tool calls offered to it (false: dropped)
 tasks: true                     # llm: a front end's background tasks (titles, tags) accepted
 env: {}                         # settings its engine reads; '{role}' is that file's path once pulled
+silo:                           # its tuned kernels (CONTRIBUTING rule 5): kernels/<kind>/<name>/silo, built as
+  name: qwen35                  #   dist/silo/libnextsycl-<name>.so (default: the architecture's own, when built)
+  required: true                # no load without it (default false: the shared kernels for what it lacks)
 files:                          # by role: a file defined here, or another card's file by its key
   model:
     key: q27-q4                 # the file's id among all cards (a file is downloaded once, defined once)
@@ -29,6 +32,10 @@ files:                          # by role: a file defined here, or another card'
   mtp: q27-mtp                  # defined in qwen3.8-27b-q8.yml
 guide: guides/chat.md           # how to prompt it (Markdown, relative to this folder)
 ```
+
+`silo` also takes a name alone (`silo: qwen35`) or `none` (the shared kernels only); without it a model runs on its
+architecture's silo when one is built. `nextsycl models search` shows each model's (`-`: the shared kernels). The
+registry entry carries it as the loader's settings (`NS_SILO_NAME`, `NS_SILO_REQUIRED`, `NS_SILO=0`).
 
 Other keys: `local` (role: what it is - a part made on the machine rather than downloaded, found in nextsycl.conf
 or another registry entry), `base` (a lora: the model it rides on), `defaults` (image / video / audio: the

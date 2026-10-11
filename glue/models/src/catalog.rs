@@ -157,7 +157,7 @@ fn gib(b: u64) -> f64 {
 pub fn search(cfg: &Config, installed: &[Value], text: Option<&str>, kind: Option<&str>) -> Result<(), String> {
     let cat = Catalog::load(cfg)?;
     let want = text.map(str::to_lowercase);
-    println!("{:<44} {:<6} {:>8}  {:<6} {:<10} TITLE", "ID", "KIND", "SIZE", "GPUS", "INSTALLED");
+    println!("{:<44} {:<6} {:>8}  {:<6} {:<10} {:<18} TITLE", "ID", "KIND", "SIZE", "GPUS", "INSTALLED", "SILO");
     for m in &cat.models {
         let id = s(m, "id");
         if kind.is_some_and(|k| s(m, "kind") != k) {
@@ -170,9 +170,26 @@ pub fn search(cfg: &Config, installed: &[Value], text: Option<&str>, kind: Optio
             }
         }
         let have = if installed.iter().any(|x| x["id"] == id.as_str()) { "yes" } else { "-" };
-        println!("{:<44} {:<6} {:>7.1}G  {:<6} {:<10} {}", id, s(m, "kind"), gib(cat.bytes(m)), s(m, "gpus"), have, s(m, "title"));
+        println!("{:<44} {:<6} {:>7.1}G  {:<6} {:<10} {:<18} {}", id, s(m, "kind"), gib(cat.bytes(m)), s(m, "gpus"), have, silo_of(cfg, m), s(m, "title"));
     }
     Ok(())
+}
+
+/// The silo a card's model runs on (its tuned kernels: dist/silo/libnextsycl-<name>.so): its card's `silo`, else its
+/// architecture's when one is built; `-` the shared kernels; "(not built)" a silo the card names that is not there
+pub fn silo_of(cfg: &Config, m: &Value) -> String {
+    if m["silo"] == "none" {
+        return "-".into();
+    }
+    let named = m["silo"].as_str().or_else(|| m["silo"]["name"].as_str()).map(str::to_string);
+    let name = named.clone().unwrap_or_else(|| s(m, "arch"));
+    let built = cfg.dist.join("silo").join(format!("libnextsycl-{name}.so")).exists();
+    match (built, named.is_some(), m["silo"]["required"] == true) {
+        (true, _, true) => format!("{name} (required)"),
+        (true, _, false) => name,
+        (false, true, _) => format!("{name} (not built)"),
+        (false, false, _) => "-".into(),
+    }
 }
 
 /// A file's SHA-256, hex, reading it once
@@ -341,6 +358,18 @@ fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeMap<String, 
             env.insert(k.clone(), Value::String(x));
         }
     }
+    // the card's silo as the settings the kernel loader reads: `none` the shared kernels only, another name that silo,
+    // `required` no load without it
+    if m["silo"] == "none" {
+        env.insert("NS_SILO".into(), json!("0"));
+    } else {
+        if let Some(n) = m["silo"].as_str().or_else(|| m["silo"]["name"].as_str()).filter(|n| *n != s(m, "arch")) {
+            env.insert("NS_SILO_NAME".into(), json!(n));
+        }
+        if m["silo"]["required"] == true {
+            env.insert("NS_SILO_REQUIRED".into(), json!("1"));
+        }
+    }
     let main = ["model", "transformer", "denoiser", "lora"].iter().find_map(|r| paths.get(*r)).or_else(|| paths.values().next());
     let files: Map<String, Value> = paths.iter().map(|(r, p)| (r.clone(), Value::String(p.to_string_lossy().into_owned()))).collect();
     let mut e = json!({
@@ -349,7 +378,7 @@ fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeMap<String, 
         "files": files, "gpus": m.get("gpus").cloned().unwrap_or(json!("0")), "env": env, "enabled": true,
         "catalog": m["id"],
     });
-    for k in ["ctx", "tools", "tasks", "base", "defaults", "speech"] {
+    for k in ["ctx", "tools", "tasks", "base", "defaults", "speech", "silo"] {
         if let Some(v) = m.get(k) {
             e[k] = v.clone();
         }
@@ -373,7 +402,16 @@ pub fn pull(cfg: &Config, installed: &[Value], ids: &[String], raw: &[String]) -
     let cat = Catalog::load(cfg)?;
     let opt = |k: &str| raw.iter().position(|a| a == k).and_then(|i| raw.get(i + 1)).cloned();
     let root = PathBuf::from(opt("--dir").or_else(|| cfg.get("NS_MODELS")).ok_or("set NS_MODELS (where models go) or pass --dir DIR")?);
-    let from: Vec<PathBuf> = raw.iter().enumerate().filter(|(_, a)| *a == "--from").filter_map(|(i, _)| raw.get(i + 1)).map(PathBuf::from).collect();
+    let mut from: Vec<PathBuf> = raw.iter().enumerate().filter(|(_, a)| *a == "--from").filter_map(|(i, _)| raw.get(i + 1)).map(PathBuf::from).collect();
+    // and where the registered models' files already are (a model pulled again in another form - its files are
+    // linked from there, not downloaded or copied again)
+    for e in installed {
+        for p in e["files"].as_object().into_iter().flatten().filter_map(|(_, p)| p.as_str()).chain(e["file"].as_str()) {
+            if let Some(d) = Path::new(p).parent().filter(|d| d.is_dir() && !from.iter().any(|f| f == d)) {
+                from.push(d.to_path_buf());
+            }
+        }
+    }
     let verify = raw.iter().any(|a| a == "--verify");
     let mut out = Vec::new();
     for id in ids {
@@ -426,6 +464,11 @@ mod tests {
             if s(m, "kind") != "lora" {
                 assert!(cat.dir.join(s(m, "guide")).is_file(), "{id}: its guide {}", s(m, "guide"));
             }
+            // a silo the card names is a kernels/<kind>/<name>/silo of the repository
+            if let Some(n) = m["silo"].as_str().or_else(|| m["silo"]["name"].as_str()).filter(|n| *n != "none") {
+                let kind = if s(m, "kind") == "lora" { "image".to_string() } else { s(m, "kind") };
+                assert!(cat.dir.join(format!("../kernels/{kind}/{n}/silo")).is_dir(), "{id}: no silo kernels/{kind}/{n}/silo");
+            }
             // every {role} in a setting is a file or a local part of the model
             for v in m["env"].as_object().into_iter().flatten().filter_map(|(_, v)| v.as_str()) {
                 if let (Some(a), Some(b)) = (v.find('{'), v.find('}')) {
@@ -443,6 +486,15 @@ mod tests {
         assert_eq!(tts, std::fs::read_to_string(cat.dir.join("guides/qwen3-tts.md")).unwrap());
         let chat = cat.guide(&json!({"id": "mine", "kind": "llm", "arch": "new"})).unwrap();
         assert_eq!(chat, std::fs::read_to_string(cat.dir.join("guides/chat.md")).unwrap());
+    }
+
+    #[test]
+    fn a_cards_silo_becomes_the_loaders_settings() {
+        let e = |silo: Value| entry(&json!({"id": "x", "kind": "llm", "arch": "a", "title": "X", "silo": silo}), &BTreeMap::new(), &BTreeMap::new());
+        assert_eq!(e(json!({"name": "a", "required": true}))["env"], json!({"NS_SILO_REQUIRED": "1"}));
+        assert_eq!(e(json!("b"))["env"], json!({"NS_SILO_NAME": "b"}));
+        assert_eq!(e(json!("none"))["env"], json!({"NS_SILO": "0"}));
+        assert_eq!(e(Value::Null)["env"], json!({}));
     }
 
     #[test]

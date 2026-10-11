@@ -28,6 +28,8 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_MODELS` | none (llm start fails: set it) | host directory with the model files, mounted as /models in the containers; `models pull` puts files there | cli (llm, image, audio, video start; models pull) |
 | `NS_MOUNTS` | none | more read-only mounts for the chat server's container, `host:inside[,...]` (another model folder, a draft layer, a profile) | cli (llm start) |
 | `NS_SILO` | silos on | 0: no model silo, every model on the shared kernels (the A/B for a silo) | runtime (every kind) |
+| `NS_SILO_NAME` | the architecture's own | another silo of the engine's ABI to load (dist/silo/libnextsycl-<name>.so) - a model card's `silo.name` | runtime (every kind) |
+| `NS_SILO_REQUIRED` | 0 | 1: refuse to load when the silo is not built (no fall back to the shared kernels) - a model card's `silo.required` | runtime (every kind) |
 | `NS_SILO_DIR` | silo/ beside the kind's kernel library | directory holding the silos (`libnextsycl-<arch>.so`) | runtime (every kind) |
 | `NS_SOCKET_DIR` | $XDG_RUNTIME_DIR/nextsycl (serve's pid and marker files: /tmp) | where the control sockets live (mounted into the containers) | cli, serve, llm, video, studio |
 

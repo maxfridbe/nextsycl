@@ -146,10 +146,17 @@ impl Api {
         if std::env::var("NS_SILO").is_ok_and(|v| v == "0") {
             return Ok(None);
         }
+        // a model card's silo: NS_SILO_NAME another silo of this engine's ABI (default: the architecture's own),
+        // NS_SILO_REQUIRED=1 no load without it (not the shared kernels)
+        let name = std::env::var("NS_SILO_NAME").ok().filter(|n| !n.is_empty()).unwrap_or_else(|| arch.to_string());
+        let required = std::env::var("NS_SILO_REQUIRED").is_ok_and(|v| v == "1");
         let dir = std::env::var_os("NS_SILO_DIR").map(PathBuf::from)
                                                   .unwrap_or_else(|| self.path.parent().unwrap_or(Path::new(".")).join("silo"));
-        let path = dir.join(format!("libnextsycl-{arch}.so"));
+        let path = dir.join(format!("libnextsycl-{name}.so"));
         if !path.exists() {
+            if required {
+                return Err(format!("{}: the model's silo is not built (NS_SILO_REQUIRED=1; kernels/build.sh builds the silos)", path.display()));
+            }
             return Ok(None);
         }
         let c = CString::new(path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
