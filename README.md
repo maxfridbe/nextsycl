@@ -694,14 +694,14 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   0.99993 or better, the final norm 0.99993, the same next token at the same logit; decoding the last token alone
   after the rest agrees with the whole prompt at once (0.99997). The greedy continuation of a prompt agrees with
   llama.cpp's until two candidates sit within 1% of each other.
-- **Speed** (one B70, 2026-10-11; `llm generate --ids` of the benchy v1 prompts, 128 greedy tokens, MTP on - the
+- **Speed** (one B70, 2026-10-11, 1fecf2b; `llm generate --ids` of the benchy v1 prompts, 128 greedy tokens, MTP on - the
   default), prompt read / decode, tokens/s:
 
   | File | 20 | 2,185 | 8,000 | 40,000 | 2,185 without MTP |
   |---|---:|---:|---:|---:|---:|
-  | Q8_0 | 35 / 47.5 | 978 / 42.6 | 918 / 35.9 | (32K context) | 1,132 / 18.5 |
-  | UD-Q4_K_M | 60 / 59.6 | 1,136 / 54.0 | 1,075 / 48.8 | 502 / 36.1 | 1,151 / 27.3 |
-  | UD-Q3_K_XL | 60 / 61.3 | 1,134 / 55.7 | 1,073 / 53.1 | 502 / 34.0 | 1,150 / 29.1 |
+  | Q8_0 | 57 / 42.9 | 1,014 / 44.9 | 1,044 / 39.9 | (32K context) | 1,178 / 18.5 |
+  | UD-Q4_K_M | 60 / 59.5 | 1,184 / 57.4 | 1,245 / 55.6 | 772 / 46.9 | 1,195 / 27.3 |
+  | UD-Q3_K_XL | 60 / 55.1 | 1,180 / 58.9 | 1,243 / 57.3 | 772 / 48.5 | 1,193 / 29.0 |
 
   A coding answer (400 tokens) decodes at 61 tok/s on UD-Q4_K_M and UD-Q3_K_XL. 84-89% of the drafts are accepted;
   prompts read a little slower with MTP (the draft block follows every pass; Q8_0's chunks are 1,024 rows beside it).
