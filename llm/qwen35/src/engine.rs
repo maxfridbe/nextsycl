@@ -288,10 +288,27 @@ fn mtp_path(f: &Gguf) -> Option<std::path::PathBuf> {
     v.into_iter().next()
 }
 
+/// One GPU's share: its layers [lb, le), a prompt chunk's work memory and the half buffer its products expand into
+struct Dev {
+    gpu: Arc<Gpu>,
+    arena: Arena,
+    /// the largest matrix expanded to half (a prompt chunk's products)
+    w16: DevBuf,
+    lb: usize,
+    le: usize,
+}
+
 pub struct Qwen35<'g> {
     pub g: Geometry,
     file: &'g Gguf,
-    gpu: Arc<Gpu>,
+    /// the GPUs in layer order (the first embeds, the last holds the head and the draft block)
+    devs: Vec<Dev>,
+    /// each layer's GPU (an index into devs)
+    layer_dev: Vec<usize>,
+    /// the GPU the kernels go to now (set under `work`: a pass walks the GPUs in order)
+    cur: std::sync::atomic::AtomicUsize,
+    /// host memory a pass's rows cross between GPUs through
+    staging: Mutex<Vec<u8>>,
     k: &'static ffi::Api,
     /// the silo's tuned kernels (kernels/llm/qwen35/silo), None: the shared ones throughout
     silo: Option<&'static ffi::Silo>,
@@ -302,9 +319,6 @@ pub struct Qwen35<'g> {
     embd: Tensor,
     /// the rows a forward pass takes at most
     chunk: usize,
-    arena: Arena,
-    /// the largest matrix expanded to half (a prompt chunk's products)
-    w16: DevBuf,
     work: Mutex<()>,
     /// the draft block (loaded with drafts on and its file found)
     mtp: Option<Mtp>,
@@ -336,11 +350,14 @@ fn arena_bytes(g: &Geometry, chunk: usize) -> usize {
 const SESSION_ROOM: u64 = 5 << 29;
 
 impl<'g> Qwen35<'g> {
-    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], draft: bool, log: &mut dyn FnMut(String)) -> Result<Qwen35<'g>> {
+    /// Loads the model over `gpus` in order: with one GPU all of it there; with more, the layers split so each GPU keeps
+    /// the same share of its memory free for the sessions (NS_SPLIT: the first layer of each GPU after the first), the
+    /// head and the draft block on the last. `kv`: the context the sessions reserve (tokens in all; 0: 32K) - a split
+    /// plans their caches on the GPUs of their layers.
+    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], draft: bool, kv: (usize, usize), log: &mut dyn FnMut(String)) -> Result<Qwen35<'g>> {
         let t0 = Instant::now();
-        let gpu = gpus.first().cloned().ok_or_else(|| e("no GPU"))?;
-        if gpus.len() > 1 {
-            log(format!("qwen35: one GPU ({}); the others are not used", gpu.name));
+        if gpus.is_empty() {
+            return Err(e("no GPU"));
         }
         let g = Geometry::read(f).map_err(e)?;
         let k = ffi::api()?;
@@ -353,9 +370,17 @@ impl<'g> Qwen35<'g> {
         // no out-of-memory error: past the card it spills to host memory)
         let embd = f.tensor("token_embd.weight").ok_or_else(|| e("no token_embd.weight"))?.clone();
         let weights: u64 = f.tensors.iter().filter(|t| t.name != "token_embd.weight" && !t.name.starts_with(&format!("blk.{}.", g.layers))).map(|t| t.bytes).sum();
+        let layer_w: Vec<u64> = (0..g.layers).map(|l| {
+            let p = format!("blk.{l}.");
+            f.tensors.iter().filter(|t| t.name.starts_with(&p)).map(|t| t.bytes).sum()
+        }).collect();
+        let head_w = weights - layer_w.iter().sum::<u64>();
         let w16_bytes = [g.n_ff * g.n_embd, g.heads * 2 * g.head * g.n_embd, g.conv_dim() * g.n_embd].into_iter().max().unwrap_or(0) * 2;
-        let (total, free) = gpu.memory()?;
-        let free = free.unwrap_or(total);
+        let mut free = Vec::with_capacity(gpus.len());
+        for gpu in gpus {
+            let (total, fr) = gpu.memory()?;
+            free.push(fr.unwrap_or(total));
+        }
         // the prompt chunk: 2,048 rows (each matrix expanded to half once for them: 8K prompts 760 -> 1,100 tok/s against
         // 512) when they leave room for a session, else 1,024, else 512
         // the draft block: its file's tensors but its token embedding (rows read from the file), its snapshots
@@ -370,24 +395,128 @@ impl<'g> Qwen35<'g> {
             },
             None => None,
         };
-        let snap_bytes = (g.layers - (0..g.layers).filter(|l| g.full(*l)).count()) * drafts * (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4;
-        let mtp_bytes = mfile.as_ref().map_or(0, |m| m.tensors.iter().filter(|t| t.name != "token_embd.weight").map(|t| t.bytes).sum::<u64>() + snap_bytes as u64);
-        let fixed = weights + mtp_bytes + w16_bytes as u64 + (1536 << 20);
-        let chunk = chunk_setting().unwrap_or_else(|| {
-            [2048, 1024].into_iter().find(|c| fixed + arena_bytes(&g, *c) as u64 + SESSION_ROOM <= free).unwrap_or(512)
-        });
+        let lin_state = (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4;
+        let snap_bytes = (g.layers - (0..g.layers).filter(|l| g.full(*l)).count()) * drafts * lin_state;
+        let mtp_w = mfile.as_ref().map_or(0, |m| m.tensors.iter().filter(|t| t.name != "token_embd.weight").map(|t| t.bytes).sum::<u64>());
+        let mtp_bytes = mtp_w + if mfile.is_some() { snap_bytes as u64 } else { 0 };
+        let margin: u64 = 1536 << 20;
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         // the draft block's pass behind a chunk's: its inputs and outputs beside the main pass's
-        let arena_bytes = arena_bytes(&g, chunk) + if mfile.is_some() { chunk * 8 * g.n_embd * 4 } else { 0 };
-        let need = fixed + arena_bytes as u64;
-        if need > free {
-            return Err(e(format!("{} needs about {:.1} GiB on {} ({:.1} GiB of weights); {:.1} GiB are free", f.architecture(),
-                                 need as f64 / (1u64 << 30) as f64, gpu.name, weights as f64 / (1u64 << 30) as f64, free as f64 / (1u64 << 30) as f64)));
+        let has_mtp = mfile.is_some();
+        let arena_of = |c: usize| arena_bytes(&g, c) + if has_mtp { c * 8 * g.n_embd * 4 } else { 0 };
+        let (chunk, bounds) = if gpus.len() == 1 {
+            let fixed = weights + mtp_bytes + w16_bytes as u64 + margin;
+            let chunk = chunk_setting().unwrap_or_else(|| {
+                [2048, 1024].into_iter().find(|c| fixed + arena_bytes(&g, *c) as u64 + SESSION_ROOM <= free[0]).unwrap_or(512)
+            });
+            let need = fixed + arena_of(chunk) as u64;
+            if need > free[0] {
+                return Err(e(format!("{} needs about {:.1} GiB on {} ({:.1} GiB of weights); {:.1} GiB are free", f.architecture(), gib(need),
+                                     gpus[0].name, gib(weights), gib(free[0]))));
+            }
+            (chunk, vec![(0, g.layers)])
+        } else {
+            // a layer's cost where it lands: its weights, its cache for the planned context (full attention) or its
+            // state and verify snapshots (DeltaNet)
+            let ctx = if kv.0 > 0 { kv.0 } else { 32768 };
+            let mtp_on = has_mtp;
+            let cost: Vec<u64> = (0..g.layers).map(|l| layer_w[l] + if g.full(l) { (2 * g.heads_kv * ctx * g.head * 2) as u64 } else {
+                (lin_state * (1 + if mtp_on { drafts } else { 0 })) as u64
+            }).collect();
+            let split_env: Option<Vec<usize>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+            let plan = |c: usize| -> std::result::Result<Vec<(usize, usize)>, String> {
+                let n = gpus.len();
+                // what each GPU has for layers: its free memory less the spare, its half buffer and work memory; the
+                // last's less the head and the draft block (its weights, its cache)
+                let room: Vec<i64> = (0..n).map(|i| {
+                    // (and 512 MiB the plan does not see: the allocator's rounding, small buffers)
+                    let mut over = margin + (512 << 20) + w16_bytes as u64 + arena_of(c) as u64;
+                    if i + 1 == n {
+                        over += head_w + if mtp_on { mtp_w + (2 * g.heads_kv * ctx * g.head * 2) as u64 } else { 0 };
+                    }
+                    free[i] as i64 - over as i64
+                }).collect();
+                let mut bounds = Vec::with_capacity(n);
+                if let Some(sp) = &split_env {
+                    let mut lb = 0;
+                    for i in 0..n {
+                        let le = if i + 1 == n { g.layers } else { *sp.get(i).ok_or("NS_SPLIT: a first layer for each GPU after the first")? };
+                        bounds.push((lb, le.min(g.layers)));
+                        lb = le.min(g.layers);
+                    }
+                } else {
+                    // the last GPU first (the one that computes most: the server orders them weakest first), then each
+                    // before it: each takes the last layers left while they fit; the first the rest. A GPU the layers
+                    // do not reach is not used (a B70 runs a layer ~1.5x faster than a B65: no layer goes to the slower
+                    // card while the faster one has room)
+                    let mut le = g.layers;
+                    let mut rev = Vec::with_capacity(n);
+                    for i in (0..n).rev() {
+                        let mut lb = le;
+                        if i == 0 {
+                            lb = 0;
+                        } else {
+                            let mut have = room[i];
+                            while lb > 0 && cost[lb - 1] as i64 <= have {
+                                have -= cost[lb - 1] as i64;
+                                lb -= 1;
+                            }
+                        }
+                        rev.push((lb, le));
+                        le = lb;
+                    }
+                    rev.reverse();
+                    bounds = rev;
+                }
+                for (i, &(lb, le)) in bounds.iter().enumerate() {
+                    let need: u64 = cost[lb..le].iter().sum();
+                    if le <= lb {
+                        // a GPU before the last with no layers left for it is dropped (`load`)
+                        if i + 1 < n && split_env.is_none() {
+                            continue;
+                        }
+                        return Err(format!("{} gets no layers", gpus[i].name));
+                    }
+                    if need as i64 > room[i] {
+                        return Err(format!("layers {lb}-{} need {:.1} GiB on {}; {:.1} GiB are left for them", le - 1, gib(need), gpus[i].name,
+                                           gib(room[i].max(0) as u64)));
+                    }
+                }
+                Ok(bounds)
+            };
+            let tries: Vec<usize> = chunk_setting().map_or_else(|| vec![2048, 1024, 512], |c| vec![c]);
+            let mut last_err = String::new();
+            let mut found = None;
+            for c in tries {
+                match plan(c) {
+                    Ok(b) => {
+                        found = Some((c, b));
+                        break;
+                    }
+                    Err(x) => last_err = x,
+                }
+            }
+            found.ok_or_else(|| e(format!("{} over {} GPUs at a {ctx}-token context: {last_err}", f.architecture(), gpus.len())))?
+        };
+        let given = gpus.len();
+        let (gpus, bounds): (Vec<Arc<Gpu>>, Vec<(usize, usize)>) = gpus.iter().cloned().zip(bounds).filter(|(_, b)| b.1 > b.0).unzip();
+        if gpus.len() < given {
+            log(format!("qwen35: all of it fits {}: {} of the {given} GPUs not used", gpus.iter().map(|g| g.name.clone()).collect::<Vec<_>>().join(" + "),
+                        given - gpus.len()));
         }
+        let mut layer_dev = vec![0usize; g.layers];
+        for (i, &(lb, le)) in bounds.iter().enumerate() {
+            for d in &mut layer_dev[lb..le] {
+                *d = i;
+            }
+        }
+        let lastg = gpus[gpus.len() - 1].clone();
         let mut loaded = 0u64;
         let mut layers = Vec::with_capacity(g.layers);
         for l in 0..g.layers {
+            let gpu = &gpus[layer_dev[l]];
             let n = |s: &str| format!("blk.{l}.{s}.weight");
-            let mut read = |name: &str| -> Result<Mat> { vec_mat(f, &gpu, k, name, &mut loaded) };
+            let mut read = |name: &str| -> Result<Mat> { vec_mat(f, gpu, k, name, &mut loaded) };
             let full = if g.full(l) {
                 Some(Full { q: read(&n("attn_q"))?, k: read(&n("attn_k"))?, v: read(&n("attn_v"))?, o: read(&n("attn_output"))?,
                             q_norm: read(&n("attn_q_norm"))?.buf, k_norm: read(&n("attn_k_norm"))?.buf })
@@ -428,24 +557,25 @@ impl<'g> Qwen35<'g> {
             if let Some(a) = ly.linear.as_mut() {
                 if a.alpha.ty == a.beta.ty && a.alpha.cols == a.beta.cols && a.alpha.ty != GType::F32 {
                     let (na, nb) = (a.alpha.buf.len, a.beta.buf.len);
-                    let buf = DevBuf::new(&gpu, na + nb)?;
+                    let buf = DevBuf::new(&a.alpha.buf.gpu().clone(), na + nb)?;
                     buf.copy_within(0, &a.alpha.buf, 0, na)?;
                     buf.copy_within(na, &a.beta.buf, 0, nb)?;
                     a.ab = Some(Mat { buf, ty: a.alpha.ty, rows: a.alpha.rows + a.beta.rows, cols: a.alpha.cols });
                 }
             }
         }
-        let output_norm = vec_mat(f, &gpu, k, "output_norm.weight", &mut loaded)?.buf;
-        let output = vec_mat(f, &gpu, k, if f.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" }, &mut loaded)?;
+        let output_norm = vec_mat(f, &lastg, k, "output_norm.weight", &mut loaded)?.buf;
+        let output = vec_mat(f, &lastg, k, if f.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" }, &mut loaded)?;
         let mtp = match mfile {
-            Some(m) => Some(load_mtp(m, &g, &gpu, k, &mut loaded)?),
+            Some(m) => Some(load_mtp(m, &g, &lastg, k, &mut loaded)?),
             None => None,
         };
         let drafts = if mtp.is_some() { drafts } else { 0 };
         let mut snap_layers = Vec::new();
         if drafts > 0 {
-            for _ in (0..g.layers).filter(|l| !g.full(*l)) {
-                snap_layers.push((DevBuf::f32(&gpu, drafts * g.v_heads * g.state * g.state)?, DevBuf::f32(&gpu, drafts * (g.conv - 1) * g.conv_dim())?));
+            for l in (0..g.layers).filter(|l| !g.full(*l)) {
+                let gpu = &gpus[layer_dev[l]];
+                snap_layers.push((DevBuf::f32(gpu, drafts * g.v_heads * g.state * g.state)?, DevBuf::f32(gpu, drafts * (g.conv - 1) * g.conv_dim())?));
             }
         }
         log(match &mtp {
@@ -453,16 +583,29 @@ impl<'g> Qwen35<'g> {
             None if draft => "qwen35: no MTP file (NS_Q35_MTP or an MTP/ folder beside the model): no drafts".into(),
             None => "qwen35: drafts off".into(),
         });
-        let vh = DevBuf::f32(&gpu, 8 * g.n_embd)?;
-        gpu.sync()?;
-        let w16 = DevBuf::new(&gpu, w16_bytes)?;
-        let arena = Arena::new(&gpu, arena_bytes)?;
+        let vh = DevBuf::f32(&lastg, 8 * g.n_embd)?;
+        let mut devs = Vec::with_capacity(gpus.len());
+        for (gpu, &(lb, le)) in gpus.iter().zip(&bounds) {
+            gpu.sync()?;
+            devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, w16_bytes)?, arena: Arena::new(gpu, arena_of(chunk))?, lb, le });
+        }
         let load_s = t0.elapsed().as_secs_f64();
-        log(format!("qwen35: {} layers of {} ({} full attention), {:.1} GiB on {} in {load_s:.0} s; prompt chunks of {chunk}", g.layers, g.n_embd,
-                    (0..g.layers).filter(|l| g.full(*l)).count(), loaded as f64 / (1u64 << 30) as f64, gpu.name));
-        let probe = Probe::new(gpu.raw())?;
-        Ok(Qwen35 { g, file: f, gpu, k, silo, layers, output_norm, output, embd, chunk, arena, w16, work: Mutex::new(()), mtp, drafts,
-                    snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), probe, load_s, load_bytes: loaded })
+        let wh = devs.iter().map(|d| if d.lb == 0 && d.le == g.layers { d.gpu.name.clone() } else { format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1) })
+            .collect::<Vec<_>>().join(", ");
+        log(format!("qwen35: {} layers of {} ({} full attention), {:.1} GiB on {wh} in {load_s:.0} s; prompt chunks of {chunk}", g.layers, g.n_embd,
+                    (0..g.layers).filter(|l| g.full(*l)).count(), gib(loaded)));
+        // the probe stamps one GPU's queue: a split runs without it
+        let probe = if devs.len() == 1 {
+            Probe::new(devs[0].gpu.raw())?
+        } else {
+            if std::env::var("NS_Q35_PROFILE").is_ok_and(|v| v == "1") {
+                log("qwen35: NS_Q35_PROFILE times one GPU: off for a split".into());
+            }
+            None
+        };
+        Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, chunk,
+                    work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), probe, load_s,
+                    load_bytes: loaded })
     }
 
     /// A kernel call (its return code checked): timed on the device with NS_Q35_PROFILE=1, with the bytes it moves
@@ -502,8 +645,38 @@ impl<'g> Qwen35<'g> {
         self.chunk
     }
 
+    /// The GPU the kernels go to now
+    fn dev(&self) -> &Dev {
+        &self.devs[self.cur.load(std::sync::atomic::Ordering::Relaxed)]
+    }
+
+    fn on(&self, i: usize) {
+        self.cur.store(i, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn last(&self) -> usize {
+        self.devs.len() - 1
+    }
+
+    fn arena(&self) -> &Arena {
+        &self.dev().arena
+    }
+
     fn raw(&self) -> *mut std::ffi::c_void {
-        self.gpu.raw()
+        self.dev().gpu.raw()
+    }
+
+    /// x (rows of the GPU it is on) onto GPU `to`: a buffer of that GPU's arena
+    fn hop(&self, x: &DevBuf, to: usize) -> Result<DevBuf> {
+        self.on(to);
+        let y = self.arena().bytes(x.len)?;
+        let mut st = self.staging.lock().unwrap();
+        if st.len() < x.len {
+            st.resize(x.len, 0);
+        }
+        // the copy waits for the GPU before (its layers) and the copy into this one
+        y.copy_from_peer(x, &mut st)?;
+        Ok(y)
     }
 
     /// y [t, w.rows] = x [t, w.cols] . W^T; `role` names it in the probe
@@ -549,29 +722,29 @@ impl<'g> Qwen35<'g> {
         }
         // the matrix expanded to half (directly, or through float32), x to half, then the half product
         let elems = rows * cols;
-        if elems * 2 > self.w16.len {
+        if elems * 2 > self.dev().w16.len {
             return Err(e(format!("a {rows}x{cols} matrix past the half buffer")));
         }
         // SAFETY: the matrix's blocks -> rows x cols halfs in w16 (non-zero: a type it does not expand directly) - the
         // silo's expansion for the types it covers
         let rc = match self.silo {
             Some(s) if unsafe { (s.dequant_f16_supported)(w.ty.code() as i32) } != 0 => self.op_rc("dequant f16 silo", key, wb + 2 * elems, 0, || unsafe {
-                (s.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems as i64, self.w16.ptr().cast())
+                (s.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems as i64, self.dev().w16.ptr().cast())
             })?,
             _ => self.op_rc("dequant f16", key, wb + 2 * elems, 0,
-                            || unsafe { (k.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems as i64, self.w16.ptr().cast()) })?,
+                            || unsafe { (k.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems as i64, self.dev().w16.ptr().cast()) })?,
         };
         if rc != 0 {
-            let f = self.arena.f32(elems)?;
+            let f = self.arena().f32(elems)?;
             // SAFETY: the blocks -> float32, then -> half.
             self.op("dequant", key, wb + 4 * elems, 0, || unsafe { (k.dequant)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems, f.fp()) })?;
-            self.op("to half", key, 6 * elems, 0, || unsafe { (k.to_f16)(self.raw(), f.fp(), self.w16.ptr().cast(), elems as i64) })?;
+            self.op("to half", key, 6 * elems, 0, || unsafe { (k.to_f16)(self.raw(), f.fp(), self.dev().w16.ptr().cast(), elems as i64) })?;
         }
-        let xh = self.arena.bytes(t * cols * 2)?;
+        let xh = self.arena().bytes(t * cols * 2)?;
         // SAFETY: x [t, cols] -> half; then y [t, rows] = xh . w16^T.
         self.op("x to half", key, 6 * t * cols, 0, || unsafe { (k.to_f16)(self.raw(), x.fp(), xh.ptr().cast(), (t * cols) as i64) })?;
         self.op("gemm f16", key, 2 * t * cols + 2 * elems + 4 * t * rows, flops,
-                || unsafe { (k.gemm_f16)(self.raw(), t as i64, n, kk, xh.ptr().cast(), kk, self.w16.ptr().cast(), y.fp(), n, 0) })
+                || unsafe { (k.gemm_f16)(self.raw(), t as i64, n, kk, xh.ptr().cast(), kk, self.dev().w16.ptr().cast(), y.fp(), n, 0) })
     }
 
     /// The RMS norm into y; for decode rows with the silo also y's Q8_1 forms (the products after it read them)
@@ -582,7 +755,7 @@ impl<'g> Qwen35<'g> {
         };
         // SAFETY: arithmetic only.
         let (q8, sb) = unsafe { ((self.k.q8_1_bytes)(c as i64, rows as i64), (s.q8_split_bytes)(c as i64, rows as i64)) };
-        let (qb, sp) = (self.arena.bytes(q8)?, self.arena.bytes(sb)?);
+        let (qb, sp) = (self.arena().bytes(q8)?, self.arena().bytes(sb)?);
         // SAFETY: x and y [rows, c], w c floats, qb rows x c / 32 Q8_1 blocks, sp the split layout.
         self.op("rms norm q8", String::new, 12 * rows * c + 4 * c + q8 + sb, 6 * rows * c,
                 || unsafe { (s.rms_q8)(self.raw(), x.fp(), w.fp(), y.fp(), qb.ptr(), sp.ptr(), rows as i64, c as i64, self.g.eps) })?;
@@ -594,11 +767,11 @@ impl<'g> Qwen35<'g> {
         let k = self.k;
         // SAFETY: arithmetic only.
         let q8 = unsafe { (k.q8_1_bytes)(cols as i64, t as i64) };
-        let std = self.arena.bytes(q8)?;
+        let std = self.arena().bytes(q8)?;
         if let Some(s) = self.silo.filter(|_| split) {
             // SAFETY: arithmetic only.
             let sb = unsafe { (s.q8_split_bytes)(cols as i64, t as i64) };
-            let sp = self.arena.bytes(sb)?;
+            let sp = self.arena().bytes(sb)?;
             // SAFETY: x [t, cols] float32 -> its Q8_1 blocks and the split layout.
             self.op("quantize", key, 4 * t * cols + q8 + sb, 0,
                     || unsafe { (s.quantize_q8)(self.raw(), x.fp(), std.ptr(), sp.ptr(), cols as i64, t as i64) })?;
@@ -636,9 +809,9 @@ impl<'g> Qwen35<'g> {
             }
             file.read_into(embd, *t as u64 * row as u64, &mut raw[i * row..(i + 1) * row]).map_err(|x| e(x.0))?;
         }
-        let src = self.arena.bytes(raw.len())?;
+        let src = self.arena().bytes(raw.len())?;
         src.write(0, &raw)?;
-        let x = self.arena.f32(tokens.len() * g.n_embd)?;
+        let x = self.arena().f32(tokens.len() * g.n_embd)?;
         // SAFETY: the rows' blocks -> float32.
         self.op("dequant", String::new, raw.len() + 4 * tokens.len() * g.n_embd, 0,
                 || unsafe { (self.k.dequant)(self.raw(), embd.ty.code() as i32, src.ptr(), tokens.len() * g.n_embd, x.fp()) })?;
@@ -650,15 +823,15 @@ impl<'g> Qwen35<'g> {
     fn full(&self, a: &Full, kc: &DevBuf, vc: &DevBuf, cap: usize, h: &DevBuf, hq8: Option<&Q8>, t: usize, p0: usize) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hq, hk, d) = (g.heads, g.heads_kv, g.head);
-        let qf = self.arena.f32(t * hq * 2 * d)?;
-        let kr = self.arena.f32(t * hk * d)?;
-        let vr = self.arena.f32(t * hk * d)?;
+        let qf = self.arena().f32(t * hq * 2 * d)?;
+        let kr = self.arena().f32(t * hk * d)?;
+        let vr = self.arena().f32(t * hk * d)?;
         self.matmul("q", &a.q, h, hq8, t, &qf)?;
         self.matmul("k", &a.k, h, hq8, t, &kr)?;
         self.matmul("v", &a.v, h, hq8, t, &vr)?;
-        let q = self.arena.f32(t * hq * d)?;
-        let kn = self.arena.f32(t * hk * d)?;
-        let att = self.arena.f32(t * hq * d)?;
+        let q = self.arena().f32(t * hq * d)?;
+        let kn = self.arena().f32(t * hk * d)?;
+        let att = self.arena().f32(t * hq * d)?;
         let none = String::new;
         // the keys the rows see in all (causal): what attention reads and multiplies
         let keys = t * p0 + t * (t + 1) / 2;
@@ -684,32 +857,32 @@ impl<'g> Qwen35<'g> {
                                            p0 as i64, att.fp()))?;
                 self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
                         || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
-                let out = self.arena.f32(t * g.n_embd)?;
+                let out = self.arena().f32(t * g.n_embd)?;
                 self.matmul("o", &a.o, &att, None, t, &out)?;
                 return Ok(out);
             }
             if let Some(s) = self.silo.filter(|s| (s.attn_decode_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
                 // the silo's decode attention: a lane a key for the scores, the keys over ~512 work-groups
                 let sc = (s.attn_decode_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
-                let part = if sc > 0 { Some(self.arena.f32(sc)?) } else { None };
+                let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
                 self.op("attention silo", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
                         || (s.attn_decode)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
                                            p0 as i64, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
                 self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
                         || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
-                let out = self.arena.f32(t * g.n_embd)?;
+                let out = self.arena().f32(t * g.n_embd)?;
                 self.matmul("o", &a.o, &att, None, t, &out)?;
                 return Ok(out);
             }
             let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
-            let part = if sc > 0 { Some(self.arena.f32(sc)?) } else { None };
+            let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
             self.op("attention", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
                     || (k.attn)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64,
                                 att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
             self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
                     || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
         }
-        let out = self.arena.f32(t * g.n_embd)?;
+        let out = self.arena().f32(t * g.n_embd)?;
         self.matmul("o", &a.o, &att, None, t, &out)?;
         Ok(out)
     }
@@ -720,32 +893,32 @@ impl<'g> Qwen35<'g> {
     fn linear(&self, a: &Linear, s: &DevBuf, conv: &DevBuf, h: &DevBuf, hq8: Option<&Q8>, t: usize, snap: Option<(&DevBuf, &DevBuf)>) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hv, hk, d, cd) = (g.v_heads, g.k_heads, g.state, g.conv_dim());
-        let qkv = self.arena.f32(t * cd)?;
-        let z = self.arena.f32(t * g.inner)?;
+        let qkv = self.arena().f32(t * cd)?;
+        let z = self.arena().f32(t * g.inner)?;
         self.matmul("qkv", &a.qkv, h, hq8, t, &qkv)?;
         self.matmul("z", &a.z, h, hq8, t, &z)?;
         // one row: alpha and beta from their stacked matrix in one product
         let (alpha, beta) = match &a.ab {
             Some(ab) if t == 1 => {
-                let both = self.arena.f32(2 * hv)?;
+                let both = self.arena().f32(2 * hv)?;
                 self.matmul("alpha beta", ab, h, hq8, t, &both)?;
                 (both.view(0, hv * 4)?, both.view(hv * 4, hv * 4)?)
             }
             _ => {
-                let beta = self.arena.f32(t * hv)?;
-                let alpha = self.arena.f32(t * hv)?;
+                let beta = self.arena().f32(t * hv)?;
+                let alpha = self.arena().f32(t * hv)?;
                 self.matmul("beta", &a.beta, h, hq8, t, &beta)?;
                 self.matmul("alpha", &a.alpha, h, hq8, t, &alpha)?;
                 (alpha, beta)
             }
         };
-        let eg = self.arena.f32(t * hv * d)?;
-        let co = self.arena.f32(t * cd)?;
-        let q = self.arena.f32(t * hv * d)?;
-        let kk = self.arena.f32(t * hv * d)?;
-        let v = self.arena.f32(t * hv * d)?;
-        let o = self.arena.f32(t * hv * d)?;
-        let y = self.arena.f32(t * g.inner)?;
+        let eg = self.arena().f32(t * hv * d)?;
+        let co = self.arena().f32(t * cd)?;
+        let q = self.arena().f32(t * hv * d)?;
+        let kk = self.arena().f32(t * hv * d)?;
+        let v = self.arena().f32(t * hv * d)?;
+        let o = self.arena().f32(t * hv * d)?;
+        let y = self.arena().f32(t * g.inner)?;
         let qd = (hk * d) as i64;
         let none = String::new;
         let thd = t * hv * d;
@@ -768,7 +941,7 @@ impl<'g> Qwen35<'g> {
             self.op("gated norm", none, 4 * (3 * t * g.inner + d), 10 * t * g.inner,
                     || (k.gdn_out)(self.raw(), o.fp(), z.fp(), g.inner as i64, a.norm.fp(), y.fp(), t as i64, hv as i64, d as i64, g.eps))?;
         }
-        let out = self.arena.f32(t * g.n_embd)?;
+        let out = self.arena().f32(t * g.n_embd)?;
         self.matmul("out", &a.out, &y, None, t, &out)?;
         Ok(out)
     }
@@ -793,21 +966,33 @@ impl<'g> Qwen35<'g> {
         if s.pos + t > s.max_ctx {
             return Err(e(format!("the context is full ({} of {})", s.pos + t, s.max_ctx)));
         }
-        self.arena.reset();
+        for d in &self.devs {
+            d.arena.reset();
+        }
+        self.on(0);
         let p0 = s.pos;
         let mut snaps = self.snaps.lock().unwrap();
         let snapping = (2..=self.drafts + 1).contains(&t) && !snaps.layers.is_empty();
         snaps.of = None;
         self.phase("embed");
-        let x = self.embed(tokens)?;
-        let h = self.arena.f32(t * g.n_embd)?;
-        let ffn_g = self.arena.f32(t * g.n_ff)?;
-        let ffn_u = self.arena.f32(t * g.n_ff)?;
-        let ffn = self.arena.f32(t * g.n_embd)?;
+        let mut x = self.embed(tokens)?;
+        let mut h = self.arena().f32(t * g.n_embd)?;
+        let mut ffn_g = self.arena().f32(t * g.n_ff)?;
+        let mut ffn_u = self.arena().f32(t * g.n_ff)?;
+        let mut ffn = self.arena().f32(t * g.n_embd)?;
         let mut li = 0;
         // the arena past this point is the layer's own, made again each layer
         for (l, (ly, st)) in self.layers.iter().zip(s.layers.iter()).enumerate() {
-            let mark = self.arena.mark();
+            // the next GPU's layers: the rows cross over, its own buffers for them
+            if self.layer_dev[l] != self.cur.load(std::sync::atomic::Ordering::Relaxed) {
+                self.phase("GPU to GPU");
+                x = self.hop(&x, self.layer_dev[l])?;
+                h = self.arena().f32(t * g.n_embd)?;
+                ffn_g = self.arena().f32(t * g.n_ff)?;
+                ffn_u = self.arena().f32(t * g.n_ff)?;
+                ffn = self.arena().f32(t * g.n_embd)?;
+            }
+            let mark = self.arena().mark();
             self.phase(if ly.full.is_some() { "attention" } else { "deltanet" });
             let hq8 = self.norm(&x, &ly.attn_norm, &h, t, g.n_embd)?;
             let out = match (st, &ly.full, &ly.linear) {
@@ -831,7 +1016,7 @@ impl<'g> Qwen35<'g> {
             self.matmul("down", &ly.down, &ffn_g, None, t, &ffn)?;
             self.add(&x, &ffn, t * g.n_embd)?;
             tap(&format!("l_out-{l}"), &x)?;
-            self.arena.rewind(mark);
+            self.arena().rewind(mark);
         }
         if snapping {
             snaps.of = Some((s.id, p0, t));
@@ -844,14 +1029,14 @@ impl<'g> Qwen35<'g> {
         let ne = g.n_embd;
         self.phase("head");
         let (normed, nq8) = if let Some(ms) = s.mtp.as_ref().filter(|_| self.mtp.is_some()) {
-            let all = self.arena.f32(t * ne)?;
+            let all = self.arena().f32(t * ne)?;
             let q = self.norm(&x, &self.output_norm, &all, t, ne)?;
             tap("result_norm", &all.view((t - n) * ne * 4, n * ne * 4)?)?;
             // the rows kept for a rollback; the draft block over this pass's rows: row i pairs token i with the hidden
             // state before it (the pending one, then this pass's)
             self.vh.copy_within(0, &all, 0, t.min(8) * ne * 4)?;
             self.phase("mtp");
-            let hs = self.arena.f32(t * ne)?;
+            let hs = self.arena().f32(t * ne)?;
             hs.copy_within(0, &ms.pending, 0, ne * 4)?;
             if t > 1 {
                 hs.copy_within(ne * 4, &all, 0, (t - 1) * ne * 4)?;
@@ -864,12 +1049,12 @@ impl<'g> Qwen35<'g> {
             (all.view((t - n) * ne * 4, n * ne * 4)?, if n == t { q } else { None })
         } else {
             let last = x.view((t - n) * ne * 4, n * ne * 4)?;
-            let normed = self.arena.f32(n * ne)?;
+            let normed = self.arena().f32(n * ne)?;
             let q = self.norm(&last, &self.output_norm, &normed, n, ne)?;
             tap("result_norm", &normed)?;
             (normed, q)
         };
-        let logits = self.arena.f32(n * self.output.rows)?;
+        let logits = self.arena().f32(n * self.output.rows)?;
         self.matmul("output", &self.output, &normed, nq8.as_ref(), n, &logits)?;
         let all = logits.to_f32()?;
         if let Some(p) = &self.probe {
@@ -886,23 +1071,23 @@ impl<'g> Qwen35<'g> {
         let g = &self.g;
         let (t, ne) = (tokens.len(), g.n_embd);
         let emb = self.embed_from(&m.file, &m.embd, m.vocab, tokens)?;
-        let en = self.arena.f32(t * ne)?;
+        let en = self.arena().f32(t * ne)?;
         self.rms(&emb, &m.enorm, &en, t, ne)?;
-        let hn = self.arena.f32(t * ne)?;
+        let hn = self.arena().f32(t * ne)?;
         self.rms(hs, &m.hnorm, &hn, t, ne)?;
         // eh_proj . [en | hn] = W_e . en + W_h . hn
-        let cur = self.arena.f32(t * ne)?;
+        let cur = self.arena().f32(t * ne)?;
         self.matmul("mtp eh e", &m.eh_e, &en, None, t, &cur)?;
-        let tmp = self.arena.f32(t * ne)?;
+        let tmp = self.arena().f32(t * ne)?;
         self.matmul("mtp eh h", &m.eh_h, &hn, None, t, &tmp)?;
         self.add(&cur, &tmp, t * ne)?;
-        let h = self.arena.f32(t * ne)?;
+        let h = self.arena().f32(t * ne)?;
         let hq8 = self.norm(&cur, &m.attn_norm, &h, t, ne)?;
         let att = self.full(&m.attn, &ms.k, &ms.v, cap, &h, hq8.as_ref(), t, p0)?;
         self.add(&cur, &att, t * ne)?;
         let hq8 = self.norm(&cur, &m.post_norm, &h, t, ne)?;
-        let fg = self.arena.f32(t * g.n_ff)?;
-        let fu = self.arena.f32(t * g.n_ff)?;
+        let fg = self.arena().f32(t * g.n_ff)?;
+        let fu = self.arena().f32(t * g.n_ff)?;
         self.matmul("mtp gate", &m.gate, &h, hq8.as_ref(), t, &fg)?;
         self.matmul("mtp up", &m.up, &h, hq8.as_ref(), t, &fu)?;
         let nf = t * g.n_ff;
@@ -914,12 +1099,12 @@ impl<'g> Qwen35<'g> {
             return Ok(None);
         }
         let last = cur.view((t - 1) * ne * 4, ne * 4)?;
-        let hn2 = self.arena.f32(ne)?;
+        let hn2 = self.arena().f32(ne)?;
         let q = self.norm(&last, &m.head_norm, &hn2, 1, ne)?;
         ms.chain.copy_within(0, &hn2, 0, ne * 4)?;
-        let logits = self.arena.f32(m.output.rows)?;
+        let logits = self.arena().f32(m.output.rows)?;
         self.matmul("mtp head", &m.output, &hn2, q.as_ref(), 1, &logits)?;
-        let best = self.arena.bytes(4)?;
+        let best = self.arena().bytes(4)?;
         // SAFETY: logits [1, vocab] float32 -> its argmax (one int32).
         self.op("argmax", String::new, m.output.rows * 4, 0,
                 || unsafe { (self.k.argmax)(self.raw(), logits.fp(), 1, m.output.rows as i64, best.ptr().cast()) })?;
@@ -935,8 +1120,10 @@ impl<'g> Qwen35<'g> {
         let k = self.drafts.min(s.max_ctx.saturating_sub(s.pos + 1));
         let mut out = Vec::with_capacity(k);
         let mut tok = tail;
+        // the draft block is on the last GPU
+        self.on(self.last());
         for i in 0..k {
-            self.arena.reset();
+            self.arena().reset();
             self.phase("mtp draft");
             let hs = if i == 0 { &ms.pending } else { &ms.chain };
             let Some(t) = self.mtp_rows(ms, &[tok], hs, s.pos + i, s.max_ctx, true)? else { break };
@@ -983,23 +1170,28 @@ impl<'g> Qwen35<'g> {
         let g = &self.g;
         // the caches and states, checked against what is free first: past the card the xe driver spills into host
         // memory (no out-of-memory error) and can take the machine down
-        let full = (0..g.layers).filter(|l| g.full(*l)).count();
         let mtp_kv = if self.mtp.is_some() { 2 * g.heads_kv * max_ctx * g.head * 2 } else { 0 };
-        let need = (full * 2 * g.heads_kv * max_ctx * g.head * 2 + mtp_kv + (g.layers - full) * (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64;
-        let (total, free) = self.gpu.memory()?;
-        let free = free.unwrap_or(total);
-        if need + (1536 << 20) > free {
-            return Err(e(format!("a session of {max_ctx} tokens needs {:.2} GiB on {}; {:.2} GiB are free (1.5 GiB kept spare)", need as f64 / (1u64 << 30) as f64,
-                                 self.gpu.name, free as f64 / (1u64 << 30) as f64)));
+        // per GPU: its layers' share (the draft block's cache on the last)
+        for (i, d) in self.devs.iter().enumerate() {
+            let full = (d.lb..d.le).filter(|l| g.full(*l)).count();
+            let kv = if i == self.last() { mtp_kv } else { 0 };
+            let need = (full * 2 * g.heads_kv * max_ctx * g.head * 2 + kv + (d.le - d.lb - full) * (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64;
+            let (total, free) = d.gpu.memory()?;
+            let free = free.unwrap_or(total);
+            if need + (1536 << 20) > free {
+                return Err(e(format!("a session of {max_ctx} tokens needs {:.2} GiB on {}; {:.2} GiB are free (1.5 GiB kept spare)", need as f64 / (1u64 << 30) as f64,
+                                     d.gpu.name, free as f64 / (1u64 << 30) as f64)));
+            }
         }
         let mut layers = Vec::with_capacity(g.layers);
         for l in 0..g.layers {
+            let gpu = &self.devs[self.layer_dev[l]].gpu;
             layers.push(if g.full(l) {
                 let n = g.heads_kv * max_ctx * g.head * 2;
-                LState::Full { k: DevBuf::new(&self.gpu, n)?, v: DevBuf::new(&self.gpu, n)? }
+                LState::Full { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)? }
             } else {
-                let s = DevBuf::f32(&self.gpu, g.v_heads * g.state * g.state)?;
-                let conv = DevBuf::f32(&self.gpu, (g.conv - 1) * g.conv_dim())?;
+                let s = DevBuf::f32(gpu, g.v_heads * g.state * g.state)?;
+                let conv = DevBuf::f32(gpu, (g.conv - 1) * g.conv_dim())?;
                 s.fill(0)?;
                 conv.fill(0)?;
                 LState::Linear { s, conv }
@@ -1008,8 +1200,8 @@ impl<'g> Qwen35<'g> {
         let mtp = match &self.mtp {
             Some(_) => {
                 let n = g.heads_kv * max_ctx * g.head * 2;
-                let ms = MtpState { k: DevBuf::new(&self.gpu, n)?, v: DevBuf::new(&self.gpu, n)?, pending: DevBuf::f32(&self.gpu, g.n_embd)?,
-                                    chain: DevBuf::f32(&self.gpu, g.n_embd)? };
+                let gpu = &self.devs[self.last()].gpu;
+                let ms = MtpState { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)?, pending: DevBuf::f32(gpu, g.n_embd)?, chain: DevBuf::f32(gpu, g.n_embd)? };
                 ms.pending.fill(0)?;
                 Some(ms)
             }
@@ -1240,8 +1432,14 @@ impl<'g> Qwen35<'g> {
     }
 
     pub fn gpu_info(&self) -> Vec<GpuInfo> {
-        let (total, free) = self.gpu.memory().unwrap_or((0, None));
-        vec![GpuInfo { index: 0, name: self.gpu.name.clone(), pci: None, total, free, layers: (0, self.g.layers as u64), expert_slots: 0, host_slots: 0 }]
+        self.devs
+            .iter()
+            .map(|d| {
+                let (total, free) = d.gpu.memory().unwrap_or((0, None));
+                GpuInfo { index: d.gpu.index, name: d.gpu.name.clone(), pci: d.gpu.pci.clone(), total, free, layers: (d.lb as u64, d.le as u64), expert_slots: 0,
+                          host_slots: 0 }
+            })
+            .collect()
     }
 }
 

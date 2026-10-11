@@ -272,9 +272,11 @@ of IQ2_XXS instead could win twice.
       rule 5); qwen35's decode products the first (Q4 decode 17.7 -> 22.5-23.5 tok/s at 2K, Q3 12.3 -> 20.4)
 - [x] Qwen3.8-27B MTP (2026-10-10): the draft block from the MTP file, 3 chained drafts a step, DeltaNet snapshots
       for rollback; verify rows exact (spec-check 0 difference); decode at 2K 26 -> 43 tok/s (Q4), 18.5 -> 41.8 (Q8)
-- [ ] Qwen3.8-27B: the vision tower (mmproj: pictures in chat), two cards
-- [ ] Qwen3.8-27B decode: ~10 ms a token outside the products (launches; graphs), alpha / beta as one product,
-      Q6_K head (2 ms), IQ3_XXS / IQ2_S in the silo (the Q3 file's remaining slow types)
+- [x] Qwen3.8-27B on two cards (2026-10-11): layers split, the last GPU filled first (head + draft block there), each
+      GPU's own work memory, the rows crossing once a pass; Q8_0 and UD-Q4_K_M at 256K + 32K (`-256k` entries); exact
+- [ ] Qwen3.8-27B: the vision tower (mmproj: pictures in chat)
+- [ ] Qwen3.8-27B decode: time between kernels (launches; graphs), Q6_K head in the silo; two cards for speed (each
+      matrix split across both - two crossings a layer, through host memory today)
 - [ ] VoxCPM2 speed: the DiT's 9 evaluations a patch as one graph with the Euler update on the GPU (host round trips
       now); batch the guided and unguided rows through the products already, fuse the local attention; streamed answers
 - [x] Saved voices (2026-10-10): clone from WAV / MP3 / FLAC / Ogg / M4A, design through the voice-design model, speak by name

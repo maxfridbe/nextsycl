@@ -62,6 +62,8 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `qwen3.8-27b-q8` | Qwen3.8-27B Q8_0 (dense: gated DeltaNet + gated full attention), 32K, MTP drafts | `qwen35` | 28.4 GiB | checked (llama.cpp), served (verify passes exact) |
 | `qwen3.8-27b-q4` | Qwen3.8-27B UD-Q4_K_M, 128K + 32K, MTP drafts | `qwen35` | 16.6 GiB | checked (llama.cpp), served (verify passes exact) |
 | `qwen3.8-27b-q3` | Qwen3.8-27B UD-Q3_K_XL, 128K + 32K, MTP drafts | `qwen35` | 13.5 GiB | served |
+| `qwen3.8-27b-q8-256k` | Qwen3.8-27B Q8_0 on both GPUs, 256K + 32K, MTP drafts | `qwen35` | 28.4 GiB | served (verify passes exact) |
+| `qwen3.8-27b-q4-256k` | Qwen3.8-27B UD-Q4_K_M on both GPUs, 256K + 32K, MTP drafts | `qwen35` | 16.6 GiB | served (verify passes exact) |
 
 **Image** (`nextsycl image`; sizes with the text encoder, VAE and tokenizer)
 
@@ -712,10 +714,24 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   that pass's rows, so its cache follows the conversation; `step` drafts `NS_Q35_DRAFTS` tokens (3: 2 is as fast, 4
   and 5 slower), verifies [token, drafts] in one pass and keeps what the sampled tokens match, so what is committed
   is distributed as plain sampling. Verify rows are bit for bit the one-token decode's (`spec-check --rows 2..4`).
-  `--no-mtp` turns it off. Q8_0 with MTP fits its catalog 32K context, not 40K.
+  `--no-mtp` turns it off. Q8_0 with MTP fits its catalog 32K context on one card, not 40K.
+- **Two cards** (`--gpu all`, or `--gpu 1,0`: the B65, then the B70; the `-256k` catalog entries): the layers split
+  so the last GPU (the server orders them weakest first) takes as many as fit beside the head, the draft block and
+  the planned context's caches, and the one before it the rest - a GPU the layers do not reach is not used, so a
+  context that fits the B70 runs there alone. Each GPU has its own work memory; a pass's rows cross once (through
+  host memory, ~0.5 ms a token). `NS_SPLIT=N` puts layers N.. on the last GPU. The same tokens as one card
+  (`spec-check --rows 4`: 0 difference). It is for room, not speed (the B65 runs a layer ~1.5x slower than the B70),
+  prompt read / decode, tokens/s, MTP on:
+
+  | File, context planned | 2,185 | 8,000 | 40,000 |
+  |---|---:|---:|---:|
+  | Q8_0, 256K + 32K (B65 layers 0-26) | 990 / 37.8 | | 588 / 29.0 |
+  | UD-Q4_K_M, 256K + 32K (B65 layers 0-15) | 1,061 / 52.1 | 1,099 / 48.8 | 666 / 39.3 |
+
+  Q8_0's 40K figure is from a split with layers 0-32 on the B65 (before the last GPU filled first).
 - **Its silo** (`kernels/llm/qwen35/silo`, kernels tuned for this model): decode products for the types these files
   hold (Q4_K 507 GB/s against Strata's 366, IQ4_XS ~490 / 361, Q5_K 525 / 415, Q3_K 380 / 89, IQ3_S 439 / 118 - the
-  same outputs), flash attention on XMX for prompts, a decode attention with a lane a key over ~512 work-groups, the
+  same outputs), flash attention on XMX for prompts and, its keys split over work-groups, for decode, the
   weight expansion to half at ~300 GB/s for every type (Q6_K's went through float32 at 13-15), a norm that hands the
   products their Q8_1 blocks; prompt chunks of 2,048 when they fit. `NS_PROFILE=gpu NS_Q35_PROFILE=1` times every
   kernel on the device against the card's ceilings. Sessions check their cache against the free VRAM before

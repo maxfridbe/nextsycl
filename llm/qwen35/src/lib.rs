@@ -38,7 +38,7 @@ fn info(f: &Gguf) -> std::result::Result<String, String> {
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {
-    Ok(Box::new(engine::Qwen35::load(f, gpus, o.draft, log)?))
+    Ok(Box::new(engine::Qwen35::load(f, gpus, o.draft, o.kv, log)?))
 }
 
 impl SessionState for engine::Session {

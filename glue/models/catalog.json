@@ -1280,6 +1280,38 @@
    "env": {},
    "tools": true,
    "tasks": true
+  },
+  {
+   "id": "qwen3.8-27b-q8-256k",
+   "kind": "llm",
+   "arch": "qwen35",
+   "title": "Qwen3.8-27B Q8_0 (8-bit; both GPUs, 256K + 32K)",
+   "about": "Qwen's dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth's GGUF - the most faithful; 27 GiB",
+   "files": {
+    "model": "q27-q8",
+    "mtp": "q27-mtp"
+   },
+   "gpus": "all",
+   "ctx": "262144,32768",
+   "env": {},
+   "tools": true,
+   "tasks": true
+  },
+  {
+   "id": "qwen3.8-27b-q4-256k",
+   "kind": "llm",
+   "arch": "qwen35",
+   "title": "Qwen3.8-27B UD-Q4_K_M (4-bit; both GPUs, 256K + 32K)",
+   "about": "Qwen's dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth's GGUF - Unsloth's dynamic 4-bit; 15 GiB",
+   "files": {
+    "model": "q27-q4",
+    "mtp": "q27-mtp"
+   },
+   "gpus": "all",
+   "ctx": "262144,32768",
+   "env": {},
+   "tools": true,
+   "tasks": true
   }
  ]
 }
