@@ -264,6 +264,144 @@ struct WideIQ3S {
     static float dot(const W& r, const X& v) { return WideIQ4XS::dot(r, v); }
 };
 
+// ---- the 2- and 3-bit grid types (IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S; 2-byte aligned blocks): lane g = sub-block g (32
+// values, four groups of 8). A group is a grid entry (two words of unsigned bytes - IQ3_XXS: two 4-value entries) and
+// a sign byte (8 bits: IQ2_S's straight, the others' through ksigns_iq2xs), applied bytewise as IQ3_S's are. Local
+// words: [16] the sign masks of four bits, [128] ksigns_iq2xs, then the grid. The shared kernels ran these at ~100 GB/s.
+constexpr int GL_SIGNS = 0, GL_KSIGNS = 16, GL_GRID = 144;
+inline uint32_t grid_lut_head(int i) { return i < 16 ? sign_mask4(uint32_t(i)) : uint32_t(ksigns_iq2xs[i - 16]); }
+// group l's two words with sign byte sb into v[2l], v[2l + 1]
+inline void grid_group(const uint32_t* tab, uint32_t w0, uint32_t w1, uint32_t sb, int* v, int l) {
+    const uint32_t m0 = tab[GL_SIGNS + (sb & 0xf)], m1 = tab[GL_SIGNS + ((sb >> 4) & 0xf)];
+    v[2 * l] = int((w0 ^ m0) + (m0 & 0x01010101u));
+    v[2 * l + 1] = int((w1 ^ m1) + (m1 & 0x01010101u));
+}
+inline uint32_t word_of(const sycl::int4& v, int i) { return uint32_t(i == 0 ? v.x() : i == 1 ? v.y() : i == 2 ? v.z() : v.w()); }
+// two scales a sub-block (IQ2_S, IQ2_XS: values 0-15 and 16-31)
+struct W2 { sycl::int4 lo, hi; float d0, d1; };
+inline float dot2(const W2& r, const WideIQ4XS::X& v) { return v.d * (r.d0 * (float) dp4a4(r.lo, v.u0, 0) + r.d1 * (float) dp4a4(r.hi, v.u1, 0)); }
+
+struct WideIQ3XXS {
+    using Block = block_iq3_xxs;
+    static constexpr bool SPLIT = true;
+    static constexpr int ROWS = 1, ROWS_MULTI = 1;
+    static constexpr int LUT = GL_GRID + 256;
+    static uint32_t lut(int i) { return i < GL_GRID ? grid_lut_head(i) : iq3xxs_grid[i - GL_GRID]; }
+    using W = WideIQ4XS::W;
+    static W load(const Block* b, int g, const uint32_t* tab) {
+        W r;
+        const sycl::int4 q4 = load16_a2(b->qs + 16 * (g >> 1)), a4 = load16_a2(b->qs + 64 + 16 * (g >> 2));
+        const uint32_t qa = word_of(q4, 2 * (g & 1)), qb = word_of(q4, 2 * (g & 1) + 1), aux = word_of(a4, g & 3);
+        int v[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t qw = l < 2 ? qa : qb, sh = 16 * (l & 1);
+            const uint32_t sb = tab[GL_KSIGNS + ((aux >> (7 * l)) & 127)];
+            grid_group(tab, tab[GL_GRID + ((qw >> sh) & 0xff)], tab[GL_GRID + ((qw >> (sh + 8)) & 0xff)], sb, v, l);
+        }
+        r.lo = sycl::int4(v[0], v[1], v[2], v[3]); r.hi = sycl::int4(v[4], v[5], v[6], v[7]);
+        r.d = (float) b->d * (0.5f + (float) (aux >> 28)) * 0.5f;
+        return r;
+    }
+    using X = WideIQ4XS::X;
+    static X xload(int g, const XA& xa, int b0) { return WideIQ4XS::xload(g, xa, b0); }
+    static float dot(const W& r, const X& v) { return WideIQ4XS::dot(r, v); }
+};
+struct WideIQ2XXS {
+    using Block = block_iq2_xxs;
+    static constexpr bool SPLIT = true;
+    static constexpr int ROWS = 1, ROWS_MULTI = 1;
+    static constexpr int LUT = GL_GRID + 2 * 256;
+    static uint32_t lut(int i) {
+        if (i < GL_GRID) return grid_lut_head(i);
+        const uint64_t e = iq2xxs_grid[(i - GL_GRID) >> 1];
+        return uint32_t((i - GL_GRID) & 1 ? e >> 32 : e);
+    }
+    using W = WideIQ4XS::W;
+    static W load(const Block* b, int g, const uint32_t* tab) {
+        W r;
+        const sycl::int4 q4 = load16_a2(reinterpret_cast<const uint8_t*>(b->qs) + 16 * (g >> 1));
+        const uint32_t a0 = word_of(q4, 2 * (g & 1)), a1 = word_of(q4, 2 * (g & 1) + 1);   // grid bytes; signs + scale
+        int v[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t gi = (a0 >> (8 * l)) & 0xff, sb = tab[GL_KSIGNS + ((a1 >> (7 * l)) & 127)];
+            grid_group(tab, tab[GL_GRID + 2 * gi], tab[GL_GRID + 2 * gi + 1], sb, v, l);
+        }
+        r.lo = sycl::int4(v[0], v[1], v[2], v[3]); r.hi = sycl::int4(v[4], v[5], v[6], v[7]);
+        r.d = (float) b->d * (0.5f + (float) (a1 >> 28)) * 0.25f;
+        return r;
+    }
+    using X = WideIQ4XS::X;
+    static X xload(int g, const XA& xa, int b0) { return WideIQ4XS::xload(g, xa, b0); }
+    static float dot(const W& r, const X& v) { return WideIQ4XS::dot(r, v); }
+};
+struct WideIQ2XS {
+    using Block = block_iq2_xs;
+    static constexpr bool SPLIT = true;
+    static constexpr int ROWS = 1, ROWS_MULTI = 1;
+    static constexpr int LUT = GL_GRID + 2 * 512;
+    static uint32_t lut(int i) {
+        if (i < GL_GRID) return grid_lut_head(i);
+        const uint64_t e = iq2xs_grid[(i - GL_GRID) >> 1];
+        return uint32_t((i - GL_GRID) & 1 ? e >> 32 : e);
+    }
+    using W = W2;
+    static W load(const Block* b, int g, const uint32_t* tab) {
+        W r;
+        const sycl::int4 q4 = load16_a2(reinterpret_cast<const uint8_t*>(b->qs) + 16 * (g >> 1));
+        const uint32_t e01 = word_of(q4, 2 * (g & 1)), e23 = word_of(q4, 2 * (g & 1) + 1);   // four 16-bit entries
+        int v[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t e = ((l < 2 ? e01 : e23) >> (16 * (l & 1))) & 0xffff;
+            const uint32_t gi = e & 511, sb = tab[GL_KSIGNS + (e >> 9)];
+            grid_group(tab, tab[GL_GRID + 2 * gi], tab[GL_GRID + 2 * gi + 1], sb, v, l);
+        }
+        r.lo = sycl::int4(v[0], v[1], v[2], v[3]); r.hi = sycl::int4(v[4], v[5], v[6], v[7]);
+        const uint32_t sc = b->scales[g];
+        const float d = (float) b->d;
+        r.d0 = d * (0.5f + (float) (sc & 0xf)) * 0.25f;
+        r.d1 = d * (0.5f + (float) (sc >> 4)) * 0.25f;
+        return r;
+    }
+    using X = WideIQ4XS::X;
+    static X xload(int g, const XA& xa, int b0) { return WideIQ4XS::xload(g, xa, b0); }
+    static float dot(const W& r, const X& v) { return dot2(r, v); }
+};
+struct WideIQ2S {
+    using Block = block_iq2_s;
+    static constexpr bool SPLIT = true;
+    static constexpr int ROWS = 1, ROWS_MULTI = 1;
+    static constexpr int LUT = GL_GRID + 2 * 1024;
+    static uint32_t lut(int i) {
+        if (i < GL_GRID) return grid_lut_head(i);
+        const uint64_t e = iq2s_grid[(i - GL_GRID) >> 1];
+        return uint32_t((i - GL_GRID) & 1 ? e >> 32 : e);
+    }
+    using W = W2;
+    static W load(const Block* b, int g, const uint32_t* tab) {
+        W r;
+        const sycl::int4 q4 = load16_a2(b->qs + 16 * (g >> 2)), s4 = load16_a2(b->qs + 32 + 16 * (g >> 2)), hs = load16_a2(b->qh);
+        const uint32_t qw = word_of(q4, g & 3), sw = word_of(s4, g & 3);
+        const uint32_t qh = (word_of(hs, g >> 2) >> (8 * (g & 3))) & 0xff, sc = (word_of(hs, 2 + (g >> 2)) >> (8 * (g & 3))) & 0xff;
+        int v[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t gi = ((qw >> (8 * l)) & 0xff) | ((qh << (8 - 2 * l)) & 0x300);
+            grid_group(tab, tab[GL_GRID + 2 * gi], tab[GL_GRID + 2 * gi + 1], (sw >> (8 * l)) & 0xff, v, l);
+        }
+        r.lo = sycl::int4(v[0], v[1], v[2], v[3]); r.hi = sycl::int4(v[4], v[5], v[6], v[7]);
+        const float d = (float) b->d;
+        r.d0 = d * (0.5f + (float) (sc & 0xf)) * 0.25f;
+        r.d1 = d * (0.5f + (float) (sc >> 4)) * 0.25f;
+        return r;
+    }
+    using X = WideIQ4XS::X;
+    static X xload(int g, const XA& xa, int b0) { return WideIQ4XS::xload(g, xa, b0); }
+    static float dot(const W& r, const X& v) { return dot2(r, v); }
+};
+
 int lut_groups() {   // NS_Q35_MMVQ_GROUPS: the work-groups of a kernel with a table (default 512)
     static const int v = std::getenv("NS_Q35_MMVQ_GROUPS") ? std::max(1, std::atoi(std::getenv("NS_Q35_MMVQ_GROUPS"))) : 512;
     return v;
@@ -488,7 +626,7 @@ size_t ns_q35_q8_split_bytes(int64_t n_in, int64_t ncols) { return (size_t) (nco
 
 int ns_q35_mmvq_supported(int type, int64_t n_in) {
     switch (type) {
-        case 11: case 12: case 13: case 21: case 23: return n_in % QK == 0;
+        case 11: case 12: case 13: case 16: case 17: case 18: case 21: case 22: case 23: return n_in % QK == 0;
         case 20: return n_in % 32 == 0;
         default: return 0;
     }
@@ -506,6 +644,10 @@ int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const vo
         case 20: iq4nl(g->q, w, x_split, y, ni, no, nc); break;
         case 21: wide<WideIQ3S>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
         case 23: wide<WideIQ4XS>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
+        case 16: wide<WideIQ2XXS>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
+        case 17: wide<WideIQ2XS>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
+        case 18: wide<WideIQ3XXS>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
+        case 22: wide<WideIQ2S>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
     }
     return 0;
     NS_CATCH
