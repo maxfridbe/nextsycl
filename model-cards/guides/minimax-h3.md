@@ -101,6 +101,21 @@ The motion must carry through the cuts, and the sound with it.
 - The music is the film's, not the clips': make each clip's `non_diegetic_music: None.` and lay a song (the
   audio kind, `minimax-music3`) under the joined cuts; a 2-frame cross-fade or plain cuts.
 
+### A cut: what to carry, by kind (docs/video/scenes.md has the measurements)
+| The cut | Use |
+|---|---|
+| the same shot goes on | `guide_clip` (22 frames) + `first_audio` |
+| the same person speaks again | `ref_images` + `ref_audios` + the picture as `first_frame` and `last_frame` |
+| the speaker changes | that person's `ref_images` + `ref_audios`; two in a shot: both, `<Picture 1>` and `<Picture 2>` in the prompt |
+| the same person, a new place | `ref_images [person]` (+ the place's picture); the place in words |
+| a new scene in the same look | `ref_images [a frame of the last scene]` "in the exact look and light of `<Picture 1>`", and the light in words |
+| a match cut, a transformation | `first_frame` = the last frame + `last_frame` = the target |
+| a seamless loop | `first_frame` = `last_frame` |
+| another person does what a clip did | `ref_images [him]` + `ref_videos [clip]`, and the prompt names who is who: "Using the movement of the figure in `<Video 1>` only, the old man from `<Picture 1>` ..." |
+| a voice over b-roll | `ref_audios [the voice]`, "in an off-screen voiceover ... while no one is on screen" |
+| the same motion in another style | `control_video` (canny edges of the clip) - not with references |
+| a fix | re-render the clip; `regen` only fills small gaps |
+
 ### Every kind
 - **Draft small first** (384x384, 4 s, 8 steps: a whole film in minutes) to check the story, the prompts and the
   chain - not the picture: the noise is drawn over the latent's shape, so the final size is another composition.

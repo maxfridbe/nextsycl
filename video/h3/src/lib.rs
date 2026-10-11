@@ -111,7 +111,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "ref_audio", env: "", value: "WAV[,WAV...]", help: "a voice to hold (up to three)", at: At::Request },
     EngineOption { name: "source", env: "", value: "MP4", help: "a clip to regenerate part of", at: At::Request },
     EngineOption { name: "regen", env: "", value: "FROM-TO", help: "the seconds of the source to regenerate", at: At::Request },
-    EngineOption { name: "regen_box", env: "", value: "X,Y,W,H", help: "the region of the source to regenerate", at: At::Request },
+    EngineOption { name: "regen_box", env: "", value: "X0,Y0,X1,Y1", help: "the region of the source to regenerate (pixels: left, top, right, bottom)", at: At::Request },
     EngineOption { name: "cond_noise_aug", env: "", value: "X", help: "DO NOT USE: noise added to the keyframes, which are never denoised - it decodes as coloured confetti (seen at 0.03)", at: At::Request },
     EngineOption { name: "shift_video", env: "", value: "X", help: "the video schedule's shift (default 12)", at: At::Request },
     EngineOption { name: "shift_audio", env: "", value: "X", help: "the audio schedule's shift (default 3)", at: At::Request },
