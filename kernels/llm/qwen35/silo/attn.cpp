@@ -247,10 +247,12 @@ void attn_decode(sycl::queue& queue, const float* q, int64_t qs, const half* kc,
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             auto sg = it.get_sub_group();
             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id(), tid = (int) it.get_local_id(0);
+            // the rows fastest: a split's rows run side by side and read its keys from the cache once (the order
+            // of work-groups changes nothing in a row's arithmetic)
             int64_t gi = it.get_group(0);
-            const int64_t sp = gi % ns;
-            gi /= ns;
-            const int64_t hk = gi % Hkv, r = gi / Hkv;
+            const int64_t r = gi % T;
+            gi /= T;
+            const int64_t sp = gi % ns, hk = gi / ns;
             const int64_t kv_end = p0 + r + 1, kb = dec_split(kv_end, Hkv), nsr = (kv_end + kb - 1) / kb;
             if (sp >= nsr) return;   // the whole work-group: past this row's splits
             const int64_t j0 = sp * kb, j1 = sycl::min(kv_end, (sp + 1) * kb);

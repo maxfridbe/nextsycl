@@ -7,6 +7,8 @@
 
 #include <sycl/sycl.hpp>
 #include <cmath>
+#include <mutex>
+#include <unordered_map>
 
 namespace {
 using half = sycl::half;
@@ -272,6 +274,49 @@ int ns_q35_gdn_out(ns_gpu* g, const float* o, const float* z, int64_t zs, const 
 
 int ns_q35_argmax(ns_gpu* g, const float* x, int64_t rows, int64_t n, int32_t* out) {
     NS_TRY
+    // one row over many work-groups (a 248K vocabulary walked by one took 318 us): each its slice's best, then one
+    // work-group the best of those - the lowest index on a tie, as before
+    if (rows == 1 && n >= 65536) {
+        constexpr int WG = 256, PARTS = 256;
+        // the slices' bests: a small buffer a GPU, kept for the process
+        static std::mutex mu;
+        static std::unordered_map<ns_gpu*, void*> scratch;
+        void* sp;
+        {
+            std::lock_guard<std::mutex> l(mu);
+            auto& e = scratch[g];
+            if (!e) e = sycl::malloc_device(PARTS * 8, g->q);
+            sp = e;
+        }
+        float* bv = static_cast<float*>(sp);
+        int32_t* bi = reinterpret_cast<int32_t*>(bv + PARTS);
+        const int64_t per = (n + PARTS - 1) / PARTS;
+        g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>(PARTS * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+            const int64_t p = it.get_group(0), lo = p * per, hi = sycl::min(n, lo + per);
+            float best = -INFINITY;
+            int32_t idx = INT32_MAX;
+            for (int64_t i = lo + it.get_local_id(0); i < hi; i += WG) {
+                const float v = x[i];
+                if (v > best) {
+                    best = v;
+                    idx = (int32_t) i;
+                }
+            }
+            const float m = sycl::reduce_over_group(it.get_group(), best, sycl::maximum<float>());
+            const int32_t j = sycl::reduce_over_group(it.get_group(), best == m ? idx : INT32_MAX, sycl::minimum<int32_t>());
+            if (it.get_local_id(0) == 0) {
+                bv[p] = m;
+                bi[p] = j;
+            }
+        });
+        g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>(PARTS), sycl::range<1>(PARTS)), [=](sycl::nd_item<1> it) {
+            const float v = bv[it.get_local_id(0)];
+            const float m = sycl::reduce_over_group(it.get_group(), v, sycl::maximum<float>());
+            const int32_t j = sycl::reduce_over_group(it.get_group(), v == m ? bi[it.get_local_id(0)] : INT32_MAX, sycl::minimum<int32_t>());
+            if (it.get_local_id(0) == 0) out[0] = j;
+        });
+        return 0;
+    }
     constexpr int WG = 256;
     g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
         const int64_t r = it.get_group(0);
