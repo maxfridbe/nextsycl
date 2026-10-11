@@ -1,0 +1,39 @@
+# MiniMax H3 Ref2VA (int8 ConvRot: reference pictures, clips and sounds to video)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-h3-ref2va
+kind: video
+arch: minimax-h3
+title: 'MiniMax H3 Ref2VA (int8 ConvRot: reference pictures, clips and sounds to video)'
+about: the 50-block Ref2VA DiT in ComfyUI's int8 ConvRot - the one trained for <Picture i> / <Video k> / <Audio j> references; the same text encoder (with its vision tower), VAEs and upscaler
+gpus: '0'
+defaults:
+  steps: 8
+  seconds: 2.0
+  size: 384x288
+env: {}
+files:
+  denoiser:
+    key: h3-denoiser-ref2va-int8
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
+    size: 20970379616
+    sha256: 9255f52b6677845ad238f20dfaafa94727053694127ab7f255c048f0f9365779
+    path: minimax-h3/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
+  text-encoder: h3-te-32b-q4km
+  tokenizer: h3-tokenizer-vocab
+  tokenizer-merges: h3-tokenizer-merges
+  tokenizer-config: h3-tokenizer-config
+  vae: h3-vae
+  audio-vae: h3-audio-vae
+  upscaler: h3-upscaler
+  vision: h3-te-visual
+  embedding-art-is-explosion: h3-embedding-art-is-explosion
+  embedding-blooming-flowers: h3-embedding-blooming-flowers
+  embedding-bullet-time: h3-embedding-bullet-time
+  embedding-dark-magic: h3-embedding-dark-magic
+  embedding-fire-breath: h3-embedding-fire-breath
+  embedding-four-seasons: h3-embedding-four-seasons
+  embedding-kiss-camera: h3-embedding-kiss-camera
+  embedding-spiral-ascent: h3-embedding-spiral-ascent
+  embedding-storm-magic: h3-embedding-storm-magic
+  embedding-truman-show: h3-embedding-truman-show
+guide: guides/minimax-h3.md

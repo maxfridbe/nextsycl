@@ -1,0 +1,26 @@
+# Qwen3.8-27B Q8_0 (8-bit; the B70, 32K)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen3.8-27b-q8
+kind: llm
+arch: qwen35
+title: Qwen3.8-27B Q8_0 (8-bit; the B70, 32K)
+about: 'Qwen''s dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth''s GGUF - the most faithful; 27 GiB'
+gpus: '0'
+ctx: '32768'
+tools: true
+tasks: true
+env: {}
+files:
+  model:
+    key: q27-q8
+    url: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-Q8_0.gguf
+    size: 29047086048
+    sha256: a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348
+    path: qwen3.8-27b/Qwen3.8-27B-Q8_0.gguf
+  mtp:
+    key: q27-mtp
+    url: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/MTP/mtp-Qwen3.8-27B-Q4_0.gguf
+    size: 1369590656
+    sha256: 50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e
+    path: qwen3.8-27b/MTP/mtp-Qwen3.8-27B-Q4_0.gguf
+guide: guides/chat.md

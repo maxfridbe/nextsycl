@@ -1,0 +1,26 @@
+# Qwen-Image 2.1 uncensored Q8_0
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen-image-2.1-uncensored-q8
+kind: image
+arch: qwen-image-2.1
+title: Qwen-Image 2.1 uncensored Q8_0
+about: Qwen-Image 2.1 without its safety tuning, Q8_0
+gpus: '0'
+defaults:
+  steps: 40
+  cfg: 1.0
+  sampler: euler
+  schedule: shift
+  size: 1024x1024
+env: {}
+files:
+  transformer:
+    key: qwen-image-21-uc-q80
+    url: https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF/resolve/6b34e59458d3eb7ba6a6f86a116aed5253dc02c3/qwen-image-2.1-UC-Q8_0.gguf
+    size: 7591557920
+    sha256: cde456c72ea3ecebfc1be783300e972711d875e0c5f1bed33d42b66b156affa8
+    path: qwen-image-2.1/diffusion_models/qwen-image-2.1-UC-Q8_0.gguf
+  text-encoder: qwen-image-21-te-int8
+  vae: qwen-image-21-vae
+  tokenizer: qwen-image-21-tokenizer
+guide: guides/qwen-image-2.1.md

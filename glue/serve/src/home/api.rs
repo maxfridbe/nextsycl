@@ -144,18 +144,6 @@ pub const METHODS: &[Method] = &[
     Method { kind: "video", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "minimax-h3"}"# },
 ];
 
-/// The prompt guide of a model's architecture
-fn guide(kind: &str, arch: &str) -> &'static str {
-    match (kind, arch) {
-        ("video", _) => include_str!("guides/minimax-h3.md"),
-        ("image", _) => include_str!("guides/qwen-image-2.1.md"),
-        ("audio", "qwen3-tts") => include_str!("guides/qwen3-tts.md"),
-        ("audio", "voxcpm2") => include_str!("guides/voxcpm2.md"),
-        ("audio", _) => include_str!("guides/minimax-music3.md"),
-        _ => include_str!("guides/chat.md"),
-    }
-}
-
 fn code_of(status: u16) -> &'static str {
     match status {
         400 => "invalid_params",
@@ -344,7 +332,9 @@ impl Home {
                 if registry::kind_of(e) != k {
                     return Err((400, format!("{} is a {} model", model(), registry::kind_of(e))));
                 }
-                Ok(json!({"model": model(), "arch": e["arch"], "kind": k, "markdown": guide(k, &s(e, "arch"))}))
+                // the model card's guide (model-cards/), else its architecture's or its kind's
+                let md = self.o.cfg.guide(e).ok_or_else(|| (404, format!("no prompt guide for {} (its model card's `guide`)", model())))?;
+                Ok(json!({"model": model(), "arch": e["arch"], "kind": k, "markdown": md}))
             }
             ("llm", "chat") => {
                 let mut body = b.clone();

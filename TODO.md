@@ -173,7 +173,8 @@ of IQ2_XXS instead could win twice.
       in nextsycl-diffusion; a template engine of each kind (llm/example, image/example, video/example) with its own
       kernel, and `nextsycl <kind> selftest`
 - [x] `nextsycl llm ...` (the old top-level names still work); `nextsycl image|video engines | selftest`
-- [x] The catalog of supported models (glue/models/catalog.json: direct HF links, sizes, SHA-256) and
+- [x] The catalog of supported models (model cards since 2026-10-11: model-cards/<kind>/<id>.yml, direct HF links,
+      sizes, SHA-256, settings, prompt guides - read at run time) and
       `nextsycl models search | pull` (resumes, checks SHA-256, hard-links equal files, `--from` adopts copies)
 - [ ] The catalog's files mirrored somewhere of our own (a backup of the links)
 - [x] Qwen-Image 2.1 (image/qwenimage21) on SYCL: the Qwen3-VL text encoder in int8 ConvRot (crates/qwen3vl, shared),

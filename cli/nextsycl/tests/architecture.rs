@@ -6,6 +6,7 @@
 //! 2. One GPU runtime: SYCL. No crate that brings another (Vulkan, CUDA, OpenCL, Metal, wgpu, ONNX Runtime,
 //!    PyTorch, candle, burn...) anywhere in Cargo.lock.
 //! 3. The project's own kernels (kernels/ns, kernels/<kind>/<arch>) include no other runtime's headers.
+//! 4. Every environment variable the code reads has a row in docs/environment.md.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -123,4 +124,81 @@ fn own_kernels_include_no_other_runtime() {
         }
     }
     assert!(bad.is_empty(), "another runtime's headers in the project's kernels (SYCL only: CONTRIBUTING.md):\n  {}", bad.join("\n  "));
+}
+
+/// Every environment variable the code reads, each with the first place it is read (file:line): `env::var("X")`,
+/// `getenv("X")`, `option_env!("X")`, the settings file's `cfg.get("X")` / `cfg.or("X", ..)` / `with_prefix(..)`,
+/// an engine's `setting("X")` and its option table's `env: "X"`, the settings page's `st("X", ..)`, the helpers that
+/// wrap those (`port`, `peak`, `env_on`, `env_flag`, `lanes_env`, `cfg, "X"`, `("--flag", "X", ..)`), and the build
+/// scripts' `${X:-default}`. Over *.rs, *.cpp, *.hpp, *.h and *.sh, kernels/strata included; target/ (build output),
+/// dist/ (the built program) and node_modules/ are not sources. reference/ is ours (the parity tools) and is scanned.
+fn env_reads() -> BTreeMap<String, String> {
+    const CALLS: &[&str] = &["env::var(", "env::var_os(", "getenv(", "option_env!(", ".get(", ".or(", ".setting(", "with_prefix(",
+                             "env_on(", "env_flag(", "lanes_env(", "port(", "peak(", "st(", "env:", "cfg,"];
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let name_at = |s: &str| -> String { s.chars().take_while(|&c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_').collect() };
+    let root = root();
+    let mut out = BTreeMap::new();
+    let mut stack = vec![root.clone()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            let file = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                if !matches!(file.as_str(), "target" | "dist" | "node_modules") && !file.starts_with('.') {
+                    stack.push(p);
+                }
+                continue;
+            }
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !matches!(ext, "rs" | "cpp" | "hpp" | "h" | "sh") {
+                continue;
+            }
+            let rel = p.strip_prefix(&root).unwrap_or(&p).display().to_string();
+            for (n, line) in std::fs::read_to_string(&p).unwrap_or_default().lines().enumerate() {
+                let mut found = Vec::new();
+                if ext == "sh" {
+                    for (i, _) in line.match_indices("${") {
+                        let name = name_at(&line[i + 2..]);
+                        // not ${1:-all}: an argument
+                        if name.starts_with(|c: char| c.is_ascii_uppercase()) && line[i + 2 + name.len()..].starts_with([':', '-', '+', '=']) {
+                            found.push(name);
+                        }
+                    }
+                } else {
+                    for (i, _) in line.match_indices('"') {
+                        let name = name_at(&line[i + 1..]);
+                        if name.len() < 2 || !name.starts_with(|c: char| c.is_ascii_uppercase()) || !line[i + 1 + name.len()..].starts_with('"') {
+                            continue;
+                        }
+                        let before = line[..i].trim_end();
+                        let call = CALLS.iter().any(|&c| {
+                            before.strip_suffix(c).is_some_and(|b| c.starts_with(['.', ':']) || !b.ends_with(ident))
+                        });
+                        // ("--flag", "X", default): a flag and the setting it falls back to
+                        let flag = before.strip_suffix(',').map(str::trim_end).and_then(|b| b.strip_suffix('"'))
+                            .and_then(|b| b.rfind('"').map(|q| &b[q + 1..])).is_some_and(|f| f.starts_with("--"));
+                        if call || flag {
+                            found.push(name);
+                        }
+                    }
+                }
+                for name in found {
+                    out.entry(name).or_insert_with(|| format!("{rel}:{}", n + 1));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn every_environment_variable_is_documented() {
+    let doc = std::fs::read_to_string(root().join("docs/environment.md")).unwrap();
+    // the doc's words: a variable is documented when its name is one (NS_QW_ matches the pattern row `NS_QW_*`)
+    let words: std::collections::BTreeSet<&str> = doc.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
+    let reads = env_reads();
+    assert!(reads.len() > 100, "the scan found only {} variables: is the pattern list broken?", reads.len());
+    let missing: Vec<String> = reads.iter().filter(|(name, _)| !words.contains(name.as_str())).map(|(name, at)| format!("{name} ({at})")).collect();
+    assert!(missing.is_empty(), "environment variables read but not in docs/environment.md (a row each: CONTRIBUTING.md):\n  {}", missing.join("\n  "));
 }

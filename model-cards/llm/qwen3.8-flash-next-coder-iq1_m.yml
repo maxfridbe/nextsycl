@@ -1,0 +1,38 @@
+# Qwen3.8-Flash-Next Coder IQ1_M (coding; the B70, 128K + 32K)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen3.8-flash-next-coder-iq1_m
+kind: llm
+arch: qwen4exp
+title: Qwen3.8-Flash-Next Coder IQ1_M (coding; the B70, 128K + 32K)
+about: 'ISTA-DASLab''s coding version: half the experts, kept for code and tools'
+gpus: '0'
+ctx: 131072,32768
+tools: true
+tasks: true
+env:
+  NS_QW_CHUNK: '4096'
+  NS_QW_EXPERT_PROFILE: '{expert-profile}'
+  NS_QW_MTP: '{mtp}'
+files:
+  model:
+    key: qwen38-coder-iq1m-1
+    url: https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/5348543e0147355ac9cbcb031184a3546350988e/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf
+    size: 29608446496
+    sha256: e11083ba855e7666b48ea3f2db6a9c3a20c18751a012cc24f948de91b7087fad
+    path: qwen3.8-flash-next-coder/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf
+  shard-2:
+    key: qwen38-coder-iq1m-2
+    url: https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/5348543e0147355ac9cbcb031184a3546350988e/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf
+    size: 28800138432
+    sha256: 316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113
+    path: qwen3.8-flash-next-coder/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf
+  expert-profile:
+    key: strata-expert-profile-coder
+    url: https://raw.githubusercontent.com/Niko1221/Strata/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/data/expert-profile-coder.bin
+    size: 98328
+    sha256: a514661124d5305effe9c1bcecff7dc069af398b2b19ff9d11628a2cad0a8915
+    path: strata-data/expert-profile-coder.bin
+local:
+  mtp: 'Qwen3.8-Flash-Next''s MTP draft layer as Strata''s runtime directory (tools/mtp_fetch.py, mtp_pack.py, mtp_rt.py in Strata''s setup; ~0.8 GB): about 2x faster answers. Without it the model runs
+    without drafts.'
+guide: guides/chat.md

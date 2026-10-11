@@ -1,0 +1,26 @@
+# Qwen-Image 2.1 Q6_K
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen-image-2.1-q6k
+kind: image
+arch: qwen-image-2.1
+title: Qwen-Image 2.1 Q6_K
+about: Qwen-Image 2.1 at Q6_K
+gpus: '0'
+defaults:
+  steps: 40
+  cfg: 1.0
+  sampler: euler
+  schedule: shift
+  size: 1024x1024
+env: {}
+files:
+  transformer:
+    key: qwen-image-21-q6k
+    url: https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF/resolve/4db8efdbe3426175988fca2ac50670f35ccb7ec9/qwen-image-2.1-Q6_K.gguf
+    size: 5876556448
+    sha256: a3a0d39bb03cda26302fc048b49d019baaea1c381cbda3994f6f2a7826344fb9
+    path: qwen-image-2.1/diffusion_models/qwen-image-2.1-Q6_K.gguf
+  text-encoder: qwen-image-21-te-int8
+  vae: qwen-image-21-vae
+  tokenizer: qwen-image-21-tokenizer
+guide: guides/qwen-image-2.1.md

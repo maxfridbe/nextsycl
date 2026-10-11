@@ -1,0 +1,18 @@
+# Qwen-Image 2.1 Pruna 5-step (a LoRA, v0.1, faster, rougher; qwen-research license)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen-image-2.1-pruna-5step-lora
+kind: lora
+arch: qwen-image-2.1
+title: Qwen-Image 2.1 Pruna 5-step (a LoRA, v0.1, faster, rougher; qwen-research license)
+about: Pruna's DMD few-step LoRA at scale 1.0, trained at 1K; brings its 5 sigmas, used as given (no shift)
+base: qwen-image-2.1
+env:
+  NS_QI_SIGMAS: 1,0.94,0.8571429,0.6666667,0.4
+  NS_QI_SIGMA_SHIFT: none
+files:
+  lora:
+    key: qwen-image-21-pruna-5step
+    url: https://huggingface.co/PrunaAI/Pruna-Qwen-Image-2.1/resolve/113e63bb993001b3411eb3470b84fc444040cd7e/p_qwen_image_2.1_5step_v0.1.safetensors
+    size: 335606144
+    sha256: 021a6228a0fcd217275190b89072416a2f28548e8e18fe049531dc9b77ef89bd
+    path: qwen-image-2.1/loras/p_qwen_image_2.1_5step_v0.1.safetensors

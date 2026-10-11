@@ -1,0 +1,20 @@
+# GLM-5.3-Flash uncensored IQ2 · 64K context (both GPUs)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: glm-5.3-flash-uncensored
+kind: llm
+arch: glm5-next
+title: GLM-5.3-Flash uncensored IQ2 · 64K context (both GPUs)
+about: GLM-5.3-Flash uncensored, IQ2 imatrix with its MTP block (ds4 layout)
+gpus: all
+ctx: '65536'
+tools: false
+tasks: false
+env: {}
+files:
+  model:
+    key: glm53-iq2-ds4
+    url: https://huggingface.co/DogContext/GLM-5.3-Flash-Uncensored-Q2-ds4/resolve/235989b3a2f4ede83c05c9bdb29130ea3f77e3bb/GLM-5.3-Flash-Uncensored-IQ2-imatrix-MTP-ds4.gguf
+    size: 96505818432
+    sha256: 1b3a7d5c36d507bbcb7c99995740772114c5d0ec628a68b8263237b883f98e4e
+    path: glm53-iq2/GLM-5.3-Flash-Uncensored-IQ2-imatrix-MTP-ds4.gguf
+guide: guides/chat.md

@@ -1,0 +1,28 @@
+# Qwen-Image 2.1 Turbo Q8_0 (Viggle v0.3: 6 steps, no CFG; qwen-research license)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen-image-2.1-turbo-q8
+kind: image
+arch: qwen-image-2.1
+title: 'Qwen-Image 2.1 Turbo Q8_0 (Viggle v0.3: 6 steps, no CFG; qwen-research license)'
+about: Viggle's few-step distill merged into the base transformer in fp32, then Q8_0; the base model's text encoder and VAE; its 6 sigmas with the size's shift, no terminal stretch
+gpus: '0'
+defaults:
+  steps: 6
+  cfg: 1.0
+  sampler: euler
+  schedule: shift
+  size: 1024x1024
+env:
+  NS_QI_SIGMAS: 1,0.9375,0.875,0.75,0.5,0.25
+  NS_QI_SIGMA_SHIFT: dynamic
+files:
+  transformer:
+    key: qwen-image-21-turbo-q80
+    url: https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo/resolve/009a44a895ef85f7e643c80fdca9543795248867/Qwen-Image-2.1-viggle-turbo-v0.3-6step-Q8_0.gguf
+    size: 7687180448
+    sha256: f3aaa3a00da202b1295bb2cb8dae0b15172c1e26aaeb805cdc1e4755bd94d64f
+    path: qwen-image-2.1/diffusion_models/Qwen-Image-2.1-viggle-turbo-v0.3-6step-Q8_0.gguf
+  text-encoder: qwen-image-21-te-int8
+  vae: qwen-image-21-vae
+  tokenizer: qwen-image-21-tokenizer
+guide: guides/qwen-image-2.1.md

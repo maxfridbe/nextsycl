@@ -1,0 +1,16 @@
+# MiniMax H3 realism, people (fal; trigger r34l1sm, strength ~0.5)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-h3-realism-lora
+kind: lora
+arch: minimax-h3
+title: MiniMax H3 realism, people (fal; trigger r34l1sm, strength ~0.5)
+about: photographic people for text, image and reference to video
+base: minimax-h3
+env: {}
+files:
+  lora:
+    key: h3-lora-realism
+    url: https://huggingface.co/fal/MiniMax-H3-Realism-People-LoRA/resolve/039cc8579d7aa357a882d7f4111b25da4f72dccc/h3-realism-people-t2v-i2v-r2v.safetensors
+    size: 131229656
+    sha256: acc529601d2da117fb81179e76c56e488a3beab1171659d305f04fa3655b787e
+    path: minimax-h3/loras/h3-realism-people-t2v-i2v-r2v.safetensors

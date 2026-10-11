@@ -1,0 +1,51 @@
+# Qwen3-TTS CustomVoice (speech in nine built-in voices, styled by an instruction; 10 languages, 24 kHz)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen3-tts-custom
+kind: audio
+arch: qwen3-tts
+title: Qwen3-TTS CustomVoice (speech in nine built-in voices, styled by an instruction; 10 languages, 24 kHz)
+about: 'Qwen3-TTS 12 Hz 1.7B: the talker (a 28-layer Qwen3 of 2,048) and its 5-layer code predictor, the 12 Hz codec''s decoder (Qwen''s checkpoint)'
+gpus: '0'
+speech:
+- voices
+defaults:
+  seconds: 60.0
+env: {}
+files:
+  model:
+    key: q3t-custom-model
+    url: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/model.safetensors
+    size: 3833402552
+    sha256: 38b1d5971bdbd982b561cccec982669a53b0537c3cf5e9bd4778ed07bb2f5137
+    path: qwen3-tts/custom/model.safetensors
+  config:
+    key: q3t-custom-config
+    url: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/config.json
+    size: 4908
+    sha256: 17a07f527a1c25ea30b4e023a184482a23d3e279d697b1dc81b1bde498d29cf9
+    path: qwen3-tts/custom/config.json
+  vocab:
+    key: q3t-vocab
+    url: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/vocab.json
+    size: 2776833
+    sha256: ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910
+    path: qwen3-tts/tokenizer/vocab.json
+  merges:
+    key: q3t-merges
+    url: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/merges.txt
+    size: 1671839
+    sha256: 599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3
+    path: qwen3-tts/tokenizer/merges.txt
+  tokenizer-config:
+    key: q3t-tokenizer-config
+    url: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/tokenizer_config.json
+    size: 7344
+    sha256: dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670
+    path: qwen3-tts/tokenizer/tokenizer_config.json
+  codec:
+    key: q3t-codec
+    url: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/0c0e3051f131929182e2c023b9537f8b1c68adfe/speech_tokenizer/model.safetensors
+    size: 682293092
+    sha256: 836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258
+    path: qwen3-tts/speech_tokenizer/model.safetensors
+guide: guides/qwen3-tts.md

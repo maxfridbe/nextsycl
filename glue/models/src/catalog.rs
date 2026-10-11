@@ -1,12 +1,14 @@
-//! The catalog of supported models (`catalog.json`, built into the program; `NS_CATALOG` names another): every file a
-//! model needs as a direct link pinned to a revision, with its size and SHA-256, and the settings its registry entry
-//! gets. `nextsycl models search` lists it; `nextsycl models pull <id>` downloads what is missing, checks it, and
-//! registers the model.
+//! The catalog of supported models: the model cards (`model-cards/<kind>/<id>.yml`, read when it is needed -
+//! `NS_MODEL_CARDS` names another directory; model-cards/README.md has the format). A card is one model: what it is,
+//! every file it needs as a direct link pinned to a revision with its size and SHA-256, the settings its registry
+//! entry gets, its prompt guide. `nextsycl models search` lists them; `nextsycl models pull <id>` downloads what is
+//! missing, checks it, and registers the model.
 //!
-//! Files are keyed once and shared by id (two models naming the same file download it once); a file with the same
-//! content already on the disk under another name (the Coder's shard 2 is the original's) is hard-linked, not
-//! fetched again. Some parts are made locally rather than downloaded (Qwen3.8-Flash-Next's MTP draft layer is built
-//! by Strata's tools): a model lists them under "local", and `pull` uses one it finds (the setting in nextsycl.conf,
+//! Files are keyed once and shared by key: a card defines a file (`key`, `url`, `size`, `sha256`, `path`) or names
+//! one another card defines (two models naming the same file download it once); a file with the same content
+//! already on the disk under another name (the Coder's shard 2 is the original's) is hard-linked, not fetched
+//! again. Some parts are made locally rather than downloaded (Qwen3.8-Flash-Next's MTP draft layer is built by
+//! Strata's tools): a model lists them under "local", and `pull` uses one it finds (the setting in nextsycl.conf,
 //! or another registry entry's) or registers the model without it.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,23 +21,107 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 
-const BUILT_IN: &str = include_str!("../catalog.json");
+/// The kinds of model, in the order `search` lists them
+pub const KINDS: &[&str] = &["llm", "image", "video", "audio", "lora"];
 
-/// The catalog: its files by key, its models
+/// The catalog: its files by key, its models (each card as JSON, its files as role -> key)
 pub struct Catalog {
     pub files: Map<String, Value>,
     pub models: Vec<Value>,
+    /// the cards' directory (a card's guide is relative to it)
+    pub dir: PathBuf,
+}
+
+/// The model cards' directory: `NS_MODEL_CARDS`, else model-cards/ beside the program (a release), else in the
+/// repository it was built in (dist/../model-cards)
+pub fn cards_dir(cfg: &Config) -> PathBuf {
+    if let Some(d) = cfg.get("NS_MODEL_CARDS") {
+        return PathBuf::from(d);
+    }
+    let here = cfg.dist.join("model-cards");
+    if here.is_dir() {
+        return here;
+    }
+    cfg.dist.join("../model-cards")
 }
 
 impl Catalog {
-    /// `NS_CATALOG` (a file), else the one built in
+    /// The cards of `cards_dir`
     pub fn load(cfg: &Config) -> Result<Catalog, String> {
-        let text = match cfg.get("NS_CATALOG") {
-            Some(p) => std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?,
-            None => BUILT_IN.to_string(),
-        };
-        let v: Value = serde_json::from_str(&text).map_err(|e| format!("the catalog: {e}"))?;
-        Ok(Catalog { files: v["files"].as_object().cloned().unwrap_or_default(), models: v["models"].as_array().cloned().unwrap_or_default() })
+        Catalog::from_dir(&cards_dir(cfg))
+    }
+
+    /// Every `<kind>/<id>.yml` under `dir`: checked (the id is the file's name, the kind its folder, each file
+    /// defined once and every key named defined), in kind order, then by id
+    pub fn from_dir(dir: &Path) -> Result<Catalog, String> {
+        let mut cards = Vec::new();
+        for kind in KINDS {
+            let Ok(rd) = std::fs::read_dir(dir.join(kind)) else { continue };
+            let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml")).collect();
+            paths.sort();
+            for p in paths {
+                let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+                let v: Value = serde_yaml::from_str(&text).map_err(|e| format!("{}: {e}", p.display()))?;
+                let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                if v["id"].as_str() != Some(stem.as_str()) {
+                    return Err(format!("{}: its id is not its file's name ({stem})", p.display()));
+                }
+                if v["kind"].as_str() != Some(kind) {
+                    return Err(format!("{}: its kind is not its folder ({kind})", p.display()));
+                }
+                cards.push((p, v));
+            }
+        }
+        if cards.is_empty() {
+            return Err(format!("{}: no model cards (<kind>/<id>.yml; NS_MODEL_CARDS names another directory)", dir.display()));
+        }
+        let mut files = Map::new();
+        let mut models = Vec::with_capacity(cards.len());
+        let mut named = Vec::new();
+        for (p, mut v) in cards {
+            if let Some(fs) = v.get_mut("files").and_then(Value::as_object_mut) {
+                for (role, f) in fs.iter_mut() {
+                    if let Some(def) = f.as_object() {
+                        let key = def.get("key").and_then(Value::as_str).ok_or_else(|| format!("{}: files.{role} has no key", p.display()))?.to_string();
+                        let mut body = def.clone();
+                        body.remove("key");
+                        if files.get(&key).is_some_and(|x| x != &Value::Object(body.clone())) {
+                            return Err(format!("{}: files.{role}: {key} defined otherwise in another card", p.display()));
+                        }
+                        files.insert(key.clone(), Value::Object(body));
+                        *f = Value::String(key);
+                    } else if let Some(key) = f.as_str() {
+                        named.push((p.clone(), role.clone(), key.to_string()));
+                    } else {
+                        return Err(format!("{}: files.{role}: a file (key, url, size, sha256, path) or another card's file key", p.display()));
+                    }
+                }
+            }
+            models.push(v);
+        }
+        for (p, role, key) in named {
+            if !files.contains_key(&key) {
+                return Err(format!("{}: files.{role} names {key}, which no card defines", p.display()));
+            }
+        }
+        let mut ids = BTreeSet::new();
+        for m in &models {
+            if !ids.insert(s(m, "id")) {
+                return Err(format!("{}: two cards", s(m, "id")));
+            }
+        }
+        Ok(Catalog { files, models, dir: dir.to_path_buf() })
+    }
+
+    /// The prompt guide (Markdown) for a registry entry: its card's (the one it was pulled from, or of its id), else
+    /// a card's of the same kind and architecture, else of the same kind
+    pub fn guide(&self, entry: &Value) -> Option<String> {
+        let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("llm");
+        let has = |m: &&Value| m.get("guide").and_then(Value::as_str).is_some();
+        let card = [s(entry, "catalog"), s(entry, "id")].iter().find_map(|id| self.models.iter().filter(has).find(|m| !id.is_empty() && s(m, "id") == *id))
+            .or_else(|| self.models.iter().filter(has).find(|m| s(m, "kind") == kind && s(m, "arch") == s(entry, "arch")))
+            .or_else(|| self.models.iter().filter(has).find(|m| s(m, "kind") == kind))?;
+        std::fs::read_to_string(self.dir.join(s(card, "guide"))).ok()
     }
 
     pub fn model(&self, id: &str) -> Option<&Value> {
@@ -320,23 +406,25 @@ pub fn pull(cfg: &Config, installed: &[Value], ids: &[String], raw: &[String]) -
 mod tests {
     use super::*;
 
+    fn repo_cards() -> Catalog {
+        Catalog::from_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../model-cards")).unwrap()
+    }
+
     #[test]
-    fn the_built_in_catalog_is_whole() {
-        let v: Value = serde_json::from_str(BUILT_IN).unwrap();
-        let files = v["files"].as_object().unwrap();
-        for (k, f) in files {
+    fn the_model_cards_are_whole() {
+        let cat = repo_cards();
+        for (k, f) in &cat.files {
             assert!(s(f, "url").starts_with("https://"), "{k}: a direct link");
             assert_eq!(s(f, "sha256").len(), 64, "{k}: a SHA-256");
             assert!(f["size"].as_u64().unwrap_or(0) > 0, "{k}: a size");
             assert!(!s(f, "path").is_empty() && !s(f, "path").starts_with('/'), "{k}: a relative path");
         }
-        let mut ids = BTreeSet::new();
-        for m in v["models"].as_array().unwrap() {
+        for m in &cat.models {
             let id = s(m, "id");
-            assert!(ids.insert(id.clone()), "{id} twice");
-            assert!(["llm", "image", "video", "audio", "lora"].contains(&s(m, "kind").as_str()), "{id}: a kind");
-            for (role, key) in m["files"].as_object().unwrap() {
-                assert!(files.contains_key(key.as_str().unwrap()), "{id}: {role} names no file");
+            assert!(!s(m, "title").is_empty() && !s(m, "arch").is_empty(), "{id}: a title and an architecture");
+            // a model's guide is a file beside the cards (loras have none: they ride on a model)
+            if s(m, "kind") != "lora" {
+                assert!(cat.dir.join(s(m, "guide")).is_file(), "{id}: its guide {}", s(m, "guide"));
             }
             // every {role} in a setting is a file or a local part of the model
             for v in m["env"].as_object().into_iter().flatten().filter_map(|(_, v)| v.as_str()) {
@@ -346,6 +434,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_guide_falls_back_to_its_architecture_then_its_kind() {
+        let cat = repo_cards();
+        let tts = cat.guide(&json!({"id": "mine", "kind": "audio", "arch": "qwen3-tts"})).unwrap();
+        assert_eq!(tts, std::fs::read_to_string(cat.dir.join("guides/qwen3-tts.md")).unwrap());
+        let chat = cat.guide(&json!({"id": "mine", "kind": "llm", "arch": "new"})).unwrap();
+        assert_eq!(chat, std::fs::read_to_string(cat.dir.join("guides/chat.md")).unwrap());
     }
 
     #[test]

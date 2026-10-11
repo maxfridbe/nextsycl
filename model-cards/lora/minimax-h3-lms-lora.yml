@@ -1,0 +1,16 @@
+# MiniMax H3 LMS v1.0, rank 64 (Alissonerdx)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-h3-lms-lora
+kind: lora
+arch: minimax-h3
+title: MiniMax H3 LMS v1.0, rank 64 (Alissonerdx)
+about: a LoRA published as minimax_h3_lms_v1.0_r64
+base: minimax-h3
+env: {}
+files:
+  lora:
+    key: h3-lora-lms
+    url: https://huggingface.co/Alissonerdx/Minimax-H3-ComfyUI/resolve/849fb3d4f434f2e9b4a4d4f7253471bf5e6719f9/loras/minimax_h3_lms_v1.0_r64.safetensors
+    size: 1239664536
+    sha256: 16f3195bc6bffa431c0598dc2031e520ba058b4fcbc9f104db9e3fdfdeacf60c
+    path: minimax-h3/loras/minimax_h3_lms_v1.0_r64.safetensors

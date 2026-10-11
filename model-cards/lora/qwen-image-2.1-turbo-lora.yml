@@ -1,0 +1,18 @@
+# Qwen-Image 2.1 Turbo (Viggle v0.3, a 6-step LoRA, rank 128; qwen-research license)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen-image-2.1-turbo-lora
+kind: lora
+arch: qwen-image-2.1
+title: Qwen-Image 2.1 Turbo (Viggle v0.3, a 6-step LoRA, rank 128; qwen-research license)
+about: the few-step distill as a LoRA for the base model at scale 1.0; brings its 6-sigma preset
+base: qwen-image-2.1
+env:
+  NS_QI_SIGMAS: 1,0.9375,0.875,0.75,0.5,0.25
+  NS_QI_SIGMA_SHIFT: dynamic
+files:
+  lora:
+    key: qwen-image-21-turbo-lora
+    url: https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo/resolve/009a44a895ef85f7e643c80fdca9543795248867/Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r128.safetensors
+    size: 679604800
+    sha256: 0c98591700346f9777051d4e6fa29aa94519abec0d85b1f1f672a2a3db8c94b3
+    path: qwen-image-2.1/loras/Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r128.safetensors

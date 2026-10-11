@@ -1,0 +1,136 @@
+# MiniMax H3 (int8 ConvRot denoiser: the fastest; text, pictures, a voice to video with sound)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-h3
+kind: video
+arch: minimax-h3
+title: 'MiniMax H3 (int8 ConvRot denoiser: the fastest; text, pictures, a voice to video with sound)'
+about: the 50-block FL2VA DiT in ComfyUI's int8 ConvRot (int8 GEMMs), the Qwen3-VL 32B text encoder (Q4_K_M), video and audio VAEs, the latent upscaler
+gpus: '0'
+defaults:
+  steps: 8
+  seconds: 2.0
+  size: 384x288
+env: {}
+files:
+  denoiser:
+    key: h3-denoiser-int8
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+    size: 20970379616
+    sha256: e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a
+    path: minimax-h3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+  text-encoder:
+    key: h3-te-32b-q4km
+    url: https://huggingface.co/unsloth/MiniMax-H3-GGUF/resolve/d629413c2e5b51b38c453668b75ca3b06ca92703/qwen3vl_32b_minimax_h3-Q4_K_M.gguf
+    size: 18218065024
+    sha256: 11e6efe70a57ce7f4838c47bdbd1a1c4b8ce10e2b7747f1b065990b70f4b05fc
+    path: minimax-h3/text_encoders/qwen3vl_32b_minimax_h3-Q4_K_M.gguf
+  tokenizer:
+    key: h3-tokenizer-vocab
+    url: https://raw.githubusercontent.com/comfyanonymous/ComfyUI/08ff3c11b3a85eb07c2c06f21cb378ac2e086840/comfy/text_encoders/qwen25_tokenizer/vocab.json
+    size: 2776833
+    sha256: ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910
+    path: minimax-h3/tokenizer/vocab.json
+  tokenizer-merges:
+    key: h3-tokenizer-merges
+    url: https://raw.githubusercontent.com/comfyanonymous/ComfyUI/08ff3c11b3a85eb07c2c06f21cb378ac2e086840/comfy/text_encoders/qwen25_tokenizer/merges.txt
+    size: 1671853
+    sha256: 8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5
+    path: minimax-h3/tokenizer/merges.txt
+  tokenizer-config:
+    key: h3-tokenizer-config
+    url: https://raw.githubusercontent.com/comfyanonymous/ComfyUI/08ff3c11b3a85eb07c2c06f21cb378ac2e086840/comfy/text_encoders/qwen25_tokenizer/tokenizer_config.json
+    size: 8018
+    sha256: 49292bd4a58a43382bf01311bc3ed7a151a7f16fe07d155e900ea1af281555db
+    path: minimax-h3/tokenizer/tokenizer_config.json
+  vae:
+    key: h3-vae
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/vae/minimax_h3_video_vae_fp16.safetensors
+    size: 5207808496
+    sha256: 7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522
+    path: minimax-h3/vae/minimax_h3_video_vae_fp16.safetensors
+  audio-vae:
+    key: h3-audio-vae
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/vae/minimax_h3_audio_vae_fp32.safetensors
+    size: 605254808
+    sha256: 8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48
+    path: minimax-h3/vae/minimax_h3_audio_vae_fp32.safetensors
+  upscaler:
+    key: h3-upscaler
+    url: https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/3f941d5d182014dd5c0a5e16330420ee2d4aa0c6/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors
+    size: 690592992
+    sha256: 4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6
+    path: minimax-h3/upscaler/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors
+  vision:
+    key: h3-te-visual
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors
+    tensors: visual.
+    size: 1190570896
+    sha256: 81fceb92c313723ad1339e155df23272dd0ae61535b87a4974137f19b9ee9178
+    path: minimax-h3/text_encoders/qwen3vl_32b_minimax_h3_visual_bf16.safetensors
+  embedding-art-is-explosion:
+    key: h3-embedding-art-is-explosion
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/embeddings/minimaxh3_art_is_explosion.safetensors
+    size: 512120
+    sha256: 00e8679c77ce1fc3fd3accb67bc4db56d626b6b27609797504ab00e2b997145f
+    path: minimax-h3/embeddings/minimaxh3_art_is_explosion.safetensors
+  embedding-blooming-flowers:
+    key: h3-embedding-blooming-flowers
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/embeddings/minimaxh3_blooming_flowers.safetensors
+    size: 1259640
+    sha256: 934d1d2c50bf27cd0b3785b0f44b0b62119a90b2901f9193782d86ff7191cbe9
+    path: minimax-h3/embeddings/minimaxh3_blooming_flowers.safetensors
+  embedding-bullet-time:
+    key: h3-embedding-bullet-time
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/embeddings/minimaxh3_bullet_time.safetensors
+    size: 962680
+    sha256: e318b200d28c22fcf41d9b25ce481dd5a766f0ac50561663e33401975ea1bcae
+    path: minimax-h3/embeddings/minimaxh3_bullet_time.safetensors
+  embedding-dark-magic:
+    key: h3-embedding-dark-magic
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/embeddings/minimaxh3_dark_magic.safetensors
+    size: 604280
+    sha256: 71df9fe76f9cbb34a7508fc49d46bf35ee51744aaa17789c6406e1bec49f5866
+    path: minimax-h3/embeddings/minimaxh3_dark_magic.safetensors
+  embedding-fire-breath:
+    key: h3-embedding-fire-breath
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/embeddings/minimaxh3_fire_breath.safetensors
+    size: 1208440
+    sha256: ed048cf52802774a819e916bbf6ad6eaa047027abc6cd0decc63daccbb93c9f1
+    path: minimax-h3/embeddings/minimaxh3_fire_breath.safetensors
+  embedding-four-seasons:
+    key: h3-embedding-four-seasons
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/embeddings/minimaxh3_four_seasons.safetensors
+    size: 1454200
+    sha256: 9a432e89afc942d1ea27055372a6fb81c4dc0f4c0498a49b9f5eff1a015f1034
+    path: minimax-h3/embeddings/minimaxh3_four_seasons.safetensors
+  embedding-kiss-camera:
+    key: h3-embedding-kiss-camera
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/embeddings/minimaxh3_kiss_camera.safetensors
+    size: 993400
+    sha256: 9da82f56c26f2a81b80803a31486d31036c122112203b62d4991759a90ddf4b8
+    path: minimax-h3/embeddings/minimaxh3_kiss_camera.safetensors
+  embedding-spiral-ascent:
+    key: h3-embedding-spiral-ascent
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/embeddings/minimaxh3_spiral_ascent.safetensors
+    size: 1341560
+    sha256: 767b6bdccee4c41805802a07bf3c04ba9582fbb8e7bc4bd416ff8e000e3e29b9
+    path: minimax-h3/embeddings/minimaxh3_spiral_ascent.safetensors
+  embedding-storm-magic:
+    key: h3-embedding-storm-magic
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/embeddings/minimaxh3_storm_magic.safetensors
+    size: 1403000
+    sha256: 5047cd4499207ef20d62872c7153a476e216e7edabd12b595802f567666d7425
+    path: minimax-h3/embeddings/minimaxh3_storm_magic.safetensors
+  embedding-truman-show:
+    key: h3-embedding-truman-show
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/embeddings/minimaxh3_truman_show.safetensors
+    size: 921720
+    sha256: 3830e6ab9d7b95965f5497a6691bd92e33f8bf7a62bafb7b2331b268ff98aa00
+    path: minimax-h3/embeddings/minimaxh3_truman_show.safetensors
+  controlnet:
+    key: h3-controlnet-union-int8
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/model_patches/minimax_h3_fun_controlnet_union_2.0_pruned_int8_convrot.safetensors
+    size: 4531220608
+    sha256: 890af58bb350f0c2f6c409b1c67ea8f4196654297d037769b72de1e6f504c612
+    path: minimax-h3/model_patches/minimax_h3_fun_controlnet_union_2.0_pruned_int8_convrot.safetensors
+guide: guides/minimax-h3.md

@@ -46,8 +46,9 @@ things fast, learned on these ports: [skills/sycl-porting/SKILL.md](skills/sycl-
 
 ## Supported models
 
-What `nextsycl models search` lists and `nextsycl models pull <id>` installs (direct links, sizes and SHA-256 in
-`glue/models/catalog.json`). **Checked**: compared stage by stage with a reference run on the same files. **Served**:
+What `nextsycl models search` lists and `nextsycl models pull <id>` installs: a model card each
+(`model-cards/<kind>/<id>.yml` - direct links, sizes and SHA-256, the registry settings, the prompt guide; read at
+run time, not built in: [model-cards/README.md](model-cards/README.md)). **Checked**: compared stage by stage with a reference run on the same files. **Served**:
 running in daily use here, with its speed measured. **Listed**: in the catalog, not yet run on this machine.
 
 **Language** (`nextsycl llm`)
@@ -974,6 +975,7 @@ artifact.
 
 - `docs/architecture.md`: the layout - the foundation crates, each kind's contract and engines (`<kind>/<arch>`, their
   kernels in `kernels/<kind>/<arch>`), the glue, the program - its rules, and the engines' settings.
+- `docs/environment.md`: every environment variable and nextsycl.conf setting - its default, what it does, what reads it.
 - `CONTRIBUTING.md`: porting a model from a kind's template, the rules (SYCL only; the layers), building, checking.
 - `docs/glm5next.md`: the model's math, as this runtime computes it.
 - `docs/256k-context.md`: long context - memory a token, the measured scaling, what 256K takes and what is left.

@@ -79,6 +79,9 @@ impl nextsycl_serve::home::registry::Store for Store {
     fn file(&self) -> PathBuf {
         self.0.file()
     }
+    fn guide(&self, entry: &serde_json::Value) -> Option<String> {
+        nextsycl_models::catalog::Catalog::load(&self.0).ok()?.guide(entry)
+    }
 }
 
 pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {

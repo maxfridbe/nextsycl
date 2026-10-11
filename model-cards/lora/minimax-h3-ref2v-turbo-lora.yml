@@ -1,0 +1,16 @@
+# MiniMax H3 ref2v turbo, 4 steps (Comfy-Org)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-h3-ref2v-turbo-lora
+kind: lora
+arch: minimax-h3
+title: MiniMax H3 ref2v turbo, 4 steps (Comfy-Org)
+about: reference-to-video in 4 steps
+base: minimax-h3
+env: {}
+files:
+  lora:
+    key: h3-lora-ref2v-turbo
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/e5eb578a89295337b8ff433a035929ce0279e0b6/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors
+    size: 1956193000
+    sha256: 5b9ab5ade15d0775676d01a907268a69a1468dc6033b3b0d3ded5502f3ebb84c
+    path: minimax-h3/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors

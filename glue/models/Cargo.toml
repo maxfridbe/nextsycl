@@ -9,3 +9,4 @@ license.workspace = true
 nextsycl-gguf.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+serde_yaml = "0.9"

@@ -19,6 +19,8 @@ pub trait Store: Send + Sync {
     fn in_env(&self, name: &str) -> bool;
     /// the settings file the page edits
     fn file(&self) -> PathBuf;
+    /// an entry's prompt guide (Markdown), from the model cards
+    fn guide(&self, entry: &Value) -> Option<String>;
 }
 
 impl<T: Store + ?Sized> Store for Box<T> {
@@ -39,6 +41,9 @@ impl<T: Store + ?Sized> Store for Box<T> {
     }
     fn file(&self) -> PathBuf {
         (**self).file()
+    }
+    fn guide(&self, entry: &Value) -> Option<String> {
+        (**self).guide(entry)
     }
 }
 

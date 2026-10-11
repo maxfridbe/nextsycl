@@ -72,6 +72,8 @@ clear message where the port begins: `llm/example`, `image/example`, `video/exam
    it sets, what the value looks like, a line of help, when it applies). The program then forwards
    `--opt-NAME VALUE` from every command (and an API request's `"options"`) to it, rejects a typo with the list,
    and shows them under `nextsycl <kind> engines` - no change to the command line for a new architecture.
+   A new variable (an option's, a setting's, a kernel's getenv) gets a row in `docs/environment.md`; the
+   architecture test (`cli/nextsycl/tests/architecture.rs`) fails on one that has none.
 7. **Register it.** Add `nextsycl_<kind>_<arch>::kind()` to the program's list of that kind
    (`cli/nextsycl/src/main.rs`: `engines()`, `video_engines()`; `cli/nextsycl/src/image.rs`: `engines()`). `nextsycl <kind> engines`
    lists it.
@@ -80,7 +82,8 @@ clear message where the port begins: `llm/example`, `image/example`, `video/exam
    gives the same results as the shared kernel (same outputs, the same greedy text with `NS_SILO=0` and without), and
    measure with the kind's bench before and after (`nextsycl llm bench`, ...); quote both in the pull request.
 9. **Document it**: its settings and numbers in `docs/architecture.md` (its engine section) and the README's speed
-   tables; a catalog entry when its files are public.
+   tables; a model card (`model-cards/<kind>/<id>.yml`, model-cards/README.md) when its files are public - a model
+   of an architecture already served needs only its card, no code.
 
 ## Code style
 

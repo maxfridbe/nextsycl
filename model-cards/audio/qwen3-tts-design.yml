@@ -1,0 +1,31 @@
+# Qwen3-TTS VoiceDesign (speech in a voice made up from a description; 10 languages, 24 kHz)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen3-tts-design
+kind: audio
+arch: qwen3-tts
+title: Qwen3-TTS VoiceDesign (speech in a voice made up from a description; 10 languages, 24 kHz)
+about: 'Qwen3-TTS 12 Hz 1.7B: the talker (a 28-layer Qwen3 of 2,048) and its 5-layer code predictor, the 12 Hz codec''s decoder (Qwen''s checkpoint)'
+gpus: '0'
+speech:
+- design
+defaults:
+  seconds: 60.0
+env: {}
+files:
+  model:
+    key: q3t-design-model
+    url: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/5ecdb67327fd37bb2e042aab12ff7391903235d3/model.safetensors
+    size: 3833402552
+    sha256: 391e8db219f292c515297cdceeb43e4eae67cdde35fa57e79a6a8a532fca0522
+    path: qwen3-tts/design/model.safetensors
+  config:
+    key: q3t-design-config
+    url: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/5ecdb67327fd37bb2e042aab12ff7391903235d3/config.json
+    size: 4421
+    sha256: aecd2cc4c1fe9edef1cb7ca7c401685a43879ad43f3f9e883f1c6760b61731e0
+    path: qwen3-tts/design/config.json
+  vocab: q3t-vocab
+  merges: q3t-merges
+  tokenizer-config: q3t-tokenizer-config
+  codec: q3t-codec
+guide: guides/qwen3-tts.md

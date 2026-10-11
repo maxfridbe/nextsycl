@@ -1,0 +1,31 @@
+# Qwen3-TTS Base (speech in a voice cloned from a recording; 10 languages, 24 kHz)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen3-tts-base
+kind: audio
+arch: qwen3-tts
+title: Qwen3-TTS Base (speech in a voice cloned from a recording; 10 languages, 24 kHz)
+about: 'Qwen3-TTS 12 Hz 1.7B: the talker (a 28-layer Qwen3 of 2,048) and its 5-layer code predictor, the 12 Hz codec''s decoder (Qwen''s checkpoint), and the speaker encoder (ECAPA x-vector)'
+gpus: '0'
+speech:
+- clone
+defaults:
+  seconds: 60.0
+env: {}
+files:
+  model:
+    key: q3t-base-model
+    url: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/fd4b254389122332181a7c3db7f27e918eec64e3/model.safetensors
+    size: 3857413744
+    sha256: 38fc7fc51c5e776e840414b6fd443962e9411b9654888fd7913e4da643cb857c
+    path: qwen3-tts/base/model.safetensors
+  config:
+    key: q3t-base-config
+    url: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/fd4b254389122332181a7c3db7f27e918eec64e3/config.json
+    size: 4494
+    sha256: b4f01752d15a488abde3e1ab44723ae4f4b9e68a4037257b098b3737893cc1f9
+    path: qwen3-tts/base/config.json
+  vocab: q3t-vocab
+  merges: q3t-merges
+  tokenizer-config: q3t-tokenizer-config
+  codec: q3t-codec
+guide: guides/qwen3-tts.md

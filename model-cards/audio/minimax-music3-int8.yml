@@ -1,0 +1,26 @@
+# MiniMax Music 3, its language model in int8 (half the VRAM, faster frames)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-music3-int8
+kind: audio
+arch: minimax-music3
+title: MiniMax Music 3, its language model in int8 (half the VRAM, faster frames)
+about: the 8B semantic language model (Qwen3-8B's shape) and RVQ depth decoder, the 2.4B flow-matching transformer, the Flow-VAE decoder (MiniMax's diffusers checkpoint)
+gpus: '0'
+defaults:
+  seconds: 60.0
+  steps: 30
+  cfg: 1.7
+env:
+  NS_MM3_INT8: '1'
+files:
+  language-model-1: mm3-lm-1
+  language-model-2: mm3-lm-2
+  language-model-3: mm3-lm-3
+  language-model-4: mm3-lm-4
+  depth-decoder: mm3-depth
+  transformer-1: mm3-transformer-1
+  transformer-2: mm3-transformer-2
+  condition-encoder: mm3-condition
+  vocoder: mm3-vocoder
+  tokenizer: mm3-tokenizer
+guide: guides/minimax-music3.md
