@@ -141,6 +141,20 @@ pub fn rerun_in_image(cfg: &Config, args: &[String]) -> Option<Result<i32, Strin
         if let Some(m) = cfg.get("NS_MODELS").map(std::path::PathBuf::from).filter(|p| p.is_dir()) {
             mounts.push((m, true));
         }
+        // the registry (a job names its model by id) and the files of its models, read-only
+        let reg = nextsycl_models::registry::registry(cfg);
+        if let Some(d) = reg.parent().filter(|d| d.is_dir()) {
+            mounts.push((d.to_path_buf(), true));
+        }
+        for m in nextsycl_models::registry::all(cfg).unwrap_or_default() {
+            for p in nextsycl_models::registry::paths(&m) {
+                if let Some(d) = if p.is_dir() { Some(p.clone()) } else { p.parent().map(Path::to_path_buf) } {
+                    if d.is_dir() && args.iter().any(|a| m["id"] == a.as_str()) {
+                        mounts.push((d, true));
+                    }
+                }
+            }
+        }
         for a in args.iter().filter(|a| !a.starts_with("--")) {
             let p = cwd.join(a);
             if let Ok(c) = p.canonicalize() {
@@ -170,6 +184,10 @@ pub fn rerun_in_image(cfg: &Config, args: &[String]) -> Option<Result<i32, Strin
             c.args(mount(p, &p.to_string_lossy(), *ro));
         }
         c.args(["-w", &cwd.to_string_lossy(), "-e", "NS_IN_IMAGE=1"]);
+        // the same home (the default registry and settings under ~/.config)
+        if let Ok(h) = std::env::var("HOME") {
+            c.args(["-e", &format!("HOME={h}")]);
+        }
         if std::env::var_os("ONEAPI_DEVICE_SELECTOR").is_none() {
             c.args(["-e", "ONEAPI_DEVICE_SELECTOR=level_zero:*"]);
         }
