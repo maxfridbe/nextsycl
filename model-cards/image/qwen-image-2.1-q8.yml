@@ -6,6 +6,7 @@ arch: qwen-image-2.1
 title: Qwen-Image 2.1 Q8_0 (text to image, RGBA)
 about: Qwen's 7B single-stream DiT, Q8_0 (GGUF by abenzerps), the Qwen3-VL 8B text encoder in int8, the 64-channel VAE
 gpus: '0'
+vram_gib: 25.0                   # its memory on the card when it runs (measured on a B70)
 defaults:
   steps: 40
   cfg: 1.0

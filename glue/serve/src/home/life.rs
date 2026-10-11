@@ -96,12 +96,17 @@ impl Home {
         Ok(())
     }
 
-    /// The memory a model takes on each of its cards, MiB: as seen while it ran, else from its files' sizes
+    /// The memory a model takes on each of its cards, MiB: as seen while it ran, else its model card's `vram_gib` (as
+    /// measured where it runs), else from its files' sizes - never more than a card holds beside the spare
     fn vouched_mb(&self, m: &Value, card_mb: u64) -> (BTreeMap<usize, u64>, bool) {
         let id = s(m, "id");
         let gpus = self.gpus_of(m);
         if let Some(seen) = self.seen.lock().unwrap().get(&id).filter(|g| gpus.iter().all(|i| g.contains_key(i))) {
             return (gpus.iter().map(|g| (*g, seen[g])).collect(), true);
+        }
+        let cap = card_mb.saturating_sub(MARGIN_MB + 512);
+        if let Some(g) = m["vram_gib"].as_f64().filter(|g| *g > 0.0) {
+            return (gpus.iter().map(|i| (*i, ((g * 1024.0) as u64).min(cap))).collect(), false);
         }
         let files: u64 = registry::paths(m).iter().filter(|p| p.is_file()).filter_map(|p| std::fs::metadata(p).ok()).map(|x| x.len() >> 20).sum();
         let per = match registry::kind_of(m) {
@@ -110,7 +115,7 @@ impl Home {
             "audio" => files * 110 / 100 / gpus.len() as u64 + 2048,
             _ => files / gpus.len() as u64 + 2048,
         };
-        (gpus.iter().map(|g| (*g, per.min(card_mb.saturating_sub(1024)))).collect(), false)
+        (gpus.iter().map(|g| (*g, per.min(cap))).collect(), false)
     }
 
     /// What the studio says of the chat card: (selected mode, the mode starting)

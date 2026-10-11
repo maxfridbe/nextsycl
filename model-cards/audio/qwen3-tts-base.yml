@@ -6,6 +6,7 @@ arch: qwen3-tts
 title: Qwen3-TTS Base (speech in a voice cloned from a recording; 10 languages, 24 kHz)
 about: 'Qwen3-TTS 12 Hz 1.7B: the talker (a 28-layer Qwen3 of 2,048) and its 5-layer code predictor, the 12 Hz codec''s decoder (Qwen''s checkpoint), and the speaker encoder (ECAPA x-vector)'
 gpus: '0'
+vram_gib: 5.0                   # its memory on the card when it runs (measured on a B70)
 speech:
 - clone
 defaults:

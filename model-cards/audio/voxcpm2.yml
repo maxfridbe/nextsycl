@@ -6,6 +6,7 @@ arch: voxcpm2
 title: 'VoxCPM2 (speech in 30 languages at 48 kHz: voices designed from a description or cloned from a recording)'
 about: 'VoxCPM2: MiniCPM4 base (28 layers) and residual (8) language models, a local encoder and a local flow-matching DiT (12 layers each), AudioVAE V2 (16 kHz in, 48 kHz out) - OpenBMB''s checkpoint'
 gpus: '0'
+vram_gib: 5.5                   # its memory on the card when it runs (measured on a B70)
 speech:
 - design
 - clone

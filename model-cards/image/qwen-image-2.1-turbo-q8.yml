@@ -6,6 +6,7 @@ arch: qwen-image-2.1
 title: 'Qwen-Image 2.1 Turbo Q8_0 (Viggle v0.3: 6 steps, no CFG; qwen-research license)'
 about: Viggle's few-step distill merged into the base transformer in fp32, then Q8_0; the base model's text encoder and VAE; its 6 sigmas with the size's shift, no terminal stretch
 gpus: '0'
+vram_gib: 25.0                   # its memory on the card when it runs (measured on a B70)
 defaults:
   steps: 6
   cfg: 1.0

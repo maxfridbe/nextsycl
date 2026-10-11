@@ -15,6 +15,8 @@ arch: qwen35                    # the engine that runs it (GGUF general.architec
 title: Qwen3.8-27B UD-Q4_K_M (4-bit; the B70, 128K + 32K)
 about: Qwen's dense Qwen3.8 27B ...
 gpus: '0'                       # the GPUs it loads on: '0', '1', '0,1', or 'all' (weakest first)
+vram_gib: 29.0                  # its memory on each card when it runs, as measured (the front door keeps the card
+                                #   free for it before it has measured the model itself; else from the files' sizes)
 ctx: 131072,32768               # llm: each session's context
 tools: true                     # llm: tool calls offered to it (false: dropped)
 tasks: true                     # llm: a front end's background tasks (titles, tags) accepted
