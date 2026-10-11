@@ -337,6 +337,7 @@ impl Home {
                 Ok(json!({"model": model(), "arch": e["arch"], "kind": k, "markdown": md}))
             }
             ("llm", "chat") => {
+                let t = self.chat_target(b["model"].as_str())?;
                 let mut body = b.clone();
                 body["stream"] = json!(false);
                 call_for(&t, "POST", "/v1/chat/completions", Some(&body), 1800).map_err(|e| (502, e))
@@ -445,7 +446,9 @@ impl Home {
             }
             ("POST", "/v1/chat/completions") => {
                 need("llm")?;
-                pass(s, &self.target("llm"))
+                let model = serde_json::from_slice::<Value>(&req.body).ok().and_then(|v| v["model"].as_str().map(str::to_string));
+                let t = self.chat_target(model.as_deref())?;
+                pass(s, &t)
             }
             ("POST", p @ ("/v1/images/generations" | "/v1/images/edits" | "/v1/audio/speech")) => {
                 let kind = if p.starts_with("/v1/images") { "image" } else { "audio" };

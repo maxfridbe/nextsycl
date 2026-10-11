@@ -2,7 +2,9 @@
 //! demand and unloading.
 //!
 //! - chat (llm): the video studio's llm.mode loads one at a time (it knows when a render holds the card); the switcher
-//!   loads on Open WebUI's request and unloads after the idle time; enabled = listed by the switcher.
+//!   loads on Open WebUI's request and unloads after the idle time; enabled = listed by the switcher. A box with
+//!   neither (the front door alone): this page starts the chat server itself (`nextsycl llm start ID`) for the model
+//!   a request names, stopping the one before it.
 //! - image, audio: one server each (`nextsycl image|audio start ID --gpu N --idle-exit S`), started on the first
 //!   request for an enabled model, swapped when a request names another (after the one running), ending itself when
 //!   idle. A start waits for the card to have the model's memory free (1.5 GiB to spare: past that the xe driver
@@ -25,6 +27,11 @@ const MARGIN_MB: u64 = 1536;
 
 /// The video daemon's engines (model ids), and (engine, GPU) per loaded worker
 type VideoDaemon = (Vec<String>, Vec<(String, usize)>);
+
+/// Whether something listens on 127.0.0.1:`port`
+fn listening(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300)).is_ok()
+}
 
 pub(crate) fn s(m: &Value, k: &str) -> String {
     m.get(k).and_then(Value::as_str).unwrap_or("").to_string()
@@ -57,6 +64,36 @@ impl Home {
 
     pub(crate) fn target(&self, kind: &str) -> Target {
         Target::Tcp(format!("127.0.0.1:{}", self.port_of(kind)))
+    }
+
+    /// Where a chat request goes: the switcher when one runs (it loads the model the request names), else the chat
+    /// server, `model` (or the one loaded, or the first enabled) loaded first
+    pub(crate) fn chat_target(&self, model: Option<&str>) -> Result<Target, (u16, String)> {
+        if listening(self.o.ports.switch) {
+            return Ok(self.target("llm"));
+        }
+        let all = self.models();
+        let chat = |m: &&Value| registry::kind_of(m) == "llm" && m["enabled"] != false;
+        let id = model.filter(|id| all.iter().filter(chat).any(|m| m["id"] == *id)).map(str::to_string)
+            .or_else(|| self.chat_loaded(&all))
+            .or_else(|| all.iter().find(chat).map(|m| s(m, "id")))
+            .ok_or((409, "no chat model is enabled (system.enable)".to_string()))?;
+        self.load(&id)?;
+        Ok(Target::Tcp(format!("127.0.0.1:{}", self.o.ports.llm)))
+    }
+
+    /// The chat server for `id` started by this page (no studio to ask): the one running stopped first
+    fn chat_start(&self, id: &str) -> Result<(), (u16, String)> {
+        let _g = self.kind_lock["llm"].lock().unwrap();
+        if self.chat_loaded(&self.models()).as_deref() == Some(id) {
+            return Ok(());
+        }
+        if listening(self.o.ports.llm) {
+            self.exec("llm stop (another model)".into(), &["llm".into(), "stop".into()]).map_err(|e| (500, e))?;
+        }
+        let port = self.o.ports.llm.to_string();
+        self.exec(format!("llm start {id}"), &["llm".into(), "start".into(), id.into(), "--port".into(), port]).map_err(|e| (500, e))?;
+        Ok(())
     }
 
     /// The memory a model takes on each of its cards, MiB: as seen while it ran, else from its files' sizes
@@ -315,6 +352,9 @@ impl Home {
                 if self.chat_loaded(&all).as_deref() == Some(id) {
                     return Ok(());
                 }
+                if !listening(self.o.ports.video) {
+                    return self.chat_start(id);
+                }
                 call_for(&self.target("video"), "POST", "/rpc/llm.mode", Some(&json!({"mode": id})), 600).map_err(|e| (503, format!("the studio's llm.mode: {e}")))?;
                 let t0 = Instant::now();
                 while t0.elapsed() < Duration::from_secs(900) {
@@ -342,6 +382,9 @@ impl Home {
             }
             "video" => self.exec("video: unload the engines".into(), &["video".into(), "unload".into()]).map(|_| ()).map_err(|e| (500, e)),
             _ => {
+                if self.chat_loaded(&self.models()).as_deref() == Some(id) && !listening(self.o.ports.video) {
+                    return self.exec(format!("llm stop ({id})"), &["llm".into(), "stop".into()]).map(|_| ()).map_err(|e| (500, e));
+                }
                 if self.chat_loaded(&self.models()).as_deref() == Some(id) {
                     call_for(&self.target("video"), "POST", "/rpc/llm.mode", Some(&json!({"mode": "none"})), 120)
                         .map_err(|e| (503, format!("the studio's llm.mode: {e}")))?;
