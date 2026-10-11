@@ -53,16 +53,21 @@ inline int dp4a4(const sycl::int4 a, const sycl::int4 b, int acc) {
 struct XA {
     const int8_t* qs;
     const sycl::half* d;
+    const int16_t* sm;
     sycl::int4 q16(int b, int half) const { return *reinterpret_cast<const sycl::int4*>(qs + 32 * b + 16 * half); }
     float dd(int b) const { return (float) d[b]; }
+    int sum16(int b, int half) const { return sm[2 * b + half]; }   // the 16 quants' sum (the K-quants' mins)
 };
 inline sycl::int4 ld_q8_16(const Q81Block* b, int half) {   // standard Q8_1: qs is 4-byte aligned, four loads
     const int* q = reinterpret_cast<const int*>(b->qs) + 4 * half;
     return sycl::int4(q[0], q[1], q[2], q[3]);
 }
-// column j of `ncols` columns of n_in values in the split layout at xs
+// column j of `ncols` columns of n_in values in the split layout at xs: quants [ncols][n_in], scales [ncols][n_in /
+// 32] (half), the 16-value groups' sums [ncols][n_in / 16] (int16)
 inline XA xcol(const int8_t* xs, int n_in, int ncols, int j) {
-    return XA{xs + std::size_t(j) * n_in, reinterpret_cast<const sycl::half*>(xs + std::size_t(ncols) * n_in) + std::size_t(j) * (n_in / 32)};
+    const sycl::half* d = reinterpret_cast<const sycl::half*>(xs + std::size_t(ncols) * n_in);
+    const int16_t* sm = reinterpret_cast<const int16_t*>(d + std::size_t(ncols) * (n_in / 32));
+    return XA{xs + std::size_t(j) * n_in, d + std::size_t(j) * (n_in / 32), sm + std::size_t(j) * (n_in / 16)};
 }
 // ---- Q4_K / Q5_K: lane g = sub-block pair 2 (g >> 1), half g & 1 - 32 quants of two sub-blocks
 // a Q4_K / Q5_K block's first 16 bytes (16-byte aligned: 144 and 176 are multiples of 16): dm, then the scales
@@ -93,10 +98,9 @@ struct WideQ4K {
     static X xload(int g, const XA& xa, int b0) {   // b0 = the 256-block's first 32-block
         X v; const int sb = 2 * (g >> 1), half = g & 1;
         const int a = b0 + sb, c = b0 + sb + 1;
-        const sycl::int4 ones(0x01010101, 0x01010101, 0x01010101, 0x01010101);
         v.ua = xa.q16(a, half); v.uc = xa.q16(c, half);
         v.da = xa.dd(a); v.dc = xa.dd(c);
-        v.sa = dp4a4(ones, v.ua, 0); v.sc = dp4a4(ones, v.uc, 0);
+        v.sa = xa.sum16(a, half); v.sc = xa.sum16(c, half);   // precomputed (the quantization's): not 8 dp4a a column
         return v;
     }
     static float dot(const W& r, const X& v) {
@@ -420,10 +424,16 @@ int ns_q35_q8_split(ns_gpu* g, const void* q8_1, void* xs, int64_t n_in, int64_t
     const auto* src = static_cast<const Q81Block*>(q8_1);
     int8_t* qs = static_cast<int8_t*>(xs);
     sycl::half* d = reinterpret_cast<sycl::half*>(qs + ncols * n_in);
-    g->q.parallel_for(sycl::range<1>((size_t) nb * 8), [=](sycl::id<1> i) {   // 8 work-items a block, 4 quants each
-        const int64_t b = i[0] / 8, k = i[0] % 8;
-        reinterpret_cast<int*>(qs + b * 32)[k] = reinterpret_cast<const int*>(src[b].qs)[k];
-        if (k == 0) d[b] = src[b].ds[0];
+    int16_t* sm = reinterpret_cast<int16_t*>(d + nb);
+    g->q.parallel_for(sycl::range<1>((size_t) nb * 2), [=](sycl::id<1> i) {   // 2 work-items a block, 16 quants each
+        const int64_t b = i[0] / 2, h = i[0] % 2;
+        int t = 0;
+        for (int k = 0; k < 16; ++k) {
+            qs[b * 32 + 16 * h + k] = src[b].qs[16 * h + k];
+            t += src[b].qs[16 * h + k];
+        }
+        sm[2 * b + h] = (int16_t) t;
+        if (h == 0) d[b] = src[b].ds[0];
     });
     return 0;
     NS_CATCH
@@ -437,6 +447,7 @@ int ns_q35_quantize_q8(ns_gpu* g, const float* x, void* q8_1, void* xs, int64_t 
     auto* q = static_cast<Q81Block*>(q8_1);
     int8_t* qs = static_cast<int8_t*>(xs);
     sycl::half* d = reinterpret_cast<sycl::half*>(qs + n);
+    int16_t* sm = reinterpret_cast<int16_t*>(d + n / 32);
     g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((n + 255) / 256 * 256)), sycl::range<1>(256)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
         auto sg = it.get_sub_group();
         const int64_t i = it.get_global_id(0);
@@ -447,13 +458,17 @@ int ns_q35_quantize_q8(ns_gpu* g, const float* x, void* q8_1, void* xs, int64_t 
             amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
             sum += sycl::permute_group_by_xor(sg, sum, o);
         }
-        if (i >= n) return;
         const float dd = strata::kernels::q8_1_finite(amax / 127.0f);
         const int8_t qv = strata::kernels::q8_1_quant(v, dd, amax);
+        int t = qv;   // the 16-value group's sum (lanes 0-15, 16-31), every lane in the shuffles
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) t += sycl::permute_group_by_xor(sg, t, o);
+        if (i >= n) return;
         const int64_t b = i / 32, l = i % 32;
         qs[i] = qv;
         const sycl::half2 ds = strata::kernels::q8_1_ds(dd, sum);
         if (l == 0) d[b] = ds[0];
+        if (l % 16 == 0) sm[i / 16] = (int16_t) t;
         if (q) {
             q[b].qs[l] = qv;
             if (l == 0) q[b].ds = ds;
@@ -463,7 +478,7 @@ int ns_q35_quantize_q8(ns_gpu* g, const float* x, void* q8_1, void* xs, int64_t 
     NS_CATCH
 }
 
-size_t ns_q35_q8_split_bytes(int64_t n_in, int64_t ncols) { return (size_t) (ncols * n_in + ncols * (n_in / 32) * 2); }
+size_t ns_q35_q8_split_bytes(int64_t n_in, int64_t ncols) { return (size_t) (ncols * n_in + ncols * (n_in / 32) * 2 + ncols * (n_in / 16) * 2); }
 
 int ns_q35_mmvq_supported(int type, int64_t n_in) {
     switch (type) {

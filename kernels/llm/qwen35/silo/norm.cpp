@@ -27,6 +27,7 @@ int ns_q35_rms_q8(ns_gpu* g, const float* x, const float* w, float* y, void* q8_
     Q81* q = static_cast<Q81*>(q8_1);
     int8_t* xq = static_cast<int8_t*>(xs);   // the split layout (nullable): quants [rows][C], then scales [rows][C / 32]
     sycl::half* xd = xq ? reinterpret_cast<sycl::half*>(xq + rows * C) : nullptr;
+    int16_t* xsm = xq ? reinterpret_cast<int16_t*>(xd + rows * C / 32) : nullptr;   // the 16-value groups' sums
     const int64_t slices = C / WG;
     g->q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> part(sycl::range<1>(NSG), h);
@@ -60,9 +61,13 @@ int ns_q35_rms_q8(ns_gpu* g, const float* x, const float* w, float* y, void* q8_
             const sycl::half2 ds = strata::kernels::q8_1_ds(d, sum);
             b->qs[lane] = qv;
             if (lane == 0) b->ds = ds;
+            int t16 = qv;   // the 16-value group's sum (lanes 0-15, 16-31), every lane in the shuffles
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) t16 += sycl::permute_group_by_xor(sg, t16, o);
             if (xq) {
                 xq[r * C + c] = qv;
                 if (lane == 0) xd[(r * C + c) / 32] = ds[0];
+                if (lane % 16 == 0) xsm[(r * C + c) / 16] = (int16_t) t16;
             }
         });
     });

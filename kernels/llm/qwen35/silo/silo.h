@@ -17,7 +17,8 @@ typedef struct ns_gpu ns_gpu;
  * whole blocks */
 int ns_q35_mmvq_supported(int type, int64_t n_in);
 /* The silo's split Q8_1 layout: a column's quants [ncols][n_in] int8 (16-byte aligned, contiguous), then the blocks'
- * scales [ncols][n_in / 32] half - from standard Q8_1 blocks (column j's at j x n_in / 32) */
+ * scales [ncols][n_in / 32] half, then each 16 quants' sum [ncols][n_in / 16] int16 - from standard Q8_1 blocks
+ * (column j's at j x n_in / 32) */
 int ns_q35_q8_split(ns_gpu* g, const void* q8_1, void* xs, int64_t n_in, int64_t ncols);
 size_t ns_q35_q8_split_bytes(int64_t n_in, int64_t ncols);
 /* x [ncols, n_in] float32 -> its Q8_1 blocks (nullable; ns_quantize_q8_1's bits) and the split layout, one launch */
