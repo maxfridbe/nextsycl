@@ -36,8 +36,7 @@ pub struct Api {
     pub gdn_gates: unsafe extern "C" fn(G, *const f32, *mut f32, *const f32, *const f32, *mut f32, i64, i64, i64) -> c_int,
     pub expand: unsafe extern "C" fn(G, *const f32, i64, *mut f32, i64, i64, i64, i64) -> c_int,
     pub gdn_out: unsafe extern "C" fn(G, *const f32, *const f32, i64, *const f32, *mut f32, i64, i64, i64, f32) -> c_int,
-    /// the greedy pick on the GPU (not used yet: the logits are read back for the sampler)
-    #[allow(dead_code)]
+    /// the greedy pick on the GPU (the MTP drafts)
     pub argmax: unsafe extern "C" fn(G, *const f32, i64, i64, *mut i32) -> c_int,
 }
 

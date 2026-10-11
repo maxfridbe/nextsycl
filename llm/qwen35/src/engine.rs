@@ -855,7 +855,8 @@ impl<'g> Qwen35<'g> {
 
     /// The draft block over `tokens` at positions p0.. (row i: token i with hidden state hs[i]): its cache written
     /// there; with `head`, the last row's logits (and its normed output kept for a chained draft)
-    fn mtp_rows(&self, ms: &MtpState, tokens: &[u32], hs: &DevBuf, p0: usize, cap: usize, head: bool) -> Result<Option<Vec<f32>>> {
+    /// the last row's likeliest token (`head`: its logits' argmax, taken on the GPU - 4 bytes read back, not the logits)
+    fn mtp_rows(&self, ms: &MtpState, tokens: &[u32], hs: &DevBuf, p0: usize, cap: usize, head: bool) -> Result<Option<u32>> {
         let Some(m) = &self.mtp else { return Ok(None) };
         let g = &self.g;
         let (t, ne) = (tokens.len(), g.n_embd);
@@ -893,7 +894,13 @@ impl<'g> Qwen35<'g> {
         ms.chain.copy_within(0, &hn2, 0, ne * 4)?;
         let logits = self.arena.f32(m.output.rows)?;
         self.matmul("mtp head", &m.output, &hn2, q.as_ref(), 1, &logits)?;
-        Ok(Some(logits.to_f32()?))
+        let best = self.arena.bytes(4)?;
+        // SAFETY: logits [1, vocab] float32 -> its argmax (one int32).
+        self.op("argmax", String::new, m.output.rows * 4, 0,
+                || unsafe { (self.k.argmax)(self.raw(), logits.fp(), 1, m.output.rows as i64, best.ptr().cast()) })?;
+        let mut b = [0u8; 4];
+        best.read(0, &mut b)?;
+        Ok(Some(u32::from_le_bytes(b)))
     }
 
     /// Drafts for the positions after `tail` (committed at s.pos, not fed): the draft block on (the last fed
@@ -907,8 +914,8 @@ impl<'g> Qwen35<'g> {
             self.arena.reset();
             self.phase("mtp draft");
             let hs = if i == 0 { &ms.pending } else { &ms.chain };
-            let Some(l) = self.mtp_rows(ms, &[tok], hs, s.pos + i, s.max_ctx, true)? else { break };
-            tok = argmax(&l);
+            let Some(t) = self.mtp_rows(ms, &[tok], hs, s.pos + i, s.max_ctx, true)? else { break };
+            tok = t;
             out.push(tok);
         }
         Ok(out)
@@ -1235,16 +1242,6 @@ fn vec_mat(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, name: &str, loaded: &mut u64)
     let buf = DevBuf::new(gpu, raw.len())?;
     buf.write(0, &raw)?;
     Ok(Mat { buf, ty: t.ty, rows, cols })
-}
-
-fn argmax(l: &[f32]) -> u32 {
-    let mut best = (0usize, f32::NEG_INFINITY);
-    for (i, &v) in l.iter().enumerate() {
-        if v > best.1 {
-            best = (i, v);
-        }
-    }
-    best.0 as u32
 }
 
 /// The draft block from its file: block `layers` (eh_proj split into its embedding and hidden-state columns on the

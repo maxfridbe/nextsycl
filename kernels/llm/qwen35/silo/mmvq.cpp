@@ -312,8 +312,10 @@ void launch_cols(sycl::queue& q, const void* w, const void* x, float* y, int n_i
 }
 template <typename F>
 void wide(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out, int ncols) {
-    // past 4 columns two rows would hold 2 x 8 accumulators and 8 activation sets: one row there
-    const int r = ncols > 4 ? 1 : rows_override() ? rows_override() : F::ROWS;
+    // past 4 columns two rows would hold 2 x 8 accumulators and 8 activation sets: one row there; 3-4 columns (a
+    // verify pass) two rows sharing each lane's activations (B70, 4 columns, GB/s: Q4_K 270 -> 344, IQ4_XS 331 -> 406,
+    // Q5_K 316 -> 377; at 2 columns it is mixed). Rows never change a column's arithmetic: verify rows stay exact.
+    const int r = ncols > 4 ? 1 : rows_override() ? rows_override() : ncols >= 3 ? 2 : F::ROWS;
     if (r >= 4) launch_cols<F, 4>(q, w, x, y, n_in, n_out, ncols);
     else if (r == 2) launch_cols<F, 2>(q, w, x, y, n_in, n_out, ncols);
     else launch_cols<F, 1>(q, w, x, y, n_in, n_out, ncols);
