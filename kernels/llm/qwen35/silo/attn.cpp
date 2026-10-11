@@ -24,7 +24,17 @@
 namespace {
 namespace jm = sycl::ext::oneapi::experimental::matrix;
 using half = sycl::half;
-constexpr int D = 256, HALF_D = 128, SG = 16, M = 8, CH = 32, CHP = CH + 8;   // CHP: P's row stride (bank spread)
+// keys a chunk: the local memory a work-group holds sets how many share an Xe core, and that bounds this kernel
+// (B70, a 40K prompt: 32 keys 76 s, 64 keys 106 s - one work-group a core -, 16 keys 50 s)
+#ifndef Q35_ATTN_CH
+#define Q35_ATTN_CH 16
+#endif
+#ifndef Q35_ATTN_KPAD
+#define Q35_ATTN_KPAD 0
+#endif
+// CHP: P's row stride; KS: packed K's row stride in words - a key's 4 words go KS apart, and KS = CH would put a
+// sub-group's stores on one bank (padding measured no faster at 16 keys: 0)
+constexpr int D = 256, HALF_D = 128, SG = 16, M = 8, CH = Q35_ATTN_CH, CHP = CH + 8, KS = CH + Q35_ATTN_KPAD;
 
 template <typename T>
 inline auto lp(T* p) {
@@ -39,9 +49,10 @@ inline auto gp(T* p) {
 // keys 2i, 2i+1 of a feature), the partial scores [G][2][M][CH] float, P [G][M][CHP] half, the row stats [G][M] x 3
 template <int G>
 struct Slm {
-    static constexpr int k = D / 2 * CH, v = CH / 2 * D, s = G * 2 * M * CH, p = G * M * CHP / 2, st = 3 * G * M;
-    // Q staged as half [G][M][D] before the first chunk, over the K / V / score words (all free then)
-    static constexpr int q = G * M * D / 2;
+    static constexpr int k = D / 2 * KS, v = CH / 2 * D, s = G * 2 * M * CH, p = G * M * CHP / 2, st = 3 * G * M;
+    // Q staged as half [G][M][128] - one half of the features at a time - before the first chunk, over the K / V /
+    // score words (all free then)
+    static constexpr int q = G * M * HALF_D / 2;
     static constexpr int words = (k + v + s > q ? k + v + s : q) + p + st;
 };
 
@@ -72,25 +83,30 @@ void attn_prompt(sycl::queue& queue, const float* q, int64_t qs, const half* kc,
             // the last row's last key (rows past T take the last valid row's keys; they are not written)
             const int64_t rl = sycl::min(r0 + M, T) - 1, kv_end = p0 + rl + 1;
 
-            // ---- Q, scaled, as half [G][M][D]; the row stats
-            for (int i = tid; i < G * M * D; i += WG) {
-                const int g = i / (M * D), r = (i / D) % M, d = i % D;
-                const int64_t row = sycl::min(r0 + r, T - 1);
-                qh[i] = (half) (q[row * qs + (hk * G + g) * D + d] * qscale);
-            }
+            // ---- Q, scaled, as half: one half of the features at a time ([G][M][128]), each sub-group loading its
+            // half's fragments; the row stats
             for (int i = tid; i < G * M; i += WG) {
                 mrow[i] = -INFINITY;
                 lrow[i] = 0.0f;
             }
-            sycl::group_barrier(it.get_group());
             jm::joint_matrix<sycl::sub_group, half, jm::use::a, M, 16, jm::layout::row_major> qa[HALF_D / 16];
+            for (int hh = 0; hh < 2; ++hh) {
+                for (int i = tid; i < G * M * HALF_D; i += WG) {
+                    const int g = i / (M * HALF_D), r = (i / HALF_D) % M, d = i % HALF_D;
+                    const int64_t row = sycl::min(r0 + r, T - 1);
+                    qh[i] = (half) (q[row * qs + (hk * G + g) * D + hh * HALF_D + d] * qscale);
+                }
+                sycl::group_barrier(it.get_group());
+                if (hd == hh) {
 #pragma unroll
-            for (int k = 0; k < HALF_D / 16; ++k)
-                jm::joint_matrix_load(sg, qa[k], lp(qh + (hg * M) * D + hd * HALF_D + k * 16), (size_t) D);
+                    for (int k = 0; k < HALF_D / 16; ++k)
+                        jm::joint_matrix_load(sg, qa[k], lp(qh + (hg * M) * HALF_D + k * 16), (size_t) HALF_D);
+                }
+                sycl::group_barrier(it.get_group());
+            }
             jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, M, 16> o[HALF_D / 16];
 #pragma unroll
             for (int t = 0; t < HALF_D / 16; ++t) jm::joint_matrix_fill(sg, o[t], 0.0f);
-            sycl::group_barrier(it.get_group());   // Q's words are the chunks' from here
 
             const half* kb = kc + hk * cap * D;
             const half* vb = vc + hk * cap * D;
@@ -100,10 +116,10 @@ void attn_prompt(sycl::queue& queue, const float* q, int64_t qs, const half* kc,
                     const int n = i / (D / 8), c = i % (D / 8);
                     sycl::uint4 w(0, 0, 0, 0);
                     if (j0 + n < kv_end) w = *reinterpret_cast<const sycl::uint4*>(kb + (j0 + n) * D + 8 * c);
-                    kp[(4 * c + 0) * CH + n] = w.x();
-                    kp[(4 * c + 1) * CH + n] = w.y();
-                    kp[(4 * c + 2) * CH + n] = w.z();
-                    kp[(4 * c + 3) * CH + n] = w.w();
+                    kp[(4 * c + 0) * KS + n] = w.x();
+                    kp[(4 * c + 1) * KS + n] = w.y();
+                    kp[(4 * c + 2) * KS + n] = w.z();
+                    kp[(4 * c + 3) * KS + n] = w.w();
                 }
                 for (int i = tid; i < (CH / 2) * (D / 8); i += WG) {   // V: keys 2p, 2p + 1, features 8c .. -> words [p][8c ..]
                     const int pr = i / (D / 8), c = i % (D / 8);
@@ -128,7 +144,7 @@ void attn_prompt(sycl::queue& queue, const float* q, int64_t qs, const half* kc,
 #pragma unroll
                     for (int k = 0; k < HALF_D / 16; ++k) {
                         jm::joint_matrix<sycl::sub_group, half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> kbm;
-                        jm::joint_matrix_load(sg, kbm, lp(kph + ((hd * HALF_D + k * 16) / 2) * (CH * 2) + nt * 16 * 2), (size_t) (CH * 2));
+                        jm::joint_matrix_load(sg, kbm, lp(kph + ((hd * HALF_D + k * 16) / 2) * (KS * 2) + nt * 16 * 2), (size_t) (KS * 2));
                         jm::joint_matrix_mad(sg, s, qa[k], kbm, s);
                     }
                     jm::joint_matrix_store(sg, s, lp(sp + ((hg * 2 + hd) * M) * CH + nt * 16), (size_t) CH, jm::layout::row_major);
