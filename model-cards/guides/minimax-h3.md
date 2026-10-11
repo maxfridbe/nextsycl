@@ -105,8 +105,8 @@ The motion must carry through the cuts, and the sound with it.
 | The cut | Use |
 |---|---|
 | the same shot goes on | `guide_clip` (22 frames) + `first_audio` |
-| the same person speaks again | `ref_images` + `ref_audios` + the picture as `first_frame` and `last_frame` |
-| the speaker changes | that person's `ref_images` + `ref_audios`; two in a shot: both, `<Picture 1>` and `<Picture 2>` in the prompt |
+| the same person speaks again | `ref_images` + `ref_audios` + the picture as `first_frame` and `last_frame` - on **every** clip of the person, the first too (without it the model draws a voice, a man's for a woman) |
+| the speaker changes | that person's `ref_images` + `ref_audios`; **one speaker a shot** (two in one shot put a voice on the wrong mouth) |
 | the same person, a new place | `ref_images [person]` (+ the place's picture); the place in words |
 | a new scene in the same look | `ref_images [a frame of the last scene]` "in the exact look and light of `<Picture 1>`", and the light in words |
 | a match cut, a transformation | `first_frame` = the last frame + `last_frame` = the target |
@@ -115,6 +115,10 @@ The motion must carry through the cuts, and the sound with it.
 | a voice over b-roll | `ref_audios [the voice]`, "in an off-screen voiceover ... while no one is on screen" |
 | the same motion in another style | `control_video` (canny edges of the clip) - not with references |
 | a fix | re-render the clip; `regen` only fills small gaps |
+
+The voice reference is one steady 3 s+ recording per person (a speech model's built-in voice, or a designed one),
+the same on every clip; a short reference - one clip's own line - did not hold a voice. Cuts between people are plain
+cuts: nothing is carried, so nothing overlaps. `tests/api/harbour_dialogue.py` is this as a scene.
 
 ### Every kind
 - **Draft small first** (384x384, 4 s, 8 steps: a whole film in minutes) to check the story, the prompts and the
