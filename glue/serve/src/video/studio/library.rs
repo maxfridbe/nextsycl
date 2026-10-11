@@ -131,7 +131,8 @@ impl Studio {
     pub fn thumb(&self, name: &str) -> Option<Vec<u8>> {
         let dir = self.out.join(".thumbs");
         let dst = dir.join(format!("{name}.webp"));
-        if let Ok(b) = std::fs::read(&dst) {
+        // (a failed try leaves an empty or broken file: made again, not served)
+        if let Some(b) = std::fs::read(&dst).ok().filter(|b| b.len() > 64) {
             return Some(b);
         }
         let src = self.out.join(format!("{name}.mp4"));
@@ -140,14 +141,14 @@ impl Studio {
         }
         let _ = std::fs::create_dir_all(&dir);
         for seek in [true, false] {
-            let mut c = Command::new("ffmpeg");
+            let mut c = crate::video::media::tool("ffmpeg");
             c.args(["-v", "error", "-y"]);
             if seek {
                 c.args(["-ss", "5"]);
             }
             let _ = c.arg("-i").arg(&src).args(["-frames:v", "1", "-vf", "scale=240:-2", "-qscale:v", "60"]).arg(&dst).status();
             if let Ok(b) = std::fs::read(&dst) {
-                if !b.is_empty() {
+                if b.len() > 64 {
                     return Some(b);
                 }
             }

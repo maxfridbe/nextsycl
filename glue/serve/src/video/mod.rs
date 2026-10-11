@@ -2,5 +2,6 @@
 //! end's model switch - H3's `h3d daemon`), engine-agnostic.
 
 pub mod daemon;
+pub mod media;
 pub mod signals;
 pub mod studio;

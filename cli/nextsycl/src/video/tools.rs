@@ -224,11 +224,18 @@ fn cameras(k: &str) -> (&'static str, &'static str) {
 const SPEECH_HELP: &str = "nextsycl video speech <text file> [options]  - a speech as sized, chained character clips
   --character NAME (from --characters FILE or NS_VIDEO_CHARACTERS; data)   --words-per-s R (the character's)
   --speech-frac 0.57  --max-words 28  --min-frag 5  --min-s 4  --max-s 15  --steps 8
-  --width 896 --height 672  --chain-mode png|video|latent|none  --cond-noise-aug X
-  --cameras 1|2  --switch-every 2  --anchor chain|hub  --no-end-anchor  --chain-every N
-  --match-exposure (default) | --no-match-exposure
-  --audio-anchor prev|first|none|FILE  --audio-anchor-s 1.0   (the previous clip's sound tail at frame 0)
-  --guide-frames N   motion guide: the previous clip's last N frames as a moving keyframe at frame 0 (new)
+  --width 768 --height 576  --chain-mode png (default; latent jumps in exposure)|video|latent|none
+  --cond-noise-aug X   (do not: the keyframes are never denoised, so it decodes as confetti)
+  --cameras 1|2 (two read as jarring)  --switch-every 2  --anchor hub (default: every clip pinned to clip 1's last
+      frame at its first and last frame - nothing compounds)|chain (each from the last: drift compounds)
+  --no-end-anchor  --chain-every N  --match-exposure (default) | --no-match-exposure
+  --guide-frames N   motion across the cut: the anchor clip's last N frames (5, 22, 39) as a moving keyframe at
+      frame 0 (a single keyframe pins a pose, not a velocity: heads jump at the cuts). 22 is the house value
+  --audio-anchor prev|first|none|FILE  --audio-anchor-s S   (the previous clip's sound tail at frame 0) - default
+      none (it forces an overlap of its length at the join, which discards a single keyframe's pinned frames);
+      with --guide-frames N: the guide's clip (first in a hub, else prev) for N/24 s, so the overlap lands
+      inside the guided frames
+  (docs/video/h3.md: why each default is what it is)
   --voice-ref FILE (up to 3, in the clips directory: <Audio j>, the voice lock)
   --realism [S] | --no-realism  --lora PATH[:S] ...  --trigger WORD  --upscale 1.5
   --look-on PHRASE  --look-on-direction TEXT  --voice TEXT  --scene TEXT  --soundscape TEXT  --final-direction TEXT
@@ -283,12 +290,15 @@ pub fn speech(cfg: &Config, raw: &[String]) -> Result<()> {
     let batch = o.get("batch").map(str::to_string).unwrap_or_else(|| format!("{label}-{stamp}")).trim().to_string();
     let ncam = o.i("cameras", 1);
     let switch_every = o.i("switch-every", 2).max(1) as usize;
-    let hub = o.s("anchor", "chain") == "hub";
+    let hub = o.s("anchor", "hub") == "hub";
     let end_anchor = !o.has("no-end-anchor");
     let chain_mode = o.s("chain-mode", "png");
     let chain_every = o.i("chain-every", 0) as usize;
     let match_exposure = !o.has("no-match-exposure");
-    let audio_anchor = o.s("audio-anchor", "prev");
+    let guide = o.get("guide-frames").and_then(|v| v.parse::<usize>().ok());
+    // the sound tail of the clip the guide's frames come from, so the two cover the same span
+    let audio_anchor = o.s("audio-anchor", match (guide, hub) { (None, _) => "none", (Some(_), true) => "first", (Some(_), false) => "prev" });
+    let audio_anchor_s = o.get("audio-anchor-s").and_then(|v| v.parse::<f64>().ok()).unwrap_or_else(|| guide.map_or(1.0, |g| g as f64 / 24.0));
     let file_anchor = !matches!(audio_anchor.as_str(), "none" | "prev" | "first");
     let start_n = o.i("start-n", 1) as usize;
     let keys: Vec<Option<&str>> = (0..lines.len()).map(|i| (ncam == 2).then(|| if (i / switch_every).is_multiple_of(2) { "A" } else { "B" })).collect();
@@ -341,21 +351,23 @@ pub fn speech(cfg: &Config, raw: &[String]) -> Result<()> {
             "integrated_multimodal_description: [Shot 1] {trig}{style}, a medium shot frames {} {} {framing}{cam}{opener} and {}, {speech} {ending}\n\noverall_soundscape: {}\n\nnon_diegetic_music: None.",
             cs("who"), o.get("scene").map(str::to_string).unwrap_or_else(|| cs("scene")), o.get("voice").map(str::to_string).unwrap_or_else(|| cs("voice")),
             o.get("soundscape").map(str::to_string).unwrap_or_else(|| cs("sound")));
-        let first = (chain_mode != "none" && i > 0).then(|| if ncam == 2 { "prev_cam" } else if hub || (chain_every > 0 && i % chain_every == 0) { "first" } else { "prev" });
+        // a guide brings its own opening frames (its last one is the anchor's last frame, at frame N-1): a picture at
+        // frame 0 as well would pin that frame twice over, to two different frames
+        let first = (chain_mode != "none" && i > 0 && guide.is_none()).then(|| if ncam == 2 { "prev_cam" } else if hub || (chain_every > 0 && i % chain_every == 0) { "first" } else { "prev" });
         let n = i + start_n;
         let short: String = line.replace(&mark, "").trim().chars().take(32).collect::<String>().trim_end_matches([' ', ',', '.']).to_string();
         let mut j = json!({
             "project": project, "batch": batch, "prompt": prompt, "seconds": sec, "steps": o.i("steps", 8), "seed": 0, "te": "teacher",
-            "engine": o.s("engine", "Q8_0"), "width": o.i("width", 896), "height": o.i("height", 672), "chain_mode": chain_mode,
+            "engine": o.s("engine", "Q8_0"), "width": o.i("width", 768), "height": o.i("height", 576), "chain_mode": chain_mode,
             "cond_noise_aug": o.get("cond-noise-aug").and_then(|v| v.parse::<f64>().ok()), "first_frame": first, "camera": keys[i],
             "last_frame": (hub && end_anchor && i > 0).then_some("first"), "upscale": upscale, "loras": loras,
             "first_audio": match audio_anchor.as_str() { "none" => None, _ if file_anchor => Some(audio_anchor.clone()), _ => (i > 0).then(|| audio_anchor.clone()) },
-            "first_audio_s": o.f("audio-anchor-s", 1.0), "ref_audios": o.all("voice-ref"),
+            "first_audio_s": audio_anchor_s, "ref_audios": o.all("voice-ref"),
             "exposure_ref": (match_exposure && i > 0).then_some("first"), "queue": true,
             "label": format!("{label} {n:02}/{}: {short}...", lines.len() + start_n - 1),
         });
-        if let (Some(g), true) = (o.get("guide-frames").and_then(|v| v.parse::<usize>().ok()), i > 0 && chain_mode != "none") {
-            j["guide_clip"] = json!(format!("{}:{g}:0", if ncam == 2 { "prev_cam" } else { "prev" }));
+        if let (Some(g), true) = (guide, i > 0 && chain_mode != "none") {
+            j["guide_clip"] = json!(format!("{}:{g}:0", if hub { "first" } else if ncam == 2 { "prev_cam" } else { "prev" }));
         }
         jobs.push((j, line.clone()));
     }
@@ -365,7 +377,7 @@ pub fn speech(cfg: &Config, raw: &[String]) -> Result<()> {
              if ncam == 2 { format!(", 2 cameras switching every {switch_every}") } else { String::new() },
              if hub { format!(", hub-anchored to clip 1{}", if end_anchor { " (both ends)" } else { "" }) } else { String::new() },
              if loras.is_empty() { String::new() } else { format!(", {} lora(s)", loras.len()) },
-             if audio_anchor != "none" { format!(", audio anchored to {audio_anchor} ({}s)", o.f("audio-anchor-s", 1.0)) } else { String::new() },
+             if audio_anchor != "none" { format!(", audio anchored to {audio_anchor} ({audio_anchor_s:.4}s)") } else { String::new() },
              if match_exposure { ", exposure matched" } else { "" });
     println!("{:>3} {:>5} {:>6} {:>6}  line", "#", "secs", "words", "beats");
     for (k, (j, line)) in jobs.iter().enumerate() {
@@ -458,14 +470,14 @@ pub fn scene(cfg: &Config, raw: &[String]) -> Result<()> {
 }
 
 fn ffprobe(path: &Path, stream: &str, entry: &str) -> Option<f64> {
-    let o = Command::new("ffprobe").args(["-v", "error", "-select_streams", stream, "-count_packets", "-show_entries", &format!("stream={entry}"), "-of", "csv=p=0"]).arg(path).output().ok()?;
+    let o = nextsycl_serve::video::media::tool("ffprobe").args(["-v", "error", "-select_streams", stream, "-count_packets", "-show_entries", &format!("stream={entry}"), "-of", "csv=p=0"]).arg(path).output().ok()?;
     String::from_utf8_lossy(&o.stdout).trim().split(',').next()?.trim().parse().ok()
 }
 
 /// `nextsycl video join <prefix>`: a series of finished clips -> one film.
 pub fn join(cfg: &Config, raw: &[String]) -> Result<()> {
     let o = Opts::parse(raw, &["denoise"]);
-    let prefix = o.pos.first().ok_or("nextsycl video join <label prefix> [--from 1 --to 999] [--xfade-frames 4] [--audio-anchor-s S] [--match-loudness -18] [--denoise] [--fade-out S] [--out FILE] [--out-dir DIR]")?.clone();
+    let prefix = o.pos.first().ok_or("nextsycl video join <label prefix> [--from 1 --to 999] [--xfade-frames 2] [--audio-anchor-s S] [--match-loudness -18] [--denoise] [--fade-out 1.5] [--out FILE] [--out-dir DIR]")?.clone();
     let dir = o.get("out-dir").map(PathBuf::from).unwrap_or_else(|| super::service::out_dir(cfg));
     let fps = o.f("fps", 24.0);
     let (from, to) = (o.i("from", 1), o.i("to", 999));
@@ -495,7 +507,9 @@ pub fn join(cfg: &Config, raw: &[String]) -> Result<()> {
             if anchored.is_empty() { 0.0 } else { anchored.iter().flatten().next().copied().unwrap_or(1.0) }
         }
     };
-    let k = if anchor_s > 0.0 { pyround(anchor_s * fps / 2.0) as i64 } else { o.i("xfade-frames", 4).max(0) };
+    // a motion guide's frames are replayed at the start of the next clip as well: overlap them (the records say)
+    let guide_frames = items.values().skip(1).filter_map(|v| v.1["job"]["guide_clip"].as_str().and_then(|g| g.split(':').nth(1)).and_then(|n| n.parse::<f64>().ok())).fold(0.0, f64::max);
+    let k = if anchor_s > 0.0 || guide_frames > 0.0 { pyround(anchor_s.max(guide_frames / fps) * fps / 2.0) as i64 } else { o.i("xfade-frames", 2).max(0) };
     let n = files.len();
     if 2 * k >= *nframes.iter().min().unwrap_or(&0) {
         return Err(Error(format!("a {k}-frame overlap does not fit the shortest clip ({} frames)", nframes.iter().min().unwrap_or(&0))));
@@ -508,7 +522,7 @@ pub fn join(cfg: &Config, raw: &[String]) -> Result<()> {
         fc.push(format!("[{i}:v]trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS[v{i}]", if i > 0 { k } else { 0 }, if i + 1 < n { nf - k } else { nf }));
         let mut gain = String::new();
         if target != 0.0 {
-            let e = Command::new("ffmpeg").args(["-hide_banner", "-vn", "-i"]).arg(f).args(["-af", "ebur128=framelog=quiet", "-f", "null", "-"]).output().ok();
+            let e = nextsycl_serve::video::media::tool("ffmpeg").args(["-hide_banner", "-vn", "-i"]).arg(f).args(["-af", "ebur128=framelog=quiet", "-f", "null", "-"]).output().ok();
             let l = e.and_then(|e| {
                 let t = String::from_utf8_lossy(&e.stderr).into_owned();
                 let i = t.rfind("I:")?;
@@ -539,7 +553,7 @@ pub fn join(cfg: &Config, raw: &[String]) -> Result<()> {
     }
     let total_frames: i64 = nframes.iter().sum::<i64>() - 2 * k * (n as i64 - 1);
     let total = total_frames as f64 / fps;
-    let fade = o.f("fade-out", 0.0);
+    let fade = o.f("fade-out", 1.5);
     if fade > 0.0 {
         let st = (total - fade).max(0.0);
         fc.push(format!("[{vlab}]fade=t=out:st={st:.3}:d={fade}[voutf]"));
@@ -550,7 +564,7 @@ pub fn join(cfg: &Config, raw: &[String]) -> Result<()> {
     let (first_n, last_n) = (*items.keys().next().unwrap(), *items.keys().last().unwrap());
     let out = o.get("out").map(PathBuf::from).unwrap_or_else(|| dir.join(format!("{}_join_{first_n:02}-{last_n:02}.mp4", prefix.to_lowercase().replace(' ', "_"))));
     let part = out.with_extension("part.mp4");
-    let mut c = Command::new("ffmpeg");
+    let mut c = nextsycl_serve::video::media::tool("ffmpeg");
     c.args(["-y", "-loglevel", "error"]);
     for f in &files {
         c.arg("-i").arg(f);

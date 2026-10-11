@@ -309,9 +309,9 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     routes, every variable in the JSON body, no path variables or query strings, `{"ok": true, "result": ...}` /
     `{"ok": false, "error": {"code", "message"}}` - for `system` (state, models, enable, disable, load, unload),
     `llm` (chat, models), `image` (generate, edit, info, progress, history), `audio` (generate, info, progress,
-    history, cancel), `video` (the studio's: generate, status, wait, queue.*, jobs.*, upload ...), each kind with
+    history, cancel), `video` (the studio's: generate, status, wait, queue.*, jobs.*, timeline, upload ...), each kind with
     `describePromptGuideMD {model}`; and the OpenAI-compatible `/v1/models`, `/v1/chat/completions`,
-    `/v1/images/generations|edits`, `/v1/audio/speech` and the files they link. `GET /openapi.yml` describes the
+    `/v1/images/generations|edits`, `/v1/audio/speech` and the files they link (and `/v1/video/files/<clip>`). `GET /openapi.yml` describes the
     kinds that have an enabled model (enabling one adds its methods); the API tab lists them with a curl each.
     `/api/...` is the page's own.
   - **The settings** (the Config tab; `system.config`, `system.configSet {set: {NAME: value | null}} | {text}`,
@@ -516,7 +516,7 @@ What a clip can be made from (ComfyUI's H3 nodes, each checked against them wher
 |---|---|---|
 | text to video+audio | the prompt | `prompt` |
 | image to video, first / last frame, both | keyframes pinned at frame 0 / the last frame; their pictures shown to the text encoder too (`<Picture i>`, as ComfyUI's image-to-video node) | `first_frame`, `last_frame`, `te_pictures` |
-| motion guide, clip continuation | a clip's last frames anchored at a frame; the last latent of the clip before | `guide_clip`, `first_latent`, `first_audio` |
+| motion guide, clip continuation | a clip's last frames (22) anchored as one moving keyframe, its sound tail - how a film carries on; the last latent of the clip before (jumps in exposure: chain a PNG) | `guide_clip`, `first_audio`, `first_latent` |
 | references (Ref2VA) | up to 9 pictures, 3 clips (their sound too) and 3 sounds named `<Picture i>`, `<Video k>`, `<Audio j>` in the prompt; the Ref2VA denoiser (`minimax-h3-ref2va`). The 32B text encoder's vision tower (`visual.*`, range-fetched from the bf16 file) runs from crates/qwen3vl - checked against ComfyUI: cosine 0.99994 | `ref_images`, `ref_videos`, `ref_audio`, `ref_image_size` |
 | effects | Comfy-Org's ten embeddings: `embedding:minimaxh3_bullet_time` in the prompt (ComfyUI's splitting; cosine 0.999999) | `embeddings` (from the model's roles) |
 | ControlNet (Fun ControlNet-Union 2.0) | a control video - canny, depth, HED, MLSD or pose frames, made beforehand - the clip follows | `control_video`, `control_strength`, `control_start`, `control_end` |
@@ -900,6 +900,8 @@ Requests with it decode one token a pass (no draft block), a few small reads a l
   `NS_FUSED_MAX`, `NS_FUSED_DOWN_MAX`, `NS_ESIMD_MAX` (0 = off), `NS_KDA_COLS`, `NS_KV=f16`, `NS_MLA_DEC=0`,
   `NS_SPEC_SAMPLING=0`, `NS_SPEC_DRAFT_TEMP`, `NS_DRAFTS=2`, `NS_NGRAM=K`, `NS_EXPERT_PROFILE`, and
   `NS_FREE_MISSES=1` (wrong output: the speed decode would have with no expert copies).
+- `tests/api/`: whole jobs through the front door's API alone, each a worked example and a test of it
+  (`kaiju_lighthouse.py`: a painting into a 30 s film with sound, three chained clips joined with ffmpeg).
 - `reference/`: the offline studies and microbenchmarks - `expert-cache/` (cache, prefetch, pinning and split
   simulations on decode traces), `expand.cpp`, `esimd-fused.cpp`, `esimd-down.cpp` (the expert kernels alone),
   `mmvq-bw.cpp` (a decode product's bandwidth), `cpu-expert/` (an expert computed on the CPU), `profile/`.
@@ -979,6 +981,8 @@ artifact.
 - `B70_Startup_guide.md`: installing on an Arc Pro B70, step by step, as run on a fresh clone (times and outputs).
 - `docs/architecture.md`: the layout - the foundation crates, each kind's contract and engines (`<kind>/<arch>`, their
   kernels in `kernels/<kind>/<arch>`), the glue, the program - its rules, and the engines' settings.
+- `docs/video/h3.md`: making films with MiniMax H3 - carrying motion, sound and picture across clips, joining,
+  prompts, memory, drafting - what the H3 project learned, as the rules the tools follow.
 - `docs/environment.md`: every environment variable and nextsycl.conf setting - its default, what it does, what reads it.
 - `CONTRIBUTING.md`: porting a model from a kind's template, the rules (SYCL only; the layers), building, checking.
 - `docs/glm5next.md`: the model's math, as this runtime computes it.

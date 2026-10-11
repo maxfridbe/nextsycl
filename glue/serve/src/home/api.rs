@@ -130,8 +130,10 @@ pub const METHODS: &[Method] = &[
     Method { kind: "video", name: "queue.pause", summary: "Hold a project or batch (none: everything)", fields: &[("project", "string", "", false), ("batch", "string", "", false)], example: r#"{"project": "Harbour"}"# },
     Method { kind: "video", name: "queue.resume", summary: "Release a project or batch (none: everything)", fields: &[("project", "string", "", false), ("batch", "string", "", false)], example: "{}" },
     Method { kind: "video", name: "queue.clear", summary: "Drop the queue, or a project's / batch's part of it", fields: &[("project", "string", "", false), ("batch", "string", "", false)], example: "{}" },
-    Method { kind: "video", name: "jobs.list", summary: "Finished clips", fields: &[("limit", "integer", "", false)], example: r#"{"limit": 20}"# },
+    Method { kind: "video", name: "jobs.list", summary: "Finished clips (GET /v1/video/files/<file> fetches one)", fields: &[("limit", "integer", "", false)], example: r#"{"limit": 20}"# },
     Method { kind: "video", name: "jobs.get", summary: "A clip's record: settings, per-stage seconds, energy", fields: &[("name", "string", "h3_YYYYMMDD_HHMMSS", true)], example: r#"{"name": "h3_20261009_113734"}"# },
+    Method { kind: "video", name: "timeline", summary: "A project's clips in edit order: done (with its file's name), running, held, queued",
+             fields: &[("project", "string", "", true)], example: r#"{"project": "Harbour"}"# },
     Method { kind: "video", name: "projects.list", summary: "The projects and batches", fields: &[], example: "{}" },
     Method { kind: "video", name: "films.list", summary: "Joined films", fields: &[], example: "{}" },
     Method { kind: "video", name: "templates.list", summary: "Prompt templates", fields: &[], example: "{}" },
@@ -476,6 +478,20 @@ impl Home {
             }
             ("GET", p) if p.starts_with("/v1/images/files/") => pass(s, &self.target("image")),
             ("GET", p) if p.starts_with("/v1/audio/files/") => pass(s, &self.target("audio")),
+            ("GET", p) if p.starts_with("/v1/video/files/") => {
+                // a clip in the studio's output (its /out/ route; a Range header passed on for seeking)
+                need("video")?;
+                let name = &p["/v1/video/files/".len()..];
+                if name.is_empty() || name.contains('/') || !name.ends_with(".mp4") {
+                    return Err((404, format!("no clip {name}")));
+                }
+                let head = String::from_utf8_lossy(&req.head).into_owned();
+                let range = head.split("\r\n").find(|l| l.split(':').next().is_some_and(|k| k.trim().eq_ignore_ascii_case("range")));
+                let up = format!("GET /out/{name} HTTP/1.1\r\nHost: studio\r\n{}Connection: close\r\n\r\n", range.map(|r| format!("{r}\r\n")).unwrap_or_default());
+                let req = Request { method: "GET".into(), path: format!("/out/{name}"), target: format!("/out/{name}"), head: up.into_bytes(),
+                                    origin: None, host: None, body: Vec::new() };
+                http::forward(s, &self.target("video"), &req).map_err(|e| (502, e))
+            }
             ("GET", p) if p.starts_with("/v1/audio/voices/") => {
                 let name = p["/v1/audio/voices/".len()..].trim_end_matches(".wav");
                 match self.voices().sample_path(name).and_then(|f| std::fs::read(f).ok()) {
@@ -556,6 +572,10 @@ impl Home {
                 json!({"model": ids("audio").first(), "instructions": "warm folk", "input": "[verse]\nRiver runs slow", "response_format": "url"}))}));
             paths.insert("/v1/audio/files/{name}".into(), json!({"get": {"tags": ["openai"], "summary": "A song an answer links",
                 "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "WAV"}}}}));
+        }
+        if on.contains(&"video") {
+            paths.insert("/v1/video/files/{name}".into(), json!({"get": {"tags": ["openai"], "summary": "A finished clip (video.jobs.list's file), Range requests too",
+                "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "MP4"}}}}));
         }
         json!({
             "openapi": "3.0.3",

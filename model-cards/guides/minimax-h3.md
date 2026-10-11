@@ -26,8 +26,14 @@ non_diegetic_music: <a score the people in the scene cannot hear, or "None.">
   speed.` Moves: push in, zoom out, pan, truck, tilt, pedestal, arc, tracking, static, handheld shake, POV, roll.
 - **Sound vs music**: what is heard in the scene goes in `overall_soundscape` (and is rendered under the whole
   clip, so name only what should be heard); score goes in `non_diegetic_music` (`None.` for none).
-- **Speech rate**: about 3.8 words a second (3.3 at the slowest). A clip holds roughly (seconds - 2) x 3.3 words:
-  12 s ~ 34 words. Leave a beat after a line so it is not cut off.
+- **Speech rate**: the model speaks for about 57% of any clip, and the word count - not the clip's length - sets
+  how fast: 22 words is clear (3.3 words a second), 28 the most, 34 too fast. Size the clip to the line:
+  words / 3.3 / 0.57 seconds (22 words ~ 12 s), 4-15 s. Leave a beat after a line so it is not cut off.
+- **Sound**: `overall_soundscape` is rendered under the whole clip - weather, traffic or an electrical hum come
+  back as hiss or music. Name only the sounds something in the shot makes.
+- **Hold things in positive words**: blinking (say it), the shot size ("that exact shot size and camera position
+  hold from the first frame to the last" - a "slight push in" compounds over chained clips), the light level and
+  colour, an empty room (or extras re-roll).
 - **No negations**: guidance is 1.0, so every word renders - "no cars" puts cars in. Say what is there.
 - **Do**: concrete visual and audio detail, physical descriptions of people (age, hair, clothes, posture).
   **Don't**: plot summaries, abstract adjectives, lines longer than the shot can hold.
@@ -44,6 +50,64 @@ non_diegetic_music: <a score the people in the scene cannot hear, or "None.">
 - `control_video` (canny / depth / HED / MLSD / pose frames) the clip follows; `control_mask` + `control_source`
   regenerate the white part of the mask: describe the whole result.
 - Steps: 8 for a draft, 12-20 when dialogue or motion matter. Canvases: 768x576 is the house size; 4-15 s.
+
+## Films: a recipe for each kind
+A clip is 4-15 s; a film is several, each carrying on from the last, then joined (`nextsycl video join`, or your
+own ffmpeg). What carries across a cut:
+- `first_frame` - a picture (a PNG; a clip: its **last frame**, a still). The pose and the look, not the motion.
+- `guide_clip: "<clip>.mp4:22:0"` - the clip's last 22 frames (5, 22, 39: 17k + 5) as one moving keyframe at
+  frame 0: position *and* motion. Give no `first_frame` with it.
+- `first_audio: "<clip>.mp4"`, `first_audio_s` - its sound tail (room tone, score, a voice mid-line) at frame 0.
+- Whatever is carried, the next clip **begins with it again**: the join must overlap exactly that span (half
+  trimmed each side, the sound cross-faded over all of it), or it plays twice. `nextsycl video join` reads it from
+  the clips' records.
+
+### A monologue, an interview, a dialogue (people talking to the camera)
+The shot must hold still and the voice and face must stay the same over many clips.
+- **Hub**: every clip opens *and* closes on clip 1's last frame (`first_frame: "first"`, `last_frame: "first"`):
+  nothing compounds, any clip can be re-rendered. Each clip must end back in its opening pose.
+- **No audio anchor**, a **2-frame** cross-fade at the joins (a 1 s anchor forces a 1 s overlap, which discards the
+  pinned frames - heads jump). A steady voice: `ref_audios` (`<Audio 1>`) on every clip, and drop the timbre
+  adjectives once the voice comes from it. Or a 22-frame guide of clip 1's end with its sound (0.9167 s).
+- **Size each clip to its line**: 22 words is clear, 28 the most; clip = words / 3.3 / 0.57 s.
+- **Lock everything in positive words**: "the camera sits in one fixed position on a tripod; that exact shot size
+  holds from the first frame to the last", blinking, the eyeline (about three times), the light level, an empty room.
+- `exposure_ref: "first"` (each pinned picture held to clip 1's luminance); one camera (two cut together jar).
+- 768x576, 8 steps (12 when the lips matter), upscale 1.5; the realism LoRA at 0.5 for live-action people.
+- Join: each clip levelled to -18 LUFS (one voice, one room: the bed must not swell at the cuts), fade out 1.5 s.
+- `nextsycl video speech` does all of this from a text file.
+
+### An action scene (one continuous shot: a creature rises, a building falls)
+The motion must carry through the cuts, and the sound with it.
+- **Chain** each clip from the last with the **motion guide and its sound**: `guide_clip: "<last>.mp4:22:0"`,
+  `first_audio: "<last>.mp4"`, `first_audio_s: 0.9167`, no `first_frame`. A picture alone restarts the motion.
+- **Plan in frames**: a clip is always 17k + 5 frames (10 s asks give 243), and each later clip replays the 22
+  carried frames, so make it the 17k + 5 nearest its beat + 22 (260 frames = 10.833 s; ask exactly frames / 24)
+  - 243, 260, 260 is a 29.96 s film. Join cutting the picture in the middle of the 22 frames.
+- **Write each clip as a beat on its own timeline** (`At 00:03.000 ...`), opening "Continuing the shot, ..." and
+  re-describing who is there (the text encoder sees only this clip's prompt). Keep the style sentence word for
+  word in every clip; the first clip's can name the picture it starts from (`<Picture 1>`), the later ones
+  cannot (a guide is not shown to the text encoder).
+- One big action a clip, the camera static or one named move; name the impacts in `overall_soundscape`, the
+  score's build in `non_diegetic_music`.
+- 12 steps (motion), a square or wide canvas: 768x768 x 10 s fits INT8, a later clip's 10.8 s needs Q6_K
+  (INT8's composition in 4 GiB less); 2x ESRGAN upscale.
+- Join: level the **whole film** to -18 LUFS (levelling each clip would flatten a score that builds), fade out.
+- `tests/api/kaiju_lighthouse.py` is this recipe end to end through the API.
+
+### A montage, a music video (cuts between different shots)
+- Clips stand alone (no guide, no audio anchor); a shared look comes from the same style sentence and, if
+  wanted, the same `first_frame` picture or `ref_images` (`minimax-h3-ref2va`) for the subject.
+- The music is the film's, not the clips': make each clip's `non_diegetic_music: None.` and lay a song (the
+  audio kind, `minimax-music3`) under the joined cuts; a 2-frame cross-fade or plain cuts.
+
+### Every kind
+- **Draft small first** (384x384, 4 s, 8 steps: a whole film in minutes) to check the story, the prompts and the
+  chain - not the picture: the noise is drawn over the latent's shape, so the final size is another composition.
+- Never `cond_noise_aug` (it decodes as confetti) or `first_latent` to chain (it jumps in exposure).
+- Memory grows with width x height x seconds: a clip that does not fit fails at the denoiser, and the studio
+  then pauses its whole queue (`video.queue.resume`).
+- docs/video/h3.md has why each of these is so.
 
 ## Example
 ```

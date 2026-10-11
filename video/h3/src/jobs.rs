@@ -1009,8 +1009,9 @@ fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frame
     }
     drop(venc);
     if let Some((p, secs)) = inp.first_audio {
-        // the audio encoder needs ~0.6 s at least; the reference anchors at least 1 s
-        let secs = secs.max(1.0);
+        // the audio encoder needs ~0.6 s at least (0.5 s fails in its convolutions); H3 held it to 1 s, which with a
+        // 22-frame (0.917 s) motion guide carries 2 frames more sound than picture - so the floor is 0.75 s
+        let secs = secs.max(0.75);
         let rate = crate::audio::SAMPLE_RATE;
         let chans: Vec<Vec<f32>> = if p.extension().is_some_and(|e| e == "safetensors") {
             let ck = Checkpoint::open(p)?;
