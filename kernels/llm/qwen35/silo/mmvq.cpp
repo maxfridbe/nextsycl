@@ -181,8 +181,9 @@ struct WideIQ4XS {
 // hmask bit << 2, less 4 (ggml's -4 where the bit is clear): 4 x the activations' sums taken off a sub-block
 struct WideQ3K {
     using Block = Q3KBlock;
-    static constexpr bool SPLIT = false;   // the standard blocks: the split layout measured 7-9% slower here
-    static constexpr int ROWS_MULTI = 2;
+    static constexpr bool SPLIT = true;   // the split layout with its 16-value sums (Q3_K's sub-blocks are 16 values):
+                                          // 1 column 379 -> 420 GB/s, 4 columns 250 -> 296
+    static constexpr int ROWS_MULTI = 1;  // 4 columns: 296 / 276 / 293 against two rows' 287 / 241 / 266
     static constexpr int ROWS = 1;   // 1 row 381/357/367 GB/s, 2 rows 384/310/363
     static constexpr int LUT = 0;
     static uint32_t lut(int) { return 0; }
@@ -204,16 +205,15 @@ struct WideQ3K {
         return r;
     }
     struct X { sycl::int4 u[2]; float dx[2]; int sum[2]; };
-    static X xload(int g, const Q81Block* xb) {
+    static X xload(int g, const XA& xa, int b0) {
         X v;
         const int h = g >> 2, lg = (g >> 1) & 1, jp = g & 1;
-        const sycl::int4 ones(0x01010101, 0x01010101, 0x01010101, 0x01010101);
 #pragma unroll
         for (int jj = 0; jj < 2; ++jj) {
-            const Q81Block* a = xb + 4 * h + 2 * jp + jj;
-            v.u[jj] = ld_q8_16(a, lg);
-            v.dx[jj] = (float) a->ds[0];
-            v.sum[jj] = dp4a4(ones, v.u[jj], 0);
+            const int a = b0 + 4 * h + 2 * jp + jj;
+            v.u[jj] = xa.q16(a, lg);
+            v.dx[jj] = xa.dd(a);
+            v.sum[jj] = xa.sum16(a, lg);
         }
         return v;
     }
