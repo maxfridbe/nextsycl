@@ -55,7 +55,7 @@ pub fn switch(args: &[String]) -> Result<(), String> {
 
 /// `nextsycl serve [--host 0.0.0.0] [--port 8000] [--serve-host 0.0.0.0] [--idle-minutes 10]`: the front door - the GPUs
 /// and the models, enabling and loading them, one API for all (nextsycl_serve::home). Ports from the settings:
-/// NS_PORT, NS_SWITCH_PORT, NS_IMAGE_PORT, NS_AUDIO_PORT, NS_VIDEO_PORT, NS_CHAT_UI_PORT; the API's token NS_API_TOKEN
+/// NS_PORT, NS_SWITCH_PORT, NS_IMAGE_PORT(2), NS_AUDIO_PORT(2), NS_VIDEO_PORT, NS_CHAT_UI_PORT; the API's token NS_API_TOKEN
 /// (else one made and kept beside the registry); NS_IDLE_MINUTES.
 /// The registry and the settings for the front door (nextsycl-models', which the glue may not depend on)
 struct Store(Config);
@@ -97,6 +97,7 @@ pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
         exe: std::env::current_exe().map_err(|e| e.to_string())?,
         ports: Ports {
             llm: port("NS_PORT", 8085), switch: port("NS_SWITCH_PORT", 8001), image: port("NS_IMAGE_PORT", 8086), audio: port("NS_AUDIO_PORT", 8087),
+            image2: port("NS_IMAGE_PORT2", 8096), audio2: port("NS_AUDIO_PORT2", 8097),
             video: port("NS_VIDEO_PORT", 8090), chat_ui: port("NS_CHAT_UI_PORT", 8080),
         },
         serve_host: opt(args, "--serve-host").unwrap_or("0.0.0.0").to_string(),

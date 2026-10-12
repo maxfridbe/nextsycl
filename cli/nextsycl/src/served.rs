@@ -1,6 +1,7 @@
 //! A kind's server as a container (`image` and `audio`): `serve` in the foreground, `start` in the background (its
 //! port on a label), `ps` (the model and the request running), `logs`, and `stop` - which waits for the requests in
-//! progress, so an engine is never ended mid-kernel.
+//! progress, so an engine is never ended mid-kernel. `--slot N` (1..) names another of the kind's servers
+//! (`nextsycl-image-1` ...): the same model or another, on another card and port, beside the first.
 
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,7 @@ use nextsycl_serve::http::{call_for, Target};
 use crate::container::Ce;
 
 pub struct Served {
-    /// the container's name
+    /// the container's name (slot 0's; slot N's has `-N` after it)
     pub name: &'static str,
     /// the command's (`nextsycl <kind> ...`)
     pub kind: &'static str,
@@ -37,15 +38,41 @@ fn me() -> String {
     std::env::args().next().unwrap_or_else(|| "nextsycl".into())
 }
 
+/// The arguments without `--slot N` (the server inside has no use for it)
+pub fn without_slot(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--slot" {
+            it.next();
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out
+}
+
 impl Served {
+    /// The container's name for `--slot N` in `args` (none or 0: the first's)
+    pub fn name_for(&self, args: &[String]) -> Result<String, String> {
+        match opt(args, "--slot") {
+            None => Ok(self.name.into()),
+            Some(v) => match v.parse::<u32>() {
+                Ok(0) => Ok(self.name.into()),
+                Ok(n) => Ok(format!("{}-{n}", self.name)),
+                Err(_) => Err(format!("--slot {v}: a number")),
+            },
+        }
+    }
+
     /// `podman run`'s head: removed when it ends in the foreground, kept (for `logs`) in the background
-    pub fn run_args(&self, detach: bool, args: &[String]) -> Vec<String> {
+    pub fn run_args(&self, detach: bool, args: &[String]) -> Result<Vec<String>, String> {
         // --init: the server is not PID 1, so a stop's SIGTERM ends it (PID 1 ignores signals it does not handle)
-        vec![
-            "run".into(), if detach { "-d".into() } else { "--rm".into() }, "--init".into(), "--name".into(), self.name.into(),
+        Ok(vec![
+            "run".into(), if detach { "-d".into() } else { "--rm".into() }, "--init".into(), "--name".into(), self.name_for(args)?,
             "--network".into(), "host".into(), "--stop-timeout".into(), "120".into(),
             "--label".into(), format!("nextsycl.port={}", opt(args, "--port").unwrap_or(self.port)),
-        ]
+        ])
     }
 
     pub fn launch(&self, ce: &Ce, a: &[String], detach: bool) -> Result<(), String> {
@@ -64,6 +91,7 @@ impl Served {
 
     /// `start`: `serve` in the background, ready when it answers /health
     pub fn start(&self, cfg: &Config, args: &[String], run: impl FnOnce(bool) -> Result<(), String>) -> Result<(), String> {
+        let name = self.name_for(args)?;
         run(true)?;
         let port = opt(args, "--port").unwrap_or(self.port);
         let t = Target::Tcp(format!("127.0.0.1:{port}"));
@@ -71,33 +99,34 @@ impl Served {
         let t0 = Instant::now();
         loop {
             if call_for(&t, "GET", "/health", None, 4).is_ok() {
-                println!("{} is up on port {port} ({:.0} s): {} {} ps | logs | stop", self.name, t0.elapsed().as_secs_f64(), me(), self.kind);
+                println!("{name} is up on port {port} ({:.0} s): {} {} ps | logs | stop", t0.elapsed().as_secs_f64(), me(), self.kind);
                 return Ok(());
             }
-            if !ce.running(self.name) {
-                return Err(format!("{} ended while loading: {} {} logs", self.name, me(), self.kind));
+            if !ce.running(&name) {
+                return Err(format!("{name} ended while loading: {} {} logs", me(), self.kind));
             }
             if t0.elapsed() > Duration::from_secs(600) {
-                return Err(format!("{} did not answer in 10 minutes ({} logs)", self.name, self.kind));
+                return Err(format!("{name} did not answer in 10 minutes ({} logs)", self.kind));
             }
             std::thread::sleep(Duration::from_secs(1));
         }
     }
 
     /// The running server's address (its container's label)
-    pub fn addr(&self, cfg: &Config) -> Result<Target, String> {
+    pub fn addr(&self, cfg: &Config, args: &[String]) -> Result<Target, String> {
+        let name = self.name_for(args)?;
         let ce = Ce::new(cfg)?;
-        if !ce.running(self.name) {
-            return Err(format!("{} is not running ({} start)", self.name, self.kind));
+        if !ce.running(&name) {
+            return Err(format!("{name} is not running ({} start)", self.kind));
         }
-        let o = ce.cmd().args(["container", "inspect", "-f", "{{index .Config.Labels \"nextsycl.port\"}}", self.name]).output().map_err(|e| e.to_string())?;
+        let o = ce.cmd().args(["container", "inspect", "-f", "{{index .Config.Labels \"nextsycl.port\"}}", &name]).output().map_err(|e| e.to_string())?;
         let port = String::from_utf8_lossy(&o.stdout).trim().to_string();
         Ok(Target::Tcp(format!("127.0.0.1:{}", if port.is_empty() || port.contains("no value") { self.port } else { &port })))
     }
 
     /// `ps`: the model, what is running and how many wait
-    pub fn ps(&self, cfg: &Config) -> Result<(), String> {
-        let t = self.addr(cfg)?;
+    pub fn ps(&self, cfg: &Config, args: &[String]) -> Result<(), String> {
+        let t = self.addr(cfg, args)?;
         let info = call_for(&t, "GET", "/api/info", None, 10)?;
         let p = call_for(&t, "GET", "/api/progress", None, 10)?;
         let loras: Vec<String> = info["loras"].as_array().into_iter().flatten().filter(|l| !l["loaded"].is_null())
@@ -110,13 +139,14 @@ impl Served {
     }
 
     /// `stop`: the request in progress (and those waiting) finish first
-    pub fn stop(&self, cfg: &Config) -> Result<(), String> {
+    pub fn stop(&self, cfg: &Config, args: &[String]) -> Result<(), String> {
+        let name = self.name_for(args)?;
         let ce = Ce::new(cfg)?;
-        if !ce.running(self.name) {
-            ce.remove(self.name);
-            return Err(format!("{} is not running", self.name));
+        if !ce.running(&name) {
+            ce.remove(&name);
+            return Err(format!("{name} is not running"));
         }
-        if let Ok(t) = self.addr(cfg) {
+        if let Ok(t) = self.addr(cfg, args) {
             let t0 = Instant::now();
             let mut said = false;
             while let Ok(p) = call_for(&t, "GET", "/api/progress", None, 10) {
@@ -133,17 +163,17 @@ impl Served {
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
-        ce.stop(self.name, 120);
-        ce.remove(self.name);
-        println!("{} stopped", self.name);
+        ce.stop(&name, 120);
+        ce.remove(&name);
+        println!("{name} stopped");
         Ok(())
     }
 
     pub fn logs(&self, cfg: &Config, rest: &[String]) -> Result<(), String> {
         let ce = Ce::new(cfg)?;
         let mut a = vec!["logs".to_string()];
-        a.extend(rest.iter().cloned());
-        a.push(self.name.into());
+        a.extend(without_slot(rest));
+        a.push(self.name_for(rest)?);
         ce.cmd().args(&a).status().map_err(|e| e.to_string()).map(|_| ())
     }
 }

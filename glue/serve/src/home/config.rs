@@ -38,6 +38,8 @@ pub const SETTINGS: &[Setting] = &[
     st("NS_SWITCH_PORT", "front door", "8001", "the model switcher's port (Open WebUI's endpoint)", &["serve"]),
     st("NS_IMAGE_PORT", "front door", "8086", "the image server's port", &["serve"]),
     st("NS_AUDIO_PORT", "front door", "8087", "the audio server's port", &["serve"]),
+    st("NS_IMAGE_PORT2", "front door", "8096", "the second image server's port (a model on two cards runs on both when the work asks; 0: one server)", &["serve"]),
+    st("NS_AUDIO_PORT2", "front door", "8097", "the second audio server's port (0: one server)", &["serve"]),
     st("NS_CHAT_UI_PORT", "front door", "8080", "Open WebUI's port (a link)", &["serve"]),
     st("NS_HOST", "chat", "127.0.0.1", "the chat server's address (0.0.0.0: the network)", &["llm"]),
     st("NS_PORT", "chat", "8085", "the chat server's port", &["llm", "serve", "switch"]),

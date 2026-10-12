@@ -226,8 +226,8 @@ impl Home {
                 None => Err((404, format!("no model {id} (system.models)"))),
             };
         }
-        let loaded = call_for(&self.target(kind), "GET", "/api/info", None, 2).ok().map(|i| s(&i, "model"));
-        loaded.filter(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
+        let loaded = self.loaded_of(kind);
+        loaded.into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
             .ok_or_else(|| (409, format!("no {kind} model is enabled (system.enable)")))
     }
 
@@ -258,8 +258,8 @@ impl Home {
             .filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false)
             .filter(|m| m["speech"].as_array().is_some_and(|a| need.is_empty() || a.iter().any(|x| x == need)))
             .map(|m| s(m, "id")).collect();
-        let loaded = call_for(&self.target("audio"), "GET", "/api/info", None, 2).ok().map(|i| s(&i, "model"));
-        loaded.filter(|l| can.contains(l)).or_else(|| can.first().cloned()).ok_or_else(|| {
+        let loaded = self.loaded_of("audio");
+        loaded.into_iter().find(|l| can.contains(l)).or_else(|| can.first().cloned()).ok_or_else(|| {
             (409, match need {
                 "clone" => "no enabled speech model clones a voice (system.enable qwen3-tts-base)".to_string(),
                 "design" => "no enabled speech model designs a voice (system.enable qwen3-tts-design)".to_string(),
@@ -476,8 +476,8 @@ impl Home {
                 let t = self.ensure(&id)?;
                 pass(s, &t)
             }
-            ("GET", p) if p.starts_with("/v1/images/files/") => pass(s, &self.target("image")),
-            ("GET", p) if p.starts_with("/v1/audio/files/") => pass(s, &self.target("audio")),
+            ("GET", p) if p.starts_with("/v1/images/files/") => pass(s, &self.file_target("image")),
+            ("GET", p) if p.starts_with("/v1/audio/files/") => pass(s, &self.file_target("audio")),
             ("GET", p) if p.starts_with("/v1/video/files/") => {
                 // a clip in the studio's output (its /out/ route; a Range header passed on for seeking)
                 need("video")?;

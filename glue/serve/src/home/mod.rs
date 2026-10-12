@@ -42,6 +42,9 @@ pub struct Ports {
     pub switch: u16,
     pub image: u16,
     pub audio: u16,
+    /// the second image and audio servers' (a model enabled on two cards runs on both when the work asks; 0: none)
+    pub image2: u16,
+    pub audio2: u16,
     pub video: u16,
     /// the chat front end (Open WebUI), a link only
     pub chat_ui: u16,
@@ -85,6 +88,8 @@ pub struct Home {
     kind_lock: BTreeMap<&'static str, Mutex<()>>,
     /// model id -> card -> MiB, the most seen while it ran
     seen: Mutex<BTreeMap<String, BTreeMap<usize, u64>>>,
+    /// the requests sent on to each image and audio server and not answered yet, by its port
+    pub(crate) inflight: Mutex<BTreeMap<u16, usize>>,
 }
 
 pub(crate) fn now() -> f64 {
@@ -167,7 +172,7 @@ impl Home {
             o, token, state_file,
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
-            seen: Mutex::new(seen),
+            seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()),
         });
         let me = h.clone();
         std::thread::spawn(move || me.sample_cards());
@@ -306,10 +311,10 @@ impl Home {
         let kind = registry::kind_of(&m).to_string();
         let port = match kind.as_str() {
             "image" | "audio" => {
-                if let Err((c, e)) = self.ensure(id) {
-                    return http::respond(s, c, &err(e));
+                match self.ensure(id) {
+                    Ok(l) => l.port,
+                    Err((c, e)) => return http::respond(s, c, &err(e)),
                 }
-                if kind == "image" { self.o.ports.image } else { self.o.ports.audio }
             }
             "video" => self.o.ports.video,
             _ => self.o.ports.chat_ui,

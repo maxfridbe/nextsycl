@@ -13,7 +13,7 @@ nextsycl image gen \"<prompt>\" [--model ID] [--size WxH | --aspect W:H] [--step
                    [--schedule S] [--lora NAME[:SCALE]]... [--set NAME=VALUE]... [--out FILE|DIR] [--rgba] [--local] [--gpu N]
 nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora NAME[:SCALE]]... [--set NAME=VALUE]...
                      [--wfe] [--out DIR] [--cors ORIGIN]
-nextsycl image start [serve's options]   (in the background) | ps | logs [-f] | stop
+nextsycl image start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
 nextsycl image check <dump dir> [--model ID] [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--gpu N]
 nextsycl image engines | selftest [--gpu N]";
 
@@ -266,13 +266,13 @@ fn run(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
         return Err(format!("{}: the web front end is not built yet (./build.sh wfe)", cfg.dist.join("wfe").display()));
     }
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
-    const NAME: &str = SERVED.name;
-    if ce.running(NAME) {
-        return Err(format!("{NAME} is running already ({} stop {NAME})", ce.bin));
+    let name = SERVED.name_for(args)?;
+    if ce.running(&name) {
+        return Err(format!("{name} is running already ({} stop {name})", ce.bin));
     }
-    ce.remove(NAME);
+    ce.remove(&name);
     // --init: the server is not PID 1, so a stop's SIGTERM ends it (PID 1 ignores signals it does not handle)
-    let mut a = SERVED.run_args(detach, args);
+    let mut a = SERVED.run_args(detach, args)?;
     a.extend(ce.user_args());
     a.extend(ce.gpu_args());
     a.extend(mount(&cfg.dist, "/app", true));
@@ -300,7 +300,7 @@ fn run(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     a.push(model_id);
     let mut it = args.iter().skip(if id.is_some() && !args.first().is_some_and(|x| x.starts_with("--")) { 1 } else { 0 });
     while let Some(x) = it.next() {
-        if x == "--out" || x == "--model" {
+        if x == "--out" || x == "--model" || x == "--slot" {
             it.next();
             continue;
         }
@@ -372,8 +372,8 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("check") => check(cfg, rest),
         Some("serve") => serve(cfg, rest),
         Some("start") => SERVED.start(cfg, rest, |d| run(cfg, rest, d)),
-        Some("ps") => SERVED.ps(cfg),
-        Some("stop") => SERVED.stop(cfg),
+        Some("ps") => SERVED.ps(cfg, rest),
+        Some("stop") => SERVED.stop(cfg, rest),
         Some("logs") => SERVED.logs(cfg, rest),
         _ => Err(USAGE.into()),
     }

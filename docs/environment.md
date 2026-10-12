@@ -42,10 +42,12 @@ Where the program, its libraries, its models and its sockets are.
 |---|---|---|---|
 | `NS_API_TOKEN` | made once, kept in serve.json beside the registry | the front door API's bearer token; `audio voices design` uses it to call the front door | serve, cli (audio) |
 | `NS_AUDIO_PORT` | 8087 | the audio server's port, as the front door reaches it | serve |
+| `NS_AUDIO_PORT2` | 8097 | the second audio server's port (`audio start --slot 1`): a model enabled on two cards runs on both while its work keeps the first busy; 0: one server | serve |
 | `NS_CHAT_UI_PORT` | 8080 | Open WebUI's port (the page's link) | serve |
 | `NS_CORS` | loopback origins only | more web origins that may call the servers from a browser, comma-separated (`*`: any) | cli (llm, image, audio start) |
 | `NS_IDLE_MINUTES` | 10 | an enabled model unloads after this long without a request (0: never); the switcher uses the same unless --idle-minutes | serve, switch |
 | `NS_IMAGE_PORT` | 8086 | the image server's port, as the front door reaches it | serve |
+| `NS_IMAGE_PORT2` | 8096 | the second image server's port (`image start --slot 1`), as `NS_AUDIO_PORT2` | serve |
 | `NS_PORT` | 8085 | the chat server's port (also the url the registry gives chat entries) | cli (llm start), serve, switch |
 | `NS_SERVE_PORT` | 8000 | the front door's port; `audio voices design` calls it there | serve, cli (audio) |
 | `NS_SWITCH_PORT` | 8001 | the model switcher's port, as the front door reaches it (the switcher itself listens on --port, 8001) | serve |

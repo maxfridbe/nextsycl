@@ -13,7 +13,7 @@ const USAGE: &str = "nextsycl audio gen \"<description>\" [--lyrics TEXT | --lyr
 nextsycl audio gen \"<text to say>\" --model qwen3-tts-... [--voice NAME] [--language L] [--instructions TEXT]
                    [--ref-audio FILE.wav [--ref-text TEXT]] [--seconds N] [--seed N] [--out FILE|DIR]   (speech)
 nextsycl audio serve [MODEL] [--port 8087] [--host 127.0.0.1] [--gpu N] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
-nextsycl audio start [serve's options]   (in the background) | ps | logs [-f] | stop
+nextsycl audio start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
 nextsycl audio voice list                                   the saved voices (spoken by name: --voice NAME, \"voice\": NAME)
 nextsycl audio voice add NAME --sample FILE [--text \"what it says\"] [--description D] [--language L] [--replace]
                    a voice cloned from a recording (WAV, MP3, FLAC, Ogg, M4A; 3-15 s of one speaker)
@@ -275,13 +275,13 @@ fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
         return Err(format!("{}: the web front end is not built yet (./build.sh wfe)", cfg.dist.join("wfe").display()));
     }
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
-    const NAME: &str = SERVED.name;
-    if ce.running(NAME) {
-        return Err(format!("{NAME} is running already ({} stop {NAME})", ce.bin));
+    let name = SERVED.name_for(args)?;
+    if ce.running(&name) {
+        return Err(format!("{name} is running already ({} stop {name})", ce.bin));
     }
-    ce.remove(NAME);
+    ce.remove(&name);
     // --init: the server is not PID 1, so a stop's SIGTERM ends it (PID 1 ignores signals it does not handle)
-    let mut a = SERVED.run_args(detach, args);
+    let mut a = SERVED.run_args(detach, args)?;
     a.extend(ce.user_args());
     a.extend(ce.gpu_args());
     a.extend(mount(&cfg.dist, "/app", true));
@@ -311,7 +311,7 @@ fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     }
     let mut it = args.iter().skip(if id.is_some() { 1 } else { 0 });
     while let Some(x) = it.next() {
-        if x == "--out" || x == "--model" {
+        if x == "--out" || x == "--model" || x == "--slot" {
             it.next();
             continue;
         }
@@ -416,8 +416,8 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("designvoice") => voice(cfg, &[&["design".to_string()], rest].concat()),
         Some("serve") => serve(cfg, rest, false),
         Some("start") => SERVED.start(cfg, rest, |d| serve(cfg, rest, d)),
-        Some("ps") => SERVED.ps(cfg),
-        Some("stop") => SERVED.stop(cfg),
+        Some("ps") => SERVED.ps(cfg, rest),
+        Some("stop") => SERVED.stop(cfg, rest),
         Some("logs") => SERVED.logs(cfg, rest),
         _ => Err(USAGE.into()),
     }
