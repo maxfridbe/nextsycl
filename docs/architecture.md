@@ -171,7 +171,9 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   Small uploads and readbacks go through pinned rings copied by kernels (the runtime's memcpy waits behind the
   store's copies on the copy engine). Group-limited routing (8 groups, best 4) on by default (`NS_DS2_GROUPS=0`: as
   llama.cpp runs this file, which has no group metadata). Checked against llama.cpp layer by layer (cosine >= 0.998 to
-  layer 59); 1.58-bit R1 on a B70 + B65 with 61 GB of host memory: ~7.2 tok/s decode (llama.cpp with its experts
+  layer 59); 1.58-bit R1 on a B70 + B65 with 61 GB of host memory: ~8 tok/s decode, ~135 tok/s prompt reading - a prompt runs a
+  layer at a time over spans of 4,096 tokens (attention a chunk at a time, every expert loaded once a span, the next
+  layer's file-only experts read behind the current one's) (llama.cpp with its experts
   mmapped: 1.0, 2.8-3.5 with madvise prefetch).
 
 ## The audio engines

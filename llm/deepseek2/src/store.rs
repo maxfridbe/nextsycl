@@ -721,8 +721,10 @@ impl Store {
     }
 
     /// A prompt pass: where each expert of `need` is read - its VRAM slot (false), or its host slot (true) with the last
-    /// copy that wrote it (the caller's copy out of it waits for that); the file-only ones read into host slots first.
-    pub fn locate(&mut self, o: &Ops, l: u64, need: &[u64]) -> Result<Vec<(DevBuf, bool, Option<i64>)>> {
+    /// copy that wrote it (the caller's copy out of it waits for that) and, for the file-only ones, the read into it
+    /// that is on its way (`finish_reads` before the slot is read)
+    #[allow(clippy::type_complexity)]
+    pub fn locate(&mut self, o: &Ops, l: u64, need: &[u64]) -> Result<Vec<(DevBuf, bool, Option<i64>, Option<usize>)>> {
         let tick = self.begin();
         for &x in need {
             match self.loc.get(&(l, x)).copied() {
@@ -732,27 +734,51 @@ impl Store {
             }
         }
         for &x in need {
-            if !self.loc.contains_key(&(l, x)) {
-                self.start_read(o, (l, x), true)?;
-                self.stats.from_file += 1;
+            match self.loc.get(&(l, x)).copied() {
+                None => {
+                    self.start_read(o, (l, x), true)?;
+                    self.stats.from_file += 1;
+                }
+                Some(Loc::P(r)) => {
+                    if let Some(d) = self.reads.get(&r) {
+                        self.reader.hurry(d);
+                    }
+                }
+                _ => {}
             }
         }
         need.iter().map(|x| match self.loc.get(&(l, *x)).copied() {
             Some(Loc::V(s)) => {
                 self.stats.hits += 1;
-                Ok((self.vview(s)?, false, None))
+                Ok((self.vview(s)?, false, None, None))
             }
             Some(Loc::P(r)) => {
-                self.finish_read(r)?;
                 self.stats.direct += 1;
-                Ok((self.rview(r)?, true, None))
+                Ok((self.rview(r)?, true, None, Some(r)))
             }
             Some(Loc::R(r)) => {
                 self.stats.direct += 1;
-                Ok((self.rview(r)?, true, self.rlast[r]))
+                Ok((self.rview(r)?, true, self.rlast[r], None))
             }
             None => Err(Error("store: an expert went missing".into())),
         }).collect()
+    }
+
+    /// A long prompt's next layer: every one of its experts that is on the file only, read into pinned slots behind
+    /// what is read now (a prompt of a few hundred tokens or more asks for nearly all of a layer's experts)
+    pub fn read_layer_ahead(&mut self, o: &Ops, l: u64, n_expert: u64) -> Result<usize> {
+        if !self.parts.contains_key(&l) {
+            return Ok(0);
+        }
+        let mut n = 0;
+        for x in 0..n_expert {
+            if !self.loc.contains_key(&(l, x)) {
+                self.start_read(o, (l, x), false)?;
+                self.stats.file_prefetched += 1;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// After a prompt pass read host slots in place (or through copies): those reads' ticket, so nothing overwrites

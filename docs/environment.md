@@ -89,7 +89,7 @@ The llm kind's common options (`nextsycl_llm::COMMON_OPTIONS`); what each engine
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
-| `NS_PROFILE` | off | Time the passes by section (1: GPU synced at each boundary; gpu: device timestamps, no syncs) (--opt-profile) | llm glm5next, llm qwen35 (NS_Q35_PROFILE needs gpu), kernels:ns (gpu: profiling queues) |
+| `NS_PROFILE` | off | Time the passes by section (1: GPU synced at each boundary; gpu: device timestamps, no syncs; deepseek2: 1 its decode passes, prompt its prompt passes) (--opt-profile) | llm glm5next, llm qwen35 (NS_Q35_PROFILE needs gpu), llm deepseek2, kernels:ns (gpu: profiling queues) |
 | `NS_SPLIT` | even by layer count (glm5next); planned by free VRAM (qwen4exp, qwen35) | Layers per GPU. glm5next: A,B,... layer counts of each GPU but the last; qwen4exp, qwen35: the first layer of each GPU after the first (same for two GPUs) (--opt-split) | llm glm5next, llm qwen4exp, llm qwen35 |
 | `NS_VRAM_GUARD_GIB` | glm5next: off; qwen4exp: 1.5 | VRAM (GiB) to keep free. glm5next: a prompt read stops with an error once a GPU has less free after a chunk; qwen4exp: the load plan's margin a GPU (--opt-vram-guard-gib) | llm glm5next, llm qwen4exp; cli (passes it to the container) |
 
@@ -387,7 +387,9 @@ file; decode multiplies the pinned ones on the CPU.
 | `NS_DS2_PREFETCH_P` | 0.5 | the guessed chance of use from which an expert is loaded ahead (--opt-prefetch-p) | llm deepseek2 |
 | `NS_DS2_PREFETCH_UP` | off | 1: the look ahead also copies guessed pinned experts up to VRAM | llm deepseek2 |
 | `NS_DS2_PROMOTE` | 3 | pinned experts the CPU multiplied that a layer copies up to VRAM behind it (while the copy lane is idle) | llm deepseek2 |
+| `NS_DS2_READ_AHEAD` | 256 | prompt passes of at least this many tokens read the next layer's file-only experts behind the current layer's (0: never) | llm deepseek2 |
 | `NS_DS2_READERS` | 16 | threads reading experts from the file (--opt-readers) | llm deepseek2 |
+| `NS_DS2_SPAN` | 4096 | a prompt's tokens a pass takes a layer at a time: its experts loaded once for all of them, its attention a chunk at a time | llm deepseek2 |
 | `NS_DS2_TAP_EXPERTS` | off | Debug: 1 shows the checks each row's experts' gate, up and down outputs (ffn_moe_gate / _up / _down) | llm deepseek2 |
 | `NS_DS2_TRACE_EXPERTS` | off | Debug: FILE gets every decode request (GPU, layer, experts) for offline cache studies | llm deepseek2 |
 | `NS_DS2_TRACE_GUESS` | off | Debug: FILE gets the next layer's router guesses (top 32) beside the requests | llm deepseek2 |

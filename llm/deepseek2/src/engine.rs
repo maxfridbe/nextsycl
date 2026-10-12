@@ -51,6 +51,23 @@ pub fn prefill_chunk() -> usize {
     *V.get_or_init(|| env_usize("NS_DS2_CHUNK", 1024).clamp(1, 4096))
 }
 
+/// A prompt's tokens a pass takes a layer at a time (NS_DS2_SPAN, default 4096): its experts are loaded once for all
+/// of them, its attention runs a chunk at a time
+fn span() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS2_SPAN", 4096).clamp(1, 1 << 20))
+}
+
+/// Prompt passes of at least this many tokens read the next layer's file-only experts ahead (NS_DS2_READ_AHEAD,
+/// default 256; 0 = never)
+fn read_ahead_min() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match env_usize("NS_DS2_READ_AHEAD", 256) {
+        0 => usize::MAX / 64,
+        v => v,
+    })
+}
+
 /// Bytes of each GPU's arena (NS_DS2_ARENA_MIB; default 256 MiB and ~1.4 MiB a token of the prompt chunk)
 fn arena_bytes() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -795,7 +812,7 @@ impl<'g> Ds<'g> {
         if let Some(pl) = &pool {
             log(format!("CPU: the pinned experts multiplied by {} threads{}", pl.threads, if crate::cpu::avx512_on() { " (AVX-512 VNNI)" } else { "" }));
         }
-        let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(BTreeMap::new()));
+        let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1" || v == "prompt").then(|| Mutex::new(BTreeMap::new()));
         Ok(Ds { m, parts, owner, rope, kq_scale, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, prof, router_wait: 0.into(), rows_now: 0.into(), route_host: 0.into(), pool })
     }
 
@@ -829,8 +846,15 @@ impl<'g> Ds<'g> {
     }
 
     /// Profiling inside a section: the GPU synced and the time since `t0` added to `name`; the next lap's start
+    /// NS_PROFILE=1 times one-row passes (decode), NS_PROFILE=prompt the longer ones
+    fn timing(&self) -> bool {
+        static PROMPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let prompt = *PROMPT.get_or_init(|| std::env::var("NS_PROFILE").is_ok_and(|v| v == "prompt"));
+        self.prof.is_some() && ((self.rows_now.load(std::sync::atomic::Ordering::Relaxed) == 1) != prompt)
+    }
+
     fn lap(&self, p: &Part, name: &'static str, t0: Option<Instant>) -> Option<Instant> {
-        let pr = self.prof.as_ref().filter(|_| self.rows_now.load(std::sync::atomic::Ordering::Relaxed) == 1)?;
+        let pr = self.prof.as_ref().filter(|_| self.timing())?;
         let t0 = t0?;
         p.ops.gpu.sync().ok()?;
         let mut m = pr.lock().unwrap();
@@ -840,14 +864,14 @@ impl<'g> Ds<'g> {
         Some(Instant::now())
     }
     fn mark(&self, p: &Part) -> Option<Instant> {
-        self.prof.as_ref().filter(|_| self.rows_now.load(std::sync::atomic::Ordering::Relaxed) == 1)?;
+        self.prof.as_ref().filter(|_| self.timing())?;
         p.ops.gpu.sync().ok()?;
         Some(Instant::now())
     }
 
     /// Runs `f`, adding its time to section `name` when profiling (`p`'s GPU synced around it)
     fn timed<T>(&self, p: &Part, name: &'static str, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let Some(pr) = self.prof.as_ref().filter(|_| self.rows_now.load(std::sync::atomic::Ordering::Relaxed) == 1) else { return f() };
+        let Some(pr) = self.prof.as_ref().filter(|_| self.timing()) else { return f() };
         p.ops.gpu.sync()?;
         let t0 = Instant::now();
         let r = f()?;
@@ -943,13 +967,16 @@ impl<'g> Ds<'g> {
         Ok(self.feed_until(s, tokens, &|| false, tap)?.1)
     }
 
+    /// A prompt in spans of NS_DS2_SPAN tokens, each a layer at a time over all its tokens: attention (and the dense
+    /// layers) a chunk at a time, the experts once for the whole span - every expert loaded once a span, not once a
+    /// chunk (the disk and PCIe moved per prompt divided by the chunks a span holds). `stop()` is asked between spans.
     pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
         let (mut fed, mut logits) = (0, Vec::new());
-        for (i, c) in tokens.chunks(prefill_chunk()).enumerate() {
+        for (i, c) in tokens.chunks(span().max(prefill_chunk())).enumerate() {
             if i > 0 && stop() {
                 break;
             }
-            logits = self.forward(s, c, &mut *tap)?;
+            logits = self.pass(s, c, 1, prefill_chunk(), &mut *tap)?.pop().unwrap_or_default();
             fed += c.len();
         }
         Ok((fed, logits))
@@ -961,8 +988,16 @@ impl<'g> Ds<'g> {
 
     /// The next `tokens` (at most a chunk): the logits of the last `n_out`
     pub fn forward_rows(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
+        if tokens.len() > prefill_chunk() {
+            return Err(Error(format!("forward: {} tokens, more than a chunk", tokens.len())));
+        }
+        self.pass(s, tokens, n_out, prefill_chunk(), tap)
+    }
+
+    /// One pass over `tokens` (a chunk, or a span whose attention runs `sub` rows at a time): the last `n_out` logits
+    fn pass(&self, s: &mut Session, tokens: &[u32], n_out: usize, sub: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
         let t = tokens.len();
-        if t == 0 || t > prefill_chunk() || n_out == 0 || n_out > t.min(MMVQ_COLS) {
+        if t == 0 || n_out == 0 || n_out > t.min(MMVQ_COLS) {
             return Err(Error(format!("forward: {t} tokens, {n_out} outputs")));
         }
         let pos0 = s.pos;
@@ -985,7 +1020,7 @@ impl<'g> Ds<'g> {
                 self.timed(p, "GPU to GPU", || next.copy_from_peer(&x, &mut staging))?;
                 x = next;
             }
-            self.run_layers(&s.caches, run, &x, pos0, t, &mut *tap)?;
+            self.run_layers(&s.caches, run, &x, pos0, t, sub, &mut *tap)?;
         }
         let out = self.head(&x, t, n_out, d, &mut *tap)?;
         s.pos += t;
@@ -1025,33 +1060,53 @@ impl<'g> Ds<'g> {
     }
 
     /// One run of layers over the stream x [t, d] in place
-    fn run_layers(&self, caches: &[DevBuf], run: (usize, u64, u64), x: &DevBuf, pos0: usize, t: usize, tap: Tap) -> Result<()> {
+    /// One run of layers over the stream x [t, d] in place: attention and the dense layers `sub` rows at a time, the
+    /// experts over all t
+    #[allow(clippy::too_many_arguments)]
+    fn run_layers(&self, caches: &[DevBuf], run: (usize, u64, u64), x: &DevBuf, pos0: usize, t: usize, sub: usize, tap: Tap) -> Result<()> {
         let g = &self.m.g;
         let (d, eps) = (g.n_embd as usize, g.rms_eps as f32);
         let p = &self.parts[run.0];
         let o = &p.ops;
+        let subs: Vec<(usize, usize)> = (0..t).step_by(sub.max(1)).map(|r0| (r0, sub.min(t - r0))).collect();
         for l in run.1..run.2 {
             p.arena.reset();
-            let h = p.arena.f32(t * d)?;
-            o.rms_norm(x, Some(p.vec(l, Role::AttnNorm)?), &h, t, d, eps)?;
-            tap(&format!("attn_norm-{l}"), &h)?;
-            let att = self.timed(p, "MLA", || self.mla(p, l, &h, &caches[l as usize], pos0, t, &mut *tap))?;
-            o.add(x, &att, t * d)?;
+            for &(r0, tc) in &subs {
+                let mark = p.arena.mark();
+                let xs = x.view(r0 * d * 4, tc * d * 4)?;
+                let h = p.arena.f32(tc * d)?;
+                o.rms_norm(&xs, Some(p.vec(l, Role::AttnNorm)?), &h, tc, d, eps)?;
+                tap(&format!("attn_norm-{l}"), &h)?;
+                let att = self.timed(p, "MLA", || self.mla(p, l, &h, &caches[l as usize], pos0 + r0, tc, &mut *tap))?;
+                o.add(&xs, &att, tc * d)?;
+                p.arena.rewind(mark);
+            }
             tap(&format!("ffn_inp-{l}"), x)?;
-            o.rms_norm(x, Some(p.vec(l, Role::FfnNorm)?), &h, t, d, eps)?;
-            tap(&format!("ffn_norm-{l}"), &h)?;
-            let f = if g.is_moe(l) {
-                self.moe(p, l, t, &h, &mut *tap)?
+            if g.is_moe(l) {
+                let h = p.arena.f32(t * d)?;
+                o.rms_norm(x, Some(p.vec(l, Role::FfnNorm)?), &h, t, d, eps)?;
+                tap(&format!("ffn_norm-{l}"), &h)?;
+                let f = self.moe(p, l, t, &h, &mut *tap)?;
+                tap(&format!("ffn_out-{l}"), &f)?;
+                o.add(x, &f, t * d)?;
             } else {
-                self.timed(p, "dense FFN", || {
-                    let mut pj = p.mm_many(l, &[Role::FfnGate, Role::FfnUp], &h, t)?.into_iter();
-                    let (gt, up) = (pj.next().unwrap(), pj.next().unwrap());
-                    o.swiglu(&gt, &up, &gt, t * g.ffn_dense as usize)?;
-                    p.mm(l, Role::FfnDown, &gt, t)
-                })?
-            };
-            tap(&format!("ffn_out-{l}"), &f)?;
-            o.add(x, &f, t * d)?;
+                for &(r0, tc) in &subs {
+                    let mark = p.arena.mark();
+                    let xs = x.view(r0 * d * 4, tc * d * 4)?;
+                    let h = p.arena.f32(tc * d)?;
+                    o.rms_norm(&xs, Some(p.vec(l, Role::FfnNorm)?), &h, tc, d, eps)?;
+                    tap(&format!("ffn_norm-{l}"), &h)?;
+                    let f = self.timed(p, "dense FFN", || {
+                        let mut pj = p.mm_many(l, &[Role::FfnGate, Role::FfnUp], &h, tc)?.into_iter();
+                        let (gt, up) = (pj.next().unwrap(), pj.next().unwrap());
+                        o.swiglu(&gt, &up, &gt, tc * g.ffn_dense as usize)?;
+                        p.mm(l, Role::FfnDown, &gt, tc)
+                    })?;
+                    tap(&format!("ffn_out-{l}"), &f)?;
+                    o.add(&xs, &f, tc * d)?;
+                    p.arena.rewind(mark);
+                }
+            }
             tap(&format!("l_out-{l}"), x)?;
         }
         Ok(())
@@ -1525,6 +1580,10 @@ impl<'g> Ds<'g> {
         let (d, f) = (g.n_embd as usize, g.ffn_expert as usize);
         let need: Vec<u64> = by.keys().map(|e| *e as u64).collect();
         let slots = p.experts.lock().unwrap().locate(o, l, &need)?;
+        // a long prompt: the next layer's file-only experts read behind this layer's (NS_DS2_READ_AHEAD tokens, 256)
+        if by.values().map(|v| v.len()).sum::<usize>() >= read_ahead_min() * self.m.g.n_expert_used as usize {
+            p.experts.lock().unwrap().read_layer_ahead(o, l + 1, self.m.g.n_expert)?;
+        }
         let total: usize = by.values().map(|v| v.len()).sum();
         let mut gtok: Vec<i32> = Vec::with_capacity(total);
         let mut gw: Vec<f32> = Vec::with_capacity(total);
@@ -1545,12 +1604,26 @@ impl<'g> Ds<'g> {
         const RING: usize = 3;
         let sb = parts.bytes();
         let ring = (0..RING).map(|_| p.arena.bytes(sb)).collect::<Result<Vec<_>>>()?;
-        let hosts: Vec<usize> = slots.iter().enumerate().filter(|(_, s)| s.1).map(|(k, _)| k).collect();
+        // the experts in VRAM first, then the pinned ones, then the ones still being read from the file (their reads
+        // land while the others compute); the token lists by expert keep their rows of tb / wtb
+        let lists: Vec<&Vec<(i32, f32)>> = by.values().collect();
+        let mut row_of = Vec::with_capacity(lists.len());
+        let mut acc = 0;
+        for l in &lists {
+            row_of.push(acc);
+            acc += l.len();
+        }
+        let mut order: Vec<usize> = (0..slots.len()).collect();
+        order.sort_by_key(|&k| (slots[k].3.is_some(), slots[k].1));
+        let hosts: Vec<usize> = order.iter().copied().filter(|&k| slots[k].1).collect();
         let mut copied: Vec<Option<(i64, usize)>> = vec![None; slots.len()];
         let mut freed: [Option<i64>; RING] = [None; RING];
         let mut next = 0;
         let issue = |next: &mut usize, freed: &[Option<i64>; RING], copied: &mut [Option<(i64, usize)>]| -> Result<()> {
             if let Some(&k) = hosts.get(*next) {
+                if let Some(rd) = slots[k].3 {
+                    p.experts.lock().unwrap().finish_reads(&[rd])?;
+                }
                 let r = *next % RING;
                 copied[k] = Some((o.stream_copy_on(0, &ring[r], 0, &slots[k].0, 0, sb, &[freed[r], slots[k].2])?, r));
                 *next += 1;
@@ -1560,10 +1633,11 @@ impl<'g> Ds<'g> {
         for _ in 0..RING {
             issue(&mut next, &freed, &mut copied)?;
         }
-        let mut row = 0;
         let mut last_copy = None;
-        for (k, list) in by.values().enumerate() {
+        for &k in &order {
+            let list = lists[k];
             let n = list.len();
+            let row = row_of[k];
             let toks = tb.view(row * 4, n * 4)?;
             let (buf, slot) = match copied[k] {
                 Some((ticket, r)) => {
@@ -1585,7 +1659,6 @@ impl<'g> Ds<'g> {
             }
             o.gemm_f16(n, d, f, (&hh, 0, f), (&w16, 0), (&dn, 0, d), false)?;
             o.scatter_add(y, &dn, &toks, &wtb.view(row * 4, n * 4)?, n, d)?;
-            row += n;
         }
         // nothing may overwrite the host slots read here before their copies are done
         if let Some(t) = last_copy {
