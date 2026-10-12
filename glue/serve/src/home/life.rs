@@ -101,10 +101,12 @@ impl Home {
     fn vouched_mb(&self, m: &Value, card_mb: u64) -> (BTreeMap<usize, u64>, bool) {
         let id = s(m, "id");
         let gpus = self.gpus_of(m);
-        if let Some(seen) = self.seen.lock().unwrap().get(&id).filter(|g| gpus.iter().all(|i| g.contains_key(i))) {
-            return (gpus.iter().map(|g| (*g, seen[g])).collect(), true);
-        }
+        // a model that ran fits the card: a peak seen above what a card may be asked for (an edit's, with its vision tower,
+        // touching the card's whole memory) would otherwise refuse the model from then on, its margin never free
         let cap = card_mb.saturating_sub(MARGIN_MB + 512);
+        if let Some(seen) = self.seen.lock().unwrap().get(&id).filter(|g| gpus.iter().all(|i| g.contains_key(i))) {
+            return (gpus.iter().map(|g| (*g, seen[g].min(cap))).collect(), true);
+        }
         if let Some(g) = m["vram_gib"].as_f64().filter(|g| *g > 0.0) {
             return (gpus.iter().map(|i| (*i, ((g * 1024.0) as u64).min(cap))).collect(), false);
         }

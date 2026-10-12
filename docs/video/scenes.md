@@ -25,6 +25,7 @@ wrong mouth; both are corrected below.
 | S7 | An effect beat in a scene | the scene + an effect | the guide as S1, `embedding:minimaxh3_bullet_time` where it happens | the leap and the turn happen; at 384 px the effect reads as a spin, not a freeze |
 | S8 | A seamless loop | one picture at both ends | `first_frame` = `last_frame` = the picture | near-static, the loop closes; wanted motion needs the prompt to ask for it |
 | S9 | Another person does what A did (motion transfer) | identity from a picture, motion from a clip | Ref2VA `ref_images [him]` + `ref_videos [A]` (`ref_video_sound false`) **and a prompt that names who is who**: "Using the movement of the figure in `<Video 1>` only, the white-bearded old man ... from `<Picture 1>` ... Every person on screen is that old man" | with the bare "moves as in `<Video 1>`" the clip's own woman came out, not him (the video dominates the picture). Described, he runs with A's composition and gait. The picture alone gives his identity and not the composition. A control video (canny of A) with his picture as `first_frame` also works but jumps from the picture's room |
+| S13 | A prop (an object the scene needs) | the object | Ref2VA `ref_images [person, prop]`: "the woman from `<Picture 1>` lifts the brass lantern from `<Picture 2>`" | the lantern was picked up, held by its ring and carried off with its flame lit, at draft size (one run; the camera favoured the prop over her face) |
 | S10 | A voice over other pictures (b-roll) | a voice | Ref2VA `ref_audios [her voice]` + the place's picture, "in an off-screen voiceover ... while no one is on screen" | the place held and no one invented; whether the voice-over was spoken was not measured |
 | S11 | The same motion in another style | composition + motion | `control_video` (canny edges of A: `ffmpeg -vf edgedetect`), the new style in the prompt (INT8; not with Ref2VA) | the watercolour follows A's layout and movement exactly |
 | S12 | A fix inside a scene | the rest of the clip | `source`, `regen "FROM-TO"`, `regen_box "x0,y0,x1,y1"` | weak: a box asked for a red coat put a small red figure in the distance, and a regenerated tail came back as the original. Re-render the clip (a hub clip is independent) instead |
@@ -43,6 +44,12 @@ wrong mouth; both are corrected below.
 - **A hard cut is a plain cut**: nothing is carried, so nothing is trimmed or cross-faded; cut the sound to the
   picture's exact length first (a clip's sound runs a fraction of a frame long and a concat holds a frame for it),
   6 ms in and out so it does not click, and level each clip alone.
+- **One place, two views, people generated in it**: to cut between people in the *same* location, generate each
+  picture in the place with the place's words repeated and the viewpoint changed (out over the water behind her, back
+  at the boathouse and houses behind him), and use that picture as the person's reference *and* pinned frame.
+  `image.edit` did not work for it: with the place as a second picture it returned the place and dropped the person
+  (two orders, three phrasings); a background change on the person's own picture left the old room behind the
+  engineer and over-processed the result.
 - **Design the scene, do not collect the clips**: the first "reel" joined the best clip of each experiment, which
   were not one scene - different voices, a clip made without the reference beside one with it - and it was unwatchable.
   `harbour_dialogue.py` is the same recipes as a scene.

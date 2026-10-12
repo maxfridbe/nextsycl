@@ -42,13 +42,18 @@ FPS = 24
 STYLE = "Live-action, cinematic, natural dusk light, shallow depth of field."
 MARA = "a woman in her forties with short grey-streaked black hair, grey eyes and a weathered face, in a navy wool coat with silver buttons"
 ILYA = "an old man with a full white beard, a flat cap and oil-stained green overalls"
+QUAY = "a stone harbour quay with iron bollards at dusk, fishing boats at their moorings, grey stone houses on the hill, still water, soft violet light"
 PICTURES = {
-    "harbour": "wide cinematic photograph of a small harbour at dusk, fishing boats at their moorings, a stone quay, grey houses on the hill, "
-               "still water, soft violet light, no people",
-    "mara": f"cinematic portrait photograph, waist-up, {MARA}, standing alone on a stone harbour quay at dusk, soft violet light, "
-            "looking straight at the camera",
-    "ilya": f"cinematic portrait photograph, waist-up, {ILYA}, alone in a ship's engine room with brass pipes, warm lamp light, "
-            "looking straight at the camera",
+    # one place, three views, each picture generated with the place's words: wide; out over the water with the captain in
+    # front of it; back at the boathouse and houses with the engineer in front of them. (image.edit of a person's picture to
+    # change its background kept the old room for him and over-processed the picture, and given the place as a second picture
+    # it returned the place and dropped the person - so the people are generated in the place.)
+    "harbour": f"wide cinematic photograph of {QUAY}, no people",
+    "mara_quay": f"cinematic portrait photograph, waist-up, {MARA}, standing alone on {QUAY}; an iron bollard beside her, the still "
+                 "water, boats and far shore behind her, looking straight at the camera, shallow depth of field",
+    "ilya_quay": f"cinematic portrait photograph, waist-up, {ILYA}, standing alone on {QUAY}; an iron bollard beside him, a weathered "
+                 "stone boathouse wall and grey hillside houses behind him, looking straight at the camera, shallow depth of field",
+    "lantern": "photograph of a brass ship's lantern with a warm glowing flame and a ring handle, on a plain dark background",
 }
 # (who, the line): the voice reference is the speech model's rendering of a line of the same person's
 VOICE = {"mara": ("vivian", "We sail at first light, and the tide will not wait for any of us."),
@@ -84,11 +89,13 @@ def prompt_of(cid, who, line):
                 "at their moorings, a stone quay, grey houses on the hill, the water still and violet. The camera is static.\n\n"
                 "overall_soundscape: Water lapping against stone, a distant gull, a rope creaking.\n\nnon_diegetic_music: None.")
     if cid == "walk":
-        return (f"integrated_multimodal_description: [Shot 1] {STYLE} A wide shot from behind: the woman from <Picture 1> walks away "
-                "along a long wooden dock toward the moored boats at dusk, her coat moving, and slows near the end. The camera "
-                "tracks behind her at a steady distance.\n\noverall_soundscape: Footsteps on wooden planks, water lapping, a "
-                "distant gull.\n\nnon_diegetic_music: None.")
-    person = "the woman from <Picture 1>" if who == "mara" else "the old man from <Picture 1>"
+        return (f"integrated_multimodal_description: [Shot 1] {STYLE} A medium shot: the woman from <Picture 1> bends and lifts the "
+                "brass lantern from <Picture 2> from the stone quay, holds it by its ring at her side with its flame glowing, and "
+                "walks away along the quay toward the moored boats at dusk, her coat moving. The camera tracks behind her at a "
+                "steady distance.\n\noverall_soundscape: Footsteps on stone, water lapping, a distant gull.\n\n"
+                "non_diegetic_music: None.")
+    person = ("the woman from <Picture 1>, the harbour water and boats behind her," if who == "mara"
+              else "the old man from <Picture 1>, the boathouse wall and grey houses behind him,")
     room = "Her voice, close and clear; water lapping faintly against stone." if who == "mara" else \
         "His voice, close and clear; a faint clank of pipes."
     return (f"integrated_multimodal_description: [Shot 1] {STYLE} A medium close-up of {person}, alone in the frame, who blinks and "
@@ -242,13 +249,13 @@ def main():
         body = {"prompt": prompt_of(cid, who, line), "seconds": round(nf / FPS, 4), "steps": steps, "seed": a.seed + i, "width": w, "height": h,
                 "project": project, "queue": True, "label": f"Dialogue {run} {i:02}/{len(SCENE):02}: {cid}"}
         if cid == "establish":
-            body |= {"engine": "INT8", "first_frame": files["harbour"]}
+            body |= {"engine": "INT8", "first_frame": files["harbour"]}   # the quay, wide
         elif cid == "walk":
-            body |= {"engine": "REF2VA", "ref_images": [files["mara"]]}
+            body |= {"engine": "REF2VA", "ref_images": [files["mara_quay"], files["lantern"]]}
         else:
-            body |= {"engine": "REF2VA", "ref_images": [files[who]],
+            body |= {"engine": "REF2VA", "ref_images": [files[f"{who}_quay"]],
                      "ref_audios": [files[f"line_{cid}" if a.voices == "lines" else f"voice_{who}"]],
-                     "first_frame": files[who], "last_frame": files[who]}
+                     "first_frame": files[f"{who}_quay"], "last_frame": files[f"{who}_quay"]}
         if upscale > 1:
             body |= {"upscale": upscale, "upscaler": "esrgan-general"}
         t = time.time()

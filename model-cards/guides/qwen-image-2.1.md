@@ -17,4 +17,7 @@ Qwen-Image 2.1 draws a picture from a description, or edits pictures you give it
 ## Editing and composing (`image.edit`, `/v1/images/edits`)
 - Give up to 8 pictures; the prompt becomes instructions. The first picture is the one changed, the others are
   references - name them: `put the hat from picture 2 on the fox in picture 1`, `make it night, keep the people`.
+- Composing a person into a place from two pictures did not work in tests (the place came back without the person),
+  and a background change did not replace a strongly lit room: generate the person in the place instead, with the
+  place's words.
 - Say what changes and what stays. The output size follows the last picture unless you give one.
