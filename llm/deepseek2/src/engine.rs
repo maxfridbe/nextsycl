@@ -116,6 +116,14 @@ fn fused_max() -> usize {
     *V.get_or_init(|| env_usize("NS_DS2_MLA_FUSED_MAX", 8192))
 }
 
+/// Whether kv_b is kept as fp16 k_b / v_b (2 GB across the GPUs; the default) or, NS_DS2_KVB16=0, as the file stores
+/// it (Q6_K: 0.8 GB, decoded where it is read). The latter's VRAM holds ~140 more experts - 7% fewer read from the
+/// file - but decoding kv_b in the attention costs more: 7.0 tok/s against fp16's 7.9 (256 tokens, B70 + B65)
+fn kvb16() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS2_KVB16").map_or(true, |v| v != "0"))
+}
+
 /// Whether decode multiplies the pinned-memory experts on the CPU (NS_DS2_CPU=0: they go up to VRAM)
 fn cpu_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -200,9 +208,11 @@ pub struct Part {
     pub layers: Range<u64>,
     mats: BTreeMap<(u64, Role), Mat>,
     vecs: BTreeMap<(u64, Role), DevBuf>,
-    /// per layer: k_b [heads][kv_lora][nope] and v_b [heads][value][kv_lora], fp16
+    /// per layer: k_b [heads][kv_lora][nope] and v_b [heads][value][kv_lora], fp16 (NS_DS2_KVB16=1, or a file whose
+    /// kv_b is not Q6_K) - or kv_b as the file stores it (Q6_K), decoded where it is read
     kb: BTreeMap<u64, DevBuf>,
     vb: BTreeMap<u64, DevBuf>,
+    kvb: BTreeMap<u64, DevBuf>,
     /// the routers' biases, on the host
     biases: BTreeMap<u64, Vec<f32>>,
     scratch: DevBuf,
@@ -373,7 +383,7 @@ impl Part {
         let scratch = DevBuf::f32(gpu, SCRATCH)?;
         let mut mats = BTreeMap::new();
         let mut vecs = BTreeMap::new();
-        let (mut kb, mut vb) = (BTreeMap::new(), BTreeMap::new());
+        let (mut kb, mut vb, mut kvbs) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         let mut biases = BTreeMap::new();
         let mut bytes = 0u64;
         let mut todo: Vec<(u64, Vec<Role>)> = Vec::new();
@@ -392,6 +402,11 @@ impl Part {
                 raw.write(0, &m.file.read(t).map_err(e)?)?;
                 let n = t.elements() as usize;
                 let cols = *t.shape.last().unwrap_or(&1) as usize;
+                if r == Role::KvB && t.ty == GType::Q6K && !kvb16() {
+                    bytes += t.bytes;
+                    kvbs.insert(l, raw);
+                    continue;
+                }
                 if matches!(r, Role::KvB | Role::KB | Role::VB) {
                     // k_b and v_b as fp16, laid out for the batched products: k_b[h] [kv_lora][nope], v_b[h] [value][kv_lora]
                     let f = DevBuf::f32(gpu, n)?;
@@ -575,7 +590,7 @@ impl Part {
                     gpu.name, layers.start, layers.end - 1, gib(bytes as usize), nv, gib(nv * slot), lent, nr, gib(nr * slot), on_file, t0.elapsed().as_secs_f64()));
         let ring = Mutex::new((HostBuf::new(gpu, RING_BYTES)?, 0));
         let back = Mutex::new(HostBuf::new(gpu, BACK_BYTES)?);
-        Ok(Part { ops, arena, small, big, layers, mats, vecs, kb, vb, biases, scratch, q8, xs, ring, back, experts: Mutex::new(store), expert_slots: nv, host_slots: nr,
+        Ok(Part { ops, arena, small, big, layers, mats, vecs, kb, vb, kvb: kvbs, biases, scratch, q8, xs, ring, back, experts: Mutex::new(store), expert_slots: nv, host_slots: nr,
                   weight_bytes: bytes })
     }
 
@@ -1136,7 +1151,10 @@ impl<'g> Ds<'g> {
             o.rope(&q, t, nh, nh * kl, kl, nope, rd, pos0, &self.rope, None)?;
             tap(&format!("Qcur-{l}"), &q)?;
             let oh = p.arena.f32(t * nh * vl)?;
-            o.mla_decode(&q, p.kb.get(&l).ok_or("k_b missing")?, p.vb.get(&l).ok_or("v_b missing")?, cache, &oh, t, nh, pos0, self.kq_scale)?;
+            match p.kvb.get(&l) {
+                Some(kvb) => o.mla_decode_q6k(&q, kvb, cache, &oh, t, nh, pos0, self.kq_scale)?,
+                None => o.mla_decode(&q, p.kb.get(&l).ok_or("k_b missing")?, p.vb.get(&l).ok_or("v_b missing")?, cache, &oh, t, nh, pos0, self.kq_scale)?,
+            }
             tap(&format!("kqv_out-{l}"), &oh)?;
             let m1 = self.lap(p, "MLA 1: projections", m0);
             let out = p.mm(l, Role::Out, &oh, t)?;
@@ -1150,17 +1168,38 @@ impl<'g> Ds<'g> {
         tap(&format!("Qcur-{l}"), &q)?;
         let q16 = p.arena.bytes(t * nh * kl * 2)?;
         o.to_f16(&q, &q16, t * nh * kl)?;
-        let kb = p.kb.get(&l).ok_or("k_b missing")?;
+        // kv_b as stored: this layer's expanded to fp16 [h x 256, 512] for the products below (per head its k rows,
+        // then its v rows)
+        let kv16 = match p.kvb.get(&l) {
+            Some(kvb) => {
+                let n = nh * (nope + vl) * lat;
+                o.dequant(GType::Q6K.code(), kvb, 0, kvb.len, n, &p.scratch)?;
+                let h16 = p.arena.bytes(n * 2)?;
+                o.to_f16(&p.scratch, &h16, n)?;
+                Some(h16)
+            }
+            None => None,
+        };
+        if let Some(kv) = &kv16 {
+            // per head: q~ [t, 512] = q_nope [t, 128] . K_h [128, 512] (its rows as they are: no transpose)
+            for hh in 0..nh {
+                o.gemm_batch_h(1, false, t, lat, nope, (&q16, hh * kl, nh * kl, t * nh * kl), (kv, hh * (nope + vl) * lat, lat, (nope + vl) * lat * nh),
+                               (&qf, hh * cr, nh * cr, t * nh * cr))?;
+            }
+        }
+        let kb = p.kb.get(&l);
         // per head: q~ = k_b[h] . q_nope. oneMKL wants a batch's outputs apart, so decode widths go a row at a time (the
         // heads one batch), prompt chunks a head at a time (its rows one product)
-        if t <= MMVQ_COLS {
+        if let (None, Some(kb)) = (&kv16, kb) {
+          if t <= MMVQ_COLS {
             for r in 0..t {
                 o.gemm_batch_h(nh, true, 1, lat, nope, (&q16, r * nh * kl, kl, kl), (kb, 0, nope, lat * nope), (&qf, r * nh * cr, cr, cr))?;
             }
-        } else {
+          } else {
             for hh in 0..nh {
                 o.gemm_f16(t, lat, nope, (&q16, hh * kl, nh * kl), (kb, hh * lat * nope), (&qf, hh * cr, nh * cr), false)?;
             }
+          }
         }
         let qh = p.arena.bytes(t * nh * cr * 2)?;
         o.to_f16(&qf, &qh, t * nh * cr)?;
@@ -1188,13 +1227,19 @@ impl<'g> Ds<'g> {
         let m3 = self.lap(p, "MLA 3: attention", m2);
         let uh = p.arena.bytes(t * nh * lat * 2)?;
         o.to_f16(&u, &uh, t * nh * lat)?;
-        let vb = p.vb.get(&l).ok_or("v_b missing")?;
         let oh = p.arena.f32(t * nh * vl)?;
-        if t <= MMVQ_COLS {
+        if let Some(kv) = &kv16 {
+            // per head: out [t, 128] = u [t, 512] . V_h^T (V_h its 128 v rows)
+            for hh in 0..nh {
+                o.gemm_f16(t, vl, lat, (&uh, hh * lat, nh * lat), (kv, (hh * (nope + vl) + nope) * lat), (&oh, hh * vl, nh * vl), false)?;
+            }
+        } else if t <= MMVQ_COLS {
+            let vb = p.vb.get(&l).ok_or("v_b missing")?;
             for r in 0..t {
                 o.gemm_batch_h(nh, true, 1, vl, lat, (&uh, r * nh * lat, lat, lat), (vb, 0, lat, vl * lat), (&oh, r * nh * vl, vl, vl))?;
             }
         } else {
+            let vb = p.vb.get(&l).ok_or("v_b missing")?;
             for hh in 0..nh {
                 o.gemm_f16(t, vl, lat, (&uh, hh * lat, nh * lat), (vb, hh * vl * lat), (&oh, hh * vl, nh * vl), false)?;
             }

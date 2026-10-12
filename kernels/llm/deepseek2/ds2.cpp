@@ -113,15 +113,38 @@ int ns_ds2_kv_store(ns_gpu* g, const float* kv, const float* w, float eps, uint1
     NS_CATCH
 }
 
-int ns_ds2_mla_decode(ns_gpu* g, const float* q, const uint16_t* kb16, const uint16_t* vb16, const uint16_t* cache16, float* out, int64_t T,
-                      int64_t H, int64_t pos0, float scale) {
-    NS_TRY
+}  // extern "C"
+
+namespace {
+// Q6_K (210 bytes a 256): ql [128], qh [64], scales [16] (int8), d (half). The 32 values of one (block half n, quarter
+// g) at l = 0..31: (low or high nibble of ql[64 n + l (+32)]) | 2 bits of qh[32 n + l] << 4, less 32, times d x
+// scale[8 n + 2 g + l / 16]
+struct Q6KBlock { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; sycl::half d; };
+static_assert(sizeof(Q6KBlock) == 210, "block_q6_K is 210 bytes");
+// columns [32 k, 32 k + 32) of a 512-wide row (2 blocks) into v
+inline void q6k_cols32(const Q6KBlock* row, int k, float (&v)[32]) {
+    const Q6KBlock& b = row[k / 8];
+    const int j = (k % 8) * 32, n = j / 128, gq = (j % 128) / 32;
+    const float d = (float) b.d;
+    const uint8_t* ql = b.ql + 64 * n + (gq & 1) * 32;
+    const uint8_t* qh = b.qh + 32 * n;
+    const int shift = 2 * gq;
+#pragma unroll
+    for (int l = 0; l < 32; ++l) {
+        const int lo = gq < 2 ? (ql[l] & 0xF) : (ql[l] >> 4);
+        const int q = (lo | (((qh[l] >> shift) & 3) << 4)) - 32;
+        v[l] = d * (float) b.scales[8 * n + 2 * gq + l / 16] * (float) q;
+    }
+}
+
+// one work-group a (row, head): the absorbed query, an online softmax over the cache, the latent sum, v_b
+template <bool Q6>
+void mla_decode_t(sycl::queue& queue, const float* q, const sycl::half* kb, const sycl::half* vb, const Q6KBlock* kvb, const sycl::half* c, float* out,
+                  int64_t T, int64_t H, int64_t pos0, float scale) {
     constexpr int L = 512, R = 64, NOPE = 128, V = 128, KL = NOPE + R, CR = L + R;
-    constexpr int SG = 16, NSG = 16, WG = SG * NSG, DL = L / SG, DR = R / SG;
-    const sycl::half* kb = reinterpret_cast<const sycl::half*>(kb16);
-    const sycl::half* vb = reinterpret_cast<const sycl::half*>(vb16);
-    const sycl::half* c = reinterpret_cast<const sycl::half*>(cache16);
-    g->q.submit([&](sycl::handler& h) {
+    constexpr int SG = 16, NSG = 16, WG = SG * NSG, DL = L / SG, DR = R / SG, RB = L / 256;   // RB: blocks a kv_b row
+    using h8 = sycl::vec<sycl::half, 8>;
+    queue.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> qa(sycl::range<1>(L + R + NOPE), h), part(sycl::range<1>(NSG * L), h), red(sycl::range<1>(2 * NSG), h),
             u(sycl::range<1>(L), h);
         h.parallel_for(sycl::nd_range<1>(T * H * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
@@ -129,19 +152,37 @@ int ns_ds2_mla_decode(ns_gpu* g, const float* q, const uint16_t* kb16, const uin
             const int64_t t = it.get_group(0) / H, hd = it.get_group(0) % H;
             const int lid = (int) it.get_local_id(0), lane = (int) sg.get_local_id()[0], sgi = lid / SG;
             const float* qr = q + (t * H + hd) * KL;
-            // q_nope and q_pe into local memory (q_pe after the absorbed part: qa [L .. L + R))
             if (lid < NOPE) qa[L + R + lid] = qr[lid];
             if (lid < R) qa[L + lid] = qr[NOPE + lid];
             sycl::group_barrier(it.get_group());
-            // q~ = k_b[h] q_nope: a sub-group a row (its 128 halves read together, 8 a lane), reduced
-            using h8 = sycl::vec<sycl::half, 8>;
-            for (int r = sgi; r < L; r += NSG) {
-                const h8 w = reinterpret_cast<const h8*>(kb + ((size_t) hd * L + r) * NOPE)[lane];
-                float a = 0.f;
+            if constexpr (Q6) {
+                // q~[c] = sum_i q_nope[i] k_i[c]: a sub-group a k row at a time (every 16th), a lane 32 columns; the
+                // sub-groups' sums through local memory
+                float acc[32] = {};
+                for (int i = sgi; i < NOPE; i += NSG) {
+                    float v[32];
+                    q6k_cols32(kvb + ((size_t) hd * (NOPE + V) + i) * RB, lane, v);
+                    const float qi = qa[L + R + i];
 #pragma unroll
-                for (int f = 0; f < 8; ++f) a += (float) w[f] * qa[L + R + lane * 8 + f];
-                a = sycl::reduce_over_group(sg, a, sycl::plus<float>());
-                if (lane == 0) qa[r] = a;
+                    for (int f = 0; f < 32; ++f) acc[f] += qi * v[f];
+                }
+#pragma unroll
+                for (int f = 0; f < 32; ++f) part[sgi * L + lane * 32 + f] = acc[f];
+                sycl::group_barrier(it.get_group());
+                for (int r = lid; r < L; r += WG) {
+                    float a = 0.f;
+                    for (int k = 0; k < NSG; ++k) a += part[k * L + r];
+                    qa[r] = a;
+                }
+            } else {
+                for (int r = sgi; r < L; r += NSG) {
+                    const h8 w = reinterpret_cast<const h8*>(kb + ((size_t) hd * L + r) * NOPE)[lane];
+                    float a = 0.f;
+#pragma unroll
+                    for (int f = 0; f < 8; ++f) a += (float) w[f] * qa[L + R + lane * 8 + f];
+                    a = sycl::reduce_over_group(sg, a, sycl::plus<float>());
+                    if (lane == 0) qa[r] = a;
+                }
             }
             sycl::group_barrier(it.get_group());
             float qv[DL], qp[DR];
@@ -149,7 +190,6 @@ int ns_ds2_mla_decode(ns_gpu* g, const float* q, const uint16_t* kb16, const uin
             for (int f = 0; f < DL; ++f) qv[f] = qa[lane * DL + f];
 #pragma unroll
             for (int f = 0; f < DR; ++f) qp[f] = qa[L + lane * DR + f];
-            // the sub-group's cells sgi, sgi + NSG, ...: an online softmax each
             const int64_t n = pos0 + t + 1;
             float m = -INFINITY, sum = 0.f, acc[DL] = {};
             for (int64_t i = sgi; i < n; i += NSG) {
@@ -176,7 +216,7 @@ int ns_ds2_mla_decode(ns_gpu* g, const float* q, const uint16_t* kb16, const uin
                 for (int f = 0; f < DL; ++f) acc[f] = acc[f] * a + b * x[f];
                 m = mn;
             }
-            // the sub-groups combined
+            sycl::group_barrier(it.get_group());
             if (lane == 0) {
                 red[sgi] = m;
                 red[NSG + sgi] = sum;
@@ -196,21 +236,46 @@ int ns_ds2_mla_decode(ns_gpu* g, const float* q, const uint16_t* kb16, const uin
                 u[r] = v / tot;
             }
             sycl::group_barrier(it.get_group());
-            // out = v_b[h] u: a sub-group a row (its 512 halves, 32 a lane in four 16-byte loads)
             for (int r = sgi; r < V; r += NSG) {
-                const h8* vr = reinterpret_cast<const h8*>(vb + ((size_t) hd * V + r) * L);
                 float a = 0.f;
+                if constexpr (Q6) {
+                    float v[32];
+                    q6k_cols32(kvb + ((size_t) hd * (NOPE + V) + NOPE + r) * RB, lane, v);
 #pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const h8 w = vr[k * SG + lane];
+                    for (int f = 0; f < 32; ++f) a += v[f] * u[lane * 32 + f];
+                } else {
+                    const h8* vr = reinterpret_cast<const h8*>(vb + ((size_t) hd * V + r) * L);
 #pragma unroll
-                    for (int f = 0; f < 8; ++f) a += (float) w[f] * u[(k * SG + lane) * 8 + f];
+                    for (int k = 0; k < 4; ++k) {
+                        const h8 w = vr[k * SG + lane];
+#pragma unroll
+                        for (int f = 0; f < 8; ++f) a += (float) w[f] * u[(k * SG + lane) * 8 + f];
+                    }
                 }
                 a = sycl::reduce_over_group(sg, a, sycl::plus<float>());
                 if (lane == 0) out[(t * H + hd) * V + r] = a;
             }
         });
     });
+}
+}  // namespace
+
+extern "C" {
+
+int ns_ds2_mla_decode(ns_gpu* g, const float* q, const uint16_t* kb16, const uint16_t* vb16, const uint16_t* cache16, float* out, int64_t T,
+                      int64_t H, int64_t pos0, float scale) {
+    NS_TRY
+    mla_decode_t<false>(g->q, q, reinterpret_cast<const sycl::half*>(kb16), reinterpret_cast<const sycl::half*>(vb16), nullptr,
+                        reinterpret_cast<const sycl::half*>(cache16), out, T, H, pos0, scale);
+    return 0;
+    NS_CATCH
+}
+
+int ns_ds2_mla_decode_q6k(ns_gpu* g, const float* q, const void* kvb, const uint16_t* cache16, float* out, int64_t T, int64_t H, int64_t pos0,
+                          float scale) {
+    NS_TRY
+    mla_decode_t<true>(g->q, q, nullptr, nullptr, static_cast<const Q6KBlock*>(kvb), reinterpret_cast<const sycl::half*>(cache16), out, T, H, pos0,
+                       scale);
     return 0;
     NS_CATCH
 }

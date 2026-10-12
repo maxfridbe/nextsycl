@@ -420,6 +420,16 @@ impl Ops {
         };
         self.ok(rc, "mla_decode")
     }
+    /// The same with kv_b as stored (Q6_K, [h x 256] rows of 512)
+    pub fn mla_decode_q6k(&self, q: &DevBuf, kvb: &DevBuf, cache: &DevBuf, out: &DevBuf, t: usize, h: usize, pos0: usize, scale: f32) -> Result<()> {
+        need!(q, t * h * 192, "mla_decode q");
+        kvb.bounds(0, h * 256 * 2 * 210)?;
+        cache.bounds(0, (pos0 + t) * 576 * 2)?;
+        need!(out, t * h * 128, "mla_decode out");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.mla_decode_q6k)(self.raw(), q.fp(), kvb.ptr(), cache.ptr().cast(), out.fp(), t as i64, h as i64, pos0 as i64, scale) };
+        self.ok(rc, "mla_decode_q6k")
+    }
     /// The cache's rows pos0.. (fp16, [l + rd] each) from kv_a's output kv [t, l + rd]: the latent normed, the key part
     /// rotated
     pub fn kv_store(&self, kv: &DevBuf, w: &DevBuf, eps: f32, cache: &DevBuf, t: usize, l: usize, rd: usize, pos0: usize, r: &Rope) -> Result<()> {

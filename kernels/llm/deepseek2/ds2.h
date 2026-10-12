@@ -35,6 +35,10 @@ int ns_ds2_kv_store(ns_gpu* g, const float* kv, const float* w, float eps, uint1
  * out = v_b u. L 512, rope 64, nope and V 128 */
 int ns_ds2_mla_decode(ns_gpu* g, const float* q, const uint16_t* kb, const uint16_t* vb, const uint16_t* cache, float* out, int64_t T, int64_t H,
                       int64_t pos0, float scale);
+/* The same with kv_b as the file stores it (Q6_K, [H x (nope + V)] rows of L: per head its nope k rows, then its V v
+ * rows), decoded where it is read: no fp16 k_b / v_b kept */
+int ns_ds2_mla_decode_q6k(ns_gpu* g, const float* q, const void* kvb, const uint16_t* cache, float* out, int64_t T, int64_t H, int64_t pos0,
+                          float scale);
 /* out [rows, f] = silu(gu[r][0, f)) * gu[r][f, 2f) (a layer's experts' gate | up rows) */
 int ns_ds2_swiglu_rows(ns_gpu* g, const float* gu, float* out, int64_t rows, int64_t f);
 /* n values (a multiple of 256) of type `type` (IQ1_S) to float32 / fp16 */

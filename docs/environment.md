@@ -376,6 +376,7 @@ file; decode multiplies the pinned ones on the CPU.
 | `NS_DS2_F16_MIN` | 64 | prompt passes of at least this many tokens multiply the dense matrices in fp16 | llm deepseek2 |
 | `NS_DS2_GROUPS` | 8,4 | routing within the best K of G expert groups (DeepSeek-V3's own; 0: every expert, as llama.cpp runs this file) (--opt-groups) | llm deepseek2 |
 | `NS_DS2_KEEP_PAGES` | off | 1: the expert reads stay in the page cache (by default dropped: the pinned slots are the cache) | llm deepseek2 |
+| `NS_DS2_KVB16` | on | 0: kv_b kept as the file stores it (Q6_K, decoded where read: 1.2 GB more for experts, 7% fewer file reads, but 7.0 tok/s against fp16's 7.9) instead of fp16 k_b / v_b | llm deepseek2 |
 | `NS_DS2_LEND` | on | 0: the prompt arena's memory is not lent to the experts while decode runs | llm deepseek2 |
 | `NS_DS2_MLA_FUSED_MAX` | 8192 | decode passes take the one-launch MLA kernel up to this many cells (0: never) | llm deepseek2 |
 | `NS_DS2_MMVQ_GROUPS` | 512 | Experiment: work-groups of the IQ1_S / IQ2_XXS matrix-vector kernels | kernels:llm deepseek2 |
