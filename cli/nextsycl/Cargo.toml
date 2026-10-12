@@ -10,6 +10,7 @@ nextsycl-gguf.workspace = true
 nextsycl-core.workspace = true
 nextsycl-llm.workspace = true
 nextsycl-llm-glm5next.workspace = true
+nextsycl-llm-deepseek2.workspace = true
 nextsycl-llm-qwen4exp.workspace = true
 nextsycl-llm-qwen35.workspace = true
 nextsycl-tok.workspace = true

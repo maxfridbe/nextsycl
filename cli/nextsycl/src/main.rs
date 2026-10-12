@@ -138,7 +138,7 @@ fn gib(b: u64) -> f64 {
 
 /// The llm engines this program has, one a model architecture (llm/<arch>)
 pub(crate) fn engines() -> Vec<EngineKind> {
-    vec![nextsycl_llm_glm5next::kind(), nextsycl_llm_qwen4exp::kind(), nextsycl_llm_qwen35::kind(), nextsycl_llm_example::kind()]
+    vec![nextsycl_llm_glm5next::kind(), nextsycl_llm_qwen4exp::kind(), nextsycl_llm_qwen35::kind(), nextsycl_llm_deepseek2::kind(), nextsycl_llm_example::kind()]
 }
 
 /// The engine for `f`'s architecture, loaded on `gpus`
@@ -308,6 +308,10 @@ fn check(model: &Path, dump: &Path, gpus: &[usize]) -> Result<(), String> {
     let mut tap = |name: &str, b: &nextsycl_core::DevBuf| -> nextsycl_core::Result<()> {
         let Some(&n) = index.get(name) else { return Ok(()) };
         let mine = b.to_f32()?;
+        // NS_CHECK_SAVE=DIR: this engine's tensors too, as <name>.f32 (for a closer look than a cosine)
+        if let Ok(dir) = std::env::var("NS_CHECK_SAVE") {
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{name}.f32")), mine.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        }
         let path = dump.join(format!("{name}.f32"));
         let raw = std::fs::read(&path).map_err(|x| nextsycl_core::Error(format!("{}: {x}", path.display())))?;
         let theirs: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();

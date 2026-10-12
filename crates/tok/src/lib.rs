@@ -15,6 +15,15 @@ const GLM4_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[
 /// shape with combining marks (`\p{M}`) kept with their letters and out of the punctuation runs, single digits
 const QWEN35_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// llama.cpp's LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM (DeepSeek-V3 / R1's `deepseek-v3`): three patterns applied in turn,
+/// each splitting the pieces the one before left (what a pattern does not match stays a piece): digits in threes, runs
+/// of CJK ideographs and kana, then the words, punctuation and spaces
+const DEEPSEEK3_SPLITS: [&str; 3] = [
+    r"\p{N}{1,3}",
+    "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+",
+    r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"##,
+];
+
 /// transformers' Qwen2Tokenizer (the slow one, from vocab.json and merges.txt): case-insensitive contractions,
 /// letters, single digits
 const QWEN2_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -26,6 +35,9 @@ pub struct Tokenizer {
     /// control and user-defined tokens, longest first (matched in the text as they are)
     special: Vec<(String, u32)>,
     split: Regex,
+    /// patterns applied before `split`, each splitting what the one before left, unmatched text kept (llama.cpp's
+    /// unicode_regex_split over several patterns); empty for the one-pattern tokenizers
+    pre: Vec<Regex>,
     ignore_merges: bool,
     /// SentencePiece-style BPE (a Llama tokenizer.json: no pre-tokenizer, "▁" for spaces and ahead of the text, merges
     /// over the whole text, unknown characters as their bytes' <0xNN> tokens) instead of GPT-2's byte-level one
@@ -112,6 +124,7 @@ impl Tokenizer {
             ranks,
             special,
             split: Regex::new(pattern).map_err(|e| e.to_string())?,
+            pre: Vec::new(),
             ignore_merges: model["ignore_merges"].as_bool().unwrap_or(false),
             sentencepiece,
             byte_enc,
@@ -154,6 +167,7 @@ impl Tokenizer {
             ranks,
             special,
             split: Regex::new(QWEN2_SPLIT).map_err(|e| e.to_string())?,
+            pre: Vec::new(),
             ignore_merges: false,
             sentencepiece: false,
             byte_enc,
@@ -167,10 +181,11 @@ impl Tokenizer {
             return Err("only byte-level BPE (tokenizer.ggml.model gpt2) is read".into());
         }
         let pre = g.meta("tokenizer.ggml.pre").and_then(Value::as_str).unwrap_or("");
-        let split = match pre {
-            "glm4" | "glm5" | "chatglm-bpe" => GLM4_SPLIT,
-            "qwen35" => QWEN35_SPLIT,
-            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen35)")),
+        let (split, pre_splits): (&str, &[&str]) = match pre {
+            "glm4" | "glm5" | "chatglm-bpe" => (GLM4_SPLIT, &[]),
+            "qwen35" => (QWEN35_SPLIT, &[]),
+            "deepseek-v3" => (DEEPSEEK3_SPLITS[2], &DEEPSEEK3_SPLITS[..2]),
+            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen35, deepseek-v3)")),
         };
         let tokens = strs(g.meta("tokenizer.ggml.tokens"));
         let types: Vec<u64> = g.meta("tokenizer.ggml.token_type").and_then(Value::as_array).map(|a| a.iter().map(|x| x.as_u64().unwrap_or(1)).collect()).unwrap_or_default();
@@ -204,6 +219,7 @@ impl Tokenizer {
             ranks,
             special,
             split: Regex::new(split).map_err(|e| e.to_string())?,
+            pre: pre_splits.iter().map(|p| Regex::new(p).map_err(|e| e.to_string())).collect::<Result<_, _>>()?,
             // llama.cpp takes a piece the vocabulary has whole for GLM's (not the old chatglm-bpe); Qwen's merge by rank
             ignore_merges: matches!(pre, "glm4" | "glm5"),
             sentencepiece: false,
@@ -256,8 +272,31 @@ impl Tokenizer {
             }
             return;
         }
-        for m in self.split.find_iter(text).flatten() {
-            let piece: String = m.as_str().bytes().map(|b| self.byte_enc[b as usize]).collect();
+        let pieces: Vec<&str> = if self.pre.is_empty() {
+            self.split.find_iter(text).flatten().map(|m| m.as_str()).collect()
+        } else {
+            let mut v = vec![text];
+            for re in self.pre.iter().chain(std::iter::once(&self.split)) {
+                let mut next = Vec::with_capacity(v.len());
+                for p in v {
+                    let mut at = 0;
+                    for m in re.find_iter(p).flatten() {
+                        if m.start() > at {
+                            next.push(&p[at..m.start()]);
+                        }
+                        next.push(m.as_str());
+                        at = m.end();
+                    }
+                    if at < p.len() {
+                        next.push(&p[at..]);
+                    }
+                }
+                v = next;
+            }
+            v
+        };
+        for m in pieces {
+            let piece: String = m.bytes().map(|b| self.byte_enc[b as usize]).collect();
             if self.ignore_merges {
                 if let Some(id) = self.ids.get(&piece) {
                     out.push(*id);
@@ -388,6 +427,32 @@ pub fn glm_chat(messages: &[Message], effort: Effort, _tools: &[String]) -> Stri
         }
     }
     s += "<|assistant|><think>";
+    s
+}
+
+/// DeepSeek-V3 / R1's chat template (`tokenizer.chat_template`), its text-only, tool-free path: the BOS token, the
+/// system messages joined, `<｜User｜>` turns, assistant turns without their thinking (the template keeps what follows
+/// `</think>`) and closed by the end-of-sentence token, then `<｜Assistant｜>` to generate. R1 thinks without being
+/// asked (it opens with `<think>`); it has no effort levels.
+pub fn deepseek_chat(messages: &[Message], _effort: Effort, _tools: &[String]) -> String {
+    let mut s = String::from("<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>");
+    let system: Vec<&str> = messages.iter().filter(|m| m.role == "system").map(|m| m.content).collect();
+    s += &system.join("\n\n");
+    for m in messages {
+        match m.role {
+            "user" => {
+                s += "<\u{ff5c}User\u{ff5c}>";
+                s += m.content;
+            }
+            "assistant" => {
+                s += "<\u{ff5c}Assistant\u{ff5c}>";
+                s += m.content.rsplit("</think>").next().unwrap_or("");
+                s += "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
+            }
+            _ => {}
+        }
+    }
+    s += "<\u{ff5c}Assistant\u{ff5c}>";
     s
 }
 

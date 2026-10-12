@@ -80,6 +80,7 @@ pub const SETTINGS: &[Setting] = &[
 /// Engine settings by prefix (passed to the engine's container)
 pub const PREFIXES: &[(&str, &str, &[&str])] = &[
     ("NS_QW_", "the qwen4exp chat engine's settings (docs/engines.md)", &["llm"]),
+    ("NS_DS2_", "the deepseek2 chat engine's settings (docs/environment.md)", &["llm"]),
     ("NS_QI_", "the Qwen-Image engine's settings", &["image"]),
     ("NS_MM3_", "the MiniMax Music engine's settings", &["audio"]),
     ("NSD_", "the diffusion kernels' settings (image, audio, video)", &["image", "audio", "video"]),

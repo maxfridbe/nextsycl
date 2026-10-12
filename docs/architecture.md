@@ -161,6 +161,19 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   from the pass's snapshots (`spec-check`: verify rows bit for bit the one-token decode's - the decode attention splits
   each row's keys as a one-row pass at that position would).
 
+- **deepseek2** - DeepSeek-V3 / R1 (unsloth's dynamic GGUFs: IQ1_S experts): MLA absorbed over an fp16 cache of
+  [latent | rotated key] (576 a token and layer; YaRN as llama.cpp runs it), the 256 experts in three tiers - VRAM
+  slots, pinned host slots, the file (read by a pool of threads, 1 MiB jobs, what a layer waits for ahead of what is
+  read ahead) - exclusive, LRU. Decode multiplies the VRAM experts in one launch a layer (its own IQ1_S / IQ2_XXS
+  kernels, `kernels/llm/deepseek2`) and the pinned ones on the CPU where they are (AVX-512 VNNI, `cpu.rs`): PCIe moves
+  ~28 GB/s both directions together, so a swap costs more than the CPU's product; a few of the CPU's experts go up to
+  VRAM behind it while the copy lane is idle. Q4_K / Q5_K decode products are the qwen35 silo's wide kernels, copied.
+  Small uploads and readbacks go through pinned rings copied by kernels (the runtime's memcpy waits behind the
+  store's copies on the copy engine). Group-limited routing (8 groups, best 4) on by default (`NS_DS2_GROUPS=0`: as
+  llama.cpp runs this file, which has no group metadata). Checked against llama.cpp layer by layer (cosine >= 0.998 to
+  layer 59); 1.58-bit R1 on a B70 + B65 with 61 GB of host memory: ~7.2 tok/s decode (llama.cpp with its experts
+  mmapped: 1.0, 2.8-3.5 with madvise prefetch).
+
 ## The audio engines
 
 - **minimaxmusic3** - MiniMax Music 3 from its diffusers checkpoint (bf16 language model and depth decoder, f32 flow

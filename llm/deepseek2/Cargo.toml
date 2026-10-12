@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-llm-deepseek2"
+description = "DeepSeek-V3 / R1 (deepseek2): MLA with YaRN, 256 experts in a VRAM / pinned memory / file store - its model description and its engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-llm.workspace = true
+nextsycl-tok.workspace = true

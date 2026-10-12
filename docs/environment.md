@@ -9,7 +9,7 @@ an engine as `llm <arch>` / `image <arch>` / `audio <arch>` / `video <arch>`, `k
   `nextsycl.conf` beside the repository (`dist/../nextsycl.conf`, the file `nextsycl serve`'s Config tab edits),
   then `~/.config/nextsycl.conf`: the first that has the name wins - the environment over the files. An empty value
   counts as unset. The engine and kernel variables are read with getenv where they run (in the container): set them
-  in the file - the program forwards `NS_QW_*`, `NS_QI_*`, `NS_MM3_*`, `NS_Q3T_*`, `NS_VCP_*`, `NSD_*` and `H3_*` to
+  in the file - the program forwards `NS_QW_*`, `NS_DS2_*`, `NS_QI_*`, `NS_MM3_*`, `NS_Q3T_*`, `NS_VCP_*`, `NSD_*` and `H3_*` to
   the engine's container - or with `--opt-NAME`.
 - **`--opt-NAME VALUE`** sets an engine's declared variable for one command (README "Engine options"; `nextsycl
   <kind> engines` lists them). Rows with `(--opt-NAME)` are those.
@@ -81,6 +81,7 @@ Settings the program turns into the chat server's flags and container; a registr
 | `NS_PARALLEL` | 2 | requests decoded together (--parallel) | cli (llm start) |
 | `NS_PROMPT_CACHE_MIB` | 4096 | host memory for the prompt cache, MiB (0: off) (--prompt-cache-mib) | cli (llm start) |
 | `NS_QW_*` | none | every NS_QW_ setting in nextsycl.conf or the environment is passed into the chat server's container (a registry entry's own value wins) | cli (llm start) |
+| `NS_DS2_*` | none | every NS_DS2_ setting (the deepseek2 engine's) is passed into the chat server's container the same way | cli (llm start) |
 
 ### Every llm engine
 
@@ -359,6 +360,36 @@ The vendored Strata kernels (`kernels/strata`: shared, tuned - read only here) u
 | `STRATA_WMMA_BF16` | on (with STRATA_WMMA_GEMM) | 0 = STRATA_WMMA_GEMM leaves out the bf16 GEMMs; HIP builds only, not in the SYCL build | kernels:strata (prompt GEMM) |
 | `STRATA_WMMA_GEMM` | off | 1 = RDNA3 / RDNA3.5 WMMA dense prompt GEMM before hipBLASLt; HIP builds only, not in the SYCL build | kernels:strata (prompt GEMM) |
 
+### deepseek2
+
+DeepSeek-V3 / R1 (`llm/deepseek2`, its kernels `kernels/llm/deepseek2`): the experts in VRAM, pinned host memory and the
+file; decode multiplies the pinned ones on the CPU.
+
+| Variable | Default | What it does | Read by |
+|---|---|---|---|
+| `NS_DS2_ARENA_MIB` | 256 MiB and ~1.4 MiB a token of the prompt chunk | the passes' temporaries on each GPU (--opt-arena-mib) | llm deepseek2 |
+| `NS_DS2_CHUNK` | 1024 | a prompt pass's tokens (1..4096) (--opt-chunk) | llm deepseek2 |
+| `NS_DS2_CPU` | on | 0: the pinned experts go up to VRAM over PCIe instead of being multiplied on the CPU | llm deepseek2 |
+| `NS_DS2_CPU_AVX512` | on where the CPU has AVX-512 VNNI | Experiment: 0 runs the CPU's products in plain code | llm deepseek2 |
+| `NS_DS2_CPU_THREADS` | 16 | the CPU's workers for the pinned experts | llm deepseek2 |
+| `NS_DS2_CPU_V1` | off | Experiment: 1 runs the first AVX-512 product (indices and scales a sub-block at a time) | llm deepseek2 |
+| `NS_DS2_F16_MIN` | 64 | prompt passes of at least this many tokens multiply the dense matrices in fp16 | llm deepseek2 |
+| `NS_DS2_GROUPS` | 8,4 | routing within the best K of G expert groups (DeepSeek-V3's own; 0: every expert, as llama.cpp runs this file) (--opt-groups) | llm deepseek2 |
+| `NS_DS2_KEEP_PAGES` | off | 1: the expert reads stay in the page cache (by default dropped: the pinned slots are the cache) | llm deepseek2 |
+| `NS_DS2_MMVQ_GROUPS` | 512 | Experiment: work-groups of the IQ1_S / IQ2_XXS matrix-vector kernels | kernels:llm deepseek2 |
+| `NS_DS2_MULTI_GROUPS` | 1024 | Experiment: work-groups of the kernel that multiplies a layer's experts at once | kernels:llm deepseek2 |
+| `NS_DS2_MULTI_MAX` | 32 | passes of up to this many tokens run the experts in the decode kernels (--opt-multi-max) | llm deepseek2 |
+| `NS_DS2_OWN_K` | on | 0: Q4_K / Q5_K decode products on the shared kernels instead of this engine's (the qwen35 silo's, copied) | llm deepseek2 |
+| `NS_DS2_PREFETCH` | 0 | experts a layer starts loading ahead of the next, from its router's guess (--opt-prefetch) | llm deepseek2 |
+| `NS_DS2_PREFETCH_P` | 0.5 | the guessed chance of use from which an expert is loaded ahead (--opt-prefetch-p) | llm deepseek2 |
+| `NS_DS2_PREFETCH_UP` | off | 1: the look ahead also copies guessed pinned experts up to VRAM | llm deepseek2 |
+| `NS_DS2_PROMOTE` | 3 | pinned experts the CPU multiplied that a layer copies up to VRAM behind it (while the copy lane is idle) | llm deepseek2 |
+| `NS_DS2_READERS` | 16 | threads reading experts from the file (--opt-readers) | llm deepseek2 |
+| `NS_DS2_TAP_EXPERTS` | off | Debug: 1 shows the checks each row's experts' gate, up and down outputs (ffn_moe_gate / _up / _down) | llm deepseek2 |
+| `NS_DS2_TRACE_EXPERTS` | off | Debug: FILE gets every decode request (GPU, layer, experts) for offline cache studies | llm deepseek2 |
+| `NS_DS2_TRACE_GUESS` | off | Debug: FILE gets the next layer's router guesses (top 32) beside the requests | llm deepseek2 |
+| `NS_DS2_TRACE_ROUTE` | off | Debug: L prints layer L's choices and weights a row | llm deepseek2 |
+
 ## Tests and checks
 
 Inputs of the checks and unit tests that need files outside the repository (unset: the test is skipped), and the parity tools.
@@ -370,6 +401,7 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 | `NS_CHECK_NOISE` | the reference's noise.npy | edit-dit check: a raw float32 noise file to use instead | image qwenimage21 (check) |
 | `NS_CHECK_PICTURE` | edit-pre check fails | edit-pre check: the original picture (PNG) resized and compared with the reference's | image qwenimage21 (check) |
 | `NS_CHECK_PROMPT` | no ids compared | edit-te check: an edit prompt whose token ids are compared with the reference's | image qwenimage21 (check) |
+| `NS_CHECK_SAVE` | off | llm check: DIR gets this engine's tensors too (<name>.f32), beside the reference's | cli (llm check) |
 | `NS_DUMP_DIR` | ns-dump | Directory llama-ns-dump writes its float32 tensors and index.tsv to | reference/llama-dump (ns-dump.cpp, llama.cpp parity tool) |
 | `NS_DUMP_RE` | the GLM layer outputs (inp_embd, attn_norm-N, l_out-N, result_output, ...) | Regex of the llama.cpp graph tensor names llama-ns-dump writes | reference/llama-dump (ns-dump.cpp, llama.cpp parity tool) |
 | `NS_MM3_CHECK_STEPS` | 3 | chunks check: flow steps a window | audio minimaxmusic3 (check) |

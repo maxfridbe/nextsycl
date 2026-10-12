@@ -142,8 +142,8 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
             args.extend(["-e".into(), format!("{k}={v}")]);
         }
     }
-    // the qwen4exp engine's (its draft layer, expert profile, control vector, chunk: engines/qwen4exp)
-    for (k, v) in cfg.with_prefix("NS_QW_") {
+    // the qwen4exp and deepseek2 engines' (draft layer, expert profile, control vector, chunk, the CPU's share ...)
+    for (k, v) in cfg.with_prefix("NS_QW_").into_iter().chain(cfg.with_prefix("NS_DS2_")) {
         if !entry_env.iter().any(|(e, _)| *e == k) {
             args.extend(["-e".into(), format!("{k}={v}")]);
         }
