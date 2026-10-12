@@ -406,6 +406,20 @@ impl Ops {
         };
         self.ok(rc, "rope")
     }
+    /// MLA at decode widths in one launch (ns_ds2_mla_decode): q [t, h, 192] (rope part rotated), k_b / v_b fp16, the
+    /// cache fp16 [.., 576] -> out [t, h, 128]
+    pub fn mla_decode(&self, q: &DevBuf, kb: &DevBuf, vb: &DevBuf, cache: &DevBuf, out: &DevBuf, t: usize, h: usize, pos0: usize, scale: f32) -> Result<()> {
+        need!(q, t * h * 192, "mla_decode q");
+        kb.bounds(0, h * 512 * 128 * 2)?;
+        vb.bounds(0, h * 128 * 512 * 2)?;
+        cache.bounds(0, (pos0 + t) * 576 * 2)?;
+        need!(out, t * h * 128, "mla_decode out");
+        // SAFETY: sizes checked.
+        let rc = unsafe {
+            (self.k.mla_decode)(self.raw(), q.fp(), kb.ptr().cast(), vb.ptr().cast(), cache.ptr().cast(), out.fp(), t as i64, h as i64, pos0 as i64, scale)
+        };
+        self.ok(rc, "mla_decode")
+    }
     /// The cache's rows pos0.. (fp16, [l + rd] each) from kv_a's output kv [t, l + rd]: the latent normed, the key part
     /// rotated
     pub fn kv_store(&self, kv: &DevBuf, w: &DevBuf, eps: f32, cache: &DevBuf, t: usize, l: usize, rd: usize, pos0: usize, r: &Rope) -> Result<()> {

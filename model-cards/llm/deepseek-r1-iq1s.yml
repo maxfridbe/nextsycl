@@ -1,0 +1,33 @@
+# DeepSeek-R1 671B UD-IQ1_S · 32K context (both GPUs, pinned memory and the NVMe)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: deepseek-r1-iq1s
+kind: llm
+arch: deepseek2
+title: DeepSeek-R1 671B UD-IQ1_S · 32K context (both GPUs, pinned memory and the NVMe; ~7 tok/s)
+about: unsloth's 1.58-bit dynamic quant of DeepSeek-R1 (131 GiB); the experts beyond VRAM in pinned memory (multiplied on the CPU) and read from the file
+gpus: all
+vram_gib: 30.0
+ctx: '32768'
+tools: false
+tasks: false
+env: {}
+files:
+  model:
+    key: deepseek-r1-ud-iq1s-1
+    url: https://huggingface.co/unsloth/DeepSeek-R1-GGUF/resolve/4dab99fdb3fea560e5a402b49c6ef11e025321a8/DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-00001-of-00003.gguf
+    size: 49349193664
+    sha256: f8a206f03ea08c1cfaab8695c7fb86a72dc1620886093b5860ae550ade9033ef
+    path: deepseek-r1-iq1s/DeepSeek-R1-UD-IQ1_S-00001-of-00003.gguf
+  shard-2:
+    key: deepseek-r1-ud-iq1s-2
+    url: https://huggingface.co/unsloth/DeepSeek-R1-GGUF/resolve/4dab99fdb3fea560e5a402b49c6ef11e025321a8/DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-00002-of-00003.gguf
+    size: 49397904416
+    sha256: 775400c9fcf92862fca7af205669bdb84fa9c91f0f747fb2e573027077103fbf
+    path: deepseek-r1-iq1s/DeepSeek-R1-UD-IQ1_S-00002-of-00003.gguf
+  shard-3:
+    key: deepseek-r1-ud-iq1s-3
+    url: https://huggingface.co/unsloth/DeepSeek-R1-GGUF/resolve/4dab99fdb3fea560e5a402b49c6ef11e025321a8/DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-00003-of-00003.gguf
+    size: 41484340384
+    sha256: 3ec50e4d2ae64f78eb74dad4d40684c4970d37acfe25adf635a20ff6ec435fb6
+    path: deepseek-r1-iq1s/DeepSeek-R1-UD-IQ1_S-00003-of-00003.gguf
+guide: guides/chat.md

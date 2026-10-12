@@ -29,6 +29,12 @@ int ns_ds2_rope(ns_gpu* g, float* x, int64_t T, int64_t H, int64_t row, int64_t 
  * first L RMS-normed with w (eps), the last R rotated (as ns_ds2_rope at the row's position) */
 int ns_ds2_kv_store(ns_gpu* g, const float* kv, const float* w, float eps, uint16_t* cache, int64_t T, int64_t L, int64_t R, int64_t pos0,
                     float freq_base, float freq_scale, float ext_factor, float mscale, float corr0, float corr1);
+/* MLA at decode widths in one launch, a work-group a (row, head): q [T, H, nope + rope] (the rope part rotated), k_b
+ * [H][L][nope] and v_b [H][V][L] fp16, the cache [n, L + rope] fp16 (rows up to pos0 + t for row t) -> out [T, H, V]:
+ * q~ = k_b q_nope, scores (q~ . c + q_pe . k_pe) x scale over every earlier cell with an online softmax, u = sum p c,
+ * out = v_b u. L 512, rope 64, nope and V 128 */
+int ns_ds2_mla_decode(ns_gpu* g, const float* q, const uint16_t* kb, const uint16_t* vb, const uint16_t* cache, float* out, int64_t T, int64_t H,
+                      int64_t pos0, float scale);
 /* out [rows, f] = silu(gu[r][0, f)) * gu[r][f, 2f) (a layer's experts' gate | up rows) */
 int ns_ds2_swiglu_rows(ns_gpu* g, const float* gu, float* out, int64_t rows, int64_t f);
 /* n values (a multiple of 256) of type `type` (IQ1_S) to float32 / fp16 */

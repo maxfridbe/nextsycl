@@ -376,9 +376,12 @@ file; decode multiplies the pinned ones on the CPU.
 | `NS_DS2_F16_MIN` | 64 | prompt passes of at least this many tokens multiply the dense matrices in fp16 | llm deepseek2 |
 | `NS_DS2_GROUPS` | 8,4 | routing within the best K of G expert groups (DeepSeek-V3's own; 0: every expert, as llama.cpp runs this file) (--opt-groups) | llm deepseek2 |
 | `NS_DS2_KEEP_PAGES` | off | 1: the expert reads stay in the page cache (by default dropped: the pinned slots are the cache) | llm deepseek2 |
+| `NS_DS2_LEND` | on | 0: the prompt arena's memory is not lent to the experts while decode runs | llm deepseek2 |
+| `NS_DS2_MLA_FUSED_MAX` | 8192 | decode passes take the one-launch MLA kernel up to this many cells (0: never) | llm deepseek2 |
 | `NS_DS2_MMVQ_GROUPS` | 512 | Experiment: work-groups of the IQ1_S / IQ2_XXS matrix-vector kernels | kernels:llm deepseek2 |
 | `NS_DS2_MULTI_GROUPS` | 1024 | Experiment: work-groups of the kernel that multiplies a layer's experts at once | kernels:llm deepseek2 |
 | `NS_DS2_MULTI_MAX` | 32 | passes of up to this many tokens run the experts in the decode kernels (--opt-multi-max) | llm deepseek2 |
+| `NS_DS2_NGRAM` | 0 | up to K tokens (at most 7) drafted from the context's repeats and verified in one pass (--opt-ngram) | llm deepseek2 |
 | `NS_DS2_OWN_K` | on | 0: Q4_K / Q5_K decode products on the shared kernels instead of this engine's (the qwen35 silo's, copied) | llm deepseek2 |
 | `NS_DS2_PREFETCH` | 0 | experts a layer starts loading ahead of the next, from its router's guess (--opt-prefetch) | llm deepseek2 |
 | `NS_DS2_PREFETCH_P` | 0.5 | the guessed chance of use from which an expert is loaded ahead (--opt-prefetch-p) | llm deepseek2 |

@@ -279,6 +279,9 @@ pub struct Store {
     prefetched: HashMap<(u64, u64), i64>,
     /// the last copy up a promotion queued (the next waits for the lane to be idle)
     last_up: Option<i64>,
+    /// slots from `lend_at` on are the prompt arena's memory (the last of `vram`), lent while no prompt pass needs it
+    lend_at: usize,
+    lent: bool,
     tick: u64,
     pub stats: Stats,
     pub parts: HashMap<u64, ExpertParts>,
@@ -290,7 +293,7 @@ impl Store {
     pub fn new(vram: Vec<DevBuf>, host: Vec<HostBuf>, slot: usize, per_chunk: usize, nv: usize, nr: usize, parts: HashMap<u64, ExpertParts>,
                reader: Arc<Reader>) -> Store {
         Store { vram, host, slot, per_chunk, loc: HashMap::new(), vowner: vec![None; nv], vused: vec![0; nv], rowner: vec![None; nr], rused: vec![0; nr],
-                rfree: (0..nr).rev().collect(), rlast: vec![None; nr], vfill: vec![None; nv], reads: HashMap::new(), prefetched: HashMap::new(), last_up: None, tick: 0,
+                rfree: (0..nr).rev().collect(), rlast: vec![None; nr], vfill: vec![None; nv], reads: HashMap::new(), prefetched: HashMap::new(), last_up: None, lend_at: nv, lent: false, tick: 0,
                 stats: Stats::default(), parts, reader }
     }
     pub fn vram_slots(&self) -> usize {
@@ -300,7 +303,62 @@ impl Store {
         self.rowner.len()
     }
     fn vat(&self, s: usize) -> (usize, usize) {
+        if s >= self.lend_at {
+            return (self.vram.len() - 1, (s - self.lend_at) * self.slot);
+        }
         (s / self.per_chunk, (s % self.per_chunk) * self.slot)
+    }
+    /// The prompt arena's memory (`buf`) as more VRAM slots while no prompt pass needs it
+    pub fn add_lend(&mut self, buf: DevBuf) -> usize {
+        let n = buf.len / self.slot;
+        if n == 0 {
+            return 0;
+        }
+        self.lend_at = self.vowner.len();
+        self.vram.push(buf);
+        self.vowner.resize(self.lend_at + n, None);
+        self.vused.resize(self.lend_at + n, 0);
+        self.vfill.resize(self.lend_at + n, None);
+        self.lent = true;
+        n
+    }
+    pub fn lent(&self) -> bool {
+        self.lent
+    }
+    /// The lent slots back to the arena: their experts down to pinned slots (or dropped to the file when none is free),
+    /// every copy done before the memory is used again
+    pub fn reclaim(&mut self, o: &Ops) -> Result<()> {
+        if !self.lent {
+            return Ok(());
+        }
+        let sb = self.slot;
+        let mut last = Vec::new();
+        for s in self.lend_at..self.vowner.len() {
+            let Some(v) = self.vowner[s].take() else { continue };
+            self.prefetched.remove(&v);
+            self.loc.remove(&v);
+            if let Some(r) = self.rfree.pop() {
+                let dep = self.rlast[r].take();
+                let t = o.stream_copy_on(0, &self.rview(r)?, 0, &self.vview(s)?, 0, sb, &[self.vfill[s], dep])?;
+                self.rlast[r] = Some(t);
+                self.rowner[r] = Some(v);
+                self.rused[r] = 0;
+                self.loc.insert(v, Loc::R(r));
+                last.push(t);
+            }
+            self.vfill[s] = None;
+        }
+        for t in last {
+            o.wait_ticket(t)?;
+        }
+        self.lent = false;
+        Ok(())
+    }
+    /// The arena's memory lent again (a prompt pass is done: what it queued runs before any copy into these slots)
+    pub fn relend(&mut self) {
+        if self.vowner.len() > self.lend_at {
+            self.lent = true;
+        }
     }
     fn rat(&self, r: usize) -> (usize, usize) {
         (r / self.per_chunk, (r % self.per_chunk) * self.slot)
@@ -416,7 +474,7 @@ impl Store {
     /// The least recently used VRAM slot not in use this request
     fn vram_victim(&self) -> Result<usize> {
         let tick = self.tick;
-        (0..self.vowner.len()).filter(|&i| self.vused[i] != tick).min_by_key(|&i| if self.vowner[i].is_none() { 0 } else { self.vused[i] + 1 })
+        (0..self.vowner.len()).filter(|&i| self.vused[i] != tick && (i < self.lend_at || self.lent)).min_by_key(|&i| if self.vowner[i].is_none() { 0 } else { self.vused[i] + 1 })
             .ok_or_else(|| Error(format!("the expert store has {} VRAM slots; a layer needs more", self.vowner.len())))
     }
 

@@ -35,6 +35,7 @@ pub struct Api {
     // ds2.h
     pub rope: unsafe extern "C" fn(G, *mut f32, i64, i64, i64, i64, i64, i64, i64, f32, f32, f32, f32, f32, f32, *mut f32, i64, i64) -> c_int,
     pub kv_store: unsafe extern "C" fn(G, *const f32, *const f32, f32, *mut u16, i64, i64, i64, i64, f32, f32, f32, f32, f32, f32) -> c_int,
+    pub mla_decode: unsafe extern "C" fn(G, *const f32, *const u16, *const u16, *const u16, *mut f32, i64, i64, i64, f32) -> c_int,
     pub swiglu_rows: unsafe extern "C" fn(G, *const f32, *mut f32, i64, i64) -> c_int,
     pub own_dequant_supported: unsafe extern "C" fn(c_int) -> c_int,
     pub own_dequant: unsafe extern "C" fn(G, c_int, P, i64, *mut f32) -> c_int,
@@ -93,6 +94,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             mmvq: sym!("ns_mmvq"),
             rope: sym!("ns_ds2_rope"),
             kv_store: sym!("ns_ds2_kv_store"),
+            mla_decode: sym!("ns_ds2_mla_decode"),
             swiglu_rows: sym!("ns_ds2_swiglu_rows"),
             own_dequant_supported: sym!("ns_ds2_dequant_supported"),
             own_dequant: sym!("ns_ds2_dequant"),

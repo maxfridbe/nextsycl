@@ -48,6 +48,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "prefetch-p", env: "NS_DS2_PREFETCH_P", value: "P", help: "the guessed chance of use from which an expert is loaded ahead (0.5)", at: At::Load },
     EngineOption { name: "readers", env: "NS_DS2_READERS", value: "N", help: "threads reading experts from the file (default 16)", at: At::Load },
     EngineOption { name: "multi-max", env: "NS_DS2_MULTI_MAX", value: "TOKENS", help: "passes up to this many tokens run the experts in the decode kernels (32)", at: At::Load },
+    EngineOption { name: "ngram", env: "NS_DS2_NGRAM", value: "K", help: "up to K tokens drafted from the context's repeats, verified in one pass (default 0)", at: At::Load },
     EngineOption { name: "expert-profile", env: "NS_EXPERT_PROFILE", value: "FILE", help: "which experts fill VRAM and pinned memory first", at: At::Load },
 ];
 
@@ -81,6 +82,12 @@ impl SessionState for engine::Session {
 impl DecoderState for engine::Decoder {
     fn drafts(&self) -> (u64, u64) {
         (0, 0)
+    }
+    fn lookup_drafts(&self) -> (u64, u64) {
+        (self.drafted, self.accepted)
+    }
+    fn set_context(&mut self, tokens: &[u32]) {
+        engine::Decoder::set_context(self, tokens)
     }
     fn pending(&mut self) -> Option<u32> {
         engine::Decoder::pending(self)
@@ -129,7 +136,8 @@ impl Engine for engine::Ds<'_> {
         engine::prefill_chunk()
     }
     fn max_verify(&self) -> usize {
-        1
+        // the prompt-lookup drafts' pass (NS_DS2_NGRAM)
+        8
     }
     fn cache_fingerprint(&self) -> String {
         "deepseek2 f16-latents nsds1".into()

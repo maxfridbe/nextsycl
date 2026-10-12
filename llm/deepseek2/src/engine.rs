@@ -35,6 +35,8 @@ const MAX_COLS: usize = 18432;
 const CHUNK: usize = 2 << 30;
 /// an attention block's scores at most (bytes): rows of a prompt chunk are taken in blocks that fit
 const SCORES: usize = 128 << 20;
+/// the arena of decode passes; prompt passes take the big one, whose memory holds experts otherwise
+const SMALL_ARENA: usize = 384 << 20;
 /// the pinned rings of small uploads and readbacks
 const RING_BYTES: usize = 8 << 20;
 const BACK_BYTES: usize = 4 << 20;
@@ -88,6 +90,13 @@ fn prefetch_p() -> f32 {
 fn own_k(o: &Ops, w: &Mat) -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     !w.f32 && matches!(w.ty.code(), 12 | 13) && *V.get_or_init(|| std::env::var("NS_DS2_OWN_K").map_or(true, |v| v != "0")) && o.own_mmvq_supported(w.ty.code(), w.cols)
+}
+
+/// Decode passes take the one-launch MLA up to this many cells (NS_DS2_MLA_FUSED_MAX, default 8192; 0 = never): every
+/// head reads the cache, from the GPU's L2 while it fits
+fn fused_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS2_MLA_FUSED_MAX", 8192))
 }
 
 /// Whether decode multiplies the pinned-memory experts on the CPU (NS_DS2_CPU=0: they go up to VRAM)
@@ -168,6 +177,9 @@ impl Mat {
 pub struct Part {
     ops: Ops,
     arena: Arena,
+    /// the arenas' memory: `small` for decode, `big` for prompt passes (lent to the expert store otherwise)
+    small: DevBuf,
+    big: DevBuf,
     pub layers: Range<u64>,
     mats: BTreeMap<(u64, Role), Mat>,
     vecs: BTreeMap<(u64, Role), DevBuf>,
@@ -245,17 +257,69 @@ impl Checkpoint {
     }
 }
 
-/// Generation from a fed prompt: `Ds::step` commits the next token each call; the last committed one is fed at the
+/// Generation from a fed prompt: `Ds::step` commits the next token(s) each call; the last committed one is fed at the
 /// start of the following call
 pub struct Decoder {
     logits: Vec<f32>,
     next: Option<u32>,
+    /// the conversation's tokens and where each 3-gram last continued (prompt lookup, NS_DS2_NGRAM)
+    look: Option<Lookup>,
+    pub drafted: u64,
+    pub accepted: u64,
 }
 
 impl Decoder {
     pub fn pending(&mut self) -> Option<u32> {
         self.next.take()
     }
+    /// The conversation so far: drafts from its repeats (NS_DS2_NGRAM)
+    pub fn set_context(&mut self, tokens: &[u32]) {
+        if ngram_k() == 0 {
+            return;
+        }
+        let mut l = Lookup::default();
+        for &t in tokens {
+            l.push(t);
+        }
+        self.look = Some(l);
+    }
+}
+
+/// A conversation's tokens with a 3-gram index: `after[(a, b, c)]` is the position after that 3-gram's latest
+/// earlier occurrence
+#[derive(Default)]
+struct Lookup {
+    hist: Vec<u32>,
+    after: std::collections::HashMap<(u32, u32, u32), usize>,
+}
+
+impl Lookup {
+    fn push(&mut self, t: u32) {
+        self.hist.push(t);
+        let n = self.hist.len();
+        if n >= 4 {
+            self.after.insert((self.hist[n - 4], self.hist[n - 3], self.hist[n - 2]), n - 1);
+        }
+    }
+    /// Up to k tokens that followed the last 3 where they occurred before
+    fn propose(&self, k: usize) -> Vec<u32> {
+        let n = self.hist.len();
+        if n < 3 || k == 0 {
+            return Vec::new();
+        }
+        match self.after.get(&(self.hist[n - 3], self.hist[n - 2], self.hist[n - 1])) {
+            Some(&p) if p < n => self.hist[p..(p + k).min(n)].to_vec(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Prompt-lookup drafts (NS_DS2_NGRAM=K, 0..7; default 0): when the last 3 tokens occurred earlier in the conversation,
+/// the up to K tokens that followed them there are verified with the next token in one pass (the model has no draft
+/// block); the accepted prefix is kept, the cache rolled back past the rest
+fn ngram_k() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS2_NGRAM", 0).min(MMVQ_COLS - 1))
 }
 
 pub struct Ds<'g> {
@@ -377,7 +441,9 @@ impl Part {
         gpu.sync()?;
         let q8 = DevBuf::new(gpu, ops.q8_1_bytes(MAX_COLS, MMVQ_COLS))?;
         let xs = DevBuf::new(gpu, ops.q8_bytes(MAX_COLS, MMVQ_COLS))?;
-        let arena = Arena::new(gpu, arena_bytes())?;
+        let small = DevBuf::new(gpu, SMALL_ARENA)?;
+        let big = DevBuf::new(gpu, arena_bytes())?;
+        let arena = Arena::on(small.view(0, small.len)?);
         // the store: slots of the largest layer's [gate | up | down], in chunks; VRAM, then pinned host memory
         let moe: Vec<u64> = layers.clone().filter(|l| g.is_moe(*l)).collect();
         let n_exp = moe.len() * g.n_expert as usize;
@@ -408,6 +474,8 @@ impl Part {
             have += k;
         }
         let mut store = Store::new(vram, host, slot, per_chunk, nv, nr, parts.clone(), reader.clone());
+        // NS_DS2_LEND=0: the prompt arena's memory is not lent to the experts during decode
+        let lent = if n_exp > 0 && std::env::var("NS_DS2_LEND").map_or(true, |v| v != "0") { store.add_lend(big.view(0, big.len)?) } else { 0 };
         // what goes where at load: every layer's experts in turn (expert 0 of each layer, then 1, ...), VRAM first, then
         // pinned memory; the rest stays on the file. NS_EXPERT_PROFILE (earlier runs' requests) puts the most asked first.
         let mut all: Vec<(u64, u64)> = (0..g.n_expert).flat_map(|x| moe.iter().map(move |l| (*l, x))).collect();
@@ -486,12 +554,34 @@ impl Part {
             }
         }
         let on_file = n_exp - nv.min(n_exp) - nr;
-        log(format!("{} (layers {}-{}): {:.2} GiB of weights; experts {} in VRAM ({:.1} GiB), {} in pinned host memory ({:.1} GiB), {} on the file only ({:.1} s)",
-                    gpu.name, layers.start, layers.end - 1, gib(bytes as usize), nv, gib(nv * slot), nr, gib(nr * slot), on_file, t0.elapsed().as_secs_f64()));
+        log(format!("{} (layers {}-{}): {:.2} GiB of weights; experts {} in VRAM ({:.1} GiB, and {} slots in the prompt arena while decode runs), {} in pinned host memory ({:.1} GiB), {} on the file only ({:.1} s)",
+                    gpu.name, layers.start, layers.end - 1, gib(bytes as usize), nv, gib(nv * slot), lent, nr, gib(nr * slot), on_file, t0.elapsed().as_secs_f64()));
         let ring = Mutex::new((HostBuf::new(gpu, RING_BYTES)?, 0));
         let back = Mutex::new(HostBuf::new(gpu, BACK_BYTES)?);
-        Ok(Part { ops, arena, layers, mats, vecs, kb, vb, biases, scratch, q8, xs, ring, back, experts: Mutex::new(store), expert_slots: nv, host_slots: nr,
+        Ok(Part { ops, arena, small, big, layers, mats, vecs, kb, vb, biases, scratch, q8, xs, ring, back, experts: Mutex::new(store), expert_slots: nv, host_slots: nr,
                   weight_bytes: bytes })
+    }
+
+    /// The arena a pass of `t` tokens needs: the small one for decode widths; past them the big one, its memory taken
+    /// back from the expert store first (lent again once a pass fits the small one)
+    fn arena_for(&self, t: usize) -> Result<()> {
+        let mut st = self.experts.lock().unwrap();
+        if t > MMVQ_COLS {
+            if st.lent() {
+                // what is queued may read the lent slots: done first
+                self.ops.gpu.sync()?;
+                st.reclaim(&self.ops)?;
+            }
+            if self.arena.len() != self.big.len {
+                self.arena.set(self.big.view(0, self.big.len)?);
+            }
+        } else if self.arena.len() != self.small.len {
+            // the big arena's work is queued before any copy into its memory: the copies wait for the queue (a mark)
+            self.ops.gpu.sync()?;
+            self.arena.set(self.small.view(0, self.small.len)?);
+            st.relend();
+        }
+        Ok(())
     }
 
     /// `data` on the GPU (an arena buffer): through the pinned ring, copied by a kernel in queue order
@@ -650,7 +740,7 @@ impl Part {
 impl<'g> Ds<'g> {
     /// Loads the model over `gpus` (layers split evenly by count, or as NS_SPLIT says; the head on the last). Per GPU,
     /// `expert_bytes` of VRAM for routed experts (None: what is free less the rest); `mirror_bytes` of pinned host
-    /// memory in all (None: what the host has available less 12 GiB), shared by the parts by their MoE layers. `kv`:
+    /// memory in all (None: what the host has available less 8 GiB: 50 GB pinned on a 61 GB host read 13% fewer experts from the file than 46), shared by the parts by their MoE layers. `kv`:
     /// (context, sessions) - their caches are held back from the expert store.
     pub fn load(file: &'g Gguf, gpus: &[Arc<Gpu>], expert_bytes: Option<usize>, mirror_bytes: Option<usize>, kv: (usize, usize),
                 log: &mut dyn FnMut(String)) -> Result<Ds<'g>> {
@@ -667,7 +757,7 @@ impl<'g> Ds<'g> {
         let n = g.n_layer;
         let k = gpus.len() as u64;
         let reader = Reader::new(file)?;
-        let mirror = mirror_bytes.unwrap_or(mem_available().saturating_sub(12 << 30));
+        let mirror = mirror_bytes.unwrap_or(mem_available().saturating_sub(8 << 30));
         let mut bounds: Vec<u64> = (0..=k).map(|i| i * n / k).collect();
         if let Ok(v) = std::env::var("NS_SPLIT") {
             let counts: Vec<u64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -881,6 +971,9 @@ impl<'g> Ds<'g> {
         }
         let d = self.m.g.n_embd as usize;
         self.rows_now.store(t, std::sync::atomic::Ordering::Relaxed);
+        for p in &self.parts {
+            p.arena_for(t)?;
+        }
         let mut x = self.embed(&self.parts[0], tokens)?;
         tap("inp_embd", &x)?;
         let mut staging = Vec::new();
@@ -983,6 +1076,19 @@ impl<'g> Ds<'g> {
         tap(&format!("q-{l}"), &q)?;
         let m1 = self.lap(p, "MLA 1: projections", m0);
         o.kv_store(&kv, p.vec(l, Role::KvANorm)?, eps, cache, t, lat, rd, pos0, &self.rope)?;
+        // decode widths over a context the GPU's cache holds well: one launch for the rest of the attention
+        if t <= MMVQ_COLS && pos0 + t <= fused_max() && (nh, kl, nope, rd, lat, vl) == (nh, 192, 128, 64, 512, 128) {
+            o.rope(&q, t, nh, nh * kl, kl, nope, rd, pos0, &self.rope, None)?;
+            tap(&format!("Qcur-{l}"), &q)?;
+            let oh = p.arena.f32(t * nh * vl)?;
+            o.mla_decode(&q, p.kb.get(&l).ok_or("k_b missing")?, p.vb.get(&l).ok_or("v_b missing")?, cache, &oh, t, nh, pos0, self.kq_scale)?;
+            tap(&format!("kqv_out-{l}"), &oh)?;
+            let m1 = self.lap(p, "MLA 1: projections", m0);
+            let out = p.mm(l, Role::Out, &oh, t)?;
+            self.lap(p, "MLA 5: output projection", m1);
+            tap(&format!("attn_out-{l}"), &out)?;
+            return Ok(out);
+        }
         // the queries [t, heads, lat + rope]: the rotated part straight from the rotation, the absorbed one by k_b
         let qf = p.arena.f32(t * nh * cr)?;
         o.rope(&q, t, nh, nh * kl, kl, nope, rd, pos0, &self.rope, Some((&qf.view(lat * 4, (t * nh * cr - lat) * 4)?, nh * cr, cr)))?;
@@ -1510,22 +1616,65 @@ impl<'g> Ds<'g> {
     }
 
     pub fn decoder(&self, logits: Vec<f32>) -> Decoder {
-        Decoder { logits, next: None }
+        Decoder { logits, next: None, look: None, drafted: 0, accepted: 0 }
     }
     pub fn decoder_after(&self, next: u32) -> Decoder {
-        Decoder { logits: Vec::new(), next: Some(next) }
+        Decoder { logits: Vec::new(), next: Some(next), look: None, drafted: 0, accepted: 0 }
     }
 
-    /// The next committed token: the last one fed first
+    /// The next committed token(s): the last one fed first - with the context's repeats as drafts, verified in the
+    /// same pass when there are some (each row sampled as a one-token pass would be; the first that differs from its
+    /// draft ends the run, and the cache keeps only what is committed)
     pub fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
         if let Some(n) = d.next.take() {
-            d.logits = self.forward(s, &[n], tap)?;
+            let drafts: Vec<u32> = match &d.look {
+                Some(l) => {
+                    let mut v = l.propose(ngram_k());
+                    v.truncate(s.max_ctx.saturating_sub(s.pos + 1));
+                    v
+                }
+                None => Vec::new(),
+            };
+            if drafts.is_empty() {
+                d.logits = self.forward(s, &[n], tap)?;
+            } else {
+                let mut toks = vec![n];
+                toks.extend_from_slice(&drafts);
+                let rows = self.forward_rows(s, &toks, toks.len(), tap)?;
+                let mut out = Vec::with_capacity(toks.len());
+                for (i, r) in rows.iter().enumerate() {
+                    let y = smp.sample(r);
+                    smp.record(r, y);
+                    out.push(y);
+                    if i < drafts.len() {
+                        d.drafted += 1;
+                        if y == drafts[i] {
+                            d.accepted += 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if out.len() < toks.len() {
+                    self.rollback(s, out.len())?;
+                }
+                if let Some(l) = d.look.as_mut() {
+                    for &y in &out {
+                        l.push(y);
+                    }
+                }
+                d.next = out.last().copied();
+                return Ok(out);
+            }
         }
         if d.logits.is_empty() {
             return Err(Error("step: no logits to sample from".into()));
         }
         let tok = smp.sample(&d.logits);
         smp.record(&d.logits, tok);
+        if let Some(l) = d.look.as_mut() {
+            l.push(tok);
+        }
         d.next = Some(tok);
         Ok(vec![tok])
     }

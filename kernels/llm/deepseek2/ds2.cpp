@@ -113,6 +113,108 @@ int ns_ds2_kv_store(ns_gpu* g, const float* kv, const float* w, float eps, uint1
     NS_CATCH
 }
 
+int ns_ds2_mla_decode(ns_gpu* g, const float* q, const uint16_t* kb16, const uint16_t* vb16, const uint16_t* cache16, float* out, int64_t T,
+                      int64_t H, int64_t pos0, float scale) {
+    NS_TRY
+    constexpr int L = 512, R = 64, NOPE = 128, V = 128, KL = NOPE + R, CR = L + R;
+    constexpr int SG = 16, NSG = 16, WG = SG * NSG, DL = L / SG, DR = R / SG;
+    const sycl::half* kb = reinterpret_cast<const sycl::half*>(kb16);
+    const sycl::half* vb = reinterpret_cast<const sycl::half*>(vb16);
+    const sycl::half* c = reinterpret_cast<const sycl::half*>(cache16);
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> qa(sycl::range<1>(L + R + NOPE), h), part(sycl::range<1>(NSG * L), h), red(sycl::range<1>(2 * NSG), h),
+            u(sycl::range<1>(L), h);
+        h.parallel_for(sycl::nd_range<1>(T * H * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const auto sg = it.get_sub_group();
+            const int64_t t = it.get_group(0) / H, hd = it.get_group(0) % H;
+            const int lid = (int) it.get_local_id(0), lane = (int) sg.get_local_id()[0], sgi = lid / SG;
+            const float* qr = q + (t * H + hd) * KL;
+            // q_nope and q_pe into local memory (q_pe after the absorbed part: qa [L .. L + R))
+            if (lid < NOPE) qa[L + R + lid] = qr[lid];
+            if (lid < R) qa[L + lid] = qr[NOPE + lid];
+            sycl::group_barrier(it.get_group());
+            // q~ = k_b[h] q_nope: a sub-group a row (its 128 halves read together, 8 a lane), reduced
+            using h8 = sycl::vec<sycl::half, 8>;
+            for (int r = sgi; r < L; r += NSG) {
+                const h8 w = reinterpret_cast<const h8*>(kb + ((size_t) hd * L + r) * NOPE)[lane];
+                float a = 0.f;
+#pragma unroll
+                for (int f = 0; f < 8; ++f) a += (float) w[f] * qa[L + R + lane * 8 + f];
+                a = sycl::reduce_over_group(sg, a, sycl::plus<float>());
+                if (lane == 0) qa[r] = a;
+            }
+            sycl::group_barrier(it.get_group());
+            float qv[DL], qp[DR];
+#pragma unroll
+            for (int f = 0; f < DL; ++f) qv[f] = qa[lane * DL + f];
+#pragma unroll
+            for (int f = 0; f < DR; ++f) qp[f] = qa[L + lane * DR + f];
+            // the sub-group's cells sgi, sgi + NSG, ...: an online softmax each
+            const int64_t n = pos0 + t + 1;
+            float m = -INFINITY, sum = 0.f, acc[DL] = {};
+            for (int64_t i = sgi; i < n; i += NSG) {
+                const sycl::half* row = c + i * CR;
+                float x[DL];
+                float d = 0.f;
+                const h8* rv = reinterpret_cast<const h8*>(row + lane * DL);
+#pragma unroll
+                for (int k = 0; k < DL / 8; ++k) {
+                    const h8 w = rv[k];
+#pragma unroll
+                    for (int f = 0; f < 8; ++f) {
+                        x[k * 8 + f] = (float) w[f];
+                        d += qv[k * 8 + f] * x[k * 8 + f];
+                    }
+                }
+#pragma unroll
+                for (int f = 0; f < DR; ++f) d += qp[f] * (float) row[L + lane * DR + f];
+                d = sycl::reduce_over_group(sg, d, sycl::plus<float>()) * scale;
+                const float mn = sycl::fmax(m, d);
+                const float a = sycl::exp(m - mn), b = sycl::exp(d - mn);
+                sum = sum * a + b;
+#pragma unroll
+                for (int f = 0; f < DL; ++f) acc[f] = acc[f] * a + b * x[f];
+                m = mn;
+            }
+            // the sub-groups combined
+            if (lane == 0) {
+                red[sgi] = m;
+                red[NSG + sgi] = sum;
+            }
+            sycl::group_barrier(it.get_group());
+            float mx = -INFINITY;
+            for (int k = 0; k < NSG; ++k) mx = sycl::fmax(mx, red[k]);
+            const float sc = m == -INFINITY ? 0.f : sycl::exp(m - mx);
+#pragma unroll
+            for (int f = 0; f < DL; ++f) part[sgi * L + lane * DL + f] = acc[f] * sc;
+            sycl::group_barrier(it.get_group());
+            float tot = 0.f;
+            for (int k = 0; k < NSG; ++k) tot += red[k] == -INFINITY ? 0.f : red[NSG + k] * sycl::exp(red[k] - mx);
+            for (int r = lid; r < L; r += WG) {
+                float v = 0.f;
+                for (int k = 0; k < NSG; ++k) v += part[k * L + r];
+                u[r] = v / tot;
+            }
+            sycl::group_barrier(it.get_group());
+            // out = v_b[h] u: a sub-group a row (its 512 halves, 32 a lane in four 16-byte loads)
+            for (int r = sgi; r < V; r += NSG) {
+                const h8* vr = reinterpret_cast<const h8*>(vb + ((size_t) hd * V + r) * L);
+                float a = 0.f;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const h8 w = vr[k * SG + lane];
+#pragma unroll
+                    for (int f = 0; f < 8; ++f) a += (float) w[f] * u[(k * SG + lane) * 8 + f];
+                }
+                a = sycl::reduce_over_group(sg, a, sycl::plus<float>());
+                if (lane == 0) out[(t * H + hd) * V + r] = a;
+            }
+        });
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_ds2_swiglu_rows(ns_gpu* g, const float* gu, float* out, int64_t rows, int64_t f) {
     NS_TRY
     g->q.parallel_for(sycl::range<2>(rows, f), [=](sycl::id<2> id) {
