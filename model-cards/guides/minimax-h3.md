@@ -107,7 +107,8 @@ The motion must carry through the cuts, and the sound with it.
 | the same shot goes on | `guide_clip` (22 frames) + `first_audio` |
 | the same person speaks again | `ref_images` + `ref_audios` + the picture as `first_frame` and `last_frame` - on **every** clip of the person, the first too (without it the model draws a voice, a man's for a woman) |
 | the speaker changes | that person's `ref_images` + `ref_audios`; **one speaker a shot** (two in one shot put a voice on the wrong mouth) |
-| the same person, a new place | `ref_images [person]` (+ the place's picture); the place in words |
+| the same person, a new place | `ref_images [person's character sheet, the place's picture]`: "the woman from the character sheet `<Picture 1>` stands here, on the quay of `<Picture 2>`" |
+| a prop in the scene | `ref_images [person, ..., prop]`, "lifts the brass lantern `<Picture 3>`" |
 | a new scene in the same look | `ref_images [a frame of the last scene]` "in the exact look and light of `<Picture 1>`", and the light in words |
 | a match cut, a transformation | `first_frame` = the last frame + `last_frame` = the target |
 | a seamless loop | `first_frame` = `last_frame` |

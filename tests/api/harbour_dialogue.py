@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Reference test: a short dialogue scene with cuts between people, made through the front door's API alone.
 
-Two people talk across hard cuts - the captain, then the engineer, the captain, the engineer - between an establishing
-shot and one of her walking away. It is the recipe for people talking (docs/video/scenes.md, S2 and S3):
+Two people talk across hard cuts - the captain, then the engineer, the captain, the engineer - in one place seen
+from two sides, between an establishing shot and one of her lifting a lantern and walking away. It is the recipe
+for people talking (docs/video/scenes.md, S2, S3, S13):
 
-- every clip of a person carries her picture AND her voice as references (Ref2VA: `ref_images`, `ref_audios`, named
-  `<Picture 1>` / `<Audio 1>` in the prompt), and the picture is pinned as first and last frame - a clip made without
-  the voice reference gets whatever voice the model draws (a man's, for her), and a cut to one with it changes voice;
+- the pictures are **references, not composites**: a background (two views of one place, no people), a character sheet
+  for each person (front, three-quarter, side and a smiling close-up on a plain ground) and a prop. Each clip is Ref2VA
+  with the person's sheet, their place and their voice (`ref_images`, `ref_audios`), and the prompt says "the woman
+  from the character sheet <Picture 1> stands here, on the quay of <Picture 2>". (`image.edit` of a person into a
+  place returned the place without them.) Nothing is pinned: the shot is held by the words;
+- the voice is one steady 3 s+ sample per person on every clip, the first too (a clip made without it gets whatever
+  voice the model draws, a man's for her, and a cut to one with it changes voice);
 - one speaker in each shot (two voices in one shot put a voice on the wrong mouth);
+- warm: golden-hour light, warm clothes, a smile in the prompt and in the voice sample's instruction - a violet dusk
+  and dark coats gave cold, flat people;
 - each clip is sized to its line (words / 3.3 / 0.57 s, so a line is not rushed), cut to the next with a plain cut
   (nothing is carried, so nothing overlaps) and each clip's sound levelled alone (one voice, one room).
 
@@ -39,33 +46,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kaiju_lighthouse as K   # the API client, the probes, the polling
 
 FPS = 24
-STYLE = "Live-action, cinematic, natural dusk light, shallow depth of field."
-MARA = "a woman in her forties with short grey-streaked black hair, grey eyes and a weathered face, in a navy wool coat with silver buttons"
-ILYA = "an old man with a full white beard, a flat cap and oil-stained green overalls"
-QUAY = "a stone harbour quay with iron bollards at dusk, fishing boats at their moorings, grey stone houses on the hill, still water, soft violet light"
-PICTURES = {
-    # one place, three views, each picture generated with the place's words: wide; out over the water with the captain in
-    # front of it; back at the boathouse and houses with the engineer in front of them. (image.edit of a person's picture to
-    # change its background kept the old room for him and over-processed the picture, and given the place as a second picture
-    # it returned the place and dropped the person - so the people are generated in the place.)
-    "harbour": f"wide cinematic photograph of {QUAY}, no people",
-    "mara_quay": f"cinematic portrait photograph, waist-up, {MARA}, standing alone on {QUAY}; an iron bollard beside her, the still "
-                 "water, boats and far shore behind her, looking straight at the camera, shallow depth of field",
-    "ilya_quay": f"cinematic portrait photograph, waist-up, {ILYA}, standing alone on {QUAY}; an iron bollard beside him, a weathered "
-                 "stone boathouse wall and grey hillside houses behind him, looking straight at the camera, shallow depth of field",
-    "lantern": "photograph of a brass ship's lantern with a warm glowing flame and a ring handle, on a plain dark background",
+STYLE = ("Live-action, cinematic, warm golden-hour sunlight, soft amber and honey tones, natural warm skin tones, "
+         "shallow depth of field.")
+MARA = ("a woman in her forties with short grey-streaked black hair, grey eyes and a kind, weathered face, in a mustard-yellow "
+        "oilskin coat over a cream wool sweater and a rust-red scarf")
+ILYA = ("an old man with a full white beard, kind blue eyes and a ruddy face, in a flat tweed cap and a rust-brown wool jersey with "
+        "rolled sleeves")
+PLACE = ("a stone harbour quay with iron bollards in the golden hour, fishing boats in red and blue at their moorings, honey-coloured "
+         "stone houses on the hill, calm water glittering with warm light")
+SHEET = ("character reference sheet, photographic: full-body front view, three-quarter view and side view, and a close-up of the "
+         "smiling face, on a plain light-grey studio background, even soft warm light")
+# The pictures are references, not composites: a place (two views of it, no people), a character sheet for each person and
+# a prop. The video model puts "this character standing here" together (Ref2VA: `<Picture i>` in the prompt) - image.edit
+# of a person into a place returned the place without the person, or kept the old room behind them and over-processed it.
+PICTURES = {   # name -> (prompt, size)
+    "harbour": (f"wide cinematic photograph of {PLACE}, no people", "1024x768"),
+    "place_a": (f"cinematic photograph of {PLACE}, looking out over the water, an iron bollard in the foreground, the boats and the far "
+                "shore beyond, no people", "1024x768"),
+    "place_b": (f"cinematic photograph of {PLACE}, looking back along the quay: a weathered stone boathouse wall and the honey-coloured "
+                "houses behind, an iron bollard and cobbles in the foreground, no people", "1024x768"),
+    "sheet_mara": (f"{SHEET}: {MARA}", "1344x768"),
+    "sheet_ilya": (f"{SHEET}: {ILYA}", "1344x768"),
+    "lantern": ("photograph of a brass ship's lantern with a warm glowing flame and a ring handle, on a plain dark background", "1024x768"),
 }
+PLACE_OF = {"mara": "place_a", "ilya": "place_b"}   # where each person stands: the two views of the quay
+WARM = "warm, kind and friendly, a gentle smile in the voice"
 # (who, the line): the voice reference is the speech model's rendering of a line of the same person's
-VOICE = {"mara": ("vivian", "We sail at first light, and the tide will not wait for any of us."),
-         "ilya": ("ryan", "The engine will hold, captain, but only if you ask it nicely.")}
+VOICE = {"mara": ("vivian", "We sail at first light, my friend, and I am glad you are here."),
+         "ilya": ("ryan", "She will hold, captain, she always does for you.")}
 DESIGN = {"mara": "a woman in her forties, a warm low alto, calm and weathered, speaking slowly and steadily like a ship's captain",
           "ilya": "an old man, a gravelly deep baritone, dry and unhurried, with the tired humour of an engineer"}
 SCENE = [   # (id, who, line) - who None: no one speaks
     ("establish", None, None),
-    ("mara_1", "mara", "We sail at first light, whether the tide agrees or not."),
-    ("ilya_1", "ilya", "She will hold, captain, if you ask her nicely."),
-    ("mara_2", "mara", "Then ask her nicely, Ilya. Dawn is not far."),
-    ("ilya_2", "ilya", "Aye. Dawn it is."),
+    ("mara_1", "mara", "We sail at first light, my friend, and I am glad you are here."),
+    ("ilya_1", "ilya", "She will hold, captain, she always does for you."),
+    ("mara_2", "mara", "Thank you, Ilya. Now get some rest before the dawn."),
+    ("ilya_2", "ilya", "Aye, captain. Go well, and bring the lantern back."),
     ("walk", None, None),
 ]
 LOCK = ("The camera sits in one fixed position on a tripod; that exact shot size, light level and colour hold from the first "
@@ -85,22 +101,25 @@ def frames_for(line):
 
 def prompt_of(cid, who, line):
     if cid == "establish":
-        return (f"integrated_multimodal_description: [Shot 1] {STYLE} A wide establishing shot of a small harbour at dusk: fishing boats "
-                "at their moorings, a stone quay, grey houses on the hill, the water still and violet. The camera is static.\n\n"
-                "overall_soundscape: Water lapping against stone, a distant gull, a rope creaking.\n\nnon_diegetic_music: None.")
+        return (f"integrated_multimodal_description: [Shot 1] {STYLE} A wide establishing shot of a small harbour in the golden hour: "
+                "red and blue fishing boats at their moorings, a stone quay, honey-coloured houses on the hill, the water glittering "
+                "with warm light. The camera is static.\n\noverall_soundscape: Water lapping against stone, a distant gull, a rope "
+                "creaking.\n\nnon_diegetic_music: None.")
     if cid == "walk":
-        return (f"integrated_multimodal_description: [Shot 1] {STYLE} A medium shot: the woman from <Picture 1> bends and lifts the "
-                "brass lantern from <Picture 2> from the stone quay, holds it by its ring at her side with its flame glowing, and "
-                "walks away along the quay toward the moored boats at dusk, her coat moving. The camera tracks behind her at a "
-                "steady distance.\n\noverall_soundscape: Footsteps on stone, water lapping, a distant gull.\n\n"
+        return (f"integrated_multimodal_description: [Shot 1] {STYLE} A medium shot: the woman from the character sheet <Picture 1> "
+                "stands here on the quay of <Picture 2>, smiles, bends and lifts the brass lantern <Picture 3> by its ring, and walks "
+                "away along the quay toward the moored boats, the golden light warm on her coat. The camera tracks behind her at a "
+                "steady distance.\n\noverall_soundscape: Footsteps on stone, water lapping softly, a distant gull.\n\n"
                 "non_diegetic_music: None.")
-    person = ("the woman from <Picture 1>, the harbour water and boats behind her," if who == "mara"
-              else "the old man from <Picture 1>, the boathouse wall and grey houses behind him,")
-    room = "Her voice, close and clear; water lapping faintly against stone." if who == "mara" else \
-        "His voice, close and clear; a faint clank of pipes."
-    return (f"integrated_multimodal_description: [Shot 1] {STYLE} A medium close-up of {person}, alone in the frame, who blinks and "
-            f"looks straight into the camera, then speaks in the voice of <Audio 1> (S1): <d>[English] {line}</d> The lips move with "
-            f"the words and the eyes blink again at the end. {LOCK}\n\noverall_soundscape: {room}\n\nnon_diegetic_music: None.")
+    person = "the woman" if who == "mara" else "the old man"
+    pron = "her" if who == "mara" else "his"
+    room = "Her warm voice, close and clear; water lapping softly against stone, a distant gull." if who == "mara" else \
+        "His warm voice, close and clear; water lapping softly against stone, a distant gull."
+    return (f"integrated_multimodal_description: [Shot 1] {STYLE} A medium close-up, head and shoulders: {person} from the character "
+            f"sheet <Picture 1> stands here, on the quay of <Picture 2>, the golden light warm on {pron} face. {person.capitalize()} "
+            f"smiles gently, blinks, looks straight into the camera, then speaks in the voice of <Audio 1> (S1): <d>[English] {line}</d> "
+            f"The lips move with the words, the eyes stay warm and the smile returns at the end. {LOCK}\n\n"
+            f"overall_soundscape: {room}\n\nnon_diegetic_music: None.")
 
 
 def pcm(f, rate):
@@ -206,11 +225,11 @@ def main():
             api.rpc("system.unload", {"model": m})
         except RuntimeError:
             pass
-    for p, prompt in PICTURES.items():
+    for p, (prompt, size) in PICTURES.items():
         dst = out / f"{p}.png"
         if not dst.exists():
-            print(f"picture {p}: {a.image_model}", flush=True)
-            r = api.rpc("image.generate", {"model": a.image_model, "prompt": prompt, "size": "768x576", "steps": 20, "seed": a.seed})
+            print(f"picture {p}: {a.image_model} {size}", flush=True)
+            r = api.rpc("image.generate", {"model": a.image_model, "prompt": prompt, "size": size, "steps": 28, "seed": a.seed})
             url = r["data"][0]["url"]
             api.get(url[url.index("/v1/"):], dst)
         up(f"{p}.png", dst)
@@ -231,6 +250,7 @@ def main():
                 body["instructions"] = DESIGN[who]
             else:
                 body["voice"] = VOICE[who][0]
+                body["instructions"] = WARM
             r = api.rpc("audio.speak", body)
             url = r.get("url") or r["data"][0]["url"]
             api.get(url[url.index("/v1/"):], dst)
@@ -251,11 +271,10 @@ def main():
         if cid == "establish":
             body |= {"engine": "INT8", "first_frame": files["harbour"]}   # the quay, wide
         elif cid == "walk":
-            body |= {"engine": "REF2VA", "ref_images": [files["mara_quay"], files["lantern"]]}
+            body |= {"engine": "REF2VA", "ref_images": [files["sheet_mara"], files["place_a"], files["lantern"]]}
         else:
-            body |= {"engine": "REF2VA", "ref_images": [files[f"{who}_quay"]],
-                     "ref_audios": [files[f"line_{cid}" if a.voices == "lines" else f"voice_{who}"]],
-                     "first_frame": files[f"{who}_quay"], "last_frame": files[f"{who}_quay"]}
+            body |= {"engine": "REF2VA", "ref_images": [files[f"sheet_{who}"], files[PLACE_OF[who]]],
+                     "ref_audios": [files[f"line_{cid}" if a.voices == "lines" else f"voice_{who}"]]}
         if upscale > 1:
             body |= {"upscale": upscale, "upscaler": "esrgan-general"}
         t = time.time()

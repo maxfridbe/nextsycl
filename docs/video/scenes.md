@@ -44,12 +44,18 @@ wrong mouth; both are corrected below.
 - **A hard cut is a plain cut**: nothing is carried, so nothing is trimmed or cross-faded; cut the sound to the
   picture's exact length first (a clip's sound runs a fraction of a frame long and a concat holds a frame for it),
   6 ms in and out so it does not click, and level each clip alone.
-- **One place, two views, people generated in it**: to cut between people in the *same* location, generate each
-  picture in the place with the place's words repeated and the viewpoint changed (out over the water behind her, back
-  at the boathouse and houses behind him), and use that picture as the person's reference *and* pinned frame.
-  `image.edit` did not work for it: with the place as a second picture it returned the place and dropped the person
-  (two orders, three phrasings); a background change on the person's own picture left the old room behind the
-  engineer and over-processed the result.
+- **One place, two views: references, not composites.** To cut between people in the *same* location, generate the
+  place twice (the same words, the viewpoint changed: out over the water, back at the boathouse and houses) with no
+  people, and a **character sheet** for each person (front, three-quarter, side, a smiling close-up, plain ground), and
+  let the video model put them together: `ref_images [sheet, place]`, "the woman from the character sheet
+  `<Picture 1>` stands here, on the quay of `<Picture 2>`". Both stayed the same people in the same quay across the
+  cuts, with faces large enough to read. Two things that did not work: `image.edit` with the place as a second
+  picture returned the place and dropped the person (two orders, three phrasings), and a background change on a
+  person's picture kept the old room and over-processed it.
+- **Warmth is something you ask for**: the first version was a violet dusk with navy coats and a calm face, and read
+  cold and flat. Golden-hour light, warm-coloured clothes in the character sheet, "smiles gently ... the smile returns
+  at the end" and a warm voice instruction ("warm, kind and friendly, a gentle smile in the voice" to the speech model)
+  gave people who look at each other kindly.
 - **Design the scene, do not collect the clips**: the first "reel" joined the best clip of each experiment, which
   were not one scene - different voices, a clip made without the reference beside one with it - and it was unwatchable.
   `harbour_dialogue.py` is the same recipes as a scene.

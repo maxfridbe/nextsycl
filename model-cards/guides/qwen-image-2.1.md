@@ -18,6 +18,6 @@ Qwen-Image 2.1 draws a picture from a description, or edits pictures you give it
 - Give up to 8 pictures; the prompt becomes instructions. The first picture is the one changed, the others are
   references - name them: `put the hat from picture 2 on the fox in picture 1`, `make it night, keep the people`.
 - Composing a person into a place from two pictures did not work in tests (the place came back without the person),
-  and a background change did not replace a strongly lit room: generate the person in the place instead, with the
-  place's words.
+  and a background change did not replace a strongly lit room: do not composite: make the place (no people) and a character sheet
+  (front, three-quarter, side, a smiling close-up, a plain ground) and give both to the video model as references.
 - Say what changes and what stays. The output size follows the last picture unless you give one.
