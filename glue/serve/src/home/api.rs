@@ -39,7 +39,7 @@ pub const METHODS: &[Method] = &[
              fields: &[MODEL, ("gpus", "integer[]", "the cards (default: as registered); several for a model that spans cards", false)],
              example: r#"{"model": "qwen-image-2.1-q8", "gpus": [0]}"# },
     Method { kind: "system", name: "gpus", summary: "Change the cards a model may use (enabled or not); more than fit is allowed (the card shows overbooked). A loaded model moved off its card unloads: its next request loads it on the new cards",
-             fields: &[MODEL, ("gpus", "integer[]", "the cards: one for image and audio models, one or more for chat and video", true)],
+             fields: &[MODEL, ("gpus", "integer[]", "the cards: one or more (an image or audio model loads on the first of them with room)", true)],
              example: r#"{"model": "qwen3.8-27b-q4", "gpus": [0, 1]}"# },
     Method { kind: "system", name: "disable", summary: "Withdraw a model: unloaded (after the requests it is answering), off Open WebUI's list and this spec",
              fields: &[MODEL, ("force", "boolean", "a video model while a clip renders: stop the clip at its next step", false)], example: r#"{"model": "qwen-image-2.1-q8"}"# },

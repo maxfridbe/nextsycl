@@ -33,6 +33,17 @@ fn listening(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300)).is_ok()
 }
 
+/// An image or audio model: it loads whole on one card (the first of its cards with room)
+fn one_card(m: &Value) -> bool {
+    matches!(registry::kind_of(m), "image" | "audio")
+}
+
+/// The card a process of model `id` holds memory on, in the named cards
+fn held_on(cards: &Value, id: &str) -> Option<usize> {
+    cards.as_array()?.iter().find(|c| c["procs"].as_array().into_iter().flatten().any(|p| p["model_id"] == id))
+        .and_then(|c| c["index"].as_u64()).map(|g| g as usize)
+}
+
 pub(crate) fn s(m: &Value, k: &str) -> String {
     m.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
@@ -97,15 +108,23 @@ impl Home {
     }
 
     /// The memory a model takes on each of its cards, MiB: as seen while it ran, else its model card's `vram_gib` (as
-    /// measured where it runs), else from its files' sizes - never more than a card holds beside the spare
+    /// measured where it runs), else from its files' sizes - never more than a card holds beside the spare. An image or
+    /// audio model loads whole on one of its cards: what it takes there, for each.
     fn vouched_mb(&self, m: &Value, card_mb: u64) -> (BTreeMap<usize, u64>, bool) {
         let id = s(m, "id");
         let gpus = self.gpus_of(m);
+        let single = one_card(m);
         // a model that ran fits the card: a peak seen above what a card may be asked for (an edit's, with its vision tower,
         // touching the card's whole memory) would otherwise refuse the model from then on, its margin never free
         let cap = card_mb.saturating_sub(MARGIN_MB + 512);
-        if let Some(seen) = self.seen.lock().unwrap().get(&id).filter(|g| gpus.iter().all(|i| g.contains_key(i))) {
-            return (gpus.iter().map(|g| (*g, seen[g].min(cap))).collect(), true);
+        if let Some(seen) = self.seen.lock().unwrap().get(&id) {
+            if single && !seen.is_empty() {
+                let mb = seen.values().copied().max().unwrap_or(0).min(cap);
+                return (gpus.iter().map(|g| (*g, mb)).collect(), true);
+            }
+            if !single && gpus.iter().all(|i| seen.contains_key(i)) {
+                return (gpus.iter().map(|g| (*g, seen[g].min(cap))).collect(), true);
+            }
         }
         if let Some(g) = m["vram_gib"].as_f64().filter(|g| *g > 0.0) {
             return (gpus.iter().map(|i| (*i, ((g * 1024.0) as u64).min(cap))).collect(), false);
@@ -113,8 +132,8 @@ impl Home {
         let files: u64 = registry::paths(m).iter().filter(|p| p.is_file()).filter_map(|p| std::fs::metadata(p).ok()).map(|x| x.len() >> 20).sum();
         let per = match registry::kind_of(m) {
             "video" => card_mb.saturating_sub(4096),
-            "image" => files * 105 / 100 / gpus.len() as u64 + 4096,
-            "audio" => files * 110 / 100 / gpus.len() as u64 + 2048,
+            "image" => files * 105 / 100 + 4096,
+            "audio" => files * 110 / 100 + 2048,
             _ => files / gpus.len() as u64 + 2048,
         };
         (gpus.iter().map(|g| (*g, per.min(cap))).collect(), false)
@@ -171,7 +190,12 @@ impl Home {
             let (id, kind) = (s(m, "id"), registry::kind_of(m).to_string());
             let enabled = m["enabled"] != false;
             let gpus = self.gpus_of(m);
-            let (vouch, measured) = self.vouched_mb(m, gpus.first().map_or(32768, |g| card_mb(*g)));
+            let (mut vouch, measured) = self.vouched_mb(m, gpus.first().map_or(32768, |g| card_mb(*g)));
+            // an image or audio model allowed several cards counts on one: the one it is on, else the first it tries
+            if one_card(m) && vouch.len() > 1 {
+                let on = held_on(cards, &id).filter(|g| vouch.contains_key(g)).unwrap_or(gpus[0]);
+                vouch.retain(|g, _| *g == on);
+            }
             let mut state = match kind.as_str() {
                 "llm" if chat.0.as_deref() == Some(id.as_str()) => "loaded",
                 "llm" if chat.1 .1.as_deref() == Some(id.as_str()) => "loading",
@@ -244,9 +268,6 @@ impl Home {
             if g.is_empty() || g.iter().any(|x| *x >= n) {
                 return Err((400, format!("gpus {g:?}: one or more of 0..{}", n - 1)));
             }
-            if matches!(registry::kind_of(&m), "image" | "audio") && g.len() > 1 {
-                return Err((400, format!("{id} runs on one card")));
-            }
         }
         registry::update(&self.o.cfg, id, |e| {
             e["enabled"] = json!(true);
@@ -278,9 +299,6 @@ impl Home {
             return Err((400, format!("gpus {g:?}: one or more of 0..{}", n - 1)));
         }
         let kind = registry::kind_of(&m).to_string();
-        if matches!(kind.as_str(), "image" | "audio") && g.len() > 1 {
-            return Err((400, format!("{id} runs on one card")));
-        }
         let old = self.gpus_of(&m);
         let mut g = g;
         g.sort();
@@ -290,7 +308,9 @@ impl Home {
         }
         // a loaded model leaves the cards it was on (it reloads on the new ones at its next request)
         let state = self.model_states(std::slice::from_ref(&m), &json!([])).first().map(|x| s(x, "state")).unwrap_or_default();
-        if m["enabled"] != false && matches!(state.as_str(), "loaded" | "busy" | "loading") && kind != "video" {
+        // (an image or audio model only when its card is the one taken away)
+        let kept = one_card(&m) && held_on(&self.named_cards(&self.models()), id).is_some_and(|on| g.contains(&on));
+        if m["enabled"] != false && matches!(state.as_str(), "loaded" | "busy" | "loading") && kind != "video" && !kept {
             self.unload(id)?;
         }
         registry::update(&self.o.cfg, id, |e| e["gpus"] = json!(g.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","))).map_err(|e| (500, e))?;
@@ -432,28 +452,31 @@ impl Home {
             }
             None => {}
         }
-        // the card: the model's memory free, with room to spare
-        let gpu = self.gpus_of(&m)[0];
+        // the card: the first of its cards with the model's memory free, with room to spare
+        let gpus = self.gpus_of(&m);
         let card_mb = |c: &Value| c["vram_total_mb"].as_u64().unwrap_or(0);
-        let (need, _) = self.vouched_mb(&m, self.cards.lock().unwrap().get(gpu).map_or(32768, card_mb));
-        let need = need.get(&gpu).copied().unwrap_or(0);
+        let (need, _) = self.vouched_mb(&m, self.cards.lock().unwrap().get(gpus[0]).map_or(32768, card_mb));
         let t0 = Instant::now();
-        loop {
+        let gpu = loop {
             let cards = self.named_cards(&self.models());
-            let c = cards.get(gpu).cloned().unwrap_or(Value::Null);
-            let free = card_mb(&c).saturating_sub(c["vram_used_mb"].as_u64().unwrap_or(0));
-            if free >= need + MARGIN_MB {
-                break;
+            let free = |g: usize| cards.get(g).map_or(0, |c| card_mb(c).saturating_sub(c["vram_used_mb"].as_u64().unwrap_or(0)));
+            let want = |g: usize| need.get(&g).copied().unwrap_or(0) + MARGIN_MB;
+            if let Some(g) = gpus.iter().copied().find(|g| free(*g) >= want(*g)) {
+                break g;
             }
             if t0.elapsed() > Duration::from_secs(90) {
-                let holders: Vec<String> = c["procs"].as_array().into_iter().flatten()
-                    .map(|p| format!("{} {:.1} GiB", p["model"].as_str().or(p["program"].as_str()).unwrap_or("?"), p["vram_mb"].as_u64().unwrap_or(0) as f64 / 1024.0))
-                    .collect();
-                return Err((409, format!("GPU {gpu} is busy: {:.1} GiB free ({}), {id} needs ~{:.1} GiB; it loads once that idles out or is stopped",
-                                         free as f64 / 1024.0, holders.join(", "), (need + MARGIN_MB) as f64 / 1024.0)));
+                let busy: Vec<String> = gpus.iter().map(|g| {
+                    let holders: Vec<String> = cards.get(*g).and_then(|c| c["procs"].as_array()).into_iter().flatten()
+                        .map(|p| format!("{} {:.1} GiB", p["model"].as_str().or(p["program"].as_str()).unwrap_or("?"), p["vram_mb"].as_u64().unwrap_or(0) as f64 / 1024.0))
+                        .collect();
+                    format!("GPU {g}: {:.1} GiB free ({})", free(*g) as f64 / 1024.0, holders.join(", "))
+                }).collect();
+                return Err((409, format!("{} busy - {}; {id} needs ~{:.1} GiB; it loads once one idles out or is stopped",
+                                         if gpus.len() > 1 { "its cards are" } else { "its card is" }, busy.join("; "),
+                                         want(gpus[0]) as f64 / 1024.0)));
             }
             std::thread::sleep(Duration::from_secs(3));
-        }
+        };
         let secs = (self.o.idle_minutes * 60).to_string();
         let mut args = vec![kind.to_string(), "start".into(), id.into(), "--gpu".into(), gpu.to_string(), "--port".into(), self.port_of(kind).to_string(),
                             "--host".into(), self.o.serve_host.clone(), "--wfe".into()];
