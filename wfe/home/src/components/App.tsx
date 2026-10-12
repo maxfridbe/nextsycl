@@ -135,20 +135,32 @@ function ModelRow(m: Model) {
       </div>
       <div class="mstate"><span class={{ tag: true, [m.state]: true }}>{STATE_TEXT[m.state] ?? m.state}</span></div>
       <div class="acts">
+        <span class="onoff" attrs={{ title: m.enabled ? "enabled: it loads on its first request and unloads after the idle time" : "disabled: off the API (and Open WebUI's list)" }}>
+          <label class={{ on: !m.enabled }}>
+            <input attrs={{ type: "radio", name: `en-${m.id}`, disabled: !!p || m.state === "loading" }} props={{ checked: !m.enabled }}
+              on={{ change: () => { if (m.enabled) void act("disable", m.id, m.kind === "video" ? { force: false } : {}); } }} /> disabled
+          </label>
+          <label class={{ on: m.enabled }}>
+            <input attrs={{ type: "radio", name: `en-${m.id}`, disabled: !!p || m.state === "loading" }} props={{ checked: m.enabled }}
+              on={{ change: () => { if (!m.enabled) void act("enable", m.id, { gpus: ui.pick[m.id] ?? m.gpus }); } }} /> enabled
+          </label>
+          {p && (p.what === "enable" || p.what === "disable") ? <span class="spin" /> : null}
+        </span>
         {GpuPicker(m)}
         {m.enabled
           ? [
               loaded
                 ? btn("unload", "stop", "ghost", "unload now (after the requests it is answering); it stays enabled")
                 : btn("load", m.state === "loading" ? "starting" : "start", "", "load now (otherwise its first request does); the button spins until it answers"),
-              btn("disable", "disable", "ghost danger", m.kind === "llm" ? "unload it and take it off Open WebUI's list" : "unload it and take it off the API",
-                  m.kind === "video" ? { force: false } : {}),
-              loaded || m.kind === "video" || m.kind === "llm"
-                ? <a class="btn" attrs={{ href: page, target: "_blank", title: m.kind === "llm" ? "Open WebUI" : "its page" }}><span class="i" props={{ innerHTML: "&#xf08e;" }} /></a>
-                : null,
+              // its own page, loaded or not: an image or audio model's is its server's, so the front door starts the model
+              // first (/open/ID) and sends the browser on
+              <a class="btn" attrs={{ href: m.kind === "image" || m.kind === "audio" ? `/open/${encodeURIComponent(m.id)}` : page, target: "_blank",
+                title: m.kind === "llm" ? "Open WebUI" : m.kind === "video" ? "the video studio"
+                  : loaded ? "its page" : "its page: the model starts first (a minute), then the page opens" }}>
+                <span class="i" props={{ innerHTML: "&#xf08e;" }} /> page
+              </a>,
             ]
-          : btn("enable", "enable", "", "offer it on the cards picked: it loads on its first request, unloads after the idle time",
-                { gpus: ui.pick[m.id] ?? m.gpus })}
+          : null}
       </div>
     </div>
   );

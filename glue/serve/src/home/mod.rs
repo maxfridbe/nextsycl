@@ -263,6 +263,7 @@ impl Home {
         match (req.method.as_str(), p) {
             ("GET", "/") | ("GET", "/index.html") => self.page(&mut s),
             ("GET", p) if p.starts_with("/ui/") || p.starts_with("/static/") => self.asset(&mut s, p),
+            ("GET", p) if p.starts_with("/open/") => self.open(&mut s, &req, &p["/open/".len()..]),
             ("GET", "/health") => http::respond(&mut s, 200, &json!({"status": "ok"})),
             ("GET", "/openapi.yml") | ("GET", "/openapi.yaml") => {
                 let spec = self.openapi(&req);
@@ -288,6 +289,34 @@ impl Home {
             }
             _ => http::respond(&mut s, 404, &err(format!("no route {} {}", req.method, req.path))),
         }
+    }
+
+    /// A model's own page (an image or audio model's web front end, which only its running server has): the model is
+    /// started when it is not up - the same as its first request - and the browser sent to it. A disabled model has
+    /// none to open. The video studio and the chat page are always up.
+    fn open(&self, s: &mut Conn, req: &http::Request, id: &str) {
+        let id = id.trim_end_matches('/');
+        let m = match registry::find(&self.o.cfg, id) {
+            Ok(Some(m)) => m,
+            _ => return http::respond(s, 404, &err(format!("no model {id}"))),
+        };
+        if m["enabled"] == false {
+            return http::respond(s, 409, &err(format!("{id} is disabled: enable it to open its page")));
+        }
+        let kind = registry::kind_of(&m).to_string();
+        let port = match kind.as_str() {
+            "image" | "audio" => {
+                if let Err((c, e)) = self.ensure(id) {
+                    return http::respond(s, c, &err(e));
+                }
+                if kind == "image" { self.o.ports.image } else { self.o.ports.audio }
+            }
+            "video" => self.o.ports.video,
+            _ => self.o.ports.chat_ui,
+        };
+        let host = req.host.as_deref().unwrap_or("localhost").rsplit_once(':').map_or_else(|| req.host.clone().unwrap_or_default(), |(h, _)| h.to_string());
+        let host = if host.is_empty() { "localhost".to_string() } else { host };
+        http::respond_bytes(s, 302, "text/plain; charset=utf-8", b"", &format!("Location: http://{host}:{port}/\r\nCache-Control: no-cache\r\n"));
     }
 
     fn page(&self, s: &mut Conn) {
