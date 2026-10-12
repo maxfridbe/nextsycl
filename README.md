@@ -16,6 +16,30 @@ We stand on the shoulders of giants.
 - **A Docker-style CLI** - `nextsycl <kind> start | stop | ps | logs | ...`
 - **A porting methodology** - [CONTRIBUTING.md](CONTRIBUTING.md) and [the SYCL porting skill](skills/sycl-porting/SKILL.md)
 
+## RUN
+
+`nextsycl models pull <id>`, then pick it in the front door (:8000) or the chat front end - or `nextsycl llm start <id>`
+for a chat model. Measured speeds, decode / prompt reading:
+
+**On two 32 GB cards** (measured on an Arc Pro B70 + B65, 61 GB of host RAM, an NVMe; two B70s at least as fast):
+
+| id | model | speed |
+|---|---|---|
+| `deepseek-r1-iq1s` | **DeepSeek-R1 671B** (unsloth UD-IQ1_S, 131 GiB) - the experts that do not fit VRAM in pinned RAM (multiplied on the CPU) and on the NVMe | ~8 tok/s / ~135 tok/s, 32K context |
+| `glm-5.3-flash-uncensored-256k` | **GLM-5.3-Flash** uncensored IQ2 | ~18 tok/s / 450-1,100 tok/s, to 256K |
+
+**On one 32 GB card** (measured on an Arc Pro B70):
+
+| id | model | speed |
+|---|---|---|
+| `qwen3.8-flash-next-iq2_xs` | **Qwen3.8-Flash-Next** 125B MoE IQ2_XS (MTP drafts) | ~80 tok/s / ~1,200 tok/s, 128K |
+| `qwen3.8-flash-next-coder-iq1_m` | **Qwen3.8-Flash-Next Coder** IQ1_M | ~77 tok/s / ~1,400 tok/s, 128K |
+| `qwen3.8-27b-q4` | **Qwen3.8-27B** dense UD-Q4_K_M (MTP drafts) | 43-49 tok/s, 128K |
+| `qwen-image-2.1-q8` | **Qwen-Image 2.1** text to image, edits | 1024x1024, 40 steps: 23.8 s (16.5 s int8) |
+| `minimax-h3` | **MiniMax H3** video with sound | 896x672, 4.5 s: ~90 s |
+| `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |
+| `qwen3-tts-custom` | **Qwen3-TTS** speech | 33 s of speech: 7.7 s |
+
 A Rust runtime for language, image, video and audio models on Intel Arc GPUs, with SYCL kernels. Each kind of model has a
 contract its server and command line drive, and each model architecture its own engine behind it, tuned end to end -
 a library another program can use without the server (`docs/architecture.md`). New models are welcome:
@@ -56,6 +80,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | id | model | engine | size | status |
 |---|---|---|---|---|
 | `glm-5.3-flash-uncensored`, `-128k`, `-256k` | GLM-5.3-Flash uncensored IQ2, 64K / 128K / 256K context | `glm5next` | 89.9 GiB | checked (llama.cpp), served on both cards |
+| `deepseek-r1-iq1s` | DeepSeek-R1 671B UD-IQ1_S, 32K: experts in VRAM, pinned RAM (on the CPU) and the NVMe | `deepseek2` | 130.6 GiB | checked (llama.cpp), served on both cards |
 | `qwen3.8-flash-next-iq2_xs` | Qwen3.8-Flash-Next IQ2_XS | `qwen4exp` | 63.4 GiB | served (verify passes and batches exact) |
 | `qwen3.8-flash-next-iq2_xs-uncensored` | the same with the refusal projection (a control vector) | `qwen4exp` | 63.4 GiB | served |
 | `qwen3.8-flash-next-coder-iq1_m`, `-uncensored` | Qwen3.8-Flash-Next Coder IQ1_M | `qwen4exp` | 54.4 GiB | served |
