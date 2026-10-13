@@ -55,7 +55,7 @@ pub const OPTIONS: &[EngineOption] = &[
 /// This engine's registry entry
 pub fn kind() -> EngineKind {
     EngineKind { archs: &["deepseek2"], name: "DeepSeek-V3 / R1 (MLA with YaRN, 256 experts in VRAM, pinned memory and the file)", load, info: tools::info,
-                 kernels: Some(tools::kernels), chat: nextsycl_tok::deepseek_chat, options: OPTIONS }
+                 kernels: Some(tools::kernels), chat: nextsycl_tok::deepseek_chat, options: OPTIONS, prepare: None }
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {

@@ -4,7 +4,7 @@ id: deepseek-v4-flash-iq2m
 kind: llm
 arch: deepseek4
 title: DeepSeek-V4-Flash 284B UD-IQ2_M · 128K context (both GPUs and pinned memory)
-about: unsloth's dynamic 2-bit quant of DeepSeek-V4-Flash (84.7 GiB; 13B active, 256 experts); the experts beyond VRAM in pinned host memory
+about: unsloth's dynamic 2-bit quant of DeepSeek-V4-Flash (84.7 GiB; 13B active, 256 experts); the experts beyond VRAM in pinned host memory; the original checkpoint's last shard (3.6 GB) for its MTP draft block, converted beside it after the pull (llm prepare)
 gpus: all
 vram_gib: 30.0
 ctx: '131072'
@@ -30,4 +30,10 @@ files:
     size: 40964890464
     sha256: f80ae237748d94ffda1eb0ba793de0d80a7108453fed7cb5eee97e40d27a3398
     path: deepseek-v4-flash-iq2m/DeepSeek-V4-Flash-UD-IQ2_M-00003-of-00003.gguf
+  mtp-source:
+    key: deepseek-v4-flash-mtp-source
+    url: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/resolve/60d8d70770c6776ff598c94bb586a859a38244f1/model-00046-of-00046.safetensors
+    size: 3593956092
+    sha256: f58f722893a6148216a2155cee4a57fe691cea4d3b323135c433a936b932055d
+    path: deepseek-v4-flash-iq2m/DeepSeek-V4-Flash-00046-of-00046.safetensors
 guide: guides/chat.md

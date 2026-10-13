@@ -6,6 +6,7 @@
 //! metadata comes from the first shard, the tensors from all of them.
 
 pub mod safetensors;
+pub mod writer;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -446,6 +447,12 @@ impl From<&str> for Error {
 
 impl Gguf {
     pub fn open(path: &Path) -> Result<Gguf> {
+        Self::open_with(path, &[])
+    }
+
+    /// A model with more files after its own shards (a sidecar of tensors the model's own files lack - e.g. a draft
+    /// block converted on its own): their tensors join the index as further shards; the metadata is the model's.
+    pub fn open_with(path: &Path, extra: &[PathBuf]) -> Result<Gguf> {
         let (version, metadata, mut tensors) = read_one(path)?;
         let count = metadata.get("split.count").and_then(Value::as_u64).unwrap_or(1) as usize;
         let mut paths = vec![path.to_path_buf()];
@@ -455,6 +462,12 @@ impl Gguf {
                 let (_, _, ts) = read_one(p)?;
                 tensors.extend(ts.into_iter().map(|t| Tensor { shard: i, ..t }));
             }
+        }
+        for p in extra {
+            let i = paths.len();
+            let (_, _, ts) = read_one(p)?;
+            tensors.extend(ts.into_iter().map(|t| Tensor { shard: i, ..t }));
+            paths.push(p.clone());
         }
         let files = paths.iter().map(|p| io(File::open(p), &format!("opening {}", p.display()))).collect::<Result<Vec<_>>>()?;
         let mut index = BTreeMap::new();

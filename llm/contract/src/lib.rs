@@ -296,6 +296,9 @@ pub struct EngineKind {
     pub chat: ChatFn,
     /// the options it takes beyond the common ones (`--opt-NAME`: nextsycl_core::options)
     pub options: &'static [EngineOption],
+    /// files it makes beside a model once it is pulled (`nextsycl models pull`, `nextsycl llm prepare`): what the
+    /// model's own files lack and the engine converts from others the card fetched (deepseek4: its draft block)
+    pub prepare: Option<fn(&Gguf) -> std::result::Result<(), String>>,
 }
 
 /// Options every language engine's runtime reads (the shared loaders and guards), offered beside an engine's own

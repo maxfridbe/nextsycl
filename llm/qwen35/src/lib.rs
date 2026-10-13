@@ -26,7 +26,7 @@ pub const OPTIONS: &[EngineOption] = &[
 
 pub fn kind() -> EngineKind {
     EngineKind { archs: &[ARCH], name: "Qwen3.5 / Qwen3.8 dense (gated DeltaNet + gated full attention, SwiGLU: Qwen3.8-27B ...)", load, info,
-                 kernels: None, chat: nextsycl_tok::qwen_chat, options: OPTIONS }
+                 kernels: None, chat: nextsycl_tok::qwen_chat, options: OPTIONS, prepare: None }
 }
 
 fn info(f: &Gguf) -> std::result::Result<String, String> {

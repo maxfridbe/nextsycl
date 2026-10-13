@@ -59,6 +59,9 @@ pub struct Geometry {
     pub yarn_beta_slow: f64,
     /// per layer: 0, 4 or 128
     pub ratio: Vec<u64>,
+    /// draft (MTP) blocks after the layers: 1 when the file - or a sidecar opened with it - has block n_layer's
+    /// projections (it is then that layer: window-only attention, its MoE, its own mHC head)
+    pub n_mtp: u64,
 }
 
 impl Geometry {
@@ -67,6 +70,14 @@ impl Geometry {
     }
     pub fn is_hash(&self, layer: u64) -> bool {
         layer < self.hash_layers
+    }
+    /// whether `layer` is the draft block
+    pub fn is_mtp(&self, layer: u64) -> bool {
+        self.n_mtp > 0 && layer == self.n_layer
+    }
+    /// the layers a model holds: n_layer, and the draft block
+    pub fn n_blocks(&self) -> u64 {
+        self.n_layer + self.n_mtp
     }
 }
 
@@ -130,6 +141,15 @@ pub enum Role {
     ShGate,
     ShUp,
     ShDown,
+    // the draft block's own (block n_layer): its input's projections and norms, its head's norm and mHC
+    MtpEProj,
+    MtpHProj,
+    MtpENorm,
+    MtpHNorm,
+    MtpNorm,
+    MtpHcFn,
+    MtpHcBase,
+    MtpHcScale,
 }
 
 /// What a role belongs to, for the memory plan.
@@ -201,6 +221,14 @@ impl Role {
             ShGate => "ffn_gate_shexp.weight",
             ShUp => "ffn_up_shexp.weight",
             ShDown => "ffn_down_shexp.weight",
+            MtpEProj => "nextn.e_proj.weight",
+            MtpHProj => "nextn.h_proj.weight",
+            MtpENorm => "nextn.enorm.weight",
+            MtpHNorm => "nextn.hnorm.weight",
+            MtpNorm => "nextn.norm.weight",
+            MtpHcFn => "nextn.hc_head_fn.weight",
+            MtpHcBase => "nextn.hc_head_base.weight",
+            MtpHcScale => "nextn.hc_head_scale.weight",
         }
     }
 
@@ -214,6 +242,7 @@ const COMMON: [Role; 16] = [Role::AttnNorm, Role::FfnNorm, Role::HcAttnFn, Role:
 const COMP: [Role; 4] = [Role::CompKv, Role::CompGate, Role::CompApe, Role::CompNorm];
 const IDX: [Role; 6] = [Role::IdxQB, Role::IdxProj, Role::IdxCompKv, Role::IdxCompGate, Role::IdxCompApe, Role::IdxCompNorm];
 const MOE: [Role; 7] = [Role::Router, Role::ExpGate, Role::ExpUp, Role::ExpDown, Role::ShGate, Role::ShUp, Role::ShDown];
+const MTP: [Role; 8] = [Role::MtpEProj, Role::MtpHProj, Role::MtpENorm, Role::MtpHNorm, Role::MtpNorm, Role::MtpHcFn, Role::MtpHcBase, Role::MtpHcScale];
 
 /// A model file, resolved: its geometry and every tensor by (layer, role).
 pub struct Model<'g> {
@@ -277,6 +306,7 @@ impl<'g> Model<'g> {
             yarn_beta_fast: meta_f(file, &["rope.scaling.yarn_beta_fast"], Some(32.0))?,
             yarn_beta_slow: meta_f(file, &["rope.scaling.yarn_beta_slow"], Some(1.0))?,
             ratio,
+            n_mtp: u64::from(file.tensor(&format!("blk.{n_layer}.{}", Role::MtpEProj.name())).is_some()),
         };
         if g.hc != 4 {
             return Err(Error(format!("{} mHC streams: the engine takes 4", g.hc)));
@@ -308,6 +338,9 @@ impl<'g> Model<'g> {
         }
         v.extend(MOE);
         v.push(if g.is_hash(layer) { Role::HashTable } else { Role::RouterBias });
+        if g.is_mtp(layer) {
+            v.extend(MTP);
+        }
         v
     }
 
@@ -349,6 +382,11 @@ impl<'g> Model<'g> {
             ExpDown => vec![g.n_expert, d, g.ffn_expert],
             ShGate | ShUp => vec![g.ffn_expert * g.n_expert_shared, d],
             ShDown => vec![d, g.ffn_expert * g.n_expert_shared],
+            MtpEProj | MtpHProj => vec![d, d],
+            MtpENorm | MtpHNorm | MtpNorm => vec![d],
+            MtpHcFn => vec![hc, hc * d],
+            MtpHcBase => vec![hc],
+            MtpHcScale => vec![1],
         }
     }
 
@@ -360,7 +398,7 @@ impl<'g> Model<'g> {
         for r in [Role::TokenEmbd, Role::OutputNorm, Role::Output, Role::HeadHcFn, Role::HeadHcBase, Role::HeadHcScale] {
             self.check_one(0, r, &mut errs, &mut seen);
         }
-        for l in 0..self.g.n_layer {
+        for l in 0..self.g.n_blocks() {
             for r in self.roles(l) {
                 self.check_one(l, r, &mut errs, &mut seen);
             }
@@ -399,7 +437,7 @@ impl<'g> Model<'g> {
                 add(r, t);
             }
         }
-        for l in 0..self.g.n_layer {
+        for l in 0..self.g.n_blocks() {
             for r in self.roles(l) {
                 if let Some(t) = self.tensor(l, r) {
                     add(r, t);

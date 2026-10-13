@@ -60,7 +60,7 @@ pub const OPTIONS: &[EngineOption] = &[
 /// This engine's registry entry
 pub fn kind() -> EngineKind {
     EngineKind { archs: &["glm5-next", "glm5next"], name: "GLM-5.3-Flash (KDA + MLA with a DSA indexer, 288 experts, MTP)", load, info: tools::info,
-                 kernels: Some(tools::kernels), chat: nextsycl_tok::glm_chat, options: OPTIONS }
+                 kernels: Some(tools::kernels), chat: nextsycl_tok::glm_chat, options: OPTIONS, prepare: None }
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {

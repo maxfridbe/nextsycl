@@ -382,6 +382,9 @@ pub struct Part {
     oa_tabs: Mutex<HashMap<(u64, usize), Arc<DevBuf>>>,
     /// the dense matrices' multi-matrix tables (mm_many), by layer, rows and matrices
     multi_tabs: Mutex<HashMap<String, Arc<DevBuf>>>,
+    /// the draft block's experts, all resident in VRAM (layer, [n_expert slots of its own layout], a slot's bytes):
+    /// its MXFP4 experts are near twice the IQ2 layers', and the store has one slot size
+    resident: Option<(u64, DevBuf, usize)>,
 }
 
 /// the pinned rings' sizes
@@ -417,7 +420,22 @@ pub struct Session {
     layers: Vec<Att>,
     /// (first position, rows) of the last forward pass of 2..=MAX_VERIFY rows (a rollback's bounds)
     snapped: Option<(usize, usize)>,
+    /// the draft block's side (its window's ring is `layers`' last)
+    mtp: Option<MtpS>,
 }
+
+/// The draft block's pending rows: the last pass's final streams for its last rows (at most MTP_KEEP: the block's
+/// window is 128 positions, and a key needs only its own row) from position `slot0`, and the tokens that follow
+/// them but the last's (given when it is known)
+struct MtpS {
+    hid: DevBuf,
+    rows: usize,
+    slot0: usize,
+    next: Vec<u32>,
+}
+
+/// the draft block's rows a pass keeps for it
+const MTP_KEEP: usize = 128 + MAX_VERIFY;
 
 /// A conversation's state at a position, in host memory (`Ds4::save` / `Ds4::restore`).
 pub struct Checkpoint {
@@ -477,6 +495,12 @@ pub struct Decoder {
     look: Option<Lookup>,
     pub ng_drafted: u64,
     pub ng_accepted: u64,
+    /// the draft block's token for the position after `next`
+    draft: Option<u32>,
+    mtp: bool,
+    /// drafts verified, and accepted
+    pub drafted: u64,
+    pub accepted: u64,
 }
 
 /// A conversation's tokens with a 3-gram index: `after[(a, b, c)]` is the position following that 3-gram's most recent
@@ -520,6 +544,7 @@ impl Decoder {
     }
 
     pub fn pending(&mut self) -> Option<u32> {
+        self.draft = None;
         self.next.take()
     }
 }
@@ -538,11 +563,13 @@ pub struct Ds4<'g> {
     stamps: Mutex<Vec<Stamp>>,
     /// the pass running is a decode pass (NS_PROFILE_SPLIT=1: its sections counted apart, as "decode: ...")
     decoding: std::sync::atomic::AtomicBool,
+    /// the draft block's layer (MTP: block n_layer, on the last part), when loaded
+    pub mtp: Option<u64>,
 }
 
-const VECTORS: [Role; 15] = [Role::OutputNorm, Role::AttnNorm, Role::FfnNorm, Role::HcAttnBase, Role::HcAttnScale, Role::HcFfnBase, Role::HcFfnScale,
+const VECTORS: [Role; 20] = [Role::OutputNorm, Role::AttnNorm, Role::FfnNorm, Role::HcAttnBase, Role::HcAttnScale, Role::HcFfnBase, Role::HcFfnScale,
                              Role::HeadHcBase, Role::HeadHcScale, Role::QANorm, Role::KvNorm, Role::Sinks, Role::CompNorm, Role::IdxCompNorm,
-                             Role::RouterBias];
+                             Role::RouterBias, Role::MtpENorm, Role::MtpHNorm, Role::MtpNorm, Role::MtpHcBase, Role::MtpHcScale];
 /// the compressors' position terms: float32 [ratio][W], read as they are
 const APES: [Role; 2] = [Role::CompApe, Role::IdxCompApe];
 
@@ -561,6 +588,11 @@ fn mem_available() -> usize {
 }
 
 /// sqrt(softplus(z)): the router's score (ggml's softplus: z itself past 20)
+/// The highest logit's token
+fn argmax(l: &[f32]) -> u32 {
+    l.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32
+}
+
 fn sqrt_softplus(z: f32) -> f32 {
     (if z > 20.0 { z } else { z.exp().ln_1p() }).sqrt()
 }
@@ -590,8 +622,8 @@ fn read_expert(m: &Model, l: u64, ex: u64, p: &ExpertParts, host: &mut [u8]) -> 
 impl Part {
     /// The part's layers onto its GPU (and the head when `last`), its expert cache and mirror.
     #[allow(clippy::too_many_arguments)]
-    fn load(m: &Model, gpu: &Arc<Gpu>, layers: Range<u64>, last: bool, expert_bytes: Option<usize>, mirror_bytes: usize, kv_reserve: usize,
-            log: &mut dyn FnMut(String)) -> Result<Part> {
+    fn load(m: &Model, gpu: &Arc<Gpu>, layers: Range<u64>, last: bool, mtp: Option<u64>, expert_bytes: Option<usize>, mirror_bytes: usize,
+            kv_reserve: usize, log: &mut dyn FnMut(String)) -> Result<Part> {
         let g = &m.g;
         let ops = Ops::new(gpu.clone())?;
         let scratch = DevBuf::f32(gpu, SCRATCH)?;
@@ -608,6 +640,9 @@ impl Part {
             todo.push((0, vec![Role::OutputNorm, Role::Output, Role::HeadHcFn, Role::HeadHcBase, Role::HeadHcScale]));
         }
         todo.extend(layers.clone().map(|l| (l, m.roles(l))));
+        if let Some(ml) = mtp {
+            todo.push((ml, m.roles(ml)));
+        }
         for (l, roles) in todo {
             for r in roles {
                 if matches!(r, Role::ExpGate | Role::ExpUp | Role::ExpDown | Role::TokenEmbd | Role::HashTable) {
@@ -637,7 +672,7 @@ impl Part {
         gpu.sync()?;
         // o_a by group: its rows [g * o_lora, ..) read the group's 8 heads
         let mut groups = BTreeMap::new();
-        for l in layers.clone() {
+        for l in layers.clone().chain(mtp) {
             let w = mats.get(&(l, Role::OutA)).ok_or_else(|| Error(format!("block {l}: o_a missing")))?;
             let gs = (0..g.o_groups as usize).map(|gi| w.rows_view(gi * g.o_lora as usize, g.o_lora as usize)).collect::<Result<Vec<_>>>()?;
             groups.insert(l, gs);
@@ -647,14 +682,31 @@ impl Part {
         let moe: Vec<u64> = layers.clone().collect();
         let n_exp = moe.len() * g.n_expert as usize;
         let slot_bytes = moe.iter().map(|l| m.expert_bytes(*l) as usize).max().unwrap_or(256).next_multiple_of(256);
+        // the draft block's experts, resident: [gate | up | down] an expert, as a slot
+        let mtp_slot = mtp.map_or(0, |ml| (m.expert_bytes(ml) as usize).next_multiple_of(256));
+        let mtp_bytes = mtp_slot * g.n_expert as usize;
         let budget = match expert_bytes {
             Some(b) => b,
             // what is free less the arena, the forward pass's own buffers, and the sessions' attention caches - sized
             // now so a long context never pushes VRAM into the driver's spill path
             None => gpu.memory()?.1.map_or(8usize << 30, |f| {
                 let pass = (600 << 20) + prefill_chunk() * (352 << 10);
-                (f as usize).saturating_sub(pass + arena_bytes().max(1 << 30) + SMALL_ARENA + kv_reserve)
+                (f as usize).saturating_sub(pass + arena_bytes().max(1 << 30) + SMALL_ARENA + kv_reserve + mtp_bytes)
             }),
+        };
+        let resident = match mtp {
+            Some(ml) => {
+                let buf = DevBuf::new(gpu, mtp_bytes)?;
+                let lp = expert_parts(m, ml)?;
+                let mut host = vec![0u8; mtp_slot];
+                for ex in 0..g.n_expert {
+                    read_expert(m, ml, ex, &lp, &mut host)?;
+                    buf.write(ex as usize * mtp_slot, &host)?;
+                }
+                log(format!("{}: the draft block (layer {ml}): its {} experts resident ({:.2} GiB)", gpu.name, g.n_expert, gib(mtp_bytes)));
+                Some((ml, buf, mtp_slot))
+            }
+            None => None,
         };
         let per_chunk = (CHUNK / slot_bytes).max(1);
         let nv = (budget / slot_bytes).min(n_exp);
@@ -762,7 +814,7 @@ impl Part {
         let up = Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0));
         let back = Mutex::new(HostBuf::new(gpu, BACK_BYTES)?);
         Ok(Part { ops, arena, big, small, biases: Mutex::new(HashMap::new()), layers, mats, vecs, groups, scratch, x16, q8, esimd_gu, experts: Mutex::new(store),
-                  hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes, up, back, oa_tabs: Mutex::new(HashMap::new()), multi_tabs: Mutex::new(HashMap::new()) })
+                  hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes, up, back, oa_tabs: Mutex::new(HashMap::new()), multi_tabs: Mutex::new(HashMap::new()), resident })
     }
 
     /// The multi-matrix table of layer l's matrices `ks` (of `roles`) for t rows (made once): entry (k, r) = matrix
@@ -974,6 +1026,12 @@ impl Part {
     /// the experts whose copy is still on its way, the third the tickets of the last copy.
     #[allow(clippy::type_complexity)]
     fn ensure(&self, m: &Model, l: u64, need: &[u64], promote: bool) -> Result<(Vec<(DevBuf, bool)>, Vec<bool>, Option<(i64, i64)>)> {
+        if let Some((rl, buf, slot)) = &self.resident {
+            if *rl == l {
+                let v = need.iter().map(|&x| Ok((buf.view(x as usize * slot, *slot)?, true))).collect::<Result<Vec<_>>>()?;
+                return Ok((v, vec![false; need.len()], None));
+            }
+        }
         let mut c = self.experts.lock().unwrap();
         let c = &mut *c;
         if c.vowner.len() < need.len() {
@@ -1213,7 +1271,7 @@ impl<'g> Ds4<'g> {
     /// the parts in proportion to their layers. `kv`: (context, sessions) - their attention caches are held back from
     /// the expert store.
     pub fn load(file: &'g nextsycl_gguf::Gguf, gpus: &[Arc<Gpu>], expert_bytes: Option<usize>, mirror_bytes: Option<usize>, kv: (usize, usize),
-                log: &mut dyn FnMut(String)) -> Result<Ds4<'g>> {
+                draft: bool, log: &mut dyn FnMut(String)) -> Result<Ds4<'g>> {
         let t0 = Instant::now();
         let m = Model::open(file).map_err(e)?;
         let errs = m.check();
@@ -1262,7 +1320,8 @@ impl<'g> Ds4<'g> {
             let last = i + 1 == gpus.len();
             let share = mirror * (range.end - range.start) as usize / n as usize + spare;
             // per session and layer: the raw ring, and a compressed layer's blocks (fp16) and indexer keys (float32)
-            let reserve: usize = range.clone().map(|l| {
+            let mtp_here = (last && draft && g.n_mtp > 0).then_some(n);
+            let reserve: usize = range.clone().chain(mtp_here).map(|l| {
                 let r = g.ratio(l) as usize;
                 let mut b = raw_ring() * 512 * 2;
                 if r > 0 {
@@ -1276,7 +1335,7 @@ impl<'g> Ds4<'g> {
             if reserve > 0 {
                 log(format!("{}: {:.2} GiB held for the sessions' {} tokens", gpu.name, gib(reserve), kv.0 * kv.1));
             }
-            let part = Part::load(&m, gpu, range, last, expert_bytes, share, reserve, log)?;
+            let part = Part::load(&m, gpu, range, last, mtp_here, expert_bytes, share, reserve, log)?;
             spare = share.saturating_sub(part.host_slots * part.experts.lock().unwrap().slot_bytes);
             parts.push(part);
         }
@@ -1292,10 +1351,11 @@ impl<'g> Ds4<'g> {
             hash.insert(l, v);
         }
         let load_bytes = parts.iter().map(|p| p.weight_bytes).sum();
+        let mtp = (draft && g.n_mtp > 0).then_some(n);
         let gpu_prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "gpu");
         let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1" || v == "gpu").then(|| Mutex::new(BTreeMap::new()));
         Ok(Ds4 { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, hash, prof, gpu_prof, stamps: Mutex::new(Vec::new()),
-                 decoding: false.into() })
+                 decoding: false.into(), mtp })
     }
 
     pub fn gpu_info(&self) -> Vec<GpuInfo> {
@@ -1388,8 +1448,8 @@ impl<'g> Ds4<'g> {
     pub fn session(&self, max_ctx: usize) -> Result<Session> {
         let g = &self.m.g;
         let mut layers = Vec::new();
-        for l in 0..g.n_layer {
-            let gpu = &self.parts[self.owner[l as usize]].ops.gpu;
+        for l in 0..g.n_layer + u64::from(self.mtp.is_some()) {
+            let gpu = &self.parts[self.owner.get(l as usize).copied().unwrap_or(self.parts.len() - 1)].ops.gpu;
             let r = g.ratio(l) as usize;
             let raw = DevBuf::new(gpu, raw_ring() * 512 * 2)?;
             let comp = if r > 0 {
@@ -1410,7 +1470,14 @@ impl<'g> Ds4<'g> {
             };
             layers.push(Att { raw, comp });
         }
-        Ok(Session { pos: 0, max_ctx, layers, snapped: None })
+        let mtp = match self.mtp {
+            Some(_) => {
+                let gpu = &self.parts.last().unwrap().ops.gpu;
+                Some(MtpS { hid: DevBuf::f32(gpu, MTP_KEEP * 4 * g.n_embd as usize)?, rows: 0, slot0: 0, next: Vec::new() })
+            }
+            None => None,
+        };
+        Ok(Session { pos: 0, max_ctx, layers, snapped: None, mtp })
     }
 
     /// The raw ring's slots of the window before `pos` (at most 136 positions: (first byte, bytes) of up to two runs)
@@ -1498,6 +1565,10 @@ impl<'g> Ds4<'g> {
     pub fn reset_session(&self, sess: &mut Session) -> Result<()> {
         sess.pos = 0;
         sess.snapped = None;
+        if let Some(ms) = sess.mtp.as_mut() {
+            ms.rows = 0;
+            ms.next.clear();
+        }
         Ok(())
     }
 
@@ -1528,6 +1599,12 @@ impl<'g> Ds4<'g> {
         }
         dst.pos = src.pos;
         dst.snapped = None;
+        // the draft block's pending rows stay behind (its window's keys are copied: the ring is a layer's); the copy
+        // drafts again after its first pass
+        if let Some(ms) = dst.mtp.as_mut() {
+            ms.rows = 0;
+            ms.next.clear();
+        }
         Ok(())
     }
 
@@ -1781,7 +1858,7 @@ impl<'g> Ds4<'g> {
         for p in &self.parts {
             p.arena_for(rows)?;
         }
-        let Session { layers, pos, snapped, .. } = sess;
+        let Session { layers, pos, snapped, mtp, .. } = sess;
         let layers: &[Att] = layers;
         let start = *pos;
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(1);
@@ -1818,7 +1895,13 @@ impl<'g> Ds4<'g> {
                         x.write(0, &v)?;
                         Ok(x)
                     })?;
+                    if let Some(ms) = mtp.as_mut() {
+                        self.mtp_run(layers, ms, c[0], false, &mut *tap)?;
+                    }
                     let x = self.run_layers(layers, runs.1, x, at, c, &mut *tap)?;
+                    if let Some(ms) = mtp.as_mut() {
+                        self.mtp_keep(ms, &x, at, c)?;
+                    }
                     let l = self.head(&x, c.len(), 1, &mut *tap)?.pop().unwrap_or_default();
                     check_vram(&p1.ops.gpu)?;
                     Ok(l)
@@ -1858,6 +1941,9 @@ impl<'g> Ds4<'g> {
         if pos0 + t > sess.max_ctx {
             return Err(Error(format!("the context is {} tokens; {} more do not fit", sess.max_ctx, t)));
         }
+        if let Some(ms) = sess.mtp.as_mut() {
+            self.mtp_run(&sess.layers, ms, tokens[0], false, &mut *tap)?;
+        }
         let mut x = self.streams(tokens, &mut *tap)?;
         let mut staging = Vec::new();
         for (k, run) in self.runs().into_iter().enumerate() {
@@ -1865,6 +1951,9 @@ impl<'g> Ds4<'g> {
                 x = self.to_part(run.0, &x, &mut staging)?;
             }
             x = self.run_layers(&sess.layers, run, x, pos0, tokens, &mut *tap)?;
+        }
+        if let Some(ms) = sess.mtp.as_mut() {
+            self.mtp_keep(ms, &x, pos0, tokens)?;
         }
         let out = self.head(&x, t, n_out, &mut *tap)?;
         sess.pos += t;
@@ -1998,7 +2087,17 @@ impl<'g> Ds4<'g> {
     /// The head after the last layer (`x` [t, 4, d], on the last part) for the last `n_out` rows: the streams by the
     /// head's mHC weights, the norm, the output matrix
     fn head(&self, x: &DevBuf, t: usize, n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
+        self.head_of(x, t, n_out, None, tap)
+    }
+
+    /// The head: the main model's mHC weights and norm, or (`mtp`: its layer) the draft block's own; the output
+    /// matrix is shared
+    fn head_of(&self, x: &DevBuf, t: usize, n_out: usize, mtp: Option<u64>, tap: Tap) -> Result<Vec<Vec<f32>>> {
         let g = &self.m.g;
+        let (hl, r_fn, r_scale, r_base, r_norm) = match mtp {
+            Some(ml) => (ml, Role::MtpHcFn, Role::MtpHcScale, Role::MtpHcBase, Role::MtpNorm),
+            None => (0, Role::HeadHcFn, Role::HeadHcScale, Role::HeadHcBase, Role::OutputNorm),
+        };
         let (d, eps) = (g.n_embd as usize, g.rms_eps as f32);
         let p = self.parts.last().unwrap();
         let o = &p.ops;
@@ -2007,14 +2106,14 @@ impl<'g> Ds4<'g> {
         let xv = x.view((t - n_out) * 4 * d * 4, n_out * 4 * d * 4)?;
         let flat = p.arena.f32(n_out * 4 * d)?;
         o.rms_norm(&xv, None, &flat, n_out, 4 * d, eps)?;
-        let w = p.mat(0, Role::HeadHcFn)?;
+        let w = p.mat(hl, r_fn)?;
         let mixes = p.arena.f32(n_out * 4)?;
         p.matmul(w, n_out, (&flat, 0, w.cols), (&mixes, 0, w.rows), false)?;
         let h = p.arena.f32(n_out * d)?;
-        o.hc_head(&mixes, p.vec(0, Role::HeadHcScale)?, p.vec(0, Role::HeadHcBase)?, &xv, &h, n_out, d, g.hc_eps as f32)?;
-        tap("hc_head", &h)?;
+        o.hc_head(&mixes, p.vec(hl, r_scale)?, p.vec(hl, r_base)?, &xv, &h, n_out, d, g.hc_eps as f32)?;
+        tap(if mtp.is_some() { "mtp_hc_head" } else { "hc_head" }, &h)?;
         let out = p.arena.f32(n_out * d)?;
-        o.rms_norm(&h, Some(p.vec(0, Role::OutputNorm)?), &out, n_out, d, eps)?;
+        o.rms_norm(&h, Some(p.vec(hl, r_norm)?), &out, n_out, d, eps)?;
         tap("result_norm", &out)?;
         let logits = p.mm(0, Role::Output, &out, n_out)?;
         tap("result_output", &logits)?;
@@ -2127,15 +2226,76 @@ impl<'g> Ds4<'g> {
             return Err(Error(format!("rollback: keep {keep} of {t} rows")));
         }
         sess.pos = pos0 + keep;
+        if let Some(ms) = sess.mtp.as_mut() {
+            // the pass's rows were all kept (fewer than MTP_KEEP): the first `keep` stay pending
+            ms.rows = ms.rows.min(keep);
+            ms.next.truncate(ms.rows.saturating_sub(1));
+        }
         Ok(())
     }
 
-    pub fn decoder(&self, logits: Vec<f32>) -> Decoder {
-        Decoder { logits, next: None, look: None, ng_drafted: 0, ng_accepted: 0 }
+    /// The last pass's final streams x [t, 4, d] (on the last part) for the draft block: its last MTP_KEEP rows
+    /// pending, each with the token after it (the last's comes with `mtp_run`)
+    fn mtp_keep(&self, ms: &mut MtpS, x: &DevBuf, pos0: usize, tokens: &[u32]) -> Result<()> {
+        let d = self.m.g.n_embd as usize;
+        let t = tokens.len();
+        let k = t.min(MTP_KEEP);
+        let p = self.parts.last().unwrap();
+        p.ops.kcopy(&ms.hid, 0, x, (t - k) * 4 * d * 4, k * 4 * d * 4)?;
+        ms.rows = k;
+        ms.slot0 = pos0 + t - k;
+        ms.next = tokens[t - k + 1..].to_vec();
+        Ok(())
     }
 
-    pub fn decoder_after(&self, next: u32) -> Decoder {
-        Decoder { logits: Vec::new(), next: Some(next), look: None, ng_drafted: 0, ng_accepted: 0 }
+    /// The draft block over its pending rows, each with the token that follows it (`next` for the last): its
+    /// window's keys at their positions written; with `head`, the draft logits after the last row. The block (V4's
+    /// MTPBlock): x = e_proj(enorm(embed(next))) on every stream + h_proj(hnorm(the streams)), one layer with its
+    /// mHC (window-only attention, its MoE), then its own mHC head and norm into the shared output matrix.
+    fn mtp_run(&self, layers: &[Att], ms: &mut MtpS, next: u32, head: bool, tap: Tap) -> Result<Option<Vec<f32>>> {
+        let Some(ml) = self.mtp else { return Ok(None) };
+        if ms.rows == 0 {
+            return Ok(None);
+        }
+        let g = &self.m.g;
+        let (n, d, eps) = (ms.rows, g.n_embd as usize, g.rms_eps as f32);
+        let mut toks = std::mem::take(&mut ms.next);
+        toks.push(next);
+        let slot0 = ms.slot0;
+        ms.rows = 0;
+        let pi = self.parts.len() - 1;
+        let p = &self.parts[pi];
+        let o = &p.ops;
+        let m0 = self.mark(p);
+        p.arena.reset();
+        let emb = self.embed(p, &toks)?;
+        let en = p.arena.f32(n * d)?;
+        o.rms_norm(&emb, Some(p.vec(ml, Role::MtpENorm)?), &en, n, d, eps)?;
+        let hn = p.arena.f32(n * 4 * d)?;
+        o.rms_norm(&ms.hid.view(0, n * 4 * d * 4)?, Some(p.vec(ml, Role::MtpHNorm)?), &hn, n * 4, d, eps)?;
+        let pe = p.mm(ml, Role::MtpEProj, &en, n)?;
+        let ph = p.mm(ml, Role::MtpHProj, &hn, n * 4)?;
+        let x = DevBuf::f32(&o.gpu, n * 4 * d)?;
+        o.kcopy(&x, 0, &ph, 0, n * 4 * d * 4)?;
+        for r in 0..n {
+            for s in 0..4 {
+                o.add(&x.view((r * 4 + s) * d * 4, d * 4)?, &pe.view(r * d * 4, d * 4)?, d)?;
+            }
+        }
+        tap("mtp_in", &x)?;
+        let y = self.run_layers(layers, (pi, ml, ml + 1), x, slot0, &toks, &mut *tap)?;
+        let out = if head { self.head_of(&y, n, 1, Some(ml), &mut *tap)?.pop() } else { None };
+        self.lap(p, "MTP draft", m0);
+        Ok(out)
+    }
+
+    pub fn decoder(&self, logits: Vec<f32>, draft: bool) -> Decoder {
+        Decoder { logits, next: None, look: None, ng_drafted: 0, ng_accepted: 0, draft: None, mtp: draft && self.mtp.is_some(), drafted: 0, accepted: 0 }
+    }
+
+    pub fn decoder_after(&self, next: u32, draft: bool) -> Decoder {
+        Decoder { logits: Vec::new(), next: Some(next), look: None, ng_drafted: 0, ng_accepted: 0, draft: None, mtp: draft && self.mtp.is_some(), drafted: 0,
+                  accepted: 0 }
     }
 
     /// The next committed token(s): one, or more when prompt-lookup drafts (NS_NGRAM) are accepted - each exactly when
@@ -2171,6 +2331,20 @@ impl<'g> Ds4<'g> {
             }
             let tail = *out.last().unwrap();
             (out, tail)
+        } else if let (Some(x), Some(d)) = (dec.next, dec.draft.take().filter(|_| dec.mtp && sess.pos + 2 <= sess.max_ctx)) {
+            // the draft verified with the token: [x, d] in one pass, d kept exactly when the token drawn for its
+            // position is d (what is committed is distributed as plain sampling would be)
+            let rows = self.forward_rows(sess, &[x, d], 2, &mut *tap)?;
+            let y0 = smp.sample(&rows[0]);
+            dec.drafted += 1;
+            if y0 == d {
+                dec.accepted += 1;
+                let y1 = smp.sample(&rows[1]);
+                (vec![d, y1], y1)
+            } else {
+                self.rollback(sess, 1)?;
+                (vec![y0], y0)
+            }
         } else {
             if let Some(x) = dec.next.take() {
                 dec.logits = self.forward(sess, &[x], &mut *tap)?;
@@ -2183,6 +2357,11 @@ impl<'g> Ds4<'g> {
                 l.push(t);
             }
         }
+        // the next draft: the draft block's argmax after the committed token
+        dec.draft = match (dec.mtp, sess.mtp.as_mut()) {
+            (true, Some(ms)) => self.mtp_run(&sess.layers, ms, tail, true, &mut *tap)?.map(|l| argmax(&l)),
+            _ => None,
+        };
         dec.next = Some(tail);
         Ok(out)
     }
@@ -2197,7 +2376,7 @@ impl<'g> Ds4<'g> {
         let lim = g.swiglu_limit as f32;
         let logits = self.timed(p, "router", || p.mm(l, Role::Router, x, t))?;
         let pf = prefetch_limit();
-        let guess = if t <= MMVQ_COLS && pf > 0 && !g.is_hash(l + 1) && p.mat(l + 1, Role::Router).is_ok() {
+        let guess = if t <= MMVQ_COLS && pf > 0 && !g.is_hash(l + 1) && !g.is_mtp(l + 1) && p.mat(l + 1, Role::Router).is_ok() {
             Some(p.mm(l + 1, Role::Router, x, t)?)
         } else {
             None
@@ -2380,13 +2559,14 @@ impl<'g> Ds4<'g> {
             // clamped SwiGLU, every down in one - the resident experts first, then the ones being swapped in
             if t <= MMVQ_COLS && std::env::var("NS_DS4_MULTI").map_or(true, |v| v != "0") && parts.gate.2 == parts.up.2 && o.multi_supported(parts.gate.2.code(), d) && o.multi_supported(parts.down.2.code(), f) {
                 let lists: Vec<&Vec<(i32, f32)>> = by.values().collect();
+                let ids: Vec<usize> = by.keys().copied().collect();
                 let (now, later): (Vec<usize>, Vec<usize>) = (0..lists.len()).partition(|&k| !arriving[k]);
                 let xq = p.arena.bytes(o.q8_bytes(d, t))?;
                 o.quantize_q8((x, 0), &xq, d, t)?;
                 let dn = p.arena.f32(total * d)?;
                 let gu = p.arena.f32(2 * total * f)?;
-                // the entries in launch order: (token, weight) per row of dn
-                let mut rows: Vec<(i32, f32)> = Vec::with_capacity(total);
+                // the entries in launch order: (token, weight, expert) per row of dn
+                let mut rows: Vec<(i32, f32, usize)> = Vec::with_capacity(total);
                 for (set, wait) in [(&now, false), (&later, true)] {
                     let n: usize = set.iter().map(|&k| lists[k].len()).sum();
                     if n == 0 {
@@ -2406,7 +2586,7 @@ impl<'g> Ds4<'g> {
                             pu.push(base + parts.up.0 as u64);
                             pd.push(base + parts.down.0 as u64);
                             tk.push(ti);
-                            rows.push((ti, w));
+                            rows.push((ti, w, ids[k]));
                         }
                     }
                     // gate | up: 2n entries (the gates, then the ups, each against its token); down: n against h's rows
@@ -2442,12 +2622,14 @@ impl<'g> Ds4<'g> {
                 let mut t_ptr = vec![0i32];
                 let mut ent = Vec::with_capacity(total);
                 let mut wv = Vec::with_capacity(total);
+                // a token's experts summed in expert order, whichever were resident: the same sum as any other pass of
+                // that token (a verify row is the one-row pass's, bit for bit)
                 for ti in 0..t as i32 {
-                    for (r, &(rt, w)) in rows.iter().enumerate() {
-                        if rt == ti {
-                            ent.push(r as i32);
-                            wv.push(w);
-                        }
+                    let mut mine: Vec<(usize, usize, f32)> = rows.iter().enumerate().filter(|(_, e)| e.0 == ti).map(|(r, e)| (e.2, r, e.1)).collect();
+                    mine.sort_unstable_by_key(|e| e.0);
+                    for (_, r, w) in mine {
+                        ent.push(r as i32);
+                        wv.push(w);
                     }
                     t_ptr.push(ent.len() as i32);
                 }

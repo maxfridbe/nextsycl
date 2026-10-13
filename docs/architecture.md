@@ -191,6 +191,13 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   fp16, its scores on XMX). The passes' small tables go up and the routers'
   logits come down through pinned rings copied by kernels (the runtime's memcpy waits behind the expert copies on
   the copy engine), and the shared expert runs while the host routes; the layers split by the cards' speed.
+  MTP: the original checkpoint's draft block (its last shard; unsloth's GGUFs leave it out) converted after the pull
+  (`llm prepare`, mtp.rs: the FP4 experts losslessly MXFP4, the FP8 matrices Q8_0) into a sidecar opened as a further
+  shard - block 43, window-only attention and its own mHC head, its experts resident on the last card. It runs over
+  each pass's last 136 rows (a key needs only its row; the window is 128), drafts one token, and `step` verifies it
+  with the next in a 2-row pass that is bit for bit two one-row passes (attention splits by a row's own cells, a
+  token's experts summed in expert order): spec-check 0 difference, the same text with and without. 64-93% of the
+  drafts accepted; B70 + B65 +8-16% (26 tok/s at 3.7K).
 
 ## The audio engines
 

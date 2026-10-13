@@ -415,6 +415,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS4_DENSE_F16_MIN` | 64 | dense products of at least this many rows in fp16 on XMX (0: never; the experts keep NS_PROMPT_F16_MIN) | llm deepseek4 |
 | `NS_DS4_ATTN_XMX` | on | 0: attention on the vector units (the first kernel) instead of XMX | kernels:llm deepseek4 |
 | `NS_DS4_ATTN_G` | 8 from 64 rows, else 2 | Experiment: groups of 8 heads an attention work-group takes (1, 2, 4, 8) | kernels:llm deepseek4 |
+| `NS_DS4_IDX_FUSED` | on | 0: decode's indexer as a GEMM, a score pass and one radix select a row instead of the fused score kernel and two-level top-k | llm deepseek4 |
 | `NS_DS4_MULTI_CACHED` | on | 0: the IQ experts' multi-matrix kernel loads each row's activations again instead of holding them over a sub-group's run of rows | kernels:llm deepseek4 |
 | `NS_DS4_MULTI_DENSE` | on | 0: decode's dense products of one input a launch a matrix (shared kernels) instead of one multi-matrix launch a type | llm deepseek4 |
 | `NS_DS4_MULTI_GROUPS` | 1024 | Experiment: work-groups of the multi-expert decode kernels | kernels:llm deepseek4 |

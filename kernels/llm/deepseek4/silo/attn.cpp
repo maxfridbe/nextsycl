@@ -284,14 +284,14 @@ void attend_merge(sycl::queue& queue, const float* part, const float* sinks, flo
     });
 }
 
-// the partials' memory, a GPU's: kept for the process (sized for the most a decode pass asks: rows x splits <= 64, 64 heads)
+// the partials' memory, a GPU's: kept for the process (the most a decode pass asks: 8 rows x 64 splits x 64 heads)
 float* part_buf(ns_gpu* g, size_t floats) {
     static std::mutex mu;
     static std::vector<std::pair<ns_gpu*, std::pair<float*, size_t>>> bufs;
     std::lock_guard<std::mutex> lk(mu);
     for (auto& b : bufs)
         if (b.first == g) return b.second.second >= floats ? b.second.first : nullptr;
-    const size_t cap = std::max<size_t>(floats, (size_t) 64 * 64 * PS + (size_t) 8 * 64 * 512 / 2);
+    const size_t cap = std::max<size_t>(floats, (size_t) 8 * 64 * 64 * PS + (size_t) 8 * 64 * 512 / 2);
     float* p = sycl::malloc_device<float>(cap, g->q);
     bufs.push_back({g, {p, cap}});
     return p;
@@ -315,23 +315,37 @@ int ns_ds4_attend_xmx(ns_gpu* g, const float* q, const uint16_t* raw, int64_t R,
     // decode rows (at most 8): 8 heads a work-group, the cells in splits (~256 work-groups, 32..: at most 32 splits)
     static const bool split = [] { const char* v = getenv("NS_DS4_ATTN_SPLIT"); return !v || v[0] != '0'; }();
     if (split && T <= 8) {
-        const int64_t last = pos0 + T - 1;
-        const int64_t vis = comp ? (last + 1) / ratio : 0;
-        const int64_t maxn = sycl::min<int64_t>(window, last + 1) + (sel && vis > K ? K : vis);
-        // splits of 32 cells (B70 + B65 at 3.7K, decode's attention: 16 cells 4.7 ms a token, 32 4.3, 128 9.0), at
-        // most 64 a row and 64 x rows in all (the partials' buffer)
-        const int64_t ns_max = std::max<int64_t>(8, 64 / T);
+        // a row's split size from its own cells alone (at most 64 splits, at least 32 cells - B70 + B65 at 3.7K: 16
+        // cells 4.7 ms a token, 32 4.3, 128 9.0): a verify pass's row then sums as the one-row pass at its position
+        // does, bit for bit. Rows whose sizes differ run a launch each.
         static const int64_t force_kb = [] { const char* v = getenv("NS_DS4_ATTN_KB"); return v ? (int64_t) atoi(v) : (int64_t) 0; }();
-        int64_t kb = std::max<int64_t>(force_kb > 0 ? force_kb : 2 * DS4_ATTN_CH_DEC, (maxn + ns_max - 1) / ns_max);
-        kb = (kb + DS4_ATTN_CH_DEC - 1) / DS4_ATTN_CH_DEC * DS4_ATTN_CH_DEC;
-        const int64_t ns = (maxn + kb - 1) / kb;
+        auto cells = [&](int64_t p) {
+            const int64_t vis = comp ? (p + 1) / ratio : 0;
+            return sycl::min<int64_t>(window, p + 1) + (sel && vis > K ? K : vis);
+        };
+        auto kb_of = [&](int64_t n) {
+            int64_t kb = std::max<int64_t>(force_kb > 0 ? force_kb : 2 * DS4_ATTN_CH_DEC, (n + 63) / 64);
+            return (kb + DS4_ATTN_CH_DEC - 1) / DS4_ATTN_CH_DEC * DS4_ATTN_CH_DEC;
+        };
+        bool same = true;
+        for (int64_t r = 1; r < T; ++r) same = same && kb_of(cells(pos0 + r)) == kb_of(cells(pos0));
         // one buffer: the partials, then the fp16 queries
-        float* part = part_buf(g, (size_t) (T * H * ns) * PS + (size_t) T * H * 512 / 2);
+        float* part = part_buf(g, (size_t) 8 * 64 * 64 * PS + (size_t) 8 * 64 * 512 / 2);
         if (!part) return ns_fail("ns_ds4_attend_xmx: the partials' buffer is too small");
-        half* qh = reinterpret_cast<half*>(part + (size_t) 64 * 64 * PS);
-        attend_q16(g->q, q, qh, T * H * 512, scale * LOG2E);
-        attend_xmx<1, true, DS4_ATTN_CH_DEC>(g->q, q, r16, R, c16, ratio, sel, K, sinks, out, T, H, pos0, window, scale, kb, ns, part, qh);
-        attend_merge(g->q, part, sinks, out, T, H, pos0, window, ratio, comp != nullptr, sel != nullptr, K, kb, ns);
+        half* qh = reinterpret_cast<half*>(part + (size_t) 8 * 64 * 64 * PS);
+        auto launch = [&](int64_t r0, int64_t rows) {
+            const int64_t kb = kb_of(cells(pos0 + r0 + rows - 1));
+            const int64_t ns = (cells(pos0 + r0 + rows - 1) + kb - 1) / kb;
+            const float* qr = q + r0 * H * 512;
+            float* outr = out + r0 * H * 512;
+            const int32_t* selr = sel ? sel + r0 * K : nullptr;
+            attend_q16(g->q, qr, qh, rows * H * 512, scale * LOG2E);
+            attend_xmx<1, true, DS4_ATTN_CH_DEC>(g->q, qr, r16, R, c16, ratio, selr, K, sinks, outr, rows, H, pos0 + r0, window, scale, kb, ns, part, qh);
+            attend_merge(g->q, part, sinks, outr, rows, H, pos0 + r0, window, ratio, comp != nullptr, sel != nullptr, K, kb, ns);
+        };
+        if (same) launch(0, T);
+        else
+            for (int64_t r = 0; r < T; ++r) launch(r, 1);
         return 0;
     }
     static const int force = [] { const char* v = getenv("NS_DS4_ATTN_G"); return v ? atoi(v) : 0; }();

@@ -56,7 +56,7 @@ pub const OPTIONS: &[EngineOption] = &[
 /// This engine's registry entry
 pub fn kind() -> EngineKind {
     EngineKind { archs: &["qwen4exp"], name: "Qwen3.8-Flash-Next (Gated DeltaNet + QSA, hyper-connections, PLE, 512 experts)", load, info: tools::info,
-                 kernels: None, chat: nextsycl_tok::qwen_chat, options: OPTIONS }
+                 kernels: None, chat: nextsycl_tok::qwen_chat, options: OPTIONS, prepare: None }
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {

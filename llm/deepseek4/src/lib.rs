@@ -10,6 +10,7 @@ pub const ARCH: &str = "deepseek4";
 pub mod engine;
 pub mod ffi;
 pub mod model;
+pub mod mtp;
 pub mod ops;
 pub mod tools;
 
@@ -54,11 +55,20 @@ pub const OPTIONS: &[EngineOption] = &[
 /// This engine's registry entry
 pub fn kind() -> EngineKind {
     EngineKind { archs: &["deepseek4"], name: "DeepSeek-V4 (a window of raw keys + compressed blocks with a lightning indexer, mHC, 256 experts)", load,
-                 info: tools::info, kernels: Some(tools::kernels), chat: nextsycl_tok::deepseek4_chat, options: OPTIONS }
+                 info: tools::info, kernels: Some(tools::kernels), chat: nextsycl_tok::deepseek4_chat, options: OPTIONS, prepare: Some(mtp::prepare) }
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {
-    Ok(Box::new(engine::Ds4::load(f, gpus, o.expert_bytes, o.mirror_bytes, o.kv, log)?))
+    // with a draft asked for and the sidecar there, the model again with it as a further shard (held for the process)
+    let side = f.paths.first().and_then(|p| p.parent()).map(|d| d.join(mtp::SIDECAR)).filter(|p| p.is_file());
+    let f: &'g Gguf = match (o.draft, side) {
+        (true, Some(s)) if f.tensor("blk.43.nextn.e_proj.weight").is_none() => {
+            log(format!("deepseek4: the draft block from {}", s.display()));
+            Box::leak(Box::new(Gguf::open_with(&f.paths[0], &[s]).map_err(|e| nextsycl_core::Error(e.0))?))
+        }
+        _ => f,
+    };
+    Ok(Box::new(engine::Ds4::load(f, gpus, o.expert_bytes, o.mirror_bytes, o.kv, o.draft, log)?))
 }
 
 // ---- the contract's opaque handles over this engine's own types
@@ -80,7 +90,7 @@ impl SessionState for engine::Session {
 
 impl DecoderState for engine::Decoder {
     fn drafts(&self) -> (u64, u64) {
-        (0, 0)
+        (self.drafted, self.accepted)
     }
     fn lookup_drafts(&self) -> (u64, u64) {
         (self.ng_drafted, self.ng_accepted)
@@ -129,17 +139,17 @@ impl Engine for engine::Ds4<'_> {
         self.load_bytes
     }
     fn has_draft(&self) -> bool {
-        false
+        self.mtp.is_some()
     }
     fn prefill_chunk(&self) -> usize {
         engine::prefill_chunk()
     }
     fn max_verify(&self) -> usize {
         // the prompt-lookup drafts' pass (NS_NGRAM)
-        (engine::ngram_k() + 1).min(engine::MAX_VERIFY)
+        (engine::ngram_k() + 1).max(if self.mtp.is_some() { 2 } else { 1 }).min(engine::MAX_VERIFY)
     }
     fn cache_fingerprint(&self) -> String {
-        format!("deepseek4 raw-ring={} nsd41", engine::raw_ring())
+        format!("deepseek4 raw-ring={} nsd42{}", engine::raw_ring(), if self.mtp.is_some() { " mtp" } else { "" })
     }
 
     fn session(&self, max_ctx: usize) -> Result<Session> {
@@ -172,11 +182,11 @@ impl Engine for engine::Ds4<'_> {
         engine::Ds4::forward_batch(self, &mut own, tokens, tap)
     }
 
-    fn decoder(&self, logits: Vec<f32>, _draft: bool) -> Decoder {
-        Decoder::new(engine::Ds4::decoder(self, logits))
+    fn decoder(&self, logits: Vec<f32>, draft: bool) -> Decoder {
+        Decoder::new(engine::Ds4::decoder(self, logits, draft))
     }
-    fn decoder_after(&self, next: u32, _draft: bool) -> Decoder {
-        Decoder::new(engine::Ds4::decoder_after(self, next))
+    fn decoder_after(&self, next: u32, draft: bool) -> Decoder {
+        Decoder::new(engine::Ds4::decoder_after(self, next, draft))
     }
     fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
         let d = d.get_mut::<engine::Decoder>().ok_or_else(|| nextsycl_core::Error("a decoder of another engine".into()))?;

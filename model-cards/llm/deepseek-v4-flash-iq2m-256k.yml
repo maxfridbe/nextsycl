@@ -15,4 +15,5 @@ files:
   model: deepseek-v4-flash-ud-iq2m-1
   shard-2: deepseek-v4-flash-ud-iq2m-2
   shard-3: deepseek-v4-flash-ud-iq2m-3
+  mtp-source: deepseek-v4-flash-mtp-source
 guide: guides/chat.md

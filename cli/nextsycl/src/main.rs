@@ -90,6 +90,7 @@ language models (nextsycl llm ...; the names without `llm` still work):
   nextsycl llm spec-check <model.gguf> --prompt TEXT [--n N] [--rows R (2..5)] [--gpu 0,1]
                                 verify passes against one-token decode, logits compared
   nextsycl llm kernels <model.gguf> [--gpu N]   each weight type's decode kernel against the exact path
+  nextsycl llm prepare <model.gguf>             the files its engine makes beside it (deepseek4: the MTP sidecar)
 
 images (nextsycl image ...):
   nextsycl image engines        the architectures this build serves (gen, edit, start, serve come with the first)
@@ -800,6 +801,14 @@ fn llm(cfg: &nextsycl_models::Config, args: &[String]) -> Result<(), String> {
         Some("generate") => generate(args),
         Some("spec-check") => spec_check(args),
         Some("batch-check") => batch_check(args),
+        // the files an engine makes beside a model (as after a pull: deepseek4's draft block from its shard)
+        Some("prepare") if args.len() == 2 => {
+            let f = Gguf::open(Path::new(&args[1])).map_err(|e| e.0)?;
+            match nextsycl_llm::kind_for(&engines(), &f)?.prepare {
+                Some(p) => p(&f),
+                None => Ok(()),
+            }
+        }
         Some("kernels") if args.len() >= 2 => {
             let gpu = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0);
             kernels(Path::new(&args[1]), gpu)
@@ -886,7 +895,14 @@ fn main() -> ExitCode {
         Some("audio") => audio::cmd(&cfg, &args[1..], |r| selftest("audio", r, nextsycl_audio_example::selftest)),
         // the llm commands' names from before the kinds (nextsycl start = nextsycl llm start, ...)
         Some("start") => service::start(&cfg, rest),
-        Some("models") => models::cmd(&cfg, rest, &|g: &Gguf| nextsycl_llm::kind_for(&engines(), g).map(|k| k.name.to_string())),
+        Some("models") => models::cmd(&cfg, rest, &|g: &Gguf| {
+            let all = engines();
+            let k = nextsycl_llm::kind_for(&all, g)?;
+            if let Some(p) = k.prepare {
+                p(g)?;
+            }
+            Ok(k.name.to_string())
+        }),
         Some("stop") => service::stop(&cfg),
         Some("logs") => service::logs(&cfg, rest),
         Some("status") => client::status(rest),
