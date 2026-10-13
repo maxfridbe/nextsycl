@@ -225,6 +225,9 @@ impl Engine for engine::Ds4<'_> {
         v.push(format!("[host waited {:.2} s for the routers' logits, chose the experts in {:.2} s]",
                        engine::ROUTER_WAIT_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9,
                        engine::ROUTE_HOST_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9));
+        if let Some((hits, misses)) = engine::Ds4::draft_stats(self) {
+            v.push(format!("[draft experts: {hits} in VRAM, {misses} left out]"));
+        }
         for (i, (peak, spills)) in engine::Ds4::arena_peaks(self).iter().enumerate() {
             v.push(format!("[arena {i}: peak {:.2} GiB, {spills} request(s) past it]", *peak as f64 / (1u64 << 30) as f64));
         }

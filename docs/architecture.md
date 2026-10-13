@@ -193,7 +193,10 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   the copy engine), and the shared expert runs while the host routes; the layers split by the cards' speed.
   MTP: the original checkpoint's draft block (its last shard; unsloth's GGUFs leave it out) converted after the pull
   (`llm prepare`, mtp.rs: the FP4 experts losslessly MXFP4, the FP8 matrices Q8_0) into a sidecar opened as a further
-  shard - block 43, window-only attention and its own mHC head, its experts resident on the last card. It runs over
+  shard - block 43, window-only attention and its own mHC head, on the last card. Its 256 MXFP4 experts are 3.2 GiB, so
+  only the most recently used 128 stay in VRAM: one not there is left out of that draft (verification is exact; ~3
+  points of acceptance) and a reader thread brings it from the file through pinned staging for the passes after. With
+  a 256K reserve that keeps ~200 main experts off the file tier: 23.6 -> 24.7 tok/s. It runs over
   each pass's last 136 rows (a key needs only its row; the window is 128), drafts one token, and `step` verifies it
   with the next in a 2-row pass that is bit for bit two one-row passes (attention splits by a row's own cells, a
   token's experts summed in expert order): spec-check 0 difference, the same text with and without. 64-93% of the

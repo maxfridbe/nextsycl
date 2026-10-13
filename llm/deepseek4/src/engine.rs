@@ -7,7 +7,7 @@
 //! the same way); the attention is this model's own: a ring of the last raw keys per layer, the compressed blocks'
 //! caches (and the indexer's) built by the compressors as their blocks complete, ds4.h's attention over both.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -388,9 +388,81 @@ pub struct Part {
     oa_tabs: Mutex<HashMap<(u64, usize), Arc<DevBuf>>>,
     /// the dense matrices' multi-matrix tables (mm_many), by layer, rows and matrices
     multi_tabs: Mutex<HashMap<String, Arc<DevBuf>>>,
-    /// the draft block's experts, all resident in VRAM (layer, [n_expert slots of its own layout], a slot's bytes):
-    /// its MXFP4 experts are near twice the IQ2 layers', and the store has one slot size
-    resident: Option<(u64, DevBuf, usize)>,
+    /// the draft block's experts (their own slots: its MXFP4 experts are near twice the IQ2 layers', and the store
+    /// has one slot size)
+    draft: Option<Mutex<Draft>>,
+}
+
+/// The draft block's experts in VRAM: the most recently used `NS_DS4_MTP_EXPERTS` of them (all would be 3.2 GiB the
+/// main layers' experts lose). An expert not here is left out of that draft pass (the draft is only a guess and the
+/// verification exact: keeping 128 costs ~3 points of acceptance, 64 ~6) and read in for the passes after: a reader
+/// thread from the file into a pinned staging slot, then a copy into the least recently used slot.
+struct Draft {
+    l: u64,
+    buf: DevBuf,
+    /// a slot's bytes
+    slot: usize,
+    owner: Vec<Option<u64>>,
+    used: Vec<u64>,
+    at: HashMap<u64, usize>,
+    /// the copy still filling a slot
+    fill: HashMap<usize, i64>,
+    /// the experts being read, and the staging slots: free, or the copy last reading it
+    reading: HashSet<u64>,
+    stage_free: Vec<bool>,
+    stage_tk: Vec<Option<i64>>,
+    jobs: Option<std::sync::mpsc::Sender<(u64, usize)>>,
+    done: std::sync::mpsc::Receiver<(u64, usize, std::result::Result<(), String>)>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    /// last: the reader writes into it
+    stage: HostBuf,
+    tick: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl Drop for Draft {
+    fn drop(&mut self) {
+        // the reader done with the staging memory before it goes
+        self.jobs.take();
+        if let Some(h) = self.reader.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// NS_DS4_MTP_EXPERTS: the draft block's experts kept in VRAM (default 128 of 256)
+fn mtp_experts() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS4_MTP_EXPERTS").ok().and_then(|v| v.parse().ok()).unwrap_or(128))
+}
+
+/// the draft block's staging slots: its experts being read at once, at most
+const STAGE_SLOTS: usize = 8;
+
+/// The reader of the draft block's experts: expert `ex` of `parts` (file, its first expert's offset, an expert's
+/// bytes, where in the slot) into staging slot k of `stage` (its address and slot bytes), told back on `done`
+fn draft_reader(parts: Vec<(std::path::PathBuf, u64, usize, usize)>, stage: usize, slot: usize, jobs: std::sync::mpsc::Receiver<(u64, usize)>,
+                done: std::sync::mpsc::Sender<(u64, usize, std::result::Result<(), String>)>) {
+    use std::os::unix::fs::FileExt;
+    let mut files: HashMap<std::path::PathBuf, std::fs::File> = HashMap::new();
+    while let Ok((ex, k)) = jobs.recv() {
+        let r = (|| -> std::result::Result<(), String> {
+            for (path, off, n, at) in &parts {
+                if !files.contains_key(path) {
+                    files.insert(path.clone(), std::fs::File::open(path).map_err(|x| format!("{}: {x}", path.display()))?);
+                }
+                // SAFETY: staging slot k is this reader's until it says so on `done` (the engine sends no copy of it
+                // meanwhile), and the memory outlives the reader (Draft joins it first).
+                let dst = unsafe { std::slice::from_raw_parts_mut((stage + k * slot + at) as *mut u8, *n) };
+                files[path].read_exact_at(dst, off + ex * *n as u64).map_err(|x| format!("{}: {x}", path.display()))?;
+            }
+            Ok(())
+        })();
+        if done.send((ex, k, r)).is_err() {
+            break;
+        }
+    }
 }
 
 /// the pinned rings' sizes
@@ -694,9 +766,10 @@ impl Part {
         let moe: Vec<u64> = layers.clone().collect();
         let n_exp = moe.len() * g.n_expert as usize;
         let slot_bytes = moe.iter().map(|l| m.expert_bytes(*l) as usize).max().unwrap_or(256).next_multiple_of(256);
-        // the draft block's experts, resident: [gate | up | down] an expert, as a slot
+        // the draft block's experts: [gate | up | down] an expert, as a slot
         let mtp_slot = mtp.map_or(0, |ml| (m.expert_bytes(ml) as usize).next_multiple_of(256));
-        let mtp_bytes = mtp_slot * g.n_expert as usize;
+        let mtp_n = mtp_experts().clamp(g.n_expert_used as usize, g.n_expert as usize);
+        let mtp_bytes = mtp_slot * mtp_n;
         let budget = match expert_bytes {
             Some(b) => b,
             // what is free less the arena, the forward pass's own buffers, and the sessions' attention caches - sized
@@ -706,17 +779,30 @@ impl Part {
                 (f as usize).saturating_sub(pass + arena_bytes().max(1 << 30) + SMALL_ARENA + kv_reserve + mtp_bytes)
             }),
         };
-        let resident = match mtp {
+        let draft = match mtp {
             Some(ml) => {
                 let buf = DevBuf::new(gpu, mtp_bytes)?;
                 let lp = expert_parts(m, ml)?;
                 let mut host = vec![0u8; mtp_slot];
-                for ex in 0..g.n_expert {
+                for ex in 0..mtp_n as u64 {
                     read_expert(m, ml, ex, &lp, &mut host)?;
                     buf.write(ex as usize * mtp_slot, &host)?;
                 }
-                log(format!("{}: the draft block (layer {ml}): its {} experts resident ({:.2} GiB)", gpu.name, g.n_expert, gib(mtp_bytes)));
-                Some((ml, buf, mtp_slot))
+                let stage = HostBuf::new(gpu, STAGE_SLOTS * mtp_slot)?;
+                let src = [(Role::ExpGate, lp.gate), (Role::ExpUp, lp.up), (Role::ExpDown, lp.down)].iter().map(|(r, (at, n, _))| {
+                    let t = m.tensor(ml, *r).ok_or_else(|| Error(format!("block {ml}: {r:?} missing")))?;
+                    Ok((m.file.paths[t.shard].clone(), t.offset, *n, *at))
+                }).collect::<Result<Vec<_>>>()?;
+                let (jobs, rx) = std::sync::mpsc::channel();
+                let (tx, done) = std::sync::mpsc::channel();
+                let base = stage.device_view(0, 1)?.ptr() as usize;
+                let reader = std::thread::Builder::new().name("ds4-draft-reader".into())
+                    .spawn(move || draft_reader(src, base, mtp_slot, rx, tx)).map_err(|x| Error(format!("the draft experts' reader: {x}")))?;
+                log(format!("{}: the draft block (layer {ml}): {mtp_n} of its {} experts in VRAM ({:.2} GiB)", gpu.name, g.n_expert, gib(mtp_bytes)));
+                Some(Mutex::new(Draft { l: ml, buf, slot: mtp_slot, owner: (0..mtp_n as u64).map(Some).collect(), used: vec![0; mtp_n],
+                                        at: (0..mtp_n).map(|i| (i as u64, i)).collect(), fill: HashMap::new(), reading: HashSet::new(),
+                                        stage_free: vec![true; STAGE_SLOTS], stage_tk: vec![None; STAGE_SLOTS], jobs: Some(jobs), done,
+                                        reader: Some(reader), stage, tick: 0, hits: 0, misses: 0 }))
             }
             None => None,
         };
@@ -826,7 +912,7 @@ impl Part {
         let up = Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0));
         let back = Mutex::new(HostBuf::new(gpu, BACK_BYTES)?);
         Ok(Part { ops, arena, big, small, biases: Mutex::new(HashMap::new()), layers, mats, vecs, groups, scratch, x16, q8, esimd_gu, experts: Mutex::new(store),
-                  hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes, up, back, oa_tabs: Mutex::new(HashMap::new()), multi_tabs: Mutex::new(HashMap::new()), resident })
+                  hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes, up, back, oa_tabs: Mutex::new(HashMap::new()), multi_tabs: Mutex::new(HashMap::new()), draft })
     }
 
     /// The multi-matrix table of layer l's matrices `ks` (of `roles`) for t rows (made once): entry (k, r) = matrix
@@ -1038,9 +1124,17 @@ impl Part {
     /// the experts whose copy is still on its way, the third the tickets of the last copy.
     #[allow(clippy::type_complexity)]
     fn ensure(&self, m: &Model, l: u64, need: &[u64], promote: bool) -> Result<(Vec<(DevBuf, bool)>, Vec<bool>, Option<(i64, i64)>)> {
-        if let Some((rl, buf, slot)) = &self.resident {
-            if *rl == l {
-                let v = need.iter().map(|&x| Ok((buf.view(x as usize * slot, *slot)?, true))).collect::<Result<Vec<_>>>()?;
+        if let Some(d) = &self.draft {
+            let mut d = d.lock().unwrap();
+            if d.l == l {
+                let mut v = Vec::with_capacity(need.len());
+                for x in need {
+                    let s = *d.at.get(x).ok_or_else(|| Error(format!("draft expert {x} is not in VRAM")))?;
+                    if let Some(tk) = d.fill.remove(&s) {
+                        self.ops.await_ticket(tk)?;
+                    }
+                    v.push((d.buf.view(s * d.slot, d.slot)?, true));
+                }
                 return Ok((v, vec![false; need.len()], None));
             }
         }
@@ -1109,6 +1203,84 @@ impl Part {
             }
         }
         Ok((slots, arriving, last))
+    }
+
+    /// The draft block's pass: its experts not in VRAM left out of `by` (scaling the kept ones up to the whole
+    /// measured no better), the ones left out returned, most wanted first
+    fn draft_pick(&self, l: u64, by: &mut BTreeMap<usize, Vec<(i32, f32)>>) -> Vec<u64> {
+        let Some(d) = &self.draft else { return Vec::new() };
+        let mut d = d.lock().unwrap();
+        if d.l != l {
+            return Vec::new();
+        }
+        d.tick += 1;
+        let tick = d.tick;
+        let mut out: Vec<(u64, f32)> = Vec::new();
+        for (&e, list) in by.iter() {
+            if let Some(&s) = d.at.get(&(e as u64)) {
+                d.used[s] = tick;
+                d.hits += 1;
+            } else {
+                d.misses += 1;
+                out.push((e as u64, list.iter().map(|x| x.1).sum()));
+            }
+        }
+        for (e, _) in &out {
+            by.remove(&(*e as usize));
+        }
+        out.sort_by(|a, b| b.1.total_cmp(&a.1));
+        out.into_iter().map(|x| x.0).collect()
+    }
+
+    /// The draft block's reads done so far into their slots (each the least recently used: copies after everything
+    /// queued so far, for the passes after this one), then `want`'s next ones to the reader, as staging slots allow
+    fn draft_fill(&self, want: &[u64]) -> Result<()> {
+        let Some(d) = &self.draft else { return Ok(()) };
+        let mut d = d.lock().unwrap();
+        let d = &mut *d;
+        let sb = d.slot;
+        let mut after = None;
+        while let Ok((ex, k, r)) = d.done.try_recv() {
+            d.reading.remove(&ex);
+            d.stage_free[k] = true;
+            r.map_err(|x| Error(format!("reading a draft expert: {x}")))?;
+            let Some(s) = (0..d.owner.len()).filter(|&i| d.used[i] != d.tick).min_by_key(|&i| d.used[i]) else { continue };
+            let a = match after {
+                Some(a) => a,
+                None => *after.insert(self.ops.mark()?),
+            };
+            let tk = self.ops.stream_copy_on(1, &d.buf, s * sb, &d.stage.device_view(k * sb, sb)?, 0, sb, &[Some(a), d.fill.get(&s).copied()])?;
+            d.stage_tk[k] = Some(tk);
+            if let Some(old) = d.owner[s].replace(ex) {
+                d.at.remove(&old);
+            }
+            d.at.insert(ex, s);
+            d.fill.insert(s, tk);
+            d.used[s] = d.tick;
+        }
+        for &ex in want {
+            if d.reading.contains(&ex) || d.at.contains_key(&ex) {
+                continue;
+            }
+            let Some(k) = d.stage_free.iter().position(|f| *f) else { break };
+            if let Some(tk) = d.stage_tk[k].take() {
+                self.ops.ticket_wait(tk)?;
+            }
+            d.stage_free[k] = false;
+            d.reading.insert(ex);
+            if let Some(j) = &d.jobs {
+                j.send((ex, k)).map_err(|_| Error("the draft experts' reader is gone".into()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The draft block's experts found in VRAM, and not
+    pub fn draft_stats(&self) -> Option<(u64, u64)> {
+        self.draft.as_ref().map(|d| {
+            let d = d.lock().unwrap();
+            (d.hits, d.misses)
+        })
     }
 
     /// Expert `(l, ex)` into VRAM slot `s` (glm5next's swap: the slot's expert down to a free host slot, the wanted
@@ -1381,6 +1553,11 @@ impl<'g> Ds4<'g> {
     pub fn arena_peaks(&self) -> Vec<(usize, usize)> {
         use std::sync::atomic::Ordering::Relaxed;
         self.parts.iter().map(|p| (p.arena.peak.load(Relaxed), p.arena.spills.load(Relaxed))).collect()
+    }
+
+    /// The draft block's experts found in VRAM, and not
+    pub fn draft_stats(&self) -> Option<(u64, u64)> {
+        self.parts.iter().find_map(|p| p.draft_stats())
     }
 
     /// (VRAM hits, swaps, of them from host memory, host-memory reads by prompt passes, prefetched, prefetches used)
@@ -2516,6 +2693,12 @@ impl<'g> Ds4<'g> {
             }
         }
         ROUTE_HOST_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        // the draft block: only its experts in VRAM (the rest read in after this pass)
+        let fill = if g.is_mtp(l) { p.draft_pick(l, &mut by) } else { Vec::new() };
+        if by.is_empty() {
+            p.draft_fill(&fill)?;
+            return Ok(y);
+        }
         // the shared expert (queued above), then each routed expert added into it
         tap(&format!("ffn_shexp-{l}"), &y)?;
         let need: Vec<u64> = by.keys().map(|e| *e as u64).collect();
@@ -2828,6 +3011,9 @@ impl<'g> Ds4<'g> {
             want.sort_by(|a, b| b.1.total_cmp(&a.1));
             let want: Vec<u64> = want.into_iter().map(|(e, _)| e as u64).collect();
             self.timed(p, "expert prefetch", || p.prefetch(&self.m, l + 1, &want, pf))?;
+        }
+        if g.is_mtp(l) {
+            self.timed(p, "draft experts: reading", || p.draft_fill(&fill))?;
         }
         Ok(y)
     }
