@@ -69,6 +69,15 @@ int ns_ds4_kcopy(ns_gpu* g, void* dst, const void* src, size_t n, int64_t* ticke
 /* The host waits for ticket t (ns_mark, ns_ds4_kcopy) - not the whole queue */
 int ns_ds4_ticket_wait(ns_gpu* g, int64_t t);
 
+/* ---- idx.cpp: the lightning indexer at decode widths. score [T][ld] = sum_h w[t][h] relu(q16[t][h] . key_j) for the
+ * blocks j < (pos0 + t + 1) / 4 (and < n), -inf for the rest up to ld; q16 [T][64][128] fp16, cache [n][128] fp16 */
+int ns_ds4_idx_score_dec(ns_gpu* g, const uint16_t* q16, const float* w, const uint16_t* cache, float* score, int64_t T, int64_t H, int64_t D,
+                         int64_t n, int64_t ld, int64_t pos0);
+/* the two-level top-k's glue: sel1 [T * nch][K] (positions in chunks of C of score [T][nch * C]) -> the candidates'
+ * values and positions [T][nch * K]; sel2 [T][K] (indices into the candidates) -> positions sel [T][K] */
+int ns_ds4_topk_gather(ns_gpu* g, const float* score, const int32_t* sel1, float* cval, int32_t* cpos, int64_t T, int64_t nch, int64_t C, int64_t K);
+int ns_ds4_topk_map(ns_gpu* g, const int32_t* sel2, const int32_t* cpos, int32_t* sel, int64_t T, int64_t ncand, int64_t K);
+
 /* ---- mmvq.cpp: a layer's experts at decode widths, the deepseek2 silo's scheme (copied): activations in a split Q8
  * layout (q8_bytes: ncols x n_in quants, then their fp16 scales a block of 32, then each 16 quants' sum) */
 size_t ns_ds4_q8_bytes(int64_t n_in, int64_t ncols);

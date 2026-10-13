@@ -256,6 +256,15 @@ fn multi_dense() -> bool {
     *V.get_or_init(|| std::env::var("NS_DS4_MULTI_DENSE").map_or(true, |v| v != "0"))
 }
 
+/// Decode's indexer through this engine's fused score kernel and two-level top-k (NS_DS4_IDX_FUSED=0: the GEMM, the
+/// score pass and one radix select a row)
+fn idx_fused() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS4_IDX_FUSED").map_or(true, |v| v != "0"))
+}
+/// the two-level top-k's chunk of blocks
+const IDX_CHUNK: usize = 8192;
+
 /// NS_PROFILE_SPLIT=1: the profile's decode passes apart from the prompt's
 fn profile_split() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1582,6 +1591,33 @@ impl<'g> Ds4<'g> {
         o.rope(&iq, tr, hh, hh * d, d, d - rd, rd, pos0, 1, self.m.rope(l), false)?;
         // the head weights; their 1/sqrt(d * heads) scale is positive, so it cannot change a top-k: left out
         let w = p.mm(l, Role::IdxProj, x, tr)?;
+        if tr <= MMVQ_COLS && hh == 64 && d == 128 && idx_fused() {
+            // decode: the fused scores (each key read once, one float a block), then the top-k - in two levels past
+            // IDX_CHUNK blocks (one work-group's radix select over a 1M context's 262K blocks was a layer's longest step)
+            let iq16 = p.arena.bytes(tr * hh * d * 2)?;
+            o.to_f16(&iq, &iq16, tr * hh * d)?;
+            let nch = n.div_ceil(IDX_CHUNK);
+            let ld = if nch > 1 { nch * IDX_CHUNK } else { n };
+            let score = p.arena.f32(tr * ld)?;
+            o.idx_score_dec(&iq16, &w, &ix.cache, &score, tr, hh, d, n, ld, pos0)?;
+            if tr == 1 {
+                tap(&format!("indexer_score-{l}"), &score.view(0, n * 4)?)?;
+            }
+            let sel = p.arena.bytes(tr * kp * 4)?;
+            if nch == 1 {
+                o.topk(&score, &sel, tr, n, ld, kp)?;
+            } else {
+                let sel1 = p.arena.bytes(tr * nch * kp * 4)?;
+                o.topk(&score, &sel1, tr * nch, IDX_CHUNK, IDX_CHUNK, kp)?;
+                let nc = nch * kp;
+                let (cval, cpos) = (p.arena.f32(tr * nc)?, p.arena.bytes(tr * nc * 4)?);
+                o.topk_gather(&score, &sel1, &cval, &cpos, tr, nch, IDX_CHUNK, kp)?;
+                let sel2 = p.arena.bytes(tr * kp * 4)?;
+                o.topk(&cval, &sel2, tr, nc, nc, kp)?;
+                o.topk_map(&sel2, &cpos, &sel, tr, nc, kp)?;
+            }
+            return Ok(Some(sel));
+        }
         let rows = if tr <= MMVQ_COLS { 1 } else { (IDX_S_FLOATS / n).clamp(1, tr) };
         let score = p.arena.f32(rows * n)?;
         let nc_max = (IDX_S_FLOATS / (rows * hh)).max(1).min(n);

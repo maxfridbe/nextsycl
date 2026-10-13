@@ -641,4 +641,37 @@ impl Ops {
         };
         self.ok(rc, "ds4_mmvq_multi_var")
     }
+    /// The indexer's decode scores: score [t][ld] = sum_h w relu(q16 . key) for the blocks each row sees, -inf after
+    #[allow(clippy::too_many_arguments)]
+    pub fn idx_score_dec(&self, q16: &DevBuf, w: &DevBuf, cache: &DevBuf, score: &DevBuf, t: usize, h: usize, d: usize, n: usize, ld: usize, pos0: usize) -> Result<()> {
+        q16.bounds(0, t * h * d * 2)?;
+        need!(w, t * h, "idx_score_dec w");
+        cache.bounds(0, n.max(8) * d * 2)?;
+        need!(score, t * ld, "idx_score_dec score");
+        // SAFETY: sizes checked.
+        let rc = unsafe {
+            (self.k.ds4_idx_score_dec)(self.raw(), q16.ptr().cast(), w.fp(), cache.ptr().cast(), score.fp(), t as i64, h as i64, d as i64, n as i64, ld as i64,
+                                       pos0 as i64)
+        };
+        self.ok(rc, "ds4_idx_score_dec")
+    }
+    /// Two-level top-k glue: chunk picks sel1 -> candidates (values, positions); candidate picks sel2 -> positions
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk_gather(&self, score: &DevBuf, sel1: &DevBuf, cval: &DevBuf, cpos: &DevBuf, t: usize, nch: usize, c: usize, k: usize) -> Result<()> {
+        need!(score, t * nch * c, "topk_gather score");
+        sel1.bounds(0, t * nch * k * 4)?;
+        need!(cval, t * nch * k, "topk_gather cval");
+        cpos.bounds(0, t * nch * k * 4)?;
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds4_topk_gather)(self.raw(), score.fp(), sel1.ptr().cast(), cval.fp(), cpos.ptr().cast(), t as i64, nch as i64, c as i64, k as i64) };
+        self.ok(rc, "ds4_topk_gather")
+    }
+    pub fn topk_map(&self, sel2: &DevBuf, cpos: &DevBuf, sel: &DevBuf, t: usize, ncand: usize, k: usize) -> Result<()> {
+        sel2.bounds(0, t * k * 4)?;
+        cpos.bounds(0, t * ncand * 4)?;
+        sel.bounds(0, t * k * 4)?;
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds4_topk_map)(self.raw(), sel2.ptr().cast(), cpos.ptr().cast(), sel.ptr().cast(), t as i64, ncand as i64, k as i64) };
+        self.ok(rc, "ds4_topk_map")
+    }
 }
