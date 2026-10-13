@@ -183,11 +183,11 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   the compressed layers). Grouped output LoRA (8 groups), mHC (4 streams, GLM-5.3's), sqrt-softplus routing with hash
   routing (the file's token table) on layers 0-2. The rest - experts in VRAM and pinned host slots, the prompt path,
   checkpoints - is the glm5next engine's, forked. Decode multiplies a layer's experts in two launches (gate | up, then
-  down: the deepseek2 silo's split-Q8 scheme with an IQ3_XXS lane, `mmvq.cpp`), attention on XMX (`attn.cpp`: 8 heads of a
+  down: the deepseek2 silo's split-Q8 scheme with IQ3_XXS, IQ2_S and MXFP4 lanes - every layer, `mmvq.cpp`), attention on XMX (`attn.cpp`: 8 heads of a
   row as the DPAS rows); MXFP4 has its own kernels (`ds4.cpp`) - all in its silo, `kernels/llm/deepseek4/silo`
   (dist/silo/libnextsycl-deepseek4.so). Checked against llama.cpp layer by layer (5 tokens: cosine >= 0.98, logits 0.998, the same
-  next token; long prompts drift only where near-tied experts swap). B70 + B65, 61 GB of host memory: ~23 tok/s
-  decode (19 at 3.7K), ~630 tok/s prompt reading at 3.7K tokens. The passes' small tables go up and the routers'
+  next token; long prompts drift only where near-tied experts swap). B70 + B65, 61 GB of host memory: ~24 tok/s
+  decode (20 at 3.7K), ~630 tok/s prompt reading at 3.7K tokens. The passes' small tables go up and the routers'
   logits come down through pinned rings copied by kernels (the runtime's memcpy waits behind the expert copies on
   the copy engine), and the shared expert runs while the host routes; the layers split by the cards' speed.
 

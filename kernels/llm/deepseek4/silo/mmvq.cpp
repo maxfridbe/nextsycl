@@ -1,5 +1,6 @@
 // mmvq.cpp: the deepseek4 engine's decode products for its experts (ds4.h) - 1..8 columns of Q8 activations against
-// a layer's experts at once: IQ2_XXS (gate | up) and IQ3_XXS (down: no shared grouped kernel takes it). The scheme is
+// a layer's experts at once: IQ2_XXS and IQ2_S (gate | up), IQ3_XXS and MXFP4 (down: no shared grouped kernel takes
+// them). The scheme is
 // the deepseek2 silo's (copied, not shared): 8 lanes a 256-block, a lane a sub-block of 32 values, the activations in
 // the split Q8 layout (a column's quants contiguous and 16-byte aligned), dp4a against them, the grids in local memory.
 #include "ns.h"
@@ -129,6 +130,93 @@ struct WideIQ3XXS {
     static float dot(const W& r, const X& v) { return r.d * v.d * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)); }
 };
 
+// ---- IQ2_S (82-byte blocks, 2-byte aligned): lane g = sub-block g - four grid entries (iq2s_grid, 10-bit indices:
+// qs[4g + l] and two bits of qh[g]) with their sign bytes (qs[32 + 4g + l], no parity), two scales (nibbles of
+// scales[g]: the first 16 values', the last 16's)
+inline uint32_t load4_a2(const uint8_t* p) {
+    const uint16_t* h = reinterpret_cast<const uint16_t*>(p);
+    return uint32_t(h[0]) | (uint32_t(h[1]) << 16);
+}
+struct WideIQ2S {
+    using XT = X;
+    static X xl(int g, const XA& xa, int b0) { return xload(g, xa, b0); }
+    using Block = block_iq2_s;
+    static constexpr int LUT = 2 * 1024;
+    static uint32_t lut(int i) {
+        const uint64_t e = iq2s_grid[i >> 1];
+        return uint32_t(i & 1 ? e >> 32 : e);
+    }
+    struct W { sycl::int4 lo, hi; float s0, s1; };
+    static W load(const Block* b, int g, const uint32_t* tab) {
+        W r;
+        const sycl::uint2* grid = reinterpret_cast<const sycl::uint2*>(tab);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(b);
+        const uint32_t q4 = load4_a2(p + 2 + 4 * g), s4 = load4_a2(p + 2 + 32 + 4 * g);
+        const uint32_t qh = p[2 + 64 + g], sc = p[2 + 64 + 8 + g];
+        int v[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) grid_group(grid[((q4 >> (8 * l)) & 0xff) | ((qh << (8 - 2 * l)) & 0x300)], (s4 >> (8 * l)) & 0xff, v, l);
+        r.lo = sycl::int4(v[0], v[1], v[2], v[3]); r.hi = sycl::int4(v[4], v[5], v[6], v[7]);
+        const float d = (float) b->d;
+        r.s0 = d * (0.5f + (float) (sc & 0xf)) * 0.25f;
+        r.s1 = d * (0.5f + (float) (sc >> 4)) * 0.25f;
+        return r;
+    }
+    static float dot(const W& r, const X& v) { return v.d * (r.s0 * (float) dp4a4(r.lo, v.u0, 0) + r.s1 * (float) dp4a4(r.hi, v.u1, 0)); }
+};
+
+// ---- MXFP4 (17-byte blocks of 32: an E8M0 scale, 16 bytes of E2M1 codes - low nibbles values 0..15, high 16..31):
+// eight blocks make the 256-value step, lane g block g. Its 16 code bytes come from byte-aligned word loads; a byte's
+// two codes become their two (doubled) values through a 256-entry table; the scale is ggml's E8M0 at half
+inline float e8m0_half(uint32_t x) {
+    const uint32_t bits = x < 2 ? (0x00200000u << x) : ((x - 1) << 23);
+    return sycl::bit_cast<float>(bits);
+}
+constexpr int8_t FP4V[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+struct Mx8 { block_mxfp4 b[8]; };
+static_assert(sizeof(Mx8) == 136, "eight MXFP4 blocks are 136 bytes");
+struct WideMXFP4 {
+    using XT = X;
+    static X xl(int g, const XA& xa, int b0) { return xload(g, xa, b0); }
+    using Block = Mx8;
+    static constexpr int LUT = 256;
+    static uint32_t lut(int i) { return uint32_t(uint8_t(FP4V[i & 15])) | (uint32_t(uint8_t(FP4V[i >> 4])) << 8); }
+    struct W { sycl::int4 lo, hi; float d; };
+    static W load(const Block* b, int g, const uint32_t* tab) {
+        W r;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(b) + 17 * g;
+        // the 16 code bytes at p + 1: whole words from the 4-byte boundary below, shifted (the fifth word only when
+        // the bytes reach into it - never past the block)
+        const uint8_t* q = p + 1;
+        const uintptr_t a = reinterpret_cast<uintptr_t>(q);
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3));
+        const int sh = int(a & 3) * 8;
+        uint32_t ww[5];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) ww[i] = w[i];
+        ww[4] = sh ? w[4] : 0;
+        uint32_t lo[4], hi[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t c = sh ? (ww[i] >> sh) | (ww[i + 1] << (32 - sh)) : ww[i];
+            uint32_t l = 0, h = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t e = tab[(c >> (8 * k)) & 0xff];
+                l |= (e & 0xff) << (8 * k);
+                h |= ((e >> 8) & 0xff) << (8 * k);
+            }
+            lo[i] = l;
+            hi[i] = h;
+        }
+        r.lo = sycl::int4(int(lo[0]), int(lo[1]), int(lo[2]), int(lo[3]));
+        r.hi = sycl::int4(int(hi[0]), int(hi[1]), int(hi[2]), int(hi[3]));
+        r.d = e8m0_half(p[0]);
+        return r;
+    }
+    static float dot(const W& r, const X& v) { return r.d * v.d * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)); }
+};
+
 int multi_groups() {   // NS_DS4_MULTI_GROUPS: the work-groups of a layer's experts in one launch (each fills its grid table once; default 1024)
     static const int v = std::getenv("NS_DS4_MULTI_GROUPS") ? std::max(1, std::atoi(std::getenv("NS_DS4_MULTI_GROUPS"))) : 1024;
     return v;
@@ -235,7 +323,7 @@ int ns_ds4_quantize_q8(ns_gpu* g, const float* x, void* xs, int64_t n_in, int64_
     NS_CATCH
 }
 
-int ns_ds4_multi_supported(int type, int64_t n_in) { return (type == 16 || type == 18) && n_in % QK == 0; }
+int ns_ds4_multi_supported(int type, int64_t n_in) { return (type == 16 || type == 18 || type == 22 || type == 39) && n_in % QK == 0; }
 
 int ns_ds4_mmvq_multi(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* cols, int64_t entries, const void* xs, int64_t ncols, float* y,
                       int64_t n_in, int64_t n_out) {
@@ -243,7 +331,9 @@ int ns_ds4_mmvq_multi(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* 
     if (!ns_ds4_multi_supported(type, n_in)) return ns_fail("ns_ds4_mmvq_multi: ggml type " + std::to_string(type) + " at this width is not its own");
     if (entries < 1) return 0;
     if (type == 16) multi<WideIQ2XXS>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
-    else multi<WideIQ3XXS>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
+    else if (type == 18) multi<WideIQ3XXS>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
+    else if (type == 22) multi<WideIQ2S>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
+    else multi<WideMXFP4>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
     return 0;
     NS_CATCH
 }

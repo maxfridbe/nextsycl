@@ -172,6 +172,26 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// n values of a stored matrix (bytes [at, at + len) of w) as float32 - MXFP4 through this engine's expander, the
+/// IQ types the float32 expander lacks through the fp16 one
+fn expand(o: &crate::ops::Ops, g: &std::sync::Arc<nextsycl_core::Gpu>, ty: nextsycl_gguf::GType, w: &nextsycl_core::DevBuf, at: usize, len: usize, n: usize)
+          -> nextsycl_core::Result<nextsycl_core::DevBuf> {
+    use nextsycl_core::DevBuf;
+    let wf = DevBuf::f32(g, n)?;
+    let wv = w.view(at, len)?;
+    if ty.code() == 39 {
+        o.mxfp4_dequant(&wv, 0, n, &wf, false)?;
+    } else if o.dequant(ty.code(), &wv, 0, len, n, &wf).is_err() {
+        let hb = DevBuf::new(g, n * 2)?;
+        o.dequant_f16(ty.code(), &wv, 0, len, n, &hb)?;
+        let mut b = vec![0u8; n * 2];
+        hb.read(0, &mut b)?;
+        let v: Vec<u8> = b.chunks_exact(2).flat_map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])).to_le_bytes()).collect();
+        wf.write(0, &v)?;
+    }
+    Ok(wf)
+}
+
 /// The decode MoE's two launches (gate | up, down) on a layer's first 6 experts from the file, at 1 and 4 columns:
 /// the time a launch and the weight bytes it reads a second
 fn multi_bench(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &crate::ops::Ops, l: u64) -> nextsycl_core::Result<()> {
@@ -247,6 +267,27 @@ fn multi_bench(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &
             g.sync()?;
             Ok(t0.elapsed().as_secs_f64() / reps as f64)
         };
+        if t == 1 {
+            // set 0 against the exact path: each matrix expanded to float32, times the column
+            o.mmvq_multi(gt.code(), &gtabs[0], 2 * n, &xq, t, (&gu, 0), d, f_)?;
+            o.mmvq_multi(dt.code(), &dtabs[0], n, &hq, n, (&dn, 0), f_, d)?;
+            let (gv, dv) = (gu.to_f32()?, dn.to_f32()?);
+            let mut worst: (f64, &str) = (0.0, "");
+            for e in 0..n {
+                for (which, w, eb, ty, rows, cols, xin, got) in [("gate", gw, geb, gt, f_, d, &x, &gv[e * f_..(e + 1) * f_]),
+                                                                ("up", uw, ueb, gt, f_, d, &x, &gv[(n + e) * f_..(n + e + 1) * f_]),
+                                                                ("down", dw, deb, dt, d, f_, &h, &dv[e * d..(e + 1) * d])] {
+                    let wf = expand(o, g, ty, w, e * eb, eb, rows * cols)?;
+                    let yr = DevBuf::f32(g, rows)?;
+                    o.gemm_at(1, rows, cols, (xin, if which == "down" { e * f_ } else { 0 }, cols), (&wf, 0), (&yr, 0, rows), false)?;
+                    let (_, rel, _) = compare(got, &yr.to_f32()?);
+                    if rel > worst.0 {
+                        worst = (rel, which);
+                    }
+                }
+            }
+            println!("  against the exact path: worst rel err {:.2e} ({})", worst.0, worst.1);
+        }
         let s1 = time(&|s| o.mmvq_multi(gt.code(), &gtabs[s], 2 * n, &xq, t, (&gu, 0), d, f_))?;
         let s2 = time(&|s| o.mmvq_multi(dt.code(), &dtabs[s], n, &hq, n, (&dn, 0), f_, d))?;
         println!("  {t} column(s): gate | up {:7.1} us {:5.0} GB/s   down {:7.1} us {:5.0} GB/s", s1 * 1e6, (n * (geb + ueb)) as f64 / s1 / 1e9, s2 * 1e6,

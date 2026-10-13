@@ -2223,7 +2223,7 @@ impl<'g> Ds4<'g> {
                     }
                     if wait {
                         if let Some((_, all)) = copies {
-                            o.await_ticket(all)?;
+                            self.timed(p, "experts: waiting for swaps", || o.await_ticket(all))?;
                         }
                     }
                     let e0 = rows.len();
@@ -2355,6 +2355,7 @@ impl<'g> Ds4<'g> {
                 return o.moe_combine(&y, &dn, &cb, &wb, t, total, d);
             }
             // the types the grouped kernels do not take (MXFP4's down): each expert's three products
+            let t_one = self.mark(p);
             if let Some((_, tk)) = copies {
                 o.await_ticket(tk)?;
             }
@@ -2381,7 +2382,9 @@ impl<'g> Ds4<'g> {
             }
             let ints_view = p.arena.bytes((t + 1 + total) * 4)?;
             ints_view.copy_within(0, &ib, base * 4, (t + 1 + total) * 4)?;
-            o.moe_combine(&y, &dn, &ints_view, &wb, t, total, d)
+            o.moe_combine(&y, &dn, &ints_view, &wb, t, total, d)?;
+            self.lap(p, "experts: one at a time (MXFP4 / IQ2_S layers)", t_one);
+            Ok(())
         })?;
         if let Some(gv) = guess {
             let gb = p.router_bias(l + 1)?;
