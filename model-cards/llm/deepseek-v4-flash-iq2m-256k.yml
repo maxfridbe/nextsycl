@@ -1,0 +1,18 @@
+# DeepSeek-V4-Flash 284B UD-IQ2_M · 256K context + a 32K chat (both GPUs and pinned memory)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: deepseek-v4-flash-iq2m-256k
+kind: llm
+arch: deepseek4
+title: DeepSeek-V4-Flash 284B UD-IQ2_M · 256K context + a 32K chat (both GPUs and pinned memory)
+about: the same files as deepseek-v4-flash-iq2m with a 256K session (its compressed caches ~1.9 GiB over both cards) beside a 32K one
+gpus: all
+vram_gib: 30.0
+ctx: 262144,32768
+tools: false
+tasks: false
+env: {}
+files:
+  model: deepseek-v4-flash-ud-iq2m-1
+  shard-2: deepseek-v4-flash-ud-iq2m-2
+  shard-3: deepseek-v4-flash-ud-iq2m-3
+guide: guides/chat.md
