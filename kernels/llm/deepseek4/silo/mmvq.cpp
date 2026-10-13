@@ -217,6 +217,24 @@ struct WideMXFP4 {
     static float dot(const W& r, const X& v) { return r.d * v.d * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)); }
 };
 
+// ---- Q8_0 (34-byte blocks of 32: a half scale, 32 int8, 2-byte aligned): eight blocks make the 256-value step, lane
+// g block g (the attention's grouped output o_a in one launch: its 8 groups each against its own slice)
+struct Q8x8 { block_q8_0 b[8]; };
+static_assert(sizeof(Q8x8) == 272, "eight Q8_0 blocks are 272 bytes");
+struct WideQ8_0 {
+    using XT = X;
+    static X xl(int g, const XA& xa, int b0) { return xload(g, xa, b0); }
+    using Block = Q8x8;
+    static constexpr int LUT = 0;
+    static uint32_t lut(int) { return 0; }
+    struct W { sycl::int4 lo, hi; float d; };
+    static W load(const Block* b, int g, const uint32_t*) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(b) + 34 * g;
+        return W{load16_a2(p + 2), load16_a2(p + 18), (float) *reinterpret_cast<const sycl::half*>(p)};
+    }
+    static float dot(const W& r, const X& v) { return r.d * v.d * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)); }
+};
+
 int multi_groups() {   // NS_DS4_MULTI_GROUPS: the work-groups of a layer's experts in one launch (each fills its grid table once; default 1024)
     static const int v = std::getenv("NS_DS4_MULTI_GROUPS") ? std::max(1, std::atoi(std::getenv("NS_DS4_MULTI_GROUPS"))) : 1024;
     return v;
@@ -266,7 +284,7 @@ void multi(sycl::queue& q, const uint64_t* ptrs, const int32_t* cols, int entrie
     const std::size_t rows = std::size_t(entries) * n_out;
     const unsigned blocks = (unsigned) std::min<std::size_t>((rows + WARPS - 1) / WARPS, std::size_t(multi_groups()));
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT), h);
+        sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
         h.parallel_for(sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
                        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(32)]] {
                            uint32_t* t = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
@@ -323,7 +341,7 @@ int ns_ds4_quantize_q8(ns_gpu* g, const float* x, void* xs, int64_t n_in, int64_
     NS_CATCH
 }
 
-int ns_ds4_multi_supported(int type, int64_t n_in) { return (type == 16 || type == 18 || type == 22 || type == 39) && n_in % QK == 0; }
+int ns_ds4_multi_supported(int type, int64_t n_in) { return (type == 8 || type == 16 || type == 18 || type == 22 || type == 39) && n_in % QK == 0; }
 
 int ns_ds4_mmvq_multi(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* cols, int64_t entries, const void* xs, int64_t ncols, float* y,
                       int64_t n_in, int64_t n_out) {
@@ -332,6 +350,7 @@ int ns_ds4_mmvq_multi(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* 
     if (entries < 1) return 0;
     if (type == 16) multi<WideIQ2XXS>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
     else if (type == 18) multi<WideIQ3XXS>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
+    else if (type == 8) multi<WideQ8_0>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
     else if (type == 22) multi<WideIQ2S>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
     else multi<WideMXFP4>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
     return 0;

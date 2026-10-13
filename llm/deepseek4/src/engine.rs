@@ -362,6 +362,8 @@ pub struct Part {
     /// deepseek2 engine's lesson)
     up: Mutex<(HostBuf, usize)>,
     back: Mutex<HostBuf>,
+    /// o_a's multi-matrix tables by (layer, rows): the groups' pointers for each row, then the columns
+    oa_tabs: Mutex<HashMap<(u64, usize), Arc<DevBuf>>>,
 }
 
 /// the pinned rings' sizes
@@ -742,7 +744,29 @@ impl Part {
         let up = Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0));
         let back = Mutex::new(HostBuf::new(gpu, BACK_BYTES)?);
         Ok(Part { ops, arena, big, small, biases: Mutex::new(HashMap::new()), layers, mats, vecs, groups, scratch, x16, q8, esimd_gu, experts: Mutex::new(store),
-                  hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes, up, back })
+                  hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes, up, back, oa_tabs: Mutex::new(HashMap::new()) })
+    }
+
+    /// Layer l's o_a table for `tr` rows (made once): entry r * groups + g = group g's rows against column of the same
+    fn oa_table(&self, l: u64, tr: usize, gm: &[Mat]) -> Result<Arc<DevBuf>> {
+        let mut m = self.oa_tabs.lock().unwrap();
+        if let Some(b) = m.get(&(l, tr)) {
+            return Ok(b.clone());
+        }
+        let n = tr * gm.len();
+        let mut tb: Vec<u8> = Vec::with_capacity(n * 12);
+        for _ in 0..tr {
+            for w in gm {
+                tb.extend((w.buf.ptr() as u64).to_le_bytes());
+            }
+        }
+        for e in 0..n as i32 {
+            tb.extend(e.to_le_bytes());
+        }
+        let b = Arc::new(DevBuf::new(&self.ops.gpu, tb.len())?);
+        b.write(0, &tb)?;
+        m.insert((l, tr), b.clone());
+        Ok(b)
     }
 
     /// `data` into dst's front in queue order: through the pinned ring, copied by a kernel (big ones, or a length the
@@ -1585,14 +1609,24 @@ impl<'g> Ds4<'g> {
             if r0 == 0 && tr == t {
                 tap(&format!("attn_derope-{l}"), &att)?;
             }
-            // the grouped output: [tr][groups][gw] -> [groups][tr][gw], each group through its rows of o_a, back
-            let perm = q.view(0, tr * nh * hd * 4)?; // q is read: its buffer takes the permuted rows
-            o.permute(&att, &perm, tr, ng, gw)?;
             let gm = p.groups.get(&l).ok_or("o_a's groups")?;
-            for (gi, w) in gm.iter().enumerate() {
-                p.matmul(w, tr, (&perm, gi * tr * gw, gw), (&og, gi * tr * ol, ol), false)?;
+            if tr <= MMVQ_COLS && !gm[0].f32 && o.multi_supported(gm[0].ty.code(), gw) {
+                // decode: every (row, group) one entry of the multi-matrix product - att is [tr][groups][gw], so entry
+                // e is column e of its quantized rows and its output row e of oa ([tr][groups][o_lora]); the pointer
+                // table is the layer's own, kept (B70: 89 -> 63 us a layer against 8 launches and 2 permutes)
+                let xq = p.arena.bytes(o.q8_bytes(gw, tr * ng))?;
+                o.quantize_q8((&att, 0), &xq, gw, tr * ng)?;
+                let tab = p.oa_table(l, tr, gm)?;
+                o.mmvq_multi(gm[0].ty.code(), &tab, tr * ng, &xq, tr * ng, (&oa, r0 * ng * ol), gw, ol)?;
+            } else {
+                // the grouped output: [tr][groups][gw] -> [groups][tr][gw], each group through its rows of o_a, back
+                let perm = q.view(0, tr * nh * hd * 4)?; // q is read: its buffer takes the permuted rows
+                o.permute(&att, &perm, tr, ng, gw)?;
+                for (gi, w) in gm.iter().enumerate() {
+                    p.matmul(w, tr, (&perm, gi * tr * gw, gw), (&og, gi * tr * ol, ol), false)?;
+                }
+                o.permute(&og, &oa.view(r0 * ng * ol * 4, tr * ng * ol * 4)?, ng, tr, ol)?;
             }
-            o.permute(&og, &oa.view(r0 * ng * ol * 4, tr * ng * ol * 4)?, ng, tr, ol)?;
             t_s = self.lap(p, "attn: o_a", t_s);
         }
         let t_out = t_s;

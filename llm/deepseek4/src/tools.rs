@@ -168,7 +168,21 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
         }
         println!("{name:<34} {:<8} {:>12} {:>10.2e} {:>10.2e} {:>8.0} GB/s", ty.name(), format!("{rows}x{cols}"), errs[0], errs[1], rate);
     }
-    multi_bench(&f, &m, &g, &o, std::env::var("NS_DS4_BENCH_LAYER").ok().and_then(|v| v.parse().ok()).unwrap_or(5)).map_err(e)?;
+    let bl = std::env::var("NS_DS4_BENCH_LAYER").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    multi_bench(&f, &m, &g, &o, bl).map_err(e)?;
+    dense_bench(&f, &m, &g, &o, bl).map_err(e)?;
+    // a tiny kernel's cost in a stream of them (what a decode pass's many small steps each take)
+    let a = DevBuf::new(&g, 4096).map_err(e)?;
+    let bb = DevBuf::new(&g, 4096).map_err(e)?;
+    let n = 2000;
+    o.kcopy(&bb, 0, &a, 0, 64).map_err(e)?;
+    g.sync().map_err(e)?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..n {
+        o.kcopy(&bb, 0, &a, 0, 64).map_err(e)?;
+    }
+    g.sync().map_err(e)?;
+    println!("a tiny kernel in a stream of {n}: {:.1} us each", t0.elapsed().as_secs_f64() / n as f64 * 1e6);
     Ok(())
 }
 
@@ -190,6 +204,69 @@ fn expand(o: &crate::ops::Ops, g: &std::sync::Arc<nextsycl_core::Gpu>, ty: nexts
         wf.write(0, &v)?;
     }
     Ok(wf)
+}
+
+/// The attention's dense decode products, one column: o_a's 8 groups (each 1024 rows against its own 4096) as the
+/// shared kernel runs them (8 launches) and as one multi-matrix launch, and q_b both ways - time and bytes a second
+fn dense_bench(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &crate::ops::Ops, l: u64) -> nextsycl_core::Result<()> {
+    use nextsycl_core::DevBuf;
+    let mut rng = Rng(99);
+    for (r, groups) in [(Role::OutA, m.g.o_groups as usize), (Role::QB, 1usize)] {
+        let Some(tn) = m.tensor(l, r) else { continue };
+        let (rows, cols) = (tn.shape[tn.shape.len() - 2] as usize, tn.shape[tn.shape.len() - 1] as usize);
+        if !o.multi_supported(tn.ty.code(), cols) {
+            continue;
+        }
+        let bytes = tn.ty.bytes((rows * cols) as u64).unwrap_or(0) as usize;
+        let mut b = vec![0u8; bytes];
+        f.read_into(tn, 0, &mut b).map_err(|e| nextsycl_core::Error(e.0))?;
+        let w = DevBuf::new(g, bytes)?;
+        w.write(0, &b)?;
+        // groups: rows [gi * rg, (gi + 1) * rg) against input slice gi (o_a: the matrix's cols are a group's input)
+        let rg = rows / groups;
+        let gb = bytes / groups;
+        let xs: Vec<f32> = (0..groups * cols).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
+        let x = DevBuf::from_f32(g, &xs)?;
+        let y = DevBuf::f32(g, rows)?;
+        let q8 = DevBuf::new(g, o.q8_1_bytes(cols, 1) * groups)?;
+        let xq = DevBuf::new(g, o.q8_bytes(cols, groups))?;
+        let mut tb = Vec::new();
+        for gi in 0..groups {
+            tb.extend((w.ptr() as u64 + (gi * gb) as u64).to_le_bytes());
+        }
+        for gi in 0..groups as i32 {
+            tb.extend(gi.to_le_bytes());
+        }
+        let tab = DevBuf::new(g, tb.len())?;
+        tab.write(0, &tb)?;
+        let reps = 200;
+        let time = |run: &dyn Fn() -> nextsycl_core::Result<()>| -> nextsycl_core::Result<f64> {
+            run()?;
+            g.sync()?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                run()?;
+            }
+            g.sync()?;
+            Ok(t0.elapsed().as_secs_f64() / reps as f64)
+        };
+        let shared = time(&|| {
+            for gi in 0..groups {
+                o.quantize_q8_1((&x, gi * cols), &q8, cols, 1)?;
+                o.mmvq(tn.ty.code(), (&w, gi * gb), gb, &q8, (&y, gi * rg), cols, rg, 1)?;
+            }
+            Ok(())
+        })?;
+        let ys = y.to_f32()?;
+        let multi = time(&|| {
+            o.quantize_q8((&x, 0), &xq, cols, groups)?;
+            o.mmvq_multi(tn.ty.code(), &tab, groups, &xq, groups, (&y, 0), cols, rg)
+        })?;
+        let (cos, rel, _) = compare(&y.to_f32()?, &ys);
+        println!("{:<34} {} {}x{} in {groups} group(s): shared kernel {:6.1} us {:4.0} GB/s, multi {:6.1} us {:4.0} GB/s (cosine {cos:.6}, rel {rel:.2e})",
+                 tn.name, tn.ty.name(), rows, cols, shared * 1e6, bytes as f64 / shared / 1e9, multi * 1e6, bytes as f64 / multi / 1e9);
+    }
+    Ok(())
 }
 
 /// The decode MoE's two launches (gate | up, down) on a layer's first 6 experts from the file, at 1 and 4 columns:
