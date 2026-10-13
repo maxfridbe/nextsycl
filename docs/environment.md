@@ -398,6 +398,16 @@ file; decode multiplies the pinned ones on the CPU.
 | `NS_DS2_TRACE_GUESS` | off | Debug: FILE gets the next layer's router guesses (top 32) beside the requests | llm deepseek2 |
 | `NS_DS2_TRACE_ROUTE` | off | Debug: L prints layer L's choices and weights a row | llm deepseek2 |
 
+### deepseek4
+
+DeepSeek-V4-Flash (`llm/deepseek4`, its kernels `kernels/llm/deepseek4`): a fork of glm5next, which also reads that
+engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
+
+| Variable | Default | What it does | Read by |
+|---|---|---|---|
+| `NS_DS4_MULTI` | on | 0: decode runs each expert on its own instead of a layer's experts in two launches | llm deepseek4 |
+| `NS_DS4_MULTI_GROUPS` | 1024 | Experiment: work-groups of the multi-expert decode kernels | kernels:llm deepseek4 |
+
 ## Tests and checks
 
 Inputs of the checks and unit tests that need files outside the repository (unset: the test is skipped), and the parity tools.

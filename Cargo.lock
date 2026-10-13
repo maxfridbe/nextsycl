@@ -318,6 +318,7 @@ dependencies = [
  "nextsycl-image-qwenimage21",
  "nextsycl-llm",
  "nextsycl-llm-deepseek2",
+ "nextsycl-llm-deepseek4",
  "nextsycl-llm-example",
  "nextsycl-llm-glm5next",
  "nextsycl-llm-qwen35",
@@ -449,6 +450,16 @@ dependencies = [
 
 [[package]]
 name = "nextsycl-llm-deepseek2"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-gguf",
+ "nextsycl-llm",
+ "nextsycl-tok",
+]
+
+[[package]]
+name = "nextsycl-llm-deepseek4"
 version = "0.0.0"
 dependencies = [
  "nextsycl-core",

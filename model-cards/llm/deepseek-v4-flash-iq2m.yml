@@ -1,0 +1,33 @@
+# DeepSeek-V4-Flash 284B UD-IQ2_M · 128K context (both GPUs and pinned memory)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: deepseek-v4-flash-iq2m
+kind: llm
+arch: deepseek4
+title: DeepSeek-V4-Flash 284B UD-IQ2_M · 128K context (both GPUs and pinned memory)
+about: unsloth's dynamic 2-bit quant of DeepSeek-V4-Flash (84.7 GiB; 13B active, 256 experts); the experts beyond VRAM in pinned host memory
+gpus: all
+vram_gib: 30.0
+ctx: '131072'
+tools: false
+tasks: false
+env: {}
+files:
+  model:
+    key: deepseek-v4-flash-ud-iq2m-1
+    url: https://huggingface.co/unsloth/DeepSeek-V4-Flash-GGUF/resolve/e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0/UD-IQ2_M/DeepSeek-V4-Flash-UD-IQ2_M-00001-of-00003.gguf
+    size: 5256864
+    sha256: 9a24d09040d040330e5e490cc888df65c43184e556fee8301ffbcd3db9bde8e3
+    path: deepseek-v4-flash-iq2m/DeepSeek-V4-Flash-UD-IQ2_M-00001-of-00003.gguf
+  shard-2:
+    key: deepseek-v4-flash-ud-iq2m-2
+    url: https://huggingface.co/unsloth/DeepSeek-V4-Flash-GGUF/resolve/e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0/UD-IQ2_M/DeepSeek-V4-Flash-UD-IQ2_M-00002-of-00003.gguf
+    size: 49956780160
+    sha256: f2e8382860b99afac19bbfbbac7d817aecb855738b45bcdf06f315a1b160ebcd
+    path: deepseek-v4-flash-iq2m/DeepSeek-V4-Flash-UD-IQ2_M-00002-of-00003.gguf
+  shard-3:
+    key: deepseek-v4-flash-ud-iq2m-3
+    url: https://huggingface.co/unsloth/DeepSeek-V4-Flash-GGUF/resolve/e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0/UD-IQ2_M/DeepSeek-V4-Flash-UD-IQ2_M-00003-of-00003.gguf
+    size: 40964890464
+    sha256: f80ae237748d94ffda1eb0ba793de0d80a7108453fed7cb5eee97e40d27a3398
+    path: deepseek-v4-flash-iq2m/DeepSeek-V4-Flash-UD-IQ2_M-00003-of-00003.gguf
+guide: guides/chat.md

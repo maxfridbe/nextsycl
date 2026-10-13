@@ -176,6 +176,18 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   layer's file-only experts read behind the current one's) (llama.cpp with its experts
   mmapped: 1.0, 2.8-3.5 with madvise prefetch).
 
+- **deepseek4** - DeepSeek-V4-Flash (unsloth's UD-IQ2_M: IQ2_XXS gate / up, IQ3_XXS and MXFP4 down): 64 MQA heads of
+  512 (one key head, the key the value too, a rotated tail of 64, learned sinks) over a window of the last 128 raw
+  keys plus compressed ones - ratio 4 with overlapping blocks and the lightning indexer's top 512 on the even layers
+  from 2, ratio 128 on the odd ones (each block a per-value softmax pool, normed and rotated at its start; YaRN x16 on
+  the compressed layers). Grouped output LoRA (8 groups), mHC (4 streams, GLM-5.3's), sqrt-softplus routing with hash
+  routing (the file's token table) on layers 0-2. The rest - experts in VRAM and pinned host slots, the prompt path,
+  checkpoints - is the glm5next engine's, forked. Decode multiplies a layer's experts in two launches (gate | up, then
+  down: the deepseek2 silo's split-Q8 scheme with an IQ3_XXS lane, `kernels/llm/deepseek4/mmvq.cpp`); MXFP4 has its
+  own kernels (`ds4.cpp`). Checked against llama.cpp layer by layer (5 tokens: cosine >= 0.98, logits 0.998, the same
+  next token; long prompts drift only where near-tied experts swap). B70 + B65, 61 GB of host memory: ~20 tok/s
+  decode, ~330 tok/s prompt reading at 3.7K tokens.
+
 ## The audio engines
 
 - **minimaxmusic3** - MiniMax Music 3 from its diffusers checkpoint (bf16 language model and depth decoder, f32 flow

@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-llm-deepseek4"
+description = "DeepSeek-V4-Flash (deepseek4): its model description and its engine - tuned for it end to end"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-llm.workspace = true
+nextsycl-tok.workspace = true

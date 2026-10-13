@@ -184,8 +184,9 @@ impl Tokenizer {
         let (split, pre_splits): (&str, &[&str]) = match pre {
             "glm4" | "glm5" | "chatglm-bpe" => (GLM4_SPLIT, &[]),
             "qwen35" => (QWEN35_SPLIT, &[]),
-            "deepseek-v3" => (DEEPSEEK3_SPLITS[2], &DEEPSEEK3_SPLITS[..2]),
-            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen35, deepseek-v3)")),
+            // DeepSeek-V4's `joyai-llm`: llama.cpp gives it DeepSeek-V3's three patterns
+            "deepseek-v3" | "joyai-llm" => (DEEPSEEK3_SPLITS[2], &DEEPSEEK3_SPLITS[..2]),
+            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen35, deepseek-v3, joyai-llm)")),
         };
         let tokens = strs(g.meta("tokenizer.ggml.tokens"));
         let types: Vec<u64> = g.meta("tokenizer.ggml.token_type").and_then(Value::as_array).map(|a| a.iter().map(|x| x.as_u64().unwrap_or(1)).collect()).unwrap_or_default();
@@ -453,6 +454,43 @@ pub fn deepseek_chat(messages: &[Message], _effort: Effort, _tools: &[String]) -
         }
     }
     s += "<\u{ff5c}Assistant\u{ff5c}>";
+    s
+}
+
+/// DeepSeek-V4's chat template (the file's, without tools): BOS, the system messages joined (the maximum effort's
+/// instruction ahead of them), each user turn as `<｜User｜>` (consecutive ones joined by a blank line), each assistant
+/// turn as `<｜Assistant｜></think>` its answer `<｜end▁of▁sentence｜>` (earlier turns keep no thinking), then
+/// `<｜Assistant｜>` and `<think>` - or `</think>` at the low effort (V4's non-thinking mode).
+pub fn deepseek4_chat(messages: &[Message], effort: Effort, _tools: &[String]) -> String {
+    const MAX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+    let thinking = !matches!(effort, Effort::Low);
+    let mut s = String::from("<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>");
+    if matches!(effort, Effort::Max) {
+        s += MAX;
+    }
+    let system: Vec<&str> = messages.iter().filter(|m| m.role == "system").map(|m| m.content).collect();
+    s += &system.join("\n\n");
+    let mut in_user = false;
+    for m in messages {
+        match m.role {
+            "user" => {
+                s += if in_user { "\n\n" } else { "<\u{ff5c}User\u{ff5c}>" };
+                in_user = true;
+                s += m.content;
+            }
+            "assistant" => {
+                if in_user {
+                    s += "<\u{ff5c}Assistant\u{ff5c}></think>";
+                }
+                in_user = false;
+                s += m.content.rsplit("</think>").next().unwrap_or("");
+                s += "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
+            }
+            _ => {}
+        }
+    }
+    s += "<\u{ff5c}Assistant\u{ff5c}>";
+    s += if thinking { "<think>" } else { "</think>" };
     s
 }
 

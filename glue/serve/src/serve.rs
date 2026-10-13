@@ -1081,7 +1081,10 @@ impl Server {
         let messages: Vec<Message> = ask.messages.iter()
             .map(|m| Message { role: &m.role, content: &m.content, reasoning: m.reasoning.as_deref(), calls: &m.calls }).collect();
         let tools: Vec<String> = ask.tools.iter().map(py_json).collect();
-        let ids = self.tok.encode(&(self.chat)(&messages, ask.effort, &tools));
+        let text = (self.chat)(&messages, ask.effort, &tools);
+        // the answer starts in its thinking when the prompt opens it (a template's non-thinking mode closes it there)
+        let opens_thinking = text.trim_end().ends_with("<think>");
+        let ids = self.tok.encode(&text);
         if ids.len() + 16 > self.max_ctx {
             return Err(format!("the prompt is {} tokens; the context is {}", ids.len(), self.max_ctx));
         }
@@ -1165,7 +1168,7 @@ impl Server {
             send(s, json!({"role": "assistant"}), None);
         }
         let (mut reasoning, mut content) = (String::new(), String::new());
-        let mut thinking = true; // the prompt ends in <think>
+        let mut thinking = opens_thinking;
         let mut pending: Vec<u8> = Vec::new();
         let mut n = 0;
         let t1 = Instant::now();
