@@ -1,4 +1,4 @@
-//! This engine's kernels on one GPU (`kernels/llm/deepseek4/ds4.h`, and glm5next's generic `glm.h`): the checked
+//! This engine's kernels on one GPU (`kernels/llm/deepseek4/silo/ds4.h`, and glm5next's generic `glm.h`): the checked
 //! wrappers the engine calls.
 
 use std::ffi::c_void;
@@ -606,5 +606,21 @@ impl Ops {
                                     n_in as i64, n_out as i64)
         };
         self.ok(rc, "ds4_mmvq_multi")
+    }
+    /// n bytes of src (from src_at) into dst (from at) by a kernel in queue order (not a copy engine): its ticket
+    pub fn kcopy(&self, dst: &DevBuf, at: usize, src: &DevBuf, src_at: usize, n: usize) -> Result<i64> {
+        dst.bounds(at, n)?;
+        src.bounds(src_at, n)?;
+        let mut t = 0i64;
+        // SAFETY: both ranges in bounds (checked); t is a valid out pointer.
+        let rc = unsafe { (self.k.ds4_kcopy)(self.raw(), dst.ptr().cast::<u8>().add(at).cast(), src.ptr().cast::<u8>().add(src_at).cast(), n, &mut t) };
+        self.ok(rc, "ds4_kcopy")?;
+        Ok(t)
+    }
+    /// The host waits for ticket t (the queue goes on)
+    pub fn ticket_wait(&self, t: i64) -> Result<()> {
+        // SAFETY: plain call.
+        let rc = unsafe { (self.k.ds4_ticket_wait)(self.raw(), t) };
+        self.ok(rc, "ds4_ticket_wait")
     }
 }

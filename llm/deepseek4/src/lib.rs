@@ -1,8 +1,11 @@
 //! DeepSeek-V4-Flash (`deepseek4`): its model description (`model`: the geometry from the file's metadata, every tensor
 //! by role) and its engine (`engine`: the forward passes - attention over a window of raw keys and the compressed
 //! blocks, the compressors and the lightning indexer, the mHC streams - with glm5next's expert store and MoE paths),
-//! behind the runtime's `Engine` contract (`nextsycl-llm`). `kind()` is its registry entry. Its own kernels are in
-//! `kernels/llm/deepseek4/`.
+//! behind the runtime's `Engine` contract (`nextsycl-llm`). `kind()` is its registry entry. Its own kernels are its silo,
+//! `kernels/llm/deepseek4/silo/` (dist/silo/libnextsycl-deepseek4.so).
+
+/// The architecture the file names, and the silo's name
+pub const ARCH: &str = "deepseek4";
 
 pub mod engine;
 pub mod ffi;

@@ -168,5 +168,89 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
         }
         println!("{name:<34} {:<8} {:>12} {:>10.2e} {:>10.2e} {:>8.0} GB/s", ty.name(), format!("{rows}x{cols}"), errs[0], errs[1], rate);
     }
+    multi_bench(&f, &m, &g, &o, std::env::var("NS_DS4_BENCH_LAYER").ok().and_then(|v| v.parse().ok()).unwrap_or(5)).map_err(e)?;
+    Ok(())
+}
+
+/// The decode MoE's two launches (gate | up, down) on a layer's first 6 experts from the file, at 1 and 4 columns:
+/// the time a launch and the weight bytes it reads a second
+fn multi_bench(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &crate::ops::Ops, l: u64) -> nextsycl_core::Result<()> {
+    use nextsycl_core::DevBuf;
+    let (n, sets) = (6usize, 4usize); // 4 sets of 6 experts in turn: past the L2 cache
+    let mut bufs = Vec::new();
+    for r in [Role::ExpGate, Role::ExpUp, Role::ExpDown] {
+        let Some(tn) = m.tensor(l, r) else { return Ok(()) };
+        let (rows, cols) = (tn.shape[tn.shape.len() - 2] as usize, tn.shape[tn.shape.len() - 1] as usize);
+        let eb = tn.ty.bytes((rows * cols) as u64).unwrap_or(0) as usize;
+        let mut b = vec![0u8; eb * n * sets];
+        f.read_into(tn, 0, &mut b).map_err(|e| nextsycl_core::Error(e.0))?;
+        let w = DevBuf::new(g, b.len())?;
+        w.write(0, &b)?;
+        bufs.push((tn.ty, rows, cols, eb, w));
+    }
+    let (gt, f_, d, geb, gw) = (bufs[0].0, bufs[0].1, bufs[0].2, bufs[0].3, &bufs[0].4);
+    let (ueb, uw) = (bufs[1].3, &bufs[1].4);
+    let (dt, deb, dw) = (bufs[2].0, bufs[2].3, &bufs[2].4);
+    if !o.multi_supported(gt.code(), d) || !o.multi_supported(dt.code(), f_) {
+        println!("multi-expert: layer {l} ({} / {}) not the kernel's types", gt.name(), dt.name());
+        return Ok(());
+    }
+    println!("multi-expert, layer {l}: {n} experts, gate | up {} {f_}x{d}, down {} {d}x{f_}", gt.name(), dt.name());
+    let mut rng = Rng(777);
+    for t in [1usize, 4] {
+        // entries: each expert against one token (t = 4: experts spread over the tokens, as a verify pass)
+        let tk: Vec<i32> = (0..n).map(|i| (i % t) as i32).collect();
+        let (mut gtabs, mut dtabs) = (Vec::new(), Vec::new());
+        for s in 0..sets {
+            let mut tb = Vec::new();
+            for i in s * n..(s + 1) * n {
+                tb.extend((gw.ptr() as u64 + (i * geb) as u64).to_le_bytes());
+            }
+            for i in s * n..(s + 1) * n {
+                tb.extend((uw.ptr() as u64 + (i * ueb) as u64).to_le_bytes());
+            }
+            for v in tk.iter().chain(&tk) {
+                tb.extend(v.to_le_bytes());
+            }
+            let gtab = DevBuf::new(g, tb.len())?;
+            gtab.write(0, &tb)?;
+            gtabs.push(gtab);
+            let mut db = Vec::new();
+            for i in s * n..(s + 1) * n {
+                db.extend((dw.ptr() as u64 + (i * deb) as u64).to_le_bytes());
+            }
+            for i in 0..n as i32 {
+                db.extend(i.to_le_bytes());
+            }
+            let dtab = DevBuf::new(g, db.len())?;
+            dtab.write(0, &db)?;
+            dtabs.push(dtab);
+        }
+        let xs: Vec<f32> = (0..t * d).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
+        let x = DevBuf::from_f32(g, &xs)?;
+        let xq = DevBuf::new(g, o.q8_bytes(d, t))?;
+        o.quantize_q8((&x, 0), &xq, d, t)?;
+        let gu = DevBuf::f32(g, 2 * n * f_)?;
+        let hs: Vec<f32> = (0..n * f_).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
+        let h = DevBuf::from_f32(g, &hs)?;
+        let hq = DevBuf::new(g, o.q8_bytes(f_, n))?;
+        o.quantize_q8((&h, 0), &hq, f_, n)?;
+        let dn = DevBuf::f32(g, n * d)?;
+        let reps = 200;
+        let time = |run: &dyn Fn(usize) -> nextsycl_core::Result<()>| -> nextsycl_core::Result<f64> {
+            run(0)?;
+            g.sync()?;
+            let t0 = std::time::Instant::now();
+            for i in 0..reps {
+                run(i % sets)?;
+            }
+            g.sync()?;
+            Ok(t0.elapsed().as_secs_f64() / reps as f64)
+        };
+        let s1 = time(&|s| o.mmvq_multi(gt.code(), &gtabs[s], 2 * n, &xq, t, (&gu, 0), d, f_))?;
+        let s2 = time(&|s| o.mmvq_multi(dt.code(), &dtabs[s], n, &hq, n, (&dn, 0), f_, d))?;
+        println!("  {t} column(s): gate | up {:7.1} us {:5.0} GB/s   down {:7.1} us {:5.0} GB/s", s1 * 1e6, (n * (geb + ueb)) as f64 / s1 / 1e9, s2 * 1e6,
+                 (n * deb) as f64 / s2 / 1e9);
+    }
     Ok(())
 }

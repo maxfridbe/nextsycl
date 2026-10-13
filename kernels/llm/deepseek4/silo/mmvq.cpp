@@ -64,37 +64,34 @@ struct X { sycl::int4 u0, u1; float d; int s; };
 inline X xload(int g, const XA& xa, int b0) { return X{xa.q16(b0 + g, 0), xa.q16(b0 + g, 1), xa.dd(b0 + g), xa.sum32(b0 + g)}; }
 
 // ---- IQ2_XXS (66-byte blocks, 2-byte aligned): lane g = sub-block g - four grid entries (two words of unsigned
-// bytes each) with their signs (ksigns_iq2xs) applied bytewise. Local words: [16] the sign masks of four bits, [128]
-// ksigns_iq2xs, then the grid as words
+// bytes each) with their signs applied bytewise. The signs are computed, not looked up: ksigns_iq2xs[b] is b with
+// its parity as bit 7, and a nibble of it widens to byte masks by a multiply. Local memory holds only the grid, an
+// entry's two words read at once (B70 at the first version's 20 local reads a block: 293 GB/s)
+inline uint32_t ksign(uint32_t b7) { return b7 | ((sycl::popcount(b7) & 1u) << 7); }
 inline uint32_t sign_mask4(uint32_t b) { return ((b * 0x00204081u) & 0x01010101u) * 0xffu; }   // bit i -> 0xff in byte i
-constexpr int GL_SIGNS = 0, GL_KSIGNS = 16, GL_GRID = 144;
-inline void grid_group(const uint32_t* tab, uint32_t w0, uint32_t w1, uint32_t sb, int* v, int l) {
-    const uint32_t m0 = tab[GL_SIGNS + (sb & 0xf)], m1 = tab[GL_SIGNS + ((sb >> 4) & 0xf)];
-    v[2 * l] = int((w0 ^ m0) + (m0 & 0x01010101u));
-    v[2 * l + 1] = int((w1 ^ m1) + (m1 & 0x01010101u));
+inline void grid_group(sycl::uint2 e, uint32_t sb, int* v, int l) {
+    const uint32_t m0 = sign_mask4(sb & 0xf), m1 = sign_mask4((sb >> 4) & 0xf);
+    v[2 * l] = int((e.x() ^ m0) + (m0 & 0x01010101u));
+    v[2 * l + 1] = int((e.y() ^ m1) + (m1 & 0x01010101u));
 }
 struct WideIQ2XXS {
     using XT = X;
     static X xl(int g, const XA& xa, int b0) { return xload(g, xa, b0); }
     using Block = block_iq2_xxs;
-    static constexpr int LUT = GL_GRID + 2 * 256;
+    static constexpr int LUT = 2 * 256;
     static uint32_t lut(int i) {
-        if (i < 16) return sign_mask4(uint32_t(i));
-        if (i < GL_GRID) return uint32_t(ksigns_iq2xs[i - 16]);
-        const uint64_t e = iq2xxs_grid[(i - GL_GRID) >> 1];
-        return uint32_t((i - GL_GRID) & 1 ? e >> 32 : e);
+        const uint64_t e = iq2xxs_grid[i >> 1];
+        return uint32_t(i & 1 ? e >> 32 : e);
     }
     struct W { sycl::int4 lo, hi; float d; };
     static W load(const Block* b, int g, const uint32_t* tab) {
         W r;
+        const sycl::uint2* grid = reinterpret_cast<const sycl::uint2*>(tab);
         const sycl::int4 q4 = load16_a2(reinterpret_cast<const uint8_t*>(b->qs) + 16 * (g >> 1));
         const uint32_t a0 = word_of(q4, 2 * (g & 1)), a1 = word_of(q4, 2 * (g & 1) + 1);   // grid bytes; signs + scale
         int v[8];
 #pragma unroll
-        for (int l = 0; l < 4; ++l) {
-            const uint32_t gi = (a0 >> (8 * l)) & 0xff, sb = tab[GL_KSIGNS + ((a1 >> (7 * l)) & 127)];
-            grid_group(tab, tab[GL_GRID + 2 * gi], tab[GL_GRID + 2 * gi + 1], sb, v, l);
-        }
+        for (int l = 0; l < 4; ++l) grid_group(grid[(a0 >> (8 * l)) & 0xff], ksign((a1 >> (7 * l)) & 127), v, l);
         r.lo = sycl::int4(v[0], v[1], v[2], v[3]); r.hi = sycl::int4(v[4], v[5], v[6], v[7]);
         r.d = (float) b->d * (0.5f + (float) (a1 >> 28)) * 0.25f;
         return r;
@@ -104,19 +101,14 @@ struct WideIQ2XXS {
 
 
 // ---- IQ3_XXS (98-byte blocks, 2-byte aligned): lane g = sub-block g - eight grid entries of 4 unsigned bytes
-// (iq3xxs_grid, a byte index each: qs[8g .. 8g + 8)) with their signs (ksigns_iq2xs, 7 bits per pair of entries, from
-// the sub-block's word at byte 64 + 4g, whose top 4 bits are its scale)
-constexpr int GL3_GRID = 144;
+// (iq3xxs_grid, a byte index each: qs[8g .. 8g + 8)) with their signs (7 bits per pair of entries, from the
+// sub-block's word at byte 64 + 4g, whose top 4 bits are its scale; computed as above)
 struct WideIQ3XXS {
     using XT = X;
     static X xl(int g, const XA& xa, int b0) { return xload(g, xa, b0); }
     using Block = block_iq3_xxs;
-    static constexpr int LUT = GL3_GRID + 256;
-    static uint32_t lut(int i) {
-        if (i < 16) return sign_mask4(uint32_t(i));
-        if (i < GL3_GRID) return uint32_t(ksigns_iq2xs[i - 16]);
-        return iq3xxs_grid[i - GL3_GRID];
-    }
+    static constexpr int LUT = 256;
+    static uint32_t lut(int i) { return iq3xxs_grid[i]; }
     struct W { sycl::int4 lo, hi; float d; };
     static W load(const Block* b, int g, const uint32_t* tab) {
         W r;
@@ -128,8 +120,7 @@ struct WideIQ3XXS {
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const uint32_t iw = l < 2 ? i0 : i1, sh = 16 * (l & 1);
-            const uint32_t e1 = tab[GL3_GRID + ((iw >> sh) & 0xff)], e2 = tab[GL3_GRID + ((iw >> (sh + 8)) & 0xff)];
-            grid_group(tab, e1, e2, tab[GL_KSIGNS + ((a1 >> (7 * l)) & 127)], v, l);
+            grid_group(sycl::uint2(tab[(iw >> sh) & 0xff], tab[(iw >> (sh + 8)) & 0xff]), ksign((a1 >> (7 * l)) & 127), v, l);
         }
         r.lo = sycl::int4(v[0], v[1], v[2], v[3]); r.hi = sycl::int4(v[4], v[5], v[6], v[7]);
         r.d = (float) b->d * (0.5f + (float) (a1 >> 28)) * 0.5f;
@@ -143,14 +134,31 @@ int multi_groups() {   // NS_DS4_MULTI_GROUPS: the work-groups of a layer's expe
     return v;
 }
 
-// One row's dot over its 256-blocks: 8 lanes a block (lane g its sub-block g), 4 blocks a sub-group step
+// One row's dot over its 256-blocks: 8 lanes a block (lane g its sub-block g), 4 blocks a sub-group step. A lane's
+// blocks are loaded UNROLL at a time before any is used (the loads in flight together: one at a time, the first
+// version, held the B70 at 290 GB/s)
+#ifndef DS4_MULTI_UNROLL
+#define DS4_MULTI_UNROLL 1
+#endif
 template <typename F>
 inline float row_dot(const typename F::Block* wr, int blocks_per_row, const XA& xa, int lane, const uint32_t* tab) {
+    constexpr int U = DS4_MULTI_UNROLL;
     const int g = lane & 7, sub = lane >> 3;
     float acc = 0.f;
-    for (int kbx = sub; kbx < blocks_per_row; kbx += 4) {
-        const typename F::W wv = F::load(wr + kbx, g, tab);
-        acc += F::dot(wv, F::xl(g, xa, kbx * (QK / Q8K)));
+    for (int k0 = sub; k0 < blocks_per_row; k0 += 4 * U) {
+        typename F::W wv[U];
+        typename F::XT xv[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int kbx = k0 + 4 * u;
+            if (kbx < blocks_per_row) {
+                wv[u] = F::load(wr + kbx, g, tab);
+                xv[u] = F::xl(g, xa, kbx * (QK / Q8K));
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+            if (k0 + 4 * u < blocks_per_row) acc += F::dot(wv[u], xv[u]);
     }
     return acc;
 }

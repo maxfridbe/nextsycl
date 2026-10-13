@@ -43,6 +43,12 @@ int ns_ds4_rows_f16(ns_gpu* g, const float* x, uint16_t* cache, int64_t n, int64
 int ns_ds4_attend(ns_gpu* g, const float* q, const uint16_t* raw, int64_t R, const uint16_t* comp, int64_t ratio, const int32_t* sel, int64_t K,
                   const float* sinks, float* out, int64_t T, int64_t H, int64_t pos0, int64_t window, float scale);
 
+/* attn.cpp: the same attention on XMX (8 heads of a row as the DPAS rows; ns_ds4_attend takes it unless
+ * NS_DS4_ATTN_XMX=0) */
+int ns_ds4_attend_xmx_supported(int64_t H, int64_t D);
+int ns_ds4_attend_xmx(ns_gpu* g, const float* q, const uint16_t* raw, int64_t R, const uint16_t* comp, int64_t ratio, const int32_t* sel, int64_t K,
+                      const float* sinks, float* out, int64_t T, int64_t H, int64_t pos0, int64_t window, float scale);
+
 /* The head's mHC: from the mixes m [T, 4] (fn . rms(flatten X)) and X [T, 4, C]: pre = sigmoid(m * scale + base) + eps,
  * h [T, C] = sum_s pre[s] X[s] */
 int ns_ds4_hc_head(ns_gpu* g, const float* m, const float* scale, const float* base, const float* X, float* h, int64_t T, int64_t C, float eps);
@@ -55,6 +61,13 @@ int ns_ds4_permute(ns_gpu* g, const float* src, float* dst, int64_t A, int64_t B
 int ns_ds4_mxfp4_dequant(ns_gpu* g, const void* src, int64_t n, float* dst);
 int ns_ds4_mxfp4_dequant_f16(ns_gpu* g, const void* src, int64_t n, uint16_t* dst);
 int ns_ds4_mxfp4_mmvq(ns_gpu* g, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+
+/* n bytes (a multiple of 4) from src to dst by a kernel on the GPU's compute queue - not the runtime's memcpy, which
+ * goes to a copy engine and waits there behind the expert store's copies (the deepseek2 silo's kcopy, copied): the
+ * small tables up and the routers' logits down, through pinned memory. Its ticket */
+int ns_ds4_kcopy(ns_gpu* g, void* dst, const void* src, size_t n, int64_t* ticket);
+/* The host waits for ticket t (ns_mark, ns_ds4_kcopy) - not the whole queue */
+int ns_ds4_ticket_wait(ns_gpu* g, int64_t t);
 
 /* ---- mmvq.cpp: a layer's experts at decode widths, the deepseek2 silo's scheme (copied): activations in a split Q8
  * layout (q8_bytes: ncols x n_in quants, then their fp16 scales a block of 32, then each 16 quants' sum) */

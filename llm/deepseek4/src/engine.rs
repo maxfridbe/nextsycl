@@ -28,8 +28,22 @@ pub static ROUTER_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Time the host spent choosing each row's experts (all layers)
 pub static ROUTE_HOST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Prompt chunks of this many tokens or more multiply in fp16 on the XMX units (NS_PROMPT_F16_MIN, default 1024;
-/// 0 = never): the experts, and the dense matrices whose type the fp16 expander takes.
+/// Prompt chunks of this many tokens or more multiply their experts in fp16 on the XMX units (NS_PROMPT_F16_MIN,
+/// default 1024; 0 = never)
+/// Dense products of this many rows or more in fp16 on the XMX units, when the fp16 expander takes their type
+/// (NS_DS4_DENSE_F16_MIN, default 64; 0 = never): the attention block's 512-row q_b and o_a take it (B70 + B65, a
+/// 3.7K prompt: 447 -> 526 tok/s against the experts' 1024)
+fn dense_f16_min() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS4_DENSE_F16_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
+}
+
+/// Query rows the attention block takes at a time in a prompt pass (NS_DS4_ATT_ROWS, default 512)
+fn att_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS4_ATT_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(ATT_ROWS).clamp(64, 8192))
+}
+
 fn f16_min() -> usize {
     static F16_MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *F16_MIN.get_or_init(|| std::env::var("NS_PROMPT_F16_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1024))
@@ -189,8 +203,9 @@ pub fn arena_bytes() -> usize {
 }
 /// rows of a verify pass (the token and its drafts)
 pub const MAX_VERIFY: usize = 8;
-/// the queries' side of a prompt chunk's attention a block of rows at a time (q and its output are 128 KiB a row)
-const ATT_ROWS: usize = 512;
+/// the queries' side of a prompt chunk's attention a block of rows at a time (q and its output are 128 KiB a row; B70 +
+/// B65, a 3.7K prompt: 512 rows 550 tok/s, 2048 596 - q_b and o_a in bigger products, o_a expanded fewer times)
+const ATT_ROWS: usize = 2048;
 /// the indexer's scores per GEMM (floats): scored in chunks that fit (64 MiB)
 const IDX_S_FLOATS: usize = 16 << 20;
 
@@ -232,6 +247,19 @@ struct ExpertParts {
     gate: (usize, usize, GType),
     up: (usize, usize, GType),
     down: (usize, usize, GType),
+}
+
+/// NS_PROFILE_SPLIT=1: the profile's decode passes apart from the prompt's
+fn profile_split() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_PROFILE_SPLIT").is_ok_and(|v| v == "1"))
+}
+
+/// "decode: NAME", made once a name
+fn decode_name(name: &'static str) -> &'static str {
+    static NAMES: Mutex<BTreeMap<&'static str, &'static str>> = Mutex::new(BTreeMap::new());
+    let mut m = NAMES.lock().unwrap();
+    m.entry(name).or_insert_with(|| Box::leak(format!("decode: {name}").into_boxed_str()))
 }
 
 /// A section's device stamps: (name, its GPU, start, end)
@@ -329,7 +357,16 @@ pub struct Part {
     pub expert_slots: usize,
     pub host_slots: usize,
     pub weight_bytes: u64,
+    /// pinned rings for the passes' small tables up and the routers' logits down, copied by kernels on the compute
+    /// queue (the runtime's memcpy goes to a copy engine and waits there behind the expert store's copies - the
+    /// deepseek2 engine's lesson)
+    up: Mutex<(HostBuf, usize)>,
+    back: Mutex<HostBuf>,
 }
+
+/// the pinned rings' sizes
+const UP_BYTES: usize = 8 << 20;
+const BACK_BYTES: usize = 4 << 20;
 
 /// A layer's attention state: the raw keys' ring (fp16 [raw_ring()][512], slot pos % ring), and at a compressed
 /// layer its compressor's
@@ -479,6 +516,8 @@ pub struct Ds4<'g> {
     prof: Option<Mutex<BTreeMap<&'static str, (f64, u64)>>>,
     gpu_prof: bool,
     stamps: Mutex<Vec<Stamp>>,
+    /// the pass running is a decode pass (NS_PROFILE_SPLIT=1: its sections counted apart, as "decode: ...")
+    decoding: std::sync::atomic::AtomicBool,
 }
 
 const VECTORS: [Role; 15] = [Role::OutputNorm, Role::AttnNorm, Role::FfnNorm, Role::HcAttnBase, Role::HcAttnScale, Role::HcFfnBase, Role::HcFfnScale,
@@ -536,7 +575,7 @@ impl Part {
         let g = &m.g;
         let ops = Ops::new(gpu.clone())?;
         let scratch = DevBuf::f32(gpu, SCRATCH)?;
-        let x16 = if f16_min() > 0 && dense_f16() && prefill_chunk() >= f16_min() {
+        let x16 = if dense_f16_min() > 0 && dense_f16() && prefill_chunk() >= dense_f16_min() {
             Some(DevBuf::new(gpu, prefill_chunk() * X16_COLS * 2)?)
         } else {
             None
@@ -700,8 +739,54 @@ impl Part {
         store.lent = lend > 0;
         let arena = Arena::on(if lend > 0 { small.view(0, small.len)? } else { big.view(0, big.len)? });
         let esimd_gu = ops.moe_esimd_gu_max();
+        let up = Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0));
+        let back = Mutex::new(HostBuf::new(gpu, BACK_BYTES)?);
         Ok(Part { ops, arena, big, small, biases: Mutex::new(HashMap::new()), layers, mats, vecs, groups, scratch, x16, q8, esimd_gu, experts: Mutex::new(store),
-                  hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes })
+                  hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes, up, back })
+    }
+
+    /// `data` into dst's front in queue order: through the pinned ring, copied by a kernel (big ones, or a length the
+    /// kernel does not take, by write_async)
+    fn upload(&self, dst: &DevBuf, data: &[u8]) -> Result<()> {
+        let n = data.len();
+        let mut r = self.up.lock().unwrap();
+        if n == 0 || n % 4 != 0 || n > r.0.len / 4 {
+            drop(r);
+            return dst.write_async(0, data);
+        }
+        if r.1 + n > r.0.len {
+            // what the kernels read from the ring so far is done once the queue is
+            self.ops.gpu.sync()?;
+            r.1 = 0;
+        }
+        let off = r.1;
+        r.0.as_mut_slice()[off..off + n].copy_from_slice(data);
+        r.1 = (off + n).next_multiple_of(64);
+        let src = r.0.device_view(off, n)?;
+        self.ops.kcopy(dst, 0, &src, 0, n)?;
+        Ok(())
+    }
+
+    /// Several buffers' first floats on their way down (kernels copy them into pinned memory): the last copy's ticket
+    /// and where each lands, for `read_finish` - the queue goes on meanwhile. None when they do not fit the buffer.
+    fn read_start(&self, xs: &[(&DevBuf, usize)]) -> Result<Option<(i64, Vec<(usize, usize)>)>> {
+        let back = self.back.lock().unwrap();
+        let total: usize = xs.iter().map(|(_, n)| (n * 4).next_multiple_of(64)).sum();
+        if total > back.len {
+            return Ok(None);
+        }
+        let (mut at, mut spans, mut tk) = (0, Vec::new(), 0);
+        for (x, n) in xs {
+            tk = self.ops.kcopy(&back.device_view(at, n * 4)?, 0, x, 0, n * 4)?;
+            spans.push((at, n * 4));
+            at += (n * 4).next_multiple_of(64);
+        }
+        Ok(Some((tk, spans)))
+    }
+    fn read_finish(&self, tk: i64, spans: &[(usize, usize)]) -> Result<Vec<Vec<f32>>> {
+        self.ops.ticket_wait(tk)?;
+        let back = self.back.lock().unwrap();
+        Ok(spans.iter().map(|(a, b)| back.as_slice()[*a..a + b].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()).collect())
     }
 
     /// The arena a pass of `t` tokens needs: the small one, or the big one - its memory then out of the expert store.
@@ -779,7 +864,7 @@ impl Part {
             return self.ops.mmvq(w.ty.code(), (&w.buf, 0), w.buf.len, &self.q8, (y.0, y.1), w.cols, w.rows, t);
         }
         let rb = w.row_bytes();
-        let f16 = f16_min();
+        let f16 = dense_f16_min();
         let fits = |b: &DevBuf| t * w.cols * 2 <= b.len;
         if let Some(x16) = self.x16.as_ref().filter(|b| f16 > 0 && t >= f16 && t > MMVQ_COLS && fits(b))
             .filter(|_| x.2 == w.cols && w.cols.is_multiple_of(256) && F16_TYPES.contains(&w.ty.code())) {
@@ -1019,7 +1104,7 @@ impl Part {
 }
 
 impl<'g> Ds4<'g> {
-    /// Loads the model over `gpus` (layers split evenly by count, or as NS_SPLIT says; the head on the last). Per GPU,
+    /// Loads the model over `gpus` (layers split by the cards' speed, or as NS_SPLIT says; the head on the last). Per GPU,
     /// `expert_bytes` of VRAM for routed experts (None: what is free less the passes' needs); `mirror_bytes` of pinned
     /// host memory in all for the experts that do not fit (None: what the host has available less 10 GiB), shared by
     /// the parts in proportion to their layers. `kv`: (context, sessions) - their attention caches are held back from
@@ -1041,7 +1126,18 @@ impl<'g> Ds4<'g> {
         let mirror = mirror_bytes.unwrap_or(mem_available().saturating_sub(10 << 30));
         let mut parts = Vec::new();
         let mut owner = vec![0usize; n as usize];
-        let mut bounds: Vec<u64> = (0..=k).map(|i| i * n / k).collect();
+        // layers by each card's speed: the square root of its compute (units x clock), so a faster card takes more
+        // without its share of the pinned memory running short (B70 + B65: 25 / 18 layers - by count 21 / 22 decoded
+        // 20.4 tok/s, 24-26 21.1-21.6; by compute alone 28, its experts spilled to the file: 14.9)
+        let speed: Vec<f64> = gpus.iter().map(|g| nextsycl_core::gpu_units(g.index).map_or(1.0, |(u, m)| ((u as f64) * (m as f64)).max(1.0).sqrt())).collect();
+        let total: f64 = speed.iter().sum();
+        let mut acc = 0.0;
+        let mut bounds: Vec<u64> = vec![0];
+        for s in &speed {
+            acc += s;
+            bounds.push(((acc / total) * n as f64).round() as u64);
+        }
+        bounds[k as usize] = n;
         if let Ok(v) = std::env::var("NS_SPLIT") {
             let counts: Vec<u64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
             if counts.len() + 1 == k as usize && counts.iter().sum::<u64>() < n {
@@ -1095,7 +1191,8 @@ impl<'g> Ds4<'g> {
         let load_bytes = parts.iter().map(|p| p.weight_bytes).sum();
         let gpu_prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "gpu");
         let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1" || v == "gpu").then(|| Mutex::new(BTreeMap::new()));
-        Ok(Ds4 { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, hash, prof, gpu_prof, stamps: Mutex::new(Vec::new()) })
+        Ok(Ds4 { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, hash, prof, gpu_prof, stamps: Mutex::new(Vec::new()),
+                 decoding: false.into() })
     }
 
     pub fn gpu_info(&self) -> Vec<GpuInfo> {
@@ -1140,6 +1237,7 @@ impl<'g> Ds4<'g> {
 
     fn lap(&self, p: &Part, name: &'static str, from: Option<Mk>) -> Option<Mk> {
         let (pr, t0) = (self.prof.as_ref()?, from?);
+        let name = if self.decoding.load(std::sync::atomic::Ordering::Relaxed) { decode_name(name) } else { name };
         match t0 {
             Mk::Gpu(a) => {
                 let b = p.ops.stamp().ok()?;
@@ -1453,7 +1551,7 @@ impl<'g> Ds4<'g> {
         }
         let t_q = self.lap(p, "attn: compressors", t_comp);
         // the queries' side, a block of rows at a time
-        let rb = if t <= MMVQ_COLS { t } else { ATT_ROWS.min(t) };
+        let rb = if t <= MMVQ_COLS { t } else { att_rows().min(t) };
         let oa = p.arena.f32(t * ng * ol)?;
         let q = p.arena.f32(rb * nh * hd)?;
         let att = p.arena.f32(rb * nh * hd)?;
@@ -1461,6 +1559,7 @@ impl<'g> Ds4<'g> {
         let sinks = p.vec(l, Role::Sinks)?;
         let scale = 1.0 / (hd as f32).sqrt();
         let qb = p.mat(l, Role::QB)?;
+        let mut t_s = t_q;
         for r0 in (0..t).step_by(rb) {
             let tr = rb.min(t - r0);
             p.matmul(qb, tr, (&qr, r0 * ql, ql), (&q, 0, nh * hd), false)?;
@@ -1469,6 +1568,7 @@ impl<'g> Ds4<'g> {
             if r0 == 0 && tr == t {
                 tap(&format!("q-{l}"), &q)?;
             }
+            t_s = self.lap(p, "attn: q_b", t_s);
             let sel = match st.comp.as_ref().and_then(|c| c.idx.as_ref()) {
                 Some(ix) => {
                     let xv = x.view(r0 * d * 4, tr * d * 4)?;
@@ -1477,8 +1577,10 @@ impl<'g> Ds4<'g> {
                 }
                 None => None,
             };
+            t_s = self.lap(p, "attn: indexer", t_s);
             let comp = st.comp.as_ref().map(|c| (&c.cache, c.ratio, c.cache.len / (512 * 2)));
             o.attend(&q, &st.raw, rr, comp, sel.as_ref().map(|s| (s, g.idx_top_k as usize)), sinks, &att, tr, nh, pos0 + r0, g.window as usize, scale)?;
+            t_s = self.lap(p, "attn: attend", t_s);
             o.rope(&att, tr, nh, nh * hd, hd, hd - rd, rd, pos0 + r0, 1, rope, true)?;
             if r0 == 0 && tr == t {
                 tap(&format!("attn_derope-{l}"), &att)?;
@@ -1491,8 +1593,9 @@ impl<'g> Ds4<'g> {
                 p.matmul(w, tr, (&perm, gi * tr * gw, gw), (&og, gi * tr * ol, ol), false)?;
             }
             o.permute(&og, &oa.view(r0 * ng * ol * 4, tr * ng * ol * 4)?, ng, tr, ol)?;
+            t_s = self.lap(p, "attn: o_a", t_s);
         }
-        let t_out = self.lap(p, "attn: queries, attention, o_a", t_q);
+        let t_out = t_s;
         let out = p.mm(l, Role::OutB, &oa, t)?;
         self.lap(p, "attn: o_b", t_out);
         tap(&format!("attn_out-{l}"), &out)?;
@@ -1694,6 +1797,7 @@ impl<'g> Ds4<'g> {
     fn run_layers(&self, layers: &[Att], run: (usize, u64, u64), x: DevBuf, pos0: usize, tokens: &[u32], tap: Tap) -> Result<DevBuf> {
         let g = &self.m.g;
         let t = tokens.len();
+        self.decoding.store(profile_split() && t <= MMVQ_COLS, std::sync::atomic::Ordering::Relaxed);
         let d = g.n_embd as usize;
         let p = &self.parts[run.0];
         let o = &p.ops;
@@ -1928,13 +2032,28 @@ impl<'g> Ds4<'g> {
             None
         };
         tap(&format!("ffn_moe_logits-{l}"), &logits)?;
+        // the logits on their way down (kernels into pinned memory), the shared expert queued behind them: it runs
+        // while the host picks the routed experts
+        let mut down: Vec<(&DevBuf, usize)> = vec![(&logits, t * ne)];
+        if let Some(gl) = &guess {
+            down.push((gl, t * ne));
+        }
+        let pending = p.read_start(&down)?;
+        let y = self.timed(p, "shared expert", || {
+            let mut pj = p.mm_many(l, &[Role::ShGate, Role::ShUp], x, t)?.into_iter();
+            let (sg, su) = (pj.next().unwrap(), pj.next().unwrap());
+            o.swiglu_clamp(&sg, &su, &sg, t * g.ffn_expert as usize * g.n_expert_shared as usize, lim)?;
+            p.mm(l, Role::ShDown, &sg, t)
+        })?;
         let tw = Instant::now();
-        let lv = logits.to_f32()?;
-        ROUTER_WAIT_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        let guess = match guess {
-            Some(gl) => Some(gl.to_f32()?),
-            None => None,
+        let (lv, guess) = match pending {
+            Some((tk, spans)) => {
+                let mut v = p.read_finish(tk, &spans)?.into_iter();
+                (v.next().unwrap_or_default(), v.next())
+            }
+            None => (logits.to_f32()?, match &guess { Some(gl) => Some(gl.to_f32()?), None => None }),
         };
+        ROUTER_WAIT_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let hash = self.hash.get(&l);
         let bias = if hash.is_none() { Some(p.router_bias(l)?) } else { None };
         let th = Instant::now();
@@ -1974,13 +2093,7 @@ impl<'g> Ds4<'g> {
             }
         }
         ROUTE_HOST_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        // the shared expert first, then each routed expert added into it
-        let y = self.timed(p, "shared expert", || {
-            let mut pj = p.mm_many(l, &[Role::ShGate, Role::ShUp], x, t)?.into_iter();
-            let (sg, su) = (pj.next().unwrap(), pj.next().unwrap());
-            o.swiglu_clamp(&sg, &su, &sg, t * g.ffn_expert as usize * g.n_expert_shared as usize, lim)?;
-            p.mm(l, Role::ShDown, &sg, t)
-        })?;
+        // the shared expert (queued above), then each routed expert added into it
         tap(&format!("ffn_shexp-{l}"), &y)?;
         let need: Vec<u64> = by.keys().map(|e| *e as u64).collect();
         let promote = t <= MMVQ_COLS && !std::env::var("NS_DECODE_DIRECT").is_ok_and(|v| v == "1");
@@ -2012,7 +2125,7 @@ impl<'g> Ds4<'g> {
             ints.extend(&t_ptr);
             ints.extend(&ent);
             let wb = p.arena.f32(wts.len())?;
-            wb.write_async(0, &wts.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            p.upload(&wb, &wts.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
             // big prompt chunks: each expert expanded to fp16 once a chunk, its tokens through oneMKL's half GEMM
             let f16_min = f16_min();
             if f16_min > 0 && t >= f16_min && t > MMVQ_COLS {
@@ -2028,9 +2141,9 @@ impl<'g> Ds4<'g> {
                     }
                 }
                 let tb = p.arena.bytes(total * 4)?;
-                tb.write_async(0, &gtok.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                p.upload(&tb, &gtok.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 let wtb = p.arena.f32(total)?;
-                wtb.write_async(0, &gw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                p.upload(&wtb, &gw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 let esimd = esimd_max().map_or(p.esimd_gu, |m| m.min(p.esimd_gu));
                 let iq2 = parts.gate.2.code() == 16 && parts.up.2.code() == 16 && parts.up.0 == parts.gate.0 + parts.gate.1;
                 let esimd_rows = |n: usize| (n <= esimd && iq2).then(|| n.max(32).next_power_of_two());
@@ -2134,7 +2247,7 @@ impl<'g> Ds4<'g> {
                         tb.extend(v.to_le_bytes());
                     }
                     let gtab = p.arena.bytes(tb.len())?;
-                    gtab.write_async(0, &tb)?;
+                    p.upload(&gtab, &tb)?;
                     let mut db: Vec<u8> = Vec::with_capacity(n * 12);
                     for v in &pd {
                         db.extend(v.to_le_bytes());
@@ -2143,14 +2256,16 @@ impl<'g> Ds4<'g> {
                         db.extend(i.to_le_bytes());
                     }
                     let dtab = p.arena.bytes(db.len())?;
-                    dtab.write_async(0, &db)?;
+                    p.upload(&dtab, &db)?;
                     let g0 = 2 * e0 * f;
-                    o.mmvq_multi(parts.gate.2.code(), &gtab, 2 * n, &xq, t, (&gu, g0), d, f)?;
+                    self.timed(p, "experts: gate | up", || o.mmvq_multi(parts.gate.2.code(), &gtab, 2 * n, &xq, t, (&gu, g0), d, f))?;
                     let (gv, uv) = (gu.view(g0 * 4, n * f * 4)?, gu.view((g0 + n * f) * 4, n * f * 4)?);
-                    o.swiglu_clamp(&gv, &uv, &gv, n * f, lim)?;
                     let hq = p.arena.bytes(o.q8_bytes(f, n))?;
-                    o.quantize_q8((&gv, 0), &hq, f, n)?;
-                    o.mmvq_multi(parts.down.2.code(), &dtab, n, &hq, n, (&dn, e0 * d), f, d)?;
+                    self.timed(p, "experts: swiglu, quantize", || {
+                        o.swiglu_clamp(&gv, &uv, &gv, n * f, lim)?;
+                        o.quantize_q8((&gv, 0), &hq, f, n)
+                    })?;
+                    self.timed(p, "experts: down", || o.mmvq_multi(parts.down.2.code(), &dtab, n, &hq, n, (&dn, e0 * d), f, d))?;
                 }
                 // the combine: per token its rows of dn, with their weights
                 let mut t_ptr = vec![0i32];
@@ -2166,10 +2281,10 @@ impl<'g> Ds4<'g> {
                     t_ptr.push(ent.len() as i32);
                 }
                 let cb = p.arena.bytes((t + 1 + total) * 4)?;
-                cb.write_async(0, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                p.upload(&cb, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 let wb2 = p.arena.f32(total)?;
-                wb2.write_async(0, &wv.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-                return o.moe_combine(&y, &dn, &cb, &wb2, t, total, d);
+                p.upload(&wb2, &wv.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                return self.timed(p, "experts: combine", || o.moe_combine(&y, &dn, &cb, &wb2, t, total, d));
             }
             if parts.gate.2 == parts.up.2 && o.moe_grouped_supported(parts.gate.2.code(), parts.down.2.code(), d, f) {
                 let lists: Vec<&Vec<(i32, f32)>> = by.values().collect();
@@ -2203,7 +2318,7 @@ impl<'g> Ds4<'g> {
                         }
                     }
                     let b = p.arena.bytes(tb.len())?;
-                    b.write_async(0, &tb)?;
+                    p.upload(&b, &tb)?;
                     Ok((b, gs.len(), n))
                 };
                 let xq = p.arena.bytes(o.q8_1_bytes(d, t))?;
@@ -2236,7 +2351,7 @@ impl<'g> Ds4<'g> {
                     }
                 }
                 let cb = p.arena.bytes((t + 1 + total) * 4)?;
-                cb.write_async(0, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                p.upload(&cb, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 return o.moe_combine(&y, &dn, &cb, &wb, t, total, d);
             }
             // the types the grouped kernels do not take (MXFP4's down): each expert's three products
@@ -2244,7 +2359,7 @@ impl<'g> Ds4<'g> {
                 o.await_ticket(tk)?;
             }
             let ib = p.arena.bytes(ints.len() * 4)?;
-            ib.write_async(0, &ints.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            p.upload(&ib, &ints.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
             let xe = p.arena.f32(total * d)?;
             o.gather(x, &ib, &xe, total, d)?;
             let gt = p.arena.f32(total * f)?;

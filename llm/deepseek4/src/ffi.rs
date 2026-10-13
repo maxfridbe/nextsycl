@@ -1,5 +1,6 @@
-//! The kernels this engine runs, bound from the language kind's kernel library by name: its own
-//! (`kernels/llm/deepseek4/ds4.h`) and the generic ones of the glm5next engine's (`kernels/llm/glm5next/glm.h`: the
+//! The kernels this engine runs, bound by name: its own from its silo (`kernels/llm/deepseek4/silo/ds4.h`, built as
+//! dist/silo/libnextsycl-deepseek4.so - there is no shared fallback for them, so the engine needs it) and, from the
+//! language kind's kernel library, the generic ones of the glm5next engine's (`kernels/llm/glm5next/glm.h`: the
 //! mHC halves, norms, GEMMs, the indexer's scores and top-k, the decode products, the grouped experts).
 
 use std::ffi::{c_int, c_void};
@@ -65,6 +66,8 @@ pub struct Api {
     pub ds4_quantize_q8: unsafe extern "C" fn(Gpu, *const f32, *mut c_void, i64, i64) -> c_int,
     pub ds4_multi_supported: unsafe extern "C" fn(c_int, i64) -> c_int,
     pub ds4_mmvq_multi: unsafe extern "C" fn(Gpu, c_int, *const u64, *const i32, i64, *const c_void, i64, *mut f32, i64, i64) -> c_int,
+    pub ds4_kcopy: unsafe extern "C" fn(Gpu, *mut c_void, *const c_void, usize, *mut i64) -> c_int,
+    pub ds4_ticket_wait: unsafe extern "C" fn(Gpu, i64) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -83,6 +86,23 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
                     return Err(format!("{} is not in the kernel library (rebuild it: ./build.sh kernels)", $name));
                 }
                 // SAFETY: the symbol is declared in glm.h / ds4.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        // this engine's own kernels: its silo's library (they resolve the shared part against the kind's, loaded first)
+        let silo = nextsycl_core::silo(crate::ARCH)
+            .map_err(|e| e.0)?
+            .ok_or("deepseek4: no silo library (dist/silo/libnextsycl-deepseek4.so; build it: ./build.sh kernels)")?;
+        macro_rules! own {
+            ($name:literal) => {{
+                let p = silo.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", silo.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in ds4.h with the field's signature.
                 #[allow(clippy::missing_transmute_annotations)]
                 unsafe {
                     std::mem::transmute::<*mut c_void, _>(p)
@@ -124,20 +144,22 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             moe_grouped_supported: sym!("ns_moe_grouped_supported"),
             moe_scratch_bytes: sym!("ns_moe_scratch_bytes"),
             moe_grouped: sym!("ns_moe_grouped"),
-            ds4_rope: sym!("ns_ds4_rope"),
-            ds4_pool: sym!("ns_ds4_pool"),
-            ds4_ring_put: sym!("ns_ds4_ring_put"),
-            ds4_rows_f16: sym!("ns_ds4_rows_f16"),
-            ds4_attend: sym!("ns_ds4_attend"),
-            ds4_hc_head: sym!("ns_ds4_hc_head"),
-            ds4_permute: sym!("ns_ds4_permute"),
-            ds4_mxfp4_dequant: sym!("ns_ds4_mxfp4_dequant"),
-            ds4_mxfp4_dequant_f16: sym!("ns_ds4_mxfp4_dequant_f16"),
-            ds4_mxfp4_mmvq: sym!("ns_ds4_mxfp4_mmvq"),
-            ds4_q8_bytes: sym!("ns_ds4_q8_bytes"),
-            ds4_quantize_q8: sym!("ns_ds4_quantize_q8"),
-            ds4_multi_supported: sym!("ns_ds4_multi_supported"),
-            ds4_mmvq_multi: sym!("ns_ds4_mmvq_multi"),
+            ds4_rope: own!("ns_ds4_rope"),
+            ds4_pool: own!("ns_ds4_pool"),
+            ds4_ring_put: own!("ns_ds4_ring_put"),
+            ds4_rows_f16: own!("ns_ds4_rows_f16"),
+            ds4_attend: own!("ns_ds4_attend"),
+            ds4_hc_head: own!("ns_ds4_hc_head"),
+            ds4_permute: own!("ns_ds4_permute"),
+            ds4_mxfp4_dequant: own!("ns_ds4_mxfp4_dequant"),
+            ds4_mxfp4_dequant_f16: own!("ns_ds4_mxfp4_dequant_f16"),
+            ds4_mxfp4_mmvq: own!("ns_ds4_mxfp4_mmvq"),
+            ds4_q8_bytes: own!("ns_ds4_q8_bytes"),
+            ds4_quantize_q8: own!("ns_ds4_quantize_q8"),
+            ds4_multi_supported: own!("ns_ds4_multi_supported"),
+            ds4_mmvq_multi: own!("ns_ds4_mmvq_multi"),
+            ds4_kcopy: own!("ns_ds4_kcopy"),
+            ds4_ticket_wait: own!("ns_ds4_ticket_wait"),
         })
     })
     .as_ref()

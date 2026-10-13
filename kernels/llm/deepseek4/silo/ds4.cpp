@@ -6,6 +6,7 @@
 
 #include <sycl/sycl.hpp>
 #include <cmath>
+#include <cstdlib>
 
 namespace {
 
@@ -220,6 +221,8 @@ extern "C" {
 int ns_ds4_attend(ns_gpu* g, const float* q, const uint16_t* raw, int64_t R, const uint16_t* comp, int64_t ratio, const int32_t* sel, int64_t K,
                   const float* sinks, float* out, int64_t T, int64_t H, int64_t pos0, int64_t window, float scale) {
     NS_TRY
+    static const bool xmx = [] { const char* v = getenv("NS_DS4_ATTN_XMX"); return !v || v[0] != '0'; }();
+    if (xmx && ns_ds4_attend_xmx_supported(H, 512)) return ns_ds4_attend_xmx(g, q, raw, R, comp, ratio, sel, K, sinks, out, T, H, pos0, window, scale);
     // the most cells a row reads: the window, and the blocks the last row sees (or K of them)
     const int64_t last = pos0 + T - 1;
     int64_t vis = comp ? (last + 1) / ratio : 0;
@@ -326,6 +329,33 @@ int ns_ds4_mxfp4_mmvq(ns_gpu* g, const void* w, const void* x_q8_1, float* y, in
             if (lane == 0) y[c * n_out + o] = r;
         }
     });
+    return 0;
+    NS_CATCH
+}
+
+int ns_ds4_kcopy(ns_gpu* g, void* dst, const void* src, size_t n, int64_t* ticket) {
+    NS_TRY
+    if (n % 4 != 0) return ns_fail("ns_ds4_kcopy: a multiple of 4 bytes");
+    sycl::event e;
+    if (n % 16 == 0) {
+        const sycl::uint4* s = static_cast<const sycl::uint4*>(src);
+        sycl::uint4* d = static_cast<sycl::uint4*>(dst);
+        e = g->q.parallel_for(sycl::range<1>(n / 16), [=](sycl::id<1> i) { d[i] = s[i]; });
+    } else {
+        const uint32_t* s = static_cast<const uint32_t*>(src);
+        uint32_t* d = static_cast<uint32_t*>(dst);
+        e = g->q.parallel_for(sycl::range<1>(n / 4), [=](sycl::id<1> i) { d[i] = s[i]; });
+    }
+    const int64_t t = g->next_ev++;
+    g->ev[t % g->ev.size()] = e;
+    *ticket = t;
+    return 0;
+    NS_CATCH
+}
+
+int ns_ds4_ticket_wait(ns_gpu* g, int64_t t) {
+    NS_TRY
+    g->ev[t % g->ev.size()].wait();
     return 0;
     NS_CATCH
 }

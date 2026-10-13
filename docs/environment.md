@@ -400,12 +400,20 @@ file; decode multiplies the pinned ones on the CPU.
 
 ### deepseek4
 
-DeepSeek-V4-Flash (`llm/deepseek4`, its kernels `kernels/llm/deepseek4`): a fork of glm5next, which also reads that
+DeepSeek-V4-Flash (`llm/deepseek4`, its kernels its silo `kernels/llm/deepseek4/silo`): a fork of glm5next, which also reads that
 engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
 | `NS_DS4_MULTI` | on | 0: decode runs each expert on its own instead of a layer's experts in two launches | llm deepseek4 |
+| `NS_PROFILE_SPLIT` | off | 1: with NS_PROFILE, decode passes' sections counted apart from the prompt's ("decode: ...") | llm deepseek4 |
+| `NS_SPLIT` | by speed | layers a GPU, all but the last (default: by the square root of each card's units x clock - B70 + B65: 25 / 18) | llm deepseek4 |
+| `NS_DS4_ATT_ROWS` | 2048 | a prompt pass's query rows the attention block takes at a time (q_b, attention, o_a; 64..8192) | llm deepseek4 |
+| `NS_DS4_ATTN_SPLIT` | on | 0: decode rows' attention in one work-group a head group instead of split over the cells and merged | kernels:llm deepseek4 |
+| `NS_DS4_BENCH_LAYER` | 5 | the layer whose experts `llm kernels` times in the multi-expert launches | llm deepseek4 (kernels) |
+| `NS_DS4_DENSE_F16_MIN` | 64 | dense products of at least this many rows in fp16 on XMX (0: never; the experts keep NS_PROMPT_F16_MIN) | llm deepseek4 |
+| `NS_DS4_ATTN_XMX` | on | 0: attention on the vector units (the first kernel) instead of XMX | kernels:llm deepseek4 |
+| `NS_DS4_ATTN_G` | 8 from 64 rows, else 2 | Experiment: groups of 8 heads an attention work-group takes (1, 2, 4, 8) | kernels:llm deepseek4 |
 | `NS_DS4_MULTI_GROUPS` | 1024 | Experiment: work-groups of the multi-expert decode kernels | kernels:llm deepseek4 |
 
 ## Tests and checks
