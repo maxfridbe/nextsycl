@@ -73,11 +73,14 @@ int ns_ds4_ticket_wait(ns_gpu* g, int64_t t);
  * layout (q8_bytes: ncols x n_in quants, then their fp16 scales a block of 32, then each 16 quants' sum) */
 size_t ns_ds4_q8_bytes(int64_t n_in, int64_t ncols);
 int ns_ds4_quantize_q8(ns_gpu* g, const float* x, void* xs, int64_t n_in, int64_t ncols);
-/* the types it takes: Q8_0 (8), IQ2_XXS (16), IQ3_XXS (18), IQ2_S (22), MXFP4 (39), n_in a multiple of 256 */
+/* the types it takes: Q8_0 (8), Q5_K (13), IQ2_XXS (16), IQ3_XXS (18), IQ2_S (22), MXFP4 (39), n_in a multiple of 256 */
 int ns_ds4_multi_supported(int type, int64_t n_in);
 /* y [entries, n_out]: entry e = the matrix at ptrs[e] (n_out rows of n_in, the type's blocks) against column cols[e] of xs */
 int ns_ds4_mmvq_multi(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* cols, int64_t entries, const void* xs, int64_t ncols, float* y,
                       int64_t n_in, int64_t n_out);
+/* the same with entries of different heights: entry e's rows [rstart[e], rstart[e + 1]) of y, total_rows in all */
+int ns_ds4_mmvq_multi_var(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* cols, const int32_t* rstart, int64_t entries, const void* xs,
+                          int64_t ncols, float* y, int64_t n_in, int64_t total_rows);
 
 #ifdef __cplusplus
 }

@@ -623,4 +623,22 @@ impl Ops {
         let rc = unsafe { (self.k.ds4_ticket_wait)(self.raw(), t) };
         self.ok(rc, "ds4_ticket_wait")
     }
+    /// y [total_rows] (floats from `y.1`): entry e the matrix at the e-th pointer of `table` (u64 [entries], then i32
+    /// cols [entries], then i32 row starts [entries + 1]) against that column of xs, into its rows of y
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmvq_multi_var(&self, ty: u32, table: &DevBuf, entries: usize, xs: &DevBuf, ncols: usize, y: (&DevBuf, usize), n_in: usize, total_rows: usize) -> Result<()> {
+        if entries == 0 {
+            return Ok(());
+        }
+        table.bounds(0, entries * 16 + 4)?;
+        xs.bounds(0, self.q8_bytes(n_in, ncols))?;
+        need!(y.0, y.1 + total_rows, "mmvq_multi_var y");
+        // SAFETY: sizes checked; the pointers are the caller's (VRAM matrices of this GPU).
+        let rc = unsafe {
+            let base = table.ptr().cast::<u8>();
+            (self.k.ds4_mmvq_multi_var)(self.raw(), ty as i32, base.cast(), base.add(entries * 8).cast(), base.add(entries * 12).cast(), entries as i64, xs.ptr(),
+                                        ncols as i64, y.0.fp().add(y.1), n_in as i64, total_rows as i64)
+        };
+        self.ok(rc, "ds4_mmvq_multi_var")
+    }
 }

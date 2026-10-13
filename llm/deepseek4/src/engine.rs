@@ -249,6 +249,13 @@ struct ExpertParts {
     down: (usize, usize, GType),
 }
 
+/// Decode's dense products of one input through the multi-matrix kernel, a launch a type (NS_DS4_MULTI_DENSE=0: the
+/// shared kernels, a launch a matrix)
+fn multi_dense() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS4_MULTI_DENSE").map_or(true, |v| v != "0"))
+}
+
 /// NS_PROFILE_SPLIT=1: the profile's decode passes apart from the prompt's
 fn profile_split() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -364,6 +371,8 @@ pub struct Part {
     back: Mutex<HostBuf>,
     /// o_a's multi-matrix tables by (layer, rows): the groups' pointers for each row, then the columns
     oa_tabs: Mutex<HashMap<(u64, usize), Arc<DevBuf>>>,
+    /// the dense matrices' multi-matrix tables (mm_many), by layer, rows and matrices
+    multi_tabs: Mutex<HashMap<String, Arc<DevBuf>>>,
 }
 
 /// the pinned rings' sizes
@@ -744,7 +753,36 @@ impl Part {
         let up = Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0));
         let back = Mutex::new(HostBuf::new(gpu, BACK_BYTES)?);
         Ok(Part { ops, arena, big, small, biases: Mutex::new(HashMap::new()), layers, mats, vecs, groups, scratch, x16, q8, esimd_gu, experts: Mutex::new(store),
-                  hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes, up, back, oa_tabs: Mutex::new(HashMap::new()) })
+                  hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv + lend, host_slots: nr, weight_bytes: bytes, up, back, oa_tabs: Mutex::new(HashMap::new()), multi_tabs: Mutex::new(HashMap::new()) })
+    }
+
+    /// The multi-matrix table of layer l's matrices `ks` (of `roles`) for t rows (made once): entry (k, r) = matrix
+    /// k against column r, its rows after the previous entry's
+    fn multi_table(&self, l: u64, roles: &[Role], ks: &[usize], ws: &[&Mat], t: usize) -> Result<Arc<DevBuf>> {
+        let key = format!("{l}:{t}:{:?}", ks.iter().map(|&k| roles[k]).collect::<Vec<_>>());
+        let mut m = self.multi_tabs.lock().unwrap();
+        if let Some(b) = m.get(&key) {
+            return Ok(b.clone());
+        }
+        let (mut ptrs, mut cols, mut starts) = (Vec::new(), Vec::new(), vec![0i32]);
+        for &k in ks {
+            for r in 0..t {
+                ptrs.push(ws[k].buf.ptr() as u64);
+                cols.push(r as i32);
+                starts.push(starts.last().unwrap() + ws[k].rows as i32);
+            }
+        }
+        let mut tb: Vec<u8> = Vec::new();
+        for v in &ptrs {
+            tb.extend(v.to_le_bytes());
+        }
+        for v in cols.iter().chain(&starts) {
+            tb.extend(v.to_le_bytes());
+        }
+        let b = Arc::new(DevBuf::new(&self.ops.gpu, tb.len())?);
+        b.write(0, &tb)?;
+        m.insert(key, b.clone());
+        Ok(b)
     }
 
     /// Layer l's o_a table for `tr` rows (made once): entry r * groups + g = group g's rows against column of the same
@@ -1080,6 +1118,38 @@ impl Part {
         let ws: Vec<&Mat> = roles.iter().map(|r| self.mat(l, *r)).collect::<Result<_>>()?;
         let quantized = ws.iter().filter(|w| !w.f32 && self.ops.mmvq_supported(w.ty.code())).count();
         let cols = ws[0].cols;
+        // decode widths: the matrices of each type this engine's multi-matrix kernel takes in one launch (each
+        // (matrix, row) an entry, the tables kept a layer) - the projections in 2 launches, the shared gate | up in 1
+        let own = |w: &Mat| !w.f32 && w.cols == cols && self.ops.multi_supported(w.ty.code(), cols);
+        if t <= MMVQ_COLS && multi_dense() && ws.iter().any(|w| own(w)) {
+            let xs = self.arena.bytes(self.ops.q8_bytes(cols, t))?;
+            self.ops.quantize_q8((x, 0), &xs, cols, t)?;
+            let mut out: Vec<Option<DevBuf>> = (0..ws.len()).map(|_| None).collect();
+            let mut types: Vec<GType> = ws.iter().filter(|w| own(w)).map(|w| w.ty).collect();
+            types.dedup();
+            types.sort_by_key(|ty| ty.code());
+            types.dedup();
+            for ty in types {
+                let ks: Vec<usize> = (0..ws.len()).filter(|&k| own(ws[k]) && ws[k].ty == ty).collect();
+                let total: usize = ks.iter().map(|&k| t * ws[k].rows).sum();
+                let tab = self.multi_table(l, roles, &ks, &ws, t)?;
+                let y = self.arena.f32(total)?;
+                self.ops.mmvq_multi_var(ty.code(), &tab, ks.len() * t, &xs, t, (&y, 0), cols, total)?;
+                let mut at = 0;
+                for &k in &ks {
+                    out[k] = Some(y.view(at * 4, t * ws[k].rows * 4)?);
+                    at += t * ws[k].rows;
+                }
+            }
+            return ws.iter().zip(out).map(|(w, o)| match o {
+                Some(y) => Ok(y),
+                None => {
+                    let y = self.arena.f32(t * w.rows)?;
+                    self.matmul(w, t, (x, 0, w.cols), (&y, 0, w.rows), false)?;
+                    Ok(y)
+                }
+            }).collect();
+        }
         if t <= MMVQ_COLS && quantized > 1 && ws.iter().all(|w| w.cols == cols) && cols <= MAX_COLS {
             self.ops.quantize_q8_1((x, 0), &self.q8, cols, t)?;
             return ws.iter().map(|w| {
@@ -1465,7 +1535,7 @@ impl<'g> Ds4<'g> {
             self.m.file.read_into(emb, *tok as u64 * rb as u64, &mut rows[i * rb..(i + 1) * rb]).map_err(e)?;
         }
         let raw = DevBuf::new(&p.ops.gpu, rows.len())?;
-        raw.write_async(0, &rows)?;
+        p.upload(&raw, &rows)?;
         let x = DevBuf::f32(&p.ops.gpu, tokens.len() * g.n_embd as usize)?;
         p.ops.dequant(emb.ty.code(), &raw, 0, rows.len(), tokens.len() * g.n_embd as usize, &x)?;
         Ok(x)
@@ -1782,14 +1852,25 @@ impl<'g> Ds4<'g> {
         let m_emb = self.mark(p0);
         let x0 = self.embed(p0, tokens)?;
         tap("inp_embd", &x0)?;
-        let e0 = x0.to_f32()?;
-        let mut xs = vec![0f32; t * 4 * d];
-        for ti in 0..t {
-            for s in 0..4 {
-                xs[(ti * 4 + s) * d..(ti * 4 + s + 1) * d].copy_from_slice(&e0[ti * d..(ti + 1) * d]);
+        let x_init = if t <= MMVQ_COLS {
+            // each row 4 times on the GPU (kernel copies: no trip through the host behind the expert copies)
+            let xi = DevBuf::f32(&p0.ops.gpu, t * 4 * d)?;
+            for ti in 0..t {
+                for s in 0..4 {
+                    p0.ops.kcopy(&xi, (ti * 4 + s) * d * 4, &x0, ti * d * 4, d * 4)?;
+                }
             }
-        }
-        let x_init = DevBuf::from_f32(&p0.ops.gpu, &xs)?;
+            xi
+        } else {
+            let e0 = x0.to_f32()?;
+            let mut xs = vec![0f32; t * 4 * d];
+            for ti in 0..t {
+                for s in 0..4 {
+                    xs[(ti * 4 + s) * d..(ti * 4 + s + 1) * d].copy_from_slice(&e0[ti * d..(ti + 1) * d]);
+                }
+            }
+            DevBuf::from_f32(&p0.ops.gpu, &xs)?
+        };
         tap("hc_init", &x_init)?;
         self.lap(p0, "embedding + the 4 streams", m_emb);
         Ok(x_init)
@@ -1798,6 +1879,18 @@ impl<'g> Ds4<'g> {
     fn to_part(&self, pi: usize, x: &DevBuf, staging: &mut Vec<u8>) -> Result<DevBuf> {
         let p = &self.parts[pi];
         let next = DevBuf::new(&p.ops.gpu, x.len)?;
+        // decode widths: down by a kernel into the previous part's pinned buffer, up through this one's ring (the
+        // runtime's copies wait behind the expert store's on the copy engines)
+        if pi > 0 && x.len % 4 == 0 {
+            let src = &self.parts[pi - 1];
+            if let Some((tk, spans)) = src.read_start(&[(x, x.len / 4)])? {
+                return self.timed(p, "GPU to GPU", || {
+                    let v = src.read_finish(tk, &spans)?.into_iter().next().unwrap_or_default();
+                    p.upload(&next, &v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>())?;
+                    Ok(next)
+                });
+            }
+        }
         staging.resize(staging.len().max(x.len), 0);
         self.timed(p, "GPU to GPU", || next.copy_from_peer(x, staging))?;
         Ok(next)
@@ -1885,7 +1978,11 @@ impl<'g> Ds4<'g> {
         tap("result_norm", &out)?;
         let logits = p.mm(0, Role::Output, &out, n_out)?;
         tap("result_output", &logits)?;
-        let v = logits.to_f32()?;
+        let n = n_out * g.n_vocab as usize;
+        let v = match p.read_start(&[(&logits, n)])? {
+            Some((tk, spans)) => p.read_finish(tk, &spans)?.into_iter().next().unwrap_or_default(),
+            None => logits.to_f32()?,
+        };
         self.lap(p, "head", m_head);
         let vocab = g.n_vocab as usize;
         Ok(v.chunks(vocab).map(|c| c.to_vec()).collect())

@@ -66,6 +66,7 @@ pub struct Api {
     pub ds4_quantize_q8: unsafe extern "C" fn(Gpu, *const f32, *mut c_void, i64, i64) -> c_int,
     pub ds4_multi_supported: unsafe extern "C" fn(c_int, i64) -> c_int,
     pub ds4_mmvq_multi: unsafe extern "C" fn(Gpu, c_int, *const u64, *const i32, i64, *const c_void, i64, *mut f32, i64, i64) -> c_int,
+    pub ds4_mmvq_multi_var: unsafe extern "C" fn(Gpu, c_int, *const u64, *const i32, *const i32, i64, *const c_void, i64, *mut f32, i64, i64) -> c_int,
     pub ds4_kcopy: unsafe extern "C" fn(Gpu, *mut c_void, *const c_void, usize, *mut i64) -> c_int,
     pub ds4_ticket_wait: unsafe extern "C" fn(Gpu, i64) -> c_int,
 }
@@ -158,6 +159,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             ds4_quantize_q8: own!("ns_ds4_quantize_q8"),
             ds4_multi_supported: own!("ns_ds4_multi_supported"),
             ds4_mmvq_multi: own!("ns_ds4_mmvq_multi"),
+            ds4_mmvq_multi_var: own!("ns_ds4_mmvq_multi_var"),
             ds4_kcopy: own!("ns_ds4_kcopy"),
             ds4_ticket_wait: own!("ns_ds4_ticket_wait"),
         })

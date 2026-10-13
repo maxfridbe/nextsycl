@@ -235,6 +235,45 @@ struct WideQ8_0 {
     static float dot(const W& r, const X& v) { return r.d * v.d * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)); }
 };
 
+// ---- Q5_K (176-byte blocks of 256, 16-byte aligned: d, dmin, 12 bytes of 6-bit scales and mins, qh [32], qs [128]):
+// lane g = sub-block g - its 32 values' low nibbles (qs[32 (g / 2) + j], the high nibble for odd g) and bit g of
+// qh[j] as unsigned 5-bit codes; value = d sc_g q - dmin m_g, so a dot is d sc_g (q . x) - dmin m_g (sum x) with the
+// activations' sums the split layout carries (the shared expert's gate | up in one launch, and q_a)
+struct WideQ5K {
+    struct XT { sycl::int4 u0, u1; float d; int s; };
+    static XT xl(int g, const XA& xa, int b0) { const X v = xload(g, xa, b0); return XT{v.u0, v.u1, v.d, v.s}; }
+    using Block = block_q5_K;
+    static constexpr int LUT = 0;
+    static uint32_t lut(int) { return 0; }
+    struct W { sycl::int4 lo, hi; float dsc, dmn; };
+    static W load(const Block* b, int g, const uint32_t*) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(b);
+        const sycl::uint4* qs = reinterpret_cast<const sycl::uint4*>(p + 48 + 32 * (g >> 1));
+        const sycl::uint4* qh = reinterpret_cast<const sycl::uint4*>(p + 16);
+        const sycl::uint4 l0 = qs[0], l1 = qs[1], h0 = qh[0], h1 = qh[1];
+        const int sh = 4 * (g & 1);
+        auto code = [&](uint32_t l, uint32_t h) { return int(((l >> sh) & 0x0f0f0f0fu) | (((h >> g) & 0x01010101u) << 4)); };
+        W r;
+        r.lo = sycl::int4(code(l0.x(), h0.x()), code(l0.y(), h0.y()), code(l0.z(), h0.z()), code(l0.w(), h0.w()));
+        r.hi = sycl::int4(code(l1.x(), h1.x()), code(l1.y(), h1.y()), code(l1.z(), h1.z()), code(l1.w(), h1.w()));
+        // ggml's get_scale_min_k4
+        const uint8_t* sc = p + 4;
+        uint32_t s, m;
+        if (g < 4) {
+            s = sc[g] & 63;
+            m = sc[g + 4] & 63;
+        } else {
+            s = (sc[g + 4] & 0xf) | ((sc[g - 4] >> 6) << 4);
+            m = (sc[g + 4] >> 4) | ((sc[g] >> 6) << 4);
+        }
+        const sycl::half* dd = reinterpret_cast<const sycl::half*>(p);
+        r.dsc = (float) dd[0] * (float) s;
+        r.dmn = (float) dd[1] * (float) m;
+        return r;
+    }
+    static float dot(const W& r, const XT& v) { return v.d * (r.dsc * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)) - r.dmn * (float) v.s); }
+};
+
 int multi_groups() {   // NS_DS4_MULTI_GROUPS: the work-groups of a layer's experts in one launch (each fills its grid table once; default 1024)
     static const int v = std::getenv("NS_DS4_MULTI_GROUPS") ? std::max(1, std::atoi(std::getenv("NS_DS4_MULTI_GROUPS"))) : 1024;
     return v;
@@ -277,11 +316,80 @@ void fill_tab(uint32_t* tab, const sycl::nd_item<3>& item) {
     sycl::group_barrier(item.get_group());
 }
 
-// y [entries, n_out]: entry e = the matrix at ptrs[e] against column cols[e]; rows of all entries in one stride
-template <typename F>
-void multi(sycl::queue& q, const uint64_t* ptrs, const int32_t* cols, int entries, const void* xs, int ncols, float* y, int n_in, int n_out) {
+// The same products with the activations held: a sub-group takes a run of consecutive rows (mostly one entry's, so
+// one column), loads its lanes' NB activation blocks once - again only where the column changes - and streams the
+// weights. The first scheme loaded a row's activations for every row: 4 KiB of them against its 1 KiB of IQ2_XXS
+// weights (NS_DS4_MULTI_CACHED=0 runs it)
+template <typename F, int NB>
+void multi_cached(sycl::queue& q, const uint64_t* ptrs, const int32_t* cols, int entries, const void* xs, int ncols, float* y, int n_in, int n_out,
+                  const int32_t* rstart, int total_rows) {
     const auto* x = static_cast<const int8_t*>(xs);
-    const std::size_t rows = std::size_t(entries) * n_out;
+    const std::size_t rows = rstart ? std::size_t(total_rows) : std::size_t(entries) * n_out;
+    const unsigned blocks = (unsigned) std::min<std::size_t>((rows + WARPS - 1) / WARPS, std::size_t(multi_groups()));
+    const std::size_t nsg = std::size_t(blocks) * WARPS, chunk = (rows + nsg - 1) / nsg;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
+        h.parallel_for(sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
+                       [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(32)]] {
+                           uint32_t* t = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
+                           fill_tab<F>(t, it);
+                           const int lane = int(it.get_local_id(2)), warp = int(it.get_local_id(1));
+                           const int g = lane & 7, sub = lane >> 3;
+                           const int bpr = n_in / QK;
+                           auto sg = it.get_sub_group();
+                           const std::size_t r0 = (std::size_t(it.get_group(2)) * WARPS + warp) * chunk, r1 = std::min(rows, r0 + chunk);
+                           int e = 0, cur = -1;
+                           typename F::XT xv[NB];
+                           for (std::size_t r = r0; r < r1; ++r) {
+                               int row;
+                               if (rstart) {
+                                   while (e + 1 < entries && int(r) >= rstart[e + 1]) ++e;
+                                   row = int(r) - rstart[e];
+                               } else {
+                                   e = int(r / n_out);
+                                   row = int(r % n_out);
+                               }
+                               const int col = cols[e];
+                               if (col != cur) {
+                                   const XA xa = xcol(x, n_in, ncols, col);
+#pragma unroll
+                                   for (int u = 0; u < NB; ++u)
+                                       if (sub + 4 * u < bpr) xv[u] = F::xl(g, xa, (sub + 4 * u) * (QK / Q8K));
+                                   cur = col;
+                               }
+                               const auto* wr = reinterpret_cast<const typename F::Block*>(ptrs[e]) + std::size_t(row) * bpr;
+                               float v = 0.f;
+#pragma unroll
+                               for (int u = 0; u < NB; ++u)
+                                   if (sub + 4 * u < bpr) v += F::dot(F::load(wr + sub + 4 * u, g, t), xv[u]);
+#pragma unroll
+                               for (int o = WARP / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+                               if (lane == 0) y[r] = v;
+                           }
+                       });
+    });
+}
+
+bool cached_on() {
+    static const bool v = !(std::getenv("NS_DS4_MULTI_CACHED") && std::getenv("NS_DS4_MULTI_CACHED")[0] == '0');
+    return v;
+}
+
+// y [entries, n_out]: entry e = the matrix at ptrs[e] against column cols[e]; rows of all entries in one stride
+// rstart (null: every entry n_out rows): entry e's rows are [rstart[e], rstart[e + 1]) of y - matrices of different
+// heights in one launch (a row finds its entry by a scan: few entries)
+template <typename F>
+void multi(sycl::queue& q, const uint64_t* ptrs, const int32_t* cols, int entries, const void* xs, int ncols, float* y, int n_in, int n_out,
+           const int32_t* rstart = nullptr, int total_rows = 0) {
+    // the IQ types gain (B70: IQ2_XXS 291 -> 312 GB/s, IQ3_XXS 303 -> 317); Q8_0 and Q5_K lose, and keep the first scheme
+    if (cached_on() && F::LUT > 0) {
+        const int bpr = n_in / QK;
+        if (bpr <= 4) return multi_cached<F, 1>(q, ptrs, cols, entries, xs, ncols, y, n_in, n_out, rstart, total_rows);
+        if (bpr <= 8) return multi_cached<F, 2>(q, ptrs, cols, entries, xs, ncols, y, n_in, n_out, rstart, total_rows);
+        if (bpr <= 16) return multi_cached<F, 4>(q, ptrs, cols, entries, xs, ncols, y, n_in, n_out, rstart, total_rows);
+    }
+    const auto* x = static_cast<const int8_t*>(xs);
+    const std::size_t rows = rstart ? std::size_t(total_rows) : std::size_t(entries) * n_out;
     const unsigned blocks = (unsigned) std::min<std::size_t>((rows + WARPS - 1) / WARPS, std::size_t(multi_groups()));
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
@@ -293,7 +401,15 @@ void multi(sycl::queue& q, const uint64_t* ptrs, const int32_t* cols, int entrie
                            const int bpr = n_in / QK;
                            auto sg = it.get_sub_group();
                            for (std::size_t r = std::size_t(it.get_group(2)) * WARPS + warp; r < rows; r += std::size_t(it.get_group_range(2)) * WARPS) {
-                               const int e = int(r / n_out), row = int(r % n_out);
+                               int e, row;
+                               if (rstart) {
+                                   e = 0;
+                                   while (e + 1 < entries && int(r) >= rstart[e + 1]) ++e;
+                                   row = int(r) - rstart[e];
+                               } else {
+                                   e = int(r / n_out);
+                                   row = int(r % n_out);
+                               }
                                const auto* wr = reinterpret_cast<const typename F::Block*>(ptrs[e]) + std::size_t(row) * bpr;
                                float v = row_dot<F>(wr, bpr, xcol(x, n_in, ncols, cols[e]), lane, t);
 #pragma unroll
@@ -341,7 +457,7 @@ int ns_ds4_quantize_q8(ns_gpu* g, const float* x, void* xs, int64_t n_in, int64_
     NS_CATCH
 }
 
-int ns_ds4_multi_supported(int type, int64_t n_in) { return (type == 8 || type == 16 || type == 18 || type == 22 || type == 39) && n_in % QK == 0; }
+int ns_ds4_multi_supported(int type, int64_t n_in) { return (type == 8 || type == 13 || type == 16 || type == 18 || type == 22 || type == 39) && n_in % QK == 0; }
 
 int ns_ds4_mmvq_multi(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* cols, int64_t entries, const void* xs, int64_t ncols, float* y,
                       int64_t n_in, int64_t n_out) {
@@ -350,9 +466,28 @@ int ns_ds4_mmvq_multi(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* 
     if (entries < 1) return 0;
     if (type == 16) multi<WideIQ2XXS>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
     else if (type == 18) multi<WideIQ3XXS>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
+    else if (type == 13) multi<WideQ5K>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
     else if (type == 8) multi<WideQ8_0>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
     else if (type == 22) multi<WideIQ2S>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
     else multi<WideMXFP4>(g->q, ptrs, cols, (int) entries, xs, (int) ncols, y, (int) n_in, (int) n_out);
+    return 0;
+    NS_CATCH
+}
+
+int ns_ds4_mmvq_multi_var(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* cols, const int32_t* rstart, int64_t entries, const void* xs,
+                          int64_t ncols, float* y, int64_t n_in, int64_t total_rows) {
+    NS_TRY
+    if (!ns_ds4_multi_supported(type, n_in)) return ns_fail("ns_ds4_mmvq_multi_var: ggml type " + std::to_string(type) + " at this width is not its own");
+    if (entries < 1 || total_rows < 1) return 0;
+    const int E = (int) entries, NC = (int) ncols, K = (int) n_in, TR = (int) total_rows;
+    switch (type) {
+        case 8: multi<WideQ8_0>(g->q, ptrs, cols, E, xs, NC, y, K, 0, rstart, TR); break;
+        case 13: multi<WideQ5K>(g->q, ptrs, cols, E, xs, NC, y, K, 0, rstart, TR); break;
+        case 16: multi<WideIQ2XXS>(g->q, ptrs, cols, E, xs, NC, y, K, 0, rstart, TR); break;
+        case 18: multi<WideIQ3XXS>(g->q, ptrs, cols, E, xs, NC, y, K, 0, rstart, TR); break;
+        case 22: multi<WideIQ2S>(g->q, ptrs, cols, E, xs, NC, y, K, 0, rstart, TR); break;
+        default: multi<WideMXFP4>(g->q, ptrs, cols, E, xs, NC, y, K, 0, rstart, TR); break;
+    }
     return 0;
     NS_CATCH
 }

@@ -211,7 +211,7 @@ fn expand(o: &crate::ops::Ops, g: &std::sync::Arc<nextsycl_core::Gpu>, ty: nexts
 fn dense_bench(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &crate::ops::Ops, l: u64) -> nextsycl_core::Result<()> {
     use nextsycl_core::DevBuf;
     let mut rng = Rng(99);
-    for (r, groups) in [(Role::OutA, m.g.o_groups as usize), (Role::QB, 1usize)] {
+    for (r, groups) in [(Role::OutA, m.g.o_groups as usize), (Role::QB, 1usize), (Role::QA, 1), (Role::ShGate, 1)] {
         let Some(tn) = m.tensor(l, r) else { continue };
         let (rows, cols) = (tn.shape[tn.shape.len() - 2] as usize, tn.shape[tn.shape.len() - 1] as usize);
         if !o.multi_supported(tn.ty.code(), cols) {
