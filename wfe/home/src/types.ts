@@ -7,12 +7,16 @@ export interface Proc {
   kind?: string;
   command?: string;
   model?: string | null;
+  /** its model's registry id, when its file is a registered one */
+  model_id?: string | null;
   port?: string | null;
   gpus?: string[];
   args?: string;
 }
 
-export interface Vouched { model: string; kind: string; mb: number; measured: boolean; state: string; of?: number }
+/** a model vouched for on a card: `mb` all of it, `headroom_mb` of that its working memory beyond the weights (KV for
+ *  its context, arenas, a song's or an image's activations) - from its model card when given, else from its files */
+export interface Vouched { model: string; kind: string; mb: number; headroom_mb: number; headroom_given: boolean; measured: boolean; state: string; of?: number }
 
 export interface Card {
   index: number;
@@ -29,6 +33,7 @@ export interface Card {
   procs: Proc[];
   vouched: Vouched[];
   vouched_mb: number;
+  vouched_headroom_mb: number;
   overbooked: boolean;
 }
 
@@ -43,6 +48,9 @@ export interface Model {
   gpus: number[];
   state: ModelState;
   vouch_mb: Record<string, number>;
+  /** of vouch_mb, the headroom (Vouched) */
+  headroom_mb: Record<string, number>;
+  headroom_given: boolean;
   measured: boolean;
   page: number;
 }

@@ -179,6 +179,27 @@ impl Home {
         (gpus.iter().map(|g| (*g, per.min(cap))).collect(), false)
     }
 
+    /// Of what a model is vouched for on each card, MiB: the part that is not its weights - the working memory it
+    /// needs to run without running out (KV for its context, arenas, an image's or a song's activations). Its entry's
+    /// or its model card's `headroom_gib` (as measured: steady vs peak), else what is vouched less its files' share of
+    /// the card (an llm's files split over its cards; an image, audio or video model's whole on each). None known (0):
+    /// files at least what is vouched - weights partly off the card (host-mirrored or streamed experts).
+    /// Whether it was given (else derived from the files) comes with it.
+    fn headroom_mb(m: &Value, cards: &[Value], vouch: &BTreeMap<usize, u64>) -> (BTreeMap<usize, u64>, bool) {
+        let card = cards.iter().find(|c| [s(m, "catalog"), s(m, "id")].iter().any(|id| !id.is_empty() && c["id"] == id.as_str()));
+        let given = m["headroom_gib"].as_f64().or_else(|| card.and_then(|c| c["headroom_gib"].as_f64())).filter(|g| *g >= 0.0);
+        if let Some(g) = given {
+            return (vouch.iter().map(|(i, mb)| (*i, ((g * 1024.0) as u64).min(*mb))).collect(), true);
+        }
+        let paths: std::collections::BTreeSet<_> = registry::paths(m).into_iter().filter(|p| p.is_file()).collect();
+        let files: u64 = paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|x| x.len() >> 20).sum();
+        let weights = match registry::kind_of(m) {
+            "llm" => files / vouch.len().max(1) as u64,
+            _ => files,
+        };
+        (vouch.iter().map(|(i, mb)| (*i, if files > 0 { mb.saturating_sub(weights) } else { 0 })).collect(), false)
+    }
+
     /// What the studio says of the chat card: (selected mode, the mode starting)
     fn chat_mode(&self) -> (Option<String>, Option<String>) {
         let v = call_for(&self.target("video"), "POST", "/rpc/llm.mode", Some(&json!({})), 4).ok().map(|v| v.get("result").cloned().unwrap_or(v));
@@ -258,6 +279,8 @@ impl Home {
         let image = if need("image") { self.servers("image") } else { Vec::new() };
         let audio = if need("audio") { self.servers("audio") } else { Vec::new() };
         let video = if need("video") { self.video_daemon() } else { None };
+        // the model cards, read once: for the headroom of entries registered before cards carried it
+        let mc = if all.iter().all(|m| m.get("headroom_gib").is_some()) { Vec::new() } else { self.o.cfg.cards() };
         all.iter().filter(|m| registry::kind_of(m) != "lora").map(|m| {
             let (id, kind) = (s(m, "id"), registry::kind_of(m).to_string());
             let enabled = m["enabled"] != false;
@@ -269,6 +292,7 @@ impl Home {
                 let on = if on.is_empty() { vec![gpus[0]] } else { on };
                 vouch.retain(|g, _| on.contains(g));
             }
+            let (headroom, headroom_given) = Self::headroom_mb(m, &mc, &vouch);
             let mut state = match kind.as_str() {
                 "llm" if chat.0.as_deref() == Some(id.as_str()) => "loaded",
                 "llm" if chat.1 .1.as_deref() == Some(id.as_str()) => "loading",
@@ -300,6 +324,8 @@ impl Home {
             json!({"id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "state": state,
                    "vouch_mb": vouch.iter().map(|(g, mb)| (g.to_string(), json!(mb))).collect::<serde_json::Map<String, Value>>(),
                    "measured": measured,
+                   "headroom_mb": headroom.iter().map(|(g, mb)| (g.to_string(), json!(mb))).collect::<serde_json::Map<String, Value>>(),
+                   "headroom_given": headroom_given,
                    "page": match kind.as_str() { "image" | "audio" => json!(if kind == "image" { &image } else { &audio }.iter()
                                                       .find(|x| x.model.as_deref() == Some(id.as_str())).map_or(self.port_of(&kind), |x| x.port)),
                                                   "video" => json!(self.o.ports.video), _ => json!(self.o.ports.chat_ui) }})
@@ -314,19 +340,24 @@ impl Home {
             let total = c["vram_total_mb"].as_u64().unwrap_or(0);
             let on: Vec<&Value> = models.iter().filter(|m| m["enabled"] == true && m["vouch_mb"].get(&gi).is_some()).collect();
             let mb = |m: &Value| m["vouch_mb"][&gi].as_u64().unwrap_or(0);
+            let hr = |m: &Value| m["headroom_mb"][&gi].as_u64().unwrap_or(0);
             // chat models and video engines count once a card: one of each runs there at a time (the loaded one, else
             // the largest)
             let mut list: Vec<Value> = on.iter().filter(|m| !matches!(m["kind"].as_str(), Some("llm" | "video")))
-                .map(|m| json!({"model": m["id"], "kind": m["kind"], "mb": mb(m), "measured": m["measured"], "state": m["state"]})).collect();
+                .map(|m| json!({"model": m["id"], "kind": m["kind"], "mb": mb(m), "headroom_mb": hr(m), "headroom_given": m["headroom_given"],
+                                "measured": m["measured"], "state": m["state"]})).collect();
             for kind in ["llm", "video"] {
                 let group: Vec<&&Value> = on.iter().filter(|m| m["kind"] == kind).collect();
                 if let Some(c) = group.iter().find(|m| m["state"] == "loaded").or_else(|| group.iter().max_by_key(|m| mb(m))) {
-                    list.push(json!({"model": c["id"], "kind": kind, "mb": mb(c), "measured": c["measured"], "state": c["state"], "of": group.len()}));
+                    list.push(json!({"model": c["id"], "kind": kind, "mb": mb(c), "headroom_mb": hr(c), "headroom_given": c["headroom_given"],
+                                     "measured": c["measured"], "state": c["state"], "of": group.len()}));
                 }
             }
             let sum: u64 = list.iter().map(|v| v["mb"].as_u64().unwrap_or(0)).sum();
             c["vouched"] = json!(list);
             c["vouched_mb"] = json!(sum);
+            // of it, the models' headroom (their working memory beyond the weights)
+            c["vouched_headroom_mb"] = json!(list.iter().map(|v| v["headroom_mb"].as_u64().unwrap_or(0)).sum::<u64>());
             c["overbooked"] = json!(sum > total);
         }
     }

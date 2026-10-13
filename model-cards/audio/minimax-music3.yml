@@ -7,6 +7,7 @@ title: MiniMax Music 3 (songs from lyrics and a description, up to 6 minutes, 44
 about: the 8B semantic language model (Qwen3-8B's shape) and RVQ depth decoder, the 2.4B flow-matching transformer, the Flow-VAE decoder (MiniMax's diffusers checkpoint)
 gpus: '0'
 vram_gib: 23.0                   # its memory on the card when it runs (measured on a B70)
+headroom_gib: 3.3                # of it, a song's working memory beyond the weights (B70: 19.4 GiB loaded, 22.7 peak)
 defaults:
   seconds: 60.0
   steps: 30

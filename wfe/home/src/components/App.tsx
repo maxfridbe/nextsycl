@@ -20,6 +20,21 @@ const KINDS: { kind: Model["kind"]; title: string; icon: string }[] = [
   { kind: "video", title: "Video", icon: "&#xf03d;" },
 ];
 
+/** A vouched figure: the weights, then the headroom - the working memory it needs to run without erroring (KV for its
+ *  context, arenas, a song's or an image's activations) - in parentheses with its swatch: the model's color, its
+ *  stripes the other way (as in the card's vouch bar) */
+function Alloc(mb: number, headroom: number, kind: string, given: boolean, unit = " GiB") {
+  const h = Math.min(headroom, mb);
+  const title = h > 0
+    ? `${gib(mb)} GiB vouched: ${gib(mb - h)} for its weights + ${gib(h)} headroom (${given ? "from its model card" : "estimate: vouched less its files"})`
+    : `${gib(mb)} GiB vouched (no headroom known apart: its files do not all sit on the card)`;
+  return (
+    <span attrs={{ title }}>{gib(mb - h)}{unit}{h > 0
+      ? <span class="hr"> (+<span class="sw hatch rev" style={{ "--c": color(kind) } as Record<string, string>} />{gib(h)}{unit} headroom)</span>
+      : null}</span>
+  );
+}
+
 function procName(p: Proc): string {
   if (p.program !== "nextsycl") return p.program;
   return [p.kind, p.command, p.model].filter((x) => x).join(" ");
@@ -38,31 +53,45 @@ function CardView(c: Card) {
         {c.procs.map((p) => <i style={{ width: `${(p.vram_mb / total) * 100}%`, background: color(p.kind) }} />)}
       </div>
       <div class="meter vouch" attrs={{ title: `${gib(c.vouched_mb)} GiB vouched for by the enabled models` }}>
-        {c.vouched.map((v) => <i class={{ hatch: true, live: ["loaded", "busy"].includes(v.state) }}
-          style={{ width: `${Math.min(100, (v.mb / total) * 100)}%`, "--c": color(v.kind) } as Record<string, string>} />)}
+        {/* each model's weights, then its headroom: the same color, the stripes the other way */}
+        {c.vouched.map((v) => {
+          const h = Math.min(v.headroom_mb ?? 0, v.mb);
+          const live = ["loaded", "busy"].includes(v.state);
+          const seg = (mb: number, rev: boolean) => mb > 0
+            ? <i class={{ hatch: true, rev, live }} attrs={{ title: `${v.model}: ${gib(mb)} GiB ${rev ? "headroom" : "weights"}` }}
+                style={{ width: `${Math.min(100, (mb / total) * 100)}%`, "--c": color(v.kind) } as Record<string, string>} />
+            : null;
+          return [seg(v.mb - h, false), seg(h, true)];
+        })}
       </div>
       <div class="kv">
         <span>in use <b>{gib(c.vram_used_mb)}</b> / {gib(c.vram_total_mb)} GiB · <span class={free < 1536 ? "bad" : ""}>{gib(free)} free</span></span>
-        <span class={c.overbooked ? "warn" : ""}>vouched <b>{gib(c.vouched_mb)}</b> GiB{c.overbooked ? " - overbooked: the first to load holds the card" : ""}</span>
+        <span class={c.overbooked ? "warn" : ""}>vouched <b>{gib(c.vouched_mb)}</b> GiB{c.vouched_headroom_mb > 0
+          ? <span class="hint"> ({gib(c.vouched_headroom_mb)} of it headroom)</span> : null}{c.overbooked ? " - overbooked: the first to load holds the card" : ""}</span>
         <span>busy <b>{Math.round(c.busy_pct)}%</b></span>
         {c.power_w != null ? <span>power <b>{Math.round(c.power_w)} W</b>{c.power_cap_w ? ` / ${c.power_cap_w}` : ""}</span> : null}
         {c.temp_pkg != null ? <span>temp <b>{Math.round(c.temp_pkg)}°C</b>{c.temp_vram != null ? ` · mem ${Math.round(c.temp_vram)}°C` : ""}</span> : null}
         {c.pcie?.cur ? <span>PCIe <b>{c.pcie.cur.gen ? `${c.pcie.cur.gen}.0` : "?"} x{c.pcie.cur.width}</b></span> : null}
       </div>
       <ul class="procs">
-        {c.procs.map((p) => (
+        {c.procs.map((p) => {
+          // a loaded model's process: what it is vouched for beside what it holds now
+          const v = c.vouched.find((x) => x.model === p.model_id && ["loaded", "busy"].includes(x.state));
+          return (
           <li attrs={{ title: p.args ?? `pid ${p.pid}` }}>
             <span class="sw" style={{ background: color(p.kind) }} />
-            <span class="what">{procName(p)}{p.port ? <span class="hint"> :{p.port}</span> : null}</span>
+            <span class="what">{procName(p)}{p.port ? <span class="hint"> :{p.port}</span> : null}
+              {v && v.headroom_mb > 0 ? <span class="hint"> · vouched {Alloc(v.mb, v.headroom_mb, v.kind, v.headroom_given)}</span> : null}</span>
             <span class="mb">{gib(p.vram_mb)} GiB</span>
           </li>
-        ))}
+          );
+        })}
         {c.vouched.filter((v) => !["loaded", "busy"].includes(v.state)).map((v) => (
           <li class="dim">
             <span class="sw hatch" style={{ "--c": color(v.kind) } as Record<string, string>} />
             <span class="what">{v.model}{v.of && v.of > 1 ? <span class="hint"> (one of {v.of} {v.kind === "llm" ? "chat models" : "video engines"}: one runs at a time)</span> : null}
               <span class="hint"> {v.state}{v.measured ? "" : " · estimate"}</span></span>
-            <span class="mb">{gib(v.mb)} GiB</span>
+            <span class="mb">{Alloc(v.mb, v.headroom_mb ?? 0, v.kind, v.headroom_given)}</span>
           </li>
         ))}
         {!c.procs.length && !c.vouched.length ? <li class="dim"><span class="what hint">free, nothing enabled here</span></li> : null}
@@ -123,7 +152,8 @@ function ModelRow(m: Model) {
       {spin(what) ? <span class="spin" /> : null}{label}
     </button>
   );
-  const vouch = Object.entries(m.vouch_mb).map(([g, mb]) => `GPU ${g}: ${gib(mb)} GiB`).join(", ");
+  const vouch = Object.entries(m.vouch_mb).map(([g, mb], i) =>
+    [i ? ", " : "", `GPU ${g}: `, Alloc(mb, m.headroom_mb?.[g] ?? 0, m.kind, m.headroom_given)]);
   const page = m.kind === "llm" ? at(m.page) : at(m.page);
   return (
     <div class={{ mrow: true, off: !m.enabled }}>
@@ -229,7 +259,7 @@ function Status() {
     <div>
       <section class="panel">
         <div class="phead"><span class="i" props={{ innerHTML: "&#xf2db;" }} /><span class="ptitle">GPUs</span>
-          <span class="hint">in use, by process · below it, hatched: what the enabled models are vouched for</span></div>
+          <span class="hint">in use, by process · below it, hatched: what the enabled models are vouched for - each model's weights, then its headroom (the stripes the other way)</span></div>
         <div class="pbody"><div class="cards">{(st?.cards ?? []).map(CardView)}</div></div>
       </section>
       <Models />

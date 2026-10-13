@@ -21,6 +21,11 @@ pub trait Store: Send + Sync {
     fn file(&self) -> PathBuf;
     /// an entry's prompt guide (Markdown), from the model cards
     fn guide(&self, entry: &Value) -> Option<String>;
+    /// the model cards (each as JSON; none: no cards to read) - what an entry registered before a card key existed
+    /// lacks (`headroom_gib`)
+    fn cards(&self) -> Vec<Value> {
+        Vec::new()
+    }
 }
 
 impl<T: Store + ?Sized> Store for Box<T> {
@@ -44,6 +49,9 @@ impl<T: Store + ?Sized> Store for Box<T> {
     }
     fn guide(&self, entry: &Value) -> Option<String> {
         (**self).guide(entry)
+    }
+    fn cards(&self) -> Vec<Value> {
+        (**self).cards()
     }
 }
 

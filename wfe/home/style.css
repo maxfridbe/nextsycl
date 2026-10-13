@@ -48,6 +48,8 @@
  .meter.vouch{height:6px;background:transparent;border:1px dashed #2a2f3a}
  .hatch{background:repeating-linear-gradient(45deg,var(--c,#64748b) 0 3px,transparent 3px 7px)!important;opacity:.75}
  .hatch.live{opacity:1}
+ .hatch.rev{background:repeating-linear-gradient(-45deg,var(--c,#64748b) 0 3px,transparent 3px 7px)!important}
+ .hr .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 3px -1px 1px;border:1px solid var(--c)}
  .card.over{border-color:#b45309}
  .procs li.dim{opacity:.75} .procs .sw.hatch{border:1px solid var(--c)}
  .kind{margin:6px 0 14px} .kind h4{margin:6px 0;font-size:14px;display:flex;align-items:center;gap:6px}

@@ -82,6 +82,9 @@ impl nextsycl_serve::home::registry::Store for Store {
     fn guide(&self, entry: &serde_json::Value) -> Option<String> {
         nextsycl_models::catalog::Catalog::load(&self.0).ok()?.guide(entry)
     }
+    fn cards(&self) -> Vec<serde_json::Value> {
+        nextsycl_models::catalog::Catalog::load(&self.0).map(|c| c.models).unwrap_or_default()
+    }
 }
 
 pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {

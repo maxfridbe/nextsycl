@@ -6,6 +6,8 @@ arch: minimax-music3
 title: MiniMax Music 3, its language model in int8 (half the VRAM, faster frames)
 about: the 8B semantic language model (Qwen3-8B's shape) and RVQ depth decoder, the 2.4B flow-matching transformer, the Flow-VAE decoder (MiniMax's diffusers checkpoint)
 gpus: '0'
+vram_gib: 15.5                   # its memory on the card when it runs (measured on a B70)
+headroom_gib: 3.1                # of it, a song's working memory beyond the weights (B70: 12.3 GiB loaded, 15.4 peak)
 defaults:
   seconds: 60.0
   steps: 30

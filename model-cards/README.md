@@ -17,6 +17,9 @@ about: Qwen's dense Qwen3.8 27B ...
 gpus: '0'                       # the GPUs it loads on: '0', '1', '0,1', or 'all' (weakest first)
 vram_gib: 29.0                  # its memory on each card when it runs, as measured (the front door keeps the card
                                 #   free for it before it has measured the model itself; else from the files' sizes)
+headroom_gib: 3.3               # optional: of vram_gib, the working memory beyond the weights (KV for its context, arenas,
+                                #   a song's or an image's activations) - the front door shows it apart (else: vram_gib less
+                                #   the files' share of the card; none when the files do not all sit on the card)
 ctx: 131072,32768               # llm: each session's context
 tools: true                     # llm: tool calls offered to it (false: dropped)
 tasks: true                     # llm: a front end's background tasks (titles, tags) accepted
