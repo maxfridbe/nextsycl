@@ -256,6 +256,12 @@ fn multi_dense() -> bool {
     *V.get_or_init(|| std::env::var("NS_DS4_MULTI_DENSE").map_or(true, |v| v != "0"))
 }
 
+/// Drafts a verify pass checks (NS_DS4_DRAFTS: 1, or 2 - the draft block chained on its own output)
+fn mtp_drafts() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS4_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 2))
+}
+
 /// Decode's indexer through this engine's fused score kernel and two-level top-k (NS_DS4_IDX_FUSED=0: the GEMM, the
 /// score pass and one radix select a row)
 fn idx_fused() -> bool {
@@ -432,6 +438,10 @@ struct MtpS {
     rows: usize,
     slot0: usize,
     next: Vec<u32>,
+    /// the block's own output streams for its last row ([4, d]) and the position after that row: a second draft
+    /// runs the block again on them (`mtp_chain`)
+    chain: DevBuf,
+    chain_pos: Option<usize>,
 }
 
 /// the draft block's rows a pass keeps for it
@@ -495,8 +505,9 @@ pub struct Decoder {
     look: Option<Lookup>,
     pub ng_drafted: u64,
     pub ng_accepted: u64,
-    /// the draft block's token for the position after `next`
+    /// the draft block's token for the position after `next`, and a second one chained after it (NS_DS4_DRAFTS=2)
     draft: Option<u32>,
+    draft2: Option<u32>,
     mtp: bool,
     /// drafts verified, and accepted
     pub drafted: u64,
@@ -545,6 +556,7 @@ impl Decoder {
 
     pub fn pending(&mut self) -> Option<u32> {
         self.draft = None;
+        self.draft2 = None;
         self.next.take()
     }
 }
@@ -1473,7 +1485,8 @@ impl<'g> Ds4<'g> {
         let mtp = match self.mtp {
             Some(_) => {
                 let gpu = &self.parts.last().unwrap().ops.gpu;
-                Some(MtpS { hid: DevBuf::f32(gpu, MTP_KEEP * 4 * g.n_embd as usize)?, rows: 0, slot0: 0, next: Vec::new() })
+                Some(MtpS { hid: DevBuf::f32(gpu, MTP_KEEP * 4 * g.n_embd as usize)?, rows: 0, slot0: 0, next: Vec::new(),
+                            chain: DevBuf::f32(gpu, 4 * g.n_embd as usize)?, chain_pos: None })
             }
             None => None,
         };
@@ -2253,26 +2266,51 @@ impl<'g> Ds4<'g> {
     /// MTPBlock): x = e_proj(enorm(embed(next))) on every stream + h_proj(hnorm(the streams)), one layer with its
     /// mHC (window-only attention, its MoE), then its own mHC head and norm into the shared output matrix.
     fn mtp_run(&self, layers: &[Att], ms: &mut MtpS, next: u32, head: bool, tap: Tap) -> Result<Option<Vec<f32>>> {
-        let Some(ml) = self.mtp else { return Ok(None) };
-        if ms.rows == 0 {
+        if self.mtp.is_none() || ms.rows == 0 {
             return Ok(None);
         }
-        let g = &self.m.g;
-        let (n, d, eps) = (ms.rows, g.n_embd as usize, g.rms_eps as f32);
+        let n = ms.rows;
         let mut toks = std::mem::take(&mut ms.next);
         toks.push(next);
         let slot0 = ms.slot0;
         ms.rows = 0;
+        ms.chain_pos = None;
+        let hid = ms.hid.view(0, n * 4 * self.m.g.n_embd as usize * 4)?;
+        self.mtp_block(layers, &hid, n, slot0, &toks, head.then_some((&ms.chain, &mut ms.chain_pos)), tap)
+    }
+
+    /// A second draft: the block again on its own last output and the draft it made, one position further (the key
+    /// it writes there is provisional: the verify pass's rows run the block over that position again)
+    fn mtp_chain(&self, layers: &[Att], ms: &mut MtpS, draft: u32, max_ctx: usize, tap: Tap) -> Result<Option<Vec<f32>>> {
+        let Some(pos) = ms.chain_pos.take() else { return Ok(None) };
+        if self.mtp.is_none() || pos + 1 > max_ctx {
+            return Ok(None);
+        }
+        let d = self.m.g.n_embd as usize;
+        let gpu = &self.parts.last().unwrap().ops.gpu;
+        let hid = DevBuf::f32(gpu, 4 * d)?;
+        self.parts.last().unwrap().ops.kcopy(&hid, 0, &ms.chain, 0, 4 * d * 4)?;
+        self.mtp_block(layers, &hid, 1, pos, &[draft], None, tap)
+    }
+
+    /// The block over n rows of final streams `hid` [n, 4, d] at positions slot0.., each with its following token;
+    /// `head`: the logits after the last row, its output streams kept for a chained draft (and that position)
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_block(&self, layers: &[Att], hid: &DevBuf, n: usize, slot0: usize, toks: &[u32], head: Option<(&DevBuf, &mut Option<usize>)>, tap: Tap)
+                 -> Result<Option<Vec<f32>>> {
+        let Some(ml) = self.mtp else { return Ok(None) };
+        let g = &self.m.g;
+        let (d, eps) = (g.n_embd as usize, g.rms_eps as f32);
         let pi = self.parts.len() - 1;
         let p = &self.parts[pi];
         let o = &p.ops;
         let m0 = self.mark(p);
         p.arena.reset();
-        let emb = self.embed(p, &toks)?;
+        let emb = self.embed(p, toks)?;
         let en = p.arena.f32(n * d)?;
         o.rms_norm(&emb, Some(p.vec(ml, Role::MtpENorm)?), &en, n, d, eps)?;
         let hn = p.arena.f32(n * 4 * d)?;
-        o.rms_norm(&ms.hid.view(0, n * 4 * d * 4)?, Some(p.vec(ml, Role::MtpHNorm)?), &hn, n * 4, d, eps)?;
+        o.rms_norm(hid, Some(p.vec(ml, Role::MtpHNorm)?), &hn, n * 4, d, eps)?;
         let pe = p.mm(ml, Role::MtpEProj, &en, n)?;
         let ph = p.mm(ml, Role::MtpHProj, &hn, n * 4)?;
         let x = DevBuf::f32(&o.gpu, n * 4 * d)?;
@@ -2283,19 +2321,26 @@ impl<'g> Ds4<'g> {
             }
         }
         tap("mtp_in", &x)?;
-        let y = self.run_layers(layers, (pi, ml, ml + 1), x, slot0, &toks, &mut *tap)?;
-        let out = if head { self.head_of(&y, n, 1, Some(ml), &mut *tap)?.pop() } else { None };
+        let y = self.run_layers(layers, (pi, ml, ml + 1), x, slot0, toks, &mut *tap)?;
+        let out = match head {
+            Some((chain, chain_pos)) => {
+                o.kcopy(chain, 0, &y, (n - 1) * 4 * d * 4, 4 * d * 4)?;
+                *chain_pos = Some(slot0 + n);
+                self.head_of(&y, n, 1, Some(ml), &mut *tap)?.pop()
+            }
+            None => self.head_of(&y, n, 1, Some(ml), &mut *tap)?.pop(),
+        };
         self.lap(p, "MTP draft", m0);
         Ok(out)
     }
 
     pub fn decoder(&self, logits: Vec<f32>, draft: bool) -> Decoder {
-        Decoder { logits, next: None, look: None, ng_drafted: 0, ng_accepted: 0, draft: None, mtp: draft && self.mtp.is_some(), drafted: 0, accepted: 0 }
+        Decoder { logits, next: None, look: None, ng_drafted: 0, ng_accepted: 0, draft: None, draft2: None, mtp: draft && self.mtp.is_some(), drafted: 0, accepted: 0 }
     }
 
     pub fn decoder_after(&self, next: u32, draft: bool) -> Decoder {
-        Decoder { logits: Vec::new(), next: Some(next), look: None, ng_drafted: 0, ng_accepted: 0, draft: None, mtp: draft && self.mtp.is_some(), drafted: 0,
-                  accepted: 0 }
+        Decoder { logits: Vec::new(), next: Some(next), look: None, ng_drafted: 0, ng_accepted: 0, draft: None, draft2: None, mtp: draft && self.mtp.is_some(),
+                  drafted: 0, accepted: 0 }
     }
 
     /// The next committed token(s): one, or more when prompt-lookup drafts (NS_NGRAM) are accepted - each exactly when
@@ -2331,7 +2376,31 @@ impl<'g> Ds4<'g> {
             }
             let tail = *out.last().unwrap();
             (out, tail)
+        } else if let (Some(x), Some(d), Some(d2)) = (dec.next, dec.draft.filter(|_| dec.mtp && sess.pos + 3 <= sess.max_ctx), dec.draft2) {
+            // two drafts: [x, d, d2] in one pass, each kept exactly when the token drawn for its position is it
+            dec.draft = None;
+            dec.draft2 = None;
+            let rows = self.forward_rows(sess, &[x, d, d2], 3, &mut *tap)?;
+            let y0 = smp.sample(&rows[0]);
+            dec.drafted += 1;
+            if y0 != d {
+                self.rollback(sess, 1)?;
+                (vec![y0], y0)
+            } else {
+                dec.accepted += 1;
+                let y1 = smp.sample(&rows[1]);
+                dec.drafted += 1;
+                if y1 != d2 {
+                    self.rollback(sess, 2)?;
+                    (vec![d, y1], y1)
+                } else {
+                    dec.accepted += 1;
+                    let y2 = smp.sample(&rows[2]);
+                    (vec![d, d2, y2], y2)
+                }
+            }
         } else if let (Some(x), Some(d)) = (dec.next, dec.draft.take().filter(|_| dec.mtp && sess.pos + 2 <= sess.max_ctx)) {
+            dec.draft2 = None;
             // the draft verified with the token: [x, d] in one pass, d kept exactly when the token drawn for its
             // position is d (what is committed is distributed as plain sampling would be)
             let rows = self.forward_rows(sess, &[x, d], 2, &mut *tap)?;
@@ -2360,6 +2429,10 @@ impl<'g> Ds4<'g> {
         // the next draft: the draft block's argmax after the committed token
         dec.draft = match (dec.mtp, sess.mtp.as_mut()) {
             (true, Some(ms)) => self.mtp_run(&sess.layers, ms, tail, true, &mut *tap)?.map(|l| argmax(&l)),
+            _ => None,
+        };
+        dec.draft2 = match (dec.draft, mtp_drafts() >= 2, sess.mtp.as_mut()) {
+            (Some(d), true, Some(ms)) => self.mtp_chain(&sess.layers, ms, d, sess.max_ctx, &mut *tap)?.map(|l| argmax(&l)),
             _ => None,
         };
         dec.next = Some(tail);

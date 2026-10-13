@@ -146,7 +146,7 @@ impl Engine for engine::Ds4<'_> {
     }
     fn max_verify(&self) -> usize {
         // the prompt-lookup drafts' pass (NS_NGRAM)
-        (engine::ngram_k() + 1).max(if self.mtp.is_some() { 2 } else { 1 }).min(engine::MAX_VERIFY)
+        (engine::ngram_k() + 1).max(if self.mtp.is_some() { 3 } else { 1 }).min(engine::MAX_VERIFY)
     }
     fn cache_fingerprint(&self) -> String {
         format!("deepseek4 raw-ring={} nsd42{}", engine::raw_ring(), if self.mtp.is_some() { " mtp" } else { "" })
