@@ -395,7 +395,7 @@ struct Comp {
     idx: Option<IdxC>,
 }
 
-/// The indexer's compressed keys (float32 [ctx / 4 + 1][128]) and its ring ([comp_ring(4)][2 x 256])
+/// The indexer's compressed keys (fp16 [ctx / 4 + 1][128]) and its ring ([comp_ring(4)][2 x 256])
 struct IdxC {
     cache: DevBuf,
     ring: DevBuf,
@@ -419,10 +419,10 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// The checkpoint as a file: "NSD41", the position, the buffers
+    /// The checkpoint as a file: "NSD42", the position, the buffers
     pub fn write_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let u = |w: &mut dyn std::io::Write, x: usize| w.write_all(&(x as u64).to_le_bytes());
-        w.write_all(b"NSD41")?;
+        w.write_all(b"NSD42")?;
         u(w, self.pos)?;
         u(w, self.bufs.len())?;
         for b in &self.bufs {
@@ -442,7 +442,7 @@ impl Checkpoint {
         };
         let mut magic = [0u8; 5];
         r.read_exact(&mut magic)?;
-        if &magic != b"NSD41" {
+        if &magic != b"NSD42" {
             return Err(bad());
         }
         let pos = u(r)?;
@@ -1260,7 +1260,7 @@ impl<'g> Ds4<'g> {
                     b += (kv.0 / r + 1) * 512 * 2;
                 }
                 if r == 4 {
-                    b += (kv.0 / 4 + 1) * g.idx_dim as usize * 4;
+                    b += (kv.0 / 4 + 1) * g.idx_dim as usize * 2;
                 }
                 b
             }).sum::<usize>() * kv.1;
@@ -1391,7 +1391,7 @@ impl<'g> Ds4<'g> {
                     let iw = 2 * g.idx_dim as usize;
                     let iring = DevBuf::f32(gpu, comp_ring(4) * 2 * iw)?;
                     iring.fill(0)?;
-                    Some(IdxC { cache: DevBuf::f32(gpu, (max_ctx / 4 + 1) * g.idx_dim as usize)?, ring: iring })
+                    Some(IdxC { cache: DevBuf::new(gpu, (max_ctx / 4 + 1) * g.idx_dim as usize * 2)?, ring: iring })
                 } else {
                     None
                 };
@@ -1444,7 +1444,7 @@ impl<'g> Ds4<'g> {
                 take(&c.cache, 0, n / c.ratio * 512 * 2)?;
                 take(&c.ring, 0, c.ring.len)?;
                 if let Some(ix) = &c.idx {
-                    take(&ix.cache, 0, n / 4 * idx_d * 4)?;
+                    take(&ix.cache, 0, n / 4 * idx_d * 2)?;
                     take(&ix.ring, 0, ix.ring.len)?;
                 }
             }
@@ -1509,7 +1509,7 @@ impl<'g> Ds4<'g> {
                 }
                 dc.ring.copy_within(0, &sc.ring, 0, sc.ring.len)?;
                 if let (Some(di), Some(si)) = (&dc.idx, &sc.idx) {
-                    let nb = src.pos / 4 * idx_d * 4;
+                    let nb = src.pos / 4 * idx_d * 2;
                     if nb > 0 {
                         di.cache.copy_within(0, &si.cache, 0, nb)?;
                     }
@@ -1586,6 +1586,10 @@ impl<'g> Ds4<'g> {
         let score = p.arena.f32(rows * n)?;
         let nc_max = (IDX_S_FLOATS / (rows * hh)).max(1).min(n);
         let sbuf = p.arena.f32(rows * hh * nc_max)?;
+        // the queries in fp16 against the keys' fp16 cache, on XMX (the scores only rank the blocks; float32 GEMMs
+        // made a 128K prompt's indexer its largest part: it grows with the square of the context)
+        let iq16 = p.arena.bytes(tr * hh * d * 2)?;
+        o.to_f16(&iq, &iq16, tr * hh * d)?;
         let sel = p.arena.bytes(tr * kp * 4)?;
         for q0 in (0..tr).step_by(rows) {
             let qn = rows.min(tr - q0);
@@ -1593,7 +1597,7 @@ impl<'g> Ds4<'g> {
             let mut j0 = 0;
             while j0 < n {
                 let nc = nc_max.min(n - j0);
-                o.gemm_at(qn * hh, nc, d, (&iq, q0 * hh * d, d), (&ix.cache, j0 * d), (&sbuf, 0, nc), false)?;
+                o.gemm_f16(qn * hh, nc, d, (&iq16, q0 * hh * d, d), (&ix.cache, j0 * d), (&sbuf, 0, nc), false)?;
                 o.idx_score(&sbuf, &w.view(q0 * hh * 4, qn * hh * 4)?, &sc, qn, hh, j0, nc, n, pos0 + q0)?;
                 j0 += nc;
             }
@@ -1640,7 +1644,7 @@ impl<'g> Ds4<'g> {
         if let Some(c) = &st.comp {
             self.compress(p, l, &pj[2], &pj[3], Role::CompApe, Role::CompNorm, &c.ring, &c.cache, true, hd, ratio, pos0, t)?;
             if let Some(ix) = &c.idx {
-                self.compress(p, l, &pj[4], &pj[5], Role::IdxCompApe, Role::IdxCompNorm, &ix.ring, &ix.cache, false, g.idx_dim as usize, 4, pos0, t)?;
+                self.compress(p, l, &pj[4], &pj[5], Role::IdxCompApe, Role::IdxCompNorm, &ix.ring, &ix.cache, true, g.idx_dim as usize, 4, pos0, t)?;
             }
         }
         let t_q = self.lap(p, "attn: compressors", t_comp);

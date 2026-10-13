@@ -409,6 +409,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_PROFILE_SPLIT` | off | 1: with NS_PROFILE, decode passes' sections counted apart from the prompt's ("decode: ...") | llm deepseek4 |
 | `NS_SPLIT` | by speed | layers a GPU, all but the last (default: by the square root of each card's units x clock - B70 + B65: 25 / 18) | llm deepseek4 |
 | `NS_DS4_ATT_ROWS` | 2048 | a prompt pass's query rows the attention block takes at a time (q_b, attention, o_a; 64..8192) | llm deepseek4 |
+| `NS_DS4_ATTN_KB` | 32 | Experiment: cells a decode attention split takes (more: fewer, longer work-groups) | kernels:llm deepseek4 |
 | `NS_DS4_ATTN_SPLIT` | on | 0: decode rows' attention in one work-group a head group instead of split over the cells and merged | kernels:llm deepseek4 |
 | `NS_DS4_BENCH_LAYER` | 5 | the layer whose experts `llm kernels` times in the multi-expert launches | llm deepseek4 (kernels) |
 | `NS_DS4_DENSE_F16_MIN` | 64 | dense products of at least this many rows in fp16 on XMX (0: never; the experts keep NS_PROMPT_F16_MIN) | llm deepseek4 |

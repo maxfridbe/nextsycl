@@ -32,6 +32,10 @@ using half = sycl::half;
 #ifndef DS4_ATTN_CH
 #define DS4_ATTN_CH 16
 #endif
+// decode's split form's chunk (B70 + B65 at 3.7K: 16 cells 3.3 ms a token, 32 6.0 - more local memory a work-group)
+#ifndef DS4_ATTN_CH_DEC
+#define DS4_ATTN_CH_DEC 16
+#endif
 constexpr int D = 512, QD = 128, NQ = D / QD, SG = 16, M = 8, CH = DS4_ATTN_CH, CHP = CH + 8, KS = CH;
 constexpr float LOG2E = 1.4426950408889634f;
 
@@ -47,9 +51,9 @@ inline auto gp(T* p) {
 // local memory, in 4-byte words: K packed [D/2][CH], V packed [CH/2][D], the partial scores [G][NQ][M][CH] float,
 // P [G][M][CHP] half, the head stats [G][M] x 3; Q staged as half [G][M][QD] (a quarter of the features at a time)
 // before the first chunk, over the K / V / score words
-template <int G>
+template <int G, int C>
 struct Slm {
-    static constexpr int k = D / 2 * KS, v = CH / 2 * D, s = G * NQ * M * CH, p = G * M * CHP / 2, st = 3 * G * M;
+    static constexpr int k = D / 2 * C, v = C / 2 * D, s = G * NQ * M * C, p = G * M * (C + 8) / 2, st = 3 * G * M;
     static constexpr int q = G * M * QD / 2;
     static constexpr int words = (k + v + s > q ? k + v + s : q) + p + st;
 };
@@ -57,11 +61,13 @@ struct Slm {
 // SPLIT (decode: a few rows): a work-group per (row, head groups, split of kb cells), each head's partial (values
 // unnormalized, max, sum) into `part` [T][H][ns][PS] for the merge (attend_merge); a split past its row's cells exits
 constexpr int PS = D + 16;   // a partial's row: D values, then the max and the sum (padded: rows 64-byte aligned)
-template <int G, bool SPLIT>
+template <int G, bool SPLIT, int C = CH>
 void attend_xmx(sycl::queue& queue, const float* qv, const half* raw, int64_t R, const half* comp, int64_t ratio, const int32_t* sel, int64_t K,
-                const float* sinks, float* out, int64_t T, int64_t H, int64_t pos0, int64_t window, float scale, int64_t kb, int64_t ns, float* part) {
+                const float* sinks, float* out, int64_t T, int64_t H, int64_t pos0, int64_t window, float scale, int64_t kb, int64_t ns, float* part,
+                const half* qg = nullptr) {
     constexpr int NSG = NQ * G, WG = NSG * SG;
-    using L = Slm<G>;
+    using L = Slm<G, C>;
+    constexpr int CHL = C, CHPL = C + 8, KSL = C;
     const int64_t hgroups = H / (M * G);
     const float qscale = scale * LOG2E;
     queue.submit([&](sycl::handler& h) {
@@ -102,7 +108,14 @@ void attend_xmx(sycl::queue& queue, const float* qv, const half* raw, int64_t R,
                 lrow[i] = 0.0f;
             }
             jm::joint_matrix<sycl::sub_group, half, jm::use::a, M, 16, jm::layout::row_major> qa[QD / 16];
-            for (int qq = 0; qq < NQ; ++qq) {
+            if (qg) {
+                // the queries already scaled and in fp16 (attend_q16): each sub-group's tiles straight from global
+                const half* qb = qg + (t * H + h0 + hg * M) * D + qd * QD;
+#pragma unroll
+                for (int k = 0; k < QD / 16; ++k) jm::joint_matrix_load(sg, qa[k], gp(qb + k * 16), (size_t) D);
+                sycl::group_barrier(it.get_group());   // the head stats above
+            }
+            for (int qq = 0; qq < (qg ? 0 : NQ); ++qq) {
                 for (int i = tid; i < G * M * QD; i += WG) {
                     const int hh = i / QD, d = i % QD;   // head h0 + hh
                     qh[i] = (half) (qv[(t * H + h0 + hh) * D + qq * QD + d] * qscale);
@@ -118,18 +131,18 @@ void attend_xmx(sycl::queue& queue, const float* qv, const half* raw, int64_t R,
 #pragma unroll
             for (int tt = 0; tt < QD / 16; ++tt) jm::joint_matrix_fill(sg, o[tt], 0.0f);
 
-            for (int64_t j0 = jbeg; j0 < jend; j0 += CH) {
+            for (int64_t j0 = jbeg; j0 < jend; j0 += CHL) {
                 // ---- 1. the chunk's cells, packed as K and as V (cells past n are zeros: masked below)
-                for (int i = tid; i < CH * (D / 8); i += WG) {   // K: cell c_, features 8c .. 8c + 7 -> words [4c .. 4c + 3][c_]
+                for (int i = tid; i < CHL * (D / 8); i += WG) {   // K: cell c_, features 8c .. 8c + 7 -> words [4c .. 4c + 3][c_]
                     const int nn = i / (D / 8), c = i % (D / 8);
                     sycl::uint4 w(0, 0, 0, 0);
                     if (j0 + nn < jend) w = *reinterpret_cast<const sycl::uint4*>(cell(j0 + nn) + 8 * c);
-                    kp[(4 * c + 0) * KS + nn] = w.x();
-                    kp[(4 * c + 1) * KS + nn] = w.y();
-                    kp[(4 * c + 2) * KS + nn] = w.z();
-                    kp[(4 * c + 3) * KS + nn] = w.w();
+                    kp[(4 * c + 0) * KSL + nn] = w.x();
+                    kp[(4 * c + 1) * KSL + nn] = w.y();
+                    kp[(4 * c + 2) * KSL + nn] = w.z();
+                    kp[(4 * c + 3) * KSL + nn] = w.w();
                 }
-                for (int i = tid; i < (CH / 2) * (D / 8); i += WG) {   // V: cells 2p, 2p + 1, features 8c .. -> words [p][8c ..]
+                for (int i = tid; i < (CHL / 2) * (D / 8); i += WG) {   // V: cells 2p, 2p + 1, features 8c .. -> words [p][8c ..]
                     const int pr = i / (D / 8), c = i % (D / 8);
                     sycl::uint4 a(0, 0, 0, 0), b(0, 0, 0, 0);
                     if (j0 + 2 * pr < jend) a = *reinterpret_cast<const sycl::uint4*>(cell(j0 + 2 * pr) + 8 * c);
@@ -146,28 +159,28 @@ void attend_xmx(sycl::queue& queue, const float* qv, const half* raw, int64_t R,
                 // ---- 2. partial scores over this sub-group's quarter
                 const half* kph = (const half*) kp;
 #pragma unroll
-                for (int nt = 0; nt < CH / 16; ++nt) {
+                for (int nt = 0; nt < CHL / 16; ++nt) {
                     jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, M, 16> s;
                     jm::joint_matrix_fill(sg, s, 0.0f);
 #pragma unroll
                     for (int k = 0; k < QD / 16; ++k) {
                         jm::joint_matrix<sycl::sub_group, half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> kbm;
-                        jm::joint_matrix_load(sg, kbm, lp(kph + ((qd * QD + k * 16) / 2) * (KS * 2) + nt * 16 * 2), (size_t) (KS * 2));
+                        jm::joint_matrix_load(sg, kbm, lp(kph + ((qd * QD + k * 16) / 2) * (KSL * 2) + nt * 16 * 2), (size_t) (KSL * 2));
                         jm::joint_matrix_mad(sg, s, qa[k], kbm, s);
                     }
-                    jm::joint_matrix_store(sg, s, lp(sp + ((hg * NQ + qd) * M) * CH + nt * 16), (size_t) CH, jm::layout::row_major);
+                    jm::joint_matrix_store(sg, s, lp(sp + ((hg * NQ + qd) * M) * CHL + nt * 16), (size_t) CHL, jm::layout::row_major);
                 }
                 sycl::group_barrier(it.get_group());
-                // ---- 3. softmax: sub-group (g, q) takes heads 2q, 2q + 1 of group g, 8 lanes a head, CH / 8 cells a lane
+                // ---- 3. softmax: sub-group (g, q) takes heads 2q, 2q + 1 of group g, 8 lanes a head, CHL / 8 cells a lane
                 {
                     const int r = qd * 2 + lane / 8, part = lane % 8;
-                    float sv[CH / 8], mx = -INFINITY;
+                    float sv[CHL / 8], mx = -INFINITY;
 #pragma unroll
-                    for (int i = 0; i < CH / 8; ++i) {
-                        const int nn = part * (CH / 8) + i;
+                    for (int i = 0; i < CHL / 8; ++i) {
+                        const int nn = part * (CHL / 8) + i;
                         float v = 0.0f;
 #pragma unroll
-                        for (int q4 = 0; q4 < NQ; ++q4) v += sp[((hg * NQ + q4) * M + r) * CH + nn];
+                        for (int q4 = 0; q4 < NQ; ++q4) v += sp[((hg * NQ + q4) * M + r) * CHL + nn];
                         sv[i] = j0 + nn < jend ? v : -INFINITY;
                         mx = sycl::fmax(mx, sv[i]);
                     }
@@ -178,12 +191,12 @@ void attend_xmx(sycl::queue& queue, const float* qv, const half* raw, int64_t R,
                     const float mo = mrow[si], mn = sycl::fmax(mo, mx);
                     const float c = mn == -INFINITY ? 1.0f : sycl::exp2(mo - mn);
                     float sum = 0.0f;
-                    half* prow = pp + (hg * M + r) * CHP;
+                    half* prow = pp + (hg * M + r) * CHPL;
 #pragma unroll
-                    for (int i = 0; i < CH / 8; ++i) {
+                    for (int i = 0; i < CHL / 8; ++i) {
                         const float pv = sv[i] == -INFINITY ? 0.0f : sycl::exp2(sv[i] - mn);
                         sum += pv;
-                        prow[part * (CH / 8) + i] = (half) pv;
+                        prow[part * (CHL / 8) + i] = (half) pv;
                     }
                     sum += sycl::permute_group_by_xor(sg, sum, 1);
                     sum += sycl::permute_group_by_xor(sg, sum, 2);
@@ -205,9 +218,9 @@ void attend_xmx(sycl::queue& queue, const float* qv, const half* raw, int64_t R,
                     }
                     const half* vph = (const half*) vp;
 #pragma unroll
-                    for (int ks = 0; ks < CH / 16; ++ks) {
+                    for (int ks = 0; ks < CHL / 16; ++ks) {
                         jm::joint_matrix<sycl::sub_group, half, jm::use::a, M, 16, jm::layout::row_major> pa;
-                        jm::joint_matrix_load(sg, pa, lp(pp + (hg * M) * CHP + ks * 16), (size_t) CHP);
+                        jm::joint_matrix_load(sg, pa, lp(pp + (hg * M) * CHPL + ks * 16), (size_t) CHPL);
 #pragma unroll
                         for (int tt = 0; tt < QD / 16; ++tt) {
                             jm::joint_matrix<sycl::sub_group, half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> vbm;
@@ -244,6 +257,11 @@ void attend_xmx(sycl::queue& queue, const float* qv, const half* raw, int64_t R,
         });
     });
 }
+// decode's queries as fp16, scaled by scale log2(e): [T][H][D] (attend_xmx's SPLIT form loads its tiles from them)
+void attend_q16(sycl::queue& queue, const float* q, half* qh, int64_t n, float qscale) {
+    queue.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { qh[i] = (half) (q[i] * qscale); });
+}
+
 // the splits of each (row, head) merged, the sink in the sum: out = sum_k O_k 2^(m_k - m) / (sum_k l_k 2^(m_k - m) + 2^(sink - m))
 void attend_merge(sycl::queue& queue, const float* part, const float* sinks, float* out, int64_t T, int64_t H, int64_t pos0, int64_t window,
                   int64_t ratio, bool has_comp, bool has_sel, int64_t K, int64_t kb, int64_t ns) {
@@ -266,14 +284,14 @@ void attend_merge(sycl::queue& queue, const float* part, const float* sinks, flo
     });
 }
 
-// the partials' memory, a GPU's: kept for the process (sized for the most a decode pass asks: 8 rows, 64 heads, 32 splits)
+// the partials' memory, a GPU's: kept for the process (sized for the most a decode pass asks: rows x splits <= 64, 64 heads)
 float* part_buf(ns_gpu* g, size_t floats) {
     static std::mutex mu;
     static std::vector<std::pair<ns_gpu*, std::pair<float*, size_t>>> bufs;
     std::lock_guard<std::mutex> lk(mu);
     for (auto& b : bufs)
         if (b.first == g) return b.second.second >= floats ? b.second.first : nullptr;
-    const size_t cap = std::max<size_t>(floats, (size_t) 8 * 64 * 32 * PS);
+    const size_t cap = std::max<size_t>(floats, (size_t) 64 * 64 * PS + (size_t) 8 * 64 * 512 / 2);
     float* p = sycl::malloc_device<float>(cap, g->q);
     bufs.push_back({g, {p, cap}});
     return p;
@@ -300,14 +318,19 @@ int ns_ds4_attend_xmx(ns_gpu* g, const float* q, const uint16_t* raw, int64_t R,
         const int64_t last = pos0 + T - 1;
         const int64_t vis = comp ? (last + 1) / ratio : 0;
         const int64_t maxn = sycl::min<int64_t>(window, last + 1) + (sel && vis > K ? K : vis);
-        const int64_t want = std::max<int64_t>(1, 256 / (T * (H / M)));
-        int64_t kb = (maxn + want - 1) / want;
-        kb = std::max<int64_t>({32, (maxn + 31) / 32, kb});
-        kb = (kb + CH - 1) / CH * CH;
+        // splits of 32 cells (B70 + B65 at 3.7K, decode's attention: 16 cells 4.7 ms a token, 32 4.3, 128 9.0), at
+        // most 64 a row and 64 x rows in all (the partials' buffer)
+        const int64_t ns_max = std::max<int64_t>(8, 64 / T);
+        static const int64_t force_kb = [] { const char* v = getenv("NS_DS4_ATTN_KB"); return v ? (int64_t) atoi(v) : (int64_t) 0; }();
+        int64_t kb = std::max<int64_t>(force_kb > 0 ? force_kb : 2 * DS4_ATTN_CH_DEC, (maxn + ns_max - 1) / ns_max);
+        kb = (kb + DS4_ATTN_CH_DEC - 1) / DS4_ATTN_CH_DEC * DS4_ATTN_CH_DEC;
         const int64_t ns = (maxn + kb - 1) / kb;
-        float* part = part_buf(g, (size_t) (T * H * ns) * PS);
+        // one buffer: the partials, then the fp16 queries
+        float* part = part_buf(g, (size_t) (T * H * ns) * PS + (size_t) T * H * 512 / 2);
         if (!part) return ns_fail("ns_ds4_attend_xmx: the partials' buffer is too small");
-        attend_xmx<1, true>(g->q, q, r16, R, c16, ratio, sel, K, sinks, out, T, H, pos0, window, scale, kb, ns, part);
+        half* qh = reinterpret_cast<half*>(part + (size_t) 64 * 64 * PS);
+        attend_q16(g->q, q, qh, T * H * 512, scale * LOG2E);
+        attend_xmx<1, true, DS4_ATTN_CH_DEC>(g->q, q, r16, R, c16, ratio, sel, K, sinks, out, T, H, pos0, window, scale, kb, ns, part, qh);
         attend_merge(g->q, part, sinks, out, T, H, pos0, window, ratio, comp != nullptr, sel != nullptr, K, kb, ns);
         return 0;
     }
