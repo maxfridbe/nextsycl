@@ -82,7 +82,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 |---|---|---|---|---|
 | `glm-5.3-flash-uncensored`, `-128k`, `-256k` | GLM-5.3-Flash uncensored IQ2, 64K / 128K / 256K context | `glm5next` | 89.9 GiB | checked (llama.cpp), served on both cards |
 | `deepseek-r1-iq1s` | DeepSeek-R1 671B UD-IQ1_S, 32K: experts in VRAM, pinned RAM (on the CPU) and the NVMe | `deepseek2` | 130.6 GiB | checked (llama.cpp), served on both cards |
-| `deepseek-v4-flash-iq2m` | DeepSeek-V4-Flash 284B UD-IQ2_M, 128K: sliding window + compressed attention (CSA / HCA, the lightning indexer), mHC, experts in VRAM and pinned RAM | `deepseek4` | 84.7 GiB | checked (llama.cpp), run on both cards |
+| `deepseek-v4-flash-iq2m` | DeepSeek-V4-Flash 284B UD-IQ2_M, 128K: sliding window + compressed attention (CSA / HCA, the lightning indexer), mHC, experts in VRAM and pinned RAM | `deepseek4` | 84.7 GiB | checked (llama.cpp), served on both cards |
 | `qwen3.8-flash-next-iq2_xs` | Qwen3.8-Flash-Next IQ2_XS | `qwen4exp` | 63.4 GiB | served (verify passes and batches exact) |
 | `qwen3.8-flash-next-iq2_xs-uncensored` | the same with the refusal projection (a control vector) | `qwen4exp` | 63.4 GiB | served |
 | `qwen3.8-flash-next-coder-iq1_m`, `-uncensored` | Qwen3.8-Flash-Next Coder IQ1_M | `qwen4exp` | 54.4 GiB | served |
