@@ -124,9 +124,9 @@ impl Engine for engine::Qwen35<'_> {
         engine::Qwen35::copy_session(self, sess_mut(dst)?, src)
     }
     fn feed(&self, s: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
-        Ok(engine::Qwen35::feed_until(self, sess_mut(s)?, tokens, &|| false, tap)?.1)
+        Ok(engine::Qwen35::feed_until(self, sess_mut(s)?, tokens, &|_| false, tap)?.1)
     }
-    fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
+    fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
         engine::Qwen35::feed_until(self, sess_mut(s)?, tokens, stop, tap)
     }
     fn forward(&self, s: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {

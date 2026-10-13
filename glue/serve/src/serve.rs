@@ -215,7 +215,6 @@ pub(crate) fn cors_headers(origin: Option<&str>, allowed: &[String]) -> String {
 
 /// A request for the engine: its prompt's tokens, how to sample, where its tokens go
 struct Job {
-    #[allow(dead_code)]
     id: u64,
     ids: Vec<u32>,
     max: usize,
@@ -768,7 +767,7 @@ impl Server {
                 let r = if a.job.cancel.load(Ordering::Relaxed) {
                     Err("client gone".to_string())
                 } else {
-                    self.read_some(&mut slots[a.slot], &a.job.ids, a.reading.as_mut().unwrap(), limit, &mut none)
+                    self.read_some(a.job.id, &mut slots[a.slot], &a.job.ids, a.reading.as_mut().unwrap(), limit, &mut none)
                 };
                 // the round's reading in all (a short prompt read after a long group must not shorten the share)
                 read_after = read_after.max(Instant::now()) + g0.elapsed();
@@ -912,16 +911,30 @@ impl Server {
 
     /// Up to `limit` more of a prompt's tokens (a checkpoint saved at each stop passed): the last token's logits once
     /// it is read to its end
-    fn read_some(&self, sl: &mut Slot, ids: &[u32], rd: &mut Reading, limit: usize, none: nextsycl_llm::Tap) -> Result<Option<Vec<f32>>, String> {
+    fn read_some(&self, rid: u64, sl: &mut Slot, ids: &[u32], rd: &mut Reading, limit: usize, none: nextsycl_llm::Tap) -> Result<Option<Vec<f32>>, String> {
         let mut budget = limit;
+        // its row, as it reads: the tokens read and their speed (the reused ones not counted)
+        let (from, t0) = (rd.from, rd.t0);
+        let progress = |at: usize| self.live(rid, |r| {
+            r["state"] = json!("reading");
+            r["reused"] = json!(from);
+            r["read"] = json!(at);
+            r["read_tok_s"] = json!((at - from) as f64 / t0.elapsed().as_secs_f64().max(1e-9));
+        });
+        progress(rd.at);
         while rd.at < ids.len() && budget > 0 {
             let stop = rd.stops.first().copied().unwrap_or(ids.len());
             let end = stop.min(rd.at.saturating_add(budget)).min(ids.len());
             // read alone (no limit), it stops at a chunk's end once another request waits
-            let arrived = || limit == usize::MAX && !self.queue.lock().unwrap().is_empty();
+            let base = rd.at;
+            let arrived = |read: usize| {
+                progress(base + read);
+                limit == usize::MAX && !self.queue.lock().unwrap().is_empty()
+            };
             let (fed, logits) = self.engine.feed_until(&mut sl.sess, &ids[rd.at..end], &arrived, &mut *none).map_err(|e| e.0)?;
             budget = budget.saturating_sub(fed);
             rd.at += fed;
+            progress(rd.at);
             if rd.at < end {
                 return Ok(None); // stopped for a newcomer
             }

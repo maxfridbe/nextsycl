@@ -162,7 +162,7 @@ impl Engine for engine::Glm<'_> {
     fn feed(&self, s: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
         engine::Glm::feed(self, sess_mut(s)?, tokens, tap)
     }
-    fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
+    fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
         engine::Glm::feed_until(self, sess_mut(s)?, tokens, stop, tap)
     }
     fn forward(&self, s: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {

@@ -59,6 +59,8 @@ pub const METHODS: &[Method] = &[
              fields: &[("model", "string", "a chat model's id", true), ("messages", "object[]", "[{role, content}]", true),
                        ("max_tokens", "integer", "", false), ("temperature", "number", "", false), ("tools", "object[]", "OpenAI tool definitions", false)],
              example: r#"{"model": "qwen3.8-flash-next-iq2_xs", "messages": [{"role": "user", "content": "Say hello in five words."}], "max_tokens": 200}"# },
+    Method { kind: "llm", name: "requests", summary: "The chat requests running and the last ones that ended, with their speeds as the server reports them live: prompt tokens (reused from the cache), read seconds, tokens generated, tok/s",
+             fields: &[], example: "{}" },
     Method { kind: "llm", name: "models", summary: "The enabled chat models (what Open WebUI lists) and which is loaded", fields: &[], example: "{}" },
     Method { kind: "llm", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "qwen3.8-flash-next-iq2_xs"}"# },
 
@@ -343,6 +345,19 @@ impl Home {
                 let mut body = b.clone();
                 body["stream"] = json!(false);
                 call_for(&t, "POST", "/v1/chat/completions", Some(&body), 1800).map_err(|e| (502, e))
+            }
+            ("llm", "requests") => {
+                // the chat server's control socket (its /server routes are not on its port)
+                let dir = self.o.cfg.get("NS_SOCKET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+                    std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())).join("nextsycl")
+                });
+                let v = call_for(&crate::http::Target::Unix(dir.join("nextsycl.sock")), "GET", "/server/requests", None, 5)
+                    .map_err(|e| (503, format!("the chat server does not answer: {e}")))?;
+                let keep = ["id", "model", "state", "via", "started", "ended", "finish", "prompt_tokens", "reused", "source", "read", "read_tok_s", "read_seconds",
+                            "generated", "max_tokens", "tok_s", "generate_seconds", "drafts", "energy_j", "avg_watts"];
+                let slim = |r: &Value| Value::from(keep.iter().filter_map(|k| r.get(*k).map(|x| (k.to_string(), x.clone()))).collect::<serde_json::Map<_, _>>());
+                let list = |k: &str| v[k].as_array().into_iter().flatten().map(slim).collect::<Vec<_>>();
+                Ok(json!({"active": list("active"), "done": list("done").into_iter().take(10).collect::<Vec<_>>()}))
             }
             ("llm", "models") => {
                 let loaded = self.chat_loaded(&all);

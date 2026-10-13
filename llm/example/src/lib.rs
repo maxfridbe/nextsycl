@@ -172,9 +172,9 @@ impl Engine for Example {
     fn feed(&self, _s: &mut Session, _tokens: &[u32], _tap: Tap) -> Result<Vec<f32>> {
         Err(not_ported("feed (the prompt path)"))
     }
-    /// `feed`, stopping at a chunk's end when `stop()` says so (another request waits): tokens read, and the logits
+    /// `feed`, stopping at a chunk's end when `stop(read)` says so (another request waits): tokens read, and the logits
     /// when it read them all
-    fn feed_until(&self, _s: &mut Session, _tokens: &[u32], _stop: &(dyn Fn() -> bool + Sync), _tap: Tap) -> Result<(usize, Vec<f32>)> {
+    fn feed_until(&self, _s: &mut Session, _tokens: &[u32], _stop: &(dyn Fn(usize) -> bool + Sync), _tap: Tap) -> Result<(usize, Vec<f32>)> {
         Err(not_ported("feed_until"))
     }
     /// one pass over a few tokens (a decode or verify pass): the last row's logits

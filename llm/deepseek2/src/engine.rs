@@ -979,16 +979,16 @@ impl<'g> Ds<'g> {
     }
 
     pub fn feed(&self, s: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
-        Ok(self.feed_until(s, tokens, &|| false, tap)?.1)
+        Ok(self.feed_until(s, tokens, &|_| false, tap)?.1)
     }
 
     /// A prompt in spans of NS_DS2_SPAN tokens, each a layer at a time over all its tokens: attention (and the dense
     /// layers) a chunk at a time, the experts once for the whole span - every expert loaded once a span, not once a
-    /// chunk (the disk and PCIe moved per prompt divided by the chunks a span holds). `stop()` is asked between spans.
-    pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
+    /// chunk (the disk and PCIe moved per prompt divided by the chunks a span holds). `stop(read)` is asked between spans.
+    pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
         let (mut fed, mut logits) = (0, Vec::new());
         for (i, c) in tokens.chunks(span().max(prefill_chunk())).enumerate() {
-            if i > 0 && stop() {
+            if i > 0 && stop(fed) {
                 break;
             }
             logits = self.pass(s, c, 1, prefill_chunk(), &mut *tap)?.pop().unwrap_or_default();

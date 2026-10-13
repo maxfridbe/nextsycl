@@ -148,9 +148,9 @@ impl Engine for engine::Qwen<'_> {
     }
 
     fn feed(&self, s: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
-        Ok(Engine::feed_until(self, s, tokens, &|| false, tap)?.1)
+        Ok(Engine::feed_until(self, s, tokens, &|_| false, tap)?.1)
     }
-    fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync), _tap: Tap) -> Result<(usize, Vec<f32>)> {
+    fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), _tap: Tap) -> Result<(usize, Vec<f32>)> {
         engine::Qwen::feed_until(self, sess_mut(s)?, tokens, stop)
     }
     fn forward(&self, s: &mut Session, tokens: &[u32], _tap: Tap) -> Result<Vec<f32>> {

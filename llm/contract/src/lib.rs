@@ -225,8 +225,9 @@ pub trait Engine: Send + Sync {
 
     /// the prompt's `tokens` read: the last one's logits
     fn feed(&self, s: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>>;
-    /// as `feed`, `stop()` asked between chunks: (tokens read, the last one's logits)
-    fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)>;
+    /// as `feed`, `stop(read)` asked between chunks with the tokens read so far (a server reports the progress): (tokens
+    /// read, the last one's logits)
+    fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)>;
     /// one forward pass of at most a chunk: the last token's logits
     fn forward(&self, s: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>>;
     /// one forward pass: the last `n_out` tokens' logits

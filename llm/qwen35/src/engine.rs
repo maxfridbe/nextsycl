@@ -1260,11 +1260,11 @@ impl<'g> Qwen35<'g> {
         Ok(())
     }
 
-    pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
+    pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
         let mut logits = Vec::new();
         let mut done = 0;
         for c in tokens.chunks(self.chunk) {
-            if done > 0 && stop() {
+            if done > 0 && stop(done) {
                 break;
             }
             logits = self.pass(s, c, 1, &mut *tap)?.pop().unwrap_or_default();

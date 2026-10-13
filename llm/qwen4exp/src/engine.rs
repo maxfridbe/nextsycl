@@ -1055,11 +1055,11 @@ impl<'g> Qwen<'g> {
     /// prompt: its first window is the prompt's last token); the last token's logits. NS_QW_WINDOWS=1: every token
     /// through windows of 8 (the decode arithmetic throughout)
     pub fn forward(&self, s: &mut Session, tokens: &[u32]) -> Result<Vec<f32>> {
-        Ok(self.feed_until(s, tokens, &|| false)?.1)
+        Ok(self.feed_until(s, tokens, &|_| false)?.1)
     }
 
-    /// As `forward`, `stop()` asked between prompt chunks: (tokens read, the last one's logits - none when stopped)
-    pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync)) -> Result<(usize, Vec<f32>)> {
+    /// As `forward`, `stop(read)` asked between prompt chunks: (tokens read, the last one's logits - none when stopped)
+    pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync)) -> Result<(usize, Vec<f32>)> {
         let mut run = self.run.lock().unwrap();
         self.flush(&mut run)?;
         self.settle(&mut run, s)?;
@@ -1079,7 +1079,7 @@ impl<'g> Qwen<'g> {
         let chunk = prompt_chunk();
         let mut c0 = 0;
         while c0 < head {
-            if c0 > 0 && stop() {
+            if c0 > 0 && stop(c0) {
                 return Ok((c0, Vec::new()));
             }
             // Strata's first chunk is short (256) when the prompt is longer than twice that: the same boundaries

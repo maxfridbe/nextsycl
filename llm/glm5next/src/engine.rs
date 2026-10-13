@@ -1446,12 +1446,12 @@ impl<'g> Glm<'g> {
     /// The next `tokens` of a conversation in chunks of at most `prefill_chunk()` (the arenas bound a chunk): the
     /// logits of the last token.
     pub fn feed(&self, sess: &mut Session, tokens: &[u32], tap: Tap) -> Result<Vec<f32>> {
-        Ok(self.feed_until(sess, tokens, &|| false, tap)?.1)
+        Ok(self.feed_until(sess, tokens, &|_| false, tap)?.1)
     }
 
-    /// As `feed`, but `stop()` - asked before each chunk past the first - ends it early at a chunk's end: (the tokens
+    /// As `feed`, but `stop(read)` - asked before each chunk past the first - ends it early at a chunk's end: (the tokens
     /// read, the last one's logits). The server stops a long prompt this way when another request arrives.
-    pub fn feed_until(&self, sess: &mut Session, tokens: &[u32], stop: &(dyn Fn() -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
+    pub fn feed_until(&self, sess: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
         let chunks = chunked(tokens, prefill_chunk());
         let runs = self.runs();
         if chunks.len() >= 2 && runs.len() == 2 && pipeline() {
@@ -1459,7 +1459,7 @@ impl<'g> Glm<'g> {
         }
         let (mut fed, mut logits) = (0, Vec::new());
         for (i, c) in chunks.iter().enumerate() {
-            if i > 0 && stop() {
+            if i > 0 && stop(fed) {
                 break;
             }
             logits = self.forward(sess, c, &mut *tap)?;
@@ -1472,7 +1472,7 @@ impl<'g> Glm<'g> {
     /// one runs the second's, the draft block and the head - each GPU busy while the other works on its chunk (in
     /// turn, each idled through the other's half). The chunks' order on each GPU is kept: the same result. The taps
     /// see the second GPU's layers only.
-    fn feed_pipelined(&self, sess: &mut Session, chunks: &[&[u32]], runs: ((usize, u64, u64), (usize, u64, u64)), stop: &(dyn Fn() -> bool + Sync),
+    fn feed_pipelined(&self, sess: &mut Session, chunks: &[&[u32]], runs: ((usize, u64, u64), (usize, u64, u64)), stop: &(dyn Fn(usize) -> bool + Sync),
                       tap: Tap) -> Result<(usize, Vec<f32>)> {
         let total: usize = chunks.iter().map(|c| c.len()).sum();
         if sess.pos + total > sess.max_ctx {
@@ -1494,7 +1494,7 @@ impl<'g> Glm<'g> {
                 let mut at = start;
                 for (i, c) in chunks.iter().enumerate() {
                     // a stop ends the read at a chunk's end: the second stage reads what this one handed on
-                    if i > 0 && stop() {
+                    if i > 0 && stop(chunks[..i].iter().map(|c| c.len()).sum()) {
                         return;
                     }
                     let t0 = std::time::Instant::now();
