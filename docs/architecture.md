@@ -224,8 +224,9 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   on the GPU, 64 bytes back). Its K-quant matrices are requantized to the silo's Q8 at load. With two GPUs it runs on
   the first (the target's 52 layers stay on the B70; 6 of them on a B65 cost more than the drafter there). Checked
   against llama.cpp layer by layer (14 tokens: every layer >= 0.9999; 6,153 tokens, the ring wrapped: the same next
-  token). B70 + B65: 40-48 tok/s decode with drafts (a step: verify ~64 ms + draft ~14 ms, 3-4 tokens), 18 without;
-  ~1,350 tok/s prompt at 4.2K. The chat template's channels (a `to=self` message, then `to=user`) come back as
+  token). B70 + B65: 30-77 tok/s decode with drafts by text (prose ~31-33, code ~75; a step: verify ~62 ms + draft
+  ~12.5 ms, 2.5-4.5 tokens), 18.7 without; sampled requests drawn on the GPU (ns_mg_sample: the host sampler's
+  distribution), as fast a step as greedy; ~1,350 tok/s prompt at 4.2K, 1,215 at 35K. The chat template's channels (a `to=self` message, then `to=user`) come back as
   `reasoning_content` and `content` (nextsycl_tok::muse_channels).
 
 ## The audio engines
