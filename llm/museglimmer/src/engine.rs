@@ -47,6 +47,9 @@ pub struct Geometry {
     pub ctx: usize,
 }
 
+/// The most rows the silo's decode path takes in a pass (a verify pass of the drafter's block); prompt rows beyond
+const MAXV: usize = 16;
+
 /// The post-attention and post-FFN norms' epsilon (llama.cpp's graph: not the file's)
 const POST_EPS: f32 = 1e-8;
 
@@ -148,11 +151,69 @@ struct Layer {
     post_ffn: DevBuf,
 }
 
-/// A conversation: per layer its key / value caches ([kv heads][slots][128] half, slot = position % slots)
+/// A conversation: per layer its key / value caches ([kv heads][slots][128] half, slot = position % slots); with the
+/// drafter its layers' caches too (the target's features injected at each position, rings of the window and a pass)
 pub struct Session {
     pub pos: usize,
     pub max_ctx: usize,
     layers: Vec<(DevBuf, DevBuf, usize)>,
+    draft: Vec<(DevBuf, DevBuf, usize)>,
+    /// rows of the last pass (a rollback keeps some of them)
+    last_rows: usize,
+}
+
+/// The DFlash drafter (llama.cpp's src/models/dflash.cpp, common/speculative.cpp; its own GGUF beside the model):
+/// five layers that draft a block at once. Each position the target passes over leaves its hidden states going into
+/// the target layers `targets` - fc, a norm, then each layer's k (normed, NEOX rotation) and v into its cache. A draft
+/// is one pass of [the last token, MASK x (block - 1)] attending to that context and to the whole block (not causal),
+/// through the target's embedding and head: the block's argmaxes. Its K-quant matrices are requantized to the silo's
+/// repacked Q8 at load, so a block's 16 rows take the silo's products.
+struct Dflash {
+    layers: Vec<DLayer>,
+    fc: Mat,
+    enc_norm: DevBuf,
+    norm: DevBuf,
+    targets: Vec<usize>,
+    heads: usize,
+    heads_kv: usize,
+    window: usize,
+    theta: f32,
+    eps: f32,
+    block: usize,
+    mask: u32,
+    /// the GPU it runs on (the target's last: its head)
+    dev: usize,
+}
+
+struct DLayer {
+    attn_norm: DevBuf,
+    q: Mat,
+    k: Mat,
+    v: Mat,
+    o: Mat,
+    q_norm: DevBuf,
+    k_norm: DevBuf,
+    ffn_norm: DevBuf,
+    gate: Mat,
+    up: Mat,
+    down: Mat,
+}
+
+/// NS_MG_DRAFTS: tokens drafted a step (at most the block's less one; 0: none)
+fn draft_count() -> Option<usize> {
+    std::env::var("NS_MG_DRAFTS").ok().and_then(|v| v.parse().ok())
+}
+
+/// NS_MG_DRAFT: the drafter's GGUF; else the dflash-*.gguf beside the model (its smallest)
+fn draft_path(f: &Gguf) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("NS_MG_DRAFT") {
+        return Some(p.into());
+    }
+    let dir = f.paths.first()?.parent()?;
+    let mut v: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("dflash-") && n.ends_with(".gguf"))).collect();
+    v.sort_by_key(|p| std::fs::metadata(p).map_or(u64::MAX, |m| m.len()));
+    v.into_iter().next()
 }
 
 /// A conversation's state in host memory: per layer its caches' positions still seen (the window's, or all)
@@ -201,20 +262,43 @@ impl Checkpoint {
     }
 }
 
+/// Wall time of a step's parts (ns): the verify pass, the injection in it, the draft - reported after a run
+static T_VERIFY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_INJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_DRAFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tick(c: &std::sync::atomic::AtomicU64, t0: Instant) {
+    c.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A pass's result: its rows' logits, or their argmaxes
+enum Out {
+    Logits(Vec<Vec<f32>>),
+    Ids(Vec<u32>),
+}
+
 /// Generation from a fed prompt: the logits to draw the next token from, or the committed token not fed yet
 pub struct Decoder {
     logits: Option<Vec<f32>>,
     next: Option<u32>,
+    /// draft with the DFlash drafter
+    draft: bool,
+    /// the drafts for the positions after `next`
+    drafts: Vec<u32>,
+    pub drafted: u64,
+    pub accepted: u64,
 }
 
 impl Decoder {
-    pub fn new(logits: Vec<f32>) -> Decoder {
-        Decoder { logits: Some(logits), next: None }
+    pub fn new(logits: Vec<f32>, draft: bool) -> Decoder {
+        Decoder { logits: Some(logits), next: None, draft, drafts: Vec::new(), drafted: 0, accepted: 0 }
     }
-    pub fn after(next: u32) -> Decoder {
-        Decoder { logits: None, next: Some(next) }
+    pub fn after(next: u32, draft: bool) -> Decoder {
+        Decoder { logits: None, next: Some(next), draft, drafts: Vec::new(), drafted: 0, accepted: 0 }
     }
     pub fn pending(&mut self) -> Option<u32> {
+        self.drafts.clear();
         self.next.take()
     }
 }
@@ -255,6 +339,9 @@ pub struct MuseGlimmer<'g> {
     work: Mutex<()>,
     /// NS_MG_PROFILE=1: each kernel's time and calls
     prof: Option<Mutex<std::collections::BTreeMap<&'static str, (f64, u64)>>>,
+    /// the DFlash drafter (drafts on, its file found, the silo there) and the tokens it drafts a step
+    dflash: Option<Dflash>,
+    drafts: usize,
     load_s: f64,
     load_bytes: u64,
 }
@@ -280,7 +367,7 @@ impl<'g> MuseGlimmer<'g> {
     /// Loads the model over `gpus` in order: with one GPU all of it there; with more, the layers split so each GPU keeps
     /// room for its layers' caches (NS_SPLIT: the first layer of each GPU after the first), the head on the last. `kv`:
     /// the context the sessions reserve (tokens in all; 0: 32K).
-    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], kv: (usize, usize), log: &mut dyn FnMut(String)) -> Result<MuseGlimmer<'g>> {
+    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], kv: (usize, usize), draft: bool, log: &mut dyn FnMut(String)) -> Result<MuseGlimmer<'g>> {
         let t0 = Instant::now();
         if gpus.is_empty() {
             return Err(e("no GPU"));
@@ -299,7 +386,35 @@ impl<'g> MuseGlimmer<'g> {
             f.tensors.iter().filter(|t| t.name.starts_with(&p)).map(|t| t.bytes).sum()
         }).collect();
         let head_w = weights - layer_w.iter().sum::<u64>();
-        let w16_bytes = [g.n_ff * g.n_embd, g.heads * g.head * g.n_embd].into_iter().max().unwrap_or(0) * 2;
+        // the drafter: drafts on, the silo there (its products), its file found
+        let dfile: Option<Box<Gguf>> = match (draft && draft_count() != Some(0), silo, draft_path(f)) {
+            (true, Some(_), Some(p)) => match Gguf::open(&p) {
+                Ok(d) if d.architecture() == "dflash" => {
+                    log(format!("museglimmer: the DFlash drafter {}", p.display()));
+                    Some(Box::new(d))
+                }
+                Ok(_) => {
+                    log(format!("museglimmer: {} is not a DFlash drafter; no drafts", p.display()));
+                    None
+                }
+                Err(x) => {
+                    log(format!("museglimmer: the drafter {} does not open ({}); no drafts", p.display(), x.0));
+                    None
+                }
+            },
+            (true, None, _) => {
+                log("museglimmer: drafts need the silo; none".into());
+                None
+            }
+            _ => None,
+        };
+        // its matrices requantized to Q8 (about 1.07 bytes a weight), its caches, the features of a chunk
+        let d_elems: u64 = dfile.as_ref().map_or(0, |d| d.tensors.iter().filter(|t| t.shape.len() == 2).map(|t| t.shape.iter().product::<u64>()).sum());
+        let d_targets = dfile.as_ref().and_then(|d| d.arch_meta("target_layers")).and_then(|v| v.as_array()).map_or(0, |a| a.len());
+        let draft_w = d_elems * 17 / 16 + if dfile.is_some() { 128 << 20 } else { 0 };
+        let w16_bytes = [g.n_ff * g.n_embd, g.heads * g.head * g.n_embd, d_targets * g.n_embd * g.n_embd].into_iter().max().unwrap_or(0) * 2;
+        // a pass's target features and the injection's work beside the arena
+        let feat = |c: usize| if d_targets > 0 { c * (d_targets + 4) * g.n_embd * 4 } else { 0 };
         let mut free = Vec::with_capacity(gpus.len());
         for gpu in gpus {
             let (total, fr) = gpu.memory()?;
@@ -309,15 +424,21 @@ impl<'g> MuseGlimmer<'g> {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         let ctx = if kv.0 > 0 { kv.0 } else { 32768 };
         let split_env: Option<Vec<usize>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+        // the drafter's GPU: with two or more the first (the server orders them weakest first: the target's layers
+        // stay on the faster card, a slower one's XMX ran a 16-row verify ~3x slower), else the only one
+        let d_on = if gpus.len() > 1 { 0 } else { gpus.len() - 1 };
         // the plan for a chunk: the last GPU first (the server orders them weakest first), each taking the last layers
         // left while they fit; the first the rest
         let plan = |c: usize| -> std::result::Result<Vec<(usize, usize)>, String> {
             let n = gpus.len();
             let cost: Vec<u64> = (0..g.layers).map(|l| layer_w[l] + cache_bytes(&g, l, ctx, c) as u64).collect();
             let room: Vec<i64> = (0..n).map(|i| {
-                let mut over = margin + (512 << 20) + w16_bytes as u64 + arena_bytes(&g, c) as u64;
+                let mut over = margin + (512 << 20) + w16_bytes as u64 + (arena_bytes(&g, c) + feat(c)) as u64;
                 if i + 1 == n {
                     over += head_w;
+                }
+                if i == d_on {
+                    over += draft_w;
                 }
                 free[i] as i64 - over as i64
             }).collect();
@@ -378,7 +499,10 @@ impl<'g> MuseGlimmer<'g> {
         }
         let (chunk, bounds) = found.ok_or_else(|| e(format!("{} over {} GPUs at a {ctx}-token context: {last_err}", f.architecture(), gpus.len())))?;
         let given = gpus.len();
-        let (gpus, bounds): (Vec<Arc<Gpu>>, Vec<(usize, usize)>) = gpus.iter().cloned().zip(bounds).filter(|(_, b)| b.1 > b.0).unzip();
+        // a GPU the layers do not reach is not used, unless the drafter is on it
+        let keep: Vec<usize> = (0..gpus.len()).filter(|&i| bounds[i].1 > bounds[i].0 || (dfile.is_some() && i == d_on)).collect();
+        let d_dev = keep.iter().position(|&i| i == d_on).unwrap_or(keep.len() - 1);
+        let (gpus, bounds): (Vec<Arc<Gpu>>, Vec<(usize, usize)>) = keep.iter().map(|&i| (gpus[i].clone(), bounds[i])).unzip();
         if gpus.len() < given {
             log(format!("museglimmer: all of it fits {}: {} of the {given} GPUs not used", gpus.iter().map(|g| g.name.clone()).collect::<Vec<_>>().join(" + "),
                         given - gpus.len()));
@@ -445,12 +569,20 @@ impl<'g> MuseGlimmer<'g> {
         }
         let output_norm = vec_mat(f, &lastg, k, silo, "output_norm.weight", &mut loaded)?.buf;
         let output = vec_mat(f, &lastg, k, silo, if f.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" }, &mut loaded)?;
+        let dflash = match &dfile {
+            Some(d) => Some(load_dflash(d, &g, &gpus[d_dev], d_dev, k, silo.ok_or_else(|| e("drafts need the silo"))?, &mut loaded)?),
+            None => None,
+        };
+        let drafts = dflash.as_ref().map_or(0, |d| draft_count().unwrap_or(d.block - 1).min(d.block - 1));
+        if let Some(d) = &dflash {
+            log(format!("museglimmer: DFlash drafts ({drafts} a step; {} layers, the target's layers {:?})", d.layers.len(), d.targets));
+        }
         let ones = DevBuf::f32(&gpus[0], g.n_embd)?;
         ones.write(0, &vec![1.0f32; g.n_embd].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
         let mut devs = Vec::with_capacity(gpus.len());
         for (gpu, &(lb, le)) in gpus.iter().zip(&bounds) {
             gpu.sync()?;
-            devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, w16_bytes)?, arena: Arena::new(gpu, arena_bytes(&g, chunk))?, lb, le });
+            devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, w16_bytes)?, arena: Arena::new(gpu, arena_bytes(&g, chunk) + feat(chunk))?, lb, le });
         }
         let load_s = t0.elapsed().as_secs_f64();
         let wh = devs.iter().map(|d| if d.lb == 0 && d.le == g.layers { d.gpu.name.clone() } else { format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1) })
@@ -458,7 +590,8 @@ impl<'g> MuseGlimmer<'g> {
         log(format!("museglimmer: {} layers of {} ({} windowed), {:.1} GiB on {wh} in {load_s:.0} s; prompt chunks of {chunk}", g.layers, g.n_embd,
                     g.swa.iter().filter(|s| **s).count(), gib(loaded)));
         Ok(MuseGlimmer { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, ones, output_norm, output, embd, chunk,
-                         work: Mutex::new(()), prof: std::env::var("NS_MG_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), load_s,
+                         work: Mutex::new(()), prof: std::env::var("NS_MG_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), dflash,
+                         drafts, load_s,
                          load_bytes: loaded })
     }
 
@@ -478,11 +611,17 @@ impl<'g> MuseGlimmer<'g> {
 
     /// The profile's lines (`report`): each kernel's time in all and a token
     pub fn profile_lines(&self, tokens: usize) -> Vec<String> {
-        let Some(p) = &self.prof else { return Vec::new() };
+        use std::sync::atomic::Ordering::Relaxed;
+        let steps = STEPS.load(Relaxed).max(1) as f64;
+        let ms = |c: &std::sync::atomic::AtomicU64| c.load(Relaxed) as f64 / 1e6 / steps;
+        let mut out = vec![format!("[steps {}: verify pass {:.1} ms (its injection {:.1}), draft {:.1} ms a step]", STEPS.load(Relaxed), ms(&T_VERIFY), ms(&T_INJECT),
+                                   ms(&T_DRAFT))];
+        let Some(p) = &self.prof else { return out };
         let m = p.lock().unwrap();
         let mut v: Vec<_> = m.iter().collect();
         v.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
-        v.iter().map(|(n, (s, c))| format!("[profile {n:<16} {s:>8.3} s {c:>8} calls {:>8.3} ms/token]", s * 1000.0 / (tokens + 1) as f64)).collect()
+        out.extend(v.iter().map(|(n, (s, c))| format!("[profile {n:<16} {s:>8.3} s {c:>8} calls {:>8.3} ms/token]", s * 1000.0 / (tokens + 1) as f64)));
+        out
     }
 
     pub fn load_seconds(&self) -> f64 {
@@ -534,7 +673,7 @@ impl<'g> MuseGlimmer<'g> {
             return self.op("gemm", || unsafe { (k.gemm)(self.raw(), t as i64, n, kk, x.fp(), kk, w.buf.fp(), y.fp(), n, 0) });
         }
         if let (Some(sc), Some(s)) = (&w.scales, self.silo) {
-            if t <= 8 {
+            if t <= MAXV {
                 let own;
                 let xqb = match xq {
                     Some(q) => q,
@@ -621,11 +760,22 @@ impl<'g> MuseGlimmer<'g> {
         let (hq, hk, d) = (g.heads, g.heads_kv, g.head);
         let (qd, kd) = (hq * d, hk * d);
         let (q, kr, vr, gate) = match (&a.qkvg, xq) {
-            (Some(all), Some(x)) if t == 1 => {
-                // one product for the four
-                let y = self.arena().f32(all.rows)?;
-                self.matmul(all, h, Some(x), 1, &y)?;
-                (y.view(0, qd * 4)?, y.view(qd * 4, kd * 4)?, y.view((qd + kd) * 4, kd * 4)?, y.view((qd + 2 * kd) * 4, qd * 4)?)
+            (Some(all), Some(x)) => {
+                // one product for the four (a row's results the same as theirs apart); more rows: each one's columns out
+                let y = self.arena().f32(t * all.rows)?;
+                self.matmul(all, h, Some(x), t, &y)?;
+                if t == 1 {
+                    (y.view(0, qd * 4)?, y.view(qd * 4, kd * 4)?, y.view((qd + kd) * 4, kd * 4)?, y.view((qd + 2 * kd) * 4, qd * 4)?)
+                } else {
+                    let parts = [(qd, 0), (kd, qd), (kd, qd + kd), (qd, qd + 2 * kd)].map(|(n, c0)| -> Result<DevBuf> {
+                        let b = self.arena().f32(t * n)?;
+                        // SAFETY: y [t, all.rows] -> b [t, n].
+                        self.op("cols", || unsafe { (k.get_cols)(self.raw(), y.fp(), b.fp(), t as i64, n as i64, all.rows as i64, c0 as i64) })?;
+                        Ok(b)
+                    });
+                    let [q, kr, vr, gate] = parts;
+                    (q?, kr?, vr?, gate?)
+                }
             }
             _ => {
                 let (q, kr, vr, gate) = (self.arena().f32(t * qd)?, self.arena().f32(t * kd)?, self.arena().f32(t * kd)?, self.arena().f32(t * qd)?);
@@ -654,17 +804,24 @@ impl<'g> MuseGlimmer<'g> {
                 // the silo's flash attention on XMX (prompt rows)
                 Some(s) => self.op("attention silo", || (s.attn_prompt)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64,
                                                                        cap as i64, p0 as i64, win, att.fp()))?,
+                // and its split form for decode rows (a verify pass's: each row as its one-row pass)
+                None if self.silo.is_some_and(|s| (s.attn_decode_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) => {
+                    let s = self.silo.ok_or_else(|| e("the silo"))?;
+                    let part = self.arena().f32((s.attn_decode_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64, win) as usize)?;
+                    self.op("attention dec silo", || (s.attn_decode)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64,
+                                                                     cap as i64, p0 as i64, win, att.fp(), part.fp()))?;
+                }
                 None => {
-                    let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64, win) as usize;
+                    let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64, win, 1) as usize;
                     let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
                     self.op("attention", || (k.attn)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64,
-                                                     win, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+                                                     win, 1, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
                 }
             }
         }
         tap(&format!("attn_out-{l}"), &att)?;
         let out = self.arena().f32(t * g.n_embd)?;
-        match self.silo.filter(|_| t <= 8 && a.o.packed()) {
+        match self.silo.filter(|_| t <= MAXV && a.o.packed()) {
             Some(s) => {
                 // the gate applied as the output projection's input is quantized
                 // SAFETY: arithmetic only.
@@ -688,7 +845,7 @@ impl<'g> MuseGlimmer<'g> {
     fn post_norm(&self, out: &DevBuf, w: &DevBuf, x: &DevBuf, next: &DevBuf, eps: f32, h: &DevBuf, t: usize, into: Option<&DevBuf>)
                  -> Result<Option<DevBuf>> {
         let ne = self.g.n_embd;
-        match self.silo.filter(|_| t <= 8) {
+        match self.silo.filter(|_| t <= MAXV) {
             Some(s) => {
                 // SAFETY: arithmetic only.
                 let bytes = unsafe { (s.xq_bytes)(ne as i64, t as i64) };
@@ -719,7 +876,7 @@ impl<'g> MuseGlimmer<'g> {
     /// x [t, n_embd] normed by w: as floats into h, or (decode rows with the silo) straight to its split Q8 form
     fn norm_in(&self, x: &DevBuf, w: &DevBuf, h: &DevBuf, t: usize) -> Result<Option<DevBuf>> {
         let ne = self.g.n_embd;
-        match self.silo.filter(|_| t <= 8) {
+        match self.silo.filter(|_| t <= MAXV) {
             Some(s) => {
                 // SAFETY: arithmetic only.
                 let xq = self.arena().bytes(unsafe { (s.xq_bytes)(ne as i64, t as i64) })?;
@@ -739,10 +896,18 @@ impl<'g> MuseGlimmer<'g> {
     fn ffn(&self, ly: &Layer, xq: Option<DevBuf>, h: &DevBuf, fg: &DevBuf, fu: &DevBuf, out: &DevBuf, t: usize) -> Result<()> {
         let g = &self.g;
         let (gv, uv) = match (&ly.gu, &xq) {
-            (Some(all), Some(q)) if t == 1 => {
-                let y = self.arena().f32(all.rows)?;
-                self.matmul(all, h, Some(q), 1, &y)?;
-                (y.view(0, g.n_ff * 4)?, y.view(g.n_ff * 4, g.n_ff * 4)?)
+            (Some(all), Some(q)) => {
+                let y = self.arena().f32(t * all.rows)?;
+                self.matmul(all, h, Some(q), t, &y)?;
+                if t == 1 {
+                    (y.view(0, g.n_ff * 4)?, y.view(g.n_ff * 4, g.n_ff * 4)?)
+                } else {
+                    for (b, c0) in [(fg, 0), (fu, g.n_ff)] {
+                        // SAFETY: y [t, 2 n_ff] -> b [t, n_ff].
+                        self.op("cols", || unsafe { (self.k.get_cols)(self.raw(), y.fp(), b.fp(), t as i64, g.n_ff as i64, all.rows as i64, c0 as i64) })?;
+                    }
+                    (fg.view(0, t * g.n_ff * 4)?, fu.view(0, t * g.n_ff * 4)?)
+                }
             }
             _ => {
                 self.matmul(&ly.ffn_gate, h, xq.as_ref(), t, fg)?;
@@ -751,7 +916,7 @@ impl<'g> MuseGlimmer<'g> {
             }
         };
         let nf = t * g.n_ff;
-        match self.silo.filter(|_| t <= 8 && ly.ffn_down.packed()) {
+        match self.silo.filter(|_| t <= MAXV && ly.ffn_down.packed()) {
             Some(s) => {
                 // SAFETY: arithmetic only.
                 let xd = self.arena().bytes(unsafe { (s.xq_bytes)(g.n_ff as i64, t as i64) })?;
@@ -770,6 +935,19 @@ impl<'g> MuseGlimmer<'g> {
     /// One pass of at most a chunk: the last `n_out` rows' logits
     fn pass(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
         let _w = self.work.lock().unwrap();
+        self.pass_in(s, tokens, n_out, tap)
+    }
+
+    /// `pass` with the work lock held; with the drafter the target's features of every row go into its caches
+    fn pass_in(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
+        match self.pass_out(s, tokens, n_out, false, tap)? {
+            Out::Logits(l) => Ok(l),
+            Out::Ids(_) => Err(e("a pass's logits")),
+        }
+    }
+
+    /// A pass's last `n_out` rows: their logits, or (`ids`: a greedy decoder) only each one's argmax, picked on the GPU
+    fn pass_out(&self, s: &mut Session, tokens: &[u32], n_out: usize, ids: bool, tap: Tap) -> Result<Out> {
         let g = &self.g;
         let t = tokens.len();
         if t == 0 {
@@ -784,7 +962,7 @@ impl<'g> MuseGlimmer<'g> {
         for d in &self.devs {
             d.arena.reset();
         }
-        self.on(0);
+        self.on(self.layer_dev[0]);
         let p0 = s.pos;
         let ne = g.n_embd;
         let emb = self.embed(tokens)?;
@@ -795,6 +973,12 @@ impl<'g> MuseGlimmer<'g> {
         let mut ffn_g = self.arena().f32(t * g.n_ff)?;
         let mut ffn_u = self.arena().f32(t * g.n_ff)?;
         let mut pending: Option<DevBuf> = None;
+        // the drafter's input: the rows' hidden states going into its target layers, side by side
+        let feats = match &self.dflash {
+            Some(d) => Some(self.devs[d.dev].arena.f32(t * d.targets.len() * ne)?),
+            None => None,
+        };
+        let mut held: Vec<(usize, DevBuf)> = Vec::new();
         for (l, (ly, (kc, vc, cap))) in self.layers.iter().zip(s.layers.iter()).enumerate() {
             // the next GPU's layers: the rows cross over, its own buffers for them
             if self.layer_dev[l] != self.cur.load(std::sync::atomic::Ordering::Relaxed) {
@@ -803,8 +987,24 @@ impl<'g> MuseGlimmer<'g> {
                 ffn_g = self.arena().f32(t * g.n_ff)?;
                 ffn_u = self.arena().f32(t * g.n_ff)?;
             }
+            if let (Some(d), Some(f)) = (&self.dflash, &feats) {
+                // arrived on the drafter's GPU: the features taken on the GPUs before come over (the hop has waited)
+                if self.layer_dev[l] == d.dev && !held.is_empty() {
+                    self.bring(d, f, &mut held, t)?;
+                }
+                if let Some(k) = d.targets.iter().position(|x| *x == l) {
+                    if self.layer_dev[l] == d.dev {
+                        self.capture(d, &x, f, k, t)?;
+                    } else {
+                        // a copy kept here until then (no wait in the middle of this GPU's layers)
+                        let c = self.arena().bytes(t * ne * 4)?;
+                        c.copy_within(0, &x, 0, t * ne * 4)?;
+                        held.push((k, c));
+                    }
+                }
+            }
             // where this layer's last step leaves the next layer's normed input (outside this layer's share of the arena)
-            let dec = self.silo.filter(|_| t <= 8);
+            let dec = self.silo.filter(|_| t <= MAXV);
             let carry = match dec {
                 // SAFETY: arithmetic only.
                 Some(sl) => Some(self.arena().bytes(unsafe { (sl.xq_bytes)(ne as i64, t as i64) })?),
@@ -829,24 +1029,192 @@ impl<'g> MuseGlimmer<'g> {
             tap(&format!("l_out-{l}"), &x)?;
             self.arena().rewind(mark);
         }
+        if let (Some(d), Some(f)) = (&self.dflash, &feats) {
+            let ti = Instant::now();
+            if !held.is_empty() {
+                self.bring(d, f, &mut held, t)?;
+            }
+            self.inject(d, f, &s.draft, t, p0)?;
+            if t <= MAXV {
+                self.dev().gpu.sync()?;
+                tick(&T_INJECT, ti);
+            }
+            self.on(self.layer_dev[g.layers - 1]);
+        }
         s.pos += t;
+        s.last_rows = t;
         let n = n_out.clamp(1, t);
         let last = x.view((t - n) * ne * 4, n * ne * 4)?;
         let normed = self.arena().f32(n * ne)?;
         self.rms(&last, &self.output_norm, &normed, n, ne, g.eps)?;
         tap("result_norm", &normed)?;
-        let logits = self.arena().f32(n * self.output.rows)?;
+        let v = self.output.rows;
+        let logits = self.arena().f32(n * v)?;
         self.matmul(&self.output, &normed, None, n, &logits)?;
-        let mut all = logits.to_f32()?;
+        if ids {
+            // the multiplier and the cap change no argmax
+            let best = self.arena().bytes(n * 4)?;
+            // SAFETY: logits [n, vocab] -> n int32.
+            self.op("argmax", || unsafe { (self.k.argmax)(self.raw(), logits.fp(), best.ptr().cast(), n as i64, v as i64) })?;
+            let mut b = vec![0u8; n * 4];
+            best.read(0, &mut b)?;
+            return Ok(Out::Ids(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()));
+        }
         // the output multiplier, then the soft cap
-        let (sc, cap) = (g.logit_scale, g.softcap);
-        for v in all.iter_mut() {
-            *v *= sc;
-            if cap > 0.0 {
-                *v = cap * (*v / cap).tanh();
+        // SAFETY: n x vocab floats.
+        self.op("softcap", || unsafe { (self.k.softcap)(self.raw(), logits.fp(), (n * v) as i64, g.logit_scale, g.softcap) })?;
+        let all = logits.to_f32()?;
+        Ok(Out::Logits(all.chunks(v).map(|c| c.to_vec()).collect()))
+    }
+
+    /// Rows x [t, n_embd] (of the GPU the pass is on) into columns k of the drafter's features (on its GPU)
+    /// Rows x [t, n_embd] (on the drafter's GPU) into columns k of its features
+    fn capture(&self, d: &Dflash, x: &DevBuf, f: &DevBuf, k: usize, t: usize) -> Result<()> {
+        let (ne, nt) = (self.g.n_embd, d.targets.len());
+        // SAFETY: x [t, ne], f [t, nt ne].
+        self.op("features", || unsafe { (self.k.put_cols)(self.raw(), x.fp(), f.fp(), t as i64, ne as i64, (nt * ne) as i64, (k * ne) as i64) })
+    }
+
+    /// The features taken on the GPUs before the drafter's (each kept there) onto it, into their columns
+    fn bring(&self, d: &Dflash, f: &DevBuf, held: &mut Vec<(usize, DevBuf)>, t: usize) -> Result<()> {
+        let ne = self.g.n_embd;
+        let mut st = self.staging.lock().unwrap();
+        for (k, c) in held.drain(..) {
+            let y = self.devs[d.dev].arena.bytes(t * ne * 4)?;
+            if st.len() < y.len {
+                st.resize(y.len, 0);
+            }
+            y.copy_from_peer(&c, &mut st)?;
+            self.on(d.dev);
+            self.capture(d, &y, f, k, t)?;
+        }
+        Ok(())
+    }
+
+    /// The drafter's caches at positions p0.. from the target's features f [t, targets x n_embd]: fc, its norm, then
+    /// each layer's k (normed, rotated) and v
+    fn inject(&self, d: &Dflash, f: &DevBuf, caches: &[(DevBuf, DevBuf, usize)], t: usize, p0: usize) -> Result<()> {
+        let (g, k) = (&self.g, self.k);
+        let ne = g.n_embd;
+        self.on(d.dev);
+        let gx = self.arena().f32(t * ne)?;
+        self.matmul(&d.fc, f, None, t, &gx)?;
+        let gn = self.arena().f32(t * ne)?;
+        let gq = match self.silo.filter(|_| t <= MAXV) {
+            Some(sl) => {
+                // SAFETY: arithmetic only.
+                let xq = self.arena().bytes(unsafe { (sl.xq_bytes)(ne as i64, t as i64) })?;
+                // SAFETY: gx [t, ne], the norm ne floats -> its split Q8 form.
+                self.op("rms xq silo", || unsafe { (sl.rms_xq)(self.raw(), gx.fp(), d.enc_norm.fp(), std::ptr::null_mut(), xq.ptr(), t as i64, ne as i64, d.eps) })?;
+                Some(xq)
+            }
+            None => {
+                self.rms(&gx, &d.enc_norm, &gn, t, ne, d.eps)?;
+                None
+            }
+        };
+        let kd = d.heads_kv * g.head;
+        for (dl, (kc, vc, cap)) in d.layers.iter().zip(caches) {
+            let (kx, vx) = (self.arena().f32(t * kd)?, self.arena().f32(t * kd)?);
+            self.matmul(&dl.k, &gn, gq.as_ref(), t, &kx)?;
+            self.matmul(&dl.v, &gn, gq.as_ref(), t, &vx)?;
+            // SAFETY: the rows and caches as named in mg.h.
+            unsafe {
+                self.op("draft k norm rope", || (k.qk_norm_rope)(self.raw(), kx.fp(), kd as i64, kx.fp(), kd as i64, t as i64, d.heads_kv as i64, g.head as i64,
+                                                                 dl.k_norm.fp(), d.eps, 2, d.theta, p0 as i64))?;
+                self.op("draft kv store", || (k.kv_store)(self.raw(), kx.fp(), vx.fp(), t as i64, d.heads_kv as i64, g.head as i64, *cap as i64, p0 as i64,
+                                                          kc.ptr(), vc.ptr()))?;
             }
         }
-        Ok(all.chunks(self.output.rows).map(|c| c.to_vec()).collect())
+        Ok(())
+    }
+
+    /// Drafts for the positions after `tail` (committed at s.pos, not fed): one pass of the drafter over [tail, MASK..]
+    /// at s.pos.., the block's argmaxes after its first
+    fn draft_in(&self, s: &Session, tail: u32) -> Result<Vec<u32>> {
+        let Some(d) = &self.dflash else { return Ok(Vec::new()) };
+        let nd = self.drafts.min(s.max_ctx.saturating_sub(s.pos + 1));
+        if nd == 0 {
+            return Ok(Vec::new());
+        }
+        let (g, k) = (&self.g, self.k);
+        let sl = self.silo.ok_or_else(|| e("drafts need the silo"))?;
+        let (ne, n, rows) = (g.n_embd, s.pos, nd + 1);
+        self.on(d.dev);
+        self.arena().reset();
+        let mut toks = vec![d.mask; rows];
+        toks[0] = tail;
+        let x = self.embed(&toks)?;
+        let (qd, kd) = (d.heads * g.head, d.heads_kv * g.head);
+        let xq_of = |src: &DevBuf, w: &DevBuf| -> Result<DevBuf> {
+            // SAFETY: arithmetic only.
+            let xq = self.arena().bytes(unsafe { (sl.xq_bytes)(ne as i64, rows as i64) })?;
+            // SAFETY: src [rows, ne], w ne floats -> the normed rows' split Q8 form.
+            self.op("draft rms xq", || unsafe { (sl.rms_xq)(self.raw(), src.fp(), w.fp(), std::ptr::null_mut(), xq.ptr(), rows as i64, ne as i64, d.eps) })?;
+            Ok(xq)
+        };
+        for (dl, (kc, vc, cap)) in d.layers.iter().zip(&s.draft) {
+            let mark = self.arena().mark();
+            let hq = xq_of(&x, &dl.attn_norm)?;
+            let (q, kx, vx) = (self.arena().f32(rows * qd)?, self.arena().f32(rows * kd)?, self.arena().f32(rows * kd)?);
+            self.matmul(&dl.q, &x, Some(&hq), rows, &q)?;
+            self.matmul(&dl.k, &x, Some(&hq), rows, &kx)?;
+            self.matmul(&dl.v, &x, Some(&hq), rows, &vx)?;
+            let att = self.arena().f32(rows * qd)?;
+            // SAFETY: the rows and caches as named in mg.h.
+            unsafe {
+                self.op("draft q norm rope", || (k.qk_norm_rope)(self.raw(), q.fp(), qd as i64, q.fp(), qd as i64, rows as i64, d.heads as i64, g.head as i64,
+                                                                 dl.q_norm.fp(), d.eps, 2, d.theta, n as i64))?;
+                self.op("draft k norm rope", || (k.qk_norm_rope)(self.raw(), kx.fp(), kd as i64, kx.fp(), kd as i64, rows as i64, d.heads_kv as i64,
+                                                                 g.head as i64, dl.k_norm.fp(), d.eps, 2, d.theta, n as i64))?;
+                self.op("draft kv store", || (k.kv_store)(self.raw(), kx.fp(), vx.fp(), rows as i64, d.heads_kv as i64, g.head as i64, *cap as i64, n as i64,
+                                                          kc.ptr(), vc.ptr()))?;
+                let win = d.window as i64;
+                let sc = (k.attn_scratch)(rows as i64, d.heads as i64, d.heads_kv as i64, g.head as i64, n as i64, win, 0) as usize;
+                let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
+                self.op("draft attention", || (k.attn)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), rows as i64, d.heads as i64, d.heads_kv as i64, g.head as i64,
+                                                       *cap as i64, n as i64, win, 0, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+            }
+            let o = self.arena().f32(rows * ne)?;
+            self.matmul(&dl.o, &att, None, rows, &o)?;
+            // SAFETY: rows x ne floats each.
+            self.op("draft add", || unsafe { (k.add)(self.raw(), x.fp(), o.fp(), (rows * ne) as i64) })?;
+            let fq = xq_of(&x, &dl.ffn_norm)?;
+            let (fg, fu) = (self.arena().f32(rows * g.n_ff)?, self.arena().f32(rows * g.n_ff)?);
+            self.matmul(&dl.gate, &x, Some(&fq), rows, &fg)?;
+            self.matmul(&dl.up, &x, Some(&fq), rows, &fu)?;
+            // SAFETY: arithmetic only.
+            let xd = self.arena().bytes(unsafe { (sl.xq_bytes)(g.n_ff as i64, rows as i64) })?;
+            // SAFETY: gate and up [rows, n_ff] -> silu(gate) * up in the split Q8 form.
+            self.op("draft swiglu xq", || unsafe { (sl.xq)(self.raw(), fg.fp(), fu.fp(), 2, xd.ptr(), g.n_ff as i64, rows as i64) })?;
+            self.matmul(&dl.down, &fg, Some(&xd), rows, &o)?;
+            // SAFETY: rows x ne floats each.
+            self.op("draft add", || unsafe { (k.add)(self.raw(), x.fp(), o.fp(), (rows * ne) as i64) })?;
+            self.arena().rewind(mark);
+        }
+        // the block's rows after the first through the drafter's norm and the target's head, each one's argmax
+        let after = x.view(ne * 4, nd * ne * 4)?;
+        let xn = self.arena().f32(nd * ne)?;
+        self.rms(&after, &d.norm, &xn, nd, ne, d.eps)?;
+        // the head is on the target's last GPU
+        let last = self.layer_dev[g.layers - 1];
+        let xn = if last != d.dev { self.hop(&xn, last)? } else { xn };
+        let logits = self.arena().f32(nd * self.output.rows)?;
+        self.matmul(&self.output, &xn, None, nd, &logits)?;
+        let best = self.arena().bytes(nd * 4)?;
+        // SAFETY: logits [nd, vocab] -> nd int32.
+        self.op("argmax", || unsafe { (k.argmax)(self.raw(), logits.fp(), best.ptr().cast(), nd as i64, self.output.rows as i64) })?;
+        let mut b = vec![0u8; nd * 4];
+        best.read(0, &mut b)?;
+        Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    }
+
+    pub fn has_draft(&self) -> bool {
+        self.drafts > 0
+    }
+
+    pub fn max_verify(&self) -> usize {
+        (self.drafts + 1).max(1)
     }
 
     pub fn session(&self, max_ctx: usize) -> Result<Session> {
@@ -869,20 +1237,31 @@ impl<'g> MuseGlimmer<'g> {
             let n = g.heads_kv * cap * g.head * 2;
             layers.push((DevBuf::new(gpu, n)?, DevBuf::new(gpu, n)?, cap));
         }
-        Ok(Session { pos: 0, max_ctx, layers })
+        let mut draft = Vec::new();
+        if let Some(d) = &self.dflash {
+            // a ring of the window and a pass (a prompt chunk's injection, or a block)
+            let cap = if d.window > 0 { max_ctx.min(d.window + self.chunk.max(d.block)) } else { max_ctx + d.block };
+            let gpu = &self.devs[d.dev].gpu;
+            for _ in 0..d.layers.len() {
+                let n = d.heads_kv * cap * g.head * 2;
+                draft.push((DevBuf::new(gpu, n)?, DevBuf::new(gpu, n)?, cap));
+            }
+        }
+        Ok(Session { pos: 0, max_ctx, layers, draft, last_rows: 0 })
     }
 
     pub fn reset_session(&self, s: &mut Session) -> Result<()> {
         s.pos = 0;
+        s.last_rows = 0;
         Ok(())
     }
 
-    /// Positions [from, to) of one cache (cap slots) into another (dcap slots), head by head, in runs that wrap neither
+    /// Positions [from, to) of one cache (`heads` of cap slots) into another (dcap slots), head by head, in runs that
+    /// wrap neither
     #[allow(clippy::too_many_arguments)]
-    fn copy_ring(&self, dst: &DevBuf, dcap: usize, src: &DevBuf, scap: usize, from: usize, to: usize) -> Result<()> {
-        let g = &self.g;
-        let row = g.head * 2;
-        for h in 0..g.heads_kv {
+    fn copy_ring(&self, dst: &DevBuf, dcap: usize, src: &DevBuf, scap: usize, heads: usize, from: usize, to: usize) -> Result<()> {
+        let row = self.g.head * 2;
+        for h in 0..heads {
             let mut p = from;
             while p < to {
                 let (si, di) = (p % scap, p % dcap);
@@ -894,9 +1273,18 @@ impl<'g> MuseGlimmer<'g> {
         Ok(())
     }
 
-    /// The positions of layer `l`'s cache a session at `pos` still reads: its window's, or all
-    fn kept(&self, l: usize, pos: usize) -> usize {
-        let w = self.g.win(l);
+    /// A session's caches - the target's layers, then the drafter's - each with its key heads and window (0: all)
+    fn rings<'a>(&self, s: &'a Session) -> Vec<(&'a (DevBuf, DevBuf, usize), usize, usize)> {
+        let g = &self.g;
+        let mut v: Vec<_> = s.layers.iter().enumerate().map(|(l, c)| (c, g.heads_kv, g.win(l))).collect();
+        if let Some(d) = &self.dflash {
+            v.extend(s.draft.iter().map(|c| (c, d.heads_kv, d.window)));
+        }
+        v
+    }
+
+    /// The first position a cache with window `w` still reads at `pos`
+    fn kept(w: usize, pos: usize) -> usize {
         if w > 0 { pos.saturating_sub(w - 1) } else { 0 }
     }
 
@@ -904,12 +1292,13 @@ impl<'g> MuseGlimmer<'g> {
         if src.pos > dst.max_ctx {
             return Err(e(format!("a session of {} tokens into one of {}", src.pos, dst.max_ctx)));
         }
-        for (l, (d, s)) in dst.layers.iter().zip(&src.layers).enumerate() {
-            let from = self.kept(l, src.pos);
-            self.copy_ring(&d.0, d.2, &s.0, s.2, from, src.pos)?;
-            self.copy_ring(&d.1, d.2, &s.1, s.2, from, src.pos)?;
+        for ((d, heads, w), (sc, _, _)) in self.rings(dst).into_iter().zip(self.rings(src)) {
+            let from = Self::kept(w, src.pos);
+            self.copy_ring(&d.0, d.2, &sc.0, sc.2, heads, from, src.pos)?;
+            self.copy_ring(&d.1, d.2, &sc.1, sc.2, heads, from, src.pos)?;
         }
         dst.pos = src.pos;
+        dst.last_rows = 0;
         Ok(())
     }
 
@@ -933,10 +1322,11 @@ impl<'g> MuseGlimmer<'g> {
     /// Back to the first `keep` rows of the last pass: the caches' later slots are simply written again (a windowed
     /// layer's ring keeps a pass beyond its window, so what a kept row overwrote is still not needed)
     pub fn rollback(&self, s: &mut Session, keep: usize) -> Result<()> {
-        if keep > s.pos {
-            return Err(e(format!("a rollback to {keep} of a session at {}", s.pos)));
+        if keep > s.last_rows {
+            return Err(e(format!("a rollback to {keep} rows of a pass of {}", s.last_rows)));
         }
-        s.pos = keep;
+        s.pos -= s.last_rows - keep;
+        s.last_rows = keep;
         Ok(())
     }
 
@@ -948,28 +1338,75 @@ impl<'g> MuseGlimmer<'g> {
         Ok(out)
     }
 
-    /// The next committed token: drawn from the logits of the last pass, the one before fed first
+    /// The next committed token(s). With drafts: [token, drafts] in one pass, each row's token drawn as plain
+    /// sampling would draw it, the drafts kept while they match (what is committed is distributed as without drafts)
     pub fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
-        let l = match (d.logits.take(), d.next.take()) {
-            (Some(l), _) => l,
-            (None, Some(x)) => self.pass(s, &[x], 1, tap)?.pop().unwrap_or_default(),
+        let _w = self.work.lock().unwrap();
+        let drafting = d.draft && self.drafts > 0;
+        let out = match (d.logits.take(), d.next.take()) {
+            (Some(l), _) => vec![smp.sample(&l)],
+            (None, Some(x)) => {
+                let mut rows = vec![x];
+                if drafting {
+                    rows.extend(d.drafts.iter().take(s.max_ctx.saturating_sub(s.pos + 1)));
+                }
+                d.drafts.clear();
+                let p0 = s.pos;
+                // a greedy decoder's tokens from the GPU (64 bytes back, not 16 rows of logits)
+                let picks: Vec<Option<u32>>;
+                let tv = Instant::now();
+                let res = self.pass_out(s, &rows, rows.len(), smp.greedy(), tap)?;
+                tick(&T_VERIFY, tv);
+                STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let logits = match res {
+                    Out::Logits(l) => {
+                        picks = vec![None; l.len()];
+                        l
+                    }
+                    Out::Ids(v) => {
+                        picks = v.into_iter().map(Some).collect();
+                        vec![Vec::new(); picks.len()]
+                    }
+                };
+                let mut out = Vec::with_capacity(rows.len());
+                for (i, l) in logits.iter().enumerate() {
+                    let y = picks[i].unwrap_or_else(|| smp.sample(l));
+                    out.push(y);
+                    if i + 1 < rows.len() {
+                        d.drafted += 1;
+                        if y == rows[i + 1] {
+                            d.accepted += 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                // the rejected rows' cache slots are written again later
+                s.pos = p0 + out.len();
+                s.last_rows = out.len();
+                out
+            }
             (None, None) => return Err(e("a decoder with nothing to draw from")),
         };
-        let y = smp.sample(&l);
-        d.next = Some(y);
-        Ok(vec![y])
+        let tail = *out.last().unwrap_or(&0);
+        d.next = Some(tail);
+        if drafting {
+            let td = Instant::now();
+            d.drafts = self.draft_in(s, tail)?;
+            tick(&T_DRAFT, td);
+        }
+        Ok(out)
     }
 
     pub fn save(&self, s: &Session) -> Result<Checkpoint> {
-        let g = &self.g;
-        let row = g.head * 2;
+        let row = self.g.head * 2;
         let mut bufs = Vec::new();
-        for (l, (kc, vc, cap)) in s.layers.iter().enumerate() {
-            let from = self.kept(l, s.pos);
+        for ((kc, vc, cap), heads, w) in self.rings(s) {
+            let from = Self::kept(w, s.pos);
             let n = s.pos - from;
             for c in [kc, vc] {
-                let mut b = vec![0u8; g.heads_kv * n * row];
-                for h in 0..g.heads_kv {
+                let mut b = vec![0u8; heads * n * row];
+                for h in 0..heads {
                     let mut p = from;
                     while p < s.pos {
                         let si = p % cap;
@@ -987,21 +1424,20 @@ impl<'g> MuseGlimmer<'g> {
     }
 
     pub fn restore(&self, s: &mut Session, ck: &Checkpoint) -> Result<()> {
-        let g = &self.g;
-        let row = g.head * 2;
+        let row = self.g.head * 2;
         if ck.pos > s.max_ctx {
             return Err(e(format!("a checkpoint of {} tokens into a session of {}", ck.pos, s.max_ctx)));
         }
         let mut it = ck.bufs.iter();
-        for (l, (kc, vc, cap)) in s.layers.iter().enumerate() {
-            let from = self.kept(l, ck.pos);
+        for ((kc, vc, cap), heads, w) in self.rings(s) {
+            let from = Self::kept(w, ck.pos);
             let n = ck.pos - from;
             for c in [kc, vc] {
                 let b = it.next().ok_or_else(|| e("a short checkpoint"))?;
-                if b.len() != g.heads_kv * n * row {
+                if b.len() != heads * n * row {
                     return Err(e("a checkpoint of another shape"));
                 }
-                for h in 0..g.heads_kv {
+                for h in 0..heads {
                     let mut p = from;
                     while p < ck.pos {
                         let si = p % cap;
@@ -1014,6 +1450,7 @@ impl<'g> MuseGlimmer<'g> {
             }
         }
         s.pos = ck.pos;
+        s.last_rows = 0;
         Ok(())
     }
 
@@ -1101,4 +1538,84 @@ fn pack_stack(f: &Gguf, gpu: &Arc<Gpu>, s: &ffi::Silo, names: &[String], loaded:
         r0 += r;
     }
     Ok(Some((own, whole, parts)))
+}
+
+/// A drafter matrix onto the GPU as the silo's repacked Q8: its blocks expanded to float32 there, requantized
+fn dmat(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, s: &ffi::Silo, name: &str, loaded: &mut u64) -> Result<Mat> {
+    let t = f.tensor(name).ok_or_else(|| e(format!("the drafter has no {name}")))?;
+    if t.shape.len() != 2 {
+        return Err(e(format!("{name}: not a matrix")));
+    }
+    let (rows, cols) = (t.shape[0] as usize, t.shape[1] as usize);
+    let raw = f.read(t).map_err(|x| e(x.0))?;
+    *loaded += raw.len() as u64;
+    let src = DevBuf::new(gpu, raw.len())?;
+    src.write(0, &raw)?;
+    let fl = DevBuf::f32(gpu, rows * cols)?;
+    // SAFETY: src holds the tensor, fl its elements as float32.
+    ffi::check(unsafe { (k.dequant)(gpu.raw(), t.ty.code() as i32, src.ptr(), rows * cols, fl.fp()) }, name)?;
+    // SAFETY: arithmetic only.
+    let (bytes, at) = unsafe { ((s.q8r_bytes)(rows as i64, cols as i64), (s.q8r_scales_at)(rows as i64, cols as i64)) };
+    let own = DevBuf::new(gpu, bytes)?;
+    // SAFETY: fl [rows, cols] float32 -> own in the repacked layout.
+    ffi::check(unsafe { (s.q8r_from_f32)(gpu.raw(), fl.fp(), rows as i64, cols as i64, own.ptr()) }, name)?;
+    gpu.sync()?;
+    let scales = own.view(at, rows * (cols / 32) * 2)?;
+    Ok(Mat { buf: own, ty: GType::Q8_0, rows, cols, scales: Some(scales) })
+}
+
+/// The DFlash drafter from its file, on GPU `dev` (the target's last)
+fn load_dflash(f: &Gguf, g: &Geometry, gpu: &Arc<Gpu>, dev: usize, k: &ffi::Api, s: &ffi::Silo, loaded: &mut u64) -> Result<Dflash> {
+    let u = |key: &str| f.arch_meta(key).and_then(|v| v.as_u64()).map(|v| v as usize).ok_or_else(|| e(format!("the drafter has no dflash.{key}")));
+    let fl = |key: &str| f.arch_meta(key).and_then(|v| v.as_f64()).map(|v| v as f32).ok_or_else(|| e(format!("the drafter has no dflash.{key}")));
+    let targets: Vec<usize> = f.arch_meta("target_layers").and_then(|v| v.as_array()).ok_or_else(|| e("the drafter has no dflash.target_layers"))?
+        .iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect();
+    if targets.is_empty() || targets.iter().any(|l| *l >= g.layers) {
+        return Err(e(format!("the drafter's target layers {targets:?} for {} layers", g.layers)));
+    }
+    let (n_embd, heads, heads_kv, head) = (u("embedding_length")?, u("attention.head_count")?, u("attention.head_count_kv")?, u("attention.key_length")?);
+    if n_embd != g.n_embd || head != 128 || !heads.is_multiple_of(heads_kv) || !(heads / heads_kv).is_multiple_of(4) {
+        return Err(e(format!("a drafter of {n_embd} with {heads} / {heads_kv} heads of {head}: not this model's")));
+    }
+    if f.tensors.iter().any(|t| t.name.contains("selector") || t.name.contains("markov") || t.name.contains("conv")) {
+        return Err(e("a DFlash2 / DSpark drafter: only the plain DFlash one is run"));
+    }
+    let n_layers = u("block_count")?;
+    let mut layers = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        let n = |x: &str| format!("blk.{l}.{x}.weight");
+        layers.push(DLayer {
+            attn_norm: vec_mat(f, gpu, k, None, &n("attn_norm"), loaded)?.buf,
+            q_norm: vec_mat(f, gpu, k, None, &n("attn_q_norm"), loaded)?.buf,
+            k_norm: vec_mat(f, gpu, k, None, &n("attn_k_norm"), loaded)?.buf,
+            ffn_norm: vec_mat(f, gpu, k, None, &n("ffn_norm"), loaded)?.buf,
+            q: dmat(f, gpu, k, s, &n("attn_q"), loaded)?,
+            k: dmat(f, gpu, k, s, &n("attn_k"), loaded)?,
+            v: dmat(f, gpu, k, s, &n("attn_v"), loaded)?,
+            o: dmat(f, gpu, k, s, &n("attn_output"), loaded)?,
+            gate: dmat(f, gpu, k, s, &n("ffn_gate"), loaded)?,
+            up: dmat(f, gpu, k, s, &n("ffn_up"), loaded)?,
+            down: dmat(f, gpu, k, s, &n("ffn_down"), loaded)?,
+        });
+    }
+    let fc = dmat(f, gpu, k, s, "fc.weight", loaded)?;
+    if fc.cols != targets.len() * g.n_embd || fc.rows != g.n_embd {
+        return Err(e(format!("the drafter's fc is {} x {}", fc.rows, fc.cols)));
+    }
+    let mask = f.meta("tokenizer.ggml.mask_token_id").and_then(|v| v.as_u64()).ok_or_else(|| e("the drafter has no tokenizer.ggml.mask_token_id"))? as u32;
+    Ok(Dflash {
+        layers,
+        fc,
+        enc_norm: vec_mat(f, gpu, k, None, "enc.output_norm.weight", loaded)?.buf,
+        norm: vec_mat(f, gpu, k, None, "output_norm.weight", loaded)?.buf,
+        targets,
+        heads,
+        heads_kv,
+        window: u("attention.sliding_window").unwrap_or(0),
+        theta: fl("rope.freq_base")?,
+        eps: fl("attention.layer_norm_rms_epsilon")?,
+        block: u("block_size").unwrap_or(16),
+        mask,
+        dev,
+    })
 }

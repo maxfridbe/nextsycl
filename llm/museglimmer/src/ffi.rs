@@ -26,8 +26,14 @@ pub struct Api {
     // mg.h
     pub qk_norm_rope: unsafe extern "C" fn(G, *const f32, i64, *mut f32, i64, i64, i64, i64, *const f32, f32, c_int, f32, i64) -> c_int,
     pub kv_store: unsafe extern "C" fn(G, *const f32, *const f32, i64, i64, i64, i64, i64, M, M) -> c_int,
-    pub attn_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
-    pub attn: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
+    pub attn_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, c_int) -> i64,
+    /// (q, kc, vc, T, Hq, Hkv, D, cap, p0, win, causal, out, scratch)
+    pub attn: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, c_int, *mut f32, *mut f32) -> c_int,
+    pub put_cols: unsafe extern "C" fn(G, *const f32, *mut f32, i64, i64, i64, i64) -> c_int,
+    pub get_cols: unsafe extern "C" fn(G, *const f32, *mut f32, i64, i64, i64, i64) -> c_int,
+    pub argmax: unsafe extern "C" fn(G, *const f32, *mut i32, i64, i64) -> c_int,
+    pub add: unsafe extern "C" fn(G, *mut f32, *const f32, i64) -> c_int,
+    pub softcap: unsafe extern "C" fn(G, *mut f32, i64, f32, f32) -> c_int,
     pub gate_mul: unsafe extern "C" fn(G, *mut f32, *const f32, i64) -> c_int,
     pub rms_add: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, i64, i64, f32) -> c_int,
 }
@@ -69,6 +75,11 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             kv_store: sym!("ns_mg_kv_store"),
             attn_scratch: sym!("ns_mg_attn_scratch"),
             attn: sym!("ns_mg_attn"),
+            put_cols: sym!("ns_mg_put_cols"),
+            get_cols: sym!("ns_mg_get_cols"),
+            argmax: sym!("ns_mg_argmax"),
+            add: sym!("ns_add"),
+            softcap: sym!("ns_mg_softcap"),
             gate_mul: sym!("ns_mg_gate_mul"),
             rms_add: sym!("ns_mg_rms_add"),
         })
@@ -92,6 +103,7 @@ pub struct Silo {
     pub q8r_bytes: unsafe extern "C" fn(i64, i64) -> usize,
     pub q8r_scales_at: unsafe extern "C" fn(i64, i64) -> usize,
     pub q8r_pack: unsafe extern "C" fn(G, P, i64, i64, M) -> c_int,
+    pub q8r_from_f32: unsafe extern "C" fn(G, *const f32, i64, i64, M) -> c_int,
     pub xq_bytes: unsafe extern "C" fn(i64, i64) -> usize,
     /// (a, b, op: 0 a, 1 a sigmoid(b), 2 silu(a) b, xq, n_in, ncols)
     pub xq: unsafe extern "C" fn(G, *const f32, *const f32, c_int, M, i64, i64) -> c_int,
@@ -103,6 +115,9 @@ pub struct Silo {
     pub q8r_f16: unsafe extern "C" fn(G, P, P, i64, i64, *mut u16) -> c_int,
     pub attn_prompt_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
     pub attn_prompt: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32) -> c_int,
+    pub attn_decode_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
+    pub attn_decode_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
+    pub attn_decode: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
 }
 
 /// The silo's library: named after the engine's directory (the architecture's name has a dash)
@@ -133,12 +148,16 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             rms_xq: sym!("ns_mg_rms_xq"),
             post_rms_xq: sym!("ns_mg_post_rms_xq"),
             q8r_pack: sym!("ns_mg_q8r_pack"),
+            q8r_from_f32: sym!("ns_mg_q8r_from_f32"),
             xq_bytes: sym!("ns_mg_xq_bytes"),
             xq: sym!("ns_mg_xq"),
             mmvq: sym!("ns_mg_mmvq"),
             q8r_f16: sym!("ns_mg_q8r_f16"),
             attn_prompt_supported: sym!("ns_mg_attn_prompt_supported"),
             attn_prompt: sym!("ns_mg_attn_prompt"),
+            attn_decode_supported: sym!("ns_mg_attn_decode_supported"),
+            attn_decode_scratch: sym!("ns_mg_attn_decode_scratch"),
+            attn_decode: sym!("ns_mg_attn_decode"),
         }))
     })
     .as_ref()

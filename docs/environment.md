@@ -435,7 +435,9 @@ Muse Glimmer 30B (`llm/museglimmer`, its kernels `kernels/llm/museglimmer`).
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
 | `NS_MG_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (at least 16) (--opt-chunk) | llm museglimmer |
-| `NS_MG_MMVQ_ROWS` | 1 | Experiment: rows a sub-group in the silo's Q8_0 decode products (1, 2) | kernels:llm museglimmer (silo) |
+| `NS_MG_DRAFT` | the smallest dflash-*.gguf beside the model | the DFlash drafter's GGUF (--opt-draft) | llm museglimmer |
+| `NS_MG_DRAFTS` | 15 (the drafter's block less one) | tokens drafted a step (0: none) (--opt-drafts) | llm museglimmer |
+| `NS_MG_XMX_SHAPE` | 7 | Experiment: the silo's XMX decode products' shape (tiles of 8 rows a sub-group, sub-groups a work-group, blocks an iteration) - 7: 1, 4, 2; 0: 2, 4, 1; 1: 4, 4, 1; 2: 2, 8, 1; 3: 1, 8, 1; 4: 2, 4, 2; 5: 1, 8, 2; 6: 2, 8, 2; 8: 1, 4, 4; 9: 1, 2, 4; 10: 1, 8, 4; 11: 2, 2, 2 (`llm kernels` times them) | kernels:llm museglimmer (silo) |
 | `NS_MG_PROFILE` | off | Debug: 1 times every kernel (the queue drained before and after each) and lists them after the run | llm museglimmer |
 
 ## Tests and checks

@@ -1,13 +1,18 @@
 // mmvq.cpp: the museglimmer silo (silo.h) - Muse Glimmer 30B's Q8_0 matrices repacked at load (quants apart from
-// their scales: 16-byte aligned rows), the decode products against them (a sub-group a row, each lane whole blocks:
-// two 16-byte loads of weights, dp4a against the activations in the same split layout), and their expansion to half
-// for a prompt pass. The arithmetic is ggml's Q8_0 x Q8_1: a block's integer dot x the weight's and the activation's
-// half scales.
+// their scales: 16-byte aligned rows), the decode products against them on XMX, and their expansion to half for a
+// prompt pass. The activations of a decode pass (1..16 rows) are quantized as ggml's Q8_1 (amax / 127 a block of 32, the
+// scale kept as half) straight into the XMX operand layout: block b's quants at b x 512 bytes, word w (quants 4w .. 4w
+// + 3) of column c at w x 64 + c x 4 - every column's tile loads as one packed int8 B operand, columns past a pass's
+// rows unused (their scale 0). The product: a weight tile of 8 rows x one block (int8 DPAS 8 x 32 x 16) against it, the
+// int32 result x the rows' and columns' scales into float sums - a column's arithmetic the same however many columns a
+// pass has, so a verify row's logits are its one-row pass's bit for bit (on dp4a, one row a lane, a 16-row pass was
+// compute-bound: a 15-draft step cost 1.7 one-row passes).
 #include "ns.h"
 #include "ns_internal.hpp"
 #include "silo.h"
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <dpct/dpct.hpp>
 #include <cstdlib>
 
@@ -15,73 +20,90 @@ namespace {
 using half = sycl::half;
 constexpr int SG = 16, NSG = 4, WG = SG * NSG;
 
-inline int dp4a(int a, int b, int c) { return dpct::dp4a(a, b, c); }
-inline int dp4a4(const sycl::int4 a, const sycl::int4 b, int acc) {
-    acc = dp4a(a.x(), b.x(), acc); acc = dp4a(a.y(), b.y(), acc); acc = dp4a(a.z(), b.z(), acc); return dp4a(a.w(), b.w(), acc);
-}
 
 size_t align256(size_t n) { return (n + 255) / 256 * 256; }
 
-// R rows a sub-group (the activations' loads shared), C columns
-template <int R, int C>
-void mmvq(sycl::queue& q, const int8_t* wq, const half* ws, const int8_t* xq, const float* xs, float* y, int64_t n_in, int64_t n_out) {
+// the activations' layout (above): where column c's element i goes, and where the scales start
+inline int64_t xq_at(int64_t c, int64_t i) { return (i / 32) * 512 + ((i % 32) / 4) * 64 + c * 4 + (i % 4); }
+inline size_t xq_scales(int64_t n_in) { return align256((size_t) (n_in / 32) * 512); }
+constexpr int64_t XCOLS = 16;
+
+// ---- the products on XMX (int8 DPAS, 8 x 32 x 16): a weight tile of 8 rows x 32 (one Q8 block of each) against the
+// 16 columns' quants of that block (packed by each sub-group into local memory, columns past ncols zero), the int32
+// result scaled by the rows' and the columns' block scales into float sums. A column's arithmetic is the same however
+// many columns a pass has (a verify row's sums are its one-row pass's, bit for bit). A sub-group takes RT tiles (8 RT
+// rows), the work-group's SK sub-groups split the blocks between them, their sums added in a fixed order.
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+template <typename T>
+inline auto gpm(T* p) {
+    return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p);
+}
+
+template <int RT, int SK, int KB = 1>
+void mmvq_xmx(sycl::queue& q, const int8_t* wq, const half* ws, const int8_t* xq, const float* xs, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
     const int64_t nb = n_in / 32;
-    const int64_t rows_wg = (int64_t) NSG * R;
-    const int64_t groups = (n_out + rows_wg - 1) / rows_wg;
-    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) groups * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
-        auto sg = it.get_sub_group();
-        const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
-        const int64_t r0 = (it.get_group(0) * NSG + sgi) * R;
-        if (r0 >= n_out) return;
-        float acc[R][C];
+    constexpr int ROWS = RT * 8;
+    const int64_t groups = (n_out + ROWS - 1) / ROWS;
+    q.submit([&](sycl::handler& h) {
+        // the sums to add [SK][RT][8][16]
+        sycl::local_accessor<float, 1> red(sycl::range<1>(SK * RT * 8 * 16), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) groups * SK * SG), sycl::range<1>(SK * SG)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            auto sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
+            const int64_t row0 = it.get_group(0) * ROWS;
+            float acc[RT][8];
 #pragma unroll
-        for (int r = 0; r < R; ++r)
+            for (int t = 0; t < RT; ++t)
 #pragma unroll
-            for (int c = 0; c < C; ++c) acc[r][c] = 0.0f;
-        for (int64_t b = lane; b < nb; b += SG) {
-            sycl::int4 xv[C][2];
-            float xd[C];
+                for (int e = 0; e < 8; ++e) acc[t][e] = 0.0f;
+            const bool col = lane < ncols;
+            // KB consecutive blocks an iteration (KB = 2: a weight row's whole 64-byte line)
+            for (int64_t k0 = sgi * KB; k0 < nb; k0 += SK * KB)
 #pragma unroll
-            for (int c = 0; c < C; ++c) {
-                const sycl::int4* xp = reinterpret_cast<const sycl::int4*>(xq + c * n_in + 32 * b);
-                xv[c][0] = xp[0];
-                xv[c][1] = xp[1];
-                xd[c] = xs[c * nb + b];
+            for (int kk = 0; kk < KB; ++kk) {
+                const int64_t k = k0 + kk;
+                if (k >= nb) break;
+                jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16, jm::layout::ext_intel_packed> bm;
+                jm::joint_matrix_load(sg, bm, gpm(xq + k * 512), (size_t) 64);
+                const float xsc = col ? xs[lane * nb + k] : 0.0f;
+#pragma unroll
+                for (int t = 0; t < RT; ++t) {
+                    const int64_t r = row0 + t * 8;
+                    if (r >= n_out) break;
+                    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> am;
+                    jm::joint_matrix_load(sg, am, gpm(wq + r * n_in + 32 * k), (size_t) n_in);
+                    jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 16> cm;
+                    jm::joint_matrix_fill(sg, cm, 0);
+                    jm::joint_matrix_mad(sg, cm, am, bm, cm);
+                    // the 8 rows' scales of this block, each lane one, then to every lane
+                    const float wl = lane < 8 ? (float) ws[(r + lane) * nb + k] : 0.0f;
+                    float wr[8];
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) wr[e] = sycl::group_broadcast(sg, wl, e) * xsc;
+                    int e = 0;
+                    jm::joint_matrix_apply(sg, cm, [&](int32_t& v) { acc[t][e] += (float) v * wr[e]; ++e; });
+                }
             }
+            // the sub-groups' sums added in order: element (row e, column lane) of each tile
+            float* rd = red.get_multi_ptr<sycl::access::decorated::no>().get();
 #pragma unroll
-            for (int r = 0; r < R; ++r) {
-                const int64_t row = sycl::min<int64_t>(r0 + r, n_out - 1);
-                const sycl::int4* wp = reinterpret_cast<const sycl::int4*>(wq + row * n_in + 32 * b);
-                const sycl::int4 w0 = wp[0], w1 = wp[1];
-                const float wd = (float) ws[row * nb + b];
+            for (int t = 0; t < RT; ++t)
 #pragma unroll
-                for (int c = 0; c < C; ++c) acc[r][c] += (float) dp4a4(w1, xv[c][1], dp4a4(w0, xv[c][0], 0)) * (wd * xd[c]);
+                for (int e = 0; e < 8; ++e) rd[((sgi * RT + t) * 8 + e) * 16 + lane] = acc[t][e];
+            sycl::group_barrier(it.get_group());
+            for (int i = (int) it.get_local_id(0); i < RT * 8 * 16; i += SK * SG) {
+                const int c = i % 16, re = i / 16;
+                const int64_t row = row0 + re;
+                if (c >= ncols || row >= n_out) continue;
+                float v = 0.0f;
+                for (int s2 = 0; s2 < SK; ++s2) v += rd[(s2 * RT * 8 + re) * 16 + c];
+                y[c * n_out + row] = v;
             }
-        }
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-#pragma unroll
-            for (int c = 0; c < C; ++c) {
-                const float v = sycl::reduce_over_group(sg, acc[r][c], sycl::plus<float>());
-                if (lane == 0 && r0 + r < n_out) y[c * n_out + r0 + r] = v;
-            }
-        }
+        });
     });
 }
 
-template <int R>
-void mmvq_cols(sycl::queue& q, const int8_t* wq, const half* ws, const int8_t* xq, const float* xs, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
-    switch (ncols) {
-        case 1: mmvq<R, 1>(q, wq, ws, xq, xs, y, n_in, n_out); break;
-        case 2: mmvq<R, 2>(q, wq, ws, xq, xs, y, n_in, n_out); break;
-        case 3: mmvq<R, 3>(q, wq, ws, xq, xs, y, n_in, n_out); break;
-        case 4: mmvq<R, 4>(q, wq, ws, xq, xs, y, n_in, n_out); break;
-        case 5: mmvq<R, 5>(q, wq, ws, xq, xs, y, n_in, n_out); break;
-        case 6: mmvq<R, 6>(q, wq, ws, xq, xs, y, n_in, n_out); break;
-        case 7: mmvq<R, 7>(q, wq, ws, xq, xs, y, n_in, n_out); break;
-        default: mmvq<R, 8>(q, wq, ws, xq, xs, y, n_in, n_out); break;
-    }
-}
 }  // namespace
 
 extern "C" {
@@ -107,14 +129,37 @@ int ns_mg_q8r_pack(ns_gpu* g, const void* q8_0, int64_t rows, int64_t n_in, void
     NS_CATCH
 }
 
-size_t ns_mg_xq_bytes(int64_t n_in, int64_t ncols) { return align256((size_t) (ncols * n_in)) + (size_t) (ncols * (n_in / 32)) * 4; }
+int ns_mg_q8r_from_f32(ns_gpu* g, const float* x, int64_t rows, int64_t n_in, void* dst) {
+    NS_TRY
+    if (n_in % 32 != 0) return ns_fail("ns_mg_q8r_from_f32: n_in a multiple of 32");
+    int8_t* oq = (int8_t*) dst;
+    half* os = (half*) ((uint8_t*) dst + ns_mg_q8r_scales_at(rows, n_in));
+    const int64_t nb = rows * (n_in / 32);
+    // a sub-group of 32 a block: Q8_0's d = amax / 127 (as half), q = round(x / d)
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) nb * 32), sycl::range<1>(32)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+        auto sg = it.get_sub_group();
+        const int64_t b = it.get_group(0);
+        const int i = (int) sg.get_local_linear_id();
+        const float v = x[b * 32 + i];
+        const float amax = sycl::reduce_over_group(sg, sycl::fabs(v), sycl::maximum<float>());
+        const half d = (half) (amax / 127.0f);
+        const float df = (float) d;
+        oq[b * 32 + i] = (int8_t) (df != 0.0f ? sycl::clamp(sycl::round(v / df), -127.0f, 127.0f) : 0.0f);
+        if (i == 0) os[b] = d;
+    });
+    return 0;
+    NS_CATCH
+}
+
+size_t ns_mg_xq_bytes(int64_t n_in, int64_t ncols) { return xq_scales(n_in) + (size_t) (XCOLS * (n_in / 32)) * 4; }
 
 int ns_mg_xq(ns_gpu* g, const float* a, const float* b, int op, void* xq, int64_t n_in, int64_t ncols) {
     NS_TRY
-    if (n_in % 32 != 0) return ns_fail("ns_mg_xq: n_in a multiple of 32");
+    if (n_in % 32 != 0 || ncols > XCOLS) return ns_fail("ns_mg_xq: n_in a multiple of 32, at most 16 columns");
     if (op != 0 && !b) return ns_fail("ns_mg_xq: op needs b");
     int8_t* oq = (int8_t*) xq;
-    float* os = (float*) ((uint8_t*) xq + align256((size_t) (ncols * n_in)));
+    float* os = (float*) ((uint8_t*) xq + xq_scales(n_in));
+    const int64_t nbc = n_in / 32;
     const int64_t nb = ncols * (n_in / 32);
     // a sub-group of 32 a block (ggml's quantize_q8_1: d = amax / 127, q = round(x / d), d kept as half)
     g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) nb * 32), sycl::range<1>(32)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
@@ -128,7 +173,7 @@ int ns_mg_xq(ns_gpu* g, const float* a, const float* b, int op, void* xq, int64_
         const float amax = sycl::reduce_over_group(sg, sycl::fabs(v), sycl::maximum<float>());
         const float d = amax / 127.0f;
         const float id = d != 0.0f ? 1.0f / d : 0.0f;
-        oq[at] = (int8_t) sycl::round(v * id);
+        oq[xq_at(blk / nbc, (blk % nbc) * 32 + i)] = (int8_t) sycl::round(v * id);
         if (i == 0) os[blk] = (float) (half) d;
     });
     return 0;
@@ -137,9 +182,9 @@ int ns_mg_xq(ns_gpu* g, const float* a, const float* b, int op, void* xq, int64_
 
 int ns_mg_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* xq, int64_t rows, int64_t C, float eps) {
     NS_TRY
-    if (C % 32 != 0) return ns_fail("ns_mg_rms_xq: C a multiple of 32");
+    if (C % 32 != 0 || rows > XCOLS) return ns_fail("ns_mg_rms_xq: C a multiple of 32, at most 16 rows");
     int8_t* oq = (int8_t*) xq;
-    float* os = (float*) ((uint8_t*) xq + align256((size_t) (rows * C)));
+    float* os = (float*) ((uint8_t*) xq + xq_scales(C));
     const int64_t nb = C / 32;
     constexpr int W = 256, S = 32;
     // a work-group a row: the sum of squares, then a sub-group a block at a time
@@ -158,7 +203,7 @@ int ns_mg_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* xq, 
             const float amax = sycl::reduce_over_group(sg, sycl::fabs(v), sycl::maximum<float>());
             const float d = amax / 127.0f;
             const float id = d != 0.0f ? 1.0f / d : 0.0f;
-            oq[r * C + i] = (int8_t) sycl::round(v * id);
+            oq[xq_at(r, i)] = (int8_t) sycl::round(v * id);
             if (lane == 0) os[r * nb + b] = (float) (half) d;
         }
     });
@@ -168,9 +213,9 @@ int ns_mg_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* xq, 
 
 int ns_mg_post_rms_xq(ns_gpu* g, const float* out, const float* wp, float ep, float* x, const float* wn, float en, void* xq, int64_t rows, int64_t C) {
     NS_TRY
-    if (C % 32 != 0) return ns_fail("ns_mg_post_rms_xq: C a multiple of 32");
+    if (C % 32 != 0 || rows > XCOLS) return ns_fail("ns_mg_post_rms_xq: C a multiple of 32, at most 16 rows");
     int8_t* oq = (int8_t*) xq;
-    float* os = (float*) ((uint8_t*) xq + align256((size_t) (rows * C)));
+    float* os = (float*) ((uint8_t*) xq + xq_scales(C));
     const int64_t nb = C / 32;
     constexpr int W = 256, S = 32;
     // a work-group a row: out's sum of squares, x updated (each work-item its own elements), x's sum of squares, then
@@ -198,7 +243,7 @@ int ns_mg_post_rms_xq(ns_gpu* g, const float* out, const float* wp, float ep, fl
             const float amax = sycl::reduce_over_group(sg, sycl::fabs(v), sycl::maximum<float>());
             const float d = amax / 127.0f;
             const float id = d != 0.0f ? 1.0f / d : 0.0f;
-            oq[r * C + i] = (int8_t) sycl::round(v * id);
+            oq[xq_at(r, i)] = (int8_t) sycl::round(v * id);
             if (lane == 0) os[r * nb + b] = (float) (half) d;
         }
     });
@@ -208,14 +253,28 @@ int ns_mg_post_rms_xq(ns_gpu* g, const float* out, const float* wp, float ep, fl
 
 int ns_mg_mmvq(ns_gpu* g, const void* w, const void* wsc, const void* xq, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
     NS_TRY
-    if (ncols < 1 || ncols > 8 || n_in % 32 != 0) return ns_fail("ns_mg_mmvq: 1..8 columns, n_in a multiple of 32");
+    if (ncols < 1 || ncols > XCOLS || n_in % 32 != 0 || n_out % 8 != 0) return ns_fail("ns_mg_mmvq: 1..16 columns, n_in a multiple of 32, n_out of 8");
     const int8_t* wq = (const int8_t*) w;
     const half* ws = (const half*) wsc;
     const int8_t* xqq = (const int8_t*) xq;
-    const float* xs = (const float*) ((const uint8_t*) xq + align256((size_t) (ncols * n_in)));
-    static const int rows = [] { const char* v = std::getenv("NS_MG_MMVQ_ROWS"); return v ? std::atoi(v) : 1; }();
-    if (rows >= 2) mmvq_cols<2>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols);
-    else mmvq_cols<1>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols);
+    const float* xs = (const float*) ((const uint8_t*) xq + xq_scales(n_in));
+    // NS_MG_XMX_SHAPE: tiles a sub-group, sub-groups a work-group, blocks an iteration (default 7: 1, 4, 2 - B70, a
+    // 19968 x 6656 matrix: 576 GB/s against 474 for 2, 4, 1)
+    static const int shape = [] { const char* v = std::getenv("NS_MG_XMX_SHAPE"); return v ? std::atoi(v) : 7; }();
+    switch (shape) {
+        case 1: mmvq_xmx<4, 4>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+        case 2: mmvq_xmx<2, 8>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+        case 3: mmvq_xmx<1, 8>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+        case 4: mmvq_xmx<2, 4, 2>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+        case 5: mmvq_xmx<1, 8, 2>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+        case 6: mmvq_xmx<2, 8, 2>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+        case 8: mmvq_xmx<1, 4, 4>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+        case 9: mmvq_xmx<1, 2, 4>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+        case 10: mmvq_xmx<1, 8, 4>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+        case 11: mmvq_xmx<2, 2, 2>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+        case 0: mmvq_xmx<2, 4>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+        default: mmvq_xmx<1, 4, 2>(g->q, wq, ws, xqq, xs, y, n_in, n_out, ncols); break;
+    }
     return 0;
     NS_CATCH
 }

@@ -6,6 +6,7 @@
 
 pub mod engine;
 mod ffi;
+mod tools;
 
 use std::any::Any;
 use std::sync::Arc;
@@ -18,12 +19,14 @@ use nextsycl_llm::{Checkpoint, CheckpointState, Decoder, DecoderState, Engine, E
 pub const ARCH: &str = "muse-glimmer";
 
 pub const OPTIONS: &[EngineOption] = &[
+    EngineOption { name: "draft", env: "NS_MG_DRAFT", value: "FILE", help: "the DFlash drafter's GGUF (default: the smallest dflash-*.gguf beside the model)", at: nextsycl_llm::At::Load },
+    EngineOption { name: "drafts", env: "NS_MG_DRAFTS", value: "N", help: "tokens drafted a step (default the drafter's block less one: 15; 0: none)", at: nextsycl_llm::At::Load },
     EngineOption { name: "chunk", env: "NS_MG_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 2048 when it fits beside the weights and a session, else 1024 or 512)", at: nextsycl_llm::At::Load },
 ];
 
 pub fn kind() -> EngineKind {
     EngineKind { archs: &[ARCH], name: "Muse Glimmer (dense gated attention: sliding windows and full layers, SwiGLU, post norms: Muse-Glimmer-30B)", load, info,
-                 kernels: None, chat: nextsycl_tok::muse_chat, options: OPTIONS, prepare: None }
+                 kernels: Some(tools::kernels), chat: nextsycl_tok::muse_chat, options: OPTIONS, prepare: None }
 }
 
 fn info(f: &Gguf) -> std::result::Result<String, String> {
@@ -35,7 +38,7 @@ fn info(f: &Gguf) -> std::result::Result<String, String> {
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {
-    Ok(Box::new(engine::MuseGlimmer::load(f, gpus, o.kv, log)?))
+    Ok(Box::new(engine::MuseGlimmer::load(f, gpus, o.kv, o.draft, log)?))
 }
 
 impl SessionState for engine::Session {
@@ -55,7 +58,7 @@ impl SessionState for engine::Session {
 
 impl DecoderState for engine::Decoder {
     fn drafts(&self) -> (u64, u64) {
-        (0, 0)
+        (self.drafted, self.accepted)
     }
     fn pending(&mut self) -> Option<u32> {
         engine::Decoder::pending(self)
@@ -98,16 +101,16 @@ impl Engine for engine::MuseGlimmer<'_> {
         engine::MuseGlimmer::load_bytes(self)
     }
     fn has_draft(&self) -> bool {
-        false
+        engine::MuseGlimmer::has_draft(self)
     }
     fn prefill_chunk(&self) -> usize {
         engine::MuseGlimmer::prefill_chunk(self)
     }
     fn max_verify(&self) -> usize {
-        8
+        engine::MuseGlimmer::max_verify(self)
     }
     fn cache_fingerprint(&self) -> String {
-        format!("museglimmer f16-kv nsmg-1 chunk={}", self.prefill_chunk())
+        format!("museglimmer f16-kv nsmg-2 chunk={}{}", self.prefill_chunk(), if self.has_draft() { " dflash" } else { "" })
     }
     fn session(&self, max_ctx: usize) -> Result<Session> {
         Ok(Session::new(engine::MuseGlimmer::session(self, max_ctx)?))
@@ -141,11 +144,11 @@ impl Engine for engine::MuseGlimmer<'_> {
         }
         engine::MuseGlimmer::forward_batch(self, &mut own, tokens, tap)
     }
-    fn decoder(&self, logits: Vec<f32>, _draft: bool) -> Decoder {
-        Decoder::new(engine::Decoder::new(logits))
+    fn decoder(&self, logits: Vec<f32>, draft: bool) -> Decoder {
+        Decoder::new(engine::Decoder::new(logits, draft))
     }
-    fn decoder_after(&self, next: u32, _draft: bool) -> Decoder {
-        Decoder::new(engine::Decoder::after(next))
+    fn decoder_after(&self, next: u32, draft: bool) -> Decoder {
+        Decoder::new(engine::Decoder::after(next, draft))
     }
     fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
         let d = d.get_mut::<engine::Decoder>().ok_or_else(|| nextsycl_core::Error("a decoder of another engine".into()))?;

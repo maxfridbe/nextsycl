@@ -207,19 +207,26 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   layers of gated attention (32 / 2 heads of 128, q / k norms, a sigmoid gate from its own projection) and a SwiGLU,
   each followed by its own RMS norm (eps 1e-8) before the residual; 39 layers over a 2,048 sliding window with rotary
   positions (llama.cpp's NORM: adjacent pairs), every fourth over everything without positions; the embedding
-  RMS-normed, the logits x 0.196 then soft-capped at 20. A windowed layer's cache is a ring of its window and a pass
-  (4,095 slots), a full layer's the context. Its kernels (`kernels/llm/museglimmer/mg.cpp`): the norms with the
-  rotation, the ring stores, the windowed attention (online softmax, 4 query heads a work-group, decode split over the
-  keys), the gate, the post norm into the residual; the prompt products are the shared half GEMMs. Its silo:
-  `silo/mmvq.cpp` repacks each Q8_0 matrix at load (quants apart from scales: 16-byte loads), q | k | v | gate and
-  gate | up stacked (a decode row's one product each), and fuses decode's small steps into the quantization of the next
-  product's input (a norm, the gate, SwiGLU, a post norm with the next norm); `silo/attn.cpp` is prompt flash attention
-  on XMX (the qwen35 silo's, for heads of 128, 16 query heads a key head, the window and the ring). Checked against
-  llama.cpp layer by layer (14 tokens: every layer >= 0.99991; 6,153 tokens, the ring wrapped: the same next token,
-  result norm 0.997), the silo's decode products 0.999885 (the shared 0.999847). B70: ~17.4 tok/s decode (28 GB of
-  weights a token at ~490 GB/s; the products ~570 of 608), ~1,370 tok/s prompt at 4.2K (the vector-unit attention:
-  ~830). The chat template's channels (a `to=self`
-  message, then `to=user`) come back as `reasoning_content` and `content` (nextsycl_tok::muse_channels).
+  RMS-normed, the logits x 0.196 then soft-capped at 20. A windowed layer's cache is a ring of its window and a pass,
+  a full layer's the context. Its kernels (`kernels/llm/museglimmer/mg.cpp`): the norms with the rotation, the ring
+  stores, the windowed attention, the gate, the post norm into the residual, the soft cap and argmax on the GPU. Its
+  silo: `silo/mmvq.cpp` repacks each Q8_0 matrix at load (quants apart from scales), q | k | v | gate and gate | up
+  stacked, and runs decode's products (1..16 rows) on XMX - int8 DPAS of 8 weight rows x a block against the 16
+  columns' quants, which the norm / gate / SwiGLU kernels write straight in the packed operand layout: flat in the rows
+  (B70: ~550-590 GB/s for 1 or 16), and a column's arithmetic the same however many share the pass; `silo/attn.cpp`
+  is flash attention on XMX (the qwen35 silo's, for heads of 128 and the window / ring), for prompt rows and, split at
+  absolute key positions with chunks at absolute multiples, for decode rows - so a verify row is its one-row pass bit
+  for bit (spec-check: 0 difference; drafted text = plain text).
+  DFlash (llama.cpp's src/models/dflash.cpp, common/speculative.cpp; the drafter GGUF beside the model): a 5-layer
+  drafter fed the target's hidden states going into layers 2, 14, 26, 38, 50 (fc, a norm, each layer's k / v into its
+  own ring caches at every position a pass covers); a draft is one non-causal pass of [last token, MASK x 15] through
+  the target's embedding and head, the 15 argmaxes; `step` verifies [token, drafts] in one pass (greedy: the argmaxes
+  on the GPU, 64 bytes back). Its K-quant matrices are requantized to the silo's Q8 at load. With two GPUs it runs on
+  the first (the target's 52 layers stay on the B70; 6 of them on a B65 cost more than the drafter there). Checked
+  against llama.cpp layer by layer (14 tokens: every layer >= 0.9999; 6,153 tokens, the ring wrapped: the same next
+  token). B70 + B65: 40-48 tok/s decode with drafts (a step: verify ~64 ms + draft ~14 ms, 3-4 tokens), 18 without;
+  ~1,350 tok/s prompt at 4.2K. The chat template's channels (a `to=self` message, then `to=user`) come back as
+  `reasoning_content` and `content` (nextsycl_tok::muse_channels).
 
 ## The audio engines
 

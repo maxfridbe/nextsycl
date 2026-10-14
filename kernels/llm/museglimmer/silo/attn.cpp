@@ -48,12 +48,17 @@ struct Slm {
     static constexpr int words = (k + v + s > q ? k + v + s : q) + p + st;
 };
 
-template <int G>
-void attn_prompt(sycl::queue& queue, const float* q, const half* kc, const half* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap, int64_t p0,
-                 int64_t win, float* out) {
+// SPLIT (decode rows, at most 16 - a verify pass): the rows' keys cut at absolute positions, multiples of kbs from
+// split sp0; a work-group a (block of 8 rows, head group, split), each row's partial (values unnormalized, max in log2
+// units, sum) into `part` [T][Hq][ns][D + 2], merged after. A row's splits and the arithmetic in them do not depend on
+// the other rows (the DPAS rows are independent, a row masks its own keys; a split with none of its keys leaves an
+// empty partial the merge adds as zeros): a verify row is its one-row pass's, bit for bit.
+template <int G, bool SPLIT>
+void attn_flash(sycl::queue& queue, const float* q, const half* kc, const half* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap, int64_t p0,
+                int64_t win, float* out, int64_t kbs, int64_t sp0, int64_t ns, float* part) {
     constexpr int NSG = 2 * G, WG = NSG * SG;
     using L = Slm<G>;
-    const int64_t blocks = (T + M - 1) / M, groups = Hq / G, per_kv = Hq / Hkv;
+    const int64_t blocks = ((T + M - 1) / M) * (SPLIT ? ns : 1), groups = Hq / G, per_kv = Hq / Hkv;
     const int64_t qs = Hq * D;
     const float qscale = 1.0f / sycl::sqrt((float) D) * 1.4426950408889634f;
     queue.submit([&](sycl::handler& h) {
@@ -63,7 +68,8 @@ void attn_prompt(sycl::queue& queue, const float* q, const half* kc, const half*
             auto sg = it.get_sub_group();
             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id(), tid = (int) it.get_local_id(0);
             const int hg = sgi >> 1, hd = sgi & 1;   // this sub-group's head in the group, its half of the features
-            const int64_t gi = it.get_group(0), grp = gi % groups, r0 = (gi / groups) * M;
+            const int64_t gi = it.get_group(0), grp = gi % groups;
+            const int64_t bi = gi / groups, spl = SPLIT ? bi % ns : 0, r0 = (SPLIT ? bi / ns : bi) * M;
             const int64_t h0 = grp * G, hk = h0 / per_kv;
             uint32_t* base = slm.get_multi_ptr<sycl::access::decorated::no>().get();
             uint32_t* kp = base;
@@ -75,8 +81,14 @@ void attn_prompt(sycl::queue& queue, const float* q, const half* kc, const half*
             float* crow = lrow + G * M;
             half* qh = (half*) base;
             // the block's keys: from the first row's first to the last row's last (rows past T take the last valid row)
-            const int64_t rl = sycl::min(r0 + M, T) - 1, jend = p0 + rl + 1;
-            const int64_t jbeg = win > 0 ? sycl::max<int64_t>(0, p0 + r0 - win + 1) : 0;
+            const int64_t rl = sycl::min(r0 + M, T) - 1;
+            int64_t jend = p0 + rl + 1;
+            int64_t jbeg = win > 0 ? sycl::max<int64_t>(0, p0 + r0 - win + 1) : 0;
+            if constexpr (SPLIT) {
+                // this split's keys (the block's rows mask their own)
+                jbeg = sycl::max(jbeg, (sp0 + spl) * kbs);
+                jend = sycl::min(jend, (sp0 + spl + 1) * kbs);
+            }
 
             // ---- Q, scaled, as half: one half of the features at a time; the row stats
             for (int i = tid; i < G * M; i += WG) {
@@ -104,12 +116,14 @@ void attn_prompt(sycl::queue& queue, const float* q, const half* kc, const half*
 
             const half* kb = kc + hk * cap * D;
             const half* vb = vc + hk * cap * D;
-            for (int64_t j0 = jbeg; j0 < jend; j0 += CH) {
+            // chunks at absolute multiples of CH (a row's grouping the same whatever rows share its block: the decode
+            // rows' exactness), keys before jbeg zeros
+            for (int64_t j0 = jbeg / CH * CH; j0 < jend; j0 += CH) {
                 // ---- 1. the chunk's keys packed (keys past the block's last are zeros: masked below)
                 for (int i = tid; i < CH * (D / 8); i += WG) {   // K: key n, features 8c .. 8c + 7 -> words [4c .. 4c + 3][n]
                     const int n = i / (D / 8), c = i % (D / 8);
                     sycl::uint4 w(0, 0, 0, 0);
-                    if (j0 + n < jend) w = *reinterpret_cast<const sycl::uint4*>(kb + ((j0 + n) % cap) * D + 8 * c);
+                    if (j0 + n < jend && j0 + n >= jbeg) w = *reinterpret_cast<const sycl::uint4*>(kb + ((j0 + n) % cap) * D + 8 * c);
                     kp[(4 * c + 0) * KS + n] = w.x();
                     kp[(4 * c + 1) * KS + n] = w.y();
                     kp[(4 * c + 2) * KS + n] = w.z();
@@ -118,8 +132,8 @@ void attn_prompt(sycl::queue& queue, const float* q, const half* kc, const half*
                 for (int i = tid; i < (CH / 2) * (D / 8); i += WG) {   // V: keys 2p, 2p + 1, features 8c .. -> words [p][8c ..]
                     const int pr = i / (D / 8), c = i % (D / 8);
                     sycl::uint4 a(0, 0, 0, 0), b(0, 0, 0, 0);
-                    if (j0 + 2 * pr < jend) a = *reinterpret_cast<const sycl::uint4*>(vb + ((j0 + 2 * pr) % cap) * D + 8 * c);
-                    if (j0 + 2 * pr + 1 < jend) b = *reinterpret_cast<const sycl::uint4*>(vb + ((j0 + 2 * pr + 1) % cap) * D + 8 * c);
+                    if (j0 + 2 * pr < jend && j0 + 2 * pr >= jbeg) a = *reinterpret_cast<const sycl::uint4*>(vb + ((j0 + 2 * pr) % cap) * D + 8 * c);
+                    if (j0 + 2 * pr + 1 < jend && j0 + 2 * pr + 1 >= jbeg) b = *reinterpret_cast<const sycl::uint4*>(vb + ((j0 + 2 * pr + 1) % cap) * D + 8 * c);
                     const uint32_t av[4] = {a.x(), a.y(), a.z(), a.w()}, bv[4] = {b.x(), b.y(), b.z(), b.w()};
                     uint32_t* dst = vp + pr * D + 8 * c;
 #pragma unroll
@@ -156,7 +170,7 @@ void attn_prompt(sycl::queue& queue, const float* q, const half* kc, const half*
                     for (int i = 0; i < CH / 4; ++i) {
                         const int n = part * (CH / 4) + i;
                         const int64_t j = j0 + n;
-                        sv[i] = j <= pos && j >= first && j < jend ? s0[n] + s1[n] : -INFINITY;
+                        sv[i] = j <= pos && j >= first && j >= jbeg && j < jend ? s0[n] + s1[n] : -INFINITY;
                         mx = sycl::fmax(mx, sv[i]);
                     }
                     mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, 1));
@@ -204,6 +218,30 @@ void attn_prompt(sycl::queue& queue, const float* q, const half* kc, const half*
                 }
                 sycl::group_barrier(it.get_group());   // the chunk's words free for the next
             }
+            if constexpr (SPLIT) {
+                // ---- each row's partial (an empty one when the split had none of its keys: the work-group ran no chunk)
+                const float* lr = lrow + hg * M;
+                const float* mr = mrow + hg * M;
+                const int64_t hq = h0 + hg;
+                float* scratch = sp + sgi * (M * 16);
+#pragma unroll
+                for (int t = 0; t < HALF_D / 16; ++t) {
+                    jm::joint_matrix_store(sg, o[t], lp(scratch), (size_t) 16, jm::layout::row_major);
+                    sycl::group_barrier(sg);
+                    for (int r = 0; r < M; ++r) {
+                        if (r0 + r >= T) break;
+                        const int d = hd * HALF_D + t * 16 + lane;
+                        float* pr = part + (((r0 + r) * Hq + hq) * ns + spl) * (D + 2);
+                        pr[d] = scratch[r * 16 + lane];
+                        if (d == 0) {
+                            pr[D] = mr[r];
+                            pr[D + 1] = lr[r];
+                        }
+                    }
+                    sycl::group_barrier(sg);
+                }
+                return;
+            }
             // ---- the rows' outputs: O / l; rows past T are not written
             const float* lr = lrow + hg * M;
             float* ob = out + r0 * qs + (h0 + hg) * D + hd * HALF_D;
@@ -226,21 +264,90 @@ void attn_prompt(sycl::queue& queue, const float* q, const half* kc, const half*
         });
     });
 }
+// decode: a row's keys a split - ~512 work-groups for its own key count, a multiple of 64 (its one-row pass's choice)
+constexpr int64_t KEYS_D = 64;
+int64_t dec_kbs(int64_t keys, int64_t groups) {
+    const int64_t want = (keys * groups + 511) / 512;
+    return sycl::max<int64_t>(KEYS_D, (want + KEYS_D - 1) / KEYS_D * KEYS_D);
+}
+// row r's first and last + 1 key
+inline int64_t row_first(int64_t pos, int64_t win) { return win > 0 ? sycl::max<int64_t>(0, pos - win + 1) : 0; }
 }  // namespace
 
 extern "C" {
 
+int ns_mg_attn_decode_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh) {
+    return T >= 1 && T <= 16 && Dh == D && Hkv > 0 && Hq == 16 * Hkv;
+}
+
+int64_t ns_mg_attn_decode_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh, int64_t p0, int64_t win) {
+    const int64_t groups = Hq / 16;
+    int64_t ns = 1;
+    for (int64_t r = 0; r < T; ++r) {
+        const int64_t pos = p0 + r, first = row_first(pos, win), kb = dec_kbs(pos + 1 - first, groups);
+        ns = sycl::max(ns, (pos + kb) / kb - first / kb);
+    }
+    // a pass's splits from its first row's first to its last row's last
+    const int64_t f0 = row_first(p0, win), last = p0 + T - 1, kb0 = dec_kbs(last + 1 - row_first(last, win), groups);
+    ns = sycl::max(ns, last / kb0 - f0 / kb0 + 1);
+    return T * Hq * ns * (Dh + 2);
+}
+
+int ns_mg_attn_decode(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh, int64_t cap, int64_t p0,
+                      int64_t win, float* out, float* scratch) {
+    NS_TRY
+    if (!ns_mg_attn_decode_supported(T, Hq, Hkv, Dh)) return ns_fail("ns_mg_attn_decode: 1..16 rows, heads of 128, 16 query heads a key head");
+    if (!scratch) return ns_fail("ns_mg_attn_decode: no scratch");
+    const half* k = (const half*) kc;
+    const half* v = (const half*) vc;
+    const int64_t groups = Hq / 16;
+    // the rows' split sizes (each its own key count's); one launch when they agree, else a row at a time
+    auto kb_of = [&](int64_t r) { const int64_t pos = p0 + r; return dec_kbs(pos + 1 - row_first(pos, win), groups); };
+    const int64_t kb0 = kb_of(0);
+    bool same = true;
+    for (int64_t r = 1; r < T; ++r) same = same && kb_of(r) == kb0;
+    auto launch = [&](const float* qq, int64_t rows, int64_t pp, float* oo, float* part, int64_t kb) {
+        const int64_t sp0 = row_first(pp, win) / kb, ns = (pp + rows - 1) / kb - sp0 + 1;
+        attn_flash<16, true>(g->q, qq, k, v, rows, Hq, Hkv, cap, pp, win, oo, kb, sp0, ns, part);
+        // the splits merged a (row, head) (their maxima in log2 units; empty ones add zeros)
+        g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (rows * Hq) * D), sycl::range<1>(D)), [=](sycl::nd_item<1> it) {
+            const int64_t rh = it.get_group(0), d = it.get_local_id(0);
+            const float* pr = part + rh * ns * (D + 2);
+            float mx = -INFINITY;
+            for (int64_t s2 = 0; s2 < ns; ++s2) mx = sycl::fmax(mx, pr[s2 * (D + 2) + D]);
+            float Ls = 0.0f, A = 0.0f;
+            if (mx != -INFINITY) {
+                for (int64_t s2 = 0; s2 < ns; ++s2) {
+                    const float e = sycl::exp2(pr[s2 * (D + 2) + D] - mx);
+                    Ls += pr[s2 * (D + 2) + D + 1] * e;
+                    A += pr[s2 * (D + 2) + d] * e;
+                }
+            }
+            oo[rh * D + d] = Ls > 0.0f ? A / Ls : 0.0f;
+        });
+    };
+    if (same) {
+        launch(q, T, p0, out, scratch, kb0);
+    } else {
+        const int64_t nsa = ns_mg_attn_decode_scratch(T, Hq, Hkv, Dh, p0, win) / (T * Hq * (D + 2));
+        for (int64_t r = 0; r < T; ++r) launch(q + r * Hq * D, 1, p0 + r, out + r * Hq * D, scratch + r * Hq * nsa * (D + 2), kb_of(r));
+    }
+    return 0;
+    NS_CATCH
+}
+
+
 int ns_mg_attn_prompt_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh) {
-    return T > 8 && Dh == D && Hkv > 0 && Hq == 16 * Hkv;
+    return T > 16 && Dh == D && Hkv > 0 && Hq == 16 * Hkv;
 }
 
 int ns_mg_attn_prompt(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh, int64_t cap, int64_t p0,
                       int64_t win, float* out) {
     NS_TRY
-    if (!ns_mg_attn_prompt_supported(T, Hq, Hkv, Dh)) return ns_fail("ns_mg_attn_prompt: more than 8 rows, heads of 128, 16 query heads a key head");
+    if (!ns_mg_attn_prompt_supported(T, Hq, Hkv, Dh)) return ns_fail("ns_mg_attn_prompt: more than 16 rows, heads of 128, 16 query heads a key head");
     const int64_t need = win > 0 ? sycl::min(p0 + T, win + T - 1) : p0 + T;
     if (need > cap) return ns_fail("ns_mg_attn_prompt: the cache's ring is shorter than the window and the pass");
-    attn_prompt<16>(g->q, q, (const half*) kc, (const half*) vc, T, Hq, Hkv, cap, p0, win, out);
+    attn_flash<16, false>(g->q, q, (const half*) kc, (const half*) vc, T, Hq, Hkv, cap, p0, win, out, 0, 0, 1, nullptr);
     return 0;
     NS_CATCH
 }

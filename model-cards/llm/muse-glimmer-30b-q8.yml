@@ -4,7 +4,7 @@ id: muse-glimmer-30b-q8
 kind: llm
 arch: muse-glimmer
 title: Muse Glimmer 30B Abliterated Q8_0 (8-bit; both GPUs, 128K + 32K)
-about: 'Meta''s dense agentic Muse Glimmer 30B, abliterated (Blackfrost): 52 layers of gated attention (39 over a 2,048 sliding window, 13 full), a dense SwiGLU, logits soft-capped; it reasons on a to=self channel before its answer; 27.6 GiB'
+about: 'Meta''s dense agentic Muse Glimmer 30B, abliterated (Blackfrost): 52 layers of gated attention (39 over a 2,048 sliding window, 13 full), a dense SwiGLU, logits soft-capped; it reasons on a to=self channel before its answer; its DFlash drafter (on the second GPU) drafts 15 tokens a step; 27.6 GiB + 1.5'
 gpus: all
 ctx: 131072,32768
 tools: false
@@ -20,4 +20,10 @@ files:
     size: 29612963456
     sha256: fc7f9c5ea4035609d48439c95a19264bc825bd4ee53a5ff5decb15fe09c4deb6
     path: muse-glimmer-30b/Muse-Glimmer-30B-Abliterated-Q8_0.gguf
+  draft:                # the DFlash drafter (found beside the model): 15 drafts a step, verified exactly
+    key: mg30-dflash-q4
+    url: https://huggingface.co/The-freezer/Muse-Glimmer-30B-Abliterated-GGUF/resolve/83e7dc723f5515704adc8767dfeb279de3df914d/dflash-Muse-Glimmer-30B-Abliterated-Q4_K_M.gguf
+    size: 1631210720
+    sha256: 1b58b92b670d20b49d06a9a1210e4bf5350696bb8f7b4931769b7000d0456eda
+    path: muse-glimmer-30b/dflash-Muse-Glimmer-30B-Abliterated-Q4_K_M.gguf
 guide: guides/chat.md
