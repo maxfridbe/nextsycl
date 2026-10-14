@@ -38,7 +38,7 @@ export const state: AppState = {
   progress: null,
   gpu: null,
   history: [],
-  form: { preset: "parse", prompt: "", tiles: true, maxTokens: 8192, temperature: 0, guard: true },
+  form: { preset: "parse", prompt: "", tiles: true, maxTokens: 8192, temperature: 0, guard: true, figures: true },
   pages: [],
   result: null,
   resultPages: [],

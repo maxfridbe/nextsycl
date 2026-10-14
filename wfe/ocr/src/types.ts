@@ -57,4 +57,6 @@ export interface Form {
   maxTokens: number;
   temperature: number;
   guard: boolean;
+  /** read the text inside the pictures the model marks */
+  figures: boolean;
 }

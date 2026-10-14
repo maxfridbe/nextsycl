@@ -38,6 +38,8 @@ pub const DEFAULT_PROMPT: &str = "document parsing.";
 /// The instruction for several pages (the reference's infer_multi): the model reads every page under it, each after a
 /// `<PAGE>` mark - under a single page's instruction it reads the first page (or nothing) and stops
 pub const MULTI_PROMPT: &str = "Multi page parsing.";
+/// What a picture inside a page is read with (its text alone)
+pub const FIGURE_PROMPT: &str = "Free OCR.";
 pub const NGRAM: u32 = 35;
 pub const NGRAM_WINDOW: u32 = 128;
 pub const NGRAM_WINDOW_PAGES: u32 = 1024;
@@ -81,6 +83,34 @@ fn banned(seq: &[u32], n: usize, window: usize) -> Vec<u32> {
     let mut out: Vec<u32> = (start..end).filter(|&i| &seq[i..i + n - 1] == prefix).map(|i| seq[i + n - 1]).collect();
     out.sort_unstable();
     out.dedup();
+    out
+}
+
+/// A reading of a crop with its boxes moved to the page: [x1, y1, x2, y2] in thousandths of the crop (at `x0`, `y0`,
+/// `cw` x `ch` pixels of a `w` x `h` page) to thousandths of the page
+fn to_page(text: &str, (x0, y0, cw, ch): (u32, u32, u32, u32), (w, h): (u32, u32)) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("<|det|>") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let Some(end) = tail.find("<|/det|>") else {
+            out.push_str(tail);
+            return out;
+        };
+        let inner = &tail["<|det|>".len()..end];
+        let moved = inner.split_once('[').and_then(|(label, b)| {
+            let n: Vec<f64> = b.trim_end_matches(']').split(',').filter_map(|v| v.trim().parse().ok()).collect();
+            let [a, b, c, d] = n[..] else { return None };
+            let px = |v: f64, o: u32, s: u32, side: u32| ((o as f64 + v / 999.0 * s as f64) / side as f64 * 999.0).round().clamp(0.0, 999.0) as u32;
+            Some(format!("{label}[{}, {}, {}, {}]", px(a, x0, cw, w), px(b, y0, ch, h), px(c, x0, cw, w), px(d, y0, ch, h)))
+        });
+        out.push_str("<|det|>");
+        out.push_str(moved.as_deref().unwrap_or(inner));
+        out.push_str("<|/det|>");
+        rest = &tail[end + "<|/det|>".len()..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -197,6 +227,8 @@ impl UnlimitedOcr {
             row += 1;
         }
         debug_assert_eq!(row, n);
+        // the newline, separator and features go when this returns: the copies from them first
+        self.nsd.wait()?;
         Ok((out, n))
     }
 
@@ -221,8 +253,87 @@ impl UnlimitedOcr {
     }
 
     /// A reading: see the pages, read the prompt, write until the end (or max tokens), each piece to `text`
+    /// A reading (one at a time); then, `figures` on, each picture the model only marked (an empty `image` block of a
+    /// size that can hold text) read on its own and its text put in the block
     pub fn read(&self, req: &OcrRequest, text: &mut dyn FnMut(&str)) -> Result<OcrOutput> {
         let _w = self.work.lock().unwrap();
+        let mut out = self.read_one(req, text)?;
+        if req.figures.unwrap_or(true) {
+            self.read_figures(req, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// The empty picture blocks of a reading, cropped from their pages and read with "Free OCR."
+    fn read_figures(&self, req: &OcrRequest, out: &mut OcrOutput) -> Result<()> {
+        let t0 = Instant::now();
+        // the pages' texts: one, or each after a <PAGE> mark
+        let parts: Vec<&str> = if out.text.contains("<PAGE>") { out.text.split("<PAGE>").skip(1).collect() } else { vec![out.text.as_str()] };
+        let mut done: Vec<String> = Vec::new();
+        let mut extra = 0u32;
+        let mut any = false;
+        for (pi, part) in parts.iter().enumerate() {
+            let Some(page) = req.pages.get(pi) else {
+                done.push(part.to_string());
+                continue;
+            };
+            let mut s = String::with_capacity(part.len());
+            let mut rest: &str = part;
+            while let Some(at) = rest.find("<|det|>image [") {
+                s.push_str(&rest[..at]);
+                let tail = &rest[at..];
+                let end = tail.find("<|/det|>").map(|e| e + "<|/det|>".len()).unwrap_or(tail.len());
+                let tag = &tail[..end];
+                s.push_str(tag);
+                rest = &tail[end..];
+                // only a block with nothing written after it (up to the line's end)
+                let line_end = rest.find('\n').unwrap_or(rest.len());
+                if !rest[..line_end].trim().is_empty() {
+                    continue;
+                }
+                let nums: Vec<u32> = tag.trim_start_matches("<|det|>image [").trim_end_matches("]<|/det|>").split(',')
+                    .filter_map(|v| v.trim().parse().ok()).collect();
+                let [x1, y1, x2, y2] = nums[..] else { continue };
+                // the reference's own crop (x / 999 of the page), a margin of 1% around
+                let (w, h) = (page.width as f64, page.height as f64);
+                let px = |v: u32, side: f64, d: f64| ((v as f64 / 999.0 + d) * side).clamp(0.0, side) as u32;
+                let (cx1, cy1, cx2, cy2) = (px(x1, w, -0.01), px(y1, h, -0.01), px(x2, w, 0.01), px(y2, h, 0.01));
+                let (cw, ch) = (cx2.saturating_sub(cx1), cy2.saturating_sub(cy1));
+                // a picture big enough to hold text: 96 pixels a side and 2% of the page
+                if cw < 96 || ch < 96 || (cw as f64 * ch as f64) < 0.02 * w * h {
+                    continue;
+                }
+                let c = page.channels as usize;
+                let mut crop = Picture::new(cw, ch, page.channels);
+                for y in 0..ch as usize {
+                    let src = ((cy1 as usize + y) * page.width as usize + cx1 as usize) * c;
+                    crop.data[y * cw as usize * c..(y + 1) * cw as usize * c].copy_from_slice(&page.data[src..src + cw as usize * c]);
+                }
+                let sub = OcrRequest { pages: vec![crop], prompt: FIGURE_PROMPT.into(), tiles: Some(true), max_tokens: req.max_tokens.clamp(0, 4096),
+                                       ngram: req.ngram, ngram_window: None, temperature: 0.0, seed: req.seed, figures: Some(false), extra: Default::default() };
+                let r = self.read_one(&sub, &mut |_| {})?;
+                extra += r.tokens;
+                let t = r.text.trim();
+                if !t.is_empty() {
+                    any = true;
+                    // the picture's own blocks after it, their boxes moved from the crop's thousandths to the page's
+                    s.push('\n');
+                    s.push_str(&to_page(t, (cx1, cy1, cw, ch), (page.width, page.height)));
+                }
+            }
+            s.push_str(rest);
+            done.push(s);
+        }
+        if any {
+            out.text = if out.text.contains("<PAGE>") { done.iter().map(|p| format!("<PAGE>{p}")).collect() } else { done.concat() };
+        }
+        out.tokens += extra;
+        out.seconds += t0.elapsed().as_secs_f64();
+        Ok(())
+    }
+
+    /// One pass: see the pages, read the prompt, write
+    fn read_one(&self, req: &OcrRequest, text: &mut dyn FnMut(&str)) -> Result<OcrOutput> {
         let t0 = Instant::now();
         if req.pages.is_empty() {
             return Err(Error("no pages to read".into()));
@@ -239,6 +350,8 @@ impl UnlimitedOcr {
         };
         let ids = self.prompt_tokens(prompt, n_img);
         let x = self.embed(&ids, &img)?;
+        // the copies out of the image tokens first (sycl::free does not wait for queued work)
+        self.nsd.wait()?;
         drop(img);
         let mut cache = self.decoder.cache(ids.len())?;
         let mut logits = self.decoder.pass(&self.nsd, &mut cache, &x, ids.len(), &mut |_, _| Ok(()))?;
@@ -315,6 +428,13 @@ impl ImageEngine for UnlimitedOcr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_boxes_move_to_the_page() {
+        // a crop of the right half of a 1000 x 1000 page: its whole width is the page's 500..1000
+        let t = to_page("<|det|>text [0, 0, 999, 999]<|/det|>hello", (500, 0, 500, 1000), (1000, 1000));
+        assert_eq!(t, "<|det|>text [500, 0, 999, 999]<|/det|>hello");
+    }
 
     #[test]
     fn ngram_bans_the_repeat() {

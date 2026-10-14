@@ -73,6 +73,7 @@ export async function read(): Promise<void> {
       images: state.pages.map((p) => p.url),
       prompt: promptText(),
       tiles: f.tiles,
+      figures: f.figures !== false,
       max_tokens: f.maxTokens,
       temperature: f.temperature,
       ...(f.guard ? {} : { ngram: 0 }),

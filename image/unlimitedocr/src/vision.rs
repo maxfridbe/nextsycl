@@ -326,9 +326,13 @@ impl Vision {
         let px = DevBuf::f32(gpu, b * n * SAM_W)?;
         // SAFETY: img [b][3][side][side], px [b][gs][gs][768].
         ffi::check(unsafe { (k.patchify)(gpu.raw(), img.fp(), b as i64, side as i64, side as i64, PATCH as i64, px.fp()) }, "patchify")?;
+        // the queue first: sycl::free does not wait for work queued on the buffers
+        nsd.wait()?;
         drop(img);
         let x = DevBuf::f32(gpu, b * n * SAM_W)?;
         nsd.linear(px.ptr(), Dt::F32, b * n, SAM_W, self.patch.ptr(), SAM_W, self.patch_b.ptr(), x.ptr(), Dt::F32)?;
+        // the queue first: sycl::free does not wait for work queued on the buffers
+        nsd.wait()?;
         drop(px);
         for i in 0..b {
             nsd.gate_add(at(&x, i * n * SAM_W), Dt::F32, n, SAM_W, sam_pos, Dt::F32, none(), none())?;
@@ -370,6 +374,8 @@ impl Vision {
             nsd.gate_add(x.ptr(), Dt::F32, b * n, SAM_W, o.ptr(), Dt::F32, none(), none())?;
             tap(&format!("sam_layer_out-{li}"), &x)?;
         }
+        // the queue first: sycl::free does not wait for work queued on the buffers
+        nsd.wait()?;
         drop((hw, qkv, att, mlp));
         // the neck
         let c1 = DevBuf::f32(gpu, b * n * 256)?;
@@ -391,6 +397,8 @@ impl Vision {
         let m = g4 * g4;
         let sam = DevBuf::f32(gpu, b * m * CLIP_W)?;
         conv(&x2, g2, 512, 2, &self.net3, CLIP_W, &sam)?;
+        // the queue first: sycl::free does not wait for work queued on the buffers
+        nsd.wait()?;
         drop((c1, c1n, col, x2, x, h, o));
         tap("sam_output", &sam)?;
         // CLIP over [CLS] + SAM's tokens
@@ -405,6 +413,8 @@ impl Vision {
         let xn = DevBuf::f32(gpu, b * s * CLIP_W)?;
         nsd.layer_norm(xc.ptr(), Dt::F32, b * s, CLIP_W, self.pre_w.ptr(), self.pre_b.ptr(), CLIP_EPS, xn.ptr(), Dt::F32)?;
         // the pre-norm's output is the residual stream (VitModel.forward)
+        // the queue first: sycl::free does not wait for work queued on the buffers
+        nsd.wait()?;
         drop(xc);
         let xc = xn;
         tap("pre_ln", &xc)?;
@@ -433,6 +443,8 @@ impl Vision {
             nsd.gate_add(xc.ptr(), Dt::F32, b * s, CLIP_W, o.ptr(), Dt::F32, none(), none())?;
             tap(&format!("layer_out-{li}"), &xc)?;
         }
+        // the queue first: sycl::free does not wait for work queued on the buffers
+        nsd.wait()?;
         drop((h, qkv, att, mlp));
         // the projector over [CLIP's tokens (no CLS) | SAM's]
         let feat = DevBuf::f32(gpu, b * m * 2 * CLIP_W)?;
@@ -447,8 +459,12 @@ impl Vision {
         }
         let out = DevBuf::f32(gpu, b * m * OUT)?;
         nsd.linear(feat.ptr(), Dt::F32, b * m, 2 * CLIP_W, self.proj.ptr(), OUT, self.proj_b.ptr(), out.ptr(), Dt::F32)?;
+        // the queue first: sycl::free does not wait for work queued on the buffers
+        nsd.wait()?;
         drop(o);
         tap("projected", &out)?;
+        // the temporaries go when this returns: their work first
+        nsd.wait()?;
         Ok(out)
     }
 }

@@ -14,7 +14,7 @@ nextsycl image gen \"<prompt>\" [--model ID] [--size WxH | --aspect W:H] [--step
 nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora NAME[:SCALE]]... [--set NAME=VALUE]...
                      [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl image start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
-nextsycl image ocr PICTURE... [--model ID|FILE.gguf] [--prompt TEXT] [--no-tiles] [--max N] [--temp T] [--out FILE] [--gpu N] [--dump-views DIR]
+nextsycl image ocr PICTURE... [--model ID|FILE.gguf] [--prompt TEXT] [--no-tiles] [--no-figures] [--max N] [--temp T] [--out FILE] [--gpu N] [--dump-views DIR]
 nextsycl image check <dump dir> [--model ID|FILE.gguf] [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--tokens N] [--gpu N]
 nextsycl image engines | selftest [--gpu N]";
 
@@ -168,16 +168,23 @@ fn ocr(cfg: &Config, args: &[String]) -> Result<(), String> {
         pages,
         prompt: opt(args, "--prompt").unwrap_or("").to_string(),
         tiles: Some(!args.iter().any(|a| a == "--no-tiles")),
+        figures: Some(!args.iter().any(|a| a == "--no-figures")),
         max_tokens: opt(args, "--max").and_then(|v| v.parse().ok()).unwrap_or(0),
         temperature: opt(args, "--temp").and_then(|v| v.parse().ok()).unwrap_or(0.0),
         ..Default::default()
     };
     use std::io::Write;
+    let mut streamed = String::new();
     let out = e.ocr(&req, &mut |t| {
+        streamed.push_str(t);
         print!("{t}");
         let _ = std::io::stdout().flush();
     }).map_err(|e| e.0)?;
     println!();
+    // the pictures inside the page are read after it: the whole reading again, with them in
+    if out.text != streamed {
+        println!("--- with the text inside its pictures ---\n{}", out.text);
+    }
     eprintln!("[{} prompt tokens in {:.2} s ({:.0} tok/s); {} written in {:.2} s ({:.1} tok/s)]", out.prompt_tokens, out.prompt_seconds,
               out.prompt_tokens as f64 / out.prompt_seconds.max(1e-9), out.tokens, out.seconds, out.tokens as f64 / out.seconds.max(1e-9));
     if let Some(f) = opt(args, "--out") {

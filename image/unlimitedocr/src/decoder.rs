@@ -344,6 +344,8 @@ impl Decoder {
         // the activations to half in the input's buffer (it is read no more by this call's caller after the gate)
         let ah = DevBuf::new(&self.gpu, m * ff * 2)?;
         self.to_half(act, m * ff, &ah)?;
-        nsd.linear(ah.ptr(), Dt::F16, m, ff, down.ptr(), e, none(), out.ptr(), Dt::F32)
+        nsd.linear(ah.ptr(), Dt::F16, m, ff, down.ptr(), e, none(), out.ptr(), Dt::F32)?;
+        // ah goes when this returns: its work first (sycl::free does not wait for queued work)
+        nsd.wait()
     }
 }

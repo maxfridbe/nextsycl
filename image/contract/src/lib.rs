@@ -69,6 +69,8 @@ pub struct OcrRequest {
     /// sampling temperature (0: greedy - the model's own setting for reading)
     pub temperature: f32,
     pub seed: u64,
+    /// read the text inside the pictures the model only marks (a second pass a picture); None: the engine's default
+    pub figures: Option<bool>,
     /// the engine's own options for this request, by name
     pub extra: Given,
 }

@@ -11,8 +11,9 @@
 //!                                 URLs]; the instructions name the pictures ("the hat from picture 2"); the size
 //!                                 follows the last picture's aspect unless one is given
 //!   POST /v1/ocr                  an OCR model's reading: images [base64 or data URLs] (pages, in order), prompt,
-//!                                 tiles (a single page's tiles too; default true), max_tokens, temperature, ngram
-//!                                 (0: no repetition rule) -> text (the model's markup kept), tokens, seconds; the text
+//!                                 tiles (a single page's tiles too; default true), figures (read the text inside
+//!                                 the pictures it marks; default true), max_tokens, temperature, ngram (0: no
+//!                                 repetition rule) -> text (the model's markup kept), tokens, seconds; the text
 //!                                 so far is in /api/progress while it is written
 //!   GET  /v1/images/files/<f>     a picture made here (saved in the output directory)
 //!   GET  /v1/models, /health
@@ -410,6 +411,7 @@ impl ImageServer {
             ngram_window: b["ngram_window"].as_u64().map(|v| v as u32),
             temperature: b["temperature"].as_f64().unwrap_or(0.0) as f32,
             seed: b["seed"].as_u64().unwrap_or(0),
+            figures: b["figures"].as_bool(),
             extra: Default::default(),
         };
         let n_pages = req.pages.len();
