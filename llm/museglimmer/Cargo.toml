@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-llm-museglimmer"
+description = "Muse Glimmer 30B (muse-glimmer): dense gated attention over sliding windows and full layers, SwiGLU, post norms - its model description and its engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-llm.workspace = true
+nextsycl-tok.workspace = true

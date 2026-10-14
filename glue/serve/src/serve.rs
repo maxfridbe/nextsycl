@@ -1084,6 +1084,8 @@ impl Server {
         let text = (self.chat)(&messages, ask.effort, &tools);
         // the answer starts in its thinking when the prompt opens it (a template's non-thinking mode closes it there)
         let opens_thinking = text.trim_end().ends_with("<think>");
+        // Muse Glimmer's channels: the answer after `<|start|>assistant` is a to=self message, then the to=user one
+        let channels = text.ends_with("<|start|>assistant");
         let ids = self.tok.encode(&text);
         if ids.len() + 16 > self.max_ctx {
             return Err(format!("the prompt is {} tokens; the context is {}", ids.len(), self.max_ctx));
@@ -1168,7 +1170,9 @@ impl Server {
             send(s, json!({"role": "assistant"}), None);
         }
         let (mut reasoning, mut content) = (String::new(), String::new());
-        let mut thinking = opens_thinking;
+        let mut thinking = opens_thinking || channels;
+        // the channel model's text so far, and how much of each part has gone out
+        let (mut raw, mut sent_r, mut sent_c) = (String::new(), 0usize, 0usize);
         let mut pending: Vec<u8> = Vec::new();
         let mut n = 0;
         let t1 = Instant::now();
@@ -1209,7 +1213,21 @@ impl Server {
             let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
             pending.drain(..valid);
             let mut parts: Vec<(bool, String)> = Vec::new();
-            if thinking {
+            if channels {
+                raw.push_str(&piece);
+                let (r, c, answering) = nextsycl_tok::muse_channels(&raw);
+                if r.len() > sent_r && r.is_char_boundary(sent_r) {
+                    parts.push((true, r[sent_r..].to_string()));
+                    sent_r = r.len();
+                }
+                if c.len() > sent_c && c.is_char_boundary(sent_c) {
+                    parts.push((false, c[sent_c..].to_string()));
+                    sent_c = c.len();
+                }
+                reasoning = r;
+                content = c;
+                thinking = !answering;
+            } else if thinking {
                 // the thinking ends at </think> (one token or several pieces)
                 let joined = format!("{reasoning}{piece}");
                 if let Some(i) = joined.find("</think>") {

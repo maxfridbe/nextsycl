@@ -1003,7 +1003,7 @@ impl Part {
     fn upload(&self, dst: &DevBuf, data: &[u8]) -> Result<()> {
         let n = data.len();
         let mut r = self.up.lock().unwrap();
-        if n == 0 || n % 4 != 0 || n > r.0.len / 4 {
+        if n == 0 || !n.is_multiple_of(4) || n > r.0.len / 4 {
             drop(r);
             return dst.write_async(0, data);
         }
@@ -1022,6 +1022,7 @@ impl Part {
 
     /// Several buffers' first floats on their way down (kernels copy them into pinned memory): the last copy's ticket
     /// and where each lands, for `read_finish` - the queue goes on meanwhile. None when they do not fit the buffer.
+    #[allow(clippy::type_complexity)]
     fn read_start(&self, xs: &[(&DevBuf, usize)]) -> Result<Option<(i64, Vec<(usize, usize)>)>> {
         let back = self.back.lock().unwrap();
         let total: usize = xs.iter().map(|(_, n)| (n * 4).next_multiple_of(64)).sum();
@@ -1538,8 +1539,8 @@ impl<'g> Ds4<'g> {
             let reserve: usize = range.clone().chain(mtp_here).map(|l| {
                 let r = g.ratio(l) as usize;
                 let mut b = raw_ring() * 512 * 2;
-                if r > 0 {
-                    b += (kv.0 / r + 1) * 512 * 2;
+                if let Some(q) = kv.0.checked_div(r) {
+                    b += (q + 1) * 512 * 2;
                 }
                 if r == 4 {
                     b += (kv.0 / 4 + 1) * g.idx_dim as usize * 2;
@@ -2238,7 +2239,7 @@ impl<'g> Ds4<'g> {
         let next = DevBuf::new(&p.ops.gpu, x.len)?;
         // decode widths: down by a kernel into the previous part's pinned buffer, up through this one's ring (the
         // runtime's copies wait behind the expert store's on the copy engines)
-        if pi > 0 && x.len % 4 == 0 {
+        if pi > 0 && x.len.is_multiple_of(4) {
             let src = &self.parts[pi - 1];
             if let Some((tk, spans)) = src.read_start(&[(x, x.len / 4)])? {
                 return self.timed(p, "GPU to GPU", || {

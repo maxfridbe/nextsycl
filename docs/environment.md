@@ -50,6 +50,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_IMAGE_PORT2` | 8096 | the second image server's port (`image start --slot 1`), as `NS_AUDIO_PORT2` | serve |
 | `NS_PORT` | 8085 | the chat server's port (also the url the registry gives chat entries) | cli (llm start), serve, switch |
 | `NS_SERVE_PORT` | 8000 | the front door's port; `audio voices design` calls it there | serve, cli (audio) |
+| `OWUI_TOKEN` | a sign-in (works as is with WEBUI_AUTH=False) | Open WebUI's admin token for `glue/openwebui/install.sh` (it installs the pp / tg speed filter) | glue (openwebui install) |
 | `NS_SWITCH_PORT` | 8001 | the model switcher's port, as the front door reaches it (the switcher itself listens on --port, 8001) | serve |
 
 ## Model registry and catalog
@@ -426,6 +427,16 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS4_MULTI_CACHED` | on | 0: the IQ experts' multi-matrix kernel loads each row's activations again instead of holding them over a sub-group's run of rows | kernels:llm deepseek4 |
 | `NS_DS4_MULTI_DENSE` | on | 0: decode's dense products of one input a launch a matrix (shared kernels) instead of one multi-matrix launch a type | llm deepseek4 |
 | `NS_DS4_MULTI_GROUPS` | 1024 | Experiment: work-groups of the multi-expert decode kernels | kernels:llm deepseek4 |
+
+### museglimmer
+
+Muse Glimmer 30B (`llm/museglimmer`, its kernels `kernels/llm/museglimmer`).
+
+| Variable | Default | What it does | Read by |
+|---|---|---|---|
+| `NS_MG_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (at least 16) (--opt-chunk) | llm museglimmer |
+| `NS_MG_MMVQ_ROWS` | 1 | Experiment: rows a sub-group in the silo's Q8_0 decode products (1, 2) | kernels:llm museglimmer (silo) |
+| `NS_MG_PROFILE` | off | Debug: 1 times every kernel (the queue drained before and after each) and lists them after the run | llm museglimmer |
 
 ## Tests and checks
 

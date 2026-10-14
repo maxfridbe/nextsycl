@@ -1,0 +1,134 @@
+//! The kernels this engine runs, bound from the language kind's kernel library by name: its own
+//! (`kernels/llm/museglimmer/mg.h`) and the generic ones of the glm5next engine's (`kernels/llm/glm5next/glm.h`: the
+//! products from the stored blocks, the norms, SwiGLU, the half GEMM).
+
+use std::ffi::{c_int, c_void};
+use std::sync::OnceLock;
+
+type G = *mut c_void;
+type P = *const c_void;
+type M = *mut c_void;
+
+#[allow(clippy::type_complexity)]
+pub struct Api {
+    // glm.h
+    pub dequant: unsafe extern "C" fn(G, c_int, P, usize, *mut f32) -> c_int,
+    pub gemm: unsafe extern "C" fn(G, i64, i64, i64, *const f32, i64, *const f32, *mut f32, i64, c_int) -> c_int,
+    pub rms_norm: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, i64, i64, f32) -> c_int,
+    pub swiglu_clamp: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, i64, f32) -> c_int,
+    pub dequant_f16: unsafe extern "C" fn(G, c_int, P, i64, *mut u16) -> c_int,
+    pub to_f16: unsafe extern "C" fn(G, *const f32, *mut u16, i64) -> c_int,
+    pub gemm_f16: unsafe extern "C" fn(G, i64, i64, i64, *const u16, i64, *const u16, *mut f32, i64, c_int) -> c_int,
+    pub add: unsafe extern "C" fn(G, *mut f32, *const f32, i64) -> c_int,
+    pub q8_1_bytes: unsafe extern "C" fn(i64, i64) -> usize,
+    pub mmvq_supported: unsafe extern "C" fn(c_int) -> c_int,
+    pub quantize_q8_1: unsafe extern "C" fn(G, *const f32, M, i64, i64) -> c_int,
+    pub mmvq: unsafe extern "C" fn(G, c_int, P, P, *mut f32, i64, i64, i64) -> c_int,
+    // mg.h
+    pub qk_norm_rope: unsafe extern "C" fn(G, *const f32, i64, *mut f32, i64, i64, i64, i64, *const f32, f32, c_int, f32, i64) -> c_int,
+    pub kv_store: unsafe extern "C" fn(G, *const f32, *const f32, i64, i64, i64, i64, i64, M, M) -> c_int,
+    pub attn_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
+    pub attn: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
+    pub gate_mul: unsafe extern "C" fn(G, *mut f32, *const f32, i64) -> c_int,
+}
+
+// SAFETY: function pointers into the library, which stays loaded for the process.
+unsafe impl Send for Api {}
+unsafe impl Sync for Api {}
+
+pub fn api() -> nextsycl_core::Result<&'static Api> {
+    static API: OnceLock<std::result::Result<Api, String>> = OnceLock::new();
+    API.get_or_init(|| {
+        let lib = nextsycl_core::api().map_err(|e| e.0)?;
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{} is not in the kernel library (rebuild it: ./build.sh kernels)", $name));
+                }
+                // SAFETY: the symbol is declared in glm.h / mg.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Api {
+            dequant: sym!("ns_dequant"),
+            gemm: sym!("ns_gemm"),
+            rms_norm: sym!("ns_rms_norm"),
+            swiglu_clamp: sym!("ns_swiglu_clamp"),
+            dequant_f16: sym!("ns_dequant_f16"),
+            to_f16: sym!("ns_to_f16"),
+            gemm_f16: sym!("ns_gemm_f16"),
+            add: sym!("ns_add"),
+            q8_1_bytes: sym!("ns_q8_1_bytes"),
+            mmvq_supported: sym!("ns_mmvq_supported"),
+            quantize_q8_1: sym!("ns_quantize_q8_1"),
+            mmvq: sym!("ns_mmvq"),
+            qk_norm_rope: sym!("ns_mg_qk_norm_rope"),
+            kv_store: sym!("ns_mg_kv_store"),
+            attn_scratch: sym!("ns_mg_attn_scratch"),
+            attn: sym!("ns_mg_attn"),
+            gate_mul: sym!("ns_mg_gate_mul"),
+        })
+    })
+    .as_ref()
+    .map_err(|e| nextsycl_core::Error(e.clone()))
+}
+
+/// A call's return code as a result (the reason from the library)
+pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
+    if rc == 0 {
+        return Ok(());
+    }
+    let why = nextsycl_core::api().map(|a| a.error()).unwrap_or_default();
+    Err(nextsycl_core::Error(format!("{what}: {why}")))
+}
+
+/// The silo's kernels (kernels/llm/museglimmer/silo/silo.h, dist/silo/libnextsycl-museglimmer.so), when it is there
+pub struct Silo {
+    pub path: std::path::PathBuf,
+    pub q8r_bytes: unsafe extern "C" fn(i64, i64) -> usize,
+    pub q8r_pack: unsafe extern "C" fn(G, P, i64, i64, M) -> c_int,
+    pub xq_bytes: unsafe extern "C" fn(i64, i64) -> usize,
+    pub xq: unsafe extern "C" fn(G, *const f32, M, i64, i64) -> c_int,
+    pub mmvq: unsafe extern "C" fn(G, P, P, *mut f32, i64, i64, i64) -> c_int,
+    pub q8r_f16: unsafe extern "C" fn(G, P, i64, i64, *mut u16) -> c_int,
+}
+
+/// The silo's library: named after the engine's directory (the architecture's name has a dash)
+pub const SILO: &str = "museglimmer";
+
+/// The silo (None: the shared kernels for everything)
+pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
+    static S: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    S.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo(SILO).map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in silo.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo {
+            path: lib.path.clone(),
+            q8r_bytes: sym!("ns_mg_q8r_bytes"),
+            q8r_pack: sym!("ns_mg_q8r_pack"),
+            xq_bytes: sym!("ns_mg_xq_bytes"),
+            xq: sym!("ns_mg_xq"),
+            mmvq: sym!("ns_mg_mmvq"),
+            q8r_f16: sym!("ns_mg_q8r_f16"),
+        }))
+    })
+    .as_ref()
+    .map(|s| s.as_ref())
+    .map_err(|e| nextsycl_core::Error(e.clone()))
+}

@@ -203,6 +203,19 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   with the next in a 2-row pass that is bit for bit two one-row passes (attention splits by a row's own cells, a
   token's experts summed in expert order): spec-check 0 difference, the same text with and without. 64-93% of the
   drafts accepted; B70 + B65 +8-16% (26 tok/s at 3.7K).
+- **muse-glimmer** (`llm/museglimmer`) - Muse Glimmer 30B (Meta's dense agentic model; the abliterated Q8_0): 52
+  layers of gated attention (32 / 2 heads of 128, q / k norms, a sigmoid gate from its own projection) and a SwiGLU,
+  each followed by its own RMS norm (eps 1e-8) before the residual; 39 layers over a 2,048 sliding window with rotary
+  positions (llama.cpp's NORM: adjacent pairs), every fourth over everything without positions; the embedding
+  RMS-normed, the logits x 0.196 then soft-capped at 20. A windowed layer's cache is a ring of its window and a pass
+  (4,095 slots), a full layer's the context. Its kernels (`kernels/llm/museglimmer/mg.cpp`): the norms with the
+  rotation, the ring stores, the windowed attention (online softmax, 4 query heads a work-group, decode split over the
+  keys), the gate; the products are the shared ones. Its silo (`silo/mmvq.cpp`) repacks each Q8_0 matrix at load
+  (quants apart from scales: 16-byte loads) for the decode products and the prompt's expansion to half. Checked
+  against llama.cpp layer by layer (14 tokens: every layer >= 0.99991; 6,153 tokens, the ring wrapped: the same next
+  token, result norm 0.9974), the silo's decode products 0.999885 (the shared 0.999847). B70: ~17 tok/s decode
+  (bandwidth: the products ~557 GB/s of 608), ~830 tok/s prompt at 4.2K. The chat template's channels (a `to=self`
+  message, then `to=user`) come back as `reasoning_content` and `content` (nextsycl_tok::muse_channels).
 
 ## The audio engines
 

@@ -1,0 +1,23 @@
+# Muse Glimmer 30B Abliterated Q8_0 (8-bit; both GPUs, 128K + 32K)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: muse-glimmer-30b-q8
+kind: llm
+arch: muse-glimmer
+title: Muse Glimmer 30B Abliterated Q8_0 (8-bit; both GPUs, 128K + 32K)
+about: 'Meta''s dense agentic Muse Glimmer 30B, abliterated (Blackfrost): 52 layers of gated attention (39 over a 2,048 sliding window, 13 full), a dense SwiGLU, logits soft-capped; it reasons on a to=self channel before its answer; 27.6 GiB'
+gpus: all
+ctx: 131072,32768
+tools: false
+tasks: true
+env: {}
+silo:                   # its tuned kernels: kernels/llm/museglimmer/silo (dist/silo/libnextsycl-museglimmer.so)
+  name: museglimmer
+  required: false       # the shared kernels run it too (Q8_0 decode at about the same speed)
+files:
+  model:
+    key: mg30-q8
+    url: https://huggingface.co/The-freezer/Muse-Glimmer-30B-Abliterated-GGUF/resolve/83e7dc723f5515704adc8767dfeb279de3df914d/Muse-Glimmer-30B-Abliterated-Q8_0.gguf
+    size: 29612963456
+    sha256: fc7f9c5ea4035609d48439c95a19264bc825bd4ee53a5ff5decb15fe09c4deb6
+    path: muse-glimmer-30b/Muse-Glimmer-30B-Abliterated-Q8_0.gguf
+guide: guides/chat.md

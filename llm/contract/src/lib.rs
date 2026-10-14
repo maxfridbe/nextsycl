@@ -279,6 +279,8 @@ pub type KernelsFn = fn(&std::path::Path, usize) -> std::result::Result<(), Stri
 /// A model's chat template: the messages, the effort, and the request's tools (each tool's JSON; a template without a
 /// tool path ignores them)
 pub type ChatFn = fn(&[nextsycl_tok::Message], nextsycl_tok::Effort, &[String]) -> String;
+/// Files an engine makes beside a pulled model (EngineKind::prepare)
+pub type PrepareFn = fn(&Gguf) -> std::result::Result<(), String>;
 
 /// An engine's registry entry
 pub struct EngineKind {
@@ -298,7 +300,7 @@ pub struct EngineKind {
     pub options: &'static [EngineOption],
     /// files it makes beside a model once it is pulled (`nextsycl models pull`, `nextsycl llm prepare`): what the
     /// model's own files lack and the engine converts from others the card fetched (deepseek4: its draft block)
-    pub prepare: Option<fn(&Gguf) -> std::result::Result<(), String>>,
+    pub prepare: Option<PrepareFn>,
 }
 
 /// Options every language engine's runtime reads (the shared loaders and guards), offered beside an engine's own

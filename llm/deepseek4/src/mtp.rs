@@ -117,7 +117,7 @@ fn mxfp4(st: &SafeTensors, name: &str, out: &mut Vec<u8>) -> Result<Vec<u64>, St
             // value v of the block: byte (32 b + v) / 2's low (even v) or high (odd v) nibble
             let code = |v: usize| {
                 let x = wr[(32 * b + v) / 2];
-                if v % 2 == 0 { x & 0xf } else { x >> 4 }
+                if v.is_multiple_of(2) { x & 0xf } else { x >> 4 }
             };
             for j in 0..16 {
                 out.push(code(j) | (code(j + 16) << 4));
