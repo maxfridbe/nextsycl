@@ -438,7 +438,7 @@ Muse Glimmer 30B (`llm/museglimmer`, its kernels `kernels/llm/museglimmer`).
 | `NS_MG_DRAFT` | the smallest dflash-*.gguf beside the model | the DFlash drafter's GGUF (--opt-draft) | llm museglimmer |
 | `NS_MG_DRAFTS` | 15 (the drafter's block less one) | tokens drafted a step (0: none) (--opt-drafts) | llm museglimmer |
 | `NS_MG_XMX_SHAPE` | 7 | Experiment: the silo's XMX decode products' shape (tiles of 8 rows a sub-group, sub-groups a work-group, blocks an iteration) - 7: 1, 4, 2; 0: 2, 4, 1; 1: 4, 4, 1; 2: 2, 8, 1; 3: 1, 8, 1; 4: 2, 4, 2; 5: 1, 8, 2; 6: 2, 8, 2; 8: 1, 4, 4; 9: 1, 2, 4; 10: 1, 8, 4; 11: 2, 2, 2 (`llm kernels` times them) | kernels:llm museglimmer (silo) |
-| `NS_MG_KQ_SHAPE` | 0 | Experiment: the silo's K-quant (Q4_K, Q6_K) decode products' shape (tiles of 16 rows a sub-group, sub-groups a work-group, groups of 64 a step) - 0: 1, 16, 2; 1: 1, 8, 2; 2: 1, 4, 2; 3: 1, 8, 4; 4: 2, 8, 2 (`llm kernels` times them) | kernels:llm museglimmer (silo) |
+| `NS_MG_KQ_SHAPE` | 0 | Experiment: the silo's K-quant (Q4_K, Q6_K) decode products' shape (tiles of 16 rows a sub-group, sub-groups a work-group, groups of 64 a step) - 0: by the width (16, 13 or 8 sub-groups splitting a row's groups evenly, 2 a step); 1: 1, 8, 2; 2: 1, 4, 2; 3: 1, 8, 4; 4: 2, 8, 2; 5: 1, 16, 2; 6: 1, 13, 2; 7: 1, 13, 4 (`llm kernels` times them) | kernels:llm museglimmer (silo) |
 | `NS_MG_PROFILE` | off | Debug: 1 times every kernel (the queue drained before and after each) and lists them after the run | llm museglimmer |
 
 ## Tests and checks

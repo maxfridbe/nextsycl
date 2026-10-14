@@ -1,0 +1,24 @@
+# Muse Glimmer 30B Abliterated Q6_K (6-bit; the B70 with its drafter, 128K + 32K)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: muse-glimmer-30b-q6
+kind: llm
+arch: muse-glimmer
+title: Muse Glimmer 30B Abliterated Q6_K (6-bit; the B70 with its drafter, 128K + 32K)
+about: 'Meta''s dense agentic Muse Glimmer 30B, abliterated (Blackfrost), 6-bit (Q6_K) on one card: 52 layers of gated attention (39 over a 2,048 sliding window, 13 full), a dense SwiGLU, logits soft-capped; it reasons on a to=self channel before its answer; its DFlash drafter beside it drafts 15 tokens a step; 21.3 GiB + 1.5'
+gpus: '0'
+ctx: 131072,32768
+tools: false
+tasks: true
+env: {}
+silo:                   # its tuned kernels: kernels/llm/museglimmer/silo (dist/silo/libnextsycl-museglimmer.so; Q6_K on XMX: kq.cpp)
+  name: museglimmer
+  required: false       # the shared kernels run it too, without drafts and slower
+files:
+  model:
+    key: mg30-q6
+    url: https://huggingface.co/The-freezer/Muse-Glimmer-30B-Abliterated-GGUF/resolve/83e7dc723f5515704adc8767dfeb279de3df914d/Muse-Glimmer-30B-Abliterated-Q6_K.gguf
+    size: 22867220608
+    sha256: f5487c504af36646e7b14069b1e05cca6ab2741b5cd8f93a2ae126d5a7f643db
+    path: muse-glimmer-30b/Muse-Glimmer-30B-Abliterated-Q6_K.gguf
+  draft: mg30-dflash-q4 # defined in muse-glimmer-30b-q8.yml
+guide: guides/chat.md

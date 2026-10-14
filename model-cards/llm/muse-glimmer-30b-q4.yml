@@ -1,0 +1,24 @@
+# Muse Glimmer 30B Abliterated Q4_K_M (4-bit; the B70 with its drafter, 128K + 32K)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: muse-glimmer-30b-q4
+kind: llm
+arch: muse-glimmer
+title: Muse Glimmer 30B Abliterated Q4_K_M (4-bit; the B70 with its drafter, 128K + 32K)
+about: 'Meta''s dense agentic Muse Glimmer 30B, abliterated (Blackfrost), 4-bit (Q4_K_M) on one card: 52 layers of gated attention (39 over a 2,048 sliding window, 13 full), a dense SwiGLU, logits soft-capped; it reasons on a to=self channel before its answer; its DFlash drafter beside it drafts 15 tokens a step; 15.8 GiB + 1.5'
+gpus: '0'
+ctx: 131072,32768
+tools: false
+tasks: true
+env: {}
+silo:                   # its tuned kernels: kernels/llm/museglimmer/silo (dist/silo/libnextsycl-museglimmer.so; Q4_K_M on XMX: kq.cpp)
+  name: museglimmer
+  required: false       # the shared kernels run it too, without drafts and slower
+files:
+  model:
+    key: mg30-q4
+    url: https://huggingface.co/The-freezer/Muse-Glimmer-30B-Abliterated-GGUF/resolve/83e7dc723f5515704adc8767dfeb279de3df914d/Muse-Glimmer-30B-Abliterated-Q4_K_M.gguf
+    size: 16935296896
+    sha256: 1316a7e2b90c362a820a906867bb60941511906361827314817a8e83c33d179e
+    path: muse-glimmer-30b/Muse-Glimmer-30B-Abliterated-Q4_K_M.gguf
+  draft: mg30-dflash-q4 # defined in muse-glimmer-30b-q8.yml
+guide: guides/chat.md

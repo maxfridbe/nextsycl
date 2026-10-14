@@ -226,7 +226,15 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   against llama.cpp layer by layer (14 tokens: every layer >= 0.9999; 6,153 tokens, the ring wrapped: the same next
   token). B70 + B65: 30-77 tok/s decode with drafts by text (prose ~31-33, code ~75; a step: verify ~62 ms + draft
   ~12.5 ms, 2.5-4.5 tokens), 18.7 without; sampled requests drawn on the GPU (ns_mg_sample: the host sampler's
-  distribution), as fast a step as greedy; ~1,350 tok/s prompt at 4.2K, 1,215 at 35K. The chat template's channels (a `to=self` message, then `to=user`) come back as
+  distribution), as fast a step as greedy; ~1,350 tok/s prompt at 4.2K, 1,215 at 35K.
+  Q4_K_M and Q6_K (`silo/kq.cpp`): K-quant matrices repacked at load a row at a time, losslessly (4-bit parts in Q4_K's
+  order, Q6_K's 2 high bits laid out so a mask and a shift land them in a dword's bytes, the scales unpacked); decode's
+  products put the weights in DPAS's B operand (a lane a row, expanded by masks into local memory; its scales its own)
+  against the rows' token-major quants (the xq layout carries them and each block's sum, for Q4_K's minimum): exact
+  as Q8_0's (spec-check 0). Prompt passes expand them to half. With the drafter on the B70 alone: Q4_K_M 25.4 tok/s
+  plain, 43 drafted (front door, temperature 1: ~34 prose, ~74 code), 1,404 tok/s prompt at 6.7K; Q6_K 20 plain, 35
+  drafted (~31 / ~57). Products ~420-520 GB/s (Q8_0's ~570: the unpack, not the reads, bounds them). A model whose
+  matrices the silo does not all take gets float rows from the decode norms (the shared products need them). The chat template's channels (a `to=self` message, then `to=user`) come back as
   `reasoning_content` and `content` (nextsycl_tok::muse_channels).
 
 ## The audio engines

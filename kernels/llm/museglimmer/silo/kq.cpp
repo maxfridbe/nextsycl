@@ -67,16 +67,20 @@ void kmmvq(sycl::queue& q, const uint8_t* w, const int8_t* xa, const float* xs, 
     constexpr int ROWS = RT * 16;
     // its B tiles a group (512 bytes, 128 dwords each): Q4_K a block's; Q6_K a block's halves
     constexpr int NT = TY == Q4K ? 2 : 4;
+    // Q4_K's tiles in two sets taken in turn (one barrier a step); Q6_K's, twice the size, in one (local memory bounds
+    // the work-groups a core holds)
+    constexpr int NS = TY == Q4K ? 2 : 1;
     const int64_t groups = (n_out + ROWS - 1) / ROWS;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> red(sycl::range<1>(SK > 1 ? SK * RT * 16 * 16 : 1), h);
-        sycl::local_accessor<uint32_t, 1> tiles(sycl::range<1>(SK * NT * 128), h);
+        sycl::local_accessor<uint32_t, 1> tiles(sycl::range<1>(SK * NS * NT * 128), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) groups * SK * SG), sycl::range<1>(SK * SG)),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             auto sg = it.get_sub_group();
             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
             const int64_t row0 = it.get_group(0) * ROWS;
-            uint32_t* tl = tiles.get_multi_ptr<sycl::access::decorated::no>().get() + sgi * NT * 128;
+            uint32_t* tl0 = tiles.get_multi_ptr<sycl::access::decorated::no>().get() + sgi * NS * NT * 128;
+            int par = 0;
             // the products' sums, and (Q4_K) the minimums' apart
             float acc[RT][TT][8], accm[RT][TT][8];
 #pragma unroll
@@ -121,6 +125,11 @@ void kmmvq(sycl::queue& q, const uint8_t* w, const int8_t* xa, const float* xs, 
                     }
 #pragma unroll
                 for (int t = 0; t < RT; ++t) {
+                    // two sets of tiles in turn, a set rewritten only after the barrier past its reads; one set: past
+                    // its last reads
+                    uint32_t* tl = tl0 + par * NT * 128;
+                    if constexpr (NS == 2) par ^= 1;
+                    else sycl::group_barrier(sg);
                     const int64_t row = row0 + t * 16 + lane;
                     const uint8_t* wr = w + (row < n_out ? row : n_out - 1) * rb;
                     const sycl::vec<uint32_t, 4> n0 = wn[kg][t][0], n1 = wn[kg][t][1];
@@ -188,8 +197,6 @@ void kmmvq(sycl::queue& q, const uint8_t* w, const int8_t* xa, const float* xs, 
                             }
                         }
                     }
-                    // the tiles are rewritten for the next
-                    sycl::group_barrier(sg);
                 }
               }
             }
@@ -229,11 +236,19 @@ void kmmvq(sycl::queue& q, const uint8_t* w, const int8_t* xa, const float* xs, 
 
 template <int TY, int TT>
 void kmmvq_shape(int shape, sycl::queue& q, const uint8_t* w, const int8_t* xa, const float* xs, const float* xm, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
+    // by default a work-group's sub-groups split the row's groups evenly, 2 a step: 16, 13 (Muse's 6656 and 19968: 104
+    // and 312 groups) or 8 of them
+    if (shape == 0) {
+        const int64_t ng = n_in / 64;
+        shape = ng % 32 == 0 ? 5 : ng % 26 == 0 ? 6 : ng % 16 == 0 ? 1 : 5;
+    }
     switch (shape) {
         case 1: kmmvq<TY, 1, 8, TT, 2>(q, w, xa, xs, xm, y, n_in, n_out, ncols); break;
         case 2: kmmvq<TY, 1, 4, TT, 2>(q, w, xa, xs, xm, y, n_in, n_out, ncols); break;
         case 3: kmmvq<TY, 1, 8, TT, 4>(q, w, xa, xs, xm, y, n_in, n_out, ncols); break;
         case 4: kmmvq<TY, 2, 8, TT, 2>(q, w, xa, xs, xm, y, n_in, n_out, ncols); break;
+        case 6: kmmvq<TY, 1, 13, TT, 2>(q, w, xa, xs, xm, y, n_in, n_out, ncols); break;
+        case 7: kmmvq<TY, 1, 13, TT, 4>(q, w, xa, xs, xm, y, n_in, n_out, ncols); break;
         default: kmmvq<TY, 1, 16, TT, 2>(q, w, xa, xs, xm, y, n_in, n_out, ncols); break;
     }
 }
@@ -310,8 +325,8 @@ int ns_mg_kr_mmvq(ns_gpu* g, int type, const void* w, const void* xq, float* y, 
     const int8_t* xa = (const int8_t*) xq + mgxq::rowq(n_in);
     const float* xs = (const float*) ((const uint8_t*) xq + mgxq::scales(n_in));
     const float* xm = (const float*) ((const uint8_t*) xq + mgxq::sums(n_in));
-    // NS_MG_KQ_SHAPE: tiles a sub-group, sub-groups a work-group, groups a step (0: 1, 16, 2; 1: 1, 8, 2; 2: 1, 4, 2; 3: 1, 8, 4;
-    // 4: 2, 8, 2)
+    // NS_MG_KQ_SHAPE: tiles a sub-group, sub-groups a work-group, groups a step (0: by the width; 1: 1, 8, 2; 2: 1, 4, 2;
+    // 3: 1, 8, 4; 4: 2, 8, 2; 5: 1, 16, 2; 6: 1, 13, 2; 7: 1, 13, 4)
     static const int shape = [] { const char* v = std::getenv("NS_MG_KQ_SHAPE"); return v ? std::atoi(v) : 0; }();
     const uint8_t* wb = (const uint8_t*) w;
     if (type == Q4K) {
