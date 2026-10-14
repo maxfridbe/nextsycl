@@ -1,4 +1,4 @@
-//! Columns found before the model reads a page: the model reads a page as one whole, so blocks set side by side
+//! Columns found before an OCR model reads a page (the image engines that read share it): the model reads a page as one whole, so blocks set side by side
 //! (two school years of a transcript, a two-column article) come back as one wide table with their rows interleaved.
 //! A gutter - a strip with no ink, at least two characters wide, running down a long stretch of the page - splits
 //! the page into what is above it, its left and right sides, and what is below; what is above and below is split
@@ -12,7 +12,7 @@
 //!   kept when it spans >= 25% of the page's text height, with ink on both sides in >= 4 of its lines
 //! ```
 
-use nextsycl_image::Picture;
+use crate::Picture;
 
 /// A region of the page to read, in pixels: x, y, width, height
 pub type Region = (u32, u32, u32, u32);

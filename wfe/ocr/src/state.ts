@@ -1,15 +1,17 @@
 /** The whole client state in one object (H3's scheme). Components read it; actions mutate it and call render(). */
 import type { Form, Gpu, Info, Page, Progress, Reading } from "./types.js";
 
-/** The instructions the model is trained on (the GGUF's model card; the reference's own "document parsing.") */
-export const PRESETS: [string, string, string][] = [
+/** The instructions the model reads by: the server's (each model its own), else Unlimited-OCR's; and one's own */
+const FALLBACK: [string, string, string][] = [
   ["parse", "document parsing.", "Document → Markdown with boxes (the model's own)"],
-  ["markdown", "<|grounding|>Convert the document to markdown.", "Markdown, boxes"],
   ["free", "Free OCR.", "Plain text"],
-  ["figure", "Parse the figure.", "A figure or chart"],
-  ["describe", "Describe this image in detail.", "Describe"],
-  ["custom", "", "Your own"],
 ];
+
+export function presets(): [string, string, string][] {
+  const p = state.info?.prompts;
+  const list: [string, string, string][] = p && p.length ? p.map((x) => [x.id, x.prompt, x.title]) : FALLBACK;
+  return [...list, ["custom", "", "Your own"]];
+}
 
 export type View = "doc" | "boxes" | "raw" | "text";
 
@@ -111,6 +113,8 @@ export function restorePreferences(): void {
 
 /** The instruction the form asks for */
 export function promptText(): string {
-  const p = PRESETS.find((x) => x[0] === state.form.preset);
+  const all = presets();
+  // a preset this model does not have: its default
+  const p = all.find((x) => x[0] === state.form.preset) ?? all[0];
   return !p || p[0] === "custom" ? state.form.prompt : p[1];
 }

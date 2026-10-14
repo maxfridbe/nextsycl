@@ -12,7 +12,6 @@
 
 pub mod check;
 pub mod decoder;
-pub mod layout;
 mod ffi;
 pub mod prep;
 pub mod vision;
@@ -23,9 +22,10 @@ use std::time::Instant;
 use nextsycl_core::{DevBuf, Gpu};
 use nextsycl_diffusion::kernels::Nsd;
 use nextsycl_gguf::Gguf;
-use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, OcrOutput, OcrRequest, Picture, Result, Sampler,
+use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, OcrOutput, OcrPrompt, OcrRequest, Picture, Result, Sampler,
                      Schedule, Step};
 use nextsycl_tok::Tokenizer;
+use nextsycl_image::layout;
 use vision::CopyF;
 
 /// The architecture (the decoder GGUF's general.architecture; a registry entry may say either)
@@ -473,6 +473,15 @@ impl ImageEngine for UnlimitedOcr {
     }
     fn ocr(&self, req: &OcrRequest, text: &mut dyn FnMut(&str)) -> Result<OcrOutput> {
         self.read(req, text)
+    }
+    fn ocr_prompts(&self) -> Vec<OcrPrompt> {
+        vec![
+            OcrPrompt { id: "parse", prompt: DEFAULT_PROMPT, title: "Document → Markdown with boxes (the model's own)" },
+            OcrPrompt { id: "markdown", prompt: "<|grounding|>Convert the document to markdown.", title: "Markdown, boxes" },
+            OcrPrompt { id: "free", prompt: "Free OCR.", title: "Plain text" },
+            OcrPrompt { id: "figure", prompt: "Parse the figure.", title: "A figure or chart" },
+            OcrPrompt { id: "describe", prompt: "Describe this image in detail.", title: "Describe" },
+        ]
     }
     fn report(&self) -> Vec<String> {
         vec![format!("{ARCH}: decoder {} layers, {:.1} GiB of weights read, on {}", self.decoder.g.layers, self.decoder.loaded_bytes as f64 / (1u64 << 30) as f64,

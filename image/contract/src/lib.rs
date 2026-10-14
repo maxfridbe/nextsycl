@@ -3,6 +3,8 @@
 //! and memory plan. The server drives it only through `ImageEngine`; it is chosen by the architecture its registry
 //! entry names (`ImageKind`). Samplers, schedules, LoRAs and pictures are `nextsycl_diffusion`'s.
 
+pub mod layout;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -79,6 +81,14 @@ pub struct OcrRequest {
     pub each_page: Option<bool>,
     /// the engine's own options for this request, by name
     pub extra: Given,
+}
+
+/// An instruction an OCR model is trained on: its id, the text, what it reads
+#[derive(Clone, Debug)]
+pub struct OcrPrompt {
+    pub id: &'static str,
+    pub prompt: &'static str,
+    pub title: &'static str,
 }
 
 /// What a reading made
@@ -179,6 +189,10 @@ pub trait ImageEngine: Send + Sync {
     /// whether it reads pictures (an OCR model: `ocr`) rather than makes them
     fn reads(&self) -> bool {
         false
+    }
+    /// the instructions it reads by (the first is its default), for a page to offer
+    fn ocr_prompts(&self) -> Vec<OcrPrompt> {
+        Vec::new()
     }
     /// read the request's pages, each piece of text as it is written to `text`
     fn ocr(&self, _req: &OcrRequest, _text: &mut dyn FnMut(&str)) -> Result<OcrOutput> {

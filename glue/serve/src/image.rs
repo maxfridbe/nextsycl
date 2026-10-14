@@ -325,8 +325,9 @@ impl ImageServer {
 
     fn info(&self) -> Value {
         let g = self.engine.lock();
-        let (arch, d, edits, loaded, samplers, schedules, guidance, opts, reads) = match g.as_ref().ok().and_then(|g| {
-            g.as_ref().map(|(e, l)| (e.arch(), e.defaults(), e.edits(), l.clone(), e.samplers(), e.schedules(), e.guidance(), e.options(), e.reads()))
+        let (arch, d, edits, loaded, samplers, schedules, guidance, opts, reads, prompts) = match g.as_ref().ok().and_then(|g| {
+            g.as_ref().map(|(e, l)| (e.arch(), e.defaults(), e.edits(), l.clone(), e.samplers(), e.schedules(), e.guidance(), e.options(), e.reads(),
+                                     e.ocr_prompts()))
         }) {
             Some(x) => x,
             None => return json!({"model": self.model, "loading": true}),
@@ -335,6 +336,7 @@ impl ImageServer {
         json!({
             "model": self.model, "arch": arch, "edits": edits, "reads": reads, "guidance": guidance, "max_pictures": MAX_PICTURES,
             "max_pages": MAX_PAGES,
+            "prompts": prompts.iter().map(|p| json!({"id": p.id, "prompt": p.prompt, "title": p.title})).collect::<Vec<_>>(),
             "defaults": {"width": d.width, "height": d.height, "steps": d.steps, "cfg": d.cfg, "sampler": d.sampler.name(),
                          "schedule": d.schedule.name(), "shift": d.shift},
             "samplers": samplers.iter().map(|s| s.name()).collect::<Vec<_>>(),

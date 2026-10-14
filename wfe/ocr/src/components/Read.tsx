@@ -2,7 +2,7 @@
  *  longest reading, temperature, the repetition guard. */
 import { jsx } from "../jsx.js";
 import { addFiles, movePage, read, removePage } from "../actions.js";
-import { PRESETS, render, saveForm, state } from "../state.js";
+import { presets, render, saveForm, state } from "../state.js";
 import type { Form } from "../types.js";
 import { clamp } from "../util.js";
 
@@ -90,8 +90,9 @@ export function Read() {
       <Pages />
       <div class="row">
         <div class="chips">
-          {PRESETS.map(([id, , title]) => (
-            <button type="button" class={{ chip: true, on: f.preset === id }} on={{ click: () => set("preset", id) }}>{title}</button>
+          {presets().map(([id, , title], i, all) => (
+            <button type="button" class={{ chip: true, on: f.preset === id || (i === 0 && !all.some((x) => x[0] === f.preset)) }}
+                    on={{ click: () => set("preset", id) }}>{title}</button>
           ))}
         </div>
       </div>

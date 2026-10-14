@@ -6,6 +6,8 @@ export interface Info {
   reads?: boolean;
   max_pages?: number;
   loading?: boolean;
+  /** the instructions the model reads by (the first its default) */
+  prompts?: { id: string; prompt: string; title: string }[];
 }
 
 export interface Progress {
