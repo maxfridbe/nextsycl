@@ -18,14 +18,28 @@ typedef struct ns_gpu ns_gpu;
 size_t ns_mg_q8r_bytes(int64_t rows, int64_t n_in);
 size_t ns_mg_q8r_scales_at(int64_t rows, int64_t n_in);
 int ns_mg_q8r_pack(ns_gpu* g, const void* q8_0, int64_t rows, int64_t n_in, void* dst);
-/* Activations x [ncols, n_in] float32 in the same split layout: quants [ncols][n_in] int8 (each 32 by amax / 127,
- * rounded as ggml's Q8_1 does), then the scales [ncols][n_in / 32] float */
+/* Activations in the same split layout: quants [ncols][n_in] int8 (each 32 by amax / 127, rounded as ggml's Q8_1
+ * does), then the scales [ncols][n_in / 32] float - of x = a (op 0), a * sigmoid(b) (op 1: the attention's gate),
+ * silu(a) * b (op 2: SwiGLU); a and b [ncols, n_in] */
 size_t ns_mg_xq_bytes(int64_t n_in, int64_t ncols);
-int ns_mg_xq(ns_gpu* g, const float* x, void* xq, int64_t n_in, int64_t ncols);
-/* Decode products: y [ncols, n_out] = W [n_out, n_in] (repacked Q8_0) . x (ns_mg_xq), ncols 1..8 */
-int ns_mg_mmvq(ns_gpu* g, const void* w, const void* xq, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
-/* A repacked Q8_0 matrix expanded to half (a prompt pass's GEMMs): dst [rows, n_in] */
-int ns_mg_q8r_f16(ns_gpu* g, const void* w, int64_t rows, int64_t n_in, uint16_t* dst);
+int ns_mg_xq(ns_gpu* g, const float* a, const float* b, int op, void* xq, int64_t n_in, int64_t ncols);
+/* RMS norm straight to that layout (decode rows): x [rows, C] / rms(x) * w, its quants into xq (y nullable: the
+ * normed rows too) */
+int ns_mg_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* xq, int64_t rows, int64_t C, float eps);
+/* A post norm into the residual, then the next norm straight to the split Q8 layout (decode rows): x [rows, C] +=
+ * out / rms(out) * wp (eps ep), then xq = (x / rms(x) * wn) quantized (eps en) - one launch for the two */
+int ns_mg_post_rms_xq(ns_gpu* g, const float* out, const float* wp, float ep, float* x, const float* wn, float en, void* xq, int64_t rows, int64_t C);
+/* Decode products: y [ncols, n_out] = W [n_out, n_in] . x (ns_mg_xq), ncols 1..8; W repacked: its quants wq [n_out][n_in]
+ * and scales ws [n_out][n_in / 32] (a repacked matrix's rows r0.. are wq + r0 n_in, ws + r0 n_in / 32) */
+int ns_mg_mmvq(ns_gpu* g, const void* wq, const void* ws, const void* xq, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+/* Prompt attention (attn.cpp; the engine's own is ns_mg_attn): flash attention on XMX. out [T, Hq x 128] = softmax(q
+ * k^T / sqrt(128)) v for rows q [T, Hq x 128] at positions p0.., causal, within the window (win <= 0: all), against
+ * the ring caches [Hkv][cap][128] (slot pos % cap). Covers more than 8 rows, heads of 128, 16 query heads a key head */
+int ns_mg_attn_prompt_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t D);
+int ns_mg_attn_prompt(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
+                      int64_t win, float* out);
+/* Repacked Q8_0 rows expanded to half (a prompt pass's GEMMs): dst [rows, n_in] */
+int ns_mg_q8r_f16(ns_gpu* g, const void* wq, const void* ws, int64_t rows, int64_t n_in, uint16_t* dst);
 
 #ifdef __cplusplus
 }

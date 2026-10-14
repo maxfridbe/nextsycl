@@ -221,6 +221,22 @@ int ns_mg_attn(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_
     NS_CATCH
 }
 
+int ns_mg_rms_add(ns_gpu* g, const float* x, const float* w, float* res, int64_t rows, int64_t C, float eps) {
+    NS_TRY
+    constexpr int W = 256;
+    if (rows > 0) g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) {
+        const int64_t r = it.get_group(0);
+        const int tid = (int) it.get_local_id(0);
+        const float* xr = x + r * C;
+        float ss = 0.0f;
+        for (int64_t i = tid; i < C; i += W) ss += xr[i] * xr[i];
+        const float inv = sycl::rsqrt(sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>()) / (float) C + eps);
+        for (int64_t i = tid; i < C; i += W) res[r * C + i] += xr[i] * inv * w[i];
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_mg_gate_mul(ns_gpu* g, float* x, const float* gate, int64_t n) {
     NS_TRY
     if (n > 0) g->q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {

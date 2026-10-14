@@ -25,6 +25,8 @@ int64_t ns_mg_attn_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_
  * max(0, p - win + 1) ..= p; win <= 0: all), softmax(q k^T / sqrt(D)) v: out [T, Hq x D]. D 128, Hq / Hkv 4, 8 or 16 */
 int ns_mg_attn(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
                int64_t win, float* out, float* scratch);
+/* The post norm into the residual: res [rows, C] += x / rms(x) * w */
+int ns_mg_rms_add(ns_gpu* g, const float* x, const float* w, float* res, int64_t rows, int64_t C, float eps);
 /* x [n] *= sigmoid(gate [n]) */
 int ns_mg_gate_mul(ns_gpu* g, float* x, const float* gate, int64_t n);
 

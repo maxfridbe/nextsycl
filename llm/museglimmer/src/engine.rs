@@ -114,11 +114,24 @@ pub struct Mat {
     pub ty: GType,
     pub rows: usize,
     pub cols: usize,
-    /// Q8_0 repacked by the silo (its quants, then its scales: silo.h)
-    pub packed: bool,
+    /// Q8_0 repacked by the silo: `buf` its quants [rows][cols], these its scales [rows][cols / 32] (a view of rows
+    /// of a matrix several share)
+    pub scales: Option<DevBuf>,
+}
+
+impl Mat {
+    fn packed(&self) -> bool {
+        self.scales.is_some()
+    }
 }
 
 struct Layer {
+    /// q | k | v | gate and the FFN's gate | up repacked as one matrix each (the silo; a decode row's one product);
+    /// the matrices below are views of their rows
+    qkvg: Option<Mat>,
+    gu: Option<Mat>,
+    /// the memory the views are of
+    _own: Vec<DevBuf>,
     attn_norm: DevBuf,
     q: Mat,
     k: Mat,
@@ -382,20 +395,47 @@ impl<'g> MuseGlimmer<'g> {
         for l in 0..g.layers {
             let gpu = &gpus[layer_dev[l]];
             let n = |s: &str| format!("blk.{l}.{s}.weight");
+            // with the silo: q | k | v | gate and gate | up stacked, repacked once each
+            let (mut own, mut qkvg, mut gu) = (Vec::new(), None, None);
+            let mut attn_parts = None;
+            let mut ffn_parts = None;
+            if let Some(sl) = silo {
+                if let Some((o, whole, parts)) = pack_stack(f, gpu, sl, &[n("attn_q"), n("attn_k"), n("attn_v"), n("attn_gate")], &mut loaded)? {
+                    own.push(o);
+                    qkvg = Some(whole);
+                    attn_parts = Some(parts);
+                }
+                if let Some((o, whole, parts)) = pack_stack(f, gpu, sl, &[n("ffn_gate"), n("ffn_up")], &mut loaded)? {
+                    own.push(o);
+                    gu = Some(whole);
+                    ffn_parts = Some(parts);
+                }
+            }
             let mut read = |name: &str| -> Result<Mat> { vec_mat(f, gpu, k, silo, name, &mut loaded) };
+            let [q, kk, v, gate] = match attn_parts {
+                Some(p) => <[Mat; 4]>::try_from(p).map_err(|_| e("q | k | v | gate"))?,
+                None => [read(&n("attn_q"))?, read(&n("attn_k"))?, read(&n("attn_v"))?, read(&n("attn_gate"))?],
+            };
+            let [ffn_gate, ffn_up] = match ffn_parts {
+                Some(p) => <[Mat; 2]>::try_from(p).map_err(|_| e("gate | up"))?,
+                None => [read(&n("ffn_gate"))?, read(&n("ffn_up"))?],
+            };
             layers.push(Layer {
+                qkvg,
+                gu,
+                _own: own,
                 attn_norm: read(&n("attn_norm"))?.buf,
-                q: read(&n("attn_q"))?,
-                k: read(&n("attn_k"))?,
-                v: read(&n("attn_v"))?,
-                gate: read(&n("attn_gate"))?,
+                q,
+                k: kk,
+                v,
+                gate,
                 o: read(&n("attn_output"))?,
                 q_norm: read(&n("attn_q_norm"))?.buf,
                 k_norm: read(&n("attn_k_norm"))?.buf,
                 post_attn: read(&n("post_attention_norm"))?.buf,
                 ffn_norm: read(&n("ffn_norm"))?.buf,
-                ffn_gate: read(&n("ffn_gate"))?,
-                ffn_up: read(&n("ffn_up"))?,
+                ffn_gate,
+                ffn_up,
                 ffn_down: read(&n("ffn_down"))?,
                 post_ffn: read(&n("post_ffw_norm"))?.buf,
             });
@@ -484,8 +524,8 @@ impl<'g> MuseGlimmer<'g> {
         Ok(y)
     }
 
-    /// y [t, w.rows] = x [t, w.cols] . W^T
-    fn matmul(&self, w: &Mat, x: &DevBuf, t: usize, y: &DevBuf) -> Result<()> {
+    /// y [t, w.rows] = x [t, w.cols] . W^T; `xq`: x already in the silo's split Q8 layout (decode rows)
+    fn matmul(&self, w: &Mat, x: &DevBuf, xq: Option<&DevBuf>, t: usize, y: &DevBuf) -> Result<()> {
         let k = self.k;
         let (n, kk) = (w.rows as i64, w.cols as i64);
         let (rows, cols) = (w.rows, w.cols);
@@ -493,19 +533,27 @@ impl<'g> MuseGlimmer<'g> {
             // SAFETY: x [t, cols], the matrix [rows, cols] float32, y [t, rows].
             return self.op("gemm", || unsafe { (k.gemm)(self.raw(), t as i64, n, kk, x.fp(), kk, w.buf.fp(), y.fp(), n, 0) });
         }
-        if let (true, Some(s)) = (w.packed, self.silo) {
+        if let (Some(sc), Some(s)) = (&w.scales, self.silo) {
             if t <= 8 {
-                // SAFETY: arithmetic only.
-                let xq = self.arena().bytes(unsafe { (s.xq_bytes)(kk, t as i64) })?;
-                // SAFETY: x [t, cols] -> its split Q8 form; then the product from the repacked matrix.
-                self.op("xq silo", || unsafe { (s.xq)(self.raw(), x.fp(), xq.ptr(), kk, t as i64) })?;
-                return self.op("mmvq silo", || unsafe { (s.mmvq)(self.raw(), w.buf.ptr(), xq.ptr(), y.fp(), kk, n, t as i64) });
+                let own;
+                let xqb = match xq {
+                    Some(q) => q,
+                    None => {
+                        // SAFETY: arithmetic only.
+                        own = self.arena().bytes(unsafe { (s.xq_bytes)(kk, t as i64) })?;
+                        // SAFETY: x [t, cols] -> its split Q8 form.
+                        self.op("xq silo", || unsafe { (s.xq)(self.raw(), x.fp(), std::ptr::null(), 0, own.ptr(), kk, t as i64) })?;
+                        &own
+                    }
+                };
+                // SAFETY: the repacked matrix (quants, scales), x's split form, y [t, rows].
+                return self.op("mmvq silo", || unsafe { (s.mmvq)(self.raw(), w.buf.ptr(), sc.ptr(), xqb.ptr(), y.fp(), kk, n, t as i64) });
             }
             if rows * cols * 2 > self.dev().w16.len {
                 return Err(e(format!("a {rows}x{cols} matrix past the half buffer")));
             }
             // SAFETY: the repacked matrix -> rows x cols halfs in w16.
-            self.op("q8r f16 silo", || unsafe { (s.q8r_f16)(self.raw(), w.buf.ptr(), n, kk, self.dev().w16.ptr().cast()) })?;
+            self.op("q8r f16 silo", || unsafe { (s.q8r_f16)(self.raw(), w.buf.ptr(), sc.ptr(), n, kk, self.dev().w16.ptr().cast()) })?;
             let xh = self.arena().bytes(t * cols * 2)?;
             // SAFETY: x [t, cols] -> half; then y [t, rows] = xh . w16^T.
             self.op("x to half", || unsafe { (k.to_f16)(self.raw(), x.fp(), xh.ptr().cast(), (t * cols) as i64) })?;
@@ -545,11 +593,6 @@ impl<'g> MuseGlimmer<'g> {
         self.op("rms norm", || unsafe { (self.k.rms_norm)(self.raw(), x.fp(), w.fp(), y.fp(), rows as i64, c as i64, eps) })
     }
 
-    fn add(&self, y: &DevBuf, x: &DevBuf, n: usize) -> Result<()> {
-        // SAFETY: n floats each.
-        self.op("add", || unsafe { (self.k.add)(self.raw(), y.fp(), x.fp(), n as i64) })
-    }
-
     /// The tokens' embeddings [t, n_embd] (their rows read from the file, expanded on the GPU)
     fn embed(&self, tokens: &[u32]) -> Result<DevBuf> {
         let g = &self.g;
@@ -569,43 +612,159 @@ impl<'g> MuseGlimmer<'g> {
         Ok(x)
     }
 
-    /// Layer `l`'s attention on h [t, n_embd] (normed): its output [t, n_embd], before the post norm
+    /// Layer `l`'s attention on h [t, n_embd] (normed; or `xq`, its split Q8 form, for decode rows with the silo): its
+    /// output [t, n_embd], before the post norm
     #[allow(clippy::too_many_arguments)]
-    fn attention(&self, l: usize, a: &Layer, kc: &DevBuf, vc: &DevBuf, cap: usize, h: &DevBuf, t: usize, p0: usize, tap: Tap) -> Result<DevBuf> {
+    fn attention(&self, l: usize, a: &Layer, kc: &DevBuf, vc: &DevBuf, cap: usize, h: &DevBuf, xq: Option<&DevBuf>, t: usize, p0: usize, tap: Tap)
+                 -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hq, hk, d) = (g.heads, g.heads_kv, g.head);
-        let q = self.arena().f32(t * hq * d)?;
-        let kr = self.arena().f32(t * hk * d)?;
-        let vr = self.arena().f32(t * hk * d)?;
-        let gate = self.arena().f32(t * hq * d)?;
-        self.matmul(&a.q, h, t, &q)?;
-        self.matmul(&a.k, h, t, &kr)?;
-        self.matmul(&a.v, h, t, &vr)?;
-        self.matmul(&a.gate, h, t, &gate)?;
+        let (qd, kd) = (hq * d, hk * d);
+        let (q, kr, vr, gate) = match (&a.qkvg, xq) {
+            (Some(all), Some(x)) if t == 1 => {
+                // one product for the four
+                let y = self.arena().f32(all.rows)?;
+                self.matmul(all, h, Some(x), 1, &y)?;
+                (y.view(0, qd * 4)?, y.view(qd * 4, kd * 4)?, y.view((qd + kd) * 4, kd * 4)?, y.view((qd + 2 * kd) * 4, qd * 4)?)
+            }
+            _ => {
+                let (q, kr, vr, gate) = (self.arena().f32(t * qd)?, self.arena().f32(t * kd)?, self.arena().f32(t * kd)?, self.arena().f32(t * qd)?);
+                self.matmul(&a.q, h, xq, t, &q)?;
+                self.matmul(&a.k, h, xq, t, &kr)?;
+                self.matmul(&a.v, h, xq, t, &vr)?;
+                self.matmul(&a.gate, h, xq, t, &gate)?;
+                (q, kr, vr, gate)
+            }
+        };
         let rope = g.swa[l] as c_int;
         let win = g.win(l) as i64;
-        let att = self.arena().f32(t * hq * d)?;
+        let att = self.arena().f32(t * qd)?;
         // SAFETY: the rows and caches as named in mg.h.
         unsafe {
-            self.op("q norm rope", || (k.qk_norm_rope)(self.raw(), q.fp(), (hq * d) as i64, q.fp(), (hq * d) as i64, t as i64, hq as i64, d as i64, a.q_norm.fp(),
-                                                       g.eps, rope, g.theta, p0 as i64))?;
-            self.op("k norm rope", || (k.qk_norm_rope)(self.raw(), kr.fp(), (hk * d) as i64, kr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, a.k_norm.fp(),
-                                                       g.eps, rope, g.theta, p0 as i64))?;
+            self.op("q norm rope", || (k.qk_norm_rope)(self.raw(), q.fp(), qd as i64, q.fp(), qd as i64, t as i64, hq as i64, d as i64, a.q_norm.fp(), g.eps,
+                                                       rope, g.theta, p0 as i64))?;
+            self.op("k norm rope", || (k.qk_norm_rope)(self.raw(), kr.fp(), kd as i64, kr.fp(), kd as i64, t as i64, hk as i64, d as i64, a.k_norm.fp(), g.eps,
+                                                       rope, g.theta, p0 as i64))?;
             // llama.cpp's names: after the rotation on the windowed layers, after the norm on the full ones
             let stage = if g.swa[l] { "rope" } else { "normed" };
             tap(&format!("Qcur_{stage}-{l}"), &q)?;
             tap(&format!("Kcur_{stage}-{l}"), &kr)?;
             self.op("kv store", || (k.kv_store)(self.raw(), kr.fp(), vr.fp(), t as i64, hk as i64, d as i64, cap as i64, p0 as i64, kc.ptr(), vc.ptr()))?;
-            let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64, win) as usize;
-            let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
-            self.op("attention", || (k.attn)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64, win,
-                                             att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
-            tap(&format!("attn_out-{l}"), &att)?;
-            self.op("output gate", || (k.gate_mul)(self.raw(), att.fp(), gate.fp(), (t * hq * d) as i64))?;
+            match self.silo.filter(|s| (s.attn_prompt_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
+                // the silo's flash attention on XMX (prompt rows)
+                Some(s) => self.op("attention silo", || (s.attn_prompt)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64,
+                                                                       cap as i64, p0 as i64, win, att.fp()))?,
+                None => {
+                    let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64, win) as usize;
+                    let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
+                    self.op("attention", || (k.attn)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64,
+                                                     win, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+                }
+            }
         }
+        tap(&format!("attn_out-{l}"), &att)?;
         let out = self.arena().f32(t * g.n_embd)?;
-        self.matmul(&a.o, &att, t, &out)?;
+        match self.silo.filter(|_| t <= 8 && a.o.packed()) {
+            Some(s) => {
+                // the gate applied as the output projection's input is quantized
+                // SAFETY: arithmetic only.
+                let xo = self.arena().bytes(unsafe { (s.xq_bytes)(qd as i64, t as i64) })?;
+                // SAFETY: att and gate [t, qd] -> att * sigmoid(gate) in the split Q8 form.
+                self.op("gate xq silo", || unsafe { (s.xq)(self.raw(), att.fp(), gate.fp(), 1, xo.ptr(), qd as i64, t as i64) })?;
+                self.matmul(&a.o, &att, Some(&xo), t, &out)?;
+            }
+            None => {
+                // SAFETY: att and gate [t, qd].
+                self.op("output gate", || unsafe { (k.gate_mul)(self.raw(), att.fp(), gate.fp(), (t * qd) as i64) })?;
+                self.matmul(&a.o, &att, None, t, &out)?;
+            }
+        }
         Ok(out)
+    }
+
+    /// The post norm into the residual, then the next norm (`next`: its weight and eps) as `norm_in` makes it - one launch
+    /// for decode rows with the silo, the split Q8 form into `into` when given (else the arena)
+    #[allow(clippy::too_many_arguments)]
+    fn post_norm(&self, out: &DevBuf, w: &DevBuf, x: &DevBuf, next: &DevBuf, eps: f32, h: &DevBuf, t: usize, into: Option<&DevBuf>)
+                 -> Result<Option<DevBuf>> {
+        let ne = self.g.n_embd;
+        match self.silo.filter(|_| t <= 8) {
+            Some(s) => {
+                // SAFETY: arithmetic only.
+                let bytes = unsafe { (s.xq_bytes)(ne as i64, t as i64) };
+                let xq = match into {
+                    Some(b) => b.view(0, bytes)?,
+                    None => self.arena().bytes(bytes)?,
+                };
+                // SAFETY: out and x [t, ne], the weights ne floats -> x updated, the next norm's split Q8 form.
+                self.op("post rms xq silo", || unsafe {
+                    (s.post_rms_xq)(self.raw(), out.fp(), w.fp(), POST_EPS, x.fp(), next.fp(), eps, xq.ptr(), t as i64, ne as i64)
+                })?;
+                Ok(Some(xq))
+            }
+            None => {
+                self.post(out, w, x, t)?;
+                self.rms(x, next, h, t, ne, eps)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// The post norm into the residual: x [t, n_embd] += rms(out) * w
+    fn post(&self, out: &DevBuf, w: &DevBuf, x: &DevBuf, t: usize) -> Result<()> {
+        // SAFETY: out and x [t, n_embd], w n_embd floats.
+        self.op("post norm add", || unsafe { (self.k.rms_add)(self.raw(), out.fp(), w.fp(), x.fp(), t as i64, self.g.n_embd as i64, POST_EPS) })
+    }
+
+    /// x [t, n_embd] normed by w: as floats into h, or (decode rows with the silo) straight to its split Q8 form
+    fn norm_in(&self, x: &DevBuf, w: &DevBuf, h: &DevBuf, t: usize) -> Result<Option<DevBuf>> {
+        let ne = self.g.n_embd;
+        match self.silo.filter(|_| t <= 8) {
+            Some(s) => {
+                // SAFETY: arithmetic only.
+                let xq = self.arena().bytes(unsafe { (s.xq_bytes)(ne as i64, t as i64) })?;
+                // SAFETY: x [t, ne], w ne floats -> the normed rows' split Q8 form.
+                self.op("rms xq silo", || unsafe { (s.rms_xq)(self.raw(), x.fp(), w.fp(), std::ptr::null_mut(), xq.ptr(), t as i64, ne as i64, self.g.eps) })?;
+                Ok(Some(xq))
+            }
+            None => {
+                self.rms(x, w, h, t, ne, self.g.eps)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Layer `l`'s SwiGLU on its normed input (h, or its split Q8 form `xq`): its output [t, n_embd], before the post norm
+    #[allow(clippy::too_many_arguments)]
+    fn ffn(&self, ly: &Layer, xq: Option<DevBuf>, h: &DevBuf, fg: &DevBuf, fu: &DevBuf, out: &DevBuf, t: usize) -> Result<()> {
+        let g = &self.g;
+        let (gv, uv) = match (&ly.gu, &xq) {
+            (Some(all), Some(q)) if t == 1 => {
+                let y = self.arena().f32(all.rows)?;
+                self.matmul(all, h, Some(q), 1, &y)?;
+                (y.view(0, g.n_ff * 4)?, y.view(g.n_ff * 4, g.n_ff * 4)?)
+            }
+            _ => {
+                self.matmul(&ly.ffn_gate, h, xq.as_ref(), t, fg)?;
+                self.matmul(&ly.ffn_up, h, xq.as_ref(), t, fu)?;
+                (fg.view(0, t * g.n_ff * 4)?, fu.view(0, t * g.n_ff * 4)?)
+            }
+        };
+        let nf = t * g.n_ff;
+        match self.silo.filter(|_| t <= 8 && ly.ffn_down.packed()) {
+            Some(s) => {
+                // SAFETY: arithmetic only.
+                let xd = self.arena().bytes(unsafe { (s.xq_bytes)(g.n_ff as i64, t as i64) })?;
+                // SAFETY: gate and up [t, n_ff] -> silu(gate) * up in the split Q8 form.
+                self.op("swiglu xq silo", || unsafe { (s.xq)(self.raw(), gv.fp(), uv.fp(), 2, xd.ptr(), g.n_ff as i64, t as i64) })?;
+                self.matmul(&ly.ffn_down, fg, Some(&xd), t, out)
+            }
+            None => {
+                // SAFETY: n floats each.
+                self.op("swiglu", || unsafe { (self.k.swiglu_clamp)(self.raw(), gv.fp(), uv.fp(), gv.fp(), nf as i64, f32::INFINITY) })?;
+                self.matmul(&ly.ffn_down, &gv, None, t, out)
+            }
+        }
     }
 
     /// One pass of at most a chunk: the last `n_out` rows' logits
@@ -635,7 +794,7 @@ impl<'g> MuseGlimmer<'g> {
         let mut h = self.arena().f32(t * ne)?;
         let mut ffn_g = self.arena().f32(t * g.n_ff)?;
         let mut ffn_u = self.arena().f32(t * g.n_ff)?;
-        let mut tmp = self.arena().f32(t * ne)?;
+        let mut pending: Option<DevBuf> = None;
         for (l, (ly, (kc, vc, cap))) in self.layers.iter().zip(s.layers.iter()).enumerate() {
             // the next GPU's layers: the rows cross over, its own buffers for them
             if self.layer_dev[l] != self.cur.load(std::sync::atomic::Ordering::Relaxed) {
@@ -643,23 +802,30 @@ impl<'g> MuseGlimmer<'g> {
                 h = self.arena().f32(t * ne)?;
                 ffn_g = self.arena().f32(t * g.n_ff)?;
                 ffn_u = self.arena().f32(t * g.n_ff)?;
-                tmp = self.arena().f32(t * ne)?;
             }
+            // where this layer's last step leaves the next layer's normed input (outside this layer's share of the arena)
+            let dec = self.silo.filter(|_| t <= 8);
+            let carry = match dec {
+                // SAFETY: arithmetic only.
+                Some(sl) => Some(self.arena().bytes(unsafe { (sl.xq_bytes)(ne as i64, t as i64) })?),
+                None => None,
+            };
             let mark = self.arena().mark();
-            self.rms(&x, &ly.attn_norm, &h, t, ne, g.eps)?;
-            let out = self.attention(l, ly, kc, vc, *cap, &h, t, p0, &mut *tap)?;
-            self.rms(&out, &ly.post_attn, &tmp, t, ne, POST_EPS)?;
-            self.add(&x, &tmp, t * ne)?;
+            // the attention's normed input: made by the layer before (its last step) when it could
+            let xq = match pending.take() {
+                Some(q) => Some(q),
+                None => self.norm_in(&x, &ly.attn_norm, &h, t)?,
+            };
+            let out = self.attention(l, ly, kc, vc, *cap, &h, xq.as_ref(), t, p0, &mut *tap)?;
+            let xf = self.post_norm(&out, &ly.post_attn, &x, &ly.ffn_norm, g.eps, &h, t, None)?;
             tap(&format!("ffn_inp-{l}"), &x)?;
-            self.rms(&x, &ly.ffn_norm, &h, t, ne, g.eps)?;
-            self.matmul(&ly.ffn_gate, &h, t, &ffn_g)?;
-            self.matmul(&ly.ffn_up, &h, t, &ffn_u)?;
-            let nf = t * g.n_ff;
-            // SAFETY: n floats each.
-            self.op("swiglu", || unsafe { (self.k.swiglu_clamp)(self.raw(), ffn_g.fp(), ffn_u.fp(), ffn_g.fp(), nf as i64, f32::INFINITY) })?;
-            self.matmul(&ly.ffn_down, &ffn_g, t, &out)?;
-            self.rms(&out, &ly.post_ffn, &tmp, t, ne, POST_EPS)?;
-            self.add(&x, &tmp, t * ne)?;
+            self.ffn(ly, xf, &h, &ffn_g, &ffn_u, &out, t)?;
+            // the next layer's norm with this one's last step, on the same GPU and outside this layer's arena share
+            let next = self.layers.get(l + 1).filter(|_| self.layer_dev.get(l + 1) == Some(&self.layer_dev[l]));
+            match (next, &carry) {
+                (Some(nl), Some(c)) => pending = self.post_norm(&out, &ly.post_ffn, &x, &nl.attn_norm, g.eps, &h, t, Some(c))?,
+                _ => self.post(&out, &ly.post_ffn, &x, t)?,
+            }
             tap(&format!("l_out-{l}"), &x)?;
             self.arena().rewind(mark);
         }
@@ -670,7 +836,7 @@ impl<'g> MuseGlimmer<'g> {
         self.rms(&last, &self.output_norm, &normed, n, ne, g.eps)?;
         tap("result_norm", &normed)?;
         let logits = self.arena().f32(n * self.output.rows)?;
-        self.matmul(&self.output, &normed, n, &logits)?;
+        self.matmul(&self.output, &normed, None, n, &logits)?;
         let mut all = logits.to_f32()?;
         // the output multiplier, then the soft cap
         let (sc, cap) = (g.logit_scale, g.softcap);
@@ -880,17 +1046,59 @@ fn vec_mat(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, silo: Option<&ffi::Silo>, nam
         // SAFETY: src holds the tensor, out its elements as float32.
         ffi::check(unsafe { (k.dequant)(gpu.raw(), t.ty.code() as i32, src.ptr(), rows * cols, out.fp()) }, name)?;
         gpu.sync()?;
-        return Ok(Mat { buf: out, ty: GType::F32, rows, cols, packed: false });
+        return Ok(Mat { buf: out, ty: GType::F32, rows, cols, scales: None });
+    }
+    if let (GType::Q8_0, Some(s), true) = (t.ty, silo, cols.is_multiple_of(32)) {
+        // the matrix owns its repacked memory (its quants first), its scales a view of it
+        let (own, m) = pack(gpu, s, &raw, rows, cols, name)?;
+        return Ok(Mat { buf: own, ty: t.ty, rows, cols, scales: m.scales });
     }
     let buf = DevBuf::new(gpu, raw.len())?;
     buf.write(0, &raw)?;
-    if let (GType::Q8_0, Some(s), true) = (t.ty, silo, cols.is_multiple_of(32)) {
-        // SAFETY: arithmetic only.
-        let packed = DevBuf::new(gpu, unsafe { (s.q8r_bytes)(rows as i64, cols as i64) })?;
-        // SAFETY: buf holds the matrix's Q8_0 blocks, packed its repacked size.
-        ffi::check(unsafe { (s.q8r_pack)(gpu.raw(), buf.ptr(), rows as i64, cols as i64, packed.ptr()) }, name)?;
-        gpu.sync()?;
-        return Ok(Mat { buf: packed, ty: t.ty, rows, cols, packed: true });
+    Ok(Mat { buf, ty: t.ty, rows, cols, scales: None })
+}
+
+/// Q8_0 blocks of `rows` x `cols` repacked by the silo: the memory, and the matrix as a view of it
+fn pack(gpu: &Arc<Gpu>, s: &ffi::Silo, raw: &[u8], rows: usize, cols: usize, name: &str) -> Result<(DevBuf, Mat)> {
+    let src = DevBuf::new(gpu, raw.len())?;
+    src.write(0, raw)?;
+    // SAFETY: arithmetic only.
+    let (bytes, at) = unsafe { ((s.q8r_bytes)(rows as i64, cols as i64), (s.q8r_scales_at)(rows as i64, cols as i64)) };
+    let own = DevBuf::new(gpu, bytes)?;
+    // SAFETY: src holds the matrix's Q8_0 blocks, own its repacked size.
+    ffi::check(unsafe { (s.q8r_pack)(gpu.raw(), src.ptr(), rows as i64, cols as i64, own.ptr()) }, name)?;
+    gpu.sync()?;
+    let m = Mat { buf: own.view(0, rows * cols)?, ty: GType::Q8_0, rows, cols, scales: Some(own.view(at, rows * (cols / 32) * 2)?) };
+    Ok((own, m))
+}
+
+/// Matrices of the same width stacked (their rows one after another) and repacked as one: the memory, the whole, and
+/// each as a view of its rows
+fn pack_stack(f: &Gguf, gpu: &Arc<Gpu>, s: &ffi::Silo, names: &[String], loaded: &mut u64) -> Result<Option<(DevBuf, Mat, Vec<Mat>)>> {
+    let mut raw = Vec::new();
+    let mut shapes = Vec::new();
+    for n in names {
+        let t = f.tensor(n).ok_or_else(|| e(format!("no {n}")))?;
+        if t.ty != GType::Q8_0 || t.shape.len() != 2 {
+            return Ok(None);
+        }
+        shapes.push((t.shape[0] as usize, t.shape[1] as usize));
+        let b = f.read(t).map_err(|x| e(x.0))?;
+        *loaded += b.len() as u64;
+        raw.extend_from_slice(&b);
     }
-    Ok(Mat { buf, ty: t.ty, rows, cols, packed: false })
+    let cols = shapes[0].1;
+    if shapes.iter().any(|x| x.1 != cols) || !cols.is_multiple_of(32) {
+        return Err(e(format!("{}: matrices of different widths", names.join(", "))));
+    }
+    let rows: usize = shapes.iter().map(|x| x.0).sum();
+    let (own, whole) = pack(gpu, s, &raw, rows, cols, &names[0])?;
+    let (q, sc) = (whole.buf.ptr() as usize - own.ptr() as usize, whole.scales.as_ref().map_or(0, |x| x.ptr() as usize - own.ptr() as usize));
+    let mut parts = Vec::with_capacity(shapes.len());
+    let mut r0 = 0;
+    for (r, _) in &shapes {
+        parts.push(Mat { buf: own.view(q + r0 * cols, r * cols)?, ty: GType::Q8_0, rows: *r, cols, scales: Some(own.view(sc + r0 * (cols / 32) * 2, r * (cols / 32) * 2)?) });
+        r0 += r;
+    }
+    Ok(Some((own, whole, parts)))
 }

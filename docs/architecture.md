@@ -210,11 +210,15 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   RMS-normed, the logits x 0.196 then soft-capped at 20. A windowed layer's cache is a ring of its window and a pass
   (4,095 slots), a full layer's the context. Its kernels (`kernels/llm/museglimmer/mg.cpp`): the norms with the
   rotation, the ring stores, the windowed attention (online softmax, 4 query heads a work-group, decode split over the
-  keys), the gate; the products are the shared ones. Its silo (`silo/mmvq.cpp`) repacks each Q8_0 matrix at load
-  (quants apart from scales: 16-byte loads) for the decode products and the prompt's expansion to half. Checked
-  against llama.cpp layer by layer (14 tokens: every layer >= 0.99991; 6,153 tokens, the ring wrapped: the same next
-  token, result norm 0.9974), the silo's decode products 0.999885 (the shared 0.999847). B70: ~17 tok/s decode
-  (bandwidth: the products ~557 GB/s of 608), ~830 tok/s prompt at 4.2K. The chat template's channels (a `to=self`
+  keys), the gate, the post norm into the residual; the prompt products are the shared half GEMMs. Its silo:
+  `silo/mmvq.cpp` repacks each Q8_0 matrix at load (quants apart from scales: 16-byte loads), q | k | v | gate and
+  gate | up stacked (a decode row's one product each), and fuses decode's small steps into the quantization of the next
+  product's input (a norm, the gate, SwiGLU, a post norm with the next norm); `silo/attn.cpp` is prompt flash attention
+  on XMX (the qwen35 silo's, for heads of 128, 16 query heads a key head, the window and the ring). Checked against
+  llama.cpp layer by layer (14 tokens: every layer >= 0.99991; 6,153 tokens, the ring wrapped: the same next token,
+  result norm 0.997), the silo's decode products 0.999885 (the shared 0.999847). B70: ~17.4 tok/s decode (28 GB of
+  weights a token at ~490 GB/s; the products ~570 of 608), ~1,370 tok/s prompt at 4.2K (the vector-unit attention:
+  ~830). The chat template's channels (a `to=self`
   message, then `to=user`) come back as `reasoning_content` and `content` (nextsycl_tok::muse_channels).
 
 ## The audio engines

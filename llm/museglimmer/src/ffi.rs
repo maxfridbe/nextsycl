@@ -19,7 +19,6 @@ pub struct Api {
     pub dequant_f16: unsafe extern "C" fn(G, c_int, P, i64, *mut u16) -> c_int,
     pub to_f16: unsafe extern "C" fn(G, *const f32, *mut u16, i64) -> c_int,
     pub gemm_f16: unsafe extern "C" fn(G, i64, i64, i64, *const u16, i64, *const u16, *mut f32, i64, c_int) -> c_int,
-    pub add: unsafe extern "C" fn(G, *mut f32, *const f32, i64) -> c_int,
     pub q8_1_bytes: unsafe extern "C" fn(i64, i64) -> usize,
     pub mmvq_supported: unsafe extern "C" fn(c_int) -> c_int,
     pub quantize_q8_1: unsafe extern "C" fn(G, *const f32, M, i64, i64) -> c_int,
@@ -30,6 +29,7 @@ pub struct Api {
     pub attn_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
     pub attn: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
     pub gate_mul: unsafe extern "C" fn(G, *mut f32, *const f32, i64) -> c_int,
+    pub rms_add: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, i64, i64, f32) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -61,7 +61,6 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             dequant_f16: sym!("ns_dequant_f16"),
             to_f16: sym!("ns_to_f16"),
             gemm_f16: sym!("ns_gemm_f16"),
-            add: sym!("ns_add"),
             q8_1_bytes: sym!("ns_q8_1_bytes"),
             mmvq_supported: sym!("ns_mmvq_supported"),
             quantize_q8_1: sym!("ns_quantize_q8_1"),
@@ -71,6 +70,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             attn_scratch: sym!("ns_mg_attn_scratch"),
             attn: sym!("ns_mg_attn"),
             gate_mul: sym!("ns_mg_gate_mul"),
+            rms_add: sym!("ns_mg_rms_add"),
         })
     })
     .as_ref()
@@ -90,11 +90,19 @@ pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
 pub struct Silo {
     pub path: std::path::PathBuf,
     pub q8r_bytes: unsafe extern "C" fn(i64, i64) -> usize,
+    pub q8r_scales_at: unsafe extern "C" fn(i64, i64) -> usize,
     pub q8r_pack: unsafe extern "C" fn(G, P, i64, i64, M) -> c_int,
     pub xq_bytes: unsafe extern "C" fn(i64, i64) -> usize,
-    pub xq: unsafe extern "C" fn(G, *const f32, M, i64, i64) -> c_int,
-    pub mmvq: unsafe extern "C" fn(G, P, P, *mut f32, i64, i64, i64) -> c_int,
-    pub q8r_f16: unsafe extern "C" fn(G, P, i64, i64, *mut u16) -> c_int,
+    /// (a, b, op: 0 a, 1 a sigmoid(b), 2 silu(a) b, xq, n_in, ncols)
+    pub xq: unsafe extern "C" fn(G, *const f32, *const f32, c_int, M, i64, i64) -> c_int,
+    pub rms_xq: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, M, i64, i64, f32) -> c_int,
+    /// (out, post norm weight, its eps, x, next norm weight, its eps, xq, rows, C)
+    pub post_rms_xq: unsafe extern "C" fn(G, *const f32, *const f32, f32, *mut f32, *const f32, f32, M, i64, i64) -> c_int,
+    /// (quants, scales, xq, y, n_in, n_out, ncols)
+    pub mmvq: unsafe extern "C" fn(G, P, P, P, *mut f32, i64, i64, i64) -> c_int,
+    pub q8r_f16: unsafe extern "C" fn(G, P, P, i64, i64, *mut u16) -> c_int,
+    pub attn_prompt_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
+    pub attn_prompt: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32) -> c_int,
 }
 
 /// The silo's library: named after the engine's directory (the architecture's name has a dash)
@@ -121,11 +129,16 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
         Ok(Some(Silo {
             path: lib.path.clone(),
             q8r_bytes: sym!("ns_mg_q8r_bytes"),
+            q8r_scales_at: sym!("ns_mg_q8r_scales_at"),
+            rms_xq: sym!("ns_mg_rms_xq"),
+            post_rms_xq: sym!("ns_mg_post_rms_xq"),
             q8r_pack: sym!("ns_mg_q8r_pack"),
             xq_bytes: sym!("ns_mg_xq_bytes"),
             xq: sym!("ns_mg_xq"),
             mmvq: sym!("ns_mg_mmvq"),
             q8r_f16: sym!("ns_mg_q8r_f16"),
+            attn_prompt_supported: sym!("ns_mg_attn_prompt_supported"),
+            attn_prompt: sym!("ns_mg_attn_prompt"),
         }))
     })
     .as_ref()
