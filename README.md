@@ -37,6 +37,7 @@ for a chat model. Measured speeds, decode / prompt reading:
 | `qwen3.8-flash-next-coder-iq1_m` | **Qwen3.8-Flash-Next Coder** IQ1_M | ~77 tok/s / ~1,400 tok/s, 128K |
 | `qwen3.8-27b-q4` | **Qwen3.8-27B** dense UD-Q4_K_M (MTP drafts) | 43-49 tok/s, 128K |
 | `muse-glimmer-30b-q8` | **Muse Glimmer 30B** abliterated, dense Q8_0 with its DFlash drafter (reasons on its to=self channel) | 30-77 tok/s by text (18.7 without drafts) / ~1,350 tok/s (1,215 at 35K), 128K |
+| `muse-glimmer-30b-q8-b70`, `-b65` | the same on one card alone, without the drafter (it does not fit beside the model) | 18.7 (B70) / 16.9 (B65) tok/s, 128K |
 | `qwen-image-2.1-q8` | **Qwen-Image 2.1** text to image, edits | 1024x1024, 40 steps: 23.8 s (16.5 s int8) |
 | `minimax-h3` | **MiniMax H3** video with sound | 896x672, 4.5 s: ~90 s |
 | `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |
@@ -94,6 +95,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `qwen3.8-27b-q8-256k` | Qwen3.8-27B Q8_0 on both GPUs, 256K + 32K, MTP drafts | `qwen35` | 28.4 GiB | served (verify passes exact) |
 | `qwen3.8-27b-q4-256k` | Qwen3.8-27B UD-Q4_K_M on both GPUs, 256K + 32K, MTP drafts | `qwen35` | 16.6 GiB | served (verify passes exact) |
 | `muse-glimmer-30b-q8` | Muse Glimmer 30B Abliterated Q8_0 (dense gated attention: 39 sliding-window layers of 2,048, 13 full; post norms, soft-capped logits), 128K + 32K; its DFlash drafter (15 drafts a step, verify rows exact: the same text as without); its reasoning as `reasoning_content` | `muse-glimmer` | 29.1 GiB | checked (llama.cpp, 6K tokens), served |
+| `muse-glimmer-30b-q8-b70`, `muse-glimmer-30b-q8-b65` | the same on the B70 or the B65 alone, no drafter (the engine drops it anyway when it does not fit), 128K + 32K | `muse-glimmer` | 26.2 GiB | served |
 
 **Image** (`nextsycl image`; sizes with the text encoder, VAE and tokenizer)
 

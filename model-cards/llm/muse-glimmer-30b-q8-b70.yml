@@ -1,0 +1,19 @@
+# Muse Glimmer 30B Abliterated Q8_0 (8-bit; the B70 alone, no drafter, 128K + 32K)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: muse-glimmer-30b-q8-b70
+kind: llm
+arch: muse-glimmer
+title: Muse Glimmer 30B Abliterated Q8_0 (8-bit; the B70 alone, 128K + 32K)
+about: 'Meta''s dense agentic Muse Glimmer 30B, abliterated (Blackfrost), on the faster card alone: 52 layers of gated attention (39 over a 2,048 sliding window, 13 full), a dense SwiGLU, logits soft-capped; it reasons on a to=self channel before its answer; no DFlash drafter (it does not fit beside the model on one card), so one token a step; 27.6 GiB'
+gpus: '0'
+ctx: 131072,32768
+tools: false
+tasks: true
+env:
+  NS_MG_DRAFTS: '0'     # no drafter: it and the model do not fit one card together
+silo:                   # its tuned kernels: kernels/llm/museglimmer/silo (dist/silo/libnextsycl-museglimmer.so)
+  name: museglimmer
+  required: false
+files:
+  model: mg30-q8        # defined in muse-glimmer-30b-q8.yml
+guide: guides/chat.md

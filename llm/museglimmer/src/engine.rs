@@ -387,7 +387,7 @@ impl<'g> MuseGlimmer<'g> {
         }).collect();
         let head_w = weights - layer_w.iter().sum::<u64>();
         // the drafter: drafts on, the silo there (its products), its file found
-        let dfile: Option<Box<Gguf>> = match (draft && draft_count() != Some(0), silo, draft_path(f)) {
+        let mut dfile: Option<Box<Gguf>> = match (draft && draft_count() != Some(0), silo, draft_path(f)) {
             (true, Some(_), Some(p)) => match Gguf::open(&p) {
                 Ok(d) if d.architecture() == "dflash" => {
                     log(format!("museglimmer: the DFlash drafter {}", p.display()));
@@ -412,9 +412,10 @@ impl<'g> MuseGlimmer<'g> {
         let d_elems: u64 = dfile.as_ref().map_or(0, |d| d.tensors.iter().filter(|t| t.shape.len() == 2).map(|t| t.shape.iter().product::<u64>()).sum());
         let d_targets = dfile.as_ref().and_then(|d| d.arch_meta("target_layers")).and_then(|v| v.as_array()).map_or(0, |a| a.len());
         let draft_w = d_elems * 17 / 16 + if dfile.is_some() { 128 << 20 } else { 0 };
+        let with_draft = dfile.is_some();
         let w16_bytes = [g.n_ff * g.n_embd, g.heads * g.head * g.n_embd, d_targets * g.n_embd * g.n_embd].into_iter().max().unwrap_or(0) * 2;
         // a pass's target features and the injection's work beside the arena
-        let feat = |c: usize| if d_targets > 0 { c * (d_targets + 4) * g.n_embd * 4 } else { 0 };
+        let feat = |c: usize, dr: bool| if dr && d_targets > 0 { c * (d_targets + 4) * g.n_embd * 4 } else { 0 };
         let mut free = Vec::with_capacity(gpus.len());
         for gpu in gpus {
             let (total, fr) = gpu.memory()?;
@@ -429,15 +430,15 @@ impl<'g> MuseGlimmer<'g> {
         let d_on = if gpus.len() > 1 { 0 } else { gpus.len() - 1 };
         // the plan for a chunk: the last GPU first (the server orders them weakest first), each taking the last layers
         // left while they fit; the first the rest
-        let plan = |c: usize| -> std::result::Result<Vec<(usize, usize)>, String> {
+        let plan = |c: usize, dr: bool| -> std::result::Result<Vec<(usize, usize)>, String> {
             let n = gpus.len();
             let cost: Vec<u64> = (0..g.layers).map(|l| layer_w[l] + cache_bytes(&g, l, ctx, c) as u64).collect();
             let room: Vec<i64> = (0..n).map(|i| {
-                let mut over = margin + (512 << 20) + w16_bytes as u64 + (arena_bytes(&g, c) + feat(c)) as u64;
+                let mut over = margin + (512 << 20) + w16_bytes as u64 + (arena_bytes(&g, c) + feat(c, dr)) as u64;
                 if i + 1 == n {
                     over += head_w;
                 }
-                if i == d_on {
+                if dr && i == d_on {
                     over += draft_w;
                 }
                 free[i] as i64 - over as i64
@@ -488,13 +489,23 @@ impl<'g> MuseGlimmer<'g> {
         let tries: Vec<usize> = chunk_setting().map_or_else(|| vec![2048, 1024, 512], |c| vec![c]);
         let mut last_err = String::new();
         let mut found = None;
-        for c in tries {
-            match plan(c) {
-                Ok(b) => {
-                    found = Some((c, b));
-                    break;
+        // with the drafter first; when it does not fit beside the layers and the sessions, without it
+        for dr in if with_draft { vec![true, false] } else { vec![false] } {
+            for &c in &tries {
+                match plan(c, dr) {
+                    Ok(b) => {
+                        found = Some((c, b));
+                        break;
+                    }
+                    Err(x) => last_err = x,
                 }
-                Err(x) => last_err = x,
+            }
+            if found.is_some() {
+                if !dr && with_draft {
+                    log(format!("museglimmer: the drafter does not fit beside a {ctx}-token context ({last_err}); no drafts"));
+                    dfile = None;
+                }
+                break;
             }
         }
         let (chunk, bounds) = found.ok_or_else(|| e(format!("{} over {} GPUs at a {ctx}-token context: {last_err}", f.architecture(), gpus.len())))?;
@@ -582,10 +593,10 @@ impl<'g> MuseGlimmer<'g> {
         let mut devs = Vec::with_capacity(gpus.len());
         for (gpu, &(lb, le)) in gpus.iter().zip(&bounds) {
             gpu.sync()?;
-            devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, w16_bytes)?, arena: Arena::new(gpu, arena_bytes(&g, chunk) + feat(chunk))?, lb, le });
+            devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, w16_bytes)?, arena: Arena::new(gpu, arena_bytes(&g, chunk) + feat(chunk, dfile.is_some()))?, lb, le });
         }
         let load_s = t0.elapsed().as_secs_f64();
-        let wh = devs.iter().map(|d| if d.lb == 0 && d.le == g.layers { d.gpu.name.clone() } else { format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1) })
+        let wh = devs.iter().map(|d| if d.lb == 0 && d.le == g.layers { d.gpu.name.clone() } else { if d.le > d.lb { format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1) } else { format!("{} (the drafter)", d.gpu.name) } })
             .collect::<Vec<_>>().join(", ");
         log(format!("museglimmer: {} layers of {} ({} windowed), {:.1} GiB on {wh} in {load_s:.0} s; prompt chunks of {chunk}", g.layers, g.n_embd,
                     g.swa.iter().filter(|s| **s).count(), gib(loaded)));
