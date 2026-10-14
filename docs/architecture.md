@@ -30,8 +30,10 @@ llm/                       LANGUAGE MODELS
   example    nextsycl-llm-example    a template: the contract filled with documented stubs
 
 image/                     IMAGES
-  contract   nextsycl-image      the contract: ImageEngine, ImageRequest (+ Edit), Step, ImageKind
+  contract   nextsycl-image      the contract: ImageEngine, ImageRequest (+ Edit), Step, ImageKind; OcrRequest /
+                                 OcrOutput for an engine that reads pictures (reads, ocr)
   qwenimage21 nextsycl-image-qwenimage21  Qwen-Image 2.1: DiT, VAE, pipeline, stage checks
+  unlimitedocr nextsycl-image-unlimitedocr  Unlimited-OCR: pages to Markdown (SAM-B + CLIP-L, a DeepSeek-V2 MoE decoder)
   example    nextsycl-image-example  a template
 
 video/                     VIDEO
@@ -236,6 +238,28 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   drafted (~31 / ~57). Products ~420-520 GB/s (Q8_0's ~570: the unpack, not the reads, bounds them). A model whose
   matrices the silo does not all take gets float rows from the decode norms (the shared products need them). The chat template's channels (a `to=self` message, then `to=user`) come back as
   `reasoning_content` and `content` (nextsycl_tok::muse_channels).
+
+## The image engines
+
+- **qwen-image-2.1** (`image/qwenimage21`) - Qwen-Image 2.1's DiT, VAE and pipeline (text to image, edits).
+- **unlimited-ocr** (`image/unlimitedocr`) - Baidu's Unlimited-OCR (the DeepSeek-OCR architecture): it reads pictures
+  rather than makes them (`ImageEngine::reads`, `ocr`; the image server's `POST /v1/ocr`, the front door's `image.ocr`,
+  the page wfe/ocr). From two GGUFs: the projector (SAM ViT-B + CLIP-L + a linear, F16, float32 here) and the
+  decoder (12 layers of 1280: MHA of 10 x 128 with NEOX rotary positions, layer 0 a SwiGLU, then 64 experts of 896
+  - softmax gate, top 6 - beside 2 shared; expanded to half at load, Q8_0 / Q4_K / Q6_K / Q5_0). The reading is the
+  reference's `infer` step by step: the global view (ImageOps.pad to 1024) and, a side over 640, tiles of 640 on the
+  grid of 2 .. 32 closest to the page's aspect (PIL's bicubic resampling: `Picture::resize_bicubic`, bit-exact with
+  PIL), image tokens tiles first (a newline after each patch row), then the global view, then the separator; greedy
+  with no 35-gram repeated in the last 128 tokens; the cache keeps the prompt and only the last 128 tokens written
+  (the reference's ring: a page of any length in fixed memory). Its kernels (`kernels/image/unlimitedocr`): SAM's
+  attention with decomposed relative positions, the patch / 3x3 / window rearrangements, quick GELU, the experts'
+  gathers and scatters, Q5_0 to half; the linears, norms and attention are the diffusion kernels'. Checked: the
+  preprocessing against PIL (identical), the vision tower against the reference's own deepencoder.py on the
+  original weights (projector output rel 3e-4, tiles and global view), the decoder against llama.cpp
+  (reference/llama-dump/ns-ocr-dump.cpp: every layer cos >= 0.9999; llama.cpp's tile path resamples SAM's and CLIP's
+  positions differently from the reference - plain bicubic, CLIP's CLS row from the end - so tiles compare with
+  the reference, not llama.cpp). B70: a page (tiles) seen and read at ~600-900 tok/s, written at ~120-145 tok/s;
+  tests/api/test-ocr.py (three public transcripts, pictures only) passes on Q8_0 and Q4_K_M.
 
 ## The audio engines
 

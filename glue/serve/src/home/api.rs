@@ -75,6 +75,12 @@ pub const METHODS: &[Method] = &[
                        ("size", "string", "default: the last picture's aspect", false), ("steps", "integer", "", false), ("seed", "integer", "", false),
                        ("response_format", "string", "url (default) or b64_json", false)],
              example: r#"{"prompt": "make it night, keep the lighthouse", "images": ["data:image/png;base64,iVBORw0..."]}"# },
+    Method { kind: "image", name: "ocr", summary: "Read pages (an OCR model: Unlimited-OCR): their text as Markdown, tables as HTML, boxes with <|grounding|>",
+             fields: &[("model", "string", "an OCR model's id (default: the first enabled)", false), ("images", "string[]", "the pages, base64 or data: URLs, in order", true),
+                       ("prompt", "string", "\"document parsing.\" (default), \"Free OCR.\", \"<|grounding|>Convert the document to markdown.\", \"Parse the figure.\"", false),
+                       ("tiles", "boolean", "one page: read its 640-pixel tiles too (default true)", false), ("max_tokens", "integer", "default 8192", false),
+                       ("temperature", "number", "0 (default): greedy", false), ("ngram", "integer", "no n-gram of this many tokens repeated (35; 0: off)", false)],
+             example: r#"{"images": ["data:image/png;base64,iVBORw0..."], "prompt": "document parsing."}"# },
     Method { kind: "image", name: "info", summary: "The model's defaults, samplers, schedules, options and LoRAs (loaded: from the server)", fields: &[MODEL_OPT], example: "{}" },
     Method { kind: "image", name: "progress", summary: "The request running: step of steps, how many wait", fields: &[], example: "{}" },
     Method { kind: "image", name: "history", summary: "The pictures made, newest first, with their settings", fields: &[], example: "{}" },
@@ -364,6 +370,25 @@ impl Home {
                 let list: Vec<Value> = all.iter().filter(|m| registry::kind_of(m) == "llm" && m["enabled"] != false)
                     .map(|m| json!({"id": m["id"], "title": m["title"], "gpus": m["gpus"], "loaded": loaded.as_deref() == m["id"].as_str()})).collect();
                 Ok(json!({"models": list}))
+            }
+            ("image", "ocr") => {
+                // a reading model: the one named, else the loaded or first enabled one whose architecture reads
+                let reads = |m: &Value| s(m, "arch").contains("ocr");
+                let id = match b["model"].as_str().filter(|x| !x.is_empty()) {
+                    Some(_) => self.pick("image", b, &all)?,
+                    None => {
+                        let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "image" && m["enabled"] != false && reads(m)).collect();
+                        self.loaded_of("image").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
+                            .ok_or_else(|| (409, "no OCR model is enabled (system.enable unlimited-ocr-q8)".to_string()))?
+                    }
+                };
+                if !all.iter().any(|m| m["id"] == id.as_str() && reads(m)) {
+                    return Err((400, format!("{id} makes pictures; image.ocr needs a model that reads them")));
+                }
+                let t = self.ensure(&id)?;
+                let mut body = b.clone();
+                body["model"] = json!(id);
+                call_for(&t, "POST", "/v1/ocr", Some(&body), 3600).map_err(|e| (502, e))
             }
             ("image", "generate") | ("image", "edit") => {
                 let id = self.pick("image", b, &all)?;

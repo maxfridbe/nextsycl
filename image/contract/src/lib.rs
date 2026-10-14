@@ -51,6 +51,40 @@ pub struct Edit {
     pub strength: f32,
 }
 
+/// One reading (an OCR model's request): pictures in reading order and the instruction
+#[derive(Clone, Debug, Default)]
+pub struct OcrRequest {
+    /// the pages, in order (a single picture: its tiles are read too; several: each page whole)
+    pub pages: Vec<Picture>,
+    /// the instruction ("document parsing.", "Free OCR.", "<|grounding|>Convert the document to markdown.", ...);
+    /// empty: the engine's default
+    pub prompt: String,
+    /// read a single picture's tiles as well as the whole (more detail, more tokens); None: the engine's default
+    pub tiles: Option<bool>,
+    /// tokens to write at most (0: the engine's default)
+    pub max_tokens: u32,
+    /// no n-gram of this many tokens repeated within the window (0: off; None: the model's own setting)
+    pub ngram: Option<u32>,
+    pub ngram_window: Option<u32>,
+    /// sampling temperature (0: greedy - the model's own setting for reading)
+    pub temperature: f32,
+    pub seed: u64,
+    /// the engine's own options for this request, by name
+    pub extra: Given,
+}
+
+/// What a reading made
+#[derive(Clone, Debug, Default)]
+pub struct OcrOutput {
+    /// the text as the model wrote it (its layout markup kept: boxes, tables)
+    pub text: String,
+    pub prompt_tokens: u32,
+    pub tokens: u32,
+    /// seconds to see the pages and read the prompt, then to write
+    pub prompt_seconds: f64,
+    pub seconds: f64,
+}
+
 /// The engine's own defaults, shown by `info` and used for the request's `None` fields
 #[derive(Clone, Copy, Debug)]
 pub struct Defaults {
@@ -131,6 +165,14 @@ pub trait ImageEngine: Send + Sync {
     /// lines for `status`: its GPUs, memory, what is loaded where
     fn report(&self) -> Vec<String> {
         Vec::new()
+    }
+    /// whether it reads pictures (an OCR model: `ocr`) rather than makes them
+    fn reads(&self) -> bool {
+        false
+    }
+    /// read the request's pages, each piece of text as it is written to `text`
+    fn ocr(&self, _req: &OcrRequest, _text: &mut dyn FnMut(&str)) -> Result<OcrOutput> {
+        Err(Error(format!("{} makes pictures; it does not read them", self.arch())))
     }
 }
 

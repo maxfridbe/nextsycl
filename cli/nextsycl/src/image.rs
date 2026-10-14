@@ -14,20 +14,33 @@ nextsycl image gen \"<prompt>\" [--model ID] [--size WxH | --aspect W:H] [--step
 nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora NAME[:SCALE]]... [--set NAME=VALUE]...
                      [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl image start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
-nextsycl image check <dump dir> [--model ID] [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--gpu N]
+nextsycl image ocr PICTURE... [--model ID|FILE.gguf] [--prompt TEXT] [--no-tiles] [--max N] [--temp T] [--out FILE] [--gpu N] [--dump-views DIR]
+nextsycl image check <dump dir> [--model ID|FILE.gguf] [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--tokens N] [--gpu N]
 nextsycl image engines | selftest [--gpu N]";
 
 /// The image engines this program has (image/<arch>)
 pub fn engines() -> Vec<nextsycl_image::ImageKind> {
-    vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_example::kind()]
+    vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
     args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
 
-/// The registered image model `id`, or the first one: (entry, files by role)
+/// The registered image model `id`, or the first one: (entry, files by role). A GGUF file named instead of an id is
+/// read as it is: its architecture, and an OCR decoder's projector (mmproj-*.gguf) found beside it
 fn model(cfg: &Config, id: Option<&str>) -> Result<(Value, ModelFiles), String> {
+    if let Some(p) = id.map(Path::new).filter(|p| p.is_file()) {
+        let g = nextsycl_gguf::Gguf::open(p).map_err(|e| e.0)?;
+        let mut files = ModelFiles::new();
+        files.insert("model".into(), p.to_path_buf());
+        if let Some(mm) = std::fs::read_dir(p.parent().unwrap_or(Path::new("."))).map_err(|e| e.to_string())?.flatten().map(|e| e.path())
+            .find(|q| q.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("mmproj") && n.ends_with(".gguf"))) {
+            files.insert("mmproj".into(), mm);
+        }
+        let m = serde_json::json!({"id": p.file_stem().and_then(|s| s.to_str()).unwrap_or("model"), "arch": g.architecture(), "kind": "image"});
+        return Ok((m, files));
+    }
     let all = models::all(cfg)?;
     let m = match id {
         Some(id) => all.into_iter().find(|m| m["id"] == id).ok_or_else(|| format!("no model {id} (nextsycl models search --kind image)"))?,
@@ -125,6 +138,54 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
     gen_or_edit(cfg, args, false)
 }
 
+/// `nextsycl image ocr PICTURE...`: the pages read here (an OCR model), the text streamed to stdout (and --out)
+fn ocr(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let pages: Vec<nextsycl_image::Picture> = args.iter().take_while(|a| !a.starts_with("--"))
+        .map(|p| std::fs::read(p).map_err(|e| format!("{p}: {e}")).and_then(|b| nextsycl_image::Picture::decode(&b)))
+        .collect::<Result<_, _>>()?;
+    if pages.is_empty() {
+        return Err(USAGE.into());
+    }
+    // the views as the model sees them, written as float32 planes (a check of the preprocessing) - no model needed
+    if let Some(dir) = opt(args, "--dump-views") {
+        let seen = nextsycl_image_unlimitedocr::prep::see(&pages, !args.iter().any(|a| a == "--no-tiles"));
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let put = |name: String, v: &[f32]| std::fs::write(Path::new(dir).join(name), v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        for (i, t) in seen.tiles.iter().enumerate() {
+            put(format!("tile-{i}.f32"), &t.planes).map_err(|e| e.to_string())?;
+        }
+        for (i, g) in seen.globals.iter().enumerate() {
+            put(format!("global-{i}.f32"), &g.planes).map_err(|e| e.to_string())?;
+        }
+        println!("grid {}x{}: {} tiles, {} global views", seen.grid.0, seen.grid.1, seen.tiles.len(), seen.globals.len());
+        return Ok(());
+    }
+    let (_, e) = load(cfg, args)?;
+    if !e.reads() {
+        return Err(format!("{} makes pictures; an OCR model reads them (--model)", e.arch()));
+    }
+    let req = nextsycl_image::OcrRequest {
+        pages,
+        prompt: opt(args, "--prompt").unwrap_or("").to_string(),
+        tiles: Some(!args.iter().any(|a| a == "--no-tiles")),
+        max_tokens: opt(args, "--max").and_then(|v| v.parse().ok()).unwrap_or(0),
+        temperature: opt(args, "--temp").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+        ..Default::default()
+    };
+    use std::io::Write;
+    let out = e.ocr(&req, &mut |t| {
+        print!("{t}");
+        let _ = std::io::stdout().flush();
+    }).map_err(|e| e.0)?;
+    println!();
+    eprintln!("[{} prompt tokens in {:.2} s ({:.0} tok/s); {} written in {:.2} s ({:.1} tok/s)]", out.prompt_tokens, out.prompt_seconds,
+              out.prompt_tokens as f64 / out.prompt_seconds.max(1e-9), out.tokens, out.seconds, out.tokens as f64 / out.seconds.max(1e-9));
+    if let Some(f) = opt(args, "--out") {
+        std::fs::write(f, &out.text).map_err(|e| format!("{f}: {e}"))?;
+    }
+    Ok(())
+}
+
 /// `nextsycl image edit "<instructions>" --image P [--image R]...`: the first picture changed as described, the others
 /// as references ("put the hat from picture 2 on the fox")
 fn edit(cfg: &Config, args: &[String]) -> Result<(), String> {
@@ -209,6 +270,16 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let dir = Path::new(args.first().ok_or(USAGE)?);
     nextsycl_core::use_kind("image");
     let (m, files) = model(cfg, opt(args, "--model"))?;
+    if nextsycl_image_unlimitedocr::ARCHS.contains(&m["arch"].as_str().unwrap_or("")) {
+        let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let gpu = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
+        let mut log = |s: String| eprintln!("{s}");
+        let e = nextsycl_image_unlimitedocr::UnlimitedOcr::load(&files, &gpu, &mut log).map_err(|e| e.0)?;
+        let n: usize = opt(args, "--tokens").and_then(|v| v.parse().ok()).unwrap_or(64);
+        let worst = nextsycl_image_unlimitedocr::check::run(&e, dir, n, &mut log).map_err(|e| e.0)?;
+        println!("worst relative error {worst:.2e}");
+        return Ok(());
+    }
     if m["arch"] != nextsycl_image_qwenimage21::ARCH {
         return Err(format!("check knows {} only", nextsycl_image_qwenimage21::ARCH));
     }
@@ -370,6 +441,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("gen") => gen(cfg, rest),
         Some("edit") => edit(cfg, rest),
         Some("check") => check(cfg, rest),
+        Some("ocr") => ocr(cfg, rest),
         Some("serve") => serve(cfg, rest),
         Some("start") => SERVED.start(cfg, rest, |d| run(cfg, rest, d)),
         Some("ps") => SERVED.ps(cfg, rest),

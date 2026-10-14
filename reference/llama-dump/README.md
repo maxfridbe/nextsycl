@@ -25,3 +25,21 @@ NS_DUMP_DIR=/tmp/glm-ref NS_DUMP_RE='^(inp_embd|attn_norm-0|kda_out-0|l_out-[0-9
 
 Tensor names are llama.cpp's graph names with the layer appended (`attn_norm-3`); `index.tsv` gives each one's
 ggml shape (ne0 innermost, so a [tokens, 4096] activation is ne0 = 4096, ne1 = tokens).
+
+## OCR models (mtmd)
+
+`ns-ocr-dump.cpp` does the same for llama.cpp's multimodal path: a picture through mtmd's preprocessing and vision
+graphs, the prompt through the decoder, then greedy tokens (`gen.txt`). Each vision graph's input pixels are dumped as
+`inp_raw` (rows of tiles as a batch of tiles); names seen again get `#2`, `#3`... in the order computed.
+
+```sh
+cp reference/llama-dump/ns-ocr-dump.cpp <llama.cpp>/tools/mtmd/
+cat >> <llama.cpp>/tools/mtmd/CMakeLists.txt <<'EOT'
+add_executable(llama-ns-ocr-dump ns-ocr-dump.cpp)
+target_link_libraries(llama-ns-ocr-dump PRIVATE llama-common mtmd Threads::Threads)
+EOT
+cmake --build build-sycl --target llama-ns-ocr-dump -j 8
+NS_DUMP_DIR=/tmp/ocr ./build-sycl/bin/llama-ns-ocr-dump -m Unlimited-OCR-Q8_0.gguf --mmproj mmproj-Unlimited-OCR-F16.gguf \
+  --image page.png -p "document parsing." -n 100 --device none -ngl 0 -t 16
+nextsycl image check /tmp/ocr --model Unlimited-OCR-Q8_0.gguf     # the engine against it, stage by stage
+```

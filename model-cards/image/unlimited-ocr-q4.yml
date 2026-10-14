@@ -1,0 +1,18 @@
+# Unlimited-OCR Q4_K_M (pages to Markdown)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: unlimited-ocr-q4
+kind: image
+arch: unlimited-ocr
+title: Unlimited-OCR Q4_K_M (pages to Markdown)
+about: 'Baidu''s Unlimited-OCR as unlimited-ocr-q8, its decoder in 4 bits (Q4_K_M, imatrix; the vision encoder F16 as always): the same speed here - the weights are expanded to half on the card - for a smaller download; 1.8 GiB + 0.8'
+gpus: '0'
+env: {}
+files:
+  model:
+    key: uocr-q4km
+    url: https://huggingface.co/sahilchachra/Unlimited-OCR-GGUF/resolve/0dc781d8a23f52963918ebd5b2d1b9fe61504661/Unlimited-OCR-Q4_K_M.gguf
+    size: 1950326784
+    sha256: c8461bded976eac709a33f6b26e1414efcd2124a203f2ee93ee984a4c9e9265b
+    path: unlimited-ocr/Unlimited-OCR-Q4_K_M.gguf
+  mmproj: uocr-mmproj-f16   # defined in unlimited-ocr-q8.yml
+guide: guides/unlimited-ocr.md

@@ -10,14 +10,19 @@
 //!                                 references -, prompt, the fields above) or JSON with `images`: [base64 or data
 //!                                 URLs]; the instructions name the pictures ("the hat from picture 2"); the size
 //!                                 follows the last picture's aspect unless one is given
+//!   POST /v1/ocr                  an OCR model's reading: images [base64 or data URLs] (pages, in order), prompt,
+//!                                 tiles (a single page's tiles too; default true), max_tokens, temperature, ngram
+//!                                 (0: no repetition rule) -> text (the model's markup kept), tokens, seconds; the text
+//!                                 so far is in /api/progress while it is written
 //!   GET  /v1/images/files/<f>     a picture made here (saved in the output directory)
 //!   GET  /v1/models, /health
 //!   GET  /api/info                the model, its defaults, samplers, schedules, the LoRAs it can take
 //!   GET  /api/progress            the request running: its picture, step, seconds; requests waiting
 //!   GET  /api/history             the pictures made since the server started, newest first
 //!   GET  /api/gpu                 the card: VRAM, power, temperatures
-//!   GET  /, /ui/..., /static/...  the web front end (--wfe: wfe/image, built into dist/wfe - TSX on snabbdom, H3's
-//!                                 scheme; the page's CSS inlined at __CSS__ as H3's server does)
+//!   GET  /, /ui/..., /static/...  the web front end (--wfe: wfe/image, or wfe/ocr for a model that reads, built into
+//!                                 dist/wfe - TSX on snabbdom, H3's scheme; the page's CSS inlined at __CSS__ as H3's
+//!                                 server does)
 //! ```
 //!
 //! One request runs at a time (one engine on its GPU); the others wait their turn. A request asking for LoRAs other
@@ -105,6 +110,8 @@ fn earlier(dir: &std::path::Path) -> VecDeque<Value> {
 
 /// The most pictures an edit takes (each is a block of the denoiser's prefix: memory and time grow with them)
 const MAX_PICTURES: usize = 8;
+/// pages one OCR request reads at most (each a global view of 273 tokens)
+const MAX_PAGES: usize = 24;
 
 /// An edit request's fields (as the JSON body a generation takes) and its pictures: OpenAI's multipart form (image /
 /// image[] files, the other fields as text; `options` and `loras` as JSON text), or JSON with `images` (or `image`):
@@ -247,6 +254,16 @@ impl ImageServer {
                     Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
                 }
             }
+            ("POST", "/v1/ocr") => {
+                let body: Value = match serde_json::from_slice(&req.body) {
+                    Ok(v) => v,
+                    Err(e) => return http::respond_with(&mut s, 400, &err(format!("the body is not JSON: {e}")), &cors),
+                };
+                match self.ocr(&body) {
+                    Ok(v) => http::respond_with(&mut s, 200, &v, &cors),
+                    Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
+                }
+            }
             ("POST", "/v1/images/edits") | ("POST", "/images/edits") => {
                 let base = req.host.as_deref().map(|h| format!("http://{h}")).unwrap_or_default();
                 let r = edit_body(&req).map_err(|m| (400u16, m)).and_then(|(body, pics)| self.generate(&body, &base, pics));
@@ -261,7 +278,9 @@ impl ImageServer {
 
     /// The page: index.html with the stylesheet inlined (H3's server does the same)
     fn page(&self, s: &mut Conn, cors: &str) {
-        let dir = self.wfe.as_ref().expect("checked by the route").join("image");
+        // a model that reads pictures gets the OCR page
+        let reads = self.engine.lock().map(|g| g.as_ref().is_some_and(|(e, _)| e.reads())).unwrap_or(false);
+        let dir = self.wfe.as_ref().expect("checked by the route").join(if reads { "ocr" } else { "image" });
         match (std::fs::read_to_string(dir.join("index.html")), std::fs::read_to_string(dir.join("style.css"))) {
             (Ok(h), Ok(c)) => http::respond_bytes(s, 200, "text/html; charset=utf-8", h.replace("__CSS__", &c).as_bytes(),
                                                   &format!("{cors}Cache-Control: no-cache\r\n")),
@@ -301,15 +320,16 @@ impl ImageServer {
 
     fn info(&self) -> Value {
         let g = self.engine.lock();
-        let (arch, d, edits, loaded, samplers, schedules, guidance, opts) = match g.as_ref().ok().and_then(|g| {
-            g.as_ref().map(|(e, l)| (e.arch(), e.defaults(), e.edits(), l.clone(), e.samplers(), e.schedules(), e.guidance(), e.options()))
+        let (arch, d, edits, loaded, samplers, schedules, guidance, opts, reads) = match g.as_ref().ok().and_then(|g| {
+            g.as_ref().map(|(e, l)| (e.arch(), e.defaults(), e.edits(), l.clone(), e.samplers(), e.schedules(), e.guidance(), e.options(), e.reads()))
         }) {
             Some(x) => x,
             None => return json!({"model": self.model, "loading": true}),
         };
         drop(g);
         json!({
-            "model": self.model, "arch": arch, "edits": edits, "guidance": guidance, "max_pictures": MAX_PICTURES,
+            "model": self.model, "arch": arch, "edits": edits, "reads": reads, "guidance": guidance, "max_pictures": MAX_PICTURES,
+            "max_pages": MAX_PAGES,
             "defaults": {"width": d.width, "height": d.height, "steps": d.steps, "cfg": d.cfg, "sampler": d.sampler.name(),
                          "schedule": d.schedule.name(), "shift": d.shift},
             "samplers": samplers.iter().map(|s| s.name()).collect::<Vec<_>>(),
@@ -356,6 +376,80 @@ impl ImageServer {
             }
         }
         Ok(Some(out))
+    }
+
+    /// A reading (an OCR model): the pages decoded, read one request at a time, the text so far in the progress
+    fn ocr(&self, b: &Value) -> Result<Value, (u16, String)> {
+        let bad = |m: String| (400u16, m);
+        if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model) {
+            return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
+        }
+        let list: Vec<&str> = match (&b["images"], &b["image"]) {
+            (Value::Array(a), _) => a.iter().filter_map(Value::as_str).collect(),
+            (_, Value::String(s)) => vec![s.as_str()],
+            _ => Vec::new(),
+        };
+        if list.is_empty() {
+            return Err(bad("images: one or more pages (base64 or data: URLs)".into()));
+        }
+        if list.len() > MAX_PAGES {
+            return Err(bad(format!("{} pages: at most {MAX_PAGES} a request", list.len())));
+        }
+        let mut pages = Vec::with_capacity(list.len());
+        for (i, s) in list.iter().enumerate() {
+            let bytes = http::unbase64(s).map_err(|e| bad(format!("images[{i}]: {e}")))?;
+            pages.push(nextsycl_image::Picture::decode(&bytes).map_err(|e| bad(format!("images[{i}]: {e}")))?);
+        }
+        let prompt = b["prompt"].as_str().unwrap_or("").to_string();
+        let req = nextsycl_image::OcrRequest {
+            pages,
+            prompt: prompt.clone(),
+            tiles: b["tiles"].as_bool(),
+            max_tokens: b["max_tokens"].as_u64().unwrap_or(0) as u32,
+            ngram: b["ngram"].as_u64().map(|v| v as u32),
+            ngram_window: b["ngram_window"].as_u64().map(|v| v as u32),
+            temperature: b["temperature"].as_f64().unwrap_or(0.0) as f32,
+            seed: b["seed"].as_u64().unwrap_or(0),
+            extra: Default::default(),
+        };
+        let n_pages = req.pages.len();
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let g = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        let (engine, _) = g.as_ref().ok_or((503, "the engine is not loaded".to_string()))?;
+        if !engine.reads() {
+            return Err(bad(format!("{} makes pictures; it does not read them (an OCR model does)", self.model)));
+        }
+        let t0 = Instant::now();
+        let j0 = self.tele.joules();
+        let p = &self.progress;
+        *p.lock().unwrap() = json!({"busy": true, "reading": true, "pages": n_pages, "prompt": prompt, "text": "", "tokens": 0, "seconds": 0});
+        let mut text = String::new();
+        let mut pieces = 0u64;
+        let out = engine.ocr(&req, &mut |t| {
+            text.push_str(t);
+            pieces += 1;
+            // the page polls this: the text so far, about a token a piece
+            if pieces.is_multiple_of(4) {
+                *p.lock().unwrap() = json!({"busy": true, "reading": true, "pages": n_pages, "prompt": prompt, "text": text, "tokens": pieces,
+                                            "seconds": t0.elapsed().as_secs_f64()});
+            }
+        });
+        *p.lock().unwrap() = json!({"busy": false});
+        let out = out.map_err(|e| (400u16, e.0))?;
+        let seconds = t0.elapsed().as_secs_f64();
+        let wh = match (j0, self.tele.joules()) {
+            (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
+            _ => None,
+        };
+        let tok_s = out.tokens as f64 / out.seconds.max(1e-9);
+        let read_tok_s = out.prompt_tokens as f64 / out.prompt_seconds.max(1e-9);
+        let mut h = self.history.lock().unwrap();
+        h.push_front(json!({"kind": "ocr", "prompt": prompt, "pages": n_pages, "text": out.text, "tokens": out.tokens, "prompt_tokens": out.prompt_tokens,
+                            "seconds": seconds, "tok_s": tok_s, "wh": wh, "created": now()}));
+        h.truncate(50);
+        Ok(json!({"created": now(), "model": self.model, "text": out.text, "pages": n_pages, "tokens": out.tokens, "prompt_tokens": out.prompt_tokens,
+                  "prompt_seconds": out.prompt_seconds, "read_tok_s": read_tok_s, "write_seconds": out.seconds, "tok_s": tok_s, "seconds": seconds, "wh": wh}))
     }
 
     fn generate(&self, b: &Value, base: &str, pics: Vec<nextsycl_image::Picture>) -> Result<Value, (u16, String)> {

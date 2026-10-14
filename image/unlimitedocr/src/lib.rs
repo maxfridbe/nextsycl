@@ -1,0 +1,318 @@
+//! Unlimited-OCR (baidu/Unlimited-OCR, the DeepSeek-OCR architecture): pages in, their text out - as Markdown and HTML
+//! tables, with boxes when asked (`<|grounding|>`). From two GGUFs: the decoder (`deepseek2-ocr`, any of its quants)
+//! and the projector (`mmproj-*`, F16: SAM-B, CLIP-L and the linear into the decoder). Checked stage by stage against
+//! llama.cpp (`check`); the reading follows the reference's `infer` / `infer_multi` (modeling_unlimitedocr.py):
+//!
+//! ```text
+//!   [BOS] <image tokens> <prompt>   (the plain template: "<image>" + the instruction)
+//!   image tokens: the tiles' (one picture, a side over 640), each page's global view, the view separator - prep.rs
+//!   then greedy (or sampled) tokens, no 35-gram repeated within the last 128 tokens (1024 for several pages),
+//!   until the end of sentence
+//! ```
+
+pub mod check;
+pub mod decoder;
+mod ffi;
+pub mod prep;
+pub mod vision;
+
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use nextsycl_core::{DevBuf, Gpu};
+use nextsycl_diffusion::kernels::Nsd;
+use nextsycl_gguf::Gguf;
+use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, OcrOutput, OcrRequest, Picture, Result, Sampler,
+                     Schedule, Step};
+use nextsycl_tok::Tokenizer;
+use vision::CopyF;
+
+/// The architecture (the decoder GGUF's general.architecture; a registry entry may say either)
+pub const ARCH: &str = "unlimited-ocr";
+pub const ARCHS: &[&str] = &[ARCH, "deepseek2-ocr"];
+/// Its files: the decoder and the projector
+pub const ROLES: &[&str] = &["model", "mmproj"];
+/// The reference's image token and the instruction it is trained on
+pub const IMAGE_TOKEN: u32 = 128815;
+pub const DEFAULT_PROMPT: &str = "document parsing.";
+pub const NGRAM: u32 = 35;
+pub const NGRAM_WINDOW: u32 = 128;
+pub const NGRAM_WINDOW_PAGES: u32 = 1024;
+pub const MAX_TOKENS: u32 = 8192;
+/// the global view's patch rows (1024 / 16 / 4) and a tile's (640 / 16 / 4)
+const GQ: usize = 16;
+const TQ: usize = 10;
+
+pub fn kind() -> ImageKind {
+    ImageKind { archs: ARCHS, name: "Unlimited-OCR (pages to Markdown: SAM-B + CLIP-L vision, a DeepSeek-V2 MoE decoder)", roles: ROLES, load, options: &[] }
+}
+
+fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], _o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn ImageEngine>> {
+    let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?;
+    Ok(Box::new(UnlimitedOcr::load(files, gpu, log)?))
+}
+
+pub struct UnlimitedOcr {
+    pub nsd: Nsd,
+    pub vision: vision::Vision,
+    pub decoder: decoder::Decoder,
+    pub tok: Tokenizer,
+    eos: u32,
+    load_s: f64,
+    /// one reading at a time
+    work: Mutex<()>,
+}
+
+/// Python's no-repeat rule (SlidingWindowNoRepeatNgramProcessor): the tokens that would complete an n-gram already in
+/// the window's last `window` tokens of `seq`
+fn banned(seq: &[u32], n: usize, window: usize) -> Vec<u32> {
+    if n == 0 || seq.len() < n {
+        return Vec::new();
+    }
+    let start = seq.len().saturating_sub(window);
+    let end = seq.len() + 1 - n;
+    if end <= start {
+        return Vec::new();
+    }
+    let prefix = &seq[seq.len() - (n - 1)..];
+    let mut out: Vec<u32> = (start..end).filter(|&i| &seq[i..i + n - 1] == prefix).map(|i| seq[i + n - 1]).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// A small generator for sampling (splitmix64)
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> f64 {
+        self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+fn pick(logits: &mut [f32], ban: &[u32], temperature: f32, rng: &mut Rng) -> u32 {
+    for b in ban {
+        if let Some(v) = logits.get_mut(*b as usize) {
+            *v = f32::NEG_INFINITY;
+        }
+    }
+    if temperature <= 0.0 {
+        // the first of the largest (torch.argmax)
+        let mut best = 0;
+        for (i, v) in logits.iter().enumerate() {
+            if *v > logits[best] {
+                best = i;
+            }
+        }
+        return best as u32;
+    }
+    let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let p: Vec<f64> = logits.iter().map(|v| (((v - mx) / temperature) as f64).exp()).collect();
+    let mut r = rng.next() * p.iter().sum::<f64>();
+    for (i, v) in p.iter().enumerate() {
+        r -= v;
+        if r <= 0.0 {
+            return i as u32;
+        }
+    }
+    (p.len() - 1) as u32
+}
+
+impl UnlimitedOcr {
+    pub fn load(files: &ModelFiles, gpu: &Arc<Gpu>, log: &mut dyn FnMut(String)) -> Result<UnlimitedOcr> {
+        let t0 = Instant::now();
+        let path = |r: &str| files.get(r).ok_or_else(|| Error(format!("{ARCH}: no {r} file")));
+        let fm = Gguf::open(path("model")?).map_err(|e| Error(e.0))?;
+        if fm.architecture() != "deepseek2-ocr" {
+            return Err(Error(format!("{}: a {} model, not deepseek2-ocr", path("model")?.display(), fm.architecture())));
+        }
+        let fp = Gguf::open(path("mmproj")?).map_err(|e| Error(e.0))?;
+        let nsd = Nsd::new(gpu)?;
+        let tok = Tokenizer::from_gguf(&fm).map_err(Error)?;
+        let eos = fm.meta("tokenizer.ggml.eos_token_id").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+        let vision = vision::Vision::load(&fp, gpu, log)?;
+        let decoder = decoder::Decoder::load(&fm, gpu, &nsd, log)?;
+        let load_s = t0.elapsed().as_secs_f64();
+        log(format!("unlimitedocr: loaded on {} in {load_s:.1} s", gpu.name));
+        Ok(UnlimitedOcr { nsd, vision, decoder, tok, eos, load_s, work: Mutex::new(()) })
+    }
+
+    /// The prompt's tokens: [BOS], the text before the image, `n_image` image tokens, the text after
+    pub fn prompt_tokens(&self, prompt: &str, n_image: usize) -> Vec<u32> {
+        let p = if prompt.contains("<image>") { prompt.to_string() } else { format!("<image>{prompt}") };
+        let (before, after) = p.split_once("<image>").unwrap_or(("", &p));
+        let mut ids = vec![0u32];
+        ids.extend(self.tok.encode(before));
+        ids.extend(std::iter::repeat_n(IMAGE_TOKEN, n_image));
+        ids.extend(self.tok.encode(after));
+        ids
+    }
+
+    /// The pages' image tokens [n][1280] on the GPU, in the reference's order (prep.rs); `tap` sees the vision stages
+    pub fn image_tokens(&self, seen: &prep::Seen, tap: &mut dyn FnMut(&str, &DevBuf) -> nextsycl_core::Result<()>) -> Result<(DevBuf, usize)> {
+        let e = vision::OUT;
+        let (gw, gh) = (seen.grid.0 as usize, seen.grid.1 as usize);
+        let n_tiles = if seen.tiles.is_empty() { 0 } else { (TQ * gw + 1) * TQ * gh };
+        let n = n_tiles + seen.globals.len() * ((GQ + 1) * GQ + 1);
+        let gpu = &self.nsd.gpu;
+        let out = DevBuf::f32(gpu, n * e)?;
+        let nl = DevBuf::from_f32(gpu, &self.vision.newline)?;
+        let sep = DevBuf::from_f32(gpu, &self.vision.separator)?;
+        let mut row = 0usize;
+        if !seen.tiles.is_empty() {
+            // the tiles a few at a time (memory), then woven: a tile row's patch rows side by side, a newline each
+            let mut feats = Vec::new();
+            for chunk in seen.tiles.chunks(8) {
+                let planes: Vec<f32> = chunk.iter().flat_map(|v| v.planes.iter().copied()).collect();
+                feats.push(self.vision.see(&self.nsd, &planes, chunk.len(), prep::TILE as usize, tap)?);
+            }
+            let tile = |i: usize| (&feats[i / 8], (i % 8) * TQ * TQ);
+            for r in 0..gh {
+                for y in 0..TQ {
+                    for c in 0..gw {
+                        let (buf, base) = tile(r * gw + c);
+                        out.copy_within_f(row * e, buf, (base + y * TQ) * e, TQ * e)?;
+                        row += TQ;
+                    }
+                    out.copy_within_f(row * e, &nl, 0, e)?;
+                    row += 1;
+                }
+            }
+        }
+        for v in &seen.globals {
+            let f = self.vision.see(&self.nsd, &v.planes, 1, prep::BASE as usize, tap)?;
+            for y in 0..GQ {
+                out.copy_within_f(row * e, &f, y * GQ * e, GQ * e)?;
+                row += GQ;
+                out.copy_within_f(row * e, &nl, 0, e)?;
+                row += 1;
+            }
+            out.copy_within_f(row * e, &sep, 0, e)?;
+            row += 1;
+        }
+        debug_assert_eq!(row, n);
+        Ok((out, n))
+    }
+
+    /// The prompt's embeddings: the text's rows, the image tokens' rows from `img`
+    pub fn embed(&self, ids: &[u32], img: &DevBuf) -> Result<DevBuf> {
+        let e = vision::OUT;
+        let text: Vec<u32> = ids.iter().map(|&t| if t == IMAGE_TOKEN { 0 } else { t }).collect();
+        let x = self.decoder.embed(&self.nsd, &text)?;
+        let mut k = 0usize;
+        let mut i = 0usize;
+        while i < ids.len() {
+            if ids[i] == IMAGE_TOKEN {
+                let j = (i..ids.len()).find(|&j| ids[j] != IMAGE_TOKEN).unwrap_or(ids.len());
+                x.copy_within_f(i * e, img, k * e, (j - i) * e)?;
+                k += j - i;
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        Ok(x)
+    }
+
+    /// A reading: see the pages, read the prompt, write until the end (or max tokens), each piece to `text`
+    pub fn read(&self, req: &OcrRequest, text: &mut dyn FnMut(&str)) -> Result<OcrOutput> {
+        let _w = self.work.lock().unwrap();
+        let t0 = Instant::now();
+        if req.pages.is_empty() {
+            return Err(Error("no pages to read".into()));
+        }
+        let several = req.pages.len() > 1;
+        let seen = prep::see(&req.pages, req.tiles.unwrap_or(true));
+        let (img, n_img) = self.image_tokens(&seen, &mut |_, _| Ok(()))?;
+        let prompt = if req.prompt.trim().is_empty() { DEFAULT_PROMPT } else { req.prompt.as_str() };
+        let ids = self.prompt_tokens(prompt, n_img);
+        let x = self.embed(&ids, &img)?;
+        drop(img);
+        let mut cache = self.decoder.cache(ids.len())?;
+        let mut logits = self.decoder.pass(&self.nsd, &mut cache, &x, ids.len(), &mut |_, _| Ok(()))?;
+        let prompt_seconds = t0.elapsed().as_secs_f64();
+        let n = req.ngram.unwrap_or(NGRAM) as usize;
+        let window = req.ngram_window.unwrap_or(if several { NGRAM_WINDOW_PAGES } else { NGRAM_WINDOW }) as usize;
+        let max = if req.max_tokens == 0 { MAX_TOKENS } else { req.max_tokens } as usize;
+        let mut seq = ids.clone();
+        let mut out_ids: Vec<u32> = Vec::new();
+        let mut shown = 0usize;
+        let mut rng = Rng(req.seed ^ 0x6f63725f);
+        let t1 = Instant::now();
+        while out_ids.len() < max {
+            let ban = banned(&seq, n, window);
+            let next = pick(&mut logits, &ban, req.temperature, &mut rng);
+            if next == self.eos {
+                break;
+            }
+            seq.push(next);
+            out_ids.push(next);
+            // the text so far, up to its last whole character
+            let bytes = self.tok.decode_bytes(&out_ids);
+            let valid = match std::str::from_utf8(&bytes) {
+                Ok(s) => s.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            if valid > shown {
+                text(std::str::from_utf8(&bytes[shown..valid]).unwrap_or(""));
+                shown = valid;
+            }
+            if out_ids.len() == max {
+                break;
+            }
+            cache.written += 1;
+            let xe = self.decoder.embed(&self.nsd, &[next])?;
+            logits = self.decoder.pass(&self.nsd, &mut cache, &xe, 1, &mut |_, _| Ok(()))?;
+        }
+        let all = String::from_utf8_lossy(&self.tok.decode_bytes(&out_ids)).into_owned();
+        if all.len() > shown {
+            text(&all[shown..]);
+        }
+        Ok(OcrOutput { text: all, prompt_tokens: ids.len() as u32, tokens: out_ids.len() as u32, prompt_seconds, seconds: t1.elapsed().as_secs_f64() })
+    }
+}
+
+impl ImageEngine for UnlimitedOcr {
+    fn arch(&self) -> &'static str {
+        ARCH
+    }
+    fn defaults(&self) -> Defaults {
+        Defaults { width: prep::BASE, height: prep::BASE, steps: 0, cfg: 1.0, sampler: Sampler::Euler, schedule: Schedule::Shift, shift: 1.0 }
+    }
+    fn guidance(&self) -> bool {
+        false
+    }
+    fn load_seconds(&self) -> f64 {
+        self.load_s
+    }
+    fn generate(&self, _req: &ImageRequest, _progress: &mut dyn FnMut(Step)) -> Result<Vec<Picture>> {
+        Err(Error(format!("{ARCH} reads pages; it does not make pictures (image.ocr)")))
+    }
+    fn reads(&self) -> bool {
+        true
+    }
+    fn ocr(&self, req: &OcrRequest, text: &mut dyn FnMut(&str)) -> Result<OcrOutput> {
+        self.read(req, text)
+    }
+    fn report(&self) -> Vec<String> {
+        vec![format!("{ARCH}: decoder {} layers, {:.1} GiB of weights read, on {}", self.decoder.g.layers, self.decoder.loaded_bytes as f64 / (1u64 << 30) as f64,
+                     self.nsd.gpu.name)]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ngram_bans_the_repeat() {
+        // 3-grams: "1 2 3" seen; the tail "1 2" would repeat it with 3
+        let seq = [1, 2, 3, 4, 1, 2];
+        assert_eq!(banned(&seq, 3, 128), vec![3]);
+        assert!(banned(&seq, 3, 2).is_empty());
+        assert!(banned(&seq, 0, 128).is_empty());
+    }
+}

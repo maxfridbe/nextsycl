@@ -106,18 +106,36 @@ fn lanczos(x: f64) -> f64 {
     if x.abs() < 3.0 { sinc(x) * sinc(x / 3.0) } else { 0.0 }
 }
 
-/// PIL's 8-bit resampling coefficients for one axis (ImagingResample: support 3 x the scale when shrinking, fixed point
-/// with 22 fraction bits): for each output position its first input index and weights
+/// PIL's bicubic kernel (a = -0.5)
+fn bicubic(x: f64) -> f64 {
+    const A: f64 = -0.5;
+    let x = x.abs();
+    if x < 1.0 {
+        ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
+    } else if x < 2.0 {
+        (((x - 5.0) * x + 8.0) * x - 4.0) * A
+    } else {
+        0.0
+    }
+}
+
+/// PIL's 8-bit resampling coefficients for one axis (ImagingResample, Lanczos-3), see `coeffs_with`
 fn coeffs(inp: usize, out: usize) -> Vec<(usize, Vec<i64>)> {
+    coeffs_with(inp, out, 3.0, lanczos)
+}
+
+/// PIL's 8-bit resampling coefficients for one axis (ImagingResample: the filter's support x the scale when shrinking,
+/// fixed point with 22 fraction bits): for each output position its first input index and weights
+fn coeffs_with(inp: usize, out: usize, filter_support: f64, filter: fn(f64) -> f64) -> Vec<(usize, Vec<i64>)> {
     const BITS: u32 = 22;
     let scale = inp as f64 / out as f64;
     let fs = scale.max(1.0);
-    let support = 3.0 * fs;
+    let support = filter_support * fs;
     (0..out).map(|xx| {
         let center = (xx as f64 + 0.5) * scale;
         let xmin = ((center - support + 0.5) as i64).max(0) as usize;
         let xmax = ((center + support + 0.5) as i64).min(inp as i64) as usize - xmin;
-        let w: Vec<f64> = (0..xmax).map(|x| lanczos((x as f64 + xmin as f64 - center + 0.5) / fs)).collect();
+        let w: Vec<f64> = (0..xmax).map(|x| filter((x as f64 + xmin as f64 - center + 0.5) / fs)).collect();
         let total: f64 = w.iter().sum();
         let k = w.iter().map(|v| {
             let v = if total != 0.0 { v / total } else { *v } * (1u64 << BITS) as f64;
@@ -131,6 +149,16 @@ impl Picture {
     /// Resized to `w` x `h` as PIL's Image.resize with LANCZOS does it (8 bits a channel: the horizontal pass first,
     /// rounded to bytes, then the vertical one)
     pub fn resize_lanczos(&self, w: u32, h: u32) -> Picture {
+        self.resample(w, h, coeffs)
+    }
+
+    /// Resized to `w` x `h` as PIL's Image.resize with BICUBIC does it (its default: what ImageOps.pad and a plain
+    /// resize use) - the same passes as `resize_lanczos`
+    pub fn resize_bicubic(&self, w: u32, h: u32) -> Picture {
+        self.resample(w, h, |i, o| coeffs_with(i, o, 2.0, bicubic))
+    }
+
+    fn resample(&self, w: u32, h: u32, coeffs: impl Fn(usize, usize) -> Vec<(usize, Vec<i64>)>) -> Picture {
         let (iw, ih, c) = (self.width as usize, self.height as usize, self.channels as usize);
         let (w, h) = (w as usize, h as usize);
         if (w, h) == (iw, ih) {

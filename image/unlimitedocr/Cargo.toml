@@ -1,0 +1,13 @@
+[package]
+name = "nextsycl-image-unlimitedocr"
+description = "Unlimited-OCR (Baidu's DeepSeek-OCR successor): SAM-B + CLIP-L vision, a DeepSeek-V2 MoE decoder that reads pages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-image.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true

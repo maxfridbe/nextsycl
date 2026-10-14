@@ -1,0 +1,23 @@
+# Unlimited-OCR Q8_0 (pages to Markdown)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: unlimited-ocr-q8
+kind: image
+arch: unlimited-ocr
+title: Unlimited-OCR Q8_0 (pages to Markdown)
+about: 'Baidu''s Unlimited-OCR (the DeepSeek-OCR architecture, MIT): a SAM-B + CLIP-L vision encoder (F16) and a 3B DeepSeek-V2 MoE decoder (64 experts, 6 a token) that reads whole pages into Markdown, tables as HTML, boxes on request; long pages in fixed memory (the last 128 tokens written attend); GGUF by sahilchachra; 2.9 GiB + 0.8'
+gpus: '0'
+env: {}
+files:
+  model:
+    key: uocr-q8
+    url: https://huggingface.co/sahilchachra/Unlimited-OCR-GGUF/resolve/0dc781d8a23f52963918ebd5b2d1b9fe61504661/Unlimited-OCR-Q8_0.gguf
+    size: 3126139904
+    sha256: 234c36f679a3768f5564e9e02c2c1deacbd5677b9c8558a57133f1813f6dd3b8
+    path: unlimited-ocr/Unlimited-OCR-Q8_0.gguf
+  mmproj:
+    key: uocr-mmproj-f16
+    url: https://huggingface.co/sahilchachra/Unlimited-OCR-GGUF/resolve/0dc781d8a23f52963918ebd5b2d1b9fe61504661/mmproj-Unlimited-OCR-F16.gguf
+    size: 811876448
+    sha256: 4f28c295e1fcf67a97488e356f2b4372da4702b77fdfad0fa138b5821325743c
+    path: unlimited-ocr/mmproj-Unlimited-OCR-F16.gguf
+guide: guides/unlimited-ocr.md
