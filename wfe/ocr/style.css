@@ -127,7 +127,12 @@ body{max-width:1280px}
 .chip.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
 #go{min-width:200px}
 #go .i{color:inherit}
-.drop{border:2px dashed #2a2f3a;border-radius:10px;padding:14px;margin:6px 0;text-align:center;color:#9ca3af;cursor:pointer;transition:border-color .15s,background .15s}
+.drop{display:block;position:relative;border:2px dashed #2a2f3a;border-radius:10px;padding:14px;margin:6px 0;text-align:center;color:#9ca3af;cursor:pointer;transition:border-color .15s,background .15s}
+.drop:active{background:#141c2e}
+/* the file inputs: out of sight but in the page (a tap on their label opens them) */
+input.pick{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;pointer-events:none}
+label.camera{display:none;position:relative;margin:4px 0 0;padding:10px 14px;font-size:14px;text-align:center}
+@media (pointer:coarse){label.camera{display:block}}
 .drop.over{border-color:#3b82f6;background:#141c2e}
 .pages{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin:10px 0 0}
 figure.page{margin:0;background:#181b22;border:1px solid #2a2f3a;border-radius:8px;overflow:hidden}

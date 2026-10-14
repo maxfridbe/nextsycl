@@ -7,6 +7,10 @@ import type { Page } from "./types.js";
 export async function addFiles(files: FileList | File[]): Promise<void> {
   const max = state.info?.max_pages ?? 24;
   for (const f of Array.from(files as ArrayLike<File>)) {
+    if (/heic|heif/i.test(f.type) || /\.(heic|heif)$/i.test(f.name)) {
+      state.error = `${f.name}: HEIC is not read - share it as JPEG (or set the camera to "Most Compatible")`;
+      continue;
+    }
     if (!f.type.startsWith("image/")) {
       state.error = `${f.name}: a picture is needed (PNG, JPEG, WebP) - export a PDF's pages as pictures`;
       continue;

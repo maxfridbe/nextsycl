@@ -5,7 +5,6 @@ import { addFiles, movePage, read, removePage } from "../actions.js";
 import { PRESETS, render, saveForm, state } from "../state.js";
 import type { Form } from "../types.js";
 import { clamp } from "../util.js";
-import type { VNode } from "../../../vendor/snabbdom/vnode.js";
 
 function set<K extends keyof Form>(k: K, v: Form[K]): void {
   state.form[k] = v;
@@ -13,41 +12,48 @@ function set<K extends keyof Form>(k: K, v: Form[K]): void {
   render();
 }
 
-function Drop() {
-  let input: HTMLInputElement | null = null;
+/** A file input inside a label: a tap on the label opens the phone's picker (or camera) natively - no scripted
+ *  click, which mobile browsers may refuse. The input itself is kept out of sight, not out of the page. */
+function Picker(props: { camera?: boolean }) {
   return (
-    <div
-      class={{ drop: true, over: state.dragging }}
+    <input
+      class="pick"
+      attrs={{ type: "file", accept: "image/png,image/jpeg,image/webp", multiple: !props.camera, ...(props.camera ? { capture: "environment" } : {}) }}
       on={{
-        click: () => input?.click(),
-        dragover: (e: DragEvent) => {
-          e.preventDefault();
-          if (!state.dragging) { state.dragging = true; render(); }
-        },
-        dragleave: () => { state.dragging = false; render(); },
-        drop: (e: DragEvent) => {
-          e.preventDefault();
-          state.dragging = false;
-          if (e.dataTransfer?.files.length) void addFiles(e.dataTransfer.files);
-          render();
+        change: (e: Event) => {
+          const t = e.target as HTMLInputElement;
+          if (t.files) void addFiles(t.files);
+          t.value = "";
         },
       }}
-    >
-      <span class="i" props={{ innerHTML: "&#xf093;" }} /> Drop page pictures here, click to choose, or paste - PNG, JPEG, WebP; several pages are read
-      as one document, in this order
-      <input
-        attrs={{ type: "file", accept: "image/png,image/jpeg,image/webp", multiple: true }}
-        style={{ display: "none" }}
-        hook={{ insert: (v: VNode) => { input = v.elm as HTMLInputElement; } }}
+    />
+  );
+}
+
+function Drop() {
+  return (
+    <div>
+      <label
+        class={{ drop: true, over: state.dragging }}
         on={{
-          click: (e: Event) => e.stopPropagation(),
-          change: (e: Event) => {
-            const t = e.target as HTMLInputElement;
-            if (t.files) void addFiles(t.files);
-            t.value = "";
+          dragover: (e: DragEvent) => {
+            e.preventDefault();
+            if (!state.dragging) { state.dragging = true; render(); }
+          },
+          dragleave: () => { state.dragging = false; render(); },
+          drop: (e: DragEvent) => {
+            e.preventDefault();
+            state.dragging = false;
+            if (e.dataTransfer?.files.length) void addFiles(e.dataTransfer.files);
+            render();
           },
         }}
-      />
+      >
+        <Picker />
+        <span class="i" props={{ innerHTML: "&#xf093;" }} /> Tap or click to choose page pictures - or drop or paste them (PNG, JPEG,
+        WebP); several pages are read as one document, in this order
+      </label>
+      <label class="tbtn camera"><Picker camera={true} /><span class="i" props={{ innerHTML: "&#xf030;" }} /> Take a photo of a page</label>
     </div>
   );
 }
