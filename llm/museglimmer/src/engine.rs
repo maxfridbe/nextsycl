@@ -744,7 +744,8 @@ impl<'g> MuseGlimmer<'g> {
             self.file.read_into(&self.embd, *t as u64 * row as u64, &mut raw[i * row..(i + 1) * row]).map_err(|x| e(x.0))?;
         }
         let src = self.arena().bytes(raw.len())?;
-        src.write(0, &raw)?;
+        // in queue order through the pinned upload ring (no wait for the GPU; a prompt chunk's rows wait)
+        src.write_async(0, &raw)?;
         let x = self.arena().f32(tokens.len() * g.n_embd)?;
         // SAFETY: the rows' blocks -> float32.
         self.op("dequant", || unsafe { (self.k.dequant)(self.raw(), self.embd.ty.code() as i32, src.ptr(), tokens.len() * g.n_embd, x.fp()) })?;
@@ -1181,10 +1182,17 @@ impl<'g> MuseGlimmer<'g> {
                 self.op("draft kv store", || (k.kv_store)(self.raw(), kx.fp(), vx.fp(), rows as i64, d.heads_kv as i64, g.head as i64, *cap as i64, n as i64,
                                                           kc.ptr(), vc.ptr()))?;
                 let win = d.window as i64;
-                let sc = (k.attn_scratch)(rows as i64, d.heads as i64, d.heads_kv as i64, g.head as i64, n as i64, win, 0) as usize;
-                let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
-                self.op("draft attention", || (k.attn)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), rows as i64, d.heads as i64, d.heads_kv as i64, g.head as i64,
-                                                       *cap as i64, n as i64, win, 0, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+                if d.heads == 4 * d.heads_kv {
+                    // the silo's flash kernel on XMX, not causal, split over the keys
+                    let part = self.arena().f32((sl.attn_block_scratch)(rows as i64, d.heads as i64, d.heads_kv as i64, g.head as i64, n as i64, win) as usize)?;
+                    self.op("draft attention silo", || (sl.attn_block)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), rows as i64, d.heads as i64, d.heads_kv as i64,
+                                                                       g.head as i64, *cap as i64, n as i64, win, att.fp(), part.fp()))?;
+                } else {
+                    let sc = (k.attn_scratch)(rows as i64, d.heads as i64, d.heads_kv as i64, g.head as i64, n as i64, win, 0) as usize;
+                    let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
+                    self.op("draft attention", || (k.attn)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), rows as i64, d.heads as i64, d.heads_kv as i64, g.head as i64,
+                                                           *cap as i64, n as i64, win, 0, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+                }
             }
             let o = self.arena().f32(rows * ne)?;
             self.matmul(&dl.o, &att, None, rows, &o)?;

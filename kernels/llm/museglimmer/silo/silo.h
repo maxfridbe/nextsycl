@@ -50,6 +50,11 @@ int ns_mg_attn_decode_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t D);
 int64_t ns_mg_attn_decode_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0, int64_t win);
 int ns_mg_attn_decode(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
                       int64_t win, float* out, float* scratch);
+/* The DFlash drafter's block attention (the same kernel, not causal: every row sees to the block's last; 4 query heads a
+ * key head), split over the keys and merged through `scratch` (ns_mg_attn_block_scratch floats) */
+int64_t ns_mg_attn_block_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0, int64_t win);
+int ns_mg_attn_block(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
+                     int64_t win, float* out, float* scratch);
 /* Repacked Q8_0 rows expanded to half (a prompt pass's GEMMs): dst [rows, n_in] */
 int ns_mg_q8r_f16(ns_gpu* g, const void* wq, const void* ws, int64_t rows, int64_t n_in, uint16_t* dst);
 

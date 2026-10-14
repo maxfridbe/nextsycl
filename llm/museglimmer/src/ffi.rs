@@ -119,6 +119,8 @@ pub struct Silo {
     pub attn_prompt_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
     pub attn_prompt: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32) -> c_int,
     pub attn_decode_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
+    pub attn_block_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
+    pub attn_block: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
     pub attn_decode_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
     pub attn_decode: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
 }
@@ -159,6 +161,8 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             attn_prompt_supported: sym!("ns_mg_attn_prompt_supported"),
             attn_prompt: sym!("ns_mg_attn_prompt"),
             attn_decode_supported: sym!("ns_mg_attn_decode_supported"),
+            attn_block_scratch: sym!("ns_mg_attn_block_scratch"),
+            attn_block: sym!("ns_mg_attn_block"),
             attn_decode_scratch: sym!("ns_mg_attn_decode_scratch"),
             attn_decode: sym!("ns_mg_attn_decode"),
         }))

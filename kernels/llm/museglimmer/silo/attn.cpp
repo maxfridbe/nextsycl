@@ -53,7 +53,7 @@ struct Slm {
 // units, sum) into `part` [T][Hq][ns][D + 2], merged after. A row's splits and the arithmetic in them do not depend on
 // the other rows (the DPAS rows are independent, a row masks its own keys; a split with none of its keys leaves an
 // empty partial the merge adds as zeros): a verify row is its one-row pass's, bit for bit.
-template <int G, bool SPLIT>
+template <int G, bool SPLIT, bool CAUSAL = true>
 void attn_flash(sycl::queue& queue, const float* q, const half* kc, const half* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap, int64_t p0,
                 int64_t win, float* out, int64_t kbs, int64_t sp0, int64_t ns, float* part) {
     constexpr int NSG = 2 * G, WG = NSG * SG;
@@ -82,7 +82,8 @@ void attn_flash(sycl::queue& queue, const float* q, const half* kc, const half* 
             half* qh = (half*) base;
             // the block's keys: from the first row's first to the last row's last (rows past T take the last valid row)
             const int64_t rl = sycl::min(r0 + M, T) - 1;
-            int64_t jend = p0 + rl + 1;
+            // causal: to the block's last row; not (the DFlash drafter's noise block): to the pass's last row
+            int64_t jend = CAUSAL ? p0 + rl + 1 : p0 + T;
             int64_t jbeg = win > 0 ? sycl::max<int64_t>(0, p0 + r0 - win + 1) : 0;
             if constexpr (SPLIT) {
                 // this split's keys (the block's rows mask their own)
@@ -170,7 +171,7 @@ void attn_flash(sycl::queue& queue, const float* q, const half* kc, const half* 
                     for (int i = 0; i < CH / 4; ++i) {
                         const int n = part * (CH / 4) + i;
                         const int64_t j = j0 + n;
-                        sv[i] = j <= pos && j >= first && j >= jbeg && j < jend ? s0[n] + s1[n] : -INFINITY;
+                        sv[i] = (!CAUSAL || j <= pos) && j >= first && j >= jbeg && j < jend ? s0[n] + s1[n] : -INFINITY;
                         mx = sycl::fmax(mx, sv[i]);
                     }
                     mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, 1));
@@ -275,6 +276,43 @@ inline int64_t row_first(int64_t pos, int64_t win) { return win > 0 ? sycl::max<
 }  // namespace
 
 extern "C" {
+
+// the drafter's noise block: rows p0 .. p0 + T - 1 each seeing max(0, pos - win + 1) .. p0 + T - 1, its 4 query heads a key
+// head; split over the keys as decode rows are, merged
+int ns_mg_attn_block(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh, int64_t cap, int64_t p0,
+                     int64_t win, float* out, float* scratch) {
+    NS_TRY
+    if (T < 1 || T > 16 || Dh != D || Hkv <= 0 || Hq != 4 * Hkv) return ns_fail("ns_mg_attn_block: 1..16 rows, heads of 128, 4 query heads a key head");
+    const int64_t need = win > 0 ? sycl::min(p0 + T, win + T - 1) : p0 + T;
+    if (need > cap) return ns_fail("ns_mg_attn_block: the cache's ring is shorter than the window and the block");
+    const int64_t groups = Hq / 4, first = row_first(p0, win), last = p0 + T - 1;
+    const int64_t kb = dec_kbs(last + 1 - first, groups), sp0 = first / kb, ns = last / kb - sp0 + 1;
+    if (!scratch) return ns_fail("ns_mg_attn_block: no scratch");
+    attn_flash<4, true, false>(g->q, q, (const half*) kc, (const half*) vc, T, Hq, Hkv, cap, p0, win, out, kb, sp0, ns, scratch);
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * Hq) * D), sycl::range<1>(D)), [=](sycl::nd_item<1> it) {
+        const int64_t rh = it.get_group(0), d = it.get_local_id(0);
+        const float* pr = scratch + rh * ns * (D + 2);
+        float mx = -INFINITY;
+        for (int64_t s2 = 0; s2 < ns; ++s2) mx = sycl::fmax(mx, pr[s2 * (D + 2) + D]);
+        float Ls = 0.0f, A = 0.0f;
+        if (mx != -INFINITY) {
+            for (int64_t s2 = 0; s2 < ns; ++s2) {
+                const float e = sycl::exp2(pr[s2 * (D + 2) + D] - mx);
+                Ls += pr[s2 * (D + 2) + D + 1] * e;
+                A += pr[s2 * (D + 2) + d] * e;
+            }
+        }
+        out[rh * D + d] = Ls > 0.0f ? A / Ls : 0.0f;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int64_t ns_mg_attn_block_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh, int64_t p0, int64_t win) {
+    const int64_t groups = Hq / 4, first = row_first(p0, win), last = p0 + T - 1;
+    const int64_t kb = dec_kbs(last + 1 - first, groups);
+    return T * Hq * (last / kb - first / kb + 1) * (Dh + 2);
+}
 
 int ns_mg_attn_decode_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh) {
     return T >= 1 && T <= 16 && Dh == D && Hkv > 0 && Hq == 16 * Hkv;
