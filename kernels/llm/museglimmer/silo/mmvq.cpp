@@ -186,7 +186,7 @@ int ns_mg_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* xq, 
     int8_t* oq = (int8_t*) xq;
     float* os = (float*) ((uint8_t*) xq + xq_scales(C));
     const int64_t nb = C / 32;
-    constexpr int W = 256, S = 32;
+    constexpr int W = 1024, S = 32;
     // a work-group a row: the sum of squares, then a sub-group a block at a time
     g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(S)]] {
         auto sg = it.get_sub_group();
@@ -217,7 +217,7 @@ int ns_mg_post_rms_xq(ns_gpu* g, const float* out, const float* wp, float ep, fl
     int8_t* oq = (int8_t*) xq;
     float* os = (float*) ((uint8_t*) xq + xq_scales(C));
     const int64_t nb = C / 32;
-    constexpr int W = 256, S = 32;
+    constexpr int W = 1024, S = 32;
     // a work-group a row: out's sum of squares, x updated (each work-item its own elements), x's sum of squares, then
     // a sub-group a block at a time (x read back after the barrier: its elements were other work-items')
     g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(S)]] {
