@@ -14,7 +14,7 @@ nextsycl image gen \"<prompt>\" [--model ID] [--size WxH | --aspect W:H] [--step
 nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora NAME[:SCALE]]... [--set NAME=VALUE]...
                      [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl image start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
-nextsycl image ocr PICTURE... [--model ID|FILE.gguf] [--prompt TEXT] [--no-tiles] [--no-figures] [--max N] [--temp T] [--out FILE] [--gpu N] [--dump-views DIR]
+nextsycl image ocr PICTURE|PDF... [--one-pass] [--model ID|FILE.gguf] [--prompt TEXT] [--no-tiles] [--no-figures] [--max N] [--temp T] [--out FILE] [--gpu N] [--dump-views DIR]
 nextsycl image check <dump dir> [--model ID|FILE.gguf] [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--tokens N] [--gpu N]
 nextsycl image engines | selftest [--gpu N]";
 
@@ -140,9 +140,16 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
 
 /// `nextsycl image ocr PICTURE...`: the pages read here (an OCR model), the text streamed to stdout (and --out)
 fn ocr(cfg: &Config, args: &[String]) -> Result<(), String> {
-    let pages: Vec<nextsycl_image::Picture> = args.iter().take_while(|a| !a.starts_with("--"))
-        .map(|p| std::fs::read(p).map_err(|e| format!("{p}: {e}")).and_then(|b| nextsycl_image::Picture::decode(&b)))
-        .collect::<Result<_, _>>()?;
+    let mut pages: Vec<nextsycl_image::Picture> = Vec::new();
+    for p in args.iter().take_while(|a| !a.starts_with("--")) {
+        let b = std::fs::read(p).map_err(|e| format!("{p}: {e}"))?;
+        if nextsycl_image::Picture::is_pdf(&b) {
+            // a PDF: its pages at 150 dpi
+            pages.extend(nextsycl_image::Picture::from_pdf(&b, 150.0, 64).map_err(|e| format!("{p}: {e}"))?.0);
+        } else {
+            pages.push(nextsycl_image::Picture::decode(&b).map_err(|e| format!("{p}: {e}"))?);
+        }
+    }
     if pages.is_empty() {
         return Err(USAGE.into());
     }
@@ -169,6 +176,7 @@ fn ocr(cfg: &Config, args: &[String]) -> Result<(), String> {
         prompt: opt(args, "--prompt").unwrap_or("").to_string(),
         tiles: Some(!args.iter().any(|a| a == "--no-tiles")),
         figures: Some(!args.iter().any(|a| a == "--no-figures")),
+        each_page: Some(!args.iter().any(|a| a == "--one-pass")),
         max_tokens: opt(args, "--max").and_then(|v| v.parse().ok()).unwrap_or(0),
         temperature: opt(args, "--temp").and_then(|v| v.parse().ok()).unwrap_or(0.0),
         ..Default::default()

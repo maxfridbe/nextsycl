@@ -1,5 +1,5 @@
 //! Pictures on the host: 8-bit RGB or RGBA, row-major, top row first - what an image engine returns and what an edit or
-//! a video keyframe takes. PNG in and out, with text chunks for the settings that made a picture.
+//! a video keyframe takes. PNG in and out, with text chunks for the settings that made a picture; a PDF's pages in.
 
 use std::path::Path;
 
@@ -27,6 +27,38 @@ impl Picture {
             let r = img.to_rgb8();
             Picture { width: r.width(), height: r.height(), channels: 3, data: r.into_raw() }
         })
+    }
+
+    /// Whether these bytes are a PDF (its `%PDF-` header)
+    pub fn is_pdf(bytes: &[u8]) -> bool {
+        bytes.starts_with(b"%PDF-")
+    }
+
+    /// A PDF's first `max` pages as RGB pictures at `dpi` on white (hayro, a pure-Rust rasterizer), and its page
+    /// count
+    pub fn from_pdf(bytes: &[u8], dpi: f32, max: usize) -> Result<(Vec<Picture>, usize), String> {
+        use hayro::hayro_interpret::InterpreterSettings;
+        use hayro::vello_cpu::color::palette::css::WHITE;
+        let pdf = hayro::hayro_syntax::Pdf::new(bytes.to_vec()).map_err(|e| format!("not a PDF this reads: {e:?}"))?;
+        let cache = hayro::RenderCache::new();
+        let scale = dpi / 72.0;
+        let all = pdf.pages();
+        let mut out = Vec::new();
+        for page in all.iter().take(max) {
+            let pm = hayro::render(page, &cache, &InterpreterSettings::default(), &hayro::RenderSettings::default(),
+                                   &hayro::PixmapSettings { x_scale: scale, y_scale: scale, bg_color: WHITE });
+            let png = pm.into_png().map_err(|e| format!("a PDF page: {e:?}"))?;
+            out.push(Picture::decode(&png)?.rgb());
+        }
+        Ok((out, all.len()))
+    }
+
+    /// As RGB (alpha dropped)
+    pub fn rgb(&self) -> Picture {
+        match self.channels {
+            4 => Picture { width: self.width, height: self.height, channels: 3, data: self.data.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect() },
+            _ => self.clone(),
+        }
     }
 
     /// A PNG file (any bit depth and color type; 16-bit is reduced to 8, grey and palette expanded)

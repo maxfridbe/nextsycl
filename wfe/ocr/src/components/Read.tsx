@@ -18,7 +18,7 @@ function Picker(props: { camera?: boolean }) {
   return (
     <input
       class="pick"
-      attrs={{ type: "file", accept: "image/png,image/jpeg,image/webp", multiple: !props.camera, ...(props.camera ? { capture: "environment" } : {}) }}
+      attrs={{ type: "file", accept: props.camera ? "image/png,image/jpeg,image/webp" : "image/png,image/jpeg,image/webp,application/pdf,.pdf", multiple: !props.camera, ...(props.camera ? { capture: "environment" } : {}) }}
       on={{
         change: (e: Event) => {
           const t = e.target as HTMLInputElement;
@@ -50,8 +50,8 @@ function Drop() {
         }}
       >
         <Picker />
-        <span class="i" props={{ innerHTML: "&#xf093;" }} /> Tap or click to choose page pictures - or drop or paste them (PNG, JPEG,
-        WebP); several pages are read as one document, in this order
+        <span class="i" props={{ innerHTML: "&#xf093;" }} /> Tap or click to choose pages - pictures (PNG, JPEG, WebP) or PDFs, or drop or
+        paste them; several pages are read in this order
       </label>
       <label class="tbtn camera"><Picker camera={true} /><span class="i" props={{ innerHTML: "&#xf030;" }} /> Take a photo of a page</label>
     </div>
@@ -82,6 +82,7 @@ function Pages() {
 export function Read() {
   const f = state.form;
   const one = state.pages.length <= 1;
+  const busyNote = state.busy && state.pageAt ? ` (page ${state.pageAt} of ${state.pages.length})` : "";
   const ready = !!state.info && !state.info.loading && state.info.reads !== false;
   return (
     <div class="read">
@@ -94,8 +95,17 @@ export function Read() {
           ))}
         </div>
       </div>
+      {state.note ? <div class="live">{state.note}</div> : null}
       {state.pages.length > 1
-        ? <div class="hint">{`${state.pages.length} pages are read with the model's own multi-page instruction ("Multi page parsing."), each page in turn - the presets are for a single page.`}</div>
+        ? <div class="row">
+            <div class="chips">
+              <button type="button" class={{ chip: true, on: f.perPage !== false }} on={{ click: () => set("perPage", true) }}>each page on its own</button>
+              <button type="button" class={{ chip: true, on: f.perPage === false }} on={{ click: () => set("perPage", false) }}>as one document</button>
+            </div>
+            <span class="hint">{f.perPage !== false
+              ? "each page read in turn with the instruction below, its tiles too (finer print)"
+              : "the model's own multi-page reading (\"Multi page parsing.\"): every page at 1024, in one pass - the instruction below is not used"}</span>
+          </div>
         : null}
       {f.preset === "custom"
         ? <textarea attrs={{ placeholder: "Your instruction (\"<|grounding|>\" first for boxes)" }} props={{ value: f.prompt }}
@@ -103,7 +113,7 @@ export function Read() {
         : null}
       <div class="row">
         <label class="inline" attrs={{ title: "A single page: read its 640-pixel tiles too (more detail, more tokens). Several pages are read whole." }}>
-          <input attrs={{ type: "checkbox", disabled: !one }} props={{ checked: f.tiles && one }} on={{ change: () => set("tiles", !f.tiles) }} /> tiles
+          <input attrs={{ type: "checkbox", disabled: !one && f.perPage === false }} props={{ checked: f.tiles && (one || f.perPage !== false) }} on={{ change: () => set("tiles", !f.tiles) }} /> tiles
         </label>
         <label class="inline" attrs={{ title: "The model marks pictures inside a page (screenshots, figures) without reading them: read each again on its own and put its text in" }}>
           <input attrs={{ type: "checkbox" }} props={{ checked: f.figures !== false }} on={{ change: () => set("figures", f.figures === false) }} /> read inside pictures
@@ -121,7 +131,7 @@ export function Read() {
         </label>
         <button type="button" attrs={{ id: "go", disabled: !ready || !state.pages.length || state.busy }} on={{ click: () => void read() }}>
           <span class="i" props={{ innerHTML: state.busy ? "&#xf110;" : "&#xf02d;" }} />
-          {state.busy ? "Reading…" : `Read ${state.pages.length > 1 ? `${state.pages.length} pages` : "the page"}`}
+          {state.busy ? `Reading…${busyNote}` : `Read ${state.pages.length > 1 ? `${state.pages.length} pages` : "the page"}`}
         </button>
       </div>
     </div>

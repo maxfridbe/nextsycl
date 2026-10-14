@@ -57,10 +57,11 @@ export function Output() {
   const p = state.progress;
   if (!r) {
     const so = p?.reading ? p.text ?? "" : "";
+    const at = state.pageAt ? `page ${state.pageAt} of ${state.resultPages.length} · ` : "";
     return (
       <div>
-        <div class="live">{p?.reading ? `${p.tokens ?? 0} tokens · ${fmtT(p.seconds)} · ${p.seconds ? ((p.tokens ?? 0) / p.seconds).toFixed(0) : "—"} tok/s` : "seeing the pages…"}</div>
-        <pre class="raw">{so}<span class="cursor" /></pre>
+        <div class="live">{at}{p?.reading ? `${p.tokens ?? 0} tokens · ${fmtT(p.seconds)} · ${p.seconds ? ((p.tokens ?? 0) / p.seconds).toFixed(0) : "—"} tok/s` : "seeing the page…"}</div>
+        <pre class="raw">{state.partial}{state.pageAt ? `<PAGE>` : ""}{so}<span class="cursor" /></pre>
       </div>
     );
   }

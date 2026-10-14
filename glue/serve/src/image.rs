@@ -10,7 +10,9 @@
 //!                                 references -, prompt, the fields above) or JSON with `images`: [base64 or data
 //!                                 URLs]; the instructions name the pictures ("the hat from picture 2"); the size
 //!                                 follows the last picture's aspect unless one is given
-//!   POST /v1/ocr                  an OCR model's reading: images [base64 or data URLs] (pages, in order), prompt,
+//!   POST /v1/ocr                  an OCR model's reading: images [base64 or data URLs: pictures or PDFs, split into
+//!                                 their pages here] (pages, in order), each_page (several pages each read on its
+//!                                 own; default true - false: the model's one-pass multi-page reading), prompt,
 //!                                 tiles (a single page's tiles too; default true), figures (read the text inside
 //!                                 the pictures it marks; default true), max_tokens, temperature, ngram (0: no
 //!                                 repetition rule) -> text (the model's markup kept), tokens, seconds; the text
@@ -113,6 +115,8 @@ fn earlier(dir: &std::path::Path) -> VecDeque<Value> {
 const MAX_PICTURES: usize = 8;
 /// pages one OCR request reads at most (each a global view of 273 tokens)
 const MAX_PAGES: usize = 24;
+/// a PDF's pages are rendered at this (a letter page: 1275 x 1650)
+const PDF_DPI: f32 = 150.0;
 
 /// An edit request's fields (as the JSON body a generation takes) and its pictures: OpenAI's multipart form (image /
 /// image[] files, the other fields as text; `options` and `loras` as JSON text), or JSON with `images` (or `image`):
@@ -399,7 +403,20 @@ impl ImageServer {
         let mut pages = Vec::with_capacity(list.len());
         for (i, s) in list.iter().enumerate() {
             let bytes = http::unbase64(s).map_err(|e| bad(format!("images[{i}]: {e}")))?;
+            if nextsycl_image::Picture::is_pdf(&bytes) {
+                // a PDF: its pages, rendered here (150 dpi), as many as a request takes
+                let room = MAX_PAGES.saturating_sub(pages.len());
+                let (got, total) = nextsycl_image::Picture::from_pdf(&bytes, PDF_DPI, room).map_err(|e| bad(format!("images[{i}]: {e}")))?;
+                if total > got.len() {
+                    return Err(bad(format!("images[{i}]: a PDF of {total} pages - at most {MAX_PAGES} pages a request")));
+                }
+                pages.extend(got);
+                continue;
+            }
             pages.push(nextsycl_image::Picture::decode(&bytes).map_err(|e| bad(format!("images[{i}]: {e}")))?);
+        }
+        if pages.len() > MAX_PAGES {
+            return Err(bad(format!("{} pages: at most {MAX_PAGES} a request", pages.len())));
         }
         let prompt = b["prompt"].as_str().unwrap_or("").to_string();
         let req = nextsycl_image::OcrRequest {
@@ -412,6 +429,7 @@ impl ImageServer {
             temperature: b["temperature"].as_f64().unwrap_or(0.0) as f32,
             seed: b["seed"].as_u64().unwrap_or(0),
             figures: b["figures"].as_bool(),
+            each_page: b["each_page"].as_bool(),
             extra: Default::default(),
         };
         let n_pages = req.pages.len();

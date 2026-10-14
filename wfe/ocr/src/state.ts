@@ -28,6 +28,11 @@ export interface AppState {
   boxPage: number;
   dragging: boolean;
   busy: boolean;
+  /** what is being done besides the reading itself (rendering a PDF, page 3 of 12) */
+  note: string | null;
+  /** page by page: the pages read so far (with their <PAGE> marks), and which page is being read */
+  partial: string;
+  pageAt: number;
   started: number | null;
   error: string | null;
   panels: Record<string, boolean>;
@@ -38,7 +43,7 @@ export const state: AppState = {
   progress: null,
   gpu: null,
   history: [],
-  form: { preset: "parse", prompt: "", tiles: true, maxTokens: 8192, temperature: 0, guard: true, figures: true },
+  form: { preset: "parse", prompt: "", tiles: true, maxTokens: 8192, temperature: 0, guard: true, figures: true, perPage: true },
   pages: [],
   result: null,
   resultPages: [],
@@ -46,6 +51,9 @@ export const state: AppState = {
   boxPage: 0,
   dragging: false,
   busy: false,
+  note: null,
+  partial: "",
+  pageAt: 0,
   started: null,
   error: null,
   panels: {},

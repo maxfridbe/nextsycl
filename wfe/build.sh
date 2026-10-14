@@ -25,6 +25,7 @@ for app in "${apps[@]}"; do
   cp "$app/index.html" "$app/style.css" "$OUT/$app/"
 done
 cp -r vendor/snabbdom "$OUT/vendor/"
+cp -r vendor/pdfjs "$OUT/vendor/"
 cp static/* "$OUT/static/"
 rm -rf build
 if [ "$check" = 1 ]; then

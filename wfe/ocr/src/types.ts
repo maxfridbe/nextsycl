@@ -59,4 +59,7 @@ export interface Form {
   guard: boolean;
   /** read the text inside the pictures the model marks */
   figures: boolean;
+  /** several pages: each read on its own (tiles, finer print) rather than as one document (the model's multi-page
+   *  reading, each page seen at 1024) */
+  perPage: boolean;
 }

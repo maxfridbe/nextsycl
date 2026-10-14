@@ -40,7 +40,7 @@ for a chat model. Measured speeds, decode / prompt reading:
 | `muse-glimmer-30b-q8-b70`, `-b65` | the same on one card alone, without the drafter (it does not fit beside the model) | 18.7 (B70) / 16.9 (B65) tok/s, 128K |
 | `muse-glimmer-30b-q4`, `-q6` | **Muse Glimmer 30B** Q4_K_M / Q6_K on the B70 alone, with its drafter | 43 / 35 tok/s (25.4 / 20 without drafts) / ~1,400 tok/s, 128K |
 | `qwen-image-2.1-q8` | **Qwen-Image 2.1** text to image, edits | 1024x1024, 40 steps: 23.8 s (16.5 s int8) |
-| `unlimited-ocr-q8`, `-q4` | **Unlimited-OCR** pages to Markdown (tables as HTML, boxes), its own page | a page: ~2-3 s to see, ~130 tok/s written |
+| `unlimited-ocr-q8`, `-q4` | **Unlimited-OCR** pictures and PDFs to Markdown (tables as HTML, boxes), its own page | a page: ~2-3 s to see, ~130 tok/s written |
 | `minimax-h3` | **MiniMax H3** video with sound | 896x672, 4.5 s: ~90 s |
 | `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |
 | `qwen3-tts-custom` | **Qwen3-TTS** speech | 33 s of speech: 7.7 s |

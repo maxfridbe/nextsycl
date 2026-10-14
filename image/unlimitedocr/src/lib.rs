@@ -257,6 +257,26 @@ impl UnlimitedOcr {
     /// size that can hold text) read on its own and its text put in the block
     pub fn read(&self, req: &OcrRequest, text: &mut dyn FnMut(&str)) -> Result<OcrOutput> {
         let _w = self.work.lock().unwrap();
+        if req.pages.len() > 1 && req.each_page.unwrap_or(true) {
+            // page by page, each as a reading of its own (tiles, figures), joined with <PAGE> marks
+            let mut all = OcrOutput::default();
+            for page in &req.pages {
+                text("<PAGE>");
+                let one = OcrRequest { pages: vec![page.clone()], each_page: Some(false), extra: Default::default(), ..req.clone() };
+                let mut r = self.read_one(&one, text)?;
+                if one.figures.unwrap_or(true) {
+                    self.read_figures(&one, &mut r)?;
+                }
+                text("\n");
+                all.text.push_str(&format!("<PAGE>{}\n", r.text));
+                all.prompt = r.prompt;
+                all.prompt_tokens += r.prompt_tokens;
+                all.tokens += r.tokens;
+                all.prompt_seconds += r.prompt_seconds;
+                all.seconds += r.seconds;
+            }
+            return Ok(all);
+        }
         let mut out = self.read_one(req, text)?;
         if req.figures.unwrap_or(true) {
             self.read_figures(req, &mut out)?;
@@ -310,7 +330,8 @@ impl UnlimitedOcr {
                     crop.data[y * cw as usize * c..(y + 1) * cw as usize * c].copy_from_slice(&page.data[src..src + cw as usize * c]);
                 }
                 let sub = OcrRequest { pages: vec![crop], prompt: FIGURE_PROMPT.into(), tiles: Some(true), max_tokens: req.max_tokens.clamp(0, 4096),
-                                       ngram: req.ngram, ngram_window: None, temperature: 0.0, seed: req.seed, figures: Some(false), extra: Default::default() };
+                                       ngram: req.ngram, ngram_window: None, temperature: 0.0, seed: req.seed, figures: Some(false), each_page: Some(false),
+                                       extra: Default::default() };
                 let r = self.read_one(&sub, &mut |_| {})?;
                 extra += r.tokens;
                 let t = r.text.trim();
