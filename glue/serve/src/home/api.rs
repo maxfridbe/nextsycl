@@ -77,7 +77,7 @@ pub const METHODS: &[Method] = &[
              example: r#"{"prompt": "make it night, keep the lighthouse", "images": ["data:image/png;base64,iVBORw0..."]}"# },
     Method { kind: "image", name: "ocr", summary: "Read pages (an OCR model: Unlimited-OCR): their text as Markdown, tables as HTML, boxes with <|grounding|>",
              fields: &[("model", "string", "an OCR model's id (default: the first enabled)", false), ("images", "string[]", "the pages, base64 or data: URLs, in order", true),
-                       ("prompt", "string", "\"document parsing.\" (default), \"Free OCR.\", \"<|grounding|>Convert the document to markdown.\", \"Parse the figure.\"", false),
+                       ("prompt", "string", "\"document parsing.\" (default), \"Free OCR.\", \"<|grounding|>Convert the document to markdown.\", \"Parse the figure.\"; several pages: always the model's \"Multi page parsing.\" (each page after a <PAGE> mark)", false),
                        ("tiles", "boolean", "one page: read its 640-pixel tiles too (default true)", false), ("max_tokens", "integer", "default 8192", false),
                        ("temperature", "number", "0 (default): greedy", false), ("ngram", "integer", "no n-gram of this many tokens repeated (35; 0: off)", false)],
              example: r#"{"images": ["data:image/png;base64,iVBORw0..."], "prompt": "document parsing."}"# },

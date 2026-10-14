@@ -12,6 +12,12 @@ export interface Block {
 
 const DET = /<\|det\|>([\s\S]*?)<\|\/det\|>/g;
 
+/** A reading of several pages, page by page (each starts at a `<PAGE>` mark; one page: the whole) */
+export function pages(raw: string): string[] {
+  if (!raw.includes("<PAGE>")) return [raw];
+  return raw.split("<PAGE>").filter((p, i) => i > 0 || p.trim() !== "");
+}
+
 /** The blocks in order; text before any box is a block of its own (no box) */
 export function blocks(raw: string): Block[] {
   const out: Block[] = [];
@@ -36,6 +42,8 @@ export function blocks(raw: string): Block[] {
 
 /** The text alone: boxes, tags and HTML gone, table cells tab-separated, rows on lines */
 export function plain(raw: string): string {
+  const all = pages(raw);
+  if (all.length > 1) return all.map((p, i) => `--- page ${i + 1} ---\n${plain(p)}`).join("\n\n");
   return blocks(raw).map((b) => {
     if (!b.text.includes("<")) return b.text;
     const d = new DOMParser().parseFromString(b.text, "text/html");

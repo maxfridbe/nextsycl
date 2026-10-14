@@ -64,6 +64,7 @@ export async function read(): Promise<void> {
   state.started = Date.now();
   state.error = null;
   state.result = null;
+  state.boxPage = 0;
   state.resultPages = [...state.pages];
   render();
   const f = state.form;

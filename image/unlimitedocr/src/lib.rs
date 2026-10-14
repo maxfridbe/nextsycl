@@ -35,6 +35,9 @@ pub const ROLES: &[&str] = &["model", "mmproj"];
 /// The reference's image token and the instruction it is trained on
 pub const IMAGE_TOKEN: u32 = 128815;
 pub const DEFAULT_PROMPT: &str = "document parsing.";
+/// The instruction for several pages (the reference's infer_multi): the model reads every page under it, each after a
+/// `<PAGE>` mark - under a single page's instruction it reads the first page (or nothing) and stops
+pub const MULTI_PROMPT: &str = "Multi page parsing.";
 pub const NGRAM: u32 = 35;
 pub const NGRAM_WINDOW: u32 = 128;
 pub const NGRAM_WINDOW_PAGES: u32 = 1024;
@@ -227,7 +230,13 @@ impl UnlimitedOcr {
         let several = req.pages.len() > 1;
         let seen = prep::see(&req.pages, req.tiles.unwrap_or(true));
         let (img, n_img) = self.image_tokens(&seen, &mut |_, _| Ok(()))?;
-        let prompt = if req.prompt.trim().is_empty() { DEFAULT_PROMPT } else { req.prompt.as_str() };
+        let prompt = if several && !req.prompt.contains("Multi page") {
+            MULTI_PROMPT
+        } else if req.prompt.trim().is_empty() {
+            DEFAULT_PROMPT
+        } else {
+            req.prompt.as_str()
+        };
         let ids = self.prompt_tokens(prompt, n_img);
         let x = self.embed(&ids, &img)?;
         drop(img);
@@ -271,7 +280,7 @@ impl UnlimitedOcr {
         if all.len() > shown {
             text(&all[shown..]);
         }
-        Ok(OcrOutput { text: all, prompt_tokens: ids.len() as u32, tokens: out_ids.len() as u32, prompt_seconds, seconds: t1.elapsed().as_secs_f64() })
+        Ok(OcrOutput { text: all, prompt: prompt.to_string(), prompt_tokens: ids.len() as u32, tokens: out_ids.len() as u32, prompt_seconds, seconds: t1.elapsed().as_secs_f64() })
     }
 }
 

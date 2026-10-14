@@ -57,7 +57,7 @@ pub struct OcrRequest {
     /// the pages, in order (a single picture: its tiles are read too; several: each page whole)
     pub pages: Vec<Picture>,
     /// the instruction ("document parsing.", "Free OCR.", "<|grounding|>Convert the document to markdown.", ...);
-    /// empty: the engine's default
+    /// empty: the engine's default; several pages are read under the model's multi-page instruction
     pub prompt: String,
     /// read a single picture's tiles as well as the whole (more detail, more tokens); None: the engine's default
     pub tiles: Option<bool>,
@@ -76,8 +76,10 @@ pub struct OcrRequest {
 /// What a reading made
 #[derive(Clone, Debug, Default)]
 pub struct OcrOutput {
-    /// the text as the model wrote it (its layout markup kept: boxes, tables)
+    /// the text as the model wrote it (its layout markup kept: boxes, tables; several pages: a `<PAGE>` mark before each)
     pub text: String,
+    /// the instruction it read under (several pages: the model's multi-page one)
+    pub prompt: String,
     pub prompt_tokens: u32,
     pub tokens: u32,
     /// seconds to see the pages and read the prompt, then to write

@@ -94,6 +94,9 @@ export function Read() {
           ))}
         </div>
       </div>
+      {state.pages.length > 1
+        ? <div class="hint">{`${state.pages.length} pages are read with the model's own multi-page instruction ("Multi page parsing."), each page in turn - the presets are for a single page.`}</div>
+        : null}
       {f.preset === "custom"
         ? <textarea attrs={{ placeholder: "Your instruction (\"<|grounding|>\" first for boxes)" }} props={{ value: f.prompt }}
                     on={{ input: (e: Event) => set("prompt", (e.target as HTMLTextAreaElement).value) }} />

@@ -445,10 +445,10 @@ impl ImageServer {
         let tok_s = out.tokens as f64 / out.seconds.max(1e-9);
         let read_tok_s = out.prompt_tokens as f64 / out.prompt_seconds.max(1e-9);
         let mut h = self.history.lock().unwrap();
-        h.push_front(json!({"kind": "ocr", "prompt": prompt, "pages": n_pages, "text": out.text, "tokens": out.tokens, "prompt_tokens": out.prompt_tokens,
+        h.push_front(json!({"kind": "ocr", "prompt": out.prompt, "pages": n_pages, "text": out.text, "tokens": out.tokens, "prompt_tokens": out.prompt_tokens,
                             "seconds": seconds, "tok_s": tok_s, "wh": wh, "created": now()}));
         h.truncate(50);
-        Ok(json!({"created": now(), "model": self.model, "text": out.text, "pages": n_pages, "tokens": out.tokens, "prompt_tokens": out.prompt_tokens,
+        Ok(json!({"created": now(), "model": self.model, "text": out.text, "prompt": out.prompt, "pages": n_pages, "tokens": out.tokens, "prompt_tokens": out.prompt_tokens,
                   "prompt_seconds": out.prompt_seconds, "read_tok_s": read_tok_s, "write_seconds": out.seconds, "tok_s": tok_s, "seconds": seconds, "wh": wh}))
     }
 

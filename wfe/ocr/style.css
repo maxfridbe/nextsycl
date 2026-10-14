@@ -172,3 +172,5 @@ figure.page .acts .tbtn{margin-left:0;padding:1px 6px}
   .pages{grid-template-columns:1fr 1fr}
   .doc{padding:12px}
 }
+.doc .pagehead{font:600 12px system-ui,sans-serif;color:#57606a;text-transform:uppercase;letter-spacing:.06em;border-top:1px solid #d0d7de;margin:18px 0 6px;padding-top:10px}
+.doc .pagehead:first-child{border-top:0;margin-top:0;padding-top:0}

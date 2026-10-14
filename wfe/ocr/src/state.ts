@@ -24,6 +24,8 @@ export interface AppState {
   result: Reading | null;
   resultPages: Page[];
   view: View;
+  /** the page whose boxes are drawn (several pages) */
+  boxPage: number;
   dragging: boolean;
   busy: boolean;
   started: number | null;
@@ -41,6 +43,7 @@ export const state: AppState = {
   result: null,
   resultPages: [],
   view: "doc",
+  boxPage: 0,
   dragging: false,
   busy: false,
   started: null,
