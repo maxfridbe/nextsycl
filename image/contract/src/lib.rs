@@ -71,6 +71,9 @@ pub struct OcrRequest {
     pub seed: u64,
     /// read the text inside the pictures the model only marks (a second pass a picture); None: the engine's default
     pub figures: Option<bool>,
+    /// find columns (blocks side by side, a gutter between) and read each on its own, in reading order; None: the
+    /// engine's default
+    pub columns: Option<bool>,
     /// several pages: each read on its own (its tiles too), the readings joined with `<PAGE>` marks - else the model's
     /// own multi-page reading in one pass (each page seen whole); None: the engine's default
     pub each_page: Option<bool>,

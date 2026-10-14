@@ -430,6 +430,7 @@ impl ImageServer {
             seed: b["seed"].as_u64().unwrap_or(0),
             figures: b["figures"].as_bool(),
             each_page: b["each_page"].as_bool(),
+            columns: b["columns"].as_bool(),
             extra: Default::default(),
         };
         let n_pages = req.pages.len();

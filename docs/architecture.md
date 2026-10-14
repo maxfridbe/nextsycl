@@ -260,7 +260,9 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   positions differently from the reference - plain bicubic, CLIP's CLS row from the end - so tiles compare with
   the reference, not llama.cpp). Several pages: each read on its own (each_page, default; joined with <PAGE> marks) or
   under the model's own "Multi page parsing." (single-page instructions stop after page 1); pictures inside a page
-  (empty image blocks) read again cropped (figures); PDFs split into pages by hayro (pure Rust, Picture::from_pdf) on
+  (empty image blocks) read again cropped (figures); columns found first (layout.rs: a gutter free of ink for two
+  characters down a quarter of the page splits it - above, each side, below - the sides not split again) and read
+  region by region; PDFs split into pages by hayro (pure Rust, Picture::from_pdf) on
   the server and by a vendored pdf.js on the page. B70: a page (tiles) seen and read at ~600-900 tok/s, written at ~120-145 tok/s;
   tests/api/test-ocr.py (three public transcripts, pictures only) passes on Q8_0 and Q4_K_M.
 

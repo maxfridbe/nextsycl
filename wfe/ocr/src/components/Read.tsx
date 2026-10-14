@@ -115,6 +115,9 @@ export function Read() {
         <label class="inline" attrs={{ title: "A single page: read its 640-pixel tiles too (more detail, more tokens). Several pages are read whole." }}>
           <input attrs={{ type: "checkbox", disabled: !one && f.perPage === false }} props={{ checked: f.tiles && (one || f.perPage !== false) }} on={{ change: () => set("tiles", !f.tiles) }} /> tiles
         </label>
+        <label class="inline" attrs={{ title: "Blocks set side by side (a gutter between them) are found first and each read on its own - else the model reads across them as one wide table" }}>
+          <input attrs={{ type: "checkbox" }} props={{ checked: f.columns !== false }} on={{ change: () => set("columns", f.columns === false) }} /> split columns
+        </label>
         <label class="inline" attrs={{ title: "The model marks pictures inside a page (screenshots, figures) without reading them: read each again on its own and put its text in" }}>
           <input attrs={{ type: "checkbox" }} props={{ checked: f.figures !== false }} on={{ change: () => set("figures", f.figures === false) }} /> read inside pictures
         </label>

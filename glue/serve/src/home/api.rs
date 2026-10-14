@@ -80,6 +80,7 @@ pub const METHODS: &[Method] = &[
                        ("prompt", "string", "\"document parsing.\" (default), \"Free OCR.\", \"<|grounding|>Convert the document to markdown.\", \"Parse the figure.\"; several pages: each page under it, or (each_page false) the model's \"Multi page parsing.\"; a <PAGE> mark before each page", false),
                        ("tiles", "boolean", "one page: read its 640-pixel tiles too (default true)", false),
                        ("figures", "boolean", "read the text inside the pictures the model marks (a second pass each; default true)", false),
+                       ("columns", "boolean", "find blocks set side by side (a gutter between) and read each on its own (default true)", false),
                        ("each_page", "boolean", "several pages: each read on its own with its tiles (default true); false: the model's one-pass multi-page reading", false), ("max_tokens", "integer", "default 8192", false),
                        ("temperature", "number", "0 (default): greedy", false), ("ngram", "integer", "no n-gram of this many tokens repeated (35; 0: off)", false)],
              example: r#"{"images": ["data:image/png;base64,iVBORw0..."], "prompt": "document parsing."}"# },

@@ -62,4 +62,6 @@ export interface Form {
   /** several pages: each read on its own (tiles, finer print) rather than as one document (the model's multi-page
    *  reading, each page seen at 1024) */
   perPage: boolean;
+  /** find blocks set side by side and read each on its own */
+  columns: boolean;
 }

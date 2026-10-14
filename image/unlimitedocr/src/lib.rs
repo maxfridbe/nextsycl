@@ -12,6 +12,7 @@
 
 pub mod check;
 pub mod decoder;
+pub mod layout;
 mod ffi;
 pub mod prep;
 pub mod vision;
@@ -263,7 +264,7 @@ impl UnlimitedOcr {
             for page in &req.pages {
                 text("<PAGE>");
                 let one = OcrRequest { pages: vec![page.clone()], each_page: Some(false), extra: Default::default(), ..req.clone() };
-                let mut r = self.read_one(&one, text)?;
+                let mut r = self.read_page(&one, text)?;
                 if one.figures.unwrap_or(true) {
                     self.read_figures(&one, &mut r)?;
                 }
@@ -277,11 +278,44 @@ impl UnlimitedOcr {
             }
             return Ok(all);
         }
-        let mut out = self.read_one(req, text)?;
+        let mut out = if req.pages.len() == 1 { self.read_page(req, text)? } else { self.read_one(req, text)? };
         if req.figures.unwrap_or(true) {
             self.read_figures(req, &mut out)?;
         }
         Ok(out)
+    }
+
+    /// One page: its columns found (layout.rs) and each region read on its own, their boxes moved to the page - or,
+    /// columns off or none found, the page read whole
+    fn read_page(&self, req: &OcrRequest, text: &mut dyn FnMut(&str)) -> Result<OcrOutput> {
+        let page = &req.pages[0];
+        let regions = if req.columns.unwrap_or(true) { layout::regions(page) } else { Vec::new() };
+        if regions.len() <= 1 {
+            return self.read_one(req, text);
+        }
+        let mut all = OcrOutput::default();
+        for (x, y, w, h) in regions {
+            let c = page.channels as usize;
+            let mut crop = Picture::new(w, h, page.channels);
+            for yy in 0..h as usize {
+                let src = ((y as usize + yy) * page.width as usize + x as usize) * c;
+                crop.data[yy * w as usize * c..(yy + 1) * w as usize * c].copy_from_slice(&page.data[src..src + w as usize * c]);
+            }
+            let one = OcrRequest { pages: vec![crop], columns: Some(false), figures: Some(false), each_page: Some(false), extra: Default::default(), ..req.clone() };
+            let r = self.read_one(&one, text)?;
+            text("\n");
+            let t = r.text.trim();
+            if !t.is_empty() {
+                all.text.push_str(&to_page(t, (x, y, w, h), (page.width, page.height)));
+                all.text.push('\n');
+            }
+            all.prompt = r.prompt;
+            all.prompt_tokens += r.prompt_tokens;
+            all.tokens += r.tokens;
+            all.prompt_seconds += r.prompt_seconds;
+            all.seconds += r.seconds;
+        }
+        Ok(all)
     }
 
     /// The empty picture blocks of a reading, cropped from their pages and read with "Free OCR."
@@ -331,7 +365,7 @@ impl UnlimitedOcr {
                 }
                 let sub = OcrRequest { pages: vec![crop], prompt: FIGURE_PROMPT.into(), tiles: Some(true), max_tokens: req.max_tokens.clamp(0, 4096),
                                        ngram: req.ngram, ngram_window: None, temperature: 0.0, seed: req.seed, figures: Some(false), each_page: Some(false),
-                                       extra: Default::default() };
+                                       columns: Some(false), extra: Default::default() };
                 let r = self.read_one(&sub, &mut |_| {})?;
                 extra += r.tokens;
                 let t = r.text.trim();

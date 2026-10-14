@@ -99,6 +99,7 @@ export async function read(): Promise<void> {
     prompt: promptText(),
     tiles: f.tiles,
     figures: f.figures !== false,
+    columns: f.columns !== false,
     max_tokens: f.maxTokens,
     temperature: f.temperature,
     ...(f.guard ? {} : { ngram: 0 }),
