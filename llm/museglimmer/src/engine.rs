@@ -120,11 +120,14 @@ pub struct Mat {
     /// Q8_0 repacked by the silo: `buf` its quants [rows][cols], these its scales [rows][cols / 32] (a view of rows
     /// of a matrix several share)
     pub scales: Option<DevBuf>,
+    /// Q4_K or Q6_K repacked by the silo a row at a time (kq.cpp): `buf` its rows
+    pub kr: bool,
 }
 
 impl Mat {
+    /// Its decode products take the silo's split Q8 rows
     fn packed(&self) -> bool {
-        self.scales.is_some()
+        self.scales.is_some() || self.kr
     }
 }
 
@@ -342,6 +345,8 @@ pub struct MuseGlimmer<'g> {
     /// the DFlash drafter (drafts on, its file found, the silo there) and the tokens it drafts a step
     dflash: Option<Dflash>,
     drafts: usize,
+    /// every layer's matrices take the silo's split Q8 rows (else the decode norms write float rows as well)
+    xq_ok: bool,
     load_s: f64,
     load_bytes: u64,
 }
@@ -596,13 +601,23 @@ impl<'g> MuseGlimmer<'g> {
             devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, w16_bytes)?, arena: Arena::new(gpu, arena_bytes(&g, chunk) + feat(chunk, dfile.is_some()))?, lb, le });
         }
         let load_s = t0.elapsed().as_secs_f64();
-        let wh = devs.iter().map(|d| if d.lb == 0 && d.le == g.layers { d.gpu.name.clone() } else { if d.le > d.lb { format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1) } else { format!("{} (the drafter)", d.gpu.name) } })
+        let xq_ok = silo.is_some() && layers.iter().all(|ly| [&ly.q, &ly.k, &ly.v, &ly.gate, &ly.o, &ly.ffn_gate, &ly.ffn_up, &ly.ffn_down].iter().all(|m| m.packed()));
+        if silo.is_some() && !xq_ok {
+            log("museglimmer: matrices the silo does not take - the shared kernels' decode products for them".into());
+        }
+        let wh = devs.iter().map(|d| if d.lb == 0 && d.le == g.layers {
+                d.gpu.name.clone()
+            } else if d.le > d.lb {
+                format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1)
+            } else {
+                format!("{} (the drafter)", d.gpu.name)
+            })
             .collect::<Vec<_>>().join(", ");
         log(format!("museglimmer: {} layers of {} ({} windowed), {:.1} GiB on {wh} in {load_s:.0} s; prompt chunks of {chunk}", g.layers, g.n_embd,
                     g.swa.iter().filter(|s| **s).count(), gib(loaded)));
         Ok(MuseGlimmer { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, ones, output_norm, output, embd, chunk,
                          work: Mutex::new(()), prof: std::env::var("NS_MG_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), dflash,
-                         drafts, load_s,
+                         drafts, xq_ok, load_s,
                          load_bytes: loaded })
     }
 
@@ -682,6 +697,33 @@ impl<'g> MuseGlimmer<'g> {
         if w.ty == GType::F32 {
             // SAFETY: x [t, cols], the matrix [rows, cols] float32, y [t, rows].
             return self.op("gemm", || unsafe { (k.gemm)(self.raw(), t as i64, n, kk, x.fp(), kk, w.buf.fp(), y.fp(), n, 0) });
+        }
+        if let (true, Some(s)) = (w.kr, self.silo) {
+            let ty = w.ty.code() as c_int;
+            if t <= MAXV {
+                let own;
+                let xqb = match xq {
+                    Some(q) => q,
+                    None => {
+                        // SAFETY: arithmetic only.
+                        own = self.arena().bytes(unsafe { (s.xq_bytes)(kk, t as i64) })?;
+                        // SAFETY: x [t, cols] -> its split Q8 form.
+                        self.op("xq silo", || unsafe { (s.xq)(self.raw(), x.fp(), std::ptr::null(), 0, own.ptr(), kk, t as i64) })?;
+                        &own
+                    }
+                };
+                // SAFETY: the repacked rows, x's split form, y [t, rows].
+                return self.op("kq mmvq silo", || unsafe { (s.kr_mmvq)(self.raw(), ty, w.buf.ptr(), xqb.ptr(), y.fp(), kk, n, t as i64) });
+            }
+            if rows * cols * 2 > self.dev().w16.len {
+                return Err(e(format!("a {rows}x{cols} matrix past the half buffer")));
+            }
+            // SAFETY: the repacked rows -> rows x cols halfs in w16.
+            self.op("kq f16 silo", || unsafe { (s.kr_f16)(self.raw(), ty, w.buf.ptr(), n, kk, self.dev().w16.ptr().cast()) })?;
+            let xh = self.arena().bytes(t * cols * 2)?;
+            // SAFETY: x [t, cols] -> half; then y [t, rows] = xh . w16^T.
+            self.op("x to half", || unsafe { (k.to_f16)(self.raw(), x.fp(), xh.ptr().cast(), (t * cols) as i64) })?;
+            return self.op("gemm f16", || unsafe { (k.gemm_f16)(self.raw(), t as i64, n, kk, xh.ptr().cast(), kk, self.dev().w16.ptr().cast(), y.fp(), n, 0) });
         }
         if let (Some(sc), Some(s)) = (&w.scales, self.silo) {
             if t <= MAXV {
@@ -857,7 +899,7 @@ impl<'g> MuseGlimmer<'g> {
     fn post_norm(&self, out: &DevBuf, w: &DevBuf, x: &DevBuf, next: &DevBuf, eps: f32, h: &DevBuf, t: usize, into: Option<&DevBuf>)
                  -> Result<Option<DevBuf>> {
         let ne = self.g.n_embd;
-        match self.silo.filter(|_| t <= MAXV) {
+        match self.silo.filter(|_| t <= MAXV && self.xq_ok) {
             Some(s) => {
                 // SAFETY: arithmetic only.
                 let bytes = unsafe { (s.xq_bytes)(ne as i64, t as i64) };
@@ -888,7 +930,7 @@ impl<'g> MuseGlimmer<'g> {
     /// x [t, n_embd] normed by w: as floats into h, or (decode rows with the silo) straight to its split Q8 form
     fn norm_in(&self, x: &DevBuf, w: &DevBuf, h: &DevBuf, t: usize) -> Result<Option<DevBuf>> {
         let ne = self.g.n_embd;
-        match self.silo.filter(|_| t <= MAXV) {
+        match self.silo.filter(|_| t <= MAXV && self.xq_ok) {
             Some(s) => {
                 // SAFETY: arithmetic only.
                 let xq = self.arena().bytes(unsafe { (s.xq_bytes)(ne as i64, t as i64) })?;
@@ -1515,16 +1557,19 @@ fn vec_mat(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, silo: Option<&ffi::Silo>, nam
         // SAFETY: src holds the tensor, out its elements as float32.
         ffi::check(unsafe { (k.dequant)(gpu.raw(), t.ty.code() as i32, src.ptr(), rows * cols, out.fp()) }, name)?;
         gpu.sync()?;
-        return Ok(Mat { buf: out, ty: GType::F32, rows, cols, scales: None });
+        return Ok(Mat { buf: out, ty: GType::F32, rows, cols, scales: None, kr: false });
     }
     if let (GType::Q8_0, Some(s), true) = (t.ty, silo, cols.is_multiple_of(32)) {
         // the matrix owns its repacked memory (its quants first), its scales a view of it
         let (own, m) = pack(gpu, s, &raw, rows, cols, name)?;
-        return Ok(Mat { buf: own, ty: t.ty, rows, cols, scales: m.scales });
+        return Ok(Mat { buf: own, ty: t.ty, rows, cols, scales: m.scales, kr: false });
+    }
+    if let Some(s) = silo.filter(|s| t.shape.len() == 2 && rows.is_multiple_of(16) && unsafe { (s.kr_supported)(t.ty.code() as c_int, cols as i64) } != 0) {
+        return kpack(gpu, s, t.ty, &raw, rows, cols, name);
     }
     let buf = DevBuf::new(gpu, raw.len())?;
     buf.write(0, &raw)?;
-    Ok(Mat { buf, ty: t.ty, rows, cols, scales: None })
+    Ok(Mat { buf, ty: t.ty, rows, cols, scales: None, kr: false })
 }
 
 /// Q8_0 blocks of `rows` x `cols` repacked by the silo: the memory, and the matrix as a view of it
@@ -1537,8 +1582,21 @@ fn pack(gpu: &Arc<Gpu>, s: &ffi::Silo, raw: &[u8], rows: usize, cols: usize, nam
     // SAFETY: src holds the matrix's Q8_0 blocks, own its repacked size.
     ffi::check(unsafe { (s.q8r_pack)(gpu.raw(), src.ptr(), rows as i64, cols as i64, own.ptr()) }, name)?;
     gpu.sync()?;
-    let m = Mat { buf: own.view(0, rows * cols)?, ty: GType::Q8_0, rows, cols, scales: Some(own.view(at, rows * (cols / 32) * 2)?) };
+    let m = Mat { buf: own.view(0, rows * cols)?, ty: GType::Q8_0, rows, cols, scales: Some(own.view(at, rows * (cols / 32) * 2)?), kr: false };
     Ok((own, m))
+}
+
+/// A Q4_K or Q6_K matrix of `rows` x `cols` repacked by the silo a row at a time
+fn kpack(gpu: &Arc<Gpu>, s: &ffi::Silo, ty: GType, raw: &[u8], rows: usize, cols: usize, name: &str) -> Result<Mat> {
+    // SAFETY: arithmetic only.
+    let rb = unsafe { (s.kr_row_bytes)(ty.code() as c_int, cols as i64) };
+    let src = DevBuf::new(gpu, raw.len())?;
+    src.write(0, raw)?;
+    let own = DevBuf::new(gpu, rows * rb)?;
+    // SAFETY: src holds the matrix's blocks, own its repacked rows.
+    ffi::check(unsafe { (s.kr_pack)(gpu.raw(), ty.code() as c_int, src.ptr(), rows as i64, cols as i64, own.ptr()) }, name)?;
+    gpu.sync()?;
+    Ok(Mat { buf: own, ty, rows, cols, scales: None, kr: true })
 }
 
 /// Matrices of the same width stacked (their rows one after another) and repacked as one: the memory, the whole, and
@@ -1546,11 +1604,18 @@ fn pack(gpu: &Arc<Gpu>, s: &ffi::Silo, raw: &[u8], rows: usize, cols: usize, nam
 fn pack_stack(f: &Gguf, gpu: &Arc<Gpu>, s: &ffi::Silo, names: &[String], loaded: &mut u64) -> Result<Option<(DevBuf, Mat, Vec<Mat>)>> {
     let mut raw = Vec::new();
     let mut shapes = Vec::new();
+    // one type for all: Q8_0, or a K-quant the silo takes
+    let ty = f.tensor(&names[0]).ok_or_else(|| e(format!("no {}", names[0])))?.ty;
     for n in names {
         let t = f.tensor(n).ok_or_else(|| e(format!("no {n}")))?;
-        if t.ty != GType::Q8_0 || t.shape.len() != 2 {
+        // SAFETY: arithmetic only.
+        let kq = unsafe { (s.kr_supported)(t.ty.code() as c_int, t.shape[1..].iter().product::<u64>() as i64) } != 0;
+        if t.ty != ty || t.shape.len() != 2 || !t.shape[0].is_multiple_of(16) || !(t.ty == GType::Q8_0 || kq) {
             return Ok(None);
         }
+    }
+    for n in names {
+        let t = f.tensor(n).ok_or_else(|| e(format!("no {n}")))?;
         shapes.push((t.shape[0] as usize, t.shape[1] as usize));
         let b = f.read(t).map_err(|x| e(x.0))?;
         *loaded += b.len() as u64;
@@ -1561,12 +1626,25 @@ fn pack_stack(f: &Gguf, gpu: &Arc<Gpu>, s: &ffi::Silo, names: &[String], loaded:
         return Err(e(format!("{}: matrices of different widths", names.join(", "))));
     }
     let rows: usize = shapes.iter().map(|x| x.0).sum();
+    if ty != GType::Q8_0 {
+        // a repacked K-quant's rows are contiguous: each a view of its rows
+        let m = kpack(gpu, s, ty, &raw, rows, cols, &names[0])?;
+        let rb = m.buf.len / rows;
+        let mut parts = Vec::with_capacity(shapes.len());
+        let mut r0 = 0;
+        for (r, _) in &shapes {
+            parts.push(Mat { buf: m.buf.view(r0 * rb, r * rb)?, ty, rows: *r, cols, scales: None, kr: true });
+            r0 += r;
+        }
+        let whole = Mat { buf: m.buf.view(0, rows * rb)?, ty, rows, cols, scales: None, kr: true };
+        return Ok(Some((m.buf, whole, parts)));
+    }
     let (own, whole) = pack(gpu, s, &raw, rows, cols, &names[0])?;
     let (q, sc) = (whole.buf.ptr() as usize - own.ptr() as usize, whole.scales.as_ref().map_or(0, |x| x.ptr() as usize - own.ptr() as usize));
     let mut parts = Vec::with_capacity(shapes.len());
     let mut r0 = 0;
     for (r, _) in &shapes {
-        parts.push(Mat { buf: own.view(q + r0 * cols, r * cols)?, ty: GType::Q8_0, rows: *r, cols, scales: Some(own.view(sc + r0 * (cols / 32) * 2, r * (cols / 32) * 2)?) });
+        parts.push(Mat { buf: own.view(q + r0 * cols, r * cols)?, ty: GType::Q8_0, rows: *r, cols, scales: Some(own.view(sc + r0 * (cols / 32) * 2, r * (cols / 32) * 2)?), kr: false });
         r0 += r;
     }
     Ok(Some((own, whole, parts)))
@@ -1593,7 +1671,7 @@ fn dmat(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, s: &ffi::Silo, name: &str, loade
     ffi::check(unsafe { (s.q8r_from_f32)(gpu.raw(), fl.fp(), rows as i64, cols as i64, own.ptr()) }, name)?;
     gpu.sync()?;
     let scales = own.view(at, rows * (cols / 32) * 2)?;
-    Ok(Mat { buf: own, ty: GType::Q8_0, rows, cols, scales: Some(scales) })
+    Ok(Mat { buf: own, ty: GType::Q8_0, rows, cols, scales: Some(scales), kr: false })
 }
 
 /// The DFlash drafter from its file, on GPU `dev` (the target's last)

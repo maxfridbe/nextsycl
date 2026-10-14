@@ -116,6 +116,14 @@ pub struct Silo {
     /// (quants, scales, xq, y, n_in, n_out, ncols)
     pub mmvq: unsafe extern "C" fn(G, P, P, P, *mut f32, i64, i64, i64) -> c_int,
     pub q8r_f16: unsafe extern "C" fn(G, P, P, i64, i64, *mut u16) -> c_int,
+    /// K-quants (type: ggml's code; n_in)
+    pub kr_supported: unsafe extern "C" fn(c_int, i64) -> c_int,
+    pub kr_row_bytes: unsafe extern "C" fn(c_int, i64) -> usize,
+    /// (type, raw blocks, rows, n_in, dst)
+    pub kr_pack: unsafe extern "C" fn(G, c_int, P, i64, i64, M) -> c_int,
+    /// (type, repacked, xq, y, n_in, n_out, ncols)
+    pub kr_mmvq: unsafe extern "C" fn(G, c_int, P, P, *mut f32, i64, i64, i64) -> c_int,
+    pub kr_f16: unsafe extern "C" fn(G, c_int, P, i64, i64, *mut u16) -> c_int,
     pub attn_prompt_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
     pub attn_prompt: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32) -> c_int,
     pub attn_decode_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
@@ -158,6 +166,11 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             xq: sym!("ns_mg_xq"),
             mmvq: sym!("ns_mg_mmvq"),
             q8r_f16: sym!("ns_mg_q8r_f16"),
+            kr_supported: sym!("ns_mg_kr_supported"),
+            kr_row_bytes: sym!("ns_mg_kr_row_bytes"),
+            kr_pack: sym!("ns_mg_kr_pack"),
+            kr_mmvq: sym!("ns_mg_kr_mmvq"),
+            kr_f16: sym!("ns_mg_kr_f16"),
             attn_prompt_supported: sym!("ns_mg_attn_prompt_supported"),
             attn_prompt: sym!("ns_mg_attn_prompt"),
             attn_decode_supported: sym!("ns_mg_attn_decode_supported"),

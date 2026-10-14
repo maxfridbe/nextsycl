@@ -1,4 +1,4 @@
-/* silo.h: the museglimmer engine's silo - kernels tuned for Muse Glimmer 30B Q8_0 (every matrix Q8_0), in their own
+/* silo.h: the museglimmer engine's silo - kernels tuned for Muse Glimmer 30B (Q8_0; Q4_K and Q6_K: kq.cpp), in their own
  * library (dist/silo/libnextsycl-museglimmer.so, opened by the engine at load; without it the engine uses the shared
  * ones). A Q8_0 matrix is repacked once at load into its quants and its scales apart (lossless): 34-byte blocks leave
  * the quants 2-byte aligned, the repacked rows are 16-byte loads. */
@@ -23,7 +23,8 @@ int ns_mg_q8r_pack(ns_gpu* g, const void* q8_0, int64_t rows, int64_t n_in, void
 int ns_mg_q8r_from_f32(ns_gpu* g, const float* x, int64_t rows, int64_t n_in, void* dst);
 /* Activations of a decode pass (1..16 columns) quantized for the XMX products: each 32 by amax / 127 (rounded as
  * ggml's Q8_1 does), block b's quants at b x 512 bytes - word w (quants 4w .. 4w + 3) of column c at w x 64 + c x 4: the
- * packed int8 B operand - then the scales [16][n_in / 32] float - of x = a (op 0), a * sigmoid(b) (op 1: the attention's
+ * packed int8 B operand - then the scales [n_in / 32][16] float, then the blocks' sums [n_in / 32][16] float (scale x its quants' sum: a K-quant's
+ * minimum against them) - of x = a (op 0), a * sigmoid(b) (op 1: the attention's
  * gate), silu(a) * b (op 2: SwiGLU); a and b [ncols, n_in] */
 size_t ns_mg_xq_bytes(int64_t n_in, int64_t ncols);
 int ns_mg_xq(ns_gpu* g, const float* a, const float* b, int op, void* xq, int64_t n_in, int64_t ncols);
@@ -55,6 +56,16 @@ int ns_mg_attn_decode(ns_gpu* g, const float* q, const void* kc, const void* vc,
 int64_t ns_mg_attn_block_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0, int64_t win);
 int ns_mg_attn_block(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
                      int64_t win, float* out, float* scratch);
+/* K-quant matrices (kq.cpp; type: ggml's code, 12 Q4_K or 14 Q6_K; n_in a multiple of 256) repacked a row at a time,
+ * losslessly: row r at r x ns_mg_kr_row_bytes (16-byte aligned, so rows r0.. are a view); raw: the GGUF blocks */
+int ns_mg_kr_supported(int type, int64_t n_in);
+size_t ns_mg_kr_row_bytes(int type, int64_t n_in);
+int ns_mg_kr_pack(ns_gpu* g, int type, const void* raw, int64_t rows, int64_t n_in, void* dst);
+/* Their decode products on XMX, as ns_mg_mmvq: y [ncols, n_out] = W . x (ns_mg_xq), ncols 1..16, n_out a multiple of 8;
+ * a column's sums the same however many columns */
+int ns_mg_kr_mmvq(ns_gpu* g, int type, const void* w, const void* xq, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+/* Repacked K-quant rows expanded to half (a prompt pass's GEMMs): dst [rows, n_in] */
+int ns_mg_kr_f16(ns_gpu* g, int type, const void* w, int64_t rows, int64_t n_in, uint16_t* dst);
 /* Repacked Q8_0 rows expanded to half (a prompt pass's GEMMs): dst [rows, n_in] */
 int ns_mg_q8r_f16(ns_gpu* g, const void* wq, const void* ws, int64_t rows, int64_t n_in, uint16_t* dst);
 

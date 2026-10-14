@@ -10,6 +10,7 @@
 #include "ns.h"
 #include "ns_internal.hpp"
 #include "silo.h"
+#include "xq.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
@@ -21,12 +22,11 @@ using half = sycl::half;
 constexpr int SG = 16, NSG = 4, WG = SG * NSG;
 
 
-size_t align256(size_t n) { return (n + 255) / 256 * 256; }
-
-// the activations' layout (above): where column c's element i goes, and where the scales start
-inline int64_t xq_at(int64_t c, int64_t i) { return (i / 32) * 512 + ((i % 32) / 4) * 64 + c * 4 + (i % 4); }
-inline size_t xq_scales(int64_t n_in) { return align256((size_t) (n_in / 32) * 512); }
-constexpr int64_t XCOLS = 16;
+using mgxq::align256;
+using mgxq::XCOLS;
+// the activations' layout (xq.hpp)
+inline int64_t xq_at(int64_t c, int64_t i) { return mgxq::at(c, i); }
+inline size_t xq_scales(int64_t n_in) { return mgxq::scales(n_in); }
 
 // ---- the products on XMX (int8 DPAS, 8 x 32 x 16): a weight tile of 8 rows x 32 (one Q8 block of each) against the
 // 16 columns' quants of that block (packed by each sub-group into local memory, columns past ncols zero), the int32
@@ -66,7 +66,7 @@ void mmvq_xmx(sycl::queue& q, const int8_t* wq, const half* ws, const int8_t* xq
                 if (k >= nb) break;
                 jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16, jm::layout::ext_intel_packed> bm;
                 jm::joint_matrix_load(sg, bm, gpm(xq + k * 512), (size_t) 64);
-                const float xsc = col ? xs[lane * nb + k] : 0.0f;
+                const float xsc = col ? xs[k * 16 + lane] : 0.0f;
 #pragma unroll
                 for (int t = 0; t < RT; ++t) {
                     const int64_t r = row0 + t * 8;
@@ -151,7 +151,7 @@ int ns_mg_q8r_from_f32(ns_gpu* g, const float* x, int64_t rows, int64_t n_in, vo
     NS_CATCH
 }
 
-size_t ns_mg_xq_bytes(int64_t n_in, int64_t ncols) { return xq_scales(n_in) + (size_t) (XCOLS * (n_in / 32)) * 4; }
+size_t ns_mg_xq_bytes(int64_t n_in, int64_t ncols) { return mgxq::bytes(n_in); }
 
 int ns_mg_xq(ns_gpu* g, const float* a, const float* b, int op, void* xq, int64_t n_in, int64_t ncols) {
     NS_TRY
@@ -159,6 +159,8 @@ int ns_mg_xq(ns_gpu* g, const float* a, const float* b, int op, void* xq, int64_
     if (op != 0 && !b) return ns_fail("ns_mg_xq: op needs b");
     int8_t* oq = (int8_t*) xq;
     float* os = (float*) ((uint8_t*) xq + xq_scales(n_in));
+    float* osum = (float*) ((uint8_t*) xq + mgxq::sums(n_in));
+    int8_t* oa = (int8_t*) xq + mgxq::rowq(n_in);
     const int64_t nbc = n_in / 32;
     const int64_t nb = ncols * (n_in / 32);
     // a sub-group of 32 a block (ggml's quantize_q8_1: d = amax / 127, q = round(x / d), d kept as half)
@@ -173,8 +175,14 @@ int ns_mg_xq(ns_gpu* g, const float* a, const float* b, int op, void* xq, int64_
         const float amax = sycl::reduce_over_group(sg, sycl::fabs(v), sycl::maximum<float>());
         const float d = amax / 127.0f;
         const float id = d != 0.0f ? 1.0f / d : 0.0f;
-        oq[xq_at(blk / nbc, (blk % nbc) * 32 + i)] = (int8_t) sycl::round(v * id);
-        if (i == 0) os[blk] = (float) (half) d;
+        const int qi = (int) sycl::round(v * id);
+        oq[xq_at(blk / nbc, (blk % nbc) * 32 + i)] = (int8_t) qi;
+        oa[mgxq::at_a(blk / nbc, (blk % nbc) * 32 + i)] = (int8_t) qi;
+        const int qs = sycl::reduce_over_group(sg, qi, sycl::plus<int>());
+        if (i == 0) {
+            os[(blk % nbc) * 16 + blk / nbc] = (float) (half) d;
+            osum[(blk % nbc) * 16 + blk / nbc] = (float) (half) d * (float) qs;
+        }
     });
     return 0;
     NS_CATCH
@@ -185,6 +193,8 @@ int ns_mg_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* xq, 
     if (C % 32 != 0 || rows > XCOLS) return ns_fail("ns_mg_rms_xq: C a multiple of 32, at most 16 rows");
     int8_t* oq = (int8_t*) xq;
     float* os = (float*) ((uint8_t*) xq + xq_scales(C));
+    float* osum = (float*) ((uint8_t*) xq + mgxq::sums(C));
+    int8_t* oa = (int8_t*) xq + mgxq::rowq(C);
     const int64_t nb = C / 32;
     constexpr int W = 1024, S = 32;
     // a work-group a row: the sum of squares, then a sub-group a block at a time
@@ -203,8 +213,14 @@ int ns_mg_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* xq, 
             const float amax = sycl::reduce_over_group(sg, sycl::fabs(v), sycl::maximum<float>());
             const float d = amax / 127.0f;
             const float id = d != 0.0f ? 1.0f / d : 0.0f;
-            oq[xq_at(r, i)] = (int8_t) sycl::round(v * id);
-            if (lane == 0) os[r * nb + b] = (float) (half) d;
+            const int qi = (int) sycl::round(v * id);
+            oq[xq_at(r, i)] = (int8_t) qi;
+            oa[mgxq::at_a(r, i)] = (int8_t) qi;
+            const int qs = sycl::reduce_over_group(sg, qi, sycl::plus<int>());
+            if (lane == 0) {
+                os[b * 16 + r] = (float) (half) d;
+                osum[b * 16 + r] = (float) (half) d * (float) qs;
+            }
         }
     });
     return 0;
@@ -216,6 +232,8 @@ int ns_mg_post_rms_xq(ns_gpu* g, const float* out, const float* wp, float ep, fl
     if (C % 32 != 0 || rows > XCOLS) return ns_fail("ns_mg_post_rms_xq: C a multiple of 32, at most 16 rows");
     int8_t* oq = (int8_t*) xq;
     float* os = (float*) ((uint8_t*) xq + xq_scales(C));
+    float* osum = (float*) ((uint8_t*) xq + mgxq::sums(C));
+    int8_t* oa = (int8_t*) xq + mgxq::rowq(C);
     const int64_t nb = C / 32;
     constexpr int W = 1024, S = 32;
     // a work-group a row: out's sum of squares, x updated (each work-item its own elements), x's sum of squares, then
@@ -243,8 +261,14 @@ int ns_mg_post_rms_xq(ns_gpu* g, const float* out, const float* wp, float ep, fl
             const float amax = sycl::reduce_over_group(sg, sycl::fabs(v), sycl::maximum<float>());
             const float d = amax / 127.0f;
             const float id = d != 0.0f ? 1.0f / d : 0.0f;
-            oq[xq_at(r, i)] = (int8_t) sycl::round(v * id);
-            if (lane == 0) os[r * nb + b] = (float) (half) d;
+            const int qi = (int) sycl::round(v * id);
+            oq[xq_at(r, i)] = (int8_t) qi;
+            oa[mgxq::at_a(r, i)] = (int8_t) qi;
+            const int qs = sycl::reduce_over_group(sg, qi, sycl::plus<int>());
+            if (lane == 0) {
+                os[b * 16 + r] = (float) (half) d;
+                osum[b * 16 + r] = (float) (half) d * (float) qs;
+            }
         }
     });
     return 0;
