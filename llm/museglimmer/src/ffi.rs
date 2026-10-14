@@ -32,6 +32,8 @@ pub struct Api {
     pub put_cols: unsafe extern "C" fn(G, *const f32, *mut f32, i64, i64, i64, i64) -> c_int,
     pub get_cols: unsafe extern "C" fn(G, *const f32, *mut f32, i64, i64, i64, i64) -> c_int,
     pub argmax: unsafe extern "C" fn(G, *const f32, *mut i32, i64, i64) -> c_int,
+    /// (logits, out, T, n, temperature, top_p, seed, pos0)
+    pub sample: unsafe extern "C" fn(G, *const f32, *mut i32, i64, i64, f32, f32, u64, i64) -> c_int,
     pub add: unsafe extern "C" fn(G, *mut f32, *const f32, i64) -> c_int,
     pub softcap: unsafe extern "C" fn(G, *mut f32, i64, f32, f32) -> c_int,
     pub gate_mul: unsafe extern "C" fn(G, *mut f32, *const f32, i64) -> c_int,
@@ -78,6 +80,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             put_cols: sym!("ns_mg_put_cols"),
             get_cols: sym!("ns_mg_get_cols"),
             argmax: sym!("ns_mg_argmax"),
+            sample: sym!("ns_mg_sample"),
             add: sym!("ns_add"),
             softcap: sym!("ns_mg_softcap"),
             gate_mul: sym!("ns_mg_gate_mul"),

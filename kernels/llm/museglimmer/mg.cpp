@@ -288,6 +288,118 @@ int ns_mg_get_cols(ns_gpu* g, const float* src, float* dst, int64_t T, int64_t n
     NS_CATCH
 }
 
+int ns_mg_sample(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n, float temp, float top_p, unsigned long long seed, int64_t pos0) {
+    NS_TRY
+    constexpr int W = 1024, K = 256;
+    if (T <= 0) return 0;
+    if (n < K) return ns_fail("ns_mg_sample: fewer than 256 values a row");
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> cv(sycl::range<1>(K), h);
+        sycl::local_accessor<int32_t, 1> ci(sycl::range<1>(K), h);
+        sycl::local_accessor<int32_t, 1> cnt(sycl::range<1>(1), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) T * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) {
+            auto grp = it.get_group();
+            const int64_t r = it.get_group(0);
+            const int tid = (int) it.get_local_id(0);
+            const float* xr = x + r * n;
+            // a value's order as an unsigned key (larger value, larger key)
+            auto key = [](float v) {
+                const uint32_t b = sycl::bit_cast<uint32_t>(v);
+                return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+            };
+            // the 256th largest key: built from the top bit down, keeping a bit while at least 256 keys are >= it
+            uint32_t kth = 0;
+            for (int bit = 31; bit >= 0; --bit) {
+                const uint32_t c = kth | (1u << bit);
+                int64_t m = 0;
+                for (int64_t i = tid; i < n; i += W) m += key(xr[i]) >= c;
+                if (sycl::reduce_over_group(grp, m, sycl::plus<int64_t>()) >= K) kth = c;
+            }
+            // the candidates: every key above it, then the equal ones in index order to 256 (contiguous ranges a work-item,
+            // their counts scanned)
+            if (tid == 0) cnt[0] = 0;
+            sycl::group_barrier(grp);
+            int64_t gt = 0;
+            for (int64_t i = tid; i < n; i += W) gt += key(xr[i]) > kth;
+            const int64_t n_gt = sycl::reduce_over_group(grp, gt, sycl::plus<int64_t>());
+            for (int64_t i = tid; i < n; i += W) {
+                if (key(xr[i]) > kth) {
+                    sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space> a(cnt[0]);
+                    const int at = a.fetch_add(1);
+                    cv[at] = xr[i];
+                    ci[at] = (int32_t) i;
+                }
+            }
+            const int64_t chunk = (n + W - 1) / W, b0 = tid * chunk, b1 = sycl::min<int64_t>(n, b0 + chunk);
+            int64_t eq = 0;
+            for (int64_t i = b0; i < b1; ++i) eq += key(xr[i]) == kth;
+            int64_t before = sycl::exclusive_scan_over_group(grp, eq, sycl::plus<int64_t>());
+            for (int64_t i = b0; i < b1 && n_gt + before < K; ++i) {
+                if (key(xr[i]) == kth) {
+                    cv[n_gt + before] = xr[i];
+                    ci[n_gt + before] = (int32_t) i;
+                    ++before;
+                }
+            }
+            sycl::group_barrier(grp);
+            // sorted: a higher value first, then a lower index (bitonic, 256 in local memory)
+            for (int size = 2; size <= K; size <<= 1) {
+                for (int stride = size >> 1; stride > 0; stride >>= 1) {
+                    if (tid < K) {
+                        const int partner = tid ^ stride;
+                        if (partner > tid) {
+                            const bool up = (tid & size) == 0;
+                            const float va = cv[tid], vb = cv[partner];
+                            const int32_t ia = ci[tid], ib = ci[partner];
+                            const bool a_first = va > vb || (va == vb && ia < ib);
+                            if (a_first != up) {
+                                cv[tid] = vb;
+                                cv[partner] = va;
+                                ci[tid] = ib;
+                                ci[partner] = ia;
+                            }
+                        }
+                    }
+                    sycl::group_barrier(grp);
+                }
+            }
+            // the distribution and the draw, as the host's (one work-item: 256 values)
+            if (tid == 0) {
+                uint64_t z = (uint64_t) seed + (uint64_t) (pos0 + r) * 0x9E3779B97F4A7C15ull;
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+                z ^= z >> 31;
+                float u = (float) (z >> 40) / (float) (1u << 24);
+                const float mx = cv[0];
+                float sum = 0.0f;
+                for (int i = 0; i < K; ++i) sum += sycl::exp((cv[i] - mx) / temp);
+                float acc = 0.0f;
+                int keep = K;
+                for (int i = 0; i < K; ++i) {
+                    acc += sycl::exp((cv[i] - mx) / temp) / sum;
+                    if (acc >= top_p) {
+                        keep = i + 1;
+                        break;
+                    }
+                }
+                float total = 0.0f;
+                for (int i = 0; i < keep; ++i) total += sycl::exp((cv[i] - mx) / temp) / sum;
+                int32_t pick = ci[keep - 1];
+                for (int i = 0; i < keep; ++i) {
+                    u -= sycl::exp((cv[i] - mx) / temp) / sum / total;
+                    if (u <= 0.0f) {
+                        pick = ci[i];
+                        break;
+                    }
+                }
+                out[r] = pick;
+            }
+        });
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_mg_argmax(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n) {
     NS_TRY
     constexpr int W = 1024;

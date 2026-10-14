@@ -12,7 +12,7 @@ tasks: true
 env: {}
 silo:                   # its tuned kernels: kernels/llm/museglimmer/silo (dist/silo/libnextsycl-museglimmer.so)
   name: museglimmer
-  required: false       # the shared kernels run it too (Q8_0 decode at about the same speed)
+  required: false       # the shared kernels run it too, without drafts (18 tok/s)
 files:
   model:
     key: mg30-q8

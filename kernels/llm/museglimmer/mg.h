@@ -31,6 +31,10 @@ int ns_mg_attn(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_
 int ns_mg_put_cols(ns_gpu* g, const float* src, float* dst, int64_t T, int64_t n, int64_t ld, int64_t col0);
 /* Columns col0 .. col0 + n of src [T, ld] into dst [T, n] */
 int ns_mg_get_cols(ns_gpu* g, const float* src, float* dst, int64_t T, int64_t n, int64_t ld, int64_t col0);
+/* Each row's draw, on the GPU: the host sampler's distribution (nextsycl-llm sampling.rs: softmax(x / temp) over the
+ * 256 likeliest - a higher value first, then a lower index - cut to the smallest prefix holding top_p, renormalized)
+ * drawn with one uniform a position (row t at position pos0 + t) from seed: x [T, n] -> out [T] */
+int ns_mg_sample(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n, float temp, float top_p, unsigned long long seed, int64_t pos0);
 /* Each row's largest: x [T, n] -> out [T] (the first of equals) */
 int ns_mg_argmax(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n);
 /* The post norm into the residual: res [rows, C] += x / rms(x) * w */

@@ -940,14 +940,15 @@ impl<'g> MuseGlimmer<'g> {
 
     /// `pass` with the work lock held; with the drafter the target's features of every row go into its caches
     fn pass_in(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
-        match self.pass_out(s, tokens, n_out, false, tap)? {
+        match self.pass_out(s, tokens, n_out, None, tap)? {
             Out::Logits(l) => Ok(l),
             Out::Ids(_) => Err(e("a pass's logits")),
         }
     }
 
-    /// A pass's last `n_out` rows: their logits, or (`ids`: a greedy decoder) only each one's argmax, picked on the GPU
-    fn pass_out(&self, s: &mut Session, tokens: &[u32], n_out: usize, ids: bool, tap: Tap) -> Result<Out> {
+    /// A pass's last `n_out` rows: their logits, or (`pick`: a decoder whose logits nothing reads) only each one's token,
+    /// picked on the GPU - the argmax (greedy), or a draw (`Some(sampling)`)
+    fn pass_out(&self, s: &mut Session, tokens: &[u32], n_out: usize, pick: Option<Option<nextsycl_llm::DeviceSampling>>, tap: Tap) -> Result<Out> {
         let g = &self.g;
         let t = tokens.len();
         if t == 0 {
@@ -1051,11 +1052,21 @@ impl<'g> MuseGlimmer<'g> {
         let v = self.output.rows;
         let logits = self.arena().f32(n * v)?;
         self.matmul(&self.output, &normed, None, n, &logits)?;
-        if ids {
-            // the multiplier and the cap change no argmax
+        if let Some(how) = pick {
             let best = self.arena().bytes(n * 4)?;
-            // SAFETY: logits [n, vocab] -> n int32.
-            self.op("argmax", || unsafe { (self.k.argmax)(self.raw(), logits.fp(), best.ptr().cast(), n as i64, v as i64) })?;
+            match how {
+                // the multiplier and the cap change no argmax
+                // SAFETY: logits [n, vocab] -> n int32.
+                None => self.op("argmax", || unsafe { (self.k.argmax)(self.raw(), logits.fp(), best.ptr().cast(), n as i64, v as i64) })?,
+                Some(ds) => {
+                    // SAFETY: n x vocab floats; then each row's draw (row i at its position) into n int32.
+                    self.op("softcap", || unsafe { (self.k.softcap)(self.raw(), logits.fp(), (n * v) as i64, g.logit_scale, g.softcap) })?;
+                    let pos0 = (s.pos - n) as i64;
+                    self.op("sample", || unsafe {
+                        (self.k.sample)(self.raw(), logits.fp(), best.ptr().cast(), n as i64, v as i64, ds.temperature, ds.top_p, ds.seed, pos0)
+                    })?;
+                }
+            }
             let mut b = vec![0u8; n * 4];
             best.read(0, &mut b)?;
             return Ok(Out::Ids(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()));
@@ -1352,10 +1363,12 @@ impl<'g> MuseGlimmer<'g> {
                 }
                 d.drafts.clear();
                 let p0 = s.pos;
-                // a greedy decoder's tokens from the GPU (64 bytes back, not 16 rows of logits)
+                // the tokens from the GPU when the decoder allows (64 bytes back, not 16 rows of logits)
                 let picks: Vec<Option<u32>>;
                 let tv = Instant::now();
-                let res = self.pass_out(s, &rows, rows.len(), smp.greedy(), tap)?;
+                // greedy: the argmaxes; a sampled request nothing reads the logits of: its draws (same distribution)
+                let pick = if smp.greedy() { Some(None) } else { smp.device().map(Some) };
+                let res = self.pass_out(s, &rows, rows.len(), pick, tap)?;
                 tick(&T_VERIFY, tv);
                 STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let logits = match res {
