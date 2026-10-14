@@ -203,7 +203,8 @@ def main():
         # a loop writes the same line over and over in a row; a column read one value a line repeats its values, but not
         # in a row (a credits column: 1.0, A, 1.0, B ...)
         worst, run, prev = ("", 0), 0, None
-        for l in (l.strip() for l in raw.splitlines() if l.strip()):
+        # (lines of markup alone - an empty cell of a table written a tag a line - are not text written over)
+        for l in (l.strip() for l in raw.splitlines() if re.sub(r"<[^>]*>", "", l).strip()):
             run = run + 1 if l == prev else 1
             prev = l
             if run > worst[1]:

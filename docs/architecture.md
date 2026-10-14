@@ -281,6 +281,21 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   original weights (every stage cos >= 0.99999, 40 of 40 greedy tokens). B70: a page seen at ~1000 tok/s, written at
   ~200-250; test-ocr.py: cairn and hslda pass, wtamu reads 84% of its words (the header's right column is skipped by
   the reference too).
+- **olmocr2** (`image/olmocr2`) - Ai2's olmOCR-2-7B-1025, a Qwen2.5-VL-7B fine-tune that reads whole pages into
+  Markdown (tables HTML, equations LaTeX). From two GGUFs: the projector (F16, float32 here: the two temporal patch
+  kernels summed, 32 blocks of 1280 with RMS norms, SwiGLU and 2D rotary positions - 20 frequencies of the row, 20 of
+  the column a head of 80 - attending within windows of 4 x 4 units, blocks 7 / 15 / 23 / 31 over the whole page; the
+  merger's GELU MLP) and the decoder (Qwen2-7B: 28 layers of 3584, 28 query over 4 key / value heads with biases,
+  M-RoPE 16 / 24 / 24 at base 1e6). The decoder's Q8_0 stays Q8_0 on the card, split at load into aligned int8 rows
+  and scales: the prompt's pass expands each matrix to half for oneDNN, a written token's reads 16 bytes a lane
+  (q8r_gemv: 16 -> 58 tok/s, ~460 GB/s). Patches are laid out in window order on the host (prep.rs), the merger's rows
+  gathered back to row order. The reading is olmOCR's pipeline: the page fitted to 1288 on its longest side, its one
+  instruction (text first, then the image, in Qwen's chat template), the front matter dropped and a page the model
+  says is turned turned (PIL's ROTATE_r) and read again. Its kernels (`kernels/image/olmocr2`): the window attention,
+  the Q8 products, row gathers and the one-row grouped attention (flash decoding). Checked against llama.cpp on the
+  same GGUFs (ns-ocr-dump with the prompt placing the image: every tower block cos >= 0.99996, the decoder >= 0.998 -
+  llama.cpp's CPU products quantize activations to 8 bits - and 32 of 32 greedy tokens). B70: a page seen at ~600
+  tok/s, written at ~55-58; test-ocr.py passes all three transcripts.
 
 ## The audio engines
 

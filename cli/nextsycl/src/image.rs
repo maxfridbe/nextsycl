@@ -20,7 +20,7 @@ nextsycl image engines | selftest [--gpu N]";
 
 /// The image engines this program has (image/<arch>)
 pub fn engines() -> Vec<nextsycl_image::ImageKind> {
-    vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_example::kind()]
+    vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_olmocr2::kind(), nextsycl_image_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -310,6 +310,17 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let n: usize = opt(args, "--tokens").and_then(|v| v.parse().ok()).unwrap_or(64);
         let pic = opt(args, "--picture").map(|p| nextsycl_image::Picture::read_png(Path::new(p))).transpose()?;
         let worst = nextsycl_image_paddleocrvl::check::run(&e, dir, pic.as_ref(), n, &mut log).map_err(|e| e.0)?;
+        println!("worst relative error {worst:.2e}");
+        return Ok(());
+    }
+    if nextsycl_image_olmocr2::ARCHS.contains(&m["arch"].as_str().unwrap_or("")) {
+        let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let gpu = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
+        let mut log = |s: String| eprintln!("{s}");
+        let e = nextsycl_image_olmocr2::OlmOcr::load(&files, &gpu, &mut log).map_err(|e| e.0)?;
+        let n: usize = opt(args, "--tokens").and_then(|v| v.parse().ok()).unwrap_or(32);
+        let pic = opt(args, "--picture").map(|p| nextsycl_image::Picture::read_png(Path::new(p))).transpose()?;
+        let worst = nextsycl_image_olmocr2::check::run(&e, dir, pic.as_ref(), n, &mut log).map_err(|e| e.0)?;
         println!("worst relative error {worst:.2e}");
         return Ok(());
     }

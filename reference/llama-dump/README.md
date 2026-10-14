@@ -43,3 +43,10 @@ NS_DUMP_DIR=/tmp/ocr ./build-sycl/bin/llama-ns-ocr-dump -m Unlimited-OCR-Q8_0.gg
   --image page.png -p "document parsing." -n 100 --device none -ngl 0 -t 16
 nextsycl image check /tmp/ocr --model Unlimited-OCR-Q8_0.gguf     # the engine against it, stage by stage
 ```
+
+## olmOCR-2 (Qwen2.5-VL)
+
+The same tool: a prompt holding mtmd's marker (`<__media__>`) places the picture itself (olmOCR's text comes before
+it). `~/src/olm-dump.sh DIR IMAGE [N]` on hardac1 runs it with olmOCR's instruction in Qwen's chat template (CPU);
+`nextsycl image check DIR --model olmOCR-2-7B-1025-Q8_0.gguf --picture IMAGE` compares (the picture fitted to 1288
+on its longest side first).

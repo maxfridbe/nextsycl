@@ -193,10 +193,12 @@ impl Tokenizer {
         let (split, pre_splits): (&str, &[&str]) = match pre {
             "glm4" | "glm5" | "chatglm-bpe" => (GLM4_SPLIT, &[]),
             "qwen35" => (QWEN35_SPLIT, &[]),
+            // llama.cpp's QWEN2: the contractions either case, letters, single digits
+            "qwen2" => (QWEN2_SPLIT, &[]),
             "gpt-4o" | "llama4" => (GPT4O_SPLIT, &[]),
             // DeepSeek-V4's `joyai-llm`: llama.cpp gives it DeepSeek-V3's three patterns
             "deepseek-v3" | "joyai-llm" => (DEEPSEEK3_SPLITS[2], &DEEPSEEK3_SPLITS[..2]),
-            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen35, deepseek-v3, joyai-llm, llama4)")),
+            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen2, qwen35, deepseek-v3, joyai-llm, llama4)")),
         };
         let tokens = strs(g.meta("tokenizer.ggml.tokens"));
         let types: Vec<u64> = g.meta("tokenizer.ggml.token_type").and_then(Value::as_array).map(|a| a.iter().map(|x| x.as_u64().unwrap_or(1)).collect()).unwrap_or_default();

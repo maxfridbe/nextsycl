@@ -42,6 +42,7 @@ for a chat model. Measured speeds, decode / prompt reading:
 | `qwen-image-2.1-q8` | **Qwen-Image 2.1** text to image, edits | 1024x1024, 40 steps: 23.8 s (16.5 s int8) |
 | `unlimited-ocr-q8`, `-q4` | **Unlimited-OCR** pictures and PDFs to Markdown (tables as HTML, boxes), its own page | a page: ~2-3 s to see, ~130 tok/s written |
 | `paddleocr-vl-1.6` | **PaddleOCR-VL** text, tables (HTML), formulas (LaTeX), charts, seals, spotting; the same OCR page | a page: ~1.2 s to see, ~200-250 tok/s written |
+| `olmocr-2-7b-q8` | **olmOCR-2** whole pages to Markdown (tables HTML, equations LaTeX), turned pages righted; the same OCR page | a page: ~3 s to see, ~55 tok/s written |
 | `minimax-h3` | **MiniMax H3** video with sound | 896x672, 4.5 s: ~90 s |
 | `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |
 | `qwen3-tts-custom` | **Qwen3-TTS** speech | 33 s of speech: 7.7 s |
@@ -108,6 +109,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `qwen-image-2.1-q8` | Qwen-Image 2.1 Q8_0: text to image (RGBA), edits and compositions of up to 8 pictures | `qwenimage21` | 16.4 GiB | checked, served |
 | `unlimited-ocr-q8`, `unlimited-ocr-q4` | Unlimited-OCR (Baidu, the DeepSeek-OCR architecture): pages to Markdown, tables as HTML, boxes with `<|grounding|>`; long pages in fixed memory | `unlimited-ocr` | 6.5 GiB (decoder in half) | checked (PIL, deepencoder.py, llama.cpp), served |
 | `paddleocr-vl-1.6` | PaddleOCR-VL 1.6 (PaddlePaddle): SigLIP NaViT at the page's size + ERNIE-4.5 0.3B; text, tables, formulas, charts, seals, spotting | `paddleocr-vl` | ~3 GiB (vision float32, decoder half) | checked (transformers), served |
+| `olmocr-2-7b-q8` | olmOCR-2-7B-1025 (Ai2, a Qwen2.5-VL-7B fine-tune): pages to Markdown in reading order | `olmocr2` | ~11 GiB (decoder Q8_0, vision float32) | checked (llama.cpp), served |
 | `qwen-image-2.1-turbo-q8` | Qwen-Image 2.1 Turbo (Viggle v0.3 merged): 6 steps | `qwenimage21` | 16.5 GiB | checked |
 | `qwen-image-2.1-q6k`, `-uncensored-q8` | Qwen-Image 2.1 Q6_K; the uncensored model in Q8_0 | `qwenimage21` | 14.8 / 16.4 GiB | listed |
 | `qwen-image-2.1-q4km`, `-uncensored-q4km` | Q4_K_M | `qwenimage21` | 13.6 GiB | listed (needs Q5_K in the dequant) |

@@ -140,8 +140,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         bitmaps.push_back(b.bitmap);
-        text += mtmd_get_marker(mctx);
     }
+    // the prompt places the picture itself when it holds the marker (a chat template: olmOCR's text comes first);
+    // otherwise the pictures go first
+    const std::string marker = mtmd_get_marker(mctx);
+    if (params.prompt.find(marker) == std::string::npos)
+        for (size_t i = 0; i < bitmaps.size(); ++i) text += marker;
     text += params.prompt;
     mtmd_input_text in{text.c_str(), text.size(), /*add_special*/ true, /*parse_special*/ true};
     mtmd_input_chunks* chunks = mtmd_input_chunks_init();

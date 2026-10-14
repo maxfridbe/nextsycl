@@ -1,0 +1,13 @@
+[package]
+name = "nextsycl-image-olmocr2"
+description = "olmOCR-2 (allenai, a Qwen2.5-VL-7B fine-tune): pages to Markdown with tables as HTML and equations as LaTeX"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-image.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
