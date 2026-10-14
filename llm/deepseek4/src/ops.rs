@@ -655,6 +655,29 @@ impl Ops {
         };
         self.ok(rc, "ds4_idx_score_dec")
     }
+    /// `idx_score_dec` for prompt rows (several rows sharing each key tile)
+    #[allow(clippy::too_many_arguments)]
+    pub fn idx_score_pre(&self, q16: &DevBuf, w: &DevBuf, cache: &DevBuf, score: &DevBuf, t: usize, h: usize, d: usize, n: usize, ld: usize, pos0: usize,
+                         packed: bool) -> Result<()> {
+        q16.bounds(0, t * h * d * 2)?;
+        need!(w, t * h, "idx_score_pre w");
+        cache.bounds(0, n.max(8) * d * 2)?;
+        need!(score, t * ld, "idx_score_pre score");
+        // SAFETY: sizes checked.
+        let rc = unsafe {
+            (self.k.ds4_idx_score_pre)(self.raw(), q16.ptr().cast(), w.fp(), cache.ptr().cast(), score.fp(), t as i64, h as i64, d as i64, n as i64, ld as i64,
+                                       pos0 as i64, packed as i64)
+        };
+        self.ok(rc, "ds4_idx_score_pre")
+    }
+    /// The indexer's queries q [t][64][128] float into `packed` (fp16, as the score kernels' B tiles)
+    pub fn idx_pack(&self, q: &DevBuf, packed: &DevBuf, t: usize) -> Result<()> {
+        need!(q, t * 64 * 128, "idx_pack q");
+        packed.bounds(0, t * 64 * 128 * 2)?;
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds4_idx_pack)(self.raw(), q.fp(), packed.ptr().cast(), t as i64) };
+        self.ok(rc, "ds4_idx_pack")
+    }
     /// Two-level top-k glue: chunk picks sel1 -> candidates (values, positions); candidate picks sel2 -> positions
     #[allow(clippy::too_many_arguments)]
     pub fn topk_gather(&self, score: &DevBuf, sel1: &DevBuf, cval: &DevBuf, cpos: &DevBuf, t: usize, nch: usize, c: usize, k: usize) -> Result<()> {

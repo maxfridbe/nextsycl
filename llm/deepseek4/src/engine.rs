@@ -108,6 +108,18 @@ fn esimd_max() -> Option<usize> {
     *V.get_or_init(|| std::env::var("NS_ESIMD_MAX").ok().and_then(|v| v.parse().ok()))
 }
 
+/// NS_DS4_ROUTE_LOG=path: each decode pass's experts a layer appended there ("layer e1,e2,..."), for offline cache
+/// policy studies
+fn route_log(l: u64, need: &[u64]) {
+    use std::io::Write;
+    static F: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let f = F.get_or_init(|| std::env::var("NS_DS4_ROUTE_LOG").ok().and_then(|p| std::fs::File::create(p).ok()).map(Mutex::new));
+    if let Some(f) = f {
+        let ex: Vec<String> = need.iter().map(|x| x.to_string()).collect();
+        let _ = writeln!(f.lock().unwrap(), "{l} {}", ex.join(","));
+    }
+}
+
 /// The expert profile (NS_EXPERT_PROFILE: "layer expert weight" lines), read once
 fn expert_profile() -> Option<&'static HashMap<(u64, u64), f64>> {
     static V: std::sync::OnceLock<Option<HashMap<(u64, u64), f64>>> = std::sync::OnceLock::new();
@@ -262,6 +274,19 @@ fn mtp_drafts() -> usize {
     *V.get_or_init(|| std::env::var("NS_DS4_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 2))
 }
 
+/// Prompt rows' indexer through the fused score kernel, several rows a work-group (NS_DS4_IDX_PRE=0: the fp16 GEMM
+/// writing every head's score, then the pass summing them)
+fn idx_pre() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS4_IDX_PRE").map_or(true, |v| v != "0"))
+}
+
+/// NS_DS4_IDX_PACKED=0: the prompt indexer's queries packed into local memory a work-group instead of once in global
+fn idx_packed() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS4_IDX_PACKED").map_or(true, |v| v != "0"))
+}
+
 /// Decode's indexer through this engine's fused score kernel and two-level top-k (NS_DS4_IDX_FUSED=0: the GEMM, the
 /// score pass and one radix select a row)
 fn idx_fused() -> bool {
@@ -342,6 +367,13 @@ struct Store {
 }
 
 impl Store {
+    /// The VRAM slots to give up, in order (none of this pass's): empty ones, then the least recently used (least
+    /// used first, LFU, measured mixed: 23% fewer swaps on free cards, 16% more beside a 256K reserve)
+    fn victims(&self, tick: u64) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.vowner.len()).filter(|&i| self.vused[i] != tick && self.usable(i)).collect();
+        order.sort_by_key(|&i| if self.vowner[i].is_none() { 0 } else { self.vused[i] + 1 });
+        order
+    }
     fn vat(&self, s: usize) -> (usize, usize) {
         if s >= self.base {
             return (self.vram.len() - 1, (s - self.base) * self.slot_bytes);
@@ -1171,8 +1203,7 @@ impl Part {
         }
         c.prefetched.retain(|k, _| k.0 != l);
         if !missing.is_empty() {
-            let mut order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick && c.usable(i)).collect();
-            order.sort_by_key(|&i| if c.vowner[i].is_none() { 0 } else { c.vused[i] + 1 });
+            let order = c.victims(tick);
             let mut buf: Option<Vec<u8>> = None;
             let after = if promote && !swap_wait() { None } else { Some(self.ops.mark()?) };
             for (ex, &s) in missing.iter().zip(&order) {
@@ -1349,8 +1380,7 @@ impl Part {
         if cand.is_empty() {
             return Ok(());
         }
-        let mut order: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick && c.usable(i)).collect();
-        order.sort_by_key(|&i| if c.vowner[i].is_none() { 0 } else { c.vused[i] + 1 });
+        let order = c.victims(tick);
         let after = if swap_wait() { Some(self.ops.mark()?) } else { None };
         let mut reading: HashMap<usize, i64> = HashMap::new();
         let mut buf = None;
@@ -1892,12 +1922,20 @@ impl<'g> Ds4<'g> {
         // the queries in fp16 against the keys' fp16 cache, on XMX (the scores only rank the blocks; float32 GEMMs
         // made a 128K prompt's indexer its largest part: it grows with the square of the context)
         let iq16 = p.arena.bytes(tr * hh * d * 2)?;
-        o.to_f16(&iq, &iq16, tr * hh * d)?;
+        let packed = hh == 64 && d == 128 && idx_pre() && idx_packed();
+        if packed {
+            o.idx_pack(&iq, &iq16, tr)?;
+        } else {
+            o.to_f16(&iq, &iq16, tr * hh * d)?;
+        }
         let sel = p.arena.bytes(tr * kp * 4)?;
         for q0 in (0..tr).step_by(rows) {
             let qn = rows.min(tr - q0);
             let sc = score.view(0, qn * n * 4)?;
-            let mut j0 = 0;
+            if hh == 64 && d == 128 && idx_pre() {
+                o.idx_score_pre(&iq16.view(q0 * hh * d * 2, qn * hh * d * 2)?, &w.view(q0 * hh * 4, qn * hh * 4)?, &ix.cache, &sc, qn, hh, d, n, n, pos0 + q0, packed)?;
+            }
+            let mut j0 = if hh == 64 && d == 128 && idx_pre() { n } else { 0 };
             while j0 < n {
                 let nc = nc_max.min(n - j0);
                 o.gemm_f16(qn * hh, nc, d, (&iq16, q0 * hh * d, d), (&ix.cache, j0 * d), (&sbuf, 0, nc), false)?;
@@ -2702,6 +2740,9 @@ impl<'g> Ds4<'g> {
         // the shared expert (queued above), then each routed expert added into it
         tap(&format!("ffn_shexp-{l}"), &y)?;
         let need: Vec<u64> = by.keys().map(|e| *e as u64).collect();
+        if t <= MMVQ_COLS {
+            route_log(l, &need);
+        }
         let promote = t <= MMVQ_COLS && !std::env::var("NS_DECODE_DIRECT").is_ok_and(|v| v == "1");
         let (slots, arriving, copies) = self.timed(p, "expert misses (swaps / file)", || p.ensure(&self.m, l, &need, promote))?;
         let parts = expert_parts(&self.m, l)?;

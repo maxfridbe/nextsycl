@@ -73,6 +73,12 @@ int ns_ds4_ticket_wait(ns_gpu* g, int64_t t);
  * blocks j < (pos0 + t + 1) / 4 (and < n), -inf for the rest up to ld; q16 [T][64][128] fp16, cache [n][128] fp16 */
 int ns_ds4_idx_score_dec(ns_gpu* g, const uint16_t* q16, const float* w, const uint16_t* cache, float* score, int64_t T, int64_t H, int64_t D,
                          int64_t n, int64_t ld, int64_t pos0);
+/* the same for prompt rows (NS_DS4_IDX_ROWS rows a work-group); packed: q16 from ns_ds4_idx_pack (read from global
+ * memory), else plain fp16 (packed into local memory) */
+int ns_ds4_idx_score_pre(ns_gpu* g, const uint16_t* q16, const float* w, const uint16_t* cache, float* score, int64_t T, int64_t H, int64_t D,
+                         int64_t n, int64_t ld, int64_t pos0, int64_t packed);
+/* the indexer's queries q [T][64][128] float -> fp16 as joint_matrix B tiles: [T][64][2] pairs of dims */
+int ns_ds4_idx_pack(ns_gpu* g, const float* q, uint16_t* packed, int64_t T);
 /* the two-level top-k's glue: sel1 [T * nch][K] (positions in chunks of C of score [T][nch * C]) -> the candidates'
  * values and positions [T][nch * K]; sel2 [T][K] (indices into the candidates) -> positions sel [T][K] */
 int ns_ds4_topk_gather(ns_gpu* g, const float* score, const int32_t* sel1, float* cval, int32_t* cpos, int64_t T, int64_t nch, int64_t C, int64_t K);

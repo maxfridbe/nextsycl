@@ -187,8 +187,10 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   row as the DPAS rows); MXFP4 has its own kernels (`ds4.cpp`) - all in its silo, `kernels/llm/deepseek4/silo`
   (dist/silo/libnextsycl-deepseek4.so). Checked against llama.cpp layer by layer (5 tokens: cosine >= 0.98, logits 0.998, the same
   next token; long prompts drift only where near-tied experts swap). B70 + B65, 61 GB of host memory: ~25.6 tok/s
-  decode (21.8 at 3.7K, 17 at 140K), ~630 tok/s prompt reading at 3.7K tokens, ~870 at 128K (the indexer's keys
-  fp16, its scores on XMX). The passes' small tables go up and the routers'
+  decode (21.8 at 3.7K, 17 at 140K), ~630 tok/s prompt reading at 3.7K tokens, ~870 at 128K, 943 at 256K (the
+  indexer's keys fp16; its prompt scores fused: queries packed once as XMX B tiles in global memory, each key tile
+  against a row's 64 heads, relu x weight summed in registers - the GEMM writing every head's score was half a 256K
+  prompt). The passes' small tables go up and the routers'
   logits come down through pinned rings copied by kernels (the runtime's memcpy waits behind the expert copies on
   the copy engine), and the shared expert runs while the host routes; the layers split by the cards' speed.
   MTP: the original checkpoint's draft block (its last shard; unsloth's GGUFs leave it out) converted after the pull

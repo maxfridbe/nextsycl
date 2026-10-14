@@ -27,7 +27,7 @@ for a chat model. Measured speeds, decode / prompt reading:
 |---|---|---|
 | `deepseek-r1-iq1s` | **DeepSeek-R1 671B** (unsloth UD-IQ1_S, 131 GiB) - the experts that do not fit VRAM in pinned RAM (multiplied on the CPU) and on the NVMe | ~8 tok/s / ~135 tok/s, 32K context |
 | `glm-5.3-flash-uncensored-256k` | **GLM-5.3-Flash** uncensored IQ2 | ~18 tok/s / 450-1,100 tok/s, to 256K |
-| `deepseek-v4-flash-iq2m`, `-256k` | **DeepSeek-V4-Flash 284B** (unsloth UD-IQ2_M, 84.7 GiB) - the experts beyond VRAM in pinned RAM; llama.cpp pages it from the disk (no result in 100 minutes) | ~27 tok/s with its MTP draft block (26 at 3.7K, 17 at 256K) / 635-1,000 tok/s (873 at 128K, 700 at 256K), 128K or 256K context (1M tested: 287 tok/s prompt, 12 tok/s decode) |
+| `deepseek-v4-flash-iq2m`, `-256k` | **DeepSeek-V4-Flash 284B** (unsloth UD-IQ2_M, 84.7 GiB) - the experts beyond VRAM in pinned RAM; llama.cpp pages it from the disk (no result in 100 minutes) | ~27 tok/s with its MTP draft block (26 at 3.7K, 17 at 256K) / 635-1,000 tok/s (943 at 256K), 128K or 256K context (1M tested: 287 tok/s prompt, 12 tok/s decode) |
 
 **On one 32 GB card** (measured on an Arc Pro B70):
 

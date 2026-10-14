@@ -417,6 +417,11 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS4_ATTN_G` | 8 from 64 rows, else 2 | Experiment: groups of 8 heads an attention work-group takes (1, 2, 4, 8) | kernels:llm deepseek4 |
 | `NS_DS4_DRAFTS` | 1 | 2: a second draft, the draft block chained on its own output, verified in a 3-row pass (measured slower: a poem 27.7 -> 22.7 tok/s, a 3.7K summary 26.0 -> 25.5; the second draft is kept ~45% of the time) | llm deepseek4 |
 | `NS_DS4_MTP_EXPERTS` | 128 | the draft block's experts kept in VRAM (of 256, 13 MB each; the most recently used); one missing is left out of that draft and read in for the next (256: all, 3.2 GiB) | llm deepseek4 |
+| `NS_DS4_IDX_PRE` | on | 0: prompt rows' indexer as the fp16 GEMM writing every head's score and a pass summing them, instead of the fused score kernel (256K prompt 700 -> 943 tok/s) | llm deepseek4 |
+| `NS_DS4_IDX_PACKED` | on | 0: the fused prompt indexer packs the queries into local memory a work-group instead of once into global memory (35K: indexer 3.05 -> 1.90 s) | llm deepseek4 |
+| `NS_DS4_IDX_ROWS` | 1 | Experiment: query rows a fused prompt indexer work-group takes (1, 2, 4) | kernels:llm deepseek4 |
+| `NS_DS4_IDX_KT` | 2 | Experiment: key tiles sharing each query tile loaded in the local-memory prompt indexer (1, 2) | kernels:llm deepseek4 |
+| `NS_DS4_ROUTE_LOG` | off | path: each decode pass's experts a layer written there ("layer e1,e2,..."), for offline cache studies | llm deepseek4 |
 | `NS_DS4_IDX_FUSED` | on | 0: decode's indexer as a GEMM, a score pass and one radix select a row instead of the fused score kernel and two-level top-k | llm deepseek4 |
 | `NS_DS4_MULTI_CACHED` | on | 0: the IQ experts' multi-matrix kernel loads each row's activations again instead of holding them over a sub-group's run of rows | kernels:llm deepseek4 |
 | `NS_DS4_MULTI_DENSE` | on | 0: decode's dense products of one input a launch a matrix (shared kernels) instead of one multi-matrix launch a type | llm deepseek4 |
