@@ -20,7 +20,7 @@ nextsycl image engines | selftest [--gpu N]";
 
 /// The image engines this program has (image/<arch>)
 pub fn engines() -> Vec<nextsycl_image::ImageKind> {
-    vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_example::kind()]
+    vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -35,8 +35,13 @@ fn model(cfg: &Config, id: Option<&str>) -> Result<(Value, ModelFiles), String> 
         let mut files = ModelFiles::new();
         files.insert("model".into(), p.to_path_buf());
         if let Some(mm) = std::fs::read_dir(p.parent().unwrap_or(Path::new("."))).map_err(|e| e.to_string())?.flatten().map(|e| e.path())
-            .find(|q| q.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("mmproj") && n.ends_with(".gguf"))) {
+            .find(|q| q != p && q.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("mmproj") && n.ends_with(".gguf"))) {
             files.insert("mmproj".into(), mm);
+        }
+        // a tokenizer.json beside it (PaddleOCR-VL reads the original one)
+        let tj = p.with_file_name("tokenizer.json");
+        if tj.is_file() {
+            files.insert("tokenizer".into(), tj);
         }
         let m = serde_json::json!({"id": p.file_stem().and_then(|s| s.to_str()).unwrap_or("model"), "arch": g.architecture(), "kind": "image"});
         return Ok((m, files));
@@ -180,6 +185,7 @@ fn ocr(cfg: &Config, args: &[String]) -> Result<(), String> {
         columns: Some(!args.iter().any(|a| a == "--no-columns")),
         max_tokens: opt(args, "--max").and_then(|v| v.parse().ok()).unwrap_or(0),
         temperature: opt(args, "--temp").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+        ngram: opt(args, "--ngram").and_then(|v| v.parse().ok()),
         ..Default::default()
     };
     use std::io::Write;
@@ -293,6 +299,17 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let e = nextsycl_image_unlimitedocr::UnlimitedOcr::load(&files, &gpu, &mut log).map_err(|e| e.0)?;
         let n: usize = opt(args, "--tokens").and_then(|v| v.parse().ok()).unwrap_or(64);
         let worst = nextsycl_image_unlimitedocr::check::run(&e, dir, n, &mut log).map_err(|e| e.0)?;
+        println!("worst relative error {worst:.2e}");
+        return Ok(());
+    }
+    if nextsycl_image_paddleocrvl::ARCHS.contains(&m["arch"].as_str().unwrap_or("")) {
+        let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let gpu = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
+        let mut log = |s: String| eprintln!("{s}");
+        let e = nextsycl_image_paddleocrvl::PaddleOcrVl::load(&files, &gpu, &mut log).map_err(|e| e.0)?;
+        let n: usize = opt(args, "--tokens").and_then(|v| v.parse().ok()).unwrap_or(64);
+        let pic = opt(args, "--picture").map(|p| nextsycl_image::Picture::read_png(Path::new(p))).transpose()?;
+        let worst = nextsycl_image_paddleocrvl::check::run(&e, dir, pic.as_ref(), n, &mut log).map_err(|e| e.0)?;
         println!("worst relative error {worst:.2e}");
         return Ok(());
     }

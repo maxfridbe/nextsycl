@@ -555,6 +555,7 @@ dependencies = [
  "nextsycl-gguf",
  "nextsycl-image",
  "nextsycl-image-example",
+ "nextsycl-image-paddleocrvl",
  "nextsycl-image-qwenimage21",
  "nextsycl-image-unlimitedocr",
  "nextsycl-llm",
@@ -668,6 +669,17 @@ version = "0.0.0"
 dependencies = [
  "nextsycl-core",
  "nextsycl-image",
+]
+
+[[package]]
+name = "nextsycl-image-paddleocrvl"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-image",
+ "nextsycl-tok",
 ]
 
 [[package]]

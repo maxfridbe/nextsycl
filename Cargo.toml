@@ -5,7 +5,7 @@ resolver = "2"
 members = [
     "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl",
     "llm/contract", "llm/glm5next", "llm/qwen4exp", "llm/qwen35", "llm/deepseek2", "llm/deepseek4", "llm/museglimmer", "llm/example",
-    "image/contract", "image/example", "image/qwenimage21", "image/unlimitedocr",
+    "image/contract", "image/example", "image/qwenimage21", "image/unlimitedocr", "image/paddleocrvl",
     "video/contract", "video/example", "video/h3",
     "audio/contract", "audio/example", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2",
     "glue/models", "glue/serve",
@@ -36,6 +36,7 @@ nextsycl-image = { path = "image/contract" }
 nextsycl-image-example = { path = "image/example" }
 nextsycl-image-qwenimage21 = { path = "image/qwenimage21" }
 nextsycl-image-unlimitedocr = { path = "image/unlimitedocr" }
+nextsycl-image-paddleocrvl = { path = "image/paddleocrvl" }
 nextsycl-video = { path = "video/contract" }
 nextsycl-video-example = { path = "video/example" }
 nextsycl-video-h3 = { path = "video/h3" }

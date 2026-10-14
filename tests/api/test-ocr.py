@@ -11,7 +11,7 @@ sent - the model never sees the PDF. What comes back is checked against what the
 - **facts**: strings that must appear (names, addresses, dates, grade-point averages, course titles), after the
   layout markup is stripped and spaces folded - every one of them. hslda's page has almost no text layer (its text is
   drawn), so it is checked on facts alone, read off the page by hand;
-- **no runaway**: no line repeated more than --max-repeats times (a looping decoder).
+- **no runaway**: no line repeated more than --max-repeats times in a row (a looping decoder).
 
     tests/api/test-ocr.py                                  # the three transcripts, unlimited-ocr-q8, :8000
     tests/api/test-ocr.py --model unlimited-ocr-q4 --only hslda
@@ -60,6 +60,7 @@ DOCS = {
                   "Music Appreciation", "US Government", "Economics", "3.30", "ABC Community College"],
     },
 }
+# the instruction an OpenAI-style server is given (Unlimited-OCR's); image.ocr gets --prompt, else the model's own
 PROMPT = "document parsing."
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
 
@@ -133,11 +134,13 @@ def ocr_page(args, token, png):
         body = {"model": args.model, "temperature": 0, "max_tokens": args.max_tokens,
                 "messages": [{"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    {"type": "text", "text": PROMPT}]}]}
+                    {"type": "text", "text": args.prompt or PROMPT}]}]}
         r = post(f"{args.url}/v1/chat/completions", body, token, args.timeout)
         text, tokens = r["choices"][0]["message"]["content"], r.get("usage", {}).get("completion_tokens", 0)
     else:
-        body = {"model": args.model, "images": [b64], "prompt": PROMPT, "max_tokens": args.max_tokens}
+        body = {"model": args.model, "images": [b64], "max_tokens": args.max_tokens}
+        if args.prompt:
+            body["prompt"] = args.prompt
         r = post(f"{args.url}/rpc/image.ocr", body, token, args.timeout)
         if not r.get("ok"):
             raise SystemExit(f"image.ocr: {r.get('error')}")
@@ -148,6 +151,7 @@ def ocr_page(args, token, png):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default="http://127.0.0.1:8000")
+    ap.add_argument("--prompt", default="", help="the instruction (default: the model's own - document parsing. / OCR:)")
     ap.add_argument("--token", default="")
     ap.add_argument("--api", choices=["nextsycl", "openai"], default="nextsycl",
                     help="nextsycl: POST /rpc/image.ocr; openai: /v1/chat/completions with an image_url part")
@@ -196,8 +200,14 @@ def main():
         absent = [f for f in doc["facts"] if fold(f) not in g]
         checks["facts"] = {"ok": not absent, "found": len(doc["facts"]) - len(absent), "of": len(doc["facts"]),
                            "absent": absent}
-        lines = collections.Counter(l.strip() for l in raw.splitlines() if l.strip())
-        worst = lines.most_common(1)[0] if lines else ("", 0)
+        # a loop writes the same line over and over in a row; a column read one value a line repeats its values, but not
+        # in a row (a credits column: 1.0, A, 1.0, B ...)
+        worst, run, prev = ("", 0), 0, None
+        for l in (l.strip() for l in raw.splitlines() if l.strip()):
+            run = run + 1 if l == prev else 1
+            prev = l
+            if run > worst[1]:
+                worst = (l, run)
         checks["runaway"] = {"ok": worst[1] <= args.max_repeats, "most_repeated": worst[1], "line": worst[0][:80]}
         ok = all(c["ok"] for c in checks.values())
         failed |= not ok

@@ -1,0 +1,29 @@
+# PaddleOCR-VL 1.6 (pages, tables, formulas, charts, seals)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: paddleocr-vl-1.6
+kind: image
+arch: paddleocr-vl
+title: PaddleOCR-VL 1.6 (pages, tables, formulas, charts, seals)
+about: 'PaddlePaddle''s PaddleOCR-VL 1.6 (Apache-2.0): a SigLIP NaViT vision tower that sees the page at its own size and an ERNIE-4.5 0.3B decoder; reads text, tables (to HTML), formulas (LaTeX), charts (to a table), seals, and spots text with its place; 109 languages; GGUF (BF16) by PaddlePaddle; 0.9 GiB + 0.8'
+gpus: '0'
+env: {}
+files:
+  model:
+    key: pocr16-bf16
+    url: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF/resolve/511b09642bb324401f15f97cc23bc67e8f0a291d/PaddleOCR-VL-1.6-GGUF.gguf
+    size: 935769056
+    sha256: f3ae46ec885050acf4b3d31944431e1fd90d50664fb09126af4a3c050ba14ee8
+    path: paddleocr-vl/PaddleOCR-VL-1.6-GGUF.gguf
+  mmproj:
+    key: pocr16-mmproj-bf16
+    url: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF/resolve/511b09642bb324401f15f97cc23bc67e8f0a291d/PaddleOCR-VL-1.6-GGUF-mmproj.gguf
+    size: 881770560
+    sha256: 204d757d7610d9b3faab10d506d69e5b244e32bf765e2bab2d0167e65e0a058a
+    path: paddleocr-vl/PaddleOCR-VL-1.6-GGUF-mmproj.gguf
+  tokenizer:
+    key: pocr16-tokenizer
+    url: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6/resolve/c5630abae1d940eafe0697512a0325494b02ab42/tokenizer.json
+    size: 11189060
+    sha256: c8a215a59183d0d0781adc33bacd3ce6162716f7fd568fb30234a74d69803a7d
+    path: paddleocr-vl/tokenizer.json
+guide: guides/paddleocr-vl.md

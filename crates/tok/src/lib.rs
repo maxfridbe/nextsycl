@@ -45,6 +45,8 @@ pub struct Tokenizer {
     /// SentencePiece-style BPE (a Llama tokenizer.json: no pre-tokenizer, "▁" for spaces and ahead of the text, merges
     /// over the whole text, unknown characters as their bytes' <0xNN> tokens) instead of GPT-2's byte-level one
     sentencepiece: bool,
+    /// SentencePiece-style: a "▁" put ahead of the text (Llama's Prepend; ERNIE's normalizer only replaces spaces)
+    prepend: bool,
     byte_enc: [char; 256],
     byte_dec: HashMap<char, u8>,
     pub eos: Option<u32>,
@@ -105,9 +107,11 @@ impl Tokenizer {
             };
             Some(((a, b), r))
         }).collect();
-        // SentencePiece's shape: a normalizer that puts "▁" ahead of the text, no pre-tokenizer, byte fallback
-        let sentencepiece = j["pre_tokenizer"].is_null() && model["byte_fallback"] == true
-            && j["normalizer"].to_string().contains("\"Prepend\"");
+        // SentencePiece's shape: a normalizer that makes spaces "▁" (and with Llama's, puts one ahead of the text), no
+        // pre-tokenizer, byte fallback
+        let norm = j["normalizer"].to_string();
+        let sentencepiece = j["pre_tokenizer"].is_null() && model["byte_fallback"] == true && norm.contains('\u{2581}');
+        let prepend = norm.contains("\"Prepend\"");
         // the first Split pre-tokenizer's pattern (Qwen's: case-insensitive contractions, letters, single digits...)
         let pattern = match sentencepiece {
             true => ".+",
@@ -130,6 +134,7 @@ impl Tokenizer {
             pre: Vec::new(),
             ignore_merges: model["ignore_merges"].as_bool().unwrap_or(false),
             sentencepiece,
+            prepend,
             byte_enc,
             byte_dec,
             stop,
@@ -173,6 +178,7 @@ impl Tokenizer {
             pre: Vec::new(),
             ignore_merges: false,
             sentencepiece: false,
+            prepend: false,
             byte_enc,
             byte_dec,
             stop,
@@ -228,6 +234,7 @@ impl Tokenizer {
             // llama.cpp takes a piece the vocabulary has whole for GLM's (not the old chatglm-bpe); Qwen's merge by rank
             ignore_merges: matches!(pre, "glm4" | "glm5"),
             sentencepiece: false,
+            prepend: false,
             byte_enc,
             byte_dec,
             stop,
@@ -265,7 +272,8 @@ impl Tokenizer {
             if text.is_empty() {
                 return;
             }
-            let t = format!("\u{2581}{}", text.replace(' ', "\u{2581}"));
+            let t = text.replace(' ', "\u{2581}");
+            let t = if self.prepend { format!("\u{2581}{t}") } else { t };
             let mut parts = Vec::new();
             self.bpe_parts(&t, &mut parts);
             for p in parts {
@@ -353,6 +361,12 @@ impl Tokenizer {
             let Some(t) = self.tokens.get(*id as usize) else { continue };
             if self.special.iter().any(|(_, s)| s == id) {
                 v.extend(t.as_bytes());
+            } else if self.sentencepiece {
+                // "▁" a space; <0xNN> a byte
+                match t.strip_prefix("<0x").and_then(|h| h.strip_suffix('>')).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(b) if t.len() == 6 => v.push(b),
+                    _ => v.extend(t.replace('\u{2581}', " ").as_bytes()),
+                }
             } else {
                 v.extend(t.chars().filter_map(|c| self.byte_dec.get(&c).copied()));
             }

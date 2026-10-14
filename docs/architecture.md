@@ -265,6 +265,22 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   region by region; PDFs split into pages by hayro (pure Rust, Picture::from_pdf) on
   the server and by a vendored pdf.js on the page. B70: a page (tiles) seen and read at ~600-900 tok/s, written at ~120-145 tok/s;
   tests/api/test-ocr.py (three public transcripts, pictures only) passes on Q8_0 and Q4_K_M.
+- **paddleocr-vl** (`image/paddleocrvl`) - PaddlePaddle's PaddleOCR-VL 1.6: an element reader (text, tables, formulas,
+  charts, seals, spotting - each its instruction, `ImageEngine::ocr_prompts` names them for the page). From two BF16
+  GGUFs and the original tokenizer.json (ERNIE's SentencePiece-shaped BPE: spaces as "▁", no prefix - nextsycl-tok
+  reads it): the vision tower (SigLIP NaViT, 27 blocks of 1152, at the page's own size - smart_resize to multiples of
+  28 within 0.1 .. 1 megapixel, PIL bicubic; the learned 27 x 27 position grid resized bilinear with align_corners as
+  transformers does (the repo's remote code and llama.cpp use half-pixel centres); axial 2D rotary positions, 18
+  frequencies of the row and 18 of the column a head of 72; float32 weights) and the projector (2 x 2 merge, two
+  linears), then the decoder (ERNIE-4.5 0.3B: 18 layers of 1024, 16 query heads over 2 key / value heads, M-RoPE with
+  Qwen2-VL's positions - sections 16 / 24 / 24, base 500000; weights in half). Its kernels
+  (`kernels/image/paddleocrvl`): the 2 x 2 merge, cache row copies, and one-row attention over grouped heads split over
+  chunks of 256 keys (flash decoding: 90 -> 245 tok/s on a page's 1300-token prompt). Tables come back from OTSL as
+  HTML (spans kept), spotting as `<|det|>` boxes like Unlimited-OCR's; a plain reading that loops (a dense grade grid)
+  is cut and the picture read again as a table, which goes where the loop began. Checked against transformers on the
+  original weights (every stage cos >= 0.99999, 40 of 40 greedy tokens). B70: a page seen at ~1000 tok/s, written at
+  ~200-250; test-ocr.py: cairn and hslda pass, wtamu reads 84% of its words (the header's right column is skipped by
+  the reference too).
 
 ## The audio engines
 
