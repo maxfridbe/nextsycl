@@ -166,6 +166,7 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 |---|---|---|---|
 | `NS_NH_CHUNK` | auto | A prompt pass's rows in the nemotronh engine (default the largest of 2048, 1024, 512 that fits; with its silo - without it passes of 8) (--opt-chunk) | llm nemotronh |
 | `NS_NH_DRAFTS` | 2 | Tokens the nemotronh engine drafts a step with its MTP block (at most 7; 0: none; the MTP block needs its silo) (--opt-drafts) | llm nemotronh |
+| `NS_NH_PIPELINE` | 1 | 0: a prompt of several chunks over several GPUs chunk after chunk, not as a pipeline (each GPU on its own chunk at once) | llm nemotronh |
 | `NS_NH_PROFILE` | off | Debug: 1 waits for each kernel of the nemotronh engine and times it by name (the wall time it costs, launch overhead included; the waits slow the pass), the table printed after a run | llm nemotronh |
 | `NS_NH_MULTI_GROUPS` | 1024 | Debug: the work-groups of a MoE layer's experts in one launch (the nemotronh silo) | kernels:nemotronh silo |
 | `NS_PEAK_GBS` | 608 | Debug: memory bandwidth (GB/s) the NS_Q35_PROFILE tables show each kernel's share of | llm qwen35 |

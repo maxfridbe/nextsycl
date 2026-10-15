@@ -351,6 +351,11 @@ struct Dev {
     le: usize,
 }
 
+thread_local! {
+    /// the GPU (an index into devs) this thread's kernels go to
+    static CUR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The rows the decode products take (the Q8_1 kernels' widest); a pass of more rows is a prompt pass (half products)
 const DEC: usize = 8;
 
@@ -364,7 +369,6 @@ pub struct NemotronH<'g> {
     file: &'g Gguf,
     devs: Vec<Dev>,
     layer_dev: Vec<usize>,
-    cur: std::sync::atomic::AtomicUsize,
     staging: Mutex<Vec<u8>>,
     k: &'static ffi::Api,
     /// the silo (kernels/llm/nemotronh/silo): a MoE layer's routing and experts in a few launches; None: the host's
@@ -629,7 +633,7 @@ impl<'g> NemotronH<'g> {
                         (None, true) if g.nextn > 0 => "; no MTP drafts (they need the silo)".into(),
                         _ => "; drafts off".into(),
                     }));
-        Ok(NemotronH { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, work: Mutex::new(()), chunk, mtp, drafts,
+        Ok(NemotronH { g, file: f, devs, layer_dev, staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, work: Mutex::new(()), chunk, mtp, drafts,
                        snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(),
                        prof: std::env::var("NS_NH_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get() })
     }
@@ -641,7 +645,7 @@ impl<'g> NemotronH<'g> {
         ffi::check(f(), name)?;
         self.dev().gpu.sync()?;
         let mut m = p.lock().unwrap();
-        let e = m.entry(format!("{name} (GPU {})", self.cur.load(std::sync::atomic::Ordering::Relaxed))).or_insert((0.0, 0));
+        let e = m.entry(format!("{name} (GPU {})", CUR.with(|c| c.get()))).or_insert((0.0, 0));
         e.0 += t0.elapsed().as_secs_f64();
         e.1 += 1;
         Ok(())
@@ -669,12 +673,13 @@ impl<'g> NemotronH<'g> {
         self.chunk
     }
 
+    /// The GPU this thread's kernels go to now (a prompt's pipeline runs a thread a GPU)
     fn dev(&self) -> &Dev {
-        &self.devs[self.cur.load(std::sync::atomic::Ordering::Relaxed)]
+        &self.devs[CUR.with(|c| c.get())]
     }
 
     fn on(&self, i: usize) {
-        self.cur.store(i, std::sync::atomic::Ordering::Relaxed);
+        CUR.with(|c| c.set(i));
     }
 
     fn arena(&self) -> &Arena {
@@ -683,18 +688,6 @@ impl<'g> NemotronH<'g> {
 
     fn raw(&self) -> *mut std::ffi::c_void {
         self.dev().gpu.raw()
-    }
-
-    /// x (rows of the GPU it is on) onto GPU `to`: a buffer of that GPU's arena
-    fn hop(&self, x: &DevBuf, to: usize) -> Result<DevBuf> {
-        self.on(to);
-        let y = self.arena().bytes(x.len)?;
-        let mut st = self.staging.lock().unwrap();
-        if st.len() < x.len {
-            st.resize(x.len, 0);
-        }
-        y.copy_from_peer(x, &mut st)?;
-        Ok(y)
     }
 
     /// x [t, cols] -> its Q8_1 blocks (column j at j * cols / 32 blocks)
@@ -1077,7 +1070,6 @@ impl<'g> NemotronH<'g> {
     }
 
     fn pass_in(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
-        let g = &self.g;
         let t = tokens.len();
         if t == 0 {
             return Err(e("an empty pass"));
@@ -1088,28 +1080,58 @@ impl<'g> NemotronH<'g> {
         if s.pos + t > s.max_ctx {
             return Err(e(format!("the context is full ({} of {})", s.pos + t, s.max_ctx)));
         }
-        for d in &self.devs {
-            d.arena.reset();
-        }
-        self.on(0);
         let p0 = s.pos;
         let mut snaps = self.snaps.lock().unwrap();
         let snapping = (2..=self.drafts + 1).contains(&t) && !snaps.layers.is_empty();
         snaps.of = None;
-        let mut mi = 0;
-        let mut x = self.embed(tokens)?;
-        let mut h = self.arena().f32(t * g.n_embd)?;
-        for (l, (ly, st)) in self.layers.iter().zip(s.layers.iter()).enumerate() {
-            if self.layer_dev[l] != self.cur.load(std::sync::atomic::Ordering::Relaxed) {
-                x = self.hop(&x, self.layer_dev[l])?;
-                h = self.arena().f32(t * g.n_embd)?;
-            }
+        let mut x = None;
+        for i in 0..self.devs.len() {
+            self.on(i);
+            self.devs[i].arena.reset();
+            let xi = match x.take() {
+                None => self.embed(tokens)?,
+                Some(prev) => self.hop_here(&prev)?,
+            };
+            x = Some(self.dev_layers(i, s, xi, t, p0, &mut *tap, snapping.then_some(&*snaps))?);
+        }
+        if snapping {
+            snaps.of = Some((s.id, p0, t));
+        }
+        drop(snaps);
+        let x = x.ok_or_else(|| e("no GPU"))?;
+        let out = self.head(s, tokens, &x, t, p0, n_out.clamp(1, t), tap)?;
+        s.pos += t;
+        s.last_rows = t;
+        Ok(out)
+    }
+
+    /// x (rows of another GPU) onto this thread's GPU: a buffer of its arena (the copy waits for both)
+    fn hop_here(&self, x: &DevBuf) -> Result<DevBuf> {
+        let y = self.arena().bytes(x.len)?;
+        let mut st = self.staging.lock().unwrap();
+        if st.len() < x.len {
+            st.resize(x.len, 0);
+        }
+        y.copy_from_peer(x, &mut st)?;
+        Ok(y)
+    }
+
+    /// GPU i's layers over x [t, n_embd] (on GPU i, this thread's): x after them. `snaps`: a verify pass's Mamba
+    /// snapshots
+    #[allow(clippy::too_many_arguments)]
+    fn dev_layers(&self, i: usize, s: &Session, x: DevBuf, t: usize, p0: usize, tap: Tap, snaps: Option<&Snaps>) -> Result<DevBuf> {
+        let g = &self.g;
+        let (lb, le) = (self.devs[i].lb, self.devs[i].le);
+        let h = self.arena().f32(t * g.n_embd)?;
+        let mut mi = (0..lb).filter(|l| g.kinds[*l] == Kind::Mamba).count();
+        for l in lb..le {
+            let (ly, st) = (&self.layers[l], &s.layers[l]);
             let mark = self.arena().mark();
             self.rms(&x, &ly.norm, &h, t, g.n_embd)?;
             tap(&format!("attn_norm-{l}"), &h)?;
             let out = match (&ly.mix, st) {
                 (Mix::Mamba(m), LState::Mamba { conv, s: ss }) => {
-                    let sn = snapping.then(|| (&snaps.layers[mi].0, &snaps.layers[mi].1));
+                    let sn = snaps.map(|sp| (&sp.layers[mi].0, &sp.layers[mi].1));
                     mi += 1;
                     let o = self.mamba(m, conv, ss, &h, t, &mut *tap, l, sn)?;
                     tap(&format!("mamba_out-{l}"), &o)?;
@@ -1131,18 +1153,18 @@ impl<'g> NemotronH<'g> {
             tap(&format!("nemotron_h_block_out-{l}"), &x)?;
             self.arena().rewind(mark);
         }
-        if snapping {
-            snaps.of = Some((s.id, p0, t));
-        }
-        drop(snaps);
-        s.pos += t;
-        s.last_rows = t;
-        let n = n_out.clamp(1, t);
-        let ne = g.n_embd;
+        Ok(x)
+    }
+
+    /// After the last GPU's layers (on it): the draft block over the rows (MTP loaded), then the last `n` rows' logits
+    /// (n 0: none - a prompt chunk before the last)
+    #[allow(clippy::too_many_arguments)]
+    fn head(&self, s: &Session, tokens: &[u32], x: &DevBuf, t: usize, p0: usize, n: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
+        let ne = self.g.n_embd;
         // the output norm: the last rows' for the head; every row's with MTP (the draft block reads them)
         let normed = if let Some(ms) = s.mtp.as_ref().filter(|_| self.mtp.is_some()) {
             let all = self.arena().f32(t * ne)?;
-            self.rms(&x, &self.output_norm, &all, t, ne)?;
+            self.rms(x, &self.output_norm, &all, t, ne)?;
             // the rows kept for a rollback; the draft block over this pass's rows: row i pairs token i with the hidden
             // state before it (the pending one, then this pass's)
             self.vh.copy_within(0, &all, 0, t.min(DEC) * ne * 4)?;
@@ -1153,8 +1175,14 @@ impl<'g> NemotronH<'g> {
             }
             self.mtp_rows(ms, tokens, &hs, p0, s.max_ctx, false)?;
             ms.pending.copy_within(0, &all, (t - 1) * ne * 4, ne * 4)?;
+            if n == 0 {
+                return Ok(Vec::new());
+            }
             all.view((t - n) * ne * 4, n * ne * 4)?
         } else {
+            if n == 0 {
+                return Ok(Vec::new());
+            }
             let last = x.view((t - n) * ne * 4, n * ne * 4)?;
             let normed = self.arena().f32(n * ne)?;
             self.rms(&last, &self.output_norm, &normed, n, ne)?;
@@ -1166,6 +1194,115 @@ impl<'g> NemotronH<'g> {
         tap("result_output", &logits)?;
         let all = logits.to_f32()?;
         Ok(all.chunks(self.output.rows).map(|c| c.to_vec()).collect())
+    }
+
+    /// A prompt of several chunks over several GPUs as a pipeline: a thread a GPU, each taking the chunks in turn through
+    /// its layers and handing them on - the first GPU on the next chunk while the next GPU is on this one. A chunk's
+    /// rows cross over when the next GPU takes them (the sender waits for that before it reuses its memory). The last
+    /// chunk's logits; `stop` is asked before each chunk the first GPU starts
+    fn feed_pipelined(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync)) -> Result<(usize, Vec<f32>)> {
+        use std::sync::mpsc;
+        let n = self.devs.len();
+        let p_start = s.pos;
+        let chunks: Vec<&[u32]> = tokens.chunks(self.chunk).collect();
+        self.snaps.lock().unwrap().of = None;
+        let sess: &Session = s;
+        // a stage's rows to the next: (chunk index, rows on the sender's GPU); the taker's word back that it has them
+        let (fed, logits) = std::thread::scope(|sc| -> Result<(usize, Vec<f32>)> {
+            let mut senders: Vec<mpsc::SyncSender<(usize, DevBuf)>> = Vec::new();
+            let mut receivers: Vec<Option<mpsc::Receiver<(usize, DevBuf)>>> = vec![None];
+            let mut acks_tx: Vec<mpsc::SyncSender<()>> = Vec::new();
+            let mut acks_rx: Vec<Option<mpsc::Receiver<()>>> = Vec::new();
+            for _ in 1..n {
+                let (tx, rx) = mpsc::sync_channel(0);
+                senders.push(tx);
+                receivers.push(Some(rx));
+                let (atx, arx) = mpsc::sync_channel(1);
+                acks_tx.push(atx);
+                acks_rx.push(Some(arx));
+            }
+            let mut handles = Vec::with_capacity(n);
+            for i in 0..n {
+                let rx = receivers[i].take();
+                let tx = if i + 1 < n { Some(senders[i].clone()) } else { None };
+                let ack_back = if i > 0 { Some(acks_tx[i - 1].clone()) } else { None };
+                let ack_in = if i + 1 < n { acks_rx[i].take() } else { None };
+                let chunks = &chunks;
+                handles.push(sc.spawn(move || -> Result<(usize, Vec<f32>)> {
+                    self.on(i);
+                    let mut fed = 0;
+                    let mut last = Vec::new();
+                    let mut none = |_: &str, _: &DevBuf| -> Result<()> { Ok(()) };
+                    let mut c = 0;
+                    loop {
+                        let (ci, x) = match &rx {
+                            None => {
+                                if c >= chunks.len() || (fed > 0 && stop(fed)) {
+                                    break;
+                                }
+                                self.dev().arena.reset();
+                                let x = self.embed(chunks[c])?;
+                                c += 1;
+                                (c - 1, x)
+                            }
+                            Some(rx) => {
+                                let Ok((ci, prev)) = rx.recv() else { break };
+                                self.dev().arena.reset();
+                                let x = self.hop_here(&prev)?;
+                                drop(prev);
+                                if let Some(a) = &ack_back {
+                                    let _ = a.send(());
+                                }
+                                (ci, x)
+                            }
+                        };
+                        let toks = chunks[ci];
+                        let p0 = p_start + ci * self.chunk;
+                        let x = self.dev_layers(i, sess, x, toks.len(), p0, &mut none, None)?;
+                        fed += toks.len();
+                        match (&tx, &ack_in) {
+                            (Some(tx), Some(ack)) => {
+                                if tx.send((ci, x)).is_err() {
+                                    break;
+                                }
+                                // the next GPU has copied the rows: this arena is free again
+                                if ack.recv().is_err() {
+                                    break;
+                                }
+                            }
+                            _ => {
+                                let want = if ci + 1 == chunks.len() { 1 } else { 0 };
+                                last = self.head(sess, toks, &x, toks.len(), p0, want, &mut none)?.pop().unwrap_or_default();
+                            }
+                        }
+                    }
+                    Ok((fed, last))
+                }));
+            }
+            drop(senders);
+            drop(acks_tx);
+            let mut out = (0, Vec::new());
+            let mut err = None;
+            for (i, h) in handles.into_iter().enumerate() {
+                match h.join().map_err(|_| e("a pipeline stage panicked")) {
+                    Ok(Ok(r)) => {
+                        if i + 1 == n {
+                            out = r;
+                        }
+                    }
+                    Ok(Err(x)) | Err(x) => {
+                        err.get_or_insert(x);
+                    }
+                }
+            }
+            match err {
+                Some(x) => Err(x),
+                None => Ok(out),
+            }
+        })?;
+        s.pos = p_start + fed;
+        s.last_rows = 0;
+        Ok((fed, logits))
     }
 
     /// The draft block over `tokens` at positions p0.. (row i: token i with hidden state hs[i]): its cache written
@@ -1363,6 +1500,15 @@ impl<'g> NemotronH<'g> {
     }
 
     pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
+        // several chunks over several GPUs: the pipeline (NS_NH_PIPELINE=0: chunk after chunk; no taps either way but
+        // the last chunk's in order)
+        if self.devs.len() > 1 && tokens.len() > self.chunk && std::env::var("NS_NH_PIPELINE").map_or(true, |v| v != "0") {
+            if s.pos + tokens.len() > s.max_ctx {
+                return Err(e(format!("the context is full ({} of {})", s.pos + tokens.len(), s.max_ctx)));
+            }
+            let _w = self.work.lock().unwrap();
+            return self.feed_pipelined(s, tokens, stop);
+        }
         let mut logits = Vec::new();
         let mut done = 0;
         for c in tokens.chunks(self.chunk) {
