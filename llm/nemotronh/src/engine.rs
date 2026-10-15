@@ -818,15 +818,25 @@ impl<'g> NemotronH<'g> {
         self.matmul(&a.k, h, hq8.as_ref(), t, &kr)?;
         self.matmul(&a.v, h, hq8.as_ref(), t, &vr)?;
         let att = self.arena().f32(t * hq * d)?;
-        // SAFETY: arithmetic only.
-        let sc = unsafe { (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) } as usize;
-        let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
-        // SAFETY: the rows and caches as named in nh.h.
+        let (ti, hqi, hki, di, ci, pi) = (t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64);
+        // SAFETY: the rows and caches as named in nh.h / nhs.h.
         unsafe {
-            self.op("kv store", || (k.kv_store)(self.raw(), kr.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64,
-                                                p0 as i64, kc.ptr(), vc.ptr()))?;
-            self.op("attention", || (k.attn)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
-                                             p0 as i64, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+            self.op("kv store", || (k.kv_store)(self.raw(), kr.fp(), hki * di, vr.fp(), hki * di, ti, hki, di, ci, pi, kc.ptr(), vc.ptr()))?;
+            // the silo's flash attention on XMX (prompt rows: each key read once a work-group of 8 rows x 16 heads;
+            // decode rows: the keys split, a verify row's arithmetic the one-row decode's), else the engine's own
+            if let Some(s) = self.silo.filter(|s| (s.attn_prompt_supported)(ti, hqi, hki, di) != 0) {
+                self.op("attention xmx", || (s.attn_prompt)(self.raw(), q.fp(), hqi * di, kc.ptr(), vc.ptr(), ti, hqi, hki, di, ci, pi, att.fp()))?;
+            } else if let Some(s) = self.silo.filter(|s| (s.attn_decode_supported)(ti, hqi, hki, di) != 0) {
+                let sc = (s.attn_decode_scratch)(ti, hqi, hki, di, pi) as usize;
+                let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
+                self.op("attention xmx", || (s.attn_decode)(self.raw(), q.fp(), hqi * di, kc.ptr(), vc.ptr(), ti, hqi, hki, di, ci, pi, att.fp(),
+                                                            part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+            } else {
+                let sc = (k.attn_scratch)(ti, hqi, hki, di, pi) as usize;
+                let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
+                self.op("attention", || (k.attn)(self.raw(), q.fp(), hqi * di, kc.ptr(), vc.ptr(), ti, hqi, hki, di, ci, pi, att.fp(),
+                                                 part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+            }
         }
         let out = self.arena().f32(t * g.n_embd)?;
         self.matmul(&a.o, &att, None, t, &out)?;

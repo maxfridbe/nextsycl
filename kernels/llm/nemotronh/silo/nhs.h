@@ -38,6 +38,17 @@ int ns_nhs_packed_f16(ns_gpu* g, int type, const void* src, uint16_t* dst, int64
 int ns_nhs_multi(ns_gpu* g, int type, const void* base, int64_t stride, const int32_t* ids, const int32_t* cols, int64_t entries, const void* xs,
                  int64_t ncols, float* y, int64_t n_in, int64_t n_out);
 
+/* attn.cpp: flash attention on XMX (the qwen35 silo's, copied) - head 128, 16 query heads a key head, no positions,
+ * against the half cache [Hkv][cap][128]: prompt rows (more than 8) and decode rows (1..8: the keys split, merged after;
+ * scratch floats as ns_nhs_attn_decode_scratch says) */
+int ns_nhs_attn_prompt_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh);
+int ns_nhs_attn_prompt(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh,
+                       int64_t cap, int64_t p0, float* out);
+int ns_nhs_attn_decode_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh);
+int64_t ns_nhs_attn_decode_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh, int64_t p0);
+int ns_nhs_attn_decode(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh,
+                       int64_t cap, int64_t p0, float* out, float* scratch);
+
 #ifdef __cplusplus
 }
 #endif
