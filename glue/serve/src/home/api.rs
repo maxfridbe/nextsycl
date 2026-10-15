@@ -1103,3 +1103,34 @@ impl Home {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{code_of, rpc_error};
+
+    #[test]
+    fn an_rpc_error_says_everything_in_its_body() {
+        let e = rpc_error("image.generate", 400, None, "steps 8: qwen-image-2.1-turbo-q8 runs its own 6 sigmas");
+        assert_eq!((e["code"].as_str(), e["status"].as_u64(), e["retryable"].as_bool()), (Some("invalid_params"), Some(400), Some(false)));
+        assert_eq!((e["method"].as_str(), e["field"].as_str()), (Some("image.generate"), Some("steps")));
+        // a missing field, named in quotes
+        assert_eq!(rpc_error("image.generate", 400, None, "image.generate needs \"prompt\"")["field"], "prompt");
+        // a key that is not the method's is no field
+        assert!(rpc_error("image.generate", 400, None, "qwen-image is busy")["field"].is_null());
+        // no method (an unreadable request): null, not ""
+        assert!(rpc_error("", 400, Some("request_too_large"), "over 256 MiB")["method"].is_null());
+    }
+
+    #[test]
+    fn retry_follows_the_code_not_the_status_alone() {
+        assert_eq!(rpc_error("system.load", 503, None, "its cards are busy")["code"], "no_room");
+        assert_eq!(rpc_error("system.load", 503, None, "x")["retryable"], true);
+        assert_eq!(rpc_error("video.generate", 409, Some("busy"), "a clip is being made")["retryable"], true);
+        assert_eq!(rpc_error("video.cancel", 409, Some("not_running"), "no job is running")["retryable"], false);
+        assert_eq!(rpc_error("image.enable", 409, None, "disabled")["retryable"], false);
+        assert_eq!(rpc_error("audio.speak", 499, None, "cancelled")["code"], "cancelled");
+        for (st, c) in [(400, "invalid_params"), (401, "unauthorized"), (404, "not_found"), (502, "unavailable"), (504, "timeout"), (500, "internal")] {
+            assert_eq!(code_of(st), c);
+        }
+    }
+}

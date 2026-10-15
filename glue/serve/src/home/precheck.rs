@@ -213,3 +213,44 @@ pub fn speech_lists(m: &Value) -> (Vec<String>, Vec<String>) {
     (keys("spk_id"), keys("codec_language_id"))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::{number, speech_lists, steps_of, whole};
+    use serde_json::json;
+
+    #[test]
+    fn a_few_step_model_locks_its_steps() {
+        let turbo = json!({"defaults": {"steps": 6}, "env": {"NS_QI_SIGMAS": "1,0.9375,0.875,0.75,0.5,0.25"}});
+        let s = steps_of(&turbo);
+        assert_eq!((s["locked"].as_bool(), s["allowed"].clone(), s["default"].as_u64()), (Some(true), json!([6]), Some(6)));
+        let full = steps_of(&json!({"defaults": {"steps": 40}}));
+        assert_eq!((full["locked"].as_bool(), full["max"].as_u64()), (Some(false), Some(100)));
+        assert!(full["allowed"].is_null());
+    }
+
+    #[test]
+    fn numbers_are_checked_against_their_range() {
+        let b = json!({"steps": 8, "cfg": "high", "strength": 0.01, "n": 2.5});
+        assert_eq!(whole(&b, "steps", 1, 100).unwrap(), Some(8));
+        assert!(whole(&b, "steps", 1, 6).unwrap_err().1.starts_with("steps 8:"));
+        assert!(number(&b, "cfg", 0.0, 30.0).is_err());
+        assert!(number(&b, "strength", 0.05, 1.0).unwrap_err().1.starts_with("strength"));
+        assert!(whole(&b, "n", 1, 8).is_err(), "not a whole number");
+        assert_eq!(whole(&b, "seed", 0, 9).unwrap(), None);
+    }
+
+    #[test]
+    fn a_speech_model_lists_its_voices_from_its_config() {
+        let dir = std::env::temp_dir().join(format!("ns-precheck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        std::fs::write(&p, r#"{"talker_config": {"spk_id": {"Ryan": 1, "serena": 2}, "codec_language_id": {"english": 1, "beijing_dialect": 2}}}"#).unwrap();
+        let (v, l) = speech_lists(&json!({"files": {"config": p.to_str().unwrap()}}));
+        assert!(v.contains(&"ryan".to_string()) && v.contains(&"serena".to_string()));
+        assert!(l.contains(&"english".to_string()));
+        // no config (VoxCPM2's has no lists): any
+        assert_eq!(speech_lists(&json!({})), (Vec::new(), Vec::new()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

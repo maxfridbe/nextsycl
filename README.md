@@ -340,14 +340,19 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     unload after `NS_IDLE_MINUTES` (10) without one (the image and music servers exit, `--idle-exit`; the switcher
     sets the chat mode to none; the video daemon's workers let their card go), staying enabled. A load waits for its
     card to have the model's memory free plus 1.5 GiB (past the card the xe driver spills into host memory) and
-    answers 409 when it does not come free. **Disabled**: unloaded, gone from Open WebUI's list and from the API.
+    answers 503 `no_room` when it does not come free. **Disabled**: unloaded, gone from Open WebUI's list and from the API.
     The registry's `enabled` and `gpus` are the state (`nextsycl models enable|disable` agree); the enabled video
     models are the video daemon's engines (serve starts, restarts and stops it).
   - **The API**, behind `Authorization: Bearer <token>` (`NS_API_TOKEN`, else one made and kept in `serve.json`
     beside the registry; the page's API tab shows it): `POST /rpc/<kind>.<method>` - H3's rules: POST only, fixed
     routes, every variable in the JSON body, no path variables or query strings, `{"ok": true, "result": ...}` /
-    `{"ok": false, "error": {"code", "message"}}`, the HTTP status and code the studio's own for video (409 `busy`,
-    `not_running` ...) - for `system` (state, busy, version, files.stat, files.delete, models, enable, disable, load, unload),
+    `{"ok": false, "error": {"code", "message", "retryable", "status", "method", "field"}}` - **the body says
+    everything**: branch on `error.code`, retry when `retryable`, `field` names the request key at fault, `status` is
+    the code's number by convention; the HTTP status only mirrors it (a client never needs it, so another transport
+    can carry the same envelope). An unreadable request (not POST, a query string, not a JSON object, over 256 MiB) is
+    wrapped the same way (`invalid_request`, `request_too_large`); the studio's codes are kept for video (`busy`,
+    `not_running` ...) and a failed job's `error` is the same object. `no_room` (503: the model's cards are held by
+    other models now) is retryable; `conflict` (409: disabled, none enabled) is not - for `system` (state, busy, version, files.stat, files.delete, models, enable, disable, load, unload),
     `llm` (chat, models), `image` (generate, edit, status, cancel, canvases.list, info, progress, history), `audio`
     (generate, speak, status, cancel, info, progress, history), `video` (the studio's: generate, status, wait, cancel {label}, queue.* - move and remove by label,
     generate's priority - jobs.*, timeline, upload ...), each kind with
@@ -365,6 +370,25 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     features by name; `system.files.stat|delete` give a file's bytes and SHA-256 or remove it (a clip with every
     file of it). video.generate also takes `frames` (exactly 17k + 5), a `chain` object (context_frames, sound,
     still, color_reanchor) and answers frames, seconds and the keys it `ignored` (negative_prompt: H3 runs at cfg 1).
+    **API changes, 2026-10-15** (each also in `system.version`'s features):
+    - Job requests are **checked when submitted** (glue/serve/src/home/precheck.rs): steps a few-step model does not
+      run, size, sampler, cfg without a negative prompt, pictures that do not decode or pass 40 MP, a speech voice or
+      language the model does not have (read from its config, loaded or not), a `continue_from` that is not here - a
+      400 at once even with `wait: false`, not a failed job later.
+    - `image.info` answers `steps` (`locked`, `allowed`: turbo runs only 6) and the limits (8 pictures, 40 MP each,
+      256 MiB a request) without the model loaded.
+    - `image.edit` `strength` (0.05-1): the denoise starts from the first picture noised that far (ComfyUI's denoise:
+      the last steps of a round(steps / strength) run; a few-step model starts at strength itself). `reference:
+      false` makes it a plain img2img (the pictures do not condition the model); `image.generate` takes `image` (an
+      init picture) with `strength` for the same.
+    - `audio.speak` `continue_from` (a speech file made here): its last sentences (up to 15 s, cut at a pause) are
+      the in-context reference after the voice's sample, so the voice and its pace carry on between a book's chunks.
+    - `<kind>.status` / `<kind>.cancel` find a job by `label` or, when that is absent or empty, `reentrant_id`;
+      cancelling an ended job answers `already_ended` with its state, and not-found names what it looked up.
+    - `system.busy.parallel`: how many jobs of each image / audio model run at once (one per card it is enabled on).
+    - `video.status`: `preview` (a PNG of the shot so far after every step, from a fitted latent-to-RGB map),
+      `failure` {code, retryable, message, hint} beside the text `error`, and `gpu`; `video.engines.list` inputs list
+      the `ignored` keys.
     `/api/...` is the page's own.
   - **The settings** (the Config tab; `system.config`, `system.configSet {set: {NAME: value | null}} | {text}`,
     `system.restart {service}`): `nextsycl.conf` as every setting the program reads - what it does, its default,
