@@ -211,6 +211,7 @@ impl Studio {
         let mut out = serde_json::Map::new();
         let Some(job) = st.job.as_mut() else {
             out.insert("idle".into(), json!(true));
+            out.insert("job".into(), Value::Null); // nothing made since the studio started
             out.extend(st.q.payload());
             out.insert("all_projects".into(), json!(self.all_projects(&st.q)));
             out.insert("llm".into(), self.llm.status());

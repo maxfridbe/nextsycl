@@ -25,13 +25,55 @@ const PROJECT: &str = r#"{"type": "object", "properties": {"project": {"type": "
   "paused": {"type": "boolean"}, "first_index": {"type": "integer", "description": "its first clip's place in the queue (0-based)"},
   "batches": {"type": "array", "items": {"type": "object", "properties": {"batch": {"type": "string"}, "clips": {"type": "integer"}, "video_s": {"type": "number"}, "paused": {"type": "boolean"}}}}}}"#;
 
+/// image.generate / image.edit (and /v1/images/*): OpenAI's images answer, with ours
+const PICTURES: &str = r#"{"type": "object", "properties": {"created": {"type": "integer"},
+  "data": {"type": "array", "items": {"type": "object", "properties": {"url": {"type": "string", "description": "response_format url (the default here): GET it with the token"},
+    "b64_json": {"type": "string", "description": "response_format b64_json: the PNG"}, "revised_prompt": {"type": "string"}, "seed": {"type": "integer"},
+    "width": {"type": "integer"}, "height": {"type": "integer"}}}},
+  "nextsycl": {"type": "object", "properties": {"seconds": {"type": "number"}, "steps": {"type": "integer"}, "seed": {"type": "integer", "description": "the first picture's; the n-th is seed + n"},
+    "loras": {"type": "array", "items": {"type": "string"}}, "wh": {"type": "number", "nullable": true, "description": "the card's energy, watt-hours"}}}}}"#;
+
+/// A sound made (audio.history's rows; audio.generate's data[])
+const SOUND_ITEM: &str = r#"{"type": "object", "properties": {"url": {"type": "string", "description": "the WAV: GET it with the token"},
+    "seconds": {"type": "number", "description": "its length"}, "prompt": {"type": "string"}, "lyrics": {"type": "string"},
+    "model": {"type": "string"}, "seed": {"type": "integer"}, "steps": {"type": "integer"}, "cfg": {"type": "number"}, "took": {"type": "number", "description": "seconds it took"},
+    "wh": {"type": "number", "nullable": true}, "created": {"type": "integer"},
+    "voice": {"type": "string", "nullable": true, "description": "speech"}, "language": {"type": "string", "nullable": true}, "instructions": {"type": "string", "nullable": true},
+    "cloned": {"type": "boolean", "description": "speech: spoken in a recording's voice"}}}"#;
+
+/// audio.generate / audio.speak (and /v1/audio/speech with response_format url)
+fn sound() -> String {
+    format!(r#"{{"type": "object", "properties": {{"created": {{"type": "integer"}}, "data": {{"type": "array", "items": {SOUND_ITEM}}},
+  "nextsycl": {{"type": "object", "properties": {{"took": {{"type": "number"}}, "seconds": {{"type": "number"}}, "seed": {{"type": "integer"}}, "steps": {{"type": "integer"}},
+    "cfg": {{"type": "number"}}, "wh": {{"type": "number", "nullable": true}}}}}}}}}}"#)
+}
+
+/// A chat request as llm.requests lists it
+const CHAT_REQUEST: &str = r#"{"type": "object", "properties": {"id": {}, "model": {"type": "string"}, "state": {"type": "string"}, "via": {"type": "string"},
+  "started": {"type": "number"}, "ended": {"type": "number", "nullable": true}, "finish": {"type": "string", "nullable": true},
+  "prompt_tokens": {"type": "integer"}, "reused": {"type": "integer", "description": "prompt tokens taken from the cache"}, "read": {"type": "integer"},
+  "read_tok_s": {"type": "number"}, "read_seconds": {"type": "number"}, "generated": {"type": "integer"}, "max_tokens": {"type": "integer"},
+  "tok_s": {"type": "number"}, "generate_seconds": {"type": "number"}, "drafts": {}, "energy_j": {"type": "number"}, "avg_watts": {"type": "number"}}}"#;
+
+const VOICE: &str = r#"{"type": "object", "properties": {"name": {"type": "string"}, "text": {"type": "string", "nullable": true, "description": "what the sample says"},
+  "description": {"type": "string", "nullable": true}, "language": {"type": "string", "nullable": true}, "kind": {"type": "string", "enum": ["clone", "design"]},
+  "seconds": {"type": "number", "description": "the sample's length (cut to 15 s)"}, "rate": {"type": "integer"}, "created": {"type": "integer"}, "from": {"type": "string"},
+  "sample": {"type": "string", "description": "voices.list: the sample's URL (GET with the token)"}}}"#;
+
+const MODEL_STATE: &str = r#"{"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string", "enum": ["llm", "image", "audio", "video"]},
+  "title": {"type": "string"}, "arch": {"type": "string"}, "enabled": {"type": "boolean"}, "gpus": {"type": "array", "items": {"type": "integer"}},
+  "state": {"type": "string", "enum": ["disabled", "unloaded", "loading", "loaded", "busy", "ready"], "description": "busy: an image or audio model answering; ready: a video model the daemon has, not loaded"},
+  "vouch_mb": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "VRAM it is counted for, by card"},
+  "measured": {"type": "boolean"}, "headroom_mb": {"type": "object", "additionalProperties": {"type": "integer"}}, "headroom_given": {"type": "boolean"},
+  "page": {"type": "integer", "description": "the port of its own page"}}}"#;
+
 /// video.status (and video.wait)
 fn status() -> String {
-    format!(r#"{{"type": "object", "required": ["idle", "queue", "queue_items", "version"],
+    format!(r#"{{"type": "object", "required": ["idle", "job", "queue", "queue_items", "version"],
   "description": "the clip running, or the last one (idle: true then; no job at all after a restart with nothing made)",
   "properties": {{"idle": {{"type": "boolean", "description": "no clip is being made (one may still wait in the queue: queue_items)"}},
     "version": {{"type": "string", "description": "changes whenever anything here does (video.wait)"}},
-    "job": {JOB}, "stage": {{"type": "string", "description": "starting, text encoder, sampling N/M, video decoded, done, failed ..."}},
+    "job": {{"allOf": [{JOB}], "nullable": true, "description": "null: nothing made since the studio started"}}, "stage": {{"type": "string", "description": "starting, text encoder, sampling N/M, video decoded, done, failed ..."}},
     "pct": {{"type": "integer"}}, "eta": {{"type": "integer", "description": "seconds left (estimate)"}}, "elapsed": {{"type": "integer"}},
     "done": {{"type": "boolean"}}, "error": {{"type": "string", "nullable": true, "description": "failed or cancelled, with the engine's last lines"}},
     "steps_done": {{"type": "integer"}}, "steps_total": {{"type": "integer"}}, "frames": {{"type": "integer"}},
@@ -59,6 +101,56 @@ pub fn result(method: &str) -> Option<String> {
     "stage": {"type": "string", "nullable": true}, "pct": {"type": "integer", "nullable": true}, "eta_s": {"type": "integer", "nullable": true},
     "queued": {"type": "integer"}, "runnable": {"type": "integer", "description": "queued and not held"}, "held": {"type": "integer"},
     "accepts": {"type": "boolean", "description": "video.generate without queue: true starts at once"}}}}}"#.into(),
+        m if m.ends_with(".describePromptGuideMD") => r#"{"type": "object", "properties": {"model": {"type": "string"}, "arch": {"type": "string"},
+  "kind": {"type": "string"}, "markdown": {"type": "string", "description": "the model card's prompt guide: the form the model was trained on, with rules and an example"}}}"#.into(),
+        "system.state" => format!(r#"{{"type": "object", "description": "the box, as the page shows it", "properties": {{"ts": {{"type": "number"}},
+  "host": {{"type": "object", "description": "memory (meminfo)", "additionalProperties": true}},
+  "cards": {{"type": "array", "items": {{"type": "object", "description": "a GPU: memory, the processes on it with their models", "additionalProperties": true}}}},
+  "models": {{"type": "array", "items": {MODEL_STATE}}}, "services": {{"type": "object", "additionalProperties": true}},
+  "runs": {{"type": "array", "items": {{"type": "object", "properties": {{"id": {{"type": "integer"}}, "label": {{"type": "string"}}, "started": {{"type": "number"}}, "rc": {{"type": "integer", "nullable": true}}, "out": {{"type": "string"}}}}}}}},
+  "idle_minutes": {{"type": "integer"}}, "ports": {{"type": "object", "additionalProperties": {{"type": "integer"}}}}}}}}"#),
+        "system.models" => format!(r#"{{"type": "object", "properties": {{"models": {{"type": "array", "items": {MODEL_STATE}}}}}}}"#),
+        "system.enable" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "title": {"type": "string"}, "enabled": {"type": "boolean", "enum": [true]}}}"#.into(),
+        "system.disable" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "enabled": {"type": "boolean", "enum": [false]}}}"#.into(),
+        "system.gpus" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "gpus": {"type": "array", "items": {"type": "integer"}}, "changed": {"type": "boolean"},
+  "was": {"type": "array", "items": {"type": "integer"}}}}"#.into(),
+        "system.load" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "loaded": {"type": "boolean", "description": "wait: true"}, "loading": {"type": "boolean", "description": "without wait: it loads in the background (system.busy / system.models)"}}}"#.into(),
+        "system.unload" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "loaded": {"type": "boolean", "enum": [false]}}}"#.into(),
+        "system.config" => r#"{"type": "object", "properties": {"path": {"type": "string"}, "text": {"type": "string"},
+  "settings": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "group": {"type": "string"}, "value": {}, "default": {}, "what": {"type": "string"}, "readers": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": true}},
+  "other": {"type": "array", "items": {"type": "object", "additionalProperties": true}, "description": "lines of the file the program does not read"}}, "additionalProperties": true}"#.into(),
+        "system.configSet" => r#"{"type": "object", "properties": {"changed": {"type": "array", "items": {"type": "string"}}, "restart": {"type": "array", "items": {"type": "string"}, "description": "what system.restart must restart to see it"}, "path": {"type": "string"}}, "additionalProperties": true}"#.into(),
+        "system.restart" => r#"{"type": "object", "properties": {"restarting": {"type": "string"}}}"#.into(),
+        "llm.chat" => r#"{"type": "object", "description": "OpenAI's chat.completion", "properties": {"id": {"type": "string"}, "object": {"type": "string"}, "created": {"type": "integer"}, "model": {"type": "string"},
+  "choices": {"type": "array", "items": {"type": "object", "properties": {"index": {"type": "integer"}, "finish_reason": {"type": "string"},
+    "message": {"type": "object", "properties": {"role": {"type": "string"}, "content": {"type": "string", "nullable": true}, "reasoning_content": {"type": "string", "nullable": true}, "tool_calls": {"type": "array", "items": {"type": "object"}}}}}}},
+  "usage": {"type": "object", "properties": {"prompt_tokens": {"type": "integer"}, "completion_tokens": {"type": "integer"}, "total_tokens": {"type": "integer"}}}}, "additionalProperties": true}"#.into(),
+        "llm.requests" => format!(r#"{{"type": "object", "properties": {{"active": {{"type": "array", "items": {CHAT_REQUEST}}}, "done": {{"type": "array", "description": "the last 10", "items": {CHAT_REQUEST}}}}}}}"#),
+        "llm.models" => r#"{"type": "object", "properties": {"models": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "gpus": {"type": "array", "items": {"type": "integer"}}, "loaded": {"type": "boolean"}}}}}}"#.into(),
+        "image.generate" | "image.edit" => PICTURES.into(),
+        "image.ocr" => r#"{"type": "object", "properties": {"created": {"type": "integer"}, "model": {"type": "string"}, "text": {"type": "string", "description": "the reading: Markdown, tables as HTML, LaTeX; pages after a <PAGE> mark each"},
+  "prompt": {"type": "string", "description": "the instruction used"}, "pages": {"type": "integer"}, "tokens": {"type": "integer", "description": "tokens written"}, "prompt_tokens": {"type": "integer"},
+  "prompt_seconds": {"type": "number"}, "read_tok_s": {"type": "number"}, "write_seconds": {"type": "number"}, "tok_s": {"type": "number"}, "seconds": {"type": "number"}, "wh": {"type": "number", "nullable": true}}}"#.into(),
+        "image.info" | "audio.info" => r#"{"type": "object", "properties": {"loaded": {"type": "boolean"},
+  "info": {"type": "object", "description": "loaded: the server's own - model, arch, defaults, samplers, schedules, options, loras; image: edits, reads (an OCR model), prompts (its instructions), max_pictures 8, max_pages 24; audio: lyrics, speech (voices, languages, design, clone ...)", "additionalProperties": true},
+  "model": {"type": "string", "description": "not loaded"}, "title": {"type": "string"}, "defaults": {"type": "object", "additionalProperties": true}, "note": {"type": "string"}}}"#.into(),
+        "image.progress" => r#"{"type": "object", "properties": {"busy": {"type": "boolean"}, "waiting": {"type": "integer", "description": "requests queued behind it"},
+  "loaded": {"type": "boolean", "description": "false: no server running (then busy is false)"}, "prompt": {"type": "string"}, "loading": {"type": "boolean"},
+  "picture": {"type": "integer"}, "pictures": {"type": "integer"}, "at": {"type": "integer", "description": "step"}, "of": {"type": "integer"}, "seconds": {"type": "number"},
+  "reading": {"type": "boolean", "description": "an OCR reading: text so far in text, tokens"}, "pages": {"type": "integer"}, "text": {"type": "string"}, "tokens": {"type": "integer"}}}"#.into(),
+        "audio.progress" => r#"{"type": "object", "properties": {"busy": {"type": "boolean"}, "waiting": {"type": "integer"}, "loaded": {"type": "boolean"}, "prompt": {"type": "string"},
+  "phase": {"type": "string"}, "at": {"type": "integer"}, "of": {"type": "integer"}, "seconds": {"type": "number"}, "want": {"type": "number", "description": "seconds asked for"}}}"#.into(),
+        "image.history" => r#"{"type": "object", "properties": {"data": {"type": "array", "description": "newest first (200 at most; OCR readings 50)", "items": {"type": "object", "properties": {
+  "url": {"type": "string", "description": "a server-relative /v1/images/files/<file> (the same route here)"}, "kind": {"type": "string", "description": "ocr for a reading"}, "prompt": {"type": "string"}, "seed": {"type": "integer"}, "steps": {"type": "integer"},
+  "width": {"type": "integer"}, "height": {"type": "integer"}, "loras": {"type": "array", "items": {"type": "string"}}, "seconds": {"type": "number"}, "wh": {"type": "number", "nullable": true},
+  "text": {"type": "string"}, "pages": {"type": "integer"}, "created": {"type": "integer"}}}}}}"#.into(),
+        "audio.history" => format!(r#"{{"type": "object", "properties": {{"data": {{"type": "array", "description": "newest first (200 at most); url server-relative (/v1/audio/files/<file>, the same route here)", "items": {SOUND_ITEM}}}}}}}"#),
+        "audio.generate" | "audio.speak" => sound(),
+        "audio.cancel" => r#"{"type": "object", "properties": {"cancelled": {"type": "boolean", "description": "false: nothing was being made"}}}"#.into(),
+        "audio.voices.list" => format!(r#"{{"type": "object", "properties": {{"voices": {{"type": "array", "items": {VOICE}}}}}}}"#),
+        "audio.voices.add" | "audio.voices.design" => format!(r#"{{"type": "object", "properties": {{"voice": {VOICE}, "sample": {{"type": "string", "description": "the sample's URL"}},
+  "seed": {{"type": "integer", "description": "design: the seed it was read with"}}}}}}"#),
+        "audio.voices.remove" => r#"{"type": "object", "properties": {"removed": {"type": "string"}}}"#.into(),
         "video.generate" => format!(r#"{{"oneOf": [
   {{"type": "object", "description": "queued", "properties": {{"queued": {{"type": "boolean", "enum": [true]}}, "position": {{"type": "integer", "description": "1: made next"}},
     "label": {{"type": "string"}}, "project": {{"type": "string"}}, "batch": {{"type": "string"}}, "held": {{"type": "boolean"}}}}}},
@@ -83,7 +175,7 @@ pub fn result(method: &str) -> Option<String> {
   "file": {"type": "string", "nullable": true, "description": "done: the clip's URL"}, "thumb": {"type": "string", "nullable": true, "description": "done: a 240-pixel still's URL (webp)"}}}}}}"#.into(),
         "video.jobs.list" => r#"{"type": "object", "properties": {"jobs": {"type": "array", "description": "every mp4 in the clips directory, newest first", "items": {"type": "object", "properties": {
   "file": {"type": "string", "description": "<name>.mp4 (GET /v1/video/files/<file>)"}, "mtime": {"type": "integer"},
-  "size": {"description": "with a record: WxH (string); without: bytes (integer)"}, "size2": {"type": "integer", "description": "bytes (with a record)"},
+  "size": {"type": "integer", "description": "bytes"}, "canvas": {"type": "string", "nullable": true, "description": "WxH; null for an mp4 without a record"},
   "label": {"type": "string"}, "project": {"type": "string"}, "seconds": {"type": "number"}, "steps": {"type": "integer"}, "engine": {"type": "string"},
   "total": {"type": "number", "description": "seconds it took"}, "energy_wh": {"type": "number", "nullable": true}, "camera": {"type": "string", "nullable": true},
   "speech_pct": {"type": "number", "nullable": true}, "te": {"type": "string"}}}}}}"#.into(),
@@ -119,6 +211,13 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
         "video.jobs.get" => &[(404, "not_found", "no record of that clip")],
         "video.upload" => &[(400, "invalid_params", "not a picture, clip or sound (png jpg jpeg webp mp4 mov webm mkv wav mp3 flac m4a ogg), or empty")],
         "system.enable" | "system.disable" | "system.load" | "system.unload" | "system.gpus" => &[(404, "not_found", "no such model")],
+        "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.voices.design" =>
+            &[(400, "invalid_params", "the server refused a value (a size, a sampler, too many pictures or pages, an unknown voice ...)"),
+              (404, "not_found", "no such model"), (409, "conflict", "the model is disabled, or none that can do it is enabled"),
+              (499, "cancelled", "audio: stopped by audio.cancel"), (502, "unavailable", "the kind's server did not start or answer")],
+        "llm.chat" => &[(400, "invalid_params", "the chat server refused the request"), (502, "unavailable", "the chat server does not answer")],
+        "audio.voices.add" => &[(400, "invalid_params", "a bad name, a recording shorter than 3 s or not decodable")],
+        "audio.voices.remove" => &[(404, "not_found", "no saved voice of that name")],
         _ => &[],
     }
 }
@@ -127,7 +226,7 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
 pub const CODES: &str = "Error codes (error.code, with the HTTP status): invalid_request 400 (the body is not a JSON object), invalid_params 400, \
 unauthorized 401, not_found 404 (also an unknown method), conflict 409 (a model disabled, none of the kind enabled, a name taken), \
 busy 409 (video.generate while a clip is made, without queue: true), not_running 409 (video.cancel with nothing running), \
-unavailable 502/503 (the kind's server does not answer), timeout 504, internal 500.";
+cancelled 499 (audio.cancel stopped it), unavailable 502/503 (the kind's server does not answer), timeout 504, internal 500.";
 
 /// The label convention the video methods share
 pub const LABELS: &str = "Video labels: \"<series> NN/MM: text\" (\"Harbour 03/12: the lamp\"). NN orders video.timeline (the edit order); \
@@ -147,9 +246,8 @@ mod tests {
                     serde_json::from_str::<serde_json::Value>(ty).unwrap_or_else(|e| panic!("{op} {f}: {e}"));
                 }
             }
-            if let Some(r) = super::result(&op) {
-                serde_json::from_str::<serde_json::Value>(&r).unwrap_or_else(|e| panic!("{op} result: {e}"));
-            }
+            let r = super::result(&op).unwrap_or_else(|| panic!("{op}: no answer described"));
+            serde_json::from_str::<serde_json::Value>(&r).unwrap_or_else(|e| panic!("{op} result: {e}"));
             serde_json::from_str::<serde_json::Value>(m.example).unwrap_or_else(|e| panic!("{op} example: {e}"));
         }
         let w: serde_json::Value = serde_json::from_str(&super::result("video.wait").unwrap()).unwrap();

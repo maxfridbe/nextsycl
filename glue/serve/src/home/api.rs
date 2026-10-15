@@ -128,7 +128,7 @@ pub const METHODS: &[Method] = &[
     Method { kind: "audio", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "minimax-music3"}"# },
 
     Method { kind: "video", name: "generate", summary: "Make a clip: it starts at once when the studio is idle (queued: false, the job), else it is queued with queue: true (queued: true, its position) or refused with 409 busy. Anchors (first_frame, last_frame, exposure_ref, first_audio, guide_clip, source) take prev, prev_cam, first, first_cam - clips of the label's series, see label - or a file in the clips directory (video.upload, or a finished clip's name)",
-             fields: &[("prompt", "string", "the structured prompt (video.describePromptGuideMD)", true),
+             fields: &[("prompt", "string", "read as written - tokenized whole, no template, no sections parsed. H3 was trained on three fields in a fixed order: integrated_multimodal_description (shots, actions, camera, dialogue), overall_soundscape, non_diegetic_music; video.describePromptGuideMD has the form and its rules", true),
                        ("seconds", r#"{"type": "number", "minimum": 1, "maximum": 15.1, "default": 10}"#, "length; snapped up to the model's frame grid (17k + 5 frames at 24 fps); the model is trained on 5.2-15.1 s", false),
                        ("steps", r#"{"type": "integer", "minimum": 1, "maximum": 40, "default": 10}"#, "denoising steps; below 8 only with a turbo LoRA", false),
                        ("seed", r#"{"type": "integer", "minimum": -2147483648, "maximum": 2147483648, "default": 0}"#, "", false),
@@ -196,8 +196,9 @@ pub const METHODS: &[Method] = &[
     Method { kind: "video", name: "engines.list", summary: "The denoisers the daemon has", fields: &[], example: "{}" },
     Method { kind: "video", name: "canvases.list", summary: "The canvases and their measured cost", fields: &[], example: "{}" },
     Method { kind: "video", name: "summary", summary: "Measured GPU time per second of video, energy, queue ETA", fields: &[], example: "{}" },
-    Method { kind: "video", name: "upload", summary: "Put a reference, control video, mask or keyframe beside the clips (its name is what the other keys take)",
-             fields: &[("name", "string", "the file's name (picture, clip or sound)", true), ("data", "string", "the file, base64", true)],
+    Method { kind: "video", name: "upload", summary: "Put a reference, control video, mask or keyframe beside the clips (its name is what the other keys take). The request is at most 256 MiB, so the file at most about 190 MiB as base64. Uploads are kept: nothing deletes them (they sit in the clips directory with the clips)",
+             fields: &[("name", "string", "the file's name: png jpg jpeg webp mp4 mov webm mkv wav mp3 flac m4a ogg; saved as ref_<unix seconds>_<name> (letters, digits, . _ - kept, the rest _, 60 characters)", true),
+                       ("data", "string", "the file, base64 (a data: URL too)", true)],
              example: r#"{"name": "fox.png", "data": "iVBORw0KGgo..."}"# },
     Method { kind: "video", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "minimax-h3"}"# },
 ];
@@ -207,6 +208,7 @@ fn code_of(status: u16) -> &'static str {
         400 => "invalid_params",
         401 => "unauthorized",
         404 => "not_found",
+        499 => "cancelled",
         409 => "conflict",
         502 | 503 => "unavailable",
         504 => "timeout",
@@ -215,6 +217,15 @@ fn code_of(status: u16) -> &'static str {
 }
 
 type Fail = (u16, String);
+
+/// A call to a kind's server whose failure keeps that server's status (a 400 stays a 400); 502 when it does not answer
+fn relay(t: &crate::http::Target, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, Fail> {
+    match http::call_status(t, method, path, body, secs) {
+        Ok((200, v)) => Ok(v),
+        Ok((st, v)) => Err((st, v["error"]["message"].as_str().or_else(|| v["error"].as_str()).unwrap_or("request failed").to_string())),
+        Err(e) => Err((502, e)),
+    }
+}
 
 impl Home {
     fn authorized(&self, req: &Request) -> bool {
@@ -349,7 +360,7 @@ impl Home {
                 q[k] = b[k].clone();
             }
         }
-        let r = call_for(&t, "POST", "/v1/audio/speech", Some(&q), 600).map_err(|e| (502, e))?;
+        let r = relay(&t, "POST", "/v1/audio/speech", Some(&q), 600)?;
         let url = r["data"][0]["url"].as_str().ok_or_else(|| (502, format!("the speech server answered {r}")))?;
         let file = lib.dir.parent().map(|d| d.join(url.rsplit('/').next().unwrap_or(""))).unwrap_or_default();
         let bytes = std::fs::read(&file).map_err(|e| (500, format!("{}: {e}", file.display())))?;
@@ -488,7 +499,7 @@ impl Home {
                 let t = self.chat_target(b["model"].as_str())?;
                 let mut body = b.clone();
                 body["stream"] = json!(false);
-                call_for(&t, "POST", "/v1/chat/completions", Some(&body), 1800).map_err(|e| (502, e))
+                relay(&t, "POST", "/v1/chat/completions", Some(&body), 1800)
             }
             ("llm", "requests") => {
                 // the chat server's control socket (its /server routes are not on its port)
@@ -526,7 +537,7 @@ impl Home {
                 let t = self.ensure(&id)?;
                 let mut body = b.clone();
                 body["model"] = json!(id);
-                call_for(&t, "POST", "/v1/ocr", Some(&body), 3600).map_err(|e| (502, e))
+                relay(&t, "POST", "/v1/ocr", Some(&body), 3600)
             }
             ("image", "generate") | ("image", "edit") => {
                 let id = self.pick("image", b, &all)?;
@@ -537,7 +548,7 @@ impl Home {
                     body["response_format"] = json!("url");
                 }
                 let path = if m.name == "edit" { "/v1/images/edits" } else { "/v1/images/generations" };
-                call_for(&t, "POST", path, Some(&body), 3600).map_err(|e| (502, e))
+                relay(&t, "POST", path, Some(&body), 3600)
             }
             ("audio", "generate" | "speak") => {
                 let mut b = b.clone();
@@ -550,7 +561,7 @@ impl Home {
                 let mut body = b.clone();
                 body["model"] = json!(id);
                 body["response_format"] = json!("url");
-                call_for(&t, "POST", "/v1/audio/speech", Some(&body), 3600).map_err(|e| (502, e))
+                relay(&t, "POST", "/v1/audio/speech", Some(&body), 3600)
             }
             ("image" | "audio", "info") => {
                 let id = self.pick(m.kind, b, &all)?;
@@ -565,7 +576,7 @@ impl Home {
             }
             ("image" | "audio", "progress") => Ok(call_for(&t, "GET", "/api/progress", None, 5).unwrap_or(json!({"busy": false, "loaded": false}))),
             ("image" | "audio", "history") => Ok(call_for(&t, "GET", "/api/history", None, 10).unwrap_or(json!({"data": []}))),
-            ("audio", "cancel") => call_for(&t, "POST", "/api/cancel", Some(&json!({})), 10).map_err(|e| (502, e)),
+            ("audio", "cancel") => relay(&t, "POST", "/api/cancel", Some(&json!({})), 10),
             ("audio", "voices.list") => {
                 let list: Vec<Value> = self.voices().list().into_iter().map(|mut v| {
                     v["sample"] = json!(format!("http://nextsycl/v1/audio/voices/{}.wav", s(&v, "name")));
@@ -775,33 +786,48 @@ impl Home {
                 "x-curl": curl,
             }}));
         }
-        let oa = |summary: &str, body: Value| json!({"tags": ["openai"], "summary": summary,
-            "requestBody": {"required": true, "content": {"application/json": {"example": body}}}, "responses": {"200": {"description": "as OpenAI's"}}});
+        let oa = |summary: &str, body: Value, answer: &str| {
+            let schema: Value = spec::result(answer).and_then(|r| serde_json::from_str(&r).ok()).unwrap_or(json!({"type": "object"}));
+            json!({"tags": ["openai"], "summary": summary, "requestBody": {"required": true, "content": {"application/json": {"example": body}}},
+                   "responses": {"200": {"description": format!("OpenAI's shape, no envelope (as {answer}'s result)"), "content": {"application/json": {"schema": schema}}},
+                                 "4XX": {"description": "OpenAI's error: {\"error\": {\"message\", \"type\"}}"}}})
+        };
+        // a file an answer links: the bearer token like every route here; byte ranges where the kind's server serves them
+        let file = |summary: &str, name: &str, mime: &str, ranges: bool| {
+            let mut params = vec![json!({"name": "name", "in": "path", "required": true, "schema": {"type": "string"}, "description": name})];
+            let mut responses = json!({"200": {"description": format!("the file ({mime})"), "content": {mime: {"schema": {"type": "string", "format": "binary"}}}},
+                                       "401": {"description": "unauthorized: the bearer token is needed here too"},
+                                       "404": {"description": "no such file"}});
+            if ranges {
+                params.push(json!({"name": "Range", "in": "header", "required": false, "schema": {"type": "string"},
+                                   "description": "bytes=a-b, bytes=a- or bytes=-n (one span): answered 206 with Content-Range; Accept-Ranges: bytes"}));
+                responses["206"] = json!({"description": "the span asked for", "content": {mime: {"schema": {"type": "string", "format": "binary"}}}});
+            }
+            json!({"get": {"tags": ["files"], "summary": format!("{summary}{}", if ranges { "; byte ranges (Range) supported" } else { "; no byte ranges (always the whole file)" }),
+                           "security": [{"bearer": []}], "parameters": params, "responses": responses}})
+        };
         paths.insert("/v1/models".into(), json!({"get": {"tags": ["openai"], "summary": "The enabled chat, image and audio models", "responses": {"200": {"description": "OpenAI's list"}}}}));
         if on.contains(&"llm") {
             paths.insert("/v1/chat/completions".into(), json!({"post": oa("Chat (streams with stream: true; tools)",
-                json!({"model": ids("llm").first(), "messages": [{"role": "user", "content": "Hello"}], "stream": false}))}));
+                json!({"model": ids("llm").first(), "messages": [{"role": "user", "content": "Hello"}], "stream": false}), "llm.chat")}));
         }
         if on.contains(&"image") {
             paths.insert("/v1/images/generations".into(), json!({"post": oa("Pictures (and ours: steps, seed, sampler, schedule, cfg, negative_prompt, loras)",
-                json!({"model": ids("image").first(), "prompt": "a lighthouse at dusk", "size": "1024x1024"}))}));
+                json!({"model": ids("image").first(), "prompt": "a lighthouse at dusk", "size": "1024x1024"}), "image.generate")}));
             paths.insert("/v1/images/edits".into(), json!({"post": oa("Edits: multipart (image, image[] ...) or JSON images",
-                json!({"prompt": "make it night", "images": ["data:image/png;base64,..."]}))}));
-            paths.insert("/v1/images/files/{name}".into(), json!({"get": {"tags": ["openai"], "summary": "A picture an answer links (OpenAI's url form)",
-                "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "PNG"}}}}));
+                json!({"prompt": "make it night", "images": ["data:image/png;base64,..."]}), "image.edit")}));
+            paths.insert("/v1/images/files/{name}".into(), file("A picture an answer links (data[].url of image.generate / image.edit)", "<file>.png", "image/png", false));
         }
         if on.contains(&"audio") {
             paths.insert("/v1/audio/speech".into(), json!({"post": oa("A song (input: the lyrics, instructions: the music) or speech (input: the text; voice, \
                 language, instructions, ref_audio, ref_text); response_format wav or url",
-                json!({"model": ids("audio").first(), "instructions": "warm folk", "input": "[verse]\nRiver runs slow", "response_format": "url"}))}));
-            paths.insert("/v1/audio/files/{name}".into(), json!({"get": {"tags": ["openai"], "summary": "A song an answer links",
-                "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "WAV"}}}}));
+                json!({"model": ids("audio").first(), "instructions": "warm folk", "input": "[verse]\nRiver runs slow", "response_format": "url"}), "audio.generate")}));
+            paths.insert("/v1/audio/files/{name}".into(), file("A song or speech an answer links (data[].url of audio.generate / audio.speak)", "<file>.wav", "audio/wav", true));
+            paths.insert("/v1/audio/voices/{name}".into(), file("A saved voice's sample (audio.voices.list's sample)", "<voice>.wav", "audio/wav", false));
         }
         if on.contains(&"video") {
-            paths.insert("/v1/video/files/{name}".into(), json!({"get": {"tags": ["openai"], "summary": "A finished clip (video.jobs.list's file), Range requests too",
-                "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "MP4"}}}}));
-            paths.insert("/v1/video/thumbs/{name}".into(), json!({"get": {"tags": ["openai"], "summary": "A finished clip's 240-pixel still (video.timeline's thumb): <clip>.webp",
-                "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "WebP"}}}}));
+            paths.insert("/v1/video/files/{name}".into(), file("A finished clip: <clip>.mp4 (video.jobs.list's file, video.status's and video.timeline's file URLs)", "<clip>.mp4, e.g. h3_20261011_220723.mp4", "video/mp4", true));
+            paths.insert("/v1/video/thumbs/{name}".into(), file("A finished clip's 240-pixel still, 5 s in (video.timeline's thumb)", "<clip>.webp", "image/webp", false));
         }
         json!({
             "openapi": "3.0.3",

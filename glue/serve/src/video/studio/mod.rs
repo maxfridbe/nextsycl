@@ -324,7 +324,20 @@ impl Studio {
             }
             "jobs.list" => {
                 let limit = num(p, "limit", 50.0, 1.0, 500.0, true)?.as_u64().unwrap_or(50) as usize;
-                json!({"jobs": self.listing().into_iter().take(limit).collect::<Vec<_>>()})
+                // one type a key: size in bytes, canvas WxH (the page's /api/list keeps the legacy mixed size)
+                let rows = self.listing().into_iter().take(limit).map(|mut r| {
+                    if let Some(b) = r.get("size2").cloned() {
+                        r["canvas"] = r["size"].clone();
+                        r["size"] = b;
+                    } else {
+                        r["canvas"] = Value::Null;
+                    }
+                    if let Some(o) = r.as_object_mut() {
+                        o.remove("size2");
+                    }
+                    r
+                });
+                json!({"jobs": rows.collect::<Vec<_>>()})
             }
             "jobs.get" => {
                 let n = queue::basename(&ps("name"));
