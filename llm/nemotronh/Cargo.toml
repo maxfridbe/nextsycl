@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-llm-nemotronh"
+description = "Nemotron-H MoE (nemotron_h_moe: Nemotron 3.5 Super ...): Mamba-2 mixers, latent MoE and attention layers - its model description and its engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-llm.workspace = true
+nextsycl-tok.workspace = true

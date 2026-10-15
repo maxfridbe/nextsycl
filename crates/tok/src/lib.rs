@@ -29,6 +29,8 @@ const DEEPSEEK3_SPLITS: [&str; 3] = [
 
 /// transformers' Qwen2Tokenizer (the slow one, from vocab.json and merges.txt): case-insensitive contractions,
 /// letters, single digits
+/// Mistral's Tekken (llama.cpp's TEKKEN: tokenizer.json's own pattern - no contractions, single digits)
+const TEKKEN_SPLIT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const QWEN2_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 pub struct Tokenizer {
@@ -196,9 +198,11 @@ impl Tokenizer {
             // llama.cpp's QWEN2: the contractions either case, letters, single digits
             "qwen2" => (QWEN2_SPLIT, &[]),
             "gpt-4o" | "llama4" => (GPT4O_SPLIT, &[]),
+            // Nemotron 3.5's
+            "tekken" => (TEKKEN_SPLIT, &[]),
             // DeepSeek-V4's `joyai-llm`: llama.cpp gives it DeepSeek-V3's three patterns
             "deepseek-v3" | "joyai-llm" => (DEEPSEEK3_SPLITS[2], &DEEPSEEK3_SPLITS[..2]),
-            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen2, qwen35, deepseek-v3, joyai-llm, llama4)")),
+            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen2, qwen35, deepseek-v3, joyai-llm, llama4, tekken)")),
         };
         let tokens = strs(g.meta("tokenizer.ggml.tokens"));
         let types: Vec<u64> = g.meta("tokenizer.ggml.token_type").and_then(Value::as_array).map(|a| a.iter().map(|x| x.as_u64().unwrap_or(1)).collect()).unwrap_or_default();
@@ -234,7 +238,7 @@ impl Tokenizer {
             split: Regex::new(split).map_err(|e| e.to_string())?,
             pre: pre_splits.iter().map(|p| Regex::new(p).map_err(|e| e.to_string())).collect::<Result<_, _>>()?,
             // llama.cpp takes a piece the vocabulary has whole for GLM's (not the old chatglm-bpe); Qwen's merge by rank
-            ignore_merges: matches!(pre, "glm4" | "glm5"),
+            ignore_merges: matches!(pre, "glm4" | "glm5" | "tekken"),
             sentencepiece: false,
             prepend: false,
             byte_enc,
@@ -731,6 +735,91 @@ pub fn qwen_chat(messages: &[Message], _effort: Effort, tools: &[String]) -> Str
                 s += "\n<tool_response>\n";
                 s += m.content.trim();
                 s += "\n</tool_response>";
+                if k + 1 == ms.len() || ms[k + 1].role != "tool" {
+                    s += "<|im_end|>\n";
+                }
+            }
+            _ => {}
+        }
+    }
+    s += "<|im_start|>assistant\n<think>\n";
+    s
+}
+
+/// Nemotron 3.5's chat template (`tokenizer.chat_template`, n5h): ChatML with a system turn always (empty without one),
+/// the tools in it after the system text, past assistant turns' thinking dropped (`<think></think>` kept in its place:
+/// truncate_history_thinking), tool results in one user turn, then `<|im_start|>assistant\n<think>\n`. Low effort is
+/// the template's medium_effort (`{reasoning effort: efficient}` after the last user turn).
+pub fn nemotron_chat(messages: &[Message], effort: Effort, tools: &[String]) -> String {
+    let (sys, ms) = match messages.first() {
+        Some(m) if m.role == "system" => (m.content, &messages[1..]),
+        _ => ("", messages),
+    };
+    let mut s = String::from("<|im_start|>system\n");
+    s += sys;
+    if !tools.is_empty() {
+        if !sys.is_empty() {
+            s += "\n\n";
+        }
+        s += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for t in tools {
+            s += "\n";
+            s += t;
+        }
+        s += "\n</tools>";
+        s += QWEN_TOOL_FORMAT;
+    }
+    s += "<|im_end|>\n";
+    let last_user = ms.iter().rposition(|m| m.role == "user");
+    for (k, m) in ms.iter().enumerate() {
+        match m.role {
+            "system" | "user" => {
+                s += "<|im_start|>";
+                s += m.role;
+                s += "\n";
+                s += m.content;
+                if m.role == "user" && Some(k) == last_user && matches!(effort, Effort::Low) {
+                    s += "\n\n{reasoning effort: efficient}";
+                }
+                s += "<|im_end|>\n";
+            }
+            "assistant" => {
+                // thinking kept only after the last user turn (a tool loop's); before it the turn's text alone
+                let after = last_user.is_none_or(|u| k > u);
+                let text = match m.reasoning.filter(|r| after && !r.trim().is_empty()) {
+                    Some(r) => format!("<think>\n{r}</think>{}", m.content),
+                    None => format!("<think></think>{}", m.content.rsplit("</think>").next().unwrap_or(m.content)),
+                };
+                s += "<|im_start|>assistant\n";
+                if m.calls.is_empty() {
+                    s += text.trim();
+                } else {
+                    let tt = text.trim();
+                    s += tt;
+                    s += "\n";
+                    for call in m.calls {
+                        s += "<tool_call>\n<function=";
+                        s += &call.name;
+                        s += ">\n";
+                        for (k, v) in &call.args {
+                            s += "<parameter=";
+                            s += k;
+                            s += ">\n";
+                            s += v;
+                            s += "\n</parameter>\n";
+                        }
+                        s += "</function>\n</tool_call>\n";
+                    }
+                }
+                s += "<|im_end|>\n";
+            }
+            "tool" => {
+                if k == 0 || ms[k - 1].role != "tool" {
+                    s += "<|im_start|>user\n";
+                }
+                s += "<tool_response>\n";
+                s += m.content;
+                s += "\n</tool_response>\n";
                 if k + 1 == ms.len() || ms[k + 1].role != "tool" {
                     s += "<|im_end|>\n";
                 }

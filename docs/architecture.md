@@ -239,6 +239,21 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   matrices the silo does not all take gets float rows from the decode norms (the shared products need them). The chat template's channels (a `to=self` message, then `to=user`) come back as
   `reasoning_content` and `content` (nextsycl_tok::muse_channels).
 
+- **nemotronh** - NVIDIA Nemotron 3.5 Super VL 120B-A12B (`nemotron_h_moe`, llama.cpp's nemotron-h graph): 88
+  pre-norm residual blocks of three kinds - 40 Mamba-2 mixers (an input projection to z | x B C | dt, a causal conv +
+  SiLU, the selective scan with 128 heads of 64 in 8 groups and a state of 128, a SiLU(z)-gated group RMS norm), 40
+  latent-MoE layers (a float32 sigmoid router whose selection bias picks 22 of 512 experts, weights renormalized and
+  scaled by 5; the token projected to a 1024-wide latent where each expert is relu^2(up) then down, the weighted sum
+  projected back; a relu^2 shared expert on the full width) and 8 attention layers (32 / 2 heads of 128, no
+  positions). Its own kernels (`kernels/llm/nemotronh/nh.cpp`): the conv with its bias, the scan, the gated norm,
+  relu^2 and the head-128 attention; every product is Strata's Q8_1 kernels (they read the file's Q2_0 and IQ4_NL
+  expert downs, whose 2,688 inputs no 256-block type divides). unsloth's UD-Q2_K_XL (53.8 GiB) lies all in VRAM, the
+  layers split over the cards by their memory (`NS_SPLIT` overrides). First version: passes of at most 8 rows, the
+  routing on the host each MoE layer, an expert a launch; no MTP drafts yet (its block is in the file), no vision
+  tower (mmproj). Checked against llama.cpp layer by layer (`reference/llama-dump`): the same next token and top
+  logit, logits cosine 0.999997; a token fed alone after the rest gives the same logits as the prompt at once. B65 +
+  B70: decode 18.2 tok/s, prompt 27 tok/s (58 tokens).
+
 ## The image engines
 
 - **qwen-image-2.1** (`image/qwenimage21`) - Qwen-Image 2.1's DiT, VAE and pipeline (text to image, edits).
