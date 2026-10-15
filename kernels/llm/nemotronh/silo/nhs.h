@@ -31,6 +31,8 @@ int ns_nhs_multi_supported(int type, int64_t n_in);
 int ns_nhs_packed(int type, int64_t n_in);
 int64_t ns_nhs_packed_row_bytes(int type, int64_t n_in);
 int ns_nhs_pack(ns_gpu* g, int type, const void* src, void* dst, int64_t rows, int64_t n_in);
+/* rows of a matrix of a type Strata's expansion lacks (IQ1_S; IQ2_XXS) expanded to fp16 [rows][n_in] */
+int ns_nhs_wide_f16(ns_gpu* g, int type, const void* src, uint16_t* dst, int64_t rows, int64_t n_in);
 /* rows of a packed matrix (n_in values each) expanded to fp16 [rows][n_in] (the prompt path's products) */
 int ns_nhs_packed_f16(ns_gpu* g, int type, const void* src, uint16_t* dst, int64_t rows, int64_t n_in);
 /* y [entries][n_out]: entry e = expert ids[e]'s matrix (base + ids[e] * stride bytes, n_out rows of n_in in its blocks)

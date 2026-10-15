@@ -23,7 +23,7 @@ use std::ffi::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use nextsycl_core::{Arena, DevBuf, Gpu};
+use nextsycl_core::{Arena, DevBuf, Gpu, HostBuf};
 use nextsycl_gguf::{GType, Gguf, Tensor};
 use nextsycl_llm::{Error, GpuInfo, Result, Sampler, Tap};
 
@@ -159,9 +159,11 @@ pub struct Mat {
     pub cols: usize,
 }
 
-/// A layer's experts in one buffer: each [rows, cols] in its blocks, `stride` bytes apart
+/// A layer's experts in one buffer: each [rows, cols] in its blocks, `stride` bytes apart - in VRAM, or in pinned host
+/// memory the GPU reads in place over PCIe (`pin` holds it; `buf` its device view)
 struct Experts {
     buf: DevBuf,
+    _pin: Option<HostBuf>,
     ty: GType,
     rows: usize,
     cols: usize,
@@ -204,7 +206,7 @@ struct Moe {
 
 enum Mix {
     Mamba(Mamba),
-    Moe(Moe),
+    Moe(Box<Moe>),
     Attn(Attn),
 }
 
@@ -455,18 +457,24 @@ impl<'g> NemotronH<'g> {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         let ctx = if kv.0 > 0 { kv.0 } else { 32768 };
         let sessions = kv.1.max(1) as u64;
+        // a MoE layer's experts (the part a GPU without the room keeps in pinned host memory)
+        let exp_w: Vec<u64> = (0..=g.layers).map(|l| ["ffn_up_exps", "ffn_down_exps"].iter()
+            .filter_map(|s| f.tensor(&format!("blk.{l}.{s}.weight"))).map(|t| t.bytes).sum()).collect();
         // a layer's cost where it lands: its weights, its sessions' cache (attention) or states (Mamba)
         let cost: Vec<u64> = (0..g.layers).map(|l| layer_w[l] + sessions * match g.kinds[l] {
             Kind::Attn => (2 * g.heads_kv * ctx * g.head * 2) as u64,
             Kind::Mamba => ((g.inner * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64,
             Kind::Moe => 0,
         } + if g.kinds[l] == Kind::Mamba { (drafts * (g.inner * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64 } else { 0 }).collect();
-        let mtp_cost = if drafts > 0 { mtp_w + sessions * (2 * g.heads_kv * ctx * g.head * 2) as u64 } else { 0 };
+        let mtp_kv = if drafts > 0 { sessions * (2 * g.heads_kv * ctx * g.head * 2) as u64 } else { 0 };
         let n = gpus.len();
         let split_env: Option<Vec<usize>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
         // the layers over the GPUs for a prompt chunk of `chunk` rows: each GPU's room after its spare, work memory and
         // half buffer (the last's after the head too), the layers cut where each GPU's share of the room ends
-        let plan = |chunk: usize| -> std::result::Result<Vec<(usize, usize)>, String> {
+        // `host`: the MoE layers whose experts stay in pinned host memory (index g.layers: the draft block's)
+        let plan = |chunk: usize, host: &[bool]| -> std::result::Result<Vec<(usize, usize)>, String> {
+            let cost: Vec<u64> = (0..g.layers).map(|l| cost[l] - if host[l] { exp_w[l] } else { 0 }).collect();
+            let mtp_cost = if drafts > 0 { mtp_w - if host[g.layers] { exp_w[g.layers] } else { 0 } + mtp_kv } else { 0 };
             let over = |i: usize| margin + (512 << 20) + arena_bytes(&g, chunk) as u64 + w16_bytes(&g) as u64 + if i + 1 == n { head_w + mtp_cost } else { 0 };
             let room: Vec<i64> = (0..n).map(|i| free[i] as i64 - over(i) as i64).collect();
             let mut bounds = Vec::with_capacity(n);
@@ -510,17 +518,46 @@ impl<'g> NemotronH<'g> {
         // the prompt chunk: NS_NH_CHUNK, else the largest of 2,048 / 1,024 / 512 rows that fits (more rows a pass, more
         // rows an expert's product: 3.9K prompts 280 -> 530 tok/s from 512 to 2,048); without the silo, DEC
         let tries: Vec<usize> = if silo.is_none() { vec![DEC] } else { chunk_setting().map_or_else(|| vec![2048, 1024, 512], |c| vec![c]) };
-        let mut last_err = String::new();
-        let mut found = None;
-        for c in tries {
-            match plan(c) {
-                Ok(b) => {
-                    found = Some((c, b));
+        let first_fit = |host: &[bool]| -> std::result::Result<(usize, Vec<(usize, usize)>), String> {
+            let mut last_err = String::new();
+            for &c in &tries {
+                match plan(c, host) {
+                    Ok(b) => return Ok((c, b)),
+                    Err(x) => last_err = x,
+                }
+            }
+            Err(last_err)
+        };
+        // one GPU without the room (with the silo, which reads experts in place): MoE layers' experts into pinned host
+        // memory, the draft block's first, then the layers' from the last back, as few as fit the smallest chunk
+        // (NS_NH_HOST: how many layers, besides the draft block's) - then the largest chunk that fits beside them
+        let moe_layers: Vec<usize> = (0..g.layers).filter(|l| g.kinds[*l] == Kind::Moe).collect();
+        let mut host = vec![false; g.layers + 1];
+        let forced: Option<usize> = std::env::var("NS_NH_HOST").ok().and_then(|v| v.parse().ok());
+        let mut found = first_fit(&host);
+        if (found.is_err() || forced.is_some()) && n == 1 && silo.is_some() {
+            host[g.layers] = drafts > 0;
+            let smallest = *tries.last().unwrap_or(&DEC);
+            let mut k = forced.unwrap_or(0);
+            loop {
+                host.iter_mut().take(g.layers).for_each(|h| *h = false);
+                for l in moe_layers.iter().rev().take(k) {
+                    host[*l] = true;
+                }
+                if forced.is_some() || plan(smallest, &host).is_ok() || k >= moe_layers.len() {
                     break;
                 }
-                Err(x) => last_err = x,
+                k += 1;
+            }
+            found = first_fit(&host);
+            if found.is_ok() {
+                let gb: u64 = (0..=g.layers).filter(|l| host[*l]).map(|l| exp_w[l]).sum();
+                log(format!("nemotronh: {} of the MoE layers' experts{} in pinned host memory ({:.1} GiB), read in place over PCIe",
+                            (0..g.layers).filter(|l| host[*l]).count(), if host[g.layers] { " and the draft block's" } else { "" }, gib(gb)));
             }
         }
+        let last_err = found.as_ref().err().cloned().unwrap_or_default();
+        let found = found.ok();
         let (chunk, bounds) = found.ok_or_else(|| e(format!("{} over {} GPUs: {last_err}", f.architecture(), n)))?;
         let (gpus, bounds): (Vec<Arc<Gpu>>, Vec<(usize, usize)>) = gpus.iter().cloned().zip(bounds).filter(|(_, b)| b.1 > b.0).unzip();
         let mut layer_dev = vec![0usize; g.layers];
@@ -556,8 +593,8 @@ impl<'g> NemotronH<'g> {
                 }
                 Kind::Attn => Mix::Attn(Attn { q: read(&w("attn_q"))?, k: read(&w("attn_k"))?, v: read(&w("attn_v"))?, o: read(&w("attn_output"))? }),
                 Kind::Moe => {
-                    let m = load_moe(f, gpu, k, silo, &g, l, &loaded)?;
-                    Mix::Moe(m)
+                    let m = load_moe(f, gpu, k, silo, &g, l, host[l], &loaded)?;
+                    Mix::Moe(Box::new(m))
                 }
             };
             layers.push(Layer { norm, mix });
@@ -597,7 +634,7 @@ impl<'g> NemotronH<'g> {
                 attn_norm: read(&w("attn_norm"))?.buf,
                 attn: Attn { q: read(&w("attn_q"))?, k: read(&w("attn_k"))?, v: read(&w("attn_v"))?, o: read(&w("attn_output"))? },
                 post_norm: read(&w("post_attention_norm"))?.buf,
-                moe: load_moe(f, &lastg, k, silo, &g, l, &loaded)?,
+                moe: load_moe(f, &lastg, k, silo, &g, l, host[g.layers], &loaded)?,
                 head_norm: read(&w("nextn.shared_head_norm"))?.buf,
             })
         } else {
@@ -1002,6 +1039,8 @@ impl<'g> NemotronH<'g> {
                     let src = mat.buf.ptr().cast::<u8>().add(x * mat.stride).cast();
                     if stage == 1 && packed {
                         self.op("expert down f16", || (s.packed_f16)(self.raw(), mat.ty.code() as i32, src, w16.ptr().cast(), rows as i64, cols as i64))?;
+                    } else if mat.ty == GType::IQ1S {
+                        self.op("expert up f16", || (s.wide_f16)(self.raw(), mat.ty.code() as i32, src, w16.ptr().cast(), rows as i64, cols as i64))?;
                     } else {
                         self.op(if stage == 0 { "expert up f16" } else { "expert down f16" },
                                 || (k.dequant_f16)(self.raw(), mat.ty.code() as i32, src, (rows * cols) as i64, w16.ptr().cast()))?;
@@ -1728,7 +1767,7 @@ fn vec_mat(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, name: &str, loaded: &std::cel
 }
 
 /// A layer's stacked experts [experts, rows, cols] onto the GPU in their blocks
-fn experts(f: &Gguf, gpu: &Arc<Gpu>, name: &str, loaded: &std::cell::Cell<u64>) -> Result<Experts> {
+fn experts(f: &Gguf, gpu: &Arc<Gpu>, name: &str, host: bool, loaded: &std::cell::Cell<u64>) -> Result<Experts> {
     let t = f.tensor(name).ok_or_else(|| e(format!("no {name}")))?;
     if t.shape.len() != 3 {
         return Err(e(format!("{name}: [experts, rows, cols], not {:?}", t.shape)));
@@ -1738,16 +1777,24 @@ fn experts(f: &Gguf, gpu: &Arc<Gpu>, name: &str, loaded: &std::cell::Cell<u64>) 
     if stride * n != t.bytes as usize {
         return Err(e(format!("{name}: {} bytes, not {n} experts of {stride}", t.bytes)));
     }
+    loaded.set(loaded.get() + t.bytes);
+    if host {
+        let mut pin = HostBuf::new(gpu, t.bytes as usize)?;
+        f.read_into(t, 0, pin.as_mut_slice()).map_err(|x| e(x.0))?;
+        let buf = pin.device_view(0, t.bytes as usize)?;
+        return Ok(Experts { buf, _pin: Some(pin), ty: t.ty, rows, cols, stride });
+    }
     let raw = f.read(t).map_err(|x| e(x.0))?;
-    loaded.set(loaded.get() + raw.len() as u64);
     let buf = DevBuf::new(gpu, raw.len())?;
     buf.write(0, &raw)?;
-    Ok(Experts { buf, ty: t.ty, rows, cols, stride })
+    Ok(Experts { buf, _pin: None, ty: t.ty, rows, cols, stride })
 }
 
 /// A latent-MoE layer (blk.l) onto the GPU: the router, its bias, the latent projections, the experts (the downs
 /// repacked when the silo takes both projections: routed on the GPU then), the shared expert
-fn load_moe(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, silo: Option<&ffi::Silo>, g: &Geometry, l: usize, loaded: &std::cell::Cell<u64>) -> Result<Moe> {
+/// `host`: its experts in pinned host memory (a GPU without the room for them)
+#[allow(clippy::too_many_arguments)]
+fn load_moe(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, silo: Option<&ffi::Silo>, g: &Geometry, l: usize, host: bool, loaded: &std::cell::Cell<u64>) -> Result<Moe> {
     let w = |s: &str| format!("blk.{l}.{s}.weight");
     let read = |name: &str| -> Result<Mat> { vec_mat(f, gpu, k, name, loaded) };
     let router = read(&w("ffn_gate_inp"))?;
@@ -1762,8 +1809,8 @@ fn load_moe(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, silo: Option<&ffi::Silo>, g:
         bias_dev,
         to_latent: read(&w("ffn_latent_down"))?,
         from_latent: read(&w("ffn_latent_up"))?,
-        up: experts(f, gpu, &w("ffn_up_exps"), loaded)?,
-        down: experts(f, gpu, &w("ffn_down_exps"), loaded)?,
+        up: experts(f, gpu, &w("ffn_up_exps"), host, loaded)?,
+        down: experts(f, gpu, &w("ffn_down_exps"), host, loaded)?,
         on_gpu: false,
         sh_up: read(&w("ffn_up_shexp"))?,
         sh_down: read(&w("ffn_down_shexp"))?,
@@ -1784,14 +1831,20 @@ fn load_moe(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, silo: Option<&ffi::Silo>, g:
             // SAFETY: arithmetic only.
             let rb = unsafe { (s.packed_row_bytes)(ty, n) } as usize;
             let rows = g.experts * m.down.rows;
-            let buf = DevBuf::new(gpu, rows * rb)?;
+            let (buf, pin) = if host {
+                let pin = HostBuf::new(gpu, rows * rb)?;
+                (pin.device_view(0, rows * rb)?, Some(pin))
+            } else {
+                (DevBuf::new(gpu, rows * rb)?, None)
+            };
             // SAFETY: the file's blocks (rows of n) into the packed rows.
             ffi::check(unsafe { (s.pack)(gpu.raw(), ty, m.down.buf.ptr(), buf.ptr(), rows as i64, n) }, "packing the experts")?;
             gpu.sync()?;
-            m.down = Experts { buf, ty: m.down.ty, rows: m.down.rows, cols: m.down.cols, stride: m.down.rows * rb };
+            m.down = Experts { buf, _pin: pin, ty: m.down.ty, rows: m.down.rows, cols: m.down.cols, stride: m.down.rows * rb };
         }
     }
-    for x in [&m.up, &m.down] {
+    // the host's routing (no silo for them) runs an expert a launch on the shared products: their types
+    for x in [&m.up, &m.down].into_iter().filter(|_| !m.on_gpu) {
         // SAFETY: arithmetic only.
         if unsafe { (k.mmvq_supported)(x.ty.code() as i32) } == 0 {
             return Err(e(format!("layer {l}: experts in {} (the products take Q8_0, the K and IQ types, IQ4_NL, Q2_0)", x.ty.name())));

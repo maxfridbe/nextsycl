@@ -62,8 +62,9 @@ inline XA xcol(const int8_t* xs, int n_in, int ncols, int j) {
     const int16_t* sm = reinterpret_cast<const int16_t*>(d + std::size_t(ncols) * (n_in / 32));
     return XA{xs + std::size_t(j) * n_in, d + std::size_t(j) * (n_in / 32), sm + std::size_t(j) * (n_in / 16)};
 }
-struct X { sycl::int4 u0, u1; float d; };
-inline X xload(const XA& xa, int b) { return X{xa.q16(b, 0), xa.q16(b, 1), xa.dd(b)}; }
+// a sub-block's 32 quants, their scale and their sum (the types with an offset - IQ1_S's delta - need it)
+struct X { sycl::int4 u0, u1; float d; int s; };
+inline X xload(const XA& xa, int b) { return X{xa.q16(b, 0), xa.q16(b, 1), xa.dd(b), xa.sm[2 * b] + xa.sm[2 * b + 1]}; }
 
 inline uint32_t ksign(uint32_t b7) { return b7 | ((sycl::popcount(b7) & 1u) << 7); }
 inline uint32_t sign_mask4(uint32_t b) { return ((b * 0x00204081u) & 0x01010101u) * 0xffu; }   // bit i -> 0xff in byte i
@@ -80,7 +81,7 @@ struct WideIQ3XXS {
     using Block = block_iq3_xxs;
     static constexpr int LUT = 256;
     static uint32_t lut(int i) { return iq3xxs_grid[i]; }
-    struct W { sycl::int4 lo, hi; float s0, s1; };
+    struct W { sycl::int4 lo, hi; float s0, s1, off = 0.0f; };
     static W load(const Block* b, int g, const uint32_t* tab) {
         W r;
         const uint8_t* p = reinterpret_cast<const uint8_t*>(b);
@@ -107,7 +108,7 @@ struct WideIQ2S {
         const uint64_t e = iq2s_grid[i >> 1];
         return uint32_t(i & 1 ? e >> 32 : e);
     }
-    struct W { sycl::int4 lo, hi; float s0, s1; };
+    struct W { sycl::int4 lo, hi; float s0, s1, off = 0.0f; };
     static W load(const Block* b, int g, const uint32_t* tab) {
         W r;
         const sycl::uint2* grid = reinterpret_cast<const sycl::uint2*>(tab);
@@ -134,7 +135,7 @@ struct WideIQ2XS {
         const uint64_t e = iq2xs_grid[i >> 1];
         return uint32_t(i & 1 ? e >> 32 : e);
     }
-    struct W { sycl::int4 lo, hi; float s0, s1; };
+    struct W { sycl::int4 lo, hi; float s0, s1, off = 0.0f; };
     static W load(const Block* b, int g, const uint32_t* tab) {
         W r;
         const sycl::uint2* grid = reinterpret_cast<const sycl::uint2*>(tab);
@@ -161,7 +162,7 @@ struct WideIQ4XS {
     using Block = block_iq4_xs;
     static constexpr int LUT = 256;
     static uint32_t lut(int i) { return uint32_t(uint8_t(kvalues_iq4nl[i & 15])) | (uint32_t(uint8_t(kvalues_iq4nl[i >> 4])) << 8); }
-    struct W { sycl::int4 lo, hi; float s0, s1; };
+    struct W { sycl::int4 lo, hi; float s0, s1, off = 0.0f; };
     static W load(const Block* b, int g, const uint32_t* tab) {
         W r;
         const uint8_t* p = reinterpret_cast<const uint8_t*>(b);
@@ -189,22 +190,77 @@ struct WideIQ4XS {
     }
 };
 
+// IQ2_XXS (66-byte blocks: d, qs [32] uint16): sub-block g = four grid entries (bytes of the words at 8g) with their signs
+// (7 bits each of the sub-block's second word, whose top 4 bits are its scale) - the deepseek4 silo's loader
+struct WideIQ2XXS {
+    using Block = block_iq2_xxs;
+    static constexpr int LUT = 2 * 256;
+    static uint32_t lut(int i) {
+        const uint64_t e = iq2xxs_grid[i >> 1];
+        return uint32_t(i & 1 ? e >> 32 : e);
+    }
+    struct W { sycl::int4 lo, hi; float s0, s1, off = 0.0f; };
+    static W load(const Block* b, int g, const uint32_t* tab) {
+        W r;
+        const sycl::uint2* grid = reinterpret_cast<const sycl::uint2*>(tab);
+        const sycl::int4 q4 = load16_a2(reinterpret_cast<const uint8_t*>(b->qs) + 16 * (g >> 1));
+        const uint32_t a0 = word_of(q4, 2 * (g & 1)), a1 = word_of(q4, 2 * (g & 1) + 1);
+        int v[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) grid_group(grid[(a0 >> (8 * l)) & 0xff], ksign((a1 >> (7 * l)) & 127), v, l);
+        r.lo = sycl::int4(v[0], v[1], v[2], v[3]); r.hi = sycl::int4(v[4], v[5], v[6], v[7]);
+        r.s0 = r.s1 = (float) b->d * (0.5f + (float) (a1 >> 28)) * 0.25f;
+        return r;
+    }
+};
+
+// IQ1_S (50-byte blocks: d, qs [32], qh [8] uint16): sub-block g = four grid entries of eight codes 0, 1, 2 (an 11-bit
+// index: qs[4g + l] and 3 bits of qh[g]; iq1s_grid_gpu's word holds them as nibbles - the low nibbles the first four,
+// the high the last four, as llama.cpp's GPU kernels read it), the scale d (2 ((qh >> 12) & 7) + 1); a value is
+// code - 1 + delta (IQ1S_DELTA, its sign the top bit) - the -1 + delta the dot's offset times the activations' sum
+struct WideIQ1S {
+    using Block = block_iq1_s;
+    static constexpr int LUT = 2048;
+    static uint32_t lut(int i) { return iq1s_grid_gpu[i]; }
+    struct W { sycl::int4 lo, hi; float s0, s1, off = 0.0f; };
+    static W load(const Block* b, int g, const uint32_t* tab) {
+        W r;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(b);
+        const uint32_t q4 = load4_a2(p + 2 + 4 * g);
+        const uint32_t qh = *reinterpret_cast<const uint16_t*>(p + 34 + 2 * g);
+        int v[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t e = tab[((q4 >> (8 * l)) & 0xff) | (((qh >> (3 * l)) & 7) << 8)];
+            v[2 * l] = int(e & 0x0f0f0f0fu);
+            v[2 * l + 1] = int((e >> 4) & 0x0f0f0f0fu);
+        }
+        r.lo = sycl::int4(v[0], v[1], v[2], v[3]); r.hi = sycl::int4(v[4], v[5], v[6], v[7]);
+        const float dl = (float) b->d * (float) (2 * ((qh >> 12) & 7) + 1);
+        r.s0 = r.s1 = dl;
+        r.off = dl * ((qh & 0x8000) ? -1.0f - IQ1S_DELTA : -1.0f + IQ1S_DELTA);
+        return r;
+    }
+};
+
 // Q8_0 as 256-blocks (eight 34-byte blocks): lane g block g
 struct Q8x8 { block_q8_0 b[8]; };
 struct WideQ8_0 {
     using Block = Q8x8;
     static constexpr int LUT = 0;
     static uint32_t lut(int) { return 0; }
-    struct W { sycl::int4 lo, hi; float s0, s1; };
+    struct W { sycl::int4 lo, hi; float s0, s1, off = 0.0f; };
     static W load(const Block* b, int g, const uint32_t*) {
         const uint8_t* p = reinterpret_cast<const uint8_t*>(b) + 34 * g;
         const float d = (float) *reinterpret_cast<const sycl::half*>(p);
-        return W{load16_a2(p + 2), load16_a2(p + 18), d, d};
+        return W{load16_a2(p + 2), load16_a2(p + 18), d, d, 0.0f};
     }
 };
 
 template <typename F>
-inline float wdot(const typename F::W& r, const X& v) { return v.d * (r.s0 * (float) dp4a4(r.lo, v.u0, 0) + r.s1 * (float) dp4a4(r.hi, v.u1, 0)); }
+inline float wdot(const typename F::W& r, const X& v) {
+    return v.d * (r.s0 * (float) dp4a4(r.lo, v.u0, 0) + r.s1 * (float) dp4a4(r.hi, v.u1, 0) + r.off * (float) v.s);
+}
 
 template <typename F>
 void fill_tab(uint32_t* tab, const sycl::nd_item<3>& item) {
@@ -386,9 +442,51 @@ void multi32(sycl::queue& q, int type, const uint8_t* base, int64_t stride, cons
     });
 }
 
+// a matrix of a wide type expanded to half: a work-item a sub-block of 32 values, the type's own loader
+template <typename F>
+void deq_wide(sycl::queue& q, const uint8_t* src, sycl::half* dst, int64_t rows, int64_t n_in) {
+    const int64_t bpr = n_in / QK, items = rows * bpr * 8;
+    constexpr int WG = WARPS * WARP;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
+        h.parallel_for(sycl::nd_range<3>(sycl::range(1, 1, (size_t) ((items + WG - 1) / WG)) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
+                       [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(32)]] {
+                           uint32_t* t = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
+                           fill_tab<F>(t, it);
+                           const int64_t i = (int64_t) it.get_group(2) * WG + it.get_local_id(1) * WARP + it.get_local_id(2);
+                           if (i >= items) return;
+                           const int g = int(i % 8);
+                           const int64_t blk = i / 8;
+                           const typename F::W w = F::load(reinterpret_cast<const typename F::Block*>(src) + blk, g, t);
+                           sycl::half* o = dst + blk * QK + g * 32;
+                           const sycl::int4 v[2] = {w.lo, w.hi};
+#pragma unroll
+                           for (int k = 0; k < 2; ++k) {
+                               const float sc = k == 0 ? w.s0 : w.s1;
+#pragma unroll
+                               for (int j = 0; j < 16; ++j) o[16 * k + j] = (sycl::half) (sc * (float) int8_t(word_of(v[k], j / 4) >> (8 * (j % 4))) + w.off);
+                           }
+                       });
+    });
+}
 }  // namespace
 
 extern "C" {
+
+int ns_nhs_wide_f16(ns_gpu* g, int type, const void* src, uint16_t* dst, int64_t rows, int64_t n_in) {
+    NS_TRY
+    if (n_in % QK != 0) return ns_fail("ns_nhs_wide_f16: n_in a multiple of 256");
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    sycl::half* d = reinterpret_cast<sycl::half*>(dst);
+    switch (type) {
+        case 19: deq_wide<WideIQ1S>(g->q, s, d, rows, n_in); break;
+        case 16: deq_wide<WideIQ2XXS>(g->q, s, d, rows, n_in); break;
+        default: return ns_fail("ns_nhs_wide_f16: ggml type " + std::to_string(type));
+    }
+    return 0;
+    NS_CATCH
+}
+
 
 int ns_nhs_route(ns_gpu* g, const float* logits, const float* bias, int64_t T, int64_t E, int64_t K, int norm, float scale, int32_t* ids, float* w,
                  int32_t* cols) {
@@ -540,7 +638,7 @@ int ns_nhs_packed_f16(ns_gpu* g, int type, const void* src, uint16_t* dst, int64
 }
 
 int ns_nhs_multi_supported(int type, int64_t n_in) {
-    const bool wide = n_in % QK == 0 && (type == 8 || type == 17 || type == 18 || type == 22 || type == 23);
+    const bool wide = n_in % QK == 0 && (type == 8 || type == 16 || type == 17 || type == 18 || type == 19 || type == 22 || type == 23);
     const bool narrow = n_in <= 96 * 32 && ((type == 42 && n_in % 64 == 0) || ((type == 20 || type == 8) && n_in % 32 == 0));
     return wide || narrow;
 }
@@ -555,7 +653,9 @@ int ns_nhs_multi(ns_gpu* g, int type, const void* base, int64_t stride, const in
     if (n_in % QK == 0 && type != 20 && type != 42) {
         switch (type) {
             case 8: multi_wide<WideQ8_0>(g->q, b, stride, ids, cols, E, xs, NC, y, K, N); break;
+            case 16: multi_wide<WideIQ2XXS>(g->q, b, stride, ids, cols, E, xs, NC, y, K, N); break;
             case 17: multi_wide<WideIQ2XS>(g->q, b, stride, ids, cols, E, xs, NC, y, K, N); break;
+            case 19: multi_wide<WideIQ1S>(g->q, b, stride, ids, cols, E, xs, NC, y, K, N); break;
             case 18: multi_wide<WideIQ3XXS>(g->q, b, stride, ids, cols, E, xs, NC, y, K, N); break;
             case 22: multi_wide<WideIQ2S>(g->q, b, stride, ids, cols, E, xs, NC, y, K, N); break;
             default: multi_wide<WideIQ4XS>(g->q, b, stride, ids, cols, E, xs, NC, y, K, N); break;
