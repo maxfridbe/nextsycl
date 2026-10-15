@@ -349,6 +349,9 @@ struct Dev {
     seq: DevBuf,
     /// a prompt pass's matrix expanded to half (an expert's two after the largest dense one)
     w16: DevBuf,
+    /// VRAM slots the chosen experts of a layer kept in host memory are gathered into (decode: its rows' entries, up
+    /// then down; a prompt pass: one expert's raw matrix at a time); none when this GPU's experts are all in VRAM
+    slots: Option<DevBuf>,
     lb: usize,
     le: usize,
 }
@@ -475,7 +478,8 @@ impl<'g> NemotronH<'g> {
         let plan = |chunk: usize, host: &[bool]| -> std::result::Result<Vec<(usize, usize)>, String> {
             let cost: Vec<u64> = (0..g.layers).map(|l| cost[l] - if host[l] { exp_w[l] } else { 0 }).collect();
             let mtp_cost = if drafts > 0 { mtp_w - if host[g.layers] { exp_w[g.layers] } else { 0 } + mtp_kv } else { 0 };
-            let over = |i: usize| margin + (512 << 20) + arena_bytes(&g, chunk) as u64 + w16_bytes(&g) as u64 + if i + 1 == n { head_w + mtp_cost } else { 0 };
+            let slots = if host.iter().any(|h| *h) { ((drafts + 1) * g.used) as u64 * (2 * exp_w.iter().max().copied().unwrap_or(0) / g.experts as u64) } else { 0 };
+            let over = |i: usize| margin + (512 << 20) + arena_bytes(&g, chunk) as u64 + w16_bytes(&g) as u64 + slots + if i + 1 == n { head_w + mtp_cost } else { 0 };
             let room: Vec<i64> = (0..n).map(|i| free[i] as i64 - over(i) as i64).collect();
             let mut bounds = Vec::with_capacity(n);
             if let Some(sp) = &split_env {
@@ -659,7 +663,14 @@ impl<'g> NemotronH<'g> {
             tp.write(0, &bytes((0..=chunk as i32).map(|r| r * g.used as i32).collect()))?;
             let seq = DevBuf::new(gpu, chunk * g.used * 4)?;
             seq.write(0, &bytes((0..(chunk * g.used) as i32).collect()))?;
-            devs.push(Dev { gpu: gpu.clone(), arena: Arena::new(gpu, arena_bytes(&g, chunk))?, w16: DevBuf::new(gpu, w16_bytes(&g))?, tp, seq, lb, le });
+            // the host-kept experts' VRAM slots: a verify pass's entries of the widest up and down there
+            let widest = layers[lb..le].iter().filter_map(|ly| match &ly.mix { Mix::Moe(m) if m.up._pin.is_some() => Some(m.up.stride + m.down.stride), _ => None })
+                .chain(mtp.iter().filter(|m| le == g.layers && m.moe.up._pin.is_some()).map(|m| m.moe.up.stride + m.moe.down.stride)).max();
+            let slots = match widest {
+                Some(w) => Some(DevBuf::new(gpu, (drafts + 1).max(1) * g.used * w)?),
+                None => None,
+            };
+            devs.push(Dev { gpu: gpu.clone(), arena: Arena::new(gpu, arena_bytes(&g, chunk))?, w16: DevBuf::new(gpu, w16_bytes(&g))?, tp, seq, slots, lb, le });
         }
         let load_s = t0.elapsed().as_secs_f64();
         let wh = devs.iter().map(|d| format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1)).collect::<Vec<_>>().join(", ");
@@ -1016,6 +1027,11 @@ impl<'g> NemotronH<'g> {
         let dn = self.arena().f32(n_e * g.latent)?;
         // SAFETY: arithmetic only.
         let packed = unsafe { (s.packed)(m.down.ty.code() as i32, g.n_ff_exp as i64) } != 0;
+        // experts kept in host memory: each brought into a VRAM slot (one wide copy) before it is expanded
+        let staged = m.up._pin.is_some().then_some(()).and(self.dev().slots.as_ref());
+        let ex: Vec<i32> = (0..g.experts as i32).collect();
+        let exb = self.arena().bytes(g.experts * 4)?;
+        exb.write(0, &bytes(&ex))?;
         // the up products, then relu^2 and half, then the down products: one expert at a time - its matrix expanded to
         // half, then multiplied over its rows while the half copy (5.5 MB) is still in the cache (a group of 64 expanded
         // in one launch was slower: 659 -> 596 tok/s, the copies read back from memory)
@@ -1036,7 +1052,13 @@ impl<'g> NemotronH<'g> {
                 // SAFETY: expert x -> half [rows][cols] in w16 (the down packed: the silo's expansion; else the type's
                 // own); its rows (half) times it into their rows of the output.
                 unsafe {
-                    let src = mat.buf.ptr().cast::<u8>().add(x * mat.stride).cast();
+                    let src = match staged {
+                        Some(sl) => {
+                            self.op("gather", || (s.gather)(self.raw(), mat.buf.ptr(), mat.stride as i64, exb.ptr().cast::<i32>().add(x), 1, sl.ptr()))?;
+                            sl.ptr().cast_const()
+                        }
+                        None => mat.buf.ptr().cast::<u8>().add(x * mat.stride).cast(),
+                    };
                     if stage == 1 && packed {
                         self.op("expert down f16", || (s.packed_f16)(self.raw(), mat.ty.code() as i32, src, w16.ptr().cast(), rows as i64, cols as i64))?;
                     } else if mat.ty == GType::IQ1S {
@@ -1076,14 +1098,24 @@ impl<'g> NemotronH<'g> {
             let lq = self.arena().bytes((s.q8_bytes)(g.latent as i64, t as i64))?;
             self.op("quantize", || (s.quantize_q8)(self.raw(), lat.fp(), lq.ptr(), g.latent as i64, t as i64))?;
             let u = self.arena().f32(n_e * g.n_ff_exp)?;
-            self.op("experts up", || (s.multi)(self.raw(), m.up.ty.code() as i32, m.up.buf.ptr(), m.up.stride as i64, ids.ptr().cast(), cols.ptr().cast(),
+            let seq = &self.dev().seq;
+            // experts kept in host memory: the chosen ones gathered into VRAM slots first (entry j's at slot j)
+            let (ub, uids, db, dids) = match (&m.up._pin, &self.dev().slots) {
+                (Some(_), Some(sl)) if n_e * (m.up.stride + m.down.stride) <= sl.len => {
+                    let dbase = sl.ptr().cast::<u8>().add(n_e * m.up.stride);
+                    self.op("gather up", || (s.gather)(self.raw(), m.up.buf.ptr(), m.up.stride as i64, ids.ptr().cast(), n_e as i64, sl.ptr()))?;
+                    self.op("gather down", || (s.gather)(self.raw(), m.down.buf.ptr(), m.down.stride as i64, ids.ptr().cast(), n_e as i64, dbase.cast()))?;
+                    (sl.ptr().cast_const(), seq.ptr().cast_const(), dbase.cast_const().cast(), seq.ptr().cast_const())
+                }
+                _ => (m.up.buf.ptr().cast_const(), ids.ptr().cast_const(), m.down.buf.ptr().cast_const(), ids.ptr().cast_const()),
+            };
+            self.op("experts up", || (s.multi)(self.raw(), m.up.ty.code() as i32, ub, m.up.stride as i64, uids.cast(), cols.ptr().cast(),
                                                n_e as i64, lq.ptr(), t as i64, u.fp(), g.latent as i64, g.n_ff_exp as i64))?;
             self.op("relu2", || (k.relu2)(self.raw(), u.fp(), (n_e * g.n_ff_exp) as i64))?;
             let uq = self.arena().bytes((s.q8_bytes)(g.n_ff_exp as i64, n_e as i64))?;
             self.op("quantize", || (s.quantize_q8)(self.raw(), u.fp(), uq.ptr(), g.n_ff_exp as i64, n_e as i64))?;
             let dn = self.arena().f32(n_e * g.latent)?;
-            let seq = &self.dev().seq;
-            self.op("experts down", || (s.multi)(self.raw(), m.down.ty.code() as i32, m.down.buf.ptr(), m.down.stride as i64, ids.ptr().cast(),
+            self.op("experts down", || (s.multi)(self.raw(), m.down.ty.code() as i32, db, m.down.stride as i64, dids.cast(),
                                                  seq.ptr().cast(), n_e as i64, uq.ptr(), n_e as i64, dn.fp(), g.n_ff_exp as i64, g.latent as i64))?;
             let mo = self.arena().f32(t * g.latent)?;
             mo.fill(0)?;

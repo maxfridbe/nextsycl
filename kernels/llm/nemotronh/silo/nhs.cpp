@@ -637,6 +637,29 @@ int ns_nhs_packed_f16(ns_gpu* g, int type, const void* src, uint16_t* dst, int64
     NS_CATCH
 }
 
+int ns_nhs_gather(ns_gpu* g, const void* src, int64_t stride, const int32_t* ids, int64_t n, void* dst) {
+    NS_TRY
+    if (n < 1) return 0;
+    if (stride % 4 != 0) return ns_fail("ns_nhs_gather: a stride of whole words");
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    uint8_t* d = static_cast<uint8_t*>(dst);
+    if (stride % 16 == 0) {
+        const int64_t w = stride / 16;
+        g->q.parallel_for(sycl::range<1>((size_t) (n * w)), [=](sycl::id<1> id) {
+            const int64_t e = id[0] / w, i = id[0] % w;
+            reinterpret_cast<sycl::uint4*>(d + e * stride)[i] = reinterpret_cast<const sycl::uint4*>(s + std::size_t(ids[e]) * stride)[i];
+        });
+    } else {
+        const int64_t w = stride / 4;
+        g->q.parallel_for(sycl::range<1>((size_t) (n * w)), [=](sycl::id<1> id) {
+            const int64_t e = id[0] / w, i = id[0] % w;
+            reinterpret_cast<uint32_t*>(d + e * stride)[i] = reinterpret_cast<const uint32_t*>(s + std::size_t(ids[e]) * stride)[i];
+        });
+    }
+    return 0;
+    NS_CATCH
+}
+
 int ns_nhs_multi_supported(int type, int64_t n_in) {
     const bool wide = n_in % QK == 0 && (type == 8 || type == 16 || type == 17 || type == 18 || type == 19 || type == 22 || type == 23);
     const bool narrow = n_in <= 96 * 32 && ((type == 42 && n_in % 64 == 0) || ((type == 20 || type == 8) && n_in % 32 == 0));

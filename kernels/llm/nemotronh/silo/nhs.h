@@ -35,6 +35,9 @@ int ns_nhs_pack(ns_gpu* g, int type, const void* src, void* dst, int64_t rows, i
 int ns_nhs_wide_f16(ns_gpu* g, int type, const void* src, uint16_t* dst, int64_t rows, int64_t n_in);
 /* rows of a packed matrix (n_in values each) expanded to fp16 [rows][n_in] (the prompt path's products) */
 int ns_nhs_packed_f16(ns_gpu* g, int type, const void* src, uint16_t* dst, int64_t rows, int64_t n_in);
+/* dst [n][stride] = experts ids[0 .. n) of src (stride bytes each, a multiple of 4): experts in pinned host memory
+ * brought into VRAM in wide, aligned reads (the products read them there, not in place over PCIe) */
+int ns_nhs_gather(ns_gpu* g, const void* src, int64_t stride, const int32_t* ids, int64_t n, void* dst);
 /* y [entries][n_out]: entry e = expert ids[e]'s matrix (base + ids[e] * stride bytes, n_out rows of n_in in its blocks)
  * against column cols[e] of xs (ncols columns in the split layout); a packed type's matrices in the packed layout */
 int ns_nhs_multi(ns_gpu* g, int type, const void* base, int64_t stride, const int32_t* ids, const int32_t* cols, int64_t entries, const void* xs,
