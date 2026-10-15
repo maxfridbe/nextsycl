@@ -11,14 +11,20 @@ use std::any::Any;
 use std::sync::Arc;
 
 use nextsycl_gguf::Gguf;
+use nextsycl_llm::{At, EngineOption};
 use nextsycl_llm::{Checkpoint, CheckpointState, Decoder, DecoderState, Engine, EngineKind, GpuInfo, LoadOptions, Result, Sampler, Session, SessionState,
                    Tap};
 
 pub const ARCH: &str = "nemotron_h_moe";
 
+pub const OPTIONS: &[EngineOption] = &[
+    EngineOption { name: "chunk", env: "NS_NH_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default the largest of 2048, 1024, 512 that fits)", at: At::Load },
+    EngineOption { name: "drafts", env: "NS_NH_DRAFTS", value: "N", help: "tokens drafted a step with the MTP block (default 2, at most 7; 0: none)", at: At::Load },
+];
+
 pub fn kind() -> EngineKind {
     EngineKind { archs: &[ARCH], name: "Nemotron-H MoE (Mamba-2 + latent MoE + attention: Nemotron 3.5 Super 120B-A12B)", load, info, kernels: None,
-                 chat: nextsycl_tok::nemotron_chat, options: &[], prepare: None }
+                 chat: nextsycl_tok::nemotron_chat, options: OPTIONS, prepare: None }
 }
 
 fn info(f: &Gguf) -> std::result::Result<String, String> {
@@ -32,7 +38,7 @@ fn info(f: &Gguf) -> std::result::Result<String, String> {
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {
-    Ok(Box::new(engine::NemotronH::load(f, gpus, o.kv, log)?))
+    Ok(Box::new(engine::NemotronH::load(f, gpus, o.draft, o.kv, log)?))
 }
 
 impl SessionState for engine::Session {
@@ -52,7 +58,7 @@ impl SessionState for engine::Session {
 
 impl DecoderState for engine::Decoder {
     fn drafts(&self) -> (u64, u64) {
-        (0, 0)
+        (self.drafted, self.accepted)
     }
     fn pending(&mut self) -> Option<u32> {
         engine::Decoder::pending(self)
@@ -95,16 +101,17 @@ impl Engine for engine::NemotronH<'_> {
         engine::NemotronH::load_bytes(self)
     }
     fn has_draft(&self) -> bool {
-        false
+        engine::NemotronH::has_draft(self)
     }
     fn prefill_chunk(&self) -> usize {
         engine::NemotronH::prefill_chunk(self)
     }
     fn max_verify(&self) -> usize {
-        1
+        engine::NemotronH::max_verify(self)
     }
     fn cache_fingerprint(&self) -> String {
-        "nemotronh f16-kv f32-ssm nsnmh-1".into()
+        // checkpoints hold the draft block's cache too when it is loaded
+        if self.has_draft() { "nemotronh f16-kv f32-ssm nsnmh-1 mtp".into() } else { "nemotronh f16-kv f32-ssm nsnmh-1".into() }
     }
     fn session(&self, max_ctx: usize) -> Result<Session> {
         Ok(Session::new(engine::NemotronH::session(self, max_ctx)?))
@@ -138,11 +145,11 @@ impl Engine for engine::NemotronH<'_> {
         }
         engine::NemotronH::forward_batch(self, &mut own, tokens, tap)
     }
-    fn decoder(&self, logits: Vec<f32>, _draft: bool) -> Decoder {
-        Decoder::new(engine::Decoder::new(logits))
+    fn decoder(&self, logits: Vec<f32>, draft: bool) -> Decoder {
+        Decoder::new(engine::Decoder::new(logits, draft))
     }
-    fn decoder_after(&self, next: u32, _draft: bool) -> Decoder {
-        Decoder::new(engine::Decoder::after(next))
+    fn decoder_after(&self, next: u32, draft: bool) -> Decoder {
+        Decoder::new(engine::Decoder::after(next, draft))
     }
     fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
         let d = d.get_mut::<engine::Decoder>().ok_or_else(|| nextsycl_core::Error("a decoder of another engine".into()))?;

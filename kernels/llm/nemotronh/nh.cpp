@@ -143,7 +143,8 @@ constexpr int GA = 8;
 
 extern "C" {
 
-int ns_nh_conv(ns_gpu* g, const float* x, int64_t xs, float* state, const float* w, const float* b, float* out, int64_t T, int64_t C, int k) {
+int ns_nh_conv(ns_gpu* g, const float* x, int64_t xs, float* state, const float* w, const float* b, float* out, int64_t T, int64_t C, int k,
+               float* snap) {
     NS_TRY
     if (T <= 0) return 0;
     if (k < 2 || k > 8) return ns_fail("ns_nh_conv: a kernel of 2 to 8");
@@ -159,6 +160,8 @@ int ns_nh_conv(ns_gpu* g, const float* x, int64_t xs, float* state, const float*
             for (int j = 0; j < k; ++j) s += win[j] * w[c * k + j];
             out[t * C + c] = s / (1.0f + sycl::exp(-s));
             for (int j = 0; j < k - 1; ++j) win[j] = win[j + 1];
+            if (snap && t + 1 < T)
+                for (int j = 0; j < k - 1; ++j) snap[(t * (k - 1) + j) * C + c] = win[j];
         }
         for (int j = 0; j < k - 1; ++j) state[j * C + c] = win[j];
     });
@@ -167,7 +170,7 @@ int ns_nh_conv(ns_gpu* g, const float* x, int64_t xs, float* state, const float*
 }
 
 int ns_nh_ssm(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t dts, const float* dt_bias, const float* A, const float* Dp, float* S,
-              float* y, int64_t T, int64_t H, int64_t P, int64_t N, int64_t G) {
+              float* y, int64_t T, int64_t H, int64_t P, int64_t N, int64_t G, float* snap) {
     NS_TRY
     if (T <= 0) return 0;
     if (N % SG != 0 || N > 256 || H % G != 0 || P > 64) return ns_fail("ns_nh_ssm: d_state a multiple of 16 up to 256, head dim up to 64, the heads a multiple of the groups");
@@ -218,6 +221,10 @@ int ns_nh_ssm(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t 
                             const int64_t n = lane + i * SG;
                             s[i] = s[i] * dA + sb[r * N + n] * xdt;
                             part[r] += s[i] * scl[r * N + n];
+                        }
+                        if (snap && t0 + r + 1 < T) {
+                            float* o = snap + (((t0 + r) * H + hh) * P + p) * N;
+                            for (int64_t i = 0; i < per; ++i) o[lane + i * SG] = s[i];
                         }
                     }
                 }

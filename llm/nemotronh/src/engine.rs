@@ -12,7 +12,12 @@
 //!   logits = output(output_norm(x))
 //! ```
 //!
-//! The appended MTP block (`nextn_predict_layers`) is not read yet: no drafts.
+//! MTP: the appended block (`nextn_predict_layers`: blk.88) reads a position's output-normed hidden state with the
+//! token after it - eh_proj(enorm(embed(x)) | hnorm(h)), an attention layer with its own cache, a latent-MoE layer, a
+//! LayerNorm, the shared head - and predicts the token after that. It runs behind every pass over the pass's rows (its
+//! cache follows the conversation); `step` drafts NS_NH_DRAFTS tokens (the block chained on its own normed output),
+//! verifies [token, drafts] in one pass and keeps the longest prefix the sampled tokens match - a rejected row's Mamba
+//! states come back from the pass's snapshots.
 
 use std::ffi::c_int;
 use std::sync::{Arc, Mutex};
@@ -215,6 +220,44 @@ pub struct Session {
     pub max_ctx: usize,
     layers: Vec<LState>,
     last_rows: usize,
+    /// which session (the snapshots name the one they belong to)
+    id: u64,
+    /// the draft block's cache and inputs (MTP loaded)
+    mtp: Option<MtpState>,
+}
+
+/// A session's draft block state: its cache ([kv heads][max_ctx][128] half), the output-normed hidden state of the last
+/// position fed (the next token pairs with it), and the block's own normed output (a chained draft pairs with it)
+struct MtpState {
+    k: DevBuf,
+    v: DevBuf,
+    pending: DevBuf,
+    chain: DevBuf,
+}
+
+/// The draft block (blk.<layers>): eh_proj split into its embedding and hidden-state columns at load
+struct Mtp {
+    enorm: DevBuf,
+    hnorm: DevBuf,
+    eh_e: Mat,
+    eh_h: Mat,
+    attn_norm: DevBuf,
+    attn: Attn,
+    post_norm: DevBuf,
+    moe: Moe,
+    head_norm: DevBuf,
+}
+
+/// Each Mamba layer's state after each row of a verify pass but the last (its conv inputs [rows-1][conv-1][channels],
+/// its scan [rows-1][heads][head dim][state]), and whose pass they are (session, first position, rows)
+struct Snaps {
+    layers: Vec<(DevBuf, DevBuf)>,
+    of: Option<(u64, usize, usize)>,
+}
+
+/// NS_NH_DRAFTS: tokens drafted a step (default 2; at most 7 - a verify pass is at most 8 rows)
+fn draft_count() -> usize {
+    std::env::var("NS_NH_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(2).min(DEC - 1)
 }
 
 enum LState {
@@ -273,16 +316,23 @@ impl Checkpoint {
 pub struct Decoder {
     logits: Option<Vec<f32>>,
     next: Option<u32>,
+    /// draft with the MTP block
+    mtp: bool,
+    /// the drafts for the positions after `next`
+    drafts: Vec<u32>,
+    pub drafted: u64,
+    pub accepted: u64,
 }
 
 impl Decoder {
-    pub fn new(logits: Vec<f32>) -> Decoder {
-        Decoder { logits: Some(logits), next: None }
+    pub fn new(logits: Vec<f32>, mtp: bool) -> Decoder {
+        Decoder { logits: Some(logits), next: None, mtp, drafts: Vec::new(), drafted: 0, accepted: 0 }
     }
-    pub fn after(next: u32) -> Decoder {
-        Decoder { logits: None, next: Some(next) }
+    pub fn after(next: u32, mtp: bool) -> Decoder {
+        Decoder { logits: None, next: Some(next), mtp, drafts: Vec::new(), drafted: 0, accepted: 0 }
     }
     pub fn pending(&mut self) -> Option<u32> {
+        self.drafts.clear();
         self.next.take()
     }
 }
@@ -326,6 +376,15 @@ pub struct NemotronH<'g> {
     work: Mutex<()>,
     /// a prompt pass's rows
     chunk: usize,
+    /// the draft block (loaded with drafts on), on the last GPU
+    mtp: Option<Mtp>,
+    /// drafts a step
+    drafts: usize,
+    /// the verify passes' Mamba snapshots (under `work`)
+    snaps: Mutex<Snaps>,
+    /// the output-normed hidden states of the last pass's rows (up to DEC: a rollback's pending state)
+    vh: DevBuf,
+    next_id: std::sync::atomic::AtomicU64,
     /// NS_NH_PROFILE=1: each kernel waited for and timed by name (seconds, calls) - the wall time it costs, launch
     /// overhead and all (the waits slow the pass itself)
     prof: Option<Mutex<std::collections::BTreeMap<String, (f64, u64)>>>,
@@ -333,14 +392,18 @@ pub struct NemotronH<'g> {
     load_bytes: u64,
 }
 
-/// A pass's work memory for `t` rows: the activations (float32, and half copies for the products), the experts' rows,
-/// the last rows' logits, with room to spare
+/// A pass's work memory for `t` rows: what lives through the pass (x, h, the head's and the draft block's rows) plus the
+/// most one layer takes (a layer's buffers go when it ends) - a MoE layer's experts' rows, a Mamba layer's projections -
+/// a fifth more to spare
 fn arena_bytes(g: &Geometry, t: usize) -> usize {
-    let e = t * g.used;
-    let acts = t * (g.in_proj() + 2 * g.conv_dim() + 3 * g.inner + 8 * g.n_embd + 2 * g.n_ff_shared + 4 * g.latent + g.experts
-        + g.heads * g.head * 2 + 2 * g.heads_kv * g.head) * 6 / 4;
-    let exps = e * (g.n_ff_exp + g.latent) * 2 + e * 4;
-    (acts + exps + DEC * g.vocab) * 4 + (64 << 20)
+    let (e, f) = (t * g.used, 4usize);
+    let keep = t * g.n_embd * f * 9 + DEC * g.vocab * f;
+    let half = t * g.inner.max(g.n_ff_shared) * 2;
+    let moe = e * (g.latent * 2 + g.n_ff_exp * f + g.n_ff_exp * 2 + g.latent * f + 16)
+        + t * (g.experts + 3 * g.latent + g.n_ff_shared + 2 * g.n_embd) * f + t * g.latent * 2 + half;
+    let mamba = t * (g.in_proj() + g.conv_dim() + 2 * g.inner + g.n_embd) * f + half;
+    let attn = t * (2 * g.heads * g.head + 2 * g.heads_kv * g.head + g.n_embd) * f + half;
+    (keep + moe.max(mamba).max(attn)) * 6 / 5 + (64 << 20)
 }
 
 /// The half buffer a prompt pass's products expand a matrix into: the largest dense matrix (an expert's fit too)
@@ -352,7 +415,7 @@ fn w16_bytes(g: &Geometry) -> usize {
 impl<'g> NemotronH<'g> {
     /// Loads the model over `gpus` in order, the layers split so each GPU keeps about the same memory free (NS_SPLIT:
     /// the first layer of each GPU after the first); the head on the last. `kv`: the context the sessions reserve
-    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], kv: (usize, usize), log: &mut dyn FnMut(String)) -> Result<NemotronH<'g>> {
+    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], draft: bool, kv: (usize, usize), log: &mut dyn FnMut(String)) -> Result<NemotronH<'g>> {
         let t0 = Instant::now();
         if gpus.is_empty() {
             return Err(e("no GPU"));
@@ -370,6 +433,15 @@ impl<'g> NemotronH<'g> {
             f.tensors.iter().filter(|t| t.name.starts_with(&p)).map(|t| t.bytes).sum()
         }).collect();
         let head_w: u64 = ["output.weight", "output_norm.weight"].iter().filter_map(|n| f.tensor(n)).map(|t| t.bytes).sum();
+        // the draft block: its weights, its cache, the Mamba snapshots of its verify passes (with the silo only: it
+        // runs its MoE layer on the GPU)
+        let drafts = if draft && g.nextn > 0 && silo.is_some() { draft_count() } else { 0 };
+        let mtp_w: u64 = if drafts > 0 {
+            let p = format!("blk.{}.", g.layers);
+            f.tensors.iter().filter(|t| t.name.starts_with(&p)).map(|t| t.bytes).sum()
+        } else {
+            0
+        };
         let mut free = Vec::with_capacity(gpus.len());
         for gpu in gpus {
             let (total, fr) = gpu.memory()?;
@@ -384,13 +456,14 @@ impl<'g> NemotronH<'g> {
             Kind::Attn => (2 * g.heads_kv * ctx * g.head * 2) as u64,
             Kind::Mamba => ((g.inner * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64,
             Kind::Moe => 0,
-        }).collect();
+        } + if g.kinds[l] == Kind::Mamba { (drafts * (g.inner * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64 } else { 0 }).collect();
+        let mtp_cost = if drafts > 0 { mtp_w + sessions * (2 * g.heads_kv * ctx * g.head * 2) as u64 } else { 0 };
         let n = gpus.len();
         let split_env: Option<Vec<usize>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
         // the layers over the GPUs for a prompt chunk of `chunk` rows: each GPU's room after its spare, work memory and
         // half buffer (the last's after the head too), the layers cut where each GPU's share of the room ends
         let plan = |chunk: usize| -> std::result::Result<Vec<(usize, usize)>, String> {
-            let over = |i: usize| margin + (512 << 20) + arena_bytes(&g, chunk) as u64 + w16_bytes(&g) as u64 + if i + 1 == n { head_w } else { 0 };
+            let over = |i: usize| margin + (512 << 20) + arena_bytes(&g, chunk) as u64 + w16_bytes(&g) as u64 + if i + 1 == n { head_w + mtp_cost } else { 0 };
             let room: Vec<i64> = (0..n).map(|i| free[i] as i64 - over(i) as i64).collect();
             let mut bounds = Vec::with_capacity(n);
             if let Some(sp) = &split_env {
@@ -479,54 +552,7 @@ impl<'g> NemotronH<'g> {
                 }
                 Kind::Attn => Mix::Attn(Attn { q: read(&w("attn_q"))?, k: read(&w("attn_k"))?, v: read(&w("attn_v"))?, o: read(&w("attn_output"))? }),
                 Kind::Moe => {
-                    let router = read(&w("ffn_gate_inp"))?;
-                    let bias_t = f.tensor(&format!("blk.{l}.exp_probs_b.bias")).ok_or_else(|| e(format!("layer {l}: no exp_probs_b.bias")))?;
-                    let raw = f.read(bias_t).map_err(|x| e(x.0))?;
-                    let bias: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                    let bias_dev = DevBuf::new(gpu, bias.len() * 4)?;
-                    bias_dev.write(0, &raw)?;
-                    let m = Moe {
-                        router,
-                        bias,
-                        bias_dev,
-                        to_latent: read(&w("ffn_latent_down"))?,
-                        from_latent: read(&w("ffn_latent_up"))?,
-                        up: experts(f, gpu, &w("ffn_up_exps"), &loaded)?,
-                        down: experts(f, gpu, &w("ffn_down_exps"), &loaded)?,
-                        on_gpu: false,
-                        sh_up: read(&w("ffn_up_shexp"))?,
-                        sh_down: read(&w("ffn_down_shexp"))?,
-                    };
-                    if m.router.rows != g.experts || m.bias.len() != g.experts || m.up.rows != g.n_ff_exp || m.up.cols != g.latent || m.down.rows != g.latent
-                        || m.down.cols != g.n_ff_exp {
-                        return Err(e(format!("layer {l}: the experts' shapes ({} x {} up, {} x {} down, a router of {}) are not the metadata's", m.up.rows,
-                                             m.up.cols, m.down.rows, m.down.cols, m.router.rows)));
-                    }
-                    let mut m = m;
-                    // the silo takes both projections: the routing on the GPU, the downs repacked for its kernels
-                    // SAFETY: arithmetic only.
-                    if let Some(s) = silo.filter(|s| unsafe { (s.multi_supported)(m.up.ty.code() as i32, m.up.cols as i64) != 0
-                                                             && (s.multi_supported)(m.down.ty.code() as i32, m.down.cols as i64) != 0 }) {
-                        m.on_gpu = true;
-                        let (ty, n) = (m.down.ty.code() as i32, m.down.cols as i64);
-                        // SAFETY: arithmetic only.
-                        if unsafe { (s.packed)(ty, n) } != 0 {
-                            // SAFETY: arithmetic only.
-                            let rb = unsafe { (s.packed_row_bytes)(ty, n) } as usize;
-                            let rows = g.experts * m.down.rows;
-                            let buf = DevBuf::new(gpu, rows * rb)?;
-                            // SAFETY: the file's blocks (rows of n) into the packed rows.
-                            ffi::check(unsafe { (s.pack)(gpu.raw(), ty, m.down.buf.ptr(), buf.ptr(), rows as i64, n) }, "packing the experts")?;
-                            gpu.sync()?;
-                            m.down = Experts { buf, ty: m.down.ty, rows: m.down.rows, cols: m.down.cols, stride: m.down.rows * rb };
-                        }
-                    }
-                    for x in [&m.up, &m.down] {
-                        // SAFETY: arithmetic only.
-                        if unsafe { (k.mmvq_supported)(x.ty.code() as i32) } == 0 {
-                            return Err(e(format!("layer {l}: experts in {} (the products take Q8_0, the K and IQ types, IQ4_NL, Q2_0)", x.ty.name())));
-                        }
-                    }
+                    let m = load_moe(f, gpu, k, silo, &g, l, &loaded)?;
                     Mix::Moe(m)
                 }
             };
@@ -537,6 +563,53 @@ impl<'g> NemotronH<'g> {
         }
         let output_norm = vec_mat(f, &lastg, k, "output_norm.weight", &loaded)?.buf;
         let output = vec_mat(f, &lastg, k, if f.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" }, &loaded)?;
+        let mtp = if drafts > 0 {
+            let l = g.layers;
+            let w = |s: &str| format!("blk.{l}.{s}.weight");
+            let read = |name: &str| -> Result<Mat> { vec_mat(f, &lastg, k, name, &loaded) };
+            // eh_proj [n_embd, 2 n_embd]: each row's first half of blocks multiplies the embedding, the second the
+            // hidden state
+            let t = f.tensor(&w("nextn.eh_proj")).ok_or_else(|| e("no nextn.eh_proj"))?;
+            let (rows, cols) = (t.shape[0] as usize, t.shape[1..].iter().product::<u64>() as usize);
+            if cols != 2 * g.n_embd || matches!(t.ty, GType::F32 | GType::F16 | GType::BF16) {
+                return Err(e("nextn.eh_proj: a quantized [n_embd, 2 n_embd] matrix"));
+            }
+            let raw = f.read(t).map_err(|x| e(x.0))?;
+            loaded.set(loaded.get() + raw.len() as u64);
+            let (rb, hb) = (t.ty.bytes(cols as u64).unwrap_or(0) as usize, t.ty.bytes(g.n_embd as u64).unwrap_or(0) as usize);
+            let (mut ea, mut ha) = (Vec::with_capacity(rows * hb), Vec::with_capacity(rows * hb));
+            for r in 0..rows {
+                ea.extend_from_slice(&raw[r * rb..r * rb + hb]);
+                ha.extend_from_slice(&raw[r * rb + hb..(r + 1) * rb]);
+            }
+            let (be, bh) = (DevBuf::new(&lastg, ea.len())?, DevBuf::new(&lastg, ha.len())?);
+            be.write(0, &ea)?;
+            bh.write(0, &ha)?;
+            Some(Mtp {
+                enorm: read(&w("nextn.enorm"))?.buf,
+                hnorm: read(&w("nextn.hnorm"))?.buf,
+                eh_e: Mat { buf: be, ty: t.ty, rows, cols: g.n_embd },
+                eh_h: Mat { buf: bh, ty: t.ty, rows, cols: g.n_embd },
+                attn_norm: read(&w("attn_norm"))?.buf,
+                attn: Attn { q: read(&w("attn_q"))?, k: read(&w("attn_k"))?, v: read(&w("attn_v"))?, o: read(&w("attn_output"))? },
+                post_norm: read(&w("post_attention_norm"))?.buf,
+                moe: load_moe(f, &lastg, k, silo, &g, l, &loaded)?,
+                head_norm: read(&w("nextn.shared_head_norm"))?.buf,
+            })
+        } else {
+            None
+        };
+        if mtp.as_ref().is_some_and(|m| !m.moe.on_gpu) {
+            return Err(e("the MTP block's experts are not of a type the silo takes"));
+        }
+        let mut snap_layers = Vec::new();
+        if drafts > 0 {
+            for l in (0..g.layers).filter(|l| g.kinds[*l] == Kind::Mamba) {
+                let gpu = &gpus[layer_dev[l]];
+                snap_layers.push((DevBuf::f32(gpu, drafts * (g.conv - 1) * g.conv_dim())?, DevBuf::f32(gpu, drafts * g.inner * g.state)?));
+            }
+        }
+        let vh = DevBuf::f32(&lastg, DEC * g.n_embd)?;
         let mut devs = Vec::with_capacity(gpus.len());
         for (gpu, &(lb, le)) in gpus.iter().zip(&bounds) {
             gpu.sync()?;
@@ -551,8 +624,13 @@ impl<'g> NemotronH<'g> {
         let wh = devs.iter().map(|d| format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1)).collect::<Vec<_>>().join(", ");
         log(format!("nemotronh: {} layers of {} ({} Mamba-2, {} MoE of {} / {} experts, {} attention), {:.1} GiB on {wh} in {load_s:.0} s; prompt chunks of {chunk}{}", g.layers,
                     g.n_embd, g.count(Kind::Mamba), g.count(Kind::Moe), g.used, g.experts, g.count(Kind::Attn), gib(loaded.get()),
-                    if g.nextn > 0 { "; its MTP block is not read (no drafts)" } else { "" }));
-        Ok(NemotronH { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, work: Mutex::new(()), chunk,
+                    match (&mtp, draft) {
+                        (Some(_), _) => format!("; MTP drafts ({drafts} a step)"),
+                        (None, true) if g.nextn > 0 => "; no MTP drafts (they need the silo)".into(),
+                        _ => "; drafts off".into(),
+                    }));
+        Ok(NemotronH { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, work: Mutex::new(()), chunk, mtp, drafts,
+                       snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(),
                        prof: std::env::var("NS_NH_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get() })
     }
 
@@ -708,7 +786,8 @@ impl<'g> NemotronH<'g> {
 
     /// A Mamba-2 mixer on h [t, n_embd]: its output [t, n_embd]
     #[allow(clippy::too_many_arguments)]
-    fn mamba(&self, m: &Mamba, conv: &DevBuf, s: &DevBuf, h: &DevBuf, t: usize, tap: Tap, l: usize) -> Result<DevBuf> {
+    /// `snap`: where the state after each row but the last goes (a verify pass's: its conv's, its scan's)
+    fn mamba(&self, m: &Mamba, conv: &DevBuf, s: &DevBuf, h: &DevBuf, t: usize, tap: Tap, l: usize, snap: Option<(&DevBuf, &DevBuf)>) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (ip, cd) = (g.in_proj(), g.conv_dim());
         let zx = self.arena().f32(t * ip)?;
@@ -719,10 +798,11 @@ impl<'g> NemotronH<'g> {
         let hp = g.inner / g.ssm_heads;
         // SAFETY: the buffers as named in nh.h; z at 0, x B C at inner, dt at inner + conv_dim of each zx row.
         unsafe {
+            let (cs, ss) = snap.map_or((std::ptr::null_mut(), std::ptr::null_mut()), |x| (x.0.fp(), x.1.fp()));
             self.op("conv", || (k.conv)(self.raw(), zx.fp().add(g.inner), ip as i64, conv.fp(), m.conv_w.fp(), m.conv_b.fp(), co.fp(), t as i64, cd as i64,
-                                        g.conv as i32))?;
+                                        g.conv as i32, cs))?;
             self.op("ssm scan", || (k.ssm)(self.raw(), co.fp(), cd as i64, zx.fp().add(g.inner + cd), ip as i64, m.dt_b.fp(), m.a.fp(), m.d.fp(), s.fp(),
-                                           y.fp(), t as i64, g.ssm_heads as i64, hp as i64, g.state as i64, g.groups as i64))?;
+                                           y.fp(), t as i64, g.ssm_heads as i64, hp as i64, g.state as i64, g.groups as i64, ss))?;
             tap(&format!("mamba2_y_add_d-{l}"), &y)?;
             self.op("gated norm", || (k.gated_norm)(self.raw(), y.fp(), zx.fp(), ip as i64, m.norm.fp(), yn.fp(), t as i64, g.inner as i64,
                                                     (g.inner / g.groups) as i64, g.eps))?;
@@ -1013,6 +1093,10 @@ impl<'g> NemotronH<'g> {
         }
         self.on(0);
         let p0 = s.pos;
+        let mut snaps = self.snaps.lock().unwrap();
+        let snapping = (2..=self.drafts + 1).contains(&t) && !snaps.layers.is_empty();
+        snaps.of = None;
+        let mut mi = 0;
         let mut x = self.embed(tokens)?;
         let mut h = self.arena().f32(t * g.n_embd)?;
         for (l, (ly, st)) in self.layers.iter().zip(s.layers.iter()).enumerate() {
@@ -1025,7 +1109,9 @@ impl<'g> NemotronH<'g> {
             tap(&format!("attn_norm-{l}"), &h)?;
             let out = match (&ly.mix, st) {
                 (Mix::Mamba(m), LState::Mamba { conv, s: ss }) => {
-                    let o = self.mamba(m, conv, ss, &h, t, &mut *tap, l)?;
+                    let sn = snapping.then(|| (&snaps.layers[mi].0, &snaps.layers[mi].1));
+                    mi += 1;
+                    let o = self.mamba(m, conv, ss, &h, t, &mut *tap, l, sn)?;
                     tap(&format!("mamba_out-{l}"), &o)?;
                     o
                 }
@@ -1045,19 +1131,136 @@ impl<'g> NemotronH<'g> {
             tap(&format!("nemotron_h_block_out-{l}"), &x)?;
             self.arena().rewind(mark);
         }
+        if snapping {
+            snaps.of = Some((s.id, p0, t));
+        }
+        drop(snaps);
         s.pos += t;
         s.last_rows = t;
         let n = n_out.clamp(1, t);
         let ne = g.n_embd;
-        let last = x.view((t - n) * ne * 4, n * ne * 4)?;
-        let normed = self.arena().f32(n * ne)?;
-        self.rms(&last, &self.output_norm, &normed, n, ne)?;
+        // the output norm: the last rows' for the head; every row's with MTP (the draft block reads them)
+        let normed = if let Some(ms) = s.mtp.as_ref().filter(|_| self.mtp.is_some()) {
+            let all = self.arena().f32(t * ne)?;
+            self.rms(&x, &self.output_norm, &all, t, ne)?;
+            // the rows kept for a rollback; the draft block over this pass's rows: row i pairs token i with the hidden
+            // state before it (the pending one, then this pass's)
+            self.vh.copy_within(0, &all, 0, t.min(DEC) * ne * 4)?;
+            let hs = self.arena().f32(t * ne)?;
+            hs.copy_within(0, &ms.pending, 0, ne * 4)?;
+            if t > 1 {
+                hs.copy_within(ne * 4, &all, 0, (t - 1) * ne * 4)?;
+            }
+            self.mtp_rows(ms, tokens, &hs, p0, s.max_ctx, false)?;
+            ms.pending.copy_within(0, &all, (t - 1) * ne * 4, ne * 4)?;
+            all.view((t - n) * ne * 4, n * ne * 4)?
+        } else {
+            let last = x.view((t - n) * ne * 4, n * ne * 4)?;
+            let normed = self.arena().f32(n * ne)?;
+            self.rms(&last, &self.output_norm, &normed, n, ne)?;
+            normed
+        };
         tap("result_norm", &normed)?;
         let logits = self.arena().f32(n * self.output.rows)?;
         self.matmul(&self.output, &normed, None, n, &logits)?;
         tap("result_output", &logits)?;
         let all = logits.to_f32()?;
         Ok(all.chunks(self.output.rows).map(|c| c.to_vec()).collect())
+    }
+
+    /// The draft block over `tokens` at positions p0.. (row i: token i with hidden state hs[i]): its cache written
+    /// there; with `head`, the last row's likeliest token (its logits' argmax on the GPU; its normed output kept for a
+    /// chained draft)
+    fn mtp_rows(&self, ms: &MtpState, tokens: &[u32], hs: &DevBuf, p0: usize, cap: usize, head: bool) -> Result<Option<u32>> {
+        let Some(m) = &self.mtp else { return Ok(None) };
+        let g = &self.g;
+        let (t, ne) = (tokens.len(), g.n_embd);
+        let emb = self.embed(tokens)?;
+        let en = self.arena().f32(t * ne)?;
+        self.rms(&emb, &m.enorm, &en, t, ne)?;
+        let hn = self.arena().f32(t * ne)?;
+        self.rms(hs, &m.hnorm, &hn, t, ne)?;
+        // eh_proj . [en | hn] = W_e . en + W_h . hn
+        let cur = self.arena().f32(t * ne)?;
+        self.matmul(&m.eh_e, &en, None, t, &cur)?;
+        let tmp = self.arena().f32(t * ne)?;
+        self.matmul(&m.eh_h, &hn, None, t, &tmp)?;
+        self.add(&cur, &tmp, t * ne)?;
+        let h = self.arena().f32(t * ne)?;
+        self.rms(&cur, &m.attn_norm, &h, t, ne)?;
+        let att = self.attention(&m.attn, &ms.k, &ms.v, cap, &h, t, p0)?;
+        self.add(&cur, &att, t * ne)?;
+        self.rms(&cur, &m.post_norm, &h, t, ne)?;
+        let mut none = |_: &str, _: &DevBuf| -> Result<()> { Ok(()) };
+        let out = self.moe(&m.moe, &h, t, &mut none, g.layers)?;
+        self.add(&cur, &out, t * ne)?;
+        if !head {
+            return Ok(None);
+        }
+        let last = cur.view((t - 1) * ne * 4, ne * 4)?;
+        // the head's own norm: a LayerNorm (mean and variance), no bias
+        // SAFETY: one row of n_embd floats.
+        self.op("layer norm", || unsafe { (self.k.layer_norm)(self.raw(), last.fp(), m.head_norm.fp(), std::ptr::null(), ms.chain.fp(), 1, ne as i64, g.eps) })?;
+        let logits = self.arena().f32(self.output.rows)?;
+        self.matmul(&self.output, &ms.chain, None, 1, &logits)?;
+        let best = self.arena().bytes(4)?;
+        // SAFETY: logits [1, vocab] float32 -> its argmax (one int32).
+        self.op("argmax", || unsafe { (self.k.argmax)(self.raw(), logits.fp(), 1, self.output.rows as i64, best.ptr().cast()) })?;
+        let mut b = [0u8; 4];
+        best.read(0, &mut b)?;
+        Ok(Some(u32::from_le_bytes(b)))
+    }
+
+    /// Drafts for the positions after `tail` (committed at s.pos, not fed): the draft block on (the last fed
+    /// position's hidden state, tail), then chained on its own normed output and each draft
+    fn draft_in(&self, s: &Session, tail: u32) -> Result<Vec<u32>> {
+        let Some(ms) = &s.mtp else { return Ok(Vec::new()) };
+        let k = self.drafts.min(s.max_ctx.saturating_sub(s.pos + 1));
+        let mut out = Vec::with_capacity(k);
+        let mut tok = tail;
+        // the draft block is on the last GPU
+        self.on(self.devs.len() - 1);
+        for i in 0..k {
+            self.arena().reset();
+            let hs = if i == 0 { &ms.pending } else { &ms.chain };
+            let Some(t) = self.mtp_rows(ms, &[tok], hs, s.pos + i, s.max_ctx, true)? else { break };
+            tok = t;
+            out.push(tok);
+        }
+        Ok(out)
+    }
+
+    /// Back to the first `keep` rows of the session's last pass: its Mamba states from the pass's snapshots, the
+    /// attention caches and the draft block's cache simply rewritten later
+    fn rollback_in(&self, s: &mut Session, keep: usize) -> Result<()> {
+        if keep == s.last_rows {
+            return Ok(());
+        }
+        let mut snaps = self.snaps.lock().unwrap();
+        let Some((id, p0, rows)) = snaps.of else {
+            return Err(e("nemotronh: a rollback needs the last pass's snapshots (a verify pass of 2 ..= drafts + 1 rows, drafts on)"));
+        };
+        if id != s.id || p0 + rows != s.pos || keep == 0 || keep >= rows {
+            return Err(e(format!("nemotronh: a rollback to {keep} of a pass of {rows} rows at {p0} (session {id}); this session is at {}", s.pos)));
+        }
+        let g = &self.g;
+        let (cb, sb) = ((g.conv - 1) * g.conv_dim() * 4, g.inner * g.state * 4);
+        let mut mi = 0;
+        for st in &s.layers {
+            if let LState::Mamba { conv, s: ss } = st {
+                let (cs, sn) = &snaps.layers[mi];
+                conv.copy_within(0, cs, (keep - 1) * cb, cb)?;
+                ss.copy_within(0, sn, (keep - 1) * sb, sb)?;
+                mi += 1;
+            }
+        }
+        if let Some(ms) = &s.mtp {
+            ms.pending.copy_within(0, &self.vh, (keep - 1) * g.n_embd * 4, g.n_embd * 4)?;
+        }
+        snaps.of = None;
+        s.pos = p0 + keep;
+        s.last_rows = keep;
+        Ok(())
     }
 
     pub fn session(&self, max_ctx: usize) -> Result<Session> {
@@ -1069,7 +1272,7 @@ impl<'g> NemotronH<'g> {
                 Kind::Attn => kv(max_ctx) as u64,
                 Kind::Mamba => ms as u64,
                 Kind::Moe => 0,
-            }).sum();
+            }).sum::<u64>() + if d.le == g.layers && self.mtp.is_some() { kv(max_ctx) as u64 } else { 0 };
             let (total, free) = d.gpu.memory()?;
             let free = free.unwrap_or(total);
             if need + (1536 << 20) > free {
@@ -1095,7 +1298,18 @@ impl<'g> NemotronH<'g> {
                 Kind::Moe => LState::None,
             });
         }
-        Ok(Session { pos: 0, max_ctx, layers, last_rows: 0 })
+        let mtp = match &self.mtp {
+            Some(_) => {
+                let n = g.heads_kv * max_ctx * g.head * 2;
+                let gpu = &self.devs[self.devs.len() - 1].gpu;
+                let ms = MtpState { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)?, pending: DevBuf::f32(gpu, g.n_embd)?, chain: DevBuf::f32(gpu, g.n_embd)? };
+                ms.pending.fill(0)?;
+                Some(ms)
+            }
+            None => None,
+        };
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Session { pos: 0, max_ctx, layers, last_rows: 0, id, mtp })
     }
 
     pub fn reset_session(&self, s: &mut Session) -> Result<()> {
@@ -1104,6 +1318,9 @@ impl<'g> NemotronH<'g> {
                 conv.fill(0)?;
                 s.fill(0)?;
             }
+        }
+        if let Some(ms) = &s.mtp {
+            ms.pending.fill(0)?;
         }
         s.pos = 0;
         s.last_rows = 0;
@@ -1132,6 +1349,14 @@ impl<'g> NemotronH<'g> {
                 _ => return Err(e("sessions of other shapes")),
             }
         }
+        if let (Some(d), Some(sm)) = (&dst.mtp, &src.mtp) {
+            for h in 0..g.heads_kv {
+                let n = src.pos * g.head * 2;
+                d.k.copy_within(h * dst.max_ctx * g.head * 2, &sm.k, h * src.max_ctx * g.head * 2, n)?;
+                d.v.copy_within(h * dst.max_ctx * g.head * 2, &sm.v, h * src.max_ctx * g.head * 2, n)?;
+            }
+            d.pending.copy_within(0, &sm.pending, 0, g.n_embd * 4)?;
+        }
         dst.pos = src.pos;
         dst.last_rows = 0;
         Ok(())
@@ -1154,12 +1379,17 @@ impl<'g> NemotronH<'g> {
         self.pass(s, tokens, n_out, tap)
     }
 
-    /// The Mamba states have no snapshots yet: only a rollback that keeps the whole last pass
     pub fn rollback(&self, s: &mut Session, keep: usize) -> Result<()> {
-        if keep == s.last_rows {
-            return Ok(());
-        }
-        Err(e("nemotronh: no rollback (the Mamba states keep no snapshots yet)"))
+        let _w = self.work.lock().unwrap();
+        self.rollback_in(s, keep)
+    }
+
+    pub fn has_draft(&self) -> bool {
+        self.drafts > 0
+    }
+
+    pub fn max_verify(&self) -> usize {
+        self.drafts + 1
     }
 
     pub fn forward_batch(&self, sessions: &mut [&mut Session], tokens: &[u32], tap: Tap) -> Result<Vec<Vec<f32>>> {
@@ -1170,17 +1400,46 @@ impl<'g> NemotronH<'g> {
         Ok(out)
     }
 
+    /// The next committed token(s). With drafts: [token, drafts] in one pass, each row's token drawn as plain
+    /// sampling would draw it, the drafts kept while they match (what is committed is distributed as without drafts)
     pub fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
-        let y = match (d.logits.take(), d.next.take()) {
-            (Some(l), _) => smp.sample(&l),
+        let _w = self.work.lock().unwrap();
+        let drafting = d.mtp && self.drafts > 0 && s.mtp.is_some();
+        let out = match (d.logits.take(), d.next.take()) {
+            (Some(l), _) => vec![smp.sample(&l)],
             (None, Some(x)) => {
-                let l = self.pass(s, &[x], 1, tap)?.pop().unwrap_or_default();
-                smp.sample(&l)
+                let mut rows = vec![x];
+                if drafting {
+                    rows.extend(d.drafts.iter().take(s.max_ctx.saturating_sub(s.pos + 1)));
+                }
+                d.drafts.clear();
+                let logits = self.pass_in(s, &rows, rows.len(), tap)?;
+                let mut out = Vec::with_capacity(rows.len());
+                for (i, l) in logits.iter().enumerate() {
+                    let y = smp.sample(l);
+                    out.push(y);
+                    if i + 1 < rows.len() {
+                        d.drafted += 1;
+                        if y == rows[i + 1] {
+                            d.accepted += 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if out.len() < rows.len() {
+                    self.rollback_in(s, out.len())?;
+                }
+                out
             }
             (None, None) => return Err(e("a decoder with nothing to draw from")),
         };
-        d.next = Some(y);
-        Ok(vec![y])
+        let tail = *out.last().unwrap();
+        d.next = Some(tail);
+        if drafting {
+            d.drafts = self.draft_in(s, tail)?;
+        }
+        Ok(out)
     }
 
     pub fn save(&self, s: &Session) -> Result<Checkpoint> {
@@ -1207,6 +1466,19 @@ impl<'g> NemotronH<'g> {
                 }
                 LState::None => {}
             }
+        }
+        if let Some(ms) = &s.mtp {
+            for c in [&ms.k, &ms.v] {
+                let n = s.pos * g.head * 2;
+                let mut b = vec![0u8; g.heads_kv * n];
+                for h in 0..g.heads_kv {
+                    c.read(h * s.max_ctx * g.head * 2, &mut b[h * n..(h + 1) * n])?;
+                }
+                bufs.push(b);
+            }
+            let mut b = vec![0u8; g.n_embd * 4];
+            ms.pending.read(0, &mut b)?;
+            bufs.push(b);
         }
         let bytes = bufs.iter().map(|b| b.len()).sum();
         Ok(Checkpoint { pos: s.pos, bufs, bytes })
@@ -1243,6 +1515,20 @@ impl<'g> NemotronH<'g> {
                 }
                 LState::None => {}
             }
+        }
+        if let Some(ms) = &s.mtp {
+            for c in [&ms.k, &ms.v] {
+                let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's cache"))?;
+                let n = ck.pos * g.head * 2;
+                if b.len() != g.heads_kv * n {
+                    return Err(e("a checkpoint of another shape"));
+                }
+                for h in 0..g.heads_kv {
+                    c.write(h * s.max_ctx * g.head * 2, &b[h * n..(h + 1) * n])?;
+                }
+            }
+            let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's state"))?;
+            ms.pending.write(0, b)?;
         }
         s.pos = ck.pos;
         s.last_rows = 0;
@@ -1301,4 +1587,59 @@ fn experts(f: &Gguf, gpu: &Arc<Gpu>, name: &str, loaded: &std::cell::Cell<u64>) 
     let buf = DevBuf::new(gpu, raw.len())?;
     buf.write(0, &raw)?;
     Ok(Experts { buf, ty: t.ty, rows, cols, stride })
+}
+
+/// A latent-MoE layer (blk.l) onto the GPU: the router, its bias, the latent projections, the experts (the downs
+/// repacked when the silo takes both projections: routed on the GPU then), the shared expert
+fn load_moe(f: &Gguf, gpu: &Arc<Gpu>, k: &ffi::Api, silo: Option<&ffi::Silo>, g: &Geometry, l: usize, loaded: &std::cell::Cell<u64>) -> Result<Moe> {
+    let w = |s: &str| format!("blk.{l}.{s}.weight");
+    let read = |name: &str| -> Result<Mat> { vec_mat(f, gpu, k, name, loaded) };
+    let router = read(&w("ffn_gate_inp"))?;
+    let bias_t = f.tensor(&format!("blk.{l}.exp_probs_b.bias")).ok_or_else(|| e(format!("layer {l}: no exp_probs_b.bias")))?;
+    let raw = f.read(bias_t).map_err(|x| e(x.0))?;
+    let bias: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let bias_dev = DevBuf::new(gpu, bias.len() * 4)?;
+    bias_dev.write(0, &raw)?;
+    let mut m = Moe {
+        router,
+        bias,
+        bias_dev,
+        to_latent: read(&w("ffn_latent_down"))?,
+        from_latent: read(&w("ffn_latent_up"))?,
+        up: experts(f, gpu, &w("ffn_up_exps"), loaded)?,
+        down: experts(f, gpu, &w("ffn_down_exps"), loaded)?,
+        on_gpu: false,
+        sh_up: read(&w("ffn_up_shexp"))?,
+        sh_down: read(&w("ffn_down_shexp"))?,
+    };
+    if m.router.rows != g.experts || m.bias.len() != g.experts || m.up.rows != g.n_ff_exp || m.up.cols != g.latent || m.down.rows != g.latent
+        || m.down.cols != g.n_ff_exp {
+        return Err(e(format!("layer {l}: the experts' shapes ({} x {} up, {} x {} down, a router of {}) are not the metadata's", m.up.rows, m.up.cols,
+                             m.down.rows, m.down.cols, m.router.rows)));
+    }
+    // the silo takes both projections: the routing on the GPU, the downs repacked for its kernels
+    // SAFETY: arithmetic only.
+    if let Some(s) = silo.filter(|s| unsafe { (s.multi_supported)(m.up.ty.code() as i32, m.up.cols as i64) != 0
+                                             && (s.multi_supported)(m.down.ty.code() as i32, m.down.cols as i64) != 0 }) {
+        m.on_gpu = true;
+        let (ty, n) = (m.down.ty.code() as i32, m.down.cols as i64);
+        // SAFETY: arithmetic only.
+        if unsafe { (s.packed)(ty, n) } != 0 {
+            // SAFETY: arithmetic only.
+            let rb = unsafe { (s.packed_row_bytes)(ty, n) } as usize;
+            let rows = g.experts * m.down.rows;
+            let buf = DevBuf::new(gpu, rows * rb)?;
+            // SAFETY: the file's blocks (rows of n) into the packed rows.
+            ffi::check(unsafe { (s.pack)(gpu.raw(), ty, m.down.buf.ptr(), buf.ptr(), rows as i64, n) }, "packing the experts")?;
+            gpu.sync()?;
+            m.down = Experts { buf, ty: m.down.ty, rows: m.down.rows, cols: m.down.cols, stride: m.down.rows * rb };
+        }
+    }
+    for x in [&m.up, &m.down] {
+        // SAFETY: arithmetic only.
+        if unsafe { (k.mmvq_supported)(x.ty.code() as i32) } == 0 {
+            return Err(e(format!("layer {l}: experts in {} (the products take Q8_0, the K and IQ types, IQ4_NL, Q2_0)", x.ty.name())));
+        }
+    }
+    Ok(m)
 }

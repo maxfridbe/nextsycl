@@ -27,8 +27,12 @@ pub struct Api {
     pub gemm_f16: unsafe extern "C" fn(G, i64, i64, i64, *const u16, i64, *const u16, *mut f32, i64, c_int) -> c_int,
     pub gather_h: unsafe extern "C" fn(G, *const u16, *const i32, *mut u16, i64, i64) -> c_int,
     // nh.h
-    pub conv: unsafe extern "C" fn(G, *const f32, i64, *mut f32, *const f32, *const f32, *mut f32, i64, i64, c_int) -> c_int,
-    pub ssm: unsafe extern "C" fn(G, *const f32, i64, *const f32, i64, *const f32, *const f32, *const f32, *mut f32, *mut f32, i64, i64, i64, i64, i64) -> c_int,
+    pub conv: unsafe extern "C" fn(G, *const f32, i64, *mut f32, *const f32, *const f32, *mut f32, i64, i64, c_int, *mut f32) -> c_int,
+    pub ssm: unsafe extern "C" fn(G, *const f32, i64, *const f32, i64, *const f32, *const f32, *const f32, *mut f32, *mut f32, i64, i64, i64, i64, i64, *mut f32)
+                                 -> c_int,
+    pub layer_norm: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, i64, i64, f32) -> c_int,
+    /// the greedy pick on the GPU (the qwen35 engine's kernel: the MTP drafts)
+    pub argmax: unsafe extern "C" fn(G, *const f32, i64, i64, *mut i32) -> c_int,
     pub gated_norm: unsafe extern "C" fn(G, *const f32, *const f32, i64, *const f32, *mut f32, i64, i64, i64, f32) -> c_int,
     pub relu2: unsafe extern "C" fn(G, *mut f32, i64) -> c_int,
     pub kv_store: unsafe extern "C" fn(G, *const f32, i64, *const f32, i64, i64, i64, i64, i64, i64, M, M) -> c_int,
@@ -73,6 +77,8 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             gemm_f16: sym!("ns_gemm_f16"),
             gather_h: sym!("ns_gather_h"),
             conv: sym!("ns_nh_conv"),
+            layer_norm: sym!("ns_layer_norm"),
+            argmax: sym!("ns_q35_argmax"),
             ssm: sym!("ns_nh_ssm"),
             gated_norm: sym!("ns_nh_gated_norm"),
             relu2: sym!("ns_nh_relu2"),

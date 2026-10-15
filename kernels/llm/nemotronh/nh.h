@@ -14,13 +14,16 @@ extern "C" {
 typedef struct ns_gpu ns_gpu;
 
 /* The Mamba-2 conv: rows x [T] of C channels (xs floats apart) after the k-1 inputs before them (state [k-1][C],
- * oldest first; updated to the last k-1): out [T][C] = silu(sum_j in[t + j][c] * w[c][j] + b[c]) */
-int ns_nh_conv(ns_gpu* g, const float* x, int64_t xs, float* state, const float* w, const float* b, float* out, int64_t T, int64_t C, int k);
+ * oldest first; updated to the last k-1): out [T][C] = silu(sum_j in[t + j][c] * w[c][j] + b[c]). snap (nullable): the
+ * state after each row but the last, [T-1][k-1][C] (a verify pass's rollback) */
+int ns_nh_conv(ns_gpu* g, const float* x, int64_t xs, float* state, const float* w, const float* b, float* out, int64_t T, int64_t C, int k,
+               float* snap);
 /* The Mamba-2 scan (ggml's ssm_scan, d_state N, one A a head): rows xbc [T] = x [H][P] | B [G][N] | C [G][N] (xs floats
  * apart), dt [T][H] (dts apart, before its bias); per row and head dt' = softplus(dt + dt_bias), the state S [H][P][N]
- * decayed by exp(dt' A) plus dt' B x, y [T][H][P] = C . S + Dp x. A head h reads group h / (H / G) */
+ * decayed by exp(dt' A) plus dt' B x, y [T][H][P] = C . S + Dp x. A head h reads group h / (H / G). snap (nullable): S
+ * after each row but the last, [T-1][H][P][N] */
 int ns_nh_ssm(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t dts, const float* dt_bias, const float* A, const float* Dp, float* S,
-              float* y, int64_t T, int64_t H, int64_t P, int64_t N, int64_t G);
+              float* y, int64_t T, int64_t H, int64_t P, int64_t N, int64_t G, float* snap);
 /* The mixer's gate and norm: out [T][C] = rms_norm(y * silu(z)) * w over groups of `group` values (z rows zs apart) */
 int ns_nh_gated_norm(ns_gpu* g, const float* y, const float* z, int64_t zs, const float* w, float* out, int64_t T, int64_t C, int64_t group, float eps);
 /* x = max(x, 0)^2 */
