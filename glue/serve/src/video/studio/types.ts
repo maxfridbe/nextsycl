@@ -23,7 +23,11 @@ export type ClipState = "done" | "running" | "queued" | "held";
 
 export interface GenerateRequest {
   prompt: string;
-  seconds?: number;          // 1-15.1; the model is trained on 124-362 frames at 24 fps
+  seconds?: number;          // 1-15.1, snapped up to 17k + 5 frames; the model is trained on 124-362 frames at 24 fps
+  frames?: number;           // instead of seconds: exactly 17k + 5 (22-362), else 400 naming the nearest
+  reentrant_id?: string;     // idempotent submit: a clip of this id queued, running or made is answered instead
+  chain?: Chain;             // sets guide_clip, first_audio(_s), first_frame, chain_mode, exposure_ref (flat keys win)
+  negative_prompt?: string;  // ignored (cfg 1: nothing to steer); listed in the answer's ignored
   steps?: number;            // 1-40; below 8 only with a turbo LoRA
   seed?: number;
   te?: "teacher" | "student";
@@ -59,6 +63,21 @@ export interface GenerateRequest {
   sampler?: string; schedule?: string;
 }
 
+export interface Chain {
+  from?: Anchor;             // default prev
+  context_frames?: number;   // 0 or 17k + 5: the last N frames as a moving keyframe at frame 0 (trim N/2 each side when joining)
+  sound?: boolean;           // with context_frames: the last N/24 s of sound too (default true)
+  still?: boolean;           // from's last frame as first_frame (default: when context_frames is 0)
+  mode?: "video" | "png" | "latent";
+  color_reanchor?: Anchor | boolean;  // exposure_ref: the carried pictures scaled to its brightness
+}
+
+export interface GenerateAnswer {
+  queued: boolean; position?: number; job?: Job; label?: string; project?: string; batch?: string; held?: boolean;
+  frames: number; seconds: number; ignored: string[];
+  reentered: boolean; state?: "queued" | "held" | "running" | "done"; name?: string; file?: string;
+}
+
 export interface Job extends GenerateRequest {
   id: string; name: string; started: number;
   restore_vllm?: boolean; energy_wh?: number | null;
@@ -69,7 +88,7 @@ export interface Status {
   paused: boolean;
   paused_projects: string[];
   paused_batches: string[];
-  job?: Job;
+  job: Job | null;            // null: nothing made since the studio started
   stage?: string; pct?: number; done?: boolean; error?: string | null;
   eta?: number; elapsed?: number;
   queue: string[];
@@ -109,8 +128,10 @@ export interface Scene {
 
 export interface Methods {
   "status": [Record<string, never>, Status];
-  "wait": [{ version?: string; timeout_s?: number }, Status & { changed: boolean }];
-  "generate": [GenerateRequest, { queued: boolean; position?: number; job?: Job }];
+  "wait": [{ version?: string; timeout_s?: number /* 0-60 */ }, Status & { changed: boolean }];
+  "files.stat": [{ name: string }, { name: string; bytes: number; sha256: string; mtime: number }];
+  "files.delete": [{ name: string }, { deleted: string[] }];
+  "generate": [GenerateRequest, GenerateAnswer];
   "cancel": [{ label?: string }, { stopped: boolean; removed: number; label?: string }];
   "queue.move": [{ label: string; position?: number; priority?: number }, { label: string; position: number; queue: string[] }];
   "queue.remove": [{ label: string }, { removed: number; label: string }];

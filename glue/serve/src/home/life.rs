@@ -239,6 +239,34 @@ impl Home {
         }).collect()
     }
 
+    /// Every place work runs, and on which card: the image and audio servers (two each when the second port is set),
+    /// the video daemon's GPUs, the chat server's cards
+    pub(crate) fn work_slots(&self, all: &[Value], cards: &Value) -> Vec<Value> {
+        let mut v = Vec::new();
+        for kind in ["image", "audio"] {
+            if !all.iter().any(|m| registry::kind_of(m) == kind && m["enabled"] != false) {
+                continue;
+            }
+            for x in self.servers(kind) {
+                v.push(json!({"kind": kind, "slot": x.slot, "port": x.port, "gpu": card_of_port(cards, x.port),
+                              "model": x.model, "loading": x.loading, "busy": x.busy && !x.loading, "up": x.model.is_some()}));
+            }
+        }
+        if all.iter().any(|m| registry::kind_of(m) == "video" && m["enabled"] != false) {
+            if let Ok(st) = call_for(&self.target("video"), "GET", "/engine/status", None, 4) {
+                for g in st["gpus"].as_array().into_iter().flatten() {
+                    v.push(json!({"kind": "video", "slot": g["gpu"], "gpu": g["gpu"], "model": g["denoiser"],
+                                  "loading": false, "busy": !g["running"].is_null(), "up": g["engine"].as_str().is_some_and(|e| e != "unloaded")}));
+                }
+            }
+        }
+        if let Some(id) = all.iter().any(|m| registry::kind_of(m) == "llm").then(|| self.chat_loaded(all)).flatten() {
+            let gpus = all.iter().find(|m| m["id"] == id.as_str()).map(|m| self.gpus_of(m)).unwrap_or_default();
+            v.push(json!({"kind": "llm", "slot": 0, "gpu": gpus.first(), "gpus": gpus, "model": id, "loading": false, "busy": false, "up": true}));
+        }
+        v
+    }
+
     /// The models the kind's servers hold
     pub(crate) fn loaded_of(&self, kind: &str) -> Vec<String> {
         self.slots(kind).into_iter().filter_map(|p| self.server_at(p).map(|x| x.0)).collect()

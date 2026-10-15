@@ -201,9 +201,32 @@ impl Studio {
     }
 
     fn generate(&self, p: &Value) -> Result<Value, RpcError> {
+        let (p, mut ignored) = queue::unchain(p)?;
+        let p = &p;
+        for k in queue::IGNORED {
+            if p.get(k).is_some_and(|v| !v.is_null() && *v != json!("")) {
+                ignored.push(k.to_string());
+            }
+        }
         let item = self.build_item(p)?;
+        // the clip's length as made, and what the request had that the box does nothing with
+        let (frames, seconds) = (item["frames"].clone(), item["seconds"].clone());
+        let with = |mut v: Value| {
+            v["frames"] = frames.clone();
+            v["seconds"] = seconds.clone();
+            v["ignored"] = json!(ignored);
+            v
+        };
         let mut st = self.st.lock().unwrap();
         let _ = self.status(&mut st); // registers a just-finished clip before anything replaces it
+        // the clip a reentrant_id already names (queued, running or made): that one, not another
+        if let Some(r) = item["reentrant_id"].as_str() {
+            if let Some(mut v) = self.reentered(&st, r) {
+                v["reentered"] = json!(true);
+                v["ignored"] = json!(ignored);
+                return Ok(v);
+            }
+        }
         // busy: a clip running, or a runnable item waiting (an all-held queue does not block a direct request)
         let busy = self.running(&st) || st.q.items.iter().any(|i| !st.q.held(i));
         if busy {
@@ -219,10 +242,29 @@ impl Studio {
                 st.q.paused = false;
                 st.q.save_paused(&self.dir);
             }
-            return Ok(json!({"queued": true, "position": at + 1, "label": label, "project": project, "batch": batch, "held": held}));
+            return Ok(with(json!({"queued": true, "position": at + 1, "label": label, "project": project, "batch": batch, "held": held, "reentered": false})));
         }
         self.launch(&mut st, item).map_err(|e| RpcError::new("internal", &e, 503))?;
-        Ok(json!({"queued": false, "job": st.job.as_ref().map(|j| j.rec.clone())}))
+        Ok(with(json!({"queued": false, "job": st.job.as_ref().map(|j| j.rec.clone()), "reentered": false})))
+    }
+
+    /// The clip a reentrant_id names: running, queued (or held), or made (its record); a failed one is not kept
+    fn reentered(&self, st: &State, r: &str) -> Option<Value> {
+        let len = |rec: &Value| json!({"frames": rec["frames"].as_u64().unwrap_or_else(|| runner::frames_of(rec["seconds"].as_f64().unwrap_or(10.0))), "seconds": rec["seconds"]});
+        if let Some(j) = st.job.as_ref().filter(|j| !j.finished && j.rec["reentrant_id"] == r) {
+            let mut v = json!({"queued": false, "state": "running", "job": j.rec});
+            v["frames"] = len(&j.rec)["frames"].clone();
+            v["seconds"] = j.rec["seconds"].clone();
+            return Some(v);
+        }
+        if let Some((i, it)) = st.q.items.iter().enumerate().find(|(_, i)| i["reentrant_id"] == r) {
+            let held = st.q.held(it);
+            return Some(json!({"queued": true, "state": if held { "held" } else { "queued" }, "position": i + 1, "label": s(it, "label"),
+                               "project": project_of(it), "batch": s(it, "batch"), "held": held, "frames": len(it)["frames"], "seconds": it["seconds"]}));
+        }
+        let (stem, side) = self.sidecars().into_iter().find(|(_, side)| side["job"]["reentrant_id"] == r)?;
+        Some(json!({"queued": false, "state": "done", "name": stem, "file": format!("/out/{stem}.mp4"), "job": side["job"],
+                    "frames": side["frames"], "seconds": side["job"]["seconds"]}))
     }
 
     fn rpc(&self, method: &str, p: &Value) -> Result<Value, RpcError> {
@@ -339,6 +381,11 @@ impl Studio {
                 });
                 json!({"jobs": rows.collect::<Vec<_>>()})
             }
+            "files.stat" => {
+                let n = crate::files::plain(&ps("name")).map(str::to_string).ok_or_else(|| RpcError::param("name: a file in the clips directory"))?;
+                crate::files::stat(&self.out.join(&n)).map_err(|_| RpcError::not_found(&format!("no file {n}")))?
+            }
+            "files.delete" => self.delete(&ps("name"))?,
             "jobs.get" => {
                 let n = queue::basename(&ps("name"));
                 let n = n.trim_end_matches(".mp4");
@@ -346,6 +393,44 @@ impl Studio {
             }
             other => return Err(RpcError::new("unknown_method", &format!("unknown method {other}"), 404)),
         })
+    }
+
+    /// A finished clip and every file of it (its record, last frame, latents, sound tail, still), or an upload;
+    /// never the clip being made
+    fn delete(&self, name: &str) -> Result<Value, RpcError> {
+        let n = crate::files::plain(name).ok_or_else(|| RpcError::param("name: a clip (h3_YYYYMMDD_HHMMSS[.mp4]) or an upload (ref_...)"))?;
+        let mut gone = Vec::new();
+        if n.starts_with("ref_") {
+            std::fs::remove_file(self.out.join(n)).map_err(|_| RpcError::not_found(&format!("no upload {n}")))?;
+            gone.push(n.to_string());
+        } else {
+            let stem = n.strip_suffix(".mp4").unwrap_or(n);
+            if !library::is_clip_name(stem) {
+                return Err(RpcError::param(&format!("{n}: not a clip name (h3_YYYYMMDD_HHMMSS) or an upload (ref_...)")));
+            }
+            let mut st = self.st.lock().unwrap();
+            if st.job.as_ref().is_some_and(|j| !j.finished && s(&j.rec, "name") == stem) {
+                return Err(RpcError::new("busy", &format!("{stem} is being made (video.cancel first)"), 409));
+            }
+            let pre = format!("{stem}.");
+            for e in std::fs::read_dir(&self.out).into_iter().flatten().flatten() {
+                let f = e.file_name().to_string_lossy().into_owned();
+                if f.starts_with(&pre) && std::fs::remove_file(e.path()).is_ok() {
+                    gone.push(f);
+                }
+            }
+            let _ = std::fs::remove_file(self.out.join(".thumbs").join(format!("{stem}.webp")));
+            if st.last_file.as_deref() == Some(stem) {
+                st.last_file = None; // prev no longer means it
+            }
+            drop(st);
+            if gone.is_empty() {
+                return Err(RpcError::not_found(&format!("no clip {stem}")));
+            }
+            self.invalidate();
+        }
+        gone.sort();
+        Ok(json!({"deleted": gone}))
     }
 
     /// Drop the queued clips of a label; how many

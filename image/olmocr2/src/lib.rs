@@ -349,7 +349,7 @@ impl ImageEngine for OlmOcr {
     fn load_seconds(&self) -> f64 {
         self.load_s
     }
-    fn generate(&self, _req: &ImageRequest, _progress: &mut dyn FnMut(Step)) -> Result<Vec<Picture>> {
+    fn generate(&self, _req: &ImageRequest, _progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Vec<Picture>> {
         Err(Error(format!("{ARCH} reads pages; it does not make pictures (image.ocr)")))
     }
     fn reads(&self) -> bool {

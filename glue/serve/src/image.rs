@@ -77,6 +77,7 @@ pub struct ImageServer {
     progress: Mutex<Value>,
     waiting: AtomicUsize,
     history: Mutex<VecDeque<Value>>,
+    cancel: crate::cancel::Cancel,
     /// ends the process after an idle stretch (`--idle-exit`; none: never)
     pub idle: Option<&'static crate::idle::Idle>,
 }
@@ -192,7 +193,7 @@ impl ImageServer {
         let tele = Telemetry::start(std::slice::from_ref(&gpu.pci));
         let history = Mutex::new(out_dir.as_deref().map(earlier).unwrap_or_default());
         Ok(ImageServer { model, loras_known, out_dir, wfe, cors, gpu, tele, load, engine: Mutex::new(Some((e, loras))), progress: Mutex::new(json!({"busy": false})),
-                         idle: None, waiting: AtomicUsize::new(0), history })
+                         idle: None, waiting: AtomicUsize::new(0), history, cancel: Default::default() })
     }
 
     /// Answers on `addr` until the process ends
@@ -244,9 +245,24 @@ impl ImageServer {
             ("GET", "/api/progress") => {
                 let mut p = self.progress.lock().unwrap().clone();
                 p["waiting"] = json!(self.waiting.load(Ordering::Relaxed));
+                p["request_id"] = json!(self.cancel.current());
                 http::respond_with(&mut s, 200, &p, &cors)
             }
-            ("GET", "/api/history") => http::respond_with(&mut s, 200, &json!({"data": self.history.lock().unwrap().iter().collect::<Vec<_>>()}), &cors),
+            ("GET", "/api/history") => {
+                // files deleted since (system.files.delete) drop out
+                let mut h = self.history.lock().unwrap();
+                if let Some(d) = &self.out_dir {
+                    h.retain(|e| e["url"].as_str().and_then(|u| u.rsplit('/').next()).is_none_or(|f| d.join(f).exists()));
+                }
+                http::respond_with(&mut s, 200, &json!({"data": h.iter().collect::<Vec<_>>()}), &cors)
+            }
+            ("POST", "/api/cancel") => {
+                // {"id"}: that request only (the front door's job), running or waiting; none: the one running
+                let busy = self.progress.lock().unwrap()["busy"] == true;
+                let id = serde_json::from_slice::<Value>(&req.body).ok().and_then(|v| v["id"].as_str().map(str::to_string));
+                let running = self.cancel.request(id.as_deref(), busy);
+                http::respond_with(&mut s, 200, &json!({"cancelled": running, "id": id}), &cors)
+            }
             ("GET", p) if p.starts_with("/v1/images/files/") => self.file(&mut s, &p["/v1/images/files/".len()..], &cors),
             ("POST", "/v1/images/generations") | ("POST", "/images/generations") => {
                 let body: Value = match serde_json::from_slice(&req.body) {
@@ -536,6 +552,9 @@ impl ImageServer {
         self.waiting.fetch_add(1, Ordering::Relaxed);
         let mut g = self.engine.lock().unwrap_or_else(|p| p.into_inner());
         self.waiting.fetch_sub(1, Ordering::Relaxed);
+        let Some(_running) = self.cancel.begin(b["request_id"].as_str()) else {
+            return Err((499, "cancelled".into()));
+        };
         let t0 = Instant::now();
         let j0 = self.tele.joules();
         // other LoRAs: the engine reloaded with them merged
@@ -566,9 +585,13 @@ impl ImageServer {
         let pics = engine.generate(&req, &mut |st| {
             *p.lock().unwrap() = json!({"busy": true, "prompt": prompt, "picture": st.picture + 1, "pictures": n, "at": st.at, "of": st.of,
                                         "seconds": st.seconds});
+            if self.cancel.stopping() {
+                return Err(nextsycl_core::Error("cancelled".into()));
+            }
+            Ok(())
         });
         *p.lock().unwrap() = json!({"busy": false});
-        let pics = pics.map_err(|e| (400u16, e.0))?;
+        let pics = pics.map_err(|e| (if e.0 == "cancelled" { 499u16 } else { 400 }, e.0))?;
         let seconds = t0.elapsed().as_secs_f64();
         // the card's energy over the request (its counter's rise), watt-hours
         let wh = match (j0, self.tele.joules()) {

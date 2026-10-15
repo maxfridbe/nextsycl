@@ -13,8 +13,9 @@ const ITEM: &str = r#"{"type": "object", "description": "the request as checked:
 const JOB: &str = r#"{"type": "object", "description": "the queue item (every video.generate key) plus what starting it settled; anchors (first_frame ...) now name the files they resolved to",
   "properties": {"name": {"type": "string", "description": "the clip: h3_YYYYMMDD_HHMMSS; its file <name>.mp4 (GET /v1/video/files/<name>.mp4) once done"},
     "id": {"type": "string", "description": "the engine's job id"}, "started": {"type": "number", "description": "unix seconds"},
-    "label": {"type": "string"}, "project": {"type": "string"}, "seconds": {"type": "number"}, "engine": {"type": "string"},
-    "energy_wh": {"type": "number", "nullable": true}},
+    "label": {"type": "string"}, "project": {"type": "string"}, "seconds": {"type": "number"}, "frames": {"type": "integer"}, "engine": {"type": "string"},
+    "reentrant_id": {"type": "string", "nullable": true},
+    "energy_wh": {"type": "number", "nullable": true, "description": "while it runs: so far (updated with each status)"}},
   "additionalProperties": true}"#;
 
 const QUEUE_ITEM: &str = r#"{"type": "object", "properties": {"label": {"type": "string"}, "seconds": {"type": "number"}, "steps": {"type": "integer"},
@@ -47,6 +48,22 @@ fn sound() -> String {
   "nextsycl": {{"type": "object", "properties": {{"took": {{"type": "number"}}, "seconds": {{"type": "number"}}, "seed": {{"type": "integer"}}, "steps": {{"type": "integer"}},
     "cfg": {{"type": "number"}}, "wh": {{"type": "number", "nullable": true}}}}}}}}}}"#)
 }
+
+/// An image or audio job (jobs.rs): <kind>.status's answer, and generate's with wait: false
+const JOB_VIEW: &str = r#"{"type": "object", "required": ["id", "label", "state"], "properties": {
+  "id": {"type": "string"}, "kind": {"type": "string", "enum": ["image", "audio"]}, "method": {"type": "string"},
+  "label": {"type": "string", "description": "the request's label, else the id"}, "reentrant_id": {"type": "string", "nullable": true},
+  "state": {"type": "string", "enum": ["queued", "running", "done", "failed", "cancelled"], "description": "queued: waiting for its server (or its model loading); running: being made (progress)"},
+  "created": {"type": "number"}, "started": {"type": "number", "nullable": true}, "ended": {"type": "number", "nullable": true}, "seconds": {"type": "number", "description": "ended: started to ended"},
+  "progress": {"type": "object", "description": "running: the server's progress (step at / of, picture, phase, seconds)", "additionalProperties": true},
+  "result": {"type": "object", "description": "done: the answer generate gives with wait (data[].url ...)", "additionalProperties": true},
+  "error": {"type": "object", "properties": {"status": {"type": "integer"}, "code": {"type": "string"}, "message": {"type": "string"}}},
+  "restarted": {"type": "boolean", "description": "the front door restarted while it was unfinished: run again from the start"},
+  "reentered": {"type": "boolean", "description": "generate: its reentrant_id named this job, nothing new was started"}}}"#;
+
+/// <kind>.status without a label
+const JOB_LIST: &str = r#"{"type": "object", "properties": {"running": {"type": "array", "items": {"type": "object"}}, "queued": {"type": "array", "items": {"type": "object"}},
+  "recent": {"type": "array", "items": {"type": "object"}, "description": "the last 20 ended, newest first"}}, "description": "each item as <kind>.status {label} answers"}"#;
 
 /// A chat request as llm.requests lists it
 const CHAT_REQUEST: &str = r#"{"type": "object", "properties": {"id": {}, "model": {"type": "string"}, "state": {"type": "string"}, "via": {"type": "string"},
@@ -96,11 +113,33 @@ pub fn result(method: &str) -> Option<String> {
   "loading": {"type": "array", "items": {"type": "string"}, "description": "models loading"},
   "working": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string"}}}, "description": "picture and sound models answering a request"},
   "llm": {"type": "object", "properties": {"active": {"type": "integer", "description": "chat requests being answered"}}},
+  "jobs": {"type": "array", "description": "image and audio jobs not ended", "items": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string"}, "label": {"type": "string"}, "state": {"type": "string"}}}},
   "video": {"type": "object", "nullable": true, "description": "null: no video model enabled", "properties": {
     "running": {"type": "boolean"}, "label": {"type": "string", "nullable": true}, "name": {"type": "string", "nullable": true},
-    "stage": {"type": "string", "nullable": true}, "pct": {"type": "integer", "nullable": true}, "eta_s": {"type": "integer", "nullable": true},
+    "stage": {"type": "string", "nullable": true}, "pct": {"type": "integer", "nullable": true}, "eta_s": {"type": "integer", "nullable": true}, "elapsed_s": {"type": "integer", "nullable": true},
+    "gpu": {"type": "integer", "nullable": true, "description": "the card the clip is made on"}, "energy_wh": {"type": "number", "nullable": true, "description": "the clip's energy so far"},
     "queued": {"type": "integer"}, "runnable": {"type": "integer", "description": "queued and not held"}, "held": {"type": "integer"},
-    "accepts": {"type": "boolean", "description": "video.generate without queue: true starts at once"}}}}}"#.into(),
+    "accepts": {"type": "boolean", "description": "video.generate without queue: true starts at once"},
+    "slots": {"type": "integer", "description": "clips made at once: 1 (the studio makes one clip at a time, on whichever card is free)"}}},
+  "slots": {"type": "array", "description": "every place work runs: image and audio servers (two each: one per card), the video daemon's cards, the chat server", "items": {"type": "object", "properties": {
+    "kind": {"type": "string", "enum": ["image", "audio", "video", "llm"]}, "slot": {}, "port": {"type": "integer"}, "gpu": {"type": "integer", "nullable": true, "description": "its card (null: not running)"},
+    "gpus": {"type": "array", "items": {"type": "integer"}, "description": "llm: every card it spans"}, "model": {"type": "string", "nullable": true},
+    "up": {"type": "boolean", "description": "a server or engine holds a model there"}, "loading": {"type": "boolean"}, "busy": {"type": "boolean"}}}},
+  "cards": {"type": "array", "description": "each GPU and the work on it", "items": {"type": "object", "properties": {
+    "gpu": {"type": "integer"}, "name": {"type": "string"}, "vram_total_mb": {"type": "integer"}, "vram_used_mb": {"type": "integer"}, "busy_pct": {"type": "number"}, "power_w": {"type": "number"},
+    "models": {"type": "array", "items": {"type": "string"}, "description": "registered models whose processes hold memory there"}, "busy": {"type": "boolean"},
+    "work": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string"}, "model": {"type": "string", "nullable": true}}}}}}}}}"#.into(),
+        "system.version" => r#"{"type": "object", "properties": {"version": {"type": "string", "description": "the release (yy.mmdd.###)"}, "api": {"type": "integer", "description": "raised when an answer changes incompatibly"},
+  "kinds": {"type": "array", "items": {"type": "string"}, "description": "kinds with an enabled model"}, "features": {"type": "array", "items": {"type": "string"}, "description": "what this build does (names stay; new ones are added)"},
+  "methods": {"type": "array", "items": {"type": "string"}, "description": "the methods callable now"}}}"#.into(),
+        "system.files.stat" => r#"{"type": "object", "properties": {"name": {"type": "string"}, "bytes": {"type": "integer"}, "sha256": {"type": "string", "description": "hex, of the whole file"},
+  "mtime": {"type": "number"}, "url": {"type": "string", "description": "where to GET it (with the token)"}}}"#.into(),
+        "system.files.delete" => r#"{"type": "object", "properties": {"deleted": {"type": "array", "items": {"type": "string"}, "description": "the files removed (a clip: its mp4, record, last frame, latents, sound tail)"}}}"#.into(),
+        "image.canvases.list" => r#"{"type": "object", "properties": {"rule": {"type": "string"}, "canvases": {"type": "array", "items": {"type": "object", "properties": {
+  "size": {"type": "string", "description": "WxH, as image.generate's size takes it"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "aspect": {"type": "string"},
+  "mpx": {"type": "number"}, "note": {"type": "string"}, "default": {"type": "boolean"},
+  "seconds": {"type": "number", "nullable": true, "description": "measured: the mean time of a picture of this size made here (the pictures kept), per step"},
+  "made": {"type": "integer", "description": "pictures of this size it is measured on"}}}}}}"#.into(),
         m if m.ends_with(".describePromptGuideMD") => r#"{"type": "object", "properties": {"model": {"type": "string"}, "arch": {"type": "string"},
   "kind": {"type": "string"}, "markdown": {"type": "string", "description": "the model card's prompt guide: the form the model was trained on, with rules and an example"}}}"#.into(),
         "system.state" => format!(r#"{{"type": "object", "description": "the box, as the page shows it", "properties": {{"ts": {{"type": "number"}},
@@ -127,7 +166,11 @@ pub fn result(method: &str) -> Option<String> {
   "usage": {"type": "object", "properties": {"prompt_tokens": {"type": "integer"}, "completion_tokens": {"type": "integer"}, "total_tokens": {"type": "integer"}}}}, "additionalProperties": true}"#.into(),
         "llm.requests" => format!(r#"{{"type": "object", "properties": {{"active": {{"type": "array", "items": {CHAT_REQUEST}}}, "done": {{"type": "array", "description": "the last 10", "items": {CHAT_REQUEST}}}}}}}"#),
         "llm.models" => r#"{"type": "object", "properties": {"models": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "gpus": {"type": "array", "items": {"type": "integer"}}, "loaded": {"type": "boolean"}}}}}}"#.into(),
-        "image.generate" | "image.edit" => PICTURES.into(),
+        "image.generate" | "image.edit" => format!(r#"{{"oneOf": [{{"allOf": [{PICTURES}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the pictures, and the job"}},
+  {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (image.status {{label}} for the rest)"}}]}}"#),
+        "image.status" | "audio.status" => format!(r#"{{"oneOf": [{JOB_VIEW}, {JOB_LIST}]}}"#),
+        "image.cancel" | "audio.cancel" => r#"{"type": "object", "properties": {"cancelled": {"description": "label: how many jobs; none: whether anything was stopped"}, "stopped": {"type": "integer", "description": "requests stopped while running"},
+  "label": {"type": "string"}, "jobs": {"type": "array", "items": {"type": "string"}}}}"#.into(),
         "image.ocr" => r#"{"type": "object", "properties": {"created": {"type": "integer"}, "model": {"type": "string"}, "text": {"type": "string", "description": "the reading: Markdown, tables as HTML, LaTeX; pages after a <PAGE> mark each"},
   "prompt": {"type": "string", "description": "the instruction used"}, "pages": {"type": "integer"}, "tokens": {"type": "integer", "description": "tokens written"}, "prompt_tokens": {"type": "integer"},
   "prompt_seconds": {"type": "number"}, "read_tok_s": {"type": "number"}, "write_seconds": {"type": "number"}, "tok_s": {"type": "number"}, "seconds": {"type": "number"}, "wh": {"type": "number", "nullable": true}}}"#.into(),
@@ -145,16 +188,23 @@ pub fn result(method: &str) -> Option<String> {
   "width": {"type": "integer"}, "height": {"type": "integer"}, "loras": {"type": "array", "items": {"type": "string"}}, "seconds": {"type": "number"}, "wh": {"type": "number", "nullable": true},
   "text": {"type": "string"}, "pages": {"type": "integer"}, "created": {"type": "integer"}}}}}}"#.into(),
         "audio.history" => format!(r#"{{"type": "object", "properties": {{"data": {{"type": "array", "description": "newest first (200 at most); url server-relative (/v1/audio/files/<file>, the same route here)", "items": {SOUND_ITEM}}}}}}}"#),
-        "audio.generate" | "audio.speak" => sound(),
-        "audio.cancel" => r#"{"type": "object", "properties": {"cancelled": {"type": "boolean", "description": "false: nothing was being made"}}}"#.into(),
+        "audio.generate" | "audio.speak" => format!(r#"{{"oneOf": [{{"allOf": [{}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the sound, and the job"}},
+  {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (audio.status {{label}} for the rest)"}}]}}"#, sound()),
         "audio.voices.list" => format!(r#"{{"type": "object", "properties": {{"voices": {{"type": "array", "items": {VOICE}}}}}}}"#),
         "audio.voices.add" | "audio.voices.design" => format!(r#"{{"type": "object", "properties": {{"voice": {VOICE}, "sample": {{"type": "string", "description": "the sample's URL"}},
   "seed": {{"type": "integer", "description": "design: the seed it was read with"}}}}}}"#),
         "audio.voices.remove" => r#"{"type": "object", "properties": {"removed": {"type": "string"}}}"#.into(),
-        "video.generate" => format!(r#"{{"oneOf": [
+        "video.generate" => {
+            let common = r#""frames": {"type": "integer", "description": "the clip's frames as made (17k + 5)"}, "seconds": {"type": "number", "description": "frames / 24"},
+    "ignored": {"type": "array", "items": {"type": "string"}, "description": "keys given that the box does nothing with (negative_prompt, cfg, unknown chain keys)"},
+    "reentered": {"type": "boolean", "description": "its reentrant_id named a clip already queued, running or made: that one is answered, nothing new started"},
+    "state": {"type": "string", "enum": ["queued", "held", "running", "done"], "description": "reentered: where that clip is"}"#;
+            format!(r#"{{"oneOf": [
   {{"type": "object", "description": "queued", "properties": {{"queued": {{"type": "boolean", "enum": [true]}}, "position": {{"type": "integer", "description": "1: made next"}},
-    "label": {{"type": "string"}}, "project": {{"type": "string"}}, "batch": {{"type": "string"}}, "held": {{"type": "boolean"}}}}}},
-  {{"type": "object", "description": "started", "properties": {{"queued": {{"type": "boolean", "enum": [false]}}, "job": {JOB}}}}}]}}"#),
+    "label": {{"type": "string"}}, "project": {{"type": "string"}}, "batch": {{"type": "string"}}, "held": {{"type": "boolean"}}, {common}}}}},
+  {{"type": "object", "description": "started (or reentered: running, or done with name and file)", "properties": {{"queued": {{"type": "boolean", "enum": [false]}}, "job": {JOB},
+    "name": {{"type": "string", "description": "reentered, done: the clip"}}, "file": {{"type": "string", "description": "reentered, done: its URL"}}, {common}}}}}]}}"#)
+        }
         "video.status" => status(),
         "video.wait" => status().replacen(r#""required": ["idle","#, r#""required": ["changed", "idle","#, 1)
             .replacen(r#""properties": {"idle""#, r#""properties": {"changed": {"type": "boolean", "description": "false: the timeout passed"}, "idle""#, 1),
@@ -185,7 +235,9 @@ pub fn result(method: &str) -> Option<String> {
         "video.upload" => r#"{"type": "object", "properties": {"name": {"type": "string", "description": "the file's name in the clips directory (ref_<unix>_<name>): what first_frame, ref_images ... take"}}}"#.into(),
         "video.engines.list" => r#"{"type": "object", "properties": {"engines": {"type": "array", "items": {"type": "object", "properties": {
   "quant": {"type": "string", "description": "the name video.generate's engine takes"}, "file": {"type": "string"}, "path": {"type": "string"},
-  "gib": {"type": "number"}, "ready": {"type": "boolean"}, "default": {"type": "boolean"}}}}}}"#.into(),
+  "gib": {"type": "number"}, "ready": {"type": "boolean"}, "default": {"type": "boolean"},
+  "inputs": {"type": "object", "description": "the video.generate keys it reads and the ones it does not", "properties": {"takes": {"type": "array", "items": {"type": "string"}},
+    "not": {"type": "array", "items": {"type": "string"}}, "chosen": {"type": "string", "description": "when it is used"}}}}}}}}"#.into(),
         "video.canvases.list" => r#"{"type": "object", "properties": {"canvases": {"type": "array", "items": {"type": "object", "properties": {
   "width": {"type": "integer"}, "height": {"type": "integer"}, "aspect": {"type": "string"}, "note": {"type": "string"}, "mpx": {"type": "number"},
   "cost": {"type": "number", "description": "time relative to 640 x 480"}, "default": {"type": "boolean"}}}}}}"#.into(),
@@ -203,7 +255,7 @@ pub fn result(method: &str) -> Option<String> {
 /// (status, code, when)
 pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
     match method {
-        "video.generate" => &[(400, "invalid_params", "a value outside its limits (the message names it), an unknown engine or sampler, more references than allowed, references with a ControlNet"),
+        "video.generate" => &[(400, "invalid_params", "a value outside its limits (the message names it), frames not 17k + 5 (the message names the nearest), an unknown engine or sampler, more references than allowed, references with a ControlNet, a bad chain"),
                               (404, "not_found", "a file named (first_frame, ref_images, control_video ...) is not in the clips directory"),
                               (409, "busy", "a clip is being made or a runnable one waits, and queue is not true")],
         "video.cancel" => &[(404, "not_found", "label: no running or queued clip with it"), (409, "not_running", "no label and no clip is being made")],
@@ -214,10 +266,16 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
         "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.voices.design" =>
             &[(400, "invalid_params", "the server refused a value (a size, a sampler, too many pictures or pages, an unknown voice ...)"),
               (404, "not_found", "no such model"), (409, "conflict", "the model is disabled, or none that can do it is enabled"),
-              (499, "cancelled", "audio: stopped by audio.cancel"), (502, "unavailable", "the kind's server did not start or answer")],
+              (499, "cancelled", "stopped by <kind>.cancel"), (502, "unavailable", "the kind's server did not start or answer"),
+              (504, "timeout", "wait: still running after an hour (the job goes on: <kind>.status {label})")],
         "llm.chat" => &[(400, "invalid_params", "the chat server refused the request"), (502, "unavailable", "the chat server does not answer")],
         "audio.voices.add" => &[(400, "invalid_params", "a bad name, a recording shorter than 3 s or not decodable")],
         "audio.voices.remove" => &[(404, "not_found", "no saved voice of that name")],
+        "image.status" | "audio.status" => &[(404, "not_found", "no job by that label or reentrant_id")],
+        "image.cancel" | "audio.cancel" => &[(404, "not_found", "label: no queued or running job with it")],
+        "system.files.stat" => &[(400, "invalid_params", "kind is not image, audio or video, or name is not a plain file name"), (404, "not_found", "no such file")],
+        "system.files.delete" => &[(400, "invalid_params", "kind, or a name that is not a clip, upload, picture or sound"), (404, "not_found", "no such file"),
+                                   (409, "busy", "video: the clip is being made (video.cancel first)")],
         _ => &[],
     }
 }
@@ -226,12 +284,16 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
 pub const CODES: &str = "Error codes (error.code, with the HTTP status): invalid_request 400 (the body is not a JSON object), invalid_params 400, \
 unauthorized 401, not_found 404 (also an unknown method), conflict 409 (a model disabled, none of the kind enabled, a name taken), \
 busy 409 (video.generate while a clip is made, without queue: true), not_running 409 (video.cancel with nothing running), \
-cancelled 499 (audio.cancel stopped it), unavailable 502/503 (the kind's server does not answer), timeout 504, internal 500.";
+cancelled 499 (image.cancel / audio.cancel stopped it), unavailable 502/503 (the kind's server does not answer), timeout 504, internal 500.";
 
 /// The label convention the video methods share
 pub const LABELS: &str = "Video labels: \"<series> NN/MM: text\" (\"Harbour 03/12: the lamp\"). NN orders video.timeline (the edit order); \
 the series (the text before NN) is where the anchors prev / prev_cam / first / first_cam look, and the project when the request names none. \
-video.cancel, video.queue.move and video.queue.remove name clips by label.";
+video.cancel, video.queue.move and video.queue.remove name clips by label.\n\n\
+Jobs: image.generate, image.edit, audio.generate and audio.speak run as jobs here - the call can drop and the job goes on; \
+label one (else its id is its label), read it with <kind>.status {label}, stop it with <kind>.cancel {label}; wait: false answers at once. \
+reentrant_id (every generate, video's too): a submit naming the id of a job queued, running or done gets that job back, nothing new is started \
+(a failed or cancelled one is made again).";
 
 #[cfg(test)]
 mod tests {

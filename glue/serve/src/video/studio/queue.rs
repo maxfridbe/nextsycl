@@ -107,6 +107,92 @@ pub fn check_canvas(w: i64, h: i64) -> Result<(), RpcError> {
     Ok(())
 }
 
+/// Frame counts the model makes: 17k + 5, from 22 (0.92 s) to 362 (15.08 s) at 24 fps
+pub const FRAMES: (u64, u64) = (22, 362);
+
+/// `frames`: one the model makes, else the error naming the nearest ones
+pub fn check_frames(f: u64) -> Result<u64, RpcError> {
+    if f % 17 == 5 && (FRAMES.0..=FRAMES.1).contains(&f) {
+        return Ok(f);
+    }
+    let down = (FRAMES.0..=f.min(FRAMES.1)).rev().find(|n| n % 17 == 5);
+    let up = (f.max(FRAMES.0)..=FRAMES.1).find(|n| n % 17 == 5);
+    let near: Vec<String> = down.into_iter().chain(up).collect::<BTreeSet<_>>().into_iter().map(|n| n.to_string()).collect();
+    Err(RpcError::param(&format!("frames {f}: the model makes 17k + 5 frames ({}-{}); nearest: {}", FRAMES.0, FRAMES.1, near.join(" or "))))
+}
+
+/// The keys a chain object stands for. `chain: {from, context_frames, sound, still, mode, color_reanchor}`:
+/// - context_frames N (17k + 5): the last N frames of `from` as one moving keyframe at frame 0 (guide_clip) - the
+///   clip replays them, so a join trims N / 2 each side; with `sound` (default true) the sound's last N / 24 s too
+///   (first_audio, first_audio_s)
+/// - still (default: when context_frames is 0): `from`'s last frame as the first frame (first_frame, chain_mode `mode`)
+/// - color_reanchor: an anchor or picture whose brightness the carried pictures are scaled to (exposure_ref)
+///
+/// Keys given flat as well win. pin_renorm and keys the box does not have are listed back as ignored.
+pub fn unchain(p: &Value) -> Result<(Value, Vec<String>), RpcError> {
+    let mut out = p.clone();
+    let mut ignored = Vec::new();
+    let Some(c) = p.get("chain").filter(|c| !c.is_null()) else { return Ok((out, ignored)) };
+    let c = c.as_object().ok_or_else(|| RpcError::param("chain: an object {from, context_frames, sound, still, mode, color_reanchor}"))?;
+    let from = c.get("from").and_then(|v| v.as_str()).unwrap_or("prev").to_string();
+    let n = c.get("context_frames").map_or(Ok(0), |v| v.as_u64().ok_or_else(|| RpcError::param("chain.context_frames: a whole number")))?;
+    if n > 0 && (n % 17 != 5 || n > FRAMES.1) {
+        let near = check_frames(n).err().map(|e| e.message).unwrap_or_default();
+        return Err(RpcError::param(&format!("chain.context_frames {n}: 5, 22, 39 ... (17k + 5) - {}", near.rsplit("; ").next().unwrap_or(""))));
+    }
+    let set = |out: &mut Value, k: &str, v: Value| {
+        if out.get(k).is_none_or(|x| x.is_null()) {
+            out[k] = v;
+        }
+    };
+    if n > 0 {
+        set(&mut out, "guide_clip", json!(format!("{from}:{n}:0")));
+        if c.get("sound").and_then(|v| v.as_bool()) != Some(false) {
+            set(&mut out, "first_audio", json!(from));
+            set(&mut out, "first_audio_s", json!(n as f64 / 24.0));
+        }
+    }
+    if c.get("still").and_then(|v| v.as_bool()).unwrap_or(n == 0) {
+        set(&mut out, "first_frame", json!(from));
+        if let Some(m) = c.get("mode") {
+            set(&mut out, "chain_mode", m.clone());
+        }
+    }
+    if let Some(r) = c.get("color_reanchor").filter(|v| !v.is_null()) {
+        let r = match r {
+            Value::Bool(true) => json!(from),
+            Value::Bool(false) => Value::Null,
+            v => v.clone(),
+        };
+        set(&mut out, "exposure_ref", r);
+    }
+    for k in c.keys().filter(|k| !["from", "context_frames", "sound", "still", "mode", "color_reanchor"].contains(&k.as_str())) {
+        ignored.push(format!("chain.{k}"));
+    }
+    if let Some(o) = out.as_object_mut() {
+        o.remove("chain");
+    }
+    Ok((out, ignored))
+}
+
+/// Request keys the box takes and does nothing with: H3 runs at cfg 1 (one pass, no unconditional branch), so
+/// there is nothing for a negative prompt to steer
+pub const IGNORED: [&str; 2] = ["negative_prompt", "cfg"];
+
+/// What each denoiser takes (engines.list): the text/image-to-video ones and Ref2VA
+pub fn inputs_of(quant: &str) -> Value {
+    let common = ["prompt", "seconds", "frames", "steps", "seed", "width", "height", "te", "first_frame", "last_frame", "exposure_ref", "guide_clip",
+                  "first_audio", "first_audio_s", "ref_audios", "loras", "upscale", "upscaler", "shift_video", "shift_audio", "sampler", "schedule", "chain", "source", "regen", "regen_box"];
+    if quant == "REF2VA" {
+        json!({"takes": common.iter().chain(["ref_images", "ref_videos", "ref_image_size", "ref_video_sound", "te_pictures"].iter()).collect::<Vec<_>>(),
+               "not": ["control_video", "control_mask", "control_source", "control_strength", "control_start", "control_end"],
+               "chosen": "by itself when ref_images or ref_videos are given"})
+    } else {
+        json!({"takes": common.iter().chain(["control_video", "control_mask", "control_source", "control_strength", "control_start", "control_end"].iter()).collect::<Vec<_>>(),
+               "not": ["ref_images", "ref_videos"], "chosen": if quant == "INT8" { "by default" } else { "by engine" }})
+    }
+}
+
 /// A number parameter: the default when absent, rejected (not clamped) outside [lo, hi].
 pub fn num(p: &Value, key: &str, default: f64, lo: f64, hi: f64, int: bool) -> Result<Value, RpcError> {
     let v = match p.get(key) {
@@ -229,7 +315,20 @@ impl Studio {
         it.insert("prompt".into(), json!(prompt));
         it.insert("sampler".into(), sampler);
         it.insert("schedule".into(), schedule);
-        it.insert("seconds".into(), num(p, "seconds", 10.0, 1.0, 15.1, false)?);
+        // frames, when given, set the length exactly (seconds = frames / 24); else seconds snapped up to the grid
+        match p.get("frames").filter(|v| !v.is_null()) {
+            Some(f) => {
+                let f = check_frames(f.as_u64().ok_or_else(|| RpcError::param("frames: a whole number"))?)?;
+                it.insert("seconds".into(), json!(f as f64 / 24.0));
+                it.insert("frames".into(), json!(f));
+            }
+            None => {
+                let sec = num(p, "seconds", 10.0, 1.0, 15.1, false)?;
+                it.insert("frames".into(), json!(super::runner::frames_of(sec.as_f64().unwrap_or(10.0))));
+                it.insert("seconds".into(), sec);
+            }
+        }
+        it.insert("reentrant_id".into(), reentrant(p).map_or(Value::Null, |r| json!(r)));
         it.insert("steps".into(), num(p, "steps", 10.0, 1.0, 40.0, true)?);
         it.insert("seed".into(), num(p, "seed", 0.0, -2147483648.0, 2147483648.0, true)?);
         it.insert("te".into(), json!(te));
@@ -315,6 +414,11 @@ impl Studio {
         it.insert("ref_image_size".into(), ris.map_or(Value::Null, |v| json!(v)));
         Ok(Value::Object(it))
     }
+}
+
+/// A request's reentrant_id (reentrantid is read too)
+pub fn reentrant(p: &Value) -> Option<String> {
+    ["reentrant_id", "reentrantid"].iter().find_map(|k| p.get(*k).and_then(|v| v.as_str())).map(str::trim).filter(|r| !r.is_empty()).map(|r| r.chars().take(200).collect())
 }
 
 pub fn basename(p: &str) -> String {
@@ -404,6 +508,26 @@ mod tests {
         assert_eq!(project_of(&json!({"label": "x", "project": "P"})), "P");
         assert_eq!(dialogue_of("says: <d>[English] First   batch.</d> then <d>[English] More.</d>"), "First batch. / More.");
         assert_eq!(clean_label("a<b>c 01/02: ok"), "abc 01/02: ok");
+    }
+
+    #[test]
+    fn frames_and_chains() {
+        assert_eq!(check_frames(107).unwrap(), 107);
+        let e = check_frames(97).unwrap_err().message;
+        assert!(e.contains("90 or 107"), "{e}");
+        assert!(check_frames(400).unwrap_err().message.contains("nearest: 362"));
+        assert!(check_frames(10).unwrap_err().message.contains("nearest: 22"));
+        let (p, ig) = unchain(&json!({"prompt": "x", "chain": {"from": "prev", "context_frames": 22, "color_reanchor": "first", "pin_renorm": true}})).unwrap();
+        assert_eq!(p["guide_clip"], "prev:22:0");
+        assert_eq!(p["first_audio"], "prev");
+        assert!((p["first_audio_s"].as_f64().unwrap() - 22.0 / 24.0).abs() < 1e-9);
+        assert!(p["first_frame"].is_null() && p.get("chain").is_none());
+        assert_eq!(p["exposure_ref"], "first");
+        assert_eq!(ig, vec!["chain.pin_renorm".to_string()]);
+        let (p, _) = unchain(&json!({"chain": {"mode": "png"}, "first_frame": "a.png"})).unwrap();
+        assert_eq!(p["first_frame"], "a.png"); // the flat key wins
+        assert_eq!(p["chain_mode"], "png");
+        assert!(unchain(&json!({"chain": {"context_frames": 30}})).is_err());
     }
 
     #[test]

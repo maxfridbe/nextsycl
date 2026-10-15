@@ -257,6 +257,7 @@ fn gen_or_edit(cfg: &Config, args: &[String], editing: bool) -> Result<(), Strin
             last = s.seconds;
             eprintln!("prompt encoded in {:.1} s", s.seconds);
         }
+        Ok(())
     }).map_err(|e| e.0)?;
     eprintln!();
     let id = m["id"].as_str().unwrap_or("image");

@@ -388,7 +388,7 @@ impl ImageEngine for QwenImage21 {
             (None, None) => self.defaults().steps,
         }
     }
-    fn generate(&self, req: &ImageRequest, progress: &mut dyn FnMut(Step)) -> Result<Vec<Picture>> {
+    fn generate(&self, req: &ImageRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Vec<Picture>> {
         let d = self.defaults();
         let t0 = Instant::now();
         // an edit: the picture and its references (the pipeline's condition images, in order); the output takes the
@@ -467,7 +467,7 @@ impl ImageEngine for QwenImage21 {
                 raw(&format!("cond{i}.f32"), &b.to_f32()?);
             }
         }
-        progress(Step { picture: 0, at: 0, of: steps as u32, seconds: t0.elapsed().as_secs_f64() });
+        progress(Step { picture: 0, at: 0, of: steps as u32, seconds: t0.elapsed().as_secs_f64() })?;
         let mut out = Vec::new();
         for p in 0..req.n.max(1) {
             let nz = noise(req.seed + p as u64, hw.0 * hw.1 * dit::LATENT);
@@ -480,14 +480,12 @@ impl ImageEngine for QwenImage21 {
                 // the model's own path: Euler on the GPU
                 let lat = DevBuf::from_f32(&self.nsd.gpu, &nz)?;
                 self.denoise_cfg(&embeds, tokens, &pads, neg, &conds, &lat, hw, &sig, &mut |i, _| {
-                    progress(Step { picture: p, at: i as u32 + 1, of, seconds: t0.elapsed().as_secs_f64() });
-                    Ok(())
+                    progress(Step { picture: p, at: i as u32 + 1, of, seconds: t0.elapsed().as_secs_f64() })
                 })?;
                 lat
             } else {
                 let out = self.denoise_sampled(&embeds, tokens, &pads, neg, &conds, nz, hw, &sig, sampler, req.seed + p as u64, &mut |i| {
-                    progress(Step { picture: p, at: i as u32 + 1, of, seconds: t0.elapsed().as_secs_f64() });
-                    Ok(())
+                    progress(Step { picture: p, at: i as u32 + 1, of, seconds: t0.elapsed().as_secs_f64() })
                 })?;
                 DevBuf::from_f32(&self.nsd.gpu, &out)?
             };

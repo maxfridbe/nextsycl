@@ -84,9 +84,9 @@ impl ImageEngine for Example {
     /// The pipeline. For each of `req.n` pictures (seed + i): the text encoded (report step 0), the noise drawn, the
     /// sampler stepped over `sigmas(schedule, steps, shift)` with the denoiser (report each step), the latents
     /// decoded to a `Picture` (`req.rgba`: keep alpha).
-    fn generate(&self, req: &ImageRequest, progress: &mut dyn FnMut(Step)) -> Result<Vec<Picture>> {
+    fn generate(&self, req: &ImageRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Vec<Picture>> {
         let d = self.defaults();
-        progress(Step { picture: 0, at: 0, of: req.steps.unwrap_or(d.steps), seconds: 0.0 });
+        progress(Step { picture: 0, at: 0, of: req.steps.unwrap_or(d.steps), seconds: 0.0 })?;
         Err(not_ported("generate"))
     }
 }

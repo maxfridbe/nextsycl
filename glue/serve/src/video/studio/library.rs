@@ -333,10 +333,15 @@ impl Studio {
             })
             .collect();
         if listed.is_empty() {
-            return vec![json!({"quant": "INT8", "file": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "path": "", "gib": 19.53, "ready": true, "default": true})];
+            return vec![json!({"quant": "INT8", "file": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "path": "", "gib": 19.53, "ready": true, "default": true,
+                               "inputs": super::queue::inputs_of("INT8")})];
         }
         let mut v = listed;
         v.sort_by(|a, b| a["gib"].as_f64().unwrap_or(0.0).total_cmp(&b["gib"].as_f64().unwrap_or(0.0)));
+        // what each takes (video.generate's keys)
+        for e in v.iter_mut() {
+            e["inputs"] = super::queue::inputs_of(e["quant"].as_str().unwrap_or(""));
+        }
         v
     }
 

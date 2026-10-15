@@ -180,8 +180,8 @@ pub trait ImageEngine: Send + Sync {
     }
     /// seconds the load took
     fn load_seconds(&self) -> f64;
-    /// make the request's pictures, reporting each step
-    fn generate(&self, req: &ImageRequest, progress: &mut dyn FnMut(Step)) -> Result<Vec<Picture>>;
+    /// make the request's pictures, reporting each step (an error from `progress` stops it there: a cancel)
+    fn generate(&self, req: &ImageRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Vec<Picture>>;
     /// lines for `status`: its GPUs, memory, what is loaded where
     fn report(&self) -> Vec<String> {
         Vec::new()

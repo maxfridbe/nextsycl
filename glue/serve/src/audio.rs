@@ -23,7 +23,7 @@
 use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -48,7 +48,7 @@ pub struct AudioServer {
     engine: Mutex<Box<dyn AudioEngine>>,
     progress: Mutex<Value>,
     waiting: AtomicUsize,
-    cancel: AtomicBool,
+    cancel: crate::cancel::Cancel,
     history: Mutex<VecDeque<Value>>,
     /// ends the process after an idle stretch (`--idle-exit`; none: never)
     pub idle: Option<&'static crate::idle::Idle>,
@@ -125,7 +125,7 @@ impl AudioServer {
         let tele = Telemetry::start(std::slice::from_ref(&gpu.pci));
         let history = Mutex::new(out_dir.as_deref().map(earlier).unwrap_or_default());
         Ok(AudioServer { model, out_dir, wfe, cors, gpu, tele, engine: Mutex::new(engine), progress: Mutex::new(json!({"busy": false})),
-                         idle: None, waiting: AtomicUsize::new(0), cancel: AtomicBool::new(false), history })
+                         idle: None, waiting: AtomicUsize::new(0), cancel: Default::default(), history })
     }
 
     /// Answers on `addr` until the process ends
@@ -174,15 +174,23 @@ impl AudioServer {
             ("GET", "/api/progress") => {
                 let mut p = self.progress.lock().unwrap().clone();
                 p["waiting"] = json!(self.waiting.load(Ordering::Relaxed));
+                p["request_id"] = json!(self.cancel.current());
                 http::respond_with(&mut s, 200, &p, &cors)
             }
-            ("GET", "/api/history") => http::respond_with(&mut s, 200, &json!({"data": self.history.lock().unwrap().iter().collect::<Vec<_>>()}), &cors),
-            ("POST", "/api/cancel") => {
-                let busy = self.progress.lock().unwrap()["busy"] == true;
-                if busy {
-                    self.cancel.store(true, Ordering::Relaxed);
+            ("GET", "/api/history") => {
+                // files deleted since (system.files.delete) drop out
+                let mut h = self.history.lock().unwrap();
+                if let Some(d) = &self.out_dir {
+                    h.retain(|e| e["url"].as_str().and_then(|u| u.rsplit('/').next()).is_none_or(|f| d.join(f).exists()));
                 }
-                http::respond_with(&mut s, 200, &json!({"cancelled": busy}), &cors)
+                http::respond_with(&mut s, 200, &json!({"data": h.iter().collect::<Vec<_>>()}), &cors)
+            }
+            ("POST", "/api/cancel") => {
+                // {"id"}: that request only (the front door's job), running or waiting; none: the one running
+                let busy = self.progress.lock().unwrap()["busy"] == true;
+                let id = serde_json::from_slice::<Value>(&req.body).ok().and_then(|v| v["id"].as_str().map(str::to_string));
+                let running = self.cancel.request(id.as_deref(), busy);
+                http::respond_with(&mut s, 200, &json!({"cancelled": running, "id": id}), &cors)
             }
             ("GET", p) if p.starts_with("/v1/audio/files/") => self.file(&mut s, &p["/v1/audio/files/".len()..], &req.head, &cors),
             ("GET", "/api/voices") => http::respond_with(&mut s, 200, &json!({"data": self.voices().map(|l| l.list()).unwrap_or_default()}), &cors),
@@ -357,6 +365,9 @@ impl AudioServer {
         self.waiting.fetch_add(1, Ordering::Relaxed);
         let engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
         self.waiting.fetch_sub(1, Ordering::Relaxed);
+        let Some(_running) = self.cancel.begin(b["request_id"].as_str()) else {
+            return Err((499, "cancelled".into()));
+        };
         let speech = engine.speech().is_some();
         // speech: input is the text to say, instructions its style or voice; a song: input the lyrics, instructions
         // the music
@@ -409,13 +420,12 @@ impl AudioServer {
         let (steps, cfg) = (req.steps.unwrap_or(d.steps), req.cfg.unwrap_or(d.cfg));
         let t0 = Instant::now();
         let j0 = self.tele.joules();
-        self.cancel.store(false, Ordering::Relaxed);
         let p = &self.progress;
         let want = req.seconds.unwrap_or(d.seconds);
         *p.lock().unwrap() = json!({"busy": true, "prompt": prompt, "phase": "prompt", "at": 0, "of": 1, "seconds": 0, "want": want});
         let out = engine.generate(&req, &mut |st| {
             *p.lock().unwrap() = json!({"busy": true, "prompt": prompt, "phase": st.phase, "at": st.at, "of": st.of, "seconds": st.seconds, "want": want});
-            if self.cancel.load(Ordering::Relaxed) {
+            if self.cancel.stopping() {
                 return Err(nextsycl_core::Error("cancelled".into()));
             }
             Ok(())

@@ -20,6 +20,7 @@
 
 mod api;
 mod config;
+mod jobs;
 mod life;
 mod spec;
 pub mod registry;
@@ -91,6 +92,8 @@ pub struct Home {
     seen: Mutex<BTreeMap<String, BTreeMap<usize, u64>>>,
     /// the requests sent on to each image and audio server and not answered yet, by its port
     pub(crate) inflight: Mutex<BTreeMap<u16, usize>>,
+    /// image and audio requests as jobs (jobs.json beside serve.json)
+    jobs: jobs::Jobs,
 }
 
 pub(crate) fn now() -> f64 {
@@ -169,14 +172,16 @@ impl Home {
         let seen = st["seen"].as_object().map(|m| m.iter().map(|(id, g)| {
             (id.clone(), g.as_object().map(|g| g.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).collect()).unwrap_or_default())
         }).collect()).unwrap_or_default();
+        let jobs = jobs::Jobs::load(state_file.with_file_name("jobs.json"));
         let h = Arc::new(Home {
-            o, token, state_file,
+            o, token, state_file, jobs,
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()),
         });
         let me = h.clone();
         std::thread::spawn(move || me.sample_cards());
+        h.resume_jobs();
         // the video daemon as the enabled video models say (it is this page's to start and stop)
         let me = h.clone();
         std::thread::spawn(move || {
@@ -272,13 +277,13 @@ impl Home {
             ("GET", p) if p.starts_with("/open/") => self.open(&mut s, &req, &p["/open/".len()..]),
             ("GET", "/health") => http::respond(&mut s, 200, &json!({"status": "ok"})),
             ("GET", "/openapi.yml") | ("GET", "/openapi.yaml") => {
-                let spec = self.openapi(&req);
+                let spec = self.openapi(&req, false);
                 http::respond_bytes(&mut s, 200, "application/yaml; charset=utf-8", yaml::to_yaml(&spec).as_bytes(), "Cache-Control: no-cache\r\n")
             }
-            ("GET", "/openapi.json") => http::respond(&mut s, 200, &self.openapi(&req)),
+            ("GET", "/openapi.json") => http::respond(&mut s, 200, &self.openapi(&req, false)),
             ("GET", "/api/state") => http::respond(&mut s, 200, &self.state()),
             ("GET", "/api/config") => http::respond(&mut s, 200, &self.config()),
-            ("GET", "/api/spec") => http::respond(&mut s, 200, &json!({"token": self.token, "spec": self.openapi(&req)})),
+            ("GET", "/api/spec") => http::respond(&mut s, 200, &json!({"token": self.token, "spec": self.openapi(&req, true)})),
             ("GET", p) if p.starts_with("/api/runs/") => {
                 let id: u64 = p["/api/runs/".len()..].parse().unwrap_or(0);
                 match self.run_json(id, 64 * 1024) {
