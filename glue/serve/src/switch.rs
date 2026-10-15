@@ -10,6 +10,11 @@
 //! registry: `tools: false` drops a request's tool definitions, `tasks: false` declines Open WebUI's background
 //! tasks ("### Task:" prompts). The log carries sizes only, never content.
 //!
+//! A request may carry `X-Keep-Up-S: <seconds>` (Open WebUI's connection sends it; empty or not a number: 300): the
+//! model is kept that long after the request ends - the front door does not stop it to make room for pictures,
+//! sound or clips meanwhile (`GET /keep` says which models are kept and for how long). A request without the header
+//! keeps nothing: once it is answered, the model may be preempted.
+//!
 //! With `idle`, the loaded model is unloaded (the studio's llm.mode "none") once nothing has asked for it that long
 //! and it is not answering; the next request loads it again.
 //!
@@ -55,6 +60,16 @@ pub struct Switch {
     pub idle: Option<Duration>,
     swap: Mutex<()>,
     last_use: Mutex<HashMap<String, Instant>>,
+    /// model id -> kept until (X-Keep-Up-S)
+    keep: Mutex<HashMap<String, Instant>>,
+}
+
+/// The default of an X-Keep-Up-S header that gives no number
+pub const KEEP_UP_S: u64 = 300;
+
+/// A request's X-Keep-Up-S: none (the header absent), else its seconds (a day at most; not a number: KEEP_UP_S)
+pub fn keep_up_s(head: &[u8]) -> Option<u64> {
+    http::header(head, "x-keep-up-s").map(|v| v.trim().parse::<f64>().ok().filter(|x| *x >= 0.0).map_or(KEEP_UP_S, |x| (x as u64).min(86400)))
 }
 
 /// Python's truth for a JSON value the studio sends (null, false, "" and 0 are false)
@@ -70,7 +85,7 @@ impl Switch {
     pub fn new(models: Models, aliases: HashMap<String, String>, upstream: Target, studio_url: &str, wait: Duration, in_use: Duration)
                -> Result<Switch, String> {
         let (host, path) = http::split_url(studio_url)?;
-        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, images: None, idle: None, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()) })
+        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, images: None, idle: None, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()), keep: Mutex::new(HashMap::new()) })
     }
 
     pub fn run(self: Arc<Self>, addr: &str) -> Result<(), String> {
@@ -205,6 +220,12 @@ impl Switch {
             }
             return http::respond(&mut s, 200, &json!({"object": "list", "data": data}));
         }
+        if req.method == "GET" && req.path == "/keep" {
+            let kept: serde_json::Map<String, Value> = self.keep.lock().unwrap().iter()
+                .filter_map(|(m, until)| until.checked_duration_since(Instant::now()).map(|d| (m.clone(), json!(d.as_secs_f64().round()))))
+                .collect();
+            return http::respond(&mut s, 200, &json!({"kept": kept}));
+        }
         if req.method != "POST" {
             if let Err(e) = http::forward(&mut s, &self.upstream, &req) {
                 http::respond(&mut s, 502, &json!({"error": {"message": format!("the model server is not answering: {e}")}}));
@@ -263,6 +284,25 @@ impl Switch {
         }
         if let Some(m) = &model {
             self.last_use.lock().unwrap().insert(m.id.clone(), Instant::now());
+            // kept from the end of the answer
+            if let Some(k) = keep_up_s(&req.head) {
+                self.keep.lock().unwrap().insert(m.id.clone(), Instant::now() + Duration::from_secs(k));
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_keep_header_says_how_long() {
+        let h = |v: &str| format!("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n{v}\r\n").into_bytes();
+        assert_eq!(keep_up_s(&h("")), None);
+        assert_eq!(keep_up_s(&h("X-Keep-Up-S: 120\r\n")), Some(120));
+        assert_eq!(keep_up_s(&h("x-keep-up-s: \r\n")), Some(KEEP_UP_S));
+        assert_eq!(keep_up_s(&h("X-Keep-Up-S: soon\r\n")), Some(KEEP_UP_S));
+        assert_eq!(keep_up_s(&h("X-Keep-Up-S: 999999\r\n")), Some(86400));
     }
 }

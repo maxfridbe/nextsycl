@@ -81,7 +81,8 @@ pub const METHODS: &[Method] = &[
 
     Method { kind: "llm", name: "chat", summary: "A chat completion (OpenAI's body; stream is ignored - use /v1/chat/completions to stream)",
              fields: &[("model", "string", "a chat model's id", true), ("messages", "object[]", "[{role, content}]", true),
-                       ("max_tokens", "integer", "", false), ("temperature", "number", "", false), ("tools", "object[]", "OpenAI tool definitions", false)],
+                       ("max_tokens", "integer", "", false), ("temperature", "number", "", false), ("tools", "object[]", "OpenAI tool definitions", false),
+                       ("keep_up_s", r#"{"type": "number", "minimum": 0, "maximum": 86400}"#, "keep the model loaded this long after the answer: picture, sound and video work does not stop it for room meanwhile (as /v1/chat/completions' X-Keep-Up-S header, which Open WebUI sends: 300). Absent: nothing kept - once idle the model may be stopped for other work", false)],
              example: r#"{"model": "qwen3.8-flash-next-iq2_xs", "messages": [{"role": "user", "content": "Say hello in five words."}], "max_tokens": 200}"# },
     Method { kind: "llm", name: "requests", summary: "The chat requests running and the last ones that ended, with their speeds as the server reports them live: prompt tokens (reused from the cache), read seconds, tokens generated, tok/s",
              fields: &[], example: "{}" },
@@ -306,7 +307,7 @@ const FEATURES: &[&str] = &[
     "errors.retryable", "errors.no_room", "jobs.precheck", "image.info.steps", "image.generate.init_image", "image.edit.reference",
     "video.failure", "video.gpu", "video.engines.ignored", "audio.speak.precheck.voice", "jobs.cancel.reentrant_id", "rpc.errors.body",
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
-    "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room",
+    "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -740,7 +741,16 @@ impl Home {
                 let t = self.chat_target(b["model"].as_str())?;
                 let mut body = b.clone();
                 body["stream"] = json!(false);
-                relay(&t, "POST", "/v1/chat/completions", Some(&body), 1800)
+                let keep = body.as_object_mut().and_then(|o| o.remove("keep_up_s"));
+                let r = relay(&t, "POST", "/v1/chat/completions", Some(&body), 1800);
+                // kept from the end of the answer (the model that answered)
+                if let Some(k) = keep.filter(|k| !k.is_null()) {
+                    let secs = k.as_f64().filter(|x| *x >= 0.0).map_or(crate::switch::KEEP_UP_S, |x| (x as u64).min(86400));
+                    if let Some(id) = self.chat_loaded(&self.models()) {
+                        self.keep_chat(&id, secs);
+                    }
+                }
+                r
             }
             ("llm", "requests") => {
                 // the chat server's control socket (its /server routes are not on its port)
@@ -1098,7 +1108,13 @@ impl Home {
                 need("llm")?;
                 let model = serde_json::from_slice::<Value>(&req.body).ok().and_then(|v| v["model"].as_str().map(str::to_string));
                 let t = self.chat_target(model.as_deref())?;
-                pass(s, &t)
+                let r = pass(s, &t);
+                if let Some(secs) = crate::switch::keep_up_s(&req.head) {
+                    if let Some(id) = self.chat_loaded(&self.models()) {
+                        self.keep_chat(&id, secs);
+                    }
+                }
+                r
             }
             ("POST", p @ ("/v1/images/generations" | "/v1/images/edits" | "/v1/audio/speech")) => {
                 let kind = if p.starts_with("/v1/images") { "image" } else { "audio" };

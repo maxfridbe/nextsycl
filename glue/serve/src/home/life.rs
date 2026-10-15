@@ -32,8 +32,6 @@ const MARGIN_MB: u64 = 1536;
 const ROOM_WAIT_S: u64 = 90;
 const JOB_ROOM_WAIT_S: u64 = 1800;
 
-/// A chat model this long without a request is idle: stopped when a picture, sound or clip needs its room
-const CHAT_IDLE_S: f64 = 300.0;
 
 /// Idle work that holds memory on a card and can go for a model that needs the room
 struct Holder {
@@ -732,7 +730,7 @@ impl Home {
             return Ok(Ok(self.lease(x.port)));
         }
         // not loaded: the first card of its with the room now, or once idle models there go (picture and sound
-        // servers, an idle video worker, a chat model unused for CHAT_IDLE_S); a slot no server holds, else one an
+        // servers, an idle video worker, a chat model not kept by X-Keep-Up-S); a slot no server holds, else one an
         // idle model holds, else one a busy model of the kind holds, after its requests
         let plan = gpus.iter().copied().find_map(|g| self.room_plan(&cards, g, want(g), kind, false).map(|p| (g, p)));
         let empty = sv.iter().find(|x| x.model.is_none());
@@ -816,7 +814,7 @@ impl Home {
 
     /// What could go from card `g` so `want` MiB is free there: none needed (Some(empty)), the idle holders to stop
     /// (Some), or no way now (None). Idle: a picture or sound server without work, the video daemon's worker while the
-    /// studio has nothing to make, a chat model without a request for CHAT_IDLE_S. `light`: picture and sound servers
+    /// studio has nothing to make, a chat model answering nothing and not kept (chat_idle). `light`: picture and sound servers
     /// only (for a second copy, which is no reason to stop a video or chat model). The kind asking is never asked to
     /// free its own kind's chat or video.
     fn room_plan(&self, cards: &Value, g: usize, want: u64, asking: &str, light: bool) -> Option<Vec<Holder>> {
@@ -922,15 +920,31 @@ impl Home {
             .is_some_and(|st| st["idle"] == true && st["queue_items"].as_array().is_none_or(|a| a.iter().all(|i| i["held"] == true)))
     }
 
-    /// The chat model loaded, when it has had no request for CHAT_IDLE_S and is not changing
+    /// The chat model loaded, when it may be preempted: answering nothing, not changing, and not kept - a request
+    /// that sent X-Keep-Up-S (Open WebUI's connection does: 300 s) keeps it that long after it ended, here or through
+    /// the switcher (its GET /keep); a request without the header keeps nothing
     fn chat_idle(&self) -> Option<String> {
         let id = self.chat_loaded(&self.models())?;
         let v = call_for(&Target::Unix(self.chat_socket()), "GET", "/server/requests", None, 3).ok()?;
         if v["active"].as_array().is_some_and(|a| !a.is_empty()) || self.chat_mode().1.is_some() {
             return None;
         }
-        let last = v["done"].as_array().into_iter().flatten().filter_map(|r| r["ended"].as_f64()).fold(0.0, f64::max);
-        (now() - last > CHAT_IDLE_S).then_some(id)
+        if self.chat_keep.lock().unwrap().get(&id).is_some_and(|until| *until > now()) {
+            return None;
+        }
+        if listening(self.o.ports.switch) {
+            // the switcher not answering: kept, to be safe
+            let k = call_for(&Target::Tcp(format!("127.0.0.1:{}", self.o.ports.switch)), "GET", "/keep", None, 3).ok()?;
+            if k["kept"][id.as_str()].as_f64().is_some_and(|s| s > 0.0) {
+                return None;
+            }
+        }
+        Some(id)
+    }
+
+    /// A chat request's keep (X-Keep-Up-S / keep_up_s): `id` kept that long from now
+    pub(crate) fn keep_chat(&self, id: &str, secs: u64) {
+        self.chat_keep.lock().unwrap().insert(id.to_string(), now() + secs as f64);
     }
 
     /// The chat server's control socket (its /server routes are not on its port)

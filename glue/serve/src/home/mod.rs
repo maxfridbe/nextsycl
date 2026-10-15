@@ -97,6 +97,8 @@ pub struct Home {
     jobs: jobs::Jobs,
     /// a job's stage while its server is chosen, and what it waits for: job id -> (stage, waiting_for)
     stages: Mutex<BTreeMap<String, (String, String)>>,
+    /// chat model id -> kept until (unix seconds): X-Keep-Up-S on /v1/chat/completions, keep_up_s on llm.chat
+    chat_keep: Mutex<BTreeMap<String, f64>>,
 }
 
 pub(crate) fn now() -> f64 {
@@ -180,7 +182,7 @@ impl Home {
             o, token, state_file, jobs,
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
-            seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()),
+            seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()), chat_keep: Mutex::new(BTreeMap::new()),
         });
         let me = h.clone();
         std::thread::spawn(move || me.sample_cards());

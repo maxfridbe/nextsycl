@@ -341,7 +341,8 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     sets the chat mode to none; the video daemon's workers let their card go), staying enabled. A load waits for its
     card to have the model's memory free plus 1.5 GiB (past the card the xe driver spills into host memory); idle
     work holding it is stopped for it at once (picture and sound servers without a request, the video worker while
-    the studio has nothing to make, a chat model unused for 5 minutes - never a render or a request), and it answers
+    the studio has nothing to make, a chat model answering nothing that no `X-Keep-Up-S` keeps - never a render or a
+    request), and it answers
     503 `no_room` when the room does not come free (a job waits up to 30 minutes first, saying what for; a chat
     load, like the others, 90 s). **Disabled**: unloaded, gone from Open WebUI's list and from the API.
     The registry's `enabled` and `gpus` are the state (`nextsycl models enable|disable` agree); the enabled video
@@ -414,6 +415,11 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     - **Idle models make room at once** for a job that needs it (see the load rule above), and a job runs on the
       first of its cards that has (or can be given) the room; a job waits for room up to 30 minutes instead of
       failing after 90 s.
+    - **Chat keep-up**: a chat request may send `X-Keep-Up-S: <seconds>` (/v1/chat/completions, through the front
+      door or the switcher; empty or not a number = 300) or `keep_up_s` (llm.chat): the model is kept that long after
+      the answer, and nothing stops it for room meanwhile. Without it the model may be preempted as soon as it is idle.
+      Open WebUI sends it from its connection's headers (Admin Settings > Connections > the switcher's connection >
+      Headers: `{"X-Keep-Up-S": "300"}`); the switcher's `GET /keep` lists what is kept.
     - **`llm.chat` answers 503 `no_room`** (retryable) like the other kinds when a chat model must load and its
       cards stay held, instead of a 15-minute timeout or a spill.
     - **Uploads**: `image.upload` / `audio.upload {name, data}` keep a picture or recording once (audio as WAV);
