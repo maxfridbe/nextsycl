@@ -243,7 +243,7 @@ fn gen_or_edit(cfg: &Config, args: &[String], editing: bool) -> Result<(), Strin
         rgba: args.iter().any(|a| a == "--rgba"),
         negative: opt(args, "--negative").map(str::to_string),
         cfg: opt(args, "--cfg").map(|s| s.parse().map_err(|_| "--cfg X")).transpose()?,
-        edit: editing.then(|| nextsycl_image::Edit { image: pics[0].clone(), refs: pics[1..].to_vec(), mask: None, strength: 1.0 }),
+        edit: editing.then(|| nextsycl_image::Edit { image: pics[0].clone(), refs: pics[1..].to_vec(), mask: None, strength: 1.0, condition: true }),
         ..Default::default()
     };
     let t0 = std::time::Instant::now();

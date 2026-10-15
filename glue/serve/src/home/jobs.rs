@@ -195,7 +195,7 @@ impl Home {
             self.jobs.update(id, |j| {
                 j["state"] = json!("cancelled");
                 j["ended"] = json!(now());
-                j["error"] = json!({"status": 499, "code": "cancelled", "message": "cancelled before it started"});
+                j["error"] = json!({"status": 499, "code": "cancelled", "message": "cancelled before it started", "retryable": false});
                 j["body"] = Value::Null;
             });
             return;
@@ -215,7 +215,9 @@ impl Home {
                 Err((st, m)) => {
                     let st = if cancel && st != 200 { 499 } else { st };
                     j["state"] = json!(if st == 499 { "cancelled" } else { "failed" });
-                    j["error"] = json!({"status": st, "code": super::api::code_of(st), "message": m});
+                    let mut e = super::api::error_of(st, &m);
+                    e["status"] = json!(st);
+                    j["error"] = e;
                 }
             }
         });

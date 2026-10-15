@@ -394,6 +394,8 @@ impl ImageEngine for QwenImage21 {
         // an edit: the picture and its references (the pipeline's condition images, in order); the output takes the
         // last one's aspect at the model's area unless a size is given
         let pics: Vec<Picture> = match &req.edit {
+            // img2img: the picture is where the denoise starts, not a condition
+            Some(e) if !e.condition => Vec::new(),
             Some(e) => {
                 if e.mask.is_some() {
                     return Err(Error(format!("{ARCH}: masks are not part of this model's edits (describe the change instead)")));
@@ -413,7 +415,7 @@ impl ImageEngine for QwenImage21 {
             return Err(Error(format!("{ARCH}: LoRAs are not ported yet")));
         }
         let area = (d.width * d.height) as usize;
-        let (dw, dh) = match pics.last() {
+        let (dw, dh) = match pics.last().or(req.edit.as_ref().map(|e| &e.image)) {
             Some(p) => dims(area as f64, p.width as f64 / p.height as f64),
             None => (d.width as usize, d.height as usize),
         };
@@ -454,7 +456,7 @@ impl ImageEngine for QwenImage21 {
         }
         let sig = match (strength < 1.0, preset) {
             (false, _) => sig,
-            // a few-step model's own levels: those at or below the strength
+            // a few-step model's own levels: from the strength, then its own below it
             (true, Some(_)) if schedule == Schedule::Shift => sched::below(&sig, strength),
             (true, _) => sched::tail(&levels(((steps as f32 / strength).round() as usize).max(steps))?, steps),
         };

@@ -22,6 +22,7 @@ mod api;
 mod config;
 mod jobs;
 mod life;
+mod precheck;
 mod spec;
 pub mod registry;
 mod yaml;

@@ -75,19 +75,22 @@ pub const METHODS: &[Method] = &[
     Method { kind: "llm", name: "models", summary: "The enabled chat models (what Open WebUI lists) and which is loaded", fields: &[], example: "{}" },
     Method { kind: "llm", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "qwen3.8-flash-next-iq2_xs"}"# },
 
-    Method { kind: "image", name: "generate", summary: "Pictures from a prompt (the model loads first if it must)",
-             fields: &[MODEL_OPT, ("prompt", "string", "", true), ("size", "string", "WxH, e.g. 1024x1024", false), ("n", "integer", "pictures", false),
-                       ("steps", "integer", "", false), ("seed", "integer", "", false), ("sampler", "string", "ComfyUI's names (euler, euler_ancestral, dpmpp_2m ...)", false),
+    Method { kind: "image", name: "generate", summary: "Pictures from a prompt, or from an init picture (image + strength: img2img); the model loads first if it must. Checked when submitted (a bad value is a 400 even with wait: false)",
+             fields: &[MODEL_OPT, ("prompt", "string", "", true), ("size", "string", "WxH, e.g. 1024x1024, both multiples of 16 (default: the model's, or the init picture's aspect)", false), ("n", "integer", "pictures", false),
+                       ("image", "string", "an init picture (base64 or a data: URL; at most 40 MP): a plain img2img - the denoise starts from it at strength and the prompt guides it (it is no reference: for an edit that reads the picture use image.edit). Needs strength below 1", false),
+                       ("strength", r#"{"type": "number", "minimum": 0.05, "maximum": 1}"#, "with image: how far from it (ComfyUI's denoise: the last steps of a round(steps / strength)-step schedule); 0.3-0.6 is the usual img2img range", false),
+                       ("steps", "integer", "image.info's steps: a few-step model (turbo) runs only its own count (6)", false), ("seed", "integer", "", false), ("sampler", "string", "ComfyUI's names (euler, euler_ancestral, dpmpp_2m ...)", false),
                        ("schedule", "string", "", false), ("cfg", "number", "true guidance (needs negative_prompt)", false), ("negative_prompt", "string", "", false),
                        ("loras", "string[]", "name:scale", false), ("response_format", "string", "url (default) or b64_json", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
                        ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false)],
              example: r#"{"model": "qwen-image-2.1-q8", "prompt": "a lighthouse at dusk, oil painting", "size": "1024x768"}"# },
-    Method { kind: "image", name: "edit", summary: "Edit or compose pictures: the first is changed, the others are references the prompt names",
-             fields: &[MODEL_OPT, ("prompt", "string", "the instructions", true), ("images", "string[]", "up to 8, base64 or data: URLs", true),
+    Method { kind: "image", name: "edit", summary: "Edit or compose pictures: the first is changed, the others are references the prompt names. With reference: false and strength below 1 it is a plain img2img (as image.generate's image). Checked when submitted (a bad value is a 400 even with wait: false)",
+             fields: &[MODEL_OPT, ("prompt", "string", "the instructions", true), ("images", "string[]", "up to 8, base64 or data: URLs (PNG, JPEG, WebP); each at most 40 MP, the request at most 256 MiB; each is resized to about 1 MP, so 2048 px on the long side is plenty", true),
+                       ("reference", r#"{"type": "boolean", "default": true}"#, "true (default): the pictures condition the model as an edit's references (its vision tower reads them) as well as being where strength starts; false: a plain img2img - the denoise starts from the first picture and the prompt alone guides it, comparable with other tools' img2img (needs strength below 1)", false),
                        ("size", "string", "default: the last picture's aspect", false), ("steps", "integer", "", false), ("seed", "integer", "", false),
-                       ("strength", r#"{"type": "number", "minimum": 0.05, "maximum": 1, "default": 1}"#, "how far from the first picture: 1 (default) makes a new picture guided by it; below 1 starts from that picture noised this far (ComfyUI's denoise: the last steps of a steps / strength run). Measured on Qwen-Image 2.1: 0.9 keeps the framing, face, hair and clothes and still makes the change asked (a pose, a prop); 0.75 and below give back nearly the same picture (detail varies). The first picture is resized to the output's size", false),
+                       ("strength", r#"{"type": "number", "minimum": 0.05, "maximum": 1, "default": 1}"#, "how far from the first picture: 1 (default) makes a new picture guided by it; below 1 starts from the first picture, encoded and noised to the level strength reaches: the run is the last steps of a round(steps / strength)-step schedule, exactly ComfyUI's KSampler denoise (a few-step model such as turbo starts at strength itself, then takes its own levels below it). With reference true the picture also conditions the model, which holds it closer than a plain img2img at the same number: measured on Qwen-Image 2.1, 0.9 keeps the framing, face, hair and clothes and still makes the change asked; 0.75 and below give back nearly the same picture. With reference false it behaves as other tools' img2img. The first picture is resized to the output's size", false),
                        ("response_format", "string", "url (default) or b64_json", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
@@ -254,6 +257,8 @@ const FEATURES: &[&str] = &[
     "video.frames", "video.chain", "video.priority", "video.cancel.label", "video.queue.move", "video.queue.remove", "video.engines.inputs",
     "video.negative_prompt.ignored", "image.canvases", "image.cancel", "spec.open",
     "image.edit.strength", "audio.speak.continue_from", "video.preview", "system.busy.parallel",
+    "errors.retryable", "errors.no_room", "jobs.precheck", "image.info.steps", "image.generate.init_image", "image.edit.reference",
+    "video.failure", "video.gpu", "video.engines.ignored",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -272,10 +277,23 @@ pub(crate) fn code_of(status: u16) -> &'static str {
         404 => "not_found",
         499 => "cancelled",
         409 => "conflict",
-        502 | 503 => "unavailable",
+        502 => "unavailable",
+        503 => "no_room",
         504 => "timeout",
         _ => "internal",
     }
+}
+
+/// Whether the same call may succeed later unchanged: the box was busy or a server did not answer (not a bad value,
+/// a missing or disabled model, a cancel)
+pub(crate) fn retryable(status: u16, code: &str) -> bool {
+    matches!(status, 502..=504) || code == "busy"
+}
+
+/// An error's body: code, message, whether to retry
+pub(crate) fn error_of(status: u16, m: &str) -> Value {
+    let code = code_of(status);
+    json!({"code": code, "message": m, "retryable": retryable(status, code)})
 }
 
 type Fail = (u16, String);
@@ -298,7 +316,7 @@ impl Home {
         let rpc = req.path.starts_with("/rpc/");
         let fail = |s: &mut Conn, st: u16, m: String| {
             if rpc {
-                http::respond(s, st, &json!({"ok": false, "error": {"code": code_of(st), "message": m}}));
+                http::respond(s, st, &json!({"ok": false, "error": error_of(st, &m)}));
             } else {
                 http::respond(s, st, &json!({"error": {"message": m, "type": if st == 401 { "invalid_api_key" } else { "invalid_request_error" }}}));
             }
@@ -349,7 +367,7 @@ impl Home {
 
     /// A kind's model for a request: the one it names (enabled, of the kind), else the loaded one, else the first
     /// enabled
-    fn pick(&self, kind: &str, body: &Value, all: &[Value]) -> Result<String, Fail> {
+    pub(super) fn pick(&self, kind: &str, body: &Value, all: &[Value]) -> Result<String, Fail> {
         let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == kind && m["enabled"] != false).collect();
         if let Some(id) = body["model"].as_str().filter(|x| !x.is_empty()) {
             return match all.iter().find(|m| m["id"] == id) {
@@ -373,7 +391,7 @@ impl Home {
     /// The speech model for a request that names none (or names one not registered): one that clones for a saved
     /// voice or a recording, the built-in voices' for a voice, the voice-design one for instructions alone; the
     /// loaded one first
-    fn speech_model(&self, b: &Value, all: &[Value]) -> Result<String, Fail> {
+    pub(super) fn speech_model(&self, b: &Value, all: &[Value]) -> Result<String, Fail> {
         if b["model"].as_str().is_some_and(|m| all.iter().any(|x| x["id"] == m)) {
             return self.pick("audio", b, all);
         }
@@ -453,7 +471,7 @@ impl Home {
     fn studio_rpc(&self, name: &str, b: &Value, host: &str) -> Option<(u16, Value)> {
         let method = name.strip_prefix("video.").filter(|m| !matches!(*m, "upload" | "describePromptGuideMD"))?;
         let all = self.models();
-        let envelope = |st: u16, m: String| (st, json!({"ok": false, "error": {"code": code_of(st), "message": m}}));
+        let envelope = |st: u16, m: String| (st, json!({"ok": false, "error": error_of(st, &m)}));
         if let Err((st, m)) = self.checked(name, b, &all) {
             return Some(envelope(st, m));
         }
@@ -466,6 +484,8 @@ impl Home {
             if v["error"]["code"] == "invalid_param" {
                 v["error"]["code"] = json!("invalid_params");
             }
+            let code = v["error"]["code"].as_str().unwrap_or("").to_string();
+            v["error"]["retryable"] = json!(retryable(st, &code));
             return Some((st, v));
         }
         let url = |kind: &str, n: &str| format!("http://{host}/v1/video/{kind}/{n}");
@@ -525,14 +545,16 @@ impl Home {
             if runnable > 0 {
                 reasons.push(format!("{runnable} clip(s) queued"));
             }
-            let gpu = slots.iter().find(|x| x["kind"] == "video" && x["busy"] == true).map(|x| x["gpu"].clone()).unwrap_or(Value::Null);
+            // the studio's job as the engine reports it, else the card the daemon shows busy
+            let gpu = Some(st["gpu"].clone()).filter(|g| running && !g.is_null())
+                .or_else(|| slots.iter().find(|x| x["kind"] == "video" && x["busy"] == true).map(|x| x["gpu"].clone())).unwrap_or(Value::Null);
             let on = |k: &str| if running { st[k].clone() } else { Value::Null };
             json!({"running": running, "label": if running { st["job"]["label"].clone() } else { Value::Null }, "name": if running { st["job"]["name"].clone() } else { Value::Null },
                    "stage": on("stage"), "pct": on("pct"), "eta_s": on("eta"), "elapsed_s": on("elapsed"), "gpu": gpu,
                    "energy_wh": if running { st["job"]["energy_wh"].clone() } else { Value::Null },
                    "queued": items.len(), "runnable": runnable, "held": held,
                    "accepts": !st.is_null() && !running && runnable == 0, "reachable": !st.is_null(),
-                   "slots": 1})
+                   "slots": 1, "cards": slots.iter().filter(|x| x["kind"] == "video").count()})
         } else {
             Value::Null
         };
@@ -568,7 +590,10 @@ impl Home {
     fn rpc(self: &Arc<Self>, name: &str, b: &Value) -> Result<Value, Fail> {
         // pictures, songs and speech run as jobs (jobs.rs), which call work
         if super::jobs::METHODS.contains(&name) {
-            self.checked(name, b, &self.models())?;
+            let all = self.models();
+            self.checked(name, b, &all)?;
+            // what the server would refuse, refused now (wait: false would answer OK, then fail)
+            self.precheck(name, b, &all)?;
             return self.submit(name, b);
         }
         self.work(name, b)
@@ -623,7 +648,7 @@ impl Home {
                     std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())).join("nextsycl")
                 });
                 let v = call_for(&crate::http::Target::Unix(dir.join("nextsycl.sock")), "GET", "/server/requests", None, 5)
-                    .map_err(|e| (503, format!("the chat server does not answer: {e}")))?;
+                    .map_err(|e| (502, format!("the chat server does not answer: {e}")))?;
                 let keep = ["id", "model", "state", "via", "started", "ended", "finish", "prompt_tokens", "reused", "source", "read", "read_tok_s", "read_seconds",
                             "generated", "max_tokens", "tok_s", "generate_seconds", "drafts", "energy_j", "avg_watts"];
                 let slim = |r: &Value| Value::from(keep.iter().filter_map(|k| r.get(*k).map(|x| (k.to_string(), x.clone()))).collect::<serde_json::Map<_, _>>());
@@ -681,14 +706,23 @@ impl Home {
             }
             ("image" | "audio", "info") => {
                 let id = self.pick(m.kind, b, &all)?;
-                match call_for(&t, "GET", "/api/info", None, 5) {
-                    Ok(i) if s(&i, "model") == id => Ok(json!({"loaded": true, "info": i})),
-                    _ => {
-                        let e = all.iter().find(|x| x["id"] == id.as_str()).cloned().unwrap_or(Value::Null);
-                        Ok(json!({"loaded": false, "model": id, "title": e["title"], "defaults": e["defaults"],
-                                  "note": "not loaded: the server's own details come once it is (system.load)"}))
-                    }
+                let e = all.iter().find(|x| x["id"] == id.as_str()).cloned().unwrap_or(Value::Null);
+                // what a request may send, known without the model loaded
+                let limits = if m.kind == "image" {
+                    json!({"steps": super::precheck::steps_of(&e), "max_pictures": 8, "max_picture_pixels": crate::image::MAX_PICTURE_PIXELS,
+                           "max_request_bytes": 256u64 << 20, "size_multiple": 16})
+                } else {
+                    json!({"max_request_bytes": 256u64 << 20})
+                };
+                let mut v = match call_for(&t, "GET", "/api/info", None, 5) {
+                    Ok(i) if s(&i, "model") == id => json!({"loaded": true, "model": id, "info": i}),
+                    _ => json!({"loaded": false, "model": id, "title": e["title"], "defaults": e["defaults"],
+                                "note": "not loaded: the server's own details (info) come once it is (system.load); steps and the limits are known now"}),
+                };
+                if let (Some(o), Some(l)) = (v.as_object_mut(), limits.as_object()) {
+                    o.extend(l.clone());
                 }
+                Ok(v)
             }
             ("image" | "audio", "progress") => Ok(call_for(&t, "GET", "/api/progress", None, 5).unwrap_or(json!({"busy": false, "loaded": false}))),
             ("image" | "audio", "history") => Ok(call_for(&t, "GET", "/api/history", None, 10).unwrap_or(json!({"data": []}))),
@@ -785,7 +819,7 @@ impl Home {
     /// A file into the studio's output (its upload route takes the raw bytes)
     fn studio_upload(&self, name: &str, data: &[u8]) -> Result<Value, Fail> {
         use std::io::{Read, Write};
-        let mut c = Conn::connect(&self.target("video")).map_err(|e| (503, format!("the studio does not answer: {e}")))?;
+        let mut c = Conn::connect(&self.target("video")).map_err(|e| (502, format!("the studio does not answer: {e}")))?;
         let q: String = name.chars().map(|ch| if ch.is_ascii_alphanumeric() || "._-".contains(ch) { ch.to_string() } else { format!("%{:02X}", ch as u32 & 0xff) }).collect();
         write!(c, "POST /api/upload?name={q} HTTP/1.1\r\nHost: studio\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", data.len())
             .and_then(|_| c.write_all(data)).map_err(|e| (502, e.to_string()))?;
@@ -893,7 +927,7 @@ impl Home {
         let ids = |k: &str| -> Vec<Value> { all.iter().filter(|m| registry::kind_of(m) == k && m["enabled"] != false).map(|m| m["id"].clone()).collect() };
         let envelope = json!({"type": "object", "properties": {
             "ok": {"type": "boolean"}, "result": {"description": "the method's answer"},
-            "error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}});
+            "error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "retryable": {"type": "boolean", "description": "true: the same call may work later (no_room, unavailable, timeout, busy)"}}}}});
         let engines: Vec<String> = if on.contains(&"video") {
             call_for(&self.target("video"), "POST", "/rpc/engines.list", Some(&json!({})), 3).ok()
                 .and_then(|v| v["result"]["engines"].as_array().map(|a| a.iter().filter_map(|e| e["quant"].as_str().map(str::to_string)).collect()))

@@ -375,6 +375,10 @@ impl Studio {
         out.insert("stage".into(), json!(stage));
         out.insert("done".into(), json!(done));
         out.insert("error".into(), json!(error));
+        // the same as data: what kind of failure, and whether running it again as is can help
+        out.insert("failure".into(), if failed { failure(state, j["error"].as_str().unwrap_or(""), &log) } else { Value::Null });
+        // the card the engine runs it on (while it waits for one: the one it asked for, if any)
+        out.insert("gpu".into(), if idle { Value::Null } else { j["gpu"].clone() });
         out.insert("exited".into(), json!(idle));
         out.insert("rc".into(), if idle { json!(if done { 0 } else { 1 }) } else { Value::Null });
         out.insert("elapsed".into(), json!(elapsed as i64));
@@ -496,4 +500,41 @@ pub fn snap_seconds(s: f64) -> f64 {
 /// The record of a job as it was when the studio restarted, if it is still worth following.
 pub fn recover(dir: &Path) -> Option<Value> {
     std::fs::read(dir.join("job.json")).ok().and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+/// A failed clip's kind: {code, retryable, message, hint}. Read from the engine's error and its last lines.
+pub fn failure(state: &str, error: &str, log: &[String]) -> Value {
+    let text = format!("{error}\n{}", log.iter().rev().take(8).cloned().collect::<Vec<_>>().join("\n")).to_lowercase();
+    let has = |ps: &[&str]| ps.iter().any(|p| text.contains(p));
+    let (code, retryable, hint) = if state == "cancelled" || error.starts_with("cancelled") {
+        ("cancelled", false, "stopped by video.cancel")
+    } else if has(&["memory cap", "out of memory", "out_of_device_memory", "out of device memory", "refused a scratch buffer", "cannot allocate"]) {
+        ("out_of_memory", false, "the same clip will not fit again: fewer frames, a smaller canvas or a smaller engine (q6k, q4km)")
+    } else if has(&["does not answer", "ended unexpectedly", "does not listen", "closed its output", "broken pipe", "connection reset", "killed"]) {
+        ("engine_lost", true, "the engine process ended or stopped answering mid-clip; the same request may work")
+    } else if has(&["no such file", "not found", "must be", "a multiple of", "cannot read", "cannot decode", "invalid"]) {
+        ("invalid_input", false, "a file or value the engine could not use: change the request")
+    } else {
+        ("engine_error", false, "the engine's own error: see message")
+    };
+    json!({"code": code, "retryable": retryable, "message": error, "hint": hint})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::failure;
+
+    #[test]
+    fn failures_say_whether_to_retry() {
+        let log = |l: &str| vec![l.to_string()];
+        let f = failure("failed", "nsd_alloc: 900 MiB would pass the device memory cap (30 GiB)", &[]);
+        assert_eq!((f["code"].as_str(), f["retryable"].as_bool()), (Some("out_of_memory"), Some(false)));
+        let f = failure("failed", "the engine process ended unexpectedly (signal: 9)", &[]);
+        assert_eq!((f["code"].as_str(), f["retryable"].as_bool()), (Some("engine_lost"), Some(true)));
+        let f = failure("cancelled", "", &log("sampling"));
+        assert_eq!(f["code"], "cancelled");
+        let f = failure("failed", "first_frame: no such file", &[]);
+        assert_eq!(f["code"], "invalid_input");
+        assert_eq!(failure("failed", "something odd", &[])["code"], "engine_error");
+    }
 }

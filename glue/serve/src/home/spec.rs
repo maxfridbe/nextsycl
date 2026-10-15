@@ -57,7 +57,7 @@ const JOB_VIEW: &str = r#"{"type": "object", "required": ["id", "label", "state"
   "created": {"type": "number"}, "started": {"type": "number", "nullable": true}, "ended": {"type": "number", "nullable": true}, "seconds": {"type": "number", "description": "ended: started to ended"},
   "progress": {"type": "object", "description": "running: the server's progress (step at / of, picture, phase, seconds)", "additionalProperties": true},
   "result": {"type": "object", "description": "done: the answer generate gives with wait (data[].url ...)", "additionalProperties": true},
-  "error": {"type": "object", "properties": {"status": {"type": "integer"}, "code": {"type": "string"}, "message": {"type": "string"}}},
+  "error": {"type": "object", "properties": {"status": {"type": "integer"}, "code": {"type": "string"}, "message": {"type": "string"}, "retryable": {"type": "boolean", "description": "the same call may succeed later unchanged (no_room, unavailable, timeout); false: change the request (invalid_params, not_found, conflict, cancelled)"}}},
   "restarted": {"type": "boolean", "description": "the front door restarted while it was unfinished: run again from the start"},
   "reentered": {"type": "boolean", "description": "generate: its reentrant_id named this job, nothing new was started"}}}"#;
 
@@ -92,7 +92,12 @@ fn status() -> String {
     "version": {{"type": "string", "description": "changes whenever anything here does (video.wait)"}},
     "job": {{"allOf": [{JOB}], "nullable": true, "description": "null: nothing made since the studio started"}}, "stage": {{"type": "string", "description": "starting, text encoder, sampling N/M, video decoded, done, failed ..."}},
     "pct": {{"type": "integer"}}, "eta": {{"type": "integer", "description": "seconds left (estimate)"}}, "elapsed": {{"type": "integer"}},
-    "done": {{"type": "boolean"}}, "error": {{"type": "string", "nullable": true, "description": "failed or cancelled, with the engine's last lines"}},
+    "done": {{"type": "boolean"}}, "error": {{"type": "string", "nullable": true, "description": "failed or cancelled, with the engine's last lines (text, as before; failure has it as data)"}},
+    "failure": {{"type": "object", "nullable": true, "description": "failed or cancelled: what kind, and whether the same request again can help", "properties": {{
+      "code": {{"type": "string", "enum": ["out_of_memory", "engine_lost", "invalid_input", "engine_error", "cancelled"]}},
+      "retryable": {{"type": "boolean", "description": "true only for engine_lost (the engine process ended or stopped answering); out_of_memory needs fewer frames, a smaller canvas or engine"}},
+      "message": {{"type": "string", "description": "the engine's error"}}, "hint": {{"type": "string"}}}}}},
+    "gpu": {{"type": "integer", "nullable": true, "description": "the card the clip runs on (null when idle; while it waits for a card, the one it asked for or null)"}},
     "steps_done": {{"type": "integer"}}, "steps_total": {{"type": "integer"}}, "frames": {{"type": "integer"}},
     "times": {{"type": "object", "additionalProperties": {{"type": "number"}}, "description": "seconds by stage"}},
     "file": {{"type": "string", "nullable": true, "description": "done: the clip's URL (/v1/video/files/<name>.mp4)"}},
@@ -118,10 +123,11 @@ pub fn result(method: &str) -> Option<String> {
   "video": {"type": "object", "nullable": true, "description": "null: no video model enabled", "properties": {
     "running": {"type": "boolean"}, "label": {"type": "string", "nullable": true}, "name": {"type": "string", "nullable": true},
     "stage": {"type": "string", "nullable": true}, "pct": {"type": "integer", "nullable": true}, "eta_s": {"type": "integer", "nullable": true}, "elapsed_s": {"type": "integer", "nullable": true},
-    "gpu": {"type": "integer", "nullable": true, "description": "the card the clip is made on"}, "energy_wh": {"type": "number", "nullable": true, "description": "the clip's energy so far"},
+    "gpu": {"type": "integer", "nullable": true, "description": "the card the clip is made on (null when nothing runs, or while the clip waits for a card the engine has not given it yet)"}, "energy_wh": {"type": "number", "nullable": true, "description": "the clip's energy so far"},
     "queued": {"type": "integer"}, "runnable": {"type": "integer", "description": "queued and not held"}, "held": {"type": "integer"},
     "accepts": {"type": "boolean", "description": "video.generate without queue: true starts at once"},
-    "slots": {"type": "integer", "description": "clips made at once: 1 (the studio makes one clip at a time, on whichever card is free)"}}},
+    "slots": {"type": "integer", "description": "clips made at once: 1. The studio makes one clip at a time; the daemon has a worker on each card (cards, and the video rows of the slots list) and the clip goes to whichever is free, so two video rows never mean two clips"},
+    "cards": {"type": "integer", "description": "cards the video daemon can make a clip on"}}},
   "slots": {"type": "array", "description": "every place work runs: image and audio servers (two each: one per card), the video daemon's cards, the chat server", "items": {"type": "object", "properties": {
     "kind": {"type": "string", "enum": ["image", "audio", "video", "llm"]}, "slot": {}, "port": {"type": "integer"}, "gpu": {"type": "integer", "nullable": true, "description": "its card (null: not running)"},
     "gpus": {"type": "array", "items": {"type": "integer"}, "description": "llm: every card it spans"}, "model": {"type": "string", "nullable": true},
@@ -179,7 +185,11 @@ pub fn result(method: &str) -> Option<String> {
   "prompt_seconds": {"type": "number"}, "read_tok_s": {"type": "number"}, "write_seconds": {"type": "number"}, "tok_s": {"type": "number"}, "seconds": {"type": "number"}, "wh": {"type": "number", "nullable": true}}}"#.into(),
         "image.info" | "audio.info" => r#"{"type": "object", "properties": {"loaded": {"type": "boolean"},
   "info": {"type": "object", "description": "loaded: the server's own - model, arch, defaults, samplers, schedules, options, loras; image: edits, reads (an OCR model), prompts (its instructions), max_pictures 8, max_pages 24; audio: lyrics, speech (voices, languages, design, clone ...)", "additionalProperties": true},
-  "model": {"type": "string", "description": "not loaded"}, "title": {"type": "string"}, "defaults": {"type": "object", "additionalProperties": true}, "note": {"type": "string"}}}"#.into(),
+  "model": {"type": "string"}, "title": {"type": "string", "description": "not loaded"}, "defaults": {"type": "object", "additionalProperties": true, "description": "not loaded: the registry's"}, "note": {"type": "string"},
+  "steps": {"type": "object", "description": "image, loaded or not: the steps a request may send", "properties": {"default": {"type": "integer"}, "locked": {"type": "boolean", "description": "true: a few-step model (turbo) runs only allowed"},
+    "allowed": {"type": "array", "nullable": true, "items": {"type": "integer"}, "description": "locked: the only count (6 for turbo); null: any from min to max"}, "min": {"type": "integer"}, "max": {"type": "integer"}, "note": {"type": "string"}}},
+  "max_pictures": {"type": "integer", "description": "image.edit: pictures a request (8)"}, "max_picture_pixels": {"type": "integer", "description": "each picture sent: at most this many pixels (40 MP; it is resized to about 1 MP anyway, so 2048 px on the long side is plenty)"},
+  "max_request_bytes": {"type": "integer", "description": "the whole request body (256 MiB: about 190 MiB of pictures as base64)"}, "size_multiple": {"type": "integer", "description": "size: both sides a multiple of this"}}}"#.into(),
         "image.progress" => r#"{"type": "object", "properties": {"busy": {"type": "boolean"}, "waiting": {"type": "integer", "description": "requests queued behind it"},
   "loaded": {"type": "boolean", "description": "false: no server running (then busy is false)"}, "prompt": {"type": "string"}, "loading": {"type": "boolean"},
   "picture": {"type": "integer"}, "pictures": {"type": "integer"}, "at": {"type": "integer", "description": "step"}, "of": {"type": "integer"}, "seconds": {"type": "number"},
@@ -240,7 +250,8 @@ pub fn result(method: &str) -> Option<String> {
   "quant": {"type": "string", "description": "the name video.generate's engine takes"}, "file": {"type": "string"}, "path": {"type": "string"},
   "gib": {"type": "number"}, "ready": {"type": "boolean"}, "default": {"type": "boolean"},
   "inputs": {"type": "object", "description": "the video.generate keys it reads and the ones it does not", "properties": {"takes": {"type": "array", "items": {"type": "string"}},
-    "not": {"type": "array", "items": {"type": "string"}}, "chosen": {"type": "string", "description": "when it is used"}}}}}}}}"#.into(),
+    "not": {"type": "array", "items": {"type": "string"}, "description": "refused with this engine (a 400)"}, "chosen": {"type": "string", "description": "when it is used"},
+    "ignored": {"type": "array", "items": {"type": "string"}, "description": "accepted but read by nothing (negative_prompt, cfg: H3 runs one pass a step at cfg 1; chain.pin_renorm): echoed back in video.generate's ignored"}}}}}}}}"#.into(),
         "video.canvases.list" => r#"{"type": "object", "properties": {"canvases": {"type": "array", "items": {"type": "object", "properties": {
   "width": {"type": "integer"}, "height": {"type": "integer"}, "aspect": {"type": "string"}, "note": {"type": "string"}, "mpx": {"type": "number"},
   "cost": {"type": "number", "description": "time relative to 640 x 480"}, "default": {"type": "boolean"}}}}}}"#.into(),
@@ -265,11 +276,13 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
         "video.queue.move" | "video.queue.remove" => &[(404, "not_found", "no queued clip with that label")],
         "video.jobs.get" => &[(404, "not_found", "no record of that clip")],
         "video.upload" => &[(400, "invalid_params", "not a picture, clip or sound (png jpg jpeg webp mp4 mov webm mkv wav mp3 flac m4a ogg), or empty")],
-        "system.enable" | "system.disable" | "system.load" | "system.unload" | "system.gpus" => &[(404, "not_found", "no such model")],
+        "system.load" => &[(404, "not_found", "no such model"), (503, "no_room", "its cards are held by other models now (retryable)")],
+        "system.enable" | "system.disable" | "system.unload" | "system.gpus" => &[(404, "not_found", "no such model")],
         "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.voices.design" =>
             &[(400, "invalid_params", "the server refused a value (a size, a sampler, too many pictures or pages, an unknown voice ...)"),
-              (404, "not_found", "no such model"), (409, "conflict", "the model is disabled, or none that can do it is enabled"),
+              (404, "not_found", "no such model"), (409, "conflict", "the model is disabled, or none that can do it is enabled (never retry as is)"),
               (499, "cancelled", "stopped by <kind>.cancel"), (502, "unavailable", "the kind's server did not start or answer"),
+              (503, "no_room", "the model's cards have no room for it now (other models hold them; it loads once one idles out, about 10 minutes at most): retry later"),
               (504, "timeout", "wait: still running after an hour (the job goes on: <kind>.status {label})")],
         "llm.chat" => &[(400, "invalid_params", "the chat server refused the request"), (502, "unavailable", "the chat server does not answer")],
         "audio.voices.add" => &[(400, "invalid_params", "a bad name, a recording shorter than 3 s or not decodable")],
@@ -287,7 +300,10 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
 pub const CODES: &str = "Error codes (error.code, with the HTTP status): invalid_request 400 (the body is not a JSON object), invalid_params 400, \
 unauthorized 401, not_found 404 (also an unknown method), conflict 409 (a model disabled, none of the kind enabled, a name taken), \
 busy 409 (video.generate while a clip is made, without queue: true), not_running 409 (video.cancel with nothing running), \
-cancelled 499 (image.cancel / audio.cancel stopped it), unavailable 502/503 (the kind's server does not answer), timeout 504, internal 500.";
+cancelled 499 (image.cancel / audio.cancel stopped it), unavailable 502 (the kind's server does not answer), \
+no_room 503 (the model's cards are held by other models now; it loads once one idles out), timeout 504, internal 500. \
+Every error has retryable: true for no_room, unavailable, timeout and video's busy (the same call may work later), false otherwise \
+(change the request: a bad value, a disabled or missing model, a cancel).";
 
 /// The label convention the video methods share
 pub const LABELS: &str = "Video labels: \"<series> NN/MM: text\" (\"Harbour 03/12: the lamp\"). NN orders video.timeline (the edit order); \

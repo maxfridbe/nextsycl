@@ -51,6 +51,9 @@ pub struct Edit {
     pub mask: Option<Picture>,
     /// how far from the original (1.0: as far as a new picture)
     pub strength: f32,
+    /// the pictures also condition the model as an edit's (its references, read by its vision tower); false: a plain
+    /// img2img - the denoise starts from `image` (strength below 1) and the prompt alone guides it
+    pub condition: bool,
 }
 
 /// One reading (an OCR model's request): pictures in reading order and the instruction

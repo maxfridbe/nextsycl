@@ -38,10 +38,10 @@ pub fn tail(sigmas: &[f32], steps: usize) -> Vec<f32> {
     sigmas[sigmas.len().saturating_sub(steps + 1)..].to_vec()
 }
 
-/// The levels of `sigmas` at or below `strength` (a fixed schedule started partway), at least its last step
+/// A fixed schedule started partway: `strength` itself, then the levels of `sigmas` below it (a few-step model's
+/// own levels can sit far apart: starting at the first one below would skip most of the change asked)
 pub fn below(sigmas: &[f32], strength: f32) -> Vec<f32> {
-    let first = sigmas.iter().position(|s| *s <= strength).unwrap_or(sigmas.len() - 1).min(sigmas.len() - 2);
-    sigmas[first..].to_vec()
+    std::iter::once(strength).chain(sigmas.iter().copied().filter(|s| *s < strength)).collect()
 }
 
 #[cfg(test)]
@@ -71,7 +71,7 @@ mod tests {
         assert_eq!(t.len(), 21);
         assert!(t[0] < 0.9 && t[20] == 0.0);
         let b = super::below(&[1.0, 0.9, 0.5, 0.25, 0.0], 0.6);
-        assert_eq!(b, vec![0.5, 0.25, 0.0]);
-        assert_eq!(super::below(&[1.0, 0.9, 0.0], 0.05), vec![0.9, 0.0]);
+        assert_eq!(b, vec![0.6, 0.5, 0.25, 0.0]);
+        assert_eq!(super::below(&[1.0, 0.9, 0.0], 0.05), vec![0.05, 0.0]);
     }
 }

@@ -10,7 +10,9 @@
 //!                                 references -, prompt, the fields above) or JSON with `images`: [base64 or data
 //!                                 URLs]; the instructions name the pictures ("the hat from picture 2"); the size
 //!                                 follows the last picture's aspect unless one is given; strength (0.05 to 1,
-//!                                 default 1): below 1 the picture starts from the first one, noised that far
+//!                                 default 1): below 1 the picture starts from the first one, noised that far;
+//!                                 reference (default true; false: a plain img2img, the pictures do not condition)
+//!                                 generations take image (an init picture: a plain img2img, strength below 1)
 //!   POST /v1/ocr                  an OCR model's reading: images [base64 or data URLs: pictures or PDFs, split into
 //!                                 their pages here] (pages, in order), each_page (several pages each read on its
 //!                                 own; default true - false: the model's one-pass multi-page reading), prompt,
@@ -117,6 +119,25 @@ fn earlier(dir: &std::path::Path) -> VecDeque<Value> {
 const MAX_PICTURES: usize = 8;
 /// pages one OCR request reads at most (each a global view of 273 tokens)
 const MAX_PAGES: usize = 24;
+/// The most pixels a picture sent may have (it is resized to the model's area, about a megapixel, anyway)
+pub const MAX_PICTURE_PIXELS: u64 = 40_000_000;
+
+/// A picture sent, checked against the pixel limit
+pub(crate) fn picture(bytes: &[u8], what: &str) -> Result<nextsycl_image::Picture, String> {
+    let p = nextsycl_image::Picture::decode(bytes).map_err(|e| format!("{what}: {e}"))?;
+    let px = p.width as u64 * p.height as u64;
+    if px > MAX_PICTURE_PIXELS {
+        return Err(format!("{what}: {}x{} is {:.1} MP; at most {} MP (it is resized to about 1 MP anyway)", p.width, p.height, px as f64 / 1e6,
+                           MAX_PICTURE_PIXELS / 1_000_000));
+    }
+    Ok(p)
+}
+
+/// image.generate's init picture (base64 or a data URL)
+fn init_picture(s: &str) -> Result<nextsycl_image::Picture, String> {
+    picture(&http::unbase64(s).map_err(|e| format!("image: {e}"))?, "image")
+}
+
 /// a PDF's pages are rendered at this (a letter page: 1275 x 1650)
 const PDF_DPI: f32 = 150.0;
 
@@ -138,7 +159,7 @@ fn edit_body(req: &http::Request) -> Result<(Value, Vec<nextsycl_image::Picture>
                 continue;
             }
             if name == "image" || name.starts_with("image_") {
-                pics.push(nextsycl_image::Picture::decode(&p.data).map_err(|e| format!("{}: {e}", p.filename.as_deref().unwrap_or(name)))?);
+                pics.push(picture(&p.data, p.filename.as_deref().unwrap_or(name))?);
                 continue;
             }
             let text = String::from_utf8_lossy(&p.data).to_string();
@@ -164,7 +185,7 @@ fn edit_body(req: &http::Request) -> Result<(Value, Vec<nextsycl_image::Picture>
         };
         for (i, s) in list.iter().enumerate() {
             let bytes = http::unbase64(s).map_err(|e| format!("images[{i}]: {e}"))?;
-            pics.push(nextsycl_image::Picture::decode(&bytes).map_err(|e| format!("images[{i}]: {e}"))?);
+            pics.push(picture(&bytes, &format!("images[{i}]"))?);
         }
         v
     };
@@ -271,7 +292,17 @@ impl ImageServer {
                     Err(e) => return http::respond_with(&mut s, 400, &err(format!("the body is not JSON: {e}")), &cors),
                 };
                 let base = req.host.as_deref().map(|h| format!("http://{h}")).unwrap_or_default();
-                match self.generate(&body, &base, Vec::new()) {
+                // an init picture: a plain img2img (the denoise starts from it; it is no edit's reference)
+                let mut body = body;
+                let mut pics = Vec::new();
+                if let Some(i) = ["image", "init_image"].iter().find_map(|k| body[*k].as_str().filter(|v| !v.is_empty())).map(str::to_string) {
+                    match init_picture(&i) {
+                        Ok(p) => pics.push(p),
+                        Err(m) => return http::respond_with(&mut s, 400, &err(m), &cors),
+                    }
+                    body["reference"] = json!(false);
+                }
+                match self.generate(&body, &base, pics) {
                     Ok(v) => http::respond_with(&mut s, 200, &v, &cors),
                     Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
                 }
@@ -526,8 +557,13 @@ impl ImageServer {
         if !(0.05..=1.0).contains(&strength) {
             return Err(bad(format!("strength {strength}: from 0.05 to 1")));
         }
+        // the pictures are the edit's references too, unless reference is false (a plain img2img)
+        let condition = b["reference"] != false;
         if strength < 1.0 && pics.is_empty() {
-            return Err(bad("strength: an edit's (the picture to start from)".into()));
+            return Err(bad("strength: needs a picture to start from (image.generate's image, or image.edit's first picture)".into()));
+        }
+        if !condition && strength >= 1.0 {
+            return Err(bad("an init picture without its use as a reference needs strength below 1 (at 1 the picture would be ignored)".into()));
         }
         let req = ImageRequest {
             prompt: prompt.clone(),
@@ -542,7 +578,7 @@ impl ImageServer {
             schedule,
             shift: num(&["shift"]).map(|v| v as f32),
             loras: Vec::new(),
-            edit: (!pics.is_empty()).then(|| nextsycl_image::Edit { image: pics[0].clone(), refs: pics[1..].to_vec(), mask: None, strength: strength as f32 }),
+            edit: (!pics.is_empty()).then(|| nextsycl_image::Edit { image: pics[0].clone(), refs: pics[1..].to_vec(), mask: None, strength: strength as f32, condition }),
             rgba: b["background"].as_str() == Some("transparent") || b["rgba"].as_bool() == Some(true),
             extra: Default::default(),
         };

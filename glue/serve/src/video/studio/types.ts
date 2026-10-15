@@ -97,6 +97,14 @@ export interface Status {
   all_projects: string[];
   version?: string;
   preview?: string | null;    // while it samples: a picture of the shot so far (PNG URL, new each step)
+  failure?: Failure | null;   // failed or cancelled: the error as data
+  gpu?: number | null;        // the card the clip runs on
+}
+
+export interface Failure {
+  code: "out_of_memory" | "engine_lost" | "invalid_input" | "engine_error" | "cancelled";
+  retryable: boolean;         // true only for engine_lost
+  message: string; hint: string;
 }
 
 export interface QueueItem {

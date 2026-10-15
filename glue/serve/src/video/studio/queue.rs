@@ -180,16 +180,22 @@ pub fn unchain(p: &Value) -> Result<(Value, Vec<String>), RpcError> {
 pub const IGNORED: [&str; 2] = ["negative_prompt", "cfg"];
 
 /// What each denoiser takes (engines.list): the text/image-to-video ones and Ref2VA
+/// Keys accepted and listed back in `ignored`: nothing on this box reads them (cfg is 1, a single pass a step; no
+/// pin renormalisation)
+fn ignored_keys() -> Vec<String> {
+    IGNORED.iter().map(|k| k.to_string()).chain(["chain.pin_renorm".to_string()]).collect()
+}
+
 pub fn inputs_of(quant: &str) -> Value {
     let common = ["prompt", "seconds", "frames", "steps", "seed", "width", "height", "te", "first_frame", "last_frame", "exposure_ref", "guide_clip",
                   "first_audio", "first_audio_s", "ref_audios", "loras", "upscale", "upscaler", "shift_video", "shift_audio", "sampler", "schedule", "chain", "source", "regen", "regen_box"];
     if quant == "REF2VA" {
         json!({"takes": common.iter().chain(["ref_images", "ref_videos", "ref_image_size", "ref_video_sound", "te_pictures"].iter()).collect::<Vec<_>>(),
                "not": ["control_video", "control_mask", "control_source", "control_strength", "control_start", "control_end"],
-               "chosen": "by itself when ref_images or ref_videos are given"})
+               "chosen": "by itself when ref_images or ref_videos are given", "ignored": ignored_keys()})
     } else {
         json!({"takes": common.iter().chain(["control_video", "control_mask", "control_source", "control_strength", "control_start", "control_end"].iter()).collect::<Vec<_>>(),
-               "not": ["ref_images", "ref_videos"], "chosen": if quant == "INT8" { "by default" } else { "by engine" }})
+               "not": ["ref_images", "ref_videos"], "chosen": if quant == "INT8" { "by default" } else { "by engine" }, "ignored": ignored_keys()})
     }
 }
 

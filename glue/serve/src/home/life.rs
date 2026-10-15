@@ -10,7 +10,7 @@
 //!   one running), ending itself when idle. A second (`--slot 1`, NS_IMAGE_PORT2 / NS_AUDIO_PORT2) holds another model,
 //!   or a second copy of a model enabled on two cards: started when a request finds its copy with work and its other
 //!   card with room; requests go to the copy without work, else the one with fewer. A start waits for the card to have the model's memory free (1.5 GiB to spare: past that the xe driver
-//!   spills into host memory and the box can hang), and answers 409 when it does not come free.
+//!   spills into host memory and the box can hang), and answers 503 no_room when it does not come free.
 //! - video: the daemon (`nextsycl video start`) with the enabled video models as its engines, on their GPUs; its
 //!   workers load per clip and let the card go when idle. No video model enabled: the daemon is stopped.
 
@@ -522,7 +522,7 @@ impl Home {
                 if !listening(self.o.ports.video) {
                     return self.chat_start(id);
                 }
-                call_for(&self.target("video"), "POST", "/rpc/llm.mode", Some(&json!({"mode": id})), 600).map_err(|e| (503, format!("the studio's llm.mode: {e}")))?;
+                call_for(&self.target("video"), "POST", "/rpc/llm.mode", Some(&json!({"mode": id})), 600).map_err(|e| (502, format!("the studio's llm.mode: {e}")))?;
                 let t0 = Instant::now();
                 while t0.elapsed() < Duration::from_secs(900) {
                     if self.chat_loaded(&all).as_deref() == Some(id) {
@@ -554,7 +554,7 @@ impl Home {
                 }
                 if self.chat_loaded(&self.models()).as_deref() == Some(id) {
                     call_for(&self.target("video"), "POST", "/rpc/llm.mode", Some(&json!({"mode": "none"})), 120)
-                        .map_err(|e| (503, format!("the studio's llm.mode: {e}")))?;
+                        .map_err(|e| (502, format!("the studio's llm.mode: {e}")))?;
                 }
                 Ok(())
             }
@@ -623,7 +623,7 @@ impl Home {
             let t0 = Instant::now();
             while self.server_at(x.port).is_some_and(|(_, _, busy)| busy) || inflight(x.port) > 0 {
                 if t0.elapsed() > Duration::from_secs(1800) {
-                    return Err((409, format!("{other} has been busy for 30 minutes; {id} waits for it")));
+                    return Err((503, format!("{other} has been busy for 30 minutes; {id} waits for it")));
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }
@@ -643,7 +643,7 @@ impl Home {
                         .collect();
                     format!("GPU {g}: {:.1} GiB free ({})", free(&cards, *g) as f64 / 1024.0, holders.join(", "))
                 }).collect();
-                return Err((409, format!("{} busy - {}; {id} needs ~{:.1} GiB; it loads once one idles out or is stopped",
+                return Err((503, format!("{} busy - {}; {id} needs ~{:.1} GiB; it loads once one idles out or is stopped",
                                          if gpus.len() > 1 { "its cards are" } else { "its card is" }, busy.join("; "),
                                          want(gpus[0]) as f64 / 1024.0)));
             }
@@ -664,7 +664,7 @@ impl Home {
         self.loading.lock().unwrap().insert(id.to_string(), now());
         let r = self.exec(format!("{kind} start {id} on GPU {gpu}{}", if x.slot > 0 { format!(" (server {})", x.slot + 1) } else { String::new() }), &args);
         self.loading.lock().unwrap().remove(id);
-        r.map_err(|e| (503, e))?;
+        r.map_err(|e| (502, e))?;
         self.wait_up(x.port, id)
     }
 
