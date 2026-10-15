@@ -303,9 +303,16 @@ impl Home {
             }
             return Ok(json!({"cancelled": stopped > 0, "stopped": stopped}));
         }
-        let open: Vec<Value> = self.jobs.named(kind, b).into_iter().filter(|j| !ended(j)).collect();
+        let named = self.jobs.named(kind, b);
+        let open: Vec<Value> = named.iter().filter(|j| !ended(j)).cloned().collect();
+        let which = if label.is_empty() { format!("reentrant_id {:?}", reentrant(b).unwrap_or_default()) } else { format!("label {label:?}") };
         if open.is_empty() {
-            return Err((404, format!("no queued or running {kind} job labelled {label:?}")));
+            // ended already: nothing to stop, which is what a cancel wants (its state says how it ended)
+            if let Some(j) = named.first() {
+                return Ok(json!({"cancelled": 0, "stopped": 0, "already_ended": true, "state": j["state"], "label": j["label"],
+                                 "reentrant_id": j["reentrant_id"], "jobs": [j["id"]]}));
+            }
+            return Err((404, format!("no {kind} job with {which}")));
         }
         let mut stopped = 0;
         for j in &open {
@@ -318,7 +325,7 @@ impl Home {
                 }
             }
         }
-        Ok(json!({"cancelled": open.len(), "stopped": stopped, "label": label,
+        Ok(json!({"cancelled": open.len(), "stopped": stopped, "already_ended": false, "label": open[0]["label"], "reentrant_id": open[0]["reentrant_id"],
                   "jobs": open.iter().map(|j| j["id"].clone()).collect::<Vec<_>>()}))
     }
 

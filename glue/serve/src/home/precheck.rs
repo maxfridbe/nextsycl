@@ -176,6 +176,17 @@ impl Home {
             }
         }
         let voice = s(b, "voice");
+        // the model's own voices and languages, from its config (Qwen3-TTS: talker_config); a model without lists
+        // (VoxCPM2) takes any language
+        let (own_voices, own_langs) = speech_lists(&m);
+        let lang = s(b, "language").to_lowercase();
+        if !lang.is_empty() && lang != "auto" && !own_langs.is_empty() && !own_langs.contains(&lang) {
+            let shown: Vec<&str> = own_langs.iter().map(String::as_str).filter(|l| !l.ends_with("_dialect")).collect();
+            return Err(bad(format!("language {lang}: not one {id} speaks ({}, or auto)", shown.join(", "))));
+        }
+        if !voice.is_empty() && carried.is_empty() && can("voices") && !saved(&voice) && !own_voices.is_empty() && !own_voices.contains(&voice.to_lowercase()) {
+            return Err(bad(format!("voice {voice}: not a built-in voice of {id} ({}) nor a saved one (audio.voices.list)", own_voices.join(", "))));
+        }
         if !voice.is_empty() && carried.is_empty() && !can("voices") && !saved(&voice) {
             return Err(bad(format!("voice {voice}: not a saved voice (audio.voices.list), and {id} has no built-in voices")));
         }
@@ -192,3 +203,13 @@ impl Home {
         Ok(())
     }
 }
+
+/// A speech model's built-in voices and languages (lower case), read from its config file; empty: no list (any)
+pub fn speech_lists(m: &Value) -> (Vec<String>, Vec<String>) {
+    let Some(c) = m["files"]["config"].as_str().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let keys = |k: &str| -> Vec<String> { c["talker_config"][k].as_object().into_iter().flatten().map(|(n, _)| n.to_lowercase()).collect() };
+    (keys("spk_id"), keys("codec_language_id"))
+}
+
