@@ -17,7 +17,8 @@ export type ErrorCode =
 /** "prev" = previous clip of this series, "first" = the series hub, "*_cam" = same camera only. */
 export type Anchor = "prev" | "prev_cam" | "first" | "first_cam" | (string & {});
 export type ChainMode = "png" | "video" | "latent" | "none";
-export type Engine = "Q4_K_M" | "Q6_K" | "Q8_0";
+/** engines.list's quant: INT8 (default; Q8_0 is read as it), Q6_K, Q4_K_M, REF2VA (chosen by itself for ref_images / ref_videos) */
+export type Engine = "INT8" | "Q6_K" | "Q4_K_M" | "REF2VA" | (string & {});
 export type ClipState = "done" | "running" | "queued" | "held";
 
 export interface GenerateRequest {
@@ -27,7 +28,7 @@ export interface GenerateRequest {
   seed?: number;
   te?: "teacher" | "student";
   label?: string;            // "Name NN/MM: ..." - the NN drives edit order
-  width?: number; height?: number;
+  width?: number; height?: number;  // 256-1344, multiples of 32, width * height <= 1032192
   engine?: Engine;
   chain_mode?: ChainMode;
   first_frame?: Anchor | null;   // also accepts a still dropped into out/
@@ -39,14 +40,23 @@ export interface GenerateRequest {
   camera?: string | null;
   upscale?: number;          // latent upscale at decode, 1.5 = free resolution
   loras?: string[];          // "path:strength"
-  ref_audios?: string[];     // voices to speak in: <Audio 1>, <Audio 2> ... (files in out/)
+  ref_audios?: string[];     // at most 3; voices to speak in: <Audio 1>, <Audio 2> ... (files in out/)
   guide_clip?: string | null;  // motion guide: "<anchor or file>[:frames[:at]]" - the last frames of a clip as one moving keyframe
   shift_video?: number; shift_audio?: number;  // flow shifts (12, 3)
   source?: Anchor | null;    // masked run: a clip whose latents are kept outside the regenerated part
   regen?: string | null;     // "from-to" seconds to regenerate; a source shorter than the clip is extended
   regen_box?: string | null; // "x0,y0,x1,y1" pixels: regenerate only inside
   project?: string; batch?: string;
-  queue?: boolean;
+  queue?: boolean;           // busy without it: 409 busy
+  priority?: number;         // -9..9: a queued clip goes ahead of lower ones
+  upscaler?: "esrgan-general" | "esrgan-anime" | "latent";
+  ref_images?: string[];     // at most 9 (Ref2VA)
+  ref_videos?: string[];     // at most 3
+  ref_image_size?: "match" | "max";
+  ref_video_sound?: boolean; te_pictures?: boolean;
+  control_video?: string; control_mask?: string; control_source?: string;
+  control_strength?: number; control_start?: number; control_end?: number;
+  sampler?: string; schedule?: string;
 }
 
 export interface Job extends GenerateRequest {
@@ -101,7 +111,9 @@ export interface Methods {
   "status": [Record<string, never>, Status];
   "wait": [{ version?: string; timeout_s?: number }, Status & { changed: boolean }];
   "generate": [GenerateRequest, { queued: boolean; position?: number; job?: Job }];
-  "cancel": [Record<string, never>, { stopped: true }];
+  "cancel": [{ label?: string }, { stopped: boolean; removed: number; label?: string }];
+  "queue.move": [{ label: string; position?: number; priority?: number }, { label: string; position: number; queue: string[] }];
+  "queue.remove": [{ label: string }, { removed: number; label: string }];
   "queue.list": [Record<string, never>, { queue: GenerateRequest[] }];
   "queue.clear": [Scope, { cleared: number }];
   "queue.pause": [Scope, HoldResult];

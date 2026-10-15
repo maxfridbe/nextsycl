@@ -18,6 +18,7 @@ use super::life::s;
 use super::{now, Home};
 use crate::http::{self, call_for, Conn, Request};
 use super::registry;
+use super::spec;
 
 /// One method: its kind and name, what it does, its body's fields (name, JSON type, description, required) and an
 /// example body
@@ -34,6 +35,8 @@ const MODEL_OPT: (&str, &str, &str, bool) = ("model", "string", "the model's id;
 
 pub const METHODS: &[Method] = &[
     Method { kind: "system", name: "state", summary: "The box: the GPUs (memory by process and vouched for), every model's state, the front ends", fields: &[], example: "{}" },
+    Method { kind: "system", name: "busy", summary: "Is anything working: a clip made or waiting to run, a picture, sound or chat answered, a model loading. video.accepts says whether video.generate starts a clip at once (else 409 busy without queue: true)",
+             fields: &[], example: "{}" },
     Method { kind: "system", name: "models", summary: "Every registered model: kind, enabled, its GPUs, its state (disabled, unloaded, loading, loaded, busy, ready)", fields: &[], example: "{}" },
     Method { kind: "system", name: "enable", summary: "Offer a model on GPU(s): it loads on its first request and unloads when idle; chat models join Open WebUI's list",
              fields: &[MODEL, ("gpus", "integer[]", "the cards (default: as registered); several for a model that spans cards", false)],
@@ -124,20 +127,62 @@ pub const METHODS: &[Method] = &[
     Method { kind: "audio", name: "cancel", summary: "Stop the sound being made (between steps or frames)", fields: &[], example: "{}" },
     Method { kind: "audio", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "minimax-music3"}"# },
 
-    Method { kind: "video", name: "generate", summary: "Queue a clip (the studio's generate: every key of the studio's form)",
-             fields: &[("prompt", "string", "the structured prompt (video.describePromptGuideMD)", true), ("seconds", "number", "4-15", false),
-                       ("steps", "integer", "", false), ("seed", "integer", "", false), ("width", "integer", "", false), ("height", "integer", "", false),
-                       ("engine", "string", "INT8, Q6_K, Q4_K_M, REF2VA", false), ("label", "string", "", false), ("project", "string", "", false),
-                       ("first_frame", "string", "a picture or clip in the studio's output, or prev", false), ("last_frame", "string", "", false),
-                       ("ref_images", "string[]", "Ref2VA references (files in the output)", false), ("ref_videos", "string[]", "", false), ("ref_audios", "string[]", "", false),
-                       ("control_video", "string", "", false), ("control_mask", "string", "", false), ("control_source", "string", "", false),
-                       ("sampler", "string", "", false), ("schedule", "string", "", false), ("queue", "boolean", "queue when busy (default: 409 busy)", false)],
-             example: r#"{"prompt": "integrated_multimodal_description: [Shot 1] Live-action, a red fox trots through deep snow at dawn.\n\noverall_soundscape: soft wind, crunching snow.\n\nnon_diegetic_music: None.", "seconds": 5, "steps": 8, "queue": true}"# },
+    Method { kind: "video", name: "generate", summary: "Make a clip: it starts at once when the studio is idle (queued: false, the job), else it is queued with queue: true (queued: true, its position) or refused with 409 busy. Anchors (first_frame, last_frame, exposure_ref, first_audio, guide_clip, source) take prev, prev_cam, first, first_cam - clips of the label's series, see label - or a file in the clips directory (video.upload, or a finished clip's name)",
+             fields: &[("prompt", "string", "the structured prompt (video.describePromptGuideMD)", true),
+                       ("seconds", r#"{"type": "number", "minimum": 1, "maximum": 15.1, "default": 10}"#, "length; snapped up to the model's frame grid (17k + 5 frames at 24 fps); the model is trained on 5.2-15.1 s", false),
+                       ("steps", r#"{"type": "integer", "minimum": 1, "maximum": 40, "default": 10}"#, "denoising steps; below 8 only with a turbo LoRA", false),
+                       ("seed", r#"{"type": "integer", "minimum": -2147483648, "maximum": 2147483648, "default": 0}"#, "", false),
+                       ("width", r#"{"type": "integer", "minimum": 256, "maximum": 1344, "multipleOf": 32, "default": 768}"#, "a multiple of 32; width x height at most 1032192 pixels (768 x 1344); video.canvases.list has the tested ones", false),
+                       ("height", r#"{"type": "integer", "minimum": 256, "maximum": 1344, "multipleOf": 32, "default": 576}"#, "as width", false),
+                       ("engine", r#"{"type": "string", "default": "INT8"}"#, "the denoiser, by video.engines.list's quant (Q8_0 is read as INT8); REF2VA is chosen by itself when ref_images or ref_videos are given", false),
+                       ("label", r#"{"type": "string", "maxLength": 80}"#, "\"<series> NN/MM: text\", e.g. \"Harbour 03/12: the lamp\": NN is the clip's place in video.timeline (the edit order), the text before it the series the anchors prev / first look in and the project when none is given. Letters, digits, _ and  -.,:'()!?/ only (others are dropped); labels name clips for video.cancel, video.queue.move and video.queue.remove", false),
+                       ("project", r#"{"type": "string", "maxLength": 60}"#, "default: the label's series", false),
+                       ("batch", r#"{"type": "string", "maxLength": 60}"#, "a group inside the project, held or cleared together", false),
+                       ("queue", r#"{"type": "boolean", "default": false}"#, "queue the clip when the studio is busy (false: 409 busy)", false),
+                       ("priority", r#"{"type": "integer", "minimum": -9, "maximum": 9, "default": 0}"#, "a queued clip goes ahead of every clip of a lower priority (same priority: first come first made)", false),
+                       ("te", r#"{"type": "string", "enum": ["teacher", "student"], "default": "teacher"}"#, "the text encoder", false),
+                       ("chain_mode", r#"{"type": "string", "enum": ["video", "png", "latent", "none"], "default": "video"}"#, "how a first_frame clip is carried over: its mp4's last frame, its lossless .last.png, its last latent, or not at all", false),
+                       ("first_frame", "string", "anchor or file: the clip starts on this picture / clip's last frame", false),
+                       ("last_frame", "string", "anchor or file: the clip ends on this picture (prev: the newest clip anywhere)", false),
+                       ("exposure_ref", "string", "anchor or file: a picture whose exposure and colour the clip keeps", false),
+                       ("first_audio", "string", "anchor or file: the sound the clip continues from", false),
+                       ("first_audio_s", r#"{"type": "number"}"#, "seconds of first_audio to continue from", false),
+                       ("guide_clip", "string", "a motion guide: \"<anchor or file>[:frames[:at]]\" - the last frames of a clip as one moving keyframe", false),
+                       ("camera", "string", "a camera name: prev_cam / first_cam anchor on the series' clips of the same camera", false),
+                       ("upscale", r#"{"type": "number", "minimum": 1}"#, "upscale at decode (1.5: the canvas 1.5 times); above 1 only", false),
+                       ("upscaler", r#"{"type": "string", "enum": ["esrgan-general", "esrgan-anime", "latent"], "default": "esrgan-general"}"#, "with upscale", false),
+                       ("loras", r#"{"type": "array", "items": {"type": "string", "maxLength": 200}}"#, "\"path:strength\"", false),
+                       ("ref_images", r#"{"type": "array", "maxItems": 9, "items": {"type": "string"}}"#, "Ref2VA reference pictures (files in the clips directory), <Image 1> ... in the prompt", false),
+                       ("ref_videos", r#"{"type": "array", "maxItems": 3, "items": {"type": "string"}}"#, "Ref2VA reference clips", false),
+                       ("ref_audios", r#"{"type": "array", "maxItems": 3, "items": {"type": "string"}}"#, "voices to speak in: <Audio 1> ... in the prompt", false),
+                       ("ref_image_size", r#"{"type": "string", "enum": ["match", "max"]}"#, "reference pictures resized to the canvas, or kept as large as fits", false),
+                       ("ref_video_sound", "boolean", "the reference clips' sound too", false),
+                       ("te_pictures", "boolean", "the text encoder sees the reference pictures", false),
+                       ("control_video", "string", "a ControlNet control clip (file); not with Ref2VA", false),
+                       ("control_mask", "string", "a mask clip or picture (file): regenerate inside it", false),
+                       ("control_source", "string", "the clip the mask applies to (file)", false),
+                       ("control_strength", r#"{"type": "number", "minimum": 0, "maximum": 10, "default": 1}"#, "", false),
+                       ("control_start", r#"{"type": "number", "minimum": 0, "maximum": 1, "default": 0}"#, "the part of the steps the control steers", false),
+                       ("control_end", r#"{"type": "number", "minimum": 0, "maximum": 1, "default": 1}"#, "", false),
+                       ("source", "string", "anchor or file: a masked run - this clip's latents are kept outside the regenerated part", false),
+                       ("regen", "string", "\"from-to\" seconds to regenerate in source; a source shorter than the clip is extended", false),
+                       ("regen_box", "string", "\"x0,y0,x1,y1\" pixels: regenerate only inside", false),
+                       ("shift_video", "number", "flow shift of the picture (12)", false), ("shift_audio", "number", "flow shift of the sound (3)", false),
+                       ("cond_noise_aug", "number", "noise on the first frame (harmful here: shows as confetti)", false),
+                       ("sampler", "string", "ComfyUI's name (none: the engine's own Euler)", false), ("schedule", "string", "ComfyUI's name", false)],
+             example: r#"{"prompt": "integrated_multimodal_description: [Shot 1] Live-action, a red fox trots through deep snow at dawn.\n\noverall_soundscape: soft wind, crunching snow.\n\nnon_diegetic_music: None.", "label": "Fox 01/03: snow", "seconds": 5, "steps": 8, "queue": true}"# },
     Method { kind: "video", name: "status", summary: "The clip running or last: stage, percent, ETA, timings, the queue, version", fields: &[], example: "{}" },
     Method { kind: "video", name: "wait", summary: "Long poll: answers when the status's version changes, or at the timeout",
              fields: &[("version", "string", "the last version seen", false), ("timeout_s", "number", "", false)], example: r#"{"version": "", "timeout_s": 30}"# },
-    Method { kind: "video", name: "cancel", summary: "Stop the running clip at its next step", fields: &[], example: "{}" },
-    Method { kind: "video", name: "queue.list", summary: "The queue", fields: &[], example: "{}" },
+    Method { kind: "video", name: "cancel", summary: "Stop the running clip at its next step; with a label, that clip only: stopped if it runs, dropped from the queue if it waits",
+             fields: &[("label", "string", "a clip's label (none: the running clip)", false)], example: r#"{"label": "Fox 02/03: the den"}"# },
+    Method { kind: "video", name: "queue.list", summary: "The queue in the order it will run (each item as video.generate checked it)", fields: &[], example: "{}" },
+    Method { kind: "video", name: "queue.move", summary: "Move a queued clip (the first with that label) to a place in the queue: 1 = made next",
+             fields: &[("label", "string", "", true), ("position", r#"{"type": "integer", "minimum": 1, "default": 1}"#, "", false),
+                       ("priority", r#"{"type": "integer", "minimum": -9, "maximum": 9}"#, "give it this priority too (where later clips go)", false)],
+             example: r#"{"label": "Fox 03/03: night", "position": 1}"# },
+    Method { kind: "video", name: "queue.remove", summary: "Drop the queued clips with that label (a running one: video.cancel)", fields: &[("label", "string", "", true)],
+             example: r#"{"label": "Fox 03/03: night"}"# },
     Method { kind: "video", name: "queue.pause", summary: "Hold a project or batch (none: everything)", fields: &[("project", "string", "", false), ("batch", "string", "", false)], example: r#"{"project": "Harbour"}"# },
     Method { kind: "video", name: "queue.resume", summary: "Release a project or batch (none: everything)", fields: &[("project", "string", "", false), ("batch", "string", "", false)], example: "{}" },
     Method { kind: "video", name: "queue.clear", summary: "Drop the queue, or a project's / batch's part of it", fields: &[("project", "string", "", false), ("batch", "string", "", false)], example: "{}" },
@@ -163,7 +208,7 @@ fn code_of(status: u16) -> &'static str {
         401 => "unauthorized",
         404 => "not_found",
         409 => "conflict",
-        503 => "unavailable",
+        502 | 503 => "unavailable",
         504 => "timeout",
         _ => "internal",
     }
@@ -198,7 +243,11 @@ impl Home {
                     _ => return fail(&mut s, 400, "the body must be a JSON object".into()),
                 }
             };
-            match self.rpc(&req.path["/rpc/".len()..], &body) {
+            let name = &req.path["/rpc/".len()..];
+            if let Some((st, v)) = self.studio_rpc(name, &body, req.host.as_deref().unwrap_or("localhost:8000")) {
+                return http::respond(&mut s, st, &v);
+            }
+            match self.rpc(name, &body) {
                 Ok(v) => {
                     // the files an answer links, as the caller reaches them (through here: /v1/.../files/...)
                     let host = req.host.clone().unwrap_or_else(|| "localhost:8000".into());
@@ -310,7 +359,8 @@ impl Home {
         Ok(json!({"voice": v, "sample": format!("http://nextsycl/v1/audio/voices/{name}.wav"), "seed": seed}))
     }
 
-    fn rpc(self: &Arc<Self>, name: &str, b: &Value) -> Result<Value, Fail> {
+    /// The method a name calls, its body's required fields there, its kind enabled
+    fn checked(&self, name: &str, b: &Value, all: &[Value]) -> Result<&'static Method, Fail> {
         let Some(m) = METHODS.iter().find(|m| format!("{}.{}", m.kind, m.name) == name) else {
             return Err((404, format!("no method {name} (GET /openapi.yml)")));
         };
@@ -319,14 +369,99 @@ impl Home {
                 return Err((400, format!("{name} needs \"{f}\"")));
             }
         }
-        let all = self.models();
-        if !self.kinds_on(&all).contains(&m.kind) {
+        if !self.kinds_on(all).contains(&m.kind) {
             return Err((409, format!("no {} model is enabled (system.enable)", m.kind)));
         }
+        Ok(m)
+    }
+
+    /// A studio method (video.*, but upload and the guide): the studio's answer as it gave it - its status and error
+    /// code (busy, not_running ...) - with the files it names as URLs through here
+    fn studio_rpc(&self, name: &str, b: &Value, host: &str) -> Option<(u16, Value)> {
+        let method = name.strip_prefix("video.").filter(|m| !matches!(*m, "upload" | "describePromptGuideMD"))?;
+        let all = self.models();
+        let envelope = |st: u16, m: String| (st, json!({"ok": false, "error": {"code": code_of(st), "message": m}}));
+        if let Err((st, m)) = self.checked(name, b, &all) {
+            return Some(envelope(st, m));
+        }
+        let (st, mut v) = match http::call_status(&self.target("video"), "POST", &format!("/rpc/{method}"), Some(b), 120) {
+            Ok(r) => r,
+            Err(e) => return Some(envelope(502, format!("the video studio does not answer: {e}"))),
+        };
+        if v["ok"] == false {
+            // one spelling for both servers
+            if v["error"]["code"] == "invalid_param" {
+                v["error"]["code"] = json!("invalid_params");
+            }
+            return Some((st, v));
+        }
+        let url = |kind: &str, n: &str| format!("http://{host}/v1/video/{kind}/{n}");
+        let r = &mut v["result"];
+        if let Some(f) = r["file"].as_str().and_then(|f| f.strip_prefix("/out/")).map(str::to_string) {
+            r["file"] = json!(url("files", &f));
+        }
+        for c in r.get_mut("clips").and_then(Value::as_array_mut).into_iter().flatten() {
+            if c["state"] == "done" {
+                if let Some(n) = c["name"].as_str().map(str::to_string) {
+                    c["file"] = json!(url("files", &format!("{n}.mp4")));
+                    c["thumb"] = json!(url("thumbs", &format!("{n}.webp")));
+                }
+            }
+        }
+        Some((st, v))
+    }
+
+    /// Whether anything is working: models loading or answering, chat requests, the clip being made and the queue
+    fn busy(&self, all: &[Value]) -> Value {
+        let cards = self.named_cards(all);
+        let states = self.model_states(all, &cards);
+        let with = |st: &str| states.iter().filter(|m| m["state"] == st).collect::<Vec<_>>();
+        let loading: Vec<Value> = with("loading").iter().map(|m| m["id"].clone()).collect();
+        let working: Vec<Value> = with("busy").iter().map(|m| json!({"id": m["id"], "kind": m["kind"]})).collect();
+        let mut reasons: Vec<String> = loading.iter().map(|m| format!("{} loading", m.as_str().unwrap_or(""))).collect();
+        reasons.extend(working.iter().map(|m| format!("{} answering", m["id"].as_str().unwrap_or(""))));
+        let active = if self.kinds_on(all).contains(&"llm") {
+            let dir = self.o.cfg.get("NS_SOCKET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())).join("nextsycl")
+            });
+            call_for(&crate::http::Target::Unix(dir.join("nextsycl.sock")), "GET", "/server/requests", None, 3).ok()
+                .and_then(|v| v["active"].as_array().map(|a| a.len())).unwrap_or(0)
+        } else {
+            0
+        };
+        if active > 0 {
+            reasons.push(format!("{active} chat request(s)"));
+        }
+        let video = if self.kinds_on(all).contains(&"video") {
+            let st = call_for(&self.target("video"), "POST", "/rpc/status", Some(&json!({})), 10).ok().map(|v| v["result"].clone()).unwrap_or(Value::Null);
+            let items = st["queue_items"].as_array().cloned().unwrap_or_default();
+            let held = items.iter().filter(|i| i["held"] == true).count();
+            let running = !st.is_null() && st["idle"] != true;
+            let runnable = items.len() - held;
+            if running {
+                reasons.push(format!("clip {} {}", st["job"]["label"].as_str().unwrap_or(""), st["stage"].as_str().unwrap_or("")));
+            }
+            if runnable > 0 {
+                reasons.push(format!("{runnable} clip(s) queued"));
+            }
+            let on = |k: &str| if running { st[k].clone() } else { Value::Null };
+            json!({"running": running, "label": if running { st["job"]["label"].clone() } else { Value::Null }, "name": if running { st["job"]["name"].clone() } else { Value::Null },
+                   "stage": on("stage"), "pct": on("pct"), "eta_s": on("eta"), "queued": items.len(), "runnable": runnable, "held": held,
+                   "accepts": !st.is_null() && !running && runnable == 0, "reachable": !st.is_null()})
+        } else {
+            Value::Null
+        };
+        json!({"busy": !reasons.is_empty(), "reasons": reasons, "loading": loading, "working": working, "llm": {"active": active}, "video": video})
+    }
+
+    fn rpc(self: &Arc<Self>, name: &str, b: &Value) -> Result<Value, Fail> {
+        let all = self.models();
+        let m = self.checked(name, b, &all)?;
         let model = || s(b, "model");
         let t = self.target(m.kind);
         match (m.kind, m.name) {
             ("system", "state") => Ok(self.state()),
+            ("system", "busy") => Ok(self.busy(&all)),
             ("system", "models") => {
                 let cards = self.named_cards(&all);
                 Ok(json!({"models": self.model_states(&all, &cards)}))
@@ -535,6 +670,17 @@ impl Home {
                                     origin: None, host: None, body: Vec::new() };
                 http::forward(s, &self.target("video"), &req).map_err(|e| (502, e))
             }
+            ("GET", p) if p.starts_with("/v1/video/thumbs/") => {
+                need("video")?;
+                let name = &p["/v1/video/thumbs/".len()..];
+                if name.is_empty() || name.contains('/') || !name.ends_with(".webp") {
+                    return Err((404, format!("no still {name}")));
+                }
+                let req = Request { method: "GET".into(), path: format!("/thumb/{name}"), target: format!("/thumb/{name}"),
+                                    head: format!("GET /thumb/{name} HTTP/1.1\r\nHost: studio\r\nConnection: close\r\n\r\n").into_bytes(),
+                                    origin: None, host: None, body: Vec::new() };
+                http::forward(s, &self.target("video"), &req).map_err(|e| (502, e))
+            }
             ("GET", p) if p.starts_with("/v1/audio/voices/") => {
                 let name = p["/v1/audio/voices/".len()..].trim_end_matches(".wav");
                 match self.voices().sample_path(name).and_then(|f| std::fs::read(f).ok()) {
@@ -558,12 +704,20 @@ impl Home {
         let envelope = json!({"type": "object", "properties": {
             "ok": {"type": "boolean"}, "result": {"description": "the method's answer"},
             "error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}});
+        let engines: Vec<String> = if on.contains(&"video") {
+            call_for(&self.target("video"), "POST", "/rpc/engines.list", Some(&json!({})), 3).ok()
+                .and_then(|v| v["result"]["engines"].as_array().map(|a| a.iter().filter_map(|e| e["quant"].as_str().map(str::to_string)).collect()))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let mut paths = Map::new();
         for m in METHODS.iter().filter(|m| on.contains(&m.kind)) {
             let mut props = Map::new();
             let mut required = Vec::new();
             for (f, ty, d, req) in m.fields {
                 let mut p = match *ty {
+                    t if t.starts_with('{') => serde_json::from_str(t).unwrap_or_else(|e| panic!("{}.{} {f}: {e}", m.kind, m.name)),
                     t if t.ends_with("[]") => json!({"type": "array", "items": {"type": &t[..t.len() - 2]}}),
                     t => json!({"type": t}),
                 };
@@ -572,6 +726,15 @@ impl Home {
                 }
                 if *f == "model" && m.kind != "system" {
                     p["enum"] = Value::Array(ids(m.kind));
+                }
+                // the names the studio takes now: the daemon's denoisers, ComfyUI's samplers and schedules
+                if m.kind == "video" && m.name == "generate" {
+                    match *f {
+                        "engine" if !engines.is_empty() => p["enum"] = json!(engines),
+                        "sampler" => p["enum"] = json!(nextsycl_diffusion::samplers::NAMES),
+                        "schedule" => p["enum"] = json!(nextsycl_diffusion::Schedule::ALL.iter().map(|s| s.name()).collect::<Vec<_>>()),
+                        _ => {}
+                    }
                 }
                 props.insert(f.to_string(), p);
                 if *req {
@@ -584,13 +747,31 @@ impl Home {
             }
             let example: Value = serde_json::from_str(m.example).unwrap_or(json!({}));
             let route = format!("/rpc/{}.{}", m.kind, m.name);
+            let op = format!("{}.{}", m.kind, m.name);
+            let mut ok = envelope.clone();
+            if let Some(r) = spec::result(&op) {
+                ok["properties"]["result"] = serde_json::from_str(&r).unwrap_or_else(|e| panic!("{op} result: {e}"));
+            }
+            let mut responses = json!({"200": {"description": "{\"ok\": true, \"result\": ...}", "content": {"application/json": {"schema": ok}}},
+                                       "401": {"description": "unauthorized: no or a wrong token"},
+                                       "400": {"description": "invalid_request / invalid_params: the body or a value (error.message says which)"}});
+            for (st, code, when) in spec::errors(&op) {
+                let k = st.to_string();
+                let d = format!("{code}: {when}");
+                let d = match responses[&k]["description"].as_str() { Some(o) if *st != 400 => format!("{o}; {d}"), _ => d };
+                responses[&k] = json!({"description": d, "content": {"application/json": {"schema": envelope.clone()}}});
+            }
+            if m.kind != "system" {
+                let d = format!("conflict: no {} model is enabled", m.kind);
+                let d = match responses["409"]["description"].as_str() { Some(o) => format!("{o}; {d}"), None => d };
+                responses["409"] = json!({"description": d});
+            }
             let curl = format!("curl -s http://{host}{route} -H 'Authorization: Bearer {}' -H 'Content-Type: application/json' -d '{}'",
                                self.token, example.to_string().replace('\'', "'\\''"));
             paths.insert(route, json!({"post": {
                 "tags": [m.kind], "operationId": format!("{}.{}", m.kind, m.name), "summary": m.summary,
                 "requestBody": {"required": true, "content": {"application/json": {"schema": schema, "example": example}}},
-                "responses": {"200": {"description": "{\"ok\": true, \"result\": ...}", "content": {"application/json": {"schema": envelope.clone()}}},
-                              "4XX": {"description": "{\"ok\": false, \"error\": {\"code\", \"message\"}}"}},
+                "responses": responses,
                 "x-curl": curl,
             }}));
         }
@@ -619,14 +800,16 @@ impl Home {
         if on.contains(&"video") {
             paths.insert("/v1/video/files/{name}".into(), json!({"get": {"tags": ["openai"], "summary": "A finished clip (video.jobs.list's file), Range requests too",
                 "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "MP4"}}}}));
+            paths.insert("/v1/video/thumbs/{name}".into(), json!({"get": {"tags": ["openai"], "summary": "A finished clip's 240-pixel still (video.timeline's thumb): <clip>.webp",
+                "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "WebP"}}}}));
         }
         json!({
             "openapi": "3.0.3",
             "info": {"title": "nextsycl", "version": crate::VERSION, "description": format!(
                 "The box's API (nextsycl serve). Rules: POST /rpc/<kind>.<method>, every variable in the JSON body - no path variables, no query \
                  strings; answers {{\"ok\": true, \"result\": ...}} or {{\"ok\": false, \"error\": {{\"code\", \"message\"}}}}. The OpenAI-compatible \
-                 /v1 routes are the exception. Send Authorization: Bearer {} with every call. Kinds here: {}. Generated {:.0}.",
-                self.token, on.join(", "), now())},
+                 /v1 routes are the exception. Send Authorization: Bearer {} with every call. Kinds here: {}. Generated {:.0}.\n\n{}\n\n{}",
+                self.token, on.join(", "), now(), spec::CODES, spec::LABELS)},
             "servers": [{"url": format!("http://{host}")}],
             "security": [{"bearer": []}],
             "components": {"securitySchemes": {"bearer": {"type": "http", "scheme": "bearer", "description": format!("the token: {}", self.token)}}},

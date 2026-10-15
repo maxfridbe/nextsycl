@@ -346,12 +346,16 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
   - **The API**, behind `Authorization: Bearer <token>` (`NS_API_TOKEN`, else one made and kept in `serve.json`
     beside the registry; the page's API tab shows it): `POST /rpc/<kind>.<method>` - H3's rules: POST only, fixed
     routes, every variable in the JSON body, no path variables or query strings, `{"ok": true, "result": ...}` /
-    `{"ok": false, "error": {"code", "message"}}` - for `system` (state, models, enable, disable, load, unload),
+    `{"ok": false, "error": {"code", "message"}}`, the HTTP status and code the studio's own for video (409 `busy`,
+    `not_running` ...) - for `system` (state, busy, models, enable, disable, load, unload),
     `llm` (chat, models), `image` (generate, edit, info, progress, history), `audio` (generate, info, progress,
-    history, cancel), `video` (the studio's: generate, status, wait, queue.*, jobs.*, timeline, upload ...), each kind with
+    history, cancel), `video` (the studio's: generate, status, wait, cancel {label}, queue.* - move and remove by label,
+    generate's priority - jobs.*, timeline, upload ...), each kind with
     `describePromptGuideMD {model}`; and the OpenAI-compatible `/v1/models`, `/v1/chat/completions`,
-    `/v1/images/generations|edits`, `/v1/audio/speech` and the files they link (and `/v1/video/files/<clip>`). `GET /openapi.yml` describes the
-    kinds that have an enabled model (enabling one adds its methods); the API tab lists them with a curl each.
+    `/v1/images/generations|edits`, `/v1/audio/speech` and the files they link (and `/v1/video/files/<clip>`, `/v1/video/thumbs/<clip>.webp`). `GET /openapi.yml` describes the
+    kinds that have an enabled model (enabling one adds its methods): every body key with its limits and names (the
+    video engines as the daemon lists them), each answer's shape (glue/serve/src/home/spec.rs), each method's errors,
+    and the video label convention ("Series NN/MM: text"); the API tab lists them with a curl each.
     `/api/...` is the page's own.
   - **The settings** (the Config tab; `system.config`, `system.configSet {set: {NAME: value | null}} | {text}`,
     `system.restart {service}`): `nextsycl.conf` as every setting the program reads - what it does, its default,

@@ -178,13 +178,19 @@ pub fn forward_body(mut client: impl Write, upstream: &Target, req: &Request, bo
     Ok(())
 }
 
-/// `call` with a read timeout of `secs`
-pub fn call_for(t: &Target, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, String> {
+/// `call_for` that keeps the answer whatever its status: (status, body)
+pub fn call_status(t: &Target, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<(u16, Value), String> {
     let (status, mut r) = send(t, method, path, body)?;
     r.get_ref().set_read_timeout(Some(Duration::from_secs(secs))).map_err(|e| e.to_string())?;
     let mut all = String::new();
     r.read_to_string(&mut all).map_err(|e| e.to_string())?;
     let v: Value = if all.trim().is_empty() { Value::Null } else { serde_json::from_str(&all).map_err(|e| format!("the answer is not JSON: {e}"))? };
+    Ok((status, v))
+}
+
+/// `call` with a read timeout of `secs`
+pub fn call_for(t: &Target, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, String> {
+    let (status, v) = call_status(t, method, path, body, secs)?;
     if status == 200 {
         Ok(v)
     } else {

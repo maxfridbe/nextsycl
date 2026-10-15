@@ -170,6 +170,17 @@ pub fn quant_of(id: &str) -> &'static str {
     }
 }
 
+/// The front-end names of the models the daemon has (INT8 always)
+pub fn engine_names() -> Vec<String> {
+    let mut v = vec!["INT8".to_string()];
+    for (q, _) in engine_pairs() {
+        if !v.contains(&q) {
+            v.push(q);
+        }
+    }
+    v
+}
+
 /// Whether the daemon has a model of that front-end name
 pub fn engine_known(name: &str) -> bool {
     engine_pairs().iter().any(|(q, _)| q == name)
@@ -223,7 +234,15 @@ impl Studio {
         it.insert("seed".into(), num(p, "seed", 0.0, -2147483648.0, 2147483648.0, true)?);
         it.insert("te".into(), json!(te));
         it.insert("label".into(), json!(clean_label(&p.get("label").map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).unwrap_or_default())));
-        it.insert("engine".into(), json!(engine_name(p.get("engine").and_then(|v| v.as_str()))));
+        let engine = engine_name(p.get("engine").and_then(|v| v.as_str()));
+        if engine != "INT8" && !engine_known(&engine) {
+            let _ = self.engines(); // the daemon's list (a model added since the studio started)
+            if !engine_known(&engine) {
+                return Err(RpcError::param(&format!("engine {engine}? (video.engines.list: {})", engine_names().join(", "))));
+            }
+        }
+        it.insert("engine".into(), json!(engine));
+        it.insert("priority".into(), num(p, "priority", 0.0, -9.0, 9.0, true)?);
         it.insert("width".into(), width);
         it.insert("height".into(), height);
         it.insert("chain_mode".into(), json!(chain_mode));
@@ -252,7 +271,10 @@ impl Studio {
         };
         it.insert("first_frame".into(), ff);
         for (k, max, what) in [("ref_images", 9, "ref_image"), ("ref_videos", 3, "ref_video"), ("ref_audios", 3, "ref_audio")] {
-            let list: Vec<String> = p.get(k).and_then(|v| v.as_array()).map(|a| a.iter().take(max).filter_map(|x| x.as_str()).map(basename).collect()).unwrap_or_default();
+            let list: Vec<String> = p.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).map(basename).collect()).unwrap_or_default();
+            if list.len() > max {
+                return Err(RpcError::param(&format!("{k}: at most {max} ({} given)", list.len())));
+            }
             for f in &list {
                 if !self.out.join(f).exists() {
                     return Err(RpcError::not_found(&format!("{what} {f} not found in out/")));
@@ -300,6 +322,11 @@ pub fn basename(p: &str) -> String {
 }
 
 impl Queue {
+    /// Where an item of this priority goes: after every item of the same or a higher one
+    pub fn slot(&self, priority: i64) -> usize {
+        self.items.iter().position(|i| i["priority"].as_i64().unwrap_or(0) < priority).unwrap_or(self.items.len())
+    }
+
     pub fn held(&self, item: &Value) -> bool {
         let p = project_of(item);
         let b = s(item, "batch");
@@ -377,5 +404,14 @@ mod tests {
         assert_eq!(project_of(&json!({"label": "x", "project": "P"})), "P");
         assert_eq!(dialogue_of("says: <d>[English] First   batch.</d> then <d>[English] More.</d>"), "First batch. / More.");
         assert_eq!(clean_label("a<b>c 01/02: ok"), "abc 01/02: ok");
+    }
+
+    #[test]
+    fn priority_places() {
+        let q = Queue { items: vec![json!({"priority": 2}), json!({"priority": 0}), json!({}), json!({"priority": -1})], ..Queue::default() };
+        assert_eq!(q.slot(0), 3); // after its equals, ahead of lower ones
+        assert_eq!(q.slot(1), 1);
+        assert_eq!(q.slot(5), 0);
+        assert_eq!(q.slot(-5), 4);
     }
 }

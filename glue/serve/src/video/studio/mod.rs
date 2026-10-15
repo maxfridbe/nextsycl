@@ -212,13 +212,14 @@ impl Studio {
             }
             let held = st.q.held(&item);
             let (label, project, batch) = (s(&item, "label"), project_of(&item), s(&item, "batch"));
-            st.q.items.push(item);
+            let at = st.q.slot(item["priority"].as_i64().unwrap_or(0));
+            st.q.items.insert(at, item);
             st.q.save(&self.dir);
             if st.q.paused {
                 st.q.paused = false;
                 st.q.save_paused(&self.dir);
             }
-            return Ok(json!({"queued": true, "position": st.q.items.len(), "label": label, "project": project, "batch": batch, "held": held}));
+            return Ok(json!({"queued": true, "position": at + 1, "label": label, "project": project, "batch": batch, "held": held}));
         }
         self.launch(&mut st, item).map_err(|e| RpcError::new("internal", &e, 503))?;
         Ok(json!({"queued": false, "job": st.job.as_ref().map(|j| j.rec.clone())}))
@@ -267,8 +268,44 @@ impl Studio {
             }
             "cancel" => {
                 let mut st = self.st.lock().unwrap();
-                self.cancel(&mut st).map_err(|e| RpcError::new("not_running", &e, 409))?;
-                json!({"stopped": true})
+                let label = ps("label");
+                if label.is_empty() {
+                    self.cancel(&mut st).map_err(|e| RpcError::new("not_running", &e, 409))?;
+                    json!({"stopped": true, "removed": 0})
+                } else {
+                    // one clip by its label: the running one stopped, queued ones dropped
+                    let running = self.running(&st) && st.job.as_ref().is_some_and(|j| s(&j.rec, "label") == label);
+                    if running {
+                        self.cancel(&mut st).map_err(|e| RpcError::new("not_running", &e, 409))?;
+                    }
+                    let removed = self.remove(&mut st, &label);
+                    if !running && removed == 0 {
+                        return Err(RpcError::not_found(&format!("no running or queued clip labelled {label:?}")));
+                    }
+                    json!({"stopped": running, "removed": removed, "label": label})
+                }
+            }
+            "queue.remove" => {
+                let label = ps("label");
+                let removed = self.remove(&mut self.st.lock().unwrap(), &label);
+                if removed == 0 {
+                    return Err(RpcError::not_found(&format!("no queued clip labelled {label:?}")));
+                }
+                json!({"removed": removed, "label": label})
+            }
+            "queue.move" => {
+                let label = ps("label");
+                let mut st = self.st.lock().unwrap();
+                let from = st.q.items.iter().position(|i| s(i, "label") == label).ok_or_else(|| RpcError::not_found(&format!("no queued clip labelled {label:?}")))?;
+                let to = num(p, "position", 1.0, 1.0, 1e6, true)?.as_u64().unwrap_or(1) as usize;
+                let mut item = st.q.items.remove(from);
+                let to = (to - 1).min(st.q.items.len());
+                if let Some(pr) = p.get("priority").filter(|v| !v.is_null()) {
+                    item["priority"] = num(&json!({"priority": pr}), "priority", 0.0, -9.0, 9.0, true)?;
+                }
+                st.q.items.insert(to, item);
+                st.q.save(&self.dir);
+                json!({"label": label, "position": to + 1, "queue": st.q.items.iter().map(|i| s(i, "label")).collect::<Vec<_>>()})
             }
             "llm.mode" => self.llm.set(self, p.get("mode").and_then(|m| m.as_str()))?,
             "scene.export" => self.scene_export(&self.st.lock().unwrap(), &ps("project")),
@@ -296,6 +333,14 @@ impl Studio {
             }
             other => return Err(RpcError::new("unknown_method", &format!("unknown method {other}"), 404)),
         })
+    }
+
+    /// Drop the queued clips of a label; how many
+    fn remove(&self, st: &mut State, label: &str) -> usize {
+        let before = st.q.items.len();
+        st.q.items.retain(|i| s(i, "label") != label);
+        st.q.save(&self.dir);
+        before - st.q.items.len()
     }
 
     fn record(&self, name: &str) -> Option<Value> {
