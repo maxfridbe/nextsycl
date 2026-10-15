@@ -471,6 +471,11 @@ impl<'g> NemotronH<'g> {
         } + if g.kinds[l] == Kind::Mamba { (drafts * (g.inner * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64 } else { 0 }).collect();
         let mtp_kv = if drafts > 0 { sessions * (2 * g.heads_kv * ctx * g.head * 2) as u64 } else { 0 };
         let n = gpus.len();
+        // each GPU's speed: its compute units x clock (NS_NH_SPEED: one number a GPU, in order)
+        let speed: Vec<f64> = match std::env::var("NS_NH_SPEED").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<f64>>()) {
+            Some(v) if v.len() == gpus.len() => v,
+            _ => gpus.iter().map(|g| nextsycl_core::gpu_units(g.index).map_or(1.0, |(u, mhz)| (u as f64 * mhz as f64).max(1.0))).collect(),
+        };
         let split_env: Option<Vec<usize>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
         // the layers over the GPUs for a prompt chunk of `chunk` rows: each GPU's room after its spare, work memory and
         // half buffer (the last's after the head too), the layers cut where each GPU's share of the room ends
@@ -495,20 +500,40 @@ impl<'g> NemotronH<'g> {
                 if total as i64 > have {
                     return Err(format!("its layers need {:.1} GiB at a {ctx}-token context; the GPUs have {:.1} GiB for them", gib(total), gib(have.max(0) as u64)));
                 }
-                let mut lb = 0;
-                let mut acc_room = 0i64;
-                let mut acc = 0u64;
-                for (i, r) in room.iter().enumerate() {
-                    acc_room += *r;
-                    let target = (total as f64 * acc_room as f64 / have as f64) as u64;
-                    let mut le = lb;
-                    while le < g.layers && (i + 1 == n || acc + cost[le] <= target) {
-                        acc += cost[le];
-                        le += 1;
+                // each GPU a share of the work (its layers' weights) by its speed, the last GPU first, as far as its room
+                // goes: a decode visits the GPUs in turn and a prompt's pipeline waits for the slowest stage, so the
+                // slower card takes fewer layers (IQ1_M, B65 + B70: 48 / 40 by room, 40 / 48 by speed - decode 27.2 ->
+                // 28.5 tok/s, an 8K prompt 1,004 -> 1,164)
+                let mut rev = Vec::with_capacity(n);
+                let mut le = g.layers;
+                let mut s_rem: f64 = speed.iter().sum();
+                for i in (0..n).rev() {
+                    if i == 0 {
+                        rev.push((0, le));
+                        break;
                     }
-                    bounds.push((lb, le));
-                    lb = le;
+                    let w_rem: u64 = layer_w[..le].iter().sum();
+                    let target = w_rem as f64 * speed[i] / s_rem;
+                    let before: i64 = room[..i].iter().sum();
+                    let (mut lb, mut took, mut used) = (le, 0u64, 0i64);
+                    while lb > 0 {
+                        let c = cost[lb - 1] as i64;
+                        let rest: u64 = cost[..lb].iter().sum();
+                        // the GPUs before must still hold what is left; past this GPU's share only when they cannot
+                        let must = rest as i64 > before;
+                        if used + c > room[i] || (!must && took as f64 + layer_w[lb - 1] as f64 / 2.0 > target) {
+                            break;
+                        }
+                        used += c;
+                        took += layer_w[lb - 1];
+                        lb -= 1;
+                    }
+                    rev.push((lb, le));
+                    le = lb;
+                    s_rem -= speed[i];
                 }
+                rev.reverse();
+                bounds = rev;
             }
             for (i, &(lb, le)) in bounds.iter().enumerate() {
                 let need: u64 = cost[lb..le].iter().sum();
@@ -1109,13 +1134,15 @@ impl<'g> NemotronH<'g> {
                 }
                 _ => (m.up.buf.ptr().cast_const(), ids.ptr().cast_const(), m.down.buf.ptr().cast_const(), ids.ptr().cast_const()),
             };
-            self.op("experts up", || (s.multi)(self.raw(), m.up.ty.code() as i32, ub, m.up.stride as i64, uids.cast(), cols.ptr().cast(),
+            let un = if self.prof.is_some() { format!("experts up {}", m.up.ty.name()) } else { String::new() };
+            self.op(&un, || (s.multi)(self.raw(), m.up.ty.code() as i32, ub, m.up.stride as i64, uids.cast(), cols.ptr().cast(),
                                                n_e as i64, lq.ptr(), t as i64, u.fp(), g.latent as i64, g.n_ff_exp as i64))?;
             self.op("relu2", || (k.relu2)(self.raw(), u.fp(), (n_e * g.n_ff_exp) as i64))?;
             let uq = self.arena().bytes((s.q8_bytes)(g.n_ff_exp as i64, n_e as i64))?;
             self.op("quantize", || (s.quantize_q8)(self.raw(), u.fp(), uq.ptr(), g.n_ff_exp as i64, n_e as i64))?;
             let dn = self.arena().f32(n_e * g.latent)?;
-            self.op("experts down", || (s.multi)(self.raw(), m.down.ty.code() as i32, db, m.down.stride as i64, dids.cast(),
+            let dname = if self.prof.is_some() { format!("experts down {}", m.down.ty.name()) } else { String::new() };
+            self.op(&dname, || (s.multi)(self.raw(), m.down.ty.code() as i32, db, m.down.stride as i64, dids.cast(),
                                                  seq.ptr().cast(), n_e as i64, uq.ptr(), n_e as i64, dn.fp(), g.n_ff_exp as i64, g.latent as i64))?;
             let mo = self.arena().f32(t * g.latent)?;
             mo.fill(0)?;

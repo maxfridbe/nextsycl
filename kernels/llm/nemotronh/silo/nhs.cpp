@@ -275,15 +275,17 @@ int multi_groups() {   // NS_NH_MULTI_GROUPS: the work-groups of a layer's exper
     return v;
 }
 
-// a sub-group a run of consecutive rows (mostly one entry's: one column), its lanes' NB activation blocks loaded once
-// a column, the weights streamed (the deepseek4 silo's multi_cached)
+// 8 lanes a row (lane g sub-block g of each of the row's 256-blocks), 4 rows a sub-group at once: each lane walks the
+// row's blocks (its activations, NB blocks, loaded once a column) and the 8 lanes' sums reduce in 3 steps - a row
+// over all 32 lanes (one sub-block a lane, 5 reduction steps a row) left the B65 at 70 GB/s on 1,024-wide rows. A
+// sub-group takes a run of consecutive rows (mostly one entry's: one column)
 template <typename F, int NB>
 void multi256(sycl::queue& q, const uint8_t* base, int64_t stride, const int32_t* ids, const int32_t* cols, int entries, const void* xs, int ncols,
               float* y, int n_in, int n_out) {
     const auto* x = static_cast<const int8_t*>(xs);
     const std::size_t rows = std::size_t(entries) * n_out;
-    const unsigned blocks = (unsigned) std::min<std::size_t>((rows + WARPS - 1) / WARPS, std::size_t(multi_groups()));
-    const std::size_t nsg = std::size_t(blocks) * WARPS, chunk = (rows + nsg - 1) / nsg;
+    const unsigned blocks = (unsigned) std::min<std::size_t>((rows + WARPS * 4 - 1) / (WARPS * 4), std::size_t(multi_groups()));
+    const std::size_t nsg = std::size_t(blocks) * WARPS, chunk = ((rows + nsg - 1) / nsg + 3) / 4 * 4;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
         h.parallel_for(sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
@@ -291,30 +293,33 @@ void multi256(sycl::queue& q, const uint8_t* base, int64_t stride, const int32_t
                            uint32_t* t = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
                            fill_tab<F>(t, it);
                            const int lane = int(it.get_local_id(2)), warp = int(it.get_local_id(1));
-                           const int g = lane & 7, sub = lane >> 3;
+                           const int g = lane & 7, slot = lane >> 3;
                            const int bpr = n_in / QK;
                            auto sg = it.get_sub_group();
                            const std::size_t r0 = (std::size_t(it.get_group(2)) * WARPS + warp) * chunk, r1 = std::min(rows, r0 + chunk);
                            int cur = -1;
                            X xv[NB];
-                           for (std::size_t r = r0; r < r1; ++r) {
-                               const int e = int(r / n_out), row = int(r % n_out);
+                           for (std::size_t rb = r0; rb < r1; rb += 4) {
+                               const std::size_t r = rb + slot;
+                               const bool live = r < r1;
+                               const std::size_t rr = live ? r : r1 - 1;
+                               const int e = int(rr / n_out), row = int(rr % n_out);
                                const int col = cols[e];
                                if (col != cur) {
                                    const XA xa = xcol(x, n_in, ncols, col);
 #pragma unroll
                                    for (int u = 0; u < NB; ++u)
-                                       if (sub + 4 * u < bpr) xv[u] = xload(xa, (sub + 4 * u) * (QK / Q8K) + g);
+                                       if (u < bpr) xv[u] = xload(xa, u * (QK / Q8K) + g);
                                    cur = col;
                                }
                                const auto* wr = reinterpret_cast<const typename F::Block*>(base + std::size_t(ids[e]) * stride) + std::size_t(row) * bpr;
                                float v = 0.f;
 #pragma unroll
                                for (int u = 0; u < NB; ++u)
-                                   if (sub + 4 * u < bpr) v += wdot<F>(F::load(wr + sub + 4 * u, g, t), xv[u]);
+                                   if (u < bpr) v += wdot<F>(F::load(wr + u, g, t), xv[u]);
 #pragma unroll
-                               for (int o = WARP / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
-                               if (lane == 0) y[r] = v;
+                               for (int o = 4; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+                               if (g == 0 && live) y[r] = v;
                            }
                        });
     });
@@ -324,9 +329,9 @@ template <typename F>
 void multi_wide(sycl::queue& q, const uint8_t* base, int64_t stride, const int32_t* ids, const int32_t* cols, int entries, const void* xs, int ncols,
                 float* y, int n_in, int n_out) {
     const int bpr = n_in / QK;
-    if (bpr <= 4) multi256<F, 1>(q, base, stride, ids, cols, entries, xs, ncols, y, n_in, n_out);
-    else if (bpr <= 8) multi256<F, 2>(q, base, stride, ids, cols, entries, xs, ncols, y, n_in, n_out);
-    else multi256<F, 4>(q, base, stride, ids, cols, entries, xs, ncols, y, n_in, n_out);
+    if (bpr <= 4) multi256<F, 4>(q, base, stride, ids, cols, entries, xs, ncols, y, n_in, n_out);
+    else if (bpr <= 8) multi256<F, 8>(q, base, stride, ids, cols, entries, xs, ncols, y, n_in, n_out);
+    else multi256<F, 16>(q, base, stride, ids, cols, entries, xs, ncols, y, n_in, n_out);
 }
 
 // ---- the 32-value step (the down projections, 2,688 inputs = 84 sub-blocks): a lane a sub-block, the 32 lanes of a

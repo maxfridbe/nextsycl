@@ -175,6 +175,45 @@ int ns_nh_ssm(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t 
     if (T <= 0) return 0;
     if (N % SG != 0 || N > 256 || H % G != 0 || P > 64) return ns_fail("ns_nh_ssm: d_state a multiple of 16 up to 256, head dim up to 64, the heads a multiple of the groups");
     const int64_t hpg = H / G, xd = H * P;
+    if (T <= 8) {
+        // decode widths: a sub-group per (head, p), its lanes the state's N values (N / 16 each), B and C read from
+        // global memory (a few rows: no staging) - the tiled kernel below costs 104 against 30 us for one row
+        g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (H * P) * SG), sycl::range<1>(SG)),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            auto sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id();
+            const int64_t hp = it.get_group(0), h = hp / P, p = hp % P, gr = h / hpg;
+            const int64_t per = N / SG;
+            float s[16];
+            float* sp = S + (h * P + p) * N;
+            for (int64_t i = 0; i < per; ++i) s[i] = sp[lane + i * SG];
+            const float a = A[h], dd = Dp[h], bias = dt_bias[h];
+            for (int64_t t = 0; t < T; ++t) {
+                const float* row = xbc + t * xs;
+                float d = dt[t * dts + h] + bias;
+                d = d <= 20.0f ? sycl::log1p(sycl::exp(d)) : d;
+                const float dA = sycl::exp(d * a);
+                const float xv = row[h * P + p];
+                const float xdt = xv * d;
+                const float* B = row + xd + gr * N;
+                const float* C = row + xd + G * N + gr * N;
+                float acc = 0.0f;
+                for (int64_t i = 0; i < per; ++i) {
+                    const int64_t n = lane + i * SG;
+                    s[i] = s[i] * dA + B[n] * xdt;
+                    acc += s[i] * C[n];
+                }
+                acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+                if (lane == 0) y[t * xd + h * P + p] = acc + dd * xv;
+                if (snap && t + 1 < T) {
+                    float* o = snap + ((t * H + h) * P + p) * N;
+                    for (int64_t i = 0; i < per; ++i) o[lane + i * SG] = s[i];
+                }
+            }
+            for (int64_t i = 0; i < per; ++i) sp[lane + i * SG] = s[i];
+        });
+        return 0;
+    }
     constexpr int TT = 32;   // rows a tile
     // a work-group a head: a sub-group per p, its lanes the state's N values (N / 16 each); the head's B, C, x, dt' and
     // decay for a tile of rows staged in local memory once (every p of the head reads them: from global memory each
