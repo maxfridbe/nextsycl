@@ -170,39 +170,65 @@ int ns_nh_ssm(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t 
               float* y, int64_t T, int64_t H, int64_t P, int64_t N, int64_t G) {
     NS_TRY
     if (T <= 0) return 0;
-    if (N % SG != 0 || N > 256 || H % G != 0) return ns_fail("ns_nh_ssm: d_state a multiple of 16 up to 256, the heads a multiple of the groups");
+    if (N % SG != 0 || N > 256 || H % G != 0 || P > 64) return ns_fail("ns_nh_ssm: d_state a multiple of 16 up to 256, head dim up to 64, the heads a multiple of the groups");
     const int64_t hpg = H / G, xd = H * P;
-    // a sub-group per (head, p): its lanes the state's N values (N / 16 each); per row the decay and update, then C . S
-    // reduced over the sub-group
-    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (H * P) * SG), sycl::range<1>(SG)),
-                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
-        auto sg = it.get_sub_group();
-        const int lane = (int) sg.get_local_linear_id();
-        const int64_t hp = it.get_group(0), h = hp / P, p = hp % P, gr = h / hpg;
-        const int64_t per = N / SG;
-        float s[16];
-        float* sp = S + (h * P + p) * N;
-        for (int64_t i = 0; i < per; ++i) s[i] = sp[lane + i * SG];
-        const float a = A[h], dd = Dp[h], bias = dt_bias[h];
-        for (int64_t t = 0; t < T; ++t) {
-            const float* row = xbc + t * xs;
-            float d = dt[t * dts + h] + bias;
-            d = d <= 20.0f ? sycl::log1p(sycl::exp(d)) : d;
-            const float dA = sycl::exp(d * a);
-            const float xv = row[h * P + p];
-            const float xdt = xv * d;
-            const float* B = row + xd + gr * N;
-            const float* C = row + xd + G * N + gr * N;
-            float acc = 0.0f;
-            for (int64_t i = 0; i < per; ++i) {
-                const int64_t n = lane + i * SG;
-                s[i] = s[i] * dA + B[n] * xdt;
-                acc += s[i] * C[n];
+    constexpr int TT = 32;   // rows a tile
+    // a work-group a head: a sub-group per p, its lanes the state's N values (N / 16 each); the head's B, C, x, dt' and
+    // decay for a tile of rows staged in local memory once (every p of the head reads them: from global memory each
+    // read them 64 times), then the rows in order - decay and update, C . S reduced over the sub-group
+    const size_t wg = (size_t) P * SG;
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sb(sycl::range<1>((size_t) TT * N), h), scl(sycl::range<1>((size_t) TT * N), h);
+        sycl::local_accessor<float, 1> sx(sycl::range<1>((size_t) TT * P), h), sdt(sycl::range<1>(TT), h), sda(sycl::range<1>(TT), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) H * wg), sycl::range<1>(wg)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            auto sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id();
+            const int64_t hh = it.get_group(0), p = sg.get_group_linear_id(), gr = hh / hpg;
+            const int64_t li = it.get_local_id(0);
+            const int64_t per = N / SG;
+            float s[16];
+            float* sp = S + (hh * P + p) * N;
+            for (int64_t i = 0; i < per; ++i) s[i] = sp[lane + i * SG];
+            const float a = A[hh], dd = Dp[hh], bias = dt_bias[hh];
+            for (int64_t t0 = 0; t0 < T; t0 += TT) {
+                const int64_t tn = sycl::min<int64_t>(TT, T - t0);
+                sycl::group_barrier(it.get_group());
+                for (int64_t i = li; i < tn * N; i += (int64_t) wg) {
+                    const int64_t r = i / N, n = i % N;
+                    const float* row = xbc + (t0 + r) * xs + xd + gr * N;
+                    sb[i] = row[n];
+                    scl[i] = row[G * N + n];
+                }
+                for (int64_t i = li; i < tn * P; i += (int64_t) wg) sx[i] = xbc[(t0 + i / P) * xs + hh * P + i % P];
+                if (li < tn) {
+                    float d = dt[(t0 + li) * dts + hh] + bias;
+                    d = d <= 20.0f ? sycl::log1p(sycl::exp(d)) : d;
+                    sdt[li] = d;
+                    sda[li] = sycl::exp(d * a);
+                }
+                sycl::group_barrier(it.get_group());
+                // the rows' partial sums kept, reduced after the tile (no reduction in the recurrence's way)
+                float part[TT];
+#pragma unroll
+                for (int r = 0; r < TT; ++r) {
+                    part[r] = 0.0f;
+                    if (r < tn) {
+                        const float xdt = sx[r * P + p] * sdt[r], dA = sda[r];
+                        for (int64_t i = 0; i < per; ++i) {
+                            const int64_t n = lane + i * SG;
+                            s[i] = s[i] * dA + sb[r * N + n] * xdt;
+                            part[r] += s[i] * scl[r * N + n];
+                        }
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < TT; ++r) {
+                    const float acc = sycl::reduce_over_group(sg, part[r], sycl::plus<float>());
+                    if (lane == 0 && r < tn) y[(t0 + r) * xd + hh * P + p] = acc + dd * sx[r * P + p];
+                }
             }
-            acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
-            if (lane == 0) y[t * xd + h * P + p] = acc + dd * xv;
-        }
-        for (int64_t i = 0; i < per; ++i) sp[lane + i * SG] = s[i];
+            for (int64_t i = 0; i < per; ++i) sp[lane + i * SG] = s[i];
+        });
     });
     return 0;
     NS_CATCH
@@ -279,6 +305,34 @@ int ns_nh_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void
     if (D != 128 || Hq % GA != 0 || Hq % Hkv != 0 || (Hq / Hkv) % GA != 0) return ns_fail("ns_nh_attn: head 128, query heads a multiple of 8 a key head");
     if (ns_nh_attn_scratch(T, Hq, Hkv, D, p0) > 0 && !scratch) return ns_fail("ns_nh_attn: no scratch");
     attn<8, GA>(g->q, q, qs, (const half*) kc, (const half*) vc, T, Hq, Hkv, cap, p0, out, scratch);
+    return 0;
+    NS_CATCH
+}
+
+int ns_nh_q6k_f16(ns_gpu* g, const void* src, int64_t n, uint16_t* dst) {
+    NS_TRY
+    if (n % 256 != 0) return ns_fail("ns_nh_q6k_f16: n a multiple of 256");
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    half* y = reinterpret_cast<half*>(dst);
+    // ggml's dequantize_row_q6_K: a work-item a (block, half, l), four values each
+    g->q.parallel_for(sycl::range<1>((size_t) (n / 256 * 64)), [=](sycl::id<1> id) {
+        const int64_t i = id[0], b = i / 64, hn = (i % 64) / 32, l = i % 32;
+        const uint8_t* blk = s + b * 210;
+        const uint8_t* ql = blk + 64 * hn;
+        const uint8_t* qh = blk + 128 + 32 * hn;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192) + 8 * hn;
+        const float d = (float) *reinterpret_cast<const half*>(blk + 208);
+        const int is = (int) l / 16;
+        const int q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+        const int q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+        const int q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+        const int q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+        half* o = y + b * 256 + 128 * hn;
+        o[l] = (half) (d * sc[is] * q1);
+        o[l + 32] = (half) (d * sc[is + 2] * q2);
+        o[l + 64] = (half) (d * sc[is + 4] * q3);
+        o[l + 96] = (half) (d * sc[is + 6] * q4);
+    });
     return 0;
     NS_CATCH
 }

@@ -164,6 +164,9 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
+| `NS_NH_CHUNK` | auto | A prompt pass's rows in the nemotronh engine (default the largest of 2048, 1024, 512 that fits; with its silo - without it passes of 8) | llm nemotronh |
+| `NS_NH_PROFILE` | off | Debug: 1 waits for each kernel of the nemotronh engine and times it by name (the wall time it costs, launch overhead included; the waits slow the pass), the table printed after a run | llm nemotronh |
+| `NS_NH_MULTI_GROUPS` | 1024 | Debug: the work-groups of a MoE layer's experts in one launch (the nemotronh silo) | kernels:nemotronh silo |
 | `NS_PEAK_GBS` | 608 | Debug: memory bandwidth (GB/s) the NS_Q35_PROFILE tables show each kernel's share of | llm qwen35 |
 | `NS_PEAK_TF16` | 183 | Debug: f16 TFLOP/s peak the NS_Q35_PROFILE tables compare the f16 GEMMs with | llm qwen35 |
 | `NS_PEAK_TF32` | 22.9 | Debug: f32 TFLOP/s peak the NS_Q35_PROFILE tables compare the other kernels with | llm qwen35 |

@@ -161,4 +161,7 @@ impl Engine for engine::NemotronH<'_> {
     fn gpu_info(&self) -> Vec<GpuInfo> {
         engine::NemotronH::gpu_info(self)
     }
+    fn report(&self, _tokens: usize) -> Vec<String> {
+        engine::NemotronH::profile_lines(self)
+    }
 }

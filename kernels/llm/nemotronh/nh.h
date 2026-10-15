@@ -35,6 +35,9 @@ int64_t ns_nh_attn_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_
 int ns_nh_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap,
                int64_t p0, float* out, float* scratch);
 
+/* n values of a Q6_K tensor (n a multiple of 256) expanded to fp16 (the prompt path's products) */
+int ns_nh_q6k_f16(ns_gpu* g, const void* src, int64_t n, uint16_t* dst);
+
 #ifdef __cplusplus
 }
 #endif

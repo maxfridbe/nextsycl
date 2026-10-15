@@ -184,14 +184,17 @@ struct Attn {
 struct Moe {
     /// float32 [experts, n_embd]
     router: Mat,
-    /// the selection bias (exp_probs_b), on the host: the choice is made there
+    /// the selection bias (exp_probs_b), on the host (its routing) and the GPU (the silo's)
     bias: Vec<f32>,
+    bias_dev: DevBuf,
     to_latent: Mat,
     from_latent: Mat,
     up: Experts,
     down: Experts,
     sh_up: Mat,
     sh_down: Mat,
+    /// routed on the GPU by the silo (its downs packed for it); else on the host
+    on_gpu: bool,
 }
 
 enum Mix {
@@ -288,12 +291,23 @@ impl Decoder {
 struct Dev {
     gpu: Arc<Gpu>,
     arena: Arena,
+    /// the MoE combine's fixed tables for the silo's routing: row r's entries start at r * used ([CHUNK + 1]), entry j
+    /// is row j of the experts' outputs ([CHUNK * used])
+    tp: DevBuf,
+    seq: DevBuf,
+    /// a prompt pass's matrix expanded to half (an expert's two after the largest dense one)
+    w16: DevBuf,
     lb: usize,
     le: usize,
 }
 
-/// The rows a pass takes (the Q8_1 products' widest)
-const CHUNK: usize = 8;
+/// The rows the decode products take (the Q8_1 kernels' widest); a pass of more rows is a prompt pass (half products)
+const DEC: usize = 8;
+
+/// NS_NH_CHUNK: a prompt pass's rows (default: chosen at load; with the silo only - without it passes of DEC rows)
+fn chunk_setting() -> Option<usize> {
+    std::env::var("NS_NH_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|v| *v >= DEC)
+}
 
 pub struct NemotronH<'g> {
     pub g: Geometry,
@@ -303,23 +317,36 @@ pub struct NemotronH<'g> {
     cur: std::sync::atomic::AtomicUsize,
     staging: Mutex<Vec<u8>>,
     k: &'static ffi::Api,
+    /// the silo (kernels/llm/nemotronh/silo): a MoE layer's routing and experts in a few launches; None: the host's
+    silo: Option<&'static ffi::Silo>,
     layers: Vec<Layer>,
     output_norm: DevBuf,
     output: Mat,
     embd: Tensor,
     work: Mutex<()>,
+    /// a prompt pass's rows
+    chunk: usize,
+    /// NS_NH_PROFILE=1: each kernel waited for and timed by name (seconds, calls) - the wall time it costs, launch
+    /// overhead and all (the waits slow the pass itself)
+    prof: Option<Mutex<std::collections::BTreeMap<String, (f64, u64)>>>,
     load_s: f64,
     load_bytes: u64,
 }
 
-/// A pass's work memory: the activations of CHUNK rows, the experts' rows, the logits, with room to spare
-fn arena_bytes(g: &Geometry) -> usize {
-    let t = CHUNK;
+/// A pass's work memory for `t` rows: the activations (float32, and half copies for the products), the experts' rows,
+/// the last rows' logits, with room to spare
+fn arena_bytes(g: &Geometry, t: usize) -> usize {
     let e = t * g.used;
     let acts = t * (g.in_proj() + 2 * g.conv_dim() + 3 * g.inner + 8 * g.n_embd + 2 * g.n_ff_shared + 4 * g.latent + g.experts
-        + g.heads * g.head * 2 + 2 * g.heads_kv * g.head);
-    let exps = e * (g.n_ff_exp + g.latent) * 2;
-    (acts + exps + t * g.vocab) * 4 + (64 << 20)
+        + g.heads * g.head * 2 + 2 * g.heads_kv * g.head) * 6 / 4;
+    let exps = e * (g.n_ff_exp + g.latent) * 2 + e * 4;
+    (acts + exps + DEC * g.vocab) * 4 + (64 << 20)
+}
+
+/// The half buffer a prompt pass's products expand a matrix into: the largest dense matrix (an expert's fit too)
+fn w16_bytes(g: &Geometry) -> usize {
+    let dense = [g.in_proj() * g.n_embd, g.n_embd * g.inner, g.n_ff_shared * g.n_embd, g.heads * g.head * g.n_embd].into_iter().max().unwrap_or(0);
+    dense.max(g.n_ff_exp * g.latent) * 2
 }
 
 impl<'g> NemotronH<'g> {
@@ -332,6 +359,11 @@ impl<'g> NemotronH<'g> {
         }
         let g = Geometry::read(f).map_err(e)?;
         let k = ffi::api()?;
+        let silo = ffi::silo()?;
+        log(match silo {
+            Some(s) => format!("nemotronh: the MoE layers on the GPU from its silo {}", s.path.display()),
+            None => "nemotronh: no silo - the routing on the host, an expert a launch".into(),
+        });
         let embd = f.tensor("token_embd.weight").ok_or_else(|| e("no token_embd.weight"))?.clone();
         let layer_w: Vec<u64> = (0..g.layers).map(|l| {
             let p = format!("blk.{l}.");
@@ -354,47 +386,65 @@ impl<'g> NemotronH<'g> {
             Kind::Moe => 0,
         }).collect();
         let n = gpus.len();
-        let over = |i: usize| margin + (512 << 20) + arena_bytes(&g) as u64 + if i + 1 == n { head_w } else { 0 };
-        let room: Vec<i64> = (0..n).map(|i| free[i] as i64 - over(i) as i64).collect();
         let split_env: Option<Vec<usize>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
-        let mut bounds = Vec::with_capacity(n);
-        if let Some(sp) = &split_env {
-            let mut lb = 0;
-            for i in 0..n {
-                let le = if i + 1 == n { g.layers } else { *sp.get(i).ok_or_else(|| e("NS_SPLIT: a first layer for each GPU after the first"))? };
-                bounds.push((lb, le.min(g.layers)));
-                lb = le.min(g.layers);
-            }
-        } else {
-            // the same share of each GPU's room: the layers in order, a GPU's share cut where its part of the total ends
-            let total: u64 = cost.iter().sum();
-            let have: i64 = room.iter().sum();
-            if total as i64 > have {
-                return Err(e(format!("{} needs {:.1} GiB for its layers at a {ctx}-token context; the GPUs have {:.1} GiB for them", f.architecture(),
-                                     gib(total), gib(have.max(0) as u64))));
-            }
-            let mut lb = 0;
-            let mut acc_room = 0i64;
-            let mut acc = 0u64;
-            for (i, r) in room.iter().enumerate() {
-                acc_room += *r;
-                let target = (total as f64 * acc_room as f64 / have as f64) as u64;
-                let mut le = lb;
-                while le < g.layers && (i + 1 == n || acc + cost[le] <= target) {
-                    acc += cost[le];
-                    le += 1;
+        // the layers over the GPUs for a prompt chunk of `chunk` rows: each GPU's room after its spare, work memory and
+        // half buffer (the last's after the head too), the layers cut where each GPU's share of the room ends
+        let plan = |chunk: usize| -> std::result::Result<Vec<(usize, usize)>, String> {
+            let over = |i: usize| margin + (512 << 20) + arena_bytes(&g, chunk) as u64 + w16_bytes(&g) as u64 + if i + 1 == n { head_w } else { 0 };
+            let room: Vec<i64> = (0..n).map(|i| free[i] as i64 - over(i) as i64).collect();
+            let mut bounds = Vec::with_capacity(n);
+            if let Some(sp) = &split_env {
+                let mut lb = 0;
+                for i in 0..n {
+                    let le = if i + 1 == n { g.layers } else { *sp.get(i).ok_or("NS_SPLIT: a first layer for each GPU after the first")? };
+                    bounds.push((lb, le.min(g.layers)));
+                    lb = le.min(g.layers);
                 }
-                bounds.push((lb, le));
-                lb = le;
+            } else {
+                let total: u64 = cost.iter().sum();
+                let have: i64 = room.iter().sum();
+                if total as i64 > have {
+                    return Err(format!("its layers need {:.1} GiB at a {ctx}-token context; the GPUs have {:.1} GiB for them", gib(total), gib(have.max(0) as u64)));
+                }
+                let mut lb = 0;
+                let mut acc_room = 0i64;
+                let mut acc = 0u64;
+                for (i, r) in room.iter().enumerate() {
+                    acc_room += *r;
+                    let target = (total as f64 * acc_room as f64 / have as f64) as u64;
+                    let mut le = lb;
+                    while le < g.layers && (i + 1 == n || acc + cost[le] <= target) {
+                        acc += cost[le];
+                        le += 1;
+                    }
+                    bounds.push((lb, le));
+                    lb = le;
+                }
+            }
+            for (i, &(lb, le)) in bounds.iter().enumerate() {
+                let need: u64 = cost[lb..le].iter().sum();
+                if need as i64 > room[i] {
+                    return Err(format!("layers {lb}-{} need {:.1} GiB on {}; {:.1} GiB are left for them", le.max(lb + 1) - 1, gib(need), gpus[i].name,
+                                       gib(room[i].max(0) as u64)));
+                }
+            }
+            Ok(bounds)
+        };
+        // the prompt chunk: NS_NH_CHUNK, else the largest of 2,048 / 1,024 / 512 rows that fits (more rows a pass, more
+        // rows an expert's product: 3.9K prompts 280 -> 530 tok/s from 512 to 2,048); without the silo, DEC
+        let tries: Vec<usize> = if silo.is_none() { vec![DEC] } else { chunk_setting().map_or_else(|| vec![2048, 1024, 512], |c| vec![c]) };
+        let mut last_err = String::new();
+        let mut found = None;
+        for c in tries {
+            match plan(c) {
+                Ok(b) => {
+                    found = Some((c, b));
+                    break;
+                }
+                Err(x) => last_err = x,
             }
         }
-        for (i, &(lb, le)) in bounds.iter().enumerate() {
-            let need: u64 = cost[lb..le].iter().sum();
-            if need as i64 > room[i] {
-                return Err(e(format!("layers {lb}-{} need {:.1} GiB on {}; {:.1} GiB are left for them", le.max(lb + 1) - 1, gib(need), gpus[i].name,
-                                     gib(room[i].max(0) as u64))));
-            }
-        }
+        let (chunk, bounds) = found.ok_or_else(|| e(format!("{} over {} GPUs: {last_err}", f.architecture(), n)))?;
         let (gpus, bounds): (Vec<Arc<Gpu>>, Vec<(usize, usize)>) = gpus.iter().cloned().zip(bounds).filter(|(_, b)| b.1 > b.0).unzip();
         let mut layer_dev = vec![0usize; g.layers];
         for (i, &(lb, le)) in bounds.iter().enumerate() {
@@ -433,13 +483,17 @@ impl<'g> NemotronH<'g> {
                     let bias_t = f.tensor(&format!("blk.{l}.exp_probs_b.bias")).ok_or_else(|| e(format!("layer {l}: no exp_probs_b.bias")))?;
                     let raw = f.read(bias_t).map_err(|x| e(x.0))?;
                     let bias: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let bias_dev = DevBuf::new(gpu, bias.len() * 4)?;
+                    bias_dev.write(0, &raw)?;
                     let m = Moe {
                         router,
                         bias,
+                        bias_dev,
                         to_latent: read(&w("ffn_latent_down"))?,
                         from_latent: read(&w("ffn_latent_up"))?,
                         up: experts(f, gpu, &w("ffn_up_exps"), &loaded)?,
                         down: experts(f, gpu, &w("ffn_down_exps"), &loaded)?,
+                        on_gpu: false,
                         sh_up: read(&w("ffn_up_shexp"))?,
                         sh_down: read(&w("ffn_down_shexp"))?,
                     };
@@ -447,6 +501,25 @@ impl<'g> NemotronH<'g> {
                         || m.down.cols != g.n_ff_exp {
                         return Err(e(format!("layer {l}: the experts' shapes ({} x {} up, {} x {} down, a router of {}) are not the metadata's", m.up.rows,
                                              m.up.cols, m.down.rows, m.down.cols, m.router.rows)));
+                    }
+                    let mut m = m;
+                    // the silo takes both projections: the routing on the GPU, the downs repacked for its kernels
+                    // SAFETY: arithmetic only.
+                    if let Some(s) = silo.filter(|s| unsafe { (s.multi_supported)(m.up.ty.code() as i32, m.up.cols as i64) != 0
+                                                             && (s.multi_supported)(m.down.ty.code() as i32, m.down.cols as i64) != 0 }) {
+                        m.on_gpu = true;
+                        let (ty, n) = (m.down.ty.code() as i32, m.down.cols as i64);
+                        // SAFETY: arithmetic only.
+                        if unsafe { (s.packed)(ty, n) } != 0 {
+                            // SAFETY: arithmetic only.
+                            let rb = unsafe { (s.packed_row_bytes)(ty, n) } as usize;
+                            let rows = g.experts * m.down.rows;
+                            let buf = DevBuf::new(gpu, rows * rb)?;
+                            // SAFETY: the file's blocks (rows of n) into the packed rows.
+                            ffi::check(unsafe { (s.pack)(gpu.raw(), ty, m.down.buf.ptr(), buf.ptr(), rows as i64, n) }, "packing the experts")?;
+                            gpu.sync()?;
+                            m.down = Experts { buf, ty: m.down.ty, rows: m.down.rows, cols: m.down.cols, stride: m.down.rows * rb };
+                        }
                     }
                     for x in [&m.up, &m.down] {
                         // SAFETY: arithmetic only.
@@ -467,19 +540,45 @@ impl<'g> NemotronH<'g> {
         let mut devs = Vec::with_capacity(gpus.len());
         for (gpu, &(lb, le)) in gpus.iter().zip(&bounds) {
             gpu.sync()?;
-            devs.push(Dev { gpu: gpu.clone(), arena: Arena::new(gpu, arena_bytes(&g))?, lb, le });
+            let bytes = |v: Vec<i32>| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            let tp = DevBuf::new(gpu, (chunk + 1) * 4)?;
+            tp.write(0, &bytes((0..=chunk as i32).map(|r| r * g.used as i32).collect()))?;
+            let seq = DevBuf::new(gpu, chunk * g.used * 4)?;
+            seq.write(0, &bytes((0..(chunk * g.used) as i32).collect()))?;
+            devs.push(Dev { gpu: gpu.clone(), arena: Arena::new(gpu, arena_bytes(&g, chunk))?, w16: DevBuf::new(gpu, w16_bytes(&g))?, tp, seq, lb, le });
         }
         let load_s = t0.elapsed().as_secs_f64();
         let wh = devs.iter().map(|d| format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1)).collect::<Vec<_>>().join(", ");
-        log(format!("nemotronh: {} layers of {} ({} Mamba-2, {} MoE of {} / {} experts, {} attention), {:.1} GiB on {wh} in {load_s:.0} s{}", g.layers,
+        log(format!("nemotronh: {} layers of {} ({} Mamba-2, {} MoE of {} / {} experts, {} attention), {:.1} GiB on {wh} in {load_s:.0} s; prompt chunks of {chunk}{}", g.layers,
                     g.n_embd, g.count(Kind::Mamba), g.count(Kind::Moe), g.used, g.experts, g.count(Kind::Attn), gib(loaded.get()),
                     if g.nextn > 0 { "; its MTP block is not read (no drafts)" } else { "" }));
-        Ok(NemotronH { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, layers, output_norm, output, embd, work: Mutex::new(()),
-                       load_s, load_bytes: loaded.get() })
+        Ok(NemotronH { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, work: Mutex::new(()), chunk,
+                       prof: std::env::var("NS_NH_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get() })
     }
 
     fn op(&self, name: &str, f: impl FnOnce() -> c_int) -> Result<()> {
-        ffi::check(f(), name)
+        let Some(p) = &self.prof else { return ffi::check(f(), name) };
+        self.dev().gpu.sync()?;
+        let t0 = Instant::now();
+        ffi::check(f(), name)?;
+        self.dev().gpu.sync()?;
+        let mut m = p.lock().unwrap();
+        let e = m.entry(format!("{name} (GPU {})", self.cur.load(std::sync::atomic::Ordering::Relaxed))).or_insert((0.0, 0));
+        e.0 += t0.elapsed().as_secs_f64();
+        e.1 += 1;
+        Ok(())
+    }
+
+    /// NS_NH_PROFILE's table: each kernel's share, the costliest first
+    pub fn profile_lines(&self) -> Vec<String> {
+        let Some(p) = &self.prof else { return Vec::new() };
+        let m = p.lock().unwrap();
+        let total: f64 = m.values().map(|v| v.0).sum();
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+        let mut out = vec![format!("profile: {total:.3} s in kernels (each waited for)")];
+        out.extend(v.iter().map(|(k, (s, n))| format!("  {k:<28} {s:>8.3} s {:>5.1}% {n:>8} calls {:>8.1} us/call", 100.0 * s / total.max(1e-9), 1e6 * s / *n as f64)));
+        out
     }
 
     pub fn load_seconds(&self) -> f64 {
@@ -489,7 +588,7 @@ impl<'g> NemotronH<'g> {
         self.load_bytes
     }
     pub fn prefill_chunk(&self) -> usize {
-        CHUNK
+        self.chunk
     }
 
     fn dev(&self) -> &Dev {
@@ -538,8 +637,8 @@ impl<'g> NemotronH<'g> {
             // SAFETY: x [t, cols], the matrix [rows, cols] float32, y [t, rows].
             return self.op("gemm", || unsafe { (k.gemm)(self.raw(), t as i64, n, kk, x.fp(), kk, w.buf.fp(), y.fp(), n, 0) });
         }
-        if t > CHUNK {
-            return Err(e(format!("a product of {t} rows (at most {CHUNK})")));
+        if t > DEC {
+            return self.matmul16(w, x, t, y);
         }
         let own;
         let q = match xq {
@@ -549,8 +648,33 @@ impl<'g> NemotronH<'g> {
                 &own
             }
         };
+        let name = if self.prof.is_some() { format!("mmvq {} {}x{} t{t}", w.ty.name(), w.rows, w.cols) } else { String::new() };
         // SAFETY: the matrix in its blocks, x's Q8_1 blocks, y [t, rows].
-        self.op("mmvq", || unsafe { (k.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), q.ptr(), y.fp(), kk, n, t as i64) })
+        self.op(&name, || unsafe { (k.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), q.ptr(), y.fp(), kk, n, t as i64) })
+    }
+
+    /// The prompt pass's product: the matrix expanded to half (its type's own expansion, Q6_K's from this engine's
+    /// kernels), x to half, then the half GEMM
+    fn matmul16(&self, w: &Mat, x: &DevBuf, t: usize, y: &DevBuf) -> Result<()> {
+        let k = self.k;
+        let elems = w.rows * w.cols;
+        let w16 = &self.dev().w16;
+        if elems * 2 > w16.len {
+            return Err(e(format!("a {}x{} matrix past the half buffer", w.rows, w.cols)));
+        }
+        let key = if self.prof.is_some() { format!("{} {}x{}", w.ty.name(), w.rows, w.cols) } else { String::new() };
+        // SAFETY: the matrix's blocks -> rows x cols halfs.
+        if w.ty == GType::Q6K {
+            self.op(&format!("dequant16 {key}"), || unsafe { (k.q6k_f16)(self.raw(), w.buf.ptr(), elems as i64, w16.ptr().cast()) })?;
+        } else {
+            self.op(&format!("dequant16 {key}"), || unsafe { (k.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems as i64, w16.ptr().cast()) })?;
+        }
+        let xh = self.arena().bytes(t * w.cols * 2)?;
+        // SAFETY: x [t, cols] -> half; then y [t, rows] = xh . w16^T.
+        self.op("to half", || unsafe { (k.to_f16)(self.raw(), x.fp(), xh.ptr().cast(), (t * w.cols) as i64) })?;
+        self.op(&format!("gemm16 {key}"), || unsafe {
+            (k.gemm_f16)(self.raw(), t as i64, w.rows as i64, w.cols as i64, xh.ptr().cast(), w.cols as i64, w16.ptr().cast(), y.fp(), w.rows as i64, 0)
+        })
     }
 
     fn rms(&self, x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, c: usize) -> Result<()> {
@@ -613,13 +737,13 @@ impl<'g> NemotronH<'g> {
     fn attention(&self, a: &Attn, kc: &DevBuf, vc: &DevBuf, cap: usize, h: &DevBuf, t: usize, p0: usize) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hq, hk, d) = (g.heads, g.heads_kv, g.head);
-        let hq8 = self.quantize(h.fp(), g.n_embd, t)?;
+        let hq8 = if t <= DEC { Some(self.quantize(h.fp(), g.n_embd, t)?) } else { None };
         let q = self.arena().f32(t * hq * d)?;
         let kr = self.arena().f32(t * hk * d)?;
         let vr = self.arena().f32(t * hk * d)?;
-        self.matmul(&a.q, h, Some(&hq8), t, &q)?;
-        self.matmul(&a.k, h, Some(&hq8), t, &kr)?;
-        self.matmul(&a.v, h, Some(&hq8), t, &vr)?;
+        self.matmul(&a.q, h, hq8.as_ref(), t, &q)?;
+        self.matmul(&a.k, h, hq8.as_ref(), t, &kr)?;
+        self.matmul(&a.v, h, hq8.as_ref(), t, &vr)?;
         let att = self.arena().f32(t * hq * d)?;
         // SAFETY: arithmetic only.
         let sc = unsafe { (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) } as usize;
@@ -639,14 +763,21 @@ impl<'g> NemotronH<'g> {
     /// A latent-MoE layer on h [t, n_embd]: the routed experts in the latent, projected back, plus the shared expert
     fn moe(&self, m: &Moe, h: &DevBuf, t: usize, tap: Tap, l: usize) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
-        let hq8 = self.quantize(h.fp(), g.n_embd, t)?;
+        let hq8 = if t <= DEC { Some(self.quantize(h.fp(), g.n_embd, t)?) } else { None };
         // the router (float32) and the choice on the host: sigmoid, the bias for the choice only, the chosen ones'
         // probabilities renormalized and scaled
         let logits = self.arena().f32(t * g.experts)?;
         self.matmul(&m.router, h, None, t, &logits)?;
         tap(&format!("ffn_moe_logits-{l}"), &logits)?;
         let lat = self.arena().f32(t * g.latent)?;
-        self.matmul(&m.to_latent, h, Some(&hq8), t, &lat)?;
+        self.matmul(&m.to_latent, h, hq8.as_ref(), t, &lat)?;
+        if let Some(s) = self.silo.filter(|_| m.on_gpu) {
+            let mo = if t > DEC { self.moe_prompt(s, m, &logits, &lat, t)? } else { self.moe_gpu(s, m, &logits, &lat, t)? };
+            return self.moe_tail(m, mo, h, hq8.as_ref(), t, tap, l);
+        }
+        if t > DEC {
+            return Err(e(format!("a MoE layer of {t} rows without the silo (its passes are {DEC} rows)")));
+        }
         let lg = logits.to_f32()?;
         let n_e = t * g.used;
         let mut ent: Vec<(usize, usize, f32)> = Vec::with_capacity(n_e);
@@ -711,12 +842,145 @@ impl<'g> NemotronH<'g> {
         self.op("moe combine", || unsafe {
             (k.moe_combine)(self.raw(), mo.fp(), dn.fp(), tpb.ptr().cast(), idb.ptr().cast(), wb.fp(), t as i64, g.latent as i64)
         })?;
+        self.moe_tail(m, mo, h, hq8.as_ref(), t, tap, l)
+    }
+
+    /// A MoE layer's routed experts over a prompt pass's rows: routed on the GPU, the choice read back and grouped by
+    /// expert; per expert in use its rows gathered (half), its up and down expanded to half and multiplied over them,
+    /// relu^2 between; the rows' weighted sums. The latent sum [t, latent]
+    fn moe_prompt(&self, s: &ffi::Silo, m: &Moe, logits: &DevBuf, lat: &DevBuf, t: usize) -> Result<DevBuf> {
+        let (g, k) = (&self.g, self.k);
+        let n_e = t * g.used;
+        let ids = self.arena().bytes(n_e * 4)?;
+        let ws = self.arena().f32(n_e)?;
+        let cols = self.arena().bytes(n_e * 4)?;
+        // SAFETY: the buffers as named in nhs.h.
+        self.op("route", || unsafe {
+            (s.route)(self.raw(), logits.fp(), m.bias_dev.fp(), t as i64, g.experts as i64, g.used as i64, g.w_norm as c_int, g.w_scale, ids.ptr().cast(),
+                      ws.fp(), cols.ptr().cast())
+        })?;
+        let mut idb = vec![0u8; n_e * 4];
+        ids.read(0, &mut idb)?;
+        let chosen: Vec<usize> = idb.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
+        // the entries in expert order (stable: rows ascending within an expert); each entry's place there
+        let mut count = vec![0usize; g.experts + 1];
+        for x in &chosen {
+            count[x + 1] += 1;
+        }
+        for i in 0..g.experts {
+            count[i + 1] += count[i];
+        }
+        let mut fill = count.clone();
+        let mut rows = vec![0i32; n_e];
+        let mut place = vec![0i32; n_e];
+        for (j, x) in chosen.iter().enumerate() {
+            rows[fill[*x]] = (j / g.used) as i32;
+            place[j] = fill[*x] as i32;
+            fill[*x] += 1;
+        }
+        let bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let rowb = self.arena().bytes(n_e * 4)?;
+        rowb.write(0, &bytes(&rows))?;
+        let placeb = self.arena().bytes(n_e * 4)?;
+        placeb.write(0, &bytes(&place))?;
+        let lat16 = self.arena().bytes(t * g.latent * 2)?;
+        let xg = self.arena().bytes(n_e * g.latent * 2)?;
+        let u = self.arena().f32(n_e * g.n_ff_exp)?;
+        // SAFETY: the buffers as named in glm.h: the latent rows to half, then each entry's row gathered in expert order.
+        unsafe {
+            self.op("to half", || (k.to_f16)(self.raw(), lat.fp(), lat16.ptr().cast(), (t * g.latent) as i64))?;
+            self.op("gather", || (k.gather_h)(self.raw(), lat16.ptr().cast(), rowb.ptr().cast(), xg.ptr().cast(), n_e as i64, g.latent as i64))?;
+        }
+        let w16 = &self.dev().w16;
+        let u16 = self.arena().bytes(n_e * g.n_ff_exp * 2)?;
+        let dn = self.arena().f32(n_e * g.latent)?;
+        // SAFETY: arithmetic only.
+        let packed = unsafe { (s.packed)(m.down.ty.code() as i32, g.n_ff_exp as i64) } != 0;
+        // the up products, then relu^2 and half, then the down products: one expert at a time - its matrix expanded to
+        // half, then multiplied over its rows while the half copy (5.5 MB) is still in the cache (a group of 64 expanded
+        // in one launch was slower: 659 -> 596 tok/s, the copies read back from memory)
+        for (stage, mat) in [(0, &m.up), (1, &m.down)] {
+            if stage == 1 {
+                // SAFETY: n floats, then to half.
+                unsafe {
+                    self.op("relu2", || (k.relu2)(self.raw(), u.fp(), (n_e * g.n_ff_exp) as i64))?;
+                    self.op("to half", || (k.to_f16)(self.raw(), u.fp(), u16.ptr().cast(), (n_e * g.n_ff_exp) as i64))?;
+                }
+            }
+            let (rows, cols) = (mat.rows, mat.cols);
+            for x in 0..g.experts {
+                let (a, b) = (count[x], count[x + 1]);
+                if a == b {
+                    continue;
+                }
+                // SAFETY: expert x -> half [rows][cols] in w16 (the down packed: the silo's expansion; else the type's
+                // own); its rows (half) times it into their rows of the output.
+                unsafe {
+                    let src = mat.buf.ptr().cast::<u8>().add(x * mat.stride).cast();
+                    if stage == 1 && packed {
+                        self.op("expert down f16", || (s.packed_f16)(self.raw(), mat.ty.code() as i32, src, w16.ptr().cast(), rows as i64, cols as i64))?;
+                    } else {
+                        self.op(if stage == 0 { "expert up f16" } else { "expert down f16" },
+                                || (k.dequant_f16)(self.raw(), mat.ty.code() as i32, src, (rows * cols) as i64, w16.ptr().cast()))?;
+                    }
+                    let (xin, out) = if stage == 0 { (xg.ptr().cast::<u16>().add(a * cols), u.fp().add(a * rows)) } else { (u16.ptr().cast::<u16>().add(a * cols), dn.fp().add(a * rows)) };
+                    self.op(if stage == 0 { "expert up gemm16" } else { "expert down gemm16" }, || {
+                        (k.gemm_f16)(self.raw(), (b - a) as i64, rows as i64, cols as i64, xin, cols as i64, w16.ptr().cast(), out, rows as i64, 0)
+                    })?;
+                }
+            }
+        }
+        let mo = self.arena().f32(t * g.latent)?;
+        mo.fill(0)?;
+        // SAFETY: mo [t, latent], dn [entries, latent] in expert order, row r's entries r * used.. (their places), weights.
+        self.op("moe combine", || unsafe {
+            (k.moe_combine)(self.raw(), mo.fp(), dn.fp(), self.dev().tp.ptr().cast(), placeb.ptr().cast(), ws.fp(), t as i64, g.latent as i64)
+        })?;
+        Ok(mo)
+    }
+
+    /// A MoE layer's routed experts on the GPU (the silo): routing, every chosen expert's up in one launch, relu^2,
+    /// every down in one, the weighted sum per row - no wait for the host. The latent sum [t, latent]
+    fn moe_gpu(&self, s: &ffi::Silo, m: &Moe, logits: &DevBuf, lat: &DevBuf, t: usize) -> Result<DevBuf> {
+        let (g, k) = (&self.g, self.k);
+        let n_e = t * g.used;
+        let ids = self.arena().bytes(n_e * 4)?;
+        let ws = self.arena().f32(n_e)?;
+        let cols = self.arena().bytes(n_e * 4)?;
+        // SAFETY: the buffers as named in nhs.h / glm.h.
+        unsafe {
+            self.op("route", || (s.route)(self.raw(), logits.fp(), m.bias_dev.fp(), t as i64, g.experts as i64, g.used as i64, g.w_norm as c_int, g.w_scale,
+                                          ids.ptr().cast(), ws.fp(), cols.ptr().cast()))?;
+            let lq = self.arena().bytes((s.q8_bytes)(g.latent as i64, t as i64))?;
+            self.op("quantize", || (s.quantize_q8)(self.raw(), lat.fp(), lq.ptr(), g.latent as i64, t as i64))?;
+            let u = self.arena().f32(n_e * g.n_ff_exp)?;
+            self.op("experts up", || (s.multi)(self.raw(), m.up.ty.code() as i32, m.up.buf.ptr(), m.up.stride as i64, ids.ptr().cast(), cols.ptr().cast(),
+                                               n_e as i64, lq.ptr(), t as i64, u.fp(), g.latent as i64, g.n_ff_exp as i64))?;
+            self.op("relu2", || (k.relu2)(self.raw(), u.fp(), (n_e * g.n_ff_exp) as i64))?;
+            let uq = self.arena().bytes((s.q8_bytes)(g.n_ff_exp as i64, n_e as i64))?;
+            self.op("quantize", || (s.quantize_q8)(self.raw(), u.fp(), uq.ptr(), g.n_ff_exp as i64, n_e as i64))?;
+            let dn = self.arena().f32(n_e * g.latent)?;
+            let seq = &self.dev().seq;
+            self.op("experts down", || (s.multi)(self.raw(), m.down.ty.code() as i32, m.down.buf.ptr(), m.down.stride as i64, ids.ptr().cast(),
+                                                 seq.ptr().cast(), n_e as i64, uq.ptr(), n_e as i64, dn.fp(), g.n_ff_exp as i64, g.latent as i64))?;
+            let mo = self.arena().f32(t * g.latent)?;
+            mo.fill(0)?;
+            self.op("moe combine", || (k.moe_combine)(self.raw(), mo.fp(), dn.fp(), self.dev().tp.ptr().cast(), seq.ptr().cast(), ws.fp(), t as i64,
+                                                      g.latent as i64))?;
+            Ok(mo)
+        }
+    }
+
+    /// A MoE layer after its routed experts: the latent sum projected back, plus the shared expert
+    #[allow(clippy::too_many_arguments)]
+    fn moe_tail(&self, m: &Moe, mo: DevBuf, h: &DevBuf, hq8: Option<&DevBuf>, t: usize, tap: Tap, l: usize) -> Result<DevBuf> {
+        let (g, k) = (&self.g, self.k);
         tap(&format!("ffn_moe_out-{l}"), &mo)?;
         let out = self.arena().f32(t * g.n_embd)?;
         self.matmul(&m.from_latent, &mo, None, t, &out)?;
         // the shared expert on the full width
         let su = self.arena().f32(t * g.n_ff_shared)?;
-        self.matmul(&m.sh_up, h, Some(&hq8), t, &su)?;
+        self.matmul(&m.sh_up, h, hq8, t, &su)?;
         // SAFETY: n floats.
         self.op("relu2", || unsafe { (k.relu2)(self.raw(), su.fp(), (t * g.n_ff_shared) as i64) })?;
         let sd = self.arena().f32(t * g.n_embd)?;
@@ -726,7 +990,7 @@ impl<'g> NemotronH<'g> {
         Ok(out)
     }
 
-    /// One pass of at most CHUNK rows: the last `n_out` rows' logits
+    /// One pass of at most a chunk's rows: the last `n_out` rows' logits
     fn pass(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
         let _w = self.work.lock().unwrap();
         self.pass_in(s, tokens, n_out, tap)
@@ -738,8 +1002,8 @@ impl<'g> NemotronH<'g> {
         if t == 0 {
             return Err(e("an empty pass"));
         }
-        if t > CHUNK {
-            return Err(e(format!("a pass of {t} rows; it takes {CHUNK}")));
+        if t > self.chunk {
+            return Err(e(format!("a pass of {t} rows; it takes {}", self.chunk)));
         }
         if s.pos + t > s.max_ctx {
             return Err(e(format!("the context is full ({} of {})", s.pos + t, s.max_ctx)));
@@ -876,7 +1140,7 @@ impl<'g> NemotronH<'g> {
     pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
         let mut logits = Vec::new();
         let mut done = 0;
-        for c in tokens.chunks(CHUNK) {
+        for c in tokens.chunks(self.chunk) {
             if done > 0 && stop(done) {
                 break;
             }
