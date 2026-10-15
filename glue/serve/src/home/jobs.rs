@@ -195,14 +195,15 @@ impl Home {
             self.jobs.update(id, |j| {
                 j["state"] = json!("cancelled");
                 j["ended"] = json!(now());
-                j["error"] = json!({"status": 499, "code": "cancelled", "message": "cancelled before it started", "retryable": false});
+                j["error"] = super::api::rpc_error(&s(j, "method"), 499, None, "cancelled before it started");
                 j["body"] = Value::Null;
             });
             return;
         }
         let mut body = j["body"].clone();
         body["request_id"] = json!(id);
-        let r = self.work(&s(&j, "method"), &body);
+        let method = s(&j, "method");
+        let r = self.work(&method, &body);
         let cancel = self.jobs.get(id).is_some_and(|j| j["cancel"] == true);
         self.jobs.update(id, |j| {
             j["ended"] = json!(now());
@@ -215,8 +216,7 @@ impl Home {
                 Err((st, m)) => {
                     let st = if cancel && st != 200 { 499 } else { st };
                     j["state"] = json!(if st == 499 { "cancelled" } else { "failed" });
-                    let mut e = super::api::error_of(st, &m);
-                    e["status"] = json!(st);
+                    let e = super::api::rpc_error(&method, st, None, &m);
                     j["error"] = e;
                 }
             }

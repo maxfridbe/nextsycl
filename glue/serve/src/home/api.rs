@@ -2,7 +2,8 @@
 //!
 //! - `POST /rpc/<kind>.<method>`: H3's rules - POST only, one fixed route a method, every variable in the JSON body (no
 //!   path variables, no query strings); the answer `{"ok": true, "result": ...}` or `{"ok": false, "error": {"code",
-//!   "message"}}` with the HTTP status. Kinds: `system` (the box: models, enabling, loading), `llm`, `image`, `audio`,
+//!   "message", "retryable", "status", "method", "field"}}` - the body says it all (the HTTP status mirrors
+//!   error.status for HTTP's sake; a client never needs it, so another transport can carry the same envelope). Kinds: `system` (the box: models, enabling, loading), `llm`, `image`, `audio`,
 //!   `video` (the studio's methods, `video.generate` ...). Every kind but system has `describePromptGuideMD {model}`.
 //! - The OpenAI-compatible routes (`/v1/models`, `/v1/chat/completions`, `/v1/images/generations`, `/v1/images/edits`,
 //!   `/v1/audio/speech` and the files they link) - passed to the switcher or the kind's server, which is started for
@@ -258,7 +259,7 @@ const FEATURES: &[&str] = &[
     "video.negative_prompt.ignored", "image.canvases", "image.cancel", "spec.open",
     "image.edit.strength", "audio.speak.continue_from", "video.preview", "system.busy.parallel",
     "errors.retryable", "errors.no_room", "jobs.precheck", "image.info.steps", "image.generate.init_image", "image.edit.reference",
-    "video.failure", "video.gpu", "video.engines.ignored", "audio.speak.precheck.voice", "jobs.cancel.reentrant_id",
+    "video.failure", "video.gpu", "video.engines.ignored", "audio.speak.precheck.voice", "jobs.cancel.reentrant_id", "rpc.errors.body",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -290,10 +291,33 @@ pub(crate) fn retryable(status: u16, code: &str) -> bool {
     matches!(status, 502..=504) || code == "busy"
 }
 
-/// An error's body: code, message, whether to retry
+/// An error's body: code, message, whether to retry, and the status as a number (the same as the HTTP one, so a
+/// client - or another transport - needs only the body)
 pub(crate) fn error_of(status: u16, m: &str) -> Value {
     let code = code_of(status);
-    json!({"code": code, "message": m, "retryable": retryable(status, code)})
+    json!({"code": code, "message": m, "retryable": retryable(status, code), "status": status})
+}
+
+/// An /rpc error in full: error_of with the method, the request key at fault when the message starts with one
+/// ("steps 8: ...", "images[0]: ...", "voice bogus: ..."), and a code of its own where the status's is too broad
+pub(crate) fn rpc_error(method: &str, status: u16, code: Option<&str>, m: &str) -> Value {
+    let mut e = error_of(status, m);
+    if let Some(c) = code {
+        e["code"] = json!(c);
+        e["retryable"] = json!(retryable(status, c));
+    }
+    e["method"] = if method.is_empty() { Value::Null } else { json!(method) };
+    e["field"] = field_of(method, m).map_or(Value::Null, |f| json!(f));
+    e
+}
+
+/// The request key a message names first, when it is one of the method's fields
+fn field_of(method: &str, m: &str) -> Option<String> {
+    let (kind, name) = method.split_once('.')?;
+    let me = METHODS.iter().find(|x| x.kind == kind && x.name == name)?;
+    let first: String = m.trim_start_matches('"').chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+    let mentioned = |f: &str| first == f || m.contains(&format!("needs \"{f}\""));
+    me.fields.iter().map(|f| f.0).chain(["strength", "image", "reference", "continue_from"]).find(|f| mentioned(f)).map(str::to_string)
 }
 
 type Fail = (u16, String);
@@ -314,9 +338,17 @@ impl Home {
 
     pub(crate) fn api(self: &Arc<Self>, mut s: Conn, req: Request) {
         let rpc = req.path.starts_with("/rpc/");
+        let method = req.path.strip_prefix("/rpc/").unwrap_or("").to_string();
+        let fail_as = |s: &mut Conn, st: u16, code: Option<&str>, m: String| {
+            if rpc {
+                http::respond(s, st, &json!({"ok": false, "error": rpc_error(&method, st, code, &m)}));
+            } else {
+                http::respond(s, st, &json!({"error": {"message": m, "type": if st == 401 { "invalid_api_key" } else { "invalid_request_error" }}}));
+            }
+        };
         let fail = |s: &mut Conn, st: u16, m: String| {
             if rpc {
-                http::respond(s, st, &json!({"ok": false, "error": error_of(st, &m)}));
+                fail_as(s, st, None, m);
             } else {
                 http::respond(s, st, &json!({"error": {"message": m, "type": if st == 401 { "invalid_api_key" } else { "invalid_request_error" }}}));
             }
@@ -326,12 +358,12 @@ impl Home {
         }
         if rpc {
             if req.method != "POST" || req.target.contains('?') {
-                return fail(&mut s, 400, "POST only, every variable in the JSON body (no query strings)".into());
+                return fail_as(&mut s, 400, Some("invalid_request"), "POST only, every variable in the JSON body (no query strings)".into());
             }
             let body: Value = if req.body.is_empty() { json!({}) } else {
                 match serde_json::from_slice(&req.body) {
                     Ok(v @ Value::Object(_)) => v,
-                    _ => return fail(&mut s, 400, "the body must be a JSON object".into()),
+                    _ => return fail_as(&mut s, 400, Some("invalid_request"), "the body must be a JSON object".into()),
                 }
             };
             let name = &req.path["/rpc/".len()..];
@@ -471,7 +503,7 @@ impl Home {
     fn studio_rpc(&self, name: &str, b: &Value, host: &str) -> Option<(u16, Value)> {
         let method = name.strip_prefix("video.").filter(|m| !matches!(*m, "upload" | "describePromptGuideMD"))?;
         let all = self.models();
-        let envelope = |st: u16, m: String| (st, json!({"ok": false, "error": error_of(st, &m)}));
+        let envelope = |st: u16, m: String| (st, json!({"ok": false, "error": rpc_error(name, st, None, &m)}));
         if let Err((st, m)) = self.checked(name, b, &all) {
             return Some(envelope(st, m));
         }
@@ -484,8 +516,16 @@ impl Home {
             if v["error"]["code"] == "invalid_param" {
                 v["error"]["code"] = json!("invalid_params");
             }
+            // the studio's own code kept; the rest as every /rpc error has it
             let code = v["error"]["code"].as_str().unwrap_or("").to_string();
-            v["error"]["retryable"] = json!(retryable(st, &code));
+            let m = v["error"]["message"].as_str().unwrap_or("").to_string();
+            let mut e = rpc_error(name, st, Some(&code).filter(|c| !c.is_empty()).map(String::as_str), &m);
+            if let Some(o) = v["error"].as_object() {
+                for (k, x) in o.iter().filter(|(k, _)| !["code", "message"].contains(&k.as_str())) {
+                    e[k.as_str()] = x.clone();
+                }
+            }
+            v["error"] = e;
             return Some((st, v));
         }
         let url = |kind: &str, n: &str| format!("http://{host}/v1/video/{kind}/{n}");
@@ -927,7 +967,13 @@ impl Home {
         let ids = |k: &str| -> Vec<Value> { all.iter().filter(|m| registry::kind_of(m) == k && m["enabled"] != false).map(|m| m["id"].clone()).collect() };
         let envelope = json!({"type": "object", "properties": {
             "ok": {"type": "boolean"}, "result": {"description": "the method's answer"},
-            "error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "retryable": {"type": "boolean", "description": "true: the same call may work later (no_room, unavailable, timeout, busy)"}}}}});
+            "error": {"type": "object", "required": ["code", "message", "retryable", "status"], "description": "ok false: everything about the failure - read this, not the HTTP status (which only mirrors status)", "properties": {
+                "code": {"type": "string", "description": "the convention to branch on (the list in the description above): invalid_request, invalid_params, unauthorized, not_found, conflict, busy, not_running, no_room, cancelled, unavailable, timeout, request_too_large, internal"},
+                "message": {"type": "string", "description": "what was wrong, in words: the value, the limit or the nearest legal one, what to do"},
+                "retryable": {"type": "boolean", "description": "true: the same call may work later unchanged (no_room, unavailable, timeout, busy); false: change the request"},
+                "status": {"type": "integer", "description": "the code's number by convention (400, 404, 409, 499, 502, 503 ...): the same as the HTTP status, here so another transport carries it"},
+                "method": {"type": "string", "nullable": true, "description": "the method called"},
+                "field": {"type": "string", "nullable": true, "description": "the request key at fault, when the message names one (steps, voice, images, size ...)"}}}}});
         let engines: Vec<String> = if on.contains(&"video") {
             call_for(&self.target("video"), "POST", "/rpc/engines.list", Some(&json!({})), 3).ok()
                 .and_then(|v| v["result"]["engines"].as_array().map(|a| a.iter().filter_map(|e| e["quant"].as_str().map(str::to_string)).collect()))

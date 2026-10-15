@@ -266,7 +266,11 @@ impl Home {
     fn handle(self: &Arc<Self>, mut s: Conn) {
         let req = match http::read_request(&mut s) {
             Ok(r) => r,
-            Err(e) => return http::respond(&mut s, 400, &err(e)),
+            // unreadable (too large, cut short): the /rpc envelope, which an OpenAI client reads as error.message too
+            Err(e) => {
+                let code = if e.contains("over 256 MiB") { "request_too_large" } else { "invalid_request" };
+                return http::respond(&mut s, 400, &json!({"ok": false, "error": api::rpc_error("", 400, Some(code), &e)}));
+            }
         };
         let p = req.path.as_str();
         if p.starts_with("/rpc/") || p.starts_with("/v1/") {

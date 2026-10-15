@@ -57,7 +57,8 @@ const JOB_VIEW: &str = r#"{"type": "object", "required": ["id", "label", "state"
   "created": {"type": "number"}, "started": {"type": "number", "nullable": true}, "ended": {"type": "number", "nullable": true}, "seconds": {"type": "number", "description": "ended: started to ended"},
   "progress": {"type": "object", "description": "running: the server's progress (step at / of, picture, phase, seconds)", "additionalProperties": true},
   "result": {"type": "object", "description": "done: the answer generate gives with wait (data[].url ...)", "additionalProperties": true},
-  "error": {"type": "object", "properties": {"status": {"type": "integer"}, "code": {"type": "string"}, "message": {"type": "string"}, "retryable": {"type": "boolean", "description": "the same call may succeed later unchanged (no_room, unavailable, timeout); false: change the request (invalid_params, not_found, conflict, cancelled)"}}},
+  "error": {"type": "object", "description": "failed or cancelled: the /rpc error object (code, message, retryable, status, method, field)", "properties": {"status": {"type": "integer"}, "code": {"type": "string"}, "message": {"type": "string"}, "retryable": {"type": "boolean", "description": "the same call may succeed later unchanged (no_room, unavailable, timeout); false: change the request (invalid_params, not_found, conflict, cancelled)"},
+    "method": {"type": "string", "nullable": true}, "field": {"type": "string", "nullable": true}}},
   "restarted": {"type": "boolean", "description": "the front door restarted while it was unfinished: run again from the start"},
   "reentered": {"type": "boolean", "description": "generate: its reentrant_id named this job, nothing new was started"}}}"#;
 
@@ -299,7 +300,10 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
 }
 
 /// What every answer's error code means
-pub const CODES: &str = "Error codes (error.code, with the HTTP status): invalid_request 400 (the body is not a JSON object), invalid_params 400, \
+pub const CODES: &str = "Every /rpc answer is the envelope: {\"ok\": true, \"result\": ...} or {\"ok\": false, \"error\": {code, message, retryable, status, method, field}}. \
+Read ok and error.code: the body says everything, and the HTTP status only mirrors error.status (a client never needs it; another transport carries the same envelope). \
+A job's failure (image/audio status, a failed submit replayed) has the same error object. \
+Error codes (error.code, error.status by convention): invalid_request 400 (not POST, a query string, the body is not a JSON object), request_too_large 400 (over 256 MiB), invalid_params 400, \
 unauthorized 401, not_found 404 (also an unknown method), conflict 409 (a model disabled, none of the kind enabled, a name taken), \
 busy 409 (video.generate while a clip is made, without queue: true), not_running 409 (video.cancel with nothing running), \
 cancelled 499 (image.cancel / audio.cancel stopped it), unavailable 502 (the kind's server does not answer), \

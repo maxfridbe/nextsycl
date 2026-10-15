@@ -106,7 +106,7 @@ impl Home {
         let shift = schedule.as_deref().is_none_or(|v| v.eq_ignore_ascii_case("shift"));
         if let (Some(n), Some(st), true, true) = (own, steps, shift, b["options"]["sigmas"].is_null()) {
             if st as usize != n {
-                return Err(bad(format!("{id} runs its own {n} sigmas (a few-step distill): steps {st} is not one of its schedules - send {n} or leave steps out")));
+                return Err(bad(format!("steps {st}: {id} runs its own {n} sigmas (a few-step distill) - send {n} or leave steps out")));
             }
         }
         let cfg = number(b, "cfg", 0.0, 30.0)?.unwrap_or(1.0);
