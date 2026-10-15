@@ -430,18 +430,41 @@ impl ImageEngine for QwenImage21 {
             (Some(p), None) => p.nodes.len(),
             _ => steps,
         };
-        let sig = match preset {
-            // another schedule than the model's own: ComfyUI's, at the shift the model's would use for this size
-            _ if schedule != Schedule::Shift => {
-                let shift = req.shift.filter(|s| *s > 0.0).unwrap_or_else(|| sched::mu(hw.0 * hw.1).exp() as f32);
-                nextsycl_diffusion::samplers::sigmas_for(sampler, schedule, steps as u32, shift)
+        let levels = |steps: usize| -> Result<Vec<f32>> {
+            Ok(match preset {
+                // another schedule than the model's own: ComfyUI's, at the shift the model's would use for this size
+                _ if schedule != Schedule::Shift => {
+                    let shift = req.shift.filter(|s| *s > 0.0).unwrap_or_else(|| sched::mu(hw.0 * hw.1).exp() as f32);
+                    nextsycl_diffusion::samplers::sigmas_for(sampler, schedule, steps as u32, shift)
+                }
+                Some(p) if steps == p.nodes.len() => sched::preset(&p.nodes, hw.0 * hw.1, p.dynamic),
+                Some(p) => {
+                    return Err(Error(format!("this model runs its own {} sigmas (a few-step distill): {steps} steps is not one of its schedules",
+                                             p.nodes.len())))
+                }
+                None => sched::sigmas(steps, hw.0 * hw.1),
+            })
+        };
+        let sig = levels(steps)?;
+        // a strength below 1: start partway down from the first picture (its latents at the output's size, noised
+        // to the first level kept) - the levels a full run of steps / strength would take, the last `steps` of them
+        let strength = req.edit.as_ref().map_or(1.0, |e| e.strength);
+        if !(0.05..=1.0).contains(&strength) {
+            return Err(Error(format!("strength {strength}: from 0.05 to 1")));
+        }
+        let sig = match (strength < 1.0, preset) {
+            (false, _) => sig,
+            // a few-step model's own levels: those at or below the strength
+            (true, Some(_)) if schedule == Schedule::Shift => sched::below(&sig, strength),
+            (true, _) => sched::tail(&levels(((steps as f32 / strength).round() as usize).max(steps))?, steps),
+        };
+        let start = match &req.edit {
+            Some(e) if strength < 1.0 => {
+                let r = e.image.rgba().resize_lanczos(w as u32, h as u32);
+                let px: Vec<f32> = r.data.iter().map(|v| *v as f32 / 255.0 * 2.0 - 1.0).collect();
+                Some(self.vae.encode(&self.nsd, &px, h, w)?)
             }
-            Some(p) if steps == p.nodes.len() => sched::preset(&p.nodes, hw.0 * hw.1, p.dynamic),
-            Some(p) => {
-                return Err(Error(format!("this model runs its own {} sigmas (a few-step distill): {steps} steps is not one of its schedules",
-                                         p.nodes.len())))
-            }
-            None => sched::sigmas(steps, hw.0 * hw.1),
+            _ => None,
         };
         let (seen, lats) = if pics.is_empty() { (Vec::new(), Vec::new()) } else { self.pictures(&pics, area)? };
         let encode = |p: &str| -> Result<(DevBuf, usize, Vec<bool>)> {
@@ -470,7 +493,15 @@ impl ImageEngine for QwenImage21 {
         progress(Step { picture: 0, at: 0, of: steps as u32, seconds: t0.elapsed().as_secs_f64() })?;
         let mut out = Vec::new();
         for p in 0..req.n.max(1) {
-            let nz = noise(req.seed + p as u64, hw.0 * hw.1 * dit::LATENT);
+            let mut nz = noise(req.seed + p as u64, hw.0 * hw.1 * dit::LATENT);
+            if let Some(l0) = &start {
+                // x = s0 noise + (1 - s0) picture; the samplers scale their start by s0, the GPU path takes x as is
+                let s0 = sig[0];
+                let own = sampler == Sampler::Euler && schedule == Schedule::Shift;
+                for (x, l) in nz.iter_mut().zip(l0) {
+                    *x = if own { s0 * *x + (1.0 - s0) * l } else { *x + (1.0 - s0) / s0 * l };
+                }
+            }
             if let Ok(dir) = std::env::var("NS_QI_DUMP") {
                 let _ = std::fs::write(format!("{dir}/noise.f32"), nz.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
             }

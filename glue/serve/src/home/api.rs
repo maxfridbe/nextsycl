@@ -87,6 +87,7 @@ pub const METHODS: &[Method] = &[
     Method { kind: "image", name: "edit", summary: "Edit or compose pictures: the first is changed, the others are references the prompt names",
              fields: &[MODEL_OPT, ("prompt", "string", "the instructions", true), ("images", "string[]", "up to 8, base64 or data: URLs", true),
                        ("size", "string", "default: the last picture's aspect", false), ("steps", "integer", "", false), ("seed", "integer", "", false),
+                       ("strength", r#"{"type": "number", "minimum": 0.05, "maximum": 1, "default": 1}"#, "how far from the first picture: 1 (default) makes a new picture guided by it; below 1 starts from that picture noised this far (ComfyUI's denoise: the last steps of a steps / strength run). Measured on Qwen-Image 2.1: 0.9 keeps the framing, face, hair and clothes and still makes the change asked (a pose, a prop); 0.75 and below give back nearly the same picture (detail varies). The first picture is resized to the output's size", false),
                        ("response_format", "string", "url (default) or b64_json", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
@@ -127,6 +128,7 @@ pub const METHODS: &[Method] = &[
                        ("instructions", "string", "how to say it (CustomVoice), or the voice to make up (VoiceDesign)", false),
                        ("ref_audio", "string", "a recording of the voice to clone, WAV as base64 or a data: URL (the Base model)", false),
                        ("ref_text", "string", "what the recording says: the closer, in-context clone", false),
+                       ("continue_from", r#"{"type": "string", "maxLength": 200}"#, "carry on from speech made here (a book in chunks): the file name (or url) of the chunk before; its last sentences (up to 15 s, cut at a pause) are the in-context reference, after the saved voice's sample when voice names one - pace and voice go on, anchored to the voice. Needs a model that clones (picked for you when model is not given); a built-in voice name is dropped", false),
                        ("seconds", "number", "the most to make", false), ("seed", "integer", "", false),
                        ("options", "object", "the engine's own: greedy, temperature, top-k, streaming", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
@@ -210,7 +212,7 @@ pub const METHODS: &[Method] = &[
                        ("cond_noise_aug", "number", "noise on the first frame (harmful here: shows as confetti)", false),
                        ("sampler", "string", "ComfyUI's name (none: the engine's own Euler)", false), ("schedule", "string", "ComfyUI's name", false)],
              example: r#"{"prompt": "integrated_multimodal_description: [Shot 1] Live-action, a red fox trots through deep snow at dawn.\n\noverall_soundscape: soft wind, crunching snow.\n\nnon_diegetic_music: None.", "label": "Fox 01/03: snow", "seconds": 5, "steps": 8, "queue": true}"# },
-    Method { kind: "video", name: "status", summary: "The clip running or last: stage, percent, ETA, timings, the queue, version", fields: &[], example: "{}" },
+    Method { kind: "video", name: "status", summary: "The clip running or last: stage, percent, ETA, timings, a preview picture of the shot while it samples (preview), the queue, version", fields: &[], example: "{}" },
     Method { kind: "video", name: "wait", summary: "Long poll: answers when the status's version changes, or at the timeout",
              fields: &[("version", "string", "the last version seen", false), ("timeout_s", r#"{"type": "number", "minimum": 0, "maximum": 60, "default": 30}"#, "the longest it waits (above 60: refused)", false)], example: r#"{"version": "", "timeout_s": 30}"# },
     Method { kind: "video", name: "cancel", summary: "Stop the running clip at its next step; with a label, that clip only: stopped if it runs, dropped from the queue if it waits",
@@ -251,6 +253,7 @@ const FEATURES: &[&str] = &[
     "jobs.image", "jobs.audio", "jobs.cancel.label", "reentrant_id",
     "video.frames", "video.chain", "video.priority", "video.cancel.label", "video.queue.move", "video.queue.remove", "video.engines.inputs",
     "video.negative_prompt.ignored", "image.canvases", "image.cancel", "spec.open",
+    "image.edit.strength", "audio.speak.continue_from", "video.preview", "system.busy.parallel",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -375,7 +378,7 @@ impl Home {
             return self.pick("audio", b, all);
         }
         let voice = s(b, "voice");
-        let need = if !s(b, "ref_audio").is_empty() || (!voice.is_empty() && self.voices().get(&voice).is_some()) {
+        let need = if !s(b, "ref_audio").is_empty() || !s(b, "continue_from").is_empty() || (!voice.is_empty() && self.voices().get(&voice).is_some()) {
             "clone"
         } else if !voice.is_empty() {
             "voices"
@@ -467,8 +470,10 @@ impl Home {
         }
         let url = |kind: &str, n: &str| format!("http://{host}/v1/video/{kind}/{n}");
         let r = &mut v["result"];
-        if let Some(f) = r["file"].as_str().and_then(|f| f.strip_prefix("/out/")).map(str::to_string) {
-            r["file"] = json!(url("files", &f));
+        for k in ["file", "preview"] {
+            if let Some(f) = r[k].as_str().and_then(|f| f.strip_prefix("/out/")).map(str::to_string) {
+                r[k] = json!(url("files", &f));
+            }
         }
         for c in r.get_mut("clips").and_then(Value::as_array_mut).into_iter().flatten() {
             if c["state"] == "done" {
@@ -544,7 +549,20 @@ impl Home {
                    "work": here.iter().filter(|x| x["busy"] == true).map(|x| json!({"kind": x["kind"], "model": x["model"]})).collect::<Vec<_>>()})
         }).collect();
         json!({"busy": !reasons.is_empty(), "reasons": reasons, "loading": loading, "working": working, "llm": {"active": active},
-               "jobs": jobs, "video": video, "cards": per_card, "slots": slots})
+               "jobs": jobs, "video": video, "cards": per_card, "slots": slots, "parallel": self.parallel(all)})
+    }
+
+    /// How many requests of each image and audio model run at once: a copy a card it is enabled on, as many as the
+    /// kind has servers (a second copy starts when the first has work and its card has the room then)
+    fn parallel(&self, all: &[Value]) -> Value {
+        let mut out = serde_json::Map::new();
+        for kind in ["image", "audio"] {
+            let servers = self.slots(kind).len();
+            let models: serde_json::Map<String, Value> = all.iter().filter(|m| registry::kind_of(m) == kind && m["enabled"] != false)
+                .map(|m| (s(m, "id"), json!(self.gpus_of(m).len().min(servers)))).collect();
+            out.insert(kind.into(), json!({"servers": servers, "models": models}));
+        }
+        Value::Object(out)
     }
 
     fn rpc(self: &Arc<Self>, name: &str, b: &Value) -> Result<Value, Fail> {
@@ -828,8 +846,9 @@ impl Home {
             ("GET", p) if p.starts_with("/v1/video/files/") => {
                 // a clip in the studio's output (its /out/ route; a Range header passed on for seeking)
                 need("video")?;
-                let name = &p["/v1/video/files/".len()..];
-                if name.is_empty() || name.contains('/') || !name.ends_with(".mp4") {
+                let name = p["/v1/video/files/".len()..].split('?').next().unwrap_or("");
+                let still = name.ends_with(".preview.png") || name.ends_with(".last.png");
+                if name.is_empty() || name.contains('/') || !(name.ends_with(".mp4") || still) {
                     return Err((404, format!("no clip {name}")));
                 }
                 let head = String::from_utf8_lossy(&req.head).into_owned();
@@ -986,7 +1005,7 @@ impl Home {
             paths.insert("/v1/audio/voices/{name}".into(), file("A saved voice's sample (audio.voices.list's sample)", "<voice>.wav", "audio/wav", false));
         }
         if on.contains(&"video") {
-            paths.insert("/v1/video/files/{name}".into(), file("A finished clip: <clip>.mp4 (video.jobs.list's file, video.status's and video.timeline's file URLs)", "<clip>.mp4, e.g. h3_20261011_220723.mp4", "video/mp4", true));
+            paths.insert("/v1/video/files/{name}".into(), file("A finished clip: <clip>.mp4 (video.jobs.list's file, video.status's and video.timeline's file URLs); also <clip>.preview.png (video.status's preview while it samples) and <clip>.last.png (a clip's last frame), image/png", "<clip>.mp4, e.g. h3_20261011_220723.mp4", "video/mp4", true));
             paths.insert("/v1/video/thumbs/{name}".into(), file("A finished clip's 240-pixel still, 5 s in (video.timeline's thumb)", "<clip>.webp", "image/webp", false));
         }
         json!({

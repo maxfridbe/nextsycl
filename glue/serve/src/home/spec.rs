@@ -96,6 +96,7 @@ fn status() -> String {
     "steps_done": {{"type": "integer"}}, "steps_total": {{"type": "integer"}}, "frames": {{"type": "integer"}},
     "times": {{"type": "object", "additionalProperties": {{"type": "number"}}, "description": "seconds by stage"}},
     "file": {{"type": "string", "nullable": true, "description": "done: the clip's URL (/v1/video/files/<name>.mp4)"}},
+    "preview": {{"type": "string", "nullable": true, "description": "while it samples: a picture of the shot so far (/v1/video/files/<name>.preview.png?t=<when>, PNG, 4x the latent grid: 320x176 for 1280x704) - the denoised estimate's middle frame after each step, its colours from a fitted latent-to-RGB map (close, not the decoder's). The URL changes with each step; null when idle or before the first step"}},
     "engine_log": {{"type": "array", "items": {{"type": "string"}}}},
     "queue": {{"type": "array", "items": {{"type": "string"}}, "description": "the queue's labels in run order"}},
     "queue_items": {{"type": "array", "items": {QUEUE_ITEM}}}, "queue_len": {{"type": "integer"}},
@@ -128,7 +129,9 @@ pub fn result(method: &str) -> Option<String> {
   "cards": {"type": "array", "description": "each GPU and the work on it", "items": {"type": "object", "properties": {
     "gpu": {"type": "integer"}, "name": {"type": "string"}, "vram_total_mb": {"type": "integer"}, "vram_used_mb": {"type": "integer"}, "busy_pct": {"type": "number"}, "power_w": {"type": "number"},
     "models": {"type": "array", "items": {"type": "string"}, "description": "registered models whose processes hold memory there"}, "busy": {"type": "boolean"},
-    "work": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string"}, "model": {"type": "string", "nullable": true}}}}}}}}}"#.into(),
+    "work": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string"}, "model": {"type": "string", "nullable": true}}}}}}},
+  "parallel": {"type": "object", "description": "how many image / audio jobs run at the same time. Jobs of one model run side by side up to models[id]: a copy of the model a card it is enabled on, at most servers. The first copy takes the first job; a second job finds it busy and starts a second copy on the other card when that card has the room (else it waits for the first). So a long book can submit two audio.speak at once (wait: false) and keep both busy. Jobs of two different models run side by side when each has a server", "properties": {
+    "image": {"type": "object", "properties": {"servers": {"type": "integer", "description": "the kind's servers (2)"}, "models": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "enabled model id: its jobs that run at once"}}}, "audio": {"type": "object", "properties": {"servers": {"type": "integer", "description": "the kind's servers (2)"}, "models": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "enabled model id: its jobs that run at once"}}}}}}}"#.into(),
         "system.version" => r#"{"type": "object", "properties": {"version": {"type": "string", "description": "the release (yy.mmdd.###)"}, "api": {"type": "integer", "description": "raised when an answer changes incompatibly"},
   "kinds": {"type": "array", "items": {"type": "string"}, "description": "kinds with an enabled model"}, "features": {"type": "array", "items": {"type": "string"}, "description": "what this build does (names stay; new ones are added)"},
   "methods": {"type": "array", "items": {"type": "string"}, "description": "the methods callable now"}}}"#.into(),

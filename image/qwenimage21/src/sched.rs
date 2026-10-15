@@ -33,6 +33,17 @@ pub fn preset(nodes: &[f64], tokens: usize, dynamic: bool) -> Vec<f32> {
     out
 }
 
+/// The last `steps` steps of `sigmas` (a run started partway: an edit's strength below 1, as ComfyUI's denoise)
+pub fn tail(sigmas: &[f32], steps: usize) -> Vec<f32> {
+    sigmas[sigmas.len().saturating_sub(steps + 1)..].to_vec()
+}
+
+/// The levels of `sigmas` at or below `strength` (a fixed schedule started partway), at least its last step
+pub fn below(sigmas: &[f32], strength: f32) -> Vec<f32> {
+    let first = sigmas.iter().position(|s| *s <= strength).unwrap_or(sigmas.len() - 1).min(sigmas.len() - 2);
+    sigmas[first..].to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -51,5 +62,16 @@ mod tests {
         let s = super::preset(&n, 4096, true);
         assert_eq!(s[0], 1.0);
         assert!(s[5] > 0.25 && s[6] == 0.0, "a large image shifts toward noise: {s:?}");
+    }
+
+    #[test]
+    fn a_partway_run_keeps_its_steps_and_starts_lower() {
+        let full = super::sigmas(40, 4096);
+        let t = super::tail(&full, 20);
+        assert_eq!(t.len(), 21);
+        assert!(t[0] < 0.9 && t[20] == 0.0);
+        let b = super::below(&[1.0, 0.9, 0.5, 0.25, 0.0], 0.6);
+        assert_eq!(b, vec![0.5, 0.25, 0.0]);
+        assert_eq!(super::below(&[1.0, 0.9, 0.0], 0.05), vec![0.9, 0.0]);
     }
 }

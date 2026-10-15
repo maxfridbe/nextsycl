@@ -617,6 +617,16 @@ impl Studio {
     /// An mp4 of out/, with byte ranges (the video player seeks).
     fn file(&self, mut stream: &TcpStream, req: &http::Request, name: &str) -> http::Result<()> {
         let p = self.out.join(name);
+        // a clip's still pictures: its preview while it is made, its last frame
+        if (name.ends_with(".preview.png") || name.ends_with(".last.png")) && p.is_file() {
+            return match std::fs::read(&p) {
+                Ok(b) => {
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", b.len())?;
+                    stream.write_all(&b).map_err(Into::into)
+                }
+                Err(_) => http::respond(stream, 404, &json!({"error": "no such picture"})),
+            };
+        }
         if !name.ends_with(".mp4") || !p.is_file() {
             return http::respond(stream, 404, &json!({"error": "no such clip"}));
         }

@@ -1326,9 +1326,12 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         let mut progress = ctl.progress.take();
         let mut times = Vec::new();
         let mut t_step = Instant::now();
-        let r = denoiser::sample_with(&mut d, c.sampler, &noise_v, &noise_a, &sigmas, inpaint.as_ref(), c.seed, &mut |_, _, _| {
+        let preview = out.with_extension("preview.png");
+        let r = denoiser::sample_with(&mut d, c.sampler, &noise_v, &noise_a, &sigmas, inpaint.as_ref(), c.seed, &mut |_, dv, _| {
             times.push(t_step.elapsed().as_secs_f64());
             t_step = Instant::now();
+            // the shot so far: the denoised estimate's middle frame (a failed write costs the preview only)
+            let _ = write_preview(&preview, dv, shape);
             Ok(())
         }, &mut |i, b| {
             if b == 0 || b == nblocks / 2 {
@@ -1369,6 +1372,60 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     rep["total_seconds"] = json!(total);
     ctl.say(format!("clip   : {} in {total:.1} s", out.display()));
     Ok(rep)
+}
+
+/// Latent channel -> RGB in [0, 1] (24 rows, then the offset): a least-squares fit of the clips' latents to their
+/// decoded frames (held-out clip: r = 0.98, mean error 0.036) - a preview's colours, not the decoder's
+const LATENT_RGB: [[f32; 3]; 25] = [
+    [-0.0245, -0.05739, -0.05477], [0.03135, 0.05228, 0.02513], [0.1308, 0.07397, 0.01471], [0.09719, 0.0271, -0.07798],
+    [0.05887, 0.07277, 0.01016], [0.08445, 0.06948, 0.03474], [0.02325, 0.02233, 0.03108], [0.0367, 0.0421, 0.04121],
+    [0.01797, 0.0246, 0.03111], [0.14978, 0.12763, 0.14073], [-0.04545, -0.04475, -0.03529], [-0.03017, -0.02193, -0.00413],
+    [0.0132, 0.01396, 0.02623], [-0.00713, 0.00399, 0.00554], [-0.00159, 0.01, 0.02435], [0.00283, -0.00604, -0.02108],
+    [-0.00492, -0.0108, -0.01629], [-0.02036, -0.02123, -0.01064], [0.00093, -0.0006, -0.00354], [0.03749, 0.03516, 0.0389],
+    [-0.00247, -0.0058, -0.00564], [-0.00975, -0.00785, -0.01178], [-0.00824, -0.00214, 0.0038], [7e-05, 0.00242, 0.00835],
+    [0.49103, 0.45144, 0.42555],
+];
+
+/// The middle latent frame of `v` ([24, T, H, W]) as a picture [H, W, 3] by `LATENT_RGB`
+pub fn latent_rgb(v: &[f32], shape: Shape) -> Vec<f32> {
+    let n = shape.h * shape.w;
+    let t = shape.t / 2;
+    let mut px = vec![0.0f32; n * 3];
+    for (i, p) in px.chunks_exact_mut(3).enumerate() {
+        p.copy_from_slice(&LATENT_RGB[24]);
+        for (ch, row) in LATENT_RGB[..24].iter().enumerate() {
+            let x = v[(ch * shape.t + t) * n + i];
+            p.iter_mut().zip(row).for_each(|(o, k)| *o += k * x);
+        }
+    }
+    px
+}
+
+/// The preview beside the clip (written whole, then moved in: a reader never sees half of one)
+fn write_preview(path: &Path, v: &[f32], shape: Shape) -> Result<()> {
+    // four times the latent grid (a latent is 16 pixels): smooth enough to look at
+    const UP: usize = 4;
+    let (w, h) = (shape.w * UP, shape.h * UP);
+    let small = latent_rgb(v, shape);
+    let at = |x: usize, y: usize, c: usize| small[(y.min(shape.h - 1) * shape.w + x.min(shape.w - 1)) * 3 + c];
+    let mut px = vec![0.0f32; w * h * 3];
+    for y in 0..h {
+        let fy = ((y as f32 + 0.5) / UP as f32 - 0.5).max(0.0);
+        let (y0, ty) = (fy as usize, fy.fract());
+        for x in 0..w {
+            let fx = ((x as f32 + 0.5) / UP as f32 - 0.5).max(0.0);
+            let (x0, tx) = (fx as usize, fx.fract());
+            for c in 0..3 {
+                let top = at(x0, y0, c) * (1.0 - tx) + at(x0 + 1, y0, c) * tx;
+                let bot = at(x0, y0 + 1, c) * (1.0 - tx) + at(x0 + 1, y0 + 1, c) * tx;
+                px[(y * w + x) * 3 + c] = top * (1.0 - ty) + bot * ty;
+            }
+        }
+    }
+    let tmp = path.with_extension("tmp.png");
+    crate::media::write_png(&tmp, &px, w, h)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// One job, as the daemon receives it: `{"kind": "bench-blocks", "tokens": 47173}` and so on.

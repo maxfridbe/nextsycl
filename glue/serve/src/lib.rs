@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod cache;
 pub mod cancel;
+pub mod carry;
 pub mod files;
 pub mod gpustat;
 pub mod home;

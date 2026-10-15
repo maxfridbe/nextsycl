@@ -96,6 +96,7 @@ export interface Status {
   projects: Project[];
   all_projects: string[];
   version?: string;
+  preview?: string | null;    // while it samples: a picture of the shot so far (PNG URL, new each step)
 }
 
 export interface QueueItem {

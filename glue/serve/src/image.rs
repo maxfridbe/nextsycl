@@ -9,7 +9,8 @@
 //!   POST /v1/images/edits         OpenAI's form (multipart: image / image[] files - the picture to change, then
 //!                                 references -, prompt, the fields above) or JSON with `images`: [base64 or data
 //!                                 URLs]; the instructions name the pictures ("the hat from picture 2"); the size
-//!                                 follows the last picture's aspect unless one is given
+//!                                 follows the last picture's aspect unless one is given; strength (0.05 to 1,
+//!                                 default 1): below 1 the picture starts from the first one, noised that far
 //!   POST /v1/ocr                  an OCR model's reading: images [base64 or data URLs: pictures or PDFs, split into
 //!                                 their pages here] (pages, in order), each_page (several pages each read on its
 //!                                 own; default true - false: the model's one-pass multi-page reading), prompt,
@@ -517,6 +518,17 @@ impl ImageServer {
         let sampler = parse_name("sampler").map(|v| Sampler::parse(v).ok_or_else(|| bad(format!("sampler {v}?")))).transpose()?;
         let schedule = parse_name("schedule").map(|v| Schedule::parse(v).ok_or_else(|| bad(format!("schedule {v}?")))).transpose()?;
         let want_loras = self.loras_of(b).map_err(bad)?;
+        // an edit's strength: how far from the first picture (1: as far as a new one; lower starts from it)
+        let strength = match &b["strength"] {
+            Value::Null => 1.0,
+            v => v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).ok_or_else(|| bad("strength: a number from 0.05 to 1".into()))?,
+        };
+        if !(0.05..=1.0).contains(&strength) {
+            return Err(bad(format!("strength {strength}: from 0.05 to 1")));
+        }
+        if strength < 1.0 && pics.is_empty() {
+            return Err(bad("strength: an edit's (the picture to start from)".into()));
+        }
         let req = ImageRequest {
             prompt: prompt.clone(),
             negative: b["negative_prompt"].as_str().filter(|v| !v.trim().is_empty()).map(str::to_string),
@@ -530,7 +542,7 @@ impl ImageServer {
             schedule,
             shift: num(&["shift"]).map(|v| v as f32),
             loras: Vec::new(),
-            edit: (!pics.is_empty()).then(|| nextsycl_image::Edit { image: pics[0].clone(), refs: pics[1..].to_vec(), mask: None, strength: 1.0 }),
+            edit: (!pics.is_empty()).then(|| nextsycl_image::Edit { image: pics[0].clone(), refs: pics[1..].to_vec(), mask: None, strength: strength as f32 }),
             rgba: b["background"].as_str() == Some("transparent") || b["rgba"].as_bool() == Some(true),
             extra: Default::default(),
         };

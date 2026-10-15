@@ -7,7 +7,9 @@
 //!                                 link)} and ours: steps, cfg, options {NAME: value} (the engine's own: /api/info);
 //!                                 speech: {input: the text, voice, language, instructions (its style; a designed
 //!                                 voice's description), ref_audio (base64 WAV / data URL: a voice to clone),
-//!                                 ref_text, seconds (the most), seed, response_format, options}
+//!                                 ref_text, continue_from (a speech file made here: its last sentences are the
+//!                                 reference, after the voice's - the voice carries on), seconds (the most), seed,
+//!                                 response_format, options}
 //!   GET  /v1/audio/files/<f>      a song made here (saved in the output directory; byte ranges for seeking)
 //!   POST /api/cancel              stops the request running (between frames or steps)
 //!   GET  /v1/models, /health
@@ -393,6 +395,11 @@ impl AudioServer {
             instructions: instructions.clone(),
             reference,
         };
+        let carried = text(&["continue_from"]);
+        // carrying on: a voice that is not a saved one (a built-in voice of the chunk before) is in that chunk already
+        if carried.is_some() && req.voice.as_ref().is_some_and(|v| !self.voices().is_some_and(|l| l.get(v).is_some())) {
+            req.voice = None;
+        }
         // a saved voice: its recording and transcript as the reference, for a model that clones
         if let (Some(sp), Some(v)) = (engine.speech(), req.voice.clone()) {
             if !sp.voices.iter().any(|x| x.eq_ignore_ascii_case(&v)) {
@@ -411,6 +418,29 @@ impl AudioServer {
                 req.voice = None;
                 saved = Some(v);
             }
+        }
+        // carry on from speech made here: the end of that file (its last sentences) after the voice's reference
+        if let Some(name) = &carried {
+            let sp = engine.speech().ok_or_else(|| bad("continue_from: speech's (this is a song model)".into()))?;
+            if !sp.clone {
+                return Err(bad("continue_from: speak it with a model that clones (qwen3-tts-base, voxcpm2)".into()));
+            }
+            let name = name.rsplit('/').next().unwrap_or(name);
+            let ok = name.ends_with(".wav") && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+            let path = self.out_dir.as_ref().filter(|_| ok).map(|d| d.join(name)).filter(|p| p.is_file())
+                .ok_or_else(|| (404u16, format!("continue_from {name}: no speech file of that name here")))?;
+            let (info, _) = nextsycl_audio::wav_info(&path).map_err(bad)?;
+            let said = info.iter().find(|(k, _)| k == "INAM").map(|(_, v)| v.clone()).filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| bad(format!("continue_from {name}: the file does not say what it says (not speech made here)")))?;
+            let bytes = std::fs::read(&path).map_err(|e| (500u16, format!("{name}: {e}")))?;
+            let (samples, rate) = nextsycl_audio::decode_wav(&bytes).map_err(bad)?;
+            let (end, end_text) = crate::carry::tail(&samples, rate, &said, crate::carry::KEEP_S);
+            let before = nextsycl_audio::Reference { samples: end, rate, text: Some(end_text) };
+            req.reference = Some(match req.reference.take() {
+                Some(voice) if voice.text.is_some() => crate::carry::join(voice, before),
+                _ => before,
+            });
+            req.voice = None;
         }
         if !given.is_empty() {
             nextsycl_core::options::resolve(&given, engine.options(), nextsycl_core::At::Request, &self.model).map_err(bad)?;
@@ -447,6 +477,7 @@ impl AudioServer {
             meta["language"] = json!(req.language);
             meta["instructions"] = json!(instructions);
             meta["cloned"] = json!(req.reference.is_some());
+            meta["continued"] = json!(carried);
         }
         let meta = meta.to_string();
         let wav = audio.wav(&[("INAM", &prompt), ("ILYR", lyrics.as_deref().unwrap_or("")), ("ICMT", &meta)]);

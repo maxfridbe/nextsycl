@@ -387,6 +387,11 @@ impl Studio {
         out.insert("per_step".into(), Value::Null);
         out.insert("metrics".into(), json!([]));
         out.insert("file".into(), if done { json!(format!("/out/{name}.mp4")) } else { Value::Null });
+        // while it samples: the engine's picture of the shot so far (its latents' middle frame, each step)
+        let pv = self.out.join(format!("{name}.preview.png"));
+        let pv_at = (!idle).then(|| std::fs::metadata(&pv).and_then(|m| m.modified()).ok()).flatten()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+        out.insert("preview".into(), pv_at.map_or(Value::Null, |t| json!(format!("/out/{name}.preview.png?t={t}"))));
         out.insert("engine_log".into(), json!(log.iter().rev().take(12).rev().collect::<Vec<_>>()));
         out.extend(st.q.payload());
         out.insert("all_projects".into(), json!(self.all_projects(&st.q)));
