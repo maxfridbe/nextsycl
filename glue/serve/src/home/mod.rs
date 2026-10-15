@@ -95,6 +95,8 @@ pub struct Home {
     pub(crate) inflight: Mutex<BTreeMap<u16, usize>>,
     /// image and audio requests as jobs (jobs.json beside serve.json)
     jobs: jobs::Jobs,
+    /// a job's stage while its server is chosen, and what it waits for: job id -> (stage, waiting_for)
+    stages: Mutex<BTreeMap<String, (String, String)>>,
 }
 
 pub(crate) fn now() -> f64 {
@@ -178,7 +180,7 @@ impl Home {
             o, token, state_file, jobs,
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
-            seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()),
+            seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()),
         });
         let me = h.clone();
         std::thread::spawn(move || me.sample_cards());
@@ -264,12 +266,15 @@ impl Home {
     }
 
     fn handle(self: &Arc<Self>, mut s: Conn) {
-        let req = match http::read_request(&mut s) {
+        let req = match http::read_request_at(&mut s) {
             Ok(r) => r,
-            // unreadable (too large, cut short): the /rpc envelope, which an OpenAI client reads as error.message too
-            Err(e) => {
+            // unreadable (too large, cut short): the /rpc envelope (HTTP 200 on /rpc, as every /rpc error; 400 elsewhere),
+            // which an OpenAI client reads as error.message too
+            Err((path, e)) => {
                 let code = if e.contains("over 256 MiB") { "request_too_large" } else { "invalid_request" };
-                return http::respond(&mut s, 400, &json!({"ok": false, "error": api::rpc_error("", 400, Some(code), &e)}));
+                let method = path.strip_prefix("/rpc/").unwrap_or("");
+                let st = if path.starts_with("/rpc/") { 200 } else { 400 };
+                return http::respond(&mut s, st, &json!({"ok": false, "error": api::rpc_error(method, 400, Some(code), &e)}));
             }
         };
         let p = req.path.as_str();

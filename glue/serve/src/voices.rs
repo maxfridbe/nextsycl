@@ -101,6 +101,15 @@ impl Library {
         Ok(rec)
     }
 
+    /// A voice's record with one key set (its owner ...): the record
+    pub fn tag(&self, name: &str, key: &str, value: Value) -> Result<Value, String> {
+        let mut v = self.get(name).ok_or_else(|| format!("no saved voice {name:?}"))?;
+        v[key] = value;
+        let f = self.dir.join(name).join("voice.json");
+        std::fs::write(&f, serde_json::to_string_pretty(&v).unwrap_or_default()).map_err(|e| format!("{}: {e}", f.display()))?;
+        Ok(v)
+    }
+
     pub fn remove(&self, name: &str) -> Result<(), String> {
         check_name(name)?;
         let d = self.dir.join(name);
@@ -140,6 +149,8 @@ mod tests {
         let wav = Audio { rate: 16000, channels: 1, samples: (0..32000).map(|i| (i as f32 * 0.01).sin() * 0.5).collect() }.wav(&[]);
         let r = lib.add("anna", &wav, Some(" Hello. "), None, Some("english"), "clone", "test", false).unwrap();
         assert_eq!(r["text"], "Hello.");
+        assert_eq!(lib.tag("anna", "owner", json!("film-app")).unwrap()["owner"], "film-app");
+        assert_eq!(lib.get("anna").unwrap()["owner"], "film-app");
         assert!(lib.add("anna", &wav, None, None, None, "clone", "test", false).is_err());
         assert_eq!(lib.list().len(), 1);
         let rf = lib.reference("anna").unwrap();

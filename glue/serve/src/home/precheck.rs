@@ -53,9 +53,28 @@ pub fn steps_of(m: &Value) -> Value {
     }
 }
 
+/// A job's queue keys: priority -9..9, held and queue true or false, project and batch text
+fn queue_fields(b: &Value) -> Result<(), Fail> {
+    if !b["priority"].is_null() && b["priority"].as_i64().is_none_or(|p| !(-9..=9).contains(&p)) {
+        return Err(bad(format!("priority {}: a whole number from -9 to 9", b["priority"])));
+    }
+    for k in ["held", "queue"] {
+        if !b[k].is_null() && !b[k].is_boolean() {
+            return Err(bad(format!("{k} {}: true or false", b[k])));
+        }
+    }
+    for k in ["project", "batch"] {
+        if !b[k].is_null() && !b[k].is_string() {
+            return Err(bad(format!("{k} {}: a name (text)", b[k])));
+        }
+    }
+    Ok(())
+}
+
 impl Home {
     /// The checks for `name` (a job method) before it is queued
     pub(super) fn precheck(&self, name: &str, b: &Value, all: &[Value]) -> Result<(), Fail> {
+        queue_fields(b)?;
         match name {
             "image.generate" | "image.edit" => self.precheck_image(name == "image.edit", b, all),
             "audio.speak" => self.precheck_speak(b, all),
@@ -227,6 +246,14 @@ mod tests {
         let full = steps_of(&json!({"defaults": {"steps": 40}}));
         assert_eq!((full["locked"].as_bool(), full["max"].as_u64()), (Some(false), Some(100)));
         assert!(full["allowed"].is_null());
+    }
+
+    #[test]
+    fn queue_keys_are_checked() {
+        assert!(super::queue_fields(&json!({"priority": 3, "held": true, "queue": false, "project": "film"})).is_ok());
+        for b in [json!({"priority": 10}), json!({"priority": 1.5}), json!({"held": "yes"}), json!({"project": 4})] {
+            assert_eq!(super::queue_fields(&b).unwrap_err().0, 400, "{b}");
+        }
     }
 
     #[test]

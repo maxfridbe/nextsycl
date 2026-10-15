@@ -339,8 +339,11 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
   - **Enabled** models load on their first request - an API call, their page, Open WebUI through the switcher - and
     unload after `NS_IDLE_MINUTES` (10) without one (the image and music servers exit, `--idle-exit`; the switcher
     sets the chat mode to none; the video daemon's workers let their card go), staying enabled. A load waits for its
-    card to have the model's memory free plus 1.5 GiB (past the card the xe driver spills into host memory) and
-    answers 503 `no_room` when it does not come free. **Disabled**: unloaded, gone from Open WebUI's list and from the API.
+    card to have the model's memory free plus 1.5 GiB (past the card the xe driver spills into host memory); idle
+    work holding it is stopped for it at once (picture and sound servers without a request, the video worker while
+    the studio has nothing to make, a chat model unused for 5 minutes - never a render or a request), and it answers
+    503 `no_room` when the room does not come free (a job waits up to 30 minutes first, saying what for; a chat
+    load, like the others, 90 s). **Disabled**: unloaded, gone from Open WebUI's list and from the API.
     The registry's `enabled` and `gpus` are the state (`nextsycl models enable|disable` agree); the enabled video
     models are the video daemon's engines (serve starts, restarts and stops it).
   - **The API**, behind `Authorization: Bearer <token>` (`NS_API_TOKEN`, else one made and kept in `serve.json`
@@ -348,13 +351,14 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     routes, every variable in the JSON body, no path variables or query strings, `{"ok": true, "result": ...}` /
     `{"ok": false, "error": {"code", "message", "retryable", "status", "method", "field"}}` - **the body says
     everything**: branch on `error.code`, retry when `retryable`, `field` names the request key at fault, `status` is
-    the code's number by convention; the HTTP status only mirrors it (a client never needs it, so another transport
-    can carry the same envelope). An unreadable request (not POST, a query string, not a JSON object, over 256 MiB) is
+    the code's number by convention. **Every /rpc answer is HTTP 200, errors too** (401, an unknown method, a body
+    too large to read), so another transport can carry the same envelope; only the OpenAI routes and the files use
+    HTTP statuses. An unreadable request (not POST, a query string, not a JSON object, over 256 MiB) is
     wrapped the same way (`invalid_request`, `request_too_large`); the studio's codes are kept for video (`busy`,
     `not_running` ...) and a failed job's `error` is the same object. `no_room` (503: the model's cards are held by
     other models now) is retryable; `conflict` (409: disabled, none enabled) is not - for `system` (state, busy, version, files.stat, files.delete, models, enable, disable, load, unload),
-    `llm` (chat, models), `image` (generate, edit, status, cancel, canvases.list, info, progress, history), `audio`
-    (generate, speak, status, cancel, info, progress, history), `video` (the studio's: generate, status, wait, cancel {label}, queue.* - move and remove by label,
+    `llm` (chat, models), `image` (generate, edit, status, jobs, cancel, queue.*, upload, canvases.list, info, progress,
+    history), `audio` (generate, speak, status, jobs, cancel, queue.*, upload, voices.*, info, progress, history), `video` (the studio's: generate, status, wait, cancel {label}, queue.* - move and remove by label,
     generate's priority - jobs.*, timeline, upload ...), each kind with
     `describePromptGuideMD {model}`; and the OpenAI-compatible `/v1/models`, `/v1/chat/completions`,
     `/v1/images/generations|edits`, `/v1/audio/speech` and the files they link (and `/v1/video/files/<clip>`, `/v1/video/thumbs/<clip>.webp`). `GET /openapi.yml` describes the
@@ -365,7 +369,9 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     Pictures, songs and speech run as **jobs** (glue/serve/src/home/jobs.rs, kept in jobs.json beside serve.json):
     a label, `<kind>.status {label}`, `<kind>.cancel {label}` (the servers stop that request only, between steps),
     `wait: false` to answer at once; the call can drop and the job goes on, and a restart runs unfinished ones again.
-    `reentrant_id` on every generate (video's too) makes a submit idempotent. `system.busy` says where work runs
+    `reentrant_id` on every generate (video's too) makes a submit idempotent. A kind makes as many jobs at once as
+    it has servers; the rest wait in a queue as video's (`priority`, `held`, `project`, `batch`, `queue: false`;
+    `<kind>.queue.list|move|pause|resume`), and `stage` / `waiting_for` say what a job waits for. `system.busy` says where work runs
     (slots: two image and audio servers, the video daemon's cards) and each card's share; `system.version` lists the
     features by name; `system.files.stat|delete` give a file's bytes and SHA-256 or remove it (a clip with every
     file of it). video.generate also takes `frames` (exactly 17k + 5), a `chain` object (context_frames, sound,
@@ -389,6 +395,34 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     - `video.status`: `preview` (a PNG of the shot so far after every step, from a fitted latent-to-RGB map),
       `failure` {code, retryable, message, hint} beside the text `error`, and `gpu`; `video.engines.list` inputs list
       the `ignored` keys.
+    **API changes, 2026-10-15 (2), api 3** - for a client that also drives another engine box (nextcuda):
+    - **/rpc errors are HTTP 200** with the envelope (before: the HTTP status mirrored `error.status`); a client
+      reads `ok` and `error.code`. The OpenAI routes and file routes keep real statuses.
+    - Image and audio results name their run details **`run`** (was `nextsycl`; the /v1 routes keep `nextsycl`).
+    - `system.models` gives each model `capabilities` (neutral words: chat, tools, generate, edit, img2img, few_step,
+      ocr, song, speech, clone, voice_design, text_to_video, reference_images ...) and the `methods` that take it.
+    - `system.cards`: one neutral list of the GPUs (memory total / used / free, load, power, temperature, the models
+      and processes on each, what the enabled models are counted for).
+    - **`<kind>.status` answers one job** (label or reentrant_id needed); **`<kind>.jobs`** is the list (running,
+      queued in run order, the last ended; `limit`, `project`).
+    - **A queue for image and audio jobs**: as many run at once as the kind has servers (two); `priority`, `held`,
+      `project`, `batch` and `queue` (false: 409 `busy`, retryable, when it would not start now) on submit;
+      `<kind>.queue.list|move|pause|resume`; a waiting job is cancelled at once.
+    - Jobs say **`stage`** (queued, held, starting, waiting, loading, running, then how they ended) and
+      **`waiting_for`** in words (the jobs ahead, the model loading on GPU n, a card's room and who holds it, the
+      job its server finishes first), plus `position`, `priority`, `project`, `batch`.
+    - **Idle models make room at once** for a job that needs it (see the load rule above), and a job runs on the
+      first of its cards that has (or can be given) the room; a job waits for room up to 30 minutes instead of
+      failing after 90 s.
+    - **`llm.chat` answers 503 `no_room`** (retryable) like the other kinds when a chat model must load and its
+      cards stay held, instead of a 15-minute timeout or a spill.
+    - **Uploads**: `image.upload` / `audio.upload {name, data}` keep a picture or recording once (audio as WAV);
+      `image`, `images`, `ref_audio` and voices.add's `sample` then take `upload:<name>`. `system.files.stat|delete`
+      take their names.
+    - Saved voices take an **`owner`** (voices.add / voices.design; voices.list filters by it; replacing or removing
+      an owned voice must name it) and voices.list says whether each is **`ready`** and which enabled models speak it.
+    - `continue_from` naming a file that is not here is 404 `not_found` (field continue_from), as the spec now says,
+      the same as video's missing files and missing uploads.
     `/api/...` is the page's own.
   - **The settings** (the Config tab; `system.config`, `system.configSet {set: {NAME: value | null}} | {text}`,
     `system.restart {service}`): `nextsycl.conf` as every setting the program reads - what it does, its default,

@@ -102,27 +102,34 @@ pub struct Request {
 
 /// Reads one request from a connection.
 pub fn read_request(stream: impl Read) -> Result<Request, String> {
+    read_request_at(stream).map_err(|e| e.1)
+}
+
+/// read_request, its error with the path the request named ("" when it did not get that far): an API answers in the
+/// shape of the route asked for
+pub fn read_request_at(stream: impl Read) -> Result<Request, (String, String)> {
     let mut r = BufReader::new(stream);
     let mut line = String::new();
-    r.read_line(&mut line).map_err(|e| e.to_string())?;
+    r.read_line(&mut line).map_err(|e| (String::new(), e.to_string()))?;
     let mut parts = line.split_whitespace();
-    let method = parts.next().ok_or("empty request")?.to_string();
-    let target = parts.next().ok_or("no path in the request")?.to_string();
+    let method = parts.next().ok_or((String::new(), "empty request".to_string()))?.to_string();
+    let target = parts.next().ok_or((String::new(), "no path in the request".to_string()))?.to_string();
     let path = target.split('?').next().unwrap_or("/").to_string();
+    let fail = |e: String| (path.clone(), e);
     let mut head = line.clone().into_bytes();
     let mut length = 0usize;
     let mut origin = None;
     let mut host = None;
     loop {
         let mut h = String::new();
-        let n = r.read_line(&mut h).map_err(|e| e.to_string())?;
+        let n = r.read_line(&mut h).map_err(|e| fail(e.to_string()))?;
         head.extend_from_slice(h.as_bytes());
         if n == 0 || h == "\r\n" || h == "\n" {
             break;
         }
         if let Some((k, v)) = h.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
-                length = v.trim().parse().map_err(|_| "bad Content-Length")?;
+                length = v.trim().parse().map_err(|_| fail("bad Content-Length".into()))?;
             } else if k.trim().eq_ignore_ascii_case("origin") {
                 origin = Some(v.trim().to_string());
             } else if k.trim().eq_ignore_ascii_case("host") {
@@ -131,10 +138,10 @@ pub fn read_request(stream: impl Read) -> Result<Request, String> {
         }
     }
     if length > 256 << 20 {
-        return Err("request body over 256 MiB".into());
+        return Err(fail("request body over 256 MiB".into()));
     }
     let mut body = vec![0u8; length];
-    r.read_exact(&mut body).map_err(|e| e.to_string())?;
+    r.read_exact(&mut body).map_err(|e| fail(e.to_string()))?;
     Ok(Request { method, path, target, head, origin, host, body })
 }
 

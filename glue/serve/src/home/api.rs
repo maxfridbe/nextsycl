@@ -2,8 +2,9 @@
 //!
 //! - `POST /rpc/<kind>.<method>`: H3's rules - POST only, one fixed route a method, every variable in the JSON body (no
 //!   path variables, no query strings); the answer `{"ok": true, "result": ...}` or `{"ok": false, "error": {"code",
-//!   "message", "retryable", "status", "method", "field"}}` - the body says it all (the HTTP status mirrors
-//!   error.status for HTTP's sake; a client never needs it, so another transport can carry the same envelope). Kinds: `system` (the box: models, enabling, loading), `llm`, `image`, `audio`,
+//!   "message", "retryable", "status", "method", "field"}}` - the body says it all: every /rpc answer is HTTP 200,
+//!   errors too (error.status carries the number by convention), so another transport can carry the same envelope;
+//!   only the file routes (/v1/.../files/...) use HTTP statuses. Kinds: `system` (the box: models, enabling, loading), `llm`, `image`, `audio`,
 //!   `video` (the studio's methods, `video.generate` ...). Every kind but system has `describePromptGuideMD {model}`.
 //! - The OpenAI-compatible routes (`/v1/models`, `/v1/chat/completions`, `/v1/images/generations`, `/v1/images/edits`,
 //!   `/v1/audio/speech` and the files they link) - passed to the switcher or the kind's server, which is started for
@@ -34,6 +35,15 @@ pub struct Method {
 const MODEL: (&str, &str, &str, bool) = ("model", "string", "the model's registry id (system.models)", true);
 const MODEL_OPT: (&str, &str, &str, bool) = ("model", "string", "the model's id; none: the loaded one, else the first enabled", false);
 
+/// A job's place in its kind's queue (image and audio, as video.generate's)
+const QUEUE: (&str, &str, &str, bool) = ("queue", r#"{"type": "boolean", "default": true}"#, "false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn", false);
+const PRIORITY: (&str, &str, &str, bool) = ("priority", r#"{"type": "integer", "minimum": -9, "maximum": 9, "default": 0}"#, "a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)", false);
+const HELD: (&str, &str, &str, bool) = ("held", r#"{"type": "boolean", "default": false}"#, "queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch", false);
+const PROJECT: (&str, &str, &str, bool) = ("project", r#"{"type": "string", "maxLength": 60}"#, "a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}", false);
+const BATCH: (&str, &str, &str, bool) = ("batch", r#"{"type": "string", "maxLength": 60}"#, "a group inside the project", false);
+const JOB_ID: [(&str, &str, &str, bool); 2] = [("label", "string", "the job's label (looked up first)", false),
+                                               ("reentrant_id", "string", "or the reentrant_id it was submitted with (used when label is absent or empty)", false)];
+
 pub const METHODS: &[Method] = &[
     Method { kind: "system", name: "state", summary: "The box: the GPUs (memory by process and vouched for), every model's state, the front ends", fields: &[], example: "{}" },
     Method { kind: "system", name: "busy", summary: "Is anything working: a clip made or waiting to run, a picture, sound or chat answered, a model loading. video.accepts says whether video.generate starts a clip at once (else 409 busy without queue: true)",
@@ -46,7 +56,9 @@ pub const METHODS: &[Method] = &[
     Method { kind: "system", name: "files.delete", summary: "Delete a file: a picture, a song or speech, a clip (with its record, last frame, latents and sound tail; not while it is made) or an upload (ref_...)",
              fields: &[("kind", r#"{"type": "string", "enum": ["image", "audio", "video"]}"#, "", true), ("name", "string", "the file's name; a clip: h3_... with or without .mp4", true)],
              example: r#"{"kind": "video", "name": "h3_20261011_220723"}"# },
-    Method { kind: "system", name: "models", summary: "Every registered model: kind, enabled, its GPUs, its state (disabled, unloaded, loading, loaded, busy, ready)", fields: &[], example: "{}" },
+    Method { kind: "system", name: "models", summary: "Every registered model: kind, enabled, its GPUs, its state (disabled, unloaded, loading, loaded, busy, ready), what it can do (capabilities, methods)", fields: &[], example: "{}" },
+    Method { kind: "system", name: "cards", summary: "The GPUs, one neutral list: name, memory (total, used, free, and what the enabled models are counted for), load, power, temperature, the models and processes on each",
+             fields: &[], example: "{}" },
     Method { kind: "system", name: "enable", summary: "Offer a model on GPU(s): it loads on its first request and unloads when idle; chat models join Open WebUI's list",
              fields: &[MODEL, ("gpus", "integer[]", "the cards (default: as registered); several for a model that spans cards", false)],
              example: r#"{"model": "qwen-image-2.1-q8", "gpus": [0]}"# },
@@ -78,27 +90,29 @@ pub const METHODS: &[Method] = &[
 
     Method { kind: "image", name: "generate", summary: "Pictures from a prompt, or from an init picture (image + strength: img2img); the model loads first if it must. Checked when submitted (a bad value is a 400 even with wait: false)",
              fields: &[MODEL_OPT, ("prompt", "string", "", true), ("size", "string", "WxH, e.g. 1024x1024, both multiples of 16 (default: the model's, or the init picture's aspect)", false), ("n", "integer", "pictures", false),
-                       ("image", "string", "an init picture (base64 or a data: URL; at most 40 MP): a plain img2img - the denoise starts from it at strength and the prompt guides it (it is no reference: for an edit that reads the picture use image.edit). Needs strength below 1", false),
+                       ("image", "string", "an init picture (base64, a data: URL, or upload:<name> from image.upload; at most 40 MP): a plain img2img - the denoise starts from it at strength and the prompt guides it (it is no reference: for an edit that reads the picture use image.edit). Needs strength below 1", false),
                        ("strength", r#"{"type": "number", "minimum": 0.05, "maximum": 1}"#, "with image: how far from it (ComfyUI's denoise: the last steps of a round(steps / strength)-step schedule); 0.3-0.6 is the usual img2img range", false),
                        ("steps", "integer", "image.info's steps: a few-step model (turbo) runs only its own count (6)", false), ("seed", "integer", "", false), ("sampler", "string", "ComfyUI's names (euler, euler_ancestral, dpmpp_2m ...)", false),
                        ("schedule", "string", "", false), ("cfg", "number", "true guidance (needs negative_prompt)", false), ("negative_prompt", "string", "", false),
                        ("loras", "string[]", "name:scale", false), ("response_format", "string", "url (default) or b64_json", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
-                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false)],
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
              example: r#"{"model": "qwen-image-2.1-q8", "prompt": "a lighthouse at dusk, oil painting", "size": "1024x768"}"# },
     Method { kind: "image", name: "edit", summary: "Edit or compose pictures: the first is changed, the others are references the prompt names. With reference: false and strength below 1 it is a plain img2img (as image.generate's image). Checked when submitted (a bad value is a 400 even with wait: false)",
-             fields: &[MODEL_OPT, ("prompt", "string", "the instructions", true), ("images", "string[]", "up to 8, base64 or data: URLs (PNG, JPEG, WebP); each at most 40 MP, the request at most 256 MiB; each is resized to about 1 MP, so 2048 px on the long side is plenty", true),
+             fields: &[MODEL_OPT, ("prompt", "string", "the instructions", true), ("images", "string[]", "up to 8, base64, data: URLs or upload:<name> (image.upload) - PNG, JPEG, WebP; each at most 40 MP, the request at most 256 MiB; each is resized to about 1 MP, so 2048 px on the long side is plenty", true),
                        ("reference", r#"{"type": "boolean", "default": true}"#, "true (default): the pictures condition the model as an edit's references (its vision tower reads them) as well as being where strength starts; false: a plain img2img - the denoise starts from the first picture and the prompt alone guides it, comparable with other tools' img2img (needs strength below 1)", false),
                        ("size", "string", "default: the last picture's aspect", false), ("steps", "integer", "", false), ("seed", "integer", "", false),
                        ("strength", r#"{"type": "number", "minimum": 0.05, "maximum": 1, "default": 1}"#, "how far from the first picture: 1 (default) makes a new picture guided by it; below 1 starts from the first picture, encoded and noised to the level strength reaches: the run is the last steps of a round(steps / strength)-step schedule, exactly ComfyUI's KSampler denoise (a few-step model such as turbo starts at strength itself, then takes its own levels below it). With reference true the picture also conditions the model, which holds it closer than a plain img2img at the same number: measured on Qwen-Image 2.1, 0.9 keeps the framing, face, hair and clothes and still makes the change asked; 0.75 and below give back nearly the same picture. With reference false it behaves as other tools' img2img. The first picture is resized to the output's size", false),
                        ("response_format", "string", "url (default) or b64_json", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
-                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false)],
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
              example: r#"{"prompt": "make it night, keep the lighthouse", "images": ["data:image/png;base64,iVBORw0..."]}"# },
     Method { kind: "image", name: "ocr", summary: "Read pages (an OCR model: Unlimited-OCR): their text as Markdown, tables as HTML, boxes with <|grounding|>",
-             fields: &[("model", "string", "an OCR model's id (default: the first enabled)", false), ("images", "string[]", "the pages, base64 or data: URLs, in order: pictures, or PDFs (split into their pages, 150 dpi)", true),
+             fields: &[("model", "string", "an OCR model's id (default: the first enabled)", false), ("images", "string[]", "the pages, base64, data: URLs or upload:<name> (image.upload), in order: pictures, or PDFs (split into their pages, 150 dpi)", true),
                        ("prompt", "string", "\"document parsing.\" (default), \"Free OCR.\", \"<|grounding|>Convert the document to markdown.\", \"Parse the figure.\"; several pages: each page under it, or (each_page false) the model's \"Multi page parsing.\"; a <PAGE> mark before each page", false),
                        ("tiles", "boolean", "one page: read its 640-pixel tiles too (default true)", false),
                        ("figures", "boolean", "read the text inside the pictures the model marks (a second pass each; default true)", false),
@@ -107,10 +121,24 @@ pub const METHODS: &[Method] = &[
                        ("temperature", "number", "0 (default): greedy", false), ("ngram", "integer", "no n-gram of this many tokens repeated (35; 0: off)", false)],
              example: r#"{"images": ["data:image/png;base64,iVBORw0..."], "prompt": "document parsing."}"# },
     Method { kind: "image", name: "info", summary: "The model's defaults, samplers, schedules, options and LoRAs (loaded: from the server)", fields: &[MODEL_OPT], example: "{}" },
-    Method { kind: "image", name: "status", summary: "A job (image.generate / image.edit) by its label or reentrant_id: state, progress, its pictures when done; none: the running, queued and last ended",
-             fields: &[("label", "string", "the job's label (looked up first)", false), ("reentrant_id", "string", "or the reentrant_id it was submitted with (used when label is absent or empty)", false)], example: r#"{"label": "poster-7"}"# },
-    Method { kind: "image", name: "cancel", summary: "Stop a job by its label or reentrant_id (running: between steps; waiting: before it starts; ended: 200 with already_ended); neither: whatever the image servers are making",
-             fields: &[("label", "string", "the job's label (looked up first)", false), ("reentrant_id", "string", "or the reentrant_id it was submitted with (used when label is absent or empty)", false)], example: r#"{"label": "poster-7"}"# },
+    Method { kind: "image", name: "status", summary: "One job (image.generate / image.edit) by its label or reentrant_id (one of them is needed: image.jobs lists them): state, stage and what it waits for, its place in the queue, progress, its pictures when done",
+             fields: &JOB_ID, example: r#"{"label": "poster-7"}"# },
+    Method { kind: "image", name: "jobs", summary: "The image jobs: running, waiting (in run order) and the last ended, each as image.status answers it",
+             fields: &[("limit", r#"{"type": "integer", "minimum": 0, "maximum": 200, "default": 20}"#, "ended jobs listed", false), ("project", "string", "only this project's", false)], example: r#"{"limit": 5}"# },
+    Method { kind: "image", name: "queue.list", summary: "The waiting image jobs in run order (held ones too: held, waiting_for)", fields: &[], example: "{}" },
+    Method { kind: "image", name: "queue.move", summary: "Move a waiting job to a place in the queue (1 = made next)",
+             fields: &[JOB_ID[0], JOB_ID[1], ("position", r#"{"type": "integer", "minimum": 1, "default": 1}"#, "", false),
+                       ("priority", r#"{"type": "integer", "minimum": -9, "maximum": 9}"#, "give it this priority too (where later jobs go)", false)], example: r#"{"label": "poster-9", "position": 1}"# },
+    Method { kind: "image", name: "queue.pause", summary: "Hold a waiting job (label or reentrant_id), a project or batch (also the ones submitted later), or (none) the whole image queue; running jobs go on",
+             fields: &[JOB_ID[0], JOB_ID[1], ("project", "string", "", false), ("batch", "string", "", false)], example: r#"{"project": "Harbour"}"# },
+    Method { kind: "image", name: "queue.resume", summary: "Release what queue.pause held (none: everything)",
+             fields: &[JOB_ID[0], JOB_ID[1], ("project", "string", "", false), ("batch", "string", "", false)], example: "{}" },
+    Method { kind: "image", name: "upload", summary: "Keep a picture here once (PNG, JPEG, WebP; at most 40 MP): image.generate's image, image.edit's and image.ocr's images then name it as \"upload:<name>\" instead of sending it again. Kept until system.files.delete {kind: image, name}",
+             fields: &[("name", "string", "the file's name: png jpg jpeg webp; kept as up_<unix seconds>_<name> (letters, digits, . _ - kept, the rest _, 60 characters)", true),
+                       ("data", "string", "the picture, base64 (a data: URL too)", true)],
+             example: r#"{"name": "hero.png", "data": "iVBORw0KGgo..."}"# },
+    Method { kind: "image", name: "cancel", summary: "Stop a job by its label or reentrant_id (running: between steps; waiting: at once; ended: ok with already_ended); neither: whatever the image servers are making",
+             fields: &JOB_ID, example: r#"{"label": "poster-7"}"# },
     Method { kind: "image", name: "canvases.list", summary: "Sizes for image.generate: the model's tested ones with their aspect, and the time measured here per size",
              fields: &[MODEL_OPT], example: "{}" },
     Method { kind: "image", name: "progress", summary: "The request running: step of steps, how many wait", fields: &[], example: "{}" },
@@ -123,43 +151,60 @@ pub const METHODS: &[Method] = &[
                        ("seconds", "number", "", false), ("seed", "integer", "", false), ("steps", "integer", "", false), ("cfg", "number", "", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
-                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false)],
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
              example: r#"{"model": "minimax-music3", "instructions": "warm acoustic folk, 90 BPM, a soft male voice", "input": "[verse]\nRiver runs slow tonight\n[chorus]\nCarry me home", "seconds": 60}"# },
     Method { kind: "audio", name: "speak", summary: "Speech from text (a speech model: Qwen3-TTS, VoxCPM2); the answer links the WAV. Checked when submitted (voice, language, continue_from, ref_audio: a 400 even with wait: false). Two run at once (one per card: system.busy.parallel), so a book can keep two chunks in flight with wait: false - but a chunk with continue_from needs the chunk before it finished",
              fields: &[MODEL_OPT, ("input", "string", "the text to say", true),
                        ("voice", "string", "a built-in voice (qwen3-tts-custom: serena, vivian, uncle_fu, ryan, aiden, ono_anna, sohee, eric, dylan; audio.info lists them) or a saved one (audio.voices.list: spoken by a model that clones). Checked when submitted, the model loaded or not: an unknown name is a 400 at once (the message lists the voices)", false),
                        ("language", "string", "english, chinese, japanese ... or auto (default). Checked when submitted against the model's list (Qwen3-TTS: chinese, english, german, italian, portuguese, spanish, japanese, korean, french, russian); VoxCPM2 has no list and takes any", false),
                        ("instructions", "string", "how to say it (CustomVoice), or the voice to make up (VoiceDesign)", false),
-                       ("ref_audio", "string", "a recording of the voice to clone, WAV as base64 or a data: URL (the Base model)", false),
+                       ("ref_audio", "string", "a recording of the voice to clone: WAV as base64 or a data: URL, or upload:<name> (audio.upload, any format it takes) - the Base model", false),
                        ("ref_text", "string", "what the recording says: the closer, in-context clone", false),
                        ("continue_from", r#"{"type": "string", "maxLength": 200}"#, "carry on from speech made here (a book in chunks): the file name (or url) of the chunk before; its last sentences (up to 15 s, cut at a pause) are the in-context reference, after the saved voice's sample when voice names one - pace and voice go on, anchored to the voice. Needs a model that clones (picked for you when model is not given); a built-in voice name is dropped", false),
                        ("seconds", "number", "the most to make", false), ("seed", "integer", "", false),
                        ("options", "object", "the engine's own: greedy, temperature, top-k, streaming", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
-                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false)],
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
              example: r#"{"model": "qwen3-tts-custom", "input": "Good morning. The bread is still warm.", "voice": "ryan", "language": "english", "instructions": "cheerful, a little hurried"}"# },
-    Method { kind: "audio", name: "voices.list", summary: "The saved voices (cloned or designed): name, what the sample says, its description, length; sample: its WAV",
-             fields: &[], example: "{}" },
+    Method { kind: "audio", name: "voices.list", summary: "The saved voices (cloned or designed): name, owner, what the sample says, its description, length, whether it can be spoken now (ready) and by which enabled models; sample: its WAV",
+             fields: &[("owner", "string", "only this owner's voices", false)], example: r#"{"owner": "film-app"}"# },
     Method { kind: "audio", name: "voices.add", summary: "Save a voice cloned from a recording (WAV, MP3, FLAC, Ogg, M4A; 3-15 s of one speaker is best)",
-             fields: &[("name", "string", "lowercase letters, digits, - and _", true), ("sample", "string", "the recording, base64 or a data: URL", true),
+             fields: &[("name", "string", "lowercase letters, digits, - and _", true), ("sample", "string", "the recording, base64, a data: URL or upload:<name> (audio.upload)", true),
                        ("text", "string", "what the recording says (a closer clone)", false), ("description", "string", "", false),
-                       ("language", "string", "", false), ("replace", "boolean", "over a voice of that name", false)],
+                       ("language", "string", "", false), ("replace", "boolean", "over a voice of that name", false),
+                       ("owner", r#"{"type": "string", "maxLength": 60}"#, "who it belongs to (an app or a person): voices.list filters by it, and replace / voices.remove of an owned voice must name it", false)],
              example: r#"{"name": "grandpa", "sample": "data:audio/mpeg;base64,SUQzBAAAAA...", "text": "Well, back in my day we walked to school."}"# },
     Method { kind: "audio", name: "voices.design", summary: "Make up a voice from a description (the voice-design model reads a sample) and save it",
              fields: &[("name", "string", "", true), ("instructions", "string", "the voice: age, gender, timbre, pace, emotion, accent", true),
                        ("text", "string", "what the sample says (default: a ten-second line in the language)", false), ("language", "string", "", false),
                        ("seed", "integer", "another seed, another speaker of that kind", false), ("model", "string", "a voice-design model", false),
-                       ("replace", "boolean", "", false)],
+                       ("replace", "boolean", "", false), ("owner", r#"{"type": "string", "maxLength": 60}"#, "who it belongs to (as voices.add)", false)],
              example: r#"{"name": "narrator", "instructions": "A deep, warm male narrator in his fifties, unhurried, a slight rasp.", "language": "english"}"# },
-    Method { kind: "audio", name: "voices.remove", summary: "Delete a saved voice", fields: &[("name", "string", "", true)], example: r#"{"name": "narrator"}"# },
+    Method { kind: "audio", name: "voices.remove", summary: "Delete a saved voice (an owned one: owner must match)", fields: &[("name", "string", "", true), ("owner", "string", "the voice's owner, when it has one", false)], example: r#"{"name": "narrator"}"# },
     Method { kind: "audio", name: "info", summary: "The model's defaults, limits and options (a speech model: its voices and languages)", fields: &[MODEL_OPT], example: "{}" },
     Method { kind: "audio", name: "progress", summary: "The request running: its phase and how far", fields: &[], example: "{}" },
     Method { kind: "audio", name: "history", summary: "The songs and speech made, newest first", fields: &[], example: "{}" },
-    Method { kind: "audio", name: "status", summary: "A job (audio.generate / audio.speak) by its label or reentrant_id: state, progress, its sound when done; none: the running, queued and last ended",
-             fields: &[("label", "string", "the job's label (looked up first)", false), ("reentrant_id", "string", "or the reentrant_id it was submitted with (used when label is absent or empty)", false)], example: r#"{"label": "theme-3"}"# },
-    Method { kind: "audio", name: "cancel", summary: "Stop a job by its label or reentrant_id (running: between steps or frames; waiting: before it starts; ended: 200 with already_ended); neither: whatever the audio servers are making",
-             fields: &[("label", "string", "the job's label (looked up first)", false), ("reentrant_id", "string", "or the reentrant_id it was submitted with (used when label is absent or empty)", false)], example: r#"{"label": "theme-3"}"# },
+    Method { kind: "audio", name: "status", summary: "One job (audio.generate / audio.speak) by its label or reentrant_id (one of them is needed: audio.jobs lists them): state, stage and what it waits for, its place in the queue, progress, its sound when done",
+             fields: &JOB_ID, example: r#"{"label": "theme-3"}"# },
+    Method { kind: "audio", name: "jobs", summary: "The audio jobs: running, waiting (in run order) and the last ended, each as audio.status answers it",
+             fields: &[("limit", r#"{"type": "integer", "minimum": 0, "maximum": 200, "default": 20}"#, "ended jobs listed", false), ("project", "string", "only this project's", false)], example: r#"{"limit": 5}"# },
+    Method { kind: "audio", name: "queue.list", summary: "The waiting audio jobs in run order (held ones too: held, waiting_for)", fields: &[], example: "{}" },
+    Method { kind: "audio", name: "queue.move", summary: "Move a waiting job to a place in the queue (1 = made next)",
+             fields: &[JOB_ID[0], JOB_ID[1], ("position", r#"{"type": "integer", "minimum": 1, "default": 1}"#, "", false),
+                       ("priority", r#"{"type": "integer", "minimum": -9, "maximum": 9}"#, "give it this priority too (where later jobs go)", false)], example: r#"{"label": "chapter-4", "position": 1}"# },
+    Method { kind: "audio", name: "queue.pause", summary: "Hold a waiting job (label or reentrant_id), a project or batch (also the ones submitted later), or (none) the whole audio queue; running jobs go on",
+             fields: &[JOB_ID[0], JOB_ID[1], ("project", "string", "", false), ("batch", "string", "", false)], example: r#"{"project": "Harbour"}"# },
+    Method { kind: "audio", name: "queue.resume", summary: "Release what queue.pause held (none: everything)",
+             fields: &[JOB_ID[0], JOB_ID[1], ("project", "string", "", false), ("batch", "string", "", false)], example: "{}" },
+    Method { kind: "audio", name: "upload", summary: "Keep a recording here once (WAV, MP3, FLAC, Ogg, M4A; kept as WAV): audio.speak's ref_audio and audio.voices.add's sample then name it as \"upload:<name>\" instead of sending it again. Kept until system.files.delete {kind: audio, name}",
+             fields: &[("name", "string", "the file's name; kept as up_<unix seconds>_<name>.wav (letters, digits, . _ - kept, the rest _, 60 characters)", true),
+                       ("data", "string", "the recording, base64 (a data: URL too)", true)],
+             example: r#"{"name": "grandpa.mp3", "data": "SUQzBAAAAA..."}"# },
+    Method { kind: "audio", name: "cancel", summary: "Stop a job by its label or reentrant_id (running: between steps or frames; waiting: at once; ended: ok with already_ended); neither: whatever the audio servers are making",
+             fields: &JOB_ID, example: r#"{"label": "theme-3"}"# },
     Method { kind: "audio", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "minimax-music3"}"# },
 
     Method { kind: "video", name: "generate", summary: "Make a clip: it starts at once when the studio is idle (queued: false, the job), else it is queued with queue: true (queued: true, its position) or refused with 409 busy. Anchors (first_frame, last_frame, exposure_ref, first_audio, guide_clip, source) take prev, prev_cam, first, first_cam - clips of the label's series, see label - or a file in the clips directory (video.upload, or a finished clip's name)",
@@ -249,7 +294,7 @@ pub const METHODS: &[Method] = &[
 ];
 
 /// system.version's api: raised when an answer changes in a way an old client misreads
-const API_VERSION: u32 = 2;
+const API_VERSION: u32 = 3;
 
 /// What this build does, by names a client can test for (system.version); names are added, never reused
 const FEATURES: &[&str] = &[
@@ -260,6 +305,8 @@ const FEATURES: &[&str] = &[
     "image.edit.strength", "audio.speak.continue_from", "video.preview", "system.busy.parallel",
     "errors.retryable", "errors.no_room", "jobs.precheck", "image.info.steps", "image.generate.init_image", "image.edit.reference",
     "video.failure", "video.gpu", "video.engines.ignored", "audio.speak.precheck.voice", "jobs.cancel.reentrant_id", "rpc.errors.body",
+    "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
+    "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -302,6 +349,8 @@ pub(crate) fn error_of(status: u16, m: &str) -> Value {
 /// ("steps 8: ...", "images[0]: ...", "voice bogus: ..."), and a code of its own where the status's is too broad
 pub(crate) fn rpc_error(method: &str, status: u16, code: Option<&str>, m: &str) -> Value {
     let mut e = error_of(status, m);
+    // a job refused with queue: false says "busy: ..." (as video's busy)
+    let code = code.or_else(|| (status == 409 && m.starts_with("busy:")).then_some("busy"));
     if let Some(c) = code {
         e["code"] = json!(c);
         e["retryable"] = json!(retryable(status, c));
@@ -341,7 +390,8 @@ impl Home {
         let method = req.path.strip_prefix("/rpc/").unwrap_or("").to_string();
         let fail_as = |s: &mut Conn, st: u16, code: Option<&str>, m: String| {
             if rpc {
-                http::respond(s, st, &json!({"ok": false, "error": rpc_error(&method, st, code, &m)}));
+                // HTTP 200: the envelope is the answer, error.status keeps the number
+                http::respond(s, 200, &json!({"ok": false, "error": rpc_error(&method, st, code, &m)}));
             } else {
                 http::respond(s, st, &json!({"error": {"message": m, "type": if st == 401 { "invalid_api_key" } else { "invalid_request_error" }}}));
             }
@@ -367,8 +417,8 @@ impl Home {
                 }
             };
             let name = &req.path["/rpc/".len()..];
-            if let Some((st, v)) = self.studio_rpc(name, &body, req.host.as_deref().unwrap_or("localhost:8000")) {
-                return http::respond(&mut s, st, &v);
+            if let Some((_, v)) = self.studio_rpc(name, &body, req.host.as_deref().unwrap_or("localhost:8000")) {
+                return http::respond(&mut s, 200, &v);
             }
             match self.rpc(name, &body) {
                 Ok(v) => {
@@ -460,6 +510,7 @@ impl Home {
         if lib.get(&name).is_some() && b["replace"] != true {
             return Err((409, format!("a voice {name:?} exists already (replace: true)")));
         }
+        self.owned(&name, b)?;
         let lang = b["language"].as_str().filter(|l| !l.is_empty());
         let text = b["text"].as_str().filter(|t| !t.trim().is_empty()).map(str::to_string)
             .or_else(|| crate::voices::design_text(lang).map(str::to_string))
@@ -477,8 +528,11 @@ impl Home {
         let file = lib.dir.parent().map(|d| d.join(url.rsplit('/').next().unwrap_or(""))).unwrap_or_default();
         let bytes = std::fs::read(&file).map_err(|e| (500, format!("{}: {e}", file.display())))?;
         let seed = r["nextsycl"]["seed"].clone();
-        let v = lib.add(&name, &bytes, Some(&text), Some(&s(b, "instructions")), lang, "design", &format!("designed by {id}, seed {seed}"), b["replace"] == true)
+        let mut v = lib.add(&name, &bytes, Some(&text), Some(&s(b, "instructions")), lang, "design", &format!("designed by {id}, seed {seed}"), b["replace"] == true)
             .map_err(|e| (400, e))?;
+        if let Some(owner) = b["owner"].as_str().filter(|o| !o.trim().is_empty()) {
+            v = lib.tag(&name, "owner", json!(owner.trim())).map_err(|e| (500, e))?;
+        }
         Ok(json!({"voice": v, "sample": format!("http://nextsycl/v1/audio/voices/{name}.wav"), "seed": seed}))
     }
 
@@ -569,8 +623,10 @@ impl Home {
             reasons.push(format!("{active} chat request(s)"));
         }
         let jobs = self.jobs_open();
-        if !jobs.is_empty() {
-            reasons.push(format!("{} image/audio job(s)", jobs.len()));
+        // held jobs wait for a release, not for the box: they are listed, not reasons
+        let live = jobs.iter().filter(|j| j["held"] != true).count();
+        if live > 0 {
+            reasons.push(format!("{live} image/audio job(s)"));
         }
         let mut slots = self.work_slots(all, &cards);
         let video = if self.kinds_on(all).contains(&"video") {
@@ -628,6 +684,9 @@ impl Home {
     }
 
     fn rpc(self: &Arc<Self>, name: &str, b: &Value) -> Result<Value, Fail> {
+        // pictures and recordings sent before (upload:<name>) read in
+        let resolved = self.uploads_in(name, b)?;
+        let b = resolved.as_ref().unwrap_or(b);
         // pictures, songs and speech run as jobs (jobs.rs), which call work
         if super::jobs::METHODS.contains(&name) {
             let all = self.models();
@@ -658,6 +717,7 @@ impl Home {
                 let cards = self.named_cards(&all);
                 Ok(json!({"models": self.model_states(&all, &cards)}))
             }
+            ("system", "cards") => Ok(self.cards_view(&all)),
             ("system", "enable") => self.enable(&model(), b.get("gpus")).map(|t| json!({"model": model(), "title": t, "enabled": true})),
             ("system", "gpus") => self.set_gpus(&model(), b.get("gpus")),
             ("system", "disable") => self.disable(&model(), b["force"] == true).map(|_| json!({"model": model(), "enabled": false})),
@@ -722,7 +782,9 @@ impl Home {
             }
             ("image", "generate") | ("image", "edit") => {
                 let id = self.pick("image", b, &all)?;
-                let t = self.ensure(&id)?;
+                let job = b["request_id"].as_str();
+                let t = self.ensure_for(&id, job)?;
+                self.sent(job);
                 let mut body = b.clone();
                 body["model"] = json!(id);
                 if body.get("response_format").is_none() {
@@ -738,7 +800,9 @@ impl Home {
                 }
                 let b = &b;
                 let id = self.pick("audio", b, &all)?;
-                let t = self.ensure(&id)?;
+                let job = b["request_id"].as_str();
+                let t = self.ensure_for(&id, job)?;
+                self.sent(job);
                 let mut body = b.clone();
                 body["model"] = json!(id);
                 body["response_format"] = json!("url");
@@ -767,21 +831,51 @@ impl Home {
             ("image" | "audio", "progress") => Ok(call_for(&t, "GET", "/api/progress", None, 5).unwrap_or(json!({"busy": false, "loaded": false}))),
             ("image" | "audio", "history") => Ok(call_for(&t, "GET", "/api/history", None, 10).unwrap_or(json!({"data": []}))),
             ("image" | "audio", "status") => self.job_status(m.kind, b),
+            ("image" | "audio", "jobs") => self.job_list(m.kind, b),
+            ("image" | "audio", "queue.list") => Ok(self.queue_list(m.kind)),
+            ("image" | "audio", "queue.move") => self.queue_move(m.kind, b),
+            ("image" | "audio", "queue.pause") => self.queue_hold(m.kind, b, true),
+            ("image" | "audio", "queue.resume") => self.queue_hold(m.kind, b, false),
+            ("image" | "audio", "upload") => self.upload(m.kind, b),
             ("image", "canvases.list") => self.image_canvases(b, &all),
             ("image" | "audio", "cancel") => self.job_cancel(m.kind, b),
             ("audio", "voices.list") => {
-                let list: Vec<Value> = self.voices().list().into_iter().map(|mut v| {
-                    v["sample"] = json!(format!("http://nextsycl/v1/audio/voices/{}.wav", s(&v, "name")));
+                // the enabled models that speak a saved voice: the ones that clone
+                let speakers: Vec<Value> = all.iter().filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false)
+                    .filter(|m| m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "clone"))).map(|m| m["id"].clone()).collect();
+                let lib = self.voices();
+                let owner = s(b, "owner");
+                let list: Vec<Value> = lib.list().into_iter().filter(|v| owner.is_empty() || v["owner"] == owner.as_str()).map(|mut v| {
+                    let name = s(&v, "name");
+                    v["sample"] = json!(format!("http://nextsycl/v1/audio/voices/{name}.wav"));
+                    // ready: its sample is there and reads, and an enabled model can speak it now
+                    let reads = lib.sample_path(&name).is_some_and(|f| nextsycl_audio::wav_info(&f).is_ok_and(|(_, secs)| secs > 0.0));
+                    v["ready"] = json!(reads && !speakers.is_empty());
+                    v["models"] = json!(speakers);
+                    if !reads {
+                        v["problem"] = json!("its sample is missing or does not read: add it again");
+                    } else if speakers.is_empty() {
+                        v["problem"] = json!("no enabled speech model clones a voice (system.enable qwen3-tts-base or voxcpm2)");
+                    }
                     v
                 }).collect();
                 Ok(json!({"voices": list}))
             }
-            ("audio", "voices.remove") => self.voices().remove(&s(b, "name")).map(|_| json!({"removed": s(b, "name")})).map_err(|e| (404, e)),
+            ("audio", "voices.remove") => {
+                self.owned(&s(b, "name"), b)?;
+                self.voices().remove(&s(b, "name")).map(|_| json!({"removed": s(b, "name")})).map_err(|e| (404, e))
+            }
             ("audio", "voices.add") => {
                 let bytes = http::unbase64(&s(b, "sample")).map_err(|e| (400, format!("sample: {e}")))?;
                 let o = |k: &str| b[k].as_str().filter(|x| !x.trim().is_empty());
-                let v = self.voices().add(&s(b, "name"), &bytes, o("text"), o("description"), o("language"), "clone", "a recording", b["replace"] == true)
+                if b["replace"] == true {
+                    self.owned(&s(b, "name"), b)?;
+                }
+                let mut v = self.voices().add(&s(b, "name"), &bytes, o("text"), o("description"), o("language"), "clone", "a recording", b["replace"] == true)
                     .map_err(|e| (400, e))?;
+                if let Some(owner) = o("owner") {
+                    v = self.voices().tag(&s(b, "name"), "owner", json!(owner)).map_err(|e| (500, e))?;
+                }
                 Ok(json!({"voice": v, "sample": format!("http://nextsycl/v1/audio/voices/{}.wav", s(b, "name"))}))
             }
             ("audio", "voices.design") => self.design_voice(b, &all),
@@ -796,6 +890,116 @@ impl Home {
             }
             _ => Err((404, format!("no method {name}"))),
         }
+    }
+
+    /// A kind's output directory (the servers' NS_IMAGE_OUT / NS_AUDIO_OUT)
+    fn out_dir(&self, kind: &str) -> std::path::PathBuf {
+        let (key, def) = if kind == "image" { ("NS_IMAGE_OUT", "images") } else { ("NS_AUDIO_OUT", "audio") };
+        std::path::PathBuf::from(self.o.cfg.get(key).unwrap_or_else(|| format!("{}/.local/share/nextsycl/{def}", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))))
+    }
+
+    /// `<kind>.upload {name, data}`: a picture (checked, kept as sent) or a recording (any format voices take, kept as
+    /// WAV) under <output>/uploads, named up_<unix>_<name>
+    fn upload(&self, kind: &str, b: &Value) -> Result<Value, Fail> {
+        let data = http::unbase64(&s(b, "data")).map_err(|e| (400, format!("data: {e}")))?;
+        if data.is_empty() {
+            return Err((400, "data: empty".into()));
+        }
+        let raw = s(b, "name");
+        let clean: String = raw.rsplit('/').next().unwrap_or("").chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).take(60).collect();
+        let ext = clean.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
+        let (stem, bytes) = if kind == "image" {
+            if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+                return Err((400, format!("name {raw:?}: a picture's name (png, jpg, jpeg, webp)")));
+            }
+            crate::image::picture(&data, "data").map_err(|e| (400, e))?;
+            (clean.clone(), data)
+        } else {
+            if !matches!(ext.as_str(), "wav" | "mp3" | "flac" | "ogg" | "m4a") {
+                return Err((400, format!("name {raw:?}: a recording's name (wav, mp3, flac, ogg, m4a)")));
+            }
+            let (samples, rate) = nextsycl_audio::decode_audio(&data).map_err(|e| (400, format!("data: {e}")))?;
+            let a = nextsycl_audio::Audio { rate, channels: 1, samples };
+            (format!("{}.wav", clean.rsplit_once('.').map_or(clean.as_str(), |x| x.0)), a.wav(&[]))
+        };
+        let dir = self.out_dir(kind).join("uploads");
+        std::fs::create_dir_all(&dir).map_err(|e| (500, format!("{}: {e}", dir.display())))?;
+        let name = format!("up_{}_{stem}", now() as u64);
+        std::fs::write(dir.join(&name), &bytes).map_err(|e| (500, format!("{name}: {e}")))?;
+        let mut r = crate::files::stat(&dir.join(&name)).map_err(|e| (500, e))?;
+        r["name"] = json!(name);
+        r["ref"] = json!(format!("upload:{name}"));
+        Ok(r)
+    }
+
+    /// The fields of a request that may name an upload, by method: (field, is a list)
+    fn upload_fields(name: &str) -> (&'static str, &'static [(&'static str, bool)]) {
+        match name {
+            "image.generate" => ("image", &[("image", false), ("init_image", false)]),
+            "image.edit" => ("image", &[("images", true), ("image", false)]),
+            "image.ocr" => ("image", &[("images", true)]),
+            "audio.speak" => ("audio", &[("ref_audio", false)]),
+            "audio.voices.add" => ("audio", &[("sample", false)]),
+            _ => ("", &[]),
+        }
+    }
+
+    /// The request with every "upload:<name>" read in as base64 (none named: None); an upload not here is 404
+    fn uploads_in(&self, method: &str, b: &Value) -> Result<Option<Value>, Fail> {
+        let (kind, fields) = Self::upload_fields(method);
+        let named = |v: &Value| v.as_str().and_then(|x| x.strip_prefix("upload:")).map(str::to_string);
+        if !fields.iter().any(|(f, list)| if *list { b[*f].as_array().is_some_and(|a| a.iter().any(|v| named(v).is_some())) } else { named(&b[*f]).is_some() }) {
+            return Ok(None);
+        }
+        let dir = self.out_dir(kind).join("uploads");
+        let read = |what: String, n: &str| -> Result<Value, Fail> {
+            let plain = crate::files::plain(n).filter(|x| x.starts_with("up_")).ok_or_else(|| (400, format!("{what}: upload:{n} is not an upload's name ({kind}.upload answers it)")))?;
+            let bytes = std::fs::read(dir.join(plain)).map_err(|_| (404, format!("{what}: no upload {plain} here ({kind}.upload it, or it was deleted)")))?;
+            Ok(json!(http::base64(&bytes)))
+        };
+        let mut out = b.clone();
+        for (f, list) in fields {
+            if *list {
+                if let Some(a) = out[*f].as_array_mut() {
+                    for (i, v) in a.iter_mut().enumerate() {
+                        if let Some(n) = named(v) {
+                            *v = read(format!("{f}[{i}]"), &n)?;
+                        }
+                    }
+                }
+            } else if let Some(n) = named(&out[*f]) {
+                out[*f] = read(f.to_string(), &n)?;
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// A saved voice that has an owner may be replaced or removed only by a request naming that owner
+    fn owned(&self, name: &str, b: &Value) -> Result<(), Fail> {
+        let Some(v) = self.voices().get(name) else { return Ok(()) };
+        match v["owner"].as_str() {
+            Some(o) if o != s(b, "owner").trim() => Err((409, format!("owner: voice {name} belongs to {o:?} - name that owner to replace or remove it"))),
+            _ => Ok(()),
+        }
+    }
+
+    /// system.cards: each GPU in one neutral shape - what any engine on any box can report
+    fn cards_view(&self, all: &[Value]) -> Value {
+        let mut cards = self.named_cards(all);
+        let models = self.model_states(all, &cards);
+        self.vouch(&mut cards, &models);
+        let list: Vec<Value> = cards.as_array().into_iter().flatten().map(|c| {
+            let total = c["vram_total_mb"].as_u64().unwrap_or(0);
+            let used = c["vram_used_mb"].as_u64().unwrap_or(0);
+            let procs: Vec<Value> = c["procs"].as_array().into_iter().flatten().map(|p| json!({"pid": p["pid"], "program": p["program"], "kind": p["kind"],
+                "model": p["model_id"].as_str().or(p["model"].as_str()), "vram_mb": p["vram_mb"]})).collect();
+            let models: Vec<Value> = c["procs"].as_array().into_iter().flatten().filter_map(|p| p["model_id"].as_str().map(|m| json!(m))).collect();
+            json!({"gpu": c["index"], "name": c["name"], "bus": c["pci"], "vram_total_mb": total, "vram_used_mb": used, "vram_free_mb": total.saturating_sub(used),
+                   "busy_pct": c["busy_pct"], "power_w": c["power_w"], "power_cap_w": c["power_cap_w"], "temp_c": c["temp_pkg"], "temp_vram_c": c["temp_vram"],
+                   "models": models, "processes": procs, "vouched_mb": c["vouched_mb"], "overbooked": c["overbooked"],
+                   "enabled_models": c["vouched"].as_array().into_iter().flatten().map(|v| v["model"].clone()).collect::<Vec<_>>()})
+        }).collect();
+        json!({"cards": list})
     }
 
     /// system.files.stat / files.delete: a picture or sound in its kind's output directory, or through the studio
@@ -815,13 +1019,15 @@ impl Home {
             }
             return Ok(r);
         }
-        let (key, sub, def) = match kind.as_str() {
-            "image" => ("NS_IMAGE_OUT", "images", "images"),
-            "audio" => ("NS_AUDIO_OUT", "audio", "audio"),
+        let sub = match kind.as_str() {
+            "image" => "images",
+            "audio" => "audio",
             _ => return Err((400, "kind: image, audio or video".into())),
         };
-        let dir = self.o.cfg.get(key).unwrap_or_else(|| format!("{}/.local/share/nextsycl/{def}", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())));
-        let path = std::path::Path::new(&dir).join(&name);
+        // an upload (up_...) is kept under uploads/
+        let upload = name.starts_with("up_");
+        let dir = if upload { self.out_dir(&kind).join("uploads") } else { self.out_dir(&kind) };
+        let path = dir.join(&name);
         // what the servers make, not the saved voices or anything else kept there
         let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
         let ok = if kind == "image" { matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp") } else { ext == "wav" };
@@ -830,7 +1036,10 @@ impl Home {
         }
         if op == "files.stat" {
             let mut r = crate::files::stat(&path).map_err(|e| (404, e))?;
-            r["url"] = json!(format!("http://nextsycl/v1/{sub}/files/{name}"));
+            r["url"] = if upload { Value::Null } else { json!(format!("http://nextsycl/v1/{sub}/files/{name}")) };
+            if upload {
+                r["ref"] = json!(format!("upload:{name}"));
+            }
             return Ok(r);
         }
         std::fs::remove_file(&path).map_err(|e| (500, format!("{name}: {e}")))?;
@@ -967,11 +1176,11 @@ impl Home {
         let ids = |k: &str| -> Vec<Value> { all.iter().filter(|m| registry::kind_of(m) == k && m["enabled"] != false).map(|m| m["id"].clone()).collect() };
         let envelope = json!({"type": "object", "properties": {
             "ok": {"type": "boolean"}, "result": {"description": "the method's answer"},
-            "error": {"type": "object", "required": ["code", "message", "retryable", "status"], "description": "ok false: everything about the failure - read this, not the HTTP status (which only mirrors status)", "properties": {
+            "error": {"type": "object", "required": ["code", "message", "retryable", "status"], "description": "ok false: everything about the failure (the HTTP status is 200 all the same)", "properties": {
                 "code": {"type": "string", "description": "the convention to branch on (the list in the description above): invalid_request, invalid_params, unauthorized, not_found, conflict, busy, not_running, no_room, cancelled, unavailable, timeout, request_too_large, internal"},
                 "message": {"type": "string", "description": "what was wrong, in words: the value, the limit or the nearest legal one, what to do"},
                 "retryable": {"type": "boolean", "description": "true: the same call may work later unchanged (no_room, unavailable, timeout, busy); false: change the request"},
-                "status": {"type": "integer", "description": "the code's number by convention (400, 404, 409, 499, 502, 503 ...): the same as the HTTP status, here so another transport carries it"},
+                "status": {"type": "integer", "description": "the code's number by convention (400, 404, 409, 499, 502, 503 ...): in the body, not the HTTP status, so another transport carries it"},
                 "method": {"type": "string", "nullable": true, "description": "the method called"},
                 "field": {"type": "string", "nullable": true, "description": "the request key at fault, when the message names one (steps, voice, images, size ...)"}}}}});
         let engines: Vec<String> = if on.contains(&"video") {
@@ -1022,26 +1231,31 @@ impl Home {
             if let Some(r) = spec::result(&op) {
                 ok["properties"]["result"] = serde_json::from_str(&r).unwrap_or_else(|e| panic!("{op} result: {e}"));
             }
-            let mut responses = json!({"200": {"description": "{\"ok\": true, \"result\": ...}", "content": {"application/json": {"schema": ok}}},
-                                       "401": {"description": "unauthorized: no or a wrong token"},
-                                       "400": {"description": "invalid_request / invalid_params: the body or a value (error.message says which)"}});
+            // every answer is HTTP 200 with the envelope; the errors it can carry are listed (x-errors, and in words)
+            let mut errors = vec![json!({"status": 400, "code": "invalid_request", "when": "not POST, a query string, the body not a JSON object"}),
+                                  json!({"status": 400, "code": "invalid_params", "when": "a value refused (error.message and error.field say which)"}),
+                                  json!({"status": 401, "code": "unauthorized", "when": "no or a wrong token"})];
+            let mut add = |st: u16, code: &str, when: String| match errors.iter_mut().find(|e| e["code"] == code && e["status"] == st) {
+                // one entry a code: the method's own case first
+                Some(e) => e["when"] = json!(format!("{when}; {}", e["when"].as_str().unwrap_or(""))),
+                None => errors.push(json!({"status": st, "code": code, "when": when})),
+            };
             for (st, code, when) in spec::errors(&op) {
-                let k = st.to_string();
-                let d = format!("{code}: {when}");
-                let d = match responses[&k]["description"].as_str() { Some(o) if *st != 400 => format!("{o}; {d}"), _ => d };
-                responses[&k] = json!({"description": d, "content": {"application/json": {"schema": envelope.clone()}}});
+                add(*st, code, when.to_string());
             }
             if m.kind != "system" {
-                let d = format!("conflict: no {} model is enabled", m.kind);
-                let d = match responses["409"]["description"].as_str() { Some(o) => format!("{o}; {d}"), None => d };
-                responses["409"] = json!({"description": d});
+                add(409, "conflict", format!("no {} model is enabled", m.kind));
             }
+            let words: Vec<String> = errors.iter().map(|e| format!("{} {}: {}", e["code"].as_str().unwrap_or(""), e["status"], e["when"].as_str().unwrap_or(""))).collect();
+            let responses = json!({"200": {"description": format!("{{\"ok\": true, \"result\": ...}}, or {{\"ok\": false, \"error\": ...}} - errors are HTTP 200 too. Its errors: {}", words.join("; ")),
+                                           "content": {"application/json": {"schema": ok}}}});
             let curl = format!("curl -s http://{host}{route} -H 'Authorization: Bearer {}' -H 'Content-Type: application/json' -d '{}'",
                                tok, example.to_string().replace('\'', "'\\''"));
             paths.insert(route, json!({"post": {
                 "tags": [m.kind], "operationId": format!("{}.{}", m.kind, m.name), "summary": m.summary,
                 "requestBody": {"required": true, "content": {"application/json": {"schema": schema, "example": example}}},
                 "responses": responses,
+                "x-errors": errors,
                 "x-curl": curl,
             }}));
         }
@@ -1092,8 +1306,8 @@ impl Home {
             "openapi": "3.0.3",
             "info": {"title": "nextsycl", "version": crate::VERSION, "description": format!(
                 "The box's API (nextsycl serve). Rules: POST /rpc/<kind>.<method>, every variable in the JSON body - no path variables, no query \
-                 strings; answers {{\"ok\": true, \"result\": ...}} or {{\"ok\": false, \"error\": {{\"code\", \"message\"}}}}. The OpenAI-compatible \
-                 /v1 routes are the exception. Send Authorization: Bearer <token> with every /rpc and /v1 call (the token is on the page's API tab; \
+                 strings; answers {{\"ok\": true, \"result\": ...}} or {{\"ok\": false, \"error\": {{\"code\", \"message\", ...}}}}, always HTTP 200. The \
+                 OpenAI-compatible /v1 routes and the files are the exception (HTTP statuses). Send Authorization: Bearer <token> with every /rpc and /v1 call (the token is on the page's API tab; \
                  this document needs none). Kinds here: {}. Generated {:.0}.\n\n{}\n\n{}",
                 on.join(", "), now(), spec::CODES, spec::LABELS)},
             "servers": [{"url": format!("http://{host}")}],

@@ -31,7 +31,7 @@ const PICTURES: &str = r#"{"type": "object", "properties": {"created": {"type": 
   "data": {"type": "array", "items": {"type": "object", "properties": {"url": {"type": "string", "description": "response_format url (the default here): GET it with the token"},
     "b64_json": {"type": "string", "description": "response_format b64_json: the PNG"}, "revised_prompt": {"type": "string"}, "seed": {"type": "integer"},
     "width": {"type": "integer"}, "height": {"type": "integer"}}}},
-  "nextsycl": {"type": "object", "properties": {"seconds": {"type": "number"}, "steps": {"type": "integer"}, "seed": {"type": "integer", "description": "the first picture's; the n-th is seed + n"},
+  "run": {"type": "object", "description": "how it was made (the /v1 routes call this nextsycl; /rpc names it run)", "properties": {"seconds": {"type": "number"}, "steps": {"type": "integer"}, "seed": {"type": "integer", "description": "the first picture's; the n-th is seed + n"},
     "loras": {"type": "array", "items": {"type": "string"}}, "wh": {"type": "number", "nullable": true, "description": "the card's energy, watt-hours"}}}}}"#;
 
 /// A sound made (audio.history's rows; audio.generate's data[])
@@ -45,7 +45,7 @@ const SOUND_ITEM: &str = r#"{"type": "object", "properties": {"url": {"type": "s
 /// audio.generate / audio.speak (and /v1/audio/speech with response_format url)
 fn sound() -> String {
     format!(r#"{{"type": "object", "properties": {{"created": {{"type": "integer"}}, "data": {{"type": "array", "items": {SOUND_ITEM}}},
-  "nextsycl": {{"type": "object", "properties": {{"took": {{"type": "number"}}, "seconds": {{"type": "number"}}, "seed": {{"type": "integer"}}, "steps": {{"type": "integer"}},
+  "run": {{"type": "object", "description": "how it was made (the /v1 routes call this nextsycl; /rpc names it run)", "properties": {{"took": {{"type": "number"}}, "seconds": {{"type": "number"}}, "seed": {{"type": "integer"}}, "steps": {{"type": "integer"}},
     "cfg": {{"type": "number"}}, "wh": {{"type": "number", "nullable": true}}}}}}}}}}"#)
 }
 
@@ -53,7 +53,11 @@ fn sound() -> String {
 const JOB_VIEW: &str = r#"{"type": "object", "required": ["id", "label", "state"], "properties": {
   "id": {"type": "string"}, "kind": {"type": "string", "enum": ["image", "audio"]}, "method": {"type": "string"},
   "label": {"type": "string", "description": "the request's label, else the id"}, "reentrant_id": {"type": "string", "nullable": true},
-  "state": {"type": "string", "enum": ["queued", "running", "done", "failed", "cancelled"], "description": "queued: waiting for its server (or its model loading); running: being made (progress)"},
+  "state": {"type": "string", "enum": ["queued", "running", "done", "failed", "cancelled"], "description": "queued: not being made yet (stage says why); running: being made (progress)"},
+  "stage": {"type": "string", "enum": ["queued", "held", "starting", "waiting", "loading", "running", "done", "failed", "cancelled"], "description": "where it is: queued (in the kind's queue behind others), held (paused: queue.resume), starting (being handed to its server), waiting (for room on a card, a server to finish another model's or another job's work), loading (its model), running, then how it ended"},
+  "waiting_for": {"type": "string", "nullable": true, "description": "not running yet: what it waits for, in words - the jobs ahead, the model loading on GPU n, the room on a card (free and needed, and who holds the rest), the job its server finishes first"},
+  "position": {"type": "integer", "description": "queued: its place in the queue (1: next; held ones count)"}, "held": {"type": "boolean", "description": "queued: held by itself, its project, batch or the queue"},
+  "priority": {"type": "integer"}, "project": {"type": "string", "nullable": true}, "batch": {"type": "string", "nullable": true},
   "created": {"type": "number"}, "started": {"type": "number", "nullable": true}, "ended": {"type": "number", "nullable": true}, "seconds": {"type": "number", "description": "ended: started to ended"},
   "progress": {"type": "object", "description": "running: the server's progress (step at / of, picture, phase, seconds)", "additionalProperties": true},
   "result": {"type": "object", "description": "done: the answer generate gives with wait (data[].url ...)", "additionalProperties": true},
@@ -62,9 +66,12 @@ const JOB_VIEW: &str = r#"{"type": "object", "required": ["id", "label", "state"
   "restarted": {"type": "boolean", "description": "the front door restarted while it was unfinished: run again from the start"},
   "reentered": {"type": "boolean", "description": "generate: its reentrant_id named this job, nothing new was started"}}}"#;
 
-/// <kind>.status without a label
-const JOB_LIST: &str = r#"{"type": "object", "properties": {"running": {"type": "array", "items": {"type": "object"}}, "queued": {"type": "array", "items": {"type": "object"}},
-  "recent": {"type": "array", "items": {"type": "object"}, "description": "the last 20 ended, newest first"}}, "description": "each item as <kind>.status {label} answers"}"#;
+/// <kind>.jobs
+const JOB_LIST: &str = r#"{"type": "object", "properties": {"running": {"type": "array", "items": {"type": "object"}}, "queued": {"type": "array", "items": {"type": "object"}, "description": "in run order"},
+  "recent": {"type": "array", "items": {"type": "object"}, "description": "the last ended (limit, 20 by default), newest first"},
+  "at_once": {"type": "integer", "description": "jobs of the kind made at once (its servers: one a card)"},
+  "paused": {"type": "object", "description": "what queue.pause holds: all, projects, batches", "properties": {"all": {"type": "boolean"}, "projects": {"type": "array", "items": {"type": "string"}}, "batches": {"type": "array", "items": {"type": "string"}}}}},
+  "description": "each item as <kind>.status {label} answers"}"#;
 
 /// A chat request as llm.requests lists it
 const CHAT_REQUEST: &str = r#"{"type": "object", "properties": {"id": {}, "model": {"type": "string"}, "state": {"type": "string"}, "via": {"type": "string"},
@@ -76,14 +83,20 @@ const CHAT_REQUEST: &str = r#"{"type": "object", "properties": {"id": {}, "model
 const VOICE: &str = r#"{"type": "object", "properties": {"name": {"type": "string"}, "text": {"type": "string", "nullable": true, "description": "what the sample says"},
   "description": {"type": "string", "nullable": true}, "language": {"type": "string", "nullable": true}, "kind": {"type": "string", "enum": ["clone", "design"]},
   "seconds": {"type": "number", "description": "the sample's length (cut to 15 s)"}, "rate": {"type": "integer"}, "created": {"type": "integer"}, "from": {"type": "string"},
-  "sample": {"type": "string", "description": "voices.list: the sample's URL (GET with the token)"}}}"#;
+  "sample": {"type": "string", "description": "voices.list: the sample's URL (GET with the token)"},
+  "owner": {"type": "string", "nullable": true, "description": "who it belongs to (voices.add / voices.design owner)"},
+  "ready": {"type": "boolean", "description": "voices.list: it can be spoken now - its sample reads and an enabled model clones (models)"},
+  "models": {"type": "array", "items": {"type": "string"}, "description": "voices.list: the enabled models that speak it"},
+  "problem": {"type": "string", "description": "voices.list, not ready: why"}}}"#;
 
 const MODEL_STATE: &str = r#"{"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string", "enum": ["llm", "image", "audio", "video"]},
   "title": {"type": "string"}, "arch": {"type": "string"}, "enabled": {"type": "boolean"}, "gpus": {"type": "array", "items": {"type": "integer"}},
   "state": {"type": "string", "enum": ["disabled", "unloaded", "loading", "loaded", "busy", "ready"], "description": "busy: an image or audio model answering; ready: a video model the daemon has, not loaded"},
   "vouch_mb": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "VRAM it is counted for, by card"},
   "measured": {"type": "boolean"}, "headroom_mb": {"type": "object", "additionalProperties": {"type": "integer"}}, "headroom_given": {"type": "boolean"},
-  "page": {"type": "integer", "description": "the port of its own page"}}}"#;
+  "page": {"type": "integer", "description": "the port of its own page"},
+  "capabilities": {"type": "array", "items": {"type": "string"}, "description": "what it does, in neutral words: chat, stream, tools; generate, edit, compose, img2img, loras, few_step; ocr, read_pages, pdf; song, lyrics, instrumental; speech, builtin_voices, clone, saved_voices, continue_from, voice_design; text_to_video, image_to_video, sound, chain, first_last_frame, voice_reference, controlnet, inpaint, reference_images, reference_videos"},
+  "methods": {"type": "array", "items": {"type": "string"}, "description": "the /rpc methods that take it as model"}}}"#;
 
 /// video.status (and video.wait)
 fn status() -> String {
@@ -120,7 +133,7 @@ pub fn result(method: &str) -> Option<String> {
   "loading": {"type": "array", "items": {"type": "string"}, "description": "models loading"},
   "working": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string"}}}, "description": "picture and sound models answering a request"},
   "llm": {"type": "object", "properties": {"active": {"type": "integer", "description": "chat requests being answered"}}},
-  "jobs": {"type": "array", "description": "image and audio jobs not ended", "items": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string"}, "label": {"type": "string"}, "state": {"type": "string"}}}},
+  "jobs": {"type": "array", "description": "image and audio jobs not ended (held ones too; they are no reason for busy)", "items": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string"}, "label": {"type": "string"}, "state": {"type": "string"}, "held": {"type": "boolean"}}}},
   "video": {"type": "object", "nullable": true, "description": "null: no video model enabled", "properties": {
     "running": {"type": "boolean"}, "label": {"type": "string", "nullable": true}, "name": {"type": "string", "nullable": true},
     "stage": {"type": "string", "nullable": true}, "pct": {"type": "integer", "nullable": true}, "eta_s": {"type": "integer", "nullable": true}, "elapsed_s": {"type": "integer", "nullable": true},
@@ -178,7 +191,23 @@ pub fn result(method: &str) -> Option<String> {
         "llm.models" => r#"{"type": "object", "properties": {"models": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "gpus": {"type": "array", "items": {"type": "integer"}}, "loaded": {"type": "boolean"}}}}}}"#.into(),
         "image.generate" | "image.edit" => format!(r#"{{"oneOf": [{{"allOf": [{PICTURES}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the pictures, and the job"}},
   {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (image.status {{label}} for the rest)"}}]}}"#),
-        "image.status" | "audio.status" => format!(r#"{{"oneOf": [{JOB_VIEW}, {JOB_LIST}]}}"#),
+        "image.status" | "audio.status" => JOB_VIEW.into(),
+        "image.jobs" | "audio.jobs" => JOB_LIST.into(),
+        "image.queue.list" | "audio.queue.list" => format!(r#"{{"type": "object", "properties": {{"queue": {{"type": "array", "items": {JOB_VIEW}, "description": "in run order"}},
+  "paused": {{"type": "object", "additionalProperties": true}}}}}}"#),
+        "image.queue.move" | "audio.queue.move" => r#"{"type": "object", "properties": {"label": {"type": "string"}, "position": {"type": "integer"}, "queue": {"type": "array", "items": {"type": "string"}, "description": "the waiting labels in run order"}}}"#.into(),
+        "image.queue.pause" | "image.queue.resume" | "audio.queue.pause" | "audio.queue.resume" => r#"{"type": "object", "properties": {"paused": {"type": "string", "description": "pause: queue | project <p> | batch <b> | N job(s)"},
+  "resumed": {"type": "string", "description": "resume: the same"}, "queued": {"type": "integer"}, "held": {"type": "integer"}, "paused_state": {"type": "object", "additionalProperties": true}}}"#.into(),
+        "image.upload" | "audio.upload" => r#"{"type": "object", "properties": {"name": {"type": "string", "description": "up_<unix>_<name> (audio: .wav)"}, "ref": {"type": "string", "description": "upload:<name>: what image / images / ref_audio / sample take in place of base64"},
+  "bytes": {"type": "integer"}, "sha256": {"type": "string"}, "mtime": {"type": "number"}}}"#.into(),
+        "system.cards" => r#"{"type": "object", "properties": {"cards": {"type": "array", "items": {"type": "object", "properties": {
+  "gpu": {"type": "integer"}, "name": {"type": "string"}, "bus": {"type": "string", "description": "its PCI address"},
+  "vram_total_mb": {"type": "integer"}, "vram_used_mb": {"type": "integer"}, "vram_free_mb": {"type": "integer"},
+  "busy_pct": {"type": "number"}, "power_w": {"type": "number", "nullable": true}, "power_cap_w": {"type": "number", "nullable": true}, "temp_c": {"type": "number", "nullable": true}, "temp_vram_c": {"type": "number", "nullable": true},
+  "models": {"type": "array", "items": {"type": "string"}, "description": "registered models whose processes hold memory there"},
+  "processes": {"type": "array", "items": {"type": "object", "properties": {"pid": {"type": "integer"}, "program": {"type": "string"}, "kind": {"type": "string", "nullable": true}, "model": {"type": "string", "nullable": true}, "vram_mb": {"type": "integer"}}}},
+  "enabled_models": {"type": "array", "items": {"type": "string"}, "description": "the enabled models counted on it"}, "vouched_mb": {"type": "integer", "description": "what they are counted for"},
+  "overbooked": {"type": "boolean", "description": "they are counted for more than it holds (the first to load holds it)"}}}}}}"#.into(),
         "image.cancel" | "audio.cancel" => r#"{"type": "object", "properties": {"cancelled": {"description": "label: how many jobs; none: whether anything was stopped"}, "stopped": {"type": "integer", "description": "requests stopped while running"},
   "label": {"type": "string"}, "reentrant_id": {"type": "string", "nullable": true}, "jobs": {"type": "array", "items": {"type": "string"}},
   "already_ended": {"type": "boolean", "description": "the job named had ended before the cancel (nothing stopped; state says how it ended) - a cancel is safe to repeat"},
@@ -282,15 +311,19 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
         "system.load" => &[(404, "not_found", "no such model"), (503, "no_room", "its cards are held by other models now (retryable)")],
         "system.enable" | "system.disable" | "system.unload" | "system.gpus" => &[(404, "not_found", "no such model")],
         "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.voices.design" =>
-            &[(400, "invalid_params", "a value refused, when the job is submitted (wait false too): steps a few-step model does not run, a size, a sampler, a picture that does not decode, a voice or language the speech model does not have, a continue_from that is not here ..."),
-              (404, "not_found", "no such model"), (409, "conflict", "the model is disabled, or none that can do it is enabled (never retry as is)"),
+            &[(400, "invalid_params", "a value refused, when the job is submitted (wait false too): steps a few-step model does not run, a size, a sampler, a picture that does not decode, a voice or language the speech model does not have, a priority outside -9..9 ..."),
+              (404, "not_found", "no such model; a continue_from or upload:<name> that is not here (error.field names which)"), (409, "conflict", "the model is disabled, or none that can do it is enabled (never retry as is)"),
+              (409, "busy", "queue: false and the job would not start at once (retryable)"),
               (499, "cancelled", "stopped by <kind>.cancel"), (502, "unavailable", "the kind's server did not start or answer"),
-              (503, "no_room", "the model's cards have no room for it now (other models hold them; it loads once one idles out, about 10 minutes at most): retry later"),
+              (503, "no_room", "the model's cards have no room for it (other work that is not idle holds them; idle models there are stopped for it at once). A job waits for the room up to 30 minutes first - stage waiting, waiting_for says who holds the card - then fails with this; image.ocr and voices.design wait 90 s. Retryable"),
               (504, "timeout", "wait: still running after an hour (the job goes on: <kind>.status {label})")],
-        "llm.chat" => &[(400, "invalid_params", "the chat server refused the request"), (502, "unavailable", "the chat server does not answer")],
-        "audio.voices.add" => &[(400, "invalid_params", "a bad name, a recording shorter than 3 s or not decodable")],
-        "audio.voices.remove" => &[(404, "not_found", "no saved voice of that name")],
-        "image.status" | "audio.status" => &[(404, "not_found", "no job by that label or reentrant_id")],
+        "llm.chat" => &[(400, "invalid_params", "the chat server refused the request"), (502, "unavailable", "the chat server does not answer"),
+                        (503, "no_room", "the model is not loaded and its cards have no room for it (work that is not idle holds them; idle picture, sound and video work is stopped for it at once): retryable")],
+        "audio.voices.add" => &[(400, "invalid_params", "a bad name, a recording shorter than 3 s or not decodable"), (409, "conflict", "replace over a voice another owner has")],
+        "audio.voices.remove" => &[(404, "not_found", "no saved voice of that name"), (409, "conflict", "the voice has an owner and the request names another")],
+        "image.status" | "audio.status" => &[(400, "invalid_params", "neither label nor reentrant_id (<kind>.jobs lists them)"), (404, "not_found", "no job by that label or reentrant_id")],
+        "image.queue.move" | "audio.queue.move" | "image.queue.pause" | "image.queue.resume" | "audio.queue.pause" | "audio.queue.resume" => &[(404, "not_found", "label / reentrant_id: no waiting job by it")],
+        "image.upload" | "audio.upload" => &[(400, "invalid_params", "a name of another type, data not base64, empty, or not a picture / recording that decodes (a picture over 40 MP)")],
         "image.cancel" | "audio.cancel" => &[(404, "not_found", "no job with that label or reentrant_id at all (the message names which); an ended one answers 200 already_ended")],
         "system.files.stat" => &[(400, "invalid_params", "kind is not image, audio or video, or name is not a plain file name"), (404, "not_found", "no such file")],
         "system.files.delete" => &[(400, "invalid_params", "kind, or a name that is not a clip, upload, picture or sound"), (404, "not_found", "no such file"),
@@ -300,14 +333,15 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
 }
 
 /// What every answer's error code means
-pub const CODES: &str = "Every /rpc answer is the envelope: {\"ok\": true, \"result\": ...} or {\"ok\": false, \"error\": {code, message, retryable, status, method, field}}. \
-Read ok and error.code: the body says everything, and the HTTP status only mirrors error.status (a client never needs it; another transport carries the same envelope). \
+pub const CODES: &str = "Every /rpc answer is the envelope: {\"ok\": true, \"result\": ...} or {\"ok\": false, \"error\": {code, message, retryable, status, method, field}}, \
+always with HTTP 200 - errors too (401, an unknown method, a body too large to read). Read ok and error.code: error.status is the code's number by convention, \
+in the body so another transport carries the same envelope. Only the file routes (/v1/.../files/..., the OpenAI routes) answer with HTTP statuses. \
 A job's failure (image/audio status, a failed submit replayed) has the same error object. \
 Error codes (error.code, error.status by convention): invalid_request 400 (not POST, a query string, the body is not a JSON object), request_too_large 400 (over 256 MiB), invalid_params 400, \
 unauthorized 401, not_found 404 (also an unknown method), conflict 409 (a model disabled, none of the kind enabled, a name taken), \
-busy 409 (video.generate while a clip is made, without queue: true), not_running 409 (video.cancel with nothing running), \
+busy 409 (video.generate while a clip is made, or an image / audio job that would wait, without queue: true), not_running 409 (video.cancel with nothing running), \
 cancelled 499 (image.cancel / audio.cancel stopped it), unavailable 502 (the kind's server does not answer), \
-no_room 503 (the model's cards are held by other models now; it loads once one idles out), timeout 504, internal 500. \
+no_room 503 (the model's cards are held by work that is not idle; idle models are stopped for it first), timeout 504, internal 500. \
 Every error has retryable: true for no_room, unavailable, timeout and video's busy (the same call may work later), false otherwise \
 (change the request: a bad value, a disabled or missing model, a cancel).";
 
@@ -316,7 +350,11 @@ pub const LABELS: &str = "Video labels: \"<series> NN/MM: text\" (\"Harbour 03/1
 the series (the text before NN) is where the anchors prev / prev_cam / first / first_cam look, and the project when the request names none. \
 video.cancel, video.queue.move and video.queue.remove name clips by label.\n\n\
 Jobs: image.generate, image.edit, audio.generate and audio.speak run as jobs here - the call can drop and the job goes on; \
-label one (else its id is its label), read it with <kind>.status {label}, stop it with <kind>.cancel {label}; wait: false answers at once. \
+label one (else its id is its label), read it with <kind>.status {label} (stage and waiting_for say what it waits for), list them with <kind>.jobs, \
+stop it with <kind>.cancel {label}; wait: false answers at once. A kind makes as many jobs at once as it has servers (one a card); the rest wait \
+in a queue as video's: priority, held, project and batch on submit, <kind>.queue.list / move / pause / resume. \
+Pictures and recordings used again (an init picture, edit references, a voice sample) can be sent once with <kind>.upload and named as \
+\"upload:<name>\" after. \
 reentrant_id (every generate, video's too): a submit naming the id of a job queued, running or done gets that job back, nothing new is started \
 (a failed or cancelled one is made again).";
 
