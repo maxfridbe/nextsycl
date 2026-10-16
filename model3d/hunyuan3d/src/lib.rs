@@ -1,0 +1,296 @@
+//! Hunyuan3D (Tencent): a mesh from one picture of an object, two architectures on one engine.
+//!
+//! - **hunyuan3d-2mini** (2mini-turbo): DINOv2-giant at 1,022 px, the Flux-style `Hunyuan3DDiT` (8 double + 16
+//!   single blocks, guidance-distilled: no CFG batch) over 512 latent tokens, ConsistencyFlowMatchEuler in 5 steps,
+//!   and the turbo ShapeVAE decoder (FlashVDM's light geometry decoder).
+//! - **hunyuan3d-2.1**: DINOv2-Large at 518 px, `HunYuanDiTPlain` (21 blocks, U-ViT skips, MoE in the last 6, the
+//!   timestep as a token) over 4,096 tokens, FlowMatchEuler in 50 steps with CFG 5, the ShapeVAE decoder.
+//!
+//! The pipeline (`generate`): the picture cut out and recentred (`picture`), its DINOv2 tokens (`dino`), the latents
+//! denoised from the seed (`flux` / `plain`, `sched`), decoded to occupancy logits on a grid in [-1.01, 1.01]^3
+//! (`vae`), meshed by marching cubes at 0 (`nextsycl_mesh::tools::mc`), small floating pieces dropped, finished
+//! (decimated to `faces`). The parity of every stage with Tencent's code is `check`'s.
+
+pub mod check;
+pub mod dino;
+mod ffi;
+pub mod flux;
+pub mod ops;
+pub mod picture;
+pub mod plain;
+pub mod sched;
+pub mod vae;
+
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use nextsycl_core::{At, DevBuf, EngineOption, Gpu};
+use nextsycl_gguf::safetensors::SafeTensors;
+use nextsycl_model3d::{Abilities, Defaults, Error, LoadOptions, Mesh, MeshRequest, Model3dEngine, Model3dKind, ModelFiles, Result, Step};
+
+use crate::ops::{read_f32, Ops, Weights};
+
+pub const ARCH_21: &str = "hunyuan3d-2.1";
+pub const ARCH_MINI: &str = "hunyuan3d-2mini";
+
+/// The files by role: `model` (the DiT file with its conditioner and VAE: Tencent's mini-turbo safetensors, or
+/// Comfy-Org's 2.1 repackage), `vae` (2mini: the turbo decoder), and the paint model's (2.1's texture)
+pub const ROLES: &[&str] = &["model", "vae?", "paint-unet?", "paint-vae?", "paint-dino?", "upscaler?"];
+
+pub const OPTIONS: &[EngineOption] = &[
+    EngineOption { name: "tokens", env: "NS_M3D_HY_TOKENS", value: "N", help: "latent tokens of the shape (2mini 512 as Tencent's turbo example; 2.1 4096)", at: At::Both },
+    EngineOption { name: "decode", env: "NS_M3D_HY_DECODE", value: "fast|dense", help: "the grid: coarse to fine near the surface (fast) or every point", at: At::Both },
+    EngineOption { name: "chunk", env: "NS_M3D_HY_CHUNK", value: "N", help: "points the shape decoder queries at once", at: At::Both },
+];
+
+/// This engine's registry entry
+pub fn kind() -> Model3dKind {
+    Model3dKind {
+        archs: &[ARCH_21, ARCH_MINI],
+        name: "Hunyuan3D (2.1: shape and PBR paint; 2mini-turbo: fast shape) - a mesh from a picture",
+        roles: ROLES,
+        load,
+        options: OPTIONS,
+    }
+}
+
+/// What differs between the two architectures
+#[derive(Clone, Copy, Debug)]
+pub struct Arch {
+    pub name: &'static str,
+    /// the picture: the processor's size, the encoder's
+    pub proc_size: usize,
+    pub enc_size: usize,
+    pub tokens: usize,
+    pub steps: u32,
+    pub cfg: f32,
+    pub resolution: u32,
+    pub scale_factor: f32,
+}
+
+pub const MINI: Arch = Arch { name: ARCH_MINI, proc_size: 1022, enc_size: 1022, tokens: 512, steps: 5, cfg: 5.0, resolution: 380, scale_factor: 1.018_813_7 };
+pub const V21: Arch = Arch { name: ARCH_21, proc_size: 512, enc_size: 518, tokens: 4096, steps: 50, cfg: 5.0, resolution: 384, scale_factor: 1.003_950_6 };
+
+/// The box the shape lives in: [-BOUNDS, BOUNDS]^3
+pub const BOUNDS: f32 = 1.01;
+const BORDER: f32 = 0.15;
+/// The smallest share of the triangles a connected piece keeps (Tencent's FloaterRemover: 0.5 %)
+const FLOATERS: f32 = 0.005;
+
+#[allow(clippy::large_enum_variant)] // one a loaded engine
+pub enum Dit {
+    Flux(flux::Flux),
+    Plain(plain::Plain),
+}
+
+pub struct Hunyuan3d {
+    pub arch: Arch,
+    pub ops: Ops,
+    pub dino: dino::Dino,
+    pub dit: Dit,
+    pub vae: vae::Vae,
+    loaded: Instant,
+    load_seconds: f64,
+    settings: LoadOptions,
+    weights_bytes: usize,
+    busy: Mutex<()>,
+}
+
+/// A seeded standard-normal draw (splitmix64, Box-Muller): the starting noise
+pub fn noise(seed: u64, n: usize) -> Vec<f32> {
+    let mut s = seed;
+    let mut next = || {
+        s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut out = Vec::with_capacity(n + 1);
+    while out.len() < n {
+        let (u, v) = (next().max(1e-300), next());
+        let r = (-2.0 * u.ln()).sqrt();
+        out.push((r * (std::f64::consts::TAU * v).cos()) as f32);
+        out.push((r * (std::f64::consts::TAU * v).sin()) as f32);
+    }
+    out.truncate(n);
+    out
+}
+
+fn open(files: &ModelFiles, role: &str) -> Result<SafeTensors> {
+    let p = files.get(role).ok_or_else(|| Error(format!("no {role} file")))?;
+    SafeTensors::open(p).map_err(|e| Error(e.0))
+}
+
+fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Model3dEngine>> {
+    let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?;
+    let model = open(files, "model")?;
+    // the architecture by the file's tensors: the Flux-style DiT has double blocks
+    let arch = if model.tensor("model.double_blocks.0.img_mod.lin.weight").is_some() { MINI } else { V21 };
+    Ok(Box::new(Hunyuan3d::load(arch, files, &model, gpu, o, log)?))
+}
+
+impl Hunyuan3d {
+    pub fn load(arch: Arch, files: &ModelFiles, model: &SafeTensors, gpu: &Arc<Gpu>, o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Hunyuan3d> {
+        let t0 = Instant::now();
+        let ops = Ops::new(gpu)?;
+        let dw = Weights::new(model, "conditioner.main_image_encoder.model.", gpu);
+        let dino = dino::Dino::load(&dw, arch.enc_size)?;
+        log(format!("{}: DINOv2 of {} layers x {} at {} px ({} tokens)", arch.name, dino.layers(), dino.width, dino.size, dino.tokens()));
+        let mw = Weights::new(model, "model.", gpu);
+        let dit = if arch.name == ARCH_MINI { Dit::Flux(flux::Flux::load(&mw)?) } else { Dit::Plain(plain::Plain::load(&mw)?) };
+        let vae = if arch.name == ARCH_MINI {
+            let vf = open(files, "vae").map_err(|e| Error(format!("{}: the turbo decoder: {}", arch.name, e.0)))?;
+            vae::Vae::load(&Weights::new(&vf, "", gpu), arch.scale_factor)?
+        } else {
+            vae::Vae::load(&Weights::new(model, "vae.", gpu), arch.scale_factor)?
+        };
+        gpu.sync()?;
+        let weights_bytes = dw.bytes.get() + mw.bytes.get() + vae.bytes;
+        let load_seconds = t0.elapsed().as_secs_f64();
+        log(format!("{}: loaded on {} in {load_seconds:.1} s ({:.2} GiB of weights)", arch.name, gpu.name, weights_bytes as f64 / (1u64 << 30) as f64));
+        Ok(Hunyuan3d { arch, ops, dino, dit, vae, loaded: Instant::now(), load_seconds, settings: o.clone(), weights_bytes, busy: Mutex::new(()) })
+    }
+
+    /// A setting: the request's option, else the load's, else the environment
+    fn setting(&self, req: &MeshRequest, name: &str, env: &str) -> Option<String> {
+        req.extra.get(name).cloned().or_else(|| self.settings.setting(env))
+    }
+
+    /// The DiT's velocity for latents `x` at sigma `t` (guided: CFG for 2.1, the distilled guidance for 2mini)
+    fn velocity(&self, st: &mut Run, x: &DevBuf, t: f32, cfg: f32, v: &DevBuf) -> Result<()> {
+        match (&self.dit, &mut st.dit) {
+            (Dit::Flux(f), RunDit::Flux(sc)) => f.forward(&self.ops, sc, x, t, cfg, v, None),
+            (Dit::Plain(p), RunDit::Plain(sc)) => p.forward_cfg(&self.ops, sc, x, t, cfg, v),
+            _ => Err(Error("the DiT and its scratch disagree".into())),
+        }
+    }
+
+    /// The DINOv2 tokens of a picture's pixels (float32 [3, size, size], normalized)
+    pub fn condition(&self, pixels: &[f32]) -> Result<DevBuf> {
+        self.dino.forward(&self.ops, pixels)
+    }
+
+    /// The per-generation state for `tokens` latent rows beside `cond`
+    pub fn run_state(&self, cond: &DevBuf, tokens: usize) -> Result<Run> {
+        let rows = self.dino.tokens();
+        let dit = match &self.dit {
+            Dit::Flux(f) => RunDit::Flux(f.scratch(&self.ops, cond, rows, tokens)?),
+            Dit::Plain(p) => RunDit::Plain(p.scratch(&self.ops, cond, rows, tokens)?),
+        };
+        Ok(Run { dit, tokens })
+    }
+
+    /// The latents from `noise` (host [tokens, 64]) over `sigmas`, reporting each step
+    pub fn sample(&self, st: &mut Run, noise_v: &[f32], sigmas: &[f32], cfg: f32, progress: &mut dyn FnMut(u32, u32) -> Result<()>) -> Result<Vec<f32>> {
+        let n = noise_v.len();
+        let x = DevBuf::from_f32(&self.ops.gpu, noise_v)?;
+        let v = DevBuf::new(&self.ops.gpu, n * 4)?;
+        let steps = sigmas.len() - 1;
+        for i in 0..steps {
+            let (s0, s1) = (sigmas[i], sigmas[i + 1]);
+            if s1 != s0 {
+                self.velocity(st, &x, s0, cfg, &v)?;
+                self.ops.axpy(x.ptr(), v.ptr(), n, s1 - s0)?;
+            }
+            self.ops.gpu.sync()?;
+            progress(i as u32 + 1, steps as u32)?;
+        }
+        read_f32(&x, n)
+    }
+
+    /// Occupancy logits on the (res + 1)^3 lattice over [-BOUNDS, BOUNDS]^3 (x slowest), every point
+    pub fn decode_dense(&self, latents: &[f32], res: usize, chunk: usize, progress: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<Vec<f32>> {
+        let n = latents.len() / self.vae.channels;
+        let tokens = self.vae.tokens(&self.ops, latents)?;
+        let data = self.vae.data(&self.ops, &tokens, n)?;
+        drop(tokens);
+        let sc = self.vae.query_scratch(&self.ops, chunk)?;
+        let step = 2.0 * BOUNDS / res as f32;
+        self.vae.query_lattice(&self.ops, &data, &sc, res + 1, -BOUNDS, step, None, progress)
+    }
+
+    /// The mesh of a logit grid: marching cubes at 0, the floaters dropped
+    pub fn mesh(logits: &[f32], res: usize) -> Mesh {
+        let r1 = res + 1;
+        let step = 2.0 * BOUNDS / res as f32;
+        let m = nextsycl_mesh::tools::mc::marching_cubes(logits, [r1, r1, r1], 0.0, [-BOUNDS; 3], step);
+        nextsycl_mesh::tools::mc::drop_floaters(&m, FLOATERS)
+    }
+}
+
+/// One generation's working state
+pub struct Run {
+    dit: RunDit,
+    pub tokens: usize,
+}
+
+enum RunDit {
+    Flux(flux::Scratch),
+    Plain(plain::Scratch),
+}
+
+impl Model3dEngine for Hunyuan3d {
+    fn arch(&self) -> &'static str {
+        self.arch.name
+    }
+    fn abilities(&self) -> Abilities {
+        Abilities { generate: true, texture: false, views: 1, rig: false, animate: false }
+    }
+    fn defaults(&self) -> Defaults {
+        Defaults { steps: self.arch.steps, cfg: self.arch.cfg, resolution: self.arch.resolution, faces: 40_000, texture_size: 2048, frames: 0, fps: 0.0 }
+    }
+    fn options(&self) -> &'static [EngineOption] {
+        OPTIONS
+    }
+    fn load_seconds(&self) -> f64 {
+        self.load_seconds
+    }
+    fn report(&self) -> Vec<String> {
+        let mut r = vec![format!("{} on {}: {:.2} GiB of weights, up {:.0} s", self.arch.name, self.ops.gpu.name,
+                                 self.weights_bytes as f64 / (1u64 << 30) as f64, self.loaded.elapsed().as_secs_f64())];
+        if let Ok((total, Some(free))) = self.ops.gpu.memory() {
+            r.push(format!("card: {:.1} of {:.1} GiB free", free as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64));
+        }
+        r
+    }
+    fn generate(&self, req: &MeshRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Mesh> {
+        let _one = self.busy.lock().map_err(|_| Error("a previous request failed midway".into()))?;
+        let t0 = Instant::now();
+        let mut report = |phase: &'static str, at: u32, of: u32| progress(Step { phase, at, of, seconds: t0.elapsed().as_secs_f64() });
+        let view = req.views.first().ok_or_else(|| Error("no picture".into()))?;
+        if req.texture {
+            return Err(Error(format!("{} paints no textures yet: ask for the shape alone (texture false)", self.arch.name)));
+        }
+        let num = |name: &str, env: &str| -> Result<Option<usize>> {
+            self.setting(req, name, env).map(|v| v.parse::<usize>().map_err(|_| Error(format!("{name}: {v}?")))).transpose()
+        };
+        let tokens = num("tokens", "NS_M3D_HY_TOKENS")?.unwrap_or(self.arch.tokens);
+        let res = req.resolution.unwrap_or(self.arch.resolution) as usize;
+        if !(16..=1024).contains(&res) || !(64..=16384).contains(&tokens) {
+            return Err(Error(format!("resolution {res} (16 to 1024) or tokens {tokens} (64 to 16384) out of range")));
+        }
+        let steps = req.steps.unwrap_or(self.arch.steps) as usize;
+        let cfg = req.cfg.unwrap_or(self.arch.cfg);
+        report("image", 0, 1)?;
+        let (pixels, _note) = picture::prepare(&view.image, req.remove_background.unwrap_or(true), self.arch.proc_size, self.arch.enc_size, BORDER)?;
+        let cond = self.condition(&pixels)?;
+        self.ops.gpu.sync()?;
+        report("image", 1, 1)?;
+        let sigmas = if self.arch.name == ARCH_MINI { sched::consistency(steps, 100) } else { sched::flow_match(steps) };
+        let mut st = self.run_state(&cond, tokens)?;
+        let latents = self.sample(&mut st, &noise(req.seed, tokens * self.vae.channels), &sigmas, cfg, &mut |a, b| report("shape", a, b))?;
+        drop(st);
+        drop(cond);
+        let chunk = num("chunk", "NS_M3D_HY_CHUNK")?.unwrap_or_else(|| self.vae.chunk());
+        let logits = self.decode_dense(&latents, res, chunk, &mut |a, b| report("decode", (a / 1024) as u32, (b / 1024) as u32))?;
+        report("mesh", 0, 1)?;
+        let m = Self::mesh(&logits, res);
+        if m.triangles() == 0 {
+            return Err(Error("the shape decoded to nothing (no surface in the box)".into()));
+        }
+        let out = nextsycl_model3d::finish(m, Some(req.faces.unwrap_or(40_000)));
+        report("mesh", 1, 1)?;
+        Ok(out)
+    }
+}

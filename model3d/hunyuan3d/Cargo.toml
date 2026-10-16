@@ -1,0 +1,14 @@
+[package]
+name = "nextsycl-model3d-hunyuan3d"
+description = "Hunyuan3D 2.1 (shape and PBR paint) and Hunyuan3D-2mini-turbo (fast shape): meshes from a picture on Intel Arc (SYCL)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-mesh.workspace = true
+nextsycl-model3d.workspace = true
+serde_json.workspace = true

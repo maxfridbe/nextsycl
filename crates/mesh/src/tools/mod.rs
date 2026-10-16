@@ -4,6 +4,7 @@
 
 pub mod closest;
 pub mod decimate;
+pub mod mc;
 pub mod remesh;
 pub mod uv;
 
