@@ -32,6 +32,9 @@ int ns_image_hi21_cat_gelu(ns_gpu* g, const void* att, int64_t M, int64_t A, con
  * D at most 256. */
 int ns_image_hi21_attn_small(ns_gpu* g, const float* q, int64_t qs, const float* k, const float* v, int64_t kvs, int64_t L, int64_t Hq,
                              int64_t Hkv, int64_t D, float scale, const float* bias, int causal, float* out);
+/* out [M, N] float32 = x [M, K] half . w^T (w [N, K] half) + bias (float32 [N] or NULL): accumulated and written in
+ * float32 (oneDNN, mm.cpp) - products whose values may pass half's range */
+int ns_image_hi21_linear_f32(ns_gpu* g, const void* x, int64_t M, int64_t K, const void* w, int64_t N, const float* bias, float* out);
 /* x float32 += a * y float32 (n values): the sampler's step */
 int ns_image_hi21_axpy(ns_gpu* g, float* x, const float* y, int64_t n, float a);
 /* conversions, n values: float32 -> half, half -> float32 (times s) */

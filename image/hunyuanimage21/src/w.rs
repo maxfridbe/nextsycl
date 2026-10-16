@@ -203,9 +203,16 @@ impl Lin {
     }
 
     /// out [m, n] (out_dt) = x [m, k] W^T + bias, with W from `ready` (x half, or float32 for a float32 matrix)
-    pub fn gemm(&self, nsd: &Nsd, w: *const std::ffi::c_void, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void, out_dt: Dt) -> Result<()> {
+    /// A half product with a float32 output is accumulated and written in float32 (`K::linear_f32`: the shared
+    /// linear rounds through half first).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm(&self, nsd: &Nsd, k8: &K, w: *const std::ffi::c_void, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void, out_dt: Dt)
+                -> Result<()> {
         let dt = if self.half() { Dt::F16 } else { Dt::F32 };
         let bias = self.bias.as_ref().map_or(none(), |b| b.ptr() as *const _);
+        if dt == Dt::F16 && out_dt == Dt::F32 {
+            return k8.linear_f32(x, m, self.k, w, self.n, bias.cast(), out.cast());
+        }
         nsd.linear(x, dt, m, self.k, w, self.n, bias, out, out_dt)
     }
 
@@ -228,7 +235,7 @@ impl Lin {
     #[allow(clippy::too_many_arguments)]
     pub fn apply(&self, nsd: &Nsd, k8: &K, scratch: &DevBuf, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void, out_dt: Dt) -> Result<()> {
         let w = self.ready(nsd, k8, scratch)?;
-        self.gemm(nsd, w, x, m, out, out_dt)
+        self.gemm(nsd, k8, w, x, m, out, out_dt)
     }
 }
 

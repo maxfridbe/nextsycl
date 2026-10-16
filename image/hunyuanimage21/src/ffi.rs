@@ -19,6 +19,7 @@ struct Api {
     geglu: unsafe extern "C" fn(G, P, c_int, i64, i64, M) -> c_int,
     cat_gelu: unsafe extern "C" fn(G, P, i64, i64, P, i64, i64, M) -> c_int,
     attn_small: unsafe extern "C" fn(G, *const f32, i64, *const f32, *const f32, i64, i64, i64, i64, i64, f32, *const f32, c_int, *mut f32) -> c_int,
+    linear_f32: unsafe extern "C" fn(G, P, i64, i64, P, i64, *const f32, *mut f32) -> c_int,
     axpy: unsafe extern "C" fn(G, *mut f32, *const f32, i64, f32) -> c_int,
     to_half: unsafe extern "C" fn(G, *const f32, M, i64, f32) -> c_int,
     to_float: unsafe extern "C" fn(G, P, *mut f32, i64) -> c_int,
@@ -59,6 +60,7 @@ fn api() -> Result<&'static Api> {
             geglu: sym!("ns_image_hi21_geglu"),
             cat_gelu: sym!("ns_image_hi21_cat_gelu"),
             attn_small: sym!("ns_image_hi21_attn_small"),
+            linear_f32: sym!("ns_image_hi21_linear_f32"),
             axpy: sym!("ns_image_hi21_axpy"),
             to_half: sym!("ns_image_hi21_to_half"),
             to_float: sym!("ns_image_hi21_to_float"),
@@ -155,6 +157,13 @@ impl K {
         // SAFETY: q, k, v rows as named, out [l, hq * d], bias [hq, l, l] or null.
         check(unsafe { (self.k.attn_small)(self.g(), q, qs as i64, k, v, kvs as i64, l as i64, hq as i64, hkv as i64, d as i64, scale, bias, causal as c_int, out) },
               "attention")
+    }
+
+    /// out [m, n] float32 = x [m, k] half . w^T (w [n, k] half) + bias, accumulated and written in float32
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_f32(&self, x: P, m: usize, k: usize, w: P, n: usize, bias: *const f32, out: *mut f32) -> Result<()> {
+        // SAFETY: x [m, k], w [n, k], out [m, n], bias [n] or null.
+        check(unsafe { (self.k.linear_f32)(self.g(), x, m as i64, k as i64, w, n as i64, bias, out) }, "linear (float32 out)")
     }
 
     /// x += a y, n floats

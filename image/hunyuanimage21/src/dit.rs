@@ -528,7 +528,7 @@ impl Dit {
                 let w = s.qkv.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
-                    s.qkv.gemm(nsd, w, hptr(&b.h, r0 * DIM), rows, hptr(&b.big, r0 * 3 * DIM), Dt::F16)?;
+                    s.qkv.gemm(nsd, k, w, hptr(&b.h, r0 * DIM), rows, hptr(&b.big, r0 * 3 * DIM), Dt::F16)?;
                 }
             }
             prof::mark(nsd, "qkv")?;
@@ -546,7 +546,7 @@ impl Dit {
                 let w = s.proj.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
-                    s.proj.gemm(nsd, w, hptr(&b.att, r0 * DIM), rows, fptr(&b.o, r0 * DIM).cast(), Dt::F32)?;
+                    s.proj.gemm(nsd, k, w, hptr(&b.att, r0 * DIM), rows, fptr(&b.o, r0 * DIM).cast(), Dt::F32)?;
                     nsd.gate_add(fptr(&b.x, r0 * DIM).cast(), Dt::F32, rows, DIM, fptr(&b.o, r0 * DIM).cast(), Dt::F32, z, md(m, 2).cast())?;
                     k.ln_mod(fptr(&b.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, 4), md(m, 3), hptr(&b.h, r0 * DIM), T::F16)?;
                 }
@@ -556,7 +556,7 @@ impl Dit {
                 let w = s.fc1.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
-                    s.fc1.gemm(nsd, w, hptr(&b.h, r0 * DIM), rows, hptr(&b.mlp, r0 * FFN), Dt::F16)?;
+                    s.fc1.gemm(nsd, k, w, hptr(&b.h, r0 * DIM), rows, hptr(&b.mlp, r0 * FFN), Dt::F16)?;
                     k.act(hptr(&b.mlp, r0 * FFN), T::F16, rows * FFN, Act::GeluTanh)?;
                 }
             }
@@ -565,7 +565,7 @@ impl Dit {
                 let w = s.fc2.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
-                    s.fc2.gemm(nsd, w, hptr(&b.mlp, r0 * FFN), rows, fptr(&b.o, r0 * DIM).cast(), Dt::F32)?;
+                    s.fc2.gemm(nsd, k, w, hptr(&b.mlp, r0 * FFN), rows, fptr(&b.o, r0 * DIM).cast(), Dt::F32)?;
                     nsd.gate_add(fptr(&b.x, r0 * DIM).cast(), Dt::F32, rows, DIM, fptr(&b.o, r0 * DIM).cast(), Dt::F32, z, md(m, 5).cast())?;
                 }
             }
@@ -587,7 +587,7 @@ impl Dit {
             prof::mark(nsd, "norm + modulate")?;
             let w = s.linear1.ready(nsd, k, sc)?;
             for b in branches {
-                s.linear1.gemm(nsd, w, b.h.ptr(), b.n + b.t, b.big.ptr(), Dt::F16)?;
+                s.linear1.gemm(nsd, k, w, b.h.ptr(), b.n + b.t, b.big.ptr(), Dt::F16)?;
             }
             prof::mark(nsd, "linear1")?;
             for b in branches {
@@ -603,7 +603,7 @@ impl Dit {
             let w = s.linear2.ready(nsd, k, sc)?;
             for b in branches {
                 let rows = b.n + b.t;
-                s.linear2.gemm(nsd, w, b.mlp.ptr(), rows, b.o.ptr(), Dt::F32)?;
+                s.linear2.gemm(nsd, k, w, b.mlp.ptr(), rows, b.o.ptr(), Dt::F32)?;
                 nsd.gate_add(b.x.ptr(), Dt::F32, rows, DIM, b.o.ptr(), Dt::F32, z, md(2).cast())?;
             }
             prof::mark(nsd, "linear2")?;
