@@ -22,7 +22,10 @@ crates/                    THE FOUNDATION - every kind uses it, it knows no kind
                                  schedules, LoRA references, pictures (PNG); the diffusion kernels' bindings (Nsd)
   qwen3vl    nextsycl-qwen3vl    the Qwen3-VL text tower (int8 ConvRot): a text encoder image and video engines share
   mesh       nextsycl-mesh       meshes (PBR textures, skins, morph animation), GLB and OBJ, and the CPU tools: weld,
-                                 decimate (quadric), remesh (isotropic), re-UV (charts, packing, baking), closest points
+                                 decimate (quadric), remesh (isotropic), re-UV (charts, packing, baking), closest points,
+                                 orient (consistent outward winding)
+  remover    nextsycl-remover    the background remover the 3D engines share: BiRefNet (Swin-L) on the shared vision
+                                 kernels (kernels/diffusion/vision.cpp), and the object picture an image-to-3D model wants
 
 llm/                       LANGUAGE MODELS
   contract   nextsycl-llm        the contract: Engine, Session / Decoder / Checkpoint, Sampler, EngineKind; host sampling
@@ -67,6 +70,8 @@ model3d/                   3D
                                  a rectified-flow MMDiT), morph targets; stage checks
   unirig     nextsycl-model3d-unirig   UniRig: a skeleton (Michelangelo encoder, OPT decoder) and skin weights (PTv3)
   rignet     nextsycl-model3d-rignet   RigNet (GPLv3, its own crate): a skeleton and skin weights from graph networks
+  trellis2   nextsycl-model3d-trellis2  TRELLIS.2 and Pixal3D (arch pixal3d): DINOv3, the flow DiTs, the sparse
+                                 decoders, the dual-grid mesh, the PBR bake, stage checks
   example    nextsycl-model3d-example  a template
 
 glue/                      WHAT MAKES ENGINES A PRODUCT (libraries too)
@@ -400,6 +405,25 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   gathers and max-aggregation, global pooling; eval BatchNorm as a per-channel affine after each ReLU), the geometry on
   the CPU.
   Settings: `NS_M3D_RIGNET_FACES`, `NS_M3D_RIGNET_BANDWIDTH`, `NS_M3D_RIGNET_THRESHOLD`.
+- **trellis2** (`model3d/trellis2`, arch `trellis2` and `pixal3d`) - Microsoft's TRELLIS.2 and Tencent ARC's Pixal3D from
+  Aero-Ex's GGUF flows and the fp16 decoders, stage by stage as Trellis2ImageTo3DPipeline: the object picture
+  (`nextsycl-remover`'s `prepare`; Pixal3D squares it with a tenth to spare), DINOv3 ViT-L/16 (float32 linears, attention
+  in half, the 2-D RoPE half-split through `nsd_rope`), the flow DiT every stage runs (30 blocks of 1536: shared +
+  per-block adaLN; its own kernel for TRELLIS's per-head RMS norm with the interleaved 3-D RoPE; flash attention over
+  every token; the picture's keys and values made once a stage, the unconditioned pass's cross-attention its value
+  bias - exact, the keys all equal; Q8_0 expanded to half per product; float32 residual, float32-output products on
+  oneDNN, `mm.cpp`), FlowEulerGuidanceIntervalSampler on the host, the structure decoder (dense conv3d as the sparse
+  gather over the full grid, a 3-D pixel shuffle), the sparse decoders (host coordinate maps; children's neighbour maps
+  derived from their parents'; the submanifold convolution a row-blocked 27-tap gather and a GEMM; the texture decoder
+  replays the shape decoder's subdivisions), the cascade, then on the CPU the dual-grid mesh, `tools::orient`, vertex
+  clustering to ~4x the budget, the quadric decimation, `tools::unwrap` and the bake (renormalized trilinear voxel
+  samples at each texel, snapped to the decoded surface from two voxels outside). Pixal3D's blocks add `proj_linear`
+  of DINOv3 patch features `grid_sample`d at each voxel's projection (`pixal.rs`: a manual field of view; NAF's half
+  taken as the low-res samples). Each stage loads its model and drops it after (`NS_M3D_T2_RESIDENT=1` keeps them);
+  a stage refuses to start when the card has less than its need plus 1.5 GiB free. `NS_M3D_T2_PROFILE=1`: stage times,
+  the DiT's parts, the card's peak. Checked against `reference/trellis2/ref.py` / `reference/pixal3d/ref.py`: every
+  stage rel <= 6e-4 on the reference's inputs (the guided samplers' 12 steps 5.8e-3); B70: the 1024 cascade 80 s
+  (9.1 GiB peak), 512 21 s, Pixal3D 45 s.
 
 ## The model registry
 

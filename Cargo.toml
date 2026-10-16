@@ -4,11 +4,9 @@ resolver = "2"
 # crate an architecture (llm/, image/, video/) -, the glue that makes them a service (glue/), the program (cli/)
 members = [
     "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl",
-    "crates/mesh",
+    "crates/mesh", "crates/remover",
     "model3d/contract",
-    "model3d/example",
-    "model3d/hunyuan3d",
-    "model3d/example", "model3d/animateanymesh", "model3d/unirig", "model3d/rignet",
+    "model3d/example", "model3d/hunyuan3d", "model3d/animateanymesh", "model3d/unirig", "model3d/rignet", "model3d/trellis2",
     "llm/contract", "llm/glm5next", "llm/qwen4exp", "llm/qwen35", "llm/deepseek2", "llm/deepseek4", "llm/museglimmer", "llm/nemotronh", "llm/example",
     "image/contract", "image/example", "image/qwenimage21", "image/unlimitedocr", "image/paddleocrvl", "image/olmocr2", "image/hunyuanimage21",
     "video/contract", "video/example", "video/h3",
@@ -30,6 +28,7 @@ nextsycl-tok = { path = "crates/tok" }
 nextsycl-diffusion = { path = "crates/diffusion" }
 nextsycl-qwen3vl = { path = "crates/qwen3vl" }
 nextsycl-mesh = { path = "crates/mesh" }
+nextsycl-remover = { path = "crates/remover" }
 nextsycl-llm = { path = "llm/contract" }
 nextsycl-llm-glm5next = { path = "llm/glm5next" }
 nextsycl-llm-qwen4exp = { path = "llm/qwen4exp" }
@@ -60,6 +59,7 @@ nextsycl-model3d-hunyuan3d = { path = "model3d/hunyuan3d" }
 nextsycl-model3d-animateanymesh = { path = "model3d/animateanymesh" }
 nextsycl-model3d-unirig = { path = "model3d/unirig" }
 nextsycl-model3d-rignet = { path = "model3d/rignet" }
+nextsycl-model3d-trellis2 = { path = "model3d/trellis2" }
 nextsycl-models = { path = "glue/models" }
 nextsycl-serve = { path = "glue/serve" }
 serde_json = "1"

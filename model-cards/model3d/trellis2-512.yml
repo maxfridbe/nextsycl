@@ -1,0 +1,27 @@
+# TRELLIS.2 4B Q8_0, the 512 path (one picture to a textured mesh; lighter and faster; MIT)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: trellis2-512
+kind: model3d
+arch: trellis2
+title: 'TRELLIS.2 4B Q8_0, 512 (picture to textured mesh, the light path; MIT)'
+about: TRELLIS.2's 512 pipeline - the same DINOv3, structure flow and decoders as trellis2 with the 512 shape and texture flows only (two fewer 1.3B models to download, a coarser mesh in a fraction of the time); BiRefNet cuts opaque pictures out
+gpus: '0'
+vram_gib: 4.0                    # its memory on the card when it runs: the peak measured 2.9 GiB on a B70 (models load stage by stage)
+does: [generate, texture]
+env: {}
+files:
+  pipeline: trellis2-pipeline
+  dino: trellis2-dinov3-vitl16
+  ss_flow: trellis2-ss-flow-q8
+  ss_dec: trellis2-ss-dec
+  shape_flow_512: trellis2-shape-flow-512-q8
+  shape_dec: trellis2-shape-dec
+  tex_flow_512:
+    key: trellis2-tex-flow-512-q8
+    url: https://huggingface.co/Aero-Ex/Trellis2-GGUF/resolve/edf81aef93af0823ac8721da3c9cd3c52d539f87/texture/slat_flow_imgshape2tex_dit_1_3B_512_bf16_Q8_0.gguf
+    size: 1426451744
+    sha256: ed803025b96c609db6dbbf65ab3cc676d3fedab3cdc6231e67a3e085e5f421f0
+    path: trellis2/texture/slat_flow_imgshape2tex_dit_1_3B_512_bf16_Q8_0.gguf
+  tex_dec: trellis2-tex-dec
+  remover: birefnet
+guide: guides/trellis2.md

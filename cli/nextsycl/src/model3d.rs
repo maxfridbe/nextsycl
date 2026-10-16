@@ -24,12 +24,14 @@ nextsycl model3d check <dump dir> [--model ID] [--stages pre,cond,dit,steps,vae,
                    maps,pic,dino,enc,dual,unet,unipc,steps,decode
 nextsycl model3d check <dump dir> --model ID [--stages a,b,...] [--mesh FILE.obj] [--prompt TEXT] [--gpu N]
                    an engine's stages against its reference's dumps (reference/<arch>/)
+nextsycl model3d check DUMP_DIR [--model ID] [--stages pre,remover,dino,ss,ssdec,shape,cascade,tex,sdec,tdec] [--full] [--picture FILE] [--gpu N]
+                   an engine's stages against reference/trellis2/ref.py's dumps
 nextsycl model3d engines | selftest [--gpu N]";
 
 /// The 3D engines this program has (model3d/<arch>)
 pub fn engines() -> Vec<nextsycl_model3d::Model3dKind> {
-    vec![nextsycl_model3d_hunyuan3d::kind(), nextsycl_model3d_unirig::kind(), nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(),
-         nextsycl_model3d_example::kind()]
+    vec![nextsycl_model3d_trellis2::kind(), nextsycl_model3d_trellis2::kind_pixal(), nextsycl_model3d_hunyuan3d::kind(), nextsycl_model3d_unirig::kind(),
+         nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -42,7 +44,7 @@ fn num<T: std::str::FromStr>(args: &[String], k: &str) -> Result<Option<T>, Stri
 
 /// The arguments that are not options or option values (the files)
 fn positional(args: &[String]) -> Vec<String> {
-    const FLAGS: &[&str] = &["--texture", "--no-texture", "--keep-background", "--here", "--wfe", "-f"];
+    const FLAGS: &[&str] = &["--texture", "--no-texture", "--keep-background", "--here", "--wfe", "-f", "--full"];
     let mut out = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -275,6 +277,7 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let stages = |all: &'static str| -> Vec<String> { opt(args, "--stages").unwrap_or(all).split(',').map(str::to_string).collect() };
     let worst = match m["arch"].as_str().unwrap_or("") {
         nextsycl_model3d_hunyuan3d::ARCH_21 | nextsycl_model3d_hunyuan3d::ARCH_MINI => return check_hunyuan3d(cfg, args),
+        nextsycl_model3d_trellis2::ARCH | nextsycl_model3d_trellis2::ARCH_PIXAL => return check_trellis2(cfg, args),
         nextsycl_model3d_animateanymesh::ARCH => {
             let e = nextsycl_model3d_animateanymesh::AnimateAnyMesh::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
             let st = stages("embed,fps,enc,clip,dit,dec");
@@ -297,6 +300,28 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         a => return Err(format!("check knows {}, {}, {}, {} and {} (not {a})", nextsycl_model3d_hunyuan3d::ARCH_21, nextsycl_model3d_hunyuan3d::ARCH_MINI,
                                 nextsycl_model3d_animateanymesh::ARCH, nextsycl_model3d_unirig::ARCH, nextsycl_model3d_rignet::ARCH)),
     };
+    println!("worst relative error {worst:.2e}");
+    Ok(())
+}
+
+/// `nextsycl model3d check DIR`: the engine's stages against a reference's dumps (TRELLIS.2 / Pixal3D)
+fn check_trellis2(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let dir = Path::new(positional(args).into_iter().next().ok_or(USAGE)?.as_str()).to_path_buf();
+    nextsycl_core::use_kind("model3d");
+    let (m, files) = model(cfg, args, "generate")?;
+    let arch = m["arch"].as_str().unwrap_or("");
+    if arch != nextsycl_model3d_trellis2::ARCH && arch != nextsycl_model3d_trellis2::ARCH_PIXAL {
+        return Err(format!("check knows {} and {}, not {arch}", nextsycl_model3d_trellis2::ARCH, nextsycl_model3d_trellis2::ARCH_PIXAL));
+    }
+    let arch = if arch == nextsycl_model3d_trellis2::ARCH { nextsycl_model3d_trellis2::ARCH } else { nextsycl_model3d_trellis2::ARCH_PIXAL };
+    let stages: Vec<&str> = opt(args, "--stages").unwrap_or("dino,ss,ssdec,shape,tex,sdec,tdec").split(',').collect();
+    let pic = opt(args, "--picture").map(|p| -> Result<nextsycl_model3d_trellis2::Picture, String> {
+        nextsycl_model3d_trellis2::Picture::decode(&std::fs::read(p).map_err(|e| format!("{p}: {e}"))?)
+    }).transpose()?;
+    let g = gpu(args)?;
+    let mut log = |s: String| eprintln!("{s}");
+    let e = nextsycl_model3d_trellis2::Trellis2::load(arch, &files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+    let worst = nextsycl_model3d_trellis2::check::run(&e, &dir, pic.as_ref(), &stages, args.iter().any(|a| a == "--full"), &mut log).map_err(|e| e.0)?;
     println!("worst relative error {worst:.2e}");
     Ok(())
 }

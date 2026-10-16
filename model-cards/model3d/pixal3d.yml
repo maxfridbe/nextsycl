@@ -1,0 +1,48 @@
+# Pixal3D Q8_0 (one picture to a textured mesh, pixel-aligned; the 1024 cascade; MIT)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: pixal3d
+kind: model3d
+arch: pixal3d
+title: 'Pixal3D Q8_0 (picture to textured mesh, pixel-aligned TRELLIS.2; the 1024 cascade; MIT)'
+about: Tencent ARC's Pixal3D from Aero-Ex's GGUFs - TRELLIS.2's pipeline whose flows also read DINOv3 features sampled where each voxel projects into the picture (a pinhole camera of the picture's field of view, --opt-fov, default 49 degrees; MoGe-2's estimate is not ported), so the mesh follows the picture closely; NAF's upsampled half of the features is the low-res ones again (not ported); TRELLIS.2's DINOv3, decoders and BiRefNet
+gpus: '0'
+vram_gib: 6.0                    # its memory on the card when it runs: the peak measured 4.6 GiB on a B70 (models load stage by stage)
+does: [generate, texture]
+env: {}
+files:
+  pipeline:
+    key: pixal3d-pipeline
+    url: https://huggingface.co/Aero-Ex/Pixal3D-GGUF/resolve/1c2630e408cde95f7bac9c65028404aa49796065/pipeline.json
+    size: 4068
+    sha256: 1647217de06e32477702d14895e826fea73497d94537b809a53637f13482a237
+    path: pixal3d/pipeline.json
+  dino: trellis2-dinov3-vitl16
+  ss_flow:
+    key: pixal3d-ss-flow-q8
+    url: https://huggingface.co/Aero-Ex/Pixal3D-GGUF/resolve/1c2630e408cde95f7bac9c65028404aa49796065/Sparse/ss_flow_img_dit_1_3B_64_bf16_Q8_0.gguf
+    size: 1427084032
+    sha256: 6551ab0381262db6b2a6a2e351f18f7462583d2b064ca9d0b89e4410ef73f16d
+    path: pixal3d/Sparse/ss_flow_img_dit_1_3B_64_bf16_Q8_0.gguf
+  ss_dec: trellis2-ss-dec
+  shape_flow_512:
+    key: pixal3d-shape-flow-512-q8
+    url: https://huggingface.co/Aero-Ex/Pixal3D-GGUF/resolve/1c2630e408cde95f7bac9c65028404aa49796065/shape/slat_flow_img2shape_dit_1_3B_512_bf16_Q8_0.gguf
+    size: 1476761184
+    sha256: 651dc94f65bf8af0ddd1e6c5c266c496f1cd61c03f965acaaf53d92bc6f4912f
+    path: pixal3d/shape/slat_flow_img2shape_dit_1_3B_512_bf16_Q8_0.gguf
+  shape_flow_1024:
+    key: pixal3d-shape-flow-1024-q8
+    url: https://huggingface.co/Aero-Ex/Pixal3D-GGUF/resolve/1c2630e408cde95f7bac9c65028404aa49796065/shape/slat_flow_img2shape_dit_1_3B_1024_bf16_Q8_0.gguf
+    size: 1476761184
+    sha256: 7ce2303bb03fcbb8ec435d76be34dcbe21f1b3d12a673a818855342b6d5652c8
+    path: pixal3d/shape/slat_flow_img2shape_dit_1_3B_1024_bf16_Q8_0.gguf
+  shape_dec: trellis2-shape-dec
+  tex_flow_1024:
+    key: pixal3d-tex-flow-1024-q8
+    url: https://huggingface.co/Aero-Ex/Pixal3D-GGUF/resolve/1c2630e408cde95f7bac9c65028404aa49796065/texture/slat_flow_imgshape2tex_dit_1_3B_1024_bf16_Q8_0.gguf
+    size: 1476813408
+    sha256: c827e6f5e4b6078434d8c2d054e37424706de1e5587830d5943121cd4ce2dcd8
+    path: pixal3d/texture/slat_flow_imgshape2tex_dit_1_3B_1024_bf16_Q8_0.gguf
+  tex_dec: trellis2-tex-dec
+  remover: birefnet
+guide: guides/pixal3d.md

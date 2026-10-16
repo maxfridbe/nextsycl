@@ -151,6 +151,12 @@ fn bicubic(x: f64) -> f64 {
     }
 }
 
+/// PIL's bilinear (triangle) kernel
+fn bilinear(x: f64) -> f64 {
+    let x = x.abs();
+    if x < 1.0 { 1.0 - x } else { 0.0 }
+}
+
 /// PIL's 8-bit resampling coefficients for one axis (ImagingResample, Lanczos-3), see `coeffs_with`
 fn coeffs(inp: usize, out: usize) -> Vec<(usize, Vec<i64>)> {
     coeffs_with(inp, out, 3.0, lanczos)
@@ -188,6 +194,12 @@ impl Picture {
     /// resize use) - the same passes as `resize_lanczos`
     pub fn resize_bicubic(&self, w: u32, h: u32) -> Picture {
         self.resample(w, h, |i, o| coeffs_with(i, o, 2.0, bicubic))
+    }
+
+    /// Resized to `w` x `h` as PIL's Image.resize with BILINEAR does it (torchvision's Resize of a PIL picture) - the
+    /// same passes as `resize_lanczos`
+    pub fn resize_bilinear(&self, w: u32, h: u32) -> Picture {
+        self.resample(w, h, |i, o| coeffs_with(i, o, 1.0, bilinear))
     }
 
     fn resample(&self, w: u32, h: u32, coeffs: impl Fn(usize, usize) -> Vec<(usize, Vec<i64>)>) -> Picture {
