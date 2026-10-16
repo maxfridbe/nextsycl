@@ -296,10 +296,16 @@ impl Model3dEngine for AnimateAnyMesh {
             None => self.traj.unwrap_or_else(|| MIN_TRAJ.max(n / 8)),
         }.max(1);
         progress(Step { phase: "encode", at: 0, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
+        prof::reset_clock(&self.ops.nsd)?;
         let (sh, _) = self.shape(&p)?;
+        prof::mark(&self.ops.nsd, "vae shape")?;
         let (_, idx) = self.sample_tokens(&sh, k, req.seed)?;
+        prof::mark(&self.ops.nsd, "vae farthest points")?;
         let f0 = self.f0(&sh, &idx)?;
+        prof::mark(&self.ops.nsd, "vae encode")?;
         let text = self.text(prompt)?;
+        prof::mark(&self.ops.nsd, "clip")?;
+        prof::report(&mut |s| eprintln!("{s}"));
         progress(Step { phase: "encode", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
         let noise = ops::noise(req.seed, k * dit::CHANNELS);
         let y = self.sample(&text, &f0, &noise, steps, cfg, progress, t0, &mut |_, _| Ok(()))?;
@@ -309,7 +315,10 @@ impl Model3dEngine for AnimateAnyMesh {
         for (r, f) in s.chunks_exact_mut(dit::CHANNELS).zip(f0h.chunks_exact(vae::LATENT)) {
             r[..vae::LATENT].copy_from_slice(f);
         }
+        prof::reset_clock(&self.ops.nsd)?;
         let off = self.decode(&sh, &s)?;
+        prof::mark(&self.ops.nsd, "vae decode")?;
+        prof::report(&mut |s| eprintln!("{s}"));
         let mut out = Vec::with_capacity(vae::FRAMES);
         for t in 0..vae::FRAMES {
             let merged: Vec<[f32; 3]> = (0..n).map(|v| {
