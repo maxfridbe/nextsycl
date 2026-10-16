@@ -8,6 +8,7 @@ use nextsycl_model3d::{Error, Result};
 
 use crate::ffi::RELU;
 use crate::ops::{Lin, Ln, Ops, Weights};
+use crate::prof::mark;
 use crate::tokens::VOCAB;
 
 pub const WIDTH: usize = 1024;
@@ -180,6 +181,7 @@ impl Opt {
         }
         let x = self.embed(o, tokens)?;
         self.add_positions(o, &x, b, pos, true)?;
+        mark(&o.nsd, "decoder embed")?;
         let hd = WIDTH / HEADS;
         let (t, q, kk, vv, a, h) = (o.buf(b * WIDTH)?, o.buf(b * WIDTH)?, o.buf(b * WIDTH)?, o.buf(b * WIDTH)?, o.buf(b * WIDTH)?, o.buf(b * FFN)?);
         let fresh: Vec<i32> = (0..b).map(|i| (pool.used + i) as i32).collect();
@@ -189,14 +191,20 @@ impl Opt {
             o.linear(&t, b, &ly.q, &q)?;
             o.linear(&t, b, &ly.k, &kk)?;
             o.linear(&t, b, &ly.v, &vv)?;
+            mark(&o.nsd, "decoder qkv")?;
             o.k.scatter(&kk, &fresh, b, WIDTH, &pool.k[li])?;
             o.k.scatter(&vv, &fresh, b, WIDTH, &pool.v[li])?;
             o.k.attn_slots(&q, &pool.k[li], &pool.v[li], slots, stride, pos + 1, b, HEADS, hd, 1.0 / (hd as f32).sqrt(), &a)?;
+            mark(&o.nsd, "decoder attention")?;
             o.linear(&a, b, &ly.o, &t)?;
             o.k.add(&x, &t, b * WIDTH)?;
+            mark(&o.nsd, "decoder out")?;
             self.ffn(o, ly, &x, b, &t, &h)?;
+            mark(&o.nsd, "decoder ffn")?;
         }
         pool.used += b;
-        self.logits(o, &x, b)
+        let l = self.logits(o, &x, b);
+        mark(&o.nsd, "decoder logits")?;
+        l
     }
 }

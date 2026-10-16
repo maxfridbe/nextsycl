@@ -23,8 +23,8 @@ pub fn voxel_skin(v: &[[f32; 3]], f: &[[u32; 3]], joints: &[[f32; 3]], grid: usi
     let (c, s) = crate::prep::normalization(v.iter().copied());
     let nv: Vec<[f32; 3]> = v.iter().map(|p| crate::prep::apply(*p, c, s)).collect();
     let nj: Vec<[f32; 3]> = joints.iter().map(|p| crate::prep::apply(*p, c, s)).collect();
-    let vox = voxelize(&nv, f, grid);
-    let d = distances(&nv, f, &vox, &nj, grid);
+    let (vox, cells) = voxelize_cells(&nv, f, grid);
+    let d = distances(&nv, f, &vox, &cells, &nj, grid);
     weights(&d, n, &nv, &nj)
 }
 
@@ -81,10 +81,16 @@ fn hits(v: &[[f32; 3]], f: &[[u32; 3]], axis: usize, g: usize) -> (Vec<f32>, Vec
 
 /// The solid voxels: their centres (UniRig's convention: (c(i), c(j), c(g - 1 - k)))
 pub fn voxelize(v: &[[f32; 3]], f: &[[u32; 3]], g: usize) -> Vec<[f32; 3]> {
+    voxelize_cells(v, f, g).0
+}
+
+/// The solid voxels: their centres, and each one's cell on the grid (i, j, g - 1 - k: where its centre is)
+fn voxelize_cells(v: &[[f32; 3]], f: &[[u32; 3]], g: usize) -> (Vec<[f32; 3]>, Vec<[u16; 3]>) {
     let (xl, xh) = hits(v, f, 0, g); // rays along x, indexed (y, z)
     let (yl, yh) = hits(v, f, 1, g); // along y, indexed (x, z)
     let (zl, zh) = hits(v, f, 2, g); // along z, indexed (x, y)
     let mut out = Vec::new();
+    let mut cells = Vec::new();
     for i in 0..g {
         let ci = centre(i, g);
         for j in 0..g {
@@ -99,11 +105,12 @@ pub fn voxelize(v: &[[f32; 3]], f: &[[u32; 3]], g: usize) -> Vec<[f32; 3]> {
                 let mz = { let r = i * g + j; zl[r] <= ck && ck <= zh[r] };
                 if (mx && my) || (mx && mz) || (my && mz) {
                     out.push([ci, cj, gz]);
+                    cells.push([i as u16, j as u16, kz as u16]);
                 }
             }
         }
     }
-    out
+    (out, cells)
 }
 
 fn d3(a: [f32; 3], b: [f32; 3]) -> f64 {
@@ -111,73 +118,179 @@ fn d3(a: [f32; 3], b: [f32; 3]) -> f64 {
     (x * x + y * y + z * z).sqrt()
 }
 
-/// A uniform grid of points for nearest-neighbour queries within a few cells
+/// A uniform grid of points for nearest-neighbour queries within a few cells (a coordinate's cell: (x / cell).floor()):
+/// dense over the points' box when that is small, else the occupied cells sorted; each cell's points in their order
 struct Cells {
     cell: f32,
-    map: HashMap<[i32; 3], Vec<u32>>,
+    lo: [i32; 3],
+    dim: [usize; 3],
+    /// dense: every cell of the box; sparse: the occupied cells' keys, sorted
+    keys: Option<Vec<[i32; 3]>>,
+    start: Vec<u32>,
+    pts: Vec<u32>,
 }
 
 impl Cells {
     fn new(pts: &[[f32; 3]], cell: f32) -> Cells {
-        let mut map: HashMap<[i32; 3], Vec<u32>> = HashMap::new();
-        for (i, p) in pts.iter().enumerate() {
-            map.entry(Self::key(*p, cell)).or_default().push(i as u32);
+        let keys: Vec<[i32; 3]> = pts.iter().map(|p| Self::key(*p, cell)).collect();
+        if keys.is_empty() {
+            return Cells { cell, lo: [0; 3], dim: [0; 3], keys: None, start: vec![0], pts: Vec::new() };
         }
-        Cells { cell, map }
+        let mut lo = [i32::MAX; 3];
+        let mut hi = [i32::MIN; 3];
+        for k in &keys {
+            for c in 0..3 {
+                lo[c] = lo[c].min(k[c]);
+                hi[c] = hi[c].max(k[c]);
+            }
+        }
+        let dim = [0, 1, 2].map(|c| (hi[c] as i64 - lo[c] as i64) as usize + 1);
+        let total = dim[0].saturating_mul(dim[1]).saturating_mul(dim[2]);
+        if total > (16 << 20).max(8 * pts.len()) {
+            let mut order: Vec<u32> = (0..pts.len() as u32).collect();
+            order.sort_by_key(|&i| (keys[i as usize], i));
+            let mut uk: Vec<[i32; 3]> = Vec::new();
+            let mut start = Vec::new();
+            for (r, &i) in order.iter().enumerate() {
+                if uk.last() != Some(&keys[i as usize]) {
+                    uk.push(keys[i as usize]);
+                    start.push(r as u32);
+                }
+            }
+            start.push(order.len() as u32);
+            return Cells { cell, lo, dim, keys: Some(uk), start, pts: order };
+        }
+        let at = |k: &[i32; 3]| ((k[0] - lo[0]) as usize * dim[1] + (k[1] - lo[1]) as usize) * dim[2] + (k[2] - lo[2]) as usize;
+        let mut start = vec![0u32; total + 1];
+        for k in &keys {
+            start[at(k) + 1] += 1;
+        }
+        for i in 0..total {
+            start[i + 1] += start[i];
+        }
+        let mut fill = start.clone();
+        let mut out = vec![0u32; keys.len()];
+        for (i, k) in keys.iter().enumerate() {
+            let c = at(k);
+            out[fill[c] as usize] = i as u32;
+            fill[c] += 1;
+        }
+        Cells { cell, lo, dim, keys: None, start, pts: out }
     }
     fn key(p: [f32; 3], cell: f32) -> [i32; 3] {
         p.map(|x| (x / cell).floor() as i32)
+    }
+    /// The points of one cell
+    fn of(&self, q: [i32; 3]) -> &[u32] {
+        let at = match &self.keys {
+            Some(k) => match k.binary_search(&q) {
+                Ok(i) => i,
+                Err(_) => return &[],
+            },
+            None => {
+                let r = [0, 1, 2].map(|c| q[c] as i64 - self.lo[c] as i64);
+                if (0..3).any(|c| r[c] < 0 || r[c] >= self.dim[c] as i64) {
+                    return &[];
+                }
+                (r[0] as usize * self.dim[1] + r[1] as usize) * self.dim[2] + r[2] as usize
+            }
+        };
+        &self.pts[self.start[at] as usize..self.start[at + 1] as usize]
     }
     /// Points within the 3 x 3 x 3 cells around p
     fn near(&self, p: [f32; 3]) -> impl Iterator<Item = u32> + '_ {
         let k = Self::key(p, self.cell);
         (-1..=1).flat_map(move |a| (-1..=1).flat_map(move |b| (-1..=1).map(move |c| [k[0] + a, k[1] + b, k[2] + c])))
-            .filter_map(|q| self.map.get(&q)).flatten().copied()
+            .flat_map(move |q| self.of(q)).copied()
     }
 }
 
-/// Shortest paths from each joint (its nearest node) over the graph of the mesh and the voxels: [J, N] for the mesh's
-/// vertices (inf: unreachable)
-pub fn distances(v: &[[f32; 3]], f: &[[u32; 3]], vox: &[[f32; 3]], joints: &[[f32; 3]], g: usize) -> Vec<Vec<f64>> {
+/// The threads the CPU stages use
+fn threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).min(32)
+}
+
+/// [f(0), f(1), ... f(n - 1)], computed on the machine's threads
+fn par_map<T: Send + Clone + Default>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let mut out = vec![T::default(); n];
+    let per = n.div_ceil(threads()).max(4096);
+    std::thread::scope(|sc| {
+        for (c, ch) in out.chunks_mut(per).enumerate() {
+            let f = &f;
+            sc.spawn(move || {
+                for (k, slot) in ch.iter_mut().enumerate() {
+                    *slot = f(c * per + k);
+                }
+            });
+        }
+    });
+    out
+}
+
+/// No edge (a voxel's missing neighbour or link)
+const NONE: u32 = u32::MAX;
+
+/// Shortest paths from each joint (its nearest node) over the graph of the mesh and the voxels (`cells`: each voxel's
+/// place on the grid): [J, N] for the mesh's vertices (inf: unreachable)
+pub fn distances(v: &[[f32; 3]], f: &[[u32; 3]], vox: &[[f32; 3]], cells: &[[u16; 3]], joints: &[[f32; 3]], g: usize) -> Vec<Vec<f64>> {
     let n = v.len();
     let m = vox.len();
     let h = 2.0 / g as f32;
     let reach = h as f64 * 1.001;
-    // directed edges, summed when repeated (scipy's csr_matrix); then undirected as the smaller of both directions
-    let mut w: HashMap<(u32, u32), f64> = HashMap::new();
-    let mut add = |a: usize, b: usize, d: f64| *w.entry((a as u32, b as u32)).or_insert(0.0) += d;
-    // voxels to their axis neighbours, 3x their distance
-    let vc = Cells::new(vox, h);
-    for (i, p) in vox.iter().enumerate() {
-        for q in vc.near(*p) {
-            let d = d3(*p, vox[q as usize]);
-            if q as usize != i && d > 0.0 && d < reach {
-                add(n + i, n + q as usize, d * 3.0);
+    // The graph is the reference's: directed edges summed when repeated (scipy's csr_matrix), then undirected as
+    // the smaller of both directions. Voxel to voxel: the axis neighbours on the grid (the only voxels within
+    // reach), 3x their distance, the same both ways; each voxel to its nearest vertex within reach, one way. Neither
+    // kind repeats, so they go into the adjacency as they are; the vertices' own edges through a map.
+    let mut grid = vec![NONE; g * g * g];
+    for (i, c) in cells.iter().enumerate() {
+        grid[(c[0] as usize * g + c[1] as usize) * g + c[2] as usize] = i as u32;
+    }
+    let vnb: Vec<[(u32, f64); 6]> = par_map(m, |i| {
+        let c = cells[i];
+        let mut out = [(NONE, 0.0); 6];
+        for (s, (axis, step)) in [(0, -1i32), (0, 1), (1, -1), (1, 1), (2, -1), (2, 1)].into_iter().enumerate() {
+            let t = c[axis] as i32 + step;
+            if t < 0 || t >= g as i32 {
+                continue;
+            }
+            let mut q = c;
+            q[axis] = t as u16;
+            let o = grid[(q[0] as usize * g + q[1] as usize) * g + q[2] as usize];
+            if o != NONE {
+                let d = d3(vox[i], vox[o as usize]);
+                if d > 0.0 && d < reach {
+                    out[s] = ((n + o as usize) as u32, d * 3.0);
+                }
             }
         }
-    }
-    // vertices to vertices closer than 1e-5 (at most 3 a vertex)
-    let link = 1e-5f32;
-    let lc = Cells::new(v, link);
+        out
+    });
+    drop(grid);
+    // each voxel to its nearest vertex, when within reach
+    let mc = Cells::new(v, h);
+    let link: Vec<(u32, f64)> = par_map(m, |i| {
+        let p = vox[i];
+        match mc.near(p).map(|q| (d3(p, v[q as usize]), q)).min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))) {
+            Some((d, q)) if d > 0.0 && d < reach => (q, d),
+            _ => (NONE, 0.0),
+        }
+    });
+    drop(mc);
+    // between vertices: those closer than 1e-5 (at most 3 a vertex), and the mesh's edges (float32 lengths, as numpy)
+    let mut w: HashMap<(u32, u32), f64> = HashMap::new();
+    let mut add = |a: usize, b: usize, d: f64| *w.entry((a as u32, b as u32)).or_insert(0.0) += d;
+    let lk = 1e-5f32;
+    let lc = Cells::new(v, lk);
     for (i, p) in v.iter().enumerate() {
         let mut near: Vec<(f64, u32)> = lc.near(*p).filter(|&q| q as usize != i).map(|q| (d3(*p, v[q as usize]), q)).collect();
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (d, q) in near.into_iter().take(3) {
-            if d > 0.0 && d < link as f64 * 1.001 {
+            if d > 0.0 && d < lk as f64 * 1.001 {
                 add(i, q as usize, d);
             }
         }
     }
-    // each voxel to its nearest vertex, when within reach
-    let mc = Cells::new(v, h);
-    for (i, p) in vox.iter().enumerate() {
-        if let Some((d, q)) = mc.near(*p).map(|q| (d3(*p, v[q as usize]), q)).min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))) {
-            if d > 0.0 && d < reach {
-                add(n + i, q as usize, d);
-            }
-        }
-    }
-    // the mesh's edges (float32 lengths, as numpy)
+    drop(lc);
     for t in f {
         for k in 0..3 {
             let (a, b) = (t[k] as usize, t[(k + 1) % 3] as usize);
@@ -186,31 +299,52 @@ pub fn distances(v: &[[f32; 3]], f: &[[u32; 3]], vox: &[[f32; 3]], joints: &[[f3
             add(a, b, l as f64);
         }
     }
-    // undirected adjacency: an edge's weight the smaller of its two directions
     let mut und: HashMap<(u32, u32), f64> = HashMap::with_capacity(w.len());
     for (&(a, b), &d) in &w {
         let key = (a.min(b), a.max(b));
         let e = und.entry(key).or_insert(f64::INFINITY);
         *e = e.min(d);
     }
+    drop(w);
+    // the adjacency (CSR)
     let total = n + m;
-    let mut deg = vec![0u32; total + 1];
+    let mut deg = vec![0usize; total];
     for &(a, b) in und.keys() {
         deg[a as usize] += 1;
         deg[b as usize] += 1;
     }
+    for (i, (nb, &(q, _))) in vnb.iter().zip(&link).enumerate() {
+        deg[n + i] += nb.iter().filter(|e| e.0 != NONE).count();
+        if q != NONE {
+            deg[n + i] += 1;
+            deg[q as usize] += 1;
+        }
+    }
     let mut start = vec![0usize; total + 1];
     for i in 0..total {
-        start[i + 1] = start[i] + deg[i] as usize;
+        start[i + 1] = start[i] + deg[i];
     }
+    drop(deg);
     let mut fill = start.clone();
     let mut adj = vec![(0u32, 0f64); start[total]];
+    let mut put = |a: usize, e: (u32, f64)| {
+        adj[fill[a]] = e;
+        fill[a] += 1;
+    };
     for (&(a, b), &d) in &und {
-        adj[fill[a as usize]] = (b, d);
-        fill[a as usize] += 1;
-        adj[fill[b as usize]] = (a, d);
-        fill[b as usize] += 1;
+        put(a as usize, (b, d));
+        put(b as usize, (a, d));
     }
+    for (i, (nb, &(q, d))) in vnb.iter().zip(&link).enumerate() {
+        for &e in nb.iter().filter(|e| e.0 != NONE) {
+            put(n + i, e);
+        }
+        if q != NONE {
+            put(n + i, (q, d));
+            put(q as usize, ((n + i) as u32, d));
+        }
+    }
+    drop((vnb, link, und));
     // each joint's nearest node, vertices and voxels together
     let nodes: Vec<usize> = joints.iter().map(|j| {
         let mut best = (f64::INFINITY, 0usize);
@@ -223,7 +357,7 @@ pub fn distances(v: &[[f32; 3]], f: &[[u32; 3]], vox: &[[f32; 3]], joints: &[[f3
         best.1
     }).collect();
     // Dijkstra from each, in parallel
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    let threads = threads().min(joints.len().max(1));
     let mut out: Vec<Vec<f64>> = vec![Vec::new(); joints.len()];
     std::thread::scope(|sc| {
         let chunks: Vec<(usize, &mut [Vec<f64>])> = {

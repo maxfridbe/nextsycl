@@ -155,6 +155,7 @@ impl UniRig {
         x.copy_within(0, prefix, 0, l0 * opt::WIDTH * 4)?;
         let first = self.opt.prefill(o, &x, l0, &mut pool, 1)?;
         drop(x);
+        prof::mark(&o.nsd, "decoder prefill")?;
         let stride = l0 + max_new + 1;
         // each beam's slots: the prefix's, then its own
         let mut hist: Vec<Vec<i32>> = vec![(0..l0 as i32).collect(); nb];
@@ -182,9 +183,11 @@ impl UniRig {
         let mut logits: Vec<f32> = (0..nb).flat_map(|_| first.iter().copied()).collect();
         loop {
             let st = beams.step(&logits, rng);
+            prof::mark(&o.nsd, "decoder search (host)")?;
             progress(beams.running[0].len())?;
             if beams.done {
                 prof::used(&o.nsd, "at the skeleton decoder's end");
+                prof::report(&mut |s| eprintln!("{s}"));
                 return Ok(beams.best());
             }
             if pool.used + nb > pool.cap {
@@ -220,7 +223,9 @@ impl UniRig {
         let (ind, fps) = encoder::queries(&sm.pts, rng);
         let q: Vec<usize> = fps.iter().map(|&i| ind[i]).collect();
         progress(at("skeleton", 0, 1))?;
+        prof::reset_clock(&self.ops.nsd)?;
         let (_, prefix) = self.prefix(&sm.pts, &sm.nrm, &q)?;
+        prof::mark(&self.ops.nsd, "skeleton encoder")?;
         let st = if beams <= 1 { search::Settings { beams: 1, sample: false, ..Default::default() } } else { search::Settings { beams, ..Default::default() } };
         let gen = self.generate(&prefix, st, rng, &mut |n| progress(at("skeleton", n, n + 1)))?;
         drop(prefix);

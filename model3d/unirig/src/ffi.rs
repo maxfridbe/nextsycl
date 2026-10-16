@@ -77,6 +77,8 @@ pub struct Silo {
     pub path: std::path::PathBuf,
     attention_supported: unsafe extern "C" fn(i64, i64, c_int) -> c_int,
     attention: unsafe extern "C" fn(G, F, i64, i64, F, i64, i64, F, i64, i64, i64, i64, i64, i64, i64, i64, f32, c_int, O, i64, O, i64) -> c_int,
+    attn_slots_supported: unsafe extern "C" fn(i64, i64) -> c_int,
+    attn_slots: unsafe extern "C" fn(G, F, F, F, I, i64, i64, i64, i64, i64, f32, O) -> c_int,
 }
 
 // SAFETY: function pointers into a library that stays loaded for the process.
@@ -105,6 +107,8 @@ pub fn silo() -> Result<Option<&'static Silo>> {
             path: lib.path.clone(),
             attention_supported: sym!("ns_model3d_unirig_silo_attention_supported"),
             attention: sym!("ns_model3d_unirig_silo_attention"),
+            attn_slots_supported: sym!("ns_model3d_unirig_silo_attn_slots_supported"),
+            attn_slots: sym!("ns_model3d_unirig_silo_attn_slots"),
         }))
     })
     .as_ref()
@@ -204,7 +208,13 @@ impl K {
     #[allow(clippy::too_many_arguments)]
     pub fn attn_slots(&self, q: &DevBuf, kpool: &DevBuf, vpool: &DevBuf, slots: &DevBuf, stride: usize, len: usize, b: usize, h: usize, d: usize,
                       scale: f32, out: &DevBuf) -> Result<()> {
-        // SAFETY: q and out hold b h d floats; the slots name rows of the pools.
+        // SAFETY (both): q and out hold b h d floats; the slots name rows of the pools.
+        if let Some(s) = self.silo.filter(|s| unsafe { (s.attn_slots_supported)(d as i64, len as i64) } == 1) {
+            return check(unsafe {
+                (s.attn_slots)(self.g, q.fp(), kpool.fp(), vpool.fp(), slots.ptr() as I, stride as i64, len as i64, b as i64, h as i64, d as i64, scale,
+                               out.fp())
+            }, "slot attention (silo)");
+        }
         check(unsafe {
             (self.k.attn_slots)(self.g, q.fp(), kpool.fp(), vpool.fp(), slots.ptr() as I, stride as i64, len as i64, b as i64, h as i64, d as i64, scale,
                                 out.fp())
