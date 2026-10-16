@@ -1,0 +1,73 @@
+# TRELLIS.2 4B Q8_0 (one picture to a textured mesh; the 1024 cascade; MIT)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: trellis2
+kind: model3d
+arch: trellis2
+title: 'TRELLIS.2 4B Q8_0 (picture to textured mesh, the 1024 cascade; MIT)'
+about: Microsoft's TRELLIS.2 from Aero-Ex's GGUFs - DINOv3 ViT-L/16, five 1.3B flow transformers (Q8_0) for the sparse structure, the shape at 512 then 1024 and the PBR texture, the fp16 sparse decoders (a dual-grid mesh, PBR voxels baked into base colour and metallic-roughness textures); BiRefNet cuts opaque pictures out
+gpus: '0'
+vram_gib: 10.0                   # its memory on the card when it runs: the 1024 peak measured 9.1 GiB on a B70 (models load stage by stage)
+does: [generate, texture]
+env: {}
+files:
+  pipeline:
+    key: trellis2-pipeline
+    url: https://huggingface.co/Aero-Ex/Trellis2-GGUF/resolve/edf81aef93af0823ac8721da3c9cd3c52d539f87/pipeline.json
+    size: 4186
+    sha256: 222c359ab1ed9bc6735a640a34f95d47f8681b9bc4aaa101bfb80274676253c6
+    path: trellis2/pipeline.json
+  dino:
+    key: trellis2-dinov3-vitl16
+    url: https://huggingface.co/Aero-Ex/Trellis2-GGUF/resolve/edf81aef93af0823ac8721da3c9cd3c52d539f87/Vision/dinov3-vitl16-pretrain-lvd1689m.safetensors
+    size: 1212559808
+    sha256: dcb2e45127cccbf1601e5f42fef165eea275c8e5213197e8dcf3f48822718179
+    path: trellis2/Vision/dinov3-vitl16-pretrain-lvd1689m.safetensors
+  ss_flow:
+    key: trellis2-ss-flow-q8
+    url: https://huggingface.co/Aero-Ex/Trellis2-GGUF/resolve/edf81aef93af0823ac8721da3c9cd3c52d539f87/refiner/ss_flow_img_dit_1_3B_64_bf16_Q8_0.gguf
+    size: 1425960128
+    sha256: 77fe692f2361b82dadcdad202b41118ba5cee18dbd7b4b44900e15bb01f0d88e
+    path: trellis2/refiner/ss_flow_img_dit_1_3B_64_bf16_Q8_0.gguf
+  ss_dec:
+    key: trellis2-ss-dec
+    url: https://huggingface.co/Aero-Ex/Trellis2-GGUF/resolve/edf81aef93af0823ac8721da3c9cd3c52d539f87/decoders/Stage1/ss_dec_conv3d_16l8_fp16.safetensors
+    size: 147591972
+    sha256: 1c76d4a40519aa2d711cc263a8404105231ac26db31d946bed48b84fee79009a
+    path: trellis2/decoders/Stage1/ss_dec_conv3d_16l8_fp16.safetensors
+  shape_flow_512:
+    key: trellis2-shape-flow-512-q8
+    url: https://huggingface.co/Aero-Ex/Trellis2-GGUF/resolve/edf81aef93af0823ac8721da3c9cd3c52d539f87/shape/slat_flow_img2shape_dit_1_3B_512_bf16_Q8_0.gguf
+    size: 1426255136
+    sha256: b4ff432308ef886927b54ad2a42b61126e804f2dd9f3bfa2dfba5a43dc9569db
+    path: trellis2/shape/slat_flow_img2shape_dit_1_3B_512_bf16_Q8_0.gguf
+  shape_flow_1024:
+    key: trellis2-shape-flow-1024-q8
+    url: https://huggingface.co/Aero-Ex/Trellis2-GGUF/resolve/edf81aef93af0823ac8721da3c9cd3c52d539f87/shape/slat_flow_img2shape_dit_1_3B_1024_bf16_Q8_0.gguf
+    size: 1426255136
+    sha256: 6e93d61b657aa2e33c259ec519f993be9d37297499875b78c137c7b954074fa3
+    path: trellis2/shape/slat_flow_img2shape_dit_1_3B_1024_bf16_Q8_0.gguf
+  shape_dec:
+    key: trellis2-shape-dec
+    url: https://huggingface.co/Aero-Ex/Trellis2-GGUF/resolve/edf81aef93af0823ac8721da3c9cd3c52d539f87/decoders/Stage2/shape_dec_next_dc_f16c32_fp16.safetensors
+    size: 948490494
+    sha256: e3b718d3e43e4f8780e9a24ac6fff231811a67e3b058e336e10fe654c911d581
+    path: trellis2/decoders/Stage2/shape_dec_next_dc_f16c32_fp16.safetensors
+  tex_flow_1024:
+    key: trellis2-tex-flow-1024-q8
+    url: https://huggingface.co/Aero-Ex/Trellis2-GGUF/resolve/edf81aef93af0823ac8721da3c9cd3c52d539f87/texture/slat_flow_imgshape2tex_dit_1_3B_1024_bf16_Q8_0.gguf
+    size: 1426451744
+    sha256: 9534022bef479385757b060509260f8583a468a0bdb943ac10deb87984f2c582
+    path: trellis2/texture/slat_flow_imgshape2tex_dit_1_3B_1024_bf16_Q8_0.gguf
+  tex_dec:
+    key: trellis2-tex-dec
+    url: https://huggingface.co/Aero-Ex/Trellis2-GGUF/resolve/edf81aef93af0823ac8721da3c9cd3c52d539f87/decoders/Stage2/tex_dec_next_dc_f16c32_fp16.safetensors
+    size: 948458812
+    sha256: 97ea69addea2ecd9312910f5f548234665eef51c088386180b7cd5b258645e3c
+    path: trellis2/decoders/Stage2/tex_dec_next_dc_f16c32_fp16.safetensors
+  remover:
+    key: birefnet
+    url: https://huggingface.co/ZhengPeng7/BiRefNet/resolve/e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4/model.safetensors
+    size: 444473596
+    sha256: 9ab37426bf4de0567af6b5d21b16151357149139362e6e8992021b8ce356a154
+    path: trellis2/birefnet/model.safetensors
+guide: guides/trellis2.md

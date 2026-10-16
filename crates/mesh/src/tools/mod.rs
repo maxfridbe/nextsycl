@@ -97,6 +97,93 @@ pub fn compact(m: &mut Mesh) {
     }
 }
 
+/// The triangles wound consistently, outward: across every edge two triangles share (a manifold edge) the
+/// neighbour is flipped to run the edge the other way, region by region from a seed; then each connected region whose
+/// signed volume is negative is turned inside out. For meshes whose winding carries no meaning (a dual grid's quads,
+/// marching cubes without signs). Returns how many triangles were flipped.
+pub fn orient(m: &mut Mesh) -> usize {
+    let nt = m.indices.len() / 3;
+    if nt == 0 {
+        return 0;
+    }
+    // every edge as (undirected key, triangle, forward?), sorted: an edge of two entries is manifold
+    let mut e: Vec<(u64, u32, bool)> = Vec::with_capacity(nt * 3);
+    for t in 0..nt {
+        for k in 0..3 {
+            let (a, b) = (m.indices[t * 3 + k], m.indices[t * 3 + (k + 1) % 3]);
+            e.push((((a.min(b) as u64) << 32) | a.max(b) as u64, t as u32, a < b));
+        }
+    }
+    e.sort_unstable_by_key(|x| x.0);
+    // each triangle's neighbours across its manifold edges, and whether the pair runs the edge the same way
+    let mut adj: Vec<Vec<(u32, bool)>> = vec![Vec::new(); nt];
+    let mut i = 0;
+    while i < e.len() {
+        let mut j = i + 1;
+        while j < e.len() && e[j].0 == e[i].0 {
+            j += 1;
+        }
+        if j - i == 2 {
+            let (x, y) = (e[i], e[i + 1]);
+            let same = x.2 == y.2;
+            adj[x.1 as usize].push((y.1, same));
+            adj[y.1 as usize].push((x.1, same));
+        }
+        i = j;
+    }
+    drop(e);
+    let mut flip = vec![false; nt];
+    let mut seen = vec![false; nt];
+    let mut stack = Vec::new();
+    let pos = |i: u32| {
+        let q = m.positions[i as usize];
+        [q[0] as f64, q[1] as f64, q[2] as f64]
+    };
+    for seed in 0..nt {
+        if seen[seed] {
+            continue;
+        }
+        let mut region = vec![seed as u32];
+        seen[seed] = true;
+        stack.push(seed as u32);
+        while let Some(t) = stack.pop() {
+            for &(n, same) in &adj[t as usize] {
+                if !seen[n as usize] {
+                    seen[n as usize] = true;
+                    // the same direction along a shared edge means opposite windings: flip the neighbour
+                    flip[n as usize] = flip[t as usize] ^ same;
+                    region.push(n);
+                    stack.push(n);
+                }
+            }
+        }
+        // the region's signed volume as it would be wound
+        let mut vol = 0f64;
+        for &t in &region {
+            let t = t as usize;
+            let mut v = [m.indices[t * 3], m.indices[t * 3 + 1], m.indices[t * 3 + 2]];
+            if flip[t] {
+                v.swap(1, 2);
+            }
+            let (a, b, c) = (pos(v[0]), pos(v[1]), pos(v[2]));
+            vol += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
+        }
+        if vol < 0.0 {
+            for &t in &region {
+                flip[t as usize] = !flip[t as usize];
+            }
+        }
+    }
+    let mut flipped = 0;
+    for (t, f) in flip.iter().enumerate() {
+        if *f {
+            m.indices.swap(t * 3 + 1, t * 3 + 2);
+            flipped += 1;
+        }
+    }
+    flipped
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use crate::Mesh;
@@ -155,6 +242,23 @@ mod tests {
         assert_eq!(w.positions.len(), testing::sphere(8, 12).positions.len());
         assert_eq!(map.len(), m.positions.len());
         assert!(testing::is_closed_manifold(&w));
+    }
+
+    #[test]
+    fn orient_turns_scrambled_triangles_outward() {
+        let good = testing::sphere(10, 16);
+        let mut m = good.clone();
+        // every third triangle turned around, then the whole surface inside out
+        for t in (0..m.triangles()).step_by(3) {
+            m.indices.swap(t * 3 + 1, t * 3 + 2);
+        }
+        for t in 0..m.triangles() {
+            m.indices.swap(t * 3 + 1, t * 3 + 2);
+        }
+        orient(&mut m);
+        assert!(testing::is_closed_manifold(&m));
+        // as wound as the outward sphere, triangle by triangle
+        assert_eq!(m.indices.chunks(3).zip(good.indices.chunks(3)).filter(|(a, b)| a != b).count(), 0);
     }
 
     #[test]

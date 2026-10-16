@@ -19,11 +19,13 @@ nextsycl model3d tool decimate IN OUT --faces N          quadric decimation (pos
 nextsycl model3d tool remesh IN OUT [--edge X] [--passes N]   isotropic remeshing (even triangles)
 nextsycl model3d tool uv IN OUT [--size N]               a fresh atlas, the old texture or colours baked across
 nextsycl model3d tool convert IN OUT                     GLB <-> OBJ (by the extensions)
+nextsycl model3d check DUMP_DIR [--model ID] [--stages pre,remover,dino,ss,ssdec,shape,cascade,tex,sdec,tdec] [--full] [--picture FILE] [--gpu N]
+                   an engine's stages against reference/trellis2/ref.py's dumps
 nextsycl model3d engines | selftest [--gpu N]";
 
 /// The 3D engines this program has (model3d/<arch>)
 pub fn engines() -> Vec<nextsycl_model3d::Model3dKind> {
-    vec![nextsycl_model3d_example::kind()]
+    vec![nextsycl_model3d_trellis2::kind(), nextsycl_model3d_trellis2::kind_pixal(), nextsycl_model3d_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -36,7 +38,7 @@ fn num<T: std::str::FromStr>(args: &[String], k: &str) -> Result<Option<T>, Stri
 
 /// The arguments that are not options or option values (the files)
 fn positional(args: &[String]) -> Vec<String> {
-    const FLAGS: &[&str] = &["--texture", "--no-texture", "--keep-background", "--here", "--wfe", "-f"];
+    const FLAGS: &[&str] = &["--texture", "--no-texture", "--keep-background", "--here", "--wfe", "-f", "--full"];
     let mut out = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -226,6 +228,28 @@ fn tool(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `nextsycl model3d check DIR`: the engine's stages against a reference's dumps (TRELLIS.2 / Pixal3D)
+fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let dir = Path::new(positional(args).into_iter().next().ok_or(USAGE)?.as_str()).to_path_buf();
+    nextsycl_core::use_kind("model3d");
+    let (m, files) = model(cfg, args, "generate")?;
+    let arch = m["arch"].as_str().unwrap_or("");
+    if arch != nextsycl_model3d_trellis2::ARCH && arch != nextsycl_model3d_trellis2::ARCH_PIXAL {
+        return Err(format!("check knows {} and {}, not {arch}", nextsycl_model3d_trellis2::ARCH, nextsycl_model3d_trellis2::ARCH_PIXAL));
+    }
+    let arch = if arch == nextsycl_model3d_trellis2::ARCH { nextsycl_model3d_trellis2::ARCH } else { nextsycl_model3d_trellis2::ARCH_PIXAL };
+    let stages: Vec<&str> = opt(args, "--stages").unwrap_or("dino,ss,ssdec,shape,tex,sdec,tdec").split(',').collect();
+    let pic = opt(args, "--picture").map(|p| -> Result<nextsycl_model3d_trellis2::Picture, String> {
+        nextsycl_model3d_trellis2::Picture::decode(&std::fs::read(p).map_err(|e| format!("{p}: {e}"))?)
+    }).transpose()?;
+    let g = gpu(args)?;
+    let mut log = |s: String| eprintln!("{s}");
+    let e = nextsycl_model3d_trellis2::Trellis2::load(arch, &files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+    let worst = nextsycl_model3d_trellis2::check::run(&e, &dir, pic.as_ref(), &stages, args.iter().any(|a| a == "--full"), &mut log).map_err(|e| e.0)?;
+    println!("worst relative error {worst:.2e}");
+    Ok(())
+}
+
 /// The 3D server's container (`model3d serve` in the foreground, `model3d start` in the background)
 const SERVED: crate::served::Served = crate::served::Served { name: "nextsycl-model3d", kind: "model3d", port: "8088" };
 
@@ -331,6 +355,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("gen" | "generate") => gen(cfg, rest),
         Some("rig" | "animate") => rig(cfg, rest),
         Some("tool" | "tools") => tool(rest),
+        Some("check") => check(cfg, rest),
         Some("serve") => serve(cfg, rest, false),
         Some("start") => SERVED.start(cfg, rest, |d| serve(cfg, rest, d)),
         Some("ps") => SERVED.ps(cfg, rest),

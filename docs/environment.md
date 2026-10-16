@@ -266,6 +266,8 @@ The `model3d` kind (meshes from pictures, rigging, animation) and its engines' s
 |---|---|---|---|
 | `NS_MODEL3D_OUT` | ~/.local/share/nextsycl/model3d | where meshes (GLB, with their picture and settings beside them) and 3D uploads are kept | cli (model3d), serve |
 | `NS_M3D_*` | - | every NS_M3D_ setting in nextsycl.conf is passed to the 3D server | cli (model3d serve) |
+| `NS_M3D_T2_PROFILE` | off | TRELLIS.2 / Pixal3D: set: each stage's time and the card's memory on stderr, and the run's peak (the card's free memory watched every 50 ms) (--opt-profile) | model3d trellis2 |
+| `NS_M3D_T2_RESIDENT` | off | TRELLIS.2 / Pixal3D: set: every model stays loaded after its stage (faster repeats; ~11 GiB of weights on the card) - by default each stage loads its model and drops it after (--opt-resident) | model3d trellis2 |
 
 ## Diffusion kernels: `NSD_*`
 
