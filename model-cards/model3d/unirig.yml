@@ -1,0 +1,25 @@
+# UniRig (a skeleton and skin weights for a mesh; MIT)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: unirig
+kind: model3d
+arch: unirig
+title: 'UniRig (a skeleton and skin weights for any mesh: characters, animals, objects; MIT)'
+about: VAST-AI, SIGGRAPH 2025 - the skeleton from an OPT-350m-shaped autoregressive decoder over a Michelangelo shape encoding (beam search with sampling, as UniRig's inference), the skin weights from Point Transformer V3, bone attention and a voxel geodesic prior; float32. The skin checkpoint is read as published (its optimizer state skipped, never loaded)
+does: [rig]
+gpus: '0'
+vram_gib: 5.5                    # measured 4.6 GiB on a B70 rigging a 7.6K-vertex humanoid (the weights 2.9; the beams' key / value pool grows with longer skeletons)
+env: {}
+files:
+  skeleton:
+    key: unirig-skeleton-axl-256
+    url: https://huggingface.co/VAST-AI/UniRig/resolve/36842e2b5947e9e60f89275b83208c8e74071c63/skeleton/articulation-xl_quantization_256/model.ckpt
+    size: 1439617174
+    sha256: d8cf9b42d56e7bc316d293597ecf8c4c39a8631cdd44a261ecf388242fabd0f4
+    path: unirig/skeleton/articulation-xl_quantization_256/model.ckpt
+  skin:
+    key: unirig-skin-axl
+    url: https://huggingface.co/VAST-AI/UniRig/resolve/36842e2b5947e9e60f89275b83208c8e74071c63/skin/articulation-xl/model.ckpt
+    size: 4375464854
+    sha256: 9d40cf42fb9d4c10d8b373d9f4f557c6fbbc5ebacae7ae6b3dce5a0d8a18bc33
+    path: unirig/skin/articulation-xl/model.ckpt
+guide: guides/unirig.md

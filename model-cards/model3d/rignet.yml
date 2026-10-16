@@ -1,0 +1,22 @@
+# RigNet (a skeleton and skin weights for a character mesh; GPLv3)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: rignet
+kind: model3d
+arch: rignet
+title: 'RigNet (a skeleton and skin weights for a character mesh; SIGGRAPH 2020; GPLv3)'
+about: Xu et al.'s RigNet - GMEdgeNet joints with mean-shift, RootNet and BoneNet for the tree, SkinNet for the weights over volumetric geodesics. Its code is GPLv3 (a commercial licence is offered by UMass), and so is the nextsycl engine that ports it (model3d/rignet, kept apart). Best on humanoids and animals standing upright, facing +Z, symmetric about x = 0.
+does: [rig]
+gpus: '0'
+vram_gib: 1.0                    # the four networks (~50 MB of weights) and a 4,000-triangle mesh's activations
+env: {}
+files:
+  # The authors' own download, from Google Drive (github.com/zhan-xu/RigNet's README): a Drive file has no pinned
+  # revision, so the link is the file id; the SHA-256 is of the file as downloaded on 2026-10-16. The engine reads the
+  # four checkpoints it needs out of the ZIP at load (inflated into a temporary folder, removed after).
+  models:
+    key: rignet-trained-models
+    url: https://drive.usercontent.google.com/download?id=1gM2Lerk7a2R0g9DwlK3IvCfp8c2aFVXs&export=download&confirm=t
+    size: 195677735
+    sha256: 97fe5ae10c55b417acb3fe715547a7fa984e4d583a24bc158f30462a1b855212
+    path: rignet/trained_models.zip
+guide: guides/rignet.md

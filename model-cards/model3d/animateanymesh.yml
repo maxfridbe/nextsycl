@@ -1,0 +1,48 @@
+# AnimateAnyMesh (a mesh set in motion by a sentence; 16 frames as morph targets; Apache-2.0)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: animateanymesh
+kind: model3d
+arch: animateanymesh
+title: 'AnimateAnyMesh (text-driven mesh animation: 16 frames as morph targets; Apache-2.0)'
+about: Wu et al., ICCV 2025 - DyMeshVAE (neighbour attention over the mesh's edges, farthest-point trajectory tokens) and a 12-layer rectified-flow MMDiT conditioned on SD 1.5's CLIP-L text tower; float32; the output keeps the input mesh (UVs, textures) and adds one morph target a frame
+does: [animate]
+gpus: '0'
+vram_gib: 1.5                    # measured 1.1 GiB on a B70 animating a 7.6K-vertex mesh (more vertices: a little more)
+defaults:
+  steps: 63
+  cfg: 3.0
+  frames: 16
+  fps: 10
+env: {}
+files:
+  rf:
+    key: aam-rf
+    url: https://huggingface.co/JarrentWu/AnimateAnyMesh/resolve/d3360418409cc51d7bdc0c9633dfb93844113696/rf_model/rf_epoch_f.pth
+    size: 805255167
+    sha256: a5f1ad53e6616ef909f2234a0b80289c26538806cb397679c28279be4e122506
+    path: animateanymesh/rf_model/rf_epoch_f.pth
+  vae:
+    key: aam-dvae
+    url: https://huggingface.co/JarrentWu/AnimateAnyMesh/resolve/d3360418409cc51d7bdc0c9633dfb93844113696/dvae/dvae_f.pth
+    size: 146248555
+    sha256: af78499ca80c8761086cbc6cd48e6dcc735e09238b64784621ac2b776db2c710
+    path: animateanymesh/dvae/dvae_f.pth
+  factors:
+    key: aam-dvae-factors
+    url: https://huggingface.co/JarrentWu/AnimateAnyMesh/resolve/d3360418409cc51d7bdc0c9633dfb93844113696/dvae_factors/dvae_f.json
+    size: 136
+    sha256: c40f9bfa3398b5353325933ae039e57d9bac74c9f4ee5d70724fef04c47e8cd2
+    path: animateanymesh/dvae_factors/dvae_f.json
+  vocab:
+    key: sd15-clip-vocab
+    url: https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/451f4fe16113bff5a5d2269ed5ad43b0592e9a14/tokenizer/vocab.json
+    size: 1059962
+    sha256: e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349
+    path: animateanymesh/clip/tokenizer/vocab.json
+  merges:
+    key: sd15-clip-merges
+    url: https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/451f4fe16113bff5a5d2269ed5ad43b0592e9a14/tokenizer/merges.txt
+    size: 524619
+    sha256: 9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a
+    path: animateanymesh/clip/tokenizer/merges.txt
+guide: guides/animateanymesh.md

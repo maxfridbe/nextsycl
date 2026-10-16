@@ -570,8 +570,11 @@ dependencies = [
  "nextsycl-llm-qwen35",
  "nextsycl-llm-qwen4exp",
  "nextsycl-model3d",
+ "nextsycl-model3d-animateanymesh",
  "nextsycl-model3d-example",
  "nextsycl-model3d-hunyuan3d",
+ "nextsycl-model3d-rignet",
+ "nextsycl-model3d-unirig",
  "nextsycl-models",
  "nextsycl-serve",
  "nextsycl-tok",
@@ -841,6 +844,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextsycl-model3d-animateanymesh"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-model3d",
+ "serde_json",
+]
+
+[[package]]
 name = "nextsycl-model3d-example"
 version = "0.0.0"
 dependencies = [
@@ -856,6 +870,29 @@ dependencies = [
  "nextsycl-diffusion",
  "nextsycl-gguf",
  "nextsycl-mesh",
+ "nextsycl-model3d",
+ "serde_json",
+]
+
+[[package]]
+name = "nextsycl-model3d-rignet"
+version = "0.0.0"
+dependencies = [
+ "miniz_oxide 0.8.9",
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-model3d",
+ "serde_json",
+]
+
+[[package]]
+name = "nextsycl-model3d-unirig"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
  "nextsycl-model3d",
  "serde_json",
 ]

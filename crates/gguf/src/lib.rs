@@ -6,6 +6,7 @@
 //! metadata comes from the first shard, the tensors from all of them.
 
 pub mod pth;
+pub mod pthst;
 pub mod safetensors;
 pub mod writer;
 

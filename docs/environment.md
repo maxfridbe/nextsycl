@@ -271,6 +271,13 @@ The `model3d` kind (meshes from pictures, rigging, animation) and its engines' s
 | `NS_M3D_HY_CHUNK` | by the decoder's width | points the shape decoder queries at once (--opt-chunk) | model3d hunyuan3d |
 | `NS_M3D_HY_PAINT` | 1 | 0: 2.1 loads without its paint model (no textures; ~6.5 GiB less) even when the paint files are there (--opt-paint) | model3d hunyuan3d |
 | `NS_M3D_HY_PAINT_STEPS` | 15 | the texture's UniPC steps (--opt-paint-steps) | model3d hunyuan3d |
+| `NS_M3D_AAM_PROFILE` | off | Debug: set: AnimateAnyMesh waits for the GPU after each named step of the flow and prints the totals (slower; shows where the time goes) | model3d animateanymesh |
+| `NS_M3D_AAM_TRAJ` | max(512, vertices / 8) | AnimateAnyMesh: the trajectory tokens DyMeshVAE samples (more: finer motion, slower) (--opt-traj; per request too) | model3d animateanymesh |
+| `NS_M3D_UNIRIG_BEAMS` | 15 | UniRig: the skeleton decoder's beams, sampled as UniRig's inference (1: greedy, the same skeleton every time) (--opt-beams; per request too) | model3d unirig |
+| `NS_M3D_UNIRIG_PROFILE` | off | Debug: set: UniRig waits for the GPU after each named step and prints the totals (slower; shows where the time goes) | model3d unirig |
+| `NS_M3D_RIGNET_FACES` | 4000 | RigNet: the triangles the mesh is decimated to before rigging (the weights go back to every vertex of the input) (--opt-faces; per request too) | model3d rignet |
+| `NS_M3D_RIGNET_BANDWIDTH` | the learned 0.0429 | RigNet: the joints' mean-shift bandwidth (smaller: more, closer joints) (--opt-bandwidth; per request too) | model3d rignet |
+| `NS_M3D_RIGNET_THRESHOLD` | 1e-5 | RigNet: the joints' density threshold (lower: more joints) (--opt-threshold; per request too) | model3d rignet |
 
 ## Diffusion kernels: `NSD_*`
 

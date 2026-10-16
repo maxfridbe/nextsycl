@@ -1,0 +1,13 @@
+[package]
+name = "nextsycl-model3d-animateanymesh"
+description = "AnimateAnyMesh: a mesh set in motion by a sentence (CLIP-L text, DyMeshVAE, a rectified-flow MMDiT) on Intel Arc (SYCL)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-model3d.workspace = true
+serde_json.workspace = true

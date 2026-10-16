@@ -22,11 +22,14 @@ nextsycl model3d tool convert IN OUT                     GLB <-> OBJ (by the ext
 nextsycl model3d check <dump dir> [--model ID] [--stages pre,cond,dit,steps,vae,grid] [--picture P] [--gpu N]
                    an engine's stages against a reference's dumps (reference/hunyuan3d); a paint dump's stages:
                    maps,pic,dino,enc,dual,unet,unipc,steps,decode
+nextsycl model3d check <dump dir> --model ID [--stages a,b,...] [--mesh FILE.obj] [--prompt TEXT] [--gpu N]
+                   an engine's stages against its reference's dumps (reference/<arch>/)
 nextsycl model3d engines | selftest [--gpu N]";
 
 /// The 3D engines this program has (model3d/<arch>)
 pub fn engines() -> Vec<nextsycl_model3d::Model3dKind> {
-    vec![nextsycl_model3d_example::kind(), nextsycl_model3d_hunyuan3d::kind()]
+    vec![nextsycl_model3d_hunyuan3d::kind(), nextsycl_model3d_unirig::kind(), nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(),
+         nextsycl_model3d_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -182,8 +185,8 @@ fn rig(cfg: &Config, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `nextsycl model3d check DIR`: an engine's stages against a reference's dumps (Hunyuan3D: reference/hunyuan3d)
-fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
+/// `nextsycl model3d check DIR` for Hunyuan3D: its stages against reference/hunyuan3d's dumps
+fn check_hunyuan3d(cfg: &Config, args: &[String]) -> Result<(), String> {
     let dir = positional(args).into_iter().next().ok_or(USAGE)?;
     nextsycl_core::use_kind("model3d");
     let (m, files) = model(cfg, args, "generate")?;
@@ -259,6 +262,42 @@ fn tool(args: &[String]) -> Result<(), String> {
     };
     write_any(output, &out)?;
     println!("{output}: {before} -> {} triangles, {} vertices ({:.2} s)", out.triangles(), out.positions.len(), t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// `nextsycl model3d check DIR --model ID`: an engine's stages against the reference's dumps in DIR
+fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let dir = PathBuf::from(positional(args).into_iter().next().ok_or(USAGE)?);
+    nextsycl_core::use_kind("model3d");
+    let (m, files) = model(cfg, args, "")?;
+    let g = gpu(args)?;
+    let mut log = |s: String| eprintln!("{s}");
+    let stages = |all: &'static str| -> Vec<String> { opt(args, "--stages").unwrap_or(all).split(',').map(str::to_string).collect() };
+    let worst = match m["arch"].as_str().unwrap_or("") {
+        nextsycl_model3d_hunyuan3d::ARCH_21 | nextsycl_model3d_hunyuan3d::ARCH_MINI => return check_hunyuan3d(cfg, args),
+        nextsycl_model3d_animateanymesh::ARCH => {
+            let e = nextsycl_model3d_animateanymesh::AnimateAnyMesh::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+            let st = stages("embed,fps,enc,clip,dit,dec");
+            let st: Vec<&str> = st.iter().map(String::as_str).collect();
+            nextsycl_model3d_animateanymesh::check::run(&e, &dir, &st, opt(args, "--mesh").map(Path::new), opt(args, "--prompt"), &mut log)
+                .map_err(|e| e.0)?
+        }
+        nextsycl_model3d_unirig::ARCH => {
+            let e = nextsycl_model3d_unirig::UniRig::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+            let st = stages("encoder,logits,skin");
+            let st: Vec<&str> = st.iter().map(String::as_str).collect();
+            nextsycl_model3d_unirig::check::run(&e, &dir, &st, opt(args, "--mesh").map(Path::new), &mut log).map_err(|e| e.0)?
+        }
+        nextsycl_model3d_rignet::ARCH => {
+            let e = nextsycl_model3d_rignet::RigNet::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+            let st = stages("joints,root,bones,skin");
+            let st: Vec<&str> = st.iter().map(String::as_str).collect();
+            nextsycl_model3d_rignet::check::run(&e, &dir, &st, opt(args, "--mesh").map(Path::new), &mut log).map_err(|e| e.0)?
+        }
+        a => return Err(format!("check knows {}, {}, {}, {} and {} (not {a})", nextsycl_model3d_hunyuan3d::ARCH_21, nextsycl_model3d_hunyuan3d::ARCH_MINI,
+                                nextsycl_model3d_animateanymesh::ARCH, nextsycl_model3d_unirig::ARCH, nextsycl_model3d_rignet::ARCH)),
+    };
+    println!("worst relative error {worst:.2e}");
     Ok(())
 }
 
