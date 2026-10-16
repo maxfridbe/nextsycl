@@ -125,12 +125,12 @@ fn in_slabs(m: &Mesh, target: usize, k: usize, diag: f32) -> Mesh {
     }
     let mut first = vec![usize::MAX; m.positions.len()];
     let mut shared = vec![false; m.positions.len()];
-    for t in 0..ntri {
+    for (t, &st) in slab_of.iter().enumerate() {
         for j in 0..3 {
             let v = m.indices[t * 3 + j] as usize;
             if first[v] == usize::MAX {
-                first[v] = slab_of[t];
-            } else if first[v] != slab_of[t] {
+                first[v] = st;
+            } else if first[v] != st {
                 shared[v] = true;
             }
         }
