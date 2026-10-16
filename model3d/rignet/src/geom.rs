@@ -32,9 +32,23 @@ impl Rng {
     }
 }
 
+/// [f(0), f(1), ... f(n - 1)], computed on the machine's threads (each value as one thread alone would)
+pub fn par_rows<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let per = n.div_ceil(threads()).max(16);
+    let mut parts: Vec<Vec<T>> = Vec::new();
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..n.div_ceil(per)).map(|c| {
+            let f = &f;
+            sc.spawn(move || (c * per..((c + 1) * per).min(n)).map(f).collect::<Vec<T>>())
+        }).collect();
+        parts = hs.into_iter().map(|h| h.join().expect("a geometry thread panicked")).collect();
+    });
+    parts.into_iter().flatten().collect()
+}
+
 /// The threads the CPU stages use
 pub fn threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16)
+    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 32)
 }
 
 /// Scaled to height 1 on its longest side, its feet (lowest y) at 0, centred in x and z: (positions, pivot, scale);
@@ -290,20 +304,23 @@ impl Geodesic {
 /// nearest sample's
 pub fn surface_geodesic(v: &[[f32; 3]], pts: &[[f32; 3]], nrm: &[[f32; 3]]) -> Geodesic {
     let s = pts.len();
-    let mut adj: Vec<Vec<(u32, f32)>> = vec![Vec::new(); s];
-    for p in 0..s {
+    // each sample's links (its nearest 5 whose normals are not opposed), found on the threads
+    let links: Vec<Vec<(f32, u32)>> = par_rows(s, |p| {
         let mut d: Vec<(f32, u32)> = (0..s).map(|q| (length(sub(pts[q], pts[p])), q as u32)).collect();
         d.select_nth_unstable_by(6.min(s - 1), |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         let mut near: Vec<(f32, u32)> = d[..7.min(s)].to_vec();
         near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         let np = length(nrm[p]);
-        for &(dq, q) in near.iter().skip(1).take(5) {
+        near.into_iter().skip(1).take(5).filter(|&(_, q)| {
             let nq = length(nrm[q as usize]);
-            let cos = dot(nrm[q as usize], nrm[p]) / (nq * np + 1e-10);
-            if cos > -0.5 {
-                adj[p].push((q, dq));
-                adj[q as usize].push((p as u32, dq));
-            }
+            dot(nrm[q as usize], nrm[p]) / (nq * np + 1e-10) > -0.5
+        }).collect()
+    });
+    let mut adj: Vec<Vec<(u32, f32)>> = vec![Vec::new(); s];
+    for (p, l) in links.iter().enumerate() {
+        for &(dq, q) in l {
+            adj[p].push((q, dq));
+            adj[q as usize].push((p as u32, dq));
         }
     }
     // an edge stored both ways, once each (the reference's sparse matrix keeps one value a pair)
@@ -329,17 +346,18 @@ pub fn surface_geodesic(v: &[[f32; 3]], pts: &[[f32; 3]], nrm: &[[f32; 3]]) -> G
             });
         }
     });
-    let nn = v.iter().map(|x| {
+    let nn = par_rows(v.len(), |i| {
+        let x = v[i];
         let mut best = (f32::INFINITY, 0u32);
         for (q, p) in pts.iter().enumerate() {
-            let d = sub(*p, *x);
+            let d = sub(*p, x);
             let d = dot(d, d);
             if d < best.0 {
                 best = (d, q as u32);
             }
         }
         best.1
-    }).collect();
+    });
     Geodesic { s, dist, nn }
 }
 

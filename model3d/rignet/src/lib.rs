@@ -132,6 +132,7 @@ impl RigNet {
 
     /// The decimated mesh's geometry (welded, decimated to `faces` triangles, normalized)
     pub fn prepare(&self, m: &Mesh, faces: usize, seed: u64) -> Result<Prepared> {
+        lap("");
         let (mut w, _) = tools::weld(m, 1e-7);
         tools::compact(&mut w);
         let mut d = if w.triangles() > faces { tools::decimate(&w, faces) } else { w };
@@ -140,6 +141,7 @@ impl RigNet {
             return Err(Error("the mesh has too few triangles to rig".into()));
         }
         let faces: Vec<[u32; 3]> = d.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+        lap("weld, decimate");
         Ok(self.prepare_geometry(&d.positions, &faces, seed))
     }
 
@@ -149,10 +151,14 @@ impl RigNet {
         let vn = geom::vertex_normals(&pos, faces);
         let mut rng = geom::Rng::new(seed ^ 0x51_9e7);
         let (pts, nrm) = geom::poisson_disk(&pos, &vn, faces, 4000, &mut rng);
+        lap("surface samples");
         let geodesic = geom::surface_geodesic(&pos, &pts, &nrm);
+        lap("surface geodesics");
         let geo = geom::geo_edges(&geodesic, &mut rng);
         let tpl = geom::tpl_edges(pos.len(), faces);
+        lap("edges");
         let vox = geom::voxelize(&pos, faces, 88);
+        lap("voxels");
         Prepared { pos, faces: faces.to_vec(), pivot, scale, tpl, geo, geodesic, vox }
     }
 
@@ -167,13 +173,18 @@ impl RigNet {
         let jf: Vec<[f32; 3]> = joints.iter().map(|j| j.map(|x| x as f32)).collect();
         let shape = self.root.shape(&self.ops, mi)?;
         let root_logits = self.root.run(&self.ops, &shape, &jf)?;
+        lap("rootnet");
         let root = (0..jf.len()).max_by(|a, b| root_logits[*a].total_cmp(&root_logits[*b]).then(b.cmp(a))).unwrap_or(0);
         let (pairs, rows) = skel::pairs(joints, &p.vox);
+        lap("pairs");
         let shape = self.bone.shape(&self.ops, mi)?;
         let logits = self.bone.run(&self.ops, &shape, &jf, &rows)?;
+        lap("bonenet");
         let prob: Vec<f32> = logits.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
         let cost = skel::costs(joints, &pairs, &prob, &p.vox);
-        Ok(skel::prim_symmetric(&cost, root, joints))
+        let r = skel::prim_symmetric(&cost, root, joints);
+        lap("costs, tree");
+        Ok(r)
     }
 
     /// The skin weights [n, joints] of the decimated mesh for a skeleton in tree order
@@ -183,8 +194,10 @@ impl RigNet {
             return Ok(vec![1.0; p.pos.len()]);
         }
         let geo = geom::volumetric_geodesic(&p.pos, &p.faces, &bones, &p.geodesic);
+        lap("volumetric geodesics");
         let (input, ids, mask) = skel::skin_input(&p.pos, &geo, &bones, &leaf);
         let logits = self.skin.run(&self.ops, mi, &input)?;
+        lap("skinnet");
         let ring = one_ring(p.pos.len(), &p.tpl);
         let wb = skel::skin_weights(&logits, &ids, &mask, bones.len(), &ring);
         // the bones' weights to their joints
@@ -195,15 +208,19 @@ impl RigNet {
                 out[v * nj + j] += wb[v * bones.len() + b];
             }
         }
+        lap("weights");
         Ok(out)
     }
 
     /// The whole rig of a prepared mesh
     pub fn rig_prepared(&self, p: &Prepared, s: Settings, progress: &mut dyn FnMut(&'static str, u32) -> Result<()>) -> Result<Rigged> {
+        lap("");
         let mi = self.mesh_in(p)?;
         let (disp, attn) = self.joint.run(&self.ops, &mi)?;
+        lap("jointnet");
         let bw = s.bandwidth.unwrap_or(self.joint.bandwidth) as f64;
         let joints = skel::joints_from(&p.pos, &disp, &attn, &p.vox, bw, s.threshold as f64);
+        lap("mean-shift");
         if joints.is_empty() {
             return Err(Error(format!("{ARCH}: no joints found (try a lower --opt-threshold or another --opt-bandwidth)")));
         }
@@ -216,6 +233,24 @@ impl RigNet {
         progress("skin", 1)?;
         Ok(Rigged { joints, parents, weights })
     }
+}
+
+/// NS_M3D_RIGNET_PROFILE: each step's time on stderr (the time since the last step's end; the GPU's work is waited
+/// for by the steps that read it back)
+pub fn lap(step: &str) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("NS_M3D_RIGNET_PROFILE").is_some()) {
+        return;
+    }
+    let mut l = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = *l {
+        if !step.is_empty() {
+            eprintln!("rignet: {step:<22} {:>8.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    *l = Some(Instant::now());
 }
 
 /// Each vertex's neighbours over the mesh's edges (itself apart)
@@ -271,7 +306,9 @@ impl Model3dEngine for RigNet {
         let dec: Vec<[f32; 3]> = p.pos.iter().map(|q| unmap(*q)).collect();
         let flat: Vec<u32> = p.faces.iter().flatten().copied().collect();
         let nj = r.joints.len();
+        lap("");
         let dense = tools::skin::transfer(&dec, &flat, &r.weights, nj, &req.mesh.positions);
+        lap("weights to the mesh");
         let joints = r.joints.iter().zip(&r.parents).enumerate().map(|(i, (j, par))| Joint {
             name: if par.is_none() { "root".to_string() } else { format!("joint_{i}") },
             parent: *par,

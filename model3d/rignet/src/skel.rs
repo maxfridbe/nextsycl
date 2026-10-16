@@ -19,23 +19,18 @@ pub fn meanshift(pts: &mut [[f64; 3]], bandwidth: f64, w: &[f64], max_iter: usiz
     let b2 = bandwidth * bandwidth;
     while diff > 1e-3 && it < max_iter {
         // K[i][j] = max(b^2 - |p_i - p_j|^2, 0) * w[i]; a point's new place: its column of K, normalized, over the points
-        let mut colsum = vec![0f64; n];
-        for (j, cs) in colsum.iter_mut().enumerate() {
-            *cs = (0..n).map(|i| (b2 - d2(pts[i], pts[j])).max(0.0) * w[i]).sum();
-        }
-        let mut next = vec![[0f64; 3]; n];
-        for (a, nx) in next.iter_mut().enumerate() {
+        let p: &[[f64; 3]] = pts;
+        let colsum = crate::geom::par_rows(n, |j| (0..n).map(|i| (b2 - d2(p[i], p[j])).max(0.0) * w[i]).sum::<f64>());
+        let next = crate::geom::par_rows(n, |a| {
             let mut m = [0f64; 3];
             for b in 0..n {
-                let k = (b2 - d2(pts[b], pts[a])).max(0.0) * w[b] / (colsum[a] + 1e-10);
+                let k = (b2 - d2(p[b], p[a])).max(0.0) * w[b] / (colsum[a] + 1e-10);
                 for c in 0..3 {
-                    m[c] += k * pts[b][c];
+                    m[c] += k * p[b][c];
                 }
             }
-            for c in 0..3 {
-                nx[c] = 0.3 * (m[c] - pts[a][c]) + pts[a][c];
-            }
-        }
+            [0, 1, 2].map(|c| 0.3 * (m[c] - p[a][c]) + p[a][c])
+        });
         diff = next.iter().zip(pts.iter()).map(|(a, b)| d2(*a, *b)).sum::<f64>().sqrt();
         pts.copy_from_slice(&next);
         it += 1;
@@ -45,7 +40,7 @@ pub fn meanshift(pts: &mut [[f64; 3]], bandwidth: f64, w: &[f64], max_iter: usiz
 /// Each point's density: the sum over all points of max(b^2 - d^2, 0)
 pub fn density(pts: &[[f64; 3]], bandwidth: f64) -> Vec<f64> {
     let b2 = bandwidth * bandwidth;
-    (0..pts.len()).map(|j| pts.iter().map(|p| (b2 - d2(*p, pts[j])).max(0.0)).sum()).collect()
+    crate::geom::par_rows(pts.len(), |j| pts.iter().map(|p| (b2 - d2(*p, pts[j])).max(0.0)).sum())
 }
 
 /// cluster_utils.nms_meanshift: from the densest down, a point suppresses those within the bandwidth
