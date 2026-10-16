@@ -92,7 +92,9 @@ fn options(m: &Value, args: &[String]) -> Result<nextsycl_model3d::LoadOptions, 
     }
     let ks = engines();
     let k = nextsycl_model3d::kind_for(&ks, m["arch"].as_str().unwrap_or(""))?;
-    for (var, v) in super::opt_env(k.options, nextsycl_core::At::Load, k.name)? {
+    // a command here loads and asks at once: every option it takes is checked (a per-request one such as TRELLIS's
+    // --opt-fov goes in the request's `extra`), those set at load also set their variables
+    for (var, v) in super::opt_env(k.options, nextsycl_core::At::Both, k.name)? {
         settings.insert(var, v);
     }
     Ok(nextsycl_model3d::LoadOptions { settings })

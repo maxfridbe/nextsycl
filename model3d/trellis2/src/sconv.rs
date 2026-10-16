@@ -72,7 +72,8 @@ impl SConv {
 /// A neighbour map on the GPU
 pub fn upload_nmap(gpu: &Arc<Gpu>, nmap: &[i32]) -> Result<DevBuf> {
     let b = DevBuf::new(gpu, nmap.len() * 4)?;
-    b.write(0, &nmap.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+    // SAFETY: the i32 values' own bytes (the GPU reads them little-endian, as the host holds them).
+    b.write(0, unsafe { std::slice::from_raw_parts(nmap.as_ptr().cast::<u8>(), nmap.len() * 4) })?;
     Ok(b)
 }
 

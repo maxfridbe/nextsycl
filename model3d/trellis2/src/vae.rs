@@ -10,6 +10,7 @@ use std::sync::Arc;
 use nextsycl_core::{DevBuf, Error, Gpu, Result};
 use nextsycl_diffusion::kernels::Dt;
 
+use crate::ffi::Epi;
 use crate::sconv::{upload_nmap, SConv};
 use crate::sparse::{child_neighbours, neighbours, subdivide, Tree};
 use crate::w::{File, Keep, Lin};
@@ -48,7 +49,7 @@ pub struct Decoded {
     pub level_coords: Vec<Vec<[i32; 3]>>,
     pub subs: Vec<Vec<f32>>,
     pub tree: Tree,
-    pub nmap: Vec<i32>,
+    pub nmap: Arc<Vec<i32>>,
     /// the features after each up block (for the check), when asked
     pub ups: Vec<Vec<f32>>,
 }
@@ -61,6 +62,8 @@ pub struct Plan<'a> {
     pub upsample: Option<usize>,
     /// keep each up block's output features (the check)
     pub keep_ups: bool,
+    /// each stage's time on stderr (each synced)
+    pub profile: bool,
 }
 
 impl Decoder {
@@ -119,14 +122,25 @@ impl Decoder {
             return Err(Error(format!("the decoder's latent: {} values for {n} voxels of {}", latent.len(), self.from_latent.k)));
         }
         let mut out = Decoded::default();
+        let t_run = std::time::Instant::now();
+        let mut t_lap = std::time::Instant::now();
+        let mut lap = |what: String| -> Result<()> {
+            if plan.profile {
+                g.sync()?;
+                eprintln!("  decoder: {what:<44} {:>6.3} s", t_lap.elapsed().as_secs_f64());
+                t_lap = std::time::Instant::now();
+            }
+            Ok(())
+        };
         let mut coords = coords.to_vec();
-        let mut nmap_h = neighbours(&coords);
+        let mut nmap_h = Arc::new(neighbours(&coords));
         let mut nmap = upload_nmap(g, &nmap_h)?;
         let lat = crate::w::dev_half(g, latent)?;
         let mut c = self.from_latent.n;
         let mut h = DevBuf::f32(g, n * c)?;
         self.from_latent.apply(nsd, k, &self.scratch, lat.ptr(), n, h.ptr(), Dt::F32)?;
         drop(lat);
+        lap(format!("{n} voxels in, their neighbours"))?;
         let total: usize = self.stages.iter().map(|(b, u)| b.len() + u.is_some() as usize).sum();
         let mut done = 0u32;
         for (si, (blocks, up)) in self.stages.iter().enumerate() {
@@ -144,26 +158,26 @@ impl Decoder {
                 // the MLP a row block at a time (its 4C-wide middle is the largest buffer here)
                 let rows = ((256usize << 20) / (b.mlp0.n * 2)).clamp(1, n);
                 let mid = DevBuf::new(g, rows * b.mlp0.n * 2)?;
+                // the second product's float32 result before its add (none when the silo adds it in the product)
+                let o = DevBuf::f32(g, if k.silo().is_some() { 1 } else { rows * c })?;
                 for r0 in (0..n).step_by(rows) {
                     let m = rows.min(n - r0);
                     // SAFETY: row blocks inside hh (half [n, c]) and h (float32 [n, c]).
                     let (xi, xo) = unsafe { (hh.ptr().cast::<u16>().add(r0 * c).cast(), h.fp().add(r0 * c)) };
-                    b.mlp0.apply(nsd, k, &self.scratch, xi, m, mid.ptr(), Dt::F16)?;
-                    k.silu(mid.ptr(), Dt::F16, m * b.mlp0.n)?;
-                    let o = DevBuf::f32(g, m * c)?;
-                    b.mlp2.apply(nsd, k, &self.scratch, mid.ptr(), m, o.ptr(), Dt::F32)?;
-                    k.add(xo.cast(), Dt::F32, o.ptr(), Dt::F32, m * c)?;
+                    b.mlp0.apply_epi(nsd, k, &self.scratch, xi, m, mid.ptr(), Dt::F16, Epi::Silu, None)?;
+                    b.mlp2.apply_epi(nsd, k, &self.scratch, mid.ptr(), m, xo.cast(), Dt::F32, Epi::Resid(std::ptr::null()), Some(&o))?;
                 }
                 done += 1;
                 progress(done, total as u32)?;
             }
+            lap(format!("stage {si}: {} blocks of {c} over {n} voxels", blocks.len()))?;
             let Some(u) = up else { continue };
             if u.cin != c {
                 return Err(Error(format!("stage {si}'s up block takes {} channels, the stage has {c}", u.cin)));
             }
             out.level_coords.push(coords.clone());
             // which children: the logits (shape) or the shape decoder's tree (texture)
-            let sub = if let Some(t) = plan.guide {
+            let mut sub = if let Some(t) = plan.guide {
                 t.levels.get(si).cloned().ok_or_else(|| Error(format!("the guide has no level {si}")))?
             } else {
                 let ts = u.to_subdiv.as_ref().ok_or_else(|| Error("a decoder without to_subdiv needs the shape decoder's subdivisions".into()))?;
@@ -176,6 +190,7 @@ impl Decoder {
                 out.subs.push(lg);
                 s
             };
+            lap(format!("stage {si}: the subdivision"))?;
             if sub.parent.is_empty() {
                 return Err(Error(format!("the decoder kept no voxels at level {}", si + 1)));
             }
@@ -198,9 +213,15 @@ impl Decoder {
             drop(h);
             k.ln_mod(hc.ptr(), Dt::F16, nc, u.cout, 1e-6, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(), hc.ptr(), Dt::F16)?;
             k.silu(hc.ptr(), Dt::F16, nc * u.cout)?;
-            nmap_h = child_neighbours(&nmap_h, &sub);
+            lap(format!("stage {si}: conv1, the children's gathers ({})", sub.parent.len()))?;
+            nmap_h = match &sub.nmap {
+                Some(m) => m.clone(),
+                None => Arc::new(child_neighbours(&nmap_h, &sub)),
+            };
+            sub.nmap = Some(nmap_h.clone());
             drop(nmap);
             nmap = upload_nmap(g, &nmap_h)?;
+            lap(format!("stage {si}: the children's neighbours"))?;
             let c2 = DevBuf::f32(g, nc * u.cout)?;
             u.conv2.apply(cx, &hc, nc, &nmap, c2.ptr(), Dt::F32)?;
             k.add(xs.ptr(), Dt::F32, c2.ptr(), Dt::F32, nc * u.cout)?;
@@ -212,6 +233,7 @@ impl Decoder {
                 out.ups.push(h.to_f32()?);
             }
             out.tree.levels.push(sub);
+            lap(format!("stage {si}: conv2"))?;
             done += 1;
             progress(done, total as u32)?;
         }
@@ -226,6 +248,10 @@ impl Decoder {
         out.feats = o.to_f32()?;
         out.coords = coords;
         out.nmap = nmap_h;
+        lap("the output layer, read back".into())?;
+        if plan.profile {
+            eprintln!("  decoder: {} voxels out in {:.2} s", out.coords.len(), t_run.elapsed().as_secs_f64());
+        }
         Ok(out)
     }
 }

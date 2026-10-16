@@ -47,14 +47,13 @@ impl Voxels {
 }
 
 /// The base colour and metallic-roughness textures of `mesh` (with an atlas) from the voxels, each texel's point
-/// snapped onto `surface` (the decoded mesh, before it was simplified) first. The texels are found as
+/// snapped onto the decoded mesh (before it was simplified: `near`, its closest-point tree) first. The texels are found as
 /// `tools::uv::rasterize` finds them (texel centres inside a triangle in UV space; the barycentric surface point and
 /// normal), sampled on every thread, the empty ones grown from their neighbours.
-pub fn bake(mesh: &Mesh, surface: &Mesh, vox: &Voxels, size: u32) -> Material {
-    let near = Closest::new(&surface.positions, &surface.indices);
+pub fn bake(mesh: &Mesh, near: &Closest, vox: &Voxels, size: u32, push_voxels: f32) -> Material {
     // the nearest point of the decoded surface, looked for from two voxels outside along the texel's normal: on a
     // thin shell the simplified surface sits between the two sheets, and the outer one is the one seen
-    let push = 2.0 / vox.res as f32;
+    let push = push_voxels / vox.res as f32;
     let s = size as usize;
     let texels = texels(mesh, size);
     let mut attrs = vec![[0f32; ATTRS]; texels.len()];
@@ -65,33 +64,52 @@ pub fn bake(mesh: &Mesh, surface: &Mesh, vox: &Voxels, size: u32) -> Material {
             *a = vox.sample(near.query(q).map_or(p, |(x, _, _)| x));
         }
     });
-    let mut base = vec![[0f32; 4]; s * s];
-    let mut mr = vec![[0f32; 4]; s * s];
-    let mut hit = vec![false; s * s];
+    // both textures' texels together (base colour RGBA, then metallic-roughness RGBA) and whether each is covered
+    let mut cells = vec![Cell::default(); s * s];
     for ((t, _, _), a) in texels.iter().zip(&attrs) {
-        base[*t] = [a[0], a[1], a[2], 1.0];
-        mr[*t] = [0.0, a[4], a[3], 1.0];
-        hit[*t] = true;
+        cells[*t] = Cell { v: [a[0], a[1], a[2], 1.0, 0.0, a[4], a[3], 1.0], hit: true };
     }
-    let tex = |mut acc: Vec<[f32; 4]>| {
-        let mut h = hit.clone();
-        dilate(&mut acc, &mut h, s, 8);
+    dilate(&mut cells, s, 8);
+    let tex = |off: usize| {
         let mut t = Texture::new(size, size);
-        for (px, c) in t.rgba.chunks_exact_mut(4).zip(&acc) {
-            for (o, v) in px.iter_mut().zip(c) {
+        for (px, c) in t.rgba.chunks_exact_mut(4).zip(&cells) {
+            for (o, v) in px.iter_mut().zip(&c.v[off..off + 4]) {
                 *o = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         }
         t
     };
-    Material { base_color: Some(tex(base)), metallic_roughness: Some(tex(mr)), normal: None, base_color_factor: [1.0; 4], metallic: 1.0, roughness: 1.0 }
+    Material { base_color: Some(tex(0)), metallic_roughness: Some(tex(4)), normal: None, base_color_factor: [1.0; 4], metallic: 1.0, roughness: 1.0 }
 }
 
-/// Every texel a triangle covers (its centre inside, in UV space): (texel index, surface point, normal)
-fn texels(m: &Mesh, size: u32) -> Vec<(usize, [f32; 3], [f32; 3])> {
+/// A texel of both textures: base colour RGBA, metallic-roughness RGBA; covered (or grown into) yet
+#[derive(Clone, Copy, Default)]
+struct Cell {
+    v: [f32; 8],
+    hit: bool,
+}
+
+/// A covered texel: its index, the surface point and the normal there
+type Texel = (usize, [f32; 3], [f32; 3]);
+
+/// Every texel a triangle covers (its centre inside, in UV space): (texel index, surface point, normal), the
+/// triangles in order (a later one's texel after an earlier one's), found on every thread
+fn texels(m: &Mesh, size: u32) -> Vec<Texel> {
+    let nt = m.indices.len() / 3;
+    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(32);
+    let per = nt.div_ceil(threads).max(4096);
+    let parts: Vec<Vec<Texel>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..nt).step_by(per).map(|t0| sc.spawn(move || texels_of(m, size, t0, (t0 + per).min(nt)))).collect();
+        hs.into_iter().map(|h| h.join().expect("a texel thread panicked")).collect()
+    });
+    parts.concat()
+}
+
+/// `texels` of triangles t0 .. t1
+fn texels_of(m: &Mesh, size: u32, t0: usize, t1: usize) -> Vec<Texel> {
     let s = size as usize;
     let mut out = Vec::new();
-    for t in m.indices.chunks_exact(3) {
+    for t in m.indices[t0 * 3..t1 * 3].chunks_exact(3) {
         let uv = [0, 1, 2].map(|k| {
             let u = m.uvs[t[k] as usize];
             [u[0] * size as f32, u[1] * size as f32]
@@ -128,31 +146,43 @@ fn texels(m: &Mesh, size: u32) -> Vec<(usize, [f32; 3], [f32; 3])> {
     out
 }
 
-/// Empty texels next to filled ones take their mean, `passes` times (the seams' gutters)
-fn dilate(acc: &mut [[f32; 4]], hit: &mut [bool], s: usize, passes: usize) {
+/// Empty texels next to filled ones take their mean, `passes` times (the seams' gutters); rows on every thread
+fn dilate(cells: &mut [Cell], s: usize, passes: usize) {
     for _ in 0..passes {
-        let (prev, was) = (acc.to_vec(), hit.to_vec());
-        for y in 0..s {
-            for x in 0..s {
-                if was[y * s + x] {
-                    continue;
-                }
-                let mut sum = [0f32; 4];
-                let mut n = 0.0;
-                for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
-                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
-                    if nx >= 0 && ny >= 0 && (nx as usize) < s && (ny as usize) < s && was[ny as usize * s + nx as usize] {
-                        let c = prev[ny as usize * s + nx as usize];
-                        sum.iter_mut().zip(c).for_each(|(a, b)| *a += b);
-                        n += 1.0;
+        let prev = cells.to_vec();
+        let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(32);
+        let rows = s.div_ceil(threads).max(1);
+        let pass = |y0: usize, chunk: &mut [Cell]| {
+            for (yy, row) in chunk.chunks_exact_mut(s).enumerate() {
+                let y = y0 + yy;
+                for (x, c) in row.iter_mut().enumerate() {
+                    if c.hit {
+                        continue;
+                    }
+                    let mut sum = [0f32; 8];
+                    let mut n = 0.0;
+                    for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                        let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                        if nx >= 0 && ny >= 0 && (nx as usize) < s && (ny as usize) < s {
+                            let p = &prev[ny as usize * s + nx as usize];
+                            if p.hit {
+                                sum.iter_mut().zip(p.v).for_each(|(a, b)| *a += b);
+                                n += 1.0;
+                            }
+                        }
+                    }
+                    if n > 0.0 {
+                        *c = Cell { v: sum.map(|v| v / n), hit: true };
                     }
                 }
-                if n > 0.0 {
-                    acc[y * s + x] = sum.map(|v| v / n);
-                    hit[y * s + x] = true;
-                }
             }
-        }
+        };
+        std::thread::scope(|sc| {
+            for (i, chunk) in cells.chunks_mut(rows * s).enumerate() {
+                let pass = &pass;
+                sc.spawn(move || pass(i * rows, chunk));
+            }
+        });
     }
 }
 
