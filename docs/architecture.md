@@ -58,6 +58,9 @@ audio/                     AUDIO
 model3d/                   3D
   contract   nextsycl-model3d    the contract: Model3dEngine (generate: pictures to a mesh; rig: a skeleton and skin
                                  weights, or motion from words), MeshRequest / RigRequest, Abilities, Step, Model3dKind
+  hunyuan3d  nextsycl-model3d-hunyuan3d  Hunyuan3D 2.1 (shape + PBR paint) and 2mini-turbo: DINOv2, the Flux-style and
+                                 the plain MoE DiTs, the ShapeVAE decoder (coarse to fine), the paint model's 2.5D
+                                 UNet, SD VAE, UniPC, views, bake; stage checks
   example    nextsycl-model3d-example  a template
 
 glue/                      WHAT MAKES ENGINES A PRODUCT (libraries too)
@@ -345,6 +348,19 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   convolution, attention over a causal window, float32 RoPE, layer-scaled residuals, ELU (the encoder's); the
   encoder's strided causal convolutions go through `ns_audio_mm3_conv1d_lr` too. The text embedding stays
   on disk (a row read a token). Settings: `NS_Q3T_INT8=1` (`--opt-int8`).
+
+## The 3D engines
+
+- **hunyuan3d** - Hunyuan3D (Tencent) from its own files: 2mini-turbo (Tencent's DiT safetensors with its
+  DINOv2-giant conditioner, the turbo ShapeVAE decoder) and 2.1 (Comfy-Org's single-file shape model; the paint
+  model's PyTorch .bin checkpoints, read by offset through `nextsycl_gguf::pth`, and DINOv2-giant). Its kernels
+  (`kernels/model3d/hunyuan3d`): layer norm with affine and modulation in one pass, per-head q / k norms in strided
+  rows, the shape decoder's Fourier query embedding (of points or lattice indices), the MoE's routing, gather and
+  scatter, GroupNorm, GEGLU, padding / concatenation / nearest upsampling for the UNet. The shared diffusion
+  kernels do the linears, attention (self, batched, cross), convolutions and RoPE. CPU: marching cubes and the
+  decimation (`crates/mesh`), the picture's preprocessing, the paint model's six views (a port of Tencent's
+  rasterizer), UniPC, the bake and the inpainting. Settings: `NS_M3D_HY_TOKENS`, `NS_M3D_HY_DECODE`,
+  `NS_M3D_HY_CHUNK`, `NS_M3D_HY_PAINT`, `NS_M3D_HY_PAINT_STEPS` (docs/environment.md).
 
 ## The model registry
 

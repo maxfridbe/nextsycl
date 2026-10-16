@@ -107,6 +107,13 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `muse-glimmer-30b-q8-b70`, `muse-glimmer-30b-q8-b65` | the same on the B70 or the B65 alone, no drafter (the engine drops it anyway when it does not fit), 128K + 32K | `muse-glimmer` | 26.2 GiB | served |
 | `muse-glimmer-30b-q4`, `muse-glimmer-30b-q6` | Muse Glimmer 30B Q4_K_M / Q6_K on the B70 alone with its DFlash drafter (the silo's K-quant products on XMX, verify exact), 128K + 32K | `muse-glimmer` | 15.8 / 21.3 GiB + 1.5 | checked (spec-check 0), served |
 
+**3D** (`nextsycl model3d`: a mesh from a picture)
+
+| id | model | engine | size | status |
+|---|---|---|---|---|
+| `hunyuan3d-2mini-turbo` | Hunyuan3D-2mini-turbo: the 0.6B Flux-style DiT, DINOv2-giant, the FlashVDM turbo decoder; shape only | `hunyuan3d` | 3.9 GiB | checked |
+| `hunyuan3d-2.1` | Hunyuan3D 2.1: the 3.0B MoE DiT (shape) and the paint model (PBR textures) | `hunyuan3d` | 15.0 GiB | checked |
+
 **Image** (`nextsycl image`; sizes with the text encoder, VAE and tokenizer)
 
 | id | model | engine | size | status |
@@ -910,6 +917,48 @@ attention layers without positions (32 / 2 heads of 128); its MTP block drafts. 
   decodes ~30. On the B70 alone (`nemotron-3.5-super-iq1m-b70`, the B65 left free) 13 MoE layers' experts (15.5 GiB)
   sit in pinned host memory, gathered into VRAM each step; its prompt passes still expand experts one at a time. Open: the expert up products at decode (IQ3_XXS / IQ2_S / IQ1_S at ~150 GB/s on the B70, a third of the dense
   ones - neither the grid lookups nor the index math; `NS_NH_PROFILE=1` times every kernel), the vision tower.
+
+## 3D
+
+Hunyuan3D (`model3d/hunyuan3d`): a mesh (GLB) from one picture of an object. **hunyuan3d-2mini-turbo** makes the
+shape in seconds; **hunyuan3d-2.1** makes a finer shape and paints it (base colour and metallic-roughness in a UV
+atlas).
+
+```sh
+nextsycl models pull hunyuan3d-2mini-turbo        # or hunyuan3d-2.1
+nextsycl model3d gen picture.png --model hunyuan3d-2mini-turbo [--seed N] [--resolution 380] [--faces 40000]
+nextsycl model3d gen picture.png --model hunyuan3d-2.1 --texture [--texture-size 2048]
+nextsycl model3d check <reference dump dir> --model ID [--stages ...]    # reference/hunyuan3d
+```
+
+A picture with transparency is cut out by its alpha; an opaque one by its near-uniform border colour (the shared
+background remover will take over). The shape: the picture recentred, DINOv2's tokens, the DiT's latents, the
+ShapeVAE's occupancy on a grid decoded coarse to fine near the surface, marching cubes, small pieces dropped,
+decimated to `faces`. The texture: six views' normal and position maps, the 2.5D multiview UNet's albedo and
+metallic-roughness views (15 UniPC steps, three-way guidance), baked into a fresh atlas, unseen texels filled from
+the mesh.
+
+- **Checked** against Tencent's own code in float32 on the CPU (`reference/hunyuan3d/`, the same files), each stage
+  from the reference's input. 2mini-turbo: the conditioner rel 3.7e-3 (cos 0.999993), the DiT's double block 0
+  2.9e-4 / 4.7e-4, its velocity at every step 6e-4 - 2.3e-3, five steps 1.5e-2 (cos 0.99989), the decoder's
+  transformer 7.6e-4, logits at fixed points 7.6e-4 (8,191 of 8,192 on the same side), a 128^3 grid 7.2e-4 (45 of
+  2.1M points flip; the mesh 38,336 vertices to skimage's 38,328). 2.1: the conditioner 2.8e-3, block 0 5.0e-4, the
+  conditional and unconditional passes 4.1e-4 / 4.0e-4, the guided velocity 2.0e-3 - 1.4e-2 (CFG 5 amplifies), the
+  decoder's logits 2.5e-4. Paint: the six views' maps 6e-5 (12 of 4.7M values more than one level off), the
+  picture 2.8e-4, DINOv2-giant 2.9e-3, its projection 3.3e-4, the VAE's latents 1.1e-3 - 2.2e-3, the reference
+  UNet's states 1e-3 - 3e-3, the UNet's 36 outputs 2.2e-3, the guided v 3.5e-3, UniPC 1e-7, 15 steps 5.7e-3 (cos
+  0.99998), the decoded views 1.5e-4; the bake against Tencent's back-projection over the same atlas cos 0.994
+  (differences on edges: texel centres and depth-edge rules).
+- Tencent's turbo example samples 512 latent tokens (its turbo decoder's `latent_shape`); the DiT is trained at
+  3,072, which keeps detail 512 loses: 3,072 is the default (`--opt-tokens 512` for the example's).
+
+Speed (`model3d gen`, the penguin of Tencent's demo, seed 7, 2026-10-16; mesh to 40,000 triangles):
+
+| model | B70 | B65 | phases on the B70 | VRAM peak |
+|---|---|---|---|---|
+| 2mini-turbo (5 steps, 380^3) | 4.2 s | 5.3 s | picture 0.8, shape 1.1, decode 1.8, mesh 0.5 | 5.1 GiB |
+| 2.1 shape (50 steps, CFG 5, 384^3) | 26.4 s | 40.8 s | picture 0.6, shape 22.1 (0.2 s a pass), decode 3.2, mesh 0.5 | 9.7 GiB |
+| 2.1 textured | 48.2 s | 75.0 s | shape as above, views 0.2, 15 steps 19.7 (1.3 s a step), decode 1.2, bake 0.7 | 16.9 GiB (B65) |
 
 ## Speed by model
 
