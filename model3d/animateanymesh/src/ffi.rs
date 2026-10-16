@@ -99,6 +99,8 @@ pub struct Silo {
     pub path: std::path::PathBuf,
     attention_supported: unsafe extern "C" fn(i64, i64, c_int) -> c_int,
     attention: unsafe extern "C" fn(G, F, i64, i64, F, i64, i64, F, i64, i64, i64, i64, i64, i64, i64, i64, f32, c_int, O, i64, O, i64) -> c_int,
+    fps_supported: unsafe extern "C" fn(i64, i64, i64) -> c_int,
+    fps: unsafe extern "C" fn(G, F, i64, i64, i64, O, *mut i32) -> c_int,
 }
 
 // SAFETY: function pointers into a library that stays loaded for the process.
@@ -127,6 +129,8 @@ pub fn silo() -> Result<Option<&'static Silo>> {
             path: lib.path.clone(),
             attention_supported: sym!("ns_model3d_aam_silo_attention_supported"),
             attention: sym!("ns_model3d_aam_silo_attention"),
+            fps_supported: sym!("ns_model3d_aam_silo_fps_supported"),
+            fps: sym!("ns_model3d_aam_silo_fps"),
         }))
     })
     .as_ref()
@@ -212,7 +216,10 @@ impl K {
 
     /// Farthest points of x [N, D]: `k` int32 indices into `idx` (dist: N floats of scratch)
     pub fn fps(&self, x: &DevBuf, n: usize, d: usize, k: usize, dist: &DevBuf, idx: &DevBuf) -> Result<()> {
-        // SAFETY: x holds n d floats, dist n, idx k int32.
+        // SAFETY (both): x holds n d floats, dist n, idx k int32.
+        if let Some(s) = self.silo.filter(|s| unsafe { (s.fps_supported)(n as i64, d as i64, k as i64) } == 1) {
+            return check(unsafe { (s.fps)(self.g, x.fp(), n as i64, d as i64, k as i64, dist.fp(), idx.ptr().cast()) }, "farthest point sampling (silo)");
+        }
         check(unsafe { (self.k.fps)(self.g, x.fp(), n as i64, d as i64, k as i64, dist.fp(), idx.ptr().cast()) }, "farthest point sampling")
     }
 
