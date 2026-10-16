@@ -12,3 +12,5 @@ nextsycl-diffusion.workspace = true
 nextsycl-gguf.workspace = true
 nextsycl-model3d.workspace = true
 serde_json.workspace = true
+# RigNet ships its checkpoints deflated in one ZIP (already in the build through png)
+miniz_oxide = "0.8"

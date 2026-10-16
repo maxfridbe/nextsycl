@@ -865,6 +865,7 @@ dependencies = [
 name = "nextsycl-model3d-rignet"
 version = "0.0.0"
 dependencies = [
+ "miniz_oxide 0.8.9",
  "nextsycl-core",
  "nextsycl-diffusion",
  "nextsycl-gguf",
