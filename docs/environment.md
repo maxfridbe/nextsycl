@@ -168,6 +168,8 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_NH_DENSE` | 1 | 0: the nemotronh engine's dense decode products on the shared mmvq instead of its silo's | llm:nemotronh |
 | `NS_NH_DENSE_GROUPS` | 512 | Debug: the work-groups of the nemotronh silo's dense products with a table | kernels:nemotronh silo |
 | `NS_NH_DENSE_ROWS` | 0 | Debug: 1, 2 or 4 rows a sub-group in every 256-block type of the nemotronh silo's dense products (0: each type's own) | kernels:nemotronh silo |
+| `NS_NH_MOE_MT` | 64 | Debug: rows a tile of the nemotronh silo's prompt expert products (32 or 64) | kernels:nemotronh silo |
+| `NS_NH_MOE_XMX` | 1 | 0: the nemotronh prompt pass's experts expanded to half one at a time, then the GEMM (else one XMX launch a projection) | llm:nemotronh |
 | `NS_NH_DRAFTS` | 2 | Tokens the nemotronh engine drafts a step with its MTP block (at most 7; 0: none; the MTP block needs its silo) (--opt-drafts) | llm nemotronh |
 | `NS_NH_HOST` | auto | MoE layers (from the last back) whose experts the nemotronh engine keeps in pinned host memory on one GPU (default: as few as fit; the draft block's first) | llm nemotronh |
 | `NS_NH_SPEED` | units x clock | The nemotronh engine's relative speed of each GPU, in order ('1,1.6'): its layers split by it (as far as each GPU's memory goes) | llm nemotronh |

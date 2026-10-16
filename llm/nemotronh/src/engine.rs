@@ -386,6 +386,8 @@ pub struct NemotronH<'g> {
     silo: Option<&'static ffi::Silo>,
     /// the silo's dense decode products (NS_NH_DENSE=0: the shared mmvq)
     dense: bool,
+    /// the prompt pass's experts on XMX (NS_NH_MOE_XMX=0: expanded one at a time, then the GEMM)
+    moe_xmx: bool,
     layers: Vec<Layer>,
     output_norm: DevBuf,
     output: Mat,
@@ -717,6 +719,7 @@ impl<'g> NemotronH<'g> {
         Ok(NemotronH { g, file: f, devs, layer_dev, staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, work: Mutex::new(()), chunk, mtp, drafts,
                        snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(),
                        dense: std::env::var("NS_NH_DENSE").map_or(true, |v| v != "0"),
+                       moe_xmx: std::env::var("NS_NH_MOE_XMX").map_or(true, |v| v != "0"),
                        prof: std::env::var("NS_NH_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get() })
     }
 
@@ -1064,8 +1067,14 @@ impl<'g> NemotronH<'g> {
         rowb.write(0, &bytes(&rows))?;
         let placeb = self.arena().bytes(n_e * 4)?;
         placeb.write(0, &bytes(&place))?;
+        // experts in VRAM (not staged from host memory): both projections on XMX, a launch each (NS_NH_MOE_XMX=0: one
+        // expert at a time, expanded to half, then the GEMM)
+        let staged = m.up._pin.is_some().then_some(()).and(self.dev().slots.as_ref());
+        let xmx = staged.is_none() && self.moe_xmx;
+        // SAFETY: arithmetic only.
+        let mt = if xmx { (unsafe { (s.moe_tile_rows)() }) as usize } else { 0 };
         let lat16 = self.arena().bytes(t * g.latent * 2)?;
-        let xg = self.arena().bytes(n_e * g.latent * 2)?;
+        let xg = self.arena().bytes((n_e + mt) * g.latent * 2)?;
         let u = self.arena().f32(n_e * g.n_ff_exp)?;
         // SAFETY: the buffers as named in glm.h: the latent rows to half, then each entry's row gathered in expert order.
         unsafe {
@@ -1073,19 +1082,42 @@ impl<'g> NemotronH<'g> {
             self.op("gather", || (k.gather_h)(self.raw(), lat16.ptr().cast(), rowb.ptr().cast(), xg.ptr().cast(), n_e as i64, g.latent as i64))?;
         }
         let w16 = &self.dev().w16;
-        let u16 = self.arena().bytes(n_e * g.n_ff_exp * 2)?;
+        let u16 = self.arena().bytes((n_e + mt) * g.n_ff_exp * 2)?;
         let dn = self.arena().f32(n_e * g.latent)?;
+        if xmx {
+            // tiles of at most mt rows of one expert: (expert, first row, rows)
+            let mut tiles = Vec::new();
+            for x in 0..g.experts {
+                let mut a = count[x];
+                while a < count[x + 1] {
+                    let r = (count[x + 1] - a).min(mt);
+                    tiles.extend_from_slice(&[x as i32, a as i32, r as i32]);
+                    a += r;
+                }
+            }
+            let nt = tiles.len() / 3;
+            let tb = self.arena().bytes(tiles.len() * 4)?;
+            tb.write(0, &bytes(&tiles))?;
+            let un = if self.prof.is_some() { format!("experts up xmx {}", m.up.ty.name()) } else { String::new() };
+            let dname = if self.prof.is_some() { format!("experts down xmx {}", m.down.ty.name()) } else { String::new() };
+            // SAFETY: the buffers as named in nhs.h (x padded by a tile's rows).
+            unsafe {
+                self.op(&un, || (s.moe_gemm)(self.raw(), m.up.ty.code() as c_int, m.up.buf.ptr(), m.up.stride as i64, tb.ptr().cast(), nt as i64,
+                                             xg.ptr(), g.latent as i64, g.n_ff_exp as i64, std::ptr::null_mut(), u16.ptr()))?;
+                self.op(&dname, || (s.moe_gemm)(self.raw(), m.down.ty.code() as c_int, m.down.buf.ptr(), m.down.stride as i64, tb.ptr().cast(), nt as i64,
+                                                u16.ptr(), g.n_ff_exp as i64, g.latent as i64, dn.fp(), std::ptr::null_mut()))?;
+            }
+        }
         // SAFETY: arithmetic only.
         let packed = unsafe { (s.packed)(m.down.ty.code() as i32, g.n_ff_exp as i64) } != 0;
-        // experts kept in host memory: each brought into a VRAM slot (one wide copy) before it is expanded
-        let staged = m.up._pin.is_some().then_some(()).and(self.dev().slots.as_ref());
         let ex: Vec<i32> = (0..g.experts as i32).collect();
         let exb = self.arena().bytes(g.experts * 4)?;
         exb.write(0, &bytes(&ex))?;
         // the up products, then relu^2 and half, then the down products: one expert at a time - its matrix expanded to
         // half, then multiplied over its rows while the half copy (5.5 MB) is still in the cache (a group of 64 expanded
         // in one launch was slower: 659 -> 596 tok/s, the copies read back from memory)
-        for (stage, mat) in [(0, &m.up), (1, &m.down)] {
+        // (experts kept in host memory: each brought into a VRAM slot - one wide copy - before it is expanded)
+        for (stage, mat) in [(0, &m.up), (1, &m.down)].into_iter().filter(|_| !xmx) {
             if stage == 1 {
                 // SAFETY: n floats, then to half.
                 unsafe {

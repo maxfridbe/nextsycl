@@ -8,6 +8,7 @@
 #include "nhs.h"
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <dpct/dpct.hpp>
 #include <algorithm>
 #include <cstdlib>
@@ -474,6 +475,222 @@ void deq_wide(sycl::queue& q, const uint8_t* src, sycl::half* dst, int64_t rows,
                        });
     });
 }
+
+// ---- the prompt pass's experts on XMX (ns_nhs_moe_gemm): a work-group a tile of up to MT rows of one expert (the
+// rows in expert order), over the output 64 rows at a time; a step of 32 inputs: each of its 64 lanes decodes one
+// output row's 32 weights (the types' loaders above) into a half tile in local memory (two, taken in turn: one barrier
+// a step), then its 4 sub-groups of 16 multiply their 16 rows of it against the tile's rows (half DPAS 8 x 16 x 16,
+// float sums). No expansion of the matrix to memory, one launch a projection
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+struct DW { sycl::int4 lo, hi; float s0, s1, off; };
+
+// a 256-block type: row rp's sub-block sb (its loader's lane g = sb % 8)
+template <typename F>
+struct DecWide {
+    static constexpr bool HALF = false;
+    static constexpr int LUT = F::LUT;
+    static uint32_t lut(int i) { return F::lut(i); }
+    static DW dec(const uint8_t* rp, int sb, int, const uint32_t* tab) {
+        const typename F::W w = F::load(reinterpret_cast<const typename F::Block*>(rp) + sb / 8, sb % 8, tab);
+        return DW{w.lo, w.hi, w.s0, w.s1, w.off};
+    }
+};
+// the packed 32-value types (a row's codes, then its scales at qsb)
+struct DecQ2_0 {
+    static constexpr bool HALF = false;
+    static constexpr int LUT = 0;
+    static uint32_t lut(int) { return 0; }
+    static DW dec(const uint8_t* rp, int s, int qsb, const uint32_t*) {
+        const sycl::uint2 c = *reinterpret_cast<const sycl::uint2*>(rp + 8 * s);
+        const float d = (float) reinterpret_cast<const sycl::half*>(rp + qsb)[s >> 1];
+        auto spread = [](uint32_t b) { return int((b | (b << 6) | (b << 12) | (b << 18)) & 0x03030303u); };
+        const uint32_t a = c.x(), b = c.y();
+        return DW{sycl::int4(spread(a & 0xff), spread((a >> 8) & 0xff), spread((a >> 16) & 0xff), spread(a >> 24)),
+                  sycl::int4(spread(b & 0xff), spread((b >> 8) & 0xff), spread((b >> 16) & 0xff), spread(b >> 24)), d, d, -d};
+    }
+};
+// IQ4_NL / IQ4_XS: the codes kept (lo: a sub-block's 16 bytes, s0 its scale), turned into half pairs at the tile
+// write (emit) through a table of a byte's two values as half (low nibble, high), a pair of pairs regrouped, then one
+// packed multiply - not to int8 and back
+inline uint32_t iq4_half_pair(int i) {
+    return uint32_t(sycl::bit_cast<uint16_t>(sycl::half((float) kvalues_iq4nl[i & 15]))) |
+           (uint32_t(sycl::bit_cast<uint16_t>(sycl::half((float) kvalues_iq4nl[i >> 4]))) << 16);
+}
+inline void iq4_emit(const DW& w, const uint32_t* tab, uint32_t* out) {
+    const sycl::half2 d(w.s0);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t c = word_of(w.lo, i);
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const uint32_t t0 = tab[(c >> (16 * k)) & 0xff], t1 = tab[(c >> (16 * k + 8)) & 0xff];
+            // bytes 4i + 2k, + 1: values 4i + 2k, + 1 (low nibbles: pair 2i + k) and 16 + those (high: pair 8 + 2i + k)
+            out[2 * i + k] = sycl::bit_cast<uint32_t>(sycl::bit_cast<sycl::half2>((t0 & 0xffffu) | (t1 << 16)) * d);
+            out[8 + 2 * i + k] = sycl::bit_cast<uint32_t>(sycl::bit_cast<sycl::half2>((t0 >> 16) | (t1 & 0xffff0000u)) * d);
+        }
+    }
+}
+struct DecIQ4NL {
+    static constexpr bool HALF = true;
+    static constexpr int LUT = 256;
+    static uint32_t lut(int i) { return iq4_half_pair(i); }
+    static DW dec(const uint8_t* rp, int s, int qsb, const uint32_t*) {
+        const sycl::int4 c = *reinterpret_cast<const sycl::int4*>(rp + 16 * s);
+        const float d = (float) reinterpret_cast<const sycl::half*>(rp + qsb)[s];
+        return DW{c, sycl::int4(0), d, d, 0.0f};
+    }
+    static void emit(const DW& w, const uint32_t* tab, uint32_t* out) { iq4_emit(w, tab, out); }
+};
+struct DecIQ4XS {
+    static constexpr bool HALF = true;
+    static constexpr int LUT = 256;
+    static uint32_t lut(int i) { return iq4_half_pair(i); }
+    static DW dec(const uint8_t* rp, int sb, int, const uint32_t*) {
+        const uint8_t* p = rp + std::size_t(sb / 8) * sizeof(block_iq4_xs);
+        const int g = sb % 8;
+        const sycl::int4 c = load16_a2(p + 8 + 16 * g);
+        const uint32_t sh = *reinterpret_cast<const uint16_t*>(p + 2);
+        const uint32_t ls = ((p[4 + g / 2] >> (4 * (g % 2))) & 0xf) | (((sh >> (2 * g)) & 3) << 4);
+        const float d = (float) *reinterpret_cast<const sycl::half*>(p) * (float) ((int) ls - 32);
+        return DW{c, sycl::int4(0), d, d, 0.0f};
+    }
+    static void emit(const DW& w, const uint32_t* tab, uint32_t* out) { iq4_emit(w, tab, out); }
+};
+struct DecQ8_0 {
+    static constexpr bool HALF = false;
+    static constexpr int LUT = 0;
+    static uint32_t lut(int) { return 0; }
+    static DW dec(const uint8_t* rp, int s, int qsb, const uint32_t*) {
+        const sycl::int4* c = reinterpret_cast<const sycl::int4*>(rp + 32 * s);
+        const float d = (float) reinterpret_cast<const sycl::half*>(rp + qsb)[s];
+        return DW{c[0], c[1], d, d, 0.0f};
+    }
+};
+
+int moe_mt() {   // NS_NH_MOE_MT=32|64: rows a tile of the prompt experts' products (default 64)
+    static const int v = std::getenv("NS_NH_MOE_MT") ? std::atoi(std::getenv("NS_NH_MOE_MT")) : 64;
+    return v;
+}
+
+// each sub-group a quarter of the tile's rows (MA tiles of 8) against all 64 columns (4 B tiles): its A tiles (read from
+// memory: staged in local memory instead, 2-3x slower) each used 4 times. Measured (B70, 8K prompt, IQ3_XXS up of a
+// 2,048-row chunk): a sub-group's 16 columns 28 ms, 32 columns 24, 64 columns 17; 64-row tiles 16 (32: 17); the
+// expansion + GEMM per expert before it 22
+template <typename D, int MT>
+void moe_gemm(sycl::queue& q, const uint8_t* base, int64_t stride, int64_t rb, int qsb, const int32_t* tiles, int ntiles, const sycl::half* x, int K,
+              int N, float* yf, sycl::half* yh) {
+    constexpr int SGS = 16, NSG = 4, NT = 64, WG = NSG * SGS, KSB = 4, NB = 4, MA = MT / 8 / NSG;
+    // the weights' tile [KSB * 16 pairs][NT] (the output's stage after the last, in the same memory)
+    constexpr int TILE = KSB * 16 * NT;
+    static_assert(TILE >= MT * NT, "the output stage fits the tile");
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(D::LUT > 0 ? D::LUT : 1), h);
+        sycl::local_accessor<uint32_t, 1> bt(sycl::range<1>(TILE), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ntiles * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = it.get_sub_group();
+            const int lid = (int) it.get_local_id(0), sgi = lid / SGS;
+            uint32_t* tb = tab.get_multi_ptr<sycl::access::decorated::no>().get();
+            uint32_t* tl = bt.get_multi_ptr<sycl::access::decorated::no>().get();
+            float* sp = reinterpret_cast<float*>(tl);
+            if constexpr (D::LUT > 1) {
+                for (int i = lid; i < D::LUT; i += WG) tb[i] = D::lut(i);
+                sycl::group_barrier(it.get_group());
+            }
+            const int ti = (int) it.get_group(0);
+            const int e = tiles[3 * ti], a = tiles[3 * ti + 1], m = tiles[3 * ti + 2];
+            const uint8_t* wb = base + std::size_t(e) * stride;
+            const int nsb = K / 32;
+            for (int n0 = 0; n0 < N; n0 += NT) {
+                jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> acc[MA][NB];
+#pragma unroll
+                for (int i = 0; i < MA; ++i)
+#pragma unroll
+                    for (int j = 0; j < NB; ++j) jm::joint_matrix_fill(sg, acc[i][j], 0.0f);
+                const int n = n0 + lid;
+                const uint8_t* rp = wb + std::size_t(n < N ? n : N - 1) * rb;
+                for (int s0 = 0; s0 < nsb; s0 += KSB) {
+                    // this lane's row's KSB sub-blocks -> half pairs, column lid of the tile (sub-block j's pair p at j * 16 + p)
+                    DW w[KSB];
+#pragma unroll
+                    for (int j = 0; j < KSB; ++j) w[j] = D::dec(rp, sycl::min(s0 + j, nsb - 1), qsb, tb);
+                    sycl::group_barrier(it.get_group());   // (the tiles' last readers done)
+#pragma unroll
+                    for (int j = 0; j < KSB; ++j) {
+                        const bool live = n < N && s0 + j < nsb;
+                        if constexpr (D::HALF) {
+                            uint32_t hv[16];
+                            D::emit(w[j], tb, hv);
+#pragma unroll
+                            for (int p = 0; p < 16; ++p) tl[(j * 16 + p) * NT + lid] = live ? hv[p] : 0u;
+                            continue;
+                        }
+                        // a dword's 4 int8 -> 2 half pairs exactly (biased bytes in the mantissa of 1024, less 1152), then
+                        // one packed half multiply-add a pair
+                        const sycl::half2 hs0(w[j].s0), hs1(w[j].s1), off(w[j].off), bias(1152.0f);
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const uint32_t xw = word_of(i < 4 ? w[j].lo : w[j].hi, i % 4) ^ 0x80808080u;
+                            const uint32_t pl = (xw & 0xffu) | ((xw & 0xff00u) << 8) | 0x64006400u;
+                            const uint32_t ph = ((xw >> 16) & 0xffu) | ((xw >> 8) & 0xff0000u) | 0x64006400u;
+                            const sycl::half2& s = i < 4 ? hs0 : hs1;
+                            const sycl::half2 vl = (sycl::bit_cast<sycl::half2>(pl) - bias) * s + off;
+                            const sycl::half2 vh = (sycl::bit_cast<sycl::half2>(ph) - bias) * s + off;
+                            tl[(j * 16 + 2 * i) * NT + lid] = live ? sycl::bit_cast<uint32_t>(vl) : 0u;
+                            tl[(j * 16 + 2 * i + 1) * NT + lid] = live ? sycl::bit_cast<uint32_t>(vh) : 0u;
+                        }
+                    }
+                    sycl::group_barrier(it.get_group());
+#pragma unroll
+                    for (int hk = 0; hk < 2 * KSB; ++hk) {
+                        if (s0 * 32 + hk * 16 >= K) break;
+                        jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> bm[NB];
+#pragma unroll
+                        for (int j = 0; j < NB; ++j)
+                            jm::joint_matrix_load(sg, bm[j], sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                                                                 reinterpret_cast<sycl::half*>(tl + hk * 8 * NT + j * 16)), (size_t) (NT * 2));
+#pragma unroll
+                        for (int i = 0; i < MA; ++i) {
+                            jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> am;
+                            const int r8 = (sgi * MA + i) * 8;
+                            jm::joint_matrix_load(sg, am, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                                                              x + std::size_t(a + r8) * K + s0 * 32 + hk * 16), (size_t) K);
+#pragma unroll
+                            for (int j = 0; j < NB; ++j) jm::joint_matrix_mad(sg, acc[i][j], am, bm[j], acc[i][j]);
+                        }
+                    }
+                }
+                sycl::group_barrier(it.get_group());   // (the tile's readers done: it becomes the output's stage)
+#pragma unroll
+                for (int i = 0; i < MA; ++i)
+#pragma unroll
+                    for (int j = 0; j < NB; ++j)
+                        jm::joint_matrix_store(sg, acc[i][j], sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                                                                  sp + ((sgi * MA + i) * 8) * NT + j * 16), (size_t) NT, jm::layout::row_major);
+                sycl::group_barrier(it.get_group());
+                for (int idx = lid; idx < m * NT; idx += WG) {
+                    const int r = idx / NT, c = idx % NT;
+                    if (n0 + c >= N) continue;
+                    const float v = sp[idx];
+                    const std::size_t o = std::size_t(a + r) * N + n0 + c;
+                    if (yh) {
+                        const float u = sycl::fmax(v, 0.0f);
+                        yh[o] = sycl::half(u * u);
+                    } else {
+                        yf[o] = v;
+                    }
+                }
+                // (the next stage's first barrier keeps its tile writes after these reads)
+            }
+        });
+    });
+}
+
+template <typename D>
+void moe_mts(sycl::queue& q, const uint8_t* base, int64_t stride, int64_t rb, int qsb, const int32_t* tiles, int ntiles, const sycl::half* x, int K, int N,
+             float* yf, sycl::half* yh, int mt) {
+    if (mt >= 64) moe_gemm<D, 64>(q, base, stride, rb, qsb, tiles, ntiles, x, K, N, yf, yh);
+    else moe_gemm<D, 32>(q, base, stride, rb, qsb, tiles, ntiles, x, K, N, yf, yh);
+}
 }  // namespace
 
 extern "C" {
@@ -694,6 +911,42 @@ int ns_nhs_multi(ns_gpu* g, int type, const void* base, int64_t stride, const in
         case 42: multi32<NarrowQ2_0>(g->q, type, b, stride, ids, cols, E, xs, NC, y, K, N); break;
         case 20: multi32<NarrowIQ4NL>(g->q, type, b, stride, ids, cols, E, xs, NC, y, K, N); break;
         default: multi32<NarrowQ8_0>(g->q, type, b, stride, ids, cols, E, xs, NC, y, K, N); break;
+    }
+    return 0;
+    NS_CATCH
+}
+
+
+int ns_nhs_moe_tile_rows() { return moe_mt() >= 64 ? 64 : 32; }
+
+int ns_nhs_moe_gemm(ns_gpu* g, int type, const void* base, int64_t stride, const int32_t* tiles, int64_t ntiles, const void* x, int64_t n_in, int64_t n_out,
+                    float* y, void* y_relu2_half) {
+    NS_TRY
+    if (!ns_nhs_multi_supported(type, n_in) || n_in % 32 != 0) return ns_fail("ns_nhs_moe_gemm: ggml type " + std::to_string(type) + " at " + std::to_string(n_in) + " inputs");
+    if (ntiles < 1) return 0;
+    const uint8_t* b = static_cast<const uint8_t*>(base);
+    const auto* xh = static_cast<const sycl::half*>(x);
+    auto* yh = static_cast<sycl::half*>(y_relu2_half);
+    const int K = (int) n_in, N = (int) n_out, T = (int) ntiles, mt = ns_nhs_moe_tile_rows();
+    if (ns_nhs_packed(type, n_in)) {
+        const int64_t rb = packed_row(type, K);
+        const int qsb = packed_qs(type, K);
+        switch (type) {
+            case 42: moe_mts<DecQ2_0>(g->q, b, stride, rb, qsb, tiles, T, xh, K, N, y, yh, mt); break;
+            case 20: moe_mts<DecIQ4NL>(g->q, b, stride, rb, qsb, tiles, T, xh, K, N, y, yh, mt); break;
+            case 8: moe_mts<DecQ8_0>(g->q, b, stride, rb, qsb, tiles, T, xh, K, N, y, yh, mt); break;
+        }
+        return 0;
+    }
+    const int bpr = K / QK;
+    switch (type) {
+        case 8: moe_mts<DecWide<WideQ8_0>>(g->q, b, stride, int64_t(bpr) * sizeof(Q8x8), 0, tiles, T, xh, K, N, y, yh, mt); break;
+        case 16: moe_mts<DecWide<WideIQ2XXS>>(g->q, b, stride, int64_t(bpr) * sizeof(block_iq2_xxs), 0, tiles, T, xh, K, N, y, yh, mt); break;
+        case 17: moe_mts<DecWide<WideIQ2XS>>(g->q, b, stride, int64_t(bpr) * sizeof(block_iq2_xs), 0, tiles, T, xh, K, N, y, yh, mt); break;
+        case 18: moe_mts<DecWide<WideIQ3XXS>>(g->q, b, stride, int64_t(bpr) * sizeof(block_iq3_xxs), 0, tiles, T, xh, K, N, y, yh, mt); break;
+        case 19: moe_mts<DecWide<WideIQ1S>>(g->q, b, stride, int64_t(bpr) * sizeof(block_iq1_s), 0, tiles, T, xh, K, N, y, yh, mt); break;
+        case 22: moe_mts<DecWide<WideIQ2S>>(g->q, b, stride, int64_t(bpr) * sizeof(block_iq2_s), 0, tiles, T, xh, K, N, y, yh, mt); break;
+        case 23: moe_mts<DecIQ4XS>(g->q, b, stride, int64_t(bpr) * sizeof(block_iq4_xs), 0, tiles, T, xh, K, N, y, yh, mt); break;
     }
     return 0;
     NS_CATCH

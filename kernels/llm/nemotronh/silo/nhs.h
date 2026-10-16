@@ -43,6 +43,14 @@ int ns_nhs_gather(ns_gpu* g, const void* src, int64_t stride, const int32_t* ids
 int ns_nhs_multi(ns_gpu* g, int type, const void* base, int64_t stride, const int32_t* ids, const int32_t* cols, int64_t entries, const void* xs,
                  int64_t ncols, float* y, int64_t n_in, int64_t n_out);
 
+/* The prompt pass's experts on XMX: tiles [ntiles][3] = (expert, first row, rows - at most ns_nhs_moe_tile_rows()) over
+ * x [rows][n_in] half in expert order (readable to the last tile's first row + the tile rows); the expert's matrix
+ * (base + expert * stride, packed when ns_nhs_packed) decoded a step of 32 inputs at a time into local memory. Out:
+ * y [rows][n_out] float, or (y_relu2_half not null) relu(v)^2 as half there */
+int ns_nhs_moe_tile_rows(void);
+int ns_nhs_moe_gemm(ns_gpu* g, int type, const void* base, int64_t stride, const int32_t* tiles, int64_t ntiles, const void* x, int64_t n_in, int64_t n_out,
+                    float* y, void* y_relu2_half);
+
 /* dense.cpp: the dense matrices' decode products (the qwen35 silo's, copied, Q6_K added): x [ncols, n_in] -> its
  * Q8_1 blocks (nullable) and the split layout in one launch; whether a type at a width is taken; y [ncols, n_out] =
  * W [n_out, n_in] . x for 1..8 columns from the split layout */
