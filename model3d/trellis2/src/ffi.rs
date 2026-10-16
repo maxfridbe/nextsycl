@@ -1,5 +1,7 @@
-//! This engine's own C ABI (`kernels/model3d/trellis2/t2.h`), bound from the 3D kernel library by name, and the calls
-//! on one GPU (`K`). The pointers are device memory the host never dereferences; t2.h says each call's sizes.
+//! This engine's own C ABI (`kernels/model3d/trellis2/t2.h`), bound from the 3D kernel library by name, its silo's
+//! (`kernels/model3d/trellis2/silo/t2s.h`, dist/silo/libnextsycl-trellis2.so when it is there and NS_SILO is not 0),
+//! and the calls on one GPU (`K`: the silo's kernel where it covers a call, t2.h's otherwise). The pointers are device
+//! memory the host never dereferences; the headers say each call's sizes.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_int, c_void};
@@ -71,6 +73,75 @@ pub fn api() -> Result<&'static Api> {
     .map_err(|e| Error(e.clone()))
 }
 
+/// The silo's kernels (t2s.h)
+#[allow(clippy::type_complexity)]
+pub struct Silo {
+    pub path: std::path::PathBuf,
+    linear_supported: unsafe extern "C" fn(c_int, c_int) -> c_int,
+    linear: unsafe extern "C" fn(G, P, i64, i64, P, i64, *const f32, M, c_int, c_int, *const f32) -> c_int,
+    ln_mod_supported: unsafe extern "C" fn(i64, c_int, c_int) -> c_int,
+    ln_mod: unsafe extern "C" fn(G, P, c_int, i64, i64, f32, *const f32, *const f32, *const f32, *const f32, M, c_int) -> c_int,
+}
+
+// SAFETY: function pointers into a library that stays loaded for the process.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+/// The silo, opened once (None: there is none, or NS_SILO=0 - t2.h's kernels for everything)
+pub fn silo() -> Result<Option<&'static Silo>> {
+    static SILO: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    SILO.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo(crate::ARCH).map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in t2s.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo {
+            path: lib.path.clone(),
+            linear_supported: sym!("ns_t2s_linear_supported"),
+            linear: sym!("ns_t2s_linear"),
+            ln_mod_supported: sym!("ns_t2s_ln_mod_supported"),
+            ln_mod: sym!("ns_t2s_ln_mod"),
+        }))
+    })
+    .as_ref()
+    .map(|s| s.as_ref())
+    .map_err(|e| Error(e.clone()))
+}
+
+/// What a product does to its result (t2s.h's epilogues)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Epi {
+    /// out = x w^T + bias
+    Plain,
+    /// out = gelu_tanh(x w^T + bias)
+    Gelu,
+    /// out = silu(x w^T + bias)
+    Silu,
+    /// out (float32) += (x w^T + bias) * gate (null: a plain add)
+    Resid(*const f32),
+}
+
+impl Epi {
+    fn code(self) -> (c_int, *const f32) {
+        match self {
+            Epi::Plain => (0, std::ptr::null()),
+            Epi::Gelu => (1, std::ptr::null()),
+            Epi::Resid(g) => (2, g),
+            Epi::Silu => (3, std::ptr::null()),
+        }
+    }
+}
+
 fn check(rc: c_int, what: &str) -> Result<()> {
     if rc == 0 {
         return Ok(());
@@ -86,6 +157,7 @@ fn d(dt: Dt) -> c_int {
 /// The kernels on one GPU
 pub struct K {
     k: &'static Api,
+    s: Option<&'static Silo>,
     g: G,
 }
 
@@ -95,7 +167,27 @@ unsafe impl Sync for K {}
 
 impl K {
     pub fn new(gpu: &Gpu) -> Result<K> {
-        Ok(K { k: api()?, g: gpu.raw() })
+        Ok(K { k: api()?, s: silo()?, g: gpu.raw() })
+    }
+
+    /// The silo, when it is loaded
+    pub fn silo(&self) -> Option<&'static Silo> {
+        self.s
+    }
+
+    /// The silo's product of x [m, k] half and w [n, k] half (+ bias) with the epilogue into out (out_dt): false when
+    /// there is no silo or it does not take the epilogue (the caller runs t2.h's kernels instead)
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_epi(&self, x: P, m: usize, k: usize, w: P, n: usize, bias: *const f32, out: M, out_dt: Dt, epi: Epi) -> Result<bool> {
+        let Some(s) = self.s else { return Ok(false) };
+        let (e, gate) = epi.code();
+        // SAFETY: a plain query.
+        if unsafe { (s.linear_supported)(e, d(out_dt)) } == 0 {
+            return Ok(false);
+        }
+        // SAFETY: sizes as named (t2s.h).
+        check(unsafe { (s.linear)(self.g, x, m as i64, k as i64, w, n as i64, bias, out, d(out_dt), e, gate) }, "linear (silo)")?;
+        Ok(true)
     }
 
     /// out [m, n] float32 = x [m, k] half . w [n, k] half ^T + bias
@@ -107,6 +199,12 @@ impl K {
     #[allow(clippy::too_many_arguments)]
     pub fn ln_mod(&self, x: P, x_dt: Dt, m: usize, c: usize, eps: f32, w: *const f32, b: *const f32, scale: *const f32, shift: *const f32, out: M,
                   out_dt: Dt) -> Result<()> {
+        if let Some(s) = self.s {
+            // SAFETY: a plain query; then sizes as named (t2s.h).
+            if unsafe { (s.ln_mod_supported)(c as i64, d(x_dt), d(out_dt)) } != 0 {
+                return check(unsafe { (s.ln_mod)(self.g, x, d(x_dt), m as i64, c as i64, eps, w, b, scale, shift, out, d(out_dt)) }, "layer norm (silo)");
+            }
+        }
         // SAFETY: sizes as named (t2.h).
         check(unsafe { (self.k.ln_mod)(self.g, x, d(x_dt), m as i64, c as i64, eps, w, b, scale, shift, out, d(out_dt)) }, "layer norm")
     }

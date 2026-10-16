@@ -237,7 +237,7 @@ pub fn run(e: &Trellis2, dir: &Path, picture: Option<&Picture>, stages: &[&str],
     let hr = has("hr_coords");
     let (tcoords, sname, cname) = if hr { (coords_npy(dir, "hr_coords")?, "shape_hr_slat", "cond1024") } else { (coords.clone(), "shape_slat", "cond512") };
     if stages.contains(&"cascade") && hr {
-        let up = e.shape_dec()?.run(cx, &coords, &npy(dir, "shape_slat")?, &vae::Plan { guide: None, upsample: Some(4), keep_ups: false }, |_, _| Ok(()))?;
+        let up = e.shape_dec()?.run(cx, &coords, &npy(dir, "shape_slat")?, &vae::Plan { guide: None, upsample: Some(4), keep_ups: false, profile: false }, |_, _| Ok(()))?;
         let want = coords_npy(dir, "hr_up")?;
         let mut a = up.coords.clone();
         let mut b = want.clone();
@@ -323,7 +323,7 @@ pub fn run(e: &Trellis2, dir: &Path, picture: Option<&Picture>, stages: &[&str],
     if stages.contains(&"sdec") || stages.contains(&"tdec") {
         let res = if hr { 1024 } else { 512 };
         let sd = e.shape_dec()?;
-        let dec = sd.run(cx, &tcoords, &npy(dir, sname)?, &vae::Plan { guide: None, upsample: None, keep_ups: true }, |_, _| Ok(()))?;
+        let dec = sd.run(cx, &tcoords, &npy(dir, sname)?, &vae::Plan { guide: None, upsample: None, keep_ups: true, profile: false }, |_, _| Ok(()))?;
         drop(sd);
         for i in 0..dec.subs.len() {
             let (rc, rs) = (coords_npy(dir, &format!("sdec_c{i}"))?, npy(dir, &format!("sdec_sub{i}"))?);
@@ -348,7 +348,7 @@ pub fn run(e: &Trellis2, dir: &Path, picture: Option<&Picture>, stages: &[&str],
             tree.levels.push(crate::sparse::subdivide(&rc, |p, o| rs[p * 8 + o] > 0.0));
         }
         let sd = e.shape_dec()?;
-        let rt = sd.run(cx, &tcoords, &npy(dir, sname)?, &vae::Plan { guide: Some(&tree), upsample: None, keep_ups: true }, |_, _| Ok(()))?;
+        let rt = sd.run(cx, &tcoords, &npy(dir, sname)?, &vae::Plan { guide: Some(&tree), upsample: None, keep_ups: true, profile: false }, |_, _| Ok(()))?;
         drop(sd);
         for i in 0..rt.ups.len() {
             let next = if i + 1 < tree.levels.len() { format!("sdec_c{}", i + 1) } else { "sdec_coords".into() };
@@ -364,7 +364,7 @@ pub fn run(e: &Trellis2, dir: &Path, picture: Option<&Picture>, stages: &[&str],
                       mesh.positions.len(), mesh.triangles()));
         if stages.contains(&"tdec") && has("tdec") {
             let td = e.tex_dec()?;
-            let tv = td.run(cx, &tcoords, &npy(dir, "tex_slat")?, &vae::Plan { guide: Some(&dec.tree), upsample: None, keep_ups: false }, |_, _| Ok(()))?;
+            let tv = td.run(cx, &tcoords, &npy(dir, "tex_slat")?, &vae::Plan { guide: Some(&dec.tree), upsample: None, keep_ups: false, profile: false }, |_, _| Ok(()))?;
             let mine: Vec<f32> = tv.feats.iter().map(|v| v * 0.5 + 0.5).collect();
             let (a, b, _, _) = align(&tv.coords, &mine, &coords_npy(dir, "tdec_coords")?, &npy(dir, "tdec")?, 6);
             l.line("tdec", &a, &b);

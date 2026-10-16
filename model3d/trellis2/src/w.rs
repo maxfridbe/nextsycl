@@ -10,7 +10,7 @@ use nextsycl_diffusion::kernels::{none, Dt, Nsd};
 use nextsycl_gguf::safetensors::SafeTensors;
 use nextsycl_gguf::{GType, Gguf};
 
-use crate::ffi::K;
+use crate::ffi::{Epi, K};
 
 pub fn ge(e: nextsycl_gguf::Error) -> Error {
     Error(e.0)
@@ -190,10 +190,16 @@ impl Lin {
         let n = shape[0];
         let k = shape[1..].iter().product::<usize>();
         let bias = if f.has(&format!("{p}.bias")) { Some(DevBuf::from_f32(gpu, &f.vec(&format!("{p}.bias"))?)?) } else { None };
-        let w = if ty == GType::Q8_0 && keep == Keep::Stored {
+        let w = if (ty == GType::Q8_0 && keep == Keep::Stored) || (ty == GType::F16 && keep != Keep::F32) || (ty == GType::F32 && keep == Keep::F32) {
+            // as stored: Q8_0 blocks, half values kept as half or float32 as float32 (the same bits a trip through
+            // float32 on the host gives)
             let b = DevBuf::new(gpu, raw.len())?;
             b.write(0, &raw)?;
-            Wt::Q8(b)
+            match ty {
+                GType::Q8_0 => Wt::Q8(b),
+                GType::F16 => Wt::Half(b),
+                _ => Wt::F32(b),
+            }
         } else {
             let v = floats(p, ty, &raw)?;
             if keep == Keep::F32 { Wt::F32(DevBuf::from_f32(gpu, &v)?) } else { Wt::Half(dev_half(gpu, &v)?) }
@@ -235,9 +241,45 @@ impl Lin {
     /// out [m, n] = x [m, k] (half) W^T + bias, in half or (accumulated and written in) float32
     #[allow(clippy::too_many_arguments)]
     pub fn apply(&self, nsd: &Nsd, k8: &K, scratch: &DevBuf, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void, out_dt: Dt) -> Result<()> {
+        self.apply_epi(nsd, k8, scratch, x, m, out, out_dt, Epi::Plain, None)
+    }
+
+    /// `apply` with an epilogue: the silo's product with it fused when the silo takes it (one pass), else the product
+    /// and then t2.h's pass (a residual's product goes through `tmp`, float32 [m, n], first)
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_epi(&self, nsd: &Nsd, k8: &K, scratch: &DevBuf, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void, out_dt: Dt,
+                     epi: Epi, tmp: Option<&DevBuf>) -> Result<()> {
         if m == 0 {
             return Ok(());
         }
+        if !matches!(self.w, Wt::F32(_)) && k8.silo().is_some() {
+            let w = self.ready(nsd, scratch)?;
+            if k8.linear_epi(x, m, self.k, w, self.n, self.bias_p(), out, out_dt, epi)? {
+                return Ok(());
+            }
+        }
+        match epi {
+            Epi::Plain => {}
+            Epi::Gelu => {
+                self.plain(nsd, k8, scratch, x, m, out, out_dt)?;
+                return nsd.gelu(out, out_dt, m * self.n, true);
+            }
+            Epi::Silu => {
+                self.plain(nsd, k8, scratch, x, m, out, out_dt)?;
+                return k8.silu(out, out_dt, m * self.n);
+            }
+            Epi::Resid(gate) => {
+                let t = tmp.ok_or_else(|| Error("a residual product without its float32 buffer".into()))?;
+                self.plain(nsd, k8, scratch, x, m, t.ptr(), Dt::F32)?;
+                return k8.gate_add(out.cast(), m, self.n, t.ptr(), Dt::F32, gate);
+            }
+        }
+        self.plain(nsd, k8, scratch, x, m, out, out_dt)
+    }
+
+    /// t2.h's (and the shared nsd_linear's) product
+    #[allow(clippy::too_many_arguments)]
+    fn plain(&self, nsd: &Nsd, k8: &K, scratch: &DevBuf, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void, out_dt: Dt) -> Result<()> {
         if let Wt::F32(w) = &self.w {
             return nsd.linear(x, Dt::F32, m, self.k, w.ptr(), self.n, self.bias_p().cast(), out, out_dt);
         }

@@ -88,8 +88,11 @@ for d in $(ls -d */*/silo 2>/dev/null); do
   arch=$(basename "$(dirname "$d")")
   objs=$(ls "$OBJ"/$(echo "$d" | tr / _)_*.o 2>/dev/null || true)
   [ -n "$objs" ] || continue
+  # a silo of a kind that links oneDNN (image, video, audio, 3D) may call it too: the copy in dist/, one level up
+  extra=()
+  case "$d" in llm/*) ;; *) extra=(-L"$DNNL/lib" -ldnnl -Wl,-rpath,'$ORIGIN/..') ;; esac
   echo "==> linking silo/libnextsycl-$arch.so"
-  icpx "${LINK[@]}" $objs -o "$OUT/silo/.libnextsycl-$arch.so.new" && mv -f "$OUT/silo/.libnextsycl-$arch.so.new" "$OUT/silo/libnextsycl-$arch.so"
+  icpx "${LINK[@]}" $objs "${extra[@]}" -o "$OUT/silo/.libnextsycl-$arch.so.new" && mv -f "$OUT/silo/.libnextsycl-$arch.so.new" "$OUT/silo/libnextsycl-$arch.so"
 done
 # flash attention (diffusion/flash/flash.cpp -> libnextsycl-flash.so, loaded by the diffusion kernels on first use):
 # ARK's kernel on sycl-tla, with the flags sycl-tla wants; skipped when the build image lacks the headers or the

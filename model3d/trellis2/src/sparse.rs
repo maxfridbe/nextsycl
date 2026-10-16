@@ -95,14 +95,16 @@ pub fn neighbours(coords: &[[i32; 3]]) -> Vec<i32> {
     out
 }
 
-/// One channel-to-space subdivision: for each child its parent row and octant, the children's coordinates, and each
-/// parent's child rows by octant (-1: not subdivided there)
+/// One channel-to-space subdivision: for each child its parent row and octant, the children's coordinates, each
+/// parent's child rows by octant (-1: not subdivided there), and the children's neighbour map once a decoder made it
+/// (the texture decoder, replaying the shape decoder's subdivisions, takes it from there)
 #[derive(Clone, Debug, Default)]
 pub struct Subdiv {
     pub parent: Vec<i32>,
     pub sub: Vec<i32>,
     pub coords: Vec<[i32; 3]>,
     pub children: Vec<[i32; 8]>,
+    pub nmap: Option<std::sync::Arc<Vec<i32>>>,
 }
 
 /// The octant's offset: x + s % 2, y + s / 2 % 2, z + s / 4

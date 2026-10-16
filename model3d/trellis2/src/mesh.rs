@@ -3,7 +3,7 @@
 //! four voxels around that edge make a quad when all four exist, split on the diagonal whose split weights
 //! (softplus(h[6])) multiply larger. The quads' winding carries no inside or outside, so the mesh is oriented after.
 
-use nextsycl_model3d::mesh::{tools, Mesh};
+use nextsycl_model3d::mesh::{cross, dot, sub, tools, Mesh};
 
 /// The voxels around each axis' edge, relative to the voxel (o_voxel's edge_neighbor_voxel_offset)
 const QUAD: [[[i32; 3]; 4]; 3] = [
@@ -93,6 +93,120 @@ pub fn cluster(m: &Mesh, cell: f32) -> Mesh {
     }
     tools::compact(&mut out);
     out
+}
+
+/// The simplified mesh's small open patches turned to agree with what surrounds them. `tools::orient` joins
+/// triangles across manifold edges and turns each such region by its signed volume, which means nothing for the small
+/// open patches the clustering and the decimation leave between non-manifold edges: one triangle in a few hundred
+/// came out facing inward (holes in a back-face-culled view, a normal pointing in for the bake's texel search). Here
+/// each open region smaller than a hundredth of the mesh, the larger first, turns by a vote of its triangles: does
+/// each normal agree with the normals of the triangles of other regions it shares a vertex with (area-weighted)? The
+/// large and the closed regions keep their windings. Returns the triangles flipped.
+#[allow(dead_code)]
+pub fn orient_patches(m: &mut Mesh) -> usize {
+    let nt = m.indices.len() / 3;
+    if nt == 0 {
+        return 0;
+    }
+    // the regions: triangles joined across edges two triangles share running opposite ways (consistent windings); a
+    // region with any other edge (open, non-manifold or inconsistent) is open
+    let mut e: Vec<(u64, u32, bool)> = Vec::with_capacity(nt * 3);
+    for t in 0..nt {
+        for k in 0..3 {
+            let (a, b) = (m.indices[t * 3 + k], m.indices[t * 3 + (k + 1) % 3]);
+            e.push((((a.min(b) as u64) << 32) | a.max(b) as u64, t as u32, a < b));
+        }
+    }
+    e.sort_unstable_by_key(|x| x.0);
+    let mut parent: Vec<u32> = (0..nt as u32).collect();
+    fn root(p: &mut [u32], mut x: u32) -> u32 {
+        while p[x as usize] != x {
+            p[x as usize] = p[p[x as usize] as usize];
+            x = p[x as usize];
+        }
+        x
+    }
+    let mut rim = vec![false; nt];
+    let mut i = 0;
+    while i < e.len() {
+        let mut j = i + 1;
+        while j < e.len() && e[j].0 == e[i].0 {
+            j += 1;
+        }
+        if j - i == 2 && e[i].2 != e[i + 1].2 {
+            let (a, b) = (root(&mut parent, e[i].1), root(&mut parent, e[i + 1].1));
+            if a != b {
+                parent[a as usize] = b;
+            }
+        } else {
+            for x in &e[i..j] {
+                rim[x.1 as usize] = true;
+            }
+        }
+        i = j;
+    }
+    drop(e);
+    let region: Vec<u32> = (0..nt as u32).map(|t| root(&mut parent, t)).collect();
+    let mut size = vec![0u32; nt];
+    let mut open = vec![false; nt];
+    for t in 0..nt {
+        size[region[t] as usize] += 1;
+        open[region[t] as usize] |= rim[t];
+    }
+    let small = (nt / 100).max(1) as u32;
+    let mut patches: Vec<u32> = (0..nt as u32).filter(|&r| size[r as usize] > 0 && size[r as usize] < small && open[r as usize]).collect();
+    if patches.is_empty() {
+        return 0;
+    }
+    patches.sort_by_key(|&r| std::cmp::Reverse(size[r as usize]));
+    // each patch's triangles, and each vertex's triangles
+    let mut members: Vec<Vec<u32>> = vec![Vec::new(); nt];
+    for t in 0..nt {
+        let r = region[t] as usize;
+        if size[r] < small && open[r] {
+            members[r].push(t as u32);
+        }
+    }
+    let nv = m.positions.len();
+    let mut start = vec![0u32; nv + 1];
+    for &v in &m.indices {
+        start[v as usize + 1] += 1;
+    }
+    for v in 0..nv {
+        start[v + 1] += start[v];
+    }
+    let mut fill = start.clone();
+    let mut vt = vec![0u32; m.indices.len()];
+    for (k, &v) in m.indices.iter().enumerate() {
+        vt[fill[v as usize] as usize] = (k / 3) as u32;
+        fill[v as usize] += 1;
+    }
+    let normal = |m: &Mesh, t: usize| {
+        let p = [0, 1, 2].map(|k| m.positions[m.indices[t * 3 + k] as usize]);
+        cross(sub(p[1], p[0]), sub(p[2], p[0]))
+    };
+    let mut flipped = 0;
+    for r in patches {
+        let mut vote = 0f64;
+        for &t in &members[r as usize] {
+            let n = normal(m, t as usize);
+            for k in 0..3 {
+                let v = m.indices[t as usize * 3 + k] as usize;
+                for &u in &vt[start[v] as usize..start[v + 1] as usize] {
+                    if region[u as usize] != r {
+                        vote += dot(n, normal(m, u as usize)) as f64;
+                    }
+                }
+            }
+        }
+        if vote < 0.0 {
+            for &t in &members[r as usize] {
+                m.indices.swap(t as usize * 3 + 1, t as usize * 3 + 2);
+                flipped += 1;
+            }
+        }
+    }
+    flipped
 }
 
 #[cfg(test)]

@@ -58,10 +58,12 @@ const GIB: f64 = (1u64 << 30) as f64;
 /// The options it takes (`--opt-NAME`)
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "resident", env: "NS_M3D_T2_RESIDENT", value: "", help: "keep every model loaded between requests (default: each stage loads its model and drops it after)", at: At::Load },
+    EngineOption { name: "sage", env: "NS_M3D_T2_SAGE", value: "", help: "approximate: the flows' self-attention over 8192 tokens and more as SageAttention (int8 queries and keys; the cascade's second pass ~25% faster, its samples ~1e-2 off the exact ones) instead of half flash attention", at: At::Load },
     EngineOption { name: "profile", env: "NS_M3D_T2_PROFILE", value: "", help: "each stage's time and the card's memory, on stderr", at: At::Load },
     EngineOption { name: "max-tokens", env: "", value: "N", help: "the cascade's token budget for the second shape pass (49152): the resolution steps down by 128 until it fits", at: At::Request },
     EngineOption { name: "remesh", env: "", value: "", help: "remesh the surface isotropically before decimating it (slower)", at: At::Request },
     EngineOption { name: "fov", env: "", value: "DEGREES", help: "pixal3d: the picture's horizontal field of view (default 40)", at: At::Request },
+    EngineOption { name: "bake-push", env: "", value: "VOXELS", help: "the bake looks for each texel's surface point from this far outside along its normal (default 2)", at: At::Both },
 ];
 
 /// This engine's registry entries
@@ -154,6 +156,9 @@ impl Config {
     }
 }
 
+/// NS_M3D_T2_PROFILE on any engine of the process (the loads' times)
+static PROFILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// A model loaded when its stage needs it, kept when resident
 struct Slot<T>(Mutex<Option<Arc<T>>>);
 
@@ -166,7 +171,11 @@ impl<T> Slot<T> {
         if let Some(t) = g.as_ref() {
             return Ok(t.clone());
         }
+        let t0 = Instant::now();
         let t = Arc::new(load()?);
+        if PROFILE.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("  loaded a {} in {:.2} s", std::any::type_name::<T>().rsplit("::").next().unwrap_or("model"), t0.elapsed().as_secs_f64());
+        }
         if resident {
             *g = Some(t.clone());
         }
@@ -196,6 +205,7 @@ pub struct Trellis2 {
     models: Models,
     resident: bool,
     profile: bool,
+    sage: bool,
     loaded: Instant,
     load_s: f64,
     run: Mutex<()>,
@@ -289,6 +299,7 @@ impl Trellis2 {
             },
             resident: flag("NS_M3D_T2_RESIDENT"),
             profile: flag("NS_M3D_T2_PROFILE"),
+            sage: flag("NS_M3D_T2_SAGE"),
             loaded: Instant::now(),
             load_s: 0.0,
             run: Mutex::new(()),
@@ -298,7 +309,14 @@ impl Trellis2 {
         if !f.has("blocks.0.modulation") {
             return Err(Error(format!("{}: not a TRELLIS flow model", f.path())));
         }
-        log(format!("{arch}: ready on {} (models load stage by stage{})", gpu.name, if e.resident { ", then stay" } else { "" }));
+        if e.profile {
+            PROFILE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let silo = match e.cx.k.silo() {
+            Some(s) => format!("silo {}", s.path.display()),
+            None => "no silo: the shared kernels".to_string(),
+        };
+        log(format!("{arch}: ready on {} (models load stage by stage{}; {silo})", gpu.name, if e.resident { ", then stay" } else { "" }));
         Ok(Trellis2 { load_s: t0.elapsed().as_secs_f64(), ..e })
     }
 
@@ -322,7 +340,9 @@ impl Trellis2 {
     fn dit(&self, slot: &Slot<dit::Dit>, r: &str) -> Result<Arc<dit::Dit>> {
         slot.get(self.resident, || {
             self.room(r, 1.6 * GIB)?;
-            dit::Dit::load(&self.file(r)?, &self.cx.gpu)
+            let mut d = dit::Dit::load(&self.file(r)?, &self.cx.gpu)?;
+            d.sage = self.sage;
+            Ok(d)
         })
     }
 
@@ -506,7 +526,7 @@ impl Trellis2 {
         norm(&mut slat, &self.cfg.shape_mean, &self.cfg.shape_std);
         let mut res = 512;
         if cascade {
-            let up = self.shape_dec()?.run(&self.cx, &coords, &slat, &vae::Plan { guide: None, upsample: Some(4), keep_ups: false }, |_, _| Ok(()))?;
+            let up = self.shape_dec()?.run(&self.cx, &coords, &slat, &vae::Plan { guide: None, upsample: Some(4), keep_ups: false, profile: self.profile }, |_, _| Ok(()))?;
             let budget = req.extra.get("max-tokens").and_then(|v| v.parse().ok()).unwrap_or(49152usize);
             let (hc, r) = cascade_coords(&up.coords, 512, res_req as usize, budget);
             res = r;
@@ -525,81 +545,111 @@ impl Trellis2 {
         }
         tr.res = res;
         self.mark(&mut tr, "shape", &mut t0);
-        // the texture latent
-        let tslat = if req.texture {
-            let sn: Vec<f32> = slat.chunks_exact(32).flat_map(|r| r.iter().enumerate().map(|(c, x)| (x - self.cfg.shape_mean[c]) / self.cfg.shape_std[c]).collect::<Vec<_>>())
-                .collect();
-            let (c_tx, p_tx) = match &pcond {
-                Some(pc) => pc.texture(self, &coords, res)?,
-                None => (None, None),
-            };
-            let m = self.tex_flow(cascade)?;
-            let cond = c_tx.as_ref().unwrap_or(if cascade { cond1024.as_ref().unwrap() } else { &cond512 });
-            let mut t = self.flow(&m, &txp, &coords, draw(coords.len() * 32), cond, Some(&sn), p_tx.as_ref(), |i, of| report("texture", i, of))?;
-            drop(m);
-            norm(&mut t, &self.cfg.tex_mean, &self.cfg.tex_std);
-            self.mark(&mut tr, "texture", &mut t0);
-            Some(t)
-        } else {
-            None
-        };
-        drop((cond512, cond1024, pcond));
-        // decode
+        // the shape decoder first: its mesh is cut from the voxels, oriented, decimated and unwrapped (and the bake's
+        // closest-point tree built) on a thread of the CPU while the GPU runs the texture flow and decoder
         let sd = self.shape_dec()?;
-        let dec = sd.run(&self.cx, &coords, &slat, &vae::Plan { guide: None, upsample: None, keep_ups: false }, |i, of| report("decode", i, of))?;
+        let mut dec = sd.run(&self.cx, &coords, &slat, &vae::Plan { guide: None, upsample: None, keep_ups: false, profile: self.profile }, |i, of| report("decode", i, of))?;
         drop(sd);
         if !self.resident {
             drop(self.models.shape_dec.0.lock().unwrap().take());
         }
         tr.voxels = dec.coords.len();
-        let surface = mesh::dual_grid(&dec.coords, &dec.feats, &dec.nmap, res);
         self.mark(&mut tr, "decode", &mut t0);
-        let vox = match &tslat {
-            Some(t) => {
+        let tree = std::mem::take(&mut dec.tree);
+        let faces = req.faces.unwrap_or(300_000) as usize;
+        let size = req.texture_size.unwrap_or(if res <= 512 { 1024 } else { 2048 });
+        let remesh = req.extra.contains_key("remesh");
+        let mut surface = Mesh::default();
+        let (mut m, vox, near) = std::thread::scope(|sc| -> Result<_> {
+            let (sf, dc, texture, profile, arch) = (&mut surface, &dec, req.texture, self.profile, self.arch);
+            let cpu = sc.spawn(move || {
+                let t = Instant::now();
+                let mut laps = Vec::new();
+                let mut lap = |what: &'static str| laps.push((what, t.elapsed().as_secs_f64()));
+                *sf = mesh::dual_grid(&dc.coords, &dc.feats, &dc.nmap, res);
+                lap("dual grid");
+                tools::orient(sf);
+                let surface: &Mesh = sf;
+                lap("oriented");
+                // a dense surface clustered first to about four times the budget (cells of a few voxels), then decimated
+                let cell = (surface.positions.len() as f32 / (2 * faces) as f32).sqrt() / res as f32;
+                let mut m = match (remesh, surface.triangles() > 4 * faces) {
+                    (true, _) => tools::remesh(surface, None, 3),
+                    (false, true) => mesh::cluster(surface, cell),
+                    (false, false) => surface.clone(),
+                };
+                if remesh && m.triangles() > 4 * faces {
+                    m = mesh::cluster(&m, cell);
+                }
+                lap("clustered");
+                if m.triangles() > faces {
+                    m = tools::decimate(&m, faces);
+                }
+                lap("decimated");
+                tools::orient(&mut m);
+                // WIP: mesh::orient_patches(&mut m) fixes specks on the helmet but turns parts of the base inward; off for now
+                let flipped = 0;
+                lap("oriented");
+                // and the decoded surface's closest points for the bake's texel search
+                let near = texture.then(|| {
+                    m.compute_normals();
+                    m = tools::unwrap(&m, size, 4);
+                    lap("unwrapped");
+                    let near = tools::closest::Closest::new(&surface.positions, &surface.indices);
+                    lap("the closest-point tree");
+                    near
+                });
+                if profile {
+                    let laps: Vec<String> = laps.iter().map(|(w, s)| format!("{w} {s:.2}")).collect();
+                    eprintln!("{arch}: on the CPU, {} -> {} triangles ({flipped} in small patches turned to their surroundings), by s: {}", surface.triangles(),
+                              m.triangles(), laps.join(", "));
+                }
+                (m, near)
+            });
+            // the texture latent, then its decoder on the shape decoder's subdivisions
+            let vox = if req.texture {
+                let sn: Vec<f32> = slat.chunks_exact(32).flat_map(|r| r.iter().enumerate().map(|(c, x)| (x - self.cfg.shape_mean[c]) / self.cfg.shape_std[c]).collect::<Vec<_>>())
+                    .collect();
+                let (c_tx, p_tx) = match &pcond {
+                    Some(pc) => pc.texture(self, &coords, res)?,
+                    None => (None, None),
+                };
+                let tm = self.tex_flow(cascade)?;
+                let cond = c_tx.as_ref().unwrap_or(if cascade { cond1024.as_ref().unwrap() } else { &cond512 });
+                let mut t = self.flow(&tm, &txp, &coords, draw(coords.len() * 32), cond, Some(&sn), p_tx.as_ref(), |i, of| report("texture", i, of))?;
+                drop(tm);
+                drop((c_tx, p_tx));
+                norm(&mut t, &self.cfg.tex_mean, &self.cfg.tex_std);
+                self.mark(&mut tr, "texture", &mut t0);
                 let td = self.tex_dec()?;
-                let tv = td.run(&self.cx, &coords, t, &vae::Plan { guide: Some(&dec.tree), upsample: None, keep_ups: false }, |i, of| report("decode", i, of))?;
+                let tv = td.run(&self.cx, &coords, &t, &vae::Plan { guide: Some(&tree), upsample: None, keep_ups: false, profile: self.profile }, |i, of| report("decode", i, of))?;
+                drop(td);
                 if tv.coords != dec.coords {
                     return Err(Error("the texture decoder's voxels are not the shape decoder's".into()));
                 }
                 let attrs = tv.feats.iter().map(|v| v * 0.5 + 0.5).collect();
+                let v = bake::Voxels::new(&tv.coords, attrs, res);
                 self.mark(&mut tr, "tex-decode", &mut t0);
-                Some(bake::Voxels::new(&tv.coords, attrs, res))
-            }
-            None => None,
-        };
-        drop(dec);
-        // the mesh
-        report("mesh", 0, 1)?;
-        let mut surface = surface;
-        tools::orient(&mut surface);
-        self.mark(&mut tr, "orient", &mut t0);
-        let faces = req.faces.unwrap_or(300_000) as usize;
-        let mut m = if req.extra.contains_key("remesh") { tools::remesh(&surface, None, 3) } else { surface.clone() };
-        // a dense surface clustered first to about four times the budget (cells of a few voxels), then decimated
-        if m.triangles() > 4 * faces {
-            let cell = (m.positions.len() as f32 / (2 * faces) as f32).sqrt() / res as f32;
-            m = mesh::cluster(&m, cell);
-        }
-        if m.triangles() > faces {
-            m = tools::decimate(&m, faces);
-        }
-        tools::orient(&mut m);
-        if self.profile {
-            eprintln!("{}: decimated {} -> {} triangles", self.arch, surface.triangles(), m.triangles());
-        }
-        report("mesh", 1, 1)?;
+                Some(v)
+            } else {
+                None
+            };
+            report("mesh", 0, 1)?;
+            let (m, near) = cpu.join().map_err(|_| Error("the mesh thread panicked".into()))?;
+            report("mesh", 1, 1)?;
+            Ok((m, vox, near))
+        })?;
+        drop((cond512, cond1024, pcond, dec));
+        // the time the mesh's thread took past the GPU's work
         self.mark(&mut tr, "mesh", &mut t0);
-        if let Some(vox) = &vox {
+        if let (Some(vox), Some(near)) = (&vox, &near) {
             report("bake", 0, 1)?;
-            let size = req.texture_size.unwrap_or(if res <= 512 { 1024 } else { 2048 });
-            m.compute_normals();
-            let mut u = tools::unwrap(&m, size, 4);
-            self.mark(&mut tr, "unwrap", &mut t0);
-            u.material = Some(bake::bake(&u, &surface, vox, size));
-            m = u;
+            m.material = Some(bake::bake(&m, near, vox, size, req.extra.get("bake-push").and_then(|v| v.parse().ok()).unwrap_or(2.0)));
             report("bake", 1, 1)?;
             self.mark(&mut tr, "bake", &mut t0);
         }
+        drop(near);
+        drop(surface);
         // to glTF's y-up, the picture's view facing +z: TRELLIS's z-up (x, y, z) -> (x, z, -y); Pixal3D's grid is already
         // y-up with the camera on its +z side (its camera looks along the world's +y, the grid's -z)
         if self.arch != ARCH_PIXAL {

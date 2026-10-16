@@ -10,6 +10,7 @@ use std::sync::Arc;
 use nextsycl_core::{DevBuf, Error, Gpu, Result};
 use nextsycl_diffusion::kernels::Dt;
 
+use crate::ffi::Epi;
 use crate::w::{dev_half, File, Keep, Lin};
 use crate::Ctx;
 
@@ -17,6 +18,8 @@ pub const C: usize = 1536;
 pub const HEADS: usize = 12;
 pub const HD: usize = 128;
 const MLP: usize = 8192;
+/// The shortest sequence NS_M3D_T2_SAGE takes to SageAttention (the shared kernel's own floor, NSD_SAGE_MIN_S's default)
+pub const SAGE_MIN: usize = 8192;
 
 struct Block {
     modulation: Vec<f32>,
@@ -78,6 +81,9 @@ pub struct Dit {
     out: Lin,
     scratch: DevBuf,
     pub bytes: usize,
+    /// NS_M3D_T2_SAGE: the self-attention of long sequences (SAGE_MIN tokens and more) as SageAttention (int8 q and k,
+    /// the shared diffusion kernels' `attention`) instead of the half flash attention - approximate, opt-in
+    pub sage: bool,
     /// NS_M3D_T2_PROFILE: seconds in [self-attention's linears and norms, its attention, the cross-attention, the MLP]
     /// over the calls (each part synced; slower)
     pub prof: std::sync::Mutex<Option<[f64; 4]>>,
@@ -202,6 +208,7 @@ impl Dit {
             out,
             scratch,
             bytes,
+            sage: false,
             prof: std::sync::Mutex::new(None),
         })
     }
@@ -220,14 +227,16 @@ impl Dit {
     }
 
     pub fn work(&self, gpu: &Arc<Gpu>, n: usize, l: usize) -> Result<Work> {
+        // the residual products' float32 results go straight into the stream when the silo fuses the adds
+        let fused = crate::ffi::silo()?.is_some();
         Ok(Work {
             n,
             h: DevBuf::f32(gpu, n * C)?,
             hn: DevBuf::new(gpu, n * C * 2)?,
             qkv: DevBuf::new(gpu, n * 3 * C * 2)?,
             att: DevBuf::new(gpu, n * C * 2)?,
-            o: DevBuf::f32(gpu, n * C)?,
-            o2: DevBuf::f32(gpu, if self.proj_ch.is_some() { n * C } else { 1 })?,
+            o: DevBuf::f32(gpu, if fused { 1 } else { n * C })?,
+            o2: DevBuf::f32(gpu, if self.proj_ch.is_some() && !fused { n * C } else { 1 })?,
             mlp: DevBuf::new(gpu, n * MLP * 2)?,
             kv: DevBuf::new(gpu, l * 2 * C * 2)?,
             x: DevBuf::new(gpu, n * self.in_ch.max(1) * 2)?,
@@ -313,10 +322,13 @@ impl Dit {
             k.qk_norm_rope(w.qkv.ptr(), n, HEADS, HD, 3 * C, b.q_gamma.fp(), cs.fp())?;
             k.qk_norm_rope(hp(&w.qkv, C), n, HEADS, HD, 3 * C, b.k_gamma.fp(), cs.fp())?;
             tick(0)?;
-            nsd.attention_qk(w.qkv.ptr(), n, 3 * C, hp(&w.qkv, C), hp(&w.qkv, 2 * C), n, 3 * C, Dt::F16, HEADS, HD, w.att.ptr(), Dt::F16)?;
+            if self.sage && n >= SAGE_MIN {
+                nsd.attention(w.qkv.ptr(), hp(&w.qkv, C), hp(&w.qkv, 2 * C), Dt::F16, n, HEADS, HD, 3 * C, w.att.ptr(), Dt::F16)?;
+            } else {
+                nsd.attention_qk(w.qkv.ptr(), n, 3 * C, hp(&w.qkv, C), hp(&w.qkv, 2 * C), n, 3 * C, Dt::F16, HEADS, HD, w.att.ptr(), Dt::F16)?;
+            }
             tick(1)?;
-            b.out.apply(nsd, k, s, w.att.ptr(), n, w.o.ptr(), Dt::F32)?;
-            k.gate_add(w.h.fp(), n, C, w.o.ptr(), Dt::F32, md(2))?;
+            b.out.apply_epi(nsd, k, s, w.att.ptr(), n, w.h.ptr(), Dt::F32, Epi::Resid(md(2)), Some(&w.o))?;
             tick(0)?;
             // cross-attention to the picture
             let kv = match cross {
@@ -333,24 +345,20 @@ impl Dit {
                 b.cq.apply(nsd, k, s, w.hn.ptr(), n, w.att.ptr(), Dt::F16)?;
                 k.qk_norm_rope(w.att.ptr(), n, HEADS, HD, C, b.cq_gamma.fp(), std::ptr::null())?;
                 nsd.attention_qk(w.att.ptr(), n, C, kv.ptr(), hp(kv, C), l, 2 * C, Dt::F16, HEADS, HD, w.hn.ptr(), Dt::F16)?;
-                b.cout.apply(nsd, k, s, w.hn.ptr(), n, w.o.ptr(), Dt::F32)?;
-                k.gate_add(w.h.fp(), n, C, w.o.ptr(), Dt::F32, std::ptr::null())?;
+                b.cout.apply_epi(nsd, k, s, w.hn.ptr(), n, w.h.ptr(), Dt::F32, Epi::Resid(std::ptr::null()), Some(&w.o))?;
             } else if let Cross::Const(rows) = cross {
                 // SAFETY: block bi's row of the [blocks, 1536] table.
                 k.add_row(w.h.fp(), n, C, unsafe { rows.fp().add(bi * C) })?;
             }
             if let (Some(pl), Some(pf)) = (&b.proj, proj) {
                 // Pixal3D: the projected features' term beside the cross-attention's
-                pl.apply(nsd, k, s, pf.ptr(), n, w.o2.ptr(), Dt::F32)?;
-                k.gate_add(w.h.fp(), n, C, w.o2.ptr(), Dt::F32, std::ptr::null())?;
+                pl.apply_epi(nsd, k, s, pf.ptr(), n, w.h.ptr(), Dt::F32, Epi::Resid(std::ptr::null()), Some(&w.o2))?;
             }
             tick(2)?;
             // the MLP
             k.ln_mod(w.h.ptr(), Dt::F32, n, C, 1e-6, std::ptr::null(), std::ptr::null(), md(4), md(3), w.hn.ptr(), Dt::F16)?;
-            b.mlp0.apply(nsd, k, s, w.hn.ptr(), n, w.mlp.ptr(), Dt::F16)?;
-            nsd.gelu(w.mlp.ptr(), Dt::F16, n * MLP, true)?;
-            b.mlp2.apply(nsd, k, s, w.mlp.ptr(), n, w.o.ptr(), Dt::F32)?;
-            k.gate_add(w.h.fp(), n, C, w.o.ptr(), Dt::F32, md(5))?;
+            b.mlp0.apply_epi(nsd, k, s, w.hn.ptr(), n, w.mlp.ptr(), Dt::F16, Epi::Gelu, None)?;
+            b.mlp2.apply_epi(nsd, k, s, w.mlp.ptr(), n, w.h.ptr(), Dt::F32, Epi::Resid(md(5)), Some(&w.o))?;
             tick(3)?;
             if let Some(p) = probe.as_deref_mut() {
                 if bi == 0 {
