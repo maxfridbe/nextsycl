@@ -11,6 +11,8 @@
 //!   order     skin_pts                                 -> ptv3_order.npy (the curves' orders, given ptv3_perm)
 //!   skin      skin_pts + skin_nrm + skin_vox + skin_joints + skin_enc_ind / fps + ptv3_order
 //!                                                      -> skin_glob, skin_bone, skin_ptv3, skin_mesh, skin .npy
+//!   voxel     mesh_v + mesh_f + skin_norm + skin_joints -> voxel_skin.npy (the prior; voxelization and shortest paths)
+//!   reskin    skin_pts + skin + mesh_v + mesh_f        -> skin_v.npy (the weights on the mesh's vertices)
 //! ```
 
 use std::path::Path;
@@ -189,6 +191,34 @@ pub fn run(m: &UniRig, dir: &Path, stages: &[&str], _mesh: Option<&Path>, log: &
         note(line("skin mesh", &tr.mesh, &f32s(&rd("skin_mesh")?.1), log));
         let w = crate::skin::masked(&soft, &prior, &parents, 3.0);
         note(line("skin", &w, &f32s(&rd("skin")?.1), log));
+    }
+    if need("voxel") || need("reskin") {
+        let mv = points(&rd("mesh_v")?.1);
+        let mf: Vec<[u32; 3]> = rd("mesh_f")?.1.chunks_exact(3).map(|c| [c[0] as u32, c[1] as u32, c[2] as u32]).collect();
+        let nn = rd("skin_norm")?.1;
+        let (c, s) = ([nn[0] as f32, nn[1] as f32, nn[2] as f32], nn[3] as f32);
+        let nv: Vec<[f32; 3]> = mv.iter().map(|p| crate::prep::apply(*p, c, s)).collect();
+        let parents: Vec<Option<usize>> = rd("parents")?.1.iter().map(|x| if *x < 0.0 { None } else { Some(*x as usize) }).collect();
+        if need("voxel") {
+            let joints = points(&rd("skin_joints")?.1);
+            let t0 = Instant::now();
+            let got = crate::voxel::voxel_skin(&nv, &mf, &joints, 196);
+            log(format!("voxel        {:.2} s", t0.elapsed().as_secs_f64()));
+            let want = f32s(&rd("voxel_skin")?.1);
+            note(line("voxel skin", &got, &want, log));
+            let j = joints.len();
+            let am = |v: &[f32]| v.chunks_exact(j).map(|r| (0..j).max_by(|&a, &b| r[a].total_cmp(&r[b])).unwrap_or(0)).collect::<Vec<_>>();
+            let same = am(&got).iter().zip(am(&want)).filter(|(a, b)| **a == *b).count();
+            log(format!("voxel skin   the largest joint agrees at {same} of {} vertices", nv.len()));
+        }
+        if need("reskin") {
+            let pts = points(&rd("skin_pts")?.1);
+            let sw = f32s(&rd("skin")?.1);
+            let t0 = Instant::now();
+            let got = crate::reskin::reskin(&pts, &sw, &nv, &mf, &parents);
+            log(format!("reskin       {:.2} s", t0.elapsed().as_secs_f64()));
+            note(line("skin on mesh", &got, &f32s(&rd("skin_v")?.1), log));
+        }
     }
     Ok(worst)
 }
