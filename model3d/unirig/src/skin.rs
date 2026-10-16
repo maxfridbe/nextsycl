@@ -31,8 +31,7 @@ impl Lng {
     }
     fn run(&self, o: &Ops, x: &DevBuf, rows: usize, out: &DevBuf) -> Result<()> {
         o.linear(x, rows, &self.l, out)?;
-        o.ln(out, rows, self.l.n, Some(&self.n), out)?;
-        o.k.act(out, rows * self.l.n, GELU)
+        o.k.ln_gelu(out, rows, self.l.n, 1e-5, Some(&self.n.w), Some(&self.n.b), out)
     }
 }
 
@@ -238,7 +237,9 @@ impl SkinModel {
             let r = c.min(n - r0);
             let rj = r * j;
             o.linear(&mesh.view(r0 * FEAT * 4, r * FEAT * 4)?, r, &self.qmesh, &qm)?;
+            crate::prof::mark(&o.nsd, "skin head q")?;
             o.k.bone_attn(&qm, &kb, r, j, HEADS, FEAT, 1.0 / (FEAT as f32).sqrt(), &sc)?;
+            crate::prof::mark(&o.nsd, "skin head scores")?;
             o.k.skin_in(&sc, &pv.view(r0 * j * 4, rj * 4)?, rj, HEADS, &self.attn_norm.w, &self.attn_norm.b, &self.vox_w, &self.vox_b, &self.vox_norm.w,
                         &self.vox_norm.b, &xin)?;
             self.down.run(o, &xin, rj, &x16)?;
@@ -247,6 +248,7 @@ impl SkinModel {
             self.pred[2].run(o, &x512b, rj, &x512a)?;
             self.pred[3].run(o, &x512a, rj, &x512b)?;
             o.linear(&x512b, rj, &self.last, &lg)?;
+            crate::prof::mark(&o.nsd, "skin head mlp")?;
             let v = lg.to_f32()?;
             logits[r0 * j..r0 * j + rj].copy_from_slice(&v[..rj]);
         }
