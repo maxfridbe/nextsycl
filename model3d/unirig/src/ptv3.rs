@@ -228,6 +228,7 @@ impl Ptv3 {
         let n3 = dev_i32(&o.gpu, &neighbours(&lay.gc, 3))?;
         let ords: Vec<DevBuf> = lay.orders.iter().map(|v| dev_i32(&o.gpu, &v.iter().map(|&i| i as i32).collect::<Vec<_>>())).collect::<Result<_>>()?;
         let f = DevBuf::from_f32(&o.gpu, feat)?;
+        crate::prof::mark(&o.nsd, "ptv3 neighbours")?;
         let cmax = OUT;
         let x = o.buf(n * cmax)?;
         let t = o.buf(n * cmax)?;
@@ -254,6 +255,7 @@ impl Ptv3 {
             for (i, b) in self.blocks[st].iter().enumerate() {
                 // the positional encoding
                 self.conv(o, &x, n, c, &n3, 27, &b.conv, &t)?;
+                crate::prof::mark(&o.nsd, "ptv3 sparse conv")?;
                 o.linear(&t, n, &b.cpe_lin, &a)?;
                 o.ln(&a, n, c, Some(&b.cpe_ln), &a)?;
                 o.k.add(&x, &a, n * c)?;
@@ -265,10 +267,12 @@ impl Ptv3 {
                 o.k.head_norm(&q2, n, 3 * c, c, h, d, 1e-5)?;
                 // UniRig hands flash attention qkv.half(): the inputs rounded to half, the product float32
                 o.k.round_half(&q2, n * 3 * c)?;
+                crate::prof::mark(&o.nsd, "ptv3 qkv")?;
                 let kv = q2.view(c * 4, q2.len - c * 4)?;
                 let vv = q2.view(2 * c * 4, q2.len - 2 * c * 4)?;
                 o.k.attention((&q2, 3 * c, d), (&kv, 3 * c, d), (&vv, 3 * c, d), n / PATCH, PATCH, PATCH, h, d, d, 1.0 / (d as f32).sqrt(), false,
                               &scratch, (&t, c))?;
+                crate::prof::mark(&o.nsd, "ptv3 attention")?;
                 o.k.scatter(&t, &ords[i % 4], n, c, &a)?;
                 o.linear(&a, n, &b.proj, &t)?;
                 o.k.add(&x, &t, n * c)?;
@@ -278,6 +282,7 @@ impl Ptv3 {
                 o.k.act(&u, n * 4 * c, GELU)?;
                 o.linear(&u, n, &b.fc2, &t)?;
                 o.k.add(&x, &t, n * c)?;
+                crate::prof::mark(&o.nsd, "ptv3 mlp")?;
             }
         }
         Ok(x)

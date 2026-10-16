@@ -163,12 +163,14 @@ impl SkinModel {
                    mut trace: Option<&mut Trace>) -> Result<Vec<f32>> {
         let n = pts.len();
         let j = joints.len();
+        crate::prof::reset_clock(&o.nsd)?;
         // the shape
         let lat = self.global.encode(o, pts, nrm, queries)?;
         let t = encoder::TOKENS;
         let glob = o.buf(t * FEAT)?;
         self.out_proj.run(o, &lat, t, &glob)?;
         drop(lat);
+        crate::prof::mark(&o.nsd, "skin shape encoder")?;
         // the bones
         let mut min = [f32::INFINITY; 3];
         for p in pts {
@@ -196,12 +198,14 @@ impl SkinModel {
                 b.run(o, &bone, j, &kvp, j + t, (&q, &a, &h), &scratch)?;
             }
         }
+        crate::prof::mark(&o.nsd, "skin bones")?;
         // the samples
         let feat: Vec<f32> = pts.iter().zip(nrm).flat_map(|(p, q)| [p[0], p[1], p[2], q[0], q[1], q[2], 0.0, 0.0, 0.0]).collect();
         let pf = self.ptv3.forward(o, &feat, lay)?;
         let mesh = o.buf(n * FEAT)?;
         self.feat_map.run(o, &pf, n, &mesh)?;
         drop(pf);
+        crate::prof::mark(&o.nsd, "skin ptv3")?;
         if let Some(tr) = trace.as_deref_mut() {
             tr.glob = glob.to_f32()?;
             tr.bone = bone.to_f32()?;
@@ -210,14 +214,17 @@ impl SkinModel {
         lat2.copy_within(0, &bone, 0, j * FEAT * 4)?;
         {
             let (q, a, h) = (o.buf(n * FEAT)?, o.buf(n * FEAT)?, o.buf(n * 4 * FEAT)?);
+            // the scores of many sample rows at once (fewer passes of the attention)
+            let big = o.buf((n * HEADS * (j + t)).min(192 << 20).max(HEADS * (j + t)))?;
             for b in &self.mesh_attn {
                 o.linear(&lat2, j + t, &b.wkv, &kvp)?;
-                b.run(o, &mesh, n, &kvp, j + t, (&q, &a, &h), &scratch)?;
+                b.run(o, &mesh, n, &kvp, j + t, (&q, &a, &h), &big)?;
             }
         }
         if let Some(tr) = trace {
             tr.mesh = mesh.to_f32()?;
         }
+        crate::prof::mark(&o.nsd, "skin mesh-bone attention")?;
         // the head, a chunk of samples at a time
         let kb = o.buf(j * HEADS * FEAT)?;
         o.linear(&bone, j, &self.kmesh, &kb)?;
@@ -242,6 +249,8 @@ impl SkinModel {
             let v = lg.to_f32()?;
             logits[r0 * j..r0 * j + rj].copy_from_slice(&v[..rj]);
         }
+        crate::prof::mark(&o.nsd, "skin head")?;
+        crate::prof::report(&mut |s| eprintln!("{s}"));
         // softmax over the bones
         for row in logits.chunks_exact_mut(j) {
             let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
