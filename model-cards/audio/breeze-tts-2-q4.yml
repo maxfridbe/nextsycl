@@ -4,9 +4,9 @@ id: breeze-tts-2-q4
 kind: audio
 arch: breeze-tts-2
 title: 'Breeze TTS 2 Q4_K (speech in English and Chinese, 24 kHz: a smaller download of breeze-tts-2; non-commercial)'
-about: 'Breeze TTS 2 from CrispASR''s Q4_K GGUF (Q4_K; the text encoder''s 1,152-wide matrices Q4_0): the same engine and modes as breeze-tts-2, a 2.2 GB file instead of 3.4 GB, a little further from the checkpoint; the same memory on the card (the matrices are expanded to half). Weights and outputs: BreezeBlue Research and Non-Commercial License 1.1 (research and non-commercial use only)'
+about: 'Breeze TTS 2 from CrispASR''s Q4_K GGUF (Q4_K; the text encoder''s 1,152-wide matrices Q4_0): the same engine and modes as breeze-tts-2, a 2.2 GB file instead of 3.4 GB, further from the checkpoint (the 4-bit text encoder: its output 1e-1 from upstream''s against Q8_0''s 6e-3 - a word can come out wrong; prefer breeze-tts-2); the same memory on the card (the matrices are expanded to half). Weights and outputs: BreezeBlue Research and Non-Commercial License 1.1 (research and non-commercial use only)'
 gpus: '0'
-vram_gib: 7.0                   # as breeze-tts-2 (the matrices expand to half either way)
+vram_gib: 6.5                   # as breeze-tts-2 (the matrices expand to half either way)
 speech:
 - design
 - clone

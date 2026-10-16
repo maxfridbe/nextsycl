@@ -177,7 +177,8 @@ impl BreezeTts2 {
         let encoder = Encoder::load(gpu, &cw)?;
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
-        log(format!("{ARCH} on {} in {load_s:.0} s", gpu.name));
+        let after = gpu.memory()?.1.unwrap_or(free);
+        log(format!("{ARCH} on {} in {load_s:.0} s ({:.1} GiB of weights on the card)", gpu.name, free.saturating_sub(after) as f64 / (1u64 << 30) as f64));
         Ok(BreezeTts2 { ops, nsd, tok, w, te, bb, dd, table: table.w, head0, proj, heads, vocab, groups, codes, codec, encoder, loaded: Instant::now(), load_s })
     }
 

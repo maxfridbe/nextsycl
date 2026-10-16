@@ -125,7 +125,8 @@ impl Lm {
             act: DevBuf::f32(g, r * self.ffn)?,
             tmp: DevBuf::f32(g, r * self.hidden)?,
             xh: DevBuf::new(g, r * widest * 2)?,
-            part: DevBuf::f32(g, ops.attn_scratch(b, r / b.max(1), self.heads, HEAD, t).max(1))?,
+            // the split-key scratch of a one-row decode at the cache's end (a wide pass takes none)
+            part: DevBuf::f32(g, ops.attn_scratch(b, 1, self.heads, HEAD, t.saturating_sub(1)).max(ops.attn_scratch(b, r / b.max(1), self.heads, HEAD, 0)).max(1))?,
             out: DevBuf::f32(g, r * self.hidden)?,
         })
     }

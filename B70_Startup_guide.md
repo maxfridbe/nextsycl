@@ -84,6 +84,7 @@ Good first models for one B70:
 | `qwen-image-2.1-q8` | image | 16.4 GB | text to image (RGBA), edits |
 | `qwen3-tts-custom` | speech | 4.2 GB | nine voices, styled by an instruction, 10 languages |
 | `voxcpm2` | speech | 4.6 GB | 30 languages at 48 kHz, voices designed from a description or cloned |
+| `breeze-tts-2` | speech | 3.4 GB | English and Chinese: voices designed, cloned or directed, vocal events (non-commercial license) |
 | `minimax-music3` | music | 26.6 GB | songs from lyrics and a description |
 | `minimax-h3` | video | 47.9 GB | text / pictures / a voice to video with sound |
 

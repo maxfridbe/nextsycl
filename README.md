@@ -76,7 +76,10 @@ against MiniMax's diffusers code on the same files; a minute of song in 89 s on 
 int8 (118 s in half). **Qwen3-TTS** (`audio/qwen3tts`): speech in ten languages - nine built-in voices styled by an
 instruction, voices made up from a description, voices cloned from a recording - its talker, code predictor, 12 Hz
 codec (decoder and encoder) and speaker encoder in SYCL, checked against qwen-tts' own code; 33 s of speech in 7.7 s
-on the B70.
+on the B70. **Breeze TTS 2** (`audio/breezetts2`): English and Chinese speech - voices designed from a description,
+cloned from a recording and its transcript, or cloned and directed by an instruction, vocal events inline ("(laugh)",
+"[笑]") - its T5Gemma2 text encoder, Qwen3 backbone and depth decoder from CrispASR's GGUF on the music engine's kernels
+and its own, the 12 Hz codec shared with Qwen3-TTS; checked against upstream's code; 1.8-2.2x real time on the B70.
 
 A skill for porting to SYCL on Arc - the safety rules, migration traps, parity method, profiling and what made
 things fast, learned on these ports: [skills/sycl-porting/SKILL.md](skills/sycl-porting/SKILL.md).
@@ -161,6 +164,8 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `qwen3-tts-base` | Qwen3-TTS Base: a voice cloned from a recording (its x-vector; with its transcript, in context) | `qwen3tts` | 4.5 GiB | checked, served |
 | `voxcpm2` | VoxCPM2 2B: speech in 30 languages at 48 kHz - plain, designed from a description, cloned (with a transcript: continued); MiniCPM4 language models, a local flow-matching DiT, AudioVAE V2 | `voxcpm2` | 4.6 GiB | checked, served |
 | `voxcpm2-int8` | the same files, the language models in int8 at load | `voxcpm2` | 4.6 GiB | checked, served |
+| `breeze-tts-2` | Breeze TTS 2 (~3B, Q8_0 GGUF): English and Chinese at 24 kHz - voices designed, cloned (recording + transcript) or directed (a clone + an instruction), vocal events; weights and outputs non-commercial (BreezeBlue license) | `breezetts2` | 3.4 GB + codec | checked |
+| `breeze-tts-2-q4` | the same model from the Q4_K GGUF (a 2.2 GB download; the same memory on the card; the 4-bit text encoder is 1e-1 from upstream - a word can slip) | `breezetts2` | 2.2 GB + codec | checked |
 
 **3D** (`nextsycl model3d`: rigging and animation of a mesh; the result keeps the input mesh, its UVs and textures)
 
@@ -839,6 +844,40 @@ on the API, chips and "save voice" buttons on the page.
   data: URL), `ref_text`, `seconds` (the most), `seed`, `options` (`greedy`, `temperature`, `top-k`, `streaming`).
   The page takes the text, the voice (chips), the description or instruction, a recording to clone and its
   transcript, the language.
+
+### Breeze TTS 2
+
+Breeze TTS 2 (`audio/breezetts2`, BreezeBlue's CSM fork, ~3B; CrispASR's GGUF of it): English and Chinese speech at
+24 kHz. A T5Gemma2 text encoder (26 layers, bidirectional, a symmetric sliding window) reads each text segment of the
+prompt; a Qwen3 backbone (28 layers) draws a frame's first code, a 12-layer depth decoder the other fifteen of the
+Qwen3-TTS 12 Hz codec (the same codec file, shared through `crates/codec12hz`). Four ways: **design** (`--instructions`:
+the voice described, in the language of the text), **clone** (`--ref-audio` + `--ref-text`, the exact transcript),
+**direction** (a clone + `--instructions`: tone, emotion, pace), plain; guidance `--cfg` 4 with an instruction. Vocal
+events inline: `(laugh)`, `(sigh)`, `(cough)`, `(clears throat)`; `[笑]`, `[叹气]`, `[咳嗽]`, `[清嗓子]`. **License:
+the weights and their outputs are research and non-commercial only** (BreezeBlue Research and Non-Commercial License
+1.1); the upstream code is Apache-2.0.
+
+```sh
+nextsycl models pull breeze-tts-2
+nextsycl audio gen "(sigh) Welcome aboard. Your journey begins now." --model breeze-tts-2 \
+                   --instructions "A warm, thoughtful young woman with a clear voice and a calm, reflective delivery."
+nextsycl audio gen "[叹气] 没想到过了这么久，你还记得我的声音。" --model breeze-tts-2 --ref-audio r.wav --ref-text "..." \
+                   [--instructions "用激动的语气，语速稍快。"] [--cfg 4] [--seed N] [--opt-temperature 0.9]
+nextsycl audio check <reference dump dir> --model breeze-tts-2 [--stages prompt,frames,codec]
+```
+
+- **Ported**: the GGUF's matrices expanded to half at load (F16 / Q8_0 / Q4_0 / Q4_K on the host; the text embedding
+  read from the file a row a token); the backbone and depth decoder on the music engine's cached decode (the depth
+  decoder's guided pair as one batch of two); this engine's kernels (`kernels/audio/breezetts2`) for the text encoder's
+  windowed bidirectional attention, its GELU-tanh gate and the table-driven RoPE; the prompt of upstream's four
+  templates; Gemma's tokenizer (`nextsycl_tok`, SentencePiece-style).
+- **Checked** against upstream's own code (`reference/breezetts2/ref.py`, float32 on the CPU, greedy; prompts of all
+  four templates, English and Chinese): token ids identical; the recording's codes 1,152 of 1,152; with the f16 GGUF
+  the text encoder 4-5e-4, the prompt rows 7-9e-4, each frame's backbone logits 4e-4 and depth logits 8-9e-4 (teacher
+  forced: no first code differs); with the served Q8_0 file 6e-3, 7-1e-2, 3-5e-3 and 8e-3 (its quantization); the
+  codec 1.4-5e-6. Real clips in every mode, English and Chinese, transcribe word for word (Whisper small).
+- **Speed** (B70, 2026-10-16): 22 frames a second with guidance (design, direction: 1.8x real time), 28 without
+  (clone: 2.2x); 5.4 s of designed speech in 3.9 s with the decode. 5.4 GiB of weights, 6.1 GiB in a run.
 
 ### VoxCPM2
 

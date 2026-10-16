@@ -8,7 +8,7 @@ arch: breeze-tts-2
 title: 'Breeze TTS 2 Q8_0 (speech in English and Chinese, 24 kHz: voices designed, cloned or directed; vocal events; non-commercial)'
 about: 'Breeze TTS 2 (BreezeBlue, a CSM fork, ~3B): a T5Gemma2 text encoder (26 layers), a Qwen3 backbone (28 layers) and a 12-layer depth decoder over the Qwen3-TTS 12 Hz codec''s 16 codebooks - CrispASR''s Q8_0 GGUF, half on the GPU. Voice design from a description, voice cloning from a recording and its exact transcript, voice direction (a cloned voice steered by an instruction), vocal events inline ("(laugh)", "[笑]"). Weights and outputs: BreezeBlue Research and Non-Commercial License 1.1 (research and non-commercial use only)'
 gpus: '0'
-vram_gib: 7.0                   # its memory on the card when it runs (measured on a B70)
+vram_gib: 6.5                   # its memory on the card when it runs (measured on a B70: 5.4 GiB of weights, 6.1 GiB in a run)
 speech:
 - design
 - clone

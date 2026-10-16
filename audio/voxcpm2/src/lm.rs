@@ -126,7 +126,8 @@ impl Lm {
                 true => Some(DevBuf::new(g, self.layers.iter().flat_map(|l| [&l.qkv, &l.o, &l.gu, &l.down]).map(|m| m.n * m.k).max().unwrap_or(0) * 2)?),
                 false => None,
             },
-            part: DevBuf::f32(g, if t > 0 { ops.attn_scratch(1, r, self.heads, HEAD, t).max(1) } else { 1 })?,
+            // a one-row decode at the cache's end splits the keys and needs scratch; a wide pass takes none
+            part: DevBuf::f32(g, if t > 0 { ops.attn_scratch(1, 1, self.heads, HEAD, t - 1).max(ops.attn_scratch(1, r, self.heads, HEAD, 0)).max(1) } else { 1 })?,
             out: DevBuf::f32(g, r * self.hidden)?,
             rows: r,
         })

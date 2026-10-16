@@ -265,6 +265,10 @@ of IQ2_XXS instead could win twice.
       1,152 codes as the reference's - as the prompt's example)
 - [x] VoxCPM2 (audio/voxcpm2, 2026-10-10): plain / designed / cloned / continued speech at 48 kHz; MiniCPM4 LMs, the
       local encoder and flow-matching DiT, AudioVAE V2 from its .pth; checked (teacher-forced patches 1e-3..4e-2, VAE 1e-6)
+- [x] Breeze TTS 2 (audio/breezetts2, 2026-10-16): design / clone / direction / vocal events in English and Chinese from
+      CrispASR's GGUF (q8_0; q4_k card); the 12 Hz codec moved to crates/codec12hz (shared with Qwen3-TTS, re-checked);
+      checked against upstream (f16: 4e-4..9e-4 a stage, Q8_0 3e-3..1e-2). B70: 22 frames/s guided, 28 unguided.
+      Next: int8 / graphs for speed, a served registry entry, streamed answers
 - [x] Qwen3.8-27B (llm/qwen35, 2026-10-10): the dense qwen35 graph (gated DeltaNet + gated full attention, dense
       SwiGLU) on the shared products / KDA scan and its own attention and gates; checked against llama.cpp on Q8_0
       (cosine >= 0.99993 every layer, same next token); served as qwen3.8-27b-q8 / -q4 / -q3 (tools, reasoning)
