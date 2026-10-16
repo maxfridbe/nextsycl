@@ -6,7 +6,7 @@ arch: hunyuanimage-2.1
 title: 'HunyuanImage 2.1 Q8_0 (text to image, 2K; 50 steps with guidance; Tencent Hunyuan Community License)'
 about: Tencent's 17B DiT (20 double + 40 single blocks), Q8_0 (GGUF by calcuis); Qwen2.5-VL-7B Q4_0 and byT5-small for the text (quoted text drawn by its glyph encoder), the 32x VAE; APG guidance as the official pipeline
 gpus: '0'
-vram_gib: 27.0                   # its memory on the card when it runs (a B70, 2048x2048)
+vram_gib: 27.0                   # its memory on the card when it runs (a B70, 2048x2048: the distilled 25.3 measured, plus the negative pass)
 defaults:
   steps: 50
   cfg: 3.5

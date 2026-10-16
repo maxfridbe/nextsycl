@@ -6,7 +6,7 @@ arch: hunyuanimage-2.1
 title: 'HunyuanImage 2.1 Distilled Q8_0 (text to image, 2K; 8 steps, guidance embedded; Tencent Hunyuan Community License)'
 about: Tencent's MeanFlow-distilled 17B DiT (calcuis' v2 GGUF, Q8_0) - one pass a step, its guidance scale embedded; the base model's text encoders and VAE
 gpus: '0'
-vram_gib: 27.0                   # its memory on the card when it runs (a B70, 2048x2048)
+vram_gib: 25.5                   # its memory on the card when it runs (measured on a B70, 2048x2048)
 defaults:
   steps: 8
   cfg: 3.25

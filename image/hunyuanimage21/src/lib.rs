@@ -193,6 +193,9 @@ impl HunyuanImage21 {
             };
             self.k.axpy(lat.fp(), v.fp(), n, sigmas[i + 1] - sigmas[i])?;
             nsd.gpu.sync()?;
+            if i == 0 {
+                prof::used(nsd, "after the first step");
+            }
             each(i, &lat)?;
         }
         Ok(lat)

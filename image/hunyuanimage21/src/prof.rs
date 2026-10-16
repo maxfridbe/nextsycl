@@ -59,3 +59,13 @@ pub fn report(log: &mut dyn FnMut(String)) {
         s.t.clear();
     }
 }
+
+/// With NS_HI_PROFILE: the card's memory in use now, every process counted (the high point of a run, where it is called)
+pub fn used(nsd: &Nsd, at: &str) {
+    if on() {
+        if let Ok((total, Some(free))) = nsd.gpu.memory() {
+            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            eprintln!("memory {at}: {:.2} GiB used of {:.2} on the card", gib(total - free), gib(total));
+        }
+    }
+}

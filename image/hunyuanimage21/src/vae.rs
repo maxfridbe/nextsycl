@@ -256,6 +256,7 @@ impl Vae {
         drop(x);
         let out = self.conv(nsd, &self.conv_out, &n, hh, ww)?;
         nsd.wait()?;
+        crate::prof::used(nsd, "at the VAE's last convolution");
         Ok((out, hh, ww))
     }
 }

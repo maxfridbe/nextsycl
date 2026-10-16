@@ -35,6 +35,8 @@ image/                     IMAGES
   contract   nextsycl-image      the contract: ImageEngine, ImageRequest (+ Edit), Step, ImageKind; OcrRequest /
                                  OcrOutput for an engine that reads pictures (reads, ocr)
   qwenimage21 nextsycl-image-qwenimage21  Qwen-Image 2.1: DiT, VAE, pipeline, stage checks
+  hunyuanimage21 nextsycl-image-hunyuanimage21  HunyuanImage 2.1: the 17B DiT (base or MeanFlow-distilled), Qwen2.5-VL and
+                                 byT5 text encoders, the 32x VAE, APG guidance, stage checks
   unlimitedocr nextsycl-image-unlimitedocr  Unlimited-OCR: pages to Markdown (SAM-B + CLIP-L, a DeepSeek-V2 MoE decoder)
   example    nextsycl-image-example  a template
 
@@ -271,6 +273,16 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
 ## The image engines
 
 - **qwen-image-2.1** (`image/qwenimage21`) - Qwen-Image 2.1's DiT, VAE and pipeline (text to image, edits).
+- **hunyuanimage-2.1** (`image/hunyuanimage21`) - Tencent's HunyuanImage 2.1 from calcuis' GGUFs (ComfyUI's names):
+  the DiT's Q8_0 matrices stay Q8_0 (18.3 GiB) and are expanded to half (the shared dequant) into one scratch just
+  before each product, every guidance branch reusing the expansion; products feeding the residual are accumulated
+  and written in float32 on oneDNN (`kernels/image/hunyuanimage21/mm.cpp`: the text rows pass half's range); every
+  step's modulations are computed at once in float32. The text: Qwen2.5-VL-7B Q4_0 (26 of 28 layers: hidden_states[-3]),
+  byT5-small in float32 with T5's bucketed position bias; only valid tokens are run (the official model masks the
+  padding). Its own kernels (`hi21.cpp`): Q4_0, the modulated / affine layer norm, short-sequence attention (refiner,
+  byT5, the text encoder), the single blocks' [attention | gelu(mlp)], the VAE's group norm, DC-AE upsample shuffle and
+  channel-repeat shortcuts. Settings: `NS_HI_GUIDANCE` (apg | cfg), `NS_HI_PROFILE`. Checked against the official
+  modules (reference/hunyuanimage21): every stage rel <= 3e-3.
 - **unlimited-ocr** (`image/unlimitedocr`) - Baidu's Unlimited-OCR (the DeepSeek-OCR architecture): it reads pictures
   rather than makes them (`ImageEngine::reads`, `ocr`; the image server's `POST /v1/ocr`, the front door's `image.ocr`,
   the page wfe/ocr). From two GGUFs: the projector (SAM ViT-B + CLIP-L + a linear, F16, float32 here) and the
