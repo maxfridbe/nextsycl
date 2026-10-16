@@ -102,6 +102,8 @@ pub struct Dit {
     zeros: DevBuf,
     /// the products on the silo (its matrices split: `Lin::split_q8`), with GELU and the gated residuals fused
     silo: bool,
+    /// the silo's products in int8 x int8 (approximate, NS_HI_INT8: each row of the inputs quantized as it goes)
+    int8: bool,
     pub meanflow: bool,
     pub guided: bool,
     pub bytes: usize,
@@ -202,11 +204,17 @@ pub struct Batch<'a> {
     mlp: DevBuf,
     /// the refiner's rows and buffers (one branch at a time)
     rx: DevBuf,
+    /// the int8 products' quantized inputs: int8 [rows, FFN], float32 [rows]
+    q: Option<(DevBuf, DevBuf)>,
 }
 
 impl Batch<'_> {
     /// the branches' image rows as a batch of the silo's products: (count, the rows between them), when they are evenly
     /// spaced (one or two branches always are)
+    fn q(&self) -> (*mut i8, *mut f32) {
+        self.q.as_ref().map_or((std::ptr::null_mut(), std::ptr::null_mut()), |(x, s)| (x.ptr().cast(), s.fp()))
+    }
+
     fn img_batch(&self) -> Option<(usize, usize)> {
         let b = &self.branches;
         let step = b.get(1).map_or(0, |x| x.r0 - b[0].r0);
@@ -223,7 +231,8 @@ fn fptr(b: &DevBuf, at: usize) -> *mut f32 {
 }
 
 impl Dit {
-    pub fn load(f: &Gguf, nsd: &Nsd, k: &K, log: &mut dyn FnMut(String)) -> Result<Dit> {
+    /// The DiT of `f`; `int8`: its products in int8 x int8 on the silo (approximate)
+    pub fn load(f: &Gguf, nsd: &Nsd, k: &K, int8: bool, log: &mut dyn FnMut(String)) -> Result<Dit> {
         let t0 = std::time::Instant::now();
         let gpu = &nsd.gpu;
         let lin = |names: &[&str], bias: &[&str], perms: &[Perm], keep: Keep| Lin::load(f, nsd, k, names, bias, perms, keep);
@@ -237,8 +246,13 @@ impl Dit {
         // with the silo the products' matrices are split as loaded (the same bytes; the modulations stay Q8_0, for
         // their float32 products)
         let silo = k.silo().is_some();
+        if int8 && !k.int8() {
+            return Err(Error("NS_HI_INT8=1: the silo's int8 products are not available here (built? NS_SILO=0?)".into()));
+        }
         let prod = |mut l: Lin| -> Result<Lin> {
-            if silo {
+            if int8 {
+                l.rows_q8(nsd, k)?;
+            } else if silo {
                 l.split_q8(nsd, k)?;
             }
             Ok(l)
@@ -332,6 +346,7 @@ impl Dit {
                 z
             },
             silo,
+            int8,
             meanflow,
             guided,
             bytes: 0,
@@ -345,7 +360,8 @@ impl Dit {
             + dit.scratch.len;
         log(format!("hunyuanimage 2.1 dit: {doubles_n} double + {singles_n} single blocks{}{}, {:.1} GiB on {} in {:.1} s{}",
                     if meanflow { ", MeanFlow" } else { "" }, if guided { ", guidance embedded" } else { "" }, bytes as f64 / (1u64 << 30) as f64, gpu.name,
-                    t0.elapsed().as_secs_f64(), k.silo().map_or_else(String::new, |p| format!(" (products on the silo, {})", p.display()))));
+                    t0.elapsed().as_secs_f64(),
+                    k.silo().map_or_else(String::new, |p| format!(" (products on the silo{}, {})", if int8 { " in int8" } else { "" }, p.display()))));
         Ok(Dit { bytes, ..dit })
     }
 
@@ -495,6 +511,7 @@ impl Dit {
             o: DevBuf::f32(gpu, rows * DIM)?,
             mlp: DevBuf::new(gpu, rows * mlp * 2)?,
             rx: DevBuf::f32(gpu, tq * (3 * DIM + FFN + 3 * DIM))?,
+            q: if self.int8 { Some((DevBuf::new(gpu, rows * FFN)?, DevBuf::f32(gpu, rows)?)) } else { None },
         })
     }
 
@@ -549,11 +566,11 @@ impl Dit {
         if let (true, Some((count, step))) = (img, bt.img_batch()) {
             let b0 = &bt.branches[0];
             return l.mm(&self.k, at(x.0, b0.r0, x.1, x.2), x.1, b0.n, at(out.0, b0.r0, out.1, out.2), out.1, post, None, true,
-                        (count, step * x.1, step * out.1));
+                        (count, step * x.1, step * out.1), bt.q());
         }
         for b in &bt.branches {
             let (r0, rows) = if img { (b.r0, b.n) } else { (b.r0 + b.n, b.t) };
-            l.mm(&self.k, at(x.0, r0, x.1, x.2), x.1, rows, at(out.0, r0, out.1, out.2), out.1, post, None, true, (1, 0, 0))?;
+            l.mm(&self.k, at(x.0, r0, x.1, x.2), x.1, rows, at(out.0, r0, out.1, out.2), out.1, post, None, true, (1, 0, 0), bt.q())?;
         }
         Ok(())
     }
@@ -673,9 +690,9 @@ impl Dit {
             prof::mark(nsd, "norm + modulate")?;
             if let (true, Some(l1m)) = (self.silo, &s.linear1_mlp) {
                 // q k v, then the mlp's columns with their GELU: [att | gelu(mlp)] needs no pass of its own
-                s.linear1.mm(k, bt.h.ptr(), DIM, rows, bt.big.ptr(), wide, Post::Half, None, true, (1, 0, 0))?;
+                s.linear1.mm(k, bt.h.ptr(), DIM, rows, bt.big.ptr(), wide, Post::Half, None, true, (1, 0, 0), bt.q())?;
                 prof::mark(nsd, "linear1")?;
-                l1m.mm(k, bt.h.ptr(), DIM, rows, hptr(&bt.big, 3 * DIM), wide, Post::Gelu, None, true, (1, 0, 0))?;
+                l1m.mm(k, bt.h.ptr(), DIM, rows, hptr(&bt.big, 3 * DIM), wide, Post::Gelu, None, true, (1, 0, 0), bt.q())?;
                 prof::mark(nsd, "linear1 mlp + gelu")?;
             } else {
                 let w = s.linear1.ready(nsd, k, sc)?;
@@ -694,8 +711,8 @@ impl Dit {
             if self.silo {
                 // linear2 over [att | gelu(mlp)] as two products into the residual: its first DIM columns on the
                 // attention's rows, the rest on linear1's GELU columns where they are
-                s.linear2.mm(k, bt.att.ptr(), DIM, rows, bt.x.ptr(), DIM, Post::Gate(md(2)), Some((0, DIM)), true, (1, 0, 0))?;
-                s.linear2.mm(k, hptr(&bt.big, 3 * DIM), wide, rows, bt.x.ptr(), DIM, Post::Gate(md(2)), Some((DIM, FFN)), false, (1, 0, 0))?;
+                s.linear2.mm(k, bt.att.ptr(), DIM, rows, bt.x.ptr(), DIM, Post::Gate(md(2)), Some((0, DIM)), true, (1, 0, 0), bt.q())?;
+                s.linear2.mm(k, hptr(&bt.big, 3 * DIM), wide, rows, bt.x.ptr(), DIM, Post::Gate(md(2)), Some((DIM, FFN)), false, (1, 0, 0), bt.q())?;
                 prof::mark(nsd, "linear2")?;
                 continue;
             }
