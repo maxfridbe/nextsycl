@@ -18,6 +18,9 @@
 //! With `idle`, the loaded model is unloaded (the studio's llm.mode "none") once nothing has asked for it that long
 //! and it is not answering; the next request loads it again.
 //!
+//! In maintenance (crate::maintenance: the front door's notice beside the registry), chat requests are answered with
+//! the notice (503, Retry-After) and no model is loaded; the list stays as it is.
+//!
 //! With an image server (`images`), the images API (`/v1/images/...`: generations, edits, files) goes to it and its
 //! model is listed beside the chat ones while it answers - one base URL for a front end's chat and pictures.
 
@@ -58,6 +61,8 @@ pub struct Switch {
     pub images: Option<Target>,
     /// unload the chat model after this long without a request
     pub idle: Option<Duration>,
+    /// maintenance mode's notice file (crate::maintenance), read on every request
+    pub maintenance: Option<std::path::PathBuf>,
     swap: Mutex<()>,
     last_use: Mutex<HashMap<String, Instant>>,
     /// model id -> kept until (X-Keep-Up-S)
@@ -85,7 +90,7 @@ impl Switch {
     pub fn new(models: Models, aliases: HashMap<String, String>, upstream: Target, studio_url: &str, wait: Duration, in_use: Duration)
                -> Result<Switch, String> {
         let (host, path) = http::split_url(studio_url)?;
-        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, images: None, idle: None, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()), keep: Mutex::new(HashMap::new()) })
+        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, images: None, idle: None, maintenance: None, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()), keep: Mutex::new(HashMap::new()) })
     }
 
     pub fn run(self: Arc<Self>, addr: &str) -> Result<(), String> {
@@ -231,6 +236,13 @@ impl Switch {
                 http::respond(&mut s, 502, &json!({"error": {"message": format!("the model server is not answering: {e}")}}));
             }
             return;
+        }
+        if let Some(n) = self.maintenance.as_deref().and_then(crate::maintenance::read) {
+            let m = crate::maintenance::message(&n);
+            eprintln!("refused: maintenance");
+            let body = json!({"error": {"message": m, "type": "maintenance", "code": "maintenance"}});
+            let extra = format!("Retry-After: {}\r\n", n["retry_after_s"].as_u64().unwrap_or(900));
+            return http::respond_bytes(&mut s, 503, "application/json", body.to_string().as_bytes(), &extra);
         }
         let mut body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
         let mut changed = false;

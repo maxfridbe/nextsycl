@@ -68,7 +68,11 @@ export interface State {
   runs: Run[];
   idle_minutes: number;
   ports: { video: number; chat_ui: number };
+  /** maintenance mode while it is on (system.maintenance): the notice callers read, the bypass key */
+  maintenance: Maintenance | null;
 }
+
+export interface Maintenance { on: boolean; message: string; since: number; until: number | null; retry_after_s: number; notice: string; bypass?: string }
 
 export interface Operation {
   tags: string[];

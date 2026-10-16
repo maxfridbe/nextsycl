@@ -440,6 +440,16 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     (`nextsycl.conf.bak-<time>`, the last 10), and lists what has to restart to see the change, a button each (this
     page, the switcher, the studio, the video daemon, the image and music servers, the chat model). A setting in a
     service's environment wins over the file and is marked.
+  - **Maintenance mode** (`nextsycl maintenance on --message TEXT --eta MINUTES [--unload]` / `off` / `status`, the
+    page's Maintenance button, `system.maintenance {on, message, eta_s, unload}`): the box set aside for development
+    while callers are told. What would start work - `llm.chat`, image / audio / video generation, edits, speech,
+    `system.load` / `enable`, the OpenAI POST routes - is refused with error code `maintenance` (503, retryable,
+    `retry_after_s`, the notice in `error.maintenance`; `/v1` answers HTTP 503 with `Retry-After`). Status, listings,
+    cancels and guides answer as always, and `system.busy` / `version` / `state` carry the notice. Queued image and
+    audio jobs wait (stage `maintenance`); the video queue pauses (what was paused before is put back when it ends);
+    running work finishes; `--unload` unloads the models not answering. Open WebUI's chats are answered with the
+    notice by the switcher (it reads `maintenance.json` beside the registry). Turning it on prints a bypass key:
+    requests with `X-Maintenance-Bypass: <key>` go through, so a developer can test through :8000 meanwhile.
 
   ![nextsycl serve: the GPUs, the models](docs/screenshots/home-desktop.webp)
   ![nextsycl serve: the API tab](docs/screenshots/home-api.webp)
@@ -452,7 +462,7 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
   its last request (that request gets a 409 naming it). Per entry: `tools: false` drops tool definitions, `tasks:
   false` declines a front end's background tasks. `--alias` keeps old model ids working. `--images`: the images API
   (`/v1/images/...`) goes to the image server and its model is listed while it runs - one base URL for chat and
-  pictures.
+  pictures. In maintenance mode it answers chat requests with the notice (503, `Retry-After`) and loads nothing.
 - **`gpustat`**: the card's telemetry every few seconds into a JSON file the pages read: VRAM used (the DRM clients'
   `drm-resident-vram0` in /proc/*/fdinfo - root only) and total, busy %, power over a 15 s window, the power cap,
   temperatures, fan, the PCIe link it trained at and what the card and slot could do.

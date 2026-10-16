@@ -79,3 +79,7 @@
  textarea.conf{width:100%;min-height:60vh;background:#0c0e13;color:#e5e7eb;border:1px solid #2f3646;border-radius:8px;padding:10px;font:12px/1.5 ui-monospace,monospace;box-sizing:border-box}
  .saved{background:#0f1a14;border:1px solid #14532d;border-radius:8px;padding:8px 10px;margin:4px 0 10px;font-size:13px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
  @media (max-width:640px){ .srow{grid-template-columns:1fr} }
+ button.btn{background:#1f2430;color:#93c5fd;border:1px solid #2f3646;border-radius:7px;padding:5px 11px;font-size:13px;cursor:pointer}
+ button.btn.small{padding:2px 8px;font-size:12px} .btn.maint{margin-left:auto} .btn.maint.on{background:#f59e0b;color:#111;border-color:#f59e0b}
+ .maintbar{background:#3b2a0a;border:1px solid #f59e0b;color:#fcd34d;padding:8px 12px;border-radius:8px;margin:8px 0;font-size:13px}
+ .maintbar code{color:#fde68a}

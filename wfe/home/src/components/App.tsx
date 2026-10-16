@@ -1,7 +1,7 @@
 /** The page: the host strip and the tabs - Status (the GPUs with what holds them and what is vouched for them, the
  *  models by kind with enable / start / stop, the front ends, the actions' output) and API. */
 import { jsx } from "../jsx.js";
-import { act, render, setTab, ui } from "../main.js";
+import { act, copy, maintenance, render, setTab, ui } from "../main.js";
 import type { Card, Model, Proc, Service } from "../types.js";
 import { Api } from "./Api.js";
 import { ConfigView } from "./Config.js";
@@ -274,6 +274,7 @@ function Status() {
 
 export function App() {
   const h = ui.state?.host;
+  const mt = ui.state?.maintenance ?? null;
   return (
     <div id="app">
       <div class="top">
@@ -287,7 +288,20 @@ export function App() {
               <span>load <b>{h.load1?.toFixed(1) ?? "?"}</b> / {h.cpus} CPUs</span>
             </div>
           : null}
+        {ui.state
+          ? <button class={{ btn: true, maint: true, on: !!mt }} attrs={{ title: mt ? "end maintenance: queued work starts again" : "set the box aside for development: callers told, new work refused" }}
+              on={{ click: () => void maintenance(!mt) }}>{mt ? "End maintenance" : "Maintenance"}</button>
+          : null}
       </div>
+      {mt
+        ? <div class="maintbar">
+            <b>Maintenance</b> {mt.notice}
+            {mt.bypass
+              ? <span class="hint"> · bypass header <code>X-Maintenance-Bypass: {mt.bypass}</code>{" "}
+                  <button class="btn small" on={{ click: () => void copy(mt.bypass ?? "", "bypass") }}>{ui.copied === "bypass" ? "copied" : "copy"}</button></span>
+              : null}
+          </div>
+        : null}
       <div class="tabs">
         <button class={{ tab: true, on: ui.tab === "status" }} on={{ click: () => setTab("status") }}>Status</button>
         <button class={{ tab: true, on: ui.tab === "api" }} on={{ click: () => setTab("api") }}>API</button>

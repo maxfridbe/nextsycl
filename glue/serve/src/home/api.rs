@@ -78,6 +78,12 @@ pub const METHODS: &[Method] = &[
              example: r#"{"set": {"NS_IDLE_MINUTES": "15"}}"# },
     Method { kind: "system", name: "restart", summary: "Restart what reads the settings: serve, switch, studio, video, image, audio or llm",
              fields: &[("service", "string", "serve | switch | studio | video | image | audio | llm", true)], example: r#"{"service": "switch"}"# },
+    Method { kind: "system", name: "maintenance", summary: "Maintenance mode: the box set aside for development. On, what would start work (llm.chat, image/audio/video generation, edits, speech, system.load / enable, the OpenAI POST routes) is refused with error code maintenance (retryable, retry_after_s, the notice in error.maintenance; /v1: HTTP 503 + Retry-After); status, listings, cancels and guides answer as always; queued image and audio jobs wait, the video queue pauses, running work finishes; system.busy / version / state carry the notice, and Open WebUI's chats are answered with it. The answer to turning it on carries a bypass key: a request with the header X-Maintenance-Bypass: <key> goes through (a developer testing meanwhile). Without on: the current state",
+             fields: &[("on", "boolean", "true: on, false: off; absent: just the state", false),
+                       ("message", "string", "what callers are told (kernel work on the B70, say)", false),
+                       ("eta_s", "number", "about how long, in seconds: retry_after_s and the notice's end", false),
+                       ("unload", "boolean", "true: unload the loaded models not answering now (frees the cards)", false)],
+             example: r#"{"on": true, "message": "kernel work", "eta_s": 3600, "unload": true}"# },
 
     Method { kind: "llm", name: "chat", summary: "A chat completion (OpenAI's body; stream is ignored - use /v1/chat/completions to stream)",
              fields: &[("model", "string", "a chat model's id", true), ("messages", "object[]", "[{role, content}]", true),
@@ -308,6 +314,7 @@ const FEATURES: &[&str] = &[
     "video.failure", "video.gpu", "video.engines.ignored", "audio.speak.precheck.voice", "jobs.cancel.reentrant_id", "rpc.errors.body",
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
+    "system.maintenance", "errors.maintenance",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -336,7 +343,7 @@ pub(crate) fn code_of(status: u16) -> &'static str {
 /// Whether the same call may succeed later unchanged: the box was busy or a server did not answer (not a bad value,
 /// a missing or disabled model, a cancel)
 pub(crate) fn retryable(status: u16, code: &str) -> bool {
-    matches!(status, 502..=504) || code == "busy"
+    matches!(status, 502..=504) || code == "busy" || code == "maintenance"
 }
 
 /// An error's body: code, message, whether to retry, and the status as a number (the same as the HTTP one, so a
@@ -407,6 +414,10 @@ impl Home {
         if !self.authorized(&req) {
             return fail(&mut s, 401, "Authorization: Bearer <token> (the token is on the page's API tab)".into());
         }
+        // maintenance: what would start work refused with the notice (maint.rs)
+        if self.maintenance_refused(&mut s, &req) {
+            return;
+        }
         if rpc {
             if req.method != "POST" || req.target.contains('?') {
                 return fail_as(&mut s, 400, Some("invalid_request"), "POST only, every variable in the JSON body (no query strings)".into());
@@ -438,7 +449,7 @@ impl Home {
     }
 
     /// The kinds with an enabled model (system always)
-    fn kinds_on(&self, all: &[Value]) -> Vec<&'static str> {
+    pub(super) fn kinds_on(&self, all: &[Value]) -> Vec<&'static str> {
         let mut v = vec!["system"];
         for k in ["llm", "image", "audio", "video"] {
             if all.iter().any(|m| registry::kind_of(m) == k && m["enabled"] != false) {
@@ -603,7 +614,7 @@ impl Home {
 
     /// Whether anything is working: models loading or answering, chat requests, image and audio jobs, the clip being
     /// made and the queue; where work runs (slots) and each card's share of it
-    fn busy(&self, all: &[Value]) -> Value {
+    pub(super) fn busy(&self, all: &[Value]) -> Value {
         let cards = self.named_cards(all);
         let states = self.model_states(all, &cards);
         let with = |st: &str| states.iter().filter(|m| m["state"] == st).collect::<Vec<_>>();
@@ -667,7 +678,9 @@ impl Home {
                    "power_w": c["power_w"], "models": models, "busy": here.iter().any(|x| x["busy"] == true),
                    "work": here.iter().filter(|x| x["busy"] == true).map(|x| json!({"kind": x["kind"], "model": x["model"]})).collect::<Vec<_>>()})
         }).collect();
+        let maintenance = self.maintenance().map(|n| super::maint::public(&n));
         json!({"busy": !reasons.is_empty(), "reasons": reasons, "loading": loading, "working": working, "llm": {"active": active},
+               "maintenance": maintenance,
                "jobs": jobs, "video": video, "cards": per_card, "slots": slots, "parallel": self.parallel(all)})
     }
 
@@ -711,7 +724,8 @@ impl Home {
             ("system", "version") => {
                 let on = self.kinds_on(&all);
                 let methods: Vec<String> = METHODS.iter().filter(|m| on.contains(&m.kind)).map(|m| format!("{}.{}", m.kind, m.name)).collect();
-                Ok(json!({"version": crate::VERSION, "api": API_VERSION, "kinds": on, "features": FEATURES, "methods": methods}))
+                Ok(json!({"version": crate::VERSION, "api": API_VERSION, "kinds": on, "features": FEATURES, "methods": methods,
+                          "maintenance": self.maintenance().map(|n| super::maint::public(&n))}))
             }
             ("system", "files.stat" | "files.delete") => self.file_op(m.name, b),
             ("system", "models") => {
@@ -728,6 +742,7 @@ impl Home {
             ("system", "config") => Ok(self.config()),
             ("system", "configSet") => self.config_set(b),
             ("system", "restart") => self.restart(&s(b, "service")),
+            ("system", "maintenance") => self.maintenance_set(b),
             (k, "describePromptGuideMD") => {
                 let e = all.iter().find(|x| x["id"] == model().as_str()).ok_or_else(|| (404, format!("no model {}", model())))?;
                 if registry::kind_of(e) != k {
@@ -1261,6 +1276,9 @@ impl Home {
             }
             if m.kind != "system" {
                 add(409, "conflict", format!("no {} model is enabled", m.kind));
+            }
+            if super::maint::starts_work(&op) {
+                add(spec::MAINTENANCE.0, spec::MAINTENANCE.1, spec::MAINTENANCE.2.to_string());
             }
             let words: Vec<String> = errors.iter().map(|e| format!("{} {}: {}", e["code"].as_str().unwrap_or(""), e["status"], e["when"].as_str().unwrap_or(""))).collect();
             let responses = json!({"200": {"description": format!("{{\"ok\": true, \"result\": ...}}, or {{\"ok\": false, \"error\": ...}} - errors are HTTP 200 too. Its errors: {}", words.join("; ")),

@@ -11,6 +11,7 @@ pub mod files;
 pub mod gpustat;
 pub mod home;
 pub mod idle;
+pub mod maintenance;
 pub mod http;
 pub mod image;
 pub mod serve;

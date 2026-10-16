@@ -57,6 +57,9 @@ every kind:
   nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once]
                                 GPU telemetry (VRAM from the DRM clients, busy %, power, temperatures, the PCIe link)
                                 into a JSON file, as root
+  nextsycl maintenance [on|off|status] [--message TEXT] [--eta MINUTES] [--unload]
+                                the front door's maintenance mode: callers told, new work refused, queues waiting;
+                                on prints the bypass key (header X-Maintenance-Bypass) for testing meanwhile
   nextsycl version
 
 language models (nextsycl llm ...; the names without `llm` still work):
@@ -923,6 +926,7 @@ fn main() -> ExitCode {
         Some("gpus") => gpus(),
         Some("switch") => host::switch(rest),
         Some("gpustat") => host::gpustat(rest),
+        Some("maintenance") => host::maintenance(&cfg, rest),
         Some("tokenize") if args.len() == 3 => tokenize(Path::new(&args[1]), &args[2]),
         Some("generate") => generate(&args),
         // `serve FILE` (the llm server's old name), else the box at a glance

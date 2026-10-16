@@ -45,6 +45,8 @@ pub fn switch(args: &[String]) -> Result<(), String> {
     let studio = opt(args, "--studio").unwrap_or("http://127.0.0.1:8090/rpc/llm.mode");
     let mut sw = Switch::new(list, aliases, upstream, studio, secs(args, "--wait", 420.0)?, secs(args, "--in-use", 90.0)?)?;
     sw.images = opt(args, "--images").map(|a| Target::Tcp(a.to_string()));
+    // the front door's maintenance notice, beside the registry
+    sw.maintenance = Some(nextsycl_serve::maintenance::file_beside(&models::registry(&Config::load())));
     // the same idle time as the front door's (NS_IDLE_MINUTES), unless given
     let idle = opt(args, "--idle-minutes").map(str::to_string).or_else(|| Config::load().get("NS_IDLE_MINUTES"));
     sw.idle = idle.map(|v| v.parse::<f64>().map_err(|_| "--idle-minutes N")).transpose()?.filter(|m| *m > 0.0)
@@ -121,4 +123,46 @@ pub fn gpustat(args: &[String]) -> Result<(), String> {
         vram_mb: opt(args, "--vram-mb").map(|v| v.parse().map_err(|_| "--vram-mb N")).transpose()?,
         once: args.iter().any(|a| a == "--once"),
     })
+}
+
+/// `nextsycl maintenance [on|off|status] [--message TEXT] [--eta MINUTES] [--unload] [--port 8000]`: the front door's
+/// maintenance mode (nextsycl_serve::maintenance) - callers told, new work refused, the queues waiting; on answers the
+/// bypass key (header X-Maintenance-Bypass) for testing through the front door meanwhile
+pub fn maintenance(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let port = opt(args, "--port").map(str::to_string).or_else(|| cfg.get("NS_SERVE_PORT")).unwrap_or("8000".into());
+    let mut body = serde_json::json!({"do": "maintenance"});
+    match args.first().map(String::as_str) {
+        Some("on") => {
+            body["on"] = true.into();
+            body["message"] = opt(args, "--message").unwrap_or("").into();
+            if let Some(m) = opt(args, "--eta") {
+                body["eta_s"] = (m.parse::<f64>().map_err(|_| "--eta MINUTES")? * 60.0).into();
+            }
+            body["unload"] = args.iter().any(|a| a == "--unload").into();
+        }
+        Some("off") => body["on"] = false.into(),
+        None | Some("status") => {}
+        Some(x) => return Err(format!("maintenance {x}: on, off or status")),
+    }
+    let t = Target::Tcp(format!("127.0.0.1:{port}"));
+    let v = nextsycl_serve::http::call_for(&t, "POST", "/api/action", Some(&body), 60).map_err(|e| format!("the front door (:{port}): {e}"))?;
+    if let Some(e) = v["error"].as_str() {
+        return Err(e.to_string());
+    }
+    match v["maintenance"].as_object() {
+        Some(n) => {
+            println!("maintenance ON: {}", n.get("notice").and_then(|x| x.as_str()).unwrap_or(""));
+            if let Some(k) = v["bypass"].as_str() {
+                println!("bypass: X-Maintenance-Bypass: {k}");
+            }
+            for r in v["draining"].as_array().into_iter().flatten() {
+                println!("still running: {}", r.as_str().unwrap_or(""));
+            }
+            for m in v["unloading"].as_array().into_iter().flatten() {
+                println!("unloading {}", m.as_str().unwrap_or(""));
+            }
+        }
+        None => println!("maintenance off"),
+    }
+    Ok(())
 }

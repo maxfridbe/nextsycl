@@ -160,6 +160,10 @@ impl Home {
 
     /// Start the kind's next waiting jobs while it has fewer running than servers (the first not held, in order)
     fn dispatch(self: &Arc<Self>, kind: &str) {
+        // maintenance: the queue waits (system.maintenance off dispatches again)
+        if self.maintenance().is_some() {
+            return;
+        }
         let cap = self.slots(kind).len().max(1);
         let start: Vec<String> = {
             let mut l = self.jobs.list.lock().unwrap();
@@ -366,7 +370,10 @@ impl Home {
                 let busy = l.iter().filter(|x| x["kind"] == kind.as_str() && x["state"] == "running").count();
                 v["position"] = json!(me + 1);
                 v["held"] = json!(held(j, &paused));
-                if held(j, &paused) {
+                if let Some(n) = self.maintenance() {
+                    stage = "maintenance".into();
+                    waiting_for = json!(format!("maintenance to end ({})", crate::maintenance::message(&n)));
+                } else if held(j, &paused) {
                     stage = "held".into();
                     waiting_for = json!(if j["held"] == true { format!("released ({kind}.queue.resume with its label)") } else {
                         format!("its {} resumed ({kind}.queue.resume)", if paused["all"] == true { "queue" } else if s(j, "batch").is_empty() { "project" } else { "project or batch" })

@@ -112,6 +112,31 @@ export async function act(what: string, model: string, extra: Record<string, unk
   void poll();
 }
 
+/** Maintenance mode on (asking what to tell callers and for how long) or off */
+export async function maintenance(on: boolean): Promise<void> {
+  const body: Record<string, unknown> = { do: "maintenance", on };
+  if (on) {
+    const message = prompt("Maintenance: what should callers be told?", "development on the GPUs");
+    if (message === null) return;
+    const mins = prompt("About how many minutes? (empty: unknown)", "60");
+    if (mins === null) return;
+    body.message = message;
+    if (mins.trim() && Number(mins) > 0) body.eta_s = Number(mins) * 60;
+    body.unload = confirm("Unload the loaded models that are not answering now (free the cards)?");
+  } else if (!confirm("End maintenance? Queued work starts again.")) {
+    return;
+  }
+  try {
+    const r = await fetch("/api/action", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const j = (await r.json()) as { error?: string };
+    if (!r.ok) ui.error = j.error ?? `HTTP ${r.status}`;
+  } catch (e) {
+    ui.error = String(e);
+  }
+  render();
+  void poll();
+}
+
 export type Tab = "status" | "api" | "config";
 
 export async function loadConfig(): Promise<void> {

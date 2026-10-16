@@ -3,7 +3,7 @@
 //! - **The page** (`/`, wfe/home): every GPU - its memory by process, and the memory the enabled models are vouched
 //!   for (hatched; several may vouch for one card: whichever loads first holds it) - and every registered model:
 //!   enable it on GPU(s), start (load now: the button spins until it answers) and stop (unload), its page, its state;
-//!   an API tab with the bearer token and a curl for every method.
+//!   an API tab with the bearer token and a curl for every method; maintenance mode on and off (maint.rs).
 //! - **Enabled models** load on their first request (an API call here, its page, Open WebUI through the switcher) and
 //!   unload after `idle_minutes` without one (the image and audio servers exit, the switcher sets the chat mode to
 //!   none, the video daemon's workers let their card go); they stay enabled. Disabled: unloaded, gone from Open WebUI's
@@ -22,6 +22,7 @@ mod api;
 mod config;
 mod jobs;
 mod life;
+mod maint;
 mod precheck;
 mod spec;
 pub mod registry;
@@ -99,6 +100,10 @@ pub struct Home {
     stages: Mutex<BTreeMap<String, (String, String)>>,
     /// chat model id -> kept until (unix seconds): X-Keep-Up-S on /v1/chat/completions, keep_up_s on llm.chat
     chat_keep: Mutex<BTreeMap<String, f64>>,
+    /// maintenance mode's notice (crate::maintenance: beside the registry, every service reads it) and the key that
+    /// lets a request through it (kept in the state file; empty: none)
+    maint_file: PathBuf,
+    maint_bypass: Mutex<String>,
 }
 
 pub(crate) fn now() -> f64 {
@@ -178,11 +183,14 @@ impl Home {
             (id.clone(), g.as_object().map(|g| g.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).collect()).unwrap_or_default())
         }).collect()).unwrap_or_default();
         let jobs = jobs::Jobs::load(state_file.with_file_name("jobs.json"));
+        let maint_file = crate::maintenance::file_beside(&registry::registry(&o.cfg));
+        let maint_bypass = Mutex::new(st["maintenance_bypass"].as_str().unwrap_or("").to_string());
         let h = Arc::new(Home {
             o, token, state_file, jobs,
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()), chat_keep: Mutex::new(BTreeMap::new()),
+            maint_file, maint_bypass,
         });
         let me = h.clone();
         std::thread::spawn(move || me.sample_cards());
@@ -242,7 +250,7 @@ impl Home {
     }
 
     fn save_state(&self) {
-        let st = json!({"token": self.token, "seen": *self.seen.lock().unwrap()});
+        let st = json!({"token": self.token, "seen": *self.seen.lock().unwrap(), "maintenance_bypass": *self.maint_bypass.lock().unwrap()});
         let tmp = self.state_file.with_extension("json.tmp");
         if std::fs::write(&tmp, serde_json::to_string_pretty(&st).unwrap_or_default()).is_ok() {
             let _ = std::fs::rename(&tmp, &self.state_file);
@@ -400,8 +408,14 @@ impl Home {
         };
         let mut cards = cards;
         self.vouch(&mut cards, &models);
+        let maintenance = self.maintenance().map(|n| {
+            let mut v = maint::public(&n);
+            v["bypass"] = json!(*self.maint_bypass.lock().unwrap());
+            v
+        });
         json!({"ts": now(), "host": meminfo(), "cards": cards, "models": models, "services": self.services(), "runs": runs,
-               "idle_minutes": self.o.idle_minutes, "ports": {"video": self.o.ports.video, "chat_ui": self.o.ports.chat_ui}})
+               "idle_minutes": self.o.idle_minutes, "ports": {"video": self.o.ports.video, "chat_ui": self.o.ports.chat_ui},
+               "maintenance": maintenance})
     }
 
     /// The cards, a process's model by its registry id where its file is a registered one (`model_id`)
@@ -488,7 +502,8 @@ impl Home {
             "unload" => self.unload(&model).map(|_| json!({"model": model, "loaded": false})),
             "config" => self.config_set(b),
             "restart" => self.restart(b["service"].as_str().unwrap_or("")),
-            other => Err((400, format!("no action {other:?} (enable, disable, gpus, load, unload, config, restart)"))),
+            "maintenance" => self.maintenance_set(b),
+            other => Err((400, format!("no action {other:?} (enable, disable, gpus, load, unload, config, restart, maintenance)"))),
         }
     }
 }

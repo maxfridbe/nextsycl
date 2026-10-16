@@ -183,6 +183,12 @@ pub fn result(method: &str) -> Option<String> {
   "other": {"type": "array", "items": {"type": "object", "additionalProperties": true}, "description": "lines of the file the program does not read"}}, "additionalProperties": true}"#.into(),
         "system.configSet" => r#"{"type": "object", "properties": {"changed": {"type": "array", "items": {"type": "string"}}, "restart": {"type": "array", "items": {"type": "string"}, "description": "what system.restart must restart to see it"}, "path": {"type": "string"}}, "additionalProperties": true}"#.into(),
         "system.restart" => r#"{"type": "object", "properties": {"restarting": {"type": "string"}}}"#.into(),
+        "system.maintenance" => r#"{"type": "object", "required": ["on"], "properties": {
+  "on": {"type": "boolean"},
+  "maintenance": {"type": "object", "nullable": true, "description": "the notice while on", "properties": {"message": {"type": "string"}, "notice": {"type": "string", "description": "the sentence refused callers read"}, "since": {"type": "number"}, "until": {"type": "number", "nullable": true}, "retry_after_s": {"type": "integer"}}},
+  "bypass": {"type": "string", "description": "turning it on: the X-Maintenance-Bypass key that lets a request through"},
+  "unloading": {"type": "array", "items": {"type": "string"}, "description": "models being unloaded (unload: true)"},
+  "draining": {"type": "array", "items": {"type": "string"}, "description": "work still running, as system.busy's reasons"}}}"#.into(),
         "llm.chat" => r#"{"type": "object", "description": "OpenAI's chat.completion", "properties": {"id": {"type": "string"}, "object": {"type": "string"}, "created": {"type": "integer"}, "model": {"type": "string"},
   "choices": {"type": "array", "items": {"type": "object", "properties": {"index": {"type": "integer"}, "finish_reason": {"type": "string"},
     "message": {"type": "object", "properties": {"role": {"type": "string"}, "content": {"type": "string", "nullable": true}, "reasoning_content": {"type": "string", "nullable": true}, "tool_calls": {"type": "array", "items": {"type": "object"}}}}}}},
@@ -332,6 +338,9 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
     }
 }
 
+/// The error every method that starts work may give besides its own (maint.rs's starts_work)
+pub const MAINTENANCE: (u16, &str, &str) = (503, "maintenance", "maintenance mode is on (system.maintenance): refused with the notice (error.maintenance) and error.retry_after_s; retryable");
+
 /// What every answer's error code means
 pub const CODES: &str = "Every /rpc answer is the envelope: {\"ok\": true, \"result\": ...} or {\"ok\": false, \"error\": {code, message, retryable, status, method, field}}, \
 always with HTTP 200 - errors too (401, an unknown method, a body too large to read). Read ok and error.code: error.status is the code's number by convention, \
@@ -341,8 +350,10 @@ Error codes (error.code, error.status by convention): invalid_request 400 (not P
 unauthorized 401, not_found 404 (also an unknown method), conflict 409 (a model disabled, none of the kind enabled, a name taken), \
 busy 409 (video.generate while a clip is made, or an image / audio job that would wait, without queue: true), not_running 409 (video.cancel with nothing running), \
 cancelled 499 (image.cancel / audio.cancel stopped it), unavailable 502 (the kind's server does not answer), \
-no_room 503 (the model's cards are held by work that is not idle; idle models are stopped for it first), timeout 504, internal 500. \
-Every error has retryable: true for no_room, unavailable, timeout and video's busy (the same call may work later), false otherwise \
+no_room 503 (the model's cards are held by work that is not idle; idle models are stopped for it first), \
+maintenance 503 (system.maintenance is on: what starts work - chat, generation, edits, speech, system.load / enable - is refused; error.maintenance has the notice, \
+error.retry_after_s when to try again; status, listings and cancels answer as always), timeout 504, internal 500. \
+Every error has retryable: true for no_room, maintenance, unavailable, timeout and video's busy (the same call may work later), false otherwise \
 (change the request: a bad value, a disabled or missing model, a cancel).";
 
 /// The label convention the video methods share
