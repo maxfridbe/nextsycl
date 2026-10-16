@@ -296,9 +296,9 @@ pub fn skin_input(pos: &[[f32; 3]], geo: &[f32], bones: &[[f32; 6]], leaf: &[boo
     (input, ids, mask)
 }
 
-/// The full weights [n, bones] from SkinNet's logits [n, 5]: softmax, masked, placed (a masked slot - fewer than 5 bones
-/// - writes its 0 over bone 0, as the reference does), averaged over each vertex's
-/// one-ring (post_filter: the neighbours alone), cut below 0.35 of each vertex's largest, renormalized
+/// The full weights [n, bones] from SkinNet's logits [n, 5]: softmax, masked, placed (a masked slot, when there are
+/// fewer than 5 bones, writes its 0 over bone 0, as the reference does), averaged over each vertex's one-ring
+/// (post_filter: the neighbours alone), cut below 0.35 of each vertex's largest, renormalized
 pub fn skin_weights(logits: &[f32], ids: &[usize], mask: &[f32], nb: usize, ring: &[Vec<u32>]) -> Vec<f32> {
     let n = logits.len() / 5;
     let mut full = vec![0f64; n * nb];
