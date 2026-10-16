@@ -172,6 +172,7 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_NH_MOE_XMX` | 1 | 0: the nemotronh prompt pass's experts expanded to half one at a time, then the GEMM (else one XMX launch a projection) | llm:nemotronh |
 | `NS_NH_DRAFTS` | 2 | Tokens the nemotronh engine drafts a step with its MTP block (at most 7; 0: none; the MTP block needs its silo) (--opt-drafts) | llm nemotronh |
 | `NS_NH_HOST` | auto | MoE layers (from the last back) whose experts the nemotronh engine keeps in pinned host memory on one GPU (default: as few as fit; the draft block's first) | llm nemotronh |
+| `NS_NH_SCAN` | 1 | 0: the nemotronh engine's prompt rows through the Mamba scan row after row instead of in 64-row chunks | llm:nemotronh |
 | `NS_NH_SPEED` | units x clock | The nemotronh engine's relative speed of each GPU, in order ('1,1.6'): its layers split by it (as far as each GPU's memory goes) | llm nemotronh |
 | `NS_NH_PIPELINE` | 1 | 0: a prompt of several chunks over several GPUs chunk after chunk, not as a pipeline (each GPU on its own chunk at once) | llm nemotronh |
 | `NS_NH_PROFILE` | off | Debug: 1 waits for each kernel of the nemotronh engine and times it by name (the wall time it costs, launch overhead included; the waits slow the pass), the table printed after a run | llm nemotronh |

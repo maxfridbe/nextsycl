@@ -24,6 +24,11 @@ int ns_nh_conv(ns_gpu* g, const float* x, int64_t xs, float* state, const float*
  * after each row but the last, [T-1][H][P][N] */
 int ns_nh_ssm(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t dts, const float* dt_bias, const float* A, const float* Dp, float* S,
               float* y, int64_t T, int64_t H, int64_t P, int64_t N, int64_t G, float* snap);
+/* The same scan for prompt rows in Mamba-2's chunked form (64-row chunks: within one as small products, the state
+ * carried over them after; no snapshots), head dim 64 and d_state 128 only; scratch: ns_nh_ssm_chunk_scratch floats */
+int64_t ns_nh_ssm_chunk_scratch(int64_t T, int64_t H, int64_t P, int64_t N);
+int ns_nh_ssm_chunk(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t dts, const float* dt_bias, const float* A, const float* Dp, float* S,
+                    float* y, int64_t T, int64_t H, int64_t P, int64_t N, int64_t G, float* scratch);
 /* The mixer's gate and norm: out [T][C] = rms_norm(y * silu(z)) * w over groups of `group` values (z rows zs apart) */
 int ns_nh_gated_norm(ns_gpu* g, const float* y, const float* z, int64_t zs, const float* w, float* out, int64_t T, int64_t C, int64_t group, float eps);
 /* x = max(x, 0)^2 */

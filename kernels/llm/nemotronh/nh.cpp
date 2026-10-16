@@ -280,6 +280,212 @@ int ns_nh_ssm(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t 
     NS_CATCH
 }
 
+// ---- the chunked scan (Mamba-2's chunked form): rows in chunks of SL; within a chunk the outputs and the chunk's
+// state contribution as small products, the state carried over the chunks after, each chunk's entering state into its
+// outputs last. Decays within a chunk from differences of the log decays' running sums. Measured (8K prompt, a layer of
+// 2,048 rows): B70 5.3 -> 3.7 ms, B65 10.2 -> 5.4 against row after row; of the B70's: C . B^T ~0.1, the chunks' work
+// 1.8, the carry 0.2, the entering states' outputs 1.1 (the per-chunk states, 134 MB, through memory three times)
+namespace {
+constexpr int SL = 64, SWG = 256;
+}
+
+int64_t ns_nh_ssm_chunk_scratch(int64_t T, int64_t H, int64_t P, int64_t N) {
+    const int64_t nc = (T + SL - 1) / SL;
+    // the chunks' contributions / entering states, C . B^T a (chunk, group), a head's running decays, its whole decay
+    return nc * H * P * N + nc * H * SL * SL + nc * H * SL + nc * H;
+}
+
+int ns_nh_ssm_chunk(ns_gpu* g, const float* xbc, int64_t xs, const float* dt, int64_t dts, const float* dt_bias, const float* A, const float* Dp,
+                    float* S, float* y, int64_t T, int64_t H, int64_t P, int64_t N, int64_t G, float* scratch) {
+    NS_TRY
+    if (T <= 0) return 0;
+    if (P != 64 || N != 128 || H % G != 0) return ns_fail("ns_nh_ssm_chunk: head dim 64, d_state 128");
+    const int64_t hpg = H / G, xd = H * P, nc = (T + SL - 1) / SL;
+    float* dS = scratch;                       // [nc][H][P][N]: the chunks' contributions, then their entering states
+    float* cb = dS + nc * H * P * N;           // [nc][G][SL][SL]: C_t . B_s
+    float* eL = cb + nc * H * SL * SL;         // [nc][H][SL]: exp(the head's log decays summed to row t)
+    float* dec = eL + nc * H * SL;             // [nc][H]: a chunk's whole decay
+    // 0: C . B^T a (chunk, group), both tiles in local memory; a lane 4 x 4 of it
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::float4, 1> sB(sycl::range<1>(SL * 32), h), sC(sycl::range<1>(SL * 32), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (nc * G) * SWG), sycl::range<1>(SWG)), [=](sycl::nd_item<1> it) {
+            const int li = (int) it.get_local_id(0);
+            const int64_t c = it.get_group(0) / G, gr = it.get_group(0) % G, r0 = c * SL;
+            const int lc = (int) sycl::min<int64_t>(SL, T - r0);
+            for (int i = li; i < SL * 32; i += SWG) {
+                const int r = i / 32, n4 = i % 32;
+                const float* row = xbc + (r0 + r) * xs + xd + gr * 128 + 4 * n4;
+                sB[i] = r < lc ? *reinterpret_cast<const sycl::float4*>(row) : sycl::float4(0.0f);
+                sC[i] = r < lc ? *reinterpret_cast<const sycl::float4*>(row + G * 128) : sycl::float4(0.0f);
+            }
+            sycl::group_barrier(it.get_group());
+            const int tb = li / 16, sb = li % 16;
+            float acc[4][4] = {};
+            for (int n4 = 0; n4 < 32; ++n4) {
+                sycl::float4 cv[4], bv[4];
+#pragma unroll
+                for (int a = 0; a < 4; ++a) cv[a] = sC[(4 * tb + a) * 32 + n4];
+#pragma unroll
+                for (int b = 0; b < 4; ++b) bv[b] = sB[(4 * sb + b) * 32 + n4];
+#pragma unroll
+                for (int a = 0; a < 4; ++a)
+#pragma unroll
+                    for (int b = 0; b < 4; ++b) acc[a][b] += sycl::dot(cv[a], bv[b]);
+            }
+            float* o = cb + ((c * G + gr) * SL) * SL;
+#pragma unroll
+            for (int a = 0; a < 4; ++a)
+                *reinterpret_cast<sycl::float4*>(o + (4 * tb + a) * SL + 4 * sb) = sycl::float4(acc[a][0], acc[a][1], acc[a][2], acc[a][3]);
+        });
+    });
+    // 1: a work-group a (chunk, head): the running log decays; W[t][s] = (C_t . B_s) exp(L_t - L_s) dt'_s; y = W x + D x;
+    //    the contribution sum_s exp(L_end - L_s) dt'_s x_s B_s
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sW(sycl::range<1>(SL * SL), h), sX(sycl::range<1>(SL * 64), h);
+        sycl::local_accessor<float, 1> sdt(sycl::range<1>(SL), h), sL(sycl::range<1>(SL), h), sel(sycl::range<1>(SL), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (nc * H) * SWG), sycl::range<1>(SWG)), [=](sycl::nd_item<1> it) {
+            const int li = (int) it.get_local_id(0);
+            const int64_t c = it.get_group(0) / H, hh = it.get_group(0) % H, gr = hh / hpg, r0 = c * SL;
+            const int lc = (int) sycl::min<int64_t>(SL, T - r0);
+            // the log decays and their running sums (a work-group scan over the first 64 lanes' values)
+            float la = 0.0f;
+            if (li < SL) {
+                float d = 0.0f;
+                if (li < lc) {
+                    d = dt[(r0 + li) * dts + hh] + dt_bias[hh];
+                    d = d <= 20.0f ? sycl::log1p(sycl::exp(d)) : d;
+                    la = d * A[hh];
+                }
+                sdt[li] = d;
+            }
+            const float run = sycl::inclusive_scan_over_group(it.get_group(), li < SL ? la : 0.0f, sycl::plus<float>());
+            if (li < SL) sL[li] = run;
+            for (int i = li; i < SL * 16; i += SWG) {
+                const int r = i / 16, p4 = i % 16;
+                *reinterpret_cast<sycl::float4*>(&sX[r * 64 + 4 * p4]) =
+                    r < lc ? *reinterpret_cast<const sycl::float4*>(xbc + (r0 + r) * xs + hh * 64 + 4 * p4) : sycl::float4(0.0f);
+            }
+            sycl::group_barrier(it.get_group());
+            const float Lend = sL[lc - 1];
+            if (li < SL) {
+                eL[(c * H + hh) * SL + li] = li < lc ? sycl::exp(sL[li]) : 0.0f;
+                sel[li] = li < lc ? sycl::exp(Lend - sL[li]) * sdt[li] : 0.0f;
+                if (li == 0) dec[c * H + hh] = sycl::exp(Lend);
+            }
+            {
+                const float* cbg = cb + ((c * G + gr) * SL) * SL;
+                for (int i = li; i < SL * SL; i += SWG) {
+                    const int tt = i / SL, s = i % SL;
+                    sW[i] = (s <= tt && tt < lc) ? cbg[i] * sycl::exp(sL[tt] - sL[s]) * sdt[s] : 0.0f;
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            // y [t][p]: a lane 4 rows x 4 columns
+            {
+                const int tb = li / 16, pb = li % 16;
+                float acc[4][4] = {};
+                const int tmax = sycl::min(lc, 4 * tb + 4);
+                for (int s = 0; s < tmax; ++s) {
+                    const sycl::float4 xv = *reinterpret_cast<const sycl::float4*>(&sX[s * 64 + 4 * pb]);
+#pragma unroll
+                    for (int a = 0; a < 4; ++a) {
+                        const float w = sW[(4 * tb + a) * SL + s];
+                        acc[a][0] += w * xv.x(); acc[a][1] += w * xv.y(); acc[a][2] += w * xv.z(); acc[a][3] += w * xv.w();
+                    }
+                }
+                const float dd = Dp[hh];
+#pragma unroll
+                for (int a = 0; a < 4; ++a) {
+                    const int tt = 4 * tb + a;
+                    if (tt >= lc) continue;
+                    const sycl::float4 xv = *reinterpret_cast<const sycl::float4*>(&sX[tt * 64 + 4 * pb]);
+                    *reinterpret_cast<sycl::float4*>(y + (r0 + tt) * xd + hh * 64 + 4 * pb) =
+                        sycl::float4(acc[a][0] + dd * xv.x(), acc[a][1] + dd * xv.y(), acc[a][2] + dd * xv.z(), acc[a][3] + dd * xv.w());
+                }
+            }
+            // the contribution [p][n]: a lane 4 p x 8 n, B's rows from memory (the group's heads share them: cached)
+            {
+                const int pb = li / 16, nb = li % 16;
+                float acc[4][8] = {};
+                for (int s = 0; s < lc; ++s) {
+                    const sycl::float4 xv = *reinterpret_cast<const sycl::float4*>(&sX[s * 64 + 4 * pb]);
+                    const float e = sel[s];
+                    const float xe[4] = {xv.x() * e, xv.y() * e, xv.z() * e, xv.w() * e};
+                    const float* br = xbc + (r0 + s) * xs + xd + gr * 128 + 8 * nb;
+                    const sycl::float4 b0 = *reinterpret_cast<const sycl::float4*>(br), b1 = *reinterpret_cast<const sycl::float4*>(br + 4);
+                    const float bv[8] = {b0.x(), b0.y(), b0.z(), b0.w(), b1.x(), b1.y(), b1.z(), b1.w()};
+#pragma unroll
+                    for (int b = 0; b < 8; ++b)
+#pragma unroll
+                        for (int a = 0; a < 4; ++a) acc[a][b] += xe[a] * bv[b];
+                }
+                float* o = dS + ((c * H + hh) * 64) * 128;
+#pragma unroll
+                for (int a = 0; a < 4; ++a) {
+                    float* orow = o + (4 * pb + a) * 128 + 8 * nb;
+                    *reinterpret_cast<sycl::float4*>(orow) = sycl::float4(acc[a][0], acc[a][1], acc[a][2], acc[a][3]);
+                    *reinterpret_cast<sycl::float4*>(orow + 4) = sycl::float4(acc[a][4], acc[a][5], acc[a][6], acc[a][7]);
+                }
+            }
+        });
+    });
+    // 2: the state over the chunks, an element a work-item: each chunk's entering state in place of its contribution
+    const int64_t el = H * P * N;
+    g->q.parallel_for(sycl::range<1>((size_t) el), [=](sycl::id<1> id) {
+        const int64_t i = id[0], hh = i / (P * N);
+        float s = S[i];
+        for (int64_t c = 0; c < nc; ++c) {
+            float* d = dS + c * el + i;
+            const float v = *d;
+            *d = s;
+            s = dec[c * H + hh] * s + v;
+        }
+        S[i] = s;
+    });
+    // 3: a work-group a (chunk, head): y [t][p] += exp(L_t) C_t . S_in[p]; C's tile and the entering state in local memory
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::float4, 1> sC(sycl::range<1>(SL * 32), h), sS(sycl::range<1>(64 * 32), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (nc * H) * SWG), sycl::range<1>(SWG)), [=](sycl::nd_item<1> it) {
+            const int li = (int) it.get_local_id(0);
+            const int64_t c = it.get_group(0) / H, hh = it.get_group(0) % H, gr = hh / hpg, r0 = c * SL;
+            const int lc = (int) sycl::min<int64_t>(SL, T - r0);
+            const float* sin = dS + ((c * H + hh) * 64) * 128;
+            for (int i = li; i < SL * 32; i += SWG) {
+                const int r = i / 32, n4 = i % 32;
+                sC[i] = r < lc ? *reinterpret_cast<const sycl::float4*>(xbc + (r0 + r) * xs + xd + G * 128 + gr * 128 + 4 * n4) : sycl::float4(0.0f);
+                sS[i] = *reinterpret_cast<const sycl::float4*>(sin + 4 * i);
+            }
+            sycl::group_barrier(it.get_group());
+            const int tb = li / 16, pb = li % 16;
+            float acc[4][4] = {};
+            for (int n4 = 0; n4 < 32; ++n4) {
+                sycl::float4 cv[4], sv[4];
+#pragma unroll
+                for (int a = 0; a < 4; ++a) cv[a] = sC[(4 * tb + a) * 32 + n4];
+#pragma unroll
+                for (int b = 0; b < 4; ++b) sv[b] = sS[(4 * pb + b) * 32 + n4];
+#pragma unroll
+                for (int a = 0; a < 4; ++a)
+#pragma unroll
+                    for (int b = 0; b < 4; ++b) acc[a][b] += sycl::dot(cv[a], sv[b]);
+            }
+            const float* el_ = eL + (c * H + hh) * SL;
+#pragma unroll
+            for (int a = 0; a < 4; ++a) {
+                const int tt = 4 * tb + a;
+                if (tt >= lc) continue;
+                float* yo = y + (r0 + tt) * xd + hh * 64 + 4 * pb;
+                const float e = el_[tt];
+                sycl::float4 v = *reinterpret_cast<sycl::float4*>(yo);
+                v += sycl::float4(acc[a][0], acc[a][1], acc[a][2], acc[a][3]) * e;
+                *reinterpret_cast<sycl::float4*>(yo) = v;
+            }
+        });
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_nh_gated_norm(ns_gpu* g, const float* y, const float* z, int64_t zs, const float* w, float* out, int64_t T, int64_t C, int64_t group, float eps) {
     NS_TRY
     if (T <= 0) return 0;

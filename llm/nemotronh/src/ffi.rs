@@ -30,6 +30,9 @@ pub struct Api {
     pub conv: unsafe extern "C" fn(G, *const f32, i64, *mut f32, *const f32, *const f32, *mut f32, i64, i64, c_int, *mut f32) -> c_int,
     pub ssm: unsafe extern "C" fn(G, *const f32, i64, *const f32, i64, *const f32, *const f32, *const f32, *mut f32, *mut f32, i64, i64, i64, i64, i64, *mut f32)
                                  -> c_int,
+    pub ssm_chunk_scratch: unsafe extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub ssm_chunk: unsafe extern "C" fn(G, *const f32, i64, *const f32, i64, *const f32, *const f32, *const f32, *mut f32, *mut f32, i64, i64, i64, i64, i64,
+                                       *mut f32) -> c_int,
     pub layer_norm: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, i64, i64, f32) -> c_int,
     /// the greedy pick on the GPU (the qwen35 engine's kernel: the MTP drafts)
     pub argmax: unsafe extern "C" fn(G, *const f32, i64, i64, *mut i32) -> c_int,
@@ -80,6 +83,8 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             layer_norm: sym!("ns_layer_norm"),
             argmax: sym!("ns_q35_argmax"),
             ssm: sym!("ns_nh_ssm"),
+            ssm_chunk_scratch: sym!("ns_nh_ssm_chunk_scratch"),
+            ssm_chunk: sym!("ns_nh_ssm_chunk"),
             gated_norm: sym!("ns_nh_gated_norm"),
             relu2: sym!("ns_nh_relu2"),
             kv_store: sym!("ns_nh_kv_store"),

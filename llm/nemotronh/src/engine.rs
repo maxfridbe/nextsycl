@@ -388,6 +388,8 @@ pub struct NemotronH<'g> {
     dense: bool,
     /// the prompt pass's experts on XMX (NS_NH_MOE_XMX=0: expanded one at a time, then the GEMM)
     moe_xmx: bool,
+    /// prompt rows' Mamba scan in 64-row chunks (NS_NH_SCAN=0: row after row)
+    chunked_scan: bool,
     layers: Vec<Layer>,
     output_norm: DevBuf,
     output: Mat,
@@ -420,7 +422,8 @@ fn arena_bytes(g: &Geometry, t: usize) -> usize {
     let half = t * g.inner.max(g.n_ff_shared) * 2;
     let moe = e * (g.latent * 2 + g.n_ff_exp * f + g.n_ff_exp * 2 + g.latent * f + 16)
         + t * (g.experts + 3 * g.latent + g.n_ff_shared + 2 * g.n_embd) * f + t * g.latent * 2 + half;
-    let mamba = t * (g.in_proj() + g.conv_dim() + 2 * g.inner + g.n_embd) * f + half;
+    // (the chunked scan's scratch: a state a 64-row chunk and head)
+    let mamba = t * (g.in_proj() + g.conv_dim() + 2 * g.inner + g.n_embd) * f + half + t.div_ceil(64) * g.ssm_heads * ((g.inner / g.ssm_heads.max(1)) * g.state + 64 * 64 + 65) * f;
     let attn = t * (2 * g.heads * g.head + 2 * g.heads_kv * g.head + g.n_embd) * f + half;
     (keep + moe.max(mamba).max(attn)) * 6 / 5 + (64 << 20)
 }
@@ -720,6 +723,7 @@ impl<'g> NemotronH<'g> {
                        snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(),
                        dense: std::env::var("NS_NH_DENSE").map_or(true, |v| v != "0"),
                        moe_xmx: std::env::var("NS_NH_MOE_XMX").map_or(true, |v| v != "0"),
+                       chunked_scan: std::env::var("NS_NH_SCAN").map_or(true, |v| v != "0"),
                        prof: std::env::var("NS_NH_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get() })
     }
 
@@ -895,8 +899,16 @@ impl<'g> NemotronH<'g> {
             let (cs, ss) = snap.map_or((std::ptr::null_mut(), std::ptr::null_mut()), |x| (x.0.fp(), x.1.fp()));
             self.op("conv", || (k.conv)(self.raw(), zx.fp().add(g.inner), ip as i64, conv.fp(), m.conv_w.fp(), m.conv_b.fp(), co.fp(), t as i64, cd as i64,
                                         g.conv as i32, cs))?;
-            self.op("ssm scan", || (k.ssm)(self.raw(), co.fp(), cd as i64, zx.fp().add(g.inner + cd), ip as i64, m.dt_b.fp(), m.a.fp(), m.d.fp(), s.fp(),
-                                           y.fp(), t as i64, g.ssm_heads as i64, hp as i64, g.state as i64, g.groups as i64, ss))?;
+            // prompt rows without snapshots: the chunked scan (NS_NH_SCAN=0: row after row)
+            if snap.is_none() && t > DEC && hp == 64 && g.state == 128 && self.chunked_scan {
+                let sc = self.arena().f32((k.ssm_chunk_scratch)(t as i64, g.ssm_heads as i64, hp as i64, g.state as i64) as usize)?;
+                self.op("ssm scan chunked", || (k.ssm_chunk)(self.raw(), co.fp(), cd as i64, zx.fp().add(g.inner + cd), ip as i64, m.dt_b.fp(), m.a.fp(),
+                                                             m.d.fp(), s.fp(), y.fp(), t as i64, g.ssm_heads as i64, hp as i64, g.state as i64,
+                                                             g.groups as i64, sc.fp()))?;
+            } else {
+                self.op("ssm scan", || (k.ssm)(self.raw(), co.fp(), cd as i64, zx.fp().add(g.inner + cd), ip as i64, m.dt_b.fp(), m.a.fp(), m.d.fp(), s.fp(),
+                                               y.fp(), t as i64, g.ssm_heads as i64, hp as i64, g.state as i64, g.groups as i64, ss))?;
+            }
             tap(&format!("mamba2_y_add_d-{l}"), &y)?;
             self.op("gated norm", || (k.gated_norm)(self.raw(), y.fp(), zx.fp(), ip as i64, m.norm.fp(), yn.fp(), t as i64, g.inner as i64,
                                                     (g.inner / g.groups) as i64, g.eps))?;
