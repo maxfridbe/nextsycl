@@ -404,6 +404,11 @@ impl Effort {
     }
 }
 
+/// Where a user turn begins in each chat template's prompt (GLM; DeepSeek R1 and V4; ChatML: Qwen, Nemotron; Muse):
+/// the server checkpoints a prompt there, since a template rewrites what follows the last user turn's start for the
+/// next turn (CONTRIBUTING.md rule 1). A template whose user turns begin otherwise adds its marker here.
+pub const USER_TURNS: &[&str] = &["<|user|>", "<\u{ff5c}User\u{ff5c}>", "<|im_start|>user", "<|start|>user"];
+
 /// One message of a conversation.
 #[derive(Default)]
 pub struct Message<'a> {

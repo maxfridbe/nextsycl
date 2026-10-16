@@ -24,7 +24,7 @@ ctx: 131072,32768               # llm: each session's context
 tools: true                     # llm: tool calls offered to it (false: dropped)
 tasks: true                     # llm: a front end's background tasks (titles, tags) accepted
 env: {}                         # settings its engine reads; '{role}' is that file's path once pulled
-silo:                           # its tuned kernels (CONTRIBUTING rule 5): kernels/<kind>/<name>/silo, built as
+silo:                           # its tuned kernels (CONTRIBUTING rule 6): kernels/<kind>/<name>/silo, built as
   name: qwen35                  #   dist/silo/libnextsycl-<name>.so (default: the architecture's own, when built)
   required: true                # no load without it (default false: the shared kernels for what it lacks)
 files:                          # by role: a file defined here, or another card's file by its key

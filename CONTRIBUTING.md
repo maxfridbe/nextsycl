@@ -6,12 +6,19 @@ guide is how to port one, and the few rules every change follows.
 
 ## The rules
 
-1. **SYCL is the only GPU runtime.** Every kernel is SYCL (oneAPI DPC++, Level Zero), on the GPU's own queue. No
+1. **Every language model caches prompts.** A conversation's next turn reads only what is new: the server checkpoints
+   each prompt at the start of its last user turn (and its first, and its end) and mounts the longest checkpoint
+   that is a prefix of the next prompt. So an engine implements `save` / `restore` / `read_checkpoint` with its
+   `cache_fingerprint`, and its chat template keeps what comes before the last user turn unchanged on the next turn
+   (rewrite only what follows it - effort notes, dropped thinking) and begins user turns with a marker in
+   `nextsycl_tok::USER_TURNS` (a new template's marker is added there). The CPU-side check runs for every engine;
+   check a port on the box too: the second turn's request shows `reused` > 0.
+2. **SYCL is the only GPU runtime.** Every kernel is SYCL (oneAPI DPC++, Level Zero), on the GPU's own queue. No
    Vulkan, CUDA, OpenCL, HIP, Metal, wgpu, or a framework that brings one (candle, PyTorch, ONNX Runtime, burn...).
    oneAPI's own libraries (oneMKL, oneDNN) run on the same SYCL queue and are fine. Host code is Rust.
-2. **Third-party crates are fine** - anything that does not bring another GPU runtime (rule 1). Prefer a few
+3. **Third-party crates are fine** - anything that does not bring another GPU runtime (rule 2). Prefer a few
    well-known ones; say why in the pull request.
-3. **Keep the architecture** (`docs/architecture.md`):
+4. **Keep the architecture** (`docs/architecture.md`):
    - an engine is its own crate under its kind (`llm/<arch>`, `image/<arch>`, `video/<arch>`, `audio/<arch>`), with its kernels in
      `kernels/<kind>/<arch>/`;
    - it depends only on the foundation (`crates/`) and its own kind's contract (`<kind>/contract`) - never on
@@ -19,9 +26,9 @@ guide is how to port one, and the few rules every change follows.
    - what two kinds both need moves down into the foundation, not sideways;
    - its kernels' C functions are named `ns_<kind>_<arch>_*`, declared in its own header, and bound by its own crate
      by name (its `ffi.rs`) - never added to the shared `kernels/ns/ns.h`.
-4. **Exact before fast.** An engine is checked against a reference (the model's own implementation, or llama.cpp
+5. **Exact before fast.** An engine is checked against a reference (the model's own implementation, or llama.cpp
    for an llm) before it is tuned, and every speed claim comes with the measurement that made it.
-5. **Tune in the model's silo, never in the shared kernels.** The shared kernels (`kernels/ns`, `kernels/strata`,
+6. **Tune in the model's silo, never in the shared kernels.** The shared kernels (`kernels/ns`, `kernels/strata`,
    `kernels/diffusion`, and one engine's kernels another engine calls) are tuned for the engines already on them;
    changing one to speed up another model can slow or break those. A kernel tuned for one model goes in that model's
    **silo**, `kernels/<kind>/<arch>/silo/` - its own library, `dist/silo/libnextsycl-<arch>.so`, which the engine
@@ -30,8 +37,9 @@ guide is how to port one, and the few rules every change follows.
    kernels alone. Start a silo kernel as a copy of the shared one, then change the copy. A change to a shared kernel
    itself (a bug fix, a new type) re-runs every engine that calls it - its check and its bench - before it lands.
 
-Rules 1 and 3 are checked by `cargo test` (`cli/nextsycl/tests/architecture.rs`) and `./build.sh test` (the kernel
-libraries link against no other runtime); CI runs both.
+Every rule a machine can check is a test in `cli/nextsycl/tests/architecture.rs` (its header maps each rule to its
+tests; rule 5 is a review rule), run by `cargo test`; `./build.sh test` checks the kernel libraries link against no
+other runtime. CI runs both. A new rule comes with its test.
 
 ## Building
 
@@ -78,7 +86,7 @@ clear message where the port begins: `llm/example`, `image/example`, `video/exam
    (`cli/nextsycl/src/main.rs`: `engines()`, `video_engines()`; `cli/nextsycl/src/image.rs`: `engines()`). `nextsycl <kind> engines`
    lists it.
 8. **Then make it fast** - as its own thing: graphs, fused kernels, its own memory plan, and kernels tuned for its
-   shapes in its silo (rule 5: `kernels/<kind>/<arch>/silo/`, never by editing the shared ones). Check that the silo
+   shapes in its silo (rule 6: `kernels/<kind>/<arch>/silo/`, never by editing the shared ones). Check that the silo
    gives the same results as the shared kernel (same outputs, the same greedy text with `NS_SILO=0` and without), and
    measure with the kind's bench before and after (`nextsycl llm bench`, ...); quote both in the pull request.
 9. **Document it**: its settings and numbers in `docs/architecture.md` (its engine section) and the README's speed

@@ -1,12 +1,20 @@
-//! The architecture's rules, checked on every `cargo test` (CONTRIBUTING.md explains them):
+//! The directives (CONTRIBUTING.md's rules), checked on every `cargo test`, each by the tests named here:
 //!
-//! 1. Layers: the foundation (crates/) depends only on the foundation; a kind's contract (<kind>/contract) on the
-//!    foundation; an engine (<kind>/<arch>) on the foundation and its own kind's contract - never on another kind,
-//!    the glue or the program; the glue (glue/) on the foundation and the contracts, never on an engine.
-//! 2. One GPU runtime: SYCL. No crate that brings another (Vulkan, CUDA, OpenCL, Metal, wgpu, ONNX Runtime,
-//!    PyTorch, candle, burn...) anywhere in Cargo.lock.
-//! 3. The project's own kernels (kernels/ns, kernels/<kind>/<arch>) include no other runtime's headers.
-//! 4. Every environment variable the code reads has a row in docs/environment.md.
+//! 1. Every language model caches prompts: `every_llm_template_keeps_a_cacheable_prefix` (each engine's chat template
+//!    has a user-turn marker the server checkpoints at, and a later turn's prompt begins with the earlier one's up to
+//!    its last user turn) and `every_llm_engine_saves_checkpoints` (each served engine's save / restore / read).
+//! 2. SYCL is the only GPU runtime: `sycl_is_the_only_gpu_runtime` (no crate that brings another anywhere in
+//!    Cargo.lock) and `own_kernels_include_no_other_runtime` (kernels/ns, kernels/<kind>/<arch>); `./build.sh test`
+//!    checks the libraries link against no other runtime.
+//! 3. Third-party crates bring no other GPU runtime: `sycl_is_the_only_gpu_runtime`.
+//! 4. The architecture: `layers_depend_only_downward` (the foundation on the foundation, a contract on the
+//!    foundation, an engine on the foundation and its own kind's contract, the glue never on an engine).
+//! 5. Exact before fast: a review rule (the pull request's parity check and measurements), not a test.
+//! 6. Tuning in silos: `silos_are_their_engines_own` (a silo is opened by its engine, included by nothing outside
+//!    its arch, and gates its ops with `_supported` checks).
+//!
+//! And every environment variable the code reads has a row in docs/environment.md:
+//! `every_environment_variable_is_documented`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -67,7 +75,7 @@ fn layers_depend_only_downward() {
     for (name, dir) in &crates {
         let (l, kind) = layer(dir);
         for d in deps(dir) {
-            let Some(ddir) = crates.get(&d) else { continue }; // a third-party crate (rule 2 checks those)
+            let Some(ddir) = crates.get(&d) else { continue }; // a third-party crate (rule 3 checks those)
             let (dl, dkind) = layer(ddir);
             let ok = match l {
                 "foundation" => dl == "foundation",
@@ -201,4 +209,140 @@ fn every_environment_variable_is_documented() {
     assert!(reads.len() > 100, "the scan found only {} variables: is the pattern list broken?", reads.len());
     let missing: Vec<String> = reads.iter().filter(|(name, _)| !words.contains(name.as_str())).map(|(name, at)| format!("{name} ({at})")).collect();
     assert!(missing.is_empty(), "environment variables read but not in docs/environment.md (a row each: CONTRIBUTING.md):\n  {}", missing.join("\n  "));
+}
+
+/// Every language engine's registry entry (the program's own list: `engines()` in main.rs)
+fn llm_kinds() -> Vec<nextsycl_llm::EngineKind> {
+    vec![nextsycl_llm_glm5next::kind(), nextsycl_llm_qwen4exp::kind(), nextsycl_llm_qwen35::kind(), nextsycl_llm_deepseek2::kind(),
+         nextsycl_llm_deepseek4::kind(), nextsycl_llm_museglimmer::kind(), nextsycl_llm_nemotronh::kind(), nextsycl_llm_example::kind()]
+}
+
+/// The engines under llm/ (each but the contract)
+fn llm_arch_dirs() -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(root().join("llm")).unwrap().flatten().filter(|e| e.path().join("Cargo.toml").exists())
+        .map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n != "contract").collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn every_llm_template_keeps_a_cacheable_prefix() {
+    use nextsycl_tok::{Effort, Message, USER_TURNS};
+    let main = std::fs::read_to_string(root().join("cli/nextsycl/src/main.rs")).unwrap();
+    for arch in llm_arch_dirs() {
+        let krate = format!("nextsycl_llm_{arch}::kind()");
+        assert!(main.contains(&krate), "llm/{arch} is not in main.rs's engines()");
+        assert!(std::fs::read_to_string(root().join(file!()).canonicalize().unwrap_or_else(|_| root().join("cli/nextsycl/tests/architecture.rs")))
+                    .unwrap().contains(&krate), "llm/{arch} is not in this test's llm_kinds()");
+    }
+    let tool = r#"{"type": "function", "function": {"name": "weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}"#.to_string();
+    let m = |role, content| Message { role, content, ..Default::default() };
+    let answer = |content| Message { role: "assistant", content, reasoning: Some("Let me think about it."), ..Default::default() };
+    let sys = m("system", "You are a careful assistant. Keep answers short.");
+    let turns: [Vec<Message>; 3] = [
+        vec![m("system", sys.content), m("user", "What is a nebula?")],
+        vec![m("system", sys.content), m("user", "What is a nebula?"), answer("A cloud of gas and dust."), m("user", "And a pulsar?")],
+        vec![m("system", sys.content), m("user", "What is a nebula?"), answer("A cloud of gas and dust."), m("user", "And a pulsar?"),
+             answer("A spinning neutron star."), m("user", "Thanks.")],
+    ];
+    // where the server checkpoints a prompt for the next turn: the start of its last user turn
+    let last_user = |p: &str| USER_TURNS.iter().filter_map(|u| p.rfind(u)).max();
+    let mut bad = Vec::new();
+    for k in llm_kinds() {
+        for effort in [Effort::Low, Effort::High, Effort::Max] {
+            for tools in [vec![], vec![tool.clone()]] {
+                let p: Vec<String> = turns.iter().map(|t| (k.chat)(t, effort, &tools)).collect();
+                let tag = format!("{} ({effort:?}{})", k.name, if tools.is_empty() { "" } else { ", tools" });
+                let mut prev = 0;
+                for i in 0..2 {
+                    let Some(at) = last_user(&p[i]) else {
+                        bad.push(format!("{tag}: turn {} has no user-turn marker the server knows (nextsycl_tok::USER_TURNS)", i + 1));
+                        break;
+                    };
+                    if !p[i + 1].starts_with(&p[i][..at]) {
+                        let same = p[i].bytes().zip(p[i + 1].bytes()).take_while(|(a, b)| a == b).count();
+                        bad.push(format!("{tag}: turn {} does not begin with turn {}'s prompt up to its last user turn (they part at byte {same} of {at}: {:?} / {:?})",
+                                         i + 2, i + 1, &p[i][same..(same + 40).min(p[i].len())], &p[i + 1][same..(same + 40).min(p[i + 1].len())]));
+                    }
+                    if at <= prev || !p[i][..at].contains(sys.content) {
+                        bad.push(format!("{tag}: turn {}'s checkpoint ({at}) does not move past the system prompt and the turns before", i + 1));
+                    }
+                    prev = at;
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "prompt caching broken (rule 1, CONTRIBUTING.md):\n  {}", bad.join("\n  "));
+}
+
+#[test]
+fn every_llm_engine_saves_checkpoints() {
+    let mut bad = Vec::new();
+    for arch in llm_arch_dirs().into_iter().filter(|a| a != "example") {
+        let lib = std::fs::read_to_string(root().join(format!("llm/{arch}/src/lib.rs"))).unwrap();
+        for f in ["fn cache_fingerprint(", "fn save(", "fn restore(", "fn read_checkpoint("] {
+            let Some(at) = lib.find(f) else {
+                bad.push(format!("llm/{arch}: no {f}..)"));
+                continue;
+            };
+            let body = &lib[at..];
+            let body = &body[..body[1..].find("\n    fn ").map_or(body.len(), |e| e + 1)];
+            // a refusal: the body is an error outright (an error under a condition - a verify pass open - is fine)
+            let first = body.split_once('{').map_or("", |b| b.1).trim_start();
+            if ["Err(", "Ok(Err", "unimplemented!", "todo!", "panic!"].iter().any(|r| first.starts_with(r)) || body.contains("not supported") {
+                bad.push(format!("llm/{arch}: {f}..) refuses: {}", body.lines().take(4).collect::<Vec<_>>().join(" ")));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "engines without prompt-cache checkpoints (rule 1, CONTRIBUTING.md):\n  {}", bad.join("\n  "));
+}
+
+#[test]
+fn silos_are_their_engines_own() {
+    let root = root();
+    let mut bad = Vec::new();
+    let mut silos = Vec::new();
+    for kind in ["llm", "image", "video", "audio"] {
+        for e in std::fs::read_dir(root.join("kernels").join(kind)).into_iter().flatten().flatten() {
+            if e.path().join("silo").is_dir() {
+                silos.push((kind, e.file_name().to_string_lossy().to_string()));
+            }
+        }
+    }
+    assert!(!silos.is_empty(), "no silos found: is the scan broken?");
+    // every C / C++ file of the kernels: (its path relative to the root, its text)
+    let mut files = Vec::new();
+    let mut stack = vec![root.join("kernels")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if matches!(p.extension().and_then(|x| x.to_str()), Some("cpp" | "hpp" | "h")) {
+                files.push((p.strip_prefix(&root).unwrap().display().to_string(), std::fs::read_to_string(&p).unwrap_or_default()));
+            }
+        }
+    }
+    for (kind, arch) in &silos {
+        // its engine opens it (nextsycl_core::silo), so it runs without it on the shared kernels
+        let src = root.join(kind).join(arch).join("src");
+        let opens = std::fs::read_dir(&src).into_iter().flatten().flatten()
+            .any(|f| std::fs::read_to_string(f.path()).unwrap_or_default().contains("nextsycl_core::silo("));
+        if !opens {
+            bad.push(format!("{kind}/{arch}: kernels/{kind}/{arch}/silo exists but {} never opens it (nextsycl_core::silo)", src.display()));
+        }
+        // nothing outside its arch includes it
+        let own = format!("kernels/{kind}/{arch}/");
+        for (path, text) in &files {
+            if !path.starts_with(&own) && text.lines().any(|l| l.trim_start().starts_with("#include") && l.contains(&format!("{arch}/silo/"))) {
+                bad.push(format!("{path} includes {arch}'s silo (a silo is its engine's own)"));
+            }
+        }
+        // its header gates its ops
+        let gated = files.iter().any(|(p, t)| p.starts_with(&format!("{own}silo/")) && p.ends_with(".h") && t.contains("_supported("));
+        if !gated {
+            bad.push(format!("kernels/{kind}/{arch}/silo: no `_supported` check in its header"));
+        }
+    }
+    assert!(bad.is_empty(), "silos broken (rule 6, CONTRIBUTING.md):\n  {}", bad.join("\n  "));
 }

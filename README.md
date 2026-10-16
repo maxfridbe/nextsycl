@@ -10,7 +10,7 @@ We stand on the shoulders of giants.
 - **No Python**
 - **No Node**
 - **Every useful model, optimized**
-- **Silo architecture** - only do what is best for model X ([CONTRIBUTING.md](CONTRIBUTING.md) rule 5)
+- **Silo architecture** - only do what is best for model X ([CONTRIBUTING.md](CONTRIBUTING.md) rule 6)
 - **Test driven** - nothing is committed until it beats the base, with the same results
 - **A single API control plane** - the front door on :8000
 - **A Docker-style CLI** - `nextsycl <kind> start | stop | ps | logs | ...`
@@ -169,7 +169,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 - **Kernels tuned per model, in silos:** the shared kernels (`kernels/ns`, Strata's, the diffusion ones) stay as the
   engines on them were tuned; a model's faster versions live in its silo (`kernels/<kind>/<arch>/silo/`, its own
   library `dist/silo/libnextsycl-<arch>.so`), which its engine opens at load and uses for what they cover - the
-  shared kernels for the rest, or for everything with `NS_SILO=0` (CONTRIBUTING.md rule 5).
+  shared kernels for the rest, or for everything with `NS_SILO=0` (CONTRIBUTING.md rule 6).
 - **Long context, to 256K:** the DSA indexer past 2,048 tokens (each row attends to its top 512 pools of 4 tokens and
   its own unfinished pool), checked against llama.cpp; a context per session (`--ctx 262144,32768` / `NS_CTX`: one
   long session and a short one; default two of 64K). A 253K-token prompt reads in 249 s (~1,020 tok/s) and decodes at

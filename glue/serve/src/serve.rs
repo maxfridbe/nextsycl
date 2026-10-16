@@ -334,6 +334,20 @@ fn fresh_seed(id: u64) -> u64 {
 /// Prefixes shorter than this are read again rather than cached
 const MIN_CHECKPOINT: usize = 64;
 
+/// The token runs that begin a user turn in this tokenizer's prompts: each of nextsycl_tok::USER_TURNS whose leading
+/// special token the vocabulary has (a marker of another model's template would only match plain text)
+pub fn user_turn_marks(tok: &Tokenizer) -> Vec<Vec<u32>> {
+    nextsycl_tok::USER_TURNS.iter()
+        .filter(|m| m.find('>').and_then(|e| tok.id(&m[..=e])).is_some())
+        .map(|m| tok.encode(m))
+        .collect()
+}
+
+/// Where in `ids` one of `marks` begins
+pub fn turn_starts(ids: &[u32], marks: &[Vec<u32>]) -> Vec<usize> {
+    (0..ids.len()).filter(|&i| marks.iter().any(|m| !m.is_empty() && ids[i..].starts_with(m))).collect()
+}
+
 fn respond(s: &mut Conn, code: u16, body: &Value) {
     http::respond(s, code, body)
 }
@@ -445,14 +459,14 @@ impl Server {
     }
 
     /// The checkpoint positions of a prompt: the end of its first turn and the start of its last user turn (each
-    /// where a `<|user|>` token begins), and its end.
+    /// where a user turn begins, nextsycl_tok::USER_TURNS), and its end. The end alone is seldom a prefix of the next
+    /// turn's prompt - the templates rewrite the last turns (effort notes on the last user turn, past thinking
+    /// dropped) - so the next turn mounts the start of this one's last user turn.
     fn stops(&self, ids: &[u32]) -> Vec<usize> {
         let mut v = Vec::new();
-        if let Some(u) = self.tok.id("<|user|>") {
-            let at: Vec<usize> = ids.iter().enumerate().filter(|(_, t)| **t == u).map(|(i, _)| i).collect();
-            v.extend(at.first().copied());
-            v.extend(at.last().copied());
-        }
+        let at = turn_starts(ids, &user_turn_marks(&self.tok));
+        v.extend(at.first().copied());
+        v.extend(at.last().copied());
         v.push(ids.len());
         v.retain(|p| *p >= MIN_CHECKPOINT);
         v.sort();
@@ -1388,5 +1402,14 @@ mod tests {
         let named = vec!["http://studio:8095/".to_string()];
         assert!(cors_headers(Some("http://studio:8095"), &named).contains("http://studio:8095"));
         assert!(cors_headers(Some("https://example.com"), &["*".to_string()]).contains("https://example.com"));
+    }
+
+    #[test]
+    fn turn_starts_finds_each_marker() {
+        // 10 = <|im_start|>, 3263 = user (Nemotron's ids); 7 = a one-token marker
+        let marks = vec![vec![10, 3263], vec![7]];
+        let ids = [10, 99, 1, 10, 3263, 5, 11, 10, 42, 7, 2, 10, 3263];
+        assert_eq!(super::turn_starts(&ids, &marks), vec![3, 9, 11]);
+        assert!(super::turn_starts(&ids, &[vec![]]).is_empty());
     }
 }

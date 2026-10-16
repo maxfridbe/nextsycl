@@ -270,7 +270,7 @@ of IQ2_XXS instead could win twice.
       (cosine >= 0.99993 every layer, same next token); served as qwen3.8-27b-q8 / -q4 / -q3 (tools, reasoning)
 - [x] Silos (2026-10-10): a model's tuned kernels in `kernels/<kind>/<arch>/silo/` -> `dist/silo/libnextsycl-<arch>.so`,
       opened by the engine at load, the shared kernels for what it does not cover or without it (CONTRIBUTING.md
-      rule 5); qwen35's decode products the first (Q4 decode 17.7 -> 22.5-23.5 tok/s at 2K, Q3 12.3 -> 20.4)
+      rule 6); qwen35's decode products the first (Q4 decode 17.7 -> 22.5-23.5 tok/s at 2K, Q3 12.3 -> 20.4)
 - [x] Qwen3.8-27B MTP (2026-10-10): the draft block from the MTP file, 3 chained drafts a step, DeltaNet snapshots
       for rollback; verify rows exact (spec-check 0 difference); decode at 2K 26 -> 43 tok/s (Q4), 18.5 -> 41.8 (Q8)
 - [x] Qwen3.8-27B on two cards (2026-10-11): layers split, the last GPU filled first (head + draft block there), each
