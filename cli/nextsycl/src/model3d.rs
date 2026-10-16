@@ -154,6 +154,9 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
                             extra: nextsycl_core::options::by_name(super::engine_opts(), e.options()) };
     let t0 = std::time::Instant::now();
     let mesh = e.generate(&req, &mut progress).map_err(|e| e.0)?;
+    for l in e.report() {
+        eprintln!("{l}");
+    }
     let out = out_file(cfg, args, &format!("{}-{seed}", m["id"].as_str().unwrap_or("mesh")))?;
     std::fs::write(&out, nextsycl_model3d::mesh::glb::write(&mesh)?).map_err(|e| format!("{}: {e}", out.display()))?;
     println!("{} ({} triangles{}, {:.1} s, seed {seed})", out.display(), mesh.triangles(),

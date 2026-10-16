@@ -1,8 +1,10 @@
 //! Hunyuan3D (Tencent): a mesh from one picture of an object, two architectures on one engine.
 //!
 //! - **hunyuan3d-2mini** (2mini-turbo): DINOv2-giant at 1,022 px, the Flux-style `Hunyuan3DDiT` (8 double + 16
-//!   single blocks, guidance-distilled: no CFG batch) over 512 latent tokens, ConsistencyFlowMatchEuler in 5 steps,
-//!   and the turbo ShapeVAE decoder (FlashVDM's light geometry decoder).
+//!   single blocks, guidance-distilled: no CFG batch) over 3,072 latent tokens, ConsistencyFlowMatchEuler in 5
+//!   steps, and the turbo ShapeVAE decoder (FlashVDM's light geometry decoder). Tencent's turbo example samples 512
+//!   tokens (the turbo decoder's `latent_shape`, which its pipeline reads); the DiT's own config and ComfyUI use
+//!   3,072, and in tests 3,072 keeps detail 512 loses (lettering, creases) for about a second more.
 //! - **hunyuan3d-2.1**: DINOv2-Large at 518 px, `HunYuanDiTPlain` (21 blocks, U-ViT skips, MoE in the last 6, the
 //!   timestep as a token) over 4,096 tokens, FlowMatchEuler in 50 steps with CFG 5, the ShapeVAE decoder.
 //!
@@ -39,7 +41,7 @@ pub const ARCH_MINI: &str = "hunyuan3d-2mini";
 pub const ROLES: &[&str] = &["model", "vae?", "paint-unet?", "paint-vae?", "paint-dino?", "upscaler?"];
 
 pub const OPTIONS: &[EngineOption] = &[
-    EngineOption { name: "tokens", env: "NS_M3D_HY_TOKENS", value: "N", help: "latent tokens of the shape (2mini 512 as Tencent's turbo example; 2.1 4096)", at: At::Both },
+    EngineOption { name: "tokens", env: "NS_M3D_HY_TOKENS", value: "N", help: "latent tokens of the shape (2mini 3072, 2.1 4096; Tencent's turbo example samples 512)", at: At::Both },
     EngineOption { name: "decode", env: "NS_M3D_HY_DECODE", value: "fast|dense", help: "the grid: coarse to fine near the surface (fast) or every point", at: At::Both },
     EngineOption { name: "chunk", env: "NS_M3D_HY_CHUNK", value: "N", help: "points the shape decoder queries at once", at: At::Both },
 ];
@@ -69,7 +71,7 @@ pub struct Arch {
     pub scale_factor: f32,
 }
 
-pub const MINI: Arch = Arch { name: ARCH_MINI, proc_size: 1022, enc_size: 1022, tokens: 512, steps: 5, cfg: 5.0, resolution: 380, scale_factor: 1.018_813_7 };
+pub const MINI: Arch = Arch { name: ARCH_MINI, proc_size: 1022, enc_size: 1022, tokens: 3072, steps: 5, cfg: 5.0, resolution: 380, scale_factor: 1.018_813_7 };
 pub const V21: Arch = Arch { name: ARCH_21, proc_size: 512, enc_size: 518, tokens: 4096, steps: 50, cfg: 5.0, resolution: 384, scale_factor: 1.003_950_6 };
 
 /// The box the shape lives in: [-BOUNDS, BOUNDS]^3
@@ -95,6 +97,8 @@ pub struct Hunyuan3d {
     settings: LoadOptions,
     weights_bytes: usize,
     busy: Mutex<()>,
+    /// the card's least free memory seen during the last request (bytes), for `report`
+    low: std::sync::atomic::AtomicU64,
 }
 
 /// A seeded standard-normal draw (splitmix64, Box-Muller): the starting noise
@@ -150,7 +154,15 @@ impl Hunyuan3d {
         let weights_bytes = dw.bytes.get() + mw.bytes.get() + vae.bytes;
         let load_seconds = t0.elapsed().as_secs_f64();
         log(format!("{}: loaded on {} in {load_seconds:.1} s ({:.2} GiB of weights)", arch.name, gpu.name, weights_bytes as f64 / (1u64 << 30) as f64));
-        Ok(Hunyuan3d { arch, ops, dino, dit, vae, loaded: Instant::now(), load_seconds, settings: o.clone(), weights_bytes, busy: Mutex::new(()) })
+        Ok(Hunyuan3d { arch, ops, dino, dit, vae, loaded: Instant::now(), load_seconds, settings: o.clone(), weights_bytes, busy: Mutex::new(()),
+                       low: u64::MAX.into() })
+    }
+
+    /// Notes the card's free memory now (the low point of a request is in `report`)
+    fn note_memory(&self) {
+        if let Ok((_, Some(free))) = self.ops.gpu.memory() {
+            self.low.fetch_min(free, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// A setting: the request's option, else the load's, else the environment
@@ -195,6 +207,9 @@ impl Hunyuan3d {
                 self.ops.axpy(x.ptr(), v.ptr(), n, s1 - s0)?;
             }
             self.ops.gpu.sync()?;
+            if i == 0 {
+                self.note_memory();
+            }
             progress(i as u32 + 1, steps as u32)?;
         }
         read_f32(&x, n)
@@ -228,6 +243,7 @@ impl Hunyuan3d {
             let step = 2.0 * BOUNDS / r as f32;
             if k == 0 {
                 g = self.vae.query_lattice(&self.ops, &data, &sc, r1, -BOUNDS, step, None, &mut |_, _| Ok(()))?;
+                self.note_memory();
                 queried += g.len();
             } else {
                 let idx = grid::refine(&g, prev, r1, 0.0, k + 1 == lv.len());
@@ -284,13 +300,19 @@ impl Model3dEngine for Hunyuan3d {
     fn report(&self) -> Vec<String> {
         let mut r = vec![format!("{} on {}: {:.2} GiB of weights, up {:.0} s", self.arch.name, self.ops.gpu.name,
                                  self.weights_bytes as f64 / (1u64 << 30) as f64, self.loaded.elapsed().as_secs_f64())];
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         if let Ok((total, Some(free))) = self.ops.gpu.memory() {
-            r.push(format!("card: {:.1} of {:.1} GiB free", free as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64));
+            r.push(format!("card: {:.1} of {:.1} GiB free", gib(free), gib(total)));
+            let low = self.low.load(std::sync::atomic::Ordering::Relaxed);
+            if low != u64::MAX {
+                r.push(format!("the last request: the card at most {:.1} GiB used ({:.1} GiB free at the lowest)", gib(total - low), gib(low)));
+            }
         }
         r
     }
     fn generate(&self, req: &MeshRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Mesh> {
         let _one = self.busy.lock().map_err(|_| Error("a previous request failed midway".into()))?;
+        self.low.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         let t0 = Instant::now();
         let mut report = |phase: &'static str, at: u32, of: u32| progress(Step { phase, at, of, seconds: t0.elapsed().as_secs_f64() });
         let view = req.views.first().ok_or_else(|| Error("no picture".into()))?;

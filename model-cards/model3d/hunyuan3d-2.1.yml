@@ -1,0 +1,19 @@
+# Hunyuan3D 2.1 (a detailed mesh from a picture)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: hunyuan3d-2.1
+kind: model3d
+arch: hunyuan3d-2.1
+title: Hunyuan3D 2.1 (a detailed mesh from a picture)
+about: 'Tencent''s Hunyuan3D 2.1 shape model (Comfy-Org''s single-file repackage): DINOv2-Large at 518 px, the 3.0B HunYuanDiTPlain (21 blocks, U-ViT skips, MoE in the last 6) in 50 flow-matching steps with CFG 5 over 4,096 latent tokens, the ShapeVAE decoder; marching cubes.'
+gpus: '0'
+vram_gib: 10.0                  # its memory on the card when it runs (measured on a B65: 9.7 GiB at the peak)
+does: [generate]
+env: {}
+files:
+  model:
+    key: hy3d-21-model
+    url: https://huggingface.co/Comfy-Org/hunyuan3D_2.1_repackaged/resolve/606def5076d38b387b005caf93b5336c56ca99f9/hunyuan_3d_v2.1.safetensors
+    size: 7365943290
+    sha256: 5f21e98a6cb99b13b5e224abaee33929570fff7af2b6a0060001559a04ba9d72
+    path: hunyuan3d21/hunyuan_3d_v2.1.safetensors
+guide: guides/hunyuan3d.md

@@ -263,7 +263,7 @@ The `model3d` kind (meshes from pictures, rigging, animation) and its engines' s
 |---|---|---|---|
 | `NS_MODEL3D_OUT` | ~/.local/share/nextsycl/model3d | where meshes (GLB, with their picture and settings beside them) and 3D uploads are kept | cli (model3d), serve |
 | `NS_M3D_*` | - | every NS_M3D_ setting in nextsycl.conf is passed to the 3D server | cli (model3d serve) |
-| `NS_M3D_HY_TOKENS` | 512 (2mini), 4096 (2.1) | the shape's latent tokens (Tencent's turbo example samples the turbo decoder's 512) (--opt-tokens) | model3d hunyuan3d |
+| `NS_M3D_HY_TOKENS` | 3072 (2mini), 4096 (2.1) | the shape's latent tokens (Tencent's turbo example samples the turbo decoder's 512: coarser) (--opt-tokens) | model3d hunyuan3d |
 | `NS_M3D_HY_DECODE` | fast | fast: the grid decoded coarse to fine, only near the surface (FlashVDM's hierarchical decoding); dense: every point (--opt-decode) | model3d hunyuan3d |
 | `NS_M3D_HY_CHUNK` | by the decoder's width | points the shape decoder queries at once (--opt-chunk) | model3d hunyuan3d |
 

@@ -1,0 +1,25 @@
+# Hunyuan3D-2mini-turbo (a mesh from a picture in seconds; shape only)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: hunyuan3d-2mini-turbo
+kind: model3d
+arch: hunyuan3d-2mini
+title: Hunyuan3D-2mini-turbo (a mesh from a picture in seconds; shape only)
+about: 'Tencent''s Hunyuan3D-2mini, turbo: DINOv2-giant at 1,022 px, the 0.6B Flux-style DiT (8 double + 16 single blocks, guidance-distilled) in 5 consistency steps over 3,072 latent tokens, the FlashVDM turbo shape decoder; marching cubes. No texture.'
+gpus: '0'
+vram_gib: 5.5                   # its memory on the card when it runs (measured on a B65: 5.1 GiB at the peak)
+does: [generate]
+env: {}
+files:
+  model:
+    key: hy3d-mini-turbo-dit
+    url: https://huggingface.co/tencent/Hunyuan3D-2mini/resolve/f90a0f7df7d5e6f71109cf333f6a95a0ae3194a6/hunyuan3d-dit-v2-mini-turbo/model.fp16.safetensors
+    size: 3822584202
+    sha256: bdbcef30dd0149a281e17d5b5b1fdad1122c904e098a42f3100e04e03c247bc4
+    path: hunyuan3dmini/hunyuan3d-dit-v2-mini-turbo/model.fp16.safetensors
+  vae:
+    key: hy3d-mini-turbo-vae
+    url: https://huggingface.co/tencent/Hunyuan3D-2mini/resolve/f90a0f7df7d5e6f71109cf333f6a95a0ae3194a6/hunyuan3d-vae-v2-mini-turbo/model.fp16.safetensors
+    size: 407410402
+    sha256: 5dcaca67a8da9e7079fb7b55714a572d0651ac95983bb43099913feaf6738f94
+    path: hunyuan3dmini/hunyuan3d-vae-v2-mini-turbo/model.fp16.safetensors
+guide: guides/hunyuan3d.md
