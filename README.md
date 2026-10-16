@@ -28,8 +28,8 @@ for a chat model. Measured speeds, decode / prompt reading:
 | `deepseek-r1-iq1s` | **DeepSeek-R1 671B** (unsloth UD-IQ1_S, 131 GiB) - the experts that do not fit VRAM in pinned RAM (multiplied on the CPU) and on the NVMe | ~8 tok/s / ~135 tok/s, 32K context |
 | `glm-5.3-flash-uncensored-256k` | **GLM-5.3-Flash** uncensored IQ2 | ~18 tok/s / 450-1,100 tok/s, to 256K |
 | `deepseek-v4-flash-iq2m`, `-256k` | **DeepSeek-V4-Flash 284B** (unsloth UD-IQ2_M, 84.7 GiB) - the experts beyond VRAM in pinned RAM; llama.cpp pages it from the disk (no result in 100 minutes) | ~27 tok/s with its MTP draft block (26 at 3.7K, 17 at 256K) / 635-1,000 tok/s (943 at 256K), 128K or 256K context (1M tested: 287 tok/s prompt, 12 tok/s decode) |
-| `nemotron-3.5-super-q2kxl` | **Nemotron 3.5 Super 120B-A12B** (unsloth UD-Q2_K_XL; hybrid Mamba-2 / latent MoE / attention; text only; port in progress, not yet on the server) | ~43 tok/s with its MTP drafts (30 without) / ~690-1,070 tok/s, 32K (128K tested: 844 / 32) |
-| `nemotron-3.5-super-iq1m` | **Nemotron 3.5 Super** UD-IQ1_M (the same; or on the B70 alone, experts in pinned RAM: ~21 tok/s / ~350 tok/s at 2K) | ~48 tok/s with MTP (32 without) / ~700-1,200 tok/s, 32K (128K tested: 807 / 34) |
+| `nemotron-3.5-super-q2kxl` | **Nemotron 3.5 Super 120B-A12B** (unsloth UD-Q2_K_XL; hybrid Mamba-2 / latent MoE / attention; text only; port in progress, not yet on the server) | ~40 tok/s with its MTP drafts (30 without) / ~790-1,140 tok/s, 32K (128K tested: 868 / 34) |
+| `nemotron-3.5-super-iq1m` | **Nemotron 3.5 Super** UD-IQ1_M (the same; or on the B70 alone, experts in pinned RAM: ~21 tok/s / ~350 tok/s at 2K) | ~46 tok/s with MTP (32 without) / ~880-1,470 tok/s, 32K (128K tested: 1,120 / 38) |
 
 **On one 32 GB card** (measured on an Arc Pro B70):
 
@@ -878,24 +878,28 @@ server, text only.
   experts) through the silo's own decode products (the qwen35 silo's, copied, with a Q6_K kernel: ~520 GB/s on the
   B70), one quantize feeding both activation layouts. MTP drafts 2 a step (`NS_NH_DRAFTS`), the Mamba states
   snapshotted for the verify's rollback.
-- **Prompts**: chunks of 2,048 rows when they fit; dense matrices expanded to half for the GEMM, the experts grouped by
-  expert after a GPU routing pass and each expanded then multiplied; flash attention on XMX; on two cards the layers
-  split by measured speed (`NS_NH_SPEED`), the GPUs pipelined over the chunks.
+- **Prompts**: chunks of 2,048 rows when they fit; dense matrices expanded to half for the GEMM; the routed experts on
+  XMX in one launch a projection (rows sorted by expert after a GPU routing pass; a work-group takes 64 rows of one
+  expert, its lanes decode the quantized weights 128 inputs at a time into a half tile in local memory, each sub-group
+  multiplies its 16 rows against all 64 columns; the up's output written as ReLU-squared half); the Mamba scan in
+  64-row chunks (Mamba-2's chunked form: the in-chunk part as small products, the state carried over the chunks);
+  flash attention on XMX; on two cards the layers split by measured speed (`NS_NH_SPEED`), the GPUs pipelined over
+  the chunks.
 - **One card**: `--gpu 0` keeps the MoE layers' experts that do not fit in pinned host memory and gathers the chosen
   ones into VRAM before each product (`NS_NH_HOST`).
-- **Speed** (2026-10-15, prompt read / decode tokens/s, MTP on; context sweeps from the earlier commits, the 2K-128K
-  prompts of benchy v1):
+- **Speed** (2026-10-15, 6913713 + the conv; `nemo-sweep`: benchy v1 prompts, 128 greedy tokens, MTP on), prompt
+  read / decode, tokens/s:
 
   | File, GPUs | 20 | 2K | 8K | 40K | 128K |
   |---|---:|---:|---:|---:|---:|
-  | UD-Q2_K_XL, B65 + B70 | - / 43.2 | 687 / 37.0 | 1,061 / 41.6 | 1,072 / 36.8 | 844 / 32.4 |
-  | UD-IQ1_M, B65 + B70 | - / 47.7 | 702 / 41.6 | 1,204 / 42.7 | 1,013 / 37.9 | 807 / 34.2 |
+  | UD-IQ1_M, B65 + B70 | 62 / 46.1 | 884 / 47.0 | 1,431 / 45.7 | 1,472 / 44.0 | 1,120 / 37.6 |
+  | UD-Q2_K_XL, B65 + B70 | 54 / 41.7 | 789 / 39.6 | 1,141 / 41.9 | 1,134 / 38.5 | 868 / 34.3 |
   | UD-IQ1_M, B70 alone (host-memory experts) | | 347 / 21.4 | | | |
 
-  The B70-alone longer contexts are not yet re-measured since the gather (before it: 8K 107, 128K 119 tok/s
-  prompt). Without drafts: Q2_K_XL 30.0, IQ1_M 31.8 tok/s. Strata on the same B70 reads ~880 (2K) / 1,400 (8K) and decodes
-  ~30. Open: the expert up products (IQ3_XXS / IQ2_S / IQ1_S at ~150 GB/s on the B70, a third of the dense ones -
-  neither the grid lookups nor the index math; `NS_NH_PROFILE=1` times every kernel), the vision tower.
+  Without drafts: Q2_K_XL 30.0, IQ1_M 31.8 tok/s decode. Strata on the same B70 reads ~880 (2K) / 1,400 (8K) and
+  decodes ~30. The B70-alone row predates the prompt kernels above (its experts are staged from host memory, the old
+  path). Open: the expert up products at decode (IQ3_XXS / IQ2_S / IQ1_S at ~150 GB/s on the B70, a third of the dense
+  ones - neither the grid lookups nor the index math; `NS_NH_PROFILE=1` times every kernel), the vision tower.
 
 ## Speed by model
 
