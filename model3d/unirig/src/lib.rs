@@ -184,6 +184,7 @@ impl UniRig {
             let st = beams.step(&logits, rng);
             progress(beams.running[0].len())?;
             if beams.done {
+                prof::used(&o.nsd, "at the skeleton decoder's end");
                 return Ok(beams.best());
             }
             if pool.used + nb > pool.cap {

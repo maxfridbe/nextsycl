@@ -220,6 +220,7 @@ impl SkinModel {
                 o.linear(&lat2, j + t, &b.wkv, &kvp)?;
                 b.run(o, &mesh, n, &kvp, j + t, (&q, &a, &h), &big)?;
             }
+            crate::prof::used(&o.nsd, "in the mesh-bone attention (its buffers held)");
         }
         if let Some(tr) = trace {
             tr.mesh = mesh.to_f32()?;

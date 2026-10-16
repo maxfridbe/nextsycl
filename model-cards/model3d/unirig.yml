@@ -7,7 +7,7 @@ title: 'UniRig (a skeleton and skin weights for any mesh: characters, animals, o
 about: VAST-AI, SIGGRAPH 2025 - the skeleton from an OPT-350m-shaped autoregressive decoder over a Michelangelo shape encoding (beam search with sampling, as UniRig's inference), the skin weights from Point Transformer V3, bone attention and a voxel geodesic prior; float32. The skin checkpoint is read as published (its optimizer state skipped, never loaded)
 does: [rig]
 gpus: '0'
-vram_gib: 9.0                    # the weights 2.9 GiB; the decoder's key / value pool for 15 beams up to 6 GiB (it takes what the card has free)
+vram_gib: 5.5                    # measured 4.6 GiB on a B70 rigging a 7.6K-vertex humanoid (the weights 2.9; the beams' key / value pool grows with longer skeletons)
 env: {}
 files:
   skeleton:
