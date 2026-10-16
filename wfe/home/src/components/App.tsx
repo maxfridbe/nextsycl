@@ -101,7 +101,9 @@ function CardView(c: Card) {
 }
 
 const STATE_TEXT: Record<string, string> = {
-  disabled: "disabled", unloaded: "enabled · unloaded", loading: "loading…", loaded: "loaded", busy: "working", ready: "ready",
+  disabled: "disabled", unloaded: "enabled · unloaded", loading: "loading…", loaded: "loaded", busy: "working",
+  // a video model the daemon has, its weights not on a card (they load with the first clip)
+  ready: "enabled · unloaded (daemon up)",
 };
 
 function GpuPicker(m: Model) {
@@ -145,7 +147,8 @@ function GpuPicker(m: Model) {
 function ModelRow(m: Model) {
   const p = ui.pending[m.id];
   const spin = (what: string) => p?.what === what || (what === "load" && m.state === "loading");
-  const loaded = ["loaded", "busy", "ready"].includes(m.state);
+  // weights on a card (a video model "ready" is not: the daemon is up, its weights load with the first clip)
+  const loaded = ["loaded", "busy"].includes(m.state);
   const btn = (what: string, label: string, cls: string, title: string, extra: Record<string, unknown> = {}) => (
     <button class={cls} attrs={{ disabled: !!p || (what !== "load" && m.state === "loading"), title }}
       on={{ click: () => void act(what, m.id, extra) }}>

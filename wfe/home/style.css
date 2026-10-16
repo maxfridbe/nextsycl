@@ -56,7 +56,7 @@
  .mrow{display:grid;grid-template-columns:18px minmax(160px,1fr) 150px auto;gap:6px 12px;align-items:center;padding:7px 0;border-top:1px solid #222733}
  .mrow.off .name{color:#94a3b8} .mname .name{font-weight:600;font-size:14px} .mname .sub{color:#6b7280;font-size:12px;overflow-wrap:anywhere}
  .tag{font-size:11px;padding:2px 8px;border-radius:999px;background:#1f2937;color:#cbd5e1;white-space:nowrap}
- .tag.loaded,.tag.ready{background:#064e3b;color:#a7f3d0} .tag.busy,.tag.loading{background:#78350f;color:#fde68a} .tag.disabled{background:#111827;color:#6b7280}
+ .tag.loaded{background:#064e3b;color:#a7f3d0} .tag.busy,.tag.loading{background:#78350f;color:#fde68a} .tag.disabled{background:#111827;color:#6b7280}
  .acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;align-items:center}
  .gpus{display:inline-flex;gap:4px} .gpu{font-size:11px;border:1px solid #2f3646;border-radius:6px;padding:3px 6px;color:#9ca3af;cursor:pointer;display:inline-flex;gap:4px;align-items:center}
  .gpu.on{border-color:#3b82f6;color:#e5e7eb} .gpu input{margin:0}

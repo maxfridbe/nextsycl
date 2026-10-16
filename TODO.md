@@ -393,6 +393,31 @@ misses), KDA 10.9 (its products at ~613 GB/s), MLA 4.7, the draft block 3.2, the
       moe_grouped in two phases) - +1% (most misses are prefetched now; little demand wait is left)
 - [ ] The card swap (below) - the misses' copies at x16
 
+## 3D + HunyuanImage speed (paused 2026-10-16, branches not merged)
+
+Four worktree branches, each tuned in its own silo, parity re-checked at the port's levels; none merged or
+deployed. To resume: merge each, then workspace clippy -D warnings + cargo test, clean timings (B70 and B65, no
+profiling), README speed lines and cards' vram_gib, deploy.
+- [ ] `worktree-agent-aaf0b95e0fbb9cdd5` TRELLIS.2/Pixal3D (WIP c7918ca): helmet 1024 79.8 -> ~61.5 s (silo GEMMs with
+      fused epilogues + layer norm, as-stored weight upload, mesh work on a CPU thread beside the texture flow).
+      Before merging: re-run ~/src/t2check.sh (the reorder, as-stored loads and nmap reuse are not re-checked; shape
+      sampler 6.96e-3 a little above ~5e-3), measure `--opt-sage` and fix its help text (quotes unmeasured
+      numbers), document NS_M3D_T2_SAGE, B65/512/Pixal3D timings. Blotches = inward-facing small patches after
+      cluster/decimate (`tools::orient` signed volume); fix orientation or set doubleSided for this engine.
+      `--opt-fov` is refused by `model3d gen` at load though the README shows it.
+- [ ] `worktree-agent-a7f572630a67e3cb5` Hunyuan3D (c77c69b, d7dffd0): 2mini 4.2 -> 2.4 s, 2.1 textured 48.2 -> 36.9 s
+      (B70); flash self-attention default, zero-context cross-attention = bias, threaded grid, silo norms/GEGLU,
+      opt-in NS_M3D_HY_INT8. Left: B65 re-bench with the silo, clean B70 run, parallel bake grow/back-projection.
+- [ ] `worktree-agent-a6710f7a3d93bd3be` HunyuanImage 2.1 (2e0671c, 4083027, WIP 833fb7c): distilled 1024 3.9 -> 2.5 s,
+      base 32.1 -> 20.2 s (Q8_0 read as int8 by oneDNN, fused GELU/gate, CFG batch, VAE group norm). The int8 mode
+      (NS_HI_INT8) is approximate (PSNR 23.5 dB): fix or drop it. Full cargo test not run.
+- [ ] `worktree-agent-aef5d2f5a8e0caf76` rigging (2c4dfdb, e9bb061, 43273a4, WIP b5d27c9): fox AnimateAnyMesh 12.7 ->
+      ~8-9 s, UniRig 12.5 -> 6.8 s, RigNet 2.4 -> 0.7 s. Left: time after the WIP commit on both meshes.
+      RigNet joint count varies run to run (19-26): `crates/mesh` decimate builds its queue from HashMap keys -
+      sort them.
+- [ ] The front door can't plan for GPU processes it doesn't manage (an agent's TRELLIS run goes 0 -> 23 GB in
+      seconds): hold /tmp/ds2run.lock or keep tests off cards the front door uses.
+
 ## To try
 
 - [ ] Swap the cards' slots: the B70 to the x16 slot, the B65 to Gen4 x4 - then NS_SPLIT=15 (the B65's 12 MoE layers
