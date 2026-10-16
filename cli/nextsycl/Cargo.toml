@@ -35,6 +35,7 @@ nextsycl-audio-qwen3tts.workspace = true
 nextsycl-audio-voxcpm2.workspace = true
 nextsycl-model3d.workspace = true
 nextsycl-model3d-example.workspace = true
+nextsycl-model3d-animateanymesh.workspace = true
 nextsycl-models.workspace = true
 nextsycl-serve.workspace = true
 serde_json.workspace = true

@@ -5,6 +5,7 @@
 pub mod closest;
 pub mod decimate;
 pub mod remesh;
+pub mod skin;
 pub mod uv;
 
 use std::collections::HashMap;
