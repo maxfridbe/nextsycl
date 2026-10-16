@@ -59,6 +59,10 @@ pub fn nchw(v: &[f32], n: usize, c: usize, hw: usize) -> Vec<f32> {
 ///   unipc   v_i, x_i             -> latents_i                   the sampler alone
 ///   steps   noise.npy            -> latents_<last>.npy          the whole denoising
 ///   decode  latents_<last>.npy   -> images.npy                  the twelve views
+///   bake    images.npy (albedo) + mesh.glb, unwrapped -> texture.npy   writes bake_mesh.obj (the atlas) and
+///           bake_texture.npy / bake_seen.npy; ref_paint.py bake on that mesh writes texture.npy and trust.npy, and
+///           the next run compares the texels both saw (Tencent's raster puts a texel at v (size - 1) + 1/2, this
+///           one at v size: up to a texel apart at the far edge)
 /// ```
 pub fn run_paint(e: &Hunyuan3d, dir: &Path, stages: &[String], picture: Option<&Texture>, log: &mut dyn FnMut(String)) -> Result<f64> {
     use crate::paint::{self, nn::Mem, unet::{BRANCHES, MATS, VIEWS}, SIZE};
@@ -188,7 +192,66 @@ pub fn run_paint(e: &Hunyuan3d, dir: &Path, stages: &[String], picture: Option<&
         log(format!("decode: 12 views in {:.2} s", t.elapsed().as_secs_f64()));
         keep(line("views", &got, &want[..per * MATS * VIEWS], log)?);
     }
+    if has("bake") {
+        const T: u32 = 1024;
+        let mesh = nextsycl_model3d::read_mesh(&std::fs::read(dir.join("mesh.glb")).map_err(|e| Error(format!("mesh.glb: {e}")))?).map_err(Error)?;
+        let scene = paint::render::Scene::new(&mesh);
+        let views: Vec<Vec<f32>> = npy("images.npy")?.chunks_exact(SIZE * SIZE * 3).take(VIEWS)
+            .map(|v| v.iter().map(|x| (x * 255.0).round()).collect::<Vec<f32>>())
+            .map(|v| paint::pil::resize(&v, SIZE, SIZE, 3, 2048, 2048, paint::pil::Filter::Bicubic)).collect();
+        // the atlas: kept from an earlier run (the reference bakes over it), else made and written
+        let obj = dir.join("bake_mesh.obj");
+        let m = match std::fs::read_to_string(&obj) {
+            Ok(t) => nextsycl_model3d::mesh::obj::read(&t).map_err(Error)?,
+            Err(_) => {
+                let m = nextsycl_model3d::mesh::tools::unwrap(&mesh, T, 4);
+                std::fs::write(&obj, nextsycl_model3d::mesh::obj::write(&m)).map_err(|e| Error(format!("{}: {e}", obj.display())))?;
+                m
+            }
+        };
+        let t = std::time::Instant::now();
+        let (rgb, seen, _) = paint::bake::bake(&m, &scene, &views, 2048, T);
+        log(format!("bake: {:.2} s, {} of {} texels seen", t.elapsed().as_secs_f64(), seen.iter().filter(|s| **s).count(), seen.len()));
+        let ts = T as usize;
+        write_npy(&dir.join("bake_texture.npy"), &[ts, ts, 3], &rgb.iter().flatten().copied().collect::<Vec<f32>>())?;
+        write_npy(&dir.join("bake_seen.npy"), &[ts, ts], &seen.iter().map(|s| *s as u8 as f32).collect::<Vec<f32>>())?;
+        if let (Ok(want), Ok(trust)) = (npy("texture.npy"), npy("trust.npy")) {
+            let (mut g, mut w) = (Vec::new(), Vec::new());
+            let mut only_one = 0;
+            for k in 0..seen.len() {
+                match (seen[k], trust[k] > 0.5) {
+                    (true, true) => {
+                        g.extend_from_slice(&rgb[k]);
+                        w.extend_from_slice(&want[k * 3..k * 3 + 3]);
+                    }
+                    (false, false) => {}
+                    _ => only_one += 1,
+                }
+            }
+            keep(line("bake (both saw)", &g, &w, log)?);
+            log(format!("bake: {} texels seen by both, {only_one} by one only", g.len() / 3));
+        } else {
+            log(format!("bake: no texture.npy yet - run ref_paint.py bake --mesh {} --views {}", obj.display(), dir.display()));
+        }
+    }
     Ok(worst)
+}
+
+/// A little-endian float32 .npy of `shape`
+pub fn write_npy(path: &Path, shape: &[usize], v: &[f32]) -> Result<()> {
+    let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+    let mut head = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({}{}), }}", dims.join(", "), if shape.len() == 1 { "," } else { "" });
+    while (10 + head.len() + 1) % 64 != 0 {
+        head.push(' ');
+    }
+    head.push('\n');
+    let mut b = b"\x93NUMPY\x01\x00".to_vec();
+    b.extend((head.len() as u16).to_le_bytes());
+    b.extend(head.as_bytes());
+    for x in v {
+        b.extend(x.to_le_bytes());
+    }
+    std::fs::write(path, b).map_err(|e| Error(format!("{}: {e}", path.display())))
 }
 
 /// A little-endian float32 .npy: (shape, values)

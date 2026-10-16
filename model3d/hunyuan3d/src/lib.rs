@@ -9,9 +9,11 @@
 //!   timestep as a token) over 4,096 tokens, FlowMatchEuler in 50 steps with CFG 5, the ShapeVAE decoder.
 //!
 //! The pipeline (`generate`): the picture cut out and recentred (`picture`), its DINOv2 tokens (`dino`), the latents
-//! denoised from the seed (`flux` / `plain`, `sched`), decoded to occupancy logits on a grid in [-1.01, 1.01]^3
-//! (`vae`), meshed by marching cubes at 0 (`nextsycl_mesh::tools::mc`), small floating pieces dropped, finished
-//! (decimated to `faces`). The parity of every stage with Tencent's code is `check`'s.
+//! denoised from the seed (`flux` / `plain`, `sched`), decoded to occupancy logits on a grid in [-1.01, 1.01]^3 -
+//! coarse to fine near the surface (`grid`, `vae`) - meshed by marching cubes at 0 (`nextsycl_mesh::tools::mc`),
+//! small floating pieces dropped, finished (decimated to `faces`); with `texture` (2.1), painted by the paint model
+//! (`paint`: six views of albedo and metallic-roughness, baked into a UV atlas). The parity of every stage with
+//! Tencent's code is `check`'s.
 
 pub mod check;
 pub mod dino;
@@ -38,8 +40,9 @@ pub const ARCH_21: &str = "hunyuan3d-2.1";
 pub const ARCH_MINI: &str = "hunyuan3d-2mini";
 
 /// The files by role: `model` (the DiT file with its conditioner and VAE: Tencent's mini-turbo safetensors, or
-/// Comfy-Org's 2.1 repackage), `vae` (2mini: the turbo decoder), and the paint model's (2.1's texture)
-pub const ROLES: &[&str] = &["model", "vae?", "paint-unet?", "paint-vae?", "paint-dino?", "upscaler?"];
+/// Comfy-Org's 2.1 repackage), `vae` (2mini: the turbo decoder), and the paint model's (2.1's textures: its UNet and
+/// VAE checkpoints, DINOv2-giant)
+pub const ROLES: &[&str] = &["model", "vae?", "paint-unet?", "paint-vae?", "paint-dino?"];
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "tokens", env: "NS_M3D_HY_TOKENS", value: "N", help: "latent tokens of the shape (2mini 3072, 2.1 4096; Tencent's turbo example samples 512)", at: At::Both },

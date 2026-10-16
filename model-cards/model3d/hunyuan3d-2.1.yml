@@ -1,13 +1,13 @@
-# Hunyuan3D 2.1 (a detailed mesh from a picture)
+# Hunyuan3D 2.1 (a detailed mesh from a picture, with PBR textures)
 # model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
 id: hunyuan3d-2.1
 kind: model3d
 arch: hunyuan3d-2.1
-title: Hunyuan3D 2.1 (a detailed mesh from a picture)
-about: 'Tencent''s Hunyuan3D 2.1 shape model (Comfy-Org''s single-file repackage): DINOv2-Large at 518 px, the 3.0B HunYuanDiTPlain (21 blocks, U-ViT skips, MoE in the last 6) in 50 flow-matching steps with CFG 5 over 4,096 latent tokens, the ShapeVAE decoder; marching cubes.'
+title: Hunyuan3D 2.1 (a detailed mesh from a picture, with PBR textures)
+about: 'Tencent''s Hunyuan3D 2.1. Shape (Comfy-Org''s single-file repackage): DINOv2-Large at 518 px, the 3.0B HunYuanDiTPlain (21 blocks, U-ViT skips, MoE in the last 6) in 50 flow-matching steps with CFG 5 over 4,096 latent tokens, the ShapeVAE decoder, marching cubes. Paint: the 2.5D multiview UNet (Stable Diffusion 2.1 with material-aware, reference, multiview and DINOv2-giant attentions) draws six views of albedo and metallic-roughness in 15 UniPC steps, baked into a UV atlas. NS_M3D_HY_PAINT=0 loads the shape model alone.'
 gpus: '0'
-vram_gib: 10.0                  # its memory on the card when it runs (measured on a B65: 9.7 GiB at the peak)
-does: [generate]
+vram_gib: 17.0                  # its memory on the card when it runs (measured on a B65: 16.9 GiB at the peak, textured)
+does: [generate, texture]
 env: {}
 files:
   model:
@@ -16,4 +16,22 @@ files:
     size: 7365943290
     sha256: 5f21e98a6cb99b13b5e224abaee33929570fff7af2b6a0060001559a04ba9d72
     path: hunyuan3d21/hunyuan_3d_v2.1.safetensors
+  paint-unet:
+    key: hy3d-21-paint-unet
+    url: https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/hunyuan3d-paintpbr-v2-1/unet/diffusion_pytorch_model.bin
+    size: 3925293863
+    sha256: 675a1b5cd0098b2002637c443946529c03c5cd54427f40245263350feb3dd5b8
+    path: hunyuan3d21/hunyuan3d-paintpbr-v2-1/unet/diffusion_pytorch_model.bin
+  paint-vae:
+    key: hy3d-21-paint-vae
+    url: https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/hunyuan3d-paintpbr-v2-1/vae/diffusion_pytorch_model.bin
+    size: 334707217
+    sha256: 1b4889b6b1d4ce7ae320a02dedaeff1780ad77d415ea0d744b476155c6377ddc
+    path: hunyuan3d21/hunyuan3d-paintpbr-v2-1/vae/diffusion_pytorch_model.bin
+  paint-dino:
+    key: dinov2-giant
+    url: https://huggingface.co/facebook/dinov2-giant/resolve/611a9d42f2335e0f921f1e313ad3c1b7178d206d/model.safetensors
+    size: 4546005432
+    sha256: 917d3c470db999d32a312f8542149be91c7cbac61ee8fb4b67ae3d82b79ce21f
+    path: hunyuan3d21/dinov2-giant/model.safetensors
 guide: guides/hunyuan3d.md

@@ -3,7 +3,8 @@
 Hunyuan3D turns one picture of an object into a 3D mesh (GLB). Two models:
 
 - **hunyuan3d-2mini-turbo**: about 5 seconds, a clean shape; no texture.
-- **hunyuan3d-2.1**: about 30 seconds on a B70, finer detail (engraved lettering, thin parts); shape only for now.
+- **hunyuan3d-2.1**: about 30 seconds for the shape on a B70, finer detail (engraved lettering, thin parts); with
+  `texture` its paint model adds PBR textures (base colour, metallic-roughness) in about 35 seconds more.
 
 ## The picture
 - One object, whole, seen from the front or three-quarters, filling most of the picture. Avoid crops that cut the
@@ -21,5 +22,7 @@ Hunyuan3D turns one picture of an object into a 3D mesh (GLB). Two models:
 - `resolution`: the grid the surface is cut from (380 / 384). Higher keeps finer detail and costs time; 256 is a
   quick draft.
 - `faces`: the triangle budget (40,000 by default); the surface is decimated to it. Raise it for close-ups.
+- `texture` (2.1): paint the mesh. The views the model paints follow the picture closely on the front and invent
+  the back; text and logos on the picture come through. `texture_size` sets the atlas (2048 by default).
 - `--opt-tokens N`: the turbo's latent tokens: 3,072 by default; 512 (what Tencent's turbo example samples) is a
   second faster and loses fine detail such as lettering.
