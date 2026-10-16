@@ -83,7 +83,7 @@ impl Conds {
 
     /// The global tokens and the features projected at `coords` of an r^3 grid from the picture's `size` features,
     /// `wide` (the NAF stages): [low-res | low-res again] (2048), else 1024
-    fn project(&self, e: &Trellis2, size: usize, coords: &[[i32; 3]], r: usize, wide: bool) -> Result<Cond> {
+    pub fn project(&self, e: &Trellis2, size: usize, coords: &[[i32; 3]], r: usize, wide: bool) -> Result<Cond> {
         let f = if size == 512 { &self.f512 } else { self.f1024.as_ref().ok_or_else(|| Error("pixal3d: no 1024 features".into()))? };
         let g = &e.cx.gpu;
         let np = size / 16;

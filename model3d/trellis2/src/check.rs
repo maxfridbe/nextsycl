@@ -190,6 +190,10 @@ pub fn run(e: &Trellis2, dir: &Path, picture: Option<&Picture>, stages: &[&str],
             neg.fill(0)?;
             let v1 = m.forward(cx, &w, &input, t, &neg, c.1, &cs, None, None)?;
             l.line(&format!("{name} call 1"), &to_ref(&v1), &npy(dir, &format!("{name}_call1"))?);
+            // as the sampler runs it: the zero condition's cross-attention as its value bias
+            let rows = m.const_cross(cx)?;
+            let v2 = m.forward_with(cx, &w, &input, t, dit::Cross::Const(&rows), &cs, None, None)?;
+            l.line(&format!("{name} call 1 (bias)"), &to_ref(&v2), &npy(dir, &format!("{name}_call1"))?);
         }
         drop(w);
         if !full {
@@ -259,6 +263,61 @@ pub fn run(e: &Trellis2, dir: &Path, picture: Option<&Picture>, stages: &[&str],
         if let Some(mut s) = r {
             s.chunks_exact_mut(32).for_each(|row| row.iter_mut().enumerate().for_each(|(c, x)| *x = *x * e.cfg.tex_std[c] + e.cfg.tex_mean[c]));
             l.line("tex slat", &s, &npy(dir, "tex_slat")?);
+        }
+    }
+    if stages.contains(&"pixal") && has("px_ss_global") {
+        // reference/pixal3d/ref.py's dumps: each stage's projected condition, then its flow's first calls on them
+        let info: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("px_info.json")).map_err(|e| Error(e.to_string()))?)
+            .map_err(|e| Error(e.to_string()))?;
+        let cam = crate::pixal::Camera::new(info["fov"].as_f64().unwrap_or(crate::pixal::DEFAULT_FOV));
+        l.say(format!("pixal camera       distance {:.6} here, {:.6} in the reference", cam.distance, info["distance"].as_f64().unwrap_or(0.0)));
+        let conds = crate::pixal::Conds::new(e, &pre, &cam, true)?;
+        for (name, size, grid, wide) in [("ss", 512, 16, false), ("shape512", 512, 32, true), ("shape1024", 1024, 64, true), ("tex", 1024, 64, true)] {
+            let coords = match name {
+                "ss" => sconv::grid(16),
+                "shape512" => coords.clone(),
+                _ => coords_npy(dir, "hr_coords")?,
+            };
+            let (glob, proj) = conds.project(e, size, &coords, grid, wide)?;
+            let half_f32 = |b: &DevBuf| -> Result<Vec<f32>> {
+                let f = DevBuf::f32(g, b.len / 2)?;
+                cx.k.convert(b.ptr(), nextsycl_diffusion::kernels::Dt::F16, b.len / 2, f.ptr(), nextsycl_diffusion::kernels::Dt::F32)?;
+                f.to_f32()
+            };
+            l.line(&format!("px {name} global"), &half_f32(&glob.unwrap().0)?, &npy(dir, &format!("px_{name}_global"))?);
+            l.line(&format!("px {name} proj"), &half_f32(proj.as_ref().unwrap())?, &npy(dir, &format!("px_{name}_proj"))?);
+            // the flow on the reference's own condition
+            let m = match name {
+                "ss" => e.ss_flow()?,
+                "shape512" => e.shape_flow(false)?,
+                "shape1024" => e.shape_flow(true)?,
+                _ => e.tex_flow(true)?,
+            };
+            let gl = crate::w::dev_half(g, &npy(dir, &format!("px_{name}_global"))?)?;
+            let pj = crate::w::dev_half(g, &npy(dir, &format!("px_{name}_proj"))?)?;
+            let n = coords.len();
+            let noise = npy(dir, &format!("px_{name}_noise"))?;
+            let x = if name == "ss" { chw_to_hwc(&noise, 8) } else { noise };
+            let input: Vec<f32> = if name == "tex" {
+                let cc = npy(dir, "px_tex_concat")?;
+                (0..n).flat_map(|i| x[i * 32..(i + 1) * 32].iter().chain(&cc[i * 32..(i + 1) * 32]).copied().collect::<Vec<_>>()).collect()
+            } else {
+                x
+            };
+            let w = m.work(g, n, 5)?;
+            let cs = DevBuf::from_f32(g, &dit::rope(&coords))?;
+            let mut probe = dit::Probe::default();
+            let v = m.forward(cx, &w, &input, 1000.0, &gl, 5, &cs, Some(&pj), Some(&mut probe))?;
+            let to_ref = |v: &[f32]| if name == "ss" { hwc_to_chw(v, 8) } else { v.to_vec() };
+            let p = format!("px_{name}");
+            l.line(&format!("{p} block 0"), &probe.block0, &npy(dir, &format!("{p}_blk0"))?);
+            l.line(&format!("{p} block 29"), &probe.last, &npy(dir, &format!("{p}_blk29"))?);
+            l.line(&format!("{p} call 0"), &to_ref(&v), &npy(dir, &format!("{p}_call0"))?);
+            let (zg, zp) = (DevBuf::new(g, gl.len)?, DevBuf::new(g, pj.len)?);
+            zg.fill(0)?;
+            zp.fill(0)?;
+            let v1 = m.forward(cx, &w, &input, 1000.0, &zg, 5, &cs, Some(&zp), None)?;
+            l.line(&format!("{p} call 1"), &to_ref(&v1), &npy(dir, &format!("{p}_call1"))?);
         }
     }
     if stages.contains(&"sdec") || stages.contains(&"tdec") {

@@ -6,7 +6,7 @@ arch: trellis2
 title: 'TRELLIS.2 4B Q8_0, 512 (picture to textured mesh, the light path; MIT)'
 about: TRELLIS.2's 512 pipeline - the same DINOv3, structure flow and decoders as trellis2 with the 512 shape and texture flows only (two fewer 1.3B models to download, a coarser mesh in a fraction of the time); BiRefNet cuts opaque pictures out
 gpus: '0'
-vram_gib: 8.0                    # its memory on the card when it runs (stage by stage; measured on a B70, see the guide)
+vram_gib: 4.0                    # its memory on the card when it runs: the peak measured 2.9 GiB on a B70 (models load stage by stage)
 does: [generate, texture]
 env: {}
 files:

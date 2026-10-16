@@ -152,6 +152,14 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `voxcpm2` | VoxCPM2 2B: speech in 30 languages at 48 kHz - plain, designed from a description, cloned (with a transcript: continued); MiniCPM4 language models, a local flow-matching DiT, AudioVAE V2 | `voxcpm2` | 4.6 GiB | checked, served |
 | `voxcpm2-int8` | the same files, the language models in int8 at load | `voxcpm2` | 4.6 GiB | checked, served |
 
+**3D** (`nextsycl model3d`: a picture to a textured mesh, GLB)
+
+| id | model | engine | size | status |
+|---|---|---|---|---|
+| `trellis2` | TRELLIS.2 4B Q8_0: DINOv3, four 1.3B flows (structure, shape 512 + 1024, texture 1024), the sparse decoders; the 1024 cascade, PBR textures; BiRefNet cuts opaque pictures out | `trellis2` | 8.8 GiB (9.1 GiB peak on the card) | checked |
+| `trellis2-512` | the same, the 512 path only (the 512 shape and texture flows) | `trellis2` | 7.4 GiB (2.9 GiB peak) | checked |
+| `pixal3d` | Pixal3D Q8_0: TRELLIS.2 with pixel-aligned DINOv3 features (manual field of view; NAF not ported) | `pixal3d` | 8.9 GiB (4.5 GiB peak) | checked |
+
 ## What it does
 
 - **Two cards:** the layers split over the GPUs (each with a SYCL context of its own), the experts in an exclusive
@@ -939,6 +947,52 @@ attention layers without positions (32 / 2 heads of 128); its MTP block drafts. 
   decodes ~30. On the B70 alone (`nemotron-3.5-super-iq1m-b70`, the B65 left free) 13 MoE layers' experts (15.5 GiB)
   sit in pinned host memory, gathered into VRAM each step; its prompt passes still expand experts one at a time. Open: the expert up products at decode (IQ3_XXS / IQ2_S / IQ1_S at ~150 GB/s on the B70, a third of the dense
   ones - neither the grid lookups nor the index math; `NS_NH_PROFILE=1` times every kernel), the vision tower.
+
+## 3D
+
+```sh
+nextsycl models pull trellis2                                  # or trellis2-512, pixal3d
+nextsycl model3d gen helmet.png --model trellis2 --seed 42 --out helmet.glb [--resolution 512|1024] [--faces 300000]
+nextsycl model3d gen goblin.jpg --model trellis2               # an opaque picture: cut out by BiRefNet first
+nextsycl model3d gen helmet.png --model pixal3d --opt-fov 30
+nextsycl model3d check <reference dump dir> --model trellis2 [--stages pre,remover,dino,ss,ssdec,shape,cascade,tex,sdec,tdec] [--full]
+```
+
+**TRELLIS.2** (`model3d/trellis2`, kernels in `kernels/model3d/trellis2`) runs Trellis2ImageTo3DPipeline: the
+picture prepared as the pipeline does (long side <= 1024, cut out when opaque - `crates/remover`, BiRefNet -,
+cropped to its alpha > 0.8 box, squared, premultiplied), DINOv3 ViT-L/16 tokens at 512 and 1024, the sparse
+structure (a 1.3B DiT over the dense 16^3 grid, 12 guided Euler steps, the conv3d decoder to 64^3 occupancy pooled to
+32^3), the shape latent on those voxels at 512, the cascade (the shape decoder's subdivisions x4, re-quantized to
+1024 / 16 under a 49152-token budget, the 1024 shape flow there), the texture latent, the shape decoder (sparse
+ConvNeXt stages with channel-to-space subdivisions) to a dual-grid mesh and the texture decoder (replaying the
+shape's subdivisions) to PBR voxels; then the mesh oriented, clustered and decimated to the triangle budget, unwrapped
+and baked (each texel snapped to the decoded surface, the voxels sampled trilinearly as flex_gemm's grid_sample_3d),
+y up. The flows' Q8_0 matrices are expanded to half per product, the residual streams float32; the sparse convolutions
+are a 27-tap gather and a GEMM; the neighbour maps of millions of voxels come from their parents' (no hashing). Models
+load stage by stage (`--opt-resident` keeps them). **Pixal3D** is the same engine (arch `pixal3d`): every block adds
+`proj_linear` of DINOv3 patch features sampled where its voxel projects into the picture (a pinhole camera of
+`--opt-fov`, default 49.1 degrees), its cross-attention reading only CLS and the 4 registers; NAF's upsampled half
+of the features takes the low-res ones again (softer fine detail), MoGe-2's camera estimate is not ported.
+
+Checked against `reference/trellis2/ref.py` and `reference/pixal3d/ref.py` (the official modules on the same files,
+float32 on the CPU, the CUDA extensions stood in for; the helmet example): BiRefNet's logits rel 1.2e-6 (no mask pixel
+flipped), DINOv3 1.8e-4 / 2.5e-4 (512 / 1024), every flow's first call <= 3.1e-4 (Pixal3D's <= 4.8e-4, its projected
+features 2.4-3.0e-4), the samplers' 12 guided steps 5.2e-3 (structure) and 5.8e-3 (shape), the texture's 3.4e-4, the
+structure decoder 1.8e-4 (no cell flipped), the shape decoder on the reference's subdivisions 5.5e-4 (on its own,
+0.04% of the children decided otherwise - logits near zero), the texture decoder 6-8e-4.
+
+B70 (the helmet example: TRELLIS.2 4267 structure voxels, 20323 in the cascade's second pass, 22 M triangles decoded;
+Pixal3D 2332 and 11502; the card's peak):
+
+| path | total | dino | structure | shape | texture | decoders | mesh + bake | peak |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| trellis2 1024 cascade | 79.8 s | 1.3 s | 4.4 s | 6.4 + 29.4 s | 18.1 s | 10.6 s | 9.4 s | 9.1 GiB |
+| trellis2-512 | 20.7 s | 0.6 s | 4.4 s | 4.1 s | 2.8 s | 4.8 s | 3.9 s | 2.9 GiB |
+| pixal3d 1024 cascade | 45.1 s | 2.0 s | 4.4 s | 4.5 + 13.1 s | 7.9 s | 6.5 s | 6.7 s | 4.5 GiB |
+
+The second shape pass is where the time goes: at 20323 tokens a call takes 1.39 s - self-attention 0.67 s (flash,
+half), the MLP 0.40 s, cross-attention to the 4101 picture tokens 0.15 s, the other linears 0.16 s. The goblin
+(an opaque picture: BiRefNet 1.2 s) at 1024: 53.5 s.
 
 ## Speed by model
 

@@ -24,6 +24,8 @@ int ns_model3d_trellis2_ln_mod(ns_gpu* g, const void* x, int x_dt, int64_t M, in
 int ns_model3d_trellis2_qk_norm_rope(ns_gpu* g, void* x, int64_t M, int64_t H, int64_t D, int64_t stride, const float* gamma, const float* cs);
 /* x [M, C] float32 += h [M, C] (h_dt) * gate (float32 [C]; NULL: a plain add) */
 int ns_model3d_trellis2_gate_add(ns_gpu* g, float* x, int64_t M, int64_t C, const void* h, int h_dt, const float* gate);
+/* x [M, C] float32 += row [C] (float32) on every row */
+int ns_model3d_trellis2_add_row(ns_gpu* g, float* x, int64_t M, int64_t C, const float* row);
 /* dst = src over n values, converting between float32 and half */
 int ns_model3d_trellis2_convert(ns_gpu* g, const void* src, int src_dt, int64_t n, void* dst, int dst_dt);
 /* x = silu(x) in place over n values */

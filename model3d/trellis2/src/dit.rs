@@ -44,9 +44,13 @@ struct HostLin {
 }
 
 impl HostLin {
-    fn load(f: &File, p: &str) -> Result<HostLin> {
-        let (sh, w) = f.host(&format!("{p}.weight"))?;
-        Ok(HostLin { w, b: f.vec(&format!("{p}.bias"))?, n: sh[0], k: sh[1] })
+    /// `p` as an [n, *] matrix (some files store small matrices reshaped: the values are in order)
+    fn load(f: &File, p: &str, n: usize) -> Result<HostLin> {
+        let (_, w) = f.host(&format!("{p}.weight"))?;
+        if w.len() % n != 0 {
+            return Err(Error(format!("{p}.weight: {} values for {n} rows", w.len())));
+        }
+        Ok(HostLin { k: w.len() / n, w, b: f.vec(&format!("{p}.bias"))?, n })
     }
     fn apply(&self, x: &[f32]) -> Vec<f32> {
         (0..self.n).map(|o| {
@@ -74,6 +78,9 @@ pub struct Dit {
     out: Lin,
     scratch: DevBuf,
     pub bytes: usize,
+    /// NS_M3D_T2_PROFILE: seconds in [self-attention's linears and norms, its attention, the cross-attention, the MLP]
+    /// over the calls (each part synced; slower)
+    pub prof: std::sync::Mutex<Option<[f64; 4]>>,
 }
 
 /// A call's buffers, sized for n tokens and l condition tokens
@@ -89,6 +96,17 @@ pub struct Work {
     kv: DevBuf,
     x: DevBuf,
     out: DevBuf,
+}
+
+/// What a call's cross-attention reads
+pub enum Cross<'a> {
+    /// the picture's tokens (half [l, cond_ch]): their keys and values made in every block
+    Tokens(&'a DevBuf, usize),
+    /// every block's keys and values made once (`cache_cross`) for l tokens
+    Cached(&'a [DevBuf], usize),
+    /// the unconditioned pass's zero tokens: each block's cross-attention output is one row for every token (keys and
+    /// values all their biases: the attention returns the value bias) - `const_cross`, [blocks, 1536] float32
+    Const(&'a DevBuf),
 }
 
 /// The first call's insides, for the check: the input layer's output, block 0's and the last block's
@@ -162,8 +180,12 @@ impl Dit {
                 + blk.proj.as_ref().map_or(0, |p| p.bytes());
             blocks.push(blk);
         }
-        let input = Lin::load(f, gpu, "input_layer", Keep::Stored)?;
-        let out = Lin::load(f, gpu, "out_layer", Keep::Stored)?;
+        // the input and output layers as [1536, in] and [out, 1536] whatever shape the file gives them (ComfyUI-GGUF
+        // stores matrices too narrow for Q8_0 reshaped; their values are in order)
+        let mut input = Lin::load(f, gpu, "input_layer", Keep::Stored)?;
+        let mut out = Lin::load(f, gpu, "out_layer", Keep::Stored)?;
+        (input.n, input.k) = (C, input.n * input.k / C);
+        (out.n, out.k) = (out.n * out.k / C, C);
         let cond_ch = blocks[0].ckv.k;
         let proj_ch = blocks[0].proj.as_ref().map(|p| p.k);
         let scratch = DevBuf::new(gpu, MLP * C * 2 + proj_ch.unwrap_or(0) * C * 2)?;
@@ -172,14 +194,15 @@ impl Dit {
             out_ch: out.n,
             cond_ch,
             proj_ch,
-            t0: HostLin::load(f, "t_embedder.mlp.0")?,
-            t2: HostLin::load(f, "t_embedder.mlp.2")?,
-            ada: HostLin::load(f, "adaLN_modulation.1")?,
+            t0: HostLin::load(f, "t_embedder.mlp.0", C)?,
+            t2: HostLin::load(f, "t_embedder.mlp.2", C)?,
+            ada: HostLin::load(f, "adaLN_modulation.1", 6 * C)?,
             input,
             blocks,
             out,
             scratch,
             bytes,
+            prof: std::sync::Mutex::new(None),
         })
     }
 
@@ -216,11 +239,46 @@ impl Dit {
     /// rotary phases `cs` ([n, 64, 2], `rope`), Pixal3D's projected features `proj` (half [n, proj_ch])
     #[allow(clippy::too_many_arguments)]
     pub fn forward(&self, cx: &Ctx, w: &Work, x: &[f32], t: f32, cond: &DevBuf, l: usize, cs: &DevBuf, proj: Option<&DevBuf>,
-                   mut probe: Option<&mut Probe>) -> Result<Vec<f32>> {
+                   probe: Option<&mut Probe>) -> Result<Vec<f32>> {
+        self.forward_with(cx, w, x, t, Cross::Tokens(cond, l), cs, proj, probe)
+    }
+
+    /// Every block's cross-attention keys and values (RMS-normed keys) for the tokens `cond` (half [l, cond_ch])
+    pub fn cache_cross(&self, cx: &Ctx, cond: &DevBuf, l: usize) -> Result<Vec<DevBuf>> {
+        self.blocks.iter().map(|b| {
+            let kv = DevBuf::new(&cx.gpu, l * 2 * C * 2)?;
+            b.ckv.apply(&cx.nsd, &cx.k, &self.scratch, cond.ptr(), l, kv.ptr(), Dt::F16)?;
+            cx.k.qk_norm_rope(kv.ptr(), l, HEADS, HD, 2 * C, b.ck_gamma.fp(), std::ptr::null())?;
+            Ok(kv)
+        }).collect()
+    }
+
+    /// The zero condition's cross-attention output of every block: to_out(the value bias) [blocks, 1536] float32
+    pub fn const_cross(&self, cx: &Ctx) -> Result<DevBuf> {
+        let out = DevBuf::f32(&cx.gpu, self.blocks.len() * C)?;
+        for (i, b) in self.blocks.iter().enumerate() {
+            let bias = b.ckv.bias.as_ref().map(|x| x.to_f32()).transpose()?.unwrap_or_else(|| vec![0.0; 2 * C]);
+            let v = dev_half(&cx.gpu, &bias[C..2 * C])?;
+            let row = DevBuf::f32(&cx.gpu, C)?;
+            b.cout.apply(&cx.nsd, &cx.k, &self.scratch, v.ptr(), 1, row.ptr(), Dt::F32)?;
+            out.copy_within(i * C * 4, &row, 0, C * 4)?;
+        }
+        Ok(out)
+    }
+
+    /// `forward` with the cross-attention's keys and values as given
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with(&self, cx: &Ctx, w: &Work, x: &[f32], t: f32, cross: Cross, cs: &DevBuf, proj: Option<&DevBuf>,
+                        mut probe: Option<&mut Probe>) -> Result<Vec<f32>> {
         let (nsd, k, g) = (&cx.nsd, &cx.k, &cx.gpu);
         let n = w.n;
         if x.len() != n * self.in_ch {
             return Err(Error(format!("the flow's input: {} values for {n} tokens of {}", x.len(), self.in_ch)));
+        }
+        if let Cross::Tokens(_, l) | Cross::Cached(_, l) = cross {
+            if l * 2 * C * 2 > w.kv.len && matches!(cross, Cross::Tokens(..)) {
+                return Err(Error(format!("{l} condition tokens for a work sized for fewer")));
+            }
         }
         if proj.is_some() != self.proj_ch.is_some() {
             return Err(Error("projected features given to a model without proj_linear (or missing for one with it)".into()));
@@ -237,6 +295,16 @@ impl Dit {
             // SAFETY: offsets inside the half buffers sized above.
             unsafe { b.ptr().cast::<u16>().add(off).cast() }
         };
+        let mut prof = *self.prof.lock().unwrap();
+        let mut t0 = std::time::Instant::now();
+        let mut tick = |i: usize| -> Result<()> {
+            if let Some(p) = prof.as_mut() {
+                g.sync()?;
+                p[i] += t0.elapsed().as_secs_f64();
+                t0 = std::time::Instant::now();
+            }
+            Ok(())
+        };
         for (bi, b) in self.blocks.iter().enumerate() {
             // SAFETY: rows of the [blocks, 6, 1536] modulation table.
             let md = |j: usize| unsafe { mods.fp().add(bi * 6 * C + j * C) as *const f32 };
@@ -244,28 +312,46 @@ impl Dit {
             b.qkv.apply(nsd, k, s, w.hn.ptr(), n, w.qkv.ptr(), Dt::F16)?;
             k.qk_norm_rope(w.qkv.ptr(), n, HEADS, HD, 3 * C, b.q_gamma.fp(), cs.fp())?;
             k.qk_norm_rope(hp(&w.qkv, C), n, HEADS, HD, 3 * C, b.k_gamma.fp(), cs.fp())?;
+            tick(0)?;
             nsd.attention_qk(w.qkv.ptr(), n, 3 * C, hp(&w.qkv, C), hp(&w.qkv, 2 * C), n, 3 * C, Dt::F16, HEADS, HD, w.att.ptr(), Dt::F16)?;
+            tick(1)?;
             b.out.apply(nsd, k, s, w.att.ptr(), n, w.o.ptr(), Dt::F32)?;
             k.gate_add(w.h.fp(), n, C, w.o.ptr(), Dt::F32, md(2))?;
+            tick(0)?;
             // cross-attention to the picture
-            k.ln_mod(w.h.ptr(), Dt::F32, n, C, 1e-6, b.norm2.0.fp(), b.norm2.1.fp(), std::ptr::null(), std::ptr::null(), w.hn.ptr(), Dt::F16)?;
-            b.cq.apply(nsd, k, s, w.hn.ptr(), n, w.att.ptr(), Dt::F16)?;
-            k.qk_norm_rope(w.att.ptr(), n, HEADS, HD, C, b.cq_gamma.fp(), std::ptr::null())?;
-            b.ckv.apply(nsd, k, s, cond.ptr(), l, w.kv.ptr(), Dt::F16)?;
-            k.qk_norm_rope(w.kv.ptr(), l, HEADS, HD, 2 * C, b.ck_gamma.fp(), std::ptr::null())?;
-            nsd.attention_qk(w.att.ptr(), n, C, w.kv.ptr(), hp(&w.kv, C), l, 2 * C, Dt::F16, HEADS, HD, w.hn.ptr(), Dt::F16)?;
-            b.cout.apply(nsd, k, s, w.hn.ptr(), n, w.o.ptr(), Dt::F32)?;
-            if let (Some(pl), Some(pf)) = (&b.proj, proj) {
-                pl.apply(nsd, k, s, pf.ptr(), n, w.o2.ptr(), Dt::F32)?;
-                k.add(w.o.ptr(), Dt::F32, w.o2.ptr(), Dt::F32, n * C)?;
+            let kv = match cross {
+                Cross::Tokens(cond, l) => {
+                    b.ckv.apply(nsd, k, s, cond.ptr(), l, w.kv.ptr(), Dt::F16)?;
+                    k.qk_norm_rope(w.kv.ptr(), l, HEADS, HD, 2 * C, b.ck_gamma.fp(), std::ptr::null())?;
+                    Some((&w.kv, l))
+                }
+                Cross::Cached(kvs, l) => Some((&kvs[bi], l)),
+                Cross::Const(_) => None,
+            };
+            if let Some((kv, l)) = kv {
+                k.ln_mod(w.h.ptr(), Dt::F32, n, C, 1e-6, b.norm2.0.fp(), b.norm2.1.fp(), std::ptr::null(), std::ptr::null(), w.hn.ptr(), Dt::F16)?;
+                b.cq.apply(nsd, k, s, w.hn.ptr(), n, w.att.ptr(), Dt::F16)?;
+                k.qk_norm_rope(w.att.ptr(), n, HEADS, HD, C, b.cq_gamma.fp(), std::ptr::null())?;
+                nsd.attention_qk(w.att.ptr(), n, C, kv.ptr(), hp(kv, C), l, 2 * C, Dt::F16, HEADS, HD, w.hn.ptr(), Dt::F16)?;
+                b.cout.apply(nsd, k, s, w.hn.ptr(), n, w.o.ptr(), Dt::F32)?;
+                k.gate_add(w.h.fp(), n, C, w.o.ptr(), Dt::F32, std::ptr::null())?;
+            } else if let Cross::Const(rows) = cross {
+                // SAFETY: block bi's row of the [blocks, 1536] table.
+                k.add_row(w.h.fp(), n, C, unsafe { rows.fp().add(bi * C) })?;
             }
-            k.gate_add(w.h.fp(), n, C, w.o.ptr(), Dt::F32, std::ptr::null())?;
+            if let (Some(pl), Some(pf)) = (&b.proj, proj) {
+                // Pixal3D: the projected features' term beside the cross-attention's
+                pl.apply(nsd, k, s, pf.ptr(), n, w.o2.ptr(), Dt::F32)?;
+                k.gate_add(w.h.fp(), n, C, w.o2.ptr(), Dt::F32, std::ptr::null())?;
+            }
+            tick(2)?;
             // the MLP
             k.ln_mod(w.h.ptr(), Dt::F32, n, C, 1e-6, std::ptr::null(), std::ptr::null(), md(4), md(3), w.hn.ptr(), Dt::F16)?;
             b.mlp0.apply(nsd, k, s, w.hn.ptr(), n, w.mlp.ptr(), Dt::F16)?;
             nsd.gelu(w.mlp.ptr(), Dt::F16, n * MLP, true)?;
             b.mlp2.apply(nsd, k, s, w.mlp.ptr(), n, w.o.ptr(), Dt::F32)?;
             k.gate_add(w.h.fp(), n, C, w.o.ptr(), Dt::F32, md(5))?;
+            tick(3)?;
             if let Some(p) = probe.as_deref_mut() {
                 if bi == 0 {
                     p.block0 = w.h.to_f32()?;
@@ -273,6 +359,9 @@ impl Dit {
                     p.last = w.h.to_f32()?;
                 }
             }
+        }
+        if let Some(p) = prof {
+            *self.prof.lock().unwrap() = Some(p);
         }
         k.ln_mod(w.h.ptr(), Dt::F32, n, C, 1e-5, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(), w.hn.ptr(), Dt::F16)?;
         self.out.apply(nsd, k, s, w.hn.ptr(), n, w.out.ptr(), Dt::F32)?;

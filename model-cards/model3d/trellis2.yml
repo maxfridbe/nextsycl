@@ -4,7 +4,7 @@ id: trellis2
 kind: model3d
 arch: trellis2
 title: 'TRELLIS.2 4B Q8_0 (picture to textured mesh, the 1024 cascade; MIT)'
-about: Microsoft's TRELLIS.2 from Aero-Ex's GGUFs - DINOv3 ViT-L/16, five 1.3B flow transformers (Q8_0) for the sparse structure, the shape at 512 then 1024 and the PBR texture, the fp16 sparse decoders (a dual-grid mesh, PBR voxels baked into base colour and metallic-roughness textures); BiRefNet cuts opaque pictures out
+about: Microsoft's TRELLIS.2 from Aero-Ex's GGUFs - DINOv3 ViT-L/16, four 1.3B flow transformers (Q8_0) - the sparse structure, the shape at 512 then 1024, the PBR texture at 1024, the fp16 sparse decoders (a dual-grid mesh, PBR voxels baked into base colour and metallic-roughness textures); BiRefNet cuts opaque pictures out
 gpus: '0'
 vram_gib: 10.0                   # its memory on the card when it runs: the 1024 peak measured 9.1 GiB on a B70 (models load stage by stage)
 does: [generate, texture]

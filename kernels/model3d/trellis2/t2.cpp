@@ -117,6 +117,14 @@ int ns_model3d_trellis2_gate_add(ns_gpu* g, float* x, int64_t M, int64_t C, cons
     NS_CATCH
 }
 
+int ns_model3d_trellis2_add_row(ns_gpu* g, float* x, int64_t M, int64_t C, const float* row) {
+    NS_TRY
+    if (M <= 0 || C <= 0) return 0;
+    g->q.parallel_for(sycl::range<1>((size_t) (M * C)), [=](sycl::id<1> id) { x[id[0]] += row[id[0] % (size_t) C]; });
+    return 0;
+    NS_CATCH
+}
+
 int ns_model3d_trellis2_convert(ns_gpu* g, const void* src, int src_dt, int64_t n, void* dst, int dst_dt) {
     NS_TRY
     if (!dt_ok(src_dt) || !dt_ok(dst_dt)) return ns_fail("ns_model3d_trellis2_convert: float32 or half");

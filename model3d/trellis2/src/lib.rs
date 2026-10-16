@@ -389,18 +389,23 @@ impl Trellis2 {
                 mut step: impl FnMut(u32, u32) -> Result<()>) -> Result<Vec<f32>> {
         let n = coords.len();
         let g = &self.cx.gpu;
-        self.room("a flow's activations", (n * (dit::C * 4 * 3 + dit::C * 2 * 6 + 8192 * 2)) as f64)?;
+        self.room("a flow's activations", (n * (dit::C * 4 * 3 + dit::C * 2 * 6 + 8192 * 2) + 30 * cond.1 * 2 * dit::C * 2) as f64)?;
         let w = m.work(g, n, cond.1)?;
         let cs = DevBuf::from_f32(g, &dit::rope(coords))?;
-        let neg = DevBuf::new(g, cond.1 * m.cond_ch * 2)?;
-        neg.fill(0)?;
+        // the condition's keys and values made once for every call; the zero condition's attention is its value bias
+        let kvs = m.cache_cross(&self.cx, &cond.0, cond.1)?;
+        let neg = m.const_cross(&self.cx)?;
         let negp = proj.map(|p| -> Result<DevBuf> {
             let z = DevBuf::new(g, p.len)?;
             z.fill(0)?;
             Ok(z)
         }).transpose()?;
         let out = m.out_ch;
-        sampler::sample(x0, p, |x, t, c| {
+        if self.profile {
+            *m.prof.lock().unwrap() = Some([0.0; 4]);
+        }
+        let t_flow = Instant::now();
+        let r = sampler::sample(x0, p, |x, t, c| {
             let input = match concat {
                 Some(cc) => {
                     let k = cc.len() / n;
@@ -413,9 +418,14 @@ impl Trellis2 {
                 }
                 None => x.to_vec(),
             };
-            let (cnd, pj) = if c { (&cond.0, proj) } else { (&neg, negp.as_ref()) };
-            m.forward(&self.cx, &w, &input, t, cnd, cond.1, &cs, pj, None)
-        }, &mut step)
+            let (cross, pj) = if c { (dit::Cross::Cached(&kvs, cond.1), proj) } else { (dit::Cross::Const(&neg), negp.as_ref()) };
+            m.forward_with(&self.cx, &w, &input, t, cross, &cs, pj, None)
+        }, &mut step);
+        if let Some(t) = m.prof.lock().unwrap().take() {
+            eprintln!("{}: flow of {n} tokens, {} calls in {:.2} s: self-attention linears {:.2} s, its attention {:.2} s, cross-attention {:.2} s, MLP {:.2} s",
+                      self.arch, p.calls(), t_flow.elapsed().as_secs_f64(), t[0], t[1], t[2], t[3]);
+        }
+        r
     }
 
     fn mark(&self, tr: &mut Trace, what: &'static str, t0: &mut Instant) {
@@ -590,10 +600,12 @@ impl Trellis2 {
             report("bake", 1, 1)?;
             self.mark(&mut tr, "bake", &mut t0);
         }
-        // to glTF's y-up: TRELLIS's z-up (x, y, z) -> (x, z, -y); Pixal3D's grid has y up, its camera at -z: (-x, y, -z)
-        let pixal = self.arch == ARCH_PIXAL;
-        for p in &mut m.positions {
-            *p = if pixal { [-p[0], p[1], -p[2]] } else { [p[0], p[2], -p[1]] };
+        // to glTF's y-up, the picture's view facing +z: TRELLIS's z-up (x, y, z) -> (x, z, -y); Pixal3D's grid is already
+        // y-up with the camera on its +z side (its camera looks along the world's +y, the grid's -z)
+        if self.arch != ARCH_PIXAL {
+            for p in &mut m.positions {
+                *p = [p[0], p[2], -p[1]];
+            }
         }
         m.normals.clear();
         m.compute_normals();

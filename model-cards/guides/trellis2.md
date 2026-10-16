@@ -25,7 +25,7 @@ nextsycl model3d gen helmet.png --model trellis2 --seed 42 --out helmet.glb
 nextsycl model3d gen goblin.jpg --model trellis2-512 --faces 150000
 ```
 
-**Speed and memory** (a B70; the helmet example, 4267 structure voxels, 20571 in the cascade's second pass): 512
-in 40 s, the 1024 cascade in 83 s (shape 32 s, texture 18 s, decoders 11 s, mesh 7 s, bake 3 s); the models load
-stage by stage, so the card needs about 9 GiB at the 1024 peak (the decoders at 8 million voxels), less at 512.
-`--opt-resident` keeps every model loaded between requests (faster repeats, ~11 GiB more).
+**Speed and memory** (a B70; the helmet example, 4267 structure voxels, 20323 in the cascade's second pass): 512
+in 21 s, the 1024 cascade in 80 s (the second shape pass 29 s, texture 18 s, decoders 11 s, mesh and bake 9 s); the
+models load stage by stage, so the card needs about 9 GiB at the 1024 peak (the decoders at 8 million voxels), 3 GiB
+at 512. `--opt-resident` keeps every model loaded between requests (faster repeats, ~11 GiB more).

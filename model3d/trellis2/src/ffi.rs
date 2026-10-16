@@ -19,6 +19,7 @@ pub struct Api {
     qk_norm_rope: unsafe extern "C" fn(G, M, i64, i64, i64, i64, *const f32, *const f32) -> c_int,
     gate_add: unsafe extern "C" fn(G, *mut f32, i64, i64, P, c_int, *const f32) -> c_int,
     convert: unsafe extern "C" fn(G, P, c_int, i64, M, c_int) -> c_int,
+    add_row: unsafe extern "C" fn(G, *mut f32, i64, i64, *const f32) -> c_int,
     silu: unsafe extern "C" fn(G, M, c_int, i64) -> c_int,
     add: unsafe extern "C" fn(G, M, c_int, P, c_int, i64) -> c_int,
     gather27: unsafe extern "C" fn(G, P, i64, *const i32, i64, i64, M) -> c_int,
@@ -56,6 +57,7 @@ pub fn api() -> Result<&'static Api> {
             qk_norm_rope: sym!("ns_model3d_trellis2_qk_norm_rope"),
             gate_add: sym!("ns_model3d_trellis2_gate_add"),
             convert: sym!("ns_model3d_trellis2_convert"),
+            add_row: sym!("ns_model3d_trellis2_add_row"),
             silu: sym!("ns_model3d_trellis2_silu"),
             add: sym!("ns_model3d_trellis2_add"),
             gather27: sym!("ns_model3d_trellis2_gather27"),
@@ -120,6 +122,11 @@ impl K {
     pub fn convert(&self, src: P, src_dt: Dt, n: usize, dst: M, dst_dt: Dt) -> Result<()> {
         // SAFETY: n values each.
         check(unsafe { (self.k.convert)(self.g, src, d(src_dt), n as i64, dst, d(dst_dt)) }, "convert")
+    }
+    /// x [m, c] += row [c] on every row
+    pub fn add_row(&self, x: *mut f32, m: usize, c: usize, row: *const f32) -> Result<()> {
+        // SAFETY: sizes as named (t2.h).
+        check(unsafe { (self.k.add_row)(self.g, x, m as i64, c as i64, row) }, "row add")
     }
     pub fn silu(&self, x: M, dt: Dt, n: usize) -> Result<()> {
         // SAFETY: n values.
