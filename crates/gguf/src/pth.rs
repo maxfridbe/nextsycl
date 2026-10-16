@@ -370,27 +370,7 @@ fn unpickle(p: &[u8], at: usize) -> Result<(V, usize)> {
                 let f = st.pop().unwrap_or(V::None);
                 let a: Vec<V> = match &args { V::Tuple(a) => a.as_ref().clone(), _ => Vec::new() };
                 let name = if let V::Global(_, n) = &f { n.as_ref() } else { "" };
-                st.push(match name {
-                    "_rebuild_tensor_v2" | "_rebuild_tensor" | "_rebuild_tensor_v3" => match a.first() {
-                        Some(V::Storage(key, ty)) => {
-                            let off = if let Some(V::Int(o)) = a.get(1) { *o as usize } else { 0 };
-                            // v3 names the dtype itself (a global torch.float32 ...); v2 takes the storage's
-                            let dtype = ty.or_else(|| match a.get(5) {
-                                Some(V::Global(_, d)) => dtype_named(d),
-                                _ => None,
-                            });
-                            match dtype {
-                                Some(dtype) => V::Tensor(Rc::new(PthTensor { name: String::new(), dtype, shape: a.get(2).map(ints).unwrap_or_default(),
-                                                                            stride: a.get(3).map(ints).unwrap_or_default(), storage: key.to_string(), offset: off })),
-                                None => V::Obj,
-                            }
-                        }
-                        _ => V::Obj,
-                    },
-                    "_rebuild_parameter" | "_rebuild_parameter_with_state" => a.first().cloned().unwrap_or(V::Obj),
-                    "OrderedDict" | "dict" | "defaultdict" => V::Dict(Rc::new(RefCell::new(Vec::new()))),
-                    _ => V::Obj,
-                });
+                st.push(rebuild(name, &a));
             }
             b'b' => {
                 // BUILD: an object's state (dropped: opaque objects stay opaque)
@@ -429,6 +409,37 @@ fn unpickle(p: &[u8], at: usize) -> Result<(V, usize)> {
             }
             o => return Err(bad(format!("opcode 0x{o:02x} at byte {}", i - 1))),
         }
+    }
+}
+
+/// What a REDUCE of the callable `name` with `a` makes: a tensor (torch's rebuild functions, also wrapped in
+/// `_rebuild_from_type_v2`, as a Parameter or a tensor subclass saves), a dict, or an opaque object
+fn rebuild(name: &str, a: &[V]) -> V {
+    match name {
+        "_rebuild_tensor_v2" | "_rebuild_tensor" | "_rebuild_tensor_v3" => match a.first() {
+            Some(V::Storage(key, ty)) => {
+                let off = if let Some(V::Int(o)) = a.get(1) { *o as usize } else { 0 };
+                // v3 names the dtype itself (a global torch.float32 ...); v2 takes the storage's
+                let dtype = ty.or_else(|| match a.get(5) {
+                    Some(V::Global(_, d)) => dtype_named(d),
+                    _ => None,
+                });
+                match dtype {
+                    Some(dtype) => V::Tensor(Rc::new(PthTensor { name: String::new(), dtype, shape: a.get(2).map(ints).unwrap_or_default(),
+                                                                stride: a.get(3).map(ints).unwrap_or_default(), storage: key.to_string(), offset: off })),
+                    None => V::Obj,
+                }
+            }
+            _ => V::Obj,
+        },
+        "_rebuild_parameter" | "_rebuild_parameter_with_state" => a.first().cloned().unwrap_or(V::Obj),
+        // (func, type, func's args, state): the tensor func makes
+        "_rebuild_from_type_v2" | "_rebuild_from_type" => match (a.first(), a.get(2)) {
+            (Some(V::Global(_, f)), Some(V::Tuple(args))) => rebuild(f, args),
+            _ => V::Obj,
+        },
+        "OrderedDict" | "dict" | "defaultdict" => V::Dict(Rc::new(RefCell::new(Vec::new()))),
+        _ => V::Obj,
     }
 }
 

@@ -17,7 +17,9 @@ pub mod ops;
 pub mod opt;
 pub mod prep;
 pub mod prof;
+pub mod ptv3;
 pub mod search;
+pub mod skin;
 pub mod tokens;
 
 use std::sync::Arc;
@@ -54,6 +56,7 @@ pub struct UniRig {
     pub ops: Ops,
     pub enc: encoder::Encoder,
     pub opt: opt::Opt,
+    pub skin: skin::SkinModel,
     load_s: f64,
 }
 
@@ -72,11 +75,15 @@ impl UniRig {
         let w = Weights { pth: &sk, prefix: pre.clone(), gpu };
         let enc = encoder::Encoder::load(&Weights { pth: &sk, prefix: format!("{pre}mesh_encoder."), gpu })?;
         let opt = opt::Opt::load(&w)?;
+        let sp = open(files, "skin")?;
+        let pre = sp.prefix_of("model.qmesh.weight").map(|p| format!("{p}model."))
+            .ok_or_else(|| Error(format!("{}: not UniRig's skin checkpoint (no model.qmesh)", sp.path.display())))?;
+        let skin = skin::SkinModel::load(&Weights { pth: &sp, prefix: pre, gpu })?;
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
         let silo = ops.k.silo().map_or_else(|| "no silo: the engine's own kernels".to_string(), |s| format!("silo {}", s.path.display()));
         log(format!("{ARCH}: loaded on {} in {load_s:.1} s (float32; {silo})", gpu.name));
-        Ok(UniRig { ops, enc, opt, load_s })
+        Ok(UniRig { ops, enc, opt, skin, load_s })
     }
 
     /// The decoder's prefix [1024 + 2, 1024]: the encoder's latents through output_proj, then bos and the class token

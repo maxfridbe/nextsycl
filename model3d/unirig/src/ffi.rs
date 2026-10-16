@@ -18,6 +18,7 @@ struct Api {
     ln: unsafe extern "C" fn(G, F, i64, i64, i64, f32, F, F, O) -> c_int,
     head_norm: unsafe extern "C" fn(G, O, i64, i64, i64, i64, i64, f32) -> c_int,
     act: unsafe extern "C" fn(G, O, i64, c_int) -> c_int,
+    round_half: unsafe extern "C" fn(G, O, i64) -> c_int,
     add: unsafe extern "C" fn(G, O, F, i64) -> c_int,
     affine: unsafe extern "C" fn(G, O, i64, i64, F, F) -> c_int,
     attention: unsafe extern "C" fn(G, F, i64, i64, F, i64, i64, F, i64, i64, i64, i64, i64, i64, i64, i64, f32, c_int, O, i64, O, i64) -> c_int,
@@ -54,6 +55,7 @@ fn api() -> Result<&'static Api> {
             ln: sym!("ns_model3d_unirig_ln"),
             head_norm: sym!("ns_model3d_unirig_head_norm"),
             act: sym!("ns_model3d_unirig_act"),
+            round_half: sym!("ns_model3d_unirig_round_half"),
             add: sym!("ns_model3d_unirig_add"),
             affine: sym!("ns_model3d_unirig_affine"),
             attention: sym!("ns_model3d_unirig_attention"),
@@ -161,6 +163,12 @@ impl K {
     pub fn act(&self, x: &DevBuf, n: usize, kind: i32) -> Result<()> {
         // SAFETY: x holds n floats.
         check(unsafe { (self.k.act)(self.g, x.fp(), n as i64, kind) }, "activation")
+    }
+
+    /// x rounded to half and back, in place (n values)
+    pub fn round_half(&self, x: &DevBuf, n: usize) -> Result<()> {
+        // SAFETY: x holds n floats.
+        check(unsafe { (self.k.round_half)(self.g, x.fp(), n as i64) }, "rounding to half")
     }
 
     pub fn add(&self, x: &DevBuf, y: &DevBuf, n: usize) -> Result<()> {

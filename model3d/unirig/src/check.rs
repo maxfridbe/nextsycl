@@ -8,7 +8,9 @@
 //!   logits    cond + greedy.npy                        -> greedy_logits.npy (teacher-forced)
 //!   greedy    cond                                     -> greedy.npy (the tokens, greedy with the grammar)
 //!   detok     beam.npy                                 -> joints.npy, parents.npy
-//!   skin ...  (the skin stages: see the skin module)
+//!   order     skin_pts                                 -> ptv3_order.npy (the curves' orders, given ptv3_perm)
+//!   skin      skin_pts + skin_nrm + skin_vox + skin_joints + skin_enc_ind / fps + ptv3_order
+//!                                                      -> skin_glob, skin_bone, skin_ptv3, skin_mesh, skin .npy
 //! ```
 
 use std::path::Path;
@@ -145,6 +147,48 @@ pub fn run(m: &UniRig, dir: &Path, stages: &[&str], _mesh: Option<&Path>, log: &
         if gp != want {
             note(1.0);
         }
+    }
+    if need("order") {
+        let pts = points(&rd("skin_pts")?.1);
+        let perm: Vec<usize> = rd("ptv3_perm")?.1.iter().map(|x| *x as usize).collect();
+        let (_, want) = rd("ptv3_order")?;
+        let gc = crate::ptv3::grid_coords(&pts);
+        let got = crate::ptv3::orders(&gc, [perm[0], perm[1], perm[2], perm[3]]);
+        let codes = crate::ptv3::codes(&gc);
+        for (k, o) in got.iter().enumerate() {
+            let w = &want[k * pts.len()..(k + 1) * pts.len()];
+            let same = o.iter().zip(w).filter(|(a, b)| **a as f64 == **b).count();
+            // equal codes (points sharing a voxel) may come in either order
+            let c = &codes[perm[k]];
+            let tied = o.iter().zip(w).filter(|(a, b)| **a as f64 != **b && c[**a] == c[**b as usize]).count();
+            log(format!("order {k}      {same} of {} the same, {tied} more at equal codes", pts.len()));
+            if same + tied != pts.len() {
+                note(1.0);
+            }
+        }
+    }
+    if need("skin") {
+        let pts = points(&rd("skin_pts")?.1);
+        let nrm = points(&rd("skin_nrm")?.1);
+        let joints = points(&rd("skin_joints")?.1);
+        let prior = f32s(&rd("skin_vox")?.1);
+        let ind: Vec<usize> = rd("skin_enc_ind")?.1.iter().map(|x| *x as usize).collect();
+        let fps: Vec<usize> = rd("skin_enc_fps")?.1.iter().map(|x| *x as usize).collect();
+        let q: Vec<usize> = fps.iter().map(|&i| ind[i]).collect();
+        let (_, ord) = rd("ptv3_order")?;
+        let n = pts.len();
+        let lay = crate::ptv3::Layout { gc: crate::ptv3::grid_coords(&pts), orders: (0..4).map(|k| ord[k * n..(k + 1) * n].iter().map(|x| *x as usize).collect()).collect() };
+        let parents: Vec<Option<usize>> = rd("parents")?.1.iter().map(|x| if *x < 0.0 { None } else { Some(*x as usize) }).collect();
+        let mut tr = crate::skin::Trace::default();
+        let t0 = Instant::now();
+        let soft = m.skin.predict(&m.ops, &pts, &nrm, &q, &lay, &joints, &prior, Some(&mut tr))?;
+        log(format!("skin         {:.2} s", t0.elapsed().as_secs_f64()));
+        note(line("skin glob", &tr.glob, &f32s(&rd("skin_glob")?.1), log));
+        note(line("skin bone", &tr.bone, &f32s(&rd("skin_bone")?.1), log));
+        note(line("skin ptv3", &tr.ptv3, &f32s(&rd("skin_ptv3")?.1), log));
+        note(line("skin mesh", &tr.mesh, &f32s(&rd("skin_mesh")?.1), log));
+        let w = crate::skin::masked(&soft, &prior, &parents, 3.0);
+        note(line("skin", &w, &f32s(&rd("skin")?.1), log));
     }
     Ok(worst)
 }

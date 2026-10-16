@@ -82,6 +82,14 @@ int ns_model3d_unirig_head_norm(ns_gpu* g, float* x, int64_t M, int64_t row, int
     NS_CATCH
 }
 
+int ns_model3d_unirig_round_half(ns_gpu* g, float* x, int64_t n) {
+    NS_TRY
+    if (n <= 0) return 0;
+    g->q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { x[i] = (float) (sycl::half) x[i]; });
+    return 0;
+    NS_CATCH
+}
+
 int ns_model3d_unirig_act(ns_gpu* g, float* x, int64_t n, int kind) {
     NS_TRY
     if (kind < 0 || kind > 1) return ns_fail("ns_model3d_unirig_act: kind 0 (gelu) or 1 (relu)");

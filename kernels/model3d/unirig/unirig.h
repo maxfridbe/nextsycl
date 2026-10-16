@@ -17,6 +17,8 @@ typedef struct ns_gpu ns_gpu;
 int ns_model3d_unirig_ln(ns_gpu* g, const float* x, int64_t x_row, int64_t M, int64_t C, float eps, const float* w, const float* b, float* out);
 /* Per head layer norm, no affine, in place: rows of x [M, row], head h of n_heads at col + h * D (D at most 64) */
 int ns_model3d_unirig_head_norm(ns_gpu* g, float* x, int64_t M, int64_t row, int64_t col, int64_t n_heads, int64_t D, float eps);
+/* x in place, n values: each rounded to half and back (what PTv3's flash attention takes: UniRig's qkv.half()) */
+int ns_model3d_unirig_round_half(ns_gpu* g, float* x, int64_t n);
 /* x in place, n values: kind 0 GELU (erf), 1 ReLU */
 int ns_model3d_unirig_act(ns_gpu* g, float* x, int64_t n, int kind);
 /* x [n] += y [n] */

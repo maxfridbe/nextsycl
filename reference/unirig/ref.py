@@ -6,7 +6,7 @@ CUDA:
 - torch_cluster.fps (its CPU algorithm: start at the first point, the farthest next, distances summed x, y, z);
 - spconv's SubMConv3d (submanifold: an output at every input point; the kernel's taps read the point of the neighbour
   voxel - the first point of the cloud in it when several share it - and the centre tap the point itself);
-- torch_scatter.segment_csr; flash_attn's varlen attention and its MHA module (float32 here: flash_attn runs half);
+- torch_scatter.segment_csr; flash_attn's varlen attention (UniRig hands it qkv.half(): the inputs half, the product float32 here) and its MHA module;
 - lightning (a plain nn.Module).
 The voxel prior uses UniRig's own pyrender path (PYOPENGL_PLATFORM=egl; pyrender from /var/mnt/2TBSSD/nextsycl-ref/pyr).
 transformers 4.51.3 (UniRig's) from /var/mnt/2TBSSD/nextsycl-ref/tf451.
@@ -154,7 +154,7 @@ def is_spconv_module(m):
 
 
 def flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, dropout_p=0.0, softmax_scale=None):
-    """float32 (the original runs half), per patch"""
+    """the product in float32 on the half inputs UniRig hands it, per patch"""
     qkv = qkv.float()
     out = torch.empty(qkv.shape[0], qkv.shape[2], qkv.shape[3])
     cu = cu_seqlens.tolist()
