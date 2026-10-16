@@ -270,6 +270,7 @@ impl Vae {
         o.linear(&att, n, &self.fin_out, &qn)?;
         let out = o.buf(n * 3 * FRAMES)?;
         o.linear(&qn, n, &self.to_outputs, &out)?;
+        crate::prof::used(&o.nsd, "at the decode's end (its buffers held)");
         Ok(out)
     }
 }

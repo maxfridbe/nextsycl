@@ -266,6 +266,7 @@ The `model3d` kind (meshes from pictures, rigging, animation) and its engines' s
 |---|---|---|---|
 | `NS_MODEL3D_OUT` | ~/.local/share/nextsycl/model3d | where meshes (GLB, with their picture and settings beside them) and 3D uploads are kept | cli (model3d), serve |
 | `NS_M3D_*` | - | every NS_M3D_ setting in nextsycl.conf is passed to the 3D server | cli (model3d serve) |
+| `NS_M3D_AAM_PROFILE` | off | Debug: set: AnimateAnyMesh waits for the GPU after each named step of the flow and prints the totals (slower; shows where the time goes) | model3d animateanymesh |
 | `NS_M3D_AAM_TRAJ` | max(512, vertices / 8) | AnimateAnyMesh: the trajectory tokens DyMeshVAE samples (more: finer motion, slower) (--opt-traj; per request too) | model3d animateanymesh |
 
 ## Diffusion kernels: `NSD_*`

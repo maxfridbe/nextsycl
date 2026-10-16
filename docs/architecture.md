@@ -60,6 +60,10 @@ audio/                     AUDIO
 model3d/                   3D
   contract   nextsycl-model3d    the contract: Model3dEngine (generate: pictures to a mesh; rig: a skeleton and skin
                                  weights, or motion from words), MeshRequest / RigRequest, Abilities, Step, Model3dKind
+  animateanymesh nextsycl-model3d-animateanymesh  AnimateAnyMesh: a mesh set in motion by a sentence (CLIP-L, DyMeshVAE,
+                                 a rectified-flow MMDiT), morph targets; stage checks
+  unirig     nextsycl-model3d-unirig   UniRig: a skeleton (Michelangelo encoder, OPT decoder) and skin weights (PTv3)
+  rignet     nextsycl-model3d-rignet   RigNet (GPLv3, its own crate): a skeleton and skin weights from graph networks
   example    nextsycl-model3d-example  a template
 
 glue/                      WHAT MAKES ENGINES A PRODUCT (libraries too)
@@ -357,6 +361,18 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   convolution, attention over a causal window, float32 RoPE, layer-scaled residuals, ELU (the encoder's); the
   encoder's strided causal convolutions go through `ns_audio_mm3_conv1d_lr` too. The text embedding stays
   on disk (a row read a token). Settings: `NS_Q3T_INT8=1` (`--opt-int8`).
+
+## The 3D engines
+
+- **animateanymesh** - AnimateAnyMesh from its PyTorch checkpoints, read without Python (`nextsycl_gguf::pth`, the
+  RF checkpoint also holding SD 1.5's CLIP-L text tower), float32 throughout as the reference. Its kernels
+  (`kernels/model3d/animateanymesh`): layer norms with two streams (the MMDiT's x and text tokens, each with its
+  adaLN modulation), gated residual adds, GELU / GEGLU / quick GELU, dense attention with any row and head strides
+  (the qkv packed per head, the sync blocks' two value streams), attention over a CSR of each vertex's mesh
+  neighbours (the reference builds a dense N x N mask), farthest point sampling of the 256-d embeddings in one
+  work-group (the distances summed feature by feature, unfused, as pytorch3d), and the flow's guidance and midpoint
+  steps; the linear layers are the shared kernels' float32 oneDNN product. Its silo runs the attention as two
+  oneDNN products and a softmax. Settings: `NS_M3D_AAM_TRAJ` (`--opt-traj`), `NS_M3D_AAM_PROFILE`.
 
 ## The model registry
 

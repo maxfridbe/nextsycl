@@ -152,6 +152,12 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `voxcpm2` | VoxCPM2 2B: speech in 30 languages at 48 kHz - plain, designed from a description, cloned (with a transcript: continued); MiniCPM4 language models, a local flow-matching DiT, AudioVAE V2 | `voxcpm2` | 4.6 GiB | checked, served |
 | `voxcpm2-int8` | the same files, the language models in int8 at load | `voxcpm2` | 4.6 GiB | checked, served |
 
+**3D** (`nextsycl model3d`: rigging and animation of a mesh; the result keeps the input mesh, its UVs and textures)
+
+| id | model | engine | size | status |
+|---|---|---|---|---|
+| `animateanymesh` | AnimateAnyMesh: a mesh set in motion by a sentence - DyMeshVAE (neighbour attention over the mesh's edges), a rectified-flow MMDiT on SD 1.5's CLIP-L; 16 frames as glTF morph targets (Apache-2.0) | `animateanymesh` | 0.9 GiB | checked |
+
 ## What it does
 
 - **Two cards:** the layers split over the GPUs (each with a SYCL context of its own), the experts in an exclusive
@@ -939,6 +945,35 @@ attention layers without positions (32 / 2 heads of 128); its MTP block drafts. 
   decodes ~30. On the B70 alone (`nemotron-3.5-super-iq1m-b70`, the B65 left free) 13 MoE layers' experts (15.5 GiB)
   sit in pinned host memory, gathered into VRAM each step; its prompt passes still expand experts one at a time. Open: the expert up products at decode (IQ3_XXS / IQ2_S / IQ1_S at ~150 GB/s on the B70, a third of the dense
   ones - neither the grid lookups nor the index math; `NS_NH_PROFILE=1` times every kernel), the vision tower.
+
+## 3D: rigging and animation
+
+`nextsycl model3d rig MESH.glb|.obj --model ID` takes a mesh and returns it as GLB with what the model adds: a
+skeleton and skin weights (UniRig, RigNet), or a morph animation (AnimateAnyMesh, with `--prompt`). The input's
+vertices, UVs and textures are kept; a model that works on a resampled copy hands its result back to every vertex.
+
+```sh
+nextsycl models pull animateanymesh
+nextsycl model3d rig dragon.glb --model animateanymesh --prompt "the dragon flaps its wings" [--seed N] [--cfg 3] [--frames 16] [--fps 10]
+nextsycl model3d check <reference dump dir> --model ID [--stages ...] [--mesh FILE.obj] [--prompt TEXT]   # reference/<arch>/ref.py
+```
+
+### AnimateAnyMesh
+
+`model3d/animateanymesh`, float32 as the reference: the mesh merged and normalized in Blender's frame, DyMeshVAE's
+encoder (neighbour attention as a CSR over the faces' edges instead of the reference's dense N x N mask; farthest
+points of the 256-d embeddings on the GPU), CLIP-L, the 12-layer MMDiT through 63 midpoint steps with guidance 3,
+the decoder's 16 frames mapped back to the input's vertices. Its silo (`kernels/model3d/animateanymesh/silo`) runs
+attention as two float32 oneDNN products: 13x the engine's own kernel on the DiT's shapes.
+
+| mesh (B70) | vertices | trajectory tokens | time |
+|---|---|---|---|
+| reference/meshes/humanoid.obj | 7,590 | 948 | 3.7 s (encode 0.7 s, 63 flow steps 2.7 s, decode 0.3 s) |
+| reference/meshes/humanoid_lo.obj | 3,630 | 512 | 2.1 s |
+
+Checked against the official code in float32 on the CPU (reference/animateanymesh/ref.py, the same noise and
+trajectory vertices): every stage within 2e-6 relative RMS - the embeddings 3e-7, the farthest points identical, the
+rest latents 5e-7, CLIP 7e-7, one DiT pass 6e-7, the 63-step flow 1.6e-6, the decoded frames 7e-8.
 
 ## Speed by model
 

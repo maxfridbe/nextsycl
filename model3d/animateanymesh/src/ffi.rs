@@ -93,10 +93,52 @@ pub struct Norm<'a> {
     pub shift: Option<&'a DevBuf>,
 }
 
+/// The silo's kernels (kernels/model3d/animateanymesh/silo/silo.h, dist/silo/libnextsycl-animateanymesh.so)
+#[allow(clippy::type_complexity)]
+pub struct Silo {
+    pub path: std::path::PathBuf,
+    attention_supported: unsafe extern "C" fn(i64, i64, c_int) -> c_int,
+    attention: unsafe extern "C" fn(G, F, i64, i64, F, i64, i64, F, i64, i64, i64, i64, i64, i64, i64, i64, f32, c_int, O, i64, O, i64) -> c_int,
+}
+
+// SAFETY: function pointers into a library that stays loaded for the process.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+/// The silo (None: the engine's own kernels throughout)
+pub fn silo() -> Result<Option<&'static Silo>> {
+    static S: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    S.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo(crate::ARCH).map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in silo.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo {
+            path: lib.path.clone(),
+            attention_supported: sym!("ns_model3d_aam_silo_attention_supported"),
+            attention: sym!("ns_model3d_aam_silo_attention"),
+        }))
+    })
+    .as_ref()
+    .map(|s| s.as_ref())
+    .map_err(|e| Error(e.clone()))
+}
+
 /// The kernels on one GPU
 pub struct K {
     k: &'static Api,
     g: G,
+    silo: Option<&'static Silo>,
 }
 
 // SAFETY: a GPU handle (its queue is thread-safe) and function pointers.
@@ -105,7 +147,12 @@ unsafe impl Sync for K {}
 
 impl K {
     pub fn new(gpu: &Gpu) -> Result<K> {
-        Ok(K { k: api()?, g: gpu.raw() })
+        Ok(K { k: api()?, g: gpu.raw(), silo: silo()? })
+    }
+
+    /// The silo in use, if any
+    pub fn silo(&self) -> Option<&'static Silo> {
+        self.silo
     }
 
     /// out [M, C] = layer norm of x [M, C], rows (r % s) < t taking `n0`, the others `n1` (s = t: one stream)
@@ -139,7 +186,14 @@ impl K {
     #[allow(clippy::too_many_arguments)]
     pub fn attention(&self, q: (&DevBuf, usize, usize), k: (&DevBuf, usize, usize), v: (&DevBuf, usize, usize), b: usize, sq: usize, skv: usize,
                      h: usize, d: usize, dv: usize, scale: f32, causal: bool, scratch: &DevBuf, out: (&DevBuf, usize)) -> Result<()> {
-        // SAFETY: the strides and counts the caller names stay inside its buffers; the scratch's size is passed.
+        // SAFETY (both): the strides and counts the caller names stay inside its buffers; the scratch's size is passed.
+        if let Some(s) = self.silo.filter(|s| unsafe { (s.attention_supported)(d as i64, dv as i64, causal as c_int) } == 1) {
+            return check(unsafe {
+                (s.attention)(self.g, q.0.fp(), q.1 as i64, q.2 as i64, k.0.fp(), k.1 as i64, k.2 as i64, v.0.fp(), v.1 as i64, v.2 as i64, b as i64,
+                              sq as i64, skv as i64, h as i64, d as i64, dv as i64, scale, causal as c_int, scratch.fp(), scratch.floats() as i64,
+                              out.0.fp(), out.1 as i64)
+            }, "attention (silo)");
+        }
         check(unsafe {
             (self.k.attention)(self.g, q.0.fp(), q.1 as i64, q.2 as i64, k.0.fp(), k.1 as i64, k.2 as i64, v.0.fp(), v.1 as i64, v.2 as i64, b as i64,
                                sq as i64, skv as i64, h as i64, d as i64, dv as i64, scale, causal as c_int, scratch.fp(), scratch.floats() as i64,

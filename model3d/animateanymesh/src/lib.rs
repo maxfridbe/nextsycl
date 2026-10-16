@@ -20,6 +20,7 @@ pub mod dit;
 mod ffi;
 pub mod ops;
 pub mod prep;
+pub mod prof;
 pub mod vae;
 
 use std::path::Path;
@@ -121,7 +122,8 @@ impl AnimateAnyMesh {
         let traj = o.setting("NS_M3D_AAM_TRAJ").map(|v| v.parse::<usize>().map_err(|_| Error(format!("NS_M3D_AAM_TRAJ: {v:?} is not a count")))).transpose()?;
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
-        log(format!("{ARCH}: loaded on {} in {load_s:.1} s (CLIP-L, the MMDiT, DyMeshVAE; float32)", gpu.name));
+        let silo = ops.k.silo().map_or_else(|| "no silo: the engine's own kernels".to_string(), |s| format!("silo {}", s.path.display()));
+        log(format!("{ARCH}: loaded on {} in {load_s:.1} s (CLIP-L, the MMDiT, DyMeshVAE; float32; {silo})", gpu.name));
         Ok(AnimateAnyMesh { ops, tok, clip, dit, vae, factors, traj, load_s })
     }
 
@@ -198,6 +200,7 @@ impl AnimateAnyMesh {
             self.dit.forward(o, &w, text, &x2, t, &out)?;
             o.k.cfg(&out, n, cfg, f)
         };
+        prof::reset_clock(&o.nsd)?;
         for i in 0..steps {
             let (ta, tb) = (ts[i], ts[i + 1]);
             let dt = tb - ta;
@@ -208,8 +211,11 @@ impl AnimateAnyMesh {
             o.k.axpy(&y, &f2, dt, n, &ym)?;
             y.copy_within(0, &ym, 0, n * 4)?;
             trace(i + 1, &y)?;
+            prof::mark(&o.nsd, "solver")?;
             progress(Step { phase: "motion", at: i as u32 + 1, of: steps as u32, seconds: t0.elapsed().as_secs_f64() })?;
         }
+        prof::report(&mut |s| eprintln!("{s}"));
+        prof::used(&o.nsd, "at the flow's end (its buffers held)");
         Ok(y)
     }
 
@@ -230,14 +236,15 @@ impl AnimateAnyMesh {
     }
 }
 
-/// torch.linspace(0, 1, n) in float32: the first half counted up from 0, the rest down from 1
+/// torch.linspace(0, 1, n) in float32: the first half counted up from 0, the rest down from 1 (one rounding each:
+/// PyTorch's vector kernel fuses the product and the sum)
 pub fn linspace(n: usize) -> Vec<f32> {
     if n < 2 {
         return vec![0.0; n];
     }
     let step = 1.0f32 / (n - 1) as f32;
     let half = n / 2;
-    (0..n).map(|i| if i < half { step * i as f32 } else { 1.0 - step * (n - 1 - i) as f32 }).collect()
+    (0..n).map(|i| if i < half { step * i as f32 } else { (-step).mul_add((n - 1 - i) as f32, 1.0) }).collect()
 }
 
 /// Frames resampled in time (linearly): `n` frames over the same span as `frames`
@@ -336,6 +343,8 @@ mod tests {
         assert_eq!(t[63], 1.0);
         assert_eq!(t[1], 1.0 / 63.0);
         assert_eq!(t[62], 1.0 - 1.0 / 63.0);
+        // where a separate product and sum round twice, torch's (and this) rounds once
+        assert_eq!(t[41], 0.650_793_6);
     }
 
     #[test]

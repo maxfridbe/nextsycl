@@ -9,6 +9,7 @@ use nextsycl_model3d::Result;
 use crate::clip::{CTX, WIDTH as CLIP_WIDTH};
 use crate::ffi::{Norm, GELU, SILU};
 use crate::ops::{Lin, Ln, Ops, Weights};
+use crate::prof::mark;
 
 pub const WIDTH: usize = 512;
 pub const CHANNELS: usize = 64;
@@ -146,6 +147,7 @@ impl Dit {
         o.linear(&h1, 1, &self.t_proj, &temb)?;
         o.k.act(&temb, WIDTH, SILU)?;
         o.linear(&temb, 1, &self.adaln, &w.mods)?;
+        mark(&o.nsd, "dit time")?;
         // the input: trajectory tokens through input_proj and ln_pre, the text after them, a sequence each
         o.linear(x, 2 * k, &self.input_proj, &w.xin)?;
         o.ln(&w.xin, 2 * k, WIDTH, 1e-5, self.ln_pre.norm(), &w.xin)?;
@@ -161,26 +163,36 @@ impl Dit {
             let (ts, tc, tg, ts2, tc2, tg2) = (md(1, 0)?, md(1, 1)?, md(1, 2)?, md(1, 3)?, md(1, 4)?, md(1, 5)?);
             o.k.ln(&w.x, m, WIDTH, 1e-6, s, k, Norm { scale: Some(&xc), shift: Some(&xs), ..Default::default() },
                    Norm { scale: Some(&tc), shift: Some(&ts), ..Default::default() }, &w.n)?;
+            mark(&o.nsd, "dit norm")?;
             o.linear(&w.n, m, &bl.c_qkv, &w.qkv)?;
+            mark(&o.nsd, "dit qkv")?;
             // per head: q, k, v of 64 each, side by side (the qkv row viewed as [heads, 3 * 64])
             let qkv_k = w.qkv.view(hd * 4, w.qkv.len - hd * 4)?;
             let qkv_v = w.qkv.view(2 * hd * 4, w.qkv.len - 2 * hd * 4)?;
             o.k.attention((&w.qkv, 3 * WIDTH, 3 * hd), (&qkv_k, 3 * WIDTH, 3 * hd), (&qkv_v, 3 * WIDTH, 3 * hd), 2, s, s, HEADS, hd, hd,
                           1.0 / (hd as f32).sqrt(), false, &w.scratch, (&w.a, WIDTH))?;
+            mark(&o.nsd, "dit attention")?;
             o.linear(&w.a, m, &bl.c_proj, &w.p)?;
+            mark(&o.nsd, "dit proj")?;
             o.k.gated_add(&w.x, &w.p, m, WIDTH, s, k, Some(&xg), Some(&tg))?;
             o.k.ln(&w.x, m, WIDTH, 1e-5, s, k, Norm { w: Some(&bl.ln_x.w), b: Some(&bl.ln_x.b), scale: Some(&xc2), shift: Some(&xs2) },
                    Norm { w: Some(&bl.ln_text.w), b: Some(&bl.ln_text.b), scale: Some(&tc2), shift: Some(&ts2) }, &w.n)?;
+            mark(&o.nsd, "dit norm")?;
             o.linear(&w.n, m, &bl.fc, &w.h)?;
+            mark(&o.nsd, "dit mlp up")?;
             o.k.act(&w.h, m * 4 * WIDTH, GELU)?;
+            mark(&o.nsd, "dit gelu")?;
             o.linear(&w.h, m, &bl.proj, &w.p)?;
+            mark(&o.nsd, "dit mlp down")?;
             o.k.gated_add(&w.x, &w.p, m, WIDTH, s, k, Some(&xg2), Some(&tg2))?;
+            mark(&o.nsd, "dit norm")?;
         }
         for b in 0..2 {
             w.xo.copy_within(b * k * WIDTH * 4, &w.x, b * s * WIDTH * 4, k * WIDTH * 4)?;
         }
         o.ln(&w.xo, 2 * k, WIDTH, 1e-5, self.ln_post.norm(), &w.xo)?;
-        o.linear(&w.xo, 2 * k, &self.output_proj, out)
+        o.linear(&w.xo, 2 * k, &self.output_proj, out)?;
+        mark(&o.nsd, "dit out")
     }
 }
 
