@@ -1,0 +1,28 @@
+# HunyuanImage 2.1 Distilled Q8_0 (text to image, 2K; 8 steps, guidance embedded; Tencent Hunyuan Community License)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: hunyuanimage-2.1-distilled-q8
+kind: image
+arch: hunyuanimage-2.1
+title: 'HunyuanImage 2.1 Distilled Q8_0 (text to image, 2K; 8 steps, guidance embedded; Tencent Hunyuan Community License)'
+about: Tencent's MeanFlow-distilled 17B DiT (calcuis' v2 GGUF, Q8_0) - one pass a step, its guidance scale embedded; the base model's text encoders and VAE
+gpus: '0'
+vram_gib: 27.0                   # its memory on the card when it runs (a B70, 2048x2048)
+defaults:
+  steps: 8
+  cfg: 3.25
+  sampler: euler
+  schedule: shift
+  size: 2048x2048
+env: {}
+files:
+  transformer:
+    key: hunyuanimage-21-distilled-v2-q80
+    url: https://huggingface.co/calcuis/hunyuanimage-gguf/resolve/58e0ab0fde518f423953522842841347bc6e8686/hunyuanimage2.1-distilled-v2-q8_0.gguf
+    size: 19950072480
+    sha256: 0d12d718cae0c8107448d77eef01c0fe7e6c5ddbf9cb8352239ebd13e49a45fe
+    path: hunyuanimage21/hunyuanimage2.1-distilled-v2-q8_0.gguf
+  text-encoder: hunyuanimage-21-qwen25vl-q40
+  tokenizer: qwen25-vl-tokenizer
+  byt5: hunyuanimage-21-byt5-f16
+  vae: hunyuanimage-21-vae
+guide: guides/hunyuanimage-2.1.md

@@ -1,0 +1,48 @@
+# HunyuanImage 2.1 Q8_0 (text to image, 2K; 50 steps with guidance; Tencent Hunyuan Community License)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: hunyuanimage-2.1-q8
+kind: image
+arch: hunyuanimage-2.1
+title: 'HunyuanImage 2.1 Q8_0 (text to image, 2K; 50 steps with guidance; Tencent Hunyuan Community License)'
+about: Tencent's 17B DiT (20 double + 40 single blocks), Q8_0 (GGUF by calcuis); Qwen2.5-VL-7B Q4_0 and byT5-small for the text (quoted text drawn by its glyph encoder), the 32x VAE; APG guidance as the official pipeline
+gpus: '0'
+vram_gib: 27.0                   # its memory on the card when it runs (a B70, 2048x2048)
+defaults:
+  steps: 50
+  cfg: 3.5
+  sampler: euler
+  schedule: shift
+  size: 2048x2048
+env: {}
+files:
+  transformer:
+    key: hunyuanimage-21-q80
+    url: https://huggingface.co/calcuis/hunyuanimage-gguf/resolve/58e0ab0fde518f423953522842841347bc6e8686/hunyuanimage2.1-q8_0.gguf
+    size: 19791300832
+    sha256: 7a9bab36f273f8cad57a81a59fb30360551f217878092c5683c7ed7aa94e0d5c
+    path: hunyuanimage21/hunyuanimage2.1-q8_0.gguf
+  text-encoder:
+    key: hunyuanimage-21-qwen25vl-q40
+    url: https://huggingface.co/calcuis/hunyuanimage-gguf/resolve/58e0ab0fde518f423953522842841347bc6e8686/qwen2.5-vl-7b-test-q4_0.gguf
+    size: 5034814240
+    sha256: 7c6c439dd1f353839a12681099467dd667769bef87ff4c1989b49a35573c0ded
+    path: hunyuanimage21/qwen2.5-vl-7b-test-q4_0.gguf
+  tokenizer:
+    key: qwen25-vl-tokenizer
+    url: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/resolve/cc594898137f460bfe9f0759e9844b3ce807cfb5/tokenizer.json
+    size: 7031645
+    sha256: c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539
+    path: hunyuanimage21/tokenizer.json
+  byt5:
+    key: hunyuanimage-21-byt5-f16
+    url: https://huggingface.co/calcuis/pig-encoder/resolve/9a815b07068e86aba6f4fbf5f8913b544f64907a/byt5_small_glyphxl_fp32-f16.gguf
+    size: 438713376
+    sha256: 24d454240dab2f0ff178635d95b2472d0747124a3cc4ae92f3429fc3231c07a7
+    path: hunyuanimage21/byt5_small_glyphxl_fp32-f16.gguf
+  vae:
+    key: hunyuanimage-21-vae
+    url: https://huggingface.co/calcuis/hunyuanimage-gguf/resolve/58e0ab0fde518f423953522842841347bc6e8686/pig_hunyuan_image_vae_fp32-f16.gguf
+    size: 811483424
+    sha256: bc050c80629454ecda3a203964bac3747e89a52d18bb2b7361a8651b9b9a2edb
+    path: hunyuanimage21/pig_hunyuan_image_vae_fp32-f16.gguf
+guide: guides/hunyuanimage-2.1.md

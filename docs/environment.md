@@ -191,11 +191,14 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 
 ## Image
 
-Qwen-Image 2.1 (`image/qwenimage21`).
+Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`).
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
 | `NS_IMAGE_OUT` | ~/.local/share/nextsycl/images | where pictures are saved | cli (image) |
+| `NS_HI_*` | - | every NS_HI_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
+| `NS_HI_GUIDANCE` | apg | the HunyuanImage base model's guidance: apg (the pipeline's MIX_mode_0: CFG through step 5, or 38 when the negative quotes text, then adaptive projected guidance) or cfg (plain CFG every step) (--opt-guidance; per request too) | image hunyuanimage21 |
+| `NS_HI_PROFILE` | off | Debug: set: a GPU wait after each named step of the DiT, the totals printed after the picture (slower; shows where the time goes) | image hunyuanimage21 |
 | `NS_QI_*` | - | every NS_QI_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_QI_DUMP` | off | Debug: a directory: what the denoiser is given (embeds, pads, cond latents, noise) written there as raw float32 files | image qwenimage21 |
 | `NS_QI_INT8` | 0 | 1: the DiT's block matrices in int8 ConvRot (~1.4x a step, half the VRAM) (--opt-int8) | image qwenimage21 |
@@ -473,6 +476,7 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 |---|---|---|---|
 | `NS_CHECK_COND` | the reference's cond_latents.npy | edit-dit check: a raw float32 file of condition latents to use instead | image qwenimage21 (check) |
 | `NS_CHECK_EMBEDS` | the reference's embeddings | edit-dit check: a raw float32 file of embeddings to use instead (the engine's own, to see their effect) | image qwenimage21 (check) |
+| `NS_CHECK_LATENTS` | the reference's last latents_N.npy | vae check (HunyuanImage 2.1): a .npy of latents [h * w, 64] to decode instead | image hunyuanimage21 (check) |
 | `NS_CHECK_NOISE` | the reference's noise.npy | edit-dit check: a raw float32 noise file to use instead | image qwenimage21 (check) |
 | `NS_CHECK_PICTURE` | edit-pre check fails | edit-pre check: the original picture (PNG) resized and compared with the reference's | image qwenimage21 (check) |
 | `NS_CHECK_PROMPT` | no ids compared | edit-te check: an edit prompt whose token ids are compared with the reference's | image qwenimage21 (check) |

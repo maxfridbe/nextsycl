@@ -20,7 +20,8 @@ nextsycl image engines | selftest [--gpu N]";
 
 /// The image engines this program has (image/<arch>)
 pub fn engines() -> Vec<nextsycl_image::ImageKind> {
-    vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_olmocr2::kind(), nextsycl_image_example::kind()]
+    vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_olmocr2::kind(), nextsycl_image_hunyuanimage21::kind(),
+         nextsycl_image_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -325,8 +326,18 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         println!("worst relative error {worst:.2e}");
         return Ok(());
     }
+    if m["arch"] == nextsycl_image_hunyuanimage21::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("te,byt5,dit,vae").split(',').collect(); // + steps
+        let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let gpu = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
+        let mut log = |s: String| eprintln!("{s}");
+        let e = nextsycl_image_hunyuanimage21::HunyuanImage21::load(&files, &gpu, &options(cfg, &m, args)?, &mut log).map_err(|e| e.0)?;
+        let worst = nextsycl_image_hunyuanimage21::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?;
+        println!("worst relative error {worst:.2e}");
+        return Ok(());
+    }
     if m["arch"] != nextsycl_image_qwenimage21::ARCH {
-        return Err(format!("check knows {} only", nextsycl_image_qwenimage21::ARCH));
+        return Err(format!("check knows {}, {} and the OCR engines", nextsycl_image_qwenimage21::ARCH, nextsycl_image_hunyuanimage21::ARCH));
     }
     let stages: Vec<&str> = opt(args, "--stages").unwrap_or("te,dit,vae").split(',').collect(); // + edit-pre, edit-te, edit-vae, edit-dit
     let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -408,7 +419,7 @@ fn run(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     a.extend(mount(&out, &out.to_string_lossy(), false));
     a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engines' own settings from the configuration (NS_QI_INT8=1 ...)
-    for (k, v) in cfg.with_prefix("NS_QI_").into_iter().chain(cfg.with_prefix("NSD_")) {
+    for (k, v) in cfg.with_prefix("NS_QI_").into_iter().chain(cfg.with_prefix("NS_HI_")).chain(cfg.with_prefix("NSD_")) {
         a.extend(["-e".into(), format!("{k}={v}")]);
     }
     a.extend([ce.image.clone(), "bash".into(), "-c".into(),

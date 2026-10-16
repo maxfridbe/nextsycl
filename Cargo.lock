@@ -555,6 +555,7 @@ dependencies = [
  "nextsycl-gguf",
  "nextsycl-image",
  "nextsycl-image-example",
+ "nextsycl-image-hunyuanimage21",
  "nextsycl-image-olmocr2",
  "nextsycl-image-paddleocrvl",
  "nextsycl-image-qwenimage21",
@@ -673,6 +674,18 @@ version = "0.0.0"
 dependencies = [
  "nextsycl-core",
  "nextsycl-image",
+]
+
+[[package]]
+name = "nextsycl-image-hunyuanimage21"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-image",
+ "nextsycl-tok",
+ "serde_json",
 ]
 
 [[package]]

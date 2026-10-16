@@ -1,0 +1,14 @@
+[package]
+name = "nextsycl-image-hunyuanimage21"
+description = "HunyuanImage 2.1: its 17B DiT (base or MeanFlow-distilled), Qwen2.5-VL and byT5 text encoders and 32x VAE on Intel Arc (SYCL)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-image.workspace = true
+nextsycl-tok.workspace = true
+serde_json.workspace = true
