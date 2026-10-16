@@ -4,8 +4,8 @@
 //! triangle or pinch the surface (a link condition) is refused. Positions and colours are kept; UVs, normals and a
 //! skin are dropped (re-UV with `uv`, normals with `Mesh::compute_normals`).
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 
 use crate::{cross, dot, normalize, sub, Mesh};
 
@@ -53,27 +53,30 @@ impl Q {
     }
 }
 
+/// A collapse priced: its edge (the ends' stamps when priced: a moved end makes it stale) and where it goes
 struct Cand {
-    cost: f64,
     a: u32,
     b: u32,
     stamp: (u32, u32),
     to: [f32; 3],
 }
-impl PartialEq for Cand {
-    fn eq(&self, o: &Self) -> bool {
-        self.cost == o.cost
-    }
+
+/// The candidates, and a min-heap of 8-byte keys over them - (cost as float32 bits, index): costs are not negative,
+/// so their bits order as they do; a small key keeps the heap's walks in cache (most of its pops are stale ones)
+struct Queue {
+    cands: Vec<Cand>,
+    heap: BinaryHeap<Reverse<u64>>,
 }
-impl Eq for Cand {}
-impl PartialOrd for Cand {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
+
+impl Queue {
+    fn push(&mut self, cost: f64, c: Cand) {
+        let i = self.cands.len() as u64;
+        self.cands.push(c);
+        self.heap.push(Reverse(((cost.max(0.0) as f32).to_bits() as u64) << 32 | i));
     }
-}
-impl Ord for Cand {
-    fn cmp(&self, o: &Self) -> Ordering {
-        o.cost.total_cmp(&self.cost) // a min-heap
+    fn pop(&mut self) -> Option<&Cand> {
+        let Reverse(k) = self.heap.pop()?;
+        Some(&self.cands[(k & 0xffff_ffff) as usize])
     }
 }
 
@@ -152,28 +155,60 @@ pub fn decimate(input: &Mesh, target: usize) -> Mesh {
         }
         (best.0.max(0.0), [best.1[0] as f32, best.1[1] as f32, best.1[2] as f32])
     };
-    let mut heap = BinaryHeap::new();
+    let mut queue = Queue { cands: Vec::new(), heap: BinaryHeap::new() };
     for &(a, b) in edges.keys() {
         let (cost, to) = price(&q, &m.positions, a, b);
-        heap.push(Cand { cost, a, b, stamp: (0, 0), to });
+        queue.push(cost, Cand { a, b, stamp: (0, 0), to });
     }
     let mut live = tris.len();
-    let neighbours = |vt: &[Vec<u32>], tris: &[[u32; 3]], alive: &[bool], v: u32| -> HashSet<u32> {
-        vt[v as usize].iter().filter(|&&t| alive[t as usize]).flat_map(|&t| tris[t as usize]).filter(|&x| x != v).collect()
+    // a vertex's neighbours, sorted (a dozen or so: a sorted list beats a hash set by far)
+    let neighbours = |vt: &[Vec<u32>], tris: &[[u32; 3]], alive: &[bool], v: u32| -> Vec<u32> {
+        let mut n: Vec<u32> = vt[v as usize].iter().filter(|&&t| alive[t as usize]).flat_map(|&t| tris[t as usize]).filter(|&x| x != v).collect();
+        n.sort_unstable();
+        n.dedup();
+        n
+    };
+    let shared_count = |x: &[u32], y: &[u32]| -> usize {
+        let (mut i, mut j, mut c) = (0, 0, 0);
+        while i < x.len() && j < y.len() {
+            match x[i].cmp(&y[j]) {
+                Ordering::Less => i += 1,
+                Ordering::Greater => j += 1,
+                Ordering::Equal => {
+                    c += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        c
     };
     while live > target {
-        let Some(c) = heap.pop() else { break };
+        // stale candidates (an end moved since they were priced) pile up: past a few per live edge, drop them (a
+        // smaller heap is a faster one - its pops walk memory)
+        if queue.heap.len() > 6 * live {
+            let cands = &queue.cands;
+            let fresh: Vec<Reverse<u64>> = std::mem::take(&mut queue.heap).into_vec().into_iter()
+                .filter(|Reverse(k)| {
+                    let c = &cands[(k & 0xffff_ffff) as usize];
+                    !gone[c.a as usize] && !gone[c.b as usize] && stamp[c.a as usize] == c.stamp.0 && stamp[c.b as usize] == c.stamp.1
+                })
+                .collect();
+            queue.heap = BinaryHeap::from(fresh);
+        }
+        let Some(&Cand { a, b, stamp: cs, to: cto }) = queue.pop() else { break };
+        let c = Cand { a, b, stamp: cs, to: cto };
         let (a, b) = (c.a, c.b);
         if gone[a as usize] || gone[b as usize] || stamp[a as usize] != c.stamp.0 || stamp[b as usize] != c.stamp.1 {
             continue;
         }
         let na = neighbours(&vt, &tris, &alive, a);
-        if !na.contains(&b) {
+        if na.binary_search(&b).is_err() {
             continue;
         }
         let nb = neighbours(&vt, &tris, &alive, b);
         // the link condition: the edge's two ends share exactly the vertices opposite it (2 inside, 1 on a boundary)
-        let shared = na.intersection(&nb).count();
+        let shared = shared_count(&na, &nb);
         let opposite = vt[a as usize].iter().filter(|&&t| alive[t as usize] && tris[t as usize].contains(&b)).count();
         if shared != opposite {
             continue;
@@ -229,7 +264,7 @@ pub fn decimate(input: &Mesh, target: usize) -> Mesh {
         stamp[a as usize] += 1;
         for n in neighbours(&vt, &tris, &alive, a) {
             let (cost, to) = price(&q, &m.positions, a, n);
-            heap.push(Cand { cost, a, b: n, stamp: (stamp[a as usize], stamp[n as usize]), to });
+            queue.push(cost, Cand { a, b: n, stamp: (stamp[a as usize], stamp[n as usize]), to });
         }
     }
     m.indices = tris.iter().zip(&alive).filter(|(_, &l)| l).flat_map(|(t, _)| *t).collect();
@@ -259,5 +294,16 @@ mod tests {
     fn under_budget_is_left_alone() {
         let m = sphere(6, 8);
         assert_eq!(decimate(&m, 10_000).triangles(), m.triangles());
+    }
+
+    /// A million triangles to 40,000, timed: `cargo test --release -p nextsycl-mesh decimate_a_million -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn decimate_a_million() {
+        let m = sphere(500, 1000);
+        let t = std::time::Instant::now();
+        let d = decimate(&m, 40_000);
+        eprintln!("{} -> {} triangles in {:.2} s", m.triangles(), d.triangles(), t.elapsed().as_secs_f64());
+        assert!(is_closed_manifold(&d));
     }
 }

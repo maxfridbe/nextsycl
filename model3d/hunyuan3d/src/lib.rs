@@ -367,13 +367,15 @@ impl Model3dEngine for Hunyuan3d {
             None | Some("fast") => self.decode_fast(&latents, res, chunk, &mut |a, b| report("decode", a as u32, b as u32))?.0,
             Some(x) => return Err(Error(format!("decode {x}: fast or dense"))),
         };
-        report("mesh", 0, 1)?;
+        // the mesh: marching cubes and the floaters (1 of 2), the decimation (2 of 2)
+        report("mesh", 0, 2)?;
         let m = Self::mesh(&logits, res);
         if m.triangles() == 0 {
             return Err(Error("the shape decoded to nothing (no surface in the box)".into()));
         }
+        report("mesh", 1, 2)?;
         let out = nextsycl_model3d::finish(m, Some(req.faces.unwrap_or(40_000)));
-        report("mesh", 1, 1)?;
+        report("mesh", 2, 2)?;
         match (&self.paint, req.texture) {
             (Some(p), true) => {
                 let steps = num("paint-steps", "NS_M3D_HY_PAINT_STEPS")?.unwrap_or(15);
