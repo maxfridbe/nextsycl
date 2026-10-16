@@ -79,6 +79,10 @@ pub struct Silo {
     attention: unsafe extern "C" fn(G, F, i64, i64, F, i64, i64, F, i64, i64, i64, i64, i64, i64, i64, i64, f32, c_int, O, i64, O, i64) -> c_int,
     attn_slots_supported: unsafe extern "C" fn(i64, i64) -> c_int,
     attn_slots: unsafe extern "C" fn(G, F, F, F, I, i64, i64, i64, i64, i64, f32, O) -> c_int,
+    bone_attn_supported: unsafe extern "C" fn(i64, i64) -> c_int,
+    ln_supported: unsafe extern "C" fn(i64) -> c_int,
+    ln: unsafe extern "C" fn(G, F, i64, i64, i64, f32, F, F, c_int, O) -> c_int,
+    bone_attn: unsafe extern "C" fn(G, F, F, i64, i64, i64, i64, f32, O) -> c_int,
 }
 
 // SAFETY: function pointers into a library that stays loaded for the process.
@@ -109,6 +113,10 @@ pub fn silo() -> Result<Option<&'static Silo>> {
             attention: sym!("ns_model3d_unirig_silo_attention"),
             attn_slots_supported: sym!("ns_model3d_unirig_silo_attn_slots_supported"),
             attn_slots: sym!("ns_model3d_unirig_silo_attn_slots"),
+            bone_attn_supported: sym!("ns_model3d_unirig_silo_bone_attn_supported"),
+            ln_supported: sym!("ns_model3d_unirig_silo_ln_supported"),
+            ln: sym!("ns_model3d_unirig_silo_ln"),
+            bone_attn: sym!("ns_model3d_unirig_silo_bone_attn"),
         }))
     })
     .as_ref()
@@ -154,8 +162,22 @@ impl K {
     /// out [m, c] = layer norm of the rows of x (stride x_row) (* w + b)
     #[allow(clippy::too_many_arguments)]
     pub fn ln(&self, x: &DevBuf, x_row: usize, m: usize, c: usize, eps: f32, w: Option<&DevBuf>, b: Option<&DevBuf>, out: &DevBuf) -> Result<()> {
-        // SAFETY: x holds m rows of x_row, out m c; w, b c floats.
+        // SAFETY (both): x holds m rows of x_row, out m c; w, b c floats.
+        if let Some(s) = self.silo.filter(|s| unsafe { (s.ln_supported)(c as i64) } == 1) {
+            return check(unsafe { (s.ln)(self.g, x.fp(), x_row as i64, m as i64, c as i64, eps, p(w), p(b), -1, out.fp()) }, "layer norm (silo)");
+        }
         check(unsafe { (self.k.ln)(self.g, x.fp(), x_row as i64, m as i64, c as i64, eps, p(w), p(b), out.fp()) }, "layer norm")
+    }
+
+    /// GELU(layer norm of x) (rows of `c`, in place when out is x): one pass in the silo, else the norm and the GELU
+    #[allow(clippy::too_many_arguments)]
+    pub fn ln_gelu(&self, x: &DevBuf, m: usize, c: usize, eps: f32, w: Option<&DevBuf>, b: Option<&DevBuf>, out: &DevBuf) -> Result<()> {
+        // SAFETY: x and out hold m c floats; w, b c floats.
+        if let Some(s) = self.silo.filter(|s| unsafe { (s.ln_supported)(c as i64) } == 1) {
+            return check(unsafe { (s.ln)(self.g, x.fp(), c as i64, m as i64, c as i64, eps, p(w), p(b), GELU, out.fp()) }, "layer norm, GELU (silo)");
+        }
+        self.ln(x, c, m, c, eps, w, b, out)?;
+        self.act(out, m * c, GELU)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -239,7 +261,10 @@ impl K {
 
     #[allow(clippy::too_many_arguments)]
     pub fn bone_attn(&self, q: &DevBuf, k: &DevBuf, r: usize, j: usize, h: usize, d: usize, scale: f32, out: &DevBuf) -> Result<()> {
-        // SAFETY: q holds r h d floats, k j h d, out r j h.
+        // SAFETY (both): q holds r h d floats, k j h d, out r j h.
+        if let Some(s) = self.silo.filter(|s| unsafe { (s.bone_attn_supported)(j as i64, d as i64) } == 1) {
+            return check(unsafe { (s.bone_attn)(self.g, q.fp(), k.fp(), r as i64, j as i64, h as i64, d as i64, scale, out.fp()) }, "bone attention (silo)");
+        }
         check(unsafe { (self.k.bone_attn)(self.g, q.fp(), k.fp(), r as i64, j as i64, h as i64, d as i64, scale, out.fp()) }, "bone attention")
     }
 

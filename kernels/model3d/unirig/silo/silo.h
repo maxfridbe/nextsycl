@@ -26,6 +26,17 @@ int ns_model3d_unirig_silo_attn_slots_supported(int64_t D, int64_t len);
  * whole key or value row (a float4 a lane), the rows shared among the work-group's sub-groups. */
 int ns_model3d_unirig_silo_attn_slots(ns_gpu* g, const float* q, const float* kpool, const float* vpool, const int32_t* slots, int64_t stride,
                                       int64_t len, int64_t B, int64_t H, int64_t D, float scale, float* out);
+/* Whether ns_model3d_unirig_silo_bone_attn takes these shapes (1) or the engine's own kernel must (0) */
+int ns_model3d_unirig_silo_bone_attn_supported(int64_t J, int64_t D);
+/* ns_model3d_unirig_bone_attn (unirig.h), the same arguments and result, for the skin head's 768 features a head: a
+ * sub-group of 16 a (sample, head), the dot products a float4 a lane. */
+int ns_model3d_unirig_silo_bone_attn(ns_gpu* g, const float* q, const float* k, int64_t R, int64_t J, int64_t H, int64_t D, float scale, float* out);
+/* Whether ns_model3d_unirig_silo_ln takes rows of C (1) or the engine's own kernel must (0) */
+int ns_model3d_unirig_silo_ln_supported(int64_t C);
+/* ns_model3d_unirig_ln (unirig.h), the same arguments and result, then GELU when act is 0 (-1: none): a sub-group of 16
+ * a row, its values in registers. */
+int ns_model3d_unirig_silo_ln(ns_gpu* g, const float* x, int64_t x_row, int64_t M, int64_t C, float eps, const float* w, const float* b, int act,
+                              float* out);
 
 #ifdef __cplusplus
 }
