@@ -158,7 +158,7 @@ impl Paint {
         let mut cond = Cond { text: BTreeMap::new(), text_rows: 77, refkv: BTreeMap::new(), dino: BTreeMap::new(), dino_rows: 0, rope: BTreeMap::new(), states: BTreeMap::new() };
         // the reference UNet on the picture's latent at t = 0
         self.dual.text_kv(ops, &self.text[2..3], 77, &mut cond)?;
-        let x = Map { buf: nn::upload_half(&mem.keep, &ref_lat)?, n: 1, h: LAT, w: LAT, c: 4 };
+        let x = Map { buf: nn::upload_half(&mem.keep, ref_lat)?, n: 1, h: LAT, w: LAT, c: 4 };
         self.dual.forward(ops, mem, &x, 0.0, &mut cond, None)?;
         mem.keep.reset();
         // the main UNet's keys: text per material, the reference's, DINO's
