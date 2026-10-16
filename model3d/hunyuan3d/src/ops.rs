@@ -62,12 +62,37 @@ pub fn f32_to_f16(f: f32) -> u16 {
     sign | out as u16
 }
 
-/// A linear layer: half weights [n, k], a float32 bias [n] or none
+/// A linear layer: half weights [n, k], a float32 bias [n] or none; or (`scale`) int8 weights rotated along their
+/// inputs (ConvRot, a group of `GROUP`) with a float32 scale a row
 pub struct Lin {
     pub w: DevBuf,
     pub b: Option<DevBuf>,
     pub n: usize,
     pub k: usize,
+    pub scale: Option<DevBuf>,
+}
+
+/// The ConvRot group of the int8 matrices: rotated by the normalized 256 x 256 Hadamard matrix along their inputs
+pub const GROUP: usize = 256;
+
+/// The normalized g x g Hadamard matrix (g a power of 4; the qwen3vl crate's, the rotation of ComfyUI's ConvRot)
+pub fn hadamard(g: usize) -> Vec<f32> {
+    const H4: [[i32; 4]; 4] = [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]];
+    let norm = 1.0 / (g as f32).sqrt();
+    let mut h = vec![0f32; g * g];
+    for i in 0..g {
+        for j in 0..g {
+            let (mut a, mut b, mut s, mut sign) = (i, j, 1, 1);
+            while s < g {
+                sign *= H4[a % 4][b % 4];
+                a /= 4;
+                b /= 4;
+                s *= 4;
+            }
+            h[i * g + j] = sign as f32 * norm;
+        }
+    }
+    h
 }
 
 impl Lin {
@@ -175,7 +200,7 @@ impl<'a> Weights<'a> {
             None => None,
         };
         self.bytes.set(self.bytes.get() + w.len + b.as_ref().map_or(0, |b| b.len));
-        Ok(Lin { w, b, n: m.n, k: m.k })
+        Ok(Lin { w, b, n: m.n, k: m.k, scale: None })
     }
     /// `<n>.weight` and `<n>.bias` (when there is one), as stored
     pub fn lin(&self, n: &str) -> Result<Lin> {
@@ -198,11 +223,13 @@ pub struct Ops {
     /// rows read in place) at every length; false: the shared choice (oneDNN's fused attention under 8,192 rows -
     /// q, k, v copied out per head first - SageAttention's int8 q and k from there)
     pub flash: bool,
+    /// the silo's kernels, for the shapes they take (None: the engine's own throughout)
+    pub silo: Option<&'static ffi::Silo>,
 }
 
 impl Ops {
     pub fn new(gpu: &Arc<Gpu>) -> Result<Ops> {
-        Ok(Ops { nsd: Nsd::new(gpu)?, gpu: gpu.clone(), k: ffi::api()?, flash: true })
+        Ok(Ops { nsd: Nsd::new(gpu)?, gpu: gpu.clone(), k: ffi::api()?, flash: true, silo: ffi::silo()? })
     }
 
     fn g(&self) -> M {
@@ -211,7 +238,57 @@ impl Ops {
 
     /// out [m, n] (out_dt) = x [m, k] half . W^T + b
     pub fn lin(&self, l: &Lin, x: P, m: usize, out: M, out_dt: Dt) -> Result<()> {
-        self.nsd.linear(x, Dt::F16, m, l.k, l.w.ptr(), l.n, l.bias(), out, out_dt)
+        match &l.scale {
+            None => self.nsd.linear(x, Dt::F16, m, l.k, l.w.ptr(), l.n, l.bias(), out, out_dt),
+            Some(s) => self.nsd.int8_linear(x, Dt::F16, m, l.k, l.w.ptr(), l.n, s.ptr(), l.n, l.bias(), out, out_dt, GROUP),
+        }
+    }
+
+    /// A half layer as int8 ConvRot (`had`: the half Hadamard matrix [GROUP, GROUP]): its rows rotated along their
+    /// inputs on the GPU (W . H), then quantized a row at a time on the host (the largest magnitude to 127)
+    /// The bytes it saves (none when the layer stays half: its inputs not a multiple of the group)
+    pub fn to_int8(&self, l: &mut Lin, had: &DevBuf) -> Result<usize> {
+        if l.scale.is_some() || !l.k.is_multiple_of(GROUP) {
+            return Ok(0);
+        }
+        let (n, k) = (l.n, l.k);
+        let rot = DevBuf::new(&self.gpu, n * k * 4)?;
+        self.nsd.linear(l.w.ptr(), Dt::F16, n * k / GROUP, GROUP, had.ptr(), GROUP, none(), rot.ptr(), Dt::F32)?;
+        let v = read_f32(&rot, n * k)?;
+        drop(rot);
+        let mut q = vec![0i8; n * k];
+        let mut scale = vec![0f32; n];
+        let threads = std::thread::available_parallelism().map_or(8, |t| t.get());
+        let per = n.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for ((qs, ss), vs) in q.chunks_mut(per * k).zip(scale.chunks_mut(per)).zip(v.chunks(per * k)) {
+                sc.spawn(move || {
+                    for ((qr, s), vr) in qs.chunks_mut(k).zip(ss.iter_mut()).zip(vs.chunks(k)) {
+                        let m = vr.iter().fold(0f32, |a, x| a.max(x.abs()));
+                        *s = m / 127.0;
+                        let inv = if m > 0.0 { 127.0 / m } else { 0.0 };
+                        for (o, x) in qr.iter_mut().zip(vr) {
+                            *o = (x * inv).round().clamp(-127.0, 127.0) as i8;
+                        }
+                    }
+                });
+            }
+        });
+        let w = DevBuf::new(&self.gpu, n * k)?;
+        // SAFETY: i8s viewed as bytes.
+        w.write(0, unsafe { std::slice::from_raw_parts(q.as_ptr().cast::<u8>(), q.len()) })?;
+        l.w = w;
+        l.scale = Some(DevBuf::from_f32(&self.gpu, &scale)?);
+        Ok(n * k - n * 4)
+    }
+
+    /// The half Hadamard matrix of the int8 layers' rotation
+    pub fn hadamard(&self) -> Result<DevBuf> {
+        let h: Vec<u16> = hadamard(GROUP).into_iter().map(f32_to_f16).collect();
+        let b = DevBuf::new(&self.gpu, h.len() * 2)?;
+        // SAFETY: u16s viewed as bytes.
+        b.write(0, unsafe { std::slice::from_raw_parts(h.as_ptr().cast::<u8>(), h.len() * 2) })?;
+        Ok(b)
     }
 
     /// out [m, n] half += x [m, k] half . W^T (no bias)
@@ -221,6 +298,13 @@ impl Ops {
 
     /// out [m, c] = (layernorm(x) * w + b) * (1 + scale) + shift (each float32 [c] or null); x and out half or float32
     pub fn ln(&self, x: P, x_half: bool, m: usize, c: usize, eps: f32, w: P, b: P, scale: P, shift: P, out: M, out_half: bool) -> Result<()> {
+        if let Some(s) = self.silo {
+            // SAFETY: a pure check; then the same arguments as the engine's kernel.
+            if unsafe { (s.ln_supported)(c as i64) } != 0 {
+                return ffi::check(unsafe { (s.ln)(self.g(), x, x_half as i32, m as i64, c as i64, eps, w.cast(), b.cast(), scale.cast(), shift.cast(), out, out_half as i32) },
+                                  "layer norm (silo)");
+            }
+        }
         // SAFETY: the caller's buffers hold the sizes named.
         ffi::check(unsafe { (self.k.ln)(self.g(), x, x_half as i32, m as i64, c as i64, eps, w.cast(), b.cast(), scale.cast(), shift.cast(), out, out_half as i32) },
                    "layer norm")
@@ -246,6 +330,12 @@ impl Ops {
     }
     /// x float32 [m, c] += y (half or float32) * gate (float32 [c] or null)
     pub fn add(&self, x: M, y: P, y_half: bool, m: usize, c: usize, gate: P) -> Result<()> {
+        if let Some(s) = self.silo {
+            // SAFETY: a pure check; then the same arguments as the engine's kernel.
+            if unsafe { (s.add_supported)(m as i64, c as i64) } != 0 {
+                return ffi::check(unsafe { (s.add)(self.g(), x.cast(), y, y_half as i32, m as i64, c as i64, gate.cast()) }, "add (silo)");
+            }
+        }
         // SAFETY: the caller's buffers hold the sizes named.
         ffi::check(unsafe { (self.k.add)(self.g(), x.cast(), y, y_half as i32, m as i64, c as i64, gate.cast()) }, "add")
     }
@@ -279,15 +369,39 @@ impl Ops {
         // SAFETY: the caller's buffers hold the sizes named.
         ffi::check(unsafe { (self.k.scatter_add)(self.g(), y, idx.cast(), w.cast(), n as i64, c as i64, out.cast()) }, "scatter add")
     }
+    /// Floats of `group_norm`'s scratch for these shapes
+    pub fn group_norm_scratch(&self, f: usize, n: usize, c: usize, g: usize) -> usize {
+        match self.silo {
+            // SAFETY: pure functions of the shapes.
+            Some(s) if unsafe { (s.group_norm_supported)(f as i64, n as i64, c as i64, g as i64) } != 0 => {
+                unsafe { (s.group_norm_scratch)(f as i64, n as i64, c as i64, g as i64) as usize }.max(f * g * 2)
+            }
+            _ => f * g * 2,
+        }
+    }
+
     /// GroupNorm (G groups) of f frames of n pixels x c channels (half, channels last), SiLU after when `silu`;
-    /// `stats`: float32 scratch [f * g * 2]
+    /// `stats`: float32 scratch [group_norm_scratch(f, n, c, g)]
     pub fn group_norm(&self, x: P, f: usize, n: usize, c: usize, g: usize, w: P, b: P, eps: f32, silu: bool, stats: M, out: M) -> Result<()> {
+        if let Some(s) = self.silo {
+            // SAFETY: a pure check; then the engine kernel's arguments, the scratch sized by group_norm_scratch.
+            if unsafe { (s.group_norm_supported)(f as i64, n as i64, c as i64, g as i64) } != 0 {
+                return ffi::check(unsafe { (s.group_norm)(self.g(), x, f as i64, n as i64, c as i64, g as i64, w.cast(), b.cast(), eps, silu as i32, stats.cast(), out) },
+                                  "group norm (silo)");
+            }
+        }
         // SAFETY: the caller's buffers hold the sizes named.
         ffi::check(unsafe { (self.k.group_norm)(self.g(), x, f as i64, n as i64, c as i64, g as i64, w.cast(), b.cast(), eps, silu as i32, stats.cast(), out) },
                    "group norm")
     }
     /// out [m, f] = x[:, :f] * gelu(x[:, f:]), half
     pub fn geglu(&self, x: P, m: usize, f: usize, out: M) -> Result<()> {
+        if let Some(s) = self.silo {
+            // SAFETY: a pure check; then the same arguments as the engine's kernel.
+            if unsafe { (s.geglu_supported)(m as i64, f as i64) } != 0 {
+                return ffi::check(unsafe { (s.geglu)(self.g(), x, m as i64, f as i64, out) }, "geglu (silo)");
+            }
+        }
         // SAFETY: x holds [m, 2f], out [m, f].
         ffi::check(unsafe { (self.k.geglu)(self.g(), x, m as i64, f as i64, out) }, "geglu")
     }

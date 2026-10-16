@@ -77,6 +77,61 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
     .map_err(|e| nextsycl_core::Error(e.clone()))
 }
 
+/// The silo's kernels (kernels/model3d/hunyuan3d/silo/silo.h, dist/silo/libnextsycl-hunyuan3d.so)
+#[allow(clippy::type_complexity)]
+pub struct Silo {
+    pub path: std::path::PathBuf,
+    pub group_norm_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
+    pub group_norm_scratch: unsafe extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub group_norm: unsafe extern "C" fn(G, P, i64, i64, i64, i64, *const f32, *const f32, f32, c_int, *mut f32, M) -> c_int,
+    pub ln_supported: unsafe extern "C" fn(i64) -> c_int,
+    pub ln: unsafe extern "C" fn(G, P, c_int, i64, i64, f32, *const f32, *const f32, *const f32, *const f32, M, c_int) -> c_int,
+    pub geglu_supported: unsafe extern "C" fn(i64, i64) -> c_int,
+    pub geglu: unsafe extern "C" fn(G, P, i64, i64, M) -> c_int,
+    pub add_supported: unsafe extern "C" fn(i64, i64) -> c_int,
+    pub add: unsafe extern "C" fn(G, *mut f32, P, c_int, i64, i64, *const f32) -> c_int,
+}
+
+// SAFETY: function pointers into a library that stays loaded for the process.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+/// The silo (None: the engine's own kernels throughout - no file, or NS_SILO=0)
+pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
+    static S: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    S.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo("hunyuan3d").map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in silo.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo {
+            path: lib.path.clone(),
+            group_norm_supported: sym!("ns_model3d_hy_silo_group_norm_supported"),
+            group_norm_scratch: sym!("ns_model3d_hy_silo_group_norm_scratch"),
+            group_norm: sym!("ns_model3d_hy_silo_group_norm"),
+            ln_supported: sym!("ns_model3d_hy_silo_ln_supported"),
+            ln: sym!("ns_model3d_hy_silo_ln"),
+            geglu_supported: sym!("ns_model3d_hy_silo_geglu_supported"),
+            geglu: sym!("ns_model3d_hy_silo_geglu"),
+            add_supported: sym!("ns_model3d_hy_silo_add_supported"),
+            add: sym!("ns_model3d_hy_silo_add"),
+        }))
+    })
+    .as_ref()
+    .map(|s| s.as_ref())
+    .map_err(|e| nextsycl_core::Error(e.clone()))
+}
+
 /// A call's return code as a result (the reason from the library)
 pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
     if rc == 0 {
