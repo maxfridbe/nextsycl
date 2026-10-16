@@ -146,7 +146,7 @@ pub fn run(m: &HunyuanImage21, dir: &Path, stages: &[&str], log: &mut dyn FnMut(
         log(format!("dit: the {} steps' modulations in {:.0} ms", ts.len(), t0.elapsed().as_secs_f64() * 1e3));
         let (_, vec0) = read_npy(&dir.join("vec0.npy"))?;
         worst = worst.max(line("vec 0", &st.vec.to_f32()?[..dit::DIM], &vec0, log));
-        let br = [m.dit.branch(&m.nsd, &pos.text, hw)?];
+        let br = m.dit.batch(&m.nsd, &[&pos.text], hw)?;
         let mut taps: Vec<(String, Vec<f32>)> = Vec::new();
         let t0 = std::time::Instant::now();
         let v = m.dit.forward(&m.nsd, &st, 0, &br, &[&lat], &mut |name, buf, r0, rows| {
@@ -168,7 +168,7 @@ pub fn run(m: &HunyuanImage21, dir: &Path, stages: &[&str], log: &mut dyn FnMut(
         };
         let v0 = match &neg {
             Some((ne, c)) => {
-                let bn = [m.dit.branch(&m.nsd, &ne.text, hw)?];
+                let bn = m.dit.batch(&m.nsd, &[&ne.text], hw)?;
                 let vn = m.dit.forward(&m.nsd, &st, 0, &bn, &[&lat], &mut |_, _, _, _| Ok(()))?;
                 let (a, b) = (v[0].to_f32()?, vn[0].to_f32()?);
                 a.iter().zip(&b).map(|(p, n)| n + c * (p - n)).collect()

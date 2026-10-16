@@ -177,21 +177,41 @@ pub fn rope_table(h: usize, w: usize, text: usize) -> Vec<f32> {
     cs
 }
 
-/// One pass's inputs and working buffers: a branch of guidance (the prompt's, the negative's)
+/// A branch of guidance (the prompt's, the negative's): its rows in the batch's buffers
 pub struct Branch<'a> {
     pub text: &'a Text,
-    /// rows: n image, t text
+    /// rows: n image, t text, from row r0 of the batch
     n: usize,
     t: usize,
+    r0: usize,
+    /// the RoPE's table for its n + t rows
+    cs: DevBuf,
+}
+
+/// One pass's inputs and working buffers for every branch at once: each branch's rows [image | text] follow the
+/// previous branch's, so a product over every row (the single blocks', the image stream's as a batch) is one call
+pub struct Batch<'a> {
+    pub branches: Vec<Branch<'a>>,
+    /// every branch's rows
+    rows: usize,
     x: DevBuf,
     h: DevBuf,
     big: DevBuf,
     att: DevBuf,
     o: DevBuf,
     mlp: DevBuf,
-    cs: DevBuf,
-    /// the refiner's rows and buffers
+    /// the refiner's rows and buffers (one branch at a time)
     rx: DevBuf,
+}
+
+impl Batch<'_> {
+    /// the branches' image rows as a batch of the silo's products: (count, the rows between them), when they are evenly
+    /// spaced (one or two branches always are)
+    fn img_batch(&self) -> Option<(usize, usize)> {
+        let b = &self.branches;
+        let step = b.get(1).map_or(0, |x| x.r0 - b[0].r0);
+        b.windows(2).all(|w| w[1].r0 - w[0].r0 == step).then_some((b.len(), step))
+    }
 }
 
 fn hptr(b: &DevBuf, at: usize) -> *mut std::ffi::c_void {
@@ -447,43 +467,49 @@ impl Dit {
         Ok(Text { qx, c, tq, byt5, tb })
     }
 
-    /// A branch's buffers for an h x w latent grid and `text`
-    pub fn branch<'a>(&self, nsd: &Nsd, text: &'a Text, hw: (usize, usize)) -> Result<Branch<'a>> {
+    /// The buffers of one pass over every branch (`texts`: the prompt's, then the negative's) for an h x w latent grid
+    pub fn batch<'a>(&self, nsd: &Nsd, texts: &[&'a Text], hw: (usize, usize)) -> Result<Batch<'a>> {
         let gpu = &nsd.gpu;
         let n = hw.0 * hw.1;
-        let t = text.tokens();
-        let s = n + t;
-        if s > self.zeros.len / 4 {
-            return Err(Error(format!("{s} rows: at most {} here", self.zeros.len / 4)));
+        let mut branches = Vec::with_capacity(texts.len());
+        let mut rows = 0;
+        for text in texts {
+            let t = text.tokens();
+            branches.push(Branch { text, n, t, r0: rows, cs: DevBuf::from_f32(gpu, &rope_table(hw.0, hw.1, t))? });
+            rows += n + t;
+        }
+        if rows > self.zeros.len / 4 {
+            return Err(Error(format!("{rows} rows: at most {} here", self.zeros.len / 4)));
         }
         let wide = 3 * DIM + FFN;
-        Ok(Branch {
-            text,
-            n,
-            t,
-            x: DevBuf::f32(gpu, s * DIM)?,
-            h: DevBuf::new(gpu, s * DIM * 2)?,
-            big: DevBuf::new(gpu, s * wide * 2)?,
-            att: DevBuf::new(gpu, s * DIM * 2)?,
-            o: DevBuf::f32(gpu, s * DIM)?,
-            mlp: DevBuf::new(gpu, s * (DIM + FFN) * 2)?,
-            cs: DevBuf::from_f32(gpu, &rope_table(hw.0, hw.1, t))?,
-            rx: DevBuf::f32(gpu, text.tq * (3 * DIM + FFN + 3 * DIM))?,
+        let tq = texts.iter().map(|t| t.tq).max().unwrap_or(0);
+        // the mlp's buffer: the double blocks' fc1 outputs; without the silo also the single blocks' [att | gelu(mlp)]
+        let mlp = if self.silo { FFN } else { DIM + FFN };
+        Ok(Batch {
+            branches,
+            rows,
+            x: DevBuf::f32(gpu, rows * DIM)?,
+            h: DevBuf::new(gpu, rows * DIM * 2)?,
+            big: DevBuf::new(gpu, rows * wide * 2)?,
+            att: DevBuf::new(gpu, rows * DIM * 2)?,
+            o: DevBuf::f32(gpu, rows * DIM)?,
+            mlp: DevBuf::new(gpu, rows * mlp * 2)?,
+            rx: DevBuf::f32(gpu, tq * (3 * DIM + FFN + 3 * DIM))?,
         })
     }
 
-    /// The token refiner for step row `si` into the branch's text rows (after the glyph rows): x = input_embedder rows;
+    /// The token refiner for step row `si` into branch b's text rows (after the glyph rows): x = input_embedder rows;
     /// c = t_embedder(t) + c_embedder(mean); per block: gates from SiLU(c), x += gate_msa attn(LN1(x)), x += gate_mlp
     /// mlp(LN2(x)) (SiLU)
-    fn refine(&self, nsd: &Nsd, st: &Steps, si: usize, b: &Branch) -> Result<()> {
+    fn refine(&self, nsd: &Nsd, st: &Steps, si: usize, bt: &Batch, b: &Branch) -> Result<()> {
         let gpu = &nsd.gpu;
         let tq = b.text.tq;
-        let x = fptr(&b.x, (b.n + b.text.tb) * DIM);
+        let x = fptr(&bt.x, (b.r0 + b.n + b.text.tb) * DIM);
         // the glyph rows first (reorder_txt_token: [valid byT5 | valid Qwen])
         if let Some(by) = &b.text.byt5 {
-            b.x.copy_within(b.n * DIM * 4, by, 0, b.text.tb * DIM * 4)?;
+            bt.x.copy_within((b.r0 + b.n) * DIM * 4, by, 0, b.text.tb * DIM * 4)?;
         }
-        b.x.copy_within((b.n + b.text.tb) * DIM * 4, &b.text.qx, 0, tq * DIM * 4)?;
+        bt.x.copy_within((b.r0 + b.n + b.text.tb) * DIM * 4, &b.text.qx, 0, tq * DIM * 4)?;
         let c = DevBuf::f32(gpu, DIM)?;
         c.copy_within(0, &st.tref, si * DIM * 4, DIM * 4)?;
         self.k.axpy(c.fp(), b.text.c.fp(), DIM, 1.0)?;
@@ -493,10 +519,10 @@ impl Dit {
             nsd.linear(c.ptr(), Dt::F32, 1, DIM, w32(&rb.ada)?, 2 * DIM, bias(&rb.ada), fptr(&gates, i * 2 * DIM).cast(), Dt::F32)?;
         }
         // the refiner's buffers in rx: normed rows | qkv | mlp; attention output reuses the normed rows' space
-        let nrm = b.rx.fp();
-        let qkv = fptr(&b.rx, tq * DIM);
-        let mlp = fptr(&b.rx, tq * 4 * DIM);
-        let att = fptr(&b.rx, tq * (4 * DIM + FFN));
+        let nrm = bt.rx.fp();
+        let qkv = fptr(&bt.rx, tq * DIM);
+        let mlp = fptr(&bt.rx, tq * 4 * DIM);
+        let att = fptr(&bt.rx, tq * (4 * DIM + FFN));
         for (i, rb) in self.ref_blocks.iter().enumerate() {
             let gate = fptr(&gates, i * 2 * DIM);
             self.k.ln_mod(x, tq, DIM, EPS, rb.norm1.0.fp(), rb.norm1.1.fp(), std::ptr::null(), std::ptr::null(), nrm.cast(), T::F32)?;
@@ -514,181 +540,179 @@ impl Dit {
         Ok(())
     }
 
+    /// A double block's product for one stream on the silo: the image stream's rows of every branch as one batched
+    /// call (when evenly spaced), the text stream's a branch at a time. `x` / `out`: (buffer, its row width in
+    /// elements, its element size).
+    #[allow(clippy::too_many_arguments)]
+    fn stream_mm(&self, l: &Lin, bt: &Batch, img: bool, x: (&DevBuf, usize, usize), out: (&DevBuf, usize, usize), post: Post) -> Result<()> {
+        let at = |b: &DevBuf, row: usize, w: usize, size: usize| -> *mut std::ffi::c_void { b.ptr().cast::<u8>().wrapping_add(row * w * size).cast() };
+        if let (true, Some((count, step))) = (img, bt.img_batch()) {
+            let b0 = &bt.branches[0];
+            return l.mm(&self.k, at(x.0, b0.r0, x.1, x.2), x.1, b0.n, at(out.0, b0.r0, out.1, out.2), out.1, post, None, true,
+                        (count, step * x.1, step * out.1));
+        }
+        for b in &bt.branches {
+            let (r0, rows) = if img { (b.r0, b.n) } else { (b.r0 + b.n, b.t) };
+            l.mm(&self.k, at(x.0, r0, x.1, x.2), x.1, rows, at(out.0, r0, out.1, out.2), out.1, post, None, true, (1, 0, 0))?;
+        }
+        Ok(())
+    }
+
     /// The velocity of each branch's latents (`lats[i]`: float32 [n, 64]) at step row `si` of `st`: float32 [n, 64]
-    /// each. `tap(name, branch 0's buffer, rows)` sees the stages a check compares (refiner output, double block 0,
-    /// the double blocks' image rows).
-    pub fn forward(&self, nsd: &Nsd, st: &Steps, si: usize, branches: &[Branch], lats: &[&DevBuf],
+    /// each. `tap(name, buffer, first row, rows)` sees branch 0's stages a check compares (refiner output, double block
+    /// 0, the double blocks' image rows).
+    pub fn forward(&self, nsd: &Nsd, st: &Steps, si: usize, bt: &Batch, lats: &[&DevBuf],
                    tap: &mut dyn FnMut(&str, &DevBuf, usize, usize) -> Result<()>) -> Result<Vec<DevBuf>> {
         let k = &self.k;
         let sc = &self.scratch;
+        let branches = &bt.branches;
         if si >= st.n {
             return Err(Error(format!("step {si} of {}", st.n)));
         }
         for (b, lat) in branches.iter().zip(lats) {
-            nsd.linear(lat.ptr(), Dt::F32, b.n, LATENT, w32(&self.img_in)?, DIM, bias(&self.img_in), b.x.ptr(), Dt::F32)?;
-            self.refine(nsd, st, si, b)?;
+            nsd.linear(lat.ptr(), Dt::F32, b.n, LATENT, w32(&self.img_in)?, DIM, bias(&self.img_in), fptr(&bt.x, b.r0 * DIM).cast(), Dt::F32)?;
+            self.refine(nsd, st, si, bt, b)?;
         }
-        tap("txt0", &branches[0].x, branches[0].n + branches[0].text.tb, branches[0].text.tq)?;
+        let b0 = &branches[0];
+        tap("txt0", &bt.x, b0.r0 + b0.n + b0.text.tb, b0.text.tq)?;
         prof::mark(nsd, "embed + refiner")?;
         let z = self.zeros.ptr() as *const std::ffi::c_void;
         for (bi, d) in self.doubles.iter().enumerate() {
             let (mi, mt) = (&st.dbl[bi].0, &st.dbl[bi].1);
             // a stream's modulation chunk j (shift1, scale1, gate1, shift2, scale2, gate2) at step si
             let md = |m: &DevBuf, j: usize| -> *const f32 { fptr(m, si * 6 * DIM + j * DIM) };
-            // the streams' rows: image [0, n), text [n, n + t)
-            let parts = |b: &Branch| [(0usize, b.n), (b.n, b.t)];
+            // the streams' rows: image [r0, r0 + n), text [r0 + n, r0 + n + t)
+            let parts = |b: &Branch| [(b.r0, b.n), (b.r0 + b.n, b.t)];
             for b in branches {
                 for (s, (r0, rows)) in [(&d.img, mi), (&d.txt, mt)].iter().zip(parts(b)) {
                     let m = s.1;
-                    k.ln_mod(fptr(&b.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, 1), md(m, 0), hptr(&b.h, r0 * DIM), T::F16)?;
+                    k.ln_mod(fptr(&bt.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, 1), md(m, 0), hptr(&bt.h, r0 * DIM), T::F16)?;
                 }
             }
             prof::mark(nsd, "norm + modulate")?;
             for (si_, s) in [&d.img, &d.txt].iter().enumerate() {
                 if self.silo {
-                    for b in branches {
-                        let (r0, rows) = parts(b)[si_];
-                        s.qkv.mm(k, hptr(&b.h, r0 * DIM), DIM, rows, hptr(&b.big, r0 * 3 * DIM), 3 * DIM, Post::Half, None, true, (1, 0, 0))?;
-                    }
+                    self.stream_mm(&s.qkv, bt, si_ == 0, (&bt.h, DIM, 2), (&bt.big, 3 * DIM, 2), Post::Half)?;
                     continue;
                 }
                 let w = s.qkv.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
-                    s.qkv.gemm(nsd, k, w, hptr(&b.h, r0 * DIM), rows, hptr(&b.big, r0 * 3 * DIM), Dt::F16)?;
+                    s.qkv.gemm(nsd, k, w, hptr(&bt.h, r0 * DIM), rows, hptr(&bt.big, r0 * 3 * DIM), Dt::F16)?;
                 }
             }
             prof::mark(nsd, "qkv")?;
             for b in branches {
-                let s = b.n + b.t;
-                nsd.rms_rope(b.big.ptr(), Dt::F16, b.n, HEADS, HEAD, 3 * DIM, d.img.q_norm.ptr(), EPS, b.cs.ptr(), HEAD)?;
-                nsd.rms_rope(hptr(&b.big, DIM), Dt::F16, b.n, HEADS, HEAD, 3 * DIM, d.img.k_norm.ptr(), EPS, b.cs.ptr(), HEAD)?;
-                nsd.rms_rope(hptr(&b.big, b.n * 3 * DIM), Dt::F16, b.t, HEADS, HEAD, 3 * DIM, d.txt.q_norm.ptr(), EPS, b.cs.ptr(), 0)?;
-                nsd.rms_rope(hptr(&b.big, b.n * 3 * DIM + DIM), Dt::F16, b.t, HEADS, HEAD, 3 * DIM, d.txt.k_norm.ptr(), EPS, b.cs.ptr(), 0)?;
+                let (q, s) = (b.r0 * 3 * DIM, b.n + b.t);
+                nsd.rms_rope(hptr(&bt.big, q), Dt::F16, b.n, HEADS, HEAD, 3 * DIM, d.img.q_norm.ptr(), EPS, b.cs.ptr(), HEAD)?;
+                nsd.rms_rope(hptr(&bt.big, q + DIM), Dt::F16, b.n, HEADS, HEAD, 3 * DIM, d.img.k_norm.ptr(), EPS, b.cs.ptr(), HEAD)?;
+                nsd.rms_rope(hptr(&bt.big, q + b.n * 3 * DIM), Dt::F16, b.t, HEADS, HEAD, 3 * DIM, d.txt.q_norm.ptr(), EPS, b.cs.ptr(), 0)?;
+                nsd.rms_rope(hptr(&bt.big, q + b.n * 3 * DIM + DIM), Dt::F16, b.t, HEADS, HEAD, 3 * DIM, d.txt.k_norm.ptr(), EPS, b.cs.ptr(), 0)?;
                 prof::mark(nsd, "rms + rope")?;
-                nsd.attention_qk(b.big.ptr(), s, 3 * DIM, hptr(&b.big, DIM), hptr(&b.big, 2 * DIM), s, 3 * DIM, Dt::F16, HEADS, HEAD, b.att.ptr(), Dt::F16)?;
+                nsd.attention_qk(hptr(&bt.big, q), s, 3 * DIM, hptr(&bt.big, q + DIM), hptr(&bt.big, q + 2 * DIM), s, 3 * DIM, Dt::F16, HEADS, HEAD,
+                                 hptr(&bt.att, b.r0 * DIM), Dt::F16)?;
                 prof::mark(nsd, "attention")?;
             }
             for (si_, (s, m)) in [(&d.img, mi), (&d.txt, mt)].iter().enumerate() {
                 if self.silo {
+                    self.stream_mm(&s.proj, bt, si_ == 0, (&bt.att, DIM, 2), (&bt.x, DIM, 4), Post::Gate(md(m, 2)))?;
                     for b in branches {
                         let (r0, rows) = parts(b)[si_];
-                        s.proj.mm(k, hptr(&b.att, r0 * DIM), DIM, rows, fptr(&b.x, r0 * DIM).cast(), DIM, Post::Gate(md(m, 2)), None, true, (1, 0, 0))?;
-                        k.ln_mod(fptr(&b.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, 4), md(m, 3), hptr(&b.h, r0 * DIM), T::F16)?;
+                        k.ln_mod(fptr(&bt.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, 4), md(m, 3), hptr(&bt.h, r0 * DIM), T::F16)?;
                     }
                     continue;
                 }
                 let w = s.proj.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
-                    s.proj.gemm(nsd, k, w, hptr(&b.att, r0 * DIM), rows, fptr(&b.o, r0 * DIM).cast(), Dt::F32)?;
-                    nsd.gate_add(fptr(&b.x, r0 * DIM).cast(), Dt::F32, rows, DIM, fptr(&b.o, r0 * DIM).cast(), Dt::F32, z, md(m, 2).cast())?;
-                    k.ln_mod(fptr(&b.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, 4), md(m, 3), hptr(&b.h, r0 * DIM), T::F16)?;
+                    s.proj.gemm(nsd, k, w, hptr(&bt.att, r0 * DIM), rows, fptr(&bt.o, r0 * DIM).cast(), Dt::F32)?;
+                    nsd.gate_add(fptr(&bt.x, r0 * DIM).cast(), Dt::F32, rows, DIM, fptr(&bt.o, r0 * DIM).cast(), Dt::F32, z, md(m, 2).cast())?;
+                    k.ln_mod(fptr(&bt.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, 4), md(m, 3), hptr(&bt.h, r0 * DIM), T::F16)?;
                 }
             }
             prof::mark(nsd, "proj")?;
             for (si_, s) in [&d.img, &d.txt].iter().enumerate() {
                 if self.silo {
-                    for b in branches {
-                        let (r0, rows) = parts(b)[si_];
-                        s.fc1.mm(k, hptr(&b.h, r0 * DIM), DIM, rows, hptr(&b.mlp, r0 * FFN), FFN, Post::Gelu, None, true, (1, 0, 0))?;
-                    }
+                    self.stream_mm(&s.fc1, bt, si_ == 0, (&bt.h, DIM, 2), (&bt.mlp, FFN, 2), Post::Gelu)?;
                     continue;
                 }
                 let w = s.fc1.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
-                    s.fc1.gemm(nsd, k, w, hptr(&b.h, r0 * DIM), rows, hptr(&b.mlp, r0 * FFN), Dt::F16)?;
-                    k.act(hptr(&b.mlp, r0 * FFN), T::F16, rows * FFN, Act::GeluTanh)?;
+                    s.fc1.gemm(nsd, k, w, hptr(&bt.h, r0 * DIM), rows, hptr(&bt.mlp, r0 * FFN), Dt::F16)?;
+                    k.act(hptr(&bt.mlp, r0 * FFN), T::F16, rows * FFN, Act::GeluTanh)?;
                 }
             }
             prof::mark(nsd, "fc1")?;
             for (si_, (s, m)) in [(&d.img, mi), (&d.txt, mt)].iter().enumerate() {
                 if self.silo {
-                    for b in branches {
-                        let (r0, rows) = parts(b)[si_];
-                        s.fc2.mm(k, hptr(&b.mlp, r0 * FFN), FFN, rows, fptr(&b.x, r0 * DIM).cast(), DIM, Post::Gate(md(m, 5)), None, true, (1, 0, 0))?;
-                    }
+                    self.stream_mm(&s.fc2, bt, si_ == 0, (&bt.mlp, FFN, 2), (&bt.x, DIM, 4), Post::Gate(md(m, 5)))?;
                     continue;
                 }
                 let w = s.fc2.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
-                    s.fc2.gemm(nsd, k, w, hptr(&b.mlp, r0 * FFN), rows, fptr(&b.o, r0 * DIM).cast(), Dt::F32)?;
-                    nsd.gate_add(fptr(&b.x, r0 * DIM).cast(), Dt::F32, rows, DIM, fptr(&b.o, r0 * DIM).cast(), Dt::F32, z, md(m, 5).cast())?;
+                    s.fc2.gemm(nsd, k, w, hptr(&bt.mlp, r0 * FFN), rows, fptr(&bt.o, r0 * DIM).cast(), Dt::F32)?;
+                    nsd.gate_add(fptr(&bt.x, r0 * DIM).cast(), Dt::F32, rows, DIM, fptr(&bt.o, r0 * DIM).cast(), Dt::F32, z, md(m, 5).cast())?;
                 }
             }
             prof::mark(nsd, "fc2")?;
             if bi == 0 {
-                let b = &branches[0];
-                tap("dbl0_img", &b.x, 0, b.n)?;
-                tap("dbl0_txt", &b.x, b.n, b.t)?;
+                tap("dbl0_img", &bt.x, b0.r0, b0.n)?;
+                tap("dbl0_txt", &bt.x, b0.r0 + b0.n, b0.t)?;
             }
         }
-        tap("dbl_img", &branches[0].x, 0, branches[0].n)?;
+        tap("dbl_img", &bt.x, b0.r0, b0.n)?;
+        // the single blocks: every branch's rows at once, but for attention
         let wide = 3 * DIM + FFN;
+        let rows = bt.rows;
         for (i, s) in self.singles.iter().enumerate() {
             let m = &st.sgl[i];
             let md = |j: usize| -> *const f32 { fptr(m, si * 3 * DIM + j * DIM) };
-            for b in branches {
-                k.ln_mod(b.x.fp(), b.n + b.t, DIM, EPS, std::ptr::null(), std::ptr::null(), md(1), md(0), b.h.ptr(), T::F16)?;
-            }
+            k.ln_mod(bt.x.fp(), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(1), md(0), bt.h.ptr(), T::F16)?;
             prof::mark(nsd, "norm + modulate")?;
             if let (true, Some(l1m)) = (self.silo, &s.linear1_mlp) {
                 // q k v, then the mlp's columns with their GELU: [att | gelu(mlp)] needs no pass of its own
-                for b in branches {
-                    s.linear1.mm(k, b.h.ptr(), DIM, b.n + b.t, b.big.ptr(), wide, Post::Half, None, true, (1, 0, 0))?;
-                }
+                s.linear1.mm(k, bt.h.ptr(), DIM, rows, bt.big.ptr(), wide, Post::Half, None, true, (1, 0, 0))?;
                 prof::mark(nsd, "linear1")?;
-                for b in branches {
-                    l1m.mm(k, b.h.ptr(), DIM, b.n + b.t, hptr(&b.big, 3 * DIM), wide, Post::Gelu, None, true, (1, 0, 0))?;
-                }
+                l1m.mm(k, bt.h.ptr(), DIM, rows, hptr(&bt.big, 3 * DIM), wide, Post::Gelu, None, true, (1, 0, 0))?;
                 prof::mark(nsd, "linear1 mlp + gelu")?;
             } else {
                 let w = s.linear1.ready(nsd, k, sc)?;
-                for b in branches {
-                    s.linear1.gemm(nsd, k, w, b.h.ptr(), b.n + b.t, b.big.ptr(), Dt::F16)?;
-                }
+                s.linear1.gemm(nsd, k, w, bt.h.ptr(), rows, bt.big.ptr(), Dt::F16)?;
                 prof::mark(nsd, "linear1")?;
             }
             for b in branches {
-                let rows = b.n + b.t;
-                nsd.rms_rope(b.big.ptr(), Dt::F16, rows, HEADS, HEAD, wide, s.q_norm.ptr(), EPS, b.cs.ptr(), HEAD)?;
-                nsd.rms_rope(hptr(&b.big, DIM), Dt::F16, rows, HEADS, HEAD, wide, s.k_norm.ptr(), EPS, b.cs.ptr(), HEAD)?;
+                let (q, s_) = (b.r0 * wide, b.n + b.t);
+                nsd.rms_rope(hptr(&bt.big, q), Dt::F16, s_, HEADS, HEAD, wide, s.q_norm.ptr(), EPS, b.cs.ptr(), HEAD)?;
+                nsd.rms_rope(hptr(&bt.big, q + DIM), Dt::F16, s_, HEADS, HEAD, wide, s.k_norm.ptr(), EPS, b.cs.ptr(), HEAD)?;
                 prof::mark(nsd, "rms + rope")?;
-                nsd.attention_qk(b.big.ptr(), rows, wide, hptr(&b.big, DIM), hptr(&b.big, 2 * DIM), rows, wide, Dt::F16, HEADS, HEAD, b.att.ptr(), Dt::F16)?;
+                nsd.attention_qk(hptr(&bt.big, q), s_, wide, hptr(&bt.big, q + DIM), hptr(&bt.big, q + 2 * DIM), s_, wide, Dt::F16, HEADS, HEAD,
+                                 hptr(&bt.att, b.r0 * DIM), Dt::F16)?;
                 prof::mark(nsd, "attention")?;
-                if !self.silo {
-                    k.cat_gelu(b.att.ptr(), rows, DIM, hptr(&b.big, 3 * DIM), wide, FFN, b.mlp.ptr())?;
-                    prof::mark(nsd, "concat + gelu")?;
-                }
             }
             if self.silo {
                 // linear2 over [att | gelu(mlp)] as two products into the residual: its first DIM columns on the
                 // attention's rows, the rest on linear1's GELU columns where they are
-                for b in branches {
-                    let rows = b.n + b.t;
-                    s.linear2.mm(k, b.att.ptr(), DIM, rows, b.x.ptr(), DIM, Post::Gate(md(2)), Some((0, DIM)), true, (1, 0, 0))?;
-                    s.linear2.mm(k, hptr(&b.big, 3 * DIM), wide, rows, b.x.ptr(), DIM, Post::Gate(md(2)), Some((DIM, FFN)), false, (1, 0, 0))?;
-                }
+                s.linear2.mm(k, bt.att.ptr(), DIM, rows, bt.x.ptr(), DIM, Post::Gate(md(2)), Some((0, DIM)), true, (1, 0, 0))?;
+                s.linear2.mm(k, hptr(&bt.big, 3 * DIM), wide, rows, bt.x.ptr(), DIM, Post::Gate(md(2)), Some((DIM, FFN)), false, (1, 0, 0))?;
                 prof::mark(nsd, "linear2")?;
                 continue;
             }
+            k.cat_gelu(bt.att.ptr(), rows, DIM, hptr(&bt.big, 3 * DIM), wide, FFN, bt.mlp.ptr())?;
+            prof::mark(nsd, "concat + gelu")?;
             let w = s.linear2.ready(nsd, k, sc)?;
-            for b in branches {
-                let rows = b.n + b.t;
-                s.linear2.gemm(nsd, k, w, b.mlp.ptr(), rows, b.o.ptr(), Dt::F32)?;
-                nsd.gate_add(b.x.ptr(), Dt::F32, rows, DIM, b.o.ptr(), Dt::F32, z, md(2).cast())?;
-            }
+            s.linear2.gemm(nsd, k, w, bt.mlp.ptr(), rows, bt.o.ptr(), Dt::F32)?;
+            nsd.gate_add(bt.x.ptr(), Dt::F32, rows, DIM, bt.o.ptr(), Dt::F32, z, md(2).cast())?;
             prof::mark(nsd, "linear2")?;
         }
         let mut out = Vec::with_capacity(branches.len());
         for b in branches {
             // the final layer: shift, scale; then the linear to 64 channels (float32)
-            k.ln_mod(b.x.fp(), b.n, DIM, EPS, std::ptr::null(), std::ptr::null(), fptr(&st.fin, si * 2 * DIM + DIM), fptr(&st.fin, si * 2 * DIM),
-                     b.o.ptr(), T::F32)?;
+            k.ln_mod(fptr(&bt.x, b.r0 * DIM), b.n, DIM, EPS, std::ptr::null(), std::ptr::null(), fptr(&st.fin, si * 2 * DIM + DIM), fptr(&st.fin, si * 2 * DIM),
+                     fptr(&bt.o, b.r0 * DIM).cast(), T::F32)?;
             let v = DevBuf::f32(&nsd.gpu, b.n * LATENT)?;
-            nsd.linear(b.o.ptr(), Dt::F32, b.n, DIM, w32(&self.final_lin)?, LATENT, bias(&self.final_lin), v.ptr(), Dt::F32)?;
+            nsd.linear(fptr(&bt.o, b.r0 * DIM).cast(), Dt::F32, b.n, DIM, w32(&self.final_lin)?, LATENT, bias(&self.final_lin), v.ptr(), Dt::F32)?;
             out.push(v);
         }
         nsd.wait()?;
