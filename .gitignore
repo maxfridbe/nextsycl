@@ -5,3 +5,4 @@ nextsycl.conf
 dist/
 benchy-results/
 wfe/build/
+.claude/
