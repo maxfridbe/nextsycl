@@ -28,6 +28,8 @@ for a chat model. Measured speeds, decode / prompt reading:
 | `deepseek-r1-iq1s` | **DeepSeek-R1 671B** (unsloth UD-IQ1_S, 131 GiB) - the experts that do not fit VRAM in pinned RAM (multiplied on the CPU) and on the NVMe | ~8 tok/s / ~135 tok/s, 32K context |
 | `glm-5.3-flash-uncensored-256k` | **GLM-5.3-Flash** uncensored IQ2 | ~18 tok/s / 450-1,100 tok/s, to 256K |
 | `deepseek-v4-flash-iq2m`, `-256k` | **DeepSeek-V4-Flash 284B** (unsloth UD-IQ2_M, 84.7 GiB) - the experts beyond VRAM in pinned RAM; llama.cpp pages it from the disk (no result in 100 minutes) | ~27 tok/s with its MTP draft block (26 at 3.7K, 17 at 256K) / 635-1,000 tok/s (943 at 256K), 128K or 256K context (1M tested: 287 tok/s prompt, 12 tok/s decode) |
+| `nemotron-3.5-super-q2kxl` | **Nemotron 3.5 Super 120B-A12B** (unsloth UD-Q2_K_XL; hybrid Mamba-2 / latent MoE / attention; text only; port in progress, not yet on the server) | ~43 tok/s with its MTP drafts (30 without) / ~690-1,070 tok/s, 32K (128K tested: 844 / 32) |
+| `nemotron-3.5-super-iq1m` | **Nemotron 3.5 Super** UD-IQ1_M (the same; or on the B70 alone, experts in pinned RAM: ~21 tok/s / ~350 tok/s at 2K) | ~48 tok/s with MTP (32 without) / ~700-1,200 tok/s, 32K (128K tested: 807 / 34) |
 
 **On one 32 GB card** (measured on an Arc Pro B70):
 
@@ -89,6 +91,8 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `glm-5.3-flash-uncensored`, `-128k`, `-256k` | GLM-5.3-Flash uncensored IQ2, 64K / 128K / 256K context | `glm5next` | 89.9 GiB | checked (llama.cpp), served on both cards |
 | `deepseek-r1-iq1s` | DeepSeek-R1 671B UD-IQ1_S, 32K: experts in VRAM, pinned RAM (on the CPU) and the NVMe | `deepseek2` | 130.6 GiB | checked (llama.cpp), served on both cards |
 | `deepseek-v4-flash-iq2m`, `-256k` | DeepSeek-V4-Flash 284B UD-IQ2_M, 128K / 256K + 32K: sliding window + compressed attention (CSA / HCA, the lightning indexer), mHC, experts in VRAM and pinned RAM, MTP drafts (the original checkpoint's draft block, converted after the pull); a needle found at 35K, 140K, 261K and 1,071,766 tokens | `deepseek4` | 88.3 GiB | checked (llama.cpp), served on both cards |
+| `nemotron-3.5-super-q2kxl` | NVIDIA Nemotron 3.5 Super 120B-A12B UD-Q2_K_XL (40 Mamba-2, 40 latent-MoE, 8 attention layers; 512 experts, 22 a token), 32K, MTP drafts; text only (the vision tower not yet) | `nemotronh` | 56 GiB | checked (llama.cpp) |
+| `nemotron-3.5-super-iq1m` | the same, UD-IQ1_M: both GPUs, or the B70 alone with the experts that do not fit in pinned host memory | `nemotronh` | 43 GiB | checked (llama.cpp) |
 | `qwen3.8-flash-next-iq2_xs` | Qwen3.8-Flash-Next IQ2_XS | `qwen4exp` | 63.4 GiB | served (verify passes and batches exact) |
 | `qwen3.8-flash-next-iq2_xs-uncensored` | the same with the refusal projection (a control vector) | `qwen4exp` | 63.4 GiB | served |
 | `qwen3.8-flash-next-coder-iq1_m`, `-uncensored` | Qwen3.8-Flash-Next Coder IQ1_M | `qwen4exp` | 54.4 GiB | served |
@@ -857,6 +861,41 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   kernel on the device against the card's ceilings. Sessions check their cache against the free VRAM before
   allocating (1.5 GiB spare).
 - Not yet: pictures (the vision tower: `mmproj`).
+
+### Nemotron 3.5 Super (hybrid Mamba-2 / latent MoE)
+
+`nemotronh` (`llm/nemotronh`, `kernels/llm/nemotronh`, its silo `kernels/llm/nemotronh/silo`): NVIDIA's
+Nemotron-H MoE as llama.cpp's `nemotron_h_moe` graph has it - 88 layers: 40 Mamba-2 mixers (conv 4, 128 heads of 64,
+8 groups, state 128, a SiLU-gated group norm), 40 latent MoE layers (a float32 sigmoid router with a selection bias,
+22 of 512 experts, the experts in a 1,024-wide latent with ReLU-squared, a shared expert on the full width) and 8
+attention layers without positions (32 / 2 heads of 128); its MTP block drafts. Work in progress: not yet on the
+server, text only.
+
+- **Checked** against llama.cpp (CPU, the same files, `llm check`): the same next token, the output logits cosine
+  0.99998 (Q2_K_XL) / 0.99999 (IQ1_M); verify rows the one-token decode's (`spec-check`: 0 of 66 flips).
+- **Decode**: the silo routes on the GPU and multiplies all of a layer's chosen experts in one launch per projection
+  (the 2,688-wide downs repacked into aligned rows); the dense matrices (Q6_K Mamba projections, K-quant shared
+  experts) through the silo's own decode products (the qwen35 silo's, copied, with a Q6_K kernel: ~520 GB/s on the
+  B70), one quantize feeding both activation layouts. MTP drafts 2 a step (`NS_NH_DRAFTS`), the Mamba states
+  snapshotted for the verify's rollback.
+- **Prompts**: chunks of 2,048 rows when they fit; dense matrices expanded to half for the GEMM, the experts grouped by
+  expert after a GPU routing pass and each expanded then multiplied; flash attention on XMX; on two cards the layers
+  split by measured speed (`NS_NH_SPEED`), the GPUs pipelined over the chunks.
+- **One card**: `--gpu 0` keeps the MoE layers' experts that do not fit in pinned host memory and gathers the chosen
+  ones into VRAM before each product (`NS_NH_HOST`).
+- **Speed** (2026-10-15, prompt read / decode tokens/s, MTP on; context sweeps from the earlier commits, the 2K-128K
+  prompts of benchy v1):
+
+  | File, GPUs | 20 | 2K | 8K | 40K | 128K |
+  |---|---:|---:|---:|---:|---:|
+  | UD-Q2_K_XL, B65 + B70 | - / 43.2 | 687 / 37.0 | 1,061 / 41.6 | 1,072 / 36.8 | 844 / 32.4 |
+  | UD-IQ1_M, B65 + B70 | - / 47.7 | 702 / 41.6 | 1,204 / 42.7 | 1,013 / 37.9 | 807 / 34.2 |
+  | UD-IQ1_M, B70 alone (host-memory experts) | | 347 / 21.4 | | | |
+
+  The B70-alone longer contexts are not yet re-measured since the gather (before it: 8K 107, 128K 119 tok/s
+  prompt). Without drafts: Q2_K_XL 30.0, IQ1_M 31.8 tok/s. Strata on the same B70 reads ~880 (2K) / 1,400 (8K) and decodes
+  ~30. Open: the expert up products (IQ3_XXS / IQ2_S / IQ1_S at ~150 GB/s on the B70, a third of the dense ones -
+  neither the grid lookups nor the index math; `NS_NH_PROFILE=1` times every kernel), the vision tower.
 
 ## Speed by model
 

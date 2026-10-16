@@ -339,6 +339,12 @@ impl Decoder {
     }
 }
 
+/// Decode rows quantized: their Q8_1 blocks (the shared mmvq's) and, with the silo, the split layout (its products')
+struct Q8 {
+    std: DevBuf,
+    split: Option<DevBuf>,
+}
+
 /// One GPU's share: its layers [lb, le) and a pass's work memory
 struct Dev {
     gpu: Arc<Gpu>,
@@ -378,6 +384,8 @@ pub struct NemotronH<'g> {
     k: &'static ffi::Api,
     /// the silo (kernels/llm/nemotronh/silo): a MoE layer's routing and experts in a few launches; None: the host's
     silo: Option<&'static ffi::Silo>,
+    /// the silo's dense decode products (NS_NH_DENSE=0: the shared mmvq)
+    dense: bool,
     layers: Vec<Layer>,
     output_norm: DevBuf,
     output: Mat,
@@ -708,6 +716,7 @@ impl<'g> NemotronH<'g> {
                     }));
         Ok(NemotronH { g, file: f, devs, layer_dev, staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, work: Mutex::new(()), chunk, mtp, drafts,
                        snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(),
+                       dense: std::env::var("NS_NH_DENSE").map_or(true, |v| v != "0"),
                        prof: std::env::var("NS_NH_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get() })
     }
 
@@ -763,18 +772,25 @@ impl<'g> NemotronH<'g> {
         self.dev().gpu.raw()
     }
 
-    /// x [t, cols] -> its Q8_1 blocks (column j at j * cols / 32 blocks)
-    fn quantize(&self, x: *const f32, cols: usize, t: usize) -> Result<DevBuf> {
+    /// x [t, cols] -> its Q8_1 blocks (column j at j * cols / 32 blocks) and, with the silo, the split layout its
+    /// dense products read - one launch for both
+    fn quantize(&self, x: *const f32, cols: usize, t: usize) -> Result<Q8> {
         // SAFETY: arithmetic only.
         let q8 = unsafe { (self.k.q8_1_bytes)(cols as i64, t as i64) };
         let q = self.arena().bytes(q8)?;
+        if let Some(s) = self.silo.filter(|_| self.dense) {
+            // SAFETY: arithmetic only; then x [t, cols] -> both layouts.
+            let sp = self.arena().bytes(unsafe { (s.q8_bytes)(cols as i64, t as i64) })?;
+            self.op("quantize", || unsafe { (s.dense_quantize)(self.raw(), x, q.ptr(), sp.ptr(), cols as i64, t as i64) })?;
+            return Ok(Q8 { std: q, split: Some(sp) });
+        }
         // SAFETY: x [t, cols] float32 -> its Q8_1 blocks.
         self.op("quantize", || unsafe { (self.k.quantize_q8_1)(self.raw(), x, q.ptr(), cols as i64, t as i64) })?;
-        Ok(q)
+        Ok(Q8 { std: q, split: None })
     }
 
-    /// y [t, w.rows] = x [t, w.cols] . W^T (`xq`: x's Q8_1 blocks when made already)
-    fn matmul(&self, w: &Mat, x: &DevBuf, xq: Option<&DevBuf>, t: usize, y: &DevBuf) -> Result<()> {
+    /// y [t, w.rows] = x [t, w.cols] . W^T (`xq`: x quantized when done already)
+    fn matmul(&self, w: &Mat, x: &DevBuf, xq: Option<&Q8>, t: usize, y: &DevBuf) -> Result<()> {
         let k = self.k;
         let (n, kk) = (w.rows as i64, w.cols as i64);
         if w.ty == GType::F32 {
@@ -792,9 +808,18 @@ impl<'g> NemotronH<'g> {
                 &own
             }
         };
+        // the silo's dense products (split activations, 16-byte loads) for the types it has, else the shared mmvq
+        // SAFETY: arithmetic only.
+        if let (Some(s), Some(sp)) = (self.silo, q.split.as_ref()) {
+            if unsafe { (s.dense_supported)(w.ty.code() as c_int, kk) } != 0 {
+                let name = if self.prof.is_some() { format!("dense {} {}x{} t{t}", w.ty.name(), w.rows, w.cols) } else { String::new() };
+                // SAFETY: the matrix in its blocks, x's split layout, y [t, rows].
+                return self.op(&name, || unsafe { (s.dense)(self.raw(), w.ty.code() as c_int, w.buf.ptr(), sp.ptr(), y.fp(), kk, n, t as i64) });
+            }
+        }
         let name = if self.prof.is_some() { format!("mmvq {} {}x{} t{t}", w.ty.name(), w.rows, w.cols) } else { String::new() };
         // SAFETY: the matrix in its blocks, x's Q8_1 blocks, y [t, rows].
-        self.op(&name, || unsafe { (k.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), q.ptr(), y.fp(), kk, n, t as i64) })
+        self.op(&name, || unsafe { (k.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), q.std.ptr(), y.fp(), kk, n, t as i64) })
     }
 
     /// The prompt pass's product: the matrix expanded to half (its type's own expansion, Q6_K's from this engine's
@@ -962,7 +987,7 @@ impl<'g> NemotronH<'g> {
         for (j, (r, x, _)) in ent.iter().enumerate() {
             // SAFETY: expert x's up [n_ff, latent] in its blocks, token r's latent Q8_1, its row of u.
             self.op("expert up", || unsafe {
-                (k.mmvq)(self.raw(), m.up.ty.code() as i32, m.up.buf.ptr().cast::<u8>().add(x * m.up.stride).cast(), latq.ptr().cast::<u8>().add(r * lq).cast(),
+                (k.mmvq)(self.raw(), m.up.ty.code() as i32, m.up.buf.ptr().cast::<u8>().add(x * m.up.stride).cast(), latq.std.ptr().cast::<u8>().add(r * lq).cast(),
                          u.fp().add(j * g.n_ff_exp), g.latent as i64, g.n_ff_exp as i64, 1)
             })?;
         }
@@ -974,7 +999,7 @@ impl<'g> NemotronH<'g> {
             // SAFETY: expert x's down [latent, n_ff] in its blocks, entry j's Q8_1, its row of dn.
             self.op("expert down", || unsafe {
                 (k.mmvq)(self.raw(), m.down.ty.code() as i32, m.down.buf.ptr().cast::<u8>().add(x * m.down.stride).cast(),
-                         uq8.ptr().cast::<u8>().add(j * uq).cast(), dn.fp().add(j * g.latent), g.n_ff_exp as i64, g.latent as i64, 1)
+                         uq8.std.ptr().cast::<u8>().add(j * uq).cast(), dn.fp().add(j * g.latent), g.n_ff_exp as i64, g.latent as i64, 1)
             })?;
         }
         // the weighted sum per token (entries in token order)
@@ -1154,7 +1179,7 @@ impl<'g> NemotronH<'g> {
 
     /// A MoE layer after its routed experts: the latent sum projected back, plus the shared expert
     #[allow(clippy::too_many_arguments)]
-    fn moe_tail(&self, m: &Moe, mo: DevBuf, h: &DevBuf, hq8: Option<&DevBuf>, t: usize, tap: Tap, l: usize) -> Result<DevBuf> {
+    fn moe_tail(&self, m: &Moe, mo: DevBuf, h: &DevBuf, hq8: Option<&Q8>, t: usize, tap: Tap, l: usize) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         tap(&format!("ffn_moe_out-{l}"), &mo)?;
         let out = self.arena().f32(t * g.n_embd)?;

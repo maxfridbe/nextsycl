@@ -43,6 +43,12 @@ int ns_nhs_gather(ns_gpu* g, const void* src, int64_t stride, const int32_t* ids
 int ns_nhs_multi(ns_gpu* g, int type, const void* base, int64_t stride, const int32_t* ids, const int32_t* cols, int64_t entries, const void* xs,
                  int64_t ncols, float* y, int64_t n_in, int64_t n_out);
 
+/* dense.cpp: the dense matrices' decode products (the qwen35 silo's, copied, Q6_K added): x [ncols, n_in] -> its
+ * Q8_1 blocks (nullable) and the split layout in one launch; whether a type at a width is taken; y [ncols, n_out] =
+ * W [n_out, n_in] . x for 1..8 columns from the split layout */
+int ns_nhs_dense_quantize(ns_gpu* g, const float* x, void* q8_1, void* xs, int64_t n_in, int64_t ncols);
+int ns_nhs_dense_supported(int type, int64_t n_in);
+int ns_nhs_dense(ns_gpu* g, int type, const void* w, const void* x_split, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 /* attn.cpp: flash attention on XMX (the qwen35 silo's, copied) - head 128, 16 query heads a key head, no positions,
  * against the half cache [Hkv][cap][128]: prompt rows (more than 8) and decode rows (1..8: the keys split, merged after;
  * scratch floats as ns_nhs_attn_decode_scratch says) */
