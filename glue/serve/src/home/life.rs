@@ -65,6 +65,14 @@ fn one_card(m: &Value) -> bool {
     matches!(registry::kind_of(m), "image" | "audio" | "model3d")
 }
 
+/// A chat model whose model card spreads one copy over every card (`gpus: all`; its title says "both GPUs"): it
+/// does not fit on fewer, so its cards are not a choice (an image or audio model's `all` is where its copies may go)
+pub(crate) fn spans_all(m: &Value, model_cards: &[Value]) -> bool {
+    registry::kind_of(m) == "llm"
+        && model_cards.iter().find(|c| [s(m, "catalog"), s(m, "id")].iter().any(|id| !id.is_empty() && c["id"] == id.as_str()))
+            .is_some_and(|c| s(c, "gpus") == "all")
+}
+
 /// The cards processes of model `id` hold memory on, in the named cards
 fn held_on(cards: &Value, id: &str) -> Vec<usize> {
     cards.as_array().into_iter().flatten().filter(|c| c["procs"].as_array().into_iter().flatten().any(|p| p["model_id"] == id))
@@ -428,7 +436,8 @@ impl Home {
         let slots_of = |k: &str| -> &Vec<Slot> { match k { "image" => &image, "audio" => &audio, _ => &m3d } };
         let video = if need("video") { self.video_daemon() } else { None };
         // the model cards, read once: for the headroom of entries registered before cards carried it
-        let mc = if all.iter().all(|m| m.get("headroom_gib").is_some()) { Vec::new() } else { self.o.cfg.cards() };
+        // and whether a chat model spans every card
+        let mc = if all.iter().all(|m| m.get("headroom_gib").is_some()) && !need("llm") { Vec::new() } else { self.o.cfg.cards() };
         all.iter().filter(|m| registry::kind_of(m) != "lora").map(|m| {
             let (id, kind) = (s(m, "id"), registry::kind_of(m).to_string());
             let enabled = m["enabled"] != false;
@@ -471,6 +480,7 @@ impl Home {
             }
             let (caps, methods) = capabilities(m);
             json!({"id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "state": state,
+                   "spans": spans_all(m, &mc),
                    "capabilities": caps, "methods": methods,
                    "vouch_mb": vouch.iter().map(|(g, mb)| (g.to_string(), json!(mb))).collect::<serde_json::Map<String, Value>>(),
                    "measured": measured,
@@ -560,10 +570,13 @@ impl Home {
             return Err((400, format!("gpus {g:?}: one or more of 0..{}", n - 1)));
         }
         let kind = registry::kind_of(&m).to_string();
-        let old = self.gpus_of(&m);
         let mut g = g;
         g.sort();
         g.dedup();
+        if g.len() < n && spans_all(&m, &self.o.cfg.cards()) {
+            return Err((400, format!("{id} is spread over every card (its model card: gpus all): it does not run on fewer")));
+        }
+        let old = self.gpus_of(&m);
         if old == g {
             return Ok(json!({"model": id, "gpus": g, "changed": false}));
         }
@@ -1116,5 +1129,26 @@ impl Home {
             args.extend(["--gpu".into(), g.to_string()]);
         }
         self.exec(format!("video start ({})", want.join(", ")), &args).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_chat_model_split_over_every_card_has_no_choice_of_cards() {
+        let cards = vec![
+            json!({"id": "glm-5.3-flash-uncensored", "kind": "llm", "gpus": "all"}),
+            json!({"id": "qwen3.8-27b-q8", "kind": "llm", "gpus": "0"}),
+            json!({"id": "breeze-tts-2", "kind": "audio", "gpus": "all"}),
+        ];
+        // the registry entry may say one card (set before): the model card decides
+        assert!(spans_all(&json!({"id": "glm-5.3-flash-uncensored", "kind": "llm", "gpus": "0"}), &cards));
+        // a variant registered under its own id, its card named by `catalog`
+        assert!(spans_all(&json!({"id": "glm-128k", "catalog": "glm-5.3-flash-uncensored", "kind": "llm"}), &cards));
+        assert!(!spans_all(&json!({"id": "qwen3.8-27b-q8", "kind": "llm"}), &cards), "a one-card chat model");
+        assert!(!spans_all(&json!({"id": "breeze-tts-2", "kind": "audio"}), &cards), "an audio model's all is where its copies may go");
+        assert!(!spans_all(&json!({"id": "my-own", "kind": "llm", "gpus": "all"}), &cards), "no model card: a choice");
     }
 }

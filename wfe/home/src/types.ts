@@ -46,6 +46,8 @@ export interface Model {
   arch: string | null;
   enabled: boolean;
   gpus: number[];
+  /** a chat model spread over every card (its model card: gpus all): its cards are not a choice */
+  spans?: boolean;
   state: ModelState;
   vouch_mb: Record<string, number>;
   /** of vouch_mb, the headroom (Vouched) */

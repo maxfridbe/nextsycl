@@ -111,12 +111,15 @@ function GpuPicker(m: Model) {
   // an enabled model's cards are its own (changed at once); a disabled one's are what enable will offer
   const pick = m.enabled ? m.gpus : (ui.pick[m.id] ??= [...m.gpus]);
   const loaded = ["loaded", "busy", "loading"].includes(m.state);
+  // one copy spread over every card: there is nothing to choose
+  const fixed = !!m.spans;
   return (
-    <span class="gpus" attrs={{ title: (m.kind === "image" || m.kind === "audio" ? "the cards it may load on (the first with room)" : "the cards it may use")
+    <span class="gpus" attrs={{ title: fixed ? "spread over every card: it does not run on fewer"
+      : (m.kind === "image" || m.kind === "audio" ? "the cards it may load on (the first with room)" : "the cards it may use")
       + (m.enabled ? " - click to change (more than fit is allowed; a loaded model moved off its card unloads)" : "") }}>
       {cards.map((c) => (
-        <label class={{ gpu: true, on: pick.includes(c.index) }}>
-          <input attrs={{ type: "checkbox", name: `g-${m.id}`, disabled: !!ui.pending[m.id] }} props={{ checked: pick.includes(c.index) }}
+        <label class={{ gpu: true, on: fixed || pick.includes(c.index), fixed }}>
+          <input attrs={{ type: "checkbox", name: `g-${m.id}`, disabled: fixed || !!ui.pending[m.id] }} props={{ checked: fixed || pick.includes(c.index) }}
             on={{ change: (e: Event) => {
               const on = (e.target as HTMLInputElement).checked;
               const next = on ? [...new Set([...pick, c.index])].sort() : pick.filter((g) => g !== c.index);

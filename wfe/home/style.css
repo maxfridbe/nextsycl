@@ -59,7 +59,7 @@
  .tag.loaded{background:#064e3b;color:#a7f3d0} .tag.busy,.tag.loading{background:#78350f;color:#fde68a} .tag.disabled{background:#111827;color:#6b7280}
  .acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;align-items:center}
  .gpus{display:inline-flex;gap:4px} .gpu{font-size:11px;border:1px solid #2f3646;border-radius:6px;padding:3px 6px;color:#9ca3af;cursor:pointer;display:inline-flex;gap:4px;align-items:center}
- .gpu.on{border-color:#3b82f6;color:#e5e7eb} .gpu input{margin:0}
+ .gpu.on{border-color:#3b82f6;color:#e5e7eb} .gpu input{margin:0} .gpu.fixed{cursor:default;opacity:.75}
  .onoff{display:inline-flex;gap:4px;align-items:center} .onoff label{font-size:11px;border:1px solid #2f3646;border-radius:6px;padding:3px 6px;color:#9ca3af;cursor:pointer;display:inline-flex;gap:4px;align-items:center}
  .onoff label.on{border-color:#3b82f6;color:#e5e7eb} .onoff input{margin:0}
  .spin{display:inline-block;width:11px;height:11px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:sp .8s linear infinite;margin-right:6px;vertical-align:-1px}
