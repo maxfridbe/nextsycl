@@ -46,7 +46,9 @@ for a chat model. Measured speeds, decode / prompt reading:
 | `unlimited-ocr-q8`, `-q4` | **Unlimited-OCR** pictures and PDFs to Markdown (tables as HTML, boxes), its own page | a page: ~2-3 s to see, ~130 tok/s written |
 | `paddleocr-vl-1.6` | **PaddleOCR-VL** text, tables (HTML), formulas (LaTeX), charts, seals, spotting; the same OCR page | a page: ~1.2 s to see, ~200-250 tok/s written |
 | `olmocr-2-7b-q8` | **olmOCR-2** whole pages to Markdown (tables HTML, equations LaTeX), turned pages righted; the same OCR page | a page: ~3 s to see, ~55 tok/s written |
+| `unirig` | **UniRig** a skeleton and skin weights for any mesh (`model3d.rig`) | a 7.6K-vertex humanoid: 6-8 s |
 | `rignet` | **RigNet** a skeleton and skin weights for a character mesh (`model3d.rig`); its own crate, **GPLv3** as RigNet's code | a 7.6K-vertex humanoid: 2.3 s |
+| `animateanymesh` | **AnimateAnyMesh** a mesh set in motion by a sentence, as morph targets (`model3d.rig` with a prompt) | a 7.6K-vertex humanoid, 16 frames: 3.7 s |
 | `minimax-h3` | **MiniMax H3** video with sound | 896x672, 4.5 s: ~90 s |
 | `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |
 | `qwen3-tts-custom` | **Qwen3-TTS** speech | 33 s of speech: 7.7 s |
@@ -158,6 +160,8 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | id | model | engine | size | status |
 |---|---|---|---|---|
 | `animateanymesh` | AnimateAnyMesh: a mesh set in motion by a sentence - DyMeshVAE (neighbour attention over the mesh's edges), a rectified-flow MMDiT on SD 1.5's CLIP-L; 16 frames as glTF morph targets (Apache-2.0) | `animateanymesh` | 0.9 GiB | checked |
+| `unirig` | UniRig: a skeleton (an OPT-350m-shaped decoder over a Michelangelo shape encoding, 15 sampled beams) and skin weights (Point Transformer V3, bone attention, a voxel geodesic prior) for any mesh (MIT) | `unirig` | 5.4 GiB | checked |
+| `rignet` | RigNet: a skeleton (GMEdgeNet joints, RootNet, BoneNet's tree) and skin weights (SkinNet over volumetric geodesics) for a character mesh; **GPLv3**, its own crate | `rignet` | 0.2 GiB | checked |
 
 ## What it does
 
@@ -975,6 +979,40 @@ attention as two float32 oneDNN products: 13x the engine's own kernel on the DiT
 Checked against the official code in float32 on the CPU (reference/animateanymesh/ref.py, the same noise and
 trajectory vertices): every stage within 2e-6 relative RMS - the embeddings 3e-7, the farthest points identical, the
 rest latents 5e-7, CLIP 7e-7, one DiT pass 6e-7, the 63-step flow 1.6e-6, the decoded frames 7e-8.
+
+### UniRig
+
+`model3d/unirig`, float32 (as UniRig's own float32 configs; its flash attention's half inputs in PTv3 are rounded the
+same way): the mesh in Blender's frame, merged and normalized; 65,536 samples through Michelangelo's encoder and
+the 24-layer OPT decoder over UniRig's skeleton tokens with their grammar, beam search with sampling as transformers
+4.51 does it (15 beams, top-k 5, top-p 0.95, temperature 1.5, repetition penalty 3; keys and values in a slot pool
+the beams share, so a beam following another copies a list, not the cache); the voxel prior on the CPU (a solid
+voxelization by rays through the pixel centres of UniRig's six pyrender views, shortest paths from the joints over
+the mesh and the voxels); 32,768 samples through Point Transformer V3 (its submanifold convolutions as im2col over a
+neighbour table, attention in 1,024-point patches along z-order and Hilbert curves), the bone encoder, 16 mesh-bone
+attention blocks and the skin head; the samples' weights carried to the mesh's vertices as UniRig's reskin does,
+then to the user's own, four a vertex. The skin checkpoint is read as published (4.4 GB, its optimizer state never
+loaded). Its silo runs the attention as float32 oneDNN products.
+
+| mesh (B70) | vertices | joints | time |
+|---|---|---|---|
+| reference/meshes/humanoid.obj | 7,590 merged (8,595 in the file) | 28 | 6-8 s (the skeleton's 102 tokens 1.6-2.7 s, the prior 0.3 s, the skin model 3 s) |
+
+Checked against the official code in float32 on the CPU (reference/unirig/ref.py, the same samples, subsets and
+curves): the encoder's latents 2.4e-6 relative RMS, the farthest points identical, teacher-forced logits 2.6e-6 (the
+argmax the same at all 75 positions), greedy decoding the same 74 tokens, the beam-sampled sequence read back to the
+same 28 joints and parents; the skin model's shape latents 2.3e-6, bones 7.6e-7, PTv3 features 2.1e-6, the weights
+2.1e-6; reskinning 6.4e-4 (ties among the 7 nearest samples). The voxel prior differs by 2e-2 relative RMS (rays
+against pyrender's rasterized depth), its largest joint the same at 7,582 of 7,590 vertices.
+
+### RigNet
+
+`model3d/rignet`, **GPLv3** as RigNet's code (the only such crate; a program built with it is GPLv3): the mesh
+decimated to about 4,000 triangles (crates/mesh's quadric decimation, not MeshLab's: the remeshed vertices differ),
+its geometry on the CPU (surface geodesics, geodesic edges, a voxelization), GMEdgeNet's joints by mean-shift,
+RootNet, BoneNet and the symmetric Prim tree, SkinNet over volumetric geodesics (ray visibility on the CPU), the
+weights carried back to every vertex of the input. Each network matches the reference to about 1e-6 relative RMS on
+the same geometry; 2.3 s a rig on the B70. Details: model-cards/guides/rignet.md.
 
 ## Speed by model
 

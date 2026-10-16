@@ -374,6 +374,20 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   steps; the linear layers are the shared kernels' float32 oneDNN product. Its silo runs the attention as two
   oneDNN products and a softmax. Settings: `NS_M3D_AAM_TRAJ` (`--opt-traj`), `NS_M3D_AAM_PROFILE`.
 
+- **unirig** - UniRig from its two Lightning checkpoints, read without Python (the skin one's optimizer state skipped),
+  float32. Its kernels (`kernels/model3d/unirig`): layer norms, per-head norms (PTv3's q / k), GELU / ReLU, dense
+  attention with any strides, a decode step's attention over a slot pool of keys and values shared by the beams,
+  gathers and scatters (the curves' orders), the sparse convolutions' im2col over a neighbour table, the skin head's
+  per-head bone attention and its input rows; the linear layers are the shared kernels' float32 oneDNN product. The
+  host side: the skeleton grammar, transformers 4.51's beam search with sampling, the voxel prior (voxelization on
+  rays, Dijkstra from each joint, threads), the serialization codes, reskinning. Its silo runs the attention as two
+  oneDNN products. Settings: `NS_M3D_UNIRIG_BEAMS` (`--opt-beams`), `NS_M3D_UNIRIG_PROFILE`.
+- **rignet** - RigNet (GPLv3, its own crate) from the authors' trained_models.zip (the checkpoints inflated at load,
+  the legacy torch format read by `nextsycl_gguf::pth`). Its networks on the GPU (`kernels/model3d/rignet`: EdgeConv
+  gathers and max-aggregation, global pooling; eval BatchNorm as a per-channel affine after each ReLU), the geometry on
+  the CPU.
+  Settings: `NS_M3D_RIGNET_FACES`, `NS_M3D_RIGNET_BANDWIDTH`, `NS_M3D_RIGNET_THRESHOLD`.
+
 ## The model registry
 
 `nextsycl models` (`glue/models`) keeps what a machine serves: an entry's id, kind, files, GPUs, contexts and engine
