@@ -198,6 +198,7 @@ Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`).
 | `NS_IMAGE_OUT` | ~/.local/share/nextsycl/images | where pictures are saved | cli (image) |
 | `NS_HI_*` | - | every NS_HI_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_HI_GUIDANCE` | apg | the HunyuanImage base model's guidance: apg (the pipeline's MIX_mode_0: CFG through step 5, or 38 when the negative quotes text, then adaptive projected guidance) or cfg (plain CFG every step) (--opt-guidance; per request too) | image hunyuanimage21 |
+| `NS_HI_INT8` | 0 | 1: the DiT's products in int8 x int8 on the silo (rows of both factors turned by a 256-block Hadamard, one scale a row; approximate: distilled 512 check latents 1.7e-2 against 2.6e-3, 2048x2048 8 steps 7.8 -> 5.9 s) (--opt-int8) | image hunyuanimage21 |
 | `NS_HI_PROFILE` | off | Debug: set: a GPU wait after each named step of the DiT, the totals printed after the picture (slower; shows where the time goes) | image hunyuanimage21 |
 | `NS_QI_*` | - | every NS_QI_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_QI_DUMP` | off | Debug: a directory: what the denoiser is given (embeds, pads, cond latents, noise) written there as raw float32 files | image qwenimage21 |

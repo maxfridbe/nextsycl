@@ -102,13 +102,17 @@ pub struct Mm {
     pub out_dt: i32,
     pub post: i32,
     pub gate: *const f32,
+    pub wscale: *const f32,
+    pub xq: *mut i8,
+    pub xs: *mut f32,
 }
 
 /// The silo's products (silo.h): the DiT's Q8_0 matrices read as int8 in the product, with its fusions
 struct Silo {
     path: std::path::PathBuf,
     q8_split: unsafe extern "C" fn(G, P, i64, i64, *mut i8, M) -> c_int,
-    linear_supported: unsafe extern "C" fn(G) -> c_int,
+    q8_rows: unsafe extern "C" fn(G, P, i64, i64, *mut i8, *mut f32) -> c_int,
+    linear_supported: unsafe extern "C" fn(G, c_int) -> c_int,
     linear: unsafe extern "C" fn(G, *const Mm) -> c_int,
     gn_supported: unsafe extern "C" fn(i64, i64) -> c_int,
     gn_scratch: unsafe extern "C" fn(i64) -> i64,
@@ -140,6 +144,7 @@ fn silo() -> Result<Option<&'static Silo>> {
         Ok(Some(Silo {
             path: lib.path.clone(),
             q8_split: sym!("ns_image_hi21_silo_q8_split"),
+            q8_rows: sym!("ns_image_hi21_silo_q8_rows"),
             linear_supported: sym!("ns_image_hi21_silo_linear_supported"),
             linear: sym!("ns_image_hi21_silo_linear"),
             gn_supported: sym!("ns_image_hi21_silo_group_norm_supported"),
@@ -183,14 +188,18 @@ pub struct K {
     k: &'static Api,
     /// the silo's products, when built and supported on this GPU
     silo: Option<&'static Silo>,
+    /// whether the silo runs its int8 x int8 products here
+    int8: bool,
 }
 
 impl K {
     pub fn new(gpu: &std::sync::Arc<Gpu>) -> Result<K> {
         let k = api()?;
         // SAFETY: a capability check on the GPU's handle.
-        let silo = silo()?.filter(|s| unsafe { (s.linear_supported)(gpu.raw()) } == 1);
-        Ok(K { gpu: gpu.clone(), k, silo })
+        let silo = silo()?.filter(|s| unsafe { (s.linear_supported)(gpu.raw(), 0) } == 1);
+        // SAFETY: as above.
+        let int8 = silo.is_some_and(|s| unsafe { (s.linear_supported)(gpu.raw(), 1) } == 1);
+        Ok(K { gpu: gpu.clone(), k, silo, int8 })
     }
 
     /// The silo's library, when its products are used here
@@ -203,6 +212,18 @@ impl K {
         let silo = self.silo.ok_or_else(|| Error("the silo is not loaded".into()))?;
         // SAFETY: blocks holds n x k / 32 Q8_0 blocks, w n x k bytes, s n x k / 32 halves.
         check(unsafe { (silo.q8_split)(self.g(), blocks, n as i64, k as i64, w.cast(), s) }, "q8_0 split")
+    }
+
+    /// Whether the silo's int8 x int8 products run here
+    pub fn int8(&self) -> bool {
+        self.int8
+    }
+
+    /// A Q8_0 matrix [n, k] requantized for the silo's int8 products: int8 [n, k] over a float32 scale a row
+    pub fn q8_rows(&self, blocks: P, n: usize, k: usize, w: M, scale: *mut f32) -> Result<()> {
+        let silo = self.silo.ok_or_else(|| Error("the silo is not loaded".into()))?;
+        // SAFETY: blocks holds n x k / 32 Q8_0 blocks, w n x k bytes, scale n floats.
+        check(unsafe { (silo.q8_rows)(self.g(), blocks, n as i64, k as i64, w.cast(), scale) }, "q8_0 to int8 rows")
     }
 
     /// One of the silo's products (silo.h)

@@ -38,13 +38,22 @@ pub const ROLES: &[&str] = &["transformer", "text-encoder", "tokenizer", "byt5",
 const GIB: f64 = (1u64 << 30) as f64;
 
 /// The options it takes (`--opt-NAME`: at load the variable named; per request a field of the request's `options`)
-pub const OPTIONS: &[EngineOption] = &[EngineOption {
-    name: "guidance",
-    env: "NS_HI_GUIDANCE",
-    value: "apg|cfg",
-    help: "the base model's guidance: the pipeline's APG after a few CFG steps (default), or plain CFG throughout",
-    at: At::Both,
-}];
+pub const OPTIONS: &[EngineOption] = &[
+    EngineOption {
+        name: "guidance",
+        env: "NS_HI_GUIDANCE",
+        value: "apg|cfg",
+        help: "the base model's guidance: the pipeline's APG after a few CFG steps (default), or plain CFG throughout",
+        at: At::Both,
+    },
+    EngineOption {
+        name: "int8",
+        env: "NS_HI_INT8",
+        value: "0|1",
+        help: "the DiT's products in int8 x int8 (each row of the inputs and of the matrices over its own scale; approximate, faster)",
+        at: At::Load,
+    },
+];
 
 /// This engine's registry entry
 pub fn kind() -> ImageKind {
@@ -138,7 +147,8 @@ impl HunyuanImage21 {
         let nsd = Nsd::new(gpu)?;
         let k = ffi::K::new(gpu)?;
         let f = nextsycl_gguf::Gguf::open(role(files, "transformer")?).map_err(w::ge)?;
-        let dit = dit::Dit::load(&f, &nsd, &k, log)?;
+        let int8 = o.setting("NS_HI_INT8").is_some_and(|v| v == "1");
+        let dit = dit::Dit::load(&f, &nsd, &k, int8, log)?;
         drop(f);
         let te = te::TextEncoder::load(role(files, "text-encoder")?, role(files, "tokenizer")?, &nsd, &k, log)?;
         let byt5 = byt5::Byt5::load(role(files, "byt5")?, &nsd, &k, log)?;

@@ -58,6 +58,9 @@ pub enum Wt {
     Blocks(DevBuf, GType),
     /// Q8_0 split for the silo's products: int8 values [n, k] and half scales [k / 32, n] (the same bytes)
     I8 { w: DevBuf, s: DevBuf },
+    /// requantized for the silo's int8 x int8 products (approximate, NS_HI_INT8): int8 [n, k] over a float32 scale a
+    /// row
+    I8Rows { w: DevBuf, s: DevBuf },
     Half(DevBuf),
     F32(DevBuf),
 }
@@ -184,7 +187,7 @@ impl Lin {
     pub fn bytes(&self) -> usize {
         let w = match &self.w {
             Wt::Blocks(b, _) | Wt::Half(b) | Wt::F32(b) => b.len,
-            Wt::I8 { w, s } => w.len + s.len,
+            Wt::I8 { w, s } | Wt::I8Rows { w, s } => w.len + s.len,
         };
         w + self.bias.as_ref().map_or(0, |b| b.len)
     }
@@ -202,7 +205,7 @@ impl Lin {
                 scratch.ptr()
             }
             Wt::Half(b) | Wt::F32(b) => b.ptr(),
-            Wt::I8 { .. } => return Err(Error("a matrix split for the silo has no half copy".into())),
+            Wt::I8 { .. } | Wt::I8Rows { .. } => return Err(Error("a matrix split for the silo has no half copy".into())),
         })
     }
 
@@ -229,7 +232,7 @@ impl Lin {
                 scratch.ptr()
             }
             Wt::F32(b) => b.ptr(),
-            Wt::Half(_) | Wt::I8 { .. } => return Err(Error("a half or split matrix has no float32 product here".into())),
+            Wt::Half(_) | Wt::I8 { .. } | Wt::I8Rows { .. } => return Err(Error("a half or split matrix has no float32 product here".into())),
         };
         let bias = self.bias.as_ref().map_or(none(), |b| b.ptr() as *const _);
         nsd.linear(x, Dt::F32, m, self.k, w, self.n, bias, out, Dt::F32)
@@ -274,13 +277,31 @@ impl Lin {
         Ok(true)
     }
 
-    /// One of the silo's products on a split matrix (`split_q8`): for each of `batch` inputs (rows `x_bs` halves
-    /// apart, `o_bs` values apart in out), out [m, n] (rows ldo apart) = x [m, kn] (rows lda apart) . W[:, k0 ..
-    /// k0 + kn]^T (+ bias when `bias`), as `post` says
+    /// A Q8_0 matrix requantized for the silo's int8 products (`Wt::I8Rows`); any other kept as it is. False when it
+    /// stays as it was.
+    pub fn rows_q8(&mut self, nsd: &Nsd, k8: &K) -> Result<bool> {
+        let Wt::Blocks(b, GType::Q8_0) = &self.w else { return Ok(false) };
+        let gpu = &nsd.gpu;
+        let w = DevBuf::new(gpu, self.n * self.k)?;
+        let s = DevBuf::f32(gpu, self.n)?;
+        k8.q8_rows(b.ptr(), self.n, self.k, w.ptr(), s.fp())?;
+        nsd.wait()?;
+        self.w = Wt::I8Rows { w, s };
+        Ok(true)
+    }
+
+    /// One of the silo's products on a split matrix (`split_q8`, or `rows_q8` with `q` the int8 path's scratch: int8
+    /// [rows, kn], float32 [rows]): for each of `batch` inputs (rows `x_bs` halves apart, `o_bs` values apart in out),
+    /// out [m, n] (rows ldo apart) = x [m, kn] (rows lda apart) . W[:, k0 .. k0 + kn]^T (+ bias when `bias`), as
+    /// `post` says
     #[allow(clippy::too_many_arguments)]
     pub fn mm(&self, k8: &K, x: *const std::ffi::c_void, lda: usize, m: usize, out: *mut std::ffi::c_void, ldo: usize, post: Post,
-              cols: Option<(usize, usize)>, bias: bool, batch: (usize, usize, usize)) -> Result<()> {
-        let Wt::I8 { w, s } = &self.w else { return Err(Error("a product on a matrix not split for the silo".into())) };
+              cols: Option<(usize, usize)>, bias: bool, batch: (usize, usize, usize), q: (*mut i8, *mut f32)) -> Result<()> {
+        let (w, s, wscale) = match &self.w {
+            Wt::I8 { w, s } => (w, s.ptr() as *const std::ffi::c_void, std::ptr::null()),
+            Wt::I8Rows { w, s } => (w, std::ptr::null(), s.fp() as *const f32),
+            _ => return Err(Error("a product on a matrix not split for the silo".into())),
+        };
         let (k0, kn) = cols.unwrap_or((0, self.k));
         let (out_dt, p, gate) = match post {
             Post::Half => (1, 0, std::ptr::null()),
@@ -298,7 +319,7 @@ impl Lin {
             kn: kn as i64,
             n: self.n as i64,
             w: w.ptr() as *const i8,
-            s: s.ptr(),
+            s,
             bias: if bias { self.bias.as_ref().map_or(std::ptr::null(), |b| b.fp() as *const f32) } else { std::ptr::null() },
             out,
             ldo: ldo as i64,
@@ -306,6 +327,9 @@ impl Lin {
             out_dt,
             post: p,
             gate,
+            wscale,
+            xq: q.0,
+            xs: q.1,
         })
     }
 
