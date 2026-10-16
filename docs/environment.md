@@ -266,6 +266,8 @@ The `model3d` kind (meshes from pictures, rigging, animation) and its engines' s
 | `NS_M3D_HY_TOKENS` | 3072 (2mini), 4096 (2.1) | the shape's latent tokens (Tencent's turbo example samples the turbo decoder's 512: coarser) (--opt-tokens) | model3d hunyuan3d |
 | `NS_M3D_HY_DECODE` | fast | fast: the grid decoded coarse to fine, only near the surface (FlashVDM's hierarchical decoding); dense: every point (--opt-decode) | model3d hunyuan3d |
 | `NS_M3D_HY_CHUNK` | by the decoder's width | points the shape decoder queries at once (--opt-chunk) | model3d hunyuan3d |
+| `NS_M3D_HY_PAINT` | 1 | 0: 2.1 loads without its paint model (no textures; ~6.5 GiB less) even when the paint files are there (--opt-paint) | model3d hunyuan3d |
+| `NS_M3D_HY_PAINT_STEPS` | 15 | the texture's UniPC steps (--opt-paint-steps) | model3d hunyuan3d |
 
 ## Diffusion kernels: `NSD_*`
 

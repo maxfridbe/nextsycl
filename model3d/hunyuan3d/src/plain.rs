@@ -203,6 +203,8 @@ impl Plain {
             ops.head_norm(o.ptr(), rows, self.heads, HEAD, 2 * wd, b.kn2.ptr(), none(), EPS, true)?;
             kv.push(o);
         }
+        // ch is freed on return: its kernels first
+        ops.gpu.sync()?;
         Ok(Ctx { rows, kv })
     }
 

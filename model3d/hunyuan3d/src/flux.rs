@@ -179,6 +179,8 @@ impl Flux {
         ops.to_half(cond.ptr(), condh.ptr(), rows * self.context)?;
         let txt0 = DevBuf::new(gpu, rows * wd * 4)?;
         ops.lin(&self.cond_in, condh.ptr(), rows, txt0.ptr(), Dt::F32)?;
+        // condh is freed on return: its kernels first
+        ops.gpu.sync()?;
         let nmods = self.doubles.len() * 12 + self.singles.len() * 3 + 2;
         Ok(Scratch {
             rows,

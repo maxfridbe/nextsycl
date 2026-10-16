@@ -72,6 +72,15 @@ impl SafeTensors {
         Ok(SafeTensors { path: path.to_path_buf(), metadata, tensors, index, file })
     }
 
+    /// A table of tensors in another file laid out the same way (raw, row-major bytes at known offsets): a PyTorch
+    /// checkpoint's storages (`crate::pth`)
+    pub fn from_tensors(path: &Path, mut tensors: Vec<StTensor>) -> Result<SafeTensors> {
+        let file = File::open(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+        tensors.sort_by_key(|t| t.offset);
+        let index = tensors.iter().enumerate().map(|(i, t)| (t.name.clone(), i)).collect();
+        Ok(SafeTensors { path: path.to_path_buf(), metadata: BTreeMap::new(), tensors, index, file })
+    }
+
     pub fn tensor(&self, name: &str) -> Option<&StTensor> {
         self.index.get(name).map(|i| &self.tensors[*i])
     }

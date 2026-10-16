@@ -20,7 +20,8 @@ nextsycl model3d tool remesh IN OUT [--edge X] [--passes N]   isotropic remeshin
 nextsycl model3d tool uv IN OUT [--size N]               a fresh atlas, the old texture or colours baked across
 nextsycl model3d tool convert IN OUT                     GLB <-> OBJ (by the extensions)
 nextsycl model3d check <dump dir> [--model ID] [--stages pre,cond,dit,steps,vae,grid] [--picture P] [--gpu N]
-                   an engine's stages against a reference's dumps (reference/hunyuan3d)
+                   an engine's stages against a reference's dumps (reference/hunyuan3d); a paint dump's stages:
+                   maps,pic,dino,enc,dual,unet,unipc,steps,decode
 nextsycl model3d engines | selftest [--gpu N]";
 
 /// The 3D engines this program has (model3d/<arch>)
@@ -198,7 +199,15 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let e = nextsycl_model3d_hunyuan3d::Hunyuan3d::load(a, &files, &st, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
     let stages: Vec<String> = opt(args, "--stages").unwrap_or("all").split(',').map(str::to_string).collect();
     let pic = opt(args, "--picture").map(|p| std::fs::read(p).map_err(|e| format!("{p}: {e}")).and_then(|b| nextsycl_model3d::read_picture(&b))).transpose()?;
-    let worst = nextsycl_model3d_hunyuan3d::check::run(&e, Path::new(&dir), &stages, pic.as_ref(), &mut log).map_err(|e| e.0)?;
+    // the paint model's dumps (reference/hunyuan3d/ref_paint.py) hold the views' maps; the shape's do not
+    let d = Path::new(&dir);
+    let worst = if d.join("normal.npy").exists() {
+        let stages = if stages.iter().any(|s| s == "all") { vec!["paint".to_string()] } else { stages };
+        nextsycl_model3d_hunyuan3d::check::run_paint(&e, d, &stages, pic.as_ref(), &mut log)
+    } else {
+        nextsycl_model3d_hunyuan3d::check::run(&e, d, &stages, pic.as_ref(), &mut log)
+    }
+    .map_err(|e| e.0)?;
     println!("worst relative error {worst:.2e}");
     Ok(())
 }

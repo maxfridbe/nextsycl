@@ -148,14 +148,24 @@ pub fn unwrap(m: &Mesh, size: u32, gutter: u32) -> Mesh {
     out
 }
 
-/// Every texel a triangle covers in UV space (sampled at the texel centre), with the surface point and normal
-/// there, handed to `sample`; the texture it fills (texels no triangle covers grown from their neighbours)
-pub fn rasterize(m: &Mesh, size: u32, mut sample: impl FnMut([f32; 3], [f32; 3]) -> [f32; 4]) -> Texture {
+/// A texel a triangle covers in UV space: its index in the texture (row-major, v down), the triangle, the
+/// barycentric weights of its centre, and the surface point and normal there
+#[derive(Clone, Copy, Debug)]
+pub struct Texel {
+    pub index: usize,
+    pub tri: usize,
+    pub bary: [f32; 3],
+    pub pos: [f32; 3],
+    pub normal: [f32; 3],
+}
+
+/// Every texel a triangle covers in UV space (sampled at the texel centre; a texel two triangles cover is listed
+/// for each)
+pub fn texels(m: &Mesh, size: u32) -> Vec<Texel> {
     let s = size as usize;
-    let mut acc = vec![[0f32; 4]; s * s];
-    let mut hit = vec![false; s * s];
+    let mut out = Vec::new();
     let tri_n = |t: &[u32]| normalize(cross(sub(m.positions[t[1] as usize], m.positions[t[0] as usize]), sub(m.positions[t[2] as usize], m.positions[t[0] as usize])));
-    for t in m.indices.chunks_exact(3) {
+    for (ti, t) in m.indices.chunks_exact(3).enumerate() {
         let uv = [0, 1, 2].map(|k| { let u = m.uvs[t[k] as usize]; [u[0] * size as f32, u[1] * size as f32] });
         let x0 = uv.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min).floor().max(0.0) as usize;
         let x1 = (uv.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max).ceil() as usize).min(s);
@@ -178,12 +188,24 @@ pub fn rasterize(m: &Mesh, size: u32, mut sample: impl FnMut([f32; 3], [f32; 3])
                 let nrm = if m.normals.is_empty() { fnrm } else {
                     normalize(add(add(scale(m.normals[t[0] as usize], b0), scale(m.normals[t[1] as usize], b1)), scale(m.normals[t[2] as usize], b2)))
                 };
-                acc[y * s + x] = sample(pos, nrm);
-                hit[y * s + x] = true;
+                out.push(Texel { index: y * s + x, tri: ti, bary: [b0, b1, b2], pos, normal: nrm });
             }
         }
     }
-    dilate(&mut acc, &mut hit, s, 8);
+    out
+}
+
+/// Every texel a triangle covers in UV space (sampled at the texel centre), with the surface point and normal
+/// there, handed to `sample`; the texture it fills (texels no triangle covers grown from their neighbours)
+pub fn rasterize(m: &Mesh, size: u32, mut sample: impl FnMut([f32; 3], [f32; 3]) -> [f32; 4]) -> Texture {
+    let s = size as usize;
+    let mut acc = vec![[0f32; 4]; s * s];
+    let mut hit = vec![false; s * s];
+    for t in texels(m, size) {
+        acc[t.index] = sample(t.pos, t.normal);
+        hit[t.index] = true;
+    }
+    grow(&mut acc, &mut hit, s, 8);
     let mut t = Texture::new(size, size);
     for (px, c) in t.rgba.chunks_exact_mut(4).zip(&acc) {
         for (o, v) in px.iter_mut().zip(c) {
@@ -193,8 +215,8 @@ pub fn rasterize(m: &Mesh, size: u32, mut sample: impl FnMut([f32; 3], [f32; 3])
     t
 }
 
-/// Empty texels next to filled ones take their mean, `passes` times
-fn dilate(acc: &mut [[f32; 4]], hit: &mut [bool], s: usize, passes: usize) {
+/// Empty texels (of an s x s texture) next to filled ones take their mean, `passes` times: a texture's gutter
+pub fn grow(acc: &mut [[f32; 4]], hit: &mut [bool], s: usize, passes: usize) {
     for _ in 0..passes {
         let (prev, was) = (acc.to_vec(), hit.to_vec());
         for y in 0..s {

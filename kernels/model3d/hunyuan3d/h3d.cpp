@@ -263,4 +263,119 @@ int ns_model3d_hunyuan3d_scatter_add(ns_gpu* g, const void* y, const int32_t* id
     NS_CATCH
 }
 
+int ns_model3d_hunyuan3d_group_norm(ns_gpu* g, const void* x, int64_t F, int64_t N, int64_t C, int64_t G, const float* w, const float* b,
+                                    float eps, int silu, float* stats, void* out) {
+    NS_TRY
+    if (G <= 0 || C % G != 0) return ns_fail("ns_model3d_hunyuan3d_group_norm: channels not a multiple of the groups");
+    if (F <= 0 || N <= 0) return 0;
+    constexpr int WG = 256;
+    const half* a = (const half*) x;
+    half* o = (half*) out;
+    const int64_t cg = C / G, per = N * cg;
+    // the statistics: one work-group a frame and group, the mean first, then the variance about it
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (F * G) * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+        const int64_t fg = (int64_t) it.get_group(0);
+        const int64_t f = fg / G, gr = fg % G;
+        const int64_t l = (int64_t) it.get_local_id(0);
+        const half* base = a + f * N * C + gr * cg;
+        float s = 0.0f;
+        for (int64_t i = l; i < per; i += WG) s += (float) base[(i / cg) * C + i % cg];
+        const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) per;
+        float s2 = 0.0f;
+        for (int64_t i = l; i < per; i += WG) {
+            const float d = (float) base[(i / cg) * C + i % cg] - mean;
+            s2 += d * d;
+        }
+        const float var = sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) per;
+        if (l == 0) {
+            stats[fg * 2] = mean;
+            stats[fg * 2 + 1] = sycl::rsqrt(var + eps);
+        }
+    });
+    g->q.parallel_for(sycl::range<1>((size_t) (F * N * C)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        const int64_t c = i % C, f = i / (N * C);
+        const int64_t fg = f * G + c / cg;
+        float y = ((float) a[i] - stats[fg * 2]) * stats[fg * 2 + 1] * w[c] + b[c];
+        if (silu) y = y / (1.0f + sycl::exp(-y));
+        o[i] = (half) y;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_model3d_hunyuan3d_geglu(ns_gpu* g, const void* x, int64_t M, int64_t F, void* out) {
+    NS_TRY
+    if (M <= 0 || F <= 0) return 0;
+    const half* a = (const half*) x;
+    half* o = (half*) out;
+    g->q.parallel_for(sycl::range<1>((size_t) (M * F)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        const int64_t r = i / F, c = i % F;
+        const float h = (float) a[r * 2 * F + c], gt = (float) a[r * 2 * F + F + c];
+        o[i] = (half) (h * 0.5f * gt * (1.0f + sycl::erf(gt * 0.70710678118654752f)));
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_model3d_hunyuan3d_pad2d(ns_gpu* g, const void* x, int64_t N, int64_t H, int64_t W, int64_t C, int64_t t, int64_t b, int64_t l,
+                               int64_t r, void* out) {
+    NS_TRY
+    if (t < 0 || b < 0 || l < 0 || r < 0) return ns_fail("ns_model3d_hunyuan3d_pad2d: negative padding");
+    const int64_t Ho = H + t + b, Wo = W + l + r;
+    if (N <= 0 || Ho <= 0 || Wo <= 0 || C <= 0) return 0;
+    const half* a = (const half*) x;
+    half* o = (half*) out;
+    g->q.parallel_for(sycl::range<1>((size_t) (N * Ho * Wo * C)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        const int64_t c = i % C, px = (i / C) % Wo, py = (i / C / Wo) % Ho, n = i / C / Wo / Ho;
+        const int64_t sy = py - t, sx = px - l;
+        o[i] = (sy >= 0 && sy < H && sx >= 0 && sx < W) ? a[((n * H + sy) * W + sx) * C + c] : (half) 0.0f;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_model3d_hunyuan3d_concat(ns_gpu* g, const void* a, int64_t Ca, const void* b, int64_t Cb, int64_t M, void* out) {
+    NS_TRY
+    if (M <= 0) return 0;
+    const int64_t C = Ca + Cb;
+    const half* pa = (const half*) a;
+    const half* pb = (const half*) b;
+    half* o = (half*) out;
+    g->q.parallel_for(sycl::range<1>((size_t) (M * C)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        const int64_t r = i / C, c = i % C;
+        o[i] = c < Ca ? pa[r * Ca + c] : pb[r * Cb + c - Ca];
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_model3d_hunyuan3d_up2(ns_gpu* g, const void* x, int64_t N, int64_t H, int64_t W, int64_t C, void* out) {
+    NS_TRY
+    if (N <= 0 || H <= 0 || W <= 0 || C <= 0) return 0;
+    const half* a = (const half*) x;
+    half* o = (half*) out;
+    const int64_t Wo = 2 * W, Ho = 2 * H;
+    g->q.parallel_for(sycl::range<1>((size_t) (N * Ho * Wo * C)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        const int64_t c = i % C, px = (i / C) % Wo, py = (i / C / Wo) % Ho, n = i / C / Wo / Ho;
+        o[i] = a[((n * H + py / 2) * W + px / 2) * C + c];
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_model3d_hunyuan3d_add_half(ns_gpu* g, void* x, const void* y, int64_t n, float s) {
+    NS_TRY
+    if (n <= 0) return 0;
+    half* a = (half*) x;
+    const half* b = (const half*) y;
+    g->q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { a[i] = (half) ((float) a[i] + s * (float) b[i]); });
+    return 0;
+    NS_CATCH
+}
+
 }  // extern "C"

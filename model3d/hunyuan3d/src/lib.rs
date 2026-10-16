@@ -19,6 +19,7 @@ mod ffi;
 pub mod flux;
 pub mod grid;
 pub mod ops;
+pub mod paint;
 pub mod picture;
 pub mod plain;
 pub mod sched;
@@ -44,6 +45,8 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "tokens", env: "NS_M3D_HY_TOKENS", value: "N", help: "latent tokens of the shape (2mini 3072, 2.1 4096; Tencent's turbo example samples 512)", at: At::Both },
     EngineOption { name: "decode", env: "NS_M3D_HY_DECODE", value: "fast|dense", help: "the grid: coarse to fine near the surface (fast) or every point", at: At::Both },
     EngineOption { name: "chunk", env: "NS_M3D_HY_CHUNK", value: "N", help: "points the shape decoder queries at once", at: At::Both },
+    EngineOption { name: "paint", env: "NS_M3D_HY_PAINT", value: "0|1", help: "2.1: load the paint model (textures; ~6.5 GiB more) when its files are there", at: At::Load },
+    EngineOption { name: "paint-steps", env: "NS_M3D_HY_PAINT_STEPS", value: "N", help: "2.1: the texture's UniPC steps (15)", at: At::Both },
 ];
 
 /// This engine's registry entry
@@ -96,6 +99,8 @@ pub struct Hunyuan3d {
     load_seconds: f64,
     settings: LoadOptions,
     weights_bytes: usize,
+    /// 2.1's paint model, when its files are there (and NS_M3D_HY_PAINT is not 0)
+    pub paint: Option<paint::Paint>,
     busy: Mutex<()>,
     /// the card's least free memory seen during the last request (bytes), for `report`
     low: std::sync::atomic::AtomicU64,
@@ -150,11 +155,24 @@ impl Hunyuan3d {
         } else {
             vae::Vae::load(&Weights::new(model, "vae.", gpu), arch.scale_factor)?
         };
+        let want_paint = o.setting("NS_M3D_HY_PAINT").is_none_or(|v| v != "0");
+        let paint = match (files.get("paint-unet"), files.get("paint-vae"), files.get("paint-dino")) {
+            (Some(u), Some(v), Some(d)) if arch.name == ARCH_21 && want_paint => {
+                let open_any = |p: &std::path::Path| -> Result<SafeTensors> {
+                    let r = if p.extension().is_some_and(|e| e == "safetensors") { SafeTensors::open(p) } else { nextsycl_gguf::pth::open(p) };
+                    r.map_err(|e| Error(e.0))
+                };
+                let (u, v, d) = (open_any(u)?, open_any(v)?, open_any(d)?);
+                paint::Paint::check_files(&u)?;
+                Some(paint::Paint::load(&u, &v, &d, gpu, log)?)
+            }
+            _ => None,
+        };
         gpu.sync()?;
-        let weights_bytes = dw.bytes.get() + mw.bytes.get() + vae.bytes;
+        let weights_bytes = dw.bytes.get() + mw.bytes.get() + vae.bytes + paint.as_ref().map_or(0, |p| p.bytes);
         let load_seconds = t0.elapsed().as_secs_f64();
         log(format!("{}: loaded on {} in {load_seconds:.1} s ({:.2} GiB of weights)", arch.name, gpu.name, weights_bytes as f64 / (1u64 << 30) as f64));
-        Ok(Hunyuan3d { arch, ops, dino, dit, vae, loaded: Instant::now(), load_seconds, settings: o.clone(), weights_bytes, busy: Mutex::new(()),
+        Ok(Hunyuan3d { arch, ops, dino, dit, vae, loaded: Instant::now(), load_seconds, settings: o.clone(), weights_bytes, paint, busy: Mutex::new(()),
                        low: u64::MAX.into() })
     }
 
@@ -286,7 +304,7 @@ impl Model3dEngine for Hunyuan3d {
         self.arch.name
     }
     fn abilities(&self) -> Abilities {
-        Abilities { generate: true, texture: false, views: 1, rig: false, animate: false }
+        Abilities { generate: true, texture: self.paint.is_some(), views: 1, rig: false, animate: false }
     }
     fn defaults(&self) -> Defaults {
         Defaults { steps: self.arch.steps, cfg: self.arch.cfg, resolution: self.arch.resolution, faces: 40_000, texture_size: 2048, frames: 0, fps: 0.0 }
@@ -316,8 +334,9 @@ impl Model3dEngine for Hunyuan3d {
         let t0 = Instant::now();
         let mut report = |phase: &'static str, at: u32, of: u32| progress(Step { phase, at, of, seconds: t0.elapsed().as_secs_f64() });
         let view = req.views.first().ok_or_else(|| Error("no picture".into()))?;
-        if req.texture {
-            return Err(Error(format!("{} paints no textures yet: ask for the shape alone (texture false)", self.arch.name)));
+        if req.texture && self.paint.is_none() {
+            return Err(Error(format!("{} has no paint model loaded (2.1 with its paint files: paint-unet, paint-vae, paint-dino): ask for the shape alone",
+                                     self.arch.name)));
         }
         let num = |name: &str, env: &str| -> Result<Option<usize>> {
             self.setting(req, name, env).map(|v| v.parse::<usize>().map_err(|_| Error(format!("{name}: {v}?")))).transpose()
@@ -352,6 +371,15 @@ impl Model3dEngine for Hunyuan3d {
         }
         let out = nextsycl_model3d::finish(m, Some(req.faces.unwrap_or(40_000)));
         report("mesh", 1, 1)?;
-        Ok(out)
+        match (&self.paint, req.texture) {
+            (Some(p), true) => {
+                let steps = num("paint-steps", "NS_M3D_HY_PAINT_STEPS")?.unwrap_or(15);
+                let size = req.texture_size.unwrap_or(2048).clamp(256, 8192);
+                let painted = p.paint(&self.ops, &out, &view.image, req.seed, steps, size, None, &mut |ph, a, b| report(ph, a, b))?;
+                self.note_memory();
+                Ok(nextsycl_model3d::finish(painted, None))
+            }
+            _ => Ok(out),
+        }
     }
 }

@@ -185,6 +185,8 @@ impl Vae {
             ops.lin(&b.fc2, mid.ptr(), n, h.ptr(), Dt::F16)?;
             ops.add(x.ptr(), h.ptr(), true, n, wd, none())?;
         }
+        // the temporaries are freed on return: their kernels first
+        ops.gpu.sync()?;
         Ok(x)
     }
 

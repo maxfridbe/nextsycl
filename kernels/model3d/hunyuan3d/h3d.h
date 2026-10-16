@@ -46,6 +46,23 @@ int ns_model3d_hunyuan3d_gather(ns_gpu* g, const void* x, const int32_t* idx, in
 /* out float32 [M, C]: row idx[i] += w[i] * y[i] (y half [n, C], w float32 [n]); the idx distinct within a call */
 int ns_model3d_hunyuan3d_scatter_add(ns_gpu* g, const void* y, const int32_t* idx, const float* w, int64_t n, int64_t C, float* out);
 
+/* The paint model's (a Stable Diffusion 2 UNet and VAE, channels last):
+ * group_norm: F frames of N pixels x C channels in G groups, per frame and group (x - mean) / sqrt(var + eps) * w + b,
+ *   then SiLU when silu; x, out half (out may be x); stats float32 scratch [F * G * 2]
+ * geglu: out half [M, F] = x[:, :F] * gelu(x[:, F:]) (erf), x half [M, 2F]
+ * pad2d: out half [N, H + t + b, W + l + r, C] = x half [N, H, W, C] with zeros around
+ * concat: out half [M, Ca + Cb] = [a [M, Ca] | b [M, Cb]] (half)
+ * up2: out half [N, 2H, 2W, C] = nearest 2x of x half [N, H, W, C]
+ * add_half: x half += s * y half over n values (in float32) */
+int ns_model3d_hunyuan3d_group_norm(ns_gpu* g, const void* x, int64_t F, int64_t N, int64_t C, int64_t G, const float* w, const float* b,
+                                    float eps, int silu, float* stats, void* out);
+int ns_model3d_hunyuan3d_geglu(ns_gpu* g, const void* x, int64_t M, int64_t F, void* out);
+int ns_model3d_hunyuan3d_pad2d(ns_gpu* g, const void* x, int64_t N, int64_t H, int64_t W, int64_t C, int64_t t, int64_t b, int64_t l,
+                               int64_t r, void* out);
+int ns_model3d_hunyuan3d_concat(ns_gpu* g, const void* a, int64_t Ca, const void* b, int64_t Cb, int64_t M, void* out);
+int ns_model3d_hunyuan3d_up2(ns_gpu* g, const void* x, int64_t N, int64_t H, int64_t W, int64_t C, void* out);
+int ns_model3d_hunyuan3d_add_half(ns_gpu* g, void* x, const void* y, int64_t n, float s);
+
 #ifdef __cplusplus
 }
 #endif

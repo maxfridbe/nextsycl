@@ -275,6 +275,40 @@ impl Ops {
         // SAFETY: the caller's buffers hold the sizes named.
         ffi::check(unsafe { (self.k.scatter_add)(self.g(), y, idx.cast(), w.cast(), n as i64, c as i64, out.cast()) }, "scatter add")
     }
+    /// GroupNorm (G groups) of f frames of n pixels x c channels (half, channels last), SiLU after when `silu`;
+    /// `stats`: float32 scratch [f * g * 2]
+    pub fn group_norm(&self, x: P, f: usize, n: usize, c: usize, g: usize, w: P, b: P, eps: f32, silu: bool, stats: M, out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        ffi::check(unsafe { (self.k.group_norm)(self.g(), x, f as i64, n as i64, c as i64, g as i64, w.cast(), b.cast(), eps, silu as i32, stats.cast(), out) },
+                   "group norm")
+    }
+    /// out [m, f] = x[:, :f] * gelu(x[:, f:]), half
+    pub fn geglu(&self, x: P, m: usize, f: usize, out: M) -> Result<()> {
+        // SAFETY: x holds [m, 2f], out [m, f].
+        ffi::check(unsafe { (self.k.geglu)(self.g(), x, m as i64, f as i64, out) }, "geglu")
+    }
+    /// x [n, h, w, c] half zero-padded by (top, bottom, left, right) into out
+    pub fn pad2d(&self, x: P, n: usize, h: usize, w: usize, c: usize, pad: (usize, usize, usize, usize), out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        ffi::check(unsafe { (self.k.pad2d)(self.g(), x, n as i64, h as i64, w as i64, c as i64, pad.0 as i64, pad.1 as i64, pad.2 as i64, pad.3 as i64, out) },
+                   "pad")
+    }
+    /// out [m, ca + cb] = [a | b], half
+    pub fn concat(&self, a: P, ca: usize, b: P, cb: usize, m: usize, out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        ffi::check(unsafe { (self.k.concat)(self.g(), a, ca as i64, b, cb as i64, m as i64, out) }, "concat")
+    }
+    /// out [n, 2h, 2w, c] = nearest 2x of x [n, h, w, c], half
+    pub fn up2(&self, x: P, n: usize, h: usize, w: usize, c: usize, out: M) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        ffi::check(unsafe { (self.k.up2)(self.g(), x, n as i64, h as i64, w as i64, c as i64, out) }, "up2")
+    }
+    /// x half += s * y half
+    pub fn add_half(&self, x: M, y: P, n: usize, s: f32) -> Result<()> {
+        // SAFETY: n halves each.
+        ffi::check(unsafe { (self.k.add_half)(self.g(), x, y, n as i64, s) }, "add (half)")
+    }
+
     /// GELU in place over n halves: exact (erf) or the tanh approximation
     pub fn gelu(&self, x: M, n: usize, tanh: bool) -> Result<()> {
         self.nsd.gelu(x, Dt::F16, n, tanh)

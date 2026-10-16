@@ -223,6 +223,8 @@ impl Dino {
         }
         let out = DevBuf::new(gpu, s * c * 4)?;
         ops.ln(x.ptr(), false, s, c, EPS, self.lnw.ptr(), self.lnb.ptr(), none(), none(), out.ptr(), false)?;
+        // the temporaries are freed on return: their kernels first
+        ops.gpu.sync()?;
         Ok(out)
     }
 }

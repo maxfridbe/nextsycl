@@ -22,6 +22,12 @@ pub struct Api {
     pub route: unsafe extern "C" fn(G, *const f32, i64, i64, i64, *mut i32, *mut f32) -> c_int,
     pub gather: unsafe extern "C" fn(G, P, *const i32, i64, i64, M) -> c_int,
     pub scatter_add: unsafe extern "C" fn(G, P, *const i32, *const f32, i64, i64, *mut f32) -> c_int,
+    pub group_norm: unsafe extern "C" fn(G, P, i64, i64, i64, i64, *const f32, *const f32, f32, c_int, *mut f32, M) -> c_int,
+    pub geglu: unsafe extern "C" fn(G, P, i64, i64, M) -> c_int,
+    pub pad2d: unsafe extern "C" fn(G, P, i64, i64, i64, i64, i64, i64, i64, i64, M) -> c_int,
+    pub concat: unsafe extern "C" fn(G, P, i64, P, i64, i64, M) -> c_int,
+    pub up2: unsafe extern "C" fn(G, P, i64, i64, i64, i64, M) -> c_int,
+    pub add_half: unsafe extern "C" fn(G, M, P, i64, f32) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -59,6 +65,12 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             route: sym!("ns_model3d_hunyuan3d_route"),
             gather: sym!("ns_model3d_hunyuan3d_gather"),
             scatter_add: sym!("ns_model3d_hunyuan3d_scatter_add"),
+            group_norm: sym!("ns_model3d_hunyuan3d_group_norm"),
+            geglu: sym!("ns_model3d_hunyuan3d_geglu"),
+            pad2d: sym!("ns_model3d_hunyuan3d_pad2d"),
+            concat: sym!("ns_model3d_hunyuan3d_concat"),
+            up2: sym!("ns_model3d_hunyuan3d_up2"),
+            add_half: sym!("ns_model3d_hunyuan3d_add_half"),
         })
     })
     .as_ref()
