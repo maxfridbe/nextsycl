@@ -10,6 +10,7 @@ vram_gib: 5.5                   # its memory on the card when it runs (measured 
 does: [generate]
 env: {}
 files:
+  remover: birefnet             # the shared background remover (BiRefNet; defined in trellis2.yml)
   model:
     key: hy3d-mini-turbo-dit
     url: https://huggingface.co/tencent/Hunyuan3D-2mini/resolve/f90a0f7df7d5e6f71109cf333f6a95a0ae3194a6/hunyuan3d-dit-v2-mini-turbo/model.fp16.safetensors

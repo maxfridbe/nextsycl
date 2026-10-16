@@ -10,6 +10,7 @@ vram_gib: 17.0                  # its memory on the card when it runs (measured 
 does: [generate, texture]
 env: {}
 files:
+  remover: birefnet             # the shared background remover (BiRefNet; defined in trellis2.yml)
   model:
     key: hy3d-21-model
     url: https://huggingface.co/Comfy-Org/hunyuan3D_2.1_repackaged/resolve/606def5076d38b387b005caf93b5336c56ca99f9/hunyuan_3d_v2.1.safetensors

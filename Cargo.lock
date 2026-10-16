@@ -872,6 +872,7 @@ dependencies = [
  "nextsycl-gguf",
  "nextsycl-mesh",
  "nextsycl-model3d",
+ "nextsycl-remover",
  "serde_json",
 ]
 

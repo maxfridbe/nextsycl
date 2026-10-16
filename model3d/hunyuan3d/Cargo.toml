@@ -11,4 +11,5 @@ nextsycl-diffusion.workspace = true
 nextsycl-gguf.workspace = true
 nextsycl-mesh.workspace = true
 nextsycl-model3d.workspace = true
+nextsycl-remover.workspace = true
 serde_json.workspace = true

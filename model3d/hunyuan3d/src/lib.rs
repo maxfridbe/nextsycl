@@ -42,7 +42,7 @@ pub const ARCH_MINI: &str = "hunyuan3d-2mini";
 /// The files by role: `model` (the DiT file with its conditioner and VAE: Tencent's mini-turbo safetensors, or
 /// Comfy-Org's 2.1 repackage), `vae` (2mini: the turbo decoder), and the paint model's (2.1's textures: its UNet and
 /// VAE checkpoints, DINOv2-giant)
-pub const ROLES: &[&str] = &["model", "vae?", "paint-unet?", "paint-vae?", "paint-dino?"];
+pub const ROLES: &[&str] = &["model", "vae?", "paint-unet?", "paint-vae?", "paint-dino?", "remover?"];
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "tokens", env: "NS_M3D_HY_TOKENS", value: "N", help: "latent tokens of the shape (2mini 3072, 2.1 4096; Tencent's turbo example samples 512)", at: At::Both },
@@ -104,6 +104,9 @@ pub struct Hunyuan3d {
     weights_bytes: usize,
     /// 2.1's paint model, when its files are there (and NS_M3D_HY_PAINT is not 0)
     pub paint: Option<paint::Paint>,
+    /// the shared background remover (BiRefNet, nextsycl-remover), when the entry names its file: an opaque
+    /// picture is cut out by it (else by picture.rs's border fallback)
+    remover: Option<nextsycl_remover::Remover>,
     busy: Mutex<()>,
     /// the card's least free memory seen during the last request (bytes), for `report`
     low: std::sync::atomic::AtomicU64,
@@ -171,11 +174,19 @@ impl Hunyuan3d {
             }
             _ => None,
         };
+        let remover = match files.get("remover") {
+            Some(p) => {
+                let r = nextsycl_remover::Remover::load(p, gpu).map_err(|e| Error(format!("the background remover: {}", e.0)))?;
+                log(format!("{}: the background remover (BiRefNet) loaded", arch.name));
+                Some(r)
+            }
+            None => None,
+        };
         gpu.sync()?;
         let weights_bytes = dw.bytes.get() + mw.bytes.get() + vae.bytes + paint.as_ref().map_or(0, |p| p.bytes);
         let load_seconds = t0.elapsed().as_secs_f64();
         log(format!("{}: loaded on {} in {load_seconds:.1} s ({:.2} GiB of weights)", arch.name, gpu.name, weights_bytes as f64 / (1u64 << 30) as f64));
-        Ok(Hunyuan3d { arch, ops, dino, dit, vae, loaded: Instant::now(), load_seconds, settings: o.clone(), weights_bytes, paint, busy: Mutex::new(()),
+        Ok(Hunyuan3d { arch, ops, dino, dit, vae, loaded: Instant::now(), load_seconds, settings: o.clone(), weights_bytes, paint, remover, busy: Mutex::new(()),
                        low: u64::MAX.into() })
     }
 
@@ -352,7 +363,19 @@ impl Model3dEngine for Hunyuan3d {
         let steps = req.steps.unwrap_or(self.arch.steps) as usize;
         let cfg = req.cfg.unwrap_or(self.arch.cfg);
         report("image", 0, 1)?;
-        let (pixels, _note) = picture::prepare(&view.image, req.remove_background.unwrap_or(true), self.arch.proc_size, self.arch.enc_size, BORDER)?;
+        let cut = req.remove_background.unwrap_or(true);
+        // an opaque picture cut out by BiRefNet when it is loaded: its mask becomes the alpha the processor reads
+        let cut_out;
+        let image = match &self.remover {
+            Some(r) if cut && view.image.rgba.chunks_exact(4).all(|p| p[3] == 255) => {
+                let pic = nextsycl_diffusion::Picture { width: view.image.width, height: view.image.height, channels: 4, data: view.image.rgba.clone() };
+                let c = r.cut_out(&pic).map_err(|e| Error(format!("the background remover: {}", e.0)))?;
+                cut_out = nextsycl_model3d::Texture { width: c.width, height: c.height, rgba: c.data };
+                &cut_out
+            }
+            _ => &view.image,
+        };
+        let (pixels, _note) = picture::prepare(image, cut, self.arch.proc_size, self.arch.enc_size, BORDER)?;
         let cond = self.condition(&pixels)?;
         self.ops.gpu.sync()?;
         report("image", 1, 1)?;
