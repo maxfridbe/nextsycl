@@ -557,9 +557,12 @@ impl Home {
         } else {
             ""
         };
+        // a saved voice without its transcript: not a model that clones only with one
+        let untold = !voice.is_empty() && self.voices().get(&voice).is_some_and(|v| v["text"].as_str().is_none_or(|t| t.trim().is_empty()));
         let can: Vec<String> = all.iter()
             .filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false)
             .filter(|m| m["speech"].as_array().is_some_and(|a| need.is_empty() || a.iter().any(|x| x == need)))
+            .filter(|m| !(untold && needs_text(all, &m["id"])))
             .map(|m| s(m, "id")).collect();
         let loaded = self.loaded_of("audio");
         loaded.into_iter().find(|l| can.contains(l)).or_else(|| can.first().cloned()).ok_or_else(|| {
@@ -959,6 +962,9 @@ impl Home {
                     v["sample"] = json!(format!("http://nextsycl/v1/audio/voices/{name}.wav"));
                     // ready: its sample is there and reads, and an enabled model can speak it now
                     let reads = lib.sample_path(&name).is_some_and(|f| nextsycl_audio::wav_info(&f).is_ok_and(|(_, secs)| secs > 0.0));
+                    // a voice that does not say what its sample says: not the models that clone only with the transcript
+                    let said = v["text"].as_str().is_some_and(|t| !t.trim().is_empty());
+                    let speakers: Vec<Value> = speakers.iter().filter(|id| said || !needs_text(&all, id)).cloned().collect();
                     v["ready"] = json!(reads && !speakers.is_empty());
                     v["models"] = json!(speakers);
                     if !reads {
@@ -1559,6 +1565,11 @@ impl Home {
             "paths": paths,
         })
     }
+}
+
+/// Whether a speech model clones only with what the recording says (its card's `speech` lists `transcript`)
+pub(super) fn needs_text(all: &[Value], id: &Value) -> bool {
+    all.iter().find(|m| &m["id"] == id).is_some_and(|m| m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "transcript")))
 }
 
 #[cfg(test)]

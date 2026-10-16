@@ -12,6 +12,7 @@ speech:
 - clone
 - direction
 - events
+- transcript                    # a clone needs what the recording says (saved voices without it go elsewhere)
 defaults:
   seconds: 60.0
   cfg: 4.0

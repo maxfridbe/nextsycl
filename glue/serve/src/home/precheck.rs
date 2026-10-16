@@ -213,6 +213,15 @@ impl Home {
         if !voice.is_empty() && saved(&voice) && !can("clone") {
             return Err(bad(format!("voice {voice} is a saved voice: speak it with a model that clones (qwen3-tts-base, voxcpm2)")));
         }
+        // a model that clones only with the transcript: a saved voice must have one, a recording its ref_text
+        if can("transcript") {
+            if !voice.is_empty() && carried.is_empty() && self.voices().get(&voice).is_some_and(|v| v["text"].as_str().is_none_or(|t| t.trim().is_empty())) {
+                return Err(bad(format!("voice {voice}: {id} clones only with what the sample says, and this voice has no transcript - add it again with text, or leave model out")));
+            }
+            if b["ref_audio"].as_str().is_some_and(|a| !a.is_empty()) && s(b, "ref_text").trim().is_empty() {
+                return Err(bad(format!("ref_text: {id} clones from a recording and its exact transcript")));
+            }
+        }
         if let Some(a) = b["ref_audio"].as_str().filter(|a| !a.is_empty()) {
             if !can("clone") {
                 return Err(bad(format!("ref_audio: {id} does not clone a voice")));

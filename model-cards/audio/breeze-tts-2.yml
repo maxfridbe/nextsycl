@@ -14,6 +14,7 @@ speech:
 - clone
 - direction
 - events
+- transcript                    # a clone needs what the recording says (saved voices without it go elsewhere)
 defaults:
   seconds: 60.0
   cfg: 4.0                      # used with an instruction (design, direction); a clone or plain read is unguided
