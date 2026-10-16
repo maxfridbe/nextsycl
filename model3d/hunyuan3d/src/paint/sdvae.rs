@@ -56,10 +56,13 @@ impl Mid {
     fn run(&self, ops: &Ops, mem: &Mem, x: &Map) -> Result<Map> {
         let h = self.r0.run(ops, mem, x, None)?;
         mem.end_block();
+        crate::prof::part(&ops.nsd, "sdvae resnet")?;
         let h = self.attn.run(ops, mem, &h)?;
         mem.end_block();
+        crate::prof::part(&ops.nsd, "sdvae attention")?;
         let h = self.r1.run(ops, mem, &h, None)?;
         mem.end_block();
+        crate::prof::part(&ops.nsd, "sdvae resnet")?;
         Ok(h)
     }
 }
@@ -126,10 +129,12 @@ impl SdVae {
             for r in rs {
                 y = r.run(ops, mem, &y, None)?;
                 mem.end_block();
+                crate::prof::part(&ops.nsd, "sdvae resnet")?;
             }
             if let Some(d) = ds {
                 y = d.run(ops, &mem.tmp, &mem.keep, &y, None)?;
                 mem.end_block();
+                crate::prof::part(&ops.nsd, "sdvae resample")?;
             }
         }
         y = self.e_mid.run(ops, mem, &y)?;
@@ -156,12 +161,14 @@ impl SdVae {
             for r in rs {
                 x = r.run(ops, mem, &x, None)?;
                 mem.end_block();
+                crate::prof::part(&ops.nsd, "sdvae resnet")?;
             }
             if let Some(u) = us {
                 let up = Map::new(&mem.tmp, x.n, 2 * x.h, 2 * x.w, x.c)?;
                 ops.up2(x.p(), x.n, x.h, x.w, x.c, up.buf.ptr())?;
                 x = u.run(ops, &mem.tmp, &mem.keep, &up, None)?;
                 mem.end_block();
+                crate::prof::part(&ops.nsd, "sdvae resample")?;
             }
         }
         let xn = self.d_norm.run(ops, &mem.tmp, &mem.keep, &x, true)?;

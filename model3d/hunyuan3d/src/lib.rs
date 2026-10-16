@@ -51,6 +51,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "chunk", env: "NS_M3D_HY_CHUNK", value: "N", help: "points the shape decoder queries at once", at: At::Both },
     EngineOption { name: "paint", env: "NS_M3D_HY_PAINT", value: "0|1", help: "2.1: load the paint model (textures; ~6.5 GiB more) when its files are there", at: At::Load },
     EngineOption { name: "paint-steps", env: "NS_M3D_HY_PAINT_STEPS", value: "N", help: "2.1: the texture's UniPC steps (15)", at: At::Both },
+    EngineOption { name: "int8", env: "NS_M3D_HY_INT8", value: "0|1", help: "2.1: the DiT's block matrices as int8 ConvRot (faster steps, 2.7 GiB less VRAM; approximate: see docs/environment.md)", at: At::Load },
     EngineOption { name: "attn", env: "NS_M3D_HY_ATTN", value: "flash|shared", help: "self-attention: the strided flash kernel (half), or the shared kernels' choice (oneDNN; int8 SageAttention from 8,192 rows)", at: At::Load },
 ];
 
@@ -158,11 +159,24 @@ impl Hunyuan3d {
             Some(x) => return Err(Error(format!("NS_M3D_HY_ATTN {x}: flash or shared"))),
         };
 
+        if let Some(s) = ops.silo {
+            log(format!("{}: the silo {} (its norms, GEGLU and adds)", arch.name, s.path.display()));
+        }
         let dw = Weights::new(model, "conditioner.main_image_encoder.model.", gpu);
         let dino = dino::Dino::load(&dw, arch.enc_size)?;
         log(format!("{}: DINOv2 of {} layers x {} at {} px ({} tokens)", arch.name, dino.layers(), dino.width, dino.size, dino.tokens()));
         let mw = Weights::new(model, "model.", gpu);
-        let dit = if arch.name == ARCH_MINI { Dit::Flux(flux::Flux::load(&mw)?) } else { Dit::Plain(plain::Plain::load(&mw)?) };
+        let mut dit = if arch.name == ARCH_MINI { Dit::Flux(flux::Flux::load(&mw)?) } else { Dit::Plain(plain::Plain::load(&mw)?) };
+        let mut weights_bytes = 0usize;
+        // 2.1's DiT only: 2mini's steps are no faster in int8 (its products are small), only less exact
+        if o.setting("NS_M3D_HY_INT8").is_some_and(|v| v == "1") && arch.name == ARCH_21 {
+            let t = Instant::now();
+            let had = ops.hadamard()?;
+            let saved = if let Dit::Plain(p) = &mut dit { p.to_int8(&ops, &had)? } else { 0 };
+            weights_bytes = weights_bytes.wrapping_sub(saved);
+            log(format!("{}: the DiT's block matrices as int8 ConvRot in {:.1} s ({:.2} GiB less)", arch.name, t.elapsed().as_secs_f64(),
+                        saved as f64 / (1u64 << 30) as f64));
+        }
         let vae = if arch.name == ARCH_MINI {
             let vf = open(files, "vae").map_err(|e| Error(format!("{}: the turbo decoder: {}", arch.name, e.0)))?;
             vae::Vae::load(&Weights::new(&vf, "", gpu), arch.scale_factor)?
@@ -191,7 +205,7 @@ impl Hunyuan3d {
             None => None,
         };
         gpu.sync()?;
-        let weights_bytes = dw.bytes.get() + mw.bytes.get() + vae.bytes + paint.as_ref().map_or(0, |p| p.bytes);
+        let weights_bytes = weights_bytes.wrapping_add(dw.bytes.get() + mw.bytes.get() + vae.bytes + paint.as_ref().map_or(0, |p| p.bytes));
         let load_seconds = t0.elapsed().as_secs_f64();
         log(format!("{}: loaded on {} in {load_seconds:.1} s ({:.2} GiB of weights)", arch.name, gpu.name, weights_bytes as f64 / (1u64 << 30) as f64));
         Ok(Hunyuan3d { arch, ops, dino, dit, vae, loaded: Instant::now(), load_seconds, settings: o.clone(), weights_bytes, paint, remover, busy: Mutex::new(()),

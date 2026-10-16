@@ -130,7 +130,7 @@ impl Gn {
     /// GroupNorm(x) (+ SiLU) into a new map of `out`
     pub fn run(&self, ops: &Ops, tmp: &Arena, out: &Arena, x: &Map, silu: bool) -> Result<Map> {
         let o = Map::new(out, x.n, x.h, x.w, x.c)?;
-        let stats = floats(tmp, x.n * GROUPS * 2)?;
+        let stats = floats(tmp, ops.group_norm_scratch(x.n, x.h * x.w, x.c, GROUPS))?;
         ops.group_norm(x.p(), x.n, x.h * x.w, x.c, GROUPS, self.w.ptr(), self.b.ptr(), self.eps, silu, stats.ptr(), o.buf.ptr())?;
         Ok(o)
     }
@@ -165,6 +165,7 @@ impl Resnet {
     pub fn run(&self, ops: &Ops, mem: &Mem, x: &Map, temb: Option<P>) -> Result<Map> {
         let (tmp, keep) = (&mem.tmp, &mem.keep);
         let h = self.n1.run(ops, tmp, tmp, x, true)?;
+        crate::prof::part(&ops.nsd, "resnet norm")?;
         let bias = match (&self.temb, temb) {
             (Some(l), Some(t)) => {
                 let b = floats(tmp, l.n)?;
@@ -175,8 +176,11 @@ impl Resnet {
             _ => None,
         };
         let h = self.c1.run(ops, tmp, tmp, &h, bias.as_ref().map(|b| b.ptr() as P))?;
+        crate::prof::part(&ops.nsd, "resnet conv")?;
         let h2 = self.n2.run(ops, tmp, tmp, &h, true)?;
+        crate::prof::part(&ops.nsd, "resnet norm")?;
         let out = self.c2.run(ops, tmp, keep, &h2, None)?;
+        crate::prof::part(&ops.nsd, "resnet conv")?;
         match &self.short {
             Some(s) => {
                 let sc = halves(tmp, x.rows() * s.n)?;

@@ -195,6 +195,28 @@ impl Plain {
         })
     }
 
+    /// The blocks' matrices as int8 ConvRot (`NS_M3D_HY_INT8`): the bytes saved
+    pub fn to_int8(&mut self, ops: &Ops, had: &DevBuf) -> Result<usize> {
+        let mut saved = 0;
+        for b in &mut self.blocks {
+            if let Some((wa, wb, _, _)) = &mut b.skip {
+                saved += ops.to_int8(wa, had)? + ops.to_int8(wb, had)?;
+            }
+            for l in [&mut b.qkv, &mut b.out1, &mut b.q2, &mut b.out2] {
+                saved += ops.to_int8(l, had)?;
+            }
+            let ffns: Vec<&mut Ffn> = match &mut b.mlp {
+                Mlp::Dense(f) => vec![f],
+                Mlp::Moe { experts, shared, .. } => experts.iter_mut().chain(std::iter::once(shared)).collect(),
+            };
+            for f in ffns {
+                saved += ops.to_int8(&mut f.up, had)? + ops.to_int8(&mut f.down, had)?;
+            }
+            ops.gpu.sync()?;
+        }
+        Ok(saved)
+    }
+
     pub fn depth(&self) -> usize {
         self.blocks.len()
     }
