@@ -571,6 +571,7 @@ dependencies = [
  "nextsycl-llm-qwen4exp",
  "nextsycl-model3d",
  "nextsycl-model3d-example",
+ "nextsycl-model3d-hunyuan3d",
  "nextsycl-models",
  "nextsycl-serve",
  "nextsycl-tok",
@@ -845,6 +846,18 @@ version = "0.0.0"
 dependencies = [
  "nextsycl-core",
  "nextsycl-model3d",
+]
+
+[[package]]
+name = "nextsycl-model3d-hunyuan3d"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-mesh",
+ "nextsycl-model3d",
+ "serde_json",
 ]
 
 [[package]]

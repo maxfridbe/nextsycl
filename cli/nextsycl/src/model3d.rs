@@ -19,11 +19,14 @@ nextsycl model3d tool decimate IN OUT --faces N          quadric decimation (pos
 nextsycl model3d tool remesh IN OUT [--edge X] [--passes N]   isotropic remeshing (even triangles)
 nextsycl model3d tool uv IN OUT [--size N]               a fresh atlas, the old texture or colours baked across
 nextsycl model3d tool convert IN OUT                     GLB <-> OBJ (by the extensions)
+nextsycl model3d check <dump dir> [--model ID] [--stages pre,cond,dit,steps,vae,grid] [--picture P] [--gpu N]
+                   an engine's stages against a reference's dumps (reference/hunyuan3d); a paint dump's stages:
+                   maps,pic,dino,enc,dual,unet,unipc,steps,decode
 nextsycl model3d engines | selftest [--gpu N]";
 
 /// The 3D engines this program has (model3d/<arch>)
 pub fn engines() -> Vec<nextsycl_model3d::Model3dKind> {
-    vec![nextsycl_model3d_example::kind()]
+    vec![nextsycl_model3d_example::kind(), nextsycl_model3d_hunyuan3d::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -152,6 +155,9 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
                             extra: nextsycl_core::options::by_name(super::engine_opts(), e.options()) };
     let t0 = std::time::Instant::now();
     let mesh = e.generate(&req, &mut progress).map_err(|e| e.0)?;
+    for l in e.report() {
+        eprintln!("{l}");
+    }
     let out = out_file(cfg, args, &format!("{}-{seed}", m["id"].as_str().unwrap_or("mesh")))?;
     std::fs::write(&out, nextsycl_model3d::mesh::glb::write(&mesh)?).map_err(|e| format!("{}: {e}", out.display()))?;
     println!("{} ({} triangles{}, {:.1} s, seed {seed})", out.display(), mesh.triangles(),
@@ -173,6 +179,36 @@ fn rig(cfg: &Config, args: &[String]) -> Result<(), String> {
     std::fs::write(&out, nextsycl_model3d::mesh::glb::write(&out_mesh)?).map_err(|e| format!("{}: {e}", out.display()))?;
     println!("{} ({} joints, {} frames, {:.1} s)", out.display(), out_mesh.skin.as_ref().map_or(0, |s| s.joints.len()),
              out_mesh.animation.as_ref().map_or(0, |a| a.frames.len()), t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// `nextsycl model3d check DIR`: an engine's stages against a reference's dumps (Hunyuan3D: reference/hunyuan3d)
+fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let dir = positional(args).into_iter().next().ok_or(USAGE)?;
+    nextsycl_core::use_kind("model3d");
+    let (m, files) = model(cfg, args, "generate")?;
+    let arch = m["arch"].as_str().unwrap_or("");
+    if ![nextsycl_model3d_hunyuan3d::ARCH_21, nextsycl_model3d_hunyuan3d::ARCH_MINI].contains(&arch) {
+        return Err(format!("check knows Hunyuan3D only, not {arch}"));
+    }
+    let model_file = files.get("model").ok_or("the entry has no model file")?;
+    let st = nextsycl_gguf::safetensors::SafeTensors::open(model_file).map_err(|e| e.0)?;
+    let a = if arch == nextsycl_model3d_hunyuan3d::ARCH_MINI { nextsycl_model3d_hunyuan3d::MINI } else { nextsycl_model3d_hunyuan3d::V21 };
+    let g = gpu(args)?;
+    let mut log = |s: String| eprintln!("{s}");
+    let e = nextsycl_model3d_hunyuan3d::Hunyuan3d::load(a, &files, &st, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+    let stages: Vec<String> = opt(args, "--stages").unwrap_or("all").split(',').map(str::to_string).collect();
+    let pic = opt(args, "--picture").map(|p| std::fs::read(p).map_err(|e| format!("{p}: {e}")).and_then(|b| nextsycl_model3d::read_picture(&b))).transpose()?;
+    // the paint model's dumps (reference/hunyuan3d/ref_paint.py) hold the views' maps; the shape's do not
+    let d = Path::new(&dir);
+    let worst = if d.join("normal.npy").exists() {
+        let stages = if stages.iter().any(|s| s == "all") { vec!["paint".to_string()] } else { stages };
+        nextsycl_model3d_hunyuan3d::check::run_paint(&e, d, &stages, pic.as_ref(), &mut log)
+    } else {
+        nextsycl_model3d_hunyuan3d::check::run(&e, d, &stages, pic.as_ref(), &mut log)
+    }
+    .map_err(|e| e.0)?;
+    println!("worst relative error {worst:.2e}");
     Ok(())
 }
 
@@ -331,6 +367,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("gen" | "generate") => gen(cfg, rest),
         Some("rig" | "animate") => rig(cfg, rest),
         Some("tool" | "tools") => tool(rest),
+        Some("check") => check(cfg, rest),
         Some("serve") => serve(cfg, rest, false),
         Some("start") => SERVED.start(cfg, rest, |d| serve(cfg, rest, d)),
         Some("ps") => SERVED.ps(cfg, rest),

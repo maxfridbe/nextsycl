@@ -3,9 +3,14 @@
 //! met. Boundary edges carry a perpendicular plane (the outline keeps its shape); a collapse that would flip a
 //! triangle or pinch the surface (a link condition) is refused. Positions and colours are kept; UVs, normals and a
 //! skin are dropped (re-UV with `uv`, normals with `Mesh::compute_normals`).
+//!
+//! A large mesh (a marching cubes surface: a million triangles) is first reduced in slabs, side by side: its
+//! triangles split along the longest axis into one slab a thread, each decimated to its share of the budget with the
+//! vertices it shares with a neighbour held still, the slabs welded back; one pass over the whole then meets the
+//! budget (and clears the bands the held vertices left).
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 
 use crate::{cross, dot, normalize, sub, Mesh};
 
@@ -53,27 +58,30 @@ impl Q {
     }
 }
 
+/// A collapse priced: its edge (the ends' stamps when priced: a moved end makes it stale) and where it goes
 struct Cand {
-    cost: f64,
     a: u32,
     b: u32,
     stamp: (u32, u32),
     to: [f32; 3],
 }
-impl PartialEq for Cand {
-    fn eq(&self, o: &Self) -> bool {
-        self.cost == o.cost
-    }
+
+/// The candidates, and a min-heap of 8-byte keys over them - (cost as float32 bits, index): costs are not negative,
+/// so their bits order as they do; a small key keeps the heap's walks in cache (most of its pops are stale ones)
+struct Queue {
+    cands: Vec<Cand>,
+    heap: BinaryHeap<Reverse<u64>>,
 }
-impl Eq for Cand {}
-impl PartialOrd for Cand {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
+
+impl Queue {
+    fn push(&mut self, cost: f64, c: Cand) {
+        let i = self.cands.len() as u64;
+        self.cands.push(c);
+        self.heap.push(Reverse(((cost.max(0.0) as f32).to_bits() as u64) << 32 | i));
     }
-}
-impl Ord for Cand {
-    fn cmp(&self, o: &Self) -> Ordering {
-        o.cost.total_cmp(&self.cost) // a min-heap
+    fn pop(&mut self) -> Option<&Cand> {
+        let Reverse(k) = self.heap.pop()?;
+        Some(&self.cands[(k & 0xffff_ffff) as usize])
     }
 }
 
@@ -90,6 +98,90 @@ pub fn decimate(input: &Mesh, target: usize) -> Mesh {
         super::compact(&mut m);
         return m;
     }
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    if threads > 1 && m.triangles() >= SLABS_FROM && m.triangles() > 4 * target {
+        m = in_slabs(&m, target, threads, diag);
+    }
+    collapse(m, target, &[], diag)
+}
+
+/// Meshes of at least this many triangles are reduced in slabs first
+const SLABS_FROM: usize = 200_000;
+
+/// The mesh's triangles in `k` slabs along its longest axis, each decimated to target / k on a thread of its own
+/// with the vertices on its cut held still, welded back together
+fn in_slabs(m: &Mesh, target: usize, k: usize, diag: f32) -> Mesh {
+    let (lo, hi) = m.bounds();
+    let axis = (0..3).max_by(|&a, &b| (hi[a] - lo[a]).total_cmp(&(hi[b] - lo[b]))).unwrap_or(0);
+    let ntri = m.triangles();
+    let key = |t: usize| (0..3).map(|j| m.positions[m.indices[t * 3 + j] as usize][axis]).sum::<f32>();
+    let mut order: Vec<usize> = (0..ntri).collect();
+    order.sort_by(|&a, &b| key(a).total_cmp(&key(b)));
+    let per = ntri.div_ceil(k);
+    // the slab of each triangle, and which vertices more than one slab uses
+    let mut slab_of = vec![0usize; ntri];
+    for (i, &t) in order.iter().enumerate() {
+        slab_of[t] = i / per;
+    }
+    let mut first = vec![usize::MAX; m.positions.len()];
+    let mut shared = vec![false; m.positions.len()];
+    for (t, &st) in slab_of.iter().enumerate() {
+        for j in 0..3 {
+            let v = m.indices[t * 3 + j] as usize;
+            if first[v] == usize::MAX {
+                first[v] = st;
+            } else if first[v] != st {
+                shared[v] = true;
+            }
+        }
+    }
+    let slabs: Vec<(Mesh, Vec<bool>)> = (0..k).map(|s| {
+        let mut local = vec![u32::MAX; m.positions.len()];
+        let mut sub = Mesh::default();
+        let mut held = Vec::new();
+        for &t in &order[(s * per).min(ntri)..((s + 1) * per).min(ntri)] {
+            for j in 0..3 {
+                let v = m.indices[t * 3 + j] as usize;
+                if local[v] == u32::MAX {
+                    local[v] = sub.positions.len() as u32;
+                    sub.positions.push(m.positions[v]);
+                    if let Some(c) = m.colors.get(v) {
+                        sub.colors.push(*c);
+                    }
+                    held.push(shared[v]);
+                }
+                sub.indices.push(local[v]);
+            }
+        }
+        (sub, held)
+    }).collect();
+    let share = target.div_ceil(k);
+    let done: Vec<Mesh> = std::thread::scope(|sc| {
+        let hs: Vec<_> = slabs.into_iter().map(|(sub, held)| sc.spawn(move || collapse(sub, share, &held, diag))).collect();
+        hs.into_iter().map(|h| h.join().expect("a decimation thread")).collect()
+    });
+    let mut all = Mesh { material: m.material.clone(), ..Default::default() };
+    for d in done {
+        let base = all.positions.len() as u32;
+        all.positions.extend_from_slice(&d.positions);
+        all.colors.extend_from_slice(&d.colors);
+        all.indices.extend(d.indices.iter().map(|i| i + base));
+    }
+    if all.colors.len() != all.positions.len() {
+        all.colors.clear();
+    }
+    // the held vertices meet their twins at the very same place
+    super::weld(&all, diag * 1e-6).0
+}
+
+/// Collapses edges of a welded mesh until it has at most `target` triangles; `held` (empty: none) marks vertices
+/// that may not move
+fn collapse(mut m: Mesh, target: usize, held: &[bool], diag: f32) -> Mesh {
+    if m.triangles() <= target {
+        super::compact(&mut m);
+        return m;
+    }
+    let is_held = |v: u32| held.get(v as usize).copied().unwrap_or(false);
     let nv = m.positions.len();
     let mut tris: Vec<[u32; 3]> = m.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
     let mut alive = vec![true; tris.len()];
@@ -152,28 +244,60 @@ pub fn decimate(input: &Mesh, target: usize) -> Mesh {
         }
         (best.0.max(0.0), [best.1[0] as f32, best.1[1] as f32, best.1[2] as f32])
     };
-    let mut heap = BinaryHeap::new();
+    let mut queue = Queue { cands: Vec::new(), heap: BinaryHeap::new() };
     for &(a, b) in edges.keys() {
         let (cost, to) = price(&q, &m.positions, a, b);
-        heap.push(Cand { cost, a, b, stamp: (0, 0), to });
+        queue.push(cost, Cand { a, b, stamp: (0, 0), to });
     }
     let mut live = tris.len();
-    let neighbours = |vt: &[Vec<u32>], tris: &[[u32; 3]], alive: &[bool], v: u32| -> HashSet<u32> {
-        vt[v as usize].iter().filter(|&&t| alive[t as usize]).flat_map(|&t| tris[t as usize]).filter(|&x| x != v).collect()
+    // a vertex's neighbours, sorted (a dozen or so: a sorted list beats a hash set by far)
+    let neighbours = |vt: &[Vec<u32>], tris: &[[u32; 3]], alive: &[bool], v: u32| -> Vec<u32> {
+        let mut n: Vec<u32> = vt[v as usize].iter().filter(|&&t| alive[t as usize]).flat_map(|&t| tris[t as usize]).filter(|&x| x != v).collect();
+        n.sort_unstable();
+        n.dedup();
+        n
+    };
+    let shared_count = |x: &[u32], y: &[u32]| -> usize {
+        let (mut i, mut j, mut c) = (0, 0, 0);
+        while i < x.len() && j < y.len() {
+            match x[i].cmp(&y[j]) {
+                Ordering::Less => i += 1,
+                Ordering::Greater => j += 1,
+                Ordering::Equal => {
+                    c += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        c
     };
     while live > target {
-        let Some(c) = heap.pop() else { break };
+        // stale candidates (an end moved since they were priced) pile up: past a few per live edge, drop them (a
+        // smaller heap is a faster one - its pops walk memory)
+        if queue.heap.len() > 6 * live {
+            let cands = &queue.cands;
+            let fresh: Vec<Reverse<u64>> = std::mem::take(&mut queue.heap).into_vec().into_iter()
+                .filter(|Reverse(k)| {
+                    let c = &cands[(k & 0xffff_ffff) as usize];
+                    !gone[c.a as usize] && !gone[c.b as usize] && stamp[c.a as usize] == c.stamp.0 && stamp[c.b as usize] == c.stamp.1
+                })
+                .collect();
+            queue.heap = BinaryHeap::from(fresh);
+        }
+        let Some(&Cand { a, b, stamp: cs, to: cto }) = queue.pop() else { break };
+        let c = Cand { a, b, stamp: cs, to: cto };
         let (a, b) = (c.a, c.b);
-        if gone[a as usize] || gone[b as usize] || stamp[a as usize] != c.stamp.0 || stamp[b as usize] != c.stamp.1 {
+        if gone[a as usize] || gone[b as usize] || stamp[a as usize] != c.stamp.0 || stamp[b as usize] != c.stamp.1 || is_held(a) || is_held(b) {
             continue;
         }
         let na = neighbours(&vt, &tris, &alive, a);
-        if !na.contains(&b) {
+        if na.binary_search(&b).is_err() {
             continue;
         }
         let nb = neighbours(&vt, &tris, &alive, b);
         // the link condition: the edge's two ends share exactly the vertices opposite it (2 inside, 1 on a boundary)
-        let shared = na.intersection(&nb).count();
+        let shared = shared_count(&na, &nb);
         let opposite = vt[a as usize].iter().filter(|&&t| alive[t as usize] && tris[t as usize].contains(&b)).count();
         if shared != opposite {
             continue;
@@ -229,7 +353,7 @@ pub fn decimate(input: &Mesh, target: usize) -> Mesh {
         stamp[a as usize] += 1;
         for n in neighbours(&vt, &tris, &alive, a) {
             let (cost, to) = price(&q, &m.positions, a, n);
-            heap.push(Cand { cost, a, b: n, stamp: (stamp[a as usize], stamp[n as usize]), to });
+            queue.push(cost, Cand { a, b: n, stamp: (stamp[a as usize], stamp[n as usize]), to });
         }
     }
     m.indices = tris.iter().zip(&alive).filter(|(_, &l)| l).flat_map(|(t, _)| *t).collect();
@@ -259,5 +383,30 @@ mod tests {
     fn under_budget_is_left_alone() {
         let m = sphere(6, 8);
         assert_eq!(decimate(&m, 10_000).triangles(), m.triangles());
+    }
+
+    /// A million triangles to 40,000, timed: `cargo test --release -p nextsycl-mesh decimate_a_million -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn decimate_a_million() {
+        let m = sphere(500, 1000);
+        let t = std::time::Instant::now();
+        let d = decimate(&m, 40_000);
+        eprintln!("{} -> {} triangles in {:.2} s", m.triangles(), d.triangles(), t.elapsed().as_secs_f64());
+        assert!(is_closed_manifold(&d));
+        let worst = d.positions.iter().map(|p| (crate::length(*p) - 1.0).abs()).fold(0f32, f32::max);
+        assert!(worst < 0.01, "a vertex {worst} off the surface");
+    }
+
+    #[test]
+    fn slabs_meet_the_budget_and_stay_closed() {
+        // big enough for the slabs (200,000 triangles)
+        let m = sphere(200, 520);
+        assert!(m.triangles() >= SLABS_FROM);
+        let d = decimate(&m, 20_000);
+        assert!(d.triangles() <= 20_000 && d.triangles() > 15_000, "{} triangles", d.triangles());
+        assert!(is_closed_manifold(&d), "the slabs left holes or folds");
+        let worst = d.positions.iter().map(|p| (crate::length(*p) - 1.0).abs()).fold(0f32, f32::max);
+        assert!(worst < 0.01, "a vertex {worst} off the surface");
     }
 }
