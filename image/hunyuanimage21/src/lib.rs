@@ -166,10 +166,11 @@ impl HunyuanImage21 {
         let nsd = &self.nsd;
         let ts = sched::timesteps(sigmas, self.dit.meanflow);
         let st = self.dit.steps(nsd, &ts, guidance.map(|g| g * 1000.0))?;
-        let mut branches = vec![self.dit.branch(nsd, &pos.text, hw)?];
+        let mut texts = vec![&pos.text];
         if let Some((e, _)) = neg {
-            branches.push(self.dit.branch(nsd, &e.text, hw)?);
+            texts.push(&e.text);
         }
+        let batch = self.dit.batch(nsd, &texts, hw)?;
         let lat = DevBuf::from_f32(&nsd.gpu, x)?;
         let n = x.len();
         // APG starts later when the glyph path is on: the pipeline sets its OCR flag from the last prompt it encodes
@@ -177,7 +178,7 @@ impl HunyuanImage21 {
         let mut apg = neg.map(|(e, _)| sched::Apg::new(if e.glyphs { sched::APG_START_OCR } else { sched::APG_START }));
         for i in 0..ts.len() {
             prof::reset_clock(nsd)?;
-            let v = self.dit.forward(nsd, &st, i, &branches, &[&lat, &lat], &mut |_, _, _, _| Ok(()))?;
+            let v = self.dit.forward(nsd, &st, i, &batch, &[&lat, &lat], &mut |_, _, _, _| Ok(()))?;
             let v = match (neg, &mut apg) {
                 (Some((_, scale)), Some(g)) if mode == Guidance::Apg => {
                     let (c, u) = (v[0].to_f32()?, v[1].to_f32()?);
@@ -208,10 +209,11 @@ impl HunyuanImage21 {
     pub fn denoise_sampled(&self, pos: &Encoded, neg: Option<(&Encoded, f32)>, guidance: Option<f32>, x: Vec<f32>, hw: (usize, usize), sigmas: &[f32],
                            sampler: Sampler, seed: u64, each: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
         let nsd = &self.nsd;
-        let mut branches = vec![self.dit.branch(nsd, &pos.text, hw)?];
+        let mut texts = vec![&pos.text];
         if let Some((e, _)) = neg {
-            branches.push(self.dit.branch(nsd, &e.text, hw)?);
+            texts.push(&e.text);
         }
+        let batch = self.dit.batch(nsd, &texts, hw)?;
         let lat = DevBuf::f32(&nsd.gpu, x.len())?;
         let mut model = |x: &[f32], sigma: f32| -> std::result::Result<Vec<f32>, String> {
             let run = || -> Result<Vec<f32>> {
@@ -219,7 +221,7 @@ impl HunyuanImage21 {
                 let next = sigmas.iter().position(|s| (*s - sigma).abs() < 1e-6).and_then(|i| sigmas.get(i + 1)).copied();
                 let tr = self.dit.meanflow.then(|| next.unwrap_or(sigma) * 1000.0);
                 let st = self.dit.steps(nsd, &[(sigma * 1000.0, tr)], guidance.map(|g| g * 1000.0))?;
-                let v = self.dit.forward(nsd, &st, 0, &branches, &[&lat, &lat], &mut |_, _, _, _| Ok(()))?;
+                let v = self.dit.forward(nsd, &st, 0, &batch, &[&lat, &lat], &mut |_, _, _, _| Ok(()))?;
                 let v = match neg {
                     Some((_, scale)) => {
                         let (c, u) = (v[0].to_f32()?, v[1].to_f32()?);
