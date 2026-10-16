@@ -168,6 +168,12 @@ pub fn run(e: &Hunyuan3d, dir: &Path, stages: &[String], picture: Option<&Textur
         keep(line("grid logits", &got, &want, log)?);
         let flips = got.iter().zip(&want).filter(|(a, b)| (**a > 0.0) != (**b > 0.0)).count();
         log(format!("grid: {flips} of {} points on the other side of the surface", want.len()));
+        // coarse to fine: the same surface from a share of the points
+        let t = std::time::Instant::now();
+        let (fast, queried) = e.decode_fast(&latents, res, e.vae.chunk(), &mut |_, _| Ok(()))?;
+        let flips = fast.iter().zip(&want).filter(|(a, b)| (**a > 0.0) != (**b > 0.0)).count();
+        log(format!("grid {res} coarse to fine: {:.2} s, {queried} points queried ({:.0} %), {flips} on the other side of the surface", t.elapsed().as_secs_f64(),
+                    100.0 * queried as f64 / want.len() as f64));
         let t = std::time::Instant::now();
         let m = Hunyuan3d::mesh(&got, res);
         log(format!("mesh: {} vertices, {} triangles in {:.2} s (the reference's skimage: {} vertices, {} faces)", m.positions.len(), m.triangles(),

@@ -15,6 +15,7 @@ pub mod check;
 pub mod dino;
 mod ffi;
 pub mod flux;
+pub mod grid;
 pub mod ops;
 pub mod picture;
 pub mod plain;
@@ -210,6 +211,40 @@ impl Hunyuan3d {
         self.vae.query_lattice(&self.ops, &data, &sc, res + 1, -BOUNDS, step, None, progress)
     }
 
+    /// The same lattice decoded coarse to fine (`grid`): the whole of the coarsest level, then at each finer one
+    /// only the points near the surface; `progress(level, levels)`. Also the points queried.
+    pub fn decode_fast(&self, latents: &[f32], res: usize, chunk: usize, progress: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<(Vec<f32>, usize)> {
+        let n = latents.len() / self.vae.channels;
+        let tokens = self.vae.tokens(&self.ops, latents)?;
+        let data = self.vae.data(&self.ops, &tokens, n)?;
+        drop(tokens);
+        let sc = self.vae.query_scratch(&self.ops, chunk)?;
+        let lv = grid::levels(res, 63);
+        let mut g: Vec<f32> = Vec::new();
+        let mut prev = 0;
+        let mut queried = 0;
+        for (k, &r) in lv.iter().enumerate() {
+            let r1 = r + 1;
+            let step = 2.0 * BOUNDS / r as f32;
+            if k == 0 {
+                g = self.vae.query_lattice(&self.ops, &data, &sc, r1, -BOUNDS, step, None, &mut |_, _| Ok(()))?;
+                queried += g.len();
+            } else {
+                let idx = grid::refine(&g, prev, r1, 0.0, k + 1 == lv.len());
+                let vals = self.vae.query_lattice(&self.ops, &data, &sc, r1, -BOUNDS, step, Some(&idx), &mut |_, _| Ok(()))?;
+                queried += idx.len();
+                let mut fine = grid::upsample(&g, prev, r1);
+                for (i, v) in idx.iter().zip(vals) {
+                    fine[*i as usize] = v;
+                }
+                g = fine;
+            }
+            prev = r1;
+            progress(k + 1, lv.len())?;
+        }
+        Ok((g, queried))
+    }
+
     /// The mesh of a logit grid: marching cubes at 0, the floaters dropped
     pub fn mesh(logits: &[f32], res: usize) -> Mesh {
         let r1 = res + 1;
@@ -283,7 +318,11 @@ impl Model3dEngine for Hunyuan3d {
         drop(st);
         drop(cond);
         let chunk = num("chunk", "NS_M3D_HY_CHUNK")?.unwrap_or_else(|| self.vae.chunk());
-        let logits = self.decode_dense(&latents, res, chunk, &mut |a, b| report("decode", (a / 1024) as u32, (b / 1024) as u32))?;
+        let logits = match self.setting(req, "decode", "NS_M3D_HY_DECODE").as_deref() {
+            Some("dense") => self.decode_dense(&latents, res, chunk, &mut |a, b| report("decode", (a * 100 / b.max(1)) as u32, 100))?,
+            None | Some("fast") => self.decode_fast(&latents, res, chunk, &mut |a, b| report("decode", a as u32, b as u32))?.0,
+            Some(x) => return Err(Error(format!("decode {x}: fast or dense"))),
+        };
         report("mesh", 0, 1)?;
         let m = Self::mesh(&logits, res);
         if m.triangles() == 0 {
