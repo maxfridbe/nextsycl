@@ -86,6 +86,21 @@ impl Opt {
         Ok(Pool { k, v, cap, used: 0 })
     }
 
+    /// The pool with room for `cap` slots, its used ones copied over (the old one freed)
+    pub fn grow(&self, o: &Ops, pool: &mut Pool, cap: usize) -> Result<()> {
+        if cap <= pool.cap {
+            return Err(Error("the key / value pool cannot grow further (the card's memory)".into()));
+        }
+        let mut new = self.pool(o, cap)?;
+        for l in 0..LAYERS {
+            new.k[l].copy_within(0, &pool.k[l], 0, pool.used * WIDTH * 4)?;
+            new.v[l].copy_within(0, &pool.v[l], 0, pool.used * WIDTH * 4)?;
+        }
+        new.used = pool.used;
+        *pool = new;
+        Ok(())
+    }
+
     /// Bytes of a pool of `cap` slots
     pub fn pool_bytes(cap: usize) -> usize {
         LAYERS * 2 * cap * WIDTH * 4

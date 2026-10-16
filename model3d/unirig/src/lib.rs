@@ -141,15 +141,16 @@ impl UniRig {
         let l0 = encoder::TOKENS + START.len();
         let nb = s.beams.max(1);
         let max_new = s.max_new.min(self.opt.max_positions() - l0);
-        // the pool: the prefix's slots, then one a beam a step - as many steps as the card holds (1.5 GiB kept free)
+        // the pool: the prefix's slots, then one a beam a step - grown as the sequences do, as far as the card holds
+        // (1.5 GiB kept free)
         let free = o.gpu.memory()?.1.unwrap_or(8 << 30) as usize;
         let room = free.saturating_sub(3 << 29) / opt::Opt::pool_bytes(1);
-        let cap = (l0 + nb * max_new).min(room);
-        if cap < l0 + nb * 8 {
+        let most = (l0 + nb * max_new).min(room);
+        if most < l0 + nb * 8 {
             return Err(Error(format!("not enough free memory on {} for the decoder's cache", o.gpu.name)));
         }
-        let max_new = max_new.min((cap - l0) / nb);
-        let mut pool = self.opt.pool(o, cap)?;
+        let max_new = max_new.min((most - l0) / nb);
+        let mut pool = self.opt.pool(o, (l0 + nb * 192).min(most))?;
         let x = o.buf(l0 * opt::WIDTH)?;
         x.copy_within(0, prefix, 0, l0 * opt::WIDTH * 4)?;
         let first = self.opt.prefill(o, &x, l0, &mut pool, 1)?;
@@ -168,6 +169,10 @@ impl UniRig {
                 if t == tokens::EOS || seq.len() >= max_new {
                     return Ok(seq);
                 }
+                if pool.used + 1 > pool.cap {
+                    let cap = (pool.cap * 2).min(most);
+                self.opt.grow(o, &mut pool, cap)?;
+                }
                 hist[0].push(pool.used as i32);
                 slots.write(0, &ops::i32_bytes(&hist[0]))?;
                 logits = self.opt.step(o, &[t], l0 + seq.len() - 1, &mut pool, &slots, stride)?;
@@ -180,6 +185,10 @@ impl UniRig {
             progress(beams.running[0].len())?;
             if beams.done {
                 return Ok(beams.best());
+            }
+            if pool.used + nb > pool.cap {
+                let cap = (pool.cap * 2).min(most);
+                self.opt.grow(o, &mut pool, cap)?;
             }
             // the new running beams follow their parents' slots, then a slot of their own
             let old = hist.clone();
