@@ -4,6 +4,9 @@ resolver = "2"
 # crate an architecture (llm/, image/, video/) -, the glue that makes them a service (glue/), the program (cli/)
 members = [
     "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl",
+    "crates/mesh",
+    "model3d/contract",
+    "model3d/example",
     "llm/contract", "llm/glm5next", "llm/qwen4exp", "llm/qwen35", "llm/deepseek2", "llm/deepseek4", "llm/museglimmer", "llm/nemotronh", "llm/example",
     "image/contract", "image/example", "image/qwenimage21", "image/unlimitedocr", "image/paddleocrvl", "image/olmocr2",
     "video/contract", "video/example", "video/h3",
@@ -24,6 +27,7 @@ nextsycl-gguf = { path = "crates/gguf" }
 nextsycl-tok = { path = "crates/tok" }
 nextsycl-diffusion = { path = "crates/diffusion" }
 nextsycl-qwen3vl = { path = "crates/qwen3vl" }
+nextsycl-mesh = { path = "crates/mesh" }
 nextsycl-llm = { path = "llm/contract" }
 nextsycl-llm-glm5next = { path = "llm/glm5next" }
 nextsycl-llm-qwen4exp = { path = "llm/qwen4exp" }
@@ -47,6 +51,8 @@ nextsycl-audio-example = { path = "audio/example" }
 nextsycl-audio-minimaxmusic3 = { path = "audio/minimaxmusic3" }
 nextsycl-audio-qwen3tts = { path = "audio/qwen3tts" }
 nextsycl-audio-voxcpm2 = { path = "audio/voxcpm2" }
+nextsycl-model3d = { path = "model3d/contract" }
+nextsycl-model3d-example = { path = "model3d/example" }
 nextsycl-models = { path = "glue/models" }
 nextsycl-serve = { path = "glue/serve" }
 serde_json = "1"

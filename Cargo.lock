@@ -568,6 +568,8 @@ dependencies = [
  "nextsycl-llm-nemotronh",
  "nextsycl-llm-qwen35",
  "nextsycl-llm-qwen4exp",
+ "nextsycl-model3d",
+ "nextsycl-model3d-example",
  "nextsycl-models",
  "nextsycl-serve",
  "nextsycl-tok",
@@ -808,6 +810,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextsycl-mesh"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "png 0.17.16",
+ "serde_json",
+]
+
+[[package]]
+name = "nextsycl-model3d"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-mesh",
+]
+
+[[package]]
+name = "nextsycl-model3d-example"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-model3d",
+]
+
+[[package]]
 name = "nextsycl-models"
 version = "0.0.0"
 dependencies = [
@@ -837,6 +864,7 @@ dependencies = [
  "nextsycl-diffusion",
  "nextsycl-image",
  "nextsycl-llm",
+ "nextsycl-model3d",
  "nextsycl-tok",
  "serde_json",
  "sha2",

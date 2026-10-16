@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-mesh"
+description = "What every 3D engine shares: meshes (textures, PBR, skins, morph animation), GLB and OBJ files, and the CPU tools (decimate, remesh, re-UV)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+png = "0.17"
+# reading the textures and pictures a mesh file carries (PNG, JPEG); CPU decoders only
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

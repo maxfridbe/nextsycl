@@ -1,6 +1,6 @@
 # Architecture
 
-nextsycl runs language, image, video and audio models on Intel Arc GPUs. Each **kind** of model has a contract - a Rust
+nextsycl runs language, image, video, audio and 3D models on Intel Arc GPUs. Each **kind** of model has a contract - a Rust
 trait its server and command line drive - and each model **architecture** has its own engine behind it: a complete
 runtime for that model on these GPUs, with its own kernels. There is no generic forward pass parameterised by a config:
 the speed here comes from decisions that only make sense for one model (GLM-5.3's KDA scan sized per card, its MLA
@@ -21,6 +21,8 @@ crates/                    THE FOUNDATION - every kind uses it, it knows no kind
   diffusion  nextsycl-diffusion  what every diffusion engine shares: samplers and schedules by name, the sigma
                                  schedules, LoRA references, pictures (PNG); the diffusion kernels' bindings (Nsd)
   qwen3vl    nextsycl-qwen3vl    the Qwen3-VL text tower (int8 ConvRot): a text encoder image and video engines share
+  mesh       nextsycl-mesh       meshes (PBR textures, skins, morph animation), GLB and OBJ, and the CPU tools: weld,
+                                 decimate (quadric), remesh (isotropic), re-UV (charts, packing, baking), closest points
 
 llm/                       LANGUAGE MODELS
   contract   nextsycl-llm        the contract: Engine, Session / Decoder / Checkpoint, Sampler, EngineKind; host sampling
@@ -53,6 +55,11 @@ audio/                     AUDIO
                                  AudioVAE V2, a .pth reader, stage checks
   example    nextsycl-audio-example  a template
 
+model3d/                   3D
+  contract   nextsycl-model3d    the contract: Model3dEngine (generate: pictures to a mesh; rig: a skeleton and skin
+                                 weights, or motion from words), MeshRequest / RigRequest, Abilities, Step, Model3dKind
+  example    nextsycl-model3d-example  a template
+
 glue/                      WHAT MAKES ENGINES A PRODUCT (libraries too)
   models     nextsycl-models     the registry of what a machine serves, settings, the catalog of supported models
   serve      nextsycl-serve      the servers: OpenAI-compatible APIs over a kind's contract (llm, image, audio), the prompt
@@ -66,7 +73,7 @@ kernels/                   SYCL ONLY - one library a kind (dist/libnextsycl-<kin
   strata/                 the imported Strata kernels (MIT), linked into the llm library
   diffusion/              the shared diffusion kernels (H3's, on oneDNN), linked into the image, video and audio libraries;
                           diffusion/flash: flash attention (ARK on sycl-tla) as libnextsycl-flash.so, loaded on use
-  llm/<arch>/  image/<arch>/  video/<arch>/  audio/<arch>/   an engine's own kernels and its header
+  llm/<arch>/  image/<arch>/  video/<arch>/  audio/<arch>/  model3d/<arch>/   an engine's own kernels and its header
                           (ns_<kind>_<arch>_* symbols)
   <kind>/<arch>/silo/     the engine's silo: kernels tuned for that model alone, replacing shared ones for what they
                           cover - their own library, dist/silo/libnextsycl-<arch>.so, opened by the engine at load
@@ -122,6 +129,13 @@ keyframes, an audio reference, the output path; progress by stage; `cancel` stop
 **audio** (`nextsycl-audio`) - `generate(request, progress) -> Audio`: the description, the lyrics, a length limit,
 steps, guidance, seed; `defaults()` (with the longest it makes and its sample rate); progress by the engine's phases,
 and an error from `progress` cancels. Files by role, a sharded file as `<role>-1`, `<role>-2` ... (`shards`).
+
+**model3d** (`nextsycl-model3d`) - `generate(request, progress) -> Mesh` (one or several pictures of an object, each
+with the side it shows; texture or not; seed, steps, guidance, resolution, a triangle budget) and `rig(request,
+progress) -> Mesh` (a mesh in; a skeleton and skin weights, or with a prompt a morph animation); `abilities()` says
+which it does, how many views it takes and whether it paints; `defaults()`. Meshes are `nextsycl_mesh::Mesh`, written
+as GLB. The server (`nextsycl model3d serve`) answers `/v1/model3d/generate` and `/rig`; the front door runs them as
+jobs (`model3d.generate`, `model3d.rig`, as image.generate's) and the CPU tools itself (`model3d.tool`).
 
 ## Adding a model
 

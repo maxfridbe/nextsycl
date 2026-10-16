@@ -42,6 +42,21 @@ const SOUND_ITEM: &str = r#"{"type": "object", "properties": {"url": {"type": "s
     "voice": {"type": "string", "nullable": true, "description": "speech"}, "language": {"type": "string", "nullable": true}, "instructions": {"type": "string", "nullable": true},
     "cloned": {"type": "boolean", "description": "speech: spoken in a recording's voice"}}}"#;
 
+/// One mesh made (model3d.generate / model3d.rig; model3d.history's items)
+const MESH_ITEM: &str = r#"{"type": "object", "properties": {
+    "url": {"type": "string", "description": "the GLB (glTF binary): GET it with the token"}, "picture": {"type": "string", "description": "generate: the picture it was made from (PNG)"},
+    "model": {"type": "string"}, "arch": {"type": "string"}, "seed": {"type": "integer"}, "steps": {"type": "integer"}, "cfg": {"type": "number"}, "resolution": {"type": "integer"},
+    "faces": {"type": "integer", "description": "the triangle budget asked"}, "triangles": {"type": "integer", "description": "what it has"}, "texture": {"type": "boolean"}, "textured": {"type": "boolean"},
+    "rigged": {"type": "integer", "nullable": true, "description": "rig: its joints"}, "animated": {"type": "integer", "nullable": true, "description": "animate: its frames"},
+    "prompt": {"type": "string", "nullable": true}, "views": {"type": "array", "items": {"type": "string", "nullable": true}}, "bytes": {"type": "integer"},
+    "took": {"type": "number"}, "wh": {"type": "number", "nullable": true}, "created": {"type": "integer"}}}"#;
+
+/// model3d.generate / model3d.rig (and /v1/model3d/... with response_format url)
+fn meshes() -> String {
+    format!(r#"{{"type": "object", "properties": {{"created": {{"type": "integer"}}, "data": {{"type": "array", "items": {MESH_ITEM}}},
+  "run": {{"type": "object", "description": "how it was made (the /v1 routes call this nextsycl)", "properties": {{"took": {{"type": "number"}}, "seed": {{"type": "integer"}}, "wh": {{"type": "number", "nullable": true}}, "triangles": {{"type": "integer"}}}}}}}}}}"#)
+}
+
 /// audio.generate / audio.speak (and /v1/audio/speech with response_format url)
 fn sound() -> String {
     format!(r#"{{"type": "object", "properties": {{"created": {{"type": "integer"}}, "data": {{"type": "array", "items": {SOUND_ITEM}}},
@@ -49,9 +64,9 @@ fn sound() -> String {
     "cfg": {{"type": "number"}}, "wh": {{"type": "number", "nullable": true}}}}}}}}}}"#)
 }
 
-/// An image or audio job (jobs.rs): <kind>.status's answer, and generate's with wait: false
+/// An image, audio or 3D job (jobs.rs): <kind>.status's answer, and generate's with wait: false
 const JOB_VIEW: &str = r#"{"type": "object", "required": ["id", "label", "state"], "properties": {
-  "id": {"type": "string"}, "kind": {"type": "string", "enum": ["image", "audio"]}, "method": {"type": "string"},
+  "id": {"type": "string"}, "kind": {"type": "string", "enum": ["image", "audio", "model3d"]}, "method": {"type": "string"},
   "label": {"type": "string", "description": "the request's label, else the id"}, "reentrant_id": {"type": "string", "nullable": true},
   "state": {"type": "string", "enum": ["queued", "running", "done", "failed", "cancelled"], "description": "queued: not being made yet (stage says why); running: being made (progress)"},
   "stage": {"type": "string", "enum": ["queued", "held", "starting", "waiting", "loading", "running", "done", "failed", "cancelled"], "description": "where it is: queued (in the kind's queue behind others), held (paused: queue.resume), starting (being handed to its server), waiting (for room on a card, a server to finish another model's or another job's work), loading (its model), running, then how it ended"},
@@ -197,14 +212,20 @@ pub fn result(method: &str) -> Option<String> {
         "llm.models" => r#"{"type": "object", "properties": {"models": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "gpus": {"type": "array", "items": {"type": "integer"}}, "loaded": {"type": "boolean"}}}}}}"#.into(),
         "image.generate" | "image.edit" => format!(r#"{{"oneOf": [{{"allOf": [{PICTURES}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the pictures, and the job"}},
   {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (image.status {{label}} for the rest)"}}]}}"#),
-        "image.status" | "audio.status" => JOB_VIEW.into(),
-        "image.jobs" | "audio.jobs" => JOB_LIST.into(),
-        "image.queue.list" | "audio.queue.list" => format!(r#"{{"type": "object", "properties": {{"queue": {{"type": "array", "items": {JOB_VIEW}, "description": "in run order"}},
+        "model3d.generate" | "model3d.rig" => format!(r#"{{"oneOf": [{{"allOf": [{}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the mesh, and the job"}},
+  {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (model3d.status {{label}} for the rest)"}}]}}"#, meshes()),
+        "model3d.tool" => format!(r#"{{"type": "object", "properties": {{"created": {{"type": "integer"}}, "data": {{"type": "array", "items": {MESH_ITEM}}}}}}}"#),
+        "model3d.history" => format!(r#"{{"type": "object", "properties": {{"data": {{"type": "array", "description": "newest first (200 at most); url server-relative (/v1/model3d/files/<file>, the same route here)", "items": {MESH_ITEM}}}}}}}"#),
+        "model3d.progress" => r#"{"type": "object", "properties": {"busy": {"type": "boolean"}, "waiting": {"type": "integer"}, "loaded": {"type": "boolean"}, "prompt": {"type": "string", "description": "what it works on: N picture(s), or the motion"},
+  "phase": {"type": "string", "description": "image, structure, shape, texture, decode, mesh, bake, skeleton, skin, motion"}, "at": {"type": "integer"}, "of": {"type": "integer"}, "seconds": {"type": "number"}}}"#.into(),
+        "image.status" | "audio.status" | "model3d.status" => JOB_VIEW.into(),
+        "image.jobs" | "audio.jobs" | "model3d.jobs" => JOB_LIST.into(),
+        "image.queue.list" | "audio.queue.list" | "model3d.queue.list" => format!(r#"{{"type": "object", "properties": {{"queue": {{"type": "array", "items": {JOB_VIEW}, "description": "in run order"}},
   "paused": {{"type": "object", "additionalProperties": true}}}}}}"#),
-        "image.queue.move" | "audio.queue.move" => r#"{"type": "object", "properties": {"label": {"type": "string"}, "position": {"type": "integer"}, "queue": {"type": "array", "items": {"type": "string"}, "description": "the waiting labels in run order"}}}"#.into(),
-        "image.queue.pause" | "image.queue.resume" | "audio.queue.pause" | "audio.queue.resume" => r#"{"type": "object", "properties": {"paused": {"type": "string", "description": "pause: queue | project <p> | batch <b> | N job(s)"},
+        "image.queue.move" | "audio.queue.move" | "model3d.queue.move" => r#"{"type": "object", "properties": {"label": {"type": "string"}, "position": {"type": "integer"}, "queue": {"type": "array", "items": {"type": "string"}, "description": "the waiting labels in run order"}}}"#.into(),
+        "image.queue.pause" | "image.queue.resume" | "audio.queue.pause" | "audio.queue.resume" | "model3d.queue.pause" | "model3d.queue.resume" => r#"{"type": "object", "properties": {"paused": {"type": "string", "description": "pause: queue | project <p> | batch <b> | N job(s)"},
   "resumed": {"type": "string", "description": "resume: the same"}, "queued": {"type": "integer"}, "held": {"type": "integer"}, "paused_state": {"type": "object", "additionalProperties": true}}}"#.into(),
-        "image.upload" | "audio.upload" => r#"{"type": "object", "properties": {"name": {"type": "string", "description": "up_<unix>_<name> (audio: .wav)"}, "ref": {"type": "string", "description": "upload:<name>: what image / images / ref_audio / sample take in place of base64"},
+        "image.upload" | "audio.upload" | "model3d.upload" => r#"{"type": "object", "properties": {"name": {"type": "string", "description": "up_<unix>_<name> (audio: .wav)"}, "ref": {"type": "string", "description": "upload:<name>: what image / images / ref_audio / sample take in place of base64"},
   "bytes": {"type": "integer"}, "sha256": {"type": "string"}, "mtime": {"type": "number"}}}"#.into(),
         "system.cards" => r#"{"type": "object", "properties": {"cards": {"type": "array", "items": {"type": "object", "properties": {
   "gpu": {"type": "integer"}, "name": {"type": "string"}, "bus": {"type": "string", "description": "its PCI address"},
@@ -214,14 +235,14 @@ pub fn result(method: &str) -> Option<String> {
   "processes": {"type": "array", "items": {"type": "object", "properties": {"pid": {"type": "integer"}, "program": {"type": "string"}, "kind": {"type": "string", "nullable": true}, "model": {"type": "string", "nullable": true}, "vram_mb": {"type": "integer"}}}},
   "enabled_models": {"type": "array", "items": {"type": "string"}, "description": "the enabled models counted on it"}, "vouched_mb": {"type": "integer", "description": "what they are counted for"},
   "overbooked": {"type": "boolean", "description": "they are counted for more than it holds (the first to load holds it)"}}}}}}"#.into(),
-        "image.cancel" | "audio.cancel" => r#"{"type": "object", "properties": {"cancelled": {"description": "label: how many jobs; none: whether anything was stopped"}, "stopped": {"type": "integer", "description": "requests stopped while running"},
+        "image.cancel" | "audio.cancel" | "model3d.cancel" => r#"{"type": "object", "properties": {"cancelled": {"description": "label: how many jobs; none: whether anything was stopped"}, "stopped": {"type": "integer", "description": "requests stopped while running"},
   "label": {"type": "string"}, "reentrant_id": {"type": "string", "nullable": true}, "jobs": {"type": "array", "items": {"type": "string"}},
   "already_ended": {"type": "boolean", "description": "the job named had ended before the cancel (nothing stopped; state says how it ended) - a cancel is safe to repeat"},
   "state": {"type": "string", "description": "already_ended: done, failed or cancelled"}}}"#.into(),
         "image.ocr" => r#"{"type": "object", "properties": {"created": {"type": "integer"}, "model": {"type": "string"}, "text": {"type": "string", "description": "the reading: Markdown, tables as HTML, LaTeX; pages after a <PAGE> mark each"},
   "prompt": {"type": "string", "description": "the instruction used"}, "pages": {"type": "integer"}, "tokens": {"type": "integer", "description": "tokens written"}, "prompt_tokens": {"type": "integer"},
   "prompt_seconds": {"type": "number"}, "read_tok_s": {"type": "number"}, "write_seconds": {"type": "number"}, "tok_s": {"type": "number"}, "seconds": {"type": "number"}, "wh": {"type": "number", "nullable": true}}}"#.into(),
-        "image.info" | "audio.info" => r#"{"type": "object", "properties": {"loaded": {"type": "boolean"},
+        "image.info" | "audio.info" | "model3d.info" => r#"{"type": "object", "properties": {"loaded": {"type": "boolean"},
   "info": {"type": "object", "description": "loaded: the server's own - model, arch, defaults, samplers, schedules, options, loras; image: edits, reads (an OCR model), prompts (its instructions), max_pictures 8, max_pages 24; audio: lyrics, speech (voices, languages, design, clone ...)", "additionalProperties": true},
   "model": {"type": "string"}, "title": {"type": "string", "description": "not loaded"}, "defaults": {"type": "object", "additionalProperties": true, "description": "not loaded: the registry's"}, "note": {"type": "string"},
   "steps": {"type": "object", "description": "image, loaded or not: the steps a request may send", "properties": {"default": {"type": "integer"}, "locked": {"type": "boolean", "description": "true: a few-step model (turbo) runs only allowed"},
@@ -316,7 +337,7 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
         "video.upload" => &[(400, "invalid_params", "not a picture, clip or sound (png jpg jpeg webp mp4 mov webm mkv wav mp3 flac m4a ogg), or empty")],
         "system.load" => &[(404, "not_found", "no such model"), (503, "no_room", "its cards are held by other models now (retryable)")],
         "system.enable" | "system.disable" | "system.unload" | "system.gpus" => &[(404, "not_found", "no such model")],
-        "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.voices.design" =>
+        "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.voices.design" | "model3d.generate" | "model3d.rig" =>
             &[(400, "invalid_params", "a value refused, when the job is submitted (wait false too): steps a few-step model does not run, a size, a sampler, a picture that does not decode, a voice or language the speech model does not have, a priority outside -9..9 ..."),
               (404, "not_found", "no such model; a continue_from or upload:<name> that is not here (error.field names which)"), (409, "conflict", "the model is disabled, or none that can do it is enabled (never retry as is)"),
               (409, "busy", "queue: false and the job would not start at once (retryable)"),
@@ -327,11 +348,13 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
                         (503, "no_room", "the model is not loaded and its cards have no room for it (work that is not idle holds them; idle picture, sound and video work is stopped for it at once): retryable")],
         "audio.voices.add" => &[(400, "invalid_params", "a bad name, a recording shorter than 3 s or not decodable"), (409, "conflict", "replace over a voice another owner has")],
         "audio.voices.remove" => &[(404, "not_found", "no saved voice of that name"), (409, "conflict", "the voice has an owner and the request names another")],
-        "image.status" | "audio.status" => &[(400, "invalid_params", "neither label nor reentrant_id (<kind>.jobs lists them)"), (404, "not_found", "no job by that label or reentrant_id")],
-        "image.queue.move" | "audio.queue.move" | "image.queue.pause" | "image.queue.resume" | "audio.queue.pause" | "audio.queue.resume" => &[(404, "not_found", "label / reentrant_id: no waiting job by it")],
-        "image.upload" | "audio.upload" => &[(400, "invalid_params", "a name of another type, data not base64, empty, or not a picture / recording that decodes (a picture over 40 MP)")],
-        "image.cancel" | "audio.cancel" => &[(404, "not_found", "no job with that label or reentrant_id at all (the message names which); an ended one answers 200 already_ended")],
-        "system.files.stat" => &[(400, "invalid_params", "kind is not image, audio or video, or name is not a plain file name"), (404, "not_found", "no such file")],
+        "image.status" | "audio.status" | "model3d.status" => &[(400, "invalid_params", "neither label nor reentrant_id (<kind>.jobs lists them)"), (404, "not_found", "no job by that label or reentrant_id")],
+        "image.queue.move" | "audio.queue.move" | "image.queue.pause" | "image.queue.resume" | "audio.queue.pause" | "audio.queue.resume"
+        | "model3d.queue.move" | "model3d.queue.pause" | "model3d.queue.resume" => &[(404, "not_found", "label / reentrant_id: no waiting job by it")],
+        "model3d.tool" => &[(400, "invalid_params", "an op it does not know, faces missing for decimate, or a mesh that does not read"), (404, "not_found", "file: no GLB of that name here")],
+        "image.upload" | "audio.upload" | "model3d.upload" => &[(400, "invalid_params", "a name of another type, data not base64, empty, or not a picture / recording / mesh that decodes (a picture over 40 MP)")],
+        "image.cancel" | "audio.cancel" | "model3d.cancel" => &[(404, "not_found", "no job with that label or reentrant_id at all (the message names which); an ended one answers 200 already_ended")],
+        "system.files.stat" => &[(400, "invalid_params", "kind is not image, audio, video or model3d, or name is not a plain file name"), (404, "not_found", "no such file")],
         "system.files.delete" => &[(400, "invalid_params", "kind, or a name that is not a clip, upload, picture or sound"), (404, "not_found", "no such file"),
                                    (409, "busy", "video: the clip is being made (video.cancel first)")],
         _ => &[],

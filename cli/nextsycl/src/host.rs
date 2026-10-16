@@ -101,8 +101,8 @@ pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
         wfe,
         exe: std::env::current_exe().map_err(|e| e.to_string())?,
         ports: Ports {
-            llm: port("NS_PORT", 8085), switch: port("NS_SWITCH_PORT", 8001), image: port("NS_IMAGE_PORT", 8086), audio: port("NS_AUDIO_PORT", 8087),
-            image2: port("NS_IMAGE_PORT2", 8096), audio2: port("NS_AUDIO_PORT2", 8097),
+            llm: port("NS_PORT", 8085), switch: port("NS_SWITCH_PORT", 8001), image: port("NS_IMAGE_PORT", 8086), audio: port("NS_AUDIO_PORT", 8087), model3d: port("NS_MODEL3D_PORT", 8088),
+            image2: port("NS_IMAGE_PORT2", 8096), audio2: port("NS_AUDIO_PORT2", 8097), model3d2: port("NS_MODEL3D_PORT2", 8098),
             video: port("NS_VIDEO_PORT", 8090), chat_ui: port("NS_CHAT_UI_PORT", 8080),
         },
         serve_host: opt(args, "--serve-host").unwrap_or("0.0.0.0").to_string(),

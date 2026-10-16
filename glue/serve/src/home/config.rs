@@ -24,14 +24,14 @@ const fn st(name: &'static str, group: &'static str, default: &'static str, what
 }
 
 pub const SETTINGS: &[Setting] = &[
-    st("NS_MODELS", "box", "", "host directory with the model files (seen as /models in the containers)", &["llm", "image", "audio", "video"]),
-    st("NS_REGISTRY", "box", "~/.config/nextsycl/models.json", "the model registry (nextsycl models)", &["serve", "switch", "studio", "llm", "image", "audio", "video"]),
+    st("NS_MODELS", "box", "", "host directory with the model files (seen as /models in the containers)", &["llm", "image", "audio", "video", "model3d"]),
+    st("NS_REGISTRY", "box", "~/.config/nextsycl/models.json", "the model registry (nextsycl models)", &["serve", "switch", "studio", "llm", "image", "audio", "video", "model3d"]),
     st("NS_MODEL_CARDS", "box", "model-cards beside the program, else in the repository", "the model cards: the models nextsycl models search | pull offer, their prompt guides", &["cli", "serve"]),
     st("NS_SOCKET_DIR", "box", "$XDG_RUNTIME_DIR/nextsycl", "where the control sockets live", &["serve", "llm", "video", "studio"]),
-    st("NS_IMAGE", "box", "localhost/nextsycl-build", "the container image with the oneAPI runtime", &["llm", "image", "audio", "video"]),
-    st("NS_CONTAINER_ENGINE", "box", "podman", "podman or docker", &["llm", "image", "audio", "video"]),
+    st("NS_IMAGE", "box", "localhost/nextsycl-build", "the container image with the oneAPI runtime", &["llm", "image", "audio", "video", "model3d"]),
+    st("NS_CONTAINER_ENGINE", "box", "podman", "podman or docker", &["llm", "image", "audio", "video", "model3d"]),
     st("NS_MOUNTS", "box", "", "more read-only directories for the containers, host:inside[,...]", &["llm"]),
-    st("NS_CORS", "box", "", "web pages that may call the servers from a browser, beyond the loopback ones", &["llm", "image", "audio"]),
+    st("NS_CORS", "box", "", "web pages that may call the servers from a browser, beyond the loopback ones", &["llm", "image", "audio", "model3d"]),
     st("NS_SERVE_PORT", "front door", "8000", "this page's port", &["serve"]),
     st("NS_API_TOKEN", "front door", "made once (serve.json)", "the API's bearer token", &["serve"]),
     st("NS_IDLE_MINUTES", "front door", "10", "an enabled model unloads after this long without a request (0: never)", &["serve", "switch"]),
@@ -40,6 +40,8 @@ pub const SETTINGS: &[Setting] = &[
     st("NS_AUDIO_PORT", "front door", "8087", "the audio server's port", &["serve"]),
     st("NS_IMAGE_PORT2", "front door", "8096", "the second image server's port (a model on two cards runs on both when the work asks; 0: one server)", &["serve"]),
     st("NS_AUDIO_PORT2", "front door", "8097", "the second audio server's port (0: one server)", &["serve"]),
+    st("NS_MODEL3D_PORT", "front door", "8088", "the 3D server's port", &["serve"]),
+    st("NS_MODEL3D_PORT2", "front door", "8098", "the second 3D server's port (0: one server)", &["serve"]),
     st("NS_CHAT_UI_PORT", "front door", "8080", "Open WebUI's port (a link)", &["serve"]),
     st("NS_HOST", "chat", "127.0.0.1", "the chat server's address (0.0.0.0: the network)", &["llm"]),
     st("NS_PORT", "chat", "8085", "the chat server's port", &["llm", "serve", "switch"]),
@@ -60,6 +62,7 @@ pub const SETTINGS: &[Setting] = &[
     st("NS_STUDIO_MODES", "chat", "", "the studio's chat modes file, kept in step with the registry", &["cli", "serve"]),
     st("NS_IMAGE_OUT", "images", "~/.local/share/nextsycl/images", "where pictures are saved", &["image"]),
     st("NS_AUDIO_OUT", "audio", "~/.local/share/nextsycl/audio", "where songs, speech and saved voices are kept", &["audio"]),
+    st("NS_MODEL3D_OUT", "3d", "~/.local/share/nextsycl/model3d", "where meshes (GLB) are saved", &["model3d"]),
     st("NS_VIDEO_MODEL", "video", "", "the video daemon's default model (serve: the enabled video models decide)", &["video"]),
     st("NS_VIDEO_ENGINES", "video", "", "the video daemon's other models (serve: the enabled video models decide)", &["video"]),
     st("NS_VIDEO_GPUS", "video", "", "the video daemon's GPUs (serve: the enabled video models' GPUs)", &["video"]),
@@ -85,7 +88,8 @@ pub const PREFIXES: &[(&str, &str, &[&str])] = &[
     ("NS_DS2_", "the deepseek2 chat engine's settings (docs/environment.md)", &["llm"]),
     ("NS_QI_", "the Qwen-Image engine's settings", &["image"]),
     ("NS_MM3_", "the MiniMax Music engine's settings", &["audio"]),
-    ("NSD_", "the diffusion kernels' settings (image, audio, video)", &["image", "audio", "video"]),
+    ("NS_M3D_", "the 3D engines' settings", &["model3d"]),
+    ("NSD_", "the diffusion kernels' settings (image, audio, video, 3D)", &["image", "audio", "video", "model3d"]),
     ("H3_", "the H3 engine's settings", &["video"]),
 ];
 
@@ -245,7 +249,7 @@ impl Home {
     }
 
     /// Restart what reads the settings: serve (this page: systemd brings it back), switch, studio (their services
-    /// do), video (the daemon, when no clip renders), image / audio (stopped: the next request loads them), llm (the
+    /// do), video (the daemon, when no clip renders), image / audio / model3d (stopped: the next request loads them), llm (the
     /// chat model reloaded)
     pub(crate) fn restart(&self, what: &str) -> Result<Value, (u16, String)> {
         let kill = |pattern: &str| -> Result<(), (u16, String)> {
@@ -281,7 +285,7 @@ impl Home {
                 self.video_apply(false).map_err(|e| (500, e))?;
                 Ok(json!({"restarted": "video"}))
             }
-            k @ ("image" | "audio") => {
+            k @ ("image" | "audio" | "model3d") => {
                 let _ = self.exec(format!("{k} stop (settings changed)"), &[k.into(), "stop".into()]);
                 Ok(json!({"stopped": k, "note": "the next request loads it with the new settings"}))
             }
@@ -292,7 +296,7 @@ impl Home {
                 self.load(&id)?;
                 Ok(json!({"reloaded": id}))
             }
-            other => Err((400, format!("restart {other:?}: serve, switch, studio, video, image, audio or llm"))),
+            other => Err((400, format!("restart {other:?}: serve, switch, studio, video, image, audio, model3d or llm"))),
         }
     }
 }

@@ -14,6 +14,7 @@ mod bench;
 mod client;
 mod container;
 mod audio;
+mod model3d;
 mod host;
 mod image;
 mod video;
@@ -36,13 +37,13 @@ pub const VERSION: &str = match option_env!("NS_VERSION") {
     None => "dev",
 };
 
-const USAGE: &str = "nextsycl - language, image, video and audio models on Intel Arc GPUs (Rust + SYCL)
+const USAGE: &str = "nextsycl - language, image, video, audio and 3D models on Intel Arc GPUs (Rust + SYCL)
 
 every kind:
   nextsycl models [list] [--json]           the registry (NS_REGISTRY): every model this machine serves, its kind
   nextsycl models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M...]] [--set NAME=VALUE]...
                       [--no-tools] [--no-tasks] [--disabled]
-  nextsycl models search [TEXT] [--kind llm|image|video|audio|lora]     the catalog of supported models
+  nextsycl models search [TEXT] [--kind llm|image|video|audio|model3d|lora]     the catalog of supported models
   nextsycl models pull <id>... [--dir DIR] [--from DIR]... [--verify] [--again]
                                 its files downloaded (resumed when run again; each checked by SHA-256) or linked
                                 (the same file already here; --from DIR: copies elsewhere on the machine), registered
@@ -112,6 +113,14 @@ audio (nextsycl audio ...):
   nextsycl audio check <dump dir> [--stages ar,dit,voc,chunks]    the engine against a reference's dumps
   nextsycl audio engines        the architectures this build serves
   nextsycl audio selftest [--gpu N]  the audio kernel library, an engine's own symbol, a kernel on the GPU
+
+3D (nextsycl model3d ... or nextsycl 3d ...):
+  nextsycl model3d gen PICTURE [PICTURE:SIDE]... [--model ID] [--texture] [--seed N] [--faces N] [--out FILE.glb]
+                                a mesh from a picture or several views (TRELLIS.2, Hunyuan3D, Pixal3D), in this process
+  nextsycl model3d rig MESH.glb [--model ID] [--prompt \"the motion\"]   a skeleton and skin weights, or motion
+  nextsycl model3d serve [MODEL] [--wfe] [--port 8088] [--out DIR]    the 3D API (/v1/model3d/generate, /rig) in a container
+  nextsycl model3d tool decimate|remesh|uv|convert IN OUT [...]       the CPU mesh tools (no GPU)
+  nextsycl model3d engines | selftest [--gpu N]
 
 settings (environment, or NAME=value lines in nextsycl.conf beside the repository or ~/.config/nextsycl.conf):
   NS_MODELS        host directory with the model files, seen as /models                  (required for start)
@@ -896,6 +905,7 @@ fn main() -> ExitCode {
         Some("image") => image::cmd(&cfg, &args[1..], |r| selftest("image", r, nextsycl_image_example::selftest)),
         Some("video") => video::cmd(&cfg, &args[1..], |r| selftest("video", r, nextsycl_video_example::selftest)),
         Some("audio") => audio::cmd(&cfg, &args[1..], |r| selftest("audio", r, nextsycl_audio_example::selftest)),
+        Some("model3d" | "3d") => model3d::cmd(&cfg, &args[1..], |r| selftest("model3d", r, nextsycl_model3d_example::selftest)),
         // the llm commands' names from before the kinds (nextsycl start = nextsycl llm start, ...)
         Some("start") => service::start(&cfg, rest),
         Some("models") => models::cmd(&cfg, rest, &|g: &Gguf| {

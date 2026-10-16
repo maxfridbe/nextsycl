@@ -11,6 +11,7 @@ nextsycl-diffusion.workspace = true
 nextsycl-llm.workspace = true
 nextsycl-image.workspace = true
 nextsycl-audio.workspace = true
+nextsycl-model3d.workspace = true
 nextsycl-tok.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

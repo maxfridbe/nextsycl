@@ -55,7 +55,7 @@ impl<T: Store + ?Sized> Store for Box<T> {
     }
 }
 
-/// An entry's kind: "llm", "image", "video", "audio" or "lora" (entries from before kinds are llm)
+/// An entry's kind: "llm", "image", "video", "audio", "model3d" or "lora" (entries from before kinds are llm)
 pub fn kind_of(m: &Value) -> &str {
     m.get("kind").and_then(|v| v.as_str()).unwrap_or("llm")
 }

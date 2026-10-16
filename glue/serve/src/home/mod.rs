@@ -46,9 +46,11 @@ pub struct Ports {
     pub switch: u16,
     pub image: u16,
     pub audio: u16,
-    /// the second image and audio servers' (a model enabled on two cards runs on both when the work asks; 0: none)
+    pub model3d: u16,
+    /// the second image, audio and 3D servers' (a model enabled on two cards runs on both when the work asks; 0: none)
     pub image2: u16,
     pub audio2: u16,
+    pub model3d2: u16,
     pub video: u16,
     /// the chat front end (Open WebUI), a link only
     pub chat_ui: u16,
@@ -129,7 +131,7 @@ fn process(pid: u32) -> Value {
     let rest = &args[i + 1..];
     let get = |k: &str| rest.iter().position(|a| a == k).and_then(|j| rest.get(j + 1)).cloned();
     let gpus: Vec<String> = rest.iter().enumerate().filter(|(_, a)| *a == "--gpu").filter_map(|(j, _)| rest.get(j + 1).cloned()).collect();
-    let kinds = ["llm", "image", "video", "audio"];
+    let kinds = ["llm", "image", "video", "audio", "model3d"];
     let (kind, cmd, model) = match rest.first().map(String::as_str) {
         Some(k) if kinds.contains(&k) => {
             (k.to_string(), rest.get(1).cloned().unwrap_or_default(), rest.get(2).filter(|a| !a.starts_with("--")).map(|a| base(a)))
@@ -188,7 +190,7 @@ impl Home {
         let h = Arc::new(Home {
             o, token, state_file, jobs,
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
-            kind_lock: ["llm", "image", "audio", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
+            kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()), chat_keep: Mutex::new(BTreeMap::new()),
             maint_file, maint_bypass,
         });
@@ -322,7 +324,7 @@ impl Home {
         }
     }
 
-    /// A model's own page (an image or audio model's web front end, which only its running server has): the model is
+    /// A model's own page (an image, audio or 3D model's web front end, which only its running server has): the model is
     /// started when it is not up - the same as its first request - and the browser sent to it. A disabled model has
     /// none to open. The video studio and the chat page are always up.
     fn open(&self, s: &mut Conn, req: &http::Request, id: &str) {
@@ -336,7 +338,7 @@ impl Home {
         }
         let kind = registry::kind_of(&m).to_string();
         let port = match kind.as_str() {
-            "image" | "audio" => {
+            "image" | "audio" | "model3d" => {
                 match self.ensure(id) {
                     Ok(l) => l.port,
                     Err((c, e)) => return http::respond(s, c, &err(e)),

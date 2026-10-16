@@ -1,0 +1,10 @@
+[package]
+name = "nextsycl-model3d-example"
+description = "A template 3D engine: every part of the contract in place, nothing ported - copy it to port a model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-model3d.workspace = true

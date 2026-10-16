@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use crate::config::Config;
 
 /// The kinds of model, in the order `search` lists them
-pub const KINDS: &[&str] = &["llm", "image", "video", "audio", "lora"];
+pub const KINDS: &[&str] = &["llm", "image", "video", "audio", "model3d", "lora"];
 
 /// The catalog: its files by key, its models (each card as JSON, its files as role -> key)
 pub struct Catalog {
@@ -388,7 +388,7 @@ fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeMap<String, 
         "files": files, "gpus": m.get("gpus").cloned().unwrap_or(json!("0")), "env": env, "enabled": true,
         "catalog": m["id"],
     });
-    for k in ["ctx", "tools", "tasks", "base", "defaults", "speech", "silo", "vram_gib", "headroom_gib"] {
+    for k in ["ctx", "tools", "tasks", "base", "defaults", "speech", "does", "silo", "vram_gib", "headroom_gib"] {
         if let Some(v) = m.get(k) {
             e[k] = v.clone();
         }

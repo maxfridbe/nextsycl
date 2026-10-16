@@ -108,7 +108,7 @@ fn own_kernels_include_no_other_runtime() {
     const OTHERS: &[&str] = &["cuda", "vulkan", "CL/", "hip/", "Metal/", "level_zero/"];
     let k = root().join("kernels");
     let mut dirs = vec![k.join("ns")];
-    for kind in ["llm", "image", "video", "audio"] {
+    for kind in ["llm", "image", "video", "audio", "model3d"] {
         if let Ok(rd) = std::fs::read_dir(k.join(kind)) {
             dirs.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
         }
@@ -302,7 +302,7 @@ fn silos_are_their_engines_own() {
     let root = root();
     let mut bad = Vec::new();
     let mut silos = Vec::new();
-    for kind in ["llm", "image", "video", "audio"] {
+    for kind in ["llm", "image", "video", "audio", "model3d"] {
         for e in std::fs::read_dir(root.join("kernels").join(kind)).into_iter().flatten().flatten() {
             if e.path().join("silo").is_dir() {
                 silos.push((kind, e.file_name().to_string_lossy().to_string()));

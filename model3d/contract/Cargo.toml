@@ -1,0 +1,10 @@
+[package]
+name = "nextsycl-model3d"
+description = "The 3D engines' contract: meshes from pictures (generate), skeletons and motion for a mesh (rig), the progress, the registry entry an engine provides"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-mesh.workspace = true

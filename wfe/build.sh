@@ -14,7 +14,7 @@ TSC="vendor/typescript/tsc.js"
 OUT=../dist/wfe
 check=0; apps=()
 for a in "$@"; do [ "$a" = "--check" ] && check=1 || apps+=("$a"); done
-[ ${#apps[@]} -eq 0 ] && apps=(home image ocr audio video)
+[ ${#apps[@]} -eq 0 ] && apps=(home image ocr audio model3d video)
 mkdir -p "$OUT/vendor" "$OUT/static"
 rm -rf build
 for app in "${apps[@]}"; do

@@ -9,7 +9,7 @@ an engine as `llm <arch>` / `image <arch>` / `audio <arch>` / `video <arch>`, `k
   `nextsycl.conf` beside the repository (`dist/../nextsycl.conf`, the file `nextsycl serve`'s Config tab edits),
   then `~/.config/nextsycl.conf`: the first that has the name wins - the environment over the files. An empty value
   counts as unset. The engine and kernel variables are read with getenv where they run (in the container): set them
-  in the file - the program forwards `NS_QW_*`, `NS_DS2_*`, `NS_QI_*`, `NS_MM3_*`, `NS_Q3T_*`, `NS_VCP_*`, `NSD_*` and `H3_*` to
+  in the file - the program forwards `NS_QW_*`, `NS_DS2_*`, `NS_QI_*`, `NS_MM3_*`, `NS_Q3T_*`, `NS_VCP_*`, `NS_M3D_*`, `NSD_*` and `H3_*` to
   the engine's container - or with `--opt-NAME`.
 - **`--opt-NAME VALUE`** sets an engine's declared variable for one command (README "Engine options"; `nextsycl
   <kind> engines` lists them). Rows with `(--opt-NAME)` are those.
@@ -43,6 +43,8 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_API_TOKEN` | made once, kept in serve.json beside the registry | the front door API's bearer token; `audio voices design` uses it to call the front door | serve, cli (audio) |
 | `NS_AUDIO_PORT` | 8087 | the audio server's port, as the front door reaches it | serve |
 | `NS_AUDIO_PORT2` | 8097 | the second audio server's port (`audio start --slot 1`): a model enabled on two cards runs on both while its work keeps the first busy; 0: one server | serve |
+| `NS_MODEL3D_PORT` | 8088 | the 3D server's port, as the front door reaches it | serve |
+| `NS_MODEL3D_PORT2` | 8098 | the second 3D server's port (`model3d start --slot 1`), as `NS_AUDIO_PORT2` | serve |
 | `NS_CHAT_UI_PORT` | 8080 | Open WebUI's port (the page's link) | serve |
 | `NS_CORS` | loopback origins only | more web origins that may call the servers from a browser, comma-separated (`*`: any) | cli (llm, image, audio start) |
 | `NS_IDLE_MINUTES` | 10 | an enabled model unloads after this long without a request (0: never); the switcher uses the same unless --idle-minutes | serve, switch |
@@ -252,6 +254,15 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_VCP_*` | - | every NS_VCP_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_VCP_INT8` | 0 | 1: the language models' matrices in int8 (less VRAM, faster patches) (--opt-int8) | audio voxcpm2 |
 | `NS_VCP_MAX_RATIO` | 6 | the per-request option max-ratio's name: the most patches a text token (a runaway's bound); a request's options only, the variable itself is not read (--opt-max-ratio) | audio voxcpm2 |
+
+## 3D
+
+The `model3d` kind (meshes from pictures, rigging, animation) and its engines' settings, `NS_M3D_*`.
+
+| Variable | Default | What it does | Read by |
+|---|---|---|---|
+| `NS_MODEL3D_OUT` | ~/.local/share/nextsycl/model3d | where meshes (GLB, with their picture and settings beside them) and 3D uploads are kept | cli (model3d), serve |
+| `NS_M3D_*` | - | every NS_M3D_ setting in nextsycl.conf is passed to the 3D server | cli (model3d serve) |
 
 ## Diffusion kernels: `NSD_*`
 

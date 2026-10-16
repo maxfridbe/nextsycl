@@ -1,6 +1,6 @@
 # Model cards
 
-One YAML file a model, `<kind>/<id>.yml` (kind: `llm`, `image`, `video`, `audio`, `lora`): everything nextsycl knows
+One YAML file a model, `<kind>/<id>.yml` (kind: `llm`, `image`, `video`, `audio`, `model3d`, `lora`): everything nextsycl knows
 about a model it offers, read when it is needed - not built into the program. `nextsycl models search` lists the
 cards, `nextsycl models pull <id>` downloads a card's files, checks them and registers the model with the card's
 settings; the front door's `describePromptGuideMD` answers with the card's guide. A release carries this folder
@@ -44,7 +44,8 @@ registry entry carries it as the loader's settings (`NS_SILO_NAME`, `NS_SILO_REQ
 
 Other keys: `local` (role: what it is - a part made on the machine rather than downloaded, found in nextsycl.conf
 or another registry entry), `base` (a lora: the model it rides on), `defaults` (image / video / audio: the
-request's defaults - steps, cfg, size, seconds ...), `speech` (audio: `voices`, `design`, `clone`).
+request's defaults - steps, cfg, size, seconds ...), `speech` (audio: `voices`, `design`, `clone`), `does` (model3d: `generate`, `texture`, `rig`, `animate` - what it is
+asked for).
 
 The rules, checked when the cards load and by `cargo test` (`the_model_cards_are_whole`): the id is the file's
 name and the kind its folder; a file key is defined once (defining it again the same way is allowed) and every key

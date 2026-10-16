@@ -51,10 +51,10 @@ pub const METHODS: &[Method] = &[
     Method { kind: "system", name: "version", summary: "The release, the API's version, the kinds enabled, the features this build has (names a client can test for) and the methods callable now",
              fields: &[], example: "{}" },
     Method { kind: "system", name: "files.stat", summary: "A file an answer linked: its bytes and SHA-256 (to check a download), mtime, URL",
-             fields: &[("kind", r#"{"type": "string", "enum": ["image", "audio", "video"]}"#, "", true), ("name", "string", "the file's name (the last part of its URL)", true)],
+             fields: &[("kind", r#"{"type": "string", "enum": ["image", "audio", "video", "model3d"]}"#, "", true), ("name", "string", "the file's name (the last part of its URL)", true)],
              example: r#"{"kind": "video", "name": "h3_20261011_220723.mp4"}"# },
     Method { kind: "system", name: "files.delete", summary: "Delete a file: a picture, a song or speech, a clip (with its record, last frame, latents and sound tail; not while it is made) or an upload (ref_...)",
-             fields: &[("kind", r#"{"type": "string", "enum": ["image", "audio", "video"]}"#, "", true), ("name", "string", "the file's name; a clip: h3_... with or without .mp4", true)],
+             fields: &[("kind", r#"{"type": "string", "enum": ["image", "audio", "video", "model3d"]}"#, "", true), ("name", "string", "the file's name; a clip: h3_... with or without .mp4", true)],
              example: r#"{"kind": "video", "name": "h3_20261011_220723"}"# },
     Method { kind: "system", name: "models", summary: "Every registered model: kind, enabled, its GPUs, its state (disabled, unloaded, loading, loaded, busy, ready), what it can do (capabilities, methods)", fields: &[], example: "{}" },
     Method { kind: "system", name: "cards", summary: "The GPUs, one neutral list: name, memory (total, used, free, and what the enabled models are counted for), load, power, temperature, the models and processes on each",
@@ -214,6 +214,59 @@ pub const METHODS: &[Method] = &[
              fields: &JOB_ID, example: r#"{"label": "theme-3"}"# },
     Method { kind: "audio", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "minimax-music3"}"# },
 
+    Method { kind: "model3d", name: "generate", summary: "A mesh from a picture of an object, or several views of it (TRELLIS.2, Hunyuan3D, Pixal3D; the model loads first if it must): its shape and, with texture, PBR textures; the answer links the GLB. A job like image.generate (wait, reentrant_id, status, cancel)",
+             fields: &[MODEL_OPT, ("image", "string", "the picture: PNG, JPEG or WebP as base64, a data: URL or upload:<name> (model3d.upload); a transparent background is the object's outline, an opaque one is cut out (remove_background)", false),
+                       ("images", r#"{"type": "array", "maxItems": 8, "items": {"oneOf": [{"type": "string"}, {"type": "object", "properties": {"image": {"type": "string"}, "side": {"type": "string", "description": "front, back, left, right, top, bottom, or an azimuth in degrees"}}}]}}"#, "several views of the object (a multi-view model: model3d.info's abilities.views); each a picture or {image, side}", false),
+                       ("texture", "boolean", "PBR textures too (base colour, metallic-roughness); default: what the model does (model3d.info)", false),
+                       ("seed", "integer", "", false), ("steps", "integer", "denoising steps of each stage", false), ("cfg", "number", "guidance", false),
+                       ("resolution", "integer", "the shape's grid / octree resolution: detail against time and memory", false),
+                       ("faces", "integer", "at most this many triangles (decimated to it)", false), ("texture_size", "integer", "the texture's side in texels", false),
+                       ("remove_background", r#"{"type": "boolean", "default": true}"#, "cut the background out of an opaque picture", false),
+                       ("options", "object", "the engine's own (model3d.info lists them)", false),
+                       ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
+                       ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
+             example: r#"{"model": "trellis2", "image": "data:image/png;base64,iVBORw0...", "texture": true, "seed": 42, "wait": false, "reentrant_id": "chair-1"}"# },
+    Method { kind: "model3d", name: "rig", summary: "A mesh given a skeleton and skin weights (UniRig, RigNet), or set in motion by words (AnimateAnyMesh: prompt); the answer links the rigged or animated GLB. A job like model3d.generate",
+             fields: &[MODEL_OPT, ("mesh", "string", "the mesh: GLB or OBJ as base64, a data: URL or upload:<name> (model3d.upload)", false),
+                       ("file", "string", "or a GLB made here (model3d.generate's file name or url)", false),
+                       ("prompt", "string", "an animating model: the motion, in words (\"a dragon flapping its wings\")", false),
+                       ("frames", "integer", "an animating model: frames to make", false), ("fps", "number", "", false),
+                       ("seed", "integer", "", false), ("steps", "integer", "", false), ("cfg", "number", "", false), ("options", "object", "the engine's own", false),
+                       ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
+                       ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit (as model3d.generate)", false),
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends; false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
+             example: r#"{"model": "unirig", "file": "1792132541-trellis2-42.glb"}"# },
+    Method { kind: "model3d", name: "tool", summary: "The CPU mesh tools, here (no GPU, no model): decimate (to a triangle budget), remesh (even triangles), uv (a fresh atlas, the texture or colours baked across), convert; the result is saved beside the meshes made (model3d.history) and linked",
+             fields: &[("op", r#"{"type": "string", "enum": ["decimate", "remesh", "uv", "convert"]}"#, "", true),
+                       ("mesh", "string", "the mesh: GLB or OBJ as base64, a data: URL or upload:<name>", false), ("file", "string", "or a GLB made here", false),
+                       ("faces", "integer", "decimate: at most this many triangles", false), ("edge", "number", "remesh: the edge length (default: the mesh's mean)", false),
+                       ("passes", "integer", "remesh: passes (5)", false), ("size", "integer", "uv: the texture's side (2048)", false)],
+             example: r#"{"op": "decimate", "file": "1792132541-trellis2-42.glb", "faces": 20000}"# },
+    Method { kind: "model3d", name: "info", summary: "The model's abilities (generate, texture, views, rig, animate), defaults and options (loaded: from the server)", fields: &[MODEL_OPT], example: "{}" },
+    Method { kind: "model3d", name: "progress", summary: "The request running: its phase (image, structure, shape, texture, decode, mesh, bake, skeleton, skin, motion) and how far", fields: &[], example: "{}" },
+    Method { kind: "model3d", name: "history", summary: "The meshes made, newest first, with their settings and pictures", fields: &[], example: "{}" },
+    Method { kind: "model3d", name: "status", summary: "One job (model3d.generate / model3d.rig) by its label or reentrant_id: state, stage and what it waits for, its place in the queue, progress, its GLB when done",
+             fields: &JOB_ID, example: r#"{"label": "chair-1"}"# },
+    Method { kind: "model3d", name: "jobs", summary: "The 3D jobs: running, waiting (in run order) and the last ended, each as model3d.status answers it",
+             fields: &[("limit", r#"{"type": "integer", "minimum": 0, "maximum": 200, "default": 20}"#, "ended jobs listed", false), ("project", "string", "only this project's", false)], example: r#"{"limit": 5}"# },
+    Method { kind: "model3d", name: "queue.list", summary: "The waiting 3D jobs in run order (held ones too: held, waiting_for)", fields: &[], example: "{}" },
+    Method { kind: "model3d", name: "queue.move", summary: "Move a waiting job to a place in the queue (1 = made next)",
+             fields: &[JOB_ID[0], JOB_ID[1], ("position", r#"{"type": "integer", "minimum": 1, "default": 1}"#, "", false),
+                       ("priority", r#"{"type": "integer", "minimum": -9, "maximum": 9}"#, "give it this priority too (where later jobs go)", false)], example: r#"{"label": "chair-2", "position": 1}"# },
+    Method { kind: "model3d", name: "queue.pause", summary: "Hold a waiting job (label or reentrant_id), a project or batch (also the ones submitted later), or (none) the whole 3D queue; running jobs go on",
+             fields: &[JOB_ID[0], JOB_ID[1], ("project", "string", "", false), ("batch", "string", "", false)], example: r#"{"project": "Props"}"# },
+    Method { kind: "model3d", name: "queue.resume", summary: "Release what queue.pause held (none: everything)",
+             fields: &[JOB_ID[0], JOB_ID[1], ("project", "string", "", false), ("batch", "string", "", false)], example: "{}" },
+    Method { kind: "model3d", name: "upload", summary: "Keep a picture (PNG, JPEG, WebP) or a mesh (GLB, OBJ) here once: model3d.generate's image / images and model3d.rig's mesh then name it as \"upload:<name>\". Kept until system.files.delete {kind: model3d, name}",
+             fields: &[("name", "string", "the file's name: png jpg jpeg webp glb obj; kept as up_<unix seconds>_<name>", true), ("data", "string", "base64 (a data: URL too)", true)],
+             example: r#"{"name": "chair.png", "data": "iVBORw0KGgo..."}"# },
+    Method { kind: "model3d", name: "cancel", summary: "Stop a job by its label or reentrant_id (running: between steps; waiting: at once; ended: ok with already_ended); neither: whatever the 3D servers are making",
+             fields: &JOB_ID, example: r#"{"label": "chair-1"}"# },
+    Method { kind: "model3d", name: "describePromptGuideMD", summary: "How to get good meshes from the model, as Markdown", fields: &[MODEL], example: r#"{"model": "trellis2"}"# },
+
     Method { kind: "video", name: "generate", summary: "Make a clip: it starts at once when the studio is idle (queued: false, the job), else it is queued with queue: true (queued: true, its position) or refused with 409 busy. Anchors (first_frame, last_frame, exposure_ref, first_audio, guide_clip, source) take prev, prev_cam, first, first_cam - clips of the label's series, see label - or a file in the clips directory (video.upload, or a finished clip's name)",
              fields: &[("prompt", "string", "read as written - tokenized whole, no template, no sections parsed. H3 was trained on three fields in a fixed order: integrated_multimodal_description (shots, actions, camera, dialogue), overall_soundscape, non_diegetic_music; video.describePromptGuideMD has the form and its rules", true),
                        ("seconds", r#"{"type": "number", "minimum": 1, "maximum": 15.1, "default": 10}"#, "length; snapped up to the model's frame grid (17k + 5 frames at 24 fps: 4 s -> 107 frames); the model is trained on 5.2-15.1 s. The answer's frames and seconds say what is made", false),
@@ -314,7 +367,7 @@ const FEATURES: &[&str] = &[
     "video.failure", "video.gpu", "video.engines.ignored", "audio.speak.precheck.voice", "jobs.cancel.reentrant_id", "rpc.errors.body",
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
-    "system.maintenance", "errors.maintenance",
+    "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -451,7 +504,7 @@ impl Home {
     /// The kinds with an enabled model (system always)
     pub(super) fn kinds_on(&self, all: &[Value]) -> Vec<&'static str> {
         let mut v = vec!["system"];
-        for k in ["llm", "image", "audio", "video"] {
+        for k in ["llm", "image", "audio", "video", "model3d"] {
             if all.iter().any(|m| registry::kind_of(m) == k && m["enabled"] != false) {
                 v.push(k);
             }
@@ -638,7 +691,7 @@ impl Home {
         // held jobs wait for a release, not for the box: they are listed, not reasons
         let live = jobs.iter().filter(|j| j["held"] != true).count();
         if live > 0 {
-            reasons.push(format!("{live} image/audio job(s)"));
+            reasons.push(format!("{live} image/audio/3D job(s)"));
         }
         let mut slots = self.work_slots(all, &cards);
         let video = if self.kinds_on(all).contains(&"video") {
@@ -688,7 +741,7 @@ impl Home {
     /// kind has servers (a second copy starts when the first has work and its card has the room then)
     fn parallel(&self, all: &[Value]) -> Value {
         let mut out = serde_json::Map::new();
-        for kind in ["image", "audio"] {
+        for kind in super::jobs::KINDS {
             let servers = self.slots(kind).len();
             let models: serde_json::Map<String, Value> = all.iter().filter(|m| registry::kind_of(m) == kind && m["enabled"] != false)
                 .map(|m| (s(m, "id"), json!(self.gpus_of(m).len().min(servers)))).collect();
@@ -833,7 +886,32 @@ impl Home {
                 body["response_format"] = json!("url");
                 relay(&t, "POST", "/v1/audio/speech", Some(&body), 3600)
             }
-            ("image" | "audio", "info") => {
+            ("model3d", "tool") => self.mesh_tool(b),
+            ("model3d", "generate" | "rig") => {
+                // a model that does it: the one named, else the loaded or first enabled one whose card says so (rig: a
+                // rigger or an animator)
+                let want = if m.name == "rig" { "rig" } else { "generate" };
+                let able = |m: &Value| m["does"].as_array().is_none_or(|a| a.iter().any(|x| x == want || (want == "rig" && x == "animate")));
+                let id = match b["model"].as_str().filter(|x| !x.is_empty()) {
+                    Some(_) => self.pick("model3d", b, &all)?,
+                    None => {
+                        let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "model3d" && m["enabled"] != false && able(m)).collect();
+                        self.loaded_of("model3d").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
+                            .ok_or_else(|| (409, format!("no enabled 3D model does {want} (system.models: capabilities)")))?
+                    }
+                };
+                if !all.iter().any(|m| m["id"] == id.as_str() && able(m)) {
+                    return Err((400, format!("{id} does not {want} (model3d.{})", if want == "rig" { "generate" } else { "rig" })));
+                }
+                let job = b["request_id"].as_str();
+                let t = self.ensure_for(&id, job)?;
+                self.sent(job);
+                let mut body = b.clone();
+                body["model"] = json!(id);
+                body["response_format"] = json!("url");
+                relay(&t, "POST", &format!("/v1/model3d/{}", m.name), Some(&body), 7200)
+            }
+            ("image" | "audio" | "model3d", "info") => {
                 let id = self.pick(m.kind, b, &all)?;
                 let e = all.iter().find(|x| x["id"] == id.as_str()).cloned().unwrap_or(Value::Null);
                 // what a request may send, known without the model loaded
@@ -853,17 +931,17 @@ impl Home {
                 }
                 Ok(v)
             }
-            ("image" | "audio", "progress") => Ok(call_for(&t, "GET", "/api/progress", None, 5).unwrap_or(json!({"busy": false, "loaded": false}))),
-            ("image" | "audio", "history") => Ok(call_for(&t, "GET", "/api/history", None, 10).unwrap_or(json!({"data": []}))),
-            ("image" | "audio", "status") => self.job_status(m.kind, b),
-            ("image" | "audio", "jobs") => self.job_list(m.kind, b),
-            ("image" | "audio", "queue.list") => Ok(self.queue_list(m.kind)),
-            ("image" | "audio", "queue.move") => self.queue_move(m.kind, b),
-            ("image" | "audio", "queue.pause") => self.queue_hold(m.kind, b, true),
-            ("image" | "audio", "queue.resume") => self.queue_hold(m.kind, b, false),
-            ("image" | "audio", "upload") => self.upload(m.kind, b),
+            ("image" | "audio" | "model3d", "progress") => Ok(call_for(&t, "GET", "/api/progress", None, 5).unwrap_or(json!({"busy": false, "loaded": false}))),
+            ("image" | "audio" | "model3d", "history") => Ok(call_for(&t, "GET", "/api/history", None, 10).unwrap_or(json!({"data": []}))),
+            ("image" | "audio" | "model3d", "status") => self.job_status(m.kind, b),
+            ("image" | "audio" | "model3d", "jobs") => self.job_list(m.kind, b),
+            ("image" | "audio" | "model3d", "queue.list") => Ok(self.queue_list(m.kind)),
+            ("image" | "audio" | "model3d", "queue.move") => self.queue_move(m.kind, b),
+            ("image" | "audio" | "model3d", "queue.pause") => self.queue_hold(m.kind, b, true),
+            ("image" | "audio" | "model3d", "queue.resume") => self.queue_hold(m.kind, b, false),
+            ("image" | "audio" | "model3d", "upload") => self.upload(m.kind, b),
             ("image", "canvases.list") => self.image_canvases(b, &all),
-            ("image" | "audio", "cancel") => self.job_cancel(m.kind, b),
+            ("image" | "audio" | "model3d", "cancel") => self.job_cancel(m.kind, b),
             ("audio", "voices.list") => {
                 // the enabled models that speak a saved voice: the ones that clone
                 let speakers: Vec<Value> = all.iter().filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false)
@@ -917,9 +995,75 @@ impl Home {
         }
     }
 
-    /// A kind's output directory (the servers' NS_IMAGE_OUT / NS_AUDIO_OUT)
+    /// `model3d.tool`: a CPU mesh tool run here, its result saved beside the meshes the 3D servers make
+    fn mesh_tool(&self, b: &Value) -> Result<Value, Fail> {
+        use nextsycl_model3d::mesh::tools;
+        let dir = self.out_dir("model3d");
+        let bytes = match (b["mesh"].as_str().filter(|x| !x.is_empty()), b["file"].as_str().filter(|x| !x.is_empty())) {
+            (Some(m), _) => http::unbase64(m).map_err(|e| (400, format!("mesh: {e}")))?,
+            (None, Some(f)) => {
+                let f = f.rsplit('/').next().unwrap_or(f);
+                let plain = crate::files::plain(f).filter(|x| x.ends_with(".glb")).ok_or_else(|| (400, format!("file {f}: a GLB's name")))?;
+                std::fs::read(dir.join(plain)).map_err(|_| (404, format!("file {f}: no GLB of that name here")))?
+            }
+            _ => return Err((400, "mesh (GLB or OBJ, base64 / a data: URL / upload:<name>) or file (a GLB made here): required".into())),
+        };
+        let m = nextsycl_model3d::read_mesh(&bytes).map_err(|e| (400, format!("mesh: {e}")))?;
+        let op = s(b, "op");
+        let before = m.triangles();
+        let t0 = std::time::Instant::now();
+        let num = |k: &str| b[k].as_f64();
+        let out = match op.as_str() {
+            "decimate" => {
+                let faces = num("faces").ok_or((400, "faces: required by decimate".to_string()))? as usize;
+                let mat = m.material.clone();
+                let mut d = tools::decimate(&m, faces.max(4));
+                d.material = mat;
+                d.compute_normals();
+                d
+            }
+            "remesh" => {
+                let mut r = tools::remesh(&m, num("edge").map(|x| x as f32), num("passes").map_or(5, |x| x.clamp(1.0, 20.0) as usize));
+                r.compute_normals();
+                r
+            }
+            "uv" => {
+                let size = num("size").map_or(2048, |x| x.clamp(64.0, 8192.0) as u32);
+                let mut u = tools::unwrap(&m, size, 4);
+                if m.material.as_ref().is_some_and(|x| x.base_color.is_some()) || !m.colors.is_empty() {
+                    u.material = Some(tools::bake(&u, &m, size).map_err(|e| (400, e))?);
+                }
+                if u.normals.is_empty() {
+                    u.compute_normals();
+                }
+                u
+            }
+            "convert" => m,
+            other => return Err((400, format!("op {other:?}: decimate, remesh, uv or convert"))),
+        };
+        let glb = nextsycl_model3d::mesh::glb::write(&out).map_err(|e| (500, e))?;
+        std::fs::create_dir_all(&dir).map_err(|e| (500, format!("{}: {e}", dir.display())))?;
+        let created = now() as u64;
+        let name = format!("{created}-tool-{op}-{}.glb", self.next.lock().map(|mut n| { *n += 1; *n }).unwrap_or(0));
+        let path = dir.join(&name);
+        std::fs::write(&path, &glb).map_err(|e| (500, format!("{name}: {e}")))?;
+        let took = t0.elapsed().as_secs_f64();
+        let meta = json!({"model": "tool", "arch": format!("tool:{op}"), "prompt": op, "triangles": out.triangles(), "before": before, "took": took, "created": created,
+                          "textured": out.material.as_ref().is_some_and(|x| x.base_color.is_some()), "rigged": out.skin.as_ref().map(|s| s.joints.len()),
+                          "animated": out.animation.as_ref().map(|a| a.frames.len())});
+        let _ = std::fs::write(path.with_extension("json"), serde_json::to_vec_pretty(&meta).unwrap_or_default());
+        let mut e = crate::model3d::entry(&path).unwrap_or(meta);
+        e["url"] = json!(format!("http://nextsycl/v1/model3d/files/{name}"));
+        Ok(json!({"created": created, "data": [e]}))
+    }
+
+    /// A kind's output directory (the servers' NS_IMAGE_OUT / NS_AUDIO_OUT / NS_MODEL3D_OUT)
     fn out_dir(&self, kind: &str) -> std::path::PathBuf {
-        let (key, def) = if kind == "image" { ("NS_IMAGE_OUT", "images") } else { ("NS_AUDIO_OUT", "audio") };
+        let (key, def) = match kind {
+            "image" => ("NS_IMAGE_OUT", "images"),
+            "model3d" => ("NS_MODEL3D_OUT", "model3d"),
+            _ => ("NS_AUDIO_OUT", "audio"),
+        };
         std::path::PathBuf::from(self.o.cfg.get(key).unwrap_or_else(|| format!("{}/.local/share/nextsycl/{def}", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))))
     }
 
@@ -938,6 +1082,17 @@ impl Home {
                 return Err((400, format!("name {raw:?}: a picture's name (png, jpg, jpeg, webp)")));
             }
             crate::image::picture(&data, "data").map_err(|e| (400, e))?;
+            (clean.clone(), data)
+        } else if kind == "model3d" {
+            match ext.as_str() {
+                "png" | "jpg" | "jpeg" | "webp" => {
+                    nextsycl_model3d::read_picture(&data).map_err(|e| (400, format!("data: {e}")))?;
+                }
+                "glb" | "obj" => {
+                    nextsycl_model3d::read_mesh(&data).map_err(|e| (400, format!("data: {e}")))?;
+                }
+                _ => return Err((400, format!("name {raw:?}: a picture's or a mesh's name (png, jpg, jpeg, webp, glb, obj)"))),
+            }
             (clean.clone(), data)
         } else {
             if !matches!(ext.as_str(), "wav" | "mp3" | "flac" | "ogg" | "m4a") {
@@ -965,6 +1120,8 @@ impl Home {
             "image.ocr" => ("image", &[("images", true)]),
             "audio.speak" => ("audio", &[("ref_audio", false)]),
             "audio.voices.add" => ("audio", &[("sample", false)]),
+            "model3d.generate" => ("model3d", &[("image", false), ("images", true)]),
+            "model3d.rig" | "model3d.tool" => ("model3d", &[("mesh", false)]),
             _ => ("", &[]),
         }
     }
@@ -972,7 +1129,8 @@ impl Home {
     /// The request with every "upload:<name>" read in as base64 (none named: None); an upload not here is 404
     fn uploads_in(&self, method: &str, b: &Value) -> Result<Option<Value>, Fail> {
         let (kind, fields) = Self::upload_fields(method);
-        let named = |v: &Value| v.as_str().and_then(|x| x.strip_prefix("upload:")).map(str::to_string);
+        // a picture of a list may be {image, side} (model3d.generate's views): its image named
+        let named = |v: &Value| v.as_str().or_else(|| v["image"].as_str()).and_then(|x| x.strip_prefix("upload:")).map(str::to_string);
         if !fields.iter().any(|(f, list)| if *list { b[*f].as_array().is_some_and(|a| a.iter().any(|v| named(v).is_some())) } else { named(&b[*f]).is_some() }) {
             return Ok(None);
         }
@@ -988,7 +1146,11 @@ impl Home {
                 if let Some(a) = out[*f].as_array_mut() {
                     for (i, v) in a.iter_mut().enumerate() {
                         if let Some(n) = named(v) {
-                            *v = read(format!("{f}[{i}]"), &n)?;
+                            if v.is_object() {
+                                v["image"] = read(format!("{f}[{i}].image"), &n)?;
+                            } else {
+                                *v = read(format!("{f}[{i}]"), &n)?;
+                            }
                         }
                     }
                 }
@@ -1047,7 +1209,8 @@ impl Home {
         let sub = match kind.as_str() {
             "image" => "images",
             "audio" => "audio",
-            _ => return Err((400, "kind: image, audio or video".into())),
+            "model3d" => "model3d",
+            _ => return Err((400, "kind: image, audio, video or model3d".into())),
         };
         // an upload (up_...) is kept under uploads/
         let upload = name.starts_with("up_");
@@ -1055,7 +1218,12 @@ impl Home {
         let path = dir.join(&name);
         // what the servers make, not the saved voices or anything else kept there
         let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-        let ok = if kind == "image" { matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp") } else { ext == "wav" };
+        let ok = match kind.as_str() {
+            "image" => matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp"),
+            // a mesh and the picture and settings beside it; an upload (a picture or a mesh)
+            "model3d" => matches!(ext.as_str(), "glb" | "obj" | "png" | "jpg" | "jpeg" | "webp" | "json"),
+            _ => ext == "wav",
+        };
         if !ok || !path.is_file() {
             return Err((404, format!("no {kind} file {name}")));
         }
@@ -1157,6 +1325,34 @@ impl Home {
             }
             ("GET", p) if p.starts_with("/v1/images/files/") => pass(s, &self.file_target("image")),
             ("GET", p) if p.starts_with("/v1/audio/files/") => pass(s, &self.file_target("audio")),
+            ("GET", p) if p.starts_with("/v1/model3d/files/") => {
+                // from the directory (a tool's result needs no 3D server running)
+                let name = p["/v1/model3d/files/".len()..].split('?').next().unwrap_or("");
+                let kind = match name.rsplit('.').next() {
+                    Some("glb") => "model/gltf-binary",
+                    Some("png") => "image/png",
+                    Some("json") => "application/json",
+                    _ => return Err((404, format!("no file {name}"))),
+                };
+                let plain = crate::files::plain(name).ok_or_else(|| (404, format!("no file {name}")))?;
+                let b = std::fs::read(self.out_dir("model3d").join(plain)).map_err(|_| (404, format!("no file {name}")))?;
+                http::respond_bytes(s, 200, kind, &b, "Cache-Control: max-age=31536000, immutable\r\n");
+                Ok(())
+            }
+            ("POST", p @ ("/v1/model3d/generate" | "/v1/model3d/rig")) => {
+                need("model3d")?;
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let named = body["model"].as_str().filter(|n| all.iter().any(|m| m["id"] == *n)).map(str::to_string);
+                let want = if p.ends_with("/rig") { "rig" } else { "generate" };
+                let id = match named {
+                    Some(n) => self.pick("model3d", &json!({"model": n}), &all)?,
+                    None => all.iter().filter(|m| registry::kind_of(m) == "model3d" && m["enabled"] != false)
+                        .find(|m| m["does"].as_array().is_none_or(|a| a.iter().any(|x| x == want || (want == "rig" && x == "animate"))))
+                        .map(|m| m["id"].as_str().unwrap_or("").to_string()).ok_or_else(|| (409u16, format!("no enabled 3D model does {want}")))?,
+                };
+                let t = self.ensure(&id)?;
+                pass(s, &t)
+            }
             ("GET", p) if p.starts_with("/v1/video/files/") => {
                 // a clip in the studio's output (its /out/ route; a Range header passed on for seeking)
                 need("video")?;
@@ -1331,6 +1527,13 @@ impl Home {
                 json!({"model": ids("audio").first(), "instructions": "warm folk", "input": "[verse]\nRiver runs slow", "response_format": "url"}), "audio.generate")}));
             paths.insert("/v1/audio/files/{name}".into(), file("A song or speech an answer links (data[].url of audio.generate / audio.speak)", "<file>.wav", "audio/wav", true));
             paths.insert("/v1/audio/voices/{name}".into(), file("A saved voice's sample (audio.voices.list's sample)", "<voice>.wav", "audio/wav", false));
+        }
+        if on.contains(&"model3d") {
+            paths.insert("/v1/model3d/generate".into(), json!({"post": oa("A mesh from a picture (image) or several views (images: [{image, side}]); texture, seed, steps, faces; response_format glb or url",
+                json!({"model": ids("model3d").first(), "image": "data:image/png;base64,iVBORw0...", "texture": true, "response_format": "url"}), "model3d.generate")}));
+            paths.insert("/v1/model3d/rig".into(), json!({"post": oa("A mesh rigged (skeleton and skin weights) or animated (prompt: the motion); mesh as base64 GLB / OBJ, or file: a GLB made here",
+                json!({"model": ids("model3d").first(), "file": "1792132541-trellis2-42.glb", "response_format": "url"}), "model3d.rig")}));
+            paths.insert("/v1/model3d/files/{name}".into(), file("A mesh an answer links (data[].url of model3d.generate / model3d.rig), or its picture (.png)", "<file>.glb", "model/gltf-binary", true));
         }
         if on.contains(&"video") {
             paths.insert("/v1/video/files/{name}".into(), file("A finished clip: <clip>.mp4 (video.jobs.list's file, video.status's and video.timeline's file URLs); also <clip>.preview.png (video.status's preview while it samples) and <clip>.last.png (a clip's last frame), image/png", "<clip>.mp4, e.g. h3_20261011_220723.mp4", "video/mp4", true));

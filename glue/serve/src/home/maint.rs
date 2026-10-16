@@ -1,6 +1,6 @@
 //! Maintenance mode in the front door (crate::maintenance has the notice and its file): turning it on and off, what
 //! it refuses, what it pauses. On: the video studio's queue paused (what was paused before is kept and put back when
-//! the mode ends), image and audio jobs held in their queues, idle models unloaded when asked (`unload`); work
+//! the mode ends), image, audio and 3D jobs held in their queues, idle models unloaded when asked (`unload`); work
 //! running finishes. Off: the queues go on.
 
 use std::sync::Arc;
@@ -18,12 +18,12 @@ type Fail = (u16, String);
 /// cancels, guides, uploads, unloading - answer as always
 pub(super) fn starts_work(method: &str) -> bool {
     matches!(method, "system.enable" | "system.load" | "llm.chat" | "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak"
-                     | "audio.voices.design" | "video.generate")
+                     | "audio.voices.design" | "video.generate" | "model3d.generate" | "model3d.rig")
 }
 
 /// The OpenAI routes that start work
 fn openai_starts_work(method: &str, path: &str) -> bool {
-    method == "POST" && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/images/generations" | "/v1/images/edits" | "/v1/audio/speech")
+    method == "POST" && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/images/generations" | "/v1/images/edits" | "/v1/audio/speech" | "/v1/model3d/generate" | "/v1/model3d/rig")
 }
 
 impl Home {

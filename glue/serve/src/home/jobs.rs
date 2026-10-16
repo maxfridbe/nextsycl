@@ -1,5 +1,5 @@
-//! Image and audio requests as jobs, the way the video studio keeps clips: `image.generate`, `image.edit`,
-//! `audio.generate` and `audio.speak` each become a job with a label, run here in the background (the HTTP call that
+//! Image, audio and 3D requests as jobs, the way the video studio keeps clips: `image.generate`, `image.edit`,
+//! `audio.generate`, `audio.speak`, `model3d.generate` and `model3d.rig` each become a job with a label, run here in the background (the HTTP call that
 //! asked for it can drop: the job goes on), and are read with `<kind>.status {label}` (one) or `<kind>.jobs` (the
 //! list), and stopped with `<kind>.cancel {label}`. With `wait` (the default) the call answers when the job ends;
 //! `wait: false` answers at once with the job. A `reentrant_id` makes a submit idempotent: one that names the id of a
@@ -27,7 +27,10 @@ use super::{now, Home};
 use crate::http::{call_for, Target};
 
 /// The methods that run as jobs
-pub const METHODS: [&str; 4] = ["image.generate", "image.edit", "audio.generate", "audio.speak"];
+pub const METHODS: [&str; 6] = ["image.generate", "image.edit", "audio.generate", "audio.speak", "model3d.generate", "model3d.rig"];
+
+/// The kinds whose requests run as jobs here
+pub const KINDS: [&str; 3] = ["image", "audio", "model3d"];
 
 /// Finished jobs kept
 const KEEP: usize = 200;
@@ -77,7 +80,14 @@ impl Jobs {
             j["started"] = Value::Null;
         }
         let paused = std::fs::read(file.with_extension("paused.json")).ok().and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(json!({"image": {"all": false, "projects": [], "batches": []}, "audio": {"all": false, "projects": [], "batches": []}}));
+            .unwrap_or(json!({}));
+        // every kind's pauses (a file from before a kind was added lacks it)
+        let mut paused = paused;
+        for k in KINDS {
+            if paused[k].is_null() {
+                paused[k] = json!({"all": false, "projects": [], "batches": []});
+            }
+        }
         Jobs { list: Mutex::new(list), ended: Condvar::new(), file, paused: Mutex::new(paused) }
     }
 
@@ -153,7 +163,7 @@ fn place_for(waiting: &[Value], priority: i64) -> f64 {
 impl Home {
     /// Jobs the last run left unfinished, started again
     pub(crate) fn resume_jobs(self: &Arc<Self>) {
-        for kind in ["image", "audio"] {
+        for kind in KINDS {
             self.dispatch(kind);
         }
     }
