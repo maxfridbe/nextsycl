@@ -3,6 +3,11 @@
 //! met. Boundary edges carry a perpendicular plane (the outline keeps its shape); a collapse that would flip a
 //! triangle or pinch the surface (a link condition) is refused. Positions and colours are kept; UVs, normals and a
 //! skin are dropped (re-UV with `uv`, normals with `Mesh::compute_normals`).
+//!
+//! A large mesh (a marching cubes surface: a million triangles) is first reduced in slabs, side by side: its
+//! triangles split along the longest axis into one slab a thread, each decimated to its share of the budget with the
+//! vertices it shares with a neighbour held still, the slabs welded back; one pass over the whole then meets the
+//! budget (and clears the bands the held vertices left).
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
@@ -93,6 +98,90 @@ pub fn decimate(input: &Mesh, target: usize) -> Mesh {
         super::compact(&mut m);
         return m;
     }
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    if threads > 1 && m.triangles() >= SLABS_FROM && m.triangles() > 4 * target {
+        m = in_slabs(&m, target, threads, diag);
+    }
+    collapse(m, target, &[], diag)
+}
+
+/// Meshes of at least this many triangles are reduced in slabs first
+const SLABS_FROM: usize = 200_000;
+
+/// The mesh's triangles in `k` slabs along its longest axis, each decimated to target / k on a thread of its own
+/// with the vertices on its cut held still, welded back together
+fn in_slabs(m: &Mesh, target: usize, k: usize, diag: f32) -> Mesh {
+    let (lo, hi) = m.bounds();
+    let axis = (0..3).max_by(|&a, &b| (hi[a] - lo[a]).total_cmp(&(hi[b] - lo[b]))).unwrap_or(0);
+    let ntri = m.triangles();
+    let key = |t: usize| (0..3).map(|j| m.positions[m.indices[t * 3 + j] as usize][axis]).sum::<f32>();
+    let mut order: Vec<usize> = (0..ntri).collect();
+    order.sort_by(|&a, &b| key(a).total_cmp(&key(b)));
+    let per = ntri.div_ceil(k);
+    // the slab of each triangle, and which vertices more than one slab uses
+    let mut slab_of = vec![0usize; ntri];
+    for (i, &t) in order.iter().enumerate() {
+        slab_of[t] = i / per;
+    }
+    let mut first = vec![usize::MAX; m.positions.len()];
+    let mut shared = vec![false; m.positions.len()];
+    for t in 0..ntri {
+        for j in 0..3 {
+            let v = m.indices[t * 3 + j] as usize;
+            if first[v] == usize::MAX {
+                first[v] = slab_of[t];
+            } else if first[v] != slab_of[t] {
+                shared[v] = true;
+            }
+        }
+    }
+    let slabs: Vec<(Mesh, Vec<bool>)> = (0..k).map(|s| {
+        let mut local = vec![u32::MAX; m.positions.len()];
+        let mut sub = Mesh::default();
+        let mut held = Vec::new();
+        for &t in &order[(s * per).min(ntri)..((s + 1) * per).min(ntri)] {
+            for j in 0..3 {
+                let v = m.indices[t * 3 + j] as usize;
+                if local[v] == u32::MAX {
+                    local[v] = sub.positions.len() as u32;
+                    sub.positions.push(m.positions[v]);
+                    if let Some(c) = m.colors.get(v) {
+                        sub.colors.push(*c);
+                    }
+                    held.push(shared[v]);
+                }
+                sub.indices.push(local[v]);
+            }
+        }
+        (sub, held)
+    }).collect();
+    let share = target.div_ceil(k);
+    let done: Vec<Mesh> = std::thread::scope(|sc| {
+        let hs: Vec<_> = slabs.into_iter().map(|(sub, held)| sc.spawn(move || collapse(sub, share, &held, diag))).collect();
+        hs.into_iter().map(|h| h.join().expect("a decimation thread")).collect()
+    });
+    let mut all = Mesh { material: m.material.clone(), ..Default::default() };
+    for d in done {
+        let base = all.positions.len() as u32;
+        all.positions.extend_from_slice(&d.positions);
+        all.colors.extend_from_slice(&d.colors);
+        all.indices.extend(d.indices.iter().map(|i| i + base));
+    }
+    if all.colors.len() != all.positions.len() {
+        all.colors.clear();
+    }
+    // the held vertices meet their twins at the very same place
+    super::weld(&all, diag * 1e-6).0
+}
+
+/// Collapses edges of a welded mesh until it has at most `target` triangles; `held` (empty: none) marks vertices
+/// that may not move
+fn collapse(mut m: Mesh, target: usize, held: &[bool], diag: f32) -> Mesh {
+    if m.triangles() <= target {
+        super::compact(&mut m);
+        return m;
+    }
+    let is_held = |v: u32| held.get(v as usize).copied().unwrap_or(false);
     let nv = m.positions.len();
     let mut tris: Vec<[u32; 3]> = m.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
     let mut alive = vec![true; tris.len()];
@@ -199,7 +288,7 @@ pub fn decimate(input: &Mesh, target: usize) -> Mesh {
         let Some(&Cand { a, b, stamp: cs, to: cto }) = queue.pop() else { break };
         let c = Cand { a, b, stamp: cs, to: cto };
         let (a, b) = (c.a, c.b);
-        if gone[a as usize] || gone[b as usize] || stamp[a as usize] != c.stamp.0 || stamp[b as usize] != c.stamp.1 {
+        if gone[a as usize] || gone[b as usize] || stamp[a as usize] != c.stamp.0 || stamp[b as usize] != c.stamp.1 || is_held(a) || is_held(b) {
             continue;
         }
         let na = neighbours(&vt, &tris, &alive, a);
@@ -305,5 +394,19 @@ mod tests {
         let d = decimate(&m, 40_000);
         eprintln!("{} -> {} triangles in {:.2} s", m.triangles(), d.triangles(), t.elapsed().as_secs_f64());
         assert!(is_closed_manifold(&d));
+        let worst = d.positions.iter().map(|p| (crate::length(*p) - 1.0).abs()).fold(0f32, f32::max);
+        assert!(worst < 0.01, "a vertex {worst} off the surface");
+    }
+
+    #[test]
+    fn slabs_meet_the_budget_and_stay_closed() {
+        // big enough for the slabs (200,000 triangles)
+        let m = sphere(200, 520);
+        assert!(m.triangles() >= SLABS_FROM);
+        let d = decimate(&m, 20_000);
+        assert!(d.triangles() <= 20_000 && d.triangles() > 15_000, "{} triangles", d.triangles());
+        assert!(is_closed_manifold(&d), "the slabs left holes or folds");
+        let worst = d.positions.iter().map(|p| (crate::length(*p) - 1.0).abs()).fold(0f32, f32::max);
+        assert!(worst < 0.01, "a vertex {worst} off the surface");
     }
 }

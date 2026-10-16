@@ -148,8 +148,14 @@ pub fn bake(m: &Mesh, s: &Scene, views: &[Vec<f32>], size: usize, tsize: u32) ->
     let n = (tsize * tsize) as usize;
     let mut merge = vec![[0f32; 3]; n];
     let mut trust = vec![0f32; n];
-    for (vi, img) in views.iter().enumerate() {
-        let b = back_project(s, &tex, img, super::render::ELEVS[vi], super::render::AZIMS[vi], size);
+    // the views projected side by side (a thread each), merged in order
+    let projected: Vec<Baked> = std::thread::scope(|sc| {
+        let hs: Vec<_> = views.iter().enumerate()
+            .map(|(vi, img)| { let tex = &tex; sc.spawn(move || back_project(s, tex, img, super::render::ELEVS[vi], super::render::AZIMS[vi], size)) })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("a bake thread")).collect()
+    });
+    for (vi, b) in projected.into_iter().enumerate() {
         // the texture's own (a texel two triangles cover keeps the last), weighted
         let mut tw = vec![0f32; n];
         let mut tc = vec![[0f32; 3]; n];

@@ -253,15 +253,26 @@ impl Paint {
         }
         drop(cond);
         // bake: the views at 2,048 (Pillow's bicubic in place of RealESRGAN), the albedo and the metallic-roughness
-        let big: Vec<Vec<f32>> = views.iter().map(|v| pil::resize(v, SIZE, SIZE, 3, RENDER, RENDER, pil::Filter::Bicubic)).collect();
+        let big: Vec<Vec<f32>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = views.iter().map(|v| sc.spawn(move || pil::resize(v, SIZE, SIZE, 3, RENDER, RENDER, pil::Filter::Bicubic))).collect();
+            hs.into_iter().map(|h| h.join().expect("a resize thread")).collect()
+        });
         let mut m = nextsycl_mesh::tools::unwrap(mesh, tsize, 4);
         m.compute_normals();
         let mut textures = Vec::new();
-        for (k, set) in big.chunks(VIEWS).enumerate() {
-            let (rgb, seen, tex) = bake::bake(&m, &scene, set, RENDER, tsize);
-            textures.push(bake::inpaint(&m, &rgb, &seen, &tex, tsize));
-            progress("bake", k as u32 + 1, 2)?;
-        }
+        // albedo and metallic-roughness side by side
+        let baked: Vec<Texture> = std::thread::scope(|sc| {
+            let hs: Vec<_> = big.chunks(VIEWS).map(|set| {
+                let (m, scene) = (&m, &scene);
+                sc.spawn(move || {
+                    let (rgb, seen, tex) = bake::bake(m, scene, set, RENDER, tsize);
+                    bake::inpaint(m, &rgb, &seen, &tex, tsize)
+                })
+            }).collect();
+            hs.into_iter().map(|h| h.join().expect("a bake thread")).collect()
+        });
+        textures.extend(baked);
+        progress("bake", 2, 2)?;
         let mr = textures.pop().expect("two");
         let albedo = textures.pop().expect("two");
         // glTF's metallic-roughness: roughness in G, metallic in B (Tencent's mr picture: metallic R, roughness G)
@@ -279,13 +290,16 @@ impl Paint {
 
 /// The six views' normal and position maps as the model takes them: 8-bit values [512, 512, 3]
 pub fn maps(scene: &render::Scene) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
-    let (mut n, mut p) = (Vec::new(), Vec::new());
-    for i in 0..VIEWS {
-        let v = render::view(scene, render::ELEVS[i], render::AZIMS[i], RENDER);
-        n.push(pil::resize(&render::normal_map(scene, &v), RENDER, RENDER, 3, SIZE, SIZE, pil::Filter::Bicubic));
-        p.push(pil::resize(&render::position_map(scene, &v), RENDER, RENDER, 3, SIZE, SIZE, pil::Filter::Bicubic));
-    }
-    (n, p)
+    // a view a thread
+    let both: Vec<(Vec<f32>, Vec<f32>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..VIEWS).map(|i| sc.spawn(move || {
+            let v = render::view(scene, render::ELEVS[i], render::AZIMS[i], RENDER);
+            (pil::resize(&render::normal_map(scene, &v), RENDER, RENDER, 3, SIZE, SIZE, pil::Filter::Bicubic),
+             pil::resize(&render::position_map(scene, &v), RENDER, RENDER, 3, SIZE, SIZE, pil::Filter::Bicubic))
+        })).collect();
+        hs.into_iter().map(|h| h.join().expect("a render thread")).collect()
+    });
+    both.into_iter().unzip()
 }
 
 /// The picture as the paint model takes it: resized to 512 (Pillow, bicubic, alpha premultiplied) and put on white;
