@@ -15,7 +15,9 @@
 //! Tencent splits q, k, v per head out of the concatenation [q | k | v] (and the cross-attention's k, v out of
 //! [k | v]) - head h's q is features [384 h, 384 h + 128) of it, its k the next 128, its v the next - so the stacked
 //! matrices' rows are reordered at load into whole q, k, v. CFG runs the conditional and the unconditional (all-zero
-//! context) passes one after the other; the context's keys and values are computed once a generation.
+//! context) passes one after the other (as one batch of two they take as long: the products are as fast at 4,097
+//! rows as at 8,194); the context's keys and values are computed once a generation. The all-zero context's keys and
+//! values are zeros - its attention gives zeros - so the unconditional pass's cross-attention is out2's bias alone.
 
 use nextsycl_core::{DevBuf, Error, Result};
 use nextsycl_diffusion::kernels::{none, Dt};
@@ -54,6 +56,9 @@ struct Block {
     qn2: DevBuf,
     kn2: DevBuf,
     out2: Lin,
+    /// out2 of zeros: its bias as the half product rounds it (float32 [width]), the unconditional pass's
+    /// cross-attention
+    out2_zero: DevBuf,
     n3: (DevBuf, DevBuf),
     mlp: Mlp,
 }
@@ -92,7 +97,10 @@ struct Ctx {
 
 pub struct Scratch {
     tokens: usize,
-    ctx: [Ctx; 2],
+    /// the picture's context (the unconditional one is all zeros)
+    ctx: Ctx,
+    /// half ones [tokens + 1, width]: a bias added to every row through `add`'s gate
+    ones: DevBuf,
     x: DevBuf,
     xh: DevBuf,
     qkv: DevBuf,
@@ -161,6 +169,10 @@ impl Plain {
                 qn2: w.vec(&format!("{a2}q_norm.weight"))?,
                 kn2: w.vec(&format!("{a2}k_norm.weight"))?,
                 out2: w.lin(&format!("{a2}out_proj"))?,
+                out2_zero: {
+                    let b = w.bias_or_zero(&format!("{a2}out_proj.bias"), width)?;
+                    DevBuf::from_f32(&w.gpu, &b.iter().map(|&v| nextsycl_gguf::safetensors::f16_to_f32(crate::ops::f32_to_f16(v))).collect::<Vec<f32>>())?
+                },
                 n3: norm(w, &format!("{p}norm3"))?,
                 mlp,
             });
@@ -187,15 +199,12 @@ impl Plain {
         self.blocks.len()
     }
 
-    /// The keys and values of a context (float32 [rows, context features]; None: the unconditional zeros)
-    fn context_kv(&self, ops: &Ops, cond: Option<&DevBuf>, rows: usize) -> Result<Ctx> {
+    /// The keys and values of a context (float32 [rows, context features])
+    fn context_kv(&self, ops: &Ops, cond: &DevBuf, rows: usize) -> Result<Ctx> {
         let gpu = &ops.gpu;
         let wd = self.width;
         let ch = DevBuf::new(gpu, rows * self.context * 2)?;
-        match cond {
-            Some(c) => ops.to_half(c.ptr(), ch.ptr(), rows * self.context)?,
-            None => ch.fill(0)?,
-        }
+        ops.to_half(cond.ptr(), ch.ptr(), rows * self.context)?;
         let mut kv = Vec::new();
         for b in &self.blocks {
             let o = DevBuf::new(gpu, rows * 2 * wd * 2)?;
@@ -219,7 +228,12 @@ impl Plain {
         let nskip = self.blocks.len() / 2;
         Ok(Scratch {
             tokens,
-            ctx: [self.context_kv(ops, Some(cond), rows)?, self.context_kv(ops, None, rows)?],
+            ctx: self.context_kv(ops, cond, rows)?,
+            ones: {
+                let b = DevBuf::new(gpu, s * wd * 2)?;
+                b.write(0, &crate::ops::f32_to_f16(1.0).to_le_bytes().repeat(s * wd))?;
+                b
+            },
             x: DevBuf::new(gpu, s * wd * 4)?,
             xh: DevBuf::new(gpu, s * wd * 2)?,
             qkv: DevBuf::new(gpu, s * 3 * wd * 2)?,
@@ -253,7 +267,7 @@ impl Plain {
         let (wd, h) = (self.width, self.heads);
         let n = sc.tokens;
         let s = n + 1;
-        let ctx = &sc.ctx[which];
+        let ctx = &sc.ctx;
         // the time token, then the latents
         let tf: Vec<u16> = timestep_features(t, self.t1.k).iter().map(|&v| crate::ops::f32_to_f16(v)).collect();
         // SAFETY: u16s viewed as bytes.
@@ -272,34 +286,46 @@ impl Plain {
                 ops.lin(wb, sc.xh.ptr(), s, sc.tmp.ptr(), Dt::F16)?;
                 ops.add(sc.tmpf.ptr(), sc.tmp.ptr(), true, s, wd, none())?;
                 ops.ln(sc.tmpf.ptr(), false, s, wd, EPS, nw.ptr(), nb.ptr(), none(), none(), sc.x.ptr(), false)?;
+                crate::prof::part(&ops.nsd, "plain skip")?;
             }
             // self-attention
             ops.ln(sc.x.ptr(), false, s, wd, EPS, b.n1.0.ptr(), b.n1.1.ptr(), none(), none(), sc.xh.ptr(), true)?;
             ops.lin(&b.qkv, sc.xh.ptr(), s, sc.qkv.ptr(), Dt::F16)?;
             ops.head_norm(sc.qkv.ptr(), s, h, HEAD, 3 * wd, b.qn1.ptr(), none(), EPS, true)?;
             ops.head_norm(hp(&sc.qkv, wd), s, h, HEAD, 3 * wd, b.kn1.ptr(), none(), EPS, true)?;
+            crate::prof::part(&ops.nsd, "plain qkv")?;
             ops.attention(sc.qkv.ptr(), hp(&sc.qkv, wd), hp(&sc.qkv, 2 * wd), s, h, HEAD, 3 * wd, sc.att.ptr())?;
+            crate::prof::part(&ops.nsd, "plain self-attention")?;
             ops.lin(&b.out1, sc.att.ptr(), s, sc.tmp.ptr(), Dt::F16)?;
             ops.add(sc.x.ptr(), sc.tmp.ptr(), true, s, wd, none())?;
-            // cross-attention to the context
-            ops.ln(sc.x.ptr(), false, s, wd, EPS, b.n2.0.ptr(), b.n2.1.ptr(), none(), none(), sc.xh.ptr(), true)?;
-            ops.lin(&b.q2, sc.xh.ptr(), s, sc.qkv.ptr(), Dt::F16)?;
-            ops.head_norm(sc.qkv.ptr(), s, h, HEAD, wd, b.qn2.ptr(), none(), EPS, true)?;
-            let kv = &ctx.kv[i];
-            ops.cross_attention(sc.qkv.ptr(), s, wd, kv.ptr(), hp(kv, wd), ctx.rows, 2 * wd, h, HEAD, sc.att.ptr())?;
-            ops.lin(&b.out2, sc.att.ptr(), s, sc.tmp.ptr(), Dt::F16)?;
-            ops.add(sc.x.ptr(), sc.tmp.ptr(), true, s, wd, none())?;
+            crate::prof::part(&ops.nsd, "plain out")?;
+            // cross-attention to the context; the unconditional pass's is out2's bias
+            if which == 0 {
+                ops.ln(sc.x.ptr(), false, s, wd, EPS, b.n2.0.ptr(), b.n2.1.ptr(), none(), none(), sc.xh.ptr(), true)?;
+                ops.lin(&b.q2, sc.xh.ptr(), s, sc.qkv.ptr(), Dt::F16)?;
+                ops.head_norm(sc.qkv.ptr(), s, h, HEAD, wd, b.qn2.ptr(), none(), EPS, true)?;
+                let kv = &ctx.kv[i];
+                ops.cross_attention(sc.qkv.ptr(), s, wd, kv.ptr(), hp(kv, wd), ctx.rows, 2 * wd, h, HEAD, sc.att.ptr())?;
+                ops.lin(&b.out2, sc.att.ptr(), s, sc.tmp.ptr(), Dt::F16)?;
+                ops.add(sc.x.ptr(), sc.tmp.ptr(), true, s, wd, none())?;
+            } else {
+                ops.add(sc.x.ptr(), sc.ones.ptr(), true, s, wd, b.out2_zero.ptr())?;
+            }
+            crate::prof::part(&ops.nsd, "plain cross")?;
             // the MLP, or the experts
             ops.ln(sc.x.ptr(), false, s, wd, EPS, b.n3.0.ptr(), b.n3.1.ptr(), none(), none(), sc.xh.ptr(), true)?;
             match &b.mlp {
                 Mlp::Dense(f) => {
                     self.ffn(ops, sc, f, sc.xh.ptr(), s, sc.tmp.ptr())?;
                     ops.add(sc.x.ptr(), sc.tmp.ptr(), true, s, wd, none())?;
+                    crate::prof::part(&ops.nsd, "plain mlp")?;
                 }
                 Mlp::Moe { gate, experts, shared, top } => {
                     self.moe(ops, sc, gate, experts, *top, s)?;
+                    crate::prof::part(&ops.nsd, "plain moe experts")?;
                     self.ffn(ops, sc, shared, sc.xh.ptr(), s, sc.tmp.ptr())?;
                     ops.add(sc.x.ptr(), sc.tmp.ptr(), true, s, wd, none())?;
+                    crate::prof::part(&ops.nsd, "plain moe shared")?;
                 }
             }
             if i < nskip {

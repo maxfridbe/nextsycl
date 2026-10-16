@@ -315,6 +315,7 @@ impl Unet {
                     Layer::Down(c) => c.run(ops, &mem.tmp, &mem.keep, &h, None)?,
                     Layer::Up(_) => return Err(Error("an upsampler in a down block".into())),
                 };
+                crate::prof::part(&ops.nsd, if matches!(l, Layer::Res(_)) { "unet resnet" } else if matches!(l, Layer::Tf(_)) { "unet tf out" } else { "unet resample" })?;
                 mem.end_block();
                 // the skips: every resnet / attention pair's output (the attention's when there is one) and the
                 // downsampler's
@@ -331,6 +332,7 @@ impl Unet {
                 Layer::Tf(tf) => tf.run(ops, mem, &h, cond, self.main)?,
                 _ => return Err(Error("a resampler in the middle block".into())),
             };
+            crate::prof::part(&ops.nsd, if matches!(l, Layer::Res(_)) { "unet resnet" } else { "unet tf out" })?;
             mem.end_block();
         }
         for blk in &self.up {
@@ -350,6 +352,7 @@ impl Unet {
                     }
                     Layer::Down(_) => return Err(Error("a downsampler in an up block".into())),
                 };
+                crate::prof::part(&ops.nsd, if matches!(l, Layer::Res(_)) { "unet resnet" } else if matches!(l, Layer::Tf(_)) { "unet tf out" } else { "unet resample" })?;
                 mem.end_block();
             }
         }
@@ -393,6 +396,7 @@ impl Tf {
         let att = halves(tmp, rows * c)?;
         let o = halves(tmp, rows * c)?;
         ops.ln(hs.ptr(), false, rows, c, EPS_LN, b.n1.0.ptr(), b.n1.1.ptr(), none(), none(), nh.ptr(), true)?;
+        crate::prof::part(&ops.nsd, "unet tf in")?;
         match (&b.extra, main) {
             (None, false) => {
                 // the reference UNet: its states kept (the main UNet's reference attention reads them), then its
@@ -403,13 +407,14 @@ impl Tf {
                 let (wqkv, wo) = b.sa.as_ref().expect("the reference UNet's self-attention");
                 let qkv = halves(tmp, rows * 3 * c)?;
                 ops.lin(wqkv, nh.ptr(), rows, qkv.ptr(), Dt::F16)?;
-                ops.nsd.attention_batch(qkv.ptr(), hp(&qkv, c), hp(&qkv, 2 * c), Dt::F16, x.n, l, heads, HEAD, 3 * c, att.ptr(), Dt::F16)?;
+                ops.attention_batch(qkv.ptr(), hp(&qkv, c), hp(&qkv, 2 * c), x.n, l, heads, HEAD, 3 * c, att.ptr())?;
                 ops.lin(wo, att.ptr(), rows, o.ptr(), Dt::F16)?;
                 ops.add(hs.ptr(), o.ptr(), true, rows, c, none())?;
             }
             (Some(e), true) => self.extras(ops, tmp, e, x, &hs, &nh, &att, &o, cond)?,
             _ => return Err(Error("a block's attentions and its UNet disagree".into())),
         }
+        crate::prof::part(&ops.nsd, "unet tf multiview")?;
         // the text cross-attention (and the main UNet's DINO attention) on norm2
         ops.ln(hs.ptr(), false, rows, c, EPS_LN, b.n2.0.ptr(), b.n2.1.ptr(), none(), none(), nh.ptr(), true)?;
         let q = halves(tmp, rows * c)?;
@@ -421,6 +426,7 @@ impl Tf {
         }
         ops.lin(&b.out2, att.ptr(), rows, o.ptr(), Dt::F16)?;
         ops.add(hs.ptr(), o.ptr(), true, rows, c, none())?;
+        crate::prof::part(&ops.nsd, "unet tf text")?;
         if let Some(e) = &b.extra {
             let dino = cond.dino.get(&self.name).ok_or_else(|| Error(format!("no DINO keys for {}", self.name)))?;
             ops.lin(&e.dq, nh.ptr(), rows, q.ptr(), Dt::F16)?;
@@ -435,6 +441,7 @@ impl Tf {
             ops.lin(&e.dout, att.ptr(), rows, o.ptr(), Dt::F16)?;
             ops.add(hs.ptr(), o.ptr(), true, rows, c, none())?;
         }
+        crate::prof::part(&ops.nsd, "unet tf dino")?;
         // the feed-forward (GEGLU)
         ops.ln(hs.ptr(), false, rows, c, EPS_LN, b.n3.0.ptr(), b.n3.1.ptr(), none(), none(), nh.ptr(), true)?;
         let f2 = b.ff1.n;
@@ -444,6 +451,7 @@ impl Tf {
         ops.geglu(mid.ptr(), rows, f2 / 2, act.ptr())?;
         ops.lin(&b.ff2, act.ptr(), rows, o.ptr(), Dt::F16)?;
         ops.add(hs.ptr(), o.ptr(), true, rows, c, none())?;
+        crate::prof::part(&ops.nsd, "unet tf ff")?;
         // out
         let hh = halves(tmp, rows * c)?;
         ops.to_half(hs.ptr(), hh.ptr(), rows * c)?;
@@ -469,11 +477,12 @@ impl Tf {
         for (m, (w, _)) in e.mda.iter().enumerate() {
             ops.lin(w, hp(nh, m * per_mat * c), per_mat, hp(&qkv, m * per_mat * 3 * c), Dt::F16)?;
         }
-        ops.nsd.attention_batch(qkv.ptr(), hp(&qkv, c), hp(&qkv, 2 * c), Dt::F16, x.n, l, heads, HEAD, 3 * c, att.ptr(), Dt::F16)?;
+        ops.attention_batch(qkv.ptr(), hp(&qkv, c), hp(&qkv, 2 * c), x.n, l, heads, HEAD, 3 * c, att.ptr())?;
         for (m, (_, wo)) in e.mda.iter().enumerate() {
             ops.lin(wo, hp(att, m * per_mat * c), per_mat, hp(o, m * per_mat * c), Dt::F16)?;
         }
         ops.add(hs.ptr(), o.ptr(), true, rows, c, none())?;
+        crate::prof::part(&ops.nsd, "unet tf self (mda)")?;
         // the reference attention: the albedo rows of branches 1 and 2 (branch 0 has none: its scale is 0) ask the
         // reference UNet's states; one value and output a material, added into that material's rows
         let kv = cond.refkv.get(&self.name).ok_or_else(|| Error(format!("no reference keys for {}", self.name)))?;
@@ -490,6 +499,7 @@ impl Tf {
             let dst = (m * BRANCHES * VIEWS * l + q0) * c;
             ops.add(fp(hs, dst).cast(), ro.ptr(), true, nq, c, none())?;
         }
+        crate::prof::part(&ops.nsd, "unet tf reference")?;
         // the multiview attention: each (material, branch)'s six views together, q and k rotated by position
         let (w, wo) = &e.mv;
         ops.lin(w, nh.ptr(), rows, qkv.ptr(), Dt::F16)?;
@@ -497,7 +507,7 @@ impl Tf {
         let cs = cond.rope.get(&group).ok_or_else(|| Error(format!("no rotation for {group} tokens")))?;
         ops.nsd.rope(qkv.ptr(), Dt::F16, rows, heads, HEAD, 3 * c, cs.ptr(), HEAD)?;
         ops.nsd.rope(hp(&qkv, c), Dt::F16, rows, heads, HEAD, 3 * c, cs.ptr(), HEAD)?;
-        ops.nsd.attention_batch(qkv.ptr(), hp(&qkv, c), hp(&qkv, 2 * c), Dt::F16, MATS * BRANCHES, group, heads, HEAD, 3 * c, att.ptr(), Dt::F16)?;
+        ops.attention_batch(qkv.ptr(), hp(&qkv, c), hp(&qkv, 2 * c), MATS * BRANCHES, group, heads, HEAD, 3 * c, att.ptr())?;
         ops.lin(wo, att.ptr(), rows, o.ptr(), Dt::F16)?;
         ops.add(hs.ptr(), o.ptr(), true, rows, c, none())?;
         Ok(())

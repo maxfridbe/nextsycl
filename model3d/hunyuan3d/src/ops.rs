@@ -194,11 +194,15 @@ pub struct Ops {
     pub nsd: Nsd,
     pub gpu: Arc<Gpu>,
     k: &'static ffi::Api,
+    /// self-attention by the strided flash kernel (the shared kernels' cross-attention path, half precision, the
+    /// rows read in place) at every length; false: the shared choice (oneDNN's fused attention under 8,192 rows -
+    /// q, k, v copied out per head first - SageAttention's int8 q and k from there)
+    pub flash: bool,
 }
 
 impl Ops {
     pub fn new(gpu: &Arc<Gpu>) -> Result<Ops> {
-        Ok(Ops { nsd: Nsd::new(gpu)?, gpu: gpu.clone(), k: ffi::api()? })
+        Ok(Ops { nsd: Nsd::new(gpu)?, gpu: gpu.clone(), k: ffi::api()?, flash: true })
     }
 
     fn g(&self) -> M {
@@ -315,7 +319,22 @@ impl Ops {
     }
     /// Self-attention over s rows of h heads x d (q, k, v rows `stride` apart, half); out [s, h d] half
     pub fn attention(&self, q: P, k: P, v: P, s: usize, h: usize, d: usize, stride: usize, out: M) -> Result<()> {
+        if self.flash {
+            return self.nsd.attention_qk(q, s, stride, k, v, s, stride, Dt::F16, h, d, out, Dt::F16);
+        }
         self.nsd.attention(q, k, v, Dt::F16, s, h, d, stride, out, Dt::F16)
+    }
+
+    /// b sequences of s rows each, one after the other (q, k, v rows `stride` apart); out [b s, h d] half
+    pub fn attention_batch(&self, q: P, k: P, v: P, b: usize, s: usize, h: usize, d: usize, stride: usize, out: M) -> Result<()> {
+        if self.flash {
+            for i in 0..b {
+                let at = |p: P| p.cast::<u16>().wrapping_add(i * s * stride).cast();
+                self.nsd.attention_qk(at(q), s, stride, at(k), at(v), s, stride, Dt::F16, h, d, out.cast::<u16>().wrapping_add(i * s * h * d).cast(), Dt::F16)?;
+            }
+            return Ok(());
+        }
+        self.nsd.attention_batch(q, k, v, Dt::F16, b, s, h, d, stride, out, Dt::F16)
     }
     /// sq query rows (qs apart) over skv key / value rows (kvs apart); out [sq, h d] half
     pub fn cross_attention(&self, q: P, sq: usize, qs: usize, k: P, v: P, skv: usize, kvs: usize, h: usize, d: usize, out: M) -> Result<()> {

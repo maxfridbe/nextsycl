@@ -17,12 +17,15 @@
 use nextsycl_core::{DevBuf, Error, Result};
 use nextsycl_diffusion::kernels::{none, Dt};
 
-use crate::ops::{hp, read_f32, Lin, Ops, Weights, P};
+use crate::ops::{hp, read_f32, HostMat, Lin, Ops, Weights, P};
 
 const EPS: f32 = 1e-6;
 const HEAD: usize = 64;
 pub const FREQS: usize = 8;
 pub const QUERY: usize = 3 * (2 * FREQS + 1);
+/// The query embedding as the product reads it: zero features after the 51 (oneDNN takes 51 columns slowly - a
+/// quarter of a second to build each product's kernel - and 64 at once)
+const QUERY_PAD: usize = 64;
 
 struct Res {
     ln1w: DevBuf,
@@ -127,9 +130,15 @@ impl Vae {
         } else {
             None
         };
+        let qm = w.host_mat(&format!("{g}query_proj.weight"))?;
+        if qm.k != QUERY {
+            return Err(Error(format!("the geometry decoder takes {} query features, not {QUERY}", qm.k)));
+        }
+        let qm = HostMat { v: (0..qm.n).flat_map(|r| qm.v[r * QUERY..(r + 1) * QUERY].iter().copied().chain(std::iter::repeat_n(0, QUERY_PAD - QUERY))).collect(),
+                           n: qm.n, k: QUERY_PAD };
         let geo = Geo {
             width: gw,
-            query: w.lin(&format!("{g}query_proj"))?,
+            query: w.upload(&qm, if w.has(&format!("{g}query_proj.bias")) { Some(w.host_f32(&format!("{g}query_proj.bias"))?) } else { None })?,
             latents: if w.has(&format!("{g}latents_proj.weight")) { Some(w.lin(&format!("{g}latents_proj"))?) } else { None },
             ln1: norm(w, &format!("{a}ln_1"))?,
             ln2: norm(w, &format!("{a}ln_2"))?,
@@ -144,9 +153,6 @@ impl Vae {
             post: norm_opt(w, &format!("{g}ln_post"))?,
             out: w.lin(&format!("{g}output_proj"))?,
         };
-        if geo.query.k != QUERY {
-            return Err(Error(format!("the geometry decoder takes {} query features, not {QUERY}", geo.query.k)));
-        }
         Ok(Vae { width, channels, scale_factor, post_kl: w.lin("post_kl")?, blocks, geo, bytes: w.bytes.get() })
     }
 
@@ -229,6 +235,12 @@ impl Vae {
         Ok(QueryScratch {
             q,
             emb: DevBuf::new(gpu, q * QUERY * 2)?,
+            emb_pad: DevBuf::new(gpu, q * QUERY_PAD * 2)?,
+            zeros: {
+                let z = DevBuf::new(gpu, q * (QUERY_PAD - QUERY) * 2)?;
+                z.fill(0)?;
+                z
+            },
             x: DevBuf::new(gpu, q * gw * 4)?,
             h: DevBuf::new(gpu, q * gw * 2)?,
             qq: DevBuf::new(gpu, q * gw * 2)?,
@@ -245,13 +257,16 @@ impl Vae {
         let g = &self.geo;
         let gw = g.width;
         let heads = gw / HEAD;
-        ops.lin(&g.query, sc.emb.ptr(), n, sc.x.ptr(), Dt::F32)?;
+        ops.concat(sc.emb.ptr(), QUERY, sc.zeros.ptr(), QUERY_PAD - QUERY, n, sc.emb_pad.ptr())?;
+        ops.lin(&g.query, sc.emb_pad.ptr(), n, sc.x.ptr(), Dt::F32)?;
         ops.ln(sc.x.ptr(), false, n, gw, EPS, g.ln1.0.ptr(), g.ln1.1.ptr(), none(), none(), sc.h.ptr(), true)?;
         ops.lin(&g.q, sc.h.ptr(), n, sc.qq.ptr(), Dt::F16)?;
         if let Some((nw, nb)) = &g.qn {
             ops.head_norm(sc.qq.ptr(), n, heads, HEAD, gw, nw.ptr(), nb.ptr(), EPS, false)?;
         }
+        crate::prof::part(&ops.nsd, "geo query")?;
         ops.cross_attention(sc.qq.ptr(), n, gw, data.kv.ptr(), hp(&data.kv, gw), data.n, 2 * gw, heads, HEAD, sc.att.ptr())?;
+        crate::prof::part(&ops.nsd, "geo attention")?;
         ops.lin(&g.proj, sc.att.ptr(), n, sc.h.ptr(), Dt::F16)?;
         ops.add(sc.x.ptr(), sc.h.ptr(), true, n, gw, none())?;
         ops.ln(sc.x.ptr(), false, n, gw, EPS, g.ln3.0.ptr(), g.ln3.1.ptr(), none(), none(), sc.h.ptr(), true)?;
@@ -264,7 +279,8 @@ impl Vae {
             Some((w, b)) => ops.ln(sc.x.ptr(), false, n, gw, 1e-5, w.ptr(), b.ptr(), none(), none(), sc.h.ptr(), true)?,
             None => ops.to_half(sc.x.ptr(), sc.h.ptr(), n * gw)?,
         }
-        ops.lin(&g.out, sc.h.ptr(), n, sc.logits.ptr(), Dt::F32)
+        ops.lin(&g.out, sc.h.ptr(), n, sc.logits.ptr(), Dt::F32)?;
+        crate::prof::part(&ops.nsd, "geo mlp")
     }
 
     /// Logits at points (host float32 [n, 3])
@@ -310,6 +326,9 @@ impl Vae {
 pub struct QueryScratch {
     pub q: usize,
     emb: DevBuf,
+    /// [q, 64]: emb and zeros
+    emb_pad: DevBuf,
+    zeros: DevBuf,
     x: DevBuf,
     h: DevBuf,
     qq: DevBuf,
