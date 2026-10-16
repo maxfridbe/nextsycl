@@ -77,6 +77,81 @@ fn api() -> Result<&'static Api> {
     .map_err(|e| Error(e.clone()))
 }
 
+/// The silo's name (`kernels/image/hunyuanimage21/silo` -> `dist/silo/libnextsycl-hunyuanimage21.so`)
+pub const SILO: &str = "hunyuanimage21";
+
+/// One product's arguments (silo.h's `ns_hi21_mm`)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Mm {
+    pub x: P,
+    pub lda: i64,
+    pub x_bs: i64,
+    pub b: i64,
+    pub m: i64,
+    pub k: i64,
+    pub k0: i64,
+    pub kn: i64,
+    pub n: i64,
+    pub w: *const i8,
+    pub s: P,
+    pub bias: *const f32,
+    pub out: M,
+    pub ldo: i64,
+    pub o_bs: i64,
+    pub out_dt: i32,
+    pub post: i32,
+    pub gate: *const f32,
+}
+
+/// The silo's products (silo.h): the DiT's Q8_0 matrices read as int8 in the product, with its fusions
+struct Silo {
+    path: std::path::PathBuf,
+    q8_split: unsafe extern "C" fn(G, P, i64, i64, *mut i8, M) -> c_int,
+    linear_supported: unsafe extern "C" fn(G) -> c_int,
+    linear: unsafe extern "C" fn(G, *const Mm) -> c_int,
+    gn_supported: unsafe extern "C" fn(i64, i64) -> c_int,
+    gn_scratch: unsafe extern "C" fn(i64) -> i64,
+    group_norm: unsafe extern "C" fn(G, P, i64, i64, i64, *const f32, *const f32, f32, c_int, *mut f32, M) -> c_int,
+}
+
+// SAFETY: function pointers into a library that stays loaded for the process.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+/// The silo, when built (None: NS_SILO=0, or no file - the engine's own kernels throughout)
+fn silo() -> Result<Option<&'static Silo>> {
+    static S: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    S.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo(SILO).map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in silo.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo {
+            path: lib.path.clone(),
+            q8_split: sym!("ns_image_hi21_silo_q8_split"),
+            linear_supported: sym!("ns_image_hi21_silo_linear_supported"),
+            linear: sym!("ns_image_hi21_silo_linear"),
+            gn_supported: sym!("ns_image_hi21_silo_group_norm_supported"),
+            gn_scratch: sym!("ns_image_hi21_silo_gn_scratch"),
+            group_norm: sym!("ns_image_hi21_silo_group_norm"),
+        }))
+    })
+    .as_ref()
+    .map(|s| s.as_ref())
+    .map_err(|e| Error(e.clone()))
+}
+
 /// A call's return code as a result (the reason from the library)
 fn check(rc: c_int, what: &str) -> Result<()> {
     if rc == 0 {
@@ -106,11 +181,35 @@ pub enum Act {
 pub struct K {
     pub gpu: std::sync::Arc<Gpu>,
     k: &'static Api,
+    /// the silo's products, when built and supported on this GPU
+    silo: Option<&'static Silo>,
 }
 
 impl K {
     pub fn new(gpu: &std::sync::Arc<Gpu>) -> Result<K> {
-        Ok(K { gpu: gpu.clone(), k: api()? })
+        let k = api()?;
+        // SAFETY: a capability check on the GPU's handle.
+        let silo = silo()?.filter(|s| unsafe { (s.linear_supported)(gpu.raw()) } == 1);
+        Ok(K { gpu: gpu.clone(), k, silo })
+    }
+
+    /// The silo's library, when its products are used here
+    pub fn silo(&self) -> Option<&'static std::path::Path> {
+        self.silo.map(|s| s.path.as_path())
+    }
+
+    /// A Q8_0 matrix [n, k] into the silo's int8 values [n, k] and half scales [k / 32, n]
+    pub fn q8_split(&self, blocks: P, n: usize, k: usize, w: M, s: M) -> Result<()> {
+        let silo = self.silo.ok_or_else(|| Error("the silo is not loaded".into()))?;
+        // SAFETY: blocks holds n x k / 32 Q8_0 blocks, w n x k bytes, s n x k / 32 halves.
+        check(unsafe { (silo.q8_split)(self.g(), blocks, n as i64, k as i64, w.cast(), s) }, "q8_0 split")
+    }
+
+    /// One of the silo's products (silo.h)
+    pub fn mm(&self, a: &Mm) -> Result<()> {
+        let silo = self.silo.ok_or_else(|| Error("the silo is not loaded".into()))?;
+        // SAFETY: the buffers `a` names hold the rows, columns and strides it gives (the caller's to hold).
+        check(unsafe { (silo.linear)(self.g(), a) }, "linear (silo)")
     }
 
     fn g(&self) -> G {
@@ -196,10 +295,11 @@ impl K {
         check(unsafe { (self.k.up_shuffle)(self.g(), conv, x, h as i64, w as i64, c as i64, ci as i64, (4 * c / ci) as i64, out) }, "upsample")
     }
 
-    /// floats of scratch the group norm needs for g groups
+    /// floats of scratch the group norm needs for g groups (the engine's kernel or the silo's)
     pub fn gn_scratch(&self, g: usize) -> usize {
-        // SAFETY: a size query.
-        unsafe { (self.k.gn_scratch)(g as i64) as usize }
+        // SAFETY: size queries.
+        let own = unsafe { (self.k.gn_scratch)(g as i64) as usize };
+        self.silo.map_or(own, |s| own.max(unsafe { (s.gn_scratch)(g as i64) } as usize))
     }
 
     /// GroupNorm (+ SiLU) of x [n, c] half
@@ -207,6 +307,10 @@ impl K {
     pub fn group_norm(&self, x: P, n: usize, c: usize, groups: usize, weight: *const f32, bias: *const f32, eps: f32, silu: bool, scratch: *mut f32,
                       out: M) -> Result<()> {
         // SAFETY: x and out [n, c], weight / bias [c], scratch gn_scratch(groups) floats.
+        if let Some(s) = self.silo.filter(|s| unsafe { (s.gn_supported)(c as i64, groups as i64) } == 1) {
+            return check(unsafe { (s.group_norm)(self.g(), x, n as i64, c as i64, groups as i64, weight, bias, eps, silu as c_int, scratch, out) },
+                         "group norm (silo)");
+        }
         check(unsafe { (self.k.group_norm)(self.g(), x, n as i64, c as i64, groups as i64, weight, bias, eps, silu as c_int, scratch, out) }, "group norm")
     }
 
