@@ -1,0 +1,13 @@
+[package]
+name = "nextsycl-model3d-unirig"
+description = "UniRig: a skeleton (an autoregressive OPT decoder over a Michelangelo shape encoding) and skin weights (Point Transformer V3, bone attention) for a mesh, on Intel Arc (SYCL)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-model3d.workspace = true
+serde_json.workspace = true

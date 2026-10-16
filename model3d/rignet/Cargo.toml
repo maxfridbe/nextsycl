@@ -1,0 +1,14 @@
+[package]
+name = "nextsycl-model3d-rignet"
+description = "RigNet: a skeleton and skin weights for a mesh (GMEdgeNet joints, RootNet, BoneNet, SkinNet) on Intel Arc (SYCL). GPLv3, as RigNet's code."
+version.workspace = true
+edition.workspace = true
+# RigNet's code is GPLv3 (github.com/zhan-xu/RigNet); this port of it is too, kept in its own crate
+license = "GPL-3.0-only"
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-model3d.workspace = true
+serde_json.workspace = true

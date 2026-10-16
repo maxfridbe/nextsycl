@@ -25,7 +25,7 @@ nextsycl model3d engines | selftest [--gpu N]";
 
 /// The 3D engines this program has (model3d/<arch>)
 pub fn engines() -> Vec<nextsycl_model3d::Model3dKind> {
-    vec![nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_example::kind()]
+    vec![nextsycl_model3d_unirig::kind(), nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -244,7 +244,20 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
             nextsycl_model3d_animateanymesh::check::run(&e, &dir, &st, opt(args, "--mesh").map(Path::new), opt(args, "--prompt"), &mut log)
                 .map_err(|e| e.0)?
         }
-        a => return Err(format!("check knows {} (not {a})", nextsycl_model3d_animateanymesh::ARCH)),
+        nextsycl_model3d_unirig::ARCH => {
+            let e = nextsycl_model3d_unirig::UniRig::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+            let st = stages("encoder,logits,skin");
+            let st: Vec<&str> = st.iter().map(String::as_str).collect();
+            nextsycl_model3d_unirig::check::run(&e, &dir, &st, opt(args, "--mesh").map(Path::new), &mut log).map_err(|e| e.0)?
+        }
+        nextsycl_model3d_rignet::ARCH => {
+            let e = nextsycl_model3d_rignet::RigNet::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+            let st = stages("joints,root,bones,skin");
+            let st: Vec<&str> = st.iter().map(String::as_str).collect();
+            nextsycl_model3d_rignet::check::run(&e, &dir, &st, opt(args, "--mesh").map(Path::new), &mut log).map_err(|e| e.0)?
+        }
+        a => return Err(format!("check knows {}, {} and {} (not {a})", nextsycl_model3d_animateanymesh::ARCH, nextsycl_model3d_unirig::ARCH,
+                                nextsycl_model3d_rignet::ARCH)),
     };
     println!("worst relative error {worst:.2e}");
     Ok(())
