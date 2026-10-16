@@ -20,18 +20,41 @@ pub fn levels(res: usize, min: usize) -> Vec<usize> {
     r
 }
 
+/// `out` (x slowest: `n` slabs of equal length) filled slab by slab on every core: `f(x, slab)`
+fn par_slabs<T: Send>(out: &mut [T], n: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+    let per = out.len() / n.max(1);
+    if per == 0 {
+        return;
+    }
+    let threads = std::thread::available_parallelism().map_or(8, |t| t.get()).min(n);
+    let slabs_each = n.div_ceil(threads);
+    std::thread::scope(|sc| {
+        for (t, part) in out.chunks_mut(slabs_each * per).enumerate() {
+            let f = &f;
+            sc.spawn(move || {
+                for (k, slab) in part.chunks_mut(per).enumerate() {
+                    f(t * slabs_each + k, slab);
+                }
+            });
+        }
+    });
+}
+
 /// Points of an n^3 lattice (x slowest) set where `mask` is, grown by one in every direction (a 3 x 3 x 3 box)
 pub fn dilate(mask: &[bool], n: usize) -> Vec<bool> {
     // separable: along z, then y, then x
     let mut a = mask.to_vec();
+    let mut src = vec![false; a.len()];
     let at = |x: usize, y: usize, z: usize| (x * n + y) * n + z;
     for axis in 0..3 {
-        let src = a.clone();
-        for x in 0..n {
+        std::mem::swap(&mut a, &mut src);
+        let src = &src;
+        par_slabs(&mut a, n, |x, slab| {
             for y in 0..n {
                 for z in 0..n {
                     let i = at(x, y, z);
                     if src[i] {
+                        slab[y * n + z] = true;
                         continue;
                     }
                     let c = [x, y, z][axis];
@@ -44,10 +67,10 @@ pub fn dilate(mask: &[bool], n: usize) -> Vec<bool> {
                         p[axis] = k as usize;
                         src[at(p[0], p[1], p[2])]
                     };
-                    a[i] = nb(-1) || nb(1);
+                    slab[y * n + z] = nb(-1) || nb(1);
                 }
             }
-        }
+        });
     }
     a
 }
@@ -56,7 +79,7 @@ pub fn dilate(mask: &[bool], n: usize) -> Vec<bool> {
 pub fn near_surface(v: &[f32], n: usize, level: f32, near: f32) -> Vec<bool> {
     let at = |x: usize, y: usize, z: usize| (x * n + y) * n + z;
     let mut out = vec![false; n * n * n];
-    for x in 0..n {
+    par_slabs(&mut out, n, |x, slab| {
         for y in 0..n {
             for z in 0..n {
                 let i = at(x, y, z);
@@ -69,10 +92,10 @@ pub fn near_surface(v: &[f32], n: usize, level: f32, near: f32) -> Vec<bool> {
                     }
                     m |= (v[at(a as usize, b as usize, c as usize)] > level) != s;
                 }
-                out[i] = m;
+                slab[y * n + z] = m;
             }
         }
-    }
+    });
     out
 }
 
@@ -86,7 +109,8 @@ pub fn upsample(v: &[f32], nc: usize, nf: usize) -> Vec<f32> {
     }).collect();
     let at = |x: usize, y: usize, z: usize| v[(x * nc + y) * nc + z];
     let mut out = vec![0f32; nf * nf * nf];
-    for (x, &(x0, x1, fx)) in taps.iter().enumerate() {
+    par_slabs(&mut out, nf, |x, slab| {
+        let (x0, x1, fx) = taps[x];
         for (y, &(y0, y1, fy)) in taps.iter().enumerate() {
             for (z, &(z0, z1, fz)) in taps.iter().enumerate() {
                 let l = |a: f32, b: f32, f: f32| a + (b - a) * f;
@@ -94,10 +118,10 @@ pub fn upsample(v: &[f32], nc: usize, nf: usize) -> Vec<f32> {
                 let c01 = l(at(x0, y1, z0), at(x0, y1, z1), fz);
                 let c10 = l(at(x1, y0, z0), at(x1, y0, z1), fz);
                 let c11 = l(at(x1, y1, z0), at(x1, y1, z1), fz);
-                out[(x * nf + y) * nf + z] = l(l(c00, c01, fy), l(c10, c11, fy), fx);
+                slab[y * nf + z] = l(l(c00, c01, fy), l(c10, c11, fy), fx);
             }
         }
-    }
+    });
     out
 }
 
@@ -107,21 +131,36 @@ pub fn refine(coarse: &[f32], nc: usize, nf: usize, level: f32, last: bool) -> V
     if !last {
         m = dilate(&m, nc);
     }
-    let mut f = vec![false; nf * nf * nf];
     let map = |i: usize| ((i as f64 * (nf - 1) as f64 / (nc - 1) as f64).round() as usize).min(nf - 1);
+    // the fine slab each coarse x lands on (the map is one to one: nf > nc)
+    let mut from = vec![usize::MAX; nf];
     for x in 0..nc {
+        from[map(x)] = x;
+    }
+    let mut f = vec![false; nf * nf * nf];
+    par_slabs(&mut f, nf, |fx, slab| {
+        let x = from[fx];
+        if x == usize::MAX {
+            return;
+        }
         for y in 0..nc {
             for z in 0..nc {
                 if m[(x * nc + y) * nc + z] {
-                    f[(map(x) * nf + map(y)) * nf + map(z)] = true;
+                    slab[map(y) * nf + map(z)] = true;
                 }
             }
         }
-    }
+    });
     for _ in 0..if last { 2 } else { 1 } {
         f = dilate(&f, nf);
     }
-    f.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i as i32).collect()
+    // the set points' indices, slab by slab
+    let mut lists: Vec<Vec<i32>> = vec![Vec::new(); nf];
+    par_slabs(&mut lists, nf, |x, l| {
+        let base = x * nf * nf;
+        l[0] = f[base..base + nf * nf].iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| (base + i) as i32).collect();
+    });
+    lists.concat()
 }
 
 #[cfg(test)]
@@ -183,5 +222,129 @@ mod tests {
         m[(2 * n + 2) * n + 2] = true;
         let d = dilate(&m, n);
         assert_eq!(d.iter().filter(|b| **b).count(), 27);
+    }
+
+    // the one-thread forms the slab-parallel ones replace, for the test below
+    fn serial_dilate(mask: &[bool], n: usize) -> Vec<bool> {
+        // separable: along z, then y, then x
+        let mut a = mask.to_vec();
+        let at = |x: usize, y: usize, z: usize| (x * n + y) * n + z;
+        for axis in 0..3 {
+            let src = a.clone();
+            for x in 0..n {
+                for y in 0..n {
+                    for z in 0..n {
+                        let i = at(x, y, z);
+                        if src[i] {
+                            continue;
+                        }
+                        let c = [x, y, z][axis];
+                        let nb = |d: i64| -> bool {
+                            let k = c as i64 + d;
+                            if k < 0 || k >= n as i64 {
+                                return false;
+                            }
+                            let mut p = [x, y, z];
+                            p[axis] = k as usize;
+                            src[at(p[0], p[1], p[2])]
+                        };
+                        a[i] = nb(-1) || nb(1);
+                    }
+                }
+            }
+        }
+        a
+    }
+    fn serial_near_surface(v: &[f32], n: usize, level: f32, near: f32) -> Vec<bool> {
+        let at = |x: usize, y: usize, z: usize| (x * n + y) * n + z;
+        let mut out = vec![false; n * n * n];
+        for x in 0..n {
+            for y in 0..n {
+                for z in 0..n {
+                    let i = at(x, y, z);
+                    let s = v[i] > level;
+                    let mut m = (v[i] - level).abs() < near;
+                    for (dx, dy, dz) in [(-1i64, 0i64, 0i64), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)] {
+                        let (a, b, c) = (x as i64 + dx, y as i64 + dy, z as i64 + dz);
+                        if a < 0 || b < 0 || c < 0 || a >= n as i64 || b >= n as i64 || c >= n as i64 {
+                            continue;
+                        }
+                        m |= (v[at(a as usize, b as usize, c as usize)] > level) != s;
+                    }
+                    out[i] = m;
+                }
+            }
+        }
+        out
+    }
+    fn serial_upsample(v: &[f32], nc: usize, nf: usize) -> Vec<f32> {
+        let s = (nc - 1) as f32 / (nf - 1).max(1) as f32;
+        let taps: Vec<(usize, usize, f32)> = (0..nf).map(|j| {
+            let c = j as f32 * s;
+            let i = (c.floor() as usize).min(nc - 1);
+            (i, (i + 1).min(nc - 1), c - i as f32)
+        }).collect();
+        let at = |x: usize, y: usize, z: usize| v[(x * nc + y) * nc + z];
+        let mut out = vec![0f32; nf * nf * nf];
+        for (x, &(x0, x1, fx)) in taps.iter().enumerate() {
+            for (y, &(y0, y1, fy)) in taps.iter().enumerate() {
+                for (z, &(z0, z1, fz)) in taps.iter().enumerate() {
+                    let l = |a: f32, b: f32, f: f32| a + (b - a) * f;
+                    let c00 = l(at(x0, y0, z0), at(x0, y0, z1), fz);
+                    let c01 = l(at(x0, y1, z0), at(x0, y1, z1), fz);
+                    let c10 = l(at(x1, y0, z0), at(x1, y0, z1), fz);
+                    let c11 = l(at(x1, y1, z0), at(x1, y1, z1), fz);
+                    out[(x * nf + y) * nf + z] = l(l(c00, c01, fy), l(c10, c11, fy), fx);
+                }
+            }
+        }
+        out
+    }
+    fn serial_refine(coarse: &[f32], nc: usize, nf: usize, level: f32, last: bool) -> Vec<i32> {
+        let mut m = serial_near_surface(coarse, nc, level, 0.95);
+        if !last {
+            m = serial_dilate(&m, nc);
+        }
+        let mut f = vec![false; nf * nf * nf];
+        let map = |i: usize| ((i as f64 * (nf - 1) as f64 / (nc - 1) as f64).round() as usize).min(nf - 1);
+        for x in 0..nc {
+            for y in 0..nc {
+                for z in 0..nc {
+                    if m[(x * nc + y) * nc + z] {
+                        f[(map(x) * nf + map(y)) * nf + map(z)] = true;
+                    }
+                }
+            }
+        }
+        for _ in 0..if last { 2 } else { 1 } {
+            f = serial_dilate(&f, nf);
+        }
+        f.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i as i32).collect()
+    }
+
+    #[test]
+    fn the_parallel_passes_match_one_thread() {
+        // a bumpy field: a sphere plus ripples, coarse 23^3 -> fine 45^3
+        let field = |n: usize| -> Vec<f32> {
+            let mut v = Vec::new();
+            for x in 0..n {
+                for y in 0..n {
+                    for z in 0..n {
+                        let p = [x, y, z].map(|i| -1.0 + 2.0 * i as f32 / (n - 1) as f32);
+                        let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                        v.push(4.0 * (0.6 - r) + 0.3 * (9.0 * p[0]).sin() * (7.0 * p[1]).cos());
+                    }
+                }
+            }
+            v
+        };
+        let c = field(23);
+        for last in [false, true] {
+            assert_eq!(refine(&c, 23, 45, 0.0, last), serial_refine(&c, 23, 45, 0.0, last));
+        }
+        assert_eq!(upsample(&c, 23, 45), serial_upsample(&c, 23, 45));
+        let m = near_surface(&c, 23, 0.0, 0.95);
+        assert_eq!(m, serial_near_surface(&c, 23, 0.0, 0.95));
+        assert_eq!(dilate(&m, 23), serial_dilate(&m, 23));
     }
 }

@@ -23,6 +23,7 @@ pub mod grid;
 pub mod ops;
 pub mod paint;
 pub mod picture;
+pub mod prof;
 pub mod plain;
 pub mod sched;
 pub mod vae;
@@ -50,6 +51,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "chunk", env: "NS_M3D_HY_CHUNK", value: "N", help: "points the shape decoder queries at once", at: At::Both },
     EngineOption { name: "paint", env: "NS_M3D_HY_PAINT", value: "0|1", help: "2.1: load the paint model (textures; ~6.5 GiB more) when its files are there", at: At::Load },
     EngineOption { name: "paint-steps", env: "NS_M3D_HY_PAINT_STEPS", value: "N", help: "2.1: the texture's UniPC steps (15)", at: At::Both },
+    EngineOption { name: "attn", env: "NS_M3D_HY_ATTN", value: "flash|shared", help: "self-attention: the strided flash kernel (half), or the shared kernels' choice (oneDNN; int8 SageAttention from 8,192 rows)", at: At::Load },
 ];
 
 /// This engine's registry entry
@@ -149,7 +151,13 @@ fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn Fn
 impl Hunyuan3d {
     pub fn load(arch: Arch, files: &ModelFiles, model: &SafeTensors, gpu: &Arc<Gpu>, o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Hunyuan3d> {
         let t0 = Instant::now();
-        let ops = Ops::new(gpu)?;
+        let mut ops = Ops::new(gpu)?;
+        ops.flash = match o.setting("NS_M3D_HY_ATTN").as_deref() {
+            None | Some("flash") => true,
+            Some("shared") => false,
+            Some(x) => return Err(Error(format!("NS_M3D_HY_ATTN {x}: flash or shared"))),
+        };
+
         let dw = Weights::new(model, "conditioner.main_image_encoder.model.", gpu);
         let dino = dino::Dino::load(&dw, arch.enc_size)?;
         log(format!("{}: DINOv2 of {} layers x {} at {} px ({} tokens)", arch.name, dino.layers(), dino.width, dino.size, dino.tokens()));
@@ -239,6 +247,7 @@ impl Hunyuan3d {
                 self.ops.axpy(x.ptr(), v.ptr(), n, s1 - s0)?;
             }
             self.ops.gpu.sync()?;
+            prof::mark(&self.ops.nsd, "dit step")?;
             if i == 0 {
                 self.note_memory();
             }
@@ -263,9 +272,11 @@ impl Hunyuan3d {
     pub fn decode_fast(&self, latents: &[f32], res: usize, chunk: usize, progress: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<(Vec<f32>, usize)> {
         let n = latents.len() / self.vae.channels;
         let tokens = self.vae.tokens(&self.ops, latents)?;
+        prof::mark(&self.ops.nsd, "vae transformer")?;
         let data = self.vae.data(&self.ops, &tokens, n)?;
         drop(tokens);
         let sc = self.vae.query_scratch(&self.ops, chunk)?;
+        prof::mark(&self.ops.nsd, "vae data")?;
         let lv = grid::levels(res, 63);
         let mut g: Vec<f32> = Vec::new();
         let mut prev = 0;
@@ -277,15 +288,22 @@ impl Hunyuan3d {
                 g = self.vae.query_lattice(&self.ops, &data, &sc, r1, -BOUNDS, step, None, &mut |_, _| Ok(()))?;
                 self.note_memory();
                 queried += g.len();
+                prof::mark(&self.ops.nsd, "decode coarse level")?;
             } else {
                 let idx = grid::refine(&g, prev, r1, 0.0, k + 1 == lv.len());
+                prof::mark(&self.ops.nsd, "decode refine (CPU)")?;
                 let vals = self.vae.query_lattice(&self.ops, &data, &sc, r1, -BOUNDS, step, Some(&idx), &mut |_, _| Ok(()))?;
                 queried += idx.len();
+                prof::mark(&self.ops.nsd, "decode fine levels")?;
                 let mut fine = grid::upsample(&g, prev, r1);
                 for (i, v) in idx.iter().zip(vals) {
                     fine[*i as usize] = v;
                 }
                 g = fine;
+                prof::mark(&self.ops.nsd, "decode upsample (CPU)")?;
+            }
+            if prof::on() {
+                eprintln!("decode: level {k} ({r1}^3): {queried} points queried so far");
             }
             prev = r1;
             progress(k + 1, lv.len())?;
@@ -298,7 +316,10 @@ impl Hunyuan3d {
         let r1 = res + 1;
         let step = 2.0 * BOUNDS / res as f32;
         let m = nextsycl_mesh::tools::mc::marching_cubes(logits, [r1, r1, r1], 0.0, [-BOUNDS; 3], step);
-        nextsycl_mesh::tools::mc::drop_floaters(&m, FLOATERS)
+        let _ = prof::mark_cpu("marching cubes (CPU)");
+        let m = nextsycl_mesh::tools::mc::drop_floaters(&m, FLOATERS);
+        let _ = prof::mark_cpu("floaters (CPU)");
+        m
     }
 }
 
@@ -346,6 +367,15 @@ impl Model3dEngine for Hunyuan3d {
         let _one = self.busy.lock().map_err(|_| Error("a previous request failed midway".into()))?;
         self.low.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         let t0 = Instant::now();
+        prof::reset_clock(&self.ops.nsd)?;
+        let r = self.generate_timed(req, progress, t0);
+        prof::report(&mut |s| eprintln!("{s}"));
+        r
+    }
+}
+
+impl Hunyuan3d {
+    fn generate_timed(&self, req: &MeshRequest, progress: &mut dyn FnMut(Step) -> Result<()>, t0: Instant) -> Result<Mesh> {
         let mut report = |phase: &'static str, at: u32, of: u32| progress(Step { phase, at, of, seconds: t0.elapsed().as_secs_f64() });
         let view = req.views.first().ok_or_else(|| Error("no picture".into()))?;
         if req.texture && self.paint.is_none() {
@@ -371,16 +401,20 @@ impl Model3dEngine for Hunyuan3d {
                 let pic = nextsycl_diffusion::Picture { width: view.image.width, height: view.image.height, channels: 4, data: view.image.rgba.clone() };
                 let c = r.cut_out(&pic).map_err(|e| Error(format!("the background remover: {}", e.0)))?;
                 cut_out = nextsycl_model3d::Texture { width: c.width, height: c.height, rgba: c.data };
+                prof::mark(&self.ops.nsd, "background remover")?;
                 &cut_out
             }
             _ => &view.image,
         };
         let (pixels, _note) = picture::prepare(image, cut, self.arch.proc_size, self.arch.enc_size, BORDER)?;
+        prof::mark(&self.ops.nsd, "picture (CPU)")?;
         let cond = self.condition(&pixels)?;
         self.ops.gpu.sync()?;
+        prof::mark(&self.ops.nsd, "dino")?;
         report("image", 1, 1)?;
         let sigmas = if self.arch.name == ARCH_MINI { sched::consistency(steps, 100) } else { sched::flow_match(steps) };
         let mut st = self.run_state(&cond, tokens)?;
+        prof::mark(&self.ops.nsd, "dit context")?;
         let latents = self.sample(&mut st, &noise(req.seed, tokens * self.vae.channels), &sigmas, cfg, &mut |a, b| report("shape", a, b))?;
         drop(st);
         drop(cond);
@@ -398,6 +432,7 @@ impl Model3dEngine for Hunyuan3d {
         }
         report("mesh", 1, 2)?;
         let out = nextsycl_model3d::finish(m, Some(req.faces.unwrap_or(40_000)));
+        prof::mark_cpu("finish (CPU: decimation)")?;
         report("mesh", 2, 2)?;
         match (&self.paint, req.texture) {
             (Some(p), true) => {
@@ -405,7 +440,9 @@ impl Model3dEngine for Hunyuan3d {
                 let size = req.texture_size.unwrap_or(2048).clamp(256, 8192);
                 let painted = p.paint(&self.ops, &out, &view.image, req.seed, steps, size, None, &mut |ph, a, b| report(ph, a, b))?;
                 self.note_memory();
-                Ok(nextsycl_model3d::finish(painted, None))
+                let m = nextsycl_model3d::finish(painted, None);
+                prof::mark_cpu("paint finish (CPU)")?;
+                Ok(m)
             }
             _ => Ok(out),
         }

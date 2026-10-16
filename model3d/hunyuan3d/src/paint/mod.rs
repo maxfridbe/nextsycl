@@ -140,6 +140,7 @@ impl Paint {
             nlat.extend(self.vae.encode(ops, mem, &to01(&normal[i]), SIZE, SIZE)?);
             plat.extend(self.vae.encode(ops, mem, &to01(&position[i]), SIZE, SIZE)?);
         }
+        crate::prof::mark(&ops.nsd, "paint vae encode")?;
         Ok((ref_lat, nlat, plat))
     }
 
@@ -147,8 +148,10 @@ impl Paint {
     pub fn conditions(&self, ops: &Ops, mem: &Mem, normal: &[Vec<f32>], position: &[Vec<f32>], picture: &[f32]) -> Result<(Cond, Vec<f32>, Vec<f32>)> {
         let (ref_lat, nlat, plat) = self.encode_all(ops, mem, normal, position, picture)?;
         let states = self.dino_states(ops, picture)?;
+        crate::prof::mark(&ops.nsd, "paint dino")?;
         let pos01: Vec<Vec<f32>> = position.iter().map(|p| p.iter().map(|x| x / 255.0).collect()).collect();
         let cond = self.prepare(ops, mem, &ref_lat, &self.project(ops, &states)?, &pos01)?;
+        crate::prof::mark(&ops.nsd, "paint conditions")?;
         Ok((cond, nlat, plat))
     }
 
@@ -203,8 +206,10 @@ impl Paint {
         }
         let x = Map { buf: nn::upload_half(&mem.keep, &input)?, n, h: LAT, w: LAT, c: 12 };
         let out = DevBuf::new(&ops.gpu, n * px * 4 * 4)?;
+        crate::prof::mark(&ops.nsd, "paint unet input")?;
         self.unet.forward(ops, mem, &x, t, cond, Some(&out))?;
         mem.keep.reset();
+        crate::prof::mark(&ops.nsd, "paint unet")?;
         let raw = read_f32(&out, n * px * 4)?;
         let per = px * 4;
         let mut v = vec![0f32; MATS * VIEWS * per];
@@ -219,6 +224,7 @@ impl Paint {
                 }
             }
         }
+        crate::prof::mark_cpu("paint guidance")?;
         Ok((v, raw))
     }
 
@@ -232,6 +238,7 @@ impl Paint {
         let scene = render::Scene::new(mesh);
         let (normal, position) = maps(&scene);
         let pic = reference_picture(picture);
+        crate::prof::mark_cpu("paint views (CPU)")?;
         progress("views", 1, 1)?;
         let (mut cond, nlat, plat) = self.conditions(ops, &mem, &normal, &position, &pic)?;
         let mut sched = unipc::UniPc::new(steps);
@@ -239,6 +246,7 @@ impl Paint {
         for i in 0..steps {
             let (v, _) = self.guided(ops, &mem, &mut cond, &lat, &nlat, &plat, sched.timesteps[i] as f32)?;
             lat = sched.step(&v, &lat);
+            crate::prof::mark_cpu("paint unipc (CPU)")?;
             progress("texture", i as u32 + 1, steps as u32)?;
         }
         let per = LAT * LAT * 4;
@@ -252,13 +260,16 @@ impl Paint {
             ops.gpu.sync()?;
         }
         drop(cond);
+        crate::prof::mark(&ops.nsd, "paint vae decode")?;
         // bake: the views at 2,048 (Pillow's bicubic in place of RealESRGAN), the albedo and the metallic-roughness
         let big: Vec<Vec<f32>> = std::thread::scope(|sc| {
             let hs: Vec<_> = views.iter().map(|v| sc.spawn(move || pil::resize(v, SIZE, SIZE, 3, RENDER, RENDER, pil::Filter::Bicubic))).collect();
             hs.into_iter().map(|h| h.join().expect("a resize thread")).collect()
         });
+        crate::prof::mark_cpu("paint resize (CPU)")?;
         let mut m = nextsycl_mesh::tools::unwrap(mesh, tsize, 4);
         m.compute_normals();
+        crate::prof::mark_cpu("paint unwrap (CPU)")?;
         let mut textures = Vec::new();
         // albedo and metallic-roughness side by side
         let baked: Vec<Texture> = std::thread::scope(|sc| {
@@ -272,6 +283,7 @@ impl Paint {
             hs.into_iter().map(|h| h.join().expect("a bake thread")).collect()
         });
         textures.extend(baked);
+        crate::prof::mark_cpu("paint bake + inpaint (CPU)")?;
         progress("bake", 2, 2)?;
         let mr = textures.pop().expect("two");
         let albedo = textures.pop().expect("two");
