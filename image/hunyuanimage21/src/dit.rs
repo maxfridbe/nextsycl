@@ -25,7 +25,7 @@ use nextsycl_gguf::Gguf;
 
 use crate::ffi::{Act, K, T};
 use crate::prof;
-use crate::w::{host, rope_perm, tensor, Keep, Lin, Perm};
+use crate::w::{host, rope_perm, tensor, Keep, Lin, Perm, Post};
 
 pub const DIM: usize = 3584;
 pub const HEADS: usize = 28;
@@ -55,8 +55,9 @@ struct Double {
 
 struct Single {
     modulation: Lin,
-    /// q | k | v | mlp
+    /// q | k | v | mlp (with the silo: q | k | v, the mlp's rows in linear1_mlp)
     linear1: Lin,
+    linear1_mlp: Option<Lin>,
     /// [attention | mlp] -> 3584
     linear2: Lin,
     q_norm: DevBuf,
@@ -99,6 +100,8 @@ pub struct Dit {
     scratch: DevBuf,
     /// zeros: the gate rows kernels' row index
     zeros: DevBuf,
+    /// the products on the silo (its matrices split: `Lin::split_q8`), with GELU and the gated residuals fused
+    silo: bool,
     pub meanflow: bool,
     pub guided: bool,
     pub bytes: usize,
@@ -211,6 +214,15 @@ impl Dit {
             DevBuf::from_f32(gpu, &v)
         };
         let qk = [Perm { from: 0, to: DIM }, Perm { from: DIM, to: 2 * DIM }];
+        // with the silo the products' matrices are split as loaded (the same bytes; the modulations stay Q8_0, for
+        // their float32 products)
+        let silo = k.silo().is_some();
+        let prod = |mut l: Lin| -> Result<Lin> {
+            if silo {
+                l.split_q8(nsd, k)?;
+            }
+            Ok(l)
+        };
         let mlp2 = |p: &str, a: &str, b: &str| -> Result<Mlp2> { Ok(Mlp2 { l1: one(&format!("{p}.{a}"), Keep::F32)?, l2: one(&format!("{p}.{b}"), Keep::F32)? }) };
         let doubles_n = (0..).take_while(|i| f.tensor(&format!("double_blocks.{i}.img_attn_qkv.weight")).is_some()).count();
         let singles_n = (0..).take_while(|i| f.tensor(&format!("single_blocks.{i}.linear1.weight")).is_some()).count();
@@ -224,12 +236,12 @@ impl Dit {
         let stream = |p: &str| -> Result<Stream> {
             Ok(Stream {
                 modulation: one(&format!("{p}_mod.linear"), Keep::Stored)?,
-                qkv: lin(&[&format!("{p}_attn_qkv.weight")], &[&format!("{p}_attn_qkv.bias")], &qk, Keep::Stored)?,
+                qkv: prod(lin(&[&format!("{p}_attn_qkv.weight")], &[&format!("{p}_attn_qkv.bias")], &qk, Keep::Stored)?)?,
                 q_norm: vec_dev(&format!("{p}_attn_q_norm.weight"), true)?,
                 k_norm: vec_dev(&format!("{p}_attn_k_norm.weight"), true)?,
-                proj: one(&format!("{p}_attn_proj"), Keep::Stored)?,
-                fc1: one(&format!("{p}_mlp.fc1"), Keep::Stored)?,
-                fc2: one(&format!("{p}_mlp.fc2"), Keep::Stored)?,
+                proj: prod(one(&format!("{p}_attn_proj"), Keep::Stored)?)?,
+                fc1: prod(one(&format!("{p}_mlp.fc1"), Keep::Stored)?)?,
+                fc2: prod(one(&format!("{p}_mlp.fc2"), Keep::Stored)?)?,
             })
         };
         let mut doubles = Vec::with_capacity(doubles_n);
@@ -239,10 +251,14 @@ impl Dit {
         let mut singles = Vec::with_capacity(singles_n);
         for i in 0..singles_n {
             let p = format!("single_blocks.{i}");
+            let l1 = lin(&[&format!("{p}.linear1.weight")], &[&format!("{p}.linear1.bias")], &qk, Keep::Stored)?;
+            // the silo's linear1 is two products: q k v, and the mlp's rows with GELU on their outputs
+            let (linear1, linear1_mlp) = if silo { (prod(l1.rows(nsd, 0, 3 * DIM)?)?, Some(prod(l1.rows(nsd, 3 * DIM, FFN)?)?)) } else { (l1, None) };
             singles.push(Single {
                 modulation: one(&format!("{p}.modulation.linear"), Keep::Stored)?,
-                linear1: lin(&[&format!("{p}.linear1.weight")], &[&format!("{p}.linear1.bias")], &qk, Keep::Stored)?,
-                linear2: one(&format!("{p}.linear2"), Keep::Stored)?,
+                linear1,
+                linear1_mlp,
+                linear2: prod(one(&format!("{p}.linear2"), Keep::Stored)?)?,
                 q_norm: vec_dev(&format!("{p}.q_norm.weight"), true)?,
                 k_norm: vec_dev(&format!("{p}.k_norm.weight"), true)?,
             });
@@ -273,6 +289,8 @@ impl Dit {
         let guided = f.tensor("guidance_in.mlp.0.weight").is_some();
         let biggest = doubles.iter().flat_map(|d| [&d.img, &d.txt]).flat_map(|s| [&s.qkv, &s.proj, &s.fc1, &s.fc2])
             .chain(singles.iter().flat_map(|s| [&s.linear1, &s.linear2])).map(|l| l.n * l.k).max().unwrap_or(0);
+        // the expansion's scratch: none on the silo, which reads the matrices as they are
+        let biggest = if silo { 1 } else { biggest };
         let dit = Dit {
             k: k.clone(),
             img_in,
@@ -293,6 +311,7 @@ impl Dit {
                 z.fill(0)?;
                 z
             },
+            silo,
             meanflow,
             guided,
             bytes: 0,
@@ -300,12 +319,13 @@ impl Dit {
             singles,
         };
         let bytes = dit.doubles.iter().flat_map(|d| [&d.img, &d.txt]).flat_map(|s| [&s.modulation, &s.qkv, &s.proj, &s.fc1, &s.fc2]).map(|l| l.bytes()).sum::<usize>()
-            + dit.singles.iter().flat_map(|s| [&s.modulation, &s.linear1, &s.linear2]).map(|l| l.bytes()).sum::<usize>()
+            + dit.singles.iter().flat_map(|s| [Some(&s.modulation), Some(&s.linear1), s.linear1_mlp.as_ref(), Some(&s.linear2)]).flatten().map(|l| l.bytes())
+                .sum::<usize>()
             + dit.ref_blocks.iter().flat_map(|b| [&b.qkv, &b.proj, &b.fc1, &b.fc2, &b.ada]).map(|l| l.bytes()).sum::<usize>()
             + dit.scratch.len;
-        log(format!("hunyuanimage 2.1 dit: {doubles_n} double + {singles_n} single blocks{}{}, {:.1} GiB on {} in {:.1} s",
+        log(format!("hunyuanimage 2.1 dit: {doubles_n} double + {singles_n} single blocks{}{}, {:.1} GiB on {} in {:.1} s{}",
                     if meanflow { ", MeanFlow" } else { "" }, if guided { ", guidance embedded" } else { "" }, bytes as f64 / (1u64 << 30) as f64, gpu.name,
-                    t0.elapsed().as_secs_f64()));
+                    t0.elapsed().as_secs_f64(), k.silo().map_or_else(String::new, |p| format!(" (products on the silo, {})", p.display()))));
         Ok(Dit { bytes, ..dit })
     }
 
@@ -525,6 +545,13 @@ impl Dit {
             }
             prof::mark(nsd, "norm + modulate")?;
             for (si_, s) in [&d.img, &d.txt].iter().enumerate() {
+                if self.silo {
+                    for b in branches {
+                        let (r0, rows) = parts(b)[si_];
+                        s.qkv.mm(k, hptr(&b.h, r0 * DIM), DIM, rows, hptr(&b.big, r0 * 3 * DIM), 3 * DIM, Post::Half, None, true, (1, 0, 0))?;
+                    }
+                    continue;
+                }
                 let w = s.qkv.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
@@ -543,6 +570,14 @@ impl Dit {
                 prof::mark(nsd, "attention")?;
             }
             for (si_, (s, m)) in [(&d.img, mi), (&d.txt, mt)].iter().enumerate() {
+                if self.silo {
+                    for b in branches {
+                        let (r0, rows) = parts(b)[si_];
+                        s.proj.mm(k, hptr(&b.att, r0 * DIM), DIM, rows, fptr(&b.x, r0 * DIM).cast(), DIM, Post::Gate(md(m, 2)), None, true, (1, 0, 0))?;
+                        k.ln_mod(fptr(&b.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, 4), md(m, 3), hptr(&b.h, r0 * DIM), T::F16)?;
+                    }
+                    continue;
+                }
                 let w = s.proj.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
@@ -553,6 +588,13 @@ impl Dit {
             }
             prof::mark(nsd, "proj")?;
             for (si_, s) in [&d.img, &d.txt].iter().enumerate() {
+                if self.silo {
+                    for b in branches {
+                        let (r0, rows) = parts(b)[si_];
+                        s.fc1.mm(k, hptr(&b.h, r0 * DIM), DIM, rows, hptr(&b.mlp, r0 * FFN), FFN, Post::Gelu, None, true, (1, 0, 0))?;
+                    }
+                    continue;
+                }
                 let w = s.fc1.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
@@ -562,6 +604,13 @@ impl Dit {
             }
             prof::mark(nsd, "fc1")?;
             for (si_, (s, m)) in [(&d.img, mi), (&d.txt, mt)].iter().enumerate() {
+                if self.silo {
+                    for b in branches {
+                        let (r0, rows) = parts(b)[si_];
+                        s.fc2.mm(k, hptr(&b.mlp, r0 * FFN), FFN, rows, fptr(&b.x, r0 * DIM).cast(), DIM, Post::Gate(md(m, 5)), None, true, (1, 0, 0))?;
+                    }
+                    continue;
+                }
                 let w = s.fc2.ready(nsd, k, sc)?;
                 for b in branches {
                     let (r0, rows) = parts(b)[si_];
@@ -585,11 +634,23 @@ impl Dit {
                 k.ln_mod(b.x.fp(), b.n + b.t, DIM, EPS, std::ptr::null(), std::ptr::null(), md(1), md(0), b.h.ptr(), T::F16)?;
             }
             prof::mark(nsd, "norm + modulate")?;
-            let w = s.linear1.ready(nsd, k, sc)?;
-            for b in branches {
-                s.linear1.gemm(nsd, k, w, b.h.ptr(), b.n + b.t, b.big.ptr(), Dt::F16)?;
+            if let (true, Some(l1m)) = (self.silo, &s.linear1_mlp) {
+                // q k v, then the mlp's columns with their GELU: [att | gelu(mlp)] needs no pass of its own
+                for b in branches {
+                    s.linear1.mm(k, b.h.ptr(), DIM, b.n + b.t, b.big.ptr(), wide, Post::Half, None, true, (1, 0, 0))?;
+                }
+                prof::mark(nsd, "linear1")?;
+                for b in branches {
+                    l1m.mm(k, b.h.ptr(), DIM, b.n + b.t, hptr(&b.big, 3 * DIM), wide, Post::Gelu, None, true, (1, 0, 0))?;
+                }
+                prof::mark(nsd, "linear1 mlp + gelu")?;
+            } else {
+                let w = s.linear1.ready(nsd, k, sc)?;
+                for b in branches {
+                    s.linear1.gemm(nsd, k, w, b.h.ptr(), b.n + b.t, b.big.ptr(), Dt::F16)?;
+                }
+                prof::mark(nsd, "linear1")?;
             }
-            prof::mark(nsd, "linear1")?;
             for b in branches {
                 let rows = b.n + b.t;
                 nsd.rms_rope(b.big.ptr(), Dt::F16, rows, HEADS, HEAD, wide, s.q_norm.ptr(), EPS, b.cs.ptr(), HEAD)?;
@@ -597,8 +658,21 @@ impl Dit {
                 prof::mark(nsd, "rms + rope")?;
                 nsd.attention_qk(b.big.ptr(), rows, wide, hptr(&b.big, DIM), hptr(&b.big, 2 * DIM), rows, wide, Dt::F16, HEADS, HEAD, b.att.ptr(), Dt::F16)?;
                 prof::mark(nsd, "attention")?;
-                k.cat_gelu(b.att.ptr(), rows, DIM, hptr(&b.big, 3 * DIM), wide, FFN, b.mlp.ptr())?;
-                prof::mark(nsd, "concat + gelu")?;
+                if !self.silo {
+                    k.cat_gelu(b.att.ptr(), rows, DIM, hptr(&b.big, 3 * DIM), wide, FFN, b.mlp.ptr())?;
+                    prof::mark(nsd, "concat + gelu")?;
+                }
+            }
+            if self.silo {
+                // linear2 over [att | gelu(mlp)] as two products into the residual: its first DIM columns on the
+                // attention's rows, the rest on linear1's GELU columns where they are
+                for b in branches {
+                    let rows = b.n + b.t;
+                    s.linear2.mm(k, b.att.ptr(), DIM, rows, b.x.ptr(), DIM, Post::Gate(md(2)), Some((0, DIM)), true, (1, 0, 0))?;
+                    s.linear2.mm(k, hptr(&b.big, 3 * DIM), wide, rows, b.x.ptr(), DIM, Post::Gate(md(2)), Some((DIM, FFN)), false, (1, 0, 0))?;
+                }
+                prof::mark(nsd, "linear2")?;
+                continue;
             }
             let w = s.linear2.ready(nsd, k, sc)?;
             for b in branches {

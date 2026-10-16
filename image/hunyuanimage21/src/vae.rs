@@ -22,6 +22,7 @@ use nextsycl_diffusion::kernels::{none, Dt, Nsd};
 use nextsycl_gguf::{GType, Gguf};
 
 use crate::ffi::K;
+use crate::prof;
 use crate::w::{floats, ge, host, tensor};
 
 pub const SCALING: f32 = 0.75289;
@@ -148,21 +149,22 @@ impl Vae {
     fn conv(&self, nsd: &Nsd, c: &Conv, x: &DevBuf, h: usize, w: usize) -> Result<DevBuf> {
         let out = DevBuf::new(&nsd.gpu, h * w * c.co * 2)?;
         nsd.conv2d(x.ptr(), Dt::F16, 1, h, w, c.ci, c.w.ptr(), c.co, c.k, c.b.ptr(), out.ptr())?;
+        prof::mark(nsd, if c.k == 1 { "vae conv 1x1" } else { "vae conv 3x3" })?;
         Ok(out)
     }
 
-    fn gn(&self, n: &Norm, x: &DevBuf, px: usize, c: usize, silu: bool, gpu: &std::sync::Arc<nextsycl_core::Gpu>) -> Result<DevBuf> {
-        let out = DevBuf::new(gpu, px * c * 2)?;
+    fn gn(&self, nsd: &Nsd, n: &Norm, x: &DevBuf, px: usize, c: usize, silu: bool) -> Result<DevBuf> {
+        let out = DevBuf::new(&nsd.gpu, px * c * 2)?;
         self.k.group_norm(x.ptr(), px, c, GROUPS, n.w.fp(), n.b.fp(), EPS, silu, self.scratch.fp(), out.ptr())?;
+        prof::mark(nsd, "vae group norm")?;
         Ok(out)
     }
 
     fn resnet(&self, nsd: &Nsd, r: &Resnet, x: DevBuf, h: usize, w: usize) -> Result<DevBuf> {
-        let gpu = &nsd.gpu;
         let px = h * w;
-        let a = self.gn(&r.norm1, &x, px, r.conv1.ci, true, gpu)?;
+        let a = self.gn(nsd, &r.norm1, &x, px, r.conv1.ci, true)?;
         let a = self.conv(nsd, &r.conv1, &a, h, w)?;
-        let b = self.gn(&r.norm2, &a, px, r.conv2.ci, true, gpu)?;
+        let b = self.gn(nsd, &r.norm2, &a, px, r.conv2.ci, true)?;
         drop(a);
         let b = self.conv(nsd, &r.conv2, &b, h, w)?;
         let x = match &r.shortcut {
@@ -170,6 +172,7 @@ impl Vae {
             None => x,
         };
         nsd.gate_add(x.ptr(), Dt::F16, px, r.conv2.co, b.ptr(), Dt::F16, none(), none())?;
+        prof::mark(nsd, "vae add")?;
         Ok(x)
     }
 
@@ -178,7 +181,7 @@ impl Vae {
         let gpu = &nsd.gpu;
         let a = &self.att;
         let (s, c) = (h * w, a.q.co);
-        let n = self.gn(&a.norm, &x, s, c, false, gpu)?;
+        let n = self.gn(nsd, &a.norm, &x, s, c, false)?;
         let lin = |cv: &Conv, x: &DevBuf| -> Result<DevBuf> {
             let o = DevBuf::new(gpu, s * cv.co * 2)?;
             nsd.linear(x.ptr(), Dt::F16, s, cv.ci, cv.w.ptr(), cv.co, cv.b.ptr(), o.ptr(), Dt::F16)?;
@@ -196,6 +199,7 @@ impl Vae {
         nsd.linear(p.ptr(), Dt::F16, s, s, vt.ptr(), c, none(), o.ptr(), Dt::F16)?;
         let pr = lin(&a.proj, &o)?;
         nsd.gate_add(x.ptr(), Dt::F16, s, c, pr.ptr(), Dt::F16, none(), none())?;
+        prof::mark(nsd, "vae attention")?;
         Ok(x)
     }
 
@@ -224,6 +228,7 @@ impl Vae {
         if lat.len() != h * w * Z {
             return Err(Error(format!("{} latents for {h} x {w} x {Z}", lat.len())));
         }
+        prof::reset_clock(nsd)?;
         let l = DevBuf::from_f32(gpu, lat)?;
         let z = DevBuf::new(gpu, h * w * Z * 2)?;
         self.k.to_half(l.fp(), z.ptr(), h * w * Z, 1.0 / SCALING)?;
@@ -245,6 +250,7 @@ impl Vae {
                 let co = up.co / 4;
                 let o = DevBuf::new(gpu, 4 * hh * ww * co * 2)?;
                 self.k.up_shuffle(cv.ptr(), x.ptr(), hh, ww, co, c, o.ptr())?;
+                prof::mark(nsd, "vae upsample")?;
                 drop(cv);
                 x = o;
                 hh *= 2;
@@ -252,11 +258,11 @@ impl Vae {
                 c = co;
             }
         }
-        let n = self.gn(&self.norm_out, &x, hh * ww, c, true, gpu)?;
+        let n = self.gn(nsd, &self.norm_out, &x, hh * ww, c, true)?;
         drop(x);
         let out = self.conv(nsd, &self.conv_out, &n, hh, ww)?;
         nsd.wait()?;
-        crate::prof::used(nsd, "at the VAE's last convolution");
+        prof::used(nsd, "at the VAE's last convolution");
         Ok((out, hh, ww))
     }
 }
