@@ -1,0 +1,36 @@
+# Breeze TTS 2 Q8_0 (speech in English and Chinese, 24 kHz: voices designed, cloned or directed; vocal events)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# License: the weights and everything they make are BreezeBlue's Research and Non-Commercial License 1.1 (no commercial
+# use); the upstream inference code is Apache-2.0. See the guide.
+id: breeze-tts-2
+kind: audio
+arch: breeze-tts-2
+title: 'Breeze TTS 2 Q8_0 (speech in English and Chinese, 24 kHz: voices designed, cloned or directed; vocal events; non-commercial)'
+about: 'Breeze TTS 2 (BreezeBlue, a CSM fork, ~3B): a T5Gemma2 text encoder (26 layers), a Qwen3 backbone (28 layers) and a 12-layer depth decoder over the Qwen3-TTS 12 Hz codec''s 16 codebooks - CrispASR''s Q8_0 GGUF, half on the GPU. Voice design from a description, voice cloning from a recording and its exact transcript, voice direction (a cloned voice steered by an instruction), vocal events inline ("(laugh)", "[笑]"). Weights and outputs: BreezeBlue Research and Non-Commercial License 1.1 (research and non-commercial use only)'
+gpus: '0'
+vram_gib: 7.0                   # its memory on the card when it runs (measured on a B70)
+speech:
+- design
+- clone
+- direction
+- events
+defaults:
+  seconds: 60.0
+  cfg: 4.0                      # used with an instruction (design, direction); a clone or plain read is unguided
+env: {}
+files:
+  model:
+    key: bz2-q8
+    url: https://huggingface.co/cstr/breeze-tts-2-GGUF/resolve/5314fe9ae3ec6eac1a9238c4f6888fdc9fda0e83/breeze-tts-2-q8_0.gguf
+    size: 3426639936
+    sha256: 6eeeab68cdc6d3150dfba2b4bae4bf2cf58d9bb1b6edb7d6e50e8cc12802852a
+    path: breezetts2/breeze-tts-2-q8_0.gguf
+  tokenizer:
+    key: bz2-tokenizer
+    url: https://huggingface.co/BreezeBlue/Breeze-TTS-2/resolve/3e28c5151381a722f1d8661b4118c298caa77aa4/tokenizer.json
+    size: 33386945
+    sha256: d3ec9ac3eb2392389b9f5112e85d8b43316494addb587ba7b7a9d61eac23af96
+    path: breezetts2/tokenizer.json
+  # Breeze's audio_tokenizer/model.safetensors is this same file byte for byte (sha256 836b7b35...): Qwen3-TTS's codec
+  codec: q3t-codec
+guide: guides/breeze-tts-2.md

@@ -1,0 +1,11 @@
+[package]
+name = "nextsycl-codec12hz"
+description = "The Qwen3-TTS 12 Hz speech codec (Qwen3-TTS-Tokenizer-12Hz): its decoder (16 codes a frame to 24 kHz samples) and its encoder (a recording to codes) - shared by the speech engines that speak in its codes (Qwen3-TTS, Breeze TTS 2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true

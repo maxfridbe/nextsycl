@@ -1,0 +1,15 @@
+[package]
+name = "nextsycl-audio-breezetts2"
+description = "Breeze TTS 2 on Intel Arc (SYCL): English and Chinese speech in a voice designed from a description, cloned from a recording and its transcript, or cloned and directed by an instruction, with vocal events in the text - a T5Gemma2 text encoder, a Qwen3 backbone, a depth decoder over the 12 Hz codec's 16 codebooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-codec12hz.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
+nextsycl-audio.workspace = true
+serde_json.workspace = true

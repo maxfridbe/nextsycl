@@ -6,7 +6,7 @@
 //!   text (+ instruction, voice, language) -> the talker's prompt (prompt.rs): projected text tokens + codec tokens
 //!   -> the talker (talker.rs, a 28-layer Qwen3 of 2,048) draws a frame's first code, 12.5 frames a second; its code
 //!      predictor (5 layers of 1,024) the other fifteen; the frame fed back with the next text token
-//!   -> the 12 Hz codec's decoder (codec.rs): 16 codes a frame -> 1,920 samples at 24 kHz
+//!   -> the 12 Hz codec's decoder (nextsycl-codec12hz): 16 codes a frame -> 1,920 samples at 24 kHz
 //! ```
 //!
 //! The weights are the checkpoint's own files (`nextsycl models pull qwen3-tts-custom` ...): the model's bf16
@@ -15,8 +15,6 @@
 //! (reference/qwen3tts/ref.py: qwen-tts' own code on the same files).
 
 pub mod check;
-pub mod codec;
-pub mod encoder;
 mod ffi;
 pub mod ops;
 pub mod prompt;
@@ -33,8 +31,9 @@ use nextsycl_core::{DevBuf, Gpu};
 use nextsycl_diffusion::kernels::Nsd;
 use nextsycl_tok::Tokenizer;
 
-use crate::codec::Codec;
-use crate::encoder::Encoder;
+pub use nextsycl_codec12hz as codec;
+use nextsycl_codec12hz::{Codec, Encoder};
+
 use crate::ops::{Ops, Shards};
 use crate::prompt::{Config, Spec, Voice};
 use crate::sample::{Draw, Rng};
@@ -128,9 +127,9 @@ impl Qwen3Tts {
         let weights = Shards::open(&[model])?;
         let talker = Talker::load(&ops, &weights, int8, log)?;
         let speaker = if weights.find("speaker_encoder.fc.weight").is_ok() { Some(Speaker::load(&weights)?) } else { None };
-        let codec_f = Shards::open(&[codec])?;
-        let codec = Codec::load(&ops, &codec_f)?;
-        let encoder = if speaker.is_some() { Some(Encoder::load(&ops, &codec_f)?) } else { None };
+        let codec_f = codec::Weights::open(&codec)?;
+        let codec = Codec::load(gpu, &codec_f)?;
+        let encoder = if speaker.is_some() { Some(Encoder::load(gpu, &codec_f)?) } else { None };
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("{ARCH} ({}) on {} in {load_s:.0} s", conf.kind, gpu.name));
@@ -162,7 +161,7 @@ impl Qwen3Tts {
                     // with its transcript: the recording's codes as the example the talker continues
                     Some(text) => {
                         let enc = self.encoder.as_ref().ok_or_else(|| Error("this checkpoint has no codec encoder".into()))?;
-                        let codes = enc.encode(&self.ops, &self.nsd, &wav)?;
+                        let codes = enc.encode(&self.nsd, &wav)?;
                         Voice::InContext { spk: x, text: text.to_string(), codes }
                     }
                     None => Voice::XVector(x),
@@ -266,6 +265,8 @@ impl AudioEngine for Qwen3Tts {
             clone: kind == "base" && self.speaker.is_some(),
             clone_needs_text: false,
             clone_takes_text: kind == "base" && self.encoder.is_some(),
+            direction: false,
+            events: Vec::new(),
             requires: Some(match kind {
                 "custom_voice" => "voice",
                 "voice_design" => "instructions",
@@ -296,11 +297,11 @@ impl AudioEngine for Qwen3Tts {
             // recording's share of the samples cut off
             Voice::InContext { codes: rc, .. } => {
                 let all: Vec<Vec<i32>> = rc.iter().chain(&codes).cloned().collect();
-                let wav = self.codec.decode(&self.ops, &self.nsd, &all)?;
+                let wav = self.codec.decode(&self.nsd, &all)?;
                 let cut = (rc.len() as f64 / all.len().max(1) as f64 * wav.len() as f64) as usize;
                 wav[cut.min(wav.len())..].to_vec()
             }
-            _ => self.codec.decode(&self.ops, &self.nsd, &codes)?,
+            _ => self.codec.decode(&self.nsd, &codes)?,
         };
         progress(Step { phase: "decode", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
         Ok(Audio { rate: codec::RATE, channels: 1, samples })

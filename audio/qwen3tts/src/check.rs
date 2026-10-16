@@ -122,7 +122,7 @@ pub fn run(e: &Qwen3Tts, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String
         }
         if let (Voice::InContext { codes, .. }, Some(enc), Ok(wav)) = (&spec.voice, &e.encoder, read_wav(&dir.join("ref.wav"))) {
             // and its codes (the codec's encoder), frame by frame and codebook by codebook
-            let got = enc.encode(&e.ops, &e.nsd, &wav)?;
+            let got = enc.encode(&e.nsd, &wav)?;
             let same: usize = got.iter().zip(codes).map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x == y).count()).sum();
             let firsts = got.iter().zip(codes).filter(|(a, b)| a[0] == b[0]).count();
             log(format!("{:<24} {} frames here, {} in the reference; {same} of {} codes agree, {firsts} first codes", "recording's codes",
@@ -163,7 +163,7 @@ pub fn run(e: &Qwen3Tts, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String
     if stages.contains(&"codec") {
         let codes = codes_ref.ok_or_else(|| Error(format!("{}: no codes.npy", dir.display())))?;
         let t = Instant::now();
-        let mut got = e.codec.decode(&e.ops, &e.nsd, &codes)?;
+        let mut got = e.codec.decode(&e.nsd, &codes)?;
         // an in-context clone's: the recording's share cut off, as the reference does
         if let Ok(Voice::InContext { codes: rc, .. }) = spec_of(dir).map(|s| s.voice) {
             if codes.starts_with(&rc) {

@@ -161,15 +161,16 @@ pub const METHODS: &[Method] = &[
                        ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
                        QUEUE, PRIORITY, HELD, PROJECT, BATCH],
              example: r#"{"model": "minimax-music3", "instructions": "warm acoustic folk, 90 BPM, a soft male voice", "input": "[verse]\nRiver runs slow tonight\n[chorus]\nCarry me home", "seconds": 60}"# },
-    Method { kind: "audio", name: "speak", summary: "Speech from text (a speech model: Qwen3-TTS, VoxCPM2); the answer links the WAV. Checked when submitted (voice, language, continue_from, ref_audio: a 400 even with wait: false). Two run at once (one per card: system.busy.parallel), so a book can keep two chunks in flight with wait: false - but a chunk with continue_from needs the chunk before it finished",
-             fields: &[MODEL_OPT, ("input", "string", "the text to say", true),
+    Method { kind: "audio", name: "speak", summary: "Speech from text (a speech model: Qwen3-TTS, VoxCPM2, Breeze TTS 2); the answer links the WAV. Checked when submitted (voice, language, continue_from, ref_audio: a 400 even with wait: false). Two run at once (one per card: system.busy.parallel), so a book can keep two chunks in flight with wait: false - but a chunk with continue_from needs the chunk before it finished",
+             fields: &[MODEL_OPT, ("input", "string", "the text to say (Breeze TTS 2: vocal events inline - English (laugh) (sigh) (cough) (clears throat), Chinese [笑] [叹气] [咳嗽] [清嗓子])", true),
                        ("voice", "string", "a built-in voice (qwen3-tts-custom: serena, vivian, uncle_fu, ryan, aiden, ono_anna, sohee, eric, dylan; audio.info lists them) or a saved one (audio.voices.list: spoken by a model that clones). Checked when submitted, the model loaded or not: an unknown name is a 400 at once (the message lists the voices)", false),
                        ("language", "string", "english, chinese, japanese ... or auto (default). Checked when submitted against the model's list (Qwen3-TTS: chinese, english, german, italian, portuguese, spanish, japanese, korean, french, russian); VoxCPM2 has no list and takes any", false),
-                       ("instructions", "string", "how to say it (CustomVoice), or the voice to make up (VoiceDesign)", false),
+                       ("instructions", "string", "how to say it (CustomVoice), or the voice to make up (VoiceDesign, Breeze TTS 2: write it in the language of the text); with a cloned voice (ref_audio or a saved voice) the direction of its tone, emotion, pace (Breeze TTS 2: voice direction - picked for you when model is not given)", false),
                        ("ref_audio", "string", "a recording of the voice to clone: WAV as base64 or a data: URL, or upload:<name> (audio.upload, any format it takes) - the Base model", false),
-                       ("ref_text", "string", "what the recording says: the closer, in-context clone", false),
+                       ("ref_text", "string", "what the recording says: the closer, in-context clone (Breeze TTS 2: required, the exact transcript)", false),
                        ("continue_from", r#"{"type": "string", "maxLength": 200}"#, "carry on from speech made here (a book in chunks): the file name (or url) of the chunk before; its last sentences (up to 15 s, cut at a pause) are the in-context reference, after the saved voice's sample when voice names one - pace and voice go on, anchored to the voice. Needs a model that clones (picked for you when model is not given); a built-in voice name is dropped", false),
                        ("seconds", "number", "the most to make", false), ("seed", "integer", "", false),
+                       ("cfg", "number", "guidance with instructions (Breeze TTS 2: 4 by default for design and direction; 1 turns it off)", false),
                        ("options", "object", "the engine's own: greedy, temperature, top-k, streaming", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
@@ -543,7 +544,11 @@ impl Home {
             return self.pick("audio", b, all);
         }
         let voice = s(b, "voice");
-        let need = if !s(b, "ref_audio").is_empty() || !s(b, "continue_from").is_empty() || (!voice.is_empty() && self.voices().get(&voice).is_some()) {
+        let cloned = !s(b, "ref_audio").is_empty() || !s(b, "continue_from").is_empty() || (!voice.is_empty() && self.voices().get(&voice).is_some());
+        // a clone with an instruction: a model that directs a cloned voice (Breeze TTS 2)
+        let need = if cloned && !s(b, "instructions").is_empty() {
+            "direction"
+        } else if cloned {
             "clone"
         } else if !voice.is_empty() {
             "voices"
@@ -560,6 +565,7 @@ impl Home {
         loaded.into_iter().find(|l| can.contains(l)).or_else(|| can.first().cloned()).ok_or_else(|| {
             (409, match need {
                 "clone" => "no enabled speech model clones a voice (system.enable qwen3-tts-base)".to_string(),
+                "direction" => "no enabled speech model directs a cloned voice by instructions (system.enable breeze-tts-2)".to_string(),
                 "design" => "no enabled speech model designs a voice (system.enable qwen3-tts-design)".to_string(),
                 "voices" => "no enabled speech model has built-in voices (system.enable qwen3-tts-custom)".to_string(),
                 _ => "no speech model is enabled (system.enable qwen3-tts-custom ...)".to_string(),

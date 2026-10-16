@@ -13,12 +13,13 @@
 //! The convolutions and the transformer on the GPU (float32, oneDNN), the downsample and the nearest-code search on
 //! the host.
 
-use nextsycl_audio::{Error, Result};
-use nextsycl_core::DevBuf;
+use std::sync::Arc;
+
+use nextsycl_core::{DevBuf, Error, Gpu, Result};
 use nextsycl_diffusion::kernels::{Dt, Nsd};
 
-use crate::codec::{conv, lin, stack, Conv, Lin};
-use crate::ops::{fp, Ops, Shards};
+use crate::decoder::{conv, lin, stack, Conv, Lin};
+use crate::ops::{fp, Ops, Weights};
 
 const HEADS: usize = 8;
 const HEAD: usize = 64;
@@ -53,6 +54,7 @@ struct Rvq {
 }
 
 pub struct Encoder {
+    ops: Ops,
     first: Conv,
     /// per stride: the residual unit and the strided conv
     stages: Vec<(Res, Conv, usize)>,
@@ -65,7 +67,7 @@ pub struct Encoder {
     acoustic: Rvq,
 }
 
-fn rvq(f: &Shards, p: &str, n: usize) -> Result<Rvq> {
+fn rvq(f: &Weights, p: &str, n: usize) -> Result<Rvq> {
     let s = f.shape(&format!("{p}input_proj.weight"))?;
     let mut books = Vec::new();
     for i in 0..n {
@@ -111,7 +113,8 @@ impl Rvq {
 
 impl Encoder {
     /// From the speech tokenizer's safetensors (`encoder.`)
-    pub fn load(ops: &Ops, f: &Shards) -> Result<Encoder> {
+    pub fn load(gpu: &Arc<Gpu>, f: &Weights) -> Result<Encoder> {
+        let ops = &Ops::new(gpu)?;
         let p = "encoder.encoder.layers.";
         let first = conv(ops, f, &format!("{p}0.conv"), false, true)?;
         let mut stages = Vec::new();
@@ -150,6 +153,7 @@ impl Encoder {
         }
         let q = "encoder.quantizer.";
         Ok(Encoder {
+            ops: ops.clone(),
             first,
             stages,
             last,
@@ -162,7 +166,8 @@ impl Encoder {
     }
 
     /// 24 kHz mono samples to their frames' codes [T][16] (T = ceil(samples / 1,920))
-    pub fn encode(&self, ops: &Ops, nsd: &Nsd, wav: &[f32]) -> Result<Vec<Vec<i32>>> {
+    pub fn encode(&self, nsd: &Nsd, wav: &[f32]) -> Result<Vec<Vec<i32>>> {
+        let ops = &self.ops;
         let g = &ops.gpu;
         let n = wav.len();
         if n < HOP {
@@ -171,7 +176,7 @@ impl Encoder {
         // the widest signal: the first conv's (64 channels at the input rate), or a residual unit's half of it
         let widest = self.first.co * (n + 8);
         let (a, b, c) = (DevBuf::f32(g, widest)?, DevBuf::f32(g, widest)?, DevBuf::f32(g, widest)?);
-        a.write(0, &crate::talker::bytes(wav))?;
+        a.write(0, &crate::bytes(wav))?;
         let f0 = &self.first;
         ops.conv_causal(a.fp(), 1, 1, n, &f0.w, f0.co, f0.k, f0.bias(), 1, b.fp())?;
         // x in b

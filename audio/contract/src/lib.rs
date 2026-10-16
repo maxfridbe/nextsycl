@@ -62,6 +62,10 @@ pub struct Speech {
     pub clone_needs_text: bool,
     /// whether a transcript of the recording makes a closer clone
     pub clone_takes_text: bool,
+    /// whether it styles a cloned voice by `instructions` (a recording and an instruction together: voice direction)
+    pub direction: bool,
+    /// the vocal events it reads inline in the text ("(laugh)", "[笑]" ...); empty: none
+    pub events: Vec<String>,
     /// what a request must carry: "voice" (a built-in one), "instructions" (the voice to make up), "reference" (a
     /// recording, or a saved voice); none: nothing besides the text
     pub requires: Option<&'static str>,

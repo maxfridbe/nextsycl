@@ -37,6 +37,10 @@ export interface Speech {
   clone_needs_text: boolean;
   /** a transcript of the recording makes a closer clone */
   clone_takes_text?: boolean;
+  /** steers a cloned voice by instructions (a recording and an instruction together: voice direction) */
+  direction?: boolean;
+  /** the vocal events it reads inline in the text ("(laugh)", "[笑]" ...) */
+  events?: string[];
   /** what a request must carry besides the text */
   requires?: "voice" | "instructions" | "reference" | null;
 }

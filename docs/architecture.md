@@ -26,6 +26,9 @@ crates/                    THE FOUNDATION - every kind uses it, it knows no kind
                                  orient (consistent outward winding)
   remover    nextsycl-remover    the background remover the 3D engines share: BiRefNet (Swin-L) on the shared vision
                                  kernels (kernels/diffusion/vision.cpp), and the object picture an image-to-3D model wants
+  codec12hz  nextsycl-codec12hz  the Qwen3-TTS 12 Hz speech codec the speech engines share (Qwen3-TTS, Breeze TTS 2):
+                                 its decoder (codes to 24 kHz) and encoder (a recording to codes), the resampler; on the
+                                 audio library's codec kernels (q3t.h, mm3.h's convolutions) and the diffusion kernels
 
 llm/                       LANGUAGE MODELS
   contract   nextsycl-llm        the contract: Engine, Session / Decoder / Checkpoint, Sampler, EngineKind; host sampling
@@ -54,10 +57,13 @@ audio/                     AUDIO
                                  (a waveform; WAV with an INFO chunk), AudioKind
   minimaxmusic3 nextsycl-audio-minimaxmusic3  MiniMax Music 3: the language model and depth decoder, the flow
                                  transformer and its windows, the decoder, stage checks
-  qwen3tts   nextsycl-audio-qwen3tts  Qwen3-TTS: the prompt per voice kind, the talker and code predictor, the 12 Hz
-                                 codec's decoder and encoder, the speaker encoder (host), stage checks
+  qwen3tts   nextsycl-audio-qwen3tts  Qwen3-TTS: the prompt per voice kind, the talker and code predictor, the speaker
+                                 encoder (host), stage checks; the 12 Hz codec from nextsycl-codec12hz
   voxcpm2    nextsycl-audio-voxcpm2  VoxCPM2: MiniCPM4 language models, the local encoder and flow-matching DiT,
                                  AudioVAE V2, a .pth reader, stage checks
+  breezetts2 nextsycl-audio-breezetts2  Breeze TTS 2: the T5Gemma2 text encoder, the Qwen3 backbone and depth decoder
+                                 from CrispASR's GGUF, the prompts of its four templates, guidance, stage checks; the 12 Hz
+                                 codec from nextsycl-codec12hz
   example    nextsycl-audio-example  a template
 
 model3d/                   3D
@@ -368,7 +374,18 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   `ns_audio_mm3_conv1d_lr`); its own (`kernels/audio/qwen3tts`) are the codec's: SnakeBeta, the depthwise causal
   convolution, attention over a causal window, float32 RoPE, layer-scaled residuals, ELU (the encoder's); the
   encoder's strided causal convolutions go through `ns_audio_mm3_conv1d_lr` too. The text embedding stays
-  on disk (a row read a token). Settings: `NS_Q3T_INT8=1` (`--opt-int8`).
+  on disk (a row read a token). Settings: `NS_Q3T_INT8=1` (`--opt-int8`). The codec (decoder, encoder, resampler) is
+  the foundation crate `nextsycl-codec12hz`, which Breeze TTS 2 shares; its kernels stay in `q3t.cpp` (shared kernels
+  now: rule 6).
+- **breezetts2** - Breeze TTS 2 from CrispASR's GGUF (q8_0 or q4_k: F16 / Q8_0 / Q4_0 / Q4_K expanded to half on the
+  host at load; the text embedding stays on disk), the checkpoint's tokenizer.json and Qwen's codec file (the same as
+  Qwen3-TTS's). The backbone (Qwen3) and depth decoder (Llama, llama3 RoPE) run on the MiniMax Music engine's kernels
+  (gemv, the half cache, attention: 2 and 4 query heads a key head); its own (`kernels/audio/breezetts2`) are the
+  text encoder's bidirectional attention over a symmetric window (heads of 256), its GELU-tanh gate and a per-head RMS
+  norm + RoPE from a frequency table. The text encoder's and the prefill's wide products are oneDNN's half GEMM.
+  Guidance (an instruction's design or direction) runs a second backbone over the prompt without the instruction; the
+  depth decoder runs both branches as one batch of two. Draws on the host. Per-request options: `NS_BZ2_GREEDY`,
+  `NS_BZ2_TEMPERATURE`, `NS_BZ2_TOP_K`.
 
 ## The 3D engines
 

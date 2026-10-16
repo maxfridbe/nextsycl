@@ -547,6 +547,7 @@ name = "nextsycl"
 version = "0.0.0"
 dependencies = [
  "nextsycl-audio",
+ "nextsycl-audio-breezetts2",
  "nextsycl-audio-example",
  "nextsycl-audio-minimaxmusic3",
  "nextsycl-audio-qwen3tts",
@@ -594,6 +595,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextsycl-audio-breezetts2"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-audio",
+ "nextsycl-codec12hz",
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-tok",
+ "serde_json",
+]
+
+[[package]]
 name = "nextsycl-audio-example"
 version = "0.0.0"
 dependencies = [
@@ -620,6 +634,7 @@ name = "nextsycl-audio-qwen3tts"
 version = "0.0.0"
 dependencies = [
  "nextsycl-audio",
+ "nextsycl-codec12hz",
  "nextsycl-core",
  "nextsycl-diffusion",
  "nextsycl-gguf",
@@ -638,6 +653,15 @@ dependencies = [
  "nextsycl-gguf",
  "nextsycl-tok",
  "serde_json",
+]
+
+[[package]]
+name = "nextsycl-codec12hz"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
 ]
 
 [[package]]

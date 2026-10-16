@@ -1,0 +1,28 @@
+# Breeze TTS 2 Q4_K (the same model from the smaller GGUF: a 2.2 GB download; expanded to half on the GPU as the Q8_0)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: breeze-tts-2-q4
+kind: audio
+arch: breeze-tts-2
+title: 'Breeze TTS 2 Q4_K (speech in English and Chinese, 24 kHz: a smaller download of breeze-tts-2; non-commercial)'
+about: 'Breeze TTS 2 from CrispASR''s Q4_K GGUF (Q4_K; the text encoder''s 1,152-wide matrices Q4_0): the same engine and modes as breeze-tts-2, a 2.2 GB file instead of 3.4 GB, a little further from the checkpoint; the same memory on the card (the matrices are expanded to half). Weights and outputs: BreezeBlue Research and Non-Commercial License 1.1 (research and non-commercial use only)'
+gpus: '0'
+vram_gib: 7.0                   # as breeze-tts-2 (the matrices expand to half either way)
+speech:
+- design
+- clone
+- direction
+- events
+defaults:
+  seconds: 60.0
+  cfg: 4.0
+env: {}
+files:
+  model:
+    key: bz2-q4
+    url: https://huggingface.co/cstr/breeze-tts-2-GGUF/resolve/5314fe9ae3ec6eac1a9238c4f6888fdc9fda0e83/breeze-tts-2-q4_k.gguf
+    size: 2206392384
+    sha256: 133eceae5030edab9a8569524181d92ba406fc14ea8c3861a61a3ee177c387d7
+    path: breezetts2/breeze-tts-2-q4_k.gguf
+  tokenizer: bz2-tokenizer
+  codec: q3t-codec
+guide: guides/breeze-tts-2.md

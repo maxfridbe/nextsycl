@@ -37,6 +37,17 @@ export function Speak() {
     <div class="create">
       <div class="lab">text <span class="hint">what to say; punctuation sets the pauses</span></div>
       {area("text", "", "Good morning. The bread is still warm, and the coffee is ready.")}
+      {sp.events?.length
+        ? <div class="row">
+            <span class="hint">vocal events, where they happen in the text:</span>
+            <span class="chips">
+              {sp.events.map((e) => (
+                <button type="button" class="chip" attrs={{ title: `add ${e} to the text` }}
+                        on={{ click: () => set("text", `${f.text}${f.text && !f.text.endsWith(" ") ? " " : ""}${e} `) }}>{e}</button>
+              ))}
+            </span>
+          </div>
+        : null}
       {sp.voices.length
         ? <div>
             <div class="lab">voice</div>
@@ -51,6 +62,7 @@ export function Speak() {
         ? <div>
             <div class="lab">{sp.requires === "instructions" ? "the voice" : sp.design ? "the voice, or the style" : "how to say it"}
               <span class="hint">{sp.requires === "instructions" ? "who speaks: age, gender, timbre, pace, emotion, accent"
+                : sp.design && sp.direction ? "optional: a voice to make up (who speaks: age, gender, timbre, pace; in the language of the text), or with a cloned voice its direction: tone, emotion, pace, delivery"
                 : sp.design ? "optional: a voice to make up (who speaks: age, gender, timbre, pace), or with a cloned voice its style"
                 : "optional: the mood, the pace, the delivery"}</span>
             </div>
@@ -127,6 +139,13 @@ export function Speak() {
         {open
           ? <div class="subbody">
               <div class="row">
+                {sp.design || sp.direction
+                  ? <label attrs={{ title: "guidance with an instruction (1: none)" }}>cfg
+                      <input attrs={{ type: "number", min: 1, max: 10, step: 0.5, placeholder: String(state.info?.defaults?.cfg ?? "") }}
+                             props={{ value: f.cfg === null ? "" : String(f.cfg) }}
+                             on={{ change: (e: Event) => { const t = (e.target as HTMLInputElement).value.trim(); state.form.cfg = t === "" ? null : Number(t); saveForm(); render(); } }} />
+                    </label>
+                  : null}
                 {(state.info?.options ?? []).map((o) => (
                   <label attrs={{ title: o.help }}>{o.name}
                     <input attrs={{ type: "text", placeholder: o.value || "on" }} props={{ value: f.options[o.name] ?? "" }}

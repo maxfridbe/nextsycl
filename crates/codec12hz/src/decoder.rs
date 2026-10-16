@@ -12,11 +12,12 @@
 //! Long clips go in 300-frame chunks, each with up to 25 frames of the one before as context (cut from its output),
 //! as the reference's chunked_decode does. Float32 throughout (the checkpoint's own); the convolutions on oneDNN.
 
-use nextsycl_audio::{Error, Result};
-use nextsycl_core::DevBuf;
+use std::sync::Arc;
+
+use nextsycl_core::{DevBuf, Error, Gpu, Result};
 use nextsycl_diffusion::kernels::{none, Dt, Nsd};
 
-use crate::ops::{fp, Ops, Shards};
+use crate::ops::{fp, Ops, Weights};
 
 pub const RATE: u32 = 24000;
 /// samples a frame
@@ -86,6 +87,7 @@ struct Layer {
 }
 
 pub struct Codec {
+    ops: Ops,
     /// host codebooks [16][2048 x 256] (already divided by their usage)
     books: Vec<Vec<f32>>,
     dim: usize,
@@ -104,7 +106,7 @@ pub struct Codec {
     pub groups: usize,
 }
 
-pub(crate) fn lin(ops: &Ops, f: &Shards, name: &str, bias: bool) -> Result<Lin> {
+pub(crate) fn lin(ops: &Ops, f: &Weights, name: &str, bias: bool) -> Result<Lin> {
     let s = f.shape(&format!("{name}.weight"))?;
     Ok(Lin {
         w: f.dev_f32(ops, &format!("{name}.weight"))?,
@@ -115,7 +117,7 @@ pub(crate) fn lin(ops: &Ops, f: &Shards, name: &str, bias: bool) -> Result<Lin> 
 }
 
 /// Linear layers stacked by rows (a fused q/k/v, gate/up)
-pub(crate) fn stack(ops: &Ops, f: &Shards, names: &[String]) -> Result<Lin> {
+pub(crate) fn stack(ops: &Ops, f: &Weights, names: &[String]) -> Result<Lin> {
     let mut v = Vec::new();
     let mut k = 0;
     for n in names {
@@ -125,7 +127,7 @@ pub(crate) fn stack(ops: &Ops, f: &Shards, names: &[String]) -> Result<Lin> {
     Ok(Lin { n: v.len() / k, k, w: DevBuf::from_f32(&ops.gpu, &v)?, b: None })
 }
 
-pub(crate) fn conv(ops: &Ops, f: &Shards, name: &str, transposed: bool, bias: bool) -> Result<Conv> {
+pub(crate) fn conv(ops: &Ops, f: &Weights, name: &str, transposed: bool, bias: bool) -> Result<Conv> {
     let s = f.shape(&format!("{name}.weight"))?;
     let (ci, co) = if transposed { (s[0], s[1]) } else { (s[1], s[0]) };
     Ok(Conv {
@@ -137,7 +139,7 @@ pub(crate) fn conv(ops: &Ops, f: &Shards, name: &str, transposed: bool, bias: bo
     })
 }
 
-fn snake(ops: &Ops, f: &Shards, name: &str) -> Result<Snake> {
+fn snake(ops: &Ops, f: &Weights, name: &str) -> Result<Snake> {
     Ok(Snake { a: f.dev_f32(ops, &format!("{name}.alpha"))?, b: f.dev_f32(ops, &format!("{name}.beta"))? })
 }
 
@@ -162,7 +164,8 @@ struct Work {
 
 impl Codec {
     /// From the speech tokenizer's safetensors (its decoder's tensors, `decoder.` prefixed)
-    pub fn load(ops: &Ops, f: &Shards) -> Result<Codec> {
+    pub fn load(gpu: &Arc<Gpu>, f: &Weights) -> Result<Codec> {
+        let ops = &Ops::new(gpu)?;
         let p = "decoder.";
         let mut books = Vec::new();
         for (part, n) in [("rvq_first", 1), ("rvq_rest", usize::MAX)] {
@@ -238,6 +241,7 @@ impl Codec {
             i += 1;
         }
         let c = Codec {
+            ops: ops.clone(),
             out_first: conv(ops, f, &format!("{p}quantizer.rvq_first.output_proj"), false, false)?,
             out_rest: conv(ops, f, &format!("{p}quantizer.rvq_rest.output_proj"), false, false)?,
             pre: conv(ops, f, &format!("{p}pre_conv.conv"), false, true)?,
@@ -264,7 +268,8 @@ impl Codec {
     }
 
     /// Frames [T][16] to samples (24 kHz mono), in chunks as the reference
-    pub fn decode(&self, ops: &Ops, nsd: &Nsd, frames: &[Vec<i32>]) -> Result<Vec<f32>> {
+    pub fn decode(&self, nsd: &Nsd, frames: &[Vec<i32>]) -> Result<Vec<f32>> {
+        let ops = &self.ops;
         let hop = self.hop();
         let mut out = Vec::with_capacity(frames.len() * hop);
         let mut s = 0;
@@ -308,8 +313,8 @@ impl Codec {
                 }
             }
         }
-        w.c.write(0, &crate::talker::bytes(&e1))?;
-        w.c.write(d * t * 4, &crate::talker::bytes(&e2))?;
+        w.c.write(0, &crate::bytes(&e1))?;
+        w.c.write(d * t * 4, &crate::bytes(&e2))?;
         let cd = self.out_first.co;
         ops.conv_causal(w.c.fp(), 1, d, t, &self.out_first.w, cd, 1, std::ptr::null(), 1, w.a.fp())?;
         ops.conv_causal(fp(&w.c, d * t), 1, d, t, &self.out_rest.w, cd, 1, std::ptr::null(), 1, w.b.fp())?;

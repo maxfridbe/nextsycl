@@ -141,6 +141,14 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             if speech("design") {
                 c.push("voice_design");
             }
+            // a cloned voice steered by an instruction (a recording and instructions together)
+            if speech("direction") {
+                c.push("voice_direction");
+            }
+            // vocal events inline in the text ("(laugh)", "[笑]")
+            if speech("events") {
+                c.push("vocal_events");
+            }
             let mut methods = vec!["audio.speak"];
             if speech("design") {
                 methods.push("audio.voices.design");

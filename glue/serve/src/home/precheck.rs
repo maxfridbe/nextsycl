@@ -177,6 +177,7 @@ impl Home {
         let m = all.iter().find(|x| x["id"] == id.as_str()).cloned().unwrap_or(Value::Null);
         let can = |c: &str| m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == c));
         number(b, "seconds", 0.5, 600.0)?;
+        number(b, "cfg", 0.0, 30.0)?;
         let saved = |v: &str| self.voices().get(v).is_some();
         let carried = s(b, "continue_from");
         if !carried.is_empty() {

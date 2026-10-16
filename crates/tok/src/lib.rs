@@ -112,7 +112,9 @@ impl Tokenizer {
         // SentencePiece's shape: a normalizer that makes spaces "▁" (and with Llama's, puts one ahead of the text), no
         // pre-tokenizer, byte fallback
         let norm = j["normalizer"].to_string();
-        let sentencepiece = j["pre_tokenizer"].is_null() && model["byte_fallback"] == true && norm.contains('\u{2581}');
+        // (Gemma's: a Split on " " after a normalizer that left no spaces - nothing to split)
+        let space_split = j["pre_tokenizer"]["type"] == "Split" && j["pre_tokenizer"]["pattern"]["String"] == " ";
+        let sentencepiece = (j["pre_tokenizer"].is_null() || space_split) && model["byte_fallback"] == true && norm.contains('\u{2581}');
         let prepend = norm.contains("\"Prepend\"");
         // the first Split pre-tokenizer's pattern (Qwen's: case-insensitive contractions, letters, single digits...)
         let pattern = match sentencepiece {
@@ -970,6 +972,25 @@ mod hf_json_tests {
         assert_eq!(crate::muse_channels(" to=self<|message|>Thinking<|eo"), ("Thinking".into(), String::new(), false));
         assert_eq!(crate::muse_channels(" to=self<|message|>Thinking<|eom|><|start|>assi"), ("Thinking".into(), String::new(), false));
         assert_eq!(crate::muse_channels(" to=user<|message|>Hi"), (String::new(), "Hi".into(), true));
+    }
+
+    /// Gemma's tokenizer.json shape (Breeze TTS 2's text encoder): spaces made "▁" by the normalizer, then a Split on
+    /// " " that finds none - SentencePiece-style BPE, no "▁" ahead of the text, byte fallback, added tokens literal
+    #[test]
+    fn gemma_shaped_json_is_sentencepiece() {
+        let j = serde_json::json!({
+            "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"},
+            "pre_tokenizer": {"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious", "invert": false},
+            "added_tokens": [{"id": 0, "content": "<bos>"}, {"id": 9, "content": "[S0]"}],
+            "model": {"type": "BPE", "byte_fallback": true,
+                      "vocab": {"<bos>": 0, "h": 1, "i": 2, "hi": 3, "\u{2581}": 4, "\u{2581}hi": 5, "<0x21>": 6, "[S0]": 9},
+                      "merges": [["h", "i"], ["\u{2581}", "hi"]]}
+        });
+        let p = std::env::temp_dir().join(format!("nstok-gemma-{}.json", std::process::id()));
+        std::fs::write(&p, j.to_string()).unwrap();
+        let t = super::Tokenizer::from_hf_json(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(t.encode("[S0]hi hi!"), vec![9, 3, 5, 6]);
     }
 
 }
