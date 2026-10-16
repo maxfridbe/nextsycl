@@ -1,0 +1,17 @@
+# NVIDIA Nemotron 3.5 Super VL 120B-A12B UD-IQ1_M on the B70 alone (the experts that do not fit in pinned host memory)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: nemotron-3.5-super-iq1m-b70
+kind: llm
+arch: nemotron_h_moe
+title: Nemotron 3.5 Super 120B-A12B UD-IQ1_M (the B70 alone)
+about: 'The same 1-bit quant as nemotron-3.5-super-iq1m on one card: the engine keeps as many MoE layers'' experts as do not fit VRAM in pinned host memory and brings the chosen ones over PCIe each step, so the other card stays free for pictures, sound or clips. About 21 tok/s with MTP drafts (both cards: ~46), prompts 450-560 tok/s (2K-8K); 13 MoE layers'' experts (15.5 GiB) in pinned host memory; text only for now'
+gpus: '0'
+vram_gib: 29.0
+ctx: '32768'
+tools: true
+tasks: true
+env: {}
+files:
+  model: nemotron-3.5-super-ud-iq1m-1     # defined in nemotron-3.5-super-iq1m.yml
+  shard-2: nemotron-3.5-super-ud-iq1m-2
+guide: guides/chat.md

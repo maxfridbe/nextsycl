@@ -3,7 +3,7 @@
 id: nemotron-3.5-super-iq1m
 kind: llm
 arch: nemotron_h_moe
-title: Nemotron 3.5 Super 120B-A12B UD-IQ1_M (both GPUs, or the B70 with host-memory experts)
+title: Nemotron 3.5 Super 120B-A12B UD-IQ1_M (both GPUs)
 about: 'unsloth''s dynamic 1-bit quant of NVIDIA''s hybrid Mamba-2 / latent-MoE / attention model (43 GiB; IQ1_S / IQ2 / IQ3_XXS ups, Q2_0 downs). On two cards all in VRAM; on one card (gpus: "0") the engine keeps as many MoE layers'' experts as do not fit in pinned host memory, read in place over PCIe. Text only for now'
 gpus: all
 vram_gib: 22.0

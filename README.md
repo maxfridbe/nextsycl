@@ -28,8 +28,8 @@ for a chat model. Measured speeds, decode / prompt reading:
 | `deepseek-r1-iq1s` | **DeepSeek-R1 671B** (unsloth UD-IQ1_S, 131 GiB) - the experts that do not fit VRAM in pinned RAM (multiplied on the CPU) and on the NVMe | ~8 tok/s / ~135 tok/s, 32K context |
 | `glm-5.3-flash-uncensored-256k` | **GLM-5.3-Flash** uncensored IQ2 | ~18 tok/s / 450-1,100 tok/s, to 256K |
 | `deepseek-v4-flash-iq2m`, `-256k` | **DeepSeek-V4-Flash 284B** (unsloth UD-IQ2_M, 84.7 GiB) - the experts beyond VRAM in pinned RAM; llama.cpp pages it from the disk (no result in 100 minutes) | ~27 tok/s with its MTP draft block (26 at 3.7K, 17 at 256K) / 635-1,000 tok/s (943 at 256K), 128K or 256K context (1M tested: 287 tok/s prompt, 12 tok/s decode) |
-| `nemotron-3.5-super-q2kxl` | **Nemotron 3.5 Super 120B-A12B** (unsloth UD-Q2_K_XL; hybrid Mamba-2 / latent MoE / attention; text only; port in progress, not yet on the server) | ~40 tok/s with its MTP drafts (30 without) / ~790-1,140 tok/s, 32K (128K tested: 868 / 34) |
-| `nemotron-3.5-super-iq1m` | **Nemotron 3.5 Super** UD-IQ1_M (the same; or on the B70 alone, experts in pinned RAM: ~21 tok/s / ~350 tok/s at 2K) | ~46 tok/s with MTP (32 without) / ~880-1,470 tok/s, 32K (128K tested: 1,120 / 38) |
+| `nemotron-3.5-super-q2kxl` | **Nemotron 3.5 Super 120B-A12B** (unsloth UD-Q2_K_XL; hybrid Mamba-2 / latent MoE / attention; text only) | ~40 tok/s with its MTP drafts (30 without) / ~790-1,140 tok/s, 32K (128K tested: 868 / 34) |
+| `nemotron-3.5-super-iq1m` | **Nemotron 3.5 Super** UD-IQ1_M (the same; or on the B70 alone, experts in pinned RAM: ~21 tok/s / ~350 tok/s at 2K) | ~46 tok/s with MTP (32 without) / ~880-1,470 tok/s, 32K (128K tested: 1,120 / 38); `-b70`: the B70 alone, ~21 / 450-560 |
 
 **On one 32 GB card** (measured on an Arc Pro B70):
 
@@ -91,8 +91,9 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `glm-5.3-flash-uncensored`, `-128k`, `-256k` | GLM-5.3-Flash uncensored IQ2, 64K / 128K / 256K context | `glm5next` | 89.9 GiB | checked (llama.cpp), served on both cards |
 | `deepseek-r1-iq1s` | DeepSeek-R1 671B UD-IQ1_S, 32K: experts in VRAM, pinned RAM (on the CPU) and the NVMe | `deepseek2` | 130.6 GiB | checked (llama.cpp), served on both cards |
 | `deepseek-v4-flash-iq2m`, `-256k` | DeepSeek-V4-Flash 284B UD-IQ2_M, 128K / 256K + 32K: sliding window + compressed attention (CSA / HCA, the lightning indexer), mHC, experts in VRAM and pinned RAM, MTP drafts (the original checkpoint's draft block, converted after the pull); a needle found at 35K, 140K, 261K and 1,071,766 tokens | `deepseek4` | 88.3 GiB | checked (llama.cpp), served on both cards |
-| `nemotron-3.5-super-q2kxl` | NVIDIA Nemotron 3.5 Super 120B-A12B UD-Q2_K_XL (40 Mamba-2, 40 latent-MoE, 8 attention layers; 512 experts, 22 a token), 32K, MTP drafts; text only (the vision tower not yet) | `nemotronh` | 56 GiB | checked (llama.cpp) |
-| `nemotron-3.5-super-iq1m` | the same, UD-IQ1_M: both GPUs, or the B70 alone with the experts that do not fit in pinned host memory | `nemotronh` | 43 GiB | checked (llama.cpp) |
+| `nemotron-3.5-super-q2kxl` | NVIDIA Nemotron 3.5 Super 120B-A12B UD-Q2_K_XL (40 Mamba-2, 40 latent-MoE, 8 attention layers; 512 experts, 22 a token), 32K, MTP drafts; text only (the vision tower not yet) | `nemotronh` | 56 GiB | checked (llama.cpp), served |
+| `nemotron-3.5-super-iq1m` | the same, UD-IQ1_M, on both GPUs | `nemotronh` | 43 GiB | checked (llama.cpp), served |
+| `nemotron-3.5-super-iq1m-b70` | the same on the B70 alone, the experts that do not fit in pinned host memory (the B65 left free) | `nemotronh` | 43 GiB | served |
 | `qwen3.8-flash-next-iq2_xs` | Qwen3.8-Flash-Next IQ2_XS | `qwen4exp` | 63.4 GiB | served (verify passes and batches exact) |
 | `qwen3.8-flash-next-iq2_xs-uncensored` | the same with the refusal projection (a control vector) | `qwen4exp` | 63.4 GiB | served |
 | `qwen3.8-flash-next-coder-iq1_m`, `-uncensored` | Qwen3.8-Flash-Next Coder IQ1_M | `qwen4exp` | 54.4 GiB | served |
@@ -878,8 +879,7 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
 Nemotron-H MoE as llama.cpp's `nemotron_h_moe` graph has it - 88 layers: 40 Mamba-2 mixers (conv 4, 128 heads of 64,
 8 groups, state 128, a SiLU-gated group norm), 40 latent MoE layers (a float32 sigmoid router with a selection bias,
 22 of 512 experts, the experts in a 1,024-wide latent with ReLU-squared, a shared expert on the full width) and 8
-attention layers without positions (32 / 2 heads of 128); its MTP block drafts. Work in progress: not yet on the
-server, text only.
+attention layers without positions (32 / 2 heads of 128); its MTP block drafts. Served; text only (the vision tower not yet).
 
 - **Checked** against llama.cpp (CPU, the same files, `llm check`): the same next token, the output logits cosine
   0.99998 (Q2_K_XL) / 0.99999 (IQ1_M); verify rows the one-token decode's (`spec-check`: 0 of 66 flips).
@@ -904,11 +904,11 @@ server, text only.
   |---|---:|---:|---:|---:|---:|
   | UD-IQ1_M, B65 + B70 | 62 / 46.1 | 884 / 47.0 | 1,431 / 45.7 | 1,472 / 44.0 | 1,120 / 37.6 |
   | UD-Q2_K_XL, B65 + B70 | 54 / 41.7 | 789 / 39.6 | 1,141 / 41.9 | 1,134 / 38.5 | 868 / 34.3 |
-  | UD-IQ1_M, B70 alone (host-memory experts) | | 347 / 21.4 | | | |
+  | UD-IQ1_M, B70 alone (host-memory experts) | 44 / 20.9 | 447 / 21.3 | 562 / 19.6 | | |
 
   Without drafts: Q2_K_XL 30.0, IQ1_M 31.8 tok/s decode. Strata on the same B70 reads ~880 (2K) / 1,400 (8K) and
-  decodes ~30. The B70-alone row predates the prompt kernels above (its experts are staged from host memory, the old
-  path). Open: the expert up products at decode (IQ3_XXS / IQ2_S / IQ1_S at ~150 GB/s on the B70, a third of the dense
+  decodes ~30. On the B70 alone (`nemotron-3.5-super-iq1m-b70`, the B65 left free) 13 MoE layers' experts (15.5 GiB)
+  sit in pinned host memory, gathered into VRAM each step; its prompt passes still expand experts one at a time. Open: the expert up products at decode (IQ3_XXS / IQ2_S / IQ1_S at ~150 GB/s on the B70, a third of the dense
   ones - neither the grid lookups nor the index math; `NS_NH_PROFILE=1` times every kernel), the vision tower.
 
 ## Speed by model
