@@ -278,6 +278,7 @@ The `model3d` kind (meshes from pictures, rigging, animation) and its engines' s
 | `NS_M3D_RIGNET_FACES` | 4000 | RigNet: the triangles the mesh is decimated to before rigging (the weights go back to every vertex of the input) (--opt-faces; per request too) | model3d rignet |
 | `NS_M3D_RIGNET_BANDWIDTH` | the learned 0.0429 | RigNet: the joints' mean-shift bandwidth (smaller: more, closer joints) (--opt-bandwidth; per request too) | model3d rignet |
 | `NS_M3D_RIGNET_THRESHOLD` | 1e-5 | RigNet: the joints' density threshold (lower: more joints) (--opt-threshold; per request too) | model3d rignet |
+| `NS_M3D_RIGNET_PROFILE` | off | Debug: set: RigNet prints each step's time on stderr (the geometry, each network, the mean-shift, the volumetric geodesics) | model3d rignet |
 | `NS_M3D_T2_PROFILE` | off | TRELLIS.2 / Pixal3D: set: each stage's time and the card's memory on stderr, and the run's peak (the card's free memory watched every 50 ms) (--opt-profile) | model3d trellis2 |
 | `NS_M3D_T2_RESIDENT` | off | TRELLIS.2 / Pixal3D: set: every model stays loaded after its stage (faster repeats; ~11 GiB of weights on the card) - by default each stage loads its model and drops it after (--opt-resident) | model3d trellis2 |
 
