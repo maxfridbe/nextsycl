@@ -148,6 +148,29 @@ int ns_nh_conv(ns_gpu* g, const float* x, int64_t xs, float* state, const float*
     NS_TRY
     if (T <= 0) return 0;
     if (k < 2 || k > 8) return ns_fail("ns_nh_conv: a kernel of 2 to 8");
+    if (!snap && T > 8) {
+        // prompt rows: a work-item a (row, channel), its k inputs read (the state's for rows before the first), then
+        // the state's last k-1 inputs written (a channel serial over the rows: B70 1.9 ms a 2,048-row layer)
+        g->q.parallel_for(sycl::range<1>((size_t) (T * C)), [=](sycl::id<1> id) {
+            const int64_t t = id[0] / C, c = id[0] % C;
+            float s = b ? b[c] : 0.0f;
+            for (int j = 0; j < k; ++j) {
+                const int64_t r = t - (k - 1) + j;
+                s += (r >= 0 ? x[r * xs + c] : state[(r + k - 1) * C + c]) * w[c * k + j];
+            }
+            out[t * C + c] = s / (1.0f + sycl::exp(-s));
+        });
+        g->q.parallel_for(sycl::range<1>((size_t) C), [=](sycl::id<1> id) {
+            const int64_t c = id[0];
+            float win[8];
+            for (int j = 0; j < k - 1; ++j) {
+                const int64_t r = T - (k - 1) + j;
+                win[j] = r >= 0 ? x[r * xs + c] : state[(r + k - 1) * C + c];
+            }
+            for (int j = 0; j < k - 1; ++j) state[j * C + c] = win[j];
+        });
+        return 0;
+    }
     // a work-item a channel: its k-1 inputs before, then the rows in order (the state's last k-1 written back)
     g->q.parallel_for(sycl::range<1>((size_t) C), [=](sycl::id<1> id) {
         const int64_t c = id[0];
