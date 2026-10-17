@@ -448,6 +448,10 @@ profiling), README speed lines and cards' vram_gib, deploy.
       first; two servers a card measured a loss, 1.54x -> 0.65x).
 - [ ] Voxtral TTS cloning without its encoder, on the GPU: `docs/proposals/voxtral-encoderless-clone.md` (phase 2
       of the port; shipped only if it beats the nearest preset on speaker likeness).
+- [ ] Drive moves miss an engine's sidecar files (2026-10-17: deepseek-v4-flash's `deepseek-v4-flash-mtp.gguf` and the
+      `00046-of-00046.safetensors` it is made from sit beside the first shard, found by convention, not named in the
+      registry - moved by hand). A move should take the files an engine looks for beside its own (an `ArchFiles`
+      list from the engine, or every file in a folder only that model uses).
 
 ## To try
 
