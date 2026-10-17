@@ -86,7 +86,7 @@ impl Dev<'_> {
     pub fn gemv(&self, x: *const f32, m: usize, w: &Mat, bias: *const c_void, out: *mut f32, ldo: usize, flags: i32, norm: Option<&DevBuf>) -> Result<()> {
         let (wt, sc) = match &w.scale {
             None => (0, std::ptr::null()),
-            Some(s) => (1, s.fp() as *const f32),
+            Some(s) => (if w.group { 2 } else { 1 }, s.fp() as *const f32),
         };
         let nw = norm.map_or(std::ptr::null(), |n| n.fp() as *const f32);
         // SAFETY: the caller's buffers hold the sizes named.

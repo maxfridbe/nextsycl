@@ -29,11 +29,13 @@ pub fn fp(b: &DevBuf, at: usize) -> *mut f32 {
 pub struct Ops {
     pub gpu: Arc<Gpu>,
     k: &'static ffi::Api,
+    /// the engine's silo, when built: its products also take int8 with a scale every 32 weights
+    pub silo: Option<&'static ffi::Silo>,
 }
 
 impl Ops {
     pub fn new(gpu: &Arc<Gpu>) -> Result<Ops> {
-        Ok(Ops { gpu: gpu.clone(), k: ffi::api()? })
+        Ok(Ops { gpu: gpu.clone(), k: ffi::api()?, silo: ffi::silo()? })
     }
 
     fn g(&self) -> M {
@@ -42,6 +44,14 @@ impl Ops {
 
     /// out[m] (+)= x[m] . W^T (* scale + bias), m < M <= 8, out rows `ldo` apart
     pub fn gemv(&self, x: *const f32, m: usize, k: usize, w: &Mat, bias: P, out: *mut f32, ldo: usize, acc: bool) -> Result<()> {
+        if w.group {
+            // int8 by 32s: the silo's product (the shared one takes a scale a row)
+            let s = self.silo.ok_or_else(|| Error("an int8 matrix by 32s without the silo".into()))?;
+            let sc = w.scale.as_ref().map_or(std::ptr::null(), |s| s.fp() as *const f32);
+            // SAFETY: the caller's buffers hold the sizes named.
+            return ffi::check(unsafe { (s.gemv)(self.g(), x, m as i64, k as i64, w.w.ptr(), 2, sc, w.n as i64, bias.cast(), out, ldo as i64, acc as i32,
+                                                std::ptr::null(), 0.0) }, "q3s gemv");
+        }
         let (wt, sc) = match &w.scale {
             None => (0, std::ptr::null()),
             Some(s) => (1, s.fp() as *const f32),
@@ -118,10 +128,12 @@ impl Ops {
 
 }
 
-/// A matrix [n, k] on the GPU: half, or int8 with a scale per row
+/// A matrix [n, k] on the GPU: half, or int8 with a scale per row - or, with the silo, a scale every 32 weights of a
+/// row, half (`group`: Q8_0's blocks; a scale a row loses more to Qwen3's outlier columns)
 pub struct Mat {
     pub w: DevBuf,
     pub scale: Option<DevBuf>,
+    pub group: bool,
     pub n: usize,
     pub k: usize,
 }
@@ -142,7 +154,13 @@ impl Mat {
             None => self.w.ptr(),
             Some(s) => {
                 let wh = wh.ok_or_else(|| Error("a half matrix buffer for a wide int8 product".into()))?;
-                ops.dequant_rows(self.w.ptr(), s.fp(), self.n, self.k, wh.ptr())?;
+                match (self.group, ops.silo) {
+                    (true, Some(k)) => {
+                        // SAFETY: w [n, k] int8, its scales [n, k / 32], wh n * k halfs.
+                        ffi::check(unsafe { (k.dequant_q8)(ops.g(), self.w.ptr().cast(), s.ptr(), self.n as i64, self.k as i64, wh.ptr()) }, "int8 by 32s to half")?
+                    }
+                    _ => ops.dequant_rows(self.w.ptr(), s.fp(), self.n, self.k, wh.ptr())?,
+                }
                 wh.ptr()
             }
         };
@@ -246,7 +264,10 @@ impl Shards {
         }
         let gpu = &ops.gpu;
         let w = DevBuf::new(gpu, n * k * if int8 { 1 } else { 2 })?;
-        let scale = if int8 { Some(DevBuf::f32(gpu, n)?) } else { None };
+        // int8: a scale every 32 weights with the silo (NS_Q3T_INT8_ROWS=1: a scale a row, as without it)
+        let group = int8 && k % 32 == 0 && ops.silo.is_some() && !std::env::var("NS_Q3T_INT8_ROWS").is_ok_and(|v| v == "1");
+        // (a scale a row float32, every 32 weights half)
+        let scale = if int8 { Some(DevBuf::new(gpu, if group { n * k / 32 * 2 } else { n * 4 })?) } else { None };
         let stage = DevBuf::new(gpu, biggest * 2)?;
         let f = DevBuf::f32(gpu, biggest)?;
         let mut row = 0;
@@ -254,12 +275,18 @@ impl Shards {
             let cnt = self.rows_to(ops, name, *r0, *r1, &stage, &f, 0)?;
             match &scale {
                 None => ops.to_half(f.fp(), w.ptr().wrapping_byte_add(row * k * 2), cnt)?,
+                Some(s) if group => {
+                    let ks = ops.silo.ok_or_else(|| Error("no silo".into()))?;
+                    // SAFETY: f holds the part's rows, w and the (half) scales room for them at `row`.
+                    ffi::check(unsafe { (ks.quant_q8)(ops.g(), f.fp(), (r1 - r0) as i64, k as i64, w.ptr().wrapping_byte_add(row * k).cast(), s.ptr().wrapping_byte_add(row * k / 32 * 2)) },
+                               "int8 by 32s")?
+                }
                 Some(s) => ops.quant_rows(f.fp(), r1 - r0, k, w.ptr().wrapping_byte_add(row * k), fp(s, row))?,
             }
             ops.gpu.sync()?;
             row += r1 - r0;
         }
-        Ok(Mat { w, scale, n, k })
+        Ok(Mat { w, scale, group, n, k })
     }
 
     /// A whole tensor as a matrix

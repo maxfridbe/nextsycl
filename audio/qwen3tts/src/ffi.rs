@@ -85,6 +85,8 @@ pub struct Silo {
     pub graph_launch: unsafe extern "C" fn(G, M) -> c_int,
     pub graph_free: unsafe extern "C" fn(M),
     pub read_async: unsafe extern "C" fn(G, M, P, usize) -> c_int,
+    pub quant_q8: unsafe extern "C" fn(G, *const f32, i64, i64, *mut i8, M) -> c_int,
+    pub dequant_q8: unsafe extern "C" fn(G, *const i8, P, i64, i64, M) -> c_int,
 }
 
 // SAFETY: function pointers into the silo library, which stays loaded for the process.
@@ -124,6 +126,8 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             graph_launch: sym!("ns_q3s_graph_launch"),
             graph_free: sym!("ns_q3s_graph_free"),
             read_async: sym!("ns_q3s_read_async"),
+            quant_q8: sym!("ns_q3s_quant_q8"),
+            dequant_q8: sym!("ns_q3s_dequant_q8"),
         }))
     })
     .as_ref()

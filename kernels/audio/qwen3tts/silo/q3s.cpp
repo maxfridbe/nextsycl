@@ -15,24 +15,29 @@ namespace X = sycl::ext::oneapi::experimental;
 constexpr int SG = 16;
 constexpr int HD = 128;   // a head's width
 
-// ---- the decode's product. A work-group of 8 sub-groups; each sub-group R = 2 output rows over a share of K: KS
-// sub-groups split a row pair's K (interleaved chunks of SG * V), their sums merged through local memory. Its lanes
-// read V weights at a time (16 bytes: 8 halfs or 16 int8), U chunks a step (loads in flight). NORM: each x row's
-// 1 / rms reduced over the work-group first, the row read normed (x * inv * weight); SWIGLU: the row pair is (gate n,
-// up n) and the output silu(gate) * up.
-constexpr int NSG = 8, R = 2, U = 2;
+// ---- the decode's product. A work-group of 8 sub-groups; each sub-group R output rows (a block) over a share of K:
+// KS sub-groups split a block's K (interleaved chunks of SG * V), their sums merged through local memory. Its lanes
+// read V weights at a time (16 bytes: 8 halfs or 16 int8), x's V values once for all R rows (R large for int8, whose
+// x would otherwise be read from cache twice for every weight byte). NORM: each x row's 1 / rms reduced over the
+// work-group first, the row read normed (x * inv * weight); SWIGLU: the block is R/2 gate rows and their R/2 up rows,
+// the output silu(gate) * up.
+constexpr int NSG = 8;
 constexpr int64_t KMAX_NORM = 2048;   // the widest normed input (the talker's hidden)
+constexpr int64_t Q8 = 32;            // grouped int8: weights a scale
 
-template <typename WT, int MM>
-void gemv(sycl::queue& q, const float* x, int M, int64_t K, const WT* w, const float* scale, int64_t N, const float* bias, float* out,
+template <typename WT, int MM, int R, bool GQ>
+void gemv(sycl::queue& q, const float* x, int M, int64_t K, const WT* w, const float* gscale, int64_t N, const float* bias, float* out,
           int64_t ldo, int flags, const float* norm_w, float eps, int KS) {
-    constexpr int V = sizeof(WT) == 1 ? 16 : 8;
+    constexpr int V = sizeof(WT) == 1 ? 16 : 8, RH = R / 2;
     const bool norm = flags & NS_Q3S_NORM, acc = flags & NS_Q3S_ACC, swiglu = flags & NS_Q3S_SWIGLU;
-    const int64_t pairs = swiglu ? N / 2 : (N + R - 1) / R;   // row pairs to make
-    const int per_wg = NSG / KS;                              // row pairs a work-group
-    const int64_t groups = (pairs + per_wg - 1) / per_wg;
     const int64_t Nh = N / 2;
+    const int64_t blocks = swiglu ? (Nh + RH - 1) / RH : (N + R - 1) / R;
+    const int per_wg = NSG / KS;   // blocks a work-group
+    const int64_t groups = (blocks + per_wg - 1) / per_wg;
     const int64_t step = (int64_t) KS * SG * V;
+    // GQ: int8 with a half scale every Q8 weights of a row (gscale [N, K / Q8] half); else a float scale a row (or none)
+    const float* scale = GQ ? nullptr : gscale;
+    const int64_t KG = K / Q8;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> red(sycl::range<1>((size_t) NSG * MM * R), h);
         sycl::local_accessor<float, 1> inv(sycl::range<1>(MM), h);
@@ -41,7 +46,7 @@ void gemv(sycl::queue& q, const float* x, int M, int64_t K, const WT* w, const f
             auto sg = it.get_sub_group();
             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
             const int ks = sgi % KS, rp = sgi / KS;
-            const int64_t pair = (int64_t) it.get_group(0) * per_wg + rp;
+            const int64_t blk = (int64_t) it.get_group(0) * per_wg + rp;
             float iv[MM];
 #pragma unroll
             for (int m = 0; m < MM; ++m) iv[m] = 1.0f;
@@ -61,72 +66,63 @@ void gemv(sycl::queue& q, const float* x, int M, int64_t K, const WT* w, const f
 #pragma unroll
                 for (int m = 0; m < MM; ++m) iv[m] = m < M ? inv[m] : 1.0f;
             }
+            // the block's rows (clamped: rows past the end compute a copy, not written)
             int64_t rows[R];
-            if (swiglu) {
-                rows[0] = pair < Nh ? pair : Nh - 1;
-                rows[1] = rows[0] + Nh;
-            } else {
 #pragma unroll
-                for (int r = 0; r < R; ++r) rows[r] = pair * R + r < N ? pair * R + r : N - 1;
+            for (int r = 0; r < R; ++r) {
+                if (swiglu) {
+                    const int64_t n = sycl::min(blk * RH + (r % RH), Nh - 1);
+                    rows[r] = r < RH ? n : n + Nh;
+                } else {
+                    rows[r] = sycl::min(blk * R + r, N - 1);
+                }
             }
             float a[MM][R];
 #pragma unroll
             for (int m = 0; m < MM; ++m)
 #pragma unroll
                 for (int r = 0; r < R; ++r) a[m][r] = 0.0f;
-            for (int64_t k0 = ((int64_t) ks * SG + lane) * V; k0 < K; k0 += U * step) {
-                float wf[U][R][V];
-                bool in[U];
+            for (int64_t k = ((int64_t) ks * SG + lane) * V; k < K; k += step) {
+                float xv[MM][V];
 #pragma unroll
-                for (int u = 0; u < U; ++u) {
-                    const int64_t k = k0 + u * step;
-                    in[u] = k < K;
-#pragma unroll
-                    for (int r = 0; r < R; ++r) {
-                        sycl::vec<WT, V> wv(0);
-                        if (in[u]) wv = *reinterpret_cast<const sycl::vec<WT, V>*>(w + rows[r] * K + k);
-#pragma unroll
-                        for (int i = 0; i < V; ++i) wf[u][r][i] = (float) wv[i];
-                    }
-                }
-#pragma unroll
-                for (int u = 0; u < U; ++u) {
-                    if (!in[u]) continue;
-                    const int64_t k = k0 + u * step;
-                    float nw[V];
-                    if (norm) {
+                for (int m = 0; m < MM; ++m) {
+                    if (m < M) {
 #pragma unroll
                         for (int i = 0; i < V; i += 4) {
-                            const sycl::vec<float, 4> n4 = *reinterpret_cast<const sycl::vec<float, 4>*>(norm_w + k + i);
-                            nw[i] = n4[0];
-                            nw[i + 1] = n4[1];
-                            nw[i + 2] = n4[2];
-                            nw[i + 3] = n4[3];
+                            const sycl::vec<float, 4> x4 = *reinterpret_cast<const sycl::vec<float, 4>*>(x + m * K + k + i);
+                            xv[m][i] = x4[0];
+                            xv[m][i + 1] = x4[1];
+                            xv[m][i + 2] = x4[2];
+                            xv[m][i + 3] = x4[3];
                         }
                     }
+                }
+                if (norm) {
+#pragma unroll
+                    for (int i = 0; i < V; i += 4) {
+                        const sycl::vec<float, 4> n4 = *reinterpret_cast<const sycl::vec<float, 4>*>(norm_w + k + i);
+#pragma unroll
+                        for (int m = 0; m < MM; ++m) {
+                            xv[m][i] = n4[0] * (xv[m][i] * iv[m]);
+                            xv[m][i + 1] = n4[1] * (xv[m][i + 1] * iv[m]);
+                            xv[m][i + 2] = n4[2] * (xv[m][i + 2] * iv[m]);
+                            xv[m][i + 3] = n4[3] * (xv[m][i + 3] * iv[m]);
+                        }
+                    }
+                }
+                sycl::vec<WT, V> wv[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) wv[r] = *reinterpret_cast<const sycl::vec<WT, V>*>(w + rows[r] * K + k);
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const float gs = GQ ? (float) reinterpret_cast<const half*>(gscale)[rows[r] * KG + k / Q8] : 1.0f;
 #pragma unroll
                     for (int m = 0; m < MM; ++m) {
                         if (m < M) {
-                            float xv[V];
+                            float s = 0.0f;
 #pragma unroll
-                            for (int i = 0; i < V; i += 4) {
-                                const sycl::vec<float, 4> x4 = *reinterpret_cast<const sycl::vec<float, 4>*>(x + m * K + k + i);
-                                xv[i] = x4[0];
-                                xv[i + 1] = x4[1];
-                                xv[i + 2] = x4[2];
-                                xv[i + 3] = x4[3];
-                            }
-                            if (norm) {
-#pragma unroll
-                                for (int i = 0; i < V; ++i) xv[i] = nw[i] * (xv[i] * iv[m]);
-                            }
-#pragma unroll
-                            for (int r = 0; r < R; ++r) {
-                                float s = 0.0f;
-#pragma unroll
-                                for (int i = 0; i < V; ++i) s += wf[u][r][i] * xv[i];
-                                a[m][r] += s;
-                            }
+                            for (int i = 0; i < V; ++i) s += (float) wv[r][i] * xv[m][i];
+                            a[m][r] += GQ ? s * gs : s;
                         }
                     }
                 }
@@ -156,32 +152,35 @@ void gemv(sycl::queue& q, const float* x, int M, int64_t K, const WT* w, const f
                 }
             }
             if (ks != 0 || lane != 0) return;
-            if (swiglu) {
-                if (pair >= Nh) return;
 #pragma unroll
-                for (int m = 0; m < MM; ++m) {
-                    if (m < M) {
-                        float gt = a[m][0], up = a[m][1];
-                        if (scale) { gt *= scale[rows[0]]; up *= scale[rows[1]]; }
-                        if (bias) { gt += bias[rows[0]]; up += bias[rows[1]]; }
-                        float* o = out + m * ldo + pair;
+            for (int m = 0; m < MM; ++m) {
+                if (m >= M) continue;
+                if (swiglu) {
+#pragma unroll
+                    for (int r = 0; r < RH; ++r) {
+                        const int64_t n = blk * RH + r;
+                        if (n >= Nh) continue;
+                        float gt = a[m][r], up = a[m][r + RH];
+                        if (scale) {
+                            gt *= scale[rows[r]];
+                            up *= scale[rows[r + RH]];
+                        }
+                        if (bias) {
+                            gt += bias[rows[r]];
+                            up += bias[rows[r + RH]];
+                        }
+                        float* o = out + m * ldo + n;
                         const float v = gt / (1.0f + sycl::exp(-gt)) * up;
                         *o = acc ? *o + v : v;
                     }
-                }
-                return;
-            }
-#pragma unroll
-            for (int m = 0; m < MM; ++m) {
-                if (m < M) {
+                } else {
 #pragma unroll
                     for (int r = 0; r < R; ++r) {
-                        const int64_t n = pair * R + r;
-                        if (n < N) {
-                            const float v = a[m][r] * (scale ? scale[n] : 1.0f) + (bias ? bias[n] : 0.0f);
-                            float* o = out + m * ldo + n;
-                            *o = acc ? *o + v : v;
-                        }
+                        const int64_t n = blk * R + r;
+                        if (n >= N) continue;
+                        const float v = a[m][r] * (scale ? scale[n] : 1.0f) + (bias ? bias[n] : 0.0f);
+                        float* o = out + m * ldo + n;
+                        *o = acc ? *o + v : v;
                     }
                 }
             }
@@ -189,13 +188,14 @@ void gemv(sycl::queue& q, const float* x, int M, int64_t K, const WT* w, const f
     });
 }
 
-// K shares a row pair: enough sub-groups in flight for a narrow product (about 2,048 of them), each share at least
-// one chunk of SG * V
-int k_shares(int64_t pairs, int64_t K, int V) {
+// K shares a block: enough sub-groups in flight for a narrow product (about 2,048 of them), each share at least one
+// chunk of SG * V
+int k_shares(int64_t blocks, int64_t K, int V) {
     int ks = 1;
-    while (ks < NSG && pairs * ks < 2048 && K / ((int64_t) (ks * 2) * SG * V) >= 1) ks *= 2;
+    while (ks < NSG && blocks * ks < 2048 && K / ((int64_t) (ks * 2) * SG * V) >= 1) ks *= 2;
     return ks;
 }
+
 
 // q / k of a row: 128 values a head over a sub-group (8 a lane, strided by 16), RMS-normed and rotated at `pos`
 inline void norm_rope(float v[8], const float* weight, float eps, const float* inv_freq, float pos, int l, sycl::sub_group sg) {
@@ -282,22 +282,61 @@ int ns_q3s_gemv(ns_gpu* g, const float* x, int64_t M, int64_t K, const void* w, 
     if (M > 8 || K % 256 != 0) return ns_fail("ns_q3s_gemv: at most 8 rows, K a multiple of 256");
     if ((flags & NS_Q3S_NORM) && (K > KMAX_NORM || M > 2 || !norm_w)) return ns_fail("ns_q3s_gemv: a normed input of at most 2 rows of 2,048");
     if ((flags & NS_Q3S_SWIGLU) && N % 2) return ns_fail("ns_q3s_gemv: SwiGLU takes an even number of rows");
-    const int V = wt == 1 ? 16 : 8;
-    const int64_t pairs = (flags & NS_Q3S_SWIGLU) ? N / 2 : (N + R - 1) / R;
-    const int ks = k_shares(pairs, K, V);
-#define Q3S_GEMV(WT, MM) gemv<WT, MM>(g->q, x, (int) M, K, (const WT*) w, scale, N, bias, out, ldo, flags, norm_w, eps, ks)
+    const int V = wt == 0 ? 8 : 16;
+    constexpr int R = 2;
+    if (wt == 2 && K % Q8) return ns_fail("ns_q3s_gemv: grouped int8 wants K a multiple of 32");
+    const int64_t blocks = (flags & NS_Q3S_SWIGLU) ? (N / 2 + R / 2 - 1) / (R / 2) : (N + R - 1) / R;
+    const int ks = k_shares(blocks, K, V);
+#define Q3S_GEMV(WT, MM, GQ) gemv<WT, MM, R, GQ>(g->q, x, (int) M, K, (const WT*) w, scale, N, bias, out, ldo, flags, norm_w, eps, ks)
     if (wt == 0) {
-        if (M == 1) Q3S_GEMV(half, 1);
-        else if (M == 2) Q3S_GEMV(half, 2);
-        else Q3S_GEMV(half, 8);
+        if (M == 1) Q3S_GEMV(half, 1, false);
+        else if (M == 2) Q3S_GEMV(half, 2, false);
+        else Q3S_GEMV(half, 8, false);
     } else if (wt == 1) {
-        if (M == 1) Q3S_GEMV(int8_t, 1);
-        else if (M == 2) Q3S_GEMV(int8_t, 2);
-        else Q3S_GEMV(int8_t, 8);
+        if (M == 1) Q3S_GEMV(int8_t, 1, false);
+        else if (M == 2) Q3S_GEMV(int8_t, 2, false);
+        else Q3S_GEMV(int8_t, 8, false);
+    } else if (wt == 2) {
+        if (M == 1) Q3S_GEMV(int8_t, 1, true);
+        else if (M == 2) Q3S_GEMV(int8_t, 2, true);
+        else Q3S_GEMV(int8_t, 8, true);
     } else {
-        return ns_fail("ns_q3s_gemv: weights half (0) or int8 (1)");
+        return ns_fail("ns_q3s_gemv: weights half (0), int8 a scale a row (1) or a scale every 32 (2)");
     }
 #undef Q3S_GEMV
+    return 0;
+    NS_CATCH
+}
+
+int ns_q3s_quant_q8(ns_gpu* g, const float* w, int64_t N, int64_t K, int8_t* q, void* scale_h) {
+    NS_TRY
+    if (K % Q8) return ns_fail("ns_q3s_quant_q8: K a multiple of 32");
+    half* scale = (half*) scale_h;
+    const int64_t KG = K / Q8;
+    // a sub-group of 16 a block of 32 (2 a lane): its largest magnitude / 127 the scale, the weights rounded
+    if (N > 0) g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N * KG) * SG), sycl::range<1>(SG)),
+                                 [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        auto sg = it.get_sub_group();
+        const int l = (int) sg.get_local_linear_id();
+        const int64_t b = it.get_group(0);
+        const float* src = w + b * Q8;
+        const float v0 = src[l], v1 = src[l + SG];
+        const float mx = sycl::reduce_over_group(sg, sycl::fmax(sycl::fabs(v0), sycl::fabs(v1)), sycl::maximum<float>());
+        // the scale as half (Q8_0's), the weights rounded against that half scale
+        const float sc = sycl::fmax((float) (half) (mx / 127.0f), 6e-8f);
+        q[b * Q8 + l] = (int8_t) sycl::clamp(sycl::rint(v0 / sc), -127.0f, 127.0f);
+        q[b * Q8 + l + SG] = (int8_t) sycl::clamp(sycl::rint(v1 / sc), -127.0f, 127.0f);
+        if (l == 0) scale[b] = (half) sc;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q3s_dequant_q8(ns_gpu* g, const int8_t* q, const void* scale_h, int64_t N, int64_t K, void* out) {
+    NS_TRY
+    half* o = (half*) out;
+    const half* scale = (const half*) scale_h;
+    if (N > 0 && K > 0) g->q.parallel_for(sycl::range<1>((size_t) (N * K)), [=](sycl::id<1> i) { o[i] = (half) ((float) q[i] * (float) scale[i / Q8]); });
     return 0;
     NS_CATCH
 }

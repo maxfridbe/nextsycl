@@ -17,12 +17,19 @@ extern "C" {
  * whose K is a multiple of 256 */
 int ns_q3s_supported(int64_t head, int64_t group, int64_t k);
 
+/* W [N, K] float32 to int8 with a half scale every 32 weights of a row (its largest magnitude / 127; Q8_0's blocks):
+ * q [N, K], scale [N, K / 32] half */
+int ns_q3s_quant_q8(ns_gpu* g, const float* w, int64_t N, int64_t K, int8_t* q, void* scale);
+/* That int8 back to half (a wide product's matrix): out [N, K] */
+int ns_q3s_dequant_q8(ns_gpu* g, const int8_t* q, const void* scale, int64_t N, int64_t K, void* out);
+
 /* gemv flags */
 #define NS_Q3S_ACC 1    /* out += x . W^T (a residual) instead of out = */
 #define NS_Q3S_NORM 2   /* each x row RMS-normed with norm_w (eps) first */
 #define NS_Q3S_SWIGLU 4 /* W is [gate; up] (N rows: N/2 each): out[m, n] = silu(gate_n . x) * (up_n . x), N/2 wide */
 
-/* out[m] = x[m] . W^T (* scale + bias), m < M <= 8; W [N, K] half (wt 0) or int8 (wt 1, scale a row); out rows ldo apart */
+/* out[m] = x[m] . W^T (* scale + bias), m < M <= 8; W [N, K] half (wt 0), int8 with a scale a row (wt 1, scale [N]) or
+ * with a half scale every 32 weights of a row (wt 2, scale [N, K / 32] half); out rows ldo apart */
 int ns_q3s_gemv(ns_gpu* g, const float* x, int64_t M, int64_t K, const void* w, int wt, const float* scale, int64_t N, const float* bias,
                 float* out, int64_t ldo, int flags, const float* norm_w, float eps);
 
