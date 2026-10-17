@@ -310,8 +310,23 @@ pub const COMMON_OPTIONS: &[EngineOption] = &[
     EngineOption { name: "profile", env: "NS_PROFILE", value: "1|gpu", help: "time the passes by part (gpu: device timestamps)", at: At::Load },
 ];
 
-/// The entry of `kinds` serving `g`'s architecture
+/// The name a file's engine is chosen by: its `general.architecture`, or `<arch>.<variant>` when the file names a
+/// variant (`<arch>.variant`: DeepSeek-V4.1's files say `deepseek4` with the variant `v41_flash` - another
+/// architecture under its predecessor's name)
+pub fn engine_arch(g: &Gguf) -> String {
+    let arch = g.architecture();
+    match g.arch_meta("variant").and_then(|v| v.as_str()) {
+        Some(v) => format!("{arch}.{v}"),
+        None => arch.to_string(),
+    }
+}
+
+/// The entry of `kinds` serving `g`'s architecture (its variant's entry first, when it names one)
 pub fn kind_for<'k>(kinds: &'k [EngineKind], g: &Gguf) -> std::result::Result<&'k EngineKind, String> {
+    let named = engine_arch(g);
+    if let Some(k) = kinds.iter().find(|k| k.archs.contains(&named.as_str())) {
+        return Ok(k);
+    }
     let arch = g.architecture();
     kinds.iter().find(|k| k.archs.contains(&arch)).ok_or_else(|| {
         let known: Vec<&str> = kinds.iter().flat_map(|k| k.archs.iter().copied()).collect();

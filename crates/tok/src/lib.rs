@@ -572,6 +572,48 @@ pub fn deepseek4_chat(messages: &[Message], effort: Effort, _tools: &[String]) -
     s
 }
 
+/// DeepSeek-V4.1's prompt (its `encoding/encoding.py`): V4's turns, the reasoning effort a numeric budget in a
+/// `<｜System｜>` block at the very start (thinking only: high 75, max 100), which the first system message joins. Low is
+/// the chat mode (`</think>` at once). Earlier turns' thinking is dropped, as the reference does without tools.
+pub fn deepseek41_chat(messages: &[Message], effort: Effort, _tools: &[String]) -> String {
+    let budget = match effort {
+        Effort::Low => None,
+        Effort::High => Some(75),
+        Effort::Max => Some(100),
+    };
+    let mut s = String::from("<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>");
+    let system: Vec<&str> = messages.iter().filter(|m| m.role == "system").map(|m| m.content).collect();
+    if budget.is_some() || !system.is_empty() {
+        s += "<\u{ff5c}System\u{ff5c}>";
+    }
+    if let Some(b) = budget {
+        s += &format!("Reasoning Effort: {b} (range 1-100, the higher the value, the more thorough the reasoning)\n\n");
+    }
+    s += &system.join("\n\n");
+    let mut in_user = false;
+    for m in messages {
+        match m.role {
+            "user" => {
+                s += if in_user { "\n\n" } else { "<\u{ff5c}User\u{ff5c}>" };
+                in_user = true;
+                s += m.content;
+            }
+            "assistant" => {
+                if in_user {
+                    s += "<\u{ff5c}Assistant\u{ff5c}></think>";
+                }
+                in_user = false;
+                s += m.content.rsplit("</think>").next().unwrap_or("");
+                s += "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
+            }
+            _ => {}
+        }
+    }
+    s += "<\u{ff5c}Assistant\u{ff5c}>";
+    s += if budget.is_some() { "<think>" } else { "</think>" };
+    s
+}
+
 /// Muse Glimmer's default system persona (its template's `default_persona`, as this file's GGUF has it)
 const MUSE_PERSONA: &str = r#"## Identity
 

@@ -483,6 +483,17 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS4_MULTI_CACHED` | on | 0: the IQ experts' multi-matrix kernel loads each row's activations again instead of holding them over a sub-group's run of rows | kernels:llm deepseek4 |
 | `NS_DS4_MULTI_DENSE` | on | 0: decode's dense products of one input a launch a matrix (shared kernels) instead of one multi-matrix launch a type | llm deepseek4 |
 | `NS_DS4_MULTI_GROUPS` | 1024 | Experiment: work-groups of the multi-expert decode kernels | kernels:llm deepseek4 |
+| `NS_DS41_ENGRAM_DIR` | `deepseek-engram` beside the model | the directory of DeepSeek-V4.1's two Engram shards (model-00047/48-of-00048.safetensors, read in rows) | llm deepseek41 |
+| `NS_DS41_ENGRAM_READERS` | 48 | the Engram's reader threads: its row reads in flight (O_DIRECT, a 4 KiB page each) | llm deepseek41 |
+| `NS_DS41_ENGRAM_CACHE` | 262144 | the Engram rows kept in host memory (264 B each; 0: none) | llm deepseek41 |
+| `NS_DS41_DRAFTS` | 3 | the DSpark towers' drafts a verify pass checks (1..7) | llm deepseek41 |
+| `NS_DS41_PIN_GIB` | 40 | pinned host memory for the experts that do not fit VRAM (at most what is available less 12 GiB) | llm deepseek41 |
+| `NS_DS41_FREE_GIB` | 1.5 | VRAM each GPU keeps free beyond the plan (the xe driver has no out-of-memory path) | llm deepseek41 |
+| `NS_DS41_DENSE_F16_MIN` | 64 | dense products of at least this many rows in fp16 on XMX | llm deepseek41 |
+| `NS_DS41_ATTN_XMX` | on | 0: attention on the vector units instead of XMX (deepseek4's kernels, copied) | kernels:llm deepseek41 |
+| `NS_DS41_ATTN_SPLIT` | on | 0: decode rows' attention in one work-group a head group instead of split over the cells | kernels:llm deepseek41 |
+| `NS_DS41_ATTN_KB` | 32 | Experiment: cells a decode attention split takes | kernels:llm deepseek41 |
+| `NS_DS41_ATTN_G` | 8 from 64 rows, else 2 | Experiment: groups of 8 heads an attention work-group takes | kernels:llm deepseek41 |
 
 ### museglimmer
 

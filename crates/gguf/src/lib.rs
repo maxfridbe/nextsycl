@@ -70,6 +70,12 @@ pub enum GType {
     MXFP4,
     /// GSQ-RCO's 2-bit type (Qwen3.8-Flash-Next's files): 64 values, an f16 scale and 2-bit codes
     Q2_0,
+    /// YoungAi's vector-quantized expert container (DeepSeek-V4.1's `ffn_exps_vq.blob`, a `DQVL` blob of every expert's
+    /// gate, up and down): opaque bytes, shape [bytes]. Its code (42) is Q2_0's too: a tensor named `*.blob` is this one
+    VqBlob,
+    /// YoungAi's fp8_32x32 (code 44): an E4M3 plane [rows][cols], then one E8M0 scale a 32 x 32 tile (1024 values in
+    /// 1025 bytes when both sides are multiples of 32)
+    Fp8B32,
 }
 
 impl GType {
@@ -109,6 +115,7 @@ impl GType {
             35 => TQ2_0,
             39 => MXFP4,
             42 => Q2_0,
+            44 => Fp8B32,
             _ => return None,
         })
     }
@@ -149,7 +156,8 @@ impl GType {
             TQ1_0 => 34,
             TQ2_0 => 35,
             MXFP4 => 39,
-            Q2_0 => 42,
+            Q2_0 | VqBlob => 42,
+            Fp8B32 => 44,
         }
     }
 
@@ -170,6 +178,8 @@ impl GType {
             IQ4NL => (32, 18),
             MXFP4 => (32, 17),
             Q2_0 => (64, 18),
+            VqBlob => (1, 1),
+            Fp8B32 => (1024, 1025),
             Q2K => (256, 84),
             Q3K => (256, 110),
             Q4K => (256, 144),
@@ -237,6 +247,8 @@ impl GType {
             TQ2_0 => "TQ2_0",
             MXFP4 => "MXFP4",
             Q2_0 => "Q2_0",
+            VqBlob => "VQ_BLOB",
+            Fp8B32 => "FP8_32X32",
         }
     }
 }
@@ -415,6 +427,8 @@ fn read_one(path: &Path) -> Result<(u32, BTreeMap<String, Value>, Vec<Tensor>)> 
         dims.reverse();
         let code = r.u32()?;
         let ty = GType::from_code(code).ok_or_else(|| Error(format!("{}: tensor {name}: ggml type {code} is not known here", path.display())))?;
+        // code 42 is two types: a VQ expert container is named `*.blob`
+        let ty = if ty == GType::Q2_0 && name.ends_with(".blob") { GType::VqBlob } else { ty };
         let off = r.u64()?;
         raw.push((name, ty, dims, off));
     }
@@ -529,6 +543,7 @@ mod tests {
         assert_eq!(GType::Q6K.bpw(), 6.5625);
         assert_eq!(GType::IQ2XXS.bpw(), 2.0625);
         assert_eq!(GType::Q8_0.bpw(), 8.5);
+        assert_eq!(GType::Fp8B32.bytes(5120 * 512), Some(5120 * 512 / 1024 * 1025));
         for c in 0..64 {
             if let Some(t) = GType::from_code(c) {
                 assert_eq!(t.code(), c);
