@@ -878,6 +878,9 @@ nextsycl audio check <reference dump dir> --model breeze-tts-2 [--stages prompt,
   codec 1.4-5e-6. Real clips in every mode, English and Chinese, transcribe word for word (Whisper small).
 - **Speed** (B70, 2026-10-16): 22 frames a second with guidance (design, direction: 1.8x real time), 28 without
   (clone: 2.2x); 5.4 s of designed speech in 3.9 s with the decode. 5.4 GiB of weights, 6.1 GiB in a run.
+- **One server a card**: two Breeze servers on one card make less than half the audio one does (B70 1.54x real time
+  alone, 0.65x for the pair: the driver time-slices them). Several clips in one engine instead (batched decode, ~3-4x
+  estimated) is a proposal for review: `docs/proposals/speech-batching.md`.
 
 ### VoxCPM2
 

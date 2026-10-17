@@ -428,6 +428,9 @@ profiling), README speed lines and cards' vram_gib, deploy.
       retire guard stays (it no longer fires). nsd.cpp's per-row caches measured 2026-10-17: ~2 MiB a new shape
       (kernels, not scratchpads); now kept to 512 shapes a map (bound(): the queue drained, the map emptied).
 
+- [ ] Review `docs/proposals/speech-batching.md`: several speech requests in one engine's decode step (Breeze
+      first; two servers a card measured a loss, 1.54x -> 0.65x).
+
 ## To try
 
 - [ ] Swap the cards' slots: the B70 to the x16 slot, the B65 to Gen4 x4 - then NS_SPLIT=15 (the B65's 12 MoE layers
