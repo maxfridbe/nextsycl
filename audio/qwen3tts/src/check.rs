@@ -105,6 +105,9 @@ pub fn spec_of(dir: &Path) -> Result<Spec> {
 
 pub fn run(e: &Qwen3Tts, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)) -> Result<f64> {
     let mut worst = 0f64;
+    if stages.contains(&"kernels") {
+        crate::device::bench(&e.talker, &e.ops, log)?;
+    }
     let want = |n: &str| -> Result<Vec<f32>> { Ok(read_npy(&dir.join(n))?.1.into_iter().map(|x| x as f32).collect()) };
     let t0 = Instant::now();
     let codes_ref: Option<Vec<Vec<i32>>> = match read_npy(&dir.join("codes.npy")) {

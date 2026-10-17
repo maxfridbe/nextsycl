@@ -15,6 +15,7 @@
 //! (reference/qwen3tts/ref.py: qwen-tts' own code on the same files).
 
 pub mod check;
+pub mod device;
 mod ffi;
 pub mod ops;
 pub mod prompt;
@@ -125,7 +126,12 @@ impl Qwen3Tts {
             return Err(Error(format!("{}: not Qwen3-TTS's tokenizer (no <|im_start|> at 151644)", dir.display())));
         }
         let weights = Shards::open(&[model])?;
-        let talker = Talker::load(&ops, &weights, int8, log)?;
+        let mut talker = Talker::load(&ops, &weights, int8, log)?;
+        let silo = device::silo(&talker)?;
+        if silo.is_some() {
+            talker.ptab = Some(talker.project_tables(&ops, &nsd)?);
+        }
+        log(format!("{ARCH}: the frames {}", if silo.is_some() { "on the device (the silo's kernels, a graph a frame)" } else { "on the shared kernels, the draws on the host" }));
         let speaker = if weights.find("speaker_encoder.fc.weight").is_ok() { Some(Speaker::load(&weights)?) } else { None };
         let codec_f = codec::Weights::open(&codec)?;
         let codec = Codec::load(gpu, &codec_f)?;
@@ -183,17 +189,36 @@ impl Qwen3Tts {
                   force: Option<&[Vec<i32>]>, keep: Option<&mut Vec<Vec<f32>>>) -> Result<Vec<Vec<i32>>> {
         let (ops, nsd, t) = (&self.ops, &self.nsd, &self.talker);
         let bound = prompt::bound(&self.tok, s);
+        let tq = Instant::now();
         let ss = t.session(ops, bound, max)?;
         let p = prompt::build(t, ops, nsd, &ss, &self.weights, &self.tok, &self.conf, s)?;
         let h = t.lm.hidden;
         let l = p.rows.len() / h;
+        let tb = tq.elapsed().as_secs_f64();
         t.prefill(ops, nsd, &ss, &p.rows)?;
+        let tpf = tq.elapsed().as_secs_f64() - tb;
+        let tf = Instant::now();
         let mut keep = keep;
         if let Some(k) = keep.as_deref_mut() {
             k.push(p.rows.clone());
             k.push(t.logits0(ops, &ss)?);
         }
         progress(Step { phase: "prompt", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
+        if let Some(k) = device::silo(t)?.filter(|_| t.ptab.is_some()) {
+            let feed = [p.trailing.as_slice(), p.pad.as_slice()].concat();
+            let mut codes: Vec<Vec<i32>> = Vec::new();
+            let m = t.frames_device(k, ops, &ss, l, &feed, d, max, seed, force, &mut |c| {
+                codes.push(c);
+                progress(Step { phase: "tokens", at: codes.len() as u32, of: max as u32, seconds: t0.elapsed().as_secs_f64() })
+            })?;
+            if let Some(k) = keep {
+                k.push(vec![m[0] as f32, m[1] as f32]);
+            }
+            if codes.is_empty() {
+                return Err(Error("the model ended the speech before its first frame".into()));
+            }
+            return Ok(codes);
+        }
         // the rows fed a frame each, then tts_pad's
         let n_tr = p.trailing.len() / h;
         let feed = DevBuf::from_f32(&ops.gpu, &[p.trailing.as_slice(), p.pad.as_slice()].concat())?;
@@ -214,6 +239,13 @@ impl Qwen3Tts {
             progress(Step { phase: "tokens", at: codes.len() as u32, of: max as u32, seconds: t0.elapsed().as_secs_f64() })?;
         }
         ops.gpu.sync()?;
+        if talker::profiling() {
+            let pr = ss.prof.get();
+            let n = codes.len().max(1) as f64;
+            eprintln!("[q3t profile] prompt {l} rows: build {:.1} ms, prefill {:.1} ms; {} frames in {:.1} ms ({:.2} ms a frame): c0 logits {:.3}, c0 draw {:.3}, \
+                       predictor {:.3}, talker {:.3} ms a frame", tb * 1e3, tpf * 1e3, codes.len(), tf.elapsed().as_secs_f64() * 1e3,
+                      tf.elapsed().as_secs_f64() * 1e3 / n, pr[0] * 1e3 / n, pr[1] * 1e3 / n, pr[2] * 1e3 / n, pr[3] * 1e3 / n);
+        }
         if let Some(k) = keep {
             // a forced run's disagreements, for a check
             let m = ss.misses.get();
@@ -285,6 +317,9 @@ impl AudioEngine for Qwen3Tts {
     fn generate(&self, req: &AudioRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Audio> {
         let t0 = Instant::now();
         let s = self.spec(req)?;
+        if talker::profiling() {
+            eprintln!("[q3t profile] request (a clone's speaker embedding and codes) {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
         let d = self.drawing(req)?;
         let seconds = req.seconds.unwrap_or(self.defaults().seconds);
         if seconds <= 0.0 {
@@ -294,6 +329,7 @@ impl AudioEngine for Qwen3Tts {
         progress(Step { phase: "prompt", at: 0, of: 1, seconds: 0.0 })?;
         let codes = self.frames(&s, &d, max, req.seed, t0, progress, None, None)?;
         progress(Step { phase: "decode", at: 0, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
+        let td = Instant::now();
         let samples = match &s.voice {
             // as qwen-tts: the recording's codes decoded ahead of the new ones (the codec's context), then the
             // recording's share of the samples cut off
@@ -306,6 +342,9 @@ impl AudioEngine for Qwen3Tts {
             _ => self.codec.decode(&self.nsd, &codes)?,
         };
         progress(Step { phase: "decode", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
+        if talker::profiling() {
+            eprintln!("[q3t profile] codec {:.1} ms", td.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(Audio { rate: codec::RATE, channels: 1, samples })
     }
     fn report(&self) -> Vec<String> {

@@ -252,6 +252,8 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_Q3T_*` | - | every NS_Q3T_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_Q3T_GREEDY` | 0 | the per-request option greedy's name: most likely code, no repetition penalty; a request's options only, the variable itself is not read (--opt-greedy) | audio qwen3tts |
 | `NS_Q3T_INT8` | 0 | 1: the talker's and code predictor's matrices in int8 (less VRAM, faster frames) (--opt-int8) | audio qwen3tts |
+| `NS_Q3T_PROFILE` | 0 | 1: each request's stages timed on stderr (the request, the prompt's build and prefill, the frames - with the silo the graph's recording and the time a frame; without it each stage synchronised -, the codec) | audio qwen3tts |
+| `NS_Q3T_EAGER` | 0 | 1: the silo's frame launched kernel by kernel, not replayed as a recorded graph (the A/B for the graph) | audio qwen3tts |
 | `NS_Q3T_STREAMING` | clone 1, built-in and designed voices 0 | the per-request option streaming's name: the text fed a token a frame; a request's options only, the variable itself is not read (--opt-streaming) | audio qwen3tts |
 | `NS_Q3T_TEMPERATURE` | 0.9 | the per-request option temperature's name: the talker's sampling temperature; a request's options only, the variable itself is not read (--opt-temperature) | audio qwen3tts |
 | `NS_Q3T_TOP_K` | 50 | the per-request option top-k's name: the talker's top-k; a request's options only, the variable itself is not read (--opt-top-k) | audio qwen3tts |
