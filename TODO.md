@@ -269,6 +269,10 @@ of IQ2_XXS instead could win twice.
       CrispASR's GGUF (q8_0; q4_k card); the 12 Hz codec moved to crates/codec12hz (shared with Qwen3-TTS, re-checked);
       checked against upstream (f16: 4e-4..9e-4 a stage, Q8_0 3e-3..1e-2). B70: 22 frames/s guided, 28 unguided.
       Next: int8 / graphs for speed, a served registry entry, streamed answers
+- [x] Fish Audio S2 Pro (audio/s2pro, 2026-10-17): plain / cloned speech in ~80 languages at 44.1 kHz, free-form inline
+      tags (`instructions` as one), several speakers; s2.cpp's GGUF kept as Q8_0 on the card, Fish's codec (decoder,
+      encoder) in float32; checked against fish-speech (F16: logits 1e-4, greedy frames identical; codec 1e-6 with the
+      GGUF's half weights). B70: 42 frames/s (2.0x real time). Next: sampling on the GPU, graphs for the fast model
 - [x] Qwen3.8-27B (llm/qwen35, 2026-10-10): the dense qwen35 graph (gated DeltaNet + gated full attention, dense
       SwiGLU) on the shared products / KDA scan and its own attention and gates; checked against llama.cpp on Q8_0
       (cosine >= 0.99993 every layer, same next token); served as qwen3.8-27b-q8 / -q4 / -q3 (tools, reasoning)

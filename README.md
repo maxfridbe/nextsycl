@@ -166,6 +166,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `voxcpm2-int8` | the same files, the language models in int8 at load | `voxcpm2` | 4.6 GiB | checked, served |
 | `breeze-tts-2` | Breeze TTS 2 (~3B, Q8_0 GGUF): English and Chinese at 24 kHz - voices designed, cloned (recording + transcript) or directed (a clone + an instruction), vocal events; weights and outputs non-commercial (BreezeBlue license) | `breezetts2` | 3.4 GB + codec | checked |
 | `breeze-tts-2-q4` | the same model from the Q4_K GGUF (a 2.2 GB download; the same memory on the card; the 4-bit text encoder is 1e-1 from upstream - a word can slip) | `breezetts2` | 2.2 GB + codec | checked |
+| `s2-pro` | Fish Audio S2 Pro (~4.6B Dual-AR, Q8_0 GGUF with its codec): ~80 languages at 44.1 kHz - voices cloned (recording + transcript), free-form inline tags (`[whisper]`, `[laughing]` ...; `instructions` become one), several speakers in one text; no voice design; weights and outputs non-commercial (Fish Audio Research License) | `s2pro` | 5.6 GB | checked |
 
 **3D** (`nextsycl model3d`: rigging and animation of a mesh; the result keeps the input mesh, its UVs and textures)
 
@@ -881,6 +882,60 @@ nextsycl audio check <reference dump dir> --model breeze-tts-2 [--stages prompt,
 - **One server a card**: two Breeze servers on one card make less than half the audio one does (B70 1.54x real time
   alone, 0.65x for the pair: the driver time-slices them). Several clips in one engine instead (batched decode, ~3-4x
   estimated) is a proposal for review: `docs/proposals/speech-batching.md`.
+
+### S2 Pro
+
+Fish Audio S2 Pro (`audio/s2pro`, ~4.6B; s2.cpp's GGUF of it, the codec in the same file): speech in about 80
+languages at 44.1 kHz (best in English, Chinese and Japanese). A Dual-AR model: a 36-layer Qwen3 slow model draws each
+frame's semantic code, a 4-layer fast model the other nine of Fish's RVQ codec (21.5 frames a second). What it really
+does:
+
+- **clone** (`--ref-audio` + `--ref-text`, the exact transcript; or a saved voice with one): yes. Without the
+  transcript it does not clone (upstream drops the recording).
+- **direction**: yes, by S2 Pro's own mechanism - free-form tags in square brackets anywhere in the text (`[whisper]`,
+  `[laughing]`, `[excited tone]`, `[pause]`, `[pitch up]` ...; 15,000+ in training). `--instructions` becomes such a
+  tag at the start of the text (and of each speaker turn).
+- **vocal events**: yes, as tags (`[laughing]`, `[sigh]`, `[inhale]`, `[clearing throat]`, `[chuckle]`, `[panting]` ...).
+- **several speakers**: yes, `<|speaker:0|>`, `<|speaker:1|>` turns in one text, read in batches that carry the
+  conversation on.
+- **design**: no (no description input, no built-in voices). Without a recording the voice is the model's pick for
+  the text, and it changes with the seed.
+
+**License: the weights and their outputs are research and non-commercial only** (Fish Audio Research License;
+commercial use needs Fish Audio's written license).
+
+```sh
+nextsycl models pull s2-pro
+nextsycl audio gen "Hello! [laughing] Isn't that something?" --model s2-pro [--seed N]
+nextsycl audio gen "I have a secret to tell you." --model s2-pro --ref-audio r.wav --ref-text "..." [--instructions "whisper"]
+nextsycl audio gen "<|speaker:0|>Did you hear that? <|speaker:1|>[whisper] Hear what?" --model s2-pro
+                   [--opt-temperature 0.7] [--opt-top-p 0.7] [--opt-top-k 30] [--opt-greedy 1]
+nextsycl audio check <reference dump dir> --model s2-pro [--stages prompt,frames,codec]
+```
+
+- **Ported**: the GGUF's matrices kept as Q8_0 on the card (int8 codes and half scales), read by this engine's own
+  decode product (`kernels/audio/s2pro`). A prompt's wide products expand them to float32 for oneDNN's GEMM - half
+  overflows on some prompts' activations.
+  - The embeddings stay in the file (a row a token; a frame's 11 rows summed).
+  - fish-speech's RoPE on interleaved pairs with its bfloat16 table.
+  - The attention, cache and embeddings on the music engine's kernels.
+  - Fish's codec (decoder, encoder, quantizers) in float32 on the Qwen3-TTS codec's and the shared kernels.
+  - fish-speech's conversation prompt, speaker batches, inline-tag instructions, and its draws (top-p before the
+    temperature, repetition-aware resampling).
+- **Checked** against fish-speech's own code (`reference/s2pro/ref.py`, float32 on the CPU, greedy; plain, clone,
+  Chinese, a 170-token paragraph):
+  - prompts identical; the recording's codes 2,137 of 2,140 (every semantic code)
+  - with the F16 file, the slow logits 1.1-1.3e-4 and the fast logits 0.4-1.3e-4, teacher forced; greedy frames
+    identical (40 / 40, 30 / 30) up to a near tie
+  - with the served Q8_0 file, 6e-3 and 1-5e-3 (its quantization)
+  - the codec 7e-7 .. 2e-6 against the reference with the GGUF's half weights (5-8e-4 against codec.pth's float32)
+  - real clips in every mode, English, Chinese, Japanese, a dialogue, transcribe word for word (Whisper small)
+  - details: [docs/ports/s2pro.md](docs/ports/s2pro.md)
+- **Speed** (B70, 2026-10-17): 42 frames a second (2.0x real time for the frames); a 42.8 s paragraph in 24.4 s with
+  the decode (1.75x). 5.6 GiB on the card loaded, 6.5 GiB at a long clip's peak.
+- **Served** like the other speech models: `nextsycl audio serve s2-pro` (`/v1/audio/speech`: `input`, `ref_audio` +
+  `ref_text` or a saved `voice` with its transcript, `instructions` as a tag, `seconds`, `seed`, `options`) and
+  `:8000`'s `audio.speak`.
 
 ### VoxCPM2
 

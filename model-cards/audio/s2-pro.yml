@@ -8,7 +8,7 @@ arch: s2-pro
 title: 'Fish Audio S2 Pro Q8_0 (speech in ~80 languages, 44.1 kHz: voices cloned from a recording, free-form inline tags, several speakers; non-commercial)'
 about: 'Fish Audio S2 Pro (~4.6B, Dual-AR): a 36-layer Qwen3 slow model draws each frame''s semantic code, a 4-layer fast model the other nine of Fish''s RVQ codec (44.1 kHz, 21.5 frames a second) - s2.cpp''s Q8_0 GGUF with the codec inside, kept as Q8_0 on the card. Voice cloning from a recording and its exact transcript; tone, emotion, pace and vocal events by free-form tags in square brackets anywhere in the text ([whisper], [laughing], [excited tone], [pause]); `instructions` become such a tag; several speakers in one text (<|speaker:0|>, <|speaker:1|> ...). No voice design from a description and no built-in voices: without a recording the voice is the model''s pick (it varies with the seed). Weights and outputs: Fish Audio Research License (research and non-commercial use only)'
 gpus: '0'
-vram_gib: 8.0                   # its memory on the card when it runs (measured on a B70; see docs/ports/s2pro.md)
+vram_gib: 7.0                   # its memory on the card when it runs (measured on a B70: 5.6 GiB loaded, 6.5 GiB at a 43 s clip's peak)
 speech:
 - clone
 - direction                     # a clone (or the model's voice) steered by instructions: an inline tag
