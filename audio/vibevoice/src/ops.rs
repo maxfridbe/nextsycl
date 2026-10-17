@@ -6,7 +6,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use nextsycl_audio::{Error, Result};
 use nextsycl_core::{DevBuf, Gpu};
@@ -19,15 +21,58 @@ pub fn fp(b: &DevBuf, at: usize) -> *mut f32 {
     b.fp().wrapping_add(at)
 }
 
+/// The values a product's split input needs (Ops::prod): its m rows ldx apart of k, and the rows past m its last
+/// tile of 32 reads
+pub fn split_len(m: usize, ldx: usize, k: usize) -> usize {
+    (m + 32) * ldx + k
+}
+
+/// A product's input split for the matrix engines (two bfloat16 buffers of at least split_len values) and the
+/// scratch its K pieces meet in (Ops::gemm_scratch floats)
+pub struct Split {
+    pub hi: DevBuf,
+    pub lo: DevBuf,
+    pub part: DevBuf,
+}
+
 /// The engine's kernels on one GPU
 pub struct Ops {
     pub gpu: Arc<Gpu>,
     k: &'static ffi::Api,
+    /// NS_VV_PROFILE=2: the tokenizers' operations timed one by one (the GPU waited for after each), by label
+    prof: Option<Mutex<(Instant, BTreeMap<String, (f64, u32)>)>>,
 }
 
 impl Ops {
     pub fn new(gpu: &Arc<Gpu>) -> Result<Ops> {
-        Ok(Ops { gpu: gpu.clone(), k: ffi::api()? })
+        let prof = std::env::var("NS_VV_PROFILE").is_ok_and(|v| v == "2").then(|| Mutex::new((Instant::now(), BTreeMap::new())));
+        Ok(Ops { gpu: gpu.clone(), k: ffi::api()?, prof })
+    }
+
+    /// NS_VV_PROFILE=2: the time since the last mark (the GPU waited for) under `label()`
+    pub fn mark(&self, label: impl FnOnce() -> String) -> Result<()> {
+        if let Some(p) = &self.prof {
+            self.gpu.sync()?;
+            let mut p = p.lock().map_err(|_| Error("profile lock".into()))?;
+            let now = Instant::now();
+            let dt = (now - p.0).as_secs_f64();
+            p.0 = now;
+            let e = p.1.entry(label()).or_insert((0.0, 0));
+            e.0 += dt;
+            e.1 += 1;
+        }
+        Ok(())
+    }
+
+    /// NS_VV_PROFILE=2: the marks' table on stderr, a frame's share (`frames`)
+    pub fn report(&self, frames: usize) {
+        if let Some(Ok(p)) = self.prof.as_ref().map(|p| p.lock()) {
+            let mut rows: Vec<_> = p.1.iter().collect();
+            rows.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+            for (k, (t, n)) in rows {
+                eprintln!("  {k:<44} {:>8.3} ms a frame {n:>7} calls {:>8.1} us each", 1e3 * t / frames.max(1) as f64, 1e6 * t / (*n).max(1) as f64);
+            }
+        }
     }
 
     fn g(&self) -> *mut c_void {
@@ -85,6 +130,64 @@ impl Ops {
         // SAFETY: as rope_kv; part checked above.
         ffi::check(unsafe { (self.k.attn_dec)(self.g(), q, qs as i64, seqs.len() as i64, pos.ptr() as *const i32, a.0.ptr(), a.1.ptr(), a.2 as i64, b.0.ptr(),
                                               b.1.ptr(), b.2 as i64, hq as i64, hkv as i64, 128, pieces as i64, out, part.fp()) }, "attention")
+    }
+
+    /// The product over m rows of x `ldx` apart (windows of a signal may overlap): the small-batch one for up to 8
+    /// rows, the tiled one for more - bfloat16 weights on the matrix engines when `split` (two bfloat16 buffers of at
+    /// least split_len(m, ldx, k) values) is given: x is split into them first
+    #[allow(clippy::too_many_arguments)]
+    pub fn prod(&self, x: *const f32, m: usize, ldx: usize, w: &Mat, out: *mut f32, ldo: usize, epi: Epi, gamma: Option<(*const f32, usize)>,
+                split: Option<&Split>) -> Result<()> {
+        if m <= 8 && w.k.is_multiple_of(8) && ldx.is_multiple_of(4) {
+            return self.gemv_epi(x, m, ldx, w, out, ldo, epi, gamma);
+        }
+        let bias = w.bias.as_ref().map_or(std::ptr::null(), |b| b.fp() as *const f32);
+        let (gamma, ldg) = gamma.unwrap_or((std::ptr::null(), 0));
+        let (mut xh, mut xl) = (std::ptr::null(), std::ptr::null());
+        let (mut part, mut part_len) = (std::ptr::null_mut(), 0);
+        if let Some(Split { hi, lo, part: pb }) = split.filter(|_| w.wt == 1 && w.k.is_multiple_of(16) && ldx.is_multiple_of(8)) {
+            (part, part_len) = (pb.fp(), pb.floats());
+            if hi.len.min(lo.len) < split_len(m, ldx, w.k) * 2 {
+                return Err(Error(format!("split buffers of {} bytes for {m} rows of {} ({ldx} apart)", hi.len.min(lo.len), w.k)));
+            }
+            // SAFETY: x holds (m - 1) * ldx + k floats (the caller's), hi / lo at least that many halves (checked).
+            ffi::check(unsafe { (self.k.split)(self.g(), x, ((m - 1) * ldx + w.k) as i64, hi.ptr(), lo.ptr()) }, "split")?;
+            (xh, xl) = (hi.ptr() as *const c_void, lo.ptr() as *const c_void);
+        }
+        // SAFETY: the caller's buffers hold the sizes named; the split ones have room for the tiles' rows past m.
+        ffi::check(unsafe { (self.k.gemm)(self.g(), x, xh, xl, m as i64, ldx as i64, w.k as i64, w.w.ptr(), w.wt as i32, w.n as i64, bias, epi as i32, gamma,
+                                          ldg as i64, out, ldo as i64, part, part_len as i64) }, "gemm")
+    }
+
+    /// Floats of scratch the matrix engines' form of an [m, k] x [k, n] product splits K with
+    pub fn gemm_scratch(&self, m: usize, n: usize, k: usize) -> usize {
+        // SAFETY: arithmetic only.
+        unsafe { (self.k.gemm_scratch)(m as i64, n as i64, k as i64) as usize }
+    }
+
+    /// cur [p + l, c] = prev's rows [prev_off, prev_off + p), then the l rows of x normed (times w)
+    #[allow(clippy::too_many_arguments)]
+    pub fn norm_hist(&self, prev: &DevBuf, prev_off: usize, x: *const f32, l: usize, c: usize, p: usize, w: &DevBuf, eps: f32, cur: &DevBuf) -> Result<()> {
+        if prev.len < (prev_off + p) * c * 4 || cur.len < (p + l) * c * 4 {
+            return Err(Error(format!("norm_hist: buffers of {} / {} bytes for {p} + {l} rows of {c}", prev.len, cur.len)));
+        }
+        // SAFETY: sizes checked above; x l * c floats, w c.
+        ffi::check(unsafe { (self.k.norm_hist)(self.g(), prev.fp(), prev_off as i64, x, l as i64, c as i64, p as i64, w.fp(), eps, cur.fp()) }, "norm")
+    }
+
+    /// x[t] += gamma * depthwise conv (k taps over cur [k - 1 + l, c]); h[t] = norm(x[t]) * w2
+    #[allow(clippy::too_many_arguments)]
+    pub fn block_mix(&self, cur: &DevBuf, x: *mut f32, l: usize, c: usize, k: usize, dw_w: &DevBuf, dw_b: &DevBuf, gamma: &DevBuf, w2: &DevBuf, eps: f32,
+                     h: *mut f32) -> Result<()> {
+        // SAFETY: cur (k - 1 + l) * c floats (the caller's), x and h l * c, the weights c * k and c.
+        ffi::check(unsafe { (self.k.block_mix)(self.g(), cur.fp(), x, l as i64, c as i64, k as i64, dw_w.fp(), dw_b.fp(), gamma.fp(), w2.fp(), eps, h) },
+                   "block mix")
+    }
+
+    /// buf [p + l, c]: rows [l, l + p) moved to the front
+    pub fn shift(&self, buf: *mut f32, p: usize, l: usize, c: usize) -> Result<()> {
+        // SAFETY: buf (p + l) * c floats (the caller's).
+        ffi::check(unsafe { (self.k.shift)(self.g(), buf, p as i64, l as i64, c as i64) }, "shift")
     }
 
     /// out [s * b, h]: row i * b + j = silu(c0[j] + temb[i]) (every step's conditions)
@@ -149,44 +252,10 @@ impl Ops {
         ffi::check(unsafe { (self.k.add)(self.g(), x, y, n as i64) }, "add")
     }
 
-    /// out [c, r] = x [r, c]
-    pub fn transpose(&self, x: *const f32, r: usize, c: usize, out: *mut f32) -> Result<()> {
-        // SAFETY: r * c floats each.
-        ffi::check(unsafe { (self.k.transpose)(self.g(), x, r as i64, c as i64, out) }, "transpose")
-    }
-
-    /// A 1-D convolution of one signal x [ci, l] (oneDNN): w [co, ci, k] (transposed: [ci, co, k]) float32, pad_l /
-    /// pad_r zeros (a transposed one: outputs cut from its start / end); out [co, lo]
-    pub fn conv(&self, transposed: bool, x: *const f32, ci: usize, l: usize, w: &DevBuf, co: usize, k: usize, bias: &DevBuf, stride: usize, pad_l: usize,
-                pad_r: usize, out: *mut f32, lo: usize) -> Result<()> {
-        // SAFETY: the caller's buffers hold the sizes named; the weight stays alive and unchanged (oneDNN keeps its
-        // reordered copy by its address).
-        ffi::check(unsafe { (self.k.conv1d_lr)(self.g(), transposed as i32, x, 1, ci as i64, l as i64, w.fp(), co as i64, k as i64, bias.fp(), stride as i64, 1,
-                                               pad_l as i64, pad_r as i64, out, lo as i64) }, "conv1d")
-    }
-
-    /// x [r, c] += scale[c] * y [r, c]
-    pub fn scale_add(&self, x: *mut f32, y: *const f32, scale: &DevBuf, r: usize, c: usize) -> Result<()> {
-        // SAFETY: r * c floats each, scale c.
-        ffi::check(unsafe { (self.k.scale_add)(self.g(), x, y, scale.fp(), r as i64, c as i64) }, "scale add")
-    }
-
     /// x = silu(x) over n
     pub fn silu(&self, x: *mut f32, n: usize) -> Result<()> {
         // SAFETY: n floats.
         ffi::check(unsafe { (self.k.silu)(self.g(), x, n as i64) }, "silu")
-    }
-
-    /// The depthwise causal convolution over l rows of c channels after the k - 1 rows of `ctx`
-    pub fn dwconv(&self, x: *const f32, ctx: &DevBuf, l: usize, c: usize, w: &DevBuf, bias: &DevBuf, k: usize, out: *mut f32) -> Result<()> {
-        // SAFETY: x and out l * c floats, ctx (k - 1) * c, w c * k, bias c.
-        ffi::check(unsafe { (self.k.dwconv)(self.g(), x, ctx.fp(), l as i64, c as i64, w.fp(), bias.fp(), k as i64, out) }, "depthwise conv")
-    }
-
-    /// ctx [p, c] becomes the last p rows of [ctx; x] (x [l, c])
-    pub fn ctx_push(&self, ctx: &DevBuf, p: usize, x: *const f32, l: usize, c: usize) -> Result<()> {
-        // SAFETY: ctx p * c floats, x l * c.
-        ffi::check(unsafe { (self.k.ctx_push)(self.g(), ctx.fp(), p as i64, x, l as i64, c as i64) }, "context push")
     }
 }
 

@@ -161,6 +161,40 @@ impl Weights {
         Ok(Mat { w, wt: 0, scales: None, bias, n, k, k_in })
     }
 
+    /// Whether a tensor is bfloat16 in the file
+    pub fn is_bf16(&self, name: &str) -> bool {
+        self.tensor(name).is_ok_and(|t| t.ty == GType::BF16)
+    }
+
+    /// A matrix [n, k] from host values: bfloat16 on the GPU when `bf16` (values that came from bfloat16, so exact),
+    /// else float32
+    pub fn mat_host(&self, ops: &Ops, v: &[f32], n: usize, k: usize, bf16: bool, bias: Option<&[f32]>) -> Result<Mat> {
+        if v.len() != n * k {
+            return Err(Error(format!("{} values for a [{n}, {k}] matrix", v.len())));
+        }
+        let gpu = &ops.gpu;
+        let w = if bf16 {
+            let b: Vec<u8> = v.iter().flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes()).collect();
+            let w = DevBuf::new(gpu, b.len())?;
+            w.write(0, &b)?;
+            w
+        } else {
+            DevBuf::from_f32(gpu, v)?
+        };
+        let bias = bias.map(|b| DevBuf::from_f32(gpu, b)).transpose()?;
+        Ok(Mat { w, wt: if bf16 { 1 } else { 3 }, scales: None, bias, n, k, k_in: k })
+    }
+
+    /// A matrix tensor (and its bias) as the file holds its values: bfloat16 or float32 (mat_host)
+    pub fn mat_exact(&self, ops: &Ops, name: &str, bias: Option<&str>) -> Result<Mat> {
+        let s = self.shape(name)?;
+        if s.len() != 2 {
+            return Err(Error(format!("{name}: shape {s:?}, a matrix expected")));
+        }
+        let b = bias.map(|b| self.all(b)).transpose()?;
+        self.mat_host(ops, &self.all(name)?, s[0], s[1], self.is_bf16(name), b.as_deref())
+    }
+
     /// The language model's matrices, stacked by rows as `mat` does: kept as the file holds them when that is Q8_0
     /// (the codes and the block scales apart: half the bytes a step reads), else in half. `interleave`: the two
     /// matrices' rows alternated - gate i, up i - as Epi::Swiglu takes them.

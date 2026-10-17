@@ -322,13 +322,12 @@ impl VibeVoice {
     pub fn encode(&self, x: &[f32]) -> Result<Vec<f32>> {
         let hop = self.cfg.hop();
         let piece = ENC_FRAMES * hop;
-        let w = self.enc.work(&self.ops, piece)?;
-        let s = self.enc.stream(&self.ops)?;
+        let s = self.enc.stream(&self.ops, piece)?;
         let input = DevBuf::f32(&self.ops.gpu, piece)?;
         let mut out = Vec::with_capacity(x.len() / hop * self.enc.dim_out);
         for p in x.chunks(piece) {
             input.write(0, &bytes(p))?;
-            let (y, rows) = self.enc.push(&self.ops, &self.nsd, &s, &input, p.len(), &w)?;
+            let (y, rows) = self.enc.push(&self.ops, &self.nsd, &s, Some(&input), p.len())?;
             self.ops.gpu.sync()?;
             let mut v = vec![0f32; rows * self.enc.dim_out];
             y.read(0, as_bytes_mut(&mut v))?;
@@ -394,10 +393,9 @@ impl VibeVoice {
         self.lm.prefill(ops, nsd, &pos, rows, 0, &cond)?;
         progress(Step { phase: "prompt", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
         let mut hw = self.head.work(ops, s.steps)?;
-        let (dw, sw) = (self.dec.work(ops, 1)?, self.sem.work(ops, self.cfg.hop())?);
-        let (ds, ss) = (self.dec.stream(ops)?, self.sem.stream(ops)?);
+        let (ds, ss) = (self.dec.stream(ops, 1)?, self.sem.stream(ops, self.cfg.hop())?);
         let logits = DevBuf::f32(g, 4)?;
-        let lat_in = DevBuf::f32(g, self.dec.dim_in)?;
+        let lat_in = { let (b, at) = self.dec.input(&ds); b.view(at * 4, self.dec.dim_in * 4)? };
         let (sem_in, lat_row) = (DevBuf::f32(g, self.semantic.width())?, DevBuf::f32(g, self.acoustic.width())?);
         sem_in.fill(0)?;
         lat_row.fill(0)?;
@@ -454,9 +452,9 @@ impl VibeVoice {
                 self.head.sample(ops, nsd, &mut hw, &cond, &z, s.cfg, first.as_mut(), Some(&lat_row), Some((&lat_in, self.scale, self.bias)))?;
                 prof.mark(g, 2)?;
                 // the acoustic decoder, then the semantic encoder on its samples
-                let (y, n) = self.dec.push(ops, nsd, &ds, &lat_in, 1, &dw)?;
+                let (y, n) = self.dec.push(ops, nsd, &ds, None, 1)?;
                 prof.mark(g, 3)?;
-                let (sv, _) = self.sem.push(ops, nsd, &ss, y, n, &sw)?;
+                let (sv, _) = self.sem.push(ops, nsd, &ss, Some(y), n)?;
                 prof.mark(g, 4)?;
                 sem_in.copy_within(0, sv, 0, self.sem.dim_out * 4)?;
                 // the samples kept on the GPU, read back a batch of frames at a time
@@ -495,6 +493,7 @@ impl VibeVoice {
         }
         samples.extend(sbuf.to_f32()?[..sfill].iter());
         prof.print(frames);
+        ops.report(frames);
         if samples.is_empty() {
             return Err(Error("the model ended the speech before its first frame".into()));
         }

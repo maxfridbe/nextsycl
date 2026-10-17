@@ -211,8 +211,7 @@ pub fn run(e: &VibeVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
         let (lats, speech, sem) = (want("latents.npy")?, want("speech.npy")?, want("semantic.npy")?);
         let n = lats.len() / lat;
         let hop = e.cfg.hop();
-        let (dw, sw) = (e.dec.work(ops, 1)?, e.sem.work(ops, hop)?);
-        let (ds, ss) = (e.dec.stream(ops)?, e.sem.stream(ops)?);
+        let (ds, ss) = (e.dec.stream(ops, 1)?, e.sem.stream(ops, hop)?);
         let (lin, chunk) = (DevBuf::f32(g, lat)?, DevBuf::f32(g, hop)?);
         let (mut got_s, mut got_m) = (Vec::new(), Vec::new());
         // the frames in the reference's token order: an audio end clears both streams (a new segment starts afresh)
@@ -229,13 +228,13 @@ pub fn run(e: &VibeVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
             }
             let un: Vec<f32> = lats[f * lat..(f + 1) * lat].iter().map(|v| v / e.scale - e.bias).collect();
             lin.write(0, &bytes(&un))?;
-            let (y, rows) = e.dec.push(ops, &e.nsd, &ds, &lin, 1, &dw)?;
+            let (y, rows) = e.dec.push(ops, &e.nsd, &ds, Some(&lin), 1)?;
             let mut v = vec![0f32; rows];
             y.read(0, crate::as_bytes_mut(&mut v))?;
             got_s.extend(v);
             // the semantic encoder on the reference's own samples
             chunk.write(0, &bytes(&speech[f * hop..(f + 1) * hop]))?;
-            let (y, _) = e.sem.push(ops, &e.nsd, &ss, &chunk, hop, &sw)?;
+            let (y, _) = e.sem.push(ops, &e.nsd, &ss, Some(&chunk), hop)?;
             let mut m = vec![0f32; e.sem.dim_out];
             y.read(0, crate::as_bytes_mut(&mut m))?;
             got_m.extend(m);

@@ -47,7 +47,7 @@ inline void epi_one(int epi, float* out, int64_t ldo, int m, int64_t n, float v,
     }
 }
 
-// WK: 0 half, 1 bfloat16, 2 Q8_0 (codes [N, K] int8, scales [N, K / 32] half). Each sub-group R output rows, its lanes
+// WK: 0 half, 1 bfloat16, 2 Q8_0 (codes [N, K] int8, scales [N, K / 32] half), 3 float32. Each sub-group R output rows, its lanes
 // V values at a time across K; KS sub-groups share a row group's K (interleaved), their sums met in local memory.
 template <int WK, int MM, int KS>
 void gemv(sycl::queue& q, const float* x, int M, int64_t ldx, int64_t K, const void* w, const half* dq, int64_t N, const float* bias, int epi,
@@ -80,6 +80,15 @@ void gemv(sycl::queue& q, const float* x, int M, int64_t ldx, int64_t K, const v
                         const sycl::vec<uint16_t, V> wv = *reinterpret_cast<const sycl::vec<uint16_t, V>*>((const uint16_t*) w + n * K + k);
 #pragma unroll
                         for (int i = 0; i < V; ++i) wf[r][i] = bf16f(wv[i]);
+                    } else if constexpr (WK == 3) {
+#pragma unroll
+                        for (int i = 0; i < V; i += 4) {
+                            const sycl::vec<float, 4> w4 = *reinterpret_cast<const sycl::vec<float, 4>*>((const float*) w + n * K + k + i);
+                            wf[r][i] = w4[0];
+                            wf[r][i + 1] = w4[1];
+                            wf[r][i + 2] = w4[2];
+                            wf[r][i + 3] = w4[3];
+                        }
                     } else {
                         const sycl::vec<int8_t, V> wv = *reinterpret_cast<const sycl::vec<int8_t, V>*>((const int8_t*) w + n * K + k);
 #pragma unroll
@@ -212,10 +221,11 @@ int ns_audio_vv_gemv(ns_gpu* g, const float* x, int64_t M, int64_t ldx, int64_t 
     const int ks = pick_ks(N, K);
     if (wt == 0) gemv_m<0>(g->q, ks, x, (int) M, ldx, K, w, nullptr, N, bias, epi, gamma, ldg, out, ldo);
     else if (wt == 1) gemv_m<1>(g->q, ks, x, (int) M, ldx, K, w, nullptr, N, bias, epi, gamma, ldg, out, ldo);
+    else if (wt == 3) gemv_m<3>(g->q, ks, x, (int) M, ldx, K, w, nullptr, N, bias, epi, gamma, ldg, out, ldo);
     else if (wt == 2) {
         if (!scales) return ns_fail("ns_audio_vv_gemv: Q8_0 without its scales");
         gemv_m<2>(g->q, ks, x, (int) M, ldx, K, w, (const half*) scales, N, bias, epi, gamma, ldg, out, ldo);
-    } else return ns_fail("ns_audio_vv_gemv: weights half (0), bfloat16 (1) or Q8_0 (2)");
+    } else return ns_fail("ns_audio_vv_gemv: weights half (0), bfloat16 (1), Q8_0 (2) or float32 (3)");
     return 0;
     NS_CATCH
 }
