@@ -199,7 +199,8 @@ pub fn run(e: &VibeVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
         for f in 0..n {
             cond.write(0, &bytes(&wc[f * 2 * h..(f + 1) * 2 * h]))?;
             let mut first = Vec::new();
-            lats.extend(e.head.sample(ops, &e.nsd, &mut hw, &cond, &noise[f * lat..(f + 1) * lat], cfg, Some(&mut first))?);
+            e.head.sample(ops, &e.nsd, &mut hw, &cond, &noise[f * lat..(f + 1) * lat], cfg, Some(&mut first), None, None)?;
+            lats.extend(e.head.latent(&hw)?);
             eps0.extend(first);
         }
         log(format!("{:<24} {n} frames in {:.2} s", "head", t.elapsed().as_secs_f64()));

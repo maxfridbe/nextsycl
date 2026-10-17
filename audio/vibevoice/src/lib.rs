@@ -64,6 +64,8 @@ const STEPS_A_ROW: usize = 4;
 pub(crate) const CHUNK: usize = 256;
 /// a voice's recording through the encoder a piece at a time (frames a piece)
 const ENC_FRAMES: usize = 8;
+/// a run's samples are read back from the GPU this many frames at a time
+const SAMPLE_FRAMES: usize = 256;
 
 pub const OPTIONS: &[EngineOption] = &[];
 
@@ -408,6 +410,9 @@ impl VibeVoice {
         // whether cond's second row holds the negative branch's next hidden state already (the paired step made it)
         let mut paired = false;
         let mut samples = Vec::new();
+        // the frames' samples on the GPU until a read-back (SAMPLE_FRAMES frames at a time)
+        let sbuf = DevBuf::f32(g, SAMPLE_FRAMES * self.cfg.hop())?;
+        let mut sfill = 0;
         let mut prof = Prof::new();
         prof.start(g)?;
         for _ in 0..max_steps {
@@ -445,21 +450,23 @@ impl VibeVoice {
                     None => (0..self.head.latent).map(|_| rng.normal()).collect(),
                 };
                 let mut first = keep.as_ref().map(|_| Vec::new());
-                let latent = self.head.sample(ops, nsd, &mut hw, &cond, &z, s.cfg, first.as_mut())?;
+                // the latent on the GPU: the acoustic connector's input (lat_row) and, unscaled, the decoder's
+                self.head.sample(ops, nsd, &mut hw, &cond, &z, s.cfg, first.as_mut(), Some(&lat_row), Some((&lat_in, self.scale, self.bias)))?;
                 prof.mark(g, 2)?;
-                // the acoustic decoder on the unscaled latent, then the semantic encoder on its samples
-                let un: Vec<f32> = latent.iter().map(|v| v / self.scale - self.bias).collect();
-                lat_in.write_async(0, &bytes(&un))?;
+                // the acoustic decoder, then the semantic encoder on its samples
                 let (y, n) = self.dec.push(ops, nsd, &ds, &lat_in, 1, &dw)?;
                 prof.mark(g, 3)?;
                 let (sv, _) = self.sem.push(ops, nsd, &ss, y, n, &sw)?;
                 prof.mark(g, 4)?;
                 sem_in.copy_within(0, sv, 0, self.sem.dim_out * 4)?;
-                let mut chunk = vec![0f32; n];
-                y.read(0, as_bytes_mut(&mut chunk))?;
-                samples.extend_from_slice(&chunk);
+                // the samples kept on the GPU, read back a batch of frames at a time
+                if sfill + n > sbuf.floats() {
+                    samples.extend(sbuf.to_f32()?[..sfill].iter());
+                    sfill = 0;
+                }
+                sbuf.copy_within(sfill * 4, y, 0, n * 4)?;
+                sfill += n;
                 // the next input: the acoustic connector's latent plus the semantic connector's features
-                lat_row.write_async(0, &bytes(&latent))?;
                 self.acoustic.apply(ops, nsd, &lat_row, 1, &ctmp, &xh, &next)?;
                 self.semantic.apply(ops, nsd, &sem_in, 1, &ctmp, &xh, &tmp)?;
                 ops.add(next.fp(), tmp.fp(), h)?;
@@ -468,7 +475,7 @@ impl VibeVoice {
                 if let Some(k) = keep.as_deref_mut() {
                     k.cond.push(cond.to_f32()?);
                     k.eps0.push(first.unwrap_or_default());
-                    k.latents.push(latent);
+                    k.latents.push(self.head.latent(&hw)?);
                     k.semantic.push(sem_in.to_f32()?[..self.sem.dim_out].to_vec());
                     k.embeds.push(next.to_f32()?);
                 }
@@ -486,7 +493,7 @@ impl VibeVoice {
             paired = true;
             p += 1;
         }
-        g.sync()?;
+        samples.extend(sbuf.to_f32()?[..sfill].iter());
         prof.print(frames);
         if samples.is_empty() {
             return Err(Error("the model ended the speech before its first frame".into()));

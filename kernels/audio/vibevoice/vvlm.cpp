@@ -36,13 +36,13 @@ inline float gelu(float v) {
 }
 
 // what follows the product for output n of row m (v: the sum, its bias added)
-inline void epi_one(int epi, float* out, int64_t ldo, int m, int64_t n, float v, const float* gamma) {
+inline void epi_one(int epi, float* out, int64_t ldo, int m, int64_t n, float v, const float* gamma, int64_t ldg) {
     float* o = out + m * ldo + n;
     switch (epi) {
     case NS_VV_STORE: *o = v; break;
     case NS_VV_ACC: *o += v; break;
     case NS_VV_GELU: *o = gelu(v); break;
-    case NS_VV_RES: *o += gamma[n] * v; break;
+    case NS_VV_RES: *o += gamma[m * ldg + n] * v; break;
     default: break;
     }
 }
@@ -51,7 +51,7 @@ inline void epi_one(int epi, float* out, int64_t ldo, int m, int64_t n, float v,
 // V values at a time across K; KS sub-groups share a row group's K (interleaved), their sums met in local memory.
 template <int WK, int MM, int KS>
 void gemv(sycl::queue& q, const float* x, int M, int64_t ldx, int64_t K, const void* w, const half* dq, int64_t N, const float* bias, int epi,
-          const float* gamma, float* out, int64_t ldo) {
+          const float* gamma, int64_t ldg, float* out, int64_t ldo) {
     constexpr int R = 2, V = WK == 2 ? 16 : 8, RG = NSG / KS, ROWS = RG * R;
     const int64_t groups = (N + ROWS - 1) / ROWS;
     q.submit([&](sycl::handler& h) {
@@ -134,7 +134,7 @@ void gemv(sycl::queue& q, const float* x, int M, int64_t ldx, int64_t K, const v
                 } else {
 #pragma unroll
                     for (int r = 0; r < R; ++r)
-                        if (nb + r < N) epi_one(epi, out, ldo, m, nb + r, b[r], gamma);
+                        if (nb + r < N) epi_one(epi, out, ldo, m, nb + r, b[r], gamma, ldg);
                 }
             };
             if constexpr (KS == 1) {
@@ -171,20 +171,20 @@ void gemv(sycl::queue& q, const float* x, int M, int64_t ldx, int64_t K, const v
 
 template <int WK, int MM>
 void gemv_ks(sycl::queue& q, int ks, const float* x, int M, int64_t ldx, int64_t K, const void* w, const half* dq, int64_t N, const float* bias,
-             int epi, const float* gamma, float* out, int64_t ldo) {
-    if (ks >= 4) gemv<WK, MM, 4>(q, x, M, ldx, K, w, dq, N, bias, epi, gamma, out, ldo);
-    else if (ks == 2) gemv<WK, MM, 2>(q, x, M, ldx, K, w, dq, N, bias, epi, gamma, out, ldo);
-    else gemv<WK, MM, 1>(q, x, M, ldx, K, w, dq, N, bias, epi, gamma, out, ldo);
+             int epi, const float* gamma, int64_t ldg, float* out, int64_t ldo) {
+    if (ks >= 4) gemv<WK, MM, 4>(q, x, M, ldx, K, w, dq, N, bias, epi, gamma, ldg, out, ldo);
+    else if (ks == 2) gemv<WK, MM, 2>(q, x, M, ldx, K, w, dq, N, bias, epi, gamma, ldg, out, ldo);
+    else gemv<WK, MM, 1>(q, x, M, ldx, K, w, dq, N, bias, epi, gamma, ldg, out, ldo);
 }
 
 template <int WK>
 void gemv_m(sycl::queue& q, int ks, const float* x, int M, int64_t ldx, int64_t K, const void* w, const half* dq, int64_t N, const float* bias,
-            int epi, const float* gamma, float* out, int64_t ldo) {
-    if (M == 1) gemv_ks<WK, 1>(q, ks, x, M, ldx, K, w, dq, N, bias, epi, gamma, out, ldo);
-    else if (M == 2) gemv_ks<WK, 2>(q, ks, x, M, ldx, K, w, dq, N, bias, epi, gamma, out, ldo);
-    else if (M <= 4) gemv_ks<WK, 4>(q, ks, x, M, ldx, K, w, dq, N, bias, epi, gamma, out, ldo);
-    else if (M <= 8) gemv_ks<WK, 8>(q, ks, x, M, ldx, K, w, dq, N, bias, epi, gamma, out, ldo);
-    else gemv_ks<WK, 20>(q, ks, x, M, ldx, K, w, dq, N, bias, epi, gamma, out, ldo);
+            int epi, const float* gamma, int64_t ldg, float* out, int64_t ldo) {
+    if (M == 1) gemv_ks<WK, 1>(q, ks, x, M, ldx, K, w, dq, N, bias, epi, gamma, ldg, out, ldo);
+    else if (M == 2) gemv_ks<WK, 2>(q, ks, x, M, ldx, K, w, dq, N, bias, epi, gamma, ldg, out, ldo);
+    else if (M <= 4) gemv_ks<WK, 4>(q, ks, x, M, ldx, K, w, dq, N, bias, epi, gamma, ldg, out, ldo);
+    else if (M <= 8) gemv_ks<WK, 8>(q, ks, x, M, ldx, K, w, dq, N, bias, epi, gamma, ldg, out, ldo);
+    else gemv_ks<WK, 20>(q, ks, x, M, ldx, K, w, dq, N, bias, epi, gamma, ldg, out, ldo);
 }
 
 // the split of K a shape gets (NS_VV_GEMV_KS overrides: a tuning switch): a matrix of few rows splits its long rows so
@@ -202,7 +202,7 @@ int pick_ks(int64_t N, int64_t K) {
 extern "C" {
 
 int ns_audio_vv_gemv(ns_gpu* g, const float* x, int64_t M, int64_t ldx, int64_t K, const void* w, int wt, const void* scales, int64_t N,
-                     const float* bias, int epi, const float* gamma, float* out, int64_t ldo) {
+                     const float* bias, int epi, const float* gamma, int64_t ldg, float* out, int64_t ldo) {
     NS_TRY
     if (M <= 0 || N <= 0) return 0;
     if (M > 20) return ns_fail("ns_audio_vv_gemv: at most 20 rows");
@@ -210,11 +210,11 @@ int ns_audio_vv_gemv(ns_gpu* g, const float* x, int64_t M, int64_t ldx, int64_t 
     if (epi == NS_VV_SWIGLU && N % 2 != 0) return ns_fail("ns_audio_vv_gemv: SwiGLU takes interleaved gate / up rows (N even)");
     if (epi == NS_VV_RES && !gamma) return ns_fail("ns_audio_vv_gemv: a residual's layer scale");
     const int ks = pick_ks(N, K);
-    if (wt == 0) gemv_m<0>(g->q, ks, x, (int) M, ldx, K, w, nullptr, N, bias, epi, gamma, out, ldo);
-    else if (wt == 1) gemv_m<1>(g->q, ks, x, (int) M, ldx, K, w, nullptr, N, bias, epi, gamma, out, ldo);
+    if (wt == 0) gemv_m<0>(g->q, ks, x, (int) M, ldx, K, w, nullptr, N, bias, epi, gamma, ldg, out, ldo);
+    else if (wt == 1) gemv_m<1>(g->q, ks, x, (int) M, ldx, K, w, nullptr, N, bias, epi, gamma, ldg, out, ldo);
     else if (wt == 2) {
         if (!scales) return ns_fail("ns_audio_vv_gemv: Q8_0 without its scales");
-        gemv_m<2>(g->q, ks, x, (int) M, ldx, K, w, (const half*) scales, N, bias, epi, gamma, out, ldo);
+        gemv_m<2>(g->q, ks, x, (int) M, ldx, K, w, (const half*) scales, N, bias, epi, gamma, ldg, out, ldo);
     } else return ns_fail("ns_audio_vv_gemv: weights half (0), bfloat16 (1) or Q8_0 (2)");
     return 0;
     NS_CATCH

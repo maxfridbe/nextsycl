@@ -37,10 +37,10 @@ int ns_audio_vv_ctx_push(ns_gpu* g, float* ctx, int64_t P, const float* x, int64
  * of 8). bias float32 [N] or NULL. What epi does with v = the sum + bias, out rows ldo apart:
  *   STORE  out[m, n] = v              ACC  out[m, n] += v           GELU  out[m, n] = gelu(v) (exact, erf)
  *   SWIGLU rows 2i and 2i + 1 are gate i and up i: out[m, i] = silu(gate) * up
- *   RES    out[m, n] += gamma[n] * v (a layer-scaled residual) */
+ *   RES    out[m, n] += gamma[m * ldg + n] * v (a layer-scaled residual; ldg 0: one scale for every row) */
 enum { NS_VV_STORE = 0, NS_VV_ACC = 1, NS_VV_SWIGLU = 2, NS_VV_GELU = 3, NS_VV_RES = 4 };
 int ns_audio_vv_gemv(ns_gpu* g, const float* x, int64_t M, int64_t ldx, int64_t K, const void* w, int wt, const void* scales, int64_t N,
-                     const float* bias, int epi, const float* gamma, float* out, int64_t ldo);
+                     const float* bias, int epi, const float* gamma, int64_t ldg, float* out, int64_t ldo);
 /* RMS norm of the rows of x [M, C] into out [M, C]: x / sqrt(mean(x^2) + eps) * w (w NULL: 1), then with scale /
  * shift (rows lds apart; NULL: none) v * (1 + scale[m]) + shift[m] */
 int ns_audio_vv_rms_norm(ns_gpu* g, const float* x, int64_t M, int64_t C, const float* w, float eps, const float* scale, const float* shift,
@@ -60,6 +60,16 @@ int ns_audio_vv_attn_dec(ns_gpu* g, const float* q, int64_t qs, int64_t R, const
 int ns_audio_vv_dequant_q8(ns_gpu* g, const void* q, const void* d, int64_t N, int64_t K, void* out);
 /* x [M, 2C] of interleaved gate / up pairs -> out [M, C] = silu(gate) * up */
 int ns_audio_vv_swiglu_pairs(ns_gpu* g, const float* x, int64_t M, int64_t C, float* out);
+
+/* vvhead.cpp - the diffusion head.
+ * out [S * B, H]: row s * B + b = silu(c0[b] + temb[s]) (c0 [B, H]: the branches' conditions; temb [S, H]: the steps'
+ * timestep embeddings) - every step's conditions at once */
+int ns_audio_vv_silu_rows(ns_gpu* g, const float* c0, const float* temb, int64_t S, int64_t B, int64_t H, float* out);
+/* One DPM-Solver++ step (sched.rs's) on a latent x [L]: v [2, L] the two branches' v-predictions, mixed by cfg
+ * (n + cfg (p - n)); d0 = a_s x - s_s v; x = ratio x - ae d0 (second: - 0.5 ae inv_r0 (d0 - prev)); prev = d0. Then x
+ * copied to the head's next input rows (x_in, both rows ldin apart), lat, and un = x / scale - bias (each NULL: not) */
+int ns_audio_vv_dpm(ns_gpu* g, const float* v, int64_t L, float cfg, float* x, float* prev, float a_s, float s_s, float ratio, float ae, float inv_r0,
+                    int second, float* x_in, int64_t ldin, float* lat, float* un, float scale, float bias);
 
 #ifdef __cplusplus
 }

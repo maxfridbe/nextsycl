@@ -25,12 +25,14 @@ pub struct Api {
     pub attn: unsafe extern "C" fn(G, *const f32, i64, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
     pub dwconv: unsafe extern "C" fn(G, *const f32, *const f32, i64, i64, *const f32, *const f32, i64, *mut f32) -> c_int,
     pub ctx_push: unsafe extern "C" fn(G, *mut f32, i64, *const f32, i64, i64) -> c_int,
-    pub gemv: unsafe extern "C" fn(G, *const f32, i64, i64, i64, P, c_int, P, i64, *const f32, c_int, *const f32, *mut f32, i64) -> c_int,
+    pub gemv: unsafe extern "C" fn(G, *const f32, i64, i64, i64, P, c_int, P, i64, *const f32, c_int, *const f32, i64, *mut f32, i64) -> c_int,
     pub rms_norm: unsafe extern "C" fn(G, *const f32, i64, i64, *const f32, f32, *const f32, *const f32, i64, *mut f32) -> c_int,
     pub rope_kv: unsafe extern "C" fn(G, *mut f32, i64, i64, *const i32, i64, i64, i64, *const f32, M, M, i64, M, M, i64) -> c_int,
     pub attn_dec: unsafe extern "C" fn(G, *const f32, i64, i64, *const i32, P, P, i64, P, P, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
     pub dequant_q8: unsafe extern "C" fn(G, P, P, i64, i64, M) -> c_int,
     pub swiglu_pairs: unsafe extern "C" fn(G, *const f32, i64, i64, *mut f32) -> c_int,
+    pub silu_rows: unsafe extern "C" fn(G, *const f32, *const f32, i64, i64, i64, *mut f32) -> c_int,
+    pub dpm: unsafe extern "C" fn(G, *const f32, i64, f32, *mut f32, *mut f32, f32, f32, f32, f32, f32, c_int, *mut f32, i64, *mut f32, *mut f32, f32, f32) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -73,6 +75,8 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             attn_dec: sym!("ns_audio_vv_attn_dec"),
             dequant_q8: sym!("ns_audio_vv_dequant_q8"),
             swiglu_pairs: sym!("ns_audio_vv_swiglu_pairs"),
+            silu_rows: sym!("ns_audio_vv_silu_rows"),
+            dpm: sym!("ns_audio_vv_dpm"),
         })
     })
     .as_ref()

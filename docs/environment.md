@@ -269,6 +269,7 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_VXT_VLLM_OMNI` | - | `audio voice enroll`: a vllm-omni checkout (enroll.py runs its voxtral_tts decoder code) | cli (audio voice enroll) |
 | `NS_VXT_TORCH` | - | `audio voice enroll`: PyTorch with XPU installed with `pip install --target` for the build image's Python (its PYTHONPATH) | cli (audio voice enroll) |
 | `NS_VXT_ENROLL_TOOL` | <dist>/../reference/voxtraltts | `audio voice enroll`: where enroll.py and ref.py are | cli (audio voice enroll) |
+| `NS_VV_GEMV_KS` | by shape | Debug: the VibeVoice products' split of K between a work-group's sub-groups (1, 2 or 4), for every shape (a tuning switch) | kernels:audio (vibevoice) |
 | `NS_VV_PROFILE` | 0 | Debug: 1 times a run's stages (logits, head, decoder, semantic encoder, connectors, language model; the GPU waited for at each boundary), the table on stderr at its end | audio vibevoice |
 | `NS_VCP_*` | - | every NS_VCP_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_VCP_INT8` | 0 | 1: the language models' matrices in int8 (less VRAM, faster patches) (--opt-int8) | audio voxcpm2 |

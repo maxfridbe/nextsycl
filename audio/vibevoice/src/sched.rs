@@ -53,13 +53,11 @@ impl Dpm {
         self.at = 0;
     }
 
-    /// One step: the model's v-prediction `v` at the current timestep moves `x` toward the next sigma
-    pub fn step(&mut self, v: &[f32], x: &mut [f32]) {
-        let i = self.at;
+    /// Step i's coefficients: the data prediction x0 = a_s x - s_s v, then x = ratio x - ae x0, or with `second`
+    /// (the midpoint update from the previous x0, m1) x = ratio x - ae x0 - 0.5 ae inv_r0 (x0 - m1)
+    pub fn coef(&self, i: usize) -> Coef {
         let n = self.timesteps.len();
         let (a_s, s_s) = alpha_sigma(self.sigmas[i]);
-        // the data prediction x0 = alpha x - sigma v
-        let x0: Vec<f32> = x.iter().zip(v).map(|(x, v)| a_s * x - s_s * v).collect();
         let (a_t, s_t) = alpha_sigma(self.sigmas[i + 1]);
         let lambda = |a: f32, s: f32| a.ln() - s.ln();
         let l_t = lambda(a_t, s_t);
@@ -67,27 +65,48 @@ impl Dpm {
         let h = l_t - l_s;
         // exp(-h) - 1, with the last step's sigma 0 (h infinite): -1
         let em1 = (-h).exp() - 1.0;
-        let ratio = s_t / s_s;
-        let first = self.prev.is_none() || i == n - 1;
-        match (&self.prev, first) {
-            (Some(m1), false) => {
-                // second order (midpoint): D1 = (m0 - m1) / r0, r0 = h_0 / h
-                let (a_1, s_1) = alpha_sigma(self.sigmas[i - 1]);
-                let r0 = (l_s - lambda(a_1, s_1)) / h;
+        // first order at the start and the end; else the midpoint second order: D1 = (m0 - m1) / r0, r0 = h_0 / h
+        let second = i > 0 && i < n - 1;
+        let inv_r0 = if second {
+            let (a_1, s_1) = alpha_sigma(self.sigmas[i - 1]);
+            1.0 / ((l_s - lambda(a_1, s_1)) / h)
+        } else {
+            0.0
+        };
+        Coef { a_s, s_s, ratio: s_t / s_s, ae: a_t * em1, inv_r0, second }
+    }
+
+    /// One step: the model's v-prediction `v` at the current timestep moves `x` toward the next sigma
+    pub fn step(&mut self, v: &[f32], x: &mut [f32]) {
+        let c = self.coef(self.at);
+        let x0: Vec<f32> = x.iter().zip(v).map(|(x, v)| c.a_s * x - c.s_s * v).collect();
+        match (&self.prev, c.second) {
+            (Some(m1), true) => {
                 for ((x, d0), m1) in x.iter_mut().zip(&x0).zip(m1) {
-                    let d1 = (1.0 / r0) * (d0 - m1);
-                    *x = ratio * *x - (a_t * em1) * d0 - 0.5 * (a_t * em1) * d1;
+                    let d1 = c.inv_r0 * (d0 - m1);
+                    *x = c.ratio * *x - c.ae * d0 - 0.5 * c.ae * d1;
                 }
             }
             _ => {
                 for (x, d0) in x.iter_mut().zip(&x0) {
-                    *x = ratio * *x - (a_t * em1) * d0;
+                    *x = c.ratio * *x - c.ae * d0;
                 }
             }
         }
         self.prev = Some(x0);
         self.at += 1;
     }
+}
+
+/// One step's coefficients (Dpm::coef)
+#[derive(Clone, Copy, Debug)]
+pub struct Coef {
+    pub a_s: f32,
+    pub s_s: f32,
+    pub ratio: f32,
+    pub ae: f32,
+    pub inv_r0: f32,
+    pub second: bool,
 }
 
 #[cfg(test)]

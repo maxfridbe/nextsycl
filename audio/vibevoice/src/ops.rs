@@ -40,15 +40,16 @@ impl Ops {
     }
 
     /// out[m] (epi) x[m] . W^T + bias for m < M <= 20 rows of x `ldx` floats apart (a window of a longer signal, a
-    /// convolution's), out rows `ldo` apart; `gamma` the layer scale of Epi::Res
+    /// convolution's), out rows `ldo` apart; `gamma` the layer scale of Epi::Res and its rows' distance (0: one for
+    /// every row)
     #[allow(clippy::too_many_arguments)]
-    pub fn gemv_epi(&self, x: *const f32, m: usize, ldx: usize, w: &Mat, out: *mut f32, ldo: usize, epi: Epi, gamma: Option<&DevBuf>) -> Result<()> {
+    pub fn gemv_epi(&self, x: *const f32, m: usize, ldx: usize, w: &Mat, out: *mut f32, ldo: usize, epi: Epi, gamma: Option<(*const f32, usize)>) -> Result<()> {
         let bias = w.bias.as_ref().map_or(std::ptr::null(), |b| b.fp() as *const f32);
         let scales = w.scales.as_ref().map_or(std::ptr::null(), |s| s.ptr() as *const c_void);
-        let gamma = gamma.map_or(std::ptr::null(), |g| g.fp() as *const f32);
+        let (gamma, ldg) = gamma.unwrap_or((std::ptr::null(), 0));
         // SAFETY: the caller's buffers hold the sizes named.
-        ffi::check(unsafe { (self.k.gemv)(self.g(), x, m as i64, ldx as i64, w.k as i64, w.w.ptr(), w.wt as i32, scales, w.n as i64, bias, epi as i32, gamma, out,
-                                           ldo as i64) }, "gemv")
+        ffi::check(unsafe { (self.k.gemv)(self.g(), x, m as i64, ldx as i64, w.k as i64, w.w.ptr(), w.wt as i32, scales, w.n as i64, bias, epi as i32, gamma,
+                                           ldg as i64, out, ldo as i64) }, "gemv")
     }
 
     /// RMS norm of the rows of x [m, c] into out: x / rms * w (w None: 1); with `modulate` (scale, shift, their rows
@@ -84,6 +85,23 @@ impl Ops {
         // SAFETY: as rope_kv; part checked above.
         ffi::check(unsafe { (self.k.attn_dec)(self.g(), q, qs as i64, seqs.len() as i64, pos.ptr() as *const i32, a.0.ptr(), a.1.ptr(), a.2 as i64, b.0.ptr(),
                                               b.1.ptr(), b.2 as i64, hq as i64, hkv as i64, 128, pieces as i64, out, part.fp()) }, "attention")
+    }
+
+    /// out [s * b, h]: row i * b + j = silu(c0[j] + temb[i]) (every step's conditions)
+    pub fn silu_rows(&self, c0: *const f32, temb: *const f32, s: usize, b: usize, h: usize, out: *mut f32) -> Result<()> {
+        // SAFETY: c0 b * h floats, temb s * h, out s * b * h.
+        ffi::check(unsafe { (self.k.silu_rows)(self.g(), c0, temb, s as i64, b as i64, h as i64, out) }, "silu rows")
+    }
+
+    /// One DPM-Solver++ step on the device (vv.h's ns_audio_vv_dpm): `c` the step's coefficients (sched.rs)
+    #[allow(clippy::too_many_arguments)]
+    pub fn dpm(&self, v: *const f32, l: usize, cfg: f32, x: *mut f32, prev: *mut f32, c: &crate::sched::Coef, x_in: Option<(*mut f32, usize)>, lat: Option<*mut f32>,
+               un: Option<(*mut f32, f32, f32)>) -> Result<()> {
+        let (xi, ldin) = x_in.unwrap_or((std::ptr::null_mut(), 0));
+        let (u, scale, bias) = un.unwrap_or((std::ptr::null_mut(), 1.0, 0.0));
+        // SAFETY: v 2l floats, x / prev / lat / un l, x_in two rows of l, ldin apart.
+        ffi::check(unsafe { (self.k.dpm)(self.g(), v, l as i64, cfg, x, prev, c.a_s, c.s_s, c.ratio, c.ae, c.inv_r0, c.second as i32, xi, ldin as i64,
+                                         lat.unwrap_or(std::ptr::null_mut()), u, scale, bias) }, "dpm step")
     }
 
     /// out [m, c] = silu(gate) * up of x [m, 2c] holding interleaved (gate, up) pairs
