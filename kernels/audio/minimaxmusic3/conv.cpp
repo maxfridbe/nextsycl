@@ -2,7 +2,9 @@
 // Float32 signals [B, C, L] and weights as the checkpoint has them; oneDNN may compute in a narrower type
 // (NS_MM3_FPMATH: f16, bf16, tf32; the default strict: float32, exact and as fast here). Primitives are made
 // once a shape; each weight is reordered to oneDNN's preferred layout once (keyed by its pointer: the weights live as
-// long as the engine).
+// long as the engine). The primitives share one scratch buffer (oneDNN's user scratchpad: in its own mode each GPU
+// primitive keeps a scratchpad of its own, sized by the signal - gigabytes at 24 kHz - and a primitive is made for
+// every clip's length, so the card filled clip by clip); the shapes kept are bounded (MAX_PRIMS).
 #include "ns.h"
 #include "ns_internal.hpp"
 #include "mm3.h"
@@ -25,8 +27,11 @@ using tag = memory::format_tag;
 
 struct Prim {
     dnnl::primitive p;
-    memory::desc src, wei, dst;
+    memory::desc src, wei, dst, scratch;
 };
+
+// the most shapes kept: a clip's last chunk has a length of its own, each a dozen primitives
+constexpr size_t MAX_PRIMS = 256;
 
 struct Dnn {
     dnnl::engine eng;
@@ -35,6 +40,9 @@ struct Dnn {
     std::map<std::tuple<int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>, Prim> prims;
     // (weight pointer, primitive key's transposed / Ci / Co / K) -> the weight in the primitive's layout
     std::map<std::tuple<const void*, int, int64_t, int64_t, int64_t>, memory> weights;
+    // the scratchpad every primitive uses (one stream: one call at a time), grown to the largest asked
+    void* scratch = nullptr;
+    size_t scratch_cap = 0;
 };
 
 std::mutex mu;
@@ -76,19 +84,29 @@ int run(ns_gpu* g, bool tr, const float* x, int64_t B, int64_t Ci, int64_t L, co
         memory::desc bmd({Co}, memory::data_type::f32, tag::a);
         dnnl::primitive_attr attr;
         attr.set_fpmath_mode(fpmath());
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         Prim made;
         if (!tr) {
             auto pd = dnnl::convolution_forward::primitive_desc(d.eng, dnnl::prop_kind::forward_inference, dnnl::algorithm::convolution_direct, src, wany,
                                                                 bias ? bmd : memory::desc(), dst, {stride}, {dil - 1}, {pl}, {pr}, attr);
-            made = Prim{dnnl::convolution_forward(pd), pd.src_desc(), pd.weights_desc(), pd.dst_desc()};
+            made = Prim{dnnl::convolution_forward(pd), pd.src_desc(), pd.weights_desc(), pd.dst_desc(), pd.scratchpad_desc()};
         } else {
             auto pd = dnnl::deconvolution_forward::primitive_desc(d.eng, dnnl::prop_kind::forward_inference, dnnl::algorithm::deconvolution_direct, src,
                                                                   wany, bias ? bmd : memory::desc(), dst, {stride}, {pl}, {pr}, attr);
-            made = Prim{dnnl::deconvolution_forward(pd), pd.src_desc(), pd.weights_desc(), pd.dst_desc()};
+            made = Prim{dnnl::deconvolution_forward(pd), pd.src_desc(), pd.weights_desc(), pd.dst_desc(), pd.scratchpad_desc()};
         }
+        if (d.prims.size() >= MAX_PRIMS) d.prims.clear();
         it = d.prims.emplace(key, made).first;
     }
     Prim& p = it->second;
+    const size_t need = p.scratch.get_size();
+    if (need > d.scratch_cap) {
+        d.st.wait();                               // nothing queued may still use the old one
+        if (d.scratch) sycl::free(d.scratch, g->q);
+        d.scratch = sycl::malloc_device(need, g->q);
+        d.scratch_cap = d.scratch ? need : 0;
+        if (!d.scratch) return ns_fail("ns_audio_mm3_conv: the device refused a scratchpad of " + std::to_string(need >> 20) + " MiB");
+    }
     if (p.src != memory::desc({B, Ci, L}, memory::data_type::f32, tag::ncw) || p.dst != memory::desc({B, Co, Lo}, memory::data_type::f32, tag::ncw)) {
         return ns_fail("ns_audio_mm3_conv: oneDNN wants another layout for the signal");
     }
@@ -103,6 +121,7 @@ int run(ns_gpu* g, bool tr, const float* x, int64_t B, int64_t Ci, int64_t L, co
         wi = d.weights.insert_or_assign(wk, nw).first;
     }
     std::unordered_map<int, memory> args{{DNNL_ARG_SRC, mem(p.src, d.eng, x)}, {DNNL_ARG_WEIGHTS, wi->second}, {DNNL_ARG_DST, mem(p.dst, d.eng, out)}};
+    if (need) args.insert({DNNL_ARG_SCRATCHPAD, mem(p.scratch, d.eng, d.scratch)});
     if (bias) args.insert({DNNL_ARG_BIAS, mem(memory::desc({Co}, memory::data_type::f32, tag::a), d.eng, bias)});
     p.p.execute(d.st, args);
     return 0;

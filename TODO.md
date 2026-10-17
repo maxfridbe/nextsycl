@@ -422,12 +422,11 @@ profiling), README speed lines and cards' vram_gib, deploy.
 - [ ] The front door can't plan for GPU processes it doesn't manage (an agent's TRELLIS run goes 0 -> 23 GB in
       seconds): hold /tmp/ds2run.lock or keep tests off cards the front door uses.
 
-- [ ] Audio servers leak card memory per request (2026-10-16: Breeze TTS 2, ~0.3 GB a clip; ~77 clips filled a
-      32 GB card, then conv1d OUT_OF_RESOURCES and the next request hung in the prompt phase at 100% CPU). Guarded
-      now (a GPU error or +4 GiB over the loaded model ends the server after its answer; `stop` gives up on a
-      request stuck 120 s). Find the source with a loop of varied-length requests on a free card - suspects: the
-      shared nsd.cpp per-shape caches (gemm/lin/sdpa/attn maps keyed by rows, never trimmed; oneDNN library-mode
-      scratchpads), conv.cpp's prims/weights maps.
+- [x] Audio servers leaked card memory per request - fixed 2026-10-17: conv.cpp's oneDNN convolutions each kept
+      a library-mode scratchpad (sized by the signal: GBs at 24 kHz) and a primitive was made per clip length. Now one
+      shared user scratchpad + at most 256 shapes; a Breeze clip went from +6.3 GB to +0.5 GB, flat over clips. The
+      retire guard stays (it no longer fires). Still open: nsd.cpp's per-row caches (gemm/lin/sdpa) use library-mode
+      scratchpads too - matmuls need little, but a long-running image/video server could creep the same way.
 
 ## To try
 

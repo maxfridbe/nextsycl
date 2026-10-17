@@ -241,7 +241,13 @@ impl AudioServer {
             eprintln!("nextsycl audio: card memory {now} MiB, {was} MiB once loaded - ending so a fresh server takes the next request");
             self.retire.store(true, Ordering::Relaxed);
         }
-        if self.retire.load(Ordering::Relaxed) && self.waiting.load(Ordering::Relaxed) == 0 {
+        if !self.retire.load(Ordering::Relaxed) {
+            return;
+        }
+        // the engine held while ending: a request that got it after this one's answer is on the card (it retires
+        // the server after its own answer), and none starts while the runtime is torn down
+        let Ok(_engine) = self.engine.try_lock() else { return };
+        if self.waiting.load(Ordering::Relaxed) == 0 {
             std::process::exit(0);
         }
     }
