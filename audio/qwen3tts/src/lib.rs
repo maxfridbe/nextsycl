@@ -136,6 +136,12 @@ impl Qwen3Tts {
         let codec_f = codec::Weights::open(&codec)?;
         let codec = Codec::load(gpu, &codec_f)?;
         let encoder = if speaker.is_some() { Some(Encoder::load(gpu, &codec_f)?) } else { None };
+        // the decoder's two shortest chunk lengths made once now (their primitives), so a short answer (up to 8 s)
+        // does not wait for them
+        let tw = Instant::now();
+        codec.decode_bucketed(&nsd, &[vec![0; 16]])?;
+        codec.decode_bucketed(&nsd, &vec![vec![0; 16]; 60])?;
+        log(format!("{ARCH}: the codec's short chunks made ready in {:.1} s", tw.elapsed().as_secs_f64()));
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("{ARCH} ({}) on {} in {load_s:.0} s", conf.kind, gpu.name));
@@ -335,11 +341,11 @@ impl AudioEngine for Qwen3Tts {
             // recording's share of the samples cut off
             Voice::InContext { codes: rc, .. } => {
                 let all: Vec<Vec<i32>> = rc.iter().chain(&codes).cloned().collect();
-                let wav = self.codec.decode(&self.nsd, &all)?;
+                let wav = self.codec.decode_bucketed(&self.nsd, &all)?;
                 let cut = (rc.len() as f64 / all.len().max(1) as f64 * wav.len() as f64) as usize;
                 wav[cut.min(wav.len())..].to_vec()
             }
-            _ => self.codec.decode(&self.nsd, &codes)?,
+            _ => self.codec.decode_bucketed(&self.nsd, &codes)?,
         };
         progress(Step { phase: "decode", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
         if talker::profiling() {

@@ -24,6 +24,8 @@ pub const RATE: u32 = 24000;
 pub const HOP: usize = 1920;
 const CHUNK: usize = 300;
 const CONTEXT: usize = 25;
+/// `decode_bucketed`'s chunk lengths (the longest a chunk and its context)
+const BUCKETS: [usize; 5] = [50, 100, 175, 250, CHUNK + CONTEXT];
 const WINDOW: usize = 72;
 const HEADS: usize = 16;
 const HEAD: usize = 64;
@@ -278,6 +280,29 @@ impl Codec {
             let ctx = if s > CONTEXT { CONTEXT } else { s };
             let wav = self.run(ops, nsd, &frames[s - ctx..e])?;
             out.extend_from_slice(&wav[ctx * hop..]);
+            s = e;
+        }
+        Ok(out)
+    }
+
+    /// As `decode`, each chunk's frames padded at their end to one of a few lengths (`BUCKETS`, the last frame
+    /// repeated): the decoder is causal, so the padding changes none of the samples kept, and the convolutions'
+    /// oneDNN primitives - made once a shape, ~20 ms each, ~35 a shape - are made for those lengths only, once a
+    /// process, not for every clip's own length (0.7 s a request otherwise)
+    pub fn decode_bucketed(&self, nsd: &Nsd, frames: &[Vec<i32>]) -> Result<Vec<f32>> {
+        let ops = &self.ops;
+        let hop = self.hop();
+        let mut out = Vec::with_capacity(frames.len() * hop);
+        let mut s = 0;
+        while s < frames.len() {
+            let e = (s + CHUNK).min(frames.len());
+            let ctx = if s > CONTEXT { CONTEXT } else { s };
+            let n = e - (s - ctx);
+            let b = BUCKETS.iter().copied().find(|b| *b >= n).unwrap_or(n);
+            let mut part: Vec<Vec<i32>> = frames[s - ctx..e].to_vec();
+            part.resize(b, frames[e - 1].clone());
+            let wav = self.run(ops, nsd, &part)?;
+            out.extend_from_slice(&wav[ctx * hop..n * hop]);
             s = e;
         }
         Ok(out)

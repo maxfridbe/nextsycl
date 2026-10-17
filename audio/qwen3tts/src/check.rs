@@ -166,7 +166,12 @@ pub fn run(e: &Qwen3Tts, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String
     if stages.contains(&"codec") {
         let codes = codes_ref.ok_or_else(|| Error(format!("{}: no codes.npy", dir.display())))?;
         let t = Instant::now();
-        let mut got = e.codec.decode(&e.nsd, &codes)?;
+        let mut got = e.codec.decode_bucketed(&e.nsd, &codes)?;
+        let first = t.elapsed().as_secs_f64();
+        // again: the time with the decoder's primitives made (a server's every request after its first)
+        let t2 = Instant::now();
+        e.codec.decode_bucketed(&e.nsd, &codes)?;
+        let again = t2.elapsed().as_secs_f64();
         // an in-context clone's: the recording's share cut off, as the reference does
         if let Ok(Voice::InContext { codes: rc, .. }) = spec_of(dir).map(|s| s.voice) {
             if codes.starts_with(&rc) {
@@ -174,7 +179,7 @@ pub fn run(e: &Qwen3Tts, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String
                 got.drain(..cut);
             }
         }
-        log(format!("codec: {} frames to {:.2} s in {:.2} s", codes.len(), got.len() as f64 / crate::codec::RATE as f64, t.elapsed().as_secs_f64()));
+        log(format!("codec: {} frames to {:.2} s in {first:.2} s (again {again:.2} s)", codes.len(), got.len() as f64 / crate::codec::RATE as f64));
         let wav = match read_npy(&dir.join("speech.npy")) {
             Ok((_, v)) => v.into_iter().map(|x| x as f32).collect(),
             Err(_) => read_wav(&dir.join("speech.wav"))?,
