@@ -88,7 +88,7 @@ export function Speak() {
                 </div>
               : null}
             {state.voices.some((v) => v.name === f.voice)
-              ? <div class="row"><audio attrs={{ src: `/v1/audio/voices/${f.voice}.wav`, controls: true, preload: "none" }} /></div>
+              ? <div class="row"><audio attrs={{ src: `v1/audio/voices/${f.voice}.wav`, controls: true, preload: "none" }} /></div>
               : <div>
                   <div class="lab">the voice to clone <span class="hint">3-15 s of one person speaking clearly (WAV, MP3, FLAC, Ogg, M4A)</span></div>
                   <div class="row">

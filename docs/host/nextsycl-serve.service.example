@@ -12,7 +12,9 @@ User=you
 Environment=XDG_RUNTIME_DIR=/run/user/1000 HOME=/home/you NS_REGISTRY=/var/lib/nextsycl/models.json
 WorkingDirectory=/path/to/nextsycl
 # (through sh: SELinux on Fedora Atomic lets a service run binaries under home only that way)
-ExecStart=/bin/sh -c "exec /path/to/nextsycl/dist/nextsycl serve --port 8000"
+# --serve-host 127.0.0.1: the image, audio and 3D servers it starts check no token, so they listen on this machine
+# only and are reached through the front door - their pages under /open/<id>/
+ExecStart=/bin/sh -c "exec /path/to/nextsycl/dist/nextsycl serve --port 8000 --serve-host 127.0.0.1"
 # the servers it started are containers of their own: they stay up across a restart of this page
 KillMode=process
 Restart=always

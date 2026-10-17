@@ -64,6 +64,12 @@ audio/                     AUDIO
   breezetts2 nextsycl-audio-breezetts2  Breeze TTS 2: the T5Gemma2 text encoder, the Qwen3 backbone and depth decoder
                                  from CrispASR's GGUF, the prompts of its four templates, guidance, stage checks; the 12 Hz
                                  codec from nextsycl-codec12hz
+  vibevoice  nextsycl-audio-vibevoice  VibeVoice-1.5B: the Qwen2.5-1.5B language model, the diffusion head and its
+                                 DPM-Solver++, the σ-VAE acoustic encoder / decoder and semantic encoder (streaming), the
+                                 script's prompt of up to four voices, stage checks
+  s2pro      nextsycl-audio-s2pro  Fish Audio S2 Pro: the Dual-AR's slow (Qwen3, 36 layers) and fast (4 layers) models
+                                 from s2.cpp's GGUF, fish-speech's conversation prompt and speaker turns, Fish's RVQ codec
+                                 (decoder, encoder, quantizers), stage checks
   voxtraltts nextsycl-audio-voxtraltts  Voxtral 4B TTS: the Ministral backbone, the flow-matching acoustic transformer,
                                  the Voxtral codec decoder from CrispASR's GGUF, the preset voices' prompt, stage checks
   example    nextsycl-audio-example  a template
@@ -388,6 +394,31 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   Guidance (an instruction's design or direction) runs a second backbone over the prompt without the instruction; the
   depth decoder runs both branches as one batch of two. Draws on the host. Per-request options: `NS_BZ2_GREEDY`,
   `NS_BZ2_TEMPERATURE`, `NS_BZ2_TOP_K`.
+- **vibevoice** - VibeVoice-1.5B from gguf-org's GGUF (the language model Q8_0, the rest BF16; all expanded to half on
+  the host at load, the convolutions float32 for oneDNN; the token embedding stays on disk, of the tied output head only
+  the four tokens it may say are on the card) with the -hf checkpoint's tokenizer.json and config.json (the shapes and
+  constants the GGUF does not state). The language model (Qwen2.5-1.5B: q / k / v biases, 12 query heads over 2) runs
+  on the music engine's small-batch product and key / value store, Breeze's table RoPE and its own attention for six
+  query heads a key head (`kernels/audio/vibevoice/vv.cpp`, a copy of mm3's: rule 6); the prompt's wide products are
+  oneDNN's half GEMM. Guidance: a second, negative cache from an audio start alone, stepped only on audio frames (as
+  upstream). The diffusion head's two branches run as two rows of the small-batch product; DPM-Solver++ (2M,
+  v-prediction, cosine betas) steps on the host. The σ-VAE tokenizers stream a frame at a time over time rows: each
+  causal convolution carries its last inputs (`vv.cpp`'s depthwise convolution over rows with that context; the
+  channel-mixing ones transposed around mm3's oneDNN convolutions, a transposed one cut to its new outputs); the
+  ConvNeXt blocks' norms and MLPs on the shared kernels and the codec's layer-scaled residual. A voice's recording goes
+  through the acoustic encoder eight frames a piece. No settings of its own.
+- **s2pro** - Fish Audio S2 Pro from s2.cpp's GGUF (one file: the Dual-AR transformer as Q8_0 or F16, the codec as F16
+  with its weight norm folded) and the checkpoint's tokenizer.json. The matrices stay as the file has them: Q8_0 on the
+  card as int8 codes and half scales (split at load so a lane reads 8 aligned codes), F16 as half; the token and
+  codebook embeddings stay on disk (the rows a prompt or a frame needs read from the file). Its kernels
+  (`kernels/audio/s2pro`): the decode's product over Q8_0 for up to 8 rows, the Q8_0 matrix expanded to half for a
+  prompt's wide products (oneDNN's half GEMM), and fish-speech's RoPE on interleaved pairs from a table of bfloat16
+  cosines and sines (upstream keeps them so) with an optional per-head RMS norm. The slow and fast models' attention,
+  half cache and embeddings are the MiniMax Music engine's (32 query heads over 8); the codec runs in float32 on the
+  Qwen3-TTS codec's windowed attention, depthwise convolution and layer-scaled residuals, the MiniMax Music engine's
+  convolutions and the shared Snake / norms / linear layers; its quantizers on the host. Draws on the host (upstream's
+  top-p before the temperature, repetition-aware resampling of the first code). Per-request options: `NS_S2P_GREEDY`,
+  `NS_S2P_TEMPERATURE`, `NS_S2P_TOP_P`, `NS_S2P_TOP_K`.
 - **voxtraltts** - Voxtral 4B TTS 2603 from CrispASR's GGUF (q8_0 served, f16 for parity; F16 / Q8_0 / Q4_0 / Q4_K
   expanded to half at load; the Tekken vocabulary, the 20 preset voices and the codec in the file; the text embedding
   and the voices read from the file a row at a time). The backbone (Ministral 3B, adjacent-pair RoPE made rotate-half
@@ -396,7 +427,9 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   its 7-step Euler ODE on the GPU (mm3's guided step); the codec's ALiBi window attention, whole-row q / k norm, causal
   padding and the flow's input rows are its own (`kernels/audio/voxtraltts`), its convolutions mm3's oneDNN ones, its
   layer-scaled residuals Qwen3-TTS's. Decoded in 375-frame chunks. Per-request option: `NS_VXT_STEPS` (`--opt-steps`,
-  or a request's `steps`). No clone / design / instructions: the open weights have no audio encoder.
+  or a request's `steps`), `NS_VXT_ENROLLED` (a saved voice's fitted codes, set by the audio server for an enrolled
+  voice). No clone from a recording, design or instructions: the open weights have no audio encoder; saved voices are
+  enrolled by `nextsycl audio voice enroll` (PyTorch XPU, `reference/voxtraltts/enroll.py`: experimental).
 
 ## The 3D engines
 
@@ -457,7 +490,9 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
 
 `nextsycl models` (`glue/models`) keeps what a machine serves: an entry's id, kind, files, GPUs, contexts and engine
 settings, so an engine's settings are given once, at `models add --set`, and `nextsycl llm start <id>` applies them.
-The README's Models section has the commands.
+The README's Models section has the commands. Where an entry's files live is the registry's business too:
+`nextsycl_serve::drives` (the front door's Drives panel, `system.move`, `nextsycl models move`) copies a model's files
+to another drive, checks them, repoints the entry and removes the old files that no other entry names.
 
 ## What stays shared on purpose
 

@@ -84,6 +84,14 @@ pub const METHODS: &[Method] = &[
                        ("eta_s", "number", "about how long, in seconds: retry_after_s and the notice's end", false),
                        ("unload", "boolean", "true: unload the loaded models not answering now (frees the cards)", false)],
              example: r#"{"on": true, "message": "kernel work", "eta_s": 3600, "unload": true}"# },
+    Method { kind: "system", name: "drives", summary: "The drives the models are on: device, PCIe link, mount, size, free space, the models' bytes, the read speed as measured (and when); each model's bytes by drive, whether it streams its weights from the disk while it serves, and for each other drive what a move needs or why it cannot move now; the move under way (or the last)",
+             fields: &[], example: "{}" },
+    Method { kind: "system", name: "drive.measure", summary: "Measure a drive's read speed in the background (up to 4 GiB of its largest model files read with O_DIRECT, past the page cache; nothing written), kept with its date (system.drives). Refused while a model loads from it or a move uses it",
+             fields: &[("drive", "string", "the drive's id (nvme1n1) or its mount point (system.drives)", true)], example: r#"{"drive": "nvme1n1"}"# },
+    Method { kind: "system", name: "move", summary: "Move a model's files to another drive, as a job (its progress in system.drives' move): each file copied and read back (size, SHA-256), then the registry repointed, then the old files removed - those another model names stay. Refused while the model is loaded or loading (stop it first), another move runs, or the drive lacks the room (plus 1%, at least 4 GiB); nothing loads the model while it moves",
+             fields: &[MODEL, ("drive", "string", "the drive's id (nvme1n1) or its mount point (system.drives)", true)], example: r#"{"model": "olmocr-2-7b-q8", "drive": "nvme1n1"}"# },
+    Method { kind: "system", name: "move.cancel", summary: "Stop the move under way: what it copied is removed and the registry stays as it was (once the registry is repointed it finishes)",
+             fields: &[], example: "{}" },
 
     Method { kind: "llm", name: "chat", summary: "A chat completion (OpenAI's body; stream is ignored - use /v1/chat/completions to stream)",
              fields: &[("model", "string", "a chat model's id", true), ("messages", "object[]", "[{role, content}]", true),
@@ -161,13 +169,15 @@ pub const METHODS: &[Method] = &[
                        ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
                        QUEUE, PRIORITY, HELD, PROJECT, BATCH],
              example: r#"{"model": "minimax-music3", "instructions": "warm acoustic folk, 90 BPM, a soft male voice", "input": "[verse]\nRiver runs slow tonight\n[chorus]\nCarry me home", "seconds": 60}"# },
-    Method { kind: "audio", name: "speak", summary: "Speech from text (a speech model: Qwen3-TTS, VoxCPM2, Breeze TTS 2); the answer links the WAV. Checked when submitted (voice, language, continue_from, ref_audio: a 400 even with wait: false). Two run at once (one per card: system.busy.parallel), so a book can keep two chunks in flight with wait: false - but a chunk with continue_from needs the chunk before it finished",
-             fields: &[MODEL_OPT, ("input", "string", "the text to say (Breeze TTS 2: vocal events inline - English (laugh) (sigh) (cough) (clears throat), Chinese [笑] [叹气] [咳嗽] [清嗓子])", true),
+    Method { kind: "audio", name: "speak", summary: "Speech from text (a speech model: Qwen3-TTS, VoxCPM2, Breeze TTS 2, VibeVoice - a script of up to four speakers); the answer links the WAV. Checked when submitted (voice, language, continue_from, ref_audio: a 400 even with wait: false). Two run at once (one per card: system.busy.parallel), so a book can keep two chunks in flight with wait: false - but a chunk with continue_from needs the chunk before it finished",
+             fields: &[MODEL_OPT, ("input", "string", "the text to say (Breeze TTS 2: vocal events inline - English (laugh) (sigh) (cough) (clears throat), Chinese [笑] [叹气] [咳嗽] [清嗓子]; VibeVoice: a script, \"Speaker 1: ...\\nSpeaker 2: ...\", up to four speakers)", true),
                        ("voice", "string", "a built-in voice (qwen3-tts-custom: serena, vivian, uncle_fu, ryan, aiden, ono_anna, sohee, eric, dylan; audio.info lists them) or a saved one (audio.voices.list: spoken by a model that clones). Checked when submitted, the model loaded or not: an unknown name is a 400 at once (the message lists the voices)", false),
                        ("language", "string", "english, chinese, japanese ... or auto (default). Checked when submitted against the model's list (Qwen3-TTS: chinese, english, german, italian, portuguese, spanish, japanese, korean, french, russian); VoxCPM2 has no list and takes any", false),
                        ("instructions", "string", "how to say it (CustomVoice), or the voice to make up (VoiceDesign, Breeze TTS 2: write it in the language of the text); with a cloned voice (ref_audio or a saved voice) the direction of its tone, emotion, pace (Breeze TTS 2: voice direction - picked for you when model is not given)", false),
                        ("ref_audio", "string", "a recording of the voice to clone: WAV as base64 or a data: URL, or upload:<name> (audio.upload, any format it takes) - the Base model", false),
                        ("ref_text", "string", "what the recording says: the closer, in-context clone (Breeze TTS 2: required, the exact transcript)", false),
+                       ("voices", "string[]", "a multi-speaker script's saved voices (audio.voices.list), one a speaker in order: Speaker 1's first (VibeVoice: up to four; picked for you when model is not given). Not with voice / ref_audio", false),
+                       ("ref_audios", "string[]", "a multi-speaker script's recordings, one a speaker in order (WAV as base64, a data: URL, or upload:<name>); not with voices / voice / ref_audio", false),
                        ("continue_from", r#"{"type": "string", "maxLength": 200}"#, "carry on from speech made here (a book in chunks): the file name (or url) of the chunk before; its last sentences (up to 15 s, cut at a pause) are the in-context reference, after the saved voice's sample when voice names one - pace and voice go on, anchored to the voice. Needs a model that clones (picked for you when model is not given); a built-in voice name is dropped", false),
                        ("seconds", "number", "the most to make", false), ("seed", "integer", "", false),
                        ("cfg", "number", "guidance with instructions (Breeze TTS 2: 4 by default for design and direction; 1 turns it off)", false),
@@ -369,6 +379,7 @@ const FEATURES: &[&str] = &[
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
+    "system.drives", "system.move",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -548,8 +559,11 @@ impl Home {
         // a saved voice alone (no recording, no carry-on): a model it is enrolled for speaks it too
         let saved_only = !voice.is_empty() && s(b, "ref_audio").is_empty() && s(b, "continue_from").is_empty() && self.voices().get(&voice).is_some();
         let lib = self.voices();
+        let speakers = ["voices", "ref_audios"].iter().any(|k| b[*k].as_array().is_some_and(|a| !a.is_empty()));
         // a clone with an instruction: a model that directs a cloned voice (Breeze TTS 2)
-        let need = if cloned && !s(b, "instructions").is_empty() {
+        let need = if speakers {
+            "speakers"
+        } else if cloned && !s(b, "instructions").is_empty() {
             "direction"
         } else if cloned {
             "clone"
@@ -579,6 +593,7 @@ impl Home {
         loaded.into_iter().find(|l| can.contains(l)).or_else(|| can.first().cloned()).ok_or_else(|| {
             (409, match need {
                 "clone" => "no enabled speech model clones a voice (system.enable qwen3-tts-base)".to_string(),
+                "speakers" => "no enabled speech model speaks a script of several voices (system.enable vibevoice-1.5b)".to_string(),
                 "direction" => "no enabled speech model directs a cloned voice by instructions (system.enable breeze-tts-2)".to_string(),
                 "design" => "no enabled speech model designs a voice (system.enable qwen3-tts-design)".to_string(),
                 "voices" => "no enabled speech model has built-in voices (system.enable qwen3-tts-custom)".to_string(),
@@ -816,6 +831,13 @@ impl Home {
             ("system", "configSet") => self.config_set(b),
             ("system", "restart") => self.restart(&s(b, "service")),
             ("system", "maintenance") => self.maintenance_set(b),
+            ("system", "drives") => {
+                let cards = self.named_cards(&all);
+                Ok(self.drives_view(&all, &self.model_states(&all, &cards)))
+            }
+            ("system", "drive.measure") => self.drive_measure(&s(b, "drive")),
+            ("system", "move") => self.model_move(&model(), &s(b, "drive")),
+            ("system", "move.cancel") => self.move_cancel(),
             (k, "describePromptGuideMD") => {
                 let e = all.iter().find(|x| x["id"] == model().as_str()).ok_or_else(|| (404, format!("no model {}", model())))?;
                 if registry::kind_of(e) != k {
@@ -1144,7 +1166,7 @@ impl Home {
             "image.generate" => ("image", &[("image", false), ("init_image", false)]),
             "image.edit" => ("image", &[("images", true), ("image", false)]),
             "image.ocr" => ("image", &[("images", true)]),
-            "audio.speak" => ("audio", &[("ref_audio", false)]),
+            "audio.speak" => ("audio", &[("ref_audio", false), ("ref_audios", true)]),
             "audio.voices.add" => ("audio", &[("sample", false)]),
             "model3d.generate" => ("model3d", &[("image", false), ("images", true)]),
             "model3d.rig" | "model3d.tool" => ("model3d", &[("mesh", false)]),

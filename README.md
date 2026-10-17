@@ -80,9 +80,13 @@ on the B70. **Breeze TTS 2** (`audio/breezetts2`): English and Chinese speech - 
 cloned from a recording and its transcript, or cloned and directed by an instruction, vocal events inline ("(laugh)",
 "[笑]") - its T5Gemma2 text encoder, Qwen3 backbone and depth decoder from CrispASR's GGUF on the music engine's kernels
 and its own, the 12 Hz codec shared with Qwen3-TTS; checked against upstream's code; 1.8-2.2x real time on the B70.
+**VibeVoice** (`audio/vibevoice`): long-form speech of up to four speakers, each voice cloned from a recording without
+its transcript - its Qwen2.5-1.5B language model, diffusion head and streaming σ-VAE decoder and semantic encoder in
+SYCL from gguf-org's GGUF, checked stage by stage against transformers' implementation; 5.8x real time on the B70.
 **Voxtral TTS** (`audio/voxtraltts`): Mistral's Voxtral 4B TTS - nine languages in 20 preset voices - its Ministral 3B
 backbone, flow-matching acoustic transformer and Voxtral codec decoder from CrispASR's GGUF, checked against
-vllm-omni's code; 2.3x real time on the B70 (the open weights have no audio encoder: no cloning).
+vllm-omni's code; 2.3x real time on the B70 (the open weights have no audio encoder: no cloning from a recording;
+saved voices enrolled by fitting their codes on the GPU, experimental).
 
 A skill for porting to SYCL on Arc - the safety rules, migration traps, parity method, profiling and what made
 things fast, learned on these ports: [skills/sycl-porting/SKILL.md](skills/sycl-porting/SKILL.md).
@@ -168,8 +172,10 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `voxcpm2` | VoxCPM2 2B: speech in 30 languages at 48 kHz - plain, designed from a description, cloned (with a transcript: continued); MiniCPM4 language models, a local flow-matching DiT, AudioVAE V2 | `voxcpm2` | 4.6 GiB | checked, served |
 | `voxcpm2-int8` | the same files, the language models in int8 at load | `voxcpm2` | 4.6 GiB | checked, served |
 | `breeze-tts-2` | Breeze TTS 2 (~3B, Q8_0 GGUF): English and Chinese at 24 kHz - voices designed, cloned (recording + transcript) or directed (a clone + an instruction), vocal events; weights and outputs non-commercial (BreezeBlue license) | `breezetts2` | 3.4 GB + codec | checked |
+| `vibevoice-1.5b` | VibeVoice-1.5B (Q8_0 GGUF): long-form speech of up to four speakers in English and Chinese at 24 kHz, each voice cloned from a recording (no transcript); MIT, with Microsoft's responsible-use terms | `vibevoice` | 3.9 GiB | checked |
 | `breeze-tts-2-q4` | the same model from the Q4_K GGUF (a 2.2 GB download; the same memory on the card; the 4-bit text encoder is 1e-1 from upstream - a word can slip) | `breezetts2` | 2.2 GB + codec | checked |
-| `voxtral-4b-tts` | Voxtral 4B TTS 2603 (Mistral, Q8_0 GGUF): nine languages at 24 kHz in 20 preset voices; no cloning, design or instructions (the open weights have no audio encoder); weights, voices and outputs non-commercial (CC BY-NC 4.0) | `voxtraltts` | 4.3 GB | checked |
+| `s2-pro` | Fish Audio S2 Pro (~4.6B Dual-AR, Q8_0 GGUF with its codec): ~80 languages at 44.1 kHz - voices cloned (recording + transcript), free-form inline tags (`[whisper]`, `[laughing]` ...; `instructions` become one), several speakers in one text; no voice design; weights and outputs non-commercial (Fish Audio Research License) | `s2pro` | 5.6 GB | checked |
+| `voxtral-4b-tts` | Voxtral 4B TTS 2603 (Mistral, Q8_0 GGUF): nine languages at 24 kHz in 20 preset voices; no cloning from a recording, design or instructions (the open weights have no audio encoder); saved voices enrolled for it (experimental); weights, voices and outputs non-commercial (CC BY-NC 4.0) | `voxtraltts` | 4.3 GB | checked |
 
 **3D** (`nextsycl model3d`: rigging and animation of a mesh; the result keeps the input mesh, its UVs and textures)
 
@@ -362,6 +368,61 @@ added or disabled shows at once. With `NS_STUDIO_MODES` set to a mode file (one 
 leaves the others alone. `nextsycl llm start <id>` mounts the entry's files at the same paths in the container, so an
 entry can point anywhere on the machine.
 
+### Drives: where the files are, and moving them
+
+The front door's **Drives** panel (and `system.drives`, `nextsycl drives`) lists every drive a registered model's files
+sit on, plus the models folders set (`NS_MODELS`, `NS_MODEL_DIRS`): each filesystem once, with its device and PCIe
+link (sysfs), mount, size, free space, the models' bytes on it, and its read speed once measured. **measure**
+(`system.drive.measure`, `nextsycl drives measure <drive>`) reads up to 4 GiB of the drive's largest model files with
+O_DIRECT - past the page cache, nothing written - with 4 reads of 16 MiB in flight, and keeps the result with its date
+in `serve.json`; it is refused while a model loads from that drive or a move uses it.
+
+Each model row shows where its files are and a **→ drive** button for every other drive; `system.move {model,
+drive}` and `nextsycl models move <id> --to <drive | mount>` do the same (the command hands the move to the front door
+when it is up, else runs it itself; Ctrl-C or `--cancel` stops it). A move:
+
+1. is refused while the model is loaded, loading or held by the video daemon (stop or disable it first), while
+   another move runs (one at a time: `moving.json` beside the registry), while any process has one of its files open
+   or mapped, or when the drive lacks the room: the bytes to write plus 1% of the drive (at least 4 GiB) kept free;
+2. copies each file - its file and the shards beside it, its files by role, settings that are paths (a folder with
+   what is in it) - reading past the page cache and dropping the written pages as it goes (a model's worth of cache
+   would push out what the loaded models use), then reads the copy back with O_DIRECT: the same size and SHA-256 or
+   the copy is removed and the move fails. A second name of the same file (a hard link) is linked again there;
+3. repoints the registry entry in one write (its `file`, `files` and path settings; `path:scale` and lists kept), so the
+   next start mounts the new paths;
+4. removes the old files - except those another registered model still names (those stay, and that model with them:
+   the panel's result lists what was kept and why) - and the folders that emptied.
+
+A cancel or a failure before step 3 removes what the move wrote; the registry stays as it was. Meanwhile nothing
+loads the model: the front door's enable and load refuse, a job waits for the move as it waits for room, and
+`nextsycl <kind> start` refuses.
+
+**Where files go.** A drive's models folder is a folder set on it (`NS_MODELS`, `NS_MODEL_DIRS`), else
+`<mount>/nextsycl-models`. A file below a models folder keeps its path below it (`~/models/olmocr2/x.gguf` ->
+`/var/mnt/2TBSSD/nextsycl-models/olmocr2/x.gguf`, and a move back lands where it was); a file anywhere else keeps its
+layout below its model's folder - the nearest folder its files share, under its own name
+(`/var/mnt/2TBSSD/minimaxmusic3/models/minimax-music3/vocoder/...` -> `~/models/minimax-music3/vocoder/...`). A file
+already at the target with the same bytes (a move that did not finish, or another model's copy) is used, not copied;
+one with other bytes stops the move.
+
+**Streaming models.** A model whose card says `streams: true` reads weights from its files while it serves
+(deepseek-r1-iq1s and V4-Flash read experts from the file tier, the Qwen3.8-Flash-Next family its PLE rows every
+window): its drive's speed is its speed, so the page asks before moving one to a slower drive (measured, else by
+link), and the command wants `--yes`. Load-once models lose only load seconds on a slower drive.
+
+```
+$ nextsycl drives
+DRIVE       DEVICE                     LINK          MOUNT                  SIZE     FREE    MODELS  READ
+nvme0n1p3   SKHynix_HFS001TEJ9X162N    PCIe 4.0 x4   /var/home              951G      27G      596G  7.2 GB/s (2026-10-17)
+            37 models: glm-5.3-flash-uncensored ... deepseek-r1-iq1s ... breeze-tts-2
+nvme1n1     PCIe SSD                   PCIe 3.0 x4   /var/mnt/2TBSSD       1877G     344G      287G  1.7 GB/s (2026-10-17)
+            20 models: qwen3.8-flash-next-coder-iq1_m ... qwen3.8-27b-q4-256k breeze-tts-2
+```
+
+(hardac1: the P41 measures 7.2 GB/s with 4 reads in flight - a single `dd` reads 6.3 -, the DRAM-less Phison 1.7.)
+
+![the Drives panel during a move](docs/screenshots/home-drives.webp)
+
 ## Host services
 
 Three small services sit beside the model servers, all in the program (no Python on the serving path):
@@ -378,6 +439,10 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     seen while they ran, else an estimate from their files; chat models and video engines count once a card - one
     runs at a time - and an overbooked card is flagged: whichever loads first holds it). Every registered model by
     kind: enable it on its GPU(s), start it now (the button spins until it answers), stop it, disable it, its page.
+  - **Model pages** through the door: an image, audio or 3D model's own page is `/open/<id>/` (the model starts if it
+    is not up; every request under it, the page's API calls too, is passed to its server as `/<rest>`). Those servers
+    check no token, so run the door with `--serve-host 127.0.0.1` (the example unit does): they listen on this
+    machine only and another machine reaches them here. The video studio and the chat page are sent to by redirect.
   - **Enabled** models load on their first request - an API call, their page, Open WebUI through the switcher - and
     unload after `NS_IDLE_MINUTES` (10) without one (the image and music servers exit, `--idle-exit`; the switcher
     sets the chat mode to none; the video daemon's workers let their card go), staying enabled. A load waits for its
@@ -886,6 +951,100 @@ nextsycl audio check <reference dump dir> --model breeze-tts-2 [--stages prompt,
   alone, 0.65x for the pair: the driver time-slices them). Several clips in one engine instead (batched decode, ~3-4x
   estimated) is a proposal for review: `docs/proposals/speech-batching.md`.
 
+### VibeVoice
+
+VibeVoice-1.5B (`audio/vibevoice`, Microsoft; gguf-org's GGUF of it): long-form, multi-speaker speech in English and
+Chinese at 24 kHz. A script of up to four speakers (`Speaker 1: ...`, a turn a line) is read by a Qwen2.5-1.5B
+language model; for each 7.5 Hz frame a diffusion head draws a 64-value acoustic latent (10 DPM-Solver++ steps, guided
+by a second, negative run of the language model: `--cfg`, 1.3), the σ-VAE acoustic decoder turns it into 3,200
+samples, and the semantic encoder reads them back for the next step. Each speaker's voice is cloned from a recording
+(no transcript needed: `--ref-audio` once a speaker in order, or saved voices `--voices NAME,NAME`); a speaker without
+one gets a voice of the model's own. The model ends the speech itself (up to 90 minutes). **License: MIT; Microsoft's
+model card restricts its use - no imitation of a real person's voice without their consent, no passing its speech off
+as real, disclose that the audio is AI-generated.**
+
+```sh
+nextsycl models pull vibevoice-1.5b
+nextsycl audio gen "Speaker 1: Welcome back to the show.\nSpeaker 2: Thanks for having me." --model vibevoice-1.5b \
+                   --ref-audio host.wav --ref-audio guest.wav [--cfg 1.3] [--steps 10] [--seed N]
+nextsycl audio gen "Good morning. The bread is still warm." --model vibevoice-1.5b [--voice SAVED]
+nextsycl audio check <reference dump dir> --model vibevoice-1.5b [--stages prompt,lm,head,codec,run]
+```
+
+The audio server and the front door take a script's voices as `voices` (saved voices) or `ref_audios` (recordings), a
+speaker each in order; `audio.speak` picks a model of several speakers (card `speech: speakers`) for them.
+
+- **Ported**: the GGUF's tensors expanded to half at load (the language model Q8_0, the rest BF16: exact in half; the
+  convolutions float32 for oneDNN; the token embedding read from the file a row a token, the tied head's four tokens on
+  the card); the tokenizer and config.json from the -hf checkpoint. The language model on the music engine's product
+  and cache, Breeze's RoPE and this engine's attention for six query heads a key head (`kernels/audio/vibevoice`), its
+  two guidance branches in one paired pass a step; the head's branches as two rows, DPM-Solver++ on the host; the
+  tokenizers streaming a frame at a time over time rows, each causal convolution carrying its last inputs (this
+  engine's depthwise convolution, mm3's oneDNN convolutions transposed around).
+- **Checked** against transformers' implementation (`reference/vibevoice/ref.py`, float32 on the CPU; its loop
+  bit-identical to `generate`'s frames): token ids identical; with the f16 GGUF the language model's logits 4e-4 and
+  hidden states 2e-3 / 5e-4 teacher forced (51 of 51 tokens agree), with the served Q8_0 2e-3 and 1.4-2e-2 (its
+  quantization); the diffusion head 4e-7, the acoustic decoder 2e-4, the semantic encoder 7-10e-4, the voice encoder
+  3e-4 / 1e-3; Chinese token ids identical, and a run that splits into two audio segments (the negative branch's
+  restart, the streams' reset) as close. Clips plain, cloned, two-speaker and a 46 s show transcribe word for word
+  (Whisper small); the speakers alternate as cast (pitch). `docs/ports/vibevoice.md` has the details.
+- **Speed** (2026-10-17): 43.5 frames a second on the B70 (5.8x real time: 46.5 s of a two-speaker show in 8.8 s with
+  the prompt), 38.9 on the B65 (5.2x). 4.9 GiB of weights, 5.6 GiB in a run.
+
+### S2 Pro
+
+Fish Audio S2 Pro (`audio/s2pro`, ~4.6B; s2.cpp's GGUF of it, the codec in the same file): speech in about 80
+languages at 44.1 kHz (best in English, Chinese and Japanese). A Dual-AR model: a 36-layer Qwen3 slow model draws each
+frame's semantic code, a 4-layer fast model the other nine of Fish's RVQ codec (21.5 frames a second). What it really
+does:
+
+- **clone** (`--ref-audio` + `--ref-text`, the exact transcript; or a saved voice with one): yes. Without the
+  transcript it does not clone (upstream drops the recording).
+- **direction**: yes, by S2 Pro's own mechanism - free-form tags in square brackets anywhere in the text (`[whisper]`,
+  `[laughing]`, `[excited tone]`, `[pause]`, `[pitch up]` ...; 15,000+ in training). `--instructions` becomes such a
+  tag at the start of the text (and of each speaker turn).
+- **vocal events**: yes, as tags (`[laughing]`, `[sigh]`, `[inhale]`, `[clearing throat]`, `[chuckle]`, `[panting]` ...).
+- **several speakers**: yes, `<|speaker:0|>`, `<|speaker:1|>` turns in one text, read in batches that carry the
+  conversation on.
+- **design**: no (no description input, no built-in voices). Without a recording the voice is the model's pick for
+  the text, and it changes with the seed.
+
+**License: the weights and their outputs are research and non-commercial only** (Fish Audio Research License;
+commercial use needs Fish Audio's written license).
+
+```sh
+nextsycl models pull s2-pro
+nextsycl audio gen "Hello! [laughing] Isn't that something?" --model s2-pro [--seed N]
+nextsycl audio gen "I have a secret to tell you." --model s2-pro --ref-audio r.wav --ref-text "..." [--instructions "whisper"]
+nextsycl audio gen "<|speaker:0|>Did you hear that? <|speaker:1|>[whisper] Hear what?" --model s2-pro
+                   [--opt-temperature 0.7] [--opt-top-p 0.7] [--opt-top-k 30] [--opt-greedy 1]
+nextsycl audio check <reference dump dir> --model s2-pro [--stages prompt,frames,codec]
+```
+
+- **Ported**: the GGUF's matrices kept as Q8_0 on the card (int8 codes and half scales), read by this engine's own
+  decode product (`kernels/audio/s2pro`). A prompt's wide products expand them to float32 for oneDNN's GEMM - half
+  overflows on some prompts' activations.
+  - The embeddings stay in the file (a row a token; a frame's 11 rows summed).
+  - fish-speech's RoPE on interleaved pairs with its bfloat16 table.
+  - The attention, cache and embeddings on the music engine's kernels.
+  - Fish's codec (decoder, encoder, quantizers) in float32 on the Qwen3-TTS codec's and the shared kernels.
+  - fish-speech's conversation prompt, speaker batches, inline-tag instructions, and its draws (top-p before the
+    temperature, repetition-aware resampling).
+- **Checked** against fish-speech's own code (`reference/s2pro/ref.py`, float32 on the CPU, greedy; plain, clone,
+  Chinese, a 170-token paragraph):
+  - prompts identical; the recording's codes 2,137 of 2,140 (every semantic code)
+  - with the F16 file, the slow logits 1.1-1.3e-4 and the fast logits 0.4-1.3e-4, teacher forced; greedy frames
+    identical (40 / 40, 30 / 30) up to a near tie
+  - with the served Q8_0 file, 6e-3 and 1-5e-3 (its quantization)
+  - the codec 7e-7 .. 2e-6 against the reference with the GGUF's half weights (5-8e-4 against codec.pth's float32)
+  - real clips in every mode, English, Chinese, Japanese, a dialogue, transcribe word for word (Whisper small)
+  - details: [docs/ports/s2pro.md](docs/ports/s2pro.md)
+- **Speed** (B70, 2026-10-17): 42 frames a second (2.0x real time for the frames); a 42.8 s paragraph in 24.4 s with
+  the decode (1.75x). 5.6 GiB on the card loaded, 6.5 GiB at a long clip's peak.
+- **Served** like the other speech models: `nextsycl audio serve s2-pro` (`/v1/audio/speech`: `input`, `ref_audio` +
+  `ref_text` or a saved `voice` with its transcript, `instructions` as a tag, `seconds`, `seed`, `options`) and
+  `:8000`'s `audio.speak`.
+
 ### Voxtral TTS
 
 Voxtral 4B TTS 2603 (`audio/voxtraltts`, Mistral; CrispASR's GGUF of it): speech at 24 kHz in English, French,
@@ -896,8 +1055,12 @@ state per 12.5 Hz frame; a 3-layer flow-matching transformer turns it into the f
 levels (7 guided Euler steps, `--cfg` 1.2); the Voxtral codec's decoder makes 240 samples a frame. `--language` alone
 picks that language's voice. **What it does not do**: the open checkpoint ships the codec's decoder but not its encoder
 (no `audio_tokenizer.encoder_blocks` / `input_proj` tensors; vllm-omni refuses `ref_audio` for it), and its prompt has
-no instruction - so **no cloning** (saved voices go to models that clone), **no voice design or direction, no vocal
-events**. **License: CC BY-NC 4.0** - the weights, the preset voices and the speech they make are non-commercial.
+no instruction - so **no cloning from a recording, no voice design or direction, no vocal events**. **Experimental:**
+a saved voice can be **enrolled** (`nextsycl audio voice enroll NAME`: its codes fitted through the released decoder
+with PyTorch XPU, ~1-2 minutes a voice on a B65) and is then spoken as `--voice NAME`; it measured closer to the
+speaker than the nearest preset for all four voices tried, a little below Breeze's and VoxCPM2's clones
+(`docs/ports/voxtraltts.md`). **License: CC BY-NC 4.0** - the weights, the preset voices and the speech they make are
+non-commercial.
 
 ```sh
 nextsycl models pull voxtral-4b-tts
@@ -905,6 +1068,8 @@ nextsycl audio gen "The quick brown fox jumps over the lazy dog." --model voxtra
 nextsycl audio gen "Le soleil se couchait lentement sur la mer." --model voxtral-4b-tts --language french \
                    [--cfg 1.2] [--steps 7] [--seed N]
 nextsycl audio check <reference dump dir> --dir <f16 GGUF dir> [--stages prompt,frames,flow,codec]
+nextsycl audio voice enroll NAME [--gpu N]          # experimental; NS_VXT_CHECKPOINT / NS_VXT_VLLM_OMNI / NS_VXT_TORCH
+nextsycl audio gen "..." --model voxtral-4b-tts --voice NAME
 ```
 
 - **Ported**: the GGUF's matrices expanded to half at load (q and k rows reordered so the rotate-half RoPE kernel

@@ -6,6 +6,7 @@ arch: qwen4exp
 title: Qwen3.8-Flash-Next Coder IQ1_M (coding; the B70, 128K + 32K)
 about: 'ISTA-DASLab''s coding version: half the experts, kept for code and tools'
 gpus: '0'
+streams: true                   # its PLE rows read from the file every window while it serves: keep it on the fastest drive
 ctx: 131072,32768
 tools: true
 tasks: true

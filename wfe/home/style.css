@@ -83,3 +83,10 @@
  button.btn.small{padding:2px 8px;font-size:12px} .btn.maint{margin-left:auto} .btn.maint.on{background:#f59e0b;color:#111;border-color:#f59e0b}
  .maintbar{background:#3b2a0a;border:1px solid #f59e0b;color:#fcd34d;padding:8px 12px;border-radius:8px;margin:8px 0;font-size:13px}
  .maintbar code{color:#fde68a}
+ .drow{display:grid;grid-template-columns:18px minmax(160px,1fr) minmax(180px,280px) auto;gap:6px 12px;align-items:center;padding:8px 0;border-top:1px solid #222733}
+ .drow:first-child{border-top:0} .drow .name{font-weight:600;font-size:14px} .drow .sub{color:#6b7280;font-size:12px;overflow-wrap:anywhere} .dspace{min-width:0} .dspace .kv{margin:2px 0 0}
+ .mrow .disk{grid-column:2 / -1;display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center;font-size:12px;margin-top:-2px}
+ .disk .tag{margin-left:6px;font-size:10px;background:#3b2a0a;color:#fcd34d} button.slower{border-color:#b45309}
+ .movebar{background:#0f1a2a;border:1px solid #1e3a8a;border-radius:8px;padding:8px 10px;margin:0 0 8px;font-size:13px} .movebar.bad{background:#2a0f0f;border-color:#7f1d1d}
+ .mvhead{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap} .mvfile{font-size:11px;overflow-wrap:anywhere;margin-top:2px}
+ @media (max-width:640px){ .drow{grid-template-columns:18px 1fr} .drow .dspace,.drow .acts{grid-column:1 / -1} .drow .acts{justify-content:flex-start} .mrow .disk{grid-column:1 / -1} }

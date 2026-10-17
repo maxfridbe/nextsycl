@@ -17,7 +17,9 @@
 //! What the open release does not do: the checkpoint has the codec's decoder only - no encoder - so no voice is cloned
 //! from a recording (vllm-omni refuses ref_audio for it: "The open-source variant only supports preset voices"); its
 //! prompt has no instruction, so no voice is designed or directed, and no vocal events are read. A request's style is
-//! its preset voice (casual, cheerful, neutral; a language's own speakers) and the guidance.
+//! its preset voice (casual, cheerful, neutral; a language's own speakers) and the guidance. Experimental: a saved
+//! voice's codes fitted through the decoder (reference/voxtraltts/enroll.py; `nextsycl audio voice enroll`), handed in
+//! as the `enrolled` option, are its prompt instead of a preset's rows - docs/ports/voxtraltts.md has the gate.
 //!
 //! License: the weights, the voices and what they make are CC BY-NC 4.0 (non-commercial).
 
@@ -383,6 +385,7 @@ impl AudioEngine for VoxtralTts {
             events: Vec::new(),
             requires: None,
             enrolled: true,
+            speakers: 1,
         })
     }
     fn options(&self) -> &'static [EngineOption] {

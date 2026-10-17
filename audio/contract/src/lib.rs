@@ -33,8 +33,11 @@ pub struct AudioRequest {
     pub language: Option<String>,
     /// speech: how to say it, or the voice to make up (a designed voice)
     pub instructions: Option<String>,
-    /// speech: a recording whose voice to speak in (a clone)
+    /// speech: a recording whose voice to speak in (a clone; a multi-speaker script's first speaker)
     pub reference: Option<Reference>,
+    /// speech, a multi-speaker script (an engine whose `Speech::speakers` is above 1): the other speakers' recordings,
+    /// the second speaker's first
+    pub references: Vec<Reference>,
 }
 
 /// A recording to clone a voice from: mono samples, their rate, and what is said in it (a transcript makes a
@@ -73,6 +76,9 @@ pub struct Speech {
     /// `<voice>/enrolled/<arch>.npy`, handed in as the request's `enrolled` option) - a model without an encoder
     /// (Voxtral TTS: experimental)
     pub enrolled: bool,
+    /// the speakers a script may have, each its own voice ("Speaker 1: ...\nSpeaker 2: ..."; `reference` and
+    /// `references` their recordings); 0 or 1: one voice
+    pub speakers: usize,
 }
 
 /// The engine's own defaults, shown by `engines` and used for the request's `None` fields

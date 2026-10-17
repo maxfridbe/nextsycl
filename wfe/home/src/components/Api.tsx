@@ -32,7 +32,7 @@ export function Api() {
       (groups[tag] ??= []).push({ path, method, op });
     }
   }
-  const order = ["system", "llm", "image", "audio", "video", "openai"];
+  const order = ["system", "llm", "image", "audio", "video", "model3d", "openai"];
   return (
     <div>
       <section class="panel">

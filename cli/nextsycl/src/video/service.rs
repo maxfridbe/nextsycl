@@ -97,6 +97,10 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     for o in &others {
         entries.push(super::model(cfg, Some(o))?.0);
     }
+    // not while one's files move to another drive (nextsycl models move)
+    for e in &entries {
+        crate::drives::not_moving(cfg, e["id"].as_str().unwrap_or(""))?;
+    }
     // the --opt-NAMEs the engine takes at load: checked here, passed as the variables they set
     let (_, opts) = super::kind_and_options(&m)?;
 

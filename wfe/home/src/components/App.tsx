@@ -5,19 +5,21 @@ import { act, copy, maintenance, render, setTab, ui } from "../main.js";
 import type { Card, Model, Proc, Service } from "../types.js";
 import { Api } from "./Api.js";
 import { ConfigView } from "./Config.js";
+import { DrivesPanel, ModelDisk } from "./Drives.js";
 
 const gib = (mb: number) => (mb / 1024).toFixed(1);
 const short = (n: string) => n.replace("Intel(R) Arc(TM) ", "").replace(" Graphics", "");
 /** a link to a service on this box, as the browser reaches it */
 const at = (port: number, path = "/") => `${location.protocol}//${location.hostname}:${port}${path}`;
 
-const COLORS: Record<string, string> = { llm: "#06b6d4", image: "#f59e0b", video: "#ec4899", audio: "#8b5cf6" };
+const COLORS: Record<string, string> = { llm: "#06b6d4", image: "#f59e0b", video: "#ec4899", audio: "#8b5cf6", model3d: "#22c55e" };
 const color = (k?: string) => COLORS[k ?? ""] ?? "#64748b";
 const KINDS: { kind: Model["kind"]; title: string; icon: string }[] = [
   { kind: "llm", title: "Chat", icon: "&#xf086;" },
   { kind: "image", title: "Images", icon: "&#xf03e;" },
   { kind: "audio", title: "Audio", icon: "&#xf001;" },
   { kind: "video", title: "Video", icon: "&#xf03d;" },
+  { kind: "model3d", title: "3D", icon: "&#xf1b2;" },
 ];
 
 /** A vouched figure: the weights, then the headroom - the working memory it needs to run without erroring (KV for its
@@ -189,7 +191,7 @@ function ModelRow(m: Model) {
                 : btn("load", m.state === "loading" ? "starting" : "start", "", "load now (otherwise its first request does); the button spins until it answers"),
               // its own page, loaded or not: an image or audio model's is its server's, so the front door starts the model
               // first (/open/ID) and sends the browser on
-              <a class="btn" attrs={{ href: m.kind === "image" || m.kind === "audio" ? `/open/${encodeURIComponent(m.id)}` : page, target: "_blank",
+              <a class="btn" attrs={{ href: m.kind === "image" || m.kind === "audio" || m.kind === "model3d" ? `/open/${encodeURIComponent(m.id)}` : page, target: "_blank",
                 title: m.kind === "llm" ? "Open WebUI" : m.kind === "video" ? "the video studio"
                   : loaded ? "its page" : "its page: the model starts first (a minute), then the page opens" }}>
                 <span class="i" props={{ innerHTML: "&#xf08e;" }} /> page
@@ -197,6 +199,7 @@ function ModelRow(m: Model) {
             ]
           : null}
       </div>
+      {ModelDisk(m)}
     </div>
   );
 }
@@ -268,6 +271,7 @@ function Status() {
           <span class="hint">in use, by process · below it, hatched: what the enabled models are vouched for - each model's weights, then its headroom (the stripes the other way)</span></div>
         <div class="pbody"><div class="cards">{(st?.cards ?? []).map(CardView)}</div></div>
       </section>
+      <DrivesPanel />
       <Models />
       <section class="panel">
         <div class="phead"><span class="i" props={{ innerHTML: "&#xf233;" }} /><span class="ptitle">Front ends</span></div>

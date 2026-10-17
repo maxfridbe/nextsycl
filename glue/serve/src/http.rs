@@ -164,6 +164,29 @@ pub fn forward(mut client: impl Write, upstream: &Target, req: &Request) -> Resu
     Ok(())
 }
 
+/// `forward` to another path: the request line names `target` (a path and its query) instead of the one received, the
+/// client's Connection header gives way to `Connection: close`, every other header and the body pass unchanged, and
+/// the answer is copied back as it arrives (streamed answers included) until upstream closes
+pub fn forward_to(mut client: impl Write, upstream: &Target, req: &Request, target: &str) -> Result<(), String> {
+    let head = String::from_utf8_lossy(&req.head);
+    let mut lines = head.split("\r\n").filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or("");
+    let version = first.rsplit(' ').next().filter(|v| v.starts_with("HTTP/")).unwrap_or("HTTP/1.1");
+    let mut out = format!("{} {target} {version}\r\n", req.method);
+    for l in lines {
+        if l.split(':').next().unwrap_or("").trim().eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        out.push_str(l);
+        out.push_str("\r\n");
+    }
+    out.push_str("Connection: close\r\n\r\n");
+    let mut up = Conn::connect(upstream).map_err(|e| format!("{upstream} does not answer ({e})"))?;
+    up.write_all(out.as_bytes()).and_then(|_| up.write_all(&req.body)).and_then(|_| up.flush()).map_err(|e| e.to_string())?;
+    std::io::copy(&mut up, &mut client).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// `forward` with another body: the request's head with its Content-Length set to `body`'s and the connection to
 /// close (the answer is then copied back as it arrives - streamed answers included - until upstream closes)
 pub fn forward_body(mut client: impl Write, upstream: &Target, req: &Request, body: &[u8]) -> Result<(), String> {
@@ -415,5 +438,28 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert_eq!((p[0].name.as_str(), p[0].data.as_slice()), ("prompt", b"make it red".as_slice()));
         assert_eq!((p[1].name.as_str(), p[1].filename.as_deref(), p[1].data.as_slice()), ("image[]", Some("a.png"), b"\x89PNG".as_slice()));
+    }
+
+    #[test]
+    fn forward_to_names_the_new_path_and_passes_the_rest() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let up = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let got = read_request(&mut c).unwrap();
+            c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap();
+            got
+        });
+        let raw = b"POST /open/m/v1/x?a=1 HTTP/1.1\r\nHost: box:8000\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello";
+        let req = read_request(&raw[..]).unwrap();
+        let mut answer = Vec::new();
+        forward_to(&mut answer, &Target::Tcp(addr), &req, "/v1/x?a=1").unwrap();
+        let got = up.join().unwrap();
+        assert_eq!((got.method.as_str(), got.target.as_str()), ("POST", "/v1/x?a=1"));
+        assert_eq!(got.host.as_deref(), Some("box:8000"));
+        assert_eq!(got.body, b"hello");
+        let head = String::from_utf8_lossy(&got.head).to_ascii_lowercase();
+        assert!(head.contains("connection: close") && !head.contains("keep-alive"), "{head}");
+        assert!(answer.ends_with(b"\r\n\r\nok"), "{}", String::from_utf8_lossy(&answer));
     }
 }

@@ -4,6 +4,9 @@
 //!   for (hatched; several may vouch for one card: whichever loads first holds it) - and every registered model:
 //!   enable it on GPU(s), start (load now: the button spins until it answers) and stop (unload), its page, its state;
 //!   an API tab with the bearer token and a curl for every method; maintenance mode on and off (maint.rs).
+//! - **The drives** (disks.rs, crate::drives): each drive the models are on - device, link, free space, a read speed
+//!   measured on demand - and moving a model's files to another one (copied, checked, the registry repointed, the old
+//!   files removed), one move at a time, never while the model is loaded.
 //! - **Enabled models** load on their first request (an API call here, its page, Open WebUI through the switcher) and
 //!   unload after `idle_minutes` without one (the image and audio servers exit, the switcher sets the chat mode to
 //!   none, the video daemon's workers let their card go); they stay enabled. Disabled: unloaded, gone from Open WebUI's
@@ -20,6 +23,7 @@
 
 mod api;
 mod config;
+mod disks;
 mod jobs;
 mod life;
 mod maint;
@@ -106,6 +110,8 @@ pub struct Home {
     /// lets a request through it (kept in the state file; empty: none)
     maint_file: PathBuf,
     maint_bypass: Mutex<String>,
+    /// the drives: their measured speeds (kept in the state file), a measurement and a move under way (disks.rs)
+    disks: disks::Disks,
 }
 
 pub(crate) fn now() -> f64 {
@@ -192,7 +198,7 @@ impl Home {
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()), chat_keep: Mutex::new(BTreeMap::new()),
-            maint_file, maint_bypass,
+            maint_file, maint_bypass, disks: disks::Disks::new(&st),
         });
         let me = h.clone();
         std::thread::spawn(move || me.sample_cards());
@@ -252,7 +258,8 @@ impl Home {
     }
 
     fn save_state(&self) {
-        let st = json!({"token": self.token, "seen": *self.seen.lock().unwrap(), "maintenance_bypass": *self.maint_bypass.lock().unwrap()});
+        let st = json!({"token": self.token, "seen": *self.seen.lock().unwrap(), "maintenance_bypass": *self.maint_bypass.lock().unwrap(),
+                        "drives": *self.disks.measured.lock().unwrap()});
         let tmp = self.state_file.with_extension("json.tmp");
         if std::fs::write(&tmp, serde_json::to_string_pretty(&st).unwrap_or_default()).is_ok() {
             let _ = std::fs::rename(&tmp, &self.state_file);
@@ -293,10 +300,12 @@ impl Home {
         if p.starts_with("/rpc/") || p.starts_with("/v1/") {
             return self.api(s, req);
         }
+        if let Some(rest) = p.strip_prefix("/open/") {
+            return self.open(&mut s, &req, rest);
+        }
         match (req.method.as_str(), p) {
             ("GET", "/") | ("GET", "/index.html") => self.page(&mut s),
             ("GET", p) if p.starts_with("/ui/") || p.starts_with("/static/") => self.asset(&mut s, p),
-            ("GET", p) if p.starts_with("/open/") => self.open(&mut s, &req, &p["/open/".len()..]),
             ("GET", "/health") => http::respond(&mut s, 200, &json!({"status": "ok"})),
             ("GET", "/openapi.yml") | ("GET", "/openapi.yaml") => {
                 let spec = self.openapi(&req, false);
@@ -324,11 +333,14 @@ impl Home {
         }
     }
 
-    /// A model's own page (an image, audio or 3D model's web front end, which only its running server has): the model is
-    /// started when it is not up - the same as its first request - and the browser sent to it. A disabled model has
-    /// none to open. The video studio and the chat page are always up.
-    fn open(&self, s: &mut Conn, req: &http::Request, id: &str) {
-        let id = id.trim_end_matches('/');
+    /// A model's own page (an image, audio or 3D model's web front end, which only its running server has), served
+    /// through this door: `/open/<id>/<sub>` starts the model when it is not up - the same as its first request - and
+    /// passes the request on to its server as `/<sub>` (any method: the page's own API calls go the same way).
+    /// `/open/<id>` alone is sent to `/open/<id>/`, so the page's relative links resolve under it. Those servers check
+    /// no token and listen on --serve-host (127.0.0.1): this is how another machine reaches them. A disabled model has
+    /// none to open. The video studio and the chat page are always up and on the network: the browser is sent there.
+    fn open(&self, s: &mut Conn, req: &http::Request, rest: &str) {
+        let (id, sub) = rest.split_once('/').map_or((rest, None), |(i, r)| (i, Some(r)));
         let m = match registry::find(&self.o.cfg, id) {
             Ok(Some(m)) => m,
             _ => return http::respond(s, 404, &err(format!("no model {id}"))),
@@ -336,13 +348,21 @@ impl Home {
         if m["enabled"] == false {
             return http::respond(s, 409, &err(format!("{id} is disabled: enable it to open its page")));
         }
-        let kind = registry::kind_of(&m).to_string();
-        let port = match kind.as_str() {
+        let query = req.target.find('?').map_or("", |i| &req.target[i..]);
+        let port = match registry::kind_of(&m) {
             "image" | "audio" | "model3d" => {
-                match self.ensure(id) {
-                    Ok(l) => l.port,
+                let Some(sub) = sub else {
+                    let to = format!("/open/{id}/{query}");
+                    return http::respond_bytes(s, 302, "text/plain; charset=utf-8", b"", &format!("Location: {to}\r\nCache-Control: no-cache\r\n"));
+                };
+                let lease = match self.ensure(id) {
+                    Ok(l) => l,
                     Err((c, e)) => return http::respond(s, c, &err(e)),
+                };
+                if let Err(e) = http::forward_to(&mut *s, &lease, req, &format!("/{sub}{query}")) {
+                    http::respond(s, 502, &err(e));
                 }
+                return;
             }
             "video" => self.o.ports.video,
             _ => self.o.ports.chat_ui,
@@ -417,7 +437,7 @@ impl Home {
         });
         json!({"ts": now(), "host": meminfo(), "cards": cards, "models": models, "services": self.services(), "runs": runs,
                "idle_minutes": self.o.idle_minutes, "ports": {"video": self.o.ports.video, "chat_ui": self.o.ports.chat_ui},
-               "maintenance": maintenance})
+               "maintenance": maintenance, "drives": self.drives_view(&all, &models)})
     }
 
     /// The cards, a process's model by its registry id where its file is a registered one (`model_id`)
@@ -489,8 +509,8 @@ impl Home {
         }
     }
 
-    /// The page's buttons: {"do": enable | disable | load | unload, "model", "gpus": [..], "force"}; a load runs on (the
-    /// state shows it loading), the others answer when done
+    /// The page's buttons: {"do": enable | disable | load | unload | measure | move | move_cancel, "model", "gpus": [..],
+    /// "force", "drive"}; a load, a measurement and a move run on (the state shows them), the others answer when done
     fn action(self: &Arc<Self>, b: &Value) -> Result<Value, (u16, String)> {
         let model = b["model"].as_str().unwrap_or("").to_string();
         match b["do"].as_str().unwrap_or("") {
@@ -505,7 +525,10 @@ impl Home {
             "config" => self.config_set(b),
             "restart" => self.restart(b["service"].as_str().unwrap_or("")),
             "maintenance" => self.maintenance_set(b),
-            other => Err((400, format!("no action {other:?} (enable, disable, gpus, load, unload, config, restart, maintenance)"))),
+            "measure" => self.drive_measure(b["drive"].as_str().unwrap_or("")),
+            "move" => self.model_move(&model, b["drive"].as_str().unwrap_or("")),
+            "move_cancel" => self.move_cancel(),
+            other => Err((400, format!("no action {other:?} (enable, disable, gpus, load, unload, config, restart, maintenance, measure, move, move_cancel)"))),
         }
     }
 }

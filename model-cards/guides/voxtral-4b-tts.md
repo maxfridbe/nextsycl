@@ -24,6 +24,12 @@ instruction: **no voice cloning** (`ref_audio`, saved voices - those go to a mod
 direction** (`instructions` is refused), **no vocal events**. Style comes from the voice: the casual and cheerful
 voices speak more loosely than the neutral ones.
 
+## Enrolled voices (experimental)
+A saved voice enrolled for Voxtral (`nextsycl audio voice enroll NAME`: its codes fitted to its recording through the
+codec's decoder, a minute or two on a GPU) is spoken with `voice: NAME`. It sounds closer to the speaker than any
+preset, but less close than a model that clones from the recording (VoxCPM2, Breeze TTS 2); a voice not enrolled is
+refused here. Only enroll voices you have the speaker's consent for.
+
 ## Settings
 `cfg` (1.2, upstream's): how strongly the flow follows the backbone - 1 is unguided, higher is more articulated and
 eventually harsher. `seed`: the flow's noise (the words and rhythm come from the backbone, which always takes its most

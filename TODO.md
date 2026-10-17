@@ -269,11 +269,22 @@ of IQ2_XXS instead could win twice.
       CrispASR's GGUF (q8_0; q4_k card); the 12 Hz codec moved to crates/codec12hz (shared with Qwen3-TTS, re-checked);
       checked against upstream (f16: 4e-4..9e-4 a stage, Q8_0 3e-3..1e-2). B70: 22 frames/s guided, 28 unguided.
       Next: int8 / graphs for speed, a served registry entry, streamed answers
+- [x] VibeVoice-1.5B (audio/vibevoice, 2026-10-17): long-form scripts of up to four speakers, each voice cloned from a
+      recording (no transcript), from gguf-org's Q8_0 GGUF + the -hf tokenizer / config; checked against transformers'
+      implementation (f16: logits 4e-4, head 4e-7, decoder 2e-4); the contract's references / speakers, voices and
+      ref_audios through the server and the front door. B70: 43.5 frames/s (5.8x real time), 5.6 GiB.
+      Next: SYCL graphs for the tokenizers' ~500 small launches a frame, the head's ten read-backs on the device
+- [x] Fish Audio S2 Pro (audio/s2pro, 2026-10-17): plain / cloned speech in ~80 languages at 44.1 kHz, free-form inline
+      tags (`instructions` as one), several speakers; s2.cpp's GGUF kept as Q8_0 on the card, Fish's codec (decoder,
+      encoder) in float32; checked against fish-speech (F16: logits 1e-4, greedy frames identical; codec 1e-6 with the
+      GGUF's half weights). B70: 42 frames/s (2.0x real time). Next: sampling on the GPU, graphs for the fast model
 - [x] Voxtral TTS (audio/voxtraltts, 2026-10-17): Voxtral 4B TTS 2603 from CrispASR's GGUF (q8_0 card), nine languages,
       20 preset voices (no clone / design / instructions: the open weights have no encoder); Tekken in nextsycl_tok;
       checked against vllm-omni's code (f16: teacher-forced hidden 3-6e-4, flow 1e-6, codec 5.5e-4). B70 30 frames/s
-      (2.4x real time). Next: the flow in int8 or a per-frame graph; the encoderless clone (docs/proposals/
-      voxtral-encoderless-clone.md)
+      (2.4x real time). Encoderless enrolment (experimental, stage A of docs/proposals/voxtral-encoderless-clone.md):
+      `audio voice enroll` fits a saved voice's codes with PyTorch XPU (1-2 min a voice, B65); likeness 0.956-0.968 vs
+      the nearest preset's 0.813-0.952, WER 0. Next: an "enroll" button / job placement in the front door; the flow in
+      int8 or a per-frame graph
 - [x] Qwen3.8-27B (llm/qwen35, 2026-10-10): the dense qwen35 graph (gated DeltaNet + gated full attention, dense
       SwiGLU) on the shared products / KDA scan and its own attention and gates; checked against llama.cpp on Q8_0
       (cosine >= 0.99993 every layer, same next token); served as qwen3.8-27b-q8 / -q4 / -q3 (tools, reasoning)
@@ -435,6 +446,8 @@ profiling), README speed lines and cards' vram_gib, deploy.
 
 - [ ] Review `docs/proposals/speech-batching.md`: several speech requests in one engine's decode step (Breeze
       first; two servers a card measured a loss, 1.54x -> 0.65x).
+- [ ] Voxtral TTS cloning without its encoder, on the GPU: `docs/proposals/voxtral-encoderless-clone.md` (phase 2
+      of the port; shipped only if it beats the nearest preset on speaker likeness).
 
 ## To try
 

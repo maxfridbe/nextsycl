@@ -25,6 +25,7 @@ const fn st(name: &'static str, group: &'static str, default: &'static str, what
 
 pub const SETTINGS: &[Setting] = &[
     st("NS_MODELS", "box", "", "host directory with the model files (seen as /models in the containers)", &["llm", "image", "audio", "video", "model3d"]),
+    st("NS_MODEL_DIRS", "box", "", "more models folders, one a drive (commas): where a model moved to that drive goes (else <mount>/nextsycl-models); NS_MODELS is one already", &["serve", "cli"]),
     st("NS_REGISTRY", "box", "~/.config/nextsycl/models.json", "the model registry (nextsycl models)", &["serve", "switch", "studio", "llm", "image", "audio", "video", "model3d"]),
     st("NS_MODEL_CARDS", "box", "model-cards beside the program, else in the repository", "the model cards: the models nextsycl models search | pull offer, their prompt guides", &["cli", "serve"]),
     st("NS_SOCKET_DIR", "box", "$XDG_RUNTIME_DIR/nextsycl", "where the control sockets live", &["serve", "llm", "video", "studio"]),

@@ -352,7 +352,7 @@ impl AudioEngine for VoxCpm2 {
     }
     fn speech(&self) -> Option<Speech> {
         Some(Speech { voices: Vec::new(), languages: Vec::new(), instructions: true, design: true, clone: true, clone_needs_text: false,
-                      clone_takes_text: true, direction: false, events: Vec::new(), requires: None, enrolled: false })
+                      clone_takes_text: true, direction: false, events: Vec::new(), requires: None, enrolled: false, speakers: 1 })
     }
     fn options(&self) -> &'static [EngineOption] {
         OPTIONS

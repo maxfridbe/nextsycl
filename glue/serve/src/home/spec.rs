@@ -141,6 +141,16 @@ fn status() -> String {
 }
 
 /// The answer of a method, as JSON Schema text (none: not described)
+/// A move of a model's files (system.move, system.drives' move)
+const MOVE: &str = r#"{"type": "object", "properties": {"model": {"type": "string"}, "to": {"type": "string", "description": "the drive"}, "from": {"type": "array", "items": {"type": "string"}},
+  "folder": {"type": "string"}, "state": {"type": "string", "enum": ["copying", "registry", "removing", "done", "failed", "cancelled"]}, "running": {"type": "boolean"},
+  "files": {"type": "integer"}, "file_index": {"type": "integer"}, "file": {"type": "string", "nullable": true}, "file_to": {"type": "string", "nullable": true},
+  "bytes": {"type": "integer", "description": "the files moved"}, "need": {"type": "integer", "description": "bytes written there (a file there already, the same bytes, is used)"},
+  "done": {"type": "integer"}, "work": {"type": "integer", "description": "bytes read and written in all: each copied byte twice (copied, read back)"}, "pct": {"type": "number"},
+  "rate_mb_s": {"type": "number"}, "eta_s": {"type": "number", "nullable": true}, "started": {"type": "number"}, "seconds": {"type": "number"},
+  "result": {"type": "object", "nullable": true, "description": "done: renamed (old path: new), removed (the old files), kept (old files another model names, with those models)", "additionalProperties": true},
+  "error": {"type": "string", "nullable": true}, "warning": {"type": "string", "nullable": true, "description": "a model that streams from the disk, to a slower drive"}}}"#;
+
 pub fn result(method: &str) -> Option<String> {
     Some(match method {
         "system.busy" => r#"{"type": "object", "required": ["busy"], "properties": {
@@ -199,6 +209,23 @@ pub fn result(method: &str) -> Option<String> {
   "other": {"type": "array", "items": {"type": "object", "additionalProperties": true}, "description": "lines of the file the program does not read"}}, "additionalProperties": true}"#.into(),
         "system.configSet" => r#"{"type": "object", "properties": {"changed": {"type": "array", "items": {"type": "string"}}, "restart": {"type": "array", "items": {"type": "string"}, "description": "what system.restart must restart to see it"}, "path": {"type": "string"}}, "additionalProperties": true}"#.into(),
         "system.restart" => r#"{"type": "object", "properties": {"restarting": {"type": "string"}}}"#.into(),
+        "system.drives" => format!(r#"{{"type": "object", "properties": {{
+  "drives": {{"type": "array", "items": {{"type": "object", "properties": {{
+    "id": {{"type": "string", "description": "the device's name (nvme1n1, nvme0n1p3): what drive takes"}}, "disk": {{"type": "string"}}, "model": {{"type": "string", "description": "the disk's model (sysfs)"}},
+    "link": {{"type": "string", "nullable": true, "description": "an NVMe's PCIe link now: PCIe 4.0 x4"}}, "link_gb_s": {{"type": "number", "nullable": true}},
+    "device": {{"type": "string"}}, "fstype": {{"type": "string"}}, "mount": {{"type": "string"}}, "folder": {{"type": "string", "description": "where models moved here go (a models folder set on it, else <mount>/nextsycl-models)"}},
+    "size": {{"type": "integer"}}, "free": {{"type": "integer"}}, "margin": {{"type": "integer", "description": "bytes a move leaves free (1%, at least 4 GiB)"}},
+    "models_bytes": {{"type": "integer", "description": "the registered models' files on it (a file once)"}}, "models": {{"type": "array", "items": {{"type": "string"}}}},
+    "measured": {{"type": "object", "nullable": true, "properties": {{"mb_s": {{"type": "number", "description": "MB/s read past the page cache"}}, "bytes": {{"type": "integer"}}, "seconds": {{"type": "number"}}, "at": {{"type": "number", "description": "unix seconds"}}, "file": {{"type": "string"}}}}}},
+    "measuring": {{"type": "boolean"}}, "rate_gb_s": {{"type": "number", "nullable": true, "description": "as measured, else its link's"}}}}}}}},
+  "models": {{"type": "object", "description": "model id: its files' place", "additionalProperties": {{"type": "object", "properties": {{
+    "bytes": {{"type": "integer"}}, "files": {{"type": "integer"}}, "missing": {{"type": "integer"}}, "drives": {{"type": "object", "additionalProperties": {{"type": "integer"}}, "description": "drive id: its bytes there"}},
+    "streams": {{"type": "boolean", "description": "reads its weights from the disk while it serves (its model card's streams): its drive's speed is its speed"}},
+    "moving": {{"type": "boolean"}}, "move": {{"type": "object", "description": "each drive it could move to: {{need: bytes to write}}, with why when it cannot now", "additionalProperties": {{"type": "object", "properties": {{"need": {{"type": "integer"}}, "why": {{"type": "string"}}}}}}}}}}}}}},
+  "move": {{"nullable": true, "allOf": [{MOVE}]}}, "measuring": {{"type": "string", "nullable": true}}, "folders": {{"type": "array", "items": {{"type": "string"}}, "description": "the models folders set (NS_MODELS, NS_MODEL_DIRS)"}}}}}}"#),
+        "system.drive.measure" => r#"{"type": "object", "properties": {"drive": {"type": "string"}, "measuring": {"type": "boolean"}, "reads_up_to": {"type": "integer"}}}"#.into(),
+        "system.move" => format!(r#"{{"type": "object", "properties": {{"move": {MOVE}}}}}"#),
+        "system.move.cancel" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "cancelling": {"type": "boolean"}}}"#.into(),
         "system.maintenance" => r#"{"type": "object", "required": ["on"], "properties": {
   "on": {"type": "boolean"},
   "maintenance": {"type": "object", "nullable": true, "description": "the notice while on", "properties": {"message": {"type": "string"}, "notice": {"type": "string", "description": "the sentence refused callers read"}, "since": {"type": "number"}, "until": {"type": "number", "nullable": true}, "retry_after_s": {"type": "integer"}}},
@@ -337,7 +364,12 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
         "video.jobs.get" => &[(404, "not_found", "no record of that clip")],
         "video.upload" => &[(400, "invalid_params", "not a picture, clip or sound (png jpg jpeg webp mp4 mov webm mkv wav mp3 flac m4a ogg), or empty")],
         "system.load" => &[(404, "not_found", "no such model"), (503, "no_room", "its cards are held by other models now (retryable)")],
-        "system.enable" | "system.disable" | "system.unload" | "system.gpus" => &[(404, "not_found", "no such model")],
+        "system.enable" | "system.disable" | "system.unload" | "system.gpus" => &[(404, "not_found", "no such model"), (409, "conflict", "enable: the model's files are moving (system.move)")],
+        "system.drive.measure" => &[(404, "not_found", "no such drive (system.drives)"), (409, "busy", "a model loads from it, a move uses it, or another drive is being measured")],
+        "system.move" => &[(400, "invalid_params", "its files are on that drive already, missing, or one would land on another file"), (404, "not_found", "no such model or drive"),
+                           (409, "conflict", "the model is loaded or loading (stop it first), a process has its files open, or the drive lacks the room"),
+                           (409, "busy", "another move runs, or a drive is being measured")],
+        "system.move.cancel" => &[(409, "conflict", "no move is under way")],
         "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.voices.design" | "model3d.generate" | "model3d.rig" =>
             &[(400, "invalid_params", "a value refused, when the job is submitted (wait false too): steps a few-step model does not run, a size, a sampler, a picture that does not decode, a voice or language the speech model does not have, a priority outside -9..9 ..."),
               (404, "not_found", "no such model; a continue_from or upload:<name> that is not here (error.field names which)"), (409, "conflict", "the model is disabled, or none that can do it is enabled (never retry as is)"),

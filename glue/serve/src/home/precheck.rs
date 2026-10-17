@@ -228,6 +228,33 @@ impl Home {
                 return Err(bad(format!("ref_text: {id} clones from a recording and its exact transcript")));
             }
         }
+        // a multi-speaker script's voices: saved ones (voices) or recordings (ref_audios), a speaker each
+        let names: Vec<&Value> = b["voices"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+        let recs: Vec<&Value> = b["ref_audios"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+        if !names.is_empty() || !recs.is_empty() {
+            if !can("speakers") {
+                return Err(bad(format!("voices / ref_audios: {id} speaks one voice - use a model of several speakers (vibevoice-1.5b) or leave model out")));
+            }
+            if !names.is_empty() && !recs.is_empty() {
+                return Err(bad("voices or ref_audios: one list of the speakers' voices, not both".into()));
+            }
+            if !voice.is_empty() || b["ref_audio"].as_str().is_some_and(|a| !a.is_empty()) || !carried.is_empty() {
+                return Err(bad("voices / ref_audios name every speaker's voice: not with voice, ref_audio or continue_from".into()));
+            }
+            if names.len().max(recs.len()) > 4 {
+                return Err(bad(format!("voices: {} speakers, at most 4", names.len().max(recs.len()))));
+            }
+            for v in names {
+                let n = v.as_str().unwrap_or_default();
+                if !saved(n) {
+                    return Err(bad(format!("voices: {n:?} is not a saved voice (audio.voices.list)")));
+                }
+            }
+            for (i, a) in recs.iter().enumerate() {
+                let wav = crate::http::unbase64(a.as_str().unwrap_or_default()).map_err(|e| bad(format!("ref_audios[{i}]: {e}")))?;
+                nextsycl_audio::decode_wav(&wav).map_err(|e| bad(format!("ref_audios[{i}]: {e} (a WAV)")))?;
+            }
+        }
         if let Some(a) = b["ref_audio"].as_str().filter(|a| !a.is_empty()) {
             if !can("clone") {
                 return Err(bad(format!("ref_audio: {id} does not clone a voice")));

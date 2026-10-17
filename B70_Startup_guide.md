@@ -85,6 +85,8 @@ Good first models for one B70:
 | `qwen3-tts-custom` | speech | 4.2 GB | nine voices, styled by an instruction, 10 languages |
 | `voxcpm2` | speech | 4.6 GB | 30 languages at 48 kHz, voices designed from a description or cloned |
 | `breeze-tts-2` | speech | 3.4 GB | English and Chinese: voices designed, cloned or directed, vocal events (non-commercial license) |
+| `vibevoice-1.5b` | speech | 4.2 GB | long-form scripts of up to four speakers, each voice cloned from a recording (MIT; no impersonation) |
+| `s2-pro` | speech | 5.6 GB | ~80 languages at 44.1 kHz: voices cloned, free-form inline tags, several speakers (non-commercial license) |
 | `voxtral-4b-tts` | speech | 4.3 GB | nine languages in 20 preset voices (no cloning; non-commercial license) |
 | `minimax-music3` | music | 26.6 GB | songs from lyrics and a description |
 | `minimax-h3` | video | 47.9 GB | text / pictures / a voice to video with sound |

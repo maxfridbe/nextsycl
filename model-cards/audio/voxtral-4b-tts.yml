@@ -8,7 +8,7 @@ id: voxtral-4b-tts
 kind: audio
 arch: voxtral-tts
 title: 'Voxtral 4B TTS Q8_0 (speech in nine languages in 20 preset voices, 24 kHz; non-commercial)'
-about: 'Mistral''s Voxtral 4B TTS 2603: a Ministral 3B backbone (26 layers) that makes a hidden state per 12.5 Hz frame, a 3-layer flow-matching acoustic transformer (semantic code + 36 FSQ values by a 7-step guided Euler ODE) and the Voxtral codec''s decoder - CrispASR''s Q8_0 GGUF, half on the GPU. English, French, German, Spanish, Italian, Portuguese, Dutch, Arabic, Hindi in 20 preset voices (casual, cheerful and neutral English speakers; a male and a female voice for most languages). No cloning, voice design, instructions or vocal events in the open weights (the checkpoint has no audio encoder). Weights, voices and outputs: CC BY-NC 4.0 (non-commercial)'
+about: 'Mistral''s Voxtral 4B TTS 2603: a Ministral 3B backbone (26 layers) that makes a hidden state per 12.5 Hz frame, a 3-layer flow-matching acoustic transformer (semantic code + 36 FSQ values by a 7-step guided Euler ODE) and the Voxtral codec''s decoder - CrispASR''s Q8_0 GGUF, half on the GPU. English, French, German, Spanish, Italian, Portuguese, Dutch, Arabic, Hindi in 20 preset voices (casual, cheerful and neutral English speakers; a male and a female voice for most languages). No cloning from a recording, voice design, instructions or vocal events in the open weights (the checkpoint has no audio encoder); experimental: saved voices enrolled for it (their codes fitted through the decoder). Weights, voices and outputs: CC BY-NC 4.0 (non-commercial)'
 gpus: '0'
 vram_gib: 7.5                   # its memory on the card when it runs (measured: 6.8 GiB of weights, 7.2 GiB peak in a server run)
 speech:

@@ -1,0 +1,33 @@
+# Fish Audio S2 Pro Q8_0 (speech in ~80 languages, 44.1 kHz: voices cloned from a recording; inline tags; several speakers)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# License: the weights and everything they make are under the Fish Audio Research License (research and non-commercial
+# use only; commercial use needs a written license from Fish Audio). See the guide.
+id: s2-pro
+kind: audio
+arch: s2-pro
+title: 'Fish Audio S2 Pro Q8_0 (speech in ~80 languages, 44.1 kHz: voices cloned from a recording, free-form inline tags, several speakers; non-commercial)'
+about: 'Fish Audio S2 Pro (~4.6B, Dual-AR): a 36-layer Qwen3 slow model draws each frame''s semantic code, a 4-layer fast model the other nine of Fish''s RVQ codec (44.1 kHz, 21.5 frames a second) - s2.cpp''s Q8_0 GGUF with the codec inside, kept as Q8_0 on the card. Voice cloning from a recording and its exact transcript; tone, emotion, pace and vocal events by free-form tags in square brackets anywhere in the text ([whisper], [laughing], [excited tone], [pause]); `instructions` become such a tag; several speakers in one text (<|speaker:0|>, <|speaker:1|> ...). No voice design from a description and no built-in voices: without a recording the voice is the model''s pick (it varies with the seed). Weights and outputs: Fish Audio Research License (research and non-commercial use only)'
+gpus: '0'
+vram_gib: 7.0                   # its memory on the card when it runs (measured on a B70: 5.6 GiB loaded, 6.5 GiB at a 43 s clip's peak)
+speech:
+- clone
+- direction                     # a clone (or the model's voice) steered by instructions: an inline tag
+- events                        # inline tags in the text
+- transcript                    # a clone needs what the recording says (saved voices without it go elsewhere)
+defaults:
+  seconds: 60.0
+env: {}
+files:
+  model:
+    key: s2pro-q8
+    url: https://huggingface.co/rodrigomt/s2-pro-gguf/resolve/a7320690b5585b03b20ed6484b55926f3015f48d/s2-pro-q8_0.gguf
+    size: 5630037088
+    sha256: e2043182234786e7b975547d3bbcb23ff02e4ff684b82f7fa851287e4cb4f267
+    path: s2pro/s2-pro-q8_0.gguf
+  tokenizer:
+    key: s2pro-tokenizer
+    url: https://huggingface.co/rodrigomt/s2-pro-gguf/resolve/a7320690b5585b03b20ed6484b55926f3015f48d/tokenizer.json
+    size: 12217872
+    sha256: f24e08099d45a8adf3f52f5f0b03276e433bb9d689bb15fcbcc48ce58744588b
+    path: s2pro/tokenizer.json
+guide: guides/s2-pro.md

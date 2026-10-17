@@ -13,6 +13,7 @@
 mod bench;
 mod client;
 mod container;
+mod drives;
 mod audio;
 mod model3d;
 mod host;
@@ -51,6 +52,11 @@ every kind:
                                 a file outside the catalog (every shard of a split file); then added
   nextsycl models remove <id> [--files]     --files: its files deleted too
   nextsycl models enable <id> | disable <id>
+  nextsycl models move <id> --to <drive | mount> [--yes]   its files to another drive: copied, read back (SHA-256),
+                                the registry repointed, the old files removed (those another model names stay);
+                                the front door's job when it is up; --cancel stops the move under way
+  nextsycl drives [--json]      the drives the models are on: device, PCIe link, mount, size, free, models, read speed
+  nextsycl drives measure <drive>   its read speed: 4 GiB of model files past the page cache (O_DIRECT), kept
   nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
   nextsycl switch [--port 8001] [--upstream 127.0.0.1:8085] [--studio URL] [--alias OLD=NEW]...
                                 the chat front end's model switcher: every registered chat model on one endpoint,
@@ -908,6 +914,8 @@ fn main() -> ExitCode {
         Some("model3d" | "3d") => model3d::cmd(&cfg, &args[1..], |r| selftest("model3d", r, nextsycl_model3d_example::selftest)),
         // the llm commands' names from before the kinds (nextsycl start = nextsycl llm start, ...)
         Some("start") => service::start(&cfg, rest),
+        Some("models") if rest.first().is_some_and(|a| a == "move") => drives::move_cmd(&cfg, rest),
+        Some("drives") => drives::cmd(&cfg, rest),
         Some("models") => models::cmd(&cfg, rest, &|g: &Gguf| {
             let all = engines();
             let k = nextsycl_llm::kind_for(&all, g)?;

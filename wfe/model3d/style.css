@@ -1,5 +1,5 @@
 /* nextsycl 3D - H3's stylesheet (as the audio page's): its palette, header pill, metric strip, panels, progress bar and icons; the form, the viewer and the gallery added at the end. */
-@font-face{font-family:"NF";src:url(/static/nf.woff2) format("woff2");font-display:swap}
+@font-face{font-family:"NF";src:url(static/nf.woff2) format("woff2");font-display:swap}
  .i{font-family:"NF",system-ui;font-style:normal;display:inline-block;min-width:1.1em;text-align:center;color:#93c5fd}
  .i.dim{color:#6b7280} .i.ok{color:#22c55e} .i.warn{color:#f59e0b} .i.err{color:#f87171}
  .pill .i{color:#94a3b8;min-width:1em} button .i{color:inherit;margin-right:6px}

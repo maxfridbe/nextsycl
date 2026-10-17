@@ -84,7 +84,7 @@ export async function go(): Promise<void> {
       a = await api.rig(body);
     }
     const made = a.data[0];
-    if (made) state.shown = { ...made, url: made.url.replace(/^https?:\/\/[^/]+/, "") };
+    if (made) state.shown = made;
     state.status = `done in ${((performance.now() - t0) / 1000).toFixed(1)} s` + (made?.triangles ? ` · ${made.triangles} triangles` : "");
     await refreshHistory();
   } catch (e) {

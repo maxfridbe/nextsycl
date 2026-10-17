@@ -26,7 +26,8 @@ voices. nextsycl runs it as the `audio/voxtraltts` engine (arch `voxtral-tts`, m
 | mode | supported | why |
 |---|---|---|
 | preset voices (20) | yes | `voice_embedding/*.pt`: each a reference clip's frames as their summed code embeddings |
-| voice cloning (a recording, saved voices) | **no** | the checkpoint has the codec's decoder but no encoder (below) |
+| voice cloning from a recording | **no** | the checkpoint has the codec's decoder but no encoder (below) |
+| saved voices, enrolled | **experimental** | the voice's codes fitted through the decoder once, on the GPU (below: "Encoderless enrolment") |
 | voice design (a description) | **no** | the prompt has no instruction or description input |
 | direction (tone, emotion, pace by instruction) | **no** | the same: no instruction input; style comes from the preset (casual, cheerful, neutral) |
 | vocal events | **no** | none in the model's training format or upstream's code |
@@ -43,8 +44,9 @@ The missing encoder, with the evidence:
 - A voice prompt is the encoder's codes of a clip, embedded and summed (`encode_tokens`); without the encoder there are
   no codes for a new recording. (Mistral's hosted service does adaptation.)
 
-The engine refuses `ref_audio` and `instructions` with these reasons; its card lists `speech: [voices]`, so the front
-door routes saved voices and clones to models that clone.
+The engine refuses `ref_audio` and `instructions` with these reasons; its card lists `speech: [voices, enrolled]`: the
+front door routes recordings and saved voices to models that clone, and a saved voice to Voxtral only when that voice
+is enrolled for it and no enabled model clones (or the request names Voxtral).
 
 ## Architecture
 
@@ -135,6 +137,68 @@ Memory: 6.8 GiB of weights on the card (half; the f16 file the same), 7.2 GiB in
 
 Where the time goes: per frame the backbone reads its 3.0B weights once (~6 GB in half) and the flow its 0.35B seven
 times (~5 GB). Next for speed: the flow in int8, or a graph per frame.
+
+## Encoderless enrolment (experimental)
+
+The plan is `docs/proposals/voxtral-encoderless-clone.md` (stage A; after the post at
+bbioon.com/blog/fixing-voxtral-voice-cloning-without-an-encoder). A saved voice's codes are fitted so that the
+released decoder reproduces its recording; the engine then prompts with those frames' summed embeddings (plus the
+end-of-audio frame) exactly as upstream's `encode_waveforms` + `encode_tokens` would with an encoder's codes.
+
+```sh
+nextsycl audio voice enroll NAME [--gpu N] [--steps 2000]     # -> <voices>/NAME/enrolled/voxtral-tts.npy (+ .json, .wav)
+nextsycl audio gen "..." --model voxtral-4b-tts --voice NAME    # (or audio.speak with voice NAME)
+```
+
+- **Tool**: `reference/voxtraltts/enroll.py`, PyTorch 2.14 with XPU (`torch.xpu`) on one card, in the build image
+  (its Python 3.14; the wheels installed with `pip install --target`, `NS_VXT_TORCH`), the decoder being vllm-omni's own
+  `VoxtralTTSAudioTokenizer` from the safetensors (`NS_VXT_CHECKPOINT`, `NS_VXT_VLLM_OMNI`). The codec's flash-attn
+  path is stood in by the same ALiBi / causal / window attention on SDPA (its SDPA fallback's `.view` fails on XPU's
+  non-contiguous result). The CLI checks the card's free memory by the front door's count (8 + 1.5 GiB); the front
+  door has no "enroll" button or job placement yet.
+- **Parameters**: per 80 ms frame (1,920 samples) a continuous 256-d semantic vector (the decoder sees its nearest VQ
+  codeword, straight through; a commitment term 0.25 pulls it there) and 36 continuous acoustic values (tanh, scaled
+  to the 21 levels, rounded straight through). Initialised from random codewords and the middle level.
+- **Loss**: L1 waveform + multi-resolution STFT (512/1024/2048, spectral convergence + log magnitude) + log-mel L1
+  (80 bins); magnitudes floored at 1e-4 (a gated recording's digital silence - 36 % exact zeros in one voice - otherwise
+  dominates the log terms).
+- **Schedule**: 2,000 Adam steps, lr 0.05 with a 5 % warm-up and a cosine to 10 %, the first half relaxed (the decoder
+  sees the continuous vectors and unrounded levels), then quantized. Float32 (bf16 autocast is an option).
+- **Time** (B65, 2026-10-17): 61 s for a 6.4 s clip, 90 s for 9.9 s, 131 s for 15 s (the clip is cut at 15 s), plus
+  ~3 s to load; 64 s end to end through `nextsycl audio voice enroll` for the 6.4 s voice. Under the 5-minute goal on
+  the slower card; stage B (a trained encoder) was not needed.
+
+### The gate
+
+Four saved voices of the library (two cloned recordings, a cloned speaker, a designed voice; 6.4-16.6 s), two new
+English sentences each, seed 1, Voxtral Q8_0. Likeness: cosine of microsoft/wavlm-base-plus-sv x-vectors between the
+voice's recording and the speech (its same-speaker threshold is ~0.86); words: Whisper small's WER
+(`reference/voxtraltts/gate.py`). "Best preset" is the best of the 20 presets for that speaker (by likeness);
+Breeze TTS 2 and VoxCPM2 clone the same recording with its transcript.
+
+| voice | fit (decoder's reconstruction) | Voxtral enrolled | best Voxtral preset | Breeze TTS 2 clone | VoxCPM2 clone |
+|---|---|---|---|---|---|
+| keeper (6.4 s) | 0.973, log-mel 0.38 | **0.968**, WER 0 | 0.952 (cheerful_female), 0 | 0.980, 0 | 0.972, 0.02 |
+| narrator (9.9 s, designed) | 0.977, 0.34 | **0.958**, 0 | 0.902 (neutral_male), 0 | 0.981, 0 | 0.977, 0 |
+| cp-3da6… (15 s of 16.6) | 0.988, 0.29 | **0.959**, 0 | 0.878 (neutral_male), 0 | 0.979, 0 | 0.988, 0 |
+| cp-631c… (15 s) | 0.943, 0.60 | **0.956**, 0 | 0.813 (nl_male), 0 | 0.959, 0 | 0.973, 0 |
+
+The enrolled voice beats the nearest preset for every speaker (by 0.016 to 0.143) with the presets' word accuracy (WER
+0; the presets 0.003 on average): **shipped as experimental**. It stays a little below the models that clone from the
+recording (Breeze TTS 2, VoxCPM2: 0.96-0.99). Through the audio server (`voice: keeper` with its enrolment) a new
+sentence measured 0.981. Caveats: four speakers, two sentences each, one speaker-embedding model (WavLM's cosine is
+compressed near 1); listen before relying on it.
+
+### The in-distribution prior (swept; off)
+
+`--text TRANSCRIPT --prior W`: the backbone (bf16 on the card, frozen) reads a preset voice, the transcript and the
+fitted frames teacher-forced, and the NLL of each frame's semantic code under its semantic head is added to the loss
+(every 4th quantized step; the choice's gradient through a softmax over the codewords' distances). Measured: the
+model's own codes for a sentence (the reference run) have an NLL of 0.79 nats a frame; the fitted codes 14.2 - less
+likely than uniform (9.0): the inversion's semantic codes are nothing the backbone would say, yet it conditions on them
+well. W 0.1 / 2 / 20 brought the NLL to 14.3 / 13.0 / 11.9 with the fit unchanged (log-mel 0.34-0.35) and likeness
+unchanged within noise (narrator: 0.958 without, 0.960 at W 2, 0.951 at W 20; WER 0), at about +25 s a voice. It is
+kept as an option and off by default.
 
 ## License
 
