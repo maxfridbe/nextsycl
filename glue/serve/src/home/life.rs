@@ -533,6 +533,9 @@ impl Home {
     /// Enable `id` on cards `gpus` (a list; none: as it was)
     pub(crate) fn enable(self: &Arc<Self>, id: &str, gpus: Option<&Value>) -> Result<String, (u16, String)> {
         let m = self.entry(id)?;
+        if let Some(why) = self.moving_why(id) {
+            return Err((409, why));
+        }
         let n = self.ncards();
         let gpus: Option<Vec<usize>> = gpus.and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(|g| g as usize).collect());
         if let Some(g) = &gpus {
@@ -628,6 +631,9 @@ impl Home {
         if m["enabled"] == false {
             return Err((409, format!("{id} is disabled: enable it first")));
         }
+        if let Some(why) = self.moving_why(id) {
+            return Err((409, why));
+        }
         if self.loading.lock().unwrap().insert(id.to_string(), now()).is_some() {
             return Ok(());
         }
@@ -646,6 +652,9 @@ impl Home {
     /// Load `id` and return when it answers
     pub(crate) fn load(&self, id: &str) -> Result<(), (u16, String)> {
         let m = self.entry(id)?;
+        if let Some(why) = self.moving_why(id) {
+            return Err((409, why));
+        }
         match registry::kind_of(&m) {
             "image" | "audio" | "model3d" => self.ensure(id).map(|_| ()),
             "video" => self.video_apply(false).map_err(|e| (500, e)),
@@ -718,6 +727,15 @@ impl Home {
         loop {
             if job.is_some_and(|j| self.job_cancelled(j)) {
                 return Err((499, format!("cancelled while it waited for {id}")));
+            }
+            // its files moving to another drive: it waits for the move like for room
+            if let Some(why) = self.moving_why(id) {
+                self.note(job, "waiting", &why);
+                if t0.elapsed() > limit {
+                    return Err((409, why));
+                }
+                std::thread::sleep(Duration::from_secs(3));
+                continue;
             }
             let why = match self.place(&m, id, kind, job)? {
                 Ok(lease) => return Ok(lease),

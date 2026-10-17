@@ -55,6 +55,8 @@ fn model(cfg: &Config, id: Option<&str>) -> Result<(Value, ModelFiles), String> 
     if models::kind_of(&m) != "image" {
         return Err(format!("{} is a {} model, not an image one", m["id"].as_str().unwrap_or("?"), models::kind_of(&m)));
     }
+    // not while its files move to another drive (nextsycl models move)
+    crate::drives::not_moving(cfg, m["id"].as_str().unwrap_or(""))?;
     let files: ModelFiles = m["files"].as_object().into_iter().flatten().filter_map(|(r, p)| Some((r.clone(), PathBuf::from(p.as_str()?)))).collect();
     Ok((m, files))
 }

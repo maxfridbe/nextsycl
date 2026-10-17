@@ -6,6 +6,7 @@ arch: qwen4exp
 title: Swift 1.5 IQ2_XS (short thinking; the B70, 128K + 32K)
 about: 'UkisAI''s fine-tune: much shorter thinking'
 gpus: '0'
+streams: true                   # its PLE rows read from the file every window while it serves: keep it on the fastest drive
 ctx: 131072,32768
 tools: true
 tasks: true

@@ -6,6 +6,7 @@ arch: qwen4exp
 title: Qwen3.8-Flash-Next IQ2_XS (general; the B70, 128K + 32K)
 about: the original model, GSQ-RCO IQ2_XS by ISTA-DASLab
 gpus: '0'
+streams: true                   # its PLE rows read from the file every window while it serves: keep it on the fastest drive
 ctx: 131072,32768
 tools: true
 tasks: true

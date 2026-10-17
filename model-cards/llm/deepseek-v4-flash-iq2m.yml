@@ -6,6 +6,7 @@ arch: deepseek4
 title: DeepSeek-V4-Flash 284B UD-IQ2_M · 128K context (both GPUs and pinned memory)
 about: unsloth's dynamic 2-bit quant of DeepSeek-V4-Flash (84.7 GiB; 13B active, 256 experts); the experts beyond VRAM in pinned host memory; the original checkpoint's last shard (3.6 GB) for its MTP draft block, converted beside it after the pull (llm prepare)
 gpus: all
+streams: true                   # experts beyond VRAM and pinned memory read from the file while it serves: keep it on the fastest drive
 vram_gib: 30.0
 ctx: '131072'
 tools: false

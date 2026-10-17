@@ -27,6 +27,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_IMAGE` | localhost/nextsycl-build (`./build.sh image`) | the container image with the oneAPI runtime the servers run in; build.sh builds in it too | cli (llm, image, audio, video start), build (build.sh) |
 | `NS_IN_IMAGE` | unset | set inside the image when the program re-runs a GPU command there (a host without oneAPI: `gpus`, `llm generate`, the selftests ...); set, the command runs in this process | cli |
 | `NS_MODELS` | none (llm start fails: set it) | host directory with the model files, mounted as /models in the containers; `models pull` puts files there | cli (llm, image, audio, video start; models pull) |
+| `NS_MODEL_DIRS` | none | more models folders, one a drive, comma-separated: a model moved to that drive (`system.move`, `nextsycl models move`) goes there, else to `<mount>/nextsycl-models`; NS_MODELS is the first models folder | serve (drives), cli (drives, models move) |
 | `NS_MOUNTS` | none | more read-only mounts for the chat server's container, `host:inside[,...]` (another model folder, a draft layer, a profile) | cli (llm start) |
 | `NS_SILO` | silos on | 0: no model silo, every model on the shared kernels (the A/B for a silo) | runtime (every kind) |
 | `NS_SILO_NAME` | the architecture's own | another silo of the engine's ABI to load (dist/silo/libnextsycl-<name>.so) - a model card's `silo.name` | runtime (every kind) |

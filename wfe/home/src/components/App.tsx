@@ -5,6 +5,7 @@ import { act, copy, maintenance, render, setTab, ui } from "../main.js";
 import type { Card, Model, Proc, Service } from "../types.js";
 import { Api } from "./Api.js";
 import { ConfigView } from "./Config.js";
+import { DrivesPanel, ModelDisk } from "./Drives.js";
 
 const gib = (mb: number) => (mb / 1024).toFixed(1);
 const short = (n: string) => n.replace("Intel(R) Arc(TM) ", "").replace(" Graphics", "");
@@ -197,6 +198,7 @@ function ModelRow(m: Model) {
             ]
           : null}
       </div>
+      {ModelDisk(m)}
     </div>
   );
 }
@@ -268,6 +270,7 @@ function Status() {
           <span class="hint">in use, by process · below it, hatched: what the enabled models are vouched for - each model's weights, then its headroom (the stripes the other way)</span></div>
         <div class="pbody"><div class="cards">{(st?.cards ?? []).map(CardView)}</div></div>
       </section>
+      <DrivesPanel />
       <Models />
       <section class="panel">
         <div class="phead"><span class="i" props={{ innerHTML: "&#xf233;" }} /><span class="ptitle">Front ends</span></div>

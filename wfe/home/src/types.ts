@@ -72,7 +72,67 @@ export interface State {
   ports: { video: number; chat_ui: number };
   /** maintenance mode while it is on (system.maintenance): the notice callers read, the bypass key */
   maintenance: Maintenance | null;
+  /** the drives the models are on, each model's place on them, the move under way (system.drives) */
+  drives?: Drives;
 }
+
+export interface Measured { mb_s: number; bytes: number; seconds: number; at: number; file: string }
+
+export interface Drive {
+  id: string;
+  disk: string;
+  model: string;
+  link: string | null;
+  device: string;
+  fstype: string;
+  mount: string;
+  /** where models moved here go */
+  folder: string;
+  size: number;
+  free: number;
+  /** what a move leaves free */
+  margin: number;
+  models_bytes: number;
+  models: string[];
+  measured: Measured | null;
+  measuring: boolean;
+  /** as measured, else its link's */
+  rate_gb_s: number | null;
+}
+
+/** a model's files: bytes by drive, and for each other drive what a move needs or why it cannot move now */
+export interface DiskModel {
+  bytes: number;
+  files: number;
+  missing: number;
+  drives: Record<string, number>;
+  streams: boolean;
+  moving: boolean;
+  move: Record<string, { need?: number; why?: string }>;
+}
+
+export interface Move {
+  model: string;
+  to: string;
+  from: string[];
+  state: "copying" | "registry" | "removing" | "done" | "failed" | "cancelled";
+  running: boolean;
+  files: number;
+  file_index: number;
+  file: string | null;
+  bytes: number;
+  done: number;
+  work: number;
+  pct: number;
+  rate_mb_s: number;
+  eta_s: number | null;
+  started: number;
+  seconds: number;
+  error: string | null;
+  warning: string | null;
+}
+
+export interface Drives { drives: Drive[]; models: Record<string, DiskModel>; move: Move | null; measuring: string | null; folders: string[] }
 
 export interface Maintenance { on: boolean; message: string; since: number; until: number | null; retry_after_s: number; notice: string; bypass?: string }
 

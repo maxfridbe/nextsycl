@@ -446,7 +446,9 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
 
 `nextsycl models` (`glue/models`) keeps what a machine serves: an entry's id, kind, files, GPUs, contexts and engine
 settings, so an engine's settings are given once, at `models add --set`, and `nextsycl llm start <id>` applies them.
-The README's Models section has the commands.
+The README's Models section has the commands. Where an entry's files live is the registry's business too:
+`nextsycl_serve::drives` (the front door's Drives panel, `system.move`, `nextsycl models move`) copies a model's files
+to another drive, checks them, repoints the entry and removes the old files that no other entry names.
 
 ## What stays shared on purpose
 
