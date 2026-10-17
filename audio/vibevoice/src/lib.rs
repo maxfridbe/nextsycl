@@ -67,6 +67,54 @@ const ENC_FRAMES: usize = 8;
 
 pub const OPTIONS: &[EngineOption] = &[];
 
+/// NS_VV_PROFILE=1: a run's stages timed (the GPU waited for at each boundary, which costs a little), the table on
+/// stderr at its end
+struct Prof {
+    on: bool,
+    t: Instant,
+    acc: [(f64, u32); 7],
+}
+
+const PROF_STAGES: [&str; 7] = ["logits (read back)", "negative step (alone)", "diffusion head", "acoustic decoder", "semantic encoder",
+                                "samples + connectors", "language model (paired)"];
+
+impl Prof {
+    fn new() -> Prof {
+        Prof { on: std::env::var("NS_VV_PROFILE").is_ok_and(|v| v == "1"), t: Instant::now(), acc: [(0.0, 0); 7] }
+    }
+
+    fn start(&mut self, g: &Gpu) -> Result<()> {
+        if self.on {
+            g.sync()?;
+            self.t = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// The time since the last mark into stage i
+    fn mark(&mut self, g: &Gpu, i: usize) -> Result<()> {
+        if self.on {
+            g.sync()?;
+            let n = Instant::now();
+            self.acc[i].0 += (n - self.t).as_secs_f64();
+            self.acc[i].1 += 1;
+            self.t = n;
+        }
+        Ok(())
+    }
+
+    fn print(&self, frames: usize) {
+        if !self.on {
+            return;
+        }
+        let total: f64 = self.acc.iter().map(|a| a.0).sum();
+        eprintln!("[vv profile: {frames} frames, {:.2} ms a frame]", 1e3 * total / frames.max(1) as f64);
+        for (name, (t, n)) in PROF_STAGES.iter().zip(self.acc) {
+            eprintln!("  {name:<26} {:>7.3} ms a frame  {n:>6} calls  {:>5.1}%", 1e3 * t / frames.max(1) as f64, 100.0 * t / total.max(1e-12));
+        }
+    }
+}
+
 pub fn kind() -> AudioKind {
     AudioKind { archs: &[ARCH], name: "VibeVoice (long-form speech of up to four speakers, each cloned from a recording; 7.5 Hz latents drawn by a diffusion head)",
                 roles: ROLES, load, options: OPTIONS }
@@ -360,9 +408,12 @@ impl VibeVoice {
         // whether cond's second row holds the negative branch's next hidden state already (the paired step made it)
         let mut paired = false;
         let mut samples = Vec::new();
+        let mut prof = Prof::new();
+        prof.start(g)?;
         for _ in 0..max_steps {
             ops.gemv(cond.fp(), 1, &self.logit_rows, logits.fp(), 4, false)?;
             let l4 = logits.to_f32()?;
+            prof.mark(g, 0)?;
             let best = (0..4).fold(0, |b, i| if l4[i] > l4[b] { i } else { b });
             let tok = tokens[best];
             if let Some(k) = keep.as_deref_mut() {
@@ -386,6 +437,7 @@ impl VibeVoice {
                 if !paired {
                     self.lm.step(ops, nsd, &neg, &bos, np, &tmp)?;
                     cond.copy_within(h * 4, &tmp, 0, h * 4)?;
+                    prof.mark(g, 1)?;
                 }
                 np += 1;
                 let z: Vec<f32> = match noise {
@@ -394,11 +446,14 @@ impl VibeVoice {
                 };
                 let mut first = keep.as_ref().map(|_| Vec::new());
                 let latent = self.head.sample(ops, nsd, &mut hw, &cond, &z, s.cfg, first.as_mut())?;
+                prof.mark(g, 2)?;
                 // the acoustic decoder on the unscaled latent, then the semantic encoder on its samples
                 let un: Vec<f32> = latent.iter().map(|v| v / self.scale - self.bias).collect();
                 lat_in.write_async(0, &bytes(&un))?;
                 let (y, n) = self.dec.push(ops, nsd, &ds, &lat_in, 1, &dw)?;
+                prof.mark(g, 3)?;
                 let (sv, _) = self.sem.push(ops, nsd, &ss, y, n, &sw)?;
+                prof.mark(g, 4)?;
                 sem_in.copy_within(0, sv, 0, self.sem.dim_out * 4)?;
                 let mut chunk = vec![0f32; n];
                 y.read(0, as_bytes_mut(&mut chunk))?;
@@ -408,6 +463,7 @@ impl VibeVoice {
                 self.acoustic.apply(ops, nsd, &lat_row, 1, &ctmp, &xh, &next)?;
                 self.semantic.apply(ops, nsd, &sem_in, 1, &ctmp, &xh, &tmp)?;
                 ops.add(next.fp(), tmp.fp(), h)?;
+                prof.mark(g, 5)?;
                 frames += 1;
                 if let Some(k) = keep.as_deref_mut() {
                     k.cond.push(cond.to_f32()?);
@@ -426,10 +482,12 @@ impl VibeVoice {
             // both branches read the next input in one pass (the weights read once): the positive always, the negative
             // for the next step if it is an audio frame (else its row goes unused and its position is written again)
             self.lm.pair(ops, nsd, &pos, p, &neg, np, &next, &cond)?;
+            prof.mark(g, 6)?;
             paired = true;
             p += 1;
         }
         g.sync()?;
+        prof.print(frames);
         if samples.is_empty() {
             return Err(Error("the model ended the speech before its first frame".into()));
         }

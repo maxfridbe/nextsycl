@@ -34,12 +34,62 @@ impl Ops {
         self.gpu.raw()
     }
 
-    /// out[m] (+)= x[m] . W^T (+ bias), m < M <= 8, out rows `ldo` apart (K a multiple of 256)
+    /// out[m] (+)= x[m] . W^T (+ bias), m < M <= 20, out rows `ldo` apart
     pub fn gemv(&self, x: *const f32, m: usize, w: &Mat, out: *mut f32, ldo: usize, acc: bool) -> Result<()> {
+        self.gemv_epi(x, m, w.k, w, out, ldo, if acc { Epi::Acc } else { Epi::Store }, None)
+    }
+
+    /// out[m] (epi) x[m] . W^T + bias for m < M <= 20 rows of x `ldx` floats apart (a window of a longer signal, a
+    /// convolution's), out rows `ldo` apart; `gamma` the layer scale of Epi::Res
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_epi(&self, x: *const f32, m: usize, ldx: usize, w: &Mat, out: *mut f32, ldo: usize, epi: Epi, gamma: Option<&DevBuf>) -> Result<()> {
         let bias = w.bias.as_ref().map_or(std::ptr::null(), |b| b.fp() as *const f32);
+        let scales = w.scales.as_ref().map_or(std::ptr::null(), |s| s.ptr() as *const c_void);
+        let gamma = gamma.map_or(std::ptr::null(), |g| g.fp() as *const f32);
         // SAFETY: the caller's buffers hold the sizes named.
-        ffi::check(unsafe { (self.k.gemv)(self.g(), x, m as i64, w.k as i64, w.w.ptr(), 0, std::ptr::null(), w.n as i64, bias, out, ldo as i64, acc as i32) },
-                   "gemv")
+        ffi::check(unsafe { (self.k.gemv)(self.g(), x, m as i64, ldx as i64, w.k as i64, w.w.ptr(), w.wt as i32, scales, w.n as i64, bias, epi as i32, gamma, out,
+                                           ldo as i64) }, "gemv")
+    }
+
+    /// RMS norm of the rows of x [m, c] into out: x / rms * w (w None: 1); with `modulate` (scale, shift, their rows
+    /// `lds` apart): then v * (1 + scale) + shift
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm(&self, x: *const f32, m: usize, c: usize, w: Option<&DevBuf>, eps: f32, modulate: Option<(*const f32, *const f32, usize)>, out: *mut f32)
+                    -> Result<()> {
+        let (sc, sh, lds) = modulate.unwrap_or((std::ptr::null(), std::ptr::null(), 0));
+        // SAFETY: x and out m * c floats; w c; scale / shift m rows of c, lds apart.
+        ffi::check(unsafe { (self.k.rms_norm)(self.g(), x, m as i64, c as i64, w.map_or(std::ptr::null(), |w| w.fp() as *const f32), eps, sc, sh, lds as i64, out) },
+                   "rms norm")
+    }
+
+    /// A decode step's RoPE and key / value store: rows of `qkv` (`ws` apart), row r of sequence `seqs[r]` (its
+    /// cache's keys, values, positions) at the position in `pos` (device int32 [rows])
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_kv(&self, qkv: *mut f32, ws: usize, pos: &DevBuf, hq: usize, hkv: usize, d: usize, inv: &DevBuf, seqs: &[(&DevBuf, &DevBuf, usize)]) -> Result<()> {
+        let (a, b) = (seqs[0], *seqs.get(1).unwrap_or(&seqs[0]));
+        // SAFETY: qkv rows of (hq + 2 hkv) d floats; the caches [hkv, t, d] half; pos rows int32.
+        ffi::check(unsafe { (self.k.rope_kv)(self.g(), qkv, ws as i64, seqs.len() as i64, pos.ptr() as *const i32, hq as i64, hkv as i64, d as i64, inv.fp(),
+                                             a.0.ptr(), a.1.ptr(), a.2 as i64, b.0.ptr(), b.1.ptr(), b.2 as i64) }, "rope + kv store")
+    }
+
+    /// A decode step's attention: row r of sequence `seqs[r]` up to its position in `pos`; the keys in `pieces`
+    /// pieces (`part`: rows * hq * pieces * 130 floats); out [rows, hq * 128]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_dec(&self, q: *const f32, qs: usize, pos: &DevBuf, seqs: &[(&DevBuf, &DevBuf, usize)], hq: usize, hkv: usize, pieces: usize, out: *mut f32,
+                    part: &DevBuf) -> Result<()> {
+        let (a, b) = (seqs[0], *seqs.get(1).unwrap_or(&seqs[0]));
+        if part.len < seqs.len() * hq * pieces * 130 * 4 {
+            return Err(Error(format!("attention scratch of {} bytes for {} rows in {pieces} pieces", part.len, seqs.len())));
+        }
+        // SAFETY: as rope_kv; part checked above.
+        ffi::check(unsafe { (self.k.attn_dec)(self.g(), q, qs as i64, seqs.len() as i64, pos.ptr() as *const i32, a.0.ptr(), a.1.ptr(), a.2 as i64, b.0.ptr(),
+                                              b.1.ptr(), b.2 as i64, hq as i64, hkv as i64, 128, pieces as i64, out, part.fp()) }, "attention")
+    }
+
+    /// out [m, c] = silu(gate) * up of x [m, 2c] holding interleaved (gate, up) pairs
+    pub fn swiglu_pairs(&self, x: *const f32, m: usize, c: usize, out: *mut f32) -> Result<()> {
+        // SAFETY: x m * 2c floats, out m * c.
+        ffi::check(unsafe { (self.k.swiglu_pairs)(self.g(), x, m as i64, c as i64, out) }, "swiglu")
     }
 
     /// Floats of scratch `attn` needs
@@ -122,10 +172,25 @@ impl Ops {
     }
 }
 
-/// A matrix [n, k] on the GPU in half, its bias float32 [n] (or none). `k` may be padded with zero columns to a
-/// multiple of 256 (the small-batch product's step): the input rows are then `k` wide, zero past `k_in`.
+/// What a product does with its sums (vv.h's NS_VV_*)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Epi {
+    Store = 0,
+    Acc = 1,
+    /// rows 2i, 2i + 1 are gate i and up i: out[i] = silu(gate) * up
+    Swiglu = 2,
+    Gelu = 3,
+    /// out += gamma * v
+    Res = 4,
+}
+
+/// A matrix [n, k] on the GPU: half (wt 0), bfloat16 (1) or Q8_0 (2: int8 codes [n, k], `scales` half [n, k / 32]),
+/// its bias float32 [n] (or none). `k` may be padded with zero columns to a multiple of 256: the input rows are then
+/// `k` wide, zero past `k_in`.
 pub struct Mat {
     pub w: DevBuf,
+    pub wt: u8,
+    pub scales: Option<DevBuf>,
     pub bias: Option<DevBuf>,
     pub n: usize,
     pub k: usize,
@@ -133,17 +198,40 @@ pub struct Mat {
 }
 
 impl Mat {
-    /// out [m, n] f32 = x [m, k] f32 . W^T + bias: a few rows by the engine's own product (bound by reading W once; k a
-    /// multiple of 256), more - or any k - by oneDNN's half GEMM (x converted into `xh`, a half buffer of m * k)
+    /// Bytes its weights take on the card
+    pub fn bytes(&self) -> usize {
+        self.w.len + self.scales.as_ref().map_or(0, |s| s.len)
+    }
+
+    /// out [m, n] f32 = x [m, k] f32 . W^T + bias: a few rows by the engine's own product (bound by reading W once), more
+    /// by oneDNN's half GEMM (x converted into `xh`, a half buffer of m * k)
     pub fn apply(&self, ops: &Ops, nsd: &Nsd, x: *const f32, m: usize, xh: &DevBuf, out: *mut f32) -> Result<()> {
-        if m <= 8 && self.k.is_multiple_of(256) {
+        self.apply_with(ops, nsd, x, m, xh, out, None)
+    }
+
+    /// As apply; a Q8_0 matrix's wide product expands it into `deq` (half [n, k]) first
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_with(&self, ops: &Ops, nsd: &Nsd, x: *const f32, m: usize, xh: &DevBuf, out: *mut f32, deq: Option<&DevBuf>) -> Result<()> {
+        if m <= 8 && self.k.is_multiple_of(8) {
             return ops.gemv(x, m, self, out, self.n, false);
         }
         if xh.len < m * self.k * 2 {
             return Err(Error(format!("a half staging buffer of {} bytes for a [{m}, {}] product", xh.len, self.k)));
         }
+        let w = match self.wt {
+            0 => self.w.ptr(),
+            2 => {
+                let d = deq.filter(|d| d.len >= self.n * self.k * 2)
+                    .ok_or_else(|| Error(format!("a Q8_0 [{}, {}] product of {m} rows needs room to expand it", self.n, self.k)))?;
+                let sc = self.scales.as_ref().ok_or_else(|| Error("a Q8_0 matrix without its scales".into()))?;
+                // SAFETY: codes n * k bytes, scales n * k / 32 halves, d n * k halves (checked).
+                ffi::check(unsafe { (ops.k.dequant_q8)(ops.g(), self.w.ptr(), sc.ptr(), self.n as i64, self.k as i64, d.ptr()) }, "Q8_0 expand")?;
+                d.ptr()
+            }
+            t => return Err(Error(format!("a wide product of weights of type {t}"))),
+        };
         ops.to_half(x, xh.ptr(), m * self.k)?;
         let bias = self.bias.as_ref().map_or(none(), |b| b.ptr() as *const c_void);
-        nsd.linear(xh.ptr(), Dt::F16, m, self.k, self.w.ptr(), self.n, bias, out.cast(), Dt::F32)
+        nsd.linear(xh.ptr(), Dt::F16, m, self.k, w, self.n, bias, out.cast(), Dt::F32)
     }
 }

@@ -1,4 +1,4 @@
-//! The kernels this engine runs, bound from the audio kernel library by name: the MiniMax Music engine's small-batch
+//! The kernels this engine runs, bound from the audio kernel library by name: the MiniMax Music engine's
 //! product, key / value store, conversions, transpose and oneDNN convolutions (`kernels/audio/minimaxmusic3/mm3.h`),
 //! Breeze TTS 2's per-head RoPE from a frequency table (`kernels/audio/breezetts2/bz2.h`), the 12 Hz codec's
 //! layer-scaled residual and SiLU (`kernels/audio/qwen3tts/q3t.h`), and its own (`kernels/audio/vibevoice/vv.h`): the
@@ -13,7 +13,6 @@ type P = *const c_void;
 
 #[allow(clippy::type_complexity)]
 pub struct Api {
-    pub gemv: unsafe extern "C" fn(G, *const f32, i64, i64, P, c_int, *const f32, i64, *const f32, *mut f32, i64, c_int) -> c_int,
     pub kv_store: unsafe extern "C" fn(G, *const f32, *const f32, i64, i64, i64, i64, i64, i64, i64, M, M) -> c_int,
     pub to_half: unsafe extern "C" fn(G, *const f32, M, i64) -> c_int,
     pub add: unsafe extern "C" fn(G, *mut f32, *const f32, i64) -> c_int,
@@ -26,6 +25,12 @@ pub struct Api {
     pub attn: unsafe extern "C" fn(G, *const f32, i64, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
     pub dwconv: unsafe extern "C" fn(G, *const f32, *const f32, i64, i64, *const f32, *const f32, i64, *mut f32) -> c_int,
     pub ctx_push: unsafe extern "C" fn(G, *mut f32, i64, *const f32, i64, i64) -> c_int,
+    pub gemv: unsafe extern "C" fn(G, *const f32, i64, i64, i64, P, c_int, P, i64, *const f32, c_int, *const f32, *mut f32, i64) -> c_int,
+    pub rms_norm: unsafe extern "C" fn(G, *const f32, i64, i64, *const f32, f32, *const f32, *const f32, i64, *mut f32) -> c_int,
+    pub rope_kv: unsafe extern "C" fn(G, *mut f32, i64, i64, *const i32, i64, i64, i64, *const f32, M, M, i64, M, M, i64) -> c_int,
+    pub attn_dec: unsafe extern "C" fn(G, *const f32, i64, i64, *const i32, P, P, i64, P, P, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
+    pub dequant_q8: unsafe extern "C" fn(G, P, P, i64, i64, M) -> c_int,
+    pub swiglu_pairs: unsafe extern "C" fn(G, *const f32, i64, i64, *mut f32) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -50,7 +55,6 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             }};
         }
         Ok(Api {
-            gemv: sym!("ns_audio_mm3_gemv"),
             kv_store: sym!("ns_audio_mm3_kv_store"),
             to_half: sym!("ns_audio_mm3_to_half"),
             add: sym!("ns_audio_mm3_add"),
@@ -63,6 +67,12 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             attn: sym!("ns_audio_vv_attn"),
             dwconv: sym!("ns_audio_vv_dwconv"),
             ctx_push: sym!("ns_audio_vv_ctx_push"),
+            gemv: sym!("ns_audio_vv_gemv"),
+            rms_norm: sym!("ns_audio_vv_rms_norm"),
+            rope_kv: sym!("ns_audio_vv_rope_kv"),
+            attn_dec: sym!("ns_audio_vv_attn_dec"),
+            dequant_q8: sym!("ns_audio_vv_dequant_q8"),
+            swiglu_pairs: sym!("ns_audio_vv_swiglu_pairs"),
         })
     })
     .as_ref()

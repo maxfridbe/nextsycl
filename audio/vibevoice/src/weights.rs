@@ -158,7 +158,106 @@ impl Weights {
             }
             None => None,
         };
-        Ok(Mat { w, bias, n, k, k_in })
+        Ok(Mat { w, wt: 0, scales: None, bias, n, k, k_in })
+    }
+
+    /// The language model's matrices, stacked by rows as `mat` does: kept as the file holds them when that is Q8_0
+    /// (the codes and the block scales apart: half the bytes a step reads), else in half. `interleave`: the two
+    /// matrices' rows alternated - gate i, up i - as Epi::Swiglu takes them.
+    pub fn mat_lm(&self, ops: &Ops, names: &[&str], bias: Option<&[&str]>, interleave: bool) -> Result<Mat> {
+        let mut k = 0;
+        let mut rows = Vec::new();
+        for name in names {
+            let s = self.shape(name)?;
+            if s.len() != 2 || (k != 0 && s[1] != k) {
+                return Err(Error(format!("{name}: shape {s:?}, a matrix {k} wide expected")));
+            }
+            k = s[1];
+            rows.push(s[0]);
+        }
+        if interleave && (names.len() != 2 || rows[0] != rows[1] || bias.is_some()) {
+            return Err(Error(format!("{names:?}: two matrices of as many rows, without biases, to interleave")));
+        }
+        let q8 = names.iter().all(|n| self.tensor(n).is_ok_and(|t| t.ty == GType::Q8_0)) && k.is_multiple_of(32);
+        if !q8 && !interleave {
+            return self.mat(ops, names, bias, false);
+        }
+        let n: usize = rows.iter().sum();
+        let gpu = &ops.gpu;
+        let blocks = k / 32;
+        let (w, scales) = if q8 { (DevBuf::new(gpu, n * k)?, Some(DevBuf::new(gpu, n * blocks * 2)?)) } else { (DevBuf::new(gpu, n * k * 2)?, None) };
+        // rows [r0, r1) of one matrix on the host: Q8_0 codes and scales (the f16 bits), or float32 values
+        let host = |name: &str, r0: usize, r1: usize| -> Result<(Vec<u8>, Vec<u8>, Vec<f32>)> {
+            if !q8 {
+                return Ok((Vec::new(), Vec::new(), self.rows(name, r0, r1)?));
+            }
+            let t = self.tensor(name)?;
+            let rb = blocks * 34;
+            let mut raw = vec![0u8; (r1 - r0) * rb];
+            self.g.read_into(t, (r0 * rb) as u64, &mut raw).map_err(|e| Error(e.0))?;
+            let (mut codes, mut d) = (Vec::with_capacity((r1 - r0) * k), Vec::with_capacity((r1 - r0) * blocks * 2));
+            for b in raw.chunks_exact(34) {
+                d.extend_from_slice(&b[..2]);
+                codes.extend_from_slice(&b[2..]);
+            }
+            Ok((codes, d, Vec::new()))
+        };
+        // output rows from `at` on, from the host
+        let stage = if q8 { None } else { Some(DevBuf::f32(gpu, ((8usize << 20) / k).max(2) * k)?) };
+        let upload = |at: usize, (codes, d, v): (Vec<u8>, Vec<u8>, Vec<f32>)| -> Result<()> {
+            if let Some(sc) = &scales {
+                w.write(at * k, &codes)?;
+                return sc.write(at * blocks * 2, &d);
+            }
+            let stage = stage.as_ref().ok_or_else(|| Error("no staging buffer".into()))?;
+            stage.write(0, &crate::bytes(&v))?;
+            ops.to_half(stage.fp(), w.ptr().wrapping_byte_add(at * k * 2), v.len())?;
+            gpu.sync()
+        };
+        // a staging buffer's worth of output rows a piece (half of it from each matrix when interleaving)
+        let step = (((8usize << 20) / k).max(2) / 2).max(1);
+        if interleave {
+            let mut r0 = 0;
+            while r0 < rows[0] {
+                let r1 = (r0 + step).min(rows[0]);
+                let (a, b) = (host(names[0], r0, r1)?, host(names[1], r0, r1)?);
+                let mut out = (Vec::new(), Vec::new(), Vec::new());
+                for i in 0..r1 - r0 {
+                    for p in [&a, &b] {
+                        if q8 {
+                            out.0.extend_from_slice(&p.0[i * k..(i + 1) * k]);
+                            out.1.extend_from_slice(&p.1[i * blocks * 2..(i + 1) * blocks * 2]);
+                        } else {
+                            out.2.extend_from_slice(&p.2[i * k..(i + 1) * k]);
+                        }
+                    }
+                }
+                upload(2 * r0, out)?;
+                r0 = r1;
+            }
+        } else {
+            let mut at = 0;
+            for (name, &nr) in names.iter().zip(&rows) {
+                let mut r0 = 0;
+                while r0 < nr {
+                    let r1 = (r0 + 2 * step).min(nr);
+                    upload(at + r0, host(name, r0, r1)?)?;
+                    r0 = r1;
+                }
+                at += nr;
+            }
+        }
+        let bias = match bias {
+            Some(bs) => {
+                let mut v = Vec::with_capacity(n);
+                for bn in bs {
+                    v.extend(self.all(bn)?);
+                }
+                Some(DevBuf::from_f32(gpu, &v)?)
+            }
+            None => None,
+        };
+        Ok(Mat { w, wt: if q8 { 2 } else { 0 }, scales, bias, n, k, k_in: k })
     }
 }
 
