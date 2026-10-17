@@ -6,6 +6,7 @@ arch: deepseek2
 title: DeepSeek-R1 671B UD-IQ1_S · 32K context (both GPUs, pinned memory and the NVMe; ~7 tok/s)
 about: unsloth's 1.58-bit dynamic quant of DeepSeek-R1 (131 GiB); the experts beyond VRAM in pinned memory (multiplied on the CPU) and read from the file
 gpus: all
+streams: true                   # experts beyond VRAM and pinned memory read from the file while it serves: keep it on the fastest drive
 vram_gib: 30.0
 ctx: '32768'
 tools: false

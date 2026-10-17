@@ -70,6 +70,8 @@ fn model(cfg: &Config, args: &[String], want: &str) -> Result<(Value, ModelFiles
     if models::kind_of(&m) != "model3d" {
         return Err(format!("{} is a {} model, not a 3D one", m["id"].as_str().unwrap_or("?"), models::kind_of(&m)));
     }
+    // not while its files move to another drive (nextsycl models move)
+    crate::drives::not_moving(cfg, m["id"].as_str().unwrap_or(""))?;
     let files: ModelFiles = m["files"].as_object().into_iter().flatten().filter_map(|(r, p)| Some((r.clone(), PathBuf::from(p.as_str()?)))).collect();
     Ok((m, files))
 }

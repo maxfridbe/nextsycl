@@ -60,7 +60,7 @@ pub fn switch(args: &[String]) -> Result<(), String> {
 /// NS_PORT, NS_SWITCH_PORT, NS_IMAGE_PORT(2), NS_AUDIO_PORT(2), NS_VIDEO_PORT, NS_CHAT_UI_PORT; the API's token NS_API_TOKEN
 /// (else one made and kept beside the registry); NS_IDLE_MINUTES.
 /// The registry and the settings for the front door (nextsycl-models', which the glue may not depend on)
-struct Store(Config);
+pub(crate) struct Store(pub(crate) Config);
 
 impl nextsycl_serve::home::registry::Store for Store {
     fn models(&self) -> Result<Vec<serde_json::Value>, String> {

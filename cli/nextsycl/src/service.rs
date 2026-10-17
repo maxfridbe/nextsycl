@@ -57,6 +57,8 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
         if m["enabled"] == false {
             return Err(format!("{id} is disabled (nextsycl models enable {id})"));
         }
+        // not while its files move to another drive (nextsycl models move)
+        crate::drives::not_moving(cfg, &id)?;
         raw.remove(0);
         let get = |k: &str| m.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
         for (flag, key) in [("--model", "file"), ("--ctx", "ctx"), ("--name", "id")] {

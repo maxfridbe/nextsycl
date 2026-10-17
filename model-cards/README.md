@@ -20,6 +20,9 @@ vram_gib: 29.0                  # its memory on each card when it runs, as measu
 headroom_gib: 3.3               # optional: of vram_gib, the working memory beyond the weights (KV for its context, arenas,
                                 #   a song's or an image's activations) - the front door shows it apart (else: vram_gib less
                                 #   the files' share of the card; none when the files do not all sit on the card)
+streams: true                   # optional: it reads weights from its files while it serves (experts or rows from the
+                                #   file as decode needs them), so its drive's speed is its speed - the front door warns
+                                #   before moving it to a slower drive (README: Drives)
 ctx: 131072,32768               # llm: each session's context
 tools: true                     # llm: tool calls offered to it (false: dropped)
 tasks: true                     # llm: a front end's background tasks (titles, tags) accepted

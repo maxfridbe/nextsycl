@@ -84,6 +84,14 @@ pub const METHODS: &[Method] = &[
                        ("eta_s", "number", "about how long, in seconds: retry_after_s and the notice's end", false),
                        ("unload", "boolean", "true: unload the loaded models not answering now (frees the cards)", false)],
              example: r#"{"on": true, "message": "kernel work", "eta_s": 3600, "unload": true}"# },
+    Method { kind: "system", name: "drives", summary: "The drives the models are on: device, PCIe link, mount, size, free space, the models' bytes, the read speed as measured (and when); each model's bytes by drive, whether it streams its weights from the disk while it serves, and for each other drive what a move needs or why it cannot move now; the move under way (or the last)",
+             fields: &[], example: "{}" },
+    Method { kind: "system", name: "drive.measure", summary: "Measure a drive's read speed in the background (up to 4 GiB of its largest model files read with O_DIRECT, past the page cache; nothing written), kept with its date (system.drives). Refused while a model loads from it or a move uses it",
+             fields: &[("drive", "string", "the drive's id (nvme1n1) or its mount point (system.drives)", true)], example: r#"{"drive": "nvme1n1"}"# },
+    Method { kind: "system", name: "move", summary: "Move a model's files to another drive, as a job (its progress in system.drives' move): each file copied and read back (size, SHA-256), then the registry repointed, then the old files removed - those another model names stay. Refused while the model is loaded or loading (stop it first), another move runs, or the drive lacks the room (plus 1%, at least 4 GiB); nothing loads the model while it moves",
+             fields: &[MODEL, ("drive", "string", "the drive's id (nvme1n1) or its mount point (system.drives)", true)], example: r#"{"model": "olmocr-2-7b-q8", "drive": "nvme1n1"}"# },
+    Method { kind: "system", name: "move.cancel", summary: "Stop the move under way: what it copied is removed and the registry stays as it was (once the registry is repointed it finishes)",
+             fields: &[], example: "{}" },
 
     Method { kind: "llm", name: "chat", summary: "A chat completion (OpenAI's body; stream is ignored - use /v1/chat/completions to stream)",
              fields: &[("model", "string", "a chat model's id", true), ("messages", "object[]", "[{role, content}]", true),
@@ -369,6 +377,7 @@ const FEATURES: &[&str] = &[
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
+    "system.drives", "system.move",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -805,6 +814,13 @@ impl Home {
             ("system", "configSet") => self.config_set(b),
             ("system", "restart") => self.restart(&s(b, "service")),
             ("system", "maintenance") => self.maintenance_set(b),
+            ("system", "drives") => {
+                let cards = self.named_cards(&all);
+                Ok(self.drives_view(&all, &self.model_states(&all, &cards)))
+            }
+            ("system", "drive.measure") => self.drive_measure(&s(b, "drive")),
+            ("system", "move") => self.model_move(&model(), &s(b, "drive")),
+            ("system", "move.cancel") => self.move_cancel(),
             (k, "describePromptGuideMD") => {
                 let e = all.iter().find(|x| x["id"] == model().as_str()).ok_or_else(|| (404, format!("no model {}", model())))?;
                 if registry::kind_of(e) != k {

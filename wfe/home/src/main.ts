@@ -74,7 +74,8 @@ async function poll(): Promise<void> {
     ui.error = `nextsycl serve does not answer (${String(e)})`;
   }
   render();
-  const busy = Object.keys(ui.pending).length > 0 || ui.state?.runs.some((x) => x.rc === null);
+  const busy = Object.keys(ui.pending).length > 0 || ui.state?.runs.some((x) => x.rc === null)
+    || !!ui.state?.drives?.move?.running || !!ui.state?.drives?.measuring;
   setTimeout(() => void poll(), busy ? 1000 : 2500);
 }
 
@@ -107,6 +108,19 @@ export async function act(what: string, model: string, extra: Record<string, unk
   } catch (e) {
     ui.error = String(e);
     delete ui.pending[model];
+  }
+  render();
+  void poll();
+}
+
+/** A drive action (measure, move, move_cancel): answered at once, its progress in the state's drives */
+export async function driveAct(body: Record<string, unknown>): Promise<void> {
+  try {
+    const r = await fetch("/api/action", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const j = (await r.json()) as { error?: string };
+    if (!r.ok) ui.error = j.error ?? `HTTP ${r.status}`;
+  } catch (e) {
+    ui.error = String(e);
   }
   render();
   void poll();

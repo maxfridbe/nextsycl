@@ -4,6 +4,9 @@
 //!   for (hatched; several may vouch for one card: whichever loads first holds it) - and every registered model:
 //!   enable it on GPU(s), start (load now: the button spins until it answers) and stop (unload), its page, its state;
 //!   an API tab with the bearer token and a curl for every method; maintenance mode on and off (maint.rs).
+//! - **The drives** (disks.rs, crate::drives): each drive the models are on - device, link, free space, a read speed
+//!   measured on demand - and moving a model's files to another one (copied, checked, the registry repointed, the old
+//!   files removed), one move at a time, never while the model is loaded.
 //! - **Enabled models** load on their first request (an API call here, its page, Open WebUI through the switcher) and
 //!   unload after `idle_minutes` without one (the image and audio servers exit, the switcher sets the chat mode to
 //!   none, the video daemon's workers let their card go); they stay enabled. Disabled: unloaded, gone from Open WebUI's
@@ -20,6 +23,7 @@
 
 mod api;
 mod config;
+mod disks;
 mod jobs;
 mod life;
 mod maint;
@@ -106,6 +110,8 @@ pub struct Home {
     /// lets a request through it (kept in the state file; empty: none)
     maint_file: PathBuf,
     maint_bypass: Mutex<String>,
+    /// the drives: their measured speeds (kept in the state file), a measurement and a move under way (disks.rs)
+    disks: disks::Disks,
 }
 
 pub(crate) fn now() -> f64 {
@@ -192,7 +198,7 @@ impl Home {
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()), chat_keep: Mutex::new(BTreeMap::new()),
-            maint_file, maint_bypass,
+            maint_file, maint_bypass, disks: disks::Disks::new(&st),
         });
         let me = h.clone();
         std::thread::spawn(move || me.sample_cards());
@@ -252,7 +258,8 @@ impl Home {
     }
 
     fn save_state(&self) {
-        let st = json!({"token": self.token, "seen": *self.seen.lock().unwrap(), "maintenance_bypass": *self.maint_bypass.lock().unwrap()});
+        let st = json!({"token": self.token, "seen": *self.seen.lock().unwrap(), "maintenance_bypass": *self.maint_bypass.lock().unwrap(),
+                        "drives": *self.disks.measured.lock().unwrap()});
         let tmp = self.state_file.with_extension("json.tmp");
         if std::fs::write(&tmp, serde_json::to_string_pretty(&st).unwrap_or_default()).is_ok() {
             let _ = std::fs::rename(&tmp, &self.state_file);
@@ -417,7 +424,7 @@ impl Home {
         });
         json!({"ts": now(), "host": meminfo(), "cards": cards, "models": models, "services": self.services(), "runs": runs,
                "idle_minutes": self.o.idle_minutes, "ports": {"video": self.o.ports.video, "chat_ui": self.o.ports.chat_ui},
-               "maintenance": maintenance})
+               "maintenance": maintenance, "drives": self.drives_view(&all, &models)})
     }
 
     /// The cards, a process's model by its registry id where its file is a registered one (`model_id`)
@@ -489,8 +496,8 @@ impl Home {
         }
     }
 
-    /// The page's buttons: {"do": enable | disable | load | unload, "model", "gpus": [..], "force"}; a load runs on (the
-    /// state shows it loading), the others answer when done
+    /// The page's buttons: {"do": enable | disable | load | unload | measure | move | move_cancel, "model", "gpus": [..],
+    /// "force", "drive"}; a load, a measurement and a move run on (the state shows them), the others answer when done
     fn action(self: &Arc<Self>, b: &Value) -> Result<Value, (u16, String)> {
         let model = b["model"].as_str().unwrap_or("").to_string();
         match b["do"].as_str().unwrap_or("") {
@@ -505,7 +512,10 @@ impl Home {
             "config" => self.config_set(b),
             "restart" => self.restart(b["service"].as_str().unwrap_or("")),
             "maintenance" => self.maintenance_set(b),
-            other => Err((400, format!("no action {other:?} (enable, disable, gpus, load, unload, config, restart, maintenance)"))),
+            "measure" => self.drive_measure(b["drive"].as_str().unwrap_or("")),
+            "move" => self.model_move(&model, b["drive"].as_str().unwrap_or("")),
+            "move_cancel" => self.move_cancel(),
+            other => Err((400, format!("no action {other:?} (enable, disable, gpus, load, unload, config, restart, maintenance, measure, move, move_cancel)"))),
         }
     }
 }
