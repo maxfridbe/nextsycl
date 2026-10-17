@@ -80,6 +80,9 @@ on the B70. **Breeze TTS 2** (`audio/breezetts2`): English and Chinese speech - 
 cloned from a recording and its transcript, or cloned and directed by an instruction, vocal events inline ("(laugh)",
 "[笑]") - its T5Gemma2 text encoder, Qwen3 backbone and depth decoder from CrispASR's GGUF on the music engine's kernels
 and its own, the 12 Hz codec shared with Qwen3-TTS; checked against upstream's code; 1.8-2.2x real time on the B70.
+**VibeVoice** (`audio/vibevoice`): long-form speech of up to four speakers, each voice cloned from a recording without
+its transcript - its Qwen2.5-1.5B language model, diffusion head and streaming σ-VAE decoder and semantic encoder in
+SYCL from gguf-org's GGUF, checked stage by stage against transformers' implementation; 5.8x real time on the B70.
 
 A skill for porting to SYCL on Arc - the safety rules, migration traps, parity method, profiling and what made
 things fast, learned on these ports: [skills/sycl-porting/SKILL.md](skills/sycl-porting/SKILL.md).
@@ -165,6 +168,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `voxcpm2` | VoxCPM2 2B: speech in 30 languages at 48 kHz - plain, designed from a description, cloned (with a transcript: continued); MiniCPM4 language models, a local flow-matching DiT, AudioVAE V2 | `voxcpm2` | 4.6 GiB | checked, served |
 | `voxcpm2-int8` | the same files, the language models in int8 at load | `voxcpm2` | 4.6 GiB | checked, served |
 | `breeze-tts-2` | Breeze TTS 2 (~3B, Q8_0 GGUF): English and Chinese at 24 kHz - voices designed, cloned (recording + transcript) or directed (a clone + an instruction), vocal events; weights and outputs non-commercial (BreezeBlue license) | `breezetts2` | 3.4 GB + codec | checked |
+| `vibevoice-1.5b` | VibeVoice-1.5B (Q8_0 GGUF): long-form speech of up to four speakers in English and Chinese at 24 kHz, each voice cloned from a recording (no transcript); MIT, with Microsoft's responsible-use terms | `vibevoice` | 3.9 GiB | checked |
 | `breeze-tts-2-q4` | the same model from the Q4_K GGUF (a 2.2 GB download; the same memory on the card; the 4-bit text encoder is 1e-1 from upstream - a word can slip) | `breezetts2` | 2.2 GB + codec | checked |
 
 **3D** (`nextsycl model3d`: rigging and animation of a mesh; the result keeps the input mesh, its UVs and textures)
@@ -878,6 +882,45 @@ nextsycl audio check <reference dump dir> --model breeze-tts-2 [--stages prompt,
   codec 1.4-5e-6. Real clips in every mode, English and Chinese, transcribe word for word (Whisper small).
 - **Speed** (B70, 2026-10-16): 22 frames a second with guidance (design, direction: 1.8x real time), 28 without
   (clone: 2.2x); 5.4 s of designed speech in 3.9 s with the decode. 5.4 GiB of weights, 6.1 GiB in a run.
+
+### VibeVoice
+
+VibeVoice-1.5B (`audio/vibevoice`, Microsoft; gguf-org's GGUF of it): long-form, multi-speaker speech in English and
+Chinese at 24 kHz. A script of up to four speakers (`Speaker 1: ...`, a turn a line) is read by a Qwen2.5-1.5B
+language model; for each 7.5 Hz frame a diffusion head draws a 64-value acoustic latent (10 DPM-Solver++ steps, guided
+by a second, negative run of the language model: `--cfg`, 1.3), the σ-VAE acoustic decoder turns it into 3,200
+samples, and the semantic encoder reads them back for the next step. Each speaker's voice is cloned from a recording
+(no transcript needed: `--ref-audio` once a speaker in order, or saved voices `--voices NAME,NAME`); a speaker without
+one gets a voice of the model's own. The model ends the speech itself (up to 90 minutes). **License: MIT; Microsoft's
+model card restricts its use - no imitation of a real person's voice without their consent, no passing its speech off
+as real, disclose that the audio is AI-generated.**
+
+```sh
+nextsycl models pull vibevoice-1.5b
+nextsycl audio gen "Speaker 1: Welcome back to the show.\nSpeaker 2: Thanks for having me." --model vibevoice-1.5b \
+                   --ref-audio host.wav --ref-audio guest.wav [--cfg 1.3] [--steps 10] [--seed N]
+nextsycl audio gen "Good morning. The bread is still warm." --model vibevoice-1.5b [--voice SAVED]
+nextsycl audio check <reference dump dir> --model vibevoice-1.5b [--stages prompt,lm,head,codec,run]
+```
+
+The audio server and the front door take a script's voices as `voices` (saved voices) or `ref_audios` (recordings), a
+speaker each in order; `audio.speak` picks a model of several speakers (card `speech: speakers`) for them.
+
+- **Ported**: the GGUF's tensors expanded to half at load (the language model Q8_0, the rest BF16: exact in half; the
+  convolutions float32 for oneDNN; the token embedding read from the file a row a token, the tied head's four tokens on
+  the card); the tokenizer and config.json from the -hf checkpoint. The language model on the music engine's product
+  and cache, Breeze's RoPE and this engine's attention for six query heads a key head (`kernels/audio/vibevoice`), its
+  two guidance branches in one paired pass a step; the head's branches as two rows, DPM-Solver++ on the host; the
+  tokenizers streaming a frame at a time over time rows, each causal convolution carrying its last inputs (this
+  engine's depthwise convolution, mm3's oneDNN convolutions transposed around).
+- **Checked** against transformers' implementation (`reference/vibevoice/ref.py`, float32 on the CPU; its loop
+  bit-identical to `generate`'s frames): token ids identical; with the f16 GGUF the language model's logits 4e-4 and
+  hidden states 2e-3 / 5e-4 teacher forced (51 of 51 tokens agree), with the served Q8_0 2e-3 and 1.4-2e-2 (its
+  quantization); the diffusion head 4e-7, the acoustic decoder 2e-4, the semantic encoder 7-10e-4, the voice encoder
+  3e-4 / 1e-3. Clips plain, cloned, two-speaker and a 46 s show transcribe word for word (Whisper small); the
+  speakers alternate as cast (pitch). `docs/ports/vibevoice.md` has the details.
+- **Speed** (2026-10-17): 43.5 frames a second on the B70 (5.8x real time: 46.5 s of a two-speaker show in 8.8 s with
+  the prompt), 38.9 on the B65 (5.2x). 4.9 GiB of weights, 5.6 GiB in a run.
 
 ### VoxCPM2
 

@@ -33,8 +33,7 @@ Saved voices (`audio.voices.add`) work with or without their transcript: `voice:
 ## Settings
 `cfg` (1.3: the diffusion head's guidance - higher holds the voice tighter, too high sounds harsh), `steps` (10: the
 diffusion steps a frame), `seed` (the voices made up and the details of delivery), `seconds` (the most; the model ends
-the speech itself - a script of a few minutes takes a few minutes of frames). The speed is about 7.5 frames (one
-second) of speech for each frame the card makes - see the README for the measured real-time factor.
+the speech itself). On a B70 it makes speech about 5.8 times faster than real time (a minute in about 10 s).
 
 ## License and responsible use
 MIT (Microsoft's weights; gguf-org's conversion; this engine). Microsoft's model card restricts its use: do not use

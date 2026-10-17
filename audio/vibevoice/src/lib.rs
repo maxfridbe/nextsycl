@@ -350,12 +350,12 @@ impl VibeVoice {
         lat_row.fill(0)?;
         let (tmp, ctmp, xh) = (DevBuf::f32(g, h)?, DevBuf::f32(g, h)?, DevBuf::new(g, 2 * h * 2)?);
         let next = DevBuf::f32(g, h)?;
-        let prev = DevBuf::f32(g, h)?;
         let bos = DevBuf::from_f32(g, &self.embedding(self.cfg.audio_bos)?)?;
         let tokens = [self.cfg.audio_bos, self.cfg.audio_eos, self.cfg.audio, self.cfg.eos];
         let mut rng = Rng::new(s.seed);
         let (mut p, mut np, mut frames) = (l, 0usize, 0usize);
-        let mut have_prev = false;
+        // whether cond's second row holds the negative branch's next hidden state already (the paired step made it)
+        let mut paired = false;
         let mut samples = Vec::new();
         for _ in 0..max_steps {
             ops.gemv(cond.fp(), 1, &self.logit_rows, logits.fp(), 4, false)?;
@@ -375,12 +375,16 @@ impl VibeVoice {
                 // the negative branch starts over: its audio start at position 0, the next input at 1
                 self.lm.step(ops, nsd, &neg, &bos, 0, &tmp)?;
                 np = 1;
+                paired = false;
             }
             if tok == self.cfg.audio {
-                // the negative branch reads what the positive one just read (an audio start first)
-                self.lm.step(ops, nsd, &neg, if have_prev { &prev } else { &bos }, np, &tmp)?;
+                // the negative branch reads what the positive one just read (an audio start, before any): the paired
+                // step read it already
+                if !paired {
+                    self.lm.step(ops, nsd, &neg, &bos, np, &tmp)?;
+                    cond.copy_within(h * 4, &tmp, 0, h * 4)?;
+                }
                 np += 1;
-                cond.copy_within(h * 4, &tmp, 0, h * 4)?;
                 let z: Vec<f32> = match noise {
                     Some(n) => n.get(frames).cloned().ok_or_else(|| Error(format!("no noise for frame {frames}")))?,
                     None => (0..self.head.latent).map(|_| rng.normal()).collect(),
@@ -416,10 +420,11 @@ impl VibeVoice {
             if tok == self.cfg.eos || frames >= s.frames {
                 break;
             }
-            self.lm.step(ops, nsd, &pos, &next, p, &cond)?;
+            // both branches read the next input in one pass (the weights read once): the positive always, the negative
+            // for the next step if it is an audio frame (else its row goes unused and its position is written again)
+            self.lm.pair(ops, nsd, &pos, p, &neg, np, &next, &cond)?;
+            paired = true;
             p += 1;
-            prev.copy_within(0, &next, 0, h * 4)?;
-            have_prev = true;
         }
         g.sync()?;
         if samples.is_empty() {

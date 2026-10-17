@@ -150,6 +150,36 @@ impl Lm {
         nsd.rms_norm_mod(c.x.ptr(), Dt::F32, n, h, self.norm.ptr(), self.eps, none(), none(), none(), c.out.ptr(), Dt::F32)
     }
 
+    /// One row through two sequences at once - `row` at position `pa` of cache `a` and at `pb` of cache `b` - so the
+    /// weights are read once for both (the guidance's two branches read the same input). Their normed outputs in
+    /// `last` [2, hidden]: a's, then b's. Runs in a's work buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pair(&self, ops: &Ops, nsd: &Nsd, a: &Cache, pa: usize, b: &Cache, pb: usize, row: &DevBuf, last: &DevBuf) -> Result<()> {
+        if pa >= a.t || pb >= b.t || a.rows < 2 {
+            return Err(Error(format!("a paired step at {pa} / {pb}: the caches hold {} / {} positions", a.t, b.t)));
+        }
+        let (h, w, q) = (self.hidden, self.qkv_width(), self.heads * HEAD);
+        a.x.copy_within(0, row, 0, h * 4)?;
+        a.x.copy_within(h * 4, row, 0, h * 4)?;
+        for (li, l) in self.layers.iter().enumerate() {
+            nsd.rms_norm_mod(a.x.ptr(), Dt::F32, 2, h, l.in_norm.ptr(), self.eps, none(), none(), none(), a.hb.ptr(), Dt::F32)?;
+            ops.gemv(a.hb.fp(), 2, &l.qkv, a.qkv.fp(), w, false)?;
+            for (r, c, p) in [(0, a, pa), (1, b, pb)] {
+                let qr = fp(&a.qkv, r * w);
+                ops.rope(qr, w, 1, 1, self.heads, HEAD, &self.inv_freq, p)?;
+                ops.rope(qr.wrapping_add(q), w, 1, 1, self.kv, HEAD, &self.inv_freq, p)?;
+                ops.kv_store(qr.wrapping_add(q), qr.wrapping_add(q + self.kv * HEAD), w, 1, 1, self.kv, HEAD, c.t, p, &c.k[li], &c.v[li])?;
+                ops.attn(qr, w, &c.k[li], &c.v[li], 1, 1, self.heads, self.kv, HEAD, c.t, p, fp(&a.att, r * q), c.part.fp())?;
+            }
+            ops.gemv(a.att.fp(), 2, &l.o, a.x.fp(), h, true)?;
+            nsd.rms_norm_mod(a.x.ptr(), Dt::F32, 2, h, l.post_norm.ptr(), self.eps, none(), none(), none(), a.hb.ptr(), Dt::F32)?;
+            ops.gemv(a.hb.fp(), 2, &l.gu, a.gu.fp(), l.gu.n, false)?;
+            nsd.swiglu(a.gu.ptr(), Dt::F32, 2, self.ffn, a.act.ptr(), Dt::F32)?;
+            ops.gemv(a.act.fp(), 2, &l.down, a.x.fp(), h, true)?;
+        }
+        nsd.rms_norm_mod(a.x.ptr(), Dt::F32, 2, h, self.norm.ptr(), self.eps, none(), none(), none(), last.ptr(), Dt::F32)
+    }
+
     /// Rows [L, hidden] (host) from position p0 in passes of the cache's width; the last row's normed output in `last`
     pub fn prefill(&self, ops: &Ops, nsd: &Nsd, c: &Cache, rows: &[f32], p0: usize, last: &DevBuf) -> Result<()> {
         let h = self.hidden;

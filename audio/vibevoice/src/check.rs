@@ -141,13 +141,14 @@ pub fn run(e: &VibeVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
         let l = prefill.len() / h;
         let pos = e.lm.cache(ops, crate::CHUNK, l + toks.len() + 1)?;
         let neg = e.lm.cache(ops, 2, toks.len() + 2)?;
-        let (cond, tmp, next, prev) = (DevBuf::f32(g, h)?, DevBuf::f32(g, h)?, DevBuf::f32(g, h)?, DevBuf::f32(g, h)?);
+        // the run's own steps (VibeVoice::speak): both branches read each input in one paired pass
+        let (cond, tmp, next) = (DevBuf::f32(g, 2 * h)?, DevBuf::f32(g, h)?, DevBuf::f32(g, h)?);
         let bos = DevBuf::from_f32(g, &e.embedding(e.cfg.audio_bos)?)?;
         let logits = DevBuf::f32(g, 4)?;
         let t = Instant::now();
         e.lm.prefill(ops, &e.nsd, &pos, &prefill, 0, &cond)?;
         let (mut got_l, mut got_c, mut agree) = (Vec::new(), Vec::new(), 0);
-        let (mut frame, mut np, mut have_prev) = (0usize, 0usize, false);
+        let (mut frame, mut np, mut paired) = (0usize, 0usize, false);
         let tokens = [e.cfg.audio_bos, e.cfg.audio_eos, e.cfg.audio, e.cfg.eos];
         for (step, &tok) in toks.iter().enumerate() {
             ops.gemv(cond.fp(), 1, &e.logit_rows, logits.fp(), 4, false)?;
@@ -160,12 +161,15 @@ pub fn run(e: &VibeVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
             if tok == e.cfg.audio_bos {
                 e.lm.step(ops, &e.nsd, &neg, &bos, 0, &tmp)?;
                 np = 1;
+                paired = false;
             }
             if tok == e.cfg.audio {
-                e.lm.step(ops, &e.nsd, &neg, if have_prev { &prev } else { &bos }, np, &tmp)?;
+                if !paired {
+                    e.lm.step(ops, &e.nsd, &neg, &bos, np, &tmp)?;
+                    cond.copy_within(h * 4, &tmp, 0, h * 4)?;
+                }
                 np += 1;
                 got_c.extend(cond.to_f32()?);
-                got_c.extend(tmp.to_f32()?);
                 next.write(0, &bytes(&embeds[frame * h..(frame + 1) * h]))?;
                 frame += 1;
             } else {
@@ -174,9 +178,8 @@ pub fn run(e: &VibeVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
             if tok == e.cfg.eos || step + 1 == toks.len() {
                 break;
             }
-            e.lm.step(ops, &e.nsd, &pos, &next, l + step, &cond)?;
-            prev.copy_within(0, &next, 0, h * 4)?;
-            have_prev = true;
+            e.lm.pair(ops, &e.nsd, &pos, l + step, &neg, np, &next, &cond)?;
+            paired = true;
         }
         log(format!("{:<24} {} steps ({frame} frames) in {:.1} s; the best of four agrees at {agree} of {}", "lm (forced)", toks.len(),
                     t.elapsed().as_secs_f64(), toks.len()));
