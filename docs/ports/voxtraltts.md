@@ -117,10 +117,11 @@ are, vLLM's Mistral backbone written out, mistral-common's prompt. `nextsycl aud
 | flow results (teacher forced, the reference's noise) | 6.4e-4 (3 of 4,356 levels differ) | 4.9e-4 (2 of 1,584) |
 | flow alone (the reference's hidden states and noise, 16 frames) | velocities 1.7e-6, results 2.0e-6, 0 of 576 levels | 4.7e-7, 4.3e-7, 0 |
 | codec (the reference's codes) | 5.5e-4 | 5.4e-4 |
-| a free run with the reference's noise | identical for 34 frames | identical for 19 frames |
+| a free run with the reference's noise | identical for 1-34 frames (two runs) | identical for 19 frames |
 
 A free run parts from the reference at the first FSQ level that rounds the other way (a value within ~1e-3 of a
-level's edge): a level feeds the next frame's input. Judge parity by the teacher-forced stages.
+level's edge; which one varies from run to run with the GPU's summation order): a level feeds the next frame's input.
+Judge parity by the teacher-forced stages (re-run after merging main: the same numbers to two digits).
 
 Real clips (q8_0, `audio gen`, seed 3) transcribe word for word with Whisper small in all nine languages (English in
 three voices, French, German, Spanish, Italian, Portuguese, Dutch, Arabic; Hindi missed its first word, "नमस्ते").
