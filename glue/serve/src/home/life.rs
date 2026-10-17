@@ -157,6 +157,10 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             if speech("events") {
                 c.push("vocal_events");
             }
+            // a script of several speakers, each its own voice (voices / ref_audios)
+            if speech("speakers") {
+                c.push("multi_speaker");
+            }
             let mut methods = vec!["audio.speak"];
             if speech("design") {
                 methods.push("audio.voices.design");

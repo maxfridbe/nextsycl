@@ -12,6 +12,8 @@ const USAGE: &str = "nextsycl audio gen \"<description>\" [--lyrics TEXT | --lyr
                    [--cfg X] [--seed N] [--set NAME=VALUE]... [--opt-NAME VALUE]... [--out FILE|DIR] [--gpu N]
 nextsycl audio gen \"<text to say>\" --model qwen3-tts-... [--voice NAME] [--language L] [--instructions TEXT]
                    [--ref-audio FILE.wav [--ref-text TEXT]] [--cfg X] [--seconds N] [--seed N] [--out FILE|DIR]   (speech)
+nextsycl audio gen \"Speaker 1: ...\\nSpeaker 2: ...\" --model vibevoice-1.5b [--ref-audio S1.wav --ref-audio S2.wav ... |
+                   --voices NAME,NAME ...]   (a multi-speaker script: a recording or saved voice a speaker, in order)
 nextsycl audio serve [MODEL] [--port 8087] [--host 127.0.0.1] [--gpu N] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl audio start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
 nextsycl audio voice list                                   the saved voices (spoken by name: --voice NAME, \"voice\": NAME)
@@ -20,13 +22,13 @@ nextsycl audio voice add NAME --sample FILE [--text \"what it says\"] [--descrip
 nextsycl audio voice design NAME --instructions \"the voice\" [--text \"what the sample says\"] [--language L] [--seed N] [--replace]
                    a voice made up from a description (the front door's voice-design model reads a sample)
 nextsycl audio voice rm NAME            (addvoice / clonevoice NAME ... = voice add; designvoice = voice design)
-nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec] [--gpu N]
+nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | prompt,lm,head,codec,run] [--gpu N]
 nextsycl audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextsycl_audio::AudioKind> {
     vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_voxcpm2::kind(), nextsycl_audio_breezetts2::kind(),
-         nextsycl_audio_example::kind()]
+         nextsycl_audio_vibevoice::kind(), nextsycl_audio_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -40,6 +42,8 @@ fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
         let dir = Path::new(d);
         let (arch, files) = if let Ok(f) = nextsycl_audio_breezetts2::files_in(dir) {
             (nextsycl_audio_breezetts2::ARCH, f)
+        } else if let Ok(f) = nextsycl_audio_vibevoice::files_in(dir) {
+            (nextsycl_audio_vibevoice::ARCH, f)
         } else if dir.join("audiovae.pth").exists() {
             (nextsycl_audio_voxcpm2::ARCH, nextsycl_audio_voxcpm2::files_in(dir).map_err(|e| e.0)?)
         } else if dir.join("speech_tokenizer").is_dir() {
@@ -111,12 +115,38 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_nanos() as u64 % 100_000).unwrap_or(0)
     });
     let mut voice = opt(args, "--voice").map(str::to_string);
-    let reference = match opt(args, "--ref-audio") {
-        Some(f) => {
-            let b = std::fs::read(f).map_err(|e| format!("{f}: {e}"))?;
-            let (samples, rate) = nextsycl_audio::decode_audio(&b).map_err(|e| format!("{f}: {e}"))?;
-            Some(nextsycl_audio::Reference { samples, rate, text: opt(args, "--ref-text").map(str::to_string) })
+    // a multi-speaker script's voices: --ref-audio once a speaker (speaker 1's first), or --voices NAME,NAME (saved)
+    let recordings: Vec<&str> = args.windows(2).filter(|w| w[0] == "--ref-audio").map(|w| w[1].as_str()).collect();
+    let read_ref = |f: &str, text: Option<String>| -> Result<nextsycl_audio::Reference, String> {
+        let b = std::fs::read(f).map_err(|e| format!("{f}: {e}"))?;
+        let (samples, rate) = nextsycl_audio::decode_audio(&b).map_err(|e| format!("{f}: {e}"))?;
+        Ok(nextsycl_audio::Reference { samples, rate, text })
+    };
+    let mut references = Vec::new();
+    for f in recordings.iter().skip(1) {
+        references.push(read_ref(f, None)?);
+    }
+    let mut saved: Vec<String> = opt(args, "--voices").map(|v| v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+    if !saved.is_empty() {
+        if !recordings.is_empty() || voice.is_some() {
+            return Err("--voices names every speaker's saved voice: not with --voice or --ref-audio".into());
         }
+        if e.speech().is_none_or(|sp| sp.speakers < saved.len()) {
+            return Err(format!("--voices: {} voices, and {} speaks {} at most", saved.len(), m["id"].as_str().unwrap_or("this model"),
+                               e.speech().map_or(0, |sp| sp.speakers.max(1))));
+        }
+        let lib = nextsycl_serve::voices::Library::of(&out_dir(cfg, &[]));
+        for v in saved.iter().skip(1) {
+            references.push(lib.reference(v)?);
+        }
+        voice = Some(saved.remove(0));
+    }
+    if !references.is_empty() && e.speech().is_none_or(|sp| sp.speakers < references.len() + 1) {
+        return Err(format!("{} recordings, and {} speaks one voice (a model of several speakers: vibevoice-1.5b)", references.len() + 1,
+                           m["id"].as_str().unwrap_or("this model")));
+    }
+    let reference = match recordings.first() {
+        Some(f) => Some(read_ref(f, opt(args, "--ref-text").map(str::to_string))?),
         // a saved voice: its recording and transcript (for a model that clones)
         None => match (&voice, e.speech()) {
             (Some(v), Some(sp)) if !sp.voices.iter().any(|x| x.eq_ignore_ascii_case(v)) => {
@@ -150,11 +180,13 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         language: opt(args, "--language").map(str::to_string),
         instructions: opt(args, "--instructions").map(str::to_string),
         reference,
+        references,
     };
     let t0 = std::time::Instant::now();
     // frames a second of sound: speech 12.5, songs 25
     let fps = match e.arch() {
         "voxcpm2" => 6.25,
+        "vibevoice" => 7.5,
         _ if e.speech().is_some() => 12.5,
         _ => 25.0,
     };
@@ -232,13 +264,17 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,codec").split(',').collect();
         let e = nextsycl_audio_breezetts2::BreezeTts2::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_breezetts2::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_vibevoice::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,lm,head,codec,run").split(',').collect();
+        let e = nextsycl_audio_vibevoice::VibeVoice::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_vibevoice::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else if m["arch"] == nextsycl_audio_minimaxmusic3::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("ar,dit,voc").split(',').collect();
         let e = nextsycl_audio_minimaxmusic3::MiniMaxMusic3::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_minimaxmusic3::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH, nextsycl_audio_voxcpm2::ARCH,
-                           nextsycl_audio_breezetts2::ARCH));
+        return Err(format!("check knows {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH, nextsycl_audio_voxcpm2::ARCH,
+                           nextsycl_audio_breezetts2::ARCH, nextsycl_audio_vibevoice::ARCH));
     };
     println!("worst relative error {worst:.2e}");
     Ok(())
@@ -309,7 +345,7 @@ fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     a.extend(mount(&out, &out.to_string_lossy(), false));
     a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engines' own settings from the configuration (NS_MM3_INT8=1 ...)
-    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NS_VCP_")).chain(cfg.with_prefix("NS_BZ2_"))
+    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NS_VCP_")).chain(cfg.with_prefix("NS_BZ2_")).chain(cfg.with_prefix("NS_VV_"))
         .chain(cfg.with_prefix("NSD_")) {
         a.extend(["-e".into(), format!("{k}={v}")]);
     }

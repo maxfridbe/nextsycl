@@ -293,7 +293,8 @@ impl AudioServer {
             "model": self.model, "arch": e.arch(), "lyrics": e.lyrics(), "wfe": self.wfe.is_some(),
             "speech": e.speech().map(|sp| json!({"voices": sp.voices, "languages": sp.languages, "instructions": sp.instructions, "design": sp.design,
                                                  "clone": sp.clone, "clone_needs_text": sp.clone_needs_text, "clone_takes_text": sp.clone_takes_text,
-                                                 "direction": sp.direction, "events": sp.events, "requires": sp.requires})),
+                                                 "direction": sp.direction, "events": sp.events, "requires": sp.requires,
+                                                 "speakers": sp.speakers.max(1)})),
             "defaults": {"seconds": f(d.seconds), "max_seconds": f(d.max_seconds), "steps": d.steps, "cfg": f(d.cfg), "rate": d.rate},
             "options": e.options().iter().filter(|o| o.at != nextsycl_core::At::Load)
                 .map(|o| json!({"name": o.name, "value": o.value, "help": o.help})).collect::<Vec<_>>(),
@@ -421,6 +422,7 @@ impl AudioServer {
             language: text(&["language"]),
             instructions: instructions.clone(),
             reference,
+            references: Vec::new(),
         };
         let carried = text(&["continue_from"]);
         // carrying on: a voice that is not a saved one (a built-in voice of the chunk before) is in that chunk already
@@ -445,6 +447,40 @@ impl AudioServer {
                 req.voice = None;
                 saved = Some(v);
             }
+        }
+        // a multi-speaker script's voices, a speaker each in order: "voices" (saved voices' names) or "ref_audios"
+        // (recordings, base64 WAV); the first is the reference, the others `references`
+        let names: Vec<String> = b["voices"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        let recs: Vec<String> = b["ref_audios"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        if !names.is_empty() || !recs.is_empty() {
+            let sp = engine.speech().ok_or_else(|| bad("voices: speech's (this is a song model)".into()))?;
+            if !names.is_empty() && !recs.is_empty() {
+                return Err(bad("voices or ref_audios: one list of the speakers' voices, not both".into()));
+            }
+            if req.reference.is_some() || saved.is_some() || carried.is_some() {
+                return Err(bad("voices / ref_audios name every speaker's voice: not with voice, ref_audio or continue_from".into()));
+            }
+            let n = names.len().max(recs.len());
+            if n > sp.speakers.max(1) {
+                return Err(bad(format!("{n} speakers' voices: {} speaks {} at most", self.model, sp.speakers.max(1))));
+            }
+            let mut refs = Vec::new();
+            for v in &names {
+                let lib = self.voices().ok_or_else(|| bad(format!("voices: {v} - this server keeps no saved voices")))?;
+                if lib.get(v).is_none() {
+                    return Err(bad(format!("voices: {v} - no saved voice of that name")));
+                }
+                refs.push(lib.reference(v).map_err(bad)?);
+            }
+            for (i, a) in recs.iter().enumerate() {
+                let wav = http::unbase64(a).map_err(|e| bad(format!("ref_audios[{i}]: {e}")))?;
+                let (samples, rate) = nextsycl_audio::decode_wav(&wav).map_err(|e| bad(format!("ref_audios[{i}]: {e}")))?;
+                refs.push(nextsycl_audio::Reference { samples, rate, text: None });
+            }
+            req.reference = Some(refs.remove(0));
+            req.references = refs;
+            req.voice = None;
+            saved = names.first().cloned();
         }
         // carry on from speech made here: the end of that file (its last sentences) after the voice's reference
         if let Some(name) = &carried {
