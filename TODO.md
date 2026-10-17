@@ -430,6 +430,8 @@ profiling), README speed lines and cards' vram_gib, deploy.
 
 - [ ] Review `docs/proposals/speech-batching.md`: several speech requests in one engine's decode step (Breeze
       first; two servers a card measured a loss, 1.54x -> 0.65x).
+- [ ] Voxtral TTS cloning without its encoder, on the GPU: `docs/proposals/voxtral-encoderless-clone.md` (phase 2
+      of the port; shipped only if it beats the nearest preset on speaker likeness).
 
 ## To try
 
