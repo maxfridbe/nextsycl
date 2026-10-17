@@ -20,13 +20,13 @@ nextsycl audio voice add NAME --sample FILE [--text \"what it says\"] [--descrip
 nextsycl audio voice design NAME --instructions \"the voice\" [--text \"what the sample says\"] [--language L] [--seed N] [--replace]
                    a voice made up from a description (the front door's voice-design model reads a sample)
 nextsycl audio voice rm NAME            (addvoice / clonevoice NAME ... = voice add; designvoice = voice design)
-nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec] [--gpu N]
+nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | prompt,frames,flow,codec] [--gpu N]
 nextsycl audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextsycl_audio::AudioKind> {
     vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_voxcpm2::kind(), nextsycl_audio_breezetts2::kind(),
-         nextsycl_audio_example::kind()]
+         nextsycl_audio_voxtraltts::kind(), nextsycl_audio_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -40,6 +40,8 @@ fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
         let dir = Path::new(d);
         let (arch, files) = if let Ok(f) = nextsycl_audio_breezetts2::files_in(dir) {
             (nextsycl_audio_breezetts2::ARCH, f)
+        } else if let Ok(f) = nextsycl_audio_voxtraltts::files_in(dir) {
+            (nextsycl_audio_voxtraltts::ARCH, f)
         } else if dir.join("audiovae.pth").exists() {
             (nextsycl_audio_voxcpm2::ARCH, nextsycl_audio_voxcpm2::files_in(dir).map_err(|e| e.0)?)
         } else if dir.join("speech_tokenizer").is_dir() {
@@ -232,13 +234,17 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,codec").split(',').collect();
         let e = nextsycl_audio_breezetts2::BreezeTts2::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_breezetts2::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_voxtraltts::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,flow,codec").split(',').collect();
+        let e = nextsycl_audio_voxtraltts::VoxtralTts::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_voxtraltts::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else if m["arch"] == nextsycl_audio_minimaxmusic3::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("ar,dit,voc").split(',').collect();
         let e = nextsycl_audio_minimaxmusic3::MiniMaxMusic3::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_minimaxmusic3::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH, nextsycl_audio_voxcpm2::ARCH,
-                           nextsycl_audio_breezetts2::ARCH));
+        return Err(format!("check knows {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH, nextsycl_audio_voxcpm2::ARCH,
+                           nextsycl_audio_breezetts2::ARCH, nextsycl_audio_voxtraltts::ARCH));
     };
     println!("worst relative error {worst:.2e}");
     Ok(())

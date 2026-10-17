@@ -64,6 +64,8 @@ audio/                     AUDIO
   breezetts2 nextsycl-audio-breezetts2  Breeze TTS 2: the T5Gemma2 text encoder, the Qwen3 backbone and depth decoder
                                  from CrispASR's GGUF, the prompts of its four templates, guidance, stage checks; the 12 Hz
                                  codec from nextsycl-codec12hz
+  voxtraltts nextsycl-audio-voxtraltts  Voxtral 4B TTS: the Ministral backbone, the flow-matching acoustic transformer,
+                                 the Voxtral codec decoder from CrispASR's GGUF, the preset voices' prompt, stage checks
   example    nextsycl-audio-example  a template
 
 model3d/                   3D
@@ -386,6 +388,15 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   Guidance (an instruction's design or direction) runs a second backbone over the prompt without the instruction; the
   depth decoder runs both branches as one batch of two. Draws on the host. Per-request options: `NS_BZ2_GREEDY`,
   `NS_BZ2_TEMPERATURE`, `NS_BZ2_TOP_K`.
+- **voxtraltts** - Voxtral 4B TTS 2603 from CrispASR's GGUF (q8_0 served, f16 for parity; F16 / Q8_0 / Q4_0 / Q4_K
+  expanded to half at load; the Tekken vocabulary, the 20 preset voices and the codec in the file; the text embedding
+  and the voices read from the file a row at a time). The backbone (Ministral 3B, adjacent-pair RoPE made rotate-half
+  by reordering q / k rows at load) runs on the MiniMax Music engine's kernels (gemv, the half cache, attention: 4 query
+  heads a key head) and Breeze TTS 2's table RoPE; the acoustic transformer's guided pair as one batch of six rows,
+  its 7-step Euler ODE on the GPU (mm3's guided step); the codec's ALiBi window attention, whole-row q / k norm, causal
+  padding and the flow's input rows are its own (`kernels/audio/voxtraltts`), its convolutions mm3's oneDNN ones, its
+  layer-scaled residuals Qwen3-TTS's. Decoded in 375-frame chunks. Per-request option: `NS_VXT_STEPS` (`--opt-steps`,
+  or a request's `steps`). No clone / design / instructions: the open weights have no audio encoder.
 
 ## The 3D engines
 

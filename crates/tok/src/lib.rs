@@ -44,6 +44,9 @@ pub struct Tokenizer {
     /// unicode_regex_split over several patterns); empty for the one-pattern tokenizers
     pre: Vec<Regex>,
     ignore_merges: bool,
+    /// tiktoken-style BPE (Mistral's Tekken files): no merge list - the adjacent pair whose joined bytes are the
+    /// lowest-ranked token (its id) merges first
+    tiktoken: bool,
     /// SentencePiece-style BPE (a Llama tokenizer.json: no pre-tokenizer, "▁" for spaces and ahead of the text, merges
     /// over the whole text, unknown characters as their bytes' <0xNN> tokens) instead of GPT-2's byte-level one
     sentencepiece: bool,
@@ -137,6 +140,7 @@ impl Tokenizer {
             split: Regex::new(pattern).map_err(|e| e.to_string())?,
             pre: Vec::new(),
             ignore_merges: model["ignore_merges"].as_bool().unwrap_or(false),
+            tiktoken: false,
             sentencepiece,
             prepend,
             byte_enc,
@@ -181,6 +185,7 @@ impl Tokenizer {
             split: Regex::new(QWEN2_SPLIT).map_err(|e| e.to_string())?,
             pre: Vec::new(),
             ignore_merges: false,
+            tiktoken: false,
             sentencepiece: false,
             prepend: false,
             byte_enc,
@@ -241,11 +246,49 @@ impl Tokenizer {
             pre: pre_splits.iter().map(|p| Regex::new(p).map_err(|e| e.to_string())).collect::<Result<_, _>>()?,
             // llama.cpp takes a piece the vocabulary has whole for GLM's (not the old chatglm-bpe); Qwen's merge by rank
             ignore_merges: matches!(pre, "glm4" | "glm5" | "tekken"),
+            tiktoken: false,
             sentencepiece: false,
             prepend: false,
             byte_enc,
             byte_dec,
             stop,
+        })
+    }
+
+    /// Mistral's Tekken vocabulary as tiktoken holds it (tekken.json's `vocab`, or CrispASR's GGUF blob of it): each
+    /// piece's bytes in rank order, the first `active` of them in use; ids are `specials.len()` + rank (the specials
+    /// first, as mistral-common numbers them). Text is split by Tekken's pattern and merged tiktoken's way; special
+    /// tokens are not read in the text (mistral-common's encode treats it as plain text) - the caller places their ids.
+    pub fn from_tekken(pieces: &[Vec<u8>], specials: &[String], active: usize) -> Result<Tokenizer, String> {
+        let byte_enc = byte_alphabet();
+        let byte_dec = byte_enc.iter().enumerate().map(|(b, c)| (*c, b as u8)).collect();
+        let n0 = specials.len();
+        let mut tokens: Vec<String> = specials.to_vec();
+        let mut ids = HashMap::new();
+        for (r, p) in pieces.iter().take(active).enumerate() {
+            let t: String = p.iter().map(|b| byte_enc[*b as usize]).collect();
+            ids.entry(t.clone()).or_insert((n0 + r) as u32);
+            tokens.push(t);
+        }
+        if (0..=255u8).any(|b| !ids.contains_key(&byte_enc[b as usize].to_string())) {
+            return Err("a Tekken vocabulary without every single byte".into());
+        }
+        let eos = specials.iter().position(|s| s == "</s>").map(|i| i as u32);
+        Ok(Tokenizer {
+            eos,
+            tokens,
+            ids,
+            ranks: HashMap::new(),
+            special: Vec::new(),
+            split: Regex::new(TEKKEN_SPLIT).map_err(|e| e.to_string())?,
+            pre: Vec::new(),
+            ignore_merges: true,
+            tiktoken: true,
+            sentencepiece: false,
+            prepend: false,
+            byte_enc,
+            byte_dec,
+            stop: eos.into_iter().collect(),
         })
     }
 
@@ -347,7 +390,11 @@ impl Tokenizer {
         let mut parts: Vec<String> = piece.chars().map(|c| c.to_string()).collect();
         loop {
             let best = (0..parts.len().saturating_sub(1))
-                .filter_map(|i| self.ranks.get(&(parts[i].clone(), parts[i + 1].clone())).map(|r| (*r, i)))
+                .filter_map(|i| match self.tiktoken {
+                    // tiktoken: the pair whose joined piece ranks lowest
+                    true => self.ids.get(&format!("{}{}", parts[i], parts[i + 1])).map(|r| (*r as usize, i)),
+                    false => self.ranks.get(&(parts[i].clone(), parts[i + 1].clone())).map(|r| (*r, i)),
+                })
                 .min();
             let Some((_, i)) = best else { break };
             let joined = format!("{}{}", parts[i], parts[i + 1]);
@@ -991,6 +1038,26 @@ mod hf_json_tests {
         let t = super::Tokenizer::from_hf_json(&p).unwrap();
         std::fs::remove_file(&p).ok();
         assert_eq!(t.encode("[S0]hi hi!"), vec![9, 3, 5, 6]);
+    }
+
+    /// Tekken (tiktoken's BPE): ids after the specials, the lowest-ranked joined pair merges first, a piece the
+    /// vocabulary holds whole taken whole, a special's text read as plain text
+    #[test]
+    fn tekken_merges_by_the_joined_rank() {
+        let mut pieces: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
+        // ranks 256..: "lo", "hel" is not there, "el", "hello" whole
+        for p in ["lo", "el", "hello", " w"] {
+            pieces.push(p.as_bytes().to_vec());
+        }
+        let specials: Vec<String> = ["<unk>", "<s>", "</s>"].iter().map(|s| s.to_string()).collect();
+        let t = super::Tokenizer::from_tekken(&pieces, &specials, pieces.len()).unwrap();
+        let id = |p: &str| 3 + pieces.iter().position(|x| x == p.as_bytes()).unwrap() as u32;
+        // "hello" whole; "helo": h + el + o? "lo" (256) ranks below "el" (257): h, e, lo
+        assert_eq!(t.encode("hello"), vec![id("hello")]);
+        assert_eq!(t.encode("helo"), vec![id("h"), id("e"), id("lo")]);
+        assert_eq!(t.encode("<s>"), vec![id("<"), id("s"), id(">")]);
+        assert_eq!(t.decode(&t.encode("hello world")), "hello world");
+        assert_eq!(t.eos, Some(2));
     }
 
 }

@@ -1,0 +1,30 @@
+# Voxtral 4B TTS Q8_0 (speech in nine languages in 20 preset voices, 24 kHz; non-commercial)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# License: the weights, the preset voices and what they make are CC BY-NC 4.0 (no commercial use). See the guide.
+# The open release has the codec's decoder only (no audio encoder) and no instruction input: no cloning (saved voices go
+# to other models), no voice design or direction, no vocal events - only the preset voices below.
+id: voxtral-4b-tts
+kind: audio
+arch: voxtral-tts
+title: 'Voxtral 4B TTS Q8_0 (speech in nine languages in 20 preset voices, 24 kHz; non-commercial)'
+about: 'Mistral''s Voxtral 4B TTS 2603: a Ministral 3B backbone (26 layers) that makes a hidden state per 12.5 Hz frame, a 3-layer flow-matching acoustic transformer (semantic code + 36 FSQ values by a 7-step guided Euler ODE) and the Voxtral codec''s decoder - CrispASR''s Q8_0 GGUF, half on the GPU. English, French, German, Spanish, Italian, Portuguese, Dutch, Arabic, Hindi in 20 preset voices (casual, cheerful and neutral English speakers; a male and a female voice for most languages). No cloning, voice design, instructions or vocal events in the open weights (the checkpoint has no audio encoder). Weights, voices and outputs: CC BY-NC 4.0 (non-commercial)'
+gpus: '0'
+vram_gib: 7.5                   # its memory on the card when it runs (measured: 6.8 GiB of weights, 7.2 GiB peak in a server run)
+speech:
+- voices
+voices: [casual_female, casual_male, cheerful_female, neutral_female, neutral_male, pt_male, pt_female, nl_male, nl_female, it_male, it_female,
+         fr_male, fr_female, es_male, es_female, de_male, de_female, ar_male, hi_male, hi_female]
+languages: [english, french, german, spanish, italian, portuguese, dutch, arabic, hindi]
+defaults:
+  seconds: 60.0
+  cfg: 1.2                      # upstream's guidance of the flow (1: none)
+  steps: 7                      # the flow's Euler steps a frame (upstream's)
+env: {}
+files:
+  model:
+    key: vxt-q8
+    url: https://huggingface.co/cstr/voxtral-4b-tts-GGUF/resolve/aec6a93fb3a1dcb6c71ead7132ecc97a0a42cfa6/voxtral-4b-tts-q8_0.gguf
+    size: 4345579776
+    sha256: 75c8049e1242b288caffae27211c415c4a6c647bc9c00a3eda3b56daab90dfb9
+    path: voxtraltts/voxtral-4b-tts-q8_0.gguf
+guide: guides/voxtral-4b-tts.md

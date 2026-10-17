@@ -258,6 +258,7 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_BZ2_GREEDY` | 0 | the per-request option greedy's name: the most likely code, backbone and depth decoder (deterministic; may not end); a request's options only, the variable itself is not read (--opt-greedy) | audio breezetts2 |
 | `NS_BZ2_TEMPERATURE` | 0.9 | the per-request option temperature's name: the sampling temperature, backbone and depth decoder; a request's options only, the variable itself is not read (--opt-temperature) | audio breezetts2 |
 | `NS_BZ2_TOP_K` | 50 | the per-request option top-k's name: the sampling top-k, backbone and depth decoder; a request's options only, the variable itself is not read (--opt-top-k) | audio breezetts2 |
+| `NS_VXT_STEPS` | 7 | the per-request option steps's name: the flow's Euler steps a frame (upstream's 7; fewer is faster, the model is trained for 7); a request's options only, the variable itself is not read (--opt-steps) | audio voxtraltts |
 | `NS_VCP_*` | - | every NS_VCP_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_VCP_INT8` | 0 | 1: the language models' matrices in int8 (less VRAM, faster patches) (--opt-int8) | audio voxcpm2 |
 | `NS_VCP_MAX_RATIO` | 6 | the per-request option max-ratio's name: the most patches a text token (a runaway's bound); a request's options only, the variable itself is not read (--opt-max-ratio) | audio voxcpm2 |

@@ -269,6 +269,11 @@ of IQ2_XXS instead could win twice.
       CrispASR's GGUF (q8_0; q4_k card); the 12 Hz codec moved to crates/codec12hz (shared with Qwen3-TTS, re-checked);
       checked against upstream (f16: 4e-4..9e-4 a stage, Q8_0 3e-3..1e-2). B70: 22 frames/s guided, 28 unguided.
       Next: int8 / graphs for speed, a served registry entry, streamed answers
+- [x] Voxtral TTS (audio/voxtraltts, 2026-10-17): Voxtral 4B TTS 2603 from CrispASR's GGUF (q8_0 card), nine languages,
+      20 preset voices (no clone / design / instructions: the open weights have no encoder); Tekken in nextsycl_tok;
+      checked against vllm-omni's code (f16: teacher-forced hidden 3-6e-4, flow 1e-6, codec 5.5e-4). B70 30 frames/s
+      (2.4x real time). Next: the flow in int8 or a per-frame graph; the encoderless clone (docs/proposals/
+      voxtral-encoderless-clone.md)
 - [x] Qwen3.8-27B (llm/qwen35, 2026-10-10): the dense qwen35 graph (gated DeltaNet + gated full attention, dense
       SwiGLU) on the shared products / KDA scan and its own attention and gates; checked against llama.cpp on Q8_0
       (cosine >= 0.99993 every layer, same next token); served as qwen3.8-27b-q8 / -q4 / -q3 (tools, reasoning)

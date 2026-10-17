@@ -233,10 +233,12 @@ impl Home {
     }
 }
 
-/// A speech model's built-in voices and languages (lower case), read from its config file; empty: no list (any)
+/// A speech model's built-in voices and languages (lower case), read from its config file, else from its entry's own
+/// `voices` / `languages` (a card's, for a model whose file holds them: Voxtral TTS's GGUF); empty: no list (any)
 pub fn speech_lists(m: &Value) -> (Vec<String>, Vec<String>) {
     let Some(c) = m["files"]["config"].as_str().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else {
-        return (Vec::new(), Vec::new());
+        let list = |k: &str| -> Vec<String> { m[k].as_array().into_iter().flatten().filter_map(|x| x.as_str()).map(str::to_lowercase).collect() };
+        return (list("voices"), list("languages"));
     };
     let keys = |k: &str| -> Vec<String> { c["talker_config"][k].as_object().into_iter().flatten().map(|(n, _)| n.to_lowercase()).collect() };
     (keys("spk_id"), keys("codec_language_id"))
@@ -288,6 +290,9 @@ mod tests {
         assert!(l.contains(&"english".to_string()));
         // no config (VoxCPM2's has no lists): any
         assert_eq!(speech_lists(&json!({})), (Vec::new(), Vec::new()));
+        // no config but the entry's own lists (Voxtral TTS's card)
+        let (v, l) = speech_lists(&json!({"voices": ["Neutral_Female", "fr_male"], "languages": ["french"]}));
+        assert_eq!((v, l), (vec!["neutral_female".to_string(), "fr_male".to_string()], vec!["french".to_string()]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

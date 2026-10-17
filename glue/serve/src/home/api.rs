@@ -563,6 +563,8 @@ impl Home {
             .filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false)
             .filter(|m| m["speech"].as_array().is_some_and(|a| need.is_empty() || a.iter().any(|x| x == need)))
             .filter(|m| !(untold && needs_text(all, &m["id"])))
+            // a built-in voice: a model that has it (or lists none)
+            .filter(|m| need != "voices" || speaks(m, &voice))
             .map(|m| s(m, "id")).collect();
         let loaded = self.loaded_of("audio");
         loaded.into_iter().find(|l| can.contains(l)).or_else(|| can.first().cloned()).ok_or_else(|| {
@@ -932,7 +934,7 @@ impl Home {
                 };
                 let mut v = match call_for(&t, "GET", "/api/info", None, 5) {
                     Ok(i) if s(&i, "model") == id => json!({"loaded": true, "model": id, "info": i}),
-                    _ => json!({"loaded": false, "model": id, "title": e["title"], "defaults": e["defaults"],
+                    _ => json!({"loaded": false, "model": id, "title": e["title"], "defaults": e["defaults"], "voices": e["voices"], "languages": e["languages"],
                                 "note": "not loaded: the server's own details (info) come once it is (system.load); steps and the limits are known now"}),
                 };
                 if let (Some(o), Some(l)) = (v.as_object_mut(), limits.as_object()) {
@@ -1572,9 +1574,25 @@ pub(super) fn needs_text(all: &[Value], id: &Value) -> bool {
     all.iter().find(|m| &m["id"] == id).is_some_and(|m| m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "transcript")))
 }
 
+/// Whether a speech model speaks the built-in voice `voice`: it lists it (any case), or lists none (its config or card
+/// names no voices: any name is its engine's to check)
+pub(super) fn speaks(m: &Value, voice: &str) -> bool {
+    let (own, _) = super::precheck::speech_lists(m);
+    own.is_empty() || own.contains(&voice.to_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{code_of, rpc_error};
+    use super::{code_of, rpc_error, speaks};
+
+    #[test]
+    fn a_built_in_voice_goes_to_a_model_that_has_it() {
+        let vox = serde_json::json!({"id": "voxtral-4b-tts", "voices": ["neutral_female", "fr_male"]});
+        assert!(speaks(&vox, "Neutral_Female"));
+        assert!(!speaks(&vox, "serena"));
+        // no list: the engine decides
+        assert!(speaks(&serde_json::json!({"id": "x"}), "serena"));
+    }
 
     #[test]
     fn an_rpc_error_says_everything_in_its_body() {

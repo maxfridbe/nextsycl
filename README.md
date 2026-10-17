@@ -80,6 +80,9 @@ on the B70. **Breeze TTS 2** (`audio/breezetts2`): English and Chinese speech - 
 cloned from a recording and its transcript, or cloned and directed by an instruction, vocal events inline ("(laugh)",
 "[笑]") - its T5Gemma2 text encoder, Qwen3 backbone and depth decoder from CrispASR's GGUF on the music engine's kernels
 and its own, the 12 Hz codec shared with Qwen3-TTS; checked against upstream's code; 1.8-2.2x real time on the B70.
+**Voxtral TTS** (`audio/voxtraltts`): Mistral's Voxtral 4B TTS - nine languages in 20 preset voices - its Ministral 3B
+backbone, flow-matching acoustic transformer and Voxtral codec decoder from CrispASR's GGUF, checked against
+vllm-omni's code; 2.3x real time on the B70 (the open weights have no audio encoder: no cloning).
 
 A skill for porting to SYCL on Arc - the safety rules, migration traps, parity method, profiling and what made
 things fast, learned on these ports: [skills/sycl-porting/SKILL.md](skills/sycl-porting/SKILL.md).
@@ -166,6 +169,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `voxcpm2-int8` | the same files, the language models in int8 at load | `voxcpm2` | 4.6 GiB | checked, served |
 | `breeze-tts-2` | Breeze TTS 2 (~3B, Q8_0 GGUF): English and Chinese at 24 kHz - voices designed, cloned (recording + transcript) or directed (a clone + an instruction), vocal events; weights and outputs non-commercial (BreezeBlue license) | `breezetts2` | 3.4 GB + codec | checked |
 | `breeze-tts-2-q4` | the same model from the Q4_K GGUF (a 2.2 GB download; the same memory on the card; the 4-bit text encoder is 1e-1 from upstream - a word can slip) | `breezetts2` | 2.2 GB + codec | checked |
+| `voxtral-4b-tts` | Voxtral 4B TTS 2603 (Mistral, Q8_0 GGUF): nine languages at 24 kHz in 20 preset voices; no cloning, design or instructions (the open weights have no audio encoder); weights, voices and outputs non-commercial (CC BY-NC 4.0) | `voxtraltts` | 4.3 GB | checked |
 
 **3D** (`nextsycl model3d`: rigging and animation of a mesh; the result keeps the input mesh, its UVs and textures)
 
@@ -881,6 +885,42 @@ nextsycl audio check <reference dump dir> --model breeze-tts-2 [--stages prompt,
 - **One server a card**: two Breeze servers on one card make less than half the audio one does (B70 1.54x real time
   alone, 0.65x for the pair: the driver time-slices them). Several clips in one engine instead (batched decode, ~3-4x
   estimated) is a proposal for review: `docs/proposals/speech-batching.md`.
+
+### Voxtral TTS
+
+Voxtral 4B TTS 2603 (`audio/voxtraltts`, Mistral; CrispASR's GGUF of it): speech at 24 kHz in English, French,
+German, Spanish, Italian, Portuguese, Dutch, Arabic and Hindi, in 20 **preset voices** - `neutral_female` (the
+default), `neutral_male`, `casual_female`, `casual_male`, `cheerful_female`, and a female and a male voice for each
+other language (`fr_female`, `de_male`, ... ; Arabic `ar_male` only). A Ministral 3B backbone (26 layers) makes a hidden
+state per 12.5 Hz frame; a 3-layer flow-matching transformer turns it into the frame's semantic code and 36 acoustic
+levels (7 guided Euler steps, `--cfg` 1.2); the Voxtral codec's decoder makes 240 samples a frame. `--language` alone
+picks that language's voice. **What it does not do**: the open checkpoint ships the codec's decoder but not its encoder
+(no `audio_tokenizer.encoder_blocks` / `input_proj` tensors; vllm-omni refuses `ref_audio` for it), and its prompt has
+no instruction - so **no cloning** (saved voices go to models that clone), **no voice design or direction, no vocal
+events**. **License: CC BY-NC 4.0** - the weights, the preset voices and the speech they make are non-commercial.
+
+```sh
+nextsycl models pull voxtral-4b-tts
+nextsycl audio gen "The quick brown fox jumps over the lazy dog." --model voxtral-4b-tts --voice casual_male
+nextsycl audio gen "Le soleil se couchait lentement sur la mer." --model voxtral-4b-tts --language french \
+                   [--cfg 1.2] [--steps 7] [--seed N]
+nextsycl audio check <reference dump dir> --dir <f16 GGUF dir> [--stages prompt,frames,flow,codec]
+```
+
+- **Ported**: the GGUF's matrices expanded to half at load (q and k rows reordered so the rotate-half RoPE kernel
+  turns the checkpoint's adjacent pairs); the backbone on the music engine's cached decode and Breeze's RoPE; the
+  acoustic transformer's two guidance passes as one batch of six rows with the whole ODE on the GPU; this engine's
+  kernels (`kernels/audio/voxtraltts`) for the codec's causal ALiBi attention, its whole-row q / k norms and causal
+  padding; Tekken (tiktoken BPE) in `nextsycl_tok`; vllm-omni's loop and codec where CrispASR's runtime differs (ALiBi
+  slopes, the window's W + 1 keys, replicate padding, 375-frame decode chunks, frame 0 from the prompt's last position:
+  `docs/ports/voxtraltts.md`).
+- **Checked** against upstream's own code (`reference/voxtraltts/ref.py`: vllm-omni's acoustic transformer and codec
+  run as they are, float32 on the CPU from the safetensors; English and French): token ids identical; with the f16
+  GGUF the prompt rows 3e-9, each frame's hidden state 3-6e-4 and semantic logits 1-2e-4 teacher forced (no semantic
+  code differs, 2-3 of thousands of acoustic levels), the flow alone 5e-7..2e-6 (no level differs), the codec 5.5e-4.
+  Clips in all nine languages transcribe word for word (Whisper small).
+- **Speed** (B70, Q8_0, 2026-10-17): 30 frames a second, 2.4x real time; 34.6 s of speech in 15.2 s with the prompt
+  and decode. 6.8 GiB of weights, 7.2 GiB in a run. B65: 22 frames a second.
 
 ### VoxCPM2
 

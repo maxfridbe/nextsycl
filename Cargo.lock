@@ -552,6 +552,7 @@ dependencies = [
  "nextsycl-audio-minimaxmusic3",
  "nextsycl-audio-qwen3tts",
  "nextsycl-audio-voxcpm2",
+ "nextsycl-audio-voxtraltts",
  "nextsycl-core",
  "nextsycl-gguf",
  "nextsycl-image",
@@ -645,6 +646,18 @@ dependencies = [
 
 [[package]]
 name = "nextsycl-audio-voxcpm2"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-audio",
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-tok",
+ "serde_json",
+]
+
+[[package]]
+name = "nextsycl-audio-voxtraltts"
 version = "0.0.0"
 dependencies = [
  "nextsycl-audio",
