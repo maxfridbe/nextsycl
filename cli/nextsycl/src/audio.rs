@@ -28,7 +28,7 @@ nextsycl audio engines | selftest [--gpu N]";
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextsycl_audio::AudioKind> {
     vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_voxcpm2::kind(), nextsycl_audio_breezetts2::kind(),
-         nextsycl_audio_vibevoice::kind(), nextsycl_audio_example::kind()]
+         nextsycl_audio_vibevoice::kind(), nextsycl_audio_s2pro::kind(), nextsycl_audio_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -44,6 +44,8 @@ fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
             (nextsycl_audio_breezetts2::ARCH, f)
         } else if let Ok(f) = nextsycl_audio_vibevoice::files_in(dir) {
             (nextsycl_audio_vibevoice::ARCH, f)
+        } else if let Ok(f) = nextsycl_audio_s2pro::files_in(dir) {
+            (nextsycl_audio_s2pro::ARCH, f)
         } else if dir.join("audiovae.pth").exists() {
             (nextsycl_audio_voxcpm2::ARCH, nextsycl_audio_voxcpm2::files_in(dir).map_err(|e| e.0)?)
         } else if dir.join("speech_tokenizer").is_dir() {
@@ -185,10 +187,11 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         references,
     };
     let t0 = std::time::Instant::now();
-    // frames a second of sound: speech 12.5, songs 25
+    // frames a second of sound: speech 12.5 (S2 Pro 21.5), songs 25
     let fps = match e.arch() {
         "voxcpm2" => 6.25,
         "vibevoice" => 7.5,
+        nextsycl_audio_s2pro::ARCH => nextsycl_audio_s2pro::FPS as f64,
         _ if e.speech().is_some() => 12.5,
         _ => 25.0,
     };
@@ -270,13 +273,17 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,lm,head,codec,run").split(',').collect();
         let e = nextsycl_audio_vibevoice::VibeVoice::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_vibevoice::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_s2pro::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,codec").split(',').collect();
+        let e = nextsycl_audio_s2pro::S2Pro::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_s2pro::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else if m["arch"] == nextsycl_audio_minimaxmusic3::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("ar,dit,voc").split(',').collect();
         let e = nextsycl_audio_minimaxmusic3::MiniMaxMusic3::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_minimaxmusic3::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH, nextsycl_audio_voxcpm2::ARCH,
-                           nextsycl_audio_breezetts2::ARCH, nextsycl_audio_vibevoice::ARCH));
+        return Err(format!("check knows {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
+                           nextsycl_audio_voxcpm2::ARCH, nextsycl_audio_breezetts2::ARCH, nextsycl_audio_vibevoice::ARCH, nextsycl_audio_s2pro::ARCH));
     };
     println!("worst relative error {worst:.2e}");
     Ok(())

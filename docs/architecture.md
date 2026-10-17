@@ -67,6 +67,9 @@ audio/                     AUDIO
   vibevoice  nextsycl-audio-vibevoice  VibeVoice-1.5B: the Qwen2.5-1.5B language model, the diffusion head and its
                                  DPM-Solver++, the σ-VAE acoustic encoder / decoder and semantic encoder (streaming), the
                                  script's prompt of up to four voices, stage checks
+  s2pro      nextsycl-audio-s2pro  Fish Audio S2 Pro: the Dual-AR's slow (Qwen3, 36 layers) and fast (4 layers) models
+                                 from s2.cpp's GGUF, fish-speech's conversation prompt and speaker turns, Fish's RVQ codec
+                                 (decoder, encoder, quantizers), stage checks
   example    nextsycl-audio-example  a template
 
 model3d/                   3D
@@ -402,6 +405,18 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   channel-mixing ones transposed around mm3's oneDNN convolutions, a transposed one cut to its new outputs); the
   ConvNeXt blocks' norms and MLPs on the shared kernels and the codec's layer-scaled residual. A voice's recording goes
   through the acoustic encoder eight frames a piece. No settings of its own.
+- **s2pro** - Fish Audio S2 Pro from s2.cpp's GGUF (one file: the Dual-AR transformer as Q8_0 or F16, the codec as F16
+  with its weight norm folded) and the checkpoint's tokenizer.json. The matrices stay as the file has them: Q8_0 on the
+  card as int8 codes and half scales (split at load so a lane reads 8 aligned codes), F16 as half; the token and
+  codebook embeddings stay on disk (the rows a prompt or a frame needs read from the file). Its kernels
+  (`kernels/audio/s2pro`): the decode's product over Q8_0 for up to 8 rows, the Q8_0 matrix expanded to half for a
+  prompt's wide products (oneDNN's half GEMM), and fish-speech's RoPE on interleaved pairs from a table of bfloat16
+  cosines and sines (upstream keeps them so) with an optional per-head RMS norm. The slow and fast models' attention,
+  half cache and embeddings are the MiniMax Music engine's (32 query heads over 8); the codec runs in float32 on the
+  Qwen3-TTS codec's windowed attention, depthwise convolution and layer-scaled residuals, the MiniMax Music engine's
+  convolutions and the shared Snake / norms / linear layers; its quantizers on the host. Draws on the host (upstream's
+  top-p before the temperature, repetition-aware resampling of the first code). Per-request options: `NS_S2P_GREEDY`,
+  `NS_S2P_TEMPERATURE`, `NS_S2P_TOP_P`, `NS_S2P_TOP_K`.
 
 ## The 3D engines
 
