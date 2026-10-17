@@ -408,6 +408,7 @@ impl AudioEngine for BreezeTts2 {
             direction: true,
             events: EVENTS.iter().map(|e| e.to_string()).collect(),
             requires: None,
+            enrolled: false,
         })
     }
     fn options(&self) -> &'static [EngineOption] {

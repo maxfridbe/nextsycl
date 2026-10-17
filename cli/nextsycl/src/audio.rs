@@ -19,6 +19,8 @@ nextsycl audio voice add NAME --sample FILE [--text \"what it says\"] [--descrip
                    a voice cloned from a recording (WAV, MP3, FLAC, Ogg, M4A; 3-15 s of one speaker)
 nextsycl audio voice design NAME --instructions \"the voice\" [--text \"what the sample says\"] [--language L] [--seed N] [--replace]
                    a voice made up from a description (the front door's voice-design model reads a sample)
+nextsycl audio voice enroll NAME [--gpu N] [--steps 2000]
+                   a saved voice fitted for Voxtral TTS (experimental: no encoder in its open weights; PyTorch XPU)
 nextsycl audio voice rm NAME            (addvoice / clonevoice NAME ... = voice add; designvoice = voice design)
 nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | prompt,frames,flow,codec] [--gpu N]
 nextsycl audio engines | selftest [--gpu N]";
@@ -366,9 +368,11 @@ fn voice(cfg: &Config, args: &[String]) -> Result<(), String> {
             }
             for v in list {
                 let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
-                println!("{:<16} {:<6} {:>5.1} s  {}{}", s("name"), s("kind"), v["seconds"].as_f64().unwrap_or(0.0),
+                let enrolled: Vec<&str> = v["enrolled"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).collect();
+                println!("{:<16} {:<6} {:>5.1} s  {}{}{}", s("name"), s("kind"), v["seconds"].as_f64().unwrap_or(0.0),
                          if s("description").is_empty() { String::new() } else { format!("{} - ", s("description")) },
-                         if s("text").is_empty() { "(no transcript: an x-vector clone)".into() } else { format!("\"{}\"", s("text")) });
+                         if s("text").is_empty() { "(no transcript: an x-vector clone)".into() } else { format!("\"{}\"", s("text")) },
+                         if enrolled.is_empty() { String::new() } else { format!("  [enrolled: {}]", enrolled.join(", ")) });
             }
             Ok(())
         }
@@ -406,6 +410,7 @@ fn voice(cfg: &Config, args: &[String]) -> Result<(), String> {
                      r["voice"]["text"].as_str().unwrap_or(""));
             Ok(())
         }
+        Some("enroll") => enroll(cfg, &lib, name, args),
         Some("rm" | "remove" | "delete") => {
             lib.remove(name)?;
             println!("removed voice {name}");
@@ -413,6 +418,74 @@ fn voice(cfg: &Config, args: &[String]) -> Result<(), String> {
         }
         _ => Err(USAGE.into()),
     }
+}
+
+/// The card memory an enrolment takes (GiB; the decoder's fit of a 15 s clip on a B65: ~6), and the margin kept free
+const ENROLL_GIB: f64 = 8.0;
+
+/// `nextsycl audio voice enroll NAME`: a saved voice fitted for Voxtral TTS (experimental; no encoder in its open
+/// weights) - reference/voxtraltts/enroll.py in the build image with PyTorch XPU on one card, its codes kept with the
+/// voice (`<voice>/enrolled/voxtral-tts.npy`, the report and the decoder's reconstruction beside them)
+fn enroll(cfg: &Config, lib: &nextsycl_serve::voices::Library, name: &str, args: &[String]) -> Result<(), String> {
+    let arch = opt(args, "--arch").unwrap_or(nextsycl_audio_voxtraltts::ARCH);
+    if arch != nextsycl_audio_voxtraltts::ARCH {
+        return Err(format!("--arch {arch}: only {} enrolls voices", nextsycl_audio_voxtraltts::ARCH));
+    }
+    let sample = lib.sample_path(name).ok_or_else(|| format!("no saved voice {name:?} (nextsycl audio voice list)"))?;
+    let dir = |k: &str, what: &str| -> Result<PathBuf, String> {
+        cfg.get(k).map(PathBuf::from).filter(|p| p.is_dir()).ok_or_else(|| format!("{k}: {what} (nextsycl.conf)"))
+    };
+    let ckpt = dir("NS_VXT_CHECKPOINT", "the mistralai/Voxtral-4B-TTS-2603 checkout (consolidated.safetensors, params.json)")?;
+    let omni = dir("NS_VXT_VLLM_OMNI", "a vllm-omni checkout (its voxtral_tts code is the decoder enroll.py runs)")?;
+    let torch = dir("NS_VXT_TORCH", "PyTorch with XPU, installed with pip --target (the image's Python)")?;
+    let tool = cfg.get("NS_VXT_ENROLL_TOOL").map(PathBuf::from).unwrap_or_else(|| cfg.dist.join("../reference/voxtraltts"));
+    if !tool.join("enroll.py").is_file() {
+        return Err(format!("{}: no enroll.py (NS_VXT_ENROLL_TOOL: the repository's reference/voxtraltts)", tool.display()));
+    }
+    let gpu: usize = num(args, "--gpu")?.unwrap_or(0);
+    // the card's memory by the front door's count: the fit runs only with its share and 1.5 GiB more free
+    let port = cfg.get("NS_SERVE_PORT").unwrap_or_else(|| "8000".into());
+    let st = nextsycl_serve::http::call_for(&nextsycl_serve::http::Target::Tcp(format!("127.0.0.1:{port}")), "GET", "/api/state", None, 5)
+        .map_err(|e| format!("the front door (:{port}) did not answer ({e}): its card count is the memory check"))?;
+    let card = st["cards"].as_array().and_then(|c| c.get(gpu)).ok_or_else(|| format!("no GPU {gpu}"))?;
+    let free = (card["vram_total_mb"].as_f64().unwrap_or(0.0) - card["vram_used_mb"].as_f64().unwrap_or(0.0)) / 1024.0;
+    if free < ENROLL_GIB + 1.5 {
+        return Err(format!("GPU {gpu} has {free:.1} GiB free; an enrolment needs {ENROLL_GIB} + 1.5 (another card: --gpu N)"));
+    }
+    let vdir = sample.parent().ok_or("the voice's directory")?.to_path_buf();
+    let out = vdir.join("enrolled");
+    std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let ce = crate::container::Ce::new(cfg)?;
+    ce.need_image()?;
+    let mut a: Vec<String> = vec!["run".into(), "--rm".into(), "--name".into(), format!("nextsycl-enroll-{gpu}"), "--security-opt".into(), "label=disable".into()];
+    a.extend(ce.gpu_args());
+    for (host, inside, ro) in [(&tool, "/tool", true), (&ckpt, "/ckpt", true), (&omni, "/omni", true), (&torch, "/torch", true), (&vdir, "/voice", false)] {
+        a.extend(crate::container::mount(host, inside, ro));
+    }
+    for e in [format!("ZE_AFFINITY_MASK={gpu}"), "PYTHONPATH=/torch".into(), "PYTHONDONTWRITEBYTECODE=1".into(), "OMP_NUM_THREADS=8".into()] {
+        a.extend(["-e".into(), e]);
+    }
+    let steps = num::<u32>(args, "--steps")?.unwrap_or(2000).to_string();
+    let seconds = opt(args, "--seconds").unwrap_or("15").to_string();
+    a.extend([ce.image.clone(), "bash".into(), "-c".into(), "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; exec python3 \"$@\"".into(), "enroll".into(),
+              "/tool/enroll.py".into(), "/ckpt".into(), "--code".into(), "/omni".into(), "--audio".into(), "/voice/sample.wav".into(),
+              "--out".into(), format!("/voice/enrolled/.{arch}.npy"), "--report".into(), format!("/voice/enrolled/.{arch}.json"),
+              "--device".into(), "xpu".into(), "--steps".into(), steps, "--seconds".into(), seconds]);
+    eprintln!("enrolling {name} for {arch} on GPU {gpu} (PyTorch XPU; a minute or two) ...");
+    let t0 = std::time::Instant::now();
+    let st = ce.cmd().args(&a).status().map_err(|e| e.to_string())?;
+    if !st.success() {
+        return Err(format!("the enrolment ended ({st})"));
+    }
+    for ext in ["npy", "json", "wav"] {
+        let (from, to) = (out.join(format!(".{arch}.{ext}")), out.join(format!("{arch}.{ext}")));
+        if from.exists() {
+            std::fs::rename(&from, &to).map_err(|e| format!("{}: {e}", to.display()))?;
+        }
+    }
+    println!("enrolled {name} for {arch} in {:.0} s: {} (experimental: Voxtral speaks it as \"voice\": \"{name}\")", t0.elapsed().as_secs_f64(),
+             out.join(format!("{arch}.npy")).display());
+    Ok(())
 }
 
 /// `nextsycl audio <command>`

@@ -5,6 +5,8 @@
 //!   <audio output>/voices/<name>/sample.wav    the recording (mono, its own rate)
 //!                                /voice.json    {name, text (what it says), description, language, kind: clone |
 //!                                               design, seconds, rate, created, from}
+//!                                /enrolled/<arch>.npy   the voice fitted for a model without an encoder (Voxtral
+//!                                               TTS: `nextsycl audio voice enroll`), its report beside it (.json)
 //! ```
 //!
 //! The audio server reads them (the output directory is mounted into its container); the front door and the
@@ -41,11 +43,16 @@ impl Library {
         Library { dir: out_dir.join("voices") }
     }
 
-    /// Every voice's record, by name
+    /// Every voice's record, by name (with `enrolled`: the architectures it is enrolled for)
     pub fn list(&self) -> Vec<Value> {
         let mut v: Vec<Value> = std::fs::read_dir(&self.dir).into_iter().flatten().flatten()
             .filter_map(|e| std::fs::read_to_string(e.path().join("voice.json")).ok())
-            .filter_map(|t| serde_json::from_str(&t).ok())
+            .filter_map(|t| serde_json::from_str::<Value>(&t).ok())
+            .map(|mut r| {
+                let name = r["name"].as_str().unwrap_or("").to_string();
+                r["enrolled"] = json!(self.enrolled(&name));
+                r
+            })
             .collect();
         v.sort_by(|a: &Value, b: &Value| a["name"].as_str().cmp(&b["name"].as_str()));
         v
@@ -62,6 +69,29 @@ impl Library {
         check_name(name).ok()?;
         let p = self.dir.join(name).join("sample.wav");
         p.exists().then_some(p)
+    }
+
+    /// Where a voice's enrolment for an architecture goes (`<voice>/enrolled/<arch>.npy`)
+    pub fn enrolled_file(&self, name: &str, arch: &str) -> Option<PathBuf> {
+        check_name(name).ok()?;
+        let ok = !arch.is_empty() && arch.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        ok.then(|| self.dir.join(name).join("enrolled").join(format!("{arch}.npy")))
+    }
+
+    /// A voice's enrolment for an architecture, when it has one
+    pub fn enrolled_path(&self, name: &str, arch: &str) -> Option<PathBuf> {
+        self.enrolled_file(name, arch).filter(|p| p.is_file())
+    }
+
+    /// The architectures a voice is enrolled for
+    pub fn enrolled(&self, name: &str) -> Vec<String> {
+        if check_name(name).is_err() {
+            return Vec::new();
+        }
+        let mut v: Vec<String> = std::fs::read_dir(self.dir.join(name).join("enrolled")).into_iter().flatten().flatten()
+            .filter_map(|e| e.file_name().to_str()?.strip_suffix(".npy").filter(|n| !n.starts_with('.')).map(str::to_string)).collect();
+        v.sort();
+        v
     }
 
     /// A voice as a request's reference: the recording and its transcript
@@ -92,6 +122,8 @@ impl Library {
         let keep = samples.len().min((MAX_S * rate as f64) as usize);
         let a = Audio { rate, channels: 1, samples: samples[..keep].to_vec() };
         std::fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
+        // a new recording: the enrolments fitted to the old one no longer hold
+        let _ = std::fs::remove_dir_all(d.join("enrolled"));
         a.write_wav(&d.join("sample.wav"), &[("INAM", name)])?;
         let rec = json!({
             "name": name, "text": text.map(str::trim).filter(|t| !t.is_empty()), "description": description, "language": language,
@@ -153,6 +185,16 @@ mod tests {
         assert_eq!(lib.get("anna").unwrap()["owner"], "film-app");
         assert!(lib.add("anna", &wav, None, None, None, "clone", "test", false).is_err());
         assert_eq!(lib.list().len(), 1);
+        // an enrolment is listed, and goes when the recording is replaced
+        let e = lib.enrolled_file("anna", "voxtral-tts").unwrap();
+        assert!(lib.enrolled_path("anna", "voxtral-tts").is_none());
+        std::fs::create_dir_all(e.parent().unwrap()).unwrap();
+        std::fs::write(&e, b"x").unwrap();
+        assert_eq!(lib.enrolled("anna"), vec!["voxtral-tts".to_string()]);
+        assert_eq!(lib.list()[0]["enrolled"], json!(["voxtral-tts"]));
+        assert!(lib.enrolled_file("anna", "../x").is_none());
+        lib.add("anna", &wav, Some("Hello."), None, Some("english"), "clone", "test", true).unwrap();
+        assert!(lib.enrolled("anna").is_empty());
         let rf = lib.reference("anna").unwrap();
         assert_eq!((rf.rate, rf.samples.len(), rf.text.as_deref()), (16000, 32000, Some("Hello.")));
         assert!(lib.add("short", &wav[..1000], None, None, None, "clone", "test", false).is_err());

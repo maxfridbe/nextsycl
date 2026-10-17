@@ -146,6 +146,10 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             if speech("clone") {
                 c.extend(["clone", "saved_voices", "continue_from"]);
             }
+            // saved voices fitted for it (a model without an encoder: experimental)
+            if speech("enrolled") {
+                c.push("enrolled_voices");
+            }
             if speech("design") {
                 c.push("voice_design");
             }

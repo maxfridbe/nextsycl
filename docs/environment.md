@@ -258,7 +258,12 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_BZ2_GREEDY` | 0 | the per-request option greedy's name: the most likely code, backbone and depth decoder (deterministic; may not end); a request's options only, the variable itself is not read (--opt-greedy) | audio breezetts2 |
 | `NS_BZ2_TEMPERATURE` | 0.9 | the per-request option temperature's name: the sampling temperature, backbone and depth decoder; a request's options only, the variable itself is not read (--opt-temperature) | audio breezetts2 |
 | `NS_BZ2_TOP_K` | 50 | the per-request option top-k's name: the sampling top-k, backbone and depth decoder; a request's options only, the variable itself is not read (--opt-top-k) | audio breezetts2 |
-| `NS_VXT_STEPS` | 7 | the per-request option steps's name: the flow's Euler steps a frame (upstream's 7; fewer is faster, the model is trained for 7); a request's options only, the variable itself is not read (--opt-steps) | audio voxtraltts |
+| `NS_VXT_STEPS` | 7 | the option steps's name: the flow's Euler steps a frame (upstream's 7; fewer is faster, the model is trained for 7); read from a request's options (`audio gen --opt-steps` puts it there too), the variable itself is not read | audio voxtraltts |
+| `NS_VXT_ENROLLED` | - | the option enrolled's name: an enrolled voice's fitted codes (experimental; reference/voxtraltts/enroll.py) as the voice; read from a request's options (`audio gen --opt-enrolled` puts it there too), the variable itself is not read | audio voxtraltts |
+| `NS_VXT_CHECKPOINT` | - | `audio voice enroll`: the mistralai/Voxtral-4B-TTS-2603 checkout (consolidated.safetensors, params.json) whose codec decoder the fit runs through | cli (audio voice enroll) |
+| `NS_VXT_VLLM_OMNI` | - | `audio voice enroll`: a vllm-omni checkout (enroll.py runs its voxtral_tts decoder code) | cli (audio voice enroll) |
+| `NS_VXT_TORCH` | - | `audio voice enroll`: PyTorch with XPU installed with `pip install --target` for the build image's Python (its PYTHONPATH) | cli (audio voice enroll) |
+| `NS_VXT_ENROLL_TOOL` | <dist>/../reference/voxtraltts | `audio voice enroll`: where enroll.py and ref.py are | cli (audio voice enroll) |
 | `NS_VCP_*` | - | every NS_VCP_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_VCP_INT8` | 0 | 1: the language models' matrices in int8 (less VRAM, faster patches) (--opt-int8) | audio voxcpm2 |
 | `NS_VCP_MAX_RATIO` | 6 | the per-request option max-ratio's name: the most patches a text token (a runaway's bound); a request's options only, the variable itself is not read (--opt-max-ratio) | audio voxcpm2 |

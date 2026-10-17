@@ -1,8 +1,9 @@
 # Voxtral 4B TTS Q8_0 (speech in nine languages in 20 preset voices, 24 kHz; non-commercial)
 # model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
 # License: the weights, the preset voices and what they make are CC BY-NC 4.0 (no commercial use). See the guide.
-# The open release has the codec's decoder only (no audio encoder) and no instruction input: no cloning (saved voices go
-# to other models), no voice design or direction, no vocal events - only the preset voices below.
+# The open release has the codec's decoder only (no audio encoder) and no instruction input: no cloning from a recording
+# (saved voices go to models that clone), no voice design or direction, no vocal events. Experimental: a saved voice
+# fitted for it (`nextsycl audio voice enroll NAME`, no encoder: its codes fitted through the decoder) is spoken.
 id: voxtral-4b-tts
 kind: audio
 arch: voxtral-tts
@@ -12,6 +13,7 @@ gpus: '0'
 vram_gib: 7.5                   # its memory on the card when it runs (measured: 6.8 GiB of weights, 7.2 GiB peak in a server run)
 speech:
 - voices
+- enrolled                      # speaks saved voices enrolled for it (experimental; docs/ports/voxtraltts.md)
 voices: [casual_female, casual_male, cheerful_female, neutral_female, neutral_male, pt_male, pt_female, nl_male, nl_female, it_male, it_female,
          fr_male, fr_female, es_male, es_female, de_male, de_female, ar_male, hi_male, hi_female]
 languages: [english, french, german, spanish, italian, portuguese, dutch, arabic, hindi]

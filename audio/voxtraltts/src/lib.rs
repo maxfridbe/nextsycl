@@ -64,7 +64,9 @@ pub const DEFAULT_VOICE: &str = "neutral_female";
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "steps", env: "NS_VXT_STEPS", value: "7", help: "the flow's Euler steps a frame (upstream's 7; fewer is faster, the model is trained for 7)",
-                   at: At::Request },
+                   at: At::Both },
+    EngineOption { name: "enrolled", env: "NS_VXT_ENROLLED", value: "FILE.npy",
+                   help: "experimental: a voice's fitted codes [F, 37] (reference/voxtraltts/enroll.py) as the voice instead of a preset", at: At::Both },
 ];
 
 /// The languages it speaks, each with the preset voice a request in it that names none gets
@@ -112,6 +114,8 @@ pub struct VoxtralTts {
 pub struct Spec {
     pub text: String,
     pub voice: String,
+    /// an enrolled voice's codes [F][37] (as the model emits them), its prompt rows made from them
+    pub enrolled: Option<Vec<Vec<i32>>>,
     pub cfg: f32,
     pub steps: usize,
 }
@@ -228,13 +232,21 @@ impl VoxtralTts {
                 None => STEPS,
             },
         };
-        Ok(Spec { text: req.prompt.clone(), voice: self.voice_of(req)?, cfg, steps })
+        let enrolled = match given(req, "enrolled") {
+            Some(p) => Some(enrolled_codes(Path::new(p))?),
+            None => None,
+        };
+        let voice = if enrolled.is_some() { "enrolled".to_string() } else { self.voice_of(req)? };
+        Ok(Spec { text: req.prompt.clone(), voice, enrolled, cfg, steps })
     }
 
     /// The prompt's ids and its rows [L, hidden] (host): the voice's rows at its [AUDIO] positions
     pub fn prompt(&self, s: &Spec) -> Result<(Vec<u32>, Vec<f32>)> {
         let h = self.bb.hidden;
-        let voice = self.w.all(&format!("voice.{}", s.voice))?;
+        let voice = match &s.enrolled {
+            Some(c) => self.enrolled_rows(c)?,
+            None => self.w.all(&format!("voice.{}", s.voice))?,
+        };
         let n = voice.len() / h;
         let ids = prompt::ids(&self.tok, &self.sp, &s.text, n);
         let mut rows = Vec::with_capacity(ids.len() * h);
@@ -248,6 +260,23 @@ impl VoxtralTts {
             }
         }
         Ok((ids, rows))
+    }
+
+    /// An enrolled voice's prompt rows [F + 1, hidden]: each frame's codes embedded and summed, then the end-of-audio
+    /// frame (semantic [END_AUDIO], the acoustic ones [EMPTY_AUDIO]) - upstream's encode_waveforms + encode_tokens
+    pub fn enrolled_rows(&self, codes: &[Vec<i32>]) -> Result<Vec<f32>> {
+        let h = self.bb.hidden;
+        let out = DevBuf::f32(&self.ops.gpu, h)?;
+        let tmp = DevBuf::f32(&self.ops.gpu, h)?;
+        let mut eoa = vec![0i32; 1 + ACOUSTIC];
+        eoa[0] = END as i32;
+        let mut rows = Vec::with_capacity((codes.len() + 1) * h);
+        for f in codes.iter().chain(std::iter::once(&eoa)) {
+            self.frame_rows(f, out.fp(), &tmp)?;
+            self.ops.gpu.sync()?;
+            rows.extend(out.to_f32()?);
+        }
+        Ok(rows)
     }
 
     /// A frame's 37 rows of the audio embedding summed into `out` (codebook 0 from 0, codebook i > 0 from
@@ -353,6 +382,7 @@ impl AudioEngine for VoxtralTts {
             direction: false,
             events: Vec::new(),
             requires: None,
+            enrolled: true,
         })
     }
     fn options(&self) -> &'static [EngineOption] {
@@ -379,6 +409,19 @@ impl AudioEngine for VoxtralTts {
     fn report(&self) -> Vec<String> {
         vec![format!("{ARCH} on {} (half, loaded {:.0} s ago)", self.ops.gpu.name, self.loaded.elapsed().as_secs_f64())]
     }
+}
+
+/// An enrolled voice's codes: a .npy [F, 37] of whole numbers (enroll.py's), each in its codebook's range
+pub fn enrolled_codes(path: &Path) -> Result<Vec<Vec<i32>>> {
+    let (shape, v) = check::read_npy(path)?;
+    if shape.len() != 2 || shape[1] != 1 + ACOUSTIC || shape[0] == 0 || shape[0] > 1000 {
+        return Err(Error(format!("{}: codes [frames, {}] expected (1 to 1,000 frames), not {shape:?}", path.display(), 1 + ACOUSTIC)));
+    }
+    let codes: Vec<Vec<i32>> = v.chunks(1 + ACOUSTIC).map(|f| f.iter().map(|x| *x as i32).collect()).collect();
+    if codes.iter().any(|f| f[0] < SPECIAL as i32 || f[1..].iter().any(|c| *c < SPECIAL as i32 || *c >= (SPECIAL + LEVELS) as i32)) {
+        return Err(Error(format!("{}: codes outside their codebooks (semantic >= 2, acoustic 2..22)", path.display())));
+    }
+    Ok(codes)
 }
 
 /// A directory with the GGUF (q8_0 preferred, as `models pull` lays it out or by hand): its files by role

@@ -69,6 +69,10 @@ pub struct Speech {
     /// what a request must carry: "voice" (a built-in one), "instructions" (the voice to make up), "reference" (a
     /// recording, or a saved voice); none: nothing besides the text
     pub requires: Option<&'static str>,
+    /// whether it speaks a saved voice that was enrolled for its architecture (the voice's fitted codes,
+    /// `<voice>/enrolled/<arch>.npy`, handed in as the request's `enrolled` option) - a model without an encoder
+    /// (Voxtral TTS: experimental)
+    pub enrolled: bool,
 }
 
 /// The engine's own defaults, shown by `engines` and used for the request's `None` fields

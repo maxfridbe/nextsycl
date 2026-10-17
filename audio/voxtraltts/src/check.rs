@@ -85,7 +85,7 @@ pub fn spec_of(dir: &Path) -> Result<Spec> {
     let p = dir.join("request.json");
     let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).map_err(|e| Error(format!("{}: {e}", p.display())))?)
         .map_err(|e| Error(format!("{}: {e}", p.display())))?;
-    Ok(Spec { text: r["text"].as_str().unwrap_or_default().to_string(), voice: r["voice"].as_str().unwrap_or(crate::DEFAULT_VOICE).to_string(),
+    Ok(Spec { text: r["text"].as_str().unwrap_or_default().to_string(), voice: r["voice"].as_str().unwrap_or(crate::DEFAULT_VOICE).to_string(), enrolled: None,
               cfg: r["cfg"].as_f64().unwrap_or(crate::CFG as f64) as f32, steps: crate::STEPS })
 }
 

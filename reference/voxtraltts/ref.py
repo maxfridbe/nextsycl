@@ -120,6 +120,59 @@ class Backbone:
         return rms(x, self.norm, p["norm_eps"])
 
 
+def flash_standin(q, k, v, causal, window_size, alibi_slopes):
+    """flash_attn_func's math for the codec (its path on CUDA): ALiBi slope_h (j - i), causal, keys i - left .. i + right;
+    q / k / v [B, S, H, D] -> [B, S, H, D] contiguous (the SDPA fallback's view fails on a non-contiguous result on XPU)"""
+    S = q.shape[1]
+    pos = torch.arange(S, device=q.device)
+    rel = pos.unsqueeze(0) - pos.unsqueeze(1)
+    bias = alibi_slopes.to(q.dtype).view(-1, 1, 1) * rel.unsqueeze(0).to(q.dtype)
+    if causal:
+        bias = bias.masked_fill(rel.unsqueeze(0) > 0, float("-inf"))
+    bias = bias.masked_fill(((rel < -window_size[0]) | (rel > window_size[1])).unsqueeze(0), float("-inf"))
+    o = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=bias.unsqueeze(0))
+    return o.transpose(1, 2).contiguous()
+
+
+def modules(code, flash=False):
+    """Upstream's acoustic transformer and codec modules (a vllm-omni checkout), their vLLM parts stood in for; `flash`:
+    the codec's flash-attn path with `flash_standin` (the same attention; off the CPU)"""
+    log = logging.getLogger("voxtral-ref")
+    ns = dict(math=math, np=np, torch=torch, nn=nn, F=F, Enum=Enum, dataclass=dataclass, fields=fields, is_dataclass=is_dataclass, replace=replace,
+              Union=Union, get_args=get_args, get_origin=get_origin, ceil=ceil, rms_norm=nn.RMSNorm, logger=log, logging=logging,
+              default_weight_loader=weight_loader, rearrange=rearrange, deepcopy=deepcopy, pad_sequence=pad_sequence,
+              weight_norm=torch.nn.utils.parametrizations.weight_norm, HAS_FLASH_ATTN=flash, flash_attn_func=flash_standin if flash else None, VllmConfig=object,
+              current_omni_platform=types.SimpleNamespace(device_type="cpu"), Any=object, __name__="voxtral_upstream")
+    upstream(os.path.join(code, MODELS, "voxtral_tts_audio_generation.py"),
+             ["AudioSpecialTokens", "AcousticTransformerArgs", "MultimodalAudioModelArgs", "_repeat_interleave", "repeat_kv", "from_nested_dict",
+              "FeedForward", "BidirectionalAttention", "AcousticTransformerBlock", "TimeEmbedding", "FlowMatchingAudioTransformer"], ns)
+    upstream(os.path.join(code, MODELS, "voxtral_tts_audio_tokenizer.py"),
+             ["AudioTokenizerArgs", "SemanticCodebook", "AcousticCodebook", "MistralAudioCodebook", "prepare_for_attention", "pad1d", "CausalConv1d",
+              "CausalConvTranspose1d", "MultiVocabEmbeddings", "Attention", "TransformerBlock", "Transformer", "VoxtralTTSAudioTokenizer"], ns)
+    return ns
+
+
+def audio_args(params):
+    """params.json's audio model arguments as vllm-omni's parser leaves them (7 Euler steps when it names none)"""
+    a = deepcopy(params["multimodal"]["audio_model_args"])
+    a["acoustic_transformer_args"].setdefault("n_decoding_steps", 7)
+    return a
+
+
+def make_codec(ns, sf, params, audio_model_args):
+    """Upstream's VoxtralTTSAudioTokenizer with the checkpoint's decoder, quantizer and audio embeddings, float32"""
+    mm = params["multimodal"]
+    cfg = types.SimpleNamespace(audio_config={"codec_args": mm["audio_tokenizer_args"], "audio_model_args": deepcopy(audio_model_args)},
+                                text_config=types.SimpleNamespace(hidden_size=params["dim"]))
+    codec = ns["VoxtralTTSAudioTokenizer"](vllm_config=types.SimpleNamespace(model_config=types.SimpleNamespace(hf_config=cfg)))
+    for name in sf.keys():
+        if name.startswith("audio_tokenizer."):
+            codec.load_weight((name[len("audio_tokenizer."):], sf.get_tensor(name).float()))
+        elif name == "mm_audio_embeddings.audio_codebook_embeddings.embeddings.weight":
+            codec.load_weight(("audio_token_embedding.embeddings.weight", sf.get_tensor(name).float()))
+    return codec.float().eval()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
@@ -137,34 +190,11 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     params = json.load(open(os.path.join(a.model, "params.json")))
     mm = params["multimodal"]
-    audio_model_args = deepcopy(mm["audio_model_args"])
-    # vllm-omni's config parser (transformers_utils/parsers/voxtral_tts.py): 7 Euler steps when params.json names none
-    audio_model_args["acoustic_transformer_args"].setdefault("n_decoding_steps", 7)
+    audio_model_args = audio_args(params)
 
-    # upstream's modules, their vLLM parts stood in for
-    log = logging.getLogger("voxtral-ref")
-    ns = dict(math=math, np=np, torch=torch, nn=nn, F=F, Enum=Enum, dataclass=dataclass, fields=fields, is_dataclass=is_dataclass, replace=replace,
-              Union=Union, get_args=get_args, get_origin=get_origin, ceil=ceil, rms_norm=nn.RMSNorm, logger=log, logging=logging,
-              default_weight_loader=weight_loader, rearrange=rearrange, deepcopy=deepcopy, pad_sequence=pad_sequence,
-              weight_norm=torch.nn.utils.parametrizations.weight_norm, HAS_FLASH_ATTN=False, flash_attn_func=None, VllmConfig=object,
-              current_omni_platform=types.SimpleNamespace(device_type="cpu"), Any=object, __name__="voxtral_upstream")
-    upstream(os.path.join(a.code, MODELS, "voxtral_tts_audio_generation.py"),
-             ["AudioSpecialTokens", "AcousticTransformerArgs", "MultimodalAudioModelArgs", "_repeat_interleave", "repeat_kv", "from_nested_dict",
-              "FeedForward", "BidirectionalAttention", "AcousticTransformerBlock", "TimeEmbedding", "FlowMatchingAudioTransformer"], ns)
-    upstream(os.path.join(a.code, MODELS, "voxtral_tts_audio_tokenizer.py"),
-             ["AudioTokenizerArgs", "SemanticCodebook", "AcousticCodebook", "MistralAudioCodebook", "prepare_for_attention", "pad1d", "CausalConv1d",
-              "CausalConvTranspose1d", "MultiVocabEmbeddings", "Attention", "TransformerBlock", "Transformer", "VoxtralTTSAudioTokenizer"], ns)
-
+    ns = modules(a.code)
     sf = safe_open(os.path.join(a.model, "consolidated.safetensors"), framework="pt")
-    cfg = types.SimpleNamespace(audio_config={"codec_args": mm["audio_tokenizer_args"], "audio_model_args": deepcopy(audio_model_args)},
-                                text_config=types.SimpleNamespace(hidden_size=params["dim"]))
-    codec = ns["VoxtralTTSAudioTokenizer"](vllm_config=types.SimpleNamespace(model_config=types.SimpleNamespace(hf_config=cfg)))
-    for name in sf.keys():
-        if name.startswith("audio_tokenizer."):
-            codec.load_weight((name[len("audio_tokenizer."):], sf.get_tensor(name).float()))
-        elif name == "mm_audio_embeddings.audio_codebook_embeddings.embeddings.weight":
-            codec.load_weight(("audio_token_embedding.embeddings.weight", sf.get_tensor(name).float()))
-    codec.float().eval()
+    codec = make_codec(ns, sf, params, audio_model_args)
 
     def decode(codes):
         """codes [T, 37] as emitted: cut at the first [END_AUDIO], 2 taken off, 375-frame chunks (decode_helper_batch_async), float32"""

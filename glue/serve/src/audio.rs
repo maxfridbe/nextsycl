@@ -409,6 +409,8 @@ impl AudioServer {
         let frames_per_s = if speech { 12.5 } else { 25.0 };
         let seconds = num(&["seconds", "duration", "audio_duration"]).or_else(|| num(&["max_new_tokens"]).map(|f| f / frames_per_s)).map(|v| v as f32);
         let mut saved: Option<String> = None;
+        // a saved voice's enrolment (its fitted codes' file), for an engine that speaks enrolled voices
+        let mut enrolled: Option<String> = None;
         let mut req = AudioRequest {
             prompt: prompt.clone(),
             lyrics: lyrics.clone(),
@@ -436,10 +438,18 @@ impl AudioServer {
                     known.extend(lib.list().iter().filter_map(|x| x["name"].as_str().map(str::to_string)));
                     return Err(bad(format!("voice {v}: none such ({})", known.join(", "))));
                 }
-                if !sp.clone {
-                    return Err(bad(format!("voice {v} is a saved voice: speak it with a model that clones (qwen3-tts-base)")));
+                // a model without an encoder speaks a saved voice it was enrolled for: its fitted codes, not the recording
+                let enrolled_file = if sp.clone { None } else { lib.enrolled_path(&v, engine.arch()) };
+                if !sp.clone && !(sp.enrolled && enrolled_file.is_some()) {
+                    return Err(bad(match sp.enrolled {
+                        true => format!("voice {v} is a saved voice not enrolled for {}: nextsycl audio voice enroll {v} (experimental), or a model that \
+                                         clones (qwen3-tts-base)", engine.arch()),
+                        false => format!("voice {v} is a saved voice: speak it with a model that clones (qwen3-tts-base)"),
+                    }));
                 }
-                if req.reference.is_none() {
+                if let Some(f) = enrolled_file {
+                    enrolled = Some(f.to_string_lossy().into_owned());
+                } else if req.reference.is_none() {
                     req.reference = Some(lib.reference(&v).map_err(bad)?);
                 }
                 req.voice = None;
@@ -470,8 +480,15 @@ impl AudioServer {
             req.voice = None;
         }
         if !given.is_empty() {
+            // a file path the server reads: only a saved voice's enrolment names it (a request names the voice)
+            if given.keys().any(|k| k == "enrolled" || k.ends_with("_ENROLLED")) {
+                return Err(bad("options.enrolled: not a request's (name the enrolled saved voice in voice)".into()));
+            }
             nextsycl_core::options::resolve(&given, engine.options(), nextsycl_core::At::Request, &self.model).map_err(bad)?;
             req.extra = nextsycl_core::options::by_name(&given, engine.options());
+        }
+        if let Some(f) = enrolled {
+            req.extra.insert("enrolled".into(), f);
         }
         let d = engine.defaults();
         let (steps, cfg) = (req.steps.unwrap_or(d.steps), req.cfg.unwrap_or(d.cfg));
@@ -510,7 +527,11 @@ impl AudioServer {
             meta["voice"] = json!(req.voice.clone().or(saved));
             meta["language"] = json!(req.language);
             meta["instructions"] = json!(instructions);
-            meta["cloned"] = json!(req.reference.is_some());
+            // a saved voice spoken by its enrolment (no recording in the prompt: its fitted codes) is a clone too
+            meta["cloned"] = json!(req.reference.is_some() || req.extra.contains_key("enrolled"));
+            if req.extra.contains_key("enrolled") {
+                meta["enrolled"] = json!(true);
+            }
             meta["continued"] = json!(carried);
         }
         let meta = meta.to_string();

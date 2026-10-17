@@ -210,8 +210,14 @@ impl Home {
         if !voice.is_empty() && carried.is_empty() && !can("voices") && !saved(&voice) {
             return Err(bad(format!("voice {voice}: not a saved voice (audio.voices.list), and {id} has no built-in voices")));
         }
-        if !voice.is_empty() && saved(&voice) && !can("clone") {
-            return Err(bad(format!("voice {voice} is a saved voice: speak it with a model that clones (qwen3-tts-base, voxcpm2)")));
+        // a saved voice: a model that clones it, or one it is enrolled for (no recording or carry-on beside it)
+        let enrolled = carried.is_empty() && s(b, "ref_audio").is_empty() && super::api::enrolled_for(&self.voices(), &voice, &m);
+        if !voice.is_empty() && saved(&voice) && !can("clone") && !enrolled {
+            return Err(bad(match can("enrolled") {
+                true => format!("voice {voice} is a saved voice not enrolled for {id}: enroll it (nextsycl audio voice enroll {voice}, experimental) or \
+                                 use a model that clones (qwen3-tts-base, voxcpm2)"),
+                false => format!("voice {voice} is a saved voice: speak it with a model that clones (qwen3-tts-base, voxcpm2)"),
+            }));
         }
         // a model that clones only with the transcript: a saved voice must have one, a recording its ref_text
         if can("transcript") {

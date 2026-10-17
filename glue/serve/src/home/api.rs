@@ -545,6 +545,9 @@ impl Home {
         }
         let voice = s(b, "voice");
         let cloned = !s(b, "ref_audio").is_empty() || !s(b, "continue_from").is_empty() || (!voice.is_empty() && self.voices().get(&voice).is_some());
+        // a saved voice alone (no recording, no carry-on): a model it is enrolled for speaks it too
+        let saved_only = !voice.is_empty() && s(b, "ref_audio").is_empty() && s(b, "continue_from").is_empty() && self.voices().get(&voice).is_some();
+        let lib = self.voices();
         // a clone with an instruction: a model that directs a cloned voice (Breeze TTS 2)
         let need = if cloned && !s(b, "instructions").is_empty() {
             "direction"
@@ -566,6 +569,12 @@ impl Home {
             // a built-in voice: a model that has it (or lists none)
             .filter(|m| need != "voices" || speaks(m, &voice))
             .map(|m| s(m, "id")).collect();
+        // a saved voice no enabled model clones: a model it is enrolled for (experimental; models that clone come first)
+        let can = if can.is_empty() && need == "clone" && saved_only {
+            all.iter().filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false && enrolled_for(&lib, &voice, m)).map(|m| s(m, "id")).collect()
+        } else {
+            can
+        };
         let loaded = self.loaded_of("audio");
         loaded.into_iter().find(|l| can.contains(l)).or_else(|| can.first().cloned()).ok_or_else(|| {
             (409, match need {
@@ -966,7 +975,10 @@ impl Home {
                     let reads = lib.sample_path(&name).is_some_and(|f| nextsycl_audio::wav_info(&f).is_ok_and(|(_, secs)| secs > 0.0));
                     // a voice that does not say what its sample says: not the models that clone only with the transcript
                     let said = v["text"].as_str().is_some_and(|t| !t.trim().is_empty());
-                    let speakers: Vec<Value> = speakers.iter().filter(|id| said || !needs_text(&all, id)).cloned().collect();
+                    let mut speakers: Vec<Value> = speakers.iter().filter(|id| said || !needs_text(&all, id)).cloned().collect();
+                    // and the models without an encoder it is enrolled for (experimental: Voxtral TTS)
+                    speakers.extend(all.iter().filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false && enrolled_for(&lib, &name, m))
+                        .map(|m| m["id"].clone()));
                     v["ready"] = json!(reads && !speakers.is_empty());
                     v["models"] = json!(speakers);
                     if !reads {
@@ -1574,6 +1586,12 @@ pub(super) fn needs_text(all: &[Value], id: &Value) -> bool {
     all.iter().find(|m| &m["id"] == id).is_some_and(|m| m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "transcript")))
 }
 
+/// Whether a model speaks the saved voice `voice` by its enrolment (its card's `speech` lists `enrolled`, and the voice
+/// has a fit for its architecture)
+pub(super) fn enrolled_for(lib: &crate::voices::Library, voice: &str, m: &Value) -> bool {
+    m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "enrolled")) && m["arch"].as_str().is_some_and(|arch| lib.enrolled_path(voice, arch).is_some())
+}
+
 /// Whether a speech model speaks the built-in voice `voice`: it lists it (any case), or lists none (its config or card
 /// names no voices: any name is its engine's to check)
 pub(super) fn speaks(m: &Value, voice: &str) -> bool {
@@ -1583,7 +1601,23 @@ pub(super) fn speaks(m: &Value, voice: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{code_of, rpc_error, speaks};
+    use super::{code_of, enrolled_for, rpc_error, speaks};
+
+    #[test]
+    fn an_enrolled_voice_goes_to_its_model() {
+        let dir = std::env::temp_dir().join(format!("ns-enrolled-{}", std::process::id()));
+        let lib = crate::voices::Library::of(&dir);
+        let vox = serde_json::json!({"id": "voxtral-4b-tts", "arch": "voxtral-tts", "speech": ["voices", "enrolled"]});
+        assert!(!enrolled_for(&lib, "anna", &vox));
+        let f = lib.enrolled_file("anna", "voxtral-tts").unwrap();
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"x").unwrap();
+        assert!(enrolled_for(&lib, "anna", &vox));
+        // a model whose card does not speak enrolled voices, or of another architecture
+        assert!(!enrolled_for(&lib, "anna", &serde_json::json!({"arch": "voxtral-tts", "speech": ["voices"]})));
+        assert!(!enrolled_for(&lib, "anna", &serde_json::json!({"arch": "qwen3-tts", "speech": ["enrolled"]})));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn a_built_in_voice_goes_to_a_model_that_has_it() {
