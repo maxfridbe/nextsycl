@@ -917,8 +917,9 @@ speaker each in order; `audio.speak` picks a model of several speakers (card `sp
   bit-identical to `generate`'s frames): token ids identical; with the f16 GGUF the language model's logits 4e-4 and
   hidden states 2e-3 / 5e-4 teacher forced (51 of 51 tokens agree), with the served Q8_0 2e-3 and 1.4-2e-2 (its
   quantization); the diffusion head 4e-7, the acoustic decoder 2e-4, the semantic encoder 7-10e-4, the voice encoder
-  3e-4 / 1e-3. Clips plain, cloned, two-speaker and a 46 s show transcribe word for word (Whisper small); the
-  speakers alternate as cast (pitch). `docs/ports/vibevoice.md` has the details.
+  3e-4 / 1e-3; Chinese token ids identical, and a run that splits into two audio segments (the negative branch's
+  restart, the streams' reset) as close. Clips plain, cloned, two-speaker and a 46 s show transcribe word for word
+  (Whisper small); the speakers alternate as cast (pitch). `docs/ports/vibevoice.md` has the details.
 - **Speed** (2026-10-17): 43.5 frames a second on the B70 (5.8x real time: 46.5 s of a two-speaker show in 8.8 s with
   the prompt), 38.9 on the B65 (5.2x). 4.9 GiB of weights, 5.6 GiB in a run.
 

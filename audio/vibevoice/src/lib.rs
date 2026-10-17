@@ -57,6 +57,9 @@ pub const SPEAKERS: usize = 4;
 /// the language model's positions (Qwen2.5-1.5B's 65,536), and the longest a request runs (90 minutes, upstream's)
 const MAX_POS: usize = 65536;
 const MAX_SECONDS: f32 = 5400.0;
+/// a run's steps at most, a prompt row each: a bound on a run that does not end. Upstream's is 2, which cuts a long
+/// script read without recordings short (speech takes about 2.4 frames a text token); the request's seconds bound it too
+const STEPS_A_ROW: usize = 4;
 /// prompt rows a pass
 pub(crate) const CHUNK: usize = 256;
 /// a voice's recording through the encoder a piece at a time (frames a piece)
@@ -322,18 +325,18 @@ impl VibeVoice {
         Ok(rows)
     }
 
-    /// The speech: from the prompt's rows, step by step until the model ends it (or `s.frames` frames, or twice the
-    /// prompt's length in steps: upstream's bound). `noise`: a check's noise a frame (else drawn from the seed);
-    /// `keep`: what a check compares
+    /// The speech: from the prompt's rows, step by step until the model ends it (or `s.frames` frames, or STEPS_A_ROW
+    /// times the prompt's length in steps, or the model's positions). `noise`: a check's noise a frame (else drawn from
+    /// the seed); `keep`: what a check compares
     #[allow(clippy::too_many_arguments)]
     pub fn speak(&self, rows: &[f32], s: Settings, t0: Instant, progress: &mut dyn FnMut(Step) -> Result<()>, noise: Option<&[Vec<f32>]>,
                  mut keep: Option<&mut Keep>) -> Result<Vec<f32>> {
         let (ops, nsd, h) = (&self.ops, &self.nsd, self.lm.hidden);
         let l = rows.len() / h;
-        let max_steps = (2 * l).min(s.frames + 2);
-        if l + max_steps + 1 > MAX_POS {
-            return Err(Error(format!("the prompt is {l} positions; with the speech the model reads {MAX_POS}")));
+        if l + 2 > MAX_POS {
+            return Err(Error(format!("the prompt is {l} positions; the model reads {MAX_POS} with the speech")));
         }
+        let max_steps = (STEPS_A_ROW * l).min(s.frames + 2).min(MAX_POS - l - 1);
         let g = &ops.gpu;
         let pos: Cache = self.lm.cache(ops, CHUNK, l + max_steps + 1)?;
         let neg: Cache = self.lm.cache(ops, 2, max_steps + 2)?;
@@ -413,7 +416,7 @@ impl VibeVoice {
                     k.semantic.push(sem_in.to_f32()?[..self.sem.dim_out].to_vec());
                     k.embeds.push(next.to_f32()?);
                 }
-                progress(Step { phase: "tokens", at: frames as u32, of: s.frames as u32, seconds: t0.elapsed().as_secs_f64() })?;
+                progress(Step { phase: "tokens", at: frames as u32, of: s.frames.min(max_steps) as u32, seconds: t0.elapsed().as_secs_f64() })?;
             } else {
                 next.write(0, &bytes(&self.embedding(tok)?))?;
             }

@@ -73,7 +73,9 @@ A ConvNeXt block is:
   - An audio end clears both streaming caches.
   - An audio start restarts the negative branch: its audio start at position 0, the next input at 1.
   - The end of text ends the run.
-- **Bounds**: a run takes at most twice the prompt's length in steps (upstream's), and the request's seconds.
+- **Bounds**: upstream takes at most twice the prompt's length in steps. That cuts a long script read without voice
+  recordings short, because speech takes about 2.4 frames a text token. The engine allows four times the prompt's
+  length, and the request's `seconds` bounds it as well.
 
 Transformers' `model.generate` differs from upstream in one way. Its generation config's `guidance_scale` 1.3 adds
 an `UnbatchedClassifierFreeGuidanceLogitsProcessor` to the token choice, which upstream does not have. The two then
@@ -119,24 +121,27 @@ upstream.
   |difference| 0.0).
 - The Whisper transcripts of the reference's own clips are word for word.
 
-`nextsycl audio check DUMP --dir DIR` compares each stage from the reference's own inputs. Two dumps were used:
+`nextsycl audio check DUMP --dir DIR` compares each stage from the reference's own inputs. Three dumps were used:
 
 - **plain**: one speaker, no voice, 19 frames.
 - **two**: two speakers with the en-Alice and en-Frank voices, 251 voice frames, 49 frames.
+- **zh**: a Chinese two-speaker script with the en-Maya and en-Carter voices, 47 frames. The model closed the first
+  speaker's audio and opened a new segment between the turns (audio end, audio start). That exercises the negative
+  branch's restart and the streams' reset.
 
 Numbers are relative RMS errors.
 
 | stage | Q8_0 (served) | f16 file |
 |---|---|---|
-| token ids | identical (43 / 324) | identical |
+| token ids | identical (43 / 324 / 486, Chinese included) | identical |
 | voice latents (acoustic encoder) | 3.4e-4 / 1.0e-3 | 3.5e-4 / 1.0e-3 |
 | voice rows (connector) | 3.0e-4 | 3.0e-4 |
 | prompt rows | 3.0e-4 (0 without voices) | 3.0e-4 |
-| logits, teacher forced (51 steps) | 2.2-2.3e-3; the best of four agrees 51 / 51 | 4.2-4.8e-4; 51 / 51 |
+| logits, teacher forced (21-51 steps) | 2.2-2.6e-3; the best of four agrees on every step | 4.2-4.8e-4; every step |
 | hidden state, positive / negative | 1.4-1.6e-2 / 1.9-2.1e-2 | 2.2e-3 / 5.0e-4 |
-| diffusion head: first output / latents (10 steps, the reference's conditions and noise) | 4e-7 / 4-6e-7 | the same |
-| acoustic decoder (speech) | 1.7-2.4e-4 | the same |
-| semantic features | 7.4-9.8e-4 | the same |
+| diffusion head: first output / latents (10 steps, the reference's conditions and noise) | 4e-7 / 4e-7 to 6e-6 | the same |
+| acoustic decoder (speech) | 1.5-2.4e-4 | the same |
+| semantic features | 7.4e-4 to 3.8e-3 | the same |
 | next inputs (connectors) | 3.0e-4 | the same |
 
 What the numbers show:
@@ -151,6 +156,8 @@ What the numbers show:
   - Its clip still says the script word for word.
   - The reference's clip and the engine's run transcribe identically (Whisper small): "Welcome back to the show.
     Today we talk about gardens. Thanks for having me. I love tomatoes."
+  - The Chinese run transcribes as the script, apart from Whisper writing it in traditional characters and a
+    homophone (戴 for 带).
 
 ## Clips
 

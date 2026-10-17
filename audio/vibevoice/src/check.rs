@@ -214,8 +214,18 @@ pub fn run(e: &VibeVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
         let (ds, ss) = (e.dec.stream(ops)?, e.sem.stream(ops)?);
         let (lin, chunk) = (DevBuf::f32(g, lat)?, DevBuf::f32(g, hop)?);
         let (mut got_s, mut got_m) = (Vec::new(), Vec::new());
+        // the frames in the reference's token order: an audio end clears both streams (a new segment starts afresh)
+        let toks: Vec<u32> = read_npy(&dir.join("tokens.npy"))?.1.into_iter().map(|x| x as u32).collect();
+        let mut f = 0;
         let t = Instant::now();
-        for f in 0..n {
+        for tok in toks {
+            if tok == e.cfg.audio_eos {
+                e.dec.reset(&ds)?;
+                e.sem.reset(&ss)?;
+            }
+            if tok != e.cfg.audio || f >= n {
+                continue;
+            }
             let un: Vec<f32> = lats[f * lat..(f + 1) * lat].iter().map(|v| v / e.scale - e.bias).collect();
             lin.write(0, &bytes(&un))?;
             let (y, rows) = e.dec.push(ops, &e.nsd, &ds, &lin, 1, &dw)?;
@@ -228,6 +238,7 @@ pub fn run(e: &VibeVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
             let mut m = vec![0f32; e.sem.dim_out];
             y.read(0, crate::as_bytes_mut(&mut m))?;
             got_m.extend(m);
+            f += 1;
         }
         log(format!("{:<24} {n} frames in {:.2} s", "decoder + semantic", t.elapsed().as_secs_f64()));
         report(log, &mut worst, "speech (decoder)", &got_s, &speech);
