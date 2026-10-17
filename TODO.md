@@ -422,6 +422,13 @@ profiling), README speed lines and cards' vram_gib, deploy.
 - [ ] The front door can't plan for GPU processes it doesn't manage (an agent's TRELLIS run goes 0 -> 23 GB in
       seconds): hold /tmp/ds2run.lock or keep tests off cards the front door uses.
 
+- [ ] Audio servers leak card memory per request (2026-10-16: Breeze TTS 2, ~0.3 GB a clip; ~77 clips filled a
+      32 GB card, then conv1d OUT_OF_RESOURCES and the next request hung in the prompt phase at 100% CPU). Guarded
+      now (a GPU error or +4 GiB over the loaded model ends the server after its answer; `stop` gives up on a
+      request stuck 120 s). Find the source with a loop of varied-length requests on a free card - suspects: the
+      shared nsd.cpp per-shape caches (gemm/lin/sdpa/attn maps keyed by rows, never trimmed; oneDNN library-mode
+      scratchpads), conv.cpp's prims/weights maps.
+
 ## To try
 
 - [ ] Swap the cards' slots: the B70 to the x16 slot, the B65 to Gen4 x4 - then NS_SPLIT=15 (the B65's 12 MoE layers

@@ -10,6 +10,9 @@ use nextsycl_serve::http::{call_for, Target};
 
 use crate::container::Ce;
 
+/// How long a request's progress may stand still before `stop` takes it for hung (seconds)
+const STUCK_S: u64 = 120;
+
 pub struct Served {
     /// the container's name (slot 0's; slot N's has `-N` after it)
     pub name: &'static str,
@@ -138,7 +141,8 @@ impl Served {
         Ok(())
     }
 
-    /// `stop`: the request in progress (and those waiting) finish first
+    /// `stop`: the request in progress (and those waiting) finish first - unless its progress stands still for
+    /// STUCK_S (a hung engine never finishes): then it is stopped as it is
     pub fn stop(&self, cfg: &Config, args: &[String]) -> Result<(), String> {
         let name = self.name_for(args)?;
         let ce = Ce::new(cfg)?;
@@ -149,8 +153,15 @@ impl Served {
         if let Ok(t) = self.addr(cfg, args) {
             let t0 = Instant::now();
             let mut said = false;
+            let (mut last, mut moved) = (serde_json::Value::Null, Instant::now());
             while let Ok(p) = call_for(&t, "GET", "/api/progress", None, 10) {
                 if p["busy"] != true && p["waiting"].as_u64().unwrap_or(0) == 0 {
+                    break;
+                }
+                if p != last {
+                    (last, moved) = (p.clone(), Instant::now());
+                } else if moved.elapsed() > Duration::from_secs(STUCK_S) {
+                    println!("no progress for {STUCK_S} s (stuck at {}): stopping it as it is", p["phase"].as_str().unwrap_or("?"));
                     break;
                 }
                 if !said {

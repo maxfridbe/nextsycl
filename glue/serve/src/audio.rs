@@ -25,7 +25,7 @@
 use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +54,11 @@ pub struct AudioServer {
     history: Mutex<VecDeque<Value>>,
     /// ends the process after an idle stretch (`--idle-exit`; none: never)
     pub idle: Option<&'static crate::idle::Idle>,
+    /// this process's card memory once the model was loaded (MiB), and whether to end after the request in hand: a
+    /// GPU error, or memory grown well past the loaded model's (caches that keep a piece of every request's shape) -
+    /// the front door starts a fresh server for the next request, so a leak never fills the card
+    vram_loaded: AtomicU64,
+    retire: AtomicBool,
 }
 
 /// A float32 setting as JSON without its binary tail (1.7, not 1.7000000476837158)
@@ -127,7 +132,8 @@ impl AudioServer {
         let tele = Telemetry::start(std::slice::from_ref(&gpu.pci));
         let history = Mutex::new(out_dir.as_deref().map(earlier).unwrap_or_default());
         Ok(AudioServer { model, out_dir, wfe, cors, gpu, tele, engine: Mutex::new(engine), progress: Mutex::new(json!({"busy": false})),
-                         idle: None, waiting: AtomicUsize::new(0), cancel: Default::default(), history })
+                         idle: None, waiting: AtomicUsize::new(0), cancel: Default::default(), history,
+                         vram_loaded: AtomicU64::new(own_vram_mb()), retire: AtomicBool::new(false) })
     }
 
     /// Answers on `addr` until the process ends
@@ -221,8 +227,22 @@ impl AudioServer {
                     Ok((None, wav)) => http::respond_bytes(&mut s, 200, "audio/wav", &wav, &cors),
                     Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
                 }
+                self.maybe_retire();
             }
             _ => http::respond_with(&mut s, 404, &err(format!("no route {} {}", req.method, req.path)), &cors),
+        }
+    }
+
+    /// Ends the process after an answer when it should (a GPU error; card memory grown past the loaded model's by
+    /// more than RETIRE_GROWTH_MB or half of it) and nothing waits; the front door starts a fresh server
+    fn maybe_retire(&self) {
+        let (was, now) = (self.vram_loaded.load(Ordering::Relaxed), own_vram_mb());
+        if was > 0 && now > was + RETIRE_GROWTH_MB.max(was / 2) {
+            eprintln!("nextsycl audio: card memory {now} MiB, {was} MiB once loaded - ending so a fresh server takes the next request");
+            self.retire.store(true, Ordering::Relaxed);
+        }
+        if self.retire.load(Ordering::Relaxed) && self.waiting.load(Ordering::Relaxed) == 0 {
+            std::process::exit(0);
         }
     }
 
@@ -463,6 +483,13 @@ impl AudioServer {
         });
         *p.lock().unwrap() = json!({"busy": false});
         drop(engine);
+        if let Err(e) = &out {
+            // the device failed (out of resources, lost): this process's GPU state is not to be trusted again
+            if gpu_failed(&e.0) {
+                eprintln!("nextsycl audio: a GPU error ({}) - ending after this answer", e.0);
+                self.retire.store(true, Ordering::Relaxed);
+            }
+        }
         let audio = out.map_err(|e| (if e.0 == "cancelled" { 499 } else { 400 }, e.0))?;
         let took = t0.elapsed().as_secs_f64();
         // the card's energy over the request (its counter's rise), watt-hours
@@ -503,9 +530,45 @@ impl AudioServer {
     }
 }
 
+/// How far a server's card memory may grow past the loaded model's before it ends (MiB; or half the model's)
+const RETIRE_GROWTH_MB: u64 = 4096;
+
+/// Whether an engine error is the device failing (not a bad request)
+fn gpu_failed(m: &str) -> bool {
+    ["UR_RESULT_ERROR", "level_zero backend failed", "DEVICE_LOST", "out of device memory"].iter().any(|k| m.contains(k))
+}
+
+/// This process's memory on the cards (MiB): its DRM clients' resident VRAM (/proc/self/fdinfo); 0 when unreadable
+pub fn own_vram_mb() -> u64 {
+    let Ok(fds) = std::fs::read_dir("/proc/self/fd") else { return 0 };
+    let mut seen = std::collections::HashSet::new();
+    let mut kb = 0;
+    for fd in fds.flatten() {
+        if !std::fs::read_link(fd.path()).is_ok_and(|t| t.starts_with("/dev/dri/")) {
+            continue;
+        }
+        let Ok(info) = std::fs::read_to_string(std::path::Path::new("/proc/self/fdinfo").join(fd.file_name())) else { continue };
+        let field = |k: &str| info.lines().find_map(|l| l.strip_prefix(k)).map(|v| v.trim().to_string());
+        // one client can be open on several descriptors: count it once
+        if field("drm-client-id:").is_some_and(|id| seen.insert(id)) {
+            kb += field("drm-resident-vram0:").and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok()).unwrap_or(0);
+        }
+    }
+    kb / 1024
+}
+
 #[cfg(test)]
 mod tests {
-    use super::range;
+    use super::{gpu_failed, own_vram_mb, range};
+
+    #[test]
+    fn a_device_failure_retires_the_server_a_bad_request_does_not() {
+        assert!(gpu_failed("conv1d: sycl: level_zero backend failed with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)"));
+        assert!(!gpu_failed("ref_text: the recording's exact transcript"));
+        assert!(!gpu_failed("cancelled"));
+        // no card open here: nothing to count
+        assert_eq!(own_vram_mb(), 0);
+    }
 
     #[test]
     fn byte_ranges() {
@@ -517,3 +580,4 @@ mod tests {
         assert_eq!(range(b"Host: a\r\n", 100), None);
     }
 }
+
