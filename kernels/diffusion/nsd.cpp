@@ -187,6 +187,16 @@ struct Ctx {
     }
 };
 
+// The per-shape caches below are kept to MAX_SHAPES each: a server that sees a new row count every request (a text
+// encoder, a prompt) would otherwise add a few MiB of kernels a shape for as long as it runs. Emptied whole (the
+// queue drained first: oneDNN wants a primitive alive until its kernels ran) - the shapes in use are made again.
+constexpr size_t MAX_SHAPES = 512;
+template <typename M> void bound(Ctx& c, M& m) {
+    if (m.size() < MAX_SHAPES) return;
+    c.q.wait();
+    m.clear();
+}
+
 inline dnnl::memory::data_type ddt(int dt) {
     return dt == F16 ? dnnl::memory::data_type::f16 : dt == BF16 ? dnnl::memory::data_type::bf16
                                                                  : dnnl::memory::data_type::f32;
@@ -550,6 +560,7 @@ static int int8_linear_rows(Ctx& c, const void* x, int x_dt, int64_t M, int64_t 
         if (it == c.rot.end()) {
             try {
                 memory::desc d32({rows, g}, ddt(r_dt), memory::format_tag::ab);
+                bound(c, c.rot);
                 it = c.rot.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, smd, hmd, d32))).first;
             } catch (const dnnl::error& e) {
                 if (r_dt == x_dt) throw;
@@ -605,6 +616,7 @@ static int int8_linear_rows(Ctx& c, const void* x, int x_dt, int64_t M, int64_t 
                 if (bias) po.append_binary(dnnl::algorithm::binary_add, col_md);
                 dnnl::primitive_attr attr;
                 attr.set_post_ops(po);
+                bound(c, c.gemm);
                 it = c.gemm.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, smd, wmd, dmd, attr))).first;
             }
             std::unordered_map<int, memory> args{{DNNL_ARG_SRC, usm(smd, c.eng, xq)}, {DNNL_ARG_WEIGHTS, usm(wmd, c.eng, w)},
@@ -631,7 +643,7 @@ static int int8_linear_rows(Ctx& c, const void* x, int x_dt, int64_t M, int64_t 
         memory::desc d2({rows, N}, memory::data_type::s32, memory::format_tag::ab);
         auto key = std::make_tuple(rows, K, N, -1, 0, 0);
         auto it = c.gemm.find(key);
-        if (it == c.gemm.end()) it = c.gemm.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, s2, wmd, d2))).first;
+        if (it == c.gemm.end()) bound(c, c.gemm), it = c.gemm.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, s2, wmd, d2))).first;
         it->second.execute(c.strm, {{DNNL_ARG_SRC, usm(s2, c.eng, xq + r0 * K)}, {DNNL_ARG_WEIGHTS, usm(wmd, c.eng, w)},
                                     {DNNL_ARG_DST, usm(d2, c.eng, acc)}});
         q.parallel_for(sycl::range<2>((size_t) rows, (size_t) N), [=](sycl::id<2> id) {
@@ -693,6 +705,7 @@ int nsd_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const voi
                 po.append_binary(dnnl::algorithm::binary_add, col_md);
                 attr.set_post_ops(po);
             }
+            bound(c, c.lin);
             it = c.lin.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, smd, wmd, dmd, attr))).first;
         }
         void* dst = convert ? tmp : (char*) out + (size_t) r0 * N * oe;
@@ -731,6 +744,7 @@ int nsd_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const
             po.append_sum(1.0f);
             dnnl::primitive_attr attr;
             attr.set_post_ops(po);
+            bound(c, c.lin);
             it = c.lin.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, smd, wmd, dmd, attr))).first;
         }
         std::unordered_map<int, memory> args{{DNNL_ARG_SRC, usm(smd, c.eng, (const char*) x + (size_t) r0 * K * xe)}, {DNNL_ARG_WEIGHTS, usm(wmd, c.eng, w)},
@@ -1586,6 +1600,7 @@ static Ctx::Sdpa& sdpa_for(Ctx& c, int64_t rows, int64_t S, int64_t H, int64_t D
     if (sd.in.size() != 4) throw std::runtime_error("oneDNN's attention partition has unexpected inputs");
     sd.cp = parts[0].compile(sd.in, {out}, c.eng);
     sd.out = sd.cp.query_logical_tensor(out.get_id());
+    bound(c, c.sdpa);
     return c.sdpa.emplace(key, std::move(sd)).first->second;
 }
 
@@ -1707,6 +1722,7 @@ static Ctx::Sdpa& sdpa_qk_for(Ctx& c, int64_t rows, int64_t Skv, int64_t H, int6
     if (sd.in.size() != 4) throw std::runtime_error("oneDNN's strided attention partition has unexpected inputs");
     sd.cp = parts[0].compile(sd.in, {out}, c.eng);
     sd.out = sd.cp.query_logical_tensor(out.get_id());
+    bound(c, c.sdpa_qk);
     return c.sdpa_qk.emplace(key, std::move(sd)).first->second;
 }
 
@@ -1835,6 +1851,7 @@ static Ctx::Sdpa& sdpa_batch_for(Ctx& c, int64_t B, int64_t S, int64_t H, int64_
     if (sd.in.size() != 4) throw std::runtime_error("oneDNN's batched attention partition has unexpected inputs");
     sd.cp = parts[0].compile(sd.in, {out}, c.eng);
     sd.out = sd.cp.query_logical_tensor(out.get_id());
+    bound(c, c.sdpa_b);
     return c.sdpa_b.emplace(key, std::move(sd)).first->second;
 }
 
@@ -2096,6 +2113,7 @@ static int attention_split(Ctx& c, const void* q, const void* k, const void* v, 
         if (it == c.attn.end()) {
             Ctx::Attn a{dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, q_md, k_md, s_md)),
                         dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, s_md, v_md, o_md))};
+            bound(c, c.attn);
             it = c.attn.emplace(key, std::move(a)).first;
         }
         auto s_mem = usm(s_md, c.eng, sc);

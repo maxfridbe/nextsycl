@@ -425,8 +425,8 @@ profiling), README speed lines and cards' vram_gib, deploy.
 - [x] Audio servers leaked card memory per request - fixed 2026-10-17: conv.cpp's oneDNN convolutions each kept
       a library-mode scratchpad (sized by the signal: GBs at 24 kHz) and a primitive was made per clip length. Now one
       shared user scratchpad + at most 256 shapes; a Breeze clip went from +6.3 GB to +0.5 GB, flat over clips. The
-      retire guard stays (it no longer fires). Still open: nsd.cpp's per-row caches (gemm/lin/sdpa) use library-mode
-      scratchpads too - matmuls need little, but a long-running image/video server could creep the same way.
+      retire guard stays (it no longer fires). nsd.cpp's per-row caches measured 2026-10-17: ~2 MiB a new shape
+      (kernels, not scratchpads); now kept to 512 shapes a map (bound(): the queue drained, the map emptied).
 
 ## To try
 
