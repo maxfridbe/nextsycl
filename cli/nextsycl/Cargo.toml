@@ -34,6 +34,7 @@ nextsycl-audio-minimaxmusic3.workspace = true
 nextsycl-audio-qwen3tts.workspace = true
 nextsycl-audio-voxcpm2.workspace = true
 nextsycl-audio-breezetts2.workspace = true
+nextsycl-audio-s2pro.workspace = true
 nextsycl-model3d.workspace = true
 nextsycl-model3d-example.workspace = true
 nextsycl-model3d-hunyuan3d.workspace = true

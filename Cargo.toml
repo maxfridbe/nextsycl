@@ -10,7 +10,7 @@ members = [
     "llm/contract", "llm/glm5next", "llm/qwen4exp", "llm/qwen35", "llm/deepseek2", "llm/deepseek4", "llm/museglimmer", "llm/nemotronh", "llm/example",
     "image/contract", "image/example", "image/qwenimage21", "image/unlimitedocr", "image/paddleocrvl", "image/olmocr2", "image/hunyuanimage21",
     "video/contract", "video/example", "video/h3",
-    "audio/contract", "audio/example", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2",
+    "audio/contract", "audio/example", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2", "audio/s2pro",
     "glue/models", "glue/serve",
     "cli/nextsycl",
 ]
@@ -55,6 +55,7 @@ nextsycl-audio-minimaxmusic3 = { path = "audio/minimaxmusic3" }
 nextsycl-audio-qwen3tts = { path = "audio/qwen3tts" }
 nextsycl-audio-voxcpm2 = { path = "audio/voxcpm2" }
 nextsycl-audio-breezetts2 = { path = "audio/breezetts2" }
+nextsycl-audio-s2pro = { path = "audio/s2pro" }
 nextsycl-model3d = { path = "model3d/contract" }
 nextsycl-model3d-example = { path = "model3d/example" }
 nextsycl-model3d-hunyuan3d = { path = "model3d/hunyuan3d" }
