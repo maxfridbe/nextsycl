@@ -300,10 +300,12 @@ impl Home {
         if p.starts_with("/rpc/") || p.starts_with("/v1/") {
             return self.api(s, req);
         }
+        if let Some(rest) = p.strip_prefix("/open/") {
+            return self.open(&mut s, &req, rest);
+        }
         match (req.method.as_str(), p) {
             ("GET", "/") | ("GET", "/index.html") => self.page(&mut s),
             ("GET", p) if p.starts_with("/ui/") || p.starts_with("/static/") => self.asset(&mut s, p),
-            ("GET", p) if p.starts_with("/open/") => self.open(&mut s, &req, &p["/open/".len()..]),
             ("GET", "/health") => http::respond(&mut s, 200, &json!({"status": "ok"})),
             ("GET", "/openapi.yml") | ("GET", "/openapi.yaml") => {
                 let spec = self.openapi(&req, false);
@@ -331,11 +333,14 @@ impl Home {
         }
     }
 
-    /// A model's own page (an image, audio or 3D model's web front end, which only its running server has): the model is
-    /// started when it is not up - the same as its first request - and the browser sent to it. A disabled model has
-    /// none to open. The video studio and the chat page are always up.
-    fn open(&self, s: &mut Conn, req: &http::Request, id: &str) {
-        let id = id.trim_end_matches('/');
+    /// A model's own page (an image, audio or 3D model's web front end, which only its running server has), served
+    /// through this door: `/open/<id>/<sub>` starts the model when it is not up - the same as its first request - and
+    /// passes the request on to its server as `/<sub>` (any method: the page's own API calls go the same way).
+    /// `/open/<id>` alone is sent to `/open/<id>/`, so the page's relative links resolve under it. Those servers check
+    /// no token and listen on --serve-host (127.0.0.1): this is how another machine reaches them. A disabled model has
+    /// none to open. The video studio and the chat page are always up and on the network: the browser is sent there.
+    fn open(&self, s: &mut Conn, req: &http::Request, rest: &str) {
+        let (id, sub) = rest.split_once('/').map_or((rest, None), |(i, r)| (i, Some(r)));
         let m = match registry::find(&self.o.cfg, id) {
             Ok(Some(m)) => m,
             _ => return http::respond(s, 404, &err(format!("no model {id}"))),
@@ -343,13 +348,21 @@ impl Home {
         if m["enabled"] == false {
             return http::respond(s, 409, &err(format!("{id} is disabled: enable it to open its page")));
         }
-        let kind = registry::kind_of(&m).to_string();
-        let port = match kind.as_str() {
+        let query = req.target.find('?').map_or("", |i| &req.target[i..]);
+        let port = match registry::kind_of(&m) {
             "image" | "audio" | "model3d" => {
-                match self.ensure(id) {
-                    Ok(l) => l.port,
+                let Some(sub) = sub else {
+                    let to = format!("/open/{id}/{query}");
+                    return http::respond_bytes(s, 302, "text/plain; charset=utf-8", b"", &format!("Location: {to}\r\nCache-Control: no-cache\r\n"));
+                };
+                let lease = match self.ensure(id) {
+                    Ok(l) => l,
                     Err((c, e)) => return http::respond(s, c, &err(e)),
+                };
+                if let Err(e) = http::forward_to(&mut *s, &lease, req, &format!("/{sub}{query}")) {
+                    http::respond(s, 502, &err(e));
                 }
+                return;
             }
             "video" => self.o.ports.video,
             _ => self.o.ports.chat_ui,

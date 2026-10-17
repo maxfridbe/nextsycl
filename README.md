@@ -429,6 +429,10 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     seen while they ran, else an estimate from their files; chat models and video engines count once a card - one
     runs at a time - and an overbooked card is flagged: whichever loads first holds it). Every registered model by
     kind: enable it on its GPU(s), start it now (the button spins until it answers), stop it, disable it, its page.
+  - **Model pages** through the door: an image, audio or 3D model's own page is `/open/<id>/` (the model starts if it
+    is not up; every request under it, the page's API calls too, is passed to its server as `/<rest>`). Those servers
+    check no token, so run the door with `--serve-host 127.0.0.1` (the example unit does): they listen on this
+    machine only and another machine reaches them here. The video studio and the chat page are sent to by redirect.
   - **Enabled** models load on their first request - an API call, their page, Open WebUI through the switcher - and
     unload after `NS_IDLE_MINUTES` (10) without one (the image and music servers exit, `--idle-exit`; the switcher
     sets the chat mode to none; the video daemon's workers let their card go), staying enabled. A load waits for its
