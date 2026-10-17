@@ -41,7 +41,7 @@ export type ModelState = "disabled" | "unloaded" | "loading" | "loaded" | "busy"
 
 export interface Model {
   id: string;
-  kind: "llm" | "image" | "audio" | "video";
+  kind: "llm" | "image" | "audio" | "video" | "model3d";
   title: string | null;
   arch: string | null;
   enabled: boolean;
