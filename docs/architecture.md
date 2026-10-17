@@ -64,6 +64,9 @@ audio/                     AUDIO
   breezetts2 nextsycl-audio-breezetts2  Breeze TTS 2: the T5Gemma2 text encoder, the Qwen3 backbone and depth decoder
                                  from CrispASR's GGUF, the prompts of its four templates, guidance, stage checks; the 12 Hz
                                  codec from nextsycl-codec12hz
+  vibevoice  nextsycl-audio-vibevoice  VibeVoice-1.5B: the Qwen2.5-1.5B language model, the diffusion head and its
+                                 DPM-Solver++, the σ-VAE acoustic encoder / decoder and semantic encoder (streaming), the
+                                 script's prompt of up to four voices, stage checks
   example    nextsycl-audio-example  a template
 
 model3d/                   3D
@@ -386,6 +389,19 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   Guidance (an instruction's design or direction) runs a second backbone over the prompt without the instruction; the
   depth decoder runs both branches as one batch of two. Draws on the host. Per-request options: `NS_BZ2_GREEDY`,
   `NS_BZ2_TEMPERATURE`, `NS_BZ2_TOP_K`.
+- **vibevoice** - VibeVoice-1.5B from gguf-org's GGUF (the language model Q8_0, the rest BF16; all expanded to half on
+  the host at load, the convolutions float32 for oneDNN; the token embedding stays on disk, of the tied output head only
+  the four tokens it may say are on the card) with the -hf checkpoint's tokenizer.json and config.json (the shapes and
+  constants the GGUF does not state). The language model (Qwen2.5-1.5B: q / k / v biases, 12 query heads over 2) runs
+  on the music engine's small-batch product and key / value store, Breeze's table RoPE and its own attention for six
+  query heads a key head (`kernels/audio/vibevoice/vv.cpp`, a copy of mm3's: rule 6); the prompt's wide products are
+  oneDNN's half GEMM. Guidance: a second, negative cache from an audio start alone, stepped only on audio frames (as
+  upstream). The diffusion head's two branches run as two rows of the small-batch product; DPM-Solver++ (2M,
+  v-prediction, cosine betas) steps on the host. The σ-VAE tokenizers stream a frame at a time over time rows: each
+  causal convolution carries its last inputs (`vv.cpp`'s depthwise convolution over rows with that context; the
+  channel-mixing ones transposed around mm3's oneDNN convolutions, a transposed one cut to its new outputs); the
+  ConvNeXt blocks' norms and MLPs on the shared kernels and the codec's layer-scaled residual. A voice's recording goes
+  through the acoustic encoder eight frames a piece. No settings of its own.
 
 ## The 3D engines
 

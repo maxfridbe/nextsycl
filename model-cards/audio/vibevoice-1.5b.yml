@@ -1,0 +1,40 @@
+# VibeVoice-1.5B Q8_0 (long-form, multi-speaker speech in English and Chinese at 24 kHz: up to four voices, each cloned
+# from a recording)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# License: MIT (the weights, gguf-org's conversion, upstream's code). Microsoft's responsible-use terms: no voice
+# impersonation without its owner's consent, no passing synthetic speech off as real. See the guide.
+id: vibevoice-1.5b
+kind: audio
+arch: vibevoice
+title: 'VibeVoice-1.5B Q8_0 (long-form speech of up to four speakers in English and Chinese, 24 kHz: voices cloned from recordings, no transcript needed)'
+about: 'VibeVoice-1.5B (Microsoft): a Qwen2.5-1.5B language model reads a script of up to four speakers ("Speaker 1: ...") and their voices'' recordings; a diffusion head draws each 7.5 Hz frame''s acoustic latent and the σ-VAE decoder makes the sound - gguf-org''s Q8_0 GGUF (the language model 8-bit, the tokenizers and head BF16), half on the GPU. Voice cloning from a recording alone (no transcript), multi-speaker dialogue (podcasts), long-form (tens of minutes). MIT; Microsoft asks that it not impersonate anyone without consent'
+gpus: '0'
+vram_gib: 6.0                   # its memory on the card when it runs (measured on a B70: 4.9 GiB of weights, 5.6 GiB in a 46 s run)
+speech:
+- clone                         # a recording, or a saved voice, with or without its transcript
+- speakers                      # a script of several speakers, each with a voice (voices / ref_audios: one a speaker)
+defaults:
+  seconds: 600.0                # the most; the model ends the speech itself
+  steps: 10
+  cfg: 1.3
+env: {}
+files:
+  model:
+    key: vv15-q8
+    url: https://huggingface.co/gguf-org/vibevoice-gguf/resolve/197bcd95c76e586b534b67524d667c1dc5efce34/vibevoice-1.5b-q8_0.gguf
+    size: 4191203040
+    sha256: f1b7fdf26e5bb75e0b29f9538999b724bd871561c73930780df91d6b68b95572
+    path: vibevoice/vibevoice-1.5b-q8_0.gguf
+  tokenizer:
+    key: vv15-tokenizer
+    url: https://huggingface.co/vibevoice/VibeVoice-1.5B-hf/resolve/d4cd82eb4371bf3e3d088e1ea7fa4eefb60449bf/tokenizer.json
+    size: 11421892
+    sha256: 3fd169731d2cbde95e10bf356d66d5997fd885dd8dbb6fb4684da3f23b2585d8
+    path: vibevoice/tokenizer.json
+  config:
+    key: vv15-config
+    url: https://huggingface.co/vibevoice/VibeVoice-1.5B-hf/resolve/d4cd82eb4371bf3e3d088e1ea7fa4eefb60449bf/config.json
+    size: 3201
+    sha256: 31bb81380f725d3f80e1b948183339093fd6600563e2f21d907ffd273fd01adb
+    path: vibevoice/config.json
+guide: guides/vibevoice.md

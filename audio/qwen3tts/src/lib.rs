@@ -272,6 +272,7 @@ impl AudioEngine for Qwen3Tts {
                 "voice_design" => "instructions",
                 _ => "reference",
             }),
+            speakers: 1,
         })
     }
     fn options(&self) -> &'static [EngineOption] {

@@ -1,0 +1,15 @@
+[package]
+name = "nextsycl-audio-vibevoice"
+description = "VibeVoice-1.5B on Intel Arc (SYCL): long-form, multi-speaker speech (up to four voices, each cloned from a recording) - a Qwen2.5-1.5B language model, a diffusion head that draws each 7.5 Hz frame's acoustic latent, the σ-VAE acoustic decoder and the semantic encoder that reads each frame back"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-codec12hz.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
+nextsycl-audio.workspace = true
+serde_json.workspace = true

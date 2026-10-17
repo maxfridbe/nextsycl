@@ -47,7 +47,7 @@ registry entry carries it as the loader's settings (`NS_SILO_NAME`, `NS_SILO_REQ
 
 Other keys: `local` (role: what it is - a part made on the machine rather than downloaded, found in nextsycl.conf
 or another registry entry), `base` (a lora: the model it rides on), `defaults` (image / video / audio: the
-request's defaults - steps, cfg, size, seconds ...), `speech` (audio: `voices`, `design`, `clone`, `direction` - a clone steered by `instructions` -, `events` - vocal events in the text, `transcript` - a clone needs what the recording says), `does` (model3d: `generate`, `texture`, `rig`, `animate` - what it is
+request's defaults - steps, cfg, size, seconds ...), `speech` (audio: `voices`, `design`, `clone`, `direction` - a clone steered by `instructions` -, `events` - vocal events in the text, `transcript` - a clone needs what the recording says, `speakers` - a script of several speakers, a voice each: `voices` / `ref_audios`), `does` (model3d: `generate`, `texture`, `rig`, `animate` - what it is
 asked for).
 
 The rules, checked when the cards load and by `cargo test` (`the_model_cards_are_whole`): the id is the file's
