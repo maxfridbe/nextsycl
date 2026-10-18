@@ -47,7 +47,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "engram-dir", env: "NS_DS41_ENGRAM_DIR", value: "DIR", help: "the two Engram shards' directory (default: deepseek-engram beside the model)", at: At::Load },
     EngineOption { name: "engram-readers", env: "NS_DS41_ENGRAM_READERS", value: "N", help: "Engram row reads in flight (default 48)", at: At::Load },
     EngineOption { name: "engram-cache", env: "NS_DS41_ENGRAM_CACHE", value: "ROWS", help: "Engram rows kept in host memory (default 262144)", at: At::Load },
-    EngineOption { name: "drafts", env: "NS_DS41_DRAFTS", value: "K", help: "the towers' drafts a verify pass checks (1..7, default 3)", at: At::Load },
+    EngineOption { name: "drafts", env: "NS_DS41_DRAFTS", value: "K", help: "the towers' drafts a verify pass checks (1..7, default 2)", at: At::Load },
     EngineOption { name: "pin-gib", env: "NS_DS41_PIN_GIB", value: "GIB", help: "pinned host memory for experts (default 40)", at: At::Load },
     EngineOption { name: "free-gib", env: "NS_DS41_FREE_GIB", value: "GIB", help: "VRAM each GPU keeps free (default 1.5)", at: At::Load },
     EngineOption { name: "prefill-chunk", env: "NS_PREFILL_CHUNK", value: "TOKENS", help: "a prompt chunk's tokens (default 2048)", at: At::Load },

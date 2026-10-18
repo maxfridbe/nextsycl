@@ -117,10 +117,10 @@ fn pipeline() -> bool {
     std::env::var("NS_PIPELINE").map_or(true, |v| v != "0")
 }
 
-/// Drafts a verify pass checks (NS_DS41_DRAFTS, 1..5, default 3)
+/// Drafts a verify pass checks (NS_DS41_DRAFTS, 1..7, default 2: the third is rarely kept)
 pub fn mtp_drafts() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_usize("NS_DS41_DRAFTS", 3).clamp(1, MAX_VERIFY - 1))
+    *V.get_or_init(|| env_usize("NS_DS41_DRAFTS", 2).clamp(1, MAX_VERIFY - 1))
 }
 
 /// VRAM each GPU keeps free beyond the plan (NS_DS41_FREE_GIB, default 1.5: the xe driver has no out-of-memory path)

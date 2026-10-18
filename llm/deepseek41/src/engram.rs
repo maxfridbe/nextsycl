@@ -3,7 +3,7 @@
 //!
 //! A token's rows at an Engram layer: its compressed id and the 3 before it (the pad id before the start) multiplied by
 //! the layer's 4 multipliers and XORed one lookback at a time - the 2-, 3- and 4-gram's hashes - each modulo 8 primes
-//! (a head each) plus the head's offset: 24 rows of 256 E4M3 weights and 8 E8M0 scales, a page read (4 KiB, O_DIRECT)
+//! (a head each) plus the head's offset: 24 rows of 256 E4M3 weights and 8 E8M0 scales, a 512-byte read (O_DIRECT)
 //! for each, the weight and the scale apart. The rows are known from the tokens before any layer runs: `Engram::fetch`
 //! hands them to a pool of reader threads (one read in flight each: the queue depth) and returns at once; `Fetch::wait`
 //! takes them at the layer. A small cache keeps the rows read last (a verify pass re-reads its positions).
@@ -73,8 +73,8 @@ impl Fetch {
 
 struct Job {
     fetch: Arc<Fetch>,
-    /// (table, row, where in out)
-    items: Vec<(usize, u64, usize)>,
+    /// (table, row, where in out, the row's weights (false) or its scales (true))
+    items: Vec<(usize, u64, usize, bool)>,
 }
 
 pub struct Engram {
@@ -221,13 +221,12 @@ impl Engram {
                 loop {
                     let job = { rx.lock().unwrap().recv() };
                     let Ok(job) = job else { break };
-                    let mut row = vec![0u8; rb];
-                    for &(ti, r, at) in &job.items {
+                    let mut part = vec![0u8; rb];
+                    for &(ti, r, at, scales) in &job.items {
                         let t = &tables[ti];
-                        let res = read_at(&t.file, &mut b, t.weight + r * hd as u64, &mut row[..hd], &pages)
-                            .and_then(|_| read_at(&t.file, &mut b, t.scale + r * (hd / 32) as u64, &mut row[hd..], &pages));
-                        match res {
-                            Ok(()) => job.fetch.out.lock().unwrap()[at..at + rb].copy_from_slice(&row),
+                        let (off, n, at) = if scales { (t.scale + r * (hd / 32) as u64, hd / 32, at + hd) } else { (t.weight + r * hd as u64, hd, at) };
+                        match read_at(&t.file, &mut b, off, &mut part[..n], &pages) {
+                            Ok(()) => job.fetch.out.lock().unwrap()[at..at + n].copy_from_slice(&part[..n]),
                             Err(e) => *job.fetch.err.lock().unwrap() = Some(format!("reading an Engram row: {e}")),
                         }
                     }
@@ -281,17 +280,22 @@ impl Engram {
             for (k, &r) in rows.iter().enumerate() {
                 match c.0.get(&(li, r)) {
                     Some(v) => out[k * rb..(k + 1) * rb].copy_from_slice(v),
-                    None => todo.push((li, r, k * rb)),
+                    None => {
+                        todo.push((li, r, k * rb, false));
+                        todo.push((li, r, k * rb, true));
+                    }
                 }
             }
         }
-        self.cached_rows.fetch_add((rows.len() - todo.len()) as u64, Ordering::Relaxed);
-        self.read_rows.fetch_add(todo.len() as u64, Ordering::Relaxed);
+        self.cached_rows.fetch_add((rows.len() - todo.len() / 2) as u64, Ordering::Relaxed);
+        self.read_rows.fetch_add((todo.len() / 2) as u64, Ordering::Relaxed);
         let fetch = Arc::new(Fetch { out: Mutex::new(out), left: AtomicUsize::new(todo.len()), done: Condvar::new(), lock: Mutex::new(()), err: Mutex::new(None) });
         if todo.is_empty() {
             return fetch;
         }
-        // a job a few rows: every reader busy, few channel round trips
+        // a job a read or a few (a row's weights and its scales apart, in flight at once): the drive is bound by reads a
+        // second (a DRAM-less one ~67K at any size up to 4 KiB), so the first layer's reads go out first and alone
+        // (fetch is called in layer order) and the later layers' queue behind them
         let per = todo.len().div_ceil(readers()).clamp(1, 16);
         let jobs = self.jobs.lock().unwrap();
         for items in todo.chunks(per) {
