@@ -97,6 +97,12 @@ fn q4k_own() -> bool {
     *V.get_or_init(|| std::env::var("NS_DS41_Q4K").map_or(true, |v| v != "0"))
 }
 
+/// Decode's mHC mixes through the fused kernels (NS_HC_FUSED=0: the mixes, then the Sinkhorn)
+fn hc_fused() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_HC_FUSED").map_or(true, |v| v != "0"))
+}
+
 /// Whether the big arena lends its memory to the expert store while no prompt chunk needs it (NS_LEND=0: no)
 fn lend_arena() -> bool {
     std::env::var("NS_LEND").map_or(true, |v| v != "0")
@@ -1759,8 +1765,15 @@ impl<'g> Ds41<'g> {
         if !w.f32() || w.rows != 24 {
             return Err(Error(format!("block {l}: the mHC mixes are float32 [24, 4 d]")));
         }
-        o.hc_mix(x, &w.buf, mixes, &p.arena.f32(t * 32 * 25)?, t, 4 * d, eps)?;
-        o.hc_pre(mixes, p.vec(l, scale)?, p.vec(l, base)?, x, h, post, comb, pre_out, t, d, g.hc_eps as f32, g.hc_iters as u32)?;
+        if t <= MMVQ_COLS && hc_fused() {
+            // decode widths: the mixes and the Sinkhorn in glm5next's two fused launches (its h and norm, by this half's
+            // own mix, are replaced below)
+            o.hc_pre_fused(x, &w.buf, p.vec(l, scale)?, p.vec(l, base)?, p.vec(l, norm)?, h, post, comb, pre_out, normed, &p.arena.f32(t * 32 * 25)?, t, d,
+                           eps, g.hc_eps as f32, g.hc_iters as u32)?;
+        } else {
+            o.hc_mix(x, &w.buf, mixes, &p.arena.f32(t * 32 * 25)?, t, 4 * d, eps)?;
+            o.hc_pre(mixes, p.vec(l, scale)?, p.vec(l, base)?, x, h, post, comb, pre_out, t, d, g.hc_eps as f32, g.hc_iters as u32)?;
+        }
         o.hc_collapse(x, pre_in, h, t, d)?;
         o.rms_norm(h, Some(p.vec(l, norm)?), normed, t, d, eps)
     }

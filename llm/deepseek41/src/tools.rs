@@ -249,6 +249,62 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
             println!("vq_mmv {name:<10} {n} matrices [{rows} x {cols}], 1 token: {us:.1} us ({:.0} GB/s of indices)", bytes as f64 / us / 1e3);
         }
     }
+    // the memory's own rate: 256 MiB copied by a kernel (a read and a write a byte)
+    {
+        let n = 256usize << 20;
+        let (a, b) = (DevBuf::new(&g, n).map_err(e)?, DevBuf::new(&g, n).map_err(e)?);
+        o.kcopy(&b, 0, &a, 0, n).map_err(e)?;
+        g.sync().map_err(e)?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..10 {
+            o.kcopy(&b, 0, &a, 0, n).map_err(e)?;
+        }
+        g.sync().map_err(e)?;
+        let s = t0.elapsed().as_secs_f64() / 10.0;
+        println!("copy kernel: 256 MiB in {:.0} us ({:.0} GB/s read + write)", s * 1e6, 2.0 * n as f64 / s / 1e9);
+    }
+    // q4_K decode products: q_b and o_b of layer 20, against the shared kernels' expansion
+    for role in [Role::QB, Role::OutB] {
+        let t = m.tensor(20, role).ok_or("no tensor")?;
+        let (rows, cols) = (t.shape[0] as usize, t.shape[1] as usize);
+        let raw = f.read(t).map_err(|e| e.0)?;
+        let wd = DevBuf::new(&g, raw.len()).map_err(e)?;
+        wd.write(0, &raw).map_err(e)?;
+        let wf = DevBuf::f32(&g, rows * cols).map_err(e)?;
+        o.dequant(12, &wd, 0, raw.len(), rows * cols, &wf).map_err(e)?;
+        let x: Vec<f32> = (0..cols).map(|_| rnd()).collect();
+        let xd = DevBuf::from_f32(&g, &x).map_err(e)?;
+        let yd = DevBuf::f32(&g, rows).map_err(e)?;
+        let yw = DevBuf::f32(&g, rows).map_err(e)?;
+        o.gemm_at(1, rows, cols, (&xd, 0, cols), (&wf, 0), (&yw, 0, rows), false).map_err(e)?;
+        for _ in 0..3 {
+            o.q4k_mv(&wd, rows, cols, (&xd, 0, cols), None, (&yd, 0, rows), 1).map_err(e)?;
+        }
+        g.sync().map_err(e)?;
+        let it = 50;
+        let t0 = std::time::Instant::now();
+        for _ in 0..it {
+            o.q4k_mv(&wd, rows, cols, (&xd, 0, cols), None, (&yd, 0, rows), 1).map_err(e)?;
+        }
+        g.sync().map_err(e)?;
+        let us = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
+        let (rel, _) = compare(&yd.to_f32().map_err(e)?, &yw.to_f32().map_err(e)?);
+        println!("q4k_mv {:<24} [{rows} x {cols}]: rel err {rel:.2e}, {us:.1} us ({:.0} GB/s)", t.name, raw.len() as f64 / us / 1e3);
+        // the shared kernels (Strata's): Q8_1 of x, then the product
+        let q8 = DevBuf::new(&g, o.q8_1_bytes(cols, 1)).map_err(e)?;
+        o.quantize_q8_1((&xd, 0), &q8, cols, 1).map_err(e)?;
+        for _ in 0..3 {
+            o.mmvq(12, (&wd, 0), raw.len(), &q8, (&yd, 0), cols, rows, 1).map_err(e)?;
+        }
+        g.sync().map_err(e)?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..it {
+            o.mmvq(12, (&wd, 0), raw.len(), &q8, (&yd, 0), cols, rows, 1).map_err(e)?;
+        }
+        g.sync().map_err(e)?;
+        let us = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
+        println!("shared mmvq {:<19} [{rows} x {cols}]: {us:.1} us ({:.0} GB/s)", t.name, raw.len() as f64 / us / 1e3);
+    }
     // an fp8_32x32 matrix: the Engram's wkv, rows [0, 64)
     if let Some(t) = m.tensor(m.g.engram_layers.first().copied().unwrap_or(1), Role::EngramWkv).filter(|t| t.ty == GType::Fp8B32) {
         let (rows, cols) = (t.shape[0] as usize, t.shape[1] as usize);

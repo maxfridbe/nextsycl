@@ -17,6 +17,9 @@ pub struct Api {
     pub hc_mix: unsafe extern "C" fn(Gpu, *const f32, *const f32, *mut f32, *mut f32, i64, i64, f32) -> c_int,
     pub rms_norm: unsafe extern "C" fn(Gpu, *const f32, *const f32, *mut f32, i64, i64, f32) -> c_int,
     pub hc_pre: unsafe extern "C" fn(Gpu, *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32, *mut f32, i64, i64, f32, c_int) -> c_int,
+    #[allow(clippy::type_complexity)]
+    pub hc_pre_fused: unsafe extern "C" fn(Gpu, *const f32, *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32, *mut f32,
+                                           *mut f32, *mut f32, i64, i64, f32, f32, c_int) -> c_int,
     pub hc_post: unsafe extern "C" fn(Gpu, *const f32, *const f32, *const f32, *const f32, *mut f32, i64, i64) -> c_int,
     pub hc_mean: unsafe extern "C" fn(Gpu, *const f32, *mut f32, i64, i64) -> c_int,
     pub swiglu_clamp: unsafe extern "C" fn(Gpu, *const f32, *const f32, *mut f32, i64, f32) -> c_int,
@@ -106,6 +109,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             hc_mix: sym!("ns_hc_mix"),
             rms_norm: sym!("ns_rms_norm"),
             hc_pre: sym!("ns_hc_pre"),
+            hc_pre_fused: sym!("ns_hc_pre_fused"),
             hc_post: sym!("ns_hc_post"),
             hc_mean: sym!("ns_hc_mean"),
             swiglu_clamp: sym!("ns_swiglu_clamp"),

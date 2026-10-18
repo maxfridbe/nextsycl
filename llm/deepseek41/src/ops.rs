@@ -193,6 +193,27 @@ impl Ops {
         let rc = unsafe { (self.k.hc_pre)(self.raw(), m.fp(), scale.fp(), base.fp(), x.fp(), h.fp(), post.fp(), comb.fp(), pre.fp(), t as i64, c as i64, eps, iters as i32) };
         self.ok(rc, "hc_pre")
     }
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_pre_fused(&self, x: &DevBuf, fn_: &DevBuf, scale: &DevBuf, base: &DevBuf, nw: &DevBuf, h: &DevBuf, post: &DevBuf, comb: &DevBuf,
+                        pre: &DevBuf, normed: &DevBuf, part: &DevBuf, t: usize, c: usize, eps: f32, hc_eps: f32, iters: u32) -> Result<()> {
+        need!(part, t * 32 * 25, "hc_pre_fused scratch");
+        need!(x, t * 4 * c, "hc_pre_fused X");
+        need!(fn_, 24 * 4 * c, "hc_pre_fused fn");
+        need!(scale, 3, "hc_pre_fused scale");
+        need!(base, 24, "hc_pre_fused base");
+        need!(nw, c, "hc_pre_fused norm");
+        need!(h, t * c, "hc_pre_fused h");
+        need!(normed, t * c, "hc_pre_fused normed");
+        need!(post, t * 4, "hc_pre_fused post");
+        need!(comb, t * 16, "hc_pre_fused comb");
+        need!(pre, t * 4, "hc_pre_fused pre");
+        // SAFETY: sizes checked.
+        let rc = unsafe {
+            (self.k.hc_pre_fused)(self.raw(), x.fp(), fn_.fp(), scale.fp(), base.fp(), nw.fp(), h.fp(), post.fp(), comb.fp(), pre.fp(), normed.fp(),
+                                  part.fp(), t as i64, c as i64, eps, hc_eps, iters as i32)
+        };
+        self.ok(rc, "hc_pre_fused")
+    }
     pub fn hc_post(&self, y: &DevBuf, x: &DevBuf, post: &DevBuf, comb: &DevBuf, xo: &DevBuf, t: usize, c: usize) -> Result<()> {
         need!(y, t * c, "hc_post y");
         need!(x, t * 4 * c, "hc_post X");
