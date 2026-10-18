@@ -491,7 +491,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_MTP` | 0 | 1: DeepSeek-V4.1's three DSpark draft towers loaded (2.9 GiB on the last GPU) and drafting - a gain on code (+3%, 84% kept), a loss on prose (59% kept: 15.7 against 20.3 tok/s) | llm deepseek41 |
 | `NS_DS41_DRAFTS` | 2 | the DSpark towers' drafts a verify pass checks (1..7; a third is rarely kept) | llm deepseek41 |
 | `NS_DS41_PIN_GIB` | 40 | pinned host memory for the experts that do not fit VRAM (at most what is available less 12 GiB) | llm deepseek41 |
-| `NS_DS41_FREE_GIB` | 1.5 | VRAM each GPU keeps free beyond the plan (the xe driver has no out-of-memory path) | llm deepseek41 |
+| `NS_DS41_FREE_GIB` | 0.75 | VRAM each GPU keeps free beyond the plan (the xe driver has no out-of-memory path; the plan's own reserve for a pass is generous: at 0.75 an 8.7K prompt and 256 tokens peaked at 30.3 of 32 GiB - 2.4 GiB free -, at 1.5 at 29.5) | llm deepseek41 |
 | `NS_DS41_QSIM` | on | 0: the model's low-precision simulations (fp8 window keys and attention output, fp4 compressed and indexer keys) left out - a check against a reference without them | llm deepseek41 |
 | `NS_DS41_VQ_V` | measured | 0..5: the VQ decode products' kernel variant (0 a sub-group a row on the float32 codebook, 1 a lane a row on the bytes, 2 a lane a row on fp16, 3 a sub-group a row on fp16, 4 a lane a row two bytes at once, 5 by lookup table: each 8 values of x against every codebook entry in local memory) instead of the fastest of them timed at load | llm deepseek41 |
 | `NS_DS41_LUT_RUNS` | 16 | Experiment: the runs of 64-column units a row is split into by the VQ lookup-table variant (a work-group a run; their partials added after) | llm deepseek41 |

@@ -171,10 +171,10 @@ pub fn mtp_drafts() -> usize {
     *V.get_or_init(|| env_usize("NS_DS41_DRAFTS", 2).clamp(1, MAX_VERIFY - 1))
 }
 
-/// VRAM each GPU keeps free beyond the plan (NS_DS41_FREE_GIB, default 1.5: the xe driver has no out-of-memory path)
+/// VRAM each GPU keeps free beyond the plan (NS_DS41_FREE_GIB, default 0.75: the xe driver has no out-of-memory path; the plan reserves a pass generously - measured 2.4 GiB free at the peak)
 fn keep_free() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| (std::env::var("NS_DS41_FREE_GIB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5) * (1u64 << 30) as f64) as usize)
+    *V.get_or_init(|| (std::env::var("NS_DS41_FREE_GIB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.75) * (1u64 << 30) as f64) as usize)
 }
 
 /// The pinned host memory for experts in all (NS_DS41_PIN_GIB, default 40, at most what is available less 12 GiB)

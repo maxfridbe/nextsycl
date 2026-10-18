@@ -50,7 +50,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "mtp", env: "NS_DS41_MTP", value: "0|1", help: "the DSpark draft towers loaded and drafting (default 0: they cost more than they save on prose)", at: At::Load },
     EngineOption { name: "drafts", env: "NS_DS41_DRAFTS", value: "K", help: "the towers' drafts a verify pass checks (1..7, default 2)", at: At::Load },
     EngineOption { name: "pin-gib", env: "NS_DS41_PIN_GIB", value: "GIB", help: "pinned host memory for experts (default 40)", at: At::Load },
-    EngineOption { name: "free-gib", env: "NS_DS41_FREE_GIB", value: "GIB", help: "VRAM each GPU keeps free (default 1.5)", at: At::Load },
+    EngineOption { name: "free-gib", env: "NS_DS41_FREE_GIB", value: "GIB", help: "VRAM each GPU keeps free beyond the plan (default 0.75: 2.4 GiB measured free at the peak)", at: At::Load },
     EngineOption { name: "prefill-chunk", env: "NS_PREFILL_CHUNK", value: "TOKENS", help: "a prompt chunk's tokens (default 2048)", at: At::Load },
     EngineOption { name: "pipeline", env: "NS_PIPELINE", value: "0|1", help: "a long prompt's chunks pipelined over two GPUs (default 1)", at: At::Load },
     EngineOption { name: "prefetch", env: "NS_PREFETCH", value: "N", help: "experts swapped in ahead of their layer (default 8; 0 none)", at: At::Load },
