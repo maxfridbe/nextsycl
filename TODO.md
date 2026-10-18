@@ -273,6 +273,11 @@ of IQ2_XXS instead could win twice.
       recording (no transcript), from gguf-org's Q8_0 GGUF + the -hf tokenizer / config; checked against transformers'
       implementation (f16: logits 4e-4, head 4e-7, decoder 2e-4); the contract's references / speakers, voices and
       ref_audios through the server and the front door. B70: 43.5 frames/s (5.8x real time), 5.6 GiB.
+- [x] VibeVoice speed (2026-10-18): the language model's decode step, the head and the tokenizers on the engine's own
+      kernels (Q8_0 on the card, no read-backs in the head, convolutions as products over windows, the matrix engines
+      on split bfloat16): B70 79.3 frames/s (10.6x), B65 64.0 (8.5x), 4.0 GiB; the tokenizers 50-100x closer to the
+      reference. Left (docs/ports/vibevoice.md): 12.6 ms a frame against 6.4 ms of weights - small products, norms,
+      the tokenizers' latency-bound high stages (a fused block kernel, ~1 ms), graphs (<= 0.5 ms).
       Next: SYCL graphs for the tokenizers' ~500 small launches a frame, the head's ten read-backs on the device
 - [x] Fish Audio S2 Pro (audio/s2pro, 2026-10-17): plain / cloned speech in ~80 languages at 44.1 kHz, free-form inline
       tags (`instructions` as one), several speakers; s2.cpp's GGUF kept as Q8_0 on the card, Fish's codec (decoder,

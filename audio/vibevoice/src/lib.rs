@@ -13,9 +13,9 @@
 //! ```
 //!
 //! The weights are gguf-org's GGUF of microsoft/VibeVoice-1.5B (`nextsycl models pull vibevoice-1.5b`: q8_0 - the
-//! language model's matrices; the tokenizers, connectors and head in BF16 - expanded to half at load); the tokenizer
-//! and config.json are the -hf checkpoint's (vibevoice/VibeVoice-1.5B-hf). `check` compares the stages with the
-//! reference's dumps (reference/vibevoice/ref.py: the model's transformers implementation, float32 on the CPU).
+//! language model's matrices, kept so on the card; the tokenizers in BF16, kept so; the connectors and head in BF16,
+//! expanded to half); the tokenizer and config.json are the -hf checkpoint's (vibevoice/VibeVoice-1.5B-hf). `check`
+//! compares the stages with the reference's dumps (reference/vibevoice/ref.py: the model's transformers implementation, float32 on the CPU).
 //!
 //! License: MIT (the weights and upstream's code). Microsoft asks that it not be used to impersonate a voice without
 //! its owner's consent, nor to pass synthetic speech off as real (its model card's responsible-use section).
@@ -244,7 +244,7 @@ impl VibeVoice {
         let (model, tokf, conf) = (role(files, "model")?, role(files, "tokenizer")?, role(files, "config")?);
         let cfg = Config::read(&conf)?;
         let w = Weights::open(&model)?;
-        // the file's matrices in half (Q8_0 doubles, BF16 / F16 the same), the convolutions and vectors in float32;
+        // at most the file's matrices in half (an upper bound: Q8_0 and BF16 stay as they are), the vectors in float32;
         // the token embedding stays in the file; work room 1.5 GiB
         let embd = w.tensor("model.language_model.embed_tokens.weight")?.bytes;
         let expanded: u64 = w.g.tensors.iter().filter(|t| !t.name.ends_with("embed_tokens.weight"))
@@ -390,7 +390,12 @@ impl VibeVoice {
         let pos: Cache = self.lm.cache(ops, CHUNK, l + max_steps + 1)?;
         let neg: Cache = self.lm.cache(ops, 2, max_steps + 2)?;
         let cond = DevBuf::f32(g, 2 * h)?;
+        let tp = Instant::now();
         self.lm.prefill(ops, nsd, &pos, rows, 0, &cond)?;
+        if std::env::var("NS_VV_PROFILE").is_ok_and(|v| v == "1") {
+            g.sync()?;
+            eprintln!("[vv prompt: {l} positions through the language model in {:.3} s]", tp.elapsed().as_secs_f64());
+        }
         progress(Step { phase: "prompt", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
         let mut hw = self.head.work(ops, s.steps)?;
         let (ds, ss) = (self.dec.stream(ops, 1)?, self.sem.stream(ops, self.cfg.hop())?);
@@ -522,10 +527,15 @@ impl VibeVoice {
         }
         let mut voices: Vec<Option<usize>> = Vec::new();
         let mut lat = Vec::new();
+        let prof = Prof::new().on;
+        let t = Instant::now();
+        let (mut t_res, mut t_enc) = (0.0, 0.0);
         for r in &refs {
             let x = self.voice_samples(r)?;
+            t_res = t.elapsed().as_secs_f64() - t_enc;
             voices.push(Some(x.len() / self.cfg.hop()));
             lat.push(self.encode(&x)?);
+            t_enc = t.elapsed().as_secs_f64() - t_res;
         }
         let (ids, placed) = prompt::ids(&self.tok, self.specials(), &lines, &voices)?;
         let mut rows = Vec::new();
@@ -533,6 +543,10 @@ impl VibeVoice {
             rows.push(self.voice_rows(&lat[*s], rng)?.1);
         }
         let rows = self.prompt_rows(&ids, &placed, &rows)?;
+        if prof {
+            eprintln!("[vv prompt: {} voices ({} frames): resampled in {:.3} s, encoded in {:.3} s; {} positions ready at {:.3} s]", refs.len(),
+                      voices.iter().flatten().sum::<usize>(), t_res, t_enc, ids.len(), t.elapsed().as_secs_f64());
+        }
         Ok((ids, rows, lines))
     }
 }
@@ -586,7 +600,7 @@ impl AudioEngine for VibeVoice {
         Ok(Audio { rate: RATE, channels: 1, samples })
     }
     fn report(&self) -> Vec<String> {
-        vec![format!("{ARCH} on {} (half, loaded {:.0} s ago)", self.ops.gpu.name, self.loaded.elapsed().as_secs_f64())]
+        vec![format!("{ARCH} on {} (Q8_0 / bfloat16 / half, loaded {:.0} s ago)", self.ops.gpu.name, self.loaded.elapsed().as_secs_f64())]
     }
 }
 

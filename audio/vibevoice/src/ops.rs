@@ -36,11 +36,14 @@ pub struct Split {
 }
 
 /// The engine's kernels on one GPU
+/// The last mark and each label's (seconds, calls)
+type OpTimes = (Instant, BTreeMap<String, (f64, u32)>);
+
 pub struct Ops {
     pub gpu: Arc<Gpu>,
     k: &'static ffi::Api,
     /// NS_VV_PROFILE=2: the tokenizers' operations timed one by one (the GPU waited for after each), by label
-    prof: Option<Mutex<(Instant, BTreeMap<String, (f64, u32)>)>>,
+    prof: Option<Mutex<OpTimes>>,
 }
 
 impl Ops {
