@@ -501,6 +501,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_PIPE_LOG` | 0 | 1: each prompt chunk's time on each GPU of the two-GPU pipeline (and the second's wait for the first), on stderr; 2: and each layer's attention and experts apart (a GPU sync between them) | llm deepseek41 |
 | `NS_DS41_PLACE` | expert | Experiment: `layer` fills VRAM, then pinned memory, with the experts in layer order (the last layers of a GPU then live in the file alone) instead of every layer the same share | llm deepseek41 |
 | `NS_DS41_VQ_LUT` | 1 | 0: the VQ lookup-table variant left out of the decode products' timing at load | llm deepseek41 |
+| `NS_DS41_IDX_XMX` | 1 | 0: the indexer's scores in the scalar kernel instead of on XMX (deepseek4's form for 32 heads; the queries rounded to fp16) | kernels:llm deepseek41 |
 | `NS_DS41_VQ_GEMM_MAX` | 100000 | a prompt pass's experts past NS_DS41_PROMPT_MMV tokens and up to this many multiplied on XMX straight from their indices; more expanded to fp16 for a GEMM (0: all expanded) | llm deepseek41 |
 | `NS_DS41_VQ_GEMM_V` | 5 | Experiment: the prompt's XMX expert product's form - 0 its B tiles through local memory, 1 decoded straight into the tiles' registers (8 K slices a work-group), 2 / 3 the same with 4 K slices, 4 / 5 as 2 / 3 and past 32 tokens 8 token tiles a sub-group | kernels:llm deepseek41 |
 | `NS_DS41_VQ_BENCH` | 0,1 | `llm kernels`: the VQ decode variants it times | llm deepseek41 |

@@ -5,6 +5,8 @@
 #include "ds41.h"
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 
@@ -85,6 +87,87 @@ void quant_sim_sg(sycl::queue& q, float* x, int64_t nb, int kind) {
     });
 }
 
+
+// The indexer's scores on XMX (deepseek4's ns_ds4_idx_score_dec, copied for 32 heads and a ratio): a work-group a row
+// and 8 TB x 8 keys, the row's queries packed in local memory as B (fp16, VNNI [D/2][32][2]), the keys straight from
+// their fp16 cache as A tiles (8 keys x 16 dims); relu, the head weights and the sum over the heads in registers. The
+// scalar form's work grew with the context x the rows: a 32K prompt's indexer layers its largest cost after the experts.
+namespace jmi = sycl::ext::oneapi::experimental::matrix;
+constexpr int IXD = 128, IXH = 32, IXM = 8, IXSG = 8, IXTB = 4;
+
+template <typename T>
+inline auto ix_lp(T* p) {
+    return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+}
+template <typename T>
+inline auto ix_gp(T* p) {
+    return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p);
+}
+
+void idx_score_xmx(sycl::queue& q, const float* qf, const float* w, const sycl::half* kc, float* score, int64_t T, int64_t n, int64_t ld, int64_t pos0,
+                   int64_t ratio) {
+    constexpr int64_t per_wg = IXSG * IXTB * IXM;
+    const int64_t wgs = (ld + per_wg - 1) / per_wg;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::half, 1> qp(sycl::range<1>(IXD * IXH), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * wgs) * IXSG * 16), sycl::range<1>(IXSG * 16)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id(), tid = (int) it.get_local_id(0);
+            const int64_t gi = it.get_group(0), t = gi / wgs, wg0 = (gi % wgs) * per_wg;
+            sycl::half* qs = qp.get_multi_ptr<sycl::access::decorated::no>().get();
+            for (int i = tid; i < IXD * IXH; i += IXSG * 16) {
+                const int hh = i / IXD, k = i % IXD;
+                qs[(k / 2) * (IXH * 2) + hh * 2 + (k & 1)] = (sycl::half) qf[(t * IXH + hh) * IXD + k];
+            }
+            sycl::group_barrier(it.get_group());
+            const int64_t nv = sycl::min<int64_t>(n, (pos0 + t + 1) / ratio);
+            float* out = score + t * ld;
+            for (int tb = 0; tb < IXTB; ++tb) {
+                const int64_t c0 = wg0 + (sgi * IXTB + tb) * IXM;
+                if (c0 >= ld) break;
+                if (c0 >= nv) {
+                    if (lane < IXM && c0 + lane < ld) out[c0 + lane] = -INFINITY;
+                    continue;
+                }
+                jmi::joint_matrix<sycl::sub_group, float, jmi::use::accumulator, IXM, 16> acc[IXH / 16];
+#pragma unroll
+                for (int nt = 0; nt < IXH / 16; ++nt) jmi::joint_matrix_fill(sg, acc[nt], 0.0f);
+                // a tile past the cache's keys reads keys n - 8 .. (in bounds; the rows before c0 masked below)
+                const int64_t cr = sycl::max<int64_t>(0, sycl::min<int64_t>(c0, n - IXM));
+                const sycl::half* kb = kc + cr * IXD;
+#pragma unroll
+                for (int k = 0; k < IXD / 16; ++k) {
+                    jmi::joint_matrix<sycl::sub_group, sycl::half, jmi::use::a, IXM, 16, jmi::layout::row_major> a;
+                    jmi::joint_matrix_load(sg, a, ix_gp(kb + k * 16), (size_t) IXD);
+#pragma unroll
+                    for (int nt = 0; nt < IXH / 16; ++nt) {
+                        jmi::joint_matrix<sycl::sub_group, sycl::half, jmi::use::b, 16, 16, jmi::layout::ext_intel_packed> b;
+                        jmi::joint_matrix_load(sg, b, ix_lp(qs + (k * 16 / 2) * (IXH * 2) + nt * 16 * 2), (size_t) (IXH * 2));
+                        jmi::joint_matrix_mad(sg, acc[nt], a, b, acc[nt]);
+                    }
+                }
+                float sv[IXM] = {};
+#pragma unroll
+                for (int nt = 0; nt < IXH / 16; ++nt) {
+                    const float wh = w[t * IXH + nt * 16 + lane];
+                    int e = 0;
+                    jmi::joint_matrix_apply(sg, acc[nt], [&](float& x) { sv[e] += sycl::fmax(x, 0.0f) * wh; ++e; });
+                }
+                const int64_t shift = c0 - cr;
+#pragma unroll
+                for (int e = 0; e < IXM; ++e) {
+                    const float v = sycl::reduce_over_group(sg, sv[e], sycl::plus<float>());
+                    const int64_t j = cr + e;
+                    if (lane == 0 && e >= shift && j < ld) out[j] = j < nv ? v : -INFINITY;
+                }
+                if (lane == 0)
+                    for (int64_t e = IXM - shift; e < IXM; ++e)
+                        if (c0 + e < ld) out[c0 + e] = -INFINITY;
+            }
+        });
+    });
+}
 }  // namespace
 
 extern "C" {
@@ -174,6 +257,12 @@ int ns_ds41_idx_score(ns_gpu* g, const float* q, const float* w, const uint16_t*
     NS_TRY
     constexpr int WG = 128, HM = 32, CH = 16;
     if (H > HM || D % CH != 0 || ratio < 1) return ns_fail("ns_ds41_idx_score: at most 32 heads, dims a multiple of 16");
+    // NS_DS41_IDX_XMX=0: the scalar form
+    static const bool xmx = [] { const char* v = std::getenv("NS_DS41_IDX_XMX"); return !v || std::atoi(v) != 0; }();
+    if (xmx && H == IXH && D == IXD && n >= IXM) {
+        idx_score_xmx(g->q, q, w, reinterpret_cast<const sycl::half*>(k), score, T, n, ld, pos0, ratio);
+        return 0;
+    }
     const sycl::half* kh = reinterpret_cast<const sycl::half*>(k);
     const int64_t per = (ld + WG - 1) / WG;
     g->q.submit([&](sycl::handler& h) {
