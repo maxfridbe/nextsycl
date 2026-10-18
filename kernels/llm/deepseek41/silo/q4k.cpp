@@ -92,7 +92,7 @@ void q4k_rows(sycl::queue& q, const BlockQ4K* wb, int64_t rows, int64_t nb, cons
 // The same products with each weight decoded once for all the columns (a verify pass's rows): per 8 weights, the
 // columns' x loaded, then each row's weights met by every column - the arithmetic of a column exactly q4k_rows's (the
 // same sums in the same order), so a verify row equals its one-row product. MC columns at most (1, 2, 4, 8).
-template <int R, int MC>
+template <int R, int MC, bool MAGIC = false>
 void q4k_cols(sycl::queue& q, const BlockQ4K* wb, int64_t rows, int64_t nb, const float* x, int64_t xcs, int64_t rpg, int64_t xgs, float* y, int64_t ycs,
               int64_t t) {
     constexpr int SG = 16, SPG = 8;
@@ -127,8 +127,22 @@ void q4k_cols(sycl::queue& q, const BlockQ4K* wb, int64_t rows, int64_t nb, cons
                 for (int rr = 0; rr < R; ++rr) {
                     if (rr >= nr) break;
                     const uint32_t qq = reinterpret_cast<const uint32_t*>(wb[(r0 + rr) * nb + b].qs + 32 * k)[u];
-                    const float q0 = (float) (qq & 0xF), q1 = (float) ((qq >> 8) & 0xF), q2 = (float) ((qq >> 16) & 0xF), q3 = (float) ((qq >> 24) & 0xF);
-                    const float q4 = (float) ((qq >> 4) & 0xF), q5 = (float) ((qq >> 12) & 0xF), q6 = (float) ((qq >> 20) & 0xF), q7 = (float) ((qq >> 28) & 0xF);
+                    float q0, q1, q2, q3, q4, q5, q6, q7;
+                    if constexpr (MAGIC) {
+                        // 1 + q / 16 by its bits (a nibble into the mantissa's top): no int-to-float conversion
+                        constexpr uint32_t M = 0x00780000u, ONE = 0x3F800000u;
+                        q0 = sycl::bit_cast<float>(((qq << 19) & M) | ONE);
+                        q1 = sycl::bit_cast<float>(((qq << 11) & M) | ONE);
+                        q2 = sycl::bit_cast<float>(((qq << 3) & M) | ONE);
+                        q3 = sycl::bit_cast<float>(((qq >> 5) & M) | ONE);
+                        q4 = sycl::bit_cast<float>(((qq << 15) & M) | ONE);
+                        q5 = sycl::bit_cast<float>(((qq << 7) & M) | ONE);
+                        q6 = sycl::bit_cast<float>(((qq >> 1) & M) | ONE);
+                        q7 = sycl::bit_cast<float>(((qq >> 9) & M) | ONE);
+                    } else {
+                        q0 = (float) (qq & 0xF); q1 = (float) ((qq >> 8) & 0xF); q2 = (float) ((qq >> 16) & 0xF); q3 = (float) ((qq >> 24) & 0xF);
+                        q4 = (float) ((qq >> 4) & 0xF); q5 = (float) ((qq >> 12) & 0xF); q6 = (float) ((qq >> 20) & 0xF); q7 = (float) ((qq >> 28) & 0xF);
+                    }
 #pragma unroll
                     for (int c = 0; c < MC; ++c) {
                         if (c >= t) break;
@@ -148,7 +162,13 @@ void q4k_cols(sycl::queue& q, const BlockQ4K* wb, int64_t rows, int64_t nb, cons
 #pragma unroll
                 for (int c = 0; c < MC; ++c) {
                     if (c >= t) break;
-                    acc[rr][c] += d * s0 * lo[rr][c] - dm * m0 * slo[c] + d * s1 * hi[rr][c] - dm * m1 * shi[c];
+                    if constexpr (MAGIC) {
+                        // sum (1 + q/16) x - sum x = sum q x / 16
+                        const float l = 16.f * (lo[rr][c] - slo[c]), h = 16.f * (hi[rr][c] - shi[c]);
+                        acc[rr][c] += d * s0 * l - dm * m0 * slo[c] + d * s1 * h - dm * m1 * shi[c];
+                    } else {
+                        acc[rr][c] += d * s0 * lo[rr][c] - dm * m0 * slo[c] + d * s1 * hi[rr][c] - dm * m1 * shi[c];
+                    }
                 }
             }
         }
@@ -174,6 +194,18 @@ int ns_ds41_q4k_mv(ns_gpu* g, const void* w, int64_t rows, int64_t cols, const f
     // several columns (a verify pass): each weight decoded once for all of them, the same arithmetic a column as the
     // one-column kernel's (NS_DS41_Q4K_COLS: 0 never, 1 one column too; default: from two)
     static const int cols_once = [] { const char* v = std::getenv("NS_DS41_Q4K_COLS"); return v ? std::atoi(v) : 2; }();
+    // NS_DS41_Q4K_MAGIC=1 (experiment): the nibbles to floats by their bits, every column count
+    static const bool magic = [] { const char* v = std::getenv("NS_DS41_Q4K_MAGIC"); return v && std::atoi(v) != 0; }();
+    if (magic) {
+        if (rpg > 0 && rpg % 4 != 0) return ns_fail("ns_ds41_q4k_mv: a group's rows a multiple of 4");
+        const BlockQ4K* wb = static_cast<const BlockQ4K*>(w);
+        const int64_t nb = cols / 256;
+        if (t == 1) q4k_cols<4, 1, true>(g->q, wb, rows, nb, x, xcs, rpg, xgs, y, ycs, t);
+        else if (t == 2) q4k_cols<4, 2, true>(g->q, wb, rows, nb, x, xcs, rpg, xgs, y, ycs, t);
+        else if (t <= 4) q4k_cols<4, 4, true>(g->q, wb, rows, nb, x, xcs, rpg, xgs, y, ycs, t);
+        else q4k_cols<2, 8, true>(g->q, wb, rows, nb, x, xcs, rpg, xgs, y, ycs, t);
+        return 0;
+    }
     if (cols_once > 0 && t >= cols_once) {
         if (rpg > 0 && rpg % 4 != 0) return ns_fail("ns_ds41_q4k_mv: a group's rows a multiple of 4");
         const BlockQ4K* wb = static_cast<const BlockQ4K*>(w);

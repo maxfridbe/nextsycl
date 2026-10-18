@@ -178,7 +178,7 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
             println!("{:<26} {}-bit [{rows} x {cols}]: expanded rel err {rel:.2e} (max {mx:.2e}), 3-column product rel err {yrel:.2e} ({us:.0} us)",
                      format!("{} {}", t.name, ["gate", "up", "down"][which]), nbit);
             // a prompt pass's product on XMX (ns_ds41_vq_gemm): 40 tokens of fp16 x, against the host's W x
-            let nt = 40usize;
+            let nt: usize = std::env::var("NS_DS41_GEMM_TEST_N").ok().and_then(|v| v.parse().ok()).unwrap_or(40).clamp(1, 64);
             let xs: Vec<f32> = (0..64 * cols).map(|_| rnd()).collect();
             let xf = DevBuf::from_f32(&g, &xs).map_err(e)?;
             let xh = DevBuf::new(&g, xs.len() * 2).map_err(e)?;

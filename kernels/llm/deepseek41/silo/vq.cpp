@@ -741,6 +741,13 @@ int ns_ds41_vq_gemm(ns_gpu* g, const void* p0, const void* p1, int64_t split, in
     // an 8,734-token prompt: 379 / 415 / 435 / 421 / 441 / 472 tok/s (one run each: +-5%)
     static const int v = [] { const char* e = std::getenv("NS_DS41_VQ_GEMM_V"); return e ? std::atoi(e) : 5; }();
 #define VR(P, M, KS, R) vq_gemm_rt<P, M, KS, R>(g->q, a, b, split, rows, cols, ch, xh, ldx, n, y, ldy)
+    // 8 / 9: 2 row tiles a sub-group, 4 token tiles, 8 / 16 K slices a work-group (the occupancy the row tiles cost)
+    if (v == 8 || v == 9) {
+        if (rows % 32 != 0) return ns_fail("ns_ds41_vq_gemm: rows a multiple of 32");
+        if (nbit > 12) { if (v == 8) VR(true, 4, 8, 2); else VR(true, 4, 16, 2); }
+        else { if (v == 8) VR(false, 4, 8, 2); else VR(false, 4, 16, 2); }
+        return 0;
+    }
     // 6: 2 row tiles a sub-group, 7: 4 (the large register file)
     if (v == 6 || v == 7) {
         const bool w = n > 32;

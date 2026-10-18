@@ -503,10 +503,12 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_VQ_LUT` | 1 | 0: the VQ lookup-table variant left out of the decode products' timing at load | llm deepseek41 |
 | `NS_DS41_IDX_XMX` | 1 | 0: the indexer's scores in the scalar kernel instead of on XMX (deepseek4's form for 32 heads; the queries rounded to fp16) | kernels:llm deepseek41 |
 | `NS_DS41_VQ_GEMM_MAX` | 100000 | a prompt pass's experts past NS_DS41_PROMPT_MMV tokens and up to this many multiplied on XMX straight from their indices; more expanded to fp16 for a GEMM (0: all expanded) | llm deepseek41 |
-| `NS_DS41_VQ_GEMM_V` | 5 | Experiment: the prompt's XMX expert product's form - 0 its B tiles through local memory, 1 decoded straight into the tiles' registers (8 K slices a work-group), 2 / 3 the same with 4 K slices, 4 / 5 as 2 / 3 and past 32 tokens 8 token tiles a sub-group | kernels:llm deepseek41 |
+| `NS_DS41_VQ_GEMM_V` | 5 | Experiment: the prompt's XMX expert product's form - 0 its B tiles through local memory, 1 decoded straight into the tiles' registers (8 K slices a work-group), 2 / 3 the same with 4 K slices, 4 / 5 as 2 / 3 and past 32 tokens 8 token tiles a sub-group, 6 / 7 two or four row tiles a sub-group (4 K slices), 8 / 9 two with 8 / 16 K slices | kernels:llm deepseek41 |
+| `NS_DS41_GEMM_TEST_N` | 40 | `llm kernels`: the tokens of its vq_gemm check (1..64) | llm deepseek41 |
 | `NS_DS41_VQ_BENCH` | 0,1 | `llm kernels`: the VQ decode variants it times | llm deepseek41 |
 | `NS_DS41_Q4K_R` | 4 | Experiment: rows a sub-group of decode's q4_K products (1, 2 or 4) | kernels:llm deepseek41 |
 | `NS_DS41_Q4K_COLS` | 2 | decode's q4_K products decode each weight once for all of a pass's columns from this many columns (a verify pass; the same arithmetic a column as the one-column kernel, so verify rows stay bit-identical); 1 one column too, 0 never | kernels:llm deepseek41 |
+| `NS_DS41_Q4K_MAGIC` | 0 | Experiment: 1: decode's q4_K products turn the nibbles into floats by their bits (1 + q/16, no conversion; the sums rounded differently) | kernels:llm deepseek41 |
 | `NS_DS41_VQ_RPG` | 8 | Experiment: sub-groups a work-group of the VQ decode products | kernels:llm deepseek41 |
 | `NS_DS41_VQ_RPS` | 1 | Experiment: rows a sub-group of the VQ decode products takes in turn | kernels:llm deepseek41 |
 | `NS_DS41_Q4K` | on | 0: decode's q4_K products through the shared Q8_1 quantization and product (o_a a launch a group) instead of this engine's float32 kernel | llm deepseek41 |
