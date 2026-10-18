@@ -60,6 +60,8 @@ pub struct Api {
     pub ds41_vq_codebook_f32: unsafe extern "C" fn(Gpu, *const u8, i64, *mut f32) -> c_int,
     pub ds41_fp8_dequant: unsafe extern "C" fn(Gpu, *const u8, i64, i64, i64, i64, *mut c_void, c_int) -> c_int,
     pub ds41_q4k_mv: unsafe extern "C" fn(Gpu, *const c_void, i64, i64, *const f32, i64, i64, i64, *mut f32, i64, i64) -> c_int,
+    pub ds41_markov_step: unsafe extern "C" fn(Gpu, *const f32, *const f32, i64, *mut i32) -> c_int,
+    pub ds41_gather_rows: unsafe extern "C" fn(Gpu, *const f32, *const i32, i64, i64, *mut f32) -> c_int,
     pub ds41_fp8_mmv: unsafe extern "C" fn(Gpu, *const u8, i64, i64, *const f32, *mut f32, i64) -> c_int,
 }
 
@@ -148,6 +150,8 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             ds41_vq_codebook_f32: own!("ns_ds41_vq_codebook_f32"),
             ds41_fp8_dequant: own!("ns_ds41_fp8_dequant"),
             ds41_fp8_mmv: own!("ns_ds41_fp8_mmv"),
+            ds41_markov_step: own!("ns_ds41_markov_step"),
+            ds41_gather_rows: own!("ns_ds41_gather_rows"),
             ds41_q4k_mv: own!("ns_ds41_q4k_mv"),
         })
     })

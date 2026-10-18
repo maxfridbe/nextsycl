@@ -948,7 +948,7 @@ impl Part {
         if last {
             let mut v = vec![Role::OutputNorm, Role::Output];
             if mtp {
-                v.extend([Role::MtpMainProj, Role::MtpMainNorm, Role::MtpMarkovHead, Role::MtpConfidence, Role::MtpOutNorm]);
+                v.extend([Role::MtpMainProj, Role::MtpMainNorm, Role::MtpMarkovEmbd, Role::MtpMarkovHead, Role::MtpConfidence, Role::MtpOutNorm]);
             }
             todo.push((0, v));
         }
@@ -2167,24 +2167,25 @@ impl<'g> Ds41<'g> {
         let h = p.arena.f32(b * d)?;
         o.hc_collapse(&x.view(0, b * 4 * d * 4)?, &x.view(b * 4 * d * 4, b * 16)?, &h, b, d)?;
         o.rms_norm(&h, Some(p.vec(0, Role::MtpOutNorm)?), &h, b, d, eps)?;
-        let logits = p.mm(0, Role::Output, &h, b)?;
+        // only the rows a draft is taken from (row i: the token after position pos + i)
+        let k = k.min(b);
+        let logits = p.mm(0, Role::Output, &h, k)?;
         tap("mtp_logits", &logits)?;
-        let lv = p.read_f32(&logits, b * g.n_vocab as usize)?;
         let vocab = g.n_vocab as usize;
-        // the Markov bias: the previous token's (tail, then each draft) rank-256 embedding through its head
-        let mut out = Vec::with_capacity(k);
-        let mut prev = tail;
-        for i in 0..k.min(b) {
-            let me = self.rows_of(p, Role::MtpMarkovEmbd, &[prev])?;
+        // the Markov bias, on the GPU: the previous token's (tail, then each draft) rank-256 embedding through its head,
+        // added to its row, the argmax the next previous token
+        let toks = p.arena.bytes((k + 1) * 4)?;
+        p.upload(&toks, &(tail as i32).to_le_bytes())?;
+        let emb = p.mat(0, Role::MtpMarkovEmbd)?;
+        let me = p.arena.f32(emb.cols)?;
+        for i in 0..k {
+            o.gather_rows(&emb.buf, emb.rows, &toks, i * 4, 1, emb.cols, &me)?;
             let bias = p.mm(0, Role::MtpMarkovHead, &me, 1)?;
-            let bv = p.read_f32(&bias, vocab)?;
-            let row: Vec<f32> = lv[i * vocab..(i + 1) * vocab].iter().zip(&bv).map(|(a, b)| a + b).collect();
-            let y = argmax(&row);
-            out.push(y);
-            prev = y;
+            o.markov_step((&logits, i * vocab), &bias, vocab, &toks, (i + 1) * 4)?;
         }
+        let tv = p.read_f32(&toks, k + 1)?;
         let _ = (t0, &mut x);
-        Ok(out)
+        Ok(tv[1..].iter().map(|f| f.to_bits()).collect())
     }
 
     pub fn decoder(&self, logits: Vec<f32>, draft: bool) -> Decoder {

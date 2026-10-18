@@ -218,4 +218,34 @@ int ns_ds41_cand_mask(ns_gpu* g, float* score, const int32_t* cand, uint8_t* mar
     NS_CATCH
 }
 
+int ns_ds41_markov_step(ns_gpu* g, const float* logits, const float* bias, int64_t n, int32_t* tok) {
+    NS_TRY
+    constexpr int WG = 1024;
+    g->q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+        const int lid = it.get_local_id(0);
+        float best = -INFINITY;
+        int32_t bi = 0;
+        for (int64_t i = lid; i < n; i += WG) {
+            const float v = logits[i] + bias[i];
+            if (v > best) {
+                best = v;
+                bi = (int32_t) i;
+            }
+        }
+        const float m = sycl::reduce_over_group(it.get_group(), best, sycl::maximum<float>());
+        // the lowest index of the best (the host's argmax keeps the first)
+        const int32_t w = sycl::reduce_over_group(it.get_group(), best == m ? bi : INT32_MAX, sycl::minimum<int32_t>());
+        if (lid == 0) *tok = w;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_ds41_gather_rows(ns_gpu* g, const float* table, const int32_t* idx, int64_t count, int64_t cols, float* out) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<2>(count, cols), [=](sycl::id<2> id) { out[id[0] * cols + id[1]] = table[(int64_t) idx[id[0]] * cols + id[1]]; });
+    return 0;
+    NS_CATCH
+}
+
 }  // extern "C"

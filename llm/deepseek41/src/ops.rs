@@ -555,6 +555,25 @@ impl Ops {
         };
         self.ok(rc, "ds41_vq_mmv")
     }
+    /// *tok (an i32 at byte `at` of `toks`) = argmax(logits + bias) over n
+    pub fn markov_step(&self, logits: (&DevBuf, usize), bias: &DevBuf, n: usize, toks: &DevBuf, at: usize) -> Result<()> {
+        need!(logits.0, logits.1 + n, "markov_step logits");
+        need!(bias, n, "markov_step bias");
+        toks.bounds(at, 4)?;
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds41_markov_step)(self.raw(), logits.0.fp().add(logits.1), bias.fp(), n as i64, toks.ptr().cast::<u8>().add(at).cast()) };
+        self.ok(rc, "ds41_markov_step")
+    }
+    /// out [count][cols] = rows of table [rows][cols] named by the i32s at byte `at` of idx (on the GPU; each below `rows`)
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_rows(&self, table: &DevBuf, rows: usize, idx: &DevBuf, at: usize, count: usize, cols: usize, out: &DevBuf) -> Result<()> {
+        need!(table, rows * cols, "gather_rows table");
+        idx.bounds(at, count * 4)?;
+        need!(out, count * cols, "gather_rows out");
+        // SAFETY: sizes checked; the indices are argmaxes below `rows` (the vocabulary).
+        let rc = unsafe { (self.k.ds41_gather_rows)(self.raw(), table.fp(), idx.ptr().cast::<u8>().add(at).cast(), count as i64, cols as i64, out.fp()) };
+        self.ok(rc, "ds41_gather_rows")
+    }
     /// A codebook's E4M3 bytes widened to float32 (x 2^-8) for the decode products
     pub fn vq_codebook_f32(&self, cb: &DevBuf, n: usize, out: &DevBuf) -> Result<()> {
         cb.bounds(0, n)?;

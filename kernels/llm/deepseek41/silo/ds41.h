@@ -64,6 +64,11 @@ int ns_ds41_block_max(ns_gpu* g, const float* score, float* bmax, int64_t T, int
 /* score [T][ld] to -inf outside the blocks cand [T][K] lists (mark: scratch of T x nb bytes) */
 int ns_ds41_cand_mask(ns_gpu* g, float* score, const int32_t* cand, uint8_t* mark, int64_t T, int64_t n, int64_t ld, int64_t K, int64_t bs);
 
+/* The draft's Markov chain on the GPU: *tok = argmax(logits + bias) (the lowest index of a tie), n values */
+int ns_ds41_markov_step(ns_gpu* g, const float* logits, const float* bias, int64_t n, int32_t* tok);
+/* out [count][cols] = table rows idx[0..count) (the indices on the GPU) */
+int ns_ds41_gather_rows(ns_gpu* g, const float* table, const int32_t* idx, int64_t count, int64_t cols, float* out);
+
 /* ---- vq.cpp: the routed experts' VQ (YoungAi's DQV3 payloads) and the fp8_32x32 matrices */
 /* whether an expert matrix of rows x cols at nbit (12 or 13) index bits is taken */
 int ns_ds41_vq_supported(int64_t rows, int64_t cols, int64_t nbit);
