@@ -12,6 +12,7 @@
 #include "ds41.h"
 
 #include <sycl/sycl.hpp>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -54,10 +55,89 @@ inline VqMat vq_open(const uint8_t* p, int64_t rows, int64_t cols, int64_t nbit)
 
 }  // namespace
 
+namespace {
+// an index's 8 weights (x 2^-8): CB 0 from the E4M3 bytes a byte at a time, 1 from the bytes two at a time (a word's
+// bytes 0 and 2, then 1 and 3, as fp16 pairs), 2 from the fp16 codebook (cbh)
+template <int CB>
+inline void vq_weights(const uint8_t* cb, const sycl::half* cbh, uint32_t ix, float wv[8]) {
+    if constexpr (CB == 2) {
+        const sycl::vec<sycl::half, 8> h = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(cbh + (size_t) ix * 8);
+#pragma unroll
+        for (int d = 0; d < 8; ++d) wv[d] = (float) h[d];
+    } else if constexpr (CB == 1) {
+        const sycl::uint2 w = *reinterpret_cast<const sycl::uint2*>(cb + (size_t) ix * 8);
+#pragma unroll
+        for (int hw = 0; hw < 2; ++hw) {
+            const uint32_t u = hw ? w.y() : w.x();
+            const uint32_t e = ((u & 0x00800080u) << 8) | ((u & 0x007F007Fu) << 7);
+            const uint32_t o = (u & 0x80008000u) | ((u & 0x7F007F00u) >> 1);
+            const sycl::vec<sycl::half, 2> he = sycl::bit_cast<sycl::vec<sycl::half, 2>>(e), ho = sycl::bit_cast<sycl::vec<sycl::half, 2>>(o);
+            wv[4 * hw + 0] = (float) he[0];
+            wv[4 * hw + 2] = (float) he[1];
+            wv[4 * hw + 1] = (float) ho[0];
+            wv[4 * hw + 3] = (float) ho[1];
+        }
+    } else {
+        const sycl::uint2 w = *reinterpret_cast<const sycl::uint2*>(cb + (size_t) ix * 8);
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+            wv[d] = e4m3_scaled((w.x() >> (8 * d)) & 0xFF);
+            wv[4 + d] = e4m3_scaled((w.y() >> (8 * d)) & 0xFF);
+        }
+    }
+}
+
+// vq_mmv's variants 1, 2 and 4: a lane an output row (WG rows a work-group), the activations read alike by all lanes, an
+// index's weights from the E4M3 bytes (8 bytes gathered; 4 converts them two at a time) or the fp16 codebook (2: 16
+// bytes). 6 experts, one token, gate | up / down in us - B70 12-bit: variant 0 239 / 158, 1 216 / 121, 2 199 / 105,
+// 3 230 / 149, 4 191 / 106; 13-bit: 374 / 220, 266 / 138, 264 / 132, 226 / 153, 240 / 122; B65 12-bit: 440 / 279,
+// 507 / 245, 452 / 209, 418 / 264, 433 / 210. Which wins depends on the GPU and the shape: the engine times them all
+// at load (vq_pick).
+template <bool PLANE, int CB>
+void vq_mmv_rows(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const uint8_t* cb, const sycl::half* cbh, const float* x, float* y,
+                 int64_t rows, int64_t cols, int WG) {
+    const int64_t rgs = (rows + WG - 1) / WG, chunks = cols / 64;
+    q.parallel_for(sycl::nd_range<1>(entries * rgs * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        const int64_t gi = it.get_group(0), e = gi / rgs, r = (gi % rgs) * WG + it.get_local_id(0);
+        if (r >= rows) return;
+        const int32_t* me = meta + e * 10;
+        const int nc = me[0];
+        const VqMat m = vq_open(reinterpret_cast<const uint8_t*>(ptrs[e]), rows, cols, PLANE ? 13 : 12);
+        const uint32_t* srow = reinterpret_cast<const uint32_t*>(m.stream + r * m.mrow);
+        const uint8_t* prow = PLANE ? m.plane + r * m.prow : nullptr;
+        float acc[8] = {};
+        for (int64_t k = 0; k < chunks; ++k) {
+            uint32_t idx[8];
+            chunk_idx(srow + 3 * k, PLANE ? prow[k] : 0u, idx);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                float wv[8];
+                vq_weights<CB>(cb, cbh, idx[i], wv);
+                for (int c = 0; c < nc; ++c) {
+                    const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(x + (int64_t) me[2 + c] * cols + k * 64 + i * 8);
+                    const sycl::float4 a = xv[0], b = xv[1];
+                    acc[c] += wv[0] * a.x() + wv[1] * a.y() + wv[2] * a.z() + wv[3] * a.w() + wv[4] * b.x() + wv[5] * b.y() + wv[6] * b.z() + wv[7] * b.w();
+                }
+            }
+        }
+        const float gn = (float) m.gains[r] * 256.f;
+        for (int c = 0; c < nc; ++c) y[(int64_t) (me[1] + c) * rows + r] = acc[c] * gn;
+    });
+}
+}  // namespace
+
 extern "C" {
 
 int ns_ds41_vq_supported(int64_t rows, int64_t cols, int64_t nbit) {
     return rows > 0 && cols % 64 == 0 && (nbit == 12 || nbit == 13);
+}
+
+int ns_ds41_vq_codebook_f16(ns_gpu* g, const uint8_t* cb, int64_t n, void* outv) {
+    NS_TRY
+    sycl::half* out = static_cast<sycl::half*>(outv);
+    g->q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { out[i] = (sycl::half) e4m3_scaled(cb[i]); });
+    return 0;
+    NS_CATCH
 }
 
 int ns_ds41_vq_codebook_f32(ns_gpu* g, const uint8_t* cb, int64_t n, float* out) {
@@ -93,15 +173,25 @@ int ns_ds41_vq_dequant(ns_gpu* g, const void* payload, const uint8_t* cb, int64_
     NS_CATCH
 }
 
-// A sub-group of 16 an output row, RPG rows a work-group (RPS a sub-group in turn); each lane a run of 64-column chunks,
+// Variants 0 and 3: a sub-group of 16 an output row, RPG rows a work-group (RPS a sub-group in turn); each lane a run of 64-column chunks,
 // every column at once. The codebook's gathers go through L1 (a lane an index): as float32 (cbf, widened once a layer:
-// no conversion a weight) or the E4M3 bytes. Measured on the B70 (6 experts of a 12-bit layer, one token): gate | up
+// no conversion a weight), fp16 (3: cbf is the fp16 codebook) or the E4M3 bytes (cbf null). Measured on the B70 (6 experts of a 12-bit layer, one token): gate | up
 // 208 us, down 121 us with cbf (218 / 144 from the bytes); kept local-memory codebooks (bytes, fp16; persistent or not;
 // rows staged; 4 rows sharing the activations) all measured slower, 217-720 us.
 int ns_ds41_vq_mmv(ns_gpu* g, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const uint8_t* cb, const float* cbf, const float* x, float* y,
-                   int64_t rows, int64_t cols, int64_t nbit) {
+                   int64_t rows, int64_t cols, int64_t nbit, int variant) {
     NS_TRY
     if (!ns_ds41_vq_supported(rows, cols, nbit)) return ns_fail("ns_ds41_vq_mmv: cols a multiple of 64, 12 or 13 bits");
+    const sycl::half* cbh = reinterpret_cast<const sycl::half*>(cbf);
+    if (variant == 1 || variant == 2 || variant == 4) {
+        const bool p = nbit > 12;
+#define VQR(P, C) vq_mmv_rows<P, C>(g->q, ptrs, meta, entries, cb, cbh, x, y, rows, cols, 64)
+        if (variant == 1) { if (p) VQR(true, 0); else VQR(false, 0); }
+        else if (variant == 2) { if (p) VQR(true, 2); else VQR(false, 2); }
+        else { if (p) VQR(true, 1); else VQR(false, 1); }
+#undef VQR
+        return 0;
+    }
     constexpr int SG = 16, MC = 8;
     static const int rpg_s = [] { const char* v = std::getenv("NS_DS41_VQ_RPG"); return v ? std::atoi(v) : 8; }();
     static const int rps_s = [] { const char* v = std::getenv("NS_DS41_VQ_RPS"); return v ? std::atoi(v) : 1; }();
@@ -127,7 +217,9 @@ int ns_ds41_vq_mmv(ns_gpu* g, const uint64_t* ptrs, const int32_t* meta, int64_t
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 float wv[8];
-                if (cbf) {
+                if (variant == 3) {
+                    vq_weights<2>(cb, cbh, idx[i], wv);
+                } else if (cbf) {
                     const sycl::float4* cw = reinterpret_cast<const sycl::float4*>(cbf + (size_t) idx[i] * 8);
                     const sycl::float4 c0 = cw[0], c1 = cw[1];
                     wv[0] = c0.x(); wv[1] = c0.y(); wv[2] = c0.z(); wv[3] = c0.w();

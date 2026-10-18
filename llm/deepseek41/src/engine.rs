@@ -50,6 +50,10 @@ const MTP_KEEP: usize = MTP_WIN + MAX_VERIFY;
 /// Time the host spent waiting for the routers' logits / choosing experts (all layers)
 pub static ROUTER_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ROUTE_HOST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Decode: the host's time from a layer's router logits to its expert products queued (the GPU has nothing queued
+/// meanwhile but the shared expert), and of it the file reads
+pub static TURN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static FILE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
@@ -370,6 +374,10 @@ pub struct Part {
     cbs: HashMap<u64, DevBuf>,
     /// the codebooks as float32 (the decode products' weights without a conversion each)
     cbf: HashMap<u64, DevBuf>,
+    /// and as fp16 (exact), for the variants that gather 16 bytes an index
+    cbh: HashMap<u64, DevBuf>,
+    /// the decode products' kernel variant by index width: [gate | up, down] (measured at load: vq_pick)
+    vq_pick: HashMap<usize, [i32; 2]>,
     /// the expert stores (one a span size) and the store of each layer
     stores: Vec<Mutex<Store>>,
     store_of: HashMap<u64, usize>,
@@ -747,6 +755,7 @@ impl Part {
         if file.is_empty() {
             return Ok(at);
         }
+        let t0 = Instant::now();
         let ks = file.iter().map(|_| self.stage_slot(c)).collect::<Result<Vec<_>>>()?;
         let sb = c.slot_bytes;
         let mut slices: Vec<Option<&mut [u8]>> = c.stage.as_mut_slice().chunks_mut(sb).map(Some).collect();
@@ -768,6 +777,7 @@ impl Part {
         for (x, k) in file.iter().zip(ks) {
             at.insert(*x, k);
         }
+        FILE_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(at)
     }
 
@@ -928,6 +938,104 @@ pub struct Ds41<'g> {
     pub mtp: bool,
 }
 
+/// the decode products' kernel variants (ds41.h: ns_ds41_vq_mmv): 0 a sub-group a row (float32 codebook), 1 a lane a row
+/// (the E4M3 bytes), 2 a lane a row (fp16 codebook), 3 a sub-group a row (fp16), 4 a lane a row (the bytes two at once)
+const VQ_VARIANTS: usize = 5;
+
+/// The widened codebook variant `var` reads: float32 (0), fp16 (2, 3), none (the bytes)
+fn vq_wide<'a>(wide: (&'a HashMap<u64, DevBuf>, &'a HashMap<u64, DevBuf>), l: u64, var: i32) -> Option<&'a DevBuf> {
+    match var {
+        0 => wide.0.get(&l),
+        2 | 3 => wide.1.get(&l),
+        _ => None,
+    }
+}
+
+/// The decode products' fastest kernel variant on this GPU for each index width of its layers, [gate | up, down]: both
+/// timed on six of a layer's experts in VRAM, one token (NS_DS41_VQ_V=0..4 sets it instead). Which wins depends on the
+/// GPU and the shape (B70 + B65: 3 or 4 for gate | up, 2 or 4 for down).
+#[allow(clippy::too_many_arguments)]
+fn vq_pick(o: &Ops, g: &crate::model::Geometry, vq: &HashMap<u64, LayerVq>, cbs: &HashMap<u64, DevBuf>, wide: (&HashMap<u64, DevBuf>, &HashMap<u64, DevBuf>),
+           stores: &[Mutex<Store>],
+           store_of: &HashMap<u64, usize>, draft: &HashMap<u64, DevBuf>, log: &mut dyn FnMut(String)) -> Result<HashMap<usize, [i32; 2]>> {
+    let mut out = HashMap::new();
+    if let Some(v) = std::env::var("NS_DS41_VQ_V").ok().and_then(|v| v.parse::<i32>().ok()) {
+        for l in vq.values() {
+            out.insert(l.nbit, [v, v]);
+        }
+        return Ok(out);
+    }
+    let (d, f) = (g.n_embd as usize, g.ffn_expert as usize);
+    let mut layers: Vec<u64> = vq.keys().copied().collect();
+    layers.sort();
+    for l in layers {
+        let v = &vq[&l];
+        if out.contains_key(&v.nbit) {
+            continue;
+        }
+        // six of the layer's experts in VRAM: the store's slots it owns, or the towers' buffer
+        let bases: Vec<u64> = match (draft.get(&l), store_of.get(&l)) {
+            (Some(buf), _) => (0..6).map(|x| buf.ptr() as u64 + (x * v.span.next_multiple_of(256)) as u64).collect(),
+            (None, Some(&si)) => {
+                let c = stores[si].lock().unwrap();
+                (0..c.base).filter(|s| c.vowner[*s].is_some_and(|k| k.0 == l)).take(6).map(|s| {
+                    let (ch, at) = c.vat(s);
+                    c.vram[ch].ptr() as u64 + at as u64
+                }).collect()
+            }
+            _ => Vec::new(),
+        };
+        if bases.len() < 6 {
+            continue;
+        }
+        let n = bases.len();
+        let mut tb: Vec<u8> = Vec::new();
+        let mut meta: Vec<i32> = Vec::new();
+        for w in 0..2 {
+            for (x, b) in bases.iter().enumerate() {
+                tb.extend((b + if w == 0 { v.gate } else { v.up } as u64).to_le_bytes());
+                meta.extend([1, (w * n + x) as i32, 0, 0, 0, 0, 0, 0, 0, 0]);
+            }
+        }
+        tb.extend(i32s(&meta));
+        let mut db: Vec<u8> = bases.iter().flat_map(|b| (b + v.down as u64).to_le_bytes()).collect();
+        db.extend(i32s(&(0..n).flat_map(|x| [1, x as i32, x as i32, 0, 0, 0, 0, 0, 0, 0]).collect::<Vec<_>>()));
+        let (gt, dt) = (DevBuf::new(&o.gpu, tb.len())?, DevBuf::new(&o.gpu, db.len())?);
+        gt.write(0, &tb)?;
+        dt.write(0, &db)?;
+        let x = DevBuf::f32(&o.gpu, n * f.max(d))?;
+        x.fill(0)?;
+        let y = DevBuf::f32(&o.gpu, 2 * n * f.max(d))?;
+        let mut pick = [0i32; 2];
+        for (k, (tab, e, rows, cols)) in [(&gt, 2 * n, f, d), (&dt, n, d, f)].into_iter().enumerate() {
+            let run = |var: i32, reps: usize| -> Result<f64> {
+                let t0 = Instant::now();
+                for _ in 0..reps {
+                    o.vq_mmv(tab, e, (&cbs[&l], vq_wide(wide, l, var)), &x, (&y, 0), e, rows, cols, v.nbit, var)?;
+                }
+                o.gpu.sync()?;
+                Ok(t0.elapsed().as_secs_f64() * 1e6 / reps as f64)
+            };
+            // the clocks up first, then each twice in turn
+            let t0 = Instant::now();
+            while t0.elapsed().as_secs_f64() < 0.15 {
+                run(0, 10)?;
+            }
+            let mut best = [f64::MAX; VQ_VARIANTS];
+            for _ in 0..2 {
+                for (var, b) in best.iter_mut().enumerate() {
+                    *b = b.min(run(var as i32, 20)?);
+                }
+            }
+            pick[k] = (0..VQ_VARIANTS).min_by(|a, b| best[*a].total_cmp(&best[*b])).unwrap_or(0) as i32;
+            log(format!("{}: {}-bit VQ {} products: {} us (variants 0-{}) - taking {}", o.gpu.name, v.nbit, ["gate | up", "down"][k],
+                        best.iter().map(|b| format!("{b:.0}")).collect::<Vec<_>>().join(" / "), VQ_VARIANTS - 1, pick[k]));
+        }
+        out.insert(v.nbit, pick);
+    }
+    Ok(out)
+}
+
 /// the small tensors kept as float32 vectors
 const VECTORS: [Role; 15] = [Role::OutputNorm, Role::AttnNorm, Role::FfnNorm, Role::HcAttnBase, Role::HcAttnScale, Role::HcFfnBase, Role::HcFfnScale,
                              Role::QANorm, Role::KvNorm, Role::Sinks, Role::CompNorm, Role::IdxKNorm, Role::RouterBias, Role::MtpMainNorm, Role::MtpOutNorm];
@@ -1002,6 +1110,7 @@ impl Part {
         let mut vq = HashMap::new();
         let mut cbs = HashMap::new();
         let mut cbf = HashMap::new();
+        let mut cbh = HashMap::new();
         for l in layers.clone().chain(towers.iter().copied()) {
             let v = layer_vq(m, l)?;
             if !ops.vq_supported(g.ffn_expert as usize, g.n_embd as usize, v.nbit) {
@@ -1012,6 +1121,9 @@ impl Part {
             let f = DevBuf::f32(gpu, v.cb_bytes.len())?;
             ops.vq_codebook_f32(&cb, v.cb_bytes.len(), &f)?;
             cbf.insert(l, f);
+            let h = DevBuf::new(gpu, v.cb_bytes.len() * 2)?;
+            ops.vq_codebook_f16(&cb, v.cb_bytes.len(), &h)?;
+            cbh.insert(l, h);
             cbs.insert(l, cb);
             vq.insert(l, v);
         }
@@ -1166,7 +1278,8 @@ impl Part {
         let cand = DevBuf::new(gpu, if g.cand_top > 0 { prefill_chunk().max(MAX_VERIFY) * g.cand_top as usize * 4 } else { 4 })?;
         let zeros = DevBuf::f32(gpu, 4 * g.head_dim as usize)?;
         zeros.fill(0)?;
-        Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), vq, cbs, cbf, stores, store_of, draft,
+        let vq_pick = vq_pick(&ops, g, &vq, &cbs, (&cbf, &cbh), &stores, &store_of, &draft, log)?;
+        Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
                   hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
                   up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros })
     }
@@ -1289,6 +1402,17 @@ impl<'g> Ds41<'g> {
         x.0 += t0.elapsed().as_secs_f64();
         x.1 += 1;
         Ok(r)
+    }
+
+    /// With NS_PROFILE=1: the time since `t0` (the GPU drained) added to `name`
+    fn lap(&self, p: &Part, name: &'static str, t0: Instant) -> Result<()> {
+        let Some(pr) = &self.prof else { return Ok(()) };
+        p.ops.gpu.sync()?;
+        let mut m = pr.lock().unwrap();
+        let x = m.entry(name).or_insert((0.0, 0));
+        x.0 += t0.elapsed().as_secs_f64();
+        x.1 += 1;
+        Ok(())
     }
 
     pub fn profile(&self) -> Vec<(&'static str, f64, u64)> {
@@ -2128,8 +2252,9 @@ impl<'g> Ds41<'g> {
             let xs = x.view(0, b * 4 * d * 4)?;
             let pre_in = x.view(b * 4 * d * 4, b * 16)?;
             let (normed, post, comb, pre_out) = (&ws[1], &ws[2], &ws[3], &ws[4]);
-            self.hc_half(p, l, Role::HcAttnFn, Role::HcAttnBase, Role::HcAttnScale, Role::AttnNorm, &xs, &pre_in, &ws, b)?;
+            self.timed(p, "draft: hc", || self.hc_half(p, l, Role::HcAttnFn, Role::HcAttnBase, Role::HcAttnScale, Role::AttnNorm, &xs, &pre_in, &ws, b))?;
             o.kcopy(&attn_pre, 0, pre_out, 0, b * 16)?;
+            let ta = Instant::now();
             // the attention: q and the block's keys from the block, the window's from the ring
             let rope = self.m.rope(l);
             let qr = p.mm(l, Role::QA, normed, b)?;
@@ -2155,9 +2280,10 @@ impl<'g> Ds41<'g> {
             let og = p.arena.f32(b * g.o_groups as usize * g.o_lora as usize)?;
             self.out_a(p, l, &att, &q, &og, &oa, 0, b)?;
             let a = p.mm(l, Role::OutB, &oa, b)?;
+            self.lap(p, "draft: attention", ta)?;
             o.hc_post(&a, &xs, post, comb, &x1, b, d)?;
             self.hc_half(p, l, Role::HcFfnFn, Role::HcFfnBase, Role::HcFfnScale, Role::FfnNorm, &x1, &attn_pre, &ws, b)?;
-            let ffn = self.moe(p, l, b, normed, &mut *tap)?;
+            let ffn = self.timed(p, "draft: moe", || self.moe(p, l, b, normed, &mut *tap))?;
             o.hc_post(&ffn, &x1, post, comb, &x2, b, d)?;
             o.kcopy(&x2, b * 4 * d * 4, pre_out, 0, b * 16)?;
             o.kcopy(&x, 0, &x2, 0, sz)?;
@@ -2169,7 +2295,7 @@ impl<'g> Ds41<'g> {
         o.rms_norm(&h, Some(p.vec(0, Role::MtpOutNorm)?), &h, b, d, eps)?;
         // only the rows a draft is taken from (row i: the token after position pos + i)
         let k = k.min(b);
-        let logits = p.mm(0, Role::Output, &h, k)?;
+        let logits = self.timed(p, "draft: head", || p.mm(0, Role::Output, &h, k))?;
         tap("mtp_logits", &logits)?;
         let vocab = g.n_vocab as usize;
         // the Markov bias, on the GPU: the previous token's (tail, then each draft) rank-256 embedding through its head,
@@ -2285,6 +2411,7 @@ impl<'g> Ds41<'g> {
             None => (logits.to_f32()?, match &guess { Some(gl) => Some(gl.to_f32()?), None => None }),
         };
         ROUTER_WAIT_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let turn = Instant::now();
         let bias = p.router_bias(l)?;
         let th = Instant::now();
         let pick = |ti: usize| -> Vec<(usize, f32)> {
@@ -2320,7 +2447,6 @@ impl<'g> Ds41<'g> {
         let (slots, arriving, copies) = self.timed(p, "experts: misses", || p.ensure(&self.m, l, &need, promote))?;
         let vq = &p.vq[&l];
         let cb = &p.cbs[&l];
-        let cbf = if std::env::var("NS_DS41_VQ_F32CB").map_or(true, |v| v != "0") { p.cbf.get(&l) } else { None };
         let nbit = vq.nbit;
         let total: usize = by.values().map(|v| v.len()).sum();
         let lists: Vec<&Vec<(i32, f32)>> = by.values().collect();
@@ -2375,13 +2501,17 @@ impl<'g> Ds41<'g> {
                     db.extend(i32s(&dmeta));
                     let dtab = p.arena.bytes(db.len())?;
                     p.upload(&dtab, &db)?;
-                    o.vq_mmv(&gtab, ptrs.len(), (cb, cbf), x, (&gu, 0), 2 * total, f, d, nbit)?;
+                    let pick = p.vq_pick.get(&nbit).copied().unwrap_or([0, 0]);
+                    o.vq_mmv(&gtab, ptrs.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, pick[0])), x, (&gu, 0), 2 * total, f, d, nbit, pick[0])?;
                     // h = silu(gate) up, in place of the gates (rows of the set only: the same op on the others is a no-op
                     // since they are computed once - the whole range is cheap and simplest)
                     let (gv, uv) = (gu.view(0, total * f * 4)?, gu.view(total * f * 4, total * f * 4)?);
                     let hset = p.arena.f32(total * f)?;
                     o.swiglu_clamp(&gv, &uv, &hset, total * f, lim)?;
-                    o.vq_mmv(&dtab, dptr.len(), (cb, cbf), &hset, (&dn, 0), total, d, f, nbit)?;
+                    o.vq_mmv(&dtab, dptr.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, pick[1])), &hset, (&dn, 0), total, d, f, nbit, pick[1])?;
+                    if !wait {
+                        TURN_NS.fetch_add(turn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 Ok(())
             })?;

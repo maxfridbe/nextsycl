@@ -532,10 +532,11 @@ impl Ops {
         self.ok(rc, "ds41_vq_dequant")
     }
     /// Decode products of expert matrices: `table` = u64 payload pointers [entries], then i32 meta [entries][10]
-    /// ({ncol, y0, cols}); y [(y0 + c) * rows + r] (floats from `y.1`, `y_rows` rows of `rows` in all)
+    /// ({ncol, y0, cols}); y [(y0 + c) * rows + r] (floats from `y.1`, `y_rows` rows of `rows` in all); `variant` 0 a
+    /// sub-group a row, 1 a lane a row
     #[allow(clippy::too_many_arguments)]
     pub fn vq_mmv(&self, table: &DevBuf, entries: usize, cb: (&DevBuf, Option<&DevBuf>), x: &DevBuf, y: (&DevBuf, usize), y_rows: usize, rows: usize, cols: usize,
-                  nbit: usize) -> Result<()> {
+                  nbit: usize, variant: i32) -> Result<()> {
         if entries == 0 {
             return Ok(());
         }
@@ -543,7 +544,7 @@ impl Ops {
         table.bounds(0, entries * 48)?;
         cb.bounds(0, (1usize << nbit) * 8)?;
         if let Some(f) = cbf {
-            f.bounds(0, (1usize << nbit) * 32)?;
+            f.bounds(0, (1usize << nbit) * if variant == 2 || variant == 3 { 16 } else { 32 })?;
         }
         need!(y.0, y.1 + y_rows * rows, "vq_mmv y");
         // SAFETY: sizes checked; the pointers are VRAM / pinned slots of this GPU holding the payloads, the columns
@@ -551,7 +552,7 @@ impl Ops {
         let rc = unsafe {
             let base = table.ptr().cast::<u8>();
             (self.k.ds41_vq_mmv)(self.raw(), base.cast(), base.add(entries * 8).cast(), entries as i64, cb.ptr().cast(), cbf.map_or(std::ptr::null(), |f| f.fp()),
-                                 x.fp(), y.0.fp().add(y.1), rows as i64, cols as i64, nbit as i64)
+                                 x.fp(), y.0.fp().add(y.1), rows as i64, cols as i64, nbit as i64, variant)
         };
         self.ok(rc, "ds41_vq_mmv")
     }
@@ -573,6 +574,14 @@ impl Ops {
         // SAFETY: sizes checked; the indices are argmaxes below `rows` (the vocabulary).
         let rc = unsafe { (self.k.ds41_gather_rows)(self.raw(), table.fp(), idx.ptr().cast::<u8>().add(at).cast(), count as i64, cols as i64, out.fp()) };
         self.ok(rc, "ds41_gather_rows")
+    }
+    /// A codebook's E4M3 bytes as fp16 (x 2^-8, exact) for the decode products' variants that gather 16 bytes an index
+    pub fn vq_codebook_f16(&self, cb: &DevBuf, n: usize, out: &DevBuf) -> Result<()> {
+        cb.bounds(0, n)?;
+        out.bounds(0, n * 2)?;
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds41_vq_codebook_f16)(self.raw(), cb.ptr().cast(), n as i64, out.ptr()) };
+        self.ok(rc, "ds41_vq_codebook_f16")
     }
     /// A codebook's E4M3 bytes widened to float32 (x 2^-8) for the decode products
     pub fn vq_codebook_f32(&self, cb: &DevBuf, n: usize, out: &DevBuf) -> Result<()> {

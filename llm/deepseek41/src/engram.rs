@@ -95,7 +95,7 @@ pub struct Engram {
     jobs: Mutex<Option<std::sync::mpsc::Sender<Job>>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     cache: Arc<Mutex<RowCache>>,
-    /// rows read from disk, found in the cache; reads (pages)
+    /// rows read from disk, found in the cache; reads
     pub read_rows: AtomicU64,
     pub cached_rows: AtomicU64,
     pub pages: Arc<AtomicU64>,
@@ -145,15 +145,32 @@ impl Drop for Bounce {
     }
 }
 
-/// bytes [off, off + dst.len()) of f through page-aligned reads
+/// bytes read from the tables, and the reads' time (each read's own, summed) and the longest one, in nanoseconds
+static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+static READ_NS: AtomicU64 = AtomicU64::new(0);
+static READ_MAX_NS: AtomicU64 = AtomicU64::new(0);
+fn bytes_read() -> &'static AtomicU64 {
+    &READ_BYTES
+}
+
+/// NS_DS41_ENGRAM_ALIGN: the reads' unit in bytes (default 512: the drives' logical block, what O_DIRECT needs; a row's
+/// 256 weights are one block, its scales another - 4096 reads whole pages, 8 times the bytes)
+fn read_align() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_ENGRAM_ALIGN").ok().and_then(|v| v.parse::<u64>().ok()).filter(|v| v.is_power_of_two() && *v >= 512).unwrap_or(512))
+}
+
+/// bytes [off, off + dst.len()) of f through block-aligned reads (the bounce buffer is page-aligned)
 fn read_at(f: &File, b: &mut Bounce, off: u64, dst: &mut [u8], pages: &AtomicU64) -> std::io::Result<()> {
-    let a = off & !4095;
-    let end = (off + dst.len() as u64).next_multiple_of(4096);
+    let al = read_align();
+    let a = off & !(al - 1);
+    let end = (off + dst.len() as u64).next_multiple_of(al);
     let n = (end - a) as usize;
     if n > b.len {
         *b = Bounce::new(n);
     }
     let buf = &mut b.buf()[..n];
+    let t0 = std::time::Instant::now();
     let mut got = 0;
     while got < n {
         let k = f.read_at(&mut buf[got..], a + got as u64)?;
@@ -162,7 +179,11 @@ fn read_at(f: &File, b: &mut Bounce, off: u64, dst: &mut [u8], pages: &AtomicU64
         }
         got += k;
     }
-    pages.fetch_add((n / 4096) as u64, Ordering::Relaxed);
+    let ns = t0.elapsed().as_nanos() as u64;
+    READ_NS.fetch_add(ns, Ordering::Relaxed);
+    READ_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+    pages.fetch_add(1, Ordering::Relaxed);
+    bytes_read().fetch_add(n as u64, Ordering::Relaxed);
     let s = (off - a) as usize;
     dst.copy_from_slice(&buf[s..s + dst.len()]);
     Ok(())
@@ -305,9 +326,12 @@ impl Engram {
         Ok(out)
     }
 
-    /// (rows read from disk, rows from the cache, 4 KiB pages read, seconds waited)
-    pub fn stats(&self) -> (u64, u64, u64, f64) {
-        (self.read_rows.load(Ordering::Relaxed), self.cached_rows.load(Ordering::Relaxed), self.pages.load(Ordering::Relaxed),
+    /// (rows read from disk, rows from the cache, reads, bytes read, the reads' mean and longest time in microseconds,
+    /// seconds the passes waited)
+    pub fn stats(&self) -> (u64, u64, u64, u64, f64, f64, f64) {
+        let reads = self.pages.load(Ordering::Relaxed);
+        (self.read_rows.load(Ordering::Relaxed), self.cached_rows.load(Ordering::Relaxed), reads, READ_BYTES.load(Ordering::Relaxed),
+         READ_NS.load(Ordering::Relaxed) as f64 * 1e-3 / reads.max(1) as f64, READ_MAX_NS.load(Ordering::Relaxed) as f64 * 1e-3,
          self.wait_ns.load(Ordering::Relaxed) as f64 * 1e-9)
     }
 }

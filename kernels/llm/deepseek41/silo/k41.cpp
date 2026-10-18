@@ -62,6 +62,29 @@ inline float bf16_round(float x) {
     return sycl::bit_cast<float>(u);
 }
 
+// quant_sim with a lane an element and a sub-group a block (block 16 or 32): the same arithmetic as a work-item a block,
+// without its serial chain (a decode pass's blocks are few: the serial form took ~19 us a call)
+template <int B>
+void quant_sim_sg(sycl::queue& q, float* x, int64_t nb, int kind) {
+    constexpr int WG = 128;
+    const int64_t n = nb * B;
+    q.parallel_for(sycl::nd_range<1>((n + WG - 1) / WG * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(B)]] {
+        const auto sg = it.get_sub_group();
+        const int64_t i = it.get_global_id(0);
+        const bool in = i < n;
+        const float v = in ? x[i] : 0.f;
+        const float amax = sycl::reduce_over_group(sg, sycl::fabs(v), sycl::maximum<float>());
+        if (!in) return;
+        if (kind == 0) {
+            const float s = pow2_ceil(sycl::fmax(amax, 1e-4f) / 448.f);
+            x[i] = e4m3_round(sycl::fmin(sycl::fmax(v / s, -448.f), 448.f)) * s;
+        } else {
+            const float s = kind == 1 ? pow2_ceil(sycl::fmax(amax, 6.f * 1.1754944e-38f) / 6.f) : e4m3_round(sycl::fmax(amax, 6.f * 0.001953125f) / 6.f);
+            x[i] = e2m1_round(sycl::fmin(sycl::fmax(v / s, -6.f), 6.f)) * s;
+        }
+    });
+}
+
 }  // namespace
 
 extern "C" {
@@ -70,6 +93,12 @@ int ns_ds41_quant_sim(ns_gpu* g, float* x, int64_t rows, int64_t cols, int64_t b
     NS_TRY
     if (block <= 0 || block > 64 || cols % block != 0 || kind < 0 || kind > 2) return ns_fail("ns_ds41_quant_sim: a block of 1..64 dividing the row");
     const int64_t nb = rows * (cols / block);
+    if (block == 16 || block == 32) {
+        // whole blocks a work-group (128 a multiple of the block): no block spans two sub-groups
+        if (block == 16) quant_sim_sg<16>(g->q, x, nb, kind);
+        else quant_sim_sg<32>(g->q, x, nb, kind);
+        return 0;
+    }
     g->q.parallel_for(sycl::range<1>(nb), [=](sycl::id<1> id) {
         float* v = x + id[0] * block;
         float amax = 0.f;

@@ -484,13 +484,16 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS4_MULTI_DENSE` | on | 0: decode's dense products of one input a launch a matrix (shared kernels) instead of one multi-matrix launch a type | llm deepseek4 |
 | `NS_DS4_MULTI_GROUPS` | 1024 | Experiment: work-groups of the multi-expert decode kernels | kernels:llm deepseek4 |
 | `NS_DS41_ENGRAM_DIR` | `deepseek-engram` beside the model | the directory of DeepSeek-V4.1's two Engram shards (model-00047/48-of-00048.safetensors, read in rows) | llm deepseek41 |
+| `NS_DS41_ENGRAM_ALIGN` | 512 | the Engram reads' unit in bytes (a power of two from 512: the drives' logical block, what O_DIRECT needs; 4096 reads whole pages) | llm deepseek41 |
 | `NS_DS41_ENGRAM_READERS` | 48 | the Engram's reader threads: its row reads in flight (O_DIRECT, a 4 KiB page each) | llm deepseek41 |
 | `NS_DS41_ENGRAM_CACHE` | 262144 | the Engram rows kept in host memory (264 B each; 0: none) | llm deepseek41 |
 | `NS_DS41_DRAFTS` | 3 | the DSpark towers' drafts a verify pass checks (1..7) | llm deepseek41 |
 | `NS_DS41_PIN_GIB` | 40 | pinned host memory for the experts that do not fit VRAM (at most what is available less 12 GiB) | llm deepseek41 |
 | `NS_DS41_FREE_GIB` | 1.5 | VRAM each GPU keeps free beyond the plan (the xe driver has no out-of-memory path) | llm deepseek41 |
 | `NS_DS41_QSIM` | on | 0: the model's low-precision simulations (fp8 window keys and attention output, fp4 compressed and indexer keys) left out - a check against a reference without them | llm deepseek41 |
-| `NS_DS41_VQ_F32CB` | on | 0: the VQ decode products convert each codebook byte instead of reading the codebook widened to float32 | llm deepseek41 |
+| `NS_DS41_VQ_V` | measured | 0..4: the VQ decode products' kernel variant (0 a sub-group a row on the float32 codebook, 1 a lane a row on the bytes, 2 a lane a row on fp16, 3 a sub-group a row on fp16, 4 a lane a row two bytes at once) instead of the fastest of them timed at load | llm deepseek41 |
+| `NS_DS41_VQ_BENCH` | 0,1 | `llm kernels`: the VQ decode variants it times | llm deepseek41 |
+| `NS_DS41_Q4K_R` | 4 | Experiment: rows a sub-group of decode's q4_K products (1, 2 or 4) | kernels:llm deepseek41 |
 | `NS_DS41_VQ_RPG` | 8 | Experiment: sub-groups a work-group of the VQ decode products | kernels:llm deepseek41 |
 | `NS_DS41_VQ_RPS` | 1 | Experiment: rows a sub-group of the VQ decode products takes in turn | kernels:llm deepseek41 |
 | `NS_DS41_Q4K` | on | 0: decode's q4_K products through the shared Q8_1 quantization and product (o_a a launch a group) instead of this engine's float32 kernel | llm deepseek41 |

@@ -77,9 +77,11 @@ int ns_ds41_vq_supported(int64_t rows, int64_t cols, int64_t nbit);
  * [2^nbit][8]; out [rows][cols] as fp16 (f16 = 1) or float32 */
 int ns_ds41_vq_dequant(ns_gpu* g, const void* payload, const uint8_t* cb, int64_t rows, int64_t cols, int64_t nbit, void* out, int f16);
 /* Decode products: entry e = the matrix at ptrs[e] against meta[e] = {ncol, y0, col_0 .. col_7} columns of x [*][cols]:
- * y[(y0 + c) * rows + r] = W . x[col_c] */
+ * y[(y0 + c) * rows + r] = W . x[col_c]; variant 0 a sub-group a row (cbf: the float32 codebook, or null), 1 a lane a row (the bytes) */
 int ns_ds41_vq_mmv(ns_gpu* g, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const uint8_t* cb, const float* cbf, const float* x, float* y,
-                   int64_t rows, int64_t cols, int64_t nbit);
+                   int64_t rows, int64_t cols, int64_t nbit, int variant);
+/* the codebook's n E4M3 bytes as fp16 x 2^-8 (exact) */
+int ns_ds41_vq_codebook_f16(ns_gpu* g, const uint8_t* cb, int64_t n, void* out);
 /* the codebook's n E4M3 bytes as float32 x 2^-8 (vq_mmv's cbf: no conversion a weight; null: from the bytes) */
 int ns_ds41_vq_codebook_f32(ns_gpu* g, const uint8_t* cb, int64_t n, float* out);
 /* fp8_32x32 [rows][cols] (w: the E4M3 plane, then the E8M0 tile scales): rows [r0, r0 + n) expanded to float32 / fp16 */

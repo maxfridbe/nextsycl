@@ -212,13 +212,14 @@ impl Engine for engine::Ds41<'_> {
         for (name, secs, calls) in engine::Ds41::profile(self) {
             v.push(format!("[profile {name:<34} {secs:>7.2} s  {calls:>6} calls  {:>8.2} ms/token]", secs * 1000.0 / (tokens + 1) as f64));
         }
-        v.push(format!("[host waited {:.2} s for the routers' logits, chose the experts in {:.2} s; {} experts read from the file]",
-                       engine::ROUTER_WAIT_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9,
-                       engine::ROUTE_HOST_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9, self.file_reads()));
+        let ld = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9;
+        v.push(format!("[host waited {:.2} s for the routers' logits, chose the experts in {:.2} s; {} experts read from the file in {:.2} s; decode's turns from \
+                        logits to products queued {:.2} s]", ld(&engine::ROUTER_WAIT_NS), ld(&engine::ROUTE_HOST_NS), self.file_reads(), ld(&engine::FILE_NS),
+                       ld(&engine::TURN_NS)));
         if let Some(en) = &self.engram {
-            let (rows, cached, pages, waited) = en.stats();
-            v.push(format!("[engram: {rows} rows read ({pages} pages of 4 KiB, {:.1} MB), {cached} from the cache, the passes waited {waited:.2} s]",
-                           pages as f64 * 4096.0 / 1e6));
+            let (rows, cached, reads, bytes, mean, max, waited) = en.stats();
+            v.push(format!("[engram: {rows} rows read ({reads} reads, {:.1} MB, {mean:.0} us each on average, {max:.0} us the longest), {cached} from the cache, \
+                            the passes waited {waited:.2} s ({:.2} ms a pass token)]", bytes as f64 / 1e6, waited * 1e3 / (tokens + 1) as f64));
         }
         for (i, (peak, spills)) in engine::Ds41::arena_peaks(self).iter().enumerate() {
             v.push(format!("[arena {i}: peak {:.2} GiB, {spills} request(s) past it]", *peak as f64 / (1u64 << 30) as f64));

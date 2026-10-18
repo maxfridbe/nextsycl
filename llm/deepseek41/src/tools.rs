@@ -164,7 +164,7 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
             tab.write(0, &tb).map_err(e)?;
             let yd = DevBuf::f32(&g, 3 * rows).map_err(e)?;
             let t0 = std::time::Instant::now();
-            o.vq_mmv(&tab, 1, (&cbd, None), &xd, (&yd, 0), 3, rows, cols, nbit).map_err(e)?;
+            o.vq_mmv(&tab, 1, (&cbd, None), &xd, (&yd, 0), 3, rows, cols, nbit, 0).map_err(e)?;
             g.sync().map_err(e)?;
             let us = t0.elapsed().as_secs_f64() * 1e6;
             let y = yd.to_f32().map_err(e)?;
@@ -179,12 +179,12 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
                      format!("{} {}", t.name, ["gate", "up", "down"][which]), nbit);
         }
     }
-    // a decode layer's products: 6 experts' gate | up in one launch, their downs in another, one token (12-bit layer)
-    {
-        let l = 20u64;
+    // a decode layer's products: 6 experts' gate | up in one launch, their downs in another, one token - a 12-bit layer
+    // (20) and a 13-bit one (0); 8 sets of 6 experts in turn (the indices from VRAM, not L2, as in a pass), each variant
+    // of the kernel (NS_DS41_VQ_BENCH, default "0,1") against the first, after half a second of warm-up (the clocks up)
+    for l in [20u64, 0] {
         let t = m.tensor(l, Role::Experts).ok_or("no blob")?;
-        let n_e = 6usize;
-        let span = 6_700_000usize;
+        let (n_e, sets) = (6usize, 8usize);
         let raw = {
             let mut v = vec![0u8; (16 + 384 * 24) as usize];
             f.read_into(t, 0, &mut v).map_err(|e| e.0)?;
@@ -193,36 +193,48 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
         let slot = |x: usize, w: usize| u64::from_le_bytes(raw[16 + (x * 3 + w) * 8..24 + (x * 3 + w) * 8].try_into().unwrap());
         let mut ph = [0u8; 32];
         f.read_into(t, slot(0, 0), &mut ph).map_err(|e| e.0)?;
+        let ncb = u16::from_le_bytes([ph[6], ph[7]]) as usize;
+        let ncb = if ncb == 0 { 65536 } else { ncb };
+        let nbit = if ncb > 4096 { 13 } else { 12 };
         let cb_off = u64::from_le_bytes(ph[24..32].try_into().unwrap());
-        let mut cb = vec![0u8; 4096 * 8];
+        let mut cb = vec![0u8; ncb * 8];
         f.read_into(t, cb_off, &mut cb).map_err(|e| e.0)?;
         let cbd = DevBuf::new(&g, cb.len()).map_err(e)?;
         cbd.write(0, &cb).map_err(e)?;
-        let buf = DevBuf::new(&g, n_e * span).map_err(e)?;
-        let mut tb: Vec<u8> = Vec::new();
-        let mut meta: Vec<i32> = Vec::new();
-        let mut db: Vec<u8> = Vec::new();
-        let mut dmeta: Vec<i32> = Vec::new();
-        for x in 0..n_e {
-            let s0 = slot(x * 50, 0);
-            let len = (slot(x * 50, 2) - s0) as usize + 5120 * 2 + 32 + 5120 * 216 + 4;
-            let mut v = vec![0u8; len.min(span)];
-            f.read_into(t, s0, &mut v).map_err(|e| e.0)?;
-            buf.write(x * span, &v).map_err(e)?;
-            let base = buf.ptr() as u64 + (x * span) as u64;
-            for w in 0..2 {
-                tb.extend((base + slot(x * 50, w) - s0).to_le_bytes());
-                meta.extend([1, (w * n_e + x) as i32, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let span = (slot(1, 0) - slot(0, 0)) as usize;
+        let total = n_e * sets;
+        let buf = DevBuf::new(&g, total * span.next_multiple_of(256)).map_err(e)?;
+        let (mut gts, mut dts) = (Vec::new(), Vec::new());
+        for s in 0..sets {
+            let mut tb: Vec<u8> = Vec::new();
+            let mut meta: Vec<i32> = Vec::new();
+            let mut db: Vec<u8> = Vec::new();
+            let mut dmeta: Vec<i32> = Vec::new();
+            for x in 0..n_e {
+                let ex = s * n_e + x;
+                let src = ex * 7 + 3;
+                let s0 = slot(src, 0);
+                let mut v = vec![0u8; span];
+                f.read_into(t, s0, &mut v).map_err(|e| e.0)?;
+                let at = ex * span.next_multiple_of(256);
+                buf.write(at, &v).map_err(e)?;
+                let base = buf.ptr() as u64 + at as u64;
+                for w in 0..2 {
+                    tb.extend((base + slot(src, w) - s0).to_le_bytes());
+                    meta.extend([1, (w * n_e + x) as i32, 0, 0, 0, 0, 0, 0, 0, 0]);
+                }
+                db.extend((base + slot(src, 2) - s0).to_le_bytes());
+                dmeta.extend([1, x as i32, x as i32, 0, 0, 0, 0, 0, 0, 0]);
             }
-            db.extend((base + slot(x * 50, 2) - s0).to_le_bytes());
-            dmeta.extend([1, x as i32, x as i32, 0, 0, 0, 0, 0, 0, 0]);
+            tb.extend(meta.iter().flat_map(|v| v.to_le_bytes()));
+            db.extend(dmeta.iter().flat_map(|v| v.to_le_bytes()));
+            let gt = DevBuf::new(&g, tb.len()).map_err(e)?;
+            gt.write(0, &tb).map_err(e)?;
+            let dt = DevBuf::new(&g, db.len()).map_err(e)?;
+            dt.write(0, &db).map_err(e)?;
+            gts.push(gt);
+            dts.push(dt);
         }
-        tb.extend(meta.iter().flat_map(|v| v.to_le_bytes()));
-        db.extend(dmeta.iter().flat_map(|v| v.to_le_bytes()));
-        let gt = DevBuf::new(&g, tb.len()).map_err(e)?;
-        gt.write(0, &tb).map_err(e)?;
-        let dt = DevBuf::new(&g, db.len()).map_err(e)?;
-        dt.write(0, &db).map_err(e)?;
         let x: Vec<f32> = (0..d).map(|_| rnd()).collect();
         let xd = DevBuf::from_f32(&g, &x).map_err(e)?;
         let gu = DevBuf::f32(&g, 2 * n_e * ff).map_err(e)?;
@@ -231,22 +243,39 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
         let dn = DevBuf::f32(&g, n_e * d).map_err(e)?;
         let cbf = DevBuf::f32(&g, cb.len()).map_err(e)?;
         o.vq_codebook_f32(&cbd, cb.len(), &cbf).map_err(e)?;
-        let wf = std::env::var("NS_DS41_VQ_F32CB").map_or(true, |v| v != "0");
-        let cbs = (&cbd, if wf { Some(&cbf) } else { None });
-        for (name, tab, n, x, y, rows, cols) in [("gate | up", &gt, 2 * n_e, &xd, &gu, ff, d), ("down", &dt, n_e, &hd, &dn, d, ff)] {
-            for _ in 0..3 {
-                o.vq_mmv(tab, n, cbs, x, (y, 0), n, rows, cols, 12).map_err(e)?;
+        let cbh = DevBuf::new(&g, cb.len() * 2).map_err(e)?;
+        o.vq_codebook_f16(&cbd, cb.len(), &cbh).map_err(e)?;
+        let variants: Vec<i32> = std::env::var("NS_DS41_VQ_BENCH").unwrap_or_else(|_| "0,1".into()).split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        for (name, tabs, n, x, y, rows, cols) in [("gate | up", &gts, 2 * n_e, &xd, &gu, ff, d), ("down", &dts, n_e, &hd, &dn, d, ff)] {
+            let mut first: Option<Vec<f32>> = None;
+            for &v in &variants {
+                let t0 = std::time::Instant::now();
+                while t0.elapsed().as_secs_f64() < 0.5 {
+                    for tab in tabs.iter() {
+                        o.vq_mmv(tab, n, (&cbd, Some(if v >= 2 && v != 4 { &cbh } else { &cbf })), x, (y, 0), n, rows, cols, nbit, v).map_err(e)?;
+                    }
+                    g.sync().map_err(e)?;
+                }
+                let it = 40;
+                let t0 = std::time::Instant::now();
+                for i in 0..it {
+                    o.vq_mmv(&tabs[i % sets], n, (&cbd, Some(if v >= 2 && v != 4 { &cbh } else { &cbf })), x, (y, 0), n, rows, cols, nbit, v).map_err(e)?;
+                }
+                g.sync().map_err(e)?;
+                let us = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
+                o.vq_mmv(&tabs[0], n, (&cbd, Some(if v >= 2 && v != 4 { &cbh } else { &cbf })), x, (y, 0), n, rows, cols, nbit, v).map_err(e)?;
+                let got = y.view(0, n * rows * 4).map_err(e)?.to_f32().map_err(e)?;
+                let rel = match &first {
+                    Some(f0) => compare(&got, f0).0,
+                    None => {
+                        first = Some(got);
+                        0.0
+                    }
+                };
+                let bytes = n * rows * (cols * nbit / 64 + 2);
+                println!("vq_mmv v{v} {nbit}-bit {name:<10} {n} matrices [{rows} x {cols}], 1 token: {us:.1} us ({:.0} GB/s of indices), vs v{}: {rel:.1e}",
+                         bytes as f64 / us / 1e3, variants[0]);
             }
-            g.sync().map_err(e)?;
-            let it = 50;
-            let t0 = std::time::Instant::now();
-            for _ in 0..it {
-                o.vq_mmv(tab, n, cbs, x, (y, 0), n, rows, cols, 12).map_err(e)?;
-            }
-            g.sync().map_err(e)?;
-            let us = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
-            let bytes = n * rows * (cols * 12 / 64 + 2);
-            println!("vq_mmv {name:<10} {n} matrices [{rows} x {cols}], 1 token: {us:.1} us ({:.0} GB/s of indices)", bytes as f64 / us / 1e3);
         }
     }
     // the memory's own rate: 256 MiB copied by a kernel (a read and a write a byte)
