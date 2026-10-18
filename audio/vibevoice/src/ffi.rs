@@ -28,7 +28,7 @@ pub struct Api {
     pub swiglu_pairs: unsafe extern "C" fn(G, *const f32, i64, i64, *mut f32) -> c_int,
     pub gemm: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, P, c_int, i64, *const f32, c_int, *const f32, i64, *mut f32, i64, *mut f32, i64) -> c_int,
     pub gemm_scratch: unsafe extern "C" fn(i64, i64, i64) -> i64,
-    pub split: unsafe extern "C" fn(G, *const f32, i64, M, M) -> c_int,
+    pub split: unsafe extern "C" fn(G, *const f32, i64, c_int, M, M) -> c_int,
     pub norm_hist: unsafe extern "C" fn(G, *const f32, i64, *const f32, i64, i64, i64, *const f32, f32, *mut f32) -> c_int,
     pub block_mix: unsafe extern "C" fn(G, *const f32, *mut f32, i64, i64, i64, *const f32, *const f32, *const f32, *const f32, f32, *mut f32) -> c_int,
     pub shift: unsafe extern "C" fn(G, *mut f32, i64, i64, i64) -> c_int,

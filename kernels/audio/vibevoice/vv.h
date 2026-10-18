@@ -60,9 +60,10 @@ int ns_audio_vv_gemm(ns_gpu* g, const float* x, const void* xh, const void* xl, 
                      const float* bias, int epi, const float* gamma, int64_t ldg, float* out, int64_t ldo, float* part, int64_t part_len);
 /* The float32 scratch (part, part_len floats) the matrix engines' form of a product splits K with; 0: none */
 int64_t ns_audio_vv_gemm_scratch(int64_t M, int64_t N, int64_t K);
-/* x [n] float32 -> hi, lo bfloat16 [n]: hi = x rounded, lo = (x - hi) rounded (the matrix engines' form of x: with
- * xh / xl given, ns_audio_vv_gemm runs bfloat16 weights on them, K a multiple of 16, ldx of 8, rows past M readable) */
-int ns_audio_vv_split(ns_gpu* g, const float* x, int64_t n, void* hi, void* lo);
+/* x [n] float32 -> hi, lo [n] in the weights' type wt (bfloat16 1, half 0): hi = x rounded, lo = (x - hi) rounded (the
+ * matrix engines' form of x: with xh / xl given, ns_audio_vv_gemm runs half or bfloat16 weights on them, K a multiple
+ * of 16, ldx of 8, the rows of the last tile of 32 past M readable) */
+int ns_audio_vv_split(ns_gpu* g, const float* x, int64_t n, int wt, void* hi, void* lo);
 /* A block's first norm after its depthwise convolution's carried rows: cur [P + L, C] = prev's rows [prev_off,
  * prev_off + P) (the previous call's buffer), then norm(x[t]) * w for the L rows of x */
 int ns_audio_vv_norm_hist(ns_gpu* g, const float* prev, int64_t prev_off, const float* x, int64_t L, int64_t C, int64_t P, const float* w, float eps,

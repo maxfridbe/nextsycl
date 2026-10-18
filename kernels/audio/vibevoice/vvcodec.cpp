@@ -106,18 +106,19 @@ inline void epilogue(int epi, float* o, float v, const float* gamma, int64_t g) 
     }
 }
 
-// The same product on the matrix engines for bfloat16 weights, x given split into two bfloat16 parts (ns_audio_vv_split:
-// hi = x rounded, lo = x - hi rounded; together x to ~2^-17 of itself): both multiplied by the exact weights and summed
-// in float32 - float32 products to within ~1e-5, at the engines' rate. A work-group of 4 sub-groups computes 32 x 64 of
+// The same product on the matrix engines for bfloat16 (or half: T) weights, x given split into two parts of that type
+// (ns_audio_vv_split: hi = x rounded, lo = x - hi rounded; together x to ~2^-17 of itself in bfloat16, ~2^-22 in half): both multiplied by the exact weights and summed
+// in float32 - float32 products to within ~1e-5, at the engines' rate. A work-group of NSG (8) sub-groups computes 64 x 64 of
 // the output (each sub-group 8 rows x 4 tiles of 16): x's tiles read from memory (rows ldx apart: windows), W's staged
 // 32 values of K at a time in local memory as packed pairs (the engines' B layout). x's rows past M must be readable
 // (the caller's buffers have room) and K a multiple of 16.
 namespace jm = sycl::ext::oneapi::experimental::matrix;
 using bf16 = sycl::ext::oneapi::bfloat16;
 
+template <typename T, int NSG>
 void gemm_xmx(sycl::queue& q, const uint16_t* xh, const uint16_t* xl, int64_t M, int64_t ldx, int64_t K, const uint16_t* w, int64_t N, const float* bias,
               int epi, const float* gamma, int64_t ldg, float* out, int64_t ldo, float* part, int64_t ks) {
-    constexpr int SGS = 16, NSG = 4, WG = SGS * NSG, TM = 8 * NSG, TN = 64, TK = 32, NB = TN / 16;
+    constexpr int SGS = 16, WG = SGS * NSG, TM = 8 * NSG, TN = 64, TK = 32, NB = TN / 16;
     const int64_t gm = (M + TM - 1) / TM, gn = (N + TN - 1) / TN;
     // K in ks pieces (each a multiple of TK): with few output tiles, more work-groups share the work
     const int64_t kc = ((K + ks - 1) / ks + TK - 1) / TK * TK;
@@ -138,9 +139,9 @@ void gemm_xmx(sycl::queue& q, const uint16_t* xh, const uint16_t* xl, int64_t M,
             const int64_t mr = m0 + sgi * 8;
             for (int64_t k0 = kbeg; k0 < kend; k0 += TK) {
                 sycl::group_barrier(it.get_group());   // (the last step's readers done)
-                // W's [TN, TK / 2] pairs, neighbouring lanes on neighbouring pairs of a row
+                // W's [TN, TK / 2] pairs, neighbouring lanes on neighbouring rows (no two in one bank of local memory)
                 for (int e = 0; e < TN * TK / 2 / WG; ++e) {
-                    const int idx = e * WG + lid, nn = idx / (TK / 2), p = idx % (TK / 2);
+                    const int idx = e * WG + lid, nn = idx % TN, p = idx / TN;
                     const int64_t n = n0 + nn, k = k0 + 2 * p;
                     tl[p * TN + nn] = n < N && k < kend ? *reinterpret_cast<const uint32_t*>(w + n * K + k) : 0u;
                 }
@@ -148,16 +149,16 @@ void gemm_xmx(sycl::queue& q, const uint16_t* xh, const uint16_t* xl, int64_t M,
 #pragma unroll
                 for (int hk = 0; hk < TK / 16; ++hk) {
                     if (k0 + hk * 16 >= kend) break;
-                    jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> mh, ml;
+                    jm::joint_matrix<sycl::sub_group, T, jm::use::a, 8, 16, jm::layout::row_major> mh, ml;
                     jm::joint_matrix_load(sg, mh, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
-                                                      reinterpret_cast<const bf16*>(xh + mr * ldx + k0 + hk * 16)), (size_t) ldx);
+                                                      reinterpret_cast<const T*>(xh + mr * ldx + k0 + hk * 16)), (size_t) ldx);
                     jm::joint_matrix_load(sg, ml, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
-                                                      reinterpret_cast<const bf16*>(xl + mr * ldx + k0 + hk * 16)), (size_t) ldx);
+                                                      reinterpret_cast<const T*>(xl + mr * ldx + k0 + hk * 16)), (size_t) ldx);
 #pragma unroll
                     for (int j = 0; j < NB; ++j) {
-                        jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::ext_intel_packed> bm;
+                        jm::joint_matrix<sycl::sub_group, T, jm::use::b, 16, 16, jm::layout::ext_intel_packed> bm;
                         jm::joint_matrix_load(sg, bm, sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
-                                                          reinterpret_cast<bf16*>(tl + hk * 8 * TN + j * 16)), (size_t) (TN * 2));
+                                                          reinterpret_cast<T*>(tl + hk * 8 * TN + j * 16)), (size_t) (TN * 2));
                         jm::joint_matrix_mad(sg, acc[j], mh, bm, acc[j]);
                         jm::joint_matrix_mad(sg, acc[j], ml, bm, acc[j]);
                     }
@@ -190,10 +191,10 @@ void gemm_xmx(sycl::queue& q, const uint16_t* xh, const uint16_t* xl, int64_t M,
     }
 }
 
-// the split of K a matrix-engine product takes: doubled while the output's tiles (32 x 64) and pieces make fewer than
+// the split of K a matrix-engine product takes: doubled while the output's tiles (64 x 64) and pieces make fewer than
 // 256 work-groups and each piece keeps 128 values of K or more
 int64_t xmx_ks(int64_t M, int64_t N, int64_t K) {
-    const int64_t tiles = ((M + 31) / 32) * ((N + 63) / 64);
+    const int64_t tiles = ((M + 63) / 64) * ((N + 63) / 64);
     int64_t ks = 1;
     while (tiles * ks < 256 && K / (ks * 2) >= 128 && ks < 32) ks *= 2;
     return ks;
@@ -205,9 +206,62 @@ bool simt() {
     return v;
 }
 
-// a work-group's size for rows of C channels
-inline int row_wg(int64_t C) {
-    return C >= 1024 ? 256 : C >= 256 ? 128 : 64;
+// a row's work for the norms and the block's mixing: narrow rows (C <= 256) a sub-group of 16 each, 8 rows a work-group;
+// wide ones a work-group each (512 work-items from 2,048 channels: the low stage's single row spread wide)
+template <bool SGROW, typename F>
+void per_row(sycl::queue& q, int64_t rows, int64_t C, F f) {
+    if constexpr (SGROW) {
+        constexpr int R = 8;
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((rows + R - 1) / R) * R * 16), sycl::range<1>(R * 16)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = it.get_sub_group();
+            const int64_t r = it.get_group(0) * R + sg.get_group_linear_id();
+            if (r >= rows) return;   // (a whole sub-group: its reductions are its own)
+            f(r, (int) sg.get_local_linear_id(), 16, [&](float s) { return sycl::reduce_over_group(sg, s, sycl::plus<float>()); });
+        });
+    } else {
+        const int WG = C >= 2048 ? 512 : 256;
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+            f((int64_t) it.get_group(0), (int) it.get_local_id(0), WG,
+              [&](float s) { return sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()); });
+        });
+    }
+}
+
+template <bool SGROW>
+void norm_hist(sycl::queue& q, const float* prev, int64_t prev_off, const float* x, int64_t L, int64_t C, int64_t P, const float* w, float eps, float* cur) {
+    // a row of cur: the carried rows copied, the new ones normed
+    per_row<SGROW>(q, P + L, C, [=](int64_t r, int lid, int n, auto reduce) {
+        float* o = cur + r * C;
+        if (r < P) {
+            const float* s = prev + (prev_off + r) * C;
+            for (int64_t i = lid; i < C; i += n) o[i] = s[i];
+            return;
+        }
+        const float* xr = x + (r - P) * C;
+        float s = 0.0f;
+        for (int64_t i = lid; i < C; i += n) s += xr[i] * xr[i];
+        const float inv = sycl::rsqrt(reduce(s) / (float) C + eps);
+        for (int64_t i = lid; i < C; i += n) o[i] = xr[i] * inv * w[i];
+    });
+}
+
+template <bool SGROW>
+void block_mix(sycl::queue& q, const float* cur, float* x, int64_t L, int64_t C, int64_t K, const float* dw_w, const float* dw_b, const float* gamma,
+               const float* w2, float eps, float* h) {
+    per_row<SGROW>(q, L, C, [=](int64_t t, int lid, int n, auto reduce) {
+        float* xr = x + t * C;
+        float s = 0.0f;
+        for (int64_t c = lid; c < C; c += n) {
+            float a = dw_b ? dw_b[c] : 0.0f;
+            for (int64_t k = 0; k < K; ++k) a += dw_w[c * K + k] * cur[(t + k) * C + c];
+            const float v = xr[c] + gamma[c] * a;
+            xr[c] = v;
+            s += v * v;
+        }
+        const float inv = sycl::rsqrt(reduce(s) / (float) C + eps);
+        for (int64_t c = lid; c < C; c += n) h[t * C + c] = xr[c] * inv * w2[c];
+    });
 }
 }  // namespace
 
@@ -224,11 +278,11 @@ int ns_audio_vv_gemm(ns_gpu* g, const float* x, const void* xh, const void* xl, 
     if (M <= 0 || N <= 0) return 0;
     if (epi == NS_VV_SWIGLU) return ns_fail("ns_audio_vv_gemm: no SwiGLU (the small-batch product has it)");
     if (epi == NS_VV_RES && !gamma) return ns_fail("ns_audio_vv_gemm: a residual's layer scale");
-    if (wt == 0) gemm<0>(g->q, x, M, ldx, K, w, N, bias, epi, gamma, ldg, out, ldo);
-    else if (wt == 1 && xh && xl && K % 16 == 0 && ldx % 8 == 0 && !simt()) {
+    if ((wt == 0 || wt == 1) && xh && xl && K % 16 == 0 && ldx % 8 == 0 && !simt()) {
         const int64_t ks = part && part_len >= ns_audio_vv_gemm_scratch(M, N, K) ? xmx_ks(M, N, K) : 1;
-        gemm_xmx(g->q, (const uint16_t*) xh, (const uint16_t*) xl, M, ldx, K, (const uint16_t*) w, N, bias, epi, gamma, ldg, out, ldo, part, ks);
-    }
+        if (wt == 1) gemm_xmx<bf16, 8>(g->q, (const uint16_t*) xh, (const uint16_t*) xl, M, ldx, K, (const uint16_t*) w, N, bias, epi, gamma, ldg, out, ldo, part, ks);
+        else gemm_xmx<sycl::half, 8>(g->q, (const uint16_t*) xh, (const uint16_t*) xl, M, ldx, K, (const uint16_t*) w, N, bias, epi, gamma, ldg, out, ldo, part, ks);
+    } else if (wt == 0) gemm<0>(g->q, x, M, ldx, K, w, N, bias, epi, gamma, ldg, out, ldo);
     else if (wt == 1) gemm<1>(g->q, x, M, ldx, K, w, N, bias, epi, gamma, ldg, out, ldo);
     else if (wt == 3) gemm<3>(g->q, x, M, ldx, K, w, N, bias, epi, gamma, ldg, out, ldo);
     else return ns_fail("ns_audio_vv_gemm: weights half (0), bfloat16 (1) or float32 (3)");
@@ -236,17 +290,24 @@ int ns_audio_vv_gemm(ns_gpu* g, const float* x, const void* xh, const void* xl, 
     NS_CATCH
 }
 
-int ns_audio_vv_split(ns_gpu* g, const float* x, int64_t n, void* hi, void* lo) {
+extern "C++" template <typename T>
+void split(sycl::queue& q, const float* x, int64_t n, void* hi, void* lo) {
+    T* h = (T*) hi;
+    T* l = (T*) lo;
+    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const float v = x[id[0]];
+        const T a(v);
+        h[id[0]] = a;
+        l[id[0]] = T(v - (float) a);
+    });
+}
+
+int ns_audio_vv_split(ns_gpu* g, const float* x, int64_t n, int wt, void* hi, void* lo) {
     NS_TRY
     if (n <= 0) return 0;
-    bf16* h = (bf16*) hi;
-    bf16* l = (bf16*) lo;
-    g->q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const float v = x[id[0]];
-        const bf16 a(v);
-        h[id[0]] = a;
-        l[id[0]] = bf16(v - (float) a);
-    });
+    if (wt == 1) split<bf16>(g->q, x, n, hi, lo);
+    else if (wt == 0) split<sycl::half>(g->q, x, n, hi, lo);
+    else return ns_fail("ns_audio_vv_split: for half (0) or bfloat16 (1) weights");
     return 0;
     NS_CATCH
 }
@@ -255,24 +316,8 @@ int ns_audio_vv_norm_hist(ns_gpu* g, const float* prev, int64_t prev_off, const 
                           float* cur) {
     NS_TRY
     if (C <= 0 || L + P <= 0) return 0;
-    const int WG = row_wg(C);
-    // a work-group a row of cur: the carried rows copied, the new ones normed
-    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (P + L) * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
-        const int64_t r = it.get_group(0);
-        const int lid = (int) it.get_local_id(0);
-        float* o = cur + r * C;
-        if (r < P) {
-            const float* s = prev + (prev_off + r) * C;
-            for (int64_t i = lid; i < C; i += WG) o[i] = s[i];
-            return;
-        }
-        const float* xr = x + (r - P) * C;
-        float s = 0.0f;
-        for (int64_t i = lid; i < C; i += WG) s += xr[i] * xr[i];
-        s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
-        const float inv = sycl::rsqrt(s / (float) C + eps);
-        for (int64_t i = lid; i < C; i += WG) o[i] = xr[i] * inv * w[i];
-    });
+    if (C <= 256) norm_hist<true>(g->q, prev, prev_off, x, L, C, P, w, eps, cur);
+    else norm_hist<false>(g->q, prev, prev_off, x, L, C, P, w, eps, cur);
     return 0;
     NS_CATCH
 }
@@ -282,23 +327,8 @@ int ns_audio_vv_block_mix(ns_gpu* g, const float* cur, float* x, int64_t L, int6
     NS_TRY
     if (L <= 0 || C <= 0) return 0;
     if (K < 1 || K > 32) return ns_fail("ns_audio_vv_block_mix: a kernel of 1 to 32 taps");
-    const int WG = row_wg(C);
-    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) L * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
-        const int64_t t = it.get_group(0);
-        const int lid = (int) it.get_local_id(0);
-        float* xr = x + t * C;
-        float s = 0.0f;
-        for (int64_t c = lid; c < C; c += WG) {
-            float a = dw_b ? dw_b[c] : 0.0f;
-            for (int64_t k = 0; k < K; ++k) a += dw_w[c * K + k] * cur[(t + k) * C + c];
-            const float v = xr[c] + gamma[c] * a;
-            xr[c] = v;
-            s += v * v;
-        }
-        s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
-        const float inv = sycl::rsqrt(s / (float) C + eps);
-        for (int64_t c = lid; c < C; c += WG) h[t * C + c] = xr[c] * inv * w2[c];
-    });
+    if (C <= 256) block_mix<true>(g->q, cur, x, L, C, K, dw_w, dw_b, gamma, w2, eps, h);
+    else block_mix<false>(g->q, cur, x, L, C, K, dw_w, dw_b, gamma, w2, eps, h);
     return 0;
     NS_CATCH
 }

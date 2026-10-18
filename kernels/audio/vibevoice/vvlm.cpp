@@ -52,7 +52,7 @@ inline void epi_one(int epi, float* out, int64_t ldo, int m, int64_t n, float v,
 template <int WK, int MM, int KS>
 void gemv(sycl::queue& q, const float* x, int M, int64_t ldx, int64_t K, const void* w, const half* dq, int64_t N, const float* bias, int epi,
           const float* gamma, int64_t ldg, float* out, int64_t ldo) {
-    constexpr int R = 2, V = WK == 2 ? 16 : 8, RG = NSG / KS, ROWS = RG * R;
+    constexpr int R = MM >= 8 ? 4 : 2, V = WK == 2 ? 16 : 8, RG = NSG / KS, ROWS = RG * R;
     const int64_t groups = (N + ROWS - 1) / ROWS;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm(sycl::range<1>((size_t) (KS > 1 ? NSG * MM * R : 1)), h);
@@ -198,12 +198,15 @@ void gemv_m(sycl::queue& q, int ks, const float* x, int M, int64_t ldx, int64_t 
 
 // the split of K a shape gets (NS_VV_GEMV_KS overrides: a tuning switch): a matrix of few rows splits its long rows so
 // that every row group's sub-groups share them (the GPU has room for ~2,000 sub-groups at once)
-int pick_ks(int64_t N, int64_t K) {
+int pick_ks(int64_t M, int64_t N, int64_t K) {
     static const int force = [] { const char* v = std::getenv("NS_VV_GEMV_KS"); return v ? std::atoi(v) : 0; }();
     if (force > 0) return force;
     const int64_t sgs = (N + 1) / 2;
-    if (sgs >= 4096 || K < 1024) return 1;
-    if (sgs >= 1024) return 2;
+    // measured on the B70 (check --stages bench): the language model's, the head's and the tokenizers' shapes
+    if (K < 512) return 1;
+    if (M >= 4) return 4;
+    if (sgs >= 4096) return M == 1 && K >= 4096 ? 4 : 1;
+    if (sgs >= 384) return 2;
     return 4;
 }
 }  // namespace
@@ -218,7 +221,7 @@ int ns_audio_vv_gemv(ns_gpu* g, const float* x, int64_t M, int64_t ldx, int64_t 
     if (K % (wt == 2 ? 32 : 8) != 0 || ldx % 4 != 0) return ns_fail("ns_audio_vv_gemv: K a multiple of 8 (Q8_0: 32), rows 16-byte aligned");
     if (epi == NS_VV_SWIGLU && N % 2 != 0) return ns_fail("ns_audio_vv_gemv: SwiGLU takes interleaved gate / up rows (N even)");
     if (epi == NS_VV_RES && !gamma) return ns_fail("ns_audio_vv_gemv: a residual's layer scale");
-    const int ks = pick_ks(N, K);
+    const int ks = pick_ks(M, N, K);
     if (wt == 0) gemv_m<0>(g->q, ks, x, (int) M, ldx, K, w, nullptr, N, bias, epi, gamma, ldg, out, ldo);
     else if (wt == 1) gemv_m<1>(g->q, ks, x, (int) M, ldx, K, w, nullptr, N, bias, epi, gamma, ldg, out, ldo);
     else if (wt == 3) gemv_m<3>(g->q, ks, x, (int) M, ldx, K, w, nullptr, N, bias, epi, gamma, ldg, out, ldo);

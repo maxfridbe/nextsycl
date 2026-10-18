@@ -113,9 +113,9 @@ impl Lm {
         self.layers.iter().map(|l| l.qkv.bytes() + l.o.bytes() + l.gu.bytes() + l.down.bytes()).sum()
     }
 
-    /// Layer 0's matrices (a bench's): q / k / v, o, gate / up, down
-    pub fn mats(&self) -> [&Mat; 4] {
-        let l = &self.layers[0];
+    /// Layer i's matrices (a bench's): q / k / v, o, gate / up, down
+    pub fn mats(&self, i: usize) -> [&Mat; 4] {
+        let l = &self.layers[i];
         [&l.qkv, &l.o, &l.gu, &l.down]
     }
 

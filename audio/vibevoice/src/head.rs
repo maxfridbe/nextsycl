@@ -122,9 +122,9 @@ impl Head {
         self.cond.bytes() + self.mods.bytes() * steps.div_ceil(MOD_STEPS) + steps * step
     }
 
-    /// The matrices a bench times: the modulations, the first layer's gate / up and down
-    pub fn mats(&self) -> [&Mat; 3] {
-        [&self.mods, &self.layers[0].gu, &self.layers[0].down]
+    /// The matrices a bench times: the modulations, and each layer's gate / up and down
+    pub fn mats(&self) -> (&Mat, Vec<[&Mat; 2]>) {
+        (&self.mods, self.layers.iter().map(|l| [&l.gu, &l.down]).collect())
     }
 
     pub fn work(&self, ops: &Ops, steps: usize) -> Result<Work> {

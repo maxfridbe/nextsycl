@@ -171,6 +171,24 @@ impl Coder {
             + self.stages.iter().flatten().map(|b| b.l1.bytes() + b.l2.bytes() + b.dw_w.len).sum::<usize>()
     }
 
+    /// The products a bench times, with the rows a frame gives them: the low stages' (a few rows: weights read once)
+    pub fn bench_mats(&self) -> Vec<(String, &Mat, usize)> {
+        let mut v = Vec::new();
+        let mut l = if self.convs[0].ci == 1 { 3200 } else { 1 };
+        for (i, c) in self.all_convs().enumerate() {
+            let (m, _) = c.windows(l);
+            if m <= 8 {
+                v.push((format!("conv {i}"), &c.w, m));
+            }
+            l = c.out_rows(l);
+            if let Some(b) = self.stages.get(i).and_then(|s| s.first()).filter(|_| l <= 8) {
+                v.push((format!("stage {i} mlp1"), &b.l1, l));
+                v.push((format!("stage {i} mlp2"), &b.l2, l));
+            }
+        }
+        v
+    }
+
     /// The convolutions in order, the head last
     fn all_convs(&self) -> impl Iterator<Item = &Conv> {
         self.convs.iter().chain(std::iter::once(&self.head))

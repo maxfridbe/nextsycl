@@ -22,9 +22,9 @@ pub fn fp(b: &DevBuf, at: usize) -> *mut f32 {
 }
 
 /// The values a product's split input needs (Ops::prod): its m rows ldx apart of k, and the rows past m its last
-/// tile of 32 reads
+/// tile (of up to 64 rows) reads
 pub fn split_len(m: usize, ldx: usize, k: usize) -> usize {
-    (m + 32) * ldx + k
+    (m + 64) * ldx + k
 }
 
 /// A product's input split for the matrix engines (two bfloat16 buffers of at least split_len values) and the
@@ -145,13 +145,13 @@ impl Ops {
         let (gamma, ldg) = gamma.unwrap_or((std::ptr::null(), 0));
         let (mut xh, mut xl) = (std::ptr::null(), std::ptr::null());
         let (mut part, mut part_len) = (std::ptr::null_mut(), 0);
-        if let Some(Split { hi, lo, part: pb }) = split.filter(|_| w.wt == 1 && w.k.is_multiple_of(16) && ldx.is_multiple_of(8)) {
+        if let Some(Split { hi, lo, part: pb }) = split.filter(|_| w.wt <= 1 && w.k.is_multiple_of(16) && ldx.is_multiple_of(8)) {
             (part, part_len) = (pb.fp(), pb.floats());
             if hi.len.min(lo.len) < split_len(m, ldx, w.k) * 2 {
                 return Err(Error(format!("split buffers of {} bytes for {m} rows of {} ({ldx} apart)", hi.len.min(lo.len), w.k)));
             }
             // SAFETY: x holds (m - 1) * ldx + k floats (the caller's), hi / lo at least that many halves (checked).
-            ffi::check(unsafe { (self.k.split)(self.g(), x, ((m - 1) * ldx + w.k) as i64, hi.ptr(), lo.ptr()) }, "split")?;
+            ffi::check(unsafe { (self.k.split)(self.g(), x, ((m - 1) * ldx + w.k) as i64, w.wt as i32, hi.ptr(), lo.ptr()) }, "split")?;
             (xh, xl) = (hi.ptr() as *const c_void, lo.ptr() as *const c_void);
         }
         // SAFETY: the caller's buffers hold the sizes named; the split ones have room for the tiles' rows past m.

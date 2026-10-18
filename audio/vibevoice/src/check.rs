@@ -248,6 +248,68 @@ pub fn run(e: &VibeVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
         a.iter_mut().zip(&b).for_each(|(x, y)| *x += y);
         report(log, &mut worst, "next inputs (connectors)", &a, &want("embeds.npy")?);
     }
+    if stages.contains(&"bench") {
+        // the products a frame runs, a group of them at a time (one shape: every layer's, or both tokenizers'), each
+        // group swept 20 times (its matrices in turn, so the cache holds few of them, as in a frame): the time a call
+        // and its rate in GB/s of weights read
+        use crate::ops::{Epi, Mat};
+        let mut groups: Vec<(String, Vec<&Mat>, usize, Epi)> = Vec::new();
+        let ln = e.lm.layers();
+        for (j, (n, epi)) in [("lm qkv", Epi::Store), ("lm o", Epi::Acc), ("lm gate/up", Epi::Swiglu), ("lm down", Epi::Acc)].into_iter().enumerate() {
+            groups.push((n.into(), (0..ln).map(|i| e.lm.mats(i)[j]).collect(), 2, epi));
+        }
+        let (mods, hl) = e.head.mats();
+        groups.push(("head modulations".into(), vec![mods], 2 * steps.min(10), Epi::Store));
+        groups.push(("head gate/up".into(), hl.iter().map(|l| l[0]).collect(), 2, Epi::Swiglu));
+        groups.push(("head down".into(), hl.iter().map(|l| l[1]).collect(), 2, Epi::Acc));
+        let (dm, sm) = (e.dec.bench_mats(), e.sem.bench_mats());
+        for (n, m, rows) in dm.iter().chain(&sm) {
+            let key = n.split(' ').skip(1).collect::<Vec<_>>().join(" ");
+            match groups.iter_mut().find(|g| g.0 == format!("tokenizers {key} [{rows}, {}]", m.k)) {
+                Some(g) => g.1.push(m),
+                None => groups.push((format!("tokenizers {key} [{rows}, {}]", m.k), vec![m], *rows, Epi::Store)),
+            }
+        }
+        // the tokenizers' frame: 50 pushes of the decoder (a latent) and of the semantic encoder (a frame's samples)
+        {
+            let hop = e.cfg.hop();
+            let (ds, ss) = (e.dec.stream(ops, 1)?, e.sem.stream(ops, hop)?);
+            let (lin, sin) = (DevBuf::f32(g, lat)?, DevBuf::f32(g, hop)?);
+            lin.fill(0)?;
+            sin.fill(0)?;
+            for (name, c, s, x, l) in [("decoder", &e.dec, &ds, &lin, 1), ("semantic encoder", &e.sem, &ss, &sin, hop)] {
+                c.push(ops, &e.nsd, s, Some(x), l)?;
+                g.sync()?;
+                let t = Instant::now();
+                for _ in 0..50 {
+                    c.push(ops, &e.nsd, s, Some(x), l)?;
+                }
+                g.sync()?;
+                log(format!("{name:<44} a frame {:7.3} ms", t.elapsed().as_secs_f64() * 1e3 / 50.0));
+            }
+        }
+        let widest = groups.iter().flat_map(|(_, ms, r, _)| ms.iter().map(move |m| r * m.k.max(m.n))).max().unwrap_or(1);
+        let (x, out) = (DevBuf::f32(g, widest)?, DevBuf::f32(g, widest)?);
+        x.fill(0)?;
+        for (n, ms, rows, epi) in groups {
+            let sweep = |reps: usize| -> Result<()> {
+                for _ in 0..reps {
+                    for m in &ms {
+                        ops.gemv_epi(x.fp(), rows, m.k, m, out.fp(), m.n, epi, None)?;
+                    }
+                }
+                Ok(())
+            };
+            sweep(2)?;
+            g.sync()?;
+            let t = Instant::now();
+            sweep(20)?;
+            g.sync()?;
+            let us = t.elapsed().as_secs_f64() * 1e6 / (20 * ms.len()) as f64;
+            let bytes = ms[0].bytes() as f64;
+            log(format!("{n:<44} x{:<2} [{rows}, {}] x {} ({:.1} MB): {us:7.1} us  {:5.0} GB/s", ms.len(), ms[0].k, ms[0].n, bytes / 1e6, bytes / us / 1e3));
+        }
+    }
     if stages.contains(&"run") {
         let noise = want("noise.npy")?;
         let wl = want("latents.npy")?;
