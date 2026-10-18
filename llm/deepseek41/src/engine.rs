@@ -1031,6 +1031,9 @@ struct Comp {
 struct Att {
     raw: DevBuf,
     comp: Option<Comp>,
+    /// a kv source whose readers continue on the next GPU (a split past it, at an index source): its compressed and
+    /// indexer keys copied there each pass
+    mirror: Option<Comp>,
 }
 
 /// the compressor's ring of a ratio-2 source: the block being built, and a verify pass rolled back
@@ -1148,6 +1151,12 @@ pub struct Ds41<'g> {
     prof: Option<Mutex<BTreeMap<&'static str, (f64, u64)>>>,
     /// the towers are loaded (on the last part)
     pub mtp: bool,
+    /// the kv source mirrored on the second GPU (the parts split at an index source after it)
+    mirror_src: Option<u64>,
+    /// a pipelined prompt's candidate blocks for the second GPU, a chunk's at a time in order (the first stage runs a
+    /// chunk ahead: its blocks must not land while the second GPU still reads the chunk before's)
+    cand_q: Mutex<std::collections::VecDeque<Vec<u8>>>,
+    pipelining: std::sync::atomic::AtomicBool,
 }
 
 /// the decode products' kernel variants (ds41.h: ns_ds41_vq_mmv): 0 a sub-group a row (float32 codebook), 1 a lane a row
@@ -1548,9 +1557,17 @@ impl<'g> Ds41<'g> {
         if cuts.len() + 1 != k {
             return Err(Error(format!("NS_SPLIT: {} layer counts for {k} GPUs", cuts.len())));
         }
+        let mut mirror_src = None;
         for c in cuts {
-            if c <= *bounds.last().unwrap() || c >= n || (g.kv_source(c).is_some() && !g.kv_sources.contains(&c)) {
-                return Err(Error(format!("a split at layer {c}: a part must begin at a kv source ({:?}) or before the compressed layers", g.kv_sources)));
+            // a part begins at a kv source, before the compressed layers, or (two GPUs) at an index source: its source's
+            // keys mirrored on the second GPU
+            let at_index = k == 2 && g.index_sources.contains(&c) && g.kv_source(c).is_some();
+            if c <= *bounds.last().unwrap() || c >= n || (g.kv_source(c).is_some() && !g.kv_sources.contains(&c) && !at_index) {
+                return Err(Error(format!("a split at layer {c}: a part must begin at a kv source ({:?}), an index source ({:?}, two GPUs) or before the \
+                                          compressed layers", g.kv_sources, g.index_sources)));
+            }
+            if at_index && !g.kv_sources.contains(&c) {
+                mirror_src = g.kv_source(c);
             }
             bounds.push(c);
         }
@@ -1576,7 +1593,11 @@ impl<'g> Ds41<'g> {
                     b += (kv.0 / r + 1) * (512 + g.idx_dim as usize) * 2;
                 }
                 b
-            }).sum::<usize>() * kv.1 + if last && mtp { kv.1 * 3 * MTP_WIN * 1024 } else { 0 };
+            }).sum::<usize>() * kv.1 + if last && mtp { kv.1 * 3 * MTP_WIN * 1024 } else { 0 }
+                + match mirror_src {
+                    Some(sl) if i == 1 => (kv.0 / g.ratio(sl) as usize + 1) * (512 + g.idx_dim as usize) * 2 * kv.1,
+                    _ => 0,
+                };
             if reserve > 0 {
                 log(format!("{}: {:.2} GiB held for the sessions' {} tokens", gpu.name, gib(reserve), kv.0 * kv.1));
             }
@@ -1592,7 +1613,11 @@ impl<'g> Ds41<'g> {
         };
         let load_bytes = parts.iter().map(|p| p.weight_bytes).sum();
         let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(BTreeMap::new()));
-        Ok(Ds41 { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, engram, prof, mtp })
+        if let Some(sl) = mirror_src {
+            log(format!("layers {}.. on the second GPU: kv source {sl}'s keys mirrored there", bounds[1]));
+        }
+        Ok(Ds41 { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, engram, prof, mtp, mirror_src, cand_q: Mutex::new(Default::default()),
+                  pipelining: std::sync::atomic::AtomicBool::new(false) })
     }
 
     pub fn gpu_info(&self) -> Vec<GpuInfo> {
@@ -1686,7 +1711,14 @@ impl<'g> Ds41<'g> {
             } else {
                 None
             };
-            layers.push(Att { raw, comp });
+            let mirror = if self.mirror_src == Some(l) {
+                let r = g.ratio(l) as usize;
+                let gpu = &self.parts[1].ops.gpu;
+                Some(Comp { ratio: r, cache: DevBuf::new(gpu, (max_ctx / r + 1) * 512 * 2)?, ring: None, idx: DevBuf::new(gpu, (max_ctx / r + 1) * g.idx_dim as usize * 2)? })
+            } else {
+                None
+            };
+            layers.push(Att { raw, comp, mirror });
         }
         let mtp = if self.mtp {
             let gpu = &self.parts.last().unwrap().ops.gpu;
@@ -1758,29 +1790,38 @@ impl<'g> Ds41<'g> {
             return Err(Error(format!("restore: a checkpoint of {} tokens into a session of {}", ck.pos, sess.max_ctx)));
         }
         let mut it = ck.bufs.iter();
-        let mut put = |b: &DevBuf, at: usize| -> Result<()> {
-            let v = it.next().ok_or("restore: the checkpoint is short")?;
-            if !v.is_empty() {
-                b.write(at, v)?;
-            }
-            Ok(())
-        };
         for a in &sess.layers {
             let runs = Self::window_runs(ck.pos);
             for k in 0..2 {
-                put(&a.raw, runs.get(k).map_or(0, |r| r.0))?;
+                let v = it.next().ok_or("restore: the checkpoint is short")?;
+                if !v.is_empty() {
+                    a.raw.write(runs.get(k).map_or(0, |r| r.0), v)?;
+                }
             }
             if let Some(c) = &a.comp {
-                put(&c.cache, 0)?;
-                put(&c.idx, 0)?;
+                let (cache, idx) = (it.next().ok_or("restore: the checkpoint is short")?, it.next().ok_or("restore: the checkpoint is short")?);
+                for cc in [Some(c), a.mirror.as_ref()].into_iter().flatten() {
+                    if !cache.is_empty() {
+                        cc.cache.write(0, cache)?;
+                    }
+                    if !idx.is_empty() {
+                        cc.idx.write(0, idx)?;
+                    }
+                }
                 if let Some(r) = &c.ring {
-                    put(r, 0)?;
+                    let v = it.next().ok_or("restore: the checkpoint is short")?;
+                    if !v.is_empty() {
+                        r.write(0, v)?;
+                    }
                 }
             }
         }
         if let Some(ms) = &sess.mtp {
             for r in &ms.rings {
-                put(r, 0)?;
+                let v = it.next().ok_or("restore: the checkpoint is short")?;
+                if !v.is_empty() {
+                    r.write(0, v)?;
+                }
             }
         }
         let toks = it.next().ok_or("restore: the checkpoint has no tokens")?;
@@ -1824,6 +1865,13 @@ impl<'g> Ds41<'g> {
                     dr.copy_within(0, sr, 0, sr.len)?;
                 }
             }
+            if let (Some(dm), Some(sm)) = (&d.mirror, &s.mirror) {
+                let nb = src.pos / sm.ratio;
+                if nb > 0 {
+                    dm.cache.copy_within(0, &sm.cache, 0, nb * 512 * 2)?;
+                    dm.idx.copy_within(0, &sm.idx, 0, nb * idx_d * 2)?;
+                }
+            }
         }
         if let (Some(dm), Some(sm)) = (dst.mtp.as_mut(), src.mtp.as_ref()) {
             for (d, s) in dm.rings.iter().zip(&sm.rings) {
@@ -1835,6 +1883,50 @@ impl<'g> Ds41<'g> {
         dst.hist = src.hist.clone();
         dst.pos = src.pos;
         dst.snapped = None;
+        Ok(())
+    }
+
+    /// The pass's new rows of kv source l's compressed and indexer keys (and the candidate blocks it kept, when it did)
+    /// onto the second GPU: read back here (the host waits for the source anyway, at the next router), queued there
+    /// through its pinned ring
+    fn mirror_up(&self, l: u64, a: &Att, pos0: usize, t: usize, cand: bool) -> Result<()> {
+        let (Some(c), Some(m)) = (&a.comp, &a.mirror) else { return Ok(()) };
+        let g = &self.m.g;
+        let p1 = &self.parts[1];
+        let (j0, j1) = (pos0 / c.ratio, (pos0 + t) / c.ratio);
+        let id = g.idx_dim as usize;
+        let piece = 1 << 20;
+        let mut v = Vec::new();
+        for (src, dst, w) in [(&c.cache, &m.cache, 512 * 2), (&c.idx, &m.idx, id * 2)] {
+            let (at, len) = (j0 * w, (j1 - j0) * w);
+            if len == 0 {
+                continue;
+            }
+            v.resize(len, 0);
+            src.read(at, &mut v)?;
+            for (k, ch) in v.chunks(piece).enumerate() {
+                p1.upload(&dst.view(at + k * piece, ch.len())?, ch)?;
+            }
+        }
+        let mut blocks = Vec::new();
+        if cand && g.cand_source == Some(l) {
+            blocks.resize(t * g.cand_top as usize * 4, 0);
+            self.parts[0].cand.read(0, &mut blocks)?;
+        }
+        if self.pipelining.load(std::sync::atomic::Ordering::Relaxed) {
+            self.cand_q.lock().unwrap().push_back(blocks);
+        } else {
+            self.cand_in(&blocks)?;
+        }
+        Ok(())
+    }
+
+    /// A pass's candidate blocks into the second GPU's (empty: none kept)
+    fn cand_in(&self, blocks: &[u8]) -> Result<()> {
+        let p1 = &self.parts[1];
+        for (k, ch) in blocks.chunks(1 << 20).enumerate() {
+            p1.upload(&p1.cand.view(k * (1 << 20), ch.len())?, ch)?;
+        }
         Ok(())
     }
 
@@ -2037,7 +2129,10 @@ impl<'g> Ds41<'g> {
         if let Some(c) = &st.comp {
             self.compress(p, l, x, c, pos0, t, &mut *tap)?;
         }
-        let comp = src.and_then(|s| layers[s as usize].comp.as_ref());
+        let comp = src.and_then(|s| {
+            let a = &layers[s as usize];
+            if self.owner[s as usize] != self.owner[l as usize] { a.mirror.as_ref() } else { a.comp.as_ref() }
+        });
         if g.index_sources.contains(&l) {
             let c = comp.ok_or("an index source without its kv source's keys")?;
             sh.sel = self.select(p, l, x, &qr, c, pos0, t, sh, &mut *tap)?;
@@ -2167,6 +2262,13 @@ impl<'g> Ds41<'g> {
                   DevBuf::f32(gpu, t * 24)?];
         let attn_pre = DevBuf::f32(gpu, t * 4)?;
         let mut sh = Shared::default();
+        // a part after the candidate source on another GPU: its blocks (copied over) hold when that source kept them
+        if let (Some(cs), Some(ms)) = (g.cand_source, self.mirror_src) {
+            if cs == ms && run.1 > cs && self.owner[cs as usize] != run.0 {
+                let n = (pos0 + t) / g.ratio(cs) as usize;
+                sh.cand = n > g.idx_top_k as usize && n.div_ceil(g.cand_block as usize) > g.cand_top as usize;
+            }
+        }
         let keep = t.min(MTP_KEEP);
         for l in run.1..run.2 {
             let lt0 = Instant::now();
@@ -2194,6 +2296,9 @@ impl<'g> Ds41<'g> {
             o.kcopy(&attn_pre, 0, pre_out, 0, t * 16)?;
             tap(&format!("attn_norm-{l}"), normed)?;
             let att = self.timed(p, "attention", || self.attention(p, l, normed, layers, pos0, t, &mut sh, &mut *tap))?;
+            if self.mirror_src == Some(l) {
+                self.mirror_up(l, &layers[l as usize], pos0, t, sh.cand)?;
+            }
             o.hc_post(&att, &xs, post, comb, x1, t, d)?;
             tap(&format!("hc_attn_post-{l}"), &x1.view(0, t * 4 * d * 4)?)?;
             self.timed(p, "hc", || self.hc_half(p, l, Role::HcFfnFn, Role::HcFfnBase, Role::HcFfnScale, Role::FfnNorm, x1, &attn_pre, &ws, t))?;
@@ -2301,6 +2406,8 @@ impl<'g> Ds41<'g> {
         let layers: &[Att] = layers;
         let hist: &[u32] = hist;
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(1);
+        self.pipelining.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cand_q.lock().unwrap().clear();
         let done = std::thread::scope(|sc| -> Result<(usize, Vec<f32>)> {
             let ahead = sc.spawn(move || {
                 let mut none = |_: &str, _: &DevBuf| Ok(());
@@ -2340,6 +2447,10 @@ impl<'g> Ds41<'g> {
                 let waited = tw.elapsed().as_secs_f64();
                 let step = (|| -> Result<Vec<f32>> {
                     let v = v?;
+                    if self.mirror_src.is_some() {
+                        let blocks = self.cand_q.lock().unwrap().pop_front().unwrap_or_default();
+                        self.cand_in(&blocks)?;
+                    }
                     let x = DevBuf::new(&p1.ops.gpu, v.len())?;
                     x.write(0, &v)?;
                     let eng = Vec::new();
@@ -2365,7 +2476,9 @@ impl<'g> Ds41<'g> {
             drop(rx);
             ahead.join().map_err(|_| Error("the pipeline's first stage panicked".into()))?;
             out.map(|l| (at - start, l))
-        })?;
+        });
+        self.pipelining.store(false, std::sync::atomic::Ordering::Relaxed);
+        let done = done?;
         sess.pos += done.0;
         sess.hist.truncate(sess.pos);
         sess.snapped = None;
