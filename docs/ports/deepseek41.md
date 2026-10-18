@@ -42,14 +42,16 @@ malformed prompts; the parity checks did not (they read the reference's token id
 
 | | before (60e5c08) | now |
 |---|---|---|
-| prompt, 39 tokens | 12.8 tok/s | 34 tok/s |
-| prompt, 2.3K | 144 tok/s | 348 tok/s |
-| prompt, 8.7K | 203 tok/s | 463-510 tok/s |
-| prompt, 35K | 138.5 tok/s | 476-481 tok/s |
-| decode (served, no drafts) | 20.5-21.1 tok/s | 19.3-21.9 tok/s |
-| Engram wait a decode token | 1.3-1.9 ms (2TB SATA-class NVMe) | 0.11 ms |
+| prompt, 16-21 tokens (served, after the first) | ~0.7 s for 41-65 tokens on malformed prompts | 0.6-0.7 s |
+| prompt, 2.3K | 144 tok/s | 323-384 tok/s |
+| prompt, 8.7K | 203 tok/s | 466-532 tok/s |
+| prompt, 35K | 138.5 tok/s | 581-586 tok/s (the needle found) |
+| decode, no drafts (256 tokens) | 20.5-21.1 tok/s (malformed prompts) | 19-21 tok/s |
+| Engram wait a decode token | 1.3-1.9 ms (the old SATA-class drive) | 0.11 ms |
 
-What made the prompt pass faster (9cb15f0, da9953f):
+Run to run the same command varies by about 5-7%; the ranges are of several runs.
+
+What made the prompt pass faster (9cb15f0, da9953f, 4da3366, 2f55e3a, e4f0490):
 
 1. **The experts on XMX straight from their indices** (`ns_ds41_vq_gemm`): each lane decodes its weight row's 16 values
    a step into a packed fp16 B tile's registers (the layout glm5next probed), 4 K slices a work-group, 8 token tiles a
@@ -61,29 +63,46 @@ What made the prompt pass faster (9cb15f0, da9953f):
    a layer of a 2K chunk); now every layer has the same share of VRAM, pinned memory and the file.
 4. **The file's experts read on 8 threads** into 64 pinned slots while the GPU works; each chunk's Engram rows asked
    for a chunk ahead.
+5. **Short prompts' dense products 8 rows a launch** through the decode kernel (below 64 rows the expansion was to
+   float32: q_b alone 168 MB a pass).
+6. **The indexer's scores on XMX** (deepseek4's kernel copied for 32 heads and the ratio): 35K 476 -> 581 tok/s.
+7. **0.75 GiB kept free beyond the plan instead of 1.5** (the plan's pass reserve is generous: 2.2-2.4 GiB measured
+   free at the peak): ~100 more experts in VRAM a card, decode +4-9%.
 
-Where a 2K chunk's layer goes now (NS_DS41_PIPE_LOG=2): attention 25 ms (B70) / 40 ms (B65), experts 80-100 / 95-135
-ms; the B65 bounds the pipeline. The decode products got a lookup-table variant (each 8 values of x against every
-codebook entry in local memory), timed at load with the others: the B65 takes it (12-bit gate | up 418 -> 328 us).
+Where a 2K chunk's layer goes (NS_DS41_PIPE_LOG=2): B70 attention 25 ms, its VRAM experts 23-27 ms, the copied waves
+51-66 ms (copies and products overlapped); B65 attention 40 ms, VRAM experts 42-51 ms, waves 58-71 ms. A short prompt
+moves ~7 GB of host and file experts (the floor of its ~0.6 s).
+
+Tried and left off (each measured; docs/environment.md has the switches): the XMX product with 2 or 4 row tiles and
+8 / 16 K slices (within noise end to end), the q4_K nibbles to floats by their bits (B65 one column no faster), a
+short prompt's next-layer file reads from its router's guess (no change: 0.6-0.7 s either way), more layers on the
+B70 (NS_SPLIT=24 / 28 with the kv source's keys mirrored on the B65: slower - the B70's VRAM is the binding limit),
+the VQ decode lookup table's run count. The decode VQ lookup-table variant (each 8 values of x against every
+codebook entry in local memory) is timed at load with the others: the B65 takes it (12-bit gate | up 418 -> 328 us).
 
 ## MTP (the DSpark towers)
 
-Off by default (NS_DS41_MTP=1 loads them): measured before the tokenizer fix, drafts 2 kept 80% on code but ran at
-16.5 tok/s against 18.0 without; 43% on prose (12.6 against 18.7). A verify pass of 3 rows costs ~2.7 one-token passes:
-3 tokens route to ~2.5x the experts, and the q4_K decode products re-decode their weights for each column. To
-re-measure with well-formed prompts.
+Off by default (NS_DS41_MTP=1). With well-formed prompts, 256 tokens --ignore-eos, two runs each: code without drafts
+19.0 / 18.4 tok/s, 1 draft 18.2 / 18.1 (82% kept), 2 drafts 17.9 / 19.8 (78%); prose 19.9 / 19.0, 1 draft 16.7 / 16.6
+(55%), 2 drafts 15.3 / 15.1 (50%). A verify pass's q4_K products now decode each weight once for all its columns
+(q4k_cols; spec-check: 0 of 138 three-row rows differ, max |diff| 0), and with the towers loaded the VQ lookup table is
+left out (it is built a column at a time). The cost left is the experts: 2-3 tokens route to about twice the experts
+of one.
 
 ## Placement and memory (served at 131K context)
 
-- VRAM: B70 layers 0-19 (17.1 + 6.8 GiB of experts), B65 layers 20-39 + the head (23.9 GiB); 1.5 GiB kept free a
-  card; the staging ring 0.16 GiB a card.
-- Pinned host memory: 40 GiB of experts (NS_DS41_PIN_GIB) + the file slots (0.44 GiB a card).
-- The file: ~10 GiB of experts read when needed; the Engram's 203 GB read a row at a time (238K reads/s at QD 48 on the
+- VRAM: B70 layers 0-19 (16.8 + 6.7 GiB of experts), B65 layers 20-39 + the head (23.6 GiB); 0.75 GiB kept free
+  beyond the plan (2.2 GiB measured free at the peak); the staging ring 0.16 GiB a card.
+- Pinned host memory: ~44 GiB of experts + the file slots (0.44 GiB a card).
+- The file: ~7 GiB of experts read when needed; the Engram's 203 GB read a row at a time (238K reads/s at QD 48 on the
   P310, 80 us a read alone).
 
 ## Open
 
-- Prompt: the per-layer copies and products still add up rather than overlap fully; a chunk-wide expert prefetch or
-  a split putting more layers on the B70 (the kv-source layers 2, 8, 14, 20 bound where a part may begin) are next.
-- MTP: a q4_K decode product that decodes each weight once for all of a verify pass's columns.
+- Decode (~20 tok/s against V4's 25.6): the B65's q4_K products are ALU-bound (q_b 252 GB/s against the B70's 478;
+  its 1,280 columns leave 4 of 16 lanes a second pass), the VQ products ~20 ms a token on both cards, the swaps' down
+  copy before each up (a pool of free VRAM slots would take it off the critical path), the host's turn from router
+  logits to queued products (~2.6 ms a token).
+- Prompt: the XMX expert product decodes each expert once a 32-token tile; one decode for all of an expert's tokens
+  (local memory, many token tiles) is the next kernel.
 - Vision (the sidecar GGUF).
