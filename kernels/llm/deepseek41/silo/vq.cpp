@@ -13,6 +13,7 @@
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -409,6 +410,86 @@ void vq_gemm_run(sycl::queue& q, const uint8_t* p0, const uint8_t* p1, int64_t s
         });
     });
 }
+
+// RT row tiles a sub-group (a lane decodes rows r, r + 16, ...): each A tile loaded meets RT B tiles - the A loads (x
+// read again by every row tile of the matrix) were what the one-tile form spent most on, the B65 more than the B70
+template <bool PLANE, int MT, int KS, int RT>
+void vq_gemm_rt(sycl::queue& q, const uint8_t* p0, const uint8_t* p1, int64_t split, int64_t rows, int64_t cols, const sycl::half* cbh,
+                const sycl::half* x, int64_t ldx, int64_t n, float* y, int64_t ldy) {
+    const int64_t rgroups = rows / (16 * RT), ttiles = (n + 8 * MT - 1) / (8 * MT), units = cols / 64, ups = (units + KS - 1) / KS;
+    auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<(RT * MT > 8 ? 256 : 128)>};
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> cs(sycl::range<1>(KS * RT * MT * 128), h);
+        h.parallel_for(sycl::nd_range<1>(rgroups * ttiles * KS * 16, KS * 16), props, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const auto sg = it.get_sub_group();
+            const int s = (int) sg.get_group_id()[0], lane = (int) sg.get_local_id()[0];
+            const int64_t gi = it.get_group(0), tt = gi % ttiles, rg = gi / ttiles;
+            const uint32_t* srow[RT];
+            const uint8_t* prow[RT];
+#pragma unroll
+            for (int t = 0; t < RT; ++t) {
+                const int64_t r = (rg * RT + t) * 16 + lane;
+                const bool second = r >= split;
+                const int64_t mr = second ? rows - split : split, rr = second ? r - split : r;
+                const VqMat m = vq_open(second ? p1 : p0, mr, cols, PLANE ? 13 : 12);
+                srow[t] = reinterpret_cast<const uint32_t*>(m.stream + rr * m.mrow);
+                prow[t] = PLANE ? m.plane + rr * m.prow : nullptr;
+            }
+            const int64_t tok0 = tt * 8 * MT;
+            jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> acc[RT][MT];
+#pragma unroll
+            for (int t = 0; t < RT; ++t)
+#pragma unroll
+                for (int mm = 0; mm < MT; ++mm) jm::joint_matrix_fill(sg, acc[t][mm], 0.0f);
+            const int64_t ua = s * ups, ub = sycl::min<int64_t>(units, ua + ups);
+            for (int64_t u = ua; u < ub; ++u) {
+                uint32_t idx[RT][8];
+#pragma unroll
+                for (int t = 0; t < RT; ++t) chunk_idx(srow[t] + 3 * u, PLANE ? prow[t][u] : 0u, idx[t]);
+#pragma unroll
+                for (int kt = 0; kt < 4; ++kt) {
+                    jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> bm[RT];
+#pragma unroll
+                    for (int t = 0; t < RT; ++t) {
+                        const sycl::vec<sycl::half, 8> h0 = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(cbh + (size_t) idx[t][2 * kt] * 8);
+                        const sycl::vec<sycl::half, 8> h1 = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(cbh + (size_t) idx[t][2 * kt + 1] * 8);
+                        jm::joint_matrix_fill(sg, bm[t], sycl::half(0));
+                        int e = 0;
+                        jm::joint_matrix_apply(sg, bm[t], [&](sycl::half& hh) {
+                            hh = e < 8 ? h0[e & 7] : h1[e & 7];
+                            ++e;
+                        });
+                    }
+#pragma unroll
+                    for (int mm = 0; mm < MT; ++mm) {
+                        jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> am;
+                        jm::joint_matrix_load(sg, am, gm_gp(x + (tok0 + 8 * mm) * ldx + u * 64 + kt * 16), (size_t) ldx);
+#pragma unroll
+                        for (int t = 0; t < RT; ++t) jm::joint_matrix_mad(sg, acc[t][mm], am, bm[t], acc[t][mm]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < RT; ++t)
+#pragma unroll
+                for (int mm = 0; mm < MT; ++mm)
+                    jm::joint_matrix_store(sg, acc[t][mm], gm_lp(&cs[((s * RT + t) * MT + mm) * 128]), (size_t) 16, jm::layout::row_major);
+            sycl::group_barrier(it.get_group());
+            for (int o = (int) it.get_local_id(0); o < RT * MT * 128; o += KS * 16) {
+                const int t = o / (MT * 128), mm = (o / 128) % MT, ti = (o % 128) / 16, col = o % 16;
+                const int64_t tok = tok0 + 8 * mm + ti;
+                if (tok >= n) continue;
+                float v = 0.f;
+                for (int k = 0; k < KS; ++k) v += cs[((k * RT + t) * MT + mm) * 128 + ti * 16 + col];
+                const int64_t row = (rg * RT + t) * 16 + col;
+                const bool sec = row >= split;
+                const uint8_t* pp = sec ? p1 : p0;
+                const float gn = (float) reinterpret_cast<const sycl::half*>(pp + 32)[sec ? row - split : row] * 256.f;
+                y[tok * ldy + row] = v * gn;
+            }
+        });
+    });
+}
 }  // namespace
 
 extern "C" {
@@ -659,6 +740,19 @@ int ns_ds41_vq_gemm(ns_gpu* g, const void* p0, const void* p1, int64_t split, in
     // work-group); 2 / 3 as they with 4 K slices; 4 / 5 as 2 / 3 and past 32 tokens 8 token tiles a sub-group. B70 + B65,
     // an 8,734-token prompt: 379 / 415 / 435 / 421 / 441 / 472 tok/s (one run each: +-5%)
     static const int v = [] { const char* e = std::getenv("NS_DS41_VQ_GEMM_V"); return e ? std::atoi(e) : 5; }();
+#define VR(P, M, KS, R) vq_gemm_rt<P, M, KS, R>(g->q, a, b, split, rows, cols, ch, xh, ldx, n, y, ldy)
+    // 6: 2 row tiles a sub-group, 7: 4 (the large register file)
+    if (v == 6 || v == 7) {
+        const bool w = n > 32;
+        if (rows % (16 * (v == 7 ? 4 : 2)) != 0) return ns_fail("ns_ds41_vq_gemm: rows a multiple of the row tiles");
+        if (nbit > 12) {
+            if (v == 6) { if (w) VR(true, 8, 4, 2); else VR(true, 4, 4, 2); } else { if (w) VR(true, 8, 4, 4); else VR(true, 4, 4, 4); }
+        } else {
+            if (v == 6) { if (w) VR(false, 8, 4, 2); else VR(false, 4, 4, 2); } else { if (w) VR(false, 8, 4, 4); else VR(false, 4, 4, 4); }
+        }
+        return 0;
+    }
+#undef VR
 #define VG(P, M, KS, D) vq_gemm_run<P, M, KS, D>(g->q, a, b, split, rows, cols, ch, xh, ldx, n, y, ldy)
     // past 32 tokens, 8 token tiles a sub-group (each decoded row meets 64 tokens)
     const bool wide = n > 32 && v >= 4;

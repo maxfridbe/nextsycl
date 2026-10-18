@@ -628,6 +628,17 @@ impl Part {
         if !acc && t <= MMVQ_COLS && w.ty == GType::Q4K && q4k_own() {
             return o.q4k_mv(&w.buf, w.rows, w.cols, x, None, y, t);
         }
+        // a short prompt's rows 8 at a time through the decode product: below the fp16 GEMM's rows the expansion was
+        // to float32, the whole matrix a pass (q_b: 168 MB written for a 21-token prompt)
+        if !acc && t < dense_f16_min() && w.ty == GType::Q4K && q4k_own() {
+            let mut r0 = 0;
+            while r0 < t {
+                let n = MMVQ_COLS.min(t - r0);
+                o.q4k_mv(&w.buf, w.rows, w.cols, (x.0, x.1 + r0 * x.2, x.2), None, (y.0, y.1 + r0 * y.2, y.2), n)?;
+                r0 += n;
+            }
+            return Ok(());
+        }
         if !acc && t <= MMVQ_COLS && contiguous && o.mmvq_supported(w.ty.code()) {
             o.quantize_q8_1((x.0, x.1), &self.q8, w.cols, t)?;
             return o.mmvq(w.ty.code(), (&w.buf, 0), w.buf.len, &self.q8, (y.0, y.1), w.cols, w.rows, t);
@@ -2068,10 +2079,17 @@ impl<'g> Ds41<'g> {
         let o = &p.ops;
         let (ng, ol, gw) = (g.o_groups as usize, g.o_lora as usize, (g.n_head * g.head_dim / g.o_groups) as usize);
         match p.groups.get(&l) {
-            Some(_) if tr <= MMVQ_COLS && q4k_own() => {
-                // every group in one launch: rows [g o_lora, ..) read their heads [g gw, ..) of att's row
+            Some(_) if tr < dense_f16_min() && q4k_own() => {
+                // every group in one launch: rows [g o_lora, ..) read their heads [g gw, ..) of att's row; 8 rows of att
+                // a launch
                 let w = p.mat(l, Role::OutA)?;
-                o.q4k_mv(&w.buf, w.rows, w.cols, (att, 0, ng * gw), Some((ol, gw)), (oa, r0 * ng * ol, ng * ol), tr)
+                let mut a = 0;
+                while a < tr {
+                    let n = MMVQ_COLS.min(tr - a);
+                    o.q4k_mv(&w.buf, w.rows, w.cols, (att, a * ng * gw, ng * gw), Some((ol, gw)), (oa, (r0 + a) * ng * ol, ng * ol), n)?;
+                    a += n;
+                }
+                Ok(())
             }
             Some(gm) => {
                 let perm = perm.view(0, tr * ng * gw * 4)?;
@@ -2851,7 +2869,13 @@ impl<'g> Ds41<'g> {
                         }
                         pending = Some(tk);
                     }
+                    let ts = Instant::now();
                     self.prompt_set(p, l, x, &lists, &first, &views, &resident, &dn, total)?;
+                    if pipe_split() {
+                        o.gpu.sync()?;
+                        eprintln!("[layer {l}: the {} experts in VRAM multiplied in {:.1} ms]", resident.len(), ts.elapsed().as_secs_f64() * 1e3);
+                    }
+                    let tw = Instant::now();
                     for (wi, wave) in waves.iter().enumerate() {
                         if let Some(Some(tk)) = pending.take() {
                             o.await_ticket(tk)?;
@@ -2872,7 +2896,12 @@ impl<'g> Ds41<'g> {
                             pending = Some(tk);
                         }
                     }
-                    join(&mut read)
+                    join(&mut read)?;
+                    if pipe_split() {
+                        o.gpu.sync()?;
+                        eprintln!("[layer {l}: {} waves of the others copied up and multiplied in {:.1} ms]", waves.len(), tw.elapsed().as_secs_f64() * 1e3);
+                    }
+                    Ok(())
                 })?;
                 // the ring's last readers: before the next layer's copies
                 *p.ring_free.lock().unwrap() = Some(o.mark()?);
