@@ -492,7 +492,12 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_PIN_GIB` | 40 | pinned host memory for the experts that do not fit VRAM (at most what is available less 12 GiB) | llm deepseek41 |
 | `NS_DS41_FREE_GIB` | 1.5 | VRAM each GPU keeps free beyond the plan (the xe driver has no out-of-memory path) | llm deepseek41 |
 | `NS_DS41_QSIM` | on | 0: the model's low-precision simulations (fp8 window keys and attention output, fp4 compressed and indexer keys) left out - a check against a reference without them | llm deepseek41 |
-| `NS_DS41_VQ_V` | measured | 0..4: the VQ decode products' kernel variant (0 a sub-group a row on the float32 codebook, 1 a lane a row on the bytes, 2 a lane a row on fp16, 3 a sub-group a row on fp16, 4 a lane a row two bytes at once) instead of the fastest of them timed at load | llm deepseek41 |
+| `NS_DS41_VQ_V` | measured | 0..5: the VQ decode products' kernel variant (0 a sub-group a row on the float32 codebook, 1 a lane a row on the bytes, 2 a lane a row on fp16, 3 a sub-group a row on fp16, 4 a lane a row two bytes at once, 5 by lookup table: each 8 values of x against every codebook entry in local memory) instead of the fastest of them timed at load | llm deepseek41 |
+| `NS_DS41_LUT_RUNS` | 16 | Experiment: the runs of 64-column units a row is split into by the VQ lookup-table variant (a work-group a run; their partials added after) | llm deepseek41 |
+| `NS_DS41_PROMPT_MMV` | 0 | a prompt pass's experts with at most this many of its tokens multiplied by the decode kernels (8 tokens an entry) instead of the XMX product from the indices (vq_gemm, faster at every count measured) | llm deepseek41 |
+| `NS_DS41_PROMPT_MMV_V` | 3 | the decode kernels' variant (NS_DS41_VQ_V's numbers) for those experts | llm deepseek41 |
+| `NS_DS41_PROMPT_RING` | 24 | a prompt pass's VRAM staging slots (a slot an expert, from each GPU's expert memory) for the experts in host memory or only in the file: copied up on the copy lane, half the ring a wave, while the others are multiplied (0: host-memory experts read in place, the file's swapped in) | llm deepseek41 |
+| `NS_DS41_VQ_GEMM_MAX` | 100000 | a prompt pass's experts past NS_DS41_PROMPT_MMV tokens and up to this many multiplied on XMX straight from their indices; more expanded to fp16 for a GEMM (0: all expanded) | llm deepseek41 |
 | `NS_DS41_VQ_BENCH` | 0,1 | `llm kernels`: the VQ decode variants it times | llm deepseek41 |
 | `NS_DS41_Q4K_R` | 4 | Experiment: rows a sub-group of decode's q4_K products (1, 2 or 4) | kernels:llm deepseek41 |
 | `NS_DS41_VQ_RPG` | 8 | Experiment: sub-groups a work-group of the VQ decode products | kernels:llm deepseek41 |

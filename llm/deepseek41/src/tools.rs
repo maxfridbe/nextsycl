@@ -164,7 +164,7 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
             tab.write(0, &tb).map_err(e)?;
             let yd = DevBuf::f32(&g, 3 * rows).map_err(e)?;
             let t0 = std::time::Instant::now();
-            o.vq_mmv(&tab, 1, (&cbd, None), &xd, (&yd, 0), 3, rows, cols, nbit, 0).map_err(e)?;
+            o.vq_mmv(&tab, 1, (&cbd, None), &xd, (&yd, 0), 3, rows, cols, nbit, 0, None).map_err(e)?;
             g.sync().map_err(e)?;
             let us = t0.elapsed().as_secs_f64() * 1e6;
             let y = yd.to_f32().map_err(e)?;
@@ -177,6 +177,55 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
             let (yrel, _) = compare(&y, &yw);
             println!("{:<26} {}-bit [{rows} x {cols}]: expanded rel err {rel:.2e} (max {mx:.2e}), 3-column product rel err {yrel:.2e} ({us:.0} us)",
                      format!("{} {}", t.name, ["gate", "up", "down"][which]), nbit);
+            // a prompt pass's product on XMX (ns_ds41_vq_gemm): 40 tokens of fp16 x, against the host's W x
+            let nt = 40usize;
+            let xs: Vec<f32> = (0..64 * cols).map(|_| rnd()).collect();
+            let xf = DevBuf::from_f32(&g, &xs).map_err(e)?;
+            let xh = DevBuf::new(&g, xs.len() * 2).map_err(e)?;
+            o.to_f16(&xf, &xh, xs.len()).map_err(e)?;
+            let mut x16 = vec![0u8; xs.len() * 2];
+            xh.read(0, &mut x16).map_err(e)?;
+            let xr: Vec<f32> = x16.chunks_exact(2).map(|c| nextsycl_gguf::safetensors::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+            let cbh = DevBuf::new(&g, cb.len() * 2).map_err(e)?;
+            o.vq_codebook_f16(&cbd, cb.len(), &cbh).map_err(e)?;
+            let yg = DevBuf::f32(&g, nt * rows).map_err(e)?;
+            o.vq_gemm(&pd, None, rows, rows, cols, nbit, &cbh, &xh, cols, nt, (&yg, 0), rows).map_err(e)?;
+            g.sync().map_err(e)?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..10 {
+                o.vq_gemm(&pd, None, rows, rows, cols, nbit, &cbh, &xh, cols, nt, (&yg, 0), rows).map_err(e)?;
+            }
+            g.sync().map_err(e)?;
+            let gus = t0.elapsed().as_secs_f64() * 1e5;
+            let got = yg.to_f32().map_err(e)?;
+            let mut yw = vec![0f32; nt * rows];
+            for c in 0..nt {
+                for r in 0..rows {
+                    yw[c * rows + r] = (0..cols).map(|k| want[r * cols + k] as f64 * xr[c * cols + k] as f64).sum::<f64>() as f32;
+                }
+            }
+            let (grel, gmx) = compare(&got, &yw);
+            println!("{:<26} vq_gemm {nt} tokens: rel err {grel:.2e} (max {gmx:.2e}), {gus:.0} us", "");
+            if which == 0 {
+                // gate and up as one matrix (two payloads, the split at the gate's rows), as a prompt pass runs them
+                let mut pu = vec![0u8; len as usize];
+                f.read_into(t, slot(1), &mut pu).map_err(|e| e.0)?;
+                let wu = vq_host(&pu, &cb, rows, cols, nbit);
+                let pud = DevBuf::new(&g, pu.len().next_multiple_of(256)).map_err(e)?;
+                pud.write(0, &pu).map_err(e)?;
+                let y2 = DevBuf::f32(&g, nt * 2 * rows).map_err(e)?;
+                o.vq_gemm(&pd, Some(&pud), rows, 2 * rows, cols, nbit, &cbh, &xh, cols, nt, (&y2, 0), 2 * rows).map_err(e)?;
+                let got = y2.to_f32().map_err(e)?;
+                let mut yw = vec![0f32; nt * 2 * rows];
+                for c in 0..nt {
+                    for r in 0..2 * rows {
+                        let w = if r < rows { &want[r * cols..(r + 1) * cols] } else { &wu[(r - rows) * cols..(r - rows + 1) * cols] };
+                        yw[c * 2 * rows + r] = (0..cols).map(|k| w[k] as f64 * xr[c * cols + k] as f64).sum::<f64>() as f32;
+                    }
+                }
+                let (grel, gmx) = compare(&got, &yw);
+                println!("{:<26} vq_gemm gate | up {nt} tokens: rel err {grel:.2e} (max {gmx:.2e})", "");
+            }
         }
     }
     // a decode layer's products: 6 experts' gate | up in one launch, their downs in another, one token - a 12-bit layer
@@ -228,6 +277,9 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
             }
             tb.extend(meta.iter().flat_map(|v| v.to_le_bytes()));
             db.extend(dmeta.iter().flat_map(|v| v.to_le_bytes()));
+            // the lookup-table variant's lists: every gate | up reads x's one column, each down its own row of h
+            tb.extend(crate::ops::lut_lists(1, (0..2 * n_e).map(|e| (0, e, 0))).ok_or("lists")?.0);
+            db.extend(crate::ops::lut_lists(n_e, (0..n_e).map(|e| (e, e, 0))).ok_or("lists")?.0);
             let gt = DevBuf::new(&g, tb.len()).map_err(e)?;
             gt.write(0, &tb).map_err(e)?;
             let dt = DevBuf::new(&g, db.len()).map_err(e)?;
@@ -246,24 +298,24 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
         let cbh = DevBuf::new(&g, cb.len() * 2).map_err(e)?;
         o.vq_codebook_f16(&cbd, cb.len(), &cbh).map_err(e)?;
         let variants: Vec<i32> = std::env::var("NS_DS41_VQ_BENCH").unwrap_or_else(|_| "0,1".into()).split(',').filter_map(|v| v.trim().parse().ok()).collect();
-        for (name, tabs, n, x, y, rows, cols) in [("gate | up", &gts, 2 * n_e, &xd, &gu, ff, d), ("down", &dts, n_e, &hd, &dn, d, ff)] {
+        for (name, tabs, n, x, y, rows, cols, lut) in [("gate | up", &gts, 2 * n_e, &xd, &gu, ff, d, (1, 2 * n_e)), ("down", &dts, n_e, &hd, &dn, d, ff, (n_e, 1))] {
             let mut first: Option<Vec<f32>> = None;
             for &v in &variants {
                 let t0 = std::time::Instant::now();
                 while t0.elapsed().as_secs_f64() < 0.5 {
                     for tab in tabs.iter() {
-                        o.vq_mmv(tab, n, (&cbd, Some(if v >= 2 && v != 4 { &cbh } else { &cbf })), x, (y, 0), n, rows, cols, nbit, v).map_err(e)?;
+                        o.vq_mmv(tab, n, (&cbd, Some(if v >= 2 && v != 4 { &cbh } else { &cbf })), x, (y, 0), n, rows, cols, nbit, v, Some(lut)).map_err(e)?;
                     }
                     g.sync().map_err(e)?;
                 }
                 let it = 40;
                 let t0 = std::time::Instant::now();
                 for i in 0..it {
-                    o.vq_mmv(&tabs[i % sets], n, (&cbd, Some(if v >= 2 && v != 4 { &cbh } else { &cbf })), x, (y, 0), n, rows, cols, nbit, v).map_err(e)?;
+                    o.vq_mmv(&tabs[i % sets], n, (&cbd, Some(if v >= 2 && v != 4 { &cbh } else { &cbf })), x, (y, 0), n, rows, cols, nbit, v, Some(lut)).map_err(e)?;
                 }
                 g.sync().map_err(e)?;
                 let us = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
-                o.vq_mmv(&tabs[0], n, (&cbd, Some(if v >= 2 && v != 4 { &cbh } else { &cbf })), x, (y, 0), n, rows, cols, nbit, v).map_err(e)?;
+                o.vq_mmv(&tabs[0], n, (&cbd, Some(if v >= 2 && v != 4 { &cbh } else { &cbf })), x, (y, 0), n, rows, cols, nbit, v, Some(lut)).map_err(e)?;
                 let got = y.view(0, n * rows * 4).map_err(e)?.to_f32().map_err(e)?;
                 let rel = match &first {
                     Some(f0) => compare(&got, f0).0,

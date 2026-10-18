@@ -12,10 +12,15 @@
 #include "ds41.h"
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -122,6 +127,260 @@ void vq_mmv_rows(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int6
         }
         const float gn = (float) m.gains[r] * 256.f;
         for (int c = 0; c < nc; ++c) y[(int64_t) (me[1] + c) * rows + r] = acc[c] * gn;
+    });
+}
+}  // namespace
+
+// The decode products by lookup table (variant 5, ns_ds41_vq_lut): a column of x and a run of 8 of its values (a
+// group) give every codebook entry's dot product with them, T[g][j] = cb[j] . x[8g .. 8g + 8) - 2^nbit of them, built
+// in local memory - and a row's product is then the sum of T[g][idx(r, g)] over its groups: one 4-byte local read an
+// index instead of an 8-value codebook gather and 8 multiply-adds. A work-group takes one column of x (xl lists the
+// entries and their column slots that read it), a run of U 64-column units and R = L x RHO rows (each lane RHO), and
+// builds the tables of P groups at a time (what local memory holds); a row's sum over the run is a partial, scaled by
+// the row's gain. The partials of a row's runs are then added in order (the second kernel): the same arithmetic for a
+// row whatever the other rows and columns of the launch (a verify pass's rows equal one-token rows).
+namespace {
+constexpr int LUT_L = 512, LUT_RHO = 8, LUT_SLOTS = 16;
+
+// index GI (0..7) of a chunk of 8 (its 12 bytes w0 w1 w2, the 13th bits pb)
+template <int GI, bool PLANE>
+inline uint32_t chunk_one(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t pb) {
+    uint32_t v;
+    if constexpr (GI < 5) v = (uint32_t) ((((uint64_t) w1 << 32) | w0) >> (12 * GI)) & 0xFFFu;
+    else if constexpr (GI == 5) v = ((w1 >> 28) | (w2 << 4)) & 0xFFFu;
+    else if constexpr (GI == 6) v = (w2 >> 8) & 0xFFFu;
+    else v = (w2 >> 20) & 0xFFFu;
+    if constexpr (PLANE) v |= ((pb >> GI) & 1u) << 12;
+    return v;
+}
+
+template <bool PLANE, int P>
+void vq_lut_run(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, const int32_t* xl, int64_t nx, int64_t kb, int64_t ubn, int U,
+                const uint8_t* cb, const float* x, float* part, int64_t yrows, int64_t rows, int64_t cols) {
+    constexpr int NE = PLANE ? 8192 : 4096;
+    const int64_t units = cols / 64, R = (int64_t) LUT_L * LUT_RHO;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> T(sycl::range<1>(P * NE), h);
+        h.parallel_for(sycl::nd_range<1>(nx * ubn * kb * LUT_L, LUT_L), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int64_t gi = it.get_group(0);
+            const int64_t c = gi / (ubn * kb), ub = (gi / kb) % ubn, k = gi % kb;
+            const int lane = (int) it.get_local_id(0);
+            const int32_t* xlc = xl + c * (1 + 2 * LUT_SLOTS);
+            const int n = sycl::min(xlc[0], LUT_SLOTS);
+            const int64_t r_lo = k * R;
+            if (r_lo >= (int64_t) n * rows) return;   // the whole work-group alike, before any barrier
+            const int64_t u0 = ub * U, u1 = sycl::min<int64_t>(units, u0 + U);
+            // this lane's rows r_lo + lane + L i: their payloads and rows (-1: none)
+            const uint8_t* base[LUT_RHO];
+            int32_t rr[LUT_RHO];
+            float acc[LUT_RHO];
+#pragma unroll
+            for (int i = 0; i < LUT_RHO; ++i) {
+                const int64_t ri = r_lo + lane + (int64_t) LUT_L * i;
+                acc[i] = 0.f;
+                base[i] = nullptr;
+                rr[i] = -1;
+                if (ri < (int64_t) n * rows) {
+                    base[i] = reinterpret_cast<const uint8_t*>(ptrs[xlc[1 + 2 * (int) (ri / rows)]]);
+                    rr[i] = (int32_t) (ri % rows);
+                }
+            }
+            const int64_t mrow = cols / 8 * 12 / 8, prow = cols / 64, s0 = 32 + rows * 2, p0 = s0 + rows * mrow;
+            const float* xc = x + c * cols;
+            for (int64_t u = u0; u < u1; ++u) {
+                uint32_t w0[LUT_RHO], w1[LUT_RHO], w2[LUT_RHO], pb[LUT_RHO];
+#pragma unroll
+                for (int i = 0; i < LUT_RHO; ++i) {
+                    if (rr[i] >= 0) {
+                        const uint32_t* sp = reinterpret_cast<const uint32_t*>(base[i] + s0 + rr[i] * mrow + 12 * u);
+                        w0[i] = sp[0];
+                        w1[i] = sp[1];
+                        w2[i] = sp[2];
+                        pb[i] = PLANE ? (uint32_t) base[i][p0 + rr[i] * prow + u] : 0u;
+                    } else {
+                        w0[i] = w1[i] = w2[i] = pb[i] = 0u;
+                    }
+                }
+                auto pass = [&](auto pc) {
+                    constexpr int PS = decltype(pc)::value;
+                    // the tables of groups 8u + P PS .. + P, a lane every L-th entry
+                    float xv[P][8];
+#pragma unroll
+                    for (int gg = 0; gg < P; ++gg) {
+                        const sycl::float4* xp = reinterpret_cast<const sycl::float4*>(xc + (u * 8 + PS * P + gg) * 8);
+                        const sycl::float4 a = xp[0], b = xp[1];
+                        xv[gg][0] = a.x(); xv[gg][1] = a.y(); xv[gg][2] = a.z(); xv[gg][3] = a.w();
+                        xv[gg][4] = b.x(); xv[gg][5] = b.y(); xv[gg][6] = b.z(); xv[gg][7] = b.w();
+                    }
+                    sycl::group_barrier(it.get_group());
+                    for (int j = lane; j < NE; j += LUT_L) {
+                        float wv[8];
+                        vq_weights<1>(cb, nullptr, (uint32_t) j, wv);
+#pragma unroll
+                        for (int gg = 0; gg < P; ++gg) {
+                            float s = 0.f;
+#pragma unroll
+                            for (int d = 0; d < 8; ++d) s += wv[d] * xv[gg][d];
+                            T[gg * NE + j] = s;
+                        }
+                    }
+                    sycl::group_barrier(it.get_group());
+#pragma unroll
+                    for (int i = 0; i < LUT_RHO; ++i) {
+                        const uint32_t a0 = w0[i], a1 = w1[i], a2 = w2[i], ap = pb[i];
+                        float s;
+                        if constexpr (P == 2) {
+                            s = T[chunk_one<PS * 2, PLANE>(a0, a1, a2, ap)] + T[NE + chunk_one<PS * 2 + 1, PLANE>(a0, a1, a2, ap)];
+                        } else if constexpr (P == 4) {
+                            s = (T[chunk_one<PS * 4, PLANE>(a0, a1, a2, ap)] + T[NE + chunk_one<PS * 4 + 1, PLANE>(a0, a1, a2, ap)]) +
+                                (T[2 * NE + chunk_one<PS * 4 + 2, PLANE>(a0, a1, a2, ap)] + T[3 * NE + chunk_one<PS * 4 + 3, PLANE>(a0, a1, a2, ap)]);
+                        } else {
+                            s = ((T[chunk_one<0, PLANE>(a0, a1, a2, ap)] + T[NE + chunk_one<1, PLANE>(a0, a1, a2, ap)]) +
+                                 (T[2 * NE + chunk_one<2, PLANE>(a0, a1, a2, ap)] + T[3 * NE + chunk_one<3, PLANE>(a0, a1, a2, ap)])) +
+                                ((T[4 * NE + chunk_one<4, PLANE>(a0, a1, a2, ap)] + T[5 * NE + chunk_one<5, PLANE>(a0, a1, a2, ap)]) +
+                                 (T[6 * NE + chunk_one<6, PLANE>(a0, a1, a2, ap)] + T[7 * NE + chunk_one<7, PLANE>(a0, a1, a2, ap)]));
+                        }
+                        acc[i] += s;
+                    }
+                };
+                pass(std::integral_constant<int, 0>{});
+                if constexpr (P <= 4) pass(std::integral_constant<int, 1>{});
+                if constexpr (P == 2) {
+                    pass(std::integral_constant<int, 2>{});
+                    pass(std::integral_constant<int, 3>{});
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < LUT_RHO; ++i) {
+                if (rr[i] < 0) continue;
+                const int64_t ri = r_lo + lane + (int64_t) LUT_L * i;
+                const int sl = (int) (ri / rows);
+                const int e = xlc[1 + 2 * sl], qq = xlc[2 + 2 * sl];
+                const float gn = (float) reinterpret_cast<const sycl::half*>(base[i] + 32)[rr[i]] * 256.f;
+                part[ub * yrows * rows + ((int64_t) meta[e * 10 + 1] + qq) * rows + rr[i]] = acc[i] * gn;
+            }
+        });
+    });
+}
+
+// the partials' memory, a GPU's (grown when a launch needs more; kept for the process)
+float* lut_buf(ns_gpu* g, size_t floats) {
+    static std::mutex mu;
+    static std::vector<std::pair<ns_gpu*, std::pair<float*, size_t>>> bufs;
+    std::lock_guard<std::mutex> lk(mu);
+    for (auto& b : bufs) {
+        if (b.first != g) continue;
+        if (b.second.second >= floats) return b.second.first;
+        g->q.wait();
+        sycl::free(b.second.first, g->q);
+        b.second.second = std::max(floats, (size_t) 4 << 20);
+        b.second.first = sycl::malloc_device<float>(b.second.second, g->q);
+        return b.second.first;
+    }
+    const size_t cap = std::max(floats, (size_t) 4 << 20);
+    float* p = sycl::malloc_device<float>(cap, g->q);
+    bufs.push_back({g, {p, cap}});
+    return p;
+}
+
+size_t lut_local_bytes(ns_gpu* g) {
+    static std::mutex mu;
+    static std::vector<std::pair<ns_gpu*, size_t>> v;
+    std::lock_guard<std::mutex> lk(mu);
+    for (auto& b : v)
+        if (b.first == g) return b.second;
+    const size_t n = g->q.get_device().get_info<sycl::info::device::local_mem_size>();
+    v.push_back({g, n});
+    return n;
+}
+}  // namespace
+
+// A prompt pass's expert products on XMX straight from the indices (ns_ds41_vq_gemm): y [n][ldy] = x [n][K] . W^T for
+// a VQ W of `rows` rows (two payloads: rows < split the first's, the rest the second's - an expert's gate and up as one
+// matrix). A sub-group takes 16 rows of W and 8 MT tokens: a lane decodes its row's 64 columns a unit (8 indices, each
+// 8 fp16 codebook values) into local memory as four packed 16 x 16 B tiles, then each meets the MT token tiles (A, fp16
+// rows of x from global memory) - half x half -> float. The rows' gains scale the sums on the way out. Nothing is
+// expanded to memory: an expansion wrote and read the whole matrix in fp16 whatever its tokens.
+namespace {
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+
+template <typename T>
+inline auto gm_lp(T* p) {
+    return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+}
+template <typename T>
+inline auto gm_gp(T* p) {
+    return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p);
+}
+
+template <bool PLANE, int MT, int KS>
+void vq_gemm_run(sycl::queue& q, const uint8_t* p0, const uint8_t* p1, int64_t split, int64_t rows, int64_t cols, const sycl::half* cbh,
+                 const sycl::half* x, int64_t ldx, int64_t n, float* y, int64_t ldy) {
+    const int64_t rtiles = rows / 16, ttiles = (n + 8 * MT - 1) / (8 * MT), units = cols / 64, ups = (units + KS - 1) / KS;
+    q.submit([&](sycl::handler& h) {
+        // per sub-group: a unit's four B tiles [4][8][16] words (two halves each); then its MT sums [8][16] floats
+        sycl::local_accessor<uint32_t, 1> bt(sycl::range<1>(KS * 4 * 128), h);
+        sycl::local_accessor<float, 1> cs(sycl::range<1>(KS * MT * 128), h);
+        h.parallel_for(sycl::nd_range<1>(rtiles * ttiles * KS * 16, KS * 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const auto sg = it.get_sub_group();
+            const int s = (int) sg.get_group_id()[0], lane = (int) sg.get_local_id()[0];
+            const int64_t gi = it.get_group(0), tt = gi % ttiles, rt = gi / ttiles;
+            const int64_t r = rt * 16 + lane;
+            const bool second = r >= split;
+            const int64_t mr = second ? rows - split : split, rr = second ? r - split : r;
+            const VqMat m = vq_open(second ? p1 : p0, mr, cols, PLANE ? 13 : 12);
+            const uint32_t* srow = reinterpret_cast<const uint32_t*>(m.stream + rr * m.mrow);
+            const uint8_t* prow = PLANE ? m.plane + rr * m.prow : nullptr;
+            uint32_t* b = &bt[s * 512];
+            const int64_t tok0 = tt * 8 * MT;
+            jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> acc[MT];
+#pragma unroll
+            for (int mm = 0; mm < MT; ++mm) jm::joint_matrix_fill(sg, acc[mm], 0.0f);
+            const int64_t ua = s * ups, ub = sycl::min<int64_t>(units, ua + ups);
+            for (int64_t u = ua; u < ub; ++u) {
+                uint32_t idx[8];
+                chunk_idx(srow + 3 * u, PLANE ? prow[u] : 0u, idx);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const sycl::uint4 hv = *reinterpret_cast<const sycl::uint4*>(cbh + (size_t) idx[i] * 8);
+                    // values k = 8i .. 8i + 7 as four pairs: tile k / 16, pair row (k % 16) / 2, this lane's column
+                    const int t = i >> 1, pr = (i & 1) * 4;
+                    b[t * 128 + (pr + 0) * 16 + lane] = hv.x();
+                    b[t * 128 + (pr + 1) * 16 + lane] = hv.y();
+                    b[t * 128 + (pr + 2) * 16 + lane] = hv.z();
+                    b[t * 128 + (pr + 3) * 16 + lane] = hv.w();
+                }
+                sycl::group_barrier(sg);
+#pragma unroll
+                for (int kt = 0; kt < 4; ++kt) {
+                    jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> bm;
+                    jm::joint_matrix_load(sg, bm, gm_lp(reinterpret_cast<sycl::half*>(b + kt * 128)), (size_t) 32);
+#pragma unroll
+                    for (int mm = 0; mm < MT; ++mm) {
+                        jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> am;
+                        jm::joint_matrix_load(sg, am, gm_gp(x + (tok0 + 8 * mm) * ldx + u * 64 + kt * 16), (size_t) ldx);
+                        jm::joint_matrix_mad(sg, acc[mm], am, bm, acc[mm]);
+                    }
+                }
+                sycl::group_barrier(sg);
+            }
+#pragma unroll
+            for (int mm = 0; mm < MT; ++mm) jm::joint_matrix_store(sg, acc[mm], gm_lp(&cs[(s * MT + mm) * 128]), (size_t) 16, jm::layout::row_major);
+            sycl::group_barrier(it.get_group());
+            // the K slices' sums added in order, scaled by the rows' gains
+            for (int o = (int) it.get_local_id(0); o < MT * 128; o += KS * 16) {
+                const int mm = o / 128, t = (o % 128) / 16, col = o % 16;
+                const int64_t tok = tok0 + 8 * mm + t;
+                if (tok >= n) continue;
+                float v = 0.f;
+                for (int k = 0; k < KS; ++k) v += cs[(k * MT + mm) * 128 + t * 16 + col];
+                const int64_t row = rt * 16 + col;
+                const bool sec = row >= split;
+                const uint8_t* pp = sec ? p1 : p0;
+                const float gn = (float) reinterpret_cast<const sycl::half*>(pp + 32)[sec ? row - split : row] * 256.f;
+                y[tok * ldy + row] = v * gn;
+            }
+        });
     });
 }
 }  // namespace
@@ -314,6 +573,64 @@ int ns_ds41_fp8_mmv(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols, con
             if (lane == 0) y[c * ycs + r] = s;
         }
     });
+    return 0;
+    NS_CATCH
+}
+
+int ns_ds41_vq_lut(ns_gpu* g, const uint64_t* ptrs, const int32_t* meta, const int32_t* xl, int64_t nx, int64_t maxn, const uint8_t* cb, const float* x,
+                   float* y, int64_t yrows, int64_t rows, int64_t cols, int64_t nbit, int64_t units_per_group) {
+    NS_TRY
+    if (!ns_ds41_vq_supported(rows, cols, nbit)) return ns_fail("ns_ds41_vq_lut: cols a multiple of 64, 12 or 13 bits");
+    if (nx < 1 || maxn < 1 || maxn > LUT_SLOTS || yrows < 1) return ns_fail("ns_ds41_vq_lut: 1..16 entries a column of x");
+    const int64_t units = cols / 64;
+    const int U = (int) std::min<int64_t>(std::max<int64_t>(units_per_group, 1), units);
+    const int64_t ubn = (units + U - 1) / U, R = (int64_t) LUT_L * LUT_RHO, kb = (maxn * rows + R - 1) / R;
+    float* part = lut_buf(g, (size_t) (ubn * yrows * rows));
+    if (!part) return ns_fail("ns_ds41_vq_lut: no memory for the partials");
+    const size_t lm = lut_local_bytes(g);
+    const size_t ne = nbit > 12 ? 8192 : 4096;
+    const bool plane = nbit > 12;
+    // the most groups' tables local memory holds (less a little for the runtime's own)
+    if (8 * ne * 4 + 1024 <= lm) {
+        if (plane) vq_lut_run<true, 8>(g->q, ptrs, meta, xl, nx, kb, ubn, U, cb, x, part, yrows, rows, cols);
+        else vq_lut_run<false, 8>(g->q, ptrs, meta, xl, nx, kb, ubn, U, cb, x, part, yrows, rows, cols);
+    } else if (4 * ne * 4 + 1024 <= lm) {
+        if (plane) vq_lut_run<true, 4>(g->q, ptrs, meta, xl, nx, kb, ubn, U, cb, x, part, yrows, rows, cols);
+        else vq_lut_run<false, 4>(g->q, ptrs, meta, xl, nx, kb, ubn, U, cb, x, part, yrows, rows, cols);
+    } else if (2 * ne * 4 + 1024 <= lm) {
+        if (plane) vq_lut_run<true, 2>(g->q, ptrs, meta, xl, nx, kb, ubn, U, cb, x, part, yrows, rows, cols);
+        else vq_lut_run<false, 2>(g->q, ptrs, meta, xl, nx, kb, ubn, U, cb, x, part, yrows, rows, cols);
+    } else {
+        return ns_fail("ns_ds41_vq_lut: too little local memory for two groups' tables");
+    }
+    // each listed row's partials added in order of their unit runs
+    const int64_t total = nx * maxn * rows;
+    g->q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> id) {
+        const int64_t c = id[0] / (maxn * rows), s = (id[0] / rows) % maxn, r = id[0] % rows;
+        const int32_t* xlc = xl + c * (1 + 2 * LUT_SLOTS);
+        if (s >= sycl::min(xlc[0], LUT_SLOTS)) return;
+        const int e = xlc[1 + 2 * s], qq = xlc[2 + 2 * s];
+        const int64_t at = ((int64_t) meta[e * 10 + 1] + qq) * rows + r;
+        float v = 0.f;
+        for (int64_t b = 0; b < ubn; ++b) v += part[b * yrows * rows + at];
+        y[at] = v;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_ds41_vq_gemm(ns_gpu* g, const void* p0, const void* p1, int64_t split, int64_t rows, int64_t cols, int64_t nbit, const void* cbh, const void* x,
+                    int64_t ldx, int64_t n, float* y, int64_t ldy) {
+    NS_TRY
+    if (rows % 16 != 0 || cols % 64 != 0 || split < 1 || split > rows || split % 16 != 0 || (nbit != 12 && nbit != 13))
+        return ns_fail("ns_ds41_vq_gemm: rows and the split multiples of 16, cols of 64, 12 or 13 bits");
+    if (n < 1) return 0;
+    const auto* a = static_cast<const uint8_t*>(p0);
+    const auto* b = static_cast<const uint8_t*>(p1 ? p1 : p0);
+    const auto* ch = static_cast<const sycl::half*>(cbh);
+    const auto* xh = static_cast<const sycl::half*>(x);
+    if (nbit > 12) vq_gemm_run<true, 4, 8>(g->q, a, b, split, rows, cols, ch, xh, ldx, n, y, ldy);
+    else vq_gemm_run<false, 4, 8>(g->q, a, b, split, rows, cols, ch, xh, ldx, n, y, ldy);
     return 0;
     NS_CATCH
 }

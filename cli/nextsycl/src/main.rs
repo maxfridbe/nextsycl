@@ -97,7 +97,7 @@ language models (nextsycl llm ...; the names without `llm` still work):
   nextsycl llm info <model.gguf>      the architecture and geometry, every tensor checked by role, bytes by group
   nextsycl llm tokenize <model.gguf> <text>
   nextsycl llm check <model.gguf> <dump dir> [--gpu N[,M]]    the forward pass against a reference dump
-  nextsycl llm spec-check <model.gguf> --prompt TEXT [--n N] [--rows R (2..5)] [--gpu 0,1]
+  nextsycl llm spec-check <model.gguf> --prompt TEXT [--n N] [--rows R (2..5)] [--gpu 0,1] [--prefill | --prompt-decode]
                                 verify passes against one-token decode, logits compared
   nextsycl llm kernels <model.gguf> [--gpu N]   each weight type's decode kernel against the exact path
   nextsycl llm prepare <model.gguf>             the files its engine makes beside it (deepseek4: the MTP sidecar)
@@ -639,6 +639,29 @@ fn spec_check(args: &[String]) -> Result<(), String> {
         s.sort_by(|a, b| b.total_cmp(a));
         s[0] - s[1]
     };
+    if args.iter().any(|a| a == "--prompt-decode") {
+        // the prompt pass's last logits against the prompt fed a token at a time (the decode path)
+        let mut a = eng.session(ids.len() + 4).map_err(e)?;
+        let got = eng.feed(&mut a, &ids, &mut none).map_err(e)?;
+        let mut b = eng.session(ids.len() + 4).map_err(e)?;
+        let mut want = Vec::new();
+        for t in &ids {
+            want = eng.forward(&mut b, &[*t], &mut none).map_err(e)?;
+        }
+        let dot: f64 = got.iter().zip(&want).map(|(a, b)| *a as f64 * *b as f64).sum();
+        let na: f64 = got.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        let nb: f64 = want.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        let d = got.iter().zip(want.iter()).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let top = |v: &[f32]| {
+            let mut i: Vec<usize> = (0..v.len()).collect();
+            i.sort_by(|a, b| v[*b].total_cmp(&v[*a]));
+            i[..5].iter().map(|&k| format!("{k}:{:.3}", v[k])).collect::<Vec<_>>().join(" ")
+        };
+        println!("{} prompt tokens: prompt pass against a token at a time: cosine {:.6}, max |diff| {d:.4}, top1 {}", ids.len(), dot / (na * nb).max(1e-30),
+                 if argmax(&got) == argmax(&want) { "same" } else { "FLIP" });
+        println!("  prompt pass:    {}\n  token at a time: {}", top(&got), top(&want));
+        return Ok(());
+    }
     let mut a = eng.session(ids.len() + n + 4).map_err(e)?;
     let mut la = eng.feed(&mut a, &ids, &mut none).map_err(e)?;
     let mut toks = Vec::new();

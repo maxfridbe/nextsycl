@@ -533,20 +533,33 @@ impl Ops {
     }
     /// Decode products of expert matrices: `table` = u64 payload pointers [entries], then i32 meta [entries][10]
     /// ({ncol, y0, cols}); y [(y0 + c) * rows + r] (floats from `y.1`, `y_rows` rows of `rows` in all); `variant` 0 a
-    /// sub-group a row, 1 a lane a row
+    /// sub-group a row, 1 a lane a row; 5 by lookup table, which takes `lut` = (nx, maxn): the table's third part, after
+    /// the pointers and the meta, lists for each of nx columns of x the (entry, column slot) pairs that read it (lut_lists)
     #[allow(clippy::too_many_arguments)]
     pub fn vq_mmv(&self, table: &DevBuf, entries: usize, cb: (&DevBuf, Option<&DevBuf>), x: &DevBuf, y: (&DevBuf, usize), y_rows: usize, rows: usize, cols: usize,
-                  nbit: usize, variant: i32) -> Result<()> {
+                  nbit: usize, variant: i32, lut: Option<(usize, usize)>) -> Result<()> {
         if entries == 0 {
             return Ok(());
         }
         let (cb, cbf) = cb;
         table.bounds(0, entries * 48)?;
         cb.bounds(0, (1usize << nbit) * 8)?;
-        if let Some(f) = cbf {
-            f.bounds(0, (1usize << nbit) * if variant == 2 || variant == 3 { 16 } else { 32 })?;
+        if let Some(f) = cbf.filter(|_| matches!(variant, 0 | 2 | 3)) {
+            f.bounds(0, (1usize << nbit) * if variant == 0 { 32 } else { 16 })?;
         }
         need!(y.0, y.1 + y_rows * rows, "vq_mmv y");
+        if variant == VQ_LUT {
+            let (nx, maxn) = lut.ok_or_else(|| Error("vq_mmv: the lookup-table variant needs the columns' lists".into()))?;
+            table.bounds(0, entries * 48 + nx * LUT_STRIDE * 4)?;
+            need!(x, nx * cols, "vq_lut x");
+            // SAFETY: as below; the lists after the meta, each slot's entry < entries (lut_lists).
+            let rc = unsafe {
+                let base = table.ptr().cast::<u8>();
+                (self.k.ds41_vq_lut)(self.raw(), base.cast(), base.add(entries * 8).cast(), base.add(entries * 48).cast(), nx as i64, maxn as i64, cb.ptr().cast(),
+                                     x.fp(), y.0.fp().add(y.1), y_rows as i64, rows as i64, cols as i64, nbit as i64, lut_units(cols) as i64)
+            };
+            return self.ok(rc, "ds41_vq_lut");
+        }
         // SAFETY: sizes checked; the pointers are VRAM / pinned slots of this GPU holding the payloads, the columns
         // the caller's rows of x.
         let rc = unsafe {
@@ -555,6 +568,25 @@ impl Ops {
                                  x.fp(), y.0.fp().add(y.1), rows as i64, cols as i64, nbit as i64, variant)
         };
         self.ok(rc, "ds41_vq_mmv")
+    }
+    /// A prompt pass's expert product on XMX from the indices: y [n][ldy] (from float y.1) = x [n][cols] (fp16, rows ldx
+    /// apart, its buffer readable to a multiple of 32 rows) . W^T; W's rows < split from payload p0, the rest from p1
+    #[allow(clippy::too_many_arguments)]
+    pub fn vq_gemm(&self, p0: &DevBuf, p1: Option<&DevBuf>, split: usize, rows: usize, cols: usize, nbit: usize, cbh: &DevBuf, x: &DevBuf, ldx: usize, n: usize,
+                   y: (&DevBuf, usize), ldy: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        cbh.bounds(0, (1usize << nbit) * 16)?;
+        x.bounds(0, (n.next_multiple_of(32) - 1) * ldx * 2 + cols * 2)?;
+        need!(y.0, y.1 + (n - 1) * ldy + rows, "vq_gemm y");
+        // SAFETY: x and y checked; the payloads are expert slots of this GPU (or pinned, device-visible) of a layer's
+        // matrices with these shapes; cbh holds 2^nbit entries.
+        let rc = unsafe {
+            (self.k.ds41_vq_gemm)(self.raw(), p0.ptr(), p1.map_or(std::ptr::null(), |b| b.ptr()), split as i64, rows as i64, cols as i64, nbit as i64, cbh.ptr(),
+                                  x.ptr(), ldx as i64, n as i64, y.0.fp().add(y.1), ldy as i64)
+        };
+        self.ok(rc, "ds41_vq_gemm")
     }
     /// *tok (an i32 at byte `at` of `toks`) = argmax(logits + bias) over n
     pub fn markov_step(&self, logits: (&DevBuf, usize), bias: &DevBuf, n: usize, toks: &DevBuf, at: usize) -> Result<()> {
@@ -637,4 +669,34 @@ impl Ops {
         };
         self.ok(rc, "ds41_fp8_mmv")
     }
+}
+
+/// The VQ decode products' lookup-table variant (ns_ds41_vq_lut)
+pub const VQ_LUT: i32 = 5;
+/// A column's list in the lookup-table variant's table: its count, then 16 (entry, column slot) pairs
+pub const LUT_STRIDE: usize = 33;
+
+/// 64-column units a work-group of the lookup-table variant takes (NS_DS41_LUT_RUNS, default 16 runs a row)
+fn lut_units(cols: usize) -> usize {
+    static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let runs = *RUNS.get_or_init(|| std::env::var("NS_DS41_LUT_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(16).max(1));
+    (cols / 64).div_ceil(runs).max(1)
+}
+
+/// The lookup-table variant's lists (the bytes after a table's meta) from (column of x, entry, column slot) triples: for
+/// each of nx columns its count and pairs; (bytes, the largest count). None when a column has more than 16 readers.
+pub fn lut_lists(nx: usize, pairs: impl IntoIterator<Item = (usize, usize, usize)>) -> Option<(Vec<u8>, usize)> {
+    let mut v = vec![0i32; nx * LUT_STRIDE];
+    for (c, e, q) in pairs {
+        let at = c * LUT_STRIDE;
+        let n = v[at] as usize;
+        if c >= nx || n >= (LUT_STRIDE - 1) / 2 {
+            return None;
+        }
+        v[at + 1 + 2 * n] = e as i32;
+        v[at + 2 + 2 * n] = q as i32;
+        v[at] += 1;
+    }
+    let maxn = (0..nx).map(|c| v[c * LUT_STRIDE] as usize).max().unwrap_or(0).max(1);
+    Some((v.iter().flat_map(|x| x.to_le_bytes()).collect(), maxn))
 }

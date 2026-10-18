@@ -74,6 +74,33 @@ pub fn arena_bytes() -> usize {
     })
 }
 
+/// A prompt pass's experts with at most this many tokens multiplied from their indices (the decode kernels), the rest
+/// expanded to fp16 for a GEMM (NS_DS41_PROMPT_MMV, default 0: none - the XMX product from the indices, vq_gemm, is faster at every count)
+fn prompt_mmv_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_PROMPT_MMV", 0))
+}
+/// The decode kernels' variant for a prompt's few-token experts (NS_DS41_PROMPT_MMV_V, default 3: a sub-group a row, the
+/// fp16 codebook - its columns share each index's weights)
+fn prompt_mmv_variant() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_PROMPT_MMV_V", 3) as i32)
+}
+/// A prompt pass's VRAM staging slots for the experts it reads from host memory or the file (NS_DS41_PROMPT_RING,
+/// default 24; 0: read in place from host memory, the file's swapped in)
+fn prompt_ring() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_PROMPT_RING", 24))
+}
+/// A prompt pass's experts with more tokens than NS_DS41_PROMPT_MMV and at most this many multiplied on XMX from their
+/// indices (ns_ds41_vq_gemm), more expanded to fp16 for a GEMM (NS_DS41_VQ_GEMM_MAX, default 100000: all; 0: none)
+fn vq_gemm_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_VQ_GEMM_MAX", 100_000))
+}
+/// Token slots of one batch of a prompt's few-token experts (their gate | up and h in the arena)
+const PROMPT_MMV_SLOTS: usize = 1024;
+
 /// Dense products of this many rows or more in fp16 on the XMX units (NS_DS41_DENSE_F16_MIN, default 64)
 fn dense_f16_min() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -400,6 +427,18 @@ pub struct Part {
     cand: DevBuf,
     /// the compressor's position terms (zero: V4.1 has none) for the pooling kernel
     zeros: DevBuf,
+    /// a prompt pass's staging slots in VRAM for the experts in host memory or the file (copied up on the copy lane while
+    /// the others are multiplied; none when NS_DS41_PROMPT_RING=0): the buffer and its slots' size
+    ring: Option<(DevBuf, usize)>,
+    /// the ticket after the last pass's readers of the ring (its next copies wait for it)
+    ring_free: Mutex<Option<i64>>,
+}
+
+/// Where a prompt pass reads an expert from (Part::locate)
+enum Src {
+    V(DevBuf),
+    R(DevBuf),
+    F,
 }
 
 /// The pass-wide state the attention layers hand down: whether the last index source picked (its top-k rows in
@@ -684,6 +723,82 @@ impl Part {
         Ok((slots, arriving, last))
     }
 
+    /// A prompt pass's experts of `need` (layer l) where they are, nothing moved: a VRAM slot, a pinned host slot, or the
+    /// file only
+    fn locate(&self, l: u64, need: &[u64]) -> Result<Vec<Src>> {
+        let mut c = self.store(l)?.lock().unwrap();
+        let c = &mut *c;
+        c.tick += 1;
+        let tick = c.tick;
+        let sb = c.slot_bytes;
+        let mut out = Vec::with_capacity(need.len());
+        for &ex in need {
+            out.push(match c.loc.get(&(l, ex)).copied() {
+                Some(Loc::V(s)) => {
+                    c.hits += 1;
+                    c.vused[s] = tick;
+                    let (ch, o) = c.vat(s);
+                    Src::V(c.vram[ch].view(o, sb)?)
+                }
+                Some(Loc::R(r)) => {
+                    c.direct += 1;
+                    let (rch, ro) = c.rat(r);
+                    Src::R(c.host[rch].device_view(ro, sb)?)
+                }
+                None => {
+                    c.from_file += 1;
+                    Src::F
+                }
+            });
+        }
+        // a copy into a VRAM slot or down to a host slot still on its way (decode's swaps) lands before a product reads it
+        for t in [c.last_up, c.down_any.take()].into_iter().flatten() {
+            self.ops.await_ticket(t)?;
+        }
+        Ok(out)
+    }
+
+    /// Experts `ks` of layer l into the staging ring's slots `slots` (their sources `src`: host slots copied up, the
+    /// file's read into pinned staging on threads first), each copy after `free[slot]`: their views, the last copy's ticket
+    #[allow(clippy::too_many_arguments)]
+    fn stage_up(&self, m: &Model, l: u64, ks: &[usize], need: &[u64], src: &[Src], slots: &[usize], free: &[Option<i64>]) -> Result<(Vec<DevBuf>, Option<i64>)> {
+        let (ring, rs) = self.ring.as_ref().ok_or("no staging ring")?;
+        let vq = &self.vq[&l];
+        let mut last = None;
+        let mut views = Vec::with_capacity(ks.len());
+        let files: Vec<u64> = ks.iter().filter(|&&k| matches!(src[k], Src::F)).map(|&k| need[k]).collect();
+        let mut c = self.store(l)?.lock().unwrap();
+        let c = &mut *c;
+        let staged = if files.is_empty() { HashMap::new() } else { self.stage_reads(m, vq, c, l, &files)? };
+        let sb = c.slot_bytes;
+        for (&k, &s) in ks.iter().zip(slots) {
+            let from = match &src[k] {
+                Src::R(h) => h.view(0, vq.span)?,
+                Src::F => {
+                    let st = match staged.get(&need[k]) {
+                        Some(&st) => st,
+                        None => {
+                            let st = self.stage_slot(c)?;
+                            read_expert(m, vq, need[k], &mut c.stage.as_mut_slice()[st * sb..(st + 1) * sb])?;
+                            st
+                        }
+                    };
+                    let v = c.stage.device_view(st * sb, vq.span)?;
+                    let t = self.ops.stream_copy_on(1, ring, s * rs, &v, 0, vq.span, &[free[s]])?;
+                    c.stage_tk[st] = Some(t);
+                    last = Some(t);
+                    views.push(ring.view(s * rs, *rs)?);
+                    continue;
+                }
+                Src::V(_) => return Err(Error("stage_up: an expert in VRAM".into())),
+            };
+            let t = self.ops.stream_copy_on(1, ring, s * rs, &from, 0, vq.span, &[free[s]])?;
+            last = Some(t);
+            views.push(ring.view(s * rs, *rs)?);
+        }
+        Ok((views, last))
+    }
+
     /// Expert (l, ex) into VRAM slot s: the slot's expert down to a free host slot, the wanted one up from its host
     /// slot or the file (read on this thread: the queue first drained of the copies that could touch the slot)
     #[allow(clippy::too_many_arguments)]
@@ -944,8 +1059,9 @@ pub struct Ds41<'g> {
 }
 
 /// the decode products' kernel variants (ds41.h: ns_ds41_vq_mmv): 0 a sub-group a row (float32 codebook), 1 a lane a row
-/// (the E4M3 bytes), 2 a lane a row (fp16 codebook), 3 a sub-group a row (fp16), 4 a lane a row (the bytes two at once)
-const VQ_VARIANTS: usize = 5;
+/// (the E4M3 bytes), 2 a lane a row (fp16 codebook), 3 a sub-group a row (fp16), 4 a lane a row (the bytes two at once),
+/// 5 by lookup table (each group of 8 values of x against every codebook entry, in local memory)
+const VQ_VARIANTS: usize = 6;
 
 /// The widened codebook variant `var` reads: float32 (0), fp16 (2, 3), none (the bytes)
 fn vq_wide<'a>(wide: (&'a HashMap<u64, DevBuf>, &'a HashMap<u64, DevBuf>), l: u64, var: i32) -> Option<&'a DevBuf> {
@@ -1003,8 +1119,12 @@ fn vq_pick(o: &Ops, g: &crate::model::Geometry, vq: &HashMap<u64, LayerVq>, cbs:
             }
         }
         tb.extend(i32s(&meta));
+        let (gl, gmax) = crate::ops::lut_lists(1, (0..2 * n).map(|e| (0, e, 0))).ok_or("vq_pick: the lists")?;
+        tb.extend(gl);
         let mut db: Vec<u8> = bases.iter().flat_map(|b| (b + v.down as u64).to_le_bytes()).collect();
         db.extend(i32s(&(0..n).flat_map(|x| [1, x as i32, x as i32, 0, 0, 0, 0, 0, 0, 0]).collect::<Vec<_>>()));
+        let (dl, dmax) = crate::ops::lut_lists(n, (0..n).map(|e| (e, e, 0))).ok_or("vq_pick: the lists")?;
+        db.extend(dl);
         let (gt, dt) = (DevBuf::new(&o.gpu, tb.len())?, DevBuf::new(&o.gpu, db.len())?);
         gt.write(0, &tb)?;
         dt.write(0, &db)?;
@@ -1012,11 +1132,11 @@ fn vq_pick(o: &Ops, g: &crate::model::Geometry, vq: &HashMap<u64, LayerVq>, cbs:
         x.fill(0)?;
         let y = DevBuf::f32(&o.gpu, 2 * n * f.max(d))?;
         let mut pick = [0i32; 2];
-        for (k, (tab, e, rows, cols)) in [(&gt, 2 * n, f, d), (&dt, n, d, f)].into_iter().enumerate() {
+        for (k, (tab, e, rows, cols, lut)) in [(&gt, 2 * n, f, d, (1, gmax)), (&dt, n, d, f, (n, dmax))].into_iter().enumerate() {
             let run = |var: i32, reps: usize| -> Result<f64> {
                 let t0 = Instant::now();
                 for _ in 0..reps {
-                    o.vq_mmv(tab, e, (&cbs[&l], vq_wide(wide, l, var)), &x, (&y, 0), e, rows, cols, v.nbit, var)?;
+                    o.vq_mmv(tab, e, (&cbs[&l], vq_wide(wide, l, var)), &x, (&y, 0), e, rows, cols, v.nbit, var, Some(lut))?;
                 }
                 o.gpu.sync()?;
                 Ok(t0.elapsed().as_secs_f64() * 1e6 / reps as f64)
@@ -1156,11 +1276,13 @@ impl Part {
             classes.entry(vq[&l].span.next_multiple_of(256)).or_default().push(l);
         }
         let total_bytes: usize = classes.iter().map(|(sb, ls)| sb * ls.len() * g.n_expert as usize).sum::<usize>().max(1);
+        let ring_slot = classes.keys().copied().max().unwrap_or(0);
+        let ring_bytes = prompt_ring() * ring_slot;
         let budget = match expert_bytes {
             Some(b) => b,
             None => gpu.memory()?.1.map_or(8usize << 30, |f| {
                 let pass = (900 << 20) + prefill_chunk() * (400 << 10);
-                (f as usize).saturating_sub(pass + arena_bytes() + SMALL_ARENA + kv_reserve + keep_free() + (512 << 20))
+                (f as usize).saturating_sub(pass + arena_bytes() + SMALL_ARENA + kv_reserve + keep_free() + ring_bytes + (512 << 20))
             }),
         };
         let mut stores = Vec::new();
@@ -1284,9 +1406,10 @@ impl Part {
         let zeros = DevBuf::f32(gpu, 4 * g.head_dim as usize)?;
         zeros.fill(0)?;
         let vq_pick = vq_pick(&ops, g, &vq, &cbs, (&cbf, &cbh), &stores, &store_of, &draft, log)?;
+        let ring = if ring_bytes > 0 { Some((DevBuf::new(gpu, ring_bytes)?, ring_slot)) } else { None };
         Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
                   hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
-                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros })
+                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None) })
     }
 }
 
@@ -2457,7 +2580,9 @@ impl<'g> Ds41<'g> {
         tap(&format!("ffn_shexp-{l}"), &y)?;
         let need: Vec<u64> = by.keys().map(|e| *e as u64).collect();
         let promote = t <= MMVQ_COLS;
-        let (slots, arriving, copies) = self.timed(p, "experts: misses", || p.ensure(&self.m, l, &need, promote))?;
+        let staging = !promote && p.ring.is_some() && !p.draft.contains_key(&l);
+        let (slots_of, arriving, copies) =
+            if staging { (Vec::new(), Vec::new(), None) } else { self.timed(p, "experts: misses", || p.ensure(&self.m, l, &need, promote))? };
         let vq = &p.vq[&l];
         let cb = &p.cbs[&l];
         let nbit = vq.nbit;
@@ -2491,7 +2616,7 @@ impl<'g> Ds41<'g> {
                     let mut dmeta: Vec<i32> = Vec::new();
                     for which in 0..2 {
                         for &k in set.iter() {
-                            let base = slots[k].ptr() as u64;
+                            let base = slots_of[k].ptr() as u64;
                             ptrs.push(base + if which == 0 { vq.gate } else { vq.up } as u64);
                             let mut m = vec![lists[k].len() as i32, (which * total + first[k]) as i32];
                             m.extend(lists[k].iter().map(|(ti, _)| *ti));
@@ -2500,7 +2625,7 @@ impl<'g> Ds41<'g> {
                         }
                     }
                     for &k in set.iter() {
-                        dptr.push(slots[k].ptr() as u64 + vq.down as u64);
+                        dptr.push(slots_of[k].ptr() as u64 + vq.down as u64);
                         let mut m = vec![lists[k].len() as i32, first[k] as i32];
                         m.extend((0..lists[k].len()).map(|j| (first[k] + j) as i32));
                         m.resize(10, 0);
@@ -2508,24 +2633,105 @@ impl<'g> Ds41<'g> {
                     }
                     let mut tb: Vec<u8> = ptrs.iter().flat_map(|v| v.to_le_bytes()).collect();
                     tb.extend(i32s(&meta));
-                    let gtab = p.arena.bytes(tb.len())?;
-                    p.upload(&gtab, &tb)?;
                     let mut db: Vec<u8> = dptr.iter().flat_map(|v| v.to_le_bytes()).collect();
                     db.extend(i32s(&dmeta));
+                    let mut pick = p.vq_pick.get(&nbit).copied().unwrap_or([0, 0]);
+                    // the lookup-table variant's lists: gate | up entries by token (the column of x), downs by their row of h
+                    let (mut glut, mut dlut) = (None, None);
+                    if pick[0] == crate::ops::VQ_LUT {
+                        let mut pairs = Vec::new();
+                        for w in 0..2 {
+                            for (i, &k) in set.iter().enumerate() {
+                                for (q, (ti, _)) in lists[k].iter().enumerate() {
+                                    pairs.push((*ti as usize, w * set.len() + i, q));
+                                }
+                            }
+                        }
+                        match crate::ops::lut_lists(t, pairs) {
+                            Some((v, mx)) => {
+                                tb.extend(v);
+                                glut = Some((t, mx));
+                            }
+                            None => pick[0] = 0,
+                        }
+                    }
+                    if pick[1] == crate::ops::VQ_LUT {
+                        let mut pairs = Vec::new();
+                        for (i, &k) in set.iter().enumerate() {
+                            for q in 0..lists[k].len() {
+                                pairs.push((first[k] + q, i, q));
+                            }
+                        }
+                        match crate::ops::lut_lists(total, pairs) {
+                            Some((v, mx)) => {
+                                db.extend(v);
+                                dlut = Some((total, mx));
+                            }
+                            None => pick[1] = 0,
+                        }
+                    }
+                    let gtab = p.arena.bytes(tb.len())?;
+                    p.upload(&gtab, &tb)?;
                     let dtab = p.arena.bytes(db.len())?;
                     p.upload(&dtab, &db)?;
-                    let pick = p.vq_pick.get(&nbit).copied().unwrap_or([0, 0]);
-                    o.vq_mmv(&gtab, ptrs.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, pick[0])), x, (&gu, 0), 2 * total, f, d, nbit, pick[0])?;
+                    o.vq_mmv(&gtab, ptrs.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, pick[0])), x, (&gu, 0), 2 * total, f, d, nbit, pick[0], glut)?;
                     // h = silu(gate) up, in place of the gates (rows of the set only: the same op on the others is a no-op
                     // since they are computed once - the whole range is cheap and simplest)
                     let (gv, uv) = (gu.view(0, total * f * 4)?, gu.view(total * f * 4, total * f * 4)?);
                     let hset = p.arena.f32(total * f)?;
                     o.swiglu_clamp(&gv, &uv, &hset, total * f, lim)?;
-                    o.vq_mmv(&dtab, dptr.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, pick[1])), &hset, (&dn, 0), total, d, f, nbit, pick[1])?;
+                    o.vq_mmv(&dtab, dptr.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, pick[1])), &hset, (&dn, 0), total, d, f, nbit, pick[1], dlut)?;
                     if !wait {
                         TURN_NS.fetch_add(turn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
+                Ok(())
+            })?;
+        } else if staging {
+            self.timed(p, "experts: prompt products", || {
+                // the experts in VRAM multiplied while those in host memory and the file are copied up into the staging
+                // ring, half of it a wave: a wave's copies queued while the one before is multiplied
+                let src = p.locate(l, &need)?;
+                let mut views: Vec<Option<DevBuf>> = src.iter().map(|s| match s {
+                    Src::V(v) => v.view(0, v.len).map(Some),
+                    _ => Ok(None),
+                }).collect::<Result<_>>()?;
+                let resident: Vec<usize> = (0..need.len()).filter(|&k| views[k].is_some()).collect();
+                let mut away: Vec<usize> = (0..need.len()).filter(|&k| matches!(src[k], Src::R(_))).collect();
+                away.extend((0..need.len()).filter(|&k| matches!(src[k], Src::F)));
+                let k_ring = p.ring.as_ref().map_or(0, |r| r.0.len / r.1);
+                let w = (k_ring / 2).clamp(1, STAGE);
+                let waves: Vec<&[usize]> = away.chunks(w).collect();
+                let mut free: Vec<Option<i64>> = vec![*p.ring_free.lock().unwrap(); k_ring];
+                let mut pending: Option<Option<i64>> = None;
+                if let Some(w0) = waves.first() {
+                    let slots: Vec<usize> = (0..w0.len()).collect();
+                    let (v, tk) = p.stage_up(&self.m, l, w0, &need, &src, &slots, &free)?;
+                    for (&k, b) in w0.iter().zip(v) {
+                        views[k] = Some(b);
+                    }
+                    pending = Some(tk);
+                }
+                self.prompt_set(p, l, x, &lists, &first, &views, &resident, &dn, total)?;
+                for (wi, wave) in waves.iter().enumerate() {
+                    if let Some(Some(tk)) = pending.take() {
+                        o.await_ticket(tk)?;
+                    }
+                    self.prompt_set(p, l, x, &lists, &first, &views, wave, &dn, total)?;
+                    let done = Some(o.mark()?);
+                    free[(wi % 2) * w..(wi % 2) * w + wave.len()].fill(done);
+                    if let Some(next) = waves.get(wi + 1) {
+                        let h = (wi + 1) % 2;
+                        let slots: Vec<usize> = (h * w..h * w + next.len()).collect();
+                        let (v, tk) = p.stage_up(&self.m, l, next, &need, &src, &slots, &free)?;
+                        for (&k, b) in next.iter().zip(v) {
+                            views[k] = Some(b);
+                        }
+                        pending = Some(tk);
+                    }
+                }
+                // the ring's last readers: before the next layer's copies
+                *p.ring_free.lock().unwrap() = Some(o.mark()?);
                 Ok(())
             })?;
         } else {
@@ -2533,27 +2739,9 @@ impl<'g> Ds41<'g> {
                 if let Some(tk) = copies {
                     o.await_ticket(tk)?;
                 }
-                let nmax = lists.iter().map(|l| l.len()).max().unwrap_or(1);
-                let xh = p.arena.bytes(nmax * d * 2)?;
-                let w16 = p.arena.bytes(2 * f * d * 2)?;
-                let gu = p.arena.f32(nmax * 2 * f)?;
-                let hh = p.arena.bytes(nmax * f * 2)?;
-                let toks: Vec<i32> = lists.iter().flat_map(|l| l.iter().map(|(ti, _)| *ti)).collect();
-                let tb = p.arena.bytes(total * 4)?;
-                p.upload(&tb, &i32s(&toks))?;
-                for (k, list) in lists.iter().enumerate() {
-                    let n = list.len();
-                    let buf = &slots[k];
-                    let tv = tb.view(first[k] * 4, n * 4)?;
-                    o.gather_f16(x, &tv, &xh, n, d)?;
-                    o.vq_dequant(buf, vq.gate, vq.up - vq.gate, cb, f, d, nbit, &w16.view(0, f * d * 2)?, true)?;
-                    o.vq_dequant(buf, vq.up, vq.down - vq.up, cb, f, d, nbit, &w16.view(f * d * 2, f * d * 2)?, true)?;
-                    o.gemm_f16(n, 2 * f, d, (&xh, 0, d), (&w16, 0), (&gu, 0, 2 * f), false)?;
-                    o.swiglu_gu_f16(&gu, &hh, n, f, lim)?;
-                    o.vq_dequant(buf, vq.down, vq.span - vq.down, cb, d, f, nbit, &w16.view(0, d * f * 2)?, true)?;
-                    o.gemm_f16(n, d, f, (&hh, 0, f), (&w16, 0), (&dn, first[k] * d, d), false)?;
-                }
-                Ok(())
+                let views: Vec<Option<DevBuf>> = slots_of.iter().map(|v| v.view(0, v.len).map(Some)).collect::<Result<_>>()?;
+                let all: Vec<usize> = (0..lists.len()).collect();
+                self.prompt_set(p, l, x, &lists, &first, &views, &all, &dn, total)
             })?;
         }
         let mut t_ptr = vec![0i32];
@@ -2595,6 +2783,114 @@ impl<'g> Ds41<'g> {
             self.timed(p, "experts: prefetch", || p.prefetch(&self.m, l + 1, &want, pf))?;
         }
         Ok(y)
+    }
+
+    /// A prompt pass's products of experts `set` (their payloads at views[k]) for their tokens (lists, first: as moe):
+    /// the few-token ones from their indices, the others expanded to fp16 for a GEMM; into dn's rows
+    #[allow(clippy::too_many_arguments)]
+    fn prompt_set(&self, p: &Part, l: u64, x: &DevBuf, lists: &[&Vec<(i32, f32)>], first: &[usize], views: &[Option<DevBuf>], set: &[usize], dn: &DevBuf,
+                  total: usize) -> Result<()> {
+        let g = &self.m.g;
+        let o = &p.ops;
+        let (d, f) = (g.n_embd as usize, g.ffn_expert as usize);
+        let lim = g.swiglu_limit as f32;
+        let vq = &p.vq[&l];
+        let cb = &p.cbs[&l];
+        let nbit = vq.nbit;
+        if set.is_empty() {
+            return Ok(());
+        }
+            // experts with few tokens straight from their indices (the decode kernels, up to 8 tokens an entry): an
+            // expansion to fp16 writes and reads its whole matrix whatever its tokens
+            let few = prompt_mmv_max();
+            let small: Vec<usize> = set.iter().copied().filter(|&k| lists[k].len() <= few).collect();
+            let mut at = 0;
+            while at < small.len() {
+                // a batch of experts, at most PROMPT_MMV_SLOTS of their tokens
+                let mut end = at;
+                let mut slots = 0;
+                while end < small.len() && (slots + lists[small[end]].len() <= PROMPT_MMV_SLOTS || end == at) {
+                    slots += lists[small[end]].len();
+                    end += 1;
+                }
+                let batch = &small[at..end];
+                at = end;
+                let mk = p.arena.mark();
+                let gu = p.arena.f32(2 * slots * f)?;
+                let hh = p.arena.f32(slots * f)?;
+                let (mut gp, mut gm, mut dp, mut dm) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let mut slot = 0;
+                for &k in batch {
+                    let base = views[k].as_ref().ok_or("an expert not in place")?.ptr() as u64;
+                    for (ci, ch) in lists[k].chunks(MMVQ_COLS).enumerate() {
+                        let j0 = ci * MMVQ_COLS;
+                        for (w, off) in [(0usize, vq.gate), (1, vq.up)] {
+                            gp.push(base + off as u64);
+                            let mut m = vec![ch.len() as i32, (w * slots + slot) as i32];
+                            m.extend(ch.iter().map(|(ti, _)| *ti));
+                            m.resize(10, 0);
+                            gm.extend(m);
+                        }
+                        dp.push(base + vq.down as u64);
+                        let mut m = vec![ch.len() as i32, (first[k] + j0) as i32];
+                        m.extend((0..ch.len()).map(|c| (slot + c) as i32));
+                        m.resize(10, 0);
+                        dm.extend(m);
+                        slot += ch.len();
+                    }
+                }
+                let mut tb: Vec<u8> = gp.iter().flat_map(|v| v.to_le_bytes()).collect();
+                tb.extend(i32s(&gm));
+                let mut db: Vec<u8> = dp.iter().flat_map(|v| v.to_le_bytes()).collect();
+                db.extend(i32s(&dm));
+                let gtab = p.arena.bytes(tb.len())?;
+                p.upload(&gtab, &tb)?;
+                let dtab = p.arena.bytes(db.len())?;
+                p.upload(&dtab, &db)?;
+                let var = prompt_mmv_variant();
+                o.vq_mmv(&gtab, gp.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, var)), x, (&gu, 0), 2 * slots, f, d, nbit, var, None)?;
+                o.swiglu_clamp(&gu.view(0, slots * f * 4)?, &gu.view(slots * f * 4, slots * f * 4)?, &hh, slots * f, lim)?;
+                o.vq_mmv(&dtab, dp.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, var)), &hh, (dn, 0), total, d, f, nbit, var, None)?;
+                p.arena.rewind(mk);
+            }
+            let lists_big: Vec<usize> = set.iter().copied().filter(|&k| lists[k].len() > few).collect();
+            if lists_big.is_empty() {
+                return Ok(());
+            }
+            // fp16 x and h readable to whole tiles of 32 tokens (the XMX product's)
+            let nmax = lists_big.iter().map(|&k| lists[k].len()).max().unwrap_or(1).next_multiple_of(32);
+            let xh = p.arena.bytes(nmax * d * 2)?;
+            let gu = p.arena.f32(nmax * 2 * f)?;
+            let hh = p.arena.bytes(nmax * f * 2)?;
+            let gmax = vq_gemm_max();
+            let w16 = if lists_big.iter().any(|&k| lists[k].len() > gmax) { Some(p.arena.bytes(2 * f * d * 2)?) } else { None };
+            let toks: Vec<i32> = lists.iter().flat_map(|l| l.iter().map(|(ti, _)| *ti)).collect();
+            let tb = p.arena.bytes(total * 4)?;
+            p.upload(&tb, &i32s(&toks))?;
+            let cbh = &p.cbh[&l];
+            for &k in &lists_big {
+                let n = lists[k].len();
+                let buf = views[k].as_ref().ok_or("an expert not in place")?;
+                let tv = tb.view(first[k] * 4, n * 4)?;
+                o.gather_f16(x, &tv, &xh, n, d)?;
+                match &w16 {
+                    Some(w16) if n > gmax => {
+                        o.vq_dequant(buf, vq.gate, vq.up - vq.gate, cb, f, d, nbit, &w16.view(0, f * d * 2)?, true)?;
+                        o.vq_dequant(buf, vq.up, vq.down - vq.up, cb, f, d, nbit, &w16.view(f * d * 2, f * d * 2)?, true)?;
+                        o.gemm_f16(n, 2 * f, d, (&xh, 0, d), (w16, 0), (&gu, 0, 2 * f), false)?;
+                        o.swiglu_gu_f16(&gu, &hh, n, f, lim)?;
+                        o.vq_dequant(buf, vq.down, vq.span - vq.down, cb, d, f, nbit, &w16.view(0, d * f * 2)?, true)?;
+                        o.gemm_f16(n, d, f, (&hh, 0, f), (w16, 0), (dn, first[k] * d, d), false)?;
+                    }
+                    _ => {
+                        let (gv, uv, dv) = (buf.view(vq.gate, vq.up - vq.gate)?, buf.view(vq.up, vq.down - vq.up)?, buf.view(vq.down, vq.span - vq.down)?);
+                        o.vq_gemm(&gv, Some(&uv), f, 2 * f, d, nbit, cbh, &xh, d, n, (&gu, 0), 2 * f)?;
+                        o.swiglu_gu_f16(&gu, &hh, n, f, lim)?;
+                        o.vq_gemm(&dv, None, d, d, f, nbit, cbh, &hh, f, n, (dn, first[k] * d), d)?;
+                    }
+                }
+            }
+        Ok(())
     }
 
     /// The decode requests per expert since load blended into the profile at `path` (old weights halved)
