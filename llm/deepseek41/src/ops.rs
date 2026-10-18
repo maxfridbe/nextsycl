@@ -421,7 +421,9 @@ impl Ops {
     /// The model's low-precision simulation in place on x [rows][cols], a scale a `block` (kind 0 E4M3 / power-of-two
     /// scale, 1 E2M1 / power of two, 2 E2M1 / E4M3 scale)
     pub fn quant_sim(&self, x: &DevBuf, rows: usize, cols: usize, block: usize, kind: i32) -> Result<()> {
-        if rows == 0 {
+        // NS_DS41_QSIM=0: none (a check against a reference without them: their rounding amplifies float noise)
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if rows == 0 || !*ON.get_or_init(|| std::env::var("NS_DS41_QSIM").map_or(true, |v| v != "0")) {
             return Ok(());
         }
         need!(x, rows * cols, "quant_sim x");

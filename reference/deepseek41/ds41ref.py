@@ -36,8 +36,13 @@ def pow2_ceil(x):
     return torch.ldexp(torch.ones_like(x), e)
 
 
+QSIM = os.environ.get('NS_DS41_QSIM', '1') != '0'
+
+
 def fp8_sim(x, block=32):
     """E4M3 with a power-of-two scale a block (amax >= 1e-4), quantized and back."""
+    if not QSIM:
+        return x
     sh = x.shape
     v = x.reshape(-1, block)
     amax = v.abs().amax(-1, keepdim=True).clamp_min(1e-4)
@@ -62,6 +67,8 @@ def e2m1_round(y):
 def fp4_sim(x, block, e4m3_scale):
     """E2M1 a value with a scale a block: a power of two (amax >= 6 x 2^-126, the indexer's), or an E4M3 amax / 6
     (amax >= 6 x 2^-9, the compressed keys')."""
+    if not QSIM:
+        return x
     sh = x.shape
     v = x.reshape(-1, block)
     amax = v.abs().amax(-1, keepdim=True)
@@ -385,6 +392,8 @@ def main():
             if l > 0:
                 pre_mix = teacher_input(args.teacher, f'pre_mix-{l}', (T, r.HC))
         tap(f'l_in-{l}', h)
+        if l > 0:
+            tap(f'pre_mix-{l}', pre_mix)
         if r.engram and l in r.eng_layers:
             h = r.engram_apply(l, h, torch.from_numpy(hashes), tap)
             tap(f'hc_engram-{l}', h)

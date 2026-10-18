@@ -489,6 +489,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_DRAFTS` | 3 | the DSpark towers' drafts a verify pass checks (1..7) | llm deepseek41 |
 | `NS_DS41_PIN_GIB` | 40 | pinned host memory for the experts that do not fit VRAM (at most what is available less 12 GiB) | llm deepseek41 |
 | `NS_DS41_FREE_GIB` | 1.5 | VRAM each GPU keeps free beyond the plan (the xe driver has no out-of-memory path) | llm deepseek41 |
+| `NS_DS41_QSIM` | on | 0: the model's low-precision simulations (fp8 window keys and attention output, fp4 compressed and indexer keys) left out - a check against a reference without them | llm deepseek41 |
 | `NS_DS41_DENSE_F16_MIN` | 64 | dense products of at least this many rows in fp16 on XMX | llm deepseek41 |
 | `NS_DS41_ATTN_XMX` | on | 0: attention on the vector units instead of XMX (deepseek4's kernels, copied) | kernels:llm deepseek41 |
 | `NS_DS41_ATTN_SPLIT` | on | 0: decode rows' attention in one work-group a head group instead of split over the cells | kernels:llm deepseek41 |

@@ -1067,7 +1067,7 @@ impl Part {
         // the big arena lent to the largest store while no prompt chunk needs it
         let mut lent = false;
         if lend_arena() {
-            if let Some(st) = stores.iter().max_by_key(|s| s.lock().unwrap().slot_bytes * s.lock().unwrap().vowner.len()) {
+            if let Some(st) = stores.iter().max_by_key(|s| { let c = s.lock().unwrap(); c.slot_bytes * c.vowner.len() }) {
                 let mut c = st.lock().unwrap();
                 let n = big.len / c.slot_bytes;
                 if n > 0 {
