@@ -87,7 +87,7 @@ int ns_ds41_vq_mmv(ns_gpu* g, const uint64_t* ptrs, const int32_t* meta, int64_t
 int ns_ds41_vq_lut(ns_gpu* g, const uint64_t* ptrs, const int32_t* meta, const int32_t* xl, int64_t nx, int64_t maxn, const uint8_t* cb, const float* x,
                    float* y, int64_t yrows, int64_t rows, int64_t cols, int64_t nbit, int64_t units_per_group);
 /* A prompt pass's expert product on XMX from the indices: y [n][ldy] = x [n][cols] (fp16, rows ldx apart, readable to
- * a multiple of 32 rows) . W^T, W of `rows` rows: rows < split from payload p0, the rest p1's (an expert's gate and up
+ * a multiple of 64 rows) . W^T, W of `rows` rows: rows < split from payload p0, the rest p1's (an expert's gate and up
  * as one); cbh the layer's fp16 codebook (x 2^-8) */
 int ns_ds41_vq_gemm(ns_gpu* g, const void* p0, const void* p1, int64_t split, int64_t rows, int64_t cols, int64_t nbit, const void* cbh, const void* x,
                     int64_t ldx, int64_t n, float* y, int64_t ldy);

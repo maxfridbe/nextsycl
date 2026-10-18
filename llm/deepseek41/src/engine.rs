@@ -98,6 +98,22 @@ fn vq_gemm_max() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_usize("NS_DS41_VQ_GEMM_MAX", 100_000))
 }
+/// A prompt pass's pinned slots for the experts only the file holds (NS_DS41_PROMPT_FILE_SLOTS, default 64; 0: read a
+/// wave at a time on the host thread)
+fn prompt_file_slots() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_PROMPT_FILE_SLOTS", 64))
+}
+/// NS_DS41_PIPE_LOG=1: each prompt chunk's time on each GPU of the pipeline; 2: and each layer's, its attention and
+/// its experts apart (a GPU sync between them: no overlap across layers)
+fn pipe_log() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_PIPE_LOG").is_ok_and(|v| v == "1" || v == "2"))
+}
+fn pipe_split() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_PIPE_LOG").is_ok_and(|v| v == "2"))
+}
 /// Token slots of one batch of a prompt's few-token experts (their gate | up and h in the arena)
 const PROMPT_MMV_SLOTS: usize = 1024;
 
@@ -432,7 +448,13 @@ pub struct Part {
     ring: Option<(DevBuf, usize)>,
     /// the ticket after the last pass's readers of the ring (its next copies wait for it)
     ring_free: Mutex<Option<i64>>,
+    /// a prompt pass's pinned slots for the experts only the file holds: read on threads while the GPU multiplies the
+    /// others, then copied up through the ring; the copy last reading each slot
+    pstage: Option<PStage>,
 }
+
+/// A prompt pass's pinned slots for the file's experts: the buffer, a slot's bytes, the copy last reading each
+type PStage = (Mutex<HostBuf>, usize, Mutex<Vec<Option<i64>>>);
 
 /// Where a prompt pass reads an expert from (Part::locate)
 enum Src {
@@ -758,20 +780,78 @@ impl Part {
         Ok(out)
     }
 
+    /// Experts (k, ex) of layer l only the file holds read into the pinned prompt slots on threads (each slot's last
+    /// copy up done first): k -> its slot. At most as many as there are slots; the rest are left to stage_up.
+    fn read_files(&self, m: &Model, l: u64, files: &[(usize, u64)]) -> Result<HashMap<usize, usize>> {
+        let Some((buf, sb, tks)) = &self.pstage else { return Ok(HashMap::new()) };
+        let vq = &self.vq[&l];
+        let mut buf = buf.lock().unwrap();
+        let n = files.len().min(tks.lock().unwrap().len());
+        {
+            let mut t = tks.lock().unwrap();
+            for tk in t.iter_mut().take(n) {
+                if let Some(x) = tk.take() {
+                    self.ops.ticket_wait(x)?;
+                }
+            }
+        }
+        let failed: Mutex<Option<String>> = Mutex::new(None);
+        let t0 = Instant::now();
+        {
+            let mut chunks: Vec<&mut [u8]> = buf.as_mut_slice().chunks_mut(*sb).take(n).collect();
+            // 8 readers, each a share of the experts
+            let jobs: Vec<(u64, &mut [u8])> = files.iter().take(n).map(|f| f.1).zip(chunks.drain(..)).collect();
+            let per = jobs.len().div_ceil(8).max(1);
+            let mut jobs = jobs;
+            std::thread::scope(|sc| {
+                while !jobs.is_empty() {
+                    let part: Vec<(u64, &mut [u8])> = jobs.drain(..per.min(jobs.len())).collect();
+                    let failed = &failed;
+                    sc.spawn(move || {
+                        for (ex, b) in part {
+                            if let Err(e) = read_expert(m, vq, ex, b) {
+                                *failed.lock().unwrap() = Some(e.0);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        FILE_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        if let Some(x) = failed.into_inner().unwrap() {
+            return Err(Error(format!("reading experts: {x}")));
+        }
+        Ok(files.iter().take(n).enumerate().map(|(i, f)| (f.0, i)).collect())
+    }
+
     /// Experts `ks` of layer l into the staging ring's slots `slots` (their sources `src`: host slots copied up, the
     /// file's read into pinned staging on threads first), each copy after `free[slot]`: their views, the last copy's ticket
     #[allow(clippy::too_many_arguments)]
-    fn stage_up(&self, m: &Model, l: u64, ks: &[usize], need: &[u64], src: &[Src], slots: &[usize], free: &[Option<i64>]) -> Result<(Vec<DevBuf>, Option<i64>)> {
+    #[allow(clippy::too_many_arguments)]
+    fn stage_up(&self, m: &Model, l: u64, ks: &[usize], need: &[u64], src: &[Src], slots: &[usize], free: &[Option<i64>], read: &HashMap<usize, usize>)
+                -> Result<(Vec<DevBuf>, Option<i64>)> {
         let (ring, rs) = self.ring.as_ref().ok_or("no staging ring")?;
         let vq = &self.vq[&l];
         let mut last = None;
         let mut views = Vec::with_capacity(ks.len());
-        let files: Vec<u64> = ks.iter().filter(|&&k| matches!(src[k], Src::F)).map(|&k| need[k]).collect();
+        // the file's experts read ahead (read_files): copied up from their pinned slots
+        let mut rest = Vec::new();
+        for (&k, &s) in ks.iter().zip(slots) {
+            if let (Src::F, Some(&i), Some((buf, sb, tks))) = (&src[k], read.get(&k), &self.pstage) {
+                let v = buf.lock().unwrap().device_view(i * sb, vq.span)?;
+                let t = self.ops.stream_copy_on(1, ring, s * rs, &v, 0, vq.span, &[free[s]])?;
+                tks.lock().unwrap()[i] = Some(t);
+                last = Some(t);
+            } else {
+                rest.push((k, s));
+            }
+        }
+        let files: Vec<u64> = rest.iter().filter(|(k, _)| matches!(src[*k], Src::F)).map(|(k, _)| need[*k]).collect();
         let mut c = self.store(l)?.lock().unwrap();
         let c = &mut *c;
         let staged = if files.is_empty() { HashMap::new() } else { self.stage_reads(m, vq, c, l, &files)? };
         let sb = c.slot_bytes;
-        for (&k, &s) in ks.iter().zip(slots) {
+        for &(k, s) in &rest {
             let from = match &src[k] {
                 Src::R(h) => h.view(0, vq.span)?,
                 Src::F => {
@@ -787,13 +867,14 @@ impl Part {
                     let t = self.ops.stream_copy_on(1, ring, s * rs, &v, 0, vq.span, &[free[s]])?;
                     c.stage_tk[st] = Some(t);
                     last = Some(t);
-                    views.push(ring.view(s * rs, *rs)?);
                     continue;
                 }
                 Src::V(_) => return Err(Error("stage_up: an expert in VRAM".into())),
             };
             let t = self.ops.stream_copy_on(1, ring, s * rs, &from, 0, vq.span, &[free[s]])?;
             last = Some(t);
+        }
+        for &s in slots {
             views.push(ring.view(s * rs, *rs)?);
         }
         Ok((views, last))
@@ -1310,7 +1391,9 @@ impl Part {
                 host.push(HostBuf::new(gpu, k * slot_bytes)?);
                 have += k;
             }
-            let mut all: Vec<(u64, u64)> = ls.iter().flat_map(|l| (0..g.n_expert).map(move |x| (*l, x))).collect();
+            // without a profile, every layer the same share of VRAM, host memory and the file (expert-major order): in
+            // layer order the last layers were the file's alone - a prompt pass read all of their experts from the file
+            let mut all: Vec<(u64, u64)> = (0..g.n_expert).flat_map(|x| ls.iter().map(move |l| (*l, x))).collect();
             if let Some(prof) = expert_profile() {
                 all.sort_by_key(|k| std::cmp::Reverse(prof.get(k).copied().unwrap_or(0.0) as u64));
             }
@@ -1407,9 +1490,11 @@ impl Part {
         zeros.fill(0)?;
         let vq_pick = vq_pick(&ops, g, &vq, &cbs, (&cbf, &cbh), &stores, &store_of, &draft, log)?;
         let ring = if ring_bytes > 0 { Some((DevBuf::new(gpu, ring_bytes)?, ring_slot)) } else { None };
+        let nfs = prompt_file_slots();
+        let pstage = if ring_bytes > 0 && nfs > 0 { Some((Mutex::new(HostBuf::new(gpu, nfs * ring_slot)?), ring_slot, Mutex::new(vec![None; nfs]))) } else { None };
         Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
                   hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
-                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None) })
+                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage })
     }
 }
 
@@ -2059,6 +2144,7 @@ impl<'g> Ds41<'g> {
         let mut sh = Shared::default();
         let keep = t.min(MTP_KEEP);
         for l in run.1..run.2 {
+            let lt0 = Instant::now();
             p.arena.reset();
             let xs = ring[ix].view(0, t * 4 * d * 4)?;
             let pre_in = ring[ix].view(t * 4 * d * 4, t * 16)?;
@@ -2087,7 +2173,16 @@ impl<'g> Ds41<'g> {
             tap(&format!("hc_attn_post-{l}"), &x1.view(0, t * 4 * d * 4)?)?;
             self.timed(p, "hc", || self.hc_half(p, l, Role::HcFfnFn, Role::HcFfnBase, Role::HcFfnScale, Role::FfnNorm, x1, &attn_pre, &ws, t))?;
             tap(&format!("ffn_norm-{l}"), normed)?;
+            let split = (t > MMVQ_COLS && pipe_split()).then(|| -> Result<Instant> {
+                gpu.sync()?;
+                Ok(Instant::now())
+            }).transpose()?;
             let ffn = self.moe(p, l, t, normed, &mut *tap)?;
+            if let Some(t1) = split {
+                gpu.sync()?;
+                let (a, m) = (t1.duration_since(lt0).as_secs_f64(), t1.elapsed().as_secs_f64());
+                eprintln!("[layer {l} ({t} tokens): attention and the rest {:.1} ms, experts {:.1} ms]", a * 1e3, m * 1e3);
+            }
             tap(&format!("ffn_out-{l}"), &ffn)?;
             o.hc_post(&ffn, x1, post, comb, x2, t, d)?;
             // the FFN's pre rides with the streams to the next layer (and part)
@@ -2185,16 +2280,25 @@ impl<'g> Ds41<'g> {
             let ahead = sc.spawn(move || {
                 let mut none = |_: &str, _: &DevBuf| Ok(());
                 let mut at = start;
+                // each chunk's Engram rows asked for a chunk ahead (the reads of a chunk's rows outlast its first layer)
+                let mut next = chunks.first().map(|c| self.engram_start(&hist[..at + c.len()], at));
                 for (i, c) in chunks.iter().enumerate() {
                     if i > 0 && stop(chunks[..i].iter().map(|c| c.len()).sum()) {
                         return;
                     }
-                    let eng = self.engram_start(&hist[..at + c.len()], at);
+                    let t0 = Instant::now();
+                    let eng = next.take().unwrap_or_default();
+                    if let Some(n) = chunks.get(i + 1) {
+                        next = Some(self.engram_start(&hist[..at + c.len() + n.len()], at + c.len()));
+                    }
                     let r = self.streams(runs.0.0, c, &mut none).and_then(|x| self.run_layers(layers, runs.0, x, at, c, &eng, None, &mut none)).and_then(|x| {
                         let mut v = vec![0u8; x.len];
                         x.read(0, &mut v)?;
                         Ok(v)
                     });
+                    if pipe_log() {
+                        eprintln!("[pipeline: chunk {i} ({} tokens) on the first GPU in {:.3} s]", c.len(), t0.elapsed().as_secs_f64());
+                    }
                     let failed = r.is_err();
                     if tx.send(r).is_err() || failed {
                         return;
@@ -2206,7 +2310,9 @@ impl<'g> Ds41<'g> {
             let mut at = start;
             let p1 = &self.parts[runs.1.0];
             for c in chunks.iter() {
+                let tw = Instant::now();
                 let Ok(v) = rx.recv() else { break };
+                let waited = tw.elapsed().as_secs_f64();
                 let step = (|| -> Result<Vec<f32>> {
                     let v = v?;
                     let x = DevBuf::new(&p1.ops.gpu, v.len())?;
@@ -2219,6 +2325,9 @@ impl<'g> Ds41<'g> {
                     }
                     Ok(l)
                 })();
+                if pipe_log() {
+                    eprintln!("[pipeline: chunk at {at} on the second GPU in {:.3} s after waiting {waited:.3} s]", tw.elapsed().as_secs_f64() - waited);
+                }
                 match step {
                     Ok(l) => out = Ok(l),
                     Err(e) => {
@@ -2700,36 +2809,66 @@ impl<'g> Ds41<'g> {
                 let mut away: Vec<usize> = (0..need.len()).filter(|&k| matches!(src[k], Src::R(_))).collect();
                 away.extend((0..need.len()).filter(|&k| matches!(src[k], Src::F)));
                 let k_ring = p.ring.as_ref().map_or(0, |r| r.0.len / r.1);
-                let w = (k_ring / 2).clamp(1, STAGE);
+                let w = (k_ring / 2).max(1);
                 let waves: Vec<&[usize]> = away.chunks(w).collect();
                 let mut free: Vec<Option<i64>> = vec![*p.ring_free.lock().unwrap(); k_ring];
-                let mut pending: Option<Option<i64>> = None;
-                if let Some(w0) = waves.first() {
-                    let slots: Vec<usize> = (0..w0.len()).collect();
-                    let (v, tk) = p.stage_up(&self.m, l, w0, &need, &src, &slots, &free)?;
-                    for (&k, b) in w0.iter().zip(v) {
-                        views[k] = Some(b);
-                    }
-                    pending = Some(tk);
+                // the file's experts read on threads meanwhile (the reads end before the first wave holding one is copied)
+                let files: Vec<(usize, u64)> = away.iter().filter(|&&k| matches!(src[k], Src::F)).map(|&k| (k, need[k])).collect();
+                let has_file = |wave: &[usize]| wave.iter().any(|&k| matches!(src[k], Src::F));
+                if pipe_split() {
+                    eprintln!("[layer {l}: experts {} in VRAM, {} in host memory, {} from the file]", resident.len(), away.len() - files.len(), files.len());
                 }
-                self.prompt_set(p, l, x, &lists, &first, &views, &resident, &dn, total)?;
-                for (wi, wave) in waves.iter().enumerate() {
-                    if let Some(Some(tk)) = pending.take() {
-                        o.await_ticket(tk)?;
-                    }
-                    self.prompt_set(p, l, x, &lists, &first, &views, wave, &dn, total)?;
-                    let done = Some(o.mark()?);
-                    free[(wi % 2) * w..(wi % 2) * w + wave.len()].fill(done);
-                    if let Some(next) = waves.get(wi + 1) {
-                        let h = (wi + 1) % 2;
-                        let slots: Vec<usize> = (h * w..h * w + next.len()).collect();
-                        let (v, tk) = p.stage_up(&self.m, l, next, &need, &src, &slots, &free)?;
-                        for (&k, b) in next.iter().zip(v) {
+                std::thread::scope(|sc| -> Result<()> {
+                    let mut reader = (!files.is_empty()).then(|| sc.spawn(|| {
+                        let t0 = Instant::now();
+                        let r = p.read_files(&self.m, l, &files);
+                        if pipe_split() {
+                            eprintln!("[layer {l}: {} file experts read in {:.1} ms]", files.len(), t0.elapsed().as_secs_f64() * 1e3);
+                        }
+                        r
+                    }));
+                    let mut read: HashMap<usize, usize> = HashMap::new();
+                    let mut join = |read: &mut HashMap<usize, usize>| -> Result<()> {
+                        if let Some(h) = reader.take() {
+                            *read = h.join().map_err(|_| Error("an expert reader panicked".into()))??;
+                        }
+                        Ok(())
+                    };
+                    let mut pending: Option<Option<i64>> = None;
+                    if let Some(w0) = waves.first() {
+                        if has_file(w0) {
+                            join(&mut read)?;
+                        }
+                        let slots: Vec<usize> = (0..w0.len()).collect();
+                        let (v, tk) = p.stage_up(&self.m, l, w0, &need, &src, &slots, &free, &read)?;
+                        for (&k, b) in w0.iter().zip(v) {
                             views[k] = Some(b);
                         }
                         pending = Some(tk);
                     }
-                }
+                    self.prompt_set(p, l, x, &lists, &first, &views, &resident, &dn, total)?;
+                    for (wi, wave) in waves.iter().enumerate() {
+                        if let Some(Some(tk)) = pending.take() {
+                            o.await_ticket(tk)?;
+                        }
+                        self.prompt_set(p, l, x, &lists, &first, &views, wave, &dn, total)?;
+                        let done = Some(o.mark()?);
+                        free[(wi % 2) * w..(wi % 2) * w + wave.len()].fill(done);
+                        if let Some(next) = waves.get(wi + 1) {
+                            if has_file(next) {
+                                join(&mut read)?;
+                            }
+                            let h = (wi + 1) % 2;
+                            let slots: Vec<usize> = (h * w..h * w + next.len()).collect();
+                            let (v, tk) = p.stage_up(&self.m, l, next, &need, &src, &slots, &free, &read)?;
+                            for (&k, b) in next.iter().zip(v) {
+                                views[k] = Some(b);
+                            }
+                            pending = Some(tk);
+                        }
+                    }
+                    join(&mut read)
+                })?;
                 // the ring's last readers: before the next layer's copies
                 *p.ring_free.lock().unwrap() = Some(o.mark()?);
                 Ok(())
@@ -2857,8 +2996,8 @@ impl<'g> Ds41<'g> {
             if lists_big.is_empty() {
                 return Ok(());
             }
-            // fp16 x and h readable to whole tiles of 32 tokens (the XMX product's)
-            let nmax = lists_big.iter().map(|&k| lists[k].len()).max().unwrap_or(1).next_multiple_of(32);
+            // fp16 x and h readable to whole tiles of 64 tokens (the XMX product's)
+            let nmax = lists_big.iter().map(|&k| lists[k].len()).max().unwrap_or(1).next_multiple_of(64);
             let xh = p.arena.bytes(nmax * d * 2)?;
             let gu = p.arena.f32(nmax * 2 * f)?;
             let hh = p.arena.bytes(nmax * f * 2)?;

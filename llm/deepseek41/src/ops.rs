@@ -570,7 +570,7 @@ impl Ops {
         self.ok(rc, "ds41_vq_mmv")
     }
     /// A prompt pass's expert product on XMX from the indices: y [n][ldy] (from float y.1) = x [n][cols] (fp16, rows ldx
-    /// apart, its buffer readable to a multiple of 32 rows) . W^T; W's rows < split from payload p0, the rest from p1
+    /// apart, its buffer readable to a multiple of 64 rows) . W^T; W's rows < split from payload p0, the rest from p1
     #[allow(clippy::too_many_arguments)]
     pub fn vq_gemm(&self, p0: &DevBuf, p1: Option<&DevBuf>, split: usize, rows: usize, cols: usize, nbit: usize, cbh: &DevBuf, x: &DevBuf, ldx: usize, n: usize,
                    y: (&DevBuf, usize), ldy: usize) -> Result<()> {
@@ -578,7 +578,7 @@ impl Ops {
             return Ok(());
         }
         cbh.bounds(0, (1usize << nbit) * 16)?;
-        x.bounds(0, (n.next_multiple_of(32) - 1) * ldx * 2 + cols * 2)?;
+        x.bounds(0, (n.next_multiple_of(64) - 1) * ldx * 2 + cols * 2)?;
         need!(y.0, y.1 + (n - 1) * ldy + rows, "vq_gemm y");
         // SAFETY: x and y checked; the payloads are expert slots of this GPU (or pinned, device-visible) of a layer's
         // matrices with these shapes; cbh holds 2^nbit entries.

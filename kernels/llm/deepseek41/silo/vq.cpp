@@ -313,7 +313,7 @@ inline auto gm_gp(T* p) {
     return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p);
 }
 
-template <bool PLANE, int MT, int KS>
+template <bool PLANE, int MT, int KS, bool DIRECT>
 void vq_gemm_run(sycl::queue& q, const uint8_t* p0, const uint8_t* p1, int64_t split, int64_t rows, int64_t cols, const sycl::half* cbh,
                  const sycl::half* x, int64_t ldx, int64_t n, float* y, int64_t ldy) {
     const int64_t rtiles = rows / 16, ttiles = (n + 8 * MT - 1) / (8 * MT), units = cols / 64, ups = (units + KS - 1) / KS;
@@ -337,6 +337,32 @@ void vq_gemm_run(sycl::queue& q, const uint8_t* p0, const uint8_t* p1, int64_t s
 #pragma unroll
             for (int mm = 0; mm < MT; ++mm) jm::joint_matrix_fill(sg, acc[mm], 0.0f);
             const int64_t ua = s * ups, ub = sycl::min<int64_t>(units, ua + ups);
+            if constexpr (DIRECT) {
+                // lane n holds column n of a B tile (16 consecutive k of weight row n: glm5next's probed layout): two
+                // indices' 16 values straight into the tile, no local memory
+                for (int64_t u = ua; u < ub; ++u) {
+                    uint32_t idx[8];
+                    chunk_idx(srow + 3 * u, PLANE ? prow[u] : 0u, idx);
+#pragma unroll
+                    for (int kt = 0; kt < 4; ++kt) {
+                        const sycl::vec<sycl::half, 8> h0 = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(cbh + (size_t) idx[2 * kt] * 8);
+                        const sycl::vec<sycl::half, 8> h1 = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(cbh + (size_t) idx[2 * kt + 1] * 8);
+                        jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> bm;
+                        jm::joint_matrix_fill(sg, bm, sycl::half(0));
+                        int e = 0;
+                        jm::joint_matrix_apply(sg, bm, [&](sycl::half& hh) {
+                            hh = e < 8 ? h0[e & 7] : h1[e & 7];
+                            ++e;
+                        });
+#pragma unroll
+                        for (int mm = 0; mm < MT; ++mm) {
+                            jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> am;
+                            jm::joint_matrix_load(sg, am, gm_gp(x + (tok0 + 8 * mm) * ldx + u * 64 + kt * 16), (size_t) ldx);
+                            jm::joint_matrix_mad(sg, acc[mm], am, bm, acc[mm]);
+                        }
+                    }
+                }
+            } else
             for (int64_t u = ua; u < ub; ++u) {
                 uint32_t idx[8];
                 chunk_idx(srow + 3 * u, PLANE ? prow[u] : 0u, idx);
@@ -629,8 +655,21 @@ int ns_ds41_vq_gemm(ns_gpu* g, const void* p0, const void* p1, int64_t split, in
     const auto* b = static_cast<const uint8_t*>(p1 ? p1 : p0);
     const auto* ch = static_cast<const sycl::half*>(cbh);
     const auto* xh = static_cast<const sycl::half*>(x);
-    if (nbit > 12) vq_gemm_run<true, 4, 8>(g->q, a, b, split, rows, cols, ch, xh, ldx, n, y, ldy);
-    else vq_gemm_run<false, 4, 8>(g->q, a, b, split, rows, cols, ch, xh, ldx, n, y, ldy);
+    // NS_DS41_VQ_GEMM_V: 0 the B tiles through local memory, 1 straight into the tiles' registers (8 K slices a
+    // work-group); 2 / 3 as they with 4 K slices; 4 / 5 as 2 / 3 and past 32 tokens 8 token tiles a sub-group. B70 + B65,
+    // an 8,734-token prompt: 379 / 415 / 435 / 421 / 441 / 472 tok/s (one run each: +-5%)
+    static const int v = [] { const char* e = std::getenv("NS_DS41_VQ_GEMM_V"); return e ? std::atoi(e) : 5; }();
+#define VG(P, M, KS, D) vq_gemm_run<P, M, KS, D>(g->q, a, b, split, rows, cols, ch, xh, ldx, n, y, ldy)
+    // past 32 tokens, 8 token tiles a sub-group (each decoded row meets 64 tokens)
+    const bool wide = n > 32 && v >= 4;
+    if (nbit > 12) {
+        if (wide) { if (v == 4) VG(true, 8, 4, false); else VG(true, 8, 4, true); }
+        else if (v == 0) VG(true, 4, 8, false); else if (v == 2 || v == 4) VG(true, 4, 4, false); else if (v == 3 || v == 5) VG(true, 4, 4, true); else VG(true, 4, 8, true);
+    } else {
+        if (wide) { if (v == 4) VG(false, 8, 4, false); else VG(false, 8, 4, true); }
+        else if (v == 0) VG(false, 4, 8, false); else if (v == 2 || v == 4) VG(false, 4, 4, false); else if (v == 3 || v == 5) VG(false, 4, 4, true); else VG(false, 4, 8, true);
+    }
+#undef VG
     return 0;
     NS_CATCH
 }

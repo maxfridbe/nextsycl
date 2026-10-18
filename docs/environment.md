@@ -497,7 +497,10 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_PROMPT_MMV` | 0 | a prompt pass's experts with at most this many of its tokens multiplied by the decode kernels (8 tokens an entry) instead of the XMX product from the indices (vq_gemm, faster at every count measured) | llm deepseek41 |
 | `NS_DS41_PROMPT_MMV_V` | 3 | the decode kernels' variant (NS_DS41_VQ_V's numbers) for those experts | llm deepseek41 |
 | `NS_DS41_PROMPT_RING` | 24 | a prompt pass's VRAM staging slots (a slot an expert, from each GPU's expert memory) for the experts in host memory or only in the file: copied up on the copy lane, half the ring a wave, while the others are multiplied (0: host-memory experts read in place, the file's swapped in) | llm deepseek41 |
+| `NS_DS41_PROMPT_FILE_SLOTS` | 64 | a prompt pass's pinned slots (each GPU) for the experts only the file holds: read on 8 threads while the GPU multiplies the others (0: a wave at a time on the host thread) | llm deepseek41 |
+| `NS_DS41_PIPE_LOG` | 0 | 1: each prompt chunk's time on each GPU of the two-GPU pipeline (and the second's wait for the first), on stderr; 2: and each layer's attention and experts apart (a GPU sync between them) | llm deepseek41 |
 | `NS_DS41_VQ_GEMM_MAX` | 100000 | a prompt pass's experts past NS_DS41_PROMPT_MMV tokens and up to this many multiplied on XMX straight from their indices; more expanded to fp16 for a GEMM (0: all expanded) | llm deepseek41 |
+| `NS_DS41_VQ_GEMM_V` | 5 | Experiment: the prompt's XMX expert product's form - 0 its B tiles through local memory, 1 decoded straight into the tiles' registers (8 K slices a work-group), 2 / 3 the same with 4 K slices, 4 / 5 as 2 / 3 and past 32 tokens 8 token tiles a sub-group | kernels:llm deepseek41 |
 | `NS_DS41_VQ_BENCH` | 0,1 | `llm kernels`: the VQ decode variants it times | llm deepseek41 |
 | `NS_DS41_Q4K_R` | 4 | Experiment: rows a sub-group of decode's q4_K products (1, 2 or 4) | kernels:llm deepseek41 |
 | `NS_DS41_VQ_RPG` | 8 | Experiment: sub-groups a work-group of the VQ decode products | kernels:llm deepseek41 |
