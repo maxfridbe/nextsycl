@@ -382,9 +382,20 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   `ns_audio_mm3_conv1d_lr`); its own (`kernels/audio/qwen3tts`) are the codec's: SnakeBeta, the depthwise causal
   convolution, attention over a causal window, float32 RoPE, layer-scaled residuals, ELU (the encoder's); the
   encoder's strided causal convolutions go through `ns_audio_mm3_conv1d_lr` too. The text embedding stays
-  on disk (a row read a token). Settings: `NS_Q3T_INT8=1` (`--opt-int8`). The codec (decoder, encoder, resampler) is
-  the foundation crate `nextsycl-codec12hz`, which Breeze TTS 2 shares; its kernels stay in `q3t.cpp` (shared kernels
-  now: rule 6).
+  on disk (a row read a token). Its silo (`kernels/audio/qwen3tts/silo`, `dist/silo/libnextsycl-qwen3tts.so`,
+  `device.rs`) runs the whole frame on the device: the products with the RMS norm before them read in and SwiGLU taken
+  out (one kernel each), q / k norm + RoPE + the cache's store + attention in one kernel (the talker's keys in parts
+  of ~32 merged by the last work-group to finish), the draws on the GPU (repetition penalty, suppressed ids,
+  temperature, top-k by a radix select, splitmix64 - a seed repeats on the device, not the host path's draws), the
+  predictor's input rows from a table made at load (`proj(E_g(c)) + b`); a frame recorded once a request as a SYCL
+  command graph and replayed, the host reading each frame's codes three frames behind. Its int8 keeps a half scale
+  every 32 weights (Q8_0's blocks); without the silo (`NS_SILO=0`) the shared kernels with the draws on the host and
+  int8 a scale a row. Settings: `NS_Q3T_INT8=1` (`--opt-int8`), `NS_Q3T_INT8_ROWS=1`, `NS_Q3T_EAGER=1` (no graph),
+  `NS_Q3T_PROFILE=1` (stage timings); `nextsycl audio check DIR --stages kernels` times the silo's kernels. The codec
+  (decoder, encoder, resampler) is the foundation crate `nextsycl-codec12hz`, which Breeze TTS 2 shares; its kernels
+  stay in `q3t.cpp` (shared kernels now: rule 6). The engine decodes through `decode_bucketed` (each chunk padded to
+  50 / 100 / 175 / 250 / 325 frames - the decoder is causal - so its oneDNN primitives are made once a length, the two
+  shortest at load).
 - **breezetts2** - Breeze TTS 2 from CrispASR's GGUF (q8_0 or q4_k: F16 / Q8_0 / Q4_0 / Q4_K expanded to half on the
   host at load; the text embedding stays on disk), the checkpoint's tokenizer.json and Qwen's codec file (the same as
   Qwen3-TTS's). The backbone (Qwen3) and depth decoder (Llama, llama3 RoPE) run on the MiniMax Music engine's kernels
