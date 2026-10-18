@@ -88,6 +88,80 @@ void q4k_rows(sycl::queue& q, const BlockQ4K* wb, int64_t rows, int64_t nb, cons
         }
     });
 }
+
+// The same products with each weight decoded once for all the columns (a verify pass's rows): per 8 weights, the
+// columns' x loaded, then each row's weights met by every column - the arithmetic of a column exactly q4k_rows's (the
+// same sums in the same order), so a verify row equals its one-row product. MC columns at most (1, 2, 4, 8).
+template <int R, int MC>
+void q4k_cols(sycl::queue& q, const BlockQ4K* wb, int64_t rows, int64_t nb, const float* x, int64_t xcs, int64_t rpg, int64_t xgs, float* y, int64_t ycs,
+              int64_t t) {
+    constexpr int SG = 16, SPG = 8;
+    const int64_t rb = (rows + R - 1) / R;
+    q.parallel_for(sycl::nd_range<1>((rb + SPG - 1) / SPG * SPG * SG, SPG * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const auto sg = it.get_sub_group();
+        const int64_t r0 = (it.get_group(0) * SPG + sg.get_group_id()[0]) * R;
+        const int lane = sg.get_local_id()[0];
+        if (r0 >= rows) return;
+        const int nr = (int) sycl::min<int64_t>(R, rows - r0);
+        const float* xr = x + (rpg > 0 ? (r0 / rpg) * xgs : 0);
+        float acc[R][MC] = {};
+        for (int64_t i = lane; i < nb * 4; i += SG) {
+            const int64_t b = i >> 2;
+            const int k = (int) (i & 3);
+            const int64_t x0 = b * 256 + k * 64;
+            float slo[MC] = {}, shi[MC] = {};
+            float lo[R][MC] = {}, hi[R][MC] = {};
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                sycl::float4 xa[MC], xb[MC];
+#pragma unroll
+                for (int c = 0; c < MC; ++c) {
+                    if (c >= t) break;
+                    const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(xr + c * xcs + x0);
+                    xa[c] = xv[u];
+                    xb[c] = xv[8 + u];
+                    slo[c] += xa[c].x() + xa[c].y() + xa[c].z() + xa[c].w();
+                    shi[c] += xb[c].x() + xb[c].y() + xb[c].z() + xb[c].w();
+                }
+#pragma unroll
+                for (int rr = 0; rr < R; ++rr) {
+                    if (rr >= nr) break;
+                    const uint32_t qq = reinterpret_cast<const uint32_t*>(wb[(r0 + rr) * nb + b].qs + 32 * k)[u];
+                    const float q0 = (float) (qq & 0xF), q1 = (float) ((qq >> 8) & 0xF), q2 = (float) ((qq >> 16) & 0xF), q3 = (float) ((qq >> 24) & 0xF);
+                    const float q4 = (float) ((qq >> 4) & 0xF), q5 = (float) ((qq >> 12) & 0xF), q6 = (float) ((qq >> 20) & 0xF), q7 = (float) ((qq >> 28) & 0xF);
+#pragma unroll
+                    for (int c = 0; c < MC; ++c) {
+                        if (c >= t) break;
+                        lo[rr][c] += q0 * xa[c].x() + q1 * xa[c].y() + q2 * xa[c].z() + q3 * xa[c].w();
+                        hi[rr][c] += q4 * xb[c].x() + q5 * xb[c].y() + q6 * xb[c].z() + q7 * xb[c].w();
+                    }
+                }
+            }
+#pragma unroll
+            for (int rr = 0; rr < R; ++rr) {
+                if (rr >= nr) break;
+                const BlockQ4K& blk = wb[(r0 + rr) * nb + b];
+                const float d = (float) blk.d, dm = (float) blk.dmin;
+                float s0, m0, s1, m1;
+                scale_min(2 * k, blk.scales, s0, m0);
+                scale_min(2 * k + 1, blk.scales, s1, m1);
+#pragma unroll
+                for (int c = 0; c < MC; ++c) {
+                    if (c >= t) break;
+                    acc[rr][c] += d * s0 * lo[rr][c] - dm * m0 * slo[c] + d * s1 * hi[rr][c] - dm * m1 * shi[c];
+                }
+            }
+        }
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+            if (rr >= nr) break;
+            for (int c = 0; c < t; ++c) {
+                const float s = sycl::reduce_over_group(sg, acc[rr][c], sycl::plus<float>());
+                if (lane == 0) y[c * ycs + r0 + rr] = s;
+            }
+        }
+    });
+}
 }  // namespace
 
 extern "C" {
@@ -97,6 +171,19 @@ int ns_ds41_q4k_mv(ns_gpu* g, const void* w, int64_t rows, int64_t cols, const f
     NS_TRY
     if (cols % 256 != 0 || t < 1 || t > 8) return ns_fail("ns_ds41_q4k_mv: cols a multiple of 256, 1..8 columns");
     static const int rows_sg = [] { const char* v = std::getenv("NS_DS41_Q4K_R"); return v ? std::atoi(v) : 4; }();
+    // several columns (a verify pass): each weight decoded once for all of them, the same arithmetic a column as the
+    // one-column kernel's (NS_DS41_Q4K_COLS: 0 never, 1 one column too; default: from two)
+    static const int cols_once = [] { const char* v = std::getenv("NS_DS41_Q4K_COLS"); return v ? std::atoi(v) : 2; }();
+    if (cols_once > 0 && t >= cols_once) {
+        if (rpg > 0 && rpg % 4 != 0) return ns_fail("ns_ds41_q4k_mv: a group's rows a multiple of 4");
+        const BlockQ4K* wb = static_cast<const BlockQ4K*>(w);
+        const int64_t nb = cols / 256;
+        if (t == 1) q4k_cols<4, 1>(g->q, wb, rows, nb, x, xcs, rpg, xgs, y, ycs, t);
+        else if (t == 2) q4k_cols<4, 2>(g->q, wb, rows, nb, x, xcs, rpg, xgs, y, ycs, t);
+        else if (t <= 4) q4k_cols<4, 4>(g->q, wb, rows, nb, x, xcs, rpg, xgs, y, ycs, t);
+        else q4k_cols<2, 8>(g->q, wb, rows, nb, x, xcs, rpg, xgs, y, ycs, t);
+        return 0;
+    }
     if (rows_sg == 2 || rows_sg == 4) {
         if (rpg > 0 && rpg % rows_sg != 0) return ns_fail("ns_ds41_q4k_mv: a group's rows a multiple of the rows a sub-group");
         const BlockQ4K* wb = static_cast<const BlockQ4K*>(w);

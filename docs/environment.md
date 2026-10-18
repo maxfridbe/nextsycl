@@ -506,6 +506,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_VQ_GEMM_V` | 5 | Experiment: the prompt's XMX expert product's form - 0 its B tiles through local memory, 1 decoded straight into the tiles' registers (8 K slices a work-group), 2 / 3 the same with 4 K slices, 4 / 5 as 2 / 3 and past 32 tokens 8 token tiles a sub-group | kernels:llm deepseek41 |
 | `NS_DS41_VQ_BENCH` | 0,1 | `llm kernels`: the VQ decode variants it times | llm deepseek41 |
 | `NS_DS41_Q4K_R` | 4 | Experiment: rows a sub-group of decode's q4_K products (1, 2 or 4) | kernels:llm deepseek41 |
+| `NS_DS41_Q4K_COLS` | 2 | decode's q4_K products decode each weight once for all of a pass's columns from this many columns (a verify pass; the same arithmetic a column as the one-column kernel, so verify rows stay bit-identical); 1 one column too, 0 never | kernels:llm deepseek41 |
 | `NS_DS41_VQ_RPG` | 8 | Experiment: sub-groups a work-group of the VQ decode products | kernels:llm deepseek41 |
 | `NS_DS41_VQ_RPS` | 1 | Experiment: rows a sub-group of the VQ decode products takes in turn | kernels:llm deepseek41 |
 | `NS_DS41_Q4K` | on | 0: decode's q4_K products through the shared Q8_1 quantization and product (o_a a launch a group) instead of this engine's float32 kernel | llm deepseek41 |

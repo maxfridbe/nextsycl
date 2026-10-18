@@ -1170,7 +1170,7 @@ fn vq_wide<'a>(wide: (&'a HashMap<u64, DevBuf>, &'a HashMap<u64, DevBuf>), l: u6
 #[allow(clippy::too_many_arguments)]
 fn vq_pick(o: &Ops, g: &crate::model::Geometry, vq: &HashMap<u64, LayerVq>, cbs: &HashMap<u64, DevBuf>, wide: (&HashMap<u64, DevBuf>, &HashMap<u64, DevBuf>),
            stores: &[Mutex<Store>],
-           store_of: &HashMap<u64, usize>, draft: &HashMap<u64, DevBuf>, log: &mut dyn FnMut(String)) -> Result<HashMap<usize, [i32; 2]>> {
+           store_of: &HashMap<u64, usize>, draft: &HashMap<u64, DevBuf>, mtp: bool, log: &mut dyn FnMut(String)) -> Result<HashMap<usize, [i32; 2]>> {
     let mut out = HashMap::new();
     if let Some(v) = std::env::var("NS_DS41_VQ_V").ok().and_then(|v| v.parse::<i32>().ok()) {
         for l in vq.values() {
@@ -1239,7 +1239,9 @@ fn vq_pick(o: &Ops, g: &crate::model::Geometry, vq: &HashMap<u64, LayerVq>, cbs:
                 run(0, 10)?;
             }
             let mut best = [f64::MAX; VQ_VARIANTS];
-            let lut = std::env::var("NS_DS41_VQ_LUT").map_or(true, |v| v != "0");
+            // not with the draft towers: the table is built a column at a time (a verify pass's rows cost each its own),
+            // and one-token passes must use the verify passes' kernel (their rows bit-identical)
+            let lut = !mtp && std::env::var("NS_DS41_VQ_LUT").map_or(true, |v| v != "0");
             for _ in 0..2 {
                 for (var, b) in best.iter_mut().enumerate().filter(|(v, _)| lut || *v as i32 != crate::ops::VQ_LUT) {
                     *b = b.min(run(var as i32, 20)?);
@@ -1504,7 +1506,7 @@ impl Part {
         let cand = DevBuf::new(gpu, if g.cand_top > 0 { prefill_chunk().max(MAX_VERIFY) * g.cand_top as usize * 4 } else { 4 })?;
         let zeros = DevBuf::f32(gpu, 4 * g.head_dim as usize)?;
         zeros.fill(0)?;
-        let vq_pick = vq_pick(&ops, g, &vq, &cbs, (&cbf, &cbh), &stores, &store_of, &draft, log)?;
+        let vq_pick = vq_pick(&ops, g, &vq, &cbs, (&cbf, &cbh), &stores, &store_of, &draft, mtp, log)?;
         let ring = if ring_bytes > 0 { Some((DevBuf::new(gpu, ring_bytes)?, ring_slot)) } else { None };
         let nfs = prompt_file_slots();
         let pstage = if ring_bytes > 0 && nfs > 0 { Some((Mutex::new(HostBuf::new(gpu, nfs * ring_slot)?), ring_slot, Mutex::new(vec![None; nfs]))) } else { None };
