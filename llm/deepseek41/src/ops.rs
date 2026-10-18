@@ -513,22 +513,34 @@ impl Ops {
     /// Decode products of expert matrices: `table` = u64 payload pointers [entries], then i32 meta [entries][10]
     /// ({ncol, y0, cols}); y [(y0 + c) * rows + r] (floats from `y.1`, `y_rows` rows of `rows` in all)
     #[allow(clippy::too_many_arguments)]
-    pub fn vq_mmv(&self, table: &DevBuf, entries: usize, cb: &DevBuf, x: &DevBuf, y: (&DevBuf, usize), y_rows: usize, rows: usize, cols: usize, nbit: usize)
-                  -> Result<()> {
+    pub fn vq_mmv(&self, table: &DevBuf, entries: usize, cb: (&DevBuf, Option<&DevBuf>), x: &DevBuf, y: (&DevBuf, usize), y_rows: usize, rows: usize, cols: usize,
+                  nbit: usize) -> Result<()> {
         if entries == 0 {
             return Ok(());
         }
+        let (cb, cbf) = cb;
         table.bounds(0, entries * 48)?;
         cb.bounds(0, (1usize << nbit) * 8)?;
+        if let Some(f) = cbf {
+            f.bounds(0, (1usize << nbit) * 32)?;
+        }
         need!(y.0, y.1 + y_rows * rows, "vq_mmv y");
         // SAFETY: sizes checked; the pointers are VRAM / pinned slots of this GPU holding the payloads, the columns
         // the caller's rows of x.
         let rc = unsafe {
             let base = table.ptr().cast::<u8>();
-            (self.k.ds41_vq_mmv)(self.raw(), base.cast(), base.add(entries * 8).cast(), entries as i64, cb.ptr().cast(), x.fp(), y.0.fp().add(y.1), rows as i64,
-                                 cols as i64, nbit as i64)
+            (self.k.ds41_vq_mmv)(self.raw(), base.cast(), base.add(entries * 8).cast(), entries as i64, cb.ptr().cast(), cbf.map_or(std::ptr::null(), |f| f.fp()),
+                                 x.fp(), y.0.fp().add(y.1), rows as i64, cols as i64, nbit as i64)
         };
         self.ok(rc, "ds41_vq_mmv")
+    }
+    /// A codebook's E4M3 bytes widened to float32 (x 2^-8) for the decode products
+    pub fn vq_codebook_f32(&self, cb: &DevBuf, n: usize, out: &DevBuf) -> Result<()> {
+        cb.bounds(0, n)?;
+        need!(out, n, "vq_codebook_f32 out");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds41_vq_codebook_f32)(self.raw(), cb.ptr().cast(), n as i64, out.fp()) };
+        self.ok(rc, "ds41_vq_codebook_f32")
     }
     /// Rows [r0, r0 + n) of an fp8_32x32 matrix [rows][cols] (stored at bytes `at` of w) expanded into dst
     #[allow(clippy::too_many_arguments)]
@@ -540,6 +552,23 @@ impl Ops {
             (self.k.ds41_fp8_dequant)(self.raw(), w.ptr().cast::<u8>().add(at).cast(), rows as i64, cols as i64, r0 as i64, n as i64, dst.ptr(), f16 as i32)
         };
         self.ok(rc, "ds41_fp8_dequant")
+    }
+    /// y = W . x for a q4_K W [rows][cols] and t (1..8) float32 columns: x (floats from x.1, columns x.2 apart; with
+    /// `group` = (rows a group, floats apart) a row block's input moves by its group), y (from y.1, columns y.2 apart)
+    #[allow(clippy::too_many_arguments)]
+    pub fn q4k_mv(&self, w: &DevBuf, rows: usize, cols: usize, x: (&DevBuf, usize, usize), group: Option<(usize, usize)>, y: (&DevBuf, usize, usize), t: usize)
+                  -> Result<()> {
+        w.bounds(0, rows * cols / 256 * 144)?;
+        let (rpg, xgs) = group.unwrap_or((0, 0));
+        let groups = if rpg > 0 { rows.div_ceil(rpg) } else { 1 };
+        need!(x.0, x.1 + (t - 1) * x.2 + (groups - 1) * xgs + cols, "q4k_mv x");
+        need!(y.0, y.1 + (t - 1) * y.2 + rows, "q4k_mv y");
+        // SAFETY: sizes checked.
+        let rc = unsafe {
+            (self.k.ds41_q4k_mv)(self.raw(), w.ptr(), rows as i64, cols as i64, x.0.fp().add(x.1), x.2 as i64, rpg as i64, xgs as i64, y.0.fp().add(y.1),
+                                 y.2 as i64, t as i64)
+        };
+        self.ok(rc, "ds41_q4k_mv")
     }
     /// y [t][rows] (floats from y.1) = W . x [t][cols] (floats from x.1), t 1..8
     pub fn fp8_mmv(&self, w: &DevBuf, rows: usize, cols: usize, x: (&DevBuf, usize), y: (&DevBuf, usize), t: usize) -> Result<()> {

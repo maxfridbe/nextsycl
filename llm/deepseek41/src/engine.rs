@@ -90,6 +90,13 @@ fn prefetch_p() -> f32 {
 /// glm5next / deepseek4 measurement: a first guess here)
 const GUESS_HIT: [f32; 16] = [0.96, 0.92, 0.86, 0.77, 0.66, 0.56, 0.45, 0.36, 0.29, 0.22, 0.18, 0.15, 0.12, 0.11, 0.09, 0.08];
 
+/// Decode's q4_K products by this engine's kernel on float32 activations, o_a's groups in one launch (NS_DS41_Q4K=0:
+/// the shared Q8_1 quantization and product, a launch a group)
+fn q4k_own() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_Q4K").map_or(true, |v| v != "0"))
+}
+
 /// Whether the big arena lends its memory to the expert store while no prompt chunk needs it (NS_LEND=0: no)
 fn lend_arena() -> bool {
     std::env::var("NS_LEND").map_or(true, |v| v != "0")
@@ -307,7 +314,15 @@ struct Store {
     lent: bool,
     pf_issued: u64,
     pf_used: u64,
+    /// pinned staging slots for experts read from the file (copied up from there on the copy lane, not through a
+    /// queue drain), and the copy last reading each
+    stage: HostBuf,
+    stage_tk: Vec<Option<i64>>,
+    stage_next: usize,
 }
+
+/// the file reads a layer takes at once (in parallel, into the staging slots)
+const STAGE: usize = 16;
 
 impl Store {
     fn victims(&self, tick: u64) -> Vec<usize> {
@@ -347,6 +362,8 @@ pub struct Part {
     biases: Mutex<HashMap<u64, Arc<Vec<f32>>>>,
     vq: HashMap<u64, LayerVq>,
     cbs: HashMap<u64, DevBuf>,
+    /// the codebooks as float32 (the decode products' weights without a conversion each)
+    cbf: HashMap<u64, DevBuf>,
     /// the expert stores (one a span size) and the store of each layer
     stores: Vec<Mutex<Store>>,
     store_of: HashMap<u64, usize>,
@@ -528,6 +545,9 @@ impl Part {
             }
             return Ok(());
         }
+        if !acc && t <= MMVQ_COLS && w.ty == GType::Q4K && q4k_own() {
+            return o.q4k_mv(&w.buf, w.rows, w.cols, x, None, y, t);
+        }
         if !acc && t <= MMVQ_COLS && contiguous && o.mmvq_supported(w.ty.code()) {
             o.quantize_q8_1((x.0, x.1), &self.q8, w.cols, t)?;
             return o.mmvq(w.ty.code(), (&w.buf, 0), w.buf.len, &self.q8, (y.0, y.1), w.cols, w.rows, t);
@@ -614,10 +634,10 @@ impl Part {
         c.prefetched.retain(|k, _| k.0 != l);
         if !missing.is_empty() {
             let order = c.victims(tick);
-            let mut buf: Option<Vec<u8>> = None;
+            let staged = self.stage_reads(m, vq, c, l, &missing)?;
             for (ex, &s) in missing.iter().zip(&order) {
                 c.misses += 1;
-                if let Some(tk) = self.swap_in(m, vq, c, l, *ex, s, &mut reading, &mut buf)? {
+                if let Some(tk) = self.swap_in(m, vq, c, l, *ex, s, &mut reading, &staged)? {
                     last = Some(last.map_or(tk, |a| a.max(tk)));
                     pending.push(*ex);
                 }
@@ -648,7 +668,7 @@ impl Part {
     /// Expert (l, ex) into VRAM slot s: the slot's expert down to a free host slot, the wanted one up from its host
     /// slot or the file (read on this thread: the queue first drained of the copies that could touch the slot)
     #[allow(clippy::too_many_arguments)]
-    fn swap_in(&self, m: &Model, vq: &LayerVq, c: &mut Store, l: u64, ex: u64, s: usize, reading: &mut HashMap<usize, i64>, buf: &mut Option<Vec<u8>>)
+    fn swap_in(&self, m: &Model, vq: &LayerVq, c: &mut Store, l: u64, ex: u64, s: usize, reading: &mut HashMap<usize, i64>, staged: &HashMap<u64, usize>)
                -> Result<Option<i64>> {
         let key = (l, ex);
         let (vch, vo) = c.vat(s);
@@ -683,20 +703,66 @@ impl Part {
             }
             _ => {
                 c.from_file += 1;
-                for t in [c.last_up, c.down_any].into_iter().flatten() {
-                    self.ops.await_ticket(t)?;
-                }
-                self.ops.gpu.sync()?;
-                let b = buf.get_or_insert_with(|| vec![0u8; sb]);
-                read_expert(m, vq, ex, b)?;
-                c.vram[vch].write(vo, &b[..vq.span])?;
-                c.vfill.remove(&s);
-                None
+                let k = match staged.get(&ex) {
+                    Some(&k) => k,
+                    None => {
+                        let k = self.stage_slot(c)?;
+                        read_expert(m, vq, ex, &mut c.stage.as_mut_slice()[k * sb..(k + 1) * sb])?;
+                        k
+                    }
+                };
+                let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &c.stage.device_view(k * sb, sb)?, 0, vq.span, &[down, fill])?;
+                c.stage_tk[k] = Some(t);
+                c.vfill.insert(s, t);
+                c.last_up = Some(t);
+                Some(t)
             }
         };
         c.vowner[s] = Some(key);
         c.loc.insert(key, Loc::V(s));
         Ok(up)
+    }
+
+    /// A free staging slot (the copy last reading it done)
+    fn stage_slot(&self, c: &mut Store) -> Result<usize> {
+        let k = c.stage_next % STAGE;
+        c.stage_next += 1;
+        if let Some(t) = c.stage_tk[k].take() {
+            self.ops.ticket_wait(t)?;
+        }
+        Ok(k)
+    }
+
+    /// The experts of `missing` held by neither VRAM nor host memory read from the file into staging slots, up to
+    /// STAGE of them at once on threads of their own: expert -> its slot
+    fn stage_reads(&self, m: &Model, vq: &LayerVq, c: &mut Store, l: u64, missing: &[u64]) -> Result<HashMap<u64, usize>> {
+        let file: Vec<u64> = missing.iter().copied().filter(|x| !c.loc.contains_key(&(l, *x))).take(STAGE).collect();
+        let mut at = HashMap::new();
+        if file.is_empty() {
+            return Ok(at);
+        }
+        let ks = file.iter().map(|_| self.stage_slot(c)).collect::<Result<Vec<_>>>()?;
+        let sb = c.slot_bytes;
+        let mut slices: Vec<Option<&mut [u8]>> = c.stage.as_mut_slice().chunks_mut(sb).map(Some).collect();
+        let jobs: Vec<(u64, &mut [u8])> = file.iter().zip(&ks).map(|(x, k)| (*x, slices[*k].take().unwrap())).collect();
+        let failed: Mutex<Option<String>> = Mutex::new(None);
+        std::thread::scope(|sc| {
+            for (x, buf) in jobs {
+                let failed = &failed;
+                sc.spawn(move || {
+                    if let Err(e) = read_expert(m, vq, x, buf) {
+                        *failed.lock().unwrap() = Some(e.0);
+                    }
+                });
+            }
+        });
+        if let Some(x) = failed.into_inner().unwrap() {
+            return Err(Error(format!("reading experts: {x}")));
+        }
+        for (x, k) in file.iter().zip(ks) {
+            at.insert(*x, k);
+        }
+        Ok(at)
     }
 
     /// Decode: the experts layer l is expected to want, swapped in now (only ones in host memory; at most `limit`)
@@ -712,9 +778,9 @@ impl Part {
         }
         let order = c.victims(tick);
         let mut reading: HashMap<usize, i64> = HashMap::new();
-        let mut buf = None;
+        let none = HashMap::new();
         for (ex, &s) in cand.iter().zip(&order) {
-            if let Some(tk) = self.swap_in(m, vq, c, l, *ex, s, &mut reading, &mut buf)? {
+            if let Some(tk) = self.swap_in(m, vq, c, l, *ex, s, &mut reading, &none)? {
                 c.prefetched.insert((l, *ex), tk);
                 c.pf_issued += 1;
             }
@@ -929,6 +995,7 @@ impl Part {
         // the experts: each layer's layout and codebook
         let mut vq = HashMap::new();
         let mut cbs = HashMap::new();
+        let mut cbf = HashMap::new();
         for l in layers.clone().chain(towers.iter().copied()) {
             let v = layer_vq(m, l)?;
             if !ops.vq_supported(g.ffn_expert as usize, g.n_embd as usize, v.nbit) {
@@ -936,6 +1003,9 @@ impl Part {
             }
             let cb = DevBuf::new(gpu, v.cb_bytes.len())?;
             cb.write(0, &v.cb_bytes)?;
+            let f = DevBuf::f32(gpu, v.cb_bytes.len())?;
+            ops.vq_codebook_f32(&cb, v.cb_bytes.len(), &f)?;
+            cbf.insert(l, f);
             cbs.insert(l, cb);
             vq.insert(l, v);
         }
@@ -1059,7 +1129,7 @@ impl Part {
             stores.push(Mutex::new(Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree: (in_r.len()..nr).collect(), tick: 0, hits: 0,
                                            misses: 0, from_host: 0, from_file: 0, direct: 0, rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(),
                                            last_up: None, prefetched: HashMap::new(), usage: HashMap::new(), base: nv, lend: 0, lent: false, pf_issued: 0,
-                                           pf_used: 0 }));
+                                           pf_used: 0, stage: HostBuf::new(gpu, STAGE * slot_bytes)?, stage_tk: vec![None; STAGE], stage_next: 0 }));
         }
         log(format!("{}: {:.2} GiB of weights, the experts loaded in {:.1} s", gpu.name, gib(bytes as usize), t0.elapsed().as_secs_f64()));
         let big = DevBuf::new(gpu, arena_bytes())?;
@@ -1090,7 +1160,7 @@ impl Part {
         let cand = DevBuf::new(gpu, if g.cand_top > 0 { prefill_chunk().max(MAX_VERIFY) * g.cand_top as usize * 4 } else { 4 })?;
         let zeros = DevBuf::f32(gpu, 4 * g.head_dim as usize)?;
         zeros.fill(0)?;
-        Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), vq, cbs, stores, store_of, draft,
+        Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), vq, cbs, cbf, stores, store_of, draft,
                   hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
                   up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros })
     }
@@ -1647,6 +1717,11 @@ impl<'g> Ds41<'g> {
         let o = &p.ops;
         let (ng, ol, gw) = (g.o_groups as usize, g.o_lora as usize, (g.n_head * g.head_dim / g.o_groups) as usize);
         match p.groups.get(&l) {
+            Some(_) if tr <= MMVQ_COLS && q4k_own() => {
+                // every group in one launch: rows [g o_lora, ..) read their heads [g gw, ..) of att's row
+                let w = p.mat(l, Role::OutA)?;
+                o.q4k_mv(&w.buf, w.rows, w.cols, (att, 0, ng * gw), Some((ol, gw)), (oa, r0 * ng * ol, ng * ol), tr)
+            }
             Some(gm) => {
                 let perm = perm.view(0, tr * ng * gw * 4)?;
                 o.permute(att, &perm, tr, ng, gw)?;
@@ -2231,6 +2306,7 @@ impl<'g> Ds41<'g> {
         let (slots, arriving, copies) = self.timed(p, "experts: misses", || p.ensure(&self.m, l, &need, promote))?;
         let vq = &p.vq[&l];
         let cb = &p.cbs[&l];
+        let cbf = if std::env::var("NS_DS41_VQ_F32CB").map_or(true, |v| v != "0") { p.cbf.get(&l) } else { None };
         let nbit = vq.nbit;
         let total: usize = by.values().map(|v| v.len()).sum();
         let lists: Vec<&Vec<(i32, f32)>> = by.values().collect();
@@ -2285,13 +2361,13 @@ impl<'g> Ds41<'g> {
                     db.extend(i32s(&dmeta));
                     let dtab = p.arena.bytes(db.len())?;
                     p.upload(&dtab, &db)?;
-                    o.vq_mmv(&gtab, ptrs.len(), cb, x, (&gu, 0), 2 * total, f, d, nbit)?;
+                    o.vq_mmv(&gtab, ptrs.len(), (cb, cbf), x, (&gu, 0), 2 * total, f, d, nbit)?;
                     // h = silu(gate) up, in place of the gates (rows of the set only: the same op on the others is a no-op
                     // since they are computed once - the whole range is cheap and simplest)
                     let (gv, uv) = (gu.view(0, total * f * 4)?, gu.view(total * f * 4, total * f * 4)?);
                     let hset = p.arena.f32(total * f)?;
                     o.swiglu_clamp(&gv, &uv, &hset, total * f, lim)?;
-                    o.vq_mmv(&dtab, dptr.len(), cb, &hset, (&dn, 0), total, d, f, nbit)?;
+                    o.vq_mmv(&dtab, dptr.len(), (cb, cbf), &hset, (&dn, 0), total, d, f, nbit)?;
                 }
                 Ok(())
             })?;

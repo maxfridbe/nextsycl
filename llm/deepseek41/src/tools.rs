@@ -164,7 +164,7 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
             tab.write(0, &tb).map_err(e)?;
             let yd = DevBuf::f32(&g, 3 * rows).map_err(e)?;
             let t0 = std::time::Instant::now();
-            o.vq_mmv(&tab, 1, &cbd, &xd, (&yd, 0), 3, rows, cols, nbit).map_err(e)?;
+            o.vq_mmv(&tab, 1, (&cbd, None), &xd, (&yd, 0), 3, rows, cols, nbit).map_err(e)?;
             g.sync().map_err(e)?;
             let us = t0.elapsed().as_secs_f64() * 1e6;
             let y = yd.to_f32().map_err(e)?;
@@ -177,6 +177,76 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
             let (yrel, _) = compare(&y, &yw);
             println!("{:<26} {}-bit [{rows} x {cols}]: expanded rel err {rel:.2e} (max {mx:.2e}), 3-column product rel err {yrel:.2e} ({us:.0} us)",
                      format!("{} {}", t.name, ["gate", "up", "down"][which]), nbit);
+        }
+    }
+    // a decode layer's products: 6 experts' gate | up in one launch, their downs in another, one token (12-bit layer)
+    {
+        let l = 20u64;
+        let t = m.tensor(l, Role::Experts).ok_or("no blob")?;
+        let n_e = 6usize;
+        let span = 6_700_000usize;
+        let raw = {
+            let mut v = vec![0u8; (16 + 384 * 24) as usize];
+            f.read_into(t, 0, &mut v).map_err(|e| e.0)?;
+            v
+        };
+        let slot = |x: usize, w: usize| u64::from_le_bytes(raw[16 + (x * 3 + w) * 8..24 + (x * 3 + w) * 8].try_into().unwrap());
+        let mut ph = [0u8; 32];
+        f.read_into(t, slot(0, 0), &mut ph).map_err(|e| e.0)?;
+        let cb_off = u64::from_le_bytes(ph[24..32].try_into().unwrap());
+        let mut cb = vec![0u8; 4096 * 8];
+        f.read_into(t, cb_off, &mut cb).map_err(|e| e.0)?;
+        let cbd = DevBuf::new(&g, cb.len()).map_err(e)?;
+        cbd.write(0, &cb).map_err(e)?;
+        let buf = DevBuf::new(&g, n_e * span).map_err(e)?;
+        let mut tb: Vec<u8> = Vec::new();
+        let mut meta: Vec<i32> = Vec::new();
+        let mut db: Vec<u8> = Vec::new();
+        let mut dmeta: Vec<i32> = Vec::new();
+        for x in 0..n_e {
+            let s0 = slot(x * 50, 0);
+            let len = (slot(x * 50, 2) - s0) as usize + 5120 * 2 + 32 + 5120 * 216 + 4;
+            let mut v = vec![0u8; len.min(span)];
+            f.read_into(t, s0, &mut v).map_err(|e| e.0)?;
+            buf.write(x * span, &v).map_err(e)?;
+            let base = buf.ptr() as u64 + (x * span) as u64;
+            for w in 0..2 {
+                tb.extend((base + slot(x * 50, w) - s0).to_le_bytes());
+                meta.extend([1, (w * n_e + x) as i32, 0, 0, 0, 0, 0, 0, 0, 0]);
+            }
+            db.extend((base + slot(x * 50, 2) - s0).to_le_bytes());
+            dmeta.extend([1, x as i32, x as i32, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        tb.extend(meta.iter().flat_map(|v| v.to_le_bytes()));
+        db.extend(dmeta.iter().flat_map(|v| v.to_le_bytes()));
+        let gt = DevBuf::new(&g, tb.len()).map_err(e)?;
+        gt.write(0, &tb).map_err(e)?;
+        let dt = DevBuf::new(&g, db.len()).map_err(e)?;
+        dt.write(0, &db).map_err(e)?;
+        let x: Vec<f32> = (0..d).map(|_| rnd()).collect();
+        let xd = DevBuf::from_f32(&g, &x).map_err(e)?;
+        let gu = DevBuf::f32(&g, 2 * n_e * ff).map_err(e)?;
+        let h: Vec<f32> = (0..n_e * ff).map(|_| rnd()).collect();
+        let hd = DevBuf::from_f32(&g, &h).map_err(e)?;
+        let dn = DevBuf::f32(&g, n_e * d).map_err(e)?;
+        let cbf = DevBuf::f32(&g, cb.len()).map_err(e)?;
+        o.vq_codebook_f32(&cbd, cb.len(), &cbf).map_err(e)?;
+        let wf = std::env::var("NS_DS41_VQ_F32CB").map_or(true, |v| v != "0");
+        let cbs = (&cbd, if wf { Some(&cbf) } else { None });
+        for (name, tab, n, x, y, rows, cols) in [("gate | up", &gt, 2 * n_e, &xd, &gu, ff, d), ("down", &dt, n_e, &hd, &dn, d, ff)] {
+            for _ in 0..3 {
+                o.vq_mmv(tab, n, cbs, x, (y, 0), n, rows, cols, 12).map_err(e)?;
+            }
+            g.sync().map_err(e)?;
+            let it = 50;
+            let t0 = std::time::Instant::now();
+            for _ in 0..it {
+                o.vq_mmv(tab, n, cbs, x, (y, 0), n, rows, cols, 12).map_err(e)?;
+            }
+            g.sync().map_err(e)?;
+            let us = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
+            let bytes = n * rows * (cols * 12 / 64 + 2);
+            println!("vq_mmv {name:<10} {n} matrices [{rows} x {cols}], 1 token: {us:.1} us ({:.0} GB/s of indices)", bytes as f64 / us / 1e3);
         }
     }
     // an fp8_32x32 matrix: the Engram's wkv, rows [0, 64)

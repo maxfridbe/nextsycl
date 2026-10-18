@@ -14,6 +14,7 @@
 #include <sycl/sycl.hpp>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 namespace {
 
@@ -59,6 +60,13 @@ int ns_ds41_vq_supported(int64_t rows, int64_t cols, int64_t nbit) {
     return rows > 0 && cols % 64 == 0 && (nbit == 12 || nbit == 13);
 }
 
+int ns_ds41_vq_codebook_f32(ns_gpu* g, const uint8_t* cb, int64_t n, float* out) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { out[i] = e4m3_scaled(cb[i]); });
+    return 0;
+    NS_CATCH
+}
+
 int ns_ds41_vq_dequant(ns_gpu* g, const void* payload, const uint8_t* cb, int64_t rows, int64_t cols, int64_t nbit, void* out, int f16) {
     NS_TRY
     if (!ns_ds41_vq_supported(rows, cols, nbit)) return ns_fail("ns_ds41_vq_dequant: cols a multiple of 64, 12 or 13 bits");
@@ -85,18 +93,27 @@ int ns_ds41_vq_dequant(ns_gpu* g, const void* payload, const uint8_t* cb, int64_
     NS_CATCH
 }
 
-// a sub-group of 16 an output row, 8 rows a work-group; each lane a run of 64-column chunks, every column at once
-int ns_ds41_vq_mmv(ns_gpu* g, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const uint8_t* cb, const float* x, float* y, int64_t rows,
-                   int64_t cols, int64_t nbit) {
+// A sub-group of 16 an output row, RPG rows a work-group (RPS a sub-group in turn); each lane a run of 64-column chunks,
+// every column at once. The codebook's gathers go through L1 (a lane an index): as float32 (cbf, widened once a layer:
+// no conversion a weight) or the E4M3 bytes. Measured on the B70 (6 experts of a 12-bit layer, one token): gate | up
+// 208 us, down 121 us with cbf (218 / 144 from the bytes); kept local-memory codebooks (bytes, fp16; persistent or not;
+// rows staged; 4 rows sharing the activations) all measured slower, 217-720 us.
+int ns_ds41_vq_mmv(ns_gpu* g, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const uint8_t* cb, const float* cbf, const float* x, float* y,
+                   int64_t rows, int64_t cols, int64_t nbit) {
     NS_TRY
     if (!ns_ds41_vq_supported(rows, cols, nbit)) return ns_fail("ns_ds41_vq_mmv: cols a multiple of 64, 12 or 13 bits");
-    constexpr int SG = 16, RPG = 8, MC = 8;
-    const int64_t rgs = (rows + RPG - 1) / RPG, chunks = cols / 64;
+    constexpr int SG = 16, MC = 8;
+    static const int rpg_s = [] { const char* v = std::getenv("NS_DS41_VQ_RPG"); return v ? std::atoi(v) : 8; }();
+    static const int rps_s = [] { const char* v = std::getenv("NS_DS41_VQ_RPS"); return v ? std::atoi(v) : 1; }();
+    const int RPG = rpg_s, RPS = rps_s;
+    const int64_t rgs = (rows + RPG * RPS - 1) / (RPG * RPS), chunks = cols / 64;
     const bool plane = nbit > 12;
     g->q.parallel_for(sycl::nd_range<1>(entries * rgs * RPG * SG, RPG * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
         const auto sg = it.get_sub_group();
-        const int64_t gi = it.get_group(0), e = gi / rgs, r = (gi % rgs) * RPG + sg.get_group_id()[0];
+        const int64_t gi = it.get_group(0), e = gi / rgs, r0 = ((gi % rgs) * RPG + sg.get_group_id()[0]) * RPS;
         const int lane = sg.get_local_id()[0];
+        for (int q = 0; q < RPS; ++q) {
+        const int64_t r = r0 + q;
         if (r >= rows) return;
         const int32_t* me = meta + e * 10;
         const int nc = me[0];
@@ -109,12 +126,19 @@ int ns_ds41_vq_mmv(ns_gpu* g, const uint64_t* ptrs, const int32_t* meta, int64_t
             chunk_idx(reinterpret_cast<const uint32_t*>(srow + 12 * k), prow ? prow[k] : 0u, idx);
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                const sycl::uint2 w = *reinterpret_cast<const sycl::uint2*>(cb + (size_t) idx[i] * 8);
                 float wv[8];
+                if (cbf) {
+                    const sycl::float4* cw = reinterpret_cast<const sycl::float4*>(cbf + (size_t) idx[i] * 8);
+                    const sycl::float4 c0 = cw[0], c1 = cw[1];
+                    wv[0] = c0.x(); wv[1] = c0.y(); wv[2] = c0.z(); wv[3] = c0.w();
+                    wv[4] = c1.x(); wv[5] = c1.y(); wv[6] = c1.z(); wv[7] = c1.w();
+                } else {
+                    const sycl::uint2 w = *reinterpret_cast<const sycl::uint2*>(cb + (size_t) idx[i] * 8);
 #pragma unroll
-                for (int d = 0; d < 4; ++d) {
-                    wv[d] = e4m3_scaled((w.x() >> (8 * d)) & 0xFF);
-                    wv[4 + d] = e4m3_scaled((w.y() >> (8 * d)) & 0xFF);
+                    for (int d = 0; d < 4; ++d) {
+                        wv[d] = e4m3_scaled((w.x() >> (8 * d)) & 0xFF);
+                        wv[4 + d] = e4m3_scaled((w.y() >> (8 * d)) & 0xFF);
+                    }
                 }
                 for (int c = 0; c < nc; ++c) {
                     const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(x + (int64_t) me[2 + c] * cols + k * 64 + i * 8);
@@ -127,6 +151,7 @@ int ns_ds41_vq_mmv(ns_gpu* g, const uint64_t* ptrs, const int32_t* meta, int64_t
         for (int c = 0; c < nc; ++c) {
             const float s = sycl::reduce_over_group(sg, acc[c], sycl::plus<float>());
             if (lane == 0) y[(int64_t) (me[1] + c) * rows + r] = s * gn;
+        }
         }
     });
     return 0;

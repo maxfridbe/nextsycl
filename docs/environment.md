@@ -490,6 +490,10 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_PIN_GIB` | 40 | pinned host memory for the experts that do not fit VRAM (at most what is available less 12 GiB) | llm deepseek41 |
 | `NS_DS41_FREE_GIB` | 1.5 | VRAM each GPU keeps free beyond the plan (the xe driver has no out-of-memory path) | llm deepseek41 |
 | `NS_DS41_QSIM` | on | 0: the model's low-precision simulations (fp8 window keys and attention output, fp4 compressed and indexer keys) left out - a check against a reference without them | llm deepseek41 |
+| `NS_DS41_VQ_F32CB` | on | 0: the VQ decode products convert each codebook byte instead of reading the codebook widened to float32 | llm deepseek41 |
+| `NS_DS41_VQ_RPG` | 8 | Experiment: sub-groups a work-group of the VQ decode products | kernels:llm deepseek41 |
+| `NS_DS41_VQ_RPS` | 1 | Experiment: rows a sub-group of the VQ decode products takes in turn | kernels:llm deepseek41 |
+| `NS_DS41_Q4K` | on | 0: decode's q4_K products through the shared Q8_1 quantization and product (o_a a launch a group) instead of this engine's float32 kernel | llm deepseek41 |
 | `NS_DS41_DENSE_F16_MIN` | 64 | dense products of at least this many rows in fp16 on XMX | llm deepseek41 |
 | `NS_DS41_ATTN_XMX` | on | 0: attention on the vector units instead of XMX (deepseek4's kernels, copied) | kernels:llm deepseek41 |
 | `NS_DS41_ATTN_SPLIT` | on | 0: decode rows' attention in one work-group a head group instead of split over the cells | kernels:llm deepseek41 |

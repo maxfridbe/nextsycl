@@ -53,8 +53,10 @@ pub struct Api {
     pub ds41_cand_mask: unsafe extern "C" fn(Gpu, *mut f32, *const i32, *mut u8, i64, i64, i64, i64, i64) -> c_int,
     pub ds41_vq_supported: unsafe extern "C" fn(i64, i64, i64) -> c_int,
     pub ds41_vq_dequant: unsafe extern "C" fn(Gpu, *const c_void, *const u8, i64, i64, i64, *mut c_void, c_int) -> c_int,
-    pub ds41_vq_mmv: unsafe extern "C" fn(Gpu, *const u64, *const i32, i64, *const u8, *const f32, *mut f32, i64, i64, i64) -> c_int,
+    pub ds41_vq_mmv: unsafe extern "C" fn(Gpu, *const u64, *const i32, i64, *const u8, *const f32, *const f32, *mut f32, i64, i64, i64) -> c_int,
+    pub ds41_vq_codebook_f32: unsafe extern "C" fn(Gpu, *const u8, i64, *mut f32) -> c_int,
     pub ds41_fp8_dequant: unsafe extern "C" fn(Gpu, *const u8, i64, i64, i64, i64, *mut c_void, c_int) -> c_int,
+    pub ds41_q4k_mv: unsafe extern "C" fn(Gpu, *const c_void, i64, i64, *const f32, i64, i64, i64, *mut f32, i64, i64) -> c_int,
     pub ds41_fp8_mmv: unsafe extern "C" fn(Gpu, *const u8, i64, i64, *const f32, *mut f32, i64) -> c_int,
 }
 
@@ -139,8 +141,10 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             ds41_vq_supported: own!("ns_ds41_vq_supported"),
             ds41_vq_dequant: own!("ns_ds41_vq_dequant"),
             ds41_vq_mmv: own!("ns_ds41_vq_mmv"),
+            ds41_vq_codebook_f32: own!("ns_ds41_vq_codebook_f32"),
             ds41_fp8_dequant: own!("ns_ds41_fp8_dequant"),
             ds41_fp8_mmv: own!("ns_ds41_fp8_mmv"),
+            ds41_q4k_mv: own!("ns_ds41_q4k_mv"),
         })
     })
     .as_ref()
