@@ -219,9 +219,15 @@ impl Tokenizer {
             .enumerate()
             .filter_map(|(i, m)| m.split_once(' ').map(|(a, b)| ((a.to_string(), b.to_string()), i)))
             .collect();
-        // 3 = control, 4 = user-defined: matched literally
+        // 3 = control, 4 = user-defined: matched literally. A file without the types (YoungAi's DeepSeek-V4.1 GGUF):
+        // DeepSeek's added tokens by their form - <｜...｜> and the think tags - or its chat template's markers would be
+        // split into ordinary pieces
+        let marked = |i: usize, t: &str| match types.get(i) {
+            Some(ty) => matches!(ty, 3 | 4),
+            None => types.is_empty() && ((t.starts_with("<\u{ff5c}") && t.ends_with("\u{ff5c}>") && t.chars().count() > 4) || t == "<think>" || t == "</think>"),
+        };
         let mut special: Vec<(String, u32)> = tokens.iter().enumerate()
-            .filter(|(i, t)| matches!(types.get(*i), Some(3) | Some(4)) && !t.is_empty() && !t.starts_with("[PAD"))
+            .filter(|(i, t)| marked(*i, t) && !t.is_empty() && !t.starts_with("[PAD"))
             .map(|(i, t)| (t.clone(), i as u32))
             .collect();
         special.sort_by_key(|s| std::cmp::Reverse(s.0.len()));

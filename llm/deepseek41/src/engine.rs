@@ -1228,8 +1228,9 @@ fn vq_pick(o: &Ops, g: &crate::model::Geometry, vq: &HashMap<u64, LayerVq>, cbs:
                 run(0, 10)?;
             }
             let mut best = [f64::MAX; VQ_VARIANTS];
+            let lut = std::env::var("NS_DS41_VQ_LUT").map_or(true, |v| v != "0");
             for _ in 0..2 {
-                for (var, b) in best.iter_mut().enumerate() {
+                for (var, b) in best.iter_mut().enumerate().filter(|(v, _)| lut || *v as i32 != crate::ops::VQ_LUT) {
                     *b = b.min(run(var as i32, 20)?);
                 }
             }
@@ -1393,7 +1394,11 @@ impl Part {
             }
             // without a profile, every layer the same share of VRAM, host memory and the file (expert-major order): in
             // layer order the last layers were the file's alone - a prompt pass read all of their experts from the file
-            let mut all: Vec<(u64, u64)> = (0..g.n_expert).flat_map(|x| ls.iter().map(move |l| (*l, x))).collect();
+            let mut all: Vec<(u64, u64)> = if std::env::var("NS_DS41_PLACE").is_ok_and(|v| v == "layer") {
+                ls.iter().flat_map(|l| (0..g.n_expert).map(move |x| (*l, x))).collect()
+            } else {
+                (0..g.n_expert).flat_map(|x| ls.iter().map(move |l| (*l, x))).collect()
+            };
             if let Some(prof) = expert_profile() {
                 all.sort_by_key(|k| std::cmp::Reverse(prof.get(k).copied().unwrap_or(0.0) as u64));
             }
