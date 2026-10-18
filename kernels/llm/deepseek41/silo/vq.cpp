@@ -159,13 +159,20 @@ int ns_ds41_vq_dequant(ns_gpu* g, const void* payload, const uint8_t* cb, int64_
         uint32_t idx[8];
         chunk_idx(reinterpret_cast<const uint32_t*>(m.stream + r * m.mrow + 12 * k), m.plane ? m.plane[r * m.prow + k] : 0u, idx);
         const float gn = (float) m.gains[r] * 256.f;
+#pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const uint8_t* c = cb + (size_t) idx[i] * 8;
-            for (int d = 0; d < 8; ++d) {
-                const float v = e4m3_scaled(c[d]) * gn;
-                const int64_t at = r * cols + k * 64 + i * 8 + d;
-                if (f16) oh[at] = (sycl::half) v;
-                else of[at] = v;
+            // an index's 8 bytes in one load (byte loads were 8 gathers an index: what bound a prompt pass's experts)
+            float wv[8];
+            vq_weights<0>(cb, nullptr, idx[i], wv);
+            const int64_t at = r * cols + k * 64 + i * 8;
+            if (f16) {
+                sycl::vec<sycl::half, 8> h;
+#pragma unroll
+                for (int d = 0; d < 8; ++d) h[d] = (sycl::half) (wv[d] * gn);
+                *reinterpret_cast<sycl::vec<sycl::half, 8>*>(oh + at) = h;
+            } else {
+#pragma unroll
+                for (int d = 0; d < 8; ++d) of[at + d] = wv[d] * gn;
             }
         }
     });
