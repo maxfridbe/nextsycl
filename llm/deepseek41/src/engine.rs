@@ -117,6 +117,11 @@ fn pipeline() -> bool {
     std::env::var("NS_PIPELINE").map_or(true, |v| v != "0")
 }
 
+/// Whether the DSpark towers load and draft (NS_DS41_MTP=1; default off)
+pub fn mtp_on() -> bool {
+    std::env::var("NS_DS41_MTP").is_ok_and(|v| v == "1")
+}
+
 /// Drafts a verify pass checks (NS_DS41_DRAFTS, 1..7, default 2: the third is rarely kept)
 pub fn mtp_drafts() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1326,7 +1331,10 @@ impl<'g> Ds41<'g> {
         bounds.push(n);
         let mut parts = Vec::new();
         let mut owner = vec![0usize; n as usize];
-        let mtp = draft && g.n_mtp > 0;
+        // the towers only when asked for (NS_DS41_MTP=1): on the B70 + B65 their drafts cost more than they save on
+        // prose (a verify pass's rows cost nearly what one-token passes do: the decode products are ALU-bound), and
+        // without them the last GPU holds ~2.9 GiB more experts
+        let mtp = draft && g.n_mtp > 0 && mtp_on();
         for (i, gpu) in gpus.iter().enumerate() {
             let range = bounds[i]..bounds[i + 1];
             for l in range.clone() {

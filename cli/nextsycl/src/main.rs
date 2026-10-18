@@ -649,6 +649,23 @@ fn spec_check(args: &[String]) -> Result<(), String> {
         la = eng.forward(&mut a, &[t], &mut none).map_err(e)?;
         refs.push(la.clone());
     }
+    if args.iter().any(|a| a == "--prefill") {
+        // the one-token passes' logits against a prompt pass over the same tokens, at a quarter, half, three quarters
+        // and all of them: the decode path's caches (a window, compressed keys, indexer keys) against the prompt path's
+        println!("{:>6} {:>10} {:>12} {:>6}", "tokens", "cosine", "max |diff|", "top1");
+        for m in [n / 4, n / 2, 3 * n / 4, n].into_iter().filter(|m| *m > 0) {
+            let mut c = eng.session(ids.len() + n + 4).map_err(e)?;
+            let all: Vec<u32> = ids.iter().chain(&toks[..m]).copied().collect();
+            let got = eng.feed(&mut c, &all, &mut none).map_err(e)?;
+            let want = &refs[m - 1];
+            let dot: f64 = got.iter().zip(want).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let na: f64 = got.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = want.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let d = got.iter().zip(want.iter()).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            println!("{:>6} {:>10.6} {:>12.5} {:>6}", all.len(), dot / (na * nb).max(1e-30), d, if argmax(&got) == argmax(want) { "same" } else { "FLIP" });
+        }
+        return Ok(());
+    }
     let mut b = eng.session(ids.len() + n + 4).map_err(e)?;
     eng.feed(&mut b, &ids, &mut none).map_err(e)?;
     if args.iter().any(|a| a == "--layers") {
