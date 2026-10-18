@@ -9,7 +9,7 @@ arch: vibevoice
 title: 'VibeVoice-1.5B Q8_0 (long-form speech of up to four speakers in English and Chinese, 24 kHz: voices cloned from recordings, no transcript needed)'
 about: 'VibeVoice-1.5B (Microsoft): a Qwen2.5-1.5B language model reads a script of up to four speakers ("Speaker 1: ...") and their voices'' recordings; a diffusion head draws each 7.5 Hz frame''s acoustic latent and the σ-VAE decoder makes the sound - gguf-org''s Q8_0 GGUF (the language model 8-bit, the tokenizers and head BF16), half on the GPU. Voice cloning from a recording alone (no transcript), multi-speaker dialogue (podcasts), long-form (tens of minutes). MIT; Microsoft asks that it not impersonate anyone without consent'
 gpus: '0'
-vram_gib: 6.0                   # its memory on the card when it runs (measured on a B70: 4.9 GiB of weights, 5.6 GiB in a 46 s run)
+vram_gib: 4.5                   # its memory on the card when it runs (measured: 3.6 GiB of weights, 4.0 GiB in a 46 s run)
 speech:
 - clone                         # a recording, or a saved voice, with or without its transcript
 - speakers                      # a script of several speakers, each with a voice (voices / ref_audios: one a speaker)

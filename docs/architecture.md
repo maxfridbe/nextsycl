@@ -394,19 +394,23 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   Guidance (an instruction's design or direction) runs a second backbone over the prompt without the instruction; the
   depth decoder runs both branches as one batch of two. Draws on the host. Per-request options: `NS_BZ2_GREEDY`,
   `NS_BZ2_TEMPERATURE`, `NS_BZ2_TOP_K`.
-- **vibevoice** - VibeVoice-1.5B from gguf-org's GGUF (the language model Q8_0, the rest BF16; all expanded to half on
-  the host at load, the convolutions float32 for oneDNN; the token embedding stays on disk, of the tied output head only
-  the four tokens it may say are on the card) with the -hf checkpoint's tokenizer.json and config.json (the shapes and
-  constants the GGUF does not state). The language model (Qwen2.5-1.5B: q / k / v biases, 12 query heads over 2) runs
-  on the music engine's small-batch product and key / value store, Breeze's table RoPE and its own attention for six
-  query heads a key head (`kernels/audio/vibevoice/vv.cpp`, a copy of mm3's: rule 6); the prompt's wide products are
-  oneDNN's half GEMM. Guidance: a second, negative cache from an audio start alone, stepped only on audio frames (as
-  upstream). The diffusion head's two branches run as two rows of the small-batch product; DPM-Solver++ (2M,
-  v-prediction, cosine betas) steps on the host. The σ-VAE tokenizers stream a frame at a time over time rows: each
-  causal convolution carries its last inputs (`vv.cpp`'s depthwise convolution over rows with that context; the
-  channel-mixing ones transposed around mm3's oneDNN convolutions, a transposed one cut to its new outputs); the
-  ConvNeXt blocks' norms and MLPs on the shared kernels and the codec's layer-scaled residual. A voice's recording goes
-  through the acoustic encoder eight frames a piece. No settings of its own.
+- **vibevoice** - VibeVoice-1.5B from gguf-org's GGUF with the -hf checkpoint's tokenizer.json and config.json (the
+  shapes and constants the GGUF does not state). The language model's matrices stay Q8_0 on the card (int8 codes and
+  half block scales, split at load; the f16 file's half), the tokenizers' the file's bfloat16, the head and connectors
+  half; the token embedding stays on disk, of the tied output head only the four tokens it may say are on the card. Its
+  kernels are its own (`kernels/audio/vibevoice`, rule 6: the products copied from mm3's and changed): a decode step of
+  the language model (Qwen2.5-1.5B: q / k / v biases, 12 query heads over 2) is 8 launches a layer - norm, q / k / v,
+  RoPE + key / value store, split attention and its merge, output, norm, gate / up with SwiGLU, down - its positions
+  read from device memory, the guidance's two branches as two rows of one pass (a second, negative cache from an audio
+  start alone, stepped only on audio frames, as upstream); a prompt in passes of 256 rows on oneDNN's half GEMM. The
+  diffusion head's ten steps run without a read-back: all ten steps' adaLN modulations in one product of 20 rows a
+  frame, DPM-Solver++ (2M, v-prediction, cosine betas) on the device. The σ-VAE tokenizers stream a frame at a time over
+  time rows: each convolution a product over windows of [carried rows; input] (strided or transposed), a ConvNeXt
+  block two launches and its MLP's products (GELU and the layer-scaled residual in their epilogues); many rows on the
+  matrix engines with x split into two bfloat16 halves (float32-accurate). A voice's recording goes through the
+  acoustic encoder eight frames a piece. Debug switches: `NS_VV_PROFILE` (1 the stages, 2 the tokenizers' operations),
+  `NS_VV_GEMV_KS`, `NS_VV_GEMM_SIMT`; `nextsycl audio check DUMP --stages bench` times the products and the
+  tokenizers' frame.
 - **s2pro** - Fish Audio S2 Pro from s2.cpp's GGUF (one file: the Dual-AR transformer as Q8_0 or F16, the codec as F16
   with its weight norm folded) and the checkpoint's tokenizer.json. The matrices stay as the file has them: Q8_0 on the
   card as int8 codes and half scales (split at load so a lane reads 8 aligned codes), F16 as half; the token and

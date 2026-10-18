@@ -1,7 +1,6 @@
-// vv.cpp: the VibeVoice engine's own kernels (vv.h). The attention is the MiniMax Music engine's cached attention
-// (mm3.cpp) copied for Qwen2.5-1.5B's six query heads a key head - the shared one keeps the shapes it was tuned for
-// (CONTRIBUTING rule 6). The tokenizers' depthwise convolution runs over time rows with the stream's last rows as its
-// left context, so a frame decoded alone gives what the whole clip would.
+// vv.cpp: the VibeVoice engine's prompt attention (vv.h): the MiniMax Music engine's cached attention (mm3.cpp)
+// copied for Qwen2.5-1.5B's six query heads a key head - the shared one keeps the shapes it was tuned for (CONTRIBUTING
+// rule 6). The decode step's attention is vvlm.cpp's.
 #include "ns.h"
 #include "ns_internal.hpp"
 #include "vv.h"
@@ -145,44 +144,6 @@ int ns_audio_vv_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, cons
     if (ns_audio_vv_attn_scratch(B, S, Hq, D, p0) > 0 && !part) return ns_fail("ns_audio_vv_attn: no scratch");
     if (D == 128 && Hq == 6 * Hkv) attn<8, 6>(g->q, q, qs, (const half*) kc, (const half*) vc, B, S, Hq, Hkv, T, p0, out, part);
     else return ns_fail("ns_audio_vv_attn: D 128 with 6 query heads a key head");
-    return 0;
-    NS_CATCH
-}
-
-int ns_audio_vv_dwconv(ns_gpu* g, const float* x, const float* ctx, int64_t L, int64_t C, const float* w, const float* bias, int64_t K,
-                       float* out) {
-    NS_TRY
-    if (K < 1 || K > 32) return ns_fail("ns_audio_vv_dwconv: a kernel of 1 to 32 taps");
-    if (L <= 0 || C <= 0) return 0;
-    const int64_t P = K - 1;
-    // one work-item an output value; consecutive items read consecutive channels of a row
-    g->q.parallel_for(sycl::range<1>((size_t) (L * C)), [=](sycl::id<1> id) {
-        const int64_t t = id[0] / C, c = id[0] % C;
-        float a = bias ? bias[c] : 0.0f;
-        for (int64_t k = 0; k < K; ++k) {
-            const int64_t i = t + k;
-            const float v = i < P ? ctx[i * C + c] : x[(i - P) * C + c];
-            a += w[c * K + k] * v;
-        }
-        out[t * C + c] = a;
-    });
-    return 0;
-    NS_CATCH
-}
-
-int ns_audio_vv_ctx_push(ns_gpu* g, float* ctx, int64_t P, const float* x, int64_t L, int64_t C) {
-    NS_TRY
-    if (P <= 0 || C <= 0 || L <= 0) return 0;
-    // a work-item a channel, its P rows in order (the rows that stay move up before the new ones land)
-    g->q.parallel_for(sycl::range<1>((size_t) C), [=](sycl::id<1> id) {
-        const int64_t c = id[0];
-        if (L >= P) {
-            for (int64_t i = 0; i < P; ++i) ctx[i * C + c] = x[(L - P + i) * C + c];
-        } else {
-            for (int64_t i = 0; i < P - L; ++i) ctx[i * C + c] = ctx[(i + L) * C + c];
-            for (int64_t i = 0; i < L; ++i) ctx[(P - L + i) * C + c] = x[i * C + c];
-        }
-    });
     return 0;
     NS_CATCH
 }

@@ -6,20 +6,26 @@
 //! convolution is causal, so a stream that carries each one's last inputs (its context: zeros at the start) gives
 //! what the whole clip would - upstream decodes and re-encodes a frame at a time this way.
 //!
-//! The signal runs as time rows [L, C] (the norms and the MLP work on rows); a channel-mixing convolution transposes
-//! to [C, L] around oneDNN's (mm3's conv1d), the depthwise one runs on rows (vv.cpp).
+//! The signal runs as time rows [L, C]. Each convolution reads a buffer of its carried rows followed by its new input
+//! rows ([ctx; x]: the stage before writes its rows there), so a window of k input rows is k * C consecutive floats and
+//! the convolution is a product over windows (`ops.prod`): a strided one's windows start s rows apart (weights
+//! [co, k * ci]); a transposed one of kernel 2s makes s output rows from each pair of input rows (weights
+//! [s * co, 2 * ci]). Its carried rows then move to the front (`shift`). A block's depthwise convolution carries its
+//! last normed rows the same way, in two buffers that alternate (the one a call writes is not the one it reads). The
+//! weights are the file's values exactly: bfloat16 (or float32), products in float32.
+
+use std::cell::Cell;
 
 use nextsycl_audio::{Error, Result};
 use nextsycl_core::DevBuf;
-use nextsycl_diffusion::kernels::{none, Dt, Nsd};
+use nextsycl_diffusion::kernels::Nsd;
 
-use crate::ops::{Mat, Ops};
+use crate::ops::{fp, split_len, Epi, Mat, Ops, Split};
 use crate::weights::Weights;
 
-/// A channel-mixing causal convolution (or a transposed one): float32 weights [co, ci, k] ([ci, co, k] transposed)
+/// A channel-mixing causal convolution (or a transposed one) as a product over windows of its input rows
 struct Conv {
-    w: DevBuf,
-    b: DevBuf,
+    w: Mat,
     ci: usize,
     co: usize,
     k: usize,
@@ -54,6 +60,15 @@ impl Conv {
     fn out_rows(&self, l: usize) -> usize {
         out_rows(self.s, self.tr, l)
     }
+
+    /// The windows over [ctx; l rows]: (how many, the floats between their starts)
+    fn windows(&self, l: usize) -> (usize, usize) {
+        if self.tr {
+            (l, self.ci)
+        } else {
+            (l / self.s, self.s * self.ci)
+        }
+    }
 }
 
 struct Block {
@@ -80,21 +95,19 @@ pub struct Coder {
     pub dim_out: usize,
 }
 
-/// A stream's carried rows: each convolution's and each block's depthwise convolution's (zeros at the start)
+/// A stream: each convolution's input buffer [its carried rows; up to the call's rows] (a stage's rows live in the
+/// next convolution's), each block's two alternating buffers of normed rows, the work buffers, and the output
 pub struct Stream {
-    ctx: Vec<DevBuf>,
-}
-
-/// The work buffers for calls of up to `rows` input rows
-pub struct Work {
     pub rows: usize,
-    ab: [DevBuf; 2],
-    t: DevBuf,
-    u: DevBuf,
-    v: DevBuf,
+    cin: Vec<DevBuf>,
+    hist: Vec<[DevBuf; 2]>,
+    /// the rows each block's last call added (where its carried rows start in the buffer it wrote)
+    prev: Vec<Cell<usize>>,
+    parity: Cell<usize>,
     h: DevBuf,
     f: DevBuf,
-    xh: DevBuf,
+    split: Split,
+    out: DevBuf,
 }
 
 impl Coder {
@@ -126,8 +139,8 @@ impl Coder {
                 }
                 let dw = n("mixer.conv.conv.conv.weight");
                 let s = f.shape(&dw)?;
-                if s.len() != 3 || s[0] != conv.co || s[1] != 1 {
-                    return Err(Error(format!("{dw}: shape {s:?}, a depthwise kernel of {} channels expected", conv.co)));
+                if s.len() != 3 || s[0] != conv.co || s[1] != 1 || s[2] > 32 {
+                    return Err(Error(format!("{dw}: shape {s:?}, a depthwise kernel of {} channels (at most 32 taps) expected", conv.co)));
                 }
                 blocks.push(Block {
                     c: conv.co,
@@ -137,8 +150,8 @@ impl Coder {
                     dw_b: f.vec(ops, &n("mixer.conv.conv.conv.bias"))?,
                     gamma: f.vec(ops, &n("gamma"))?,
                     ffn_norm: f.vec(ops, &n("ffn_norm.weight"))?,
-                    l1: f.mat(ops, &[&n("ffn.linear1.weight")], Some(&[&n("ffn.linear1.bias")]), false)?,
-                    l2: f.mat(ops, &[&n("ffn.linear2.weight")], Some(&[&n("ffn.linear2.bias")]), false)?,
+                    l1: f.mat_exact(ops, &n("ffn.linear1.weight"), Some(&n("ffn.linear1.bias")))?,
+                    l2: f.mat_exact(ops, &n("ffn.linear2.weight"), Some(&n("ffn.linear2.bias")))?,
                     ffn_gamma: f.vec(ops, &n("ffn_gamma"))?,
                 });
             }
@@ -154,138 +167,173 @@ impl Coder {
 
     /// Weights on the card (bytes)
     pub fn bytes(&self) -> usize {
-        let conv = |c: &Conv| c.w.len + c.b.len;
-        self.convs.iter().map(conv).sum::<usize>() + conv(&self.head)
-            + self.stages.iter().flatten().map(|b| b.l1.w.len + b.l2.w.len + b.dw_w.len).sum::<usize>()
+        self.convs.iter().chain(std::iter::once(&self.head)).map(|c| c.w.bytes()).sum::<usize>()
+            + self.stages.iter().flatten().map(|b| b.l1.bytes() + b.l2.bytes() + b.dw_w.len).sum::<usize>()
     }
 
-    /// A fresh stream (its context zeros)
-    pub fn stream(&self, ops: &Ops) -> Result<Stream> {
-        let mut ctx = Vec::new();
+    /// The products a bench times, with the rows a frame gives them: the low stages' (a few rows: weights read once)
+    pub fn bench_mats(&self) -> Vec<(String, &Mat, usize)> {
+        let mut v = Vec::new();
+        let mut l = if self.convs[0].ci == 1 { 3200 } else { 1 };
+        for (i, c) in self.all_convs().enumerate() {
+            let (m, _) = c.windows(l);
+            if m <= 8 {
+                v.push((format!("conv {i}"), &c.w, m));
+            }
+            l = c.out_rows(l);
+            if let Some(b) = self.stages.get(i).and_then(|s| s.first()).filter(|_| l <= 8) {
+                v.push((format!("stage {i} mlp1"), &b.l1, l));
+                v.push((format!("stage {i} mlp2"), &b.l2, l));
+            }
+        }
+        v
+    }
+
+    /// The convolutions in order, the head last
+    fn all_convs(&self) -> impl Iterator<Item = &Conv> {
+        self.convs.iter().chain(std::iter::once(&self.head))
+    }
+
+    /// A fresh stream (its carried rows zeros) for calls of up to `rows` input rows (a multiple of every stride for
+    /// an encoder)
+    pub fn stream(&self, ops: &Ops, rows: usize) -> Result<Stream> {
+        let g = &ops.gpu;
         let zeros = |n: usize| -> Result<DevBuf> {
-            let b = DevBuf::f32(&ops.gpu, n.max(1))?;
+            let b = DevBuf::f32(g, n.max(4))?;
             b.fill(0)?;
             Ok(b)
         };
-        for (c, blocks) in self.convs.iter().zip(&self.stages) {
-            ctx.push(zeros(c.ctx() * c.ci)?);
-            for b in blocks {
-                ctx.push(zeros((b.k - 1) * b.c)?);
+        let (mut cin, mut hist) = (Vec::new(), Vec::new());
+        let (mut l, mut h, mut fw, mut sp, mut pt) = (rows, 0usize, 0usize, 0usize, 0usize);
+        for (i, c) in self.all_convs().enumerate() {
+            cin.push(zeros((c.ctx() + l) * c.ci)?);
+            let (m, ldx) = c.windows(l);
+            sp = sp.max(split_len(m, ldx, c.w.k));
+            pt = pt.max(ops.gemm_scratch(m, c.w.n, c.w.k));
+            l = c.out_rows(l);
+            if let Some(blocks) = self.stages.get(i) {
+                for b in blocks {
+                    hist.push([zeros((b.k - 1 + l) * b.c)?, zeros((b.k - 1 + l) * b.c)?]);
+                    h = h.max(l * b.c);
+                    fw = fw.max(l * b.l1.n);
+                    sp = sp.max(split_len(l, b.c, b.c)).max(split_len(l, b.l1.n, b.l1.n));
+                    pt = pt.max(ops.gemm_scratch(l, b.l1.n, b.c)).max(ops.gemm_scratch(l, b.c, b.l1.n));
+                }
             }
         }
-        ctx.push(zeros(self.head.ctx() * self.head.ci)?);
-        Ok(Stream { ctx })
+        // the split inputs of the matrix engines' products (bfloat16 pairs), zeros past what a call writes
+        let split = Split { hi: zeros(sp.div_ceil(2))?, lo: zeros(sp.div_ceil(2))?, part: DevBuf::f32(g, pt.max(4))? };
+        Ok(Stream { rows, prev: (0..hist.len()).map(|_| Cell::new(0)).collect(), hist, cin, parity: Cell::new(0), h: DevBuf::f32(g, h.max(4))?,
+                    f: DevBuf::f32(g, fw.max(4))?, out: DevBuf::f32(g, (l * self.head.co).max(4))?, split })
     }
 
     /// Back to the start (zeros), as upstream clears its caches at an audio end
     pub fn reset(&self, s: &Stream) -> Result<()> {
-        s.ctx.iter().try_for_each(|c| c.fill(0))
+        s.cin.iter().chain(s.hist.iter().flatten()).try_for_each(|c| c.fill(0))?;
+        s.prev.iter().for_each(|p| p.set(0));
+        Ok(())
     }
 
-    /// Work buffers for calls of up to `rows` input rows (a multiple of every stride for an encoder)
-    pub fn work(&self, ops: &Ops, rows: usize) -> Result<Work> {
-        // the widest [rows, channels] on the way, with the carried rows, and the MLPs' 4x
-        let (mut l, mut io, mut tu, mut hid) = (rows, rows * self.dim_in, 0usize, 0usize);
-        for (c, blocks) in self.convs.iter().zip(&self.stages).map(|(c, b)| (c, Some(b))).chain(std::iter::once((&self.head, None))) {
-            tu = tu.max((c.ctx() + l) * c.ci);
-            l = c.out_rows(l);
-            io = io.max(l * c.co);
-            if let Some(b) = blocks.and_then(|b| b.first()) {
-                hid = hid.max(l * b.l1.n);
-            }
-        }
-        let g = &ops.gpu;
-        Ok(Work {
-            rows,
-            ab: [DevBuf::f32(g, io)?, DevBuf::f32(g, io)?],
-            t: DevBuf::f32(g, tu)?,
-            u: DevBuf::f32(g, tu)?,
-            v: DevBuf::f32(g, io)?,
-            h: DevBuf::f32(g, io.max(1))?,
-            f: DevBuf::f32(g, hid.max(io))?,
-            xh: DevBuf::new(g, hid.max(io) * 2)?,
-        })
+    /// The buffer the stream's next input rows go into (after the stem's carried rows), and its first float
+    pub fn input<'s>(&self, s: &'s Stream) -> (&'s DevBuf, usize) {
+        (&s.cin[0], self.convs[0].ctx() * self.convs[0].ci)
     }
 
-    /// One convolution of `l` rows of `x` with its carried rows into `out` (rows): the rows it made
-    #[allow(clippy::too_many_arguments)]
-    fn conv(&self, ops: &Ops, c: &Conv, ctx: &DevBuf, x: &DevBuf, l: usize, w: &Work, out: &DevBuf) -> Result<usize> {
-        let p = c.ctx();
-        // [ctx; x] as rows, then the context moves on
-        if p > 0 {
-            w.t.copy_within(0, ctx, 0, p * c.ci * 4)?;
+    /// `l` new rows of `x` [l, dim_in] through the stream (copied into its input first; None: already there, see
+    /// `input`): its output rows [lo, dim_out]
+    pub fn push<'s>(&self, ops: &Ops, _nsd: &Nsd, s: &'s Stream, x: Option<&DevBuf>, l: usize) -> Result<(&'s DevBuf, usize)> {
+        if l > s.rows {
+            return Err(Error(format!("{l} rows through a stream for {}", s.rows)));
         }
-        w.t.copy_within(p * c.ci * 4, x, 0, l * c.ci * 4)?;
-        ops.ctx_push(ctx, p, x.fp(), l, c.ci)?;
-        ops.transpose(w.t.fp(), p + l, c.ci, w.u.fp())?;
-        let lo = c.out_rows(l);
-        if c.tr {
-            // the outputs of the carried inputs (cut from the start) and the overlap past the last input (cut from
-            // the end) are not this call's
-            ops.conv(true, w.u.fp(), c.ci, p + l, &c.w, c.co, c.k, &c.b, c.s, p * c.s, c.k - c.s, w.v.fp(), lo)?;
-        } else {
-            ops.conv(false, w.u.fp(), c.ci, p + l, &c.w, c.co, c.k, &c.b, c.s, 0, 0, w.v.fp(), lo)?;
+        if let Some(x) = x {
+            let (b, at) = self.input(s);
+            b.copy_within(at * 4, x, 0, l * self.dim_in * 4)?;
         }
-        ops.transpose(w.v.fp(), c.co, lo, out.fp())?;
-        Ok(lo)
-    }
-
-    /// A ConvNeXt block on `x` [l, c] in place
-    #[allow(clippy::too_many_arguments)]
-    fn block(&self, ops: &Ops, nsd: &Nsd, b: &Block, ctx: &DevBuf, x: &DevBuf, l: usize, w: &Work) -> Result<()> {
-        let c = b.c;
-        nsd.rms_norm_mod(x.ptr(), Dt::F32, l, c, b.norm.ptr(), self.eps, none(), none(), none(), w.h.ptr(), Dt::F32)?;
-        ops.dwconv(w.h.fp(), ctx, l, c, &b.dw_w, &b.dw_b, b.k, w.f.fp())?;
-        ops.ctx_push(ctx, b.k - 1, w.h.fp(), l, c)?;
-        ops.scale_add(x.fp(), w.f.fp(), &b.gamma, l, c)?;
-        nsd.rms_norm_mod(x.ptr(), Dt::F32, l, c, b.ffn_norm.ptr(), self.eps, none(), none(), none(), w.h.ptr(), Dt::F32)?;
-        b.l1.apply(ops, nsd, w.h.fp(), l, &w.xh, w.f.fp())?;
-        nsd.gelu(w.f.ptr(), Dt::F32, l * b.l1.n, false)?;
-        b.l2.apply(ops, nsd, w.f.fp(), l, &w.xh, w.h.fp())?;
-        ops.scale_add(x.fp(), w.h.fp(), &b.ffn_gamma, l, c)
-    }
-
-    /// `l` new rows of `x` [l, dim_in] through the stream: its output rows [lo, dim_out], in one of the work's
-    /// buffers (the returned one)
-    pub fn push<'w>(&self, ops: &Ops, nsd: &Nsd, s: &Stream, x: &DevBuf, l: usize, w: &'w Work) -> Result<(&'w DevBuf, usize)> {
-        if l > w.rows {
-            return Err(Error(format!("{l} rows through work buffers for {}", w.rows)));
-        }
-        let mut ci = 0;
+        let par = s.parity.get();
         let mut rows = l;
-        let mut cur: Option<usize> = None;
-        for (c, blocks) in self.convs.iter().zip(&self.stages) {
+        let mut bi = 0;
+        let convs: Vec<&Conv> = self.all_convs().collect();
+        for (i, c) in convs.iter().enumerate() {
             if !c.tr && !rows.is_multiple_of(c.s) {
                 return Err(Error(format!("{rows} rows into a convolution of stride {}", c.s)));
             }
-            let dst = cur.map_or(0, |i| 1 - i);
-            let src = cur.map_or(x, |i| &w.ab[i]);
-            rows = self.conv(ops, c, &s.ctx[ci], src, rows, w, &w.ab[dst])?;
-            ci += 1;
-            cur = Some(dst);
-            for b in blocks {
-                self.block(ops, nsd, b, &s.ctx[ci], &w.ab[dst], rows, w)?;
-                ci += 1;
+            // the output: the next convolution's input buffer after its carried rows (the head's: the stream's output)
+            let (dst, ldo) = match convs.get(i + 1) {
+                Some(n) => (fp(&s.cin[i + 1], n.ctx() * n.ci), c.w.n),
+                None => (s.out.fp(), c.w.n),
+            };
+            let (m, ldx) = c.windows(rows);
+            ops.mark(|| "(before)".into())?;
+            ops.prod(s.cin[i].fp(), m, ldx, &c.w, dst, ldo, Epi::Store, None, Some(&s.split))?;
+            ops.mark(|| format!("{i} conv [{m}, {}] x {}", c.w.k, c.w.n))?;
+            if c.ctx() > 0 {
+                ops.shift(s.cin[i].fp(), c.ctx(), rows, c.ci)?;
+            }
+            ops.mark(|| "shift".into())?;
+            rows = c.out_rows(rows);
+            for b in self.stages.get(i).into_iter().flatten() {
+                let (prev, cur) = (&s.hist[bi][1 - par], &s.hist[bi][par]);
+                let ch = b.c;
+                ops.norm_hist(prev, s.prev[bi].get(), dst, rows, ch, b.k - 1, &b.norm, self.eps, cur)?;
+                ops.block_mix(cur, dst, rows, ch, b.k, &b.dw_w, &b.dw_b, &b.gamma, &b.ffn_norm, self.eps, s.h.fp())?;
+                ops.mark(|| format!("{i} norms + depthwise [{rows}, {ch}]"))?;
+                ops.prod(s.h.fp(), rows, ch, &b.l1, s.f.fp(), b.l1.n, Epi::Gelu, None, Some(&s.split))?;
+                ops.mark(|| format!("{i} mlp1 [{rows}, {ch}] x {}", b.l1.n))?;
+                ops.prod(s.f.fp(), rows, b.l1.n, &b.l2, dst, ch, Epi::Res, Some((b.ffn_gamma.fp(), 0)), Some(&s.split))?;
+                ops.mark(|| format!("{i} mlp2 [{rows}, {}] x {ch}", b.l1.n))?;
+                s.prev[bi].set(rows);
+                bi += 1;
             }
         }
-        let i = cur.unwrap_or(0);
-        let rows = self.conv(ops, &self.head, &s.ctx[ci], &w.ab[i], rows, w, &w.ab[1 - i])?;
-        Ok((&w.ab[1 - i], rows))
+        s.parity.set(1 - par);
+        Ok((&s.out, rows))
     }
 }
 
-/// A convolution's weights (float32: oneDNN's convolutions take them so) and its kernel / stride from their shape:
-/// a strided one has a kernel of twice its stride
+/// A convolution's weights as a product over windows of its input rows (the file's values: bfloat16, or float32) and
+/// its kernel / stride from their shape: a strided one has a kernel of twice its stride. A strided or plain one
+/// [co, ci, k] becomes [co, k * ci]; a transposed one [ci, co, 2s] becomes [s * co, 2 * ci]: output row r of a window
+/// (input rows i - 1, i) takes tap r + s of row i - 1 and tap r of row i.
 fn conv(ops: &Ops, f: &Weights, base: &str, tr: bool, strided: bool) -> Result<Conv> {
     let wn = format!("{base}.weight");
-    let s = f.shape(&wn)?;
-    if s.len() != 3 {
-        return Err(Error(format!("{wn}: shape {s:?}, a 1-D convolution's expected")));
+    let sh = f.shape(&wn)?;
+    if sh.len() != 3 {
+        return Err(Error(format!("{wn}: shape {sh:?}, a 1-D convolution's expected")));
     }
-    let (ci, co) = if tr { (s[0], s[1]) } else { (s[1], s[0]) };
-    let k = s[2];
-    let stride = if strided { k / 2 } else { 1 };
-    Ok(Conv { w: f.vec(ops, &wn)?, b: f.vec(ops, &format!("{base}.bias"))?, ci, co, k, s: stride, tr })
+    let (ci, co) = if tr { (sh[0], sh[1]) } else { (sh[1], sh[0]) };
+    let k = sh[2];
+    let s = if strided { k / 2 } else { 1 };
+    let v = f.all(&wn)?;
+    let bias = f.all(&format!("{base}.bias"))?;
+    let (w, n, kk, b) = if tr {
+        if k != 2 * s {
+            return Err(Error(format!("{wn}: a transposed kernel of {k}, stride {s} (2s expected)")));
+        }
+        let mut w = vec![0f32; s * co * 2 * ci];
+        for r in 0..s {
+            for c in 0..co {
+                let row = &mut w[(r * co + c) * 2 * ci..(r * co + c + 1) * 2 * ci];
+                for i in 0..ci {
+                    row[i] = v[(i * co + c) * k + r + s];
+                    row[ci + i] = v[(i * co + c) * k + r];
+                }
+            }
+        }
+        let b: Vec<f32> = (0..s).flat_map(|_| bias.iter().copied()).collect();
+        (w, s * co, 2 * ci, b)
+    } else {
+        let mut w = vec![0f32; co * k * ci];
+        for c in 0..co {
+            for t in 0..k {
+                for i in 0..ci {
+                    w[c * k * ci + t * ci + i] = v[(c * ci + i) * k + t];
+                }
+            }
+        }
+        (w, co, k * ci, bias)
+    };
+    let w = f.mat_host(ops, &w, n, kk, f.is_bf16(&wn), Some(&b))?;
+    Ok(Conv { w, ci, co, k, s, tr })
 }
 
 #[cfg(test)]

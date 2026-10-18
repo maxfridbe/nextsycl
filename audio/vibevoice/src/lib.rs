@@ -13,9 +13,9 @@
 //! ```
 //!
 //! The weights are gguf-org's GGUF of microsoft/VibeVoice-1.5B (`nextsycl models pull vibevoice-1.5b`: q8_0 - the
-//! language model's matrices; the tokenizers, connectors and head in BF16 - expanded to half at load); the tokenizer
-//! and config.json are the -hf checkpoint's (vibevoice/VibeVoice-1.5B-hf). `check` compares the stages with the
-//! reference's dumps (reference/vibevoice/ref.py: the model's transformers implementation, float32 on the CPU).
+//! language model's matrices, kept so on the card; the tokenizers in BF16, kept so; the connectors and head in BF16,
+//! expanded to half); the tokenizer and config.json are the -hf checkpoint's (vibevoice/VibeVoice-1.5B-hf). `check`
+//! compares the stages with the reference's dumps (reference/vibevoice/ref.py: the model's transformers implementation, float32 on the CPU).
 //!
 //! License: MIT (the weights and upstream's code). Microsoft asks that it not be used to impersonate a voice without
 //! its owner's consent, nor to pass synthetic speech off as real (its model card's responsible-use section).
@@ -64,8 +64,58 @@ const STEPS_A_ROW: usize = 4;
 pub(crate) const CHUNK: usize = 256;
 /// a voice's recording through the encoder a piece at a time (frames a piece)
 const ENC_FRAMES: usize = 8;
+/// a run's samples are read back from the GPU this many frames at a time
+const SAMPLE_FRAMES: usize = 256;
 
 pub const OPTIONS: &[EngineOption] = &[];
+
+/// NS_VV_PROFILE=1: a run's stages timed (the GPU waited for at each boundary, which costs a little), the table on
+/// stderr at its end
+struct Prof {
+    on: bool,
+    t: Instant,
+    acc: [(f64, u32); 7],
+}
+
+const PROF_STAGES: [&str; 7] = ["logits (read back)", "negative step (alone)", "diffusion head", "acoustic decoder", "semantic encoder",
+                                "samples + connectors", "language model (paired)"];
+
+impl Prof {
+    fn new() -> Prof {
+        Prof { on: std::env::var("NS_VV_PROFILE").is_ok_and(|v| v == "1"), t: Instant::now(), acc: [(0.0, 0); 7] }
+    }
+
+    fn start(&mut self, g: &Gpu) -> Result<()> {
+        if self.on {
+            g.sync()?;
+            self.t = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// The time since the last mark into stage i
+    fn mark(&mut self, g: &Gpu, i: usize) -> Result<()> {
+        if self.on {
+            g.sync()?;
+            let n = Instant::now();
+            self.acc[i].0 += (n - self.t).as_secs_f64();
+            self.acc[i].1 += 1;
+            self.t = n;
+        }
+        Ok(())
+    }
+
+    fn print(&self, frames: usize) {
+        if !self.on {
+            return;
+        }
+        let total: f64 = self.acc.iter().map(|a| a.0).sum();
+        eprintln!("[vv profile: {frames} frames, {:.2} ms a frame]", 1e3 * total / frames.max(1) as f64);
+        for (name, (t, n)) in PROF_STAGES.iter().zip(self.acc) {
+            eprintln!("  {name:<26} {:>7.3} ms a frame  {n:>6} calls  {:>5.1}%", 1e3 * t / frames.max(1) as f64, 100.0 * t / total.max(1e-12));
+        }
+    }
+}
 
 pub fn kind() -> AudioKind {
     AudioKind { archs: &[ARCH], name: "VibeVoice (long-form speech of up to four speakers, each cloned from a recording; 7.5 Hz latents drawn by a diffusion head)",
@@ -194,7 +244,7 @@ impl VibeVoice {
         let (model, tokf, conf) = (role(files, "model")?, role(files, "tokenizer")?, role(files, "config")?);
         let cfg = Config::read(&conf)?;
         let w = Weights::open(&model)?;
-        // the file's matrices in half (Q8_0 doubles, BF16 / F16 the same), the convolutions and vectors in float32;
+        // at most the file's matrices in half (an upper bound: Q8_0 and BF16 stay as they are), the vectors in float32;
         // the token embedding stays in the file; work room 1.5 GiB
         let embd = w.tensor("model.language_model.embed_tokens.weight")?.bytes;
         let expanded: u64 = w.g.tensors.iter().filter(|t| !t.name.ends_with("embed_tokens.weight"))
@@ -272,13 +322,12 @@ impl VibeVoice {
     pub fn encode(&self, x: &[f32]) -> Result<Vec<f32>> {
         let hop = self.cfg.hop();
         let piece = ENC_FRAMES * hop;
-        let w = self.enc.work(&self.ops, piece)?;
-        let s = self.enc.stream(&self.ops)?;
+        let s = self.enc.stream(&self.ops, piece)?;
         let input = DevBuf::f32(&self.ops.gpu, piece)?;
         let mut out = Vec::with_capacity(x.len() / hop * self.enc.dim_out);
         for p in x.chunks(piece) {
             input.write(0, &bytes(p))?;
-            let (y, rows) = self.enc.push(&self.ops, &self.nsd, &s, &input, p.len(), &w)?;
+            let (y, rows) = self.enc.push(&self.ops, &self.nsd, &s, Some(&input), p.len())?;
             self.ops.gpu.sync()?;
             let mut v = vec![0f32; rows * self.enc.dim_out];
             y.read(0, as_bytes_mut(&mut v))?;
@@ -341,13 +390,17 @@ impl VibeVoice {
         let pos: Cache = self.lm.cache(ops, CHUNK, l + max_steps + 1)?;
         let neg: Cache = self.lm.cache(ops, 2, max_steps + 2)?;
         let cond = DevBuf::f32(g, 2 * h)?;
+        let tp = Instant::now();
         self.lm.prefill(ops, nsd, &pos, rows, 0, &cond)?;
+        if std::env::var("NS_VV_PROFILE").is_ok_and(|v| v == "1") {
+            g.sync()?;
+            eprintln!("[vv prompt: {l} positions through the language model in {:.3} s]", tp.elapsed().as_secs_f64());
+        }
         progress(Step { phase: "prompt", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
         let mut hw = self.head.work(ops, s.steps)?;
-        let (dw, sw) = (self.dec.work(ops, 1)?, self.sem.work(ops, self.cfg.hop())?);
-        let (ds, ss) = (self.dec.stream(ops)?, self.sem.stream(ops)?);
+        let (ds, ss) = (self.dec.stream(ops, 1)?, self.sem.stream(ops, self.cfg.hop())?);
         let logits = DevBuf::f32(g, 4)?;
-        let lat_in = DevBuf::f32(g, self.dec.dim_in)?;
+        let lat_in = { let (b, at) = self.dec.input(&ds); b.view(at * 4, self.dec.dim_in * 4)? };
         let (sem_in, lat_row) = (DevBuf::f32(g, self.semantic.width())?, DevBuf::f32(g, self.acoustic.width())?);
         sem_in.fill(0)?;
         lat_row.fill(0)?;
@@ -360,9 +413,15 @@ impl VibeVoice {
         // whether cond's second row holds the negative branch's next hidden state already (the paired step made it)
         let mut paired = false;
         let mut samples = Vec::new();
+        // the frames' samples on the GPU until a read-back (SAMPLE_FRAMES frames at a time)
+        let sbuf = DevBuf::f32(g, SAMPLE_FRAMES * self.cfg.hop())?;
+        let mut sfill = 0;
+        let mut prof = Prof::new();
+        prof.start(g)?;
         for _ in 0..max_steps {
             ops.gemv(cond.fp(), 1, &self.logit_rows, logits.fp(), 4, false)?;
             let l4 = logits.to_f32()?;
+            prof.mark(g, 0)?;
             let best = (0..4).fold(0, |b, i| if l4[i] > l4[b] { i } else { b });
             let tok = tokens[best];
             if let Some(k) = keep.as_deref_mut() {
@@ -386,6 +445,7 @@ impl VibeVoice {
                 if !paired {
                     self.lm.step(ops, nsd, &neg, &bos, np, &tmp)?;
                     cond.copy_within(h * 4, &tmp, 0, h * 4)?;
+                    prof.mark(g, 1)?;
                 }
                 np += 1;
                 let z: Vec<f32> = match noise {
@@ -393,26 +453,32 @@ impl VibeVoice {
                     None => (0..self.head.latent).map(|_| rng.normal()).collect(),
                 };
                 let mut first = keep.as_ref().map(|_| Vec::new());
-                let latent = self.head.sample(ops, nsd, &mut hw, &cond, &z, s.cfg, first.as_mut())?;
-                // the acoustic decoder on the unscaled latent, then the semantic encoder on its samples
-                let un: Vec<f32> = latent.iter().map(|v| v / self.scale - self.bias).collect();
-                lat_in.write_async(0, &bytes(&un))?;
-                let (y, n) = self.dec.push(ops, nsd, &ds, &lat_in, 1, &dw)?;
-                let (sv, _) = self.sem.push(ops, nsd, &ss, y, n, &sw)?;
+                // the latent on the GPU: the acoustic connector's input (lat_row) and, unscaled, the decoder's
+                self.head.sample(ops, nsd, &mut hw, &cond, &z, s.cfg, first.as_mut(), Some(&lat_row), Some((&lat_in, self.scale, self.bias)))?;
+                prof.mark(g, 2)?;
+                // the acoustic decoder, then the semantic encoder on its samples
+                let (y, n) = self.dec.push(ops, nsd, &ds, None, 1)?;
+                prof.mark(g, 3)?;
+                let (sv, _) = self.sem.push(ops, nsd, &ss, Some(y), n)?;
+                prof.mark(g, 4)?;
                 sem_in.copy_within(0, sv, 0, self.sem.dim_out * 4)?;
-                let mut chunk = vec![0f32; n];
-                y.read(0, as_bytes_mut(&mut chunk))?;
-                samples.extend_from_slice(&chunk);
+                // the samples kept on the GPU, read back a batch of frames at a time
+                if sfill + n > sbuf.floats() {
+                    samples.extend(sbuf.to_f32()?[..sfill].iter());
+                    sfill = 0;
+                }
+                sbuf.copy_within(sfill * 4, y, 0, n * 4)?;
+                sfill += n;
                 // the next input: the acoustic connector's latent plus the semantic connector's features
-                lat_row.write_async(0, &bytes(&latent))?;
                 self.acoustic.apply(ops, nsd, &lat_row, 1, &ctmp, &xh, &next)?;
                 self.semantic.apply(ops, nsd, &sem_in, 1, &ctmp, &xh, &tmp)?;
                 ops.add(next.fp(), tmp.fp(), h)?;
+                prof.mark(g, 5)?;
                 frames += 1;
                 if let Some(k) = keep.as_deref_mut() {
                     k.cond.push(cond.to_f32()?);
                     k.eps0.push(first.unwrap_or_default());
-                    k.latents.push(latent);
+                    k.latents.push(self.head.latent(&hw)?);
                     k.semantic.push(sem_in.to_f32()?[..self.sem.dim_out].to_vec());
                     k.embeds.push(next.to_f32()?);
                 }
@@ -426,10 +492,13 @@ impl VibeVoice {
             // both branches read the next input in one pass (the weights read once): the positive always, the negative
             // for the next step if it is an audio frame (else its row goes unused and its position is written again)
             self.lm.pair(ops, nsd, &pos, p, &neg, np, &next, &cond)?;
+            prof.mark(g, 6)?;
             paired = true;
             p += 1;
         }
-        g.sync()?;
+        samples.extend(sbuf.to_f32()?[..sfill].iter());
+        prof.print(frames);
+        ops.report(frames);
         if samples.is_empty() {
             return Err(Error("the model ended the speech before its first frame".into()));
         }
@@ -458,10 +527,15 @@ impl VibeVoice {
         }
         let mut voices: Vec<Option<usize>> = Vec::new();
         let mut lat = Vec::new();
+        let prof = Prof::new().on;
+        let t = Instant::now();
+        let (mut t_res, mut t_enc) = (0.0, 0.0);
         for r in &refs {
             let x = self.voice_samples(r)?;
+            t_res = t.elapsed().as_secs_f64() - t_enc;
             voices.push(Some(x.len() / self.cfg.hop()));
             lat.push(self.encode(&x)?);
+            t_enc = t.elapsed().as_secs_f64() - t_res;
         }
         let (ids, placed) = prompt::ids(&self.tok, self.specials(), &lines, &voices)?;
         let mut rows = Vec::new();
@@ -469,6 +543,10 @@ impl VibeVoice {
             rows.push(self.voice_rows(&lat[*s], rng)?.1);
         }
         let rows = self.prompt_rows(&ids, &placed, &rows)?;
+        if prof {
+            eprintln!("[vv prompt: {} voices ({} frames): resampled in {:.3} s, encoded in {:.3} s; {} positions ready at {:.3} s]", refs.len(),
+                      voices.iter().flatten().sum::<usize>(), t_res, t_enc, ids.len(), t.elapsed().as_secs_f64());
+        }
         Ok((ids, rows, lines))
     }
 }
@@ -522,7 +600,7 @@ impl AudioEngine for VibeVoice {
         Ok(Audio { rate: RATE, channels: 1, samples })
     }
     fn report(&self) -> Vec<String> {
-        vec![format!("{ARCH} on {} (half, loaded {:.0} s ago)", self.ops.gpu.name, self.loaded.elapsed().as_secs_f64())]
+        vec![format!("{ARCH} on {} (Q8_0 / bfloat16 / half, loaded {:.0} s ago)", self.ops.gpu.name, self.loaded.elapsed().as_secs_f64())]
     }
 }
 

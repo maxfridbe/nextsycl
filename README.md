@@ -82,7 +82,7 @@ cloned from a recording and its transcript, or cloned and directed by an instruc
 and its own, the 12 Hz codec shared with Qwen3-TTS; checked against upstream's code; 1.8-2.2x real time on the B70.
 **VibeVoice** (`audio/vibevoice`): long-form speech of up to four speakers, each voice cloned from a recording without
 its transcript - its Qwen2.5-1.5B language model, diffusion head and streaming σ-VAE decoder and semantic encoder in
-SYCL from gguf-org's GGUF, checked stage by stage against transformers' implementation; 5.8x real time on the B70.
+SYCL from gguf-org's GGUF, checked stage by stage against transformers' implementation; 10.6x real time on the B70.
 **Voxtral TTS** (`audio/voxtraltts`): Mistral's Voxtral 4B TTS - nine languages in 20 preset voices - its Ministral 3B
 backbone, flow-matching acoustic transformer and Voxtral codec decoder from CrispASR's GGUF, checked against
 vllm-omni's code; 2.3x real time on the B70 (the open weights have no audio encoder: no cloning from a recording;
@@ -974,22 +974,26 @@ nextsycl audio check <reference dump dir> --model vibevoice-1.5b [--stages promp
 The audio server and the front door take a script's voices as `voices` (saved voices) or `ref_audios` (recordings), a
 speaker each in order; `audio.speak` picks a model of several speakers (card `speech: speakers`) for them.
 
-- **Ported**: the GGUF's tensors expanded to half at load (the language model Q8_0, the rest BF16: exact in half; the
-  convolutions float32 for oneDNN; the token embedding read from the file a row a token, the tied head's four tokens on
-  the card); the tokenizer and config.json from the -hf checkpoint. The language model on the music engine's product
-  and cache, Breeze's RoPE and this engine's attention for six query heads a key head (`kernels/audio/vibevoice`), its
-  two guidance branches in one paired pass a step; the head's branches as two rows, DPM-Solver++ on the host; the
-  tokenizers streaming a frame at a time over time rows, each causal convolution carrying its last inputs (this
-  engine's depthwise convolution, mm3's oneDNN convolutions transposed around).
+- **Ported**: the language model's matrices kept Q8_0 on the card (codes and block scales), the tokenizers' the file's
+  bfloat16, the head and connectors half; the token embedding read from the file a row a token, the tied head's four
+  tokens on the card; the tokenizer and config.json from the -hf checkpoint. All on the engine's own kernels
+  (`kernels/audio/vibevoice`): the language model's decode step (8 launches a layer, its two guidance branches in one
+  paired pass, the attention split over the keys), the diffusion head's ten steps without a read-back (every step's
+  modulations in one product a frame, DPM-Solver++ on the device), the tokenizers streaming a frame at a time (each
+  convolution a product over windows of its carried rows and input, the high stages on the matrix engines with x split
+  into two bfloat16 halves: float32-accurate).
 - **Checked** against transformers' implementation (`reference/vibevoice/ref.py`, float32 on the CPU; its loop
-  bit-identical to `generate`'s frames): token ids identical; with the f16 GGUF the language model's logits 4e-4 and
-  hidden states 2e-3 / 5e-4 teacher forced (51 of 51 tokens agree), with the served Q8_0 2e-3 and 1.4-2e-2 (its
-  quantization); the diffusion head 4e-7, the acoustic decoder 2e-4, the semantic encoder 7-10e-4, the voice encoder
-  3e-4 / 1e-3; Chinese token ids identical, and a run that splits into two audio segments (the negative branch's
+  bit-identical to `generate`'s frames): token ids identical; with the f16 GGUF the language model's logits 2-5e-4 and
+  hidden states 0.7-2.2e-3 / 5-6e-4 teacher forced (every token agrees), with the served Q8_0 2e-3 and 1.4-2e-2 (its
+  quantization); the diffusion head 4e-7, the acoustic decoder 2-3e-6, the semantic encoder 4e-6 to 8e-5, the voice
+  encoder 2-9e-6; Chinese token ids identical, and a run that splits into two audio segments (the negative branch's
   restart, the streams' reset) as close. Clips plain, cloned, two-speaker and a 46 s show transcribe word for word
-  (Whisper small); the speakers alternate as cast (pitch). `docs/ports/vibevoice.md` has the details.
-- **Speed** (2026-10-17): 43.5 frames a second on the B70 (5.8x real time: 46.5 s of a two-speaker show in 8.8 s with
-  the prompt), 38.9 on the B65 (5.2x). 4.9 GiB of weights, 5.6 GiB in a run.
+  (Whisper small; twelve seeds of the show: 1.2% word error); the speakers alternate as cast (pitch).
+  `docs/ports/vibevoice.md` has the details.
+- **Speed** (2026-10-18): 79.3 frames a second on the B70 (10.6x real time: 46.5 s of a two-speaker show in 4.9 s with
+  the prompt; 5.9 s through the server), 64.0 on the B65 (8.5x; 7.1 s through the server). A short sentence through
+  the server 0.31 s (B70) / 0.38 s (B65). A frame on the B70 is 12.6 ms against a floor of 6.4 ms of weights read
+  (`docs/ports/vibevoice.md`: what is left). 3.6 GiB of weights, 4.0 GiB in a run.
 
 ### S2 Pro
 
