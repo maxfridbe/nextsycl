@@ -197,7 +197,8 @@ impl Talker {
         let dev = Dev { k, ops };
         let n_text = feed.len() / h - 1;
         // the session's talker cache splits its keys this many ways (each a share of the keys so far)
-        let splits = s.lm.t.div_ceil(32).clamp(1, 32);
+        // the talker's attention: parts of about 64 keys, at most 64 parts
+        let splits = s.lm.t.div_ceil(32).clamp(1, 64);
         // SAFETY: arithmetic only.
         let part_n = unsafe { (k.attn_scratch)(self.lm.heads as i64, splits as i64) }.max(1) as usize;
         let draw = |x: Draw| (x.sample as i32, x.temperature, x.top_k as i32);
@@ -379,5 +380,84 @@ pub fn bench(t: &Talker, ops: &Ops, log: &mut dyn FnMut(String)) -> Result<()> {
         log(format!("{name:<34} {:>6.1} MB  silo {graph_us:>7.1} us ({:>4.0} GB/s)  shared {shared_us:>7.1} us ({:>4.0} GB/s)", gb * 1e3,
                     gb / (graph_us * 1e-6), gb / (shared_us * 1e-6)));
     }
+    // the frame's other kernels, each in a graph of N calls: the predictor's attention (one row at position 8), the
+    // talker's (one row at position 400 and 1,900 of a 2,000-position cache), a draw (sampled, top-k 50 of 2,048), a predictor
+    // pass (5 layers, one row)
+    let s = t.session(ops, 64, 2000)?;
+    // caches of zeros (not whatever the memory held)
+    for b in s.lm.k.iter().chain(&s.lm.v).chain(&s.pred.k).chain(&s.pred.v) {
+        b.fill(0)?;
+    }
+    s.lm.qkv.fill(0)?;
+    s.pred.qkv.fill(0)?;
+    let run = |f: &dyn Fn() -> Result<()>| -> Result<f64> {
+        let mut graph = std::ptr::null_mut();
+        let mut exec = std::ptr::null_mut();
+        // SAFETY: the GPU's handle, out-pointers to locals.
+        ffi::check(unsafe { (k.graph_begin)(gpu.raw(), &mut graph) }, "graph")?;
+        let rec = (0..N).try_for_each(|_| f());
+        // SAFETY: the graph begun above.
+        ffi::check(unsafe { (k.graph_end)(gpu.raw(), graph, &mut exec) }, "graph")?;
+        rec?;
+        let mut us = 0.0;
+        for _ in 0..2 {
+            let t0 = Instant::now();
+            // SAFETY: the graph just made.
+            ffi::check(unsafe { (k.graph_launch)(gpu.raw(), exec) }, "graph launch")?;
+            gpu.sync()?;
+            us = t0.elapsed().as_secs_f64() * 1e6 / N as f64;
+        }
+        // SAFETY: made above, the queue idle.
+        unsafe { (k.graph_free)(exec) };
+        Ok(us)
+    };
+    let (p, l0) = (&t.pred, &t.pred.layers[0]);
+    let w = (p.heads + 2 * p.kv) * HEAD;
+    let us = run(&|| {
+        // SAFETY: the session's predictor buffers.
+        ffi::check(unsafe { (k.attn_small)(gpu.raw(), s.pred.qkv.fp(), w as i64, 1, 8, p.heads as i64, p.kv as i64, l0.q_norm.fp(), l0.k_norm.fp(), EPS,
+                                           p.inv_freq.fp(), s.pred.k[0].ptr(), s.pred.v[0].ptr(), s.pred.t as i64, s.pred.att.fp()) }, "attn_small")
+    })?;
+    log(format!("{:<34} {us:>7.1} us", "predictor attention (1 row at 8)"));
+    let (lm, tl0) = (&t.lm, &t.lm.layers[0]);
+    let splits = s.lm.t.div_ceil(32).clamp(1, 64);
+    // SAFETY: arithmetic only.
+    let part = DevBuf::f32(gpu, unsafe { (k.attn_scratch)(lm.heads as i64, splits as i64) }.max(1) as usize)?;
+    let counters = DevBuf::new(gpu, lm.kv * 4)?;
+    counters.fill(0)?;
+    let posb = DevBuf::new(gpu, 4)?;
+    posb.write(0, &400i32.to_le_bytes())?;
+    let us = run(&|| {
+        // SAFETY: the session's talker buffers; part / counters as the frame's.
+        ffi::check(unsafe { (k.attn)(gpu.raw(), s.lm.qkv.fp(), lm.heads as i64, lm.kv as i64, tl0.q_norm.fp(), tl0.k_norm.fp(), EPS, lm.inv_freq.fp(),
+                                     posb.ptr().cast(), s.lm.k[0].ptr(), s.lm.v[0].ptr(), s.lm.t as i64, splits as i64, s.lm.att.fp(), part.fp(),
+                                     counters.ptr().cast()) }, "attn")
+    })?;
+    log(format!("{:<34} {us:>7.1} us ({splits} splits)", "talker attention (1 row at 400)"));
+    for at in [30i32, 63, 64, 200, 1900] {
+    posb.write(0, &at.to_le_bytes())?;
+    let us = run(&|| {
+        // SAFETY: as above.
+        ffi::check(unsafe { (k.attn)(gpu.raw(), s.lm.qkv.fp(), lm.heads as i64, lm.kv as i64, tl0.q_norm.fp(), tl0.k_norm.fp(), EPS, lm.inv_freq.fp(),
+                                     posb.ptr().cast(), s.lm.k[0].ptr(), s.lm.v[0].ptr(), s.lm.t as i64, splits as i64, s.lm.att.fp(), part.fp(),
+                                     counters.ptr().cast()) }, "attn")
+    })?;
+    log(format!("{:<34} {us:>7.1} us", format!("talker attention (1 row at {at})")));
+    }
+    let dr = Draws { sample: [1, 1], temperature: [0.9, 0.9], top_k: [50, 50], penalty: 1.05, suppress_from: 2048, eos: 2150, min_frames: 2, forced: 0, n_text: 0 };
+    let (db, sb, seen) = (DevBuf::new(gpu, std::mem::size_of::<Draws>())?, DevBuf::new(gpu, std::mem::size_of::<State>())?, DevBuf::new(gpu, 4096)?);
+    db.write(0, &raw(&dr))?;
+    sb.write(0, &raw(&State::default()))?;
+    seen.fill(0)?;
+    let lg: Vec<f32> = (0..2048).map(|i| ((i * 7919) % 2048) as f32 / 300.0).collect();
+    let lgb = DevBuf::from_f32(gpu, &lg)?;
+    let us = run(&|| {
+        // SAFETY: logits [2048]; the draw's buffers.
+        ffi::check(unsafe { (k.draw)(gpu.raw(), lgb.fp(), 2048, 1, db.ptr(), sb.ptr(), seen.ptr().cast(), std::ptr::null(), std::ptr::null(), 0, 0,
+                                     std::ptr::null_mut()) }, "draw")
+    })?;
+    log(format!("{:<34} {us:>7.1} us", "draw (sampled, top-k 50 of 2,048)"));
+    let us = run(&|| d.pass(&t.pred, &s.pred, 1, 8, None))?;
+    log(format!("{:<34} {us:>7.1} us", "predictor pass (5 layers, 1 row)"));
     Ok(())
 }

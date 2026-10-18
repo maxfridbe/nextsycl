@@ -37,8 +37,8 @@ int ns_q3s_gemv(ns_gpu* g, const float* x, int64_t M, int64_t K, const void* w, 
 int64_t ns_q3s_attn_scratch(int64_t Hq, int64_t splits);
 /* The talker's attention for its one row, whole: q / k of the qkv row RMS-normed per head and rotated (rotate-half,
  * 128 wide) at the position *pos (device), k and v stored (half) at that position of the cache [Hkv, T, 128], then
- * the H query heads over the cache's keys 0..*pos in `splits` parts (each ceil((pos+1)/splits) keys), merged by the
- * last part to finish (counters: Hkv zeroed ints, left zeroed); out [H x 128] */
+ * the H query heads over the cache's keys 0..*pos in parts of about 64 keys (at most `splits`, at most 64), merged by
+ * the last part to finish (counters: Hkv zeroed ints, left zeroed); out [H x 128] */
 int ns_q3s_attn(ns_gpu* g, float* qkv, int64_t H, int64_t Hkv, const float* q_norm, const float* k_norm, float eps, const float* inv_freq,
                 const int32_t* pos, void* kc, void* vc, int64_t T, int64_t splits, float* out, float* part, int32_t* counters);
 
