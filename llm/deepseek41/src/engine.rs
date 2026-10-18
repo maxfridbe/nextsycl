@@ -538,7 +538,7 @@ impl Part {
         let contiguous = x.2 == w.cols && y.2 == w.rows;
         if w.ty == GType::Fp8B32 {
             if !acc && t <= MMVQ_COLS && contiguous {
-                return o.fp8_mmv(&w.buf, w.rows, w.cols, (x.0, x.1), (y.0, y.1), t);
+                return o.fp8_mmv(&w.buf, w.rows, w.cols, (x.0, x.1, w.cols), None, (y.0, y.1, w.rows), t);
             }
             let x16 = self.arena.bytes(t * w.cols * 2)?;
             if x.2 == w.cols {
@@ -1859,6 +1859,11 @@ impl<'g> Ds41<'g> {
                     p.matmul(w, tr, (&perm, gi * tr * gw, gw), (og, gi * tr * ol, ol), false)?;
                 }
                 o.permute(og, &oa.view(r0 * ng * ol * 4, tr * ng * ol * 4)?, ng, tr, ol)
+            }
+            None if tr <= MMVQ_COLS => {
+                // fp8 o_a (the towers'), every group in one launch as the q4_K one
+                let w = p.mat(l, Role::OutA)?;
+                o.fp8_mmv(&w.buf, w.rows, w.cols, (att, 0, ng * gw), Some((ol, gw)), (oa, r0 * ng * ol, ng * ol), tr)
             }
             None => {
                 // fp8 o_a (the towers'): each group's rows [g * o_lora, ..) expanded (whole 32-row tiles) against its heads

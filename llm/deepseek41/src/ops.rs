@@ -620,12 +620,21 @@ impl Ops {
         self.ok(rc, "ds41_q4k_mv")
     }
     /// y [t][rows] (floats from y.1) = W . x [t][cols] (floats from x.1), t 1..8
-    pub fn fp8_mmv(&self, w: &DevBuf, rows: usize, cols: usize, x: (&DevBuf, usize), y: (&DevBuf, usize), t: usize) -> Result<()> {
+    pub fn fp8_mmv(&self, w: &DevBuf, rows: usize, cols: usize, x: (&DevBuf, usize, usize), groups: Option<(usize, usize)>, y: (&DevBuf, usize, usize),
+                   t: usize) -> Result<()> {
         w.bounds(0, rows * cols + rows.div_ceil(32) * cols.div_ceil(32))?;
-        need!(x.0, x.1 + t * cols, "fp8_mmv x");
-        need!(y.0, y.1 + t * rows, "fp8_mmv y");
+        let (rpg, xgs) = groups.unwrap_or((0, 0));
+        let xspan = match groups {
+            Some((rpg, xgs)) => (rows.div_ceil(rpg) - 1) * xgs + cols,
+            None => cols,
+        };
+        need!(x.0, x.1 + (t - 1) * x.2 + xspan, "fp8_mmv x");
+        need!(y.0, y.1 + (t - 1) * y.2 + rows, "fp8_mmv y");
         // SAFETY: sizes checked.
-        let rc = unsafe { (self.k.ds41_fp8_mmv)(self.raw(), w.ptr().cast(), rows as i64, cols as i64, x.0.fp().add(x.1), y.0.fp().add(y.1), t as i64) };
+        let rc = unsafe {
+            (self.k.ds41_fp8_mmv)(self.raw(), w.ptr().cast(), rows as i64, cols as i64, x.0.fp().add(x.1), x.2 as i64, rpg as i64, xgs as i64, y.0.fp().add(y.1),
+                                  y.2 as i64, t as i64)
+        };
         self.ok(rc, "ds41_fp8_mmv")
     }
 }

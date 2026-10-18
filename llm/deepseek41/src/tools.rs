@@ -319,6 +319,23 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
         let us = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
         let (rel, _) = compare(&yd.to_f32().map_err(e)?, &yw.to_f32().map_err(e)?);
         println!("q4k_mv {:<24} [{rows} x {cols}]: rel err {rel:.2e}, {us:.1} us ({:.0} GB/s)", t.name, raw.len() as f64 / us / 1e3);
+        // three columns (a verify pass of two drafts): its time, and its first column against the one-column product
+        // (a verify pass's rows exactly as one-token passes)
+        {
+            let x3: Vec<f32> = x.iter().chain(&x).chain(&x).copied().collect();
+            let x3d = DevBuf::from_f32(&g, &x3).map_err(e)?;
+            let y3 = DevBuf::f32(&g, 3 * rows).map_err(e)?;
+            o.q4k_mv(&wd, rows, cols, (&x3d, 0, cols), None, (&y3, 0, rows), 3).map_err(e)?;
+            g.sync().map_err(e)?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..it {
+                o.q4k_mv(&wd, rows, cols, (&x3d, 0, cols), None, (&y3, 0, rows), 3).map_err(e)?;
+            }
+            g.sync().map_err(e)?;
+            let us3 = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
+            let same = y3.view(0, rows * 4).map_err(e)?.to_f32().map_err(e)? == yd.to_f32().map_err(e)?;
+            println!("q4k_mv {:<24} 3 columns: {us3:.1} us; column 0 {} the one-column product", t.name, if same { "bit-identical to" } else { "differs from" });
+        }
         // the shared kernels (Strata's): Q8_1 of x, then the product
         let q8 = DevBuf::new(&g, o.q8_1_bytes(cols, 1)).map_err(e)?;
         o.quantize_q8_1((&xd, 0), &q8, cols, 1).map_err(e)?;
@@ -357,7 +374,7 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
         let x: Vec<f32> = (0..2 * cols).map(|_| rnd()).collect();
         let xd = DevBuf::from_f32(&g, &x).map_err(e)?;
         let yd = DevBuf::f32(&g, 2 * rows).map_err(e)?;
-        o.fp8_mmv(&wd, rows, cols, (&xd, 0), (&yd, 0), 2).map_err(e)?;
+        o.fp8_mmv(&wd, rows, cols, (&xd, 0, cols), None, (&yd, 0, rows), 2).map_err(e)?;
         let y = yd.to_f32().map_err(e)?;
         let mut yrel = 0f64;
         for c in 0..2 {

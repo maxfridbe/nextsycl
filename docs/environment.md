@@ -485,7 +485,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS4_MULTI_GROUPS` | 1024 | Experiment: work-groups of the multi-expert decode kernels | kernels:llm deepseek4 |
 | `NS_DS41_ENGRAM_DIR` | `deepseek-engram` beside the model | the directory of DeepSeek-V4.1's two Engram shards (model-00047/48-of-00048.safetensors, read in rows) | llm deepseek41 |
 | `NS_DS41_ENGRAM_ALIGN` | 512 | the Engram reads' unit in bytes (a power of two from 512: the drives' logical block, what O_DIRECT needs; 4096 reads whole pages) | llm deepseek41 |
-| `NS_DS41_ENGRAM_READERS` | 48 | the Engram's reader threads: its row reads in flight (O_DIRECT, a 4 KiB page each) | llm deepseek41 |
+| `NS_DS41_ENGRAM_READERS` | 48 | the Engram's reader threads: its row reads in flight (O_DIRECT, a 512-byte block each: a row's weights, then its scales) | llm deepseek41 |
 | `NS_DS41_ENGRAM_CACHE` | 262144 | the Engram rows kept in host memory (264 B each; 0: none) | llm deepseek41 |
 | `NS_DS41_DRAFTS` | 3 | the DSpark towers' drafts a verify pass checks (1..7) | llm deepseek41 |
 | `NS_DS41_PIN_GIB` | 40 | pinned host memory for the experts that do not fit VRAM (at most what is available less 12 GiB) | llm deepseek41 |

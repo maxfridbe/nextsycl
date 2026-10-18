@@ -269,7 +269,8 @@ int ns_ds41_fp8_dequant(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols,
     NS_CATCH
 }
 
-int ns_ds41_fp8_mmv(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols, const float* x, float* y, int64_t t) {
+int ns_ds41_fp8_mmv(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols, const float* x, int64_t xcs, int64_t rpg, int64_t xgs, float* y, int64_t ycs,
+                    int64_t t) {
     NS_TRY
     if (cols % 32 != 0 || t < 1 || t > 8) return ns_fail("ns_ds41_fp8_mmv: cols a multiple of 32, 1..8 rows of x");
     constexpr int SG = 16, RPG = 8;
@@ -280,6 +281,7 @@ int ns_ds41_fp8_mmv(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols, con
         const int64_t r = it.get_group(0) * RPG + sg.get_group_id()[0];
         const int lane = sg.get_local_id()[0];
         if (r >= rows) return;
+        const float* xr = x + (rpg > 0 ? (r / rpg) * xgs : 0);
         float acc[8] = {};
         for (int64_t k = lane; k < tc; k += SG) {
             const uint8_t s = sc[(r / 32) * tc + k];
@@ -293,7 +295,7 @@ int ns_ds41_fp8_mmv(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols, con
                 for (int d = 0; d < 4; ++d) wv[q * 4 + d] = e4m3_scaled((u >> (8 * d)) & 0xFF);
             }
             for (int c = 0; c < t; ++c) {
-                const float* xc = x + c * cols + k * 32;
+                const float* xc = xr + c * xcs + k * 32;
                 float s2 = 0.f;
 #pragma unroll
                 for (int d = 0; d < 32; ++d) s2 += wv[d] * xc[d];
@@ -302,7 +304,7 @@ int ns_ds41_fp8_mmv(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols, con
         }
         for (int c = 0; c < t; ++c) {
             const float s = sycl::reduce_over_group(sg, acc[c], sycl::plus<float>());
-            if (lane == 0) y[c * rows + r] = s;
+            if (lane == 0) y[c * ycs + r] = s;
         }
     });
     return 0;

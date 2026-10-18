@@ -63,7 +63,7 @@ pub struct Api {
     pub ds41_vq_codebook_f16: unsafe extern "C" fn(Gpu, *const u8, i64, *mut c_void) -> c_int,
     pub ds41_markov_step: unsafe extern "C" fn(Gpu, *const f32, *const f32, i64, *mut i32) -> c_int,
     pub ds41_gather_rows: unsafe extern "C" fn(Gpu, *const f32, *const i32, i64, i64, *mut f32) -> c_int,
-    pub ds41_fp8_mmv: unsafe extern "C" fn(Gpu, *const u8, i64, i64, *const f32, *mut f32, i64) -> c_int,
+    pub ds41_fp8_mmv: unsafe extern "C" fn(Gpu, *const u8, i64, i64, *const f32, i64, i64, i64, *mut f32, i64, i64) -> c_int,
 }
 
 // SAFETY: function pointers into the libraries, which stay loaded for the process.

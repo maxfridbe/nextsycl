@@ -86,8 +86,10 @@ int ns_ds41_vq_codebook_f16(ns_gpu* g, const uint8_t* cb, int64_t n, void* out);
 int ns_ds41_vq_codebook_f32(ns_gpu* g, const uint8_t* cb, int64_t n, float* out);
 /* fp8_32x32 [rows][cols] (w: the E4M3 plane, then the E8M0 tile scales): rows [r0, r0 + n) expanded to float32 / fp16 */
 int ns_ds41_fp8_dequant(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols, int64_t r0, int64_t n, void* out, int f16);
-/* y [t][rows] = W . x [t][cols], t 1..8 */
-int ns_ds41_fp8_mmv(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols, const float* x, float* y, int64_t t);
+/* y [t][ycs] = W . x for an fp8_32x32 W [rows][cols], t 1..8 columns of x (column c at x + c xcs); with rpg > 0, row r
+ * reads x + (r / rpg) xgs (o_a's groups) */
+int ns_ds41_fp8_mmv(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols, const float* x, int64_t xcs, int64_t rpg, int64_t xgs, float* y, int64_t ycs,
+                    int64_t t);
 
 /* ---- q4k.cpp: y [t][ycs] = W . x for a q4_K W [rows][cols], t 1..8 columns of float32 x (column c at x + c xcs); with
  * rpg > 0, row r reads x + (r / rpg) xgs (o_a's groups: a row block its own input) */
