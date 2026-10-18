@@ -270,11 +270,16 @@ fn fetch(cat: &Catalog, root: &Path, key: &str, f: &Value, from: &[PathBuf], ver
     }
     let part = target.with_file_name(format!("{name}.part"));
     let url = s(f, "url");
-    println!("  {key}: downloading {:.2} GiB\n    {url}", gib(size));
-    if let Some(prefix) = f["tensors"].as_str() {
+    if let Some(pieces) = f["parts"].as_array() {
+        // published as byte ranges of the file (name.part01-of-40 ...): each downloaded and checked, then joined
+        println!("  {key}: downloading {:.2} GiB in {} parts", gib(size), pieces.len());
+        join_parts(pieces, &target, &part)?;
+    } else if let Some(prefix) = f["tensors"].as_str() {
         // a part of a larger safetensors file: its header, then only the tensors under `prefix`, by byte range
+        println!("  {key}: downloading {:.2} GiB\n    {url}", gib(size));
         fetch_tensors(&url, prefix, &part)?;
     } else {
+        println!("  {key}: downloading {:.2} GiB\n    {url}", gib(size));
         let st = Command::new("curl").args(["-fL", "-C", "-", "--retry", "5", "--retry-delay", "5", "-o"]).arg(&part).arg(&url).status()
             .map_err(|e| format!("curl: {e}"))?;
         if !st.success() {
@@ -294,6 +299,48 @@ fn fetch(cat: &Catalog, root: &Path, key: &str, f: &Value, from: &[PathBuf], ver
     println!("ok");
     std::fs::rename(&part, &target).map_err(|e| format!("{}: {e}", target.display()))?;
     Ok(target)
+}
+
+/// A file published in byte ranges (`parts`: each a url, size and sha256, in order) into `out`: each part downloaded
+/// beside `target` (resumed when run again) and checked by its own SHA-256, then appended; the parts removed once
+/// joined. The whole file's size and SHA-256 are checked after, as for any file.
+fn join_parts(pieces: &[Value], target: &Path, out: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut paths = Vec::with_capacity(pieces.len());
+    for (i, pc) in pieces.iter().enumerate() {
+        let (url, size, sha) = (s(pc, "url"), pc["size"].as_u64().unwrap_or(0), s(pc, "sha256"));
+        let p = target.with_file_name(format!("{name}.piece{:02}", i + 1));
+        let done = target.with_file_name(format!("{name}.piece{:02}.ok", i + 1));
+        if !(done.exists() && std::fs::metadata(&p).is_ok_and(|m| m.len() == size)) {
+            println!("    part {} of {}: {url}", i + 1, pieces.len());
+            let st = Command::new("curl").args(["-fL", "-C", "-", "--retry", "5", "--retry-delay", "5", "-o"]).arg(&p).arg(&url).status()
+                .map_err(|e| format!("curl: {e}"))?;
+            let got = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            if !st.success() || got != size {
+                return Err(format!("{url}: the download failed ({got} of {size} bytes; run pull again: it resumes)"));
+            }
+            let h = sha256_of(&p)?;
+            if h != sha {
+                let _ = std::fs::remove_file(&p);
+                return Err(format!("{url}: SHA-256 {h}, the catalog says {sha} (the part is removed: pull again)"));
+            }
+            std::fs::write(&done, b"").map_err(|e| format!("{}: {e}", done.display()))?;
+        }
+        paths.push((p, done));
+    }
+    println!("    joining the parts");
+    let mut f = std::fs::File::create(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    for (p, _) in &paths {
+        let mut r = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        std::io::copy(&mut r, &mut f).map_err(|e| format!("{}: {e}", out.display()))?;
+    }
+    f.flush().map_err(|e| e.to_string())?;
+    for (p, done) in &paths {
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(done);
+    }
+    Ok(())
 }
 
 /// Bytes [a, b) of a URL
@@ -462,7 +509,14 @@ mod tests {
     fn the_model_cards_are_whole() {
         let cat = repo_cards();
         for (k, f) in &cat.files {
-            assert!(s(f, "url").starts_with("https://"), "{k}: a direct link");
+            // a file published in byte ranges: each part a direct link with its size and SHA-256, the sizes the file's
+            if let Some(ps) = f["parts"].as_array() {
+                for p in ps {
+                    assert!(s(p, "url").starts_with("https://") && s(p, "sha256").len() == 64 && p["size"].as_u64().unwrap_or(0) > 0, "{k}: a part");
+                }
+                assert_eq!(ps.iter().filter_map(|p| p["size"].as_u64()).sum::<u64>(), f["size"].as_u64().unwrap_or(0), "{k}: the parts' sizes");
+            }
+            assert!(s(f, "url").starts_with("https://") || f["parts"].is_array(), "{k}: a direct link");
             assert_eq!(s(f, "sha256").len(), 64, "{k}: a SHA-256");
             assert!(f["size"].as_u64().unwrap_or(0) > 0, "{k}: a size");
             assert!(!s(f, "path").is_empty() && !s(f, "path").starts_with('/'), "{k}: a relative path");
@@ -487,6 +541,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_file_in_parts_is_joined_after_each_is_checked() {
+        let dir = std::env::temp_dir().join(format!("ns-parts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut pieces = Vec::new();
+        for (i, body) in [b"hello ".as_slice(), b"world".as_slice()].iter().enumerate() {
+            let p = dir.join(format!("src{i}"));
+            std::fs::write(&p, body).unwrap();
+            pieces.push(json!({"url": format!("file://{}", p.display()), "size": body.len(), "sha256": sha256_of(&p).unwrap()}));
+        }
+        let (target, out) = (dir.join("whole.bin"), dir.join("whole.bin.part"));
+        join_parts(&pieces, &target, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"hello world");
+        assert!(!dir.join("whole.bin.piece01").exists(), "the parts removed once joined");
+        pieces[1]["sha256"] = json!("0".repeat(64));
+        assert!(join_parts(&pieces, &target, &out).is_err(), "a part that does not match its SHA-256");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

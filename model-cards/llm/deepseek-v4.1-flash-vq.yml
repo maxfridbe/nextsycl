@@ -1,0 +1,77 @@
+# DeepSeek-V4.1-Flash-1017 VQ · 128K context (both GPUs, pinned memory and the NVMe)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: deepseek-v4.1-flash-vq
+kind: llm
+arch: deepseek41
+title: DeepSeek-V4.1-Flash-1017 VQ · 128K context (both GPUs, pinned memory and the NVMe)
+about: Baekpica's VQ GGUF of DeepSeek-V4.1-Flash-1017 (YoungAi's recipe; 105.8 GiB - routed experts as 8-dim vector codes of 12-13 bits, ~1.6 bits a weight, the rest q4_K; 13B active, 384 experts) with its three DSpark draft towers inside, and DeepSeek's own Engram tables (two 101.5 GB shards read a row at a time while it runs - keep them on the fastest drive); the experts beyond VRAM in pinned host memory, the rest read from the file
+gpus: all
+streams: true                   # the Engram's rows and the experts beyond VRAM and pinned memory are read from the drive while it serves
+vram_gib: 30.0
+ctx: '131072'
+tools: false
+tasks: false
+env: {}
+silo:                           # its VQ kernels exist only there
+  name: deepseek41
+  required: true
+files:
+  model:
+    key: deepseek-v4.1-flash-1017-vq
+    size: 113556639424
+    sha256: 9f3afe6a46ff8de711911dfad5994519a4e5dd57b163f88a5bf4111c308d0e6f
+    path: deepseek-v4.1-flash-1017/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf
+    parts:                      # published as 40 byte ranges of the file: joined after each is checked
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part01-of-40, size: 2838915986, sha256: 3d791a1200678b5fb9b3d75f7ea325d024b127d0b305e50133258c4dbeac017a}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part02-of-40, size: 2838915986, sha256: 4af91e5a27d5281684f01da2e09ead814bfeedc2e9c29d85bd9b78cf90c6f478}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part03-of-40, size: 2838915986, sha256: 6d7389c87675fb87b88a5cf0f823713936a153c3dd043372da3105964c147fe5}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part04-of-40, size: 2838915986, sha256: 36bbeb2ecca3f3ed6f8e0795ade22f45e7bd9378f305cc3f7856bbf8c23efb7e}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part05-of-40, size: 2838915986, sha256: e907bf5f02022a2cccb6ec717d70f65d8dec66d5862f9b50e33e27bc96f44075}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part06-of-40, size: 2838915986, sha256: 868ea2c346033ffaca0be01170ac3f070a9bbfd40121251a98b28e45509c4079}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part07-of-40, size: 2838915986, sha256: 64871d704fe485e8a36f8b93d3b21d922c137b8bf1d1ab4b027e240f604e3997}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part08-of-40, size: 2838915986, sha256: 952840a832824694ed78669ff4a67bc34b3e2b81c543bc1df1f91b0c343e5637}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part09-of-40, size: 2838915986, sha256: abbcfff9af93e2cef3bf55c9a574d2e33d1b53544924598dd9a8c3e846b56dde}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part10-of-40, size: 2838915986, sha256: 99754852d98dbaa13ffba7ee9c19271d86de90876645a9b3c7a6d8c4cc89b413}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part11-of-40, size: 2838915986, sha256: a1f318760466b3361dd21db3b960df96d93bfca34bf3dfbebad549f6baddf265}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part12-of-40, size: 2838915986, sha256: c37004ebd2fb8ab953098b083e8aa91ec7ed17159cb1dbd16c0d79a841898288}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part13-of-40, size: 2838915986, sha256: ea5d2aca71f89a2ec8b170124318df6bcf4bffda491f6eac359f0fe43411fb29}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part14-of-40, size: 2838915986, sha256: 4f61fd174ec2259933147877060df3764e026008e921028aa84ebbd33a4cf10a}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part15-of-40, size: 2838915986, sha256: 1deead83972cd417399ebb41df6b7e84bd71f82445e8ae3b3d789937d0b45a88}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part16-of-40, size: 2838915986, sha256: 369609b43a67ec64fb8a8d1b4fc085109012a1ec964e52b67da5ddcf6d46b2e9}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part17-of-40, size: 2838915986, sha256: 23cfe0d8d3b774c39dfc55e2681405bea4ec06f5c240393d5e034654d7bcc18a}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part18-of-40, size: 2838915986, sha256: 744bbc6e5c9fe6be3e76cbd15173ff1a01a66062fefd3629eef827db7c553f0b}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part19-of-40, size: 2838915986, sha256: 217194e3c90ba78f7e9fb16d1a3df6a56d1a0939fd6c58ce3cf4d1aaa81bc2c0}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part20-of-40, size: 2838915986, sha256: 485ea3fc2256f02d3d8055d06c49ab0e1bbb98ad0a8f26b34d9ac769ebeb7ae0}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part21-of-40, size: 2838915986, sha256: 3410cb112183e90c21743bfaf51d3d4f5dabe785a17a375742b2af05e39117a8}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part22-of-40, size: 2838915986, sha256: 6a3cbeecf74bb8f3b3fbc135464c57afe47cc057b477bd4133cb049f8ec1ee68}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part23-of-40, size: 2838915986, sha256: 1039c98370ce28099589f1f4306db3badbf78afe56b39d3cde2462404092714b}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part24-of-40, size: 2838915986, sha256: 535221c36e43b357d715388ba8faaa9f7b365ce2e586f883041386620c056629}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part25-of-40, size: 2838915985, sha256: 3e025de4e49a63f70cfdd0bce8bfc979c52a517af5665afccf21856cb0f1e3a5}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part26-of-40, size: 2838915985, sha256: fc3bf96b3003f9b44b8c9697593fcdec5de638c2656fb0ab996ad3bfed76d568}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part27-of-40, size: 2838915985, sha256: 6bcff49038cf54f6e54b7a6de88b12ddbf2373e2e0599808e9f0e7f5703e8ad3}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part28-of-40, size: 2838915985, sha256: b40422a0279cede9fad92eee602a2ef4b334a815d8b47cec60389d31487e512c}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part29-of-40, size: 2838915985, sha256: bfbc81c0df1321da9334ec744b6fac3104dd68390eefe324765a87277b0133ca}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part30-of-40, size: 2838915985, sha256: 18b66a927e2f89a8fafbb342f4a0e3801f1142e3310d1d7b891317a8a78611e5}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part31-of-40, size: 2838915985, sha256: 8efc8e57bea65bcdb9ac565d9b18eba8d5ed381a913c79b91a3a03b4576c288c}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part32-of-40, size: 2838915985, sha256: 4c3615e1812341cf02fd8142d5f61848dbdcce1e925dc0683bd62a82658bec56}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part33-of-40, size: 2838915985, sha256: dc8bf71e09f9d0bb9cf1a7ec89bbd1a263daf550e71debb8942538043610e769}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part34-of-40, size: 2838915985, sha256: 21b347c0df4dd2e5abd27a2bbf6466daf40f98941528a5d290b5c3b1db8361ec}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part35-of-40, size: 2838915985, sha256: 7425fcb5141853bfc1bc0673c63d4e2af6b341ceae6989cd8f109452403aec4a}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part36-of-40, size: 2838915985, sha256: e6b47622003045494ebd74f440549a13821e4ea1cd452063805bf85b778445fa}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part37-of-40, size: 2838915985, sha256: fccf5f0f1b88d234c915a9785024f10d870e4b98abf6b4c82bd3dcec99c2979d}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part38-of-40, size: 2838915985, sha256: df618468ccafc1e64617de38e60ef4957c5c40bfcc25231f1226291e463b7171}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part39-of-40, size: 2838915985, sha256: 485b8c01aa6e33b00ad300fb50cdf09302788c4c43603ed9a28aad8fe1cd12a1}
+      - {url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part40-of-40, size: 2838915985, sha256: f7fbaebc68687f2c839d3e627ae46125217a798628bb140149da2b40c13a5f47}
+  engram-1:
+    key: deepseek-v4.1-flash-1017-engram-1
+    url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/deepseek-engram/model-00047-of-00048.safetensors
+    size: 101535150936
+    sha256: 76a05106ece259be83d1bfea0dcb54f23377864ee60fd321690f35e6698a2af5
+    path: deepseek-v4.1-flash-1017/deepseek-engram/model-00047-of-00048.safetensors
+  engram-2:
+    key: deepseek-v4.1-flash-1017-engram-2
+    url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/deepseek-engram/model-00048-of-00048.safetensors
+    size: 101537926640
+    sha256: 9dc51433e195bc78b5ad846b68643cc0351d3b174e5e4309222d3b7402c83afd
+    path: deepseek-v4.1-flash-1017/deepseek-engram/model-00048-of-00048.safetensors
+guide: guides/chat.md
