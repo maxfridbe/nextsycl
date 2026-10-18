@@ -12,7 +12,8 @@
 //!   h' = talker(E0(c0) + sum_i E_i(c_i) + the next text row, or tts_pad when the text has run out)
 //! ```
 //!
-//! The frames' codes (16 codebooks of 2,048) go to the codec (codec.rs). Sampling is on the host (sample.rs).
+//! The frames' codes (16 codebooks of 2,048) go to the codec (codec.rs). Here on the shared kernels with the draws on
+//! the host (sample.rs); with the engine's silo the whole frame runs on the device as one graph (device.rs).
 
 use nextsycl_audio::{Error, Result};
 use nextsycl_core::DevBuf;
@@ -25,44 +26,44 @@ const HEAD: usize = 128;
 const EPS: f32 = 1e-6;
 const THETA: f32 = 1_000_000.0;
 
-struct Layer {
-    in_norm: DevBuf,
-    post_norm: DevBuf,
-    q_norm: DevBuf,
-    k_norm: DevBuf,
-    qkv: Mat,
-    o: Mat,
-    gu: Mat,
-    down: Mat,
+pub(crate) struct Layer {
+    pub(crate) in_norm: DevBuf,
+    pub(crate) post_norm: DevBuf,
+    pub(crate) q_norm: DevBuf,
+    pub(crate) k_norm: DevBuf,
+    pub(crate) qkv: Mat,
+    pub(crate) o: Mat,
+    pub(crate) gu: Mat,
+    pub(crate) down: Mat,
 }
 
 /// A Qwen3 decoder (its sizes read from its tensors)
 pub struct Lm {
-    layers: Vec<Layer>,
-    norm: DevBuf,
+    pub(crate) layers: Vec<Layer>,
+    pub(crate) norm: DevBuf,
     pub hidden: usize,
-    heads: usize,
-    kv: usize,
-    ffn: usize,
-    inv_freq: DevBuf,
+    pub(crate) heads: usize,
+    pub(crate) kv: usize,
+    pub(crate) ffn: usize,
+    pub(crate) inv_freq: DevBuf,
 }
 
 /// One decoder's cache and work buffers for up to `rows` rows a pass and `t` positions
 pub struct Cache {
-    t: usize,
-    k: Vec<DevBuf>,
-    v: Vec<DevBuf>,
+    pub(crate) t: usize,
+    pub(crate) k: Vec<DevBuf>,
+    pub(crate) v: Vec<DevBuf>,
     pub x: DevBuf,
-    hb: DevBuf,
-    qkv: DevBuf,
-    att: DevBuf,
-    gu: DevBuf,
-    act: DevBuf,
-    tmp: DevBuf,
-    xh: DevBuf,
+    pub(crate) hb: DevBuf,
+    pub(crate) qkv: DevBuf,
+    pub(crate) att: DevBuf,
+    pub(crate) gu: DevBuf,
+    pub(crate) act: DevBuf,
+    pub(crate) tmp: DevBuf,
+    pub(crate) xh: DevBuf,
     /// an int8 matrix expanded to half for a wide product (int8 weights only)
-    wh: Option<DevBuf>,
-    part: DevBuf,
+    pub(crate) wh: Option<DevBuf>,
+    pub(crate) part: DevBuf,
     pub out: DevBuf,
 }
 
@@ -163,36 +164,45 @@ pub struct Talker {
     pub lm: Lm,
     pub pred: Lm,
     /// half [codec vocab + 15 x predictor vocab, hidden]: the talker's codec embedding, then the predictor's tables
-    table: DevBuf,
+    pub(crate) table: DevBuf,
     pub vocab: usize,
     pub pvocab: usize,
     pub groups: usize,
-    head: Mat,
+    pub(crate) head: Mat,
     /// predictor: talker hidden -> predictor hidden (with bias), and its fifteen heads
-    proj: Mat,
-    proj_b: DevBuf,
-    heads: Vec<Mat>,
+    pub(crate) proj: Mat,
+    pub(crate) proj_b: DevBuf,
+    pub(crate) heads: Vec<Mat>,
     /// the text projection's two layers (with biases)
-    fc1: Mat,
-    fc1_b: DevBuf,
-    fc2: Mat,
-    fc2_b: DevBuf,
+    pub(crate) fc1: Mat,
+    pub(crate) fc1_b: DevBuf,
+    pub(crate) fc2: Mat,
+    pub(crate) fc2_b: DevBuf,
+    /// the predictor's input row of every code, made at load for the silo's frame (device.rs)
+    pub(crate) ptab: Option<DevBuf>,
     pub bytes: usize,
 }
 
 /// A generation's caches and the hidden state each frame starts from
 pub struct Session {
     pub lm: Cache,
-    pred: Cache,
-    last: DevBuf,
-    logits: DevBuf,
-    e: DevBuf,
+    pub(crate) pred: Cache,
+    pub(crate) last: DevBuf,
+    pub(crate) logits: DevBuf,
+    pub(crate) e: DevBuf,
     /// [rows, text hidden] work for the text projection
-    th: DevBuf,
-    tp: DevBuf,
-    rows: usize,
+    pub(crate) th: DevBuf,
+    pub(crate) tp: DevBuf,
+    pub(crate) rows: usize,
     /// a forced run's disagreements: frames whose first code / whose other codes the model would not have taken
     pub misses: std::cell::Cell<[usize; 2]>,
+    /// NS_Q3T_PROFILE=1: seconds in the frames' stages (c0 logits, c0 draw, predictor, talker step)
+    pub prof: std::cell::Cell<[f64; 4]>,
+}
+
+/// NS_Q3T_PROFILE=1: each stage synchronised and timed (slower; for finding where a frame's time goes)
+pub fn profiling() -> bool {
+    std::env::var("NS_Q3T_PROFILE").is_ok_and(|v| v == "1")
 }
 
 /// What a frame's draws follow
@@ -229,6 +239,7 @@ impl Talker {
             fc1_b: f.dev_f32(ops, "talker.text_projection.linear_fc1.bias")?,
             fc2: f.mat1(ops, "talker.text_projection.linear_fc2.weight", false)?,
             fc2_b: f.dev_f32(ops, "talker.text_projection.linear_fc2.bias")?,
+            ptab: None,
             bytes: 0,
             lm,
             pred,
@@ -257,6 +268,7 @@ impl Talker {
             tp: DevBuf::f32(g, prompt.max(2) * h)?,
             rows: prompt.max(2),
             misses: std::cell::Cell::new([0, 0]),
+            prof: std::cell::Cell::new([0.0; 4]),
         })
     }
 
@@ -323,7 +335,20 @@ impl Talker {
     pub fn frame(&self, ops: &Ops, nsd: &Nsd, s: &Session, pos: usize, text: *const f32, d: &Drawing, seen: &[i32], rng: &mut Rng,
                  force: Option<&[i32]>) -> Result<Option<Vec<i32>>> {
         let h = self.lm.hidden;
+        let prof = profiling();
+        let mut tp = std::time::Instant::now();
+        let mut lap = |i: usize| -> Result<()> {
+            if prof {
+                ops.gpu.sync()?;
+                let mut p = s.prof.get();
+                p[i] += tp.elapsed().as_secs_f64();
+                s.prof.set(p);
+                tp = std::time::Instant::now();
+            }
+            Ok(())
+        };
         let mut l0 = self.logits0(ops, s)?;
+        lap(0)?;
         sample::repetition_penalty(&mut l0, seen, d.repetition_penalty);
         for (i, v) in l0.iter_mut().enumerate().skip(d.suppress_from) {
             if i as i32 != d.eos {
@@ -343,6 +368,7 @@ impl Talker {
             }
             None => sample::pick(&l0, d.talker, rng) as i32,
         };
+        lap(1)?;
         if c0 == d.eos {
             return Ok(None);
         }
@@ -375,12 +401,14 @@ impl Talker {
                 row = 0;
             }
         }
+        lap(2)?;
         // the frame fed back: its embeddings summed, plus the text row
         let idx: Vec<i32> = codes.iter().enumerate().map(|(g, c)| self.index(g, *c)).collect();
         self.sum_into(ops, s, &idx, s.lm.x.fp())?;
         ops.add(s.lm.x.fp(), text, h)?;
         self.lm.pass(ops, nsd, &s.lm, 1, pos)?;
         s.last.copy_within(0, &s.lm.out, 0, h * 4)?;
+        lap(3)?;
         Ok(Some(codes))
     }
 }

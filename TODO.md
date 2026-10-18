@@ -306,8 +306,11 @@ of IQ2_XXS instead could win twice.
 - [ ] VoxCPM2 speed: the DiT's 9 evaluations a patch as one graph with the Euler update on the GPU (host round trips
       now); batch the guided and unguided rows through the products already, fuse the local attention; streamed answers
 - [x] Saved voices (2026-10-10): clone from WAV / MP3 / FLAC / Ogg / M4A, design through the voice-design model, speak by name
-- [ ] Qwen3-TTS: the draws on the GPU / the frame as one graph (16 host round trips a frame now); streamed answers
-      (the codec chunk by chunk as frames come); the 0.6B checkpoints
+- [x] Qwen3-TTS: the draws on the GPU, the frame as one graph (its silo, 2026-10-18): B70 half 70 -> 82 frames/s,
+      int8 93 -> 125; the codec's primitives made once a chunk length (a short answer 1.1 -> 0.6 s)
+- [ ] Qwen3-TTS: streamed answers (the codec chunk by chunk as frames come); the predictor's attention inside its
+      o-projection (~4% a frame); the encoder's primitives by length buckets (an in-context clone's first request
+      +0.3 s); the 0.6B checkpoints
 - [ ] Music: the two cards together as the reference runs (the language model on one, flow + decoder on the other,
       the windows streamed between them) when chat is not on the B65; `audio start | stop | ps`; 32 kHz output (the
       reference server resamples); the caption rewriter (MiniMax's music-caption-rewriter skill) as an option

@@ -1,0 +1,896 @@
+// q3s.cpp: Qwen3-TTS's silo (q3s.h) - its frame's kernels, fused where the shared ones (the MiniMax Music engine's mm3
+// kernels and the diffusion kernels' norms) take a launch each, and the draws on the device. Started from mm3.cpp's
+// gemv and attention (copied, then changed: rule 6). Sub-groups of 16 (Xe2's native width).
+#include "ns.h"
+#include "ns_internal.hpp"
+#include "q3s.h"
+
+#include <sycl/sycl.hpp>
+#include <cmath>
+#include <limits>
+
+namespace {
+using half = sycl::half;
+namespace X = sycl::ext::oneapi::experimental;
+constexpr int SG = 16;
+constexpr int HD = 128;   // a head's width
+
+// ---- the decode's product. A work-group of 8 sub-groups; each sub-group R output rows (a block) over a share of K:
+// KS sub-groups split a block's K (interleaved chunks of SG * V), their sums merged through local memory. Its lanes
+// read V weights at a time (16 bytes: 8 halfs or 16 int8), x's V values once for all R rows (R large for int8, whose
+// x would otherwise be read from cache twice for every weight byte). NORM: each x row's 1 / rms reduced over the
+// work-group first, the row read normed (x * inv * weight); SWIGLU: the block is R/2 gate rows and their R/2 up rows,
+// the output silu(gate) * up.
+constexpr int NSG = 8;
+constexpr int64_t KMAX_NORM = 2048;   // the widest normed input (the talker's hidden)
+constexpr int64_t Q8 = 32;            // grouped int8: weights a scale
+
+template <typename WT, int MM, int R, bool GQ>
+void gemv(sycl::queue& q, const float* x, int M, int64_t K, const WT* w, const float* gscale, int64_t N, const float* bias, float* out,
+          int64_t ldo, int flags, const float* norm_w, float eps, int KS) {
+    constexpr int V = sizeof(WT) == 1 ? 16 : 8, RH = R / 2;
+    const bool norm = flags & NS_Q3S_NORM, acc = flags & NS_Q3S_ACC, swiglu = flags & NS_Q3S_SWIGLU;
+    const int64_t Nh = N / 2;
+    const int64_t blocks = swiglu ? (Nh + RH - 1) / RH : (N + R - 1) / R;
+    const int per_wg = NSG / KS;   // blocks a work-group
+    const int64_t groups = (blocks + per_wg - 1) / per_wg;
+    const int64_t step = (int64_t) KS * SG * V;
+    // GQ: int8 with a half scale every Q8 weights of a row (gscale [N, K / Q8] half); else a float scale a row (or none)
+    const float* scale = GQ ? nullptr : gscale;
+    const int64_t KG = K / Q8;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>((size_t) NSG * MM * R), h);
+        sycl::local_accessor<float, 1> inv(sycl::range<1>(MM), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) groups * SG * NSG), sycl::range<1>(SG * NSG)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            auto sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
+            const int ks = sgi % KS, rp = sgi / KS;
+            const int64_t blk = (int64_t) it.get_group(0) * per_wg + rp;
+            float iv[MM];
+#pragma unroll
+            for (int m = 0; m < MM; ++m) iv[m] = 1.0f;
+            if (norm) {
+                // each row's 1 / rms over the work-group (4 floats a work-item at a time)
+                const int li = (int) it.get_local_id(0);
+                for (int m = 0; m < M; ++m) {
+                    float ss = 0.0f;
+                    for (int64_t k = (int64_t) li * 4; k < K; k += SG * NSG * 4) {
+                        const sycl::vec<float, 4> v = *reinterpret_cast<const sycl::vec<float, 4>*>(x + m * K + k);
+                        ss += v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3];
+                    }
+                    ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+                    if (li == 0) inv[m] = sycl::rsqrt(ss / (float) K + eps);
+                }
+                sycl::group_barrier(it.get_group());
+#pragma unroll
+                for (int m = 0; m < MM; ++m) iv[m] = m < M ? inv[m] : 1.0f;
+            }
+            // the block's rows (clamped: rows past the end compute a copy, not written)
+            int64_t rows[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if (swiglu) {
+                    const int64_t n = sycl::min(blk * RH + (r % RH), Nh - 1);
+                    rows[r] = r < RH ? n : n + Nh;
+                } else {
+                    rows[r] = sycl::min(blk * R + r, N - 1);
+                }
+            }
+            float a[MM][R];
+#pragma unroll
+            for (int m = 0; m < MM; ++m)
+#pragma unroll
+                for (int r = 0; r < R; ++r) a[m][r] = 0.0f;
+            for (int64_t k = ((int64_t) ks * SG + lane) * V; k < K; k += step) {
+                float xv[MM][V];
+#pragma unroll
+                for (int m = 0; m < MM; ++m) {
+                    if (m < M) {
+#pragma unroll
+                        for (int i = 0; i < V; i += 4) {
+                            const sycl::vec<float, 4> x4 = *reinterpret_cast<const sycl::vec<float, 4>*>(x + m * K + k + i);
+                            xv[m][i] = x4[0];
+                            xv[m][i + 1] = x4[1];
+                            xv[m][i + 2] = x4[2];
+                            xv[m][i + 3] = x4[3];
+                        }
+                    }
+                }
+                if (norm) {
+#pragma unroll
+                    for (int i = 0; i < V; i += 4) {
+                        const sycl::vec<float, 4> n4 = *reinterpret_cast<const sycl::vec<float, 4>*>(norm_w + k + i);
+#pragma unroll
+                        for (int m = 0; m < MM; ++m) {
+                            xv[m][i] = n4[0] * (xv[m][i] * iv[m]);
+                            xv[m][i + 1] = n4[1] * (xv[m][i + 1] * iv[m]);
+                            xv[m][i + 2] = n4[2] * (xv[m][i + 2] * iv[m]);
+                            xv[m][i + 3] = n4[3] * (xv[m][i + 3] * iv[m]);
+                        }
+                    }
+                }
+                sycl::vec<WT, V> wv[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) wv[r] = *reinterpret_cast<const sycl::vec<WT, V>*>(w + rows[r] * K + k);
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const float gs = GQ ? (float) reinterpret_cast<const half*>(gscale)[rows[r] * KG + k / Q8] : 1.0f;
+#pragma unroll
+                    for (int m = 0; m < MM; ++m) {
+                        if (m < M) {
+                            float s = 0.0f;
+#pragma unroll
+                            for (int i = 0; i < V; ++i) s += (float) wv[r][i] * xv[m][i];
+                            a[m][r] += GQ ? s * gs : s;
+                        }
+                    }
+                }
+            }
+            // the lanes' sums, then the K shares' through local memory
+#pragma unroll
+            for (int m = 0; m < MM; ++m)
+#pragma unroll
+                for (int r = 0; r < R; ++r) a[m][r] = sycl::reduce_over_group(sg, a[m][r], sycl::plus<float>());
+            if (KS > 1) {
+                if (lane == 0) {
+#pragma unroll
+                    for (int m = 0; m < MM; ++m)
+#pragma unroll
+                        for (int r = 0; r < R; ++r) red[(sgi * MM + m) * R + r] = a[m][r];
+                }
+                sycl::group_barrier(it.get_group());
+                if (ks == 0 && lane == 0) {
+#pragma unroll
+                    for (int m = 0; m < MM; ++m)
+#pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            float s = 0.0f;
+                            for (int j = 0; j < KS; ++j) s += red[((sgi + j) * MM + m) * R + r];
+                            a[m][r] = s;
+                        }
+                }
+            }
+            if (ks != 0 || lane != 0) return;
+#pragma unroll
+            for (int m = 0; m < MM; ++m) {
+                if (m >= M) continue;
+                if (swiglu) {
+#pragma unroll
+                    for (int r = 0; r < RH; ++r) {
+                        const int64_t n = blk * RH + r;
+                        if (n >= Nh) continue;
+                        float gt = a[m][r], up = a[m][r + RH];
+                        if (scale) {
+                            gt *= scale[rows[r]];
+                            up *= scale[rows[r + RH]];
+                        }
+                        if (bias) {
+                            gt += bias[rows[r]];
+                            up += bias[rows[r + RH]];
+                        }
+                        float* o = out + m * ldo + n;
+                        const float v = gt / (1.0f + sycl::exp(-gt)) * up;
+                        *o = acc ? *o + v : v;
+                    }
+                } else {
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        const int64_t n = blk * R + r;
+                        if (n >= N) continue;
+                        const float v = a[m][r] * (scale ? scale[n] : 1.0f) + (bias ? bias[n] : 0.0f);
+                        float* o = out + m * ldo + n;
+                        *o = acc ? *o + v : v;
+                    }
+                }
+            }
+        });
+    });
+}
+
+// K shares a block: enough sub-groups in flight for a narrow product (about 2,048 of them), each share at least one
+// chunk of SG * V
+int k_shares(int64_t blocks, int64_t K, int V) {
+    int ks = 1;
+    while (ks < NSG && blocks * ks < 2048 && K / ((int64_t) (ks * 2) * SG * V) >= 1) ks *= 2;
+    return ks;
+}
+
+
+// q / k of a row: 128 values a head over a sub-group (8 a lane, strided by 16), RMS-normed and rotated at `pos`
+inline void norm_rope(float v[8], const float* weight, float eps, const float* inv_freq, float pos, int l, sycl::sub_group sg) {
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) ss += v[j] * v[j];
+    const float inv = sycl::rsqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / 128.0f + eps);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = weight[l + 16 * j] * (v[j] * inv);
+    float o[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int i = l + 16 * j;
+        const float a = pos * inv_freq[i], c = sycl::cos(a), s = sycl::sin(a);
+        o[j] = v[j] * c - v[j + 4] * s;
+        o[j + 4] = v[j + 4] * c + v[j] * s;
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = o[j];
+}
+
+// splitmix64 on two 32-bit words (the device's integers), a uniform float in [0, 1) from its top 24 bits
+inline float uniform(uint32_t st[2]) {
+    uint64_t s = ((uint64_t) st[1] << 32) | st[0];
+    s += 0x9e3779b97f4a7c15ull;
+    st[0] = (uint32_t) s;
+    st[1] = (uint32_t) (s >> 32);
+    uint64_t z = s;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    z ^= z >> 31;
+    return (float) (z >> 40) * (1.0f / 16777216.0f);
+}
+
+// a float's order as an unsigned key (larger float, larger key)
+inline uint32_t key(float v) {
+    const uint32_t b = sycl::bit_cast<uint32_t>(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// the draw's work-group: up to 4,096 logits, 16 a lane (each lane a run of 16 in index order)
+constexpr int DRAW_WG = 256, DRAW_PER = 16;
+// the attention kernels' work-group: 8 sub-groups
+constexpr int ATT_SG = 8, ATT_WG = ATT_SG * SG;
+
+// a head's 128 values from a row (8 a lane, strided by 16) RMS-normed and rotated at `pos`, into local memory at
+// their places (scaled)
+inline void head_to_local(const float* src, const float* weight, float eps, const float* inv_freq, float pos, float scale, float* dst, int l,
+                          sycl::sub_group sg) {
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = src[l + 16 * j];
+    norm_rope(v, weight, eps, inv_freq, pos, l, sg);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) dst[l + 16 * j] = v[j] * scale;
+}
+
+// q . k over a sub-group: q in local memory, k a half row (8 contiguous a lane)
+inline float dot_q(const float* q, const half* k, int l, sycl::sub_group sg) {
+    const sycl::vec<half, 8> kv = *reinterpret_cast<const sycl::vec<half, 8>*>(k + l * 8);
+    float d = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) d += q[l * 8 + i] * (float) kv[i];
+    return sycl::reduce_over_group(sg, d, sycl::plus<float>());
+}
+inline float dot_ql(const float* q, const float* k, int l, sycl::sub_group sg) {
+    float d = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) d += q[l * 8 + i] * (float) (half) k[l * 8 + i];
+    return sycl::reduce_over_group(sg, d, sycl::plus<float>());
+}
+}  // namespace
+
+// the talker's attention for G query heads a key head (ns_q3s_attn): G a constant, so the per-head state stays in
+// registers
+template <int G>
+int attn_t(ns_gpu* g, float* qkv, int64_t H, int64_t Hkv, const float* q_norm, const float* k_norm, float eps, const float* inv_freq,
+                const int32_t* pos, void* kc, void* vc, int64_t T, int64_t splits, float* out, float* part, int32_t* counters) {
+    half* kco = (half*) kc;
+    half* vco = (half*) vc;
+    const int64_t ns = splits;
+    const float scale = 1.0f / sycl::sqrt((float) HD);
+    // a work-group per (key head, split): the G query heads (and, in the split holding the new position, the new key
+    // and value, stored) normed and rotated into local memory; then the split's keys a tile of TK at a time - the
+    // tile's keys and values read into local memory by the whole work-group at once, its scores a sub-group a key,
+    // a running softmax a work-item a feature. The keys so far split into as many parts as give each about KS_KEYS
+    // (at most `splits`; the work-groups past them leave at once); a part's partial (sum, max, total) merged with the
+    // others' by the key head's last work-group to finish (a counter a key head, reset by it)
+    constexpr int TK = 32, KS_KEYS = 32, MAXP = 24;
+    if (splits > 64) return ns_fail("ns_q3s_attn: at most 64 splits");
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> qs(sycl::range<1>((size_t) (G + 2) * HD), h);
+        sycl::local_accessor<half, 1> kt(sycl::range<1>((size_t) TK * HD), h);
+        sycl::local_accessor<half, 1> vt(sycl::range<1>((size_t) TK * HD), h);
+        sycl::local_accessor<float, 1> sc(sycl::range<1>((size_t) (G * TK)), h);
+        sycl::local_accessor<int, 1> last(sycl::range<1>(1), h);
+        sycl::local_accessor<float, 1> mls(sycl::range<1>((size_t) G * 64 * 2), h);
+        sycl::local_accessor<float, 1> tm(sycl::range<1>((size_t) G * 2), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (Hkv * ns) * ATT_WG), sycl::range<1>(ATT_WG)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            auto sg = it.get_sub_group();
+            auto grp = it.get_group();
+            const int l = (int) sg.get_local_linear_id(), si = (int) sg.get_group_linear_id(), li = (int) it.get_local_id(0);
+            const int64_t sp = it.get_group(0) % ns, hk = it.get_group(0) / ns;
+            const int64_t p = *pos;
+            const int64_t kv_end = p + 1;
+            const int64_t nu = sycl::clamp((kv_end + KS_KEYS - 1) / KS_KEYS, (int64_t) 1, sycl::min(ns, (int64_t) MAXP));   // the parts used
+            if (sp >= nu) return;
+            const int64_t per = (kv_end + nu - 1) / nu;
+            const int64_t j0 = sp * per, j1 = sycl::min(kv_end, (sp + 1) * per);
+            const bool mine = j0 <= p && p < j1;   // this split holds the new position
+            float* kn = &qs[G * HD];
+            float* vn = &qs[(G + 1) * HD];
+            if (si < G) {
+                head_to_local(qkv + (hk * G + si) * HD, q_norm, eps, inv_freq, (float) p, scale, &qs[si * HD], l, sg);
+            } else if (si == G && mine) {
+                head_to_local(qkv + (H + hk) * HD, k_norm, eps, inv_freq, (float) p, 1.0f, kn, l, sg);
+                half* kd = kco + (hk * T + p) * HD;
+                half* vd = vco + (hk * T + p) * HD;
+                const float* vr = qkv + (H + Hkv + hk) * HD;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int i = l + 16 * j;
+                    kd[i] = (half) kn[i];
+                    vd[i] = (half) vr[i];
+                    vn[i] = vr[i];
+                }
+            }
+            const half* kb = kco + hk * T * HD;
+            const half* vb = vco + hk * T * HD;
+            float m[G], L[G], acc[G];
+#pragma unroll
+            for (int gq = 0; gq < G; ++gq) {
+                m[gq] = -INFINITY;
+                L[gq] = 0.0f;
+                acc[gq] = 0.0f;
+            }
+            const int d = li;   // this work-item's feature (ATT_WG == HD)
+            for (int64_t t0 = j0; t0 < j1; t0 += TK) {
+                const int tn = (int) sycl::min((int64_t) TK, j1 - t0);
+                sycl::group_barrier(grp);
+                // the tile's keys and values: 16 pieces of 8 a row, every work-item a few, all at once (the new
+                // position's from local memory, as the cache holds them: half)
+                for (int idx = li; idx < tn * 16; idx += ATT_WG) {
+                    const int j = idx / 16, c = (idx % 16) * 8;
+                    sycl::vec<half, 8> kv, vv;
+                    if (t0 + j == p) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            kv[i] = (half) kn[c + i];
+                            vv[i] = (half) vn[c + i];
+                        }
+                    } else {
+                        kv = *reinterpret_cast<const sycl::vec<half, 8>*>(kb + (t0 + j) * HD + c);
+                        vv = *reinterpret_cast<const sycl::vec<half, 8>*>(vb + (t0 + j) * HD + c);
+                    }
+                    *reinterpret_cast<sycl::vec<half, 8>*>(&kt[j * HD + c]) = kv;
+                    *reinterpret_cast<sycl::vec<half, 8>*>(&vt[j * HD + c]) = vv;
+                }
+                sycl::group_barrier(grp);
+                // the scores: a sub-group a key
+                for (int j = si; j < tn; j += ATT_SG) {
+#pragma unroll
+                    for (int gq = 0; gq < G; ++gq) {
+                        float s = 0.0f;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) s += qs[gq * HD + l * 8 + i] * (float) kt[j * HD + l * 8 + i];
+                        s = sycl::reduce_over_group(sg, s, sycl::plus<float>());
+                        if (l == 0) sc[gq * TK + j] = s;
+                    }
+                }
+                sycl::group_barrier(grp);
+                // each head's tile max, its weights exp(s - max) and their total, a sub-group a head
+                if (si < G) {
+                    float mx = -INFINITY;
+                    for (int j = l; j < tn; j += SG) mx = sycl::fmax(mx, sc[si * TK + j]);
+                    const float mt = sycl::fmax(m[si], sycl::reduce_over_group(sg, mx, sycl::maximum<float>()));
+                    float tot = 0.0f;
+                    for (int j = l; j < tn; j += SG) {
+                        const float e = sycl::exp(sc[si * TK + j] - mt);
+                        sc[si * TK + j] = e;
+                        tot += e;
+                    }
+                    tot = sycl::reduce_over_group(sg, tot, sycl::plus<float>());
+                    if (l == 0) {
+                        tm[2 * si] = mt;
+                        tm[2 * si + 1] = tot;
+                    }
+                }
+                sycl::group_barrier(grp);
+                // the running softmax, a work-item a feature of every head (the tile's values 8 at a time)
+#pragma unroll
+                for (int gq = 0; gq < G; ++gq) {
+                    const float mt = tm[2 * gq];
+                    const float c = sycl::exp(m[gq] - mt);
+                    float at = 0.0f;
+                    for (int j0 = 0; j0 < tn; j0 += 8) {
+                        float vv[8], ww[8];
+#pragma unroll
+                        for (int u = 0; u < 8; ++u) {
+                            const bool in = j0 + u < tn;
+                            vv[u] = in ? (float) vt[(j0 + u) * HD + d] : 0.0f;
+                            ww[u] = in ? sc[gq * TK + j0 + u] : 0.0f;
+                        }
+#pragma unroll
+                        for (int u = 0; u < 8; ++u) at += ww[u] * vv[u];
+                    }
+                    L[gq] = L[gq] * c + tm[2 * gq + 1];
+                    acc[gq] = acc[gq] * c + at;
+                    m[gq] = mt;
+                }
+            }
+#pragma unroll
+            for (int gq = 0; gq < G; ++gq) {
+                const int64_t hq = hk * G + gq;
+                if (nu == 1) {
+                    out[hq * HD + d] = L[gq] > 0.0f ? acc[gq] / L[gq] : 0.0f;
+                } else {
+                    float* pp = part + (hq * ns + sp) * (HD + 2);
+                    pp[d] = acc[gq];
+                    if (d == 0) {
+                        pp[HD] = m[gq];
+                        pp[HD + 1] = L[gq];
+                    }
+                }
+            }
+            if (nu == 1) return;
+            // the last of the key head's parts to finish merges them
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+            sycl::group_barrier(grp);
+            if (li == 0) {
+                sycl::atomic_ref<int32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device, sycl::access::address_space::global_space> cnt(counters[hk]);
+                last[0] = cnt.fetch_add(1) == nu - 1;
+            }
+            sycl::group_barrier(grp);
+            if (!last[0]) return;
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+            // the parts' (max, total) into local memory at once, then a work-item a feature its sums (loads in flight)
+            for (int idx = li; idx < G * nu; idx += ATT_WG) {
+                const int64_t gq = idx / nu, k = idx % nu;
+                const float* pp = part + ((hk * G + gq) * ns + k) * (HD + 2);
+                mls[(gq * 64 + k) * 2] = pp[HD];
+                mls[(gq * 64 + k) * 2 + 1] = pp[HD + 1];
+            }
+            sycl::group_barrier(grp);
+#pragma unroll
+            for (int gq = 0; gq < G; ++gq) {
+                const int64_t hq = hk * G + gq;
+                const float* pp = part + hq * ns * (HD + 2);
+                float mx = -INFINITY;
+                for (int64_t k = 0; k < nu; ++k) mx = sycl::fmax(mx, mls[(gq * 64 + k) * 2]);
+                float Lt = 0.0f, A = 0.0f;
+                if (mx != -INFINITY) {
+                    for (int64_t k0 = 0; k0 < nu; k0 += 8) {
+                        float av[8];
+#pragma unroll
+                        for (int u = 0; u < 8; ++u) av[u] = k0 + u < nu ? pp[(k0 + u) * (HD + 2) + d] : 0.0f;
+#pragma unroll
+                        for (int u = 0; u < 8; ++u) {
+                            if (k0 + u < nu) {
+                                const float e = sycl::exp(mls[(gq * 64 + k0 + u) * 2] - mx);
+                                Lt += mls[(gq * 64 + k0 + u) * 2 + 1] * e;
+                                A += av[u] * e;
+                            }
+                        }
+                    }
+                }
+                out[hq * HD + d] = Lt > 0.0f ? A / Lt : 0.0f;
+            }
+            if (li == 0) counters[hk] = 0;
+        });
+    });
+    return 0;
+}
+
+
+extern "C" {
+
+int ns_q3s_supported(int64_t head, int64_t group, int64_t k) {
+    return head == HD && (group == 1 || group == 2 || group == 4 || group == 8) && k % 256 == 0;
+}
+
+int ns_q3s_gemv(ns_gpu* g, const float* x, int64_t M, int64_t K, const void* w, int wt, const float* scale, int64_t N, const float* bias,
+                float* out, int64_t ldo, int flags, const float* norm_w, float eps) {
+    NS_TRY
+    if (M <= 0 || N <= 0) return 0;
+    if (M > 8 || K % 256 != 0) return ns_fail("ns_q3s_gemv: at most 8 rows, K a multiple of 256");
+    if ((flags & NS_Q3S_NORM) && (K > KMAX_NORM || M > 2 || !norm_w)) return ns_fail("ns_q3s_gemv: a normed input of at most 2 rows of 2,048");
+    if ((flags & NS_Q3S_SWIGLU) && N % 2) return ns_fail("ns_q3s_gemv: SwiGLU takes an even number of rows");
+    const int V = wt == 0 ? 8 : 16;
+    constexpr int R = 2;
+    if (wt == 2 && K % Q8) return ns_fail("ns_q3s_gemv: grouped int8 wants K a multiple of 32");
+    const int64_t blocks = (flags & NS_Q3S_SWIGLU) ? (N / 2 + R / 2 - 1) / (R / 2) : (N + R - 1) / R;
+    const int ks = k_shares(blocks, K, V);
+#define Q3S_GEMV(WT, MM, GQ) gemv<WT, MM, R, GQ>(g->q, x, (int) M, K, (const WT*) w, scale, N, bias, out, ldo, flags, norm_w, eps, ks)
+    if (wt == 0) {
+        if (M == 1) Q3S_GEMV(half, 1, false);
+        else if (M == 2) Q3S_GEMV(half, 2, false);
+        else Q3S_GEMV(half, 8, false);
+    } else if (wt == 1) {
+        if (M == 1) Q3S_GEMV(int8_t, 1, false);
+        else if (M == 2) Q3S_GEMV(int8_t, 2, false);
+        else Q3S_GEMV(int8_t, 8, false);
+    } else if (wt == 2) {
+        if (M == 1) Q3S_GEMV(int8_t, 1, true);
+        else if (M == 2) Q3S_GEMV(int8_t, 2, true);
+        else Q3S_GEMV(int8_t, 8, true);
+    } else {
+        return ns_fail("ns_q3s_gemv: weights half (0), int8 a scale a row (1) or a scale every 32 (2)");
+    }
+#undef Q3S_GEMV
+    return 0;
+    NS_CATCH
+}
+
+int ns_q3s_quant_q8(ns_gpu* g, const float* w, int64_t N, int64_t K, int8_t* q, void* scale_h) {
+    NS_TRY
+    if (K % Q8) return ns_fail("ns_q3s_quant_q8: K a multiple of 32");
+    half* scale = (half*) scale_h;
+    const int64_t KG = K / Q8;
+    // a sub-group of 16 a block of 32 (2 a lane): its largest magnitude / 127 the scale, the weights rounded
+    if (N > 0) g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N * KG) * SG), sycl::range<1>(SG)),
+                                 [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        auto sg = it.get_sub_group();
+        const int l = (int) sg.get_local_linear_id();
+        const int64_t b = it.get_group(0);
+        const float* src = w + b * Q8;
+        const float v0 = src[l], v1 = src[l + SG];
+        const float mx = sycl::reduce_over_group(sg, sycl::fmax(sycl::fabs(v0), sycl::fabs(v1)), sycl::maximum<float>());
+        // the scale as half (Q8_0's), the weights rounded against that half scale
+        const float sc = sycl::fmax((float) (half) (mx / 127.0f), 6e-8f);
+        q[b * Q8 + l] = (int8_t) sycl::clamp(sycl::rint(v0 / sc), -127.0f, 127.0f);
+        q[b * Q8 + l + SG] = (int8_t) sycl::clamp(sycl::rint(v1 / sc), -127.0f, 127.0f);
+        if (l == 0) scale[b] = (half) sc;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q3s_dequant_q8(ns_gpu* g, const int8_t* q, const void* scale_h, int64_t N, int64_t K, void* out) {
+    NS_TRY
+    half* o = (half*) out;
+    const half* scale = (const half*) scale_h;
+    if (N > 0 && K > 0) g->q.parallel_for(sycl::range<1>((size_t) (N * K)), [=](sycl::id<1> i) { o[i] = (half) ((float) q[i] * (float) scale[i / Q8]); });
+    return 0;
+    NS_CATCH
+}
+
+int64_t ns_q3s_attn_scratch(int64_t Hq, int64_t splits) {
+    return splits > 1 ? Hq * splits * (HD + 2) : 0;
+}
+
+int ns_q3s_attn(ns_gpu* g, float* qkv, int64_t H, int64_t Hkv, const float* q_norm, const float* k_norm, float eps, const float* inv_freq,
+                const int32_t* pos, void* kc, void* vc, int64_t T, int64_t splits, float* out, float* part, int32_t* counters) {
+    NS_TRY
+    if (splits < 1 || (splits > 1 && (!part || !counters))) return ns_fail("ns_q3s_attn: splits and their scratch");
+    if (H % Hkv) return ns_fail("ns_q3s_attn: query heads a multiple of the key heads");
+    switch (H / Hkv) {
+    case 1: return attn_t<1>(g, qkv, H, Hkv, q_norm, k_norm, eps, inv_freq, pos, kc, vc, T, splits, out, part, counters);
+    case 2: return attn_t<2>(g, qkv, H, Hkv, q_norm, k_norm, eps, inv_freq, pos, kc, vc, T, splits, out, part, counters);
+    case 4: return attn_t<4>(g, qkv, H, Hkv, q_norm, k_norm, eps, inv_freq, pos, kc, vc, T, splits, out, part, counters);
+    default: return ns_fail("ns_q3s_attn: 1, 2 or 4 query heads a key head");
+    }
+    NS_CATCH
+}
+
+int ns_q3s_attn_small(ns_gpu* g, float* qkv, int64_t ws, int64_t S, int64_t p0, int64_t H, int64_t Hkv, const float* q_norm, const float* k_norm,
+                      float eps, const float* inv_freq, void* kc, void* vc, int64_t T, float* out) {
+    NS_TRY
+    if (S < 1 || S > 2 || p0 + S > T || H % Hkv || T > 32) return ns_fail("ns_q3s_attn_small: 1 or 2 rows within a cache of at most 32");
+    const int64_t G = H / Hkv;
+    if (G > 3) return ns_fail("ns_q3s_attn_small: at most 3 query heads a key head");
+    half* ko = (half*) kc;
+    half* vo = (half*) vc;
+    const float scale = 1.0f / sycl::sqrt((float) HD);
+    // a work-group a key head: the cache's older keys and values read into local memory by the whole work-group at
+    // once, while its S new ones are normed, rotated, stored and put beside them, and the S x G query heads; then
+    // every (row, head, key) score, a sub-group each; then a work-item a feature its rows' and heads' softmax and values
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> qs(sycl::range<1>((size_t) (S * G) * HD), h);
+        sycl::local_accessor<float, 1> kt(sycl::range<1>((size_t) T * HD), h);
+        sycl::local_accessor<float, 1> vt(sycl::range<1>((size_t) T * HD), h);
+        sycl::local_accessor<float, 1> sc(sycl::range<1>((size_t) (S * G * T)), h);
+        sycl::local_accessor<float, 1> tl(sycl::range<1>((size_t) (S * G)), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) Hkv * ATT_WG), sycl::range<1>(ATT_WG)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            auto sg = it.get_sub_group();
+            auto grp = it.get_group();
+            const int l = (int) sg.get_local_linear_id(), si = (int) sg.get_group_linear_id(), li = (int) it.get_local_id(0);
+            const int64_t hk = it.get_group(0);
+            const half* kb = ko + hk * T * HD;
+            const half* vb = vo + hk * T * HD;
+            // the older keys and values (as the cache holds them: half)
+            for (int idx = li; idx < (int) p0 * 16; idx += ATT_WG) {
+                const int j = idx / 16, c = (idx % 16) * 8;
+                const sycl::vec<half, 8> kv = *reinterpret_cast<const sycl::vec<half, 8>*>(kb + j * HD + c);
+                const sycl::vec<half, 8> vv = *reinterpret_cast<const sycl::vec<half, 8>*>(vb + j * HD + c);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    kt[j * HD + c + i] = (float) kv[i];
+                    vt[j * HD + c + i] = (float) vv[i];
+                }
+            }
+            if (si < S) {
+                const int64_t pp = p0 + si;
+                float* kd = &kt[pp * HD];
+                head_to_local(qkv + si * ws + (H + hk) * HD, k_norm, eps, inv_freq, (float) pp, 1.0f, kd, l, sg);
+                const float* vr = qkv + si * ws + (H + Hkv + hk) * HD;
+                half* kg = ko + (hk * T + pp) * HD;
+                half* vg = vo + (hk * T + pp) * HD;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int i = l + 16 * j;
+                    const half kh = (half) kd[i], vh = (half) vr[i];
+                    kg[i] = kh;
+                    vg[i] = vh;
+                    kd[i] = (float) kh;
+                    vt[pp * HD + i] = (float) vh;
+                }
+            } else if (si < S + S * G) {
+                const int q = si - (int) S, s = q / (int) G, gq = q % (int) G;
+                head_to_local(qkv + s * ws + (hk * G + gq) * HD, q_norm, eps, inv_freq, (float) (p0 + s), scale, &qs[q * HD], l, sg);
+            }
+            sycl::group_barrier(grp);
+            // every (row, head, key) score: keys 0..p0+row
+            const int64_t nk = p0 + S;
+            for (int64_t t = si; t < S * G * nk; t += ATT_SG) {
+                const int64_t q = t / nk, j = t % nk, s = q / G;
+                if (j > p0 + s) continue;
+                float v = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) v += qs[q * HD + l * 8 + i] * kt[j * HD + l * 8 + i];
+                v = sycl::reduce_over_group(sg, v, sycl::plus<float>());
+                if (l == 0) sc[q * T + j] = v;
+            }
+            sycl::group_barrier(grp);
+            // each (row, head)'s weights exp(s - max) and their total, a sub-group each
+            if (si < S * G) {
+                const int64_t n = p0 + si / G + 1;
+                float mx = -INFINITY;
+                for (int64_t j = l; j < n; j += SG) mx = sycl::fmax(mx, sc[si * T + j]);
+                mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+                float tot = 0.0f;
+                for (int64_t j = l; j < n; j += SG) {
+                    const float e = sycl::exp(sc[si * T + j] - mx);
+                    sc[si * T + j] = e;
+                    tot += e;
+                }
+                tot = sycl::reduce_over_group(sg, tot, sycl::plus<float>());
+                if (l == 0) tl[si] = tot;
+            }
+            sycl::group_barrier(grp);
+            // a work-item a feature: each (row, head)'s values weighed (8 keys at a time)
+            const int d = li;
+            for (int64_t q = 0; q < S * G; ++q) {
+                const int64_t s = q / G, n = p0 + s + 1;
+                float a = 0.0f;
+                for (int64_t j0 = 0; j0 < n; j0 += 8) {
+                    float vv[8], ww[8];
+#pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        const bool in = j0 + u < n;
+                        vv[u] = in ? vt[(j0 + u) * HD + d] : 0.0f;
+                        ww[u] = in ? sc[q * T + j0 + u] : 0.0f;
+                    }
+#pragma unroll
+                    for (int u = 0; u < 8; ++u) a += ww[u] * vv[u];
+                }
+                out[s * H * HD + (hk * G + q % G) * HD + d] = a / tl[q];
+            }
+        });
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q3s_draw(ns_gpu* g, const float* logits, int64_t n, int gi, const ns_q3s_draws* d, ns_q3s_state* st, uint8_t* seen,
+                const int32_t* force, const float* ptab, int64_t base, int64_t width, float* row) {
+    NS_TRY
+    if (n < 1 || n > (int64_t) DRAW_WG * DRAW_PER) return ns_fail("ns_q3s_draw: 1 to 4,096 logits");
+    if (gi < 0 || gi > 15) return ns_fail("ns_q3s_draw: codebook 0 to 15");
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> hist(sycl::range<1>(DRAW_WG / SG * 256), h);   // a histogram a sub-group
+        sycl::local_accessor<uint32_t, 1> sh(sycl::range<1>(4), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(DRAW_WG), sycl::range<1>(DRAW_WG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            auto grp = it.get_group();
+            const int li = (int) it.get_local_id(0), sgi = (int) it.get_sub_group().get_group_linear_id();
+            const int who = gi == 0 ? 0 : 1;
+            const int frame = st->frame;
+            // the logits as the processors leave them (penalty, suppressed ids, eos held back: the talker's); the best
+            float v[DRAW_PER];
+            int best = INT32_MAX;
+            float bv = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < DRAW_PER; ++j) {
+                const int i = li * DRAW_PER + j;
+                float x = -INFINITY;
+                if (i < n) {
+                    x = logits[i];
+                    if (gi == 0) {
+                        if (d->penalty != 1.0f && seen[i]) x = x > 0.0f ? x / d->penalty : x * d->penalty;
+                        if (i >= d->suppress_from && i != d->eos) x = -INFINITY;
+                        if (i == d->eos && frame < d->min_frames) x = -INFINITY;
+                    }
+                }
+                v[j] = x;
+                if (x > bv) {
+                    bv = x;
+                    best = i;
+                }
+            }
+            // the best: the largest, the first of equals
+            const float gbv = sycl::reduce_over_group(grp, bv, sycl::maximum<float>());
+            int code = sycl::reduce_over_group(grp, bv == gbv ? best : INT32_MAX, sycl::minimum<int>());
+            if (code == INT32_MAX) code = 0;
+            if (d->sample[who] && gbv != -INFINITY) {
+                const float t = sycl::fmax(d->temperature[who], 1e-5f);
+                int nfin = 0;
+#pragma unroll
+                for (int j = 0; j < DRAW_PER; ++j) {
+                    v[j] = v[j] / t;
+                    nfin += sycl::isfinite(v[j]) ? 1 : 0;
+                }
+                const int k = d->top_k[who];
+                const int fin = sycl::reduce_over_group(grp, nfin, sycl::plus<int>());
+                float thr = -INFINITY;
+                if (k > 0 && fin > k) {
+                    // the k-th largest finite value: a radix select over the keys, 8 bits a pass from the top; a
+                    // work-item a bin, the bins counted from the top by a scan
+                    uint32_t prefix = 0, mask = 0;
+                    int want = k;
+                    for (int pass = 3; pass >= 0; --pass) {
+                        const int sh_ = pass * 8;
+                        for (int j = li; j < DRAW_WG / SG * 256; j += DRAW_WG) hist[j] = 0;
+                        sycl::group_barrier(grp);
+#pragma unroll
+                        for (int j = 0; j < DRAW_PER; ++j) {
+                            if (sycl::isfinite(v[j])) {
+                                const uint32_t kk = key(v[j]);
+                                if ((kk & mask) == prefix) {
+                                    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                                     sycl::access::address_space::local_space>(hist[sgi * 256 + ((kk >> sh_) & 255)]).fetch_add(1);
+                                }
+                            }
+                        }
+                        sycl::group_barrier(grp);
+                        // work-item li the bin 255 - li: the counts above it, its own
+                        const int b = 255 - li;
+                        int c = 0;
+                        for (int q = 0; q < DRAW_WG / SG; ++q) c += (int) hist[q * 256 + b];
+                        const int above = sycl::exclusive_scan_over_group(grp, c, sycl::plus<int>());
+                        if (above < want && above + c >= want) {
+                            sh[0] = (uint32_t) b;
+                            sh[1] = (uint32_t) (want - above);
+                        }
+                        sycl::group_barrier(grp);
+                        prefix |= sh[0] << sh_;
+                        mask |= 255u << sh_;
+                        want = (int) sh[1];
+                        sycl::group_barrier(grp);
+                    }
+                    // the key back to its float
+                    const uint32_t b = (prefix & 0x80000000u) ? (prefix & 0x7fffffffu) : ~prefix;
+                    thr = sycl::bit_cast<float>(b);
+                }
+                const float mx = gbv / t;
+                float w[DRAW_PER], ls = 0.0f;
+#pragma unroll
+                for (int j = 0; j < DRAW_PER; ++j) {
+                    w[j] = (sycl::isfinite(v[j]) && v[j] >= thr) ? sycl::exp(v[j] - mx) : 0.0f;
+                    ls += w[j];
+                }
+                const float total = sycl::reduce_over_group(grp, ls, sycl::plus<float>());
+                const float before = sycl::exclusive_scan_over_group(grp, ls, sycl::plus<float>());
+                // the generator's draw (every work-item steps a copy; work-item 0 keeps it)
+                uint32_t r[2] = {st->rng[0], st->rng[1]};
+                const float u = uniform(r) * total;
+                // the work-item whose share holds u walks its own (the last weighted code if rounding runs past the end)
+                int pick = INT32_MAX;
+                if (ls > 0.0f && u >= before && u < before + ls) {
+                    float c = before;
+#pragma unroll
+                    for (int j = 0; j < DRAW_PER; ++j) {
+                        if (pick == INT32_MAX && w[j] > 0.0f) {
+                            c += w[j];
+                            if (u < c) pick = li * DRAW_PER + j;
+                        }
+                    }
+                    if (pick == INT32_MAX) {
+#pragma unroll
+                        for (int j = DRAW_PER - 1; j >= 0; --j)
+                            if (pick == INT32_MAX && w[j] > 0.0f) pick = li * DRAW_PER + j;
+                    }
+                }
+                int lastw = -1;
+#pragma unroll
+                for (int j = 0; j < DRAW_PER; ++j)
+                    if (w[j] > 0.0f) lastw = li * DRAW_PER + j;
+                const int got = sycl::reduce_over_group(grp, pick, sycl::minimum<int>());
+                const int lw = sycl::reduce_over_group(grp, lastw, sycl::maximum<int>());
+                code = got != INT32_MAX ? got : (lw >= 0 ? lw : code);
+                if (li == 0) {
+                    st->rng[0] = r[0];
+                    st->rng[1] = r[1];
+                }
+            }
+            if (d->forced) {
+                const int f = force[frame * 16 + gi];
+                if (li == 0 && code != f && !(gi == 0 && f == d->eos)) st->misses[who] += 1;
+                code = f;
+            }
+            if (li == 0) {
+                st->codes[gi] = code;
+                if (gi == 0 && code >= 0 && code < n) seen[code] = 1;
+            }
+            if (row) {
+                const float* src = ptab + (base + (int64_t) code) * width;
+                for (int64_t j = li * 4; j < width; j += DRAW_WG * 4)
+                    *reinterpret_cast<sycl::vec<float, 4>*>(row + j) = *reinterpret_cast<const sycl::vec<float, 4>*>(src + j);
+            }
+        });
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q3s_frame_in(ns_gpu* g, const void* table, int64_t D, int64_t v0, int64_t vg, const ns_q3s_state* st, const ns_q3s_draws* d,
+                    const float* feed, float* out) {
+    NS_TRY
+    const half* t = (const half*) table;
+    g->q.parallel_for(sycl::range<1>((size_t) D), [=](sycl::id<1> id) {
+        const int64_t j = id[0];
+        // the codes' rows summed as the shared path does (8 at a time, then the two sums), then the text row
+        float s0 = 0.0f, s1 = 0.0f;
+        for (int c = 0; c < 16; ++c) {
+            const int64_t r = c == 0 ? st->codes[0] : v0 + (int64_t) (c - 1) * vg + st->codes[c];
+            const float e = (float) t[r * D + j];
+            if (c < 8) s0 += e;
+            else s1 += e;
+        }
+        const int64_t f = st->frame < d->n_text ? st->frame : d->n_text;
+        out[j] = (s0 + s1) + feed[f * D + j];
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q3s_advance(ns_gpu* g, ns_q3s_state* st) {
+    NS_TRY
+    g->q.single_task([=] {
+        st->frame += 1;
+        st->pos += 1;
+    });
+    return 0;
+    NS_CATCH
+}
+
+using Graph = X::command_graph<X::graph_state::modifiable>;
+using Exec = X::command_graph<X::graph_state::executable>;
+
+int ns_q3s_graph_begin(ns_gpu* g, void** graph) {
+    NS_TRY
+    auto* gr = new Graph(g->q.get_context(), g->q.get_device());
+    gr->begin_recording(g->q);
+    *graph = gr;
+    return 0;
+    NS_CATCH
+}
+
+int ns_q3s_graph_end(ns_gpu* g, void* graph, void** exec) {
+    NS_TRY
+    auto* gr = (Graph*) graph;
+    gr->end_recording(g->q);
+    *exec = new Exec(gr->finalize());
+    delete gr;
+    return 0;
+    NS_CATCH
+}
+
+int ns_q3s_graph_launch(ns_gpu* g, void* exec) {
+    NS_TRY
+    g->q.ext_oneapi_graph(*(Exec*) exec);
+    return 0;
+    NS_CATCH
+}
+
+void ns_q3s_graph_free(void* exec) {
+    delete (Exec*) exec;
+}
+
+int ns_q3s_read_async(ns_gpu* g, void* host, const void* src, size_t bytes) {
+    NS_TRY
+    g->q.memcpy(host, src, bytes);
+    return 0;
+    NS_CATCH
+}
+
+}  // extern "C"
