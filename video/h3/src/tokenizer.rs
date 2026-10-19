@@ -7,16 +7,15 @@
 //!    runs of punctuation, newlines, spaces);
 //! 4. each piece's UTF-8 bytes, written as GPT-2's printable stand-in characters, merged pair by pair in the order
 //!    of `merges.txt` until no listed pair is left; the pieces' ids from `vocab.json`.
+//!
+//! Steps 2-4 are the foundation's Qwen2 tokenizer (`nextsycl_tok::Tokenizer::from_vocab_merges`), with the tokens
+//! H3 adds; the normalization is here (that crate has no Unicode tables).
 
-use std::collections::HashMap;
 use std::path::Path;
 
-use fancy_regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::{Ctx, Error, Result};
-
-const PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+use crate::{Error, Result};
 
 /// The tokens the MiniMax H3 tokenizer adds to Qwen's, with their fixed ids.
 const MINIMAX_EXTRA: [(&str, u32); 7] = [
@@ -29,95 +28,22 @@ const MINIMAX_EXTRA: [(&str, u32); 7] = [
     ("<|caption_end|>", 151675),
 ];
 
-pub struct Tokenizer {
-    vocab: HashMap<String, u32>,
-    ranks: HashMap<(String, String), usize>,
-    /// literal text -> id, longest first
-    special: Vec<(String, u32)>,
-    pattern: Regex,
-    byte_char: [char; 256],
-}
-
-/// GPT-2's map from bytes to printable characters: the printable Latin-1 bytes stand for themselves, the rest are
-/// moved to U+0100 and up.
-fn bytes_to_unicode() -> [char; 256] {
-    let mut out = ['\0'; 256];
-    let printable = |b: u32| (0x21..=0x7e).contains(&b) || (0xa1..=0xac).contains(&b) || (0xae..=0xff).contains(&b);
-    let mut n = 0;
-    for b in 0..256u32 {
-        out[b as usize] = if printable(b) {
-            char::from_u32(b).unwrap()
-        } else {
-            n += 1;
-            char::from_u32(255 + n).unwrap()
-        };
-    }
-    out
-}
+pub struct Tokenizer(nextsycl_tok::Tokenizer);
 
 impl Tokenizer {
     /// From a directory with `vocab.json`, `merges.txt` and `tokenizer_config.json` (the repository's `tokenizer/`).
     pub fn load(dir: &Path) -> Result<Tokenizer> {
-        let vocab: HashMap<String, u32> =
-            serde_json::from_slice(&std::fs::read(dir.join("vocab.json")).ctx("reading vocab.json")?).ctx("parsing vocab.json")?;
-        let merges = std::fs::read_to_string(dir.join("merges.txt")).ctx("reading merges.txt")?;
-        let mut ranks = HashMap::new();
-        for (i, line) in merges.lines().filter(|l| !l.starts_with("#version") && !l.is_empty()).enumerate() {
-            let (a, b) = line.split_once(' ').ok_or_else(|| Error(format!("merges.txt line {}: {line:?}", i + 1)))?;
-            ranks.insert((a.to_string(), b.to_string()), i);
+        let t = nextsycl_tok::Tokenizer::from_vocab_merges(dir).map_err(Error)?;
+        if t.id("<|endoftext|>").is_none() {
+            return Err(Error(format!("{}: tokenizer_config.json lists no added tokens (<|endoftext|>)", dir.display())));
         }
-        let cfg: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.join("tokenizer_config.json")).ctx("reading tokenizer_config.json")?).ctx("parsing tokenizer_config.json")?;
-        let mut special: Vec<(String, u32)> = cfg["added_tokens_decoder"]
-            .as_object()
-            .ok_or("tokenizer_config.json has no added_tokens_decoder")?
-            .iter()
-            .filter_map(|(id, t)| Some((t["content"].as_str()?.to_string(), id.parse().ok()?)))
-            .collect();
-        special.extend(MINIMAX_EXTRA.iter().map(|(s, id)| (s.to_string(), *id)));
-        special.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
-        Ok(Tokenizer { vocab, ranks, special, pattern: Regex::new(PATTERN).map_err(|e| Error(e.to_string()))?, byte_char: bytes_to_unicode() })
+        Ok(Tokenizer(t.with_special(&MINIMAX_EXTRA)))
     }
 
     /// The token ids of `text`.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let text: String = text.nfc().collect();
-        let mut out = Vec::new();
-        let mut rest = text.as_str();
-        while !rest.is_empty() {
-            // the earliest special token (the longest at that position)
-            let next = self.special.iter().filter_map(|(s, id)| rest.find(s.as_str()).map(|p| (p, s.len(), *id))).min_by_key(|(p, l, _)| (*p, std::cmp::Reverse(*l)));
-            match next {
-                Some((p, len, id)) => {
-                    self.encode_plain(&rest[..p], &mut out)?;
-                    out.push(id);
-                    rest = &rest[p + len..];
-                }
-                None => {
-                    self.encode_plain(rest, &mut out)?;
-                    break;
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn encode_plain(&self, text: &str, out: &mut Vec<u32>) -> Result<()> {
-        for m in self.pattern.find_iter(text) {
-            let piece = m.map_err(|e| Error(e.to_string()))?.as_str();
-            let mut parts: Vec<String> = piece.bytes().map(|b| self.byte_char[b as usize].to_string()).collect();
-            // merge the best-ranked neighbouring pair until none is listed
-            loop {
-                let best = parts.windows(2).enumerate().filter_map(|(i, w)| self.ranks.get(&(w[0].clone(), w[1].clone())).map(|r| (*r, i))).min();
-                let Some((_, i)) = best else { break };
-                let merged = format!("{}{}", parts[i], parts[i + 1]);
-                parts.splice(i..i + 2, [merged]);
-            }
-            for p in parts {
-                out.push(*self.vocab.get(&p).ok_or_else(|| Error(format!("the piece {p:?} is not in the vocabulary")))?);
-            }
-        }
-        Ok(())
+        Ok(self.0.encode(&text))
     }
 }
 

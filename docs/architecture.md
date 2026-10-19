@@ -146,7 +146,7 @@ Every llm engine is held to the same checks: `spec-check` (verify passes equal o
 (a batch's rows equal each conversation alone), `check` against a reference dump, `bench`, `bench --needle`.
 
 **image** (`nextsycl-image`) - `generate(request, progress) -> pictures`: the prompt, size, steps, guidance, seed,
-count, sampler / schedule / shift, per-request LoRAs, an optional `Edit` (the picture, reference pictures, a mask,
+count, sampler / schedule / shift, per-request LoRAs (`side_loras`: run beside the loaded weights for that request - Qwen-Image 2.1 - else the server reloads with them merged), an optional `Edit` (the picture, reference pictures, a mask,
 a strength), RGBA; `defaults()` for what a request leaves out; `Step` progress. A model is several files by role
 (`ModelFiles`: transformer, text encoder, VAE...); `ImageKind::roles` says which, `archs` which registry entries.
 
@@ -512,7 +512,7 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
 settings, so an engine's settings are given once, at `models add --set`, and `nextsycl llm start <id>` applies them.
 The README's Models section has the commands. Where an entry's files live is the registry's business too:
 `nextsycl_serve::drives` (the front door's Drives panel, `system.move`, `nextsycl models move`) copies a model's files
-to another drive, checks them, repoints the entry and removes the old files that no other entry names.
+to another drive (with the sidecars its model card lists - files its engine finds beside the model by convention), checks them, repoints the entry and removes the old files that no other entry names. The front door loads nothing while a GPU run holds `NS_GPU_LOCK` (`cards_taken`) and plans placement with the memory every process holds (the root sampler's gpustat file).
 
 ## What stays shared on purpose
 

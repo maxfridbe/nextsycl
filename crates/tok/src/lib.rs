@@ -302,6 +302,23 @@ impl Tokenizer {
         self.ids.get(token).copied()
     }
 
+    /// More special tokens, matched in the text as they are (a model's own markers its tokenizer files do not list -
+    /// MiniMax H3's `<|caption_start|>` ...)
+    pub fn with_special(mut self, extra: &[(&str, u32)]) -> Tokenizer {
+        for (s, id) in extra {
+            self.ids.insert(s.to_string(), *id);
+            if self.tokens.len() <= *id as usize {
+                self.tokens.resize(*id as usize + 1, String::new());
+            }
+            self.tokens[*id as usize] = s.to_string();
+            if !self.special.iter().any(|x| x.0 == *s) {
+                self.special.push((s.to_string(), *id));
+            }
+        }
+        self.special.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
+        self
+    }
+
     /// Text to ids; special tokens in the text become their ids (as llama.cpp's parse_special).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();

@@ -52,44 +52,19 @@ impl Checkpoint {
         if &len8[..4] == b"GGUF" {
             return Checkpoint::open_gguf(path, file_bytes);
         }
-        let hlen = u64::from_le_bytes(len8);
-        if hlen == 0 || hlen > 256 << 20 || 8 + hlen > file_bytes {
-            return Err(Error(format!("{}: not a safetensors file (header length {hlen})", path.display())));
-        }
-        let mut hdr = vec![0u8; hlen as usize];
-        f.read_exact_at(&mut hdr, 8).ctx("reading the header")?;
-        let json: serde_json::Value = serde_json::from_slice(&hdr).ctx("parsing the header")?;
-        let obj = json.as_object().ok_or("the header is not a JSON object")?;
-        let base = 8 + hlen;
+        // the header by the foundation's reader (nextsycl_gguf::safetensors), each entry checked against its shape
+        let st = nextsycl_gguf::safetensors::SafeTensors::open(path).map_err(|e| Error(e.0))?;
         let mut entries = BTreeMap::new();
-        let mut metadata = BTreeMap::new();
-        for (name, v) in obj {
-            if name == "__metadata__" {
-                if let Some(m) = v.as_object() {
-                    for (k, val) in m {
-                        metadata.insert(k.clone(), val.as_str().unwrap_or_default().to_string());
-                    }
-                }
-                continue;
+        for t in st.tensors {
+            let dtype = DType::parse(&t.dtype)?;
+            let shape: Vec<usize> = t.shape.iter().map(|d| *d as usize).collect();
+            let bytes = t.bytes as usize;
+            if bytes != shape.iter().product::<usize>() * dtype.size() || t.offset + t.bytes > file_bytes {
+                return Err(Error(format!("header entry {}: byte range does not match its shape", t.name)));
             }
-            let bad = || Error(format!("header entry {name} is malformed"));
-            let dtype = DType::parse(v.get("dtype").and_then(|d| d.as_str()).ok_or_else(bad)?)?;
-            let shape: Vec<usize> = v
-                .get("shape")
-                .and_then(|s| s.as_array())
-                .ok_or_else(bad)?
-                .iter()
-                .map(|d| d.as_u64().map(|d| d as usize).ok_or_else(bad))
-                .collect::<Result<_>>()?;
-            let offs = v.get("data_offsets").and_then(|o| o.as_array()).ok_or_else(bad)?;
-            let (a, b) = (offs.first().and_then(|x| x.as_u64()).ok_or_else(bad)?, offs.get(1).and_then(|x| x.as_u64()).ok_or_else(bad)?);
-            let bytes = (b - a) as usize;
-            if bytes != shape.iter().product::<usize>() * dtype.size() || base + b > file_bytes {
-                return Err(Error(format!("header entry {name}: byte range does not match its shape")));
-            }
-            entries.insert(name.clone(), Entry { name: name.clone(), dtype, shape, offset: base + a, bytes, kquant: None });
+            entries.insert(t.name.clone(), Entry { name: t.name, dtype, shape, offset: t.offset, bytes, kquant: None });
         }
-        Ok(Checkpoint { path: path.to_path_buf(), entries, metadata, file_bytes })
+        Ok(Checkpoint { path: path.to_path_buf(), entries, metadata: st.metadata, file_bytes })
     }
 
     fn open_gguf(path: &Path, file_bytes: u64) -> Result<Checkpoint> {
@@ -184,4 +159,25 @@ pub fn write_f32(path: &Path, tensors: &BTreeMap<String, (Vec<usize>, Vec<f32>)>
         out.extend(v.iter().flat_map(|f| f.to_le_bytes()));
     }
     std::fs::write(path, out).ctx(format!("writing {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (Checked when it moved onto the foundation's reader: every H3 safetensors file - the int8 denoisers, the VAEs, the
+    /// vision tower, the ControlNet, the upscaler, an embedding - read to the same header as H3's own reader did,
+    /// 2026-10-19.)
+    #[test]
+    fn the_header_with_absolute_offsets_and_its_metadata() {
+        let p = std::env::temp_dir().join(format!("h3-st-{}.safetensors", std::process::id()));
+        let t: BTreeMap<String, (Vec<usize>, Vec<f32>)> = [("x.weight".to_string(), (vec![2, 3], vec![1.0; 6])), ("y".to_string(), (vec![5], vec![2.0; 5]))].into();
+        write_f32(&p, &t, &[("seed".to_string(), "7".to_string())].into()).unwrap();
+        let c = Checkpoint::open(&p).unwrap();
+        let y = c.get("y").unwrap();
+        assert_eq!((c.get("x.weight").unwrap().shape.clone(), y.dtype, y.bytes, c.metadata["seed"].as_str()), (vec![2, 3], DType::F32, 20, "7"));
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(&bytes[y.offset as usize..y.offset as usize + 4], &2f32.to_le_bytes());
+        let _ = std::fs::remove_file(p);
+    }
 }
