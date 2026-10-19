@@ -9,12 +9,12 @@ use nextsycl_models::{config::Config, registry as models};
 use serde_json::Value;
 
 const USAGE: &str = "nextsycl audio gen \"<description>\" [--lyrics TEXT | --lyrics-file FILE] [--model ID | --dir DIR] [--seconds N] [--steps N]
-                   [--cfg X] [--seed N] [--set NAME=VALUE]... [--opt-NAME VALUE]... [--out FILE|DIR] [--gpu N]
+                   [--cfg X] [--seed N] [--set NAME=VALUE]... [--opt-NAME VALUE]... [--out FILE|DIR] [--gpu N | --gpus A,B]
 nextsycl audio gen \"<text to say>\" --model qwen3-tts-... [--voice NAME] [--language L] [--instructions TEXT]
                    [--ref-audio FILE.wav [--ref-text TEXT]] [--cfg X] [--seconds N] [--seed N] [--out FILE|DIR]   (speech)
 nextsycl audio gen \"Speaker 1: ...\\nSpeaker 2: ...\" --model vibevoice-1.5b [--ref-audio S1.wav --ref-audio S2.wav ... |
                    --voices NAME,NAME ...]   (a multi-speaker script: a recording or saved voice a speaker, in order)
-nextsycl audio serve [MODEL] [--port 8087] [--host 127.0.0.1] [--gpu N] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
+nextsycl audio serve [MODEL] [--port 8087] [--host 127.0.0.1] [--gpu N | --gpus A,B] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl audio start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
 nextsycl audio voice list                                   the saved voices (spoken by name: --voice NAME, \"voice\": NAME)
 nextsycl audio voice add NAME --sample FILE [--text \"what it says\"] [--description D] [--language L] [--replace]
@@ -103,6 +103,18 @@ fn gpu(args: &[String]) -> Result<Arc<nextsycl_core::Gpu>, String> {
     nextsycl_core::Gpu::open(i).map_err(|e| e.0)
 }
 
+/// The GPUs an engine loads on: `--gpus A,B` (an engine that splits itself across cards: MiniMax Music's language
+/// model on A, its flow and decoder on B), else `--gpu N`
+fn gpus(args: &[String]) -> Result<Vec<Arc<nextsycl_core::Gpu>>, String> {
+    match opt(args, "--gpus") {
+        Some(l) => l.split(',').map(|x| {
+            let i: usize = x.trim().parse().map_err(|_| format!("--gpus {l}: GPU indices, comma-separated"))?;
+            nextsycl_core::Gpu::open(i).map_err(|e| e.0)
+        }).collect(),
+        None => Ok(vec![gpu(args)?]),
+    }
+}
+
 fn num<T: std::str::FromStr>(args: &[String], k: &str) -> Result<Option<T>, String> {
     opt(args, k).map(|s| s.parse().map_err(|_| format!("{k}: {s}?"))).transpose()
 }
@@ -118,9 +130,9 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
     let (m, files) = model(cfg, args)?;
     let ks = engines();
     let k = nextsycl_audio::kind_for(&ks, m["arch"].as_str().unwrap_or(""))?;
-    let g = gpu(args)?;
+    let g = gpus(args)?;
     let mut log = |s: String| eprintln!("{s}");
-    let e = (k.load)(&files, &[g], &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+    let e = (k.load)(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
     let seed: u64 = num(args, "--seed")?.unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_nanos() as u64 % 100_000).unwrap_or(0)
     });
@@ -289,7 +301,7 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         nextsycl_audio_voxtraltts::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else if m["arch"] == nextsycl_audio_minimaxmusic3::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("ar,dit,voc").split(',').collect();
-        let e = nextsycl_audio_minimaxmusic3::MiniMaxMusic3::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        let e = nextsycl_audio_minimaxmusic3::MiniMaxMusic3::load_on(&files, &gpus(args)?, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_minimaxmusic3::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
         return Err(format!("check knows {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
@@ -390,9 +402,10 @@ fn serve_here(m: &Value, files: ModelFiles, args: &[String], out: PathBuf, cfg: 
     nextsycl_core::use_kind("audio");
     let ks = engines();
     let k = nextsycl_audio::kind_for(&ks, m["arch"].as_str().unwrap_or(""))?;
-    let g = gpu(args)?;
+    let gs = gpus(args)?;
+    let g = gs[0].clone();
     let mut log = |s: String| eprintln!("{s}");
-    let e = (k.load)(&files, std::slice::from_ref(&g), &options(m, args)?, &mut log).map_err(|e| e.0)?;
+    let e = (k.load)(&files, &gs, &options(m, args)?, &mut log).map_err(|e| e.0)?;
     let wfe = args.iter().any(|a| a == "--wfe").then(|| cfg.dist.join("wfe"));
     let cors: Vec<String> = opt(args, "--cors").map(str::to_string).or(cfg.get("NS_CORS")).map(|c| c.split(',').map(|x| x.trim().to_string()).collect())
         .unwrap_or_default();
