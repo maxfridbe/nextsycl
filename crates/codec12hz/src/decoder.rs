@@ -26,6 +26,8 @@ const CHUNK: usize = 300;
 const CONTEXT: usize = 25;
 /// `decode_bucketed`'s chunk lengths (the longest a chunk and its context)
 const BUCKETS: [usize; 5] = [50, 100, 175, 250, CHUNK + CONTEXT];
+/// a clip decoded as it comes: its second hand-out after this many frames (2 s of sound)
+const EARLY: usize = 25;
 const WINDOW: usize = 72;
 const HEADS: usize = 16;
 const HEAD: usize = 64;
@@ -290,10 +292,20 @@ impl Codec {
     /// oneDNN primitives - made once a shape, ~20 ms each, ~35 a shape - are made for those lengths only, once a
     /// process, not for every clip's own length (0.7 s a request otherwise)
     pub fn decode_bucketed(&self, nsd: &Nsd, frames: &[Vec<i32>]) -> Result<Vec<f32>> {
+        self.decode_from(nsd, frames, 0)
+    }
+
+    /// The samples of `frames[from..]` exactly as `decode_bucketed(frames)` makes them: each chunk from its own start
+    /// (and context), so a clip decoded as its frames come - `from` the frames already handed out - joins up to the
+    /// whole clip's samples. The decoder is causal: a sample depends on its frame and the ones before it in its chunk
+    pub fn decode_from(&self, nsd: &Nsd, frames: &[Vec<i32>], from: usize) -> Result<Vec<f32>> {
         let ops = &self.ops;
         let hop = self.hop();
-        let mut out = Vec::with_capacity(frames.len() * hop);
-        let mut s = 0;
+        let mut out = Vec::with_capacity(frames.len().saturating_sub(from) * hop);
+        if from >= frames.len() {
+            return Ok(out);
+        }
+        let mut s = from / CHUNK * CHUNK;
         while s < frames.len() {
             let e = (s + CHUNK).min(frames.len());
             let ctx = if s > CONTEXT { CONTEXT } else { s };
@@ -302,10 +314,29 @@ impl Codec {
             let mut part: Vec<Vec<i32>> = frames[s - ctx..e].to_vec();
             part.resize(b, frames[e - 1].clone());
             let wav = self.run(ops, nsd, &part)?;
-            out.extend_from_slice(&wav[ctx * hop..n * hop]);
+            let keep = ctx + from.max(s) - s;
+            out.extend_from_slice(&wav[keep * hop..n * hop]);
             s = e;
         }
         Ok(out)
+    }
+
+    /// Whether a clip decoded as it comes hands out samples now: `made` frames so far, `sent` handed out. Early on
+    /// (after `first` frames, then after `EARLY`), then where the chunk being made (with its context) reaches one of
+    /// the decoder's lengths (`BUCKETS`) or its end, so a hand-out decodes no padding; the clip's end is the caller's
+    pub fn stream_due(made: usize, sent: usize, first: usize) -> bool {
+        if made <= sent {
+            return false;
+        }
+        if sent == 0 {
+            return made >= first;
+        }
+        if sent < EARLY {
+            return made >= EARLY;
+        }
+        let s = (made - 1) / CHUNK * CHUNK;
+        let ctx = if s > CONTEXT { CONTEXT } else { s };
+        made % CHUNK == 0 || BUCKETS.contains(&(made - s + ctx))
     }
 
     /// One chunk through the whole decoder

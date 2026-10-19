@@ -9,7 +9,11 @@
 //!                                 voice's description), ref_audio (base64 WAV / data URL: a voice to clone),
 //!                                 ref_text, continue_from (a speech file made here: its last sentences are the
 //!                                 reference, after the voice's - the voice carries on), seconds (the most), seed,
-//!                                 response_format, options}
+//!                                 response_format (wav | pcm | url), options}; stream: true / stream_format: audio
+//!                                 - the sound sent as it is made (wav with unknown lengths, or pcm: 16-bit, the
+//!                                 rate in X-Sample-Rate), stream_format: sse - speech.audio.delta events (base64
+//!                                 16-bit PCM), then speech.audio.done with the file's link (an engine that does not
+//!                                 stream sends its sound whole at the end)
 //!   GET  /v1/audio/files/<f>      a song made here (saved in the output directory; byte ranges for seeking)
 //!   POST /api/cancel              stops the request running (between frames or steps)
 //!   GET  /v1/models, /health
@@ -20,13 +24,14 @@
 //!   GET  /, /ui/..., /static/...  the web front end (--wfe: wfe/audio, built into dist/wfe; H3's scheme)
 //! ```
 //!
-//! One request runs at a time (one engine on its GPU); the others wait their turn.
+//! One request runs at a time (one engine on its GPU), or as many as the engine makes together (`AudioEngine::batch`:
+//! a speech engine that advances several requests a frame at a time); the others wait their turn.
 
 use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use nextsycl_audio::{AudioEngine, AudioRequest};
@@ -47,7 +52,10 @@ pub struct AudioServer {
     pub cors: Vec<String>,
     gpu: Arc<Gpu>,
     tele: Arc<Telemetry>,
-    engine: Mutex<Box<dyn AudioEngine>>,
+    /// the engine: shared by the requests it makes together (`AudioEngine::batch`), held whole to end the process
+    engine: RwLock<Box<dyn AudioEngine>>,
+    /// requests on the engine now (at most its batch; the others wait here)
+    slots: (Mutex<usize>, Condvar),
     progress: Mutex<Value>,
     waiting: AtomicUsize,
     cancel: crate::cancel::Cancel,
@@ -131,7 +139,7 @@ impl AudioServer {
         }
         let tele = Telemetry::start(std::slice::from_ref(&gpu.pci));
         let history = Mutex::new(out_dir.as_deref().map(earlier).unwrap_or_default());
-        Ok(AudioServer { model, out_dir, wfe, cors, gpu, tele, engine: Mutex::new(engine), progress: Mutex::new(json!({"busy": false})),
+        Ok(AudioServer { model, out_dir, wfe, cors, gpu, tele, engine: RwLock::new(engine), slots: Default::default(), progress: Mutex::new(json!({"busy": false})),
                          idle: None, waiting: AtomicUsize::new(0), cancel: Default::default(), history,
                          vram_loaded: AtomicU64::new(own_vram_mb()), retire: AtomicBool::new(false) })
     }
@@ -225,10 +233,24 @@ impl AudioServer {
                     Err(e) => return http::respond_with(&mut s, 400, &err(format!("the body is not JSON: {e}")), &cors),
                 };
                 let base = req.host.as_deref().map(|h| format!("http://{h}")).unwrap_or_default();
-                match self.generate(&body, &base) {
-                    Ok((Some(v), _)) => http::respond_with(&mut s, 200, &v, &cors),
-                    Ok((None, wav)) => http::respond_bytes(&mut s, 200, "audio/wav", &wav, &cors),
-                    Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
+                let how = match streamed(&body) {
+                    Ok(h) => h,
+                    Err(m) => return http::respond_with(&mut s, 400, &err(m), &cors),
+                };
+                match how {
+                    Some(how) => {
+                        let mut out = Out { s: &mut s, how, cors: &cors, started: false, rate: 0 };
+                        let r = self.generate(&body, &base, Some(&mut out));
+                        out.finish(r);
+                    }
+                    None => match self.generate(&body, &base, None) {
+                        Ok((Some(v), _)) => http::respond_with(&mut s, 200, &v, &cors),
+                        Ok((None, wav)) if body["response_format"] == "pcm" => {
+                            http::respond_bytes(&mut s, 200, "audio/pcm", &wav[wav_data_at(&wav)..], &cors)
+                        }
+                        Ok((None, wav)) => http::respond_bytes(&mut s, 200, "audio/wav", &wav, &cors),
+                        Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
+                    },
                 }
                 self.maybe_retire();
             }
@@ -249,7 +271,7 @@ impl AudioServer {
         }
         // the engine held while ending: a request that got it after this one's answer is on the card (it retires
         // the server after its own answer), and none starts while the runtime is torn down
-        let Ok(_engine) = self.engine.try_lock() else { return };
+        let Ok(_engine) = self.engine.try_write() else { return };
         if self.waiting.load(Ordering::Relaxed) == 0 {
             std::process::exit(0);
         }
@@ -287,7 +309,7 @@ impl AudioServer {
     }
 
     fn info(&self) -> Value {
-        let Ok(e) = self.engine.try_lock() else {
+        let Ok(e) = self.engine.try_read() else {
             // busy: what does not change
             return json!({"model": self.model, "busy": true});
         };
@@ -303,6 +325,7 @@ impl AudioServer {
                 .map(|o| json!({"name": o.name, "value": o.value, "help": o.help})).collect::<Vec<_>>(),
             "report": e.report(),
             "saves": self.out_dir.is_some(),
+            "streams": e.streams(),
         })
     }
 
@@ -361,23 +384,23 @@ impl AudioServer {
         lib.add(name, &bytes, text.as_deref(), description.as_deref(), language.as_deref(), kind, &from, b["replace"] == true)
     }
 
-    /// Runs a request: (JSON for response_format url, else none) and the WAV's bytes
-    fn generate(&self, b: &Value, base: &str) -> Result<(Option<Value>, Vec<u8>), (u16, String)> {
+    /// Runs a request: (JSON for response_format url or a streamed answer's end, else none) and the WAV's bytes;
+    /// `stream`: the sound sent there as it is made
+    fn generate(&self, b: &Value, base: &str, mut stream: Option<&mut Out>) -> Result<(Option<Value>, Vec<u8>), (u16, String)> {
         let bad = |m: String| (400u16, m);
         if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model && *m != "MiniMaxAI/MiniMax-Music3" && !m.starts_with("Qwen/Qwen3-TTS")) {
             return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
         }
         let text = |k: &[&str]| k.iter().find_map(|k| b[*k].as_str()).filter(|p| !p.trim().is_empty()).map(str::to_string);
         let format = b["response_format"].as_str().unwrap_or("wav");
-        if !["wav", "url"].contains(&format) {
-            return Err(bad(format!("response_format {format}: wav or url")));
+        if !["wav", "pcm", "url"].contains(&format) {
+            return Err(bad(format!("response_format {format}: wav, pcm or url")));
         }
         if format == "url" && self.out_dir.is_none() {
             return Err(bad("response_format url: this server keeps no files (start it with an output directory)".into()));
         }
-        if b.get("stream").and_then(Value::as_bool) == Some(true) {
-            return Err(bad("stream: not served (the sound is made whole)".into()));
-        }
+        // a streamed answer's last event links the file (sse)
+        let link = format == "url" || stream.as_ref().is_some_and(|o| o.how == Streamed::Sse);
         let num = |k: &[&str]| k.iter().find_map(|k| b[*k].as_f64());
         let seed = match &b["seed"] {
             Value::Number(x) => x.as_u64().ok_or_else(|| bad("seed: a whole number".into()))?,
@@ -394,11 +417,12 @@ impl AudioServer {
             }
             None => None,
         };
-        // one request at a time
+        // one request at a time, or as many as the engine makes together
         self.waiting.fetch_add(1, Ordering::Relaxed);
-        let engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+        let engine = self.engine.read().unwrap_or_else(|p| p.into_inner());
+        let _slot = Slot::take(&self.slots, engine.batch());
         self.waiting.fetch_sub(1, Ordering::Relaxed);
-        let Some(_running) = self.cancel.begin(b["request_id"].as_str()) else {
+        let Some(running) = self.cancel.begin(b["request_id"].as_str()) else {
             return Err((499, "cancelled".into()));
         };
         let speech = engine.speech().is_some();
@@ -538,14 +562,27 @@ impl AudioServer {
         let p = &self.progress;
         let want = req.seconds.unwrap_or(d.seconds);
         *p.lock().unwrap() = json!({"busy": true, "prompt": prompt, "phase": "prompt", "at": 0, "of": 1, "seconds": 0, "want": want});
-        let out = engine.generate(&req, &mut |st| {
-            *p.lock().unwrap() = json!({"busy": true, "prompt": prompt, "phase": st.phase, "at": st.at, "of": st.of, "seconds": st.seconds, "want": want});
-            if self.cancel.stopping() {
+        let mut report = |st: nextsycl_audio::Step| {
+            *p.lock().unwrap() = json!({"busy": true, "prompt": prompt, "phase": st.phase, "at": st.at, "of": st.of, "seconds": st.seconds, "want": want,
+                                        "running": self.cancel.running()});
+            if running.stopping() {
                 return Err(nextsycl_core::Error("cancelled".into()));
             }
             Ok(())
-        });
-        *p.lock().unwrap() = json!({"busy": false});
+        };
+        let out = match stream.as_deref_mut() {
+            Some(o) => {
+                o.rate = d.rate;
+                engine.generate_streamed(&req, &mut report, &mut |x| o.send(x).map_err(|e| nextsycl_core::Error(format!("the client is gone: {e}"))))
+            }
+            None => engine.generate(&req, &mut report),
+        };
+        // the last of those running: idle
+        if self.cancel.running() <= 1 {
+            *p.lock().unwrap() = json!({"busy": false});
+        }
+        drop(running);
+        drop(_slot);
         drop(engine);
         if let Err(e) = &out {
             // the device failed (out of resources, lost): this process's GPU state is not to be trusted again
@@ -586,7 +623,7 @@ impl AudioServer {
                 let mut h = self.history.lock().unwrap();
                 h.push_front(e.clone());
                 h.truncate(200);
-                if format == "url" {
+                if link {
                     let mut v = e;
                     v["url"] = json!(format!("{base}/v1/audio/files/{name}"));
                     answer = Some(json!({"created": created, "data": [v], "nextsycl": {"took": took, "seconds": audio.seconds(), "seed": seed, "steps": steps,
@@ -595,6 +632,133 @@ impl AudioServer {
             }
         }
         Ok((answer, wav))
+    }
+}
+
+/// A place on the engine: taken when fewer than its batch run (else waited for), given back when dropped
+struct Slot<'a>(&'a (Mutex<usize>, Condvar));
+
+impl<'a> Slot<'a> {
+    fn take(slots: &'a (Mutex<usize>, Condvar), batch: usize) -> Slot<'a> {
+        let mut n = slots.0.lock().unwrap_or_else(|p| p.into_inner());
+        while *n >= batch.max(1) {
+            n = slots.1.wait(n).unwrap_or_else(|p| p.into_inner());
+        }
+        *n += 1;
+        Slot(slots)
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        *self.0 .0.lock().unwrap_or_else(|p| p.into_inner()) -= 1;
+        self.0 .1.notify_one();
+    }
+}
+
+/// How a streamed answer is sent
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Streamed {
+    /// a WAV file, its lengths unknown, the samples as they come
+    Wav,
+    /// 16-bit PCM as it comes
+    Pcm,
+    /// server-sent events (OpenAI's stream_format sse): speech.audio.delta {audio: base64 16-bit PCM} as the sound
+    /// comes, then speech.audio.done (with the file's link and our numbers); an error ends it as an error event
+    Sse,
+}
+
+/// Whether the request wants its sound streamed, and how: `stream: true` or `stream_format: "audio"` (the bytes of
+/// response_format wav or pcm as they come), `stream_format: "sse"` (events)
+fn streamed(b: &Value) -> Result<Option<Streamed>, String> {
+    let format = b["response_format"].as_str().unwrap_or("wav");
+    let sf = b["stream_format"].as_str();
+    if b["stream"] != true && sf.is_none() {
+        return Ok(None);
+    }
+    match (sf.unwrap_or("audio"), format) {
+        ("sse", _) => Ok(Some(Streamed::Sse)),
+        ("audio", "wav") => Ok(Some(Streamed::Wav)),
+        ("audio", "pcm") => Ok(Some(Streamed::Pcm)),
+        ("audio", f) => Err(format!("response_format {f}: a streamed answer is wav or pcm (stream_format sse's last event links the file)")),
+        (f, _) => Err(format!("stream_format {f}: audio or sse")),
+    }
+}
+
+/// Where a WAV made by `Audio::wav` has its samples
+fn wav_data_at(wav: &[u8]) -> usize {
+    wav.windows(4).position(|w| w == b"data").map_or(wav.len(), |i| (i + 8).min(wav.len()))
+}
+
+/// A streamed answer on its connection: the head sent with the first sound (an error before it is answered as
+/// usual), each piece of sound written as it comes
+struct Out<'a> {
+    s: &'a mut Conn,
+    how: Streamed,
+    cors: &'a str,
+    started: bool,
+    rate: u32,
+}
+
+impl Out<'_> {
+    fn start(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        if self.started {
+            return Ok(());
+        }
+        self.started = true;
+        let kind = match self.how {
+            Streamed::Wav => "audio/wav",
+            Streamed::Pcm => "audio/pcm",
+            Streamed::Sse => "text/event-stream",
+        };
+        // no length: the answer ends when the connection closes
+        write!(self.s, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nCache-Control: no-cache\r\nX-Sample-Rate: {}\r\n{}Connection: close\r\n\r\n",
+               self.rate, self.cors)?;
+        if self.how == Streamed::Wav {
+            self.s.write_all(&nextsycl_audio::wav_stream_head(self.rate, 1))?;
+        }
+        self.s.flush()
+    }
+
+    fn send(&mut self, samples: &[f32]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.start()?;
+        let pcm = nextsycl_audio::pcm16(samples);
+        match self.how {
+            Streamed::Sse => write!(self.s, "data: {}\n\n", json!({"type": "speech.audio.delta", "audio": http::base64(&pcm)}))?,
+            _ => self.s.write_all(&pcm)?,
+        }
+        self.s.flush()
+    }
+
+    /// The end: an error not answered yet as usual, the events' last one (done or the error)
+    fn finish(mut self, r: Result<(Option<Value>, Vec<u8>), (u16, String)>) {
+        use std::io::Write;
+        match (r, self.started) {
+            (Err((code, m)), false) => http::respond_with(&mut *self.s, code, &err(m), self.cors),
+            (Err((_, m)), true) => {
+                if self.how == Streamed::Sse {
+                    let _ = write!(self.s, "data: {}\n\n", json!({"type": "error", "error": {"message": m}}));
+                }
+                let _ = self.s.flush();
+            }
+            (Ok((answer, _)), _) => {
+                // nothing handed out (an empty sound): the head, then the end
+                if self.start().is_err() {
+                    return;
+                }
+                if self.how == Streamed::Sse {
+                    let mut done = json!({"type": "speech.audio.done", "sample_rate": self.rate});
+                    if let Some(a) = answer {
+                        done["data"] = a["data"].clone();
+                        done["nextsycl"] = a["nextsycl"].clone();
+                    }
+                    let _ = write!(self.s, "data: {done}\n\n");
+                }
+                let _ = self.s.flush();
+            }
+        }
     }
 }
 

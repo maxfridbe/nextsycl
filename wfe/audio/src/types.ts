@@ -23,6 +23,8 @@ export interface Info {
   saves?: boolean;
   /** a speech engine: its voices and what it takes (none: songs) */
   speech?: Speech | null;
+  /** whether it hands its sound out as it is made (a streamed answer plays before the end) */
+  streams?: boolean;
 }
 
 export interface Speech {

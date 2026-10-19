@@ -1,5 +1,5 @@
 /** What the buttons do: build the request from the form, send it, keep the result. */
-import { api } from "./api.js";
+import { api, generateStreamed, Player } from "./api.js";
 import { render, saveForm, state } from "./state.js";
 import type { EnrollJob, Song } from "./types.js";
 
@@ -176,17 +176,32 @@ export async function generate(): Promise<void> {
   state.error = null;
   state.status = "starting";
   render();
+  // speech from an engine that streams plays as it is made
+  const live = state.info.speech && state.info.streams ? new Player(state.info.defaults?.rate ?? 24000) : null;
   try {
-    const j = await api.generate(body());
+    const t0 = performance.now();
+    let first: number | null = null;
+    const j = live
+      ? await generateStreamed(body(), (b64) => {
+        if (first === null) {
+          first = (performance.now() - t0) / 1000;
+          state.status = `playing (first sound after ${first.toFixed(2)} s)`;
+          render();
+        }
+        live.push(b64);
+      })
+      : await api.generate(body());
     state.result = j.data[0] ?? null;
     const n = j.nextsycl;
     const wh = n.wh != null ? ` · ${n.wh.toFixed(2)} Wh` : "";
-    state.status = `done: ${n.seconds.toFixed(1)} s of sound in ${n.took.toFixed(1)} s (${(n.seconds / n.took).toFixed(2)}× real time)${wh}`;
+    const fs = first !== null ? ` · first sound after ${(first as number).toFixed(2)} s` : "";
+    state.status = `done: ${n.seconds.toFixed(1)} s of sound in ${n.took.toFixed(1)} s (${(n.seconds / n.took).toFixed(2)}× real time)${wh}${fs}`;
     await refreshHistory();
   } catch (e) {
     const m = e instanceof Error ? e.message : String(e);
     state.error = m === "cancelled" ? null : m;
     state.status = m === "cancelled" ? "cancelled" : "failed";
+    live?.stop();
   }
   state.busy = false;
   render();

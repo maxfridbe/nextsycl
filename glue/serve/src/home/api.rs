@@ -1599,7 +1599,8 @@ impl Home {
         }
         if on.contains(&"audio") {
             paths.insert("/v1/audio/speech".into(), json!({"post": oa("A song (input: the lyrics, instructions: the music) or speech (input: the text; voice, \
-                language, instructions, ref_audio, ref_text); response_format wav or url",
+                language, instructions, ref_audio, ref_text); response_format wav, pcm or url; stream: true (or stream_format audio) sends \
+                the sound as it is made (wav or pcm), stream_format sse as speech.audio.delta events",
                 json!({"model": ids("audio").first(), "instructions": "warm folk", "input": "[verse]\nRiver runs slow", "response_format": "url"}), "audio.generate")}));
             paths.insert("/v1/audio/files/{name}".into(), file("A song or speech an answer links (data[].url of audio.generate / audio.speak)", "<file>.wav", "audio/wav", true));
             paths.insert("/v1/audio/voices/{name}".into(), file("A saved voice's sample (audio.voices.list's sample)", "<voice>.wav", "audio/wav", false));

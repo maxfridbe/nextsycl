@@ -144,7 +144,7 @@ pub fn run(e: &Qwen3Tts, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String
         let max = codes_ref.as_ref().map_or(200, |c| c.len() + 8);
         let mut keep = Vec::new();
         let greedy = stages.contains(&"frames");
-        let got = e.frames(&spec, &d, if greedy { max } else { 1 }, 0, t0, &mut |_| Ok(()), None, Some(&mut keep))?;
+        let got = e.frames(&spec, &d, if greedy { max } else { 1 }, 0, t0, &mut |_| Ok(()), None, Some(&mut keep), None)?;
         report(log, &mut worst, "prompt rows", &keep[0], &want("prefill.npy")?);
         report(log, &mut worst, "first logits", &keep[1], &want("logits0.npy")?);
         if greedy {
@@ -156,7 +156,7 @@ pub fn run(e: &Qwen3Tts, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String
                             got.len(), r.len(), first.map_or("none".into(), |f| f.to_string())));
                 // the reference's frames forced: where the model here would have chosen otherwise, each frame on its own
                 let mut k2 = Vec::new();
-                e.frames(&spec, &d, r.len() + 1, 0, t0, &mut |_| Ok(()), Some(r), Some(&mut k2))?;
+                e.frames(&spec, &d, r.len() + 1, 0, t0, &mut |_| Ok(()), Some(r), Some(&mut k2), None)?;
                 let m = &k2[2];
                 log(format!("{:<24} first codes {} of {} frames differ, the other codes {} of {}", "frames (forced)", m[0], r.len(), m[1],
                             r.len() * 15));

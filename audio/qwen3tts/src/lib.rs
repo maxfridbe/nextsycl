@@ -46,6 +46,8 @@ pub const ROLES: &[&str] = &["model", "config", "vocab", "merges", "tokenizer-co
 /// frames a second, and the longest speech made (the checkpoint's max_new_tokens)
 pub const FPS: f32 = 12.5;
 const MAX_FRAMES: usize = 8192;
+/// a streamed answer's first sound after this many frames (0.64 s of speech; NS_Q3T_STREAM_FIRST)
+const STREAM_FIRST: usize = 8;
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "int8", env: "NS_Q3T_INT8", value: "0|1", help: "the talker's and code predictor's matrices in int8 (less VRAM, faster frames)", at: At::Load },
@@ -189,10 +191,11 @@ impl Qwen3Tts {
     }
 
     /// The frames' codes [T][16]: the talker and its predictor from the prompt. `force`: a check's codes to follow
-    /// (each frame's taken from it, not drawn)
+    /// (each frame's taken from it, not drawn); `sink`: shown the codes so far after each frame (a streamed answer)
     #[allow(clippy::too_many_arguments)]
     pub fn frames(&self, s: &Spec, d: &Drawing, max: usize, seed: u64, t0: Instant, progress: &mut dyn FnMut(Step) -> Result<()>,
-                  force: Option<&[Vec<i32>]>, keep: Option<&mut Vec<Vec<f32>>>) -> Result<Vec<Vec<i32>>> {
+                  force: Option<&[Vec<i32>]>, keep: Option<&mut Vec<Vec<f32>>>, mut sink: Option<&mut dyn FnMut(&[Vec<i32>]) -> Result<()>>)
+                  -> Result<Vec<Vec<i32>>> {
         let (ops, nsd, t) = (&self.ops, &self.nsd, &self.talker);
         let bound = prompt::bound(&self.tok, s);
         let tq = Instant::now();
@@ -215,6 +218,9 @@ impl Qwen3Tts {
             let mut codes: Vec<Vec<i32>> = Vec::new();
             let m = t.frames_device(k, ops, &ss, l, &feed, d, max, seed, force, &mut |c| {
                 codes.push(c);
+                if let Some(f) = sink.as_deref_mut() {
+                    f(&codes)?;
+                }
                 progress(Step { phase: "tokens", at: codes.len() as u32, of: max as u32, seconds: t0.elapsed().as_secs_f64() })
             })?;
             if let Some(k) = keep {
@@ -240,6 +246,9 @@ impl Qwen3Tts {
                 Some(c) => {
                     seen.push(c[0]);
                     codes.push(c);
+                    if let Some(f) = sink.as_deref_mut() {
+                        f(&codes)?;
+                    }
                 }
             }
             progress(Step { phase: "tokens", at: codes.len() as u32, of: max as u32, seconds: t0.elapsed().as_secs_f64() })?;
@@ -282,6 +291,71 @@ impl Qwen3Tts {
             min_frames: 2,
         })
     }
+    /// A request's speech; with `chunk`, handed out as it is made: the codec decodes the frames so far at a few
+    /// points (`Codec::stream_due`: after the first frames, then where a chunk reaches one of its lengths) and the
+    /// rest at the end, its chunks starting where the whole clip's do - the same samples as the whole clip's, but for
+    /// the codec's own rounding (1 in 32,768 on ~0.07% of the samples, as two whole runs of a clip differ)
+    fn make(&self, req: &AudioRequest, progress: &mut dyn FnMut(Step) -> Result<()>, mut chunk: Option<&mut dyn FnMut(&[f32]) -> Result<()>>)
+            -> Result<Audio> {
+        let t0 = Instant::now();
+        let s = self.spec(req)?;
+        if talker::profiling() {
+            eprintln!("[q3t profile] request (a clone's speaker embedding and codes) {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+        let d = self.drawing(req)?;
+        let seconds = req.seconds.unwrap_or(self.defaults().seconds);
+        if seconds <= 0.0 {
+            return Err(Error(format!("{seconds} s: a length above zero")));
+        }
+        let max = ((seconds * FPS) as usize).clamp(1, MAX_FRAMES);
+        progress(Step { phase: "prompt", at: 0, of: 1, seconds: 0.0 })?;
+        // an in-context clone: the recording's codes go ahead of the new ones through the codec (its context, as
+        // qwen-tts decodes them), their samples left out
+        let rc: &[Vec<i32>] = match &s.voice {
+            Voice::InContext { codes, .. } => codes,
+            _ => &[],
+        };
+        let first = std::env::var("NS_Q3T_STREAM_FIRST").ok().and_then(|v| v.parse().ok()).unwrap_or(STREAM_FIRST);
+        let mut samples = Vec::new();
+        // frames handed out so far (of the new ones)
+        let mut sent = 0;
+        let mut td = 0.0;
+        let codes = match chunk.as_deref_mut() {
+            None => self.frames(&s, &d, max, req.seed, t0, progress, None, None, None)?,
+            Some(out) => {
+                let mut sink = |codes: &[Vec<i32>]| -> Result<()> {
+                    if !Codec::stream_due(codes.len(), sent, first) {
+                        return Ok(());
+                    }
+                    let t = Instant::now();
+                    let all: Vec<Vec<i32>> = rc.iter().chain(codes).cloned().collect();
+                    let wav = self.codec.decode_from(&self.nsd, &all, rc.len() + sent)?;
+                    td += t.elapsed().as_secs_f64();
+                    sent = codes.len();
+                    out(&wav)?;
+                    samples.extend_from_slice(&wav);
+                    Ok(())
+                };
+                self.frames(&s, &d, max, req.seed, t0, progress, None, None, Some(&mut sink))?
+            }
+        };
+        progress(Step { phase: "decode", at: 0, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
+        let t = Instant::now();
+        let all: Vec<Vec<i32>> = rc.iter().chain(&codes).cloned().collect();
+        let rest = self.codec.decode_from(&self.nsd, &all, rc.len() + sent)?;
+        td += t.elapsed().as_secs_f64();
+        if let Some(out) = chunk {
+            if !rest.is_empty() {
+                out(&rest)?;
+            }
+        }
+        samples.extend_from_slice(&rest);
+        progress(Step { phase: "decode", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
+        if talker::profiling() {
+            eprintln!("[q3t profile] codec {:.1} ms", td * 1e3);
+        }
+        Ok(Audio { rate: codec::RATE, channels: 1, samples })
+    }
 }
 
 impl AudioEngine for Qwen3Tts {
@@ -321,37 +395,14 @@ impl AudioEngine for Qwen3Tts {
         self.load_s
     }
     fn generate(&self, req: &AudioRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Audio> {
-        let t0 = Instant::now();
-        let s = self.spec(req)?;
-        if talker::profiling() {
-            eprintln!("[q3t profile] request (a clone's speaker embedding and codes) {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
-        }
-        let d = self.drawing(req)?;
-        let seconds = req.seconds.unwrap_or(self.defaults().seconds);
-        if seconds <= 0.0 {
-            return Err(Error(format!("{seconds} s: a length above zero")));
-        }
-        let max = ((seconds * FPS) as usize).clamp(1, MAX_FRAMES);
-        progress(Step { phase: "prompt", at: 0, of: 1, seconds: 0.0 })?;
-        let codes = self.frames(&s, &d, max, req.seed, t0, progress, None, None)?;
-        progress(Step { phase: "decode", at: 0, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
-        let td = Instant::now();
-        let samples = match &s.voice {
-            // as qwen-tts: the recording's codes decoded ahead of the new ones (the codec's context), then the
-            // recording's share of the samples cut off
-            Voice::InContext { codes: rc, .. } => {
-                let all: Vec<Vec<i32>> = rc.iter().chain(&codes).cloned().collect();
-                let wav = self.codec.decode_bucketed(&self.nsd, &all)?;
-                let cut = (rc.len() as f64 / all.len().max(1) as f64 * wav.len() as f64) as usize;
-                wav[cut.min(wav.len())..].to_vec()
-            }
-            _ => self.codec.decode_bucketed(&self.nsd, &codes)?,
-        };
-        progress(Step { phase: "decode", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
-        if talker::profiling() {
-            eprintln!("[q3t profile] codec {:.1} ms", td.elapsed().as_secs_f64() * 1e3);
-        }
-        Ok(Audio { rate: codec::RATE, channels: 1, samples })
+        self.make(req, progress, None)
+    }
+    fn streams(&self) -> bool {
+        true
+    }
+    fn generate_streamed(&self, req: &AudioRequest, progress: &mut dyn FnMut(Step) -> Result<()>, chunk: &mut dyn FnMut(&[f32]) -> Result<()>)
+                         -> Result<Audio> {
+        self.make(req, progress, Some(chunk))
     }
     fn report(&self) -> Vec<String> {
         vec![format!("{ARCH} {} on {} ({}, loaded {:.0} s ago)", self.conf.kind, self.ops.gpu.name, if self.int8 { "int8" } else { "half" },

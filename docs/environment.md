@@ -260,12 +260,14 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_Q3T_INT8` | 0 | 1: the talker's and code predictor's matrices in int8 (less VRAM, faster frames) (--opt-int8) | audio qwen3tts |
 | `NS_Q3T_INT8_ROWS` | 0 | 1: int8 with a scale a row (as without the silo), not a scale every 32 weights | audio qwen3tts |
 | `NS_Q3T_PROFILE` | 0 | 1: each request's stages timed on stderr (the request, the prompt's build and prefill, the frames - with the silo the graph's recording and the time a frame; without it each stage synchronised -, the codec) | audio qwen3tts |
+| `NS_Q3T_STREAM_FIRST` | 8 | a streamed answer (stream / stream_format) hands out its first sound after this many frames (8: 0.64 s of speech); then at 25 frames and where the codec's chunk lengths fall | audio qwen3tts |
 | `NS_Q3T_EAGER` | 0 | 1: the silo's frame launched kernel by kernel, not replayed as a recorded graph (the A/B for the graph) | audio qwen3tts |
 | `NS_Q3T_STREAMING` | clone 1, built-in and designed voices 0 | the per-request option streaming's name: the text fed a token a frame; a request's options only, the variable itself is not read (--opt-streaming) | audio qwen3tts |
 | `NS_Q3T_TEMPERATURE` | 0.9 | the per-request option temperature's name: the talker's sampling temperature; a request's options only, the variable itself is not read (--opt-temperature) | audio qwen3tts |
 | `NS_Q3T_TOP_K` | 50 | the per-request option top-k's name: the talker's top-k; a request's options only, the variable itself is not read (--opt-top-k) | audio qwen3tts |
 | `NS_BZ2_*` | - | every NS_BZ2_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_BZ2_GREEDY` | 0 | the per-request option greedy's name: the most likely code, backbone and depth decoder (deterministic; may not end); a request's options only, the variable itself is not read (--opt-greedy) | audio breezetts2 |
+| `NS_BZ2_BATCH` | 8 | the rows a frame takes for requests made together (a guided request - with an instruction - two, a plain one one); the server takes that many requests at once; 1: one at a time (--opt-batch) | audio breezetts2 |
 | `NS_BZ2_TEMPERATURE` | 0.9 | the per-request option temperature's name: the sampling temperature, backbone and depth decoder; a request's options only, the variable itself is not read (--opt-temperature) | audio breezetts2 |
 | `NS_BZ2_TOP_K` | 50 | the per-request option top-k's name: the sampling top-k, backbone and depth decoder; a request's options only, the variable itself is not read (--opt-top-k) | audio breezetts2 |
 | `NS_S2P_GREEDY` | 0 | the per-request option greedy's name: the most likely code, slow and fast models (deterministic; may not end); a request's options only, the variable itself is not read (--opt-greedy) | audio s2pro |
@@ -283,6 +285,7 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_VV_PROFILE` | 0 | Debug: 1 times a run's stages (logits, head, decoder, semantic encoder, connectors, language model; the GPU waited for at each boundary), the table on stderr at its end; 2 the tokenizers' operations one by one | audio vibevoice |
 | `NS_VCP_*` | - | every NS_VCP_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_VCP_CONTINUE` | 0 | 1: VoxCPM2 continues a saved voice's recording (its transcript the prompt's) instead of taking its timbre alone - continuing led the recording's last words into each sentence | audio voxcpm2 |
+| `NS_VCP_GRAPH` | 1 | 0: the silo's sampler queued an evaluation at a time instead of replayed as a recorded graph (the A/B for the graph; the host still waits once a patch) | audio voxcpm2 |
 | `NS_VCP_INT8` | 0 | 1: the language models' matrices in int8 (less VRAM, faster patches) (--opt-int8) | audio voxcpm2 |
 | `NS_VCP_MAX_RATIO` | 6 | the per-request option max-ratio's name: the most patches a text token (a runaway's bound); a request's options only, the variable itself is not read (--opt-max-ratio) | audio voxcpm2 |
 

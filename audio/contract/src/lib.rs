@@ -120,7 +120,7 @@ impl Audio {
 
     /// As a 16-bit PCM WAV file's bytes, `info` (name, text) pairs in a LIST INFO chunk (INAM, ICMT, ...)
     pub fn wav(&self, info: &[(&str, &str)]) -> Vec<u8> {
-        let data: Vec<u8> = self.samples.iter().flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect();
+        let data = pcm16(&self.samples);
         let mut list = Vec::new();
         for (id, text) in info {
             let mut t = text.as_bytes().to_vec();
@@ -160,6 +160,31 @@ impl Audio {
     pub fn write_wav(&self, path: &Path, info: &[(&str, &str)]) -> std::result::Result<(), String> {
         std::fs::write(path, self.wav(info)).map_err(|e| format!("{}: {e}", path.display()))
     }
+}
+
+/// Samples in [-1, 1] as 16-bit little-endian PCM (a WAV's data, a streamed answer's bytes)
+pub fn pcm16(samples: &[f32]) -> Vec<u8> {
+    samples.iter().flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect()
+}
+
+/// The head of a WAV file streamed as it is made: 16-bit PCM, its lengths unknown (0xFFFFFFFF, as streaming
+/// players take it); the samples follow (`pcm16`)
+pub fn wav_stream_head(rate: u32, channels: u16) -> Vec<u8> {
+    let ch = channels.max(1);
+    let mut out = Vec::with_capacity(44);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&u32::MAX.to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&ch.to_le_bytes());
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * ch as u32 * 2).to_le_bytes());
+    out.extend_from_slice(&(ch * 2).to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&u32::MAX.to_le_bytes());
+    out
 }
 
 /// A WAV file's samples (PCM 8 / 16 / 24 / 32-bit or float 32 / 64; the channels mixed to mono) and their rate
@@ -344,6 +369,24 @@ pub trait AudioEngine: Send + Sync {
     fn load_seconds(&self) -> f64;
     /// make the request's sound, reporting as it goes; an error from `progress` stops it (a cancel)
     fn generate(&self, req: &AudioRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Audio>;
+    /// how many requests it makes together: `generate` is then called from that many threads at once (an engine
+    /// that batches advances them in the same steps - several clips a frame); 1: one at a time
+    fn batch(&self) -> usize {
+        1
+    }
+    /// whether `generate_streamed` hands the sound out as it is made (not all of it at the end)
+    fn streams(&self) -> bool {
+        false
+    }
+    /// `generate`, the samples handed to `chunk` as they are made, in order: together they are the answer's samples
+    /// (the same as `generate` makes for the request); an error from `chunk` stops it (the client gone). An engine
+    /// that does not stream hands out the whole sound at the end
+    fn generate_streamed(&self, req: &AudioRequest, progress: &mut dyn FnMut(Step) -> Result<()>, chunk: &mut dyn FnMut(&[f32]) -> Result<()>)
+                         -> Result<Audio> {
+        let a = self.generate(req, progress)?;
+        chunk(&a.samples)?;
+        Ok(a)
+    }
     /// lines for `status`: its GPUs, memory, what is loaded where
     fn report(&self) -> Vec<String> {
         Vec::new()
