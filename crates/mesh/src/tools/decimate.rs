@@ -245,7 +245,11 @@ fn collapse(mut m: Mesh, target: usize, held: &[bool], diag: f32) -> Mesh {
         (best.0.max(0.0), [best.1[0] as f32, best.1[1] as f32, best.1[2] as f32])
     };
     let mut queue = Queue { cands: Vec::new(), heap: BinaryHeap::new() };
-    for &(a, b) in edges.keys() {
+    // the edges in order: a tie in cost goes to the earlier candidate, so the hash map's order would decimate the same
+    // mesh differently run to run
+    let mut keys: Vec<(u32, u32)> = edges.keys().copied().collect();
+    keys.sort_unstable();
+    for (a, b) in keys {
         let (cost, to) = price(&q, &m.positions, a, b);
         queue.push(cost, Cand { a, b, stamp: (0, 0), to });
     }
@@ -377,6 +381,15 @@ mod tests {
         // still on the sphere: every vertex near radius 1
         let worst = d.positions.iter().map(|p| (crate::length(*p) - 1.0).abs()).fold(0f32, f32::max);
         assert!(worst < 0.05, "a vertex {worst} off the surface");
+    }
+
+    #[test]
+    fn the_same_mesh_decimates_the_same_way() {
+        // a sphere's many equal costs: the ties go by edge, not by the edge map's (random) order
+        let m = sphere(40, 60);
+        let (a, b) = (decimate(&m, 600), decimate(&m, 600));
+        assert_eq!(a.indices, b.indices);
+        assert_eq!(a.positions, b.positions);
     }
 
     #[test]
