@@ -329,6 +329,13 @@ int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, i
                     const int64_t nb = std::min(SEL_BATCH, T - t0);
                     const int32_t* steps0 = p->steps_dev + t0 * SK::kStepCount;
                     const int64_t active = (int64_t) p->h_steps[(size_t) ((t0 + nb - 1) * SK::kStepCount + SK::kStepNBid)] + 1;
+                    // the GEMM pays from ~8K cells (Strata 0.2.0 on a B70: -2% at 2K, even at 8K, 3x at 40K): below 2,048 blocks
+                    // the warp kernel (NS_QW_SELECT_GEMM=1: the GEMM always, =0: never)
+                    static const int sel_mode = [] { const char* v = std::getenv("NS_QW_SELECT_GEMM"); return v ? std::atoi(v) : -1; }();
+                    if (!(sel_mode > 0 || (sel_mode < 0 && active >= 2048)))
+                        SK::qsa_block_scores(sq.idx_pooled, sq.idx_dead, p->q_idx + t0 * 512, steps0, nb, p->max_blocks, s,
+                                             p->sel_scores, cs, active);
+                    else
                     for (int64_t b0 = 0; b0 < active; b0 += SEL_TILE) {
                         const int64_t nbk = std::min<int64_t>(SEL_TILE, active - b0);
                         oneapi::mkl::blas::column_major::gemm(*cs, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,

@@ -158,6 +158,7 @@ Qwen3.8-Flash-Next on the Strata kernels (`llm/qwen4exp`, `kernels/llm/qwen4exp`
 | `NS_QW_MTP` | no drafts | the MTP draft layer: Strata's runtime directory (--opt-mtp) | llm qwen4exp |
 | `NS_QW_PLE_PREFETCH` | 1 | 0: a window's per-layer embedding rows read one after another, not asked for together first (fadvise WILLNEED) (--opt-ple-prefetch) | llm qwen4exp |
 | `NS_QW_PROFILE` | off | Debug: 1 prints each decode round's time by part on stderr (costs ~9%) (--opt-qw-profile) | llm qwen4exp, kernels:qwen4exp |
+| `NS_QW_SELECT_GEMM` | from 8K cells | the prompt's QSA block scores as oneMKL GEMM tiles from 2,048 blocks of context (below, the warp kernel is faster); 1 always, 0 never | kernels:qwen4exp |
 | `NS_QW_SPEC` | 4 | the speculative window: the token and up to N - 1 drafts (2 to 8; Strata's --spec) (--opt-spec) | llm qwen4exp |
 | `NS_QW_SPEC_MIN_P` | 0.5 | a draft enters the window while at least this likely under the draft layer (--opt-spec-min-p) | llm qwen4exp |
 | `NS_QW_WINDOWS` | off | Debug: 1 reads a prompt in decode windows instead of chunks (a check) (--opt-windows) | llm qwen4exp |
