@@ -13,7 +13,8 @@ engine needs it - there is no shared kernel for the VQ experts). Card: `model-ca
   DSpark draft towers inside.
 - **Engram tables**: DeepSeek's own shards 47 and 48 of the 1017 checkpoint (2 x 101.5 GB, safetensors), in
   `deepseek-engram/` beside the model (NS_DS41_ENGRAM_DIR moves them); read a row (264 bytes) at a time with O_DIRECT.
-- **Vision** (`DeepSeek-V4.1-Flash.vision.gguf`): not ported yet.
+- **Vision** (`DeepSeek-V4.1-Flash.vision.gguf`, 0.97 GB bf16, the same revision): the ViT and the aligner, the image
+  span's three learned rows and the routers' image biases - read from beside the model (`NS_DS41_VISION`), see Vision.
 - **License**: MIT (DeepSeek), YoungAi's tools MIT.
 
 ## The file has no token types
@@ -117,6 +118,32 @@ of one.
 - The file: ~7 GiB of experts read when needed; the Engram's 203 GB read a row at a time (238K reads/s at QD 48 on the
   P310, 80 us a read alone).
 
+## Vision
+
+Pictures go in through the chat API: OpenAI's `image_url` parts (data URLs), Anthropic's base64 `image` parts, or a
+message's `images` (base64, /api/chat); `nextsycl llm generate ... --image PATH` from the command line. The server puts
+the engine's marker (`<｜deepseek_image｜>`, id 129264) in each picture's place, and the engine turns each marker into the
+picture's span, `[start] ([image] x w, [newline]) x h [end]` (image_processor.py), as ids of its own past the
+vocabulary (the picture's key and the place in its span): the same picture gives the same ids, so the prompt cache and
+a session's reuse hold. A pass that reads a span writes the span's rows over the placeholder's embeddings: the three
+learned rows, and the ViT + aligner's rows in reading order. The span's positions route by the layers' image bias
+(`exp_probs_b_vl`), take nothing from the Engram (their rows zero; an n-gram that reaches back into a span is the
+pad), and are never routed on the GPU (decode's GPU routing is for text).
+
+- Preprocessing as the reference's: the size plan (min_pixels 544^2, at most 1,024 positions a picture), ImageOps.pad
+  with PIL's bicubic resize (crates/diffusion's), the pixels rounded to bf16 as the reference casts them.
+- The ViT (32 blocks, 1024 wide, 16 heads, the 2D rotation over the patch grid) and the aligner (3 x 3 patches a row,
+  two products with GELU) run in float32 on the first GPU, oneMKL for the products (attention a block of query rows at
+  a time, the scores within 96 MB), the weights a layer at a time from the sidecar into the prompt arena; the rows are
+  kept with the picture (8 pictures held). 1.0-1.3 s a picture (39 x 39 and 36 x 72 patches) on the B70.
+- Parity against the reference's own code (vision.py, image_processor.py of the 1017 release, `refvis.py` loading the
+  sidecar's weights) in float32: patches identical, ViT output rel err 1.8e-5 / 2.3e-5, the rows 1.1e-5 / 1.2e-5
+  (cosine 1.000000; a 512 x 512 apple and a 1000 x 500 sheet of eight renders). The reference in bf16, its own mode,
+  is 3.2e-2 from its float32 rows.
+- Answers: the apple described (colour gradient, lenticels, stem, studio backdrop); the sheet as "2 distinct objects,
+  each presented from four different angles": the goblin warrior and the ornate helmet on its stand. Through the
+  server: a 198-position prompt with a picture 2.5 s cold, 1.1 s again (the picture's rows and the prompt cache).
+
 ## Open
 
 - Decode (~20 tok/s against V4's 25.6): the B65's q4_K products are ALU-bound (q_b 252 GB/s against the B70's 478;
@@ -125,4 +152,3 @@ of one.
   logits to queued products (~2.6 ms a token).
 - Prompt: the XMX expert product decodes each expert once a 32-token tile; one decode for all of an expert's tokens
   (local memory, many token tiles) is the next kernel.
-- Vision (the sidecar GGUF).

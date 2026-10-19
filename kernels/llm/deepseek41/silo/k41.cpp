@@ -108,13 +108,19 @@ void idx_score_xmx(sycl::queue& q, const float* qf, const float* w, const sycl::
                    int64_t ratio) {
     constexpr int64_t per_wg = IXSG * IXTB * IXM;
     const int64_t wgs = (ld + per_wg - 1) / per_wg;
+    static const bool by_keys_env = [] { const char* v = std::getenv("NS_DS41_IDX_ORDER"); return !v || std::atoi(v) != 0; }();
+    const bool by_keys = by_keys_env;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<sycl::half, 1> qp(sycl::range<1>(IXD * IXH), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * wgs) * IXSG * 16), sycl::range<1>(IXSG * 16)),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
             auto sg = it.get_sub_group();
             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id(), tid = (int) it.get_local_id(0);
-            const int64_t gi = it.get_group(0), t = gi / wgs, wg0 = (gi % wgs) * per_wg;
+            // the rows of one span of keys next to each other in the grid (NS_DS41_IDX_ORDER=0: a row's spans): the
+            // work-groups running at once read the same keys, from L2 - a row's spans in a row read every key from
+            // memory once a row (at 262K keys, 128 rows: 8.4 GB a pass, bound by the memory)
+            const int64_t gi = it.get_group(0);
+            const int64_t t = by_keys ? gi % T : gi / wgs, wg0 = (by_keys ? gi / T : gi % wgs) * per_wg;
             sycl::half* qs = qp.get_multi_ptr<sycl::access::decorated::no>().get();
             for (int i = tid; i < IXD * IXH; i += IXSG * 16) {
                 const int hh = i / IXD, k = i % IXD;

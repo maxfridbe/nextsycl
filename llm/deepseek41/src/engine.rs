@@ -1385,6 +1385,8 @@ pub struct Ds41<'g> {
     /// chunk ahead: its blocks must not land while the second GPU still reads the chunk before's)
     cand_q: Mutex<std::collections::VecDeque<Vec<u8>>>,
     pipelining: std::sync::atomic::AtomicBool,
+    /// the vision sidecar (NS_DS41_VISION), when there is one
+    pub vision: Option<crate::vision::Vision>,
 }
 
 /// the decode products' kernel variants (ds41.h: ns_ds41_vq_mmv): 0 a sub-group a row (float32 codebook), 1 a lane a row
@@ -1871,13 +1873,25 @@ impl<'g> Ds41<'g> {
             log(format!("the Engram: layers {:?}, tables in {}", en.layers, dir.display()));
             Some(en)
         };
+        let vision = match crate::vision::sidecar(&file.paths[0]) {
+            Some(path) => {
+                let mut v = crate::vision::Vision::open(&path, g.n_layer, g.n_embd as usize).map_err(|x| Error(x.0))?;
+                if let Some(m) = file.meta("tokenizer.ggml.tokens").and_then(|t| t.as_array()).and_then(|a| a.get(v.cfg.image_token as usize))
+                    .and_then(|x| x.as_str()) {
+                    v.marker = m.to_string();
+                }
+                log(format!("the vision sidecar: {} ({} ViT layers, at most {} positions an image)", path.display(), v.cfg.layers, v.cfg.max_tokens));
+                Some(v)
+            }
+            None => None,
+        };
         let load_bytes = parts.iter().map(|p| p.weight_bytes).sum();
         let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(BTreeMap::new()));
         if let Some(sl) = mirror_src {
             log(format!("layers {}.. on the second GPU: kv source {sl}'s keys mirrored there", bounds[1]));
         }
         Ok(Ds41 { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, engram, prof, mtp, mirror_src, cand_q: Mutex::new(Default::default()),
-                  pipelining: std::sync::atomic::AtomicBool::new(false) })
+                  pipelining: std::sync::atomic::AtomicBool::new(false), vision })
     }
 
     pub fn gpu_info(&self) -> Vec<GpuInfo> {
@@ -2197,11 +2211,13 @@ impl<'g> Ds41<'g> {
         let cols = *t.shape.last().unwrap_or(&1);
         let rb = t.ty.bytes(cols).unwrap_or(0) as usize;
         let mut rows = vec![0u8; tokens.len() * rb];
-        for (i, tok) in tokens.iter().enumerate() {
-            if *tok as u64 >= self.m.g.n_vocab {
+        for (i, &tok) in tokens.iter().enumerate() {
+            // an image span's position: the placeholder's row (its own rows are written over it: image_spans)
+            let tok = if crate::vision::is_image(tok) { self.vision.as_ref().map_or(tok, |v| v.cfg.image_token) } else { tok };
+            if tok as u64 >= self.m.g.n_vocab {
                 return Err(Error(format!("token {tok} outside the vocabulary")));
             }
-            self.m.file.read_into(t, *tok as u64 * rb as u64, &mut rows[i * rb..(i + 1) * rb]).map_err(e)?;
+            self.m.file.read_into(t, tok as u64 * rb as u64, &mut rows[i * rb..(i + 1) * rb]).map_err(e)?;
         }
         let raw = DevBuf::new(&p.ops.gpu, rows.len())?;
         p.upload(&raw, &rows)?;
@@ -2210,12 +2226,197 @@ impl<'g> Ds41<'g> {
         Ok(x)
     }
 
+    /// An image's input rows [lh * lw][n_embd] on part p: the ViT over its patches (vision.py: the patch product, 32
+    /// blocks of norm, attention with the 2D rotation, norm, SwiGLU; the last norm), then the aligner (3 x 3 patches a
+    /// row, zero-padded, through two products with GELU between). Float32 on the GPU, the weights a layer at a time from
+    /// the sidecar (bf16) into the prompt arena; kept with the image once made.
+    pub fn image_rows(&self, p: &Part, img: &crate::vision::Img) -> Result<Arc<Vec<f32>>> {
+        if let Some(r) = img.rows.lock().unwrap().as_ref() {
+            return Ok(r.clone());
+        }
+        let vis = self.vision.as_ref().ok_or("an image span, and no vision sidecar (NS_DS41_VISION)")?;
+        let px = img.patches.lock().unwrap().clone().ok_or("an image without its patches")?;
+        let c = &vis.cfg;
+        let o = &p.ops;
+        let pl = img.plan;
+        let (n, dim, nh, ff, pp) = (pl.vh * pl.vw, c.dim, c.heads, c.ff, 3 * c.patch * c.patch);
+        let t0 = Instant::now();
+        // the big arena: an image's temporaries run to ~0.5 GiB
+        p.arena_for(prefill_chunk())?;
+        let mk = p.arena.mark();
+        let w = |name: &str, len: usize| -> Result<DevBuf> {
+            let v = crate::vision::floats(&vis.file, name).map_err(|x| Error(x.0))?;
+            if v.len() != len {
+                return Err(Error(format!("{name}: {} values, {len} expected", v.len())));
+            }
+            let b = p.arena.f32(len)?;
+            b.write(0, &f32s(&v))?;
+            Ok(b)
+        };
+        let x = p.arena.f32(n * dim)?;
+        {
+            let xin = p.arena.f32(n * pp)?;
+            xin.write(0, &f32s(&px))?;
+            let (pw, pb) = (w("v.patch_embd.weight", dim * pp)?, w("v.patch_embd.bias", dim)?);
+            o.gemm_at(n, dim, pp, (&xin, 0, pp), (&pw, 0), (&x, 0, dim), false)?;
+            o.bias_act(&x, Some(&pb), n, dim, false)?;
+        }
+        let normed = p.arena.f32(n * dim)?;
+        let qkv = p.arena.f32(n * 3 * dim)?;
+        let kc = p.arena.f32(n * dim)?;
+        let att = p.arena.f32(n * dim)?;
+        // attention a block of query rows at a time: 16 heads x rows x n scores in 96 MB at most
+        let rb = ((96usize << 20) / (4 * nh * n)).clamp(1, n);
+        let s = p.arena.f32(nh * rb * n)?;
+        let ob = p.arena.f32(nh * rb * 64)?;
+        // the MLP a block of rows at a time
+        let mb = 2048.min(n);
+        let gu = p.arena.f32(mb * 2 * ff)?;
+        let hb = p.arena.f32(mb * ff)?;
+        let lm = p.arena.mark();
+        let eps = 1e-6f32;
+        for l in 0..c.layers {
+            p.arena.rewind(lm);
+            let pre = format!("v.blk.{l}");
+            let (n1, n2) = (w(&format!("{pre}.attn_norm.weight"), dim)?, w(&format!("{pre}.ffn_norm.weight"), dim)?);
+            let (wqkv, bqkv) = (w(&format!("{pre}.attn_qkv.weight"), 3 * dim * dim)?, w(&format!("{pre}.attn_qkv.bias"), 3 * dim)?);
+            let (wo, bo) = (w(&format!("{pre}.attn_output.weight"), dim * dim)?, w(&format!("{pre}.attn_output.bias"), dim)?);
+            let (wgu, wd) = (w(&format!("{pre}.ffn_gate_up.weight"), 2 * ff * dim)?, w(&format!("{pre}.ffn_down.weight"), dim * ff)?);
+            o.rms_norm(&x, Some(&n1), &normed, n, dim, eps)?;
+            o.gemm_at(n, 3 * dim, dim, (&normed, 0, dim), (&wqkv, 0), (&qkv, 0, 3 * dim), false)?;
+            o.bias_act(&qkv, Some(&bqkv), n, 3 * dim, false)?;
+            o.vit_rope(&qkv, &kc, n, nh, pl.vw, c.theta)?;
+            for r0 in (0..n).step_by(rb) {
+                let r = rb.min(n - r0);
+                // per head: s = q k^T (q in qkv's rows, k a head's [n][64]), softmax / 8, then s v (v in qkv's rows)
+                o.gemm_batch(nh, r, n, 64, (&qkv, r0 * 3 * dim, 3 * dim, 64), (&kc, 0, n * 64), (&s, 0, n, r * n))?;
+                o.softmax_rows(&s, nh * r, n, 0.125)?;
+                // each head's [r][64] apart (oneMKL takes no interleaved outputs), then into att's rows
+                o.gemm_batch_nn(nh, r, 64, n, (&s, 0, n, r * n), (&qkv, 2 * dim, 3 * dim, 64), (&ob, 0, 64, r * 64))?;
+                o.permute(&ob, &att.view(r0 * dim * 4, r * dim * 4)?, nh, r, 64)?;
+            }
+            o.gemm_at(n, dim, dim, (&att, 0, dim), (&wo, 0), (&normed, 0, dim), false)?;
+            o.bias_act(&normed, Some(&bo), n, dim, false)?;
+            o.add(&x, &normed, n * dim)?;
+            o.rms_norm(&x, Some(&n2), &normed, n, dim, eps)?;
+            for r0 in (0..n).step_by(mb) {
+                let r = mb.min(n - r0);
+                o.gemm_at(r, 2 * ff, dim, (&normed, r0 * dim, dim), (&wgu, 0), (&gu, 0, 2 * ff), false)?;
+                o.silu_mul(&gu, &hb, r, ff)?;
+                o.gemm_at(r, dim, ff, (&hb, 0, ff), (&wd, 0), (&att, r0 * dim, dim), false)?;
+            }
+            o.add(&x, &att, n * dim)?;
+        }
+        p.arena.rewind(lm);
+        let nf = w("v.output_norm.weight", dim)?;
+        o.rms_norm(&x, Some(&nf), &normed, n, dim, eps)?;
+        let vout = normed.to_f32()?;
+        p.arena.rewind(mk);
+        // the aligner: [C, vh, vw] zero-padded to whole 3 x 3 cells, unfolded (a cell's features c-major: c * 9 + 3 ky +
+        // kx), a cell a row in reading order
+        let r = c.ratio;
+        let (lh, lw, kin, d) = (pl.lh, pl.lw, dim * r * r, self.m.g.n_embd as usize);
+        let mut un = vec![0f32; lh * lw * kin];
+        for bi in 0..lh {
+            for bj in 0..lw {
+                let row = &mut un[(bi * lw + bj) * kin..(bi * lw + bj + 1) * kin];
+                for ky in 0..r {
+                    for kx in 0..r {
+                        let (y, xx) = (bi * r + ky, bj * r + kx);
+                        if y >= pl.vh || xx >= pl.vw {
+                            continue;
+                        }
+                        let src = &vout[(y * pl.vw + xx) * dim..(y * pl.vw + xx + 1) * dim];
+                        for (ci, v) in src.iter().enumerate() {
+                            row[ci * r * r + ky * r + kx] = *v;
+                        }
+                    }
+                }
+            }
+        }
+        let l = lh * lw;
+        let ui = p.arena.f32(l * kin)?;
+        ui.write(0, &f32s(&un))?;
+        let hid = p.arena.f32(l * d)?;
+        let out = p.arena.f32(l * d)?;
+        {
+            let lm2 = p.arena.mark();
+            let (w0, b0) = (w("mm.0.weight", d * kin)?, w("mm.0.bias", d)?);
+            o.gemm_at(l, d, kin, (&ui, 0, kin), (&w0, 0), (&hid, 0, d), false)?;
+            o.bias_act(&hid, Some(&b0), l, d, true)?;
+            p.arena.rewind(lm2);
+            let (w1, b1) = (w("mm.1.weight", d * d)?, w("mm.1.bias", d)?);
+            o.gemm_at(l, d, d, (&hid, 0, d), (&w1, 0), (&out, 0, d), false)?;
+            o.bias_act(&out, Some(&b1), l, d, false)?;
+        }
+        let rows = Arc::new(out.to_f32()?);
+        p.arena.rewind(mk);
+        // NS_DS41_VISION_DUMP=PREFIX: the patches, the ViT's output and the rows as raw float32 (a check against the
+        // reference's)
+        if let Ok(pre) = std::env::var("NS_DS41_VISION_DUMP") {
+            for (name, v) in [("patches", &px[..]), ("vit", &vout[..]), ("rows", &rows[..])] {
+                std::fs::write(format!("{pre}.{name}.f32"), f32s(v)).map_err(|x| Error(format!("NS_DS41_VISION_DUMP: {x}")))?;
+            }
+            eprintln!("[the image's patches [{n}][{pp}], ViT output [{n}][{dim}], rows [{l}][{d}] in {pre}.*.f32 (grid {} x {})]", pl.vh, pl.vw);
+        }
+        eprintln!("[an image of {} x {} patches -> {} x {} rows in {:.2} s]", pl.vh, pl.vw, lh, lw, t0.elapsed().as_secs_f64());
+        *img.rows.lock().unwrap() = Some(rows.clone());
+        *img.patches.lock().unwrap() = None;
+        Ok(rows)
+    }
+
+    /// The input rows of an image span's positions among `tokens` written over x0's ([t][d]) rows
+    fn image_spans(&self, p: &Part, tokens: &[u32], x0: &DevBuf) -> Result<()> {
+        use crate::vision::{Slot, is_image};
+        let Some(vis) = self.vision.as_ref() else {
+            return if tokens.iter().any(|t| is_image(*t)) { Err(Error("an image span, and no vision sidecar (NS_DS41_VISION)".into())) } else { Ok(()) };
+        };
+        let d = self.m.g.n_embd as usize;
+        let mut buf = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            if !is_image(tokens[i]) {
+                i += 1;
+                continue;
+            }
+            // a run of one image's positions
+            let key = crate::vision::key_of(tokens[i]);
+            let mut j = i;
+            while j < tokens.len() && is_image(tokens[j]) && crate::vision::key_of(tokens[j]) == key {
+                j += 1;
+            }
+            let img = vis.image(tokens[i]).map_err(|x| Error(x.0))?;
+            let needs_rows = tokens[i..j].iter().any(|t| matches!(img.plan.slot(crate::vision::pos_of(*t)), Slot::Row(_)));
+            let rows = if needs_rows { Some(self.image_rows(p, &img)?) } else { None };
+            buf.clear();
+            for t in &tokens[i..j] {
+                let pos = crate::vision::pos_of(*t);
+                if pos >= img.plan.span() {
+                    return Err(Error(format!("an image position {pos} past its span of {}", img.plan.span())));
+                }
+                match img.plan.slot(pos) {
+                    Slot::Start => buf.extend_from_slice(&vis.start),
+                    Slot::End => buf.extend_from_slice(&vis.end),
+                    Slot::Newline => buf.extend_from_slice(&vis.newline),
+                    Slot::Row(k) => buf.extend_from_slice(&rows.as_ref().ok_or("image rows")?[k * d..(k + 1) * d]),
+                }
+            }
+            x0.view(i * d * 4, (j - i) * d * 4)?.write(0, &f32s(&buf))?;
+            i = j;
+        }
+        Ok(())
+    }
+
     /// The embedding rows on part `pi` as the 4 streams [t, 4, d], then the first mix [t, 4] (stream 0)
     fn streams(&self, pi: usize, tokens: &[u32], tap: Tap) -> Result<DevBuf> {
         let d = self.m.g.n_embd as usize;
         let t = tokens.len();
         let p = &self.parts[pi];
         let x0 = self.rows_of(p, Role::TokenEmbd, tokens)?;
+        if tokens.iter().any(|t| crate::vision::is_image(*t)) {
+            p.ops.gpu.sync()?;
+            self.image_spans(p, tokens, &x0)?;
+        }
         tap("inp_embd", &x0)?;
         let mut pre = vec![0f32; t * 4];
         for ti in 0..t {
@@ -2261,13 +2462,22 @@ impl<'g> Ds41<'g> {
     }
 
     /// Engram layer l on the streams x [t, 4, d] (rows: the layer's raw table rows [t * 24][264])
-    fn engram_apply(&self, p: &Part, l: u64, x: &DevBuf, raw: &[u8], t: usize, tap: Tap) -> Result<()> {
+    fn engram_apply(&self, p: &Part, l: u64, x: &DevBuf, raw: &[u8], tokens: &[u32], tap: Tap) -> Result<()> {
         let g = &self.m.g;
+        let t = tokens.len();
         let en = self.engram.as_ref().ok_or("the Engram is not loaded")?;
         let (d, hd, nc) = (g.n_embd as usize, en.hd, en.cols());
         let rb = p.arena.bytes(raw.len().next_multiple_of(4))?;
         let mut padded = raw.to_vec();
         padded.resize(raw.len().next_multiple_of(4), 0);
+        // an image position takes nothing from the Engram (model.py: its gate shut): its rows zero, so its key and value
+        // are zero and the gate adds nothing
+        let per = raw.len() / t.max(1);
+        for (i, tok) in tokens.iter().enumerate() {
+            if crate::vision::is_image(*tok) {
+                padded[i * per..(i + 1) * per].fill(0);
+            }
+        }
         p.upload(&rb, &padded)?;
         let rows = p.arena.f32(t * nc * hd)?;
         p.ops.engram_rows(&rb, &rows, t * nc, hd)?;
@@ -2356,7 +2566,34 @@ impl<'g> Ds41<'g> {
                 continue;
             }
             let score = p.arena.f32(qn * n)?;
-            o.idx_score(&iq, &w, &c.idx, &score, qn, ih, id, n, n, pos0 + q0, r)?;
+            self.timed(p, "indexer: scores (every key)", || o.idx_score(&iq, &w, &c.idx, &score, qn, ih, id, n, n, pos0 + q0, r))?;
+            if !use_cand && nb > ct && ct >= kp && n >= idx_two_min() && ih == 32 && id == 128 && bs == 8 {
+                // two levels: the blocks' maxima, the best ct blocks (the candidate source's candidates too), their keys
+                // scored again (the same sums: a block one tile, as in the full scoring), the top-k among those. A key of
+                // the top k lies in a block whose maximum is at least the k-th score, and at most k <= ct blocks have
+                // one: the same picks
+                let bmax = p.arena.f32(qn * nb)?;
+                o.block_max(&score, &bmax, qn, n, n, bs, pos0 + q0, r)?;
+                let own = if is_cand { None } else { Some(p.arena.bytes(qn * ct * 4)?) };
+                let cv = match &own {
+                    Some(b) => b.view(0, qn * ct * 4)?,
+                    None => p.cand.view(q0 * ct * 4, qn * ct * 4)?,
+                };
+                o.topk(&bmax, &cv, qn, nb, nb, ct)?;
+                if is_cand {
+                    sh.cand = true;
+                }
+                if qn == t {
+                    tap(&format!("indexer_score-{l}"), &score)?;
+                }
+                let sc = p.arena.f32(qn * ct * bs)?;
+                o.idx_score_cand(&iq, &w, &c.idx, &cv, ct, &sc, qn, ih, id, n, pos0 + q0, r)?;
+                let selc = p.arena.bytes(qn * kp * 4)?;
+                o.topk(&sc, &selc, qn, ct * bs, ct * bs, kp)?;
+                o.cand_pos(&selc, &cv, &p.sel.view(q0 * kp * 4, qn * kp * 4)?, qn, ct, kp, bs)?;
+                p.arena.rewind(mk);
+                continue;
+            }
             if is_cand && nb > ct {
                 let bmax = p.arena.f32(qn * nb)?;
                 o.block_max(&score, &bmax, qn, n, n, bs, pos0 + q0, r)?;
@@ -2369,7 +2606,7 @@ impl<'g> Ds41<'g> {
             if qn == t {
                 tap(&format!("indexer_score-{l}"), &score)?;
             }
-            o.topk(&score, &p.sel.view(q0 * kp * 4, qn * kp * 4)?, qn, n, n, kp)?;
+            self.timed(p, "indexer: top-k (every key)", || o.topk(&score, &p.sel.view(q0 * kp * 4, qn * kp * 4)?, qn, n, n, kp))?;
             p.arena.rewind(mk);
         }
         Ok(true)
@@ -2403,7 +2640,7 @@ impl<'g> Ds41<'g> {
         // the compressed keys this layer reads: its source's
         let src = g.kv_source(l);
         if let Some(c) = &st.comp {
-            self.compress(p, l, x, c, pos0, t, &mut *tap)?;
+            self.timed(p, "attention: compressor", || self.compress(p, l, x, c, pos0, t, &mut *tap))?;
         }
         let comp = src.and_then(|s| {
             let a = &layers[s as usize];
@@ -2411,7 +2648,8 @@ impl<'g> Ds41<'g> {
         });
         if g.index_sources.contains(&l) {
             let c = comp.ok_or("an index source without its kv source's keys")?;
-            sh.sel = self.select(p, l, x, &qr, c, pos0, t, sh, &mut *tap)?;
+            let name = if g.cand_source == Some(l) { "attention: indexer (candidate source)" } else { "attention: indexer" };
+            sh.sel = self.timed(p, name, || self.select(p, l, x, &qr, c, pos0, t, sh, &mut *tap))?;
         }
         let kp = g.idx_top_k as usize;
         let rb = if t <= MMVQ_COLS { t } else { 1024.min(t) };
@@ -2431,7 +2669,9 @@ impl<'g> Ds41<'g> {
             }
             let compv = comp.map(|c| (&c.cache, c.ratio, c.cache.len / (512 * 2)));
             let sel = if comp.is_some() && sh.sel { Some((p.sel.view(r0 * kp * 4, tr * kp * 4)?, kp)) } else { None };
-            o.attend(&q, &st.raw, rr, compv, sel.as_ref().map(|(s, k)| (s, *k)), sinks, &att, tr, nh, pos0 + r0, g.window as usize, scale)?;
+            self.timed(p, "attention: attend", || {
+                o.attend(&q, &st.raw, rr, compv, sel.as_ref().map(|(s, k)| (s, *k)), sinks, &att, tr, nh, pos0 + r0, g.window as usize, scale)
+            })?;
             if kv_fused() {
                 o.att_post(&att, tr, nh, hd, rd, pos0 + r0, rope)?;
             } else {
@@ -2569,7 +2809,7 @@ impl<'g> Ds41<'g> {
                 let en = self.engram.as_ref().ok_or("the Engram is not loaded")?;
                 let (_, rows, f) = eng.iter().find(|(li, _, _)| *li == k).ok_or("the Engram's rows were not fetched")?;
                 let raw = self.timed(p, "engram: waiting for rows", || en.take(k, rows, f))?;
-                self.timed(p, "engram", || self.engram_apply(p, l, &xs, &raw, t, &mut *tap))?;
+                self.timed(p, "engram", || self.engram_apply(p, l, &xs, &raw, tokens, &mut *tap))?;
             }
             if let (Some(ms), Some(k)) = (mh.as_deref_mut(), g.mtp_targets.iter().position(|x| *x == l)) {
                 let mean = p.arena.f32(t * d)?;
@@ -2586,7 +2826,7 @@ impl<'g> Ds41<'g> {
             tap(&format!("attn_norm-{l}"), normed)?;
             let att = self.timed(p, "attention", || self.attention(p, l, normed, layers, pos0, t, &mut sh, &mut *tap))?;
             if self.mirror_src == Some(l) {
-                self.mirror_up(l, &layers[l as usize], pos0, t, sh.cand)?;
+                self.timed(p, "mirror", || self.mirror_up(l, &layers[l as usize], pos0, t, sh.cand))?;
             }
             o.hc_post(&att, &xs, post, comb, x1, t, d)?;
             tap(&format!("hc_attn_post-{l}"), &x1.view(0, t * 4 * d * 4)?)?;
@@ -2596,7 +2836,7 @@ impl<'g> Ds41<'g> {
                 gpu.sync()?;
                 Ok(Instant::now())
             }).transpose()?;
-            let ffn = self.moe(p, l, t, normed, &mut *tap)?;
+            let ffn = self.moe(p, l, t, normed, tokens, &mut *tap)?;
             if let Some(t1) = split {
                 gpu.sync()?;
                 let (a, m) = (t1.duration_since(lt0).as_secs_f64(), t1.elapsed().as_secs_f64());
@@ -2953,7 +3193,7 @@ impl<'g> Ds41<'g> {
             self.lap(p, "draft: attention", ta)?;
             o.hc_post(&a, &xs, post, comb, &x1, b, d)?;
             self.hc_half(p, l, Role::HcFfnFn, Role::HcFfnBase, Role::HcFfnScale, Role::FfnNorm, &x1, &attn_pre, &ws, b)?;
-            let ffn = self.timed(p, "draft: moe", || self.moe(p, l, b, normed, &mut *tap))?;
+            let ffn = self.timed(p, "draft: moe", || self.moe(p, l, b, normed, &[], &mut *tap))?;
             o.hc_post(&ffn, &x1, post, comb, &x2, b, d)?;
             o.kcopy(&x2, b * 4 * d * 4, pre_out, 0, b * 16)?;
             o.kcopy(&x, 0, &x2, 0, sz)?;
@@ -3048,7 +3288,8 @@ impl<'g> Ds41<'g> {
 
     /// The MoE half of block l on x [t, d]: the router (on the host), the shared expert, the routed experts grouped by
     /// expert - from their indices at decode widths, expanded to fp16 for a prompt
-    fn moe(&self, p: &Part, l: u64, t: usize, x: &DevBuf, tap: Tap) -> Result<DevBuf> {
+    /// `tokens`: the pass's (an image position routes by the layer's image bias); empty: no image positions
+    fn moe(&self, p: &Part, l: u64, t: usize, x: &DevBuf, tokens: &[u32], tap: Tap) -> Result<DevBuf> {
         let g = &self.m.g;
         let o = &p.ops;
         let d = g.n_embd as usize;
@@ -3066,7 +3307,8 @@ impl<'g> Ds41<'g> {
         tap(&format!("ffn_moe_logits-{l}"), &logits)?;
         // one decode token routed on the GPU: its VRAM experts' products queued now, from the slot table; the host
         // reads the routing (ids, weights, which had no VRAM slot) after, for the rest and its bookkeeping
-        let groute = t == 1 && gpu_route() && !self.mtp && !p.draft.contains_key(&l) && p.store(l).is_ok() && used <= 8;
+        let img_any = tokens.iter().any(|t| crate::vision::is_image(*t));
+        let groute = t == 1 && gpu_route() && !self.mtp && !p.draft.contains_key(&l) && p.store(l).is_ok() && used <= 8 && !img_any;
         let mut early: Option<(DevBuf, DevBuf, DevBuf)> = None;
         let mut early_read = None;
         if groute {
@@ -3120,9 +3362,15 @@ impl<'g> Ds41<'g> {
         ROUTER_WAIT_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let turn = Instant::now();
         let bias = p.router_bias(l)?;
+        // image positions: the layer's image bias (model.py: bias_vl)
+        let bias_vl = if img_any { self.vision.as_ref().and_then(|v| v.bias_vl.get(&l).cloned()) } else { None };
         let th = Instant::now();
         let pick = |ti: usize| -> Vec<(usize, f32)> {
             let pr: Vec<f32> = lv[ti * ne..(ti + 1) * ne].iter().map(|z| sqrt_softplus(*z)).collect();
+            let bias = match &bias_vl {
+                Some(b) if tokens.get(ti).is_some_and(|t| crate::vision::is_image(*t)) => b,
+                _ => &bias,
+            };
             let key = |i: usize| pr[i] + bias[i];
             let mut order: Vec<usize> = (0..ne).collect();
             order.select_nth_unstable_by(used - 1, |a, c| key(*c).total_cmp(&key(*a)).then(a.cmp(c)));
@@ -3563,6 +3811,16 @@ impl<'g> Ds41<'g> {
 /// and simulation in one (ns_ds41_att_post), an mHC half's mixes, collapse and norm in two (ns_ds41_hc_pre_in); and
 /// at one row two products of the same input in one launch (Part::mm2: q_a | kv, the shared gate | up, the router | the
 /// next layer's guess)
+/// Keys from which an index source's top-k is taken in two levels (NS_DS41_IDX_TWO, default 196,608; 0: never): below
+/// it one radix select over every key was as fast (B70: 1.6 against 2.0 ms at 131K keys and 256 rows, 1.7 against 1.4
+/// at 262K; B65 2.8 / 3.0 and 3.4 / 1.9)
+fn idx_two_min() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match env_usize("NS_DS41_IDX_TWO", 196_608) {
+        0 => usize::MAX,
+        v => v,
+    })
+}
 fn fused() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("NS_DS41_KV_FUSE").map_or(true, |v| v != "0"))

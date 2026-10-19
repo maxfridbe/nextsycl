@@ -74,4 +74,10 @@ files:
     size: 101537926640
     sha256: 9dc51433e195bc78b5ad846b68643cc0351d3b174e5e4309222d3b7402c83afd
     path: deepseek-v4.1-flash-1017/deepseek-engram/model-00048-of-00048.safetensors
+  vision:                       # the vision sidecar (ViT + aligner, bf16): found beside the model, pictures in chat
+    key: deepseek-v4.1-flash-1017-vision
+    url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/DeepSeek-V4.1-Flash.vision.gguf
+    size: 971066016
+    sha256: 3a8b194a011e630e8e49a51b5f4e9821e48a9e5674e678d52c0302d6b164698c
+    path: deepseek-v4.1-flash-1017/DeepSeek-V4.1-Flash.vision.gguf
 guide: guides/chat.md

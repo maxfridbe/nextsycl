@@ -249,6 +249,17 @@ pub trait Engine: Send + Sync {
     /// a checkpoint `Checkpoint::write_to` wrote
     fn read_checkpoint(&self, r: &mut dyn std::io::Read) -> std::io::Result<Checkpoint>;
 
+    /// The text a chat template's message carries in an image's place (its tokens are then replaced by the image's
+    /// span, `image_tokens`); None: the engine reads no images
+    fn image_marker(&self) -> Option<&str> {
+        None
+    }
+    /// A picture's span of prompt ids (the file's bytes: PNG, JPEG, WebP), held by the engine for the passes that read
+    /// it - ids of its own, past the vocabulary, the same picture the same ids (a prompt cache keyed by ids holds)
+    fn image_tokens(&self, _bytes: &[u8]) -> Result<Vec<u32>> {
+        Err(Error("this model reads no images".into()))
+    }
+
     /// LogProbChain: capture each one-token pass's attention (engines without: nothing)
     fn capture_attention(&self, _on: bool) {}
     fn take_attention(&self) -> Option<Vec<f32>> {

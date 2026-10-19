@@ -94,6 +94,7 @@ language models (nextsycl llm ...; the names without `llm` still work):
                                 the server itself (what start runs in its container)
   nextsycl llm generate <model.gguf> --prompt TEXT | --prompt-file PATH | --ids FILE [--ignore-eos] [--ctx N]
                  [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--seed S] [--gpu N[,M]] [--no-mtp]
+                 [--image PATH ...]  pictures before the prompt (a vision model's)
   nextsycl llm info <model.gguf>      the architecture and geometry, every tensor checked by role, bytes by group
   nextsycl llm tokenize <model.gguf> <text>
   nextsycl llm check <model.gguf> <dump dir> [--gpu N[,M]]    the forward pass against a reference dump
@@ -462,10 +463,39 @@ fn generate(args: &[String]) -> Result<(), String> {
     let mut log = |l: String| eprintln!("[{l}]");
     let mtp = !args.iter().any(|a| a == "--no-mtp");
     // --ctx N: the session's context (default the prompt and --max: the server's sessions are larger)
-    let ctx = opt("--ctx").and_then(|v| v.parse().ok()).unwrap_or(ids.len() + max + 1).max(ids.len() + max + 1);
+    // --image PATH (repeatable): pictures before the prompt's text, for a vision model (each up to 1,024 positions)
+    let images: Vec<String> = args.windows(2).filter(|w| w[0] == "--image").map(|w| w[1].clone()).collect();
+    let room = images.len() * 1024;
+    let ctx = opt("--ctx").and_then(|v| v.parse().ok()).unwrap_or(ids.len() + room + max + 1).max(ids.len() + max + 1);
     let eng = load_engine(&f, &gs, LoadOptions { expert_bytes: expert_gib.map(|x| (x * (1u64 << 30) as f64) as usize),
                                                  mirror_bytes: mirror_gib.map(|x| (x * (1u64 << 30) as f64) as usize), draft: mtp,
                                                  kv: (ctx, 1) }, &mut log)?;
+    let ids = if images.is_empty() {
+        ids
+    } else {
+        let mk = eng.image_marker().ok_or("--image: this model reads no images")?.to_string();
+        let content = format!("{}{prompt}", mk.repeat(images.len()));
+        let raw = tok.encode(&chat_of(&f)?(&[nextsycl_tok::Message { role: "user", content: &content, ..Default::default() }], effort, &[]));
+        let mid = match tok.encode(&mk).as_slice() {
+            [one] => *one,
+            _ => return Err(format!("the image marker {mk} is not one token")),
+        };
+        let mut out = Vec::new();
+        let mut k = 0;
+        for t in raw {
+            if t == mid && k < images.len() {
+                let bytes = std::fs::read(&images[k]).map_err(|x| format!("{}: {x}", images[k]))?;
+                out.extend(eng.image_tokens(&bytes).map_err(e)?);
+                k += 1;
+            } else {
+                out.push(t);
+            }
+        }
+        if out.len() + max + 1 > ctx {
+            return Err(format!("the prompt with its pictures is {} positions; --ctx {ctx}", out.len()));
+        }
+        out
+    };
     eprintln!("[{} on {}, {} prompt tokens, loaded in {:.1} s]", f.meta("general.name").and_then(|v| v.as_str()).unwrap_or("?"),
               gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), ids.len(), eng.load_seconds());
     let mut sess = eng.session(ctx).map_err(e)?;

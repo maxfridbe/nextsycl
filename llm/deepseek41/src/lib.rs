@@ -14,6 +14,7 @@ pub mod ffi;
 pub mod model;
 pub mod ops;
 pub mod tools;
+pub mod vision;
 
 use std::any::Any;
 use std::sync::Arc;
@@ -195,6 +196,13 @@ impl Engine for engine::Ds41<'_> {
         Ok(Checkpoint::new(engine::Checkpoint::read_from(&mut r)?))
     }
 
+    fn image_marker(&self) -> Option<&str> {
+        self.vision.as_ref().map(|v| v.marker.as_str())
+    }
+    fn image_tokens(&self, bytes: &[u8]) -> Result<Vec<u32>> {
+        let v = self.vision.as_ref().ok_or_else(|| nextsycl_core::Error("no vision sidecar (NS_DS41_VISION)".into()))?;
+        v.tokens(bytes).map_err(|e| nextsycl_core::Error(e.0))
+    }
     fn gpu_info(&self) -> Vec<GpuInfo> {
         engine::Ds41::gpu_info(self)
     }

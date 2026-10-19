@@ -254,7 +254,12 @@ impl Engram {
         let comp = |p: usize| -> i64 { self.token_map.get(hist[p] as usize).copied().unwrap_or(self.pad) };
         let mut out = vec![Vec::with_capacity((hist.len() - from) * nc); self.layers.len()];
         for p in from..hist.len() {
-            let toks: Vec<i64> = (0..ng).map(|s| if p >= s { comp(p - s) } else { self.pad }).collect();
+            // an image position takes no part in an n-gram (engram.py: DEAD): it and every token before it the pad
+            let mut blocked = false;
+            let toks: Vec<i64> = (0..ng).map(|s| {
+                blocked |= p < s || crate::vision::is_image(hist[p - s]);
+                if blocked { self.pad } else { comp(p - s) }
+            }).collect();
             for (li, o) in out.iter_mut().enumerate() {
                 let mut rolling = toks[0].wrapping_mul(self.mult[li * ng]);
                 for (i, tk) in toks.iter().enumerate().skip(1) {

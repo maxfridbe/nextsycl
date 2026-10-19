@@ -19,4 +19,5 @@ files:
   model: deepseek-v4.1-flash-1017-vq
   engram-1: deepseek-v4.1-flash-1017-engram-1
   engram-2: deepseek-v4.1-flash-1017-engram-2
+  vision: deepseek-v4.1-flash-1017-vision
 guide: guides/chat.md

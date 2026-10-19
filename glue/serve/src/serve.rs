@@ -112,6 +112,8 @@ pub struct Server {
 struct Msg {
     role: String,
     content: String,
+    /// the pictures' bytes, in the order of their markers in `content` (a vision engine's)
+    images: Vec<Vec<u8>>,
     reasoning: Option<String>,
     calls: Vec<ToolCall>,
 }
@@ -437,6 +439,43 @@ fn message_json(text: &str, reasoning: &str, calls: &[Value]) -> Value {
     m
 }
 
+/// A message's text and pictures: OpenAI's content parts (`image_url`: a data URL), Anthropic's (`image`: a base64
+/// source), and a message's own `images` (base64, /api/chat's), each picture's place in the text the engine's marker.
+/// Without a marker (an engine that reads no images) the pictures are left out, as before.
+fn content_of(m: &Value, marker: Option<&str>) -> Result<(String, Vec<Vec<u8>>), String> {
+    let Some(mk) = marker else { return Ok((text_of(&m["content"]), Vec::new())) };
+    let (mut text, mut images) = (String::new(), Vec::new());
+    let mut picture = |b64: &str, text: &mut String| -> Result<(), String> {
+        images.push(http::unbase64(b64).map_err(|e| format!("an image: {e}"))?);
+        text.push_str(mk);
+        Ok(())
+    };
+    for b in m["images"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+        picture(b, &mut text)?;
+    }
+    match &m["content"] {
+        Value::String(s) => text.push_str(s),
+        Value::Array(parts) => {
+            for p in parts {
+                if let Some(t) = p.get("text").and_then(|t| t.as_str()).or_else(|| p.as_str()) {
+                    text.push_str(t);
+                    continue;
+                }
+                let url = p["image_url"]["url"].as_str().or_else(|| p["image_url"].as_str());
+                let src = (p["source"]["type"].as_str() == Some("base64")).then(|| p["source"]["data"].as_str()).flatten();
+                match (url, src) {
+                    (Some(u), _) if u.starts_with("data:") => picture(u, &mut text)?,
+                    (Some(u), _) => return Err(format!("an image by URL ({}): send its bytes as a data: URL", u.chars().take(60).collect::<String>())),
+                    (None, Some(b)) => picture(b, &mut text)?,
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok((text, images))
+}
+
 fn text_of(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -674,12 +713,13 @@ impl Server {
     /// A request's body as an `Ask` (OpenAI's fields, or /api/chat's).
     fn ask(&self, req: &Value, api: Api) -> Result<Ask, String> {
         let thinking_key = if api == Api::Lines { "thinking" } else { "reasoning_content" };
-        let messages = req["messages"].as_array().ok_or("messages are required")?.iter().map(|m| Msg {
-            role: m["role"].as_str().unwrap_or("user").to_string(),
-            content: text_of(&m["content"]),
-            reasoning: m[thinking_key].as_str().map(str::to_string),
-            calls: calls_of(&m["tool_calls"]),
-        }).collect();
+        let marker = self.engine.image_marker();
+        let mut messages = Vec::new();
+        for m in req["messages"].as_array().ok_or("messages are required")? {
+            let (content, images) = content_of(m, marker)?;
+            messages.push(Msg { role: m["role"].as_str().unwrap_or("user").to_string(), content, images,
+                                reasoning: m[thinking_key].as_str().map(str::to_string), calls: calls_of(&m["tool_calls"]) });
+        }
         let tools = match (api, req["tool_choice"].as_str()) {
             (Api::OpenAi, Some("none")) | (Api::Lines, _) => Vec::new(),
             _ => req["tools"].as_array().cloned().unwrap_or_default(),
@@ -1100,7 +1140,31 @@ impl Server {
         let opens_thinking = text.trim_end().ends_with("<think>");
         // Muse Glimmer's channels: the answer after `<|start|>assistant` is a to=self message, then the to=user one
         let channels = text.ends_with("<|start|>assistant");
-        let ids = self.tok.encode(&text);
+        let mut ids = self.tok.encode(&text);
+        // each picture's marker token (in the messages' order) replaced by the picture's span
+        let images: Vec<&Vec<u8>> = ask.messages.iter().flat_map(|m| m.images.iter()).collect();
+        if !images.is_empty() {
+            let mk = self.engine.image_marker().ok_or("this model reads no images")?;
+            let mid = match self.tok.encode(mk).as_slice() {
+                [one] => *one,
+                _ => return Err(format!("the image marker {mk} is not one token of this vocabulary")),
+            };
+            let at: Vec<usize> = ids.iter().enumerate().filter(|(_, t)| **t == mid).map(|(i, _)| i).collect();
+            // the template's own markers (none) aside, the last ones are the pictures'
+            if at.len() < images.len() {
+                return Err(format!("{} pictures, {} places for them in the prompt", images.len(), at.len()));
+            }
+            let at = &at[at.len() - images.len()..];
+            let mut out = Vec::with_capacity(ids.len());
+            let mut prev = 0;
+            for (k, &i) in at.iter().enumerate() {
+                out.extend_from_slice(&ids[prev..i]);
+                out.extend(self.engine.image_tokens(images[k]).map_err(|e| e.0)?);
+                prev = i + 1;
+            }
+            out.extend_from_slice(&ids[prev..]);
+            ids = out;
+        }
         if ids.len() + 16 > self.max_ctx {
             return Err(format!("the prompt is {} tokens; the context is {}", ids.len(), self.max_ctx));
         }
@@ -1359,8 +1423,25 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::cors_headers;
-    use super::{calls_of, py_json, safe_end, typed_args};
+    use super::{calls_of, content_of, py_json, safe_end, typed_args};
     use serde_json::json;
+
+    #[test]
+    fn pictures_take_the_markers_place() {
+        let b = crate::http::base64(b"PIC");
+        let m = json!({"role": "user", "content": [{"type": "text", "text": "a "}, {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{b}")}},
+                                                   {"type": "image", "source": {"type": "base64", "data": b}}, {"type": "text", "text": " b"}]});
+        let (t, im) = content_of(&m, Some("<I>")).unwrap();
+        assert_eq!(t, "a <I><I> b");
+        assert_eq!(im, vec![b"PIC".to_vec(), b"PIC".to_vec()]);
+        // /api/chat's images go first; an engine without a marker gets the text alone, as before
+        let m = json!({"role": "user", "content": "x", "images": [b]});
+        assert_eq!(content_of(&m, Some("<I>")).unwrap(), ("<I>x".to_string(), vec![b"PIC".to_vec()]));
+        assert_eq!(content_of(&m, None).unwrap(), ("x".to_string(), vec![]));
+        // a picture by URL is refused (the server fetches nothing)
+        let m = json!({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]});
+        assert!(content_of(&m, Some("<I>")).is_err());
+    }
 
     #[test]
     fn tool_call_text_is_held_back() {
