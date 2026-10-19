@@ -1078,8 +1078,60 @@ impl Server {
         Ok(())
     }
 
+    /// Several active, an engine that steps them together with their drafts (`steps_together`): each one's step as it
+    /// would take it alone, in one engine call
+    fn step_many(&self, slots: &mut [Slot], active: &mut [Active], rng: &mut Rng, none: nextsycl_llm::Tap) -> Result<(), String> {
+        let live: Vec<usize> = (0..active.len()).filter(|i| active[*i].finish.is_none()).collect();
+        for &i in &live {
+            let a = &mut active[i];
+            if a.dec.is_none() {
+                let mut dec = match (a.logits.take(), a.pending.take()) {
+                    (Some(l), _) => self.engine.decoder(l, true),
+                    (None, Some(y)) => self.engine.decoder_after(y, true),
+                    (None, None) => return Err("a request without logits or a token to feed".into()),
+                };
+                let mut ctx = a.job.ids.clone();
+                ctx.extend_from_slice(&a.committed);
+                dec.set_context(&ctx);
+                a.dec = Some(dec);
+            }
+        }
+        // each its own random numbers (from the server's) and logprob queue
+        let mut rngs: Vec<Rng> = live.iter().map(|_| {
+            rng.next_f32();
+            Rng(rng.0 | 1)
+        }).collect();
+        let mut lps: Vec<VecDeque<Value>> = live.iter().map(|_| VecDeque::new()).collect();
+        let toks = {
+            let mut sel: Vec<&mut Active> = active.iter_mut().filter(|a| a.finish.is_none()).collect();
+            let want: Vec<usize> = sel.iter().map(|a| a.slot).collect();
+            let mut sess: Vec<&mut Session> = Vec::with_capacity(want.len());
+            for (si, s) in slots.iter_mut().enumerate() {
+                if want.contains(&si) {
+                    sess.push(&mut s.sess);
+                }
+            }
+            // sessions in slot order: the actives too (active is sorted by slot)
+            let mut draws: Vec<ServeSampler> = sel.iter().zip(rngs.iter_mut()).zip(lps.iter_mut()).map(|((a, r), l)| ServeSampler {
+                temp: a.job.temp, top_p: a.job.top_p, seed: a.job.seed, rng: r, tok: &self.tok, k: a.job.logprobs, lps: l }).collect();
+            let mut smps: Vec<&mut dyn nextsycl_llm::Sampler> = draws.iter_mut().map(|d| d as &mut dyn nextsycl_llm::Sampler).collect();
+            let mut decs: Vec<&mut nextsycl_llm::Decoder> = sel.iter_mut().map(|a| a.dec.as_mut().unwrap()).collect();
+            self.engine.step_many(&mut sess, &mut decs, &mut smps, &mut *none).map_err(|e| e.0)?
+        };
+        for ((&i, ys), mut lq) in live.iter().zip(toks).zip(lps) {
+            for y in ys {
+                let lp = lq.pop_front();
+                self.commit(&mut active[i], y, lp);
+            }
+        }
+        Ok(())
+    }
+
     /// Several active: a token each, one batch pass for all of them
     fn step_together(&self, slots: &mut [Slot], active: &mut [Active], rng: &mut Rng, none: nextsycl_llm::Tap) -> Result<(), String> {
+        if self.engine.steps_together() {
+            return self.step_many(slots, active, rng, none);
+        }
         // each one's next token: drawn from its logits, or the one its own steps committed and did not feed
         let mut feed: Vec<(usize, u32)> = Vec::new(); // (index in active, token)
         for (i, a) in active.iter_mut().enumerate() {

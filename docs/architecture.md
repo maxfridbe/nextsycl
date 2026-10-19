@@ -217,6 +217,15 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   longer side - the session keeps that offset (`shift`, in its checkpoints too). Against llama.cpp's mtmd (CPU, the
   same Q4 file, a 640 x 480 picture): the picture's 300 rows cos 0.999998, the prompt's last logits cos 0.989 (the text
   alone: 0.989), the same 48 greedy tokens; a picture ~0.6 s on the B70.
+  Several conversations at once (`step_many`, the contract's `steps_together`; the server's requests decoding
+  together): their verify rows ([token, drafts] each, 8 rows in all) in one pass - the products once over all rows,
+  each conversation's positions, attention, DeltaNet recurrence, conv and caches its own (`FullSeg` / `LinSeg`), a
+  snapshot set each for its rollback (the second made with the first such step when the cards have 1.5 GiB to spare,
+  else the steps run one after another) - then their drafts a row each in one draft-block pass. The same tokens as
+  alone (batch-check: 0 of 96 differ, logits identical; greedy answers hash the same alone and together). 256-token
+  answers, Q4: B70 one stream 46-48 tok/s, two at once 28.9 + 29.5 = 58.4 (before: 11 + 11, a token each without
+  drafts); split over B65 + B70 (256K + 32K) 43.6, two 26.3 + 26.5 = 52.8 (before 22.3). `forward_batch` is a real
+  batch too (4 conversations 77 tok/s in all vs 27 alone).
 
 - **deepseek2** - DeepSeek-V3 / R1 (unsloth's dynamic GGUFs: IQ1_S experts): MLA absorbed over an fp16 cache of
   [latent | rotated key] (576 a token and layer; YaRN as llama.cpp runs it), the 256 experts in three tiers - VRAM

@@ -158,6 +158,20 @@ impl Engine for engine::Qwen35<'_> {
         let d = d.get_mut::<engine::Decoder>().ok_or_else(|| nextsycl_core::Error("a decoder of another engine".into()))?;
         engine::Qwen35::step(self, sess_mut(s)?, d, smp, tap)
     }
+    fn steps_together(&self) -> bool {
+        engine::Qwen35::steps_together(self)
+    }
+    fn step_many(&self, ss: &mut [&mut Session], ds: &mut [&mut Decoder], smps: &mut [&mut dyn Sampler], tap: Tap) -> Result<Vec<Vec<u32>>> {
+        let mut own: Vec<&mut engine::Session> = Vec::with_capacity(ss.len());
+        for s in ss.iter_mut() {
+            own.push(s.get_mut().ok_or_else(|| nextsycl_core::Error("a session of another engine".into()))?);
+        }
+        let mut dec: Vec<&mut engine::Decoder> = Vec::with_capacity(ds.len());
+        for d in ds.iter_mut() {
+            dec.push(d.get_mut::<engine::Decoder>().ok_or_else(|| nextsycl_core::Error("a decoder of another engine".into()))?);
+        }
+        engine::Qwen35::step_many(self, &mut own, &mut dec, smps, tap)
+    }
     fn save(&self, s: &Session) -> Result<Checkpoint> {
         Ok(Checkpoint::new(engine::Qwen35::save(self, sess(s)?)?))
     }

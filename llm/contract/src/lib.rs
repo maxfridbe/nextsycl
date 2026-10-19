@@ -243,6 +243,15 @@ pub trait Engine: Send + Sync {
     fn decoder_after(&self, next: u32, draft: bool) -> Decoder;
     /// the next committed token(s)
     fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>>;
+    /// whether `step_many` steps several conversations at once with their drafts (the server's requests decoding
+    /// together then go through it; else a token each through `forward_batch`, without drafts)
+    fn steps_together(&self) -> bool {
+        false
+    }
+    /// the next committed token(s) of each conversation, each as `step` alone would commit them
+    fn step_many(&self, _s: &mut [&mut Session], _d: &mut [&mut Decoder], _smp: &mut [&mut dyn Sampler], _tap: Tap) -> Result<Vec<Vec<u32>>> {
+        Err(Error("this engine steps one conversation at a time".into()))
+    }
 
     fn save(&self, s: &Session) -> Result<Checkpoint>;
     fn restore(&self, s: &mut Session, ck: &Checkpoint) -> Result<()>;

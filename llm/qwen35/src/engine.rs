@@ -282,8 +282,18 @@ struct Mtp {
 /// Each DeltaNet layer's state after each row of a verify pass but the last (its recurrence [rows-1][48][128][128],
 /// its conv inputs [rows-1][3][channels]), and whose pass they are (session, first position, rows)
 struct Snaps {
+    /// per DeltaNet layer: the recurrence's and the conv's states after a verify pass's rows but the last
     layers: Vec<(DevBuf, DevBuf)>,
-    of: Option<(u64, usize, usize)>,
+    /// a second set for a batch step's second conversation (made with the first such step, when the cards have room)
+    second: Option<Vec<(DevBuf, DevBuf)>>,
+    /// the last pass's verify rows: (session, position, rows, set)
+    of: Vec<(u64, usize, usize, usize)>,
+}
+
+impl Snaps {
+    fn set(&self, i: usize) -> Option<&Vec<(DevBuf, DevBuf)>> {
+        if i == 0 { Some(&self.layers) } else { self.second.as_ref() }
+    }
 }
 
 /// NS_Q35_DRAFTS: tokens drafted a step (0: none; at most 7 - a verify pass is at most 8 rows)
@@ -357,6 +367,28 @@ pub struct Qwen35<'g> {
 enum Rope<'a> {
     From(usize),
     Rows(&'a DevBuf),
+}
+
+/// A conversation's rows in a pass, as a full-attention layer reads them: from row r0, t rows at position p0, their
+/// rotary positions, its cache ([kv heads][cap][head] half)
+struct FullSeg<'a> {
+    r0: usize,
+    t: usize,
+    p0: usize,
+    rope: Rope<'a>,
+    cap: usize,
+    k: &'a DevBuf,
+    v: &'a DevBuf,
+}
+
+/// A conversation's rows in a pass, as a DeltaNet layer reads them: from row r0, t rows, its state and conv inputs, and
+/// where the states after its rows but the last go (the recurrence's, the conv's: a verify pass's snapshots)
+struct LinSeg<'a> {
+    r0: usize,
+    t: usize,
+    s: &'a DevBuf,
+    conv: &'a DevBuf,
+    snap: Option<(*mut f32, *mut f32)>,
 }
 
 /// The vision tower's work memory: what a layer's weights and the blocks take, and what each patch adds (its rows of
@@ -612,7 +644,8 @@ impl<'g> Qwen35<'g> {
             None if draft => "qwen35: no MTP file (NS_Q35_MTP or an MTP/ folder beside the model): no drafts".into(),
             None => "qwen35: drafts off".into(),
         });
-        let vh = DevBuf::f32(&lastg, 8 * g.n_embd)?;
+        // two sets of 8 rows: a batch step's two conversations
+        let vh = DevBuf::f32(&lastg, 16 * g.n_embd)?;
         let mut devs = Vec::with_capacity(gpus.len());
         for (gpu, &(lb, le)) in gpus.iter().zip(&bounds) {
             gpu.sync()?;
@@ -652,7 +685,7 @@ impl<'g> Qwen35<'g> {
             None => None,
         };
         Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, chunk,
-                    work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, of: None }), vh, next_id: 0.into(), vision, probe,
+                    work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, second: None, of: Vec::new() }), vh, next_id: 0.into(), vision, probe,
                     load_s, load_bytes: loaded })
     }
 
@@ -1081,9 +1114,10 @@ impl<'g> Qwen35<'g> {
         Ok(rows)
     }
 
-    /// A full-attention layer on h [t, n_embd]: its output [t, n_embd]
-    #[allow(clippy::too_many_arguments)]
-    fn full(&self, a: &Full, kc: &DevBuf, vc: &DevBuf, cap: usize, h: &DevBuf, hq8: Option<&Q8>, t: usize, p0: usize, rope: Rope) -> Result<DevBuf> {
+    /// A full-attention layer on h [t, n_embd]: its output [t, n_embd]. The rows are one conversation's or several's
+    /// (`segs`: each its rows, position, rotary positions and cache): the products take all rows at once, the positions,
+    /// caches and attention each conversation's own rows - each as its own pass would
+    fn full(&self, a: &Full, segs: &[FullSeg], h: &DevBuf, hq8: Option<&Q8>, t: usize) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hq, hk, d) = (g.heads, g.heads_kv, g.head);
         let qf = self.arena().f32(t * hq * 2 * d)?;
@@ -1096,77 +1130,73 @@ impl<'g> Qwen35<'g> {
         let kn = self.arena().f32(t * hk * d)?;
         let att = self.arena().f32(t * hq * d)?;
         let none = String::new;
-        // the keys the rows see in all (causal): what attention reads and multiplies
-        let keys = t * p0 + t * (t + 1) / 2;
-        // SAFETY: the rows and caches as named in q35.h.
-        unsafe {
-            match rope {
-                Rope::From(r0) => {
-                    self.op("q norm rope", none, 8 * t * hq * d, 10 * t * hq * d,
-                            || (k.qk_norm_rope)(self.raw(), qf.fp(), (hq * 2 * d) as i64, (2 * d) as i64, q.fp(), (hq * d) as i64, t as i64, hq as i64,
-                                                d as i64, a.q_norm.fp(), g.eps, g.n_rot as i64, g.theta, r0 as i64))?;
-                    self.op("k norm rope", none, 8 * t * hk * d, 10 * t * hk * d,
-                            || (k.qk_norm_rope)(self.raw(), kr.fp(), (hk * d) as i64, d as i64, kn.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64,
-                                                a.k_norm.fp(), g.eps, g.n_rot as i64, g.theta, r0 as i64))?;
+        for sg in segs {
+            let (r0, t, p0, cap, kc, vc) = (sg.r0, sg.t, sg.p0, sg.cap, sg.k, sg.v);
+            let rows = |b: &DevBuf, w: usize| b.view(r0 * w * 4, t * w * 4);
+            let (qf, kr, vr) = (rows(&qf, hq * 2 * d)?, rows(&kr, hk * d)?, rows(&vr, hk * d)?);
+            let (q, kn, att) = (rows(&q, hq * d)?, rows(&kn, hk * d)?, rows(&att, hq * d)?);
+            // the keys the rows see in all (causal): what attention reads and multiplies
+            let keys = t * p0 + t * (t + 1) / 2;
+            // SAFETY: the rows and caches as named in q35.h.
+            unsafe {
+                match sg.rope {
+                    Rope::From(r0) => {
+                        self.op("q norm rope", none, 8 * t * hq * d, 10 * t * hq * d,
+                                || (k.qk_norm_rope)(self.raw(), qf.fp(), (hq * 2 * d) as i64, (2 * d) as i64, q.fp(), (hq * d) as i64, t as i64, hq as i64,
+                                                    d as i64, a.q_norm.fp(), g.eps, g.n_rot as i64, g.theta, r0 as i64))?;
+                        self.op("k norm rope", none, 8 * t * hk * d, 10 * t * hk * d,
+                                || (k.qk_norm_rope)(self.raw(), kr.fp(), (hk * d) as i64, d as i64, kn.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64,
+                                                    a.k_norm.fp(), g.eps, g.n_rot as i64, g.theta, r0 as i64))?;
+                    }
+                    Rope::Rows(pos) => {
+                        let (s0, s1, s2) = g.sections;
+                        self.op("q norm rope", none, 8 * t * hq * d, 10 * t * hq * d,
+                                || (k.qk_norm_rope_pos)(self.raw(), qf.fp(), (hq * 2 * d) as i64, (2 * d) as i64, q.fp(), (hq * d) as i64, t as i64, hq as i64,
+                                                        d as i64, a.q_norm.fp(), g.eps, g.n_rot as i64, g.theta, pos.ptr().cast(), s0, s1, s2))?;
+                        self.op("k norm rope", none, 8 * t * hk * d, 10 * t * hk * d,
+                                || (k.qk_norm_rope_pos)(self.raw(), kr.fp(), (hk * d) as i64, d as i64, kn.fp(), (hk * d) as i64, t as i64, hk as i64,
+                                                        d as i64, a.k_norm.fp(), g.eps, g.n_rot as i64, g.theta, pos.ptr().cast(), s0, s1, s2))?;
+                    }
                 }
-                Rope::Rows(pos) => {
-                    let (s0, s1, s2) = g.sections;
-                    self.op("q norm rope", none, 8 * t * hq * d, 10 * t * hq * d,
-                            || (k.qk_norm_rope_pos)(self.raw(), qf.fp(), (hq * 2 * d) as i64, (2 * d) as i64, q.fp(), (hq * d) as i64, t as i64, hq as i64,
-                                                    d as i64, a.q_norm.fp(), g.eps, g.n_rot as i64, g.theta, pos.ptr().cast(), s0, s1, s2))?;
-                    self.op("k norm rope", none, 8 * t * hk * d, 10 * t * hk * d,
-                            || (k.qk_norm_rope_pos)(self.raw(), kr.fp(), (hk * d) as i64, d as i64, kn.fp(), (hk * d) as i64, t as i64, hk as i64,
-                                                    d as i64, a.k_norm.fp(), g.eps, g.n_rot as i64, g.theta, pos.ptr().cast(), s0, s1, s2))?;
+                self.op("kv store", none, 12 * t * hk * d, 0,
+                        || (k.kv_store)(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64, p0 as i64,
+                                        kc.ptr(), vc.ptr()))?;
+                if let Some(s) = self.silo.filter(|s| (s.attn_prompt_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
+                    // the silo's flash attention (prompt rows): each key read once a work-group of 8 rows x 6 heads
+                    // each block of 8 rows reads K and V (half) up to its last row's key, once for the 6 heads
+                    let nb = t.div_ceil(8);
+                    let block_keys = nb * p0 + 8 * nb * (nb + 1) / 2;
+                    self.op("attention silo", none, block_keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
+                            || (s.attn_prompt)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
+                                               p0 as i64, att.fp()))?;
+                } else if let Some(s) = self.silo.filter(|s| (s.attn_decode_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
+                    // the silo's decode attention: a lane a key for the scores, the keys over ~512 work-groups
+                    let sc = (s.attn_decode_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
+                    let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
+                    self.op("attention silo", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
+                            || (s.attn_decode)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
+                                               p0 as i64, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+                } else {
+                    let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
+                    let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
+                    self.op("attention", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
+                            || (k.attn)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
+                                        p0 as i64, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
                 }
             }
-            self.op("kv store", none, 12 * t * hk * d, 0,
-                    || (k.kv_store)(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64, p0 as i64,
-                                    kc.ptr(), vc.ptr()))?;
-            let silo = self.silo.filter(|s| (s.attn_prompt_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0);
-            if let Some(s) = silo {
-                // the silo's flash attention (prompt rows): each key read once a work-group of 8 rows x 6 heads
-                // each block of 8 rows reads K and V (half) up to its last row's key, once for the 6 heads
-                let nb = t.div_ceil(8);
-                let block_keys = nb * p0 + 8 * nb * (nb + 1) / 2;
-                self.op("attention silo", none, block_keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
-                        || (s.attn_prompt)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
-                                           p0 as i64, att.fp()))?;
-                self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
-                        || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
-                let out = self.arena().f32(t * g.n_embd)?;
-                self.matmul("o", &a.o, &att, None, t, &out)?;
-                return Ok(out);
-            }
-            if let Some(s) = self.silo.filter(|s| (s.attn_decode_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
-                // the silo's decode attention: a lane a key for the scores, the keys over ~512 work-groups
-                let sc = (s.attn_decode_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
-                let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
-                self.op("attention silo", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
-                        || (s.attn_decode)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
-                                           p0 as i64, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
-                self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
-                        || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
-                let out = self.arena().f32(t * g.n_embd)?;
-                self.matmul("o", &a.o, &att, None, t, &out)?;
-                return Ok(out);
-            }
-            let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
-            let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
-            self.op("attention", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
-                    || (k.attn)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64, p0 as i64,
-                                att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
-            self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
-                    || (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64))?;
         }
+        // SAFETY: att [t, hq x d] gated by qf's gate columns.
+        self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
+                || unsafe { (k.gate_mul)(self.raw(), att.fp(), qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64) })?;
         let out = self.arena().f32(t * g.n_embd)?;
         self.matmul("o", &a.o, &att, None, t, &out)?;
         Ok(out)
     }
 
-    /// A DeltaNet layer on h [t, n_embd]: its output [t, n_embd]
-    /// `snap`: where the state after each row but the last goes (a verify pass's: its recurrence's, its conv's)
-    #[allow(clippy::too_many_arguments)]
-    fn linear(&self, a: &Linear, s: &DevBuf, conv: &DevBuf, h: &DevBuf, hq8: Option<&Q8>, t: usize, snap: Option<(&DevBuf, &DevBuf)>) -> Result<DevBuf> {
+    /// A DeltaNet layer on h [t, n_embd]: its output [t, n_embd]. `segs`: each conversation's rows with its state, conv
+    /// inputs and where the state after each row but the last goes (a verify pass's snapshots: the recurrence's, the
+    /// conv's) - the recurrence and the conv each conversation's own, the rest over all rows
+    fn linear(&self, a: &Linear, segs: &[LinSeg], h: &DevBuf, hq8: Option<&Q8>, t: usize) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (hv, hk, d, cd) = (g.v_heads, g.k_heads, g.state, g.conv_dim());
         let qkv = self.arena().f32(t * cd)?;
@@ -1202,8 +1232,12 @@ impl<'g> Qwen35<'g> {
         unsafe {
             self.op("gates", none, 4 * (3 * t * hv + 2 * hv) + 4 * thd, 20 * t * hv,
                     || (k.gdn_gates)(self.raw(), alpha.fp(), beta.fp(), a.dt.fp(), a.a.fp(), eg.fp(), t as i64, hv as i64, d as i64))?;
-            self.op("conv silu", none, 4 * (2 * t * cd + 2 * (g.conv - 1) * cd + g.conv * cd), 2 * g.conv * t * cd + 4 * t * cd,
-                    || (k.conv_silu)(self.raw(), qkv.fp(), conv.fp(), a.conv.fp(), co.fp(), t as i64, cd as i64, g.conv as i32, snap.map_or(std::ptr::null_mut(), |x| x.1.fp())))?;
+            for sg in segs {
+                let t = sg.t;
+                self.op("conv silu", none, 4 * (2 * t * cd + 2 * (g.conv - 1) * cd + g.conv * cd), 2 * g.conv * t * cd + 4 * t * cd,
+                        || (k.conv_silu)(self.raw(), qkv.fp().add(sg.r0 * cd), sg.conv.fp(), a.conv.fp(), co.fp().add(sg.r0 * cd), t as i64, cd as i64, g.conv as i32,
+                                         sg.snap.map_or(std::ptr::null_mut(), |x| x.1)))?;
+            }
             self.op("expand q", none, 4 * t * hk * d + 4 * thd, 0, || (k.expand)(self.raw(), co.fp(), cd as i64, q.fp(), t as i64, hk as i64, hv as i64, d as i64))?;
             self.op("expand k", none, 4 * t * hk * d + 4 * thd, 0,
                     || (k.expand)(self.raw(), co.fp().add(qd as usize), cd as i64, kk.fp(), t as i64, hk as i64, hv as i64, d as i64))?;
@@ -1212,8 +1246,13 @@ impl<'g> Qwen35<'g> {
             self.op("l2 k", none, 8 * thd, 3 * thd, || (k.l2_norm)(self.raw(), kk.fp(), (t * hv) as i64, d as i64, g.eps))?;
             // the state [hv][d][d] read and written once, each row's q, k, v, decay in and output out; per row and head
             // the state decayed, read against k, updated, read against q: ~8 d^2
-            self.op("delta rule", none, 8 * hv * d * d + 4 * (5 * thd + t * hv), 8 * t * hv * d * d,
-                    || (k.kda_scan)(self.raw(), q.fp(), kk.fp(), v.fp(), eg.fp(), beta.fp(), s.fp(), o.fp(), t as i64, hv as i64, d as i64, snap.map_or(std::ptr::null_mut(), |x| x.0.fp())))?;
+            for sg in segs {
+                let (t, r) = (sg.t, sg.r0 * hv * d);
+                let thd = t * hv * d;
+                self.op("delta rule", none, 8 * hv * d * d + 4 * (5 * thd + t * hv), 8 * t * hv * d * d,
+                        || (k.kda_scan)(self.raw(), q.fp().add(r), kk.fp().add(r), v.fp().add(r), eg.fp().add(r), beta.fp().add(sg.r0 * hv), sg.s.fp(), o.fp().add(r),
+                                        t as i64, hv as i64, d as i64, sg.snap.map_or(std::ptr::null_mut(), |x| x.0)))?;
+            }
             self.op("gated norm", none, 4 * (3 * t * g.inner + d), 10 * t * g.inner,
                     || (k.gdn_out)(self.raw(), o.fp(), z.fp(), g.inner as i64, a.norm.fp(), y.fp(), t as i64, hv as i64, d as i64, g.eps))?;
         }
@@ -1269,7 +1308,7 @@ impl<'g> Qwen35<'g> {
         let rope_at = |dev: usize| -> Rope { match pos_rows.get(dev).and_then(|b| b.as_ref()) { Some(b) => Rope::Rows(b), None => Rope::From(r0) } };
         let mut snaps = self.snaps.lock().unwrap();
         let snapping = (2..=self.drafts + 1).contains(&t) && !snaps.layers.is_empty();
-        snaps.of = None;
+        snaps.of.clear();
         self.phase("embed");
         let mut x = self.embed(tokens)?;
         if pictures {
@@ -1295,11 +1334,14 @@ impl<'g> Qwen35<'g> {
             self.phase(if ly.full.is_some() { "attention" } else { "deltanet" });
             let hq8 = self.norm(&x, &ly.attn_norm, &h, t, g.n_embd)?;
             let out = match (st, &ly.full, &ly.linear) {
-                (LState::Full { k, v }, Some(a), _) => self.full(a, k, v, s.max_ctx, &h, hq8.as_ref(), t, p0, rope_at(self.layer_dev[l]))?,
+                (LState::Full { k, v }, Some(a), _) => {
+                    let seg = FullSeg { r0: 0, t, p0, rope: rope_at(self.layer_dev[l]), cap: s.max_ctx, k, v };
+                    self.full(a, &[seg], &h, hq8.as_ref(), t)?
+                }
                 (LState::Linear { s: rs, conv }, _, Some(a)) => {
-                    let sn = snapping.then(|| (&snaps.layers[li].0, &snaps.layers[li].1));
+                    let sn = snapping.then(|| (snaps.layers[li].0.fp(), snaps.layers[li].1.fp()));
                     li += 1;
-                    self.linear(a, rs, conv, &h, hq8.as_ref(), t, sn)?
+                    self.linear(a, &[LinSeg { r0: 0, t, s: rs, conv, snap: sn }], &h, hq8.as_ref(), t)?
                 }
                 _ => return Err(e(format!("layer {l}: its state and its weights disagree"))),
             };
@@ -1318,7 +1360,7 @@ impl<'g> Qwen35<'g> {
             self.arena().rewind(mark);
         }
         if snapping {
-            snaps.of = Some((s.id, p0, t));
+            snaps.of.push((s.id, p0, t, 0));
         }
         drop(snaps);
         s.pos += t;
@@ -1369,6 +1411,38 @@ impl<'g> Qwen35<'g> {
     #[allow(clippy::too_many_arguments)]
     fn mtp_rows(&self, ms: &MtpState, tokens: &[u32], hs: &DevBuf, p0: usize, cap: usize, head: bool, rope: Rope) -> Result<Option<u32>> {
         let Some(m) = &self.mtp else { return Ok(None) };
+        let (t, ne) = (tokens.len(), self.g.n_embd);
+        let cur = self.mtp_block(m, &[FullSeg { r0: 0, t, p0, rope, cap, k: &ms.k, v: &ms.v }], tokens, hs)?;
+        if !head {
+            return Ok(None);
+        }
+        let last = cur.view((t - 1) * ne * 4, ne * 4)?;
+        Ok(self.mtp_heads(m, &[ms], &last)?.pop())
+    }
+
+    /// The draft block's head on rows ([n][n_embd], the block's outputs, one a conversation): each one's normed row kept
+    /// for a chained draft, each one's likeliest token (the argmax on the GPU: 4 bytes a row read back)
+    fn mtp_heads(&self, m: &Mtp, mss: &[&MtpState], rows: &DevBuf) -> Result<Vec<u32>> {
+        let (n, ne) = (mss.len(), self.g.n_embd);
+        let hn2 = self.arena().f32(n * ne)?;
+        let q = self.norm(rows, &m.head_norm, &hn2, n, ne)?;
+        for (j, ms) in mss.iter().enumerate() {
+            ms.chain.copy_within(0, &hn2, j * ne * 4, ne * 4)?;
+        }
+        let logits = self.arena().f32(n * m.output.rows)?;
+        self.matmul("mtp head", &m.output, &hn2, q.as_ref(), n, &logits)?;
+        let best = self.arena().bytes(4 * n)?;
+        // SAFETY: logits [n, vocab] float32 -> each row's argmax (an int32 each).
+        self.op("argmax", String::new, n * m.output.rows * 4, 0,
+                || unsafe { (self.k.argmax)(self.raw(), logits.fp(), n as i64, m.output.rows as i64, best.ptr().cast()) })?;
+        let mut b = vec![0u8; 4 * n];
+        best.read(0, &mut b)?;
+        Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    }
+
+    /// The draft block over `tokens` (row i: token i with hidden state hs[i]), each conversation's rows (`segs`) at its
+    /// positions in its own cache: its output rows [t][n_embd]
+    fn mtp_block(&self, m: &Mtp, segs: &[FullSeg], tokens: &[u32], hs: &DevBuf) -> Result<DevBuf> {
         let g = &self.g;
         let (t, ne) = (tokens.len(), g.n_embd);
         let emb = self.embed_from(&m.file, &m.embd, m.vocab, tokens)?;
@@ -1388,7 +1462,7 @@ impl<'g> Qwen35<'g> {
         self.add(&cur, &tmp, t * ne)?;
         let h = self.arena().f32(t * ne)?;
         let hq8 = self.norm(&cur, &m.attn_norm, &h, t, ne)?;
-        let att = self.full(&m.attn, &ms.k, &ms.v, cap, &h, hq8.as_ref(), t, p0, rope)?;
+        let att = self.full(&m.attn, segs, &h, hq8.as_ref(), t)?;
         self.add(&cur, &att, t * ne)?;
         let hq8 = self.norm(&cur, &m.post_norm, &h, t, ne)?;
         let fg = self.arena().f32(t * g.n_ff)?;
@@ -1400,22 +1474,40 @@ impl<'g> Qwen35<'g> {
         self.op("swiglu", String::new, 12 * nf, 6 * nf, || unsafe { (self.k.swiglu_clamp)(self.raw(), fg.fp(), fu.fp(), fg.fp(), nf as i64, f32::INFINITY) })?;
         self.matmul("mtp down", &m.down, &fg, None, t, &tmp)?;
         self.add(&cur, &tmp, t * ne)?;
-        if !head {
-            return Ok(None);
+        Ok(cur)
+    }
+
+    /// Drafts for several conversations at once (`tails[i]` committed at ss[i].pos, not fed): each draft step one row
+    /// a conversation through the draft block, as `draft_in` makes them one at a time
+    fn draft_many(&self, ss: &[&Session], tails: &[u32]) -> Result<Vec<Vec<u32>>> {
+        let Some(m) = &self.mtp else { return Ok(vec![Vec::new(); ss.len()]) };
+        let ne = self.g.n_embd;
+        let ks: Vec<usize> = ss.iter().map(|s| if s.mtp.is_some() { self.drafts.min(s.max_ctx.saturating_sub(s.pos + 1)) } else { 0 }).collect();
+        let mut out: Vec<Vec<u32>> = ks.iter().map(|k| Vec::with_capacity(*k)).collect();
+        let mut toks: Vec<u32> = tails.to_vec();
+        self.on(self.last());
+        for i in 0..ks.iter().copied().max().unwrap_or(0) {
+            self.arena().reset();
+            self.phase("mtp draft");
+            let live: Vec<usize> = (0..ss.len()).filter(|j| i < ks[*j]).collect();
+            let n = live.len();
+            let hs = self.arena().f32(n * ne)?;
+            let mut segs = Vec::with_capacity(n);
+            let mut mss = Vec::with_capacity(n);
+            for (r, &j) in live.iter().enumerate() {
+                let (s, ms) = (ss[j], ss[j].mtp.as_ref().ok_or_else(|| e("a draft without the draft block's state"))?);
+                hs.copy_within(r * ne * 4, if i == 0 { &ms.pending } else { &ms.chain }, 0, ne * 4)?;
+                segs.push(FullSeg { r0: r, t: 1, p0: s.pos + i, rope: Rope::From(s.pos + i - s.shift), cap: s.max_ctx, k: &ms.k, v: &ms.v });
+                mss.push(ms);
+            }
+            let rows: Vec<u32> = live.iter().map(|j| toks[*j]).collect();
+            let cur = self.mtp_block(m, &segs, &rows, &hs)?;
+            for (r, y) in self.mtp_heads(m, &mss, &cur)?.into_iter().enumerate() {
+                toks[live[r]] = y;
+                out[live[r]].push(y);
+            }
         }
-        let last = cur.view((t - 1) * ne * 4, ne * 4)?;
-        let hn2 = self.arena().f32(ne)?;
-        let q = self.norm(&last, &m.head_norm, &hn2, 1, ne)?;
-        ms.chain.copy_within(0, &hn2, 0, ne * 4)?;
-        let logits = self.arena().f32(m.output.rows)?;
-        self.matmul("mtp head", &m.output, &hn2, q.as_ref(), 1, &logits)?;
-        let best = self.arena().bytes(4)?;
-        // SAFETY: logits [1, vocab] float32 -> its argmax (one int32).
-        self.op("argmax", String::new, m.output.rows * 4, 0,
-                || unsafe { (self.k.argmax)(self.raw(), logits.fp(), 1, m.output.rows as i64, best.ptr().cast()) })?;
-        let mut b = [0u8; 4];
-        best.read(0, &mut b)?;
-        Ok(Some(u32::from_le_bytes(b)))
+        Ok(out)
     }
 
     /// Drafts for the positions after `tail` (committed at s.pos, not fed): the draft block on (the last fed
@@ -1445,27 +1537,28 @@ impl<'g> Qwen35<'g> {
             return Ok(());
         }
         let mut snaps = self.snaps.lock().unwrap();
-        let Some((id, p0, rows)) = snaps.of else {
+        let Some(&(id, p0, rows, set)) = snaps.of.iter().find(|o| o.0 == s.id) else {
             return Err(e("qwen35: a rollback needs the last pass's snapshots (a verify pass of 2 ..= drafts + 1 rows, drafts on)"));
         };
-        if id != s.id || p0 + rows != s.pos || keep == 0 || keep >= rows {
+        if p0 + rows != s.pos || keep == 0 || keep >= rows {
             return Err(e(format!("qwen35: a rollback to {keep} of a pass of {rows} rows at {p0} (session {id}); this session is at {}", s.pos)));
         }
+        let layers = snaps.set(set).ok_or_else(|| e("qwen35: a rollback to a snapshot set not made"))?;
         let g = &self.g;
         let (sb, cb) = (g.v_heads * g.state * g.state * 4, (g.conv - 1) * g.conv_dim() * 4);
         let mut li = 0;
         for st in &s.layers {
             if let LState::Linear { s: rs, conv } = st {
-                let (ss, cs) = &snaps.layers[li];
+                let (ss, cs) = &layers[li];
                 rs.copy_within(0, ss, (keep - 1) * sb, sb)?;
                 conv.copy_within(0, cs, (keep - 1) * cb, cb)?;
                 li += 1;
             }
         }
         if let Some(ms) = &s.mtp {
-            ms.pending.copy_within(0, &self.vh, (keep - 1) * g.n_embd * 4, g.n_embd * 4)?;
+            ms.pending.copy_within(0, &self.vh, (set * 8 + keep - 1) * g.n_embd * 4, g.n_embd * 4)?;
         }
-        snaps.of = None;
+        snaps.of.retain(|o| o.0 != id);
         s.pos = p0 + keep;
         s.last_rows = keep;
         Ok(())
@@ -1597,18 +1690,287 @@ impl<'g> Qwen35<'g> {
         self.drafts + 1
     }
 
+    /// A token each for several conversations: one pass over all their rows (8 at a time)
     pub fn forward_batch(&self, sessions: &mut [&mut Session], tokens: &[u32], tap: Tap) -> Result<Vec<Vec<f32>>> {
+        let _w = self.work.lock().unwrap();
         let mut out = Vec::with_capacity(tokens.len());
-        for (s, t) in sessions.iter_mut().zip(tokens) {
-            out.push(self.pass(s, &[*t], 1, &mut *tap)?.pop().unwrap_or_default());
+        for (ss, ts) in sessions.chunks_mut(8).zip(tokens.chunks(8)) {
+            let rows: Vec<Vec<u32>> = ts.iter().map(|t| vec![*t]).collect();
+            for mut l in self.pass_batch(ss, &rows, &mut *tap)? {
+                out.push(l.pop().unwrap_or_default());
+            }
         }
         Ok(out)
+    }
+
+    /// Whether a batch step can keep a second conversation's verify snapshots: the second set made now (the cards'
+    /// free memory checked first, 1.5 GiB kept), or false (the step then runs the conversations one after another)
+    fn second_set(&self) -> Result<bool> {
+        let mut snaps = self.snaps.lock().unwrap();
+        if snaps.second.is_some() || snaps.layers.is_empty() {
+            return Ok(true);
+        }
+        let g = &self.g;
+        let (sb, cb) = (self.drafts * g.v_heads * g.state * g.state * 4, self.drafts * (g.conv - 1) * g.conv_dim() * 4);
+        for (i, d) in self.devs.iter().enumerate() {
+            let n = (0..g.layers).filter(|l| !g.full(*l) && self.layer_dev[*l] == i).count();
+            let (total, free) = d.gpu.memory()?;
+            if (n * (sb + cb)) as u64 + (1536 << 20) > free.unwrap_or(total) {
+                return Ok(false);
+            }
+        }
+        let mut v = Vec::with_capacity(snaps.layers.len());
+        for l in (0..g.layers).filter(|l| !g.full(*l)) {
+            let gpu = &self.devs[self.layer_dev[l]].gpu;
+            v.push((DevBuf::f32(gpu, sb / 4)?, DevBuf::f32(gpu, cb / 4)?));
+        }
+        snaps.second = Some(v);
+        Ok(true)
+    }
+
+    /// Whether `step_many` steps conversations together (else one after another)
+    pub fn steps_together(&self) -> bool {
+        true
+    }
+
+    /// The next committed token(s) of several conversations, as `step` gives each alone: their verify rows ([token,
+    /// drafts]) in one pass - the products read the weights once for all of them, the attention, recurrence and caches
+    /// each its own - then each one's drafts. Two at a time with drafts (the snapshot sets), any number without
+    pub fn step_many(&self, ss: &mut [&mut Session], ds: &mut [&mut Decoder], smps: &mut [&mut dyn Sampler], tap: Tap) -> Result<Vec<Vec<u32>>> {
+        let _w = self.work.lock().unwrap();
+        let n = ss.len();
+        let drafting: Vec<bool> = (0..n).map(|i| ds[i].mtp && self.drafts > 0 && ss[i].mtp.is_some()).collect();
+        let together = n <= 2 || !drafting.iter().any(|d| *d);
+        if !together || (drafting.iter().any(|d| *d) && n == 2 && !self.second_set()?) {
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                out.push(self.step_in(ss[i], ds[i], smps[i], &mut *tap)?);
+            }
+            return Ok(out);
+        }
+        let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut fed: Vec<usize> = Vec::new();
+        let mut rows: Vec<Vec<u32>> = Vec::new();
+        for i in 0..n {
+            match (ds[i].logits.take(), ds[i].next.take()) {
+                (Some(l), _) => out[i] = vec![smps[i].sample(&l)],
+                (None, Some(x)) => {
+                    let mut r = vec![x];
+                    if drafting[i] {
+                        r.extend(ds[i].drafts.iter().take(ss[i].max_ctx.saturating_sub(ss[i].pos + 1)));
+                    }
+                    ds[i].drafts.clear();
+                    fed.push(i);
+                    rows.push(r);
+                }
+                (None, None) => return Err(e("a decoder with nothing to draw from")),
+            }
+        }
+        if !fed.is_empty() {
+            let logits = {
+                let mut sel: Vec<&mut Session> = ss.iter_mut().enumerate().filter(|(i, _)| fed.contains(i)).map(|(_, s)| &mut **s).collect();
+                self.pass_batch(&mut sel, &rows, &mut *tap)?
+            };
+            for ((&i, r), ls) in fed.iter().zip(&rows).zip(logits) {
+                let mut o = Vec::with_capacity(r.len());
+                for (j, l) in ls.iter().enumerate() {
+                    let y = smps[i].sample(l);
+                    o.push(y);
+                    if j + 1 < r.len() {
+                        ds[i].drafted += 1;
+                        if y == r[j + 1] {
+                            ds[i].accepted += 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if o.len() < r.len() {
+                    self.rollback_in(ss[i], o.len())?;
+                }
+                out[i] = o;
+            }
+        }
+        let mut tails = Vec::with_capacity(n);
+        for i in 0..n {
+            let tail = *out[i].last().ok_or_else(|| e("a step without a token"))?;
+            ds[i].next = Some(tail);
+            tails.push(tail);
+        }
+        // the drafts: one pass a draft step for all that draft
+        let who: Vec<usize> = (0..n).filter(|i| drafting[*i]).collect();
+        if !who.is_empty() {
+            let sel: Vec<&Session> = who.iter().map(|i| &*ss[*i]).collect();
+            let tl: Vec<u32> = who.iter().map(|i| tails[*i]).collect();
+            for (i, d) in who.iter().zip(self.draft_many(&sel, &tl)?) {
+                ds[*i].drafts = d;
+            }
+        }
+        Ok(out)
+    }
+
+    /// One decode pass over several conversations' rows (`rows[i]` the next of `ss[i]`: a token, or a verify pass's
+    /// [token, drafts]; 8 rows in all at most): each one's logits for each of its rows. The products run once over all
+    /// rows; each conversation's positions, attention, recurrence and caches are its own, as its own pass would make
+    /// them (the same tokens as alone). Verify rows keep snapshots for a rollback (two conversations at most: a set
+    /// each); the draft block runs behind each.
+    fn pass_batch(&self, ss: &mut [&mut Session], rows: &[Vec<u32>], tap: Tap) -> Result<Vec<Vec<Vec<f32>>>> {
+        let g = &self.g;
+        let ne = g.n_embd;
+        let t: usize = rows.iter().map(|r| r.len()).sum();
+        if t == 0 || t > 8 || rows.len() != ss.len() || rows.iter().any(|r| r.is_empty()) {
+            return Err(e(format!("qwen35: a batch pass of {t} rows over {} conversations (1 to 8 rows, each at least one)", ss.len())));
+        }
+        for (s, r) in ss.iter().zip(rows) {
+            if s.pos + r.len() > s.max_ctx {
+                return Err(e(format!("the context is full ({} of {})", s.pos + r.len(), s.max_ctx)));
+            }
+            if r.iter().any(|x| crate::vision::is_image(*x)) {
+                return Err(e("qwen35: a picture's span in a batch pass"));
+            }
+        }
+        let r0s: Vec<usize> = rows.iter().scan(0, |a, r| {
+            let v = *a;
+            *a += r.len();
+            Some(v)
+        }).collect();
+        for d in &self.devs {
+            d.arena.reset();
+        }
+        self.on(0);
+        let mut snaps = self.snaps.lock().unwrap();
+        snaps.of.clear();
+        // which conversations keep snapshots, in which set
+        let mut sets: Vec<Option<usize>> = Vec::with_capacity(rows.len());
+        let mut next_set = 0;
+        for r in rows {
+            if (2..=self.drafts + 1).contains(&r.len()) && !snaps.layers.is_empty() {
+                if snaps.set(next_set).is_none() {
+                    return Err(e("qwen35: verify rows of more conversations than snapshot sets"));
+                }
+                sets.push(Some(next_set));
+                next_set += 1;
+            } else {
+                sets.push(None);
+            }
+        }
+        let tokens: Vec<u32> = rows.iter().flatten().copied().collect();
+        self.phase("embed");
+        let mut x = self.embed(&tokens)?;
+        let mut h = self.arena().f32(t * ne)?;
+        let mut ffn_g = self.arena().f32(t * g.n_ff)?;
+        let mut ffn_u = self.arena().f32(t * g.n_ff)?;
+        let mut ffn = self.arena().f32(t * ne)?;
+        let mut li = 0;
+        for (l, ly) in self.layers.iter().enumerate() {
+            if self.layer_dev[l] != self.cur.load(std::sync::atomic::Ordering::Relaxed) {
+                self.phase("GPU to GPU");
+                x = self.hop(&x, self.layer_dev[l])?;
+                h = self.arena().f32(t * ne)?;
+                ffn_g = self.arena().f32(t * g.n_ff)?;
+                ffn_u = self.arena().f32(t * g.n_ff)?;
+                ffn = self.arena().f32(t * ne)?;
+            }
+            let mark = self.arena().mark();
+            self.phase(if ly.full.is_some() { "attention" } else { "deltanet" });
+            let hq8 = self.norm(&x, &ly.attn_norm, &h, t, ne)?;
+            let out = match (&ly.full, &ly.linear) {
+                (Some(a), _) => {
+                    let mut segs = Vec::with_capacity(ss.len());
+                    for (i, s) in ss.iter().enumerate() {
+                        let LState::Full { k, v } = &s.layers[l] else { return Err(e(format!("layer {l}: its state and its weights disagree"))) };
+                        segs.push(FullSeg { r0: r0s[i], t: rows[i].len(), p0: s.pos, rope: Rope::From(s.pos - s.shift), cap: s.max_ctx, k, v });
+                    }
+                    self.full(a, &segs, &h, hq8.as_ref(), t)?
+                }
+                (_, Some(a)) => {
+                    let mut segs = Vec::with_capacity(ss.len());
+                    for (i, s) in ss.iter().enumerate() {
+                        let LState::Linear { s: rs, conv } = &s.layers[l] else { return Err(e(format!("layer {l}: its state and its weights disagree"))) };
+                        let snap = match sets[i] {
+                            Some(k) => snaps.set(k).map(|v| (v[li].0.fp(), v[li].1.fp())),
+                            None => None,
+                        };
+                        segs.push(LinSeg { r0: r0s[i], t: rows[i].len(), s: rs, conv, snap });
+                    }
+                    li += 1;
+                    self.linear(a, &segs, &h, hq8.as_ref(), t)?
+                }
+                _ => return Err(e(format!("layer {l}: no weights"))),
+            };
+            self.add(&x, &out, t * ne)?;
+            self.phase("ffn");
+            let hq8 = self.norm(&x, &ly.post_norm, &h, t, ne)?;
+            self.matmul("gate", &ly.gate, &h, hq8.as_ref(), t, &ffn_g)?;
+            self.matmul("up", &ly.up, &h, hq8.as_ref(), t, &ffn_u)?;
+            let nf = t * g.n_ff;
+            // SAFETY: n floats each.
+            self.op("swiglu", String::new, 12 * nf, 6 * nf,
+                    || unsafe { (self.k.swiglu_clamp)(self.raw(), ffn_g.fp(), ffn_u.fp(), ffn_g.fp(), nf as i64, f32::INFINITY) })?;
+            self.matmul("down", &ly.down, &ffn_g, None, t, &ffn)?;
+            self.add(&x, &ffn, t * ne)?;
+            tap(&format!("l_out-{l}"), &x)?;
+            self.arena().rewind(mark);
+        }
+        let p0s: Vec<usize> = ss.iter().map(|s| s.pos).collect();
+        let rope0: Vec<usize> = ss.iter().map(|s| s.pos - s.shift).collect();
+        for (i, s) in ss.iter_mut().enumerate() {
+            if let Some(k) = sets[i] {
+                snaps.of.push((s.id, s.pos, rows[i].len(), k));
+            }
+            s.pos += rows[i].len();
+            s.last_rows = rows[i].len();
+        }
+        drop(snaps);
+        self.phase("head");
+        let all = self.arena().f32(t * ne)?;
+        let q = self.norm(&x, &self.output_norm, &all, t, ne)?;
+        tap("result_norm", &all)?;
+        if let (Some(m), true) = (&self.mtp, ss.iter().all(|s| s.mtp.is_some())) {
+            self.phase("mtp");
+            // the rows kept for a rollback (each set's); the draft block over all the rows in one pass: a conversation's
+            // row j pairs its token j with the hidden state before it (its pending one, then this pass's)
+            let hs = self.arena().f32(t * ne)?;
+            let mut segs = Vec::with_capacity(ss.len());
+            for (i, s) in ss.iter().enumerate() {
+                let ms = s.mtp.as_ref().ok_or_else(|| e("a session without the draft block's state"))?;
+                let (r0, n) = (r0s[i], rows[i].len());
+                if let Some(k) = sets[i] {
+                    self.vh.copy_within(k * 8 * ne * 4, &all, r0 * ne * 4, n.min(8) * ne * 4)?;
+                }
+                hs.copy_within(r0 * ne * 4, &ms.pending, 0, ne * 4)?;
+                if n > 1 {
+                    hs.copy_within((r0 + 1) * ne * 4, &all, r0 * ne * 4, (n - 1) * ne * 4)?;
+                }
+                segs.push(FullSeg { r0, t: n, p0: p0s[i], rope: Rope::From(rope0[i]), cap: s.max_ctx, k: &ms.k, v: &ms.v });
+            }
+            self.mtp_block(m, &segs, &tokens, &hs)?;
+            for (i, s) in ss.iter().enumerate() {
+                if let Some(ms) = s.mtp.as_ref() {
+                    ms.pending.copy_within(0, &all, (r0s[i] + rows[i].len() - 1) * ne * 4, ne * 4)?;
+                }
+            }
+            self.phase("head");
+        }
+        let logits = self.arena().f32(t * self.output.rows)?;
+        self.matmul("output", &self.output, &all, q.as_ref(), t, &logits)?;
+        let lv = logits.to_f32()?;
+        if let Some(p) = &self.probe {
+            p.settle(t)?;
+        }
+        let per: Vec<Vec<f32>> = lv.chunks(self.output.rows).map(|c| c.to_vec()).collect();
+        Ok(rows.iter().zip(&r0s).map(|(r, &r0)| per[r0..r0 + r.len()].to_vec()).collect())
     }
 
     /// The next committed token(s). With drafts: [token, drafts] in one pass, each row's token drawn as plain
     /// sampling would draw it, the drafts kept while they match (what is committed is distributed as without drafts)
     pub fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
         let _w = self.work.lock().unwrap();
+        self.step_in(s, d, smp, tap)
+    }
+
+    /// `step` with the work lock held
+    fn step_in(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
         let drafting = d.mtp && self.drafts > 0 && s.mtp.is_some();
         let out = match (d.logits.take(), d.next.take()) {
             (Some(l), _) => vec![smp.sample(&l)],
