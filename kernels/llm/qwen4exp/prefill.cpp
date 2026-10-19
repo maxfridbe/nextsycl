@@ -388,31 +388,71 @@ int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, i
                 cs->memcpy(p->slot_dev, p->h_slot, (size_t) T * K * 4);
                 cs->memcpy(p->src_dev, p->h_src, (size_t) T * K * 4);
                 P::gather_rows16(p->mixed_h, p->src_dev, p->Xs, T * K, N, cs);
-                // the routed experts in id order, from their VRAM blobs: dequantized to FP16, gate | up, SwiGLU, down
+                // the routed experts in id order, from their VRAM blobs (a host-mirrored one copied into a staging slot first,
+                // one copy at PCIe speed)
                 const SK::NativeExpertLayout EL = SK::native_expert_layout(v.gu_type, v.d_type, N, NFF);
-                size_t j = 0;
-                for (int32_t e = 0; e < w->ne; ++e) {
-                    const int32_t ne = p->cnt[(size_t) e];
-                    if (ne == 0) continue;
+                if (EL.bytes > (4u << 20)) return ns_fail("qwen: an expert blob past the staging slot");
+                auto blob_of = [&](int32_t e, int q, const uint8_t*& blob) -> bool {
                     const int32_t slot = w->h_res[(size_t) l * w->ne + e];
-                    const int q = (int) (j++ % DQ);
-                    const uint8_t* blob = nullptr;
-                    if (slot >= 0) {
-                        blob = w->cache_base + w->h_slot_off[(size_t) slot];
-                    } else {
-                        // in the host mirror: its blob into VRAM first (one copy at PCIe speed), then dequantized
-                        const uint64_t at = w->h_mirror.empty() ? 0 : w->h_mirror[(size_t) l * w->ne + e];
-                        if (at == 0) return ns_fail("qwen: an expert neither in VRAM nor in the host mirror");
-                        if (EL.bytes > (4u << 20)) return ns_fail("qwen: an expert blob past the staging slot");
-                        cs->memcpy(p->blob_stage[q], (const void*) at, EL.bytes);
-                        blob = p->blob_stage[q];
-                    }
+                    if (slot >= 0) { blob = w->cache_base + w->h_slot_off[(size_t) slot]; return true; }
+                    const uint64_t at = w->h_mirror.empty() ? 0 : w->h_mirror[(size_t) l * w->ne + e];
+                    if (at == 0) return false;
+                    cs->memcpy(p->blob_stage[q], (const void*) at, EL.bytes);
+                    blob = p->blob_stage[q];
+                    return true;
+                };
+                // dequantized to FP16, gate | up, SwiGLU, down (oneMKL)
+                auto fp16_expert = [&](int32_t e, const uint8_t* blob, int q) {
+                    const int32_t ne = p->cnt[(size_t) e];
                     SK::iq_dequant_gu_f16(v.gu_type, blob, blob + EL.up_off, NFF, N, p->dq_gu[q], cs);
                     SK::iq_dequant_f16(v.d_type, blob + EL.down_off, N * NFF, p->dq_d[q], cs);
                     const int64_t o0 = p->off[(size_t) e];
                     gm.f16(p->Xs + o0 * N, p->dq_gu[q], p->GU + o0 * 1280, ne, 1280, N);
                     P::swiglu_interleaved(p->GU + o0 * 1280, p->Hh + o0 * 640, ne, cs);
                     gm.f16(p->Hh + o0 * 640, p->dq_d[q], p->Dm + o0 * N, ne, N, 640);
+                };
+                if (w->i8_group != nullptr && w->i8_supported(v.gu_type, v.d_type, N, NFF) == 1) {
+                    // the silo's int8 DPAS products (silo/i8moe.cpp): groups of up to 16 experts with rows, in id order (their rows
+                    // are back to back in Xs), one launch per product; a group closes when the staging slots are taken. A group
+                    // with more rows per expert than i8_rows_max takes the FP16 GEMMs (faster there)
+                    int32_t ge[16], gc[16];
+                    const uint8_t* gb[16];
+                    int gn = 0, staged = 0;
+                    int64_t rows = 0;
+                    auto flush = [&]() -> int {
+                        if (gn == 0) return 0;
+                        if (w->i8_rows_max > 0 && rows >= (int64_t) w->i8_rows_max * gn) {
+                            for (int i = 0; i < gn; ++i) fp16_expert(ge[i], gb[i], i % DQ);
+                        } else {
+                            const int64_t o0 = p->off[(size_t) ge[0]];
+                            const int rc = w->i8_group((void*) cs, v.gu_type, v.d_type, gb, EL.up_off, EL.down_off, gc, gn,
+                                                       p->Xs + o0 * N, N, NFF, p->GU + o0 * 1280, p->Dm + o0 * N);
+                            if (rc != 0) return ns_fail("qwen: the silo's int8 experts refused a group");
+                        }
+                        gn = 0; staged = 0; rows = 0;
+                        return 0;
+                    };
+                    for (int32_t e = 0; e < w->ne; ++e) {
+                        const int32_t ne = p->cnt[(size_t) e];
+                        if (ne == 0) continue;
+                        const bool mirrored = w->h_res[(size_t) l * w->ne + e] < 0;
+                        if (gn == 16 || (mirrored && staged == DQ)) { if (flush() != 0) return -1; }
+                        const uint8_t* blob = nullptr;
+                        if (!blob_of(e, staged, blob)) return ns_fail("qwen: an expert neither in VRAM nor in the host mirror");
+                        if (mirrored) ++staged;
+                        ge[gn] = e; gc[gn] = ne; gb[gn] = blob; ++gn;
+                        rows += ne;
+                    }
+                    if (flush() != 0) return -1;
+                } else {
+                    size_t j = 0;
+                    for (int32_t e = 0; e < w->ne; ++e) {
+                        if (p->cnt[(size_t) e] == 0) continue;
+                        const int q = (int) (j++ % DQ);
+                        const uint8_t* blob = nullptr;
+                        if (!blob_of(e, q, blob)) return ns_fail("qwen: an expert neither in VRAM nor in the host mirror");
+                        fp16_expert(e, blob, q);
+                    }
                 }
                 P::moe_combine(p->Dm, p->slot_dev, p->wts, p->shared, p->sg, p->bo, T, cs);
             }

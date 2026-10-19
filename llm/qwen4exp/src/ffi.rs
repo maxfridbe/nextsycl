@@ -132,6 +132,8 @@ pub struct Api {
     pub mtp_draft: unsafe extern "C" fn(Stage, State, *const i32, i64, c_int, c_int, f32, *mut i32, *mut f32, *mut c_int) -> c_int,
     /// Strata's grouped expert kernels take these gate/up and down formats (glm.h's ns_moe_grouped_supported)
     pub moe_grouped_supported: unsafe extern "C" fn(c_int, c_int, i64, i64) -> c_int,
+    /// the silo's kernels handed to a stage (qwen.h's ns_qw_set_silo)
+    pub set_silo: unsafe extern "C" fn(Stage, *mut c_void, *mut c_void, *mut c_void, c_int) -> c_int,
 }
 
 // SAFETY: plain function pointers into the library, which stays loaded.
@@ -179,9 +181,50 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             mtp_prefill: sym!("ns_qw_mtp_prefill"),
             mtp_draft: sym!("ns_qw_mtp_draft"),
             moe_grouped_supported: sym!("ns_moe_grouped_supported"),
+            set_silo: sym!("ns_qw_set_silo"),
         })
     })
     .as_ref()
+    .map_err(|e| nextsycl_core::Error(e.clone()))
+}
+
+/// The silo's kernels (kernels/llm/qwen4exp/silo/silo.h, dist/silo/libnextsycl-qwen4exp.so), when it is there: raw
+/// addresses, handed to the glue (ns_qw_set_silo), which calls them
+pub struct Silo {
+    pub path: std::path::PathBuf,
+    pub i8_available: *mut c_void,
+    pub i8_supported: *mut c_void,
+    pub i8_group: *mut c_void,
+}
+
+// SAFETY: addresses of functions in a library that stays loaded.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+/// The silo's library, named after the engine's directory
+pub const SILO: &str = "qwen4exp";
+
+/// The silo (None: the shared kernels for everything)
+pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
+    static S: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    S.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo(SILO).map_err(|e| e.0)? else { return Ok(None) };
+        let sym = |name: &str| -> std::result::Result<*mut c_void, String> {
+            let p = lib.symbol(name);
+            if p.is_null() {
+                return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), name));
+            }
+            Ok(p)
+        };
+        Ok(Some(Silo {
+            path: lib.path.clone(),
+            i8_available: sym("ns_qw_i8_available")?,
+            i8_supported: sym("ns_qw_i8_supported")?,
+            i8_group: sym("ns_qw_i8_group")?,
+        }))
+    })
+    .as_ref()
+    .map(|o| o.as_ref())
     .map_err(|e| nextsycl_core::Error(e.clone()))
 }
 

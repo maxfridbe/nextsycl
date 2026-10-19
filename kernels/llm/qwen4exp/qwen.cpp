@@ -608,6 +608,19 @@ int ns_qw_state_copy(ns_qw* w, ns_qw_state* dst, const ns_qw_state* src, int64_t
 
 // ---- the window
 
+int ns_qw_set_silo(ns_qw* w, void* i8_available, void* i8_supported, void* i8_group, int rows_max) {
+    if (!w) return ns_fail("qwen: no stage");
+    w->i8_supported = nullptr;
+    w->i8_group = nullptr;
+    auto avail = reinterpret_cast<int (*)(void*)>(i8_available);
+    if (avail && i8_supported && i8_group && avail(w->q) == 1) {
+        w->i8_supported = reinterpret_cast<decltype(w->i8_supported)>(i8_supported);
+        w->i8_group = reinterpret_cast<decltype(w->i8_group)>(i8_group);
+    }
+    w->i8_rows_max = rows_max;
+    return 0;
+}
+
 int ns_qw_set_sampling(ns_qw* w, float temperature, float top_p, int top_k, float min_p, unsigned long long seed) {
     NS_TRY
     w->s_temp = temperature > 0.0f ? temperature : 0.0f;

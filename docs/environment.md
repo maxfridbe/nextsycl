@@ -154,6 +154,9 @@ Qwen3.8-Flash-Next on the Strata kernels (`llm/qwen4exp`, `kernels/llm/qwen4exp`
 | `NS_QW_CVEC_LAYERS` | 1 to the last layer | FIRST,LAST: the layers the control vector steers (--opt-cvec-layers) | llm qwen4exp |
 | `NS_QW_CVEC_MODE` | project | how the control vector applies: project or add (--opt-cvec-mode) | llm qwen4exp |
 | `NS_QW_EAGER` | graphs on | Debug: 1 launches every kernel as it runs, no SYCL graphs (the A/B) | kernels:qwen4exp |
+| `NS_QW_I8` | 1 | 0: the prompt experts dequantized to FP16 and multiplied by oneMKL; else the silo's fused int8 DPAS products where the card runs them (Battlemage; gate/up IQ3_XXS/IQ3_S/IQ2_S, down IQ4_NL/Q2_0) | llm qwen4exp |
+| `NS_QW_I8_ROWS` | 128 | an expert group with this many rows an expert or more takes the FP16 GEMMs (faster there); 0 = int8 always | llm qwen4exp |
+| `NS_QW_I8_DBG`, `NS_QW_I8_MT`, `NS_QW_I8_WG`, `NS_QW_I8_GRF`, `NS_QW_I8_FORCE` | off / auto | the int8 kernels' bring-up switches (Strata's STRATA_I8_*): debug skips, rows a thread, work-group kernels, the register mode, FORCE=0 off | kernels:qwen4exp silo |
 | `NS_QW_EXPERT_PROFILE` | layer order | expert profile file ranking which experts fill VRAM first when not all fit (--opt-expert-profile) | llm qwen4exp |
 | `NS_QW_MTP` | no drafts | the MTP draft layer: Strata's runtime directory (--opt-mtp) | llm qwen4exp |
 | `NS_QW_PLE_PREFETCH` | 1 | 0: a window's per-layer embedding rows read one after another, not asked for together first (fadvise WILLNEED) (--opt-ple-prefetch) | llm qwen4exp |

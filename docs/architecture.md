@@ -188,6 +188,11 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   `NS_QW_CVEC=<file.gguf>:<scale>`, `NS_QW_CVEC_LAYERS=4,44`, `NS_QW_CVEC_MODE=project|add`,
   `NS_QW_CVEC_DIR=per-layer`. The Coder has 256 experts (the kernels take the count from the file); Swift's router is
   F32 in the file and is converted to BF16 at load (exact).
+  Its silo (`kernels/llm/qwen4exp/silo/`, handed to the glue by `ns_qw_set_silo`): the prompt experts as fused int8 DPAS
+  products (Strata 0.2.0's ESIMD kernels, `i8moe.cpp`): weights decoded in registers into the s8 operand, no FP16 copy
+  of an expert; groups of up to 16 experts a launch, the FP16 path past `NS_QW_I8_ROWS` rows an expert. B70: a 2K prompt
+  +40% (Coder) / +20-28% (IQ2_XS), 8K +8-10%, 40K +4-5%; B65 2K +49%; greedy text identical for the first 190-500
+  characters and at 8K on IQ2_XS.
 - **qwen35** - dense Qwen3.5 / Qwen3.8 (Qwen3.8-27B): gated DeltaNet (glm5next's conv, L2 norm and delta-rule scan)
   and gated full attention (its own, `kernels/llm/qwen35/q35.cpp`), a dense SwiGLU; the weights in their GGUF blocks.
   The first engine with a **silo** (`kernels/llm/qwen35/silo/`): its decode products for the types its files hold

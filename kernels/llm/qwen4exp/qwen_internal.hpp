@@ -154,6 +154,11 @@ struct ns_qw {
     struct Mtp* mtp = nullptr;
     // a control vector (cvec.cpp), on every stage
     struct Cv* cv = nullptr;
+    // the silo's int8 prompt experts (ns_qw_set_silo; null: the FP16 path)
+    int (*i8_supported)(int, int, int64_t, int64_t) = nullptr;
+    int (*i8_group)(void*, int, int, const uint8_t* const*, uint64_t, uint64_t, const int32_t*, int, const uint16_t*, int64_t,
+                    int64_t, float*, float*) = nullptr;
+    int i8_rows_max = 0;
     // a sampled request (ns_qw_set_sampling; the last stage): the window's rows drawn on the GPU, Philox(seed,
     // position), and the drafts coupled to those draws; temperature 0 = greedy (argmax)
     float s_temp = 0.0f, s_top_p = 1.0f, s_min_p = 0.0f;

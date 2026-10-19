@@ -132,6 +132,11 @@ int ns_qw_prefill_buffers(ns_qw* w, int64_t chunk, float** R);
 /* T tokens at pos0.. (committed: the state advances); ple_rows (host, T x 2560) for the stage with layer 1 */
 int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, int64_t pos0, const float* ple_rows);
 
+/* the engine's silo (kernels/llm/qwen4exp/silo/silo.h), bound by the engine at load: the prompt experts' int8 kernels
+ * (ns_qw_i8_available / _supported / _group; any null: the dequantize + oneMKL path); rows_max: the int8 kernels take an
+ * expert group while its mean rows per expert are under it (above it the FP16 GEMMs are faster; 0: always) */
+int ns_qw_set_silo(ns_qw* w, void* i8_available, void* i8_supported, void* i8_group, int rows_max);
+
 /* a control vector (cvec.cpp; Strata's --control-vector-scaled): dir n_layer x 2560 (project: unit directions;
  * add: the offsets), s n_layer (project: the scale, add: 1; 0 = layer not steered), mode 0 project / 1 add. Set
  * before any session (its graphs hold where it applies); enable switches it per request (on after set) */

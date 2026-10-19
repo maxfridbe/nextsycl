@@ -856,6 +856,17 @@ impl<'g> Qwen<'g> {
         let (mut hi, mut ho, mut hf) = (std::ptr::null_mut(), std::ptr::null_mut(), 0usize);
         // SAFETY: out-pointers to locals.
         ffi::check(unsafe { (api.buffers)(raw, &mut hi, &mut ho, &mut hf) }, "the stage's hand-off")?;
+        // the silo's int8 prompt experts (NS_QW_I8=0: the FP16 GEMMs; NS_QW_I8_ROWS: the mean rows per expert from which a
+        // group takes the FP16 GEMMs, 128 - Strata's crossover on a B70 sits at 60-230 by format; 0 = never)
+        if std::env::var("NS_QW_I8").map_or(true, |v| v != "0") {
+            if let Some(s) = ffi::silo()? {
+                let rows = std::env::var("NS_QW_I8_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+                // SAFETY: a live stage; the silo's functions have the signatures qwen.h names.
+                ffi::check(unsafe { (api.set_silo)(raw, s.i8_available, s.i8_supported, s.i8_group, rows) }, "the silo")?;
+                log(format!("{}: prompt experts on the silo's int8 kernels where the card runs them ({}, up to {rows} rows an expert)",
+                            gpu.name, s.path.display()));
+            }
+        }
         let (total, free) = gpu.memory()?;
         log(format!("{}: layers {lb}-{} ({:.2} GiB dense, {:.2} GiB experts{}) in {:.1} s; {:.1} of {:.1} GiB free", gpu.name, le - 1,
                     gib(weight_bytes), gib(expert_bytes),
