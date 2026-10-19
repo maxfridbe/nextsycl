@@ -1262,13 +1262,19 @@ the mesh.
 - Tencent's turbo example samples 512 latent tokens (its turbo decoder's `latent_shape`); the DiT is trained at
   3,072, which keeps detail 512 loses: 3,072 is the default (`--opt-tokens 512` for the example's).
 
-Speed (`model3d gen`, the penguin of Tencent's demo, seed 7, 2026-10-16; mesh to 40,000 triangles):
+Speed (`model3d gen`, the penguin of Tencent's demo, seed 7, 2026-10-19; mesh to 40,000 triangles; the silo, flash
+self-attention, the unconditional cross-attention as its bias and the grid passes on every core; before them in
+brackets):
 
-| model | B70 | B65 | phases on the B70 | VRAM peak |
-|---|---|---|---|---|
-| 2mini-turbo (5 steps, 380^3) | 4.2 s | 5.3 s | picture 0.8, shape 1.1, decode 1.8, mesh 0.5 | 5.1 GiB |
-| 2.1 shape (50 steps, CFG 5, 384^3) | 26.4 s | 40.8 s | picture 0.6, shape 22.1 (0.2 s a pass), decode 3.2, mesh 0.5 | 9.7 GiB |
-| 2.1 textured | 48.2 s | 75.0 s | shape as above, views 0.2, 15 steps 19.7 (1.3 s a step), decode 1.2, bake 0.7 | 16.9 GiB (B65) |
+| model | B70 | B65 | VRAM peak (B70, the card) |
+|---|---|---|---|
+| 2mini-turbo (5 steps, 380^3) | 2.1 s (4.1) | 2.9 s (5.4) | 5.9 GiB |
+| 2.1 shape (50 steps, CFG 5, 384^3) | 21.4 s (26.6) | 31.6 s (39.0) | 15.4 GiB |
+| 2.1 textured | 36.4 s (48.5) | 52.7 s (70.3) | 20.3 GiB (16.5 before) |
+
+`--opt-int8` (`NS_M3D_HY_INT8=1`) runs 2.1's DiT blocks in int8: faster steps, approximate (docs/environment.md). The checks above hold with the tuning (2mini's five steps 1.45e-2, 2.1's
+guided steps 2.0e-3 - 1.3e-2, the paint's views 1.5e-4 and bake as before).
+
 ## 3D: rigging and animation
 
 `nextsycl model3d rig MESH.glb|.obj --model ID` takes a mesh and returns it as GLB with what the model adds: a
