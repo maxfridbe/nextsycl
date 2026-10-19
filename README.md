@@ -102,7 +102,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 
 | id | model | engine | size | status |
 |---|---|---|---|---|
-| `glm-5.3-flash-uncensored`, `-128k`, `-256k` | GLM-5.3-Flash uncensored IQ2, 64K / 128K / 256K context | `glm5next` | 89.9 GiB | checked (llama.cpp), served on both cards |
+| `glm-5.3-flash-uncensored`, `-128k`, `-256k` | GLM-5.3-Flash uncensored IQ2, 64K / 128K / 256K context, tool calls (its `<tool_call>` form) | `glm5next` | 89.9 GiB | checked (llama.cpp), served on both cards |
 | `deepseek-r1-iq1s` | DeepSeek-R1 671B UD-IQ1_S, 32K: experts in VRAM, pinned RAM (on the CPU) and the NVMe | `deepseek2` | 130.6 GiB | checked (llama.cpp), served on both cards |
 | `deepseek-v4-flash-iq2m`, `-256k` | DeepSeek-V4-Flash 284B UD-IQ2_M, 128K / 256K + 32K: sliding window + compressed attention (CSA / HCA, the lightning indexer), mHC, experts in VRAM and pinned RAM, MTP drafts (the original checkpoint's draft block, converted after the pull); a needle found at 35K, 140K, 261K and 1,071,766 tokens | `deepseek4` | 88.3 GiB | checked (llama.cpp), served on both cards |
 | `deepseek-v4.1-flash-vq` | DeepSeek-V4.1-Flash-1017 VQ, 128K: V4's attention with the indexer at ratio 1/2 and shared compressed keys, mHC, the Engram (n-gram rows from DeepSeek's tables on disk), VQ experts on XMX from their indices, the DSpark draft towers (off by default), pictures through the vision sidecar (ViT + aligner); docs/ports/deepseek41.md | `deepseek41` | 105.8 GiB + 203 GB Engram | checked (CPU reference), served on both cards |
@@ -113,8 +113,8 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `qwen3.8-flash-next-iq2_xs-uncensored` | the same with the refusal projection (a control vector) | `qwen4exp` | 63.4 GiB | served |
 | `qwen3.8-flash-next-coder-iq1_m`, `-uncensored` | Qwen3.8-Flash-Next Coder IQ1_M | `qwen4exp` | 54.4 GiB | served |
 | `swift-1.5-iq2_xs` | Swift 1.5 IQ2_XS (short thinking) | `qwen4exp` | 63.5 GiB | served |
-| `qwen3.8-27b-q8` | Qwen3.8-27B Q8_0 (dense: gated DeltaNet + gated full attention), 32K, MTP drafts | `qwen35` | 28.4 GiB | checked (llama.cpp), served (verify passes exact) |
-| `qwen3.8-27b-q4` | Qwen3.8-27B UD-Q4_K_M, 128K + 32K, MTP drafts | `qwen35` | 16.6 GiB | checked (llama.cpp), served (verify passes exact) |
+| `qwen3.8-27b-q8` | Qwen3.8-27B Q8_0 (dense: gated DeltaNet + gated full attention), 32K, MTP drafts, pictures (its mmproj) | `qwen35` | 28.4 GiB | checked (llama.cpp), served (verify passes exact) |
+| `qwen3.8-27b-q4` | Qwen3.8-27B UD-Q4_K_M, 128K + 32K, MTP drafts, pictures (its mmproj) | `qwen35` | 16.6 GiB | checked (llama.cpp), served (verify passes exact) |
 | `qwen3.8-27b-q3` | Qwen3.8-27B UD-Q3_K_XL, 128K + 32K, MTP drafts | `qwen35` | 13.5 GiB | served |
 | `qwen3.8-27b-q8-256k` | Qwen3.8-27B Q8_0 on both GPUs, 256K + 32K, MTP drafts | `qwen35` | 28.4 GiB | served (verify passes exact) |
 | `qwen3.8-27b-q4-256k` | Qwen3.8-27B UD-Q4_K_M on both GPUs, 256K + 32K, MTP drafts | `qwen35` | 16.6 GiB | served (verify passes exact) |
@@ -1188,7 +1188,14 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   products their Q8_1 blocks; prompt chunks of 2,048 when they fit. `NS_PROFILE=gpu NS_Q35_PROFILE=1` times every
   kernel on the device against the card's ceilings. Sessions check their cache against the free VRAM before
   allocating (1.5 GiB spare).
-- Not yet: pictures (the vision tower: `mmproj`).
+- **Pictures:** the model's `mmproj-F16.gguf` (Qwen3-VL's ViT + merger; the cards' vision file, found beside the
+  model, or `NS_Q35_VISION`) reads pictures in chat - OpenAI `image_url` data URLs, Anthropic base64 parts, `/api/chat`
+  `images` - and `llm generate --image`. A picture is up to 4,096 prompt positions (`NS_Q35_IMAGE_TOKENS`), ~0.6 s to
+  see on the B70; its rotary positions are Qwen3-VL's (row and column), and the prompt cache holds across turns with
+  pictures. Against llama.cpp's mtmd on the same file: the picture's rows cos 0.999998, the prompt's last logits as
+  close as text alone (0.989 on Q4 against the CPU), the same greedy answer.
+- **Two requests at once** decode together: each one's verify rows and drafts in the same passes (the same tokens as
+  alone). Q4, 256-token answers: B70 one 47 tok/s, two 29 + 29; both cards (256K) one 44, two 26 + 26.
 
 ### Nemotron 3.5 Super (hybrid Mamba-2 / latent MoE)
 
