@@ -43,7 +43,7 @@ for a chat model. Measured speeds, decode / prompt reading:
 | `muse-glimmer-30b-q8-b70`, `-b65` | the same on one card alone, without the drafter (it does not fit beside the model) | 18.7 (B70) / 16.9 (B65) tok/s, 128K |
 | `muse-glimmer-30b-q4`, `-q6` | **Muse Glimmer 30B** Q4_K_M / Q6_K on the B70 alone, with its drafter | 43 / 35 tok/s (25.4 / 20 without drafts) / ~1,400 tok/s, 128K |
 | `qwen-image-2.1-q8` | **Qwen-Image 2.1** text to image, edits | 1024x1024, 40 steps: 23.8 s (16.5 s int8) |
-| `hunyuanimage-2.1-distilled-q8` | **HunyuanImage 2.1** text to image at 2K (quoted text spelled by its glyph encoder) | 2048x2048, 8 steps: 10.4 s; 1024x1024: 3.9 s |
+| `hunyuanimage-2.1-distilled-q8` | **HunyuanImage 2.1** text to image at 2K (quoted text spelled by its glyph encoder) | 2048x2048, 8 steps: 7.8 s; 1024x1024: 2.5 s |
 | `unlimited-ocr-q8`, `-q4` | **Unlimited-OCR** pictures and PDFs to Markdown (tables as HTML, boxes), its own page | a page: ~2-3 s to see, ~130 tok/s written |
 | `paddleocr-vl-1.6` | **PaddleOCR-VL** text, tables (HTML), formulas (LaTeX), charts, seals, spotting; the same OCR page | a page: ~1.2 s to see, ~200-250 tok/s written |
 | `olmocr-2-7b-q8` | **olmOCR-2** whole pages to Markdown (tables HTML, equations LaTeX), turned pages righted; the same OCR page | a page: ~3 s to see, ~55 tok/s written |
@@ -656,8 +656,13 @@ Checked against `reference/hunyuanimage21/ref.py` (the official modules, pinned 
 on the CPU; 512x512, a prompt quoting "HELLO"): text encoder rel 4.9e-4 (cosine 1.000000), byT5 2.6e-7, the token
 refiner 5.9e-7, double block 0 1.2e-4, after the 20 double blocks 3.0e-3, the first velocity 1.5e-3 (base model with
 CFG: 8.5e-4), the latents after 8 distilled steps 2.3e-3 (base, 4 CFG steps: 3.0e-3), the VAE's picture 7.3e-4.
-B70: distilled 2048x2048 1.04 s a step, 10.4 s a picture (VAE 1.65 s); 1024x1024 0.37 s a step, 3.9 s; base 2048x2048
-1.99 s a step (two passes), 101.5 s; 1024x1024 0.62 s a step, 32.1 s. 25.3 GiB on the card at 2048x2048.
+B70 (2026-10-19; before the silo in brackets): distilled 2048x2048 7.8 s a picture (10.3), 1024x1024 2.5 s (3.9);
+base 2048x2048 82.7 s (101.1), 1024x1024 20.2 s (31.8). The silo (kernels/image/hunyuanimage21/silo) reads the
+DiT's Q8_0 matrices as int8 inside oneDNN's product (no half copy first), fuses GELU and the gated residual adds into
+the products, runs guidance's two passes as one batch and the VAE's group norm on 8-half vectors; the checks hold
+(distilled latents 2.5e-3, base 3.4e-3) and the pictures match main's to 55-59 dB PSNR (41 dB at distilled 2048).
+`--opt-int8` (`NS_HI_INT8=1`) also multiplies in int8 x int8: distilled 2.0 s / 5.9 s, base 14.4 s / 59.2 s, approximate
+(the same picture, other details: 24.7-39 dB against the exact one). 25.4 GiB on the card at 2048x2048.
 
 `gen` runs the engine in-process (the server path, `image serve | start | ps`, comes next); the PNG keeps the
 prompt, model, seed, size and steps. `check` compares each stage with the dumps of `reference/qwenimage21/ref.py`.
