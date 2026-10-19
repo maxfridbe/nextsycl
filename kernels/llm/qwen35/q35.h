@@ -31,6 +31,16 @@ int ns_q35_vit_bias_act(ns_gpu* g, float* y, const float* b, int64_t rows, int64
 int ns_q35_vit_rope(ns_gpu* g, float* qkv, int64_t n, int64_t H, int64_t D, const float* cs, float* kh);
 /* The heads' outputs ob [H][r][D] as rows out [r][H x D] */
 int ns_q35_vit_heads(ns_gpu* g, const float* ob, int64_t H, int64_t r, int64_t D, float* out);
+/* LogProbChain's attention of one query row q [Hq x D] over the cache's first n keys: each head's softmax weights
+ * (1 / sqrt(D)), per key their mean over the heads (mode 0) or their largest (mode 1), added to out [n]; scratch [Hq][2] */
+int ns_q35_attn_probs(ns_gpu* g, const float* q, const void* kc, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t n, int mode,
+                      float* scratch, float* out);
+/* SYCL graphs: recording what is queued on the GPU's queue from begin (*out: the graph) to end (then finalized; it ran
+ * nothing), launched as one submission, freed */
+int ns_q35_graph_begin(ns_gpu* g, void** out);
+int ns_q35_graph_end(ns_gpu* g, void* h);
+int ns_q35_graph_launch(ns_gpu* g, void* h);
+void ns_q35_graph_free(void* h);
 /* x [rows, n] = softmax(x * scale) a row */
 int ns_q35_softmax_rows(ns_gpu* g, float* x, int64_t rows, int64_t n, float scale);
 /* The cache [Hkv][cap][D] half: rows k [T, Hkv x D] (ks floats apart) and v (vs apart) at positions p0.. */

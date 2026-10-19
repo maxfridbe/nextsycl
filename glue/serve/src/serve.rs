@@ -159,6 +159,8 @@ fn chain_entry(e: &mut Value, att: &[f32], turn: &[(u32, f64)], base: usize, tok
     let lp = e["logprob"].as_f64().unwrap_or(0.0);
     parts.sort_by(|a, b| (b.1 * -b.2).total_cmp(&(a.1 * -a.2)).then(b.1.total_cmp(&a.1)));
     let turn_att: f64 = att.iter().skip(base).map(|x| *x as f64).sum();
+    // OpenAI's entry keeps its logprob; the chained one beside it (and in `chain`, with what it echoes)
+    e["chained_logprob"] = json!(lp + sum);
     e["chain"] = json!({
         "logprob": lp + sum,
         "attention_to_turn": turn_att,

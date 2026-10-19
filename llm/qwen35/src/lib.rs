@@ -182,6 +182,12 @@ impl Engine for engine::Qwen35<'_> {
     fn read_checkpoint(&self, r: &mut dyn std::io::Read) -> std::io::Result<Checkpoint> {
         Ok(Checkpoint::new(engine::Checkpoint::read_from(r)?))
     }
+    fn capture_attention(&self, on: bool) {
+        engine::Qwen35::capture_attention(self, on)
+    }
+    fn take_attention(&self) -> Option<Vec<f32>> {
+        engine::Qwen35::take_attention(self)
+    }
     fn image_marker(&self) -> Option<&str> {
         self.vision.as_ref().map(|v| v.marker.as_str())
     }

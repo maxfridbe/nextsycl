@@ -7,6 +7,7 @@
 
 #include <sycl/sycl.hpp>
 #include <cmath>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 
@@ -288,6 +289,93 @@ int ns_q35_vit_heads(ns_gpu* g, const float* ob, int64_t H, int64_t r, int64_t D
     });
     return 0;
     NS_CATCH
+}
+
+int ns_q35_attn_probs(ns_gpu* g, const float* q, const void* kc, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t n, int mode,
+                      float* scratch, float* out) {
+    NS_TRY
+    if (n <= 0) return 0;
+    if (n > cap || Hq % Hkv) return ns_fail("ns_q35_attn_probs: keys past the cache, or heads that do not share");
+    const half* k = (const half*) kc;
+    const int64_t G = Hq / Hkv;
+    const float scale = 1.0f / sycl::sqrt((float) D);
+    auto score = [=](int64_t h, int64_t j) {
+        const float* qh = q + h * D;
+        const half* kj = k + ((h / G) * cap + j) * D;
+        float s = 0.0f;
+        for (int64_t i = 0; i < D; ++i) s += qh[i] * (float) kj[i];
+        return s * scale;
+    };
+    constexpr int WG = 256;
+    // each head's softmax: its largest score and its sum
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) Hq * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+        const int64_t h = it.get_group(0);
+        float m = -INFINITY;
+        for (int64_t j = it.get_local_id(0); j < n; j += WG) m = sycl::fmax(m, score(h, j));
+        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+        float z = 0.0f;
+        for (int64_t j = it.get_local_id(0); j < n; j += WG) z += sycl::exp(score(h, j) - m);
+        z = sycl::reduce_over_group(it.get_group(), z, sycl::plus<float>());
+        if (it.get_local_id(0) == 0) {
+            scratch[h * 2] = m;
+            scratch[h * 2 + 1] = z;
+        }
+    });
+    // per key: the heads' weights, their mean (mode 0) or largest (1), added to out
+    g->q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const int64_t j = id[0];
+        float acc = 0.0f;
+        for (int64_t h = 0; h < Hq; ++h) {
+            const float p = sycl::exp(score(h, j) - scratch[h * 2]) / scratch[h * 2 + 1];
+            acc = mode == 1 ? sycl::fmax(acc, p) : acc + p / (float) Hq;
+        }
+        out[j] += acc;
+    });
+    return 0;
+    NS_CATCH
+}
+
+// ---- SYCL graphs of a decode pass's position-free stretches (the engine records each once a session and row count,
+// then replays it: one submission for its ~hundred kernels)
+namespace {
+namespace X = sycl::ext::oneapi::experimental;
+struct Q35Graph {
+    std::unique_ptr<X::command_graph<X::graph_state::modifiable>> rec;
+    std::unique_ptr<X::command_graph<X::graph_state::executable>> exec;
+};
+}  // namespace
+
+int ns_q35_graph_begin(ns_gpu* g, void** out) {
+    NS_TRY
+    auto* gr = new Q35Graph();
+    gr->rec = std::make_unique<X::command_graph<X::graph_state::modifiable>>(g->q.get_context(), g->q.get_device());
+    gr->rec->begin_recording(g->q);
+    *out = gr;
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_graph_end(ns_gpu* g, void* h) {
+    NS_TRY
+    auto* gr = static_cast<Q35Graph*>(h);
+    gr->rec->end_recording(g->q);
+    gr->exec = std::make_unique<X::command_graph<X::graph_state::executable>>(gr->rec->finalize());
+    gr->rec.reset();
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_graph_launch(ns_gpu* g, void* h) {
+    NS_TRY
+    auto* gr = static_cast<Q35Graph*>(h);
+    if (!gr->exec) return ns_fail("ns_q35_graph_launch: a graph not finished");
+    g->q.ext_oneapi_graph(*gr->exec);
+    return 0;
+    NS_CATCH
+}
+
+void ns_q35_graph_free(void* h) {
+    delete static_cast<Q35Graph*>(h);
 }
 
 int ns_q35_softmax_rows(ns_gpu* g, float* x, int64_t rows, int64_t n, float scale) {

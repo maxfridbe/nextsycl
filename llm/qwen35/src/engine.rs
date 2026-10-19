@@ -355,6 +355,14 @@ pub struct Qwen35<'g> {
     next_id: std::sync::atomic::AtomicU64,
     /// the vision tower (the model's mmproj file: NS_Q35_VISION), when there is one
     pub vision: Option<crate::vision::Vision>,
+    /// LogProbChain's attention capture (None: off)
+    capture: Mutex<Option<Capture>>,
+    /// decode passes as SYCL graphs (under `work`)
+    graphs: Mutex<Graphs>,
+    /// inside a replayed stretch: kernel calls are not made (the graph makes them)
+    skip: std::sync::atomic::AtomicBool,
+    /// graphs failed to record here: off for the process
+    graphs_off: std::sync::atomic::AtomicBool,
     /// NS_Q35_PROFILE=1: every kernel timed on the device, with its bytes and arithmetic (probe.rs)
     probe: Option<Probe>,
     load_s: f64,
@@ -379,6 +387,59 @@ struct FullSeg<'a> {
     cap: usize,
     k: &'a DevBuf,
     v: &'a DevBuf,
+    /// LogProbChain: this one-row pass's attention captured (`Qwen35::capture_attention`)
+    probe: bool,
+}
+
+/// A recorded SYCL graph (ns_q35_graph_*), freed with it
+struct GraphH(*mut std::ffi::c_void);
+
+// SAFETY: a handle the kernel library made; used under the engine's work lock, freed once.
+unsafe impl Send for GraphH {}
+
+impl Drop for GraphH {
+    fn drop(&mut self) {
+        if let Ok(k) = ffi::api() {
+            // SAFETY: made by ns_q35_graph_begin, freed once here.
+            unsafe { (k.graph_free)(self.0) };
+        }
+    }
+}
+
+/// A decode pass as graphs (NS_Q35_GRAPHS): its position-free stretches - everything but the full-attention layers'
+/// rotary positions, cache writes and attention, which take the position as an argument - recorded the first time a
+/// session runs a pass of that many rows, replayed after (the same buffers: the arena hands them out in the same order).
+/// `map`: the stretches' graphs by (session, rows, snapshots kept), each with its GPU
+#[derive(Default)]
+struct Graphs {
+    map: std::collections::HashMap<(u64, usize, bool), Vec<(usize, GraphH)>>,
+    mode: GMode,
+}
+
+#[derive(Default)]
+enum GMode {
+    #[default]
+    Off,
+    /// recording: the stretches so far, the open one
+    Record { key: (u64, usize, bool), segs: Vec<(usize, GraphH)>, open: Option<(usize, GraphH)> },
+    /// replaying the stretches of `key`, the next one `idx`
+    Replay { key: (u64, usize, bool), idx: usize },
+}
+
+/// NS_Q35_GRAPHS=1: decode passes as graphs. Off by default: the same tokens, no faster (2026-10-19, Q4, 256 tokens:
+/// B70 47.47 tok/s with them and without (MTP), 27.76 / 27.43 one row a pass; B65 + B70 42.8 / 44.4, 23.6 / 23.9) -
+/// the host stays ahead of the GPU, whose kernels run back to back already
+fn graphs_on() -> bool {
+    std::env::var("NS_Q35_GRAPHS").is_ok_and(|v| v == "1")
+}
+
+/// LogProbChain's capture: per GPU the attention weights added per position (the full-attention layers of one-token
+/// passes), how many layers added, the heads' mean (0) or largest (1)
+struct Capture {
+    mode: i32,
+    bufs: Vec<Option<DevBuf>>,
+    layers: usize,
+    n: usize,
 }
 
 /// A conversation's rows in a pass, as a DeltaNet layer reads them: from row r0, t rows, its state and conv inputs, and
@@ -685,7 +746,8 @@ impl<'g> Qwen35<'g> {
             None => None,
         };
         Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, chunk,
-                    work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, second: None, of: Vec::new() }), vh, next_id: 0.into(), vision, probe,
+                    work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, second: None, of: Vec::new() }), vh, next_id: 0.into(), vision, capture: Mutex::new(None), graphs: Mutex::new(Graphs::default()), skip: false.into(), graphs_off: false.into(),
+                    probe,
                     load_s, load_bytes: loaded })
     }
 
@@ -698,6 +760,9 @@ impl<'g> Qwen35<'g> {
 
     /// `op`, its return code left to the caller
     fn op_rc(&self, name: &'static str, key: impl FnOnce() -> String, bytes: usize, flops: usize, f: impl FnOnce() -> c_int) -> Result<c_int> {
+        if self.skip.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(0);
+        }
         match &self.probe {
             Some(p) => p.op(name, key(), bytes as u64, flops as u64, f),
             None => Ok(f()),
@@ -1114,6 +1179,164 @@ impl<'g> Qwen35<'g> {
         Ok(rows)
     }
 
+    /// A decode pass's graphs begin (`key`: its session, rows, snapshots): its stretches replayed when recorded before,
+    /// else recorded now (the first stretch opened on the current GPU)
+    fn graph_start(&self, key: (u64, usize, bool)) -> Result<()> {
+        let mut gr = self.graphs.lock().unwrap();
+        if gr.map.contains_key(&key) {
+            gr.mode = GMode::Replay { key, idx: 0 };
+            self.skip.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        if gr.map.len() >= 64 {
+            gr.map.clear();
+        }
+        match self.graph_open() {
+            Ok(open) => gr.mode = GMode::Record { key, segs: Vec::new(), open: Some(open) },
+            Err(x) => {
+                // no graphs on this runtime: the passes run as they are
+                eprintln!("[qwen35: SYCL graphs unavailable ({}): decode runs kernel by kernel]", x.0);
+                self.graphs_off.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    fn graph_open(&self) -> Result<(usize, GraphH)> {
+        let mut h = std::ptr::null_mut();
+        // SAFETY: the current GPU's queue records from now; h receives the graph.
+        ffi::check(unsafe { (self.k.graph_begin)(self.raw(), &mut h) }, "graph begin")?;
+        Ok((self.cur.load(std::sync::atomic::Ordering::Relaxed), GraphH(h)))
+    }
+
+    fn graphing(&self) -> bool {
+        !matches!(self.graphs.lock().unwrap().mode, GMode::Off)
+    }
+
+    /// A stretch ends (a position-taking kernel, a GPU change or the pass's end next): recorded and run, or replayed
+    fn seg_end(&self) -> Result<()> {
+        let mut gr = self.graphs.lock().unwrap();
+        let Graphs { map, mode } = &mut *gr;
+        match mode {
+            GMode::Off => Ok(()),
+            GMode::Record { segs, open, .. } => {
+                let (dev, h) = open.take().ok_or_else(|| e("qwen35: a graph stretch ended twice"))?;
+                let g = self.devs[dev].gpu.raw();
+                // SAFETY: the stretch recorded on this GPU's queue: finished, then run once.
+                ffi::check(unsafe { (self.k.graph_end)(g, h.0) }, "graph end")?;
+                ffi::check(unsafe { (self.k.graph_launch)(g, h.0) }, "graph launch")?;
+                segs.push((dev, h));
+                Ok(())
+            }
+            GMode::Replay { key, idx } => {
+                self.skip.store(false, std::sync::atomic::Ordering::Relaxed);
+                let segs = map.get(key).ok_or_else(|| e("qwen35: a replayed pass without its graphs"))?;
+                let (dev, h) = segs.get(*idx).ok_or_else(|| e("qwen35: a replayed pass with more stretches than recorded"))?;
+                // SAFETY: a finished graph of this GPU.
+                ffi::check(unsafe { (self.k.graph_launch)(self.devs[*dev].gpu.raw(), h.0) }, "graph launch")?;
+                *idx += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// A stretch begins (after a position-taking kernel, or on the next GPU)
+    fn seg_begin(&self) -> Result<()> {
+        let recording = matches!(self.graphs.lock().unwrap().mode, GMode::Record { .. });
+        if recording {
+            let open = self.graph_open()?;
+            if let GMode::Record { open: o, .. } = &mut self.graphs.lock().unwrap().mode {
+                *o = Some(open);
+            }
+        } else if matches!(self.graphs.lock().unwrap().mode, GMode::Replay { .. }) {
+            self.skip.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// The pass's graphs end: the last stretch closed, a recording kept
+    fn graph_finish(&self) -> Result<()> {
+        self.seg_end()?;
+        let mut gr = self.graphs.lock().unwrap();
+        match std::mem::take(&mut gr.mode) {
+            GMode::Record { key, segs, .. } => {
+                if gr.map.is_empty() {
+                    eprintln!("[qwen35: decode passes as SYCL graphs: {} stretches a pass of {} rows]", segs.len(), key.1);
+                }
+                gr.map.insert(key, segs);
+            }
+            GMode::Replay { key, idx } => {
+                if gr.map.get(&key).map(|v| v.len()) != Some(idx) {
+                    gr.map.remove(&key);
+                    return Err(e("qwen35: a replayed pass with fewer stretches than recorded"));
+                }
+            }
+            GMode::Off => {}
+        }
+        Ok(())
+    }
+
+    /// After a failed pass: a recording closed and dropped, replaying stopped
+    fn graph_abort(&self) {
+        self.skip.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut gr = self.graphs.lock().unwrap();
+        if let GMode::Record { open: Some((dev, h)), .. } = std::mem::take(&mut gr.mode) {
+            // SAFETY: the open recording ended (the queue back to running work); the graph dropped unrun.
+            unsafe { (self.k.graph_end)(self.devs[dev].gpu.raw(), h.0) };
+        }
+    }
+
+    /// LogProbChain: a one-row pass's attention over its n keys (its query q, normed and turned, against the cache)
+    /// added to this GPU's capture
+    fn capture_row(&self, q: &DevBuf, kc: &DevBuf, cap: usize, n: usize) -> Result<()> {
+        let mut c = self.capture.lock().unwrap();
+        let Some(c) = c.as_mut() else { return Ok(()) };
+        let dev = self.cur.load(std::sync::atomic::Ordering::Relaxed);
+        if c.bufs[dev].as_ref().is_none_or(|b| b.len < cap * 4) {
+            let b = DevBuf::f32(&self.devs[dev].gpu, cap)?;
+            b.fill(0)?;
+            c.bufs[dev] = Some(b);
+        }
+        let out = c.bufs[dev].as_ref().ok_or_else(|| e("the capture's buffer"))?;
+        let g = &self.g;
+        let scratch = self.arena().f32(2 * g.heads)?;
+        // SAFETY: q [heads x head], the cache [kv heads][cap][head] half, n <= cap keys, out [cap].
+        self.op("chain attention", String::new, n * g.heads_kv * g.head * 2, 4 * n * g.heads * g.head,
+                || unsafe { (self.k.attn_probs)(self.raw(), q.fp(), kc.ptr(), g.heads as i64, g.heads_kv as i64, g.head as i64, cap as i64, n as i64, c.mode,
+                                                scratch.fp(), out.fp()) })?;
+        c.layers += 1;
+        c.n = n;
+        Ok(())
+    }
+
+    /// Starts (or stops) capturing attention for LogProbChain: each one-token pass from now adds, per full-attention
+    /// layer, its heads' attention over the positions it reads (NS_Q35_CHAIN_HEADS: mean, the default, or max)
+    pub fn capture_attention(&self, on: bool) {
+        let mode = if std::env::var("NS_Q35_CHAIN_HEADS").is_ok_and(|v| v == "max") { 1 } else { 0 };
+        *self.capture.lock().unwrap() = on.then(|| Capture { mode, bufs: (0..self.devs.len()).map(|_| None).collect(), layers: 0, n: 0 });
+    }
+
+    /// The attention captured since the last take: per position, the mean over the layers of the heads' weights the last
+    /// one-token pass's query gave it; None when no layer captured
+    pub fn take_attention(&self) -> Option<Vec<f32>> {
+        let mut c = self.capture.lock().unwrap();
+        let c = c.as_mut()?;
+        if c.layers == 0 {
+            return None;
+        }
+        let mut out = vec![0f32; c.n];
+        for b in c.bufs.iter().flatten() {
+            let v = b.view(0, c.n * 4).and_then(|v| v.to_f32()).ok()?;
+            for (o, x) in out.iter_mut().zip(v) {
+                *o += x;
+            }
+            b.fill(0).ok()?;
+        }
+        let n = c.layers as f32;
+        c.layers = 0;
+        Some(out.into_iter().map(|x| x / n).collect())
+    }
+
     /// A full-attention layer on h [t, n_embd]: its output [t, n_embd]. The rows are one conversation's or several's
     /// (`segs`: each its rows, position, rotary positions and cache): the products take all rows at once, the positions,
     /// caches and attention each conversation's own rows - each as its own pass would
@@ -1137,6 +1360,11 @@ impl<'g> Qwen35<'g> {
             let (q, kn, att) = (rows(&q, hq * d)?, rows(&kn, hk * d)?, rows(&att, hq * d)?);
             // the keys the rows see in all (causal): what attention reads and multiplies
             let keys = t * p0 + t * (t + 1) / 2;
+            // a graphed pass: the position-taking kernels run on their own, their scratch the most the cache needs (the
+            // arena's offsets after it the same each pass)
+            let graphing = self.graphing();
+            let p_sz = if graphing { cap.saturating_sub(t) } else { p0 };
+            self.seg_end()?;
             // SAFETY: the rows and caches as named in q35.h.
             unsafe {
                 match sg.rope {
@@ -1171,19 +1399,23 @@ impl<'g> Qwen35<'g> {
                                                p0 as i64, att.fp()))?;
                 } else if let Some(s) = self.silo.filter(|s| (s.attn_decode_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
                     // the silo's decode attention: a lane a key for the scores, the keys over ~512 work-groups
-                    let sc = (s.attn_decode_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
+                    let sc = (s.attn_decode_scratch)(t as i64, hq as i64, hk as i64, d as i64, p_sz as i64) as usize;
                     let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
                     self.op("attention silo", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
                             || (s.attn_decode)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
                                                p0 as i64, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
                 } else {
-                    let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p0 as i64) as usize;
+                    let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p_sz as i64) as usize;
                     let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
                     self.op("attention", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
                             || (k.attn)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
                                         p0 as i64, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
                 }
             }
+            if sg.probe && t == 1 {
+                self.capture_row(&q, kc, cap, p0 + 1)?;
+            }
+            self.seg_begin()?;
         }
         // SAFETY: att [t, hq x d] gated by qf's gate columns.
         self.op("output gate", none, 12 * t * hq * d, 4 * t * hq * d,
@@ -1267,9 +1499,18 @@ impl<'g> Qwen35<'g> {
         self.pass_in(s, tokens, n_out, tap)
     }
 
+    /// `pass_in`, a failed pass's graph recording closed
+    fn pass_in(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
+        let r = self.pass_eager_or_graphed(s, tokens, n_out, tap);
+        if r.is_err() {
+            self.graph_abort();
+        }
+        r
+    }
+
     /// `pass` with the work lock held: a verify pass (2 ..= drafts + 1 rows, drafts on) keeps the DeltaNet
     /// snapshots; with MTP the draft block runs over the rows behind it
-    fn pass_in(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
+    fn pass_eager_or_graphed(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
         let g = &self.g;
         let t = tokens.len();
         if t == 0 {
@@ -1306,6 +1547,7 @@ impl<'g> Qwen35<'g> {
         }
         let r0 = p0 - s.shift;
         let rope_at = |dev: usize| -> Rope { match pos_rows.get(dev).and_then(|b| b.as_ref()) { Some(b) => Rope::Rows(b), None => Rope::From(r0) } };
+        let probing = t == 1 && self.capture.lock().unwrap().is_some();
         let mut snaps = self.snaps.lock().unwrap();
         let snapping = (2..=self.drafts + 1).contains(&t) && !snaps.layers.is_empty();
         snaps.of.clear();
@@ -1319,12 +1561,19 @@ impl<'g> Qwen35<'g> {
         let mut ffn_u = self.arena().f32(t * g.n_ff)?;
         let mut ffn = self.arena().f32(t * g.n_embd)?;
         let mut li = 0;
+        // decode rows (no pictures, no capture, no profile): the layers as graphs
+        let graphed = t <= 8 && !pictures && !probing && self.probe.is_none() && graphs_on() && !self.graphs_off.load(std::sync::atomic::Ordering::Relaxed);
+        if graphed {
+            self.graph_start((s.id, t, snapping))?;
+        }
         // the arena past this point is the layer's own, made again each layer
         for (l, (ly, st)) in self.layers.iter().zip(s.layers.iter()).enumerate() {
             // the next GPU's layers: the rows cross over, its own buffers for them
             if self.layer_dev[l] != self.cur.load(std::sync::atomic::Ordering::Relaxed) {
                 self.phase("GPU to GPU");
+                self.seg_end()?;
                 x = self.hop(&x, self.layer_dev[l])?;
+                self.seg_begin()?;
                 h = self.arena().f32(t * g.n_embd)?;
                 ffn_g = self.arena().f32(t * g.n_ff)?;
                 ffn_u = self.arena().f32(t * g.n_ff)?;
@@ -1335,7 +1584,7 @@ impl<'g> Qwen35<'g> {
             let hq8 = self.norm(&x, &ly.attn_norm, &h, t, g.n_embd)?;
             let out = match (st, &ly.full, &ly.linear) {
                 (LState::Full { k, v }, Some(a), _) => {
-                    let seg = FullSeg { r0: 0, t, p0, rope: rope_at(self.layer_dev[l]), cap: s.max_ctx, k, v };
+                    let seg = FullSeg { r0: 0, t, p0, rope: rope_at(self.layer_dev[l]), cap: s.max_ctx, k, v, probe: probing };
                     self.full(a, &[seg], &h, hq8.as_ref(), t)?
                 }
                 (LState::Linear { s: rs, conv }, _, Some(a)) => {
@@ -1358,6 +1607,9 @@ impl<'g> Qwen35<'g> {
             self.add(&x, &ffn, t * g.n_embd)?;
             tap(&format!("l_out-{l}"), &x)?;
             self.arena().rewind(mark);
+        }
+        if graphed {
+            self.graph_finish()?;
         }
         if snapping {
             snaps.of.push((s.id, p0, t, 0));
@@ -1412,7 +1664,7 @@ impl<'g> Qwen35<'g> {
     fn mtp_rows(&self, ms: &MtpState, tokens: &[u32], hs: &DevBuf, p0: usize, cap: usize, head: bool, rope: Rope) -> Result<Option<u32>> {
         let Some(m) = &self.mtp else { return Ok(None) };
         let (t, ne) = (tokens.len(), self.g.n_embd);
-        let cur = self.mtp_block(m, &[FullSeg { r0: 0, t, p0, rope, cap, k: &ms.k, v: &ms.v }], tokens, hs)?;
+        let cur = self.mtp_block(m, &[FullSeg { r0: 0, t, p0, rope, cap, k: &ms.k, v: &ms.v, probe: false }], tokens, hs)?;
         if !head {
             return Ok(None);
         }
@@ -1497,7 +1749,7 @@ impl<'g> Qwen35<'g> {
             for (r, &j) in live.iter().enumerate() {
                 let (s, ms) = (ss[j], ss[j].mtp.as_ref().ok_or_else(|| e("a draft without the draft block's state"))?);
                 hs.copy_within(r * ne * 4, if i == 0 { &ms.pending } else { &ms.chain }, 0, ne * 4)?;
-                segs.push(FullSeg { r0: r, t: 1, p0: s.pos + i, rope: Rope::From(s.pos + i - s.shift), cap: s.max_ctx, k: &ms.k, v: &ms.v });
+                segs.push(FullSeg { r0: r, t: 1, p0: s.pos + i, rope: Rope::From(s.pos + i - s.shift), cap: s.max_ctx, k: &ms.k, v: &ms.v, probe: false });
                 mss.push(ms);
             }
             let rows: Vec<u32> = live.iter().map(|j| toks[*j]).collect();
@@ -1879,7 +2131,7 @@ impl<'g> Qwen35<'g> {
                     let mut segs = Vec::with_capacity(ss.len());
                     for (i, s) in ss.iter().enumerate() {
                         let LState::Full { k, v } = &s.layers[l] else { return Err(e(format!("layer {l}: its state and its weights disagree"))) };
-                        segs.push(FullSeg { r0: r0s[i], t: rows[i].len(), p0: s.pos, rope: Rope::From(s.pos - s.shift), cap: s.max_ctx, k, v });
+                        segs.push(FullSeg { r0: r0s[i], t: rows[i].len(), p0: s.pos, rope: Rope::From(s.pos - s.shift), cap: s.max_ctx, k, v, probe: false });
                     }
                     self.full(a, &segs, &h, hq8.as_ref(), t)?
                 }
@@ -1942,7 +2194,7 @@ impl<'g> Qwen35<'g> {
                 if n > 1 {
                     hs.copy_within((r0 + 1) * ne * 4, &all, r0 * ne * 4, (n - 1) * ne * 4)?;
                 }
-                segs.push(FullSeg { r0, t: n, p0: p0s[i], rope: Rope::From(rope0[i]), cap: s.max_ctx, k: &ms.k, v: &ms.v });
+                segs.push(FullSeg { r0, t: n, p0: p0s[i], rope: Rope::From(rope0[i]), cap: s.max_ctx, k: &ms.k, v: &ms.v, probe: false });
             }
             self.mtp_block(m, &segs, &tokens, &hs)?;
             for (i, s) in ss.iter().enumerate() {
