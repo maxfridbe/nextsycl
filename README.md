@@ -1369,13 +1369,20 @@ structure decoder 1.8e-4 (no cell flipped), the shape decoder on the reference's
 0.04% of the children decided otherwise - logits near zero), the texture decoder 6-8e-4.
 
 B70 (the helmet example: TRELLIS.2 4267 structure voxels, 20323 in the cascade's second pass, 22 M triangles decoded;
-Pixal3D 2332 and 11502; the card's peak):
+Pixal3D 2332 and 11502; the card's peak; 2026-10-16, before the silo):
 
 | path | total | dino | structure | shape | texture | decoders | mesh + bake | peak |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | trellis2 1024 cascade | 79.8 s | 1.3 s | 4.4 s | 6.4 + 29.4 s | 18.1 s | 10.6 s | 9.4 s | 9.1 GiB |
 | trellis2-512 | 20.7 s | 0.6 s | 4.4 s | 4.1 s | 2.8 s | 4.8 s | 3.9 s | 2.9 GiB |
 | pixal3d 1024 cascade | 45.1 s | 2.0 s | 4.4 s | 4.5 + 13.1 s | 7.9 s | 6.5 s | 6.7 s | 4.5 GiB |
+
+With the silo (its products with GELU / SiLU / the gated residual add fused, the layer norm a sub-group a row), the
+mesh cut, decimated and unwrapped on a CPU thread while the GPU runs the texture flow, and the bake on every thread
+(2026-10-19, seed 42; before in brackets): B70 trellis2 1024 60.1 s (78.7), trellis2-512 11.8 s (19.7), pixal3d
+30.3 s (44.9); B65 85.7 s (110.6), 16.4 s (25.4), 43.3 s (59.6). The 1024 run on the B70: dino 0.9 s, structure
+3.6, shape 4.5 + 26.9, texture 16.6, the decoders 2.7 + 2.7, bake 2.1 (the mesh's 7 s hidden behind the texture);
+peak 9.1 GiB. The checks hold (helmet1024's worst 3.6e-2 as before, Pixal3D's flows 4.5e-4).
 
 The second shape pass is where the time goes: at 20323 tokens a call takes 1.39 s - self-attention 0.67 s (flash,
 half), the MLP 0.40 s, cross-attention to the 4101 picture tokens 0.15 s, the other linears 0.16 s. The goblin
