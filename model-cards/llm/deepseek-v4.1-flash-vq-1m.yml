@@ -1,0 +1,22 @@
+# DeepSeek-V4.1-Flash-1017 VQ · 1M context + a 32K chat (both GPUs, pinned memory and the NVMe)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: deepseek-v4.1-flash-vq-1m
+kind: llm
+arch: deepseek41
+title: DeepSeek-V4.1-Flash-1017 VQ · 1M context + a 32K chat (both GPUs, pinned memory and the NVMe)
+about: the same files as deepseek-v4.1-flash-vq with a 1M session (its compressed caches ~1.3 GiB a card) beside a 32K one; the needle found at 261K (503 tok/s prompt) - a full 1M prompt takes about half an hour
+gpus: all
+streams: true                   # the Engram's rows and the experts beyond VRAM and pinned memory are read from the drive while it serves
+vram_gib: 30.0
+ctx: 1048576,32768
+tools: false
+tasks: false
+env: {NS_DS41_FREE_GIB: "1.5"}   # the box rule: 1.5 GiB of VRAM free
+silo:
+  name: deepseek41
+  required: true
+files:
+  model: deepseek-v4.1-flash-1017-vq
+  engram-1: deepseek-v4.1-flash-1017-engram-1
+  engram-2: deepseek-v4.1-flash-1017-engram-2
+guide: guides/chat.md

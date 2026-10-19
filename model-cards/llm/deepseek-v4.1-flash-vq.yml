@@ -11,7 +11,7 @@ vram_gib: 30.0
 ctx: '131072'
 tools: false
 tasks: false
-env: {}
+env: {NS_DS41_FREE_GIB: "1.5"}   # the box rule: 1.5 GiB of VRAM free (the engine default 0.75 measured 2.2 GiB free at the peak; ~4-9% faster decode)
 silo:                           # its VQ kernels exist only there
   name: deepseek41
   required: true
