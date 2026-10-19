@@ -288,9 +288,14 @@ impl VoxCpm2 {
         let context = if p.audio.last() == Some(&true) { CONTEXT.min(p.audio.iter().filter(|a| **a).count()) } else { 0 };
         let mut out: Vec<Vec<f32>> = p.patches[l - context..].to_vec();
         let mut prev = p.patches[l - 1].clone();
+        // the sampler on the device (the silo: a patch's evaluations as one graph), else an evaluation at a time
+        let mut sm = m.sampler(ops, nsd, &s, steps, cfg)?;
         for i in 0..max {
             m.mu(ops, nsd, &s)?;
-            let patch = m.sample(ops, nsd, &s, &noise(i), &prev, steps, cfg)?;
+            let patch = match sm.as_mut() {
+                Some(sm) => m.sample_on(ops, nsd, &s, sm, &noise(i), &prev)?,
+                None => m.sample(ops, nsd, &s, &noise(i), &prev, steps, cfg)?,
+            };
             out.push(patch.clone());
             progress(Step { phase: "tokens", at: (i + 1) as u32, of: max as u32, seconds: t0.elapsed().as_secs_f64() })?;
             let fed = match teacher {

@@ -88,3 +88,50 @@ pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
     let why = nextsycl_core::api().map(|a| a.error()).unwrap_or_default();
     Err(nextsycl_core::Error(format!("{what}: {why}")))
 }
+
+/// The silo's kernels (kernels/audio/voxcpm2/silo/vcs.h, dist/silo/libnextsycl-voxcpm2.so), when it is there: a
+/// patch's sampler on the device, recorded as one graph
+pub struct Silo {
+    pub supported: unsafe extern "C" fn(i64) -> c_int,
+    pub cfg_euler: unsafe extern "C" fn(G, *mut f32, *const f32, *const i32, i64, f32, f32) -> c_int,
+    pub graph_begin: unsafe extern "C" fn(G, *mut M) -> c_int,
+    pub graph_end: unsafe extern "C" fn(G, M, *mut M) -> c_int,
+    pub graph_launch: unsafe extern "C" fn(G, M) -> c_int,
+    pub graph_free: unsafe extern "C" fn(M),
+}
+
+// SAFETY: function pointers into the silo library, which stays loaded for the process.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+/// The silo (None: the sampler's update on the host, an evaluation at a time)
+pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
+    static SILO: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    SILO.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo("voxcpm2").map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in vcs.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo {
+            supported: sym!("ns_vcs_supported"),
+            cfg_euler: sym!("ns_vcs_cfg_euler"),
+            graph_begin: sym!("ns_vcs_graph_begin"),
+            graph_end: sym!("ns_vcs_graph_end"),
+            graph_launch: sym!("ns_vcs_graph_launch"),
+            graph_free: sym!("ns_vcs_graph_free"),
+        }))
+    })
+    .as_ref()
+    .map(|s| s.as_ref())
+    .map_err(|e| nextsycl_core::Error(e.clone()))
+}

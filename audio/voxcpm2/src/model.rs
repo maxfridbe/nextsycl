@@ -381,6 +381,157 @@ impl Model {
         Ok((0..PATCH).flat_map(|p| (0..FEAT).map(move |c| (c, p))).map(|(c, p)| x[c * PATCH + p]).collect())
     }
 
+    /// The sampler's evaluations: (time, the step's dt) for each step that evaluates the DiT (the first ones of
+    /// CFG-zero* do not: their velocity is zero)
+    fn evaluations(steps: usize) -> Vec<(f32, f32)> {
+        let ts = t_span(steps);
+        let zero_init = ((ts.len() as f32 * 0.04) as usize).max(1);
+        let (mut t, mut dt) = (ts[0], ts[0] - ts[1]);
+        let mut out = Vec::new();
+        for step in 1..ts.len() {
+            if step > zero_init {
+                out.push((t, dt));
+            }
+            t -= dt;
+            if step < ts.len() - 1 {
+                dt = t - ts[step + 1];
+            }
+        }
+        out
+    }
+
+    /// The sampler on the device for a request (`s` its session; None without the silo): its buffers, the time rows
+    /// of its steps made once, the graph recorded at its second patch (the first runs the evaluations as they are,
+    /// making the products' primitives)
+    pub fn sampler(&self, ops: &Ops, nsd: &Nsd, s: &Session, steps: usize, cfg: f32) -> Result<Option<Sampler>> {
+        let Some(k) = crate::ffi::silo()? else { return Ok(None) };
+        let n = PATCH * FEAT;
+        // SAFETY: arithmetic only.
+        if unsafe { (k.supported)(n as i64) } != 1 {
+            return Ok(None);
+        }
+        let g = &ops.gpu;
+        let d = self.dit.hidden;
+        let evals = Self::evaluations(steps);
+        // the time rows: time_mlp(sinusoid(t)) + the delta-time one, as `velocity` makes them
+        let te = DevBuf::f32(g, evals.len().max(1) * d)?;
+        let t1 = DevBuf::f32(g, d)?;
+        let dte = DevBuf::from_f32(g, &self.dt_emb)?;
+        for (i, (t, _)) in evals.iter().enumerate() {
+            let row = fp(&te, i * d);
+            let sin = DevBuf::from_f32(g, &sinusoid(d, *t))?;
+            self.time1.apply(ops, nsd, sin.fp(), 1, &s.xh, t1.fp())?;
+            ops.silu(t1.fp(), d)?;
+            self.time2.apply(ops, nsd, t1.fp(), 1, &s.xh, row)?;
+            ops.add(row, dte.fp(), d)?;
+        }
+        // the host's channels-first order of x's values in the device's rows [4, 64]
+        let order: Vec<u8> = (0..n).flat_map(|j| (((j % PATCH) * FEAT + j / PATCH) as i32).to_le_bytes()).collect();
+        let ord = DevBuf::new(g, n * 4)?;
+        ord.write(0, &order)?;
+        g.sync()?;
+        Ok(Some(Sampler {
+            k,
+            x: DevBuf::f32(g, n)?,
+            prev: DevBuf::f32(g, n)?,
+            cond_rows: DevBuf::f32(g, PATCH * d)?,
+            xp: DevBuf::f32(g, PATCH * d)?,
+            te,
+            zero: DevBuf::from_f32(g, &vec![0f32; 2 * d])?,
+            o: DevBuf::f32(g, 2 * PATCH * d)?,
+            v: DevBuf::f32(g, 2 * n)?,
+            order: ord,
+            evals,
+            cfg,
+            exec: std::ptr::null_mut(),
+            patches: 0,
+            graph: std::env::var("NS_VCP_GRAPH").map_or(true, |v| v != "0"),
+        }))
+    }
+
+    /// `sample` on the device: noise [64, 4] and the previous patch [4 x 64] in, the patch [4 x 64] out - the host
+    /// waits once, at the end
+    pub fn sample_on(&self, ops: &Ops, nsd: &Nsd, s: &Session, sm: &mut Sampler, noise: &[f32], prev: &[f32]) -> Result<Vec<f32>> {
+        let g = &ops.gpu;
+        let xr: Vec<f32> = (0..PATCH).flat_map(|p| (0..FEAT).map(move |c| noise[c * PATCH + p])).collect();
+        sm.x.write(0, &bytes(&xr))?;
+        sm.prev.write(0, &bytes(prev))?;
+        self.dit_cond.apply(nsd, sm.prev.fp(), PATCH, sm.cond_rows.fp())?;
+        if sm.exec.is_null() && sm.graph && sm.patches > 0 {
+            let mut graph = std::ptr::null_mut();
+            // SAFETY: the GPU's handle; an out-pointer to a local.
+            crate::ffi::check(unsafe { (sm.k.graph_begin)(g.raw(), &mut graph) }, "vcs graph")?;
+            let rec = self.evaluate(ops, nsd, s, sm);
+            let mut exec = std::ptr::null_mut();
+            // SAFETY: the graph begun above (ended even when the recording failed).
+            let end = crate::ffi::check(unsafe { (sm.k.graph_end)(g.raw(), graph, &mut exec) }, "vcs graph");
+            match rec.and(end) {
+                Ok(()) => sm.exec = exec,
+                Err(e) => {
+                    // not recordable here: the evaluations queued as they are from now on (the host still waits once)
+                    eprintln!("voxcpm2: the sampler's graph did not record ({}); running it unrecorded", e.0);
+                    sm.graph = false;
+                }
+            }
+        }
+        if sm.exec.is_null() {
+            self.evaluate(ops, nsd, s, sm)?;
+        } else {
+            // SAFETY: the executable graph of this request's buffers.
+            crate::ffi::check(unsafe { (sm.k.graph_launch)(g.raw(), sm.exec) }, "vcs graph launch")?;
+        }
+        sm.patches += 1;
+        sm.x.to_f32()
+    }
+
+    /// The sampler's evaluations queued: each the DiT's guided and unguided velocities, then the Euler step on x
+    fn evaluate(&self, ops: &Ops, nsd: &Nsd, s: &Session, sm: &Sampler) -> Result<()> {
+        let d = self.dit.hidden;
+        let seq = 2 * PATCH + 3;
+        let x0 = &s.dit.x;
+        for (i, (_, dt)) in sm.evals.iter().enumerate() {
+            self.dit_in.apply(nsd, sm.x.fp(), PATCH, sm.xp.fp())?;
+            for b in 0..2 {
+                let r0 = b * seq * d * 4;
+                x0.copy_within(r0, if b == 0 { &s.mu } else { &sm.zero }, 0, 2 * d * 4)?;
+                x0.copy_within(r0 + 2 * d * 4, &sm.te, i * d * 4, d * 4)?;
+                x0.copy_within(r0 + 3 * d * 4, &sm.cond_rows, 0, PATCH * d * 4)?;
+                x0.copy_within(r0 + (3 + PATCH) * d * 4, &sm.xp, 0, PATCH * d * 4)?;
+            }
+            self.dit.local(ops, nsd, &s.dit, 2 * seq, seq)?;
+            for b in 0..2 {
+                sm.o.copy_within(b * PATCH * d * 4, &s.dit.out, (b * seq + 3 + PATCH) * d * 4, PATCH * d * 4)?;
+            }
+            self.dit_out.apply(ops, nsd, sm.o.fp(), 2 * PATCH, &s.xh, sm.v.fp())?;
+            let probe = if std::env::var("NS_VCP_SAMPLER_CHECK").is_ok_and(|v| v == "1") && sm.exec.is_null() {
+                Some((sm.x.to_f32()?, sm.v.to_f32()?))
+            } else {
+                None
+            };
+            // SAFETY: x [n], v [2, n], order [n] i32 on this GPU.
+            crate::ffi::check(unsafe { (sm.k.cfg_euler)(ops.gpu.raw(), sm.x.fp(), sm.v.fp(), sm.order.ptr().cast(), (PATCH * FEAT) as i64, *dt, sm.cfg) },
+                              "vcs cfg euler")?;
+            if let Some((x, v)) = probe {
+                // the host's step on the same values (rows -> channels first), against the device's
+                let n = PATCH * FEAT;
+                let cf = |b: usize| -> Vec<f32> { (0..FEAT).flat_map(|c| (0..PATCH).map(move |p| (c, p))).map(|(c, p)| v[b * n + p * FEAT + c]).collect() };
+                let (pos, neg) = (cf(0), cf(1));
+                let mut xc: Vec<f32> = (0..FEAT).flat_map(|c| (0..PATCH).map(move |p| (c, p))).map(|(c, p)| x[p * FEAT + c]).collect();
+                let dot: f32 = pos.iter().zip(&neg).map(|(a, b)| a * b).sum();
+                let nn: f32 = neg.iter().map(|b| b * b).sum::<f32>() + 1e-8;
+                let st = dot / nn;
+                for ((xi, p), q) in xc.iter_mut().zip(&pos).zip(&neg) {
+                    let vv = q * st + sm.cfg * (p - q * st);
+                    *xi -= *dt * vv;
+                }
+                let got = sm.x.to_f32()?;
+                let worst = (0..n).map(|j| (xc[j] - got[(j % PATCH) * FEAT + j / PATCH]).abs()).fold(0f32, f32::max);
+                eprintln!("[vcs check] evaluation {i}: st {st:e}, the device's step against the host's: worst {worst:e}");
+            }
+        }
+        Ok(())
+    }
+
     /// A made patch [4 x 64] fed back: through the feature encoder, the base LM a step (then the quantizer), the
     /// residual LM a step over fusion(cat(lm, the patch's embedding)); `pos` its position
     pub fn advance(&self, ops: &Ops, nsd: &Nsd, s: &Session, patch: &[f32], pos: usize) -> Result<()> {
@@ -395,6 +546,36 @@ impl Model {
         self.fusion.apply(ops, nsd, s.a.fp(), 1, &s.xh, s.res.x.fp())?;
         self.residual.pass(ops, nsd, &s.res, 1, pos)?;
         s.res_h.copy_within(0, &s.res.out, 0, h * 4)
+    }
+}
+
+/// A request's sampler on the device (`Model::sampler`): x and the previous patch as rows [4, 64], the time rows of
+/// its evaluations, their dts, and the graph they are recorded in
+pub struct Sampler {
+    k: &'static crate::ffi::Silo,
+    x: DevBuf,
+    prev: DevBuf,
+    cond_rows: DevBuf,
+    xp: DevBuf,
+    te: DevBuf,
+    zero: DevBuf,
+    o: DevBuf,
+    v: DevBuf,
+    order: DevBuf,
+    evals: Vec<(f32, f32)>,
+    cfg: f32,
+    exec: *mut std::ffi::c_void,
+    /// patches made, and whether to record (NS_VCP_GRAPH=0: not; a recording that failed: not again)
+    patches: usize,
+    graph: bool,
+}
+
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        if !self.exec.is_null() {
+            // SAFETY: an executable graph made by graph_end; its work waited for (sample_on reads x back).
+            unsafe { (self.k.graph_free)(self.exec) };
+        }
     }
 }
 
