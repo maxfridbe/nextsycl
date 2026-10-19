@@ -45,6 +45,10 @@ guide: guides/chat.md           # how to prompt it (Markdown, relative to this f
 architecture's silo when one is built. `nextsycl models search` shows each model's (`-`: the shared kernels). The
 registry entry carries it as the loader's settings (`NS_SILO_NAME`, `NS_SILO_REQUIRED`, `NS_SILO=0`).
 
+A file published as byte ranges of itself (`name.gguf.part01-of-40` ...) lists them under `parts`, in order, each
+with its `url`, `size` and `sha256` (the file keeps its own `size`, `sha256` and `path`, no `url`): `pull` downloads
+and checks each, joins them, checks the whole and removes the parts (`llm/deepseek-v4.1-flash-vq.yml`).
+
 Other keys: `local` (role: what it is - a part made on the machine rather than downloaded, found in nextsycl.conf
 or another registry entry), `base` (a lora: the model it rides on), `defaults` (image / video / audio: the
 request's defaults - steps, cfg, size, seconds ...), `speech` (audio: `voices`, `design`, `clone`, `direction` - a clone steered by `instructions` -, `events` - vocal events in the text, `transcript` - a clone needs what the recording says, `speakers` - a script of several speakers, a voice each: `voices` / `ref_audios`, `enrolled` - a saved voice fitted for it is spoken: a model without an encoder), `voices` / `languages` (audio: a speech model's built-in voices and languages when its files hold them

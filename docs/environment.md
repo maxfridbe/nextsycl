@@ -489,6 +489,41 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS4_MULTI_CACHED` | on | 0: the IQ experts' multi-matrix kernel loads each row's activations again instead of holding them over a sub-group's run of rows | kernels:llm deepseek4 |
 | `NS_DS4_MULTI_DENSE` | on | 0: decode's dense products of one input a launch a matrix (shared kernels) instead of one multi-matrix launch a type | llm deepseek4 |
 | `NS_DS4_MULTI_GROUPS` | 1024 | Experiment: work-groups of the multi-expert decode kernels | kernels:llm deepseek4 |
+| `NS_SPLIT` | 20 (the kv source nearest half) | deepseek41: layers on the first GPU - a part begins at a kv source (2, 8, 14, 20) or, on two GPUs, at an index source (24, 28, 32, 36: its kv source's keys and the candidate blocks mirrored on the second GPU each pass); 24 and 28 measured slower (an 8.7K prompt 409-493 / 382-412 tok/s against 485, decode 17-18 / 16 against 19: the first GPU's experts spread over more layers) | llm deepseek41 |
+| `NS_DS41_ENGRAM_DIR` | `deepseek-engram` beside the model | the directory of DeepSeek-V4.1's two Engram shards (model-00047/48-of-00048.safetensors, read in rows) | llm deepseek41 |
+| `NS_DS41_ENGRAM_ALIGN` | 512 | the Engram reads' unit in bytes (a power of two from 512: the drives' logical block, what O_DIRECT needs; 4096 reads whole pages) | llm deepseek41 |
+| `NS_DS41_ENGRAM_READERS` | 48 | the Engram's reader threads: its row reads in flight (O_DIRECT, a 512-byte block each: a row's weights, then its scales) | llm deepseek41 |
+| `NS_DS41_ENGRAM_CACHE` | 262144 | the Engram rows kept in host memory (264 B each; 0: none) | llm deepseek41 |
+| `NS_DS41_MTP` | 0 | 1: DeepSeek-V4.1's three DSpark draft towers loaded (2.9 GiB on the last GPU) and drafting - a gain on code (+3%, 84% kept), a loss on prose (59% kept: 15.7 against 20.3 tok/s) | llm deepseek41 |
+| `NS_DS41_DRAFTS` | 2 | the DSpark towers' drafts a verify pass checks (1..7; a third is rarely kept) | llm deepseek41 |
+| `NS_DS41_PIN_GIB` | 40 | pinned host memory for the experts that do not fit VRAM (at most what is available less 12 GiB) | llm deepseek41 |
+| `NS_DS41_FREE_GIB` | 0.75 | VRAM each GPU keeps free beyond the plan (the xe driver has no out-of-memory path; the plan's own reserve for a pass is generous: at 0.75 an 8.7K prompt and 256 tokens peaked at 30.3 of 32 GiB - 2.4 GiB free -, at 1.5 at 29.5) | llm deepseek41 |
+| `NS_DS41_QSIM` | on | 0: the model's low-precision simulations (fp8 window keys and attention output, fp4 compressed and indexer keys) left out - a check against a reference without them | llm deepseek41 |
+| `NS_DS41_VQ_V` | measured | 0..5: the VQ decode products' kernel variant (0 a sub-group a row on the float32 codebook, 1 a lane a row on the bytes, 2 a lane a row on fp16, 3 a sub-group a row on fp16, 4 a lane a row two bytes at once, 5 by lookup table: each 8 values of x against every codebook entry in local memory) instead of the fastest of them timed at load | llm deepseek41 |
+| `NS_DS41_LUT_RUNS` | 16 | Experiment: the runs of 64-column units a row is split into by the VQ lookup-table variant (a work-group a run; their partials added after) | llm deepseek41 |
+| `NS_DS41_PROMPT_MMV` | 0 | a prompt pass's experts with at most this many of its tokens multiplied by the decode kernels (8 tokens an entry) instead of the XMX product from the indices (vq_gemm, faster at every count measured) | llm deepseek41 |
+| `NS_DS41_PROMPT_MMV_V` | 3 | the decode kernels' variant (NS_DS41_VQ_V's numbers) for those experts | llm deepseek41 |
+| `NS_DS41_PROMPT_RING` | 24 | a prompt pass's VRAM staging slots (a slot an expert, from each GPU's expert memory) for the experts in host memory or only in the file: copied up on the copy lane, half the ring a wave, while the others are multiplied (0: host-memory experts read in place, the file's swapped in) | llm deepseek41 |
+| `NS_DS41_PROMPT_FILE_SLOTS` | 64 | a prompt pass's pinned slots (each GPU) for the experts only the file holds: read on 8 threads while the GPU multiplies the others (0: a wave at a time on the host thread) | llm deepseek41 |
+| `NS_DS41_PIPE_LOG` | 0 | 1: each prompt chunk's time on each GPU of the two-GPU pipeline (and the second's wait for the first), on stderr; 2: and each layer's attention and experts apart (a GPU sync between them) | llm deepseek41 |
+| `NS_DS41_PLACE` | expert | Experiment: `layer` fills VRAM, then pinned memory, with the experts in layer order (the last layers of a GPU then live in the file alone) instead of every layer the same share | llm deepseek41 |
+| `NS_DS41_VQ_LUT` | 1 | 0: the VQ lookup-table variant left out of the decode products' timing at load | llm deepseek41 |
+| `NS_DS41_IDX_XMX` | 1 | 0: the indexer's scores in the scalar kernel instead of on XMX (deepseek4's form for 32 heads; the queries rounded to fp16) | kernels:llm deepseek41 |
+| `NS_DS41_VQ_GEMM_MAX` | 100000 | a prompt pass's experts past NS_DS41_PROMPT_MMV tokens and up to this many multiplied on XMX straight from their indices; more expanded to fp16 for a GEMM (0: all expanded) | llm deepseek41 |
+| `NS_DS41_VQ_GEMM_V` | 5 | Experiment: the prompt's XMX expert product's form - 0 its B tiles through local memory, 1 decoded straight into the tiles' registers (8 K slices a work-group), 2 / 3 the same with 4 K slices, 4 / 5 as 2 / 3 and past 32 tokens 8 token tiles a sub-group, 6 / 7 two or four row tiles a sub-group (4 K slices), 8 / 9 two with 8 / 16 K slices | kernels:llm deepseek41 |
+| `NS_DS41_GEMM_TEST_N` | 40 | `llm kernels`: the tokens of its vq_gemm check (1..64) | llm deepseek41 |
+| `NS_DS41_VQ_BENCH` | 0,1 | `llm kernels`: the VQ decode variants it times | llm deepseek41 |
+| `NS_DS41_Q4K_R` | 4 | Experiment: rows a sub-group of decode's q4_K products (1, 2 or 4) | kernels:llm deepseek41 |
+| `NS_DS41_Q4K_COLS` | 2 | decode's q4_K products decode each weight once for all of a pass's columns from this many columns (a verify pass; the same arithmetic a column as the one-column kernel, so verify rows stay bit-identical); 1 one column too, 0 never | kernels:llm deepseek41 |
+| `NS_DS41_Q4K_MAGIC` | 0 | Experiment: 1: decode's q4_K products turn the nibbles into floats by their bits (1 + q/16, no conversion; the sums rounded differently) | kernels:llm deepseek41 |
+| `NS_DS41_VQ_RPG` | 8 | Experiment: sub-groups a work-group of the VQ decode products | kernels:llm deepseek41 |
+| `NS_DS41_VQ_RPS` | 1 | Experiment: rows a sub-group of the VQ decode products takes in turn | kernels:llm deepseek41 |
+| `NS_DS41_Q4K` | on | 0: decode's q4_K products through the shared Q8_1 quantization and product (o_a a launch a group) instead of this engine's float32 kernel | llm deepseek41 |
+| `NS_DS41_DENSE_F16_MIN` | 64 | dense products of at least this many rows in fp16 on XMX | llm deepseek41 |
+| `NS_DS41_ATTN_XMX` | on | 0: attention on the vector units instead of XMX (deepseek4's kernels, copied) | kernels:llm deepseek41 |
+| `NS_DS41_ATTN_SPLIT` | on | 0: decode rows' attention in one work-group a head group instead of split over the cells | kernels:llm deepseek41 |
+| `NS_DS41_ATTN_KB` | 32 | Experiment: cells a decode attention split takes | kernels:llm deepseek41 |
+| `NS_DS41_ATTN_G` | 8 from 64 rows, else 2 | Experiment: groups of 8 heads an attention work-group takes | kernels:llm deepseek41 |
 
 ### museglimmer
 

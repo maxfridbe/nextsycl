@@ -567,6 +567,7 @@ dependencies = [
  "nextsycl-llm",
  "nextsycl-llm-deepseek2",
  "nextsycl-llm-deepseek4",
+ "nextsycl-llm-deepseek41",
  "nextsycl-llm-example",
  "nextsycl-llm-glm5next",
  "nextsycl-llm-museglimmer",
@@ -824,6 +825,16 @@ dependencies = [
 
 [[package]]
 name = "nextsycl-llm-deepseek4"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-gguf",
+ "nextsycl-llm",
+ "nextsycl-tok",
+]
+
+[[package]]
+name = "nextsycl-llm-deepseek41"
 version = "0.0.0"
 dependencies = [
  "nextsycl-core",
