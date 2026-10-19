@@ -63,6 +63,8 @@ pub struct Switch {
     pub idle: Option<Duration>,
     /// maintenance mode's notice file (crate::maintenance), read on every request
     pub maintenance: Option<std::path::PathBuf>,
+    /// the GPU run lock (crate::gpulock): while a run holds it no model is loaded or swapped in
+    pub gpu_lock: Option<std::path::PathBuf>,
     swap: Mutex<()>,
     last_use: Mutex<HashMap<String, Instant>>,
     /// model id -> kept until (X-Keep-Up-S)
@@ -90,7 +92,7 @@ impl Switch {
     pub fn new(models: Models, aliases: HashMap<String, String>, upstream: Target, studio_url: &str, wait: Duration, in_use: Duration)
                -> Result<Switch, String> {
         let (host, path) = http::split_url(studio_url)?;
-        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, images: None, idle: None, maintenance: None, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()), keep: Mutex::new(HashMap::new()) })
+        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, images: None, idle: None, maintenance: None, gpu_lock: None, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()), keep: Mutex::new(HashMap::new()) })
     }
 
     pub fn run(self: Arc<Self>, addr: &str) -> Result<(), String> {
@@ -179,6 +181,10 @@ impl Switch {
                 return Some(err(409, format!("{oname} is loaded and in use; switching to {} would cut that conversation off. Try again in a minute, or pick {oname}.",
                                              want.title)));
             }
+        }
+        // a GPU run holds the cards: nothing loads beside it
+        if let Some((f, h)) = self.gpu_lock.as_deref().and_then(|f| crate::gpulock::held(f).map(|h| (f, h))) {
+            return Some((503, json!({"error": {"message": crate::gpulock::message(f, &h), "type": "cards_taken", "code": "cards_taken"}})));
         }
         if let Err(e) = self.studio(Some(&want.id)) {
             return Some(err(503, format!("the model switch (the studio's llm.mode) did not answer: {e}")));

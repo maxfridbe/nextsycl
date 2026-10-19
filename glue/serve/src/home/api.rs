@@ -379,7 +379,7 @@ const FEATURES: &[&str] = &[
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
-    "system.drives", "system.move",
+    "system.drives", "system.move", "errors.cards_taken",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -408,7 +408,18 @@ pub(crate) fn code_of(status: u16) -> &'static str {
 /// Whether the same call may succeed later unchanged: the box was busy or a server did not answer (not a bad value,
 /// a missing or disabled model, a cancel)
 pub(crate) fn retryable(status: u16, code: &str) -> bool {
-    matches!(status, 502..=504) || code == "busy" || code == "maintenance"
+    matches!(status, 502..=504) || code == "busy" || code == "maintenance" || code == "cards_taken"
+}
+
+/// An OpenAI route's error: {"error": {message, type}}; cards taken by a GPU run (crate::gpulock) as maintenance's,
+/// with its code and Retry-After
+fn openai_error(s: &mut Conn, st: u16, m: &str) {
+    if m.starts_with("cards taken:") {
+        let body = json!({"error": {"message": m, "type": "cards_taken", "code": "cards_taken"}});
+        let extra = format!("Retry-After: {}\r\n", crate::gpulock::RETRY_AFTER_S);
+        return http::respond_bytes(s, st, "application/json", body.to_string().as_bytes(), &extra);
+    }
+    http::respond(s, st, &json!({"error": {"message": m, "type": if st == 401 { "invalid_api_key" } else { "invalid_request_error" }}}));
 }
 
 /// An error's body: code, message, whether to retry, and the status as a number (the same as the HTTP one, so a
@@ -424,9 +435,14 @@ pub(crate) fn rpc_error(method: &str, status: u16, code: Option<&str>, m: &str) 
     let mut e = error_of(status, m);
     // a job refused with queue: false says "busy: ..." (as video's busy)
     let code = code.or_else(|| (status == 409 && m.starts_with("busy:")).then_some("busy"));
+    // a load refused while a GPU run holds the cards (crate::gpulock) says "cards taken: ..."
+    let code = code.or_else(|| m.starts_with("cards taken:").then_some("cards_taken"));
     if let Some(c) = code {
         e["code"] = json!(c);
         e["retryable"] = json!(retryable(status, c));
+    }
+    if e["code"] == "cards_taken" {
+        e["retry_after_s"] = json!(crate::gpulock::RETRY_AFTER_S);
     }
     e["method"] = if method.is_empty() { Value::Null } else { json!(method) };
     e["field"] = field_of(method, m).map_or(Value::Null, |f| json!(f));
@@ -466,14 +482,14 @@ impl Home {
                 // HTTP 200: the envelope is the answer, error.status keeps the number
                 http::respond(s, 200, &json!({"ok": false, "error": rpc_error(&method, st, code, &m)}));
             } else {
-                http::respond(s, st, &json!({"error": {"message": m, "type": if st == 401 { "invalid_api_key" } else { "invalid_request_error" }}}));
+                openai_error(s, st, &m);
             }
         };
         let fail = |s: &mut Conn, st: u16, m: String| {
             if rpc {
                 fail_as(s, st, None, m);
             } else {
-                http::respond(s, st, &json!({"error": {"message": m, "type": if st == 401 { "invalid_api_key" } else { "invalid_request_error" }}}));
+                openai_error(s, st, &m);
             }
         };
         if !self.authorized(&req) {
@@ -768,7 +784,7 @@ impl Home {
         }).collect();
         let maintenance = self.maintenance().map(|n| super::maint::public(&n));
         json!({"busy": !reasons.is_empty(), "reasons": reasons, "loading": loading, "working": working, "llm": {"active": active},
-               "maintenance": maintenance,
+               "maintenance": maintenance, "cards_taken": self.cards_taken(),
                "jobs": jobs, "video": video, "cards": per_card, "slots": slots, "parallel": self.parallel(all)})
     }
 
@@ -1671,6 +1687,8 @@ mod tests {
         assert_eq!(rpc_error("video.cancel", 409, Some("not_running"), "no job is running")["retryable"], false);
         assert_eq!(rpc_error("image.enable", 409, None, "disabled")["retryable"], false);
         assert_eq!(rpc_error("audio.speak", 499, None, "cancelled")["code"], "cancelled");
+        let e = rpc_error("image.generate", 503, None, "cards taken: a GPU run holds /tmp/ds2run.lock (pid 7)");
+        assert_eq!((e["code"].as_str(), e["retryable"].as_bool(), e["retry_after_s"].as_u64()), (Some("cards_taken"), Some(true), Some(120)));
         for (st, c) in [(400, "invalid_params"), (401, "unauthorized"), (404, "not_found"), (502, "unavailable"), (504, "timeout"), (500, "internal")] {
             assert_eq!(code_of(st), c);
         }

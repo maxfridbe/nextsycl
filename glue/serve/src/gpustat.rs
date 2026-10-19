@@ -246,12 +246,23 @@ impl Card {
     }
 }
 
+/// A card's line in the file's `cards`: which card, its memory
+fn slim(r: &Value) -> Value {
+    json!({"pci": r["pci"], "name": r["name"], "vram_used_mb": r["vram_used_mb"], "vram_total_mb": r["vram_total_mb"]})
+}
+
 /// Samples until the process ends (or once)
 pub fn run(o: Options) -> Result<(), String> {
     let pci = o.pci.clone().or_else(find_card).ok_or("no Intel GPU on the xe driver (--pci ADDR)")?;
     let mut card = Card::open(&pci, o.vram_mb);
+    // every other card's memory too (`cards`, the first being this one): the front door plans loads with what root
+    // sees - every user's processes
+    let mut others: Vec<Card> = find_cards().iter().filter(|p| **p != pci).map(|p| Card::open(p, None)).collect();
     loop {
-        let (out, _) = card.sample(o.power_window);
+        let (mut out, _) = card.sample(o.power_window);
+        let mut all = vec![slim(&out)];
+        all.extend(others.iter_mut().map(|c| slim(&c.sample(o.power_window).0)));
+        out["cards"] = json!(all);
         if o.once {
             println!("{out}");
             return Ok(());

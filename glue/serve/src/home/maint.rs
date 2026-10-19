@@ -113,7 +113,7 @@ impl Home {
     }
 
     /// The video studio's queue paused; what was paused before (to put back): none when no studio answers
-    fn video_pause(&self) -> Value {
+    pub(super) fn video_pause(&self) -> Value {
         if !self.kinds_on(&self.models()).contains(&"video") {
             return Value::Null;
         }
@@ -136,7 +136,7 @@ impl Home {
     }
 
     /// The video queue as it was: resumed, then the projects and batches paused before paused again
-    fn video_restore(&self, r: &Value) {
+    pub(super) fn video_restore(&self, r: &Value) {
         if r.is_null() || r["was_all"] == true {
             return;
         }

@@ -10,7 +10,12 @@
 //!   one running), ending itself when idle. A second (`--slot 1`, NS_IMAGE_PORT2 / NS_AUDIO_PORT2) holds another model,
 //!   or a second copy of a model enabled on two cards: started when a request finds its copy with work and its other
 //!   card with room; requests go to the copy without work, else the one with fewer. A start waits for the card to have the model's memory free (1.5 GiB to spare: past that the xe driver
-//!   spills into host memory and the box can hang), and answers 503 no_room when it does not come free.
+//!   spills into host memory and the box can hang), and answers 503 no_room when it does not come free. Free is what
+//!   every process leaves (the root sampler's gpustat file counts other users'), less what loads started here have
+//!   yet to take.
+//! - GPU work this page does not manage (a test, a benchmark) holds the run lock (crate::gpulock, NS_GPU_LOCK): while
+//!   it is held no model loads - requests are refused with `cards_taken` (503, retryable), jobs wait, the video queue
+//!   pauses (mod.rs video_hold); what is loaded keeps answering.
 //! - video: the daemon (`nextsycl video start`) with the enabled video models as its engines, on their GPUs; its
 //!   workers load per clip and let the card go when idle. No video model enabled: the daemon is stopped.
 
@@ -58,6 +63,18 @@ type VideoDaemon = (Vec<String>, Vec<(String, usize)>);
 /// Whether something listens on 127.0.0.1:`port`
 fn listening(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300)).is_ok()
+}
+
+/// A card's free memory, MiB: total less used, less what each load under way (its server's port, the MiB it was
+/// placed for) has not taken yet - two loads planned at once on one card must not both count the same free memory
+fn free_on(c: &Value, pending: &[(u16, u64)]) -> u64 {
+    let free = c["vram_total_mb"].as_u64().unwrap_or(0).saturating_sub(c["vram_used_mb"].as_u64().unwrap_or(0));
+    let to_come: u64 = pending.iter().map(|(port, mb)| {
+        let has = c["procs"].as_array().into_iter().flatten().filter(|p| p["port"].as_str() == Some(port.to_string().as_str()))
+            .map(|p| p["vram_mb"].as_u64().unwrap_or(0)).sum::<u64>();
+        mb.saturating_sub(has)
+    }).sum();
+    free.saturating_sub(to_come)
 }
 
 /// An image, audio or 3D model: it loads whole on one card (the first of its cards with room)
@@ -642,6 +659,17 @@ impl Home {
         if let Some(why) = self.moving_why(id) {
             return Err((409, why));
         }
+        // a GPU run holds the cards: refused now (the load would only wait in the background)
+        if let Some(why) = self.cards_taken() {
+            let loaded = match registry::kind_of(&m) {
+                "llm" => self.chat_loaded(&self.models()).as_deref() == Some(id),
+                "video" => true,
+                k => self.loaded_of(k).iter().any(|x| x == id),
+            };
+            if !loaded {
+                return Err((503, why));
+            }
+        }
         if self.loading.lock().unwrap().insert(id.to_string(), now()).is_some() {
             return Ok(());
         }
@@ -731,7 +759,7 @@ impl Home {
             return Err((409, format!("{id} is disabled (enable it on :8000 or nextsycl models enable {id})")));
         }
         let limit = Duration::from_secs(if job.is_some() { JOB_ROOM_WAIT_S } else { ROOM_WAIT_S });
-        let t0 = Instant::now();
+        let mut t0 = Instant::now();
         loop {
             if job.is_some_and(|j| self.job_cancelled(j)) {
                 return Err((499, format!("cancelled while it waited for {id}")));
@@ -749,6 +777,17 @@ impl Home {
                 Ok(lease) => return Ok(lease),
                 Err(why) => why,
             };
+            // a GPU run holds the cards: a request is refused at once (cards_taken, retryable); a job waits in its queue
+            // as long as the run lasts (as in maintenance), its room wait starting when the run ends
+            if why.starts_with("cards taken:") {
+                if job.is_none() {
+                    return Err((503, why));
+                }
+                self.note(job, "cards_taken", &why);
+                std::thread::sleep(Duration::from_secs(3));
+                t0 = Instant::now();
+                continue;
+            }
             self.note(job, "waiting", &why);
             if t0.elapsed() > limit {
                 return Err((503, format!("{why}; {id} loads once one of them idles out or is stopped")));
@@ -785,15 +824,18 @@ impl Home {
             // with the fewest requests (its server queues it)
             let on: Vec<usize> = mine.iter().filter_map(|x| card_of_port(&cards, x.port)).collect();
             let spare = sv.iter().find(|x| x.model.is_none()).or_else(|| sv.iter().find(idle_other));
-            let plan = gpus.iter().copied().filter(|g| !on.contains(g))
+            // (no second copy while a GPU run holds the cards)
+            let plan = gpus.iter().copied().filter(|g| !on.contains(g)).filter(|_| self.cards_taken().is_none())
                 .find_map(|g| self.room_plan(&cards, g, want(g), kind, true).map(|p| (g, p)));
             if let (Some(x), Some((gpu, plan))) = (spare, plan) {
                 // (a plan another request's lock stands in the way of: no copy now, the requests share the first)
                 let started = self.free(&plan, kind, id).and_then(|_| {
                     self.stop_slot(kind, x, id)?;
-                    self.wait_room(gpu, want(gpu));
+                    if !self.wait_room(gpu, want(gpu)) {
+                        return Err((503, format!("GPU {gpu} did not come free")));
+                    }
                     self.note(job, "loading", &format!("a second copy of {id} loading on GPU {gpu} (server {})", x.slot + 1));
-                    self.start_at(kind, id, x, gpu)
+                    self.start_at(kind, id, x, gpu, want(gpu))
                 });
                 match started {
                     Ok(()) => return Ok(Ok(self.lease(x.port))),
@@ -806,6 +848,10 @@ impl Home {
                 self.wait_up(x.port, id)?;
             }
             return Ok(Ok(self.lease(x.port)));
+        }
+        // not loaded, and a GPU run holds the cards (crate::gpulock): nothing loads beside it
+        if let Some(why) = self.cards_taken() {
+            return Ok(Err(why));
         }
         // not loaded: the first card of its with the room now, or once idle models there go (picture and sound
         // servers, an idle video worker, a chat model not kept by X-Keep-Up-S); a slot no server holds, else one an
@@ -844,9 +890,12 @@ impl Home {
         if let Err((_, e)) = self.free(&plan, kind, id) {
             return Ok(Err(e));
         }
-        self.wait_room(gpu, want(gpu));
+        // the memory let go in a moment; when it does not (or something else took it), no load: the next try plans again
+        if !self.wait_room(gpu, want(gpu)) {
+            return Ok(Err(self.no_room(&self.named_cards(&self.models()), &[gpu], id, want(gpu))));
+        }
         self.note(job, "loading", &format!("{id} loading on GPU {gpu} (server {})", x.slot + 1));
-        self.start_at(kind, id, x, gpu)?;
+        self.start_at(kind, id, x, gpu, want(gpu))?;
         Ok(Ok(self.lease(x.port)))
     }
 
@@ -879,11 +928,15 @@ impl Home {
 
     /// The message for no room: each card, what it has free and who holds the rest (busy or idle)
     fn no_room(&self, cards: &Value, gpus: &[usize], id: &str, want: u64) -> String {
-        let free = |g: usize| cards.get(g).map_or(0, |c| c["vram_total_mb"].as_u64().unwrap_or(0).saturating_sub(c["vram_used_mb"].as_u64().unwrap_or(0)));
+        let free = |g: usize| self.free_mb(cards, g);
         let busy: Vec<String> = gpus.iter().map(|g| {
-            let holders: Vec<String> = cards.get(*g).and_then(|c| c["procs"].as_array()).into_iter().flatten()
+            let mut holders: Vec<String> = cards.get(*g).and_then(|c| c["procs"].as_array()).into_iter().flatten()
                 .map(|p| format!("{} {:.1} GiB", p["model"].as_str().or(p["program"].as_str()).unwrap_or("?"), p["vram_mb"].as_u64().unwrap_or(0) as f64 / 1024.0))
                 .collect();
+            // what only the root sampler sees (processes of other users)
+            if let Some(mb) = cards.get(*g).and_then(|c| c["vram_unseen_mb"].as_u64()).filter(|mb| *mb >= 256) {
+                holders.push(format!("processes of other users {:.1} GiB", mb as f64 / 1024.0));
+            }
             format!("GPU {g}: {:.1} GiB free ({})", free(*g) as f64 / 1024.0, holders.join(", "))
         }).collect();
         format!("{} held by work that is not idle - {}; {id} needs ~{:.1} GiB", if gpus.len() > 1 { "its cards are" } else { "its card is" },
@@ -897,7 +950,7 @@ impl Home {
     /// free its own kind's chat or video.
     fn room_plan(&self, cards: &Value, g: usize, want: u64, asking: &str, light: bool) -> Option<Vec<Holder>> {
         let c = cards.get(g)?;
-        let free = c["vram_total_mb"].as_u64().unwrap_or(0).saturating_sub(c["vram_used_mb"].as_u64().unwrap_or(0));
+        let free = self.free_mb(cards, g);
         if free >= want {
             return Some(Vec::new());
         }
@@ -980,16 +1033,33 @@ impl Home {
         Ok(())
     }
 
-    /// Wait (30 s at most) until card `g` has `want` MiB free: a stopped process lets go of its memory in a moment
-    fn wait_room(&self, g: usize, want: u64) {
+    /// Wait (30 s at most) until card `g` has `want` MiB free: a stopped process lets go of its memory in a moment.
+    /// False: it did not come free (the load must not start - past the card the xe driver spills into host memory)
+    fn wait_room(&self, g: usize, want: u64) -> bool {
         let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(30) {
-            let free = self.cards.lock().unwrap().get(g).map_or(0, |c| c["vram_total_mb"].as_u64().unwrap_or(0).saturating_sub(c["vram_used_mb"].as_u64().unwrap_or(0)));
-            if free >= want {
-                return;
+        loop {
+            let cards = self.cards.lock().unwrap().clone();
+            if self.free_mb(&cards, g) >= want {
+                return true;
+            }
+            if t0.elapsed() >= Duration::from_secs(30) {
+                return false;
             }
             std::thread::sleep(Duration::from_secs(1));
         }
+    }
+
+    /// What card `g` has free now, MiB: its memory less what is in use - by every process, ours or not (the page's own
+    /// sampler, or the root sampler's gpustat file when that sees more: mod.rs sample_cards) - and less what the
+    /// loads started here have yet to take
+    pub(crate) fn free_mb(&self, cards: &Value, g: usize) -> u64 {
+        let Some(c) = cards.get(g) else { return 0 };
+        let pending: Vec<(u16, u64)> = {
+            let mut l = self.pending.lock().unwrap();
+            l.retain(|p| p.3.is_none_or(|t| t.elapsed() < Duration::from_secs(6)));
+            l.iter().filter(|p| p.0 == g).map(|p| (p.1, p.2)).collect()
+        };
+        free_on(c, &pending)
     }
 
     /// Whether the studio has nothing to make: no clip running, none runnable in the queue
@@ -1041,6 +1111,10 @@ impl Home {
         if self.chat_loaded(&all).as_deref() == Some(id) {
             return Ok(());
         }
+        // a GPU run holds the cards (crate::gpulock): no chat model loads beside it
+        if let Some(why) = self.cards_taken() {
+            return Err((503, why));
+        }
         let gpus = self.gpus_of(m);
         let t0 = Instant::now();
         loop {
@@ -1051,7 +1125,7 @@ impl Home {
             let chat_on = |g: usize| cards.get(g).and_then(|c| c["procs"].as_array()).into_iter().flatten()
                 .filter(|p| p["kind"] == "llm").map(|p| p["vram_mb"].as_u64().unwrap_or(0)).sum::<u64>();
             let want = |g: usize| (need.get(&g).copied().unwrap_or(0) + MARGIN_MB).saturating_sub(chat_on(g));
-            let free = |g: usize| cards.get(g).map_or(0, |c| card_mb(g).saturating_sub(c["vram_used_mb"].as_u64().unwrap_or(0)));
+            let free = |g: usize| self.free_mb(&cards, g);
             let short: Vec<usize> = gpus.iter().copied().filter(|g| free(*g) < want(*g)).collect();
             if short.is_empty() {
                 return Ok(());
@@ -1075,8 +1149,25 @@ impl Home {
         }
     }
 
-    /// `id` started in slot `x` on card `gpu`, answering
-    fn start_at(&self, kind: &str, id: &str, x: &Slot, gpu: usize) -> Result<(), (u16, String)> {
+    /// A GPU run holding the cards (crate::gpulock, NS_GPU_LOCK): the sentence a refused load or a waiting job reads
+    pub(crate) fn cards_taken(&self) -> Option<String> {
+        let f = crate::gpulock::path(self.o.cfg.get("NS_GPU_LOCK"))?;
+        crate::gpulock::held(&f).map(|h| crate::gpulock::message(&f, &h))
+    }
+
+    /// `id` started in slot `x` on card `gpu` (placed for `want` MiB, the spare included), answering; until it answers,
+    /// the memory it has yet to take counts as taken there (free_mb)
+    fn start_at(&self, kind: &str, id: &str, x: &Slot, gpu: usize, want: u64) -> Result<(), (u16, String)> {
+        self.pending.lock().unwrap().push((gpu, x.port, want.saturating_sub(MARGIN_MB), None));
+        let r = self.start_at_(kind, id, x, gpu);
+        // kept a few seconds more: the cards are sampled every 2 s, the server's memory shows on the next
+        for p in self.pending.lock().unwrap().iter_mut().filter(|p| p.1 == x.port && p.3.is_none()) {
+            p.3 = Some(Instant::now());
+        }
+        r
+    }
+
+    fn start_at_(&self, kind: &str, id: &str, x: &Slot, gpu: usize) -> Result<(), (u16, String)> {
         let secs = (self.o.idle_minutes * 60).to_string();
         let mut args = vec![kind.to_string(), "start".into(), id.into(), "--gpu".into(), gpu.to_string(), "--port".into(), x.port.to_string(),
                             "--host".into(), self.o.serve_host.clone(), "--wfe".into(), "--slot".into(), x.slot.to_string()];
@@ -1161,6 +1252,21 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_load_under_way_counts_what_it_has_yet_to_take() {
+        let c = json!({"vram_total_mb": 32768, "vram_used_mb": 8192,
+                       "procs": [{"port": "8086", "vram_mb": 6000}, {"port": "8087", "vram_mb": 2192}]});
+        assert_eq!(free_on(&c, &[]), 24576);
+        // an audio server loading on :8097 for 10 GiB, nothing of it on the card yet
+        assert_eq!(free_on(&c, &[(8097, 10240)]), 24576 - 10240);
+        // the image server on :8086 placed for 20000, 6000 of it taken so far
+        assert_eq!(free_on(&c, &[(8086, 20000)]), 24576 - 14000);
+        // one that took more than placed for owes nothing
+        assert_eq!(free_on(&c, &[(8087, 1000)]), 24576);
+        // never below nothing
+        assert_eq!(free_on(&c, &[(8097, 40000)]), 0);
+    }
 
     #[test]
     fn a_chat_model_split_over_every_card_has_no_choice_of_cards() {

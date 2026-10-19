@@ -47,6 +47,8 @@ pub fn switch(args: &[String]) -> Result<(), String> {
     sw.images = opt(args, "--images").map(|a| Target::Tcp(a.to_string()));
     // the front door's maintenance notice, beside the registry
     sw.maintenance = Some(nextsycl_serve::maintenance::file_beside(&models::registry(&Config::load())));
+    // the GPU run lock (NS_GPU_LOCK): no chat model swapped in while a run holds it
+    sw.gpu_lock = nextsycl_serve::gpulock::path(Config::load().get("NS_GPU_LOCK"));
     // the same idle time as the front door's (NS_IDLE_MINUTES), unless given
     let idle = opt(args, "--idle-minutes").map(str::to_string).or_else(|| Config::load().get("NS_IDLE_MINUTES"));
     sw.idle = idle.map(|v| v.parse::<f64>().map_err(|_| "--idle-minutes N")).transpose()?.filter(|m| *m > 0.0)

@@ -36,6 +36,7 @@ pub const SETTINGS: &[Setting] = &[
     st("NS_SERVE_PORT", "front door", "8000", "this page's port", &["serve"]),
     st("NS_API_TOKEN", "front door", "made once (serve.json)", "the API's bearer token", &["serve"]),
     st("NS_IDLE_MINUTES", "front door", "10", "an enabled model unloads after this long without a request (0: never)", &["serve", "switch"]),
+    st("NS_GPU_LOCK", "front door", "/tmp/ds2run.lock", "the lock file GPU runs it does not manage hold (flock): while held no model loads (cards_taken), jobs wait, the video queue pauses (off: none)", &["serve", "switch"]),
     st("NS_SWITCH_PORT", "front door", "8001", "the model switcher's port (Open WebUI's endpoint)", &["serve"]),
     st("NS_IMAGE_PORT", "front door", "8086", "the image server's port", &["serve"]),
     st("NS_AUDIO_PORT", "front door", "8087", "the audio server's port", &["serve"]),

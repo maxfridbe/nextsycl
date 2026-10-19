@@ -9,6 +9,7 @@ pub mod cancel;
 pub mod carry;
 pub mod drives;
 pub mod files;
+pub mod gpulock;
 pub mod gpustat;
 pub mod home;
 pub mod idle;

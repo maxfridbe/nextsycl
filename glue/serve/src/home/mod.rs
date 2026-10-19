@@ -106,6 +106,11 @@ pub struct Home {
     stages: Mutex<BTreeMap<String, (String, String)>>,
     /// chat model id -> kept until (unix seconds): X-Keep-Up-S on /v1/chat/completions, keep_up_s on llm.chat
     chat_keep: Mutex<BTreeMap<String, f64>>,
+    /// loads started here and not yet answering (or answering a moment ago): card, server port, MiB placed for, when
+    /// it answered - what they have yet to take counts as taken (life.rs free_mb)
+    pending: Mutex<Vec<Pending>>,
+    /// the video queue paused while a GPU run held the cards (crate::gpulock): what to put back when it ends
+    lock_paused: Mutex<Option<Value>>,
     /// maintenance mode's notice (crate::maintenance: beside the registry, every service reads it) and the key that
     /// lets a request through it (kept in the state file; empty: none)
     maint_file: PathBuf,
@@ -113,6 +118,30 @@ pub struct Home {
     /// the drives: their measured speeds (kept in the state file), a measurement and a move under way (disks.rs)
     disks: disks::Disks,
 }
+
+/// The cards as this page sampled them, with what the root sampler's file (`nextsycl gpustat`: one card at its top
+/// level, every card in `cards`) saw used where that is more - processes of other users this page cannot read; the
+/// difference is `vram_unseen_mb`. A reading older than 15 s is left out.
+fn merge_gpustat(cards: &mut [Value], st: &Value, now: f64) {
+    if st["ts"].as_f64().is_none_or(|ts| (now - ts).abs() > 15.0) {
+        return;
+    }
+    let mut seen: Vec<&Value> = vec![st];
+    seen.extend(st["cards"].as_array().into_iter().flatten());
+    for s in seen {
+        let (Some(pci), Some(used)) = (s["pci"].as_str(), s["vram_used_mb"].as_u64()) else { continue };
+        for c in cards.iter_mut().filter(|c| c["pci"] == pci) {
+            let mine = c["vram_used_mb"].as_u64().unwrap_or(0);
+            if used > mine {
+                c["vram_used_mb"] = json!(used);
+                c["vram_unseen_mb"] = json!(used - mine);
+            }
+        }
+    }
+}
+
+/// A load under way: card, server port, MiB placed for, when it answered
+type Pending = (usize, u16, u64, Option<std::time::Instant>);
 
 pub(crate) fn now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
@@ -198,6 +227,7 @@ impl Home {
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()), chat_keep: Mutex::new(BTreeMap::new()),
+            pending: Mutex::new(Vec::new()), lock_paused: Mutex::new(None),
             maint_file, maint_bypass, disks: disks::Disks::new(&st),
         });
         let me = h.clone();
@@ -230,7 +260,15 @@ impl Home {
                 }).collect();
                 r
             }).collect();
+            let mut v = v;
+            // the root sampler's reading (gpustat.json) sees every process's memory; this page only its user's
+            let stat = self.o.cfg.get("NS_VIDEO_GPUSTAT").unwrap_or_else(|| "/run/gpustat.json".into());
+            if let Some(st) = std::fs::read(&stat).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+                merge_gpustat(&mut v, &st, now());
+            }
             *self.cards.lock().unwrap() = Value::from(v);
+            // a GPU run holding the cards pauses the video queue until it ends (crate::gpulock)
+            self.video_hold(self.cards_taken().is_some());
             // the most each model took on each card, kept for the vouching estimates
             let named = self.named_cards(&self.models());
             let mut changed = false;
@@ -254,6 +292,24 @@ impl Home {
                 self.save_state();
             }
             std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// The video queue while a GPU run holds the cards: paused when the run starts, put back as it was when it ends
+    /// (maintenance on meanwhile: that mode's pause stands, the queue stays as it is until the mode ends)
+    fn video_hold(&self, taken: bool) {
+        let mut paused = self.lock_paused.lock().unwrap();
+        if self.maintenance().is_some() {
+            return;
+        }
+        if taken && paused.is_none() {
+            eprintln!("{}: the video queue paused", self.cards_taken().unwrap_or_default());
+            *paused = Some(self.video_pause());
+        } else if !taken {
+            if let Some(r) = paused.take() {
+                eprintln!("the GPU run ended: the video queue as it was");
+                self.video_restore(&r);
+            }
         }
     }
 
@@ -437,7 +493,7 @@ impl Home {
         });
         json!({"ts": now(), "host": meminfo(), "cards": cards, "models": models, "services": self.services(), "runs": runs,
                "idle_minutes": self.o.idle_minutes, "ports": {"video": self.o.ports.video, "chat_ui": self.o.ports.chat_ui},
-               "maintenance": maintenance, "drives": self.drives_view(&all, &models)})
+               "maintenance": maintenance, "cards_taken": self.cards_taken(), "drives": self.drives_view(&all, &models)})
     }
 
     /// The cards, a process's model by its registry id where its file is a registered one (`model_id`)
@@ -530,5 +586,29 @@ impl Home {
             "move_cancel" => self.move_cancel(),
             other => Err((400, format!("no action {other:?} (enable, disable, gpus, load, unload, config, restart, maintenance, measure, move, move_cancel)"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_root_samplers_reading_counts_where_it_sees_more() {
+        let mut cards = vec![json!({"pci": "0000:03:00.0", "vram_used_mb": 1000, "vram_total_mb": 32768}),
+                             json!({"pci": "0000:08:00.0", "vram_used_mb": 9000, "vram_total_mb": 32768})];
+        let st = json!({"pci": "0000:03:00.0", "vram_used_mb": 31000, "ts": 100.0,
+                        "cards": [{"pci": "0000:03:00.0", "vram_used_mb": 31000}, {"pci": "0000:08:00.0", "vram_used_mb": 4000}]});
+        let mut stale = cards.clone();
+        merge_gpustat(&mut stale, &st, 200.0);
+        assert_eq!(stale, cards, "an old reading is left out");
+        merge_gpustat(&mut cards, &st, 104.0);
+        assert_eq!((cards[0]["vram_used_mb"].as_u64(), cards[0]["vram_unseen_mb"].as_u64()), (Some(31000), Some(30000)));
+        // this page saw more on the second card: its own reading stands
+        assert_eq!((cards[1]["vram_used_mb"].as_u64(), cards[1].get("vram_unseen_mb")), (Some(9000), None));
+        // an old file with no `cards` (one card at the top level)
+        let mut one = vec![json!({"pci": "0000:08:00.0", "vram_used_mb": 0})];
+        merge_gpustat(&mut one, &json!({"pci": "0000:08:00.0", "vram_used_mb": 2048, "ts": 5.0}), 5.0);
+        assert_eq!(one[0]["vram_used_mb"], 2048);
     }
 }
