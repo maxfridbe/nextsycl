@@ -45,8 +45,10 @@ malformed prompts; the parity checks did not (they read the reference's token id
 | prompt, 16-21 tokens (served, after the first) | ~0.7 s for 41-65 tokens on malformed prompts | 0.6-0.7 s |
 | prompt, 2.3K | 144 tok/s | 323-384 tok/s |
 | prompt, 8.7K | 203 tok/s | 466-532 tok/s |
-| prompt, 35K | 138.5 tok/s | 581-586 tok/s (the needle found) |
-| decode, no drafts (256 tokens) | 20.5-21.1 tok/s (malformed prompts) | 19-21 tok/s |
+| prompt, 35K | 138.5 tok/s | 565-600 tok/s (the needle found) |
+| prompt, 318K (1M window) | - | 585 tok/s (479 before the candidate-only indexer), the needle found |
+| prompt, 1,025,205 tokens (1M window) | 59 min for 1.07M (302 tok/s, the first served build) | 33 min (520 tok/s), the needle found |
+| decode, no drafts (256 tokens; NS_DS41_FREE_GIB=1.5 as served) | 20.5-21.1 tok/s (malformed prompts) | 128K window 21.0-22.9 tok/s, 1M window 20.3-21.3 |
 | Engram wait a decode token | 1.3-1.9 ms (the old SATA-class drive) | 0.11 ms |
 
 Run to run the same command varies by about 5-7%; the ranges are of several runs.
@@ -80,9 +82,27 @@ B70 (NS_SPLIT=24 / 28 with the kv source's keys mirrored on the B65: slower - th
 the VQ decode lookup table's run count. The decode VQ lookup-table variant (each 8 values of x against every
 codebook entry in local memory) is timed at load with the others: the B65 takes it (12-bit gate | up 418 -> 328 us).
 
+Round 2 (562da98, e4d273b, 2abd21a):
+
+8. **Decode reads the next layer's likely file-only experts ahead** (its router's guess on this layer's input, chance
+   >= 0.15, at most 8, 4 reader threads): the host's turn from router to products had the drive in it - 128K window
+   20.4 / 19.9 -> 22.9 / 21.0 tok/s (story / code).
+9. **The decode lookup table 1,024 lanes a work-group, 32 runs a row** (B65 12-bit gate | up 328 -> 263 us; the B70
+   takes it too for 12-bit gate | up), victims by partial selection, 8 spare VRAM slots a store.
+10. **The index sources after the candidate source (24-36) score only their 2,048 candidate blocks** (16K keys) instead of
+   every key masked: the same picks (identical text), the B65's 2K chunks flat at 3.3-3.7 s across a 318K prompt
+   (3.5 -> 5.1 before); over a 1M prompt the chunks grow 2.5 -> 4.1 s (B70: layers 2, 8, 14, 20 still score every key)
+   and 3.7 -> 4.5 s (B65).
+
+Measured and not kept in round 2: decode's file reads after the resident experts' products in the same layer (no
+gain: a read outlasts those products), spin-waiting on the router's read back (no gain), the indexer's queries packed in
+global memory with 16 key tiles a sub-group (35K 490 vs 599 tok/s; 4 tiles: equal), a grouped one-column q4_K product
+for q_b's 20 items a row (B65 93 -> 124 us: slower).
+
 ## MTP (the DSpark towers)
 
-Off by default (NS_DS41_MTP=1). With well-formed prompts, 256 tokens --ignore-eos, two runs each: code without drafts
+Off by default (NS_DS41_MTP=1). Round 2, after the decode gains (256 tokens): code 21.2 without drafts, 20.6 with 1
+(82% kept), 20.4 with 2 (78%); prose 22.5 without, 16.8 with 1 (55%), 16.3 with 2 (50%) - still a loss. With well-formed prompts, 256 tokens --ignore-eos, two runs each: code without drafts
 19.0 / 18.4 tok/s, 1 draft 18.2 / 18.1 (82% kept), 2 drafts 17.9 / 19.8 (78%); prose 19.9 / 19.0, 1 draft 16.7 / 16.6
 (55%), 2 drafts 15.3 / 15.1 (50%). A verify pass's q4_K products now decode each weight once for all its columns
 (q4k_cols; spec-check: 0 of 138 three-row rows differ, max |diff| 0), and with the towers loaded the VQ lookup table is

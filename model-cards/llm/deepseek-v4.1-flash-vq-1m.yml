@@ -4,7 +4,7 @@ id: deepseek-v4.1-flash-vq-1m
 kind: llm
 arch: deepseek41
 title: DeepSeek-V4.1-Flash-1017 VQ · 1M context + a 32K chat (both GPUs, pinned memory and the NVMe)
-about: the same files as deepseek-v4.1-flash-vq with a 1M session (its compressed caches ~1.3 GiB a card) beside a 32K one; the needle found at 261K (503 tok/s prompt) and at 1,071,766 tokens (59 min, 302 tok/s; V4 took 62)
+about: the same files as deepseek-v4.1-flash-vq with a 1M session (its compressed caches ~1.3 GiB a card) beside a 32K one; the needle found at 318K (585 tok/s prompt) and at 1,025,205 tokens (33 min, 520 tok/s; V4 took 62 for 1.07M)
 gpus: all
 streams: true                   # the Engram's rows and the experts beyond VRAM and pinned memory are read from the drive while it serves
 vram_gib: 30.0
