@@ -70,6 +70,12 @@ int ns_ds41_cand_pos(ns_gpu* g, const int32_t* selc, const int32_t* cand, int32_
 /* score [T][ld] to -inf outside the blocks cand [T][K] lists (mark: scratch of T x nb bytes) */
 int ns_ds41_cand_mask(ns_gpu* g, float* score, const int32_t* cand, uint8_t* mark, int64_t T, int64_t n, int64_t ld, int64_t K, int64_t bs);
 
+/* A decode token's routing on the GPU and its products' tables from the layer's slot table (k41.cpp has the layout) */
+int ns_ds41_route1(ns_gpu* g, const float* logits, const float* bias, int64_t ne, int64_t used, float scale, const uint64_t* tab, uint64_t dummy,
+                   int64_t off_gate, int64_t off_up, int64_t off_down, uint8_t* gtab, uint8_t* dtab, int32_t* info, int32_t* ctab);
+/* dst[pairs[2i]] = pairs[2i + 1], n pairs */
+int ns_ds41_scatter_u64(ns_gpu* g, uint64_t* dst, const int64_t* pairs, int64_t n);
+
 /* The draft's Markov chain on the GPU: *tok = argmax(logits + bias) (the lowest index of a tie), n values */
 int ns_ds41_markov_step(ns_gpu* g, const float* logits, const float* bias, int64_t n, int32_t* tok);
 /* out [count][cols] = table rows idx[0..count) (the indices on the GPU) */

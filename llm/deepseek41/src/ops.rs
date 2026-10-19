@@ -529,6 +529,32 @@ impl Ops {
         let rc = unsafe { (self.k.ds41_cand_pos)(self.raw(), selc.ptr().cast(), cand.ptr().cast(), sel.ptr().cast(), t as i64, k as i64, kp as i64, bs as i64) };
         self.ok(rc, "ds41_cand_pos")
     }
+    /// A decode token's routing and its products' tables on the GPU (ns_ds41_route1): logits / bias [ne], the layer's slot
+    /// table tab [ne] (payload addresses, 0: not in VRAM); gtab / dtab / info as the kernel lays them out
+    #[allow(clippy::too_many_arguments)]
+    pub fn route1(&self, logits: &DevBuf, bias: &DevBuf, ne: usize, used: usize, scale: f32, tab: &DevBuf, dummy: u64, offs: (usize, usize, usize), gtab: &DevBuf,
+                  dtab: &DevBuf, info: &DevBuf, ctab: &DevBuf) -> Result<()> {
+        need!(logits, ne, "route1 logits");
+        need!(bias, ne, "route1 bias");
+        tab.bounds(0, ne * 8)?;
+        gtab.bounds(0, 2 * used * 48 + 33 * 4)?;
+        dtab.bounds(0, used * 48 + used * 33 * 4)?;
+        info.bounds(0, 3 * used * 4)?;
+        ctab.bounds(0, (2 + 2 * used) * 4)?;
+        // SAFETY: extents checked; dummy is a resident payload of the layer's span (read, never written).
+        let rc = unsafe {
+            (self.k.ds41_route1)(self.raw(), logits.fp(), bias.fp(), ne as i64, used as i64, scale, tab.ptr().cast(), dummy, offs.0 as i64, offs.1 as i64,
+                                 offs.2 as i64, gtab.ptr().cast(), dtab.ptr().cast(), info.ptr().cast(), ctab.ptr().cast())
+        };
+        self.ok(rc, "ds41_route1")
+    }
+    /// dst (u64 words)[pairs[2i]] = pairs[2i + 1], n pairs (on the device)
+    pub fn scatter_u64(&self, dst: &DevBuf, pairs: &DevBuf, n: usize) -> Result<()> {
+        pairs.bounds(0, n * 16)?;
+        // SAFETY: the pairs' indices are the caller's, inside dst (Part::tab_flush: layer x expert of its table).
+        let rc = unsafe { (self.k.ds41_scatter_u64)(self.raw(), dst.ptr().cast(), pairs.ptr().cast(), n as i64) };
+        self.ok(rc, "ds41_scatter_u64")
+    }
     pub fn cand_mask(&self, score: &DevBuf, cand: &DevBuf, mark: &DevBuf, t: usize, n: usize, ld: usize, k: usize, bs: usize) -> Result<()> {
         need!(score, t * ld, "cand_mask score");
         cand.bounds(0, t * k * 4)?;

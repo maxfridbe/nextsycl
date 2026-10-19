@@ -457,4 +457,129 @@ int ns_ds41_cand_pos(ns_gpu* g, const int32_t* selc, const int32_t* cand, int32_
     NS_CATCH
 }
 
+// A decode token's routing on the GPU (one row): the router's `used` best of `ne` experts (sqrt(softplus) + bias, ties to
+// the lower index; the host's order), their weights (sqrt(softplus) / their sum x scale, summed in rank order), and the
+// products' tables built from the layer's slot table (tab: an expert's VRAM payload or 0): gate | up entries (gtab:
+// ptrs[2u], meta[2u][10], the lookup lists [33]) and down entries (dtab: ptrs[u], meta[u][10], lists [u][33]), an expert
+// row j of dn in ascending id. info: ids[u] (ascending), weights[u] (bits), missing[u] (no VRAM slot: computed by the
+// host after it reads this). An expert not in VRAM gets an entry of no columns on a resident payload (`dummy`).
+int ns_ds41_route1(ns_gpu* g, const float* logits, const float* bias, int64_t ne, int64_t used, float scale, const uint64_t* tab, uint64_t dummy,
+                   int64_t off_gate, int64_t off_up, int64_t off_down, uint8_t* gtab, uint8_t* dtab, int32_t* info, int32_t* ctab) {
+    NS_TRY
+    if (used < 1 || used > 16 || ne < used || ne > 1024) return ns_fail("ns_ds41_route1: 1..16 of at most 1024 experts");
+    constexpr int WG = 1024;
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint64_t, 1> best(sycl::range<1>(16), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            const int lid = (int) it.get_local_id(0);
+            auto grp = it.get_group();
+            float pr = 0.f;
+            uint64_t key = 0;
+            if (lid < ne) {
+                const float z = logits[lid];
+                pr = sycl::sqrt(z > 20.f ? z : sycl::log1p(sycl::exp(z)));
+                const uint32_t u = sycl::bit_cast<uint32_t>(pr + bias[lid]);
+                const uint32_t k = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+                key = ((uint64_t) k << 32) | (uint64_t) (0xFFFFFFFFu - (uint32_t) lid);
+            }
+            for (int r = 0; r < used; ++r) {
+                const uint64_t m = sycl::reduce_over_group(grp, key, sycl::maximum<uint64_t>());
+                if (lid == 0) best[r] = m;
+                if (key == m) key = 0;   // taken
+                sycl::group_barrier(grp);
+            }
+            // the chosen experts' sqrt(softplus): each held by its own item
+            sycl::group_barrier(grp);
+            if (lid != 0) return;
+            int32_t id[16];
+            float prv[16];
+            for (int r = 0; r < used; ++r) {
+                id[r] = (int32_t) (0xFFFFFFFFu - (uint32_t) (best[r] & 0xFFFFFFFFu));
+                const float z = logits[id[r]];
+                prv[r] = sycl::sqrt(z > 20.f ? z : sycl::log1p(sycl::exp(z)));
+            }
+            float sum = 0.f;
+            for (int r = 0; r < used; ++r) sum += prv[r];
+            sum += 1e-20f;
+            float wr[16];
+            for (int r = 0; r < used; ++r) wr[r] = prv[r] / sum * scale;
+            // ascending id (rows of dn, the host's expert order)
+            int ord[16];
+            for (int r = 0; r < used; ++r) ord[r] = r;
+            for (int a = 1; a < used; ++a)
+                for (int b = a; b > 0 && id[ord[b]] < id[ord[b - 1]]; --b) {
+                    const int t2 = ord[b];
+                    ord[b] = ord[b - 1];
+                    ord[b - 1] = t2;
+                }
+            uint64_t* gp = reinterpret_cast<uint64_t*>(gtab);
+            int32_t* gm = reinterpret_cast<int32_t*>(gtab + 2 * used * 8);
+            int32_t* gl = gm + 2 * used * 10;
+            uint64_t* dp = reinterpret_cast<uint64_t*>(dtab);
+            int32_t* dm = reinterpret_cast<int32_t*>(dtab + used * 8);
+            int32_t* dl = dm + used * 10;
+            int nres = 0;
+            for (int i = 0; i < 1 + 2 * 16; ++i) gl[i] = 0;
+            for (int j = 0; j < used; ++j) {
+                const int r = ord[j];
+                const uint64_t base = tab[id[r]];
+                const bool res = base != 0;
+                const uint64_t b = res ? base : dummy;
+                info[j] = id[r];
+                info[used + j] = sycl::bit_cast<int32_t>(wr[r]);
+                // the combine's table (moe_combine: t_ptr [2], ent [u], then the weights)
+                ctab[2 + j] = j;
+                ctab[2 + used + j] = sycl::bit_cast<int32_t>(wr[r]);
+                info[2 * used + j] = res ? 0 : 1;
+                for (int w = 0; w < 2; ++w) {
+                    const int e = w * (int) used + j;
+                    gp[e] = b + (uint64_t) (w == 0 ? off_gate : off_up);
+                    int32_t* me = gm + e * 10;
+                    me[0] = res ? 1 : 0;
+                    me[1] = e;
+                    for (int c = 2; c < 10; ++c) me[c] = 0;
+                }
+                dp[j] = b + (uint64_t) off_down;
+                int32_t* me = dm + j * 10;
+                me[0] = res ? 1 : 0;
+                me[1] = j;
+                me[2] = j;
+                for (int c = 3; c < 10; ++c) me[c] = 0;
+                int32_t* dlj = dl + j * 33;
+                for (int c = 0; c < 33; ++c) dlj[c] = 0;
+                if (res) {
+                    dlj[0] = 1;
+                    dlj[1] = j;
+                    dlj[2] = 0;
+                    ++nres;
+                }
+            }
+            // gate | up: the token's column read by the resident experts' gate and up entries
+            int cnt = 0;
+            for (int w = 0; w < 2; ++w)
+                for (int j = 0; j < used; ++j)
+                    if (info[2 * used + j] == 0 && cnt < 16) {
+                        gl[1 + 2 * cnt] = w * (int) used + j;
+                        gl[2 + 2 * cnt] = 0;
+                        ++cnt;
+                    }
+            gl[0] = cnt;
+            ctab[0] = 0;
+            ctab[1] = (int32_t) used;
+            (void) nres;
+        });
+    });
+    return 0;
+    NS_CATCH
+}
+
+// dst[pairs[i].idx] = pairs[i].val, n pairs (i64 index, u64 value)
+int ns_ds41_scatter_u64(ns_gpu* g, uint64_t* dst, const int64_t* pairs, int64_t n) {
+    NS_TRY
+    if (n <= 0) return 0;
+    g->q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { dst[pairs[2 * i[0]]] = (uint64_t) pairs[2 * i[0] + 1]; });
+    return 0;
+    NS_CATCH
+}
+
 }  // extern "C"

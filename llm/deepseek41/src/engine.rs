@@ -136,6 +136,12 @@ fn idx_cand() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_DS41_IDX_CAND").map_or(true, |v| v != "0"))
 }
+/// Decode routes one token on the GPU and queues its VRAM experts' products before the host reads the routing
+/// (NS_DS41_GPU_ROUTE, default 1; off with the draft towers: verify passes route on the host)
+fn gpu_route() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_GPU_ROUTE").map_or(true, |v| v != "0"))
+}
 /// Token slots of one batch of a prompt's few-token experts (their gate | up and h in the arena)
 const PROMPT_MMV_SLOTS: usize = 1024;
 
@@ -386,6 +392,11 @@ struct Store {
     rwrite: HashMap<usize, i64>,
     /// the copy up last reading each host slot (a copy down into it waits for it)
     rread: HashMap<usize, i64>,
+    /// the slots' payload addresses on the GPU (the slot table's entries are copied from here), and the zeroing of a
+    /// slot's last expert in the table that a copy up into it waits for
+    slotaddr: Option<DevBuf>,
+    vzero: HashMap<usize, i64>,
+    n_expert: usize,
     down_any: Option<i64>,
     vfill: HashMap<usize, i64>,
     last_up: Option<i64>,
@@ -487,6 +498,8 @@ pub struct Part {
     ring_free: Mutex<Option<i64>>,
     /// decode's reads ahead of the file's experts (None: NS_DS41_FILE_AHEAD=0)
     reader: Option<FileReader>,
+    /// the slot table the GPU routes decode by: [layer][expert] -> the VRAM payload's address, 0 when not in VRAM
+    devtab: DevBuf,
     /// a prompt pass's pinned slots for the experts only the file holds: read on threads while the GPU multiplies the
     /// others, then copied up through the ring; the copy last reading each slot
     pstage: Option<PStage>,
@@ -638,6 +651,7 @@ impl Part {
                 let sb = c.slot_bytes;
                 for s in c.base..c.base + c.lend {
                     let Some(v) = c.vowner[s].take() else { continue };
+                    self.tab_zero(c, v)?;
                     c.loc.remove(&v);
                     c.prefetched.remove(&v);
                     let (vch, vo) = c.vat(s);
@@ -1010,7 +1024,9 @@ impl Part {
         let from = c.loc.get(&key).copied();
         let fill = c.vfill.get(&s).copied();
         let mut down: Option<i64> = None;
+        let mut zero = c.vzero.remove(&s);
         if let Some(v) = c.vowner[s].take() {
+            zero = Some(self.tab_zero(c, v)?);
             c.loc.remove(&v);
             c.prefetched.remove(&v);
             if let Some(f) = c.rfree.pop() {
@@ -1026,7 +1042,7 @@ impl Part {
             Some(Loc::R(r)) => {
                 c.from_host += 1;
                 let (rch, ro) = c.rat(r);
-                let deps = [down, c.rwrite.get(&r).copied()];
+                let deps = [down, c.rwrite.get(&r).copied(), zero];
                 let host = c.host[rch].device_view(ro, sb)?;
                 let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &host, 0, vq.span, &deps)?;
                 reading.insert(r, t);
@@ -1046,7 +1062,7 @@ impl Part {
                         k
                     }
                 };
-                let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &c.stage.device_view(k * sb, sb)?, 0, vq.span, &[down, fill])?;
+                let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &c.stage.device_view(k * sb, sb)?, 0, vq.span, &[down, fill, zero])?;
                 c.stage_tk[k] = Some(t);
                 c.vfill.insert(s, t);
                 c.last_up = Some(t);
@@ -1054,6 +1070,9 @@ impl Part {
             }
         };
         c.vowner[s] = Some(key);
+        if let Some(t) = up {
+            self.tab_set_after(c, key, s, t)?;
+        }
         c.loc.insert(key, Loc::V(s));
         Ok(up)
     }
@@ -1079,6 +1098,8 @@ impl Part {
         let sb = c.slot_bytes;
         for &sl in &owned[..k] {
             let Some(v) = c.vowner[sl].take() else { continue };
+            let z = self.tab_zero(c, v)?;
+            c.vzero.insert(sl, z);
             c.loc.remove(&v);
             c.prefetched.remove(&v);
             let (vch, vo) = c.vat(sl);
@@ -1092,6 +1113,22 @@ impl Part {
                 c.loc.insert(v, Loc::R(f));
             }
         }
+        Ok(())
+    }
+
+    /// An expert leaves VRAM: its slot table entry zeroed on the compute queue (a decode token routed after it does not
+    /// read the slot); the copy up that refills the slot waits for this ticket (and so for the products before it)
+    fn tab_zero(&self, c: &Store, key: (u64, u64)) -> Result<i64> {
+        let at = (key.0 as usize * c.n_expert + key.1 as usize) * 8;
+        self.ops.kcopy(&self.devtab, at, &self.zeros, 0, 8)
+    }
+
+    /// An expert arrives in slot s: its slot table entry set on the copy lane after its copy up (ticket `after`), so the
+    /// table names it only once it is there
+    fn tab_set_after(&self, c: &Store, key: (u64, u64), s: usize, after: i64) -> Result<()> {
+        let Some(sa) = &c.slotaddr else { return Ok(()) };
+        let at = (key.0 as usize * c.n_expert + key.1 as usize) * 8;
+        self.ops.stream_copy_on(1, &self.devtab, at, sa, s * 8, 8, &[Some(after)])?;
         Ok(())
     }
 
@@ -1655,12 +1692,31 @@ impl Part {
                 store_of.insert(*l, stores.len());
             }
             stores.push(Mutex::new(Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree: (in_r.len()..nr).collect(), tick: 0, hits: 0, rread: HashMap::new(),
+                                           slotaddr: None, vzero: HashMap::new(), n_expert: g.n_expert as usize,
                                            misses: 0, from_host: 0, from_file: 0, direct: 0, rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(),
                                            last_up: None, prefetched: HashMap::new(), usage: HashMap::new(), base: nv, lend: 0, lent: false, pf_issued: 0,
                                            pf_used: 0, stage: HostBuf::new(gpu, STAGE * slot_bytes)?, stage_tk: vec![None; STAGE], stage_next: 0,
                                            stage_rd: vec![None; STAGE], ahead: HashMap::new() }));
         }
         log(format!("{}: {:.2} GiB of weights, the experts loaded in {:.1} s", gpu.name, gib(bytes as usize), t0.elapsed().as_secs_f64()));
+        // the slot table: every expert in VRAM now
+        let ntab = (g.n_layer as usize) * g.n_expert as usize;
+        let devtab = DevBuf::new(gpu, ntab * 8)?;
+        {
+            let mut host = vec![0u64; ntab];
+            for st in &stores {
+                let c = st.lock().unwrap();
+                for (s, o) in c.vowner.iter().enumerate() {
+                    if let Some((l, x)) = o {
+                        if *l < g.n_layer {
+                            let (ch, at) = c.vat(s);
+                            host[*l as usize * g.n_expert as usize + *x as usize] = c.vram[ch].ptr() as u64 + at as u64;
+                        }
+                    }
+                }
+            }
+            devtab.write(0, &host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        }
         let big = DevBuf::new(gpu, arena_bytes())?;
         let small = DevBuf::new(gpu, SMALL_ARENA)?;
         // the big arena lent to the largest store while no prompt chunk needs it
@@ -1683,6 +1739,17 @@ impl Part {
                 }
             }
         }
+        // each store's slot addresses on the GPU (the slot table's entries are copied from them), lent slots too
+        for st in &stores {
+            let mut c = st.lock().unwrap();
+            let addrs: Vec<u8> = (0..c.vowner.len()).flat_map(|s| {
+                let (ch, o) = c.vat(s);
+                (c.vram[ch].ptr() as u64 + o as u64).to_le_bytes()
+            }).collect();
+            let b = DevBuf::new(gpu, addrs.len().max(8))?;
+            b.write(0, &addrs)?;
+            c.slotaddr = Some(b);
+        }
         let arena = Arena::on(if lent { small.view(0, small.len)? } else { big.view(0, big.len)? });
         let k = g.idx_top_k as usize;
         let sel = DevBuf::new(gpu, prefill_chunk().max(MAX_VERIFY) * k * 4)?;
@@ -1695,7 +1762,7 @@ impl Part {
         let pstage = if ring_bytes > 0 && nfs > 0 { Some((Mutex::new(HostBuf::new(gpu, nfs * ring_slot)?), ring_slot, Mutex::new(vec![None; nfs]))) } else { None };
         Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
                   hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
-                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage,
+                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage, devtab,
                   reader: if file_ahead() > 0 { Some(FileReader::new(&m.file.paths, 4)?) } else { None } })
     }
 }
@@ -2478,9 +2545,13 @@ impl<'g> Ds41<'g> {
                 o.hc_mean(&xs, &mean, t, d)?;
                 o.kcopy(&ms.mh, (k * MTP_KEEP) * d * 4, &mean, (t - keep) * d * 4, keep * d * 4)?;
             }
-            let (normed, post, comb, pre_out) = (&ws[1], &ws[2], &ws[3], &ws[4]);
-            self.timed(p, "hc", || self.hc_half(p, l, Role::HcAttnFn, Role::HcAttnBase, Role::HcAttnScale, Role::AttnNorm, &xs, &pre_in, &ws, t))?;
-            o.kcopy(&attn_pre, 0, pre_out, 0, t * 16)?;
+            let (normed, post, comb) = (&ws[1], &ws[2], &ws[3]);
+            // each half's pre written where it is read next (no copies): the attention half's into attn_pre, the FFN
+            // half's into the next streams' tail (it rides with them to the next layer and part)
+            let v = |b: &DevBuf| b.view(0, b.len);
+            let ws_a = [v(&ws[0])?, v(&ws[1])?, v(&ws[2])?, v(&ws[3])?, v(&attn_pre)?, v(&ws[5])?];
+            let ws_f = [v(&ws[0])?, v(&ws[1])?, v(&ws[2])?, v(&ws[3])?, x2.view(t * 4 * d * 4, t * 16)?, v(&ws[5])?];
+            self.timed(p, "hc", || self.hc_half(p, l, Role::HcAttnFn, Role::HcAttnBase, Role::HcAttnScale, Role::AttnNorm, &xs, &pre_in, &ws_a, t))?;
             tap(&format!("attn_norm-{l}"), normed)?;
             let att = self.timed(p, "attention", || self.attention(p, l, normed, layers, pos0, t, &mut sh, &mut *tap))?;
             if self.mirror_src == Some(l) {
@@ -2488,7 +2559,7 @@ impl<'g> Ds41<'g> {
             }
             o.hc_post(&att, &xs, post, comb, x1, t, d)?;
             tap(&format!("hc_attn_post-{l}"), &x1.view(0, t * 4 * d * 4)?)?;
-            self.timed(p, "hc", || self.hc_half(p, l, Role::HcFfnFn, Role::HcFfnBase, Role::HcFfnScale, Role::FfnNorm, x1, &attn_pre, &ws, t))?;
+            self.timed(p, "hc", || self.hc_half(p, l, Role::HcFfnFn, Role::HcFfnBase, Role::HcFfnScale, Role::FfnNorm, x1, &attn_pre, &ws_f, t))?;
             tap(&format!("ffn_norm-{l}"), normed)?;
             let split = (t > MMVQ_COLS && pipe_split()).then(|| -> Result<Instant> {
                 gpu.sync()?;
@@ -2502,8 +2573,6 @@ impl<'g> Ds41<'g> {
             }
             tap(&format!("ffn_out-{l}"), &ffn)?;
             o.hc_post(&ffn, x1, post, comb, x2, t, d)?;
-            // the FFN's pre rides with the streams to the next layer (and part)
-            o.kcopy(x2, t * 4 * d * 4, pre_out, 0, t * 16)?;
             tap(&format!("l_out-{l}"), &x2.view(0, t * 4 * d * 4)?)?;
             ix = (ix + 2) % 3;
         }
@@ -2960,11 +3029,45 @@ impl<'g> Ds41<'g> {
         let next_main = l + 1 < g.n_layer && !g.is_mtp(l) && p.layers.contains(&(l + 1));
         let guess = if t <= MMVQ_COLS && pf > 0 && next_main { Some(p.mm(l + 1, Role::Router, x, t)?) } else { None };
         tap(&format!("ffn_moe_logits-{l}"), &logits)?;
-        let mut down: Vec<(&DevBuf, usize)> = vec![(&logits, t * ne)];
-        if let Some(gl) = &guess {
-            down.push((gl, t * ne));
+        // one decode token routed on the GPU: its VRAM experts' products queued now, from the slot table; the host
+        // reads the routing (ids, weights, which had no VRAM slot) after, for the rest and its bookkeeping
+        let groute = t == 1 && gpu_route() && !self.mtp && !p.draft.contains_key(&l) && p.store(l).is_ok() && used <= 8;
+        let mut early: Option<(DevBuf, DevBuf, DevBuf)> = None;
+        let mut early_read = None;
+        if groute {
+            let vq = &p.vq[&l];
+            // the table names an expert only once its copy up landed (tab_set_after): nothing to wait for here
+            let dummy = p.store(l)?.lock().unwrap().vram.first().map_or(0, |b| b.ptr() as u64);
+            let gtab = p.arena.bytes(2 * used * 48 + 33 * 4)?;
+            let dtab = p.arena.bytes(used * 48 + used * 33 * 4)?;
+            let info = p.arena.bytes(3 * used * 4)?;
+            let ctab = p.arena.bytes((2 + 2 * used) * 4)?;
+            let tab = p.devtab.view(l as usize * ne * 8, ne * 8)?;
+            o.route1(&logits, p.vec(l, Role::RouterBias)?, ne, used, g.expert_scale as f32, &tab, dummy, (vq.gate, vq.up, vq.down), &gtab, &dtab, &info, &ctab)?;
+            // the routing read back ahead of the products (the host's turn runs while they do)
+            let mut down: Vec<(&DevBuf, usize)> = vec![(&info, 3 * used)];
+            if let Some(gl) = &guess {
+                down.push((gl, t * ne));
+            }
+            early_read = Some(p.read_start(&down)?);
+            let (dn, gu, hset) = (p.arena.f32(used * d)?, p.arena.f32(2 * used * f)?, p.arena.f32(used * f)?);
+            let (cb, nbit) = (&p.cbs[&l], vq.nbit);
+            let pick = p.vq_pick.get(&nbit).copied().unwrap_or([0, 0]);
+            o.vq_mmv(&gtab, 2 * used, (cb, vq_wide((&p.cbf, &p.cbh), l, pick[0])), x, (&gu, 0), 2 * used, f, d, nbit, pick[0], Some((1, 2 * used)))?;
+            o.swiglu_clamp(&gu.view(0, used * f * 4)?, &gu.view(used * f * 4, used * f * 4)?, &hset, used * f, lim)?;
+            o.vq_mmv(&dtab, used, (cb, vq_wide((&p.cbf, &p.cbh), l, pick[1])), &hset, (&dn, 0), used, d, f, nbit, pick[1], Some((used, 1)))?;
+            early = Some((info, dn, ctab));
         }
-        let pending = p.read_start(&down)?;
+        let pending = match early_read {
+            Some(r) => r,
+            None => {
+                let mut down: Vec<(&DevBuf, usize)> = vec![(&logits, t * ne)];
+                if let Some(gl) = &guess {
+                    down.push((gl, t * ne));
+                }
+                p.read_start(&down)?
+            }
+        };
         // the shared expert, queued while the host picks the routed ones
         let y = {
             let sg = p.mm(l, Role::ShGate, x, t)?;
@@ -2994,7 +3097,13 @@ impl<'g> Ds41<'g> {
             let sum: f32 = s.iter().map(|i| pr[*i]).sum::<f32>() + 1e-20;
             s.iter().map(|&i| (i, pr[i] / sum * g.expert_scale as f32)).collect()
         };
-        let rows: Vec<Vec<(usize, f32)>> = if t >= 256 {
+        let mut emiss: Vec<bool> = Vec::new();
+        let rows: Vec<Vec<(usize, f32)>> = if early.is_some() {
+            // the GPU's routing: ids ascending, their weights, which had no VRAM slot
+            let ids: Vec<usize> = lv[..used].iter().map(|v| v.to_bits() as i32 as usize).collect();
+            emiss = lv[2 * used..3 * used].iter().map(|v| v.to_bits() != 0).collect();
+            vec![ids.iter().zip(&lv[used..2 * used]).map(|(&i, &w)| (i, f32::from_bits(w.to_bits()))).collect()]
+        } else if t >= 256 {
             let parts = 16.min(t);
             let per = t.div_ceil(parts);
             std::thread::scope(|sc| {
@@ -3029,11 +3138,15 @@ impl<'g> Ds41<'g> {
             first.push(e0);
             e0 += list.len();
         }
-        let dn = p.arena.f32(total * d)?;
+        let dn = match &early {
+            Some((_, dn, _)) => dn.view(0, dn.len)?,
+            None => p.arena.f32(total * d)?,
+        };
         if t <= MMVQ_COLS {
             self.timed(p, "experts: products", || {
                 let gu = p.arena.f32(2 * total * f)?;
-                let (now, later): (Vec<usize>, Vec<usize>) = (0..lists.len()).partition(|&k| !arriving[k]);
+                // routed on the GPU: only the experts it found no VRAM slot for are left
+                let (now, later): (Vec<usize>, Vec<usize>) = (0..lists.len()).filter(|&k| early.is_none() || emiss.get(k).copied().unwrap_or(true)).partition(|&k| !arriving[k]);
                 for (set, wait) in [(&now, false), (&later, true)] {
                     if set.is_empty() {
                         continue;
@@ -3235,11 +3348,16 @@ impl<'g> Ds41<'g> {
             }
             t_ptr.push(ent.len() as i32);
         }
-        let cbuf = p.arena.bytes((t + 1 + total) * 4)?;
-        p.upload(&cbuf, &i32s(&t_ptr.iter().chain(&ent).copied().collect::<Vec<_>>()))?;
-        let wb = p.arena.f32(total)?;
-        p.upload(&wb, &f32s(&wv))?;
-        o.moe_combine(&y, &dn, &cbuf, &wb, t, total, d)?;
+        if let Some((_, _, ctab)) = &early {
+            // the GPU's own combine table (the same rows and weights, in expert order)
+            o.moe_combine(&y, &dn, &ctab.view(0, (2 + used) * 4)?, &ctab.view((2 + used) * 4, used * 4)?, t, total, d)?;
+        } else {
+            let cbuf = p.arena.bytes((t + 1 + total) * 4)?;
+            p.upload(&cbuf, &i32s(&t_ptr.iter().chain(&ent).copied().collect::<Vec<_>>()))?;
+            let wb = p.arena.f32(total)?;
+            p.upload(&wb, &f32s(&wv))?;
+            o.moe_combine(&y, &dn, &cbuf, &wb, t, total, d)?;
+        }
         if let Some(gv) = guess {
             let gb = p.router_bias(l + 1)?;
             let mut miss: BTreeMap<usize, f32> = BTreeMap::new();
