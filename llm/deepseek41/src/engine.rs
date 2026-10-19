@@ -114,6 +114,11 @@ fn pipe_split() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_DS41_PIPE_LOG").is_ok_and(|v| v == "2"))
 }
+/// Decode's empty VRAM slots kept a store (NS_DS41_SPARE, default 8; 0: a swap moves its victim down first)
+fn spare_slots() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_SPARE", 8))
+}
 /// Token slots of one batch of a prompt's few-token experts (their gate | up and h in the arena)
 const PROMPT_MMV_SLOTS: usize = 1024;
 
@@ -362,6 +367,8 @@ struct Store {
     from_file: u64,
     direct: u64,
     rwrite: HashMap<usize, i64>,
+    /// the copy up last reading each host slot (a copy down into it waits for it)
+    rread: HashMap<usize, i64>,
     down_any: Option<i64>,
     vfill: HashMap<usize, i64>,
     last_up: Option<i64>,
@@ -383,9 +390,19 @@ struct Store {
 const STAGE: usize = 16;
 
 impl Store {
-    fn victims(&self, tick: u64) -> Vec<usize> {
+    /// The `k` slots to fill next: empty ones first, then the least recently used (a partial selection: a store has
+    /// thousands of slots, a layer's misses a few - sorting them all was the host's turn between router and products)
+    fn victims(&self, tick: u64, k: usize) -> Vec<usize> {
+        let key = |i: usize| if self.vowner[i].is_none() { 0 } else { self.vused[i] + 1 };
         let mut order: Vec<usize> = (0..self.vowner.len()).filter(|&i| self.vused[i] != tick && self.usable(i)).collect();
-        order.sort_by_key(|&i| if self.vowner[i].is_none() { 0 } else { self.vused[i] + 1 });
+        if k < order.len() {
+            if k == 0 {
+                return Vec::new();
+            }
+            order.select_nth_unstable_by_key(k - 1, |&i| (key(i), i));
+            order.truncate(k);
+        }
+        order.sort_by_key(|&i| (key(i), i));
         order
     }
     fn vat(&self, s: usize) -> (usize, usize) {
@@ -724,7 +741,7 @@ impl Part {
         }
         c.prefetched.retain(|k, _| k.0 != l);
         if !missing.is_empty() {
-            let order = c.victims(tick);
+            let order = c.victims(tick, missing.len());
             let staged = self.stage_reads(m, vq, c, l, &missing)?;
             for (ex, &s) in missing.iter().zip(&order) {
                 c.misses += 1;
@@ -733,6 +750,9 @@ impl Part {
                     pending.push(*ex);
                 }
                 c.vused[s] = tick;
+            }
+            if promote {
+                self.keep_spare(c, tick, &reading)?;
             }
         }
         let sb = c.slot_bytes;
@@ -907,7 +927,7 @@ impl Part {
             c.prefetched.remove(&v);
             if let Some(f) = c.rfree.pop() {
                 let (rch, ro) = c.rat(f);
-                let t = self.ops.stream_copy_on(0, &c.host[rch].device_view(ro, sb)?, 0, &c.vram[vch], vo, sb, &[reading.get(&f).copied(), fill])?;
+                let t = self.ops.stream_copy_on(0, &c.host[rch].device_view(ro, sb)?, 0, &c.vram[vch], vo, sb, &[reading.get(&f).copied(), c.rread.get(&f).copied(), fill])?;
                 down = Some(t);
                 c.rwrite.insert(f, t);
                 c.down_any = Some(t);
@@ -922,6 +942,7 @@ impl Part {
                 let host = c.host[rch].device_view(ro, sb)?;
                 let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &host, 0, vq.span, &deps)?;
                 reading.insert(r, t);
+                c.rread.insert(r, t);
                 c.rfree.push(r);
                 c.vfill.insert(s, t);
                 c.last_up = Some(t);
@@ -947,6 +968,43 @@ impl Part {
         c.vowner[s] = Some(key);
         c.loc.insert(key, Loc::V(s));
         Ok(up)
+    }
+
+    /// Decode's spare VRAM slots: an expert swapped in takes an empty slot, so its copy up waits for no copy down; the
+    /// least recently used experts are moved down to host slots afterwards, off the products' path, until NS_DS41_SPARE
+    /// slots are empty again (the next copy up into one waits for its copy down)
+    fn keep_spare(&self, c: &mut Store, tick: u64, reading: &HashMap<usize, i64>) -> Result<()> {
+        let want = spare_slots();
+        if want == 0 {
+            return Ok(());
+        }
+        let empty = (0..c.vowner.len()).filter(|&i| c.usable(i) && c.vowner[i].is_none()).count();
+        if empty >= want {
+            return Ok(());
+        }
+        let mut owned: Vec<usize> = (0..c.vowner.len()).filter(|&i| c.vused[i] != tick && c.usable(i) && c.vowner[i].is_some()).collect();
+        let k = (want - empty).min(owned.len());
+        if k == 0 {
+            return Ok(());
+        }
+        owned.select_nth_unstable_by_key(k - 1, |&i| (c.vused[i], i));
+        let sb = c.slot_bytes;
+        for &sl in &owned[..k] {
+            let Some(v) = c.vowner[sl].take() else { continue };
+            c.loc.remove(&v);
+            c.prefetched.remove(&v);
+            let (vch, vo) = c.vat(sl);
+            if let Some(f) = c.rfree.pop() {
+                let (rch, ro) = c.rat(f);
+                let t = self.ops.stream_copy_on(0, &c.host[rch].device_view(ro, sb)?, 0, &c.vram[vch], vo, sb,
+                                                &[reading.get(&f).copied(), c.rread.get(&f).copied(), c.vfill.get(&sl).copied()])?;
+                c.rwrite.insert(f, t);
+                c.down_any = Some(t);
+                c.vfill.insert(sl, t);
+                c.loc.insert(v, Loc::R(f));
+            }
+        }
+        Ok(())
     }
 
     /// A free staging slot (the copy last reading it done)
@@ -1004,7 +1062,7 @@ impl Part {
         if cand.is_empty() {
             return Ok(());
         }
-        let order = c.victims(tick);
+        let order = c.victims(tick, cand.len());
         let mut reading: HashMap<usize, i64> = HashMap::new();
         let none = HashMap::new();
         for (ex, &s) in cand.iter().zip(&order) {
@@ -1014,7 +1072,7 @@ impl Part {
             }
             c.vused[s] = tick;
         }
-        Ok(())
+        self.keep_spare(c, tick, &reading)
     }
 }
 
@@ -1481,7 +1539,7 @@ impl Part {
             for l in ls {
                 store_of.insert(*l, stores.len());
             }
-            stores.push(Mutex::new(Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree: (in_r.len()..nr).collect(), tick: 0, hits: 0,
+            stores.push(Mutex::new(Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree: (in_r.len()..nr).collect(), tick: 0, hits: 0, rread: HashMap::new(),
                                            misses: 0, from_host: 0, from_file: 0, direct: 0, rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(),
                                            last_up: None, prefetched: HashMap::new(), usage: HashMap::new(), base: nv, lend: 0, lent: false, pf_issued: 0,
                                            pf_used: 0, stage: HostBuf::new(gpu, STAGE * slot_bytes)?, stage_tk: vec![None; STAGE], stage_next: 0 }));

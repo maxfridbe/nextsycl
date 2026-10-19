@@ -141,7 +141,7 @@ void vq_mmv_rows(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int6
 // the row's gain. The partials of a row's runs are then added in order (the second kernel): the same arithmetic for a
 // row whatever the other rows and columns of the launch (a verify pass's rows equal one-token rows).
 namespace {
-constexpr int LUT_L = 512, LUT_RHO = 8, LUT_SLOTS = 16;
+constexpr int LUT_L = 1024, LUT_RHO = 8, LUT_SLOTS = 16;
 
 // index GI (0..7) of a chunk of 8 (its 12 bytes w0 w1 w2, the 13th bits pb)
 template <int GI, bool PLANE>

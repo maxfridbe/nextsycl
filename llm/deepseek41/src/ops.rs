@@ -676,10 +676,10 @@ pub const VQ_LUT: i32 = 5;
 /// A column's list in the lookup-table variant's table: its count, then 16 (entry, column slot) pairs
 pub const LUT_STRIDE: usize = 33;
 
-/// 64-column units a work-group of the lookup-table variant takes (NS_DS41_LUT_RUNS, default 16 runs a row)
+/// 64-column units a work-group of the lookup-table variant takes (NS_DS41_LUT_RUNS, default 32 runs a row)
 fn lut_units(cols: usize) -> usize {
     static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let runs = *RUNS.get_or_init(|| std::env::var("NS_DS41_LUT_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(16).max(1));
+    let runs = *RUNS.get_or_init(|| std::env::var("NS_DS41_LUT_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(32).max(1));
     (cols / 64).div_ceil(runs).max(1)
 }
 
