@@ -119,6 +119,17 @@ fn spare_slots() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_usize("NS_DS41_SPARE", 8))
 }
+/// Decode reads ahead at most this many of the next layer's likely experts that only the file holds (NS_DS41_FILE_AHEAD,
+/// default 8; 0: none)
+fn file_ahead() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_FILE_AHEAD", 8).min(STAGE / 2))
+}
+/// The chance of use from which decode reads a file expert ahead (NS_DS41_FILE_AHEAD_P, default 0.15)
+fn file_ahead_p() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_FILE_AHEAD_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15))
+}
 /// Token slots of one batch of a prompt's few-token experts (their gate | up and h in the arena)
 const PROMPT_MMV_SLOTS: usize = 1024;
 
@@ -383,6 +394,9 @@ struct Store {
     /// queue drain), and the copy last reading each
     stage: HostBuf,
     stage_tk: Vec<Option<i64>>,
+    /// a read ahead writing each staging slot, and the reads ahead by expert: (layer, expert) -> (slot, its read)
+    stage_rd: Vec<Option<Arc<RDone>>>,
+    ahead: HashMap<(u64, u64), (usize, Arc<RDone>)>,
     stage_next: usize,
 }
 
@@ -465,6 +479,8 @@ pub struct Part {
     ring: Option<(DevBuf, usize)>,
     /// the ticket after the last pass's readers of the ring (its next copies wait for it)
     ring_free: Mutex<Option<i64>>,
+    /// decode's reads ahead of the file's experts (None: NS_DS41_FILE_AHEAD=0)
+    reader: Option<FileReader>,
     /// a prompt pass's pinned slots for the experts only the file holds: read on threads while the GPU multiplies the
     /// others, then copied up through the ring; the copy last reading each slot
     pstage: Option<PStage>,
@@ -472,6 +488,58 @@ pub struct Part {
 
 /// A prompt pass's pinned slots for the file's experts: the buffer, a slot's bytes, the copy last reading each
 type PStage = (Mutex<HostBuf>, usize, Mutex<Vec<Option<i64>>>);
+
+/// Decode's file reads ahead: a few threads with their own handles on the model's files, reading an expert's bytes into
+/// a pinned staging slot while the GPU works (the next layer's likely experts, from its router's guess)
+struct FileReader {
+    tx: Mutex<std::sync::mpsc::Sender<RJob>>,
+}
+struct RJob {
+    shard: usize,
+    at: u64,
+    len: usize,
+    dst: usize,
+    done: Arc<RDone>,
+}
+#[derive(Default)]
+struct RDone {
+    state: Mutex<Option<std::result::Result<(), String>>>,
+    cv: std::sync::Condvar,
+}
+impl RDone {
+    fn wait(&self) -> Result<()> {
+        let mut g = self.state.lock().unwrap();
+        while g.is_none() {
+            g = self.cv.wait(g).unwrap();
+        }
+        g.clone().unwrap().map_err(Error)
+    }
+}
+impl FileReader {
+    fn new(paths: &[std::path::PathBuf], threads: usize) -> Result<FileReader> {
+        let files: Vec<Arc<std::fs::File>> = paths.iter().map(|p| std::fs::File::open(p).map(Arc::new).map_err(|e| Error(format!("{}: {e}", p.display()))))
+            .collect::<Result<_>>()?;
+        let (tx, rx) = std::sync::mpsc::channel::<RJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..threads {
+            let (rx, files) = (rx.clone(), files.clone());
+            std::thread::spawn(move || loop {
+                let job = match rx.lock().unwrap().recv() {
+                    Ok(j) => j,
+                    Err(_) => return,
+                };
+                use std::os::unix::fs::FileExt;
+                // SAFETY: the job's staging slot is its own (read_ahead) until its done flag is set and waited for
+                // (stage_slot or ensure), the pinned buffer alive for the engine
+                let b = unsafe { std::slice::from_raw_parts_mut(job.dst as *mut u8, job.len) };
+                let r = files[job.shard].read_exact_at(b, job.at).map_err(|e| format!("reading an expert: {e}"));
+                *job.done.state.lock().unwrap() = Some(r);
+                job.done.cv.notify_all();
+            });
+        }
+        Ok(FileReader { tx: Mutex::new(tx) })
+    }
+}
 
 /// Where a prompt pass reads an expert from (Part::locate)
 enum Src {
@@ -742,7 +810,21 @@ impl Part {
         c.prefetched.retain(|k, _| k.0 != l);
         if !missing.is_empty() {
             let order = c.victims(tick, missing.len());
-            let staged = self.stage_reads(m, vq, c, l, &missing)?;
+            // the file's experts read ahead (the layer before's guess): waited for, their slots taken as staged
+            let mut pre: HashMap<u64, usize> = HashMap::new();
+            for x in &missing {
+                if c.loc.contains_key(&(l, *x)) {
+                    continue;
+                }
+                if let Some((k, done)) = c.ahead.remove(&(l, *x)) {
+                    done.wait()?;
+                    c.stage_rd[k] = None;
+                    pre.insert(*x, k);
+                }
+            }
+            let rest: Vec<u64> = missing.iter().copied().filter(|x| !pre.contains_key(x)).collect();
+            let mut staged = self.stage_reads(m, vq, c, l, &rest)?;
+            staged.extend(pre);
             for (ex, &s) in missing.iter().zip(&order) {
                 c.misses += 1;
                 if let Some(tk) = self.swap_in(m, vq, c, l, *ex, s, &mut reading, &staged)? {
@@ -1014,7 +1096,34 @@ impl Part {
         if let Some(t) = c.stage_tk[k].take() {
             self.ops.ticket_wait(t)?;
         }
+        if let Some(r) = c.stage_rd[k].take() {
+            // a read ahead into it not taken: let it end, forget it
+            let _ = r.wait();
+            c.ahead.retain(|_, v| v.0 != k);
+        }
         Ok(k)
+    }
+
+    /// Decode: the file's experts among `want` (layer l's likely ones) read ahead into staging slots, at most `limit`
+    fn read_ahead(&self, l: u64, want: &[u64], limit: usize) -> Result<()> {
+        let (Some(rd), Ok(st)) = (&self.reader, self.store(l)) else { return Ok(()) };
+        let vq = &self.vq[&l];
+        let mut c = st.lock().unwrap();
+        let c = &mut *c;
+        let xs: Vec<u64> = want.iter().copied().filter(|x| !c.loc.contains_key(&(l, *x)) && !c.ahead.contains_key(&(l, *x))).take(limit).collect();
+        let sb = c.slot_bytes;
+        for x in xs {
+            let k = self.stage_slot(c)?;
+            let done = Arc::new(RDone::default());
+            let dst = c.stage.as_mut_slice().as_mut_ptr() as usize + k * sb;
+            let job = RJob { shard: vq.blob.shard, at: vq.blob.offset + vq.starts[x as usize], len: vq.span, dst, done: done.clone() };
+            if rd.tx.lock().unwrap().send(job).is_err() {
+                return Err(Error("the expert readers ended".into()));
+            }
+            c.stage_rd[k] = Some(done.clone());
+            c.ahead.insert((l, x), (k, done));
+        }
+        Ok(())
     }
 
     /// The experts of `missing` held by neither VRAM nor host memory read from the file into staging slots, up to
@@ -1542,7 +1651,8 @@ impl Part {
             stores.push(Mutex::new(Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree: (in_r.len()..nr).collect(), tick: 0, hits: 0, rread: HashMap::new(),
                                            misses: 0, from_host: 0, from_file: 0, direct: 0, rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(),
                                            last_up: None, prefetched: HashMap::new(), usage: HashMap::new(), base: nv, lend: 0, lent: false, pf_issued: 0,
-                                           pf_used: 0, stage: HostBuf::new(gpu, STAGE * slot_bytes)?, stage_tk: vec![None; STAGE], stage_next: 0 }));
+                                           pf_used: 0, stage: HostBuf::new(gpu, STAGE * slot_bytes)?, stage_tk: vec![None; STAGE], stage_next: 0,
+                                           stage_rd: vec![None; STAGE], ahead: HashMap::new() }));
         }
         log(format!("{}: {:.2} GiB of weights, the experts loaded in {:.1} s", gpu.name, gib(bytes as usize), t0.elapsed().as_secs_f64()));
         let big = DevBuf::new(gpu, arena_bytes())?;
@@ -1579,7 +1689,8 @@ impl Part {
         let pstage = if ring_bytes > 0 && nfs > 0 { Some((Mutex::new(HostBuf::new(gpu, nfs * ring_slot)?), ring_slot, Mutex::new(vec![None; nfs]))) } else { None };
         Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
                   hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
-                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage })
+                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage,
+                  reader: if file_ahead() > 0 { Some(FileReader::new(&m.file.paths, 4)?) } else { None } })
     }
 }
 
@@ -3123,10 +3234,16 @@ impl<'g> Ds41<'g> {
                 }
             }
             let th = prefetch_p();
-            let mut want: Vec<(usize, f32)> = miss.into_iter().map(|(e, q)| (e, 1.0 - q)).filter(|x| x.1 >= th).collect();
-            want.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let want: Vec<u64> = want.into_iter().map(|(e, _)| e as u64).collect();
+            let mut all: Vec<(usize, f32)> = miss.into_iter().map(|(e, q)| (e, 1.0 - q)).collect();
+            all.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let want: Vec<u64> = all.iter().filter(|x| x.1 >= th).map(|(e, _)| *e as u64).collect();
             self.timed(p, "experts: prefetch", || p.prefetch(&self.m, l + 1, &want, pf))?;
+            if file_ahead() > 0 {
+                // a read costs the drive and a slot, not PCIe or VRAM: a lower bar than the copies'
+                let fth = file_ahead_p();
+                let fwant: Vec<u64> = all.iter().filter(|x| x.1 >= fth).map(|(e, _)| *e as u64).collect();
+                p.read_ahead(l + 1, &fwant, file_ahead())?;
+            }
         }
         Ok(y)
     }
