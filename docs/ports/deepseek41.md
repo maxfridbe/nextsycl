@@ -49,7 +49,7 @@ malformed prompts; the parity checks did not (they read the reference's token id
 | prompt, 35K | 138.5 tok/s | 565-600 tok/s (the needle found) |
 | prompt, 318K (1M window) | - | 585 tok/s (479 before the candidate-only indexer), the needle found |
 | prompt, 1,025,205 tokens (1M window) | 59 min for 1.07M (302 tok/s, the first served build) | 33 min (520 tok/s), the needle found |
-| decode, no drafts (256 tokens; NS_DS41_FREE_GIB=1.5 as served) | 20.5-21.1 tok/s (malformed prompts) | 128K window 21.0-22.9 tok/s, 1M window 20.3-21.3 |
+| decode, no drafts (256 tokens; NS_DS41_FREE_GIB=1.5 as served) | 20.5-21.1 tok/s (malformed prompts) | 128K window story 23.1-23.3 / code 21.9-22.7 tok/s, 1M window 22.6 / 21.2 (SYCL_UR_USE_LEVEL_ZERO_V2=1; without it 1-5% less) |
 | Engram wait a decode token | 1.3-1.9 ms (the old SATA-class drive) | 0.11 ms |
 
 Run to run the same command varies by about 5-7%; the ranges are of several runs.
@@ -94,6 +94,28 @@ Round 2 (562da98, e4d273b, 2abd21a):
    every key masked: the same picks (identical text), the B65's 2K chunks flat at 3.3-3.7 s across a 318K prompt
    (3.5 -> 5.1 before); over a 1M prompt the chunks grow 2.5 -> 4.1 s (B70: layers 2, 8, 14, 20 still score every key)
    and 3.7 -> 4.5 s (B65).
+
+Round 3 (039f161, 40c1ca2, 51ba3d7):
+
+11. **Decode routes on the GPU** (NS_DS41_GPU_ROUTE): the router's picks, weights and the products' tables from a
+   per-GPU slot table of VRAM experts, the products queued before the host reads the routing - 128K, three runs:
+   story 21.97 -> 22.44, code 20.93 -> 22.33 tok/s (at 1M within noise). The text differs from the host's routing from
+   about token 30 of 256 (a near tie: sqrt(softplus) on the GPU against the host's libm).
+12. **Decode's chains fused** (NS_DS41_KV_FUSE): the window key's norm, rotation, simulation and ring write in one
+   launch, the attention output's rotation back and simulation in one, an mHC half's mixes, collapse and norm in two,
+   q_a | kv, the shared gate | up and the router | the next layer's guess one launch each - 11 launches a layer fewer:
+   128K story 22.05 -> 23.19, code 21.22 -> 22.45; 1M 21.82 -> 22.56, 20.61 -> 21.23 (three runs; llm check unchanged,
+   spec-check --prompt-decode cos 0.988).
+13. **The indexer's full scoring a key span's rows side by side** (the keys from L2): B70 2.1x at 131-262K keys, B65
+   1.3x; **its top-k in two levels past 196K keys** (the same picks). A 318K prompt is no faster: the B65 bounds the
+   pipeline there (3.5 s a 2K chunk against 2.85) - its experts 104-123 ms a layer, attention 42 ms, the candidate
+   source (layer 20, every key scored) 349 ms at 300K (54 at the start). The 1M needle again: 1,025,205 tokens in
+   1,957 s (524 tok/s; 1,970 s before), found.
+
+Where decode's time goes (unitrace, 128K): ~700 kernels a token a GPU after the fusions, ~6 ms of gaps between them a
+token a GPU; the VQ products ~5-6 ms (B70: the lookup-table variant, B65: v3/v5), the q4_K products ~9 ms. The
+SYCL_UR_USE_LEVEL_ZERO_V2=1 adapter measured +1-5% (UR_L0_USE_DRIVER_INORDER_LISTS=1: nothing); not in the cards (the
+server not yet run with it).
 
 Measured and not kept in round 2: decode's file reads after the resident experts' products in the same layer (no
 gain: a read outlasts those products), spin-waiting on the router's read back (no gain), the indexer's queries packed in
@@ -146,7 +168,8 @@ pad), and are never routed on the GPU (decode's GPU routing is for text).
 
 ## Open
 
-- Decode (~20 tok/s against V4's 25.6): the B65's q4_K products are ALU-bound (q_b 252 GB/s against the B70's 478;
+- Decode (~22-23 tok/s against V4's 25.6; 24 not reached): SYCL graphs for the attention half (its kernels need no
+  host decision; the expert half's do) are the next step against the launch gaps. Before round 3: the B65's q4_K products are ALU-bound (q_b 252 GB/s against the B70's 478;
   its 1,280 columns leave 4 of 16 lanes a second pass), the VQ products ~20 ms a token on both cards, the swaps' down
   copy before each up (a pool of free VRAM slots would take it off the critical path), the host's turn from router
   logits to queued products (~2.6 ms a token).
