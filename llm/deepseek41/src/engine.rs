@@ -130,6 +130,12 @@ fn file_ahead_p() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_DS41_FILE_AHEAD_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15))
 }
+/// The index sources after the candidate source score only their candidate blocks (NS_DS41_IDX_CAND, default 1; 0:
+/// every key, the others masked)
+fn idx_cand() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_IDX_CAND").map_or(true, |v| v != "0"))
+}
 /// Token slots of one batch of a prompt's few-token experts (their gate | up and h in the arena)
 const PROMPT_MMV_SLOTS: usize = 1024;
 
@@ -2243,7 +2249,8 @@ impl<'g> Ds41<'g> {
         let nb = n.div_ceil(bs);
         let use_cand = !is_cand && sh.cand && g.cand_source.is_some_and(|s| l > s);
         let rope = self.m.rope(l);
-        let rows = (IDX_S_FLOATS / n).clamp(1, t);
+        let compact = use_cand && nb > ct && idx_cand() && ih == 32 && id == 128 && bs == 8 && n >= 8;
+        let rows = (IDX_S_FLOATS / if compact { ct * bs } else { n }).clamp(1, t);
         for q0 in (0..t).step_by(rows) {
             let qn = rows.min(t - q0);
             let mk = p.arena.mark();
@@ -2252,6 +2259,17 @@ impl<'g> Ds41<'g> {
             o.quant_sim(&iq, qn * ih, id, 32, 1)?;
             // the head weights' positive scale ranks nothing differently: left out
             let w = p.mm(l, Role::IdxProj, &x.view(q0 * g.n_embd as usize * 4, qn * g.n_embd as usize * 4)?, qn)?;
+            if compact {
+                // only the candidate blocks scored (the masked form scored every key of the context)
+                let cv = p.cand.view(q0 * ct * 4, qn * ct * 4)?;
+                let sc = p.arena.f32(qn * ct * bs)?;
+                o.idx_score_cand(&iq, &w, &c.idx, &cv, ct, &sc, qn, ih, id, n, pos0 + q0, r)?;
+                let selc = p.arena.bytes(qn * kp * 4)?;
+                o.topk(&sc, &selc, qn, ct * bs, ct * bs, kp)?;
+                o.cand_pos(&selc, &cv, &p.sel.view(q0 * kp * 4, qn * kp * 4)?, qn, ct, kp, bs)?;
+                p.arena.rewind(mk);
+                continue;
+            }
             let score = p.arena.f32(qn * n)?;
             o.idx_score(&iq, &w, &c.idx, &score, qn, ih, id, n, n, pos0 + q0, r)?;
             if is_cand && nb > ct {

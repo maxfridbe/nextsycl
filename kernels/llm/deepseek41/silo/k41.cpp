@@ -168,6 +168,77 @@ void idx_score_xmx(sycl::queue& q, const float* qf, const float* w, const sycl::
         });
     });
 }
+
+// The same scores for the index sources after the candidate source, only over a row's candidate blocks (cand [T][K]
+// block ids of 8 keys, ascending): score [T][K x 8] compact, a block's 8 keys one A tile; -inf for keys the row does not
+// see. The masked full form scored every key of the context (1M at a 1M window) and kept these.
+void idx_score_cand_xmx(sycl::queue& q, const float* qf, const float* w, const sycl::half* kc, const int32_t* cand, int64_t K, float* score, int64_t T,
+                        int64_t n, int64_t pos0, int64_t ratio) {
+    constexpr int64_t per_wg = IXSG * IXTB;   // blocks a work-group
+    const int64_t wgs = (K + per_wg - 1) / per_wg, ld = K * IXM;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::half, 1> qp(sycl::range<1>(IXD * IXH), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * wgs) * IXSG * 16), sycl::range<1>(IXSG * 16)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id(), tid = (int) it.get_local_id(0);
+            const int64_t gi = it.get_group(0), t = gi / wgs, wb0 = (gi % wgs) * per_wg;
+            sycl::half* qs = qp.get_multi_ptr<sycl::access::decorated::no>().get();
+            for (int i = tid; i < IXD * IXH; i += IXSG * 16) {
+                const int hh = i / IXD, k = i % IXD;
+                qs[(k / 2) * (IXH * 2) + hh * 2 + (k & 1)] = (sycl::half) qf[(t * IXH + hh) * IXD + k];
+            }
+            sycl::group_barrier(it.get_group());
+            const int64_t nv = sycl::min<int64_t>(n, (pos0 + t + 1) / ratio);
+            const int64_t nb = (n + IXM - 1) / IXM;
+            float* out = score + t * ld;
+            for (int tb = 0; tb < IXTB; ++tb) {
+                const int64_t c = wb0 + sgi * IXTB + tb;
+                if (c >= K) break;
+                const int32_t b = cand[t * K + c];
+                const int64_t j0 = (int64_t) b * IXM;
+                if (b < 0 || b >= nb || j0 >= nv) {
+                    if (lane < IXM) out[c * IXM + lane] = -INFINITY;
+                    continue;
+                }
+                jmi::joint_matrix<sycl::sub_group, float, jmi::use::accumulator, IXM, 16> acc[IXH / 16];
+#pragma unroll
+                for (int nt = 0; nt < IXH / 16; ++nt) jmi::joint_matrix_fill(sg, acc[nt], 0.0f);
+                // the last block may run past the cache's keys: its tile read from n - 8 (in bounds), shifted back below
+                const int64_t cr = sycl::max<int64_t>(0, sycl::min<int64_t>(j0, n - IXM));
+                const sycl::half* kb = kc + cr * IXD;
+#pragma unroll
+                for (int k = 0; k < IXD / 16; ++k) {
+                    jmi::joint_matrix<sycl::sub_group, sycl::half, jmi::use::a, IXM, 16, jmi::layout::row_major> a;
+                    jmi::joint_matrix_load(sg, a, ix_gp(kb + k * 16), (size_t) IXD);
+#pragma unroll
+                    for (int nt = 0; nt < IXH / 16; ++nt) {
+                        jmi::joint_matrix<sycl::sub_group, sycl::half, jmi::use::b, 16, 16, jmi::layout::ext_intel_packed> bm;
+                        jmi::joint_matrix_load(sg, bm, ix_lp(qs + (k * 16 / 2) * (IXH * 2) + nt * 16 * 2), (size_t) (IXH * 2));
+                        jmi::joint_matrix_mad(sg, acc[nt], a, bm, acc[nt]);
+                    }
+                }
+                float sv[IXM] = {};
+#pragma unroll
+                for (int nt = 0; nt < IXH / 16; ++nt) {
+                    const float wh = w[t * IXH + nt * 16 + lane];
+                    int e = 0;
+                    jmi::joint_matrix_apply(sg, acc[nt], [&](float& x) { sv[e] += sycl::fmax(x, 0.0f) * wh; ++e; });
+                }
+                const int64_t shift = j0 - cr;
+#pragma unroll
+                for (int e = 0; e < IXM; ++e) {
+                    const float v = sycl::reduce_over_group(sg, sv[e], sycl::plus<float>());
+                    // tile row e is key cr + e, the block's key e - shift
+                    const int64_t be = e - shift, j = cr + e;
+                    if (lane == 0 && be >= 0 && be < IXM) out[c * IXM + be] = j < nv ? v : -INFINITY;
+                }
+                if (lane == 0)
+                    for (int64_t be = IXM - shift; be < IXM; ++be) out[c * IXM + be] = -INFINITY;
+            }
+        });
+    });
+}
 }  // namespace
 
 extern "C" {
@@ -362,6 +433,26 @@ int ns_ds41_markov_step(ns_gpu* g, const float* logits, const float* bias, int64
 int ns_ds41_gather_rows(ns_gpu* g, const float* table, const int32_t* idx, int64_t count, int64_t cols, float* out) {
     NS_TRY
     g->q.parallel_for(sycl::range<2>(count, cols), [=](sycl::id<2> id) { out[id[0] * cols + id[1]] = table[(int64_t) idx[id[0]] * cols + id[1]]; });
+    return 0;
+    NS_CATCH
+}
+
+int ns_ds41_idx_score_cand(ns_gpu* g, const float* q, const float* w, const uint16_t* k, const int32_t* cand, int64_t K, float* score, int64_t T, int64_t H,
+                           int64_t D, int64_t n, int64_t pos0, int64_t ratio) {
+    NS_TRY
+    if (H != IXH || D != IXD || n < IXM || ratio < 1) return ns_fail("ns_ds41_idx_score_cand: 32 heads of 128, at least 8 keys");
+    idx_score_cand_xmx(g->q, q, w, reinterpret_cast<const sycl::half*>(k), cand, K, score, T, n, pos0, ratio);
+    return 0;
+    NS_CATCH
+}
+
+int ns_ds41_cand_pos(ns_gpu* g, const int32_t* selc, const int32_t* cand, int32_t* sel, int64_t T, int64_t K, int64_t kp, int64_t bs) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<2>(T, kp), [=](sycl::id<2> id) {
+        const int64_t t = id[0], i = id[1];
+        const int32_t c = selc[t * kp + i];
+        sel[t * kp + i] = cand[t * K + c / bs] * (int32_t) bs + c % bs;
+    });
     return 0;
     NS_CATCH
 }
