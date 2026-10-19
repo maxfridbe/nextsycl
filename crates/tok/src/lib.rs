@@ -500,16 +500,30 @@ pub struct ToolCall {
     pub args: Vec<(String, String)>,
 }
 
-/// GLM-5.3's chat template (`tokenizer.chat_template`), its text-only, tool-free path: `[gMASK]<sop>`, the effort
-/// line, the turns, then `<|assistant|><think>` to generate.
-pub fn glm_chat(messages: &[Message], effort: Effort, _tools: &[String]) -> String {
+/// GLM-5.3's chat template (`tokenizer.chat_template`), its text path: `[gMASK]<sop>`, the effort line, with tools
+/// the tools' system turn (each tool's function as the template's tool_to_json writes it, then the call format), the
+/// turns - an assistant turn's calls as `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>`,
+/// the `tool` messages after it as one `<|observation|>` of `<tool_response>`s - then `<|assistant|><think>` to
+/// generate.
+pub fn glm_chat(messages: &[Message], effort: Effort, tools: &[String]) -> String {
     let mut s = String::from("[gMASK]<sop>");
     s += match effort {
         Effort::Low => "<|system|>Reasoning Effort: Low",
         Effort::High => "<|system|>Reasoning Effort: High",
         Effort::Max => "<|system|>Reasoning Effort: Max",
     };
-    for m in messages {
+    if !tools.is_empty() {
+        s += "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within \
+              <tools></tools> XML tags:\n<tools>\n";
+        for t in tools {
+            s += &glm_tool_json(t);
+            s += "\n";
+        }
+        s += "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}\
+              <arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...\
+              </tool_call>";
+    }
+    for (k, m) in messages.iter().enumerate() {
         match m.role {
             "system" => {
                 s += "<|system|>";
@@ -524,12 +538,94 @@ pub fn glm_chat(messages: &[Message], effort: Effort, _tools: &[String]) -> Stri
                 s += m.reasoning.unwrap_or("");
                 s += "</think>";
                 s += m.content.trim();
+                for call in m.calls {
+                    s += "<tool_call>";
+                    s += &call.name;
+                    for (k, v) in &call.args {
+                        s += "<arg_key>";
+                        s += k;
+                        s += "</arg_key><arg_value>";
+                        s += v;
+                        s += "</arg_value>";
+                    }
+                    s += "</tool_call>";
+                }
+            }
+            "tool" => {
+                if k == 0 || messages[k - 1].role != "tool" {
+                    s += "<|observation|>";
+                }
+                s += "<tool_response>";
+                s += m.content;
+                s += "</tool_response>";
             }
             _ => {}
         }
     }
     s += "<|assistant|><think>";
     s
+}
+
+/// A request's tool (its JSON, the `function` inside or the tool itself) as GLM's template lists it: the function's
+/// fields but `defer_loading` and `strict`, each value as Python's json.dumps writes it (the keys sorted: serde_json's
+/// order, the same each request)
+fn glm_tool_json(tool: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(tool) else { return tool.to_string() };
+    let f = if v["function"].is_object() { &v["function"] } else { &v };
+    let Some(o) = f.as_object() else { return tool.to_string() };
+    let fields: Vec<String> = o.iter().filter(|(k, _)| *k != "defer_loading" && *k != "strict")
+        .map(|(k, v)| format!("{}: {}", serde_json::Value::String(k.clone()), py_json(v))).collect();
+    format!("{{{}}}", fields.join(", "))
+}
+
+/// JSON as the chat templates' `tojson` writes it (Python's json.dumps: ", " and ": ", non-ASCII as is)
+pub fn py_json(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Array(a) => format!("[{}]", a.iter().map(py_json).collect::<Vec<_>>().join(", ")),
+        Value::Object(o) => format!("{{{}}}", o.iter().map(|(k, v)| format!("{}: {}", Value::String(k.clone()), py_json(v))).collect::<Vec<_>>().join(", ")),
+        x => x.to_string(),
+    }
+}
+
+/// The tool calls in a GLM answer (`<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>`,
+/// whitespace between the parts allowed): the text before the first call, and each call's name and raw values
+pub fn glm_tool_calls(answer: &str) -> (String, Vec<ToolCall>) {
+    let Some(start) = answer.find("<tool_call>") else { return (answer.to_string(), Vec::new()) };
+    let mut calls = Vec::new();
+    let mut rest = &answer[start..];
+    while let Some(i) = rest.find("<tool_call>") {
+        let body_start = i + "<tool_call>".len();
+        let end = rest[body_start..].find("</tool_call>").map_or(rest.len(), |e| body_start + e);
+        let body = &rest[body_start..end];
+        let name_end = body.find("<arg_key>").unwrap_or(body.len());
+        let name = body[..name_end].trim().to_string();
+        let mut args = Vec::new();
+        let mut p = &body[name_end..];
+        while let Some(a) = p.find("<arg_key>") {
+            let q = &p[a + "<arg_key>".len()..];
+            let Some(ke) = q.find("</arg_key>") else { break };
+            let key = q[..ke].trim().to_string();
+            let q = &q[ke + "</arg_key>".len()..];
+            let Some(vs) = q.find("<arg_value>") else { break };
+            let v = &q[vs + "<arg_value>".len()..];
+            let close = v.find("</arg_value>").or_else(|| v.find("<arg_key>")).unwrap_or(v.len());
+            args.push((key, v[..close].to_string()));
+            p = &v[close..];
+        }
+        if !name.is_empty() && !name.contains('<') {
+            calls.push(ToolCall { name, args });
+        }
+        rest = &rest[(end + "</tool_call>".len()).min(rest.len())..];
+    }
+    (answer[..start].trim_end().to_string(), calls)
+}
+
+/// The tool calls in an answer, in whichever form its template asked for: Qwen's `<function=...>` blocks or GLM's
+/// `NAME<arg_key>...` (the first call's body tells which)
+pub fn tool_calls(answer: &str) -> (String, Vec<ToolCall>) {
+    let qwen = answer.find("<tool_call>").is_some_and(|i| answer[i + "<tool_call>".len()..].trim_start().starts_with("<function="));
+    if qwen { qwen_tool_calls(answer) } else { glm_tool_calls(answer) }
 }
 
 /// DeepSeek-V3 / R1's chat template (`tokenizer.chat_template`), its text-only, tool-free path: the BOS token, the
@@ -1060,6 +1156,53 @@ mod tests {
     fn the_template() {
         let m = [Message { role: "user", content: "Hi", ..Default::default() }];
         assert_eq!(glm_chat(&m, Effort::Low, &[]), "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Hi<|assistant|><think>");
+    }
+
+    /// GLM-5.3's template rendered by jinja2 (transformers' settings) on the same conversation: tools, a call, its result
+    /// (but the tool's keys: serde_json keeps an object's keys sorted, the template its order)
+    #[test]
+    fn glms_tool_turns_as_its_template() {
+        let tool = "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather of a city\", \"parameters\": {\"type\": \"object\", \
+                    \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}, \"strict\": true}}".to_string();
+        let calls = [ToolCall { name: "get_weather".into(), args: vec![("city".into(), "Paris".into()), ("days".into(), "3".into())] },
+                     ToolCall { name: "get_weather".into(), args: vec![("city".into(), "Rome".into())] }];
+        let m = [Message { role: "system", content: "Be brief.", ..Default::default() },
+                 Message { role: "user", content: "Weather in Paris?", ..Default::default() },
+                 Message { role: "assistant", content: "", reasoning: Some("Need the tool."), calls: &calls },
+                 Message { role: "tool", content: "Sunny", ..Default::default() },
+                 Message { role: "tool", content: "Rain", ..Default::default() }];
+        let want = "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
+                    You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"Weather of a city\", \"name\": \
+                    \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \
+                    \"required\": [\"city\"], \"type\": \"object\"}}\n</tools>\n\nFor each function call, output the function name and arguments within the \
+                    following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}\
+                    </arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>Be brief.<|user|>Weather in Paris?<|assistant|><think>Need the tool.\
+                    </think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>\
+                    <tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call><|observation|><tool_response>Sunny</tool_response>\
+                    <tool_response>Rain</tool_response><|assistant|><think>";
+        assert_eq!(glm_chat(&m, Effort::Max, &[tool]), want);
+        // without tools, as before
+        assert_eq!(glm_chat(&m[..2], Effort::Low, &[]), "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>Be brief.<|user|>Weather in Paris?<|assistant|><think>");
+    }
+
+    #[test]
+    fn glms_tool_calls_parse() {
+        let a = "I will look.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value>\
+                 </tool_call>\n<tool_call>now\n</tool_call>";
+        let (text, calls) = glm_tool_calls(a);
+        assert_eq!(text, "I will look.");
+        assert_eq!(calls, vec![ToolCall { name: "get_weather".into(), args: vec![("city".into(), "Paris".into()), ("days".into(), "3".into())] },
+                               ToolCall { name: "now".into(), args: vec![] }]);
+        // GLM-4.5's form: a line a part
+        let (_, c) = glm_tool_calls("<tool_call>search\n<arg_key>q</arg_key>\n<arg_value>two\nlines</arg_value>\n</tool_call>");
+        assert_eq!(c, vec![ToolCall { name: "search".into(), args: vec![("q".into(), "two\nlines".into())] }]);
+        // either form through tool_calls
+        assert_eq!(tool_calls(a).1.len(), 2);
+        assert_eq!(tool_calls("x\n<tool_call>\n<function=f>\n<parameter=a>\n1\n</parameter>\n</function>\n</tool_call>").1,
+                   vec![ToolCall { name: "f".into(), args: vec![("a".into(), "1".into())] }]);
+        assert_eq!(tool_calls("plain"), ("plain".to_string(), vec![]));
+        // a call cut off before its end (max_tokens): what is there
+        assert_eq!(glm_tool_calls("<tool_call>f<arg_key>a</arg_key><arg_value>1").1, vec![ToolCall { name: "f".into(), args: vec![("a".into(), "1".into())] }]);
     }
 }
 

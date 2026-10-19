@@ -62,7 +62,7 @@ use nextsycl_llm::{Decoder, Engine, Session};
 use crate::cache::PromptCache;
 use crate::telemetry::Telemetry;
 use crate::http::{self, Conn};
-use nextsycl_tok::{Effort, Message, Tokenizer, ToolCall};
+use nextsycl_tok::{py_json, Effort, Message, Tokenizer, ToolCall};
 use serde_json::{json, Value};
 
 use nextsycl_llm::sampling::{sample, Rng};
@@ -388,15 +388,6 @@ fn calls_of(v: &Value) -> Vec<ToolCall> {
         }).collect());
         Some(ToolCall { name, args })
     }).collect())
-}
-
-/// JSON as the chat templates' `tojson` writes it (Python's json.dumps: ", " and ": ", non-ASCII as is)
-fn py_json(v: &Value) -> String {
-    match v {
-        Value::Array(a) => format!("[{}]", a.iter().map(py_json).collect::<Vec<_>>().join(", ")),
-        Value::Object(o) => format!("{{{}}}", o.iter().map(|(k, v)| format!("{}: {}", Value::String(k.clone()), py_json(v))).collect::<Vec<_>>().join(", ")),
-        x => x.to_string(),
-    }
 }
 
 /// A call's arguments as a JSON object: each value by its parameter's type in the tool's schema (a string as given;
@@ -1367,8 +1358,8 @@ impl Server {
             self.remember(row);
         }
         let finish = if finish == "client gone" { "stop" } else { finish };
-        // the answer's tool calls (Qwen's <tool_call> blocks), as OpenAI's tool_calls
-        let (text, calls) = if tools_on { nextsycl_tok::qwen_tool_calls(content.trim()) } else { (content.trim().to_string(), Vec::new()) };
+        // the answer's tool calls (Qwen's or GLM's <tool_call> blocks), as OpenAI's tool_calls
+        let (text, calls) = if tools_on { nextsycl_tok::tool_calls(content.trim()) } else { (content.trim().to_string(), Vec::new()) };
         let tool_calls: Vec<Value> = calls.iter().enumerate().map(|(i, c)| json!({
             "index": i, "id": format!("call_{rid}_{i}"), "type": "function",
             "function": {"name": c.name, "arguments": typed_args(&ask.tools, c).to_string()}})).collect();

@@ -7,7 +7,7 @@ title: GLM-5.3-Flash uncensored IQ2 · 64K context (both GPUs)
 about: GLM-5.3-Flash uncensored, IQ2 imatrix with its MTP block (ds4 layout)
 gpus: all
 ctx: '65536'
-tools: false
+tools: true                     # GLM's <tool_call> form: nextsycl_tok::glm_chat / glm_tool_calls
 tasks: false
 env: {}
 files:
