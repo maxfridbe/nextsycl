@@ -19,6 +19,7 @@
 //! License: the weights and what they make are BreezeBlue's Research and Non-Commercial License 1.1; the inference
 //! code upstream is Apache-2.0.
 
+pub mod batch;
 pub mod check;
 mod ffi;
 pub mod lm;
@@ -60,6 +61,8 @@ pub const OPTIONS: &[EngineOption] = &[
                    at: At::Request },
     EngineOption { name: "temperature", env: "NS_BZ2_TEMPERATURE", value: "0.9", help: "the sampling temperature (backbone and depth decoder)", at: At::Request },
     EngineOption { name: "top-k", env: "NS_BZ2_TOP_K", value: "50", help: "the sampling top-k (backbone and depth decoder)", at: At::Request },
+    EngineOption { name: "batch", env: "NS_BZ2_BATCH", value: "8",
+                   help: "the rows a frame takes for requests made together (a guided request two; 1: one request at a time)", at: At::Load },
 ];
 
 /// The vocal events the model knows inline in the text (upstream's examples): English in parentheses, Chinese in
@@ -73,7 +76,11 @@ pub fn kind() -> AudioKind {
 
 fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn AudioEngine>> {
     let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?;
-    Ok(Box::new(BreezeTts2::load(files, gpu, o, log)?))
+    let rows = match o.setting("NS_BZ2_BATCH") {
+        Some(v) => v.parse().map_err(|_| Error(format!("NS_BZ2_BATCH {v}: the rows a frame takes, 1..8")))?,
+        None => batch::ROWS,
+    };
+    Ok(Box::new(batch::Batched::new(BreezeTts2::load(files, gpu, o, log)?, rows)?))
 }
 
 fn role(files: &ModelFiles, r: &str) -> Result<PathBuf> {

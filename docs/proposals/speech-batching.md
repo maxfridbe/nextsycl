@@ -1,6 +1,9 @@
 # Proposal: several clips at once in one speech engine (batched decode)
 
-Status: **for review** (2026-10-17). Not started.
+Status: **in progress** (2026-10-19): Breeze TTS 2 batches (`audio/breezetts2/src/batch.rs`, up to 8 rows a frame, `NS_BZ2_BATCH`); the
+audio server runs as many requests as an engine batches (`AudioEngine::batch`). B70, design mode (guided), 4 clips of 5-10 s: one at a
+time 1.61x real time; 2 together 2.58x; 4 together 3.68x. Each request's codes are its solo run's (its samples identical, or 1 in
+32,768 apart on a few: the codec's own run-to-run rounding). Qwen3-TTS, VoxCPM2 and the others not yet.
 
 ## The measurement that prompted it
 
