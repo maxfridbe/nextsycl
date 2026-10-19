@@ -47,9 +47,9 @@ for a chat model. Measured speeds, decode / prompt reading:
 | `unlimited-ocr-q8`, `-q4` | **Unlimited-OCR** pictures and PDFs to Markdown (tables as HTML, boxes), its own page | a page: ~2-3 s to see, ~130 tok/s written |
 | `paddleocr-vl-1.6` | **PaddleOCR-VL** text, tables (HTML), formulas (LaTeX), charts, seals, spotting; the same OCR page | a page: ~1.2 s to see, ~200-250 tok/s written |
 | `olmocr-2-7b-q8` | **olmOCR-2** whole pages to Markdown (tables HTML, equations LaTeX), turned pages righted; the same OCR page | a page: ~3 s to see, ~55 tok/s written |
-| `unirig` | **UniRig** a skeleton and skin weights for any mesh (`model3d.rig`) | a 7.6K-vertex humanoid: 6-8 s |
-| `rignet` | **RigNet** a skeleton and skin weights for a character mesh (`model3d.rig`); its own crate, **GPLv3** as RigNet's code | a 7.6K-vertex humanoid: 2.3 s |
-| `animateanymesh` | **AnimateAnyMesh** a mesh set in motion by a sentence, as morph targets (`model3d.rig` with a prompt) | a 7.6K-vertex humanoid, 16 frames: 3.7 s |
+| `unirig` | **UniRig** a skeleton and skin weights for any mesh (`model3d.rig`) | a 7.6K-vertex humanoid: 3.2 s |
+| `rignet` | **RigNet** a skeleton and skin weights for a character mesh (`model3d.rig`); its own crate, **GPLv3** as RigNet's code | a 7.6K-vertex humanoid: 0.6 s |
+| `animateanymesh` | **AnimateAnyMesh** a mesh set in motion by a sentence, as morph targets (`model3d.rig` with a prompt) | a 7.6K-vertex humanoid, 16 frames: 2.8 s |
 | `minimax-h3` | **MiniMax H3** video with sound | 896x672, 4.5 s: ~90 s |
 | `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |
 | `qwen3-tts-custom` | **Qwen3-TTS** speech | a minute of speech: 10.7 s (8.2 s int8); a sentence: 0.64 s |
@@ -1297,7 +1297,7 @@ attention as two float32 oneDNN products: 13x the engine's own kernel on the DiT
 
 | mesh (B70) | vertices | trajectory tokens | time |
 |---|---|---|---|
-| reference/meshes/humanoid.obj | 7,590 | 948 | 3.7 s (encode 0.7 s, 63 flow steps 2.7 s, decode 0.3 s) |
+| reference/meshes/humanoid.obj | 7,590 | 948 | 2.8 s (3.1 s before the silo's one-pass attention; 2026-10-19) |
 | reference/meshes/humanoid_lo.obj | 3,630 | 512 | 2.1 s |
 
 Checked against the official code in float32 on the CPU (reference/animateanymesh/ref.py, the same noise and
@@ -1320,7 +1320,8 @@ loaded). Its silo runs the attention as float32 oneDNN products.
 
 | mesh (B70) | vertices | joints | time |
 |---|---|---|---|
-| reference/meshes/humanoid.obj | 7,590 merged (8,595 in the file) | 28 | 6-8 s (the skeleton's 102 tokens 1.6-2.7 s, the prior 0.3 s, the skin model 3 s) |
+| reference/meshes/humanoid.obj | 7,590 merged (8,595 in the file) | 28 | 3.2 s (6.3 s before the silo's attention, layer norm and bone attention and the threaded voxel prior; 2026-10-19) |
+| a 20K-vertex fox (Hunyuan3D-2mini's) | 19,984 | 21 | 3.9 s (11.6 s before) |
 
 Checked against the official code in float32 on the CPU (reference/unirig/ref.py, the same samples, subsets and
 curves): the encoder's latents 2.4e-6 relative RMS, the farthest points identical, teacher-forced logits 2.6e-6 (the
@@ -1336,7 +1337,8 @@ decimated to about 4,000 triangles (crates/mesh's quadric decimation, not MeshLa
 its geometry on the CPU (surface geodesics, geodesic edges, a voxelization), GMEdgeNet's joints by mean-shift,
 RootNet, BoneNet and the symmetric Prim tree, SkinNet over volumetric geodesics (ray visibility on the CPU), the
 weights carried back to every vertex of the input. Each network matches the reference to about 1e-6 relative RMS on
-the same geometry; 2.3 s a rig on the B70. Details: model-cards/guides/rignet.md.
+the same geometry; 0.6 s a rig on the B70 (the humanoid; the fox 0.8 s), the same joints every run (the decimation
+breaks ties by edge, not by a hash map's order). Details: model-cards/guides/rignet.md.
 ```sh
 nextsycl models pull trellis2                                  # or trellis2-512, pixal3d
 nextsycl model3d gen helmet.png --model trellis2 --seed 42 --out helmet.glb [--resolution 512|1024] [--faces 300000]
