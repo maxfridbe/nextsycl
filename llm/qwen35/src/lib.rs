@@ -7,6 +7,7 @@
 pub mod engine;
 mod ffi;
 mod probe;
+pub mod vision;
 
 use std::any::Any;
 use std::sync::Arc;
@@ -21,6 +22,8 @@ pub const ARCH: &str = "qwen35";
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "chunk", env: "NS_Q35_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 2048 when it fits beside the weights and a session, else 1024 or 512)", at: At::Load },
     EngineOption { name: "mtp", env: "NS_Q35_MTP", value: "FILE", help: "the MTP draft block's GGUF (default: the one in an MTP/ folder beside the model)", at: At::Load },
+    EngineOption { name: "vision", env: "NS_Q35_VISION", value: "FILE|0", help: "the vision tower's mmproj GGUF (default: an mmproj*.gguf beside the model; 0: no pictures)", at: At::Load },
+    EngineOption { name: "image-tokens", env: "NS_Q35_IMAGE_TOKENS", value: "N", help: "the most prompt positions a picture takes (default 4096; larger pictures are scaled down)", at: At::Load },
     EngineOption { name: "drafts", env: "NS_Q35_DRAFTS", value: "N", help: "tokens drafted a step with MTP (default 3, at most 7; 0: none)", at: At::Load },
 ];
 
@@ -164,6 +167,13 @@ impl Engine for engine::Qwen35<'_> {
     }
     fn read_checkpoint(&self, r: &mut dyn std::io::Read) -> std::io::Result<Checkpoint> {
         Ok(Checkpoint::new(engine::Checkpoint::read_from(r)?))
+    }
+    fn image_marker(&self) -> Option<&str> {
+        self.vision.as_ref().map(|v| v.marker.as_str())
+    }
+    fn image_tokens(&self, bytes: &[u8]) -> Result<Vec<u32>> {
+        let v = self.vision.as_ref().ok_or_else(|| nextsycl_core::Error("no vision tower (NS_Q35_VISION: the model's mmproj file)".into()))?;
+        v.tokens(bytes)
     }
     fn gpu_info(&self) -> Vec<GpuInfo> {
         engine::Qwen35::gpu_info(self)

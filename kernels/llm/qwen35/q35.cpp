@@ -176,6 +176,142 @@ int ns_q35_qk_norm_rope(ns_gpu* g, const float* src, int64_t ss, int64_t hs, flo
     NS_CATCH
 }
 
+int ns_q35_qk_norm_rope_pos(ns_gpu* g, const float* src, int64_t ss, int64_t hs, float* dst, int64_t ds, int64_t T, int64_t H, int64_t D,
+                            const float* w, float eps, int64_t n_rot, float theta, const int32_t* pos, int64_t s0, int64_t s1, int64_t s2) {
+    NS_TRY
+    if (T <= 0) return 0;
+    if (D % SG != 0 || n_rot > D || n_rot % 2 || s0 + s1 + s2 <= 0) return ns_fail("ns_q35_qk_norm_rope_pos: D a multiple of 16, n_rot even and at most D, sections");
+    const int64_t half_rot = n_rot / 2, sect = s0 + s1 + s2;
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * H) * SG), sycl::range<1>(SG)),
+                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        auto sg = it.get_sub_group();
+        const int l = (int) sg.get_local_linear_id();
+        const int64_t th = it.get_group(0), t = th / H, h = th % H;
+        const float* x = src + t * ss + h * hs;
+        float* y = dst + t * ds + h * D;
+        float s = 0.0f;
+        for (int64_t i = l; i < D; i += SG) s += x[i] * x[i];
+        const float inv = sycl::rsqrt(sycl::reduce_over_group(sg, s, sycl::plus<float>()) / (float) D + eps);
+        for (int64_t i = l; i < D; i += SG) {
+            const float v = x[i] * inv * w[i];
+            if (i < n_rot) {
+                const int64_t k = i < half_rot ? i : i - half_rot;
+                // the interleaved sections (llama.cpp's IMROPE, Qwen3-VL's): pair k turns by the row's t, h or w position
+                const int64_t sec = k % sect;
+                const int c = (sec % 3 == 1 && sec < 3 * s1) ? 1 : (sec % 3 == 2 && sec < 3 * s2) ? 2 : 0;
+                const float p = (float) pos[t * 3 + c];
+                const float a = p * sycl::pow(theta, -2.0f * (float) k / (float) n_rot);
+                const float c_ = sycl::cos(a), sn = sycl::sin(a);
+                const int64_t o = i < half_rot ? i + half_rot : i - half_rot;
+                const float other = x[o] * inv * w[o];
+                y[i] = i < half_rot ? v * c_ - other * sn : v * c_ + other * sn;
+            } else {
+                y[i] = v;
+            }
+        }
+    });
+    return 0;
+    NS_CATCH
+}
+
+// ---- the vision tower's (Qwen3-VL ViT in the mmproj file): a picture's patches, float32 rows
+
+int ns_q35_vit_ln(ns_gpu* g, const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t C, float eps) {
+    NS_TRY
+    if (rows <= 0) return 0;
+    constexpr int WG = 256;
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+        const int64_t r = it.get_group(0);
+        const float* xr = x + r * C;
+        float s = 0.0f;
+        for (int64_t i = it.get_local_id(0); i < C; i += WG) s += xr[i];
+        const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
+        float v = 0.0f;
+        for (int64_t i = it.get_local_id(0); i < C; i += WG) {
+            const float d = xr[i] - mean;
+            v += d * d;
+        }
+        const float inv = sycl::rsqrt(sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>()) / (float) C + eps);
+        for (int64_t i = it.get_local_id(0); i < C; i += WG) y[r * C + i] = (xr[i] - mean) * inv * w[i] + b[i];
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_vit_bias_act(ns_gpu* g, float* y, const float* b, int64_t rows, int64_t N, int act) {
+    NS_TRY
+    if (rows <= 0) return 0;
+    const int64_t n = rows * N;
+    g->q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const int64_t i = id[0];
+        float v = y[i] + (b ? b[i % N] : 0.0f);
+        if (act == 1) {
+            // GELU, tanh form (gelu_pytorch_tanh)
+            v = 0.5f * v * (1.0f + sycl::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+        } else if (act == 2) {
+            // GELU, erf form (nn.GELU())
+            v = 0.5f * v * (1.0f + sycl::erf(v * 0.7071067811865476f));
+        }
+        y[i] = v;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_vit_rope(ns_gpu* g, float* qkv, int64_t n, int64_t H, int64_t D, const float* cs, float* kh) {
+    NS_TRY
+    if (n <= 0) return 0;
+    const int64_t C = H * D, half = D / 2;
+    g->q.parallel_for(sycl::range<2>((size_t) (n * H), (size_t) half), [=](sycl::id<2> id) {
+        const int64_t r = id[0] / H, h = id[0] % H, i = id[1];
+        const float c = cs[(r * half + i) * 2], s = cs[(r * half + i) * 2 + 1];
+        float* q = qkv + r * 3 * C + h * D;
+        const float q0 = q[i], q1 = q[i + half];
+        q[i] = q0 * c - q1 * s;
+        q[i + half] = q1 * c + q0 * s;
+        const float* k = qkv + r * 3 * C + C + h * D;
+        const float k0 = k[i], k1 = k[i + half];
+        float* o = kh + (h * n + r) * D;
+        o[i] = k0 * c - k1 * s;
+        o[i + half] = k1 * c + k0 * s;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_vit_heads(ns_gpu* g, const float* ob, int64_t H, int64_t r, int64_t D, float* out) {
+    NS_TRY
+    if (r <= 0) return 0;
+    g->q.parallel_for(sycl::range<2>((size_t) r, (size_t) (H * D)), [=](sycl::id<2> id) {
+        const int64_t i = id[0], j = id[1], hh = j / D, d = j % D;
+        out[i * H * D + j] = ob[(hh * r + i) * D + d];
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_softmax_rows(ns_gpu* g, float* x, int64_t rows, int64_t n, float scale) {
+    NS_TRY
+    if (rows <= 0) return 0;
+    constexpr int WG = 256;
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+        float* xr = x + it.get_group(0) * n;
+        float m = -INFINITY;
+        for (int64_t i = it.get_local_id(0); i < n; i += WG) m = sycl::fmax(m, xr[i] * scale);
+        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+        float s = 0.0f;
+        for (int64_t i = it.get_local_id(0); i < n; i += WG) {
+            const float e = sycl::exp(xr[i] * scale - m);
+            xr[i] = e;
+            s += e;
+        }
+        const float inv = 1.0f / sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+        for (int64_t i = it.get_local_id(0); i < n; i += WG) xr[i] *= inv;
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_q35_kv_store(ns_gpu* g, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
                     void* kc, void* vc) {
     NS_TRY

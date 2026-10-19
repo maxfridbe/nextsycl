@@ -194,6 +194,9 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_Q35_MMVQ_GROUPS` | 512 | Experiment: work-groups of the silo's matrix-vector kernels with a lookup table | kernels:qwen35 silo |
 | `NS_Q35_MMVQ_ROWS` | 0 (each type's own) | Experiment: rows a sub-group (1, 2 or 4) for every 256-block type of the silo's matrix-vector kernels | kernels:qwen35 silo |
 | `NS_Q35_MTP` | the first .gguf in an MTP/ folder beside the model | the MTP draft block's GGUF (--opt-mtp) | llm qwen35 |
+| `NS_Q35_VISION` | an `mmproj*.gguf` beside the model | the vision tower's file (the model's mmproj GGUF, Qwen3-VL's ViT and merger: pictures in chat); 0: none (the model reads no pictures) (--opt-vision) | llm qwen35 |
+| `NS_Q35_IMAGE_TOKENS` | 4096 | the most prompt positions a picture takes (2 x 2 patches of 16 pixels each; larger pictures are scaled down to fit, and to what the prompt arena holds) (--opt-image-tokens) | llm qwen35 |
+| `NS_Q35_VISION_DUMP` | unset | PREFIX: a picture's patches and rows written as raw float32 to PREFIX.patches.f32 and .rows.f32 (a check against llama.cpp's mtmd: reference/llama-dump/ns-mtmd-dump.cpp) | llm qwen35 |
 | `NS_Q35_PROFILE` | off | Debug: 1 times every kernel on the device with its bytes and arithmetic (needs NS_PROFILE=gpu; one GPU only) | llm qwen35 |
 
 ## Image
@@ -581,6 +584,8 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 | `NS_CHECK_SAVE` | off | llm check: DIR gets this engine's tensors too (<name>.f32), beside the reference's | cli (llm check) |
 | `NS_DUMP_DIR` | ns-dump | Directory llama-ns-dump writes its float32 tensors and index.tsv to | reference/llama-dump (ns-dump.cpp, llama.cpp parity tool) |
 | `NS_DUMP_RE` | the GLM layer outputs (inp_embd, attn_norm-N, l_out-N, result_output, ...) | Regex of the llama.cpp graph tensor names llama-ns-dump writes | reference/llama-dump (ns-dump.cpp, llama.cpp parity tool) |
+| `NS_DUMP_PROMPT` | unset (-p) | a file whose bytes are the prompt as they are (-p and -f drop a trailing newline) | reference/llama-dump (ns-mtmd-dump.cpp, llama.cpp mtmd parity tool) |
+| `NS_DUMP_GEN` | 48 | greedy tokens llama-ns-mtmd-dump generates after the prompt (next.txt) | reference/llama-dump (ns-mtmd-dump.cpp, llama.cpp mtmd parity tool) |
 | `NS_MM3_CHECK_STEPS` | 3 | chunks check: flow steps a window | audio minimaxmusic3 (check) |
 | `NS_TEST_H3_TOKENIZER` | test skipped | the H3 tokenizer's directory (vocab.json, merges.txt, tokenizer_config.json) for its reference-match test | video h3 (cargo test) |
 | `NS_TEST_QWEN_TOKENIZER` | test skipped | a Qwen3-VL tokenizer.json for the tokenizer test (with NS_TEST_QWEN_TOKENS) | tests (crates/tok) |

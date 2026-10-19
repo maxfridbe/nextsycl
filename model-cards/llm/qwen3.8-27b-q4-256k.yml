@@ -16,4 +16,5 @@ silo:                   # its tuned kernels: kernels/llm/qwen35/silo (dist/silo/
 files:
   model: q27-q4
   mtp: q27-mtp
+  vision: q27-mmproj
 guide: guides/chat.md

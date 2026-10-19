@@ -27,4 +27,10 @@ files:
     size: 1369590656
     sha256: 50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e
     path: qwen3.8-27b/MTP/mtp-Qwen3.8-27B-Q4_0.gguf
+  vision:                       # the vision tower (Qwen3-VL's ViT + merger, F16): found beside the model, pictures in chat
+    key: q27-mmproj
+    url: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/mmproj-F16.gguf
+    size: 927607488
+    sha256: cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e
+    path: qwen3.8-27b/mmproj-F16.gguf
 guide: guides/chat.md

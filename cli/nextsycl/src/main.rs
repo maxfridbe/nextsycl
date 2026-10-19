@@ -95,6 +95,7 @@ language models (nextsycl llm ...; the names without `llm` still work):
   nextsycl llm generate <model.gguf> --prompt TEXT | --prompt-file PATH | --ids FILE [--ignore-eos] [--ctx N]
                  [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--seed S] [--gpu N[,M]] [--no-mtp]
                  [--image PATH ...]  pictures before the prompt (a vision model's)
+                 [--logits-out PATH]  the prompt's last logits as float32 (a check against a reference)
   nextsycl llm info <model.gguf>      the architecture and geometry, every tensor checked by role, bytes by group
   nextsycl llm tokenize <model.gguf> <text>
   nextsycl llm check <model.gguf> <dump dir> [--gpu N[,M]]    the forward pass against a reference dump
@@ -503,6 +504,10 @@ fn generate(args: &[String]) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let logits = eng.feed(&mut sess, &ids, &mut none).map_err(e)?;
     let prefill = t0.elapsed().as_secs_f64();
+    // --logits-out PATH: the prompt's last position's logits as float32 (a check against a reference's)
+    if let Some(p) = opt("--logits-out") {
+        std::fs::write(&p, logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).map_err(|x| format!("{p}: {x}"))?;
+    }
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let seed: u64 = opt("--seed").and_then(|v| v.parse().ok()).unwrap_or(1);
     let mut draw = TempSampler { temp, top_p, rng: &mut rng, seed };

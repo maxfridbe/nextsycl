@@ -50,3 +50,27 @@ The same tool: a prompt holding mtmd's marker (`<__media__>`) places the picture
 it). `~/src/olm-dump.sh DIR IMAGE [N]` on hardac1 runs it with olmOCR's instruction in Qwen's chat template (CPU);
 `nextsycl image check DIR --model olmOCR-2-7B-1025-Q8_0.gguf --picture IMAGE` compares (the picture fitted to 1288
 on its longest side first).
+
+## Pictures in a language model (mtmd): Qwen3.8-27B
+
+`ns-mtmd-dump.cpp`: a prompt holding mtmd's marker (`<__media__>`) for each `--image`, read by llama.cpp; each
+picture's rows from the vision tower (`image-K.f32`, its grid in `image-K.txt`), the prompt's last logits
+(`logits.f32`) and a greedy continuation (`next.txt`). Give the prompt as a file (`NS_DUMP_PROMPT`): `-p` / `-f` drop a
+trailing newline, and Qwen's prompt ends in `<think>\n`.
+
+```sh
+cp reference/llama-dump/ns-mtmd-dump.cpp <llama.cpp>/tools/mtmd/
+cat >> <llama.cpp>/tools/mtmd/CMakeLists.txt <<'EOT'
+add_executable(llama-ns-mtmd-dump ns-mtmd-dump.cpp)
+target_link_libraries(llama-ns-mtmd-dump PRIVATE llama-common mtmd Threads::Threads)
+EOT
+cmake --build build-cpu --target llama-ns-mtmd-dump -j 8
+NS_DUMP_DIR=/tmp/q27v NS_DUMP_PROMPT=prompt.txt ./build-cpu/bin/llama-ns-mtmd-dump -m Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --mmproj mmproj-F16.gguf --image pic.png -p x --device none -ngl 0 -t 16
+# the engine on the same: its rows and logits beside them
+NS_Q35_VISION_DUMP=/tmp/ours nextsycl llm generate Qwen3.8-27B-UD-Q4_K_M.gguf --image pic.png --prompt "..." --temp 0 \
+  --logits-out /tmp/ours.logits.f32
+```
+
+Pick a picture whose sides are multiples of 32 within the pixel limits: llama.cpp letterboxes a picture to the
+aligned size, transformers' processor (and the engine) stretches it.

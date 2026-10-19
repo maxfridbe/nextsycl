@@ -209,6 +209,14 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   block's own output, verifies them in one pass, keeps what the sampled tokens match and rolls the DeltaNet states back
   from the pass's snapshots (`spec-check`: verify rows bit for bit the one-token decode's - the decode attention splits
   each row's keys as a one-row pass at that position would).
+  Pictures (`llm/qwen35/src/vision.rs`): the model's mmproj file (Qwen3-VL's ViT + merger, `NS_Q35_VISION`, found
+  beside the model) runs on the first GPU in the prompt arena, its weights a layer at a time (half products, attention
+  as batched oneMKL products); a picture is `<|vision_start|>`, a span of ids of its own (the same picture the same
+  ids: the prompt cache holds), `<|vision_end|>`. The span's rotary positions are Qwen3-VL's interleaved M-RoPE (t, row,
+  column from the span's start; `ns_q35_qk_norm_rope_pos`), the text after it goes on from the span's start plus its
+  longer side - the session keeps that offset (`shift`, in its checkpoints too). Against llama.cpp's mtmd (CPU, the
+  same Q4 file, a 640 x 480 picture): the picture's 300 rows cos 0.999998, the prompt's last logits cos 0.989 (the text
+  alone: 0.989), the same 48 greedy tokens; a picture ~0.6 s on the B70.
 
 - **deepseek2** - DeepSeek-V3 / R1 (unsloth's dynamic GGUFs: IQ1_S experts): MLA absorbed over an fp16 cache of
   [latent | rotated key] (576 a token and layer; YaRN as llama.cpp runs it), the 256 experts in three tiers - VRAM
