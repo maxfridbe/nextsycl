@@ -1,9 +1,22 @@
 # Proposal: several clips at once in one speech engine (batched decode)
 
-Status: **in progress** (2026-10-19): Breeze TTS 2 batches (`audio/breezetts2/src/batch.rs`, up to 8 rows a frame, `NS_BZ2_BATCH`); the
-audio server runs as many requests as an engine batches (`AudioEngine::batch`). B70, design mode (guided), 4 clips of 5-10 s: one at a
-time 1.61x real time; 2 together 2.58x; 4 together 3.68x. Each request's codes are its solo run's (its samples identical, or 1 in
-32,768 apart on a few: the codec's own run-to-run rounding). Qwen3-TTS, VoxCPM2 and the others not yet.
+Status: **done for Breeze TTS 2 and S2 Pro** (2026-10-19): `audio/breezetts2/src/batch.rs`, `audio/s2pro/src/batch.rs` - one
+thread a card advances every request in hand a frame at a time (the products over all rows, each row's own cache and
+position, continuous batching); the audio server runs as many requests as the engine batches (`AudioEngine::batch`,
+`NS_BZ2_BATCH` / `NS_S2P_BATCH`, 8). B70, `audio serve`, clips of 5-17 s, real time a second of wall time:
+
+| engine, mode | one at a time | 2 together | 4 together | 8 together |
+|---|---|---|---|---|
+| Breeze, design (guided: 2 rows a request) | 1.61x | 2.58x | 3.68x | - |
+| Breeze, plain | 1.83x | 3.58x | 5.55x | 7.63x |
+| S2 Pro, sampled | 3.01x | 4.43x | 5.31x | - |
+| S2 Pro, greedy | 3.1x | - | 6.6x | - |
+
+Parity: a Breeze request's codes in a batch are its solo run's (every clip the same length, samples identical or 1 in
+32,768 apart - the codec's own run-to-run rounding), and a solo run is the previous engine's to the bit. S2 Pro is not
+repeatable run to run on its own (two solo runs of one greedy request differ, as two runs of the old build do); a
+batched request matches its solo run as often as two solo runs match. Qwen3-TTS (its frame is one recorded graph of
+one request), VoxCPM2 and VibeVoice: not batched yet.
 
 ## The measurement that prompted it
 

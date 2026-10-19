@@ -270,6 +270,7 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_BZ2_BATCH` | 8 | the rows a frame takes for requests made together (a guided request - with an instruction - two, a plain one one); the server takes that many requests at once; 1: one at a time (--opt-batch) | audio breezetts2 |
 | `NS_BZ2_TEMPERATURE` | 0.9 | the per-request option temperature's name: the sampling temperature, backbone and depth decoder; a request's options only, the variable itself is not read (--opt-temperature) | audio breezetts2 |
 | `NS_BZ2_TOP_K` | 50 | the per-request option top-k's name: the sampling top-k, backbone and depth decoder; a request's options only, the variable itself is not read (--opt-top-k) | audio breezetts2 |
+| `NS_S2P_BATCH` | 8 | the requests a frame takes together (the server takes that many at once); 1: one at a time (--opt-batch) | audio s2pro |
 | `NS_S2P_GREEDY` | 0 | the per-request option greedy's name: the most likely code, slow and fast models (deterministic; may not end); a request's options only, the variable itself is not read (--opt-greedy) | audio s2pro |
 | `NS_S2P_TEMPERATURE` | 0.7 | the per-request option temperature's name: the sampling temperature, slow and fast models; a request's options only, the variable itself is not read (--opt-temperature) | audio s2pro |
 | `NS_S2P_TOP_P` | 0.7 | the per-request option top-p's name: the sampling top-p, slow and fast models; a request's options only, the variable itself is not read (--opt-top-p) | audio s2pro |
@@ -286,6 +287,7 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_VCP_*` | - | every NS_VCP_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_VCP_CONTINUE` | 0 | 1: VoxCPM2 continues a saved voice's recording (its transcript the prompt's) instead of taking its timbre alone - continuing led the recording's last words into each sentence | audio voxcpm2 |
 | `NS_VCP_GRAPH` | 1 | 0: the silo's sampler queued an evaluation at a time instead of replayed as a recorded graph (the A/B for the graph; the host still waits once a patch) | audio voxcpm2 |
+| `NS_VCP_SAMPLER_CHECK` | 0 | Debug: 1 (with NS_VCP_GRAPH=0): each of the silo's sampler steps checked against the host's on the same values (stderr: the worst difference; 0 expected) | audio voxcpm2 |
 | `NS_VCP_INT8` | 0 | 1: the language models' matrices in int8 (less VRAM, faster patches) (--opt-int8) | audio voxcpm2 |
 | `NS_VCP_MAX_RATIO` | 6 | the per-request option max-ratio's name: the most patches a text token (a runaway's bound); a request's options only, the variable itself is not read (--opt-max-ratio) | audio voxcpm2 |
 

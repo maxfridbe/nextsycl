@@ -20,6 +20,7 @@
 //! License: the weights and what they make are under the Fish Audio Research License (research and non-commercial use
 //! only; commercial use needs Fish Audio's written license).
 
+pub mod batch;
 pub mod check;
 pub mod codec;
 mod ffi;
@@ -65,6 +66,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "temperature", env: "NS_S2P_TEMPERATURE", value: "0.7", help: "the sampling temperature (slow and fast models)", at: At::Request },
     EngineOption { name: "top-p", env: "NS_S2P_TOP_P", value: "0.7", help: "the sampling top-p (slow and fast models)", at: At::Request },
     EngineOption { name: "top-k", env: "NS_S2P_TOP_K", value: "30", help: "the sampling top-k (slow and fast models)", at: At::Request },
+    EngineOption { name: "batch", env: "NS_S2P_BATCH", value: "8", help: "the requests a frame takes together (1: one at a time)", at: At::Load },
 ];
 
 /// Inline tags the model card lists as common (S2 Pro reads free-form ones too: any short description in brackets)
@@ -84,7 +86,11 @@ pub fn kind() -> AudioKind {
 
 fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn AudioEngine>> {
     let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?;
-    Ok(Box::new(S2Pro::load(files, gpu, o, log)?))
+    let rows = match o.setting("NS_S2P_BATCH") {
+        Some(v) => v.parse().map_err(|_| Error(format!("NS_S2P_BATCH {v}: the requests a frame takes, 1..8")))?,
+        None => batch::ROWS,
+    };
+    Ok(Box::new(batch::Batched::new(S2Pro::load(files, gpu, o, log)?, rows)?))
 }
 
 fn role(files: &ModelFiles, r: &str) -> Result<PathBuf> {
