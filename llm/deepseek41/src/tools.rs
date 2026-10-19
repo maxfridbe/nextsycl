@@ -98,6 +98,22 @@ pub fn vq_host(pay: &[u8], cb: &[u8], rows: usize, cols: usize, nbit: usize) -> 
     out
 }
 
+/// A float of magnitude below 2 (normal or zero, as the bench's) to fp16's bits, rounded to nearest even
+fn f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let e = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+    if e <= 0 {
+        return sign;
+    }
+    let m = b & 0x7F_FFFF;
+    let (mut h, rest) = (((e as u32) << 10) | (m >> 13), m & 0x1FFF);
+    if rest > 0x1000 || (rest == 0x1000 && h & 1 == 1) {
+        h += 1;
+    }
+    sign | h as u16
+}
+
 fn compare(a: &[f32], b: &[f32]) -> (f64, f64) {
     let (mut dd, mut bb, mut mx) = (0f64, 0f64, 0f64);
     for (x, y) in a.iter().zip(b) {
@@ -120,6 +136,66 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
     let g = nextsycl_core::Gpu::open(gpu).map_err(e)?;
     let o = Ops::new(g.clone()).map_err(e)?;
     println!("gpu: {}", g.name);
+    // NS_DS41_IDX_BENCH=n1,n2,..: only the indexer's costs at a deep position - its scores for a prompt step's rows (as
+    // many as select() takes at n keys), their top-k over all n, and the two-level form (blocks' maxima, the best
+    // blocks, their keys scored again, the top-k among them) with whether its picks are the same
+    if let Ok(v) = std::env::var("NS_DS41_IDX_BENCH") {
+        let gg = &m.g;
+        let (ih, id, kp) = (gg.idx_heads as usize, gg.idx_dim as usize, gg.idx_top_k as usize);
+        let (bs, ct) = (gg.cand_block.max(1) as usize, gg.cand_top as usize);
+        let r = gg.ratio(gg.index_sources[0]) as usize;
+        for n in v.split(',').filter_map(|x| x.trim().parse::<usize>().ok()) {
+            let t = ((32usize << 20) / n).clamp(1, 2048);
+            let pos0 = n * r - t;
+            let mut seed2 = 0x9E37_79B9u64 ^ n as u64;
+            let mut rn = || {
+                seed2 ^= seed2 >> 12;
+                seed2 ^= seed2 << 25;
+                seed2 ^= seed2 >> 27;
+                ((seed2.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f32) / (1u64 << 24) as f32 - 0.5
+            };
+            let q: Vec<f32> = (0..t * ih * id).map(|_| rn()).collect();
+            let w: Vec<f32> = (0..t * ih).map(|_| rn()).collect();
+            let keys: Vec<u8> = (0..n * id).flat_map(|_| f16_bits(rn()).to_le_bytes()).collect();
+            let (qd, wd) = (DevBuf::from_f32(&g, &q).map_err(e)?, DevBuf::from_f32(&g, &w).map_err(e)?);
+            let kd = DevBuf::new(&g, keys.len()).map_err(e)?;
+            kd.write(0, &keys).map_err(e)?;
+            let sc = DevBuf::f32(&g, t * n).map_err(e)?;
+            let sel = DevBuf::new(&g, t * kp * 4).map_err(e)?;
+            let nb = n.div_ceil(bs);
+            let bmax = DevBuf::f32(&g, t * nb).map_err(e)?;
+            let cand = DevBuf::new(&g, t * ct * 4).map_err(e)?;
+            let scc = DevBuf::f32(&g, t * ct * bs).map_err(e)?;
+            let selc = DevBuf::new(&g, t * kp * 4).map_err(e)?;
+            let sel2 = DevBuf::new(&g, t * kp * 4).map_err(e)?;
+            let time = |f: &dyn Fn() -> nextsycl_core::Result<()>| -> Result<f64, String> {
+                f().map_err(e)?;
+                g.sync().map_err(e)?;
+                let t0 = std::time::Instant::now();
+                for _ in 0..3 {
+                    f().map_err(e)?;
+                }
+                g.sync().map_err(e)?;
+                Ok(t0.elapsed().as_secs_f64() * 1e3 / 3.0)
+            };
+            let a = time(&|| o.idx_score(&qd, &wd, &kd, &sc, t, ih, id, n, n, pos0, r))?;
+            let b = time(&|| o.topk(&sc, &sel, t, n, n, kp))?;
+            let c = time(&|| {
+                o.block_max(&sc, &bmax, t, n, n, bs, pos0, r)?;
+                o.topk(&bmax, &cand, t, nb, nb, ct)?;
+                o.idx_score_cand(&qd, &wd, &kd, &cand, ct, &scc, t, ih, id, n, pos0, r)?;
+                o.topk(&scc, &selc, t, ct * bs, ct * bs, kp)?;
+                o.cand_pos(&selc, &cand, &sel2, t, ct, kp, bs)
+            })?;
+            let (mut s1, mut s2) = (vec![0u8; t * kp * 4], vec![0u8; t * kp * 4]);
+            sel.read(0, &mut s1).map_err(e)?;
+            sel2.read(0, &mut s2).map_err(e)?;
+            let same = s1.chunks(4 * kp).zip(s2.chunks(4 * kp)).filter(|(x, y)| x == y).count();
+            println!("indexer at {n} keys, {t} rows: scores {a:.1} ms, top-{kp} {b:.1} ms; two-level (blocks of {bs}, best {ct}) {c:.1} ms, \
+                      rows with the same picks {same} of {t}");
+        }
+        return Ok(());
+    }
     let (d, ff) = (m.g.n_embd as usize, m.g.ffn_expert as usize);
     let mut seed = 0x1234_5678u64;
     let mut rnd = || {

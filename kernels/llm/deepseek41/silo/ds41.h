@@ -70,6 +70,27 @@ int ns_ds41_cand_pos(ns_gpu* g, const int32_t* selc, const int32_t* cand, int32_
 /* score [T][ld] to -inf outside the blocks cand [T][K] lists (mark: scratch of T x nb bytes) */
 int ns_ds41_cand_mask(ns_gpu* g, float* score, const int32_t* cand, uint8_t* mark, int64_t T, int64_t n, int64_t ld, int64_t K, int64_t bs);
 
+/* glm5next's ns_hc_pre_fused with h (and its norm) collapsed by pre_in, the half before's mix */
+int ns_ds41_hc_pre_in(ns_gpu* g, const float* x, const float* pre_in, const float* fn, const float* scale, const float* base, const float* nw, float* h,
+                      float* post, float* comb, float* pre, float* normed, float* part, int64_t T, int64_t C, float eps, float hc_eps, int iters);
+/* the attention's output: each head's last rd values rotated back at their positions, then the E4M3 simulation in 32s;
+ * x [T][H][D] */
+int ns_ds41_att_post(ns_gpu* g, float* x, int64_t T, int64_t H, int64_t D, int64_t rd, int64_t pos0, float freq_base, float freq_scale, float ext_factor,
+                     float mscale, float corr0, float corr1);
+/* one column against two q4_K matrices of the same x (cols a multiple of 256, rows1 of 4): y1 = W1 . x, y2 = W2 . x */
+int ns_ds41_q4k_mv2(ns_gpu* g, const void* w1, int64_t rows1, const void* w2, int64_t rows2, int64_t cols, const float* x, float* y1, float* y2);
+/* one float32 row against two matrices: y1 [N1] = W1 [N1][K] . x, y2 [N2] = W2 . x */
+int ns_ds41_gemv2(ns_gpu* g, const float* x, const float* w1, int64_t n1, const float* w2, int64_t n2, int64_t K, float* y1, float* y2);
+/* the vision sidecar (vision.cpp): the ViT's 2D rotation of q (in place in qkv [N][3][H][64]) and k (into kc [H][N][64]),
+ * a row softmax of s * scale, a bias with GELU (act 1), silu(gate) * up of gu [rows][2f] */
+int ns_ds41_vit_rope(ns_gpu* g, float* qkv, float* kc, int64_t N, int64_t H, int64_t n_w, float theta);
+int ns_ds41_softmax_rows(ns_gpu* g, float* s, int64_t rows, int64_t n, float scale);
+int ns_ds41_bias_act(ns_gpu* g, float* y, const float* b, int64_t rows, int64_t c, int act);
+int ns_ds41_silu_mul(ns_gpu* g, const float* gu, float* h, int64_t rows, int64_t f);
+/* a layer's window keys fused: rms norm (w), the last rd values rotated at their positions, the E4M3 simulation in 32s,
+ * into the fp16 ring (slot (pos0 + t) % R); kv [T][D] keeps the simulated values */
+int ns_ds41_kv_post(ns_gpu* g, float* kv, const float* w, int64_t T, int64_t D, float eps, int64_t rd, int64_t pos0, float freq_base, float freq_scale,
+                    float ext_factor, float mscale, float corr0, float corr1, uint16_t* ring, int64_t R);
 /* A decode token's routing on the GPU and its products' tables from the layer's slot table (k41.cpp has the layout) */
 int ns_ds41_route1(ns_gpu* g, const float* logits, const float* bias, int64_t ne, int64_t used, float scale, const uint64_t* tab, uint64_t dummy,
                    int64_t off_gate, int64_t off_up, int64_t off_down, uint8_t* gtab, uint8_t* dtab, int32_t* info, int32_t* ctab);

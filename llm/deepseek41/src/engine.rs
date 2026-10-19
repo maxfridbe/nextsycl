@@ -781,6 +781,24 @@ impl Part {
         Ok(y)
     }
 
+    /// Two products of the same x: at one decode row, both q4_K (or both float32) in one launch (NS_DS41_KV_FUSE=0: two)
+    fn mm2(&self, (l1, r1): (u64, Role), (l2, r2): (u64, Role), x: &DevBuf, t: usize) -> Result<(DevBuf, DevBuf)> {
+        let (w1, w2) = (self.mat(l1, r1)?, self.mat(l2, r2)?);
+        if t == 1 && fused() && w1.cols == w2.cols {
+            if w1.ty == GType::Q4K && w2.ty == GType::Q4K && q4k_own() && w1.rows % 4 == 0 && w1.cols % 256 == 0 {
+                let (y1, y2) = (self.arena.f32(w1.rows)?, self.arena.f32(w2.rows)?);
+                self.ops.q4k_mv2(&w1.buf, w1.rows, &w2.buf, w2.rows, w1.cols, x, &y1, &y2)?;
+                return Ok((y1, y2));
+            }
+            if w1.f32() && w2.f32() && w1.cols % 4 == 0 {
+                let (y1, y2) = (self.arena.f32(w1.rows)?, self.arena.f32(w2.rows)?);
+                self.ops.gemv2(x, &w1.buf, w1.rows, &w2.buf, w2.rows, w1.cols, &y1, &y2)?;
+                return Ok((y1, y2));
+            }
+        }
+        Ok((self.mm(l1, r1, x, t)?, self.mm(l2, r2, x, t)?))
+    }
+
     fn store(&self, l: u64) -> Result<&Mutex<Store>> {
         self.store_of.get(&l).map(|&i| &self.stores[i]).ok_or_else(|| Error(format!("block {l}: no expert store on this GPU")))
     }
@@ -2369,15 +2387,19 @@ impl<'g> Ds41<'g> {
         let gw = nh * hd / ng;
         let rope = self.m.rope(l);
         let st = &layers[l as usize];
-        let qr = p.mm(l, Role::QA, x, t)?;
+        let (qr, kv) = p.mm2((l, Role::QA), (l, Role::Kv), x, t)?;
         o.rms_norm(&qr, Some(p.vec(l, Role::QANorm)?), &qr, t, ql, eps)?;
-        let kv = p.mm(l, Role::Kv, x, t)?;
-        o.rms_norm(&kv, Some(p.vec(l, Role::KvNorm)?), &kv, t, hd, eps)?;
-        o.rope(&kv, t, 1, hd, hd, hd - rd, rd, pos0, 1, rope, false)?;
-        o.quant_sim(&kv, t, hd, 32, 0)?;
-        tap(&format!("kv-{l}"), &kv)?;
         let rr = raw_ring();
-        o.ring_put(&kv, &st.raw, t, pos0, rr, hd)?;
+        if kv_fused() {
+            o.kv_post(&kv, p.vec(l, Role::KvNorm)?, t, hd, eps, rd, pos0, rope, &st.raw, rr)?;
+            tap(&format!("kv-{l}"), &kv)?;
+        } else {
+            o.rms_norm(&kv, Some(p.vec(l, Role::KvNorm)?), &kv, t, hd, eps)?;
+            o.rope(&kv, t, 1, hd, hd, hd - rd, rd, pos0, 1, rope, false)?;
+            o.quant_sim(&kv, t, hd, 32, 0)?;
+            tap(&format!("kv-{l}"), &kv)?;
+            o.ring_put(&kv, &st.raw, t, pos0, rr, hd)?;
+        }
         // the compressed keys this layer reads: its source's
         let src = g.kv_source(l);
         if let Some(c) = &st.comp {
@@ -2410,11 +2432,15 @@ impl<'g> Ds41<'g> {
             let compv = comp.map(|c| (&c.cache, c.ratio, c.cache.len / (512 * 2)));
             let sel = if comp.is_some() && sh.sel { Some((p.sel.view(r0 * kp * 4, tr * kp * 4)?, kp)) } else { None };
             o.attend(&q, &st.raw, rr, compv, sel.as_ref().map(|(s, k)| (s, *k)), sinks, &att, tr, nh, pos0 + r0, g.window as usize, scale)?;
-            o.rope(&att, tr, nh, nh * hd, hd, hd - rd, rd, pos0 + r0, 1, rope, true)?;
-            if r0 == 0 && tr == t {
-                tap(&format!("attn_derope-{l}"), &att)?;
+            if kv_fused() {
+                o.att_post(&att, tr, nh, hd, rd, pos0 + r0, rope)?;
+            } else {
+                o.rope(&att, tr, nh, nh * hd, hd, hd - rd, rd, pos0 + r0, 1, rope, true)?;
+                if r0 == 0 && tr == t {
+                    tap(&format!("attn_derope-{l}"), &att)?;
+                }
+                o.quant_sim(&att, tr * nh, hd, 32, 0)?;
             }
-            o.quant_sim(&att, tr * nh, hd, 32, 0)?;
             self.out_a(p, l, &att, &q, &og, &oa, r0, tr)?;
         }
         let out = p.mm(l, Role::OutB, &oa, t)?;
@@ -2483,6 +2509,11 @@ impl<'g> Ds41<'g> {
         let w = p.mat(l, fn_)?;
         if !w.f32() || w.rows != 24 {
             return Err(Error(format!("block {l}: the mHC mixes are float32 [24, 4 d]")));
+        }
+        if t <= MMVQ_COLS && hc_fused() && fused() {
+            // decode widths: the mixes, the Sinkhorn, h by the half before's mix and its norm in two launches
+            return o.hc_pre_in(x, pre_in, &w.buf, p.vec(l, scale)?, p.vec(l, base)?, p.vec(l, norm)?, h, post, comb, pre_out, normed,
+                               &p.arena.f32(t * 32 * 25)?, t, d, eps, g.hc_eps as f32, g.hc_iters as u32);
         }
         if t <= MMVQ_COLS && hc_fused() {
             // decode widths: the mixes and the Sinkhorn in glm5next's two fused launches (its h and norm, by this half's
@@ -3024,10 +3055,14 @@ impl<'g> Ds41<'g> {
         let f = g.ffn_expert as usize;
         let (ne, used) = { let (a, b) = g.experts(l); (a as usize, b as usize) };
         let lim = g.swiglu_limit as f32;
-        let logits = p.mm(l, Role::Router, x, t)?;
         let pf = prefetch_limit();
         let next_main = l + 1 < g.n_layer && !g.is_mtp(l) && p.layers.contains(&(l + 1));
-        let guess = if t <= MMVQ_COLS && pf > 0 && next_main { Some(p.mm(l + 1, Role::Router, x, t)?) } else { None };
+        let (logits, guess) = if t <= MMVQ_COLS && pf > 0 && next_main {
+            let (a, b) = p.mm2((l, Role::Router), (l + 1, Role::Router), x, t)?;
+            (a, Some(b))
+        } else {
+            (p.mm(l, Role::Router, x, t)?, None)
+        };
         tap(&format!("ffn_moe_logits-{l}"), &logits)?;
         // one decode token routed on the GPU: its VRAM experts' products queued now, from the slot table; the host
         // reads the routing (ids, weights, which had no VRAM slot) after, for the rest and its bookkeeping
@@ -3070,8 +3105,7 @@ impl<'g> Ds41<'g> {
         };
         // the shared expert, queued while the host picks the routed ones
         let y = {
-            let sg = p.mm(l, Role::ShGate, x, t)?;
-            let su = p.mm(l, Role::ShUp, x, t)?;
+            let (sg, su) = p.mm2((l, Role::ShGate), (l, Role::ShUp), x, t)?;
             o.swiglu_clamp(&sg, &su, &sg, t * f, lim)?;
             p.mm(l, Role::ShDown, &sg, t)?
         };
@@ -3522,4 +3556,18 @@ impl<'g> Ds41<'g> {
         std::fs::rename(&tmp, path)?;
         Ok(v.len())
     }
+}
+
+/// Decode's fused chains (NS_DS41_KV_FUSE=0: the separate kernels; always those without the simulation): the window
+/// keys' norm, rotation, simulation and ring write in one launch (ns_ds41_kv_post), the attention output's rotation back
+/// and simulation in one (ns_ds41_att_post), an mHC half's mixes, collapse and norm in two (ns_ds41_hc_pre_in); and
+/// at one row two products of the same input in one launch (Part::mm2: q_a | kv, the shared gate | up, the router | the
+/// next layer's guess)
+fn fused() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NS_DS41_KV_FUSE").map_or(true, |v| v != "0"))
+}
+/// The fused chains that end in the simulation (kv_post, att_post): not without it
+fn kv_fused() -> bool {
+    fused() && crate::ops::qsim_on()
 }

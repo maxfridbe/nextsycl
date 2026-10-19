@@ -439,12 +439,158 @@ impl Ops {
 
     // ---- k41.cpp / vq.cpp (this model's own)
 
+    /// The attention's output att [t][h][d] in one launch (ns_ds41_att_post): each head's last rd values rotated back at
+    /// positions pos0.., then the E4M3 simulation in 32s - rope(.., inverse) and quant_sim(32, 0) in two
+    #[allow(clippy::too_many_arguments)]
+    pub fn att_post(&self, x: &DevBuf, t: usize, h: usize, d: usize, rd: usize, pos0: usize, r: crate::model::Rope) -> Result<()> {
+        if t == 0 {
+            return Ok(());
+        }
+        need!(x, t * h * d, "att_post x");
+        // SAFETY: size checked.
+        let rc = unsafe {
+            (self.k.ds41_att_post)(self.raw(), x.fp(), t as i64, h as i64, d as i64, rd as i64, pos0 as i64, r.base, r.freq_scale, r.ext_factor, r.mscale,
+                                   r.corr0, r.corr1)
+        };
+        self.ok(rc, "ds41_att_post")
+    }
+    /// hc_pre_fused with h and normed collapsed by pre_in (the half before's mix) in its own launch (ns_ds41_hc_pre_in):
+    /// what hc_pre_fused + hc_collapse + rms_norm did in four
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_pre_in(&self, x: &DevBuf, pre_in: &DevBuf, fn_: &DevBuf, scale: &DevBuf, base: &DevBuf, nw: &DevBuf, h: &DevBuf, post: &DevBuf, comb: &DevBuf,
+                     pre: &DevBuf, normed: &DevBuf, part: &DevBuf, t: usize, c: usize, eps: f32, hc_eps: f32, iters: u32) -> Result<()> {
+        need!(part, t * 32 * 25, "hc_pre_in scratch");
+        need!(x, t * 4 * c, "hc_pre_in X");
+        need!(pre_in, t * 4, "hc_pre_in pre_in");
+        need!(fn_, 24 * 4 * c, "hc_pre_in fn");
+        need!(scale, 3, "hc_pre_in scale");
+        need!(base, 24, "hc_pre_in base");
+        need!(nw, c, "hc_pre_in norm");
+        need!(h, t * c, "hc_pre_in h");
+        need!(normed, t * c, "hc_pre_in normed");
+        need!(post, t * 4, "hc_pre_in post");
+        need!(comb, t * 16, "hc_pre_in comb");
+        need!(pre, t * 4, "hc_pre_in pre");
+        // SAFETY: sizes checked.
+        let rc = unsafe {
+            (self.k.ds41_hc_pre_in)(self.raw(), x.fp(), pre_in.fp(), fn_.fp(), scale.fp(), base.fp(), nw.fp(), h.fp(), post.fp(), comb.fp(), pre.fp(),
+                                    normed.fp(), part.fp(), t as i64, c as i64, eps, hc_eps, iters as i32)
+        };
+        self.ok(rc, "ds41_hc_pre_in")
+    }
+    /// One column against two q4_K matrices of the same x in one launch (ns_ds41_q4k_mv2; rows1 a multiple of 4): y1 [rows1]
+    /// = W1 . x, y2 [rows2] = W2 . x, each row's sums exactly q4k_mv's
+    #[allow(clippy::too_many_arguments)]
+    pub fn q4k_mv2(&self, w1: &DevBuf, rows1: usize, w2: &DevBuf, rows2: usize, cols: usize, x: &DevBuf, y1: &DevBuf, y2: &DevBuf) -> Result<()> {
+        w1.bounds(0, rows1 * cols / 256 * 144)?;
+        w2.bounds(0, rows2 * cols / 256 * 144)?;
+        need!(x, cols, "q4k_mv2 x");
+        need!(y1, rows1, "q4k_mv2 y1");
+        need!(y2, rows2, "q4k_mv2 y2");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds41_q4k_mv2)(self.raw(), w1.ptr(), rows1 as i64, w2.ptr(), rows2 as i64, cols as i64, x.fp(), y1.fp(), y2.fp()) };
+        self.ok(rc, "ds41_q4k_mv2")
+    }
+    /// One float32 row x [k] against two matrices in one launch (ns_ds41_gemv2): y1 [n1] = W1 [n1][k] . x, y2 [n2] = W2 . x
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv2(&self, x: &DevBuf, w1: &DevBuf, n1: usize, w2: &DevBuf, n2: usize, k: usize, y1: &DevBuf, y2: &DevBuf) -> Result<()> {
+        need!(x, k, "gemv2 x");
+        need!(w1, n1 * k, "gemv2 w1");
+        need!(w2, n2 * k, "gemv2 w2");
+        need!(y1, n1, "gemv2 y1");
+        need!(y2, n2, "gemv2 y2");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds41_gemv2)(self.raw(), x.fp(), w1.fp(), n1 as i64, w2.fp(), n2 as i64, k as i64, y1.fp(), y2.fp()) };
+        self.ok(rc, "ds41_gemv2")
+    }
+    // ---- the vision sidecar (vision.cpp; the batched products glm5next's oneMKL ones)
+
+    /// Per b < batch: y_b [t][n] = x_b [t][k] . w_b^T, w_b [n][k] contiguous; x_b, y_b rows ldx / ldy apart; the
+    /// batch's slices sx / sw / sy floats apart (all offsets in floats)
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batch(&self, batch: usize, t: usize, n: usize, k: usize, x: (&DevBuf, usize, usize, usize), w: (&DevBuf, usize, usize),
+                      y: (&DevBuf, usize, usize, usize)) -> Result<()> {
+        need!(x.0, x.1 + (batch - 1) * x.3 + (t - 1) * x.2 + k, "gemm_batch x");
+        need!(w.0, w.1 + (batch - 1) * w.2 + n * k, "gemm_batch w");
+        need!(y.0, y.1 + (batch - 1) * y.3 + (t - 1) * y.2 + n, "gemm_batch y");
+        // SAFETY: extents checked.
+        let rc = unsafe {
+            (self.k.gemm_batch)(self.raw(), batch as i64, t as i64, n as i64, k as i64, x.0.fp().add(x.1), x.2 as i64, x.3 as i64, w.0.fp().add(w.1),
+                                w.2 as i64, y.0.fp().add(y.1), y.2 as i64, y.3 as i64, 0)
+        };
+        self.ok(rc, "gemm_batch")
+    }
+    /// Per b < batch: y_b [t][n] = x_b [t][k] . w_b, w_b [k][n] rows ldw apart (offsets and strides in floats)
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batch_nn(&self, batch: usize, t: usize, n: usize, k: usize, x: (&DevBuf, usize, usize, usize), w: (&DevBuf, usize, usize, usize),
+                         y: (&DevBuf, usize, usize, usize)) -> Result<()> {
+        need!(x.0, x.1 + (batch - 1) * x.3 + (t - 1) * x.2 + k, "gemm_batch_nn x");
+        need!(w.0, w.1 + (batch - 1) * w.3 + (k - 1) * w.2 + n, "gemm_batch_nn w");
+        need!(y.0, y.1 + (batch - 1) * y.3 + (t - 1) * y.2 + n, "gemm_batch_nn y");
+        // SAFETY: extents checked.
+        let rc = unsafe {
+            (self.k.gemm_batch_nn)(self.raw(), batch as i64, t as i64, n as i64, k as i64, x.0.fp().add(x.1), x.2 as i64, x.3 as i64, w.0.fp().add(w.1),
+                                   w.2 as i64, w.3 as i64, y.0.fp().add(y.1), y.2 as i64, y.3 as i64, 0)
+        };
+        self.ok(rc, "gemm_batch_nn")
+    }
+    /// The ViT's 2D rotation: q in place in qkv [n][3][h][64], k into kc [h][n][64]; patch i at row i / n_w
+    pub fn vit_rope(&self, qkv: &DevBuf, kc: &DevBuf, n: usize, h: usize, n_w: usize, theta: f32) -> Result<()> {
+        need!(qkv, n * 3 * h * 64, "vit_rope qkv");
+        need!(kc, n * h * 64, "vit_rope kc");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds41_vit_rope)(self.raw(), qkv.fp(), kc.fp(), n as i64, h as i64, n_w as i64, theta) };
+        self.ok(rc, "ds41_vit_rope")
+    }
+    /// s [rows][n] = softmax(s * scale) by row
+    pub fn softmax_rows(&self, s: &DevBuf, rows: usize, n: usize, scale: f32) -> Result<()> {
+        need!(s, rows * n, "softmax_rows s");
+        // SAFETY: size checked.
+        let rc = unsafe { (self.k.ds41_softmax_rows)(self.raw(), s.fp(), rows as i64, n as i64, scale) };
+        self.ok(rc, "ds41_softmax_rows")
+    }
+    /// y [rows][c] += b, then GELU when `gelu`
+    pub fn bias_act(&self, y: &DevBuf, b: Option<&DevBuf>, rows: usize, c: usize, gelu: bool) -> Result<()> {
+        need!(y, rows * c, "bias_act y");
+        if let Some(b) = b {
+            need!(b, c, "bias_act b");
+        }
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds41_bias_act)(self.raw(), y.fp(), b.map_or(std::ptr::null(), |b| b.fp()), rows as i64, c as i64, gelu as i32) };
+        self.ok(rc, "ds41_bias_act")
+    }
+    /// h [rows][f] = silu(gu[r][j]) * gu[r][f + j]
+    pub fn silu_mul(&self, gu: &DevBuf, h: &DevBuf, rows: usize, f: usize) -> Result<()> {
+        need!(gu, rows * 2 * f, "silu_mul gu");
+        need!(h, rows * f, "silu_mul h");
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds41_silu_mul)(self.raw(), gu.fp(), h.fp(), rows as i64, f as i64) };
+        self.ok(rc, "ds41_silu_mul")
+    }
+    /// A layer's window keys in one launch (ns_ds41_kv_post): kv [t, d] rms-normed by w, its last rd values rotated at
+    /// positions pos0.., the E4M3 simulation in 32s, then into the raw ring (fp16 [r][d]); what rms_norm, rope,
+    /// quant_sim(32, 0) and ring_put do in four
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_post(&self, kv: &DevBuf, w: &DevBuf, t: usize, d: usize, eps: f32, rd: usize, pos0: usize, r: crate::model::Rope, ring: &DevBuf,
+                   rn: usize) -> Result<()> {
+        if t == 0 {
+            return Ok(());
+        }
+        need!(kv, t * d, "kv_post kv");
+        need!(w, d, "kv_post w");
+        ring.bounds(0, rn * d * 2)?;
+        // SAFETY: sizes checked.
+        let rc = unsafe {
+            (self.k.ds41_kv_post)(self.raw(), kv.fp(), w.fp(), t as i64, d as i64, eps, rd as i64, pos0 as i64, r.base, r.freq_scale, r.ext_factor, r.mscale,
+                                  r.corr0, r.corr1, ring.ptr().cast(), rn as i64)
+        };
+        self.ok(rc, "ds41_kv_post")
+    }
+
     /// The model's low-precision simulation in place on x [rows][cols], a scale a `block` (kind 0 E4M3 / power-of-two
     /// scale, 1 E2M1 / power of two, 2 E2M1 / E4M3 scale)
     pub fn quant_sim(&self, x: &DevBuf, rows: usize, cols: usize, block: usize, kind: i32) -> Result<()> {
-        // NS_DS41_QSIM=0: none (a check against a reference without them: their rounding amplifies float noise)
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if rows == 0 || !*ON.get_or_init(|| std::env::var("NS_DS41_QSIM").map_or(true, |v| v != "0")) {
+        if rows == 0 || !qsim_on() {
             return Ok(());
         }
         need!(x, rows * cols, "quant_sim x");
@@ -750,4 +896,11 @@ pub fn lut_lists(nx: usize, pairs: impl IntoIterator<Item = (usize, usize, usize
     }
     let maxn = (0..nx).map(|c| v[c * LUT_STRIDE] as usize).max().unwrap_or(0).max(1);
     Some((v.iter().flat_map(|x| x.to_le_bytes()).collect(), maxn))
+}
+
+/// The model's low-precision simulation on (NS_DS41_QSIM=0: none, a check against a reference without it: its rounding
+/// amplifies float noise)
+pub fn qsim_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NS_DS41_QSIM").map_or(true, |v| v != "0"))
 }

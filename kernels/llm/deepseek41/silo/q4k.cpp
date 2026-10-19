@@ -182,6 +182,75 @@ void q4k_cols(sycl::queue& q, const BlockQ4K* wb, int64_t rows, int64_t nb, cons
         }
     });
 }
+// q4k_rows<R> for one column over two matrices of the same x in one launch (the shared expert's gate and up, q_a and
+// kv): rows [0, rows1) of wb1 into y1, then wb2's into y2 - each row's sums exactly q4k_rows's
+template <int R>
+void q4k_rows2(sycl::queue& q, const BlockQ4K* wb1, int64_t rows1, const BlockQ4K* wb2, int64_t rows2, int64_t nb, const float* x, float* y1, float* y2) {
+    const int64_t rows = rows1 + rows2, xcs = 0, ycs = 0, t = 1;
+    constexpr int SG = 16, SPG = 8, MC = 8;
+    const int64_t rb = (rows + R - 1) / R;
+    q.parallel_for(sycl::nd_range<1>((rb + SPG - 1) / SPG * SPG * SG, SPG * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const auto sg = it.get_sub_group();
+        const int64_t r0 = (it.get_group(0) * SPG + sg.get_group_id()[0]) * R;
+        const int lane = sg.get_local_id()[0];
+        if (r0 >= rows) return;
+        // rows1 a multiple of R: no sub-group's rows in both matrices
+        const bool second = r0 >= rows1;
+        const BlockQ4K* wb = second ? wb2 : wb1;
+        float* y = second ? y2 : y1;
+        const int64_t rs = second ? r0 - rows1 : r0;
+        const int nr = (int) sycl::min<int64_t>(R, (second ? rows : rows1) - r0);
+        const float* xr = x;
+        float acc[R][MC] = {};
+        for (int64_t i = lane; i < nb * 4; i += SG) {
+            const int64_t b = i >> 2;
+            const int k = (int) (i & 3);
+            const int64_t x0 = b * 256 + k * 64;
+            for (int c = 0; c < MC; ++c) {
+                if (c >= t) break;
+                const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(xr + c * xcs + x0);
+                sycl::float4 xa[8], xb[8];
+                float slo = 0.f, shi = 0.f;
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    xa[u] = xv[u];
+                    xb[u] = xv[8 + u];
+                    slo += xa[u].x() + xa[u].y() + xa[u].z() + xa[u].w();
+                    shi += xb[u].x() + xb[u].y() + xb[u].z() + xb[u].w();
+                }
+#pragma unroll
+                for (int rr = 0; rr < R; ++rr) {
+                    if (rr >= nr) break;
+                    const BlockQ4K& blk = wb[(rs + rr) * nb + b];
+                    const float d = (float) blk.d, dm = (float) blk.dmin;
+                    float s0, m0, s1, m1;
+                    scale_min(2 * k, blk.scales, s0, m0);
+                    scale_min(2 * k + 1, blk.scales, s1, m1);
+                    const uint32_t* qp = reinterpret_cast<const uint32_t*>(blk.qs + 32 * k);
+                    float lo = 0.f, hi = 0.f;
+#pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        const uint32_t qq = qp[u];
+                        lo += (float) (qq & 0xF) * xa[u].x() + (float) ((qq >> 8) & 0xF) * xa[u].y() + (float) ((qq >> 16) & 0xF) * xa[u].z() +
+                              (float) ((qq >> 24) & 0xF) * xa[u].w();
+                        hi += (float) ((qq >> 4) & 0xF) * xb[u].x() + (float) ((qq >> 12) & 0xF) * xb[u].y() + (float) ((qq >> 20) & 0xF) * xb[u].z() +
+                              (float) ((qq >> 28) & 0xF) * xb[u].w();
+                    }
+                    acc[rr][c] += d * s0 * lo - dm * m0 * slo + d * s1 * hi - dm * m1 * shi;
+                }
+            }
+        }
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+            if (rr >= nr) break;
+            for (int c = 0; c < t; ++c) {
+                const float s = sycl::reduce_over_group(sg, acc[rr][c], sycl::plus<float>());
+                if (lane == 0) y[c * ycs + rs + rr] = s;
+            }
+        }
+    });
+}
+
 }  // namespace
 
 extern "C" {
@@ -265,6 +334,44 @@ int ns_ds41_q4k_mv(ns_gpu* g, const void* w, int64_t rows, int64_t cols, const f
         for (int c = 0; c < t; ++c) {
             const float s = sycl::reduce_over_group(sg, acc[c], sycl::plus<float>());
             if (lane == 0) y[c * ycs + r] = s;
+        }
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_ds41_q4k_mv2(ns_gpu* g, const void* w1, int64_t rows1, const void* w2, int64_t rows2, int64_t cols, const float* x, float* y1, float* y2) {
+    NS_TRY
+    if (cols % 256 != 0 || rows1 % 4 != 0) return ns_fail("ns_ds41_q4k_mv2: cols a multiple of 256, the first matrix's rows of 4");
+    q4k_rows2<4>(g->q, static_cast<const BlockQ4K*>(w1), rows1, static_cast<const BlockQ4K*>(w2), rows2, cols / 256, x, y1, y2);
+    return 0;
+    NS_CATCH
+}
+
+// Float32 products of one row x [K] against two matrices [N1][K] and [N2][K] in one launch (the router's logits and
+// the next layer's guess: two oneMKL GEMMs a layer before): a sub-group a row, float4 reads
+int ns_ds41_gemv2(ns_gpu* g, const float* x, const float* w1, int64_t n1, const float* w2, int64_t n2, int64_t K, float* y1, float* y2) {
+    NS_TRY
+    constexpr int SG = 16, SPG = 8;
+    if (K % 4 != 0) return ns_fail("ns_ds41_gemv2: K a multiple of 4");
+    const int64_t n = n1 + n2;
+    g->q.parallel_for(sycl::nd_range<1>((n + SPG - 1) / SPG * SPG * SG, SPG * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const auto sg = it.get_sub_group();
+        const int64_t r = it.get_group(0) * SPG + sg.get_group_id()[0];
+        const int lane = sg.get_local_id()[0];
+        if (r >= n) return;
+        const float* wr = r < n1 ? w1 + r * K : w2 + (r - n1) * K;
+        const sycl::float4* w4 = reinterpret_cast<const sycl::float4*>(wr);
+        const sycl::float4* x4 = reinterpret_cast<const sycl::float4*>(x);
+        float acc = 0.f;
+        for (int64_t i = lane; i < K / 4; i += SG) {
+            const sycl::float4 a = w4[i], b = x4[i];
+            acc += a.x() * b.x() + a.y() * b.y() + a.z() * b.z() + a.w() * b.w();
+        }
+        acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+        if (lane == 0) {
+            if (r < n1) y1[r] = acc;
+            else y2[r - n1] = acc;
         }
     });
     return 0;
