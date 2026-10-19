@@ -47,6 +47,7 @@ const CONTEXT: usize = 3;
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "int8", env: "NS_VCP_INT8", value: "0|1", help: "the language models' matrices in int8 (less VRAM, faster patches)", at: At::Load },
+    EngineOption { name: "continue", env: "NS_VCP_CONTINUE", value: "0|1", help: "a saved voice's recording continued (its transcript the prompt's) rather than its timbre alone (the default: continuing led its last words into each sentence)", at: At::Load },
     EngineOption { name: "max-ratio", env: "NS_VCP_MAX_RATIO", value: "6", help: "the most patches a text token (a runaway's bound, as the reference's)",
                    at: At::Request },
 ];
@@ -76,6 +77,8 @@ pub struct VoxCpm2 {
     pub vae: Vae,
     pub weights: Shards,
     int8: bool,
+    /// a saved voice's transcript used: the recording continued (NS_VCP_CONTINUE=1); else its timbre alone
+    continue_prompt: bool,
     loaded: Instant,
     load_s: f64,
 }
@@ -198,7 +201,8 @@ impl VoxCpm2 {
         gpu.sync()?;
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("{ARCH} on {} in {load_s:.0} s", gpu.name));
-        Ok(VoxCpm2 { ops, nsd, tok, split, model, vae, weights, int8, loaded: Instant::now(), load_s })
+        let continue_prompt = o.setting("NS_VCP_CONTINUE").is_some_and(|v| v == "1");
+        Ok(VoxCpm2 { ops, nsd, tok, split, model, vae, weights, int8, continue_prompt, loaded: Instant::now(), load_s })
     }
 
     /// The text's token ids (no BOS), multi-character Chinese tokens split into their characters
@@ -332,8 +336,13 @@ impl VoxCpm2 {
             None => (None, None),
             Some(r) => {
                 let w = resample(&r.samples, r.rate, 16000);
-                match r.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-                    // the ultimate clone: the recording both as the reference and as the prompt it continues
+                // the recording's timbre alone (the reference): continuing it (the "ultimate clone", its transcript the
+                // prompt's) made its last words lead into each sentence - Whisper heard "it's unappreciated" (a voice's
+                // "...appreciate it") or a stray word ahead of 4 of 5 lines, where the timbre alone said all the plain
+                // ones word for word (nextcuda, 2026-10-18). NS_VCP_CONTINUE=1, or a request's options.continue = 1:
+                // continued
+                let cont = self.continue_prompt || req.extra.get("continue").is_some_and(|v| v == "1");
+                match r.text.as_deref().map(str::trim).filter(|t| !t.is_empty() && cont) {
                     Some(t) => (Some(w.clone()), Some((w, t.to_string()))),
                     None => (Some(w), None),
                 }

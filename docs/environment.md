@@ -46,6 +46,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_AUDIO_PORT2` | 8097 | the second audio server's port (`audio start --slot 1`): a model enabled on two cards runs on both while its work keeps the first busy; 0: one server | serve |
 | `NS_MODEL3D_PORT` | 8088 | the 3D server's port, as the front door reaches it | serve |
 | `NS_MODEL3D_PORT2` | 8098 | the second 3D server's port (`model3d start --slot 1`), as `NS_AUDIO_PORT2` | serve |
+| `NS_SPEECH_NORMALIZE` | 1 | 0: speech's text as sent (by default math and code symbols are said as words - √ "square root of", = "equals", d_k "d sub k" - and markdown's marks dropped; a request's `normalize: false` too) | serve (audio) |
 | `NS_CHAT_UI_PORT` | 8080 | Open WebUI's port (the page's link) | serve |
 | `NS_CORS` | loopback origins only | more web origins that may call the servers from a browser, comma-separated (`*`: any) | cli (llm, image, audio start) |
 | `NS_IDLE_MINUTES` | 10 | an enabled model unloads after this long without a request (0: never); the switcher uses the same unless --idle-minutes | serve, switch |
@@ -276,6 +277,7 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_VV_GEMV_KS` | by shape | Debug: the VibeVoice products' split of K between a work-group's sub-groups (1, 2 or 4), for every shape (a tuning switch) | kernels:audio (vibevoice) |
 | `NS_VV_PROFILE` | 0 | Debug: 1 times a run's stages (logits, head, decoder, semantic encoder, connectors, language model; the GPU waited for at each boundary), the table on stderr at its end; 2 the tokenizers' operations one by one | audio vibevoice |
 | `NS_VCP_*` | - | every NS_VCP_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
+| `NS_VCP_CONTINUE` | 0 | 1: VoxCPM2 continues a saved voice's recording (its transcript the prompt's) instead of taking its timbre alone - continuing led the recording's last words into each sentence | audio voxcpm2 |
 | `NS_VCP_INT8` | 0 | 1: the language models' matrices in int8 (less VRAM, faster patches) (--opt-int8) | audio voxcpm2 |
 | `NS_VCP_MAX_RATIO` | 6 | the per-request option max-ratio's name: the most patches a text token (a runaway's bound); a request's options only, the variable itself is not read (--opt-max-ratio) | audio voxcpm2 |
 

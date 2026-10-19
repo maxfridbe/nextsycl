@@ -407,6 +407,8 @@ impl AudioServer {
             let p = text(&["instructions", "prompt", "description"]).ok_or_else(|| bad("instructions (the music's description): required".into()))?;
             (p, text(&["input", "lyrics"]), None)
         };
+        // speech: the text as it is said (symbols as words, no markdown) unless normalize: false / NS_SPEECH_NORMALIZE=0
+        let prompt = if speech && b["normalize"] != false && !std::env::var("NS_SPEECH_NORMALIZE").is_ok_and(|v| v == "0") { speakable(&prompt) } else { prompt };
         let frames_per_s = if speech { 12.5 } else { 25.0 };
         let seconds = num(&["seconds", "duration", "audio_duration"]).or_else(|| num(&["max_new_tokens"]).map(|f| f / frames_per_s)).map(|v| v as f32);
         let mut saved: Option<String> = None;
@@ -620,8 +622,91 @@ pub fn own_vram_mb() -> u64 {
     kb / 1024
 }
 
+/// A text as it is to be said: math and code symbols as words (a model reads "Q·K^T / √d_k" as noise - a voice
+/// looped on one such line), markdown's marks out, dashes and brackets as pauses
+pub fn speakable(text: &str) -> String {
+    let c: Vec<char> = text.chars().collect();
+    let word = |ch: char| ch.is_alphanumeric();
+    let mut out = String::with_capacity(text.len() + 16);
+    for (i, &ch) in c.iter().enumerate() {
+        let prev = if i > 0 { c[i - 1] } else { ' ' };
+        let next = c.get(i + 1).copied().unwrap_or(' ');
+        let say: Option<&str> = match ch {
+            '*' | '#' | '`' => Some(" "),
+            '√' => Some(" square root of "),
+            '·' | '⋅' | '∙' => Some(" dot "),
+            '×' => Some(" times "),
+            '÷' => Some(" divided by "),
+            '=' => Some(" equals "),
+            '≈' => Some(" approximately "),
+            '≠' => Some(" not equal to "),
+            '≤' => Some(" less than or equal to "),
+            '≥' => Some(" greater than or equal to "),
+            '<' if prev == ' ' || next == ' ' => Some(" less than "),
+            '>' if prev == ' ' || next == ' ' => Some(" greater than "),
+            '+' => Some(" plus "),
+            '±' => Some(" plus or minus "),
+            '∑' => Some(" the sum of "),
+            '∏' => Some(" the product of "),
+            '∞' => Some(" infinity "),
+            '→' | '⟶' => Some(" to "),
+            '⇒' => Some(" implies "),
+            '∈' => Some(" in "),
+            '∀' => Some(" for all "),
+            '∂' => Some(" partial "),
+            '%' => Some(" percent "),
+            '&' => Some(" and "),
+            '^' => Some(" to the "),
+            '°' => Some(" degrees "),
+            'π' => Some(" pi "),
+            'θ' => Some(" theta "),
+            'α' => Some(" alpha "),
+            'β' => Some(" beta "),
+            'γ' => Some(" gamma "),
+            'Δ' | 'δ' => Some(" delta "),
+            'ε' => Some(" epsilon "),
+            'λ' => Some(" lambda "),
+            'μ' => Some(" mu "),
+            'σ' => Some(" sigma "),
+            'ω' => Some(" omega "),
+            // d_k: "d sub k"; snake_case and the rest: a space
+            '_' if word(prev) && word(next) => Some(" sub "),
+            '_' | '~' | '|' => Some(" "),
+            // a / b spaced: divided; a/b between short terms: over; TCP/IP: slash
+            '/' if prev == ' ' && next == ' ' => Some(" divided by "),
+            '/' => Some(" slash "),
+            '(' | ')' | '[' | ']' | '{' | '}' => Some(", "),
+            '—' | '–' => Some(", "),
+            '-' if prev == ' ' && next == ' ' => Some(", "),
+            _ => None,
+        };
+        match say {
+            Some(s) => out.push_str(s),
+            None => out.push(ch),
+        }
+    }
+    // spaces and pauses tidied: one space, no space before a comma or a stop, no pause twice
+    let mut t = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (a, b) in [(" ,", ","), (" .", "."), (",,", ","), (", ,", ","), (". ,", "."), (",.", "."), (" :", ":"), (" ;", ";"), (" ?", "?"), (" !", "!")] {
+        while t.contains(a) {
+            t = t.replace(a, b);
+        }
+    }
+    t.trim_matches(|ch: char| ch == ',' || ch == ' ').to_string()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn speakable_says_symbols() {
+        let s = super::speakable;
+        assert_eq!(s("Computes attention: Q·K^T, scaled by √d_k."), "Computes attention: Q dot K to the T, scaled by square root of d sub k.");
+        assert_eq!(s("Attention(Q, K, V) = softmax(QK^T / √d_k) V"), "Attention, Q, K, V, equals softmax, QK to the T divided by square root of d sub k, V");
+        assert_eq!(s("**Bold** and `code` - done"), "Bold and code, done");
+        assert_eq!(s("TCP/IP, 3-4 heads, snake_case"), "TCP slash IP, 3-4 heads, snake sub case");
+        assert_eq!(s("Plain words stay plain."), "Plain words stay plain.");
+    }
+
     use super::{gpu_failed, own_vram_mb, range};
 
     #[test]
