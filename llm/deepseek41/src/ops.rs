@@ -504,6 +504,31 @@ impl Ops {
     }
     /// score [t][ld] to -inf outside the blocks cand [t][k] lists
     #[allow(clippy::too_many_arguments)]
+    /// The index sources after the candidate source: scores [t][k x 8] over each row's candidate blocks (cand [t][k])
+    #[allow(clippy::too_many_arguments)]
+    pub fn idx_score_cand(&self, q: &DevBuf, w: &DevBuf, keys: &DevBuf, cand: &DevBuf, k: usize, score: &DevBuf, t: usize, h: usize, d: usize, n: usize, pos0: usize,
+                          ratio: usize) -> Result<()> {
+        need!(q, t * h * d, "idx_score_cand q");
+        need!(w, t * h, "idx_score_cand w");
+        keys.bounds(0, n * d * 2)?;
+        need!(cand, t * k, "idx_score_cand cand");
+        need!(score, t * k * 8, "idx_score_cand score");
+        // SAFETY: sizes checked; the candidates are block ids the kernel bounds by n.
+        let rc = unsafe {
+            (self.k.ds41_idx_score_cand)(self.raw(), q.fp(), w.fp(), keys.ptr().cast(), cand.ptr().cast(), k as i64, score.fp(), t as i64, h as i64, d as i64, n as i64,
+                                         pos0 as i64, ratio as i64)
+        };
+        self.ok(rc, "ds41_idx_score_cand")
+    }
+    /// sel [t][kp] = the positions of the picks selc [t][kp] (indices into the candidate blocks cand [t][k] of bs keys)
+    pub fn cand_pos(&self, selc: &DevBuf, cand: &DevBuf, sel: &DevBuf, t: usize, k: usize, kp: usize, bs: usize) -> Result<()> {
+        need!(selc, t * kp, "cand_pos selc");
+        need!(cand, t * k, "cand_pos cand");
+        need!(sel, t * kp, "cand_pos sel");
+        // SAFETY: sizes checked; selc's indices are below k x bs (a top-k over that many).
+        let rc = unsafe { (self.k.ds41_cand_pos)(self.raw(), selc.ptr().cast(), cand.ptr().cast(), sel.ptr().cast(), t as i64, k as i64, kp as i64, bs as i64) };
+        self.ok(rc, "ds41_cand_pos")
+    }
     pub fn cand_mask(&self, score: &DevBuf, cand: &DevBuf, mark: &DevBuf, t: usize, n: usize, ld: usize, k: usize, bs: usize) -> Result<()> {
         need!(score, t * ld, "cand_mask score");
         cand.bounds(0, t * k * 4)?;
@@ -676,10 +701,10 @@ pub const VQ_LUT: i32 = 5;
 /// A column's list in the lookup-table variant's table: its count, then 16 (entry, column slot) pairs
 pub const LUT_STRIDE: usize = 33;
 
-/// 64-column units a work-group of the lookup-table variant takes (NS_DS41_LUT_RUNS, default 16 runs a row)
+/// 64-column units a work-group of the lookup-table variant takes (NS_DS41_LUT_RUNS, default 32 runs a row)
 fn lut_units(cols: usize) -> usize {
     static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let runs = *RUNS.get_or_init(|| std::env::var("NS_DS41_LUT_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(16).max(1));
+    let runs = *RUNS.get_or_init(|| std::env::var("NS_DS41_LUT_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(32).max(1));
     (cols / 64).div_ceil(runs).max(1)
 }
 

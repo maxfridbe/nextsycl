@@ -61,6 +61,12 @@ int ns_ds41_idx_score(ns_gpu* g, const float* q, const float* w, const uint16_t*
 /* The candidate source's blocks: bmax [T][nb] = the best score of each `bs` positions (score [T][ld], n of them), the
  * block of a row's newest position +inf */
 int ns_ds41_block_max(ns_gpu* g, const float* score, float* bmax, int64_t T, int64_t n, int64_t ld, int64_t bs, int64_t pos0, int64_t ratio);
+/* The index sources after the candidate source: scores only over each row's candidate blocks (cand [T][K] ids of 8
+ * keys, ascending) into score [T][K x 8] (-inf where the row sees no key), then the picks' compact indices (selc
+ * [T][kp]) mapped back to positions (sel [T][kp]) */
+int ns_ds41_idx_score_cand(ns_gpu* g, const float* q, const float* w, const uint16_t* k, const int32_t* cand, int64_t K, float* score, int64_t T, int64_t H,
+                           int64_t D, int64_t n, int64_t pos0, int64_t ratio);
+int ns_ds41_cand_pos(ns_gpu* g, const int32_t* selc, const int32_t* cand, int32_t* sel, int64_t T, int64_t K, int64_t kp, int64_t bs);
 /* score [T][ld] to -inf outside the blocks cand [T][K] lists (mark: scratch of T x nb bytes) */
 int ns_ds41_cand_mask(ns_gpu* g, float* score, const int32_t* cand, uint8_t* mark, int64_t T, int64_t n, int64_t ld, int64_t K, int64_t bs);
 
