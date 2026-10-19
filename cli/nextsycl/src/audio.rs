@@ -21,8 +21,9 @@ nextsycl audio voice add NAME --sample FILE [--text \"what it says\"] [--descrip
                    a voice cloned from a recording (WAV, MP3, FLAC, Ogg, M4A; 3-15 s of one speaker)
 nextsycl audio voice design NAME --instructions \"the voice\" [--text \"what the sample says\"] [--language L] [--seed N] [--replace]
                    a voice made up from a description (the front door's voice-design model reads a sample)
-nextsycl audio voice enroll NAME [--gpu N] [--steps 2000]
-                   a saved voice fitted for Voxtral TTS (experimental: no encoder in its open weights; PyTorch XPU)
+nextsycl audio voice enroll NAME [--gpu N] [--steps 2000] [--replace] [--direct]
+                   a saved voice fitted for Voxtral TTS (experimental: no encoder in its open weights; PyTorch XPU) - a front-door
+                   job that waits for a card like a load (audio.voices.enroll); --direct: here, now (the door runs that)
 nextsycl audio voice rm NAME            (addvoice / clonevoice NAME ... = voice add; designvoice = voice design)
 nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | prompt,lm,head,codec,run | prompt,frames,flow,codec] [--gpu N]
 nextsycl audio engines | selftest [--gpu N]";
@@ -444,14 +445,8 @@ fn voice(cfg: &Config, args: &[String]) -> Result<(), String> {
             if let Some(n) = num::<u64>(args, "--seed")? {
                 b["seed"] = serde_json::json!(n);
             }
-            let reg = models::registry(cfg);
-            let token = cfg.get("NS_API_TOKEN").or_else(|| {
-                std::fs::read_to_string(reg.with_file_name("serve.json")).ok()
-                    .and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["token"].as_str().map(str::to_string))
-            }).ok_or("the front door's token (NS_API_TOKEN, or serve.json beside the registry): is nextsycl serve running?")?;
-            let port = cfg.get("NS_SERVE_PORT").unwrap_or_else(|| "8000".into());
-            let t = nextsycl_serve::http::Target::Tcp(format!("127.0.0.1:{port}"));
-            eprintln!("designing {name} through the front door (:{port}) ...");
+            let (t, token) = door(cfg)?;
+            eprintln!("designing {name} through the front door ...");
             let r = nextsycl_serve::http::rpc(&t, &token, "audio.voices.design", &b, 900)?;
             println!("saved voice {name}: {:.1} s, seed {}  - \"{}\"", r["voice"]["seconds"].as_f64().unwrap_or(0.0), r["seed"],
                      r["voice"]["text"].as_str().unwrap_or(""));
@@ -467,6 +462,61 @@ fn voice(cfg: &Config, args: &[String]) -> Result<(), String> {
     }
 }
 
+/// The front door (NS_SERVE_PORT on this machine) and its API token (NS_API_TOKEN, or serve.json beside the registry)
+fn door(cfg: &Config) -> Result<(nextsycl_serve::http::Target, String), String> {
+    let reg = models::registry(cfg);
+    let token = cfg.get("NS_API_TOKEN").or_else(|| {
+        std::fs::read_to_string(reg.with_file_name("serve.json")).ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["token"].as_str().map(str::to_string))
+    }).ok_or("the front door's token (NS_API_TOKEN, or serve.json beside the registry): is nextsycl serve running?")?;
+    let port = cfg.get("NS_SERVE_PORT").unwrap_or_else(|| "8000".into());
+    Ok((nextsycl_serve::http::Target::Tcp(format!("127.0.0.1:{port}")), token))
+}
+
+/// `nextsycl audio voice enroll NAME` through the front door: its job (audio.voices.enroll), which waits for a card
+/// like a load does, followed until it ends
+fn enroll_via_door(cfg: &Config, name: &str, args: &[String]) -> Result<(), String> {
+    let (t, token) = door(cfg)?;
+    let label = format!("enroll-{name}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+    let mut b = serde_json::json!({"name": name, "wait": false, "label": label});
+    if let Some(g) = num::<u64>(args, "--gpu")? {
+        b["gpu"] = serde_json::json!(g);
+    }
+    if let Some(n) = num::<u64>(args, "--steps")? {
+        b["steps"] = serde_json::json!(n);
+    }
+    if let Some(m) = opt(args, "--model") {
+        b["model"] = serde_json::json!(m);
+    }
+    if args.iter().any(|a| a == "--replace") {
+        b["replace"] = serde_json::json!(true);
+    }
+    nextsycl_serve::http::rpc(&t, &token, "audio.voices.enroll", &b, 60)?;
+    eprintln!("enrolling {name} through the front door (job {label}) ...");
+    let mut last = String::new();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let j = nextsycl_serve::http::rpc(&t, &token, "audio.status", &serde_json::json!({"label": label}), 30)?;
+        let now = match j["state"].as_str().unwrap_or("") {
+            "done" => {
+                let r = &j["result"];
+                println!("enrolled {name} for {} on GPU {} in {} s (experimental: Voxtral speaks it as \"voice\": \"{name}\")",
+                         r["model"].as_str().unwrap_or("?"), r["gpu"], r["seconds"]);
+                return Ok(());
+            }
+            "failed" | "cancelled" => return Err(j["error"]["message"].as_str().unwrap_or("the enrolment failed").to_string()),
+            _ => j["waiting_for"].as_str().map(str::to_string).or_else(|| {
+                let p = &j["progress"];
+                p["at"].as_u64().map(|a| format!("step {a} of {}", p["of"]))
+            }).unwrap_or_else(|| j["stage"].as_str().unwrap_or("").to_string()),
+        };
+        if now != last {
+            eprintln!("  {now}");
+            last = now;
+        }
+    }
+}
+
 /// The card memory an enrolment takes (GiB; the decoder's fit of a 15 s clip on a B65: ~6), and the margin kept free
 const ENROLL_GIB: f64 = 8.0;
 
@@ -478,6 +528,11 @@ fn enroll(cfg: &Config, lib: &nextsycl_serve::voices::Library, name: &str, args:
     if arch != nextsycl_audio_voxtraltts::ARCH {
         return Err(format!("--arch {arch}: only {} enrolls voices", nextsycl_audio_voxtraltts::ARCH));
     }
+    // through the front door (a job that waits for a card as a load does) unless --direct (the door's own run)
+    if !args.iter().any(|a| a == "--direct") {
+        return enroll_via_door(cfg, name, args);
+    }
+    // (--direct is itself GPU work: the door runs it once it has the card; by hand, hold the GPU run lock around it)
     let sample = lib.sample_path(name).ok_or_else(|| format!("no saved voice {name:?} (nextsycl audio voice list)"))?;
     let dir = |k: &str, what: &str| -> Result<PathBuf, String> {
         cfg.get(k).map(PathBuf::from).filter(|p| p.is_dir()).ok_or_else(|| format!("{k}: {what} (nextsycl.conf)"))

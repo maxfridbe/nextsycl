@@ -27,7 +27,7 @@ use super::{now, Home};
 use crate::http::{call_for, Target};
 
 /// The methods that run as jobs
-pub const METHODS: [&str; 6] = ["image.generate", "image.edit", "audio.generate", "audio.speak", "model3d.generate", "model3d.rig"];
+pub const METHODS: [&str; 7] = ["image.generate", "image.edit", "audio.generate", "audio.speak", "audio.voices.enroll", "model3d.generate", "model3d.rig"];
 
 /// The kinds whose requests run as jobs here
 pub const KINDS: [&str; 3] = ["image", "audio", "model3d"];
@@ -252,6 +252,10 @@ impl Home {
                 let mut j = json!({"id": id, "kind": kind, "method": name, "label": label, "reentrant_id": rid, "state": "queued",
                                    "created": now(), "started": null, "ended": null, "priority": priority, "held": b["held"] == true,
                                    "project": text("project"), "batch": text("batch"), "body": body});
+                // an enrolment says whose voice (its body is dropped when it ends)
+                if name == "audio.voices.enroll" {
+                    j["voice"] = b["name"].clone();
+                }
                 {
                     let mut l = self.jobs.list.lock().unwrap();
                     let waiting = Jobs::waiting(&l, kind);
@@ -361,7 +365,7 @@ impl Home {
     /// while it runs, its place while it waits
     fn job_view(&self, j: &Value, running: Option<&[(String, Value)]>) -> Value {
         let mut v = json!({});
-        for k in ["id", "kind", "method", "label", "reentrant_id", "created", "started", "ended", "restarted", "priority", "project", "batch"] {
+        for k in ["id", "kind", "method", "label", "reentrant_id", "created", "started", "ended", "restarted", "priority", "project", "batch", "voice"] {
             if !j[k].is_null() {
                 v[k] = j[k].clone();
             }
@@ -422,8 +426,16 @@ impl Home {
                                 None => ("starting".into(), "its server to take it".into()),
                             }
                         });
+                        // a job run here, not by a server (an enrolment): running, with its progress
+                        if st == "running" {
+                            state = "running".into();
+                            if let Some(p) = self.progress.lock().unwrap().get(&s(j, "id")) {
+                                v["progress"] = p.clone();
+                            }
+                        } else {
+                            waiting_for = json!(why);
+                        }
                         stage = st;
-                        waiting_for = json!(why);
                     }
                 }
             }

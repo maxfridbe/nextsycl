@@ -1,7 +1,7 @@
 /** What the buttons do: build the request from the form, send it, keep the result. */
 import { api } from "./api.js";
 import { render, saveForm, state } from "./state.js";
-import type { Song } from "./types.js";
+import type { EnrollJob, Song } from "./types.js";
 
 export function randomSeed(): void {
   state.form.seed = Math.floor(Math.random() * 1_000_000);
@@ -40,6 +40,37 @@ export async function refreshVoices(): Promise<void> {
   } catch {
     /* a server without an output directory */
   }
+}
+
+/** The front door's enrolments, again every few seconds while one has not ended (the voices too when one ends). */
+export async function refreshEnroll(): Promise<void> {
+  const before = (state.enroll?.jobs ?? []).filter((j) => j.state === "queued" || j.state === "running").map((j) => j.id);
+  state.enroll = await api.enrollState();
+  const open = (state.enroll?.jobs ?? []).filter((j) => j.state === "queued" || j.state === "running");
+  if (before.some((id) => !open.some((j) => j.id === id))) await refreshVoices();
+  render();
+  if (open.length) setTimeout(() => void refreshEnroll(), 3000);
+}
+
+/** The enrolment job of a voice not ended, or its last */
+export function enrollJob(name: string): EnrollJob | undefined {
+  return state.enroll?.jobs.find((j) => j.voice === name);
+}
+
+/** Enroll a saved voice for the model that speaks enrolled voices (Voxtral TTS): a front-door job that waits for a
+ *  card with room like a load (a minute or two once it runs) */
+export async function enrollVoice(name: string): Promise<void> {
+  const m = state.enroll?.models[0];
+  if (!m) return;
+  if (!window.confirm(`Enroll ${name} for ${m.title ?? m.id}? (experimental: the voice is fitted on a GPU - a minute or two once a card is free)`)) return;
+  try {
+    await api.enroll(name, m.id);
+    state.error = null;
+    state.status = `enrolling ${name} for ${m.title ?? m.id}`;
+  } catch (e) {
+    state.error = e instanceof Error ? e.message : String(e);
+  }
+  await refreshEnroll();
 }
 
 /** Ask for a name and save a voice: the recording picked (with its transcript), or a file made here. */

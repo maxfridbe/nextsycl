@@ -30,16 +30,16 @@ use crate::http::{call_for, Target};
 use super::registry;
 
 /// Memory to keep free on a card beyond a model's (the xe driver has no out-of-memory: past the card it spills)
-const MARGIN_MB: u64 = 1536;
+pub(super) const MARGIN_MB: u64 = 1536;
 
 /// How long a request waits for a card to have room before 503 no_room (a job waits longer: JOB_ROOM_WAIT_S, its
 /// status saying what for)
 const ROOM_WAIT_S: u64 = 90;
-const JOB_ROOM_WAIT_S: u64 = 1800;
+pub(super) const JOB_ROOM_WAIT_S: u64 = 1800;
 
 
 /// Idle work that holds memory on a card and can go for a model that needs the room
-struct Holder {
+pub(super) struct Holder {
     what: Free,
     /// its memory there
     mb: u64,
@@ -48,7 +48,7 @@ struct Holder {
     order: u8,
 }
 
-enum Free {
+pub(super) enum Free {
     /// an image or audio server: (kind, slot)
     Server(String, usize),
     /// the video daemon's worker on this card
@@ -927,7 +927,7 @@ impl Home {
     }
 
     /// The message for no room: each card, what it has free and who holds the rest (busy or idle)
-    fn no_room(&self, cards: &Value, gpus: &[usize], id: &str, want: u64) -> String {
+    pub(super) fn no_room(&self, cards: &Value, gpus: &[usize], id: &str, want: u64) -> String {
         let free = |g: usize| self.free_mb(cards, g);
         let busy: Vec<String> = gpus.iter().map(|g| {
             let mut holders: Vec<String> = cards.get(*g).and_then(|c| c["procs"].as_array()).into_iter().flatten()
@@ -948,7 +948,7 @@ impl Home {
     /// studio has nothing to make, a chat model answering nothing and not kept (chat_idle). `light`: picture and sound servers
     /// only (for a second copy, which is no reason to stop a video or chat model). The kind asking is never asked to
     /// free its own kind's chat or video.
-    fn room_plan(&self, cards: &Value, g: usize, want: u64, asking: &str, light: bool) -> Option<Vec<Holder>> {
+    pub(super) fn room_plan(&self, cards: &Value, g: usize, want: u64, asking: &str, light: bool) -> Option<Vec<Holder>> {
         let c = cards.get(g)?;
         let free = self.free_mb(cards, g);
         if free >= want {
@@ -998,7 +998,7 @@ impl Home {
 
     /// Stop the idle holders of a plan (for `id`; the kind `kind` asking holds its own lock; another kind's is tried, and
     /// a server whose lock is taken is left: the next try plans again)
-    fn free(&self, plan: &[Holder], kind: &str, id: &str) -> Result<(), (u16, String)> {
+    pub(super) fn free(&self, plan: &[Holder], kind: &str, id: &str) -> Result<(), (u16, String)> {
         for h in plan {
             match &h.what {
                 Free::Server(k, slot) => {
@@ -1035,7 +1035,7 @@ impl Home {
 
     /// Wait (30 s at most) until card `g` has `want` MiB free: a stopped process lets go of its memory in a moment.
     /// False: it did not come free (the load must not start - past the card the xe driver spills into host memory)
-    fn wait_room(&self, g: usize, want: u64) -> bool {
+    pub(super) fn wait_room(&self, g: usize, want: u64) -> bool {
         let t0 = Instant::now();
         loop {
             let cards = self.cards.lock().unwrap().clone();

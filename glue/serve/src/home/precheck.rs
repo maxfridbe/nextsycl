@@ -78,6 +78,7 @@ impl Home {
         match name {
             "image.generate" | "image.edit" => self.precheck_image(name == "image.edit", b, all),
             "audio.speak" => self.precheck_speak(b, all),
+            "audio.voices.enroll" => self.precheck_enroll(b, all),
             "audio.generate" => {
                 number(b, "seconds", 1.0, 600.0)?;
                 whole(b, "steps", 1, 200)?;

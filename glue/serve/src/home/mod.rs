@@ -24,6 +24,7 @@
 mod api;
 mod config;
 mod disks;
+mod enroll;
 mod jobs;
 mod life;
 mod maint;
@@ -111,6 +112,8 @@ pub struct Home {
     pending: Mutex<Vec<Pending>>,
     /// the video queue paused while a GPU run held the cards (crate::gpulock): what to put back when it ends
     lock_paused: Mutex<Option<Value>>,
+    /// the progress of running jobs no server runs (an enrolment: enroll.rs), by job id
+    progress: Mutex<BTreeMap<String, Value>>,
     /// maintenance mode's notice (crate::maintenance: beside the registry, every service reads it) and the key that
     /// lets a request through it (kept in the state file; empty: none)
     maint_file: PathBuf,
@@ -227,7 +230,7 @@ impl Home {
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()), chat_keep: Mutex::new(BTreeMap::new()),
-            pending: Mutex::new(Vec::new()), lock_paused: Mutex::new(None),
+            pending: Mutex::new(Vec::new()), lock_paused: Mutex::new(None), progress: Mutex::new(BTreeMap::new()),
             maint_file, maint_bypass, disks: disks::Disks::new(&st),
         });
         let me = h.clone();
@@ -395,7 +398,7 @@ impl Home {
     /// `/open/<id>` alone is sent to `/open/<id>/`, so the page's relative links resolve under it. Those servers check
     /// no token and listen on --serve-host (127.0.0.1): this is how another machine reaches them. A disabled model has
     /// none to open. The video studio and the chat page are always up and on the network: the browser is sent there.
-    fn open(&self, s: &mut Conn, req: &http::Request, rest: &str) {
+    fn open(self: &Arc<Self>, s: &mut Conn, req: &http::Request, rest: &str) {
         let (id, sub) = rest.split_once('/').map_or((rest, None), |(i, r)| (i, Some(r)));
         let m = match registry::find(&self.o.cfg, id) {
             Ok(Some(m)) => m,
@@ -411,6 +414,10 @@ impl Home {
                     let to = format!("/open/{id}/{query}");
                     return http::respond_bytes(s, 302, "text/plain; charset=utf-8", b"", &format!("Location: {to}\r\nCache-Control: no-cache\r\n"));
                 };
+                // a saved voice enrolled for Voxtral: this door's job (enroll.rs), not the page's server
+                if sub == "api/voices/enroll" {
+                    return self.open_enroll(s, req);
+                }
                 let lease = match self.ensure(id) {
                     Ok(l) => l,
                     Err((c, e)) => return http::respond(s, c, &err(e)),
@@ -426,6 +433,30 @@ impl Home {
         let host = req.host.as_deref().unwrap_or("localhost").rsplit_once(':').map_or_else(|| req.host.clone().unwrap_or_default(), |(h, _)| h.to_string());
         let host = if host.is_empty() { "localhost".to_string() } else { host };
         http::respond_bytes(s, 302, "text/plain; charset=utf-8", b"", &format!("Location: http://{host}:{port}/\r\nCache-Control: no-cache\r\n"));
+    }
+
+    /// An audio page's enrolments (`api/voices/enroll` under /open/<id>/): GET - the models that speak enrolled voices
+    /// and the enrolment jobs; POST {name, model, gpu} - one queued (audio.voices.enroll, as the API's)
+    fn open_enroll(self: &Arc<Self>, s: &mut Conn, req: &http::Request) {
+        if req.method != "POST" {
+            return http::respond(s, 200, &self.enroll_state());
+        }
+        if let Some(n) = self.maintenance() {
+            return http::respond(s, 503, &err(crate::maintenance::message(&n)));
+        }
+        let b: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+        let name = b["name"].as_str().unwrap_or("").to_string();
+        let mut body = json!({"name": name, "wait": false, "label": format!("enroll-{name}-{}", now() as u64)});
+        for k in ["model", "gpu", "steps", "replace"] {
+            if !b[k].is_null() {
+                body[k] = b[k].clone();
+            }
+        }
+        let all = self.models();
+        match self.precheck("audio.voices.enroll", &body, &all).and_then(|_| self.submit("audio.voices.enroll", &body)) {
+            Ok(v) => http::respond(s, 200, &v),
+            Err((c, m)) => http::respond(s, c, &err(m)),
+        }
     }
 
     fn page(&self, s: &mut Conn) {

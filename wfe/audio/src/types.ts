@@ -41,6 +41,8 @@ export interface Speech {
   direction?: boolean;
   /** the vocal events it reads inline in the text ("(laugh)", "[笑]" ...) */
   events?: string[];
+  /** speaks a saved voice enrolled for it (no encoder: the voice fitted beforehand - Voxtral TTS) */
+  enrolled?: boolean;
   /** what a request must carry besides the text */
   requires?: "voice" | "instructions" | "reference" | null;
 }
@@ -125,4 +127,26 @@ export interface SavedVoice {
   kind: "clone" | "design";
   seconds: number;
   created: number;
+  /** the architectures it is enrolled for (a model without an encoder speaks it: voxtral-tts) */
+  enrolled?: string[];
+}
+
+/** An enrolment job (the front door's audio.voices.enroll), as audio.status answers it */
+export interface EnrollJob {
+  id: string;
+  label: string;
+  /** the saved voice it enrolls */
+  voice?: string;
+  state: "queued" | "running" | "done" | "failed" | "cancelled";
+  stage?: string;
+  waiting_for?: string | null;
+  progress?: { at?: number; of?: number; seconds?: number } | null;
+  result?: { voice?: string; model?: string; gpu?: number; seconds?: number } | null;
+  error?: { message: string } | null;
+}
+
+/** The front door's enrolments (none: the page is not opened through it) */
+export interface EnrollState {
+  models: { id: string; arch: string; title?: string; enabled: boolean }[];
+  jobs: EnrollJob[];
 }

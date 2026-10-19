@@ -130,6 +130,9 @@ body{max-width:1100px}
 .chip{background:#181b22;border:1px solid #2a2f3a;color:#cbd5e1;border-radius:999px;padding:3px 10px;font-size:12px;cursor:pointer}
 .chip:hover{border-color:#3b82f6}
 .chip.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.chip.off{opacity:.55;cursor:default}
+.chip.off:hover{border-color:#2a2f3a}
+.vchip .hint{margin:0 6px}
 #go{min-width:200px}
 #go .i,#stop .i{color:inherit}
 #stop{background:#7f1d1d}

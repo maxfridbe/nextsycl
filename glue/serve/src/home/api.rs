@@ -201,6 +201,14 @@ pub const METHODS: &[Method] = &[
                        ("seed", "integer", "another seed, another speaker of that kind", false), ("model", "string", "a voice-design model", false),
                        ("replace", "boolean", "", false), ("owner", r#"{"type": "string", "maxLength": 60}"#, "who it belongs to (as voices.add)", false)],
              example: r#"{"name": "narrator", "instructions": "A deep, warm male narrator in his fifties, unhurried, a slight rasp.", "language": "english"}"# },
+    Method { kind: "audio", name: "voices.enroll", summary: "Enroll a saved voice for a speech model without an encoder (Voxtral TTS; experimental: the voice fitted through its decoder, a minute or two on a card) - a job (audio.status / audio.jobs / audio.cancel by its label; progress: the fit's step). It waits for a card with the fit's memory (~8 GiB) and 1.5 GiB more free, as a load does; once done the voice is offered to that model (audio.voices.list: models) and audio.speak speaks it there as voice",
+             fields: &[("name", "string", "the saved voice (audio.voices.list)", true), ("model", "string", "the model to enroll it for (default: the registered one that speaks enrolled voices)", false),
+                       ("gpu", "integer", "this card only (default: the model's cards, the first with room)", false),
+                       ("steps", r#"{"type": "integer", "minimum": 50, "maximum": 20000, "default": 2000}"#, "the fit's steps", false),
+                       ("replace", "boolean", "fit it again when it is enrolled already", false),
+                       ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for audio.status and audio.cancel (default: its id)", false),
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends; false: answer at once with the job", false), QUEUE, PRIORITY],
+             example: r#"{"name": "grandpa", "wait": false, "label": "enroll-grandpa"}"# },
     Method { kind: "audio", name: "voices.remove", summary: "Delete a saved voice (an owned one: owner must match)", fields: &[("name", "string", "", true), ("owner", "string", "the voice's owner, when it has one", false)], example: r#"{"name": "narrator"}"# },
     Method { kind: "audio", name: "info", summary: "The model's defaults, limits and options (a speech model: its voices and languages)", fields: &[MODEL_OPT], example: "{}" },
     Method { kind: "audio", name: "progress", summary: "The request running: its phase and how far", fields: &[], example: "{}" },
@@ -379,7 +387,7 @@ const FEATURES: &[&str] = &[
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
-    "system.drives", "system.move", "errors.cards_taken",
+    "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -1046,6 +1054,7 @@ impl Home {
                 Ok(json!({"voice": v, "sample": format!("http://nextsycl/v1/audio/voices/{}.wav", s(b, "name"))}))
             }
             ("audio", "voices.design") => self.design_voice(b, &all),
+            ("audio", "voices.enroll") => self.enroll_voice(b, &all),
             ("video", "upload") => {
                 let data = http::unbase64(&s(b, "data")).map_err(|e| (400, format!("data: {e}")))?;
                 let r = self.studio_upload(&s(b, "name"), &data)?;

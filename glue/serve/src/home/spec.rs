@@ -294,6 +294,12 @@ pub fn result(method: &str) -> Option<String> {
         "audio.voices.add" | "audio.voices.design" => format!(r#"{{"type": "object", "properties": {{"voice": {VOICE}, "sample": {{"type": "string", "description": "the sample's URL"}},
   "seed": {{"type": "integer", "description": "design: the seed it was read with"}}}}}}"#),
         "audio.voices.remove" => r#"{"type": "object", "properties": {"removed": {"type": "string"}}}"#.into(),
+        "audio.voices.enroll" => r#"{"type": "object", "description": "wait: false - the job (as audio.status answers it, voice: the saved voice); else when it ends:", "properties": {
+  "voice": {"type": "string"}, "model": {"type": "string", "description": "the model it is enrolled for"}, "arch": {"type": "string"},
+  "gpu": {"type": "integer", "description": "the card the fit ran on"}, "steps": {"type": "integer"}, "seconds": {"type": "number"},
+  "enrolled": {"type": "array", "items": {"type": "string"}, "description": "the architectures the voice is enrolled for now"},
+  "already": {"type": "boolean", "description": "it was enrolled before (replace: true fits it again)"},
+  "report": {"type": "object", "description": "the fit's report: its likeness and loss"}}}"#.into(),
         "video.generate" => {
             let common = r#""frames": {"type": "integer", "description": "the clip's frames as made (17k + 5)"}, "seconds": {"type": "number", "description": "frames / 24"},
     "ignored": {"type": "array", "items": {"type": "string"}, "description": "keys given that the box does nothing with (negative_prompt, cfg, unknown chain keys)"},
@@ -370,7 +376,7 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
                            (409, "conflict", "the model is loaded or loading (stop it first), a process has its files open, or the drive lacks the room"),
                            (409, "busy", "another move runs, or a drive is being measured")],
         "system.move.cancel" => &[(409, "conflict", "no move is under way")],
-        "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.voices.design" | "model3d.generate" | "model3d.rig" =>
+        "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.voices.design" | "audio.voices.enroll" | "model3d.generate" | "model3d.rig" =>
             &[(400, "invalid_params", "a value refused, when the job is submitted (wait false too): steps a few-step model does not run, a size, a sampler, a picture that does not decode, a voice or language the speech model does not have, a priority outside -9..9 ..."),
               (404, "not_found", "no such model; a continue_from or upload:<name> that is not here (error.field names which)"), (409, "conflict", "the model is disabled, or none that can do it is enabled (never retry as is)"),
               (409, "busy", "queue: false and the job would not start at once (retryable)"),

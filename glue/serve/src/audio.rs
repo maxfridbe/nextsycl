@@ -209,6 +209,9 @@ impl AudioServer {
                     None => http::respond_with(&mut s, 404, &err(format!("no saved voice {name}")), &cors),
                 }
             }
+            // an enrolment is a front-door job (it asks for a card like a load): the page reaches it through /open/<id>/
+            (_, "/api/voices/enroll") => http::respond_with(&mut s, 404,
+                &err("enrolling a voice is the front door's: open this page through it (http://<box>:8000/open/<model>/) or run nextsycl audio voice enroll"), &cors),
             ("POST", "/api/voices/add") | ("POST", "/api/voices/remove") => {
                 let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
                 match self.voice_op(&req.path, &body) {
@@ -294,7 +297,7 @@ impl AudioServer {
             "speech": e.speech().map(|sp| json!({"voices": sp.voices, "languages": sp.languages, "instructions": sp.instructions, "design": sp.design,
                                                  "clone": sp.clone, "clone_needs_text": sp.clone_needs_text, "clone_takes_text": sp.clone_takes_text,
                                                  "direction": sp.direction, "events": sp.events, "requires": sp.requires,
-                                                 "speakers": sp.speakers.max(1)})),
+                                                 "speakers": sp.speakers.max(1), "enrolled": sp.enrolled})),
             "defaults": {"seconds": f(d.seconds), "max_seconds": f(d.max_seconds), "steps": d.steps, "cfg": f(d.cfg), "rate": d.rate},
             "options": e.options().iter().filter(|o| o.at != nextsycl_core::At::Load)
                 .map(|o| json!({"name": o.name, "value": o.value, "help": o.help})).collect::<Vec<_>>(),

@@ -1,5 +1,5 @@
 /** The only module that talks to the server. */
-import type { GenAnswer, Gpu, Info, Progress, SavedVoice, Song } from "./types.js";
+import type { EnrollJob, EnrollState, GenAnswer, Gpu, Info, Progress, SavedVoice, Song } from "./types.js";
 
 async function getJSON<T>(path: string): Promise<T> {
   const r = await fetch(path);
@@ -20,6 +20,22 @@ export const api = {
     const r = await fetch("api/voices/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const j = (await r.json()) as SavedVoice & { error?: { message: string } };
     if (!r.ok) throw new Error(j.error?.message ?? `HTTP ${r.status}`);
+    return j;
+  },
+  /** The front door's enrolments (through /open/<id>/ only: none when the page is the server's own) */
+  async enrollState(): Promise<EnrollState | null> {
+    try {
+      const r = await fetch("api/voices/enroll");
+      return r.ok ? ((await r.json()) as EnrollState) : null;
+    } catch {
+      return null;
+    }
+  },
+  /** Enroll a saved voice (a front-door job that waits for a card); an error carries the door's message. */
+  async enroll(name: string, model?: string): Promise<EnrollJob> {
+    const r = await fetch("api/voices/enroll", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, model }) });
+    const j = (await r.json()) as EnrollJob & { error?: { message: string } | string };
+    if (!r.ok) throw new Error(typeof j.error === "string" ? j.error : j.error?.message ?? `HTTP ${r.status}`);
     return j;
   },
   async removeVoice(name: string): Promise<void> {

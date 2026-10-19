@@ -1,5 +1,5 @@
 /** The whole client state in one object (H3's scheme). Components read it; actions mutate it and call render(). */
-import type { Form, Gpu, Info, Progress, SavedVoice, Song } from "./types.js";
+import type { EnrollState, Form, Gpu, Info, Progress, SavedVoice, Song } from "./types.js";
 
 export interface AppState {
   info: Info | null;
@@ -8,6 +8,8 @@ export interface AppState {
   history: Song[];
   /** the saved voices (spoken by a model that clones) */
   voices: SavedVoice[];
+  /** the front door's enrolments (none: the page is the server's own, not opened through the door) */
+  enroll: EnrollState | null;
   form: Form;
   /** the last request's song */
   result: Song | null;
@@ -26,6 +28,7 @@ export const state: AppState = {
   gpu: null,
   history: [],
   voices: [],
+  enroll: null,
   form: { prompt: "", lyrics: "", seconds: 60, steps: null, cfg: null, seed: null, options: {}, text: "", voice: "", language: "", instructions: "",
           refAudio: "", refName: "", refText: "" },
   result: null,

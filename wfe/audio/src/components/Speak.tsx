@@ -2,7 +2,7 @@
  *  recording - whichever the model does), the language, the most to make, the seed; under Advanced the engine's own
  *  options. Each field writes straight into state.form. */
 import { jsx } from "../jsx.js";
-import { canGo, cancel, deleteVoice, generate, pickReference, randomSeed, saveVoice } from "../actions.js";
+import { canGo, cancel, deleteVoice, enrollJob, enrollVoice, generate, pickReference, randomSeed, saveVoice } from "../actions.js";
 import { panelOpen, render, saveForm, state, togglePanel } from "../state.js";
 
 type Text = "text" | "instructions" | "refText" | "voice" | "language";
@@ -26,6 +26,25 @@ const area = (k: "text" | "instructions" | "refText", cls: string, placeholder: 
 );
 
 const pretty = (v: string) => v.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+/** A saved voice's enrolment for the model without an encoder (Voxtral TTS, through the front door): its job's
+ *  progress, done, or the button that starts one; nothing when the page is not opened through the door */
+function Enroll(name: string, enrolled: string[] | undefined) {
+  const m = state.enroll?.models[0];
+  if (!m) return null;
+  const who = m.title?.split(" ")[0] ?? m.id;
+  const j = enrollJob(name);
+  if (j && (j.state === "queued" || j.state === "running")) {
+    const p = j.progress;
+    const what = p?.at && p.of ? `fitting ${Math.round((100 * p.at) / p.of)}%` : j.waiting_for ?? j.stage ?? "queued";
+    return <span class="hint" attrs={{ title: j.waiting_for ?? "" }}>{`enrolling for ${who}: ${what}`}</span>;
+  }
+  if (enrolled?.includes(m.arch)) return <span class="hint" attrs={{ title: `${name} is enrolled for ${m.id}` }}>{`✓ ${who}`}</span>;
+  return (
+    <button type="button" class="tbtn" attrs={{ title: j?.state === "failed" ? `the last try failed: ${j.error?.message ?? ""}` : `fit ${name} for ${m.id} (experimental; a minute or two on a GPU)` }}
+            on={{ click: () => void enrollVoice(name) }}>{j?.state === "failed" ? `enroll for ${who} (failed - again)` : `enroll for ${who}`}</button>
+  );
+}
 
 export function Speak() {
   const f = state.form;
@@ -71,6 +90,23 @@ export function Speak() {
               : "Cheerful and a little hurried, as if late for a train.")}
           </div>
         : null}
+      {!sp.clone && sp.enrolled && state.voices.length
+        ? <div>
+            <div class="lab">a saved voice <span class="hint">experimental: spoken once enrolled for this model (fitted on a GPU, a minute or two)</span></div>
+            <span class="chips">
+              {state.voices.map((v) => (
+                <span class="vchip">
+                  {v.enrolled?.includes(state.info?.arch ?? "")
+                    ? <button type="button" class={{ chip: true, on: f.voice === v.name }} attrs={{ title: v.description ?? v.text ?? "" }}
+                              on={{ click: () => set("voice", f.voice === v.name ? "" : v.name) }}>{v.name}</button>
+                    : <span class="chip off" attrs={{ title: "not enrolled for this model yet" }}>{v.name}</span>}
+                  {v.enrolled?.includes(state.info?.arch ?? "") ? null : Enroll(v.name, v.enrolled)}
+                </span>
+              ))}
+            </span>
+            {state.enroll ? null : <div class="hint">open this page through the front door (:8000) to enroll a voice</div>}
+          </div>
+        : null}
       {sp.clone
         ? <div>
             {state.voices.length
@@ -82,6 +118,7 @@ export function Speak() {
                         <button type="button" class={{ chip: true, on: f.voice === v.name }} attrs={{ title: v.description ?? v.text ?? "" }}
                                 on={{ click: () => set("voice", f.voice === v.name ? "" : v.name) }}>{v.name}{v.kind === "design" ? " ✦" : ""}</button>
                         <button type="button" class="tbtn x" attrs={{ title: `delete ${v.name}` }} on={{ click: () => void deleteVoice(v.name) }}>×</button>
+                        {f.voice === v.name ? Enroll(v.name, v.enrolled) : null}
                       </span>
                     ))}
                   </span>
