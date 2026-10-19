@@ -32,8 +32,10 @@
 //! ```
 //!
 //! One request runs at a time (one engine on its GPU); the others wait their turn. A request asking for LoRAs other
-//! than those merged in reloads the engine with them (the old one is dropped first: its VRAM is the new one's) - until
-//! the engines take a LoRA per request on a side path.
+//! than those merged in: an engine that takes them on a side path (`side_loras`: Qwen-Image 2.1) runs them beside the
+//! weights for that request only - each LoRA file read once and kept, put on the GPU for the request and dropped
+//! after, its few-step settings (sigmas) applied to the request; any other engine (or a request that drops a LoRA
+//! merged at load) reloads with them merged (the old one is dropped first: its VRAM is the new one's).
 
 use std::collections::VecDeque;
 use std::net::TcpListener;
@@ -62,6 +64,9 @@ pub struct KnownLora {
     pub id: String,
     pub path: PathBuf,
     pub title: String,
+    /// its registry entry's settings (a few-step LoRA's sigma preset): on the side path, those an engine option takes
+    /// per request apply to the request (a merge applies them at load)
+    pub env: Vec<(String, String)>,
 }
 
 pub struct ImageServer {
@@ -605,10 +610,16 @@ impl ImageServer {
         };
         let t0 = Instant::now();
         let j0 = self.tele.joules();
-        // other LoRAs: the engine reloaded with them merged
+        // other LoRAs: beside the weights for this request when the engine takes them so (those merged at load kept, the
+        // rest on its side path - no reload), else the engine reloaded with them merged
+        let mut side: Vec<LoraUse> = Vec::new();
         if let Some(want) = &want_loras {
-            let same = g.as_ref().is_some_and(|(_, have)| have == want);
-            if !same {
+            let have = g.as_ref().map(|(_, h)| h.clone()).unwrap_or_default();
+            let takes = g.as_ref().is_some_and(|(e, _)| e.side_loras());
+            let kept = have.iter().all(|h| want.contains(h));
+            if have != *want && takes && kept {
+                side = want.iter().filter(|w| !have.contains(w)).cloned().collect();
+            } else if have != *want {
                 *self.progress.lock().unwrap() = json!({"busy": true, "loading": true, "prompt": prompt, "seconds": 0});
                 *g = None; // its VRAM first
                 match (self.load)(want, &mut |l| eprintln!("{l}")) {
@@ -624,9 +635,18 @@ impl ImageServer {
         }
         let (engine, loras) = g.as_ref().ok_or((503, "the engine is not loaded (a reload failed)".to_string()))?;
         let mut req = req;
+        req.loras = side.clone();
         if !given.is_empty() {
             nextsycl_core::options::resolve(&given, engine.options(), nextsycl_core::At::Request, &self.model).map_err(bad)?;
             req.extra = nextsycl_core::options::by_name(&given, engine.options());
+        }
+        // a side LoRA's own settings an option takes per request (its sigma preset), unless the request gives them
+        for l in &side {
+            for (var, v) in self.loras_known.iter().filter(|k| k.id == l.name).flat_map(|k| k.env.iter()) {
+                if let Some(o) = engine.options().iter().find(|o| o.env == var && o.at != nextsycl_core::At::Load) {
+                    req.extra.entry(o.name.to_string()).or_insert_with(|| v.clone());
+                }
+            }
         }
         let steps = engine.steps_for(&req);
         let p = &self.progress;
@@ -646,7 +666,7 @@ impl ImageServer {
             (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
             _ => None,
         };
-        let lora_txt: Vec<String> = loras.iter().map(|l| format!("{}:{}", l.name, l.scale)).collect();
+        let lora_txt: Vec<String> = loras.iter().chain(&side).map(|l| format!("{}:{}", l.name, l.scale)).collect();
         let mut data = Vec::new();
         for (i, pic) in pics.iter().enumerate() {
             let s = seed + i as u64;

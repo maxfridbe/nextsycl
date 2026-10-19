@@ -20,14 +20,15 @@ pub mod prof;
 pub mod sched;
 pub mod vae;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use nextsycl_core::{DevBuf, Gpu};
 use nextsycl_diffusion::kernels::Nsd;
+use nextsycl_diffusion::lora::Delta;
 use nextsycl_gguf::Gguf;
-use nextsycl_image::{At, Defaults, EngineOption, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, Picture, Result, Sampler, Schedule, Step};
+use nextsycl_image::{At, Defaults, EngineOption, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, LoraUse, ModelFiles, Picture, Result, Sampler, Schedule, Step};
 use nextsycl_qwen3vl::TextEncoder;
 
 pub const ARCH: &str = "qwen-image-2.1";
@@ -102,6 +103,21 @@ pub struct QwenImage21 {
     pub vae: vae::Vae,
     loaded: Instant,
     load_s: f64,
+    /// LoRA files read for requests (their updates at strength 1), the last few kept: a request's LoRAs are put on
+    /// the GPU from here (dit::Side), not read again
+    lora_cache: std::sync::Mutex<Vec<(PathBuf, Arc<Vec<Delta>>)>>,
+}
+
+/// LoRA files kept read (host memory: a rank-64 LoRA of this model is ~0.6 GB as float32)
+const LORA_CACHE: usize = 3;
+
+/// A request's LoRAs on the side path while it lives (dit::Dit::set_side): dropped with it
+pub struct SideOn<'a>(&'a dit::Dit);
+
+impl Drop for SideOn<'_> {
+    fn drop(&mut self) {
+        self.0.set_side(None);
+    }
 }
 
 /// A role's file, or why not
@@ -177,7 +193,37 @@ impl QwenImage21 {
         }
         let dit = dit::Dit::load(&f, &nsd, int8, &deltas, log)?;
         let vae = vae::Vae::load(role(files, "vae")?, &nsd, (LATENT_MEAN.to_vec(), LATENT_STD.to_vec()), log)?;
-        Ok(QwenImage21 { nsd, preset, te, dit, vae, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64() })
+        Ok(QwenImage21 { nsd, preset, te, dit, vae, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64(),
+                         lora_cache: std::sync::Mutex::new(Vec::new()) })
+    }
+
+    /// A LoRA file's updates at strength 1: from the cache, else read (and kept, the oldest let go)
+    fn lora_deltas(&self, path: &Path) -> Result<Arc<Vec<Delta>>> {
+        let mut c = self.lora_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(i) = c.iter().position(|(p, _)| p == path) {
+            let hit = c.remove(i);
+            let d = hit.1.clone();
+            c.push(hit);
+            return Ok(d);
+        }
+        let d = Arc::new(nextsycl_diffusion::lora::read(path, 1.0).map_err(Error)?);
+        c.push((path.to_path_buf(), d.clone()));
+        while c.len() > LORA_CACHE {
+            c.remove(0);
+        }
+        Ok(d)
+    }
+
+    /// Put a request's LoRAs on the side path (each beside the matrix it names, at its strength) until the guard drops
+    pub fn side_on(&self, loras: &[LoraUse]) -> Result<SideOn<'_>> {
+        let t0 = Instant::now();
+        let read: Vec<(Arc<Vec<Delta>>, f32)> = loras.iter().map(|l| Ok((self.lora_deltas(&l.path)?, l.scale))).collect::<Result<_>>()?;
+        let all: Vec<(&Delta, f32)> = read.iter().flat_map(|(d, s)| d.iter().map(move |x| (x, *s))).collect();
+        let side = self.dit.side(&self.nsd, &all)?;
+        eprintln!("LoRAs {} on the side path: {} updates, {:.0} MiB, {:.2} s", loras.iter().map(|l| format!("{}:{}", l.name, l.scale)).collect::<Vec<_>>().join(", "),
+                  all.len(), side.bytes as f64 / (1 << 20) as f64, t0.elapsed().as_secs_f64());
+        self.dit.set_side(Some(side));
+        Ok(SideOn(&self.dit))
     }
 
     /// The prompt's tokens (the whole chat turn) and how many lead the turn (the system's, dropped)
@@ -367,6 +413,10 @@ impl ImageEngine for QwenImage21 {
     fn edits(&self) -> bool {
         true
     }
+    /// a request's LoRAs beside the matrices they name (dit::Side), dropped after it
+    fn side_loras(&self) -> bool {
+        true
+    }
     /// every shared sampler (Euler on the model's schedule stays on the GPU; the others step on the host)
     fn samplers(&self) -> Vec<Sampler> {
         Sampler::ALL.to_vec()
@@ -411,9 +461,8 @@ impl ImageEngine for QwenImage21 {
         }
         let sampler = req.sampler.unwrap_or(Sampler::Euler);
         let schedule = req.schedule.unwrap_or(Schedule::Shift);
-        if !req.loras.is_empty() {
-            return Err(Error(format!("{ARCH}: LoRAs are not ported yet")));
-        }
+        // the request's LoRAs on the side path (the weights stay as loaded), dropped when it ends
+        let _side = if req.loras.is_empty() { None } else { Some(self.side_on(&req.loras)?) };
         let area = (d.width * d.height) as usize;
         let (dw, dh) = match pics.last().or(req.edit.as_ref().map(|e| &e.image)) {
             Some(p) => dims(area as f64, p.width as f64 / p.height as f64),

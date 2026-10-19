@@ -38,6 +38,9 @@ const MODEL_OPT: (&str, &str, &str, bool) = ("model", "string", "the model's id;
 /// A job's place in its kind's queue (image and audio, as video.generate's)
 const QUEUE: (&str, &str, &str, bool) = ("queue", r#"{"type": "boolean", "default": true}"#, "false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn", false);
 const PRIORITY: (&str, &str, &str, bool) = ("priority", r#"{"type": "integer", "minimum": -9, "maximum": 9, "default": 0}"#, "a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)", false);
+/// An image request's own LoRAs
+const LORAS: (&str, &str, &str, bool) = ("loras", r#"{"type": "array", "items": {"oneOf": [{"type": "string", "description": "name:scale"}, {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}, "scale": {"type": "number", "default": 1}}}]}}"#,
+    "LoRAs for this request (a registered LoRA's id - system.models kind lora - or a file), each with its strength: Qwen-Image 2.1 runs them beside the loaded weights for this request only (no reload; each file read once and kept, a few-step LoRA's sigmas applied); other models reload with them merged", false);
 const HELD: (&str, &str, &str, bool) = ("held", r#"{"type": "boolean", "default": false}"#, "queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch", false);
 const PROJECT: (&str, &str, &str, bool) = ("project", r#"{"type": "string", "maxLength": 60}"#, "a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}", false);
 const BATCH: (&str, &str, &str, bool) = ("batch", r#"{"type": "string", "maxLength": 60}"#, "a group inside the project", false);
@@ -109,7 +112,7 @@ pub const METHODS: &[Method] = &[
                        ("strength", r#"{"type": "number", "minimum": 0.05, "maximum": 1}"#, "with image: how far from it (ComfyUI's denoise: the last steps of a round(steps / strength)-step schedule); 0.3-0.6 is the usual img2img range", false),
                        ("steps", "integer", "image.info's steps: a few-step model (turbo) runs only its own count (6)", false), ("seed", "integer", "", false), ("sampler", "string", "ComfyUI's names (euler, euler_ancestral, dpmpp_2m ...)", false),
                        ("schedule", "string", "", false), ("cfg", "number", "true guidance (needs negative_prompt)", false), ("negative_prompt", "string", "", false),
-                       ("loras", "string[]", "name:scale", false), ("response_format", "string", "url (default) or b64_json", false),
+                       LORAS, ("response_format", "string", "url (default) or b64_json", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
                        ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
@@ -120,7 +123,7 @@ pub const METHODS: &[Method] = &[
                        ("reference", r#"{"type": "boolean", "default": true}"#, "true (default): the pictures condition the model as an edit's references (its vision tower reads them) as well as being where strength starts; false: a plain img2img - the denoise starts from the first picture and the prompt alone guides it, comparable with other tools' img2img (needs strength below 1)", false),
                        ("size", "string", "default: the last picture's aspect", false), ("steps", "integer", "", false), ("seed", "integer", "", false),
                        ("strength", r#"{"type": "number", "minimum": 0.05, "maximum": 1, "default": 1}"#, "how far from the first picture: 1 (default) makes a new picture guided by it; below 1 starts from the first picture, encoded and noised to the level strength reaches: the run is the last steps of a round(steps / strength)-step schedule, exactly ComfyUI's KSampler denoise (a few-step model such as turbo starts at strength itself, then takes its own levels below it). With reference true the picture also conditions the model, which holds it closer than a plain img2img at the same number: measured on Qwen-Image 2.1, 0.9 keeps the framing, face, hair and clothes and still makes the change asked; 0.75 and below give back nearly the same picture. With reference false it behaves as other tools' img2img. The first picture is resized to the output's size", false),
-                       ("response_format", "string", "url (default) or b64_json", false),
+                       LORAS, ("response_format", "string", "url (default) or b64_json", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
                        ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
@@ -387,7 +390,7 @@ const FEATURES: &[&str] = &[
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
-    "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars",
+    "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults

@@ -161,6 +161,11 @@ pub trait ImageEngine: Send + Sync {
     fn edits(&self) -> bool {
         false
     }
+    /// whether it takes `ImageRequest::loras` (a request's LoRAs on a side path, the weights as loaded); else a server
+    /// reloads the model with them merged
+    fn side_loras(&self) -> bool {
+        false
+    }
     /// the samplers it runs (a request naming another is refused)
     fn samplers(&self) -> Vec<Sampler> {
         Sampler::ALL.to_vec()

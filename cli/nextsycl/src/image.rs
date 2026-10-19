@@ -10,7 +10,8 @@ use serde_json::Value;
 
 const USAGE: &str = "nextsycl image edit \"<instructions>\" --image PICTURE [--image REFERENCE]... [gen's options]
 nextsycl image gen \"<prompt>\" [--model ID] [--size WxH | --aspect W:H] [--steps N] [--seed N] [--n N] [--sampler S]
-                   [--schedule S] [--lora NAME[:SCALE]]... [--set NAME=VALUE]... [--out FILE|DIR] [--rgba] [--local] [--gpu N]
+                   [--schedule S] [--lora NAME[:SCALE]]... [--request-lora NAME[:SCALE]]... [--set NAME=VALUE]... [--out FILE|DIR] [--rgba] [--local] [--gpu N]
+                   (--lora: merged into the weights at load; --request-lora: beside them for this request, engines that take it)
 nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora NAME[:SCALE]]... [--set NAME=VALUE]...
                      [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl image start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
@@ -98,6 +99,11 @@ fn options(cfg: &Config, m: &Value, args: &[String]) -> Result<nextsycl_image::L
 
 /// Every `--lora NAME[:SCALE]`: a registered LoRA's id or a file
 fn loras(cfg: &Config, args: &[String]) -> Result<Vec<LoraUse>, String> {
+    loras_by(cfg, args, "--lora")
+}
+
+/// Every `FLAG NAME[:SCALE]` (--lora: merged at load; --request-lora: the request's own, beside the weights)
+fn loras_by(cfg: &Config, args: &[String], flag: &str) -> Result<Vec<LoraUse>, String> {
     let all = models::all(cfg)?;
     let find = |n: &str| -> Option<PathBuf> {
         all.iter()
@@ -105,8 +111,8 @@ fn loras(cfg: &Config, args: &[String]) -> Result<Vec<LoraUse>, String> {
             .and_then(|m| m["file"].as_str().map(PathBuf::from))
             .or_else(|| Path::new(n).is_file().then(|| PathBuf::from(n)))
     };
-    args.iter().enumerate().filter(|(_, a)| *a == "--lora").map(|(i, _)| {
-        let v = args.get(i + 1).ok_or("--lora NAME[:SCALE]")?;
+    args.iter().enumerate().filter(|(_, a)| *a == flag).map(|(i, _)| {
+        let v = args.get(i + 1).ok_or_else(|| format!("{flag} NAME[:SCALE]"))?;
         LoraUse::parse(v, &find)
     }).collect()
 }
@@ -247,6 +253,7 @@ fn gen_or_edit(cfg: &Config, args: &[String], editing: bool) -> Result<(), Strin
         negative: opt(args, "--negative").map(str::to_string),
         cfg: opt(args, "--cfg").map(|s| s.parse().map_err(|_| "--cfg X")).transpose()?,
         edit: editing.then(|| nextsycl_image::Edit { image: pics[0].clone(), refs: pics[1..].to_vec(), mask: None, strength: 1.0, condition: true }),
+        loras: loras_by(cfg, args, "--request-lora")?,
         ..Default::default()
     };
     let t0 = std::time::Instant::now();
@@ -451,6 +458,7 @@ fn serve_here(cfg: &Config, m: &Value, files: ModelFiles, args: &[String], out: 
     let loras = loras_for(cfg, m)?;
     let known: Vec<KnownLora> = loras.iter().filter_map(|l| Some(KnownLora {
         id: l["id"].as_str()?.to_string(), path: PathBuf::from(l["file"].as_str()?), title: l["title"].as_str().unwrap_or("").to_string(),
+        env: l["env"].as_object().into_iter().flatten().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect(),
     })).collect();
     // the settings without any LoRA's: a reload adds those of the LoRAs it merges
     let mut base = first.clone();
