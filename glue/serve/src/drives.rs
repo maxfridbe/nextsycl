@@ -8,7 +8,8 @@
 //!   when measured (`measure`: up to 4 GiB of its largest model files read with O_DIRECT - past the page cache, no
 //!   writes).
 //! - **Moving** a model (`plan`, then `Move::run`): every file it names - its file and the shards beside it, its files
-//!   by role, settings that are paths (a folder with what is in it) - is copied to the other drive and read back past
+//!   by role, settings that are paths (a folder with what is in it), the sidecars its engine finds beside its file
+//!   (`sidecars`: its model card says which) - is copied to the other drive and read back past
 //!   the cache (size and SHA-256) before the next; then the registry entry is repointed in one write; then the old
 //!   files go, except those another registered model still names (they stay, and that model with them). A cancel or a
 //!   failure removes what the move wrote and leaves the registry as it was.
@@ -359,7 +360,64 @@ pub fn named(m: &Value) -> Vec<String> {
             }
         }
     }
+    // the sidecars found beside its file (with_sidecars)
+    for p in m[SIDECAR_PATHS].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        push(p);
+    }
     v
+}
+
+/// Where with_sidecars puts an entry's sidecars (in memory only: never written to the registry)
+const SIDECAR_PATHS: &str = "_sidecar_paths";
+
+/// Whether a file name matches a pattern with `*` (any run of characters)
+fn glob(pat: &str, name: &str) -> bool {
+    match pat.split_once('*') {
+        None => pat == name,
+        Some((head, rest)) => name.strip_prefix(head).is_some_and(|tail| (0..=tail.len()).filter(|i| tail.is_char_boundary(*i)).any(|i| glob(rest, &tail[i..]))),
+    }
+}
+
+/// An entry's sidecars: what its engine finds beside its model file by convention and no registry path names - a
+/// draft block (deepseek4's `deepseek-v4-flash-mtp.gguf`), a vision tower (`*.vision.gguf`), tables in a folder
+/// (`deepseek-engram/`). The entry's `sidecars`, else its model card's: names or `*` patterns relative to the model
+/// file's folder (a folder: what is in it); those that exist
+pub fn sidecars(m: &Value, cards: &[Value]) -> Vec<PathBuf> {
+    let id = m["catalog"].as_str().or(m["id"].as_str()).unwrap_or("");
+    let pats = m["sidecars"].as_array().or_else(|| cards.iter().find(|c| c["id"] == id).and_then(|c| c["sidecars"].as_array()));
+    let main = m["file"].as_str().filter(|f| !f.is_empty()).or_else(|| m["files"]["model"].as_str());
+    let (Some(pats), Some(dir)) = (pats, main.and_then(|f| Path::new(f).parent())) else { return Vec::new() };
+    let mut out: Vec<PathBuf> = Vec::new();
+    for pat in pats.iter().filter_map(Value::as_str).map(|p| p.trim_end_matches('/')).filter(|p| !p.is_empty() && !p.contains("..")) {
+        let found: Vec<PathBuf> = if pat.contains('*') {
+            let (sub, leaf) = pat.rsplit_once('/').map_or((dir.to_path_buf(), pat), |(s, l)| (dir.join(s), l));
+            let mut v: Vec<PathBuf> = std::fs::read_dir(&sub).into_iter().flatten().flatten()
+                .filter(|e| glob(leaf, &e.file_name().to_string_lossy())).map(|e| e.path()).collect();
+            v.sort();
+            v
+        } else {
+            vec![dir.join(pat)]
+        };
+        for p in found.into_iter().filter(|p| p.exists()) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// The entries with their sidecars (sidecars) among the paths they name, for a move and the drives' view: a sidecar
+/// moves with its model and stays where another entry still has it
+pub fn with_sidecars(models: &[Value], cards: &[Value]) -> Vec<Value> {
+    models.iter().map(|m| {
+        let mut m = m.clone();
+        let s = sidecars(&m, cards);
+        if !s.is_empty() {
+            m[SIDECAR_PATHS] = json!(s.iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
+        }
+        m
+    }).collect()
 }
 
 /// The files below a folder (links to folders not followed)
@@ -514,11 +572,14 @@ pub struct Plan {
     pub bytes: u64,
     /// the folders the old files' empty folders are removed up to (models folders, mounts, the model folder's parent)
     pub stops: Vec<PathBuf>,
+    /// the model cards (each entry's sidecars: the old ones another entry still has stay)
+    pub cards: Vec<Value>,
 }
 
 /// The plan for moving entry `id` of `models` to drive `to` (`all`: every drive; `roots`: the models folders): its
 /// files not on `to` already, each to its place there (target_of)
-pub fn plan(models: &[Value], id: &str, to: &Drive, all: &[Drive], roots: &[PathBuf], ms: &[Mount]) -> Result<Plan, String> {
+pub fn plan(models: &[Value], id: &str, to: &Drive, all: &[Drive], roots: &[PathBuf], ms: &[Mount], cards: &[Value]) -> Result<Plan, String> {
+    let models = &with_sidecars(models, cards);
     let m = models.iter().find(|m| m["id"] == id).ok_or_else(|| format!("no model {id} (nextsycl models list)"))?;
     let files = files_of(m);
     if files.is_empty() {
@@ -575,7 +636,7 @@ pub fn plan(models: &[Value], id: &str, to: &Drive, all: &[Drive], roots: &[Path
     let mut stops: Vec<PathBuf> = roots.to_vec();
     stops.extend(points);
     stops.extend(base.parent().map(Path::to_path_buf));
-    Ok(Plan { model: id.to_string(), to: to.id.clone(), folder: to.folder.clone(), from, steps, rename, need, bytes, stops })
+    Ok(Plan { model: id.to_string(), to: to.id.clone(), folder: to.folder.clone(), from, steps, rename, need, bytes, stops, cards: cards.to_vec() })
 }
 
 /// A file opened to read past the page cache (O_DIRECT; plainly where the filesystem has none), and whether it is
@@ -1009,7 +1070,7 @@ impl Move {
         }
         // the old files: those no entry names now (the registry read again: another may have been added meanwhile)
         self.set("removing", p.steps.len().saturating_sub(1));
-        let names = users(&store.models().unwrap_or_default());
+        let names = users(&with_sidecars(&store.models().unwrap_or_default(), &p.cards));
         let mut removed = Vec::new();
         let mut kept = Vec::new();
         for s in &p.steps {
@@ -1216,7 +1277,7 @@ mod tests {
             json!({"id": "m2", "file": fs}),
         ];
         let store = Mem(Mutex::new(models.clone()));
-        let pl = plan(&models, "m1", &db, &[da.clone(), db.clone()], &roots, &ms).unwrap();
+        let pl = plan(&models, "m1", &db, &[da.clone(), db.clone()], &roots, &ms, &[]).unwrap();
         assert_eq!(pl.steps.len(), 5);
         assert_eq!(pl.from, vec!["da".to_string()]);
         assert_eq!(pl.need, 100_000 + 70_000 + 5_000 + 6_000);
@@ -1239,6 +1300,73 @@ mod tests {
     }
 
     #[test]
+    fn sidecars_move_with_their_model_and_stay_for_another() {
+        let t = Tmp::new("sidecars");
+        let (ms, da, db) = setup(&t);
+        let roots = vec![da.folder.clone(), db.folder.clone()];
+        // deepseek41's layout: the model, its vision sidecar and Engram folder beside it (two shards the entry names,
+        // a README the engine does not read); deepseek4's: an MTP sidecar beside the first shard
+        let d41 = da.folder.join("ds41");
+        let f41 = d41.join("V4.1-vq.gguf");
+        write(&f41, 40_000, 1);
+        write(&d41.join("V4.1.vision.gguf"), 8_000, 2);
+        write(&d41.join("deepseek-engram/model-00047-of-00048.safetensors"), 9_000, 3);
+        write(&d41.join("deepseek-engram/model-00048-of-00048.safetensors"), 9_000, 4);
+        write(&d41.join("deepseek-engram/config.json"), 100, 5);
+        write(&d41.join("README.md"), 100, 6);
+        let d4 = da.folder.join("ds4");
+        let f4 = d4.join("V4-00001-of-00002.gguf");
+        write(&f4, 30_000, 7);
+        write(&d4.join("V4-00002-of-00002.gguf"), 30_000, 8);
+        write(&d4.join("deepseek-v4-flash-mtp.gguf"), 7_000, 9);
+        let cards = vec![json!({"id": "ds41", "sidecars": ["*.vision.gguf", "deepseek-engram/", "none-*.gguf"]}),
+                         json!({"id": "ds4", "sidecars": ["deepseek-v4-flash-mtp.gguf"]})];
+        let models = vec![
+            json!({"id": "ds41", "file": f41, "files": {"model": f41, "engram-1": d41.join("deepseek-engram/model-00047-of-00048.safetensors"),
+                                                       "engram-2": d41.join("deepseek-engram/model-00048-of-00048.safetensors")}}),
+            json!({"id": "ds4", "file": f4}),
+            // a variant of ds4 on the same files (its card by `catalog`)
+            json!({"id": "ds4-256k", "catalog": "ds4", "file": f4}),
+        ];
+        assert_eq!(sidecars(&models[0], &cards), vec![d41.join("V4.1.vision.gguf"), d41.join("deepseek-engram")]);
+        assert!(sidecars(&models[0], &[]).is_empty(), "no card: none");
+        assert_eq!(sidecars(&models[2], &cards), vec![d4.join("deepseek-v4-flash-mtp.gguf")]);
+        // an entry's own list wins over its card's
+        assert!(sidecars(&json!({"id": "ds4", "file": f4, "sidecars": []}), &cards).is_empty());
+        let store = Mem(Mutex::new(models.clone()));
+        let all = [da.clone(), db.clone()];
+        let pl = plan(&models, "ds41", &db, &all, &roots, &ms, &cards).unwrap();
+        // the model, the vision sidecar and the Engram folder's three files (the README is not its)
+        assert_eq!(pl.steps.len(), 5);
+        Move::new(pl, None).run(&store).unwrap();
+        let n41 = db.folder.join("ds41");
+        assert_eq!(store.models().unwrap()[0]["file"], json!(n41.join("V4.1-vq.gguf")));
+        assert_eq!(store.models().unwrap()[0]["files"]["engram-2"], json!(n41.join("deepseek-engram/model-00048-of-00048.safetensors")));
+        assert!(store.models().unwrap()[0].get(SIDECAR_PATHS).is_none(), "the registry gets no sidecar paths");
+        assert!(n41.join("V4.1.vision.gguf").exists() && n41.join("deepseek-engram/config.json").exists());
+        assert!(!d41.join("V4.1.vision.gguf").exists() && !d41.join("deepseek-engram").exists() && d41.join("README.md").exists());
+        // ds4 moves; its variant still has the files: they are copied and stay - the sidecar with them
+        let pl = plan(&models, "ds4", &db, &all, &roots, &ms, &cards).unwrap();
+        assert_eq!(pl.steps.len(), 3);
+        let out = Move::new(pl, None).run(&store).unwrap();
+        assert!(db.folder.join("ds4/deepseek-v4-flash-mtp.gguf").exists());
+        assert!(d4.join("deepseek-v4-flash-mtp.gguf").exists(), "ds4-256k still finds its sidecar");
+        assert_eq!(out["kept"].as_array().unwrap().len(), 3);
+        // then the variant: now nothing names the old ones
+        let pl = plan(&store.models().unwrap(), "ds4-256k", &db, &all, &roots, &ms, &cards).unwrap();
+        assert!(pl.steps.iter().all(|s| s.how == How::There));
+        Move::new(pl, None).run(&store).unwrap();
+        assert!(!d4.exists());
+    }
+
+    #[test]
+    fn globs() {
+        assert!(glob("*.vision.gguf", "DeepSeek-V4.1-Flash.vision.gguf"));
+        assert!(!glob("*.vision.gguf", "x.gguf"));
+        assert!(glob("a*b*c", "aXbYc") && glob("a*", "a") && !glob("a*b", "ab-"));
+    }
+
+    #[test]
     fn a_cancelled_move_leaves_nothing_behind() {
         let t = Tmp::new("cancel");
         let (ms, da, db) = setup(&t);
@@ -1247,7 +1375,7 @@ mod tests {
         let models = vec![json!({"id": "m", "file": f})];
         let store = Mem(Mutex::new(models.clone()));
         let roots = vec![da.folder.clone(), db.folder.clone()];
-        let mv = Move::new(plan(&models, "m", &db, &[da.clone(), db.clone()], &roots, &ms).unwrap(), None);
+        let mv = Move::new(plan(&models, "m", &db, &[da.clone(), db.clone()], &roots, &ms, &[]).unwrap(), None);
         mv.cancel.store(true, Ordering::Relaxed);
         assert_eq!(mv.run(&store).unwrap_err(), "cancelled");
         assert_eq!(store.models().unwrap()[0]["file"], json!(f));
@@ -1267,19 +1395,19 @@ mod tests {
         // other bytes of the same size there: refused, and that file is left alone
         write(&db.folder.join("m/w.gguf"), 20_000, 2);
         let store = Mem(Mutex::new(models.clone()));
-        let pl = plan(&models, "m", &db, &[da.clone(), db.clone()], &roots, &ms).unwrap();
+        let pl = plan(&models, "m", &db, &[da.clone(), db.clone()], &roots, &ms, &[]).unwrap();
         assert_eq!(pl.steps[0].how, How::There);
         assert_eq!(pl.need, 0);
         assert!(Move::new(pl, None).run(&store).unwrap_err().contains("other bytes"));
         assert!(db.folder.join("m/w.gguf").exists() && f.exists());
         // the same bytes: used, the old one removed
         write(&db.folder.join("m/w.gguf"), 20_000, 1);
-        let pl = plan(&models, "m", &db, &[da.clone(), db.clone()], &roots, &ms).unwrap();
+        let pl = plan(&models, "m", &db, &[da.clone(), db.clone()], &roots, &ms, &[]).unwrap();
         Move::new(pl, None).run(&store).unwrap();
         assert!(!f.exists());
         // a size that differs is refused when planned
         write(&f, 10, 1);
-        assert!(plan(&models, "m", &db, &[da, db.clone()], &roots, &ms).unwrap_err().contains("another file is there"));
+        assert!(plan(&models, "m", &db, &[da, db.clone()], &roots, &ms, &[]).unwrap_err().contains("another file is there"));
     }
 
     #[test]

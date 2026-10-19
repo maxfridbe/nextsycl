@@ -181,11 +181,12 @@ pub fn move_cmd(cfg: &Config, args: &[String]) -> Result<(), String> {
         list.iter().map(|d| format!("{} {}", d.id, d.mount.display())).collect::<Vec<_>>().join(", ")))?;
     let m = all.iter().find(|m| m["id"] == id.as_str()).ok_or_else(|| format!("no model {id} (nextsycl models list)"))?;
     let ms = drives::mounts();
-    let plan = drives::plan(&all, &id, &to, &list, &drives::roots(&set, &list), &ms)?;
+    // (the model cards name the sidecars its engine finds beside its file: they move with it)
+    let cards = nextsycl_models::catalog::Catalog::load(cfg).map(|c| c.models).unwrap_or_default();
+    let plan = drives::plan(&all, &id, &to, &list, &drives::roots(&set, &list), &ms, &cards)?;
     // a model that reads its weights while it serves, to a slower drive: asked
     let meas = measured(cfg);
     let mb = |d: &Drive| meas.get(&d.id).and_then(|v| v["mb_s"].as_f64());
-    let cards = nextsycl_models::catalog::Catalog::load(cfg).map(|c| c.models).unwrap_or_default();
     if drives::streams(m, &cards) {
         let from = plan.from.iter().filter_map(|f| list.iter().find(|d| d.id == *f)).filter_map(|d| drives::rate(d, mb(d))).fold(f64::INFINITY, f64::min);
         let here = drives::rate(&to, mb(&to)).unwrap_or(0.0);

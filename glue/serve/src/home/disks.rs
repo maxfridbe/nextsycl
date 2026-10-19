@@ -69,11 +69,13 @@ impl Home {
     /// system.drives: every drive (its device, link, size, free space, models, measured speed), every model's place on
     /// them and what stops a move to each other drive, the move under way (or the last)
     pub(crate) fn drives_view(&self, all: &[Value], states: &[Value]) -> Value {
+        let cards = self.o.cfg.cards();
+        // (a model's sidecars count with its files)
+        let all = &drives::with_sidecars(all, &cards);
         let set = self.folders();
         let list = drives::drives(all, &set);
         let roots = drives::roots(&set, &list);
         let ms = drives::mounts();
-        let cards = self.o.cfg.cards();
         let measuring = self.disks.measuring.lock().unwrap().clone();
         let running = self.disks.running();
         let state_of = |id: &str| states.iter().find(|m| m["id"] == id).map(|m| m["state"].as_str().unwrap_or("").to_string()).unwrap_or_default();
@@ -107,7 +109,7 @@ impl Home {
                 if on.len() == 1 && on.contains_key(&d.id) {
                     continue;
                 }
-                let why = busy.clone().map_or_else(|| match drives::plan(all, &id, d, &list, &roots, &ms) {
+                let why = busy.clone().map_or_else(|| match drives::plan(all, &id, d, &list, &roots, &ms, &cards) {
                     Ok(p) => drives::room(p.need, d.free, d.size).err().map(|e| format!("{}: {e}", d.id)).map_or(json!({"need": p.need}), |e| json!({"need": p.need, "why": e})),
                     Err(e) => json!({"why": e}),
                 }, |b| json!({"why": b}));
@@ -199,7 +201,8 @@ impl Home {
             return Err((409, "busy: a drive is being measured".into()));
         }
         let ms = drives::mounts();
-        let plan = drives::plan(&all, id, &to, &list, &drives::roots(&set, &list), &ms).map_err(|e| (400, e))?;
+        let cards = self.o.cfg.cards();
+        let plan = drives::plan(&all, id, &to, &list, &drives::roots(&set, &list), &ms, &cards).map_err(|e| (400, e))?;
         let (size, free) = drives::space(&to.mount).unwrap_or((to.size, to.free));
         drives::room(plan.need, free, size).map_err(|e| (409, format!("{}: {e}", to.id)))?;
         let open = drives::open_by(&plan.steps.iter().map(|s| s.from.clone()).collect::<Vec<_>>());
@@ -208,7 +211,6 @@ impl Home {
         }
         let lock = drives::lock(&registry::registry(&self.o.cfg), id, &to.id).map_err(|e| (409, format!("busy: {e}")))?;
         // a model that reads its weights while it serves, to a slower drive: said (the page asked first)
-        let cards = self.o.cfg.cards();
         let warning = drives::streams(&m, &cards).then(|| {
             let slowest_from = plan.from.iter().filter_map(|f| list.iter().find(|d| d.id == *f)).filter_map(|d| drives::rate(d, self.measured_mb_s(&d.id))).fold(f64::INFINITY, f64::min);
             let here = drives::rate(&to, self.measured_mb_s(&to.id)).unwrap_or(0.0);

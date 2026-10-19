@@ -435,7 +435,7 @@ fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeMap<String, 
         "files": files, "gpus": m.get("gpus").cloned().unwrap_or(json!("0")), "env": env, "enabled": true,
         "catalog": m["id"],
     });
-    for k in ["ctx", "tools", "tasks", "base", "defaults", "speech", "voices", "languages", "does", "silo", "vram_gib", "headroom_gib", "streams"] {
+    for k in ["ctx", "tools", "tasks", "base", "defaults", "speech", "voices", "languages", "does", "silo", "vram_gib", "headroom_gib", "streams", "sidecars"] {
         if let Some(v) = m.get(k) {
             e[k] = v.clone();
         }

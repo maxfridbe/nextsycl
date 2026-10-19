@@ -23,6 +23,9 @@ headroom_gib: 3.3               # optional: of vram_gib, the working memory beyo
 streams: true                   # optional: it reads weights from its files while it serves (experts or rows from the
                                 #   file as decode needs them), so its drive's speed is its speed - the front door warns
                                 #   before moving it to a slower drive (README: Drives)
+sidecars: ["*.vision.gguf", engram/]  # optional: files its engine finds beside the model file by convention, no registry
+                                #   path naming them (a draft block, a vision tower, a folder of tables) - names or *
+                                #   patterns relative to the model file's folder; a drive move carries them with it
 ctx: 131072,32768               # llm: each session's context
 tools: true                     # llm: tool calls offered to it (false: dropped)
 tasks: true                     # llm: a front end's background tasks (titles, tags) accepted

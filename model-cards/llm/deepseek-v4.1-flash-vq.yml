@@ -7,6 +7,7 @@ title: DeepSeek-V4.1-Flash-1017 VQ · 128K context (both GPUs, pinned memory and
 about: Baekpica's VQ GGUF of DeepSeek-V4.1-Flash-1017 (YoungAi's recipe; 105.8 GiB - routed experts as 8-dim vector codes of 12-13 bits, ~1.6 bits a weight, the rest q4_K; 13B active, 384 experts) with its three DSpark draft towers inside, and DeepSeek's own Engram tables (two 101.5 GB shards read a row at a time while it runs - keep them on the fastest drive); the experts beyond VRAM in pinned host memory, the rest read from the file
 gpus: all
 streams: true                   # the Engram's rows and the experts beyond VRAM and pinned memory are read from the drive while it serves
+sidecars: ["*.vision.gguf", deepseek-engram/]   # found beside the model (the vision sidecar, the Engram shards' folder): they move with it
 vram_gib: 30.0
 ctx: '131072'
 tools: false
