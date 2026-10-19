@@ -69,6 +69,11 @@ fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn Fn
     Ok(Box::new(Qwen3Tts::load(files, gpu, o, log)?))
 }
 
+/// Shown the frames' codes so far after each frame (a streamed answer's codec)
+pub type CodesSink<'a> = Option<&'a mut dyn FnMut(&[Vec<i32>]) -> Result<()>>;
+/// Handed the samples as they are made (a streamed answer)
+type Samples<'a> = Option<&'a mut dyn FnMut(&[f32]) -> Result<()>>;
+
 pub struct Qwen3Tts {
     pub ops: Ops,
     pub nsd: Nsd,
@@ -194,7 +199,7 @@ impl Qwen3Tts {
     /// (each frame's taken from it, not drawn); `sink`: shown the codes so far after each frame (a streamed answer)
     #[allow(clippy::too_many_arguments)]
     pub fn frames(&self, s: &Spec, d: &Drawing, max: usize, seed: u64, t0: Instant, progress: &mut dyn FnMut(Step) -> Result<()>,
-                  force: Option<&[Vec<i32>]>, keep: Option<&mut Vec<Vec<f32>>>, mut sink: Option<&mut dyn FnMut(&[Vec<i32>]) -> Result<()>>)
+                  force: Option<&[Vec<i32>]>, keep: Option<&mut Vec<Vec<f32>>>, mut sink: CodesSink)
                   -> Result<Vec<Vec<i32>>> {
         let (ops, nsd, t) = (&self.ops, &self.nsd, &self.talker);
         let bound = prompt::bound(&self.tok, s);
@@ -295,7 +300,7 @@ impl Qwen3Tts {
     /// points (`Codec::stream_due`: after the first frames, then where a chunk reaches one of its lengths) and the
     /// rest at the end, its chunks starting where the whole clip's do - the same samples as the whole clip's, but for
     /// the codec's own rounding (1 in 32,768 on ~0.07% of the samples, as two whole runs of a clip differ)
-    fn make(&self, req: &AudioRequest, progress: &mut dyn FnMut(Step) -> Result<()>, mut chunk: Option<&mut dyn FnMut(&[f32]) -> Result<()>>)
+    fn make(&self, req: &AudioRequest, progress: &mut dyn FnMut(Step) -> Result<()>, mut chunk: Samples)
             -> Result<Audio> {
         let t0 = Instant::now();
         let s = self.spec(req)?;

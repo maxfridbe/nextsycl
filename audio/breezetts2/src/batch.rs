@@ -42,6 +42,11 @@ struct Job {
     t0: Instant,
 }
 
+/// A request checked: its spec, draws, frames at most
+type Prepared = (Spec, Drawing, usize);
+/// A request's branches: each its cache, its prompt's length, its last hidden state
+type Seqs = Vec<(Cache, usize, DevBuf)>;
+
 /// A request in the batch
 struct Live {
     job: Job,
@@ -129,7 +134,7 @@ impl AudioEngine for Batched {
 /// The batch thread: takes requests in as rows free up (in the order they came), advances those in hand a frame at
 /// a time, answers each at its end
 fn run(m: &BreezeTts2, rx: Receiver<Job>, rows: usize) {
-    let mut waiting: VecDeque<(Job, Option<(Spec, Drawing, usize)>)> = VecDeque::new();
+    let mut waiting: VecDeque<(Job, Option<Prepared>)> = VecDeque::new();
     let mut live: Vec<Live> = Vec::new();
     let mut bufs: Option<Bufs> = None;
     loop {
@@ -170,7 +175,8 @@ fn run(m: &BreezeTts2, rx: Receiver<Job>, rows: usize) {
                     used += n;
                     live.push(l);
                 }
-                Err((job, e)) => {
+                Err(b) => {
+                    let (job, e) = *b;
                     let _ = job.tx.send(Msg::Done(Err(e)));
                 }
             }
@@ -200,7 +206,7 @@ fn run(m: &BreezeTts2, rx: Receiver<Job>, rows: usize) {
 }
 
 /// What a request asks for, checked (a clone's recording encoded): its spec, draws, frames at most
-fn prepare(m: &BreezeTts2, req: &AudioRequest) -> Result<(Spec, Drawing, usize)> {
+fn prepare(m: &BreezeTts2, req: &AudioRequest) -> Result<Prepared> {
     let s = m.spec(req)?;
     let d = m.drawing(req)?;
     let seconds = req.seconds.unwrap_or(m.defaults().seconds);
@@ -211,9 +217,9 @@ fn prepare(m: &BreezeTts2, req: &AudioRequest) -> Result<(Spec, Drawing, usize)>
 }
 
 /// A request's prompt through the backbone, a branch at a time: it joins the batch
-fn join(m: &BreezeTts2, job: Job, (s, d, max): (Spec, Drawing, usize)) -> std::result::Result<Live, (Job, Error)> {
+fn join(m: &BreezeTts2, job: Job, (s, d, max): Prepared) -> std::result::Result<Live, Box<(Job, Error)>> {
     let _ = job.tx.send(Msg::Step(Step { phase: "prompt", at: 0, of: 1, seconds: job.t0.elapsed().as_secs_f64() }));
-    let r = (|| -> Result<(Vec<(Cache, usize, DevBuf)>, usize)> {
+    let r = (|| -> Result<(Seqs, usize)> {
         let (ops, h) = (&m.ops, m.bb.hidden);
         let mut seqs = Vec::new();
         let mut longest = 0;
@@ -239,7 +245,7 @@ fn join(m: &BreezeTts2, job: Job, (s, d, max): (Spec, Drawing, usize)) -> std::r
             let rng = Rng::new(job.req.seed);
             Ok(Live { job, s, d, rng, max, seen: Vec::new(), codes: Vec::new(), seqs })
         }
-        Err(e) => Err((job, e)),
+        Err(e) => Err(Box::new((job, e))),
     }
 }
 

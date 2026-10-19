@@ -336,7 +336,7 @@ impl Codec {
         }
         let s = (made - 1) / CHUNK * CHUNK;
         let ctx = if s > CONTEXT { CONTEXT } else { s };
-        made % CHUNK == 0 || BUCKETS.contains(&(made - s + ctx))
+        made.is_multiple_of(CHUNK) || BUCKETS.contains(&(made - s + ctx))
     }
 
     /// One chunk through the whole decoder

@@ -386,7 +386,7 @@ impl AudioServer {
 
     /// Runs a request: (JSON for response_format url or a streamed answer's end, else none) and the WAV's bytes;
     /// `stream`: the sound sent there as it is made
-    fn generate(&self, b: &Value, base: &str, mut stream: Option<&mut Out>) -> Result<(Option<Value>, Vec<u8>), (u16, String)> {
+    fn generate(&self, b: &Value, base: &str, stream: Option<&mut Out>) -> Result<(Option<Value>, Vec<u8>), (u16, String)> {
         let bad = |m: String| (400u16, m);
         if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model && *m != "MiniMaxAI/MiniMax-Music3" && !m.starts_with("Qwen/Qwen3-TTS")) {
             return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
@@ -570,7 +570,7 @@ impl AudioServer {
             }
             Ok(())
         };
-        let out = match stream.as_deref_mut() {
+        let out = match stream {
             Some(o) => {
                 o.rate = d.rate;
                 engine.generate_streamed(&req, &mut report, &mut |x| o.send(x).map_err(|e| nextsycl_core::Error(format!("the client is gone: {e}"))))
