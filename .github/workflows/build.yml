@@ -2,7 +2,7 @@
 #
 #   every push and pull request   build image -> ./build.sh -> ./build.sh test -> tarball artifact
 #   pushes to main                also publish the build image to the GitHub container registry, and a GitHub release
-#                                 v<version> with the tarball
+#                                 v<version> with the tarball; releases past the newest 10 are deleted with their tags
 #
 # The version is yy.mmdd.### from git (./version.sh): the commit's date, then its number among that day's commits.
 #
@@ -105,3 +105,18 @@ jobs:
           # every push to main is a release, tagged v<version> on the commit built
           if gh release view "v$NS_VERSION" >/dev/null 2>&1; then echo "v$NS_VERSION is out already"; exit 0; fi
           gh release create "v$NS_VERSION" "$PKG" "$PKG.sha256" --target "$GITHUB_SHA" --title "nextsycl $NS_VERSION" --generate-notes
+
+      # every push to main makes a release of ~hundreds of MB: keep the newest KEEP_RELEASES, delete the older ones
+      # with their tags (the commits stay; any of them can be rebuilt)
+      - name: Clean up old releases
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_RELEASES: "10"
+        run: |
+          gh release list --limit 1000 --json tagName,createdAt,isDraft,isPrerelease \
+            --jq '[.[] | select(.isDraft | not)] | sort_by(.createdAt) | reverse | .[env.KEEP_RELEASES | tonumber:] | .[].tagName' |
+          while read -r tag; do
+            echo "deleting release $tag"
+            gh release delete "$tag" --cleanup-tag --yes
+          done
