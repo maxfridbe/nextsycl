@@ -1534,6 +1534,14 @@ answer:   '9.9'
 The last `9` reads as certain (-0.0000) but chains to -0.0023: most of it from the thinking's two hesitant `9`s.
 Requests with it decode one token a pass (no draft block), a few small reads a layer more.
 
+Every entry also carries `chained_logprob` beside its `logprob`. GLM-5.3 and Qwen3.8-27B capture the attention (the
+27B: its 16 full-attention layers; `NS_Q35_CHAIN_HEADS=max` takes each position's most attentive head instead of the
+heads' mean). A first validation on the 27B (Q4, greedy, thinking; `chainval.py` in the session scratchpad, 58
+questions with known answers - facts, arithmetic, counting, primes, powers): 57 right. The one wrong answer (Tallinn
+first recorded 1219, for 1154) was raw p 1.0000, chained 0.9997 - the chain moved it, but the right answers moved as
+much (mean chained p 0.9993 with the heads' mean, 0.982 with their max on the harder 22). Too few wrong answers to say
+the chain tracks correctness better; a set the model gets wrong more often is the next step.
+
 ## Checking it
 
 - `nextsycl check <model> <dump dir>`: the forward pass against a llama.cpp dump (`reference/llama-dump`), every
