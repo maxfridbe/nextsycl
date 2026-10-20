@@ -7,7 +7,7 @@ arch: whisper
 title: 'Whisper large-v3-turbo (speech to text in 99 languages: segments and words timed, language detected; MIT)'
 about: 'OpenAI''s Whisper large-v3-turbo (809M): large-v3''s 32-layer encoder over 128 mel bands with the decoder pruned to 4 layers - the checkpoint''s own safetensors, half on the GPU. audio.transcribe: the text, segments timed by its timestamp tokens, each word timed by six alignment heads'' cross-attention (DTW), the language detected when not given; long recordings in 30 s windows (openai-whisper''s transcribe, greedy with its fallback). Translates into English too'
 gpus: '0'
-vram_gib: 2.5                   # 1.5 GiB of weights, the encoder's activations and attention table (to be measured)
+vram_gib: 2.5                   # the server loaded: 2.0 GiB on a B70 (1.5 GiB of weights, the windows' buffers, oneDNN)
 defaults: {}
 env: {}
 files:

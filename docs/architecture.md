@@ -72,6 +72,9 @@ audio/                     AUDIO
                                  (decoder, encoder, quantizers), stage checks
   voxtraltts nextsycl-audio-voxtraltts  Voxtral 4B TTS: the Ministral backbone, the flow-matching acoustic transformer,
                                  the Voxtral codec decoder from CrispASR's GGUF, the preset voices' prompt, stage checks
+  whisper    nextsycl-audio-whisper  Whisper large-v3-turbo, a recogniser (AudioEngine::transcribe): the log-mel, the
+                                 encoder and decoder on the shared kernels, openai's decoding rules and 30 s windows,
+                                 words timed by the alignment heads (docs/ports/whisper.md)
   example    nextsycl-audio-example  a template
 
 model3d/                   3D
