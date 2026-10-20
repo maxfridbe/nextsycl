@@ -86,7 +86,10 @@ impl Picture {
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let r = png::Decoder::new(std::io::BufReader::new(file)).read_info().map_err(|e| format!("{}: {e}", path.display()))?;
         let info = r.info();
-        Ok(info.uncompressed_latin1_text.iter().map(|t| (t.keyword.clone(), t.text.clone())).collect())
+        let mut out: Vec<(String, String)> = info.uncompressed_latin1_text.iter().map(|t| (t.keyword.clone(), t.text.clone())).collect();
+        // the settings that are not Latin-1 (a prompt in Chinese): iTXt
+        out.extend(info.utf8_text.iter().filter_map(|t| Some((t.keyword.clone(), t.get_text().ok()?))));
+        Ok(out)
     }
 
     /// Write as PNG, with `text` as tEXt chunks (the prompt, seed, steps... that made it)
@@ -107,7 +110,12 @@ impl Picture {
         enc.set_color(if self.channels == 4 { png::ColorType::Rgba } else { png::ColorType::Rgb });
         enc.set_depth(png::BitDepth::Eight);
         for (k, v) in text {
-            enc.add_text_chunk(k.to_string(), v.clone()).map_err(|e| e.to_string())?;
+            // tEXt holds Latin-1 only: other text (a prompt in Chinese) goes as iTXt, UTF-8
+            if v.chars().all(|c| (c as u32) < 0x100) {
+                enc.add_text_chunk(k.to_string(), v.clone()).map_err(|e| e.to_string())?;
+            } else {
+                enc.add_itxt_chunk(k.to_string(), v.clone()).map_err(|e| e.to_string())?;
+            }
         }
         let mut w = enc.write_header().map_err(|e| e.to_string())?;
         w.write_image_data(&self.data).map_err(|e| e.to_string())
@@ -117,6 +125,16 @@ impl Picture {
 #[cfg(test)]
 mod tests {
     use super::Picture;
+
+    #[test]
+    fn text_outside_latin1_goes_as_itxt() {
+        let p = Picture::new(2, 2, 3);
+        let f = std::env::temp_dir().join(format!("ns-itxt-{}.png", std::process::id()));
+        p.write_png(&f, &[("prompt", "带透明通道，一个仙人掌".into()), ("seed", "5".into())]).unwrap();
+        let t = Picture::png_text(&f).unwrap();
+        std::fs::remove_file(&f).ok();
+        assert!(t.contains(&("prompt".into(), "带透明通道，一个仙人掌".into())) && t.contains(&("seed".into(), "5".into())), "{t:?}");
+    }
 
     #[test]
     fn png_round_trip() {
