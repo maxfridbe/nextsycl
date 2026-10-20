@@ -59,7 +59,14 @@ pub const METHODS: &[Method] = &[
     Method { kind: "system", name: "files.delete", summary: "Delete a file: a picture, a song or speech, a clip (with its record, last frame, latents and sound tail; not while it is made) or an upload (ref_...)",
              fields: &[("kind", r#"{"type": "string", "enum": ["image", "audio", "video", "model3d"]}"#, "", true), ("name", "string", "the file's name; a clip: h3_... with or without .mp4", true)],
              example: r#"{"kind": "video", "name": "h3_20261011_220723"}"# },
-    Method { kind: "system", name: "models", summary: "Every registered model: kind, enabled, its GPUs, its state (disabled, unloaded, loading, loaded, busy, ready), what it can do (capabilities, methods)", fields: &[], example: "{}" },
+    Method { kind: "system", name: "models", summary: "Every registered model: kind, enabled, its GPUs, its state (disabled, unloaded, loading, loaded, busy, ready), what it can do (capabilities, methods); downloaded: true. Then every model a card offers that is not downloaded: downloaded: false, state not_downloaded, enabled false, bytes, the drive and folder it would go to, fits, its download under way (pull) - system.models.pull fetches one",
+             fields: &[], example: "{}" },
+    Method { kind: "system", name: "models.pull", summary: "Download a model a card offers (system.models: downloaded false), in the background: its files fetched (or linked when the machine has them; a partial file resumed), each SHA-256 checked, then the model registered and enabled. Into the first models folder with the room (NS_MODELS, then NS_MODEL_DIRS, then each drive's); one download at a time a folder (a second waits, queued). Answers at once with the download (system.models.pulls follows it)",
+             fields: &[("model", "string", "the card's id (system.models, downloaded false)", true)], example: r#"{"model": "qwen-image-2.1-q8"}"# },
+    Method { kind: "system", name: "models.pulls", summary: "The downloads under way and the last ones, newest first: model, state (queued, downloading, verifying, done, failed, cancelled), bytes_done, bytes_total, pct, speed (bytes a second), eta_s, drive, folder, error",
+             fields: &[], example: "{}" },
+    Method { kind: "system", name: "models.pull.cancel", summary: "Stop a model's download: curl stopped, what it fetched kept (a pull again resumes it), nothing registered",
+             fields: &[("model", "string", "the model being downloaded", true)], example: r#"{"model": "qwen-image-2.1-q8"}"# },
     Method { kind: "system", name: "cards", summary: "The GPUs, one neutral list: name, memory (total, used, free, and what the enabled models are counted for), load, power, temperature, the models and processes on each",
              fields: &[], example: "{}" },
     Method { kind: "system", name: "enable", summary: "Offer a model on GPU(s): it loads on its first request and unloads when idle; chat models join Open WebUI's list",
@@ -442,6 +449,14 @@ fn openai_error(s: &mut Conn, st: u16, m: &str) {
         let extra = format!("Retry-After: {}\r\n", crate::gpulock::RETRY_AFTER_S);
         return http::respond_bytes(s, st, "application/json", body.to_string().as_bytes(), &extra);
     }
+    // a model not downloaded says so (code model_not_downloaded, its size, the call)
+    if let Some((f, words)) = super::pulls::untag(m) {
+        let mut e = json!({"message": words, "type": "model_not_downloaded", "code": "model_not_downloaded"});
+        if let (Some(o), Some(f)) = (e.as_object_mut(), f.as_object()) {
+            o.extend(f.clone());
+        }
+        return http::respond(s, st, &json!({"error": e}));
+    }
     http::respond(s, st, &json!({"error": {"message": m, "type": if st == 401 { "invalid_api_key" } else { "invalid_request_error" }}}));
 }
 
@@ -455,6 +470,14 @@ pub(crate) fn error_of(status: u16, m: &str) -> Value {
 /// An /rpc error in full: error_of with the method, the request key at fault when the message starts with one
 /// ("steps 8: ...", "images[0]: ...", "voice bogus: ..."), and a code of its own where the status's is too broad
 pub(crate) fn rpc_error(method: &str, status: u16, code: Option<&str>, m: &str) -> Value {
+    // a model a card offers that is not downloaded (pulls.rs): its own code and what fetches it
+    if let Some((fields, words)) = super::pulls::untag(m) {
+        let mut e = rpc_error(method, status, Some("model_not_downloaded"), &words);
+        if let (Some(o), Some(f)) = (e.as_object_mut(), fields.as_object()) {
+            o.extend(f.clone());
+        }
+        return e;
+    }
     let mut e = error_of(status, m);
     // a job refused with queue: false says "busy: ..." (as video's busy)
     let code = code.or_else(|| (status == 409 && m.starts_with("busy:")).then_some("busy"));
@@ -572,6 +595,9 @@ impl Home {
                 Some(m) if registry::kind_of(m) != kind => Err((400, format!("{id} is a {} model, not {kind}", registry::kind_of(m)))),
                 Some(m) if m["enabled"] == false => Err((409, format!("{id} is disabled (system.enable)"))),
                 Some(_) => Ok(id.to_string()),
+                // a card's model not here yet: refused (409 model_not_downloaded), or with NS_AUTO_PULL fetched first -
+                // a job's request id lets it say so while it waits
+                None if self.not_downloaded(id).is_some() => self.need_downloaded(id, body["request_id"].as_str(), true).map(|_| id.to_string()),
                 None => Err((404, format!("no model {id} (system.models)"))),
             };
         }
@@ -605,7 +631,8 @@ impl Home {
     /// voice or a recording, the built-in voices' for a voice, the voice-design one for instructions alone; the
     /// loaded one first
     pub(super) fn speech_model(&self, b: &Value, all: &[Value]) -> Result<String, Fail> {
-        if b["model"].as_str().is_some_and(|m| all.iter().any(|x| x["id"] == m)) {
+        // one named that is here, or a card's not downloaded yet (pick refuses or fetches it)
+        if b["model"].as_str().is_some_and(|m| all.iter().any(|x| x["id"] == m) || self.not_downloaded(m).is_some()) {
             return self.pick("audio", b, all);
         }
         let voice = s(b, "voice");
@@ -700,7 +727,15 @@ impl Home {
                 return Err((400, format!("{name} needs \"{f}\"")));
             }
         }
-        if !self.kinds_on(all).contains(&m.kind) {
+        // a model named that a card offers and is not downloaded: refused now (409 model_not_downloaded), or with
+        // NS_AUTO_PULL its download started and the request let through (its kind is on once it lands; pick waits)
+        if m.kind != "system" {
+            if let Some(id) = b["model"].as_str().filter(|id| !all.iter().any(|x| x["id"] == *id) && self.not_downloaded(id).is_some()) {
+                self.need_downloaded(id, None, false)?;
+                return Ok(m);
+            }
+        }
+        if !self.kinds_on(all).contains(&m.kind) && !self.pulling(m.kind) {
             return Err((409, format!("no {} model is enabled (system.enable)", m.kind)));
         }
         Ok(m)
@@ -872,8 +907,21 @@ impl Home {
             ("system", "files.stat" | "files.delete") => self.file_op(m.name, b),
             ("system", "models") => {
                 let cards = self.named_cards(&all);
-                Ok(json!({"models": self.model_states(&all, &cards)}))
+                // the registered ones (downloaded), then the cards' that are not downloaded (added: no field renamed)
+                let mut models = self.model_states(&all, &cards);
+                for m in models.iter_mut() {
+                    m["downloaded"] = json!(true);
+                }
+                for mut nd in self.not_downloaded_all() {
+                    nd["state"] = json!("not_downloaded");
+                    nd["enabled"] = json!(false);
+                    models.push(nd);
+                }
+                Ok(json!({"models": models}))
             }
+            ("system", "models.pull") => self.pull_start(&model()).map(|p| json!({"pull": p.view()})),
+            ("system", "models.pulls") => Ok(json!({"pulls": self.pulls_view(), "auto_pull": self.auto_pull()})),
+            ("system", "models.pull.cancel") => self.pull_cancel(&model()),
             ("system", "cards") => Ok(self.cards_view(&all)),
             ("system", "enable") => self.enable(&model(), b.get("gpus")).map(|t| json!({"model": model(), "title": t, "enabled": true})),
             ("system", "gpus") => self.set_gpus(&model(), b.get("gpus")),
@@ -1408,8 +1456,11 @@ impl Home {
                 Ok(())
             }
             ("POST", "/v1/chat/completions") => {
-                need("llm")?;
                 let model = serde_json::from_slice::<Value>(&req.body).ok().and_then(|v| v["model"].as_str().map(str::to_string));
+                // a card's model not downloaded is said as such (chat_target refuses or fetches it), not "none enabled"
+                if !model.as_deref().is_some_and(|m| self.not_downloaded(m).is_some()) {
+                    need("llm")?;
+                }
                 let t = self.chat_target(model.as_deref())?;
                 let r = pass(s, &t);
                 if let Some(secs) = crate::switch::keep_up_s(&req.head) {
@@ -1421,7 +1472,6 @@ impl Home {
             }
             ("POST", p @ ("/v1/images/generations" | "/v1/images/edits" | "/v1/audio/speech")) => {
                 let kind = if p.starts_with("/v1/images") { "image" } else { "audio" };
-                need(kind)?;
                 // the model the body names (a JSON field, or a multipart part)
                 let ctype = http::header(&req.head, "content-type").unwrap_or_default();
                 let named = if let Some(b) = ctype.split("boundary=").nth(1) {
@@ -1430,6 +1480,15 @@ impl Home {
                 } else {
                     serde_json::from_slice::<Value>(&req.body).ok().and_then(|v| v["model"].as_str().map(str::to_string))
                 };
+                // a card's model not downloaded: refused (409 model_not_downloaded), or with NS_AUTO_PULL fetched first
+                let fetched = named.as_deref().filter(|n| self.not_downloaded(n).is_some()).map(str::to_string);
+                if let Some(n) = &fetched {
+                    self.need_downloaded(n, None, true)?;
+                }
+                let all = if fetched.is_some() { self.models() } else { all.clone() };
+                if fetched.is_none() {
+                    need(kind)?;
+                }
                 // OpenAI's own names (dall-e-3, tts-1 ...) mean "the kind's model"
                 let named = named.filter(|n| all.iter().any(|m| m["id"] == n.as_str()));
                 // speech with a voice or a recording and no model of ours named: the speech model for it
@@ -1469,8 +1528,15 @@ impl Home {
                 Ok(())
             }
             ("POST", p @ ("/v1/model3d/generate" | "/v1/model3d/rig")) => {
-                need("model3d")?;
                 let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                // a card's 3D model not downloaded: refused, or with NS_AUTO_PULL fetched first
+                let fetched = body["model"].as_str().filter(|n| self.not_downloaded(n).is_some()).map(str::to_string);
+                if let Some(n) = &fetched {
+                    self.need_downloaded(n, None, true)?;
+                } else {
+                    need("model3d")?;
+                }
+                let all = if fetched.is_some() { self.models() } else { all.clone() };
                 let named = body["model"].as_str().filter(|n| all.iter().any(|m| m["id"] == *n)).map(str::to_string);
                 let want = if p.ends_with("/rig") { "rig" } else { "generate" };
                 let id = match named {
@@ -1533,7 +1599,7 @@ impl Home {
         let envelope = json!({"type": "object", "properties": {
             "ok": {"type": "boolean"}, "result": {"description": "the method's answer"},
             "error": {"type": "object", "required": ["code", "message", "retryable", "status"], "description": "ok false: everything about the failure (the HTTP status is 200 all the same)", "properties": {
-                "code": {"type": "string", "description": "the convention to branch on (the list in the description above): invalid_request, invalid_params, unauthorized, not_found, conflict, busy, not_running, no_room, cancelled, unavailable, timeout, request_too_large, internal"},
+                "code": {"type": "string", "description": "the convention to branch on (the list in the description above): invalid_request, invalid_params, unauthorized, not_found, conflict, busy, not_running, model_not_downloaded, no_room, cancelled, unavailable, timeout, request_too_large, internal"},
                 "message": {"type": "string", "description": "what was wrong, in words: the value, the limit or the nearest legal one, what to do"},
                 "retryable": {"type": "boolean", "description": "true: the same call may work later unchanged (no_room, unavailable, timeout, busy); false: change the request"},
                 "status": {"type": "integer", "description": "the code's number by convention (400, 404, 409, 499, 502, 503 ...): in the body, not the HTTP status, so another transport carries it"},

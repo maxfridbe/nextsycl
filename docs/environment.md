@@ -44,6 +44,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_API_TOKEN` | made once, kept in serve.json beside the registry | the front door API's bearer token; `audio voices design` uses it to call the front door | serve, cli (audio) |
 | `NS_AUDIO_PORT` | 8087 | the audio server's port, as the front door reaches it | serve |
 | `NS_AUDIO_PORT2` | 8097 | the second audio server's port (`audio start --slot 1`): a model enabled on two cards runs on both while its work keeps the first busy; 0: one server | serve |
+| `NS_AUTO_PULL` | 0 | 1: a request naming a model a card offers that is not downloaded starts its download (`system.models.pull`) and waits for it, a job saying `downloading <model>: N%`; 0: it is refused 409 `model_not_downloaded` (error.model, bytes, fits, pull). Read on every request, so the page's checkbox needs no restart | serve |
 | `NS_MODEL3D_PORT` | 8088 | the 3D server's port, as the front door reaches it | serve |
 | `NS_MODEL3D_PORT2` | 8098 | the second 3D server's port (`model3d start --slot 1`), as `NS_AUDIO_PORT2` | serve |
 | `NS_SPEECH_NORMALIZE` | 1 | 0: speech's text as sent (by default math and code symbols are said as words - √ "square root of", = "equals", d_k "d sub k" - and markdown's marks dropped; a request's `normalize: false` too) | serve (audio) |

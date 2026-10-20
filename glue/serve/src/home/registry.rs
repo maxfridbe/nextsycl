@@ -26,6 +26,11 @@ pub trait Store: Send + Sync {
     fn cards(&self) -> Vec<Value> {
         Vec::new()
     }
+    /// a card's files as `nextsycl models pull` lays them out: (path under the models folder, bytes); empty: no such
+    /// card (pulls.rs: what a download is and how far it is)
+    fn card_files(&self, _id: &str) -> Vec<(String, u64)> {
+        Vec::new()
+    }
 }
 
 impl<T: Store + ?Sized> Store for Box<T> {
@@ -52,6 +57,9 @@ impl<T: Store + ?Sized> Store for Box<T> {
     }
     fn cards(&self) -> Vec<Value> {
         (**self).cards()
+    }
+    fn card_files(&self, id: &str) -> Vec<(String, u64)> {
+        (**self).card_files(id)
     }
 }
 

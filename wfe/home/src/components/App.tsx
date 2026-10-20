@@ -1,8 +1,8 @@
 /** The page: the host strip and the tabs - Status (the GPUs with what holds them and what is vouched for them, the
  *  models by kind with enable / start / stop, the front ends, the actions' output) and API. */
 import { jsx } from "../jsx.js";
-import { act, copy, maintenance, render, setTab, ui } from "../main.js";
-import type { Card, Model, Proc, Service } from "../types.js";
+import { act, autoPull, copy, maintenance, render, setTab, ui } from "../main.js";
+import type { Available, Card, Model, Proc, Service } from "../types.js";
 import { Api } from "./Api.js";
 import { ConfigView } from "./Config.js";
 import { DrivesPanel, ModelDisk } from "./Drives.js";
@@ -229,6 +229,75 @@ function Models() {
   );
 }
 
+const GIB = 1024 ** 3;
+const size = (b: number) => `${(b / GIB).toFixed(1)} GiB`;
+const KIND_TITLE: Record<string, string> = { llm: "Chat", image: "Images", audio: "Audio", video: "Video", model3d: "3D" };
+const eta = (s: number | null) => s == null ? "" : s >= 3600 ? `${(s / 3600).toFixed(1)} h` : s >= 60 ? `${Math.round(s / 60)} min` : `${Math.round(s)} s`;
+
+/** A model a card offers that is not here: its size and where it would go, a Download button - or its download's
+ *  progress with a cancel, or the last one's error */
+function AvailableRow(a: Available) {
+  const p = ui.pending[a.id];
+  const d = a.pull;
+  const last = (ui.state?.pulls ?? []).find((x) => x.model === a.id);
+  const failed = !d && last && last.state === "failed" ? last : null;
+  const going = !!d && !["done", "failed", "cancelled"].includes(d.state);
+  return (
+    <div class="mrow off">
+      <span class={{ dot: true, off: !going, busy: going }} />
+      <div class="mname">
+        <div class="name">{a.title ?? a.id}</div>
+        <div class="sub">{a.id} · {size(a.bytes)} · to {a.drive}{a.fits ? "" : <span class="bad"> - not enough room ({size(a.free)} free)</span>}</div>
+        {going && d
+          ? <div>
+              <div class="meter" attrs={{ title: `${size(d.bytes_done)} of ${size(d.bytes_total)}` }}>
+                <i style={{ width: `${d.pct}%`, background: color(a.kind) }} />
+              </div>
+              <div class="hint">{d.state === "queued" ? "queued behind another download to the same folder"
+                : d.state === "verifying" ? "checking its SHA-256…"
+                : `${d.pct}% · ${size(d.bytes_done)} of ${size(d.bytes_total)}${d.speed > 0 ? ` · ${(d.speed / 1e6).toFixed(0)} MB/s` : ""}${d.eta_s ? ` · ${eta(d.eta_s)} left` : ""}`}</div>
+            </div>
+          : null}
+        {failed ? <div class="hint bad" attrs={{ title: failed.error ?? "" }}>the last download failed: {failed.error}</div> : null}
+      </div>
+      <div class="mstate"><span class="tag">{going ? (d?.state ?? "downloading") : "not downloaded"}</span></div>
+      <div class="acts">
+        {going
+          ? <button class="ghost" attrs={{ disabled: !!p, title: "stop it: what was fetched is kept, a download again resumes it" }}
+              on={{ click: () => void act("pull_cancel", a.id) }}>{p ? <span class="spin" /> : null}cancel</button>
+          : <button attrs={{ disabled: !!p || !a.fits, title: a.fits ? `download ${size(a.bytes)} into ${a.folder}, check it, and register it (enabled)` : "no models folder has the room (NS_MODEL_DIRS adds folders)" }}
+              on={{ click: () => void act("pull", a.id) }}>{p ? <span class="spin" /> : <span class="i" props={{ innerHTML: "&#xf019;" }} />} {failed ? "retry" : "download"}</button>}
+      </div>
+    </div>
+  );
+}
+
+function NotDownloaded() {
+  const st = ui.state;
+  const list = st?.available ?? [];
+  if (!st || !list.length) return null;
+  const kinds = [...new Set(list.map((a) => a.kind))];
+  return (
+    <section class="panel">
+      <div class="phead"><span class="i" props={{ innerHTML: "&#xf019;" }} /><span class="ptitle">Not downloaded</span>
+        <span class="hint">the models a card offers that are not here · a request for one answers model_not_downloaded, unless:</span>
+        <label class="hint" attrs={{ title: "NS_AUTO_PULL: a request for one of these starts its download and waits for it (a job says downloading <model>: N%) - no restart needed" }}>
+          <input attrs={{ type: "checkbox" }} props={{ checked: st.auto_pull }} on={{ change: (e: Event) => void autoPull((e.target as HTMLInputElement).checked) }} />
+          {" "}download automatically when a request needs one
+        </label>
+      </div>
+      <div class="pbody">
+        {kinds.map((k) => (
+          <div class="kind">
+            <h4 style={{ color: color(k) }}>{KIND_TITLE[k] ?? k}<span class="hint"> {list.filter((a) => a.kind === k).length} to download</span></h4>
+            {list.filter((a) => a.kind === k).map(AvailableRow)}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function ServiceRow(s: Service) {
   return (
     <div class="svc">
@@ -273,6 +342,7 @@ function Status() {
       </section>
       <DrivesPanel />
       <Models />
+      <NotDownloaded />
       <section class="panel">
         <div class="phead"><span class="i" props={{ innerHTML: "&#xf233;" }} /><span class="ptitle">Front ends</span></div>
         <div class="pbody">{(st?.services ?? []).map(ServiceRow)}</div>
