@@ -155,6 +155,7 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             }
             (c, vec!["image.generate", "image.edit"])
         }
+        "audio" if arch == "whisper" => (vec!["transcribe", "speech_to_text", "word_timestamps", "language_detection", "translate_to_english"], vec!["audio.transcribe"]),
         "audio" if m["speech"].is_array() => {
             let mut c = vec!["speech"];
             if speech("voices") {
@@ -1252,6 +1253,15 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recogniser_transcribes_and_speaks_nothing() {
+        let (caps, methods) = capabilities(&json!({"id": "whisper-large-v3-turbo", "kind": "audio", "arch": "whisper"}));
+        assert_eq!(methods, vec!["audio.transcribe"]);
+        assert!(caps.contains(&"word_timestamps") && !caps.contains(&"speech"));
+        let (_, methods) = capabilities(&json!({"id": "voxcpm2", "kind": "audio", "arch": "voxcpm2", "speech": ["clone"]}));
+        assert!(methods.contains(&"audio.speak") && !methods.contains(&"audio.transcribe"));
+    }
 
     #[test]
     fn a_load_under_way_counts_what_it_has_yet_to_take() {

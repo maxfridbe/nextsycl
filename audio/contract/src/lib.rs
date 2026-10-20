@@ -1,5 +1,6 @@
 //! The contract between the audio server / command line and the audio engines. An engine is one model architecture's
-//! whole pipeline - from a description (and lyrics, for songs) to a waveform - with its own kernels
+//! whole pipeline - from a description (and lyrics, for songs) to a waveform, or (a recogniser) from a recording to
+//! its transcript - with its own kernels
 //! (`kernels/audio/<arch>`) and memory plan. The program drives it only through `AudioEngine`; it is chosen by the
 //! architecture its registry entry names (`AudioKind`).
 
@@ -47,6 +48,59 @@ pub struct Reference {
     pub samples: Vec<f32>,
     pub rate: u32,
     pub text: Option<String>,
+}
+
+/// A recording to write down (a recogniser: `AudioEngine::recogniser` Some)
+#[derive(Clone, Debug, Default)]
+pub struct TranscribeRequest {
+    /// mono samples at `rate` (any rate: the engine resamples)
+    pub samples: Vec<f32>,
+    pub rate: u32,
+    /// the language spoken (a code or a name; None or "auto": the engine's guess)
+    pub language: Option<String>,
+    /// translate into English instead of writing down what is said
+    pub translate: bool,
+    /// the words' times too (each word's start and end)
+    pub words: bool,
+    /// text that leads the first window (names, spelling, style) - the decoder's prompt
+    pub prompt: Option<String>,
+    /// the engine's own options for this request, by name (as `AudioRequest::extra`)
+    pub extra: Given,
+}
+
+/// A stretch of a transcript: a segment, or a word
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Timed {
+    /// seconds from the start of the recording
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    /// a word: the model's mean probability of its tokens
+    pub probability: Option<f32>,
+}
+
+/// What a recogniser heard
+#[derive(Clone, Debug, Default)]
+pub struct Transcript {
+    pub text: String,
+    /// the language it wrote down (a code: "en")
+    pub language: String,
+    pub segments: Vec<Timed>,
+    /// empty unless asked for (`TranscribeRequest::words`)
+    pub words: Vec<Timed>,
+    /// seconds of recording
+    pub duration: f64,
+}
+
+/// What a recogniser takes
+#[derive(Clone, Debug, Default)]
+pub struct Recogniser {
+    /// the languages it writes down (codes)
+    pub languages: Vec<String>,
+    /// whether it times the words
+    pub words: bool,
+    /// whether it translates into English
+    pub translate: bool,
 }
 
 /// What a speech engine takes
@@ -369,6 +423,14 @@ pub trait AudioEngine: Send + Sync {
     fn load_seconds(&self) -> f64;
     /// make the request's sound, reporting as it goes; an error from `progress` stops it (a cancel)
     fn generate(&self, req: &AudioRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Audio>;
+    /// a recogniser's languages and abilities (None: it makes sound, it does not listen)
+    fn recogniser(&self) -> Option<Recogniser> {
+        None
+    }
+    /// write a recording down (a recogniser), reporting as it goes; an error from `progress` stops it
+    fn transcribe(&self, _req: &TranscribeRequest, _progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Transcript> {
+        Err(Error(format!("{} makes sound; it does not transcribe (audio.transcribe needs a recogniser: whisper)", self.arch())))
+    }
     /// how many requests it makes together: `generate` is then called from that many threads at once (an engine
     /// that batches advances them in the same steps - several clips a frame); 1: one at a time
     fn batch(&self) -> usize {

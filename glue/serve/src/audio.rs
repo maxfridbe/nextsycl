@@ -14,6 +14,11 @@
 //!                                 rate in X-Sample-Rate), stream_format: sse - speech.audio.delta events (base64
 //!                                 16-bit PCM), then speech.audio.done with the file's link (an engine that does not
 //!                                 stream sends its sound whole at the end)
+//!   POST /v1/audio/transcriptions a recording written down (a recogniser: whisper): {audio (base64 of WAV, MP3, FLAC, Ogg,
+//!                                 M4A, or a data URL), language (a code or a name; none: detected), words (bool, true:
+//!                                 each word timed), translate (into English), prompt (text leading the first window),
+//!                                 options} -> {text, language, duration, segments [{start, end, text}], words [{start,
+//!                                 end, text, probability}], nextsycl: {took, wh}} (JSON only, no multipart form)
 //!   GET  /v1/audio/files/<f>      a song made here (saved in the output directory; byte ranges for seeking)
 //!   POST /api/cancel              stops the request running (between frames or steps)
 //!   GET  /v1/models, /health
@@ -227,6 +232,17 @@ impl AudioServer {
                     Err(m) => http::respond_with(&mut s, 400, &err(m), &cors),
                 }
             }
+            ("POST", "/v1/audio/transcriptions") | ("POST", "/audio/transcriptions") => {
+                let body: Value = match serde_json::from_slice(&req.body) {
+                    Ok(v) => v,
+                    Err(e) => return http::respond_with(&mut s, 400, &err(format!("the body is not JSON (a multipart form is not read here): {e}")), &cors),
+                };
+                match self.transcribe(&body) {
+                    Ok(v) => http::respond_with(&mut s, 200, &v, &cors),
+                    Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
+                }
+                self.maybe_retire();
+            }
             ("POST", "/v1/audio/speech") | ("POST", "/audio/speech") => {
                 let body: Value = match serde_json::from_slice(&req.body) {
                     Ok(v) => v,
@@ -316,6 +332,7 @@ impl AudioServer {
         let d = e.defaults();
         json!({
             "model": self.model, "arch": e.arch(), "lyrics": e.lyrics(), "wfe": self.wfe.is_some(),
+            "recogniser": e.recogniser().map(|r| json!({"languages": r.languages, "words": r.words, "translate": r.translate})),
             "speech": e.speech().map(|sp| json!({"voices": sp.voices, "languages": sp.languages, "instructions": sp.instructions, "design": sp.design,
                                                  "clone": sp.clone, "clone_needs_text": sp.clone_needs_text, "clone_takes_text": sp.clone_takes_text,
                                                  "direction": sp.direction, "events": sp.events, "requires": sp.requires,
@@ -382,6 +399,79 @@ impl AudioServer {
             None => from.to_string(),
         };
         lib.add(name, &bytes, text.as_deref(), description.as_deref(), language.as_deref(), kind, &from, b["replace"] == true)
+    }
+
+    /// A recording written down: the engine's transcript as JSON
+    fn transcribe(&self, b: &Value) -> Result<Value, (u16, String)> {
+        let bad = |m: String| (400u16, m);
+        if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model && !m.starts_with("openai/whisper") && *m != "whisper-1") {
+            return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
+        }
+        let a = b["audio"].as_str().or_else(|| b["file"].as_str()).filter(|x| !x.trim().is_empty())
+            .ok_or_else(|| bad("audio (the recording: base64 or a data URL): required".into()))?;
+        let bytes = http::unbase64(a).map_err(|e| bad(format!("audio: {e}")))?;
+        let (samples, rate) = nextsycl_audio::decode_audio(&bytes).map_err(|e| bad(format!("audio: {e}")))?;
+        let text = |k: &str| b[k].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+        // OpenAI's timestamp_granularities ["word"] asks for the words too
+        let words = b["words"].as_bool().unwrap_or(true)
+            || b["timestamp_granularities"].as_array().is_some_and(|g| g.iter().any(|x| x == "word"));
+        let given: nextsycl_core::options::Given = b["options"].as_object().into_iter().flatten()
+            .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect();
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let engine = self.engine.read().unwrap_or_else(|p| p.into_inner());
+        let _slot = Slot::take(&self.slots, 1);
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        let Some(_running) = self.cancel.begin(b["request_id"].as_str()) else {
+            return Err((499, "cancelled".into()));
+        };
+        if engine.recogniser().is_none() {
+            return Err(bad(format!("{} makes sound; it does not transcribe (audio.transcribe needs a recogniser: whisper-large-v3-turbo)", self.model)));
+        }
+        let mut req = nextsycl_audio::TranscribeRequest { samples, rate, language: text("language"), translate: b["translate"] == true || b["task"] == "translate",
+                                                          words, prompt: text("prompt"), extra: Default::default() };
+        if !given.is_empty() {
+            nextsycl_core::options::resolve(&given, engine.options(), nextsycl_core::At::Request, &self.model).map_err(bad)?;
+            req.extra = nextsycl_core::options::by_name(&given, engine.options());
+        }
+        let secs = req.samples.len() as f64 / req.rate.max(1) as f64;
+        let t0 = Instant::now();
+        let j0 = self.tele.joules();
+        let p = &self.progress;
+        let what = format!("{secs:.1} s of recording");
+        *p.lock().unwrap() = json!({"busy": true, "prompt": what, "phase": "listen", "at": 0, "of": 1, "seconds": 0});
+        let out = engine.transcribe(&req, &mut |st| {
+            *p.lock().unwrap() = json!({"busy": true, "prompt": what, "phase": st.phase, "at": st.at, "of": st.of, "seconds": st.seconds});
+            if self.cancel.stopping() {
+                return Err(nextsycl_core::Error("cancelled".into()));
+            }
+            Ok(())
+        });
+        *p.lock().unwrap() = json!({"busy": false});
+        drop(engine);
+        if let Err(e) = &out {
+            if gpu_failed(&e.0) {
+                eprintln!("nextsycl audio: a GPU error ({}) - ending after this answer", e.0);
+                self.retire.store(true, Ordering::Relaxed);
+            }
+        }
+        let t = out.map_err(|e| (if e.0 == "cancelled" { 499 } else { 400 }, e.0))?;
+        let took = t0.elapsed().as_secs_f64();
+        let wh = match (j0, self.tele.joules()) {
+            (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
+            _ => None,
+        };
+        let r = |x: f64| (x * 100.0).round() / 100.0;
+        let timed = |v: &[nextsycl_audio::Timed]| -> Vec<Value> {
+            v.iter().map(|x| {
+                let mut o = json!({"start": r(x.start), "end": r(x.end), "text": x.text});
+                if let Some(pr) = x.probability {
+                    o["probability"] = json!((pr as f64 * 1000.0).round() / 1000.0);
+                }
+                o
+            }).collect()
+        };
+        Ok(json!({"model": self.model, "text": t.text, "language": t.language, "duration": r(t.duration), "segments": timed(&t.segments), "words": timed(&t.words),
+                  "created": now(), "nextsycl": {"took": took, "wh": wh, "seconds": r(t.duration)}}))
     }
 
     /// Runs a request: (JSON for response_format url or a streamed answer's end, else none) and the WAV's bytes;

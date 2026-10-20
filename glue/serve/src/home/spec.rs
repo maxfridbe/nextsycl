@@ -57,6 +57,17 @@ fn meshes() -> String {
   "run": {{"type": "object", "description": "how it was made (the /v1 routes call this nextsycl)", "properties": {{"took": {{"type": "number"}}, "seed": {{"type": "integer"}}, "wh": {{"type": "number", "nullable": true}}, "triangles": {{"type": "integer"}}}}}}}}}}"#)
 }
 
+/// audio.transcribe (and /v1/audio/transcriptions)
+fn transcript() -> String {
+    let timed = r#"{"type": "object", "properties": {"start": {"type": "number", "description": "seconds from the recording's start"}, "end": {"type": "number"}, "text": {"type": "string"},
+    "probability": {"type": "number", "description": "words: the model's mean probability of the word's tokens"}}}"#;
+    format!(r#"{{"type": "object", "properties": {{"model": {{"type": "string"}}, "text": {{"type": "string", "description": "the whole transcript"}},
+  "language": {{"type": "string", "description": "the language written down (a code: en), detected or as asked"}}, "duration": {{"type": "number", "description": "seconds of recording"}},
+  "segments": {{"type": "array", "items": {timed}, "description": "stretches timed by the model's timestamp tokens"}},
+  "words": {{"type": "array", "items": {timed}, "description": "each word timed by the alignment heads' attention (empty with words: false)"}},
+  "created": {{"type": "integer"}}, "run": {{"type": "object", "properties": {{"took": {{"type": "number"}}, "wh": {{"type": "number", "nullable": true}}, "seconds": {{"type": "number"}}}}}}}}}}"#)
+}
+
 /// audio.generate / audio.speak (and /v1/audio/speech with response_format url)
 fn sound() -> String {
     format!(r#"{{"type": "object", "properties": {{"created": {{"type": "integer"}}, "data": {{"type": "array", "items": {SOUND_ITEM}}},
@@ -290,6 +301,8 @@ pub fn result(method: &str) -> Option<String> {
         "audio.history" => format!(r#"{{"type": "object", "properties": {{"data": {{"type": "array", "description": "newest first (200 at most); url server-relative (/v1/audio/files/<file>, the same route here)", "items": {SOUND_ITEM}}}}}}}"#),
         "audio.generate" | "audio.speak" => format!(r#"{{"oneOf": [{{"allOf": [{}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the sound, and the job"}},
   {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (audio.status {{label}} for the rest)"}}]}}"#, sound()),
+        "audio.transcribe" => format!(r#"{{"oneOf": [{{"allOf": [{}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the transcript, and the job"}},
+  {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (audio.status {{label}} for the rest)"}}]}}"#, transcript()),
         "audio.voices.list" => format!(r#"{{"type": "object", "properties": {{"voices": {{"type": "array", "items": {VOICE}}}}}}}"#),
         "audio.voices.add" | "audio.voices.design" => format!(r#"{{"type": "object", "properties": {{"voice": {VOICE}, "sample": {{"type": "string", "description": "the sample's URL"}},
   "seed": {{"type": "integer", "description": "design: the seed it was read with"}}}}}}"#),
@@ -376,7 +389,8 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
                            (409, "conflict", "the model is loaded or loading (stop it first), a process has its files open, or the drive lacks the room"),
                            (409, "busy", "another move runs, or a drive is being measured")],
         "system.move.cancel" => &[(409, "conflict", "no move is under way")],
-        "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.voices.design" | "audio.voices.enroll" | "model3d.generate" | "model3d.rig" =>
+        "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.transcribe" | "audio.voices.design" | "audio.voices.enroll"
+        | "model3d.generate" | "model3d.rig" =>
             &[(400, "invalid_params", "a value refused, when the job is submitted (wait false too): steps a few-step model does not run, a size, a sampler, a picture that does not decode, a voice or language the speech model does not have, a priority outside -9..9 ..."),
               (404, "not_found", "no such model; a continue_from or upload:<name> that is not here (error.field names which)"), (409, "conflict", "the model is disabled, or none that can do it is enabled (never retry as is)"),
               (409, "busy", "queue: false and the job would not start at once (retryable)"),
@@ -422,7 +436,7 @@ Every error has retryable: true for no_room, maintenance, unavailable, timeout a
 pub const LABELS: &str = "Video labels: \"<series> NN/MM: text\" (\"Harbour 03/12: the lamp\"). NN orders video.timeline (the edit order); \
 the series (the text before NN) is where the anchors prev / prev_cam / first / first_cam look, and the project when the request names none. \
 video.cancel, video.queue.move and video.queue.remove name clips by label.\n\n\
-Jobs: image.generate, image.edit, audio.generate and audio.speak run as jobs here - the call can drop and the job goes on; \
+Jobs: image.generate, image.edit, audio.generate, audio.speak and audio.transcribe run as jobs here - the call can drop and the job goes on; \
 label one (else its id is its label), read it with <kind>.status {label} (stage and waiting_for say what it waits for), list them with <kind>.jobs, \
 stop it with <kind>.cancel {label}; wait: false answers at once. A kind makes as many jobs at once as it has servers (one a card); the rest wait \
 in a queue as video's: priority, held, project and batch on submit, <kind>.queue.list / move / pause / resume. \

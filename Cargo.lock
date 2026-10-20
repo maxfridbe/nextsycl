@@ -555,6 +555,7 @@ dependencies = [
  "nextsycl-audio-vibevoice",
  "nextsycl-audio-voxcpm2",
  "nextsycl-audio-voxtraltts",
+ "nextsycl-audio-whisper",
  "nextsycl-core",
  "nextsycl-gguf",
  "nextsycl-image",
@@ -687,6 +688,18 @@ dependencies = [
 
 [[package]]
 name = "nextsycl-audio-voxtraltts"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-audio",
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-tok",
+ "serde_json",
+]
+
+[[package]]
+name = "nextsycl-audio-whisper"
 version = "0.0.0"
 dependencies = [
  "nextsycl-audio",

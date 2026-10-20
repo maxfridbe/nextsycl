@@ -1,5 +1,5 @@
 //! Image, audio and 3D requests as jobs, the way the video studio keeps clips: `image.generate`, `image.edit`,
-//! `audio.generate`, `audio.speak`, `model3d.generate` and `model3d.rig` each become a job with a label, run here in the background (the HTTP call that
+//! `audio.generate`, `audio.speak`, `audio.transcribe`, `model3d.generate` and `model3d.rig` each become a job with a label, run here in the background (the HTTP call that
 //! asked for it can drop: the job goes on), and are read with `<kind>.status {label}` (one) or `<kind>.jobs` (the
 //! list), and stopped with `<kind>.cancel {label}`. With `wait` (the default) the call answers when the job ends;
 //! `wait: false` answers at once with the job. A `reentrant_id` makes a submit idempotent: one that names the id of a
@@ -27,7 +27,7 @@ use super::{now, Home};
 use crate::http::{call_for, Target};
 
 /// The methods that run as jobs
-pub const METHODS: [&str; 7] = ["image.generate", "image.edit", "audio.generate", "audio.speak", "audio.voices.enroll", "model3d.generate", "model3d.rig"];
+pub const METHODS: [&str; 8] = ["image.generate", "image.edit", "audio.generate", "audio.speak", "audio.transcribe", "audio.voices.enroll", "model3d.generate", "model3d.rig"];
 
 /// The kinds whose requests run as jobs here
 pub const KINDS: [&str; 3] = ["image", "audio", "model3d"];
