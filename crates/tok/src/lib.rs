@@ -480,6 +480,8 @@ impl Effort {
 /// the server checkpoints a prompt there, since a template rewrites what follows the last user turn's start for the
 /// next turn (CONTRIBUTING.md rule 1). A template whose user turns begin otherwise adds its marker here.
 pub const USER_TURNS: &[&str] = &["<|user|>", "<\u{ff5c}User\u{ff5c}>", "<|im_start|>user", "<|start|>user"];
+/// The same for the assistant's turns (where the reply a prompt asks for begins)
+pub const ASSISTANT_TURNS: &[&str] = &["<|assistant|>", "<\u{ff5c}Assistant\u{ff5c}>", "<|im_start|>assistant", "<|start|>assistant"];
 
 /// One message of a conversation.
 #[derive(Default)]
