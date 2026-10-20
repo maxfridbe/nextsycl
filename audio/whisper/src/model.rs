@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn halves_round_to_nearest_even() {
-        for x in [0.0f32, 1.0, -2.5, 65504.0, 1e-5, 6.1e-5, 3.14159, -0.000_123, 1e-8] {
+        for x in [0.0f32, 1.0, -2.5, 65504.0, 1e-5, 6.1e-5, 3.25, -0.000_123, 1e-8] {
             let h = f32_to_f16(x);
             let back = f16_to_f32(h);
             let tol = (x.abs() * 1e-3).max(6e-8);

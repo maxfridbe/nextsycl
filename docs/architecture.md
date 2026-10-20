@@ -43,6 +43,8 @@ image/                     IMAGES
   qwenimage21 nextsycl-image-qwenimage21  Qwen-Image 2.1: DiT, VAE, pipeline, stage checks
   hunyuanimage21 nextsycl-image-hunyuanimage21  HunyuanImage 2.1: the 17B DiT (base or MeanFlow-distilled), Qwen2.5-VL and
                                  byT5 text encoders, the 32x VAE, APG guidance, stage checks
+  mingimage  nextsycl-image-mingimage  Ming-Image 0.1 Design: Ling-Mini-2.0 (a 256-expert MoE) and its connector, Z-Image's
+                                 6B DiT, Wan 2.1's RGBA VAE, the GGUFs' types on the card; stage checks (docs/ports/mingimage.md)
   unlimitedocr nextsycl-image-unlimitedocr  Unlimited-OCR: pages to Markdown (SAM-B + CLIP-L, a DeepSeek-V2 MoE decoder)
   example    nextsycl-image-example  a template
 

@@ -95,6 +95,8 @@ language models (nextsycl llm ...; the names without `llm` still work):
   nextsycl llm generate <model.gguf> --prompt TEXT | --prompt-file PATH | --ids FILE [--ignore-eos] [--ctx N]
                  [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--seed S] [--gpu N[,M]] [--no-mtp]
                  [--image PATH ...]  pictures before the prompt (a vision model's)
+                 [--kl FILE]  greedy, a token a pass: the reference's top-256 log-probabilities written to FILE, or
+                              (FILE there) its tokens fed and the KL against it measured
   nextsycl llm info <model.gguf>      the architecture and geometry, every tensor checked by role, bytes by group
   nextsycl llm tokenize <model.gguf> <text>
   nextsycl llm check <model.gguf> <dump dir> [--gpu N[,M]]    the forward pass against a reference dump
@@ -503,6 +505,9 @@ fn generate(args: &[String]) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let logits = eng.feed(&mut sess, &ids, &mut none).map_err(e)?;
     let prefill = t0.elapsed().as_secs_f64();
+    if let Some(path) = opt("--kl") {
+        return kl_run(&*eng, &mut sess, logits, &path, max, prefill, ids.len());
+    }
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let seed: u64 = opt("--seed").and_then(|v| v.parse().ok()).unwrap_or(1);
     let mut draw = TempSampler { temp, top_p, rng: &mut rng, seed };
@@ -542,6 +547,70 @@ fn generate(args: &[String]) -> Result<(), String> {
     let (ng_drafted, ng_accepted) = dec.lookup_drafts();
     if ng_drafted > 0 {
         eprintln!("[prompt lookup: {ng_accepted} of {ng_drafted} drafts accepted]");
+    }
+    Ok(())
+}
+
+/// A step's top `k` (token, log p) of the full softmax
+fn top_logp(l: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let mx = l.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lse = mx + l.iter().map(|x| (x - mx).exp()).sum::<f32>().ln();
+    let mut v: Vec<(u32, f32)> = l.iter().enumerate().map(|(i, x)| (i as u32, x - lse)).collect();
+    let k = k.min(v.len());
+    if k < v.len() {
+        v.select_nth_unstable_by(k, |a, b| b.1.total_cmp(&a.1));
+        v.truncate(k);
+    }
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    v
+}
+
+/// `generate --kl FILE` (nextcuda's NS_NH_KL): greedy, one token a pass. Without FILE yet, the reference: each step's
+/// top 256 log-probabilities and the token taken, written there. With it: the same tokens fed, and the mean
+/// KL(reference || this run) over those 256 (a token outside this run's 256 at its 256th's log p) and how often the
+/// top token agrees - what a setting that changes the arithmetic (a skipped expert, a cache type) costs
+fn kl_run(eng: &dyn nextsycl_llm::Engine, sess: &mut nextsycl_llm::Session, logits: Vec<f32>, path: &str, max: usize, prefill: f64, n_prompt: usize)
+          -> Result<(), String> {
+    let e = |x: nextsycl_core::Error| x.0;
+    let mut none = |_: &str, _: &nextsycl_core::DevBuf| -> nextsycl_core::Result<()> { Ok(()) };
+    let reference: Option<Vec<(u32, Vec<(u32, f32)>)>> = std::fs::read_to_string(path).ok().map(|t| {
+        t.lines().filter_map(|l| {
+            let mut it = l.split(' ');
+            let tok: u32 = it.next()?.parse().ok()?;
+            let top = it.filter_map(|p| p.split_once(':')).filter_map(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))).collect();
+            Some((tok, top))
+        }).collect()
+    });
+    let steps = reference.as_ref().map_or(max, |r| r.len().min(max));
+    let (mut l, mut out, mut sum, mut same) = (logits, Vec::new(), 0f64, 0usize);
+    let t1 = std::time::Instant::now();
+    for i in 0..steps {
+        let greedy = l.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |x| x.0 as u32);
+        let top = top_logp(&l, 256);
+        let next = match &reference {
+            None => {
+                out.push(format!("{greedy} {}", top.iter().map(|(t, p)| format!("{t}:{p}")).collect::<Vec<_>>().join(" ")));
+                greedy
+            }
+            Some(r) => {
+                let (tok, rt) = &r[i];
+                let mine: std::collections::HashMap<u32, f32> = top.iter().copied().collect();
+                let floor = top.last().map_or(-30.0, |x| x.1);
+                sum += rt.iter().map(|(t, p)| (p.exp() * (p - mine.get(t).copied().unwrap_or(floor))) as f64).sum::<f64>();
+                same += usize::from(rt.first().is_some_and(|x| x.0 == greedy));
+                *tok
+            }
+        };
+        l = eng.forward(sess, &[next], &mut none).map_err(e)?;
+    }
+    let dt = t1.elapsed().as_secs_f64();
+    eprintln!("[prompt {n_prompt} tokens in {prefill:.1} s; {steps} tokens a pass each in {dt:.1} s ({:.2} tok/s)]", steps as f64 / dt.max(1e-9));
+    match reference {
+        None => {
+            std::fs::write(path, out.join("\n") + "\n").map_err(|x| format!("{path}: {x}"))?;
+            println!("kl: the reference ({steps} steps) written to {path}");
+        }
+        Some(_) => println!("KL {:.5} over {steps} steps, top-1 agrees {:.1} %", sum / steps.max(1) as f64, 100.0 * same as f64 / steps.max(1) as f64),
     }
     Ok(())
 }

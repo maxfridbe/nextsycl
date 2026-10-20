@@ -84,6 +84,7 @@ struct St {
 }
 
 impl Pull {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(model: &str, kind: &str, title: &str, root: &Path, drive: &str, files: &[(String, u64)], run: u64, log: PathBuf) -> Pull {
         let files: Vec<(PathBuf, u64)> = files.iter().map(|(p, n)| (root.join(p), *n)).collect();
         Pull {
@@ -404,7 +405,7 @@ impl Home {
             !job.is_some_and(|j| self.job_cancelled(j))
         });
         let _ = self.pulls_view();
-        r.map_err(|(st, m)| (st, m))?;
+        r?;
         // registered now: its kind's kinds_on and pick see it
         if registry::find(&self.o.cfg, id).ok().flatten().is_none() {
             return Err((500, format!("{id}: downloaded, but the registry has no entry for it")));

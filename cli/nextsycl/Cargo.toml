@@ -26,6 +26,7 @@ nextsycl-image-unlimitedocr.workspace = true
 nextsycl-image-paddleocrvl.workspace = true
 nextsycl-image-olmocr2.workspace = true
 nextsycl-image-hunyuanimage21.workspace = true
+nextsycl-image-mingimage.workspace = true
 nextsycl-video.workspace = true
 nextsycl-video-example.workspace = true
 nextsycl-video-h3.workspace = true

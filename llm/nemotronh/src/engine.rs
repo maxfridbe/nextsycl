@@ -353,6 +353,9 @@ struct Dev {
     /// is row j of the experts' outputs ([CHUNK * used])
     tp: DevBuf,
     seq: DevBuf,
+    /// the tail skip's tables (NS_NH_TAIL_SKIP = k, a GPU with host-kept experts): row r's entries start at r * k
+    /// ([DEC + 1]); the routing's entries kept, r * used + i for i < k ([DEC * k])
+    tail: Option<(DevBuf, DevBuf)>,
     /// a prompt pass's matrix expanded to half (an expert's two after the largest dense one)
     w16: DevBuf,
     /// VRAM slots the chosen experts of a layer kept in host memory are gathered into (decode: its rows' entries, up
@@ -369,6 +372,11 @@ thread_local! {
 
 /// The rows the decode products take (the Q8_1 kernels' widest); a pass of more rows is a prompt pass (half products)
 const DEC: usize = 8;
+
+/// NS_NH_TAIL_SKIP: the chosen experts a decode row keeps in a layer whose experts are in host memory (0: all)
+fn tail_skip() -> usize {
+    std::env::var("NS_NH_TAIL_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
 
 /// NS_NH_CHUNK: a prompt pass's rows (default: chosen at load; with the silo only - without it passes of DEC rows)
 fn chunk_setting() -> Option<usize> {
@@ -390,6 +398,10 @@ pub struct NemotronH<'g> {
     moe_xmx: bool,
     /// prompt rows' Mamba scan in 64-row chunks (NS_NH_SCAN=0: row after row)
     chunked_scan: bool,
+    /// the tail skip (Strata's, nextcuda's NS_NH_TAIL_SKIP): a decode or verify row of a MoE layer whose experts are kept
+    /// in host memory uses only its first NS_NH_TAIL_SKIP chosen experts (by rank), the rest's weight not given to the
+    /// others - their PCIe reads saved. 0 (the default): off
+    tail_skip: usize,
     layers: Vec<Layer>,
     output_norm: DevBuf,
     output: Mat,
@@ -708,7 +720,18 @@ impl<'g> NemotronH<'g> {
                 Some(w) => Some(DevBuf::new(gpu, (drafts + 1).max(1) * g.used * w)?),
                 None => None,
             };
-            devs.push(Dev { gpu: gpu.clone(), arena: Arena::new(gpu, arena_bytes(&g, chunk))?, w16: DevBuf::new(gpu, w16_bytes(&g))?, tp, seq, slots, lb, le });
+            let tk = tail_skip();
+            let tail = match widest {
+                Some(_) if tk > 0 && tk < g.used => {
+                    let tpk = DevBuf::new(gpu, (DEC + 1) * 4)?;
+                    tpk.write(0, &bytes((0..=DEC as i32).map(|r| r * tk as i32).collect()))?;
+                    let keep = DevBuf::new(gpu, DEC * tk * 4)?;
+                    keep.write(0, &bytes((0..DEC as i32).flat_map(|r| (0..tk as i32).map(move |i| r * g.used as i32 + i)).collect()))?;
+                    Some((tpk, keep))
+                }
+                _ => None,
+            };
+            devs.push(Dev { gpu: gpu.clone(), arena: Arena::new(gpu, arena_bytes(&g, chunk))?, w16: DevBuf::new(gpu, w16_bytes(&g))?, tp, seq, tail, slots, lb, le });
         }
         let load_s = t0.elapsed().as_secs_f64();
         let wh = devs.iter().map(|d| format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1)).collect::<Vec<_>>().join(", ");
@@ -724,6 +747,7 @@ impl<'g> NemotronH<'g> {
                        dense: std::env::var("NS_NH_DENSE").map_or(true, |v| v != "0"),
                        moe_xmx: std::env::var("NS_NH_MOE_XMX").map_or(true, |v| v != "0"),
                        chunked_scan: std::env::var("NS_NH_SCAN").map_or(true, |v| v != "0"),
+                       tail_skip: tail_skip(),
                        prof: std::env::var("NS_NH_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get() })
     }
 
@@ -1189,6 +1213,20 @@ impl<'g> NemotronH<'g> {
         unsafe {
             self.op("route", || (s.route)(self.raw(), logits.fp(), m.bias_dev.fp(), t as i64, g.experts as i64, g.used as i64, g.w_norm as c_int, g.w_scale,
                                           ids.ptr().cast(), ws.fp(), cols.ptr().cast()))?;
+            // the tail skip: a host-kept layer's rows keep their first tail_skip choices (the routing ranks them), weights as
+            // they were; the entries compacted (row r's at r * tail_skip) and the combine's row table to match
+            let tail = self.dev().tail.as_ref().filter(|_| m.up._pin.is_some() && t <= DEC);
+            let (n_e, ids, ws, cols, tp) = match tail {
+                Some((tpk, keep)) => {
+                    let n = t * self.tail_skip;
+                    let (ik, wk, ck) = (self.arena().bytes(n * 4)?, self.arena().f32(n)?, self.arena().bytes(n * 4)?);
+                    for (src, dst) in [(ids.ptr(), ik.ptr()), (ws.ptr(), wk.ptr()), (cols.ptr(), ck.ptr())] {
+                        self.op("tail skip", || (s.gather)(self.raw(), src, 4, keep.ptr().cast(), n as i64, dst))?;
+                    }
+                    (n, ik, wk, ck, tpk)
+                }
+                None => (n_e, ids, ws, cols, &self.dev().tp),
+            };
             let lq = self.arena().bytes((s.q8_bytes)(g.latent as i64, t as i64))?;
             self.op("quantize", || (s.quantize_q8)(self.raw(), lat.fp(), lq.ptr(), g.latent as i64, t as i64))?;
             let u = self.arena().f32(n_e * g.n_ff_exp)?;
@@ -1215,7 +1253,7 @@ impl<'g> NemotronH<'g> {
                                                  seq.ptr().cast(), n_e as i64, uq.ptr(), n_e as i64, dn.fp(), g.n_ff_exp as i64, g.latent as i64))?;
             let mo = self.arena().f32(t * g.latent)?;
             mo.fill(0)?;
-            self.op("moe combine", || (k.moe_combine)(self.raw(), mo.fp(), dn.fp(), self.dev().tp.ptr().cast(), seq.ptr().cast(), ws.fp(), t as i64,
+            self.op("moe combine", || (k.moe_combine)(self.raw(), mo.fp(), dn.fp(), tp.ptr().cast(), seq.ptr().cast(), ws.fp(), t as i64,
                                                       g.latent as i64))?;
             Ok(mo)
         }
