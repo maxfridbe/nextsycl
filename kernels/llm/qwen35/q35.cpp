@@ -15,6 +15,15 @@ namespace {
 using half = sycl::half;
 constexpr int SG = 16;
 
+// value i of a cache row of form kt (0 half, 1 q8_0, 2 q4_0: silo/attn.cpp has the layout)
+inline float kv_value(const uint8_t* row, int kt, int i) {
+    if (kt == 0) return (float) reinterpret_cast<const half*>(row)[i];
+    const int b = i / 32, j = i % 32;
+    if (kt == 1) return (float) (int8_t) row[i] * (float) reinterpret_cast<const half*>(row + 256)[b];
+    const uint8_t w = row[b * 16 + (j & 15)];
+    return (float) ((int) (j < 16 ? w & 15 : w >> 4) - 8) * (float) reinterpret_cast<const half*>(row + 128)[b];
+}
+
 // ---- cached causal attention (the MiniMax Music engine's, mm3.cpp): a work-group per (row, key head, split of the
 // keys), NSG sub-groups taking the split's keys in turn, each lane DL features of the G query heads that share the key
 // head; the sub-groups' (max, sum, weighted values) merged in local memory, the splits (decode) by a second kernel
@@ -177,6 +186,75 @@ int ns_q35_qk_norm_rope(ns_gpu* g, const float* src, int64_t ss, int64_t hs, flo
     NS_CATCH
 }
 
+int ns_q35_kv_store_q(ns_gpu* g, int kt, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap,
+                      int64_t p0, void* kc, void* vc) {
+    NS_TRY
+    if (T <= 0) return 0;
+    if (D != 256 || (kt != 1 && kt != 2)) return ns_fail("ns_q35_kv_store_q: heads of 256, form 1 (q8_0) or 2 (q4_0)");
+    if (p0 + T > cap) return ns_fail("ns_q35_kv_store_q: past the cache's capacity");
+    const int64_t rb = kt == 1 ? 272 : 144;
+    uint8_t* kd = (uint8_t*) kc;
+    uint8_t* vd = (uint8_t*) vc;
+    // a work-item a block of 32 values (8 a row), keys then values
+    g->q.parallel_for(sycl::range<1>((size_t) (2 * T * Hkv * 8)), [=](sycl::id<1> id) {
+        int64_t i = id[0];
+        const int b = (int) (i % 8);
+        i /= 8;
+        const int64_t h = i % Hkv;
+        i /= Hkv;
+        const int64_t t = i % T;
+        const bool isv = i / T == 1;
+        const float* x = (isv ? v + t * vs : k + t * ks) + h * 256 + b * 32;
+        uint8_t* row = (isv ? vd : kd) + (h * cap + p0 + t) * rb;
+        if (kt == 1) {
+            float amax = 0.0f;
+            for (int j = 0; j < 32; ++j) amax = sycl::fmax(amax, sycl::fabs(x[j]));
+            const float d = amax / 127.0f, id_ = d != 0.0f ? 1.0f / d : 0.0f;
+            for (int j = 0; j < 32; ++j) row[b * 32 + j] = (uint8_t) (int8_t) sycl::round(x[j] * id_);
+            reinterpret_cast<half*>(row + 256)[b] = (half) d;
+        } else {
+            // ggml's quantize_row_q4_0: the value of the largest magnitude (the first of a tie), d = it / -8
+            float m = 0.0f, am = 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                if (sycl::fabs(x[j]) > am) {
+                    am = sycl::fabs(x[j]);
+                    m = x[j];
+                }
+            }
+            const float d = m / -8.0f, id_ = d != 0.0f ? 1.0f / d : 0.0f;
+            for (int j = 0; j < 16; ++j) {
+                const int lo = sycl::min(15, (int) (x[j] * id_ + 8.5f)), hi = sycl::min(15, (int) (x[j + 16] * id_ + 8.5f));
+                row[b * 16 + j] = (uint8_t) (lo | (hi << 4));
+            }
+            reinterpret_cast<half*>(row + 128)[b] = (half) d;
+        }
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_fwht32(ns_gpu* g, float* x, int64_t rows, int64_t n, int64_t stride) {
+    NS_TRY
+    if (rows <= 0) return 0;
+    if (n % 32) return ns_fail("ns_q35_fwht32: rows of a multiple of 32");
+    const int64_t nb = n / 32;
+    g->q.parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> id) {
+        float* p = x + (id[0] / nb) * stride + (id[0] % nb) * 32;
+        float v[32];
+        for (int i = 0; i < 32; ++i) v[i] = p[i];
+        for (int o = 1; o < 32; o <<= 1)
+            for (int i = 0; i < 32; ++i)
+                if (!(i & o)) {
+                    const float a = v[i], b = v[i + o];
+                    v[i] = a + b;
+                    v[i + o] = a - b;
+                }
+        for (int i = 0; i < 32; ++i) p[i] = v[i] * 0.17677669529663687f;
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_q35_qk_norm_rope_pos(ns_gpu* g, const float* src, int64_t ss, int64_t hs, float* dst, int64_t ds, int64_t T, int64_t H, int64_t D,
                             const float* w, float eps, int64_t n_rot, float theta, const int32_t* pos, int64_t s0, int64_t s1, int64_t s2) {
     NS_TRY
@@ -291,19 +369,19 @@ int ns_q35_vit_heads(ns_gpu* g, const float* ob, int64_t H, int64_t r, int64_t D
     NS_CATCH
 }
 
-int ns_q35_attn_probs(ns_gpu* g, const float* q, const void* kc, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t n, int mode,
+int ns_q35_attn_probs(ns_gpu* g, int kt, const float* q, const void* kc, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t n, int mode,
                       float* scratch, float* out) {
     NS_TRY
     if (n <= 0) return 0;
-    if (n > cap || Hq % Hkv) return ns_fail("ns_q35_attn_probs: keys past the cache, or heads that do not share");
-    const half* k = (const half*) kc;
-    const int64_t G = Hq / Hkv;
+    if (n > cap || Hq % Hkv || D != 256 || kt < 0 || kt > 2) return ns_fail("ns_q35_attn_probs: keys past the cache, heads that do not share, or not heads of 256");
+    const uint8_t* k = (const uint8_t*) kc;
+    const int64_t G = Hq / Hkv, rb = kt == 0 ? 512 : kt == 1 ? 272 : 144;
     const float scale = 1.0f / sycl::sqrt((float) D);
     auto score = [=](int64_t h, int64_t j) {
         const float* qh = q + h * D;
-        const half* kj = k + ((h / G) * cap + j) * D;
+        const uint8_t* row = k + ((h / G) * cap + j) * rb;
         float s = 0.0f;
-        for (int64_t i = 0; i < D; ++i) s += qh[i] * (float) kj[i];
+        for (int64_t i = 0; i < D; ++i) s += qh[i] * kv_value(row, kt, (int) i);
         return s * scale;
     };
     constexpr int WG = 256;

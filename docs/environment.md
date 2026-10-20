@@ -199,6 +199,8 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_Q35_VISION_DUMP` | unset | PREFIX: a picture's patches and rows written as raw float32 to PREFIX.patches.f32 and .rows.f32 (a check against llama.cpp's mtmd: reference/llama-dump/ns-mtmd-dump.cpp) | llm qwen35 |
 | `NS_Q35_CHAIN_HEADS` | mean | LogProbChain (`logprob_chain`): how a full-attention layer's heads combine into a position's attention - their mean, or `max` | llm qwen35 |
 | `NS_Q35_GRAPHS` | 0 | 1: decode passes' position-free stretches (all but the full-attention layers' rotary positions, cache writes and attention) as SYCL graphs, recorded once a session and row count, replayed after - the same tokens, no faster on the B70 / B65 (the host keeps ahead of the GPU) | llm qwen35 |
+| `NS_Q35_KV` | f16 | the attention cache's form a card: f16 - half (512 bytes a head's row) everywhere, the fastest; auto - q8_0 (272) on the card the plan fills first (the last: one card, that one), half on the others where it fits; auto-q4 - q4_0 (144) there instead; q8 (q8_0), q4 (q4_0) - that on every card. A quantized cache needs the silo (without it: half). B70, Q4 with MTP: one session holds 196K tokens in half, 368K in q8_0, 704K in q4_0; against half after a 12.8K prompt, KL q8_0 0.00024, q4_0 0.0032 (noise 0.00014: `llm generate --score`) | llm qwen35 |
+| `NS_Q35_KV_ROT` | 0 | 1: a quantized cache rotated (a 32-value Hadamard transform a block on keys, values and queries, the attention's output turned back) | llm qwen35 |
 | `NS_Q35_PROFILE` | off | Debug: 1 times every kernel on the device with its bytes and arithmetic (needs NS_PROFILE=gpu; one GPU only) | llm qwen35 |
 
 ## Image

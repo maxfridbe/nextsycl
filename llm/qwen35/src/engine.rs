@@ -32,6 +32,68 @@ fn e(x: impl std::fmt::Display) -> Error {
     Error(x.to_string())
 }
 
+/// The attention cache's form a GPU (NS_Q35_KV): half, q8_0 or q4_0 (llama.cpp's blocks of 32, the scales behind a
+/// row's values: kernels/llm/qwen35/silo/attn.cpp)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KvTy {
+    F16,
+    Q8,
+    Q4,
+}
+
+impl KvTy {
+    /// the kernels' code
+    fn code(self) -> c_int {
+        match self {
+            KvTy::F16 => 0,
+            KvTy::Q8 => 1,
+            KvTy::Q4 => 2,
+        }
+    }
+    /// bytes a head's row of `head` values
+    fn row(self, head: usize) -> usize {
+        match self {
+            KvTy::F16 => head * 2,
+            KvTy::Q8 => head + head / 32 * 2,
+            KvTy::Q4 => head / 2 + head / 32 * 2,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            KvTy::F16 => "f16",
+            KvTy::Q8 => "q8_0",
+            KvTy::Q4 => "q4_0",
+        }
+    }
+}
+
+/// NS_Q35_KV: the forms (the GPU the plan fills first - the last, which holds the head; the others). f16 (the default:
+/// the fastest - B70, Q4, 43K prompt: read 742 / 673 / 718 tok/s and decode 43.0 / 38.9 / 40.9 with half / q8_0 /
+/// q4_0); auto: q8_0 there, half on the others; auto-q4: q4_0 there; q8 (q8_0), q4 (q4_0): that on every GPU. One B70
+/// session's most context with MTP: half 196K, q8_0 368K, q4_0 704K
+fn kv_mode() -> std::result::Result<(KvTy, KvTy), String> {
+    match std::env::var("NS_Q35_KV").as_deref() {
+        Ok("auto") => Ok((KvTy::Q8, KvTy::F16)),
+        Err(_) | Ok("") => Ok((KvTy::F16, KvTy::F16)),
+        Ok("auto-q4") => Ok((KvTy::Q4, KvTy::F16)),
+        Ok("f16") => Ok((KvTy::F16, KvTy::F16)),
+        Ok("q8") | Ok("q8_0") => Ok((KvTy::Q8, KvTy::Q8)),
+        Ok("q4") | Ok("q4_0") => Ok((KvTy::Q4, KvTy::Q4)),
+        Ok(v) => Err(format!("NS_Q35_KV={v}: auto, auto-q4, f16, q8_0 or q4_0")),
+    }
+}
+
+/// NS_Q35_KV_ROT=1: a quantized cache's keys, values and queries rotated (a 32-value Hadamard transform a block, the
+/// attention's output turned back): the quantization error spread over the block
+fn kv_rot() -> bool {
+    std::env::var("NS_Q35_KV_ROT").is_ok_and(|v| v == "1")
+}
+
+/// A cache buffer's bytes a head's row ([kv heads][cap] rows)
+fn kv_rb(b: &DevBuf, heads_kv: usize, cap: usize) -> usize {
+    b.len / (heads_kv * cap).max(1)
+}
+
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -357,6 +419,9 @@ pub struct Qwen35<'g> {
     pub vision: Option<crate::vision::Vision>,
     /// LogProbChain's attention capture (None: off)
     capture: Mutex<Option<Capture>>,
+    /// the attention cache's form on each GPU (devs' order), and whether a quantized one is rotated
+    pub kv_tys: Vec<KvTy>,
+    kv_rot: bool,
     /// decode passes as SYCL graphs (under `work`)
     graphs: Mutex<Graphs>,
     /// inside a replayed stretch: kernel calls are not made (the graph makes them)
@@ -389,6 +454,14 @@ struct FullSeg<'a> {
     v: &'a DevBuf,
     /// LogProbChain: this one-row pass's attention captured (`Qwen35::capture_attention`)
     probe: bool,
+}
+
+impl FullSeg<'_> {
+    /// the cache's form, by its buffer's size
+    fn ty(&self, g: &Geometry) -> KvTy {
+        let rb = kv_rb(self.k, g.heads_kv, self.cap);
+        [KvTy::F16, KvTy::Q8, KvTy::Q4].into_iter().find(|t| t.row(g.head) == rb).unwrap_or(KvTy::F16)
+    }
 }
 
 /// A recorded SYCL graph (ns_q35_graph_*), freed with it
@@ -488,6 +561,12 @@ impl<'g> Qwen35<'g> {
             Some(s) => format!("qwen35: tuned kernels from its silo {}", s.path.display()),
             None => "qwen35: no silo - the shared kernels".into(),
         });
+        // the attention cache's forms (the GPU filled first, the others): a quantized cache is read by the silo's attention
+        let (mut kv_fill, mut kv_other) = kv_mode().map_err(e)?;
+        if silo.is_none() && (kv_fill, kv_other) != (KvTy::F16, KvTy::F16) {
+            log("qwen35: a quantized attention cache needs the silo: half".into());
+            (kv_fill, kv_other) = (KvTy::F16, KvTy::F16);
+        }
         // the plan: every tensor but the token embedding, a prompt chunk's work, 1.5 GiB to spare (the xe driver has
         // no out-of-memory error: past the card it spills to host memory)
         let embd = f.tensor("token_embd.weight").ok_or_else(|| e("no token_embd.weight"))?.clone();
@@ -542,19 +621,24 @@ impl<'g> Qwen35<'g> {
             // state and verify snapshots (DeltaNet)
             let ctx = if kv.0 > 0 { kv.0 } else { 32768 };
             let mtp_on = has_mtp;
-            let cost: Vec<u64> = (0..g.layers).map(|l| layer_w[l] + if g.full(l) { (2 * g.heads_kv * ctx * g.head * 2) as u64 } else {
-                (lin_state * (1 + if mtp_on { drafts } else { 0 })) as u64
-            }).collect();
+            // a layer's cost with the cache's form of the GPU it lands on: the last GPU's (filled first), the others'
+            let cost_of = |ty: KvTy| -> Vec<u64> {
+                (0..g.layers).map(|l| layer_w[l] + if g.full(l) { (2 * g.heads_kv * ctx * ty.row(g.head)) as u64 } else {
+                    (lin_state * (1 + if mtp_on { drafts } else { 0 })) as u64
+                }).collect()
+            };
             let split_env: Option<Vec<usize>> = std::env::var("NS_SPLIT").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
-            let plan = |c: usize| -> std::result::Result<Vec<(usize, usize)>, String> {
+            let plan = |c: usize, other: KvTy| -> std::result::Result<Vec<(usize, usize)>, String> {
                 let n = gpus.len();
+                let (cost_last, cost_other) = (cost_of(kv_fill), cost_of(other));
+                let cost_at = |i: usize| if i + 1 == n { &cost_last } else { &cost_other };
                 // what each GPU has for layers: its free memory less the spare, its half buffer and work memory; the
                 // last's less the head and the draft block (its weights, its cache)
                 let room: Vec<i64> = (0..n).map(|i| {
                     // (and 512 MiB the plan does not see: the allocator's rounding, small buffers)
                     let mut over = margin + (512 << 20) + w16_bytes as u64 + arena_of(c) as u64;
                     if i + 1 == n {
-                        over += head_w + if mtp_on { mtp_w + (2 * g.heads_kv * ctx * g.head * 2) as u64 } else { 0 };
+                        over += head_w + if mtp_on { mtp_w + (2 * g.heads_kv * ctx * kv_fill.row(g.head)) as u64 } else { 0 };
                     }
                     free[i] as i64 - over as i64
                 }).collect();
@@ -579,8 +663,8 @@ impl<'g> Qwen35<'g> {
                             lb = 0;
                         } else {
                             let mut have = room[i];
-                            while lb > 0 && cost[lb - 1] as i64 <= have {
-                                have -= cost[lb - 1] as i64;
+                            while lb > 0 && cost_at(i)[lb - 1] as i64 <= have {
+                                have -= cost_at(i)[lb - 1] as i64;
                                 lb -= 1;
                             }
                         }
@@ -591,7 +675,7 @@ impl<'g> Qwen35<'g> {
                     bounds = rev;
                 }
                 for (i, &(lb, le)) in bounds.iter().enumerate() {
-                    let need: u64 = cost[lb..le].iter().sum();
+                    let need: u64 = cost_at(i)[lb..le].iter().sum();
                     if le <= lb {
                         // a GPU before the last with no layers left for it is dropped (`load`)
                         if i + 1 < n && split_env.is_none() {
@@ -609,13 +693,17 @@ impl<'g> Qwen35<'g> {
             let tries: Vec<usize> = chunk_setting().map_or_else(|| vec![2048, 1024, 512], |c| vec![c]);
             let mut last_err = String::new();
             let mut found = None;
-            for c in tries {
-                match plan(c) {
-                    Ok(b) => {
-                        found = Some((c, b));
-                        break;
+            // the other GPUs' form, else the first's where theirs does not fit
+            'plans: for other in [kv_other, kv_fill] {
+                for &c in &tries {
+                    match plan(c, other) {
+                        Ok(b) => {
+                            found = Some((c, b));
+                            kv_other = other;
+                            break 'plans;
+                        }
+                        Err(x) => last_err = x,
                     }
-                    Err(x) => last_err = x,
                 }
             }
             found.ok_or_else(|| e(format!("{} over {} GPUs at a {ctx}-token context: {last_err}", f.architecture(), gpus.len())))?
@@ -633,6 +721,9 @@ impl<'g> Qwen35<'g> {
             }
         }
         let lastg = gpus[gpus.len() - 1].clone();
+        let kv_tys: Vec<KvTy> = (0..gpus.len()).map(|i| if i + 1 == gpus.len() { kv_fill } else { kv_other }).collect();
+        log(format!("qwen35: the attention cache {}{}", kv_tys.iter().map(|t| t.name()).collect::<Vec<_>>().join(" + "),
+                    if kv_rot() && kv_tys.iter().any(|t| *t != KvTy::F16) { ", rotated" } else { "" }));
         let mut loaded = 0u64;
         let mut layers = Vec::with_capacity(g.layers);
         for l in 0..g.layers {
@@ -746,7 +837,7 @@ impl<'g> Qwen35<'g> {
             None => None,
         };
         Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, chunk,
-                    work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, second: None, of: Vec::new() }), vh, next_id: 0.into(), vision, capture: Mutex::new(None), graphs: Mutex::new(Graphs::default()), skip: false.into(), graphs_off: false.into(),
+                    work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, second: None, of: Vec::new() }), vh, next_id: 0.into(), vision, capture: Mutex::new(None), kv_rot: kv_rot() && kv_tys.iter().any(|t| *t != KvTy::F16), kv_tys, graphs: Mutex::new(Graphs::default()), skip: false.into(), graphs_off: false.into(),
                     probe,
                     load_s, load_bytes: loaded })
     }
@@ -1288,7 +1379,7 @@ impl<'g> Qwen35<'g> {
 
     /// LogProbChain: a one-row pass's attention over its n keys (its query q, normed and turned, against the cache)
     /// added to this GPU's capture
-    fn capture_row(&self, q: &DevBuf, kc: &DevBuf, cap: usize, n: usize) -> Result<()> {
+    fn capture_row(&self, q: &DevBuf, kc: &DevBuf, cap: usize, n: usize, ty: KvTy) -> Result<()> {
         let mut c = self.capture.lock().unwrap();
         let Some(c) = c.as_mut() else { return Ok(()) };
         let dev = self.cur.load(std::sync::atomic::Ordering::Relaxed);
@@ -1301,8 +1392,8 @@ impl<'g> Qwen35<'g> {
         let g = &self.g;
         let scratch = self.arena().f32(2 * g.heads)?;
         // SAFETY: q [heads x head], the cache [kv heads][cap][head] half, n <= cap keys, out [cap].
-        self.op("chain attention", String::new, n * g.heads_kv * g.head * 2, 4 * n * g.heads * g.head,
-                || unsafe { (self.k.attn_probs)(self.raw(), q.fp(), kc.ptr(), g.heads as i64, g.heads_kv as i64, g.head as i64, cap as i64, n as i64, c.mode,
+        self.op("chain attention", String::new, n * g.heads_kv * ty.row(g.head), 4 * n * g.heads * g.head,
+                || unsafe { (self.k.attn_probs)(self.raw(), ty.code(), q.fp(), kc.ptr(), g.heads as i64, g.heads_kv as i64, g.head as i64, cap as i64, n as i64, c.mode,
                                                 scratch.fp(), out.fp()) })?;
         c.layers += 1;
         c.n = n;
@@ -1365,6 +1456,8 @@ impl<'g> Qwen35<'g> {
             let graphing = self.graphing();
             let p_sz = if graphing { cap.saturating_sub(t) } else { p0 };
             self.seg_end()?;
+            let ty = sg.ty(g);
+            let rot = self.kv_rot && ty != KvTy::F16;
             // SAFETY: the rows and caches as named in q35.h.
             unsafe {
                 match sg.rope {
@@ -1386,24 +1479,39 @@ impl<'g> Qwen35<'g> {
                                                         d as i64, a.k_norm.fp(), g.eps, g.n_rot as i64, g.theta, pos.ptr().cast(), s0, s1, s2))?;
                     }
                 }
-                self.op("kv store", none, 12 * t * hk * d, 0,
-                        || (k.kv_store)(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64, p0 as i64,
-                                        kc.ptr(), vc.ptr()))?;
+                if rot {
+                    // the keys, values and queries turned by the same orthogonal blocks: q . k unchanged, the values'
+                    // turn undone on the output below
+                    for (x, rows) in [(&kn, t * hk), (&vr, t * hk), (&q, t * hq)] {
+                        self.op("kv rotate", none, 8 * rows * d, 5 * rows * d, || (k.fwht32)(self.raw(), x.fp(), rows as i64, d as i64, d as i64))?;
+                    }
+                }
+                if ty == KvTy::F16 {
+                    self.op("kv store", none, 12 * t * hk * d, 0,
+                            || (k.kv_store)(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, cap as i64,
+                                            p0 as i64, kc.ptr(), vc.ptr()))?;
+                } else {
+                    self.op("kv store q", none, 8 * t * hk * d + 2 * t * hk * ty.row(d), 0,
+                            || (k.kv_store_q)(self.raw(), ty.code(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64,
+                                              cap as i64, p0 as i64, kc.ptr(), vc.ptr()))?;
+                }
                 if let Some(s) = self.silo.filter(|s| (s.attn_prompt_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
                     // the silo's flash attention (prompt rows): each key read once a work-group of 8 rows x 6 heads
                     // each block of 8 rows reads K and V (half) up to its last row's key, once for the 6 heads
                     let nb = t.div_ceil(8);
                     let block_keys = nb * p0 + 8 * nb * (nb + 1) / 2;
                     self.op("attention silo", none, block_keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
-                            || (s.attn_prompt)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
-                                               p0 as i64, att.fp()))?;
+                            || (s.attn_prompt_kv)(self.raw(), ty.code(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64,
+                                                  cap as i64, p0 as i64, att.fp()))?;
                 } else if let Some(s) = self.silo.filter(|s| (s.attn_decode_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
                     // the silo's decode attention: a lane a key for the scores, the keys over ~512 work-groups
                     let sc = (s.attn_decode_scratch)(t as i64, hq as i64, hk as i64, d as i64, p_sz as i64) as usize;
                     let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
                     self.op("attention silo", none, keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
-                            || (s.attn_decode)(self.raw(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, cap as i64,
-                                               p0 as i64, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+                            || (s.attn_decode_kv)(self.raw(), ty.code(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64,
+                                                  cap as i64, p0 as i64, att.fp(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+                } else if ty != KvTy::F16 {
+                    return Err(e(format!("qwen35: a {} cache and no silo attention for these rows", ty.name())));
                 } else {
                     let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, p_sz as i64) as usize;
                     let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
@@ -1413,7 +1521,11 @@ impl<'g> Qwen35<'g> {
                 }
             }
             if sg.probe && t == 1 {
-                self.capture_row(&q, kc, cap, p0 + 1)?;
+                self.capture_row(&q, kc, cap, p0 + 1, ty)?;
+            }
+            if rot {
+                // SAFETY: the attention's rows [t][hq x d].
+                self.op("kv rotate", none, 8 * t * hq * d, 5 * t * hq * d, || unsafe { (k.fwht32)(self.raw(), att.fp(), (t * hq) as i64, d as i64, d as i64) })?;
             }
             self.seg_begin()?;
         }
@@ -1820,12 +1932,13 @@ impl<'g> Qwen35<'g> {
         let g = &self.g;
         // the caches and states, checked against what is free first: past the card the xe driver spills into host
         // memory (no out-of-memory error) and can take the machine down
-        let mtp_kv = if self.mtp.is_some() { 2 * g.heads_kv * max_ctx * g.head * 2 } else { 0 };
+        let last_ty = self.kv_tys[self.last()];
+        let mtp_kv = if self.mtp.is_some() { 2 * g.heads_kv * max_ctx * last_ty.row(g.head) } else { 0 };
         // per GPU: its layers' share (the draft block's cache on the last)
         for (i, d) in self.devs.iter().enumerate() {
             let full = (d.lb..d.le).filter(|l| g.full(*l)).count();
             let kv = if i == self.last() { mtp_kv } else { 0 };
-            let need = (full * 2 * g.heads_kv * max_ctx * g.head * 2 + kv + (d.le - d.lb - full) * (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64;
+            let need = (full * 2 * g.heads_kv * max_ctx * self.kv_tys[i].row(g.head) + kv + (d.le - d.lb - full) * (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4) as u64;
             let (total, free) = d.gpu.memory()?;
             let free = free.unwrap_or(total);
             if need + (1536 << 20) > free {
@@ -1837,7 +1950,7 @@ impl<'g> Qwen35<'g> {
         for l in 0..g.layers {
             let gpu = &self.devs[self.layer_dev[l]].gpu;
             layers.push(if g.full(l) {
-                let n = g.heads_kv * max_ctx * g.head * 2;
+                let n = g.heads_kv * max_ctx * self.kv_tys[self.layer_dev[l]].row(g.head);
                 LState::Full { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)? }
             } else {
                 let s = DevBuf::f32(gpu, g.v_heads * g.state * g.state)?;
@@ -1849,7 +1962,7 @@ impl<'g> Qwen35<'g> {
         }
         let mtp = match &self.mtp {
             Some(_) => {
-                let n = g.heads_kv * max_ctx * g.head * 2;
+                let n = g.heads_kv * max_ctx * last_ty.row(g.head);
                 let gpu = &self.devs[self.last()].gpu;
                 let ms = MtpState { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)?, pending: DevBuf::f32(gpu, g.n_embd)?, chain: DevBuf::f32(gpu, g.n_embd)? };
                 ms.pending.fill(0)?;
@@ -1886,9 +1999,10 @@ impl<'g> Qwen35<'g> {
             match (d, s) {
                 (LState::Full { k: dk, v: dv }, LState::Full { k: sk, v: sv }) => {
                     for h in 0..g.heads_kv {
-                        let n = src.pos * g.head * 2;
-                        dk.copy_within(h * dst.max_ctx * g.head * 2, sk, h * src.max_ctx * g.head * 2, n)?;
-                        dv.copy_within(h * dst.max_ctx * g.head * 2, sv, h * src.max_ctx * g.head * 2, n)?;
+                        let rb = kv_rb(sk, g.heads_kv, src.max_ctx);
+                        let n = src.pos * rb;
+                        dk.copy_within(h * dst.max_ctx * rb, sk, h * src.max_ctx * rb, n)?;
+                        dv.copy_within(h * dst.max_ctx * rb, sv, h * src.max_ctx * rb, n)?;
                     }
                 }
                 (LState::Linear { s: ds, conv: dc }, LState::Linear { s: ss, conv: sc }) => {
@@ -1900,9 +2014,10 @@ impl<'g> Qwen35<'g> {
         }
         if let (Some(d), Some(sm)) = (&dst.mtp, &src.mtp) {
             for h in 0..g.heads_kv {
-                let n = src.pos * g.head * 2;
-                d.k.copy_within(h * dst.max_ctx * g.head * 2, &sm.k, h * src.max_ctx * g.head * 2, n)?;
-                d.v.copy_within(h * dst.max_ctx * g.head * 2, &sm.v, h * src.max_ctx * g.head * 2, n)?;
+                let rb = kv_rb(&sm.k, g.heads_kv, src.max_ctx);
+                let n = src.pos * rb;
+                d.k.copy_within(h * dst.max_ctx * rb, &sm.k, h * src.max_ctx * rb, n)?;
+                d.v.copy_within(h * dst.max_ctx * rb, &sm.v, h * src.max_ctx * rb, n)?;
             }
             d.pending.copy_within(0, &sm.pending, 0, g.n_embd * 4)?;
         }
@@ -1932,6 +2047,11 @@ impl<'g> Qwen35<'g> {
     pub fn rollback(&self, s: &mut Session, keep: usize) -> Result<()> {
         let _w = self.work.lock().unwrap();
         self.rollback_in(s, keep)
+    }
+
+    /// whether a quantized attention cache is rotated (NS_Q35_KV_ROT)
+    pub fn kv_rotated(&self) -> bool {
+        self.kv_rot
     }
 
     pub fn has_draft(&self) -> bool {
@@ -2268,10 +2388,11 @@ impl<'g> Qwen35<'g> {
             match st {
                 LState::Full { k, v } => {
                     for c in [k, v] {
-                        let mut b = vec![0u8; g.heads_kv * s.pos * g.head * 2];
+                        let rb = kv_rb(c, g.heads_kv, s.max_ctx);
+                        let mut b = vec![0u8; g.heads_kv * s.pos * rb];
                         for h in 0..g.heads_kv {
-                            let n = s.pos * g.head * 2;
-                            c.read(h * s.max_ctx * g.head * 2, &mut b[h * n..(h + 1) * n])?;
+                            let n = s.pos * rb;
+                            c.read(h * s.max_ctx * rb, &mut b[h * n..(h + 1) * n])?;
                         }
                         bufs.push(b);
                     }
@@ -2287,10 +2408,11 @@ impl<'g> Qwen35<'g> {
         }
         if let Some(ms) = &s.mtp {
             for c in [&ms.k, &ms.v] {
-                let mut b = vec![0u8; g.heads_kv * s.pos * g.head * 2];
+                let rb = kv_rb(c, g.heads_kv, s.max_ctx);
+                let mut b = vec![0u8; g.heads_kv * s.pos * rb];
                 for h in 0..g.heads_kv {
-                    let n = s.pos * g.head * 2;
-                    c.read(h * s.max_ctx * g.head * 2, &mut b[h * n..(h + 1) * n])?;
+                    let n = s.pos * rb;
+                    c.read(h * s.max_ctx * rb, &mut b[h * n..(h + 1) * n])?;
                 }
                 bufs.push(b);
             }
@@ -2317,12 +2439,13 @@ impl<'g> Qwen35<'g> {
                 LState::Full { k, v } => {
                     for c in [k, v] {
                         let b = it.next().ok_or_else(|| e("a short checkpoint"))?;
-                        let n = ck.pos * g.head * 2;
+                        let rb = kv_rb(c, g.heads_kv, s.max_ctx);
+                        let n = ck.pos * rb;
                         if b.len() != g.heads_kv * n {
                             return Err(e("a checkpoint of another shape"));
                         }
                         for h in 0..g.heads_kv {
-                            c.write(h * s.max_ctx * g.head * 2, &b[h * n..(h + 1) * n])?;
+                            c.write(h * s.max_ctx * rb, &b[h * n..(h + 1) * n])?;
                         }
                     }
                 }
@@ -2340,12 +2463,13 @@ impl<'g> Qwen35<'g> {
         if let Some(ms) = &s.mtp {
             for c in [&ms.k, &ms.v] {
                 let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's cache"))?;
-                let n = ck.pos * g.head * 2;
+                let rb = kv_rb(c, g.heads_kv, s.max_ctx);
+                        let n = ck.pos * rb;
                 if b.len() != g.heads_kv * n {
                     return Err(e("a checkpoint of another shape"));
                 }
                 for h in 0..g.heads_kv {
-                    c.write(h * s.max_ctx * g.head * 2, &b[h * n..(h + 1) * n])?;
+                    c.write(h * s.max_ctx * rb, &b[h * n..(h + 1) * n])?;
                 }
             }
             let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's state"))?;

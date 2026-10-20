@@ -38,6 +38,13 @@ int ns_q35_attn_decode_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t D);
 int64_t ns_q35_attn_decode_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0);
 int ns_q35_attn_decode(ns_gpu* g, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
                        int64_t cap, int64_t p0, float* out, float* scratch);
+/* The two above against a cache of form kt: 0 half (512 bytes a head's row), 1 q8_0 (272: the 256 int8 values, then 8
+ * half scales), 2 q4_0 (144: 8 blocks of 16 bytes - byte j value j low, j + 16 high - then 8 half scales); its rows
+ * widened to half as they are staged (q35.h: ns_q35_kv_store_q writes them) */
+int ns_q35_attn_prompt_kv(ns_gpu* g, int kt, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
+                          int64_t cap, int64_t p0, float* out);
+int ns_q35_attn_decode_kv(ns_gpu* g, int kt, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D,
+                          int64_t cap, int64_t p0, float* out, float* scratch);
 /* Weights to half for a prompt pass's GEMMs (dequant.cpp; the shared one is ns_dequant_f16): n values (a multiple of
  * 256) of a stored matrix into dst. Covers Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ3_S, IQ4_XS */
 int ns_q35_dequant_f16_supported(int type);

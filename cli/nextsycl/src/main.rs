@@ -96,6 +96,8 @@ language models (nextsycl llm ...; the names without `llm` still work):
                  [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--seed S] [--gpu N[,M]] [--no-mtp]
                  [--image PATH ...]  pictures before the prompt (a vision model's)
                  [--logits-out PATH]  the prompt's last logits as float32 (a check against a reference)
+                 [--score FILE [--score-max N (256)] [--dump OUT | --ref OUT]]  FILE's tokens teacher-forced after the
+                                prompt: their perplexity; --dump writes the logits, --ref compares with a dump (KL, top-1)
   nextsycl llm info <model.gguf>      the architecture and geometry, every tensor checked by role, bytes by group
   nextsycl llm tokenize <model.gguf> <text>
   nextsycl llm check <model.gguf> <dump dir> [--gpu N[,M]]    the forward pass against a reference dump
@@ -466,7 +468,10 @@ fn generate(args: &[String]) -> Result<(), String> {
     // --ctx N: the session's context (default the prompt and --max: the server's sessions are larger)
     // --image PATH (repeatable): pictures before the prompt's text, for a vision model (each up to 1,024 positions)
     let images: Vec<String> = args.windows(2).filter(|w| w[0] == "--image").map(|w| w[1].clone()).collect();
-    let room = images.len() * 1024;
+    // --score FILE: that text's tokens teacher-forced after the prompt (--score-max N, 256): their perplexity; --dump
+    // OUT writes every row's logits, --ref OUT compares with such a dump (another run's: a cache form against another)
+    let score_max: usize = opt("--score-max").and_then(|v| v.parse().ok()).unwrap_or(256);
+    let room = images.len() * 1024 + if opt("--score").is_some() { score_max } else { 0 };
     let ctx = opt("--ctx").and_then(|v| v.parse().ok()).unwrap_or(ids.len() + room + max + 1).max(ids.len() + max + 1);
     let eng = load_engine(&f, &gs, LoadOptions { expert_bytes: expert_gib.map(|x| (x * (1u64 << 30) as f64) as usize),
                                                  mirror_bytes: mirror_gib.map(|x| (x * (1u64 << 30) as f64) as usize), draft: mtp,
@@ -507,6 +512,57 @@ fn generate(args: &[String]) -> Result<(), String> {
     // --logits-out PATH: the prompt's last position's logits as float32 (a check against a reference's)
     if let Some(p) = opt("--logits-out") {
         std::fs::write(&p, logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).map_err(|x| format!("{p}: {x}"))?;
+    }
+    if let Some(sf) = opt("--score") {
+        let text = std::fs::read_to_string(&sf).map_err(|x| format!("{sf}: {x}"))?;
+        let mut sc = tok.encode(&text);
+        sc.truncate(score_max);
+        if sc.is_empty() || ids.len() + sc.len() + 1 > ctx {
+            return Err(format!("--score {sf}: {} tokens after a prompt of {} in a context of {ctx}", sc.len(), ids.len()));
+        }
+        // row i: the distribution that predicts sc[i] (row 0 the prompt's last logits)
+        let mut rows = vec![logits];
+        let mut at = 0;
+        while at + 1 < sc.len() {
+            // 8 rows a pass: the head reads every row (decode-width products; a wider pass would expand it to half)
+            let end = (at + 8).min(sc.len() - 1);
+            rows.extend(eng.forward_rows(&mut sess, &sc[at..end], end - at, &mut none).map_err(e)?);
+            at = end;
+        }
+        let lsm = |l: &[f32]| -> Vec<f64> {
+            let mx = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let lse = mx + l.iter().map(|&v| (v as f64 - mx).exp()).sum::<f64>().ln();
+            l.iter().map(|&v| v as f64 - lse).collect()
+        };
+        let m = rows.len() as f64;
+        let nll: f64 = rows.iter().zip(&sc).map(|(r, &y)| -lsm(r)[y as usize]).sum::<f64>() / m;
+        eprintln!("[score: {} tokens, perplexity {:.4}]", rows.len(), nll.exp());
+        if let Some(out) = opt("--dump") {
+            let b: Vec<u8> = rows.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(&out, b).map_err(|x| format!("{out}: {x}"))?;
+        }
+        if let Some(rf) = opt("--ref") {
+            let raw = std::fs::read(&rf).map_err(|x| format!("{rf}: {x}"))?;
+            let nv = rows[0].len();
+            if raw.len() != rows.len() * nv * 4 {
+                return Err(format!("--ref {rf}: {} bytes, {} rows of {nv} logits expected", raw.len(), rows.len()));
+            }
+            let (mut kl, mut kmax, mut top1, mut rnll) = (0.0f64, 0.0f64, 0usize, 0.0f64);
+            let argmax = |v: &[f32]| v.iter().enumerate().fold(0, |b, (i, x)| if *x > v[b] { i } else { b });
+            for (i, r) in rows.iter().enumerate() {
+                let refr: Vec<f32> = raw[i * nv * 4..(i + 1) * nv * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                let (p, q) = (lsm(&refr), lsm(r));
+                // KL(reference || this run) of the row
+                let k: f64 = p.iter().zip(&q).map(|(a, b)| a.exp() * (a - b)).sum();
+                kl += k;
+                kmax = kmax.max(k);
+                top1 += (argmax(&refr) == argmax(r)) as usize;
+                rnll -= p[sc[i] as usize];
+            }
+            eprintln!("[against {rf}: KL mean {:.5} max {:.4}, top-1 the same {:.1}%, perplexity {:.4} (the reference's {:.4})]", kl / m, kmax,
+                      100.0 * top1 as f64 / m, nll.exp(), (rnll / m).exp());
+        }
+        return Ok(());
     }
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let seed: u64 = opt("--seed").and_then(|v| v.parse().ok()).unwrap_or(1);

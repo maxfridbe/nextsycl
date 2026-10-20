@@ -114,7 +114,13 @@ impl Engine for engine::Qwen35<'_> {
     }
     fn cache_fingerprint(&self) -> String {
         // checkpoints hold the draft block's cache too when it is loaded
-        if self.has_draft() { "qwen35 f16-kv nsq35-1 mtp".into() } else { "qwen35 f16-kv nsq35-1".into() }
+        // and the attention cache's forms (all half: the name checkpoints had before the forms)
+        let kv = if self.kv_tys.iter().all(|t| *t == engine::KvTy::F16) {
+            "f16-kv".to_string()
+        } else {
+            format!("{}-kv{}", self.kv_tys.iter().map(|t| t.name()).collect::<Vec<_>>().join(","), if self.kv_rotated() { " rot" } else { "" })
+        };
+        format!("qwen35 {kv} nsq35-1{}", if self.has_draft() { " mtp" } else { "" })
     }
     fn session(&self, max_ctx: usize) -> Result<Session> {
         Ok(Session::new(engine::Qwen35::session(self, max_ctx)?))

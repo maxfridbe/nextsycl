@@ -1194,6 +1194,20 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   see on the B70; its rotary positions are Qwen3-VL's (row and column), and the prompt cache holds across turns with
   pictures. Against llama.cpp's mtmd on the same file: the picture's rows cos 0.999998, the prompt's last logits as
   close as text alone (0.989 on Q4 against the CPU), the same greedy answer.
+- **The attention cache's form** (`NS_Q35_KV`, a card at a time; `NS_Q35_KV_ROT=1` rotates a quantized one by a
+  32-value Hadamard transform): half by default, q8_0 or q4_0 (llama.cpp's blocks) for room. Q4 on the B70 with MTP,
+  measured with `llm generate --score` (256 tokens teacher-forced after a 12.8K prompt, against half; the noise floor -
+  half read in other chunks - KL 0.00014):
+
+  | NS_Q35_KV | KL mean (max) | top-1 the same | perplexity | one session's most context | 43K prompt read / decode |
+  |---|---:|---:|---:|---:|---:|
+  | f16 (default) | - | - | 2.688 | 196K | 742 / 43.0 tok/s |
+  | q8 | 0.00024 (0.019) | 99.2% | 2.698 | 368K | 673 / 38.9 |
+  | q8, rotated | 0.00018 (0.009) | 99.6% | 2.696 | 368K | |
+  | q4 | 0.0032 (0.041) | 99.6% | 2.706 | 704K | 718 / 40.9 |
+  | q4, rotated | 0.0023 (0.104) | 99.6% | 2.705 | 704K | |
+
+  `auto` puts q8_0 on the card the plan fills first and half on the others (`auto-q4`: q4_0 there).
 - **Two requests at once** decode together: each one's verify rows and drafts in the same passes (the same tokens as
   alone). Q4, 256-token answers: B70 one 47 tok/s, two 29 + 29; both cards (256K) one 44, two 26 + 26.
 

@@ -31,10 +31,19 @@ int ns_q35_vit_bias_act(ns_gpu* g, float* y, const float* b, int64_t rows, int64
 int ns_q35_vit_rope(ns_gpu* g, float* qkv, int64_t n, int64_t H, int64_t D, const float* cs, float* kh);
 /* The heads' outputs ob [H][r][D] as rows out [r][H x D] */
 int ns_q35_vit_heads(ns_gpu* g, const float* ob, int64_t H, int64_t r, int64_t D, float* out);
-/* LogProbChain's attention of one query row q [Hq x D] over the cache's first n keys: each head's softmax weights
- * (1 / sqrt(D)), per key their mean over the heads (mode 0) or their largest (mode 1), added to out [n]; scratch [Hq][2] */
-int ns_q35_attn_probs(ns_gpu* g, const float* q, const void* kc, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t n, int mode,
+/* LogProbChain's attention of one query row q [Hq x D] over the cache's first n keys (its form kt: 0 half, 1 q8_0, 2
+ * q4_0): each head's softmax weights (1 / sqrt(D)), per key their mean over the heads (mode 0) or their largest (mode
+ * 1), added to out [n]; scratch [Hq][2] */
+int ns_q35_attn_probs(ns_gpu* g, int kt, const float* q, const void* kc, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t n, int mode,
                       float* scratch, float* out);
+/* The cache as q8_0 (kt 1: 272 bytes a head's row) or q4_0 (kt 2: 144) - llama.cpp's blocks of 32 (q4_0 exactly as
+ * ggml's quantize_row_q4_0), the 8 half scales behind the row's values (silo/attn.cpp reads them): rows k, v as in
+ * ns_q35_kv_store */
+int ns_q35_kv_store_q(ns_gpu* g, int kt, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap,
+                      int64_t p0, void* kc, void* vc);
+/* A normalized 32-point Walsh-Hadamard transform (its own inverse) of each block of 32 of rows x [rows][n] (rows stride
+ * floats apart): a quantized cache's rotation (NS_Q35_KV_ROT) */
+int ns_q35_fwht32(ns_gpu* g, float* x, int64_t rows, int64_t n, int64_t stride);
 /* SYCL graphs: recording what is queued on the GPU's queue from begin (*out: the graph) to end (then finalized; it ran
  * nothing), launched as one submission, freed */
 int ns_q35_graph_begin(ns_gpu* g, void** out);

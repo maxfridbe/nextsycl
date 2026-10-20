@@ -40,6 +40,43 @@ using half = sycl::half;
 // sub-group's stores on one bank (padding measured no faster at 16 keys: 0)
 constexpr int D = 256, HALF_D = 128, SG = 16, M = 8, CH = Q35_ATTN_CH, CHP = CH + 8, KS = CH + Q35_ATTN_KPAD;
 
+// the cache's row of a key head and position, by its form (KT): 0 half [256], 1 q8_0 (the 256 int8 values, then 8
+// half scales: 272 bytes), 2 q4_0 (8 blocks of 16 bytes - byte j of a block holds value j low, value j + 16 high - then
+// 8 half scales: 144 bytes); llama.cpp's q8_0 / q4_0 blocks with the scales moved behind the values
+template <int KT> constexpr int64_t kv_row() { return KT == 0 ? 512 : KT == 1 ? 272 : 144; }
+
+// features 8c .. 8c + 7 of a row as 8 halves (packed in a uint4)
+template <int KT>
+inline sycl::uint4 kv_load8(const uint8_t* row, int c) {
+    if constexpr (KT == 0) {
+        return *reinterpret_cast<const sycl::uint4*>(row + 16 * c);
+    } else {
+        float f[8];
+        if constexpr (KT == 1) {
+            const sycl::uint2 w = *reinterpret_cast<const sycl::uint2*>(row + 8 * c);
+            const float d = (float) reinterpret_cast<const half*>(row + 256)[c >> 2];
+            const uint32_t ww[2] = {w.x(), w.y()};
+#pragma unroll
+            for (int i = 0; i < 8; ++i) f[i] = (float) (int8_t) ((ww[i >> 2] >> (8 * (i & 3))) & 0xff) * d;
+        } else {
+            const int blk = c >> 2, sub = c & 3;
+            const sycl::uint2 w = *reinterpret_cast<const sycl::uint2*>(row + blk * 16 + (sub & 1) * 8);
+            const float d = (float) reinterpret_cast<const half*>(row + 128)[blk];
+            const int sh = sub >= 2 ? 4 : 0;
+            const uint32_t ww[2] = {w.x(), w.y()};
+#pragma unroll
+            for (int i = 0; i < 8; ++i) f[i] = (float) ((int) (((ww[i >> 2] >> (8 * (i & 3))) >> sh) & 15) - 8) * d;
+        }
+        uint32_t o[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const half a = (half) f[2 * i], b = (half) f[2 * i + 1];
+            o[i] = (uint32_t) sycl::bit_cast<uint16_t>(a) | ((uint32_t) sycl::bit_cast<uint16_t>(b) << 16);
+        }
+        return sycl::uint4(o[0], o[1], o[2], o[3]);
+    }
+}
+
 template <typename T>
 inline auto lp(T* p) {
     return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
@@ -65,9 +102,10 @@ struct Slm {
 // does not depend on the other rows (the DPAS rows are independent, the masks and the softmax a row's own) nor on
 // how many there are, and its splits come from its own position: a verify row is the one-row decode's, bit for bit.
 int64_t dec_splits(int64_t kv, int64_t Hkv);
-template <int G, bool SPLIT>
-void attn_flash(sycl::queue& queue, const float* q, int64_t qs, const half* kc, const half* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
+template <int G, bool SPLIT, int KT>
+void attn_flash(sycl::queue& queue, const float* q, int64_t qs, const uint8_t* kc, const uint8_t* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
                 int64_t p0, float* out, int64_t kbs, int64_t ns, float* part) {
+    constexpr int64_t RB = kv_row<KT>();
     constexpr int NSG = 2 * G, WG = NSG * SG;
     using L = Slm<G>;
     const int64_t blocks = SPLIT ? ns : (T + M - 1) / M;
@@ -120,14 +158,14 @@ void attn_flash(sycl::queue& queue, const float* q, int64_t qs, const half* kc, 
 #pragma unroll
             for (int t = 0; t < HALF_D / 16; ++t) jm::joint_matrix_fill(sg, o[t], 0.0f);
 
-            const half* kb = kc + hk * cap * D;
-            const half* vb = vc + hk * cap * D;
+            const uint8_t* kb = kc + hk * cap * RB;
+            const uint8_t* vb = vc + hk * cap * RB;
             for (int64_t j0 = jbeg; j0 < jend; j0 += CH) {
                 // ---- 1. the chunk's keys packed (keys past the last row's are zeros: masked below)
                 for (int i = tid; i < CH * (D / 8); i += WG) {   // K: key n, features 8c .. 8c + 7 -> words [4c .. 4c + 3][n]
                     const int n = i / (D / 8), c = i % (D / 8);
                     sycl::uint4 w(0, 0, 0, 0);
-                    if (j0 + n < jend) w = *reinterpret_cast<const sycl::uint4*>(kb + (j0 + n) * D + 8 * c);
+                    if (j0 + n < jend) w = kv_load8<KT>(kb + (j0 + n) * RB, c);
                     kp[(4 * c + 0) * KS + n] = w.x();
                     kp[(4 * c + 1) * KS + n] = w.y();
                     kp[(4 * c + 2) * KS + n] = w.z();
@@ -136,8 +174,8 @@ void attn_flash(sycl::queue& queue, const float* q, int64_t qs, const half* kc, 
                 for (int i = tid; i < (CH / 2) * (D / 8); i += WG) {   // V: keys 2p, 2p + 1, features 8c .. -> words [p][8c ..]
                     const int pr = i / (D / 8), c = i % (D / 8);
                     sycl::uint4 a(0, 0, 0, 0), b(0, 0, 0, 0);
-                    if (j0 + 2 * pr < jend) a = *reinterpret_cast<const sycl::uint4*>(vb + (j0 + 2 * pr) * D + 8 * c);
-                    if (j0 + 2 * pr + 1 < jend) b = *reinterpret_cast<const sycl::uint4*>(vb + (j0 + 2 * pr + 1) * D + 8 * c);
+                    if (j0 + 2 * pr < jend) a = kv_load8<KT>(vb + (j0 + 2 * pr) * RB, c);
+                    if (j0 + 2 * pr + 1 < jend) b = kv_load8<KT>(vb + (j0 + 2 * pr + 1) * RB, c);
                     const uint32_t av[4] = {a.x(), a.y(), a.z(), a.w()}, bv[4] = {b.x(), b.y(), b.z(), b.w()};
                     uint32_t* dst = vp + pr * D + 8 * c;
 #pragma unroll
@@ -274,10 +312,10 @@ void attn_flash(sycl::queue& queue, const float* q, int64_t qs, const half* kc, 
     });
 }
 
-template <int G>
-void attn_prompt(sycl::queue& queue, const float* q, int64_t qs, const half* kc, const half* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
+template <int G, int KT>
+void attn_prompt(sycl::queue& queue, const float* q, int64_t qs, const uint8_t* kc, const uint8_t* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
                  int64_t p0, float* out) {
-    attn_flash<G, false>(queue, q, qs, kc, vc, T, Hq, Hkv, cap, p0, out, 0, 1, nullptr);
+    attn_flash<G, false, KT>(queue, q, qs, kc, vc, T, Hq, Hkv, cap, p0, out, 0, 1, nullptr);
 }
 
 // ---- decode rows (at most 8): the flash kernel above in its SPLIT form, the keys split over ~512 work-groups.
@@ -294,8 +332,8 @@ int64_t dec_splits(int64_t kv, int64_t Hkv) {
 
 // decode on XMX: the rows of the pass together when their splits are the same size (all but where a row's context
 // crosses a split step), else a row at a time - the same arithmetic either way - then the splits merged
-template <int G>
-void flash_decode(sycl::queue& queue, const float* q, int64_t qs, const half* kc, const half* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
+template <int G, int KT>
+void flash_decode(sycl::queue& queue, const float* q, int64_t qs, const uint8_t* kc, const uint8_t* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap,
                   int64_t p0, float* out, float* part) {
     int64_t ns = 1;
     bool same = true;
@@ -304,10 +342,10 @@ void flash_decode(sycl::queue& queue, const float* q, int64_t qs, const half* kc
         same = same && dec_split(p0 + r + 1, Hkv) == dec_split(p0 + 1, Hkv);
     }
     if (same) {
-        attn_flash<G, true>(queue, q, qs, kc, vc, T, Hq, Hkv, cap, p0, out, dec_split(p0 + 1, Hkv), ns, part);
+        attn_flash<G, true, KT>(queue, q, qs, kc, vc, T, Hq, Hkv, cap, p0, out, dec_split(p0 + 1, Hkv), ns, part);
     } else {
         for (int64_t r = 0; r < T; ++r)
-            attn_flash<G, true>(queue, q + r * qs, qs, kc, vc, 1, Hq, Hkv, cap, p0 + r, out + r * Hq * D, dec_split(p0 + r + 1, Hkv), ns,
+            attn_flash<G, true, KT>(queue, q + r * qs, qs, kc, vc, 1, Hq, Hkv, cap, p0 + r, out + r * Hq * D, dec_split(p0 + r + 1, Hkv), ns,
                                 part ? part + r * Hq * ns * (D + 2) : nullptr);
     }
     if (ns > 1) {   // the splits merged (their maxima in log2 units)
@@ -342,7 +380,21 @@ int ns_q35_attn_prompt(ns_gpu* g, const float* q, int64_t qs, const void* kc, co
                        int64_t cap, int64_t p0, float* out) {
     NS_TRY
     if (!ns_q35_attn_prompt_supported(T, Hq, Hkv, Dh)) return ns_fail("ns_q35_attn_prompt: more than 8 rows, heads of 256, 6 query heads a key head");
-    attn_prompt<6>(g->q, q, qs, (const half*) kc, (const half*) vc, T, Hq, Hkv, cap, p0, out);
+    attn_prompt<6, 0>(g->q, q, qs, (const uint8_t*) kc, (const uint8_t*) vc, T, Hq, Hkv, cap, p0, out);
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_attn_prompt_kv(ns_gpu* g, int kt, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh,
+                          int64_t cap, int64_t p0, float* out) {
+    NS_TRY
+    if (!ns_q35_attn_prompt_supported(T, Hq, Hkv, Dh)) return ns_fail("ns_q35_attn_prompt_kv: more than 8 rows, heads of 256, 6 query heads a key head");
+    const auto* k = (const uint8_t*) kc;
+    const auto* v = (const uint8_t*) vc;
+    if (kt == 0) attn_prompt<6, 0>(g->q, q, qs, k, v, T, Hq, Hkv, cap, p0, out);
+    else if (kt == 1) attn_prompt<6, 1>(g->q, q, qs, k, v, T, Hq, Hkv, cap, p0, out);
+    else if (kt == 2) attn_prompt<6, 2>(g->q, q, qs, k, v, T, Hq, Hkv, cap, p0, out);
+    else return ns_fail("ns_q35_attn_prompt_kv: a cache form 0 (half), 1 (q8_0) or 2 (q4_0)");
     return 0;
     NS_CATCH
 }
@@ -362,7 +414,22 @@ int ns_q35_attn_decode(ns_gpu* g, const float* q, int64_t qs, const void* kc, co
     NS_TRY
     if (!ns_q35_attn_decode_supported(T, Hq, Hkv, Dh)) return ns_fail("ns_q35_attn_decode: 1..8 rows, heads of 256, 6 query heads a key head");
     if (ns_q35_attn_decode_scratch(T, Hq, Hkv, Dh, p0) > 0 && !scratch) return ns_fail("ns_q35_attn_decode: no scratch");
-    flash_decode<6>(g->q, q, qs, (const half*) kc, (const half*) vc, T, Hq, Hkv, cap, p0, out, scratch);
+    flash_decode<6, 0>(g->q, q, qs, (const uint8_t*) kc, (const uint8_t*) vc, T, Hq, Hkv, cap, p0, out, scratch);
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_attn_decode_kv(ns_gpu* g, int kt, const float* q, int64_t qs, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t Dh,
+                          int64_t cap, int64_t p0, float* out, float* scratch) {
+    NS_TRY
+    if (!ns_q35_attn_decode_supported(T, Hq, Hkv, Dh)) return ns_fail("ns_q35_attn_decode_kv: 1..8 rows, heads of 256, 6 query heads a key head");
+    if (ns_q35_attn_decode_scratch(T, Hq, Hkv, Dh, p0) > 0 && !scratch) return ns_fail("ns_q35_attn_decode_kv: no scratch");
+    const auto* k = (const uint8_t*) kc;
+    const auto* v = (const uint8_t*) vc;
+    if (kt == 0) flash_decode<6, 0>(g->q, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
+    else if (kt == 1) flash_decode<6, 1>(g->q, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
+    else if (kt == 2) flash_decode<6, 2>(g->q, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
+    else return ns_fail("ns_q35_attn_decode_kv: a cache form 0 (half), 1 (q8_0) or 2 (q4_0)");
     return 0;
     NS_CATCH
 }
