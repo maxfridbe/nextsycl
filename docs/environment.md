@@ -541,6 +541,10 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_STD_OA` | 0 | 1: decode's grouped o_a (a Q8_0 / Q6_K one) in one launch of the std kernel (alone faster, end to end no gain) | llm deepseek41 |
 | `NS_DS41_STD_KU` | 2 | blocks a sub-group's decode product of an Unsloth-form expert decodes before multiplying (1, 2 or 4; their loads in flight together) | llm deepseek41 |
 | `NS_DS41_DENSE_Q4K` | 0 | 1: attention's and the shared expert's Q8_0 weights are requantized to q4_K when loaded (Q6_K ones too; half the bytes a decode token reads, the fused q4_K kernels apply; an approximation, a few seconds more at load) | llm deepseek41 |
+| `NS_DS41_PROMPT_PREFETCH` | 1 | a prompt pass starts reading the next layer's file experts while it computes this one | llm deepseek41 |
+| `NS_DS41_COLD_SKIP_PROMPT` | 0 | a prompt pass leaves out a file-only expert that gets at most `NS_DS41_COLD_SKIP_PROMPT_MAX` tokens, all with a routing-weight share under this (an approximation: measure the perplexity after such a prompt) | llm deepseek41 |
+| `NS_DS41_COLD_SKIP_PROMPT_MAX` | 4 | the most tokens such an expert may get | llm deepseek41 |
+| `NS_DS41_PROMPT_PREFETCH_MIN` | 4096 | the fewest tokens in a pass for that prefetch (below, the early reads only contend with the layer's own) | llm deepseek41 |
 | `NS_DS41_READERS` | 16 | the read-ahead's reader threads (a job a slab of an expert in ggml's row types) | llm deepseek41 |
 | `NS_DS41_PROMPT_READERS` | 16 | the prompt path's threads reading the file-only experts of a layer | llm deepseek41 |
 | `NS_DS41_DRAFTER` | none | the DSpark drafter file (Unsloth's `dspark-*.gguf`) of an Unsloth-form model, with `NS_DS41_MTP=1`; else `dspark-*.gguf` in the model's folder or its parent's | llm deepseek41 |
@@ -552,7 +556,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_PROMPT_MMV` | 0 | a prompt pass's experts with at most this many of its tokens multiplied by the decode kernels (8 tokens an entry) instead of the XMX product from the indices (vq_gemm, faster at every count measured) | llm deepseek41 |
 | `NS_DS41_PROMPT_MMV_V` | 3 | the decode kernels' variant (NS_DS41_VQ_V's numbers) for those experts | llm deepseek41 |
 | `NS_DS41_PROMPT_RING` | 24 | a prompt pass's VRAM staging slots (a slot an expert, from each GPU's expert memory) for the experts in host memory or only in the file: copied up on the copy lane, half the ring a wave, while the others are multiplied (0: host-memory experts read in place, the file's swapped in) | llm deepseek41 |
-| `NS_DS41_PROMPT_FILE_SLOTS` | 64 | a prompt pass's pinned slots (each GPU) for the experts only the file holds: read on 8 threads while the GPU multiplies the others (0: a wave at a time on the host thread) | llm deepseek41 |
+| `NS_DS41_PROMPT_FILE_SLOTS` | 320 | a prompt pass's pinned slots (each GPU, two halves for two layers) for the experts only the file holds: read on the reader pool while the GPU multiplies the others (0: a wave at a time on the host thread) | llm deepseek41 |
 | `NS_DS41_PIPE_LOG` | 0 | 1: each prompt chunk's time on each GPU of the two-GPU pipeline (and the second's wait for the first), on stderr; 2: and each layer's attention and experts apart (a GPU sync between them) | llm deepseek41 |
 | `NS_DS41_PLACE` | expert | Experiment: `layer` fills VRAM, then pinned memory, with the experts in layer order (the last layers of a GPU then live in the file alone) instead of every layer the same share | llm deepseek41 |
 | `NS_DS41_VQ_LUT` | 1 | 0: the VQ lookup-table variant left out of the decode products' timing at load | llm deepseek41 |
