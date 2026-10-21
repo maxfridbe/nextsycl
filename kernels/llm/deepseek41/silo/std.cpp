@@ -242,9 +242,9 @@ template <> struct Deq<T_Q8_0> {
 // y[(y0 + c) * rows + r] = W_e[r, :] . x[col_c] for the entries' matrices: entry e's rows at ptrs[e], meta[e] = {ncol, y0,
 // col_0 .. col_7}. A sub-group works RPS rows at once (their blocks' loads issued together, the sums then): a row alone is a
 // chain of dependent small loads
-template <int T, int RPS>
+template <int T, int RPS, int KU, int NC>
 void mmv(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const float* x, float* y, int64_t rows, int64_t cols) {
-    constexpr int SG = 32, RPG = 4, MC = 8, SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32;
+    constexpr int SG = 32, RPG = 4, MC = NC, SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32;
     const int64_t rgs = (rows + RPG * RPS - 1) / (RPG * RPS), nb = cols / 256, rowb = nb * SB;
     q.submit([&](sycl::handler& h) {
     sycl::local_accessor<uint64_t, 1> l64(sycl::range<1>(N64 > 0 ? N64 : 1), h);
@@ -263,22 +263,36 @@ void mmv(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int64_t entr
         if (nc == 0 || r0 >= rows) return;
         const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
         float acc[RPS][MC] = {};
-        for (int64_t k = 0; k < nb; ++k) {
-            float w[RPS][8];
+        for (int64_t k0 = 0; k0 < nb; k0 += KU) {
+            // KU blocks of RPS rows decoded first (their loads in flight together), then multiplied
+            float w[KU][RPS][8];
 #pragma unroll
-            for (int j = 0; j < RPS; ++j) {
-                const int64_t r = r0 + j < rows ? r0 + j : rows - 1;
-                Deq<T>::group(base + r * rowb + k * SB, lane, w[j], L);
+            for (int u = 0; u < KU; ++u) {
+                const int64_t k = k0 + u < nb ? k0 + u : nb - 1;
+#pragma unroll
+                for (int j = 0; j < RPS; ++j) {
+                    const int64_t r = r0 + j < rows ? r0 + j : rows - 1;
+                    Deq<T>::group(base + r * rowb + k * SB, lane, w[u][j], L);
+                }
             }
-            for (int c = 0; c < nc; ++c) {
-                const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(x + (int64_t) me[2 + c] * cols + k * 256 + lane * 8);
-                const sycl::float4 a = xv[0], b = xv[1];
 #pragma unroll
-                for (int j = 0; j < RPS; ++j)
-                    acc[j][c] += w[j][0] * a.x() + w[j][1] * a.y() + w[j][2] * a.z() + w[j][3] * a.w() + w[j][4] * b.x() + w[j][5] * b.y() + w[j][6] * b.z() + w[j][7] * b.w();
+            for (int c = 0; c < NC; ++c) {
+                if (c >= nc) break;
+#pragma unroll
+                for (int u = 0; u < KU; ++u) {
+                    if (k0 + u >= nb) break;
+                    const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(x + (int64_t) me[2 + c] * cols + (k0 + u) * 256 + lane * 8);
+                    const sycl::float4 a = xv[0], b = xv[1];
+#pragma unroll
+                    for (int j = 0; j < RPS; ++j)
+                        acc[j][c] += w[u][j][0] * a.x() + w[u][j][1] * a.y() + w[u][j][2] * a.z() + w[u][j][3] * a.w() + w[u][j][4] * b.x() + w[u][j][5] * b.y() +
+                                     w[u][j][6] * b.z() + w[u][j][7] * b.w();
+                }
             }
         }
-        for (int c = 0; c < nc; ++c) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (c >= nc) break;
 #pragma unroll
             for (int j = 0; j < RPS; ++j) {
                 const float s = sycl::reduce_over_group(sg, acc[j][c], sycl::plus<float>());
@@ -327,15 +341,25 @@ int ns_ds41_std_supported(int type, int64_t cols) {
     return sb_bytes(type) != 0 && cols > 0 && cols % 256 == 0;
 }
 
-int ns_ds41_std_mmv(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const float* x, float* y, int64_t rows, int64_t cols) {
+int ns_ds41_std_mmv(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const float* x, float* y, int64_t rows, int64_t cols,
+                    int64_t ncmax) {
     NS_TRY
     if (!ns_ds41_std_supported(type, cols)) return ns_fail("ns_ds41_std_mmv: type " + std::to_string(type) + " with cols " + std::to_string(cols));
     // rows a sub-group (NS_DS41_STD_RPS: 1, 2 or 4)
     static const int rps = [] { const char* v = std::getenv("NS_DS41_STD_RPS"); return v ? std::atoi(v) : 2; }();
+    // blocks a row at a time (NS_DS41_STD_KU: 1, 2 or 4)
+    static const int ku = [] { const char* v = std::getenv("NS_DS41_STD_KU"); return v ? std::atoi(v) : 1; }();
     switch (type) {
-#define CASE(T) case T: if (rps == 4) mmv<T, 4>(g->q, ptrs, meta, entries, x, y, rows, cols); else if (rps == 2) mmv<T, 2>(g->q, ptrs, meta, entries, x, y, rows, cols); else mmv<T, 1>(g->q, ptrs, meta, entries, x, y, rows, cols); return 0;
+#define RUN(T, R, K, N) mmv<T, R, K, N>(g->q, ptrs, meta, entries, x, y, rows, cols)
+#define BY_NC(T, R, K) if (ncmax <= 1) RUN(T, R, K, 1); else if (ncmax <= 2) RUN(T, R, K, 2); else if (ncmax <= 4) RUN(T, R, K, 4); else RUN(T, R, K, 8);
+#define CASE(T) case T: \
+        if (rps == 1) { if (ku == 2) { BY_NC(T, 1, 2) } else { BY_NC(T, 1, 1) } } \
+        else if (ku == 2) { BY_NC(T, 2, 2) } else { BY_NC(T, 2, 1) } \
+        return 0;
         CASE(T_Q8_0) CASE(T_Q2_K) CASE(T_Q3_K) CASE(T_Q5_K) CASE(T_Q6_K) CASE(T_IQ2_XXS) CASE(T_IQ2_XS) CASE(T_IQ3_XXS) CASE(T_IQ1_S) CASE(T_IQ3_S) CASE(T_IQ2_S) CASE(T_MXFP4)
 #undef CASE
+#undef BY_NC
+#undef RUN
         default: return ns_fail("ns_ds41_std_mmv: type");
     }
     NS_CATCH

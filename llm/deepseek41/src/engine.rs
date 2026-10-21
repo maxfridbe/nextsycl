@@ -69,6 +69,13 @@ pub static ENS_SLOT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// GUESS_HIT)
 pub static GUESS_HITS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 pub static GUESS_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Decode's routed experts held by neither VRAM nor host memory ("cold"): by their share of the layer's routing weight
+/// (<0.05, <0.1, <0.15, <0.2, <0.3, more), the layers with one, and those whose cold ones are all under 0.1
+pub static COLD_BINS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+pub static COLD_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COLD_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COLD_LAYERS_LOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DEC_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GUESS_LAST: Mutex<Vec<(u64, Vec<usize>)>> = Mutex::new(Vec::new());
 pub static WALL_STREAMS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WALL_LAYERS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -144,6 +151,35 @@ fn spare_slots() -> usize {
 fn file_ahead() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_usize("NS_DS41_FILE_AHEAD", 8).min(STAGE / 2))
+}
+/// The grouped o_a of one decode row in one launch of the std kernel (NS_DS41_STD_OA=1; default 0: a launch a group of the
+/// shared kernel - alone one launch is faster (98 against 138 us), end to end the eight overlap and it measured no gain)
+fn std_oa() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_STD_OA").is_ok_and(|v| v == "1"))
+}
+/// Attention's and the shared expert's Q8_0 / Q6_K weights requantized to q4_K when loaded (NS_DS41_DENSE_Q4K=1; default 0): half
+/// the bytes a decode token reads and the fused q4_K kernels apply. An approximation - measure the perplexity
+fn dense_q4k() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_DENSE_Q4K").is_ok_and(|v| v == "1"))
+}
+/// Decode leaves out a routed expert held by neither VRAM nor host memory (nor already being read ahead) whose share of the
+/// layer's routing weight is under this (NS_DS41_COLD_SKIP, default 0: none): its read is a ~4 ms stall for a layer, its
+/// output a few percent of the layer's routed sum. An approximation - measure the perplexity (generate --score)
+fn cold_skip() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_COLD_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
+}
+/// ... the remaining experts' weights then scaled up by the left-out share (NS_DS41_COLD_RENORM, default 0; 1: on)
+fn cold_renorm() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_COLD_RENORM").is_ok_and(|v| v == "1"))
+}
+/// ... also one whose read ahead is on its way (NS_DS41_COLD_SKIP_AHEAD, default 1; 0: wait for those)
+fn cold_skip_ahead() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_COLD_SKIP_AHEAD").map_or(true, |v| v != "0"))
 }
 /// The chance of use from which decode reads a file expert ahead (NS_DS41_FILE_AHEAD_P, default 0.2 against the measured
 /// GUESS_HIT: guesses that miss take the drive from the reads that matter - IQ2_XXS on an unseen prompt 8.7 -> 14.4 tok/s)
@@ -633,6 +669,8 @@ pub struct Part {
     q8: DevBuf,
     /// the routers' biases on the host
     biases: Mutex<HashMap<u64, Arc<Vec<f32>>>>,
+    /// per layer, the std kernel's table for the grouped o_a at one row (a Q8_0 / Q6_K o_a): 8 groups' pointers, then meta
+    oa_tab: Mutex<HashMap<u64, Arc<DevBuf>>>,
     vq: HashMap<u64, LayerVq>,
     cbs: HashMap<u64, DevBuf>,
     /// the codebooks as float32 (the decode products' weights without a conversion each)
@@ -968,10 +1006,10 @@ impl Part {
     /// from the indices, the ggml-typed form's by dequantizing in the kernel
     #[allow(clippy::too_many_arguments)]
     fn exp_mmv(&self, l: u64, down: bool, table: &DevBuf, entries: usize, x: &DevBuf, y: (&DevBuf, usize), y_rows: usize, rows: usize, cols: usize, var: i32,
-               lut: Option<(usize, usize)>) -> Result<()> {
+               lut: Option<(usize, usize)>, ncmax: usize) -> Result<()> {
         let v = &self.vq[&l];
         if let Some(s) = &v.std {
-            return self.ops.std_mmv(s.ty[if down { 2 } else { 0 }].code(), table, entries, x, y, y_rows, rows, cols);
+            return self.ops.std_mmv(s.ty[if down { 2 } else { 0 }].code(), table, entries, x, y, y_rows, rows, cols, ncmax);
         }
         let cb = self.cbs.get(&l).ok_or_else(|| Error(format!("layer {l}: no codebook")))?;
         self.ops.vq_mmv(table, entries, (cb, vq_wide((&self.cbf, &self.cbh), l, var)), x, y, y_rows, rows, cols, v.nbit, var, lut)
@@ -1744,10 +1782,22 @@ impl Part {
                 }
                 let t = m.tensor(l, r).ok_or_else(|| Error(format!("block {l}: {r:?} missing")))?;
                 let n = t.elements() as usize;
-                let raw = DevBuf::new(gpu, t.bytes as usize)?;
-                raw.write(0, &m.file.read(t).map_err(e)?)?;
-                bytes += t.bytes;
                 let cols = *t.shape.last().unwrap_or(&1) as usize;
+                let host = m.file.read(t).map_err(e)?;
+                let to_q4k = dense_q4k() && matches!(t.ty, GType::Q8_0 | GType::Q6K) && n.is_multiple_of(256) && cols.is_multiple_of(256)
+                    && matches!(r, Role::QA | Role::QB | Role::Kv | Role::OutA | Role::OutB | Role::ShGate | Role::ShUp | Role::ShDown);
+                let (raw, ty) = if to_q4k {
+                    let q = crate::requant::to_q4k(&host, n, t.ty == GType::Q6K);
+                    let raw = DevBuf::new(gpu, q.len())?;
+                    raw.write(0, &q)?;
+                    bytes += q.len() as u64;
+                    (raw, GType::Q4K)
+                } else {
+                    let raw = DevBuf::new(gpu, t.bytes as usize)?;
+                    raw.write(0, &host)?;
+                    bytes += t.bytes;
+                    (raw, t.ty)
+                };
                 if VECTORS.contains(&r) {
                     let f = DevBuf::f32(gpu, n)?;
                     ops.dequant(t.ty.code(), &raw, 0, t.bytes as usize, n, &f)?;
@@ -1756,8 +1806,8 @@ impl Part {
                     let f = DevBuf::f32(gpu, n)?;
                     ops.dequant(t.ty.code(), &raw, 0, t.bytes as usize, n, &f)?;
                     mats.insert((l, r), Mat { buf: f, ty: GType::F32, rows: n / cols, cols });
-                } else if matches!(t.ty, GType::Q4K | GType::Fp8B32) || ops.mmvq_supported(t.ty.code()) {
-                    mats.insert((l, r), Mat { buf: raw, ty: t.ty, rows: n / cols, cols });
+                } else if matches!(ty, GType::Q4K | GType::Fp8B32) || ops.mmvq_supported(ty.code()) {
+                    mats.insert((l, r), Mat { buf: raw, ty, rows: n / cols, cols });
                 } else {
                     return Err(Error(format!("{}: type {} is not one this engine multiplies", t.name, t.ty.name())));
                 }
@@ -2011,7 +2061,7 @@ impl Part {
         let ring = if ring_bytes > 0 { Some((DevBuf::new(gpu, ring_bytes)?, ring_slot)) } else { None };
         let nfs = prompt_file_slots();
         let pstage = if ring_bytes > 0 && nfs > 0 { Some((Mutex::new(HostBuf::new(gpu, nfs * ring_slot)?), ring_slot, Mutex::new(vec![None; nfs]))) } else { None };
-        Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
+        Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), oa_tab: Mutex::new(HashMap::new()), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
                   hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
                   up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage, devtab,
                   reader: if file_ahead() > 0 { Some(FileReader::new(&m.file.paths, env_usize("NS_DS41_READERS", 16))?) } else { None } })
@@ -2931,6 +2981,32 @@ impl<'g> Ds41<'g> {
         let o = &p.ops;
         let (ng, ol, gw) = (g.o_groups as usize, g.o_lora as usize, (g.n_head * g.head_dim / g.o_groups) as usize);
         match p.groups.get(&l) {
+            // one decode row, a Q8_0 / Q6_K o_a: all the groups in one launch of the std kernel (each group an entry: its rows'
+            // pointer, input vector g of att's row, output slice g of oa's) - eight launches and two permutes before
+            Some(_) if tr == 1 && std_oa() && o.std_supported(p.mat(l, Role::OutA)?.ty.code(), gw) => {
+                let w = p.mat(l, Role::OutA)?;
+                let tab = {
+                    let mut m = p.oa_tab.lock().unwrap();
+                    match m.get(&l) {
+                        Some(t) => t.clone(),
+                        None => {
+                            let rb = w.ty.bytes(w.cols as u64).ok_or("o_a: a row of whole blocks")? as usize;
+                            let mut tb: Vec<u8> = (0..ng).flat_map(|gi| (w.buf.ptr() as u64 + (gi * ol * rb) as u64).to_le_bytes()).collect();
+                            for gi in 0..ng as i32 {
+                                for v in [1i32, gi, gi, 0, 0, 0, 0, 0, 0, 0] {
+                                    tb.extend(v.to_le_bytes());
+                                }
+                            }
+                            let t = DevBuf::new(&o.gpu, tb.len())?;
+                            t.write(0, &tb)?;
+                            let t = Arc::new(t);
+                            m.insert(l, t.clone());
+                            t
+                        }
+                    }
+                };
+                o.std_mmv(w.ty.code(), &tab, ng, att, (oa, r0 * ng * ol), ng, ol, gw, 1)
+            }
             Some(_) if tr < dense_f16_min() && q4k_own() && p.mat(l, Role::OutA)?.ty == GType::Q4K => {
                 // every group in one launch: rows [g o_lora, ..) read their heads [g gw, ..) of att's row; 8 rows of att
                 // a launch
@@ -3573,9 +3649,9 @@ impl<'g> Ds41<'g> {
             let (dn, gu, hset) = (p.arena.f32(used * d)?, p.arena.f32(2 * used * f)?, p.arena.f32(used * f)?);
             let nbit = vq.nbit;
             let pick = p.vq_pick.get(&nbit).copied().unwrap_or([0, 0]);
-            p.exp_mmv(l, false, &gtab, 2 * used, x, (&gu, 0), 2 * used, f, d, pick[0], Some((1, 2 * used)))?;
+            p.exp_mmv(l, false, &gtab, 2 * used, x, (&gu, 0), 2 * used, f, d, pick[0], Some((1, 2 * used)), 1)?;
             o.swiglu_clamp(&gu.view(0, used * f * 4)?, &gu.view(used * f * 4, used * f * 4)?, &hset, used * f, lim)?;
-            p.exp_mmv(l, true, &dtab, used, &hset, (&dn, 0), used, d, f, pick[1], Some((used, 1)))?;
+            p.exp_mmv(l, true, &dtab, used, &hset, (&dn, 0), used, d, f, pick[1], Some((used, 1)), 1)?;
             early = Some((info, dn, ctab));
         }
         let pending = match early_read {
@@ -3645,8 +3721,56 @@ impl<'g> Ds41<'g> {
             }
         }
         ROUTE_HOST_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        if t == 1 && self.prof.is_some() && !p.draft.contains_key(&l) {
+            if let Ok(st) = p.store(l) {
+                let c = st.lock().unwrap();
+                let (mut any, mut low) = (false, true);
+                DEC_LAYERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for (ex, v) in &by {
+                    if c.loc.contains_key(&(l, *ex as u64)) {
+                        continue;
+                    }
+                    let frac = v[0].1 / g.expert_scale as f32;
+                    let bin = [0.05, 0.1, 0.15, 0.2, 0.3].iter().position(|b| frac < *b).unwrap_or(5);
+                    COLD_BINS[bin].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    any = true;
+                    low &= frac < 0.1;
+                }
+                if any {
+                    COLD_LAYERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if low {
+                        COLD_LAYERS_LOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
         tap(&format!("ffn_shexp-{l}"), &y)?;
-        let need: Vec<u64> = by.keys().map(|e| *e as u64).collect();
+        // cold experts of small weight left out (NS_DS41_COLD_SKIP): their rows of the products stay zero
+        let mut skip: Vec<bool> = vec![false; by.len()];
+        if cold_skip() > 0.0 && t <= MMVQ_COLS && by.len() > 1 && !p.draft.contains_key(&l) {
+            if let Ok(st) = p.store(l) {
+                let c = st.lock().unwrap();
+                for (k, (ex, v)) in by.iter().enumerate() {
+                    let key = (l, *ex as u64);
+                    if !c.loc.contains_key(&key) && (cold_skip_ahead() || !c.ahead.contains_key(&key)) && v.iter().all(|x| x.1 / (g.expert_scale as f32) < cold_skip()) {
+                        skip[k] = true;
+                    }
+                }
+            }
+            if skip.iter().all(|s| *s) {
+                skip.fill(false);
+            }
+        }
+        let skipped = skip.iter().filter(|s| **s).count();
+        COLD_SKIPPED.fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
+        // the kept experts' weight scale: 1, or total / kept when renormalizing
+        let wscale = if skipped > 0 && cold_renorm() {
+            let (all, kept): (f32, f32) = by.values().zip(&skip).fold((0.0, 0.0), |(a, k), (v, sk)| (a + v[0].1, if *sk { k } else { k + v[0].1 }));
+            if kept > 0.0 { all / kept } else { 1.0 }
+        } else {
+            1.0
+        };
+        let need: Vec<u64> = by.keys().enumerate().filter(|(k, _)| !skip[*k]).map(|(_, e)| *e as u64).collect();
         if t == 1 && self.prof.is_some() {
             let mut gl = GUESS_LAST.lock().unwrap();
             if let Some(i) = gl.iter().position(|(ly, _)| *ly == l) {
@@ -3663,6 +3787,29 @@ impl<'g> Ds41<'g> {
         let staging = !promote && p.ring.is_some() && !p.draft.contains_key(&l);
         let (slots_of, arriving, copies) =
             if staging { (Vec::new(), Vec::new(), None) } else { self.timed(p, "experts: misses", || p.ensure(&self.m, l, &need, promote))? };
+        // the slots of the experts left out: a view of the first one's (never read)
+        let (slots_of, arriving) = if skipped > 0 && !slots_of.is_empty() {
+            let (mut so, mut ar) = (Vec::with_capacity(skip.len()), Vec::with_capacity(skip.len()));
+            let (mut it, mut ia) = (slots_of.into_iter(), arriving.into_iter());
+            let mut keep0: Option<DevBuf> = None;
+            for sk in skip.iter() {
+                if *sk {
+                    so.push(None);
+                    ar.push(false);
+                } else {
+                    let b = it.next().ok_or("ensure: a slot short")?;
+                    ar.push(ia.next().unwrap_or(false));
+                    if keep0.is_none() {
+                        keep0 = Some(b.view(0, b.len)?);
+                    }
+                    so.push(Some(b));
+                }
+            }
+            let k0 = keep0.ok_or("every expert left out")?;
+            (so.into_iter().map(|b| b.map_or_else(|| k0.view(0, k0.len), Ok)).collect::<Result<Vec<_>>>()?, ar)
+        } else {
+            (slots_of, arriving)
+        };
         let vq = &p.vq[&l];
         let nbit = vq.nbit;
         let total: usize = by.values().map(|v| v.len()).sum();
@@ -3678,11 +3825,22 @@ impl<'g> Ds41<'g> {
             Some((_, dn, _)) => dn.view(0, dn.len)?,
             None => p.arena.f32(total * d)?,
         };
+        for (k, sk) in skip.iter().enumerate() {
+            if *sk {
+                let n = lists[k].len() * d * 4;
+                p.upload(&dn.view(first[k] * d * 4, n)?, &vec![0u8; n])?;
+            }
+        }
+        // the GPU routing's combine weights: the skipped ones zero (their rows are too), the kept scaled
+        if let (Some((_, _, ctab)), true) = (&early, wscale != 1.0) {
+            let ws: Vec<f32> = lists.iter().zip(&skip).map(|(v, sk)| if *sk { 0.0 } else { v[0].1 * wscale }).collect();
+            p.upload(&ctab.view((2 + used) * 4, used * 4)?, &f32s(&ws))?;
+        }
         if t <= MMVQ_COLS {
             self.timed(p, "experts: products", || {
                 let gu = p.arena.f32(2 * total * f)?;
                 // routed on the GPU: only the experts it found no VRAM slot for are left
-                let (now, later): (Vec<usize>, Vec<usize>) = (0..lists.len()).filter(|&k| early.is_none() || emiss.get(k).copied().unwrap_or(true)).partition(|&k| !arriving[k]);
+                let (now, later): (Vec<usize>, Vec<usize>) = (0..lists.len()).filter(|&k| !skip[k] && (early.is_none() || emiss.get(k).copied().unwrap_or(true))).partition(|&k| !arriving[k]);
                 for (set, wait) in [(&now, false), (&later, true)] {
                     if set.is_empty() {
                         continue;
@@ -3759,13 +3917,13 @@ impl<'g> Ds41<'g> {
                     p.upload(&gtab, &tb)?;
                     let dtab = p.arena.bytes(db.len())?;
                     p.upload(&dtab, &db)?;
-                    p.exp_mmv(l, false, &gtab, ptrs.len(), x, (&gu, 0), 2 * total, f, d, pick[0], glut)?;
+                    p.exp_mmv(l, false, &gtab, ptrs.len(), x, (&gu, 0), 2 * total, f, d, pick[0], glut, lists.iter().map(|v| v.len()).max().unwrap_or(1))?;
                     // h = silu(gate) up, in place of the gates (rows of the set only: the same op on the others is a no-op
                     // since they are computed once - the whole range is cheap and simplest)
                     let (gv, uv) = (gu.view(0, total * f * 4)?, gu.view(total * f * 4, total * f * 4)?);
                     let hset = p.arena.f32(total * f)?;
                     o.swiglu_clamp(&gv, &uv, &hset, total * f, lim)?;
-                    p.exp_mmv(l, true, &dtab, dptr.len(), &hset, (&dn, 0), total, d, f, pick[1], dlut)?;
+                    p.exp_mmv(l, true, &dtab, dptr.len(), &hset, (&dn, 0), total, d, f, pick[1], dlut, lists.iter().map(|v| v.len()).max().unwrap_or(1))?;
                     if !wait {
                         TURN_NS.fetch_add(turn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -3876,7 +4034,7 @@ impl<'g> Ds41<'g> {
         let mut per_tok: Vec<Vec<(usize, f32)>> = vec![Vec::new(); t];
         for (k, list) in lists.iter().enumerate() {
             for (j, (ti, w)) in list.iter().enumerate() {
-                per_tok[*ti as usize].push((first[k] + j, *w));
+                per_tok[*ti as usize].push((first[k] + j, if skip[k] { 0.0 } else { *w * wscale }));
             }
         }
         for v in &per_tok {
@@ -3987,9 +4145,9 @@ impl<'g> Ds41<'g> {
                 let dtab = p.arena.bytes(db.len())?;
                 p.upload(&dtab, &db)?;
                 let var = prompt_mmv_variant();
-                p.exp_mmv(l, false, &gtab, gp.len(), x, (&gu, 0), 2 * slots, f, d, var, None)?;
+                p.exp_mmv(l, false, &gtab, gp.len(), x, (&gu, 0), 2 * slots, f, d, var, None, 8)?;
                 o.swiglu_clamp(&gu.view(0, slots * f * 4)?, &gu.view(slots * f * 4, slots * f * 4)?, &hh, slots * f, lim)?;
-                p.exp_mmv(l, true, &dtab, dp.len(), &hh, (dn, 0), total, d, f, var, None)?;
+                p.exp_mmv(l, true, &dtab, dp.len(), &hh, (dn, 0), total, d, f, var, None, 8)?;
                 p.arena.rewind(mk);
             }
             let lists_big: Vec<usize> = set.iter().copied().filter(|&k| lists[k].len() > few).collect();

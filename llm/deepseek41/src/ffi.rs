@@ -74,7 +74,7 @@ pub struct Api {
     pub ds41_vq_dequant: unsafe extern "C" fn(Gpu, *const c_void, *const u8, i64, i64, i64, *mut c_void, c_int) -> c_int,
     pub ds41_vq_mmv: unsafe extern "C" fn(Gpu, *const u64, *const i32, i64, *const u8, *const f32, *const f32, *mut f32, i64, i64, i64, c_int) -> c_int,
     pub ds41_std_supported: unsafe extern "C" fn(c_int, i64) -> c_int,
-    pub ds41_std_mmv: unsafe extern "C" fn(Gpu, c_int, *const u64, *const i32, i64, *const f32, *mut f32, i64, i64) -> c_int,
+    pub ds41_std_mmv: unsafe extern "C" fn(Gpu, c_int, *const u64, *const i32, i64, *const f32, *mut f32, i64, i64, i64) -> c_int,
     pub ds41_std_dequant: unsafe extern "C" fn(Gpu, c_int, *const c_void, i64, i64, *mut c_void, c_int) -> c_int,
     pub ds41_vq_codebook_f32: unsafe extern "C" fn(Gpu, *const u8, i64, *mut f32) -> c_int,
     pub ds41_vq_gemm: unsafe extern "C" fn(Gpu, *const c_void, *const c_void, i64, i64, i64, i64, *const c_void, *const c_void, i64, i64, *mut f32, i64) -> c_int,

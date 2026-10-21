@@ -534,6 +534,13 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_STD_RPS` | 2 | rows a sub-group's decode product of an Unsloth-form expert works at once (1, 2 or 4; their loads issued together) | llm deepseek41 |
 | `NS_DS41_ODIRECT` | 0 | 1: the experts are read from the model's files with O_DIRECT (an aligned span into a thread's own buffer, the wanted bytes copied out) - one cold read is faster, but decode loses the page cache's hits (13.6 -> 12.7 tok/s) | llm deepseek41 |
 | `NS_DS41_READ_BENCH` | none | `llm kernels` on an Unsloth-form file times the experts' file reads instead (one expert at a time, buffered and O_DIRECT, then 4 / 16 / 32 in flight) | llm deepseek41 |
+| `NS_DS41_COLD_SKIP` | 0 | decode leaves out a routed expert held by neither VRAM nor host memory (nor being read ahead) whose share of the layer's routing weight is under this (an approximation: measure `generate --score`) | llm deepseek41 |
+| `NS_SCORE_ROWS` | 8 | `generate --score`: rows (1-8) fed a pass (1: as decode runs them) | llm |
+| `NS_DS41_COLD_RENORM` | 0 | with `NS_DS41_COLD_SKIP`, the experts kept have their weights scaled by (all / kept) | llm deepseek41 |
+| `NS_DS41_COLD_SKIP_AHEAD` | 1 | with `NS_DS41_COLD_SKIP`, also leave out an expert whose read ahead is on its way (0: wait for those) | llm deepseek41 |
+| `NS_DS41_STD_OA` | 0 | 1: decode's grouped o_a (a Q8_0 / Q6_K one) in one launch of the std kernel (alone faster, end to end no gain) | llm deepseek41 |
+| `NS_DS41_STD_KU` | 2 | blocks a sub-group's decode product of an Unsloth-form expert decodes before multiplying (1, 2 or 4; their loads in flight together) | llm deepseek41 |
+| `NS_DS41_DENSE_Q4K` | 0 | 1: attention's and the shared expert's Q8_0 weights are requantized to q4_K when loaded (Q6_K ones too; half the bytes a decode token reads, the fused q4_K kernels apply; an approximation, a few seconds more at load) | llm deepseek41 |
 | `NS_DS41_READERS` | 16 | the read-ahead's reader threads (a job a slab of an expert in ggml's row types) | llm deepseek41 |
 | `NS_DS41_PROMPT_READERS` | 16 | the prompt path's threads reading the file-only experts of a layer | llm deepseek41 |
 | `NS_DS41_DRAFTER` | none | the DSpark drafter file (Unsloth's `dspark-*.gguf`) of an Unsloth-form model, with `NS_DS41_MTP=1`; else `dspark-*.gguf` in the model's folder or its parent's | llm deepseek41 |

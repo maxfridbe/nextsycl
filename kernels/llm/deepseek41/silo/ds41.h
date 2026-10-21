@@ -140,7 +140,9 @@ int ns_ds41_fp8_mmv(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols, con
 int ns_ds41_std_supported(int type, int64_t cols);
 /* Decode products, vq_mmv's table: entry e = the matrix of `rows` rows at ptrs[e] against meta[e] = {ncol, y0, col_0 .. col_7}
  * columns of x [*][cols]: y[(y0 + c) * rows + r] = W . x[col_c] */
-int ns_ds41_std_mmv(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const float* x, float* y, int64_t rows, int64_t cols);
+/* ncmax: the most columns any entry has (1, 2, 4 or 8: the accumulators' count, fixed at compile time) */
+int ns_ds41_std_mmv(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const float* x, float* y, int64_t rows, int64_t cols,
+                    int64_t ncmax);
 /* A matrix [rows][cols] in `type` expanded to out [rows][cols] as fp16 (f16 = 1) or float32 */
 int ns_ds41_std_dequant(ns_gpu* g, int type, const void* src, int64_t rows, int64_t cols, void* out, int f16);
 

@@ -524,8 +524,9 @@ fn generate(args: &[String]) -> Result<(), String> {
         let mut rows = vec![logits];
         let mut at = 0;
         while at + 1 < sc.len() {
-            // 8 rows a pass: the head reads every row (decode-width products; a wider pass would expand it to half)
-            let end = (at + 8).min(sc.len() - 1);
+            // 8 rows a pass: the head reads every row (decode-width products; a wider pass would expand it to half);
+            // NS_SCORE_ROWS=1: one row a pass, as decode runs
+            let end = (at + std::env::var("NS_SCORE_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).clamp(1, 8)).min(sc.len() - 1);
             rows.extend(eng.forward_rows(&mut sess, &sc[at..end], end - at, &mut none).map_err(e)?);
             at = end;
         }

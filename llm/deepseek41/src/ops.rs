@@ -796,7 +796,7 @@ impl Ops {
     /// `vq_mmv`'s products for expert matrices in a ggml type: `table` = u64 matrix pointers [entries], then i32 meta
     /// [entries][10] ({ncol, y0, cols}); y [(y0 + c) * rows + r] (floats from `y.1`, `y_rows` rows of `rows` in all)
     #[allow(clippy::too_many_arguments)]
-    pub fn std_mmv(&self, ty: u32, table: &DevBuf, entries: usize, x: &DevBuf, y: (&DevBuf, usize), y_rows: usize, rows: usize, cols: usize) -> Result<()> {
+    pub fn std_mmv(&self, ty: u32, table: &DevBuf, entries: usize, x: &DevBuf, y: (&DevBuf, usize), y_rows: usize, rows: usize, cols: usize, ncmax: usize) -> Result<()> {
         if entries == 0 {
             return Ok(());
         }
@@ -806,7 +806,7 @@ impl Ops {
         // caller's rows of x.
         let rc = unsafe {
             let base = table.ptr().cast::<u8>();
-            (self.k.ds41_std_mmv)(self.raw(), ty as i32, base.cast(), base.add(entries * 8).cast(), entries as i64, x.fp(), y.0.fp().add(y.1), rows as i64, cols as i64)
+            (self.k.ds41_std_mmv)(self.raw(), ty as i32, base.cast(), base.add(entries * 8).cast(), entries as i64, x.fp(), y.0.fp().add(y.1), rows as i64, cols as i64, ncmax as i64)
         };
         self.ok(rc, "ds41_std_mmv")
     }

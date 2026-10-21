@@ -10,6 +10,7 @@ pub const ARCH: &str = "deepseek41";
 
 pub mod engine;
 pub mod engram;
+pub mod requant;
 pub mod ffi;
 pub mod model;
 pub mod ops;
@@ -251,6 +252,13 @@ impl Engine for engine::Ds41<'_> {
         v.push(format!("[expert misses: waited {:.2} s for read-aheads, {:.2} s in the staged reads (of it {:.2} s for a staging slot), {:.2} s submitting the swaps, \
                         {:.2} s for copies the products needed]", ld(&engine::ENS_AHEAD_NS), ld(&engine::ENS_STAGE_NS), ld(&engine::ENS_SLOT_NS), ld(&engine::ENS_SWAP_NS),
                        ld(&engine::ENS_COPY_NS)));
+        {
+            let ld = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+            v.push(format!("[cold experts left out (NS_DS41_COLD_SKIP): {}]", ld(&engine::COLD_SKIPPED)));
+            v.push(format!("[cold experts (neither in VRAM nor host memory) of {} decode layers: {} layers have one, {} of them all under 0.1 of the routing weight; by share <0.05 / <0.1 / <0.15 / <0.2 / <0.3 / more: {}]",
+                           ld(&engine::DEC_LAYERS), ld(&engine::COLD_LAYERS), ld(&engine::COLD_LAYERS_LOW),
+                           engine::COLD_BINS.iter().map(ld).map(|x| x.to_string()).collect::<Vec<_>>().join(" / ")));
+        }
         let gn = engine::GUESS_N.load(std::sync::atomic::Ordering::Relaxed).max(1) as f64;
         v.push(format!("[the guess's k-th best expert among the next layer's picks (of {gn} decode layers), k = 1..16: {}]",
                        engine::GUESS_HITS.iter().map(|h| format!("{:.2}", h.load(std::sync::atomic::Ordering::Relaxed) as f64 / gn)).collect::<Vec<_>>().join(" ")));
