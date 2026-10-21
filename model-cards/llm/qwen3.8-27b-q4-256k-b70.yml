@@ -1,0 +1,20 @@
+# Qwen3.8-27B UD-Q4_K_M (4-bit; the B70 alone, 256K + 32K, 8-bit attention cache)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen3.8-27b-q4-256k-b70
+kind: llm
+arch: qwen35
+title: Qwen3.8-27B UD-Q4_K_M (4-bit; the B70 alone, 256K + 32K, 8-bit cache)
+about: 'Qwen''s dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth''s GGUF - Unsloth''s dynamic 4-bit; 15 GiB'
+gpus: "0"                       # the B65 stays free for other models
+ctx: 262144,32768
+tools: true
+tasks: true
+env: {NS_Q35_KV: q8_0}         # the attention cache as q8_0: 196K -> 368K on one card, KL 0.00024 against half (noise 0.00014), decode ~10% slower
+silo:                   # its tuned kernels: kernels/llm/qwen35/silo (dist/silo/libnextsycl-qwen35.so)
+  name: qwen35
+  required: true        # no load on the shared kernels alone (2-4x slower decode)
+files:
+  model: q27-q4
+  mtp: q27-mtp
+  vision: q27-mmproj
+guide: guides/chat.md
