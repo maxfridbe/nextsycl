@@ -1,0 +1,25 @@
+# DeepSeek-V4.1-Flash-1017 UD-IQ2_XXS, the fast setting: cold low-weight experts left out and attention in q4_K
+# model card (model-cards/README.md): the same files as deepseek-v4.1-flash-iq2xxs, two approximations switched on
+id: deepseek-v4.1-flash-iq2xxs-fast
+kind: llm
+arch: deepseek41
+title: DeepSeek-V4.1-Flash-1017 UD-IQ2_XXS fast · 128K context (both GPUs, pinned memory and the NVMe)
+about: "The UD-IQ2_XXS of deepseek-v4.1-flash-iq2xxs with two approximations on: a routed expert held by neither VRAM nor pinned memory whose share of the layer's routing weight is under 0.2 is left out (its read is a ~4 ms stall for a layer), and attention's and the shared expert's Q8_0 / Q6_K weights are requantized to q4_K when loaded (half the bytes a decode token reads, the fused q4_K kernels). Decode ~24 tok/s against ~14; teacher-forced perplexity 3-5% higher (3.60 against 3.42 and 4.02 against 3.91 on two texts). Load takes ~20 s longer."
+gpus: all
+streams: true
+vram_gib: 30.0
+ctx: '131072'
+tools: false
+tasks: false
+env: {NS_DS41_FREE_GIB: "1.5", NS_DS41_COLD_SKIP: "0.2", NS_DS41_DENSE_Q4K: "1"}
+silo:
+  name: deepseek41
+  required: true
+files:
+  model: deepseek-v4.1-flash-1017-iq2xxs-1
+  shard-2: deepseek-v4.1-flash-1017-iq2xxs-2
+  shard-3: deepseek-v4.1-flash-1017-iq2xxs-3
+  shard-4: deepseek-v4.1-flash-1017-iq2xxs-4
+  shard-5: deepseek-v4.1-flash-1017-iq2xxs-5
+  shard-6: deepseek-v4.1-flash-1017-iq2xxs-6
+guide: guides/chat.md
