@@ -19,7 +19,7 @@ We stand on the shoulders of giants.
 ## RUN
 
 `nextsycl models pull <id>`, then pick it in the front door (:8000) or the chat front end - or `nextsycl llm start <id>`
-for a chat model. Measured speeds, decode / prompt reading:
+for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt processing):
 
 **On two 32 GB cards** (measured on an Arc Pro B70 + B65, 61 GB of host RAM, an NVMe; two B70s at least as fast):
 
@@ -28,8 +28,8 @@ for a chat model. Measured speeds, decode / prompt reading:
 | `deepseek-r1-iq1s` | **DeepSeek-R1 671B** (unsloth UD-IQ1_S, 131 GiB) - the experts that do not fit VRAM in pinned RAM (multiplied on the CPU) and on the NVMe | ~8 tok/s / ~135 tok/s, 32K context |
 | `glm-5.3-flash-uncensored-256k` | **GLM-5.3-Flash** uncensored IQ2 | ~18 tok/s / 450-1,100 tok/s, to 256K |
 | `deepseek-v4-flash-iq2m`, `-256k` | **DeepSeek-V4-Flash 284B** (unsloth UD-IQ2_M, 84.7 GiB) - the experts beyond VRAM in pinned RAM; llama.cpp pages it from the disk (no result in 100 minutes) | ~27 tok/s with its MTP draft block (26 at 3.7K, 17 at 256K) / 635-1,000 tok/s (943 at 256K), 128K or 256K context (1M tested: 287 tok/s prompt, 12 tok/s decode) |
-| `deepseek-v4.1-flash-iq2xxs`, `-fast` | **DeepSeek-V4.1-Flash-1017** (Unsloth's UD-IQ2_XXS: 146 GiB of experts in IQ1_S-Q2_K by layer, its 126 GiB Engram table inside the file read a row at a time) - the experts beyond VRAM in pinned RAM and the NVMe. Exact: ~14 tok/s / 133 (2.5K) to 470 (25K) tok/s. `-fast` (cold low-weight experts left out, attention in q4_K; perplexity +3-5%): ~24 tok/s / 92 tok/s at 580 tokens, 425 at 10K | 128K context; a 12,000-token novel without a loop |
-| `deepseek-v4.1-flash-q3kxl` | the same model, Unsloth's UD-Q3_K_XL (DeepSeek's own MXFP4 experts in most layers, 253 GiB, two thirds streamed from the drive): the quality option | ~4 tok/s |
+| `deepseek-v4.1-flash-iq2xxs`, `-fast` | **DeepSeek-V4.1-Flash-1017** (Unsloth's UD-IQ2_XXS: 146 GiB of experts in IQ1_S-Q2_K by layer, its 126 GiB Engram table inside the file read a row at a time) - the experts beyond VRAM in pinned RAM and the NVMe. `-fast`: cold low-weight experts left out, attention in q4_K (perplexity +3-5%); a 12,000-token novel without a loop | exact: tg 7-9 tok/s after a prompt (~14 sustained) / pp 125 (2.5K) to 440-470 tok/s (25K-140K). `-fast`: tg 11-13 tok/s after a prompt (23 sustained over 12K tokens of prose) / pp 118-187 (2.5K) to ~475 tok/s (140K); 128K context. [Ladder](docs/ladders/deepseek-v4.1-flash-iq2xxs_ladder_stats.md) |
+| `deepseek-v4.1-flash-q3kxl` | the same model, Unsloth's UD-Q3_K_XL (DeepSeek's own MXFP4 experts in most layers, 253 GiB, two thirds streamed from the drive): the quality option | tg ~4.4 tok/s |
 | `nemotron-3.5-super-q2kxl` | **Nemotron 3.5 Super 120B-A12B** (unsloth UD-Q2_K_XL; hybrid Mamba-2 / latent MoE / attention; text only) | ~40 tok/s with its MTP drafts (30 without) / ~790-1,140 tok/s, 32K (128K tested: 868 / 34) |
 | `nemotron-3.5-super-iq1m` | **Nemotron 3.5 Super** UD-IQ1_M (the same; or on the B70 alone, experts in pinned RAM: ~21 tok/s / ~350 tok/s at 2K) | ~46 tok/s with MTP (32 without) / ~880-1,470 tok/s, 32K (128K tested: 1,120 / 38); `-b70`: the B70 alone, ~21 / 450-560 |
 
@@ -55,7 +55,7 @@ for a chat model. Measured speeds, decode / prompt reading:
 | `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |
 | `qwen3-tts-custom` | **Qwen3-TTS** speech | a minute of speech: 10.7 s (8.2 s int8); a sentence: 0.64 s |
 
-The earlier VQ GGUF of V4.1 (1.6-bit experts, ~23 tok/s) repeated itself past ~2K tokens and was dropped for Unsloth's: [docs/ports/deepseek41-unsloth.md](docs/ports/deepseek41-unsloth.md).
+The earlier VQ GGUF of V4.1 (1.6-bit experts, tg ~23 tok/s) repeated itself past ~2K tokens and was dropped for Unsloth's: [docs/ports/deepseek41-unsloth.md](docs/ports/deepseek41-unsloth.md).
 
 ## What it is
 
@@ -108,6 +108,8 @@ dist/nextsycl llm stop
 | Audio: songs (Music 3) and speech (Qwen3-TTS, Breeze, VibeVoice, S2 Pro, Voxtral, VoxCPM2) | [docs/audio.md](docs/audio.md) |
 | 3D: meshes from pictures, rigging and animation | [docs/3d.md](docs/3d.md) |
 | Speed: every model at each context length, benchy | [docs/speed.md](docs/speed.md), [docs/benchy/](docs/benchy/) |
+| Context ladders: pp and tg by prompt length, with the machine and silo each ran on | [docs/ladders/](docs/ladders/) |
+| Speed tricks: what each silo does, what was tried, what is open | [docs/tricks.md](docs/tricks.md) |
 | Long context: memory a token, scaling, what 256K takes | [docs/256k-context.md](docs/256k-context.md) |
 | How the code is laid out; every environment variable | [docs/architecture.md](docs/architecture.md), [docs/environment.md](docs/environment.md) |
 | Porting a model; the rules | [CONTRIBUTING.md](CONTRIBUTING.md) |

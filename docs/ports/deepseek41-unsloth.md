@@ -39,14 +39,18 @@ against ggml's own `dequantize_row_*`** (a C harness built from `ggml-quants.c`;
 
 | | exact | `-fast` |
 |---|---|---|
-| decode, an unseen prompt | ~14 tok/s | ~24 tok/s (23.1 over 12,000 tokens) |
-| prompt, 580 tokens | 12.6 s (46 tok/s) | 6.3 s (92 tok/s) |
-| prompt, 2,561 tokens | 133 tok/s | 166 tok/s |
-| prompt, 9,901 tokens | 392 tok/s | 425 tok/s |
-| prompt, 25,142 tokens | 470 tok/s | 445 tok/s |
+| tg, sustained (prose, a warm expert cache) | ~14 tok/s | ~24 tok/s (23.1 over 12,000 tokens) |
+| tg, the first 256-1,024 tokens after a 2.5K-140K technical prompt | 7-9 tok/s | 11-13 tok/s |
+| pp, 580 tokens | 12.6 s (46 tok/s) | 6.3 s (92 tok/s) |
+| pp, 2,561 tokens | 133 tok/s | 166 tok/s |
+| pp, 9,901 tokens | 392 tok/s | 425 tok/s |
+| pp, 25,142 tokens | 470 tok/s | 445 tok/s |
+| pp, 139,561 tokens | 448-473 tok/s | 474 tok/s |
 | quality: perplexity of two prose texts (exact 3.42 / 3.91) | - | 3.60 / 4.02 (+3-5%) |
 
-UD-Q3_K_XL (253 GiB of experts, two thirds streamed from the drive): ~4.4 tok/s.
+UD-Q3_K_XL (253 GiB of experts, two thirds streamed from the drive): tg ~4.4 tok/s.
+
+By prompt length, with the machine and silo: [the ladder](../ladders/deepseek-v4.1-flash-iq2xxs_ladder_stats.md).
 
 **Where the time goes** (`NS_PROFILE=1`, a device-time trace): per decode token ~41 ms of GPU kernels (dense Q8_0 / Q6_K
 ~16, expert products ~13, attention 2, the rest small ones) and, without the cold-expert skip, ~22 ms waiting on ~6 cold
@@ -56,11 +60,11 @@ experts read from the file (3.7 ms each, three slabs in parallel). A prompt touc
 
 ## What helped
 
-- Read-ahead on 16 reader threads, a job a slab (Q3_K_XL decode 2.7 -> 4.4 tok/s); speculating only on guesses likely
+- Read-ahead on 16 reader threads, a job a slab (Q3_K_XL tg 2.7 -> 4.4 tok/s); speculating only on guesses likely
   enough (`NS_DS41_FILE_AHEAD_P` 0.2 against the guess's *measured* hit rates, which were half the table inherited from
-  other models': 8.7 -> 14 tok/s).
+  other models': tg 8.7 -> 14 tok/s).
 - Prompt chunks of 16384 (the card's setting; `NS_PREFILL_CHUNK`, to 32768): each chunk re-reads every non-resident
-  expert, so 10K tokens went 258 -> 391 tok/s and 24K 311 -> 470; short prompts lose ~8% (fewer resident experts).
+  expert, so pp at 10K tokens went 258 -> 391 tok/s and at 24K 311 -> 470; short prompts lose ~8% (fewer resident experts).
   Per-expert asynchronous file reads and, for passes of 4096+ tokens, the next layer's cold experts read while this one
   computes (below that the early reads only contend).
 - The expert profile (`NS_EXPERT_PROFILE`; `generate` loads and saves it too): VRAM filled with the experts used most.
@@ -68,21 +72,21 @@ experts read from the file (3.7 ms each, three slabs in parallel). A prompt touc
 ## The fast setting (approximations, off by default, on in the `-fast` card)
 
 - `NS_DS41_COLD_SKIP=0.2`: decode leaves out a routed expert held by neither VRAM nor pinned memory whose share of the
-  layer's routing weight is under 0.2 (75% of cold experts are under 0.15). 12.5 -> 18 tok/s, perplexity +1.8%.
+  layer's routing weight is under 0.2 (75% of cold experts are under 0.15). tg 12.5 -> 18 tok/s, perplexity +1.8%.
   Rescaling the kept weights (`NS_DS41_COLD_RENORM`) made it worse; 0.4 is a cliff (+11%).
 - `NS_DS41_DENSE_Q4K=1`: attention's and the shared expert's Q8_0 / Q6_K weights requantized to q4_K at load (ggml's
   `quantize_row_q4_K_ref` algorithm, ~20 s more at load): half the bytes a token reads and the fused q4_K kernels
-  apply. +1.7% perplexity, ~+2 tok/s.
+  apply. +1.7% perplexity, tg ~+2 tok/s.
 - `NS_DS41_COLD_SKIP_PROMPT=0.3` (<= 8 tokens an expert): the same for prompt passes. A secret code buried in a 10K
   prompt is still found with 0.5 / 16 and the fast decode settings together.
 
 ## Tried, no gain
 
 The DSpark drafter (55% of drafts accepted, but a verify pass touches twice the experts and the towers take 6.7 GB of
-VRAM: 5.5 against 10 tok/s, then 15.5-16.3 against 18.3 even with cheap cold reads); O_DIRECT reads (one cold expert
-3.7 -> 2.5 ms, but decode loses the page cache's hits on repeating cold experts: 13.6 -> 12.7; `NS_DS41_ODIRECT`);
+VRAM: tg 5.5 against 10 tok/s, then 15.5-16.3 against 18.3 even with cheap cold reads); O_DIRECT reads (one cold expert
+3.7 -> 2.5 ms, but decode loses the page cache's hits on repeating cold experts: tg 13.6 -> 12.7; `NS_DS41_ODIRECT`);
 more reader threads, more pinned memory, a smaller VRAM reserve, prefetch thresholds (all within the run-to-run noise
-of +-5%); the grouped `o_a` in one launch (98 against 138 us alone, no gain end to end); unrolling the expert kernel
+of +-5%); an LRU pinned host tier (`NS_DS41_HOST_LRU`: tg 12.2 against 12.9 tok/s over 1,024 tokens); the grouped `o_a` in one launch (98 against 138 us alone, no gain end to end); unrolling the expert kernel
 over blocks (register spills).
 
 ## Open

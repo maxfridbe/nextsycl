@@ -4,7 +4,7 @@ id: deepseek-v4.1-flash-iq2xxs-fast
 kind: llm
 arch: deepseek41
 title: DeepSeek-V4.1-Flash-1017 UD-IQ2_XXS fast · 128K context (both GPUs, pinned memory and the NVMe)
-about: "The UD-IQ2_XXS of deepseek-v4.1-flash-iq2xxs with two approximations on: a routed expert held by neither VRAM nor pinned memory whose share of the layer's routing weight is under 0.2 is left out (its read is a ~4 ms stall for a layer), and attention's and the shared expert's Q8_0 / Q6_K weights are requantized to q4_K when loaded (half the bytes a decode token reads, the fused q4_K kernels). Decode ~24 tok/s against ~14; teacher-forced perplexity 3-5% higher (3.60 against 3.42 and 4.02 against 3.91 on two texts). Load takes ~20 s longer."
+about: "The UD-IQ2_XXS of deepseek-v4.1-flash-iq2xxs with two approximations on: a routed expert held by neither VRAM nor pinned memory whose share of the layer's routing weight is under 0.2 is left out (its read is a ~4 ms stall for a layer), and attention's and the shared expert's Q8_0 / Q6_K weights are requantized to q4_K when loaded (half the bytes a decode token reads, the fused q4_K kernels). tg ~24 tok/s sustained against ~14 (11-13 against 7-9 in the first few hundred tokens after a prompt); pp ~475 tok/s from 25K tokens; teacher-forced perplexity 3-5% higher (3.60 against 3.42 and 4.02 against 3.91 on two texts). Load takes ~20 s longer."
 gpus: all
 streams: true
 vram_gib: 30.0

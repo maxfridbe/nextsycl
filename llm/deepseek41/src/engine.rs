@@ -146,6 +146,13 @@ fn spare_slots() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_usize("NS_DS41_SPARE", 8))
 }
+/// A full host tier gives its least recently used expert back to the file for a VRAM expert moved down (NS_DS41_HOST_LRU=1;
+/// default 0: the tier keeps the experts it was loaded with, a VRAM expert with no free host slot is dropped - the LRU
+/// tier measured no gain: tg 12.2 against 12.9 tok/s over 1,024 tokens after a 2.5K-token prompt)
+fn host_lru() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_HOST_LRU", 0) != 0)
+}
 /// Decode reads ahead at most this many of the next layer's likely experts that only the file holds (NS_DS41_FILE_AHEAD,
 /// default 8; 0: none)
 fn file_ahead() -> usize {
@@ -626,6 +633,11 @@ struct Store {
     vowner: Vec<Option<(u64, u64)>>,
     vused: Vec<u64>,
     rfree: Vec<usize>,
+    /// each host slot's expert and the tick it was last used (moved down or read in place); a ticket after the GPU's
+    /// work so far, taken once a tick before a host slot is given up (products may still read it in place)
+    rowner: Vec<Option<(u64, u64)>>,
+    rused: Vec<u64>,
+    rmark: Option<i64>,
     tick: u64,
     hits: u64,
     misses: u64,
@@ -924,6 +936,7 @@ impl Part {
                         c.rwrite.insert(f, t);
                         c.down_any = Some(t);
                         c.loc.insert(v, Loc::R(f));
+                        c.rowner[f] = Some(v);
                     }
                     c.vfill.remove(&s);
                 }
@@ -1096,6 +1109,7 @@ impl Part {
             return Err(Error(format!("the expert store has {} VRAM slots; one layer needs {}", c.vowner.len(), need.len())));
         }
         c.tick += 1;
+        c.rmark = None;
         let tick = c.tick;
         if promote {
             for &x in need {
@@ -1117,7 +1131,7 @@ impl Part {
                         last = Some(last.map_or(tk, |a| a.max(tk)));
                     }
                 }
-                Some(Loc::R(_)) if !promote => {}
+                Some(Loc::R(r)) if !promote => c.rused[r] = tick,
                 _ => missing.push(ex),
             }
         }
@@ -1165,6 +1179,7 @@ impl Part {
             }
             Loc::R(r) => {
                 c.direct += 1;
+                c.rused[r] = tick;
                 let (rch, ro) = c.rat(r);
                 c.host[rch].device_view(ro, sb)
             }
@@ -1184,6 +1199,7 @@ impl Part {
         let mut c = self.store(l)?.lock().unwrap();
         let c = &mut *c;
         c.tick += 1;
+        c.rmark = None;
         let tick = c.tick;
         let sb = c.slot_bytes;
         let mut out = Vec::with_capacity(need.len());
@@ -1197,6 +1213,7 @@ impl Part {
                 }
                 Some(Loc::R(r)) => {
                     c.direct += 1;
+                    c.rused[r] = tick;
                     let (rch, ro) = c.rat(r);
                     Src::R(c.host[rch].device_view(ro, sb)?)
                 }
@@ -1324,13 +1341,15 @@ impl Part {
             zero = Some(self.tab_zero(c, v)?);
             c.loc.remove(&v);
             c.prefetched.remove(&v);
-            if let Some(f) = c.rfree.pop() {
+            if let Some((f, gone)) = self.host_slot(c)? {
                 let (rch, ro) = c.rat(f);
-                let t = self.ops.stream_copy_on(0, &c.host[rch].device_view(ro, sb)?, 0, &c.vram[vch], vo, sb, &[reading.get(&f).copied(), c.rread.get(&f).copied(), fill])?;
+                let t = self.ops.stream_copy_on(0, &c.host[rch].device_view(ro, sb)?, 0, &c.vram[vch], vo, sb, &[reading.get(&f).copied(), c.rread.get(&f).copied(), fill, gone])?;
                 down = Some(t);
                 c.rwrite.insert(f, t);
                 c.down_any = Some(t);
                 c.loc.insert(v, Loc::R(f));
+                c.rowner[f] = Some(v);
+                c.rused[f] = c.tick;
             }
         }
         let up = match from {
@@ -1343,6 +1362,7 @@ impl Part {
                 reading.insert(r, t);
                 c.rread.insert(r, t);
                 c.rfree.push(r);
+                c.rowner[r] = None;
                 c.vfill.insert(s, t);
                 c.last_up = Some(t);
                 Some(t)
@@ -1372,6 +1392,27 @@ impl Part {
         Ok(up)
     }
 
+    /// A host slot for an expert moved down from VRAM: a free one, else (NS_DS41_HOST_LRU) the least recently used
+    /// one's expert given back to the file (the loaded tier's least profiled first), with the ticket the copy into it
+    /// waits for (products reading it in place)
+    fn host_slot(&self, c: &mut Store) -> Result<Option<(usize, Option<i64>)>> {
+        if let Some(f) = c.rfree.pop() {
+            return Ok(Some((f, None)));
+        }
+        if !host_lru() {
+            return Ok(None);
+        }
+        let tick = c.tick;
+        let Some(f) = (0..c.rowner.len()).filter(|&i| c.rowner[i].is_some() && c.rused[i] != tick)
+            .min_by_key(|&i| (c.rused[i], std::cmp::Reverse(i))) else { return Ok(None) };
+        let v = c.rowner[f].take().unwrap();
+        c.loc.remove(&v);
+        if c.rmark.is_none() {
+            c.rmark = Some(self.ops.mark()?);
+        }
+        Ok(Some((f, c.rmark)))
+    }
+
     /// Decode's spare VRAM slots: an expert swapped in takes an empty slot, so its copy up waits for no copy down; the
     /// least recently used experts are moved down to host slots afterwards, off the products' path, until NS_DS41_SPARE
     /// slots are empty again (the next copy up into one waits for its copy down)
@@ -1398,14 +1439,16 @@ impl Part {
             c.loc.remove(&v);
             c.prefetched.remove(&v);
             let (vch, vo) = c.vat(sl);
-            if let Some(f) = c.rfree.pop() {
+            if let Some((f, gone)) = self.host_slot(c)? {
                 let (rch, ro) = c.rat(f);
                 let t = self.ops.stream_copy_on(0, &c.host[rch].device_view(ro, sb)?, 0, &c.vram[vch], vo, sb,
-                                                &[reading.get(&f).copied(), c.rread.get(&f).copied(), c.vfill.get(&sl).copied()])?;
+                                                &[reading.get(&f).copied(), c.rread.get(&f).copied(), c.vfill.get(&sl).copied(), gone])?;
                 c.rwrite.insert(f, t);
                 c.down_any = Some(t);
                 c.vfill.insert(sl, t);
                 c.loc.insert(v, Loc::R(f));
+                c.rowner[f] = Some(v);
+                c.rused[f] = c.tick;
             }
         }
         Ok(())
@@ -2008,8 +2051,10 @@ impl Part {
                 loc.insert(*k, Loc::V(i));
                 vowner[i] = Some(*k);
             }
+            let mut rowner = vec![None; nr];
             for (i, k) in in_r.iter().enumerate() {
                 loc.insert(*k, Loc::R(i));
+                rowner[i] = Some(*k);
             }
             log(format!("{} (layers {:?}, {:.2} MiB experts): {} in VRAM ({:.1} GiB), {} in pinned host memory ({:.1} GiB), {} on the file only",
                         gpu.name, ls, slot_bytes as f64 / 1048576.0, in_v.len(), gib(nv * slot_bytes), in_r.len(), gib(nr * slot_bytes), n_exp - in_v.len() - in_r.len()));
@@ -2018,7 +2063,7 @@ impl Part {
             for l in ls {
                 store_of.insert(*l, stores.len());
             }
-            stores.push(Mutex::new(Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree: (in_r.len()..nr).collect(), tick: 0, hits: 0, rread: HashMap::new(),
+            stores.push(Mutex::new(Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree: (in_r.len()..nr).collect(), rowner, rused: vec![0; nr], rmark: None, tick: 0, hits: 0, rread: HashMap::new(),
                                            slotaddr: None, vzero: HashMap::new(), n_expert: g.n_expert as usize,
                                            misses: 0, from_host: 0, from_file: 0, direct: 0, rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(),
                                            last_up: None, prefetched: HashMap::new(), usage: HashMap::new(), base: nv, lend: 0, lent: false, pf_issued: 0,

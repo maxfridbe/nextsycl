@@ -12,25 +12,31 @@ clean 4.1K-word story. Not the sampler (nucleus only), not decode vs prefill (co
 Test: the 10K-token story (scratchpad prompt "Write a very long, detailed science-fiction story (at least 9000 words) about a
 lighthouse keeper on a drifting space station. Do not stop early."), unique-word ratio and 5-gram repeats by 500 words.
 
-- [ ] Engine reads the llama.cpp / Unsloth form (arch `deepseek41`, reference: llama.cpp PR 30817) - branch `ds41-unsloth`
+- [x] Engine reads the llama.cpp / Unsloth form (arch `deepseek41`, reference: llama.cpp PR 30817), merged to main
   - [x] MXFP8 (ggml 43), metadata aliases (`ple.*`, `indexer.*`), tensor names, no draft towers, merged `ffn_*_exps` roles
   - [x] the Engram from `per_layer_token_embd` (MXFP8 reordered on the host; Q5_K / Q6_K / IQ4_NL dequantized on the GPU)
   - [x] dense weights in any type the shared kernels multiply (Q8_0 / Q6_K / Q5_K), BF16 as float32
-  - [ ] routed experts as merged tensors (MXFP4, Q3_K, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, Q2_K by layer): slot
-        of three slabs, decode products, prompt products; first a correct path, then fast kernels in the silo
-  - [ ] cards + registry for UD-Q3_K_XL (452 GB: ~263 GB of model, mostly streamed) and UD-IQ2_XXS (~280 GB), 128K / 1M
-  - [ ] story test on Q3_K_XL (near-lossless MXFP4): if it degrades too, the engine (long-context attention), not the quant
-  - [ ] decode tok/s against the VQ file's 23.2 (128K); the DSpark drafter (separate file, Q8_0 / BF16) unused for now
-  - [ ] the DeepSeek Engram safetensors (2 x 101 GB beside the old model) go once the Unsloth files run
-- [ ] IQ2_XXS performance (2026-10-21 profile: decode 13.4 tok/s = ~72 ms/token: the GPU chain ~44 ms (device time 40 ms: dense
+  - [x] routed experts as merged tensors (MXFP4, Q3_K, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, Q2_K by layer) on the
+        silo's std kernels, bit-exact against ggml's dequantize_row_*
+  - [x] cards for UD-Q3_K_XL and UD-IQ2_XXS (exact and `-fast`); [ ] registered in the live registry (not deployed yet)
+  - [x] story test: Q3_K_XL a clean 2,903-word story, IQ2_XXS a clean 12,000-token novel: the VQ quant, not the engine
+  - [x] the DSpark drafter (`NS_DS41_MTP=1`): works, 55% accepted, loses (tg 5.5 against 10 tok/s)
+  - [ ] the DeepSeek Engram safetensors (2 x 101 GB beside the old model) go once the Unsloth files run (the user's call)
+- [ ] IQ2_XXS performance (2026-10-21 profile: tg 13.4 tok/s = ~72 ms/token: the GPU chain ~44 ms (device time 40 ms: dense
       Q8_0 / Q6_K ~16, expert products ~8, attention kernel 2, shared expert, head 3) + ~22 ms waiting on ~6 cold file experts a
-      token, each ~3.7 ms; prompt 258 tok/s at an 8192 chunk, read-bound at ~3.3 GB/s of the drive's ~5)
+      token, each ~3.7 ms; pp 258 tok/s at an 8192 chunk, read-bound at ~3.3 GB/s of the drive's ~5)
   - [x] read-ahead on 16 threads, a job a slab; confidence 0.3; parallel slab reads; profile in generate; std kernel grids in local
         memory + 2 rows a sub-group (+2%); O_DIRECT (opt-in: faster cold, loses page-cache hits); drafter (loses: miss-bound)
+  - [x] context ladder to 140K ([docs/ladders/deepseek-v4.1-flash-iq2xxs_ladder_stats.md](docs/ladders/deepseek-v4.1-flash-iq2xxs_ladder_stats.md)):
+        pp ~450-475 tok/s from 10K to 140K; tg 7-9 exact / 11-13 `-fast` in the first few hundred tokens at every depth (the
+        drive's reads, not attention); 256K / 1M not run (tg under 15)
+  - [x] an LRU pinned host tier (`NS_DS41_HOST_LRU`): tg 12.2 against 12.9 tok/s, no gain, opt-in
+  - [ ] tg after a prompt: the cache is cold to the text (tg ~11-13 `-fast` for the first ~1K tokens, ~23 sustained) - warm the
+        tiers from the prompt's own routing (the prompt passes already read those experts from the file)
   - [ ] one MoE pass over a GROUP of chunks per layer (attention chunk by chunk, then all the group's tokens through the experts:
         each expert read once a prompt, not a chunk; long prompts 2-4x; the group's streams > 8K tokens need pinned host spill)
   - [ ] fuse the small dense launches of a layer (q_a | kv | compressor | indexer, the shared expert's gate | up): ~5 ms a token
-  - [ ] a better guess than GUESS_HIT (calibrated for glm5next / deepseek4) for read-ahead; the profile from many more prompts
+  - [ ] a better guess than GUESS_HIT for read-ahead (recalibrated once, 2026-10-21); the profile from many more prompts
   - [ ] expert re-quantization of the cold tail (imatrix from Unsloth) to fit the resident tiers - quality risk, big
 - [ ] A repetition guard in the front door (presence / frequency penalty): none exists
 - [ ] Re-fetch the VQ GGUF only if wanted (card `deepseek-v4.1-flash-vq`, 40 checked parts)
