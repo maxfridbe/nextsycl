@@ -540,7 +540,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_COLD_RENORM` | 0 | with `NS_DS41_COLD_SKIP`, the experts kept have their weights scaled by (all / kept) | llm deepseek41 |
 | `NS_DS41_COLD_SKIP_AHEAD` | 1 | with `NS_DS41_COLD_SKIP`, also leave out an expert whose read ahead is on its way (0: wait for those) | llm deepseek41 |
 | `NS_DS41_STD_OA` | 0 | 1: decode's grouped o_a (a Q8_0 / Q6_K one) in one launch of the std kernel (alone faster, end to end no gain) | llm deepseek41 |
-| `NS_DS41_STD_KU` | 2 | blocks a sub-group's decode product of an Unsloth-form expert decodes before multiplying (1, 2 or 4; their loads in flight together) | llm deepseek41 |
+| `NS_DS41_STD_KU` | 1 | blocks a sub-group's decode product of an Unsloth-form expert decodes before multiplying (1, 2 or 4; their loads in flight together) | llm deepseek41 |
 | `NS_DS41_DENSE_Q4K` | 0 | 1: attention's and the shared expert's Q8_0 weights are requantized to q4_K when loaded (Q6_K ones too; half the bytes a decode token reads, the fused q4_K kernels apply; an approximation, a few seconds more at load) | llm deepseek41 |
 | `NS_DS41_PROMPT_PREFETCH` | 1 | a prompt pass starts reading the next layer's file experts while it computes this one | llm deepseek41 |
 | `NS_DS41_COLD_SKIP_PROMPT` | 0 | a prompt pass leaves out a file-only expert that gets at most `NS_DS41_COLD_SKIP_PROMPT_MAX` tokens, all with a routing-weight share under this (an approximation: measure the perplexity after such a prompt) | llm deepseek41 |
