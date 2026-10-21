@@ -556,10 +556,8 @@ struct FileReader {
     tx: Mutex<std::sync::mpsc::Sender<RJob>>,
 }
 struct RJob {
-    shard: usize,
-    at: u64,
-    len: usize,
-    dst: usize,
+    /// (shard, file offset, bytes, destination address): a VQ expert is one range of the file, a ggml-typed one three
+    segs: Vec<(usize, u64, usize, usize)>,
     done: Arc<RDone>,
 }
 #[derive(Default)]
@@ -590,10 +588,16 @@ impl FileReader {
                     Err(_) => return,
                 };
                 use std::os::unix::fs::FileExt;
-                // SAFETY: the job's staging slot is its own (read_ahead) until its done flag is set and waited for
-                // (stage_slot or ensure), the pinned buffer alive for the engine
-                let b = unsafe { std::slice::from_raw_parts_mut(job.dst as *mut u8, job.len) };
-                let r = files[job.shard].read_exact_at(b, job.at).map_err(|e| format!("reading an expert: {e}"));
+                let mut r = Ok(());
+                for &(shard, at, len, dst) in &job.segs {
+                    // SAFETY: the job's staging slot is its own (read_ahead) until its done flag is set and waited for
+                    // (stage_slot or ensure), the pinned buffer alive for the engine
+                    let b = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
+                    r = files[shard].read_exact_at(b, at).map_err(|e| format!("reading an expert: {e}"));
+                    if r.is_err() {
+                        break;
+                    }
+                }
                 *job.done.state.lock().unwrap() = Some(r);
                 job.done.cv.notify_all();
             });
@@ -1224,10 +1228,6 @@ impl Part {
     fn read_ahead(&self, l: u64, want: &[u64], limit: usize) -> Result<()> {
         let (Some(rd), Ok(st)) = (&self.reader, self.store(l)) else { return Ok(()) };
         let vq = &self.vq[&l];
-        // an expert of the ggml-typed form is three slabs of the file, not one span: its reads wait for the miss
-        if vq.std.is_some() {
-            return Ok(());
-        }
         let mut c = st.lock().unwrap();
         let c = &mut *c;
         let xs: Vec<u64> = want.iter().copied().filter(|x| !c.loc.contains_key(&(l, *x)) && !c.ahead.contains_key(&(l, *x))).take(limit).collect();
@@ -1236,7 +1236,19 @@ impl Part {
             let k = self.stage_slot(c)?;
             let done = Arc::new(RDone::default());
             let dst = c.stage.as_mut_slice().as_mut_ptr() as usize + k * sb;
-            let job = RJob { shard: vq.blob.shard, at: vq.blob.offset + vq.starts[x as usize], len: vq.span, dst, done: done.clone() };
+            // a VQ expert is one range of the blob; a ggml-typed one three slabs, one in each merged tensor
+            let segs = match &vq.std {
+                Some(s) => {
+                    let mut o = 0;
+                    (0..3).map(|i| {
+                        let seg = (s.t[i].shard, s.t[i].offset + x * s.mat[i] as u64, s.mat[i], dst + o);
+                        o += s.mat[i];
+                        seg
+                    }).collect()
+                }
+                None => vec![(vq.blob.shard, vq.blob.offset + vq.starts[x as usize], vq.span, dst)],
+            };
+            let job = RJob { segs, done: done.clone() };
             if rd.tx.lock().unwrap().send(job).is_err() {
                 return Err(Error("the expert readers ended".into()));
             }

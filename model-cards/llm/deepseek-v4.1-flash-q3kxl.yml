@@ -1,0 +1,67 @@
+# DeepSeek-V4.1-Flash-1017 UD-Q3_K_XL
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: deepseek-v4.1-flash-q3kxl
+kind: llm
+arch: deepseek41
+title: DeepSeek-V4.1-Flash-1017 UD-Q3_K_XL · 128K context (both GPUs, pinned memory and the NVMe)
+about: "Unsloth's dynamic GGUF of DeepSeek-V4.1-Flash-1017 (llama.cpp PR 30817's form): DeepSeek's own MXFP4 routed experts in most layers, Q3_K / IQ3_S / IQ3_XXS / IQ2_S in the rest (253 GiB of experts), Q8_0 attention and shared experts, the 189 GB MXFP8 Engram table in the last shard (read a row at a time while it runs); 13B active, 384 experts. Near the original's quality; most of its experts stream from the drive, so it is slow"
+gpus: all
+streams: true                   # the routed experts beyond VRAM and pinned memory (and the Engram table, inside the last shard) are read from the drive while it serves
+vram_gib: 30.0
+ctx: '131072'
+tools: false
+tasks: false
+env: {NS_DS41_FREE_GIB: "1.5"}   # the box rule: 1.5 GiB of VRAM free
+silo:                           # its expert kernels (std.cpp) exist only there
+  name: deepseek41
+  required: true
+files:
+  model:
+    key: deepseek-v4.1-flash-1017-q3kxl-1
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00001-of-00008.gguf
+    size: 5780927
+    sha256: 427a6be72b502c52562b1f1f7c5c764cad2a4cb3af991e9aaf02a33d958cc322
+    path: deepseek-v4.1-flash-1017-unsloth-q3kxl/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00001-of-00008.gguf
+  shard-2:
+    key: deepseek-v4.1-flash-1017-q3kxl-2
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00002-of-00008.gguf
+    size: 48856795552
+    sha256: 9a3500224d10ca5565f010f57154f5b1999406c9453d86e4a0903a8183503697
+    path: deepseek-v4.1-flash-1017-unsloth-q3kxl/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00002-of-00008.gguf
+  shard-3:
+    key: deepseek-v4.1-flash-1017-q3kxl-3
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00003-of-00008.gguf
+    size: 48089732928
+    sha256: ba5c295631a392c7f929a14b633f6c9badc0eb1c9d719ecad92ec43efd4ddc6d
+    path: deepseek-v4.1-flash-1017-unsloth-q3kxl/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00003-of-00008.gguf
+  shard-4:
+    key: deepseek-v4.1-flash-1017-q3kxl-4
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00004-of-00008.gguf
+    size: 49795067616
+    sha256: 4dd4ea5d34219cd1444218352def2977dd153739853464154a3936276f31ffbb
+    path: deepseek-v4.1-flash-1017-unsloth-q3kxl/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00004-of-00008.gguf
+  shard-5:
+    key: deepseek-v4.1-flash-1017-q3kxl-5
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00005-of-00008.gguf
+    size: 49964720992
+    sha256: 1a733e505a723fb1a5ccc15a45547c6d42097d8830d8fa4c4d17ca7bbb580855
+    path: deepseek-v4.1-flash-1017-unsloth-q3kxl/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00005-of-00008.gguf
+  shard-6:
+    key: deepseek-v4.1-flash-1017-q3kxl-6
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00006-of-00008.gguf
+    size: 49332666816
+    sha256: 0592a53ddba5a57062e266116bae26e9f1a97c268acb5287c8f4be5bb1741314
+    path: deepseek-v4.1-flash-1017-unsloth-q3kxl/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00006-of-00008.gguf
+  shard-7:
+    key: deepseek-v4.1-flash-1017-q3kxl-7
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00007-of-00008.gguf
+    size: 36265841792
+    sha256: e6e8dd016ffbb2820f0e6a37f4f8a531f5365fbdd009e758dda1c054453f9ffc
+    path: deepseek-v4.1-flash-1017-unsloth-q3kxl/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00007-of-00008.gguf
+  shard-8:
+    key: deepseek-v4.1-flash-1017-q3kxl-8
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00008-of-00008.gguf
+    size: 202758032592
+    sha256: 18ddc73eea11981cb6317c6d3c4a4e58ec71baaea2de41b071d9127bc15c2a94
+    path: deepseek-v4.1-flash-1017-unsloth-q3kxl/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00008-of-00008.gguf
+guide: guides/chat.md
