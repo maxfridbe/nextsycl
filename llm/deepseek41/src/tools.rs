@@ -163,6 +163,57 @@ fn kernels_std(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &
             }
             println!("{tag:<28} [{rows} x {cols}] {} ({})", note, t.name);
         }
+        // decode rate of the dense types: the largest tensor of each type (up to 1.5 GB) one column, the shared mmvq against the std kernel
+        let mut best: std::collections::BTreeMap<u32, &nextsycl_gguf::Tensor> = std::collections::BTreeMap::new();
+        for t in &f.tensors {
+            let cols = *t.shape.last().unwrap_or(&1) as usize;
+            if t.name.contains("_exps") || t.shape.len() != 2 || !o.std_supported(t.ty.code(), cols) || !o.mmvq_supported(t.ty.code()) || t.bytes > (3 << 29) {
+                continue;
+            }
+            if best.get(&t.ty.code()).is_none_or(|b| b.bytes < t.bytes) {
+                best.insert(t.ty.code(), t);
+            }
+        }
+        for t in best.values() {
+            let (rows, cols) = (t.shape[0] as usize, t.shape[1] as usize);
+            let src = DevBuf::new(g, t.bytes as usize).map_err(e)?;
+            for off in (0..t.bytes).step_by(256 << 20) {
+                let n = (256u64 << 20).min(t.bytes - off) as usize;
+                let mut b = vec![0u8; n];
+                f.read_into(t, off, &mut b).map_err(|x| x.0)?;
+                src.write(off as usize, &b).map_err(e)?;
+            }
+            let x: Vec<f32> = (0..cols).map(|i| ((i * 7919 % 1000) as f32 - 500.0) / 500.0).collect();
+            let xd = DevBuf::from_f32(g, &x).map_err(e)?;
+            let q8 = DevBuf::new(g, o.q8_1_bytes(cols, 1)).map_err(e)?;
+            let (y1, y2) = (DevBuf::f32(g, rows).map_err(e)?, DevBuf::f32(g, rows).map_err(e)?);
+            let mut tb = (src.ptr() as u64).to_le_bytes().to_vec();
+            for v in [1i32, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
+                tb.extend(v.to_le_bytes());
+            }
+            let tab = DevBuf::new(g, tb.len()).map_err(e)?;
+            tab.write(0, &tb).map_err(e)?;
+            let time = |f: &dyn Fn() -> nextsycl_core::Result<()>| -> Result<f64, String> {
+                f().map_err(e)?;
+                g.sync().map_err(e)?;
+                let t0 = std::time::Instant::now();
+                for _ in 0..20 {
+                    f().map_err(e)?;
+                }
+                g.sync().map_err(e)?;
+                Ok(t0.elapsed().as_secs_f64() * 1e6 / 20.0)
+            };
+            let a = time(&|| {
+                o.quantize_q8_1((&xd, 0), &q8, cols, 1)?;
+                o.mmvq(t.ty.code(), (&src, 0), t.bytes as usize, &q8, (&y1, 0), cols, rows, 1)
+            })?;
+            let b = time(&|| o.std_mmv(t.ty.code(), &tab, 1, &xd, (&y2, 0), 1, rows, cols))?;
+            let (r1, r2) = (y1.to_f32().map_err(e)?, y2.to_f32().map_err(e)?);
+            let (rel, _) = compare(&r1, &r2);
+            let gb = t.bytes as f64 / 1e9;
+            println!("{:<10} {:<28} [{rows} x {cols}] {gb:.2} GB: shared mmvq (+quantize) {a:.0} us = {:.0} GB/s, std kernel {b:.0} us = {:.0} GB/s; agree to {rel:.1e}",
+                     t.ty.name(), t.name, gb * 1e6 / a, gb * 1e6 / b);
+        }
     }
     let (d, ff) = (gg.n_embd as usize, gg.ffn_expert as usize);
     let dir = std::env::var("NS_DS41_STD_DIR").ok().map(std::path::PathBuf::from);

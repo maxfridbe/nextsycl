@@ -133,10 +133,11 @@ fn file_ahead() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_usize("NS_DS41_FILE_AHEAD", 8).min(STAGE / 2))
 }
-/// The chance of use from which decode reads a file expert ahead (NS_DS41_FILE_AHEAD_P, default 0.15)
+/// The chance of use from which decode reads a file expert ahead (NS_DS41_FILE_AHEAD_P, default 0.3: at 0.15 the guesses
+/// that miss take the drive from the reads that matter - IQ2_XXS on an unseen prompt 8.7 -> 11.9 tok/s)
 fn file_ahead_p() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("NS_DS41_FILE_AHEAD_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15))
+    *V.get_or_init(|| std::env::var("NS_DS41_FILE_AHEAD_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3))
 }
 /// The index sources after the candidate source score only their candidate blocks (NS_DS41_IDX_CAND, default 1; 0:
 /// every key, the others masked)
