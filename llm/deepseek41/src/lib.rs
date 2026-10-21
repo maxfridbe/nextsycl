@@ -66,7 +66,30 @@ pub fn kind() -> EngineKind {
                  info: tools::info, kernels: Some(tools::kernels), chat: nextsycl_tok::deepseek41_chat, options: OPTIONS, prepare: None }
 }
 
+/// The DSpark drafter file beside an Unsloth model (NS_DS41_DRAFTER names it; else `dspark-*.gguf` in the model's folder or
+/// its parent's)
+fn drafter(f: &Gguf) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("NS_DS41_DRAFTER") {
+        return Some(p.into()).filter(|p: &std::path::PathBuf| p.is_file());
+    }
+    let dir = f.paths.first()?.parent()?;
+    [Some(dir), dir.parent()].into_iter().flatten().find_map(|d| {
+        std::fs::read_dir(d).ok()?.flatten().map(|e| e.path()).find(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("dspark-") && n.ends_with(".gguf"))
+        })
+    })
+}
+
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {
+    // an Unsloth model with drafts asked for (NS_DS41_MTP=1) and its drafter file there: the model again with the drafter as
+    // a further shard, its tensors renamed to the towers' (held for the process)
+    let f: &'g Gguf = match (f.architecture() == "deepseek41" && o.draft && engine::mtp_on(), drafter(f)) {
+        (true, Some(d)) if f.tensor("mtp.0.attn_norm.weight").is_none() => {
+            log(format!("deepseek41: the DSpark drafter from {}", d.display()));
+            Box::leak(Box::new(Gguf::open_with_map(&f.paths[0], &[(d, model::dflash_name as fn(&str) -> String)]).map_err(|e| nextsycl_core::Error(e.0))?))
+        }
+        _ => f,
+    };
     Ok(Box::new(engine::Ds41::load(f, gpus, o.expert_bytes, o.mirror_bytes, o.kv, o.draft, log)?))
 }
 

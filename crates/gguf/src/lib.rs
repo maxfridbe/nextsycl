@@ -467,6 +467,9 @@ impl From<&str> for Error {
     }
 }
 
+/// A further file of a model and the function its tensor names pass through (`Gguf::open_with_map`)
+pub type Sidecar = (PathBuf, fn(&str) -> String);
+
 impl Gguf {
     pub fn open(path: &Path) -> Result<Gguf> {
         Self::open_with(path, &[])
@@ -475,6 +478,13 @@ impl Gguf {
     /// A model with more files after its own shards (a sidecar of tensors the model's own files lack - e.g. a draft
     /// block converted on its own): their tensors join the index as further shards; the metadata is the model's.
     pub fn open_with(path: &Path, extra: &[PathBuf]) -> Result<Gguf> {
+        let extra: Vec<Sidecar> = extra.iter().map(|p| (p.clone(), (|n: &str| n.to_string()) as fn(&str) -> String)).collect();
+        Self::open_with_map(path, &extra)
+    }
+
+    /// `open_with`, each further file's tensor names passed through its own function first (a sidecar whose names
+    /// would clash with the model's: a draft's `blk.0` against the model's)
+    pub fn open_with_map(path: &Path, extra: &[Sidecar]) -> Result<Gguf> {
         let (version, metadata, mut tensors) = read_one(path)?;
         let count = metadata.get("split.count").and_then(Value::as_u64).unwrap_or(1) as usize;
         let mut paths = vec![path.to_path_buf()];
@@ -485,10 +495,10 @@ impl Gguf {
                 tensors.extend(ts.into_iter().map(|t| Tensor { shard: i, ..t }));
             }
         }
-        for p in extra {
+        for (p, rename) in extra {
             let i = paths.len();
             let (_, _, ts) = read_one(p)?;
-            tensors.extend(ts.into_iter().map(|t| Tensor { shard: i, ..t }));
+            tensors.extend(ts.into_iter().map(|t| Tensor { shard: i, name: rename(&t.name), ..t }));
             paths.push(p.clone());
         }
         let files = paths.iter().map(|p| io(File::open(p), &format!("opening {}", p.display()))).collect::<Result<Vec<_>>>()?;

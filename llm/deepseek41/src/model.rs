@@ -32,6 +32,25 @@ use nextsycl_gguf::{GType, Gguf, Tensor, Value};
 
 use crate::{Error, ModelResult as Result};
 
+/// Unsloth's DSpark drafter file (`dspark-*.gguf`, architecture `dflash`) tensor names as this engine's tower roles:
+/// stages `blk.N` the towers `mtp.N`, and its projection, norms and heads the `mtp.*` globals (llama.cpp's converter:
+/// mtp.0.main_proj / main_norm -> fc / enc.output_norm, mtp.2.norm -> output_norm, markov_head.embed / head ->
+/// markov_w1 / markov_w2, confidence_head.proj -> conf_proj)
+pub fn dflash_name(n: &str) -> String {
+    match n {
+        "fc.weight" => "mtp.main_proj.weight".into(),
+        "enc.output_norm.weight" => "mtp.main_norm.weight".into(),
+        "output_norm.weight" => "mtp.out_norm.weight".into(),
+        "markov_w1.weight" => "mtp.markov_embd.weight".into(),
+        "markov_w2.weight" => "mtp.markov_head.weight".into(),
+        "conf_proj.weight" => "mtp.confidence.weight".into(),
+        _ => match n.strip_prefix("blk.") {
+            Some(r) => format!("mtp.{r}"),
+            None => n.to_string(),
+        },
+    }
+}
+
 /// The geometry, from metadata and the tensors' shapes.
 #[derive(Clone, Debug)]
 pub struct Geometry {
@@ -326,7 +345,12 @@ impl<'g> Model<'g> {
         }
         let n_layer = meta_u(file, "block_count")?;
         // the llama.cpp form keeps the DSpark drafter in a file of its own: none here
-        let n_mtp = if std { 0 } else { meta_u(file, "mtp.tower_count").unwrap_or(0) };
+        // (with the DSpark drafter file attached - its blocks renamed mtp.N.*, see `dflash_name` - the metadata's `dspark.*`)
+        let n_mtp = if std {
+            if file.tensor("mtp.0.attn_norm.weight").is_some() { alt_list(file, &["dspark.target_layers"]).map_or(0, |v| v.len() as u64) } else { 0 }
+        } else {
+            meta_u(file, "mtp.tower_count").unwrap_or(0)
+        };
         let ratio = meta_list(file, "attention.compress_ratios")?;
         if let Some(r) = ratio.iter().find(|r| **r > 2) {
             return Err(Error(format!("a compress ratio of {r}: the engine takes 0, 1 and 2")));
@@ -377,12 +401,12 @@ impl<'g> Model<'g> {
             engram_dim: alt_u(file, &["engram.head_dim", "embedding_length_per_layer_input"]).unwrap_or(0),
             engram_ngram: alt_u(file, &["engram.max_ngram_size", "ple.ngram_size"]).unwrap_or(1),
             n_mtp,
-            mtp_expert: meta_u(file, "mtp.expert_count").unwrap_or(0),
-            mtp_expert_used: meta_u(file, "mtp.expert_used_count").unwrap_or(0),
-            mtp_block: meta_u(file, "mtp.block_size").unwrap_or(0),
-            mtp_noise: meta_u(file, "mtp.noise_token_id").unwrap_or(0) as u32,
-            mtp_targets: meta_list(file, "mtp.target_layers").unwrap_or_default(),
-            markov_rank: meta_u(file, "mtp.markov_rank").unwrap_or(0),
+            mtp_expert: alt_u(file, &["mtp.expert_count", "dspark.expert_count"]).unwrap_or(0),
+            mtp_expert_used: alt_u(file, &["mtp.expert_used_count", "dspark.expert_used_count"]).unwrap_or(0),
+            mtp_block: alt_u(file, &["mtp.block_size", "dspark.block_size"]).unwrap_or(0),
+            mtp_noise: alt_u(file, &["mtp.noise_token_id", "dspark.noise_token_id"]).unwrap_or(0) as u32,
+            mtp_targets: alt_list(file, &["mtp.target_layers", "dspark.target_layers"]).unwrap_or_default(),
+            markov_rank: alt_u(file, &["mtp.markov_rank", "dspark.markov_rank"]).unwrap_or(0),
             std,
         };
         if g.hc != 4 || g.head_dim != 512 {

@@ -329,10 +329,11 @@ fn layer_std(m: &Model, l: u64) -> Result<LayerVq> {
     if ty[0] != ty[1] {
         return Err(Error(format!("block {l}: gate is {} and up {}: the products take one type for both", ty[0].name(), ty[1].name())));
     }
-    let mat = [t[0].bytes as usize / g.n_expert as usize, t[1].bytes as usize / g.n_expert as usize, t[2].bytes as usize / g.n_expert as usize];
+    let ne = g.experts(l).0 as usize;
+    let mat = [t[0].bytes as usize / ne, t[1].bytes as usize / ne, t[2].bytes as usize / ne];
     for (i, (rows, cols)) in [(f, d), (f, d), (d, f)].into_iter().enumerate() {
         let want = ty[i].bytes((rows * cols) as u64).ok_or_else(|| Error(format!("block {l}: {} rows of {cols} are not whole blocks", ty[i].name())))? as usize;
-        if mat[i] != want || t[i].bytes as usize != want * g.n_expert as usize {
+        if mat[i] != want || t[i].bytes as usize != want * ne {
             return Err(Error(format!("block {l}: {}: {} bytes an expert, {want} expected", t[i].name, mat[i])));
         }
     }
@@ -1676,9 +1677,10 @@ impl Part {
         for &l in &towers {
             let v = &vq[&l];
             let span = v.span.next_multiple_of(256);
-            let buf = DevBuf::new(gpu, span * v.starts.len())?;
+            let n_ex = if v.std.is_some() { g.mtp_expert as usize } else { v.starts.len() };
+            let buf = DevBuf::new(gpu, span * n_ex)?;
             let mut host = vec![0u8; v.span];
-            for x in 0..v.starts.len() as u64 {
+            for x in 0..n_ex as u64 {
                 read_expert(m, v, x, &mut host)?;
                 buf.write(x as usize * span, &host)?;
             }
