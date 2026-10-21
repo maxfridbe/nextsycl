@@ -407,6 +407,22 @@ fn read_expert(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8]) -> Result<()> 
     m.file.read_into(&vq.blob, vq.starts[ex as usize], &mut host[..vq.span]).map_err(e)
 }
 
+/// `read_expert`, a ggml-typed expert's three slabs on threads of their own (a synchronous read of one expert is the wait of
+/// a decode layer: 3 reads in flight keep the drive busier than 1 does)
+fn read_expert_par(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8]) -> Result<()> {
+    let Some(s) = &vq.std else { return read_expert(m, vq, ex, host) };
+    let (a, rest) = host.split_at_mut(s.mat[0]);
+    let (b, c) = rest.split_at_mut(s.mat[1]);
+    let c = &mut c[..s.mat[2]];
+    let res: Vec<Result<()>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = [(0usize, a), (1, b), (2, c)].into_iter().map(|(i, buf)| {
+            sc.spawn(move || m.file.read_into(&s.t[i], ex * s.mat[i] as u64, buf).map_err(e))
+        }).collect();
+        hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(Error("an expert reader panicked".into())))).collect()
+    });
+    res.into_iter().collect()
+}
+
 /// Where an expert is.
 #[derive(Clone, Copy)]
 enum Loc {
@@ -1277,7 +1293,7 @@ impl Part {
             for (x, buf) in jobs {
                 let failed = &failed;
                 sc.spawn(move || {
-                    if let Err(e) = read_expert(m, vq, x, buf) {
+                    if let Err(e) = read_expert_par(m, vq, x, buf) {
                         *failed.lock().unwrap() = Some(e.0);
                     }
                 });

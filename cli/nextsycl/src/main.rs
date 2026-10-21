@@ -604,6 +604,13 @@ fn generate(args: &[String]) -> Result<(), String> {
     if ng_drafted > 0 {
         eprintln!("[prompt lookup: {ng_accepted} of {ng_drafted} drafts accepted]");
     }
+    // NS_EXPERT_PROFILE=FILE: the experts this run asked for blended into the file, which the next load fills VRAM from
+    if let Ok(p) = std::env::var("NS_EXPERT_PROFILE") {
+        match eng.save_profile(Path::new(&p)) {
+            Ok(k) => eprintln!("[expert profile: {k} experts written to {p}]"),
+            Err(x) => eprintln!("[expert profile {p}: {x}]"),
+        }
+    }
     Ok(())
 }
 
