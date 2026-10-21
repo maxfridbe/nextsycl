@@ -1048,9 +1048,9 @@ impl Part {
         let t0 = Instant::now();
         {
             let mut chunks: Vec<&mut [u8]> = buf.as_mut_slice().chunks_mut(*sb).take(n).collect();
-            // 8 readers, each a share of the experts
+            // NS_DS41_PROMPT_READERS readers (default 16), each a share of the experts
             let jobs: Vec<(u64, &mut [u8])> = files.iter().take(n).map(|f| f.1).zip(chunks.drain(..)).collect();
-            let per = jobs.len().div_ceil(8).max(1);
+            let per = jobs.len().div_ceil(env_usize("NS_DS41_PROMPT_READERS", 16)).max(1);
             let mut jobs = jobs;
             std::thread::scope(|sc| {
                 while !jobs.is_empty() {
@@ -1058,7 +1058,7 @@ impl Part {
                     let failed = &failed;
                     sc.spawn(move || {
                         for (ex, b) in part {
-                            if let Err(e) = read_expert(m, vq, ex, b) {
+                            if let Err(e) = read_expert_par(m, vq, ex, b) {
                                 *failed.lock().unwrap() = Some(e.0);
                             }
                         }
