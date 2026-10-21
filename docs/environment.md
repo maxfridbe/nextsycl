@@ -533,6 +533,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_FILE_AHEAD_P` | 0.2 | the chance of use (the guess's, from the measured rank hit rates) from which decode reads a file expert ahead (guesses that miss take the drive from the reads that matter: IQ2_XXS 8.7 -> 14.4 tok/s) | llm deepseek41 |
 | `NS_DS41_STD_RPS` | 2 | rows a sub-group's decode product of an Unsloth-form expert works at once (1, 2 or 4; their loads issued together) | llm deepseek41 |
 | `NS_DS41_ODIRECT` | 0 | 1: the experts are read from the model's files with O_DIRECT (an aligned span into a thread's own buffer, the wanted bytes copied out) - one cold read is faster, but decode loses the page cache's hits (13.6 -> 12.7 tok/s) | llm deepseek41 |
+| `NS_DS41_READ_BENCH` | none | `llm kernels` on an Unsloth-form file times the experts' file reads instead (one expert at a time, buffered and O_DIRECT, then 4 / 16 / 32 in flight) | llm deepseek41 |
 | `NS_DS41_READERS` | 16 | the read-ahead's reader threads (a job a slab of an expert in ggml's row types) | llm deepseek41 |
 | `NS_DS41_PROMPT_READERS` | 16 | the prompt path's threads reading the file-only experts of a layer | llm deepseek41 |
 | `NS_DS41_DRAFTER` | none | the DSpark drafter file (Unsloth's `dspark-*.gguf`) of an Unsloth-form model, with `NS_DS41_MTP=1`; else `dspark-*.gguf` in the model's folder or its parent's | llm deepseek41 |
