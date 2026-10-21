@@ -251,6 +251,9 @@ impl Engine for engine::Ds41<'_> {
         v.push(format!("[expert misses: waited {:.2} s for read-aheads, {:.2} s in the staged reads (of it {:.2} s for a staging slot), {:.2} s submitting the swaps, \
                         {:.2} s for copies the products needed]", ld(&engine::ENS_AHEAD_NS), ld(&engine::ENS_STAGE_NS), ld(&engine::ENS_SLOT_NS), ld(&engine::ENS_SWAP_NS),
                        ld(&engine::ENS_COPY_NS)));
+        let gn = engine::GUESS_N.load(std::sync::atomic::Ordering::Relaxed).max(1) as f64;
+        v.push(format!("[the guess's k-th best expert among the next layer's picks (of {gn} decode layers), k = 1..16: {}]",
+                       engine::GUESS_HITS.iter().map(|h| format!("{:.2}", h.load(std::sync::atomic::Ordering::Relaxed) as f64 / gn)).collect::<Vec<_>>().join(" ")));
         v.push(format!("[wall: embedding + engram start {:.2} s, layers {:.2} s, head {:.2} s, sampling {:.2} s - passes of every size, the prompt's too]",
                        ld(&engine::WALL_STREAMS_NS), ld(&engine::WALL_LAYERS_NS), ld(&engine::WALL_HEAD_NS), ld(&engine::WALL_SAMPLE_NS)));
         if let Some(en) = &self.engram {

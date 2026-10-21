@@ -64,6 +64,12 @@ pub static ENS_COPY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static ENS_SLOT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Decode's wall time (no GPU syncs added): in `forward_rows` the streams (embedding), the layers (all parts), the head,
 /// and in `step` the sampler - NS_PROFILE reports them
+/// How often the guess's k-th best expert for a layer (its router on the layer before's input) was among the experts the
+/// layer then picked, over the decode passes: hits by rank, and the passes counted (NS_PROFILE reports the rates, for
+/// GUESS_HIT)
+pub static GUESS_HITS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+pub static GUESS_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GUESS_LAST: Mutex<Vec<(u64, Vec<usize>)>> = Mutex::new(Vec::new());
 pub static WALL_STREAMS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WALL_LAYERS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WALL_HEAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -139,11 +145,11 @@ fn file_ahead() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_usize("NS_DS41_FILE_AHEAD", 8).min(STAGE / 2))
 }
-/// The chance of use from which decode reads a file expert ahead (NS_DS41_FILE_AHEAD_P, default 0.3: at 0.15 the guesses
-/// that miss take the drive from the reads that matter - IQ2_XXS on an unseen prompt 8.7 -> 11.9 tok/s)
+/// The chance of use from which decode reads a file expert ahead (NS_DS41_FILE_AHEAD_P, default 0.2 against the measured
+/// GUESS_HIT: guesses that miss take the drive from the reads that matter - IQ2_XXS on an unseen prompt 8.7 -> 14.4 tok/s)
 fn file_ahead_p() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("NS_DS41_FILE_AHEAD_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3))
+    *V.get_or_init(|| std::env::var("NS_DS41_FILE_AHEAD_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.2))
 }
 /// The index sources after the candidate source score only their candidate blocks (NS_DS41_IDX_CAND, default 1; 0:
 /// every key, the others masked)
@@ -177,8 +183,8 @@ fn prefetch_p() -> f32 {
     *V.get_or_init(|| std::env::var("NS_PREFETCH_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.6))
 }
 /// How often the next layer's router run on this layer's input has its k-th best among the next layer's picks (the
-/// glm5next / deepseek4 measurement: a first guess here)
-const GUESS_HIT: [f32; 16] = [0.96, 0.92, 0.86, 0.77, 0.66, 0.56, 0.45, 0.36, 0.29, 0.22, 0.18, 0.15, 0.12, 0.11, 0.09, 0.08];
+/// glm5next / deepseek4 measurement was the first guess here; these are V4.1's own, IQ2_XXS, 11,362 decode layers, NS_PROFILE=1 reports them)
+const GUESS_HIT: [f32; 16] = [0.97, 0.91, 0.84, 0.71, 0.55, 0.40, 0.26, 0.19, 0.13, 0.10, 0.08, 0.07, 0.05, 0.04, 0.04, 0.03];
 
 /// Decode's q4_K products by this engine's kernel on float32 activations, o_a's groups in one launch (NS_DS41_Q4K=0:
 /// the shared Q8_1 quantization and product, a launch a group)
@@ -3641,6 +3647,18 @@ impl<'g> Ds41<'g> {
         ROUTE_HOST_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         tap(&format!("ffn_shexp-{l}"), &y)?;
         let need: Vec<u64> = by.keys().map(|e| *e as u64).collect();
+        if t == 1 && self.prof.is_some() {
+            let mut gl = GUESS_LAST.lock().unwrap();
+            if let Some(i) = gl.iter().position(|(ly, _)| *ly == l) {
+                let (_, order) = gl.swap_remove(i);
+                GUESS_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for (rank, e) in order.iter().enumerate() {
+                    if need.contains(&(*e as u64)) {
+                        GUESS_HITS[rank].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
         let promote = t <= MMVQ_COLS;
         let staging = !promote && p.ring.is_some() && !p.draft.contains_key(&l);
         let (slots_of, arriving, copies) =
@@ -3885,6 +3903,9 @@ impl<'g> Ds41<'g> {
                 let pr: Vec<f32> = gv[ti * ne..(ti + 1) * ne].iter().map(|z| sqrt_softplus(*z)).collect();
                 let mut order: Vec<usize> = (0..ne).collect();
                 order.sort_by(|a, b| (pr[*b] + gb[*b]).total_cmp(&(pr[*a] + gb[*a])));
+                if t == 1 && self.prof.is_some() {
+                    GUESS_LAST.lock().unwrap().push((l + 1, order[..GUESS_HIT.len()].to_vec()));
+                }
                 for (rank, &e) in order.iter().take(GUESS_HIT.len()).enumerate() {
                     *miss.entry(e).or_insert(1.0) *= 1.0 - GUESS_HIT[rank];
                 }
