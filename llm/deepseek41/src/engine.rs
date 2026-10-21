@@ -2772,7 +2772,7 @@ impl<'g> Ds41<'g> {
         let o = &p.ops;
         let (ng, ol, gw) = (g.o_groups as usize, g.o_lora as usize, (g.n_head * g.head_dim / g.o_groups) as usize);
         match p.groups.get(&l) {
-            Some(_) if tr < dense_f16_min() && q4k_own() => {
+            Some(_) if tr < dense_f16_min() && q4k_own() && p.mat(l, Role::OutA)?.ty == GType::Q4K => {
                 // every group in one launch: rows [g o_lora, ..) read their heads [g gw, ..) of att's row; 8 rows of att
                 // a launch
                 let w = p.mat(l, Role::OutA)?;
