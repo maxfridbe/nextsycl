@@ -133,6 +133,37 @@ fn kernels_std(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &
     use nextsycl_core::DevBuf;
     let e = |x: nextsycl_core::Error| x.0;
     let gg = &m.g;
+    // the dense weights' row types the std kernels expand for a prompt (Q6_K, Q5_K, Q8_0): 16 rows of the first tensor of each
+    {
+        let dir = std::env::var("NS_DS41_STD_DIR").ok().map(std::path::PathBuf::from);
+        let mut seen = std::collections::BTreeSet::new();
+        for t in &f.tensors {
+            let cols = *t.shape.last().unwrap_or(&1) as usize;
+            if t.name.contains("_exps") || t.shape.len() != 2 || !o.std_supported(t.ty.code(), cols) || !seen.insert(t.ty.code()) {
+                continue;
+            }
+            let rows = 16usize.min(t.shape[0] as usize);
+            let rb = t.ty.bytes(cols as u64).unwrap_or(0) as usize;
+            let mut raw = vec![0u8; rows * rb];
+            f.read_into(t, 0, &mut raw).map_err(|x| x.0)?;
+            let src = DevBuf::new(g, raw.len().next_multiple_of(256)).map_err(e)?;
+            src.write(0, &raw).map_err(e)?;
+            let wd = DevBuf::f32(g, rows * cols).map_err(e)?;
+            o.std_dequant(t.ty.code(), &src, 0, raw.len(), rows, cols, &wd, false).map_err(e)?;
+            let got = wd.to_f32().map_err(e)?;
+            let tag = format!("dense_{}", t.ty.name());
+            let mut note = "no reference".to_string();
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join(format!("{tag}.raw")), &raw).map_err(|x| x.to_string())?;
+                if let Ok(b) = std::fs::read(dir.join(format!("{tag}.ref.f32"))) {
+                    let r: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let (rel, mx) = compare(&got, &r);
+                    note = format!("vs ggml: rel err {rel:.2e} (max {mx:.2e})");
+                }
+            }
+            println!("{tag:<28} [{rows} x {cols}] {} ({})", note, t.name);
+        }
+    }
     let (d, ff) = (gg.n_embd as usize, gg.ffn_expert as usize);
     let dir = std::env::var("NS_DS41_STD_DIR").ok().map(std::path::PathBuf::from);
     let mut seed = 0x1234_5678u64;

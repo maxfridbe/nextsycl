@@ -766,6 +766,19 @@ impl Ops {
         };
         self.ok(rc, "ds41_vq_mmv")
     }
+    /// `rows` x `cols` values of ggml type `ty` (bytes [at, at + bytes) of `src`) expanded into the front of dst as fp16 or
+    /// float32: by the std kernels where they take the type, else the shared library's
+    #[allow(clippy::too_many_arguments)]
+    pub fn dequant_mat(&self, ty: u32, src: &DevBuf, at: usize, bytes: usize, rows: usize, cols: usize, dst: &DevBuf, f16: bool) -> Result<()> {
+        if self.std_supported(ty, cols) {
+            return self.std_dequant(ty, src, at, bytes, rows, cols, dst, f16);
+        }
+        if f16 {
+            self.dequant_f16(ty, src, at, bytes, rows * cols, dst)
+        } else {
+            self.dequant(ty, src, at, bytes, rows * cols, dst)
+        }
+    }
     /// whether an expert matrix of this ggml type and width is taken by the std kernels
     pub fn std_supported(&self, ty: u32, cols: usize) -> bool {
         // SAFETY: a capability query.

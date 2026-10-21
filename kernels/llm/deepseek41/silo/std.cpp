@@ -22,7 +22,7 @@
 namespace {
 
 // ggml type numbers
-enum : int { T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ1_S = 19, T_IQ3_S = 21, T_IQ2_S = 22, T_MXFP4 = 39 };
+enum : int { T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_Q5_K = 13, T_Q6_K = 14, T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ1_S = 19, T_IQ3_S = 21, T_IQ2_S = 22, T_MXFP4 = 39 };
 
 // bytes of 256 values
 constexpr int sb_bytes(int type) {
@@ -30,6 +30,8 @@ constexpr int sb_bytes(int type) {
         case T_Q8_0: return 8 * 34;
         case T_Q2_K: return 84;
         case T_Q3_K: return 110;
+        case T_Q5_K: return 176;
+        case T_Q6_K: return 210;
         case T_IQ2_XXS: return 66;
         case T_IQ2_XS: return 74;
         case T_IQ3_XXS: return 98;
@@ -162,6 +164,37 @@ template <> struct Deq<T_Q3_K> {
     }
 };
 
+// Q5_K: d, dmin, scales[12] (eight 6-bit scale / min pairs), qh[32], qs[128]
+template <> struct Deq<T_Q5_K> {
+    static void group(const uint8_t* b, int g, float* w) {
+        const int v = g * 8, j = v >> 6, u = v & 63, hi = u >> 5, l0 = u & 31;
+        const int is = 2 * j + hi;
+        const uint8_t* q = b + 4;
+        const uint32_t sc = is < 4 ? (q[is] & 63) : ((q[is + 4] & 0xF) | ((q[is - 4] >> 6) << 4));
+        const uint32_t mn = is < 4 ? (q[is + 4] & 63) : ((q[is + 4] >> 4) | ((q[is] >> 6) << 4));
+        const float d1 = h2f(b) * sc, m1 = h2f(b + 2) * mn;
+        const uint8_t* qh = b + 16 + l0;
+        const uint8_t* qs = b + 48 + 32 * j + l0;
+        const int bit = 1 << is;
+        for (int k = 0; k < 8; ++k) w[k] = d1 * ((hi ? (qs[k] >> 4) : (qs[k] & 0xF)) + ((qh[k] & bit) ? 16 : 0)) - m1;
+    }
+};
+
+// Q6_K: ql[128], qh[64], scales[16] (int8), d
+template <> struct Deq<T_Q6_K> {
+    static void group(const uint8_t* b, int g, float* w) {
+        const int v = g * 8, n = v >> 7, u = v & 127, quarter = u >> 5, l0 = u & 31;
+        const float d = h2f(b + 208);
+        const float sc = d * (float) (int8_t) b[192 + n * 8 + (l0 >> 4) + 2 * quarter];
+        const uint8_t* ql = b + n * 64 + (quarter & 1) * 32 + l0;
+        const uint8_t* qh = b + 128 + n * 32 + l0;
+        for (int k = 0; k < 8; ++k) {
+            const int lo = quarter < 2 ? (ql[k] & 0xF) : (ql[k] >> 4);
+            w[k] = sc * (float) ((lo | (((qh[k] >> (2 * quarter)) & 3) << 4)) - 32);
+        }
+    }
+};
+
 // MXFP4: 8 blocks of (E8M0 scale, 16 bytes of E2M1 nibbles: value j the low nibble of byte j, j + 16 the high)
 template <> struct Deq<T_MXFP4> {
     static void group(const uint8_t* r, int g, float* w) {
@@ -250,7 +283,7 @@ int ns_ds41_std_mmv(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* me
     if (!ns_ds41_std_supported(type, cols)) return ns_fail("ns_ds41_std_mmv: type " + std::to_string(type) + " with cols " + std::to_string(cols));
     switch (type) {
 #define CASE(T) case T: mmv<T>(g->q, ptrs, meta, entries, x, y, rows, cols); return 0;
-        CASE(T_Q8_0) CASE(T_Q2_K) CASE(T_Q3_K) CASE(T_IQ2_XXS) CASE(T_IQ2_XS) CASE(T_IQ3_XXS) CASE(T_IQ1_S) CASE(T_IQ3_S) CASE(T_IQ2_S) CASE(T_MXFP4)
+        CASE(T_Q8_0) CASE(T_Q2_K) CASE(T_Q3_K) CASE(T_Q5_K) CASE(T_Q6_K) CASE(T_IQ2_XXS) CASE(T_IQ2_XS) CASE(T_IQ3_XXS) CASE(T_IQ1_S) CASE(T_IQ3_S) CASE(T_IQ2_S) CASE(T_MXFP4)
 #undef CASE
         default: return ns_fail("ns_ds41_std_mmv: type");
     }
@@ -263,7 +296,7 @@ int ns_ds41_std_dequant(ns_gpu* g, int type, const void* src, int64_t rows, int6
     const uint8_t* s = reinterpret_cast<const uint8_t*>(src);
     switch (type) {
 #define CASE(T) case T: if (f16) dequant<T, true>(g->q, s, rows, cols, out); else dequant<T, false>(g->q, s, rows, cols, out); return 0;
-        CASE(T_Q8_0) CASE(T_Q2_K) CASE(T_Q3_K) CASE(T_IQ2_XXS) CASE(T_IQ2_XS) CASE(T_IQ3_XXS) CASE(T_IQ1_S) CASE(T_IQ3_S) CASE(T_IQ2_S) CASE(T_MXFP4)
+        CASE(T_Q8_0) CASE(T_Q2_K) CASE(T_Q3_K) CASE(T_Q5_K) CASE(T_Q6_K) CASE(T_IQ2_XXS) CASE(T_IQ2_XS) CASE(T_IQ3_XXS) CASE(T_IQ1_S) CASE(T_IQ3_S) CASE(T_IQ2_S) CASE(T_MXFP4)
 #undef CASE
         default: return ns_fail("ns_ds41_std_dequant: type");
     }

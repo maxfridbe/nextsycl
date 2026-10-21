@@ -834,7 +834,7 @@ impl Part {
             let mut r0 = 0;
             while r0 < w.rows {
                 let r = chunk.min(w.rows - r0);
-                o.dequant_f16(w.ty.code(), &w.buf, r0 * rb, r * rb, r * w.cols, &self.scratch)?;
+                o.dequant_mat(w.ty.code(), &w.buf, r0 * rb, r * rb, r, w.cols, &self.scratch, true)?;
                 o.gemm_f16(t, r, w.cols, (&x16, 0, w.cols), (&self.scratch, 0), (y.0, y.1 + r0, y.2), acc)?;
                 r0 += r;
             }
@@ -844,7 +844,7 @@ impl Part {
         let mut r0 = 0;
         while r0 < w.rows {
             let r = chunk.min(w.rows - r0);
-            o.dequant(w.ty.code(), &w.buf, r0 * rb, r * rb, r * w.cols, &self.scratch)?;
+            o.dequant_mat(w.ty.code(), &w.buf, r0 * rb, r * rb, r, w.cols, &self.scratch, false)?;
             o.gemm_at(t, r, w.cols, x, (&self.scratch, 0), (y.0, y.1 + r0, y.2), acc)?;
             r0 += r;
         }
