@@ -3,6 +3,28 @@
 Paused 2026-10-06. State: GLM-5.3-Flash (ds4 IQ2 file) on B70 + B65, served as the box's chat mode `glm53`, MTP on
 by default (`--no-mtp` turns it off).
 
+## DeepSeek-V4.1 on Unsloth's GGUFs (2026-10-21)
+
+Why: V4.1 on the VQ file (~1.6 bit experts) degrades past ~2K generated tokens (a story's unique-word ratio 0.6 -> 0.2,
+5-gram repeats up to 0.97, also at temperature 0.6; an SVG chat looped at ~7.3K tokens) where the old V4 IQ2_M wrote a
+clean 4.1K-word story. Not the sampler (nucleus only), not decode vs prefill (cos 0.9965 at 7.3K). The VQ GGUF is deleted
+(the card keeps its pinned URLs / SHA-256s; its registry entries are disabled; code, silo and cards stay).
+Test: the 10K-token story (scratchpad prompt "Write a very long, detailed science-fiction story (at least 9000 words) about a
+lighthouse keeper on a drifting space station. Do not stop early."), unique-word ratio and 5-gram repeats by 500 words.
+
+- [ ] Engine reads the llama.cpp / Unsloth form (arch `deepseek41`, reference: llama.cpp PR 30817) - branch `ds41-unsloth`
+  - [x] MXFP8 (ggml 43), metadata aliases (`ple.*`, `indexer.*`), tensor names, no draft towers, merged `ffn_*_exps` roles
+  - [x] the Engram from `per_layer_token_embd` (MXFP8 reordered on the host; Q5_K / Q6_K / IQ4_NL dequantized on the GPU)
+  - [x] dense weights in any type the shared kernels multiply (Q8_0 / Q6_K / Q5_K), BF16 as float32
+  - [ ] routed experts as merged tensors (MXFP4, Q3_K, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, Q2_K by layer): slot
+        of three slabs, decode products, prompt products; first a correct path, then fast kernels in the silo
+  - [ ] cards + registry for UD-Q3_K_XL (452 GB: ~263 GB of model, mostly streamed) and UD-IQ2_XXS (~280 GB), 128K / 1M
+  - [ ] story test on Q3_K_XL (near-lossless MXFP4): if it degrades too, the engine (long-context attention), not the quant
+  - [ ] decode tok/s against the VQ file's 23.2 (128K); the DSpark drafter (separate file, Q8_0 / BF16) unused for now
+  - [ ] the DeepSeek Engram safetensors (2 x 101 GB beside the old model) go once the Unsloth files run
+- [ ] A repetition guard in the front door (presence / frequency penalty): none exists
+- [ ] Re-fetch the VQ GGUF only if wanted (card `deepseek-v4.1-flash-vq`, 40 checked parts)
+
 ## Done
 
 - [x] Server (`nextsycl serve`): OpenAI API, streaming, thinking split out, prompt-prefix reuse, graceful stop (7931d08)

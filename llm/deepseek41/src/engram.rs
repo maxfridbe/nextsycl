@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use nextsycl_core::{Error, Result};
-use nextsycl_gguf::{Gguf, Value};
+use nextsycl_gguf::{GType, Gguf, Value};
 
 /// bytes of a row as the GPU takes it: the weights, then the scales
 pub fn row_bytes(hd: usize) -> usize {
@@ -45,6 +45,15 @@ struct Table {
     file: File,
     weight: u64,
     scale: u64,
+}
+
+/// The llama.cpp form's table: one tensor (`per_layer_token_embd.weight`, rows of `hd` values in ggml type `ty`) for
+/// every layer's heads, the constants in the metadata
+#[derive(Clone, Copy)]
+struct StdTable {
+    ty: GType,
+    /// a row's bytes in the file
+    src: usize,
 }
 
 /// One pass's rows on their way: rows k of layers li into `out` [n][row_bytes]
@@ -90,6 +99,10 @@ pub struct Engram {
     ngram: usize,
     heads: usize,
     pub hd: usize,
+    /// a row's bytes as `fetch` hands it on: the safetensors form's `row_bytes` (weights then scales: MXFP8 rows are
+    /// put in that form too), else the file's own row in `std`'s type (dequantized on the GPU)
+    pub rb: usize,
+    std: Option<StdTable>,
     /// the shards (the readers hold them too)
     _tables: Arc<Vec<Table>>,
     jobs: Mutex<Option<std::sync::mpsc::Sender<Job>>>,
@@ -192,6 +205,9 @@ fn read_at(f: &File, b: &mut Bounce, off: u64, dst: &mut [u8], pages: &AtomicU64
 impl Engram {
     /// The hash constants from the GGUF, the shards from `dir` (their names the metadata's table_path's), the readers.
     pub fn open(f: &Gguf, dir: &Path) -> Result<Engram> {
+        if f.architecture() == "deepseek41" {
+            return Self::open_std(f);
+        }
         let m = |k: &str| f.arch_meta(k).and_then(Value::as_u64).ok_or_else(|| Error(format!("metadata {k} is missing")));
         let layers: Vec<u64> = f.arch_meta("engram.layer_ids").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
         let token_map = ints(f, "engram.token_map")?;
@@ -209,10 +225,60 @@ impl Engram {
             tables.push(Table { file, weight: m(&format!("engram.{i}.weight_offset"))?, scale: m(&format!("engram.{i}.scale_offset"))? });
         }
         let tables = Arc::new(tables);
+        let (tx, workers, pages) = Self::spawn(&tables, hd, None)?;
+        Ok(Engram { layers, token_map, mult: ints(f, "engram.multipliers")?, primes: ints(f, "engram.primes")?, offsets: ints(f, "engram.offsets")?, pad, ngram,
+                    heads, hd, rb: row_bytes(hd), std: None, _tables: tables, jobs: Mutex::new(Some(tx)), workers,
+                    cache: Arc::new(Mutex::new((HashMap::new(), VecDeque::new()))), read_rows: AtomicU64::new(0), cached_rows: AtomicU64::new(0), pages,
+                    wait_ns: AtomicU64::new(0) })
+    }
+
+    /// The llama.cpp form: the hash constants from the metadata (`ple.*`, `engram.*`), the rows of
+    /// `per_layer_token_embd.weight` from the shard that holds it
+    fn open_std(f: &Gguf) -> Result<Engram> {
+        let m = |k: &str| f.arch_meta(k).and_then(Value::as_u64).ok_or_else(|| Error(format!("metadata {k} is missing")));
+        let list = |k: &str| -> Result<Vec<i64>> {
+            f.arch_meta(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_i64).collect()).ok_or_else(|| Error(format!("metadata {k} is missing")))
+        };
+        let layers: Vec<u64> = list("ple.layers")?.into_iter().map(|v| v as u64).collect();
+        let token_map = list("engram.token_map")?;
+        let pad = *token_map.get(m("engram.pad_token_id")? as usize).ok_or("engram: the pad id is past the token map")?;
+        let (ngram, heads, hd) = (m("ple.ngram_size")? as usize, m("ple.heads_per_ngram")? as usize, m("embedding_length_per_layer_input")? as usize);
+        let (mult, primes, offsets) = (list("ple.layer_multipliers")?, list("ple.head_vocab_sizes")?, list("ple.head_offsets")?);
+        let cols = (ngram - 1) * heads;
+        if mult.len() != layers.len() * ngram || primes.len() != layers.len() * cols || offsets.len() != layers.len() * cols {
+            return Err(Error("engram: the metadata's multipliers, primes and offsets do not match its layers".into()));
+        }
+        let t = f.tensor("per_layer_token_embd.weight").ok_or("per_layer_token_embd.weight (the Engram's table) is missing")?;
+        let src = t.ty.bytes(hd as u64).ok_or_else(|| Error(format!("the Engram's table is {}: rows of {hd} are not whole blocks", t.ty.name())))? as usize;
+        let rows_needed = (0..primes.len()).map(|c| (offsets[c] + primes[c]) as u64).max().unwrap_or(0);
+        if t.shape.first().copied().unwrap_or(0) < rows_needed || t.shape.get(1).copied() != Some(hd as u64) {
+            return Err(Error(format!("the Engram's table is {:?}: {rows_needed} rows of {hd} are needed", t.shape)));
+        }
+        let path = f.paths.get(t.shard).ok_or("the Engram's table: its shard")?;
+        // O_DIRECT: the table (110-203 GB) read a row at a time must not push the experts out of the page cache
+        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc_o_direct()).open(path).or_else(|_| File::open(path))
+            .map_err(|e| Error(format!("the Engram table {}: {e}", path.display())))?;
+        let tables = Arc::new(vec![Table { file, weight: t.offset, scale: 0 }]);
+        let std = StdTable { ty: t.ty, src };
+        let (tx, workers, pages) = Self::spawn(&tables, hd, Some(std))?;
+        // MXFP8 rows are put in the safetensors form (the GPU expands that); the other types go on as they are
+        let rb = if t.ty == GType::MXFP8 { row_bytes(hd) } else { src };
+        Ok(Engram { layers, token_map, mult, primes, offsets, pad, ngram, heads, hd, rb, std: Some(std), _tables: tables, jobs: Mutex::new(Some(tx)), workers,
+                    cache: Arc::new(Mutex::new((HashMap::new(), VecDeque::new()))), read_rows: AtomicU64::new(0), cached_rows: AtomicU64::new(0), pages,
+                    wait_ns: AtomicU64::new(0) })
+    }
+
+    /// The ggml type the GPU must dequantize the rows by, when they are not in the safetensors form
+    pub fn gpu_type(&self) -> Option<GType> {
+        self.std.map(|s| s.ty).filter(|t| *t != GType::MXFP8)
+    }
+
+    /// The reader threads (one read in flight each)
+    #[allow(clippy::type_complexity)]
+    fn spawn(tables: &Arc<Vec<Table>>, hd: usize, std: Option<StdTable>) -> Result<(std::sync::mpsc::Sender<Job>, Vec<std::thread::JoinHandle<()>>, Arc<AtomicU64>)> {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         let pages = Arc::new(AtomicU64::new(0));
-        let rb = row_bytes(hd);
         let mut workers = Vec::new();
         for i in 0..readers() {
             let (rx, tables, pages) = (rx.clone(), tables.clone(), pages.clone());
@@ -221,8 +287,28 @@ impl Engram {
                 loop {
                     let job = { rx.lock().unwrap().recv() };
                     let Ok(job) = job else { break };
-                    let mut part = vec![0u8; rb];
+                    let mut part = vec![0u8; std.map_or(row_bytes(hd), |s| s.src)];
                     for &(ti, r, at, scales) in &job.items {
+                        if let Some(s) = std {
+                            // one read a row: the table's one tensor
+                            let t = &tables[0];
+                            match read_at(&t.file, &mut b, t.weight + r * s.src as u64, &mut part[..s.src], &pages) {
+                                Ok(()) => {
+                                    let mut out = job.fetch.out.lock().unwrap();
+                                    if s.ty == GType::MXFP8 {
+                                        // [scale, 32 codes] x 8 -> 256 codes, then the 8 scales
+                                        for blk in 0..hd / 32 {
+                                            out[at + blk * 32..at + blk * 32 + 32].copy_from_slice(&part[blk * 33 + 1..blk * 33 + 33]);
+                                            out[at + hd + blk] = part[blk * 33];
+                                        }
+                                    } else {
+                                        out[at..at + s.src].copy_from_slice(&part[..s.src]);
+                                    }
+                                }
+                                Err(e) => *job.fetch.err.lock().unwrap() = Some(format!("reading an Engram row: {e}")),
+                            }
+                            continue;
+                        }
                         let t = &tables[ti];
                         let (off, n, at) = if scales { (t.scale + r * (hd / 32) as u64, hd / 32, at + hd) } else { (t.weight + r * hd as u64, hd, at) };
                         match read_at(&t.file, &mut b, off, &mut part[..n], &pages) {
@@ -237,9 +323,7 @@ impl Engram {
                 }
             }).map_err(|e| Error(format!("an Engram reader: {e}")))?);
         }
-        Ok(Engram { layers, token_map, mult: ints(f, "engram.multipliers")?, primes: ints(f, "engram.primes")?, offsets: ints(f, "engram.offsets")?, pad, ngram,
-                    heads, hd, _tables: tables, jobs: Mutex::new(Some(tx)), workers, cache: Arc::new(Mutex::new((HashMap::new(), VecDeque::new()))),
-                    read_rows: AtomicU64::new(0), cached_rows: AtomicU64::new(0), pages, wait_ns: AtomicU64::new(0) })
+        Ok((tx, workers, pages))
     }
 
     /// rows a token reads at a layer
@@ -277,7 +361,8 @@ impl Engram {
 
     /// Layer li's rows `rows` on their way into [n][row_bytes] (the cached ones copied now)
     pub fn fetch(&self, li: usize, rows: &[u64]) -> Arc<Fetch> {
-        let rb = row_bytes(self.hd);
+        let rb = self.rb;
+        let per_row = if self.std.is_some() { 1 } else { 2 };
         let mut out = vec![0u8; rows.len() * rb];
         let mut todo = Vec::new();
         {
@@ -287,13 +372,15 @@ impl Engram {
                     Some(v) => out[k * rb..(k + 1) * rb].copy_from_slice(v),
                     None => {
                         todo.push((li, r, k * rb, false));
-                        todo.push((li, r, k * rb, true));
+                        if per_row == 2 {
+                            todo.push((li, r, k * rb, true));
+                        }
                     }
                 }
             }
         }
-        self.cached_rows.fetch_add((rows.len() - todo.len() / 2) as u64, Ordering::Relaxed);
-        self.read_rows.fetch_add((todo.len() / 2) as u64, Ordering::Relaxed);
+        self.cached_rows.fetch_add((rows.len() - todo.len() / per_row) as u64, Ordering::Relaxed);
+        self.read_rows.fetch_add((todo.len() / per_row) as u64, Ordering::Relaxed);
         let fetch = Arc::new(Fetch { out: Mutex::new(out), left: AtomicUsize::new(todo.len()), done: Condvar::new(), lock: Mutex::new(()), err: Mutex::new(None) });
         if todo.is_empty() {
             return fetch;
@@ -316,7 +403,7 @@ impl Engram {
         let t0 = std::time::Instant::now();
         let out = f.wait()?;
         self.wait_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        let rb = row_bytes(self.hd);
+        let rb = self.rb;
         let cap = cache_rows();
         if cap > 0 {
             let mut c = self.cache.lock().unwrap();

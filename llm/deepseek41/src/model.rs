@@ -83,6 +83,9 @@ pub struct Geometry {
     pub mtp_noise: u32,
     pub mtp_targets: Vec<u64>,
     pub markov_rank: u64,
+    /// the llama.cpp / Unsloth form of the file (arch `deepseek41`: the experts as merged `ffn_*_exps` tensors in ggml's
+    /// row types, the Engram's table inside the file, its constants in the metadata) - not YoungAi's VQ form
+    pub std: bool,
 }
 
 impl Geometry {
@@ -177,6 +180,10 @@ pub enum Role {
     Router,
     RouterBias,
     Experts,
+    /// the llama.cpp form's experts: one merged tensor [n_expert, rows, cols] a matrix
+    ExpGate,
+    ExpUp,
+    ExpDown,
     ShGate,
     ShUp,
     ShDown,
@@ -208,7 +215,7 @@ impl Role {
             TokenEmbd | OutputNorm | Output | EngramTokenMap | EngramMult | EngramPrimes | EngramOffsets => Group::Edges,
             MtpMainProj | MtpMainNorm | MtpMarkovEmbd | MtpMarkovHead | MtpConfidence | MtpOutNorm => Group::Draft,
             Router | RouterBias | ShGate | ShUp | ShDown => Group::Shared,
-            Experts => Group::Experts,
+            Experts | ExpGate | ExpUp | ExpDown => Group::Experts,
             _ => Group::Attention,
         }
     }
@@ -256,6 +263,9 @@ impl Role {
             Router => "ffn_gate_inp.weight",
             RouterBias => "exp_probs_b.bias",
             Experts => "ffn_exps_vq.blob",
+            ExpGate => "ffn_gate_exps.weight",
+            ExpUp => "ffn_up_exps.weight",
+            ExpDown => "ffn_down_exps.weight",
             ShGate => "ffn_gate_shexp.weight",
             ShUp => "ffn_up_shexp.weight",
             ShDown => "ffn_down_shexp.weight",
@@ -275,6 +285,7 @@ const GLOBALS: [Role; 13] = [Role::TokenEmbd, Role::OutputNorm, Role::Output, Ro
 const COMMON: [Role; 16] = [Role::AttnNorm, Role::FfnNorm, Role::HcAttnFn, Role::HcAttnBase, Role::HcAttnScale, Role::HcFfnFn, Role::HcFfnBase, Role::HcFfnScale,
                             Role::QA, Role::QANorm, Role::QB, Role::Kv, Role::KvNorm, Role::Sinks, Role::OutA, Role::OutB];
 const MOE: [Role; 6] = [Role::Router, Role::RouterBias, Role::Experts, Role::ShGate, Role::ShUp, Role::ShDown];
+const MOE_STD: [Role; 8] = [Role::Router, Role::RouterBias, Role::ExpGate, Role::ExpUp, Role::ExpDown, Role::ShGate, Role::ShUp, Role::ShDown];
 
 /// A model file, resolved.
 pub struct Model<'g> {
@@ -292,26 +303,42 @@ fn meta_f(f: &Gguf, k: &str, default: Option<f64>) -> Result<f64> {
 fn meta_list(f: &Gguf, k: &str) -> Result<Vec<u64>> {
     f.arch_meta(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).ok_or_else(|| Error(format!("metadata {k} is missing")))
 }
+/// the first of a setting's names the file has (YoungAi's form, the llama.cpp form)
+fn alt<'a>(f: &'a Gguf, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|k| f.arch_meta(k))
+}
+fn alt_u(f: &Gguf, keys: &[&str]) -> Result<u64> {
+    alt(f, keys).and_then(Value::as_u64).ok_or_else(|| Error(format!("metadata {} is missing", keys[0])))
+}
+fn alt_list(f: &Gguf, keys: &[&str]) -> Result<Vec<u64>> {
+    alt(f, keys).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).ok_or_else(|| Error(format!("metadata {} is missing", keys[0])))
+}
 
 impl<'g> Model<'g> {
     pub fn open(file: &'g Gguf) -> Result<Model<'g>> {
-        if file.arch_meta("variant").and_then(Value::as_str) != Some("v41_flash") {
-            return Err(Error("not a DeepSeek-V4.1-Flash file (deepseek4.variant v41_flash)".into()));
+        let std = file.architecture() == "deepseek41";
+        if !std && file.arch_meta("variant").and_then(Value::as_str) != Some("v41_flash") {
+            return Err(Error("not a DeepSeek-V4.1-Flash file (architecture deepseek41, or deepseek4 variant v41_flash)".into()));
         }
         let gating = file.arch_meta("expert_gating_func");
         if !matches!(gating, Some(Value::Str(s)) if s == "sqrtsoftplus") && gating.and_then(Value::as_u64) != Some(4) {
             return Err(Error(format!("expert_gating_func {gating:?}: the engine takes sqrt(softplus)")));
         }
         let n_layer = meta_u(file, "block_count")?;
-        let n_mtp = meta_u(file, "mtp.tower_count").unwrap_or(0);
+        // the llama.cpp form keeps the DSpark drafter in a file of its own: none here
+        let n_mtp = if std { 0 } else { meta_u(file, "mtp.tower_count").unwrap_or(0) };
         let ratio = meta_list(file, "attention.compress_ratios")?;
         if let Some(r) = ratio.iter().find(|r| **r > 2) {
             return Err(Error(format!("a compress ratio of {r}: the engine takes 0, 1 and 2")));
         }
-        let cand = meta_u(file, "attention.candidate.source_layer").ok();
+        let cand = alt_u(file, &["attention.candidate.source_layer", "attention.indexer.candidate_source_layer"]).ok();
         let g = Geometry {
             n_embd: meta_u(file, "embedding_length")?,
-            n_vocab: meta_u(file, "vocab_size")?,
+            n_vocab: if std {
+                file.tensor("token_embd.weight").and_then(|t| t.shape.first().copied()).ok_or_else(|| Error("token_embd.weight is missing".into()))?
+            } else {
+                meta_u(file, "vocab_size")?
+            },
             n_layer,
             n_expert: meta_u(file, "expert_count")?,
             n_expert_used: meta_u(file, "expert_used_count")?,
@@ -341,14 +368,14 @@ impl<'g> Model<'g> {
             ctx: meta_u(file, "context_length")?,
             ratio,
             kv_sources: meta_list(file, "attention.kv_source_layers")?,
-            index_sources: meta_list(file, "attention.index_source_layers")?,
+            index_sources: alt_list(file, &["attention.index_source_layers", "attention.indexer.source_layers"])?,
             cand_source: cand,
-            cand_top: meta_u(file, "attention.candidate.topk_blocks").unwrap_or(0),
-            cand_block: meta_u(file, "attention.candidate.block_size").unwrap_or(1),
-            engram_layers: meta_list(file, "engram.layer_ids").unwrap_or_default(),
-            engram_heads: meta_u(file, "engram.head_count").unwrap_or(0),
-            engram_dim: meta_u(file, "engram.head_dim").unwrap_or(0),
-            engram_ngram: meta_u(file, "engram.max_ngram_size").unwrap_or(1),
+            cand_top: alt_u(file, &["attention.candidate.topk_blocks", "attention.indexer.candidate_top_k_blocks"]).unwrap_or(0),
+            cand_block: alt_u(file, &["attention.candidate.block_size", "attention.indexer.candidate_block_size"]).unwrap_or(1),
+            engram_layers: alt_list(file, &["engram.layer_ids", "ple.layers"]).unwrap_or_default(),
+            engram_heads: alt_u(file, &["engram.head_count", "ple.heads_per_ngram"]).unwrap_or(0),
+            engram_dim: alt_u(file, &["engram.head_dim", "embedding_length_per_layer_input"]).unwrap_or(0),
+            engram_ngram: alt_u(file, &["engram.max_ngram_size", "ple.ngram_size"]).unwrap_or(1),
             n_mtp,
             mtp_expert: meta_u(file, "mtp.expert_count").unwrap_or(0),
             mtp_expert_used: meta_u(file, "mtp.expert_used_count").unwrap_or(0),
@@ -356,6 +383,7 @@ impl<'g> Model<'g> {
             mtp_noise: meta_u(file, "mtp.noise_token_id").unwrap_or(0) as u32,
             mtp_targets: meta_list(file, "mtp.target_layers").unwrap_or_default(),
             markov_rank: meta_u(file, "mtp.markov_rank").unwrap_or(0),
+            std,
         };
         if g.hc != 4 || g.head_dim != 512 {
             return Err(Error(format!("{} mHC streams, heads of {}: the engine takes 4 and 512", g.hc, g.head_dim)));
@@ -379,9 +407,22 @@ impl<'g> Model<'g> {
         if l >= self.g.n_layer { format!("mtp.{}.", l - self.g.n_layer) } else { format!("blk.{l}.") }
     }
 
+    /// A role's tensor name (after `blk.N.`): the llama.cpp form names three of them differently
+    pub fn role_name(&self, r: Role) -> &'static str {
+        if !self.g.std {
+            return r.name();
+        }
+        match r {
+            Role::IdxWk => "indexer.attn_k.weight",
+            Role::EngramWkv => "engram_kv.weight",
+            Role::EngramQ => "engram_gate.weight",
+            _ => r.name(),
+        }
+    }
+
     /// A tensor by role (`layer` ignored for global roles).
     pub fn tensor(&self, l: u64, r: Role) -> Option<&'g Tensor> {
-        if r.global() { self.file.tensor(r.name()) } else { self.file.tensor(&format!("{}{}", self.prefix(l), r.name())) }
+        if r.global() { self.file.tensor(self.role_name(r)) } else { self.file.tensor(&format!("{}{}", self.prefix(l), self.role_name(r))) }
     }
 
     /// The roles block `l` has.
@@ -397,9 +438,17 @@ impl<'g> Model<'g> {
         if g.index_sources.contains(&l) {
             v.extend([Role::IdxQB, Role::IdxProj]);
         }
-        v.extend(MOE);
+        if g.std {
+            v.extend(MOE_STD);
+        } else {
+            v.extend(MOE);
+        }
         if g.is_engram(l) {
-            v.extend([Role::EngramWkv, Role::EngramQ, Role::EngramK]);
+            // the llama.cpp form has the product of the gate's q and k as one tensor (engram_gate)
+            v.extend([Role::EngramWkv, Role::EngramQ]);
+            if !g.std {
+                v.push(Role::EngramK);
+            }
         }
         v
     }
@@ -439,6 +488,8 @@ impl<'g> Model<'g> {
             Router => vec![ne, d],
             RouterBias => vec![ne],
             Experts => self.tensor(l, r).map_or(vec![0], |t| t.shape.clone()),
+            ExpGate | ExpUp => vec![ne, g.ffn_expert, d],
+            ExpDown => vec![ne, d, g.ffn_expert],
             ShGate | ShUp => vec![g.ffn_expert, d],
             ShDown => vec![d, g.ffn_expert],
             EngramWkv => vec![(hc + 1) * d, ecols * g.engram_dim],
@@ -454,7 +505,22 @@ impl<'g> Model<'g> {
             if r.group() == Group::Draft && self.g.n_mtp == 0 {
                 continue;
             }
+            // the llama.cpp form carries the Engram's constants in the metadata
+            if self.g.std && matches!(r, Role::EngramTokenMap | Role::EngramMult | Role::EngramPrimes | Role::EngramOffsets) {
+                continue;
+            }
             self.check_one(0, r, &mut errs, &mut seen);
+        }
+        if self.g.std {
+            // the vision-language router bias, and the Engram's table (read by row, not loaded)
+            for l in 0..self.g.n_layer {
+                if let Some(t) = self.file.tensor(&format!("blk.{l}.exp_probs_b_vl.bias")) {
+                    seen.insert(t.name.as_str());
+                }
+            }
+            if let Some(t) = self.file.tensor("per_layer_token_embd.weight") {
+                seen.insert(t.name.as_str());
+            }
         }
         for l in 0..self.g.n_layer + self.g.n_mtp {
             for r in self.roles(l) {

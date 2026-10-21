@@ -68,6 +68,8 @@ pub enum GType {
     TQ1_0,
     TQ2_0,
     MXFP4,
+    /// OCP MXFP8 (code 43; Unsloth's DeepSeek-V4.1 Engram table): blocks of 32 - an E8M0 scale byte, then 32 E4M3 codes
+    MXFP8,
     /// GSQ-RCO's 2-bit type (Qwen3.8-Flash-Next's files): 64 values, an f16 scale and 2-bit codes
     Q2_0,
     /// YoungAi's vector-quantized expert container (DeepSeek-V4.1's `ffn_exps_vq.blob`, a `DQVL` blob of every expert's
@@ -114,6 +116,7 @@ impl GType {
             34 => TQ1_0,
             35 => TQ2_0,
             39 => MXFP4,
+            43 => MXFP8,
             42 => Q2_0,
             44 => Fp8B32,
             _ => return None,
@@ -156,6 +159,7 @@ impl GType {
             TQ1_0 => 34,
             TQ2_0 => 35,
             MXFP4 => 39,
+            MXFP8 => 43,
             Q2_0 | VqBlob => 42,
             Fp8B32 => 44,
         }
@@ -177,6 +181,7 @@ impl GType {
             Q8_1 => (32, 36),
             IQ4NL => (32, 18),
             MXFP4 => (32, 17),
+            MXFP8 => (32, 33),
             Q2_0 => (64, 18),
             VqBlob => (1, 1),
             Fp8B32 => (1024, 1025),
@@ -246,6 +251,7 @@ impl GType {
             TQ1_0 => "TQ1_0",
             TQ2_0 => "TQ2_0",
             MXFP4 => "MXFP4",
+            MXFP8 => "MXFP8",
             Q2_0 => "Q2_0",
             VqBlob => "VQ_BLOB",
             Fp8B32 => "FP8_32X32",

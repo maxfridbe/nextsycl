@@ -1522,7 +1522,7 @@ impl Part {
         todo.extend(layers.clone().chain(towers.iter().copied()).map(|l| (l, m.roles(l))));
         for (l, roles) in todo {
             for r in roles {
-                if matches!(r, Role::Experts | Role::TokenEmbd | Role::EngramQ | Role::EngramK) {
+                if matches!(r, Role::Experts | Role::ExpGate | Role::ExpUp | Role::ExpDown | Role::TokenEmbd | Role::EngramK) || (r == Role::EngramQ && !g.std) {
                     continue; // the experts through the stores; the embedding's rows per token; q x k below
                 }
                 let t = m.tensor(l, r).ok_or_else(|| Error(format!("block {l}: {r:?} missing")))?;
@@ -1539,7 +1539,7 @@ impl Part {
                     let f = DevBuf::f32(gpu, n)?;
                     ops.dequant(t.ty.code(), &raw, 0, t.bytes as usize, n, &f)?;
                     mats.insert((l, r), Mat { buf: f, ty: GType::F32, rows: n / cols, cols });
-                } else if matches!(t.ty, GType::Q4K | GType::Fp8B32) {
+                } else if matches!(t.ty, GType::Q4K | GType::Fp8B32) || ops.mmvq_supported(t.ty.code()) {
                     mats.insert((l, r), Mat { buf: raw, ty: t.ty, rows: n / cols, cols });
                 } else {
                     return Err(Error(format!("{}: type {} is not one this engine multiplies", t.name, t.ty.name())));
@@ -1551,8 +1551,14 @@ impl Part {
                     let t = m.tensor(l, r).ok_or_else(|| Error(format!("block {l}: {r:?} missing")))?;
                     Ok(m.file.read(t).map_err(e)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
                 };
-                let (q, k) = (rd(Role::EngramQ)?, rd(Role::EngramK)?);
-                vecs.insert((l, Role::EngramQ), DevBuf::from_f32(gpu, &q.iter().zip(&k).map(|(a, b)| a * b).collect::<Vec<f32>>())?);
+                // the llama.cpp form stores the product already (engram_gate)
+                let qk = if g.std {
+                    rd(Role::EngramQ)?
+                } else {
+                    let (q, k) = (rd(Role::EngramQ)?, rd(Role::EngramK)?);
+                    q.iter().zip(&k).map(|(a, b)| a * b).collect::<Vec<f32>>()
+                };
+                vecs.insert((l, Role::EngramQ), DevBuf::from_f32(gpu, &qk)?);
             }
         }
         gpu.sync()?;
@@ -2480,7 +2486,11 @@ impl<'g> Ds41<'g> {
         }
         p.upload(&rb, &padded)?;
         let rows = p.arena.f32(t * nc * hd)?;
-        p.ops.engram_rows(&rb, &rows, t * nc, hd)?;
+        match en.gpu_type() {
+            // the llama.cpp form's Q5_K / Q6_K / IQ4_NL rows: one block a row, expanded by the shared kernels
+            Some(ty) => p.ops.dequant(ty.code(), &rb, 0, t * nc * en.rb, t * nc * hd, &rows)?,
+            None => p.ops.engram_rows(&rb, &rows, t * nc, hd)?,
+        }
         let kv = p.mm(l, Role::EngramWkv, &rows, t)?;
         p.ops.engram_gate(x, &kv, p.vec(l, Role::EngramQ)?, t, d, g.rms_eps as f32)?;
         tap(&format!("hc_engram-{l}"), &x.view(0, t * 4 * d * 4)?)?;
