@@ -125,6 +125,103 @@ fn compare(a: &[f32], b: &[f32]) -> (f64, f64) {
     ((dd / bb.max(1e-30)).sqrt(), mx)
 }
 
+/// `nextsycl kernels` on a llama.cpp-form file: each expert type's expansion and decode product on real experts (one of
+/// each type, the first and a middle expert). The product against the host's W x on the weights the expansion made - or
+/// on a reference's when `NS_DS41_STD_DIR` holds `<tag>.ref.f32` (ggml's own dequantize_row_* on `<tag>.raw`, which this
+/// writes beside `<tag>.gpu.f32`), and the expansion against it
+fn kernels_std(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &crate::ops::Ops) -> Result<(), String> {
+    use nextsycl_core::DevBuf;
+    let e = |x: nextsycl_core::Error| x.0;
+    let gg = &m.g;
+    let (d, ff) = (gg.n_embd as usize, gg.ffn_expert as usize);
+    let dir = std::env::var("NS_DS41_STD_DIR").ok().map(std::path::PathBuf::from);
+    let mut seed = 0x1234_5678u64;
+    let mut rnd = || {
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        ((seed.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f32) / (1u64 << 24) as f32 - 0.5
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for l in 0..gg.n_layer {
+        for (which, role, rows, cols) in [(0usize, Role::ExpGate, ff, d), (1, Role::ExpUp, ff, d), (2, Role::ExpDown, d, ff)] {
+            let t = m.tensor(l, role).ok_or("an expert tensor is missing")?;
+            if !seen.insert((t.ty.code(), which == 2)) {
+                continue;
+            }
+            let mat = t.bytes as usize / gg.n_expert as usize;
+            for ex in [0u64, gg.n_expert / 2] {
+                let mut raw = vec![0u8; mat];
+                f.read_into(t, ex * mat as u64, &mut raw).map_err(|x| x.0)?;
+                let src = DevBuf::new(g, mat.next_multiple_of(256)).map_err(e)?;
+                src.write(0, &raw).map_err(e)?;
+                let wd = DevBuf::f32(g, rows * cols).map_err(e)?;
+                o.std_dequant(t.ty.code(), &src, 0, mat, rows, cols, &wd, false).map_err(e)?;
+                let got = wd.to_f32().map_err(e)?;
+                let tag = format!("{}_{}_L{l}_e{ex}", t.ty.name(), ["gate", "up", "down"][which]);
+                let mut note = String::new();
+                let mut want = got.clone();
+                if let Some(dir) = &dir {
+                    std::fs::write(dir.join(format!("{tag}.raw")), &raw).map_err(|x| x.to_string())?;
+                    std::fs::write(dir.join(format!("{tag}.gpu.f32")), got.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).map_err(|x| x.to_string())?;
+                    if let Ok(b) = std::fs::read(dir.join(format!("{tag}.ref.f32"))) {
+                        let r: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                        if r.len() != got.len() {
+                            return Err(format!("{tag}: the reference has {} values, {} expected", r.len(), got.len()));
+                        }
+                        let (rel, mx) = compare(&got, &r);
+                        note = format!("expansion vs ggml: rel err {rel:.2e} (max {mx:.2e}); ");
+                        want = r;
+                    }
+                }
+                // the decode product: 3 columns of x, against the host's W x
+                let x: Vec<f32> = (0..3 * cols).map(|_| rnd()).collect();
+                let xd = DevBuf::from_f32(g, &x).map_err(e)?;
+                let mut tb: Vec<u8> = (src.ptr() as u64).to_le_bytes().to_vec();
+                for v in [3i32, 0, 0, 1, 2, 0, 0, 0, 0, 0] {
+                    tb.extend(v.to_le_bytes());
+                }
+                let tab = DevBuf::new(g, tb.len()).map_err(e)?;
+                tab.write(0, &tb).map_err(e)?;
+                let yd = DevBuf::f32(g, 3 * rows).map_err(e)?;
+                o.std_mmv(t.ty.code(), &tab, 1, &xd, (&yd, 0), 3, rows, cols).map_err(e)?;
+                g.sync().map_err(e)?;
+                let y = yd.to_f32().map_err(e)?;
+                let mut yw = vec![0f32; 3 * rows];
+                for c in 0..3 {
+                    for r in 0..rows {
+                        yw[c * rows + r] = (0..cols).map(|k| want[r * cols + k] as f64 * x[c * cols + k] as f64).sum::<f64>() as f32;
+                    }
+                }
+                let (yrel, _) = compare(&y, &yw);
+                // six experts' worth in one launch (a decode layer's gate | up or down), timed
+                let mut tb6: Vec<u8> = Vec::new();
+                for _ in 0..6 {
+                    tb6.extend((src.ptr() as u64).to_le_bytes());
+                }
+                for i in 0..6 {
+                    for v in [1i32, i, 0, 0, 0, 0, 0, 0, 0, 0] {
+                        tb6.extend(v.to_le_bytes());
+                    }
+                }
+                let tab6 = DevBuf::new(g, tb6.len()).map_err(e)?;
+                tab6.write(0, &tb6).map_err(e)?;
+                let y6 = DevBuf::f32(g, 6 * rows).map_err(e)?;
+                o.std_mmv(t.ty.code(), &tab6, 6, &xd, (&y6, 0), 6, rows, cols).map_err(e)?;
+                g.sync().map_err(e)?;
+                let t0 = std::time::Instant::now();
+                for _ in 0..10 {
+                    o.std_mmv(t.ty.code(), &tab6, 6, &xd, (&y6, 0), 6, rows, cols).map_err(e)?;
+                }
+                g.sync().map_err(e)?;
+                let us = t0.elapsed().as_secs_f64() * 1e5;
+                println!("{tag:<28} [{rows} x {cols}] {}3-column product rel err {yrel:.2e}; 6 experts in one launch {us:.0} us", note);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `nextsycl kernels`: the VQ kernels on real experts (13- and 12-bit layers, a tower) against the host decode, the
 /// decode product against expanded weights x x on the host; the fp8_32x32 kernels likewise
 pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
@@ -136,6 +233,9 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
     let g = nextsycl_core::Gpu::open(gpu).map_err(e)?;
     let o = Ops::new(g.clone()).map_err(e)?;
     println!("gpu: {}", g.name);
+    if m.g.std {
+        return kernels_std(&f, &m, &g, &o);
+    }
     // NS_DS41_IDX_BENCH=n1,n2,..: only the indexer's costs at a deep position - its scores for a prompt step's rows (as
     // many as select() takes at n keys), their top-k over all n, and the two-level form (blocks' maxima, the best
     // blocks, their keys scored again, the top-k among them) with whether its picks are the same

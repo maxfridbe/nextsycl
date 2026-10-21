@@ -62,7 +62,7 @@ pub const OPTIONS: &[EngineOption] = &[
 
 /// This engine's registry entry
 pub fn kind() -> EngineKind {
-    EngineKind { archs: &["deepseek4.v41_flash"], name: "DeepSeek-V4.1 (shared compressed keys and indexer picks, Engram, VQ experts, DSpark towers)", load,
+    EngineKind { archs: &["deepseek4.v41_flash", "deepseek41"], name: "DeepSeek-V4.1 (shared compressed keys and indexer picks, Engram, VQ experts, DSpark towers)", load,
                  info: tools::info, kernels: Some(tools::kernels), chat: nextsycl_tok::deepseek41_chat, options: OPTIONS, prepare: None }
 }
 
