@@ -766,6 +766,37 @@ impl Ops {
         };
         self.ok(rc, "ds41_vq_mmv")
     }
+    /// whether an expert matrix of this ggml type and width is taken by the std kernels
+    pub fn std_supported(&self, ty: u32, cols: usize) -> bool {
+        // SAFETY: a capability query.
+        unsafe { (self.k.ds41_std_supported)(ty as i32, cols as i64) != 0 }
+    }
+    /// An expert matrix of ggml type `ty` (at bytes `at` of `src`, `bytes` long) expanded into dst (fp16 or float32)
+    #[allow(clippy::too_many_arguments)]
+    pub fn std_dequant(&self, ty: u32, src: &DevBuf, at: usize, bytes: usize, rows: usize, cols: usize, dst: &DevBuf, f16: bool) -> Result<()> {
+        src.bounds(at, bytes)?;
+        dst.bounds(0, rows * cols * if f16 { 2 } else { 4 })?;
+        // SAFETY: sizes checked; `bytes` is the matrix's stored size (the caller's, from the type's block).
+        let rc = unsafe { (self.k.ds41_std_dequant)(self.raw(), ty as i32, src.ptr().cast::<u8>().add(at).cast(), rows as i64, cols as i64, dst.ptr(), f16 as i32) };
+        self.ok(rc, "ds41_std_dequant")
+    }
+    /// `vq_mmv`'s products for expert matrices in a ggml type: `table` = u64 matrix pointers [entries], then i32 meta
+    /// [entries][10] ({ncol, y0, cols}); y [(y0 + c) * rows + r] (floats from `y.1`, `y_rows` rows of `rows` in all)
+    #[allow(clippy::too_many_arguments)]
+    pub fn std_mmv(&self, ty: u32, table: &DevBuf, entries: usize, x: &DevBuf, y: (&DevBuf, usize), y_rows: usize, rows: usize, cols: usize) -> Result<()> {
+        if entries == 0 {
+            return Ok(());
+        }
+        table.bounds(0, entries * 48)?;
+        need!(y.0, y.1 + y_rows * rows, "std_mmv y");
+        // SAFETY: sizes checked; the pointers are VRAM / pinned slots of this GPU holding the matrices, the columns the
+        // caller's rows of x.
+        let rc = unsafe {
+            let base = table.ptr().cast::<u8>();
+            (self.k.ds41_std_mmv)(self.raw(), ty as i32, base.cast(), base.add(entries * 8).cast(), entries as i64, x.fp(), y.0.fp().add(y.1), rows as i64, cols as i64)
+        };
+        self.ok(rc, "ds41_std_mmv")
+    }
     /// A prompt pass's expert product on XMX from the indices: y [n][ldy] (from float y.1) = x [n][cols] (fp16, rows ldx
     /// apart, its buffer readable to a multiple of 64 rows) . W^T; W's rows < split from payload p0, the rest from p1
     #[allow(clippy::too_many_arguments)]

@@ -135,6 +135,15 @@ int ns_ds41_fp8_dequant(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols,
 int ns_ds41_fp8_mmv(ns_gpu* g, const uint8_t* w, int64_t rows, int64_t cols, const float* x, int64_t xcs, int64_t rpg, int64_t xgs, float* y, int64_t ycs,
                     int64_t t);
 
+/* ---- std.cpp: the routed experts in ggml's row types (Unsloth's / llama.cpp's form: merged ffn_*_exps tensors by layer in
+ * MXFP4, Q2_K, Q3_K, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S; Q8_0 too). cols a multiple of 256, float32 activations */
+int ns_ds41_std_supported(int type, int64_t cols);
+/* Decode products, vq_mmv's table: entry e = the matrix of `rows` rows at ptrs[e] against meta[e] = {ncol, y0, col_0 .. col_7}
+ * columns of x [*][cols]: y[(y0 + c) * rows + r] = W . x[col_c] */
+int ns_ds41_std_mmv(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const float* x, float* y, int64_t rows, int64_t cols);
+/* A matrix [rows][cols] in `type` expanded to out [rows][cols] as fp16 (f16 = 1) or float32 */
+int ns_ds41_std_dequant(ns_gpu* g, int type, const void* src, int64_t rows, int64_t cols, void* out, int f16);
+
 /* ---- q4k.cpp: y [t][ycs] = W . x for a q4_K W [rows][cols], t 1..8 columns of float32 x (column c at x + c xcs); with
  * rpg > 0, row r reads x + (r / rpg) xgs (o_a's groups: a row block its own input) */
 int ns_ds41_q4k_mv(ns_gpu* g, const void* w, int64_t rows, int64_t cols, const float* x, int64_t xcs, int64_t rpg, int64_t xgs, float* y, int64_t ycs,

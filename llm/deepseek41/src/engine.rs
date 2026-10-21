@@ -307,10 +307,44 @@ struct LayerVq {
     nbit: usize,
     /// the layer's E4M3 codebook bytes (on the GPU of the layer's part)
     cb_bytes: Vec<u8>,
+    /// the llama.cpp form: the three matrices' tensors, types and bytes an expert (a span: gate | up | down back to back)
+    std: Option<StdExp>,
+}
+
+/// A layer's experts in ggml's row types: three merged tensors [n_expert, rows, cols] (gate and up the same type)
+struct StdExp {
+    t: [Tensor; 3],
+    ty: [GType; 3],
+    /// each matrix's bytes in an expert
+    mat: [usize; 3],
+}
+
+/// The std form's layer: the merged tensors' types and each expert's three slabs
+fn layer_std(m: &Model, l: u64) -> Result<LayerVq> {
+    let g = &m.g;
+    let (d, f) = (g.n_embd as usize, g.ffn_expert as usize);
+    let get = |r: Role| m.tensor(l, r).cloned().ok_or_else(|| Error(format!("block {l}: {r:?} is missing")));
+    let t = [get(Role::ExpGate)?, get(Role::ExpUp)?, get(Role::ExpDown)?];
+    let ty = [t[0].ty, t[1].ty, t[2].ty];
+    if ty[0] != ty[1] {
+        return Err(Error(format!("block {l}: gate is {} and up {}: the products take one type for both", ty[0].name(), ty[1].name())));
+    }
+    let mat = [t[0].bytes as usize / g.n_expert as usize, t[1].bytes as usize / g.n_expert as usize, t[2].bytes as usize / g.n_expert as usize];
+    for (i, (rows, cols)) in [(f, d), (f, d), (d, f)].into_iter().enumerate() {
+        let want = ty[i].bytes((rows * cols) as u64).ok_or_else(|| Error(format!("block {l}: {} rows of {cols} are not whole blocks", ty[i].name())))? as usize;
+        if mat[i] != want || t[i].bytes as usize != want * g.n_expert as usize {
+            return Err(Error(format!("block {l}: {}: {} bytes an expert, {want} expected", t[i].name, mat[i])));
+        }
+    }
+    Ok(LayerVq { blob: t[0].clone(), starts: Vec::new(), span: mat.iter().sum(), gate: 0, up: mat[0], down: mat[0] + mat[1], nbit: 0, cb_bytes: Vec::new(),
+                 std: Some(StdExp { t, ty, mat }) })
 }
 
 /// Reads the slot table and checks the payloads: every expert's three payloads back to back in one layout
 fn layer_vq(m: &Model, l: u64) -> Result<LayerVq> {
+    if m.g.std {
+        return layer_std(m, l);
+    }
     let g = &m.g;
     let t = m.tensor(l, Role::Experts).ok_or_else(|| Error(format!("block {l}: the expert blob is missing")))?.clone();
     let (ne, _) = g.experts(l);
@@ -356,11 +390,19 @@ fn layer_vq(m: &Model, l: u64) -> Result<LayerVq> {
     }
     let mut cb_bytes = vec![0u8; nc * 8];
     m.file.read_into(&t, cb_off, &mut cb_bytes).map_err(e)?;
-    Ok(LayerVq { blob: t, starts, span, gate, up, down, nbit, cb_bytes })
+    Ok(LayerVq { blob: t, starts, span, gate, up, down, nbit, cb_bytes, std: None })
 }
 
 /// Expert `ex` of `vq`'s layer from the file into `host` (its span)
 fn read_expert(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8]) -> Result<()> {
+    if let Some(s) = &vq.std {
+        let mut at = 0;
+        for i in 0..3 {
+            m.file.read_into(&s.t[i], ex * s.mat[i] as u64, &mut host[at..at + s.mat[i]]).map_err(e)?;
+            at += s.mat[i];
+        }
+        return Ok(());
+    }
     m.file.read_into(&vq.blob, vq.starts[ex as usize], &mut host[..vq.span]).map_err(e)
 }
 
@@ -781,6 +823,19 @@ impl Part {
         Ok(y)
     }
 
+    /// Layer l's decode products of its experts' gate | up (`down` false) or down matrices (vq_mmv's table): the VQ form's
+    /// from the indices, the ggml-typed form's by dequantizing in the kernel
+    #[allow(clippy::too_many_arguments)]
+    fn exp_mmv(&self, l: u64, down: bool, table: &DevBuf, entries: usize, x: &DevBuf, y: (&DevBuf, usize), y_rows: usize, rows: usize, cols: usize, var: i32,
+               lut: Option<(usize, usize)>) -> Result<()> {
+        let v = &self.vq[&l];
+        if let Some(s) = &v.std {
+            return self.ops.std_mmv(s.ty[if down { 2 } else { 0 }].code(), table, entries, x, y, y_rows, rows, cols);
+        }
+        let cb = self.cbs.get(&l).ok_or_else(|| Error(format!("layer {l}: no codebook")))?;
+        self.ops.vq_mmv(table, entries, (cb, vq_wide((&self.cbf, &self.cbh), l, var)), x, y, y_rows, rows, cols, v.nbit, var, lut)
+    }
+
     /// Two products of the same x: at one decode row, both q4_K (or both float32) in one launch (NS_DS41_KV_FUSE=0: two)
     fn mm2(&self, (l1, r1): (u64, Role), (l2, r2): (u64, Role), x: &DevBuf, t: usize) -> Result<(DevBuf, DevBuf)> {
         let (w1, w2) = (self.mat(l1, r1)?, self.mat(l2, r2)?);
@@ -1169,6 +1224,10 @@ impl Part {
     fn read_ahead(&self, l: u64, want: &[u64], limit: usize) -> Result<()> {
         let (Some(rd), Ok(st)) = (&self.reader, self.store(l)) else { return Ok(()) };
         let vq = &self.vq[&l];
+        // an expert of the ggml-typed form is three slabs of the file, not one span: its reads wait for the miss
+        if vq.std.is_some() {
+            return Ok(());
+        }
         let mut c = st.lock().unwrap();
         let c = &mut *c;
         let xs: Vec<u64> = want.iter().copied().filter(|x| !c.loc.contains_key(&(l, *x)) && !c.ahead.contains_key(&(l, *x))).take(limit).collect();
@@ -1412,7 +1471,7 @@ fn vq_pick(o: &Ops, g: &crate::model::Geometry, vq: &HashMap<u64, LayerVq>, cbs:
            store_of: &HashMap<u64, usize>, draft: &HashMap<u64, DevBuf>, mtp: bool, log: &mut dyn FnMut(String)) -> Result<HashMap<usize, [i32; 2]>> {
     let mut out = HashMap::new();
     if let Some(v) = std::env::var("NS_DS41_VQ_V").ok().and_then(|v| v.parse::<i32>().ok()) {
-        for l in vq.values() {
+        for l in vq.values().filter(|l| l.std.is_none()) {
             out.insert(l.nbit, [v, v]);
         }
         return Ok(out);
@@ -1422,7 +1481,7 @@ fn vq_pick(o: &Ops, g: &crate::model::Geometry, vq: &HashMap<u64, LayerVq>, cbs:
     layers.sort();
     for l in layers {
         let v = &vq[&l];
-        if out.contains_key(&v.nbit) {
+        if v.std.is_some() || out.contains_key(&v.nbit) {
             continue;
         }
         // six of the layer's experts in VRAM: the store's slots it owns, or the towers' buffer
@@ -1578,6 +1637,13 @@ impl Part {
         let mut cbh = HashMap::new();
         for l in layers.clone().chain(towers.iter().copied()) {
             let v = layer_vq(m, l)?;
+            if let Some(s) = &v.std {
+                if ![(s.ty[0], g.n_embd), (s.ty[2], g.ffn_expert)].iter().all(|(t, c)| ops.std_supported(t.code(), *c as usize)) {
+                    return Err(Error(format!("block {l}: experts of {} | {} are not taken by the kernels", s.ty[0].name(), s.ty[2].name())));
+                }
+                vq.insert(l, v);
+                continue;
+            }
             if !ops.vq_supported(g.ffn_expert as usize, g.n_embd as usize, v.nbit) {
                 return Err(Error(format!("block {l}: {}-bit VQ experts are not taken by the kernels", v.nbit)));
             }
@@ -3338,11 +3404,11 @@ impl<'g> Ds41<'g> {
             }
             early_read = Some(p.read_start(&down)?);
             let (dn, gu, hset) = (p.arena.f32(used * d)?, p.arena.f32(2 * used * f)?, p.arena.f32(used * f)?);
-            let (cb, nbit) = (&p.cbs[&l], vq.nbit);
+            let nbit = vq.nbit;
             let pick = p.vq_pick.get(&nbit).copied().unwrap_or([0, 0]);
-            o.vq_mmv(&gtab, 2 * used, (cb, vq_wide((&p.cbf, &p.cbh), l, pick[0])), x, (&gu, 0), 2 * used, f, d, nbit, pick[0], Some((1, 2 * used)))?;
+            p.exp_mmv(l, false, &gtab, 2 * used, x, (&gu, 0), 2 * used, f, d, pick[0], Some((1, 2 * used)))?;
             o.swiglu_clamp(&gu.view(0, used * f * 4)?, &gu.view(used * f * 4, used * f * 4)?, &hset, used * f, lim)?;
-            o.vq_mmv(&dtab, used, (cb, vq_wide((&p.cbf, &p.cbh), l, pick[1])), &hset, (&dn, 0), used, d, f, nbit, pick[1], Some((used, 1)))?;
+            p.exp_mmv(l, true, &dtab, used, &hset, (&dn, 0), used, d, f, pick[1], Some((used, 1)))?;
             early = Some((info, dn, ctab));
         }
         let pending = match early_read {
@@ -3419,7 +3485,6 @@ impl<'g> Ds41<'g> {
         let (slots_of, arriving, copies) =
             if staging { (Vec::new(), Vec::new(), None) } else { self.timed(p, "experts: misses", || p.ensure(&self.m, l, &need, promote))? };
         let vq = &p.vq[&l];
-        let cb = &p.cbs[&l];
         let nbit = vq.nbit;
         let total: usize = by.values().map(|v| v.len()).sum();
         let lists: Vec<&Vec<(i32, f32)>> = by.values().collect();
@@ -3513,13 +3578,13 @@ impl<'g> Ds41<'g> {
                     p.upload(&gtab, &tb)?;
                     let dtab = p.arena.bytes(db.len())?;
                     p.upload(&dtab, &db)?;
-                    o.vq_mmv(&gtab, ptrs.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, pick[0])), x, (&gu, 0), 2 * total, f, d, nbit, pick[0], glut)?;
+                    p.exp_mmv(l, false, &gtab, ptrs.len(), x, (&gu, 0), 2 * total, f, d, pick[0], glut)?;
                     // h = silu(gate) up, in place of the gates (rows of the set only: the same op on the others is a no-op
                     // since they are computed once - the whole range is cheap and simplest)
                     let (gv, uv) = (gu.view(0, total * f * 4)?, gu.view(total * f * 4, total * f * 4)?);
                     let hset = p.arena.f32(total * f)?;
                     o.swiglu_clamp(&gv, &uv, &hset, total * f, lim)?;
-                    o.vq_mmv(&dtab, dptr.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, pick[1])), &hset, (&dn, 0), total, d, f, nbit, pick[1], dlut)?;
+                    p.exp_mmv(l, true, &dtab, dptr.len(), &hset, (&dn, 0), total, d, f, pick[1], dlut)?;
                     if !wait {
                         TURN_NS.fetch_add(turn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -3686,14 +3751,13 @@ impl<'g> Ds41<'g> {
         let (d, f) = (g.n_embd as usize, g.ffn_expert as usize);
         let lim = g.swiglu_limit as f32;
         let vq = &p.vq[&l];
-        let cb = &p.cbs[&l];
-        let nbit = vq.nbit;
         if set.is_empty() {
             return Ok(());
         }
             // experts with few tokens straight from their indices (the decode kernels, up to 8 tokens an entry): an
             // expansion to fp16 writes and reads its whole matrix whatever its tokens
-            let few = prompt_mmv_max();
+            // (the ggml-typed experts always: their products from the blocks read the matrix once, an expansion twice and more)
+            let few = if vq.std.is_some() { MMVQ_COLS } else { prompt_mmv_max() };
             let small: Vec<usize> = set.iter().copied().filter(|&k| lists[k].len() <= few).collect();
             let mut at = 0;
             while at < small.len() {
@@ -3739,9 +3803,9 @@ impl<'g> Ds41<'g> {
                 let dtab = p.arena.bytes(db.len())?;
                 p.upload(&dtab, &db)?;
                 let var = prompt_mmv_variant();
-                o.vq_mmv(&gtab, gp.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, var)), x, (&gu, 0), 2 * slots, f, d, nbit, var, None)?;
+                p.exp_mmv(l, false, &gtab, gp.len(), x, (&gu, 0), 2 * slots, f, d, var, None)?;
                 o.swiglu_clamp(&gu.view(0, slots * f * 4)?, &gu.view(slots * f * 4, slots * f * 4)?, &hh, slots * f, lim)?;
-                o.vq_mmv(&dtab, dp.len(), (cb, vq_wide((&p.cbf, &p.cbh), l, var)), &hh, (dn, 0), total, d, f, nbit, var, None)?;
+                p.exp_mmv(l, true, &dtab, dp.len(), &hh, (dn, 0), total, d, f, var, None)?;
                 p.arena.rewind(mk);
             }
             let lists_big: Vec<usize> = set.iter().copied().filter(|&k| lists[k].len() > few).collect();
@@ -3753,12 +3817,14 @@ impl<'g> Ds41<'g> {
             let xh = p.arena.bytes(nmax * d * 2)?;
             let gu = p.arena.f32(nmax * 2 * f)?;
             let hh = p.arena.bytes(nmax * f * 2)?;
-            let gmax = vq_gemm_max();
+            // the ggml-typed experts are always expanded to fp16 for a GEMM (no product from their blocks on XMX yet)
+            let gmax = if vq.std.is_some() { 0 } else { vq_gemm_max() };
             let w16 = if lists_big.iter().any(|&k| lists[k].len() > gmax) { Some(p.arena.bytes(2 * f * d * 2)?) } else { None };
             let toks: Vec<i32> = lists.iter().flat_map(|l| l.iter().map(|(ti, _)| *ti)).collect();
             let tb = p.arena.bytes(total * 4)?;
             p.upload(&tb, &i32s(&toks))?;
-            let cbh = &p.cbh[&l];
+            let (cb, cbh) = (p.cbs.get(&l), p.cbh.get(&l));
+            let nbit = vq.nbit;
             for &k in &lists_big {
                 let n = lists[k].len();
                 let buf = views[k].as_ref().ok_or("an expert not in place")?;
@@ -3766,15 +3832,24 @@ impl<'g> Ds41<'g> {
                 o.gather_f16(x, &tv, &xh, n, d)?;
                 match &w16 {
                     Some(w16) if n > gmax => {
-                        o.vq_dequant(buf, vq.gate, vq.up - vq.gate, cb, f, d, nbit, &w16.view(0, f * d * 2)?, true)?;
-                        o.vq_dequant(buf, vq.up, vq.down - vq.up, cb, f, d, nbit, &w16.view(f * d * 2, f * d * 2)?, true)?;
+                        // gate | up as rows [0, f) and [f, 2f) of w16, then the down
+                        let deq = |which: usize, rows: usize, cols: usize, dst: &DevBuf| -> Result<()> {
+                            let (at, bytes) = [(vq.gate, vq.up - vq.gate), (vq.up, vq.down - vq.up), (vq.down, vq.span - vq.down)][which];
+                            match &vq.std {
+                                Some(s) => o.std_dequant(s.ty[which].code(), buf, at, bytes, rows, cols, dst, true),
+                                None => o.vq_dequant(buf, at, bytes, cb.ok_or("no codebook")?, rows, cols, nbit, dst, true),
+                            }
+                        };
+                        deq(0, f, d, &w16.view(0, f * d * 2)?)?;
+                        deq(1, f, d, &w16.view(f * d * 2, f * d * 2)?)?;
                         o.gemm_f16(n, 2 * f, d, (&xh, 0, d), (w16, 0), (&gu, 0, 2 * f), false)?;
                         o.swiglu_gu_f16(&gu, &hh, n, f, lim)?;
-                        o.vq_dequant(buf, vq.down, vq.span - vq.down, cb, d, f, nbit, &w16.view(0, d * f * 2)?, true)?;
+                        deq(2, d, f, &w16.view(0, d * f * 2)?)?;
                         o.gemm_f16(n, d, f, (&hh, 0, f), (w16, 0), (dn, first[k] * d, d), false)?;
                     }
                     _ => {
                         let (gv, uv, dv) = (buf.view(vq.gate, vq.up - vq.gate)?, buf.view(vq.up, vq.down - vq.up)?, buf.view(vq.down, vq.span - vq.down)?);
+                        let cbh = cbh.ok_or("no fp16 codebook")?;
                         o.vq_gemm(&gv, Some(&uv), f, 2 * f, d, nbit, cbh, &xh, d, n, (&gu, 0), 2 * f)?;
                         o.swiglu_gu_f16(&gu, &hh, n, f, lim)?;
                         o.vq_gemm(&dv, None, d, d, f, nbit, cbh, &hh, f, n, (dn, first[k] * d), d)?;
