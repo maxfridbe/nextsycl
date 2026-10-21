@@ -54,6 +54,14 @@ pub static ROUTE_HOST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// meanwhile but the shared expert), and of it the file reads
 pub static TURN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static FILE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Decode's expert misses, by where the host waited (NS_PROFILE reports them): for a read ahead, in `stage_reads`
+/// (the file reads and a staging slot's earlier copy), in `swap_in` (the copies' submission), for the copies of the
+/// products that need an expert still arriving, and in `stage_slot` alone
+pub static ENS_AHEAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ENS_STAGE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ENS_SWAP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ENS_COPY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ENS_SLOT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
@@ -574,21 +582,35 @@ struct FileReader {
 }
 struct RJob {
     /// (shard, file offset, bytes, destination address): a VQ expert is one range of the file, a ggml-typed one three
-    segs: Vec<(usize, u64, usize, usize)>,
+    /// (a job each, on different threads)
+    seg: (usize, u64, usize, usize),
     done: Arc<RDone>,
 }
-#[derive(Default)]
+/// The reads of one expert (a job each) done: the count left, and the first error
 struct RDone {
-    state: Mutex<Option<std::result::Result<(), String>>>,
+    state: Mutex<(usize, Option<String>)>,
     cv: std::sync::Condvar,
 }
 impl RDone {
+    fn new(reads: usize) -> RDone {
+        RDone { state: Mutex::new((reads, None)), cv: std::sync::Condvar::new() }
+    }
+    fn finish(&self, r: std::result::Result<(), String>) {
+        let mut g = self.state.lock().unwrap();
+        g.0 -= 1;
+        if let (Err(x), None) = (r, &g.1) {
+            g.1 = Some(x);
+        }
+        if g.0 == 0 {
+            self.cv.notify_all();
+        }
+    }
     fn wait(&self) -> Result<()> {
         let mut g = self.state.lock().unwrap();
-        while g.is_none() {
+        while g.0 > 0 {
             g = self.cv.wait(g).unwrap();
         }
-        g.clone().unwrap().map_err(Error)
+        g.1.clone().map_or(Ok(()), |x| Err(Error(x)))
     }
 }
 impl FileReader {
@@ -605,18 +627,11 @@ impl FileReader {
                     Err(_) => return,
                 };
                 use std::os::unix::fs::FileExt;
-                let mut r = Ok(());
-                for &(shard, at, len, dst) in &job.segs {
-                    // SAFETY: the job's staging slot is its own (read_ahead) until its done flag is set and waited for
-                    // (stage_slot or ensure), the pinned buffer alive for the engine
-                    let b = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
-                    r = files[shard].read_exact_at(b, at).map_err(|e| format!("reading an expert: {e}"));
-                    if r.is_err() {
-                        break;
-                    }
-                }
-                *job.done.state.lock().unwrap() = Some(r);
-                job.done.cv.notify_all();
+                let (shard, at, len, dst) = job.seg;
+                // SAFETY: the job's staging slot is its own (read_ahead) until its done flag is set and waited for
+                // (stage_slot or ensure), the pinned buffer alive for the engine
+                let b = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
+                job.done.finish(files[shard].read_exact_at(b, at).map_err(|e| format!("reading an expert: {e}")));
             });
         }
         Ok(FileReader { tx: Mutex::new(tx) })
@@ -931,14 +946,19 @@ impl Part {
                     continue;
                 }
                 if let Some((k, done)) = c.ahead.remove(&(l, *x)) {
+                    let ta = Instant::now();
                     done.wait()?;
+                    ENS_AHEAD_NS.fetch_add(ta.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     c.stage_rd[k] = None;
                     pre.insert(*x, k);
                 }
             }
             let rest: Vec<u64> = missing.iter().copied().filter(|x| !pre.contains_key(x)).collect();
+            let ts = Instant::now();
             let mut staged = self.stage_reads(m, vq, c, l, &rest)?;
+            ENS_STAGE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             staged.extend(pre);
+            let tw = Instant::now();
             for (ex, &s) in missing.iter().zip(&order) {
                 c.misses += 1;
                 if let Some(tk) = self.swap_in(m, vq, c, l, *ex, s, &mut reading, &staged)? {
@@ -950,6 +970,7 @@ impl Part {
             if promote {
                 self.keep_spare(c, tick, &reading)?;
             }
+            ENS_SWAP_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         let sb = c.slot_bytes;
         let slots = need.iter().map(|ex| match c.loc[&(l, *ex)] {
@@ -1228,6 +1249,7 @@ impl Part {
 
     /// A free staging slot (the copy last reading it done)
     fn stage_slot(&self, c: &mut Store) -> Result<usize> {
+        let t0 = Instant::now();
         let k = c.stage_next % STAGE;
         c.stage_next += 1;
         if let Some(t) = c.stage_tk[k].take() {
@@ -1238,6 +1260,7 @@ impl Part {
             let _ = r.wait();
             c.ahead.retain(|_, v| v.0 != k);
         }
+        ENS_SLOT_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(k)
     }
 
@@ -1251,7 +1274,6 @@ impl Part {
         let sb = c.slot_bytes;
         for x in xs {
             let k = self.stage_slot(c)?;
-            let done = Arc::new(RDone::default());
             let dst = c.stage.as_mut_slice().as_mut_ptr() as usize + k * sb;
             // a VQ expert is one range of the blob; a ggml-typed one three slabs, one in each merged tensor
             let segs = match &vq.std {
@@ -1265,9 +1287,11 @@ impl Part {
                 }
                 None => vec![(vq.blob.shard, vq.blob.offset + vq.starts[x as usize], vq.span, dst)],
             };
-            let job = RJob { segs, done: done.clone() };
-            if rd.tx.lock().unwrap().send(job).is_err() {
-                return Err(Error("the expert readers ended".into()));
+            let done = Arc::new(RDone::new(segs.len()));
+            for seg in segs {
+                if rd.tx.lock().unwrap().send(RJob { seg, done: done.clone() }).is_err() {
+                    return Err(Error("the expert readers ended".into()));
+                }
             }
             c.stage_rd[k] = Some(done.clone());
             c.ahead.insert((l, x), (k, done));
@@ -1885,7 +1909,7 @@ impl Part {
         Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
                   hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
                   up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage, devtab,
-                  reader: if file_ahead() > 0 { Some(FileReader::new(&m.file.paths, 4)?) } else { None } })
+                  reader: if file_ahead() > 0 { Some(FileReader::new(&m.file.paths, env_usize("NS_DS41_READERS", 16))?) } else { None } })
     }
 }
 
@@ -3540,7 +3564,9 @@ impl<'g> Ds41<'g> {
                     }
                     if wait {
                         if let Some(tk) = copies {
+                            let tc = Instant::now();
                             o.await_ticket(tk)?;
+                            ENS_COPY_NS.fetch_add(tc.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     // gate and up entries (an expert's tokens as its columns), then down

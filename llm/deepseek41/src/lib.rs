@@ -248,6 +248,9 @@ impl Engine for engine::Ds41<'_> {
         v.push(format!("[host waited {:.2} s for the routers' logits, chose the experts in {:.2} s; {} experts read from the file in {:.2} s; decode's turns from \
                         logits to products queued {:.2} s]", ld(&engine::ROUTER_WAIT_NS), ld(&engine::ROUTE_HOST_NS), self.file_reads(), ld(&engine::FILE_NS),
                        ld(&engine::TURN_NS)));
+        v.push(format!("[expert misses: waited {:.2} s for read-aheads, {:.2} s in the staged reads (of it {:.2} s for a staging slot), {:.2} s submitting the swaps, \
+                        {:.2} s for copies the products needed]", ld(&engine::ENS_AHEAD_NS), ld(&engine::ENS_STAGE_NS), ld(&engine::ENS_SLOT_NS), ld(&engine::ENS_SWAP_NS),
+                       ld(&engine::ENS_COPY_NS)));
         if let Some(en) = &self.engram {
             let (rows, cached, reads, bytes, mean, max, waited) = en.stats();
             v.push(format!("[engram: {rows} rows read ({reads} reads, {:.1} MB, {mean:.0} us each on average, {max:.0} us the longest), {cached} from the cache, \
