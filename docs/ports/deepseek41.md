@@ -1,5 +1,9 @@
 # DeepSeek-V4.1-Flash-1017 (VQ GGUF): port notes
 
+> **Superseded 2026-10-21** by Unsloth's GGUFs ([deepseek41-unsloth.md](deepseek41-unsloth.md)): this file's 1.6-bit experts
+> degraded on long answers and it was removed from the box. The engine, the Engram, the tokenizer fix and the vision
+> sidecar described here are shared.
+
 nextsycl runs DeepSeek-V4.1-Flash-1017 as the `llm/deepseek41` engine (the file says `deepseek4`, variant
 `v41_flash`), with its kernels in its silo `kernels/llm/deepseek41/silo` (`dist/silo/libnextsycl-deepseek41.so`; the
 engine needs it - there is no shared kernel for the VQ experts). Card: `model-cards/llm/deepseek-v4.1-flash-vq.yml`.

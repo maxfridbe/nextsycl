@@ -527,7 +527,7 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
 
 `nextsycl models` (`glue/models`) keeps what a machine serves: an entry's id, kind, files, GPUs, contexts and engine
 settings, so an engine's settings are given once, at `models add --set`, and `nextsycl llm start <id>` applies them.
-The README's Models section has the commands. Where an entry's files live is the registry's business too:
+[registry.md](registry.md) has the commands. Where an entry's files live is the registry's business too:
 `nextsycl_serve::drives` (the front door's Drives panel, `system.move`, `nextsycl models move`) copies a model's files
 to another drive (with the sidecars its model card lists - files its engine finds beside the model by convention), checks them, repoints the entry and removes the old files that no other entry names. The front door loads nothing while a GPU run holds `NS_GPU_LOCK` (`cards_taken`) and plans placement with the memory every process holds (the root sampler's gpustat file).
 
