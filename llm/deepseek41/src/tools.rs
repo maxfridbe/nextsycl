@@ -224,6 +224,104 @@ fn kernels_std(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &
         seed ^= seed >> 27;
         ((seed.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f32) / (1u64 << 24) as f32 - 0.5
     };
+    // NS_DS41_READ_BENCH=1: the file reads of experts (three slabs each, random ones of random layers): one at a time (the
+    // latency a decode miss waits), then 16 at once (the throughput), buffered and O_DIRECT-free as the engine reads them
+    if std::env::var("NS_DS41_READ_BENCH").is_ok() {
+        let mut seed = 0x9E37_79B9u64;
+        let mut next = move |n: u64| {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            seed.wrapping_mul(0x2545F4914F6CDD1D) % n
+        };
+        let pick: Vec<(u64, u64)> = (0..96).map(|_| (next(gg.n_layer), next(gg.n_expert))).collect();
+        let span = |l: u64| -> Result<usize, String> {
+            Ok([Role::ExpGate, Role::ExpUp, Role::ExpDown].iter().map(|r| m.tensor(l, *r).map_or(0, |t| t.bytes as usize / gg.n_expert as usize)).sum())
+        };
+        let read3 = |l: u64, x: u64, host: &mut [u8]| -> Result<(), String> {
+            let mut at = 0;
+            let ts: Vec<&nextsycl_gguf::Tensor> = [Role::ExpGate, Role::ExpUp, Role::ExpDown].iter().filter_map(|r| m.tensor(l, *r)).collect();
+            let mats: Vec<usize> = ts.iter().map(|t| t.bytes as usize / gg.n_expert as usize).collect();
+            let mut parts: Vec<&mut [u8]> = Vec::new();
+            let mut rest = host;
+            for mt in &mats {
+                let (a, b) = rest.split_at_mut(*mt);
+                parts.push(a);
+                rest = b;
+                at += mt;
+            }
+            let _ = at;
+            let r: Vec<Result<(), String>> = std::thread::scope(|sc| {
+                let hs: Vec<_> = parts.into_iter().zip(&ts).zip(&mats).map(|((b, t), mt)| sc.spawn(move || f.read_into(t, x * *mt as u64, b).map_err(|e| e.0))).collect();
+                hs.into_iter().map(|h| h.join().unwrap_or(Err("panic".into()))).collect()
+            });
+            r.into_iter().collect()
+        };
+        let t0 = std::time::Instant::now();
+        let mut bytes = 0usize;
+        for &(l, x) in pick.iter().take(32) {
+            let mut b = vec![0u8; span(l)?];
+            read3(l, x, &mut b)?;
+            bytes += b.len();
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        println!("one expert at a time: {:.1} ms each ({:.0} MB average, {:.2} GB/s)", dt * 1e3 / 32.0, bytes as f64 / 32.0 / 1e6, bytes as f64 / dt / 1e9);
+        // the same experts through O_DIRECT: each slab's 4 KiB-aligned superset read into an aligned buffer, one expert at a time
+        {
+            use std::os::unix::fs::{FileExt, OpenOptionsExt};
+            let files: Vec<std::fs::File> = f.paths.iter().map(|p| std::fs::OpenOptions::new().read(true).custom_flags(0o40000).open(p).map_err(|e| e.to_string())).collect::<Result<_, _>>()?;
+            let layout = std::alloc::Layout::from_size_align(8 << 20, 4096).unwrap();
+            let t0 = std::time::Instant::now();
+            let mut bytes = 0usize;
+            for &(l, x) in pick.iter().skip(64).take(32) {
+                let ts: Vec<&nextsycl_gguf::Tensor> = [Role::ExpGate, Role::ExpUp, Role::ExpDown].iter().filter_map(|r| m.tensor(l, *r)).collect();
+                std::thread::scope(|sc| {
+                    let hs: Vec<_> = ts.iter().map(|t| {
+                        let files = &files;
+                        let n = t.bytes as usize / gg.n_expert as usize;
+                        sc.spawn(move || {
+                            let off = t.offset + x * n as u64;
+                            let a = off & !4095;
+                            let len = ((off + n as u64 + 4095) & !4095) - a;
+                            // SAFETY: allocated, used and freed in this thread with the same layout
+                            unsafe {
+                                let ptr = std::alloc::alloc(layout);
+                                let buf = std::slice::from_raw_parts_mut(ptr, len as usize);
+                                let r = files[t.shard].read_exact_at(buf, a);
+                                std::alloc::dealloc(ptr, layout);
+                                r.map(|_| n).map_err(|e| e.to_string())
+                            }
+                        })
+                    }).collect();
+                    for h in hs {
+                        bytes += h.join().unwrap().unwrap_or(0);
+                    }
+                });
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            println!("one expert at a time, O_DIRECT: {:.1} ms each ({:.2} GB/s)", dt * 1e3 / 32.0, bytes as f64 / dt / 1e9);
+        }
+        for par in [4usize, 16, 32] {
+            let t0 = std::time::Instant::now();
+            let list: Vec<(u64, u64)> = pick.iter().skip(32).copied().cycle().take(96).collect();
+            let per = list.len().div_ceil(par);
+            let tot: usize = std::thread::scope(|sc| {
+                let hs: Vec<_> = list.chunks(per).map(|ch| sc.spawn(move || -> Result<usize, String> {
+                    let mut n = 0;
+                    for &(l, x) in ch {
+                        let mut b = vec![0u8; span(l)?];
+                        read3(l, x + 17 * (n as u64 + 1) % gg.n_expert, &mut b)?;
+                        n += b.len();
+                    }
+                    Ok(n)
+                })).collect();
+                hs.into_iter().map(|h| h.join().unwrap().unwrap_or(0)).sum()
+            });
+            let dt = t0.elapsed().as_secs_f64();
+            println!("{par} experts in flight: {:.2} GB/s ({:.1} ms an expert)", tot as f64 / dt / 1e9, dt * 1e3 * par as f64 / 96.0);
+        }
+        return Ok(());
+    }
     let mut seen = std::collections::BTreeSet::new();
     for l in 0..gg.n_layer {
         for (which, role, rows, cols) in [(0usize, Role::ExpGate, ff, d), (1, Role::ExpUp, ff, d), (2, Role::ExpDown, d, ff)] {

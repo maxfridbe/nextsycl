@@ -22,6 +22,16 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
   - [ ] story test on Q3_K_XL (near-lossless MXFP4): if it degrades too, the engine (long-context attention), not the quant
   - [ ] decode tok/s against the VQ file's 23.2 (128K); the DSpark drafter (separate file, Q8_0 / BF16) unused for now
   - [ ] the DeepSeek Engram safetensors (2 x 101 GB beside the old model) go once the Unsloth files run
+- [ ] IQ2_XXS performance (2026-10-21 profile: decode 13.4 tok/s = ~72 ms/token: the GPU chain ~44 ms (device time 40 ms: dense
+      Q8_0 / Q6_K ~16, expert products ~8, attention kernel 2, shared expert, head 3) + ~22 ms waiting on ~6 cold file experts a
+      token, each ~3.7 ms; prompt 258 tok/s at an 8192 chunk, read-bound at ~3.3 GB/s of the drive's ~5)
+  - [x] read-ahead on 16 threads, a job a slab; confidence 0.3; parallel slab reads; profile in generate; std kernel grids in local
+        memory + 2 rows a sub-group (+2%); O_DIRECT (opt-in: faster cold, loses page-cache hits); drafter (loses: miss-bound)
+  - [ ] one MoE pass over a GROUP of chunks per layer (attention chunk by chunk, then all the group's tokens through the experts:
+        each expert read once a prompt, not a chunk; long prompts 2-4x; the group's streams > 8K tokens need pinned host spill)
+  - [ ] fuse the small dense launches of a layer (q_a | kv | compressor | indexer, the shared expert's gate | up): ~5 ms a token
+  - [ ] a better guess than GUESS_HIT (calibrated for glm5next / deepseek4) for read-ahead; the profile from many more prompts
+  - [ ] expert re-quantization of the cold tail (imatrix from Unsloth) to fit the resident tiers - quality risk, big
 - [ ] A repetition guard in the front door (presence / frequency penalty): none exists
 - [ ] Re-fetch the VQ GGUF only if wanted (card `deepseek-v4.1-flash-vq`, 40 checked parts)
 

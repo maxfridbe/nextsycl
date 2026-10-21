@@ -62,6 +62,12 @@ pub static ENS_STAGE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub static ENS_SWAP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ENS_COPY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ENS_SLOT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Decode's wall time (no GPU syncs added): in `forward_rows` the streams (embedding), the layers (all parts), the head,
+/// and in `step` the sampler - NS_PROFILE reports them
+pub static WALL_STREAMS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WALL_LAYERS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WALL_HEAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WALL_SAMPLE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
@@ -408,7 +414,7 @@ fn read_expert(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8]) -> Result<()> 
     if let Some(s) = &vq.std {
         let mut at = 0;
         for i in 0..3 {
-            m.file.read_into(&s.t[i], ex * s.mat[i] as u64, &mut host[at..at + s.mat[i]]).map_err(e)?;
+            read_slab(m, &s.t[i], ex * s.mat[i] as u64, &mut host[at..at + s.mat[i]])?;
             at += s.mat[i];
         }
         return Ok(());
@@ -425,11 +431,98 @@ fn read_expert_par(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8]) -> Result<
     let c = &mut c[..s.mat[2]];
     let res: Vec<Result<()>> = std::thread::scope(|sc| {
         let hs: Vec<_> = [(0usize, a), (1, b), (2, c)].into_iter().map(|(i, buf)| {
-            sc.spawn(move || m.file.read_into(&s.t[i], ex * s.mat[i] as u64, buf).map_err(e))
+            sc.spawn(move || read_slab(m, &s.t[i], ex * s.mat[i] as u64, buf))
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(Error("an expert reader panicked".into())))).collect()
     });
     res.into_iter().collect()
+}
+
+/// The model's files opened for O_DIRECT (NS_DS41_ODIRECT=1; default 0: buffered), for the experts' reads: one cold expert
+/// is faster read straight from the drive (IQ2_XXS, three slabs: 3.7 ms buffered, 2.5 ms direct) but decode then loses the
+/// page cache's hits on the cold experts that repeat (13.6 -> 12.7 tok/s), so it is opt-in
+type DirectSet = Option<Arc<Vec<std::fs::File>>>;
+fn direct_files(paths: &[std::path::PathBuf]) -> DirectSet {
+    use std::os::unix::fs::OpenOptionsExt;
+    static D: Mutex<Option<(Vec<std::path::PathBuf>, DirectSet)>> = Mutex::new(None);
+    if env_usize("NS_DS41_ODIRECT", 0) == 0 {
+        return None;
+    }
+    let mut g = D.lock().unwrap();
+    if let Some((p, f)) = g.as_ref() {
+        if p == paths {
+            return f.clone();
+        }
+    }
+    let o_direct = if cfg!(target_arch = "aarch64") { 0o200000 } else { 0o40000 };
+    let files: Option<Vec<std::fs::File>> = paths.iter().map(|p| std::fs::OpenOptions::new().read(true).custom_flags(o_direct).open(p).ok()).collect();
+    let f = files.map(Arc::new);
+    *g = Some((paths.to_vec(), f.clone()));
+    f
+}
+
+/// A page-aligned buffer of a reader thread's own for O_DIRECT reads
+struct DirectBuf {
+    ptr: *mut u8,
+    cap: usize,
+}
+impl DirectBuf {
+    fn get(&mut self, n: usize) -> &mut [u8] {
+        if n > self.cap {
+            if !self.ptr.is_null() {
+                // SAFETY: allocated below with this layout
+                unsafe { std::alloc::dealloc(self.ptr, std::alloc::Layout::from_size_align(self.cap, 4096).unwrap()) };
+            }
+            self.cap = n.next_multiple_of(1 << 20);
+            // SAFETY: a non-zero size; freed above or in Drop with the same layout
+            self.ptr = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(self.cap, 4096).unwrap()) };
+        }
+        // SAFETY: cap >= n bytes allocated, owned by this value
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, n) }
+    }
+}
+impl Drop for DirectBuf {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: allocated in get with this layout
+            unsafe { std::alloc::dealloc(self.ptr, std::alloc::Layout::from_size_align(self.cap, 4096).unwrap()) };
+        }
+    }
+}
+thread_local! {
+    static DBUF: std::cell::RefCell<DirectBuf> = const { std::cell::RefCell::new(DirectBuf { ptr: std::ptr::null_mut(), cap: 0 }) };
+}
+
+/// Bytes [at, at + dst.len()) of `file` (opened O_DIRECT) into dst: the 4 KiB-aligned span around them read into the
+/// thread's own buffer, the wanted part copied out
+fn pread_direct(file: &std::fs::File, at: u64, dst: &mut [u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let a = at & !4095;
+    let end = (at + dst.len() as u64 + 4095) & !4095;
+    DBUF.with(|b| {
+        let mut b = b.borrow_mut();
+        let buf = b.get((end - a) as usize);
+        let want = (at - a) as usize + dst.len();
+        let mut got = 0;
+        // (the last bytes of a file are short of the aligned span: enough is enough)
+        while got < want {
+            let k = file.read_at(&mut buf[got..], a + got as u64)?;
+            if k == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "past the end of the file"));
+            }
+            got += k;
+        }
+        dst.copy_from_slice(&buf[(at - a) as usize..want]);
+        Ok(())
+    })
+}
+
+/// A slab of expert tensor `t` (bytes [off, off + dst.len()) of it): O_DIRECT when the files opened so, else buffered
+fn read_slab(m: &Model, t: &Tensor, off: u64, dst: &mut [u8]) -> Result<()> {
+    if let Some(files) = direct_files(&m.file.paths) {
+        return pread_direct(&files[t.shard], t.offset + off, dst).map_err(e);
+    }
+    m.file.read_into(t, off, dst).map_err(e)
 }
 
 /// Where an expert is.
@@ -620,8 +713,9 @@ impl FileReader {
             .collect::<Result<_>>()?;
         let (tx, rx) = std::sync::mpsc::channel::<RJob>();
         let rx = Arc::new(Mutex::new(rx));
+        let direct = direct_files(paths);
         for _ in 0..threads {
-            let (rx, files) = (rx.clone(), files.clone());
+            let (rx, files, direct) = (rx.clone(), files.clone(), direct.clone());
             std::thread::spawn(move || loop {
                 let job = match rx.lock().unwrap().recv() {
                     Ok(j) => j,
@@ -632,7 +726,11 @@ impl FileReader {
                 // SAFETY: the job's staging slot is its own (read_ahead) until its done flag is set and waited for
                 // (stage_slot or ensure), the pinned buffer alive for the engine
                 let b = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
-                job.done.finish(files[shard].read_exact_at(b, at).map_err(|e| format!("reading an expert: {e}")));
+                let r = match &direct {
+                    Some(d) => pread_direct(&d[shard], at, b),
+                    None => files[shard].read_exact_at(b, at),
+                };
+                job.done.finish(r.map_err(|e| format!("reading an expert: {e}")));
             });
         }
         Ok(FileReader { tx: Mutex::new(tx) })
@@ -3163,8 +3261,11 @@ impl<'g> Ds41<'g> {
         }
         sess.hist.truncate(pos0);
         sess.hist.extend_from_slice(tokens);
+        let tw = Instant::now();
         let eng = self.engram_start(&sess.hist, pos0);
         let mut x = self.streams(0, tokens, &mut *tap)?;
+        WALL_STREAMS_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let tw = Instant::now();
         let mut staging = Vec::new();
         for (k, run) in self.runs().into_iter().enumerate() {
             if k > 0 {
@@ -3173,7 +3274,10 @@ impl<'g> Ds41<'g> {
             let last = k + 1 == self.parts.len();
             x = self.run_layers(&sess.layers, run, x, pos0, tokens, &eng, if last { sess.mtp.as_mut() } else { None }, &mut *tap)?;
         }
+        WALL_LAYERS_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let tw = Instant::now();
         let out = self.head(&x, t, n_out, &mut *tap)?;
+        WALL_HEAD_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         if let Some(ms) = sess.mtp.as_mut() {
             self.mtp_push(ms, pos0, t, (2..=MAX_VERIFY).contains(&t))?;
         }
@@ -3397,7 +3501,9 @@ impl<'g> Ds41<'g> {
                 if let Some(x) = dec.next.take() {
                     dec.logits = self.forward(sess, &[x], &mut *tap)?;
                 }
+                let ts = Instant::now();
                 let y = smp.sample(&dec.logits);
+                WALL_SAMPLE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 (vec![y], y)
             }
         };

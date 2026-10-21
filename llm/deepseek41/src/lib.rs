@@ -251,6 +251,8 @@ impl Engine for engine::Ds41<'_> {
         v.push(format!("[expert misses: waited {:.2} s for read-aheads, {:.2} s in the staged reads (of it {:.2} s for a staging slot), {:.2} s submitting the swaps, \
                         {:.2} s for copies the products needed]", ld(&engine::ENS_AHEAD_NS), ld(&engine::ENS_STAGE_NS), ld(&engine::ENS_SLOT_NS), ld(&engine::ENS_SWAP_NS),
                        ld(&engine::ENS_COPY_NS)));
+        v.push(format!("[wall: embedding + engram start {:.2} s, layers {:.2} s, head {:.2} s, sampling {:.2} s - passes of every size, the prompt's too]",
+                       ld(&engine::WALL_STREAMS_NS), ld(&engine::WALL_LAYERS_NS), ld(&engine::WALL_HEAD_NS), ld(&engine::WALL_SAMPLE_NS)));
         if let Some(en) = &self.engram {
             let (rows, cached, reads, bytes, mean, max, waited) = en.stats();
             v.push(format!("[engram: {rows} rows read ({reads} reads, {:.1} MB, {mean:.0} us each on average, {max:.0} us the longest), {cached} from the cache, \
