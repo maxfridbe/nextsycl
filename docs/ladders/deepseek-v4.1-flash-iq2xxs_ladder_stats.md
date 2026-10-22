@@ -56,6 +56,14 @@ experts the previous run left warm move a run by up to ±25%.
   instead of keeping the profile's set): 2,561-token prompt, `-fast`, 1,024 tokens: tg 12.2 against 12.9 tok/s static.
   No gain; off by default.
 
+## Since the ladder (2026-10-22, rungs not rerun)
+
+The split-Q8 dp4a expert products (`mmvq.cpp`), the prompt passes' VRAM reserve lent to the expert tiers during decode
+(`NS_DS41_LEND_RESERVE`), layers split by compute units (24 / 16) and read-ahead only on guesses above 0.4
+(`NS_DS41_FILE_AHEAD_P`): tg over 512 tokens after a short prose prompt 9.7 -> 12.7 tok/s exact and 16.1 -> 21.4
+`-fast` (medians of 3), and 23.1 -> 25.3 tok/s `-fast` sustained over the 12,000-token novel. A 35K-token needle prompt:
+pp 418-442 tok/s `-fast`, the code found.
+
 ## Rerun
 
 `~/src/run_tg.sh RESULTS "name file ctx max" ...` on hardac1 (exact then `-fast` for each rung, through

@@ -3,8 +3,8 @@
 // a run of consecutive rows with its lanes' activation blocks held in registers (loaded again only where the column
 // changes), a bounded number of work-groups (each fills its grid table in local memory once). std.cpp's float32
 // kernel decodes a lane's 8 values a block and re-reads the row's float32 activations for every row (20 KiB against
-// ~1.3 KiB of IQ2_XXS weights a row): 133-229 GB/s on the B70. Types: IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_K,
-// Q5_K, Q8_0, MXFP4 (deepseek4's, and IQ1_S / IQ2_XS / Q2_K new here). The table is std_mmv's (meta[e] = {ncol, y0,
+// ~1.3 KiB of IQ2_XXS weights a row): 133-229 GB/s on the B70. Types: IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+// Q2_K, Q5_K, Q8_0, MXFP4 (deepseek4's, and IQ1_S / IQ2_XS / IQ3_S / Q2_K new here). The table is std_mmv's (meta[e] = {ncol, y0,
 // col_0 ..}), one column an entry; an entry with ncol 0 is skipped (no VRAM slot: the host's products fill it).
 #include "ns.h"
 #include "ns_internal.hpp"
@@ -196,6 +196,34 @@ struct WideIQ2S {
         return r;
     }
     static float dot(const W& r, const X& v) { return v.d * (r.s0 * (float) dp4a4(r.lo, v.u0, 0) + r.s1 * (float) dp4a4(r.hi, v.u1, 0)); }
+};
+
+// ---- IQ3_S (110-byte blocks: d, qs[64] the index's low 8 bits, qh[8] a ninth bit an entry, signs[32], scales[4] a
+// nibble a 32 values): lane g = sub-block g - eight 9-bit grid indices of 4 unsigned bytes with their sign bytes
+struct WideIQ3S {
+    using XT = X;
+    static X xl(int g, const XA& xa, int b0) { return xload(g, xa, b0); }
+    using Block = block_iq3_s;
+    static constexpr int LUT = 512;
+    static uint32_t lut(int i) { return iq3s_grid[i]; }
+    struct W { sycl::int4 lo, hi; float d; };
+    static W load(const Block* b, int g, const uint32_t* tab) {
+        W r;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(b);
+        const uint32_t i0 = load4_a2(p + 2 + 8 * g), i1 = load4_a2(p + 2 + 8 * g + 4), s4 = load4_a2(p + 74 + 4 * g);
+        const uint32_t qh = p[66 + g];
+        int v[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t iw = l < 2 ? i0 : i1, sh = 16 * (l & 1);
+            grid_group(sycl::uint2(tab[((iw >> sh) & 0xff) | ((qh << (8 - 2 * l)) & 256)], tab[((iw >> (sh + 8)) & 0xff) | ((qh << (7 - 2 * l)) & 256)]),
+                       (s4 >> (8 * l)) & 0xff, v, l);
+        }
+        r.lo = sycl::int4(v[0], v[1], v[2], v[3]); r.hi = sycl::int4(v[4], v[5], v[6], v[7]);
+        r.d = (float) b->d * (float) (1 + 2 * ((p[106 + (g >> 1)] >> (4 * (g & 1))) & 0xf));
+        return r;
+    }
+    static float dot(const W& r, const X& v) { return r.d * v.d * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)); }
 };
 
 // ---- IQ1_S (50-byte blocks: d, qs[32] the index's low 8 bits, qh[8] u16 a sub-block: 3 high bits an entry, a 3-bit
@@ -530,7 +558,7 @@ int ns_ds41_quantize_q8(ns_gpu* g, const float* x, void* xs, int64_t n_in, int64
 
 int ns_ds41_mmvq_supported(int type, int64_t n_in) {
     switch (type) {
-        case 8: case 10: case 12: case 13: case 16: case 17: case 18: case 19: case 22: case 39: return n_in % QK == 0 && n_in <= 32 * QK;
+        case 8: case 10: case 12: case 13: case 16: case 17: case 18: case 19: case 21: case 22: case 39: return n_in % QK == 0 && n_in <= 32 * QK;
         default: return 0;
     }
 }
@@ -551,6 +579,7 @@ int ns_ds41_std_mmvq(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* m
         case 17: by_nb<WideIQ2XS>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
         case 18: by_nb<WideIQ3XXS>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
         case 19: by_nb<WideIQ1S>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
+        case 21: by_nb<WideIQ3S>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
         case 22: by_nb<WideIQ2S>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
         default: by_nb<WideMXFP4>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
     }

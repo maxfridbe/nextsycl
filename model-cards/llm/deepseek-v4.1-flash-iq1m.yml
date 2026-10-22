@@ -1,0 +1,49 @@
+# DeepSeek-V4.1-Flash-1017 UD-IQ1_M (experimental: faster than UD-IQ2_XXS, lower quality)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: deepseek-v4.1-flash-iq1m
+kind: llm
+arch: deepseek41
+title: DeepSeek-V4.1-Flash-1017 UD-IQ1_M (experimental) · 128K context (both GPUs, pinned memory and the NVMe)
+about: "Unsloth's smallest-but-one dynamic GGUF of DeepSeek-V4.1-Flash-1017 (llama.cpp PR 30817's form): routed experts in IQ1_S / IQ2_XXS / IQ2_XS / IQ2_S by layer, Q8_0 / Q6_K attention, the 103 GiB IQ4_NL Engram table in the last shard. Experimental: teacher-forced perplexity 9% above UD-IQ2_XXS (3.74 against 3.44 and 4.37 against 4.02), and a long story starts repeating itself from ~5,000 words where UD-IQ2_XXS holds to ~8,000. tg ~16 tok/s exact over 512 tokens (UD-IQ2_XXS ~12.7)."
+gpus: all
+streams: true                   # the routed experts beyond VRAM and pinned memory (and the Engram table, inside the last shard) are read from the drive while it serves
+vram_gib: 30.0
+ctx: '131072'
+tools: false
+tasks: false
+env: {NS_DS41_FREE_GIB: "1.5", NS_PREFILL_CHUNK: "16384"}   # exact; deepseek-v4.1-flash-iq1m-fast is the same files with two approximations on   # the box rule: 1.5 GiB of VRAM free
+silo:                           # its expert kernels (std.cpp, mmvq.cpp) exist only there
+  name: deepseek41
+  required: true
+files:
+  model:
+    key: deepseek-v4.1-flash-1017-iq1m-1
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00001-of-00005.gguf
+    size: 5780923
+    sha256: b843148a82de2b24df0c5a656669edbb9212eb69a41953249fe6c50d04186177
+    path: deepseek-v4.1-flash-1017-unsloth-iq1m/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00001-of-00005.gguf
+  shard-2:
+    key: deepseek-v4.1-flash-1017-iq1m-2
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00002-of-00005.gguf
+    size: 49707332128
+    sha256: 8a406949fac9583cd4ab68ce5be1151e5760a18f936548de38f551d2a396b008
+    path: deepseek-v4.1-flash-1017-unsloth-iq1m/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00002-of-00005.gguf
+  shard-3:
+    key: deepseek-v4.1-flash-1017-iq1m-3
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00003-of-00005.gguf
+    size: 49292777280
+    sha256: 4f738cf3dadbe49141ee2092c047be7d52de0157d54a3ffb45c8b30a600ae17b
+    path: deepseek-v4.1-flash-1017-unsloth-iq1m/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00003-of-00005.gguf
+  shard-4:
+    key: deepseek-v4.1-flash-1017-iq1m-4
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00004-of-00005.gguf
+    size: 40803165856
+    sha256: 28e0edad226a941b0dab9c0ee60001f1fc2d09df59d03bb4971348b8f7da6006
+    path: deepseek-v4.1-flash-1017-unsloth-iq1m/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00004-of-00005.gguf
+  shard-5:
+    key: deepseek-v4.1-flash-1017-iq1m-5
+    url: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00005-of-00005.gguf
+    size: 110595290592
+    sha256: 771805301e695d72d268151dfc43043581ba904298574aa879d4349cbe67b020
+    path: deepseek-v4.1-flash-1017-unsloth-iq1m/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00005-of-00005.gguf
+guide: guides/chat.md

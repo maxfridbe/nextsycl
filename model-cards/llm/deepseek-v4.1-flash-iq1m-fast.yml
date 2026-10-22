@@ -1,0 +1,24 @@
+# DeepSeek-V4.1-Flash-1017 UD-IQ1_M, the fast setting (experimental): cold low-weight experts left out and attention in q4_K
+# model card (model-cards/README.md): the same files as deepseek-v4.1-flash-iq1m, two approximations switched on
+id: deepseek-v4.1-flash-iq1m-fast
+kind: llm
+arch: deepseek41
+title: DeepSeek-V4.1-Flash-1017 UD-IQ1_M fast (experimental) · 128K context (both GPUs, pinned memory and the NVMe)
+about: "The UD-IQ1_M of deepseek-v4.1-flash-iq1m with deepseek-v4.1-flash-iq2xxs-fast's two approximations on (cold experts under 0.2 of the routing weight left out, attention and the shared expert in q4_K). tg ~25.8 tok/s over 512 tokens and ~26.4 sustained over 12,000 (UD-IQ2_XXS fast: ~21.4 and ~25.3); pp 143 / 242 / 450 tok/s at 580 / 2.5K / 10K tokens. Experimental: perplexity 4.07 / 4.37, and long answers degrade from ~5,000 words."
+gpus: all
+streams: true
+vram_gib: 30.0
+ctx: '131072'
+tools: false
+tasks: false
+env: {NS_DS41_FREE_GIB: "1.5", NS_DS41_COLD_SKIP: "0.2", NS_DS41_DENSE_Q4K: "1", NS_PREFILL_CHUNK: "16384", NS_DS41_COLD_SKIP_PROMPT: "0.3", NS_DS41_COLD_SKIP_PROMPT_MAX: "8"}
+silo:
+  name: deepseek41
+  required: true
+files:
+  model: deepseek-v4.1-flash-1017-iq1m-1
+  shard-2: deepseek-v4.1-flash-1017-iq1m-2
+  shard-3: deepseek-v4.1-flash-1017-iq1m-3
+  shard-4: deepseek-v4.1-flash-1017-iq1m-4
+  shard-5: deepseek-v4.1-flash-1017-iq1m-5
+guide: guides/chat.md
