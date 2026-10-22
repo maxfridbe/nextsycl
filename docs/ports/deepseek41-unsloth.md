@@ -2,8 +2,9 @@
 
 The same engine as the [VQ file's](deepseek41.md) (`llm/deepseek41`, silo `kernels/llm/deepseek41/silo`), reading the
 llama.cpp form of the model ([llama.cpp PR 30817](https://github.com/ggml-org/llama.cpp/pull/30817), architecture
-`deepseek41`) as Unsloth publishes it. Cards: `deepseek-v4.1-flash-iq2xxs`, `deepseek-v4.1-flash-iq2xxs-fast`,
-`deepseek-v4.1-flash-q3kxl`, `deepseek-v4.1-flash-iq1m` and `-iq1m-fast` (experimental).
+`deepseek41`) as Unsloth publishes it. Cards: `deepseek-v4.1-flash-iq2xxs` and `deepseek-v4.1-flash-iq2xxs-fast` (the main ones); the
+[other quants](#other-quants) `deepseek-v4.1-flash-q2kxl`, `-q2kxl-fast`, `deepseek-v4.1-flash-iq1m`, `-iq1m-fast`
+(experimental) and `deepseek-v4.1-flash-q3kxl`.
 
 ## Why
 
@@ -49,39 +50,6 @@ against ggml's own `dequantize_row_*`** (a C harness built from `ggml-quants.c`;
 | pp, 139,561 tokens | 448-473 tok/s | 474 tok/s |
 | quality: perplexity of two prose texts (exact 3.42 / 3.91) | - | 3.60 / 4.02 (+3-5%) |
 
-UD-Q3_K_XL (253 GiB of experts, two thirds streamed from the drive): tg ~4.4 tok/s.
-
-## UD-IQ1_M (experimental)
-
-Experts in IQ1_S / IQ2_XXS / IQ2_XS / IQ2_S by layer (no IQ1_M tensors despite the name), the Engram table in IQ4_NL
-(103 GiB; `Deq<T_IQ4_NL>` in std.cpp, the Engram rows through `dequant_mat`). Measured 2026-10-22 against UD-IQ2_XXS
-on the same build:
-
-| | UD-IQ2_XXS | UD-IQ1_M |
-|---|---|---|
-| perplexity, two prose texts, exact | 3.44 / 4.02 | 3.74 / 4.37 (+9%) |
-| perplexity, `-fast` | - | 4.07 / 4.37 |
-| tg, 512 tokens after a short prompt, exact / `-fast` (medians of 3) | 12.7 / 21.4 tok/s | 16.2 / 25.8 tok/s |
-| tg, sustained over 12,000 tokens, `-fast` | 25.3 tok/s | 26.4 tok/s |
-| pp `-fast`, 580 / 2,561 / 9,901 tokens | - | 143 / 242 / 450 tok/s |
-
-The faster start is the smaller experts (more of them resident); sustained, the gap is ~4%. **Long text degrades**:
-a 12-chapter novel forced to 12,000 tokens (`--ignore-eos`, greedy), unique-word share and 5-grams seen earlier in the
-text, per 1,000 words:
-
-| run | words 1-3K | 4-5K | 6-7K | 8-9K |
-|---|---|---|---|---|
-| UD-IQ2_XXS `-fast` (nextsycl) | 0.42-0.41 / <=0.01 | 0.40-0.41 / 0.02-0.03 | 0.36-0.33 / 0.06-0.08 | 0.32-0.25 / 0.13-0.42 (past the story's end) |
-| UD-IQ1_M exact (nextsycl) | 0.46-0.36 / <=0.02 | 0.36-0.31 / 0.02-0.07 | 0.28-0.32 / 0.14-0.15 | 0.26-0.27 / 0.12-0.27 |
-| UD-IQ1_M `-fast` (nextsycl) | 0.42-0.32 / <=0.02 | 0.32-0.28 / 0.06-0.07 | 0.27-0.22 / 0.22-0.30 | 0.21-0.20 / 0.68-0.90 |
-| UD-IQ1_M, llama.cpp (PR 30817 at `b72050d`, SYCL, greedy) | 0.42-0.34 / <=0.01 | 0.35-0.28 / 0.03-0.05 | 0.28-0.21 / 0.15-0.50 | 0.19-0.07 / 0.68-0.92 |
-
-llama.cpp's run (the same 51 prompt tokens; the first ~20 generated tokens the same as nextsycl's, then a near tie
-goes the other way) shrinks its chapters to ~500 words from chapter 8 and ends in a loop ("And the map. And the coast.
-And the sea. ...") before chapter 12 is done: the degradation is the quantization's, not this engine's. llama.cpp's
-speed there: tg 9.8 tok/s (14 layers' experts on the cards, the rest mmapped; nextsycl exact 13.6 over the same 12,000
-tokens).
-
 By prompt length, with the machine and silo: [the ladder](../ladders/deepseek-v4.1-flash-iq2xxs_ladder_stats.md).
 
 **Where the time goes** (`NS_PROFILE=1`, a device-time trace): per decode token ~41 ms of GPU kernels (dense Q8_0 / Q6_K
@@ -125,3 +93,54 @@ over blocks (register spills).
 
 One MoE pass over a group of chunks per layer (each expert read once a prompt, not a chunk; the group's streams over
 8K tokens need pinned spill); fusing the small dense launches; re-quantizing the cold tail of the experts. See `TODO.md`.
+
+## Other quants
+
+The engine reads every Unsloth quant of the model; UD-IQ2_XXS is the one tuned and served, the others are secondary.
+
+- **UD-Q3_K_XL** (253 GiB of experts, DeepSeek's own MXFP4 in most layers, two thirds streamed from the drive): near
+  the original's quality, tg ~4.4 tok/s.
+- **UD-Q2_K_XL** (178 GiB of experts: IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / MXFP4 by layer, no Q2_K tensors
+  despite the name; the same 126 GiB Q5_K Engram as UD-IQ2_XXS). IQ3_S got a split-Q8 dp4a kernel for it (`WideIQ3S`,
+  10 layers' down projections: 107 -> 91 us on the B70, against float32 to 3.7e-3). 2026-10-22, medians of 3:
+
+  | | UD-IQ2_XXS | UD-Q2_K_XL |
+  |---|---|---|
+  | tg, 512 tokens after a short prompt, exact / `-fast` | 12.7 / 21.4 tok/s | 8.8 / 19.2 tok/s |
+  | tg, sustained over a 12,000-token novel, `-fast` | 25.3 tok/s | 22.3 tok/s |
+  | pp `-fast` (exact), 580 / 2,561 / 9,901 tokens | - | 121 (42) / 138 (92) / 300 (280) tok/s |
+  | the novel, unique-word share / 5-grams seen earlier, per 1,000 words | 0.42-0.25 / up to 0.42 (drifts from ~8,000 words) | 0.35-0.44 / at most 0.11 (clean to the end) |
+
+  Its teacher-forced perplexity on our two prose texts (3.68 / 4.06 exact, 4.04 / 4.19 `-fast`) is not below
+  UD-IQ2_XXS's (3.44 / 4.02); the first text was written by one of these models, which favours the quant that wrote it.
+
+### UD-IQ1_M (experimental)
+
+Experts in IQ1_S / IQ2_XXS / IQ2_XS / IQ2_S by layer (no IQ1_M tensors despite the name), the Engram table in IQ4_NL
+(103 GiB; `Deq<T_IQ4_NL>` in std.cpp, the Engram rows through `dequant_mat`). Measured 2026-10-22 against UD-IQ2_XXS
+on the same build:
+
+| | UD-IQ2_XXS | UD-IQ1_M |
+|---|---|---|
+| perplexity, two prose texts, exact | 3.44 / 4.02 | 3.74 / 4.37 (+9%) |
+| perplexity, `-fast` | - | 4.07 / 4.37 |
+| tg, 512 tokens after a short prompt, exact / `-fast` (medians of 3) | 12.7 / 21.4 tok/s | 16.2 / 25.8 tok/s |
+| tg, sustained over 12,000 tokens, `-fast` | 25.3 tok/s | 26.4 tok/s |
+| pp `-fast`, 580 / 2,561 / 9,901 tokens | - | 143 / 242 / 450 tok/s |
+
+The faster start is the smaller experts (more of them resident); sustained, the gap is ~4%. **Long text degrades**:
+a 12-chapter novel forced to 12,000 tokens (`--ignore-eos`, greedy), unique-word share and 5-grams seen earlier in the
+text, per 1,000 words:
+
+| run | words 1-3K | 4-5K | 6-7K | 8-9K |
+|---|---|---|---|---|
+| UD-IQ2_XXS `-fast` (nextsycl) | 0.42-0.41 / <=0.01 | 0.40-0.41 / 0.02-0.03 | 0.36-0.33 / 0.06-0.08 | 0.32-0.25 / 0.13-0.42 (past the story's end) |
+| UD-IQ1_M exact (nextsycl) | 0.46-0.36 / <=0.02 | 0.36-0.31 / 0.02-0.07 | 0.28-0.32 / 0.14-0.15 | 0.26-0.27 / 0.12-0.27 |
+| UD-IQ1_M `-fast` (nextsycl) | 0.42-0.32 / <=0.02 | 0.32-0.28 / 0.06-0.07 | 0.27-0.22 / 0.22-0.30 | 0.21-0.20 / 0.68-0.90 |
+| UD-IQ1_M, llama.cpp (PR 30817 at `b72050d`, SYCL, greedy) | 0.42-0.34 / <=0.01 | 0.35-0.28 / 0.03-0.05 | 0.28-0.21 / 0.15-0.50 | 0.19-0.07 / 0.68-0.92 |
+
+llama.cpp's run (the same 51 prompt tokens; the first ~20 generated tokens the same as nextsycl's, then a near tie
+goes the other way) shrinks its chapters to ~500 words from chapter 8 and ends in a loop ("And the map. And the coast.
+And the sea. ...") before chapter 12 is done: the degradation is the quantization's, not this engine's. llama.cpp's
+speed there: tg 9.8 tok/s (14 layers' experts on the cards, the rest mmapped; nextsycl exact 13.6 over the same 12,000
+tokens).
