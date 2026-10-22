@@ -355,6 +355,42 @@ struct WideQ5K {
     static float dot(const W& r, const X& v) { return v.d * (r.dsc * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)) - r.dmn * (float) v.s); }
 };
 
+// ---- q4_K (144-byte blocks: d, dmin, 12 bytes of 6-bit scales and mins, qs [128]): lane g = sub-block g - its 32
+// values' nibbles (qs[32 (g / 2) + j], the high nibble for odd g) as unsigned codes; value = d sc_g q - dmin m_g (the
+// engine's dense weights requantized at load, NS_DS41_DENSE_Q4K)
+struct WideQ4K {
+    using XT = X;
+    static X xl(int g, const XA& xa, int b0) { return xload(g, xa, b0); }
+    using Block = block_q4_K;
+    static constexpr int LUT = 0;
+    static uint32_t lut(int) { return 0; }
+    struct W { sycl::int4 lo, hi; float dsc, dmn; };
+    static W load(const Block* b, int g, const uint32_t*) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(b);
+        const sycl::uint4* qs = reinterpret_cast<const sycl::uint4*>(p + 16 + 32 * (g >> 1));
+        const sycl::uint4 l0 = qs[0], l1 = qs[1];
+        const int sh = 4 * (g & 1);
+        auto code = [&](uint32_t l) { return int((l >> sh) & 0x0f0f0f0fu); };
+        W r;
+        r.lo = sycl::int4(code(l0.x()), code(l0.y()), code(l0.z()), code(l0.w()));
+        r.hi = sycl::int4(code(l1.x()), code(l1.y()), code(l1.z()), code(l1.w()));
+        const uint8_t* sc = p + 4;
+        uint32_t s, m;
+        if (g < 4) {
+            s = sc[g] & 63;
+            m = sc[g + 4] & 63;
+        } else {
+            s = (sc[g + 4] & 0xf) | ((sc[g - 4] >> 6) << 4);
+            m = (sc[g + 4] >> 4) | ((sc[g] >> 6) << 4);
+        }
+        const sycl::half* dd = reinterpret_cast<const sycl::half*>(p);
+        r.dsc = (float) dd[0] * (float) s;
+        r.dmn = (float) dd[1] * (float) m;
+        return r;
+    }
+    static float dot(const W& r, const X& v) { return v.d * (r.dsc * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)) - r.dmn * (float) v.s); }
+};
+
 int groups() {   // NS_DS41_MMVQ_GROUPS: the work-groups of a launch (each fills its grid table once; default 1024)
     static const int v = std::getenv("NS_DS41_MMVQ_GROUPS") ? std::max(1, std::atoi(std::getenv("NS_DS41_MMVQ_GROUPS"))) : 1024;
     return v;
@@ -446,7 +482,9 @@ void by_nb(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int entrie
         case 3: return by_r<F, 3>(q, ptrs, meta, entries, x, ncols, y, n_in, n_out);
         case 4: return by_r<F, 4>(q, ptrs, meta, entries, x, ncols, y, n_in, n_out);
         case 5: return by_r<F, 5>(q, ptrs, meta, entries, x, ncols, y, n_in, n_out);
-        default: return by_r<F, 6>(q, ptrs, meta, entries, x, ncols, y, n_in, n_out);
+        case 6: return by_r<F, 6>(q, ptrs, meta, entries, x, ncols, y, n_in, n_out);
+        case 7: return by_r<F, 7>(q, ptrs, meta, entries, x, ncols, y, n_in, n_out);
+        default: return by_r<F, 8>(q, ptrs, meta, entries, x, ncols, y, n_in, n_out);
     }
 }
 }  // namespace
@@ -489,7 +527,7 @@ int ns_ds41_quantize_q8(ns_gpu* g, const float* x, void* xs, int64_t n_in, int64
 
 int ns_ds41_mmvq_supported(int type, int64_t n_in) {
     switch (type) {
-        case 8: case 10: case 13: case 16: case 17: case 18: case 19: case 22: case 39: return n_in % QK == 0 && n_in <= 24 * QK;
+        case 8: case 10: case 12: case 13: case 16: case 17: case 18: case 19: case 22: case 39: return n_in % QK == 0 && n_in <= 32 * QK;
         default: return 0;
     }
 }
@@ -504,6 +542,7 @@ int ns_ds41_std_mmvq(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* m
     switch (type) {
         case 8: by_nb<WideQ8_0>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
         case 10: by_nb<WideQ2K>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
+        case 12: by_nb<WideQ4K>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
         case 13: by_nb<WideQ5K>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
         case 16: by_nb<WideIQ2XXS>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
         case 17: by_nb<WideIQ2XS>(g->q, ptrs, meta, E, x, NC, y, K, N); break;

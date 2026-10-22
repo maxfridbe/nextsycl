@@ -255,6 +255,8 @@ impl Engine for engine::Ds41<'_> {
         {
             let ld = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
             v.push(format!("[cold experts left out (NS_DS41_COLD_SKIP): {}]", ld(&engine::COLD_SKIPPED)));
+            v.push(format!("[decode's file reads ahead: {} one layer ahead, {} further, {} of them taken; {} read by the layer itself]",
+                           ld(&engine::AHEAD_NEAR), ld(&engine::AHEAD_FAR), ld(&engine::AHEAD_TAKEN), ld(&engine::STAGED_READS)));
             v.push(format!("[cold experts (neither in VRAM nor host memory) of {} decode layers: {} layers have one, {} of them all under 0.1 of the routing weight; by share <0.05 / <0.1 / <0.15 / <0.2 / <0.3 / more: {}]",
                            ld(&engine::DEC_LAYERS), ld(&engine::COLD_LAYERS), ld(&engine::COLD_LAYERS_LOW),
                            engine::COLD_BINS.iter().map(ld).map(|x| x.to_string()).collect::<Vec<_>>().join(" / ")));

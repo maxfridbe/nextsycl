@@ -434,6 +434,70 @@ fn kernels_std(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &
             }
             println!("dense L{l}: one column's products {tq:.0} us in the file's types, {t4:.0} us with q4_K");
         }
+        // the dense products as decode meets them, cold from VRAM: a role's matrices of 8 layers (as q4_K) in turn, the
+        // q4_K kernel against the split-Q8 one (+ its quantization)
+        for role in [Role::QA, Role::QB, Role::Kv, Role::OutB, Role::ShGate, Role::ShDown] {
+            let mut mats = Vec::new();
+            for l in 0..8u64 {
+                let Some(t) = m.tensor(l, role) else { continue };
+                if t.shape.len() != 2 || !matches!(t.ty, GType::Q8_0 | GType::Q6K) {
+                    continue;
+                }
+                let (rows, cols) = (t.shape[0] as usize, t.shape[1] as usize);
+                let raw = f.read(t).map_err(|e| e.0)?;
+                let q = crate::requant::to_q4k(&raw, rows * cols, t.ty == GType::Q6K);
+                let w = DevBuf::new(g, q.len()).map_err(e)?;
+                w.write(0, &q).map_err(e)?;
+                let w8 = DevBuf::new(g, raw.len().next_multiple_of(256)).map_err(e)?;
+                w8.write(0, &raw).map_err(e)?;
+                let mut tb = (w.ptr() as u64).to_le_bytes().to_vec();
+                for v in [1i32, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
+                    tb.extend(v.to_le_bytes());
+                }
+                let tab = DevBuf::new(g, tb.len()).map_err(e)?;
+                tab.write(0, &tb).map_err(e)?;
+                mats.push((w, tab, rows, cols, q.len(), w8, raw.len(), t.ty.code()));
+            }
+            let Some((rows, cols, bytes)) = mats.first().map(|m| (m.2, m.3, m.4)) else { continue };
+            let x: Vec<f32> = (0..cols).map(|_| rnd()).collect();
+            let xd = DevBuf::from_f32(g, &x).map_err(e)?;
+            let xs = DevBuf::new(g, o.std_q8_bytes(cols, 1)).map_err(e)?;
+            let (y1, y2) = (DevBuf::f32(g, rows).map_err(e)?, DevBuf::f32(g, rows).map_err(e)?);
+            o.q4k_mv(&mats[0].0, rows, cols, (&xd, 0, cols), None, (&y1, 0, rows), 1).map_err(e)?;
+            o.std_quantize_q8(&xd, &xs, cols, 1).map_err(e)?;
+            o.std_mmvq(12, &mats[0].1, 1, &xs, 1, (&y2, 0), 1, rows, cols).map_err(e)?;
+            g.sync().map_err(e)?;
+            let (rel, _) = compare(&y2.to_f32().map_err(e)?, &y1.to_f32().map_err(e)?);
+            let reps = 40;
+            let time = |f: &dyn Fn(usize) -> nextsycl_core::Result<()>| -> Result<f64, String> {
+                f(0).map_err(e)?;
+                g.sync().map_err(e)?;
+                let t0 = std::time::Instant::now();
+                for i in 0..reps * mats.len() {
+                    f(i % mats.len()).map_err(e)?;
+                }
+                g.sync().map_err(e)?;
+                Ok(t0.elapsed().as_secs_f64() * 1e6 / (reps * mats.len()) as f64)
+            };
+            let a = time(&|i| o.q4k_mv(&mats[i].0, rows, cols, (&xd, 0, cols), None, (&y1, 0, rows), 1))?;
+            let b = time(&|i| {
+                o.std_quantize_q8(&xd, &xs, cols, 1)?;
+                o.std_mmvq(12, &mats[i].1, 1, &xs, 1, (&y2, 0), 1, rows, cols)
+            })?;
+            let q8 = DevBuf::new(g, o.q8_1_bytes(cols, 1)).map_err(e)?;
+            let (b8, ty8) = (mats[0].6, mats[0].7);
+            let c = if o.mmvq_supported(ty8) {
+                time(&|i| {
+                    o.quantize_q8_1((&xd, 0), &q8, cols, 1)?;
+                    o.mmvq(ty8, (&mats[i].5, 0), b8, &q8, (&y2, 0), cols, rows, 1)
+                })?
+            } else {
+                f64::NAN
+            };
+            println!("q4_K cold {:<7} [{rows} x {cols}] {:.2} MB x {}: q4k_mv {a:.1} us = {:.0} GB/s; split Q8 (+quantize) {b:.1} us = {:.0} GB/s; rel {rel:.1e}; \
+                      the file's type ({:.2} MB) on the shared mmvq {c:.1} us = {:.0} GB/s",
+                     format!("{role:?}"), bytes as f64 / 1e6, mats.len(), bytes as f64 / a / 1e3, bytes as f64 / b / 1e3, b8 as f64 / 1e6, b8 as f64 / c / 1e3);
+        }
         let mut seen = std::collections::BTreeSet::new();
         for l in 0..gg.n_layer {
             for (which, role, rows, cols) in [(0usize, Role::ExpGate, ff, d), (2, Role::ExpDown, d, ff)] {

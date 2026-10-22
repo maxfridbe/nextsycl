@@ -58,6 +58,12 @@ pub static FILE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// (the file reads and a staging slot's earlier copy), in `swap_in` (the copies' submission), for the copies of the
 /// products that need an expert still arriving, and in `stage_slot` alone
 pub static ENS_AHEAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// decode's file reads ahead started (one layer ahead, further ahead), the ones a layer then took, and the misses a
+/// layer read from the file itself (staged)
+pub static AHEAD_NEAR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static AHEAD_FAR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static AHEAD_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static STAGED_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ENS_STAGE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ENS_SWAP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ENS_COPY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -158,6 +164,23 @@ fn lend_extra() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_usize("NS_DS41_LEND_RESERVE", 1) != 0)
 }
+/// Decode's file reads further ahead: the routers of this many layers after the next run on a layer's input too, and
+/// of each one's best NS_DS41_FILE_AHEAD_FAR_RANK (default 8) at most NS_DS41_FILE_AHEAD_FAR_TOP (default 3) that only the
+/// file holds read ahead - the best are nearly always resident (NS_DS41_FILE_AHEAD_FAR,
+/// default 2; 0: one layer ahead only). A drive read takes ~4 ms, a layer ~1: one layer ahead, decode waited ~10 ms a
+/// token on reads already started
+fn far_layers() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_FILE_AHEAD_FAR", 0))
+}
+fn far_rank() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_FILE_AHEAD_FAR_RANK", 8))
+}
+fn far_top() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_FILE_AHEAD_FAR_TOP", 3))
+}
 /// Decode's expert products against split-Q8 activations with dp4a (mmvq.cpp; NS_DS41_STD_Q8, default 1; 0: std.cpp's
 /// float32 kernel)
 fn std_q8() -> bool {
@@ -184,11 +207,12 @@ fn std_oa() -> bool {
     *V.get_or_init(|| std::env::var("NS_DS41_STD_OA").is_ok_and(|v| v == "1"))
 }
 /// Attention's and the shared expert's Q8_0 / Q6_K weights requantized to q4_K when loaded (NS_DS41_DENSE_Q4K=1; default 0):
-/// half the bytes a decode token reads and the fused q4_K kernels apply (NS_DS41_DENSE_Q4K_ROLES: a comma list of qa, qb,
-/// kv, oa, ob, shgate, shup, shdown; default all). Measured alone with a matrix hot in the GPU's cache, Q8_0 looked faster
-/// for the small ones; in decode, cold from VRAM, all eight in q4_K are faster (trace, GPU time a token: 35.0 ms against
-/// 37.4 with only o_a / o_b, 38.7 with none) - and the B65's layers hold Q6_K, whose shared kernel is slow. An
-/// approximation - measure the perplexity
+/// half the bytes a decode token reads and the fused q4_K kernels apply (an approximation - measure the perplexity).
+/// NS_DS41_DENSE_Q4K_ROLES: a comma list of qa, qb, kv, oa, ob, shgate, shup, shdown (default all; a Q6_K one of the eight
+/// is requantized whatever the list: its shared product is slow). Measured alone, cold from VRAM, the shared Q8_0 product
+/// was as fast as q4_K for q_a, kv, q_b and o_b (B70 us q4_K / Q8_0: 18 / 18, 8.4 / 8.0, 106 / 81, 89 / 84); in decode
+/// (traced, GPU time a token) keeping those four in Q8_0 was slower, B70 6.5 -> 7.8 ms of dense products - and all eight
+/// in q4_K beat only o_a / o_b (35.0 against 37.4 ms) and none (38.7)
 fn dense_q4k() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_DS41_DENSE_Q4K").is_ok_and(|v| v == "1"))
@@ -249,11 +273,13 @@ fn cold_skip_ahead() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_DS41_COLD_SKIP_AHEAD").map_or(true, |v| v != "0"))
 }
-/// The chance of use from which decode reads a file expert ahead (NS_DS41_FILE_AHEAD_P, default 0.2 against the measured
-/// GUESS_HIT: guesses that miss take the drive from the reads that matter - IQ2_XXS on an unseen prompt 8.7 -> 14.4 tok/s)
+/// The chance of use from which decode reads a file expert ahead (NS_DS41_FILE_AHEAD_P, default 0.4 against the measured
+/// GUESS_HIT: guesses that miss take the drive from the reads that matter). At 0.2, 512 tokens of the fast setting started
+/// 13,200 reads ahead and took 672 (~280 MB a token: the drive's whole rate); 0.4: 6,281 started, the same 670 taken,
+/// tg 18.4-18.9 -> 21.4 tok/s; exact 10.6-11.7 -> 11.7-11.8 (0.6: no better)
 fn file_ahead_p() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("NS_DS41_FILE_AHEAD_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.2))
+    *V.get_or_init(|| std::env::var("NS_DS41_FILE_AHEAD_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.4))
 }
 /// The index sources after the candidate source score only their candidate blocks (NS_DS41_IDX_CAND, default 1; 0:
 /// every key, the others masked)
@@ -858,6 +884,9 @@ impl RDone {
             self.cv.notify_all();
         }
     }
+    fn is_done(&self) -> bool {
+        self.state.lock().unwrap().0 == 0
+    }
     fn wait(&self) -> Result<()> {
         let mut g = self.state.lock().unwrap();
         while g.0 > 0 {
@@ -1308,6 +1337,7 @@ impl Part {
                     let ta = Instant::now();
                     done.wait()?;
                     ENS_AHEAD_NS.fetch_add(ta.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    AHEAD_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     c.stage_rd[k] = None;
                     pre.insert(*x, k);
                 }
@@ -1632,29 +1662,45 @@ impl Part {
 
     /// A free staging slot (the copy last reading it done)
     fn stage_slot(&self, c: &mut Store) -> Result<usize> {
+        Ok(self.stage_slots(c, 1)?[0])
+    }
+
+    /// n different staging slots, each free (the copy last reading it done): from the next in turn, first the ones no
+    /// read ahead holds or whose read ahead has ended, then the others (their reads ahead waited for and forgotten) -
+    /// taking slots strictly in turn waited on reads ahead nobody wanted, 3-5 ms a token
+    fn stage_slots(&self, c: &mut Store, n: usize) -> Result<Vec<usize>> {
         let t0 = Instant::now();
-        let k = c.stage_next % STAGE;
-        c.stage_next += 1;
-        if let Some(t) = c.stage_tk[k].take() {
-            self.ops.ticket_wait(t)?;
+        let order: Vec<usize> = (0..STAGE).map(|i| (c.stage_next + i) % STAGE).collect();
+        let idle = |k: usize| c.stage_rd[k].as_ref().is_none_or(|r| r.is_done());
+        let mut ks: Vec<usize> = order.iter().copied().filter(|&k| idle(k)).collect();
+        ks.extend(order.iter().copied().filter(|&k| !idle(k)));
+        ks.truncate(n.min(STAGE));
+        for &k in &ks {
+            if let Some(t) = c.stage_tk[k].take() {
+                self.ops.ticket_wait(t)?;
+            }
+            if let Some(r) = c.stage_rd[k].take() {
+                // a read ahead into it not taken: let it end, forget it
+                let _ = r.wait();
+                c.ahead.retain(|_, v| v.0 != k);
+            }
         }
-        if let Some(r) = c.stage_rd[k].take() {
-            // a read ahead into it not taken: let it end, forget it
-            let _ = r.wait();
-            c.ahead.retain(|_, v| v.0 != k);
+        if let Some(&k) = ks.last() {
+            c.stage_next = k + 1;
         }
         ENS_SLOT_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        Ok(k)
+        Ok(ks)
     }
 
     /// Decode: the file's experts among `want` (layer l's likely ones) read ahead into staging slots, at most `limit`
-    fn read_ahead(&self, l: u64, want: &[u64], limit: usize) -> Result<()> {
-        let (Some(rd), Ok(st)) = (&self.reader, self.store(l)) else { return Ok(()) };
+    fn read_ahead(&self, l: u64, want: &[u64], limit: usize) -> Result<usize> {
+        let (Some(rd), Ok(st)) = (&self.reader, self.store(l)) else { return Ok(0) };
         let vq = &self.vq[&l];
         let mut c = st.lock().unwrap();
         let c = &mut *c;
         let xs: Vec<u64> = want.iter().copied().filter(|x| !c.loc.contains_key(&(l, *x)) && !c.ahead.contains_key(&(l, *x))).take(limit).collect();
         let sb = c.slot_bytes;
+        let mut n = 0;
         for x in xs {
             let k = self.stage_slot(c)?;
             let dst = c.stage.as_mut_slice().as_mut_ptr() as usize + k * sb;
@@ -1667,8 +1713,9 @@ impl Part {
             }
             c.stage_rd[k] = Some(done.clone());
             c.ahead.insert((l, x), (k, done));
+            n += 1;
         }
-        Ok(())
+        Ok(n)
     }
 
     /// The experts of `missing` held by neither VRAM nor host memory read from the file into staging slots, up to
@@ -1680,7 +1727,8 @@ impl Part {
             return Ok(at);
         }
         let t0 = Instant::now();
-        let ks = file.iter().map(|_| self.stage_slot(c)).collect::<Result<Vec<_>>>()?;
+        let ks = self.stage_slots(c, file.len())?;
+        STAGED_READS.fetch_add(file.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let sb = c.slot_bytes;
         let mut slices: Vec<Option<&mut [u8]>> = c.stage.as_mut_slice().chunks_mut(sb).map(Some).collect();
         let jobs: Vec<(u64, &mut [u8])> = file.iter().zip(&ks).map(|(x, k)| (*x, slices[*k].take().unwrap())).collect();
@@ -2013,8 +2061,13 @@ impl Part {
                 let n = t.elements() as usize;
                 let cols = *t.shape.last().unwrap_or(&1) as usize;
                 let host = m.file.read(t).map_err(e)?;
-                let to_q4k = dense_q4k() && matches!(t.ty, GType::Q8_0 | GType::Q6K) && n.is_multiple_of(256) && cols.is_multiple_of(256)
-                    && dense_q4k_role(r);
+                let to_q4k = dense_q4k() && n.is_multiple_of(256) && cols.is_multiple_of(256)
+                    && match t.ty {
+                        GType::Q8_0 => dense_q4k_role(r),
+                        // the shared Q6_K product is slow: a Q6_K one of the eight always
+                        GType::Q6K => matches!(r, Role::QA | Role::QB | Role::Kv | Role::OutA | Role::OutB | Role::ShGate | Role::ShUp | Role::ShDown),
+                        _ => false,
+                    };
                 let (raw, ty) = if to_q4k {
                     let q = crate::requant::to_q4k(&host, n, t.ty == GType::Q6K);
                     let raw = DevBuf::new(gpu, q.len())?;
@@ -3861,6 +3914,13 @@ impl<'g> Ds41<'g> {
             (p.mm(l, Role::Router, x, t)?, None)
         };
         tap(&format!("ffn_moe_logits-{l}"), &logits)?;
+        // decode: the routers of the layers after the next on this layer's input, for file reads further ahead
+        let far: Vec<(u64, DevBuf)> = if t == 1 && guess.is_some() && file_ahead() > 0 {
+            (2..=1 + far_layers() as u64).map(|j| l + j).filter(|&lj| lj < g.n_layer && !g.is_mtp(lj) && p.layers.contains(&lj))
+                .map(|lj| Ok((lj, p.mm(lj, Role::Router, x, t)?))).collect::<Result<_>>()?
+        } else {
+            Vec::new()
+        };
         // one decode token routed on the GPU: its VRAM experts' products queued now, from the slot table; the host
         // reads the routing (ids, weights, which had no VRAM slot) after, for the rest and its bookkeeping
         let img_any = tokens.iter().any(|t| crate::vision::is_image(*t));
@@ -3882,6 +3942,7 @@ impl<'g> Ds41<'g> {
             if let Some(gl) = &guess {
                 down.push((gl, t * ne));
             }
+            down.extend(far.iter().map(|(_, b)| (b, t * ne)));
             early_read = Some(p.read_start(&down)?);
             let (dn, gu, hset) = (p.arena.f32(used * d)?, p.arena.f32(2 * used * f)?, p.arena.f32(used * f)?);
             let nbit = vq.nbit;
@@ -3898,6 +3959,7 @@ impl<'g> Ds41<'g> {
                 if let Some(gl) = &guess {
                     down.push((gl, t * ne));
                 }
+                down.extend(far.iter().map(|(_, b)| (b, t * ne)));
                 p.read_start(&down)?
             }
         };
@@ -3908,12 +3970,13 @@ impl<'g> Ds41<'g> {
             p.mm(l, Role::ShDown, &sg, t)?
         };
         let tw = Instant::now();
-        let (lv, guess) = match pending {
+        let (lv, guess, farv) = match pending {
             Some((tk, spans)) => {
                 let mut v = p.read_finish(tk, &spans)?.into_iter();
-                (v.next().unwrap_or_default(), v.next())
+                (v.next().unwrap_or_default(), v.next(), v.collect::<Vec<_>>())
             }
-            None => (logits.to_f32()?, match &guess { Some(gl) => Some(gl.to_f32()?), None => None }),
+            None => (logits.to_f32()?, match &guess { Some(gl) => Some(gl.to_f32()?), None => None },
+                     far.iter().map(|(_, b)| b.to_f32()).collect::<Result<Vec<_>>>()?),
         };
         ROUTER_WAIT_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let turn = Instant::now();
@@ -4329,7 +4392,18 @@ impl<'g> Ds41<'g> {
                 // a read costs the drive and a slot, not PCIe or VRAM: a lower bar than the copies'
                 let fth = file_ahead_p();
                 let fwant: Vec<u64> = all.iter().filter(|x| x.1 >= fth).map(|(e, _)| *e as u64).collect();
-                p.read_ahead(l + 1, &fwant, file_ahead())?;
+                let k = p.read_ahead(l + 1, &fwant, file_ahead())?;
+                AHEAD_NEAR.fetch_add(k as u64, std::sync::atomic::Ordering::Relaxed);
+                // and the guesses further ahead: their best few, their reads given more time than one layer's
+                for ((lj, _), fv) in far.iter().zip(&farv) {
+                    let fb = p.router_bias(*lj)?;
+                    let key: Vec<f32> = fv.iter().zip(fb.iter()).map(|(z, b)| sqrt_softplus(*z) + b).collect();
+                    let mut order: Vec<usize> = (0..ne).collect();
+                    order.sort_by(|a, b| key[*b].total_cmp(&key[*a]));
+                    let top: Vec<u64> = order.iter().take(far_rank()).map(|e| *e as u64).collect();
+                    let k = p.read_ahead(*lj, &top, far_top())?;
+                    AHEAD_FAR.fetch_add(k as u64, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         Ok(y)

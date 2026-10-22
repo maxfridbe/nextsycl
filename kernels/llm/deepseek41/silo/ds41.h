@@ -150,7 +150,7 @@ int ns_ds41_std_dequant(ns_gpu* g, int type, const void* src, int64_t rows, int6
  * deepseek4 silo's scheme): q8_bytes of ncols x n_in, quantize_q8 x [ncols][n_in] float32 into it */
 size_t ns_ds41_q8_bytes(int64_t n_in, int64_t ncols);
 int ns_ds41_quantize_q8(ns_gpu* g, const float* x, void* xs, int64_t n_in, int64_t ncols);
-/* the types it takes: Q8_0, Q2_K, Q5_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ2_S, MXFP4; n_in a multiple of 256, at most 6144 */
+/* the types it takes: Q8_0, Q2_K, q4_K, Q5_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ2_S, MXFP4; n_in a multiple of 256, at most 8192 */
 int ns_ds41_mmvq_supported(int type, int64_t n_in);
 /* std_mmv's table (entries with ncol 0 skipped, column col_0 of xs): y[y0 * n_out + r] = W . x[col_0] */
 int ns_ds41_std_mmvq(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const void* xs, int64_t ncols, float* y,
