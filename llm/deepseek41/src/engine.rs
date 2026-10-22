@@ -2321,10 +2321,18 @@ impl<'g> Ds41<'g> {
         let mut bounds: Vec<u64> = vec![0];
         let cuts: Vec<u64> = match std::env::var("NS_SPLIT") {
             Ok(v) => v.split(',').filter_map(|x| x.trim().parse::<u64>().ok()).scan(0, |a, c| { *a += c; Some(*a) }).collect(),
-            Err(_) => (1..k).map(|i| {
-                let want = n as f64 * i as f64 / k as f64;
-                *g.kv_sources.iter().chain(std::iter::once(&0)).min_by(|a, b| (**a as f64 - want).abs().total_cmp(&(**b as f64 - want).abs())).unwrap_or(&0)
-            }).collect(),
+            // by the GPUs' compute units (a B70's 256 and a B65's 160: 24 / 16 layers, tg 17.4 -> 20.7 tok/s against halves;
+            // their decode kernel times a layer measured 1 : 1.43), at the nearest kv source (two GPUs: an index source
+            // too, its keys mirrored)
+            Err(_) => {
+                let rate: Vec<f64> = gpus.iter().map(|gp| nextsycl_core::gpu_units(gp.index).map_or(1.0, |(u, _)| (u as f64).max(1.0))).collect();
+                let total: f64 = rate.iter().sum();
+                let at: Vec<u64> = if k == 2 { g.kv_sources.iter().chain(&g.index_sources).copied().collect() } else { g.kv_sources.clone() };
+                (1..k).map(|i| {
+                    let want = n as f64 * rate[..i].iter().sum::<f64>() / total;
+                    *at.iter().chain(std::iter::once(&0)).min_by(|a, b| (**a as f64 - want).abs().total_cmp(&(**b as f64 - want).abs())).unwrap_or(&0)
+                }).collect()
+            }
         };
         if cuts.len() + 1 != k {
             return Err(Error(format!("NS_SPLIT: {} layer counts for {k} GPUs", cuts.len())));
