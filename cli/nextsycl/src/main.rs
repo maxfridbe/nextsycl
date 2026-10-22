@@ -460,6 +460,16 @@ fn generate(args: &[String]) -> Result<(), String> {
             .collect::<Result<Vec<u32>, String>>()?,
         None => tok.encode(&chat_of(&f)?(&[nextsycl_tok::Message { role: "user", content: &prompt, ..Default::default() }], effort, &[])),
     };
+    // --ids-only (with --score and --ids-out): write the ids and stop, no GPU
+    if args.iter().any(|a| a == "--ids-only") {
+        let (sf, p) = (opt("--score").ok_or("--ids-only: --score FILE")?, opt("--ids-out").ok_or("--ids-only: --ids-out PATH")?);
+        let mut sc = tok.encode(&std::fs::read_to_string(&sf).map_err(|x| format!("{sf}: {x}"))?);
+        sc.truncate(opt("--score-max").and_then(|v| v.parse().ok()).unwrap_or(256));
+        let line = |v: &[u32]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",");
+        std::fs::write(&p, format!("{}\n{}\n", line(&ids), line(&sc))).map_err(|x| format!("{p}: {x}"))?;
+        eprintln!("[{} prompt ids and {} text ids in {p}]", ids.len(), sc.len());
+        return Ok(());
+    }
     let gs: Vec<std::sync::Arc<nextsycl_core::Gpu>> = gpus.iter().map(|i| nextsycl_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
     let expert_gib: Option<f64> = opt("--expert-gib").and_then(|v| v.parse().ok());
     let mirror_gib: Option<f64> = opt("--mirror-gib").and_then(|v| v.parse().ok());
@@ -517,6 +527,11 @@ fn generate(args: &[String]) -> Result<(), String> {
         let text = std::fs::read_to_string(&sf).map_err(|x| format!("{sf}: {x}"))?;
         let mut sc = tok.encode(&text);
         sc.truncate(score_max);
+        // --ids-out PATH: the prompt's ids and the text's, a line each (another engine's run of the same tokens)
+        if let Some(p) = opt("--ids-out") {
+            let line = |v: &[u32]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",");
+            std::fs::write(&p, format!("{}\n{}\n", line(&ids), line(&sc))).map_err(|x| format!("{p}: {x}"))?;
+        }
         if sc.is_empty() || ids.len() + sc.len() + 1 > ctx {
             return Err(format!("--score {sf}: {} tokens after a prompt of {} in a context of {ctx}", sc.len(), ids.len()));
         }
@@ -537,7 +552,13 @@ fn generate(args: &[String]) -> Result<(), String> {
         };
         let m = rows.len() as f64;
         let nll: f64 = rows.iter().zip(&sc).map(|(r, &y)| -lsm(r)[y as usize]).sum::<f64>() / m;
-        eprintln!("[score: {} tokens, perplexity {:.4}]", rows.len(), nll.exp());
+        // how often the likeliest token is the text's (a greedy run's own text: 100% from the same numerics), and where
+        // it first is not
+        let argmax = |v: &[f32]| v.iter().enumerate().fold(0, |b, (i, x)| if *x > v[b] { i } else { b });
+        let same: Vec<bool> = rows.iter().zip(&sc).map(|(r, &y)| argmax(r) == y as usize).collect();
+        let first = same.iter().position(|s| !s).map_or("none".to_string(), |i| i.to_string());
+        eprintln!("[score: {} tokens, perplexity {:.4}, the likeliest token the text's at {:.2}% (first not at row {first})]", rows.len(), nll.exp(),
+                  100.0 * same.iter().filter(|s| **s).count() as f64 / m);
         if let Some(out) = opt("--dump") {
             let b: Vec<u8> = rows.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(&out, b).map_err(|x| format!("{out}: {x}"))?;
@@ -545,13 +566,19 @@ fn generate(args: &[String]) -> Result<(), String> {
         if let Some(rf) = opt("--ref") {
             let raw = std::fs::read(&rf).map_err(|x| format!("{rf}: {x}"))?;
             let nv = rows[0].len();
-            if raw.len() != rows.len() * nv * 4 {
-                return Err(format!("--ref {rf}: {} bytes, {} rows of {nv} logits expected", raw.len(), rows.len()));
+            // --ref-from N: the reference holds rows N.. only (as many as its size says)
+            let from: usize = opt("--ref-from").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let nref = raw.len() / (nv * 4);
+            if raw.len() % (nv * 4) != 0 || from + nref > rows.len() || (from == 0 && nref != rows.len()) {
+                return Err(format!("--ref {rf}: {} bytes, {} rows of {nv} logits expected from row {from}", raw.len(), rows.len() - from));
             }
+            let m = nref as f64;
             let (mut kl, mut kmax, mut top1, mut rnll) = (0.0f64, 0.0f64, 0usize, 0.0f64);
             let argmax = |v: &[f32]| v.iter().enumerate().fold(0, |b, (i, x)| if *x > v[b] { i } else { b });
-            for (i, r) in rows.iter().enumerate() {
-                let refr: Vec<f32> = raw[i * nv * 4..(i + 1) * nv * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let nll: f64 = rows[from..from + nref].iter().zip(&sc[from..]).map(|(r, &y)| -lsm(r)[y as usize]).sum::<f64>() / m;
+            for (j, r) in rows[from..from + nref].iter().enumerate() {
+                let i = from + j;
+                let refr: Vec<f32> = raw[j * nv * 4..(j + 1) * nv * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                 let (p, q) = (lsm(&refr), lsm(r));
                 // KL(reference || this run) of the row
                 let k: f64 = p.iter().zip(&q).map(|(a, b)| a.exp() * (a - b)).sum();
@@ -560,7 +587,7 @@ fn generate(args: &[String]) -> Result<(), String> {
                 top1 += (argmax(&refr) == argmax(r)) as usize;
                 rnll -= p[sc[i] as usize];
             }
-            eprintln!("[against {rf}: KL mean {:.5} max {:.4}, top-1 the same {:.1}%, perplexity {:.4} (the reference's {:.4})]", kl / m, kmax,
+            eprintln!("[against {rf}, rows {from}..{}: KL mean {:.5} max {:.4}, top-1 the same {:.1}%, perplexity {:.4} (the reference's {:.4})]", from + nref, kl / m, kmax,
                       100.0 * top1 as f64 / m, nll.exp(), (rnll / m).exp());
         }
         return Ok(());

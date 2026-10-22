@@ -141,6 +141,8 @@ text, per 1,000 words:
 
 llama.cpp's run (the same 51 prompt tokens; the first ~20 generated tokens the same as nextsycl's, then a near tie
 goes the other way) shrinks its chapters to ~500 words from chapter 8 and ends in a loop ("And the map. And the coast.
-And the sea. ...") before chapter 12 is done: the degradation is the quantization's, not this engine's. llama.cpp's
+And the sea. ...") before chapter 12 is done. Consistent with the quantization, not proof of it: both engines read PR 30817's form of
+the model (a fault shared with it would show in both), no full-precision run of this prompt was made, and these are
+single greedy runs. llama.cpp's
 speed there: tg 9.8 tok/s (14 layers' experts on the cards, the rest mmapped; nextsycl exact 13.6 over the same 12,000
 tokens).

@@ -8,6 +8,7 @@
 /// The architecture this engine is, and the silo's name
 pub const ARCH: &str = "deepseek41";
 
+pub mod dry;
 pub mod engine;
 pub mod engram;
 pub mod requant;

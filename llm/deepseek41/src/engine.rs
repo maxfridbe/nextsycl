@@ -248,6 +248,12 @@ fn prompt_prefetch() -> bool {
 /// Decode leaves out a routed expert held by neither VRAM nor host memory (nor already being read ahead) whose share of the
 /// layer's routing weight is under this (NS_DS41_COLD_SKIP, default 0: none): its read is a ~4 ms stall for a layer, its
 /// output a few percent of the layer's routed sum. An approximation - measure the perplexity (generate --score)
+/// the Engram's rows through the shared dequant kernels as before IQ4_NL (NS_DS41_ENGRAM_SHARED=1; a measurement switch:
+/// Q5_K / Q6_K tables only)
+fn engram_shared() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_ENGRAM_SHARED").is_ok_and(|v| v == "1"))
+}
 fn cold_skip() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_DS41_COLD_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
@@ -1825,6 +1831,8 @@ pub struct Session {
     pub max_ctx: usize,
     layers: Vec<Att>,
     hist: Vec<u32>,
+    /// where this turn's generated tokens begin in `hist` (the end of the last prompt read): DRY's history
+    gen_from: usize,
     /// (first position, rows) of the last pass of 2..=MAX_VERIFY rows (a rollback's bounds)
     snapped: Option<(usize, usize)>,
     mtp: Option<MtpS>,
@@ -1919,6 +1927,8 @@ pub struct Ds41<'g> {
     pipelining: std::sync::atomic::AtomicBool,
     /// the vision sidecar (NS_DS41_VISION), when there is one
     pub vision: Option<crate::vision::Vision>,
+    /// DRY against repeated runs (NS_DS41_DRY) and the tokens that break a run
+    dry: Option<(crate::dry::Dry, crate::dry::Vocab)>,
 }
 
 /// the decode products' kernel variants (ds41.h: ns_ds41_vq_mmv): 0 a sub-group a row (float32 codebook), 1 a lane a row
@@ -2458,11 +2468,19 @@ impl<'g> Ds41<'g> {
         };
         let load_bytes = parts.iter().map(|p| p.weight_bytes).sum();
         let prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(BTreeMap::new()));
+        let dry = match crate::dry::Dry::from_env() {
+            Some(d) => {
+                let tok = nextsycl_tok::Tokenizer::from_gguf(file).map_err(Error)?;
+                log(format!("DRY against repeated runs: multiplier {}, base {}, from {} tokens", d.multiplier, d.base, d.allowed));
+                Some((d, crate::dry::vocab(tok.tokens.len(), |t| tok.decode(&[t]))))
+            }
+            None => None,
+        };
         if let Some(sl) = mirror_src {
             log(format!("layers {}.. on the second GPU: kv source {sl}'s keys mirrored there", bounds[1]));
         }
         Ok(Ds41 { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, engram, prof, mtp, mirror_src, cand_q: Mutex::new(Default::default()),
-                  pipelining: std::sync::atomic::AtomicBool::new(false), vision })
+                  pipelining: std::sync::atomic::AtomicBool::new(false), vision, dry })
     }
 
     pub fn gpu_info(&self) -> Vec<GpuInfo> {
@@ -2573,7 +2591,7 @@ impl<'g> Ds41<'g> {
         } else {
             None
         };
-        Ok(Session { pos: 0, max_ctx, layers, hist: Vec::new(), snapped: None, mtp })
+        Ok(Session { pos: 0, max_ctx, layers, hist: Vec::new(), gen_from: 0, snapped: None, mtp })
     }
 
     /// The raw ring's slots of the window before `pos` (at most 136 positions, in up to two runs)
@@ -2672,6 +2690,7 @@ impl<'g> Ds41<'g> {
         let toks = it.next().ok_or("restore: the checkpoint has no tokens")?;
         sess.hist = toks.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32).collect();
         sess.pos = ck.pos;
+        sess.gen_from = ck.pos;
         sess.snapped = None;
         if let Some(ms) = sess.mtp.as_mut() {
             ms.mh_rows = (0, 0);
@@ -2682,6 +2701,7 @@ impl<'g> Ds41<'g> {
 
     pub fn reset_session(&self, sess: &mut Session) -> Result<()> {
         sess.pos = 0;
+        sess.gen_from = 0;
         sess.hist.clear();
         sess.snapped = None;
         if let Some(ms) = sess.mtp.as_mut() {
@@ -2727,6 +2747,7 @@ impl<'g> Ds41<'g> {
         }
         dst.hist = src.hist.clone();
         dst.pos = src.pos;
+        dst.gen_from = src.gen_from;
         dst.snapped = None;
         Ok(())
     }
@@ -3054,6 +3075,7 @@ impl<'g> Ds41<'g> {
         match en.gpu_type() {
             // the llama.cpp form's Q5_K / Q6_K / IQ4_NL rows: one block a row, expanded by the shared kernels
             // the silo's std kernels where they take the type (IQ4_NL: the UD-IQ1_M file's table), else the shared ones
+            Some(ty) if engram_shared() => p.ops.dequant(ty.code(), &rb, 0, t * nc * en.rb, t * nc * hd, &rows)?,
             Some(ty) => p.ops.dequant_mat(ty.code(), &rb, 0, t * nc * en.rb, t * nc, hd, &rows, false)?,
             None => p.ops.engram_rows(&rb, &rows, t * nc, hd)?,
         }
@@ -3500,18 +3522,34 @@ impl<'g> Ds41<'g> {
     pub fn feed_until(&self, sess: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
         let chunks = chunked(tokens, prefill_chunk());
         let runs = self.runs();
-        if chunks.len() >= 2 && runs.len() == 2 && pipeline() {
-            return self.feed_pipelined(sess, &chunks, (runs[0], runs[1]), stop, tap);
-        }
-        let (mut fed, mut logits) = (0, Vec::new());
-        for (i, c) in chunks.iter().enumerate() {
-            if i > 0 && stop(fed) {
-                break;
+        let out = if chunks.len() >= 2 && runs.len() == 2 && pipeline() {
+            self.feed_pipelined(sess, &chunks, (runs[0], runs[1]), stop, tap)?
+        } else {
+            let (mut fed, mut logits) = (0, Vec::new());
+            for (i, c) in chunks.iter().enumerate() {
+                if i > 0 && stop(fed) {
+                    break;
+                }
+                logits = self.forward(sess, c, &mut *tap)?;
+                fed += c.len();
             }
-            logits = self.forward(sess, c, &mut *tap)?;
-            fed += c.len();
+            (fed, logits)
+        };
+        // what is generated after a prompt is DRY's history
+        sess.gen_from = sess.pos;
+        Ok(out)
+    }
+
+    /// `logits` as the sampler sees them: DRY's penalties (NS_DS41_DRY) against this turn's generated tokens `hist`
+    fn shaped<'a>(&self, logits: &'a [f32], hist: &[u32]) -> std::borrow::Cow<'a, [f32]> {
+        match &self.dry {
+            None => std::borrow::Cow::Borrowed(logits),
+            Some((d, br)) => {
+                let mut l = logits.to_vec();
+                crate::dry::penalize(&mut l, hist, br, d);
+                std::borrow::Cow::Owned(l)
+            }
         }
-        Ok((fed, logits))
     }
 
     /// `feed` on two GPUs with the chunks in a pipeline: a thread runs the first GPU's layers a chunk ahead while this
@@ -3852,8 +3890,11 @@ impl<'g> Ds41<'g> {
                 toks.extend_from_slice(&dr);
                 let rows = self.forward_rows(sess, &toks, toks.len(), &mut *tap)?;
                 let mut out = Vec::with_capacity(toks.len());
+                // row i follows toks[..=i]: the history to there
+                let at0 = sess.pos - toks.len();
                 for (i, r) in rows.iter().enumerate() {
-                    let y = smp.sample(r);
+                    let gen = sess.gen_from.min(at0 + i + 1);
+                    let y = smp.sample(&self.shaped(r, &sess.hist[gen..at0 + i + 1]));
                     out.push(y);
                     if i < dr.len() {
                         dec.drafted += 1;
@@ -3875,7 +3916,7 @@ impl<'g> Ds41<'g> {
                     dec.logits = self.forward(sess, &[x], &mut *tap)?;
                 }
                 let ts = Instant::now();
-                let y = smp.sample(&dec.logits);
+                let y = smp.sample(&self.shaped(&dec.logits, &sess.hist[sess.gen_from.min(sess.pos)..sess.pos]));
                 WALL_SAMPLE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 (vec![y], y)
             }
