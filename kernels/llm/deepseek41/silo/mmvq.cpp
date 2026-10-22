@@ -96,6 +96,7 @@ struct WideIQ2XXS {
     static W load(const Block* b, int g, const uint32_t* tab) {
         W r;
         const sycl::uint2* grid = reinterpret_cast<const sycl::uint2*>(tab);
+        // (2-byte loads of its 8 bytes measured slower here: B70 78 -> 89 us; for IQ3_XXS and Q2_K they won)
         const sycl::int4 q4 = load16_a2(reinterpret_cast<const uint8_t*>(b->qs) + 16 * (g >> 1));
         const uint32_t a0 = word_of(q4, 2 * (g & 1)), a1 = word_of(q4, 2 * (g & 1) + 1);   // grid bytes; signs + scale
         int v[8];
@@ -152,9 +153,9 @@ struct WideIQ3XXS {
     static W load(const Block* b, int g, const uint32_t* tab) {
         W r;
         const uint8_t* p = reinterpret_cast<const uint8_t*>(b);
-        const sycl::int4 q4 = load16_a2(p + 2 + 16 * (g >> 1));
-        const uint32_t i0 = word_of(q4, 2 * (g & 1)), i1 = word_of(q4, 2 * (g & 1) + 1);   // the 8 grid indices
-        const uint32_t a1 = word_of(load16_a2(p + 2 + 64 + 16 * (g >> 2)), g & 3);           // signs + scale
+        // 2-byte loads, not load16_a2's selects: the kernel is bound by its arithmetic (B70 105 -> 75 us, B65 164 -> 117)
+        const uint32_t i0 = load4_a2(p + 2 + 8 * g), i1 = load4_a2(p + 2 + 8 * g + 4);   // the 8 grid indices
+        const uint32_t a1 = load4_a2(p + 2 + 64 + 4 * g);                                   // signs + scale
         int v[8];
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
@@ -238,8 +239,10 @@ struct WideQ2K {
     static W load(const Block* b, int g, const uint32_t*) {
         const uint8_t* p = reinterpret_cast<const uint8_t*>(b);
         const int n = g >> 2, sh = 2 * (g & 3);
-        const sycl::int4 a = load16_a2(p + 16 + 32 * n), c = load16_a2(p + 16 + 32 * n + 16);
-        auto code = [&](int w) { return int((uint32_t(w) >> sh) & 0x03030303u); };
+        // 84-byte blocks: 4-byte aligned word loads, not load16_a2's selects (B70 154 -> 67 us, B65 151 -> 99)
+        const uint32_t* qw = reinterpret_cast<const uint32_t*>(p + 16 + 32 * n);
+        const sycl::uint4 a(qw[0], qw[1], qw[2], qw[3]), c(qw[4], qw[5], qw[6], qw[7]);
+        auto code = [&](uint32_t w) { return int((w >> sh) & 0x03030303u); };
         W r;
         r.lo = sycl::int4(code(a.x()), code(a.y()), code(a.z()), code(a.w()));
         r.hi = sycl::int4(code(c.x()), code(c.y()), code(c.z()), code(c.w()));
