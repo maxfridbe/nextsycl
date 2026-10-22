@@ -23,7 +23,7 @@
 namespace {
 
 // ggml type numbers
-enum : int { T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_Q5_K = 13, T_Q6_K = 14, T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ1_S = 19, T_IQ3_S = 21, T_IQ2_S = 22, T_MXFP4 = 39 };
+enum : int { T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_Q5_K = 13, T_Q6_K = 14, T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ1_S = 19, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22, T_MXFP4 = 39 };
 
 // bytes of 256 values
 constexpr int sb_bytes(int type) {
@@ -37,6 +37,7 @@ constexpr int sb_bytes(int type) {
         case T_IQ2_XS: return 74;
         case T_IQ3_XXS: return 98;
         case T_IQ1_S: return 50;
+        case T_IQ4_NL: return 8 * 18;
         case T_IQ3_S: return 110;
         case T_IQ2_S: return 82;
         case T_MXFP4: return 8 * 17;
@@ -154,6 +155,18 @@ template <> struct Deq<T_IQ1_S> {
         // SYCL builds have ggml's GPU form of the grid: the entry + 1 in nibbles, values 0-3 the even nibbles, 4-7 the odd
         const uint32_t e = L.b[b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)];
         for (int j = 0; j < 8; ++j) w[j] = dl * ((int) ((e >> (j < 4 ? 8 * j : 8 * (j - 4) + 4)) & 0xF) - 1 + delta);
+    }
+};
+
+// IQ4_NL: eight 18-byte blocks of 32 make the 256 (d, then 16 bytes: values 0-15 the low nibbles, 16-31 the high), a
+// nibble a value of ggml's kvalues_iq4nl (the Engram table of the UD-IQ1_M file)
+template <> struct Deq<T_IQ4_NL> {
+    static void group(const uint8_t* b, int g, float* w, const Lut& L) {
+        const uint8_t* bl = b + 18 * (g >> 2);
+        const float d = h2f(bl);
+        const int q = g & 3, sh = 4 * (q >> 1);
+        const uint8_t* qs = bl + 2 + 8 * (q & 1);
+        for (int j = 0; j < 8; ++j) w[j] = d * (float) kvalues_iq4nl[(qs[j] >> sh) & 15];
     }
 };
 
@@ -357,6 +370,7 @@ int ns_ds41_std_mmv(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* me
         else if (ku == 2) { BY_NC(T, 2, 2) } else { BY_NC(T, 2, 1) } \
         return 0;
         CASE(T_Q8_0) CASE(T_Q2_K) CASE(T_Q3_K) CASE(T_Q5_K) CASE(T_Q6_K) CASE(T_IQ2_XXS) CASE(T_IQ2_XS) CASE(T_IQ3_XXS) CASE(T_IQ1_S) CASE(T_IQ3_S) CASE(T_IQ2_S) CASE(T_MXFP4)
+        CASE(T_IQ4_NL)
 #undef CASE
 #undef BY_NC
 #undef RUN
@@ -372,6 +386,7 @@ int ns_ds41_std_dequant(ns_gpu* g, int type, const void* src, int64_t rows, int6
     switch (type) {
 #define CASE(T) case T: if (f16) dequant<T, true>(g->q, s, rows, cols, out); else dequant<T, false>(g->q, s, rows, cols, out); return 0;
         CASE(T_Q8_0) CASE(T_Q2_K) CASE(T_Q3_K) CASE(T_Q5_K) CASE(T_Q6_K) CASE(T_IQ2_XXS) CASE(T_IQ2_XS) CASE(T_IQ3_XXS) CASE(T_IQ1_S) CASE(T_IQ3_S) CASE(T_IQ2_S) CASE(T_MXFP4)
+        CASE(T_IQ4_NL)
 #undef CASE
         default: return ns_fail("ns_ds41_std_dequant: type");
     }

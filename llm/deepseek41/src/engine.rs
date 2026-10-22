@@ -3053,7 +3053,8 @@ impl<'g> Ds41<'g> {
         let rows = p.arena.f32(t * nc * hd)?;
         match en.gpu_type() {
             // the llama.cpp form's Q5_K / Q6_K / IQ4_NL rows: one block a row, expanded by the shared kernels
-            Some(ty) => p.ops.dequant(ty.code(), &rb, 0, t * nc * en.rb, t * nc * hd, &rows)?,
+            // the silo's std kernels where they take the type (IQ4_NL: the UD-IQ1_M file's table), else the shared ones
+            Some(ty) => p.ops.dequant_mat(ty.code(), &rb, 0, t * nc * en.rb, t * nc, hd, &rows, false)?,
             None => p.ops.engram_rows(&rb, &rows, t * nc, hd)?,
         }
         let kv = p.mm(l, Role::EngramWkv, &rows, t)?;
