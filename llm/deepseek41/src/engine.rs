@@ -146,6 +146,18 @@ fn spare_slots() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_usize("NS_DS41_SPARE", 8))
 }
+/// NS_DS41_SKIP_HOST=1 (a measurement - wrong output): decode's cold-expert skip takes the pinned host tier's experts too, so
+/// no expert is swapped in for the layer that asks for it - the ceiling of making its misses free
+fn skip_host() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_SKIP_HOST", 0) != 0)
+}
+/// Decode's expert stores also take the VRAM the passes' reserve leaves free while decoding (NS_DS41_LEND_RESERVE, default
+/// 1; 0: only the big arena is lent): ~6.5 GiB a card at a 16384-token chunk, given back before a pass that needs it
+fn lend_extra() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_LEND_RESERVE", 1) != 0)
+}
 /// Decode's expert products against split-Q8 activations with dp4a (mmvq.cpp; NS_DS41_STD_Q8, default 1; 0: std.cpp's
 /// float32 kernel)
 fn std_q8() -> bool {
@@ -687,6 +699,12 @@ struct Store {
     base: usize,
     lend: usize,
     lent: bool,
+    /// the lent slots' chunk of `vram` (the big arena), then the passes' reserve's: xlend more slots after them, in chunk
+    /// x_chunk, the first x_on of them in use (allocated from what decode leaves free, given back before a pass that needs it)
+    lend_chunk: usize,
+    xlend: usize,
+    x_chunk: usize,
+    x_on: usize,
     pf_issued: u64,
     pf_used: u64,
     /// pinned staging slots for experts read from the file (copied up from there on the copy lane, not through a
@@ -720,12 +738,23 @@ impl Store {
     }
     fn vat(&self, s: usize) -> (usize, usize) {
         if s >= self.base {
-            return (self.vram.len() - 1, (s - self.base) * self.slot_bytes);
+            let k = s - self.base;
+            if k < self.lend {
+                return (self.lend_chunk, k * self.slot_bytes);
+            }
+            return (self.x_chunk, (k - self.lend) * self.slot_bytes);
         }
         (s / self.per_chunk, (s % self.per_chunk) * self.slot_bytes)
     }
     fn usable(&self, s: usize) -> bool {
-        s < self.base || self.lent
+        s < self.base || if s < self.base + self.lend { self.lent } else { s - self.base - self.lend < self.x_on }
+    }
+    /// The slots' payload addresses on the GPU, a u64 each
+    fn slot_addrs(&self) -> Vec<u8> {
+        (0..self.vowner.len()).flat_map(|s| {
+            let (ch, o) = self.vat(s);
+            (self.vram[ch].ptr() as u64 + o as u64).to_le_bytes()
+        }).collect()
     }
     fn rat(&self, r: usize) -> (usize, usize) {
         (r / self.per_chunk, (r % self.per_chunk) * self.slot_bytes)
@@ -766,6 +795,11 @@ pub struct Part {
     /// the towers' experts, all in VRAM (the last part): a buffer a tower
     draft: HashMap<u64, DevBuf>,
     hold: std::sync::atomic::AtomicBool,
+    /// VRAM held back at load for the sessions' caches (kept free when the passes' reserve is lent), and whether a lend
+    /// of that reserve is due (after load and after each pass that took it back)
+    kv_reserve: usize,
+    x_due: std::sync::atomic::AtomicBool,
+    x_first: std::sync::atomic::AtomicBool,
     pub expert_slots: usize,
     pub host_slots: usize,
     pub weight_bytes: u64,
@@ -933,6 +967,77 @@ impl Part {
         }
     }
 
+    /// What decode leaves free of the passes' reserve, lent to the stores as more expert slots (NS_DS41_LEND_RESERVE): the
+    /// VRAM free now less NS_DS41_FREE_GIB, the sessions' held-back caches and 1 GiB for decode's own allocations, shared
+    /// by the stores' sizes. The first lend fixes the slot counts; a later one (after a pass took the reserve back) lends
+    /// what fits of them. The new slots are filled at once from the pinned host tier, its first slots (the
+    /// profile's next experts at load): the copies up beside the work, the host slots they free taking VRAM's victims later
+    fn lend_reserve(&self) -> Result<()> {
+        let Some(free) = self.ops.gpu.memory()?.1 else { return Ok(()) };
+        let room = (free as usize).saturating_sub(keep_free() + self.kv_reserve + (1 << 30));
+        let mut cs: Vec<_> = self.stores.iter().map(|s| s.lock().unwrap()).collect();
+        if cs.iter().any(|c| c.x_on > 0) {
+            return Ok(());
+        }
+        let weight: usize = cs.iter().map(|c| c.slot_bytes * c.base).sum::<usize>().max(1);
+        // a store's share of the room, in slots (a later lend: at most the first's count)
+        let want: Vec<usize> = cs.iter().map(|c| {
+            let n = (room as u128 * (c.slot_bytes * c.base) as u128 / weight as u128) as usize / c.slot_bytes;
+            if c.xlend > 0 { n.min(c.xlend) } else { n }
+        }).collect();
+        let mut lent = 0;
+        for (c, &n) in cs.iter_mut().zip(&want) {
+            let c = &mut **c;
+            if n == 0 {
+                continue;
+            }
+            let buf = DevBuf::new(&self.ops.gpu, n * c.slot_bytes)?;
+            if c.xlend == 0 {
+                c.vram.push(buf);
+                c.x_chunk = c.vram.len() - 1;
+                c.xlend = n;
+                let nv = c.vowner.len();
+                c.vowner.resize(nv + n, None);
+                c.vused.resize(nv + n, 0);
+            } else {
+                let xc = c.x_chunk;
+                c.vram[xc] = buf;
+            }
+            c.x_on = n;
+            let addrs = c.slot_addrs();
+            let b = DevBuf::new(&self.ops.gpu, addrs.len().max(8))?;
+            b.write(0, &addrs)?;
+            c.slotaddr = Some(b);
+            // filled from the host tier's first slots
+            let sb = c.slot_bytes;
+            let x0 = c.base + c.lend;
+            let from: Vec<(usize, (u64, u64))> = (0..c.rowner.len()).filter_map(|r| c.rowner[r].map(|v| (r, v))).take(n).collect();
+            for (k, (r, key)) in from.into_iter().enumerate() {
+                let sl = x0 + k;
+                let (vch, vo) = c.vat(sl);
+                let (rch, ro) = c.rat(r);
+                let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &c.host[rch].device_view(ro, sb)?, 0, sb, &[c.rwrite.get(&r).copied()])?;
+                c.rread.insert(r, t);
+                c.rfree.push(r);
+                c.rowner[r] = None;
+                c.vfill.insert(sl, t);
+                c.last_up = Some(t);
+                c.vowner[sl] = Some(key);
+                c.vused[sl] = c.tick;
+                self.tab_set_after(c, key, sl, t)?;
+                c.loc.insert(key, Loc::V(sl));
+                // a product the host routes waits for the copy as for a prefetch's
+                c.prefetched.insert(key, t);
+            }
+            lent += n * sb;
+        }
+        if lent > 0 && (std::env::var("NS_PROFILE").is_ok() || self.x_first.swap(false, std::sync::atomic::Ordering::Relaxed)) {
+            eprintln!("[{}: {} GiB of the passes' reserve lent to the expert stores ({:.1} GiB was free): {} more slots]", self.ops.gpu.name,
+                      format!("{:.1}", gib(lent)), gib(free as usize), want.iter().sum::<usize>());
+        }
+        Ok(())
+    }
+
     /// The arena a pass of `t` tokens needs: the small one, or the big one (its memory then out of the stores)
     fn arena_for(&self, t: usize) -> Result<()> {
         let need = t * (arena_bytes() / prefill_chunk()).max(1) + (64 << 20);
@@ -942,16 +1047,22 @@ impl Part {
         }
         let hold = self.hold.load(std::sync::atomic::Ordering::Relaxed);
         let lent = self.stores.iter().any(|s| s.lock().unwrap().lent);
+        // lent at decode's first step (a prompt pass reads host-tier experts in place, by another kernel than a resident
+        // one's: filling the slots during a prompt would change its rounding)
+        if t <= MMVQ_COLS && lent && self.x_due.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.lend_reserve()?;
+        }
         if need > SMALL_ARENA && lent {
             let after = Some(self.ops.mark()?);
             for st in &self.stores {
                 let mut c = st.lock().unwrap();
                 let c = &mut *c;
-                if c.lend == 0 {
+                if c.lend == 0 && c.x_on == 0 {
                     continue;
                 }
                 let sb = c.slot_bytes;
-                for s in c.base..c.base + c.lend {
+                let hi = c.base + c.lend + c.x_on;
+                for s in c.base..hi {
                     let Some(v) = c.vowner[s].take() else { continue };
                     self.tab_zero(c, v)?;
                     c.loc.remove(&v);
@@ -973,6 +1084,15 @@ impl Part {
                 c.lent = false;
             }
             self.ops.gpu.sync()?;
+            // the passes' reserve given back: its slots' buffer freed (the pass allocates beyond its arena)
+            for st in &self.stores {
+                let mut c = st.lock().unwrap();
+                if c.x_on > 0 {
+                    let xc = c.x_chunk;
+                    c.vram[xc] = DevBuf::new(&self.ops.gpu, 256)?;
+                    c.x_on = 0;
+                }
+            }
             self.arena.set(self.big.view(0, self.big.len)?);
         } else if need <= SMALL_ARENA && !lent && !hold {
             for st in &self.stores {
@@ -982,6 +1102,12 @@ impl Part {
                 }
             }
             self.arena.set(self.small.view(0, self.small.len)?);
+            if lend_extra() {
+                self.x_due.store(true, std::sync::atomic::Ordering::Relaxed);
+                if t <= MMVQ_COLS && self.x_due.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    self.lend_reserve()?;
+                }
+            }
         }
         Ok(())
     }
@@ -2100,7 +2226,7 @@ impl Part {
             stores.push(Mutex::new(Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree: (in_r.len()..nr).collect(), rowner, rused: vec![0; nr], rmark: None, tick: 0, hits: 0, rread: HashMap::new(),
                                            slotaddr: None, vzero: HashMap::new(), n_expert: g.n_expert as usize,
                                            misses: 0, from_host: 0, from_file: 0, direct: 0, rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(),
-                                           last_up: None, prefetched: HashMap::new(), usage: HashMap::new(), base: nv, lend: 0, lent: false, pf_issued: 0,
+                                           last_up: None, prefetched: HashMap::new(), usage: HashMap::new(), base: nv, lend: 0, lent: false, lend_chunk: 0, xlend: 0, x_chunk: 0, x_on: 0, pf_issued: 0,
                                            pf_used: 0, stage: HostBuf::new(gpu, STAGE * slot_bytes)?, stage_tk: vec![None; STAGE], stage_next: 0,
                                            stage_rd: vec![None; STAGE], ahead: HashMap::new() }));
         }
@@ -2134,6 +2260,7 @@ impl Part {
                 if n > 0 {
                     let v = big.view(0, n * c.slot_bytes)?;
                     c.vram.push(v);
+                    c.lend_chunk = c.vram.len() - 1;
                     let nv = c.vowner.len();
                     c.vowner.resize(nv + n, None);
                     c.vused.resize(nv + n, 0);
@@ -2148,10 +2275,7 @@ impl Part {
         // each store's slot addresses on the GPU (the slot table's entries are copied from them), lent slots too
         for st in &stores {
             let mut c = st.lock().unwrap();
-            let addrs: Vec<u8> = (0..c.vowner.len()).flat_map(|s| {
-                let (ch, o) = c.vat(s);
-                (c.vram[ch].ptr() as u64 + o as u64).to_le_bytes()
-            }).collect();
+            let addrs = c.slot_addrs();
             let b = DevBuf::new(gpu, addrs.len().max(8))?;
             b.write(0, &addrs)?;
             c.slotaddr = Some(b);
@@ -2167,7 +2291,7 @@ impl Part {
         let nfs = prompt_file_slots();
         let pstage = if ring_bytes > 0 && nfs > 0 { Some((Mutex::new(HostBuf::new(gpu, nfs * ring_slot)?), ring_slot, Mutex::new(vec![None; nfs]))) } else { None };
         Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), oa_tab: Mutex::new(HashMap::new()), pre_reads: Mutex::new(None), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
-                  hold: std::sync::atomic::AtomicBool::new(false), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
+                  hold: std::sync::atomic::AtomicBool::new(false), kv_reserve, x_due: std::sync::atomic::AtomicBool::new(lent && lend_extra()), x_first: std::sync::atomic::AtomicBool::new(true), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
                   up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage, devtab,
                   reader: if file_ahead() > 0 { Some(FileReader::new(&m.file.paths, env_usize("NS_DS41_READERS", 16))?) } else { None } })
     }
@@ -3859,7 +3983,8 @@ impl<'g> Ds41<'g> {
                 let c = st.lock().unwrap();
                 for (k, (ex, v)) in by.iter().enumerate() {
                     let key = (l, *ex as u64);
-                    if !c.loc.contains_key(&key) && (t > MMVQ_COLS || cold_skip_ahead() || !c.ahead.contains_key(&key)) && v.len() <= maxn
+                    let cold = if skip_host() && t <= MMVQ_COLS { !matches!(c.loc.get(&key), Some(Loc::V(_))) } else { !c.loc.contains_key(&key) };
+                    if cold && (t > MMVQ_COLS || cold_skip_ahead() || !c.ahead.contains_key(&key)) && v.len() <= maxn
                         && v.iter().all(|x| x.1 / (g.expert_scale as f32) < thr) {
                         skip[k] = true;
                     }
