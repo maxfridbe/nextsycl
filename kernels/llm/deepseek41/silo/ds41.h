@@ -146,6 +146,16 @@ int ns_ds41_std_mmv(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* me
 /* A matrix [rows][cols] in `type` expanded to out [rows][cols] as fp16 (f16 = 1) or float32 */
 int ns_ds41_std_dequant(ns_gpu* g, int type, const void* src, int64_t rows, int64_t cols, void* out, int f16);
 
+/* ---- mmvq.cpp: the same decode products (one column an entry) against activations in a split Q8 layout, dp4a (the
+ * deepseek4 silo's scheme): q8_bytes of ncols x n_in, quantize_q8 x [ncols][n_in] float32 into it */
+size_t ns_ds41_q8_bytes(int64_t n_in, int64_t ncols);
+int ns_ds41_quantize_q8(ns_gpu* g, const float* x, void* xs, int64_t n_in, int64_t ncols);
+/* the types it takes: Q8_0, Q2_K, Q5_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ2_S, MXFP4; n_in a multiple of 256, at most 6144 */
+int ns_ds41_mmvq_supported(int type, int64_t n_in);
+/* std_mmv's table (entries with ncol 0 skipped, column col_0 of xs): y[y0 * n_out + r] = W . x[col_0] */
+int ns_ds41_std_mmvq(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const void* xs, int64_t ncols, float* y,
+                     int64_t n_out, int64_t n_in);
+
 /* ---- q4k.cpp: y [t][ycs] = W . x for a q4_K W [rows][cols], t 1..8 columns of float32 x (column c at x + c xcs); with
  * rpg > 0, row r reads x + (r / rpg) xgs (o_a's groups: a row block its own input) */
 int ns_ds41_q4k_mv(ns_gpu* g, const void* w, int64_t rows, int64_t cols, const float* x, int64_t xcs, int64_t rpg, int64_t xgs, float* y, int64_t ycs,

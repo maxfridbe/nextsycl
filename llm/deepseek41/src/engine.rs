@@ -146,6 +146,12 @@ fn spare_slots() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_usize("NS_DS41_SPARE", 8))
 }
+/// Decode's expert products against split-Q8 activations with dp4a (mmvq.cpp; NS_DS41_STD_Q8, default 1; 0: std.cpp's
+/// float32 kernel)
+fn std_q8() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_STD_Q8", 1) != 0)
+}
 /// A full host tier gives its least recently used expert back to the file for a VRAM expert moved down (NS_DS41_HOST_LRU=1;
 /// default 0: the tier keeps the experts it was loaded with, a VRAM expert with no free host slot is dropped - the LRU
 /// tier measured no gain: tg 12.2 against 12.9 tok/s over 1,024 tokens after a 2.5K-token prompt)
@@ -165,11 +171,32 @@ fn std_oa() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_DS41_STD_OA").is_ok_and(|v| v == "1"))
 }
-/// Attention's and the shared expert's Q8_0 / Q6_K weights requantized to q4_K when loaded (NS_DS41_DENSE_Q4K=1; default 0): half
-/// the bytes a decode token reads and the fused q4_K kernels apply. An approximation - measure the perplexity
+/// Attention's and the shared expert's Q8_0 / Q6_K weights requantized to q4_K when loaded (NS_DS41_DENSE_Q4K=1; default 0):
+/// half the bytes a decode token reads and the fused q4_K kernels apply (NS_DS41_DENSE_Q4K_ROLES: a comma list of qa, qb,
+/// kv, oa, ob, shgate, shup, shdown; default all). Measured alone with a matrix hot in the GPU's cache, Q8_0 looked faster
+/// for the small ones; in decode, cold from VRAM, all eight in q4_K are faster (trace, GPU time a token: 35.0 ms against
+/// 37.4 with only o_a / o_b, 38.7 with none) - and the B65's layers hold Q6_K, whose shared kernel is slow. An
+/// approximation - measure the perplexity
 fn dense_q4k() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_DS41_DENSE_Q4K").is_ok_and(|v| v == "1"))
+}
+fn dense_q4k_role(r: Role) -> bool {
+    static V: std::sync::OnceLock<Vec<Role>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let v = std::env::var("NS_DS41_DENSE_Q4K_ROLES").unwrap_or_else(|_| "qa,qb,kv,oa,ob,shgate,shup,shdown".into());
+        v.split(',').filter_map(|x| match x.trim() {
+            "qa" => Some(Role::QA),
+            "qb" => Some(Role::QB),
+            "kv" => Some(Role::Kv),
+            "oa" => Some(Role::OutA),
+            "ob" => Some(Role::OutB),
+            "shgate" => Some(Role::ShGate),
+            "shup" => Some(Role::ShUp),
+            "shdown" => Some(Role::ShDown),
+            _ => None,
+        }).collect()
+    }).contains(&r)
 }
 /// ... for passes of at least this many tokens (NS_DS41_PROMPT_PREFETCH_MIN, default 4096): below, a layer's compute is too
 /// short to hide anything and the early reads only contend with the layer's own (580 tokens: 12 s -> 16-21 s with it)
@@ -1064,7 +1091,14 @@ impl Part {
                lut: Option<(usize, usize)>, ncmax: usize) -> Result<()> {
         let v = &self.vq[&l];
         if let Some(s) = &v.std {
-            return self.ops.std_mmv(s.ty[if down { 2 } else { 0 }].code(), table, entries, x, y, y_rows, rows, cols, ncmax);
+            let ty = s.ty[if down { 2 } else { 0 }].code();
+            // one column an entry (decode) with x's column count known: the split-Q8 products (NS_DS41_STD_Q8=0: float32)
+            if let Some((xc, _)) = lut.filter(|_| ncmax <= 1 && std_q8() && self.ops.std_mmvq_supported(ty, cols)) {
+                let xs = self.arena.bytes(self.ops.std_q8_bytes(cols, xc))?;
+                self.ops.std_quantize_q8(x, &xs, cols, xc)?;
+                return self.ops.std_mmvq(ty, table, entries, &xs, xc, y, y_rows, rows, cols);
+            }
+            return self.ops.std_mmv(ty, table, entries, x, y, y_rows, rows, cols, ncmax);
         }
         let cb = self.cbs.get(&l).ok_or_else(|| Error(format!("layer {l}: no codebook")))?;
         self.ops.vq_mmv(table, entries, (cb, vq_wide((&self.cbf, &self.cbh), l, var)), x, y, y_rows, rows, cols, v.nbit, var, lut)
@@ -1854,7 +1888,7 @@ impl Part {
                 let cols = *t.shape.last().unwrap_or(&1) as usize;
                 let host = m.file.read(t).map_err(e)?;
                 let to_q4k = dense_q4k() && matches!(t.ty, GType::Q8_0 | GType::Q6K) && n.is_multiple_of(256) && cols.is_multiple_of(256)
-                    && matches!(r, Role::QA | Role::QB | Role::Kv | Role::OutA | Role::OutB | Role::ShGate | Role::ShUp | Role::ShDown);
+                    && dense_q4k_role(r);
                 let (raw, ty) = if to_q4k {
                     let q = crate::requant::to_q4k(&host, n, t.ty == GType::Q6K);
                     let raw = DevBuf::new(gpu, q.len())?;
@@ -3994,6 +4028,11 @@ impl<'g> Ds41<'g> {
                             }
                             None => pick[1] = 0,
                         }
+                    }
+                    // the std kernels' split-Q8 path needs only x's column counts
+                    if p.vq[&l].std.is_some() {
+                        glut = glut.or(Some((t, 0)));
+                        dlut = dlut.or(Some((total, 0)));
                     }
                     let gtab = p.arena.bytes(tb.len())?;
                     p.upload(&gtab, &tb)?;

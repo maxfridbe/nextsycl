@@ -369,6 +369,141 @@ fn kernels_std(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &
         }
         return Ok(());
     }
+    // NS_DS41_MMV_BENCH=1: the decode product's rate per expert type, a layer's six experts a launch as decode runs it,
+    // cycling over 8 sets of 6 different experts (more bytes than the GPU's cache holds)
+    if std::env::var("NS_DS41_MMV_BENCH").is_ok() {
+        // a layer's dense products at one column: the file's type on the shared mmvq, and as q4_K (NS_DS41_DENSE_Q4K's)
+        for l in [0u64, 20] {
+            let (mut tq, mut t4) = (0.0, 0.0);
+            for role in [Role::QA, Role::QB, Role::Kv, Role::OutA, Role::OutB, Role::ShGate, Role::ShUp, Role::ShDown, Role::Router, Role::CompKv,
+                         Role::CompGate, Role::IdxWk, Role::IdxQB, Role::IdxProj] {
+                let Some(t) = m.tensor(l, role) else { continue };
+                if t.shape.len() != 2 {
+                    continue;
+                }
+                let (rows, cols) = (t.shape[0] as usize, t.shape[1] as usize);
+                let raw = f.read(t).map_err(|e| e.0)?;
+                let src = DevBuf::new(g, raw.len().next_multiple_of(256)).map_err(e)?;
+                src.write(0, &raw).map_err(e)?;
+                let x: Vec<f32> = (0..cols).map(|_| rnd()).collect();
+                let xd = DevBuf::from_f32(g, &x).map_err(e)?;
+                let q8 = DevBuf::new(g, o.q8_1_bytes(cols, 1)).map_err(e)?;
+                let y = DevBuf::f32(g, rows).map_err(e)?;
+                let reps = 50;
+                let time = |f: &dyn Fn() -> nextsycl_core::Result<()>| -> Result<f64, String> {
+                    f().map_err(e)?;
+                    g.sync().map_err(e)?;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..reps {
+                        f().map_err(e)?;
+                    }
+                    g.sync().map_err(e)?;
+                    Ok(t0.elapsed().as_secs_f64() * 1e6 / reps as f64)
+                };
+                let a = if o.mmvq_supported(t.ty.code()) {
+                    time(&|| {
+                        o.quantize_q8_1((&xd, 0), &q8, cols, 1)?;
+                        o.mmvq(t.ty.code(), (&src, 0), raw.len(), &q8, (&y, 0), cols, rows, 1)
+                    })?
+                } else {
+                    f64::NAN
+                };
+                let mut line = format!("dense L{l:<2} {:<10} {:<6} [{rows} x {cols}] {:.2} MB: mmvq {a:.1} us = {:.0} GB/s", format!("{role:?}"), t.ty.name(),
+                                       raw.len() as f64 / 1e6, raw.len() as f64 / a / 1e3);
+                if a.is_finite() {
+                    tq += a;
+                }
+                if matches!(t.ty, GType::Q8_0 | GType::Q6K) && cols % 256 == 0 && (rows * cols) % 256 == 0 {
+                    let q = crate::requant::to_q4k(&raw, rows * cols, t.ty == GType::Q6K);
+                    let w4 = DevBuf::new(g, q.len()).map_err(e)?;
+                    w4.write(0, &q).map_err(e)?;
+                    let b = time(&|| o.q4k_mv(&w4, rows, cols, (&xd, 0, cols), None, (&y, 0, rows), 1))?;
+                    t4 += b;
+                    line += &format!("; q4_K {:.2} MB {b:.1} us = {:.0} GB/s", q.len() as f64 / 1e6, q.len() as f64 / b / 1e3);
+                    if o.mmvq_supported(12) {
+                        let c = time(&|| {
+                            o.quantize_q8_1((&xd, 0), &q8, cols, 1)?;
+                            o.mmvq(12, (&w4, 0), q.len(), &q8, (&y, 0), cols, rows, 1)
+                        })?;
+                        line += &format!(", shared mmvq q4_K {c:.1} us = {:.0} GB/s", q.len() as f64 / c / 1e3);
+                    }
+                } else if a.is_finite() {
+                    t4 += a;
+                }
+                println!("{line}");
+            }
+            println!("dense L{l}: one column's products {tq:.0} us in the file's types, {t4:.0} us with q4_K");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for l in 0..gg.n_layer {
+            for (which, role, rows, cols) in [(0usize, Role::ExpGate, ff, d), (2, Role::ExpDown, d, ff)] {
+                let t = m.tensor(l, role).ok_or("an expert tensor is missing")?;
+                if !seen.insert((t.ty.code(), which)) {
+                    continue;
+                }
+                let mat = t.bytes as usize / gg.n_expert as usize;
+                let n = 48usize;
+                let mut raw = vec![0u8; mat * n];
+                f.read_into(t, 0, &mut raw).map_err(|x| x.0)?;
+                let src = DevBuf::new(g, raw.len().next_multiple_of(256)).map_err(e)?;
+                src.write(0, &raw).map_err(e)?;
+                let x: Vec<f32> = (0..cols).map(|_| rnd()).collect();
+                let xd = DevBuf::from_f32(g, &x).map_err(e)?;
+                let tabs = (0..n / 6).map(|s| {
+                    let mut tb: Vec<u8> = Vec::new();
+                    for i in 0..6 {
+                        tb.extend((src.ptr() as u64 + ((s * 6 + i) * mat) as u64).to_le_bytes());
+                    }
+                    for i in 0..6 {
+                        for v in [1i32, i, 0, 0, 0, 0, 0, 0, 0, 0] {
+                            tb.extend(v.to_le_bytes());
+                        }
+                    }
+                    let tab = DevBuf::new(g, tb.len())?;
+                    tab.write(0, &tb)?;
+                    Ok(tab)
+                }).collect::<nextsycl_core::Result<Vec<_>>>().map_err(e)?;
+                let y = DevBuf::f32(g, 6 * rows).map_err(e)?;
+                for tab in &tabs {
+                    o.std_mmv(t.ty.code(), tab, 6, &xd, (&y, 0), 6, rows, cols, 1).map_err(e)?;
+                }
+                g.sync().map_err(e)?;
+                let reps = 20;
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    for tab in &tabs {
+                        o.std_mmv(t.ty.code(), tab, 6, &xd, (&y, 0), 6, rows, cols, 1).map_err(e)?;
+                    }
+                }
+                g.sync().map_err(e)?;
+                let us = t0.elapsed().as_secs_f64() * 1e6 / (reps * tabs.len()) as f64;
+                let mb = 6.0 * mat as f64 / 1e6;
+                let mut q8 = String::from("split Q8: not this type");
+                if o.std_mmvq_supported(t.ty.code(), cols) {
+                    let xs = DevBuf::new(g, o.std_q8_bytes(cols, 1)).map_err(e)?;
+                    let yq = DevBuf::f32(g, 6 * rows).map_err(e)?;
+                    o.std_mmv(t.ty.code(), &tabs[0], 6, &xd, (&y, 0), 6, rows, cols, 1).map_err(e)?;
+                    o.std_quantize_q8(&xd, &xs, cols, 1).map_err(e)?;
+                    o.std_mmvq(t.ty.code(), &tabs[0], 6, &xs, 1, (&yq, 0), 6, rows, cols).map_err(e)?;
+                    g.sync().map_err(e)?;
+                    let (rel, _) = compare(&yq.to_f32().map_err(e)?, &y.to_f32().map_err(e)?);
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..reps {
+                        for tab in &tabs {
+                            o.std_quantize_q8(&xd, &xs, cols, 1).map_err(e)?;
+                            o.std_mmvq(t.ty.code(), tab, 6, &xs, 1, (&yq, 0), 6, rows, cols).map_err(e)?;
+                        }
+                    }
+                    g.sync().map_err(e)?;
+                    let uq = t0.elapsed().as_secs_f64() * 1e6 / (reps * tabs.len()) as f64;
+                    q8 = format!("split Q8 (+quantize) {uq:.1} us = {:.0} GB/s, against float32 rel err {rel:.1e}", mb / uq * 1e3);
+                }
+                println!("mmv {:<8} {:<4} L{l:<2} 6 x [{rows} x {cols}] {mb:.2} MB: float32 {us:.1} us = {:.0} GB/s; {q8}",
+                         t.ty.name(), ["gate", "up", "down"][which], mb / us * 1e3);
+            }
+        }
+        return Ok(());
+    }
     let mut seen = std::collections::BTreeSet::new();
     for l in 0..gg.n_layer {
         for (which, role, rows, cols) in [(0usize, Role::ExpGate, ff, d), (1, Role::ExpUp, ff, d), (2, Role::ExpDown, d, ff)] {

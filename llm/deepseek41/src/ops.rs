@@ -810,6 +810,41 @@ impl Ops {
         };
         self.ok(rc, "ds41_std_mmv")
     }
+    /// whether the split-Q8 decode products (mmvq.cpp) take an expert matrix of this type and width
+    pub fn std_mmvq_supported(&self, ty: u32, cols: usize) -> bool {
+        // SAFETY: a capability query.
+        unsafe { (self.k.ds41_mmvq_supported)(ty as i32, cols as i64) != 0 }
+    }
+    /// bytes of `ncols` columns of `n_in` activations in the split Q8 layout
+    pub fn std_q8_bytes(&self, n_in: usize, ncols: usize) -> usize {
+        // SAFETY: arithmetic only.
+        unsafe { (self.k.ds41_q8_bytes)(n_in as i64, ncols as i64) }
+    }
+    /// x [ncols][n_in] float32 into the split Q8 layout
+    pub fn std_quantize_q8(&self, x: &DevBuf, xs: &DevBuf, n_in: usize, ncols: usize) -> Result<()> {
+        need!(x, ncols * n_in, "std_quantize_q8 x");
+        xs.bounds(0, self.std_q8_bytes(n_in, ncols))?;
+        // SAFETY: sizes checked.
+        let rc = unsafe { (self.k.ds41_quantize_q8)(self.raw(), x.fp(), xs.ptr(), n_in as i64, ncols as i64) };
+        self.ok(rc, "ds41_quantize_q8")
+    }
+    /// std_mmv at one column an entry against split-Q8 activations (`ncols` columns of `cols`): y[y0 * rows + r]
+    #[allow(clippy::too_many_arguments)]
+    pub fn std_mmvq(&self, ty: u32, table: &DevBuf, entries: usize, xs: &DevBuf, ncols: usize, y: (&DevBuf, usize), y_rows: usize, rows: usize, cols: usize) -> Result<()> {
+        if entries == 0 {
+            return Ok(());
+        }
+        table.bounds(0, entries * 48)?;
+        xs.bounds(0, self.std_q8_bytes(cols, ncols))?;
+        need!(y.0, y.1 + y_rows * rows, "std_mmvq y");
+        // SAFETY: sizes checked; the pointers are VRAM / pinned slots of this GPU holding the matrices.
+        let rc = unsafe {
+            let base = table.ptr().cast::<u8>();
+            (self.k.ds41_std_mmvq)(self.raw(), ty as i32, base.cast(), base.add(entries * 8).cast(), entries as i64, xs.ptr(), ncols as i64, y.0.fp().add(y.1),
+                                   rows as i64, cols as i64)
+        };
+        self.ok(rc, "ds41_std_mmvq")
+    }
     /// A prompt pass's expert product on XMX from the indices: y [n][ldy] (from float y.1) = x [n][cols] (fp16, rows ldx
     /// apart, its buffer readable to a multiple of 64 rows) . W^T; W's rows < split from payload p0, the rest from p1
     #[allow(clippy::too_many_arguments)]
