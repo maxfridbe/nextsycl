@@ -43,15 +43,21 @@ quants ([deepseek41-unsloth.md](deepseek41-unsloth.md)).
 
 | | XQ v3 | UD-IQ2_XXS | UD-Q2_K_XL |
 |---|---|---|---|
-| tg, 512 tokens after a short prompt, exact / `-fast` | 10.1 / 20.7 tok/s | 12.7 / 21.4 | 8.8 / 19.2 |
+| tg, 512 tokens after a short prompt, exact / `-fast` | 10.1 / 21.8-22.4 tok/s | 12.7 / 21.4 | 8.8 / 19.2 |
 | pp exact, 580 / 2,561 / 9,901 tokens | 67 / 99 / 254 tok/s | - | 42 / 92 / 280 |
 | pp `-fast`, 2,561 / 9,901 tokens | 187 / 257 tok/s | - | 138 / 300 |
 | perplexity, 700 tokens of Gutenberg prose (gut1 / gut2), exact | 1.281 / 1.375 | 1.228 / - | 1.211 / 1.281 |
 
 The quant is a little worse than UD-IQ2_XXS on human text (Xolotl's own numbers put it ~15% above the FP8 original).
 How tg got there (512 tokens, exact / `-fast`): the float32 mixed kernel 6.75 / 11.0; split-Q8 products 8.2 / 15.7;
-stores by expert size 9.35 / 16.3; q4_K Engram projection and PTQ1_0 four trits at a time 10.1 / 20.6. `-fast` decode
-GPU time a token: attention 16.4 ms (as UD-IQ2_XXS), expert products ~4.6 ms (3.4), Engram 0.6 ms.
+stores by expert size 9.35 / 16.3; q4_K Engram projection and PTQ1_0 four trits at a time 10.1 / 20.6; the mixed
+product on the large register file (`grf_size<256>`: the one kernel with three loaders spilled) and Q3_K's scales in two
+loads - / 21.8-22.4 (runs of the same build differ by ~0.5).
+
+Tried and left out: a launch a type (each type ~2x faster alone, but a 30-60 us floor a launch with a token's 1-3
+experts of it: no faster); the rows staged through local memory (slower: the loaders' arithmetic, not the loads, bound
+it); 2-byte loads for Q3_K (2-3x slower); q_b on the split-Q8 kernel (70 against 106 us alone, no faster end to end);
+the file's Q8_0 attention instead of q4_K (faster a product cold, but twice the VRAM: 17-20 against 22 tok/s).
 
 ## Open
 
