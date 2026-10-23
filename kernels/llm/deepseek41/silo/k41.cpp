@@ -489,7 +489,8 @@ int ns_ds41_cand_pos(ns_gpu* g, const int32_t* selc, const int32_t* cand, int32_
 // ptrs[2u], meta[2u][10], the lookup lists [33]) and down entries (dtab: ptrs[u], meta[u][10], lists [u][33]), an expert
 // row j of dn in ascending id. info: ids[u] (ascending), weights[u] (bits), missing[u] (no VRAM slot: computed by the
 // host after it reads this). An expert not in VRAM gets an entry of no columns on a resident payload (`dummy`). tags
-// (or null): each expert's type word, ORed into its entries' first meta word (the XQ file's mixed products).
+// (or null): the XQ file's - each expert's type word (bits 8-15, ORed into its entries' first meta word: the mixed
+// products) and its up matrix's place in its slot / 256 (bits 16-31; gate at 0, down at twice up), for off_*.
 int ns_ds41_route1(ns_gpu* g, const float* logits, const float* bias, int64_t ne, int64_t used, float scale, const uint64_t* tab, uint64_t dummy,
                    int64_t off_gate, int64_t off_up, int64_t off_down, uint8_t* gtab, uint8_t* dtab, int32_t* info, int32_t* ctab, const int32_t* tags) {
     NS_TRY
@@ -552,7 +553,10 @@ int ns_ds41_route1(ns_gpu* g, const float* logits, const float* bias, int64_t ne
                 const uint64_t base = tab[id[r]];
                 const bool res = base != 0;
                 const uint64_t b = res ? base : dummy;
-                const int32_t one = res ? 1 | (tags ? tags[id[r]] : 0) : 0;
+                const int32_t tg = tags ? tags[id[r]] : 0;
+                const int32_t one = res ? 1 | (tg & 0xff00) : 0;
+                const uint64_t o_up = tags ? (uint64_t) ((uint32_t) tg >> 16) * 256 : (uint64_t) off_up;
+                const uint64_t o_gate = tags ? 0 : (uint64_t) off_gate, o_down = tags ? 2 * o_up : (uint64_t) off_down;
                 info[j] = id[r];
                 info[used + j] = sycl::bit_cast<int32_t>(wr[r]);
                 // the combine's table (moe_combine: t_ptr [2], ent [u], then the weights)
@@ -561,13 +565,13 @@ int ns_ds41_route1(ns_gpu* g, const float* logits, const float* bias, int64_t ne
                 info[2 * used + j] = res ? 0 : 1;
                 for (int w = 0; w < 2; ++w) {
                     const int e = w * (int) used + j;
-                    gp[e] = b + (uint64_t) (w == 0 ? off_gate : off_up);
+                    gp[e] = b + (w == 0 ? o_gate : o_up);
                     int32_t* me = gm + e * 10;
                     me[0] = one;
                     me[1] = e;
                     for (int c = 2; c < 10; ++c) me[c] = 0;
                 }
-                dp[j] = b + (uint64_t) off_down;
+                dp[j] = b + o_down;
                 int32_t* me = dm + j * 10;
                 me[0] = one;
                 me[1] = j;

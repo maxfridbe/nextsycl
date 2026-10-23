@@ -581,7 +581,7 @@ fn kernels_std(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &
                     tq += a;
                 }
                 if matches!(t.ty, GType::Q8_0 | GType::Q6K) && cols % 256 == 0 && (rows * cols) % 256 == 0 {
-                    let q = crate::requant::to_q4k(&raw, rows * cols, t.ty == GType::Q6K);
+                    let q = crate::requant::to_q4k(&raw, rows * cols, if t.ty == GType::Q6K { crate::requant::From::Q6K } else { crate::requant::From::Q8_0 });
                     let w4 = DevBuf::new(g, q.len()).map_err(e)?;
                     w4.write(0, &q).map_err(e)?;
                     let b = time(&|| o.q4k_mv(&w4, rows, cols, (&xd, 0, cols), None, (&y, 0, rows), 1))?;
@@ -612,7 +612,7 @@ fn kernels_std(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &
                 }
                 let (rows, cols) = (t.shape[0] as usize, t.shape[1] as usize);
                 let raw = f.read(t).map_err(|e| e.0)?;
-                let q = crate::requant::to_q4k(&raw, rows * cols, t.ty == GType::Q6K);
+                let q = crate::requant::to_q4k(&raw, rows * cols, if t.ty == GType::Q6K { crate::requant::From::Q6K } else { crate::requant::From::Q8_0 });
                 let w = DevBuf::new(g, q.len()).map_err(e)?;
                 w.write(0, &q).map_err(e)?;
                 let w8 = DevBuf::new(g, raw.len().next_multiple_of(256)).map_err(e)?;

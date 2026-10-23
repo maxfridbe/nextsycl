@@ -485,8 +485,8 @@ struct StdExp {
 }
 
 /// The XQ file's layer: its experts in up to three types (index 0 Q3_K, 1 Q2_0, 2 PTQ1_0), a tensor a type and role
-/// holding that type's experts in id order. A slot's layout is the layer's: gate at 0, up at the largest gate's bytes,
-/// down after both (`LayerVq`'s gate / up / down), whatever an expert's types.
+/// holding that type's experts in id order. An expert's slot holds its own three matrices back to back (`LayerVq::lay`),
+/// in a store of its own size; `LayerVq`'s gate / up / down / span are the layer's widest.
 struct XqExp {
     /// [type][gate, up, down]
     t: [[Option<Tensor>; 3]; 3],
@@ -515,6 +515,22 @@ impl LayerVq {
             None => 0,
         }
     }
+    /// Expert x's place in its slot: gate, up and down's first bytes and its span - the XQ file's its own types' (back to
+    /// back), every other form's the layer's
+    fn lay(&self, x: u64) -> (usize, usize, usize, usize) {
+        match self.std.as_ref().and_then(|s| s.xq.as_ref()) {
+            Some(q) => {
+                let (gt, _, dt, _) = q.ex[x as usize];
+                let g = q.gu_mat[gt as usize];
+                (0, g, 2 * g, 2 * g + q.down_mat[dt as usize])
+            }
+            None => (self.gate, self.up, self.down, self.span),
+        }
+    }
+    /// the slot size expert x is kept in (its store's)
+    fn slot_of(&self, x: u64) -> usize {
+        self.lay(x).3.next_multiple_of(256)
+    }
     /// Expert x's matrix `which` (0 gate, 1 up, 2 down): its tensor, its first byte in it, its bytes, its type
     fn mat_of(&self, x: u64, which: usize) -> Option<(&Tensor, u64, usize, GType)> {
         let s = self.std.as_ref()?;
@@ -527,9 +543,10 @@ impl LayerVq {
             None => Some((&s.t[which], x * s.mat[which] as u64, s.mat[which], s.ty[which])),
         }
     }
-    /// where matrix `which` starts in a slot
-    fn mat_at(&self, which: usize) -> usize {
-        [self.gate, self.up, self.down][which]
+    /// where expert x's matrix `which` starts in its slot
+    fn mat_at(&self, x: u64, which: usize) -> usize {
+        let (g, u, d, _) = self.lay(x);
+        [g, u, d][which]
     }
 }
 
@@ -672,7 +689,7 @@ fn read_expert(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8]) -> Result<()> 
     if vq.std.is_some() {
         for i in 0..3 {
             let (t, off, n, _) = vq.mat_of(ex, i).ok_or("an expert's matrix")?;
-            let at = vq.mat_at(i);
+            let at = vq.mat_at(ex, i);
             read_slab(m, t, off, &mut host[at..at + n], false)?;
         }
         return Ok(());
@@ -686,8 +703,9 @@ fn read_expert_par(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8], force: boo
     if vq.std.is_none() {
         return read_expert(m, vq, ex, host);
     }
-    let (a, rest) = host.split_at_mut(vq.up);
-    let (b, c) = rest.split_at_mut(vq.down - vq.up);
+    let (_, up, down, _) = vq.lay(ex);
+    let (a, rest) = host.split_at_mut(up);
+    let (b, c) = rest.split_at_mut(down - up);
     let res: Vec<Result<()>> = std::thread::scope(|sc| {
         let hs: Vec<_> = [(0usize, a), (1, b), (2, c)].into_iter().map(|(i, buf)| {
             sc.spawn(move || {
@@ -795,7 +813,7 @@ fn expert_segs(vq: &LayerVq, x: u64, dst: usize) -> Vec<(usize, u64, usize, usiz
     match &vq.std {
         Some(_) => (0..3).filter_map(|i| {
             let (t, off, n, _) = vq.mat_of(x, i)?;
-            Some((t.shard, t.offset + off, n, dst + vq.mat_at(i)))
+            Some((t.shard, t.offset + off, n, dst + vq.mat_at(x, i)))
         }).collect(),
         None => vec![(vq.blob.shard, vq.blob.offset + vq.starts[x as usize], vq.span, dst)],
     }
@@ -940,9 +958,10 @@ pub struct Part {
     cbh: HashMap<u64, DevBuf>,
     /// the decode products' kernel variant by index width: [gate | up, down] (measured at load: vq_pick)
     vq_pick: HashMap<usize, [i32; 2]>,
-    /// the expert stores (one a span size) and the store of each layer
+    /// the expert stores (one a slot size) and each (layer, slot size)'s - an expert's slot size is LayerVq::slot_of: one
+    /// for every expert of a layer but the XQ file's, whose experts' sizes follow their types
     stores: Vec<Mutex<Store>>,
-    store_of: HashMap<u64, usize>,
+    store_of: HashMap<(u64, usize), usize>,
     /// the towers' experts, all in VRAM (the last part): a buffer a tower
     draft: HashMap<u64, DevBuf>,
     hold: std::sync::atomic::AtomicBool,
@@ -971,7 +990,8 @@ pub struct Part {
     reader: Option<FileReader>,
     /// the slot table the GPU routes decode by: [layer][expert] -> the VRAM payload's address, 0 when not in VRAM
     devtab: DevBuf,
-    /// the XQ file's: [layer][expert] -> its type word (LayerVq::tag) for the GPU routing's tables
+    /// the XQ file's: [layer][expert] -> its type word (LayerVq::tag) and its up's place in its slot / 256 (bits 16-31)
+    /// for the GPU routing's tables
     xtags: Option<DevBuf>,
     /// a prompt pass's pinned slots for the experts only the file holds: read on threads while the GPU multiplies the
     /// others, then copied up through the ring; the copy last reading each slot
@@ -1415,13 +1435,36 @@ impl Part {
         Ok((self.mm(l1, r1, x, t)?, self.mm(l2, r2, x, t)?))
     }
 
-    fn store(&self, l: u64) -> Result<&Mutex<Store>> {
-        self.store_of.get(&l).map(|&i| &self.stores[i]).ok_or_else(|| Error(format!("block {l}: no expert store on this GPU")))
+    /// the store holding layer l's expert x
+    fn store_ix(&self, l: u64, x: u64) -> Option<usize> {
+        self.store_of.get(&(l, self.vq.get(&l)?.slot_of(x))).copied()
+    }
+    /// layer l's stores (several only for the XQ file)
+    fn stores_of(&self, l: u64) -> Vec<usize> {
+        let mut v: Vec<usize> = self.store_of.iter().filter(|((ly, _), _)| *ly == l).map(|(_, &i)| i).collect();
+        v.sort_unstable();
+        v
+    }
+    /// `xs`' positions grouped by their store, the stores in the order their first expert comes
+    fn by_store(&self, l: u64, xs: &[u64]) -> Result<Vec<(usize, Vec<usize>)>> {
+        let mut out: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (k, &x) in xs.iter().enumerate() {
+            let si = self.store_ix(l, x).ok_or_else(|| Error(format!("block {l}: no expert store on this GPU")))?;
+            match out.iter_mut().find(|(i, _)| *i == si) {
+                Some((_, v)) => v.push(k),
+                None => out.push((si, vec![k])),
+            }
+        }
+        Ok(out)
+    }
+    /// f on the store holding layer l's expert x (None: no store of the layer here)
+    fn with_store<R>(&self, l: u64, x: u64, f: impl FnOnce(&mut Store) -> R) -> Option<R> {
+        let si = self.store_ix(l, x)?;
+        let mut c = self.stores[si].lock().unwrap();
+        Some(f(&mut c))
     }
 
-    /// Where every expert of `need` (layer l) is read from, as a view of its slot: `promote` makes each VRAM-resident
-    /// (decode), else host-slot experts are read in place. The second value marks the experts whose copy is on its way,
-    /// the third the last copy's ticket.
+    /// `ensure` over the stores `need` spans (one but for the XQ file), the results in `need`'s order
     #[allow(clippy::type_complexity)]
     fn ensure(&self, m: &Model, l: u64, need: &[u64], promote: bool) -> Result<(Vec<DevBuf>, Vec<bool>, Option<i64>)> {
         if let Some(buf) = self.draft.get(&l) {
@@ -1429,8 +1472,35 @@ impl Part {
             let v = need.iter().map(|x| buf.view(*x as usize * span, span)).collect::<Result<Vec<_>>>()?;
             return Ok((v, vec![false; need.len()], None));
         }
+        let groups = self.by_store(l, need)?;
+        if groups.len() == 1 {
+            return self.ensure_in(m, groups[0].0, l, need, promote);
+        }
+        let mut slots: Vec<Option<DevBuf>> = (0..need.len()).map(|_| None).collect();
+        let mut arriving = vec![false; need.len()];
+        let mut last: Option<i64> = None;
+        for (si, ks) in groups {
+            let sub: Vec<u64> = ks.iter().map(|&k| need[k]).collect();
+            let (v, a, t) = self.ensure_in(m, si, l, &sub, promote)?;
+            for ((k, v), a) in ks.into_iter().zip(v).zip(a) {
+                slots[k] = Some(v);
+                arriving[k] = a;
+            }
+            last = match (last, t) {
+                (Some(x), Some(y)) => Some(x.max(y)),
+                (x, y) => x.or(y),
+            };
+        }
+        Ok((slots.into_iter().map(|v| v.ok_or_else(|| Error("ensure: an expert without a slot".into()))).collect::<Result<_>>()?, arriving, last))
+    }
+
+    /// Where every expert of `need` (layer l) is read from, as a view of its slot: `promote` makes each VRAM-resident
+    /// (decode), else host-slot experts are read in place. The second value marks the experts whose copy is on its way,
+    /// the third the last copy's ticket.
+    #[allow(clippy::type_complexity)]
+    fn ensure_in(&self, m: &Model, si: usize, l: u64, need: &[u64], promote: bool) -> Result<(Vec<DevBuf>, Vec<bool>, Option<i64>)> {
         let vq = &self.vq[&l];
-        let mut c = self.store(l)?.lock().unwrap();
+        let mut c = self.stores[si].lock().unwrap();
         let c = &mut *c;
         if c.vowner.len() < need.len() {
             return Err(Error(format!("the expert store has {} VRAM slots; one layer needs {}", c.vowner.len(), need.len())));
@@ -1528,15 +1598,17 @@ impl Part {
     /// A prompt pass's experts of `need` (layer l) where they are, nothing moved: a VRAM slot, a pinned host slot, or the
     /// file only
     fn locate(&self, l: u64, need: &[u64]) -> Result<Vec<Src>> {
-        let mut c = self.store(l)?.lock().unwrap();
+        let mut out: Vec<Option<Src>> = (0..need.len()).map(|_| None).collect();
+        for (si, ks) in self.by_store(l, need)? {
+        let mut c = self.stores[si].lock().unwrap();
         let c = &mut *c;
         c.tick += 1;
         c.rmark = None;
         let tick = c.tick;
         let sb = c.slot_bytes;
-        let mut out = Vec::with_capacity(need.len());
-        for &ex in need {
-            out.push(match c.loc.get(&(l, ex)).copied() {
+        for k in ks {
+            let ex = need[k];
+            out[k] = Some(match c.loc.get(&(l, ex)).copied() {
                 Some(Loc::V(s)) => {
                     c.hits += 1;
                     c.vused[s] = tick;
@@ -1559,7 +1631,8 @@ impl Part {
         for t in [c.last_up, c.down_any.take()].into_iter().flatten() {
             self.ops.await_ticket(t)?;
         }
-        Ok(out)
+        }
+        out.into_iter().map(|v| v.ok_or_else(|| Error("locate: an expert without a place".into()))).collect()
     }
 
     /// Experts (k, ex) of layer l only the file holds, their reads started on the reader pool into the pinned prompt slots
@@ -1615,24 +1688,30 @@ impl Part {
                 done.wait()?;
                 FILE_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 let i = *i;
-                let v = buf.lock().unwrap().device_view(i * sb, vq.span)?;
-                let t = self.ops.stream_copy_on(1, ring, s * rs, &v, 0, vq.span, &[free[s]])?;
+                let span = vq.lay(need[k]).3;
+                let v = buf.lock().unwrap().device_view(i * sb, span)?;
+                let t = self.ops.stream_copy_on(1, ring, s * rs, &v, 0, span, &[free[s]])?;
                 tks.lock().unwrap()[i] = Some(t);
                 last = Some(t);
             } else {
                 rest.push((k, s));
             }
         }
-        let files: Vec<u64> = rest.iter().filter(|(k, _)| matches!(src[*k], Src::F)).map(|(k, _)| need[*k]).collect();
-        let mut c = self.store(l)?.lock().unwrap();
+        // the rest by store (the XQ file's experts in several): the file's read into its staging slots, then copied up
+        let rest_x: Vec<u64> = rest.iter().map(|(k, _)| need[*k]).collect();
+        for (si, ix) in self.by_store(l, &rest_x)? {
+        let mut grp: Vec<(usize, usize)> = ix.iter().map(|&i| rest[i]).collect();
+        let files: Vec<u64> = grp.iter().filter(|(k, _)| matches!(src[*k], Src::F)).map(|(k, _)| need[*k]).collect();
+        let mut c = self.stores[si].lock().unwrap();
         let c = &mut *c;
         let staged = if files.is_empty() { HashMap::new() } else { self.stage_reads(m, vq, c, l, &files)? };
         let sb = c.slot_bytes;
         // the staged ones first (their slots held until copied up)
-        rest.sort_by_key(|(k, _)| !staged.contains_key(&need[*k]));
-        for &(k, s) in &rest {
+        grp.sort_by_key(|(k, _)| !staged.contains_key(&need[*k]));
+        for &(k, s) in &grp {
+            let span = vq.lay(need[k]).3;
             let from = match &src[k] {
-                Src::R(h) => h.view(0, vq.span)?,
+                Src::R(h) => h.view(0, span)?,
                 Src::F => {
                     let st = match staged.get(&need[k]) {
                         Some(&st) => st,
@@ -1642,8 +1721,8 @@ impl Part {
                             st
                         }
                     };
-                    let v = c.stage.device_view(st * sb, vq.span)?;
-                    let t = self.ops.stream_copy_on(1, ring, s * rs, &v, 0, vq.span, &[free[s]])?;
+                    let v = c.stage.device_view(st * sb, span)?;
+                    let t = self.ops.stream_copy_on(1, ring, s * rs, &v, 0, span, &[free[s]])?;
                     c.stage_tk[st] = Some(t);
                     c.stage_held[st] = false;
                     last = Some(t);
@@ -1651,8 +1730,9 @@ impl Part {
                 }
                 Src::V(_) => return Err(Error("stage_up: an expert in VRAM".into())),
             };
-            let t = self.ops.stream_copy_on(1, ring, s * rs, &from, 0, vq.span, &[free[s]])?;
+            let t = self.ops.stream_copy_on(1, ring, s * rs, &from, 0, span, &[free[s]])?;
             last = Some(t);
+        }
         }
         for &s in slots {
             views.push(ring.view(s * rs, *rs)?);
@@ -1693,7 +1773,7 @@ impl Part {
                 let (rch, ro) = c.rat(r);
                 let deps = [down, c.rwrite.get(&r).copied(), zero];
                 let host = c.host[rch].device_view(ro, sb)?;
-                let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &host, 0, vq.span, &deps)?;
+                let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &host, 0, vq.lay(ex).3, &deps)?;
                 reading.insert(r, t);
                 c.rread.insert(r, t);
                 c.rfree.push(r);
@@ -1712,7 +1792,7 @@ impl Part {
                         k
                     }
                 };
-                let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &c.stage.device_view(k * sb, sb)?, 0, vq.span, &[down, fill, zero])?;
+                let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &c.stage.device_view(k * sb, sb)?, 0, vq.lay(ex).3, &[down, fill, zero])?;
                 c.stage_tk[k] = Some(t);
                 c.stage_held[k] = false;
                 c.vfill.insert(s, t);
@@ -1844,9 +1924,21 @@ impl Part {
 
     /// Decode: the file's experts among `want` (layer l's likely ones) read ahead into staging slots, at most `limit`
     fn read_ahead(&self, l: u64, want: &[u64], limit: usize) -> Result<usize> {
-        let (Some(rd), Ok(st)) = (&self.reader, self.store(l)) else { return Ok(0) };
+        let Ok(groups) = self.by_store(l, want) else { return Ok(0) };
+        let mut n = 0;
+        for (si, ks) in groups {
+            if n >= limit {
+                break;
+            }
+            let sub: Vec<u64> = ks.iter().map(|&k| want[k]).collect();
+            n += self.read_ahead_in(si, l, &sub, limit - n)?;
+        }
+        Ok(n)
+    }
+    fn read_ahead_in(&self, si: usize, l: u64, want: &[u64], limit: usize) -> Result<usize> {
+        let Some(rd) = &self.reader else { return Ok(0) };
         let vq = &self.vq[&l];
-        let mut c = st.lock().unwrap();
+        let mut c = self.stores[si].lock().unwrap();
         let c = &mut *c;
         let xs: Vec<u64> = want.iter().copied().filter(|x| !c.loc.contains_key(&(l, *x)) && !c.ahead.contains_key(&(l, *x))).take(limit).collect();
         let sb = c.slot_bytes;
@@ -1907,14 +1999,25 @@ impl Part {
 
     /// Decode: the experts layer l is expected to want, swapped in now (only ones in host memory; at most `limit`)
     fn prefetch(&self, m: &Model, l: u64, want: &[u64], limit: usize) -> Result<()> {
-        let Ok(st) = self.store(l) else { return Ok(()) };
+        let Ok(groups) = self.by_store(l, want) else { return Ok(()) };
+        let mut n = 0;
+        for (si, ks) in groups {
+            if n >= limit {
+                break;
+            }
+            let sub: Vec<u64> = ks.iter().map(|&k| want[k]).collect();
+            n += self.prefetch_in(m, si, l, &sub, limit - n)?;
+        }
+        Ok(())
+    }
+    fn prefetch_in(&self, m: &Model, si: usize, l: u64, want: &[u64], limit: usize) -> Result<usize> {
         let vq = &self.vq[&l];
-        let mut c = st.lock().unwrap();
+        let mut c = self.stores[si].lock().unwrap();
         let c = &mut *c;
         let tick = c.tick;
         let cand: Vec<u64> = want.iter().copied().filter(|ex| matches!(c.loc.get(&(l, *ex)), Some(Loc::R(_)))).take(limit).collect();
         if cand.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let order = c.victims(tick, cand.len());
         let mut reading: HashMap<usize, i64> = HashMap::new();
@@ -1926,7 +2029,8 @@ impl Part {
             }
             c.vused[s] = tick;
         }
-        self.keep_spare(c, tick, &reading)
+        self.keep_spare(c, tick, &reading)?;
+        Ok(cand.len())
     }
 }
 
@@ -2097,7 +2201,7 @@ fn vq_wide<'a>(wide: (&'a HashMap<u64, DevBuf>, &'a HashMap<u64, DevBuf>), l: u6
 #[allow(clippy::too_many_arguments)]
 fn vq_pick(o: &Ops, g: &crate::model::Geometry, vq: &HashMap<u64, LayerVq>, cbs: &HashMap<u64, DevBuf>, wide: (&HashMap<u64, DevBuf>, &HashMap<u64, DevBuf>),
            stores: &[Mutex<Store>],
-           store_of: &HashMap<u64, usize>, draft: &HashMap<u64, DevBuf>, mtp: bool, log: &mut dyn FnMut(String)) -> Result<HashMap<usize, [i32; 2]>> {
+           store_of: &HashMap<(u64, usize), usize>, draft: &HashMap<u64, DevBuf>, mtp: bool, log: &mut dyn FnMut(String)) -> Result<HashMap<usize, [i32; 2]>> {
     let mut out = HashMap::new();
     if let Some(v) = std::env::var("NS_DS41_VQ_V").ok().and_then(|v| v.parse::<i32>().ok()) {
         for l in vq.values().filter(|l| l.std.is_none()) {
@@ -2114,7 +2218,7 @@ fn vq_pick(o: &Ops, g: &crate::model::Geometry, vq: &HashMap<u64, LayerVq>, cbs:
             continue;
         }
         // six of the layer's experts in VRAM: the store's slots it owns, or the towers' buffer
-        let bases: Vec<u64> = match (draft.get(&l), store_of.get(&l)) {
+        let bases: Vec<u64> = match (draft.get(&l), store_of.get(&(l, v.span.next_multiple_of(256)))) {
             (Some(buf), _) => (0..6).map(|x| buf.ptr() as u64 + (x * v.span.next_multiple_of(256)) as u64).collect(),
             (None, Some(&si)) => {
                 let c = stores[si].lock().unwrap();
@@ -2222,10 +2326,17 @@ impl Part {
                         GType::Q8_0 => dense_q4k_role(r),
                         // the shared Q6_K product is slow: a Q6_K one of the eight always
                         GType::Q6K => matches!(r, Role::QA | Role::QB | Role::Kv | Role::OutA | Role::OutB | Role::ShGate | Role::ShUp | Role::ShDown),
+                        // the XQ file's Engram projection: as float32, 630 MB read a token at each Engram layer
+                        GType::F16 => r == Role::EngramWkv,
                         _ => false,
                     };
                 let (raw, ty) = if to_q4k {
-                    let q = crate::requant::to_q4k(&host, n, t.ty == GType::Q6K);
+                    let from = match t.ty {
+                        GType::Q6K => crate::requant::From::Q6K,
+                        GType::F16 => crate::requant::From::F16,
+                        _ => crate::requant::From::Q8_0,
+                    };
+                    let q = crate::requant::to_q4k(&host, n, from);
                     let raw = DevBuf::new(gpu, q.len())?;
                     raw.write(0, &q)?;
                     bytes += q.len() as u64;
@@ -2240,7 +2351,7 @@ impl Part {
                     let f = DevBuf::f32(gpu, n)?;
                     ops.dequant(t.ty.code(), &raw, 0, t.bytes as usize, n, &f)?;
                     vecs.insert((l, r), f);
-                } else if matches!(t.ty, GType::F32 | GType::F16 | GType::BF16) {
+                } else if !to_q4k && matches!(t.ty, GType::F32 | GType::F16 | GType::BF16) {
                     let f = DevBuf::f32(gpu, n)?;
                     ops.dequant(t.ty.code(), &raw, 0, t.bytes as usize, n, &f)?;
                     mats.insert((l, r), Mat { buf: f, ty: GType::F32, rows: n / cols, cols });
@@ -2327,12 +2438,21 @@ impl Part {
         if !towers.is_empty() {
             log(format!("{}: the {} draft towers' experts in VRAM ({:.2} GiB)", gpu.name, towers.len(), gib(draft_bytes)));
         }
-        // the stores: one a span size, VRAM and the mirror shared by their experts' bytes
-        let mut classes: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
-        for l in layers.clone() {
-            classes.entry(vq[&l].span.next_multiple_of(256)).or_default().push(l);
+        // the stores: one a slot size (LayerVq::slot_of: a layer's span, or for the XQ file each expert's own), VRAM and
+        // the mirror shared by their experts' bytes. Without a profile, every layer the same share of VRAM, host memory
+        // and the file (expert-major order: in layer order the last layers were the file's alone - a prompt pass read all
+        // of their experts from the file)
+        let by_layer = std::env::var("NS_DS41_PLACE").is_ok_and(|v| v == "layer");
+        let keys: Vec<(u64, u64)> = if by_layer {
+            layers.clone().flat_map(|l| (0..g.n_expert).map(move |x| (l, x))).collect()
+        } else {
+            (0..g.n_expert).flat_map(|x| layers.clone().map(move |l| (l, x))).collect()
+        };
+        let mut classes: BTreeMap<usize, Vec<(u64, u64)>> = BTreeMap::new();
+        for k in keys {
+            classes.entry(vq[&k.0].slot_of(k.1)).or_default().push(k);
         }
-        let total_bytes: usize = classes.iter().map(|(sb, ls)| sb * ls.len() * g.n_expert as usize).sum::<usize>().max(1);
+        let total_bytes: usize = classes.iter().map(|(sb, ks)| sb * ks.len()).sum::<usize>().max(1);
         let ring_slot = classes.keys().copied().max().unwrap_or(0);
         let ring_bytes = prompt_ring() * ring_slot;
         let budget = match expert_bytes {
@@ -2342,17 +2462,44 @@ impl Part {
                 (f as usize).saturating_sub(pass + arena_bytes() + SMALL_ARENA + kv_reserve + keep_free() + ring_bytes + (512 << 20))
             }),
         };
+        // with several stores and a profile, each gets the slots its experts take in the profile's ranking over all of
+        // them (VRAM first, then host memory); without, each the share of its bytes
+        let ranked: Option<HashMap<usize, (usize, usize)>> = expert_profile().filter(|_| classes.len() > 1).map(|prof| {
+            let mut all: Vec<(usize, (u64, u64))> = classes.iter().flat_map(|(sb, ks)| ks.iter().map(move |k| (*sb, *k))).collect();
+            all.sort_by_key(|(_, k)| std::cmp::Reverse(prof.get(k).copied().unwrap_or(0.0) as u64));
+            let (mut out, mut used): (HashMap<usize, (usize, usize)>, usize) = (HashMap::new(), 0);
+            for (sb, _) in all {
+                used += sb;
+                let e = out.entry(sb).or_insert((0, 0));
+                if used <= budget {
+                    e.0 += 1;
+                } else if used <= budget + mirror_bytes {
+                    e.1 += 1;
+                } else {
+                    break;
+                }
+            }
+            out
+        });
         let mut stores = Vec::new();
         let mut store_of = HashMap::new();
         let (mut nv_all, mut nr_all) = (0, 0);
         let t0 = Instant::now();
-        for (slot_bytes, ls) in &classes {
+        for (slot_bytes, ks) in &classes {
             let slot_bytes = *slot_bytes;
-            let n_exp = ls.len() * g.n_expert as usize;
+            let n_exp = ks.len();
             let share = |b: usize| (b as u128 * (slot_bytes * n_exp) as u128 / total_bytes as u128) as usize;
             let per_chunk = (CHUNK / slot_bytes).max(1);
-            let nv = (share(budget) / slot_bytes).min(n_exp);
-            let nr = if n_exp > nv { (share(mirror_bytes) / slot_bytes).min(n_exp - nv + 1) } else { 0 };
+            let (nv, nr) = match ranked.as_ref() {
+                Some(r) => r.get(&slot_bytes).copied().unwrap_or((0, 0)),
+                None => (share(budget) / slot_bytes, share(mirror_bytes) / slot_bytes),
+            };
+            // a decode pass of 8 rows can want 48 of a layer's experts from one store
+            let nv = nv.max(64).min(n_exp);
+            let nr = if n_exp > nv { nr.min(n_exp - nv + 1) } else { 0 };
+            let mut ls: Vec<u64> = ks.iter().map(|k| k.0).collect();
+            ls.sort_unstable();
+            ls.dedup();
             let mut vram = Vec::new();
             let mut have = 0;
             while have < nv {
@@ -2367,13 +2514,7 @@ impl Part {
                 host.push(HostBuf::new(gpu, k * slot_bytes)?);
                 have += k;
             }
-            // without a profile, every layer the same share of VRAM, host memory and the file (expert-major order): in
-            // layer order the last layers were the file's alone - a prompt pass read all of their experts from the file
-            let mut all: Vec<(u64, u64)> = if std::env::var("NS_DS41_PLACE").is_ok_and(|v| v == "layer") {
-                ls.iter().flat_map(|l| (0..g.n_expert).map(move |x| (*l, x))).collect()
-            } else {
-                (0..g.n_expert).flat_map(|x| ls.iter().map(move |l| (*l, x))).collect()
-            };
+            let mut all: Vec<(u64, u64)> = ks.clone();
             if let Some(prof) = expert_profile() {
                 all.sort_by_key(|k| std::cmp::Reverse(prof.get(k).copied().unwrap_or(0.0) as u64));
             }
@@ -2392,10 +2533,11 @@ impl Part {
                                 let v = &vq[&key.0];
                                 read_expert(m, v, key.1, &mut buf)?;
                                 let (ch, o) = (i / per_chunk, (i % per_chunk) * slot_bytes);
+                                let span = v.lay(key.1).3;
                                 if to_v {
-                                    vram[ch].write(o, &buf[..v.span])
+                                    vram[ch].write(o, &buf[..span])
                                 } else {
-                                    views[ch].lock().unwrap()[o..o + v.span].copy_from_slice(&buf[..v.span]);
+                                    views[ch].lock().unwrap()[o..o + span].copy_from_slice(&buf[..span]);
                                     Ok(())
                                 }
                             };
@@ -2433,8 +2575,8 @@ impl Part {
                         gpu.name, ls, slot_bytes as f64 / 1048576.0, in_v.len(), gib(nv * slot_bytes), in_r.len(), gib(nr * slot_bytes), n_exp - in_v.len() - in_r.len()));
             nv_all += nv;
             nr_all += nr;
-            for l in ls {
-                store_of.insert(*l, stores.len());
+            for l in &ls {
+                store_of.insert((*l, slot_bytes), stores.len());
             }
             stores.push(Mutex::new(Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree: (in_r.len()..nr).collect(), rowner, rused: vec![0; nr], rmark: None, tick: 0, hits: 0, rread: HashMap::new(),
                                            slotaddr: None, vzero: HashMap::new(), n_expert: g.n_expert as usize,
@@ -2467,8 +2609,9 @@ impl Part {
                     // filled now with the profile's next experts (in neither VRAM nor host memory): empty, they waited for
                     // decode's misses to fill them one file read at a time (NS_DS41_FILL_LENT=1; default off)
                     if fill_lent() {
-                        let mine: Vec<u64> = layers.clone().filter(|l| store_of.get(l).is_some_and(|&si| std::ptr::eq(&stores[si], st))).collect();
-                        let mut keys: Vec<(u64, u64)> = (0..g.n_expert).flat_map(|x| mine.iter().map(move |l| (*l, x))).filter(|k| !c.loc.contains_key(k)).collect();
+                        let sb = c.slot_bytes;
+                        let mut keys: Vec<(u64, u64)> = (0..g.n_expert).flat_map(|x| layers.clone().map(move |l| (l, x)))
+                            .filter(|k| vq[&k.0].slot_of(k.1) == sb && !c.loc.contains_key(k)).collect();
                         if let Some(prof) = expert_profile() {
                             keys.sort_by_key(|k| std::cmp::Reverse(prof.get(k).copied().unwrap_or(0.0) as u64));
                         }
@@ -2483,7 +2626,7 @@ impl Part {
                                         let mut buf = vec![0u8; sb];
                                         for (i, key) in keys.iter().enumerate().skip(th).step_by(8) {
                                             let v = &vq[&key.0];
-                                            if let Err(x) = read_expert(m, v, key.1, &mut buf).and_then(|_| dst.write(i * sb, &buf[..v.span])) {
+                                            if let Err(x) = read_expert(m, v, key.1, &mut buf).and_then(|_| dst.write(i * sb, &buf[..v.lay(key.1).3])) {
                                                 *failed.lock().unwrap() = Some(x.0);
                                                 return;
                                             }
@@ -2528,7 +2671,8 @@ impl Part {
             for (l, v) in &vq {
                 if *l < g.n_layer {
                     for x in 0..ne {
-                        host[*l as usize * ne + x] = v.tag(x as u64);
+                        // the type word, and the up matrix's place in the slot (in 256 bytes; down follows at twice it)
+                        host[*l as usize * ne + x] = v.tag(x as u64) | ((v.lay(x as u64).1 / 256) << 16) as i32;
                     }
                 }
             }
@@ -4169,13 +4313,13 @@ impl<'g> Ds41<'g> {
         // one decode token routed on the GPU: its VRAM experts' products queued now, from the slot table; the host
         // reads the routing (ids, weights, which had no VRAM slot) after, for the rest and its bookkeeping
         let img_any = tokens.iter().any(|t| crate::vision::is_image(*t));
-        let groute = t == 1 && gpu_route() && !self.mtp && !p.draft.contains_key(&l) && p.store(l).is_ok() && used <= 8 && !img_any;
+        let groute = t == 1 && gpu_route() && !self.mtp && !p.draft.contains_key(&l) && !p.stores_of(l).is_empty() && used <= 8 && !img_any;
         let mut early: Option<(DevBuf, DevBuf, DevBuf)> = None;
         let mut early_read = None;
         if groute {
             let vq = &p.vq[&l];
             // the table names an expert only once its copy up landed (tab_set_after): nothing to wait for here
-            let dummy = p.store(l)?.lock().unwrap().vram.first().map_or(0, |b| b.ptr() as u64);
+            let dummy = p.stores[p.stores_of(l)[0]].lock().unwrap().vram.first().map_or(0, |b| b.ptr() as u64);
             let gtab = p.arena.bytes(2 * used * 48 + 33 * 4)?;
             let dtab = p.arena.bytes(used * 48 + used * 33 * 4)?;
             let info = p.arena.bytes(3 * used * 4)?;
@@ -4268,12 +4412,11 @@ impl<'g> Ds41<'g> {
         }
         ROUTE_HOST_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         if t == 1 && self.prof.is_some() && !p.draft.contains_key(&l) {
-            if let Ok(st) = p.store(l) {
-                let c = st.lock().unwrap();
+            if !p.stores_of(l).is_empty() {
                 let (mut any, mut low) = (false, true);
                 DEC_LAYERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for (ex, v) in &by {
-                    if c.loc.contains_key(&(l, *ex as u64)) {
+                    if p.with_store(l, *ex as u64, |c| c.loc.contains_key(&(l, *ex as u64))).unwrap_or(false) {
                         continue;
                     }
                     let frac = v[0].1 / g.expert_scale as f32;
@@ -4296,15 +4439,13 @@ impl<'g> Ds41<'g> {
         let prompt_skip = t > MMVQ_COLS && cold_skip_prompt() > 0.0 && p.ring.is_some() && !p.draft.contains_key(&l);
         if ((cold_skip() > 0.0 && t <= MMVQ_COLS) || prompt_skip) && by.len() > 1 && !p.draft.contains_key(&l) {
             let (thr, maxn) = if t <= MMVQ_COLS { (cold_skip(), usize::MAX) } else { (cold_skip_prompt(), cold_skip_prompt_max()) };
-            if let Ok(st) = p.store(l) {
-                let c = st.lock().unwrap();
-                for (k, (ex, v)) in by.iter().enumerate() {
-                    let key = (l, *ex as u64);
-                    let cold = if skip_host() && t <= MMVQ_COLS { !matches!(c.loc.get(&key), Some(Loc::V(_))) } else { !c.loc.contains_key(&key) };
-                    if cold && (t > MMVQ_COLS || cold_skip_ahead() || !c.ahead.contains_key(&key)) && v.len() <= maxn
-                        && v.iter().all(|x| x.1 / (g.expert_scale as f32) < thr) {
-                        skip[k] = true;
-                    }
+            for (k, (ex, v)) in by.iter().enumerate() {
+                let key = (l, *ex as u64);
+                let Some((cold, ahead)) = p.with_store(l, key.1, |c| {
+                    (if skip_host() && t <= MMVQ_COLS { !matches!(c.loc.get(&key), Some(Loc::V(_))) } else { !c.loc.contains_key(&key) }, c.ahead.contains_key(&key))
+                }) else { continue };
+                if cold && (t > MMVQ_COLS || cold_skip_ahead() || !ahead) && v.len() <= maxn && v.iter().all(|x| x.1 / (g.expert_scale as f32) < thr) {
+                    skip[k] = true;
                 }
             }
             if skip.iter().all(|s| *s) {
@@ -4419,7 +4560,8 @@ impl<'g> Ds41<'g> {
                     let mut dmeta: Vec<i32> = Vec::new();
                     for which in 0..2 {
                         for &k in set.iter() {
-                            ptrs.push(slots_of[k].ptr() as u64 + if which == 0 { vq.gate } else { vq.up } as u64);
+                            let (g0, u0, _, _) = vq.lay(exids[k]);
+                            ptrs.push(slots_of[k].ptr() as u64 + if which == 0 { g0 } else { u0 } as u64);
                             let mut m = vec![lists[k].len() as i32 | vq.tag(exids[k]), (which * total + first[k]) as i32];
                             m.extend(lists[k].iter().map(|(ti, _)| *ti));
                             m.resize(10, 0);
@@ -4427,7 +4569,7 @@ impl<'g> Ds41<'g> {
                         }
                     }
                     for &k in set.iter() {
-                        dptr.push(slots_of[k].ptr() as u64 + vq.down as u64);
+                        dptr.push(slots_of[k].ptr() as u64 + vq.lay(exids[k]).2 as u64);
                         let mut m = vec![lists[k].len() as i32 | vq.tag(exids[k]), first[k] as i32];
                         m.extend((0..lists[k].len()).map(|j| (first[k] + j) as i32));
                         m.resize(10, 0);
@@ -4528,11 +4670,8 @@ impl<'g> Ds41<'g> {
                 let read: HashMap<usize, (usize, Arc<RDone>)> = files.iter().filter_map(|(k, ex)| by_ex.get(ex).map(|v| (*k, v.clone()))).collect();
                 // the next layer's file experts read meanwhile: a prompt of more than a few tokens uses nearly all of them
                 if prompt_prefetch() && t >= prompt_prefetch_min() && p.layers.contains(&(l + 1)) && p.reader.is_some() {
-                    if let Ok(nst) = p.store(l + 1) {
-                        let nxt: Vec<u64> = {
-                            let c = nst.lock().unwrap();
-                            (0..ne as u64).filter(|ex| !c.loc.contains_key(&(l + 1, *ex))).collect()
-                        };
+                    if !p.stores_of(l + 1).is_empty() {
+                        let nxt: Vec<u64> = (0..ne as u64).filter(|ex| !p.with_store(l + 1, *ex, |c| c.loc.contains_key(&(l + 1, *ex))).unwrap_or(true)).collect();
                         if !nxt.is_empty() {
                             let m = p.start_file_reads(l + 1, &nxt)?;
                             *p.pre_reads.lock().unwrap() = Some((l + 1, m));
@@ -4693,16 +4832,17 @@ impl<'g> Ds41<'g> {
                 for &k in batch {
                     let base = views[k].as_ref().ok_or("an expert not in place")?.ptr() as u64;
                     let tag = vq.tag(exids[k]);
+                    let (g0, u0, d0, _) = vq.lay(exids[k]);
                     for (ci, ch) in lists[k].chunks(MMVQ_COLS).enumerate() {
                         let j0 = ci * MMVQ_COLS;
-                        for (w, off) in [(0usize, vq.gate), (1, vq.up)] {
+                        for (w, off) in [(0usize, g0), (1, u0)] {
                             gp.push(base + off as u64);
                             let mut m = vec![ch.len() as i32 | tag, (w * slots + slot) as i32];
                             m.extend(ch.iter().map(|(ti, _)| *ti));
                             m.resize(10, 0);
                             gm.extend(m);
                         }
-                        dp.push(base + vq.down as u64);
+                        dp.push(base + d0 as u64);
                         let mut m = vec![ch.len() as i32 | tag, (first[k] + j0) as i32];
                         m.extend((0..ch.len()).map(|c| (slot + c) as i32));
                         m.resize(10, 0);
@@ -4750,7 +4890,8 @@ impl<'g> Ds41<'g> {
                     Some(w16) if n > gmax => {
                         // gate | up as rows [0, f) and [f, 2f) of w16, then the down
                         let deq = |which: usize, rows: usize, cols: usize, dst: &DevBuf| -> Result<()> {
-                            let (at, bytes) = [(vq.gate, vq.up - vq.gate), (vq.up, vq.down - vq.up), (vq.down, vq.span - vq.down)][which];
+                            let (g0, u0, d0, sp) = vq.lay(exids[k]);
+                            let (at, bytes) = [(g0, u0 - g0), (u0, d0 - u0), (d0, sp - d0)][which];
                             match &vq.std {
                                 Some(_) => {
                                     let (_, _, n, ty) = vq.mat_of(exids[k], which).ok_or("an expert's matrix")?;

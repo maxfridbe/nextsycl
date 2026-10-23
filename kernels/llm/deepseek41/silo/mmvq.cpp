@@ -478,26 +478,40 @@ struct MQ2_0 {
 struct MPTQ1_0 {
     static constexpr int BYTES = 56;
     struct W { sycl::int4 lo, hi; float d; };
+    // trit n (power p = 3^n) of each byte of w, a byte each: two bytes a multiply in 16-bit lanes ((b p) & 0xff) 3 >> 8 -
+    // b p <= 20655 and 765 fit a lane, nothing carries across
+    static uint32_t trits(uint32_t w, uint32_t p) {
+        const uint32_t e = ((((w & 0x00ff00ffu) * p) & 0x00ff00ffu) * 3u >> 8) & 0x00030003u;
+        const uint32_t o = (((((w >> 8) & 0x00ff00ffu) * p) & 0x00ff00ffu) * 3u >> 8) & 0x00030003u;
+        return e | (o << 8);
+    }
+    static uint32_t trit1(uint32_t b, uint32_t p) { return (((b * p) & 0xffu) * 3u) >> 8; }
     static W load(const uint8_t* p, int g) {
         const uint32_t* bw = reinterpret_cast<const uint32_t*>(p + 28 * (g >> 2));
-        uint32_t wd[7];
+        uint32_t w[7];
 #pragma unroll
-        for (int i = 0; i < 7; ++i) wd[i] = bw[i];
-        const int v0 = 32 * (g & 3);
+        for (int i = 0; i < 7; ++i) w[i] = bw[i];
+        // lane g's 32 values 32 q .. (q = g % 4): words 0-3 hold qs[0..15] (values m + 16 n), 4-5 qs[16..23] (80 + m + 8 n),
+        // byte 0-1 of word 6 qh (120 + h + 2 n)
+        const int q = g & 3;
         uint32_t o[8];
 #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            uint32_t word = 0;
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t src = q < 3 ? w[k] : w[4 + (k & 1)];
+            const uint32_t pw = q == 0 ? 1u : q == 1 ? 9u : q == 2 ? 81u : (k < 2 ? 9u : 27u);
+            o[k] = trits(src, pw);
+        }
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int v = v0 + 4 * k + i;
-                const int by = v < 80 ? (v & 15) : v < 120 ? 16 + ((v - 80) & 7) : 24 + ((v - 120) & 1);
-                const int n = v < 80 ? (v >> 4) : v < 120 ? ((v - 80) >> 3) : ((v - 120) >> 1);
-                const uint32_t b = (wd[by >> 2] >> (8 * (by & 3))) & 0xffu;
-                const uint32_t pw = n == 0 ? 1 : n == 1 ? 3 : n == 2 ? 9 : n == 3 ? 27 : 81;
-                word |= ((((b * pw) & 0xffu) * 3u) >> 8) << (8 * i);
-            }
-            o[k] = word;
+        for (int k = 4; k < 8; ++k) {
+            const uint32_t src = q < 2 ? w[k - 4] : w[4 + (k & 1)];
+            const uint32_t pw = q == 0 ? 3u : q == 1 ? 27u : q == 2 ? (k < 6 ? 1u : 3u) : 81u;
+            o[k] = trits(src, pw);
+        }
+        if (q == 3) {
+            // values 112-119 are words 4-5's trit 4 (o[4], o[5]); 120-127 qh's trits 0-3, two bytes a trit
+            const uint32_t h0 = w[6] & 0xffu, h1 = (w[6] >> 8) & 0xffu;
+            o[6] = trit1(h0, 1) | (trit1(h1, 1) << 8) | (trit1(h0, 3) << 16) | (trit1(h1, 3) << 24);
+            o[7] = trit1(h0, 9) | (trit1(h1, 9) << 8) | (trit1(h0, 27) << 16) | (trit1(h1, 27) << 24);
         }
         W r;
         r.lo = sycl::int4(int(o[0]), int(o[1]), int(o[2]), int(o[3]));

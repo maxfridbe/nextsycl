@@ -1,4 +1,4 @@
-//! Q8_0 -> Q4_K on the host (NS_DS41_DENSE_Q4K=1): the Unsloth file keeps attention and the shared expert in Q8_0 (8.5 bits a
+//! Q8_0 (Q6_K, F16) -> Q4_K on the host (NS_DS41_DENSE_Q4K=1): the Unsloth file keeps attention and the shared expert in Q8_0 (8.5 bits a
 //! weight), a decode token reads all of them; in q4_K (4.5 bits) they are half the bytes and the engine's fused q4_K kernels
 //! (q_a | kv, the grouped o_a in one launch) apply. The quantizer is ggml's quantize_row_q4_K_ref (no importance matrix): per
 //! 32 values a scale and a minimum found by a least-squares search over 21 candidate scales, the 8 scales and minimums of a
@@ -180,9 +180,24 @@ fn quantize_block(x: &[f32], out: &mut [u8]) {
     }
 }
 
-/// A 256-value block of Q8_0 (8 x 34 bytes: an f16 scale, 32 int8) or Q6_K (210 bytes) as floats
-fn dequant_block(q6k: bool, b: &[u8], x: &mut [f32; 256]) {
-    if !q6k {
+/// What to_q4k reads
+#[derive(Clone, Copy, PartialEq)]
+pub enum From {
+    Q8_0,
+    Q6K,
+    /// the XQ file's Engram projection
+    F16,
+}
+
+/// A 256-value block of Q8_0 (8 x 34 bytes: an f16 scale, 32 int8), Q6_K (210 bytes) or F16 (512 bytes) as floats
+fn dequant_block(from: From, b: &[u8], x: &mut [f32; 256]) {
+    if from == From::F16 {
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = f16_to_f32(u16::from_le_bytes([b[2 * i], b[2 * i + 1]]));
+        }
+        return;
+    }
+    if from == From::Q8_0 {
         for s in 0..8 {
             let blk = &b[s * 34..s * 34 + 34];
             let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
@@ -210,9 +225,13 @@ fn dequant_block(q6k: bool, b: &[u8], x: &mut [f32; 256]) {
     }
 }
 
-/// Q8_0 (or, `q6k`, Q6_K) blocks -> q4_K blocks, `n` values (a multiple of 256), on all cores
-pub fn to_q4k(src: &[u8], n: usize, q6k: bool) -> Vec<u8> {
-    let sb = if q6k { 210 } else { 272 };
+/// Q8_0, Q6_K or F16 blocks -> q4_K blocks, `n` values (a multiple of 256), on all cores
+pub fn to_q4k(src: &[u8], n: usize, from: From) -> Vec<u8> {
+    let sb = match from {
+        From::Q8_0 => 272,
+        From::Q6K => 210,
+        From::F16 => 512,
+    };
     assert!(n.is_multiple_of(256) && src.len() == n / 256 * sb);
     let nb = n / 256;
     let mut out = vec![0u8; nb * 144];
@@ -224,7 +243,7 @@ pub fn to_q4k(src: &[u8], n: usize, q6k: bool) -> Vec<u8> {
                 let mut x = [0f32; 256];
                 for (bi, ob) in chunk.chunks_mut(144).enumerate() {
                     let b = ti * per + bi;
-                    dequant_block(q6k, &src[b * sb..(b + 1) * sb], &mut x);
+                    dequant_block(from, &src[b * sb..(b + 1) * sb], &mut x);
                     quantize_block(&x, ob);
                 }
             });
@@ -267,7 +286,7 @@ mod tests {
                 src.push(((v / d).round() as i8) as u8);
             }
         }
-        let q = to_q4k(&src, n, false);
+        let q = to_q4k(&src, n, From::Q8_0);
         assert_eq!(q.len(), 2 * 144);
         let y: Vec<f32> = q.chunks(144).flat_map(deq).collect();
         let err = (x.iter().zip(&y).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / x.iter().map(|a| a * a).sum::<f32>()).sqrt();
