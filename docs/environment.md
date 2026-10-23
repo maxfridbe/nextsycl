@@ -191,7 +191,10 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_PEAK_TF16` | 183 | Debug: f16 TFLOP/s peak the NS_Q35_PROFILE tables compare the f16 GEMMs with | llm qwen35 |
 | `NS_PEAK_TF32` | 22.9 | Debug: f32 TFLOP/s peak the NS_Q35_PROFILE tables compare the other kernels with | llm qwen35 |
 | `NS_Q35_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (at least 16) (--opt-chunk) | llm qwen35 |
-| `NS_Q35_DRAFTS` | 3 | tokens drafted a step with MTP (at most 7; 0: none) (--opt-drafts) | llm qwen35 |
+| `NS_Q35_DRAFTS` | 3 | tokens drafted a step with MTP or EAGLE-4 (at most 7; 0: none) (--opt-drafts) | llm qwen35 |
+| `NS_Q35_EAGLE` | unset (MTP) | the EAGLE-4 draft's folder (config.json, model.safetensors: Qwen3.8-27B's `LlamaForCausalLMEagle4`), or `auto`: an `eagle4/` folder beside the model; loaded in MTP's place on one GPU (--opt-eagle) | llm qwen35 |
+| `NS_Q35_EAGLE_HEAD` | low | the EAGLE-4 draft's head: low (its low-rank head's 128 candidates scored by the full head, as trained: 35 MB read a draft step) or full (the full head's argmax: 1.35 GB) | llm qwen35 |
+| `NS_Q35_EAGLE_CTX` | 32768 | positions the EAGLE-4 draft's cache holds (20 KiB each); no drafts past them (--opt-eagle-ctx) | llm qwen35 |
 | `NS_Q35_MMVQ_GROUPS` | 512 | Experiment: work-groups of the silo's matrix-vector kernels with a lookup table | kernels:qwen35 silo |
 | `NS_Q35_MMVQ_ROWS` | 0 (each type's own) | Experiment: rows a sub-group (1, 2 or 4) for every 256-block type of the silo's matrix-vector kernels | kernels:qwen35 silo |
 | `NS_Q35_MTP` | the first .gguf in an MTP/ folder beside the model | the MTP draft block's GGUF (--opt-mtp) | llm qwen35 |

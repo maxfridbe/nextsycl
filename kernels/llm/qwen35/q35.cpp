@@ -146,6 +146,73 @@ void attn(sycl::queue& q, const float* qp, int64_t qs, const half* kc, const hal
         });
     }
 }
+// floats as unsigned keys in the same order
+inline uint32_t f_key(float f) {
+    const uint32_t b = sycl::bit_cast<uint32_t>(f);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// A work-group's k largest of n keys (key(i)): a radix select a byte at a time, high byte first (a sub-group counts
+// its lanes of a bin together - the scores crowd into a few bins), then emit(slot, i) for the keys above the k-th and
+// as many equal to it as are left. hist: 256 local counters, st: 5
+template <typename Key, typename Emit>
+inline void group_topk(sycl::nd_item<1> it, int64_t n, int64_t k, Key key, Emit emit, uint32_t* hist, uint32_t* st) {
+    using lref = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space>;
+    auto sg = it.get_sub_group();
+    const int lid = (int) it.get_local_id(0), wg = (int) it.get_local_range(0), lane = (int) sg.get_local_linear_id();
+    if (lid == 0) {
+        st[0] = 0;
+        st[1] = 0;
+        st[2] = (uint32_t) k;
+        st[3] = 0;
+        st[4] = 0;
+    }
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = lid; i < 256; i += wg) hist[i] = 0;
+        sycl::group_barrier(it.get_group());
+        const uint32_t prefix = st[0], mask = st[1];
+        for (int64_t i0 = lid - lane; i0 < n; i0 += wg) {
+            const int64_t i = i0 + lane;
+            const uint32_t u = i < n ? key(i) : 0u;
+            bool pending = i < n && (u & mask) == prefix;
+            const uint32_t bin = (u >> shift) & 255;
+            while (sycl::any_of_group(sg, pending)) {
+                const uint32_t b = sycl::reduce_over_group(sg, pending ? bin : 256u, sycl::minimum<uint32_t>());
+                const uint32_t c = sycl::reduce_over_group(sg, pending && bin == b ? 1u : 0u, sycl::plus<uint32_t>());
+                if (lane == 0) lref(hist[b]).fetch_add(c);
+                if (bin == b) pending = false;
+            }
+        }
+        sycl::group_barrier(it.get_group());
+        if (lid == 0) {
+            const uint32_t need = st[2];
+            uint32_t c = 0;
+            int d = 255;
+            for (; d > 0; --d) {
+                if (c + hist[d] >= need) break;
+                c += hist[d];
+            }
+            st[0] = prefix | ((uint32_t) d << shift);
+            st[1] = mask | (255u << shift);
+            st[2] = need - c;
+        }
+        sycl::group_barrier(it.get_group());
+    }
+    const uint32_t t = st[0], eq = st[2], above = (uint32_t) k - eq;
+    for (int64_t i = lid; i < n; i += wg) {
+        const uint32_t u = key(i);
+        if (u > t) {
+            emit(lref(st[3]).fetch_add(1u), i);
+        } else if (u == t) {
+            const uint32_t j = lref(st[4]).fetch_add(1u);
+            if (j < eq) emit(above + j, i);
+        }
+    }
+}
+
+// the first stage's work-groups: each a slice's own top k (its keys and indices), the second picks among them
+constexpr int TOPK_PARTS = 128;
+
 }  // namespace
 
 extern "C" {
@@ -181,6 +248,31 @@ int ns_q35_qk_norm_rope(ns_gpu* g, const float* src, int64_t ss, int64_t hs, flo
                 y[i] = v;
             }
         }
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_rope(ns_gpu* g, const float* src, int64_t ss, int64_t hs, float* dst, int64_t ds, int64_t T, int64_t H, int64_t D, int64_t n_rot,
+                float theta, int64_t p0) {
+    NS_TRY
+    if (T <= 0) return 0;
+    if (D % SG != 0 || n_rot > D || n_rot % 2) return ns_fail("ns_q35_rope: D a multiple of 16, n_rot even and at most D");
+    const int64_t half_rot = n_rot / 2;
+    g->q.parallel_for(sycl::range<1>((size_t) (T * H * D)), [=](sycl::id<1> id) {
+        const int64_t i = id[0] % D, th = id[0] / D, t = th / H, h = th % H;
+        const float* x = src + t * ss + h * hs;
+        float* y = dst + t * ds + h * D;
+        if (i >= n_rot) {
+            y[i] = x[i];
+            return;
+        }
+        // rotate-half over the first n_rot: pair (i, i + n_rot / 2)
+        const int64_t k = i < half_rot ? i : i - half_rot;
+        const float a = (float) (p0 + t) * sycl::pow(theta, -2.0f * (float) k / (float) n_rot);
+        const float c = sycl::cos(a), sn = sycl::sin(a);
+        const float other = x[i < half_rot ? i + half_rot : i - half_rot];
+        y[i] = i < half_rot ? x[i] * c - other * sn : x[i] * c + other * sn;
     });
     return 0;
     NS_CATCH
@@ -512,7 +604,9 @@ int ns_q35_attn(ns_gpu* g, const float* q, int64_t qs, const void* kc, const voi
     else if (D == 256 && Hq == 4 * Hkv) attn<16, 4>(g->q, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
     else if (D == 256 && Hq == 2 * Hkv) attn<16, 2>(g->q, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
     else if (D == 256 && Hq == 8 * Hkv) attn<16, 8>(g->q, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
-    else return ns_fail("ns_q35_attn: head 256 with 2, 4, 6 or 8 query heads a key head");
+    // the EAGLE-4 draft's attention: heads of 128, a key head a query head
+    else if (D == 128 && Hq == Hkv) attn<8, 1>(g->q, q, qs, k, v, T, Hq, Hkv, cap, p0, out, scratch);
+    else return ns_fail("ns_q35_attn: head 256 with 2, 4, 6 or 8 query heads a key head, or 128 with one");
     return 0;
     NS_CATCH
 }
@@ -569,6 +663,110 @@ int ns_q35_gdn_out(ns_gpu* g, const float* o, const float* z, int64_t zs, const 
             const float zz = z[t * zs + h * d + i];
             y[r * d + i] = x[i] * inv * w[i] * (zz / (1.0f + sycl::exp(-zz)));
         }
+    });
+    return 0;
+    NS_CATCH
+}
+
+int64_t ns_q35_topk_scratch(int64_t n, int64_t k) {
+    return n > 8 * TOPK_PARTS * k ? 2 * TOPK_PARTS * k : 0;
+}
+
+int ns_q35_topk(ns_gpu* g, const float* x, int64_t n, int64_t k, int32_t* ids, void* scratch) {
+    NS_TRY
+    if (k <= 0 || k > n) return ns_fail("ns_q35_topk: k from 1 to n");
+    if (ns_q35_topk_scratch(n, k) == 0) {
+        g->q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<uint32_t, 1> hist(sycl::range<1>(256), h), st(sycl::range<1>(5), h);
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>(1024), sycl::range<1>(1024)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                group_topk(it, n, k, [=](int64_t i) { return f_key(x[i]); }, [=](uint32_t slot, int64_t i) { ids[slot] = (int32_t) i; }, &hist[0], &st[0]);
+            });
+        });
+        return 0;
+    }
+    if (!scratch) return ns_fail("ns_q35_topk: no scratch");
+    uint32_t* ck = (uint32_t*) scratch;
+    int32_t* ci = (int32_t*) scratch + TOPK_PARTS * k;
+    const int64_t slice = (n + TOPK_PARTS - 1) / TOPK_PARTS;
+    // each slice's top k (a slice of fewer than k: all of it, the rest of its slots the lowest key)
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> hist(sycl::range<1>(256), h), st(sycl::range<1>(5), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) TOPK_PARTS * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int64_t p = it.get_group(0), a = p * slice, m = sycl::max<int64_t>(0, sycl::min<int64_t>(slice, n - a));
+            uint32_t* pk = ck + p * k;
+            int32_t* pi = ci + p * k;
+            if (m <= k) {
+                for (int64_t j = it.get_local_id(0); j < k; j += 256) {
+                    pk[j] = j < m ? f_key(x[a + j]) : 0u;
+                    pi[j] = j < m ? (int32_t) (a + j) : 0;
+                }
+                return;
+            }
+            group_topk(it, m, k, [=](int64_t i) { return f_key(x[a + i]); }, [=](uint32_t slot, int64_t i) {
+                pk[slot] = f_key(x[a + i]);
+                pi[slot] = (int32_t) (a + i);
+            }, &hist[0], &st[0]);
+        });
+    });
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> hist(sycl::range<1>(256), h), st(sycl::range<1>(5), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(1024), sycl::range<1>(1024)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            group_topk(it, TOPK_PARTS * k, k, [=](int64_t i) { return ck[i]; }, [=](uint32_t slot, int64_t i) { ids[slot] = ci[i]; }, &hist[0], &st[0]);
+        });
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_scores_i8(ns_gpu* g, const void* qv, const void* dv, int64_t rows, const float* x, float* out) {
+    NS_TRY
+    if (rows <= 0) return 0;
+    const int8_t* q = (const int8_t*) qv;
+    const half* d = (const half*) dv;
+    // rows of 128: a sub-group a row, a lane 8 values (one 8-byte load), its block's scale every fourth lane's
+    constexpr int NSG = 8;
+    const int64_t groups = (rows + NSG - 1) / NSG;
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) groups * NSG * SG), sycl::range<1>(NSG * SG)),
+                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        auto sg = it.get_sub_group();
+        const int64_t r = it.get_group(0) * NSG + sg.get_group_linear_id();
+        if (r >= rows) return;
+        const int lane = (int) sg.get_local_linear_id();
+        const sycl::vec<int8_t, 8> v = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(q + r * 128 + lane * 8);
+        const float* xb = x + lane * 8;
+        float acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc += (float) v[j] * xb[j];
+        acc *= (float) d[r * 4 + lane / 4];
+        acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+        if (lane == 0) out[r] = acc;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_q35_rows_q8_0(ns_gpu* g, const void* w, int64_t cols, const int32_t* ids, int64_t rows, const float* x, float* out) {
+    NS_TRY
+    if (rows <= 0) return 0;
+    if (cols % 32) return ns_fail("ns_q35_rows_q8_0: columns a multiple of 32");
+    constexpr int NSG = 4;
+    const int64_t rb = cols / 32 * 34;
+    const int64_t groups = (rows + NSG - 1) / NSG;
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) groups * NSG * SG), sycl::range<1>(NSG * SG)),
+                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        auto sg = it.get_sub_group();
+        const int64_t r = it.get_group(0) * NSG + sg.get_group_linear_id();
+        if (r >= rows) return;
+        const int lane = (int) sg.get_local_linear_id();
+        const uint8_t* row = (const uint8_t*) w + (int64_t) (ids ? ids[r] : r) * rb;
+        float acc = 0.0f;
+        // lane l takes values l, l + 16, ...: a block's 32 values two lanes' turns
+        for (int64_t e = lane; e < cols; e += SG) {
+            const uint8_t* b = row + (e / 32) * 34;
+            acc += (float) *reinterpret_cast<const half*>(b) * (float) (int8_t) b[2 + e % 32] * x[e];
+        }
+        acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+        if (lane == 0) out[r] = acc;
     });
     return 0;
     NS_CATCH

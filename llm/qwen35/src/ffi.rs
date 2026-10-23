@@ -50,12 +50,17 @@ pub struct Api {
     pub kv_store: unsafe extern "C" fn(G, *const f32, i64, *const f32, i64, i64, i64, i64, i64, i64, M, M) -> c_int,
     pub attn_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64,
     pub attn: unsafe extern "C" fn(G, *const f32, i64, P, P, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
+    pub rope: unsafe extern "C" fn(G, *const f32, i64, i64, *mut f32, i64, i64, i64, i64, i64, f32, i64) -> c_int,
     pub gate_mul: unsafe extern "C" fn(G, *mut f32, *const f32, i64, i64, i64, i64) -> c_int,
     pub gdn_gates: unsafe extern "C" fn(G, *const f32, *mut f32, *const f32, *const f32, *mut f32, i64, i64, i64) -> c_int,
     pub expand: unsafe extern "C" fn(G, *const f32, i64, *mut f32, i64, i64, i64, i64) -> c_int,
     pub gdn_out: unsafe extern "C" fn(G, *const f32, *const f32, i64, *const f32, *mut f32, i64, i64, i64, f32) -> c_int,
     /// the greedy pick on the GPU (the MTP drafts)
     pub argmax: unsafe extern "C" fn(G, *const f32, i64, i64, *mut i32) -> c_int,
+    pub topk: unsafe extern "C" fn(G, *const f32, i64, i64, *mut i32, *mut c_void) -> c_int,
+    pub topk_scratch: unsafe extern "C" fn(i64, i64) -> i64,
+    pub scores_i8: unsafe extern "C" fn(G, P, P, i64, *const f32, *mut f32) -> c_int,
+    pub rows_q8_0: unsafe extern "C" fn(G, P, i64, *const i32, i64, *const f32, *mut f32) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -114,11 +119,16 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             kv_store: sym!("ns_q35_kv_store"),
             attn_scratch: sym!("ns_q35_attn_scratch"),
             attn: sym!("ns_q35_attn"),
+            rope: sym!("ns_q35_rope"),
             gate_mul: sym!("ns_q35_gate_mul"),
             gdn_gates: sym!("ns_q35_gdn_gates"),
             expand: sym!("ns_q35_expand"),
             gdn_out: sym!("ns_q35_gdn_out"),
             argmax: sym!("ns_q35_argmax"),
+            topk: sym!("ns_q35_topk"),
+            topk_scratch: sym!("ns_q35_topk_scratch"),
+            scores_i8: sym!("ns_q35_scores_i8"),
+            rows_q8_0: sym!("ns_q35_rows_q8_0"),
         })
     })
     .as_ref()

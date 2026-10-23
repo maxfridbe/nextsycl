@@ -236,13 +236,16 @@ pub struct Session {
     mtp: Option<MtpState>,
 }
 
-/// A session's draft block state: its cache ([kv heads][max_ctx][256] half), the normed hidden state of the last
-/// position fed (the next token pairs with it), and the block's own normed output (a chained draft pairs with it)
+/// A session's draft block state: its cache ([heads][cap][head] half: MTP's the target's kv heads and max_ctx, EAGLE's
+/// its 40 heads of 128 and its own positions), the normed hidden state of the last position fed (EAGLE: its feature;
+/// the next token pairs with it), and the block's own normed output (a chained draft pairs with it)
 struct MtpState {
     k: DevBuf,
     v: DevBuf,
     pending: DevBuf,
     chain: DevBuf,
+    heads: usize,
+    cap: usize,
 }
 
 enum LState {
@@ -408,6 +411,8 @@ pub struct Qwen35<'g> {
     work: Mutex<()>,
     /// the draft block (loaded with drafts on and its file found)
     mtp: Option<Mtp>,
+    /// the EAGLE-4 draft (eagle.rs), in MTP's place when its folder is found (one GPU)
+    eagle: Option<crate::eagle::Eagle>,
     /// drafts a step
     drafts: usize,
     /// the verify passes' DeltaNet snapshots (under `work`)
@@ -544,6 +549,11 @@ fn arena_bytes(g: &Geometry, chunk: usize) -> usize {
 /// Room kept for a session when the chunk is chosen (a 32K context's cache on the 27B is 2 GiB)
 const SESSION_ROOM: u64 = 5 << 29;
 
+/// The EAGLE-4 draft's rows a step behind a prompt pass (its work memory bounded by them), and the largest SwiGLU the
+/// work memory is planned for
+const EAGLE_ROWS: usize = 256;
+const EAGLE_FF: usize = 16384;
+
 impl<'g> Qwen35<'g> {
     /// Loads the model over `gpus` in order: with one GPU all of it there; with more, the layers split so each GPU keeps
     /// the same share of its memory free for the sessions (NS_SPLIT: the first layer of each GPU after the first), the
@@ -586,7 +596,22 @@ impl<'g> Qwen35<'g> {
         // 512) when they leave room for a session, else 1,024, else 512
         // the draft block: its file's tensors but its token embedding (rows read from the file), its snapshots
         let drafts = if draft { draft_count() } else { 0 };
-        let mfile = match (drafts > 0).then(|| mtp_path(f)).flatten() {
+        // the EAGLE-4 draft (one GPU): in MTP's place
+        let eagle_dir = match (drafts > 0).then(|| f.paths.first().and_then(|p| crate::eagle::path(p))).flatten() {
+            Some(d) if gpus.len() > 1 => {
+                log(format!("qwen35: the EAGLE-4 draft {} runs on one GPU: MTP instead", d.display()));
+                None
+            }
+            Some(d) => match crate::eagle::weight_bytes(&d) {
+                Ok(b) => Some((d, b)),
+                Err(x) => {
+                    log(format!("qwen35: the EAGLE-4 draft {} is not read ({}): MTP instead", d.display(), x.0));
+                    None
+                }
+            },
+            None => None,
+        };
+        let mfile = match (drafts > 0 && eagle_dir.is_none()).then(|| mtp_path(f)).flatten() {
             Some(p) => match Gguf::open(&p) {
                 Ok(m) => Some(Box::new(m)),
                 Err(x) => {
@@ -598,13 +623,17 @@ impl<'g> Qwen35<'g> {
         };
         let lin_state = (g.v_heads * g.state * g.state + (g.conv - 1) * g.conv_dim()) * 4;
         let snap_bytes = (g.layers - (0..g.layers).filter(|l| g.full(*l)).count()) * drafts * lin_state;
-        let mtp_w = mfile.as_ref().map_or(0, |m| m.tensors.iter().filter(|t| t.name != "token_embd.weight").map(|t| t.bytes).sum::<u64>());
-        let mtp_bytes = mtp_w + if mfile.is_some() { snap_bytes as u64 } else { 0 };
+        let mtp_w = mfile.as_ref().map_or(0, |m| m.tensors.iter().filter(|t| t.name != "token_embd.weight").map(|t| t.bytes).sum::<u64>())
+            + eagle_dir.as_ref().map_or(0, |d| d.1);
+        let mtp_bytes = mtp_w + if mfile.is_some() || eagle_dir.is_some() { snap_bytes as u64 } else { 0 };
         let margin: u64 = 1536 << 20;
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         // the draft block's pass behind a chunk's: its inputs and outputs beside the main pass's
         let has_mtp = mfile.is_some();
-        let arena_of = |c: usize| arena_bytes(&g, c) + if has_mtp { c * 8 * g.n_embd * 4 } else { 0 };
+        // EAGLE: the pass's three aux states, its rows' work (EAGLE_ROWS at a time)
+        let has_eagle = eagle_dir.is_some();
+        let arena_of = |c: usize| arena_bytes(&g, c) + if has_mtp { c * 8 * g.n_embd * 4 } else { 0 }
+            + if has_eagle { (3 * c * g.n_embd + EAGLE_ROWS.min(c) * (18 * g.n_embd + 2 * EAGLE_FF)) * 4 + (64 << 20) } else { 0 };
         let (chunk, bounds) = if gpus.len() == 1 {
             let fixed = weights + mtp_bytes + w16_bytes as u64 + margin;
             let chunk = chunk_setting().unwrap_or_else(|| {
@@ -783,7 +812,18 @@ impl<'g> Qwen35<'g> {
             Some(m) => Some(load_mtp(m, &g, &lastg, k, &mut loaded)?),
             None => None,
         };
-        let drafts = if mtp.is_some() { drafts } else { 0 };
+        let eagle = match eagle_dir {
+            Some((d, _)) => match crate::eagle::Eagle::load(&d, &lastg, g.n_embd, g.layers, g.vocab) {
+                Ok(x) if (x.eps - g.eps).abs() <= 1e-9 && x.n_ff <= EAGLE_FF => {
+                    loaded += x.bytes;
+                    Some(x)
+                }
+                Ok(x) => return Err(e(format!("the EAGLE-4 draft's norm eps {} (the model's {}) or its SwiGLU of {}", x.eps, g.eps, x.n_ff))),
+                Err(x) => return Err(e(format!("the EAGLE-4 draft {}: {}", d.display(), x.0))),
+            },
+            None => None,
+        };
+        let drafts = if mtp.is_some() || eagle.is_some() { drafts } else { 0 };
         let mut snap_layers = Vec::new();
         if drafts > 0 {
             for l in (0..g.layers).filter(|l| !g.full(*l)) {
@@ -791,10 +831,12 @@ impl<'g> Qwen35<'g> {
                 snap_layers.push((DevBuf::f32(gpu, drafts * g.v_heads * g.state * g.state)?, DevBuf::f32(gpu, drafts * (g.conv - 1) * g.conv_dim())?));
             }
         }
-        log(match &mtp {
-            Some(_) => format!("qwen35: MTP drafts ({drafts} a step)"),
-            None if draft => "qwen35: no MTP file (NS_Q35_MTP or an MTP/ folder beside the model): no drafts".into(),
-            None => "qwen35: drafts off".into(),
+        log(match (&mtp, &eagle) {
+            (_, Some(x)) => format!("qwen35: EAGLE-4 drafts ({drafts} a step; aux layers {:?}, window {}, its cache {} positions, {:.2} GiB)", x.ids,
+                                    x.window, x.ctx, gib(x.bytes)),
+            (Some(_), _) => format!("qwen35: MTP drafts ({drafts} a step)"),
+            (None, _) if draft => "qwen35: no MTP file (NS_Q35_MTP or an MTP/ folder beside the model): no drafts".into(),
+            (None, _) => "qwen35: drafts off".into(),
         });
         // two sets of 8 rows: a batch step's two conversations
         let vh = DevBuf::f32(&lastg, 16 * g.n_embd)?;
@@ -837,7 +879,7 @@ impl<'g> Qwen35<'g> {
             None => None,
         };
         Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, chunk,
-                    work: Mutex::new(()), mtp, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, second: None, of: Vec::new() }), vh, next_id: 0.into(), vision, capture: Mutex::new(None), kv_rot: kv_rot() && kv_tys.iter().any(|t| *t != KvTy::F16), kv_tys, graphs: Mutex::new(Graphs::default()), skip: false.into(), graphs_off: false.into(),
+                    work: Mutex::new(()), mtp, eagle, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, second: None, of: Vec::new() }), vh, next_id: 0.into(), vision, capture: Mutex::new(None), kv_rot: kv_rot() && kv_tys.iter().any(|t| *t != KvTy::F16), kv_tys, graphs: Mutex::new(Graphs::default()), skip: false.into(), graphs_off: false.into(),
                     probe,
                     load_s, load_bytes: loaded })
     }
@@ -1673,8 +1715,15 @@ impl<'g> Qwen35<'g> {
         let mut ffn_u = self.arena().f32(t * g.n_ff)?;
         let mut ffn = self.arena().f32(t * g.n_embd)?;
         let mut li = 0;
-        // decode rows (no pictures, no capture, no profile): the layers as graphs
-        let graphed = t <= 8 && !pictures && !probing && self.probe.is_none() && graphs_on() && !self.graphs_off.load(std::sync::atomic::Ordering::Relaxed);
+        // EAGLE: the residual stream after its three layers (its cache holding these positions)
+        let eagle = self.eagle.as_ref().zip(s.mtp.as_ref()).filter(|(_, ms)| p0 + t <= ms.cap);
+        let aux = match eagle {
+            Some(_) => Some(self.arena().f32(3 * t * g.n_embd)?),
+            None => None,
+        };
+        // decode rows (no pictures, no capture, no profile, no EAGLE): the layers as graphs
+        let graphed = t <= 8 && !pictures && !probing && self.probe.is_none() && self.eagle.is_none() && graphs_on()
+            && !self.graphs_off.load(std::sync::atomic::Ordering::Relaxed);
         if graphed {
             self.graph_start((s.id, t, snapping))?;
         }
@@ -1718,6 +1767,11 @@ impl<'g> Qwen35<'g> {
             self.matmul("down", &ly.down, &ffn_g, None, t, &ffn)?;
             self.add(&x, &ffn, t * g.n_embd)?;
             tap(&format!("l_out-{l}"), &x)?;
+            if let (Some((ea, _)), Some(a)) = (eagle, &aux) {
+                if let Some(j) = ea.ids.iter().position(|i| *i == l) {
+                    a.copy_within(j * t * g.n_embd * 4, &x, 0, t * g.n_embd * 4)?;
+                }
+            }
             self.arena().rewind(mark);
         }
         if graphed {
@@ -1753,6 +1807,15 @@ impl<'g> Qwen35<'g> {
             // the head reads the rows' Q8_1 forms when it takes them all; fewer rows (a short prompt's last) it quantizes
             // itself (the split layout does not slice by rows)
             (all.view((t - n) * ne * 4, n * ne * 4)?, if n == t { q } else { None })
+        } else if let (Some((ea, ms)), Some(a)) = (eagle, &aux) {
+            self.phase("eagle");
+            self.eagle_rows(ea, ms, tokens, a, p0, r0)?;
+            self.phase("head");
+            let last = x.view((t - n) * ne * 4, n * ne * 4)?;
+            let normed = self.arena().f32(n * ne)?;
+            let q = self.norm(&last, &self.output_norm, &normed, n, ne)?;
+            tap("result_norm", &normed)?;
+            (normed, q)
         } else {
             let last = x.view((t - n) * ne * 4, n * ne * 4)?;
             let normed = self.arena().f32(n * ne)?;
@@ -1841,9 +1904,179 @@ impl<'g> Qwen35<'g> {
         Ok(cur)
     }
 
+    /// EAGLE-4 behind a pass of t rows at p0 (rotary positions from r0): each row's feature from the aux states, the
+    /// draft over the rows EAGLE_ROWS at a time (row i: token i with the feature of the row before - the pending one,
+    /// then this pass's), the first rows' features kept for a rollback, the last one pending
+    fn eagle_rows(&self, ea: &crate::eagle::Eagle, ms: &MtpState, tokens: &[u32], aux: &DevBuf, p0: usize, r0: usize) -> Result<()> {
+        let (t, ne) = (tokens.len(), self.g.n_embd);
+        let prev = self.arena().f32(ne)?;
+        prev.copy_within(0, &ms.pending, 0, ne * 4)?;
+        for a in (0..t).step_by(EAGLE_ROWS) {
+            let n = EAGLE_ROWS.min(t - a);
+            let mark = self.arena().mark();
+            // feature = sum_j fc_j . rms_j(aux_j)
+            let feat = self.arena().f32(n * ne)?;
+            let (xn, tmp) = (self.arena().f32(n * ne)?, self.arena().f32(n * ne)?);
+            for j in 0..3 {
+                let xa = aux.view((j * t + a) * ne * 4, n * ne * 4)?;
+                let q = self.norm(&xa, &ea.fc_norm[j], &xn, n, ne)?;
+                self.matmul("eagle fc", &ea.fc[j], &xn, q.as_ref(), n, if j == 0 { &feat } else { &tmp })?;
+                if j > 0 {
+                    self.add(&feat, &tmp, n * ne)?;
+                }
+            }
+            if a == 0 {
+                self.vh.copy_within(0, &feat, 0, n.min(8) * ne * 4)?;
+            }
+            let hs = self.arena().f32(n * ne)?;
+            hs.copy_within(0, &prev, 0, ne * 4)?;
+            if n > 1 {
+                hs.copy_within(ne * 4, &feat, 0, (n - 1) * ne * 4)?;
+            }
+            prev.copy_within(0, &feat, (n - 1) * ne * 4, ne * 4)?;
+            self.eagle_block(ea, ms, &tokens[a..a + n], &hs, p0 + a, r0 + a)?;
+            self.arena().rewind(mark);
+        }
+        ms.pending.copy_within(0, &prev, 0, ne * 4)
+    }
+
+    /// The EAGLE-4 layer over `tokens` at positions p0.. (rotary r0..; row i: token i with hidden hs[i]), its cache
+    /// written there: its normed output rows [t][n_embd]
+    fn eagle_block(&self, ea: &crate::eagle::Eagle, ms: &MtpState, tokens: &[u32], hs: &DevBuf, p0: usize, r0: usize) -> Result<DevBuf> {
+        let (k, t, ne) = (self.k, tokens.len(), self.g.n_embd);
+        let (hq, d) = (ea.heads, ea.head_dim);
+        let emb = self.embed(tokens)?;
+        if tokens.iter().any(|t| crate::vision::is_image(*t)) {
+            self.put_images(tokens, &emb)?;
+        }
+        let (en, hn) = (self.arena().f32(t * ne)?, self.arena().f32(t * ne)?);
+        let eq = self.norm(&emb, &ea.in_norm, &en, t, ne)?;
+        let hq8 = self.norm(hs, &ea.hidden_norm, &hn, t, ne)?;
+        // [en | hn] . W^T = W_e . en + W_h . hn
+        let proj = |w: &[Mat; 2], role: &'static str| -> Result<DevBuf> {
+            let y = self.arena().f32(t * hq * d)?;
+            let y2 = self.arena().f32(t * hq * d)?;
+            self.matmul(role, &w[0], &en, eq.as_ref(), t, &y)?;
+            self.matmul(role, &w[1], &hn, hq8.as_ref(), t, &y2)?;
+            self.add(&y, &y2, t * hq * d)?;
+            Ok(y)
+        };
+        let (q, kr, v) = (proj(&ea.q, "eagle q")?, proj(&ea.k, "eagle k")?, proj(&ea.v, "eagle v")?);
+        let (qr, kn) = (self.arena().f32(t * hq * d)?, self.arena().f32(t * hq * d)?);
+        let none = String::new;
+        let w = (hq * d) as i64;
+        // the window: W keys ending at the query (decode rows exactly; a prompt's rows from its first row's window)
+        let start = match ea.window {
+            0 => 0,
+            wn if t <= 8 => (p0 + t).saturating_sub(wn),
+            wn => (p0 + 1).saturating_sub(wn),
+        };
+        let rb = d * 2;
+        let att = self.arena().f32(t * hq * d)?;
+        // SAFETY: the rows and the cache ([heads][cap][d] half) as named in q35.h; the attention reads the cache from
+        // key `start` (its pointers moved there, its positions counted from there).
+        unsafe {
+            self.op("eagle rope", none, 8 * t * hq * d, 10 * t * hq * d,
+                    || (k.rope)(self.raw(), q.fp(), w, d as i64, qr.fp(), w, t as i64, hq as i64, d as i64, d as i64, ea.theta, r0 as i64))?;
+            self.op("eagle rope", none, 8 * t * hq * d, 10 * t * hq * d,
+                    || (k.rope)(self.raw(), kr.fp(), w, d as i64, kn.fp(), w, t as i64, hq as i64, d as i64, d as i64, ea.theta, r0 as i64))?;
+            self.op("eagle kv store", none, 12 * t * hq * d, 0,
+                    || (k.kv_store)(self.raw(), kn.fp(), w, v.fp(), w, t as i64, hq as i64, d as i64, ms.cap as i64, p0 as i64, ms.k.ptr(), ms.v.ptr()))?;
+            let (kc, vc) = (ms.k.view(start * rb, ms.k.len - start * rb)?, ms.v.view(start * rb, ms.v.len - start * rb)?);
+            let pa = p0 - start;
+            let keys = t * pa + t * (t + 1) / 2;
+            let sc = (k.attn_scratch)(t as i64, hq as i64, hq as i64, d as i64, pa as i64) as usize;
+            let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
+            self.op("eagle attention", none, keys * hq * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
+                    || (k.attn)(self.raw(), qr.fp(), w, kc.ptr(), vc.ptr(), t as i64, hq as i64, hq as i64, d as i64, ms.cap as i64, pa as i64, att.fp(),
+                                part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+        }
+        // r = hs + o(att); s = r + mlp(post_norm(r)); out = norm(s)
+        let r = self.arena().f32(t * ne)?;
+        self.matmul("eagle o", &ea.o, &att, None, t, &r)?;
+        self.add(&r, hs, t * ne)?;
+        let h = self.arena().f32(t * ne)?;
+        let q8 = self.norm(&r, &ea.post_norm, &h, t, ne)?;
+        let (fg, fu) = (self.arena().f32(t * ea.n_ff)?, self.arena().f32(t * ea.n_ff)?);
+        self.matmul("eagle gate", &ea.gate, &h, q8.as_ref(), t, &fg)?;
+        self.matmul("eagle up", &ea.up, &h, q8.as_ref(), t, &fu)?;
+        let nf = t * ea.n_ff;
+        // SAFETY: n floats each.
+        self.op("swiglu", String::new, 12 * nf, 6 * nf, || unsafe { (k.swiglu_clamp)(self.raw(), fg.fp(), fu.fp(), fg.fp(), nf as i64, f32::INFINITY) })?;
+        self.matmul("eagle down", &ea.down, &fg, None, t, &h)?;
+        self.add(&r, &h, t * ne)?;
+        let out = self.arena().f32(t * ne)?;
+        self.rms(&r, &ea.norm, &out, t, ne)?;
+        Ok(out)
+    }
+
+    /// EAGLE-4 drafts after `tail` (committed at s.pos, not fed): its layer on (the pending feature, tail), then
+    /// chained on its own normed output and each draft; none past its cache
+    fn eagle_draft(&self, ea: &crate::eagle::Eagle, s: &Session, ms: &MtpState, tail: u32) -> Result<Vec<u32>> {
+        let ne = self.g.n_embd;
+        let k = self.drafts.min(s.max_ctx.saturating_sub(s.pos + 1)).min(ms.cap.saturating_sub(s.pos + 1));
+        let mut out = Vec::with_capacity(k);
+        let mut tok = tail;
+        self.on(self.last());
+        for i in 0..k {
+            self.arena().reset();
+            self.phase("eagle draft");
+            let hs = if i == 0 { &ms.pending } else { &ms.chain };
+            let y = self.eagle_block(ea, ms, &[tok], hs, s.pos + i, s.pos + i - s.shift)?;
+            ms.chain.copy_within(0, &y, 0, ne * 4)?;
+            tok = if ea.full_head { self.eagle_head_full(ea, &y)? } else { self.eagle_head(ea, &y)? };
+            out.push(tok);
+        }
+        Ok(out)
+    }
+
+    /// The draft's token from its output row y (eagle.rs): the low-rank scores, their top candidates, those scored by
+    /// the full head's rows - the best of them (ids and scores read back together, the choice made here)
+    fn eagle_head(&self, ea: &crate::eagle::Eagle, y: &DevBuf) -> Result<u32> {
+        let (k, ne, vocab, rank, c) = (self.k, self.g.n_embd, ea.head.rows, ea.lr_down.rows, ea.cands);
+        let low = self.arena().f32(rank)?;
+        let scores = self.arena().f32(vocab)?;
+        let pick = self.arena().bytes(8 * c)?;
+        let (ids, cs) = (pick.view(0, 4 * c)?, pick.view(4 * c, 4 * c)?);
+        let none = String::new;
+        // SAFETY: the Q8_0 matrices with their rows and columns, y ne floats, low rank floats, scores vocab floats, ids
+        // c int32s, cs c floats.
+        unsafe {
+            self.matmul("eagle low rank", &ea.lr_down, y, None, 1, &low)?;
+            self.op("eagle low rank", none, ea.lr_q.len + ea.lr_d.len + 4 * vocab, 2 * vocab * rank,
+                    || (k.scores_i8)(self.raw(), ea.lr_q.ptr(), ea.lr_d.ptr(), vocab as i64, low.fp(), scores.fp()))?;
+            let sc = (k.topk_scratch)(vocab as i64, c as i64) as usize;
+            let scratch = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
+            self.op("eagle top k", none, 20 * vocab, 0, || (k.topk)(self.raw(), scores.fp(), vocab as i64, c as i64, ids.ptr().cast(),
+                                                                    scratch.as_ref().map_or(std::ptr::null_mut(), |s| s.ptr().cast())))?;
+            self.op("eagle candidates", none, c * ne * 34 / 32, 2 * c * ne,
+                    || (k.rows_q8_0)(self.raw(), ea.head.buf.ptr(), ne as i64, ids.ptr().cast(), c as i64, y.fp(), cs.fp()))?;
+        }
+        let mut b = vec![0u8; 8 * c];
+        pick.read(0, &mut b)?;
+        let word = |i: usize| [b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]];
+        let best = (0..c).max_by(|&i, &j| f32::from_le_bytes(word(c + i)).total_cmp(&f32::from_le_bytes(word(c + j)))).unwrap_or(0);
+        Ok(u32::from_le_bytes(word(best)))
+    }
+
+    /// The draft's token from the full head (NS_Q35_EAGLE_HEAD=full): its logits' argmax
+    fn eagle_head_full(&self, ea: &crate::eagle::Eagle, y: &DevBuf) -> Result<u32> {
+        let logits = self.arena().f32(ea.head.rows)?;
+        self.matmul("eagle head", &ea.head, y, None, 1, &logits)?;
+        let best = self.arena().bytes(4)?;
+        // SAFETY: logits [1, vocab] float32 -> its argmax (an int32).
+        self.op("argmax", String::new, ea.head.rows * 4, 0, || unsafe { (self.k.argmax)(self.raw(), logits.fp(), 1, ea.head.rows as i64, best.ptr().cast()) })?;
+        let mut b = [0u8; 4];
+        best.read(0, &mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
     /// Drafts for several conversations at once (`tails[i]` committed at ss[i].pos, not fed): each draft step one row
     /// a conversation through the draft block, as `draft_in` makes them one at a time
     fn draft_many(&self, ss: &[&Session], tails: &[u32]) -> Result<Vec<Vec<u32>>> {
+        if self.eagle.is_some() {
+            return ss.iter().zip(tails).map(|(s, t)| self.draft_in(s, *t)).collect();
+        }
         let Some(m) = &self.mtp else { return Ok(vec![Vec::new(); ss.len()]) };
         let ne = self.g.n_embd;
         let ks: Vec<usize> = ss.iter().map(|s| if s.mtp.is_some() { self.drafts.min(s.max_ctx.saturating_sub(s.pos + 1)) } else { 0 }).collect();
@@ -1878,6 +2111,9 @@ impl<'g> Qwen35<'g> {
     /// position's hidden state, tail), then chained on its own normed output and each draft
     fn draft_in(&self, s: &Session, tail: u32) -> Result<Vec<u32>> {
         let Some(ms) = &s.mtp else { return Ok(Vec::new()) };
+        if let Some(ea) = &self.eagle {
+            return self.eagle_draft(ea, s, ms, tail);
+        }
         let k = self.drafts.min(s.max_ctx.saturating_sub(s.pos + 1));
         let mut out = Vec::with_capacity(k);
         let mut tok = tail;
@@ -1933,7 +2169,11 @@ impl<'g> Qwen35<'g> {
         // the caches and states, checked against what is free first: past the card the xe driver spills into host
         // memory (no out-of-memory error) and can take the machine down
         let last_ty = self.kv_tys[self.last()];
-        let mtp_kv = if self.mtp.is_some() { 2 * g.heads_kv * max_ctx * last_ty.row(g.head) } else { 0 };
+        let mtp_kv = match (&self.mtp, &self.eagle) {
+            (_, Some(ea)) => 2 * ea.heads * max_ctx.min(ea.ctx) * ea.head_dim * 2,
+            (Some(_), _) => 2 * g.heads_kv * max_ctx * last_ty.row(g.head),
+            _ => 0,
+        };
         // per GPU: its layers' share (the draft block's cache on the last)
         for (i, d) in self.devs.iter().enumerate() {
             let full = (d.lb..d.le).filter(|l| g.full(*l)).count();
@@ -1960,11 +2200,18 @@ impl<'g> Qwen35<'g> {
                 LState::Linear { s, conv }
             });
         }
-        let mtp = match &self.mtp {
-            Some(_) => {
-                let n = g.heads_kv * max_ctx * last_ty.row(g.head);
+        // the draft's cache: MTP's in the target's form, EAGLE's [40][its positions][128] half
+        let shape = match (&self.mtp, &self.eagle) {
+            (_, Some(ea)) => Some((ea.heads, max_ctx.min(ea.ctx), ea.head_dim * 2)),
+            (Some(_), _) => Some((g.heads_kv, max_ctx, last_ty.row(g.head))),
+            _ => None,
+        };
+        let mtp = match shape {
+            Some((heads, cap, rb)) => {
+                let n = heads * cap * rb;
                 let gpu = &self.devs[self.last()].gpu;
-                let ms = MtpState { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)?, pending: DevBuf::f32(gpu, g.n_embd)?, chain: DevBuf::f32(gpu, g.n_embd)? };
+                let ms = MtpState { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)?, pending: DevBuf::f32(gpu, g.n_embd)?, chain: DevBuf::f32(gpu, g.n_embd)?,
+                                    heads, cap };
                 ms.pending.fill(0)?;
                 Some(ms)
             }
@@ -2013,11 +2260,11 @@ impl<'g> Qwen35<'g> {
             }
         }
         if let (Some(d), Some(sm)) = (&dst.mtp, &src.mtp) {
-            for h in 0..g.heads_kv {
-                let rb = kv_rb(&sm.k, g.heads_kv, src.max_ctx);
-                let n = src.pos * rb;
-                d.k.copy_within(h * dst.max_ctx * rb, &sm.k, h * src.max_ctx * rb, n)?;
-                d.v.copy_within(h * dst.max_ctx * rb, &sm.v, h * src.max_ctx * rb, n)?;
+            let rb = kv_rb(&sm.k, sm.heads, sm.cap);
+            let n = src.pos.min(sm.cap).min(d.cap) * rb;
+            for h in 0..sm.heads {
+                d.k.copy_within(h * d.cap * rb, &sm.k, h * sm.cap * rb, n)?;
+                d.v.copy_within(h * d.cap * rb, &sm.v, h * sm.cap * rb, n)?;
             }
             d.pending.copy_within(0, &sm.pending, 0, g.n_embd * 4)?;
         }
@@ -2052,6 +2299,11 @@ impl<'g> Qwen35<'g> {
     /// whether a quantized attention cache is rotated (NS_Q35_KV_ROT)
     pub fn kv_rotated(&self) -> bool {
         self.kv_rot
+    }
+
+    /// whether the drafts are EAGLE-4's (else MTP's)
+    pub fn drafts_with_eagle(&self) -> bool {
+        self.eagle.is_some()
     }
 
     pub fn has_draft(&self) -> bool {
@@ -2102,7 +2354,7 @@ impl<'g> Qwen35<'g> {
 
     /// Whether `step_many` steps conversations together (else one after another)
     pub fn steps_together(&self) -> bool {
-        true
+        self.eagle.is_none()
     }
 
     /// The next committed token(s) of several conversations, as `step` gives each alone: their verify rows ([token,
@@ -2112,7 +2364,8 @@ impl<'g> Qwen35<'g> {
         let _w = self.work.lock().unwrap();
         let n = ss.len();
         let drafting: Vec<bool> = (0..n).map(|i| ds[i].mtp && self.drafts > 0 && ss[i].mtp.is_some()).collect();
-        let together = n <= 2 || !drafting.iter().any(|d| *d);
+        // EAGLE: its features come from a single conversation's pass (`pass_batch` does not make them)
+        let together = (n <= 2 || !drafting.iter().any(|d| *d)) && self.eagle.is_none();
         if !together || (drafting.iter().any(|d| *d) && n == 2 && !self.second_set()?) {
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
@@ -2407,12 +2660,12 @@ impl<'g> Qwen35<'g> {
             }
         }
         if let Some(ms) = &s.mtp {
+            let rb = kv_rb(&ms.k, ms.heads, ms.cap);
+            let n = s.pos.min(ms.cap) * rb;
             for c in [&ms.k, &ms.v] {
-                let rb = kv_rb(c, g.heads_kv, s.max_ctx);
-                let mut b = vec![0u8; g.heads_kv * s.pos * rb];
-                for h in 0..g.heads_kv {
-                    let n = s.pos * rb;
-                    c.read(h * s.max_ctx * rb, &mut b[h * n..(h + 1) * n])?;
+                let mut b = vec![0u8; ms.heads * n];
+                for h in 0..ms.heads {
+                    c.read(h * ms.cap * rb, &mut b[h * n..(h + 1) * n])?;
                 }
                 bufs.push(b);
             }
@@ -2461,15 +2714,15 @@ impl<'g> Qwen35<'g> {
             }
         }
         if let Some(ms) = &s.mtp {
+            let rb = kv_rb(&ms.k, ms.heads, ms.cap);
+            let n = ck.pos.min(ms.cap) * rb;
             for c in [&ms.k, &ms.v] {
                 let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's cache"))?;
-                let rb = kv_rb(c, g.heads_kv, s.max_ctx);
-                        let n = ck.pos * rb;
-                if b.len() != g.heads_kv * n {
+                if b.len() != ms.heads * n {
                     return Err(e("a checkpoint of another shape"));
                 }
-                for h in 0..g.heads_kv {
-                    c.write(h * s.max_ctx * rb, &b[h * n..(h + 1) * n])?;
+                for h in 0..ms.heads {
+                    c.write(h * ms.cap * rb, &b[h * n..(h + 1) * n])?;
                 }
             }
             let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's state"))?;

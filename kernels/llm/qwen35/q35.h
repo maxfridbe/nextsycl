@@ -55,6 +55,9 @@ int ns_q35_softmax_rows(ns_gpu* g, float* x, int64_t rows, int64_t n, float scal
 /* The cache [Hkv][cap][D] half: rows k [T, Hkv x D] (ks floats apart) and v (vs apart) at positions p0.. */
 int ns_q35_kv_store(ns_gpu* g, const float* k, int64_t ks, const float* v, int64_t vs, int64_t T, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
                     void* kc, void* vc);
+/* As ns_q35_qk_norm_rope without the norm (the EAGLE-4 draft's q and k: plain rotary positions) */
+int ns_q35_rope(ns_gpu* g, const float* src, int64_t ss, int64_t hs, float* dst, int64_t ds, int64_t T, int64_t H, int64_t D, int64_t n_rot,
+                float theta, int64_t p0);
 /* Floats of scratch ns_q35_attn needs for T rows of Hq heads (Hkv key heads) x D at positions p0.. (0: none) */
 int64_t ns_q35_attn_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0);
 /* Causal attention of rows q [T, Hq x D] (qs floats apart) at positions p0.. against the cache (D 256, Hq / Hkv 6 or
@@ -72,6 +75,16 @@ int ns_q35_expand(ns_gpu* g, const float* src, int64_t ss, float* dst, int64_t T
 int ns_q35_gdn_out(ns_gpu* g, const float* o, const float* z, int64_t zs, const float* w, float* y, int64_t T, int64_t H, int64_t d, float eps);
 /* The index of each row's largest value (the lowest on a tie): x [rows, n] -> out [rows] */
 int ns_q35_argmax(ns_gpu* g, const float* x, int64_t rows, int64_t n, int32_t* out);
+/* The indices of x's k largest of n values (in no order; ties at the k-th taken as found): radix selects - each of 128
+ * slices' top k, then the top k of those (the EAGLE-4 draft's low-rank head: its candidates). Scratch: the bytes / 4 of
+ * ns_q35_topk_scratch (0: none - one work-group over all of x) */
+int64_t ns_q35_topk_scratch(int64_t n, int64_t k);
+int ns_q35_topk(ns_gpu* g, const float* x, int64_t n, int64_t k, int32_t* ids, void* scratch);
+/* out[r] = row r of q [rows][128] int8 (its scales d [rows][4] half: blocks of 32) . x: the EAGLE-4 low-rank head's scores */
+int ns_q35_scores_i8(ns_gpu* g, const void* q, const void* d, int64_t rows, const float* x, float* out);
+/* out[r] = row ids[r] (r without ids) of a Q8_0 matrix [*, cols] . x: the EAGLE-4 draft's candidates scored by the full
+ * head, and its low-rank scores */
+int ns_q35_rows_q8_0(ns_gpu* g, const void* w, int64_t cols, const int32_t* ids, int64_t rows, const float* x, float* out);
 
 #ifdef __cplusplus
 }

@@ -35,6 +35,14 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   and 5 slower), verifies [token, drafts] in one pass and keeps what the sampled tokens match, so what is committed
   is distributed as plain sampling. Verify rows are bit for bit the one-token decode's (`spec-check --rows 2..4`).
   `--no-mtp` turns it off. Q8_0 with MTP fits its catalog 32K context on one card, not 40K.
+- **EAGLE-4** (`llm/qwen35/src/eagle.rs`, opt-in: `NS_Q35_EAGLE=DIR`, or `auto` for an `eagle4/` folder beside the
+  model): the EAGLE-4 draft for Qwen3.8-27B (`LlamaForCausalLMEagle4`, safetensors, kept as Q8_0) in MTP's place on
+  one GPU. One Llama layer (40 heads of 128, a 4,096-key window) over `fc` of the residual stream after layers 3, 31
+  and 59; its low-rank head's 128 candidates (`ns_q35_topk`) scored by the full head's rows. It drafts no better than
+  MTP here (2026-10-23, B70, Q4, 512 greedy tokens, 3 drafts: code 57.6 tok/s with 81% of drafts kept against MTP's
+  55.8 and 83%; prose 43.1 / 42.8 at 63%; a 14K prompt read 960 / 1,111 tok/s - its layer runs over every prompt
+  row), and it does not draft past its cache (`NS_Q35_EAGLE_CTX`, 32K) or step conversations together, so MTP stays
+  the default.
 - **Two cards** (`--gpu all`, or `--gpu 1,0`: the B65, then the B70; the `-256k` catalog entries): the layers split
   so the last GPU (the server orders them weakest first) takes as many as fit beside the head, the draft block and
   the planned context's caches, and the one before it the rest - a GPU the layers do not reach is not used, so a

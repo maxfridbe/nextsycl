@@ -11,3 +11,4 @@ nextsycl-diffusion.workspace = true
 nextsycl-gguf.workspace = true
 nextsycl-llm.workspace = true
 nextsycl-tok.workspace = true
+serde_json.workspace = true
