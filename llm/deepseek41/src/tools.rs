@@ -286,10 +286,33 @@ fn kernels_xq(m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &crate::ops:
                     let yq = DevBuf::f32(g, NC * rows).map_err(e)?;
                     o.std_mmvq(ty, &tab, NC, &xs, NC, (&yq, 0), NC, rows, cols).map_err(e)?;
                     g.sync().map_err(e)?;
-                    compare(&yq.to_f32().map_err(e)?, &yw).0
+                    let err = compare(&yq.to_f32().map_err(e)?, &yw).0;
+                    // its time: 6 entries (a decode token's experts) of this matrix, one column each, 50 launches
+                    let mut tb6: Vec<u8> = Vec::new();
+                    for _ in 0..6 {
+                        tb6.extend((src.ptr() as u64).to_le_bytes());
+                    }
+                    for c in 0..6 {
+                        let mut m = vec![1 | tag, c as i32, c as i32];
+                        m.resize(10, 0);
+                        for v in m {
+                            tb6.extend(v.to_le_bytes());
+                        }
+                    }
+                    let tab6 = DevBuf::new(g, tb6.len()).map_err(e)?;
+                    tab6.write(0, &tb6).map_err(e)?;
+                    o.std_mmvq(ty, &tab6, 6, &xs, NC, (&yq, 0), 6, rows, cols).map_err(e)?;
+                    g.sync().map_err(e)?;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..50 {
+                        o.std_mmvq(ty, &tab6, 6, &xs, NC, (&yq, 0), 6, rows, cols).map_err(e)?;
+                    }
+                    g.sync().map_err(e)?;
+                    let us = t0.elapsed().as_secs_f64() * 1e6 / 50.0;
+                    (err, us, 6.0 * mat as f64 / (us * 1e3))
                 };
-                println!("{:<10} {:<5} L{l:<2} [{rows} x {cols}] {note}; mixed 8-column product rel err {yrel:.2e}; 3 entries at 1 / 2 / 4 columns {}; split-Q8 {q8:.1e}",
-                         ty.name(), role, multi.join(" / "));
+                println!("{:<10} {:<5} L{l:<2} [{rows} x {cols}] {note}; mixed 8-column product rel err {yrel:.2e}; 3 entries at 1 / 2 / 4 columns {}; split-Q8 {:.1e}, 6 entries {:.0} us ({:.0} GB/s)",
+                         ty.name(), role, multi.join(" / "), q8.0, q8.1, q8.2);
             }
         }
     }

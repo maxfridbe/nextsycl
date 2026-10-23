@@ -12,6 +12,7 @@
 #include "ds41.h"
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <dpct/dpct.hpp>
 #include <algorithm>
 #include <cstdlib>
@@ -439,15 +440,16 @@ struct MQ3K {
         W r;
         r.lo = sycl::int4(code(q0.x(), h0.x()), code(q0.y(), h0.y()), code(q0.z(), h0.z()), code(q0.w(), h0.w()));
         r.hi = sycl::int4(code(q1.x(), h1.x()), code(q1.y(), h1.y()), code(q1.z(), h1.z()), code(q1.w(), h1.w()));
+        // lane g's scales 2g and 2g + 1: their low nibbles in the byte pair at (2g) % 8 (high nibbles for g >= 4), their top
+        // 2 bits in the pair at 8 + (2g) % 4 (shifted by 2 (g / 2)) - two 2-byte loads; byte loads at the lanes' own
+        // offsets were half this product's time
         const uint8_t* sc = p + 96;
-        auto scale = [&](int i) {
-            const int lo = i < 8 ? (sc[i] & 0xF) : (sc[i - 8] >> 4);
-            const int hi = (sc[8 + (i & 3)] >> (2 * (i >> 2))) & 3;
-            return (lo | (hi << 4)) - 32;
-        };
+        const uint32_t lw = *reinterpret_cast<const uint16_t*>(sc + ((2 * g) & 7)), hw = *reinterpret_cast<const uint16_t*>(sc + 8 + ((2 * g) & 3));
+        const int ls = g >= 4 ? 4 : 0, hs = 2 * (g >> 1);
+        auto scale = [&](int h) { return int(((lw >> (8 * h + ls)) & 15) | (((hw >> (8 * h + hs)) & 3) << 4)) - 32; };
         const float d = (float) *reinterpret_cast<const sycl::half*>(p + 108);
-        r.d0 = d * (float) scale(2 * g);
-        r.d1 = d * (float) scale(2 * g + 1);
+        r.d0 = d * (float) scale(0);
+        r.d1 = d * (float) scale(1);
         return r;
     }
     static float dot(const W& r, const X2& v) {
@@ -573,8 +575,8 @@ void run(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int entries,
     const std::size_t nsg = std::size_t(blocks) * WARPS, chunk = ((rows + nsg - 1) / nsg + R - 1) / R * R;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
-        h.parallel_for(sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
-                       [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(32)]] {
+        const sycl::nd_range<3> ndr(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP));
+        auto kern = [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(32)]] {
                            uint32_t* t = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
                            fill_tab<F>(t, it);
                            const int lane = int(it.get_local_id(2)), warp = int(it.get_local_id(1));
@@ -623,7 +625,10 @@ void run(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int entries,
                                    if (lane == 0 && r + j < r1) y[std::size_t(me[1]) * n_out + row + j] = v[j];
                                }
                            }
-                       });
+                       };
+        // the mixed form's three loaders in one kernel: the large register file (half the threads a core) instead of spills
+        if constexpr (is_mixed<F>) h.parallel_for(ndr, sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>}, kern);
+        else h.parallel_for(ndr, kern);
     });
 }
 
