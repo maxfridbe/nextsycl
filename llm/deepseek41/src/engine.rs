@@ -719,6 +719,32 @@ fn read_expert_par(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8], force: boo
     res.into_iter().collect()
 }
 
+/// Tensor t (n values) as q4_K: from the cache (NS_DS41_Q4K_CACHE, a directory; the file named by the model file, its
+/// size, the tensor's offset and name, its size checked) or requantized and kept there - NS_DS41_DENSE_Q4K's
+/// requantization was ~26 s of a load's CPU time for the XQ file (exact 16.7 s, fast 42.3 s)
+fn q4k_of(m: &Model, t: &Tensor, n: usize, from: crate::requant::From) -> Result<Vec<u8>> {
+    let want = n / 256 * 144;
+    let path = std::env::var("NS_DS41_Q4K_CACHE").ok().filter(|d| !d.is_empty()).map(|d| {
+        let f = &m.file.paths[t.shard];
+        let len = std::fs::metadata(f).map_or(0, |x| x.len());
+        let stem = f.file_name().map_or("model".into(), |s| s.to_string_lossy().into_owned());
+        std::path::Path::new(&d).join(format!("{stem}.{len:x}.{:x}.{}.q4k", t.offset, t.name))
+    });
+    if let Some(b) = path.as_ref().and_then(|p| std::fs::read(p).ok()).filter(|b| b.len() == want) {
+        return Ok(b);
+    }
+    let host = m.file.read(t).map_err(e)?;
+    let q = crate::requant::to_q4k(&host, n, from);
+    if let Some(p) = &path {
+        // kept for the next load (a failure only costs the next load the requantization again)
+        let tmp = p.with_extension("tmp");
+        if p.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::write(&tmp, &q).is_ok() {
+            let _ = std::fs::rename(&tmp, p);
+        }
+    }
+    Ok(q)
+}
+
 /// The model's files opened for O_DIRECT (NS_DS41_ODIRECT=1; default 0: buffered), for the experts' reads: one cold expert
 /// is faster read straight from the drive (IQ2_XXS, three slabs: 3.7 ms buffered, 2.5 ms direct) but decode then loses the
 /// page cache's hits on the cold experts that repeat (13.6 -> 12.7 tok/s), so it is opt-in
@@ -2332,7 +2358,6 @@ impl Part {
                 let t = m.tensor(l, r).ok_or_else(|| Error(format!("block {l}: {r:?} missing")))?;
                 let n = t.elements() as usize;
                 let cols = *t.shape.last().unwrap_or(&1) as usize;
-                let host = m.file.read(t).map_err(e)?;
                 let to_q4k = dense_q4k() && n.is_multiple_of(256) && cols.is_multiple_of(256)
                     && match t.ty {
                         GType::Q8_0 => dense_q4k_role(r),
@@ -2348,12 +2373,13 @@ impl Part {
                         GType::F16 => crate::requant::From::F16,
                         _ => crate::requant::From::Q8_0,
                     };
-                    let q = crate::requant::to_q4k(&host, n, from);
+                    let q = q4k_of(m, t, n, from)?;
                     let raw = DevBuf::new(gpu, q.len())?;
                     raw.write(0, &q)?;
                     bytes += q.len() as u64;
                     (raw, GType::Q4K)
                 } else {
+                    let host = m.file.read(t).map_err(e)?;
                     let raw = DevBuf::new(gpu, t.bytes as usize)?;
                     raw.write(0, &host)?;
                     bytes += t.bytes;

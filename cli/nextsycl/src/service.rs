@@ -144,6 +144,8 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
             let _ = std::fs::copy(&shared, d.join(&own));
         }
         args.extend(["-e".into(), format!("NS_EXPERT_PROFILE=/cache/{own}")]);
+        // the dense weights the deepseek41 engine requantizes to q4_K (NS_DS41_DENSE_Q4K), kept between loads
+        args.extend(["-e".into(), "NS_DS41_Q4K_CACHE=/cache/q4k".into()]);
     }
     args.extend(["-e".into(), "NEXTSYCL_LIB=/app/libnextsycl-llm.so".into(), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // engine settings the server reads from its environment (NS_KV=q8: the latent cache in q8; NS_SILO=0: no silos)
