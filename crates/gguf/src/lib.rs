@@ -72,6 +72,9 @@ pub enum GType {
     MXFP8,
     /// GSQ-RCO's 2-bit type (Qwen3.8-Flash-Next's files): 64 values, an f16 scale and 2-bit codes
     Q2_0,
+    /// llama-tq's group-128 ternary type (code 143; the DeepSeek-V4.1 XQ file's experts): 128 values {-1, 0, +1} x an f16
+    /// scale, 5 trits a byte - 28 bytes
+    Ptq1_0,
     /// YoungAi's vector-quantized expert container (DeepSeek-V4.1's `ffn_exps_vq.blob`, a `DQVL` blob of every expert's
     /// gate, up and down): opaque bytes, shape [bytes]. Its code (42) is Q2_0's too: a tensor named `*.blob` is this one
     VqBlob,
@@ -119,6 +122,7 @@ impl GType {
             43 => MXFP8,
             42 => Q2_0,
             44 => Fp8B32,
+            143 => Ptq1_0,
             _ => return None,
         })
     }
@@ -162,6 +166,7 @@ impl GType {
             MXFP8 => 43,
             Q2_0 | VqBlob => 42,
             Fp8B32 => 44,
+            Ptq1_0 => 143,
         }
     }
 
@@ -183,6 +188,7 @@ impl GType {
             MXFP4 => (32, 17),
             MXFP8 => (32, 33),
             Q2_0 => (64, 18),
+            Ptq1_0 => (128, 28),
             VqBlob => (1, 1),
             Fp8B32 => (1024, 1025),
             Q2K => (256, 84),
@@ -255,6 +261,7 @@ impl GType {
             Q2_0 => "Q2_0",
             VqBlob => "VQ_BLOB",
             Fp8B32 => "FP8_32X32",
+            Ptq1_0 => "PTQ1_0",
         }
     }
 }

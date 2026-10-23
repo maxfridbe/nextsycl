@@ -480,6 +480,113 @@ struct StdExp {
     ty: [GType; 3],
     /// each matrix's bytes in an expert
     mat: [usize; 3],
+    /// the XQ file's: each expert its own types
+    xq: Option<XqExp>,
+}
+
+/// The XQ file's layer: its experts in up to three types (index 0 Q3_K, 1 Q2_0, 2 PTQ1_0), a tensor a type and role
+/// holding that type's experts in id order. A slot's layout is the layer's: gate at 0, up at the largest gate's bytes,
+/// down after both (`LayerVq`'s gate / up / down), whatever an expert's types.
+struct XqExp {
+    /// [type][gate, up, down]
+    t: [[Option<Tensor>; 3]; 3],
+    /// each expert's gate | up type, its index among them, its down type, its index among those
+    ex: Vec<(u8, u32, u8, u32)>,
+    /// a gate | up matrix's bytes and a down's, by type
+    gu_mat: [usize; 3],
+    down_mat: [usize; 3],
+}
+
+/// The XQ types' index (in the pointer's tag: the silo's mixed products, T_MIXED_GU / T_MIXED_DOWN)
+const XQ_TYPES: [GType; 3] = [GType::Q3K, GType::Q2_0, GType::Ptq1_0];
+/// the silo's type codes for a mixed product: gate | up, down
+const T_MIXED_GU: u32 = 1000;
+const T_MIXED_DOWN: u32 = 1001;
+
+impl LayerVq {
+    /// What an expert's entries carry in their first meta word (beside the column count, at most 8) for the mixed
+    /// products: its gate | up type index in bits 8-11, its down's in 12-15 (0 for every other form)
+    fn tag(&self, x: u64) -> i32 {
+        match self.std.as_ref().and_then(|s| s.xq.as_ref()) {
+            Some(q) => {
+                let (gt, _, dt, _) = q.ex[x as usize];
+                ((gt as i32) | ((dt as i32) << 4)) << 8
+            }
+            None => 0,
+        }
+    }
+    /// Expert x's matrix `which` (0 gate, 1 up, 2 down): its tensor, its first byte in it, its bytes, its type
+    fn mat_of(&self, x: u64, which: usize) -> Option<(&Tensor, u64, usize, GType)> {
+        let s = self.std.as_ref()?;
+        match &s.xq {
+            Some(q) => {
+                let (gt, gi, dt, di) = q.ex[x as usize];
+                let (k, i, bytes) = if which == 2 { (dt as usize, di as u64, q.down_mat[dt as usize]) } else { (gt as usize, gi as u64, q.gu_mat[gt as usize]) };
+                Some((q.t[k][which].as_ref()?, i * bytes as u64, bytes, XQ_TYPES[k]))
+            }
+            None => Some((&s.t[which], x * s.mat[which] as u64, s.mat[which], s.ty[which])),
+        }
+    }
+    /// where matrix `which` starts in a slot
+    fn mat_at(&self, which: usize) -> usize {
+        [self.gate, self.up, self.down][which]
+    }
+}
+
+/// The XQ file's layer: the type maps, each type's tensors, every expert's place
+fn layer_xq(m: &Model, l: u64) -> Result<LayerVq> {
+    let g = &m.g;
+    let (d, f) = (g.n_embd as usize, g.ffn_expert as usize);
+    let ne = g.experts(l).0 as usize;
+    let map = |role: &str| -> Result<Vec<u8>> {
+        let name = format!("blk.{l}.ffn_exps_{role}_type");
+        let t = m.file.tensor(&name).ok_or_else(|| Error(format!("{name} is missing")))?;
+        let raw = m.file.read(t).map_err(e)?;
+        let v: Vec<i32> = raw.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        if v.len() != ne {
+            return Err(Error(format!("{name}: {} entries, {ne} experts", v.len())));
+        }
+        v.into_iter().map(|c| XQ_TYPES.iter().position(|t| t.code() == c as u32).map(|k| k as u8)
+            .ok_or_else(|| Error(format!("{name}: type {c}, the engine takes Q3_K, Q2_0 and PTQ1_0")))).collect()
+    };
+    let (gu, dn) = (map("gu")?, map("down")?);
+    let tname = |k: usize| ["q3_k", "q2_0", "ptq1_0"][k];
+    let mut t: [[Option<Tensor>; 3]; 3] = Default::default();
+    let (mut gu_mat, mut down_mat) = ([0usize; 3], [0usize; 3]);
+    for k in 0..3 {
+        gu_mat[k] = XQ_TYPES[k].bytes((f * d) as u64).ok_or("XQ: rows that are not whole blocks")? as usize;
+        down_mat[k] = XQ_TYPES[k].bytes((d * f) as u64).ok_or("XQ: rows that are not whole blocks")? as usize;
+        for (w, role) in ["gate", "up", "down"].iter().enumerate() {
+            let want = (if w == 2 { &dn } else { &gu }).iter().filter(|x| **x as usize == k).count();
+            let name = format!("blk.{l}.ffn_{role}_exps.{}.weight", tname(k));
+            match m.file.tensor(&name) {
+                Some(tt) => {
+                    let mb = if w == 2 { down_mat[k] } else { gu_mat[k] };
+                    if tt.ty != XQ_TYPES[k] || tt.bytes as usize != mb * want {
+                        return Err(Error(format!("{name}: {} {} bytes, {want} experts of {mb} expected", tt.ty.name(), tt.bytes)));
+                    }
+                    t[k][w] = Some(tt.clone());
+                }
+                None if want == 0 => {}
+                None => return Err(Error(format!("{name} is missing ({want} experts of the type)"))),
+            }
+        }
+    }
+    let (mut ngu, mut ndn) = ([0u32; 3], [0u32; 3]);
+    let ex: Vec<(u8, u32, u8, u32)> = (0..ne).map(|x| {
+        let (a, b) = (gu[x] as usize, dn[x] as usize);
+        let r = (gu[x], ngu[a], dn[x], ndn[b]);
+        ngu[a] += 1;
+        ndn[b] += 1;
+        r
+    }).collect();
+    let present = |v: &[u8], k: usize| v.iter().any(|x| *x as usize == k);
+    let g_max = (0..3).filter(|&k| present(&gu, k)).map(|k| gu_mat[k]).max().unwrap_or(0);
+    let d_max = (0..3).filter(|&k| present(&dn, k)).map(|k| down_mat[k]).max().unwrap_or(0);
+    let first = t.iter().flatten().flatten().next().cloned().ok_or_else(|| Error(format!("block {l}: no expert tensors")))?;
+    let ty = [XQ_TYPES[gu[0] as usize], XQ_TYPES[gu[0] as usize], XQ_TYPES[dn[0] as usize]];
+    Ok(LayerVq { blob: first.clone(), starts: Vec::new(), span: 2 * g_max + d_max, gate: 0, up: g_max, down: 2 * g_max, nbit: 0, cb_bytes: Vec::new(),
+                 std: Some(StdExp { t: [first.clone(), first.clone(), first], ty, mat: [g_max, g_max, d_max], xq: Some(XqExp { t, ex, gu_mat, down_mat }) }) })
 }
 
 /// The std form's layer: the merged tensors' types and each expert's three slabs
@@ -501,11 +608,14 @@ fn layer_std(m: &Model, l: u64) -> Result<LayerVq> {
         }
     }
     Ok(LayerVq { blob: t[0].clone(), starts: Vec::new(), span: mat.iter().sum(), gate: 0, up: mat[0], down: mat[0] + mat[1], nbit: 0, cb_bytes: Vec::new(),
-                 std: Some(StdExp { t, ty, mat }) })
+                 std: Some(StdExp { t, ty, mat, xq: None }) })
 }
 
 /// Reads the slot table and checks the payloads: every expert's three payloads back to back in one layout
 fn layer_vq(m: &Model, l: u64) -> Result<LayerVq> {
+    if m.g.xq {
+        return layer_xq(m, l);
+    }
     if m.g.std {
         return layer_std(m, l);
     }
@@ -559,11 +669,11 @@ fn layer_vq(m: &Model, l: u64) -> Result<LayerVq> {
 
 /// Expert `ex` of `vq`'s layer from the file into `host` (its span)
 fn read_expert(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8]) -> Result<()> {
-    if let Some(s) = &vq.std {
-        let mut at = 0;
+    if vq.std.is_some() {
         for i in 0..3 {
-            read_slab(m, &s.t[i], ex * s.mat[i] as u64, &mut host[at..at + s.mat[i]], false)?;
-            at += s.mat[i];
+            let (t, off, n, _) = vq.mat_of(ex, i).ok_or("an expert's matrix")?;
+            let at = vq.mat_at(i);
+            read_slab(m, t, off, &mut host[at..at + n], false)?;
         }
         return Ok(());
     }
@@ -573,13 +683,17 @@ fn read_expert(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8]) -> Result<()> 
 /// `read_expert`, a ggml-typed expert's three slabs on threads of their own (a synchronous read of one expert is the wait of
 /// a decode layer: 3 reads in flight keep the drive busier than 1 does)
 fn read_expert_par(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8], force: bool) -> Result<()> {
-    let Some(s) = &vq.std else { return read_expert(m, vq, ex, host) };
-    let (a, rest) = host.split_at_mut(s.mat[0]);
-    let (b, c) = rest.split_at_mut(s.mat[1]);
-    let c = &mut c[..s.mat[2]];
+    if vq.std.is_none() {
+        return read_expert(m, vq, ex, host);
+    }
+    let (a, rest) = host.split_at_mut(vq.up);
+    let (b, c) = rest.split_at_mut(vq.down - vq.up);
     let res: Vec<Result<()>> = std::thread::scope(|sc| {
         let hs: Vec<_> = [(0usize, a), (1, b), (2, c)].into_iter().map(|(i, buf)| {
-            sc.spawn(move || read_slab(m, &s.t[i], ex * s.mat[i] as u64, buf, force))
+            sc.spawn(move || {
+                let (t, off, n, _) = vq.mat_of(ex, i).ok_or_else(|| Error("an expert's matrix".into()))?;
+                read_slab(m, t, off, &mut buf[..n], force)
+            })
         }).collect();
         hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(Error("an expert reader panicked".into())))).collect()
     });
@@ -679,14 +793,10 @@ fn read_slab(m: &Model, t: &Tensor, off: u64, dst: &mut [u8], force: bool) -> Re
 /// ggml-typed one three slabs, one in each merged tensor (a job each, on different threads)
 fn expert_segs(vq: &LayerVq, x: u64, dst: usize) -> Vec<(usize, u64, usize, usize)> {
     match &vq.std {
-        Some(s) => {
-            let mut o = 0;
-            (0..3).map(|i| {
-                let seg = (s.t[i].shard, s.t[i].offset + x * s.mat[i] as u64, s.mat[i], dst + o);
-                o += s.mat[i];
-                seg
-            }).collect()
-        }
+        Some(_) => (0..3).filter_map(|i| {
+            let (t, off, n, _) = vq.mat_of(x, i)?;
+            Some((t.shard, t.offset + off, n, dst + vq.mat_at(i)))
+        }).collect(),
         None => vec![(vq.blob.shard, vq.blob.offset + vq.starts[x as usize], vq.span, dst)],
     }
 }
@@ -1261,6 +1371,10 @@ impl Part {
                lut: Option<(usize, usize)>, ncmax: usize) -> Result<()> {
         let v = &self.vq[&l];
         if let Some(s) = &v.std {
+            // the XQ file's: each entry's type its own (in its first meta word), on the float32 kernel
+            if s.xq.is_some() {
+                return self.ops.std_mmv(if down { T_MIXED_DOWN } else { T_MIXED_GU }, table, entries, x, y, y_rows, rows, cols, ncmax);
+            }
             let ty = s.ty[if down { 2 } else { 0 }].code();
             // one column an entry (decode) with x's column count known: the split-Q8 products (NS_DS41_STD_Q8=0: float32)
             if let Some((xc, _)) = lut.filter(|_| ncmax <= 1 && std_q8() && self.ops.std_mmvq_supported(ty, cols)) {
@@ -2087,7 +2201,7 @@ impl Part {
         todo.extend(layers.clone().chain(towers.iter().copied()).map(|l| (l, m.roles(l))));
         for (l, roles) in todo {
             for r in roles {
-                if matches!(r, Role::Experts | Role::ExpGate | Role::ExpUp | Role::ExpDown | Role::TokenEmbd | Role::EngramK) || (r == Role::EngramQ && !g.std) {
+                if matches!(r, Role::Experts | Role::ExpGate | Role::ExpUp | Role::ExpDown | Role::TokenEmbd | Role::EngramK) || (r == Role::EngramQ && (!g.std || g.xq)) {
                     continue; // the experts through the stores; the embedding's rows per token; q x k below
                 }
                 let t = m.tensor(l, r).ok_or_else(|| Error(format!("block {l}: {r:?} missing")))?;
@@ -2134,7 +2248,7 @@ impl Part {
                     Ok(m.file.read(t).map_err(e)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
                 };
                 // the llama.cpp form stores the product already (engram_gate)
-                let qk = if g.std {
+                let qk = if g.std && !g.xq {
                     rd(Role::EngramQ)?
                 } else {
                     let (q, k) = (rd(Role::EngramQ)?, rd(Role::EngramK)?);
@@ -2161,7 +2275,11 @@ impl Part {
         for l in layers.clone().chain(towers.iter().copied()) {
             let v = layer_vq(m, l)?;
             if let Some(s) = &v.std {
-                if ![(s.ty[0], g.n_embd), (s.ty[2], g.ffn_expert)].iter().all(|(t, c)| ops.std_supported(t.code(), *c as usize)) {
+                let types: Vec<(GType, u64)> = match &s.xq {
+                    Some(q) => q.ex.iter().flat_map(|&(gt, _, dt, _)| [(XQ_TYPES[gt as usize], g.n_embd), (XQ_TYPES[dt as usize], g.ffn_expert)]).collect(),
+                    None => vec![(s.ty[0], g.n_embd), (s.ty[2], g.ffn_expert)],
+                };
+                if !types.iter().all(|(t, c)| ops.std_supported(t.code(), *c as usize)) {
                     return Err(Error(format!("block {l}: experts of {} | {} are not taken by the kernels", s.ty[0].name(), s.ty[2].name())));
                 }
                 vq.insert(l, v);
@@ -4026,7 +4144,8 @@ impl<'g> Ds41<'g> {
         // one decode token routed on the GPU: its VRAM experts' products queued now, from the slot table; the host
         // reads the routing (ids, weights, which had no VRAM slot) after, for the rest and its bookkeeping
         let img_any = tokens.iter().any(|t| crate::vision::is_image(*t));
-        let groute = t == 1 && gpu_route() && !self.mtp && !p.draft.contains_key(&l) && p.store(l).is_ok() && used <= 8 && !img_any;
+        // (not the XQ file's: the slot table the GPU routes by has no type tags)
+        let groute = t == 1 && gpu_route() && !self.m.g.xq && !self.mtp && !p.draft.contains_key(&l) && p.store(l).is_ok() && used <= 8 && !img_any;
         let mut early: Option<(DevBuf, DevBuf, DevBuf)> = None;
         let mut early_read = None;
         if groute {
@@ -4221,6 +4340,8 @@ impl<'g> Ds41<'g> {
         let nbit = vq.nbit;
         let total: usize = by.values().map(|v| v.len()).sum();
         let lists: Vec<&Vec<(i32, f32)>> = by.values().collect();
+        // each list's expert (its pointers' type tag, the XQ file's)
+        let exids: Vec<u64> = by.keys().map(|e| *e as u64).collect();
         // the combine: per token its rows of dn, with their weights, in expert order
         let mut first = Vec::with_capacity(lists.len());
         let mut e0 = 0usize;
@@ -4273,9 +4394,8 @@ impl<'g> Ds41<'g> {
                     let mut dmeta: Vec<i32> = Vec::new();
                     for which in 0..2 {
                         for &k in set.iter() {
-                            let base = slots_of[k].ptr() as u64;
-                            ptrs.push(base + if which == 0 { vq.gate } else { vq.up } as u64);
-                            let mut m = vec![lists[k].len() as i32, (which * total + first[k]) as i32];
+                            ptrs.push(slots_of[k].ptr() as u64 + if which == 0 { vq.gate } else { vq.up } as u64);
+                            let mut m = vec![lists[k].len() as i32 | vq.tag(exids[k]), (which * total + first[k]) as i32];
                             m.extend(lists[k].iter().map(|(ti, _)| *ti));
                             m.resize(10, 0);
                             meta.extend(m);
@@ -4283,7 +4403,7 @@ impl<'g> Ds41<'g> {
                     }
                     for &k in set.iter() {
                         dptr.push(slots_of[k].ptr() as u64 + vq.down as u64);
-                        let mut m = vec![lists[k].len() as i32, first[k] as i32];
+                        let mut m = vec![lists[k].len() as i32 | vq.tag(exids[k]), first[k] as i32];
                         m.extend((0..lists[k].len()).map(|j| (first[k] + j) as i32));
                         m.resize(10, 0);
                         dmeta.extend(m);
@@ -4404,7 +4524,7 @@ impl<'g> Ds41<'g> {
                     pending = Some(tk);
                 }
                 let ts = Instant::now();
-                self.prompt_set(p, l, x, &lists, &first, &views, &resident, &dn, total)?;
+                self.prompt_set(p, l, x, &lists, &exids, &first, &views, &resident, &dn, total)?;
                 if pipe_split() {
                     o.gpu.sync()?;
                     eprintln!("[layer {l}: the {} experts in VRAM multiplied in {:.1} ms]", resident.len(), ts.elapsed().as_secs_f64() * 1e3);
@@ -4414,7 +4534,7 @@ impl<'g> Ds41<'g> {
                     if let Some(Some(tk)) = pending.take() {
                         o.await_ticket(tk)?;
                     }
-                    self.prompt_set(p, l, x, &lists, &first, &views, wave, &dn, total)?;
+                    self.prompt_set(p, l, x, &lists, &exids, &first, &views, wave, &dn, total)?;
                     let done = Some(o.mark()?);
                     free[(wi % 2) * w..(wi % 2) * w + wave.len()].fill(done);
                     if let Some(next) = waves.get(wi + 1) {
@@ -4442,7 +4562,7 @@ impl<'g> Ds41<'g> {
                 }
                 let views: Vec<Option<DevBuf>> = slots_of.iter().map(|v| v.view(0, v.len).map(Some)).collect::<Result<_>>()?;
                 let all: Vec<usize> = (0..lists.len()).collect();
-                self.prompt_set(p, l, x, &lists, &first, &views, &all, &dn, total)
+                self.prompt_set(p, l, x, &lists, &exids, &first, &views, &all, &dn, total)
             })?;
         }
         let mut t_ptr = vec![0i32];
@@ -4514,7 +4634,7 @@ impl<'g> Ds41<'g> {
     /// A prompt pass's products of experts `set` (their payloads at views[k]) for their tokens (lists, first: as moe):
     /// the few-token ones from their indices, the others expanded to fp16 for a GEMM; into dn's rows
     #[allow(clippy::too_many_arguments)]
-    fn prompt_set(&self, p: &Part, l: u64, x: &DevBuf, lists: &[&Vec<(i32, f32)>], first: &[usize], views: &[Option<DevBuf>], set: &[usize], dn: &DevBuf,
+    fn prompt_set(&self, p: &Part, l: u64, x: &DevBuf, lists: &[&Vec<(i32, f32)>], exids: &[u64], first: &[usize], views: &[Option<DevBuf>], set: &[usize], dn: &DevBuf,
                   total: usize) -> Result<()> {
         let g = &self.m.g;
         let o = &p.ops;
@@ -4547,17 +4667,18 @@ impl<'g> Ds41<'g> {
                 let mut slot = 0;
                 for &k in batch {
                     let base = views[k].as_ref().ok_or("an expert not in place")?.ptr() as u64;
+                    let tag = vq.tag(exids[k]);
                     for (ci, ch) in lists[k].chunks(MMVQ_COLS).enumerate() {
                         let j0 = ci * MMVQ_COLS;
                         for (w, off) in [(0usize, vq.gate), (1, vq.up)] {
                             gp.push(base + off as u64);
-                            let mut m = vec![ch.len() as i32, (w * slots + slot) as i32];
+                            let mut m = vec![ch.len() as i32 | tag, (w * slots + slot) as i32];
                             m.extend(ch.iter().map(|(ti, _)| *ti));
                             m.resize(10, 0);
                             gm.extend(m);
                         }
                         dp.push(base + vq.down as u64);
-                        let mut m = vec![ch.len() as i32, (first[k] + j0) as i32];
+                        let mut m = vec![ch.len() as i32 | tag, (first[k] + j0) as i32];
                         m.extend((0..ch.len()).map(|c| (slot + c) as i32));
                         m.resize(10, 0);
                         dm.extend(m);
@@ -4606,7 +4727,10 @@ impl<'g> Ds41<'g> {
                         let deq = |which: usize, rows: usize, cols: usize, dst: &DevBuf| -> Result<()> {
                             let (at, bytes) = [(vq.gate, vq.up - vq.gate), (vq.up, vq.down - vq.up), (vq.down, vq.span - vq.down)][which];
                             match &vq.std {
-                                Some(s) => o.std_dequant(s.ty[which].code(), buf, at, bytes, rows, cols, dst, true),
+                                Some(_) => {
+                                    let (_, _, n, ty) = vq.mat_of(exids[k], which).ok_or("an expert's matrix")?;
+                                    o.std_dequant(ty.code(), buf, at, n.min(bytes), rows, cols, dst, true)
+                                }
                                 None => o.vq_dequant(buf, at, bytes, cb.ok_or("no codebook")?, rows, cols, nbit, dst, true),
                             }
                         };

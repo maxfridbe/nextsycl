@@ -23,7 +23,10 @@
 namespace {
 
 // ggml type numbers
-enum : int { T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_Q5_K = 13, T_Q6_K = 14, T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ1_S = 19, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22, T_MXFP4 = 39 };
+enum : int { T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_Q5_K = 13, T_Q6_K = 14, T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ1_S = 19, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22, T_MXFP4 = 39, T_Q2_0 = 42, T_PTQ1_0 = 143 };
+// the XQ file's mixed-type experts: the products' type is each entry's own, in its first meta word beside the column
+// count (MIXED_GU: bits 8-11, the gate | up type; MIXED_DOWN: bits 12-15) - 0 Q3_K, 1 Q2_0, 2 PTQ1_0
+constexpr int T_MIXED_GU = 1000, T_MIXED_DOWN = 1001;
 
 // bytes of 256 values
 constexpr int sb_bytes(int type) {
@@ -41,6 +44,8 @@ constexpr int sb_bytes(int type) {
         case T_IQ3_S: return 110;
         case T_IQ2_S: return 82;
         case T_MXFP4: return 8 * 17;
+        case T_Q2_0: return 4 * 18;
+        case T_PTQ1_0: return 2 * 28;
         default: return 0;
     }
 }
@@ -167,6 +172,40 @@ template <> struct Deq<T_IQ4_NL> {
         const int q = g & 3, sh = 4 * (q >> 1);
         const uint8_t* qs = bl + 2 + 8 * (q & 1);
         for (int j = 0; j < 8; ++j) w[j] = d * (float) kvalues_iq4nl[(qs[j] >> sh) & 15];
+    }
+};
+
+// Q2_0 (ggml's): four 18-byte blocks of 64 make the 256 (d, then 16 bytes: value j's 2 bits at byte j / 4, bit 2 (j % 4)),
+// the value (q - 1) d
+template <> struct Deq<T_Q2_0> {
+    static void group(const uint8_t* b, int g, float* w, const Lut& L) {
+        const uint8_t* bl = b + 18 * (g >> 3);
+        const float d = h2f(bl);
+        const uint32_t q = ld16(bl + 2 + 2 * (g & 7));
+        for (int j = 0; j < 8; ++j) w[j] = d * (float) ((int) ((q >> (2 * j)) & 3) - 1);
+    }
+};
+
+// PTQ1_0 (llama-tq's, type 143): two 28-byte blocks of 128 make the 256 - qs[0..15] values 0-79 (value m + 16 n: trit n of
+// byte m), qs[16..23] values 80-119 (80 + m + 8 n), qh[0..1] values 120-127 (120 + h + 2 n), d at byte 26; a byte's trit
+// n is ((uint8) (b * 3^n) * 3) >> 8, the value (t - 1) d
+inline int trit(uint32_t b, int n) {
+    const uint32_t p = n == 0 ? 1 : n == 1 ? 3 : n == 2 ? 9 : n == 3 ? 27 : 81;
+    return (int) ((((b * p) & 0xffu) * 3u) >> 8);
+}
+template <> struct Deq<T_PTQ1_0> {
+    static void group(const uint8_t* b, int g, float* w, const Lut& L) {
+        const uint8_t* bl = b + 28 * (g >> 4);
+        const float d = h2f(bl + 26);
+        const int v0 = (g & 15) * 8;
+        for (int j = 0; j < 8; ++j) {
+            const int v = v0 + j;
+            int t;
+            if (v < 80) t = trit(bl[v & 15], v >> 4);
+            else if (v < 120) t = trit(bl[16 + ((v - 80) & 7)], (v - 80) >> 3);
+            else t = trit(bl[24 + ((v - 120) & 1)], (v - 120) >> 1);
+            w[j] = d * (float) (t - 1);
+        }
     }
 };
 
@@ -316,6 +355,61 @@ void mmv(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int64_t entr
     });
 }
 
+// The XQ file's experts: mmv with each entry's type its own (T_MIXED_GU / T_MIXED_DOWN: bits 8-11 / 12-15 of its first
+// meta word, the column count in the low byte; 0 Q3_K, 1 Q2_0, 2 PTQ1_0 - types without grids). Not in the pointer:
+// a tag in its top byte gave garbage on the B70.
+inline void deq_mixed(int k, const uint8_t* b, int lane, float* w, const Lut& L) {
+    if (k == 0) Deq<T_Q3_K>::group(b, lane, w, L);
+    else if (k == 1) Deq<T_Q2_0>::group(b, lane, w, L);
+    else Deq<T_PTQ1_0>::group(b, lane, w, L);
+}
+template <int RPS, int NC, bool DOWN>
+void mmv_mixed(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const float* x, float* y, int64_t rows, int64_t cols) {
+    constexpr int SG = 32, RPG = 4;
+    const int64_t rgs = (rows + RPG * RPS - 1) / (RPG * RPS), nb = cols / 256;
+    q.parallel_for(sycl::nd_range<1>(entries * rgs * RPG * SG, RPG * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const auto sg = it.get_sub_group();
+        const Lut L{nullptr, nullptr};
+        const int64_t gi = it.get_group(0), e = gi / rgs, r0 = ((gi % rgs) * RPG + sg.get_group_id()[0]) * RPS;
+        const int lane = sg.get_local_id()[0];
+        const int32_t* me = meta + e * 10;
+        const int nc = me[0] & 255;
+        if (nc == 0 || r0 >= rows) return;
+        const int k = (me[0] >> (DOWN ? 12 : 8)) & 15;
+        const int SB = k == 0 ? 110 : k == 1 ? 72 : 56;
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
+        const int64_t rowb = nb * SB;
+        float acc[RPS][NC] = {};
+        for (int64_t kb = 0; kb < nb; ++kb) {
+            float w[RPS][8];
+#pragma unroll
+            for (int j = 0; j < RPS; ++j) {
+                const int64_t r = r0 + j < rows ? r0 + j : rows - 1;
+                deq_mixed(k, base + r * rowb + kb * SB, lane, w[j], L);
+            }
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                if (c >= nc) break;
+                const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(x + (int64_t) me[2 + c] * cols + kb * 256 + lane * 8);
+                const sycl::float4 a = xv[0], b = xv[1];
+#pragma unroll
+                for (int j = 0; j < RPS; ++j)
+                    acc[j][c] += w[j][0] * a.x() + w[j][1] * a.y() + w[j][2] * a.z() + w[j][3] * a.w() + w[j][4] * b.x() + w[j][5] * b.y() +
+                                 w[j][6] * b.z() + w[j][7] * b.w();
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (c >= nc) break;
+#pragma unroll
+            for (int j = 0; j < RPS; ++j) {
+                const float s = sycl::reduce_over_group(sg, acc[j][c], sycl::plus<float>());
+                if (lane == 0 && r0 + j < rows) y[(int64_t) (me[1] + c) * rows + r0 + j] = s;
+            }
+        }
+    });
+}
+
 // out [rows][cols] = the matrix as fp16 or float32, a work-item a group of 8 (work-groups of 256, the grids in local memory)
 template <int T, bool F16>
 void dequant(sycl::queue& q, const uint8_t* src, int64_t rows, int64_t cols, void* out) {
@@ -351,7 +445,7 @@ void dequant(sycl::queue& q, const uint8_t* src, int64_t rows, int64_t cols, voi
 extern "C" {
 
 int ns_ds41_std_supported(int type, int64_t cols) {
-    return sb_bytes(type) != 0 && cols > 0 && cols % 256 == 0;
+    return (sb_bytes(type) != 0 || type == T_MIXED_GU || type == T_MIXED_DOWN) && cols > 0 && cols % 256 == 0;
 }
 
 int ns_ds41_std_mmv(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* meta, int64_t entries, const float* x, float* y, int64_t rows, int64_t cols,
@@ -362,6 +456,14 @@ int ns_ds41_std_mmv(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* me
     static const int rps = [] { const char* v = std::getenv("NS_DS41_STD_RPS"); return v ? std::atoi(v) : 2; }();
     // blocks a row at a time (NS_DS41_STD_KU: 1, 2 or 4)
     static const int ku = [] { const char* v = std::getenv("NS_DS41_STD_KU"); return v ? std::atoi(v) : 1; }();
+    if (type == T_MIXED_GU || type == T_MIXED_DOWN) {
+#define MX(R, N) (type == T_MIXED_GU ? mmv_mixed<R, N, false>(g->q, ptrs, meta, entries, x, y, rows, cols) : mmv_mixed<R, N, true>(g->q, ptrs, meta, entries, x, y, rows, cols))
+#define MXNC(R) if (ncmax <= 1) MX(R, 1); else if (ncmax <= 2) MX(R, 2); else if (ncmax <= 4) MX(R, 4); else MX(R, 8);
+        if (rps == 1) { MXNC(1) } else { MXNC(2) }
+#undef MXNC
+#undef MX
+        return 0;
+    }
     switch (type) {
 #define RUN(T, R, K, N) mmv<T, R, K, N>(g->q, ptrs, meta, entries, x, y, rows, cols)
 #define BY_NC(T, R, K) if (ncmax <= 1) RUN(T, R, K, 1); else if (ncmax <= 2) RUN(T, R, K, 2); else if (ncmax <= 4) RUN(T, R, K, 4); else RUN(T, R, K, 8);
@@ -370,7 +472,7 @@ int ns_ds41_std_mmv(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* me
         else if (ku == 2) { BY_NC(T, 2, 2) } else { BY_NC(T, 2, 1) } \
         return 0;
         CASE(T_Q8_0) CASE(T_Q2_K) CASE(T_Q3_K) CASE(T_Q5_K) CASE(T_Q6_K) CASE(T_IQ2_XXS) CASE(T_IQ2_XS) CASE(T_IQ3_XXS) CASE(T_IQ1_S) CASE(T_IQ3_S) CASE(T_IQ2_S) CASE(T_MXFP4)
-        CASE(T_IQ4_NL)
+        CASE(T_IQ4_NL) CASE(T_Q2_0) CASE(T_PTQ1_0)
 #undef CASE
 #undef BY_NC
 #undef RUN
@@ -386,7 +488,7 @@ int ns_ds41_std_dequant(ns_gpu* g, int type, const void* src, int64_t rows, int6
     switch (type) {
 #define CASE(T) case T: if (f16) dequant<T, true>(g->q, s, rows, cols, out); else dequant<T, false>(g->q, s, rows, cols, out); return 0;
         CASE(T_Q8_0) CASE(T_Q2_K) CASE(T_Q3_K) CASE(T_Q5_K) CASE(T_Q6_K) CASE(T_IQ2_XXS) CASE(T_IQ2_XS) CASE(T_IQ3_XXS) CASE(T_IQ1_S) CASE(T_IQ3_S) CASE(T_IQ2_S) CASE(T_MXFP4)
-        CASE(T_IQ4_NL)
+        CASE(T_IQ4_NL) CASE(T_Q2_0) CASE(T_PTQ1_0)
 #undef CASE
         default: return ns_fail("ns_ds41_std_dequant: type");
     }

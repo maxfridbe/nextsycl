@@ -105,6 +105,10 @@ pub struct Geometry {
     /// the llama.cpp / Unsloth form of the file (arch `deepseek41`: the experts as merged `ffn_*_exps` tensors in ggml's
     /// row types, the Engram's table inside the file, its constants in the metadata) - not YoungAi's VQ form
     pub std: bool,
+    /// Xolotl's XQ file (arch `deepseek41`, Strata's metadata names): the experts per expert in Q3_K / Q2_0 / PTQ1_0
+    /// (`ffn_<role>_exps.<type>.weight`, experts in id order, and `ffn_exps_{gu,down}_type` [n_expert] naming each
+    /// one's), the Engram's rows from DeepSeek's own shards (beside the file, as the VQ form's), q and k apart
+    pub xq: bool,
 }
 
 impl Geometry {
@@ -312,19 +316,66 @@ pub struct Model<'g> {
     pub g: Geometry,
 }
 
+/// A setting's name in the XQ file's metadata (Strata's: the Hugging Face config's names)
+fn xq_name(k: &str) -> Option<&'static str> {
+    Some(match k {
+        "block_count" => "num_hidden_layers",
+        "expert_gating_func" => "scoring_func",
+        "embedding_length" => "hidden_size",
+        "expert_count" => "n_routed_experts",
+        "expert_used_count" => "num_experts_per_tok",
+        "expert_feed_forward_length" => "moe_intermediate_size",
+        "expert_weights_scale" => "routed_scaling_factor",
+        "swiglu_clamp_exp" => "swiglu_limit",
+        "attention.layer_norm_rms_epsilon" => "rms_norm_eps",
+        "attention.head_count" => "num_attention_heads",
+        "attention.key_length" => "head_dim",
+        "rope.dimension_count" => "qk_rope_head_dim",
+        "attention.q_lora_rank" => "q_lora_rank",
+        "attention.output_group_count" => "o_groups",
+        "attention.output_lora_rank" => "o_lora_rank",
+        "attention.sliding_window" => "sliding_window",
+        "attention.indexer.head_count" => "index_n_heads",
+        "attention.indexer.key_length" => "index_head_dim",
+        "attention.indexer.top_k" => "index_topk",
+        "hyper_connection.count" => "hc_mult",
+        "hyper_connection.sinkhorn_iterations" => "hc_sinkhorn_iters",
+        "hyper_connection.epsilon" => "hc_eps",
+        "rope.freq_base" => "rope_theta",
+        "attention.compress_rope_freq_base" => "compress_rope_theta",
+        "rope.scaling.factor" => "rope_scaling.factor",
+        "rope.scaling.original_context_length" => "rope_scaling.original_max_position_embeddings",
+        "rope.scaling.yarn_beta_fast" => "rope_scaling.beta_fast",
+        "rope.scaling.yarn_beta_slow" => "rope_scaling.beta_slow",
+        "context_length" => "max_position_embeddings",
+        "attention.compress_ratios" => "compress_ratios",
+        "attention.kv_source_layers" => "kv_source_layer_ids",
+        "attention.index_source_layers" => "index_source_layer_ids",
+        "attention.candidate.source_layer" => "candidate_source_layer_id",
+        "attention.candidate.topk_blocks" => "candidate_topk_blocks",
+        "attention.candidate.block_size" => "candidate_block_size",
+        _ => return None,
+    })
+}
+/// A setting by its name, or the XQ file's name for it
+fn meta<'a>(f: &'a Gguf, k: &str) -> Option<&'a Value> {
+    f.arch_meta(k).or_else(|| xq_name(k).and_then(|x| f.arch_meta(x)))
+}
 fn meta_u(f: &Gguf, k: &str) -> Result<u64> {
-    f.arch_meta(k).and_then(Value::as_u64).ok_or_else(|| Error(format!("metadata {k} is missing")))
+    // (the XQ file has some counts as floats: original_max_position_embeddings 65536.0)
+    meta(f, k).and_then(|v| v.as_u64().or_else(|| v.as_f64().filter(|x| *x >= 0.0 && x.fract() == 0.0).map(|x| x as u64)))
+        .ok_or_else(|| Error(format!("metadata {k} is missing")))
 }
 fn meta_f(f: &Gguf, k: &str, default: Option<f64>) -> Result<f64> {
-    f.arch_meta(k).and_then(|v| v.as_f64().or_else(|| v.as_array().and_then(|a| a.first()).and_then(Value::as_f64))).or(default)
+    meta(f, k).and_then(|v| v.as_f64().or_else(|| v.as_array().and_then(|a| a.first()).and_then(Value::as_f64))).or(default)
         .ok_or_else(|| Error(format!("metadata {k} is missing")))
 }
 fn meta_list(f: &Gguf, k: &str) -> Result<Vec<u64>> {
-    f.arch_meta(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).ok_or_else(|| Error(format!("metadata {k} is missing")))
+    meta(f, k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).ok_or_else(|| Error(format!("metadata {k} is missing")))
 }
 /// the first of a setting's names the file has (YoungAi's form, the llama.cpp form)
 fn alt<'a>(f: &'a Gguf, keys: &[&str]) -> Option<&'a Value> {
-    keys.iter().find_map(|k| f.arch_meta(k))
+    keys.iter().find_map(|k| meta(f, k))
 }
 fn alt_u(f: &Gguf, keys: &[&str]) -> Result<u64> {
     alt(f, keys).and_then(Value::as_u64).ok_or_else(|| Error(format!("metadata {} is missing", keys[0])))
@@ -336,10 +387,11 @@ fn alt_list(f: &Gguf, keys: &[&str]) -> Result<Vec<u64>> {
 impl<'g> Model<'g> {
     pub fn open(file: &'g Gguf) -> Result<Model<'g>> {
         let std = file.architecture() == "deepseek41";
+        let xq = std && file.tensor("blk.0.ffn_exps_gu_type").is_some();
         if !std && file.arch_meta("variant").and_then(Value::as_str) != Some("v41_flash") {
             return Err(Error("not a DeepSeek-V4.1-Flash file (architecture deepseek41, or deepseek4 variant v41_flash)".into()));
         }
-        let gating = file.arch_meta("expert_gating_func");
+        let gating = meta(file, "expert_gating_func");
         if !matches!(gating, Some(Value::Str(s)) if s == "sqrtsoftplus") && gating.and_then(Value::as_u64) != Some(4) {
             return Err(Error(format!("expert_gating_func {gating:?}: the engine takes sqrt(softplus)")));
         }
@@ -397,9 +449,10 @@ impl<'g> Model<'g> {
             cand_top: alt_u(file, &["attention.candidate.topk_blocks", "attention.indexer.candidate_top_k_blocks"]).unwrap_or(0),
             cand_block: alt_u(file, &["attention.candidate.block_size", "attention.indexer.candidate_block_size"]).unwrap_or(1),
             engram_layers: alt_list(file, &["engram.layer_ids", "ple.layers"]).unwrap_or_default(),
-            engram_heads: alt_u(file, &["engram.head_count", "ple.heads_per_ngram"]).unwrap_or(0),
-            engram_dim: alt_u(file, &["engram.head_dim", "embedding_length_per_layer_input"]).unwrap_or(0),
-            engram_ngram: alt_u(file, &["engram.max_ngram_size", "ple.ngram_size"]).unwrap_or(1),
+            // (the XQ file's metadata has the Engram's constants but not its shape: DeepSeek's, 8 heads of 256 a 2-4-gram)
+            engram_heads: alt_u(file, &["engram.head_count", "ple.heads_per_ngram"]).unwrap_or(if xq { 8 } else { 0 }),
+            engram_dim: alt_u(file, &["engram.head_dim", "embedding_length_per_layer_input"]).unwrap_or(if xq { 256 } else { 0 }),
+            engram_ngram: alt_u(file, &["engram.max_ngram_size", "ple.ngram_size"]).unwrap_or(if xq { 4 } else { 1 }),
             n_mtp,
             mtp_expert: alt_u(file, &["mtp.expert_count", "dspark.expert_count"]).unwrap_or(0),
             mtp_expert_used: alt_u(file, &["mtp.expert_used_count", "dspark.expert_used_count"]).unwrap_or(0),
@@ -408,6 +461,7 @@ impl<'g> Model<'g> {
             mtp_targets: alt_list(file, &["mtp.target_layers", "dspark.target_layers"]).unwrap_or_default(),
             markov_rank: alt_u(file, &["mtp.markov_rank", "dspark.markov_rank"]).unwrap_or(0),
             std,
+            xq,
         };
         if g.hc != 4 || g.head_dim != 512 {
             return Err(Error(format!("{} mHC streams, heads of {}: the engine takes 4 and 512", g.hc, g.head_dim)));
@@ -439,6 +493,8 @@ impl<'g> Model<'g> {
         match r {
             Role::IdxWk => "indexer.attn_k.weight",
             Role::EngramWkv => "engram_kv.weight",
+            Role::EngramQ if self.g.xq => "engram_q_norm.weight",
+            Role::EngramK if self.g.xq => "engram_k_norm.weight",
             Role::EngramQ => "engram_gate.weight",
             _ => r.name(),
         }
@@ -462,7 +518,10 @@ impl<'g> Model<'g> {
         if g.index_sources.contains(&l) {
             v.extend([Role::IdxQB, Role::IdxProj]);
         }
-        if g.std {
+        if g.xq {
+            // the experts by type: their tensors checked and read by the layer's expert table (engine::layer_xq)
+            v.extend([Role::Router, Role::RouterBias, Role::ShGate, Role::ShUp, Role::ShDown]);
+        } else if g.std {
             v.extend(MOE_STD);
         } else {
             v.extend(MOE);
@@ -470,7 +529,7 @@ impl<'g> Model<'g> {
         if g.is_engram(l) {
             // the llama.cpp form has the product of the gate's q and k as one tensor (engram_gate)
             v.extend([Role::EngramWkv, Role::EngramQ]);
-            if !g.std {
+            if !g.std || g.xq {
                 v.push(Role::EngramK);
             }
         }
@@ -544,6 +603,14 @@ impl<'g> Model<'g> {
             }
             if let Some(t) = self.file.tensor("per_layer_token_embd.weight") {
                 seen.insert(t.name.as_str());
+            }
+            // the XQ file's experts by type and their type maps
+            if self.g.xq {
+                for t in &self.file.tensors {
+                    if t.name.contains("_exps.") || t.name.contains("ffn_exps_") {
+                        seen.insert(t.name.as_str());
+                    }
+                }
             }
         }
         for l in 0..self.g.n_layer + self.g.n_mtp {

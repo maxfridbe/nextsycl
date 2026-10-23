@@ -206,6 +206,9 @@ impl Engram {
     /// The hash constants from the GGUF, the shards from `dir` (their names the metadata's table_path's), the readers.
     pub fn open(f: &Gguf, dir: &Path) -> Result<Engram> {
         if f.architecture() == "deepseek41" {
+            if f.tensor("blk.0.ffn_exps_gu_type").is_some() {
+                return Self::open_xq(f, dir);
+            }
             return Self::open_std(f);
         }
         let m = |k: &str| f.arch_meta(k).and_then(Value::as_u64).ok_or_else(|| Error(format!("metadata {k} is missing")));
@@ -228,6 +231,58 @@ impl Engram {
         let (tx, workers, pages) = Self::spawn(&tables, hd, None)?;
         Ok(Engram { layers, token_map, mult: ints(f, "engram.multipliers")?, primes: ints(f, "engram.primes")?, offsets: ints(f, "engram.offsets")?, pad, ngram,
                     heads, hd, rb: row_bytes(hd), std: None, _tables: tables, jobs: Mutex::new(Some(tx)), workers,
+                    cache: Arc::new(Mutex::new((HashMap::new(), VecDeque::new()))), read_rows: AtomicU64::new(0), cached_rows: AtomicU64::new(0), pages,
+                    wait_ns: AtomicU64::new(0) })
+    }
+
+    /// The XQ file: the hash constants in its metadata (`engram.token_map`, `.multipliers`, `.primes`, `.pad_id`; the
+    /// heads' offsets each layer's running sum of its primes - as the VQ form's `engram.offsets` holds them), the rows
+    /// from DeepSeek's own shards in `dir` (the safetensors whose header has `layers.N.engram.embed.weight`)
+    fn open_xq(f: &Gguf, dir: &Path) -> Result<Engram> {
+        let m = |k: &str| f.arch_meta(k).and_then(Value::as_u64).ok_or_else(|| Error(format!("metadata {k} is missing")));
+        let list = |k: &str| -> Result<Vec<i64>> {
+            f.arch_meta(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_i64).collect()).ok_or_else(|| Error(format!("metadata {k} is missing")))
+        };
+        let layers: Vec<u64> = list("engram.layer_ids")?.into_iter().map(|v| v as u64).collect();
+        let token_map = list("engram.token_map")?;
+        let pad = *token_map.get(m("engram.pad_id")? as usize).ok_or("engram: the pad id is past the token map")?;
+        let (ngram, heads, hd) = (4usize, 8usize, 256usize);
+        let (mult, primes) = (list("engram.multipliers")?, list("engram.primes")?);
+        let cols = (ngram - 1) * heads;
+        if mult.len() != layers.len() * ngram || primes.len() != layers.len() * cols {
+            return Err(Error("engram: the metadata's multipliers and primes do not match its layers".into()));
+        }
+        let mut offsets = Vec::with_capacity(primes.len());
+        for li in 0..layers.len() {
+            let mut at = 0i64;
+            for c in 0..cols {
+                offsets.push(at);
+                at += primes[li * cols + c];
+            }
+        }
+        // each layer's table in the shard that has it: its weights' and scales' first bytes
+        let shards: Vec<PathBuf> = std::fs::read_dir(dir).map_err(|e| Error(format!("the Engram's shards in {}: {e} (NS_DS41_ENGRAM_DIR names their directory)", dir.display())))?
+            .filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "safetensors")).collect();
+        let mut tables = Vec::new();
+        for &l in &layers {
+            let (wn, sn) = (format!("layers.{l}.engram.embed.weight"), format!("layers.{l}.engram.embed.scale"));
+            let mut found = None;
+            for p in &shards {
+                let (n, head) = safetensors_header(p)?;
+                if let (Some(w), Some(sc)) = (data_start(&head, &wn), data_start(&head, &sn)) {
+                    found = Some((p.clone(), 8 + n + w, 8 + n + sc));
+                    break;
+                }
+            }
+            let (p, weight, scale) = found.ok_or_else(|| Error(format!("the Engram's layer {l}: no shard in {} has {wn}", dir.display())))?;
+            // O_DIRECT: the 203 GB of tables read in pages must not push the experts out of the page cache
+            let file = std::fs::OpenOptions::new().read(true).custom_flags(libc_o_direct()).open(&p).or_else(|_| File::open(&p))
+                .map_err(|e| Error(format!("the Engram table {}: {e}", p.display())))?;
+            tables.push(Table { file, weight, scale });
+        }
+        let tables = Arc::new(tables);
+        let (tx, workers, pages) = Self::spawn(&tables, hd, None)?;
+        Ok(Engram { layers, token_map, mult, primes, offsets, pad, ngram, heads, hd, rb: row_bytes(hd), std: None, _tables: tables, jobs: Mutex::new(Some(tx)), workers,
                     cache: Arc::new(Mutex::new((HashMap::new(), VecDeque::new()))), read_rows: AtomicU64::new(0), cached_rows: AtomicU64::new(0), pages,
                     wait_ns: AtomicU64::new(0) })
     }
@@ -433,6 +488,30 @@ impl Engram {
 }
 
 /// O_DIRECT's value on Linux x86-64 / aarch64 (no libc crate in the workspace for one constant)
+/// A safetensors file's header: its length and its JSON
+fn safetensors_header(p: &Path) -> Result<(u64, String)> {
+    let f = File::open(p).map_err(|e| Error(format!("{}: {e}", p.display())))?;
+    let mut n = [0u8; 8];
+    f.read_exact_at(&mut n, 0).map_err(|e| Error(format!("{}: {e}", p.display())))?;
+    let n = u64::from_le_bytes(n);
+    if n > 64 << 20 {
+        return Err(Error(format!("{}: a header of {n} bytes", p.display())));
+    }
+    let mut h = vec![0u8; n as usize];
+    f.read_exact_at(&mut h, 8).map_err(|e| Error(format!("{}: {e}", p.display())))?;
+    Ok((n, String::from_utf8_lossy(&h).into_owned()))
+}
+
+/// A tensor's first data byte in a safetensors header (its `data_offsets`' first, from the data's start)
+fn data_start(head: &str, name: &str) -> Option<u64> {
+    let at = head.find(&format!("\"{name}\""))?;
+    let rest = &head[at..];
+    let o = rest.find("\"data_offsets\"")?;
+    let rest = &rest[o..];
+    let b = rest.find('[')?;
+    rest[b + 1..].split([',', ']']).next()?.trim().parse().ok()
+}
+
 fn libc_o_direct() -> i32 {
     if cfg!(target_arch = "aarch64") { 0o200000 } else { 0o40000 }
 }

@@ -129,6 +129,149 @@ fn compare(a: &[f32], b: &[f32]) -> (f64, f64) {
 /// each type, the first and a middle expert). The product against the host's W x on the weights the expansion made - or
 /// on a reference's when `NS_DS41_STD_DIR` holds `<tag>.ref.f32` (ggml's own dequantize_row_* on `<tag>.raw`, which this
 /// writes beside `<tag>.gpu.f32`), and the expansion against it
+/// ggml's dequantize_row_q2_0: blocks of 64, an f16 d, value j's 2 bits at byte j / 4, bit 2 (j % 4), (q - 1) d
+fn host_q2_0(src: &[u8], out: &mut [f32]) {
+    for (b, blk) in src.chunks_exact(18).enumerate() {
+        let d = half(u16::from_le_bytes([blk[0], blk[1]]));
+        for j in 0..64 {
+            out[b * 64 + j] = (((blk[2 + j / 4] >> (2 * (j % 4))) & 3) as i32 - 1) as f32 * d;
+        }
+    }
+}
+
+/// llama-tq's PTQ1_0 (Xolotl's ptq1_0_dequant): blocks of 128 in 28 bytes - values 0-79 trit n of byte m (m + 16 n),
+/// 80-119 of byte 16 + m (80 + m + 8 n), 120-127 of byte 24 + h (120 + h + 2 n), d at 26; trit n of b is
+/// ((uint8) (b * 3^n) * 3) >> 8, the value (t - 1) d
+fn host_ptq1_0(src: &[u8], out: &mut [f32]) {
+    let trit = |b: u8, n: u32| (((b.wrapping_mul(3u8.pow(n))) as u32 * 3) >> 8) as i32;
+    for (bi, blk) in src.chunks_exact(28).enumerate() {
+        let d = half(u16::from_le_bytes([blk[26], blk[27]]));
+        let mut dg = [0i32; 128];
+        for n in 0..5 {
+            for m in 0..16 {
+                dg[m + 16 * n] = trit(blk[m], n as u32);
+            }
+            for m in 0..8 {
+                dg[80 + m + 8 * n] = trit(blk[16 + m], n as u32);
+            }
+        }
+        for n in 0..4 {
+            for h in 0..2 {
+                dg[120 + h + 2 * n] = trit(blk[24 + h], n as u32);
+            }
+        }
+        for j in 0..128 {
+            out[bi * 128 + j] = (dg[j] - 1) as f32 * d;
+        }
+    }
+}
+
+fn half(h: u16) -> f32 {
+    let (s, e, m) = ((h >> 15) as u32, ((h >> 10) & 31) as i32, (h & 1023) as u32);
+    let v = if e == 0 { m as f32 * 2f32.powi(-24) } else if e == 31 { if m == 0 { f32::INFINITY } else { f32::NAN } } else { (1.0 + m as f32 / 1024.0) * 2f32.powi(e - 15) };
+    if s == 1 { -v } else { v }
+}
+
+/// `nextsycl kernels` for the XQ file: the silo's expansion of Q2_0 and PTQ1_0 experts against the host's (ggml's and
+/// llama-tq's layouts), and the mixed-type decode product (each entry its own type, from its pointer's tag) at 8
+/// columns against the host's W x - an expert of each type in each role
+fn kernels_xq(m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &crate::ops::Ops) -> Result<(), String> {
+    use nextsycl_core::DevBuf;
+    let e = |x: nextsycl_core::Error| x.0;
+    let gg = &m.g;
+    let (d, f) = (gg.n_embd as usize, gg.ffn_expert as usize);
+    let mut seed = 0x1234_5678u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+    };
+    for l in [0u64, 20, 39] {
+        for (k, tn) in ["q3_k", "q2_0", "ptq1_0"].iter().enumerate() {
+            for (which, role) in ["gate", "down"].iter().enumerate() {
+                let name = format!("blk.{l}.ffn_{role}_exps.{tn}.weight");
+                let Some(t) = m.file.tensor(&name) else { continue };
+                let (rows, cols) = if which == 1 { (d, f) } else { (f, d) };
+                let ty = t.ty;
+                let mat = ty.bytes((rows * cols) as u64).ok_or("not whole blocks")? as usize;
+                let raw = {
+                    let mut b = vec![0u8; mat];
+                    m.file.read_into(t, 0, &mut b).map_err(|x| x.0)?;
+                    b
+                };
+                let src = DevBuf::new(g, mat.next_multiple_of(256)).map_err(e)?;
+                src.write(0, &raw).map_err(e)?;
+                // the expansion against the host's (Q3_K: the silo's own, checked against ggml before)
+                let wd = DevBuf::f32(g, rows * cols).map_err(e)?;
+                o.std_dequant(ty.code(), &src, 0, mat, rows, cols, &wd, false).map_err(e)?;
+                g.sync().map_err(e)?;
+                let got = wd.to_f32().map_err(e)?;
+                let mut want = got.clone();
+                let mut note = String::from("expansion: the silo's");
+                if k > 0 {
+                    if k == 1 { host_q2_0(&raw, &mut want) } else { host_ptq1_0(&raw, &mut want) }
+                    let (rel, mx) = compare(&got, &want);
+                    note = format!("expansion vs host rel err {rel:.2e} (max {mx:.2e})");
+                }
+                // the mixed product at 8 columns: this expert's type in its entry's first meta word
+                const NC: usize = 8;
+                let x: Vec<f32> = (0..NC * cols).map(|_| rnd()).collect();
+                let xd = DevBuf::from_f32(g, &x).map_err(e)?;
+                let tag = ((k | (k << 4)) << 8) as i32;
+                let mut tb: Vec<u8> = (src.ptr() as u64).to_le_bytes().to_vec();
+                for v in [NC as i32 | tag, 0, 0, 1, 2, 3, 4, 5, 6, 7] {
+                    tb.extend(v.to_le_bytes());
+                }
+                let tab = DevBuf::new(g, tb.len()).map_err(e)?;
+                tab.write(0, &tb).map_err(e)?;
+                let yd = DevBuf::f32(g, NC * rows).map_err(e)?;
+                o.std_mmv(if which == 1 { 1001 } else { 1000 }, &tab, 1, &xd, (&yd, 0), NC, rows, cols, NC).map_err(e)?;
+                g.sync().map_err(e)?;
+                let y = yd.to_f32().map_err(e)?;
+                let mut yw = vec![0f32; NC * rows];
+                for c in 0..NC {
+                    for r in 0..rows {
+                        yw[c * rows + r] = (0..cols).map(|i| want[r * cols + i] as f64 * x[c * cols + i] as f64).sum::<f64>() as f32;
+                    }
+                }
+                let (yrel, _) = compare(&y, &yw);
+                // and as decode passes of 1-4 rows run it: three entries of differing column counts, at each smaller width
+                let mut multi = Vec::new();
+                for ncm in [1usize, 2, 4] {
+                    let ncs = [1, ncm, ncm.saturating_sub(1).max(1)];
+                    let mut tb: Vec<u8> = Vec::new();
+                    for _ in 0..3 {
+                        tb.extend((src.ptr() as u64).to_le_bytes());
+                    }
+                    let (mut at, mut want_y) = (0usize, Vec::new());
+                    for (en, &nc) in ncs.iter().enumerate() {
+                        let xc: Vec<usize> = (0..nc).map(|c| (en * 3 + c) % NC).collect();
+                        let mut m = vec![nc as i32 | tag, at as i32];
+                        m.extend(xc.iter().map(|&c| c as i32));
+                        m.resize(10, 0);
+                        for v in m {
+                            tb.extend(v.to_le_bytes());
+                        }
+                        for &c in &xc {
+                            want_y.extend_from_slice(&yw[c * rows..(c + 1) * rows]);
+                        }
+                        at += nc;
+                    }
+                    let tab = DevBuf::new(g, tb.len()).map_err(e)?;
+                    tab.write(0, &tb).map_err(e)?;
+                    let yd = DevBuf::f32(g, at * rows).map_err(e)?;
+                    o.std_mmv(if which == 1 { 1001 } else { 1000 }, &tab, 3, &xd, (&yd, 0), at, rows, cols, ncm).map_err(e)?;
+                    g.sync().map_err(e)?;
+                    multi.push(format!("{:.1e}", compare(&yd.to_f32().map_err(e)?, &want_y).0));
+                }
+                println!("{:<10} {:<5} L{l:<2} [{rows} x {cols}] {note}; mixed 8-column product rel err {yrel:.2e}; 3 entries at 1 / 2 / 4 columns {}", ty.name(), role, multi.join(" / "));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn kernels_std(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &crate::ops::Ops) -> Result<(), String> {
     use nextsycl_core::DevBuf;
     let e = |x: nextsycl_core::Error| x.0;
@@ -687,6 +830,9 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
     let g = nextsycl_core::Gpu::open(gpu).map_err(e)?;
     let o = Ops::new(g.clone()).map_err(e)?;
     println!("gpu: {}", g.name);
+    if m.g.xq {
+        return kernels_xq(&m, &g, &o);
+    }
     if m.g.std {
         return kernels_std(&f, &m, &g, &o);
     }
