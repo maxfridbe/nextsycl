@@ -11,7 +11,7 @@ vram_gib: 30.0
 ctx: '131072'
 tools: false
 tasks: false
-env: {NS_DS41_FREE_GIB: "1.5", NS_PREFILL_CHUNK: "16384", NS_EFFORT: "high", NS_THINK_BUDGET: "8192"}   # exact; deepseek-v4.1-flash-iq2xxs-fast is the same files with two approximations on (tg ~25 against ~14 tok/s sustained)   # the box rule: 1.5 GiB of VRAM free
+env: {NS_DS41_FREE_GIB: "1.5", NS_PREFILL_CHUNK: "16384", NS_EFFORT: "high", NS_THINK_BUDGET: "8192", NS_DS41_PIN_GIB: "34"}   # exact; deepseek-v4.1-flash-iq2xxs-fast is the same files with two approximations on (tg ~25 against ~14 tok/s sustained)   # the box rule: 1.5 GiB of VRAM free
 silo:                           # its expert kernels (std.cpp) exist only there
   name: deepseek41
   required: true
