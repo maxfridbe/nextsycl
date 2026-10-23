@@ -134,8 +134,16 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
     if let Some(d) = &cache_dir {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
         args.extend(mount(d, "/cache", false));
-        // the expert profile beside the checkpoints: decode's requests, the next load's VRAM fill order
-        args.extend(["-e".into(), "NS_EXPERT_PROFILE=/cache/expert-profile.txt".into()]);
+        // the expert profile beside the checkpoints: decode's requests, the next load's VRAM fill order - a model's own
+        // (one file for all of them mixed every model's layer / expert numbers into each one's fill order); a model
+        // without one starts from the shared file it used before
+        let name: String = arg(raw, "--name", cfg, "NS_NAME", "model").chars().map(|c| if c.is_ascii_alphanumeric() || "-._".contains(c) { c } else { '_' }).collect();
+        let own = format!("expert-profile-{name}.txt");
+        let shared = d.join("expert-profile.txt");
+        if !d.join(&own).exists() && shared.exists() {
+            let _ = std::fs::copy(&shared, d.join(&own));
+        }
+        args.extend(["-e".into(), format!("NS_EXPERT_PROFILE=/cache/{own}")]);
     }
     args.extend(["-e".into(), "NEXTSYCL_LIB=/app/libnextsycl-llm.so".into(), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // engine settings the server reads from its environment (NS_KV=q8: the latent cache in q8; NS_SILO=0: no silos)

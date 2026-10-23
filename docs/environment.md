@@ -113,7 +113,7 @@ GLM-5.3 (`llm/glm5next`, `kernels/llm/glm5next`; docs/glm5next.md).
 | `NS_DENSE_F16` | 1 | Experiment: 0 = only the experts take the fp16 XMX prompt path, not the dense matrices | llm glm5next |
 | `NS_DRAFTS` | 1 | Drafts a verify pass checks: 1, or 2 (the draft block chained on its own output) (--opt-drafts) | llm glm5next |
 | `NS_ESIMD_MAX` | the GPU's limit (B70 256, B65 128) | Experiment: most tokens of an expert the ESIMD gate/up kernel takes; 0 = never | llm glm5next |
-| `NS_EXPERT_PROFILE` | none (cli service sets /cache/expert-profile.txt) | File of layer expert weight lines: which experts fill VRAM first at load; the server writes decode's requests to it at stop (--opt-expert-profile) | llm glm5next, serve (llm server, saves it) |
+| `NS_EXPERT_PROFILE` | none (cli service sets /cache/expert-profile-<model id>.txt, a new one first copied from the shared expert-profile.txt) | File of layer expert weight lines: which experts fill VRAM first at load; the server writes decode's requests to it at stop (--opt-expert-profile) | llm glm5next, serve (llm server, saves it) |
 | `NS_FREE_MISSES` | 0 | Debug: 1 = decode's expert misses read resident slots instead (WRONG output; the speed with no copies) | llm glm5next |
 | `NS_FUSED_DOWN_MAX` | 128 | Experiment: most tokens of an expert the fused down kernel takes in prompt chunks (Q2_K only); 0 = never | llm glm5next |
 | `NS_FUSED_MAX` | 64 | Experiment: most tokens of an expert the fused gate/up kernel takes in prompt chunks (oneMKL above); 0 = never | llm glm5next |
