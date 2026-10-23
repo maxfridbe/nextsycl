@@ -265,7 +265,31 @@ fn kernels_xq(m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &crate::ops:
                     g.sync().map_err(e)?;
                     multi.push(format!("{:.1e}", compare(&yd.to_f32().map_err(e)?, &want_y).0));
                 }
-                println!("{:<10} {:<5} L{l:<2} [{rows} x {cols}] {note}; mixed 8-column product rel err {yrel:.2e}; 3 entries at 1 / 2 / 4 columns {}", ty.name(), role, multi.join(" / "));
+                // decode's split-Q8 product: 8 entries of a column each (Q8 activations: ~4e-3, the other types' too)
+                let q8 = {
+                    let mut tb: Vec<u8> = Vec::new();
+                    for _ in 0..NC {
+                        tb.extend((src.ptr() as u64).to_le_bytes());
+                    }
+                    for c in 0..NC {
+                        let mut m = vec![1 | tag, c as i32, c as i32];
+                        m.resize(10, 0);
+                        for v in m {
+                            tb.extend(v.to_le_bytes());
+                        }
+                    }
+                    let tab = DevBuf::new(g, tb.len()).map_err(e)?;
+                    tab.write(0, &tb).map_err(e)?;
+                    let ty = if which == 1 { 1001 } else { 1000 };
+                    let xs = DevBuf::new(g, o.std_q8_bytes(cols, NC)).map_err(e)?;
+                    o.std_quantize_q8(&xd, &xs, cols, NC).map_err(e)?;
+                    let yq = DevBuf::f32(g, NC * rows).map_err(e)?;
+                    o.std_mmvq(ty, &tab, NC, &xs, NC, (&yq, 0), NC, rows, cols).map_err(e)?;
+                    g.sync().map_err(e)?;
+                    compare(&yq.to_f32().map_err(e)?, &yw).0
+                };
+                println!("{:<10} {:<5} L{l:<2} [{rows} x {cols}] {note}; mixed 8-column product rel err {yrel:.2e}; 3 entries at 1 / 2 / 4 columns {}; split-Q8 {q8:.1e}",
+                         ty.name(), role, multi.join(" / "));
             }
         }
     }

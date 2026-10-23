@@ -488,9 +488,10 @@ int ns_ds41_cand_pos(ns_gpu* g, const int32_t* selc, const int32_t* cand, int32_
 // products' tables built from the layer's slot table (tab: an expert's VRAM payload or 0): gate | up entries (gtab:
 // ptrs[2u], meta[2u][10], the lookup lists [33]) and down entries (dtab: ptrs[u], meta[u][10], lists [u][33]), an expert
 // row j of dn in ascending id. info: ids[u] (ascending), weights[u] (bits), missing[u] (no VRAM slot: computed by the
-// host after it reads this). An expert not in VRAM gets an entry of no columns on a resident payload (`dummy`).
+// host after it reads this). An expert not in VRAM gets an entry of no columns on a resident payload (`dummy`). tags
+// (or null): each expert's type word, ORed into its entries' first meta word (the XQ file's mixed products).
 int ns_ds41_route1(ns_gpu* g, const float* logits, const float* bias, int64_t ne, int64_t used, float scale, const uint64_t* tab, uint64_t dummy,
-                   int64_t off_gate, int64_t off_up, int64_t off_down, uint8_t* gtab, uint8_t* dtab, int32_t* info, int32_t* ctab) {
+                   int64_t off_gate, int64_t off_up, int64_t off_down, uint8_t* gtab, uint8_t* dtab, int32_t* info, int32_t* ctab, const int32_t* tags) {
     NS_TRY
     if (used < 1 || used > 16 || ne < used || ne > 1024) return ns_fail("ns_ds41_route1: 1..16 of at most 1024 experts");
     constexpr int WG = 1024;
@@ -551,6 +552,7 @@ int ns_ds41_route1(ns_gpu* g, const float* logits, const float* bias, int64_t ne
                 const uint64_t base = tab[id[r]];
                 const bool res = base != 0;
                 const uint64_t b = res ? base : dummy;
+                const int32_t one = res ? 1 | (tags ? tags[id[r]] : 0) : 0;
                 info[j] = id[r];
                 info[used + j] = sycl::bit_cast<int32_t>(wr[r]);
                 // the combine's table (moe_combine: t_ptr [2], ent [u], then the weights)
@@ -561,13 +563,13 @@ int ns_ds41_route1(ns_gpu* g, const float* logits, const float* bias, int64_t ne
                     const int e = w * (int) used + j;
                     gp[e] = b + (uint64_t) (w == 0 ? off_gate : off_up);
                     int32_t* me = gm + e * 10;
-                    me[0] = res ? 1 : 0;
+                    me[0] = one;
                     me[1] = e;
                     for (int c = 2; c < 10; ++c) me[c] = 0;
                 }
                 dp[j] = b + (uint64_t) off_down;
                 int32_t* me = dm + j * 10;
-                me[0] = res ? 1 : 0;
+                me[0] = one;
                 me[1] = j;
                 me[2] = j;
                 for (int c = 3; c < 10; ++c) me[c] = 0;

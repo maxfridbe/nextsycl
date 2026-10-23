@@ -679,7 +679,7 @@ impl Ops {
     /// table tab [ne] (payload addresses, 0: not in VRAM); gtab / dtab / info as the kernel lays them out
     #[allow(clippy::too_many_arguments)]
     pub fn route1(&self, logits: &DevBuf, bias: &DevBuf, ne: usize, used: usize, scale: f32, tab: &DevBuf, dummy: u64, offs: (usize, usize, usize), gtab: &DevBuf,
-                  dtab: &DevBuf, info: &DevBuf, ctab: &DevBuf) -> Result<()> {
+                  dtab: &DevBuf, info: &DevBuf, ctab: &DevBuf, tags: Option<&DevBuf>) -> Result<()> {
         need!(logits, ne, "route1 logits");
         need!(bias, ne, "route1 bias");
         tab.bounds(0, ne * 8)?;
@@ -687,10 +687,14 @@ impl Ops {
         dtab.bounds(0, used * 48 + used * 33 * 4)?;
         info.bounds(0, 3 * used * 4)?;
         ctab.bounds(0, (2 + 2 * used) * 4)?;
+        if let Some(tg) = tags {
+            tg.bounds(0, ne * 4)?;
+        }
         // SAFETY: extents checked; dummy is a resident payload of the layer's span (read, never written).
         let rc = unsafe {
             (self.k.ds41_route1)(self.raw(), logits.fp(), bias.fp(), ne as i64, used as i64, scale, tab.ptr().cast(), dummy, offs.0 as i64, offs.1 as i64,
-                                 offs.2 as i64, gtab.ptr().cast(), dtab.ptr().cast(), info.ptr().cast(), ctab.ptr().cast())
+                                 offs.2 as i64, gtab.ptr().cast(), dtab.ptr().cast(), info.ptr().cast(), ctab.ptr().cast(),
+                                 tags.map_or(std::ptr::null(), |t| t.ptr().cast()))
         };
         self.ok(rc, "ds41_route1")
     }

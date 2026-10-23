@@ -93,7 +93,7 @@ int ns_ds41_kv_post(ns_gpu* g, float* kv, const float* w, int64_t T, int64_t D, 
                     float ext_factor, float mscale, float corr0, float corr1, uint16_t* ring, int64_t R);
 /* A decode token's routing on the GPU and its products' tables from the layer's slot table (k41.cpp has the layout) */
 int ns_ds41_route1(ns_gpu* g, const float* logits, const float* bias, int64_t ne, int64_t used, float scale, const uint64_t* tab, uint64_t dummy,
-                   int64_t off_gate, int64_t off_up, int64_t off_down, uint8_t* gtab, uint8_t* dtab, int32_t* info, int32_t* ctab);
+                   int64_t off_gate, int64_t off_up, int64_t off_down, uint8_t* gtab, uint8_t* dtab, int32_t* info, int32_t* ctab, const int32_t* tags);
 /* dst[pairs[2i]] = pairs[2i + 1], n pairs */
 int ns_ds41_scatter_u64(ns_gpu* g, uint64_t* dst, const int64_t* pairs, int64_t n);
 

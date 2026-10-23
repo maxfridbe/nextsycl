@@ -971,6 +971,8 @@ pub struct Part {
     reader: Option<FileReader>,
     /// the slot table the GPU routes decode by: [layer][expert] -> the VRAM payload's address, 0 when not in VRAM
     devtab: DevBuf,
+    /// the XQ file's: [layer][expert] -> its type word (LayerVq::tag) for the GPU routing's tables
+    xtags: Option<DevBuf>,
     /// a prompt pass's pinned slots for the experts only the file holds: read on threads while the GPU multiplies the
     /// others, then copied up through the ring; the copy last reading each slot
     pstage: Option<PStage>,
@@ -1371,9 +1373,16 @@ impl Part {
                lut: Option<(usize, usize)>, ncmax: usize) -> Result<()> {
         let v = &self.vq[&l];
         if let Some(s) = &v.std {
-            // the XQ file's: each entry's type its own (in its first meta word), on the float32 kernel
+            // the XQ file's: each entry's type its own (in its first meta word); one column an entry on the split-Q8
+            // products like the rest, else the float32 kernel
             if s.xq.is_some() {
-                return self.ops.std_mmv(if down { T_MIXED_DOWN } else { T_MIXED_GU }, table, entries, x, y, y_rows, rows, cols, ncmax);
+                let ty = if down { T_MIXED_DOWN } else { T_MIXED_GU };
+                if let Some((xc, _)) = lut.filter(|_| ncmax <= 1 && std_q8() && self.ops.std_mmvq_supported(ty, cols)) {
+                    let xs = self.arena.bytes(self.ops.std_q8_bytes(cols, xc))?;
+                    self.ops.std_quantize_q8(x, &xs, cols, xc)?;
+                    return self.ops.std_mmvq(ty, table, entries, &xs, xc, y, y_rows, rows, cols);
+                }
+                return self.ops.std_mmv(ty, table, entries, x, y, y_rows, rows, cols, ncmax);
             }
             let ty = s.ty[if down { 2 } else { 0 }].code();
             // one column an entry (decode) with x's column count known: the split-Q8 products (NS_DS41_STD_Q8=0: float32)
@@ -2513,6 +2522,22 @@ impl Part {
             }
             devtab.write(0, &host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
         }
+        let xtags = if g.xq {
+            let ne = g.n_expert as usize;
+            let mut host = vec![0i32; ntab];
+            for (l, v) in &vq {
+                if *l < g.n_layer {
+                    for x in 0..ne {
+                        host[*l as usize * ne + x] = v.tag(x as u64);
+                    }
+                }
+            }
+            let b = DevBuf::new(gpu, ntab * 4)?;
+            b.write(0, &i32s(&host))?;
+            Some(b)
+        } else {
+            None
+        };
         // each store's slot addresses on the GPU (the slot table's entries are copied from them), lent slots too
         for st in &stores {
             let mut c = st.lock().unwrap();
@@ -2533,7 +2558,7 @@ impl Part {
         let pstage = if ring_bytes > 0 && nfs > 0 { Some((Mutex::new(HostBuf::new(gpu, nfs * ring_slot)?), ring_slot, Mutex::new(vec![None; nfs]))) } else { None };
         Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), oa_tab: Mutex::new(HashMap::new()), pre_reads: Mutex::new(None), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
                   hold: std::sync::atomic::AtomicBool::new(false), kv_reserve, x_due: std::sync::atomic::AtomicBool::new(lent && lend_extra()), x_first: std::sync::atomic::AtomicBool::new(true), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
-                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage, devtab,
+                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage, devtab, xtags,
                   reader: if file_ahead() > 0 { Some(FileReader::new(&m.file.paths, env_usize("NS_DS41_READERS", 16))?) } else { None } })
     }
 }
@@ -4144,8 +4169,7 @@ impl<'g> Ds41<'g> {
         // one decode token routed on the GPU: its VRAM experts' products queued now, from the slot table; the host
         // reads the routing (ids, weights, which had no VRAM slot) after, for the rest and its bookkeeping
         let img_any = tokens.iter().any(|t| crate::vision::is_image(*t));
-        // (not the XQ file's: the slot table the GPU routes by has no type tags)
-        let groute = t == 1 && gpu_route() && !self.m.g.xq && !self.mtp && !p.draft.contains_key(&l) && p.store(l).is_ok() && used <= 8 && !img_any;
+        let groute = t == 1 && gpu_route() && !self.mtp && !p.draft.contains_key(&l) && p.store(l).is_ok() && used <= 8 && !img_any;
         let mut early: Option<(DevBuf, DevBuf, DevBuf)> = None;
         let mut early_read = None;
         if groute {
@@ -4157,7 +4181,8 @@ impl<'g> Ds41<'g> {
             let info = p.arena.bytes(3 * used * 4)?;
             let ctab = p.arena.bytes((2 + 2 * used) * 4)?;
             let tab = p.devtab.view(l as usize * ne * 8, ne * 8)?;
-            o.route1(&logits, p.vec(l, Role::RouterBias)?, ne, used, g.expert_scale as f32, &tab, dummy, (vq.gate, vq.up, vq.down), &gtab, &dtab, &info, &ctab)?;
+            let tags = p.xtags.as_ref().map(|b| b.view(l as usize * ne * 4, ne * 4)).transpose()?;
+            o.route1(&logits, p.vec(l, Role::RouterBias)?, ne, used, g.expert_scale as f32, &tab, dummy, (vq.gate, vq.up, vq.down), &gtab, &dtab, &info, &ctab, tags.as_ref())?;
             // the routing read back ahead of the products (the host's turn runs while they do)
             let mut down: Vec<(&DevBuf, usize)> = vec![(&info, 3 * used)];
             if let Some(gl) = &guess {

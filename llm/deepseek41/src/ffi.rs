@@ -55,7 +55,7 @@ pub struct Api {
     pub ds41_block_max: unsafe extern "C" fn(Gpu, *const f32, *mut f32, i64, i64, i64, i64, i64, i64) -> c_int,
     pub ds41_idx_score_cand: unsafe extern "C" fn(Gpu, *const f32, *const f32, *const u16, *const i32, i64, *mut f32, i64, i64, i64, i64, i64, i64) -> c_int,
     pub ds41_cand_pos: unsafe extern "C" fn(Gpu, *const i32, *const i32, *mut i32, i64, i64, i64, i64) -> c_int,
-    pub ds41_route1: unsafe extern "C" fn(Gpu, *const f32, *const f32, i64, i64, f32, *const u64, u64, i64, i64, i64, *mut u8, *mut u8, *mut i32, *mut i32) -> c_int,
+    pub ds41_route1: unsafe extern "C" fn(Gpu, *const f32, *const f32, i64, i64, f32, *const u64, u64, i64, i64, i64, *mut u8, *mut u8, *mut i32, *mut i32, *const i32) -> c_int,
     pub ds41_scatter_u64: unsafe extern "C" fn(Gpu, *mut u64, *const i64, i64) -> c_int,
     pub ds41_att_post: unsafe extern "C" fn(Gpu, *mut f32, i64, i64, i64, i64, i64, f32, f32, f32, f32, f32, f32) -> c_int,
     pub ds41_hc_pre_in: unsafe extern "C" fn(Gpu, *const f32, *const f32, *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32, *mut f32,

@@ -4,7 +4,8 @@
 // changes), a bounded number of work-groups (each fills its grid table in local memory once). std.cpp's float32
 // kernel decodes a lane's 8 values a block and re-reads the row's float32 activations for every row (20 KiB against
 // ~1.3 KiB of IQ2_XXS weights a row): 133-229 GB/s on the B70. Types: IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
-// Q2_K, Q5_K, Q8_0, MXFP4 (deepseek4's, and IQ1_S / IQ2_XS / IQ3_S / Q2_K new here). The table is std_mmv's (meta[e] = {ncol, y0,
+// Q2_K, Q5_K, Q8_0, MXFP4 (deepseek4's, and IQ1_S / IQ2_XS / IQ3_S / Q2_K new here), and the XQ file's mixed Q3_K / Q2_0 /
+// PTQ1_0 experts (codes 1000 / 1001). The table is std_mmv's (meta[e] = {ncol, y0,
 // col_0 ..}), one column an entry; an entry with ncol 0 is skipped (no VRAM slot: the host's products fill it).
 #include "ns.h"
 #include "ns_internal.hpp"
@@ -422,6 +423,118 @@ struct WideQ4K {
     static float dot(const W& r, const X& v) { return v.d * (r.dsc * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)) - r.dmn * (float) v.s); }
 };
 
+// ---- the XQ file's expert types (their own 256-value steps; each lane's 32 values as unsigned codes, the offset taken
+// off with the activations' sums)
+// Q3_K (110-byte blocks: hmask[32], qs[64], scales[12], d): lane g = sub-block g - code (qs[32 (g / 4) + l] >> 2 (g % 4))
+// & 3 | hmask bit g of byte l << 2, value d (scale - 32) (code - 4), scales 2g and 2g + 1 a 16 values
+struct MQ3K {
+    static constexpr int BYTES = 110;
+    struct W { sycl::int4 lo, hi; float d0, d1; };
+    static W load(const uint8_t* p, int g) {
+        const sycl::int4 h0 = load16_a2(p), h1 = load16_a2(p + 16);
+        const uint8_t* q = p + 32 + 32 * (g >> 2);
+        const sycl::int4 q0 = load16_a2(q), q1 = load16_a2(q + 16);
+        const int sh = 2 * (g & 3);
+        auto code = [&](uint32_t qw, uint32_t hw) { return int(((qw >> sh) & 0x03030303u) | (((hw >> g) & 0x01010101u) << 2)); };
+        W r;
+        r.lo = sycl::int4(code(q0.x(), h0.x()), code(q0.y(), h0.y()), code(q0.z(), h0.z()), code(q0.w(), h0.w()));
+        r.hi = sycl::int4(code(q1.x(), h1.x()), code(q1.y(), h1.y()), code(q1.z(), h1.z()), code(q1.w(), h1.w()));
+        const uint8_t* sc = p + 96;
+        auto scale = [&](int i) {
+            const int lo = i < 8 ? (sc[i] & 0xF) : (sc[i - 8] >> 4);
+            const int hi = (sc[8 + (i & 3)] >> (2 * (i >> 2))) & 3;
+            return (lo | (hi << 4)) - 32;
+        };
+        const float d = (float) *reinterpret_cast<const sycl::half*>(p + 108);
+        r.d0 = d * (float) scale(2 * g);
+        r.d1 = d * (float) scale(2 * g + 1);
+        return r;
+    }
+    static float dot(const W& r, const X2& v) {
+        return v.d * (r.d0 * (float) (dp4a4(r.lo, v.u0, 0) - 4 * v.s0) + r.d1 * (float) (dp4a4(r.hi, v.u1, 0) - 4 * v.s1));
+    }
+};
+// Q2_0 (four 18-byte blocks of 64 make the step: d, qs[16], element j (qs[j / 4] >> 2 (j % 4)) & 3): lane g = half g % 2
+// of block g / 2, value d (code - 1)
+struct MQ2_0 {
+    static constexpr int BYTES = 72;
+    struct W { sycl::int4 lo, hi; float d; };
+    static W load(const uint8_t* p, int g) {
+        const uint8_t* bl = p + 18 * (g >> 1);
+        const uint8_t* q = bl + 2 + 8 * (g & 1);
+        const uint32_t a = load4_a2(q), b = load4_a2(q + 4);
+        auto spread = [](uint32_t c) { return int((c & 3) | (((c >> 2) & 3) << 8) | (((c >> 4) & 3) << 16) | (((c >> 6) & 3) << 24)); };
+        W r;
+        r.lo = sycl::int4(spread(a & 0xff), spread((a >> 8) & 0xff), spread((a >> 16) & 0xff), spread(a >> 24));
+        r.hi = sycl::int4(spread(b & 0xff), spread((b >> 8) & 0xff), spread((b >> 16) & 0xff), spread(b >> 24));
+        r.d = (float) *reinterpret_cast<const sycl::half*>(bl);
+        return r;
+    }
+    static float dot(const W& r, const X2& v) { return r.d * v.d * (float) (dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)) - v.s0 - v.s1); }
+};
+// PTQ1_0 (two 28-byte blocks of 128 make the step: value m + 16 n trit n of qs[m], 80 + m + 8 n of qs[16 + m], 120 + h +
+// 2 n of qs[24 + h]; trit n of byte b ((uint8) (b 3^n) 3) >> 8; d at byte 26): lane g = values 32 (g % 4) .. of block g / 4,
+// value d (trit - 1)
+struct MPTQ1_0 {
+    static constexpr int BYTES = 56;
+    struct W { sycl::int4 lo, hi; float d; };
+    static W load(const uint8_t* p, int g) {
+        const uint32_t* bw = reinterpret_cast<const uint32_t*>(p + 28 * (g >> 2));
+        uint32_t wd[7];
+#pragma unroll
+        for (int i = 0; i < 7; ++i) wd[i] = bw[i];
+        const int v0 = 32 * (g & 3);
+        uint32_t o[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            uint32_t word = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int v = v0 + 4 * k + i;
+                const int by = v < 80 ? (v & 15) : v < 120 ? 16 + ((v - 80) & 7) : 24 + ((v - 120) & 1);
+                const int n = v < 80 ? (v >> 4) : v < 120 ? ((v - 80) >> 3) : ((v - 120) >> 1);
+                const uint32_t b = (wd[by >> 2] >> (8 * (by & 3))) & 0xffu;
+                const uint32_t pw = n == 0 ? 1 : n == 1 ? 3 : n == 2 ? 9 : n == 3 ? 27 : 81;
+                word |= ((((b * pw) & 0xffu) * 3u) >> 8) << (8 * i);
+            }
+            o[k] = word;
+        }
+        W r;
+        r.lo = sycl::int4(int(o[0]), int(o[1]), int(o[2]), int(o[3]));
+        r.hi = sycl::int4(int(o[4]), int(o[5]), int(o[6]), int(o[7]));
+        r.d = (float) *reinterpret_cast<const sycl::half*>(reinterpret_cast<const uint8_t*>(bw) + 26);
+        return r;
+    }
+    static float dot(const W& r, const X2& v) { return r.d * v.d * (float) (dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)) - v.s0 - v.s1); }
+};
+// the mixed form: an entry's type in bits 8-11 (gate | up) or 12-15 (down) of its first meta word - 0 Q3_K, 1 Q2_0, 2
+// PTQ1_0 (std.cpp's T_MIXED_GU / T_MIXED_DOWN)
+template <bool DOWN>
+struct Mixed {
+    using XT = X2;
+    static X2 xl(int g, const XA& xa, int b0) { return xload2(g, xa, b0); }
+    using Block = uint8_t;
+    static constexpr int LUT = 0;
+    static uint32_t lut(int) { return 0; }
+};
+template <typename F> constexpr bool is_mixed = false;
+template <bool D> constexpr bool is_mixed<Mixed<D>> = true;
+template <bool D> constexpr int mixed_shift(Mixed<D>*) { return D ? 12 : 8; }
+// R rows of one entry from its row `row` (wr: the entry's first byte), the step's NB blocks a lane
+template <typename M, int NB, int R>
+inline void mixed_rows(const uint8_t* wr, int row, int bpr, int sub, int g, const X2* xv, float* v) {
+    const std::size_t rb = std::size_t(bpr) * M::BYTES;
+#pragma unroll
+    for (int u = 0; u < NB; ++u) {
+        if (sub + 4 * u >= bpr) continue;
+        typename M::W w[R];
+#pragma unroll
+        for (int j = 0; j < R; ++j) w[j] = M::load(wr + (std::size_t(row) + j) * rb + std::size_t(sub + 4 * u) * M::BYTES, g);
+#pragma unroll
+        for (int j = 0; j < R; ++j) v[j] += M::dot(w[j], xv[u]);
+    }
+}
+
 int groups() {   // NS_DS41_MMVQ_GROUPS: the work-groups of a launch (each fills its grid table once; default 1024)
     static const int v = std::getenv("NS_DS41_MMVQ_GROUPS") ? std::max(1, std::atoi(std::getenv("NS_DS41_MMVQ_GROUPS"))) : 1024;
     return v;
@@ -461,7 +574,7 @@ void run(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int entries,
                                const int e = int(r / n_out), row = int(r % n_out);
                                const int32_t* me = meta + 10 * e;
                                // R rows of one entry (n_out a multiple of R: an entry's rows never straddle a step)
-                               if (me[0] == 0) continue;
+                               if ((me[0] & 255) == 0) continue;
                                const int col = me[2];
                                if (col != cur) {
                                    const XA xa = xcol(x, n_in, ncols, col);
@@ -470,16 +583,24 @@ void run(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int entries,
                                        if (sub + 4 * u < bpr) xv[u] = F::xl(g, xa, (sub + 4 * u) * (QK / Q8K));
                                    cur = col;
                                }
-                               const auto* wr = reinterpret_cast<const typename F::Block*>(ptrs[e]) + std::size_t(row) * bpr;
                                float v[R] = {};
+                               if constexpr (is_mixed<F>) {
+                                   const uint8_t* wr = reinterpret_cast<const uint8_t*>(ptrs[e]);
+                                   const int k = (me[0] >> mixed_shift(static_cast<F*>(nullptr))) & 15;
+                                   if (k == 0) mixed_rows<MQ3K, NB, R>(wr, row, bpr, sub, g, xv, v);
+                                   else if (k == 1) mixed_rows<MQ2_0, NB, R>(wr, row, bpr, sub, g, xv, v);
+                                   else mixed_rows<MPTQ1_0, NB, R>(wr, row, bpr, sub, g, xv, v);
+                               } else {
+                                   const auto* wr = reinterpret_cast<const typename F::Block*>(ptrs[e]) + std::size_t(row) * bpr;
 #pragma unroll
-                               for (int u = 0; u < NB; ++u) {
-                                   if (sub + 4 * u >= bpr) continue;
-                                   typename F::W w[R];
+                                   for (int u = 0; u < NB; ++u) {
+                                       if (sub + 4 * u >= bpr) continue;
+                                       typename F::W w[R];
 #pragma unroll
-                                   for (int j = 0; j < R; ++j) w[j] = F::load(wr + std::size_t(j) * bpr + sub + 4 * u, g, t);
+                                       for (int j = 0; j < R; ++j) w[j] = F::load(wr + std::size_t(j) * bpr + sub + 4 * u, g, t);
 #pragma unroll
-                                   for (int j = 0; j < R; ++j) v[j] += F::dot(w[j], xv[u]);
+                                       for (int j = 0; j < R; ++j) v[j] += F::dot(w[j], xv[u]);
+                                   }
                                }
 #pragma unroll
                                for (int j = 0; j < R; ++j) {
@@ -558,7 +679,7 @@ int ns_ds41_quantize_q8(ns_gpu* g, const float* x, void* xs, int64_t n_in, int64
 
 int ns_ds41_mmvq_supported(int type, int64_t n_in) {
     switch (type) {
-        case 8: case 10: case 12: case 13: case 16: case 17: case 18: case 19: case 21: case 22: case 39: return n_in % QK == 0 && n_in <= 32 * QK;
+        case 8: case 10: case 12: case 13: case 16: case 17: case 18: case 19: case 21: case 22: case 39: case 1000: case 1001: return n_in % QK == 0 && n_in <= 32 * QK;
         default: return 0;
     }
 }
@@ -581,6 +702,8 @@ int ns_ds41_std_mmvq(ns_gpu* g, int type, const uint64_t* ptrs, const int32_t* m
         case 19: by_nb<WideIQ1S>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
         case 21: by_nb<WideIQ3S>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
         case 22: by_nb<WideIQ2S>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
+        case 1000: by_nb<Mixed<false>>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
+        case 1001: by_nb<Mixed<true>>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
         default: by_nb<WideMXFP4>(g->q, ptrs, meta, E, x, NC, y, K, N); break;
     }
     return 0;
