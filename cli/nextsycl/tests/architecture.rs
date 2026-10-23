@@ -249,7 +249,7 @@ fn every_llm_template_keeps_a_cacheable_prefix() {
     let last_user = |p: &str| USER_TURNS.iter().filter_map(|u| p.rfind(u)).max();
     let mut bad = Vec::new();
     for k in llm_kinds() {
-        for effort in [Effort::Low, Effort::High, Effort::Max] {
+        for effort in [Effort::Low, Effort::Medium, Effort::High, Effort::Max] {
             for tools in [vec![], vec![tool.clone()]] {
                 let p: Vec<String> = turns.iter().map(|t| (k.chat)(t, effort, &tools)).collect();
                 let tag = format!("{} ({effort:?}{})", k.name, if tools.is_empty() { "" } else { ", tools" });

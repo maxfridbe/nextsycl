@@ -461,6 +461,9 @@ impl Tokenizer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effort {
     Low,
+    /// between: DeepSeek-V4.1's budget 50; the templates without a level of their own take it as High (GLM) or as
+    /// "medium" (Muse)
+    Medium,
     High,
     Max,
 }
@@ -469,6 +472,7 @@ impl Effort {
     pub fn parse(s: &str) -> Option<Effort> {
         match s {
             "low" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
             "high" => Some(Effort::High),
             "max" => Some(Effort::Max),
             _ => None,
@@ -511,7 +515,7 @@ pub fn glm_chat(messages: &[Message], effort: Effort, tools: &[String]) -> Strin
     let mut s = String::from("[gMASK]<sop>");
     s += match effort {
         Effort::Low => "<|system|>Reasoning Effort: Low",
-        Effort::High => "<|system|>Reasoning Effort: High",
+        Effort::Medium | Effort::High => "<|system|>Reasoning Effort: High",
         Effort::Max => "<|system|>Reasoning Effort: Max",
     };
     if !tools.is_empty() {
@@ -694,11 +698,12 @@ pub fn deepseek4_chat(messages: &[Message], effort: Effort, _tools: &[String]) -
 }
 
 /// DeepSeek-V4.1's prompt (its `encoding/encoding.py`): V4's turns, the reasoning effort a numeric budget in a
-/// `<｜System｜>` block at the very start (thinking only: high 75, max 100), which the first system message joins. Low is
+/// `<｜System｜>` block at the very start (thinking only: medium 50, high 75, max 100), which the first system message joins. Low is
 /// the chat mode (`</think>` at once). Earlier turns' thinking is dropped, as the reference does without tools.
 pub fn deepseek41_chat(messages: &[Message], effort: Effort, _tools: &[String]) -> String {
     let budget = match effort {
         Effort::Low => None,
+        Effort::Medium => Some(50),
         Effort::High => Some(75),
         Effort::Max => Some(100),
     };
@@ -796,6 +801,7 @@ fn today() -> String {
 pub fn muse_chat(messages: &[Message], effort: Effort, _tools: &[String]) -> String {
     let strength = match effort {
         Effort::Low => "low",
+        Effort::Medium => "medium",
         Effort::High => "high",
         Effort::Max => "xhigh",
     };

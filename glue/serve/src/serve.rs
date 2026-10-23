@@ -7,7 +7,7 @@
 //! GET  /status                 {"busy": bool, "prompt_cache": ...}
 //! POST /v1/chat/completions    messages, max_tokens (none: --max-tokens, else the rest of the context),
 //!                              temperature, top_p, stream, reasoning_effort (or
-//!                              chat_template_kwargs.reasoning_effort): low | high | max; logprobs, top_logprobs
+//!                              chat_template_kwargs.reasoning_effort): low | medium | high | max; logprobs, top_logprobs
 //!                              (the answer's tokens, as OpenAI's choices[0].logprobs.content); usage.energy_wh;
 //!                              logprob_chain: true - each entry also "chain": its logprob chained through the
 //!                              attention to this turn's own earlier tokens (see chain_entry), and each
@@ -90,6 +90,11 @@ pub struct Server {
     parallel: usize,
     /// the tokens a request without max_tokens may make (None: to the end of the context)
     default_max: Option<usize>,
+    /// a thinking request's tokens of thought at most (NS_THINK_BUDGET): then `</think>` is its next token, forced, and it
+    /// answers - a low-bit model can deliberate without end (XQ: 16,000 words of thought on a drawing, no answer)
+    think_budget: Option<usize>,
+    /// `</think>` when the vocabulary has it as one token (the budget needs it)
+    think_end: Option<u32>,
     /// the prompt cache (the engine thread's while it reads a prompt; status calls only try)
     cache: Mutex<PromptCache>,
     /// each session's tokens held, for status
@@ -232,6 +237,8 @@ struct Job {
     tx: mpsc::Sender<Ev>,
     /// the client went away: end it
     cancel: Arc<AtomicBool>,
+    /// its thinking's budget in tokens (the prompt opens its thinking and NS_THINK_BUDGET is set)
+    think: Option<usize>,
 }
 
 /// What the engine tells a request's thread
@@ -269,6 +276,10 @@ struct Active {
     turn: Vec<(u32, f64)>,
     /// its prompt still being read (a group of chunks a round while others decode)
     reading: Option<Reading>,
+    /// thinking: the tokens of thought it may still make (None: not thinking, or no budget)
+    think: Option<usize>,
+    /// the token its next draw must be (`</think>`: the budget spent)
+    force: Option<u32>,
 }
 
 /// A prompt being read into its session: up to `at`, from `from` (`source`), the stops still ahead
@@ -299,16 +310,24 @@ struct ServeSampler<'a> {
     tok: &'a Tokenizer,
     k: Option<usize>,
     lps: &'a mut VecDeque<Value>,
+    /// the first draw's token, whatever the logits say (`</think>`: the thinking's budget spent)
+    force: Option<u32>,
 }
 
 impl nextsycl_llm::Sampler for ServeSampler<'_> {
     fn sample(&mut self, logits: &[f32]) -> u32 {
-        let y = sample(logits, self.temp, self.top_p, self.rng);
+        let y = match self.force.take() {
+            Some(f) => f,
+            None => sample(logits, self.temp, self.top_p, self.rng),
+        };
         self.record(logits, y);
         y
     }
     fn dist(&mut self, logits: &[f32]) -> Option<Vec<(u32, f32)>> {
-        nextsycl_llm::sampling::dist(logits, self.temp, self.top_p)
+        match self.force.take() {
+            Some(f) => Some(vec![(f, 1.0)]),
+            None => nextsycl_llm::sampling::dist(logits, self.temp, self.top_p),
+        }
     }
     fn uniform(&mut self) -> f32 {
         self.rng.next_f32()
@@ -319,10 +338,10 @@ impl nextsycl_llm::Sampler for ServeSampler<'_> {
         }
     }
     fn greedy(&self) -> bool {
-        self.temp <= 0.0 && self.k.is_none()
+        self.temp <= 0.0 && self.k.is_none() && self.force.is_none()
     }
     fn device(&self) -> Option<nextsycl_llm::DeviceSampling> {
-        (self.temp > 0.0 && self.k.is_none()).then_some(nextsycl_llm::DeviceSampling { temperature: self.temp, top_p: self.top_p, seed: self.seed })
+        (self.temp > 0.0 && self.k.is_none() && self.force.is_none()).then_some(nextsycl_llm::DeviceSampling { temperature: self.temp, top_p: self.top_p, seed: self.seed })
     }
 }
 
@@ -493,8 +512,13 @@ impl Server {
         let tele = Telemetry::start(&engine.gpu_info().iter().map(|g| g.pci.clone()).collect::<Vec<_>>());
         let parallel = slot_ctx.len().max(1);
         let max_ctx = slot_ctx.iter().copied().max().unwrap_or(8192);
+        let think_end = match tok.encode("</think>").as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        };
+        let think_budget = std::env::var("NS_THINK_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0 && think_end.is_some());
         Ok(Server { engine, tok, chat, name, max_ctx, slot_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
-                    inflight: AtomicU64::new(0), parallel, default_max, cache: Mutex::new(cache),
+                    inflight: AtomicU64::new(0), parallel, default_max, think_budget, think_end, cache: Mutex::new(cache),
                     live_lens: Mutex::new(vec![0; parallel]), started: Instant::now(), running: Mutex::new(Default::default()),
                     done: Mutex::new(VecDeque::new()), next_id: AtomicU64::new(1), keep, tele, cors })
     }
@@ -734,7 +758,7 @@ impl Server {
             Api::OpenAi => req["reasoning_effort"].as_str().or_else(|| req["chat_template_kwargs"]["reasoning_effort"].as_str()),
         };
         let effort = match effort {
-            Some(e) => Effort::parse(e).ok_or(format!("effort {e:?}: low, high or max"))?,
+            Some(e) => Effort::parse(e).ok_or(format!("effort {e:?}: low, medium, high or max"))?,
             None => self.default_effort,
         };
         let chain = req["logprob_chain"].as_bool().or_else(|| req["LogProbChain"].as_bool()).unwrap_or(false);
@@ -794,8 +818,9 @@ impl Server {
                 job.max = job.max.min(slots[slot].sess.max_ctx() - job.ids.len() - 1);
                 match self.begin_read(&mut slots[slot], &job.ids) {
                     Ok(rd) => {
+                        let think = job.think;
                         active.push(Active { job, slot, dec: None, logits: None, pending: None, n: 0, committed: Vec::new(), accepted: 0,
-                                             drafted: 0, finish: None, turn: Vec::new(), reading: Some(rd) });
+                                             drafted: 0, finish: None, turn: Vec::new(), reading: Some(rd), think, force: None });
                     }
                     Err(e) => {
                         let _ = job.tx.send(Ev::Fail(e));
@@ -1020,6 +1045,17 @@ impl Server {
         if a.finish.is_some() {
             return;
         }
+        // the thinking's budget: counted until `</think>`; spent, the next draw is `</think>`
+        if let Some(left) = a.think {
+            if Some(y) == self.think_end {
+                a.think = None;
+            } else if left <= 1 {
+                a.think = None;
+                a.force = self.think_end;
+            } else {
+                a.think = Some(left - 1);
+            }
+        }
         if self.tok.stop.contains(&y) {
             a.finish = Some("stop");
             return;
@@ -1049,7 +1085,7 @@ impl Server {
         }
         let (temp, top_p, k) = (a.job.temp, a.job.top_p, a.job.logprobs);
         let mut lps: VecDeque<Value> = VecDeque::new();
-        let mut draw = ServeSampler { temp, top_p, seed: a.job.seed, rng, tok: &self.tok, k, lps: &mut lps };
+        let mut draw = ServeSampler { temp, top_p, seed: a.job.seed, rng, tok: &self.tok, k, lps: &mut lps, force: a.force.take() };
         let toks = self.engine.step(&mut slots[a.slot].sess, a.dec.as_mut().unwrap(), &mut draw, &mut *none).map_err(|e| e.0)?;
         for y in toks {
             let lp = lps.pop_front();
@@ -1071,8 +1107,9 @@ impl Server {
         let (temp, top_p, k) = (a.job.temp, a.job.top_p, a.job.logprobs.unwrap_or(5));
         let mut entry: Option<Value> = None;
         let tok = &self.tok;
+        let mut force = a.force.take();
         let mut draw = |l: &[f32]| {
-            let y = sample(l, temp, top_p, rng);
+            let y = force.take().unwrap_or_else(|| sample(l, temp, top_p, rng));
             entry = Some(logprob_entry(tok, l, y, k));
             y
         };
@@ -1126,8 +1163,8 @@ impl Server {
                 }
             }
             // sessions in slot order: the actives too (active is sorted by slot)
-            let mut draws: Vec<ServeSampler> = sel.iter().zip(rngs.iter_mut()).zip(lps.iter_mut()).map(|((a, r), l)| ServeSampler {
-                temp: a.job.temp, top_p: a.job.top_p, seed: a.job.seed, rng: r, tok: &self.tok, k: a.job.logprobs, lps: l }).collect();
+            let mut draws: Vec<ServeSampler> = sel.iter_mut().zip(rngs.iter_mut()).zip(lps.iter_mut()).map(|((a, r), l)| ServeSampler {
+                temp: a.job.temp, top_p: a.job.top_p, seed: a.job.seed, rng: r, tok: &self.tok, k: a.job.logprobs, lps: l, force: a.force.take() }).collect();
             let mut smps: Vec<&mut dyn nextsycl_llm::Sampler> = draws.iter_mut().map(|d| d as &mut dyn nextsycl_llm::Sampler).collect();
             let mut decs: Vec<&mut nextsycl_llm::Decoder> = sel.iter_mut().map(|a| a.dec.as_mut().unwrap()).collect();
             self.engine.step_many(&mut sess, &mut decs, &mut smps, &mut *none).map_err(|e| e.0)?
@@ -1160,7 +1197,7 @@ impl Server {
             }
             let y = match (a.logits.take(), a.pending.take()) {
                 (Some(l), _) => {
-                    let y = sample(&l, a.job.temp, a.job.top_p, rng);
+                    let y = a.force.take().unwrap_or_else(|| sample(&l, a.job.temp, a.job.top_p, rng));
                     let lp = a.job.logprobs.map(|k| logprob_entry(&self.tok, &l, y, k));
                     self.commit(a, y, lp);
                     y
@@ -1234,6 +1271,7 @@ impl Server {
         *rid_out = rid;
         let effort = match ask.effort {
             Effort::Low => "low",
+            Effort::Medium => "medium",
             Effort::High => "high",
             Effort::Max => "max",
         };
@@ -1255,7 +1293,7 @@ impl Server {
         self.inflight.fetch_add(1, Ordering::SeqCst);
         self.queue.lock().unwrap().push_back(Job { id: rid, ids: ids.clone(), max, temp, top_p, logprobs: ask.logprobs, chain: ask.chain,
                                                      seed: ask.seed.unwrap_or_else(|| fresh_seed(rid)), tx,
-                                                   cancel: cancel.clone() });
+                                                   cancel: cancel.clone(), think: self.think_budget.filter(|_| opens_thinking) });
         self.wake.notify_one();
         // its prompt read
         let (from, source, prefill, saved) = match rx.recv() {

@@ -3,7 +3,7 @@
 id: deepseek-v4.1-flash-xq
 kind: llm
 arch: deepseek41
-title: DeepSeek-V4.1-Flash XQ v3 uncensored · exact, thinks (~10 tok/s) · 128K context (both GPUs, pinned memory and the NVMe)
+title: DeepSeek-V4.1-Flash XQ v3 uncensored · exact, thinks up to 8K tokens (~10 tok/s) · 128K context (both GPUs, pinned memory and the NVMe)
 about: "IndrasMirror's XQ v3 GGUF of DeepSeek-V4.1-Flash-1017 (from dealignai's UNCENSORED-FP8: a rank-2 refusal-direction edit of the attention output and the shared expert's down; MIT). Each routed expert has its own type - Q3_K, Q2_0 or ternary PTQ1_0 (gate and up share one, down its own; 2.09 bits a weight, 142 GiB of experts) - the rest Q8_0, and DeepSeek's own Engram tables beside it (two 101.5 GB shards read a row at a time). Exact: tg 10.7 tok/s over 512 tokens; pp 61 / 193 / 525 tok/s at 580 / 2.5K / 10K tokens (from a 7 GB/s drive; prompts read the experts beyond VRAM and pinned memory from it). Perplexity on human text a little above UD-IQ2_XXS's (gut1 1.281 vs 1.228). deepseek-v4.1-flash-xq-fast is the same files at ~22 tok/s."
 gpus: all
 streams: true                   # the experts beyond VRAM and pinned memory, and the Engram's rows, are read from the drive while it serves
@@ -12,7 +12,7 @@ vram_gib: 30.0
 ctx: '131072'
 tools: false
 tasks: false
-env: {NS_DS41_FREE_GIB: "1.5", NS_PREFILL_CHUNK: "16384", NS_DS41_VISION: "0", NS_EFFORT: "high"}   # exact (the box rule: 1.5 GiB of VRAM free); pictures off: the vision sidecar is untested on this file; it thinks unless a request asks for low effort
+env: {NS_DS41_FREE_GIB: "1.5", NS_PREFILL_CHUNK: "16384", NS_DS41_VISION: "0", NS_EFFORT: "high", NS_THINK_BUDGET: "8192"}   # exact (the box rule: 1.5 GiB of VRAM free); pictures off: the vision sidecar is untested on this file; it thinks unless a request asks for low effort
 silo:                           # its expert kernels (std.cpp, mmvq.cpp: the mixed products) exist only there
   name: deepseek41
   required: true

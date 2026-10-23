@@ -3,7 +3,7 @@
 id: deepseek-v4.1-flash-xq-fast
 kind: llm
 arch: deepseek41
-title: DeepSeek-V4.1-Flash XQ v3 uncensored · fast, thinks (~21 tok/s; skips rarely-used experts) · 128K context (both GPUs, pinned memory and the NVMe)
+title: DeepSeek-V4.1-Flash XQ v3 uncensored · fast, thinks up to 8K tokens (~21 tok/s; skips rarely-used experts) · 128K context (both GPUs, pinned memory and the NVMe)
 about: "The XQ v3 of deepseek-v4.1-flash-xq with deepseek-v4.1-flash-iq2xxs-fast's two approximations on (cold experts under 0.2 of the routing weight left out, attention and the shared expert in q4_K): tg 21.6-22.4 tok/s over 512 tokens (exact 10.7; UD-IQ2_XXS fast 21.4), pp 101 / 219 / 462 tok/s at 580 / 2.5K / 10K tokens."
 gpus: all
 streams: true
@@ -12,7 +12,7 @@ vram_gib: 30.0
 ctx: '131072'
 tools: false
 tasks: false
-env: {NS_DS41_FREE_GIB: "1.5", NS_DS41_COLD_SKIP: "0.2", NS_DS41_DENSE_Q4K: "1", NS_PREFILL_CHUNK: "16384", NS_DS41_COLD_SKIP_PROMPT: "0.3", NS_DS41_COLD_SKIP_PROMPT_MAX: "8", NS_DS41_VISION: "0", NS_EFFORT: "high"}
+env: {NS_DS41_FREE_GIB: "1.5", NS_DS41_COLD_SKIP: "0.2", NS_DS41_DENSE_Q4K: "1", NS_PREFILL_CHUNK: "16384", NS_DS41_COLD_SKIP_PROMPT: "0.3", NS_DS41_COLD_SKIP_PROMPT_MAX: "8", NS_DS41_VISION: "0", NS_EFFORT: "high", NS_THINK_BUDGET: "8192"}
 silo:
   name: deepseek41
   required: true

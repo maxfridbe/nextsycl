@@ -5,7 +5,7 @@
 //!     nextsycl ps [-a]                  the request running and the last ones (-a: all the server remembers)
 //!     nextsycl inspect <id>             one request in full, as JSON
 //!     nextsycl cache [ls | clear]       the prompt cache's checkpoints, or drop them
-//!     nextsycl chat <text> [--effort low|high|max] [--max N] [--temp T]
+//!     nextsycl chat <text> [--effort low|medium|high|max] [--max N] [--temp T]
 //!                                       one request, streamed: the thinking dimmed, then the answer
 //!
 //! The server answers on a Unix socket (config.rs); `main` sets where.
@@ -225,7 +225,7 @@ pub fn chat(raw: &[String]) -> Result<(), String> {
     let mut it = raw.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--effort" => body["reasoning_effort"] = json!(it.next().ok_or("--effort low|high|max")?),
+            "--effort" => body["reasoning_effort"] = json!(it.next().ok_or("--effort low|medium|high|max")?),
             "--max" => body["max_tokens"] = json!(it.next().and_then(|v| v.parse::<u64>().ok()).ok_or("--max N")?),
             "--temp" => body["temperature"] = json!(it.next().and_then(|v| v.parse::<f64>().ok()).ok_or("--temp T")?),
             _ => text.push(a.clone()),

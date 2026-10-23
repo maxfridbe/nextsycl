@@ -72,7 +72,7 @@ every kind:
 language models (nextsycl llm ...; the names without `llm` still work):
   nextsycl llm start <id>       a registered model as a service (a container; the model stays loaded on the GPUs);
                                 flags beside it win: [--gpu N ...] [--port N] [--host H] [--ctx N | N,M,...] [--name ID]
-                                [--effort low|high|max] [--prompt-cache-mib N] [--no-mtp]
+                                [--effort low|medium|high|max] [--prompt-cache-mib N] [--no-mtp]
   nextsycl llm serve <id>       the same in the foreground, its log here (Ctrl-C ends it)
   nextsycl llm stop             gracefully: the request running finishes, then the server ends
   nextsycl llm status [--no-stream]   live, like docker stats: the model, its GPUs, the request running, the cache
@@ -93,7 +93,7 @@ language models (nextsycl llm ...; the names without `llm` still work):
                  [--cache-dir DIR [--cache-disk-gib G (32)] [--cache-ttl-hours H (24)]]
                                 the server itself (what start runs in its container)
   nextsycl llm generate <model.gguf> --prompt TEXT | --prompt-file PATH | --ids FILE [--ignore-eos] [--ctx N]
-                 [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--seed S] [--gpu N[,M]] [--no-mtp]
+                 [--effort low|medium|high|max] [--max N] [--temp T] [--top-p P] [--seed S] [--gpu N[,M]] [--no-mtp]
                  [--image PATH ...]  pictures before the prompt (a vision model's)
                  [--logits-out PATH]  the prompt's last logits as float32 (a check against a reference)
                  [--score FILE [--score-max N (256)] [--dump OUT | --ref OUT]]  FILE's tokens teacher-forced after the
@@ -510,7 +510,7 @@ impl nextsycl_llm::Sampler for TempSampler<'_> {
     }
 }
 
-/// `nextsycl generate <model.gguf> --prompt TEXT [--effort low|high|max] [--max N] [--temp T] [--top-p P] [--gpu N]`
+/// `nextsycl generate <model.gguf> --prompt TEXT [--effort low|medium|high|max] [--max N] [--temp T] [--top-p P] [--gpu N]`
 fn generate(args: &[String]) -> Result<(), String> {
     use std::io::Write;
     let e = |x: nextsycl_core::Error| x.0;
@@ -525,7 +525,7 @@ fn generate(args: &[String]) -> Result<(), String> {
         (Some(f), None) => std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?,
         (None, None) => opt("--prompt").ok_or("--prompt TEXT, --prompt-file PATH or --ids FILE")?,
     };
-    let effort = nextsycl_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|high|max")?;
+    let effort = nextsycl_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|medium|high|max")?;
     let max: usize = opt("--max").and_then(|v| v.parse().ok()).unwrap_or(256);
     let temp: f32 = opt("--temp").and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let top_p: f32 = opt("--top-p").and_then(|v| v.parse().ok()).unwrap_or(0.95);
@@ -989,7 +989,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     if ctx_list.is_empty() || ctx_list.iter().any(|c| *c < 256) {
         return Err("--ctx N or N,M,... (tokens, at least 256 each)".into());
     }
-    let effort = nextsycl_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|high|max")?;
+    let effort = nextsycl_tok::Effort::parse(&opt("--effort").unwrap_or_else(|| "low".into())).ok_or("--effort low|medium|high|max")?;
     let gib_opt = |k: &str| opt(k).and_then(|v| v.parse::<f64>().ok()).map(|x| (x * (1u64 << 30) as f64) as usize);
     // the model's file lives as long as the server
     let f: &'static Gguf = Box::leak(Box::new(Gguf::open(Path::new(model)).map_err(|e| e.0)?));

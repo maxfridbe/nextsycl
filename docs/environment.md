@@ -83,6 +83,7 @@ Settings the program turns into the chat server's flags and container; a registr
 | `NS_HOST` | 127.0.0.1 | the chat server's address (0.0.0.0: the network) (--host) | cli (llm start) |
 | `NS_KEEP_REQUESTS` | 100 | ended requests kept for ps and inspect (--keep-requests) | cli (llm start) |
 | `NS_MAX_TOKENS` | to the context's end | tokens a request without max_tokens may make (--max-tokens) | cli (llm start) |
+| `NS_THINK_BUDGET` | none | a thinking request's tokens of thought at most: then `</think>` is its next token, forced, and it answers (a model's registry entry sets it; needs `</think>` to be one token of the vocabulary) | serve (llm server) |
 | `NS_MODEL` | /models/glm53-iq2/GLM-5.3-Flash-Uncensored-IQ2-imatrix-MTP-ds4.gguf | the model file when no registry entry names one (--model) | cli (llm start) |
 | `NS_NAME` | glm-5.3-flash-uncensored | the model name the chat server answers as (--name) | cli (llm start) |
 | `NS_NO_MTP` | off | 1: decode without the draft block (--no-mtp) | cli (llm start) |
