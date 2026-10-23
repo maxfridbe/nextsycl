@@ -12,7 +12,7 @@ vram_gib: 30.0
 ctx: '131072'
 tools: false
 tasks: false
-env: {NS_DS41_FREE_GIB: "1.5", NS_PREFILL_CHUNK: "16384", NS_DS41_VISION: "0", NS_EFFORT: "high", NS_THINK_BUDGET: "8192"}   # exact (the box rule: 1.5 GiB of VRAM free); pictures off: the vision sidecar is untested on this file; it thinks unless a request asks for low effort
+env: {NS_DS41_FREE_GIB: "1.5", NS_PREFILL_CHUNK: "16384", NS_DS41_VISION: "0", NS_EFFORT: "high", NS_THINK_BUDGET: "8192", NS_DS41_PIN_GIB: "30"}   # exact (the box rule: 1.5 GiB of VRAM free); pictures off: the vision sidecar is untested on this file; it thinks unless a request asks for low effort
 silo:                           # its expert kernels (std.cpp, mmvq.cpp: the mixed products) exist only there
   name: deepseek41
   required: true

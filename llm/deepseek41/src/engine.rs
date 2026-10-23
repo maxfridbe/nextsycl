@@ -2764,7 +2764,15 @@ impl<'g> Ds41<'g> {
         let g = &m.g;
         let n = g.n_layer;
         let k = gpus.len();
-        let mirror = mirror_bytes.unwrap_or_else(|| pin_cap().min(mem_available().saturating_sub(12 << 30)));
+        // an explicit NS_DS41_PIN_GIB caps a mirror the caller sized too (the server's: what is available less 10 GiB and
+        // its prompt cache - with the prompt and decode staging slots, ~12 GB for XQ, on top it left ~1 GB of the box's
+        // 61 and a long request set off the OOM killer)
+        let pin_set = std::env::var("NS_DS41_PIN_GIB").is_ok();
+        let mirror = match mirror_bytes {
+            Some(b) if pin_set => b.min(pin_cap()),
+            Some(b) => b,
+            None => pin_cap().min(mem_available().saturating_sub(12 << 30)),
+        };
         // the boundaries: kv sources (a source's readers stay with it); even by count unless NS_SPLIT says
         let mut bounds: Vec<u64> = vec![0];
         let cuts: Vec<u64> = match std::env::var("NS_SPLIT") {
