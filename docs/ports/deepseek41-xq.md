@@ -43,9 +43,16 @@ quants ([deepseek41-unsloth.md](deepseek41-unsloth.md)).
 
 | | XQ v3 | UD-IQ2_XXS | UD-Q2_K_XL |
 |---|---|---|---|
-| tg, 512 tokens after a short prompt, exact / `-fast` | 10.1 / 21.8-22.4 tok/s | 12.7 / 21.4 | 8.8 / 19.2 |
-| pp exact, 580 / 2,561 / 9,901 tokens | 67 / 99 / 254 tok/s | - | 42 / 92 / 280 |
-| pp `-fast`, 2,561 / 9,901 tokens | 187 / 257 tok/s | - | 138 / 300 |
+| tg, 512 tokens after a short prompt, exact / `-fast` | 10.7 / 21.6-22.4 tok/s | 12.7 / 21.4 | 8.8 / 19.2 |
+| pp exact, 580 / 2,561 / 9,901 tokens | 61 / 193 / 525 tok/s | - | 42 / 92 / 280 |
+| pp `-fast`, 580 / 2,561 / 9,901 tokens | 101 / 219 / 462 tok/s | - | 121 / 138 / 300 |
+
+Prompts are bound by the experts read from the drive (only ~40% of the 142 GiB fit VRAM and pinned memory; a 2,561-token
+prompt reads ~7,400 of them, ~70 GB). The file sits on the box's fastest drive (SK Hynix PC801-class, 7.3 GB/s O_DIRECT
+at 16 x 8 MiB; the 4 TB Crucial P310 (QLC, DRAM-less) gave 4.8, the 2 TB Phison E13T (Gen3, DRAM-less) 1.2). How pp got
+here (exact, 2,561 / 9,901 tokens): 115 / 269 from the P310; 72-154 / 436 from the fast drive (bimodal: the prompt's
+reads went through the page cache, and its reclaim beside ~45 GiB of pinned memory stalled whole layers for seconds);
+154 / 514 with them O_DIRECT; 193 / 525 with the next layer's reads started from 2,048-token passes (was 4,096).
 | perplexity, 700 tokens of Gutenberg prose (gut1 / gut2), exact | 1.281 / 1.375 | 1.228 / - | 1.211 / 1.281 |
 
 The quant is a little worse than UD-IQ2_XXS on human text (Xolotl's own numbers put it ~15% above the FP8 original).

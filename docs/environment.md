@@ -560,9 +560,10 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_PROMPT_PREFETCH` | 1 | a prompt pass starts reading the next layer's file experts while it computes this one | llm deepseek41 |
 | `NS_DS41_COLD_SKIP_PROMPT` | 0 | a prompt pass leaves out a file-only expert that gets at most `NS_DS41_COLD_SKIP_PROMPT_MAX` tokens, all with a routing-weight share under this (an approximation: measure the perplexity after such a prompt) | llm deepseek41 |
 | `NS_DS41_COLD_SKIP_PROMPT_MAX` | 4 | the most tokens such an expert may get | llm deepseek41 |
-| `NS_DS41_PROMPT_PREFETCH_MIN` | 4096 | the fewest tokens in a pass for that prefetch (below, the early reads only contend with the layer's own) | llm deepseek41 |
+| `NS_DS41_PROMPT_PREFETCH_MIN` | 2048 | the fewest tokens in a pass for that prefetch (below, the early reads only contend with the layer's own: XQ 580 tokens 8.7 -> 11-15 s with it; 2,561 tokens 16.6 -> 13.3 s) | llm deepseek41 |
 | `NS_DS41_READERS` | 16 | the read-ahead's reader threads (a job a slab of an expert in ggml's row types) | llm deepseek41 |
-| `NS_DS41_PROMPT_READERS` | 16 | the prompt path's threads reading the file-only experts of a layer | llm deepseek41 |
+| `NS_DS41_PROMPT_READERS` | 32 | the reader pool's threads at least this many (a prompt pass's file-only experts, a job a slab: 32 reads in flight keep the drive busier than 16) | llm deepseek41 |
+| `NS_DS41_PROMPT_ODIRECT` | 1 | a prompt pass's expert reads O_DIRECT (0: through the page cache, which a long prompt's tens of GB churned beside the pinned memory - reclaim stalled the reads for seconds) | llm deepseek41 |
 | `NS_DS41_DRAFTER` | none | the DSpark drafter file (Unsloth's `dspark-*.gguf`) of an Unsloth-form model, with `NS_DS41_MTP=1`; else `dspark-*.gguf` in the model's folder or its parent's | llm deepseek41 |
 | `NS_DS41_STD_DIR` | none | `llm kernels` on an Unsloth-form file writes each expert type's raw bytes and its GPU expansion here, and compares with `<tag>.ref.f32` (ggml's own dequantize_row_*) when there | llm deepseek41 |
 | `NS_DS41_SPARE` | 8 | decode's empty VRAM slots kept a store: an expert swapped in takes one (its copy up waits for no copy down), the least recently used are moved down afterwards (0: a swap moves its victim down first) | llm deepseek41 |

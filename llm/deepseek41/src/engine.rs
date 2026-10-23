@@ -234,11 +234,12 @@ fn dense_q4k_role(r: Role) -> bool {
         }).collect()
     }).contains(&r)
 }
-/// ... for passes of at least this many tokens (NS_DS41_PROMPT_PREFETCH_MIN, default 4096): below, a layer's compute is too
-/// short to hide anything and the early reads only contend with the layer's own (580 tokens: 12 s -> 16-21 s with it)
+/// ... for passes of at least this many tokens (NS_DS41_PROMPT_PREFETCH_MIN, default 2048): below, a layer's compute is too
+/// short to hide anything and the early reads only contend with the layer's own (XQ, O_DIRECT reads: 2,561 tokens 16.6 ->
+/// 13.3 s with it; 580 tokens 8.7 -> 11-15 s, fast 5.3 -> 12-29 s)
 fn prompt_prefetch_min() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_usize("NS_DS41_PROMPT_PREFETCH_MIN", 4096))
+    *V.get_or_init(|| env_usize("NS_DS41_PROMPT_PREFETCH_MIN", 2048))
 }
 /// A prompt pass starts reading the next layer's file experts while it computes this one (NS_DS41_PROMPT_PREFETCH, default 1)
 fn prompt_prefetch() -> bool {
@@ -722,6 +723,11 @@ fn read_expert_par(m: &Model, vq: &LayerVq, ex: u64, host: &mut [u8], force: boo
 /// is faster read straight from the drive (IQ2_XXS, three slabs: 3.7 ms buffered, 2.5 ms direct) but decode then loses the
 /// page cache's hits on the cold experts that repeat (13.6 -> 12.7 tok/s), so it is opt-in
 type DirectSet = Option<Arc<Vec<std::fs::File>>>;
+/// A prompt pass's expert reads O_DIRECT (NS_DS41_PROMPT_ODIRECT, default 1)
+fn prompt_odirect() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_PROMPT_ODIRECT", 1) != 0)
+}
 /// `force`: whatever NS_DS41_ODIRECT says (the prompt path's reads, NS_DS41_PROMPT_ODIRECT, default 1: a prompt reads each
 /// cold expert once, so no page cache to hit - and none of decode's cached cold experts pushed out by it)
 fn direct_files(paths: &[std::path::PathBuf], force: bool) -> DirectSet {
@@ -1010,6 +1016,8 @@ struct RJob {
     /// (shard, file offset, bytes, destination address): a VQ expert is one range of the file, a ggml-typed one three
     /// (a job each, on different threads)
     seg: (usize, u64, usize, usize),
+    /// a prompt pass's read: O_DIRECT (NS_DS41_PROMPT_ODIRECT), past the page cache
+    direct: bool,
     done: Arc<RDone>,
 }
 /// The reads of one expert (a job each) done: the count left, and the first error
@@ -1048,9 +1056,13 @@ impl FileReader {
             .collect::<Result<_>>()?;
         let (tx, rx) = std::sync::mpsc::channel::<RJob>();
         let rx = Arc::new(Mutex::new(rx));
+        // decode's reads as NS_DS41_ODIRECT says; a prompt's past the page cache (NS_DS41_PROMPT_ODIRECT): buffered, a
+        // 2,561-token prompt's ~70 GB of XQ experts went through the page cache beside ~45 GiB of pinned memory, and its
+        // reclaim stalled the readers for seconds (the same prompt 16 s or 35 s)
         let direct = direct_files(paths, false);
+        let pdirect = if prompt_odirect() { direct_files(paths, true) } else { direct.clone() };
         for _ in 0..threads {
-            let (rx, files, direct) = (rx.clone(), files.clone(), direct.clone());
+            let (rx, files, direct, pdirect) = (rx.clone(), files.clone(), direct.clone(), pdirect.clone());
             std::thread::spawn(move || loop {
                 let job = match rx.lock().unwrap().recv() {
                     Ok(j) => j,
@@ -1061,7 +1073,7 @@ impl FileReader {
                 // SAFETY: the job's staging slot is its own (read_ahead) until its done flag is set and waited for
                 // (stage_slot or ensure), the pinned buffer alive for the engine
                 let b = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
-                let r = match &direct {
+                let r = match if job.direct { &pdirect } else { &direct } {
                     Some(d) => pread_direct(&d[shard], at, b),
                     None => files[shard].read_exact_at(b, at),
                 };
@@ -1553,7 +1565,7 @@ impl Part {
             }
             let rest: Vec<u64> = missing.iter().copied().filter(|x| !pre.contains_key(x)).collect();
             let ts = Instant::now();
-            let mut staged = self.stage_reads(m, vq, c, l, &rest)?;
+            let mut staged = self.stage_reads(m, vq, c, l, &rest, false)?;
             ENS_STAGE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             staged.extend(pre);
             let tw = Instant::now();
@@ -1661,7 +1673,7 @@ impl Part {
             let segs = expert_segs(vq, *ex, base + (base_slot + i) * sb);
             let done = Arc::new(RDone::new(segs.len()));
             for seg in segs {
-                if rd.tx.lock().unwrap().send(RJob { seg, done: done.clone() }).is_err() {
+                if rd.tx.lock().unwrap().send(RJob { seg, done: done.clone(), direct: true }).is_err() {
                     return Err(Error("the expert readers ended".into()));
                 }
             }
@@ -1704,7 +1716,7 @@ impl Part {
         let files: Vec<u64> = grp.iter().filter(|(k, _)| matches!(src[*k], Src::F)).map(|(k, _)| need[*k]).collect();
         let mut c = self.stores[si].lock().unwrap();
         let c = &mut *c;
-        let staged = if files.is_empty() { HashMap::new() } else { self.stage_reads(m, vq, c, l, &files)? };
+        let staged = if files.is_empty() { HashMap::new() } else { self.stage_reads(m, vq, c, l, &files, true)? };
         let sb = c.slot_bytes;
         // the staged ones first (their slots held until copied up)
         grp.sort_by_key(|(k, _)| !staged.contains_key(&need[*k]));
@@ -1949,7 +1961,7 @@ impl Part {
             let segs = expert_segs(vq, x, dst);
             let done = Arc::new(RDone::new(segs.len()));
             for seg in segs {
-                if rd.tx.lock().unwrap().send(RJob { seg, done: done.clone() }).is_err() {
+                if rd.tx.lock().unwrap().send(RJob { seg, done: done.clone(), direct: false }).is_err() {
                     return Err(Error("the expert readers ended".into()));
                 }
             }
@@ -1962,7 +1974,7 @@ impl Part {
 
     /// The experts of `missing` held by neither VRAM nor host memory read from the file into staging slots, up to
     /// STAGE of them at once on threads of their own: expert -> its slot
-    fn stage_reads(&self, m: &Model, vq: &LayerVq, c: &mut Store, l: u64, missing: &[u64]) -> Result<HashMap<u64, usize>> {
+    fn stage_reads(&self, m: &Model, vq: &LayerVq, c: &mut Store, l: u64, missing: &[u64], prompt: bool) -> Result<HashMap<u64, usize>> {
         let free = c.stage_held.iter().filter(|h| !**h).count();
         let file: Vec<u64> = missing.iter().copied().filter(|x| !c.loc.contains_key(&(l, *x))).take(free).collect();
         let mut at = HashMap::new();
@@ -1980,7 +1992,7 @@ impl Part {
             for (x, buf) in jobs {
                 let failed = &failed;
                 sc.spawn(move || {
-                    if let Err(e) = read_expert_par(m, vq, x, buf, false) {
+                    if let Err(e) = read_expert_par(m, vq, x, buf, prompt && prompt_odirect()) {
                         *failed.lock().unwrap() = Some(e.0);
                     }
                 });
@@ -2703,7 +2715,7 @@ impl Part {
         Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), oa_tab: Mutex::new(HashMap::new()), pre_reads: Mutex::new(None), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
                   hold: std::sync::atomic::AtomicBool::new(false), kv_reserve, x_due: std::sync::atomic::AtomicBool::new(lent && lend_extra()), x_first: std::sync::atomic::AtomicBool::new(true), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
                   up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage, devtab, xtags,
-                  reader: if file_ahead() > 0 { Some(FileReader::new(&m.file.paths, env_usize("NS_DS41_READERS", 16))?) } else { None } })
+                  reader: if file_ahead() > 0 { Some(FileReader::new(&m.file.paths, env_usize("NS_DS41_READERS", 16).max(env_usize("NS_DS41_PROMPT_READERS", 32)))?) } else { None } })
     }
 }
 
@@ -2768,6 +2780,7 @@ impl<'g> Ds41<'g> {
         // prose (a verify pass's rows cost nearly what one-token passes do: the decode products are ALU-bound), and
         // without them the last GPU holds ~2.9 GiB more experts
         let mtp = draft && g.n_mtp > 0 && mtp_on();
+        let mut plans = Vec::new();
         for (i, gpu) in gpus.iter().enumerate() {
             let range = bounds[i]..bounds[i + 1];
             for l in range.clone() {
@@ -2791,7 +2804,26 @@ impl<'g> Ds41<'g> {
             if reserve > 0 {
                 log(format!("{}: {:.2} GiB held for the sessions' {} tokens", gpu.name, gib(reserve), kv.0 * kv.1));
             }
-            parts.push(Part::load(&m, gpu, range, last, mtp, expert_bytes, share, reserve, log)?);
+            plans.push((gpu, range, last, share, reserve));
+        }
+        // the parts load at once, a thread each (their experts' reads overlap: 20.1 s -> one GPU's time); each part's
+        // lines logged after, in order
+        let loaded: Vec<(Result<Part>, Vec<String>)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = plans.into_iter().map(|(gpu, range, last, share, reserve)| {
+                let m = &m;
+                sc.spawn(move || {
+                    let mut lines = Vec::new();
+                    let p = Part::load(m, gpu, range, last, mtp, expert_bytes, share, reserve, &mut |s| lines.push(s));
+                    (p, lines)
+                })
+            }).collect();
+            hs.into_iter().map(|h| h.join().unwrap_or_else(|_| (Err(Error("a part's load panicked".into())), Vec::new()))).collect()
+        });
+        for (p, lines) in loaded {
+            for l in lines {
+                log(l);
+            }
+            parts.push(p?);
         }
         let engram = if g.engram_layers.is_empty() {
             None
