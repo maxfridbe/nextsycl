@@ -753,6 +753,9 @@ struct Store {
     stage_rd: Vec<Option<Arc<RDone>>>,
     ahead: HashMap<(u64, u64), (usize, Arc<RDone>)>,
     stage_next: usize,
+    /// a staging slot holding an expert read for this step whose copy up is not queued yet (a read ahead taken, or
+    /// stage_reads'): no other read may take it until then
+    stage_held: Vec<bool>,
 }
 
 /// the file reads a layer takes at once (in parallel, into the staging slots)
@@ -1351,6 +1354,7 @@ impl Part {
                     ENS_AHEAD_NS.fetch_add(ta.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     AHEAD_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     c.stage_rd[k] = None;
+                    c.stage_held[k] = true;
                     pre.insert(*x, k);
                 }
             }
@@ -1360,6 +1364,9 @@ impl Part {
             ENS_STAGE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             staged.extend(pre);
             let tw = Instant::now();
+            // the staged ones first: their slots are held until copied up, and a miss beyond them reads into a free one
+            let mut missing = missing;
+            missing.sort_by_key(|x| !staged.contains_key(x));
             for (ex, &s) in missing.iter().zip(&order) {
                 c.misses += 1;
                 if let Some(tk) = self.swap_in(m, vq, c, l, *ex, s, &mut reading, &staged)? {
@@ -1498,6 +1505,8 @@ impl Part {
         let c = &mut *c;
         let staged = if files.is_empty() { HashMap::new() } else { self.stage_reads(m, vq, c, l, &files)? };
         let sb = c.slot_bytes;
+        // the staged ones first (their slots held until copied up)
+        rest.sort_by_key(|(k, _)| !staged.contains_key(&need[*k]));
         for &(k, s) in &rest {
             let from = match &src[k] {
                 Src::R(h) => h.view(0, vq.span)?,
@@ -1513,6 +1522,7 @@ impl Part {
                     let v = c.stage.device_view(st * sb, vq.span)?;
                     let t = self.ops.stream_copy_on(1, ring, s * rs, &v, 0, vq.span, &[free[s]])?;
                     c.stage_tk[st] = Some(t);
+                    c.stage_held[st] = false;
                     last = Some(t);
                     continue;
                 }
@@ -1581,6 +1591,7 @@ impl Part {
                 };
                 let t = self.ops.stream_copy_on(1, &c.vram[vch], vo, &c.stage.device_view(k * sb, sb)?, 0, vq.span, &[down, fill, zero])?;
                 c.stage_tk[k] = Some(t);
+                c.stage_held[k] = false;
                 c.vfill.insert(s, t);
                 c.last_up = Some(t);
                 Some(t)
@@ -1677,16 +1688,20 @@ impl Part {
         Ok(self.stage_slots(c, 1)?[0])
     }
 
-    /// n different staging slots, each free (the copy last reading it done): from the next in turn, first the ones no
-    /// read ahead holds or whose read ahead has ended, then the others (their reads ahead waited for and forgotten) -
-    /// taking slots strictly in turn waited on reads ahead nobody wanted, 3-5 ms a token
+    /// n different staging slots, each free (the copy last reading it done) and not held (an expert in it still to be
+    /// copied up this step: taking it would hand that expert another's bytes - with XQ's mixed types, NaN): from the next
+    /// in turn, first the ones no read ahead holds or whose read ahead has ended, then the others (their reads ahead
+    /// waited for and forgotten) - taking slots strictly in turn waited on reads ahead nobody wanted, 3-5 ms a token
     fn stage_slots(&self, c: &mut Store, n: usize) -> Result<Vec<usize>> {
         let t0 = Instant::now();
-        let order: Vec<usize> = (0..STAGE).map(|i| (c.stage_next + i) % STAGE).collect();
+        let order: Vec<usize> = (0..STAGE).map(|i| (c.stage_next + i) % STAGE).filter(|&k| !c.stage_held[k]).collect();
         let idle = |k: usize| c.stage_rd[k].as_ref().is_none_or(|r| r.is_done());
         let mut ks: Vec<usize> = order.iter().copied().filter(|&k| idle(k)).collect();
         ks.extend(order.iter().copied().filter(|&k| !idle(k)));
-        ks.truncate(n.min(STAGE));
+        if ks.len() < n {
+            return Err(Error(format!("{n} staging slots wanted, {} free", ks.len())));
+        }
+        ks.truncate(n);
         for &k in &ks {
             if let Some(t) = c.stage_tk[k].take() {
                 self.ops.ticket_wait(t)?;
@@ -1733,7 +1748,8 @@ impl Part {
     /// The experts of `missing` held by neither VRAM nor host memory read from the file into staging slots, up to
     /// STAGE of them at once on threads of their own: expert -> its slot
     fn stage_reads(&self, m: &Model, vq: &LayerVq, c: &mut Store, l: u64, missing: &[u64]) -> Result<HashMap<u64, usize>> {
-        let file: Vec<u64> = missing.iter().copied().filter(|x| !c.loc.contains_key(&(l, *x))).take(STAGE).collect();
+        let free = c.stage_held.iter().filter(|h| !**h).count();
+        let file: Vec<u64> = missing.iter().copied().filter(|x| !c.loc.contains_key(&(l, *x))).take(free).collect();
         let mut at = HashMap::new();
         if file.is_empty() {
             return Ok(at);
@@ -1759,6 +1775,7 @@ impl Part {
             return Err(Error(format!("reading experts: {x}")));
         }
         for (x, k) in file.iter().zip(ks) {
+            c.stage_held[k] = true;
             at.insert(*x, k);
         }
         FILE_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2297,7 +2314,7 @@ impl Part {
                                            misses: 0, from_host: 0, from_file: 0, direct: 0, rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(),
                                            last_up: None, prefetched: HashMap::new(), usage: HashMap::new(), base: nv, lend: 0, lent: false, lend_chunk: 0, xlend: 0, x_chunk: 0, x_on: 0, pf_issued: 0,
                                            pf_used: 0, stage: HostBuf::new(gpu, STAGE * slot_bytes)?, stage_tk: vec![None; STAGE], stage_next: 0,
-                                           stage_rd: vec![None; STAGE], ahead: HashMap::new() }));
+                                           stage_rd: vec![None; STAGE], ahead: HashMap::new(), stage_held: vec![false; STAGE] }));
         }
         log(format!("{}: {:.2} GiB of weights, the experts loaded in {:.1} s", gpu.name, gib(bytes as usize), t0.elapsed().as_secs_f64()));
         let big = DevBuf::new(gpu, arena_bytes())?;
