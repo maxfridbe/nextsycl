@@ -234,12 +234,12 @@ fn dense_q4k_role(r: Role) -> bool {
         }).collect()
     }).contains(&r)
 }
-/// ... for passes of at least this many tokens (NS_DS41_PROMPT_PREFETCH_MIN, default 2048): below, a layer's compute is too
-/// short to hide anything and the early reads only contend with the layer's own (XQ, O_DIRECT reads: 2,561 tokens 16.6 ->
-/// 13.3 s with it; 580 tokens 8.7 -> 11-15 s, fast 5.3 -> 12-29 s)
+/// ... for passes of at least this many tokens (NS_DS41_PROMPT_PREFETCH_MIN, default 4096): below, a layer's compute is too
+/// short to hide anything and the early reads only contend with the layer's own (XQ, O_DIRECT reads: 2,561 tokens 15.8 ->
+/// 19.2 s with it; 9,901 tokens 30.1 -> 29.2 s, fast 28.3 -> 24.1 s)
 fn prompt_prefetch_min() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_usize("NS_DS41_PROMPT_PREFETCH_MIN", 2048))
+    *V.get_or_init(|| env_usize("NS_DS41_PROMPT_PREFETCH_MIN", 4096))
 }
 /// A prompt pass starts reading the next layer's file experts while it computes this one (NS_DS41_PROMPT_PREFETCH, default 1)
 fn prompt_prefetch() -> bool {
@@ -1676,14 +1676,15 @@ impl Part {
     /// Experts (k, ex) of layer l only the file holds, their reads started on the reader pool into the pinned prompt slots
     /// (each slot's last copy up done first): k -> its slot and its reads' completion, not waited for here - stage_up waits
     /// for an expert just before it copies it up, so a wave starts as soon as its own experts are in. At most as many as
-    /// there are slots; the rest are left to stage_up.
-    fn start_file_reads(&self, l: u64, files: &[u64]) -> Result<HashMap<u64, (usize, Arc<RDone>)>> {
+    /// there are slots; the rest are left to stage_up. `from`: the half's slots already taken for this layer (the reads
+    /// the layer before started for it: their experts would be read over - the same prompt's logits went to NaN)
+    fn start_file_reads(&self, l: u64, files: &[u64], from: usize) -> Result<HashMap<u64, (usize, Arc<RDone>)>> {
         let (Some((buf, sb, tks)), Some(rd)) = (&self.pstage, &self.reader) else { return Ok(HashMap::new()) };
         let vq = &self.vq[&l];
         // the slots are two halves, a layer's parity picking its own (the next layer's reads start while this one's are used)
         let total = tks.lock().unwrap().len();
-        let (half, base_slot) = (total / 2, (l as usize % 2) * (total / 2));
-        let n = files.len().min(half);
+        let (half, base_slot) = (total / 2, (l as usize % 2) * (total / 2) + from.min(total / 2));
+        let n = files.len().min(half.saturating_sub(from));
         {
             // a slot is read into again only after the copy up that last read it
             let mut t = tks.lock().unwrap();
@@ -4731,7 +4732,8 @@ impl<'g> Ds41<'g> {
                 };
                 let todo: Vec<u64> = files.iter().map(|f| f.1).filter(|ex| !by_ex.contains_key(ex)).collect();
                 if !todo.is_empty() {
-                    by_ex.extend(p.start_file_reads(l, &todo)?);
+                    let from = by_ex.len();
+                    by_ex.extend(p.start_file_reads(l, &todo, from)?);
                 }
                 let read: HashMap<usize, (usize, Arc<RDone>)> = files.iter().filter_map(|(k, ex)| by_ex.get(ex).map(|v| (*k, v.clone()))).collect();
                 // the next layer's file experts read meanwhile: a prompt of more than a few tokens uses nearly all of them
@@ -4739,7 +4741,7 @@ impl<'g> Ds41<'g> {
                     if !p.stores_of(l + 1).is_empty() {
                         let nxt: Vec<u64> = (0..ne as u64).filter(|ex| !p.with_store(l + 1, *ex, |c| c.loc.contains_key(&(l + 1, *ex))).unwrap_or(true)).collect();
                         if !nxt.is_empty() {
-                            let m = p.start_file_reads(l + 1, &nxt)?;
+                            let m = p.start_file_reads(l + 1, &nxt, 0)?;
                             *p.pre_reads.lock().unwrap() = Some((l + 1, m));
                         }
                     }
