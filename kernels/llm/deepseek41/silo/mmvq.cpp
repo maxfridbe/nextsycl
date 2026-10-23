@@ -551,6 +551,12 @@ inline void mixed_rows(const uint8_t* wr, int row, int bpr, int sub, int g, cons
     }
 }
 
+// the large register file for the other types too (NS_DS41_MMVQ_GRF=1; the mixed form always has it)
+bool big_grf() {
+    static const bool v = std::getenv("NS_DS41_MMVQ_GRF") && std::atoi(std::getenv("NS_DS41_MMVQ_GRF")) != 0;
+    return v;
+}
+
 int groups() {   // NS_DS41_MMVQ_GROUPS: the work-groups of a launch (each fills its grid table once; default 1024)
     static const int v = std::getenv("NS_DS41_MMVQ_GROUPS") ? std::max(1, std::atoi(std::getenv("NS_DS41_MMVQ_GROUPS"))) : 1024;
     return v;
@@ -568,6 +574,7 @@ void fill_tab(uint32_t* tab, const sycl::nd_item<3>& item) {
 // activation blocks (4 blocks a step, NB steps: n_in up to 4 NB blocks) loaded where the column changes; R rows at once
 // when they are the same entry's (their blocks' loads in flight together: a row alone is a chain of a load, the grid's
 // lookups and the reduction)
+template <typename F, int NB, int R, bool BIG> class RunK;   // the kernels' names: one a register file size
 template <typename F, int NB, int R>
 void run(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int entries, const int8_t* x, int ncols, float* y, int n_in, int n_out) {
     const std::size_t rows = std::size_t(entries) * n_out;
@@ -627,8 +634,8 @@ void run(sycl::queue& q, const uint64_t* ptrs, const int32_t* meta, int entries,
                            }
                        };
         // the mixed form's three loaders in one kernel: the large register file (half the threads a core) instead of spills
-        if constexpr (is_mixed<F>) h.parallel_for(ndr, sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>}, kern);
-        else h.parallel_for(ndr, kern);
+        if (is_mixed<F> || big_grf()) h.parallel_for<RunK<F, NB, R, true>>(ndr, sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>}, kern);
+        else h.parallel_for<RunK<F, NB, R, false>>(ndr, kern);
     });
 }
 

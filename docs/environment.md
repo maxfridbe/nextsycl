@@ -584,6 +584,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_VQ_GEMM_V` | 5 | Experiment: the prompt's XMX expert product's form - 0 its B tiles through local memory, 1 decoded straight into the tiles' registers (8 K slices a work-group), 2 / 3 the same with 4 K slices, 4 / 5 as 2 / 3 and past 32 tokens 8 token tiles a sub-group, 6 / 7 two or four row tiles a sub-group (4 K slices), 8 / 9 two with 8 / 16 K slices | kernels:llm deepseek41 |
 | `NS_DS41_GEMM_TEST_N` | 40 | `llm kernels`: the tokens of its vq_gemm check (1..64) | llm deepseek41 |
 | `NS_DS41_VQ_BENCH` | 0,1 | `llm kernels`: the VQ decode variants it times | llm deepseek41 |
+| `NS_DS41_MMVQ_GRF` | 0 | Experiment: 1: every split-Q8 expert product on the large register file (grf_size 256; the XQ file's mixed one always is) | kernels:llm deepseek41 |
 | `NS_DS41_Q4K_CACHE` | none (cli service: /cache/q4k) | a directory: the q4_K blocks `NS_DS41_DENSE_Q4K` requantizes are kept there and read back at the next load (XQ fast load 42.3 -> ~17 s; ~4.7 GiB for XQ) | llm deepseek41 |
 | `NS_DS41_Q4K_R` | 4 | Experiment: rows a sub-group of decode's q4_K products (1, 2 or 4) | kernels:llm deepseek41 |
 | `NS_DS41_Q4K_COLS` | 2 | decode's q4_K products decode each weight once for all of a pass's columns from this many columns (a verify pass; the same arithmetic a column as the one-column kernel, so verify rows stay bit-identical); 1 one column too, 0 never | kernels:llm deepseek41 |
