@@ -893,6 +893,7 @@ dependencies = [
  "nextsycl-gguf",
  "nextsycl-llm",
  "nextsycl-tok",
+ "serde_json",
 ]
 
 [[package]]
