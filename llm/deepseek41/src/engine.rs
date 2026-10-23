@@ -254,6 +254,12 @@ fn engram_shared() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_DS41_ENGRAM_SHARED").is_ok_and(|v| v == "1"))
 }
+/// The big arena's slots lent to a store at load filled from the profile then (NS_DS41_FILL_LENT=1; off by default:
+/// exact decode over 4,000 tokens read as many experts from the file, 52.4K against 51.7K, tg 7.58 against 7.23)
+fn fill_lent() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_FILL_LENT", 0) != 0)
+}
 fn cold_skip() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_DS41_COLD_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
@@ -2294,24 +2300,6 @@ impl Part {
                                            stage_rd: vec![None; STAGE], ahead: HashMap::new() }));
         }
         log(format!("{}: {:.2} GiB of weights, the experts loaded in {:.1} s", gpu.name, gib(bytes as usize), t0.elapsed().as_secs_f64()));
-        // the slot table: every expert in VRAM now
-        let ntab = (g.n_layer as usize) * g.n_expert as usize;
-        let devtab = DevBuf::new(gpu, ntab * 8)?;
-        {
-            let mut host = vec![0u64; ntab];
-            for st in &stores {
-                let c = st.lock().unwrap();
-                for (s, o) in c.vowner.iter().enumerate() {
-                    if let Some((l, x)) = o {
-                        if *l < g.n_layer {
-                            let (ch, at) = c.vat(s);
-                            host[*l as usize * g.n_expert as usize + *x as usize] = c.vram[ch].ptr() as u64 + at as u64;
-                        }
-                    }
-                }
-            }
-            devtab.write(0, &host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-        }
         let big = DevBuf::new(gpu, arena_bytes())?;
         let small = DevBuf::new(gpu, SMALL_ARENA)?;
         // the big arena lent to the largest store while no prompt chunk needs it
@@ -2332,8 +2320,63 @@ impl Part {
                     c.lent = true;
                     lent = true;
                     nv_all += n;
+                    // filled now with the profile's next experts (in neither VRAM nor host memory): empty, they waited for
+                    // decode's misses to fill them one file read at a time (NS_DS41_FILL_LENT=1; default off)
+                    if fill_lent() {
+                        let mine: Vec<u64> = layers.clone().filter(|l| store_of.get(l).is_some_and(|&si| std::ptr::eq(&stores[si], st))).collect();
+                        let mut keys: Vec<(u64, u64)> = (0..g.n_expert).flat_map(|x| mine.iter().map(move |l| (*l, x))).filter(|k| !c.loc.contains_key(k)).collect();
+                        if let Some(prof) = expert_profile() {
+                            keys.sort_by_key(|k| std::cmp::Reverse(prof.get(k).copied().unwrap_or(0.0) as u64));
+                        }
+                        keys.truncate(n);
+                        let (sb, lc) = (c.slot_bytes, c.lend_chunk);
+                        let failed: Mutex<Option<String>> = Mutex::new(None);
+                        {
+                            let (keys, vq, failed, dst) = (&keys, &vq, &failed, &c.vram[lc]);
+                            std::thread::scope(|sc| {
+                                for th in 0..8 {
+                                    sc.spawn(move || {
+                                        let mut buf = vec![0u8; sb];
+                                        for (i, key) in keys.iter().enumerate().skip(th).step_by(8) {
+                                            let v = &vq[&key.0];
+                                            if let Err(x) = read_expert(m, v, key.1, &mut buf).and_then(|_| dst.write(i * sb, &buf[..v.span])) {
+                                                *failed.lock().unwrap() = Some(x.0);
+                                                return;
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                        if let Some(x) = failed.into_inner().unwrap() {
+                            return Err(Error(format!("filling the lent slots: {x}")));
+                        }
+                        for (i, k) in keys.iter().enumerate() {
+                            c.loc.insert(*k, Loc::V(nv + i));
+                            c.vowner[nv + i] = Some(*k);
+                        }
+                        log(format!("{}: the big arena's {} lent slots filled from the profile ({:.1} GiB)", gpu.name, keys.len(), gib(keys.len() * sb)));
+                    }
                 }
             }
+        }
+        // the slot table: every expert in VRAM now
+        let ntab = (g.n_layer as usize) * g.n_expert as usize;
+        let devtab = DevBuf::new(gpu, ntab * 8)?;
+        {
+            let mut host = vec![0u64; ntab];
+            for st in &stores {
+                let c = st.lock().unwrap();
+                for (s, o) in c.vowner.iter().enumerate() {
+                    if let Some((l, x)) = o {
+                        if *l < g.n_layer {
+                            let (ch, at) = c.vat(s);
+                            host[*l as usize * g.n_expert as usize + *x as usize] = c.vram[ch].ptr() as u64 + at as u64;
+                        }
+                    }
+                }
+            }
+            devtab.write(0, &host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
         }
         // each store's slot addresses on the GPU (the slot table's entries are copied from them), lent slots too
         for st in &stores {

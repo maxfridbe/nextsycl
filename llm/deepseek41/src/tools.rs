@@ -600,26 +600,54 @@ fn kernels_std(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &
                         want = r;
                     }
                 }
-                // the decode product: 3 columns of x, against the host's W x
-                let x: Vec<f32> = (0..3 * cols).map(|_| rnd()).collect();
+                // the decode product: 8 columns of x (a pass of 5-8 rows takes the 8-column kernels), against the host's
+                // W x - the float32 kernel and the split-Q8 one
+                const NC: usize = 8;
+                let x: Vec<f32> = (0..NC * cols).map(|_| rnd()).collect();
                 let xd = DevBuf::from_f32(g, &x).map_err(e)?;
                 let mut tb: Vec<u8> = (src.ptr() as u64).to_le_bytes().to_vec();
-                for v in [3i32, 0, 0, 1, 2, 0, 0, 0, 0, 0] {
+                for v in [NC as i32, 0, 0, 1, 2, 3, 4, 5, 6, 7] {
                     tb.extend(v.to_le_bytes());
                 }
                 let tab = DevBuf::new(g, tb.len()).map_err(e)?;
                 tab.write(0, &tb).map_err(e)?;
-                let yd = DevBuf::f32(g, 3 * rows).map_err(e)?;
-                o.std_mmv(t.ty.code(), &tab, 1, &xd, (&yd, 0), 3, rows, cols, 3).map_err(e)?;
+                let yd = DevBuf::f32(g, NC * rows).map_err(e)?;
+                o.std_mmv(t.ty.code(), &tab, 1, &xd, (&yd, 0), NC, rows, cols, NC).map_err(e)?;
                 g.sync().map_err(e)?;
                 let y = yd.to_f32().map_err(e)?;
-                let mut yw = vec![0f32; 3 * rows];
-                for c in 0..3 {
+                let mut yw = vec![0f32; NC * rows];
+                for c in 0..NC {
                     for r in 0..rows {
                         yw[c * rows + r] = (0..cols).map(|k| want[r * cols + k] as f64 * x[c * cols + k] as f64).sum::<f64>() as f32;
                     }
                 }
                 let (yrel, _) = compare(&y, &yw);
+                // per column, the worst
+                let col_err = |y: &[f32]| (0..NC).map(|c| compare(&y[c * rows..(c + 1) * rows], &yw[c * rows..(c + 1) * rows]).0).fold(0f64, f64::max);
+                let ycol = col_err(&y);
+                let q8 = if o.std_mmvq_supported(t.ty.code(), cols) {
+                    let xs = DevBuf::new(g, o.std_q8_bytes(cols, NC)).map_err(e)?;
+                    o.std_quantize_q8(&xd, &xs, cols, NC).map_err(e)?;
+                    // its table takes one column an entry (as the engine builds it)
+                    let mut tq: Vec<u8> = Vec::new();
+                    for _ in 0..NC {
+                        tq.extend((src.ptr() as u64).to_le_bytes());
+                    }
+                    for c in 0..NC as i32 {
+                        for v in [1i32, c, c, 0, 0, 0, 0, 0, 0, 0] {
+                            tq.extend(v.to_le_bytes());
+                        }
+                    }
+                    let tabq = DevBuf::new(g, tq.len()).map_err(e)?;
+                    tabq.write(0, &tq).map_err(e)?;
+                    let yq = DevBuf::f32(g, NC * rows).map_err(e)?;
+                    o.std_mmvq(t.ty.code(), &tabq, NC, &xs, NC, (&yq, 0), NC, rows, cols).map_err(e)?;
+                    g.sync().map_err(e)?;
+                    let yq = yq.to_f32().map_err(e)?;
+                    format!(", split Q8 {:.2e} (worst column {:.2e})", compare(&yq, &yw).0, col_err(&yq))
+                } else {
+                    String::new()
+                };
                 // six experts' worth in one launch (a decode layer's gate | up or down), timed
                 let mut tb6: Vec<u8> = Vec::new();
                 for _ in 0..6 {
@@ -641,7 +669,7 @@ fn kernels_std(f: &Gguf, m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &
                 }
                 g.sync().map_err(e)?;
                 let us = t0.elapsed().as_secs_f64() * 1e5;
-                println!("{tag:<28} [{rows} x {cols}] {}3-column product rel err {yrel:.2e}; 6 experts in one launch {us:.0} us", note);
+                println!("{tag:<28} [{rows} x {cols}] {}8-column product rel err {yrel:.2e} (worst column {ycol:.2e}){q8}; 6 experts in one launch {us:.0} us", note);
             }
         }
     }

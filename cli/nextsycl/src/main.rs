@@ -280,6 +280,85 @@ fn gpus() -> Result<(), String> {
     Ok(())
 }
 
+/// `rows-check <model.gguf> --prompt-file P --text T [--at N] [--rows R] [--gpu 0,1]`: the prompt and the text's first N
+/// tokens read, then the next R tokens as one pass of R rows and, from a copy of the session, as R passes of one row;
+/// every tapped tensor compared row by row (cosine), in the pass's order - where a multi-row pass first differs from decode
+fn rows_check(args: &[String]) -> Result<(), String> {
+    use std::collections::BTreeMap;
+    let e = |x: nextsycl_core::Error| x.0;
+    let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+    let model = args.get(1).ok_or("rows-check <model.gguf> --prompt-file P --text T")?;
+    let f = Gguf::open(Path::new(model)).map_err(|e| e.0)?;
+    let tok = nextsycl_tok::Tokenizer::from_gguf(&f)?;
+    let pf = opt("--prompt-file").ok_or("--prompt-file P")?;
+    let prompt = std::fs::read_to_string(&pf).map_err(|x| format!("{pf}: {x}"))?;
+    let tf = opt("--text").ok_or("--text T")?;
+    let text = tok.encode(&std::fs::read_to_string(&tf).map_err(|x| format!("{tf}: {x}"))?);
+    let at: usize = opt("--at").and_then(|v| v.parse().ok()).unwrap_or(200);
+    let rows: usize = opt("--rows").and_then(|v| v.parse().ok()).unwrap_or(8);
+    let mut ids = tok.encode(&chat_of(&f)?(&[nextsycl_tok::Message { role: "user", content: &prompt, ..Default::default() }], nextsycl_tok::Effort::Low, &[]));
+    ids.extend_from_slice(&text[..at.min(text.len())]);
+    let next = text.get(at..at + rows).ok_or("--text: too short for --at and --rows")?.to_vec();
+    let gpus: Vec<usize> = opt("--gpu").unwrap_or_else(|| "0".into()).split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    let gs: Vec<std::sync::Arc<nextsycl_core::Gpu>> = gpus.iter().map(|i| nextsycl_core::Gpu::open(*i)).collect::<Result<_, _>>().map_err(e)?;
+    let mut log = |l: String| eprintln!("[{l}]");
+    let eng = load_engine(&f, &gs, LoadOptions { expert_bytes: None, mirror_bytes: None, draft: false, kv: (ids.len() + rows + 8, 2) }, &mut log)?;
+    let mut a = eng.session(ids.len() + rows + 8).map_err(e)?;
+    let mut none = |_: &str, _: &nextsycl_core::DevBuf| -> nextsycl_core::Result<()> { Ok(()) };
+    eng.feed(&mut a, &ids, &mut none).map_err(e)?;
+    let mut b = eng.session(ids.len() + rows + 8).map_err(e)?;
+    eng.copy_session(&mut b, &a).map_err(e)?;
+    // the pass of R rows: each tensor once, R rows; the R passes of one row: each tensor R times, a row each
+    let mut order: Vec<String> = Vec::new();
+    let mut one: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+    {
+        let mut tap = |n: &str, d: &nextsycl_core::DevBuf| -> nextsycl_core::Result<()> {
+            if !one.contains_key(n) {
+                order.push(n.to_string());
+            }
+            one.insert(n.to_string(), d.to_f32()?);
+            Ok(())
+        };
+        eng.forward_rows(&mut a, &next, rows, &mut tap).map_err(e)?;
+    }
+    let mut many: BTreeMap<String, Vec<Vec<f32>>> = BTreeMap::new();
+    for t in &next {
+        let mut tap = |n: &str, d: &nextsycl_core::DevBuf| -> nextsycl_core::Result<()> {
+            many.entry(n.to_string()).or_default().push(d.to_f32()?);
+            Ok(())
+        };
+        eng.forward_rows(&mut b, &[*t], 1, &mut tap).map_err(e)?;
+    }
+    let cos = |x: &[f32], y: &[f32]| {
+        let (mut d, mut nx, mut ny) = (0f64, 0f64, 0f64);
+        for (p, q) in x.iter().zip(y) {
+            d += *p as f64 * *q as f64;
+            nx += (*p as f64).powi(2);
+            ny += (*q as f64).powi(2);
+        }
+        if nx == 0.0 && ny == 0.0 { 1.0 } else { d / (nx.sqrt() * ny.sqrt()).max(1e-30) }
+    };
+    println!("{} prompt tokens, rows {at}..{} of the text: {rows} rows a pass against {rows} passes of one", ids.len(), at + rows);
+    let mut shown = 0;
+    for n in &order {
+        let (Some(x), Some(ys)) = (one.get(n), many.get(n)) else { continue };
+        if ys.len() != rows || ys.iter().any(|y| y.len() * rows != x.len()) {
+            continue;
+        }
+        let w = ys[0].len();
+        let per: Vec<f64> = (0..rows).map(|r| cos(&x[r * w..(r + 1) * w], &ys[r])).collect();
+        let worst = per.iter().copied().fold(1.0, f64::min);
+        if worst < 0.9999 || shown < 3 {
+            println!("{n:<28} worst {worst:.6}  rows {}", per.iter().map(|c| format!("{c:.5}")).collect::<Vec<_>>().join(" "));
+            shown += 1;
+            if shown >= 40 {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// (cosine, relative L2 error, max |a - b|)
 fn compare(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
     let (mut ab, mut aa, mut bb, mut dd, mut mx) = (0f64, 0f64, 0f64, 0f64, 0f64);
@@ -540,8 +619,8 @@ fn generate(args: &[String]) -> Result<(), String> {
         let mut at = 0;
         while at + 1 < sc.len() {
             // 8 rows a pass: the head reads every row (decode-width products; a wider pass would expand it to half);
-            // NS_SCORE_ROWS=1: one row a pass, as decode runs
-            let end = (at + std::env::var("NS_SCORE_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).clamp(1, 8)).min(sc.len() - 1);
+            // NS_SCORE_ROWS=1: one row a pass, as decode runs (up to 64: above 8 the prompt path)
+            let end = (at + std::env::var("NS_SCORE_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).clamp(1, 64)).min(sc.len() - 1);
             rows.extend(eng.forward_rows(&mut sess, &sc[at..end], end - at, &mut none).map_err(e)?);
             at = end;
         }
@@ -592,8 +671,9 @@ fn generate(args: &[String]) -> Result<(), String> {
         }
         return Ok(());
     }
-    let mut rng = Rng(0x9E3779B97F4A7C15);
     let seed: u64 = opt("--seed").and_then(|v| v.parse().ok()).unwrap_or(1);
+    // the host's draws from the seed too (they were the same for every seed)
+    let mut rng = Rng((0x9E3779B97F4A7C15u64 ^ seed.wrapping_mul(0xBF58476D1CE4E5B9)) | 1);
     let mut draw = TempSampler { temp, top_p, rng: &mut rng, seed };
     let mut dec = eng.decoder(logits, mtp);
     dec.set_context(&ids);
@@ -1118,6 +1198,7 @@ fn main() -> ExitCode {
         Some("serve") => host::home(&cfg, rest),
         Some("spec-check") => spec_check(&args),
         Some("batch-check") => batch_check(&args),
+        Some("rows-check") => rows_check(&args),
         Some("kernels") if args.len() >= 2 => {
             let gpu = args.iter().position(|a| a == "--gpu").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0);
             kernels(Path::new(&args[1]), gpu)
