@@ -78,7 +78,7 @@ Settings the program turns into the chat server's flags and container; a registr
 | `NS_CACHE_DISK_GIB` | 32 | the prompt cache's disk budget (0: no disk tier) | cli (llm start) |
 | `NS_CACHE_TTL_HOURS` | 24 | how long disk checkpoints are kept | cli (llm start) |
 | `NS_CTX` | 65536 | tokens of context a session, or one a session: 262144,32768 (--ctx) | cli (llm start) |
-| `NS_EFFORT` | low | default reasoning effort (--effort) | cli (llm start) |
+| `NS_EFFORT` | low | default reasoning effort (--effort) for requests that name none; a model's registry entry (its card's env) may set its own | cli (llm start) |
 | `NS_GPUS` | all | the chat server's GPUs when the command and the model do not say ("0 1" or "0,1") | cli (llm start) |
 | `NS_HOST` | 127.0.0.1 | the chat server's address (0.0.0.0: the network) (--host) | cli (llm start) |
 | `NS_KEEP_REQUESTS` | 100 | ended requests kept for ps and inspect (--keep-requests) | cli (llm start) |

@@ -171,7 +171,10 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
                                      ("--name", "NS_NAME", "glm-5.3-flash-uncensored"), ("--effort", "NS_EFFORT", "low"),
                                      ("--prompt-cache-mib", "NS_PROMPT_CACHE_MIB", "4096"), ("--keep-requests", "NS_KEEP_REQUESTS", "100"),
                                      ("--parallel", "NS_PARALLEL", "2")] {
-        args.extend([flag.into(), arg(raw, flag, cfg, setting, default)]);
+        // the model's registry entry may set its own default effort (a card's NS_EFFORT: a thinking model Open WebUI
+        // asks without one); the command line still wins
+        let own = (setting == "NS_EFFORT" && !raw.iter().any(|a| a == flag)).then(|| entry_env.iter().find(|(k, _)| k == setting).map(|(_, v)| v.clone())).flatten();
+        args.extend([flag.into(), own.unwrap_or_else(|| arg(raw, flag, cfg, setting, default))]);
     }
     if raw.iter().any(|a| a == "--no-mtp") || cfg.get("NS_NO_MTP").is_some_and(|v| v == "1") {
         args.push("--no-mtp".into());
