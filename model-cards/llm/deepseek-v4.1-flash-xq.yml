@@ -1,0 +1,54 @@
+# DeepSeek-V4.1-Flash-1017 XQ v3 (IndrasMirror's uncensored mixed Q3_K / Q2_0 / PTQ1_0 experts) · 128K context
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: deepseek-v4.1-flash-xq
+kind: llm
+arch: deepseek41
+title: DeepSeek-V4.1-Flash-1017 XQ v3 uncensored · 128K context (both GPUs, pinned memory and the NVMe)
+about: "IndrasMirror's XQ v3 GGUF of DeepSeek-V4.1-Flash-1017 (from dealignai's UNCENSORED-FP8: a rank-2 refusal-direction edit of the attention output and the shared expert's down; MIT). Each routed expert has its own type - Q3_K, Q2_0 or ternary PTQ1_0 (gate and up share one, down its own; 2.09 bits a weight, 142 GiB of experts) - the rest Q8_0, and DeepSeek's own Engram tables beside it (two 101.5 GB shards read a row at a time). Exact: tg 8.2 tok/s over 512 tokens; pp 45 / 99 / 254 tok/s at 580 / 2.5K / 10K tokens. Perplexity on human text a little above UD-IQ2_XXS's (gut1 1.281 vs 1.228). deepseek-v4.1-flash-xq-fast is the same files at ~16 tok/s."
+gpus: all
+streams: true                   # the experts beyond VRAM and pinned memory, and the Engram's rows, are read from the drive while it serves
+sidecars: [deepseek-engram/]    # found beside the model: the Engram shards' folder
+vram_gib: 30.0
+ctx: '131072'
+tools: false
+tasks: false
+env: {NS_DS41_FREE_GIB: "1.5", NS_PREFILL_CHUNK: "16384", NS_DS41_VISION: "0"}   # exact (the box rule: 1.5 GiB of VRAM free); pictures off: the vision sidecar is untested on this file
+silo:                           # its expert kernels (std.cpp, mmvq.cpp: the mixed products) exist only there
+  name: deepseek41
+  required: true
+files:
+  model:
+    key: deepseek-v4.1-flash-1017-xq-v3
+    size: 162954903552
+    sha256: 73df1934302f867601dd27f7fca59109d9b11674f50cc60526ec2a1cd4f3d389
+    path: deepseek-v4.1-flash-1017/V41-XQ-1017-v3.gguf
+    parts:                      # published as 16 byte ranges of the file (v3/): joined after each is checked
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-01-of-16, size: 10737418240, sha256: 3b909e5804f7cee17dff90d834339cc5f2745bf4082e92a54d617e0bc540e07f}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-02-of-16, size: 10737418240, sha256: a98d6fc580aa12ea9b796b89e2aeaa2eb4ad840d9d549a834a119a9887c4bfbe}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-03-of-16, size: 10737418240, sha256: fe1b44c6d753efef260a19faf047f9613da0263d6a176afe1ac4e06e1a172e08}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-04-of-16, size: 10737418240, sha256: b11395be1cffce5e96e24fe56e53cc13ebc246d807b4ecd8bbfedb1c5f6fbae9}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-05-of-16, size: 10737418240, sha256: 59d0856bda06f52d9d45a8593ee0eff1cf6bd45d81e9c6f8a7b034ef8c468118}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-06-of-16, size: 10737418240, sha256: 8003ba0eeb809fbc53c9781edc564d37b64e8df819614e4c4e85d4686fc939e5}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-07-of-16, size: 10737418240, sha256: 81e613b5dba0bb01ec28a727120e1a340fb7c4ee73e19d54d9c681041e4d1a59}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-08-of-16, size: 10737418240, sha256: 919e67dae0586e553c7b510fb5405b27540dbe0bb80684f0c0c5b1757d5a0e45}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-09-of-16, size: 10737418240, sha256: 154021ddee57736cb4ea2a91b767c3c481bdade5402e88f922b2032fac513288}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-10-of-16, size: 10737418240, sha256: 156732d47d6612c2cb2ab2f9b24d76896ba8c0a5d893acb2d15b8b7d2c878b7a}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-11-of-16, size: 10737418240, sha256: 4d5cf4f47b1eb6996f028c14bfbaff2ff09d9be1959ed28226ce741983780813}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-12-of-16, size: 10737418240, sha256: 11d8ef317984113eb391cc0c91b0b7a513df49bc2a61bd182a79e7816c1d2e69}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-13-of-16, size: 10737418240, sha256: c8eb89c431e8fc38929ff00fb27dcd44fd72c2b455141b815eef2da022f5a4ec}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-14-of-16, size: 10737418240, sha256: 77aa8461419c5ccd628e1e8d530e8d84a8e1695b2195cd74b6ee62a4eebd2e93}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-15-of-16, size: 10737418240, sha256: ad0a9e2fb29bdfbf840e9dfff4a9aed5707d2b0c550d3f5a6da5238d9f9ef032}
+      - {url: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored/resolve/15e786c6653f7ff3069ea8fab635ed1948781b39/v3/V41-XQ-1017-v3.gguf.part-16-of-16, size: 1893629952, sha256: f18cb36f58df260c4d41b4a9055f827e79814efeb893250baad35a29578baa53}
+  engram-1:
+    key: deepseek-v4.1-flash-1017-engram-1
+    url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/deepseek-engram/model-00047-of-00048.safetensors
+    size: 101535150936
+    sha256: 76a05106ece259be83d1bfea0dcb54f23377864ee60fd321690f35e6698a2af5
+    path: deepseek-v4.1-flash-1017/deepseek-engram/model-00047-of-00048.safetensors
+  engram-2:
+    key: deepseek-v4.1-flash-1017-engram-2
+    url: https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF/resolve/f81ee2e9801fcc58fd51ae75dd827467ffc0b9e5/deepseek-engram/model-00048-of-00048.safetensors
+    size: 101537926640
+    sha256: 9dc51433e195bc78b5ad846b68643cc0351d3b174e5e4309222d3b7402c83afd
+    path: deepseek-v4.1-flash-1017/deepseek-engram/model-00048-of-00048.safetensors
+guide: guides/chat.md

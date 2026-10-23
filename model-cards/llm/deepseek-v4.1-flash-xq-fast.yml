@@ -1,0 +1,23 @@
+# DeepSeek-V4.1-Flash-1017 XQ v3, the fast setting: cold low-weight experts left out and attention in q4_K
+# model card (model-cards/README.md): the same files as deepseek-v4.1-flash-xq, two approximations switched on
+id: deepseek-v4.1-flash-xq-fast
+kind: llm
+arch: deepseek41
+title: DeepSeek-V4.1-Flash-1017 XQ v3 uncensored fast · 128K context (both GPUs, pinned memory and the NVMe)
+about: "The XQ v3 of deepseek-v4.1-flash-xq with deepseek-v4.1-flash-iq2xxs-fast's two approximations on (cold experts under 0.2 of the routing weight left out, attention and the shared expert in q4_K): tg 15.7 tok/s over 512 tokens (exact 8.2)."
+gpus: all
+streams: true
+sidecars: [deepseek-engram/]
+vram_gib: 30.0
+ctx: '131072'
+tools: false
+tasks: false
+env: {NS_DS41_FREE_GIB: "1.5", NS_DS41_COLD_SKIP: "0.2", NS_DS41_DENSE_Q4K: "1", NS_PREFILL_CHUNK: "16384", NS_DS41_COLD_SKIP_PROMPT: "0.3", NS_DS41_COLD_SKIP_PROMPT_MAX: "8", NS_DS41_VISION: "0"}
+silo:
+  name: deepseek41
+  required: true
+files:
+  model: deepseek-v4.1-flash-1017-xq-v3
+  engram-1: deepseek-v4.1-flash-1017-engram-1
+  engram-2: deepseek-v4.1-flash-1017-engram-2
+guide: guides/chat.md
