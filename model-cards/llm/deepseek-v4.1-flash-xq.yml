@@ -4,7 +4,7 @@ id: deepseek-v4.1-flash-xq
 kind: llm
 arch: deepseek41
 title: DeepSeek-V4.1-Flash-1017 XQ v3 uncensored · 128K context (both GPUs, pinned memory and the NVMe)
-about: "IndrasMirror's XQ v3 GGUF of DeepSeek-V4.1-Flash-1017 (from dealignai's UNCENSORED-FP8: a rank-2 refusal-direction edit of the attention output and the shared expert's down; MIT). Each routed expert has its own type - Q3_K, Q2_0 or ternary PTQ1_0 (gate and up share one, down its own; 2.09 bits a weight, 142 GiB of experts) - the rest Q8_0, and DeepSeek's own Engram tables beside it (two 101.5 GB shards read a row at a time). Exact: tg 8.2 tok/s over 512 tokens; pp 45 / 99 / 254 tok/s at 580 / 2.5K / 10K tokens. Perplexity on human text a little above UD-IQ2_XXS's (gut1 1.281 vs 1.228). deepseek-v4.1-flash-xq-fast is the same files at ~16 tok/s."
+about: "IndrasMirror's XQ v3 GGUF of DeepSeek-V4.1-Flash-1017 (from dealignai's UNCENSORED-FP8: a rank-2 refusal-direction edit of the attention output and the shared expert's down; MIT). Each routed expert has its own type - Q3_K, Q2_0 or ternary PTQ1_0 (gate and up share one, down its own; 2.09 bits a weight, 142 GiB of experts) - the rest Q8_0, and DeepSeek's own Engram tables beside it (two 101.5 GB shards read a row at a time). Exact: tg 10.1 tok/s over 512 tokens; pp 67 / 99 / 254 tok/s at 580 / 2.5K / 10K tokens. Perplexity on human text a little above UD-IQ2_XXS's (gut1 1.281 vs 1.228). deepseek-v4.1-flash-xq-fast is the same files at 20.7 tok/s."
 gpus: all
 streams: true                   # the experts beyond VRAM and pinned memory, and the Engram's rows, are read from the drive while it serves
 sidecars: [deepseek-engram/]    # found beside the model: the Engram shards' folder
