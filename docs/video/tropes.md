@@ -92,3 +92,23 @@ Two that together span the dimensions, each with its own hard part:
 - An **action** trope (T7, T8, T9) stresses D1 D2 D6, the motion carried by `guide_clip`.
 - A **suspense** trope (T12, T14, T16) stresses D2 D8 D10, the prop and the reveal.
 - A **place and time** trope (T19, T20) stresses D4 D5.
+
+## Chosen: T14 and T30
+
+`tests/api/trope_scenes.py` makes and scores two of them, built like `harbour_dialogue.py` (pictures and voices as Ref2VA
+references, one speaker a shot, each clip sized to its line):
+
+- **T14, the mystery object** (D1 D2 D4 D5 D8 D10): a medium shot of the woman lifting a walnut music box out of a trunk in
+  an attic, an extreme close-up of the lid opening on its mother-of-pearl star, a medium close-up of her listening. The
+  box is one reference picture on all three clips; the hard part is the box staying the same object while the shot size
+  changes twice. (The lantern in the table above became a music box, because it has a face to recognise and a sound.)
+- **T30, the farewell at the station** (D1 D3 D4 D7 D9 D10): she speaks (facing right), he answers from the carriage door
+  (facing left), the train pulls away with her alone on the platform waving. Two faces, two voices, one station, and the
+  eyeline across the cut.
+
+Scoring: the measured checks are the clips' size, length and sound, each speaker's pitch against the voice sample, and the
+film being the clips cut together. The rest (identity, the prop, the place, the light, the shot size, screen direction,
+the performance) are asked of a vision model, one question per dimension, 1-5, 4 passes, shown frames of the clips and
+the reference pictures at temperature 0. The judge is a model and can be wrong: the frames it saw are written beside the
+report (`frame_*.jpg`) with each clip's contact sheet, so a score can be argued with, and the by-eye review these
+dimensions started with is still the final word. Results go here once run.

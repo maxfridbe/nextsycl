@@ -49,7 +49,7 @@ fi
 
 if [ -n "$api" ]; then
   say "5. API reference tests against $api"
-  for t in tests/api/test-ocr.py tests/api/harbour_dialogue.py tests/api/kaiju_lighthouse.py; do
+  for t in tests/api/test-ocr.py tests/api/harbour_dialogue.py tests/api/trope_scenes.py tests/api/kaiju_lighthouse.py; do
     echo "-- $t --quick"
     python3 "$t" --url "$api" ${token:+--token "$token"} $([ "$t" = tests/api/test-ocr.py ] || echo --quick)
   done
