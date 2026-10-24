@@ -111,4 +111,13 @@ film being the clips cut together. The rest (identity, the prop, the place, the 
 the performance) are asked of a vision model, one question per dimension, 1-5, 4 passes, shown frames of the clips and
 the reference pictures at temperature 0. The judge is a model and can be wrong: the frames it saw are written beside the
 report (`frame_*.jpg`) with each clip's contact sheet, so a score can be argued with, and the by-eye review these
-dimensions started with is still the final word. Results go here once run.
+dimensions started with is still the final word.
+
+### Results
+
+**T14, the mystery object** (hardac1, `--quick`: 384x288, 8 steps, no upscale, INT8 + Ref2VA, seeds 1955-1957; the three clips took 61, 31 and 31 s, the pictures and the judge's model load the rest of ~25 min). All measured checks and all six judged
+dimensions passed: identity 5, prop 5, place 5, light 5, scale 5, performance 4 (of 5). Reviewed by eye against the contact
+sheets, the judge was a little generous on the prop: the reference box has a five-pointed star on its lid, the clips show a
+six- or eight-pointed one, and the latch the picture shows reads as a hinge. It is the same kind of box, in the same wood and
+light, but not the same inlay; a stricter question (count the star's points) would score it lower. The woman, the attic and the
+grade held across all three shots, and the shot size went medium, macro, close as scripted. T30 is not run yet.

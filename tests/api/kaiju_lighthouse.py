@@ -23,6 +23,7 @@ the clips, film.mp4 and report.json. Exits 1 when a check fails.
 import argparse
 import base64
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -86,7 +87,7 @@ class Api:
     def _req(self, method, path, body=None, timeout=3600):
         data = None if body is None else json.dumps(body).encode()
         r = urllib.request.Request(self.url + path, data=data, method=method,
-                                   headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+                                   headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json", **BYPASS})
         try:
             with urllib.request.urlopen(r, timeout=timeout) as a:
                 return a.read()
@@ -118,6 +119,8 @@ def token_of(arg):
 
 
 FFMPEG, FFPROBE = ["ffmpeg"], ["ffprobe"]
+# while the front door is in maintenance, a test goes through with its bypass key (printed by `nextsycl maintenance on`)
+BYPASS = {"X-Maintenance-Bypass": os.environ["MAINTENANCE_BYPASS"]} if os.environ.get("MAINTENANCE_BYPASS") else {}
 CREATURE = KAIJU
 
 

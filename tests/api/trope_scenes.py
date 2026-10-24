@@ -249,7 +249,7 @@ def make(api, a, key, root):
             prompt = build(line)
         nf = H.frames_for(line) if line else H.snap((secs or 5.0) * FPS)
         body = {"prompt": prompt, "seconds": round(nf / FPS, 4), "steps": steps, "seed": a.seed + i, "width": w, "height": h, "project": project,
-                "queue": True, "label": f"{key} {run} {i:02}/{len(t['clips']):02}: {cid}", "engine": engine,
+                "queue": True, "label": f"{key} {run} {i:02}/{len(t['clips']):02}: {cid}",
                 "ref_images": [files[r] for r in refs if not r.startswith("@")]}
         auds = [files[r[1:]] for r in refs if r.startswith("@voice")]
         if auds:
@@ -257,10 +257,15 @@ def make(api, a, key, root):
         if upscale > 1:
             body |= {"upscale": upscale, "upscaler": "esrgan-general"}
         t1 = time.time()
-        api.rpc("video.generate", body)
-        print(f"{body['label']}: queued ({nf} frames{', ' + str(len(line.split())) + ' words' if line else ''})", flush=True)
-        name = K.wait_clip(api, project, i, body["label"])
-        dst = api.get(f"/v1/video/files/{name}", out / f"{i:02}_{cid}.mp4")
+        dst = out / f"{i:02}_{cid}.mp4"
+        if a.reuse and dst.exists():
+            name = dst.name
+            print(f"{body['label']}: reusing {dst}", flush=True)
+        else:
+            api.rpc("video.generate", body)
+            print(f"{body['label']}: queued ({nf} frames{', ' + str(len(line.split())) + ' words' if line else ''})", flush=True)
+            name = K.wait_clip(api, project, i, body["label"])
+            dst = api.get(f"/v1/video/files/{name}", dst)
         p = K.probe(dst)
         H.sheet(dst, out / f"{i:02}_{cid}.png")
         row = {"file": name, "frames": p["frames"], "asked": nf, "width": p["width"], "height": p["height"], "audio": p["audio"],
@@ -333,6 +338,7 @@ def main():
     ap.add_argument("--image-model", default="qwen-image-2.1-q8")
     ap.add_argument("--speech-model", default="qwen3-tts-custom")
     ap.add_argument("--judge-model", default="qwen3.8-27b-q4")
+    ap.add_argument("--reuse", action="store_true", help="keep the clips already in --out (a run whose judge failed), and make only the missing ones")
     ap.add_argument("--no-judge", action="store_true", help="the measured checks and the sheets only")
     ap.add_argument("--ffmpeg", default="ffmpeg")
     ap.add_argument("--ffprobe", default="ffprobe")
