@@ -111,7 +111,7 @@ pub fn needs_runtime(args: &[String]) -> bool {
     a.contains(&"--here")
         || matches!(cmd.first(), Some(&("gpus" | "generate" | "spec-check" | "batch-check" | "kernels" | "check" | "selftest")))
         || (cmd.first() == Some(&"serve") && cmd.get(1).is_some_and(|m| Path::new(m).exists()))
-        || (matches!(a.first(), Some(&("image" | "video" | "audio"))) && matches!(a.get(1), Some(&("selftest" | "check"))))
+        || (matches!(a.first(), Some(&("image" | "video" | "audio" | "model3d" | "3d"))) && matches!(a.get(1), Some(&("selftest" | "check"))))
 }
 
 /// Whether the kernel library loads here: every library it links found (oneAPI's are inside the image, not on a
@@ -200,4 +200,31 @@ pub fn rerun_in_image(cfg: &Config, args: &[String]) -> Option<Result<i32, Strin
         let st = c.status().map_err(|e| format!("{}: {e}", ce.bin))?;
         Ok(st.code().unwrap_or(1))
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn every_kinds_self_check_runs_in_the_image() {
+        for kind in ["llm", "image", "audio", "video", "model3d", "3d"] {
+            assert!(needs_runtime(&a(&format!("{kind} selftest"))), "{kind} selftest runs the kernels");
+        }
+        for kind in ["image", "audio", "video", "model3d", "3d"] {
+            assert!(needs_runtime(&a(&format!("{kind} check x"))), "{kind} check runs the kernels");
+        }
+        assert!(needs_runtime(&a("gpus")));
+    }
+
+    #[test]
+    fn commands_that_only_manage_do_not_need_the_runtime() {
+        for c in ["models list", "maintenance on", "stop", "image engines", "model3d engines", "llm engines"] {
+            assert!(!needs_runtime(&a(c)), "{c} is bookkeeping");
+        }
+    }
 }

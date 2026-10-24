@@ -1,5 +1,8 @@
 # API reference tests
 
+These are the top layer of the platform's tests; `tests/run.sh --help` lists the layers below them (unit, architecture,
+and the front door end to end, all without a GPU).
+
 Scripts that use a running front door (`nextsycl serve`, :8000) the way a client would: only its API, with the
 bearer token. Each is a worked example of a whole job and a test of it: it checks what it made and exits 1 when a
 check fails. They need Python 3.9+ (no packages) and, where they say so, ffmpeg (or poppler's pdftoppm / pdftotext for test-ocr.py).

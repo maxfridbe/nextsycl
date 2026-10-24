@@ -455,6 +455,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_request_that_ends_any_way_leaves_the_server_not_busy() {
+        let p = Mutex::new(json!({"busy": true, "phase": "start"}));
+        {
+            let _idle = Idle(&p);
+            assert_eq!(p.lock().unwrap()["busy"], true, "busy while the request runs");
+        }
+        assert_eq!(*p.lock().unwrap(), json!({"busy": false}));
+        // a request refused early (the guard dropped by `?`/return) and one that panics both leave it idle
+        let refuse = |p: &Mutex<Value>| -> Result<(), String> {
+            *p.lock().unwrap() = json!({"busy": true});
+            let _idle = Idle(p);
+            Err("texture on a shape-only model".into())
+        };
+        assert!(refuse(&p).is_err());
+        assert_eq!(p.lock().unwrap()["busy"], false);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            *p.lock().unwrap_or_else(|e| e.into_inner()) = json!({"busy": true});
+            let _idle = Idle(&p);
+            panic!("an engine failed");
+        }));
+        assert_eq!(p.lock().unwrap_or_else(|e| e.into_inner())["busy"], false, "a panic does not leave the server busy for good");
+    }
+
+    #[test]
     fn file_names_stay_inside() {
         assert!(safe("1792-trellis2-7.glb"));
         assert!(!safe("../x.glb"));

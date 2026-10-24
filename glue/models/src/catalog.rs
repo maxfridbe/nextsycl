@@ -384,15 +384,7 @@ fn fetch_tensors(url: &str, prefix: &str, out: &Path) -> Result<(), String> {
     if let Some(m) = head.get("__metadata__") {
         new.insert("__metadata__".into(), m.clone());
     }
-    // the header compact with its keys sorted at every level, padded to 8 bytes. Sorted here: the workspace's
-    // serde_json keeps insertion order (preserve_order), so its Map does not sort them itself
-    fn sorted(v: Value) -> Value {
-        match v {
-            Value::Object(m) => Value::Object(m.into_iter().collect::<BTreeMap<_, _>>().into_iter().map(|(k, v)| (k, sorted(v))).collect()),
-            Value::Array(a) => Value::Array(a.into_iter().map(sorted).collect()),
-            v => v,
-        }
-    }
+    // the header compact with its keys sorted at every level, padded to 8 bytes
     let mut h = serde_json::to_string(&sorted(Value::Object(new))).map_err(|e| e.to_string())?;
     while h.len() % 8 != 0 {
         h.push(' ');
@@ -412,6 +404,16 @@ fn fetch_tensors(url: &str, prefix: &str, out: &Path) -> Result<(), String> {
 }
 
 /// The registry entry a pulled model gets. `local`: the made-locally parts found (role -> path)
+/// A JSON value with its keys sorted at every level. The workspace's serde_json keeps insertion order
+/// (preserve_order), so its Map does not sort them itself; a safetensors header is written sorted
+fn sorted(v: Value) -> Value {
+    match v {
+        Value::Object(m) => Value::Object(m.into_iter().collect::<BTreeMap<_, _>>().into_iter().map(|(k, v)| (k, sorted(v))).collect()),
+        Value::Array(a) => Value::Array(a.into_iter().map(sorted).collect()),
+        v => v,
+    }
+}
+
 fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeMap<String, String>) -> Value {
     let sub = |v: &str| -> Option<String> {
         let mut out = v.to_string();
@@ -575,6 +577,12 @@ mod tests {
         pieces[1]["sha256"] = json!("0".repeat(64));
         assert!(join_parts(&pieces, &target, &out).is_err(), "a part that does not match its SHA-256");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_header_is_sorted_at_every_level() {
+        let v = serde_json::json!({"z": 1, "b": {"y": [ {"q": 1, "a": 2} ], "c": 0}, "a": null});
+        assert_eq!(serde_json::to_string(&sorted(v)).unwrap(), r#"{"a":null,"b":{"c":0,"y":[{"a":2,"q":1}]},"z":1}"#);
     }
 
     #[test]

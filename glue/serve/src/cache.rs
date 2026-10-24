@@ -349,3 +349,43 @@ impl Disk {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nextsycl-cache-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn the_drive_free_space_is_read() {
+        let d = temp("avail");
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(avail_bytes(&d).is_some_and(|b| b > 0), "statvfs of a temp directory");
+        assert!(avail_bytes(std::path::Path::new("/nonexistent/path")).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn another_form_of_the_same_models_checkpoints_is_removed_and_other_models_are_not() {
+        let root = temp("forms");
+        let ttl = std::time::Duration::from_secs(3600);
+        let dir_of = |fp: &str| root.join(fnv(fp));
+        // two forms of one model file (its path and size are the first two words), and another model
+        for fp in ["/m/a.gguf 100 f16-kv nsq35-1", "/m/other.gguf 7 f16-kv nsq35-1"] {
+            PromptCache::new(1 << 20).with_disk(root.clone(), 1 << 20, fp, ttl).unwrap();
+            assert!(dir_of(fp).join("fingerprint.txt").exists(), "{fp}: its fingerprint is written");
+        }
+        PromptCache::new(1 << 20).with_disk(root.clone(), 1 << 20, "/m/a.gguf 100 q8_0-kv nsq35-1 mtp", ttl).unwrap();
+        assert!(!dir_of("/m/a.gguf 100 f16-kv nsq35-1").exists(), "the old form of the same model can never be read again: removed");
+        assert!(dir_of("/m/other.gguf 7 f16-kv nsq35-1").exists(), "another model's checkpoints stay");
+        assert!(dir_of("/m/a.gguf 100 q8_0-kv nsq35-1 mtp").exists(), "the current form has its directory");
+        // the same fingerprint again removes nothing
+        PromptCache::new(1 << 20).with_disk(root.clone(), 1 << 20, "/m/a.gguf 100 q8_0-kv nsq35-1 mtp", ttl).unwrap();
+        assert!(dir_of("/m/a.gguf 100 q8_0-kv nsq35-1 mtp").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
