@@ -91,6 +91,8 @@ struct Ctx {
     float* xr = nullptr; size_t xr_cap = 0;        // rotated activations [M, K], float32 (see pass 1)
     int32_t* acc = nullptr; size_t acc_cap = 0;    // fallback path: one chunk of int32 products [C, N]
     float* inv = nullptr; size_t inv_cap = 0;      // 1 / rms per row (norms)
+    uint16_t* wq = nullptr; size_t wq_cap = 0;     // nsd_linear_q: a slice of a quantized matrix's rows expanded to half / bfloat16
+    float* yq = nullptr; size_t yq_cap = 0;        // nsd_linear_q: a slice's products before they go to their columns (float32-sized slots)
     // attention, all in IEEE half: a chunk of q by head [H, rows, D]; k transposed [H, D, S]; v by head [H, S, D];
     // one chunk of scores [H, rows, S]; one chunk of results [H, rows, D]
     uint16_t* hq = nullptr; size_t hq_cap = 0;
@@ -419,7 +421,7 @@ void nsd_destroy(void* ctx) {
         std::fprintf(stderr, "h3sycl: int8 linear, %lld row chunks: rotation %.1f ms, row scales %.1f, quantize %.1f, int8 GEMM %.1f\n",
                      (long long) c->lin_calls, c->lin_ms[0], c->lin_ms[1], c->lin_ms[2], c->lin_ms[3]);
     for (void* p : {(void*) c->xq, (void*) c->rs, (void*) c->gmax, (void*) c->xr, (void*) c->acc, c->had[0], c->had[1], c->had[2],
-                    (void*) c->inv, (void*) c->hq, (void*) c->hk, (void*) c->hv, (void*) c->sc, (void*) c->ao, (void*) c->part, (void*) c->rowv})
+                    (void*) c->inv, (void*) c->wq, (void*) c->yq, (void*) c->hq, (void*) c->hk, (void*) c->hv, (void*) c->sc, (void*) c->ao, (void*) c->part, (void*) c->rowv})
         if (p) sycl::free(p, c->q);
     for (auto& [p, n] : c->mem) sycl::free(p, c->q);
     delete c;
@@ -719,6 +721,47 @@ int nsd_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const voi
                 store(out, out_dt, base + i[0], load(tmp, dt, i[0]));
             });
         }
+    }
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// nextsycl (after nextcuda's nsd_linear_q): out [M, N] = x . W^T + bias for W a GGUF-quantized matrix [N, K] kept in its
+// stored size on the card (Q8_0, Q4_K, Q6_K or BF16: nsd_dequant's types): a slice of its rows - about 64 MiB of them -
+// expanded to half or bfloat16 at a time and multiplied by nsd_linear. `ldo`: the row stride of out (0: N), for the
+// parts of a fused matrix written side by side - a slice's products then go to their columns from a scratch buffer.
+int nsd_linear_q(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int qtype, int64_t N, const float* bias,
+                 void* out, int out_dt, int64_t ldo) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || K <= 0 || N <= 0) return 0;
+    int64_t blk = 0, bytes = 0;
+    switch (qtype) {
+        case 8: blk = 32; bytes = 34; break;     // Q8_0
+        case 12: blk = 256; bytes = 144; break;  // Q4_K
+        case 14: blk = 256; bytes = 210; break;  // Q6_K
+        case 30: blk = 1; bytes = 2; break;      // BF16
+        default: g_err = "nsd_linear_q: GGUF type " + std::to_string(qtype) + " (Q8_0, Q4_K, Q6_K and BF16 are expanded)"; return -1;
+    }
+    if (K % blk != 0) { g_err = "nsd_linear_q: a row of " + std::to_string(K) + " values is not whole blocks of GGUF type " + std::to_string(qtype); return -1; }
+    if (dt == F32) { g_err = "nsd_linear_q: activations in half or bfloat16"; return -1; }
+    const int64_t rb = K / blk * bytes;                    // bytes a row
+    const int64_t stride = ldo ? ldo : N;
+    const int64_t rows = std::min<int64_t>(N, std::max<int64_t>(1, (64ll << 20) / (K * 2)));
+    uint16_t* wt = c.grow(c.wq, c.wq_cap, (size_t) (rows * K));
+    if (!wt) return -1;
+    for (int64_t r0 = 0; r0 < N; r0 += rows) {
+        const int64_t n = std::min(rows, N - r0);
+        // the slice starts on a block boundary: K is a whole number of blocks
+        if (int rc = nsd_dequant(ctx, (const uint8_t*) w + (size_t) r0 * rb, qtype, n * K, wt, dt)) return rc;
+        if (n == N && stride == N) return nsd_linear(ctx, x, dt, M, K, wt, n, bias, out, out_dt);
+        float* tmp = c.grow(c.yq, c.yq_cap, (size_t) (M * n));
+        if (!tmp) return -1;
+        if (int rc = nsd_linear(ctx, x, dt, M, K, wt, n, bias ? bias + r0 : nullptr, tmp, out_dt)) return rc;
+        const int64_t ncols = n, c0 = r0;
+        c.q.parallel_for(sycl::range<1>((size_t) (M * ncols)), [=](sycl::id<1> id) {
+            const size_t i = id[0];
+            const size_t r = i / (size_t) ncols, j = i % (size_t) ncols;
+            store(out, out_dt, r * (size_t) stride + (size_t) c0 + j, load(tmp, out_dt, i));
+        });
     }
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }

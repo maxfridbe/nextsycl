@@ -32,6 +32,7 @@ struct Api {
     int8_linear: unsafe extern "C" fn(M, P, c_int, i64, i64, *const i8, i64, *const f32, i64, *const f32, M, c_int, c_int) -> c_int,
     linear: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M, c_int) -> c_int,
     linear_acc: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M) -> c_int,
+    linear_q: unsafe extern "C" fn(M, P, c_int, i64, i64, P, c_int, i64, *const f32, M, c_int, i64) -> c_int,
     dequant: unsafe extern "C" fn(M, P, c_int, i64, M, c_int) -> c_int,
     rms_norm_mod: unsafe extern "C" fn(M, P, c_int, i64, i64, *const f32, f32, *const i32, *const f32, *const f32, M, c_int) -> c_int,
     layer_norm: unsafe extern "C" fn(M, P, c_int, i64, i64, *const f32, *const f32, f32, M, c_int) -> c_int,
@@ -82,6 +83,7 @@ fn api() -> Result<&'static Api> {
             int8_linear: sym!("nsd_int8_linear"),
             linear: sym!("nsd_linear"),
             linear_acc: sym!("nsd_linear_acc"),
+            linear_q: sym!("nsd_linear_q"),
             dequant: sym!("nsd_dequant"),
             rms_norm_mod: sym!("nsd_rms_norm_mod"),
             layer_norm: sym!("nsd_layer_norm"),
@@ -165,6 +167,16 @@ impl Nsd {
     pub fn linear(&self, x: P, dt: Dt, m: usize, k: usize, w: P, n: usize, bias: P, out: M, out_dt: Dt) -> Result<()> {
         // SAFETY: the caller's buffers hold the sizes named.
         self.ok(unsafe { (self.k.linear)(self.ctx, x, dt as c_int, m as i64, k as i64, w, n as i64, bias.cast(), out, out_dt as c_int) }, "linear")
+    }
+
+    /// out [M, N] = x [M, K] . W^T + bias with W a GGUF-quantized matrix [N, K] of type `qtype` (8 Q8_0, 12 Q4_K, 14 Q6_K,
+    /// 30 BF16: kept in its stored size on the card, a slice of its rows made half at a time); x in `dt` (half or
+    /// bfloat16); `ldo`: the row stride of out (0: n), for the parts of a fused matrix written side by side
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_q(&self, x: P, dt: Dt, m: usize, k: usize, w: P, qtype: u32, n: usize, bias: P, out: M, out_dt: Dt, ldo: usize) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        self.ok(unsafe { (self.k.linear_q)(self.ctx, x, dt as c_int, m as i64, k as i64, w, qtype as c_int, n as i64, bias.cast(), out, out_dt as c_int, ldo as i64) },
+                "quantized linear")
     }
 
     /// out [M, N] += x [M, K] . W^T, all in `dt` (a LoRA's update merged into a matrix: x = B, W = A^T)

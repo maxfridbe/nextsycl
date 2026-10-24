@@ -26,7 +26,7 @@ nextsycl image engines | selftest [--gpu N]";
 /// The image engines this program has (image/<arch>)
 pub fn engines() -> Vec<nextsycl_image::ImageKind> {
     vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_olmocr2::kind(), nextsycl_image_hunyuanimage21::kind(),
-         nextsycl_image_upscale::kind(), nextsycl_image_starvector::kind(), nextsycl_image_example::kind()]
+         nextsycl_image_upscale::kind(), nextsycl_image_starvector::kind(), nextsycl_image_mingimage::kind(), nextsycl_image_example::kind()]
 }
 
 /// `--gpu 0` or `--gpu 0,1` (an engine that splits over two cards takes the second too)
@@ -524,8 +524,17 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         println!("worst relative error {worst:.2e}");
         return Ok(());
     }
+    if m["arch"].as_str() == Some(nextsycl_image_mingimage::ARCH) {
+        let gs = gpus(args)?;
+        let mut log = |s: String| eprintln!("{s}");
+        let e = nextsycl_image_mingimage::MingImage::load(&files, &gs, &mut log).map_err(|e| e.0)?;
+        let st = opt(args, "--stages").unwrap_or("tokens,te,dit,steps,vae");
+        let worst = nextsycl_image_mingimage::check::run(&e, dir, &st.split(',').collect::<Vec<_>>(), &mut log).map_err(|e| e.0)?;
+        println!("worst relative error {worst:.2e}");
+        return Ok(());
+    }
     if m["arch"] != nextsycl_image_qwenimage21::ARCH {
-        return Err(format!("check knows {}, {} and the OCR engines", nextsycl_image_qwenimage21::ARCH, nextsycl_image_hunyuanimage21::ARCH));
+        return Err(format!("check knows {}, {}, {} and the OCR engines", nextsycl_image_qwenimage21::ARCH, nextsycl_image_hunyuanimage21::ARCH, nextsycl_image_mingimage::ARCH));
     }
     let stages: Vec<&str> = opt(args, "--stages").unwrap_or("te,dit,vae").split(',').collect(); // + edit-pre, edit-te, edit-vae, edit-dit
     let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);

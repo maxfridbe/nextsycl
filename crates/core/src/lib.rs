@@ -361,6 +361,31 @@ impl DevBuf {
 }
 
 impl DevBuf {
+    /// `height` rows of `width` bytes from `src` (at `src_at`, rows `src_pitch` apart) into this buffer (at `at`, rows
+    /// `dst_pitch` apart): a block of columns into a wider matrix, queued like any copy
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_2d(&self, at: usize, dst_pitch: usize, src: &DevBuf, src_at: usize, src_pitch: usize, width: usize, height: usize) -> Result<()> {
+        if height == 0 || width == 0 {
+            return Ok(());
+        }
+        self.bounds(at, (height - 1) * dst_pitch + width)?;
+        src.bounds(src_at, (height - 1) * src_pitch + width)?;
+        if !Arc::ptr_eq(&self.gpu, &src.gpu) {
+            return Err(Error("copy_2d: the buffers are on different GPUs (copy_from_peer)".into()));
+        }
+        let g = &self.gpu;
+        if let Some(f) = g.api.copy_2d {
+            // SAFETY: both ranges in bounds (checked), same GPU and context.
+            return check(g.api, unsafe { f(g.raw, self.ptr.cast::<u8>().add(at).cast(), dst_pitch, src.ptr.cast::<u8>().add(src_at).cast(), src_pitch, width, height) },
+                         "copying rows on the GPU");
+        }
+        // a library built before ns_copy_2d: a copy a row
+        for row in 0..height {
+            self.copy_within(at + row * dst_pitch, src, src_at + row * src_pitch, width)?;
+        }
+        Ok(())
+    }
+
     /// Bytes `[src_at, src_at + n)` of `src` (same GPU) into `[at, at + n)`, queued in order.
     pub fn copy_within(&self, at: usize, src: &DevBuf, src_at: usize, n: usize) -> Result<()> {
         self.bounds(at, n)?;

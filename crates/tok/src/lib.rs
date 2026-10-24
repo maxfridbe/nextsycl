@@ -86,7 +86,13 @@ impl Tokenizer {
     /// split pattern) - the text encoders of image and video models ship it so (Qwen3-VL's)
     pub fn from_hf_json(path: &std::path::Path) -> Result<Tokenizer, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::from_hf_json_text(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// The same from the file's text (a model that carries its tokenizer.json inside another file: Ming-Image's GGUF)
+    pub fn from_hf_json_text(text: &str) -> Result<Tokenizer, String> {
+        let path = std::path::Path::new("tokenizer.json");
+        let j: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("{}: {e}", path.display()))?;
         let model = &j["model"];
         if model["type"].as_str() != Some("BPE") {
             return Err(format!("{}: only BPE tokenizers are read", path.display()));
@@ -1272,6 +1278,23 @@ mod hf_json_tests {
         let t = super::Tokenizer::from_hf_json(&p).unwrap();
         std::fs::remove_file(&p).ok();
         assert_eq!(t.encode("[S0]hi hi!"), vec![9, 3, 5, 6]);
+    }
+
+    /// Ling's tokenizer.json (Ming-Image's): a Split pattern with possessive quantifiers (`?+`, `++`), read from text
+    #[test]
+    fn a_possessive_split_pattern_reads() {
+        let j = serde_json::json!({
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": "'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+"},
+                 "behavior": "Isolated", "invert": false},
+                {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}]},
+            "added_tokens": [{"id": 9, "content": "<role>"}],
+            "model": {"type": "BPE", "vocab": {"h": 0, "i": 1, "hi": 2, "\u{120}": 3, "\u{120}hi": 4, "1": 5, "2": 6, "!": 7, "<role>": 9},
+                      "merges": [["h", "i"], ["\u{120}", "hi"]]}
+        });
+        let t = super::Tokenizer::from_hf_json_text(&j.to_string()).unwrap();
+        // single digits; the special token whole; a space joins the word after it
+        assert_eq!(t.encode("<role>hi hi12!"), vec![9, 2, 4, 5, 6, 7]);
     }
 
     /// Tekken (tiktoken's BPE): ids after the specials, the lowest-ranked joined pair merges first, a piece the

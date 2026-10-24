@@ -94,6 +94,11 @@ int nsd_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const
 int nsd_scale_rows(void* ctx, void* x, int dt, int64_t M, int64_t C, const float* s);
 int nsd_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, const float* bias,
                void* out, int out_dt);
+/* out [M, N] = x . W^T + bias with W a GGUF-quantized matrix [N, K] of type qtype (8 Q8_0, 12 Q4_K, 14 Q6_K, 30 BF16: kept
+ * in its stored size on the card; a slice of its rows is expanded to dt at a time); x in half or bfloat16; ldo: the row
+ * stride of out (0: N), for the parts of a fused matrix written side by side. */
+int nsd_linear_q(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int qtype, int64_t N, const float* bias,
+                 void* out, int out_dt, int64_t ldo);
 
 /* Row-wise RMS norm, optionally followed by a per-row scale and shift picked from a table:
  *

@@ -1,0 +1,39 @@
+# Ming-Image-0.1-Design (text to image for UI, posters, infographics; RGBA; Rust + CUDA)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets.
+# The files are realrebelai's GGUFs (the DiT Q8_0, the text encoder - Ling-Mini-2.0 with the connector and the
+# projections - Q4_K_M; that text encoder at the revision before its "UPDATED" re-upload) and Comfy-Org's VAE.
+id: ming-image-0.1-design
+kind: image
+arch: ming-image
+title: 'Ming-Image 0.1 Design (text to image: UI, posters, infographics; RGBA; Rust + CUDA)'
+about: 'inclusionAI''s Ming-Image-0.1-Design (MIT): Z-Image''s 6B single-stream DiT conditioned by Ling-Mini-2.0 (a 16B MoE, 1.4B active) through a 1.5B connector, an RGBA VAE; text-heavy designs; RGBA decoded (with these GGUFs its alpha comes back opaque). 6.8 GiB DiT, 9.2 GiB text encoder, nothing streamed'
+gpus: '0,1'
+split: true                      # nextsycl: the DiT and the VAE on the first card, the text encoder (9.2 GiB of Q4_K) on the second
+vram_gib: 10.5                   # the first card's at 2048 x 2048 (weights 7.3, activations and the VAE's); the second's ~9.5
+defaults:
+  steps: 12
+  cfg: 1.0
+  sampler: euler
+  schedule: shift
+  size: 1024x1024
+env: {}
+files:
+  transformer:
+    key: ming-image-01-design-q80
+    url: https://huggingface.co/realrebelai/Ming-Image_GGUFs/resolve/2ee7916f36756c58034d2cca356086801105c0be/Ming-Image-0.1-Design-Q8_0.gguf
+    size: 7333197664
+    sha256: 02a10f928a5a2949a6c2b786ef8d4ad597473ce44e10ea9c1ff09baf5e9b256e
+    path: ming-image-0.1/Ming-Image-0.1-Design-Q8_0.gguf
+  text-encoder:
+    key: ming-image-01-ling-mini-q4km
+    url: https://huggingface.co/realrebelai/Ming-Image_GGUFs/resolve/1266fade6ce2a11768d39de606ef86f23eaa426b/Text%20Encoders/Ming-Image-0.1-Ling-Mini-2.0-Q4_K_M.gguf
+    size: 9931635936
+    sha256: 28aa0209671ae3b5234a6c3b3cfc0e2d0048fe4a7ba591a668f31c24e05e8915
+    path: ming-image-0.1/Ming-Image-0.1-Ling-Mini-2.0-Q4_K_M.gguf
+  vae:
+    key: ming-image-01-vae
+    url: https://huggingface.co/Comfy-Org/Ming-Image/resolve/93804ff3747517a318969c5f61b25a57daefe09f/vae/ming_image_vae_bf16.safetensors
+    size: 253816696
+    sha256: 7f5bed402dc8c77dc2e0ab1929a85d4df433b7cf7b599dfa8c353da98db0b90a
+    path: ming-image-0.1/ming_image_vae_bf16.safetensors
+guide: guides/ming-image.md

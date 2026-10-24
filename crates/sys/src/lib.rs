@@ -42,6 +42,8 @@ pub struct Api {
     pub copy_to: unsafe extern "C" fn(Gpu, *mut c_void, *const c_void, usize) -> c_int,
     pub copy_from: unsafe extern "C" fn(Gpu, *mut c_void, *const c_void, usize) -> c_int,
     pub copy_dev: unsafe extern "C" fn(Gpu, *mut c_void, *const c_void, usize) -> c_int,
+    /// (gpu, dst, dst_pitch, src, src_pitch, width, height): None in a library built before it
+    pub copy_2d: Option<unsafe extern "C" fn(Gpu, *mut c_void, usize, *const c_void, usize, usize, usize) -> c_int>,
     pub mark: unsafe extern "C" fn(Gpu, *mut i64) -> c_int,
     pub stream_copy: unsafe extern "C" fn(Gpu, *mut c_void, *const c_void, usize, *const i64, c_int, c_int, *mut i64) -> c_int,
     pub await_: unsafe extern "C" fn(Gpu, i64) -> c_int,
@@ -120,6 +122,13 @@ impl Api {
             copy_to: sym!("ns_copy_to"),
             copy_from: sym!("ns_copy_from"),
             copy_dev: sym!("ns_copy_dev"),
+            copy_2d: {
+                let n = std::ffi::CString::new("ns_copy_2d").unwrap_or_default();
+                // SAFETY: the declaration in ns.h is the field's type; a missing symbol is None.
+                let p = unsafe { dlsym(h, n.as_ptr()) };
+                // SAFETY: the declaration in ns.h is the field's type.
+                (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(Gpu, *mut c_void, usize, *const c_void, usize, usize, usize) -> c_int>(p) })
+            },
             mark: sym!("ns_mark"),
             stream_copy: sym!("ns_stream_copy"),
             await_: sym!("ns_await"),

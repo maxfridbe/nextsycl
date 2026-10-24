@@ -158,6 +158,21 @@ int ns_copy_dev(ns_gpu* g, void* dst, const void* src, size_t bytes) {
     NS_CATCH
 }
 
+int ns_copy_2d(ns_gpu* g, void* dst, size_t dst_pitch, const void* src, size_t src_pitch, size_t width, size_t height) {
+    NS_TRY
+    if (width == 0 || height == 0) return 0;
+    uint8_t* d = (uint8_t*) dst;
+    const uint8_t* s = (const uint8_t*) src;
+    // a work-item a row: it copies the row's bytes (the rows of the matrices copied this way are KiBs long)
+    g->q.parallel_for(sycl::range<1>(height), [=](sycl::id<1> r) {
+        uint8_t* dr = d + r[0] * dst_pitch;
+        const uint8_t* sr = s + r[0] * src_pitch;
+        for (size_t i = 0; i < width; ++i) dr[i] = sr[i];
+    });
+    return 0;
+    NS_CATCH
+}
+
 // Copies beside the GPU's work. The order between the two queues is kept on the device (barriers with events):
 // the host never waits on an event (Strata: host waits on queue events deadlocked under Level Zero v2).
 static int64_t keep(ns_gpu* g, sycl::event e) {

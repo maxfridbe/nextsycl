@@ -28,7 +28,8 @@ fn engines() -> Vec<(&'static str, Vec<&'static str>)> {
         v.push(("llm", k.archs.to_vec()));
     }
     for k in [nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_olmocr2::kind(),
-              nextsycl_image_hunyuanimage21::kind(), nextsycl_image_upscale::kind(), nextsycl_image_starvector::kind(), nextsycl_image_example::kind()] {
+              nextsycl_image_hunyuanimage21::kind(), nextsycl_image_upscale::kind(), nextsycl_image_starvector::kind(),
+              nextsycl_image_mingimage::kind(), nextsycl_image_example::kind()] {
         v.push(("image", k.archs.to_vec()));
     }
     for k in [nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_voxcpm2::kind(), nextsycl_audio_breezetts2::kind(),
