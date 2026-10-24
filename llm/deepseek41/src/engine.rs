@@ -294,6 +294,13 @@ fn file_ahead_p() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NS_DS41_FILE_AHEAD_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.4))
 }
+/// With NS_DS41_COLD_SKIP, decode reads a file expert ahead only when its guessed share of the routing weight is at least
+/// this many times the skip bar (NS_DS41_AHEAD_SKIP_BAR, default 0.75; 0: every guess as without skipping): those below
+/// would be left out when picked (the fast card: 5,865 reads ahead started for 256 tokens, 596 taken)
+fn ahead_skip_bar() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_AHEAD_SKIP_BAR").ok().and_then(|v| v.parse().ok()).unwrap_or(0.75))
+}
 /// The index sources after the candidate source score only their candidate blocks (NS_DS41_IDX_CAND, default 1; 0:
 /// every key, the others masked)
 fn idx_cand() -> bool {
@@ -775,6 +782,52 @@ fn direct_files(paths: &[std::path::PathBuf], force: bool) -> DirectSet {
     f
 }
 
+/// NS_DS41_REPLICA: a folder holding copies of the model's files (the same names and sizes; any of them) on another
+/// drive. The experts' file reads split between a file and its copy, NS_DS41_REPLICA_SHARE percent of the experts
+/// (default 40: a 4.8 GB/s copy beside a 7.3 GB/s drive) read from the copy - each expert always from the same one (by
+/// its offset), so the page cache holds it once. A decode layer's misses and the read ahead of the next are in the same
+/// shard (the shards hold runs of layers), so moving shards does not spread them; the copies do
+struct Replica {
+    /// per shard: the copy, buffered and O_DIRECT (None: no copy of that shard)
+    files: Vec<Option<(std::fs::File, Option<std::fs::File>)>>,
+    /// of 128: the experts read from the copy
+    share: u64,
+}
+
+impl Replica {
+    /// The copy to read [at, ..) of `shard` from, when the expert there is the copy's
+    fn pick(&self, shard: usize, at: u64, direct: bool) -> Option<&std::fs::File> {
+        let (b, d) = self.files.get(shard)?.as_ref()?;
+        // an expert's slabs are MiBs: its first 4 KiB page names it
+        ((at >> 12).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57 < self.share).then_some(())?;
+        if direct { d.as_ref() } else { Some(b) }
+    }
+}
+
+/// The copies of `paths` (NS_DS41_REPLICA), opened once
+fn replica(paths: &[std::path::PathBuf]) -> Option<&'static Replica> {
+    use std::os::unix::fs::OpenOptionsExt;
+    static R: std::sync::OnceLock<Option<Replica>> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var("NS_DS41_REPLICA").ok().filter(|d| !d.is_empty())?);
+        let share = env_usize("NS_DS41_REPLICA_SHARE", 40).min(100) as u64 * 128 / 100;
+        let o_direct = if cfg!(target_arch = "aarch64") { 0o200000 } else { 0o40000 };
+        let files: Vec<_> = paths.iter().map(|p| {
+            let c = dir.join(p.file_name()?);
+            let (a, b) = (std::fs::metadata(p).ok()?.len(), std::fs::metadata(&c).ok()?.len());
+            if a != b {
+                eprintln!("[NS_DS41_REPLICA: {} is {b} bytes, {} is {a}: not used]", c.display(), p.display());
+                return None;
+            }
+            let buffered = std::fs::File::open(&c).ok()?;
+            Some((buffered, std::fs::OpenOptions::new().read(true).custom_flags(o_direct).open(&c).ok()))
+        }).collect();
+        let n = files.iter().filter(|f| f.is_some()).count();
+        eprintln!("[NS_DS41_REPLICA: copies of {n} of the {} files in {}; {}% of the experts read from them]", paths.len(), dir.display(), share * 100 / 128);
+        (n > 0).then_some(Replica { files, share })
+    }).as_ref()
+}
+
 /// A page-aligned buffer of a reader thread's own for O_DIRECT reads
 struct DirectBuf {
     ptr: *mut u8,
@@ -833,7 +886,12 @@ fn pread_direct(file: &std::fs::File, at: u64, dst: &mut [u8]) -> std::io::Resul
 
 /// A slab of expert tensor `t` (bytes [off, off + dst.len()) of it): O_DIRECT when the files opened so, else buffered
 fn read_slab(m: &Model, t: &Tensor, off: u64, dst: &mut [u8], force: bool) -> Result<()> {
-    if let Some(files) = direct_files(&m.file.paths, force) {
+    let direct = direct_files(&m.file.paths, force);
+    if let Some(c) = replica(&m.file.paths).and_then(|r| r.pick(t.shard, t.offset + off, direct.is_some())) {
+        use std::os::unix::fs::FileExt;
+        return if direct.is_some() { pread_direct(c, t.offset + off, dst) } else { c.read_exact_at(dst, t.offset + off) }.map_err(e);
+    }
+    if let Some(files) = direct {
         return pread_direct(&files[t.shard], t.offset + off, dst).map_err(e);
     }
     m.file.read_into(t, off, dst).map_err(e)
@@ -1087,6 +1145,7 @@ impl FileReader {
         // reclaim stalled the readers for seconds (the same prompt 16 s or 35 s)
         let direct = direct_files(paths, false);
         let pdirect = if prompt_odirect() { direct_files(paths, true) } else { direct.clone() };
+        let rep = replica(paths);
         for _ in 0..threads {
             let (rx, files, direct, pdirect) = (rx.clone(), files.clone(), direct.clone(), pdirect.clone());
             std::thread::spawn(move || loop {
@@ -1099,9 +1158,12 @@ impl FileReader {
                 // SAFETY: the job's staging slot is its own (read_ahead) until its done flag is set and waited for
                 // (stage_slot or ensure), the pinned buffer alive for the engine
                 let b = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
-                let r = match if job.direct { &pdirect } else { &direct } {
-                    Some(d) => pread_direct(&d[shard], at, b),
-                    None => files[shard].read_exact_at(b, at),
+                let d = if job.direct { &pdirect } else { &direct };
+                let r = match (rep.and_then(|r| r.pick(shard, at, d.is_some())), d) {
+                    (Some(c), Some(_)) => pread_direct(c, at, b),
+                    (Some(c), None) => c.read_exact_at(b, at),
+                    (None, Some(d)) => pread_direct(&d[shard], at, b),
+                    (None, None) => files[shard].read_exact_at(b, at),
                 };
                 job.done.finish(r.map_err(|e| format!("reading an expert: {e}")));
             });
@@ -4826,10 +4888,19 @@ impl<'g> Ds41<'g> {
         if let Some(gv) = guess {
             let gb = p.router_bias(l + 1)?;
             let mut miss: BTreeMap<usize, f32> = BTreeMap::new();
+            // a decode step's guessed share of the routing weight per expert (cold-skip's measure)
+            let mut gshare: HashMap<usize, f32> = HashMap::new();
+            let used = g.n_expert_used as usize;
             for ti in 0..t {
                 let pr: Vec<f32> = gv[ti * ne..(ti + 1) * ne].iter().map(|z| sqrt_softplus(*z)).collect();
                 let mut order: Vec<usize> = (0..ne).collect();
                 order.sort_by(|a, b| (pr[*b] + gb[*b]).total_cmp(&(pr[*a] + gb[*a])));
+                if t == 1 {
+                    let sum: f32 = order.iter().take(used).map(|e| pr[*e]).sum::<f32>() + 1e-20;
+                    for &e in order.iter().take(GUESS_HIT.len()) {
+                        gshare.insert(e, pr[e] / sum);
+                    }
+                }
                 if t == 1 && self.prof.is_some() {
                     GUESS_LAST.lock().unwrap().push((l + 1, order[..GUESS_HIT.len()].to_vec()));
                 }
@@ -4845,7 +4916,10 @@ impl<'g> Ds41<'g> {
             if file_ahead() > 0 {
                 // a read costs the drive and a slot, not PCIe or VRAM: a lower bar than the copies'
                 let fth = file_ahead_p();
-                let fwant: Vec<u64> = all.iter().filter(|x| x.1 >= fth).map(|(e, _)| *e as u64).collect();
+                // with cold-skip, a file expert whose guessed share is well under its bar would be left out anyway: not read
+                let bar = if t == 1 && cold_skip() > 0.0 { cold_skip() * ahead_skip_bar() } else { 0.0 };
+                let fwant: Vec<u64> = all.iter().filter(|x| x.1 >= fth && (bar <= 0.0 || gshare.get(&x.0).is_some_and(|s| *s >= bar)))
+                    .map(|(e, _)| *e as u64).collect();
                 let k = p.read_ahead(l + 1, &fwant, file_ahead())?;
                 AHEAD_NEAR.fetch_add(k as u64, std::sync::atomic::Ordering::Relaxed);
                 // and the guesses further ahead: their best few, their reads given more time than one layer's

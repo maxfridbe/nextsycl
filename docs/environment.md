@@ -544,6 +544,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_SCORE_ROWS` | 8 | `generate --score`: rows (1-8) fed a pass (1: as decode runs them) | llm |
 | `NS_DS41_COLD_RENORM` | 0 | with `NS_DS41_COLD_SKIP`, the experts kept have their weights scaled by (all / kept) | llm deepseek41 |
 | `NS_DS41_COLD_SKIP_AHEAD` | 1 | with `NS_DS41_COLD_SKIP`, also leave out an expert whose read ahead is on its way (0: wait for those) | llm deepseek41 |
+| `NS_DS41_AHEAD_SKIP_BAR` | 0.75 | with `NS_DS41_COLD_SKIP`, decode reads a file expert ahead only when its guessed share of the routing weight is at least this many times the skip bar (those below would be left out when picked); 0: every guess | llm deepseek41 |
 | `NS_DS41_STD_OA` | 0 | 1: decode's grouped o_a (a Q8_0 / Q6_K one) in one launch of the std kernel (alone faster, end to end no gain) | llm deepseek41 |
 | `NS_DS41_STD_KU` | 1 | blocks a sub-group's decode product of an Unsloth-form expert decodes before multiplying (1, 2 or 4; their loads in flight together) | llm deepseek41 |
 | `NS_DS41_DENSE_Q4K` | 0 | 1: attention's and the shared expert's Q8_0 weights are requantized to q4_K when loaded (Q6_K ones too, and the XQ file's F16 Engram projection; half the bytes a decode token reads, the fused q4_K kernels apply; an approximation, a few seconds more at load) | llm deepseek41 |
@@ -566,6 +567,8 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_COLD_SKIP_PROMPT_MAX` | 4 | the most tokens such an expert may get | llm deepseek41 |
 | `NS_DS41_PROMPT_PREFETCH_MIN` | 4096 | the fewest tokens in a pass for that prefetch (below, the early reads only contend with the layer's own: XQ 2,561 tokens 15.8 -> 19.2 s with it; 9,901 tokens fast 28.3 -> 24.1 s) | llm deepseek41 |
 | `NS_DS41_READERS` | 16 | the read-ahead's reader threads (a job a slab of an expert in ggml's row types) | llm deepseek41 |
+| `NS_DS41_REPLICA` | unset | a folder holding copies of the model's files (the same names and sizes; any of them) on another drive: the experts' file reads split between each file and its copy (each expert always from the same one), so both drives read at once | llm deepseek41 |
+| `NS_DS41_REPLICA_SHARE` | 40 | percent of the experts read from the `NS_DS41_REPLICA` copies (40: a 4.8 GB/s drive beside a 7.3 GB/s one) | llm deepseek41 |
 | `NS_DS41_PROMPT_READERS` | 32 | the reader pool's threads at least this many (a prompt pass's file-only experts, a job a slab: 32 reads in flight keep the drive busier than 16) | llm deepseek41 |
 | `NS_DS41_PROMPT_ODIRECT` | 1 | a prompt pass's expert reads O_DIRECT (0: through the page cache, which a long prompt's tens of GB churned beside the pinned memory - reclaim stalled the reads for seconds) | llm deepseek41 |
 | `NS_DS41_DRAFTER` | none | the DSpark drafter file (Unsloth's `dspark-*.gguf`) of an Unsloth-form model, with `NS_DS41_MTP=1`; else `dspark-*.gguf` in the model's folder or its parent's | llm deepseek41 |
