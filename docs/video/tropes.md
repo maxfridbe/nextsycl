@@ -1,0 +1,94 @@
+# Scene tropes: scripts over 2-3 clips, judged across dimensions
+
+[scenes.md](scenes.md) settled what each *kind of cut* needs (S1-S13). A film is not cuts but scenes people recognise:
+the chase, the reveal, the shot / reverse-shot argument. Each trope below is a short script of 2 or 3 clips, written so
+that what it needs to carry across the cuts is exactly what the model finds hard. Like `tests/api/harbour_dialogue.py`
+(the shot / reverse-shot trope, T1), each would be one script that makes the whole scene through the API and scores it.
+
+## The dimensions every trope is judged on
+
+| | dimension | how it is measured |
+|---|---|---|
+| D1 | **Identity**: the same face, hair, build | contact sheets of each clip's frames, judged by eye (the seam number cannot tell people apart) |
+| D2 | **Costume and props**: the coat, the lantern, the gun stays the same object | sheets; a prop that vanishes or changes is a fail |
+| D3 | **Voice**: the same speaker sounds the same, two speakers differ | median pitch per clip (`harbour_dialogue.py`'s autocorrelation), against the reference |
+| D4 | **Place**: the same room / street / quay | sheets; the establishing shot against the later ones |
+| D5 | **Look and light**: time of day, colour, grade | mean luma and colour per clip against the first |
+| D6 | **Motion continuity**: the move goes on across the cut, nothing restarts | the seam (grey correlation of the carried frame, 1.0 = the same picture) and the sheets |
+| D7 | **Screen direction and eyeline** (the 180-degree rule): who is left, who looks where | sheets; flagged by hand |
+| D8 | **Scale and framing**: the shot size changes as scripted (wide to close), the subject does not jump | sheets |
+| D9 | **Sound bed**: the room tone / music / ambience carries or changes on purpose | the clips' sound; first_audio tail carried or not |
+| D10 | **Performance**: the emotion goes the way the script says (calm to alarmed) | by eye; the weakest dimension to automate |
+
+A trope passes when the dimensions it *needs* (the column below) hold, not all ten: a hard cut to another place is
+meant to change D4.
+
+## The list
+
+Clips: how many the script takes. Needs: the dimensions that must hold. Recipe: the keys from scenes.md.
+
+### Dialogue and people
+| # | Trope | Script | Clips | Needs | Recipe | Risk |
+|---|---|---|---|---|---|---|
+| T1 | **Shot / reverse shot** (a conversation) | A speaks, B answers, A replies | 3 | D1 D3 D4 D7 | S2 + S3 (one speaker a shot, Ref2VA picture + voice each); `harbour_dialogue.py` | voices on the wrong mouths if two people share a shot |
+| T2 | **Over-the-shoulder** | the same exchange, the listener's shoulder in the foreground | 2-3 | D1 D7 D8 | S3 with the place's picture | the foreground figure drifts into the speaker |
+| T3 | **The two-shot to the close-up** | two people in a room; push in on one | 2 | D1 D2 D4 D8 | S1 (guide) then Ref2VA | the face changes as the framing tightens |
+| T4 | **The monologue with cutaways** | she speaks; cut to what she describes; back | 3 | D1 D3 D4 | S2 voice carried through a b-roll cut (S10) | the voice drifts across the cutaway |
+| T5 | **The phone call / split scene** | two people, two places, one conversation | 3 | D1 D3 D4 D5 (a different look each side) | S2 + S4 | each place must stay itself on every return |
+| T6 | **The whisper / secret overheard** | someone listens at a door; the voices come through it | 2 | D1 D3 D9 | S3 + the sound bed | the muffled voice is the wrong voice |
+
+### Action and movement
+| # | Trope | Script | Clips | Needs | Recipe | Risk |
+|---|---|---|---|---|---|---|
+| T7 | **The chase** | a runner, the pursuer behind, a turn into an alley | 3 | D1 D2 D6 D7 | S1 (guide_clip + first_audio) each cut | the runner's costume changes; the pursuer swaps sides |
+| T8 | **The fight** | a blow, the reaction, the counter | 3 | D1 D6 D7 D10 | S1, an effect beat (S7) on the hit | limbs and faces melt at speed |
+| T9 | **The car pursuit** | the car out of the garage, onto the road, around a corner | 3 | D2 D4 D6 D7 | S1 | the car's colour and shape |
+| T10 | **The leap / the fall** | a jump across a gap, the landing | 2 | D1 D6 D8 | S1 or match cut (S6) | the figure's scale changes mid-jump |
+| T11 | **Running toward the camera, then past it** | a sprint that crosses the lens | 2 | D1 D6 D8 | S1 | the figure's size is not continuous |
+
+### Discovery and suspense
+| # | Trope | Script | Clips | Needs | Recipe | Risk |
+|---|---|---|---|---|---|---|
+| T12 | **The reveal** | she opens a door; we see what she sees | 2-3 | D1 D4 D7 D10 | S1 then a point-of-view cut with a Ref2VA picture of the thing | the thing is not what the script says |
+| T13 | **The slow dolly-zoom (vertigo)** | the background stretches while the subject holds | 2 | D1 D8 | S1 | the effect reads as a plain zoom |
+| T14 | **The mystery object** | a hand lifts a lantern; close on the lantern; she looks at it | 3 | D1 D2 D8 | S13 (a prop) with S1 | the lantern changes between shots |
+| T15 | **The look off-screen** | she stares past the camera; cut to what she sees | 2 | D1 D7 D10 | S3-style with the other picture | she looks at the wrong side |
+| T16 | **The ticking clock** | a face; the clock; the face again, tenser | 3 | D1 D2 D10 | S6 (match cut) | the clock's hands do not move forward |
+| T17 | **The stalker's view** | a long lens on a figure walking away | 2 | D1 D6 D8 | S1 | the figure changes as it recedes |
+
+### Place and time
+| # | Trope | Script | Clips | Needs | Recipe | Risk |
+|---|---|---|---|---|---|---|
+| T18 | **The establishing shot, then the interior** | a harbour at dawn; the room above it | 2 | D4 D5 | S5 (the look) | the room does not belong to the harbour |
+| T19 | **The time-lapse / passage of time** | the same room at dawn, noon, dusk | 3 | D4 D5 (changing on purpose) D2 | first_frame/last_frame (S6) | the room rearranges itself |
+| T20 | **The flashback** | a face; dissolve to the younger face in another time | 2-3 | D1 (older then younger) D5 | S4 with the look changed in words | the younger face is a different person |
+| T21 | **The montage** | several short beats, one idea, one grade | 3 | D5 D9 | S5 with shared words | the grade drifts |
+| T22 | **The travel / arrival** | the train leaves; the same train, a new city | 2-3 | D2 D4 D6 | S1 then S4 | the train changes |
+| T23 | **Match cut** | the bone to the spacecraft | 2 | D6 D8 | S6 | the shapes do not line up |
+
+### Transformation and effect
+| # | Trope | Script | Clips | Needs | Recipe | Risk |
+|---|---|---|---|---|---|---|
+| T24 | **The transformation** | a person, a flash, the same person transformed | 2 | D1 (the new form) D6 | S6, S7 | identity is lost not changed |
+| T25 | **The slow-motion hero moment** | the leap, bullet time, the landing | 2-3 | D1 D6 | S7 (`embedding:minimaxh3_bullet_time`) | reads as a spin, not a freeze (scenes.md) |
+| T26 | **The loop** | the same shot ends where it begins | 2 | D6 | S8 | near-static |
+| T27 | **The double / the mirror** | she meets her reflection | 2 | D1 (two of her) D7 | Ref2VA with the same picture twice | the two are not both her |
+
+### Genre staples
+| # | Trope | Script | Clips | Needs | Recipe | Risk |
+|---|---|---|---|---|---|---|
+| T28 | **The heist briefing** | the team round a table, each speaks, a plan on the wall | 3 | D1 (several) D3 D4 | S3 per speaker, one speaker a shot | too many faces to hold |
+| T29 | **The final stand** | the hero against a crowd, the camera circling | 3 | D1 D6 D7 | S1, S9 (motion transfer) | the crowd swallows the hero |
+| T30 | **The farewell at the station** | two figures, the goodbye, the train away | 3 | D1 D3 D4 D10 | S2/S3, S1 | the emotion arc is not read |
+| T31 | **The cold open** | a scene, then the title over a hard cut to another | 2 | D4 D5 (changes) D9 | plain cut (S4) | the join clicks (cut the sound to the picture) |
+| T32 | **Parallel action** | two scenes intercut: the bomb, the hero's run | 3 | D1 D2 D4 D5 | S4 each time | each strand must stay itself on every return |
+
+## What to pick
+
+The scripts are cheap on paper and costly to render (a draft clip is ~1-2 minutes, Ref2VA ~1.7x; a 3-clip trope ~15 min).
+Two that together span the dimensions, each with its own hard part:
+
+- A **dialogue** trope (T1 is done: `harbour_dialogue.py`; T5, T28 and T30 are its relatives) stresses D1 D3 D7.
+- An **action** trope (T7, T8, T9) stresses D1 D2 D6, the motion carried by `guide_clip`.
+- A **suspense** trope (T12, T14, T16) stresses D2 D8 D10, the prop and the reveal.
+- A **place and time** trope (T19, T20) stresses D4 D5.
