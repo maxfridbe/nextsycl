@@ -17,12 +17,30 @@ nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora 
 nextsycl image start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
 nextsycl image ocr PICTURE|PDF... [--one-pass] [--no-columns] [--model ID|FILE.gguf] [--prompt TEXT] [--no-tiles] [--no-figures] [--max N] [--temp T] [--out FILE] [--gpu N] [--dump-views DIR]
 nextsycl image check <dump dir> [--model ID|FILE.gguf] [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--tokens N] [--gpu N]
+nextsycl image upscale PICTURE [--model real-esrgan|waifu2x | --dir NCNN_DIR] [--variant V] [--scale N] [--noise N] [--tile N] [--out FILE] [--gpu N]
+nextsycl image upscale-check PICTURE REFERENCE.png [upscale's options]   (against realesrgan- / waifu2x-ncnn-vulkan's output: PSNR, worst pixel)
+nextsycl image vectorize PICTURE [--model starvector-1b-im2svg | --dir CHECKPOINT_DIR] [--max-length N] [--beams N] [--greedy] [--top-p P] [--seed S] [--out FILE.svg] [--gpu N]
+nextsycl image vectorize PICTURE --check REFERENCE_DIR [--stages pixels,encoder,prefill,logits,greedy] [--dir ...]   (against reference/starvector/ref.py's dumps)
 nextsycl image engines | selftest [--gpu N]";
 
 /// The image engines this program has (image/<arch>)
 pub fn engines() -> Vec<nextsycl_image::ImageKind> {
     vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_olmocr2::kind(), nextsycl_image_hunyuanimage21::kind(),
-         nextsycl_image_example::kind()]
+         nextsycl_image_upscale::kind(), nextsycl_image_starvector::kind(), nextsycl_image_example::kind()]
+}
+
+/// `--gpu 0` or `--gpu 0,1` (an engine that splits over two cards takes the second too)
+fn gpus(args: &[String]) -> Result<Vec<std::sync::Arc<nextsycl_core::Gpu>>, String> {
+    let list = opt(args, "--gpu").unwrap_or("0");
+    let mut v = Vec::new();
+    for i in list.split(',').filter(|x| !x.trim().is_empty()) {
+        let i: usize = i.trim().parse().map_err(|_| format!("--gpu {list}: card numbers, comma separated"))?;
+        v.push(nextsycl_core::Gpu::open(i).map_err(|e| e.0)?);
+    }
+    if v.is_empty() {
+        v.push(nextsycl_core::Gpu::open(0).map_err(|e| e.0)?);
+    }
+    Ok(v)
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -299,6 +317,167 @@ fn pics_size(saved: &[String]) -> (u32, u32) {
     saved.first().and_then(|p| nextsycl_image::Picture::read_png(Path::new(p)).ok()).map_or((0, 0), |p| (p.width, p.height))
 }
 
+/// An ncnn bundle's files by role, as the upscalers' cards name them: a Real-ESRGAN `models/` directory
+/// (`realesrgan-x4plus.param` ...) or waifu2x's directory of `models-*/` (`models-cunet/noise1_scale2.0x_model.param` ...)
+fn ncnn_files(dir: &Path) -> Result<ModelFiles, String> {
+    let mut files = ModelFiles::new();
+    let mut add = |sub: Option<&str>, d: &Path| -> Result<(), String> {
+        for e in std::fs::read_dir(d).map_err(|e| format!("{}: {e}", d.display()))?.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".param") || name.ends_with(".bin") {
+                files.insert(sub.map(|s| format!("{s}/{name}")).unwrap_or(name), p);
+            }
+        }
+        Ok(())
+    };
+    add(None, dir)?;
+    for e in std::fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if e.path().is_dir() && (n.starts_with("models-") || n == "models") {
+            if n == "models" {
+                add(None, &e.path())?;
+            } else {
+                add(Some(&n), &e.path())?;
+            }
+        }
+    }
+    if files.is_empty() {
+        return Err(format!("{}: no .param / .bin files (a realesrgan models/ directory, or waifu2x's with models-*/)", dir.display()));
+    }
+    Ok(files)
+}
+
+/// `image upscale` and `image upscale-check`: the engine in this process
+fn upscale_cmd(cfg: &Config, args: &[String], check: bool) -> Result<(), String> {
+    let pos: Vec<&String> = {
+        let mut v = Vec::new();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if a.starts_with("--") {
+                it.next();
+            } else {
+                v.push(a);
+            }
+        }
+        v
+    };
+    let input = pos.first().ok_or(USAGE)?;
+    nextsycl_core::use_kind("image");
+    let files = match opt(args, "--dir") {
+        Some(d) => ncnn_files(Path::new(d))?,
+        None => model(cfg, Some(opt(args, "--model").unwrap_or("real-esrgan")))?.1,
+    };
+    let gs = gpus(args)?;
+    let mut log = |s: String| eprintln!("{s}");
+    let t0 = std::time::Instant::now();
+    let e = nextsycl_image_upscale::Upscaler::load(&files, &gs, &mut log).map_err(|e| e.0)?;
+    eprintln!("loaded in {:.2} s", t0.elapsed().as_secs_f64());
+    let pic = nextsycl_image::Picture::decode(&std::fs::read(input).map_err(|e| format!("{input}: {e}"))?)?;
+    let req = nextsycl_image::UpscaleRequest {
+        picture: pic,
+        variant: opt(args, "--variant").map(str::to_string),
+        scale: opt(args, "--scale").and_then(|v| v.parse().ok()),
+        noise: opt(args, "--noise").and_then(|v| v.parse().ok()),
+        tile: opt(args, "--tile").and_then(|v| v.parse().ok()),
+    };
+    use nextsycl_image::ImageEngine;
+    let runs: usize = opt(args, "--runs").and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+    let mut out = None;
+    for r in 0..runs {
+        let (p, info) = e.upscale(&req, &mut |_| Ok(())).map_err(|e| e.0)?;
+        // (memory: nvidia-smi's per-process figure; the card's free memory moves with every other program on it)
+        eprintln!("run {}: {} {}x{} -> {}x{} ({}x{}, {} tiles of {}) in {:.3} s on {}",
+                  r + 1, info.variant, req.picture.width, req.picture.height, p.width, p.height, info.scale,
+                  info.noise.map(|n| format!(" denoise {n}")).unwrap_or_default(), info.tiles, info.tile, info.seconds, gs[0].name);
+        out = Some(p);
+    }
+    let p = out.unwrap();
+    if let Some(o) = opt(args, "--out") {
+        p.write_png(Path::new(o), &[]).map_err(|e| format!("{o}: {e}"))?;
+        eprintln!("saved {o}");
+    }
+    if check {
+        let r = pos.get(1).ok_or("upscale-check PICTURE REFERENCE.png")?;
+        let want = nextsycl_image::Picture::decode(&std::fs::read(r).map_err(|e| format!("{r}: {e}"))?)?;
+        if (want.width, want.height) != (p.width, p.height) {
+            return Err(format!("the reference is {}x{}, ours {}x{}", want.width, want.height, p.width, p.height));
+        }
+        let c = p.channels.min(want.channels) as usize;
+        let (pc, wc) = (p.channels as usize, want.channels as usize);
+        let (mut se, mut worst, mut same, mut near) = (0f64, 0i32, 0usize, 0usize);
+        let n = (p.width * p.height) as usize;
+        for i in 0..n {
+            for ch in 0..c {
+                let d = p.data[i * pc + ch] as i32 - want.data[i * wc + ch] as i32;
+                se += (d * d) as f64;
+                worst = worst.max(d.abs());
+                same += (d == 0) as usize;
+                near += (d.abs() <= 2) as usize;
+            }
+        }
+        let mse = se / (n * c) as f64;
+        let psnr = if mse == 0.0 { f64::INFINITY } else { 10.0 * (255.0f64 * 255.0 / mse).log10() };
+        println!("against {r}: PSNR {psnr:.2} dB, worst {worst}/255, {:.2}% values equal, {:.2}% within 2", 100.0 * same as f64 / (n * c) as f64,
+                 100.0 * near as f64 / (n * c) as f64);
+    }
+    Ok(())
+}
+
+/// `image vectorize`: StarVector in this process (`--check DIR`: its stages against the reference's dumps)
+fn vectorize_cmd(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let mut pos = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--greedy" {
+            continue;
+        }
+        if a.starts_with("--") {
+            it.next();
+        } else {
+            pos.push(a.clone());
+        }
+    }
+    let input = pos.first().ok_or(USAGE)?;
+    nextsycl_core::use_kind("image");
+    let files = match opt(args, "--dir") {
+        Some(d) => nextsycl_image_starvector::files_in(Path::new(d)).map_err(|e| e.0)?,
+        None => model(cfg, Some(opt(args, "--model").unwrap_or("starvector-1b-im2svg")))?.1,
+    };
+    let gs = gpus(args)?;
+    let mut log = |s: String| eprintln!("{s}");
+    let e = nextsycl_image_starvector::StarVector::load(&files, &gs[0], &mut log).map_err(|e| e.0)?;
+    if let Some(d) = opt(args, "--check") {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("pixels,encoder,prefill,logits,greedy").split(',').collect();
+        let worst = nextsycl_image_starvector::check::run(&e, Path::new(d), Path::new(input), &stages, &mut log).map_err(|e| e.0)?;
+        println!("worst relative error {worst:.2e}");
+        return Ok(());
+    }
+    let pic = nextsycl_image::Picture::decode(&std::fs::read(input).map_err(|e| format!("{input}: {e}"))?)?;
+    let greedy = args.iter().any(|a| a == "--greedy");
+    let req = nextsycl_image::VectorizeRequest {
+        picture: pic,
+        max_length: opt(args, "--max-length").and_then(|v| v.parse().ok()).unwrap_or(0),
+        beams: if greedy { Some(1) } else { opt(args, "--beams").and_then(|v| v.parse().ok()) },
+        sample: if greedy { Some(false) } else { None },
+        top_p: opt(args, "--top-p").and_then(|v| v.parse().ok()),
+        seed: opt(args, "--seed").and_then(|v| v.parse().ok()).unwrap_or(0),
+        ..Default::default()
+    };
+    use nextsycl_image::ImageEngine;
+    let out = e.vectorize(&req, &mut |_| Ok(())).map_err(|e| e.0)?;
+    eprintln!("{} tokens in {:.2} s after {:.2} s for the picture and prompt ({:.1} tokens/s){} on {}", out.tokens, out.seconds, out.prompt_seconds,
+              out.tokens as f64 / out.seconds.max(1e-9), if out.closed { ", ended by </svg>" } else { ", stopped at the length limit" }, gs[0].name);
+    match opt(args, "--out") {
+        Some(o) => {
+            std::fs::write(o, &out.svg).map_err(|e| format!("{o}: {e}"))?;
+            eprintln!("saved {o}");
+        }
+        None => println!("{}", out.svg),
+    }
+    Ok(())
+}
+
 fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let dir = Path::new(args.first().ok_or(USAGE)?);
     nextsycl_core::use_kind("image");
@@ -507,6 +686,9 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("gen") => gen(cfg, rest),
         Some("edit") => edit(cfg, rest),
         Some("check") => check(cfg, rest),
+        Some("upscale") => upscale_cmd(cfg, rest, false),
+        Some("upscale-check") => upscale_cmd(cfg, rest, true),
+        Some("vectorize") => vectorize_cmd(cfg, rest),
         Some("ocr") => ocr(cfg, rest),
         Some("serve") => serve(cfg, rest),
         Some("start") => SERVED.start(cfg, rest, |d| run(cfg, rest, d)),

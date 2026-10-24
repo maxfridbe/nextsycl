@@ -1,0 +1,31 @@
+# StarVector-1B im2svg (ServiceNow; Apache-2.0, its StarCoder base under BigCode OpenRAIL-M): a picture written as SVG
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: starvector-1b-im2svg
+kind: image
+arch: starvector
+title: 'StarVector-1B im2svg (a picture as SVG code: logos, icons, simple illustrations)'
+about: 'ServiceNow''s StarVector-1B: a CLIP ViT-L/14 sees the picture (flattened on white, 224 x 224), an adapter makes its 257 rows StarCoder-1B''s first embeddings, and StarCoder writes the SVG after "<svg" - as the starvector package''s generate_im2svg (2 beams sampled, top_p 0.9), until </svg> or max_length. The checkpoint''s own safetensors, half on the GPU; Rust and SYCL (image/starvector). image.vectorize. Checked against the package in float32: the pixels exact, the logits 4e-4, 2500 greedy tokens forced with one near-tie (0.001)'
+gpus: '0'
+vram_gib: 3.2                   # measured (nvidia-smi, the process): 3.1 GB with 2 beams to max_length 5000 (2.6 GiB of weights)
+defaults: {}
+env: {}
+files:
+  model:
+    key: starvector-1b-im2svg-st1
+    url: https://huggingface.co/starvector/starvector-1b-im2svg/resolve/380ab95d25a8e9ab1dc825debe238b4953ae13b9/model-00001-of-00002.safetensors
+    size: 4995740600
+    sha256: bea3a2add4a0107ae405391eaaefd7b95339d33b1ad98ed87862716ebdc02c20
+    path: starvector-1b-im2svg/model-00001-of-00002.safetensors
+  model_2:
+    key: starvector-1b-im2svg-st2
+    url: https://huggingface.co/starvector/starvector-1b-im2svg/resolve/380ab95d25a8e9ab1dc825debe238b4953ae13b9/model-00002-of-00002.safetensors
+    size: 146964720
+    sha256: c71c1a94c42a1408f4a75e519814f10005061a0a81a3c87f0f136d475fa916b6
+    path: starvector-1b-im2svg/model-00002-of-00002.safetensors
+  tokenizer:
+    key: starvector-1b-im2svg-tokenizer
+    url: https://huggingface.co/starvector/starvector-1b-im2svg/resolve/380ab95d25a8e9ab1dc825debe238b4953ae13b9/tokenizer.json
+    size: 3475977
+    sha256: 677ed0fa17c754ab4bdd575102360f7e508051c88d4eb1c73bec0643077248a2
+    path: starvector-1b-im2svg/tokenizer.json
+guide: guides/starvector.md

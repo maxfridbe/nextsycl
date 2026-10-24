@@ -1,0 +1,11 @@
+[package]
+name = "nextsycl-image-upscale"
+description = "Real-ESRGAN and waifu2x upscalers: their ncnn graphs and weights on SYCL (Rust)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-image.workspace = true
+nextsycl-diffusion.workspace = true

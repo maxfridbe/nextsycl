@@ -148,6 +148,8 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             (c, vec!["llm.chat"])
         }
         "image" if arch.contains("ocr") => (vec!["ocr", "read_pages", "pdf"], vec!["image.ocr"]),
+        "image" if arch == "realesrgan" || arch == "waifu2x" => (vec!["upscale", "upscale_video", "tiles"], vec!["image.upscale", "video.upscale"]),
+        "image" if arch == "starvector" => (vec!["vectorize", "svg"], vec!["image.vectorize"]),
         "image" => {
             let mut c = vec!["generate", "edit", "compose", "img2img", "loras"];
             if m["env"]["NS_QI_SIGMAS"].is_string() {

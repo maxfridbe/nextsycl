@@ -312,6 +312,28 @@ impl ImageServer {
                     Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
                 }
             }
+            ("POST", "/v1/images/vectorize") => {
+                let body: Value = match serde_json::from_slice(&req.body) {
+                    Ok(v) => v,
+                    Err(e) => return http::respond_with(&mut s, 400, &err(format!("the body is not JSON: {e}")), &cors),
+                };
+                match self.vectorize(&body) {
+                    Ok(v) => http::respond_with(&mut s, 200, &v, &cors),
+                    Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
+                }
+            }
+            ("POST", "/v1/images/upscale") | ("POST", "/v1/videos/upscale") => {
+                let body: Value = match serde_json::from_slice(&req.body) {
+                    Ok(v) => v,
+                    Err(e) => return http::respond_with(&mut s, 400, &err(format!("the body is not JSON: {e}")), &cors),
+                };
+                let base = req.host.as_deref().map(|h| format!("http://{h}")).unwrap_or_default();
+                let r = if req.path == "/v1/images/upscale" { self.upscale(&body, &base) } else { self.upscale_video(&body, &base) };
+                match r {
+                    Ok(v) => http::respond_with(&mut s, 200, &v, &cors),
+                    Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
+                }
+            }
             ("POST", "/v1/ocr") => {
                 let body: Value = match serde_json::from_slice(&req.body) {
                     Ok(v) => v,
@@ -399,14 +421,19 @@ impl ImageServer {
             "loras": self.loras_known.iter().map(|k| json!({"id": k.id, "title": k.title,
                 "loaded": loaded.iter().find(|l| l.name == k.id).map(|l| l.scale)})).collect::<Vec<_>>(),
             "saves": self.out_dir.is_some(), "wfe": self.wfe.is_some(),
+            "vectorize": self.engine.lock().ok().and_then(|g| g.as_ref().map(|(e, _)| e.vectorizes())).unwrap_or(false),
+            "upscale": self.engine.lock().ok().and_then(|g| g.as_ref().map(|(e, _)| e.upscale_variants())).unwrap_or_default().iter()
+                .map(|v| json!({"variant": v.id, "about": v.about, "scales": v.scales, "noise": v.noise})).collect::<Vec<_>>(),
         })
     }
 
     fn file(&self, s: &mut Conn, name: &str, cors: &str) {
-        let ok = !name.is_empty() && name.ends_with(".png") && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) && !name.contains("..");
+        let ok = !name.is_empty() && (name.ends_with(".png") || name.ends_with(".mp4")) && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+            && !name.contains("..");
+        let kind = if name.ends_with(".mp4") { "video/mp4" } else { "image/png" };
         match (&self.out_dir, ok) {
             (Some(d), true) => match std::fs::read(d.join(name)) {
-                Ok(b) => http::respond_bytes(s, 200, "image/png", &b, &format!("{cors}Cache-Control: max-age=31536000, immutable\r\n")),
+                Ok(b) => http::respond_bytes(s, 200, kind, &b, &format!("{cors}Cache-Control: max-age=31536000, immutable\r\n")),
                 Err(_) => http::respond_with(s, 404, &err(format!("no picture {name}")), cors),
             },
             _ => http::respond_with(s, 404, &err(format!("no picture {name}")), cors),
@@ -526,6 +553,287 @@ impl ImageServer {
         h.truncate(50);
         Ok(json!({"created": now(), "model": self.model, "text": out.text, "prompt": out.prompt, "pages": n_pages, "tokens": out.tokens, "prompt_tokens": out.prompt_tokens,
                   "prompt_seconds": out.prompt_seconds, "read_tok_s": read_tok_s, "write_seconds": out.seconds, "tok_s": tok_s, "seconds": seconds, "wh": wh}))
+    }
+
+    /// POST /v1/images/vectorize: {image (base64 / data URL), max_length, beams, sample, top_p, temperature,
+    /// repetition_penalty, seed} - the picture written as SVG by a vectorizer (StarVector)
+    fn vectorize(&self, b: &Value) -> Result<Value, (u16, String)> {
+        let bad = |m: String| (400u16, m);
+        let raw = b["image"].as_str().filter(|v| !v.is_empty()).ok_or_else(|| bad("image: the picture (base64 or a data: URL) is required".into()))?;
+        let pic = init_picture(raw).map_err(bad)?;
+        let int = |k: &str| -> Result<Option<i64>, (u16, String)> {
+            match &b[k] {
+                Value::Null => Ok(None),
+                v => v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).map(Some).ok_or_else(|| bad(format!("{k}: a whole number"))),
+            }
+        };
+        let num = |k: &str| -> Result<Option<f32>, (u16, String)> {
+            match &b[k] {
+                Value::Null => Ok(None),
+                v => v.as_f64().map(|x| Some(x as f32)).ok_or_else(|| bad(format!("{k}: a number"))),
+            }
+        };
+        let req = nextsycl_image::VectorizeRequest {
+            picture: pic,
+            max_length: int("max_length")?.map(|v| v.clamp(1, 8192) as u32).unwrap_or(0),
+            beams: int("beams")?.map(|v| v.clamp(1, 64) as u32),
+            sample: b["sample"].as_bool(),
+            top_p: num("top_p")?,
+            temperature: num("temperature")?,
+            repetition_penalty: num("repetition_penalty")?,
+            seed: int("seed")?.map(|v| v as u64).unwrap_or_else(|| now() ^ 0x5f37),
+        };
+        if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model) {
+            return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
+        }
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let g = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        let (engine, _) = match g.as_ref() {
+            None => return Err((503, "the engine is not loaded".into())),
+            Some((e, _)) if !e.vectorizes() => return Err((400, format!("{} does not write pictures as SVG (starvector-1b-im2svg does)", self.model))),
+            Some(x) => x,
+        };
+        let Some(_running) = self.cancel.begin(b["request_id"].as_str()) else {
+            return Err((499, "cancelled".into()));
+        };
+        let j0 = self.tele.joules();
+        let t0 = Instant::now();
+        let p = &self.progress;
+        let what = format!("vectorize {}x{}", req.picture.width, req.picture.height);
+        let mut n = 0u32;
+        let out = engine.vectorize(&req, &mut |_piece| {
+            n += 1;
+            *p.lock().unwrap() = json!({"busy": true, "prompt": what, "at": n, "of": req.max_length.max(n), "phase": "tokens", "seconds": t0.elapsed().as_secs_f64()});
+            if self.cancel.stopping() {
+                return Err(nextsycl_core::Error("cancelled".into()));
+            }
+            Ok(())
+        });
+        *p.lock().unwrap() = json!({"busy": false});
+        let out = out.map_err(|e| (if e.0 == "cancelled" { 499u16 } else { 400 }, e.0))?;
+        let wh = match (j0, self.tele.joules()) {
+            (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
+            _ => None,
+        };
+        let tok_s = out.tokens as f64 / out.seconds.max(1e-9);
+        {
+            let mut h = self.history.lock().unwrap();
+            h.push_front(json!({"kind": "vectorize", "prompt": format!("{} tokens{}", out.tokens, if out.closed { "" } else { ", cut at max_length" }),
+                                "seconds": out.prompt_seconds + out.seconds, "wh": wh, "created": now()}));
+            h.truncate(200);
+        }
+        Ok(json!({"created": now(), "data": [{"svg": out.svg, "closed": out.closed, "tokens": out.tokens}],
+                  "nextsycl": {"seconds": out.prompt_seconds + out.seconds, "prompt_seconds": out.prompt_seconds, "tokens": out.tokens, "tok_s": tok_s, "wh": wh}}))
+    }
+
+    /// An upscale request's settings (image.upscale and video.upscale share them)
+    fn upscale_req(b: &Value, picture: nextsycl_image::Picture) -> Result<nextsycl_image::UpscaleRequest, (u16, String)> {
+        let bad = |m: String| (400u16, m);
+        let int = |k: &str| -> Result<Option<i64>, (u16, String)> {
+            match &b[k] {
+                Value::Null => Ok(None),
+                v => v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).map(Some).ok_or_else(|| bad(format!("{k}: a whole number"))),
+            }
+        };
+        Ok(nextsycl_image::UpscaleRequest {
+            picture,
+            variant: b["variant"].as_str().filter(|v| !v.is_empty()).map(str::to_string),
+            scale: int("scale")?.map(|v| v.clamp(1, 32) as u32),
+            noise: int("noise")?.map(|v| v as i32),
+            tile: int("tile")?.map(|v| v.clamp(32, 4096) as u32),
+        })
+    }
+
+    /// The engine for an upscale, one request at a time (as a generation)
+    fn upscaler(&self, b: &Value) -> Result<std::sync::MutexGuard<'_, Option<(Box<dyn ImageEngine>, Vec<LoraUse>)>>, (u16, String)> {
+        if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model) {
+            return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
+        }
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let g = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        match g.as_ref() {
+            None => Err((503, "the engine is not loaded".into())),
+            Some((e, _)) if e.upscale_variants().is_empty() => Err((400, format!("{} makes pictures; it does not upscale them (real-esrgan, waifu2x do)", self.model))),
+            _ => Ok(g),
+        }
+    }
+
+    /// POST /v1/images/upscale: {image (base64 / data URL), variant, scale, noise, tile, response_format} (POST /v1/images/vectorize: see `vectorize`)
+    fn upscale(&self, b: &Value, base: &str) -> Result<Value, (u16, String)> {
+        let bad = |m: String| (400u16, m);
+        let raw = b["image"].as_str().filter(|v| !v.is_empty()).ok_or_else(|| bad("image: the picture (base64 or a data: URL) is required".into()))?;
+        let pic = init_picture(raw).map_err(bad)?;
+        let req = Self::upscale_req(b, pic)?;
+        let url = b["response_format"].as_str() == Some("url");
+        if url && self.out_dir.is_none() {
+            return Err(bad("response_format url: this server keeps no files (start it with an output directory)".into()));
+        }
+        let g = self.upscaler(b)?;
+        let Some(_running) = self.cancel.begin(b["request_id"].as_str()) else {
+            return Err((499, "cancelled".into()));
+        };
+        let (engine, _) = g.as_ref().expect("checked");
+        let j0 = self.tele.joules();
+        let p = &self.progress;
+        let what = format!("upscale {}x{}", req.picture.width, req.picture.height);
+        let out = engine.upscale(&req, &mut |st| {
+            *p.lock().unwrap() = json!({"busy": true, "prompt": what, "at": st.at, "of": st.of, "phase": "tiles", "seconds": st.seconds});
+            if self.cancel.stopping() {
+                return Err(nextsycl_core::Error("cancelled".into()));
+            }
+            Ok(())
+        });
+        *p.lock().unwrap() = json!({"busy": false});
+        let (pic, info) = out.map_err(|e| (if e.0 == "cancelled" { 499u16 } else { 400 }, e.0))?;
+        let wh = match (j0, self.tele.joules()) {
+            (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
+            _ => None,
+        };
+        let meta = [("model", self.model.clone()), ("variant", info.variant.clone()), ("scale", info.scale.to_string()),
+                    ("noise", info.noise.map(|n| n.to_string()).unwrap_or_default()), ("size", format!("{}x{}", pic.width, pic.height)),
+                    ("seconds", format!("{:.2}", info.seconds))];
+        let png = pic.png_bytes(&meta).map_err(|e| (500u16, e))?;
+        let mut item = json!({"width": pic.width, "height": pic.height, "variant": info.variant, "scale": info.scale, "noise": info.noise});
+        if let Some(dir) = &self.out_dir {
+            let name = format!("{}-{}-x{}.png", now(), self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"), info.scale);
+            std::fs::write(dir.join(&name), &png).map_err(|e| (500u16, format!("{}: {e}", dir.display())))?;
+            let mut h = self.history.lock().unwrap();
+            h.push_front(json!({"kind": "upscale", "url": format!("/v1/images/files/{name}"), "prompt": format!("{} {}x", info.variant, info.scale),
+                                "width": pic.width, "height": pic.height, "seconds": info.seconds, "wh": wh, "created": now()}));
+            h.truncate(200);
+            if url {
+                item["url"] = json!(format!("{base}/v1/images/files/{name}"));
+            }
+        }
+        if !url {
+            item["b64_json"] = json!(http::base64(&png));
+        }
+        Ok(json!({"created": now(), "data": [item], "nextsycl": {"seconds": info.seconds, "tiles": info.tiles, "tile": info.tile, "wh": wh}}))
+    }
+
+    /// POST /v1/videos/upscale: {video (base64 / data URL) | path (a clip on this machine: the front door's `file`),
+    /// variant, scale, noise, tile, crf} - every frame through the upscaler (ffmpeg decodes and encodes, the audio
+    /// copied as it was), an MP4 back as a link (the server keeps it) or base64
+    fn upscale_video(&self, b: &Value, base: &str) -> Result<Value, (u16, String)> {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+        let bad = |m: String| (400u16, m);
+        let dir = self.out_dir.clone().ok_or_else(|| bad("video.upscale needs a server that keeps files (start it with an output directory)".into()))?;
+        let stamp = now();
+        let src = match (b["video"].as_str().filter(|v| !v.is_empty()), b["path"].as_str().filter(|v| !v.is_empty())) {
+            (Some(v), _) => {
+                let bytes = http::unbase64(v).map_err(|e| bad(format!("video: {e}")))?;
+                let f = std::env::temp_dir().join(format!("nc-upscale-{stamp}-{}.in", std::process::id()));
+                std::fs::write(&f, bytes).map_err(|e| (500u16, format!("{}: {e}", f.display())))?;
+                (f, true)
+            }
+            (None, Some(p)) if std::path::Path::new(p).is_file() => (PathBuf::from(p), false),
+            (None, Some(p)) => return Err((404, format!("{p}: no such clip"))),
+            _ => return Err(bad("video: the clip (base64 or a data: URL), or file (a clip made here), is required".into())),
+        };
+        let cleanup = |f: &PathBuf, tmp: bool| {
+            if tmp {
+                let _ = std::fs::remove_file(f);
+            }
+        };
+        let probe = Command::new("ffprobe").args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries",
+                                                 "stream=width,height,avg_frame_rate,nb_read_packets", "-of", "json"]).arg(&src.0).output();
+        let info: Value = probe.ok().and_then(|o| serde_json::from_slice(&o.stdout).ok()).unwrap_or(Value::Null);
+        let st = &info["streams"][0];
+        let (w, h) = (st["width"].as_u64().unwrap_or(0) as usize, st["height"].as_u64().unwrap_or(0) as usize);
+        if w == 0 || h == 0 {
+            cleanup(&src.0, src.1);
+            return Err(bad("video: not a clip ffprobe reads (no video stream)".into()));
+        }
+        let fps = st["avg_frame_rate"].as_str().unwrap_or("24/1").to_string();
+        let frames: u32 = st["nb_read_packets"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let probe_pic = nextsycl_image::Picture { width: w as u32, height: h as u32, channels: 3, data: Vec::new() };
+        let req0 = Self::upscale_req(b, probe_pic)?;
+        let g = self.upscaler(b)?;
+        let Some(_running) = self.cancel.begin(b["request_id"].as_str()) else {
+            cleanup(&src.0, src.1);
+            return Err((499, "cancelled".into()));
+        };
+        let (engine, _) = g.as_ref().expect("checked");
+        let t0 = Instant::now();
+        let j0 = self.tele.joules();
+        let name = format!("{stamp}-{}-upscaled.mp4", self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"));
+        let out_path = dir.join(&name);
+        let crf = b["crf"].as_u64().unwrap_or(16).min(40).to_string();
+        let mut dec = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src.0).args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| (500u16, format!("ffmpeg: {e}")))?;
+        let mut enc: Option<std::process::Child> = None;
+        let mut out_size = (0usize, 0usize);
+        let mut info_last = None;
+        let mut n = 0u32;
+        let mut buf = vec![0u8; w * h * 3];
+        let p = &self.progress;
+        let r: Result<(), (u16, String)> = (|| {
+            let mut stdout = dec.stdout.take().ok_or((500u16, "ffmpeg's output".to_string()))?;
+            loop {
+                if stdout.read_exact(&mut buf).is_err() {
+                    break;
+                }
+                let mut req = req0.clone();
+                req.picture = nextsycl_image::Picture { width: w as u32, height: h as u32, channels: 3, data: buf.clone() };
+                let (pic, info) = engine.upscale(&req, &mut |_| if self.cancel.stopping() { Err(nextsycl_core::Error("cancelled".into())) } else { Ok(()) })
+                    .map_err(|e| (if e.0 == "cancelled" { 499u16 } else { 400 }, e.0))?;
+                if enc.is_none() {
+                    out_size = (pic.width as usize, pic.height as usize);
+                    // the source's audio, as it was; H.264 4:2:0 for any player
+                    enc = Some(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{}x{}", pic.width, pic.height),
+                                                       "-r", &fps, "-i", "-", "-i"]).arg(&src.0)
+                        .args(["-map", "0:v:0", "-map", "1:a?", "-c:v", "libx264", "-preset", "medium", "-crf", &crf, "-pix_fmt", "yuv420p", "-c:a", "copy",
+                               "-movflags", "+faststart"]).arg(&out_path)
+                        .stdin(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| (500u16, format!("ffmpeg: {e}")))?);
+                }
+                enc.as_mut().and_then(|e| e.stdin.as_mut()).ok_or((500u16, "ffmpeg's input".to_string()))?
+                    .write_all(&pic.data).map_err(|e| (500u16, format!("the encoder: {e}")))?;
+                n += 1;
+                info_last = Some(info);
+                *p.lock().unwrap() = json!({"busy": true, "prompt": format!("upscale a clip {w}x{h}"), "at": n, "of": frames.max(n), "phase": "frames",
+                                            "seconds": t0.elapsed().as_secs_f64()});
+            }
+            Ok(())
+        })();
+        *p.lock().unwrap() = json!({"busy": false});
+        let _ = dec.kill();
+        let _ = dec.wait();
+        let enc_ok = match enc {
+            Some(mut e) => {
+                drop(e.stdin.take());
+                e.wait().map(|s| s.success()).unwrap_or(false)
+            }
+            None => false,
+        };
+        cleanup(&src.0, src.1);
+        if let Err(e) = r {
+            let _ = std::fs::remove_file(&out_path);
+            return Err(e);
+        }
+        if n == 0 || !enc_ok {
+            let _ = std::fs::remove_file(&out_path);
+            return Err((500, if n == 0 { "the clip had no frames ffmpeg could decode".into() } else { "the encoder failed (ffmpeg)".into() }));
+        }
+        let seconds = t0.elapsed().as_secs_f64();
+        let wh = match (j0, self.tele.joules()) {
+            (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
+            _ => None,
+        };
+        let info = info_last.unwrap_or_default();
+        let mut item = json!({"width": out_size.0, "height": out_size.1, "frames": n, "fps": fps, "variant": info.variant, "scale": info.scale, "noise": info.noise,
+                              "name": name, "url": format!("{base}/v1/images/files/{name}")});
+        if b["response_format"].as_str() == Some("b64_json") {
+            let bytes = std::fs::read(&out_path).map_err(|e| (500u16, format!("{}: {e}", out_path.display())))?;
+            item["b64_json"] = json!(http::base64(&bytes));
+        }
+        let mut hist = self.history.lock().unwrap();
+        hist.push_front(json!({"kind": "upscale-video", "url": format!("/v1/images/files/{name}"), "prompt": format!("{} {}x, {n} frames", info.variant, info.scale),
+                               "width": out_size.0, "height": out_size.1, "seconds": seconds, "wh": wh, "created": now()}));
+        hist.truncate(200);
+        Ok(json!({"created": now(), "data": [item], "nextsycl": {"seconds": seconds, "frames": n, "fps_done": n as f64 / seconds.max(1e-9), "wh": wh}}))
     }
 
     fn generate(&self, b: &Value, base: &str, pics: Vec<nextsycl_image::Picture>) -> Result<Value, (u16, String)> {

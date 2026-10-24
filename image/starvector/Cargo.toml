@@ -1,0 +1,14 @@
+[package]
+name = "nextsycl-image-starvector"
+description = "StarVector-1B im2svg on SYCL: a picture written as SVG (a CLIP ViT-L/14 encoder, an adapter, StarCoder-1B decoding)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
+nextsycl-image.workspace = true
+serde_json.workspace = true

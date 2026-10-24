@@ -263,6 +263,15 @@ fn fetch(cat: &Catalog, root: &Path, key: &str, f: &Value, from: &[PathBuf], ver
     let same = cat.files.iter().filter(|(k, o)| *k != key && s(o, "sha256") == sha).map(|(_, o)| root.join(s(o, "path")))
         .find(|p| std::fs::metadata(p).is_ok_and(|m| m.len() == size));
     let copy = same.or_else(|| from.iter().find_map(|d| find_copy(d, &name, size, 4)));
+    // a small copy found by its name and size is hashed whatever --verify says, and passed over when it differs:
+    // waifu2x's three scale2.0x_model.param files share a name and a size, and the wrong one linked runs the wrong model
+    let copy = match copy {
+        Some(src) if !verify && size < (256 << 20) && sha256_of(&src)? != sha => {
+            println!("  {key}: {} has the name and size but not the content: not used", src.display());
+            None
+        }
+        c => c,
+    };
     if let Some(src) = copy {
         if verify && sha256_of(&src)? != sha {
             return Err(format!("{}: not the file the catalog names (SHA-256 differs)", src.display()));
@@ -285,6 +294,10 @@ fn fetch(cat: &Catalog, root: &Path, key: &str, f: &Value, from: &[PathBuf], ver
         // a part of a larger safetensors file: its header, then only the tensors under `prefix`, by byte range
         println!("  {key}: downloading {:.2} GiB\n    {url}", gib(size));
         fetch_tensors(&url, prefix, &part)?;
+    } else if let Some(member) = f["member"].as_str() {
+        // one file of a zip archive (a release's bundle: realesrgan-ncnn-vulkan's models/): the archive downloaded once
+        // under <root>/.archives (resumed like any file), the member taken out of it
+        fetch_member(&url, member, root, &part)?;
     } else {
         println!("  {key}: downloading {:.2} GiB\n    {url}", gib(size));
         let st = Command::new("curl").args(["-fL", "-C", "-", "--retry", "5", "--retry-delay", "5", "-o"]).arg(&part).arg(&url).status()
@@ -348,6 +361,29 @@ fn join_parts(pieces: &[Value], target: &Path, out: &Path) -> Result<(), String>
         let _ = std::fs::remove_file(done);
     }
     Ok(())
+}
+
+/// `member` of the zip archive at `url` into `out` (`unzip -p`), the archive kept under `<root>/.archives` for the
+/// archive's other members
+fn fetch_member(url: &str, member: &str, root: &Path, out: &Path) -> Result<(), String> {
+    let dir = root.join(".archives");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let name = url.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("archive.zip");
+    let zip = dir.join(name);
+    if !zip.is_file() {
+        let part = dir.join(format!("{name}.part"));
+        let st = Command::new("curl").args(["-fL", "-C", "-", "--retry", "5", "--retry-delay", "5", "-o"]).arg(&part).arg(url).status()
+            .map_err(|e| format!("curl: {e}"))?;
+        if !st.success() {
+            return Err(format!("{url}: the download failed (run pull again: it resumes)"));
+        }
+        std::fs::rename(&part, &zip).map_err(|e| format!("{}: {e}", zip.display()))?;
+    }
+    let o = Command::new("unzip").arg("-p").arg(&zip).arg(member).output().map_err(|e| format!("unzip: {e} (the archive's files need unzip)"))?;
+    if !o.status.success() || o.stdout.is_empty() {
+        return Err(format!("{}: no {member} in it", zip.display()));
+    }
+    std::fs::write(out, &o.stdout).map_err(|e| format!("{}: {e}", out.display()))
 }
 
 /// Bytes [a, b) of a URL

@@ -1,0 +1,241 @@
+# waifu2x (nagadomi's models; MIT) as waifu2x-ncnn-vulkan (nihui) ships them, run in Rust and SYCL (image/upscale).
+# image.upscale / video.upscale; each file pinned at the repository's commit 64914665
+id: waifu2x
+kind: image
+arch: waifu2x
+title: 'waifu2x upscaler (cunet for illustration, upconv_7 anime / photo; denoise -1 to 3, 1x to 32x)'
+about: 'nagadomi''s waifu2x models as waifu2x-ncnn-vulkan ships them: cunet (with squeeze-and-excitation blocks) and the upconv_7 anime-art and photo models, a denoise level from -1 (none) to 3, the 2x model run again for 4x and up - tiles of 400 with the program''s prepadding (7, 18 or 28 pixels, edges repeated), alpha upscaled bicubically. Checked against the program: 63-66 dB on a photograph'
+gpus: '0'
+vram_gib: 1.0                   # measured (nvidia-smi, the process): cunet 0.96 GB, upconv_7 0.91 GB on a 720p frame at its 400-pixel tiles
+defaults: {}
+env: {}
+files:
+  models-cunet/noise0_model.bin:
+    key: waifu2x-ncnn-cunet-noise0-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise0_model.bin
+    size: 2767568
+    sha256: b15c356a36bcbf6fb8c2f1404ca016fd917d4e45426bcf41f7a3867022fdd7b0
+    path: upscale/waifu2x/models-cunet/noise0_model.bin
+  models-cunet/noise0_model.param:
+    key: waifu2x-ncnn-cunet-noise0-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise0_model.param
+    size: 7231
+    sha256: 4513ef004281bd50cdbed325df500df9aec154e8495190f578f09414c75f10f9
+    path: upscale/waifu2x/models-cunet/noise0_model.param
+  models-cunet/noise0_scale2.0x_model.bin:
+    key: waifu2x-ncnn-cunet-noise0-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise0_scale2.0x_model.bin
+    size: 2776400
+    sha256: 5329a9375c9cfb64a60a2903fd8ae6e2851d9b069556bf025dbab9d0216fb27c
+    path: upscale/waifu2x/models-cunet/noise0_scale2.0x_model.bin
+  models-cunet/noise0_scale2.0x_model.param:
+    key: waifu2x-ncnn-cunet-noise0-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise0_scale2.0x_model.param
+    size: 7249
+    sha256: ccc3b2f1c9fad829ecdda40cac8dc853fcddf14917170efba888b256fbf9074a
+    path: upscale/waifu2x/models-cunet/noise0_scale2.0x_model.param
+  models-cunet/noise1_model.bin:
+    key: waifu2x-ncnn-cunet-noise1-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise1_model.bin
+    size: 2767568
+    sha256: 3407cb87c2503cbd69f8a6703b31bc4949a72080a3e1b1e536dba8bdbfad934f
+    path: upscale/waifu2x/models-cunet/noise1_model.bin
+  models-cunet/noise1_model.param:
+    key: waifu2x-ncnn-cunet-noise1-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise1_model.param
+    size: 7231
+    sha256: 4513ef004281bd50cdbed325df500df9aec154e8495190f578f09414c75f10f9
+    path: upscale/waifu2x/models-cunet/noise1_model.param
+  models-cunet/noise1_scale2.0x_model.bin:
+    key: waifu2x-ncnn-cunet-noise1-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise1_scale2.0x_model.bin
+    size: 2776400
+    sha256: 862c0e40f3df956ff57bd4d168c85dea5d375b614077fdddd3ac8cfdb9a686da
+    path: upscale/waifu2x/models-cunet/noise1_scale2.0x_model.bin
+  models-cunet/noise1_scale2.0x_model.param:
+    key: waifu2x-ncnn-cunet-noise1-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise1_scale2.0x_model.param
+    size: 7249
+    sha256: ccc3b2f1c9fad829ecdda40cac8dc853fcddf14917170efba888b256fbf9074a
+    path: upscale/waifu2x/models-cunet/noise1_scale2.0x_model.param
+  models-cunet/noise2_model.bin:
+    key: waifu2x-ncnn-cunet-noise2-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise2_model.bin
+    size: 2767568
+    sha256: b45d5febeb56166b7aff055cb0fbb87647dae528968f97d838dfd7ce0b7117f4
+    path: upscale/waifu2x/models-cunet/noise2_model.bin
+  models-cunet/noise2_model.param:
+    key: waifu2x-ncnn-cunet-noise2-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise2_model.param
+    size: 7231
+    sha256: 4513ef004281bd50cdbed325df500df9aec154e8495190f578f09414c75f10f9
+    path: upscale/waifu2x/models-cunet/noise2_model.param
+  models-cunet/noise2_scale2.0x_model.bin:
+    key: waifu2x-ncnn-cunet-noise2-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise2_scale2.0x_model.bin
+    size: 2776400
+    sha256: 5c836e6ae022636cdd5590fbb66dbca2a5fc20bbf8e628884c3612ef72d51858
+    path: upscale/waifu2x/models-cunet/noise2_scale2.0x_model.bin
+  models-cunet/noise2_scale2.0x_model.param:
+    key: waifu2x-ncnn-cunet-noise2-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise2_scale2.0x_model.param
+    size: 7249
+    sha256: ccc3b2f1c9fad829ecdda40cac8dc853fcddf14917170efba888b256fbf9074a
+    path: upscale/waifu2x/models-cunet/noise2_scale2.0x_model.param
+  models-cunet/noise3_model.bin:
+    key: waifu2x-ncnn-cunet-noise3-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise3_model.bin
+    size: 2767568
+    sha256: cd3d2440673d28d7a20aa6428a2a79e1c5e733f21de0a66785958f98d6994926
+    path: upscale/waifu2x/models-cunet/noise3_model.bin
+  models-cunet/noise3_model.param:
+    key: waifu2x-ncnn-cunet-noise3-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise3_model.param
+    size: 7231
+    sha256: 4513ef004281bd50cdbed325df500df9aec154e8495190f578f09414c75f10f9
+    path: upscale/waifu2x/models-cunet/noise3_model.param
+  models-cunet/noise3_scale2.0x_model.bin:
+    key: waifu2x-ncnn-cunet-noise3-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise3_scale2.0x_model.bin
+    size: 2776400
+    sha256: f42c18610fecb14a40f75cca9b9276a6889689d5937a4f75f0c2b21bde7e49ed
+    path: upscale/waifu2x/models-cunet/noise3_scale2.0x_model.bin
+  models-cunet/noise3_scale2.0x_model.param:
+    key: waifu2x-ncnn-cunet-noise3-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/noise3_scale2.0x_model.param
+    size: 7249
+    sha256: ccc3b2f1c9fad829ecdda40cac8dc853fcddf14917170efba888b256fbf9074a
+    path: upscale/waifu2x/models-cunet/noise3_scale2.0x_model.param
+  models-cunet/scale2.0x_model.bin:
+    key: waifu2x-ncnn-cunet-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/scale2.0x_model.bin
+    size: 2776400
+    sha256: d82ed30207fd07e1c16726a9ca838ce44e6e25a105b0278c7ca681516ee0e18e
+    path: upscale/waifu2x/models-cunet/scale2.0x_model.bin
+  models-cunet/scale2.0x_model.param:
+    key: waifu2x-ncnn-cunet-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-cunet/scale2.0x_model.param
+    size: 7249
+    sha256: ccc3b2f1c9fad829ecdda40cac8dc853fcddf14917170efba888b256fbf9074a
+    path: upscale/waifu2x/models-cunet/scale2.0x_model.param
+  models-upconv_7_anime_style_art_rgb/noise0_scale2.0x_model.bin:
+    key: waifu2x-ncnn-upconv7-anime-noise0-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_anime_style_art_rgb/noise0_scale2.0x_model.bin
+    size: 1106248
+    sha256: e1d2c4d91be98e72c0d48d08626cbe7d879aa2b80f740133dcc0d860eabb4189
+    path: upscale/waifu2x/models-upconv_7_anime_style_art_rgb/noise0_scale2.0x_model.bin
+  models-upconv_7_anime_style_art_rgb/noise0_scale2.0x_model.param:
+    key: waifu2x-ncnn-upconv7-anime-noise0-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_anime_style_art_rgb/noise0_scale2.0x_model.param
+    size: 1047
+    sha256: 413195ffde05b4d43807792c6c020c916cecdf25dcf002ee83f5e28d5cc246c6
+    path: upscale/waifu2x/models-upconv_7_anime_style_art_rgb/noise0_scale2.0x_model.param
+  models-upconv_7_anime_style_art_rgb/noise1_scale2.0x_model.bin:
+    key: waifu2x-ncnn-upconv7-anime-noise1-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_anime_style_art_rgb/noise1_scale2.0x_model.bin
+    size: 1106248
+    sha256: 536fd7070b023463d30bd105f675acf301760dce539f2fb974bd06906045514f
+    path: upscale/waifu2x/models-upconv_7_anime_style_art_rgb/noise1_scale2.0x_model.bin
+  models-upconv_7_anime_style_art_rgb/noise1_scale2.0x_model.param:
+    key: waifu2x-ncnn-upconv7-anime-noise1-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_anime_style_art_rgb/noise1_scale2.0x_model.param
+    size: 1047
+    sha256: 413195ffde05b4d43807792c6c020c916cecdf25dcf002ee83f5e28d5cc246c6
+    path: upscale/waifu2x/models-upconv_7_anime_style_art_rgb/noise1_scale2.0x_model.param
+  models-upconv_7_anime_style_art_rgb/noise2_scale2.0x_model.bin:
+    key: waifu2x-ncnn-upconv7-anime-noise2-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_anime_style_art_rgb/noise2_scale2.0x_model.bin
+    size: 1106248
+    sha256: 435f9082425c4520d3586757411ac409b1d67e428ed37ec571feb06f823e245e
+    path: upscale/waifu2x/models-upconv_7_anime_style_art_rgb/noise2_scale2.0x_model.bin
+  models-upconv_7_anime_style_art_rgb/noise2_scale2.0x_model.param:
+    key: waifu2x-ncnn-upconv7-anime-noise2-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_anime_style_art_rgb/noise2_scale2.0x_model.param
+    size: 1047
+    sha256: 413195ffde05b4d43807792c6c020c916cecdf25dcf002ee83f5e28d5cc246c6
+    path: upscale/waifu2x/models-upconv_7_anime_style_art_rgb/noise2_scale2.0x_model.param
+  models-upconv_7_anime_style_art_rgb/noise3_scale2.0x_model.bin:
+    key: waifu2x-ncnn-upconv7-anime-noise3-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_anime_style_art_rgb/noise3_scale2.0x_model.bin
+    size: 1106248
+    sha256: 3e783a9117d4564fbd0cc376375b29d7eb05bd2e457f748898e82eefb1ace2f1
+    path: upscale/waifu2x/models-upconv_7_anime_style_art_rgb/noise3_scale2.0x_model.bin
+  models-upconv_7_anime_style_art_rgb/noise3_scale2.0x_model.param:
+    key: waifu2x-ncnn-upconv7-anime-noise3-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_anime_style_art_rgb/noise3_scale2.0x_model.param
+    size: 1047
+    sha256: 413195ffde05b4d43807792c6c020c916cecdf25dcf002ee83f5e28d5cc246c6
+    path: upscale/waifu2x/models-upconv_7_anime_style_art_rgb/noise3_scale2.0x_model.param
+  models-upconv_7_anime_style_art_rgb/scale2.0x_model.bin:
+    key: waifu2x-ncnn-upconv7-anime-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_anime_style_art_rgb/scale2.0x_model.bin
+    size: 1106248
+    sha256: 27d880903ff81390a3b4a900b67af3381c465279e34297546c9a58781855f7ef
+    path: upscale/waifu2x/models-upconv_7_anime_style_art_rgb/scale2.0x_model.bin
+  models-upconv_7_anime_style_art_rgb/scale2.0x_model.param:
+    key: waifu2x-ncnn-upconv7-anime-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_anime_style_art_rgb/scale2.0x_model.param
+    size: 1047
+    sha256: 413195ffde05b4d43807792c6c020c916cecdf25dcf002ee83f5e28d5cc246c6
+    path: upscale/waifu2x/models-upconv_7_anime_style_art_rgb/scale2.0x_model.param
+  models-upconv_7_photo/noise0_scale2.0x_model.bin:
+    key: waifu2x-ncnn-upconv7-photo-noise0-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_photo/noise0_scale2.0x_model.bin
+    size: 1106248
+    sha256: fbfc8d57e4333748c9c6db2ec4d5454c98cd1c6aa53289f2989c3bdb4e84b673
+    path: upscale/waifu2x/models-upconv_7_photo/noise0_scale2.0x_model.bin
+  models-upconv_7_photo/noise0_scale2.0x_model.param:
+    key: waifu2x-ncnn-upconv7-photo-noise0-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_photo/noise0_scale2.0x_model.param
+    size: 1047
+    sha256: 413195ffde05b4d43807792c6c020c916cecdf25dcf002ee83f5e28d5cc246c6
+    path: upscale/waifu2x/models-upconv_7_photo/noise0_scale2.0x_model.param
+  models-upconv_7_photo/noise1_scale2.0x_model.bin:
+    key: waifu2x-ncnn-upconv7-photo-noise1-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_photo/noise1_scale2.0x_model.bin
+    size: 1106248
+    sha256: 9f8ce2c4df1ed862a7441e3b49ad965b8e34aaa6d87c1cad52a1768210fdfee6
+    path: upscale/waifu2x/models-upconv_7_photo/noise1_scale2.0x_model.bin
+  models-upconv_7_photo/noise1_scale2.0x_model.param:
+    key: waifu2x-ncnn-upconv7-photo-noise1-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_photo/noise1_scale2.0x_model.param
+    size: 1047
+    sha256: 413195ffde05b4d43807792c6c020c916cecdf25dcf002ee83f5e28d5cc246c6
+    path: upscale/waifu2x/models-upconv_7_photo/noise1_scale2.0x_model.param
+  models-upconv_7_photo/noise2_scale2.0x_model.bin:
+    key: waifu2x-ncnn-upconv7-photo-noise2-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_photo/noise2_scale2.0x_model.bin
+    size: 1106248
+    sha256: 432ca8f62ffc4873794a399ded70b17af23aa870b25e5ddba76f029b7ce14c2b
+    path: upscale/waifu2x/models-upconv_7_photo/noise2_scale2.0x_model.bin
+  models-upconv_7_photo/noise2_scale2.0x_model.param:
+    key: waifu2x-ncnn-upconv7-photo-noise2-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_photo/noise2_scale2.0x_model.param
+    size: 1047
+    sha256: 413195ffde05b4d43807792c6c020c916cecdf25dcf002ee83f5e28d5cc246c6
+    path: upscale/waifu2x/models-upconv_7_photo/noise2_scale2.0x_model.param
+  models-upconv_7_photo/noise3_scale2.0x_model.bin:
+    key: waifu2x-ncnn-upconv7-photo-noise3-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_photo/noise3_scale2.0x_model.bin
+    size: 1106248
+    sha256: a24379eb4e954005da1804223f428e67340e3f0037e4f7b9f568f0d0f20e9f20
+    path: upscale/waifu2x/models-upconv_7_photo/noise3_scale2.0x_model.bin
+  models-upconv_7_photo/noise3_scale2.0x_model.param:
+    key: waifu2x-ncnn-upconv7-photo-noise3-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_photo/noise3_scale2.0x_model.param
+    size: 1047
+    sha256: 413195ffde05b4d43807792c6c020c916cecdf25dcf002ee83f5e28d5cc246c6
+    path: upscale/waifu2x/models-upconv_7_photo/noise3_scale2.0x_model.param
+  models-upconv_7_photo/scale2.0x_model.bin:
+    key: waifu2x-ncnn-upconv7-photo-scale2-0x-model-bin
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_photo/scale2.0x_model.bin
+    size: 1106248
+    sha256: 25a2bb25b29e43e63179aac216cd87690791243a436328506d4ef9fca88ee962
+    path: upscale/waifu2x/models-upconv_7_photo/scale2.0x_model.bin
+  models-upconv_7_photo/scale2.0x_model.param:
+    key: waifu2x-ncnn-upconv7-photo-scale2-0x-model-param
+    url: https://raw.githubusercontent.com/nihui/waifu2x-ncnn-vulkan/64914665c45893135c9e50c1c296170a121b9f77/models/models-upconv_7_photo/scale2.0x_model.param
+    size: 1047
+    sha256: 413195ffde05b4d43807792c6c020c916cecdf25dcf002ee83f5e28d5cc246c6
+    path: upscale/waifu2x/models-upconv_7_photo/scale2.0x_model.param
+guide: guides/upscale.md

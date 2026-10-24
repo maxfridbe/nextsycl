@@ -564,7 +564,9 @@ dependencies = [
  "nextsycl-image-olmocr2",
  "nextsycl-image-paddleocrvl",
  "nextsycl-image-qwenimage21",
+ "nextsycl-image-starvector",
  "nextsycl-image-unlimitedocr",
+ "nextsycl-image-upscale",
  "nextsycl-llm",
  "nextsycl-llm-deepseek2",
  "nextsycl-llm-deepseek4",
@@ -807,6 +809,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextsycl-image-starvector"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-image",
+ "nextsycl-tok",
+ "serde_json",
+]
+
+[[package]]
 name = "nextsycl-image-unlimitedocr"
 version = "0.0.0"
 dependencies = [
@@ -815,6 +829,15 @@ dependencies = [
  "nextsycl-gguf",
  "nextsycl-image",
  "nextsycl-tok",
+]
+
+[[package]]
+name = "nextsycl-image-upscale"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-image",
 ]
 
 [[package]]

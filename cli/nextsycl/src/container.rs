@@ -112,8 +112,9 @@ pub fn needs_runtime(args: &[String]) -> bool {
         || matches!(cmd.first(), Some(&("gpus" | "generate" | "spec-check" | "batch-check" | "kernels" | "check" | "selftest")))
         || (cmd.first() == Some(&"serve") && cmd.get(1).is_some_and(|m| Path::new(m).exists()))
         || (matches!(a.first(), Some(&("image" | "video" | "audio" | "model3d" | "3d"))) && matches!(a.get(1), Some(&("selftest" | "check"))))
-        // a recording written down (a new command: it needs no --here)
+        // commands that make an answer from a file (a recording, a picture): they need no --here
         || (a.first() == Some(&"audio") && matches!(a.get(1), Some(&("transcribe" | "stt"))))
+        || (a.first() == Some(&"image") && matches!(a.get(1), Some(&("upscale" | "upscale-check" | "vectorize"))))
 }
 
 /// Whether the kernel library loads here: every library it links found (oneAPI's are inside the image, not on a
@@ -222,6 +223,9 @@ mod tests {
         }
         assert!(needs_runtime(&a("gpus")));
         assert!(needs_runtime(&a("audio transcribe talk.wav")) && needs_runtime(&a("audio stt talk.wav")), "a recording is written down on the GPU");
+        for c in ["upscale", "upscale-check", "vectorize"] {
+            assert!(needs_runtime(&a(&format!("image {c} pic.png"))), "image {c} runs on the GPU");
+        }
     }
 
     #[test]

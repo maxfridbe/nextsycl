@@ -183,6 +183,15 @@ fn maintenance_refuses_work_and_answers_the_rest() {
     let (st, text) = http(&a, "POST", "/v1/images/generations", Some(TOKEN), Some(&json!({"prompt": "x"})));
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!((st, v["error"]["code"].clone()), (503, json!("maintenance")), "{text}");
+    // every way to start work is refused, the newer ones too: upscaling, vectorizing, a recording
+    for method in ["image.upscale", "image.vectorize", "video.upscale", "audio.transcribe"] {
+        let e = err(&a, method, json!({"image": "AAAA"}));
+        assert_eq!(e["code"], "maintenance", "{method} starts work: {e}");
+    }
+    for path in ["/v1/images/upscale", "/v1/images/vectorize", "/v1/videos/upscale", "/v1/audio/transcriptions"] {
+        let (st, text) = http(&a, "POST", path, Some(TOKEN), Some(&json!({"image": "AAAA"})));
+        assert_eq!(st, 503, "{path} starts work: {text}");
+    }
     // off: the notice is cleared
     ok(&a, "system.maintenance", json!({"on": false}));
     let p = ok(&a, "system.ping", json!({}));

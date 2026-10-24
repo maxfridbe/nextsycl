@@ -138,6 +138,42 @@ pub const METHODS: &[Method] = &[
                        ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
                        QUEUE, PRIORITY, HELD, PROJECT, BATCH],
              example: r#"{"prompt": "make it night, keep the lighthouse", "images": ["data:image/png;base64,iVBORw0..."]}"# },
+    Method { kind: "image", name: "upscale", summary: "A picture made bigger (an upscaler: Real-ESRGAN - realesrgan-x4plus, realesrgan-x4plus-anime, realesr-animevideov3 2x/3x/4x - or waifu2x - cunet, upconv_7 anime / photo, denoise -1 to 3, 1x to 32x), in overlapped tiles; alpha kept. A job like image.generate (wait, reentrant_id, status, cancel)",
+             fields: &[MODEL_OPT, ("image", "string", "the picture: PNG, JPEG or WebP as base64, a data: URL or upload:<name> (image.upload)", true),
+                       ("variant", "string", "the upscaler's model (image.info's upscale list): realesrgan-x4plus (default at 4x), realesr-animevideov3 (default at 2x / 3x), ..., models-cunet (waifu2x's default)", false),
+                       ("scale", "integer", "the factor: Real-ESRGAN 2, 3 (animevideov3) or 4; waifu2x 1 (denoise only), 2, 4 ... 32 (its 2x model again each time)", false),
+                       ("noise", r#"{"type": "integer", "minimum": -1, "maximum": 3}"#, "waifu2x's denoise level (-1: none)", false),
+                       ("tile", r#"{"type": "integer", "minimum": 32}"#, "the tile's side in input pixels (Real-ESRGAN 200, waifu2x 400 by default: as the ncnn programs)", false),
+                       ("response_format", r#"{"type": "string", "enum": ["url", "b64_json"]}"#, "", false),
+                       ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
+                       ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit (as image.generate)", false),
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends; false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
+             example: r#"{"model": "real-esrgan", "image": "upload:up_1792400000_still.png", "variant": "realesrgan-x4plus", "scale": 4}"# },
+    Method { kind: "image", name: "vectorize", summary: "A picture written as SVG code (StarVector-1B im2svg: a CLIP encoder and StarCoder-1B; logos, icons, simple illustrations). As the model's own generate_im2svg: the picture flattened on white, 2 beams sampled (top_p 0.9) until </svg> or max_length; the SVG may stop short there (closed: false - the caller closes or cuts it). A job like image.generate (wait, reentrant_id, status, cancel)",
+             fields: &[MODEL_OPT, ("image", "string", "the picture: PNG, JPEG or WebP as base64, a data: URL or upload:<name> (image.upload)", true),
+                       ("max_length", r#"{"type": "integer", "minimum": 260, "maximum": 8192, "default": 5000}"#, "the sequence at most as the model counts it (the picture's 257 rows and the prompt first: 5000 leaves 4741 tokens of SVG)", false),
+                       ("beams", r#"{"type": "integer", "minimum": 1, "maximum": 8, "default": 2}"#, "", false),
+                       ("sample", r#"{"type": "boolean", "default": true}"#, "false: the likeliest tokens (beam search, or greedy with beams 1)", false),
+                       ("top_p", r#"{"type": "number", "default": 0.9}"#, "", false), ("temperature", r#"{"type": "number", "default": 1.0}"#, "", false),
+                       ("repetition_penalty", r#"{"type": "number", "default": 1.0}"#, "", false), ("seed", "integer", "", false),
+                       ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for image.status and image.cancel", false),
+                       ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit (as image.generate)", false),
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends; false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
+             example: r#"{"model": "starvector-1b-im2svg", "image": "upload:up_1792400000_logo.png", "max_length": 5000}"# },
+    Method { kind: "video", name: "upscale", summary: "A clip made bigger frame by frame by an upscaler (as image.upscale: the variant, scale, noise, tile), its sound copied as it was; an MP4 back. A job in the image queue (image.status, image.cancel)",
+             fields: &[MODEL_OPT, ("video", "string", "the clip: MP4 / WebM / MOV ... as base64 or a data: URL", false),
+                       ("file", "string", "or a clip made here (a video.generate clip's name, h3_..., with or without .mp4)", false),
+                       ("variant", "string", "as image.upscale (realesr-animevideov3: trained on video frames)", false),
+                       ("scale", "integer", "as image.upscale", false), ("noise", "integer", "as image.upscale", false), ("tile", "integer", "as image.upscale", false),
+                       ("crf", r#"{"type": "integer", "minimum": 0, "maximum": 40, "default": 16}"#, "the H.264 encode's quality (lower: better, bigger)", false),
+                       ("response_format", r#"{"type": "string", "enum": ["url", "b64_json"]}"#, "url (default): the server keeps the MP4 and links it", false),
+                       ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for image.status and image.cancel", false),
+                       ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit (as image.generate)", false),
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends; false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
+             example: r#"{"model": "real-esrgan", "file": "h3_20261019_121939", "variant": "realesr-animevideov3", "scale": 2}"# },
     Method { kind: "image", name: "ocr", summary: "Read pages (an OCR model: Unlimited-OCR): their text as Markdown, tables as HTML, boxes with <|grounding|>",
              fields: &[("model", "string", "an OCR model's id (default: the first enabled)", false), ("images", "string[]", "the pages, base64, data: URLs or upload:<name> (image.upload), in order: pictures, or PDFs (split into their pages, 150 dpi)", true),
                        ("prompt", "string", "\"document parsing.\" (default), \"Free OCR.\", \"<|grounding|>Convert the document to markdown.\", \"Parse the figure.\"; several pages: each page under it, or (each_page false) the model's \"Multi page parsing.\"; a <PAGE> mark before each page", false),
@@ -409,7 +445,7 @@ const FEATURES: &[&str] = &[
     "video.negative_prompt.ignored", "image.canvases", "image.cancel", "spec.open",
     "image.edit.strength", "audio.speak.continue_from", "video.preview", "system.busy.parallel",
     "errors.retryable", "errors.no_room", "jobs.precheck", "image.info.steps", "image.generate.init_image", "image.edit.reference",
-    "video.failure", "video.gpu", "video.engines.ignored", "audio.speak.precheck.voice", "jobs.cancel.reentrant_id", "rpc.errors.body", "audio.transcribe",
+    "video.failure", "video.gpu", "video.engines.ignored", "audio.speak.precheck.voice", "jobs.cancel.reentrant_id", "rpc.errors.body", "audio.transcribe", "image.upscale", "video.upscale", "image.vectorize",
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
@@ -615,6 +651,27 @@ impl Home {
         crate::voices::Library::of(std::path::Path::new(&out))
     }
 
+    /// The upscaler for image.upscale / video.upscale: the one named (it must upscale), else - by the variant asked
+    /// (waifu2x's are models-*) - the loaded or first enabled one of that family, else any
+    pub(super) fn upscaler_for(&self, b: &Value, all: &[Value]) -> Result<String, Fail> {
+        if b["model"].as_str().is_some_and(|x| !x.is_empty()) {
+            let id = self.pick("image", b, all)?;
+            if all.iter().any(|m| m["id"] == id.as_str() && !upscales(m)) {
+                return Err((400, format!("{id} draws pictures; upscaling needs an upscaler (real-esrgan, waifu2x)")));
+            }
+            return Ok(id);
+        }
+        let want = match b["variant"].as_str() {
+            Some(v) if v.starts_with("models-") => Some("waifu2x"),
+            Some(v) if !v.is_empty() => Some("realesrgan"),
+            _ => None,
+        };
+        let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "image" && m["enabled"] != false && upscales(m)
+            && want.is_none_or(|a| s(m, "arch") == a)).collect();
+        self.loaded_of("image").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
+            .ok_or_else(|| (409, format!("no upscaler{} is enabled (system.enable real-esrgan / waifu2x)", want.map(|a| format!(" ({a})")).unwrap_or_default())))
+    }
+
     /// The recogniser for audio.transcribe: the one named (it must listen), else the loaded or first enabled one
     pub(super) fn recogniser(&self, b: &Value, all: &[Value]) -> Result<String, Fail> {
         let listens = |m: &Value| s(m, "arch") == "whisper";
@@ -747,7 +804,8 @@ impl Home {
     /// A studio method (video.*, but upload and the guide): the studio's answer as it gave it - its status and error
     /// code (busy, not_running ...) - with the files it names as URLs through here
     fn studio_rpc(&self, name: &str, b: &Value, host: &str) -> Option<(u16, Value)> {
-        let method = name.strip_prefix("video.").filter(|m| !matches!(*m, "upload" | "describePromptGuideMD"))?;
+        // video.upscale is the image servers' (an upscaler's job), not the studio's
+        let method = name.strip_prefix("video.").filter(|m| !matches!(*m, "upload" | "describePromptGuideMD" | "upscale"))?;
         let all = self.models();
         let envelope = |st: u16, m: String| (st, json!({"ok": false, "error": rpc_error(name, st, None, &m)}));
         if let Err((st, m)) = self.checked(name, b, &all) {
@@ -1014,7 +1072,21 @@ impl Home {
                 relay(&t, "POST", "/v1/ocr", Some(&body), 3600)
             }
             ("image", "generate") | ("image", "edit") => {
-                let id = self.pick("image", b, &all)?;
+                let id = if b["model"].as_str().is_some_and(|x| !x.is_empty()) {
+                    self.pick("image", b, &all)?
+                } else {
+                    // no model named: the loaded or first enabled one that draws (not a reader, not an upscaler)
+                    let draws = |m: &Value| !s(m, "arch").contains("ocr") && !upscales(m) && !vectorizes(m);
+                    let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "image" && m["enabled"] != false && draws(m)).collect();
+                    self.loaded_of("image").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
+                        .ok_or_else(|| (409, "no image model that draws is enabled (system.enable qwen-image-2.1-q8)".to_string()))?
+                };
+                if all.iter().any(|m| m["id"] == id.as_str() && upscales(m)) {
+                    return Err((400, format!("{id} upscales pictures; image.{} needs a model that draws (image.upscale for {id})", m.name)));
+                }
+                if all.iter().any(|m| m["id"] == id.as_str() && vectorizes(m)) {
+                    return Err((400, format!("{id} writes pictures as SVG; image.{} needs a model that draws (image.vectorize for {id})", m.name)));
+                }
                 let job = b["request_id"].as_str();
                 let t = self.ensure_for(&id, job)?;
                 self.sent(job);
@@ -1025,6 +1097,52 @@ impl Home {
                 }
                 let path = if m.name == "edit" { "/v1/images/edits" } else { "/v1/images/generations" };
                 relay(&t, "POST", path, Some(&body), 3600)
+            }
+            ("image", "vectorize") => {
+                let id = if b["model"].as_str().is_some_and(|x| !x.is_empty()) {
+                    let id = self.pick("image", b, &all)?;
+                    if all.iter().any(|m| m["id"] == id.as_str() && !vectorizes(m)) {
+                        return Err((400, format!("{id} does not write SVG; image.vectorize needs a vectorizer (starvector-1b-im2svg)")));
+                    }
+                    id
+                } else {
+                    let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "image" && m["enabled"] != false && vectorizes(m)).collect();
+                    self.loaded_of("image").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
+                        .ok_or_else(|| (409, "no vectorizer is enabled (system.enable starvector-1b-im2svg)".to_string()))?
+                };
+                let job = b["request_id"].as_str();
+                let t = self.ensure_for(&id, job)?;
+                self.sent(job);
+                let mut body = b.clone();
+                body["model"] = json!(id);
+                relay(&t, "POST", "/v1/images/vectorize", Some(&body), 3600)
+            }
+            ("image", "upscale") | ("video", "upscale") => {
+                let id = self.upscaler_for(b, &all)?;
+                let job = b["request_id"].as_str();
+                let t = self.ensure_for(&id, job)?;
+                self.sent(job);
+                let mut body = b.clone();
+                body["model"] = json!(id);
+                if m.kind == "image" {
+                    if body.get("response_format").is_none() {
+                        body["response_format"] = json!("url");
+                    }
+                    return relay(&t, "POST", "/v1/images/upscale", Some(&body), 3600);
+                }
+                // a clip made here: its path (the same machine), not its bytes
+                if let Some(f) = b["file"].as_str().filter(|f| !f.is_empty()) {
+                    let plain = crate::files::plain(f.rsplit('/').next().unwrap_or(f)).ok_or_else(|| (400, format!("file {f}: a clip's name")))?;
+                    let name = if plain.ends_with(".mp4") { plain.to_string() } else { format!("{plain}.mp4") };
+                    let dir = self.o.cfg.get("NS_VIDEO_OUT").filter(|d| !d.is_empty())
+                        .unwrap_or_else(|| format!("{}/.local/share/nextsycl/video", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())));
+                    let path = std::path::Path::new(&dir).join(&name);
+                    if !path.is_file() {
+                        return Err((404, format!("file {f}: no clip {name} here (video.list)")));
+                    }
+                    body["path"] = json!(path.to_string_lossy());
+                }
+                relay(&t, "POST", "/v1/videos/upscale", Some(&body), 86400)
             }
             ("audio", "transcribe") => {
                 let id = self.recogniser(b, &all)?;
@@ -1303,6 +1421,7 @@ impl Home {
             "audio.transcribe" => ("audio", &[("audio", false)]),
             "audio.voices.add" => ("audio", &[("sample", false)]),
             "model3d.generate" => ("model3d", &[("image", false), ("images", true)]),
+            "image.upscale" | "image.vectorize" => ("image", &[("image", false)]),
             "model3d.rig" | "model3d.tool" => ("model3d", &[("mesh", false)]),
             _ => ("", &[]),
         }
@@ -1840,4 +1959,14 @@ mod tests {
             assert_eq!(code_of(st), c);
         }
     }
+}
+
+/// A registry entry that upscales (an upscaler's architecture) rather than draws or reads
+pub(super) fn upscales(m: &Value) -> bool {
+    matches!(s(m, "arch").as_str(), "realesrgan" | "waifu2x")
+}
+
+/// A registry entry that writes pictures as SVG (StarVector) rather than draws them
+pub(super) fn vectorizes(m: &Value) -> bool {
+    s(m, "arch") == "starvector"
 }

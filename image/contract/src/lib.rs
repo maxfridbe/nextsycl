@@ -108,6 +108,82 @@ pub struct OcrOutput {
     pub seconds: f64,
 }
 
+/// One upscale (an upscaler's request): the picture and the variant's settings. `None` fields take the engine's
+/// defaults
+#[derive(Clone, Debug)]
+pub struct UpscaleRequest {
+    pub picture: Picture,
+    /// the variant of the family (Real-ESRGAN: realesrgan-x4plus, realesrgan-x4plus-anime, realesr-animevideov3;
+    /// waifu2x: models-cunet, models-upconv_7_anime_style_art_rgb, models-upconv_7_photo)
+    pub variant: Option<String>,
+    /// the factor (Real-ESRGAN: 2, 3, 4 as the variant takes; waifu2x: 1, 2, 4 ... 32)
+    pub scale: Option<u32>,
+    /// waifu2x's denoise level, -1 (none) to 3
+    pub noise: Option<i32>,
+    /// the tile's side in input pixels (the picture goes through the model in tiles this big, overlapped)
+    pub tile: Option<u32>,
+}
+
+/// What an upscale was made with
+#[derive(Clone, Debug, Default)]
+pub struct UpscaleInfo {
+    pub variant: String,
+    pub scale: u32,
+    pub noise: Option<i32>,
+    pub tile: u32,
+    pub tiles: u32,
+    pub seconds: f64,
+}
+
+/// One vectorization (a picture-to-SVG model's request: StarVector). `None` fields take the model's own settings (its
+/// generate_im2svg's: 2 beams sampled, top_p 0.9, temperature 1)
+#[derive(Clone, Debug)]
+pub struct VectorizeRequest {
+    pub picture: Picture,
+    /// the sequence's length at most, as the model's `max_length` counts it (the picture's embedding rows and the prompt
+    /// included); 0: the engine's default
+    pub max_length: u32,
+    /// beams (1: no beam search)
+    pub beams: Option<u32>,
+    /// sample (true: the model's own setting) or take the most likely tokens
+    pub sample: Option<bool>,
+    pub top_p: Option<f32>,
+    pub temperature: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    pub seed: u64,
+}
+
+impl Default for VectorizeRequest {
+    fn default() -> Self {
+        VectorizeRequest { picture: Picture::new(1, 1, 3), max_length: 0, beams: None, sample: None, top_p: None, temperature: None, repetition_penalty: None, seed: 0 }
+    }
+}
+
+/// What a vectorization made
+#[derive(Clone, Debug, Default)]
+pub struct VectorizeOutput {
+    /// the SVG as the model wrote it ("<svg" and the tokens after it, decoded as its tokenizer decodes): it may stop
+    /// short of "</svg>" at the length limit (the caller closes or cuts it)
+    pub svg: String,
+    /// it ended with "</svg>" (else the length limit stopped it)
+    pub closed: bool,
+    pub tokens: u32,
+    pub prompt_tokens: u32,
+    /// seconds to see the picture and read the prompt, then to write
+    pub prompt_seconds: f64,
+    pub seconds: f64,
+}
+
+/// One variant an upscaler offers, for `info` and a page
+#[derive(Clone, Debug)]
+pub struct UpscaleVariant {
+    pub id: &'static str,
+    pub about: &'static str,
+    pub scales: &'static [u32],
+    /// the denoise levels it takes (empty: none)
+    pub noise: &'static [i32],
+}
+
 /// The engine's own defaults, shown by `info` and used for the request's `None` fields
 #[derive(Clone, Copy, Debug)]
 pub struct Defaults {
@@ -205,6 +281,22 @@ pub trait ImageEngine: Send + Sync {
     /// read the request's pages, each piece of text as it is written to `text`
     fn ocr(&self, _req: &OcrRequest, _text: &mut dyn FnMut(&str)) -> Result<OcrOutput> {
         Err(Error(format!("{} makes pictures; it does not read them", self.arch())))
+    }
+    /// the variants it upscales with (an upscaler: `upscale`); empty for every other engine
+    fn upscale_variants(&self) -> Vec<UpscaleVariant> {
+        Vec::new()
+    }
+    /// a picture made bigger, reporting each tile done (`Step::at` of `of`)
+    fn upscale(&self, _req: &UpscaleRequest, _progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<(Picture, UpscaleInfo)> {
+        Err(Error(format!("{} does not upscale (an upscaler: real-esrgan, waifu2x)", self.arch())))
+    }
+    /// whether it writes a picture as SVG (`vectorize`: StarVector)
+    fn vectorizes(&self) -> bool {
+        false
+    }
+    /// the picture as SVG, each piece of text as it is written to `text` (an error from `text` stops it: a cancel)
+    fn vectorize(&self, _req: &VectorizeRequest, _text: &mut dyn FnMut(&str) -> Result<()>) -> Result<VectorizeOutput> {
+        Err(Error(format!("{} does not vectorize pictures (starvector does)", self.arch())))
     }
 }
 

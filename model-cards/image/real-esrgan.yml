@@ -1,0 +1,84 @@
+# Real-ESRGAN (xinntao; BSD-3-Clause): the realesrgan-ncnn-vulkan release's graphs and weights, run in Rust and SYCL
+# (image/upscale). image.upscale / video.upscale; the files are one zip archive's members (the 2022-04-24 release)
+id: real-esrgan
+kind: image
+arch: realesrgan
+title: 'Real-ESRGAN upscaler (x4plus for photographs, x4plus-anime, animevideov3 2x / 3x / 4x for video frames)'
+about: 'xinntao''s Real-ESRGAN as realesrgan-ncnn-vulkan ships it: RealESRGAN_x4plus (RRDB, 23 blocks), its 6-block anime model and the compact SRVGG realesr-animevideov3 at 2x, 3x and 4x - the ncnn graphs and half weights run on the shared convolutions, in tiles of 200 with 10 pixels of mirrored context (the program''s own), alpha upscaled bicubically. Checked against the program: 58-63 dB on a photograph, every variant'
+gpus: '0'
+vram_gib: 1.0                   # measured (nvidia-smi, the process): x4plus 0.9 GB at its 200-pixel tiles, animevideov3 0.3 GB on a 720p
+                                 # frame; a larger `tile` takes more (x4plus at 512: 3.2 GB)
+defaults: {}
+env: {}
+files:
+  realesr-animevideov3-x2.bin:
+    key: realesrgan-ncnn-realesr-animevideov3-x2-bin
+    url: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+    member: models/realesr-animevideov3-x2.bin
+    size: 1247368
+    sha256: 548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d
+    path: upscale/realesrgan/realesr-animevideov3-x2.bin
+  realesr-animevideov3-x2.param:
+    key: realesrgan-ncnn-realesr-animevideov3-x2-param
+    url: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+    member: models/realesr-animevideov3-x2.param
+    size: 3173
+    sha256: b88ff4f00ebf019a7fdac17fdd45a7fd3665d37509efc5baf2e4da2e24420a04
+    path: upscale/realesrgan/realesr-animevideov3-x2.param
+  realesr-animevideov3-x3.bin:
+    key: realesrgan-ncnn-realesr-animevideov3-x3-bin
+    url: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+    member: models/realesr-animevideov3-x3.bin
+    size: 1247368
+    sha256: 548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d
+    path: upscale/realesrgan/realesr-animevideov3-x3.bin
+  realesr-animevideov3-x3.param:
+    key: realesrgan-ncnn-realesr-animevideov3-x3-param
+    url: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+    member: models/realesr-animevideov3-x3.param
+    size: 3173
+    sha256: d1a5755008791d09b57e3425fc9dd0bd26b00fdf79c606210bc0e693f8230881
+    path: upscale/realesrgan/realesr-animevideov3-x3.param
+  realesr-animevideov3-x4.bin:
+    key: realesrgan-ncnn-realesr-animevideov3-x4-bin
+    url: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+    member: models/realesr-animevideov3-x4.bin
+    size: 1247368
+    sha256: 548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d
+    path: upscale/realesrgan/realesr-animevideov3-x4.bin
+  realesr-animevideov3-x4.param:
+    key: realesrgan-ncnn-realesr-animevideov3-x4-param
+    url: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+    member: models/realesr-animevideov3-x4.param
+    size: 3077
+    sha256: 850a248e7c14c27e5bd8cf7265113a9441036a7db63963bb8aa5169d788a435e
+    path: upscale/realesrgan/realesr-animevideov3-x4.param
+  realesrgan-x4plus-anime.bin:
+    key: realesrgan-ncnn-realesrgan-x4plus-anime-bin
+    url: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+    member: models/realesrgan-x4plus-anime.bin
+    size: 8943500
+    sha256: fe01c269cfd10cdef8e018ab66ebe750cf79c7af4d1f9c16c737e1295229bacc
+    path: upscale/realesrgan/realesrgan-x4plus-anime.bin
+  realesrgan-x4plus-anime.param:
+    key: realesrgan-ncnn-realesrgan-x4plus-anime-param
+    url: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+    member: models/realesrgan-x4plus-anime.param
+    size: 30290
+    sha256: 2b8fb6e0ae4d2d85704ca08c119a2f5ea40add4f2ecd512eb7f4cd44b6127ed4
+    path: upscale/realesrgan/realesrgan-x4plus-anime.param
+  realesrgan-x4plus.bin:
+    key: realesrgan-ncnn-realesrgan-x4plus-bin
+    url: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+    member: models/realesrgan-x4plus.bin
+    size: 33424520
+    sha256: 713ee713b0353afaa27976f0563a64a5043bd70b9bd8936c2e26e25ebcdbcddf
+    path: upscale/realesrgan/realesrgan-x4plus.bin
+  realesrgan-x4plus.param:
+    key: realesrgan-ncnn-realesrgan-x4plus-param
+    url: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+    member: models/realesrgan-x4plus.param
+    size: 116029
+    sha256: 35330ececcea33b6c397a72548e788d5d53becee4734c50b7fada36e89f10a86
+    path: upscale/realesrgan/realesrgan-x4plus.param
+guide: guides/upscale.md

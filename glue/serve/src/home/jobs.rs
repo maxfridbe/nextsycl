@@ -27,7 +27,17 @@ use super::{now, Home};
 use crate::http::{call_for, Target};
 
 /// The methods that run as jobs
-pub const METHODS: [&str; 8] = ["image.generate", "image.edit", "audio.generate", "audio.speak", "audio.transcribe", "audio.voices.enroll", "model3d.generate", "model3d.rig"];
+pub const METHODS: [&str; 11] = ["image.generate", "image.edit", "image.upscale", "image.vectorize", "video.upscale", "audio.generate", "audio.speak", "audio.transcribe",
+    "audio.voices.enroll", "model3d.generate", "model3d.rig"];
+
+/// The queue a method's jobs wait in: its prefix, but video.upscale runs on the image servers (an upscaler there) and
+/// so waits with the image jobs (image.status / image.cancel read it)
+pub fn kind_of_method(name: &str) -> &str {
+    if name == "video.upscale" {
+        return "image";
+    }
+    name.split_once('.').map(|(k, _)| k).unwrap_or(name)
+}
 
 /// The kinds whose requests run as jobs here
 pub const KINDS: [&str; 3] = ["image", "audio", "model3d"];
@@ -222,7 +232,7 @@ impl Home {
 
     /// A request that runs as a job: its job made (or the one its reentrant_id names), queued, and with wait its answer
     pub(crate) fn submit(self: &Arc<Self>, name: &str, b: &Value) -> Result<Value, Fail> {
-        let (kind, _) = name.split_once('.').unwrap_or((name, ""));
+        let kind = kind_of_method(name);
         let rid = reentrant(b);
         let wait = b["wait"] != false;
         let again = rid.as_deref().and_then(|r| {
