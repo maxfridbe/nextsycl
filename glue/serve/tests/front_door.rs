@@ -316,20 +316,20 @@ fn a_song_from_a_recording_is_checked_before_it_is_queued() {
     voice["speech"] = json!(["clone"]);
     let a = door("song", vec![ace, voice], vec![]);
     // a task that works on a recording needs the recording
-    let e = err(&a, "audio.generate", json!({"model": "acestep-1.5", "prompt": "calm", "task": "cover"}));
+    let e = err(&a, "audio.generate", json!({"model": "acestep-1.5", "instructions": "calm", "task": "cover"}));
     assert_eq!(e["status"], 400, "{e}");
     assert!(e["message"].as_str().is_some_and(|m| m.contains("the recording")), "{e}");
     // an unknown task is named with the ones there are
-    let e = err(&a, "audio.generate", json!({"model": "acestep-1.5", "prompt": "calm", "task": "remix"}));
+    let e = err(&a, "audio.generate", json!({"model": "acestep-1.5", "instructions": "calm", "task": "remix"}));
     assert!(e["message"].as_str().is_some_and(|m| m.contains("text2music, cover, repaint, edit or lego")), "{e}");
     // an edit says what the recording sings now
-    let e = err(&a, "audio.generate", json!({"model": "acestep-1.5", "prompt": "calm", "task": "edit", "audio": "AAAA"}));
+    let e = err(&a, "audio.generate", json!({"model": "acestep-1.5", "instructions": "calm", "task": "edit", "audio": "AAAA"}));
     assert!(e["message"].as_str().is_some_and(|m| m.contains("source_lyrics")), "{e}");
     // a strength is a fraction
-    let e = err(&a, "audio.generate", json!({"model": "acestep-1.5", "prompt": "calm", "task": "cover", "audio": "AAAA", "cover_strength": 3}));
+    let e = err(&a, "audio.generate", json!({"model": "acestep-1.5", "instructions": "calm", "task": "cover", "audio": "AAAA", "cover_strength": 3}));
     assert_eq!(e["status"], 400, "{e}");
     // a model that cannot take a recording is refused, and named
-    let e = err(&a, "audio.generate", json!({"model": "voxcpm2", "prompt": "calm", "task": "cover", "audio": "AAAA"}));
+    let e = err(&a, "audio.generate", json!({"model": "voxcpm2", "instructions": "calm", "task": "cover", "audio": "AAAA"}));
     assert!(e["message"].as_str().is_some_and(|m| m.contains("makes no song from a recording")), "{e}");
 }
 
