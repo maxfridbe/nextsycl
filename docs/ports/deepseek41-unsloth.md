@@ -107,14 +107,19 @@ The engine reads every Unsloth quant of the model; UD-IQ2_XXS is the one tuned a
   | | UD-IQ2_XXS | UD-Q2_K_XL |
   |---|---|---|
   | tg, 512 tokens after a short prompt, exact / `-fast` | 12.7 / 21.4 tok/s | 8.8 / 19.2 tok/s |
-  | the same, 2026-10-23 (1e24759: the read-ahead skip bar; warm page cache) | 12.7 / 23.4 tok/s (with the replica) | 4.2 / 14.5-15.2 tok/s |
+  | the same, 2026-10-23 (1e24759: the read-ahead skip bar; warm page cache; the B-tree prompt / the novel prompt) | 12.7 / 23.4 tok/s (B-tree, with the replica) | 4.2 / 14.5-15.2, 4.5-4.7 / 16.7-17.0 tok/s |
   | tg, sustained over a 12,000-token novel, `-fast` | 25.3 tok/s | 22.3 tok/s |
   | pp `-fast` (exact), 580 / 2,561 / 9,901 tokens | - | 121 (42) / 138 (92) / 300 (280) tok/s |
   | the novel, unique-word share / 5-grams seen earlier, per 1,000 words | 0.42-0.25 / up to 0.42 (drifts from ~8,000 words) | 0.35-0.44 / at most 0.11 (clean to the end) |
 
-  2026-10-23: the 2026-10-22 decode speeds were not reproduced. Exact decode waits ~190 ms a token on ~27 file
-  experts (~360 MB a token from the P310, which reads 3.6-5.1 GB/s; the engine got ~2 GB/s of it), against ~200 MB
-  for UD-IQ2_XXS. The read-ahead skip bar (`NS_DS41_AHEAD_SKIP_BAR`) took `-fast` from 11.5 to 13.6 tok/s (a cold
+  2026-10-23: the 2026-10-22 decode speeds were not reproduced, and not because of the code: 91f1548 (the commit that
+  measured them) rebuilt and run beside today's gives the same exact speed (B-tree prompt: 4.1-4.2 against 4.0 tok/s;
+  fast 10.2 against 14.0 - today's read-ahead skip bar). The novel prompt of 2026-10-22 takes the same expert reads
+  as then (~5,250 from the file in 512 tokens) in twice the time: exact 4.5-4.7 tok/s (8.75 then), fast 16.7-17.0
+  (19.2). The files had been written to the P310 (QLC, DRAM-less) half an hour before that measurement; data that has
+  aged on it reads slower (4 MiB random reads, 16 threads: 2.69 GB/s on the Q2_K_XL shards written 2026-10-22, 3.97
+  GB/s on data written 2026-10-23). Exact decode waits ~190 ms a token on ~27 file experts (~360 MB a token),
+  against ~200 MB for UD-IQ2_XXS, whose experts are on nvme0. The read-ahead skip bar (`NS_DS41_AHEAD_SKIP_BAR`) took `-fast` from 11.5 to 13.6 tok/s (a cold
   page cache, 256 tokens); a replica of the expert shards on the 1.2 GB/s 2 TB drive (`NS_DS41_REPLICA`, 20-30%)
   gained nothing in either mode.
   Its teacher-forced perplexity on our two prose texts (3.68 / 4.06 exact, 4.04 / 4.19 `-fast`) is not below
