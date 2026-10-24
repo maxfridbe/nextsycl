@@ -35,6 +35,11 @@ non_diegetic_music: <a score the people in the scene cannot hear, or "None.">
   hold from the first frame to the last" - a "slight push in" compounds over chained clips), the light level and
   colour, an empty room (or extras re-roll).
 - **No negations**: guidance is 1.0, so every word renders - "no cars" puts cars in. Say what is there.
+- **Hands**: counts and plurals invite extras ("held in two hands ... the hands lift its lid" drew three), and an extreme
+  close-up of hands distorts fingers. Keep hands to the wide and medium shots; for a macro insert show the object
+  alone ("the lid swings open, the mechanism turns").
+- **A prop's picture fixes its kind, not its ornament**: counts of points, stripes or letters drift (five points became
+  six to eight). Pick props with a bold simple shape or colour.
 - **Do**: concrete visual and audio detail, physical descriptions of people (age, hair, clothes, posture).
   **Don't**: plot summaries, abstract adjectives, lines longer than the shot can hold.
 
@@ -105,6 +110,7 @@ The motion must carry through the cuts, and the sound with it.
 | The cut | Use |
 |---|---|
 | the same shot goes on | `guide_clip` (22 frames) + `first_audio` |
+| a new shot in the same scene, the sound goes on (music, room tone) | `first_audio` = the clip before, `first_audio_s 0.9167`, no `guide_clip`; on every clip after the first (without it the sound starts again from nothing) |
 | the same person speaks again | `ref_images` + `ref_audios` + the picture as `first_frame` and `last_frame` - on **every** clip of the person, the first too (without it the model draws a voice, a man's for a woman) |
 | the speaker changes | that person's `ref_images` + `ref_audios`; **one speaker a shot** (two in one shot put a voice on the wrong mouth) |
 | the same person, a new place | `ref_images [person's character sheet, the place's picture]`: "the woman from the character sheet `<Picture 1>` stands here, on the quay of `<Picture 2>`" |

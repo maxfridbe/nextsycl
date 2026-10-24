@@ -89,10 +89,8 @@ T14 = {
               "lifts out the music box <Picture 3> with both hands and holds it up in the golden light, studying it with curiosity. "
               f"{LOCK}", "Old wood creaking, a soft hush of dust, her breath.")),
         ("open", "REF2VA", ["musicbox", "attic"], 5.0,
-         shot("An extreme close-up, filling the frame: the music box <Picture 1> rests in the open palm of one hand in the golden light of <Picture 2>, "
-              "and the thumb of her other hand lifts its lid - only two hands, one person's. The mother-of-pearl star inlay gleams, the tiny brass comb and "
-              "cylinder begin to turn. "
-              f"{LOCK}", "A delicate, slightly out-of-tune music-box melody begins, close and clear, with the small ticking of its gears.")),
+         shot("Extreme close-up: a hand holds the music box <Picture 1> in the golden light of <Picture 2>; the lid opens and the brass "
+              f"cylinder turns. {LOCK}", "A delicate, slightly out-of-tune music-box melody begins, close and clear, with the small ticking of its gears.")),
         ("listen", "REF2VA", ["sheet_mara", "attic", "musicbox"], 5.0,
          shot("A medium close-up, head and shoulders: the woman from the character sheet <Picture 1> in the attic of <Picture 2> holds "
               "the open music box <Picture 3> close to her chest and listens, her eyes softening and glistening, a small, moved smile. "
