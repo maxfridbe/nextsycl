@@ -199,6 +199,18 @@ pub const METHODS: &[Method] = &[
                        ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
                        QUEUE, PRIORITY, HELD, PROJECT, BATCH],
              example: r#"{"model": "qwen3-tts-custom", "input": "Good morning. The bread is still warm.", "voice": "ryan", "language": "english", "instructions": "cheerful, a little hurried"}"# },
+    Method { kind: "audio", name: "transcribe", summary: "Speech to text (a recogniser: Whisper large-v3-turbo, 99 languages): the text, its segments timed by the model's timestamps and (words, the default) each word timed by its cross-attention. A job like audio.speak (wait, reentrant_id, status, cancel); long recordings go in 30 s windows, so an hour takes minutes",
+             fields: &[MODEL_OPT, ("audio", "string", "the recording: WAV, MP3, FLAC, Ogg or M4A as base64, a data: URL, or upload:<name> (audio.upload); any rate, mixed to mono", true),
+                       ("language", "string", "a code or a name (en, english, de, german ...); none or auto: detected on the first 30 s", false),
+                       ("words", r#"{"type": "boolean", "default": true}"#, "each word's start and end (and the model's probability for it)", false),
+                       ("translate", "boolean", "into English instead of the language spoken", false),
+                       ("prompt", "string", "text that leads the first window: names, spelling, style (Whisper's initial_prompt)", false),
+                       ("options", "object", "the engine's own: condition (each window prompted with the text before it), no-speech (the silence threshold), fallback (decode an unsure window again, warmer)", false),
+                       ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
+                       ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
+                       ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
+                       QUEUE, PRIORITY, HELD, PROJECT, BATCH],
+             example: r#"{"audio": "upload:up_1792400000_take2.wav", "language": "english", "words": true}"# },
     Method { kind: "audio", name: "voices.list", summary: "The saved voices (cloned or designed): name, owner, what the sample says, its description, length, whether it can be spoken now (ready) and by which enabled models; sample: its WAV",
              fields: &[("owner", "string", "only this owner's voices", false)], example: r#"{"owner": "film-app"}"# },
     Method { kind: "audio", name: "voices.add", summary: "Save a voice cloned from a recording (WAV, MP3, FLAC, Ogg, M4A; 3-15 s of one speaker is best)",
@@ -397,7 +409,7 @@ const FEATURES: &[&str] = &[
     "video.negative_prompt.ignored", "image.canvases", "image.cancel", "spec.open",
     "image.edit.strength", "audio.speak.continue_from", "video.preview", "system.busy.parallel",
     "errors.retryable", "errors.no_room", "jobs.precheck", "image.info.steps", "image.generate.init_image", "image.edit.reference",
-    "video.failure", "video.gpu", "video.engines.ignored", "audio.speak.precheck.voice", "jobs.cancel.reentrant_id", "rpc.errors.body",
+    "video.failure", "video.gpu", "video.engines.ignored", "audio.speak.precheck.voice", "jobs.cancel.reentrant_id", "rpc.errors.body", "audio.transcribe",
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
@@ -601,6 +613,21 @@ impl Home {
     pub(crate) fn voices(&self) -> crate::voices::Library {
         let out = self.o.cfg.get("NS_AUDIO_OUT").unwrap_or_else(|| format!("{}/.local/share/nextsycl/audio", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())));
         crate::voices::Library::of(std::path::Path::new(&out))
+    }
+
+    /// The recogniser for audio.transcribe: the one named (it must listen), else the loaded or first enabled one
+    pub(super) fn recogniser(&self, b: &Value, all: &[Value]) -> Result<String, Fail> {
+        let listens = |m: &Value| s(m, "arch") == "whisper";
+        if b["model"].as_str().is_some_and(|x| !x.is_empty()) {
+            let id = self.pick("audio", b, all)?;
+            if all.iter().any(|m| m["id"] == id.as_str() && !listens(m)) {
+                return Err((400, format!("{id} makes sound; audio.transcribe needs a recogniser (whisper-large-v3-turbo)")));
+            }
+            return Ok(id);
+        }
+        let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false && listens(m)).collect();
+        self.loaded_of("audio").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
+            .ok_or_else(|| (409, "no recogniser is enabled (system.enable whisper-large-v3-turbo)".to_string()))
     }
 
     /// The speech model for a request that names none (or names one not registered): one that clones for a saved
@@ -999,10 +1026,26 @@ impl Home {
                 let path = if m.name == "edit" { "/v1/images/edits" } else { "/v1/images/generations" };
                 relay(&t, "POST", path, Some(&body), 3600)
             }
+            ("audio", "transcribe") => {
+                let id = self.recogniser(b, &all)?;
+                let job = b["request_id"].as_str();
+                let t = self.ensure_for(&id, job)?;
+                self.sent(job);
+                let mut body = b.clone();
+                body["model"] = json!(id);
+                relay(&t, "POST", "/v1/audio/transcriptions", Some(&body), 7200)
+            }
             ("audio", "generate" | "speak") => {
                 let mut b = b.clone();
                 if m.name == "speak" {
                     b["model"] = json!(self.speech_model(&b, &all)?);
+                } else if b["model"].as_str().is_none_or(|x| x.is_empty()) {
+                    // a song: the loaded or first enabled audio model that makes songs (not a speech model, not a recogniser)
+                    let songs: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false && !m["speech"].is_array()
+                        && s(m, "arch") != "whisper").collect();
+                    if let Some(id) = self.loaded_of("audio").into_iter().find(|l| songs.iter().any(|m| m["id"] == l.as_str())).or_else(|| songs.first().map(|m| s(m, "id"))) {
+                        b["model"] = json!(id);
+                    }
                 }
                 let b = &b;
                 let id = self.pick("audio", b, &all)?;
@@ -1257,6 +1300,7 @@ impl Home {
             "image.edit" => ("image", &[("images", true), ("image", false)]),
             "image.ocr" => ("image", &[("images", true)]),
             "audio.speak" => ("audio", &[("ref_audio", false), ("ref_audios", true)]),
+            "audio.transcribe" => ("audio", &[("audio", false)]),
             "audio.voices.add" => ("audio", &[("sample", false)]),
             "model3d.generate" => ("model3d", &[("image", false), ("images", true)]),
             "model3d.rig" | "model3d.tool" => ("model3d", &[("mesh", false)]),
@@ -1469,6 +1513,15 @@ impl Home {
                 } else {
                     self.pick(kind, &json!({"model": named}), &all)?
                 };
+                let t = self.ensure(&id)?;
+                pass(s, &t)
+            }
+            ("POST", "/v1/audio/transcriptions") => {
+                need("audio")?;
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                // OpenAI's whisper-1 (or no name): the recogniser here
+                let named = body["model"].as_str().filter(|n| all.iter().any(|m| m["id"] == *n));
+                let id = self.recogniser(&json!({"model": named}), &all)?;
                 let t = self.ensure(&id)?;
                 pass(s, &t)
             }

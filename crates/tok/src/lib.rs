@@ -31,6 +31,8 @@ const DEEPSEEK3_SPLITS: [&str; 3] = [
 /// letters, single digits
 /// Mistral's Tekken (llama.cpp's TEKKEN: tokenizer.json's own pattern - no contractions, single digits)
 const TEKKEN_SPLIT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// GPT-2's own split (tokenizers' ByteLevel pre-tokenizer with use_regex, no Split of its own: Whisper's tokenizer.json)
+const GPT2_SPLIT: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 const QWEN2_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 pub struct Tokenizer {
@@ -125,6 +127,8 @@ impl Tokenizer {
             false => j["pre_tokenizer"]["pretokenizers"].as_array().into_iter().flatten()
                 .chain(std::iter::once(&j["pre_tokenizer"]))
                 .find_map(|p| (p["type"] == "Split").then(|| p["pattern"]["Regex"].as_str()).flatten())
+                // a ByteLevel pre-tokenizer alone splits by GPT-2's pattern
+                .or_else(|| (j["pre_tokenizer"]["type"] == "ByteLevel" && j["pre_tokenizer"]["use_regex"] != false).then_some(GPT2_SPLIT))
                 .ok_or("tokenizer.json: no Split pre-tokenizer pattern")?,
         };
         let byte_enc = byte_alphabet();
@@ -1216,6 +1220,20 @@ mod tests {
 
 #[cfg(test)]
 mod hf_json_tests {
+    /// Whisper's tokenizer.json (a ByteLevel pre-tokenizer, GPT-2's split: NS_TEST_WHISPER_TOKENIZER); the ids are
+    /// transformers' WhisperTokenizerFast's for the same text; skipped without the file
+    #[test]
+    fn whispers_byte_level_tokenizer() {
+        let Ok(tj) = std::env::var("NS_TEST_WHISPER_TOKENIZER") else { return };
+        let t = super::Tokenizer::from_hf_json(std::path::Path::new(&tj)).unwrap();
+        assert_eq!(t.encode(" "), vec![220]);
+        assert_eq!(t.encode(" Hello world, it's 42!"), vec![2425, 1002, 11, 309, 311, 14034, 0]);
+        let ids = t.encode("<|startoftranscript|><|en|> Hello");
+        assert_eq!(ids, vec![50258, 50259, 2425]);
+        assert_eq!(t.decode(&[2425, 1002, 11]), " Hello world,");
+        assert_eq!(t.decode(&[50365]), "<|0.00|>");
+    }
+
     /// Qwen3-VL's tokenizer.json against the ids the reference pipeline made (NS_TEST_QWEN_TOKENIZER: the file,
     /// NS_TEST_QWEN_TOKENS: the reference's tokens.json); skipped without them
     #[test]

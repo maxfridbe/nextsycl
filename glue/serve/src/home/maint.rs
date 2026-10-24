@@ -18,12 +18,12 @@ type Fail = (u16, String);
 /// cancels, guides, uploads, unloading - answer as always
 pub(super) fn starts_work(method: &str) -> bool {
     matches!(method, "system.enable" | "system.load" | "llm.chat" | "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak"
-                     | "audio.voices.design" | "audio.voices.enroll" | "video.generate" | "model3d.generate" | "model3d.rig")
+                     | "audio.transcribe" | "audio.voices.design" | "audio.voices.enroll" | "video.generate" | "model3d.generate" | "model3d.rig")
 }
 
 /// The OpenAI routes that start work
 fn openai_starts_work(method: &str, path: &str) -> bool {
-    method == "POST" && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/images/generations" | "/v1/images/edits" | "/v1/audio/speech" | "/v1/model3d/generate" | "/v1/model3d/rig")
+    method == "POST" && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/images/generations" | "/v1/images/edits" | "/v1/audio/speech" | "/v1/audio/transcriptions" | "/v1/model3d/generate" | "/v1/model3d/rig")
 }
 
 impl Home {

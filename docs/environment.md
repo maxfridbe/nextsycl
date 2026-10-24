@@ -258,7 +258,7 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 
 ## Audio
 
-MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-request option's variable is only its name: it rides in the request (`"options"`), the engine does not read the environment for it.
+MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`), Whisper (`NS_WH_`). A per-request option's variable is only its name: it rides in the request (`"options"`), the engine does not read the environment for it.
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
@@ -303,6 +303,10 @@ MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`). A per-r
 | `NS_VCP_SAMPLER_CHECK` | 0 | Debug: 1 (with NS_VCP_GRAPH=0): each of the silo's sampler steps checked against the host's on the same values (stderr: the worst difference; 0 expected) | audio voxcpm2 |
 | `NS_VCP_INT8` | 0 | 1: the language models' matrices in int8 (less VRAM, faster patches) (--opt-int8) | audio voxcpm2 |
 | `NS_VCP_MAX_RATIO` | 6 | the per-request option max-ratio's name: the most patches a text token (a runaway's bound); a request's options only, the variable itself is not read (--opt-max-ratio) | audio voxcpm2 |
+| `NS_WH_*` | - | every NS_WH_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
+| `NS_WH_CONDITION` | 0 | 1: Whisper prompts each 30 s window with the text before it (openai's condition_on_previous_text: a steadier style, but a mistake carries on); also a request's option condition (--opt-condition) | audio whisper |
+| `NS_WH_FALLBACK` | 1 | 0: a window that runs on without ending, or decodes unsure (average log-probability under -1), is kept as greedy decoding left it instead of decoded again at rising temperatures (openai's fallback); also a request's option fallback (--opt-fallback) | audio whisper |
+| `NS_WH_NO_SPEECH` | 0.6 | a window is skipped as silence when <\|nospeech\|> is likelier than this and its text unsure; also a request's option no-speech (--opt-no-speech) | audio whisper |
 
 ## 3D
 
@@ -639,6 +643,10 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 | `NS_DUMP_GEN` | 48 | greedy tokens llama-ns-mtmd-dump generates after the prompt (next.txt) | reference/llama-dump (ns-mtmd-dump.cpp, llama.cpp mtmd parity tool) |
 | `NS_MM3_CHECK_STEPS` | 3 | chunks check: flow steps a window | audio minimaxmusic3 (check) |
 | `NS_TEST_H3_TOKENIZER` | test skipped | the H3 tokenizer's directory (vocab.json, merges.txt, tokenizer_config.json) for its reference-match test | video h3 (cargo test) |
+| `NS_TEST_WHISPER_CONFIG` | test skipped | whisper-large-v3-turbo's config.json for its sizes' test | audio whisper (cargo test) |
+| `NS_TEST_WHISPER_GENERATION` | test skipped | whisper-large-v3-turbo's generation_config.json (with NS_TEST_WHISPER_TOKENIZER) for the vocabulary, rules and alignment tests | audio whisper (cargo test) |
+| `NS_TEST_WHISPER_REF` | test skipped | a folder of reference/whisper/ref.py dumps (short/, long/, song/): the mel, greedy-rule, alignment and placement tests against openai-whisper | audio whisper (cargo test) |
+| `NS_TEST_WHISPER_TOKENIZER` | test skipped | whisper-large-v3-turbo's tokenizer.json for the byte-level tokenizer test and the vocabulary tests | tests (crates/tok), audio whisper (cargo test) |
 | `NS_TEST_QWEN_TOKENIZER` | test skipped | a Qwen3-VL tokenizer.json for the tokenizer test (with NS_TEST_QWEN_TOKENS) | tests (crates/tok) |
 | `NS_TEST_QWEN_TOKENS` | test skipped | the reference pipeline's tokens.json the tokenizer test compares against | tests (crates/tok) |
 | `NS_X_INT8` | - | fixture: an option table's variable in the --opt-NAME unit tests (never read by an engine) | tests (crates/core options) |

@@ -1,0 +1,38 @@
+# Whisper large-v3-turbo (speech to text in 99 languages: segments and words timed)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# License: MIT (OpenAI's weights and code)
+id: whisper-large-v3-turbo
+kind: audio
+arch: whisper
+title: 'Whisper large-v3-turbo (speech to text in 99 languages: segments and words timed, language detected; MIT)'
+about: 'OpenAI''s Whisper large-v3-turbo (809M): large-v3''s 32-layer encoder over 128 mel bands with the decoder pruned to 4 layers - the checkpoint''s own safetensors, half on the GPU. audio.transcribe: the text, segments timed by its timestamp tokens, each word timed by six alignment heads'' cross-attention (DTW), the language detected when not given; long recordings in 30 s windows (openai-whisper''s transcribe, greedy with its fallback). Translates into English too'
+gpus: '0'
+vram_gib: 2.5                   # 1.5 GiB of weights, the encoder's activations and attention table (to be measured)
+defaults: {}
+env: {}
+files:
+  model:
+    key: whisper-v3-turbo-st
+    url: https://huggingface.co/openai/whisper-large-v3-turbo/resolve/41f01f3fe87f28c78e2fbf8b568835947dd65ed9/model.safetensors
+    size: 1617824864
+    sha256: 542566a422ae4f3fd23f1ba11add198fca01bbf82e66e6a2857b3f608b1eb9d1
+    path: whisper-large-v3-turbo/model.safetensors
+  config:
+    key: whisper-v3-turbo-config
+    url: https://huggingface.co/openai/whisper-large-v3-turbo/resolve/41f01f3fe87f28c78e2fbf8b568835947dd65ed9/config.json
+    size: 1256
+    sha256: c5b526b3e3cd64cd8940dabb45e8ba726629e22d8ed389c29b552f9140daf04a
+    path: whisper-large-v3-turbo/config.json
+  tokenizer:
+    key: whisper-v3-turbo-tokenizer
+    url: https://huggingface.co/openai/whisper-large-v3-turbo/resolve/41f01f3fe87f28c78e2fbf8b568835947dd65ed9/tokenizer.json
+    size: 2710337
+    sha256: 297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd
+    path: whisper-large-v3-turbo/tokenizer.json
+  generation:
+    key: whisper-v3-turbo-generation
+    url: https://huggingface.co/openai/whisper-large-v3-turbo/resolve/41f01f3fe87f28c78e2fbf8b568835947dd65ed9/generation_config.json
+    size: 3772
+    sha256: cce11bfe3aaa6ae9e072ea2637caaec8795e68d9b67e655a5af16ee509681a4c
+    path: whisper-large-v3-turbo/generation_config.json
+guide: guides/whisper.md

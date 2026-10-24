@@ -25,14 +25,16 @@ nextsycl audio voice enroll NAME [--gpu N] [--steps 2000] [--replace] [--direct]
                    a saved voice fitted for Voxtral TTS (experimental: no encoder in its open weights; PyTorch XPU) - a front-door
                    job that waits for a card like a load (audio.voices.enroll); --direct: here, now (the door runs that)
 nextsycl audio voice rm NAME            (addvoice / clonevoice NAME ... = voice add; designvoice = voice design)
-nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | prompt,lm,head,codec,run | prompt,frames,flow,codec] [--gpu N]
+nextsycl audio transcribe FILE [--model ID | --dir DIR] [--language L] [--translate] [--no-words] [--prompt TEXT] [--opt-NAME VALUE]...
+                   [--json] [--gpu N]   (speech to text: a recogniser, whisper-large-v3-turbo; any rate, WAV, MP3, FLAC, Ogg, M4A)
+nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | mel,encoder,logits,transcribe | prompt,lm,head,codec,run | prompt,frames,flow,codec] [--gpu N]
 nextsycl audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextsycl_audio::AudioKind> {
     vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_voxcpm2::kind(), nextsycl_audio_breezetts2::kind(),
          nextsycl_audio_vibevoice::kind(), nextsycl_audio_s2pro::kind(),
-         nextsycl_audio_voxtraltts::kind(), nextsycl_audio_example::kind()]
+         nextsycl_audio_voxtraltts::kind(), nextsycl_audio_whisper::kind(), nextsycl_audio_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -44,7 +46,10 @@ fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
 fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
     if let Some(d) = opt(args, "--dir") {
         let dir = Path::new(d);
-        let (arch, files) = if let Ok(f) = nextsycl_audio_breezetts2::files_in(dir) {
+        let whisper = std::fs::read_to_string(dir.join("config.json")).is_ok_and(|c| c.contains("\"model_type\": \"whisper\""));
+        let (arch, files) = if whisper {
+            (nextsycl_audio_whisper::ARCH, nextsycl_audio_whisper::files_in(dir).map_err(|e| e.0)?)
+        } else if let Ok(f) = nextsycl_audio_breezetts2::files_in(dir) {
             (nextsycl_audio_breezetts2::ARCH, f)
         } else if let Ok(f) = nextsycl_audio_vibevoice::files_in(dir) {
             (nextsycl_audio_vibevoice::ARCH, f)
@@ -269,6 +274,62 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `nextsycl audio transcribe FILE`: the recording written down by a recogniser in this process (inside the image)
+fn transcribe(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let file = args.first().filter(|p| !p.starts_with("--")).ok_or(USAGE)?.clone();
+    nextsycl_core::use_kind("audio");
+    let mut margs = args.to_vec();
+    let all = models::all(cfg)?;
+    // no model named: the first registered recogniser
+    if opt(args, "--model").is_none() && opt(args, "--dir").is_none() {
+        let m = all.iter().find(|m| m["arch"] == nextsycl_audio_whisper::ARCH).ok_or("no recogniser registered (nextsycl models pull whisper-large-v3-turbo)")?;
+        margs.extend(["--model".to_string(), m["id"].as_str().unwrap_or("").to_string()]);
+    }
+    let (m, files) = model(cfg, &margs)?;
+    let ks = engines();
+    let k = nextsycl_audio::kind_for(&ks, m["arch"].as_str().unwrap_or(""))?;
+    let gs = gpus(args)?;
+    let mut log = |s: String| eprintln!("{s}");
+    let e = (k.load)(&files, &gs, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+    if e.recogniser().is_none() {
+        return Err(format!("{} makes sound; transcribe needs a recogniser (--model whisper-large-v3-turbo)", m["id"].as_str().unwrap_or("?")));
+    }
+    let b = std::fs::read(&file).map_err(|e| format!("{file}: {e}"))?;
+    let (samples, rate) = nextsycl_audio::decode_audio(&b).map_err(|e| format!("{file}: {e}"))?;
+    let given: nextsycl_core::options::Given = nextsycl_core::options::given(args).into_iter()
+        .filter(|(n, _)| k.options.iter().any(|o| (o.name == n.as_str() || o.env == n.as_str()) && o.at != nextsycl_core::At::Load)).collect();
+    nextsycl_core::options::resolve(&given, k.options, nextsycl_core::At::Request, k.name)?;
+    let req = nextsycl_audio::TranscribeRequest {
+        samples,
+        rate,
+        language: opt(args, "--language").map(str::to_string),
+        translate: args.iter().any(|a| a == "--translate"),
+        words: !args.iter().any(|a| a == "--no-words"),
+        prompt: opt(args, "--prompt").map(str::to_string),
+        extra: nextsycl_core::options::by_name(&given, k.options),
+    };
+    let t0 = std::time::Instant::now();
+    let t = e.transcribe(&req, &mut |s| {
+        eprint!("\r{} {}/{} frames  {:.1} s   ", s.phase, s.at, s.of, s.seconds);
+        Ok(())
+    }).map_err(|e| e.0)?;
+    eprintln!();
+    let took = t0.elapsed().as_secs_f64();
+    if args.iter().any(|a| a == "--json") {
+        let timed = |v: &[nextsycl_audio::Timed]| -> Vec<serde_json::Value> {
+            v.iter().map(|x| serde_json::json!({"start": x.start, "end": x.end, "text": x.text, "probability": x.probability})).collect()
+        };
+        println!("{}", serde_json::json!({"text": t.text, "language": t.language, "duration": t.duration, "took": took,
+                                          "segments": timed(&t.segments), "words": timed(&t.words)}));
+    } else {
+        for s in &t.segments {
+            println!("[{:8.2} - {:8.2}] {}", s.start, s.end, s.text);
+        }
+        eprintln!("{:.1} s of recording ({}) in {took:.1} s, {} segments, {} words", t.duration, t.language, t.segments.len(), t.words.len());
+    }
+    Ok(())
+}
+
 fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let dir = Path::new(args.first().filter(|a| !a.starts_with("--")).ok_or(USAGE)?);
     nextsycl_core::use_kind("audio");
@@ -303,10 +364,14 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("ar,dit,voc").split(',').collect();
         let e = nextsycl_audio_minimaxmusic3::MiniMaxMusic3::load_on(&files, &gpus(args)?, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_minimaxmusic3::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_whisper::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("mel,encoder,logits,transcribe").split(',').collect();
+        let e = nextsycl_audio_whisper::Whisper::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_whisper::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
+        return Err(format!("check knows {}, {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
                            nextsycl_audio_voxcpm2::ARCH, nextsycl_audio_breezetts2::ARCH, nextsycl_audio_vibevoice::ARCH, nextsycl_audio_s2pro::ARCH,
-                           nextsycl_audio_voxtraltts::ARCH));
+                           nextsycl_audio_voxtraltts::ARCH, nextsycl_audio_whisper::ARCH));
     };
     println!("worst relative error {worst:.2e}");
     Ok(())
@@ -377,7 +442,7 @@ fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     a.extend(mount(&out, &out.to_string_lossy(), false));
     a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engines' own settings from the configuration (NS_MM3_INT8=1 ...)
-    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NS_VCP_")).chain(cfg.with_prefix("NS_BZ2_"))
+    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NS_VCP_")).chain(cfg.with_prefix("NS_BZ2_")).chain(cfg.with_prefix("NS_WH_"))
         .chain(cfg.with_prefix("NSD_")) {
         a.extend(["-e".into(), format!("{k}={v}")]);
     }
@@ -613,6 +678,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         }
         Some("selftest") => selftest(rest),
         Some("gen") => gen(cfg, rest),
+        Some("transcribe" | "stt") => transcribe(cfg, rest),
         Some("check") => check(cfg, rest),
         Some("voice" | "voices") => voice(cfg, rest),
         Some("addvoice" | "clonevoice") => voice(cfg, &[&["add".to_string()], rest].concat()),

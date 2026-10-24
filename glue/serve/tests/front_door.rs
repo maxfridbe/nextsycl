@@ -262,6 +262,43 @@ fn what_a_3d_model_advertises_follows_its_card() {
 }
 
 #[test]
+fn a_recording_goes_to_a_recogniser_and_to_nothing_else() {
+    let mut voice = entry("voxcpm2", "audio", &[], true);
+    voice["arch"] = json!("voxcpm2");
+    voice["speech"] = json!(["clone"]);
+    // only a speech model is enabled: transcribing has nobody to go to (409, never retry as is)
+    let a = door("stt-none", vec![voice.clone()], vec![]);
+    let e = err(&a, "audio.transcribe", json!({"audio": "AAAA"}));
+    assert_eq!(e["status"], 409, "{e}");
+    assert!(e["message"].as_str().is_some_and(|m| m.contains("no recogniser")), "{e}");
+    // naming the speech model for a recording is refused: it makes sound, it does not listen
+    let e = err(&a, "audio.transcribe", json!({"audio": "AAAA", "model": "voxcpm2"}));
+    assert_eq!(e["status"], 400, "{e}");
+    assert!(e["message"].as_str().is_some_and(|m| m.contains("makes sound")), "{e}");
+    // with a recogniser enabled it advertises transcribe, and the speech model does not
+    let mut whisper = entry("whisper-large-v3-turbo", "audio", &[], true);
+    whisper["arch"] = json!("whisper");
+    let a = door("stt", vec![voice, whisper], vec![]);
+    let all = ok(&a, "system.models", json!({}));
+    let list: Vec<Value> = all.as_array().cloned().or_else(|| all["models"].as_array().cloned()).unwrap_or_default();
+    let methods = |id: &str| -> Vec<String> {
+        list.iter().find(|m| m["id"] == id).unwrap_or_else(|| panic!("{id} not listed in {all}"))["methods"].as_array().into_iter().flatten()
+            .filter_map(Value::as_str).map(str::to_string).collect()
+    };
+    assert_eq!(methods("whisper-large-v3-turbo"), vec!["audio.transcribe".to_string()]);
+    assert!(methods("voxcpm2").contains(&"audio.speak".to_string()) && !methods("voxcpm2").contains(&"audio.transcribe".to_string()));
+    let v = ok(&a, "system.version", json!({}));
+    assert!(v["methods"].as_array().unwrap().iter().any(|m| m == "audio.transcribe"));
+    assert!(v["features"].as_array().unwrap().iter().any(|m| m == "audio.transcribe"));
+    // a recording is work: maintenance refuses it on /rpc and on the OpenAI route
+    ok(&a, "system.maintenance", json!({"on": true, "message": "x", "eta_s": 60}));
+    let e = err(&a, "audio.transcribe", json!({"audio": "AAAA"}));
+    assert_eq!(e["code"], "maintenance", "{e}");
+    let (st, text) = http(&a, "POST", "/v1/audio/transcriptions", Some(TOKEN), Some(&json!({"audio": "AAAA"})));
+    assert_eq!(st, 503, "{text}");
+}
+
+#[test]
 fn state_and_busy_answer_with_nothing_loaded() {
     let a = door("state", vec![entry("chat", "llm", &[], true), entry("pic", "image", &[], false)], vec![card("ghost", "audio", &[], 4)]);
     let st = ok(&a, "system.state", json!({}));
