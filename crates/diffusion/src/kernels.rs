@@ -233,7 +233,7 @@ impl Nsd {
         self.ok(unsafe { (self.k.swiglu)(self.ctx, x, x_dt as c_int, m as i64, c as i64, out, out_dt as c_int) }, "swiglu")
     }
 
-    /// x[r] += other[r] * gate[rows[r]] (gate float32 [R, C]; rows / gate null: a plain add)
+    /// x[r] += other[r] * gate[rows[r]] (gate float32 [R, C]; gate null: a plain add; rows null: gate's first row for every row)
     #[allow(clippy::too_many_arguments)]
     pub fn gate_add(&self, x: M, x_dt: Dt, m: usize, c: usize, other: P, other_dt: Dt, rows: P, gate: P) -> Result<()> {
         // SAFETY: the caller's buffers hold the sizes named.

@@ -508,6 +508,15 @@ impl AudioServer {
             }
             None => None,
         };
+        // a song made from a recording (a cover, a repaint, an extension): base64 (WAV, MP3, FLAC, Ogg, M4A) or a data
+        // URL, its channels kept
+        let source = match text(&["audio", "src_audio", "source_audio"]) {
+            Some(a) => {
+                let bytes = http::unbase64(&a).map_err(|e| bad(format!("audio: {e}")))?;
+                Some(nextsycl_audio::read_audio(&bytes).map_err(|e| bad(format!("audio: {e}")))?)
+            }
+            None => None,
+        };
         // one request at a time, or as many as the engine makes together
         self.waiting.fetch_add(1, Ordering::Relaxed);
         let engine = self.engine.read().unwrap_or_else(|p| p.into_inner());
@@ -516,13 +525,32 @@ impl AudioServer {
         let Some(running) = self.cancel.begin(b["request_id"].as_str()) else {
             return Err((499, "cancelled".into()));
         };
+        if source.is_some() && !engine.sources() {
+            return Err(bad(format!("audio: {} makes no song from a recording (acestep-1.5 does: task cover, repaint, edit)", self.model)));
+        }
+        // a song's request option may come as a field of its own (bpm, key, time_signature, task, repaint_start ...):
+        // the engine's option of that name, underscores for its dashes (`options` says it first)
+        let mut given = given;
+        if engine.speech().is_none() {
+            for o in engine.options().iter().filter(|o| o.at != nextsycl_core::At::Load) {
+                let v = &b[o.name.replace('-', "_").as_str()];
+                if !v.is_null() && !given.contains_key(o.name) {
+                    given.insert(o.name.to_string(), v.as_str().map_or_else(|| v.to_string(), str::to_string));
+                }
+            }
+        }
         let speech = engine.speech().is_some();
         // speech: input is the text to say, instructions its style or voice; a song: input the lyrics, instructions
         // the music
         let (prompt, lyrics, instructions) = if speech {
             (text(&["input", "text"]).ok_or_else(|| bad("input (the text to say): required".into()))?, None, text(&["instructions"]))
         } else {
-            let p = text(&["instructions", "prompt", "description"]).ok_or_else(|| bad("instructions (the music's description): required".into()))?;
+            // from a recording the description may be left out (the engine keeps the recording's sound)
+            let p = match text(&["instructions", "prompt", "description"]) {
+                Some(p) => p,
+                None if source.is_some() => String::new(),
+                None => return Err(bad("instructions (the music's description): required".into())),
+            };
             (p, text(&["input", "lyrics"]), None)
         };
         // speech: the text as it is said (symbols as words, no markdown) unless normalize: false / NS_SPEECH_NORMALIZE=0
@@ -545,6 +573,7 @@ impl AudioServer {
             instructions: instructions.clone(),
             reference,
             references: Vec::new(),
+            source,
         };
         let carried = text(&["continue_from"]);
         // carrying on: a voice that is not a saved one (a built-in voice of the chunk before) is in that chunk already

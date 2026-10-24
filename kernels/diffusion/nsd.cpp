@@ -1571,7 +1571,8 @@ int nsd_gate_add(void* ctx, void* x, int x_dt, int64_t M, int64_t C, const void*
     if (M <= 0 || C <= 0) return 0;
     c.q.parallel_for(sycl::range<2>((size_t) M, (size_t) C), [=](sycl::id<2> id) {
         const size_t r = id[0], i = id[1], p = r * C + i;
-        const float g = gate ? gate[(size_t) rows[r] * C + i] : 1.0f;
+        // a gate without a row table is one row of gates for every row (a per-channel scale)
+        const float g = gate ? gate[(rows ? (size_t) rows[r] : 0) * C + i] : 1.0f;
         store(x, x_dt, p, load(x, x_dt, p) + load(other, other_dt, p) * g);
     });
     return 0;

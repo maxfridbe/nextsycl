@@ -39,6 +39,9 @@ pub struct AudioRequest {
     /// speech, a multi-speaker script (an engine whose `Speech::speakers` is above 1): the other speakers' recordings,
     /// the second speaker's first
     pub references: Vec<Reference>,
+    /// a song made from a recording (an engine whose `sources` is true: a cover, a repaint or an extension, new words
+    /// over it): the recording, its channels kept
+    pub source: Option<Audio>,
 }
 
 /// A recording to clone a voice from: mono samples, their rate, and what is said in it (a transcript makes a
@@ -168,6 +171,15 @@ pub struct Audio {
 
 impl Audio {
     /// seconds of sound
+    /// the channels mixed to one
+    pub fn mono(&self) -> Vec<f32> {
+        let ch = self.channels.max(1) as usize;
+        if ch == 1 {
+            return self.samples.clone();
+        }
+        self.samples.chunks_exact(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect()
+    }
+
     pub fn seconds(&self) -> f64 {
         self.samples.len() as f64 / self.channels.max(1) as f64 / self.rate.max(1) as f64
     }
@@ -243,6 +255,11 @@ pub fn wav_stream_head(rate: u32, channels: u16) -> Vec<u8> {
 
 /// A WAV file's samples (PCM 8 / 16 / 24 / 32-bit or float 32 / 64; the channels mixed to mono) and their rate
 pub fn decode_wav(b: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
+    read_wav(b).map(|a| (a.mono(), a.rate))
+}
+
+/// A WAV file's sound, its channels kept (interleaved)
+pub fn read_wav(b: &[u8]) -> std::result::Result<Audio, String> {
     if b.len() < 12 || &b[..4] != b"RIFF" || &b[8..12] != b"WAVE" {
         return Err("not a WAV file".into());
     }
@@ -280,8 +297,8 @@ pub fn decode_wav(b: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
                     _ => return Err(format!("format {fmt} at {bits} bits: PCM or float expected")),
                 };
                 let w = bits / 8;
-                let samples = d.chunks_exact(w * ch).map(|f| f.chunks_exact(w).map(one).sum::<f32>() / ch as f32).collect();
-                return Ok((samples, rate as u32));
+                let samples = d.chunks_exact(w * ch).flat_map(|f| f.chunks_exact(w).map(one)).collect();
+                return Ok(Audio { rate: rate as u32, channels: ch as u16, samples });
             }
             _ => {}
         }
@@ -293,8 +310,13 @@ pub fn decode_wav(b: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
 /// A recording's samples (the channels mixed to mono) and their rate: WAV here, MP3 / FLAC / Ogg Vorbis / M4A (AAC)
 /// through symphonia
 pub fn decode_audio(b: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
+    read_audio(b).map(|a| (a.mono(), a.rate))
+}
+
+/// A recording's sound as `decode_audio` reads it, its channels kept (interleaved)
+pub fn read_audio(b: &[u8]) -> std::result::Result<Audio, String> {
     if b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WAVE" {
-        if let Ok(r) = decode_wav(b) {
+        if let Ok(r) = read_wav(b) {
             return Ok(r);
         }
     }
@@ -309,6 +331,7 @@ pub fn decode_audio(b: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
     let (id, mut rate) = (track.id, track.codec_params.sample_rate.unwrap_or(0));
     let mut dec = symphonia::default::get_codecs().make(&track.codec_params, &Default::default()).map_err(|e| format!("its codec: {e}"))?;
     let mut out = Vec::new();
+    let mut channels = 0usize;
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -324,9 +347,13 @@ pub fn decode_audio(b: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
                 let spec = *buf.spec();
                 rate = spec.rate;
                 let ch = spec.channels.count().max(1);
+                if channels != 0 && ch != channels {
+                    return Err(format!("its channels change ({channels} to {ch})"));
+                }
+                channels = ch;
                 let mut sb = SampleBuffer::<f32>::new(buf.capacity() as u64, spec);
                 sb.copy_interleaved_ref(buf);
-                out.extend(sb.samples().chunks_exact(ch).map(|f| f.iter().sum::<f32>() / ch as f32));
+                out.extend_from_slice(sb.samples());
             }
             // a damaged frame: skipped, as players do
             Err(E::DecodeError(_)) => continue,
@@ -336,7 +363,7 @@ pub fn decode_audio(b: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
     if out.is_empty() || rate == 0 {
         return Err("no samples in it".into());
     }
-    Ok((out, rate))
+    Ok(Audio { rate, channels: channels as u16, samples: out })
 }
 
 /// A WAV file's LIST INFO entries and its length in seconds (from the chunks ahead of its samples: what `Audio::wav`
@@ -409,6 +436,10 @@ pub trait AudioEngine: Send + Sync {
     fn defaults(&self) -> Defaults;
     /// whether it sings words (`AudioRequest::lyrics`)
     fn lyrics(&self) -> bool {
+        false
+    }
+    /// whether it makes a song from a recording (`AudioRequest::source`: a cover, a repaint, an extension)
+    fn sources(&self) -> bool {
         false
     }
     /// a speech engine's voices and abilities (None: not speech - songs, sounds)
@@ -513,6 +544,10 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert!((s[0] - 0.5).abs() < 1e-3 && (s[1] + 0.25).abs() < 1e-3);
         assert!((secs - 2.0 / 44100.0).abs() < 1e-9);
+        // or kept
+        let k = read_audio(&w).unwrap();
+        assert_eq!((k.rate, k.channels, k.samples.len()), (44100, 2, 4));
+        assert!((k.samples[1] - 1.0).abs() < 1e-3 && (k.samples[2] + 1.0).abs() < 1e-3);
     }
 
     #[test]

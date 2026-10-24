@@ -14,6 +14,8 @@ nextsycl audio gen \"<text to say>\" --model qwen3-tts-... [--voice NAME] [--lan
                    [--ref-audio FILE.wav [--ref-text TEXT]] [--cfg X] [--seconds N] [--seed N] [--out FILE|DIR]   (speech)
 nextsycl audio gen \"Speaker 1: ...\\nSpeaker 2: ...\" --model vibevoice-1.5b [--ref-audio S1.wav --ref-audio S2.wav ... |
                    --voices NAME,NAME ...]   (a multi-speaker script: a recording or saved voice a speaker, in order)
+nextsycl audio gen \"<description>\" --model acestep-1.5 --source FILE --opt-task cover | repaint | edit | lego [--opt-repaint-start S]
+                   [--opt-repaint-end S] [--opt-cover-strength X] [--opt-source-lyrics TEXT] ...   (a song made from a recording)
 nextsycl audio serve [MODEL] [--port 8087] [--host 127.0.0.1] [--gpu N | --gpus A,B] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl audio start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
 nextsycl audio voice list                                   the saved voices (spoken by name: --voice NAME, \"voice\": NAME)
@@ -34,7 +36,7 @@ nextsycl audio engines | selftest [--gpu N]";
 pub fn engines() -> Vec<nextsycl_audio::AudioKind> {
     vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_voxcpm2::kind(), nextsycl_audio_breezetts2::kind(),
          nextsycl_audio_vibevoice::kind(), nextsycl_audio_s2pro::kind(),
-         nextsycl_audio_voxtraltts::kind(), nextsycl_audio_whisper::kind(), nextsycl_audio_example::kind()]
+         nextsycl_audio_voxtraltts::kind(), nextsycl_audio_whisper::kind(), nextsycl_audio_acestep::kind(), nextsycl_audio_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -49,6 +51,8 @@ fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
         let whisper = std::fs::read_to_string(dir.join("config.json")).is_ok_and(|c| c.contains("\"model_type\": \"whisper\""));
         let (arch, files) = if whisper {
             (nextsycl_audio_whisper::ARCH, nextsycl_audio_whisper::files_in(dir).map_err(|e| e.0)?)
+        } else if dir.join("acestep-v15-turbo").is_dir() {
+            (nextsycl_audio_acestep::ARCH, nextsycl_audio_acestep::files_in(dir).map_err(|e| e.0)?)
         } else if let Ok(f) = nextsycl_audio_breezetts2::files_in(dir) {
             (nextsycl_audio_breezetts2::ARCH, f)
         } else if let Ok(f) = nextsycl_audio_vibevoice::files_in(dir) {
@@ -97,7 +101,10 @@ fn options(m: &Value, args: &[String]) -> Result<nextsycl_audio::LoadOptions, St
     }
     let ks = engines();
     let k = nextsycl_audio::kind_for(&ks, m["arch"].as_str().unwrap_or(""))?;
-    for (var, v) in super::opt_env(k.options, nextsycl_core::At::Load, k.name)? {
+    // the --opt-NAMEs for the load: a request's own (a song's bpm, task ...) are left for the request
+    let request_only = |n: &str| k.options.iter().any(|o| (o.name == n || o.env == n) && o.at == nextsycl_core::At::Request);
+    let load: nextsycl_core::options::Given = super::engine_opts().iter().filter(|(n, _)| !request_only(n)).map(|(a, b)| (a.clone(), b.clone())).collect();
+    for (var, v) in nextsycl_core::options::resolve(&load, k.options, nextsycl_core::At::Load, k.name)? {
         settings.insert(var, v);
     }
     Ok(nextsycl_audio::LoadOptions { settings })
@@ -208,7 +215,14 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         instructions: opt(args, "--instructions").map(str::to_string),
         reference,
         references,
+        source: match opt(args, "--source") {
+            Some(f) => Some(nextsycl_audio::read_audio(&std::fs::read(f).map_err(|e| format!("{f}: {e}"))?).map_err(|e| format!("{f}: {e}"))?),
+            None => None,
+        },
     };
+    if req.source.is_some() && !e.sources() {
+        return Err(format!("--source: {} makes no song from a recording (acestep does: --opt-task cover | repaint | edit)", e.arch()));
+    }
     let t0 = std::time::Instant::now();
     // frames a second of sound: speech 12.5 (S2 Pro 21.5), songs 25
     let fps = match e.arch() {
@@ -364,14 +378,18 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("ar,dit,voc").split(',').collect();
         let e = nextsycl_audio_minimaxmusic3::MiniMaxMusic3::load_on(&files, &gpus(args)?, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_minimaxmusic3::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_acestep::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("text,te,enc,velocity,sample,vae").split(',').collect();
+        let e = nextsycl_audio_acestep::AceStep::load(&files, &gpus(args)?, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_acestep::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else if m["arch"] == nextsycl_audio_whisper::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("mel,encoder,logits,transcribe").split(',').collect();
         let e = nextsycl_audio_whisper::Whisper::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_whisper::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {}, {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
+        return Err(format!("check knows {}, {}, {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
                            nextsycl_audio_voxcpm2::ARCH, nextsycl_audio_breezetts2::ARCH, nextsycl_audio_vibevoice::ARCH, nextsycl_audio_s2pro::ARCH,
-                           nextsycl_audio_voxtraltts::ARCH, nextsycl_audio_whisper::ARCH));
+                           nextsycl_audio_voxtraltts::ARCH, nextsycl_audio_whisper::ARCH, nextsycl_audio_acestep::ARCH));
     };
     println!("worst relative error {worst:.2e}");
     Ok(())

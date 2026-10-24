@@ -83,10 +83,37 @@ impl Home {
                 number(b, "seconds", 1.0, 600.0)?;
                 whole(b, "steps", 1, 200)?;
                 number(b, "cfg", 0.0, 30.0)?;
-                Ok(())
+                self.precheck_song(b, all)
             }
             _ => Ok(()),
         }
+    }
+
+    /// A song's task: one made from a recording needs the recording and a model that takes one (acestep)
+    fn precheck_song(&self, b: &Value, all: &[Value]) -> Result<(), Fail> {
+        let task = b["task"].as_str().or(b["options"]["task"].as_str()).unwrap_or("text2music");
+        if !["text2music", "cover", "repaint", "edit", "lego"].contains(&task) {
+            return Err(bad(format!("task {task}: text2music, cover, repaint, edit or lego")));
+        }
+        let has_audio = b["audio"].as_str().is_some_and(|a| !a.trim().is_empty());
+        if task != "text2music" && !has_audio {
+            return Err(bad(format!("task {task}: the recording to make it from (audio: base64, a data: URL or upload:<name>)")));
+        }
+        if task == "edit" && b["source_lyrics"].as_str().or(b["options"]["source-lyrics"].as_str()).is_none_or(|l| l.trim().is_empty()) {
+            return Err(bad("task edit: source_lyrics (the words the recording sings now)".into()));
+        }
+        for k in ["cover_strength", "cover_noise", "repaint_strength"] {
+            number(b, k, 0.0, 1.0)?;
+        }
+        number(b, "repaint_start", -600.0, 600.0)?;
+        number(b, "repaint_end", -1.0, 600.0)?;
+        if has_audio || task != "text2music" {
+            let id = self.pick("audio", b, all)?;
+            if all.iter().any(|m| m["id"] == id.as_str() && s(m, "arch") != "acestep") {
+                return Err(bad(format!("{id} makes no song from a recording: name a model that does (acestep-1.5)")));
+            }
+        }
+        Ok(())
     }
 
     fn precheck_image(&self, edit: bool, b: &Value, all: &[Value]) -> Result<(), Fail> {

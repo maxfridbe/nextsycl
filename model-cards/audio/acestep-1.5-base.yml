@@ -1,0 +1,84 @@
+# ACE-Step 1.5 base (lego: a track - the vocals - made in the context of a recording; 48 kHz stereo)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# License: Apache-2.0 (ACE-Step's weights and code; Qwen3-Embedding: Apache-2.0)
+id: acestep-1.5-base
+kind: audio
+arch: acestep
+title: 'ACE-Step 1.5 base (a track made in a recording''s context - the platform''s vocalize: vocals over an instrumental; 50 steps, real guidance; Apache-2.0)'
+about: 'ACE-Step''s 1.5 base DiT (not distilled: 50 steps, guidance 7 through APG) with the turbo''s text encoder and VAE, for lego: audio.generate task lego with audio (an instrumental), the track (vocals) sung to input over it; the planner LM not loaded'
+gpus: '1'
+vram_gib: 9.0                   # 6.2 GiB of weights; peak 8.8 GiB (60 s of vocals over an instrumental, the 5070)
+defaults:
+  seconds: 30.0
+  steps: 50
+  cfg: 7.0
+env:
+  NS_ACE_PLANNER: '0'
+files:
+  dit:
+    key: acestep15-base-dit
+    url: https://huggingface.co/ACE-Step/acestep-v15-base/resolve/e432212fec32b8965a14ffa57ae653438d6abd14/model.safetensors
+    size: 4787825604
+    sha256: 4177f600501a6d4bd81cadaa0abac557ffd15c54e5c8cb52053cdb24a0844d6b
+    path: acestep-1.5/acestep-v15-base/model.safetensors
+  dit_config:
+    key: acestep15-base-config
+    url: https://huggingface.co/ACE-Step/acestep-v15-base/resolve/e432212fec32b8965a14ffa57ae653438d6abd14/config.json
+    size: 1940
+    sha256: 9bb4f832f2e5e6c8bf7bddab3c6a6da1b13c01d072efbf0ed3c830536c473359
+    path: acestep-1.5/acestep-v15-base/config.json
+  silence:
+    key: acestep15-silence
+    url: https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-v15-turbo/silence_latent.pt
+    size: 3841215
+    sha256: a778e9dd942f5e8b2c09c55370782d318834432b03dabbcdf70e6ed49ad6358b
+    path: acestep-1.5/acestep-v15-turbo/silence_latent.pt
+  text_encoder:
+    key: acestep15-qwen3-embedding
+    url: https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/model.safetensors
+    size: 1191586416
+    sha256: 0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd
+    path: acestep-1.5/Qwen3-Embedding-0.6B/model.safetensors
+  text_config:
+    key: acestep15-qwen3-embedding-config
+    url: https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/config.json
+    size: 1359
+    sha256: bb23c1607cfe059a58d8f0196cf1cebb52082b1056b8e358a579da80a5759420
+    path: acestep-1.5/Qwen3-Embedding-0.6B/config.json
+  tokenizer:
+    key: acestep15-qwen3-embedding-tokenizer
+    url: https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/tokenizer.json
+    size: 11423705
+    sha256: def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a
+    path: acestep-1.5/Qwen3-Embedding-0.6B/tokenizer.json
+  vae:
+    key: acestep15-vae
+    url: https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/vae/diffusion_pytorch_model.safetensors
+    size: 337431388
+    sha256: da17edb604c40deaf09e9b24974e590d1ca83a374070e5d0884cfa4bed9a99b0
+    path: acestep-1.5/vae/diffusion_pytorch_model.safetensors
+  vae_config:
+    key: acestep15-vae-config
+    url: https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/vae/config.json
+    size: 425
+    sha256: 14e019904df567f26df750317a70e2bd08f9f8f3c40ff4a24c97d1cd3f20ccd2
+    path: acestep-1.5/vae/config.json
+  lm:
+    key: acestep15-lm-1.7b
+    url: https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/model.safetensors
+    size: 3708521528
+    sha256: f161689da73e5ecefa28ff780d51c2d92a00f056d021d7933c779ed5c6cd7db8
+    path: acestep-1.5/acestep-5Hz-lm-1.7B/model.safetensors
+  lm_config:
+    key: acestep15-lm-1.7b-config
+    url: https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/config.json
+    size: 1385
+    sha256: 73515ca4bfd86a5b56f28bf680311d1911e159c85d7f7ceb2188e310007c9010
+    path: acestep-1.5/acestep-5Hz-lm-1.7B/config.json
+  lm_tokenizer:
+    key: acestep15-lm-1.7b-tokenizer
+    url: https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/tokenizer.json
+    size: 24321939
+    sha256: 35af56c3f5cb3ea2cc578aa28a8937770981d504f183ac5c8c38baf4bbd4af4d
+    path: acestep-1.5/acestep-5Hz-lm-1.7B/tokenizer.json
+guide: guides/acestep.md

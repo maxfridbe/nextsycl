@@ -208,10 +208,24 @@ pub const METHODS: &[Method] = &[
     Method { kind: "image", name: "history", summary: "The pictures made, newest first, with their settings", fields: &[], example: "{}" },
     Method { kind: "image", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "qwen-image-2.1-q8"}"# },
 
-    Method { kind: "audio", name: "generate", summary: "A song from a description and lyrics (the model loads first if it must); the answer links the WAV",
-             fields: &[MODEL_OPT, ("instructions", "string", "the music: genre, mood, tempo, instruments, voice", true),
+    Method { kind: "audio", name: "generate", summary: "A song from a description and lyrics, or from a recording (acestep-1.5: a cover, a repaint or an extension, new words over it); the model loads first if it must; the answer links the WAV",
+             fields: &[MODEL_OPT, ("instructions", "string", "the music: genre, mood, tempo, instruments, voice (with audio it may be left out: the recording's sound is kept)", true),
                        ("input", "string", "the lyrics, [verse] / [chorus] tags on lines of their own (empty: instrumental)", false),
                        ("seconds", "number", "", false), ("seed", "integer", "", false), ("steps", "integer", "", false), ("cfg", "number", "", false),
+                       ("bpm", "integer", "acestep-1.5: the tempo (else the planner's, or none said)", false),
+                       ("key", "string", "acestep-1.5: key and scale, \"C major\", \"F# minor\"", false),
+                       ("time_signature", "string", "acestep-1.5: beats a bar: \"4\", \"3\", \"6\"", false),
+                       ("language", "string", "acestep-1.5: the lyrics' language as a code (en, zh, ja, es ...; default unknown)", false),
+                       ("task", r#"{"type": "string", "enum": ["text2music", "cover", "repaint", "edit", "lego"]}"#, "acestep-1.5: text2music (default: from the words alone); with audio - cover (the recording performed anew: input its words, instructions its sound), repaint (repaint_start to repaint_end made again; an end past the recording extends it), edit (new words sung over the recording: source_lyrics the words it sings now), lego (a vocal track over an instrumental: acestep-1.5-base)", false),
+                       ("audio", "string", "acestep-1.5, a task on a recording: the recording (WAV, MP3, FLAC, Ogg, M4A as base64 or a data: URL, or upload:<name> from audio.upload); the song is as long as it (repaint: to repaint_end)", false),
+                       ("cover_strength", "number", "cover / repaint: the share of the steps conditioned on the recording, 0 to 1 (0.5)", false),
+                       ("cover_noise", "number", "cover: how close the start is to the recording, 0 (from noise) to 1 (0)", false),
+                       ("repaint_start", "number", "repaint: seconds into the recording (0)", false),
+                       ("repaint_end", "number", "repaint: seconds; -1 or none: the recording's end; past it: the song extended to it", false),
+                       ("repaint_mode", r#"{"type": "string", "enum": ["balanced", "conservative", "aggressive"]}"#, "repaint: how much of the recording is kept at the span's edges (balanced)", false),
+                       ("repaint_strength", "number", "repaint, balanced: 0 keeps the most, 1 the least (0.5)", false),
+                       ("source_lyrics", "string", "edit: the words the recording sings now", false),
+                       ("planner", "boolean", "acestep-1.5 text2music: the 5 Hz planner LM writes the metas, the caption and the song's audio codes first (true, as the platform's use_lm)", false),
                        ("label", r#"{"type": "string", "maxLength": 120}"#, "names the job for <kind>.status and <kind>.cancel (default: its id)", false),
                        ("reentrant_id", r#"{"type": "string", "maxLength": 200}"#, "idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)", false),
                        ("wait", r#"{"type": "boolean", "default": true}"#, "true: answer when it ends (the job goes on if the call drops); false: answer at once with the job", false),
@@ -1397,8 +1411,8 @@ impl Home {
             if !matches!(ext.as_str(), "wav" | "mp3" | "flac" | "ogg" | "m4a") {
                 return Err((400, format!("name {raw:?}: a recording's name (wav, mp3, flac, ogg, m4a)")));
             }
-            let (samples, rate) = nextsycl_audio::decode_audio(&data).map_err(|e| (400, format!("data: {e}")))?;
-            let a = nextsycl_audio::Audio { rate, channels: 1, samples };
+            // kept as WAV, its channels kept (a song's source is stereo; a voice or a transcript mixes them when read)
+            let a = nextsycl_audio::read_audio(&data).map_err(|e| (400, format!("data: {e}")))?;
             (format!("{}.wav", clean.rsplit_once('.').map_or(clean.as_str(), |x| x.0)), a.wav(&[]))
         };
         let dir = self.out_dir(kind).join("uploads");
@@ -1419,6 +1433,7 @@ impl Home {
             "image.ocr" => ("image", &[("images", true)]),
             "audio.speak" => ("audio", &[("ref_audio", false), ("ref_audios", true)]),
             "audio.transcribe" => ("audio", &[("audio", false)]),
+            "audio.generate" => ("audio", &[("audio", false)]),
             "audio.voices.add" => ("audio", &[("sample", false)]),
             "model3d.generate" => ("model3d", &[("image", false), ("images", true)]),
             "image.upscale" | "image.vectorize" => ("image", &[("image", false)]),
