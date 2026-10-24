@@ -44,4 +44,6 @@ song is made in their shape. `planner: false` (option `planner 0`) skips it: fas
 | `edit` | new words (`input`) sung over the same recording | `source_lyrics` (the words it sings now), `edit_n_min` / `edit_n_max` (0 / 1) |
 | `lego` | (acestep-1.5-base) a track - the vocals - made over an instrumental, to be mixed back | `track` (vocals), `steps` (50), `cfg` (7) |
 
+**Not working on SYCL yet (2026-10-24):** the base checkpoint, so `lego` and base text-to-music, makes loud noise (rms 0.6, against 0.13 for the turbo; Whisper hears no speech) at any guidance, 50 steps. The turbo model - text2music, cover, repaint and edit - is checked on the B70. The latent statistics of both models match (final rms 1.03 / 1.06) and the planner is not the cause (turbo without it sings), so it is in how the base weights are driven; the next step is the reference's per-step dumps (`reference/acestep/ref.py`, `audio check --stages guided`).
+
 The song is as long as the recording (a repaint: to its end).

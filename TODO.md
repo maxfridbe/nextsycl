@@ -621,3 +621,5 @@ already wrote comes out near-certain because the model copies it, not because it
 ## Later
 
 - [ ] IQ3 variants of GLM (NOTES.md)
+
+- ACE-Step base checkpoint (acestep-1.5-base: lego, base text-to-music) makes noise on SYCL; turbo is fine. See model-cards/guides/acestep.md; needs the reference dumps to find it (audio check --stages guided).
