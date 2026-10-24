@@ -622,4 +622,13 @@ already wrote comes out near-certain because the model copies it, not because it
 
 - [ ] IQ3 variants of GLM (NOTES.md)
 
-- ACE-Step base checkpoint (acestep-1.5-base: lego, base text-to-music) makes noise on SYCL; turbo is fine. See model-cards/guides/acestep.md; needs the reference dumps to find it (audio check --stages guided).
+- ACE-Step base checkpoint (acestep-1.5-base: lego, base text-to-music) makes noise on SYCL; turbo is fine (2026-10-24).
+  - Symptom: 50 steps, any guidance (1, 3, 7): rms 0.6 (turbo 0.13), Whisper hears no speech. Lego is the base model with a source, so it fails too.
+  - Ruled out: guidance / the null pass (cfg 1 is noise too); the latents' scale (final rms 1.055 base vs 1.031 turbo, velocities 1.1-1.6 throughout); the planner
+    (turbo with it off still sings); the instruction text (built per task, as on CUDA); the two ported kernels (the turbo path runs them every step); buffer
+    aliasing between the conditional and null passes (`cond` allocates per layer); the schedule (1.0 -> 0.058 -> 0).
+  - Suspects, in order: the base checkpoint's config / tensors handled differently from turbo (the `turbo` flag branches in few places); something only the 50-step
+    sampler exercises (bf16 rounding over many steps); a latent bug in the turbo path 8 steps hide.
+  - Next: produce the reference's per-step dumps (`reference/acestep/ref.py` needs PyTorch + the ACE-Step package, not on hardac1) and compare layer by layer with
+    `nextsycl audio check <dump dir> --model acestep-1.5-base --stages guided`; the first diverging layer of the first step is the bug.
+  - Until then: cover, repaint and edit (turbo) are checked on the B70; lego and the base model are not (model-cards/guides/acestep.md says so).
