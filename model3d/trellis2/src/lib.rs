@@ -696,6 +696,9 @@ impl Model3dEngine for Trellis2 {
         self.load_s.max(self.loaded.elapsed().as_secs_f64().min(0.0))
     }
     fn generate(&self, req: &MeshRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Mesh> {
+        if req.mesh.is_some() {
+            return Err(Error("TRELLIS.2 paints the meshes it makes, not one it is given (hunyuan3d-2.1 or hunyuan3d-2.1-paint paint a mesh)".into()));
+        }
         let mut r = req.clone();
         if r.resolution.is_none() {
             r.resolution = Some(self.defaults().resolution);

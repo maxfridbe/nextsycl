@@ -377,8 +377,16 @@ fn fetch_tensors(url: &str, prefix: &str, out: &Path) -> Result<(), String> {
     if let Some(m) = head.get("__metadata__") {
         new.insert("__metadata__".into(), m.clone());
     }
-    // the header compact with its keys sorted (serde_json's map), padded to 8 bytes
-    let mut h = serde_json::to_string(&Value::Object(new)).map_err(|e| e.to_string())?;
+    // the header compact with its keys sorted at every level, padded to 8 bytes. Sorted here: the workspace's
+    // serde_json keeps insertion order (preserve_order), so its Map does not sort them itself
+    fn sorted(v: Value) -> Value {
+        match v {
+            Value::Object(m) => Value::Object(m.into_iter().collect::<BTreeMap<_, _>>().into_iter().map(|(k, v)| (k, sorted(v))).collect()),
+            Value::Array(a) => Value::Array(a.into_iter().map(sorted).collect()),
+            v => v,
+        }
+    }
+    let mut h = serde_json::to_string(&sorted(Value::Object(new))).map_err(|e| e.to_string())?;
     while h.len() % 8 != 0 {
         h.push(' ');
     }

@@ -153,6 +153,12 @@ const MOVE: &str = r#"{"type": "object", "properties": {"model": {"type": "strin
 
 pub fn result(method: &str) -> Option<String> {
     Some(match method {
+        "system.ping" => r#"{"type": "object", "required": ["available", "maintenance"], "properties": {
+  "available": {"type": "boolean", "description": "the control plane answered (always true in an answer: a client that gets none treats the box as away)"},
+  "maintenance": {"type": "boolean", "description": "the box is set aside (system.maintenance): it takes no new work, running work finishes"},
+  "reason": {"type": "string", "nullable": true, "description": "the maintenance notice's words; null when it is not in maintenance"},
+  "retry_after_s": {"type": "integer", "nullable": true, "description": "when to ask again (the notice's end, else 15 minutes)"},
+  "version": {"type": "string"}, "api": {"type": "integer"}, "at": {"type": "number", "description": "the box's clock, unix seconds"}}}"#.into(),
         "system.busy" => r#"{"type": "object", "required": ["busy"], "properties": {
   "busy": {"type": "boolean", "description": "anything below is true or non-empty"},
   "reasons": {"type": "array", "items": {"type": "string"}, "description": "what is working, in words"},

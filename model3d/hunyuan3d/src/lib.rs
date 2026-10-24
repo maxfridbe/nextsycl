@@ -22,6 +22,7 @@ pub mod flux;
 pub mod grid;
 pub mod ops;
 pub mod paint;
+pub mod painter;
 pub mod picture;
 pub mod prof;
 pub mod plain;
@@ -39,11 +40,13 @@ use crate::ops::{read_f32, Ops, Weights};
 
 pub const ARCH_21: &str = "hunyuan3d-2.1";
 pub const ARCH_MINI: &str = "hunyuan3d-2mini";
+/// 2.1's paint model alone (no shape model: a mesh from another engine, painted - the 12 GB cards' form)
+pub const ARCH_PAINT: &str = "hunyuan3d-2.1-paint";
 
 /// The files by role: `model` (the DiT file with its conditioner and VAE: Tencent's mini-turbo safetensors, or
 /// Comfy-Org's 2.1 repackage), `vae` (2mini: the turbo decoder), and the paint model's (2.1's textures: its UNet and
 /// VAE checkpoints, DINOv2-giant)
-pub const ROLES: &[&str] = &["model", "vae?", "paint-unet?", "paint-vae?", "paint-dino?", "remover?"];
+pub const ROLES: &[&str] = &["model?", "vae?", "paint-unet?", "paint-vae?", "paint-dino?", "remover?"];
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "tokens", env: "NS_M3D_HY_TOKENS", value: "N", help: "latent tokens of the shape (2mini 3072, 2.1 4096; Tencent's turbo example samples 512)", at: At::Both },
@@ -58,7 +61,7 @@ pub const OPTIONS: &[EngineOption] = &[
 /// This engine's registry entry
 pub fn kind() -> Model3dKind {
     Model3dKind {
-        archs: &[ARCH_21, ARCH_MINI],
+        archs: &[ARCH_21, ARCH_MINI, ARCH_PAINT],
         name: "Hunyuan3D (2.1: shape and PBR paint; 2mini-turbo: fast shape) - a mesh from a picture",
         roles: ROLES,
         load,
@@ -143,10 +146,25 @@ fn open(files: &ModelFiles, role: &str) -> Result<SafeTensors> {
 
 fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Model3dEngine>> {
     let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?;
+    if files.get("model").is_none() && files.get("paint-unet").is_some() {
+        return Ok(Box::new(painter::Painter::load(files, gpu, o, log)?));
+    }
     let model = open(files, "model")?;
     // the architecture by the file's tensors: the Flux-style DiT has double blocks
     let arch = if model.tensor("model.double_blocks.0.img_mod.lin.weight").is_some() { MINI } else { V21 };
     Ok(Box::new(Hunyuan3d::load(arch, files, &model, gpu, o, log)?))
+}
+
+/// 2.1's paint model from its three files by role (the UNet's and VAE's are PyTorch pickles, DINOv2-giant's safetensors)
+pub fn paint_from(files: &ModelFiles, gpu: &Arc<Gpu>, log: &mut dyn FnMut(String)) -> Result<paint::Paint> {
+    let open_any = |role: &str| -> Result<SafeTensors> {
+        let p = files.get(role).ok_or_else(|| Error(format!("no {role} file")))?;
+        let r = if p.extension().is_some_and(|e| e == "safetensors") { SafeTensors::open(p) } else { nextsycl_gguf::pth::open(p) };
+        r.map_err(|e| Error(e.0))
+    };
+    let (u, v, d) = (open_any("paint-unet")?, open_any("paint-vae")?, open_any("paint-dino")?);
+    paint::Paint::check_files(&u)?;
+    paint::Paint::load(&u, &v, &d, gpu, log)
 }
 
 impl Hunyuan3d {
@@ -185,15 +203,7 @@ impl Hunyuan3d {
         };
         let want_paint = o.setting("NS_M3D_HY_PAINT").is_none_or(|v| v != "0");
         let paint = match (files.get("paint-unet"), files.get("paint-vae"), files.get("paint-dino")) {
-            (Some(u), Some(v), Some(d)) if arch.name == ARCH_21 && want_paint => {
-                let open_any = |p: &std::path::Path| -> Result<SafeTensors> {
-                    let r = if p.extension().is_some_and(|e| e == "safetensors") { SafeTensors::open(p) } else { nextsycl_gguf::pth::open(p) };
-                    r.map_err(|e| Error(e.0))
-                };
-                let (u, v, d) = (open_any(u)?, open_any(v)?, open_any(d)?);
-                paint::Paint::check_files(&u)?;
-                Some(paint::Paint::load(&u, &v, &d, gpu, log)?)
-            }
+            (Some(_), Some(_), Some(_)) if arch.name == ARCH_21 && want_paint => Some(paint_from(files, gpu, log)?),
             _ => None,
         };
         let remover = match files.get("remover") {
@@ -392,6 +402,16 @@ impl Hunyuan3d {
     fn generate_timed(&self, req: &MeshRequest, progress: &mut dyn FnMut(Step) -> Result<()>, t0: Instant) -> Result<Mesh> {
         let mut report = |phase: &'static str, at: u32, of: u32| progress(Step { phase, at, of, seconds: t0.elapsed().as_secs_f64() });
         let view = req.views.first().ok_or_else(|| Error("no picture".into()))?;
+        if let Some(mesh) = &req.mesh {
+            // a mesh given: painted as it is, no shape made
+            let p = self.paint.as_ref().ok_or_else(|| Error(format!("{} has no paint model loaded (2.1 with its paint files): it cannot paint a mesh", self.arch.name)))?;
+            let steps = self.setting(req, "paint-steps", "NS_M3D_HY_PAINT_STEPS").map(|v| v.parse::<usize>().map_err(|_| Error(format!("paint-steps: {v}?")))).transpose()?.unwrap_or(15);
+            let size = req.texture_size.unwrap_or(2048).clamp(256, 8192);
+            let given = nextsycl_model3d::finish(mesh.clone(), Some(req.faces.unwrap_or(40_000)));
+            let painted = p.paint(&self.ops, &given, &view.image, req.seed, steps, size, None, &mut |ph, a, b| report(ph, a, b))?;
+            self.note_memory();
+            return Ok(nextsycl_model3d::finish(painted, None));
+        }
         if req.texture && self.paint.is_none() {
             return Err(Error(format!("{} has no paint model loaded (2.1 with its paint files: paint-unet, paint-vae, paint-dino): ask for the shape alone",
                                      self.arch.name)));

@@ -1,0 +1,32 @@
+# Hunyuan3D 2.1's paint model alone (a mesh from any engine - TRELLIS.2's, a file - painted like a picture, without
+# loading the shape model beside it)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: hunyuan3d-2.1-paint
+kind: model3d
+arch: hunyuan3d-2.1-paint
+title: Hunyuan3D 2.1 paint (PBR textures for a mesh, from a picture)
+about: 'Hunyuan3D 2.1''s paint model without its shape model: the 2.5D multiview UNet (Stable Diffusion 2.1 with material-aware, reference, multiview and DINOv2-giant attentions) draws six views of albedo and metallic-roughness in 15 UniPC steps, baked into a UV atlas. It makes no shape: model3d.generate with a mesh (or file) and a picture paints that mesh. The same files as hunyuan3d-2.1''s paint; a pull of both fetches them once.'
+gpus: '0'
+vram_gib: 0.0                   # measured on the box once it runs
+does: [texture, paint]
+env: {}
+files:
+  paint-unet:
+    key: hy3d-21-paint-unet
+    url: https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/hunyuan3d-paintpbr-v2-1/unet/diffusion_pytorch_model.bin
+    size: 3925293863
+    sha256: 675a1b5cd0098b2002637c443946529c03c5cd54427f40245263350feb3dd5b8
+    path: hunyuan3d21/hunyuan3d-paintpbr-v2-1/unet/diffusion_pytorch_model.bin
+  paint-vae:
+    key: hy3d-21-paint-vae
+    url: https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/hunyuan3d-paintpbr-v2-1/vae/diffusion_pytorch_model.bin
+    size: 334707217
+    sha256: 1b4889b6b1d4ce7ae320a02dedaeff1780ad77d415ea0d744b476155c6377ddc
+    path: hunyuan3d21/hunyuan3d-paintpbr-v2-1/vae/diffusion_pytorch_model.bin
+  paint-dino:
+    key: dinov2-giant
+    url: https://huggingface.co/facebook/dinov2-giant/resolve/611a9d42f2335e0f921f1e313ad3c1b7178d206d/model.safetensors
+    size: 4546005432
+    sha256: 917d3c470db999d32a312f8542149be91c7cbac61ee8fb4b67ae3d82b79ce21f
+    path: hunyuan3d21/dinov2-giant/model.safetensors
+guide: guides/hunyuan3d.md

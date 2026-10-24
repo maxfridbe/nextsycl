@@ -101,6 +101,8 @@ pub struct Home {
     seen: Mutex<BTreeMap<String, BTreeMap<usize, u64>>>,
     /// the requests sent on to each image and audio server and not answered yet, by its port
     pub(crate) inflight: Mutex<BTreeMap<u16, usize>>,
+    /// what each image, audio and 3D server last said of itself (model, loading, busy), by its port
+    answers: Mutex<BTreeMap<u16, (String, bool, bool)>>,
     /// image and audio requests as jobs (jobs.json beside serve.json)
     jobs: jobs::Jobs,
     /// a job's stage while its server is chosen, and what it waits for: job id -> (stage, waiting_for)
@@ -229,7 +231,7 @@ impl Home {
             o, token, state_file, jobs,
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
-            seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()), chat_keep: Mutex::new(BTreeMap::new()),
+            seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), answers: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()), chat_keep: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(Vec::new()), lock_paused: Mutex::new(None), progress: Mutex::new(BTreeMap::new()),
             maint_file, maint_bypass, disks: disks::Disks::new(&st),
         });

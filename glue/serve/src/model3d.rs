@@ -36,6 +36,15 @@ use crate::http::{self, Conn};
 use crate::serve::cors_headers;
 use crate::telemetry::Telemetry;
 
+/// Sets the progress back to not busy when dropped
+struct Idle<'a>(&'a Mutex<Value>);
+
+impl Drop for Idle<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = json!({"busy": false});
+    }
+}
+
 pub struct Model3dServer {
     /// the model id clients name
     pub model: String,
@@ -302,7 +311,9 @@ impl Model3dServer {
             .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect();
         // what comes in, read before the engine is taken (a bad picture fails at once)
         let views = if rig { Vec::new() } else { Self::views(b).map_err(bad)? };
-        let mesh_in = if rig {
+        // a mesh given to model3d.generate is painted (the pictures say how), not made
+        let paint_given = !rig && (b["mesh"].as_str().is_some_and(|m| !m.is_empty()) || b["file"].as_str().is_some_and(|m| !m.is_empty()));
+        let mesh_in = if rig || paint_given {
             let bytes = match (b["mesh"].as_str().filter(|m| !m.is_empty()), b["file"].as_str().filter(|m| !m.is_empty())) {
                 (Some(m), _) => http::unbase64(m).map_err(|e| bad(format!("mesh: {e}")))?,
                 (None, Some(f)) => {
@@ -336,6 +347,9 @@ impl Model3dServer {
         let what = if rig { b["prompt"].as_str().unwrap_or("rig").to_string() } else { format!("{} picture(s)", views.len()) };
         let p = &self.progress;
         *p.lock().unwrap() = json!({"busy": true, "prompt": what, "phase": "start", "at": 0, "of": 1, "seconds": 0});
+        // not busy again however this ends: a request refused below (texture on a shape-only model) left the server
+        // busy for good and the front door counted it working (2026-10-19)
+        let _idle = Idle(p);
         let mut report = |st: nextsycl_model3d::Step| {
             *p.lock().unwrap() = json!({"busy": true, "prompt": what, "phase": st.phase, "at": st.at, "of": st.of, "seconds": st.seconds});
             if self.cancel.stopping() {
@@ -358,8 +372,11 @@ impl Model3dServer {
             meta["frames"] = json!(req.frames.unwrap_or(d.frames));
             engine.rig(&req, &mut report)
         } else {
-            if !a.generate {
+            if !a.generate && !(paint_given && a.texture) {
                 return Err(bad(format!("{} rigs meshes; it does not make them (model3d.rig)", self.model)));
+            }
+            if paint_given && !a.texture {
+                return Err(bad(format!("{} has no paint model: it cannot paint a mesh (texture)", self.model)));
             }
             if views.is_empty() {
                 return Err(bad("image (a picture of the object) or images (several views): required".into()));
@@ -368,10 +385,13 @@ impl Model3dServer {
                 return Err(bad(format!("{} pictures: {} takes {} at most", views.len(), self.model, a.views.max(1))));
             }
             let texture = b["texture"].as_bool().unwrap_or(a.texture);
+            if paint_given && !texture {
+                return Err(bad("texture: false with a mesh given leaves nothing to do".into()));
+            }
             if texture && !a.texture {
                 return Err(bad(format!("texture: {} makes the shape alone (texture: false)", self.model)));
             }
-            let req = MeshRequest { views: views.iter().map(|v| v.0.clone()).collect(), texture, seed, steps: num("steps").map(|v| v as u32),
+            let req = MeshRequest { views: views.iter().map(|v| v.0.clone()).collect(), mesh: mesh_in, texture, seed, steps: num("steps").map(|v| v as u32),
                                     cfg: num("cfg").map(|v| v as f32), resolution: num("resolution").map(|v| v as u32), faces: num("faces").map(|v| v as u32),
                                     texture_size: num("texture_size").map(|v| v as u32), remove_background: b["remove_background"].as_bool(), extra };
             meta["texture"] = json!(texture);

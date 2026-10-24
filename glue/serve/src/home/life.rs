@@ -202,6 +202,13 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
                 if does("views") {
                     c.push("multi_view");
                 }
+                if does("paint") {
+                    c.push("paint");
+                }
+                methods.push("model3d.generate");
+            } else if does("paint") {
+                // a paint-only model: model3d.generate with a mesh (or file) paints it
+                c.extend(["texture", "paint"]);
                 methods.push("model3d.generate");
             }
             if does("rig") {
@@ -383,8 +390,12 @@ impl Home {
     /// sent on from here
     fn servers(&self, kind: &str) -> Vec<Slot> {
         self.slots(kind).into_iter().enumerate().map(|(slot, port)| {
-            let st = self.server_at(port);
             let sent = self.inflight.lock().unwrap().get(&port).copied().unwrap_or(0);
+            // a server with a request from here is working on it and may not answer until it is done: an image
+            // server mid-picture held system.state and system.busy for 6 s a server, past the platform's 8 s, and
+            // the box went "offline" for the start of every picture (2026-10-22) - what it said last, busy
+            let last = (sent > 0).then(|| self.answers.lock().unwrap().get(&port).cloned()).flatten();
+            let st = last.map(|(m, l, _)| (m, l, true)).or_else(|| self.server_at(port));
             Slot { slot, port, model: st.as_ref().map(|x| x.0.clone()), loading: st.as_ref().is_some_and(|x| x.1),
                    busy: st.as_ref().is_some_and(|x| x.2) || sent > 0 }
         }).collect()
@@ -434,7 +445,9 @@ impl Home {
         let t = Target::Tcp(format!("127.0.0.1:{port}"));
         let info = call_for(&t, "GET", "/api/info", None, 3).ok()?;
         let p = call_for(&t, "GET", "/api/progress", None, 3).unwrap_or(json!({}));
-        Some((s(&info, "model"), info["loading"] == true, p["busy"] == true || p["waiting"].as_u64().unwrap_or(0) > 0))
+        let st = (s(&info, "model"), info["loading"] == true, p["busy"] == true || p["waiting"].as_u64().unwrap_or(0) > 0);
+        self.answers.lock().unwrap().insert(port, st.clone());
+        Some(st)
     }
 
     /// The video daemon's engines (their model ids) and the ones loaded on a GPU, when it runs

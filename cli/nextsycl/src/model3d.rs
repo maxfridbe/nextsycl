@@ -9,7 +9,7 @@ use nextsycl_models::{config::Config, registry as models};
 use serde_json::Value;
 
 const USAGE: &str = "nextsycl model3d gen PICTURE [PICTURE[:SIDE]]... [--model ID] [--texture | --no-texture] [--seed N] [--steps N] [--cfg X]
-                   [--resolution N] [--faces N] [--texture-size N] [--keep-background] [--set NAME=VALUE]... [--opt-NAME VALUE]...
+                   [--resolution N] [--faces N] [--texture-size N] [--mesh FILE.glb|.obj (paint it like the picture; a model that paints)] [--keep-background] [--set NAME=VALUE]... [--opt-NAME VALUE]...
                    [--out FILE.glb|DIR] [--gpu N]                 a mesh from a picture (or several views: front, back, left, right)
 nextsycl model3d rig MESH.glb|.obj [--model ID] [--prompt \"the motion\"] [--frames N] [--fps X] [--seed N] [--out FILE.glb|DIR] [--gpu N]
                    a skeleton and skin weights (UniRig, RigNet), or motion from words (AnimateAnyMesh)
@@ -154,11 +154,16 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
         views.push(View { image: nextsycl_model3d::read_picture(&bytes).map_err(|e| format!("{path}: {e}"))?, side });
     }
-    let (m, e) = load(cfg, args, "generate")?;
+    // --mesh FILE.glb|.obj: paint that mesh (an engine that paints) instead of making a shape
+    let given = match opt(args, "--mesh") {
+        Some(f) => Some(nextsycl_model3d::read_mesh(&std::fs::read(f).map_err(|e| format!("{f}: {e}"))?).map_err(|e| format!("{f}: {e}"))?),
+        None => None,
+    };
+    let (m, e) = load(cfg, args, if given.is_some() { "texture" } else { "generate" })?;
     let a = e.abilities();
     let texture = if args.iter().any(|x| x == "--no-texture") { false } else { args.iter().any(|x| x == "--texture") || a.texture };
     let seed = seed(args)?;
-    let req = MeshRequest { views, texture, seed, steps: num(args, "--steps")?, cfg: num(args, "--cfg")?, resolution: num(args, "--resolution")?,
+    let req = MeshRequest { views, mesh: given, texture, seed, steps: num(args, "--steps")?, cfg: num(args, "--cfg")?, resolution: num(args, "--resolution")?,
                             faces: num(args, "--faces")?, texture_size: num(args, "--texture-size")?,
                             remove_background: Some(!args.iter().any(|x| x == "--keep-background")),
                             extra: nextsycl_core::options::by_name(super::engine_opts(), e.options()) };

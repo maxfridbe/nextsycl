@@ -33,6 +33,9 @@ pub struct View {
 pub struct MeshRequest {
     /// one picture, or several of the same object from different sides (an engine takes up to `Abilities::views`)
     pub views: Vec<View>,
+    /// a mesh to paint (an engine that paints: `Abilities::texture`) instead of a shape made from the pictures: the
+    /// pictures are what it is painted like
+    pub mesh: Option<Mesh>,
     /// textures too (base colour, metallic-roughness), when the engine paints them; false: the shape alone
     pub texture: bool,
     pub seed: u64,

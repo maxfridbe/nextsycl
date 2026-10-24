@@ -233,15 +233,20 @@ fn worker(cfg: &Config, args: &[String]) -> Result<(), String> {
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let current = Arc::new(AtomicU64::new(0));
     let cancel = Arc::new(AtomicBool::new(false));
+    // the job a cancel was asked for, kept: one asked before its job began (the model still loading, the job waiting
+    // here) is honoured when it begins - matched only against the running job, it was dropped, and the daemon sends a
+    // cancel once, so the clip rendered to the end
+    let cancel_for = Arc::new(AtomicU64::new(0));
     let abort = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<(u64, Value)>();
     {
-        let (current, cancel, abort) = (current.clone(), cancel.clone(), abort.clone());
+        let (current, cancel, cancel_for, abort) = (current.clone(), cancel.clone(), cancel_for.clone(), abort.clone());
         std::thread::spawn(move || {
             for line in std::io::stdin().lock().lines() {
                 let Ok(line) = line else { break };
                 let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
                 if let Some(j) = v.get("cancel").and_then(Value::as_u64) {
+                    cancel_for.store(j, Ordering::SeqCst);
                     if current.load(Ordering::SeqCst) == j {
                         cancel.store(true, Ordering::SeqCst);
                     }
@@ -305,6 +310,10 @@ fn worker(cfg: &Config, args: &[String]) -> Result<(), String> {
         };
         cancel.store(false, Ordering::SeqCst);
         current.store(job, Ordering::SeqCst);
+        // after `current` is set: a cancel landing in between is seen either here or by the reader (both SeqCst)
+        if cancel_for.load(Ordering::SeqCst) == job {
+            cancel.store(true, Ordering::SeqCst);
+        }
         let mut log = |l: String| {
             eprintln!("[job {job}] {l}");
             emit(json!({"event": "log", "job": job, "line": l}));

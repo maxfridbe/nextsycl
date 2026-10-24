@@ -7,7 +7,7 @@ title: Hunyuan3D 2.1 (a detailed mesh from a picture, with PBR textures)
 about: 'Tencent''s Hunyuan3D 2.1. Shape (Comfy-Org''s single-file repackage): DINOv2-Large at 518 px, the 3.0B HunYuanDiTPlain (21 blocks, U-ViT skips, MoE in the last 6) in 50 flow-matching steps with CFG 5 over 4,096 latent tokens, the ShapeVAE decoder, marching cubes. Paint: the 2.5D multiview UNet (Stable Diffusion 2.1 with material-aware, reference, multiview and DINOv2-giant attentions) draws six views of albedo and metallic-roughness in 15 UniPC steps, baked into a UV atlas. NS_M3D_HY_PAINT=0 loads the shape model alone.'
 gpus: '0'
 vram_gib: 21.0                  # its memory on the card when it runs (measured on a B70: 20.3 GiB at the peak, textured)
-does: [generate, texture]
+does: [generate, texture, paint]
 env: {}
 files:
   remover: birefnet             # the shared background remover (BiRefNet; defined in trellis2.yml)

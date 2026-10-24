@@ -792,6 +792,19 @@ pub fn own_vram_mb() -> u64 {
 /// A text as it is to be said: math and code symbols as words (a model reads "Q·K^T / √d_k" as noise - a voice
 /// looped on one such line), markdown's marks out, dashes and brackets as pauses
 pub fn speakable(text: &str) -> String {
+    // a script of "Speaker N:" lines (VibeVoice): each line its own, the breaks kept - joined, the speakers'
+    // lines read as one (the model said "Speaker" aloud)
+    let speaker_line = |l: &str| {
+        let l = l.trim_start().to_ascii_lowercase();
+        l.strip_prefix("speaker").is_some_and(|r| r.starts_with(char::is_whitespace) && r.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+    };
+    if text.lines().any(speaker_line) {
+        return text.lines().map(speakable_line).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
+    }
+    speakable_line(text)
+}
+
+fn speakable_line(text: &str) -> String {
     let c: Vec<char> = text.chars().collect();
     let word = |ch: char| ch.is_alphanumeric();
     let mut out = String::with_capacity(text.len() + 16);
@@ -872,6 +885,9 @@ mod tests {
         assert_eq!(s("**Bold** and `code` - done"), "Bold and code, done");
         assert_eq!(s("TCP/IP, 3-4 heads, snake_case"), "TCP slash IP, 3-4 heads, snake sub case");
         assert_eq!(s("Plain words stay plain."), "Plain words stay plain.");
+        // a speakers' script keeps its lines
+        assert_eq!(s("Speaker 1: a = b\n\nSpeaker 2: *yes*"), "Speaker 1: a equals b\nSpeaker 2: yes");
+        assert_eq!(s("one\ntwo"), "one two", "plain text is one line, as before");
     }
 
     use super::{gpu_failed, own_vram_mb, range};

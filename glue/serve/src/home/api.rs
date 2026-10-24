@@ -51,6 +51,8 @@ pub const METHODS: &[Method] = &[
     Method { kind: "system", name: "state", summary: "The box: the GPUs (memory by process and vouched for), every model's state, the front ends", fields: &[], example: "{}" },
     Method { kind: "system", name: "busy", summary: "Is anything working: a clip made or waiting to run, a picture, sound or chat answered, a model loading. video.accepts says whether video.generate starts a clip at once (else 409 busy without queue: true)",
              fields: &[], example: "{}" },
+    Method { kind: "system", name: "ping", summary: "Is the control plane here, and does it take work: `available` (it answered), `maintenance` and, when on, `reason` (the notice's words) and `retry_after_s`. Nothing is loaded or started: the cheap call a client makes before sending work and after an error",
+             fields: &[], example: "{}" },
     Method { kind: "system", name: "version", summary: "The release, the API's version, the kinds enabled, the features this build has (names a client can test for) and the methods callable now",
              fields: &[], example: "{}" },
     Method { kind: "system", name: "files.stat", summary: "A file an answer linked: its bytes and SHA-256 (to check a download), mtime, URL",
@@ -236,10 +238,12 @@ pub const METHODS: &[Method] = &[
              fields: &JOB_ID, example: r#"{"label": "theme-3"}"# },
     Method { kind: "audio", name: "describePromptGuideMD", summary: "How to prompt the model, as Markdown", fields: &[MODEL], example: r#"{"model": "minimax-music3"}"# },
 
-    Method { kind: "model3d", name: "generate", summary: "A mesh from a picture of an object, or several views of it (TRELLIS.2, Hunyuan3D, Pixal3D; the model loads first if it must): its shape and, with texture, PBR textures; the answer links the GLB. A job like image.generate (wait, reentrant_id, status, cancel)",
+    Method { kind: "model3d", name: "generate", summary: "A mesh from a picture of an object, or several views of it (TRELLIS.2, Hunyuan3D, Pixal3D; the model loads first if it must): its shape and, with texture, PBR textures - or, given a mesh (or file), that mesh painted like the picture; the answer links the GLB. A job like image.generate (wait, reentrant_id, status, cancel)",
              fields: &[MODEL_OPT, ("image", "string", "the picture: PNG, JPEG or WebP as base64, a data: URL or upload:<name> (model3d.upload); a transparent background is the object's outline, an opaque one is cut out (remove_background)", false),
                        ("images", r#"{"type": "array", "maxItems": 8, "items": {"oneOf": [{"type": "string"}, {"type": "object", "properties": {"image": {"type": "string"}, "side": {"type": "string", "description": "front, back, left, right, top, bottom, or an azimuth in degrees"}}}]}}"#, "several views of the object (a multi-view model: model3d.info's abilities.views); each a picture or {image, side}", false),
                        ("texture", "boolean", "PBR textures too (base colour, metallic-roughness); default: what the model does (model3d.info)", false),
+                       ("mesh", "string", "a mesh to paint instead of making one (a model whose card says paint: Hunyuan3D 2.1, hunyuan3d-2.1-paint): a GLB or OBJ as base64 or a data: URL; image says how it is painted", false),
+                       ("file", "string", "or a GLB made here to paint (its file name or url), as mesh", false),
                        ("seed", "integer", "", false), ("steps", "integer", "denoising steps of each stage", false), ("cfg", "number", "guidance", false),
                        ("resolution", "integer", "the shape's grid / octree resolution: detail against time and memory", false),
                        ("faces", "integer", "at most this many triangles (decimated to it)", false), ("texture_size", "integer", "the texture's side in texels", false),
@@ -380,7 +384,7 @@ const API_VERSION: u32 = 3;
 
 /// What this build does, by names a client can test for (system.version); names are added, never reused
 const FEATURES: &[&str] = &[
-    "system.busy", "system.busy.cards", "system.busy.slots", "system.version", "system.files.stat", "system.files.delete",
+    "system.busy", "system.busy.cards", "system.busy.slots", "system.ping", "system.version", "system.files.stat", "system.files.delete",
     "jobs.image", "jobs.audio", "jobs.cancel.label", "reentrant_id",
     "video.frames", "video.chain", "video.priority", "video.cancel.label", "video.queue.move", "video.queue.remove", "video.engines.inputs",
     "video.negative_prompt.ignored", "image.canvases", "image.cancel", "spec.open",
@@ -836,6 +840,14 @@ impl Home {
         match (m.kind, m.name) {
             ("system", "state") => Ok(self.state()),
             ("system", "busy") => Ok(self.busy(&all)),
+            ("system", "ping") => {
+                let n = self.maintenance().map(|n| super::maint::public(&n));
+                Ok(json!({"available": true, "maintenance": n.is_some(),
+                          "reason": n.as_ref().and_then(|n| n["message"].as_str()).filter(|m| !m.trim().is_empty()).map(str::to_string)
+                                      .or_else(|| n.as_ref().map(|_| "maintenance".to_string())),
+                          "retry_after_s": n.as_ref().and_then(|n| n["retry_after_s"].as_u64()),
+                          "version": crate::VERSION, "api": API_VERSION, "at": now()}))
+            }
             ("system", "version") => {
                 let on = self.kinds_on(&all);
                 let methods: Vec<String> = METHODS.iter().filter(|m| on.contains(&m.kind)).map(|m| format!("{}.{}", m.kind, m.name)).collect();
@@ -959,7 +971,10 @@ impl Home {
             ("model3d", "generate" | "rig") => {
                 // a model that does it: the one named, else the loaded or first enabled one whose card says so (rig: a
                 // rigger or an animator)
-                let want = if m.name == "rig" { "rig" } else { "generate" };
+                // (a mesh given to model3d.generate is painted: a model whose card says paint - one that textures what it
+                // makes need not paint a mesh it is given: TRELLIS.2 would make a new one)
+                let painting = m.name == "generate" && ["mesh", "file"].iter().any(|k| b[*k].as_str().is_some_and(|v| !v.is_empty()));
+                let want = if m.name == "rig" { "rig" } else if painting { "paint" } else { "generate" };
                 let able = |m: &Value| m["does"].as_array().is_none_or(|a| a.iter().any(|x| x == want || (want == "rig" && x == "animate")));
                 let id = match b["model"].as_str().filter(|x| !x.is_empty()) {
                     Some(_) => self.pick("model3d", b, &all)?,
@@ -1419,7 +1434,8 @@ impl Home {
                 need("model3d")?;
                 let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
                 let named = body["model"].as_str().filter(|n| all.iter().any(|m| m["id"] == *n)).map(str::to_string);
-                let want = if p.ends_with("/rig") { "rig" } else { "generate" };
+                let painting = !p.ends_with("/rig") && ["mesh", "file"].iter().any(|k| body[*k].as_str().is_some_and(|v| !v.is_empty()));
+                let want = if p.ends_with("/rig") { "rig" } else if painting { "paint" } else { "generate" };
                 let id = match named {
                     Some(n) => self.pick("model3d", &json!({"model": n}), &all)?,
                     None => all.iter().filter(|m| registry::kind_of(m) == "model3d" && m["enabled"] != false)

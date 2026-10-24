@@ -42,9 +42,25 @@ const LAT: usize = SIZE / 8;
 const RENDER: usize = 2048;
 const GUIDANCE: f32 = 3.0;
 const DINO_SIZE: usize = 224;
-/// arena sizes: a pass's kept maps and a block's temporaries
+/// arena sizes: a pass's kept maps and a block's temporaries. What a 24 GB card is given; a smaller card gets shares of
+/// what it has free (an arena past its size spills to plain allocations: slower, not wrong), NS_M3D_HY_PAINT_KEEP_MIB
+/// and NS_M3D_HY_PAINT_TMP_MIB set them
 const KEEP: usize = 3 << 30;
 const TMP: usize = 4 << 30;
+
+/// (kept, temporaries) in bytes for a card with `free` bytes now: the full sizes when they leave a quarter of the card,
+/// else 30 % and 45 % of it
+fn arena_sizes(free: Option<u64>) -> (usize, usize) {
+    let var = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok()).map(|m| m << 20);
+    let (mut keep, mut tmp) = (KEEP, TMP);
+    if let Some(f) = free.map(|f| f as usize) {
+        if (KEEP + TMP) * 4 > f * 3 {
+            keep = f * 30 / 100;
+            tmp = f * 45 / 100;
+        }
+    }
+    (var("NS_M3D_HY_PAINT_KEEP_MIB").unwrap_or(keep), var("NS_M3D_HY_PAINT_TMP_MIB").unwrap_or(tmp))
+}
 
 pub struct Paint {
     pub unet: Unet,
@@ -56,6 +72,8 @@ pub struct Paint {
     /// the learned text embeddings: albedo, metallic-roughness, the reference's [77, 1024] half
     text: [DevBuf; 3],
     pub bytes: usize,
+    /// the last run's arenas: (kept peak, temporaries peak, spills), bytes
+    pub last_arenas: std::sync::Mutex<(usize, usize, usize)>,
 }
 
 /// What a texture run makes along the way (for `check` and for looking at)
@@ -94,7 +112,7 @@ impl Paint {
         let bytes = uw.bytes.get() + dw.bytes.get() + vw.bytes.get() + gw.bytes.get();
         log(format!("paint: loaded in {:.1} s ({:.2} GiB of weights: the 2.5D UNet and its reference UNet, the VAE, DINOv2-giant)",
                     t0.elapsed().as_secs_f64(), bytes as f64 / (1u64 << 30) as f64));
-        Ok(Paint { unet: main, dual, vae, dino, proj, proj_norm, text, bytes })
+        Ok(Paint { unet: main, dual, vae, dino, proj, proj_norm, text, bytes, last_arenas: Default::default() })
     }
 
     /// DINOv2-giant's last hidden state of the picture (8-bit values [512, 512, 3]): float32 [257, 1536]
@@ -233,7 +251,8 @@ impl Paint {
     #[allow(clippy::too_many_arguments)]
     pub fn paint(&self, ops: &Ops, mesh: &Mesh, picture: &Texture, seed: u64, steps: usize, tsize: u32, trace: Option<&mut Trace>,
                  progress: &mut dyn FnMut(&'static str, u32, u32) -> Result<()>) -> Result<Mesh> {
-        let mem = Mem::new(&ops.gpu, KEEP, TMP)?;
+        let (keep, tmp) = arena_sizes(ops.gpu.memory().ok().and_then(|(_, free)| free));
+        let mem = Mem::new(&ops.gpu, keep, tmp)?;
         progress("views", 0, 1)?;
         let scene = render::Scene::new(mesh);
         let (normal, position) = maps(&scene);
@@ -296,6 +315,8 @@ impl Paint {
         if let Some(t) = trace {
             *t = Trace { normal, position, picture: pic, views };
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        *self.last_arenas.lock().unwrap() = (mem.keep.peak.load(Relaxed), mem.tmp.peak.load(Relaxed), mem.keep.spills.load(Relaxed) + mem.tmp.spills.load(Relaxed));
         Ok(m)
     }
 }
