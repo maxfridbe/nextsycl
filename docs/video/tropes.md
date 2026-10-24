@@ -121,3 +121,18 @@ sheets, the judge was a little generous on the prop: the reference box has a fiv
 six- or eight-pointed one, and the latch the picture shows reads as a hinge. It is the same kind of box, in the same wood and
 light, but not the same inlay; a stricter question (count the star's points) would score it lower. The woman, the attic and the
 grade held across all three shots, and the shot size went medium, macro, close as scripted. T30 is not run yet.
+
+Two things the first run missed, found by looking and listening rather than by the judge:
+
+- **Sound.** Each clip's sound was generated alone, so the melody did not go on across the cut and take 3 began near silent
+  before a burst (-46 dB, then -17 dB). Every clip after the first now carries the sound of the one before it
+  (`first_audio`, the last 22 frames' worth, no picture carried so a plain cut plays nothing twice): take 3 then holds -24 to
+  -26 dB throughout. Whether it is the same melody is judged by ear.
+- **Three hands.** The macro prompt said the box was "held in two hands" and then that "the hands lift its lid"; the model drew a
+  third. The prompt now says the box rests in one open palm and the thumb of her other hand lifts the lid: two hands in
+  every frame. The judge had passed the three-hands take on its own prompts (nothing asked about hands); anatomy
+  questions (hands in each clip; one body each in T30) are now judged too, and they did flag the three-hands take 1/5, though
+  they passed the first run's take 2, which on a second look also had an extra hand. A model judge misses things; look at
+  the sheets.
+
+The lid's star is still not the reference's: five points in the picture, six to eight in the clips.

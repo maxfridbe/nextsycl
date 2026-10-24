@@ -9,6 +9,9 @@ consistency across the dimensions docs/video/tropes.md names.
                                 the train leaves with her alone on the platform (wide): two faces and two voices, one
                                 station, and the two people looking at each other across the cut
 
+Every clip after the first carries the sound of the one before it (first_audio, its last 22 frames' worth): the room tone, the
+music, the idling engine go on across the cut instead of starting again from nothing.
+
 Made as harbour_dialogue.py makes a scene (docs/video/scenes.md S2, S3, S13): pictures are references, not composites - a
 place, a character sheet for each person, a prop - and every clip is Ref2VA with the pictures it needs and, for a person
 who speaks, that person's voice sample; one speaker a shot; warm light; each line's clip sized to the line.
@@ -65,6 +68,10 @@ def shot(action, sound, music="None."):
 
 
 # ---- T14: the mystery object -------------------------------------------------------------------------------------------
+ANAT_HANDS = ("Each image is one frame of a film shot. A person has two hands. Count the human hands and forearms visible in each image. Score 5 "
+         "if no image shows more than two hands, 1 if any image shows three or more hands or an extra arm that cannot belong to the same person.")
+ANAT_BODY = ("Each image is one frame of a film shot. Check each person's body: two arms, two hands, one head, no extra or missing limbs, no second "
+             "face. Score 5 if every person in every image is anatomically plausible, 1 if any has an extra limb, a missing limb or a doubled face.")
 BOX = "a small antique music box of dark walnut with a mother-of-pearl star inlaid in the lid and brass hinges"
 T14 = {
     "title": "the mystery object",
@@ -82,8 +89,9 @@ T14 = {
               "lifts out the music box <Picture 3> with both hands and holds it up in the golden light, studying it with curiosity. "
               f"{LOCK}", "Old wood creaking, a soft hush of dust, her breath.")),
         ("open", "REF2VA", ["musicbox", "attic"], 5.0,
-         shot("An extreme close-up, filling the frame: the music box <Picture 1> held in two hands in the golden light of <Picture 2>; "
-              "the hands lift its lid, the mother-of-pearl star inlay gleams, the tiny brass comb and cylinder begin to turn. "
+         shot("An extreme close-up, filling the frame: the music box <Picture 1> rests in the open palm of one hand in the golden light of <Picture 2>, "
+              "and the thumb of her other hand lifts its lid - only two hands, one person's. The mother-of-pearl star inlay gleams, the tiny brass comb and "
+              "cylinder begin to turn. "
               f"{LOCK}", "A delicate, slightly out-of-tune music-box melody begins, close and clear, with the small ticking of its gears.")),
         ("listen", "REF2VA", ["sheet_mara", "attic", "musicbox"], 5.0,
          shot("A medium close-up, head and shoulders: the woman from the character sheet <Picture 1> in the attic of <Picture 2> holds "
@@ -103,6 +111,9 @@ T14 = {
          "looks cold or differently graded.", [("find", 0.5), ("open", 0.5), ("listen", 0.5)]),
         ("D8 scale: wide, then macro, then close", "The script says: image 1 a medium shot, image 2 an extreme close-up of the music box, "
          "image 3 a medium close-up of her face. Does the shot size go that way?", [("find", 0.5), ("open", 0.5), ("listen", 0.5)]),
+        ("D1 anatomy: the find shot has two hands", ANAT_HANDS, [("find", 0.2), ("find", 0.5), ("find", 0.8)]),
+        ("D1 anatomy: the macro has two hands", ANAT_HANDS, [("open", 0.05), ("open", 0.3), ("open", 0.45), ("open", 0.7)]),
+        ("D1 anatomy: the close-up has two hands", ANAT_HANDS, [("listen", 0.2), ("listen", 0.6), ("listen", 0.9)]),
         ("D10 performance: she is moved", "Image 1 and image 2 are the start and end of one shot. Does the woman's expression move from "
          "attentive to moved (softer, eyes glistening)?", [("listen", 0.1), ("listen", 0.9)]),
     ],
@@ -160,6 +171,7 @@ T30 = {
          "woman should face right and in image 2 the man should face left. Does that hold?", [("she", 0.5), ("he", 0.5)]),
         ("D2 prop: the same train", "Image 1 is a reference picture of a green steam locomotive; image 2 is a shot of a film. Is the "
          "train in image 2 the same locomotive (green, brass fittings, red wheels)?", [("@train", 0), ("away", 0.3)]),
+        ("D1 anatomy: one body each", ANAT_BODY, [("she", 0.2), ("she", 0.6), ("he", 0.2), ("he", 0.6), ("away", 0.3), ("away", 0.7)]),
         ("D10 performance: the goodbye reads", "Images 1, 2 and 3 are the shots of a farewell. Does the emotion read as a tender goodbye "
          "(her glistening eyes, his kind nod, her alone and waving at the end)?", [("she", 0.7), ("he", 0.7), ("away", 0.8)]),
     ],
@@ -239,7 +251,7 @@ def make(api, a, key, root):
         report["voices_hz"] = pitches
         print(f"[{key}] voices: pitch {pitches}", flush=True)
 
-    t0, local, frames_of = time.time(), [], {}
+    t0, local, prev_name = time.time(), [], None
     for i, c in enumerate(t["clips"], 1):
         if len(c) == 5:   # T14: no speech
             cid, engine, refs, secs, prompt = c
@@ -254,6 +266,8 @@ def make(api, a, key, root):
         auds = [files[r[1:]] for r in refs if r.startswith("@voice")]
         if auds:
             body["ref_audios"] = auds
+        if prev_name:   # the sound goes on across the cut: the last 22 frames' worth of the clip before (no picture is carried, so a plain cut plays nothing twice)
+            body |= {"first_audio": prev_name, "first_audio_s": round(22 / FPS, 4)}
         if upscale > 1:
             body |= {"upscale": upscale, "upscaler": "esrgan-general"}
         t1 = time.time()
@@ -266,6 +280,7 @@ def make(api, a, key, root):
             print(f"{body['label']}: queued ({nf} frames{', ' + str(len(line.split())) + ' words' if line else ''})", flush=True)
             name = K.wait_clip(api, project, i, body["label"])
             dst = api.get(f"/v1/video/files/{name}", dst)
+        prev_name = name if not (a.reuse and name == dst.name) else None
         p = K.probe(dst)
         H.sheet(dst, out / f"{i:02}_{cid}.png")
         row = {"file": name, "frames": p["frames"], "asked": nf, "width": p["width"], "height": p["height"], "audio": p["audio"],
