@@ -24,7 +24,7 @@ async function open(row: ListRow): Promise<void> {
     return;
   }
   const name = row.file.replace(/\.mp4$/, "");
-  state.video = { file: row.file, poster: `/thumb/${name}.webp`, playing: false };
+  state.video = { file: row.file, poster: `thumb/${name}.webp`, playing: false };
   state.detail = { kind: "job", name, data: await api.job(name) };
   render();
 }

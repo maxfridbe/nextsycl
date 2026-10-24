@@ -19,7 +19,15 @@ export function Films() {
             <tr><th>film</th><th class="num">length</th><th class="num">MB</th><th /></tr>
           </thead>
           <tbody>
-            {films.length === 0
+            {state.joins.filter((j) => j.state === "running" || (j.state === "failed" && !films.some((f) => f.file === j.file))).map((j) => (
+              <tr>
+                <td class="lab">{j.file}</td>
+                <td class="hint" attrs={{ colspan: 3, title: j.message }}>
+                  {j.state === "running" ? `joining ${j.clips} clips of ${j.project}…` : `join failed: ${j.message}`}
+                </td>
+              </tr>
+            ))}
+            {films.length === 0 && !state.joins.some((j) => j.state === "running")
               ? <tr><td attrs={{ colspan: 4 }} class="hint">no joined films yet</td></tr>
               : films.map((f) => (
                 <tr
@@ -31,7 +39,7 @@ export function Films() {
                   <td class="num">{f.mb}</td>
                   <td>
                     <a
-                      attrs={{ href: `/out/${encodeURIComponent(f.file)}`, download: true, title: "download" }}
+                      attrs={{ href: `out/${encodeURIComponent(f.file)}`, download: true, title: "download" }}
                       on={{ click: (e: Event) => e.stopPropagation() }}
                     >
                       <span class="i dim" props={{ innerHTML: "&#xf019;" }} />

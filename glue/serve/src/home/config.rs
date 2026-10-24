@@ -28,6 +28,8 @@ pub const SETTINGS: &[Setting] = &[
     st("NS_MODEL_DIRS", "box", "", "more models folders, one a drive (commas): where a model moved to that drive goes (else <mount>/nextsycl-models); NS_MODELS is one already", &["serve", "cli"]),
     st("NS_REGISTRY", "box", "~/.config/nextsycl/models.json", "the model registry (nextsycl models)", &["serve", "switch", "studio", "llm", "image", "audio", "video", "model3d"]),
     st("NS_MODEL_CARDS", "box", "model-cards beside the program, else in the repository", "the model cards: the models nextsycl models search | pull offer, their prompt guides", &["cli", "serve"]),
+    // read on every request (pulls.rs): the page's checkbox takes effect without a restart, so no reader restarts
+    st("NS_AUTO_PULL", "box", "0", "1: a request for a model a card offers that is not downloaded starts its download and waits for it (a job says downloading <model>: N%); 0: it is refused 409 model_not_downloaded, with the call that fetches it (system.models.pull)", &[]),
     st("NS_SOCKET_DIR", "box", "$XDG_RUNTIME_DIR/nextsycl", "where the control sockets live", &["serve", "llm", "video", "studio"]),
     st("NS_IMAGE", "box", "localhost/nextsycl-build", "the container image with the oneAPI runtime", &["llm", "image", "audio", "video", "model3d"]),
     st("NS_CONTAINER_ENGINE", "box", "podman", "podman or docker", &["llm", "image", "audio", "video", "model3d"]),
@@ -100,7 +102,7 @@ fn valid_name(k: &str) -> bool {
 }
 
 /// `NAME=value` lines of a settings text, in order (comments and blanks left out)
-fn entries(text: &str) -> Vec<(String, String)> {
+pub(super) fn entries(text: &str) -> Vec<(String, String)> {
     text.lines().filter_map(|l| {
         let l = l.trim();
         if l.is_empty() || l.starts_with('#') {
@@ -179,7 +181,7 @@ fn readers(name: &str) -> Vec<&'static str> {
 }
 
 impl Home {
-    fn conf_path(&self) -> std::path::PathBuf {
+    pub(super) fn conf_path(&self) -> std::path::PathBuf {
         let p = self.o.cfg.file();
         std::fs::canonicalize(&p).unwrap_or(p)
     }

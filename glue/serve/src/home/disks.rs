@@ -50,7 +50,7 @@ fn holds(state: &str) -> Option<&'static str> {
 
 impl Home {
     /// The models folders set (NS_MODELS, NS_MODEL_DIRS)
-    fn folders(&self) -> Vec<PathBuf> {
+    pub(super) fn folders(&self) -> Vec<PathBuf> {
         drives::folders(self.o.cfg.get("NS_MODELS"), self.o.cfg.get("NS_MODEL_DIRS"))
     }
 

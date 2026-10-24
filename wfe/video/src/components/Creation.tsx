@@ -1,10 +1,11 @@
 /** Everything to do with making a new clip. Deliberately separate from Jobs. */
 import { jsx } from "../jsx.js";
 import { rpc } from "../api.js";
-import { render, state } from "../state.js";
+import { load, refresh, render, save, state } from "../state.js";
 import { navigate } from "../router.js";
-import type { Engine, GenerateRequest } from "../types.js";
-import { CanvasPicker } from "./CanvasPicker.js";
+import type { Canvas, Engine, GenerateRequest } from "../types.js";
+import { CanvasPicker, estimate } from "./CanvasPicker.js";
+import { ClipProgress } from "./Progress.js";
 import { Panel } from "./Panel.js";
 
 interface Form {
@@ -67,6 +68,23 @@ export const form: Form = {
   controlStrength: 1,
 };
 
+/** The settings a reload keeps (canvas, length, steps, engine, ...): the last ones used, in localStorage. References and
+ *  controls are left out - they name uploads that may be gone. */
+const KEPT = ["prompt", "seconds", "steps", "seed", "te", "width", "height", "engine", "upscale", "upscaler", "sampler",
+              "schedule"] as const;
+
+function remember(): void {
+  save("h3form", Object.fromEntries(KEPT.map((k) => [k, form[k]])));
+}
+
+{
+  const saved = load<Record<string, unknown>>("h3form", {});
+  const f = form as unknown as Record<string, unknown>;
+  // only a value of the default's type: a stale or hand-edited entry cannot break the form
+  for (const k of KEPT) if (saved && typeof saved[k] === typeof f[k]) f[k] = saved[k];
+  if (form.engine === ("Q8_0" as Engine)) form.engine = "INT8";
+}
+
 /** Fill the form from an existing job - the "use these settings" path. */
 export function useSettings(j: GenerateRequest): void {
   if (j.prompt && j.prompt !== "(recovered)") form.prompt = j.prompt;
@@ -92,10 +110,15 @@ export function useSettings(j: GenerateRequest): void {
   form.controlStrength = j.control_strength ?? 1;
   form.label = j.label ?? "";
   form.chain = !!j.first_frame;
+  remember();
   navigate({ tab: "create" });
 }
 
-async function generate(queue: boolean): Promise<void> {
+/** Make the clip: now if the GPU is free, else at the back of the queue (the server's queue:true - without it, a busy
+ *  GPU refused the request, which was all a separate Queue button had added) */
+async function generate(): Promise<void> {
+  form.engine = readyEngine();
+  remember();
   const body: GenerateRequest = {
     prompt: form.prompt,
     seconds: form.seconds,
@@ -109,7 +132,7 @@ async function generate(queue: boolean): Promise<void> {
     upscale: form.upscale,
     upscaler: form.upscaler,
     chain_mode: "png",
-    queue,
+    queue: true,
   };
   if (form.sampler) body.sampler = form.sampler;
   if (form.schedule) body.schedule = form.schedule;
@@ -127,13 +150,39 @@ async function generate(queue: boolean): Promise<void> {
   }
   if (form.controlVideo || form.controlMask) body.control_strength = form.controlStrength;
   if (form.chain) body.first_frame = "prev";
+  submitted = "sending…";
+  render();
   try {
-    await rpc("generate", body);
+    const r = await rpc("generate", body);
+    submitted = r.queued ? `queued at position ${r.position ?? "?"}` : "started";
     state.error = null;
   } catch (e) {
+    submitted = "";
     state.error = String(e);
   }
-  render();
+  await refresh();
+}
+
+/** What the last Generate did ("started", "queued at position 2"): the click answered on the page itself */
+let submitted = "";
+
+/** The denoiser the form names, if this box has it; else the plan's default, else the first it has (the form starts
+ *  on INT8, and a box with only Q4_K_M sent INT8 jobs the engine could not run) */
+function readyEngine(): Engine {
+  const ready = (state.plan?.engines ?? []).filter((e) => e.ready).map((e) => e.quant);
+  if (!ready.length || ready.includes(form.engine)) return form.engine;
+  const d = state.plan?.defaults.engine;
+  return (d && ready.includes(d) ? d : ready[0]!) as Engine;
+}
+
+/** The canvas table's estimate for the form as it stands: null when the plan has not loaded */
+function fitNow() {
+  const plan = state.plan;
+  const want = readyEngine();
+  const e = plan?.engines.find((x) => x.ready && x.quant === want);
+  if (!plan || !e) return null;
+  const canvas = { width: form.width, height: form.height } as Canvas;
+  return { est: estimate(plan, canvas, e, form.seconds, form.steps), cap: plan.cap_gib, margin: plan.margin_gib };
 }
 
 const num = (
@@ -144,7 +193,7 @@ const num = (
     {label}
     <input
       attrs={{ type: "number", min, max, step, value: String(form[key]) }}
-      on={{ input: (e: Event) => { form[key] = Number((e.target as HTMLInputElement).value); render(); } }}
+      on={{ input: (e: Event) => { form[key] = Number((e.target as HTMLInputElement).value); remember(); render(); } }}
     />
   </label>
 );
@@ -160,6 +209,7 @@ function EffectPicker() {
       <select on={{ change: (e: Event) => {
         const el = e.target as HTMLSelectElement;
         if (el.value) form.prompt = `${form.prompt}${form.prompt.endsWith(" ") ? "" : " "}embedding:minimaxh3_${el.value} `;
+        remember();
         el.value = "";
         render();
       } }}>
@@ -179,7 +229,7 @@ async function addRefs(kind: RefKind, files: FileList | null): Promise<void> {
   for (const f of Array.from(files ?? [])) {
     if (form[kind].length >= REF_MAX[kind]) break;
     try {
-      const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
+      const r = await fetch(`api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
       const j = (await r.json()) as { ok: boolean; name?: string; error?: string };
       if (!j.ok || !j.name) throw new Error(j.error ?? `HTTP ${r.status}`);
       form[kind] = [...form[kind], j.name];
@@ -261,7 +311,7 @@ async function setControl(key: ControlKey, files: FileList | null): Promise<void
   const f = files?.[0];
   if (!f) return;
   try {
-    const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
+    const r = await fetch(`api/upload?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f });
     const j = (await r.json()) as { ok: boolean; name?: string; error?: string };
     if (!j.ok || !j.name) throw new Error(j.error ?? `HTTP ${r.status}`);
     form[key] = j.name;
@@ -312,7 +362,7 @@ function ControlNet() {
 const named = (label: string, key: "sampler" | "schedule", names: string[] | undefined, dflt: string, title: string) => (
   <label attrs={{ title }}>
     {label}
-    <select on={{ change: (e: Event) => { form[key] = (e.target as HTMLSelectElement).value; render(); } }}>
+    <select on={{ change: (e: Event) => { form[key] = (e.target as HTMLSelectElement).value; remember(); render(); } }}>
       <option attrs={{ value: "", selected: form[key] === "" }}>{dflt}</option>
       {(names ?? []).map((n) => <option attrs={{ value: n, selected: form[key] === n }}>{n}</option>)}
     </select>
@@ -325,7 +375,7 @@ export function Creation() {
       <textarea
         attrs={{ spellcheck: false }}
         props={{ value: form.prompt }}
-        on={{ input: (e: Event) => { form.prompt = (e.target as HTMLTextAreaElement).value; } }}
+        on={{ input: (e: Event) => { form.prompt = (e.target as HTMLTextAreaElement).value; remember(); } }}
       />
       <div class="hint">
         Dialogue: <code>{"(S1) says: <d>[English] line</d>"}</code> · no negations (cfg is 1.0,
@@ -338,7 +388,7 @@ export function Creation() {
         {num("upscale", "upscale", 1, 4, 0.5)}
         <label attrs={{ title: "ESRGAN: decoded at the sampled size, the frames enlarged by a network on the GPU - about half the decode stage's time (a 5 s clip at 1152x864 on a B65: 19.6 s against 41.9). latent: the latents enlarged, then decoded at the larger size - the decoder's own fine texture." }}>
           upscaler
-          <select on={{ change: (e: Event) => { form.upscaler = (e.target as HTMLSelectElement).value; render(); } }}>
+          <select on={{ change: (e: Event) => { form.upscaler = (e.target as HTMLSelectElement).value; remember(); render(); } }}>
             <option attrs={{ value: "esrgan-general", selected: form.upscaler === "esrgan-general" }}>ESRGAN general-x4v3 (default)</option>
             <option attrs={{ value: "esrgan-anime", selected: form.upscaler === "esrgan-anime" }}>ESRGAN animevideov3 (sharper, drawn look)</option>
             <option attrs={{ value: "latent", selected: form.upscaler === "latent" }}>latent (slowest, most natural texture)</option>
@@ -351,7 +401,7 @@ export function Creation() {
           "The sigma schedule. shifted is the model's own; karras and exponential suit noise-prediction models and do poorly here.")}
         <label>
           encoder
-          <select on={{ change: (e: Event) => { form.te = (e.target as HTMLSelectElement).value as "teacher" | "student"; render(); } }}>
+          <select on={{ change: (e: Event) => { form.te = (e.target as HTMLSelectElement).value as "teacher" | "student"; remember(); render(); } }}>
             <option attrs={{ value: "teacher", selected: form.te === "teacher" }}>teacher 32B</option>
             <option attrs={{ value: "student", selected: form.te === "student" }}>student 4B</option>
           </select>
@@ -397,7 +447,7 @@ export function Creation() {
         <CanvasPicker
           width={form.width}
           height={form.height}
-          engine={form.engine}
+          engine={readyEngine()}
           seconds={form.seconds}
           steps={form.steps}
           onPick={(w, h, e, sec) => {
@@ -405,19 +455,27 @@ export function Creation() {
             form.height = h;
             form.engine = e as Engine;
             form.seconds = sec;
+            remember();
             render();
           }}
         />
       </Panel>
+      {(() => {
+        const f = fitNow();
+        return f && !f.est.fits
+          ? <div class="err">
+              {`${form.width}x${form.height} for ${form.seconds} s needs ~${f.est.gib} GiB (+${f.margin} margin) of the ${f.cap} GiB this card gives the engine: it will fail out of memory. Pick a green cell (a smaller canvas or a shorter clip).`}
+            </div>
+          : null;
+      })()}
       <div class="row">
-        <button type="button" on={{ click: () => void generate(false) }}>
+        <button type="button" on={{ click: () => void generate() }}>
           <span class="i" props={{ innerHTML: "&#xf0d0;" }} />Generate
         </button>
-        <button type="button" class="tbtn" on={{ click: () => void generate(true) }}>
-          <span class="i" props={{ innerHTML: "&#xf03a;" }} />Queue
-        </button>
+        {submitted ? <span class="hint">{submitted}</span> : null}
       </div>
       {state.error ? <pre class="err">{state.error}</pre> : null}
+      <ClipProgress />
     </div>
   );
 }

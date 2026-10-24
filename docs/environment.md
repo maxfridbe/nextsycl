@@ -47,6 +47,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_MODEL3D_PORT` | 8088 | the 3D server's port, as the front door reaches it | serve |
 | `NS_MODEL3D_PORT2` | 8098 | the second 3D server's port (`model3d start --slot 1`), as `NS_AUDIO_PORT2` | serve |
 | `NS_SPEECH_NORMALIZE` | 1 | 0: speech's text as sent (by default math and code symbols are said as words - √ "square root of", = "equals", d_k "d sub k" - and markdown's marks dropped; a request's `normalize: false` too) | serve (audio) |
+| `NS_AUTO_PULL` | 0 | 1: a request naming a model a card offers that is not downloaded starts its download (`system.models.pull`) and waits for it, a job saying `downloading <model>: N%`; 0: it is refused 409 `model_not_downloaded` (error.model, bytes, fits, pull). Read on every request, so the page's checkbox needs no restart | serve |
 | `NS_CHAT_UI_PORT` | 8080 | Open WebUI's port (the page's link) | serve |
 | `NS_CORS` | loopback origins only | more web origins that may call the servers from a browser, comma-separated (`*`: any) | cli (llm, image, audio start) |
 | `NS_GPU_LOCK` | /tmp/ds2run.lock | the lock file (flock) GPU work the front door does not manage holds while it runs - tests, benchmarks, builds: while it is held no model loads (requests get the retryable error `cards_taken`, 503, retry_after_s; /v1 Retry-After), image / audio / 3D jobs wait, the video queue pauses, the switcher swaps in no chat model. `off`: none | serve, switch |

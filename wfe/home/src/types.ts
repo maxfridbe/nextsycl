@@ -57,7 +57,7 @@ export interface Model {
   page: number;
 }
 
-export interface Service { id: string; title: string; what: string; port: number; up: boolean; detail?: string | null; link?: string; api?: string }
+export interface Service { id: string; title: string; what: string; port: number; up: boolean; detail?: string | null; link?: string; href?: string | null; api?: string }
 
 export interface Run { id: number; label: string; started: number; rc: number | null; out: string }
 
@@ -74,6 +74,28 @@ export interface State {
   maintenance: Maintenance | null;
   /** the drives the models are on, each model's place on them, the move under way (system.drives) */
   drives?: Drives;
+  /** the models a card offers that are not downloaded (system.models' downloaded: false) */
+  available: Available[];
+  /** the downloads under way and the last ones, newest first (system.models.pulls) */
+  pulls: Pull[];
+  /** NS_AUTO_PULL: a request for a model not downloaded fetches it and waits */
+  auto_pull: boolean;
+}
+
+export interface Available {
+  id: string; kind: string; title?: string; about?: string; bytes: number;
+  /** the drive and folder it would go to, whether it has the room, its free bytes */
+  drive: string; folder: string; fits: boolean; free: number;
+  pull: Pull | null;
+  /** whether this box's cards can run it (its memory against theirs), and why not */
+  runs_here?: boolean; why_not?: string | null;
+}
+
+export interface Pull {
+  model: string; kind: string; title: string; drive: string; folder: string;
+  state: "queued" | "downloading" | "verifying" | "done" | "failed" | "cancelled";
+  error: string | null; bytes_total: number; bytes_done: number; pct: number; speed: number; eta_s: number | null;
+  started: number; ended: number | null; run: number;
 }
 
 export interface Measured { mb_s: number; bytes: number; seconds: number; at: number; file: string }

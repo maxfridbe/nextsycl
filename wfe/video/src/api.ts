@@ -1,9 +1,10 @@
 /** The only module that talks to the server. Every call is typed by Methods. */
 import type {
-  Envelope, Film, Gpu, Job, JobDetail, ListRow, Methods, Plan, Scene, Status, Summary, TimelineClip,
+  Envelope, Film, Gpu, Join, Job, JobDetail, ListRow, Methods, Plan, Scene, Status, Summary, TimelineClip,
 } from "./types.js";
 
-const base = "";
+// relative: the page is served at the studio's root or under the front door's /open/<id>/
+const base = ".";
 
 export async function rpc<M extends keyof Methods>(
   method: M,
@@ -31,6 +32,7 @@ export const api = {
   summary: () => getJSON<Summary>("/api/summary"),
   list: () => getJSON<ListRow[]>("/api/list"),
   films: () => getJSON<Film[]>("/api/films"),
+  joins: () => getJSON<{ joins: Join[] }>("/api/join"),
   timeline: (project: string) =>
     getJSON<{ clips: TimelineClip[] }>(`/api/timeline?project=${encodeURIComponent(project)}`),
   job: (name: string) => getJSON<JobDetail>(`/api/job/${encodeURIComponent(name)}`),
@@ -50,6 +52,8 @@ export const api = {
     api.post<{ ok: boolean }>("/api/queue/pause", scope),
   clearQueue: (scope: { project?: string; batch?: string } = {}) =>
     rpc("queue.clear", scope),
+  join: (project: string) =>
+    api.post<{ ok: boolean; join?: Join; error?: string }>("/api/join", { project }),
   importScene: (scene: Scene, project: string, paused: boolean) =>
     api.post<{ imported?: number; project?: string; error?: string }>(
       "/api/scene/import", { scene, project, paused }),

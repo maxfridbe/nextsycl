@@ -272,6 +272,10 @@ impl Home {
     /// Where a chat request goes: the switcher when one runs (it loads the model the request names), else the chat
     /// server, `model` (or the one loaded, or the first enabled) loaded first
     pub(crate) fn chat_target(&self, model: Option<&str>) -> Result<Target, (u16, String)> {
+        // a card's chat model not downloaded: refused (409 model_not_downloaded), or with NS_AUTO_PULL fetched first
+        if let Some(id) = model {
+            self.need_downloaded(id, None, true)?;
+        }
         if listening(self.o.ports.switch) {
             // the switcher loads the model named: the room for it first, as any load
             if let Some(id) = model {

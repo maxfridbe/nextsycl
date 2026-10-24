@@ -6,18 +6,47 @@
  *  then the clip you picked. */
 import { jsx } from "../jsx.js";
 import { api } from "../api.js";
-import { cameraName, setCameraName, state } from "../state.js";
+import { cameraName, render, setCameraName, state } from "../state.js";
 import { navigate } from "../router.js";
 import type { Scene, TimelineClip } from "../types.js";
-import { fmtMS, fmtT } from "../util.js";
+import { fmtMS, fmtT, here } from "../util.js";
 import { ClipProgress } from "./Progress.js";
 import { Detail } from "./Detail.js";
 import { Panel } from "./Panel.js";
 
 function exportScene(): void {
   if (state.timelineProject) {
-    location.href = `/api/scene?project=${encodeURIComponent(state.timelineProject)}`;
+    location.href = `api/scene?project=${encodeURIComponent(state.timelineProject)}`;
   }
+}
+
+/** The project's finished clips, in this order, into one film (the studio runs the join; Films shows it) */
+async function joinFilm(): Promise<void> {
+  const project = state.timelineProject;
+  if (!project) return;
+  const done = state.timelineClips.filter((c) => c.state === "done").length;
+  if (!window.confirm(`Join the ${done} finished clips of "${project}" into one film?`)) return;
+  const r = await api.join(project);
+  if (!r.ok || !r.join) {
+    window.alert(`join failed: ${r.error ?? "?"}`);
+    return;
+  }
+  state.joins = [...state.joins, r.join];
+  render();
+  void pollJoin(r.join.file);
+}
+
+async function pollJoin(file: string): Promise<void> {
+  const { joins } = await api.joins();
+  state.joins = joins;
+  const j = joins.find((x) => x.file === file);
+  if (j?.state === "running") {
+    setTimeout(() => void pollJoin(file), 3000);
+  } else {
+    state.films = await api.films();
+    if (j?.state === "failed") window.alert(`join of "${j.project}" failed: ${j.message}`);
+  }
+  render();
 }
 
 async function importScene(file: File): Promise<void> {
@@ -67,7 +96,7 @@ function ClipCard(props: { placed: Placed; px: number }) {
       on={{ click: () => navigate({ clip: clip.n }) }}
     >
       {clip.thumb
-        ? <img attrs={{ src: clip.thumb, alt, loading: "lazy" }} />
+        ? <img attrs={{ src: here(clip.thumb), alt, loading: "lazy" }} />
         : <div class="ph">{clip.state === "running" ? "●" : "…"}</div>}
       <span class="n">{clip.n}</span>
       <span class="s">{clip.seconds ? `${clip.seconds.toFixed(1)}s` : ""}</span>
@@ -163,9 +192,10 @@ export function Timeline() {
       hint={hint}
       tools={[
         picker,
+        tool(state.joins.some((j) => j.project === state.timelineProject && j.state === "running") ? "joining…" : "join film", () => void joinFilm()),
         tool("export JSON", exportScene),
         tool("import JSON", () => document.getElementById("sceneFile")?.click()),
-        tool("types.ts", () => { location.href = "/api/types.ts"; }),
+        tool("types.ts", () => { location.href = "api/types.ts"; }),
       ]}
     >
       <ClipProgress />

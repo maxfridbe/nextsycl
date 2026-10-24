@@ -21,4 +21,7 @@ export const clipNumber = (label: string): number => {
 export const labelPrefix = (label: string): string =>
   (/^(.*?)\s*\d+\//.exec(label)?.[1] ?? "").trim();
 
+/** A link the server gave (/thumb/x.webp): relative, so it resolves under the front door's /open/<id>/ too. */
+export const here = (u: string): string => u.replace(/^https?:\/\/[^/]+/, "").replace(/^\//, "");
+
 export const clamp = (x: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, x));

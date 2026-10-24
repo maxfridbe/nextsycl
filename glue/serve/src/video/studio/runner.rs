@@ -414,7 +414,7 @@ impl Studio {
         self.engine("POST", &format!("/engine/jobs/{id}/cancel"), None).map(|_| ())
     }
 
-    /// One scheduler tick (every 5 s).
+    /// One scheduler tick (every second).
     pub(super) fn tick(&self) {
         self.llm.idle_watchdog(self);
         let mut st = self.st.lock().unwrap();
@@ -477,8 +477,10 @@ impl Studio {
     }
 
     pub fn scheduler(self: std::sync::Arc<Self>) {
+        // every second, not every 5: a tick is a status call over the engine's socket, and at 5 s a cancel, a finished
+        // clip or the next queued one showed on the page up to 5 s late
         loop {
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_secs(1));
             self.tick();
         }
     }

@@ -114,6 +114,8 @@ export interface Status {
   done?: boolean;
   exited?: boolean;
   error?: string | null;
+  /** the last clip's failure, classified (engine_lost, out of memory ...) */
+  failure?: { code: string; retryable: boolean; message: string; hint?: string } | null;
   eta?: number;
   elapsed?: number;
   rms?: number | null;
@@ -138,6 +140,10 @@ export interface TimelineClip {
 }
 
 export interface Film { file: string; mb: number; seconds: number | null; mtime: number }
+
+/** A film being joined, or joined since the studio started (GET /api/join; POST /api/join {project} starts one) */
+export interface Join { project: string; clips: number; file: string; state: "running" | "done" | "failed"; started: number; finished?: number; message: string }
+
 
 export interface ListRow {
   file: string;
@@ -315,7 +321,8 @@ export interface Methods {
   status: [Record<string, never>, Status];
   wait: [{ version?: string; timeout_s?: number }, Status];
   generate: [GenerateRequest, { queued: boolean; position?: number; job?: Job }];
-  cancel: [Record<string, never>, { stopped: true }];
+  cancel: [{ label?: string }, { stopped: boolean; removed: number; label?: string }];
+  "queue.remove": [{ index?: number; label?: string }, { removed: number; index?: number; label: string }];
   "queue.list": [Record<string, never>, { queue: GenerateRequest[] }];
   "queue.clear": [Scope, { cleared: number }];
   "queue.pause": [Scope, HoldResult];

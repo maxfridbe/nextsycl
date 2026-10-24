@@ -29,6 +29,7 @@ mod jobs;
 mod life;
 mod maint;
 mod precheck;
+mod pulls;
 mod spec;
 pub mod registry;
 mod yaml;
@@ -122,6 +123,8 @@ pub struct Home {
     maint_bypass: Mutex<String>,
     /// the drives: their measured speeds (kept in the state file), a measurement and a move under way (disks.rs)
     disks: disks::Disks,
+    /// models being downloaded, and the last ones (pulls.rs)
+    pulls: pulls::Pulls,
 }
 
 /// The cards as this page sampled them, with what the root sampler's file (`nextsycl gpustat`: one card at its top
@@ -233,7 +236,7 @@ impl Home {
             kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), answers: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()), chat_keep: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(Vec::new()), lock_paused: Mutex::new(None), progress: Mutex::new(BTreeMap::new()),
-            maint_file, maint_bypass, disks: disks::Disks::new(&st),
+            maint_file, maint_bypass, disks: disks::Disks::new(&st), pulls: pulls::Pulls::default(),
         });
         let me = h.clone();
         std::thread::spawn(move || me.sample_cards());
@@ -399,7 +402,8 @@ impl Home {
     /// passes the request on to its server as `/<sub>` (any method: the page's own API calls go the same way).
     /// `/open/<id>` alone is sent to `/open/<id>/`, so the page's relative links resolve under it. Those servers check
     /// no token and listen on --serve-host (127.0.0.1): this is how another machine reaches them. A disabled model has
-    /// none to open. The video studio and the chat page are always up and on the network: the browser is sent there.
+    /// none to open. The video studio is passed on the same way (it is up while a video model is enabled); the chat page is
+    /// on the network: the browser is sent there.
     fn open(self: &Arc<Self>, s: &mut Conn, req: &http::Request, rest: &str) {
         let (id, sub) = rest.split_once('/').map_or((rest, None), |(i, r)| (i, Some(r)));
         let m = match registry::find(&self.o.cfg, id) {
@@ -429,7 +433,18 @@ impl Home {
                 }
                 return;
             }
-            "video" => self.o.ports.video,
+            // the studio: up while a video model is enabled (with the daemon); on 127.0.0.1 like the model servers
+            "video" => {
+                let Some(sub) = sub else {
+                    let to = format!("/open/{id}/{query}");
+                    return http::respond_bytes(s, 302, "text/plain; charset=utf-8", b"", &format!("Location: {to}\r\nCache-Control: no-cache\r\n"));
+                };
+                let studio = http::Target::Tcp(format!("127.0.0.1:{}", self.o.ports.video));
+                if let Err(e) = http::forward_to(&mut *s, &studio, req, &format!("/{sub}{query}")) {
+                    http::respond(s, 502, &err(format!("the video studio does not answer: {e}")));
+                }
+                return;
+            }
             _ => self.o.ports.chat_ui,
         };
         let host = req.host.as_deref().unwrap_or("localhost").rsplit_once(':').map_or_else(|| req.host.clone().unwrap_or_default(), |(h, _)| h.to_string());
@@ -490,6 +505,9 @@ impl Home {
     /// The front ends and helpers beside the models: up or not, a link
     fn services(&self) -> Vec<Value> {
         let p = self.o.ports.clone();
+        // the studio's page through this door (its own port is on 127.0.0.1): under an enabled video model's /open/
+        let studio = self.models().into_iter().find(|m| m["kind"] == "video" && m["enabled"] != false)
+            .and_then(|m| m["id"].as_str().map(|i| format!("/open/{i}/")));
         let probes: Vec<Box<dyn FnOnce() -> Value + Send>> = vec![
             Box::new(move || json!({"id": "chat-ui", "title": "Chat", "what": "the chat front end (Open WebUI)", "port": p.chat_ui,
                                     "up": listening(p.chat_ui), "link": "/"})),
@@ -502,7 +520,7 @@ impl Home {
             Box::new(move || {
                 let up = call_for(&Target::Tcp(format!("127.0.0.1:{}", p.video)), "POST", "/rpc/status", Some(&json!({})), 3).is_ok();
                 json!({"id": "studio", "title": "Video studio", "what": "nextsycl video studio (MiniMax H3): clips, queue, projects", "port": p.video,
-                       "up": up, "link": "/"})
+                       "up": up, "link": "/", "href": studio})
             }),
         ];
         let hs: Vec<_> = probes.into_iter().map(std::thread::spawn).collect();
@@ -526,7 +544,9 @@ impl Home {
         });
         json!({"ts": now(), "host": meminfo(), "cards": cards, "models": models, "services": self.services(), "runs": runs,
                "idle_minutes": self.o.idle_minutes, "ports": {"video": self.o.ports.video, "chat_ui": self.o.ports.chat_ui},
-               "maintenance": maintenance, "cards_taken": self.cards_taken(), "drives": self.drives_view(&all, &models)})
+               "maintenance": maintenance, "cards_taken": self.cards_taken(), "drives": self.drives_view(&all, &models),
+               // the models a card offers that are not here yet, their downloads, and whether a request fetches one itself
+               "available": self.not_downloaded_all(), "pulls": self.pulls_view(), "auto_pull": self.auto_pull()})
     }
 
     /// The cards, a process's model by its registry id where its file is a registered one (`model_id`)
@@ -617,7 +637,12 @@ impl Home {
             "measure" => self.drive_measure(b["drive"].as_str().unwrap_or("")),
             "move" => self.model_move(&model, b["drive"].as_str().unwrap_or("")),
             "move_cancel" => self.move_cancel(),
-            other => Err((400, format!("no action {other:?} (enable, disable, gpus, load, unload, config, restart, maintenance, measure, move, move_cancel)"))),
+            "pull" => self.pull_start(&model).map(|p| json!({"pull": p.view()})),
+            "pull_cancel" => self.pull_cancel(&model),
+            // the page's checkbox: NS_AUTO_PULL in the settings file (read live: no restart)
+            "auto_pull" => self.config_set(&json!({"set": {"NS_AUTO_PULL": if b["on"] == true { json!("1") } else { Value::Null }}}))
+                .map(|_| json!({"auto_pull": self.auto_pull()})),
+            other => Err((400, format!("no action {other:?} (enable, disable, gpus, load, unload, config, restart, maintenance, measure, move, move_cancel, pull, pull_cancel, auto_pull)"))),
         }
     }
 }

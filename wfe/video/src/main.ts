@@ -11,7 +11,7 @@ import { api } from "./api.js";
 import { App } from "./components/App.js";
 import { autoSelectProject, loadTimeline } from "./project.js";
 import { startRouter, syncHash } from "./router.js";
-import { onRender, render, restorePreferences, state } from "./state.js";
+import { onRefresh, onRender, render, restorePreferences, state } from "./state.js";
 
 const patch = init([
   attributesModule, propsModule, classModule, styleModule, datasetModule, eventListenersModule,
@@ -31,27 +31,42 @@ function paint(): void {
 
 onRender(paint);
 
+let statusTimer: number | undefined;
+let statusSeq = 0;
+
+/** One status fetch; a refresh() in between replaces the pending poll, and an answer older than one already
+ *  shown is dropped (a slow poll must not paint over a click's fresher state). */
 async function pollStatus(): Promise<void> {
+  window.clearTimeout(statusTimer);
+  const seq = ++statusSeq;
   try {
-    state.status = await api.status();
+    const st = await api.status();
+    if (seq !== statusSeq) return;
+    state.status = st;
     // only pick a project for the user when the URL did not name one
     if (!state.timelineProject) {
       if (autoSelectProject()) syncHash();
     }
     state.error = null;
   } catch (e) {
+    if (seq !== statusSeq) return;
     state.error = String(e);
   }
   render();
   const busy = state.status && !state.status.idle;
-  setTimeout(() => void pollStatus(), busy ? 3000 : 8000);
+  // a clip in the queue that has not started yet: look again soon, it is about to
+  const starting = state.status?.idle && !state.status.paused && state.status.queue_items.some((x) => !x.held);
+  statusTimer = window.setTimeout(() => void pollStatus(), busy ? 2000 : starting ? 1500 : 8000);
 }
+
+onRefresh(pollStatus);
 
 async function pollSlow(): Promise<void> {
   try {
-    const [summary, gpu, list, films] = await Promise.all([
-      api.summary(), api.gpu(), api.list(), api.films(),
+    const [summary, gpu, list, films, joins] = await Promise.all([
+      api.summary(), api.gpu(), api.list(), api.films(), api.joins(),
     ]);
+    state.joins = joins.joins;
     state.summary = summary;
     state.gpu = gpu;
     state.list = list;
@@ -60,7 +75,8 @@ async function pollSlow(): Promise<void> {
     /* transient */
   }
   render();
-  setTimeout(() => void pollSlow(), 30000);
+  // a join running: its film shows up sooner
+  setTimeout(() => void pollSlow(), state.joins.some((j) => j.state === "running") ? 4000 : 30000);
 }
 
 async function pollTimeline(): Promise<void> {

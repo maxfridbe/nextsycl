@@ -469,33 +469,48 @@ pub fn scene(cfg: &Config, raw: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// A film's file name from a project or label prefix: letters, digits, - and _ (never h3_..., which names clips)
+fn film_stem(prefix: &str) -> String {
+    let s: String = prefix.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    let s = s.trim_matches('_').to_string();
+    if s.is_empty() || s.starts_with("h3_") { format!("film_{s}") } else { s }
+}
+
 fn ffprobe(path: &Path, stream: &str, entry: &str) -> Option<f64> {
     let o = nextsycl_serve::video::media::tool("ffprobe").args(["-v", "error", "-select_streams", stream, "-count_packets", "-show_entries", &format!("stream={entry}"), "-of", "csv=p=0"]).arg(path).output().ok()?;
     String::from_utf8_lossy(&o.stdout).trim().split(',').next()?.trim().parse().ok()
 }
 
-/// `nextsycl video join <prefix>`: a series of finished clips -> one film.
+/// `nextsycl video join <prefix>`: a series of finished clips -> one film. `--names h3_a,h3_b,...` takes those clips in
+/// that order (the studio's Join: a project's finished clips as its timeline has them), the prefix then only names the film.
 pub fn join(cfg: &Config, raw: &[String]) -> Result<()> {
     let o = Opts::parse(raw, &["denoise"]);
-    let prefix = o.pos.first().ok_or("nextsycl video join <label prefix> [--from 1 --to 999] [--xfade-frames 2] [--audio-anchor-s S] [--match-loudness -18] [--denoise] [--fade-out 1.5] [--out FILE] [--out-dir DIR]")?.clone();
+    let prefix = o.pos.first().ok_or("nextsycl video join <label prefix> [--from 1 --to 999] [--xfade-frames 2] [--audio-anchor-s S] [--match-loudness -18] [--denoise] [--fade-out 1.5] [--names h3_a,h3_b,...] [--out FILE] [--out-dir DIR]")?.clone();
     let dir = o.get("out-dir").map(PathBuf::from).unwrap_or_else(|| super::service::out_dir(cfg));
     let fps = o.f("fps", 24.0);
     let (from, to) = (o.i("from", 1), o.i("to", 999));
     // the newest finished clip of each number
+    let listed: Vec<String> = o.get("names").map(|n| n.split(',').map(|s| s.trim().trim_end_matches(".mp4").to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
     let mut names: Vec<String> = std::fs::read_dir(&dir)?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("h3_") && n.ends_with(".json")).collect();
     names.sort();
     let mut items: BTreeMap<i64, (PathBuf, Value)> = BTreeMap::new();
     for n in names {
         let Ok(side) = serde_json::from_slice::<Value>(&std::fs::read(dir.join(&n)).unwrap_or_default()) else { continue };
-        let label = side["job"]["label"].as_str().unwrap_or("");
-        let Some(rest) = label.strip_prefix(&format!("{prefix} ")) else { continue };
-        let Some(num) = rest.split(|c: char| !c.is_ascii_digit()).next().and_then(|d| d.parse::<i64>().ok()) else { continue };
+        let num = if listed.is_empty() {
+            let label = side["job"]["label"].as_str().unwrap_or("");
+            let Some(rest) = label.strip_prefix(&format!("{prefix} ")) else { continue };
+            let Some(num) = rest.split(|c: char| !c.is_ascii_digit()).next().and_then(|d| d.parse::<i64>().ok()) else { continue };
+            num
+        } else {
+            let Some(i) = listed.iter().position(|l| format!("{l}.json") == n) else { continue };
+            i as i64 + 1
+        };
         if side["times"]["TOTAL"].as_f64().is_some_and(|t| t > 0.0) && (from..=to).contains(&num) {
             items.insert(num, (dir.join(n.replace(".json", ".mp4")), side));
         }
     }
     if items.is_empty() {
-        return Err(Error(format!("no finished clips labelled {prefix:?} NN in {}", dir.display())));
+        return Err(Error(if listed.is_empty() { format!("no finished clips labelled {prefix:?} NN in {}", dir.display()) } else { format!("none of those clips is finished in {}", dir.display()) }));
     }
     let files: Vec<PathBuf> = items.values().map(|v| v.0.clone()).collect();
     let nframes: Vec<i64> = files.iter().map(|f| ffprobe(f, "v:0", "nb_read_packets").unwrap_or(0.0) as i64).collect();
@@ -562,7 +577,7 @@ pub fn join(cfg: &Config, raw: &[String]) -> Result<()> {
         alab = "aoutf".into();
     }
     let (first_n, last_n) = (*items.keys().next().unwrap(), *items.keys().last().unwrap());
-    let out = o.get("out").map(PathBuf::from).unwrap_or_else(|| dir.join(format!("{}_join_{first_n:02}-{last_n:02}.mp4", prefix.to_lowercase().replace(' ', "_"))));
+    let out = o.get("out").map(PathBuf::from).unwrap_or_else(|| dir.join(format!("{}_join_{first_n:02}-{last_n:02}.mp4", film_stem(&prefix))));
     let part = out.with_extension("part.mp4");
     let mut c = nextsycl_serve::video::media::tool("ffmpeg");
     c.args(["-y", "-loglevel", "error"]);

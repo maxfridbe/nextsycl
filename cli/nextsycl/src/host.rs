@@ -89,6 +89,9 @@ impl nextsycl_serve::home::registry::Store for Store {
     fn cards(&self) -> Vec<serde_json::Value> {
         nextsycl_models::catalog::Catalog::load(&self.0).map(|c| c.models).unwrap_or_default()
     }
+    fn card_files(&self, id: &str) -> Vec<(String, u64)> {
+        nextsycl_models::catalog::Catalog::load(&self.0).ok().and_then(|c| c.model(id).map(|m| c.file_list(m))).unwrap_or_default()
+    }
 }
 
 pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {

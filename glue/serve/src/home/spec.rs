@@ -106,7 +106,11 @@ const VOICE: &str = r#"{"type": "object", "properties": {"name": {"type": "strin
 
 const MODEL_STATE: &str = r#"{"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string", "enum": ["llm", "image", "audio", "video"]},
   "title": {"type": "string"}, "arch": {"type": "string"}, "enabled": {"type": "boolean"}, "gpus": {"type": "array", "items": {"type": "integer"}},
-  "state": {"type": "string", "enum": ["disabled", "unloaded", "loading", "loaded", "busy", "ready"], "description": "busy: an image or audio model answering; ready: a video model the daemon has, not loaded"},
+  "state": {"type": "string", "enum": ["disabled", "unloaded", "loading", "loaded", "busy", "ready", "not_downloaded"], "description": "busy: an image or audio model answering; ready: a video model the daemon has, not loaded; not_downloaded: a card's model not here (system.models.pull)"},
+  "downloaded": {"type": "boolean", "description": "false: a model a card offers that is not downloaded (enabled false; bytes, drive, folder, fits, pull say what fetching it takes)"},
+  "bytes": {"type": "integer", "description": "not downloaded: its files' bytes"}, "fits": {"type": "boolean", "description": "not downloaded: the folder it would go to has the room"},
+  "drive": {"type": "string"}, "folder": {"type": "string"}, "free": {"type": "integer"},
+  "pull": {"description": "not downloaded: its download under way (as system.models.pulls lists it), else null"},
   "vouch_mb": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "VRAM it is counted for, by card"},
   "spans": {"type": "boolean", "description": "a chat model spread over every card (its model card: gpus all): its cards are not a choice"},
   "measured": {"type": "boolean"}, "headroom_mb": {"type": "object", "additionalProperties": {"type": "integer"}}, "headroom_given": {"type": "boolean"},
@@ -142,7 +146,13 @@ fn status() -> String {
 
 /// The answer of a method, as JSON Schema text (none: not described)
 /// A move of a model's files (system.move, system.drives' move)
-const MOVE: &str = r#"{"type": "object", "properties": {"model": {"type": "string"}, "to": {"type": "string", "description": "the drive"}, "from": {"type": "array", "items": {"type": "string"}},
+const PULL: &str = r#"{"type": "object", "properties": {"model": {"type": "string"}, "kind": {"type": "string"}, "title": {"type": "string"},
+  "state": {"type": "string", "enum": ["queued", "downloading", "verifying", "done", "failed", "cancelled"], "description": "queued: behind another download to the same folder; verifying: its SHA-256 being checked"},
+  "error": {"type": "string", "nullable": true}, "bytes_total": {"type": "integer"}, "bytes_done": {"type": "integer"}, "pct": {"type": "number"},
+  "speed": {"type": "number", "description": "bytes a second"}, "eta_s": {"type": "number", "nullable": true}, "drive": {"type": "string"}, "folder": {"type": "string"},
+  "started": {"type": "number"}, "ended": {"type": "number", "nullable": true}, "run": {"type": "integer", "description": "its run on the page (its output)"}}}"#;
+
+const MOVE: &str =r#"{"type": "object", "properties": {"model": {"type": "string"}, "to": {"type": "string", "description": "the drive"}, "from": {"type": "array", "items": {"type": "string"}},
   "folder": {"type": "string"}, "state": {"type": "string", "enum": ["copying", "registry", "removing", "done", "failed", "cancelled"]}, "running": {"type": "boolean"},
   "files": {"type": "integer"}, "file_index": {"type": "integer"}, "file": {"type": "string", "nullable": true}, "file_to": {"type": "string", "nullable": true},
   "bytes": {"type": "integer", "description": "the files moved"}, "need": {"type": "integer", "description": "bytes written there (a file there already, the same bytes, is used)"},
@@ -232,6 +242,9 @@ pub fn result(method: &str) -> Option<String> {
         "system.drive.measure" => r#"{"type": "object", "properties": {"drive": {"type": "string"}, "measuring": {"type": "boolean"}, "reads_up_to": {"type": "integer"}}}"#.into(),
         "system.move" => format!(r#"{{"type": "object", "properties": {{"move": {MOVE}}}}}"#),
         "system.move.cancel" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "cancelling": {"type": "boolean"}}}"#.into(),
+        "system.models.pull" => format!(r#"{{"type": "object", "properties": {{"pull": {PULL}}}}}"#),
+        "system.models.pulls" => format!(r#"{{"type": "object", "properties": {{"pulls": {{"type": "array", "items": {PULL}}}, "auto_pull": {{"type": "boolean", "description": "NS_AUTO_PULL: a request for a model not downloaded fetches it"}}}}}}"#),
+        "system.models.pull.cancel" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "cancelling": {"type": "boolean"}}}"#.into(),
         "system.maintenance" => r#"{"type": "object", "required": ["on"], "properties": {
   "on": {"type": "boolean"},
   "maintenance": {"type": "object", "nullable": true, "description": "the notice while on", "properties": {"message": {"type": "string"}, "notice": {"type": "string", "description": "the sentence refused callers read"}, "since": {"type": "number"}, "until": {"type": "number", "nullable": true}, "retry_after_s": {"type": "integer"}}},
@@ -382,14 +395,18 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
                            (409, "conflict", "the model is loaded or loading (stop it first), a process has its files open, or the drive lacks the room"),
                            (409, "busy", "another move runs, or a drive is being measured")],
         "system.move.cancel" => &[(409, "conflict", "no move is under way")],
+        "system.models.pull" => &[(404, "not_found", "no model card of that id"), (409, "conflict", "it is downloaded already"),
+                                  (503, "no_room", "no models folder has the room for it (with 1% of the drive, at least 4 GiB, kept free)")],
+        "system.models.pull.cancel" => &[(409, "conflict", "no download of that model is under way")],
         "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak" | "audio.voices.design" | "audio.voices.enroll" | "model3d.generate" | "model3d.rig" =>
             &[(400, "invalid_params", "a value refused, when the job is submitted (wait false too): steps a few-step model does not run, a size, a sampler, a picture that does not decode, a voice or language the speech model does not have, a priority outside -9..9 ..."),
               (404, "not_found", "no such model; a continue_from or upload:<name> that is not here (error.field names which)"), (409, "conflict", "the model is disabled, or none that can do it is enabled (never retry as is)"),
               (409, "busy", "queue: false and the job would not start at once (retryable)"),
+              NOT_DOWNLOADED,
               (499, "cancelled", "stopped by <kind>.cancel"), (502, "unavailable", "the kind's server did not start or answer"),
               (503, "no_room", "the model's cards have no room for it (other work that is not idle holds them; idle models there are stopped for it at once). A job waits for the room up to 30 minutes first - stage waiting, waiting_for says who holds the card - then fails with this; image.ocr and voices.design wait 90 s. Retryable"),
               (504, "timeout", "wait: still running after an hour (the job goes on: <kind>.status {label})")],
-        "llm.chat" => &[(400, "invalid_params", "the chat server refused the request"), (502, "unavailable", "the chat server does not answer"),
+        "llm.chat" => &[(400, "invalid_params", "the chat server refused the request"), NOT_DOWNLOADED, (502, "unavailable", "the chat server does not answer"),
                         (503, "no_room", "the model is not loaded and its cards have no room for it (work that is not idle holds them; idle picture, sound and video work is stopped for it at once): retryable")],
         "audio.voices.add" => &[(400, "invalid_params", "a bad name, a recording shorter than 3 s or not decodable"), (409, "conflict", "replace over a voice another owner has")],
         "audio.voices.remove" => &[(404, "not_found", "no saved voice of that name"), (409, "conflict", "the voice has an owner and the request names another")],
@@ -406,6 +423,10 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
     }
 }
 
+/// A request naming a model a card offers that is not downloaded (pulls.rs), with NS_AUTO_PULL off
+pub const NOT_DOWNLOADED: (u16, &str, &str) = (409, "model_not_downloaded",
+    "the model named is one a card offers but is not downloaded: error.model, error.bytes, error.fits (the room on the folder it would go to), error.pull (system.models.pull fetches it). With NS_AUTO_PULL on the request downloads it and waits instead (a job's stage downloading)");
+
 /// The error every method that starts work may give besides its own (maint.rs's starts_work)
 pub const MAINTENANCE: (u16, &str, &str) = (503, "maintenance", "maintenance mode is on (system.maintenance): refused with the notice (error.maintenance) and error.retry_after_s; retryable");
 
@@ -417,6 +438,7 @@ A job's failure (image/audio status, a failed submit replayed) has the same erro
 Error codes (error.code, error.status by convention): invalid_request 400 (not POST, a query string, the body is not a JSON object), request_too_large 400 (over 256 MiB), invalid_params 400, \
 unauthorized 401, not_found 404 (also an unknown method), conflict 409 (a model disabled, none of the kind enabled, a name taken), \
 busy 409 (video.generate while a clip is made, or an image / audio job that would wait, without queue: true), not_running 409 (video.cancel with nothing running), \
+model_not_downloaded 409 (the model named is a card's that is not downloaded: error.model, error.bytes, error.fits, error.pull = system.models.pull; NS_AUTO_PULL fetches it instead), \
 cancelled 499 (image.cancel / audio.cancel stopped it), unavailable 502 (the kind's server does not answer), \
 no_room 503 (the model's cards are held by work that is not idle; idle models are stopped for it first), \
 maintenance 503 (system.maintenance is on: what starts work - chat, generation, edits, speech, system.load / enable - is refused; error.maintenance has the notice, \

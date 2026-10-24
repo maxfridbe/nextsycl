@@ -234,3 +234,13 @@ table.pick.heat th.rh .dim{color:#9ca3af;font-weight:400;font-size:12px}
 .refs{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
 .refs .ref{background:#181b22;border:1px solid #2a2f3a;border-radius:6px;padding:3px 8px;font-size:12px}
 label.tbtn{cursor:pointer;display:inline-flex;align-items:center}
+/* the last clip's failure, the queue's running row and its per-row buttons */
+.lastfail{margin:6px 0 0;padding:8px 10px;border:1px solid #7f1d1d;border-radius:6px;background:#1f1315}
+.lastfail .err{margin:4px 0}
+.grid tr.running td{background:#13202f}
+.grid td.acts{white-space:nowrap;text-align:right}
+.tbtn.rowx{padding:1px 7px;margin-left:6px}
+.tbtn.rowx.danger{border-color:#7f1d1d;color:#fca5a5}
+.tbtn.rowx:hover{border-color:#f87171;color:#fecaca}
+.minibar{height:4px;background:#1f2937;border-radius:2px;margin:3px 0;max-width:260px}
+.minibar .fill{height:100%;background:#3b82f6;border-radius:2px}

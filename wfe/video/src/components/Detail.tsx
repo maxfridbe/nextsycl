@@ -44,7 +44,7 @@ export function Detail() {
               type="button"
               class="tbtn"
               on={{ click: () => {
-                state.video = { file: `${d.name}.mp4`, poster: `/thumb/${d.name}.webp`, playing: true };
+                state.video = { file: `${d.name}.mp4`, poster: `thumb/${d.name}.webp`, playing: true };
                 render();
               } }}
             >Play</button>
@@ -81,11 +81,11 @@ export function Player() {
     <div class="player">
       <div class="row dhead">
         <b>{v.file}</b>
-        <a class="tbtn" attrs={{ href: `/out/${encodeURIComponent(v.file)}`, download: true }}>download</a>
+        <a class="tbtn" attrs={{ href: `out/${encodeURIComponent(v.file)}`, download: true }}>download</a>
         <button type="button" class="tbtn" on={{ click: close }}>close</button>
       </div>
       {v.playing
-        ? <video attrs={{ controls: true, autoplay: true, src: `/out/${encodeURIComponent(v.file)}` }} />
+        ? <video attrs={{ controls: true, autoplay: true, src: `out/${encodeURIComponent(v.file)}` }} />
         : (
           <div class="poster" on={{ click: () => { state.video = { ...v, playing: true }; render(); } }}>
             {v.poster

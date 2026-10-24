@@ -124,6 +124,8 @@ pub struct Studio {
     pub st: Mutex<State>,
     pub cache: Mutex<Cache>,
     pub llm: &'static llm::Llm,
+    /// the films being joined and joined since the start (`/api/join`), newest last
+    pub joins: Arc<Mutex<Vec<Value>>>,
 }
 
 pub struct Options {
@@ -142,6 +144,55 @@ pub struct Options {
 }
 
 impl Studio {
+    /// Join a project's finished clips, in its timeline's order, into one film (`nextsycl video join --names`, this
+    /// same program, in the background): the film lands beside the clips as <project>_join_01-NN.mp4 (Films lists it)
+    fn join(&self, project: &str) -> Result<Value, String> {
+        if project.is_empty() {
+            return Err("project: which project's clips to join".into());
+        }
+        // in the timeline's order: by clip number, as the page shows them
+        let mut done: Vec<Value> = self.timeline(&self.st.lock().unwrap(), project).into_iter().filter(|c| c["state"] == "done").collect();
+        done.sort_by_key(|c| c["n"].as_i64().unwrap_or(0));
+        let names: Vec<String> = done.iter().filter_map(|c| c["name"].as_str().map(str::to_string)).collect();
+        if names.is_empty() {
+            return Err(format!("{project}: no finished clips to join"));
+        }
+        let mut joins = self.joins.lock().unwrap();
+        if joins.iter().any(|j| j["project"] == project && j["state"] == "running") {
+            return Err(format!("{project}: a join is already running"));
+        }
+        let stem: String = project.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+        let stem = stem.trim_matches('_');
+        let stem = if stem.is_empty() || stem.starts_with("h3_") { format!("film_{stem}") } else { stem.to_string() };
+        let file = format!("{stem}_join_01-{:02}.mp4", names.len());
+        let rec = json!({"project": project, "clips": names.len(), "file": file, "state": "running", "started": now(), "message": ""});
+        joins.push(rec.clone());
+        drop(joins);
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mut c = std::process::Command::new(exe);
+        c.args(["video", "join", project, "--names", &names.join(","), "--out-dir"]).arg(&self.out).arg("--out").arg(self.out.join(&file));
+        let (joins, project, file2) = (self.joins.clone(), project.to_string(), file.clone());
+        std::thread::spawn(move || {
+            let r = c.output();
+            let (state, message) = match r {
+                Ok(o) => {
+                    let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+                    let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+                    (if o.status.success() { "done" } else { "failed" }, last)
+                }
+                Err(e) => ("failed", e.to_string()),
+            };
+            eprintln!("[join] {project} -> {file2}: {state} {message}");
+            let mut j = joins.lock().unwrap();
+            if let Some(r) = j.iter_mut().rev().find(|r| r["project"] == project.as_str() && r["state"] == "running") {
+                r["state"] = json!(state);
+                r["message"] = json!(message);
+                r["finished"] = json!(now());
+            }
+        });
+        Ok(json!({"ok": true, "join": rec}))
+    }
+
     /// The engine has a model loaded (or is loading one) on some GPU: no language model may start.
     /// Whether the engine holds the card the language models use: a GPU marked shared (`--shared-gpu`) has an engine
     /// loaded or a job running. With no GPU marked shared, any GPU counts (one card for both). An engine on a GPU of
@@ -329,6 +380,18 @@ impl Studio {
             }
             "queue.remove" => {
                 let label = ps("label");
+                // by position (0 first): a clip queued without a label is told apart from the others only by where it
+                // is; the label, when given too, has to match, so a queue that moved since the page drew it is caught
+                if let Some(i) = p.get("index").and_then(Value::as_u64) {
+                    let mut st = self.st.lock().unwrap();
+                    let i = i as usize;
+                    if st.q.items.get(i).is_none_or(|it| p.get("label").is_some() && s(it, "label") != label) {
+                        return Err(RpcError::not_found(&format!("no queued clip {} at position {i} (the queue changed?)", if label.is_empty() { "" } else { label.as_str() })));
+                    }
+                    st.q.items.remove(i);
+                    st.q.save(&self.dir);
+                    return Ok(json!({"removed": 1, "index": i, "label": label}));
+                }
                 let removed = self.remove(&mut self.st.lock().unwrap(), &label);
                 if removed == 0 {
                     return Err(RpcError::not_found(&format!("no queued clip labelled {label:?}")));
@@ -507,6 +570,10 @@ impl Studio {
                     self.hold(on, body["project"].as_str().unwrap_or("").trim(), body["batch"].as_str().unwrap_or("").trim());
                     http::respond(stream, 200, &json!({"ok": true}))
                 }
+                "/api/join" => match self.join(body["project"].as_str().unwrap_or("").trim()) {
+                    Ok(v) => http::respond(stream, 200, &v),
+                    Err(e) => http::respond(stream, 400, &json!({"ok": false, "error": e})),
+                },
                 "/api/queue/clear" => {
                     let mut st = self.st.lock().unwrap();
                     let n = st.q.items.len();
@@ -556,6 +623,7 @@ impl Studio {
             "/api/list" => respond_json(&json!(self.listing())),
             "/api/templates" => respond_json(&json!(self.templates())),
             "/api/films" => respond_json(&json!(self.films())),
+            "/api/join" => respond_json(&json!({"joins": *self.joins.lock().unwrap()})),
             "/api/timeline" => respond_json(&json!({"clips": self.timeline(&self.st.lock().unwrap(), &qv("project"))})),
             "/api/types.ts" => http::respond_bytes(stream, 200, "application/typescript; charset=utf-8", TYPES_TS.as_bytes()),
             "/api/scene" => {
@@ -714,6 +782,7 @@ pub fn run(o: Options) -> http::Result<()> {
         st: Mutex::new(st),
         cache: Mutex::new(Cache::default()),
         llm,
+        joins: Arc::new(Mutex::new(Vec::new())),
     });
     let listener = TcpListener::bind(&o.listen).map_err(|e| http::Error(format!("cannot listen on {}: {e}", o.listen)))?;
     let _ = queue::ENGINES.set(o.engines.clone());
