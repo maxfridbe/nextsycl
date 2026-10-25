@@ -169,6 +169,9 @@ T30 = {
          "woman should face right and in image 2 the man should face left. Does that hold?", [("she", 0.5), ("he", 0.5)]),
         ("D2 prop: the same train", "Image 1 is a reference picture of a green steam locomotive; image 2 is a shot of a film. Is the "
          "train in image 2 the same locomotive (green, brass fittings, red wheels)?", [("@train", 0), ("away", 0.3)]),
+        ("D6 motion: the train leaves", "Image 1, 2 and 3 are the start, middle and end of one shot of a steam locomotive. In a farewell the "
+         "train pulls away: it should get smaller and further away along the track. Does the locomotive get smaller and further away from "
+         "image 1 to image 3? Give 1 if it gets bigger and nearer.", [("away", 0.05), ("away", 0.5), ("away", 0.95)]),
         ("D1 anatomy: one body each", ANAT_BODY, [("she", 0.2), ("she", 0.6), ("he", 0.2), ("he", 0.6), ("away", 0.3), ("away", 0.7)]),
         ("D10 performance: the goodbye reads", "Images 1, 2 and 3 are the shots of a farewell. Does the emotion read as a tender goodbye "
          "(her glistening eyes, his kind nod, her alone and waving at the end)?", [("she", 0.7), ("he", 0.7), ("away", 0.8)]),

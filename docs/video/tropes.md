@@ -136,3 +136,13 @@ Two things the first run missed, found by looking and listening rather than by t
   the sheets.
 
 The lid's star is still not the reference's: five points in the picture, six to eight in the clips.
+
+**T30, the farewell at the station** (hardac1, `--quick`, sound carried across clips; her clip 60 s, his 40 s, the wide 30 s).
+Measured: every check passed; her voice 216 Hz against the sample's 242, his 143 against 147 (her sound tail was carried into
+his clip and no voice leaked), hers higher than his. Judged: her identity 5, his 5, the place 5, the light 5, the eyelines
+across the cut 5, anatomy 5, the goodbye reads 5; **the train 2**. Looking at the sheets agrees on the people and
+disagrees on the train: it is a green engine with red wheels but smaller and a different shape from the reference, and in
+the wide it appears to **arrive** (small, then large) where the script says it pulls away, a thing the judge was not asked
+(a question on the direction of travel is now). One flaw the judge did not see: a red blotch on his coat in the second clip.
+The train is the hard part of this trope, as the reference picture holds the kind of engine, not its build or the
+direction it goes.
