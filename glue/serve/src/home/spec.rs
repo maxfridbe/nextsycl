@@ -492,20 +492,15 @@ reentrant_id (every generate, video's too): a submit naming the id of a job queu
 
 #[cfg(test)]
 mod tests {
-    use super::super::api::METHODS;
+    use super::super::methods::methods;
 
     #[test]
     fn every_schema_parses() {
-        for m in METHODS {
-            let op = format!("{}.{}", m.kind, m.name);
-            for (f, ty, _, _) in m.fields {
-                if ty.starts_with('{') {
-                    serde_json::from_str::<serde_json::Value>(ty).unwrap_or_else(|e| panic!("{op} {f}: {e}"));
-                }
-            }
-            let r = super::result(&op).unwrap_or_else(|| panic!("{op}: no answer described"));
+        // every method's answer is described here (its request is its struct's, methods.rs)
+        for m in methods() {
+            let op = m.full();
+            let r = super::result(op).unwrap_or_else(|| panic!("{op}: no answer described"));
             serde_json::from_str::<serde_json::Value>(&r).unwrap_or_else(|e| panic!("{op} result: {e}"));
-            serde_json::from_str::<serde_json::Value>(m.example).unwrap_or_else(|e| panic!("{op} example: {e}"));
         }
         let w: serde_json::Value = serde_json::from_str(&super::result("video.wait").unwrap()).unwrap();
         assert!(w["properties"]["changed"].is_object() && w["required"][0] == "changed");

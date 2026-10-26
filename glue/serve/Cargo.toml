@@ -14,4 +14,7 @@ nextsycl-audio.workspace = true
 nextsycl-model3d.workspace = true
 nextsycl-tok.workspace = true
 serde_json.workspace = true
+serde = { version = "1", features = ["derive"] }
+# the RPC methods are their handlers: vendor/rpcgen, from vibe-creative-platform (tooling/sync_rpcgen.sh)
+rpcgen = { path = "../../vendor/rpcgen", default-features = false }
 sha2 = "0.10"

@@ -319,9 +319,10 @@ fn a_song_from_a_recording_is_checked_before_it_is_queued() {
     let e = err(&a, "audio.generate", json!({"model": "acestep-1.5", "instructions": "calm", "task": "cover"}));
     assert_eq!(e["status"], 400, "{e}");
     assert!(e["message"].as_str().is_some_and(|m| m.contains("the recording")), "{e}");
-    // an unknown task is named with the ones there are
+    // an unknown task is refused with the ones there are (the option is an enum: the type check names them)
     let e = err(&a, "audio.generate", json!({"model": "acestep-1.5", "instructions": "calm", "task": "remix"}));
-    assert!(e["message"].as_str().is_some_and(|m| m.contains("text2music, cover, repaint, edit or lego")), "{e}");
+    assert_eq!(e["status"], 400, "{e}");
+    assert!(e["message"].as_str().is_some_and(|m| ["remix", "text2music", "cover", "repaint", "edit", "lego"].iter().all(|w| m.contains(w))), "{e}");
     // an edit says what the recording sings now
     let e = err(&a, "audio.generate", json!({"model": "acestep-1.5", "instructions": "calm", "task": "edit", "audio": "AAAA"}));
     assert!(e["message"].as_str().is_some_and(|m| m.contains("source_lyrics")), "{e}");

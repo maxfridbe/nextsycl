@@ -37,9 +37,18 @@ guide is how to port one, and the few rules every change follows.
    kernels alone. Start a silo kernel as a copy of the shared one, then change the copy. A change to a shared kernel
    itself (a bug fix, a new type) re-runs every engine that calls it - its check and its bench - before it lands.
 
+6. **A front-door method is its handler.** `glue/serve/src/home/methods.rs`: `#[rpc(name = "image.generate", tags
+   = "image", example = r#"{...}"#)]` on a fn with a doc comment (its summary), and a request struct with
+   `#[derive(Rpc)]` (each field's doc comment its description, `#[schema(min, max, default, one_of ...)]` its
+   limits). The table, the OpenAPI document's operations, system.version's list and the wfe client
+   (`nextsycl gen-api` -> `wfe/home/src/gen/nextsycl.ts`) are made from that; never describe a method a second
+   time. The generator, rpcgen, is vibe-creative-platform's, vendored in `vendor/rpcgen`: change it there, then
+   `tooling/sync_rpcgen.sh` (a test fails on a copy edited here, and on a stale client). What happened is in the
+   answer's envelope (`error.code`, `retryable`), never only in the HTTP status.
+
 Every rule a machine can check is a test in `cli/nextsycl/tests/architecture.rs` (its header maps each rule to its
 tests; rule 5 is a review rule), run by `cargo test`; `./build.sh test` checks the kernel libraries link against no
-other runtime. CI runs both. A new rule comes with its test.
+other runtime. CI runs both. A new rule comes with its test. Rule 6 is checked by the compiler, `tsc` and `cargo test` (`home::api_files_tests`).
 
 ## Building
 

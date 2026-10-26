@@ -28,10 +28,76 @@ mod enroll;
 mod jobs;
 mod life;
 mod maint;
+mod methods;
 mod precheck;
 mod pulls;
 mod spec;
 pub mod registry;
+
+/// What the #[rpc] methods make (methods.rs, rpcgen), as (path under the repo, content): the typed client of the
+/// front door's methods for the wfe pages. `nextsycl gen-api` writes them; a test fails when the committed ones
+/// are stale.
+pub fn api_files() -> Vec<(&'static str, String)> {
+    let ts = rpcgen::typescript("nextsycl's front door (POST /rpc/<kind>.<method>; the answer in {ok, result | error})", &methods::infos())
+        .expect("the methods describe consistent types");
+    vec![("wfe/home/src/gen/nextsycl.ts", ts)]
+}
+
+#[cfg(test)]
+mod api_files_tests {
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+
+    fn root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// The committed client is what the methods make: a method changed without `nextsycl gen-api` fails here.
+    #[test]
+    fn the_committed_client_is_up_to_date() {
+        for (name, text) in super::api_files() {
+            let have = std::fs::read_to_string(root().join(name)).unwrap_or_default();
+            assert!(have == text, "{name} is stale: run `cargo run -p nextsycl -- gen-api`");
+        }
+    }
+
+    /// The document and the client say the same things: every field, limit, default, enum and example is in both.
+    #[test]
+    fn the_document_and_the_client_agree() {
+        if let Err(e) = rpcgen::parity(&super::methods::infos()) {
+            panic!("{e}");
+        }
+    }
+
+    /// vendor/rpcgen is the platform's rpcgen as tooling/sync_rpcgen.sh copied it: the tree hash it recorded is the
+    /// copy's (sha256 of the "sha256  path" lines, sorted by path). Edit rpcgen in vibe-creative-platform, then sync.
+    #[test]
+    fn the_vendored_rpcgen_is_unchanged() {
+        let dir = root().join("vendor/rpcgen");
+        let mut files = Vec::new();
+        let mut stack = vec![dir.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") || p.file_name().is_some_and(|n| n == "Cargo.toml") {
+                    files.push(p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        files.sort();
+        let mut listing = String::new();
+        for f in &files {
+            let h = Sha256::digest(std::fs::read(dir.join(f)).unwrap());
+            listing.push_str(&format!("{}  {f}\n", h.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+        }
+        let tree: String = Sha256::digest(listing.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let recorded = std::fs::read_to_string(dir.join("VENDORED")).unwrap_or_default();
+        let want = recorded.lines().find_map(|l| l.strip_prefix("tree: ")).unwrap_or_default().trim().to_string();
+        assert_eq!(tree, want, "vendor/rpcgen was changed here: change it in vibe-creative-platform/rpcgen, then tooling/sync_rpcgen.sh");
+    }
+}
 mod yaml;
 
 use std::collections::BTreeMap;

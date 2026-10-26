@@ -1178,6 +1178,19 @@ fn main() -> ExitCode {
         Some("bench") => bench::bench(rest),
         Some("cache") => client::cache(rest),
         Some("chat") => client::chat(rest),
+        // what the front door's #[rpc] methods make (the wfe pages' typed client), written under the repo root
+        Some("gen-api") => {
+            let root = std::path::PathBuf::from(rest.first().map(String::as_str).unwrap_or("."));
+            nextsycl_serve::home::api_files().into_iter().try_for_each(|(name, text)| {
+                let p = root.join(name);
+                if let Some(d) = p.parent() {
+                    std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+                }
+                std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))?;
+                println!("{}", p.display());
+                Ok::<(), String>(())
+            })
+        }
         Some("version") => {
             println!("nextsycl {VERSION}");
             Ok(())

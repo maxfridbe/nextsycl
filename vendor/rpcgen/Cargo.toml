@@ -1,0 +1,22 @@
+# rpcgen: an RPC method is its handler. Shared by vibe-creative-platform (where it lives) and nextcuda (which
+# vendors this directory: tooling/sync_rpcgen.sh there copies it and records its hash; a test in each repo fails
+# when the copy was changed by hand). Standalone on purpose: no workspace keys, so the copy builds anywhere.
+[package]
+name = "rpcgen"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "RPC methods described once, by their handlers: #[derive(Rpc)], #[rpc], rpc_methods!, and the OpenAPI document and TypeScript client made from them"
+
+[features]
+default = ["axum"]
+# async handlers answering an axum Response (vibe-creative-platform); without it, sync handlers only (nextcuda)
+axum = ["dep:axum"]
+
+[dependencies]
+rpcgen-macros = { path = "macros", version = "0.2.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+serde_yaml = "0.9"
+axum = { version = "0.8", optional = true, default-features = false, features = ["json"] }
