@@ -22,6 +22,17 @@ Write one line per fact the viewer needs, then make each shot's prompt state its
 - **The test**: look only at the middle frame of each clip. Can a stranger say who is speaking to whom, where, and what has
   just happened? If not, the staging is wrong, whatever the judge scores.
 
+## 1b. Write a scene in its genre's grammar, not as one long shot
+
+A scene that is one unbroken shot of the action reads as a documentary, not as the genre. A chase is **short shots across different
+set-ups, a cut every 1-2 s**: a low wide of the hero bursting out, a close-up of her panicked face, ground-level boots, an
+over-the-shoulder in which the pursuer appears behind her, an obstacle thrown behind her and vaulted, a close-up of his
+determination, a wide into the alley, a high angle down it. Put 3 shots in a clip (`[Shot 2] At 00:01.800, the camera cuts to ...`),
+keep the **screen direction constant in every travelling shot** (she runs to the right, he is behind her), keep one light, and carry
+the score across the clips. Check the pace as a number: cuts per second of film (frame differences; ffmpeg's scene score missed 6 of 8
+cuts in a dark film) with an average shot length of at most 2.5 s for a chase. A scene's genre has such a grammar (dialogue:
+shot / reverse shot and reactions; time passing: dissolves; a reveal: the look, then what is seen): write it down before the prompts.
+
 ## 2. Pictures that stage the shot
 
 - A reference picture's **orientation sets the motion**: a locomotive pictured from the front arrives however the prompt

@@ -70,6 +70,15 @@ def shot(action, sound, music="None.", look=WARM_LIGHT):
             f"non_diegetic_music: {music}")
 
 
+def shots(parts, sound, music="None.", look=WARM_LIGHT):
+    """A clip of several shots in H3's format: parts = [(time or None, text)]; the first is [Shot 1], the later ones 'At MM:SS.mmm, the camera cuts to ...'"""
+    body = []
+    for n, (at, text) in enumerate(parts, 1):
+        stamp = "" if n == 1 else f"At {int(at // 60):02}:{at % 60:06.3f}, the camera cuts to "
+        body.append(f"[Shot {n}] {look if n == 1 else ''} {stamp}{text}".replace("  ", " "))
+    return "integrated_multimodal_description: " + "\n".join(body) + f"\n\noverall_soundscape: {sound}\n\nnon_diegetic_music: {music}"
+
+
 # ---- T14: the mystery object -------------------------------------------------------------------------------------------
 ANAT_HANDS = ("Each image is one frame of a film shot. A person has two hands. Count the human hands and forearms visible in each image. Score 5 "
          "if no image shows more than two hands, 1 if any image shows three or more hands or an extra arm that cannot belong to the same person.")
@@ -189,16 +198,18 @@ T30 = {
          "(her glistening eyes, his kind nod, her alone and waving at the end)?", [("she", 0.7), ("he", 0.7), ("away", 0.8)]),
     ],
 }
-# ---- T7: the chase ------------------------------------------------------------------------------------------------------
-# the geography every shot keeps: one wet street, she runs from the LEFT of the frame to the RIGHT the whole time, he is BEHIND her (on her left),
-# the alley mouth is ahead on the right; one continuous tracking shot (each clip carries on the last: its picture and sound)
+# ---- T7: the chase -----------------------------------------------------------------------------------------------------
+# Hollywood chase grammar, not one long side-on tracking shot: short shots (a cut every 1-2 s) across different set-ups - a low burst out of a doorway, a
+# close-up of her panicked face, ground-level boots, an over-the-shoulder, an obstacle thrown behind her, a close-up of his determination, a high angle into the
+# alley - the SCREEN DIRECTION constant (every travelling shot goes to the right, he is always behind her), one overcast dusk light, a driving score carried across
 PURSUER = ("a tall man in a long black wool coat and a dark grey hat, clean-shaven, with a hard face")
-CHASE_LOOK = "Live-action, cinematic, overcast blue-grey dusk, a wet street lit by the warm lamps of the shopfronts, steady soft light with no sun and no glare, shallow depth of field."
-TRACK = "The camera tracks sideways at the runners' pace; the light level and colour hold from the first frame to the last."
-RUN_SOUND = "Fast footsteps splashing on wet cobbles, heavy breathing, falling rain, a distant siren."
+CHASE_LOOK = ("Live-action, cinematic, handheld camera, overcast blue-grey dusk, a wet cobbled street lit by the warm lamps of the shopfronts, steady soft light "
+              "with no sun and no glare, shallow depth of field.")
+CHASE_SOUND = "Fast footsteps splashing on wet cobbles, ragged breathing, rain, a distant siren."
+CHASE_SCORE = "A tense, driving, percussive chase score with low strings and a pounding pulse, building."
 T7 = {
     "title": "the chase",
-    "guided": True,
+    "max_asl": 2.5,   # the average shot length of the film, s: a chase cuts every 1-2 s
     "pictures": {
         "street": ("cinematic photograph of a narrow wet cobbled street at dusk, shopfronts with warm lit windows, puddles reflecting lamplight, a dark "
                    "alley opening on the right side of the street ahead, no people", "1024x768"),
@@ -207,35 +218,44 @@ T7 = {
     },
     "voices": [],
     "clips": [
-        ("run1", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
-         shot("A wide tracking shot along the wet cobbled street of <Picture 2>: the woman from the character sheet <Picture 1> runs from the left of the "
-              "frame to the right, glancing back over her shoulder; twenty paces behind her, on her left, the tall man in the long black coat from the "
-              f"character sheet <Picture 3> runs after her. Rain, dusk light. {TRACK}", RUN_SOUND, look=CHASE_LOOK)),
-        ("run2", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
-         shot("The tracking shot goes on along the street of <Picture 2>: the woman from the character sheet <Picture 1> runs on toward the right, both "
-              "running flat out through the puddles, and the man in the long black coat from the character sheet <Picture 3>, behind her on her left, "
-              f"gains a few paces. {TRACK}", RUN_SOUND, look=CHASE_LOOK)),
-        ("run3", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
-         shot("The tracking shot goes on: the woman from the character sheet <Picture 1> swerves right into the dark alley opening of <Picture 2> "
-              "ahead and runs into it, and the man in the long black coat from the character sheet <Picture 3>, behind her on her left, runs in after "
-              f"her. {TRACK}", RUN_SOUND, look=CHASE_LOOK)),
+        ("break", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
+         shots([(None, "a low wide shot from the cobbles: the woman from the character sheet <Picture 1> bursts out of a shop doorway onto the wet street of <Picture 2> "
+                       "and sprints away to the right, glancing back over her shoulder."),
+                (1.8, "a handheld close-up of her face as she runs to the right, wide eyes, her breath steaming, wet hair across her cheek, the camera tracking beside her."),
+                (3.4, "an over-the-shoulder shot from behind her: the tall man in the long black coat from the character sheet <Picture 3> bursts through the same doorway "
+                       "and runs after her, to the right.")],
+               CHASE_SOUND, CHASE_SCORE, look=CHASE_LOOK)),
+        ("pursuit", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
+         shots([(None, "a low tracking shot at ground level beside the runners: the boots of the woman from the character sheet <Picture 1> and of the man in the black coat from "
+                       "the character sheet <Picture 3> splash through puddles, both running to the right, his a few strides behind hers."),
+                (1.6, "a handheld medium shot from the front left: the woman runs to the right along the street of <Picture 2> and shoves a stack of wooden crates over behind her."),
+                (3.2, "a wide shot: the crates tumble across the cobbles and the man in the long black coat vaults them without breaking stride, still behind her, running to the right.")],
+               CHASE_SOUND, CHASE_SCORE, look=CHASE_LOOK)),
+        ("alley", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
+         shots([(None, "a tight close-up of the man in the long black coat from the character sheet <Picture 3>, running to the right, jaw set, eyes locked on his target, "
+                       "rain on his hat brim."),
+                (1.5, "a wide shot from the end of the street of <Picture 2>: the woman from the character sheet <Picture 1> swerves right into the dark alley opening and the man runs in after her."),
+                (3.0, "a high angle looking down into the narrow alley: both small figures run away from the camera toward a lit gate at the far end.")],
+               CHASE_SOUND, CHASE_SCORE, look=CHASE_LOOK)),
     ],
     "judge": [
         ("D1 identity: her", "Image 1 is a character sheet of a woman; images 2 and 3 are two shots of a film. Is the woman in each of images 2 and 3 "
-         "the same person as on the sheet (same hair, mustard cardigan, rust scarf)?", [("@sheet_mara", 0), ("run1", 0.5), ("run3", 0.3)]),
+         "the same person as on the sheet (same hair, mustard cardigan, rust scarf)? If her face is not visible give your best judgement from hair and clothes.",
+         [("@sheet_mara", 0), ("break", 0.4), ("pursuit", 0.5)]),
         ("D1 identity: him", "Image 1 is a character sheet of a man; images 2 and 3 are two shots of a film. Is the man in each of images 2 and 3 the "
-         "same person as on the sheet (long black coat, dark grey hat)?", [("@sheet_pursuer", 0), ("run1", 0.5), ("run2", 0.5)]),
-        ("D2 costume: she wears the same clothes", "Is the woman in images 1, 2 and 3 wearing the same clothes (a mustard-yellow cardigan and a "
-         "rust-red scarf) in every one?", [("run1", 0.5), ("run2", 0.5), ("run3", 0.3)]),
-        ("D4 place: one street", "Are images 1, 2 and 3 shots along the same wet cobbled street at dusk (the same shopfronts and lamp light)?",
-         [("run1", 0.5), ("run2", 0.5), ("run3", 0.3)]),
+         "same person as on the sheet (long black coat, dark grey hat)?", [("@sheet_pursuer", 0), ("pursuit", 0.9), ("alley", 0.1)]),
+        ("D2 costume: she wears the same clothes", "Is the woman in images 1, 2 and 3 wearing the same clothes (a mustard-yellow coat or cardigan and a "
+         "rust-red scarf) in each?", [("break", 0.45), ("pursuit", 0.45), ("pursuit", 0.85)]),
+        ("D8 coverage: a variety of set-ups", "Images 1 to 6 are frames from one chase sequence. Do they show at least four clearly different camera set-ups "
+         "(for example a wide shot, a close-up of a face, a low ground-level shot of boots, an over-the-shoulder shot, a high angle)?",
+         [("break", 0.1), ("break", 0.5), ("pursuit", 0.1), ("pursuit", 0.5), ("alley", 0.1), ("alley", 0.9)]),
+        ("D7 direction: she runs to the right", "In each of these two shots the woman runs along the street. Is she running toward the RIGHT side of the frame in both "
+         "image 1 and image 2?", [("pursuit", 0.45), ("pursuit", 0.85)]),
+        ("D4 geography: he chases her", "In images 1 and 2 both a woman in a yellow coat and a man in a long black coat are running. Is she AHEAD and he BEHIND her, "
+         "chasing? Give 1 if he is beside or ahead of her or they are not clearly running.", [("pursuit", 0.85), ("alley", 0.45)]),
         ("D5 look: the same light in all three", "Do images 1, 2 and 3 share one lighting and colour grade (an overcast blue-grey dusk with warm shopfront "
-         "lamps)? Give 1 if one of them has a bright golden sun glare, or is much darker or lighter than the others.", [("run1", 0.5), ("run2", 0.5), ("run3", 0.3)]),
-        ("D7 direction: she runs right, he is behind", "In every image the woman should be running toward the right of the frame and the man should be "
-         "behind her, on her left. Does that hold in each of images 1, 2 and 3?", [("run1", 0.5), ("run2", 0.5), ("run3", 0.3)]),
-        ("D4 geography: he chases her", "Images 1, 2 and 3 are shots of one chase. Is it clear that a man in a black coat is chasing a woman along a "
-         "street, both running, he behind her? Give 1 if they are not clearly running, or he is not behind her.", [("run1", 0.5), ("run2", 0.5), ("run3", 0.3)]),
-        ("D1 anatomy: one body each", ANAT_BODY, [("run1", 0.3), ("run1", 0.7), ("run2", 0.3), ("run2", 0.7), ("run3", 0.3), ("run3", 0.6)]),
+         "lamps)? Give 1 if one of them has a bright golden sun glare, or is much darker or lighter than the others.", [("break", 0.5), ("pursuit", 0.5), ("alley", 0.5)]),
+        ("D1 anatomy: one body each", ANAT_BODY, [("break", 0.3), ("break", 0.9), ("pursuit", 0.3), ("pursuit", 0.9), ("alley", 0.3), ("alley", 0.6)]),
     ],
 }
 
@@ -321,6 +341,17 @@ def colour_steps(film, skip_end=1.0):
     m = [[sum(f[c::3]) / 48 for c in range(3)] for f in fr]
     steps = [(sum(abs(a - b) for a, b in zip(m[i], m[i + 1])), (i + 1) / FPS) for i in range(len(m) - 1) if (i + 1) / FPS < len(m) / FPS - skip_end]
     return max(steps)
+
+
+def shot_cuts(film):
+    """Where a film cuts (seconds): consecutive frames (64x48 grey) that differ by more than 10 and four times the median step - the scene-change score of ffmpeg
+    missed the cuts in a dark film (it found 2 of 8)"""
+    o = subprocess.run([*K.FFMPEG, "-v", "error", "-i", str(film), "-vf", "scale=64:48,format=gray", "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
+    n = 64 * 48
+    fr = [o[i:i + n] for i in range(0, len(o) - n + 1, n)]
+    d = [sum(abs(a - b) for a, b in zip(fr[i], fr[i + 1])) / n for i in range(len(fr) - 1)]
+    med = sorted(d)[len(d) // 2]
+    return [(i + 1) / FPS for i, x in enumerate(d) if x > max(10.0, 4 * med)]
 
 
 def measure_t19(local, ck):
@@ -624,6 +655,11 @@ def make(api, a, key, root):
         big, at_s = colour_steps(film)
         report["colour_step"] = {"largest": round(big, 1), "at_s": round(at_s, 2)}
         ck[f"the picture does not jump in colour (largest frame-to-frame step {big:.1f} at {at_s:.1f} s: under 15)"] = big < 15
+    if t.get("max_asl"):   # a film that must cut fast (a chase): the average shot length
+        cuts = shot_cuts(film)
+        asl = fp["seconds"] / (len(cuts) + 1)
+        report["cuts_s"] = [round(c, 2) for c in cuts]
+        ck[f"the pace of the genre ({len(cuts)} cuts in {fp['seconds']:.1f} s, average shot {asl:.1f} s: at most {t['max_asl']} s)"] = asl <= t["max_asl"]
     if key in MEASURES:
         MEASURES[key](local, ck)
 

@@ -198,3 +198,13 @@ light that changes on purpose.
 nicely. Measured on the film: steps of 49 (dawn to noon, 5.2 s) and 277 (noon to dusk, 9.8 s) in the mean picture colour between frames, against a median of 0.7:
 the picture was cut hard while the sound crossfaded. For a passage-of-time scene the picture now dissolves over the sound's crossfade (1.2 s,
 `blend_join(..., dissolve=True)`; the film is 1.4 s shorter): the largest step is 12.3, spread over the dissolve, and a check fails a dissolving trope above 15.
+
+**T7, the chase, rewritten** ("chases in Hollywood don't work like this"). The first versions were one continuous side-on tracking shot
+of two runners, carried over three clips: consistent, but a documentary of a chase. Rewritten with chase grammar: three clips of three shots
+each, a cut every 1-2 s across a low wide of her bursting out of a doorway, a close-up of her face, an over-the-shoulder with the pursuer appearing
+behind her; ground-level boots, her shoving crates over, him vaulting them; a close-up of his face, a wide into the alley, a high angle down it. The
+direction is constant (she runs right, he is behind), one overcast-dusk light, a driving score carried across the clips. Measured: 8 cuts in
+14.5 s, an average shot of 1.6 s (a new pace check, at most 2.5 s), coverage, costume, direction, geography, light and anatomy all 5 (identity 4 and 5).
+The first run of the checks failed (2 cuts, costume 1, direction 2, geography 1) and was wrong, not the film: ffmpeg's scene score found 2 of the 8 cuts in
+a dark film, and the judge was shown frames where one person is visible, a ground-level shot or a high angle, and asked about
+both people running right. The detector is now frame differences and the questions ask about the frames that show the thing.
