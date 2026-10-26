@@ -65,8 +65,8 @@ ILYA = ("an old man with a full white beard, kind blue eyes and a ruddy face, in
 SHEET = H.SHEET
 
 
-def shot(action, sound, music="None."):
-    return (f"integrated_multimodal_description: [Shot 1] {WARM_LIGHT} {action}\n\noverall_soundscape: {sound}\n\n"
+def shot(action, sound, music="None.", look=WARM_LIGHT):
+    return (f"integrated_multimodal_description: [Shot 1] {look} {action}\n\noverall_soundscape: {sound}\n\n"
             f"non_diegetic_music: {music}")
 
 
@@ -189,7 +189,144 @@ T30 = {
          "(her glistening eyes, his kind nod, her alone and waving at the end)?", [("she", 0.7), ("he", 0.7), ("away", 0.8)]),
     ],
 }
-TROPES = {"T14": T14, "T30": T30}
+# ---- T7: the chase ------------------------------------------------------------------------------------------------------
+# the geography every shot keeps: one wet street, she runs from the LEFT of the frame to the RIGHT the whole time, he is BEHIND her (on her left),
+# the alley mouth is ahead on the right; one continuous tracking shot (each clip carries on the last: its picture and sound)
+PURSUER = ("a tall man in a long black wool coat and a dark grey hat, clean-shaven, with a hard face")
+CHASE_LOOK = "Live-action, cinematic, overcast blue-grey dusk, a wet street lit by the warm lamps of the shopfronts, steady soft light with no sun and no glare, shallow depth of field."
+TRACK = "The camera tracks sideways at the runners' pace; the light level and colour hold from the first frame to the last."
+RUN_SOUND = "Fast footsteps splashing on wet cobbles, heavy breathing, falling rain, a distant siren."
+T7 = {
+    "title": "the chase",
+    "guided": True,
+    "pictures": {
+        "street": ("cinematic photograph of a narrow wet cobbled street at dusk, shopfronts with warm lit windows, puddles reflecting lamplight, a dark "
+                   "alley opening on the right side of the street ahead, no people", "1024x768"),
+        "sheet_mara": (f"{SHEET}: {MARA}", "1344x768"),
+        "sheet_pursuer": (f"{SHEET}: {PURSUER}", "1344x768"),
+    },
+    "voices": [],
+    "clips": [
+        ("run1", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
+         shot("A wide tracking shot along the wet cobbled street of <Picture 2>: the woman from the character sheet <Picture 1> runs from the left of the "
+              "frame to the right, glancing back over her shoulder; twenty paces behind her, on her left, the tall man in the long black coat from the "
+              f"character sheet <Picture 3> runs after her. Rain, dusk light. {TRACK}", RUN_SOUND, look=CHASE_LOOK)),
+        ("run2", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
+         shot("The tracking shot goes on along the street of <Picture 2>: the woman from the character sheet <Picture 1> runs on toward the right, both "
+              "running flat out through the puddles, and the man in the long black coat from the character sheet <Picture 3>, behind her on her left, "
+              f"gains a few paces. {TRACK}", RUN_SOUND, look=CHASE_LOOK)),
+        ("run3", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
+         shot("The tracking shot goes on: the woman from the character sheet <Picture 1> swerves right into the dark alley opening of <Picture 2> "
+              "ahead and runs into it, and the man in the long black coat from the character sheet <Picture 3>, behind her on her left, runs in after "
+              f"her. {TRACK}", RUN_SOUND, look=CHASE_LOOK)),
+    ],
+    "judge": [
+        ("D1 identity: her", "Image 1 is a character sheet of a woman; images 2 and 3 are two shots of a film. Is the woman in each of images 2 and 3 "
+         "the same person as on the sheet (same hair, mustard cardigan, rust scarf)?", [("@sheet_mara", 0), ("run1", 0.5), ("run3", 0.3)]),
+        ("D1 identity: him", "Image 1 is a character sheet of a man; images 2 and 3 are two shots of a film. Is the man in each of images 2 and 3 the "
+         "same person as on the sheet (long black coat, dark grey hat)?", [("@sheet_pursuer", 0), ("run1", 0.5), ("run2", 0.5)]),
+        ("D2 costume: she wears the same clothes", "Is the woman in images 1, 2 and 3 wearing the same clothes (a mustard-yellow cardigan and a "
+         "rust-red scarf) in every one?", [("run1", 0.5), ("run2", 0.5), ("run3", 0.3)]),
+        ("D4 place: one street", "Are images 1, 2 and 3 shots along the same wet cobbled street at dusk (the same shopfronts and lamp light)?",
+         [("run1", 0.5), ("run2", 0.5), ("run3", 0.3)]),
+        ("D5 look: the same light in all three", "Do images 1, 2 and 3 share one lighting and colour grade (an overcast blue-grey dusk with warm shopfront "
+         "lamps)? Give 1 if one of them has a bright golden sun glare, or is much darker or lighter than the others.", [("run1", 0.5), ("run2", 0.5), ("run3", 0.3)]),
+        ("D7 direction: she runs right, he is behind", "In every image the woman should be running toward the right of the frame and the man should be "
+         "behind her, on her left. Does that hold in each of images 1, 2 and 3?", [("run1", 0.5), ("run2", 0.5), ("run3", 0.3)]),
+        ("D4 geography: he chases her", "Images 1, 2 and 3 are shots of one chase. Is it clear that a man in a black coat is chasing a woman along a "
+         "street, both running, he behind her? Give 1 if they are not clearly running, or he is not behind her.", [("run1", 0.5), ("run2", 0.5), ("run3", 0.3)]),
+        ("D1 anatomy: one body each", ANAT_BODY, [("run1", 0.3), ("run1", 0.7), ("run2", 0.3), ("run2", 0.7), ("run3", 0.3), ("run3", 0.6)]),
+    ],
+}
+
+# ---- T19: the passage of time -------------------------------------------------------------------------------------------
+# the same room at three hours: one base picture, the other two EDITS of it (the layout cannot be rearranged), a static camera; the light and the
+# sound change on purpose and everything else holds
+ROOM = ("a small cosy room with one tall window on the left, a wooden table with a blue teapot and an open book on it, a red armchair by the wall "
+        "on the right, a patterned rug")
+NEUTRAL_LOOK = "Live-action, cinematic, natural light, shallow depth of field."
+STILL = "The camera is static on a tripod; the room is empty; the furniture and the objects do not move."
+T19 = {
+    "title": "the passage of time",
+    "first_frames": {"dawn": "room_dawn", "noon": "room_noon", "dusk": "room_dusk"},
+    "pictures": {
+        "room_dawn": (f"cinematic photograph of {ROOM}, early dawn light, soft pink and blue, long soft shadows, no people", "1024x768"),
+        # the other two hours are COLOUR GRADES of the dawn picture (an img2img re-light at a strength that changed the hour also changed the rendering:
+        # crunchy, HDR-like, saturated; at a strength that kept the rendering the hour did not change)
+        "room_noon": ("grade:colorbalance=rs=-0.06:bs=0.03:rm=-0.02:bm=0.0:rh=0.04:bh=-0.02,eq=brightness=0.14:contrast=1.2:gamma=1.15:saturation=1.05",
+                      "1024x768", "room_dawn"),
+        "room_dusk": ("grade:colorbalance=rs=0.16:bs=-0.2:rm=0.12:bm=-0.15:rh=0.08:bh=-0.1,eq=brightness=-0.08:contrast=1.12:saturation=1.2",
+                      "1024x768", "room_dawn"),
+    },
+    "voices": [],
+    "clips": [
+        ("dawn", "INT8", [], 5.0,
+         shot(f"{ROOM[0].upper() + ROOM[1:]}, at dawn: the soft pink and blue light slowly brightens, the light on the wall slowly warms. {STILL}",
+              "Birdsong at dawn, a clock ticking softly in the room.", look=NEUTRAL_LOOK)),
+        ("noon", "INT8", [], 5.0,
+         shot(f"{ROOM[0].upper() + ROOM[1:]}, at midday: strong white-yellow sunlight pours through the window and lies on the floor. {STILL}",
+              "A distant street, a fly buzzing at the window, a clock ticking softly in the room.", look=NEUTRAL_LOOK)),
+        ("dusk", "INT8", [], 5.0,
+         shot(f"{ROOM[0].upper() + ROOM[1:]}, at dusk: the low orange-red light slowly fades to a warm glow, long shadows creep across the rug. {STILL}",
+              "Crickets outside, a distant church bell, a clock ticking softly in the room.", look=NEUTRAL_LOOK)),
+    ],
+    "judge": [
+        ("D4 place: the same room", "Are images 1, 2 and 3 the same room: the same tall window on the left, the same table with a blue teapot and an open "
+         "book, the same red armchair on the right and rug, all in the same places?", [("dawn", 0.5), ("noon", 0.5), ("dusk", 0.5)]),
+        ("D2 props: the teapot and the book stay", "Is the blue teapot and the open book on the table present, the same and in the same place in each of "
+         "images 1, 2 and 3?", [("dawn", 0.5), ("noon", 0.5), ("dusk", 0.5)]),
+        ("D5 hour: dawn, noon, dusk", "Image 1 should look like dawn (soft pink and blue light), image 2 like bright midday (strong white-yellow sun, a "
+         "blue sky outside), image 3 like dusk (low orange-red sunset light). Does each image look like its hour?", [("dawn", 0.5), ("noon", 0.5), ("dusk", 0.5)]),
+        ("D5 style: one film", "Images 1, 2 and 3 are the same room at three hours, so IGNORE differences in the brightness and colour of the light. Do the three "
+         "have the same sharpness, texture and level of detail? Give 1 only if one looks sharpened, crunchy or HDR-like compared with the others.",
+         [("dawn", 0.5), ("noon", 0.5), ("dusk", 0.5)]),
+        ("D4 empty: nobody appears", "Is each of images 1, 2 and 3 free of any person, animal or moving figure?", [("dawn", 0.5), ("noon", 0.5), ("dusk", 0.5)]),
+    ],
+}
+
+
+def mean_rgb(clip, frac=0.5):
+    d = K.probe(clip)["seconds"]
+    o = subprocess.run([*K.FFMPEG, "-v", "error", "-ss", f"{d * frac:.3f}", "-i", str(clip), "-frames:v", "1", "-vf", "scale=1:1", "-f", "rawvideo",
+                        "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
+    return tuple(o[:3])
+
+
+def crispness(clip, frac=0.5):
+    """Mean absolute grey step between neighbouring pixels of a clip's middle frame (128x96): high for an over-sharpened, HDR-like picture"""
+    d = K.probe(clip)["seconds"]
+    o = subprocess.run([*K.FFMPEG, "-v", "error", "-ss", f"{d * frac:.3f}", "-i", str(clip), "-frames:v", "1", "-vf", "scale=128:96,format=gray", "-f", "rawvideo", "-"],
+                       capture_output=True, check=True).stdout
+    W, H = 128, 96
+    e = sum(abs(o[y * W + x + 1] - o[y * W + x]) for y in range(H) for x in range(W - 1)) + sum(abs(o[(y + 1) * W + x] - o[y * W + x]) for y in range(H - 1) for x in range(W))
+    return e / (W * H)
+
+
+def frame_change(clip):
+    """Mean absolute grey change between consecutive frames of a clip (64x48): near 0 for a static camera on a still room; sparkles and highlights
+    that appear and disappear (floating dust, a crawling texture) raise it"""
+    o = subprocess.run([*K.FFMPEG, "-v", "error", "-i", str(clip), "-vf", "scale=64:48,format=gray", "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
+    n = 64 * 48
+    fr = [o[i:i + n] for i in range(0, len(o) - n + 1, n)]
+    d = [sum(abs(a - b) for a, b in zip(fr[i], fr[i + 1])) / n for i in range(len(fr) - 1)]
+    return sum(d) / max(1, len(d))
+
+
+def measure_t19(local, ck):
+    """The light changes on purpose: noon brightest, dusk warmest, dawn bluest of the warm pair"""
+    c = {cid: mean_rgb(dst) for cid, dst, _ in local}
+    luma = {k: 0.299 * r + 0.587 * g + 0.114 * b for k, (r, g, b) in c.items()}
+    warm = {k: (r + 1) / (b + 1) for k, (r, g, b) in c.items()}
+    ck[f"noon is the brightest hour (luma dawn {luma['dawn']:.0f}, noon {luma['noon']:.0f}, dusk {luma['dusk']:.0f})"] = luma["noon"] > luma["dawn"] and luma["noon"] > luma["dusk"]
+    fc = {cid: frame_change(dst) for cid, dst, _ in local}
+    ck[f"no flicker in the still room (frame-to-frame change {fc['dawn']:.2f}, {fc['noon']:.2f}, {fc['dusk']:.2f}: each under 0.8)"] = max(fc.values()) < 0.8
+    cr = {cid: crispness(dst) for cid, dst, _ in local}
+    ck[f"the three hours are rendered alike (crispness {cr['dawn']:.1f}, {cr['noon']:.1f}, {cr['dusk']:.1f}: none over 1.6x another)"] = max(cr.values()) <= 1.6 * min(cr.values())
+    ck[f"dusk is warmer than noon and dawn (red/blue {warm['dawn']:.2f}, {warm['noon']:.2f}, {warm['dusk']:.2f})"] = warm["dusk"] > warm["noon"] and warm["dusk"] > warm["dawn"]
+
+
+MEASURES = {"T19": measure_t19}
+TROPES = {"T7": T7, "T14": T14, "T19": T19, "T30": T30}
 
 
 def keyframe(clip, dst, frac, width=640):
@@ -316,13 +453,23 @@ def make(api, a, key, root):
             api.rpc("system.unload", {"model": m})
         except RuntimeError:
             pass
-    for p, (prompt, size) in t["pictures"].items():
+    for p, spec in t["pictures"].items():
+        prompt, size, base = spec[0], spec[1], (spec[2] if len(spec) > 2 else None)   # base: a picture of this trope that this one is an edit of (same room, another hour)
         dst = out / f"{p}.png"
         if not dst.exists():
-            print(f"[{key}] picture {p}: {a.image_model} {size}", flush=True)
-            r = api.rpc("image.generate", {"model": a.image_model, "prompt": prompt, "size": size, "steps": 28, "seed": a.seed})
-            url = r["data"][0]["url"]
-            api.get(url[url.index("/v1/"):], dst)
+            print(f"[{key}] picture {p}: {a.image_model} {size}{' (re-lit from ' + base + ')' if base else ''}", flush=True)
+            if base and prompt.startswith("grade:"):   # the same picture at another hour by a colour grade: the rendering and the layout cannot change
+                subprocess.run([*K.FFMPEG, "-y", "-v", "error", "-i", str(out / f"{base}.png"), "-vf", prompt[6:], str(dst)], check=True)
+                r = None
+            elif base:
+                src = "data:image/png;base64," + base64.b64encode((out / f"{base}.png").read_bytes()).decode()
+                r = api.rpc("image.generate", {"model": a.image_model, "prompt": prompt, "image": src, "strength": spec[3] if len(spec) > 3 else 0.6,
+                                               "size": size, "steps": 28, "seed": a.seed})   # img2img: the base's layout, re-lit, in the base's own rendering
+            else:
+                r = api.rpc("image.generate", {"model": a.image_model, "prompt": prompt, "size": size, "steps": 28, "seed": a.seed})
+            if r:
+                url = r["data"][0]["url"]
+                api.get(url[url.index("/v1/"):], dst)
         up(f"{p}.png", dst)
     api.rpc("system.unload", {"model": a.image_model})
     for who in t["voices"]:
@@ -340,7 +487,8 @@ def make(api, a, key, root):
         report["voices_hz"] = pitches
         print(f"[{key}] voices: pitch {pitches}", flush=True)
 
-    t0, local, prev_name, prev_spoke = time.time(), [], None, False
+    t0, local, prev_name, prev_spoke, first_nf = time.time(), [], None, False, 0
+    G = 22   # frames a guided clip carries
     for i, c in enumerate(t["clips"], 1):
         if len(c) == 5:   # T14: no speech
             cid, engine, refs, secs, prompt = c
@@ -349,13 +497,22 @@ def make(api, a, key, root):
             cid, engine, refs, secs, (line, who), build = c
             prompt = build(line)
         nf = H.frames_for(line) if line else H.snap((secs or 5.0) * FPS)
+        guided = bool(t.get("guided")) and prev_name is not None   # the shot goes on: a later clip begins with the last G frames of the one before
+        if guided:
+            nf = K.snap(first_nf + G, nearest=True)
+        first_nf = first_nf or nf
         body = {"prompt": prompt, "seconds": round(nf / FPS, 4), "steps": steps, "seed": a.seed + i, "width": w, "height": h, "project": project,
-                "queue": True, "label": f"{key} {run} {i:02}/{len(t['clips']):02}: {cid}",
-                "ref_images": [files[r] for r in refs if not r.startswith("@")]}
+                "queue": True, "label": f"{key} {run} {i:02}/{len(t['clips']):02}: {cid}"}
+        if [r for r in refs if not r.startswith("@")]:
+            body["ref_images"] = [files[r] for r in refs if not r.startswith("@")]
+        if cid in t.get("first_frames", {}):   # a clip that starts on a picture (the room at its hour)
+            body["first_frame"] = files[t["first_frames"][cid]]
         auds = [files[r[1:]] for r in refs if r.startswith("@voice")]
         if auds:
             body["ref_audios"] = auds
-        if prev_name and not prev_spoke:   # the sound goes on across the cut: the last 22 frames' worth of the clip before (no picture is carried, so a plain cut plays
+        if guided:   # picture and sound both go on (the join overlaps them)
+            body |= {"guide_clip": f"{prev_name}:{G}:0", "first_audio": prev_name, "first_audio_s": round(G / FPS, 4)}
+        elif prev_name and not prev_spoke:   # the sound goes on across the cut: the last 22 frames' worth of the clip before (no picture is carried, so a plain cut plays
             # nothing twice) - but never the tail of a speaking clip: its last word comes back as the first 0.5 s of this one (heard twice at the cut)
             body |= {"first_audio": prev_name, "first_audio_s": round(22 / FPS, 4)}
         if upscale > 1:
@@ -382,7 +539,7 @@ def make(api, a, key, root):
         local.append((cid, dst, who))
 
     heard = {}
-    if not a.no_transcribe:   # what is said and when: the lines once, and where the sound may be blended at a cut
+    if not a.no_transcribe and any(who for _, _, who in local):   # what is said and when: the lines once, and where the sound may be blended at a cut
         for m in ("minimax-h3", "minimax-h3-q6k", "minimax-h3-q4km", "minimax-h3-ref2va"):
             try:
                 api.rpc("system.unload", {"model": m})
@@ -399,7 +556,12 @@ def make(api, a, key, root):
         else:
             speech.append((0.0, K.probe(dst)["frames"] / FPS) if who else None)
     film = out / "film.mp4"
-    total, blends = blend_join([d for _, d, _ in local], [-18.0 if who else -22.0 for _, _, who in local], film, speech)
+    gd = bool(t.get("guided"))
+    if gd:   # one shot going on: each later clip begins with the last G frames of the one before; the join cuts the picture in their middle and cross-fades the sound
+        K.join([d for _, d, _ in local], film, G, FPS, -18.0, 1.0)
+        blends = [(0.0, 0.0)] * len(local)
+    else:
+        total, blends = blend_join([d for _, d, _ in local], [-18.0 if who else -22.0 for _, _, who in local], film, speech)
     report["blends"] = [{"cut": i, "overlap_s": d, "ramp_s": r} for i, (d, r) in enumerate(blends) if i]
     fp = K.probe(film)
     ck = report["checks"]
@@ -407,15 +569,19 @@ def make(api, a, key, root):
     ck["clips are the size asked"] = all(c["width"] >= w and c["height"] >= h for c in cl)
     ck["clips are the length asked"] = all(c["frames"] == c["asked"] for c in cl)
     ck["clips have sound"] = all(c["audio"] and c["loudness_lufs"] is not None for c in cl)
-    trimmed = sum(round(d * FPS) for d, _ in blends)
+    trimmed = G * (len(local) - 1) if gd else sum(round(d * FPS) for d, _ in blends)
     ck["film is the clips cut together"] = abs(fp["frames"] - (sum(c["frames"] for c in cl) - trimmed)) <= 1 and fp["audio"]
+    if gd:   # each clip begins with the last one's end (the frame G-1 of a later clip is the last clip's last frame)
+        seams = [K.corr(K.thumb(local[i][1], last=True), K.thumb(local[i + 1][1], at=G - 1)) for i in range(len(local) - 1)]
+        report["seams"] = [round(x, 3) for x in seams]
+        ck["each clip begins with the last one's end (seams " + ", ".join(f"{x:.2f}" for x in seams) + ")"] = all(x > 0.8 for x in seams)
     durs = [K.probe(dst)["frames"] / FPS for _, dst, _ in local]
     start = [0.0]   # where each clip's picture starts in the film (each later clip's picture is trimmed by its blend overlap)
     for j in range(len(local) - 1):
         start.append(start[j] + durs[j] - blends[j][0])
     spoken = [(start[j] - blends[j][0] + sp[0], start[j] - blends[j][0] + sp[1]) if sp else None for j, sp in enumerate(speech)]
-    cuts = start[1:]
-    steps = cut_steps(film, cuts)
+    cuts = start[1:] if not gd else []
+    steps = cut_steps(film, cuts) if cuts else []
     report["cut_steps_db"] = steps
     for i, st in enumerate(steps, 1):   # a cut with no word within 0.3 s either side must not jump in the sound's level
         near = any(w and w[0] < cuts[i - 1] + 0.3 and w[1] > cuts[i - 1] - 0.3 for w in (spoken[i - 1], spoken[i]))
@@ -429,6 +595,9 @@ def make(api, a, key, root):
         a_hz = [c["pitch_hz"] for c in cl if c["who"] == wa and c["pitch_hz"]]
         b_hz = [c["pitch_hz"] for c in cl if c["who"] == wb and c["pitch_hz"]]
         ck[f"{wa}'s clips are higher than {wb}'s"] = bool(a_hz and b_hz) and min(a_hz) > max(b_hz)
+
+    if key in MEASURES:
+        MEASURES[key](local, ck)
 
     # what is said: each line once, and a cut must not replay the end of the line before it (first_audio carries a speaking clip's last word)
     if heard:
@@ -482,7 +651,7 @@ def main():
     ap.add_argument("--url", default="http://localhost:8000")
     ap.add_argument("--token")
     ap.add_argument("--out", default="trope-scenes")
-    ap.add_argument("--only", default="T14,T30", help="the tropes to make (T14, T30)")
+    ap.add_argument("--only", default="T14,T30", help="the tropes to make (T7 chase, T14 mystery object, T19 passage of time, T30 farewell)")
     ap.add_argument("--quick", action="store_true", help="384x288, 8 steps, no upscale")
     ap.add_argument("--width", type=int)
     ap.add_argument("--height", type=int)

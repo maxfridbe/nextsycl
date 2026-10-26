@@ -177,3 +177,19 @@ new scene's sound in (up to 1 s) and crossfades it over the old sound's end (up 
 in step) wherever no word sits within the overlap and the ramp; a cut with speech near it stays a plain cut. Steps now 0.1 and
 3.8 dB, and a check fails a film whose sound steps by more than 8 dB at a cut with no word within 0.3 s of it. The film is about 1 s
 shorter (the trimmed starts of the shots). The same rule is in the skill.
+
+**T7, the chase and T19, the passage of time** (hardac1, `--quick`). Next two tropes, chosen to cover motion carried across cuts and
+light that changes on purpose.
+
+- *T7*: three clips as one tracking shot (each begins with the last one's end: `guide_clip` + its sound, `K.join`), a runner
+  and a pursuer as Ref2VA references on a wet street, she runs left to right and he is behind her. With the default "warm golden
+  light" in the prompt the light drifted golden, grey, dark and a sun flare crossed clip 2 (place 1/5, a seam 0.78); with a steady overcast
+  dusk look all checks pass (seams 0.95, 0.98, identity 4 and 5, costume, place, light, direction, "he chases her" 5).
+- *T19*: the same room (a table with a blue teapot and an open book, a red armchair, a window) at dawn, noon, dusk, a static camera, each clip
+  starting on its hour's picture. Found by watching: **the scene changed completely halfway** (the noon and dusk pictures made by editing
+  or img2img'ing the dawn one came out crisper, HDR-like, saturated: crispness 8.9 against 26.4 and 26.5) and **highlights appeared and
+  disappeared** (the prompts said "dust motes drift in the light"; frame-to-frame change 1.1 and 3.7 against 0.3). Fix: noon and dusk are
+  colour grades of the dawn picture (crispness 8.9, 9.6, 8.2; change 0.36, 0.27, 0.25), no particles in the prompts. Passes: same room 5, the
+  props 5, the hours 4, one rendering 5, nobody appears 5, noon brightest (luma 122, 148, 65), dusk warmest (red/blue 1.41, 1.20, 1.66), the
+  sound blended at both cuts (steps -0.9 and 4.4 dB). The judge's "one film" question scored the same dusk 4/5 once and 1/5 the
+  next: asked to ignore the light of the hour it gives 5, and the crispness number is the check to trust.

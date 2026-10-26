@@ -29,6 +29,10 @@ Write one line per fact the viewer needs, then make each shot's prompt state its
 - One picture per place per camera position (the platform seen along its length; the carriage door seen from the platform),
   one character sheet per person, one picture per prop. Props keep their kind, not their ornament (a five-pointed star came
   out with six to eight points).
+- **The same place at another hour**: do not re-render it from the base picture. img2img at a strength that changed the hour
+  also changed the rendering (noon and dusk came out 3x crisper, HDR-like and saturated: "the scene changes completely halfway"),
+  and at a strength that kept the rendering the hour did not change. Grade the base picture (`colorbalance` + `eq` in ffmpeg):
+  same rendering, same layout, only the light moves. Check it as a number (below).
 - Edit a person's photo **only in the background** if their face must hold (stage restyling slimmed a face); crop tight.
 
 ## 3. Sound at a cut - the doubled-dialogue trap
@@ -59,11 +63,17 @@ Run them on every scene before calling it done (`trope_scenes.py` does the first
 5. **Look at the contact sheets and listen to the film.** A defect the judge never saw (a red blotch on a coat, an extra
    hand, a replayed word) is found here. Send the film to the user, not only the verdict.
 
+6. **Numbers for what the eye caught**, on a still scene (`measure_t19`): frame-to-frame change under 0.8 (the room clips with dust
+   motes in the prompt were 1.1 and 3.7, the fixed ones 0.27 and 0.25), crispness (neighbour-pixel step) within 1.6x across
+   the clips (8.9, 26.4, 26.5 before; 8.9, 9.6, 8.2 after), brightness and warmth ordered as the hours.
+
 ## 5. Prompt hygiene that bit us
 
 - Counts and plurals invite extras ("held in two hands ... the hands lift its lid" drew three); keep hands to wide and medium
   shots and show a macro insert's object alone.
-- cfg 1: every word renders, negations included. Say what is there.
+- cfg 1: every word renders, negations included. Say what is there. **Do not describe floating particles** ("dust motes drift in the
+  light"): they render as sparkles that appear and disappear. Do not leave a default look in the prompt that fights the scene
+  ("warm golden light" in a dawn / noon / dusk set, or in a chase that must hold one overcast light: golden flares drifted it).
 - Hold shot size, light and colour in words ("from the first frame to the last"); say the place is empty or extras re-roll.
 
 Related: docs/video/scenes.md (what each cut carries), docs/video/tropes.md (the scripts and their results),
