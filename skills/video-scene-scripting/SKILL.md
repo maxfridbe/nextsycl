@@ -39,6 +39,11 @@ Write one line per fact the viewer needs, then make each shot's prompt state its
   starting from silence and bursting in); with no picture carried, a plain cut then plays nothing twice.
 - One speaker per shot, the same voice sample on every clip of that person, each line sized to its clip with a beat after it.
 - Level each clip alone when joining; the film's sound is the clips' sound and nothing else.
+- **Blend the sound at a cut where no speech sits on it** (a new place, time or camera): a plain join switches the ambience in one
+  step (+16.8 dB into the train shot). Bring the new sound in gradually: ramp it in over up to 1 s and overlap it with the old
+  sound's end in a crossfade of up to 0.5 s, trimming the new clip's picture by the overlap so sound and picture stay in step.
+  Where a word is near the cut (a line's end or start within the overlap and the ramp), keep a plain cut with 6 ms fades.
+  `blend_join` in `tests/api/trope_scenes.py` does it from each clip's word times (steps then 0.1 and 3.8 dB).
 
 ## 4. Checks that catch what the eye and the judge miss
 
@@ -47,7 +52,7 @@ Run them on every scene before calling it done (`trope_scenes.py` does the first
 1. **Transcribe each clip** (`audio.transcribe` with timestamps): each line appears once; no word in the first 0.6 s of a clip
    repeats the last words of the line before it.
 2. Pitch per speaker against the voice sample, and speaker A's clips above speaker B's.
-3. Clip size, length, sound, loudness; the film is the clips cut together.
+3. Clip size, length, sound, loudness; the film is the clips cut together; **the sound level does not step by more than 8 dB at a cut with no word within 0.3 s of it**.
 4. A vision-model judge, one question per dimension - and **one for every failure seen before** (hands, direction of travel,
    the geography above). It passed a three-handed take and a train arriving while the prompt said leaving: it only answers
    what it is asked, and is generous.

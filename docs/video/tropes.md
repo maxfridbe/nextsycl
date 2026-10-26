@@ -170,3 +170,10 @@ there (not asked of the judge; the lamp light is the likely source).
   geography question 5, the train leaving 5 (the old question, whether the engine shrinks, failed a train that passes and then
   recedes and was reworded; by eye the shot does show it leaving). The skill `skills/video-scene-scripting/SKILL.md` writes
   down the staging sheet, the sound rule and the checks so these are not repeated.
+
+**The sound at a cut** (reported by listening to the film): the joined film switched the ambience in one step at the cut into the
+train scene. Measured over 0.15 s either side of the cuts, the old plain join stepped +7.3 dB and +16.8 dB. `blend_join` now ramps the
+new scene's sound in (up to 1 s) and crossfades it over the old sound's end (up to 0.5 s, the new picture trimmed by the same so sound and picture stay
+in step) wherever no word sits within the overlap and the ramp; a cut with speech near it stays a plain cut. Steps now 0.1 and
+3.8 dB, and a check fails a film whose sound steps by more than 8 dB at a cut with no word within 0.3 s of it. The film is about 1 s
+shorter (the trimmed starts of the shots). The same rule is in the skill.

@@ -38,6 +38,9 @@ check fails.
 
 import argparse
 import base64
+import math
+import struct
+import wave
 import json
 import re
 import shlex
@@ -221,12 +224,75 @@ def norm_words(text):
 
 
 def transcribe(api, clip):
-    """What a clip says, with times: [(word, start_s)] from the server's recogniser (whisper)"""
+    """What a clip says, with times: [(word, start_s, end_s)] from the server's recogniser (whisper)"""
     wav = Path(clip).with_suffix(".wav")
     subprocess.run([*K.FFMPEG, "-y", "-v", "error", "-i", str(clip), "-vn", "-ac", "1", "-ar", "16000", str(wav)], check=True)
     r = api.rpc("audio.transcribe", {"audio": base64.b64encode(wav.read_bytes()).decode(), "timestamps": True}, 900)
     wav.unlink()
-    return [(norm_words(w["text"])[0], w["start"]) for w in r.get("words", []) if norm_words(w["text"])]
+    return [(norm_words(w["text"])[0], w["start"], w["end"]) for w in r.get("words", []) if norm_words(w["text"])]
+
+
+def blend_join(clips, targets, out, speech, fade=1.0, max_overlap=0.5, max_ramp=1.0):
+    """Plain picture cuts, and the sound blended at a cut where no speech sits on it: each clip's sound levelled alone to its LUFS, then
+    - a cut with quiet either side (no word within the overlap and the ramp of it): the new clip's sound comes in gradually (a ramp of up to
+      `max_ramp` s) and overlaps the old one's end in a crossfade of up to `max_overlap` s; the new clip's picture is trimmed by the overlap so
+      sound and picture stay in step (a J-cut)
+    - a cut with speech near it: a plain cut, 6 ms in and out so it does not click
+    `speech[i]` is (first_word_start, last_word_end) of clip i in seconds, or None if it says nothing. Returns (seconds, [(overlap, ramp)] a cut)"""
+    n, vparts, aparts, blends = len(clips), [], [], [(0.0, 0.0)]
+    durs = [K.probe(c)["frames"] / FPS for c in clips]
+    for i in range(1, n):
+        prev, cur = speech[i - 1], speech[i]
+        tail = durs[i - 1] - (prev[1] if prev else 0.0) if prev else durs[i - 1]
+        head = cur[0] if cur else durs[i]
+        d = min(max_overlap, tail - 0.05, head - 0.05)
+        d = round(d * FPS) / FPS if d >= 0.15 else 0.0
+        blends.append((d, min(max_ramp, head - 0.05) if d else 0.0))
+    for i, (c, t) in enumerate(zip(clips, targets)):
+        e = K.loudness(c)
+        g = f"volume={t - e:.2f}dB," if e is not None else ""
+        d, ramp = blends[i]
+        # the sound exactly the picture's length (a clip's sound runs a fraction of a frame long)
+        fin = f"afade=t=in:d={ramp:.3f}:curve=qsin" if ramp else "afade=t=in:d=0.006"
+        nxt_blends = i + 1 < n and blends[i + 1][0] > 0
+        fout = "" if nxt_blends else f",afade=t=out:st={durs[i] - 0.006:.4f}:d=0.006"
+        aparts.append(f"[{i}:a]{g}apad,atrim=end={durs[i]:.6f},asetpts=PTS-STARTPTS,alimiter=limit=0.891:level=disabled,{fin}{fout}[a{i}]")
+        vparts.append(f"[{i}:v]trim=start_frame={round(d * FPS)},setpts=PTS-STARTPTS[v{i}]")
+    chain, last = [], "a0"
+    for i in range(1, n):
+        d = blends[i][0]
+        nxt = f"A{i}"
+        if d:
+            chain.append(f"[{last}][a{i}]acrossfade=d={d:.4f}:c1=qsin:c2=qsin[{nxt}]")
+        else:
+            chain.append(f"[{last}][a{i}]concat=n=2:v=0:a=1[{nxt}]")
+        last = nxt
+    total = sum(durs) - sum(d for d, _ in blends)
+    fc = aparts + vparts + chain
+    fc.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]")
+    fc.append(f"[v]fade=t=out:st={total - fade:.3f}:d={fade}[vf];[{last}]afade=t=out:st={total - fade:.3f}:d={fade}[af]")
+    cmd = [*K.FFMPEG, "-y", "-v", "error"]
+    for c in clips:
+        cmd += ["-i", str(c)]
+    cmd += ["-filter_complex", ";".join(fc), "-map", "[vf]", "-map", "[af]", "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+            "-pix_fmt", "yuv420p", "-r", str(FPS), "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)]
+    subprocess.run(cmd, check=True)
+    return total, blends
+
+
+def level_db(wav_samples):
+    return 20 * math.log10(max(1.0, (sum(x * x for x in wav_samples) / max(1, len(wav_samples))) ** 0.5) / 32768)
+
+
+def cut_steps(film, cuts, window=0.15):
+    """The change in sound level across each cut (dB, after minus before, over `window` s) of a film"""
+    wav = Path(film).with_suffix(".steps.wav")
+    subprocess.run([*K.FFMPEG, "-y", "-v", "error", "-i", str(film), "-vn", "-ac", "1", "-ar", "16000", str(wav)], check=True)
+    with wave.open(str(wav)) as w:
+        d = struct.unpack("<%dh" % w.getnframes(), w.readframes(w.getnframes()))
+    wav.unlink()
+    r = 16000
+    return [round(level_db(d[int(t * r):int((t + window) * r)]) - level_db(d[int((t - window) * r):int(t * r)]), 1) for t in cuts]
 
 
 def make(api, a, key, root):
@@ -315,15 +381,46 @@ def make(api, a, key, root):
               f"{', pitch ' + str(row['pitch_hz']) + ' Hz' if who else ''}", flush=True)
         local.append((cid, dst, who))
 
+    heard = {}
+    if not a.no_transcribe:   # what is said and when: the lines once, and where the sound may be blended at a cut
+        for m in ("minimax-h3", "minimax-h3-q6k", "minimax-h3-q4km", "minimax-h3-ref2va"):
+            try:
+                api.rpc("system.unload", {"model": m})
+            except RuntimeError:
+                pass
+        for cid, dst, who in local:
+            heard[cid] = transcribe(api, dst)
+        report["heard"] = {cid: " ".join(w for w, _, _ in ws) for cid, ws in heard.items()}
+    speech = []
+    for cid, dst, who in local:   # (first word start, last word end); unknown (no transcription) = speaking throughout when someone speaks
+        ws = heard.get(cid)
+        if ws is not None:
+            speech.append((ws[0][1], ws[-1][2]) if ws else None)
+        else:
+            speech.append((0.0, K.probe(dst)["frames"] / FPS) if who else None)
     film = out / "film.mp4"
-    total = H.cut_join([d for _, d, _ in local], [-18.0 if who else -22.0 for _, _, who in local], film)
+    total, blends = blend_join([d for _, d, _ in local], [-18.0 if who else -22.0 for _, _, who in local], film, speech)
+    report["blends"] = [{"cut": i, "overlap_s": d, "ramp_s": r} for i, (d, r) in enumerate(blends) if i]
     fp = K.probe(film)
     ck = report["checks"]
     cl = report["clips"].values()
     ck["clips are the size asked"] = all(c["width"] >= w and c["height"] >= h for c in cl)
     ck["clips are the length asked"] = all(c["frames"] == c["asked"] for c in cl)
     ck["clips have sound"] = all(c["audio"] and c["loudness_lufs"] is not None for c in cl)
-    ck["film is the clips cut together"] = abs(fp["frames"] - sum(c["frames"] for c in cl)) <= 1 and fp["audio"]
+    trimmed = sum(round(d * FPS) for d, _ in blends)
+    ck["film is the clips cut together"] = abs(fp["frames"] - (sum(c["frames"] for c in cl) - trimmed)) <= 1 and fp["audio"]
+    durs = [K.probe(dst)["frames"] / FPS for _, dst, _ in local]
+    start = [0.0]   # where each clip's picture starts in the film (each later clip's picture is trimmed by its blend overlap)
+    for j in range(len(local) - 1):
+        start.append(start[j] + durs[j] - blends[j][0])
+    spoken = [(start[j] - blends[j][0] + sp[0], start[j] - blends[j][0] + sp[1]) if sp else None for j, sp in enumerate(speech)]
+    cuts = start[1:]
+    steps = cut_steps(film, cuts)
+    report["cut_steps_db"] = steps
+    for i, st in enumerate(steps, 1):   # a cut with no word within 0.3 s either side must not jump in the sound's level
+        near = any(w and w[0] < cuts[i - 1] + 0.3 and w[1] > cuts[i - 1] - 0.3 for w in (spoken[i - 1], spoken[i]))
+        if not near:
+            ck[f"the sound does not jump at cut {i} (step {st} dB, blend {blends[i][0]} s over {blends[i][1]:.2f} s)"] = abs(st) <= 8.0
     for who, ref in pitches.items():
         mine = [c["pitch_hz"] for c in cl if c["who"] == who]
         ck[f"{who}'s voice held (within 25% of the sample's {ref} Hz)"] = bool(ref) and all(m is not None and abs(m - ref) / ref <= 0.25 for m in mine)
@@ -334,28 +431,19 @@ def make(api, a, key, root):
         ck[f"{wa}'s clips are higher than {wb}'s"] = bool(a_hz and b_hz) and min(a_hz) > max(b_hz)
 
     # what is said: each line once, and a cut must not replay the end of the line before it (first_audio carries a speaking clip's last word)
-    if not a.no_transcribe:
-        for m in ("minimax-h3", "minimax-h3-q6k", "minimax-h3-q4km", "minimax-h3-ref2va"):
-            try:
-                api.rpc("system.unload", {"model": m})
-            except RuntimeError:
-                pass
-        heard, lines = {}, [(cid, c["who"]) for cid, c in report["clips"].items()]
-        for cid, dst, who in local:
-            heard[cid] = transcribe(api, dst)
-        report["heard"] = {cid: " ".join(w for w, _ in ws) for cid, ws in heard.items()}
+    if heard:
         prev = None
         for (cid, dst, who), clip_def in zip(local, t["clips"]):
             line = clip_def[4][0] if len(clip_def) == 6 else None
             ws = heard[cid]
             if line:
                 want = norm_words(line)
-                got = [w for w, _ in ws]
+                got = [w for w, _, _ in ws]
                 ck[f"{cid}: the line is said, once (heard {len(got)} words for {len(want)})"] = (
                     sum(w in got for w in want) >= 0.7 * len(want) and len(got) <= len(want) + 2)
             if prev is not None and prev[1]:   # the clip before spoke: its last words must not open this one
                 tail = norm_words(prev[1])[-3:]
-                early = [w for w, st in ws if st < 0.6]
+                early = [w for w, st, _ in ws if st < 0.6]
                 ck[f"{cid}: does not replay the end of the line before it"] = not (early and early[0] in tail)
             prev = (cid, line)
 
