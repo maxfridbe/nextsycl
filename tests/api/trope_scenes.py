@@ -204,57 +204,74 @@ T30 = {
 # alley - the SCREEN DIRECTION constant (every travelling shot goes to the right, he is always behind her), one overcast dusk light, a driving score carried across
 PURSUER = ("a tall man in a long black wool coat and a dark grey hat, clean-shaven, with a hard face")
 CHASE_LOOK = ("Live-action, cinematic, handheld camera, overcast blue-grey dusk, a wet cobbled street lit by the warm lamps of the shopfronts, steady soft light "
-              "with no sun and no glare, shallow depth of field.")
-CHASE_SOUND = "Fast footsteps splashing on wet cobbles, ragged breathing, rain, a distant siren."
+              "with no sun and no glare, shallow depth of field. At a full sprint every stride drives a boot hard into the wet cobbles with a splash, the weight landing, hair and coat bouncing with each step.")
+CHASE_SOUND = "Ragged breathing, falling rain, a distant siren."
 CHASE_SCORE = "A tense, driving, percussive chase score with low strings and a pounding pulse, building."
 T7 = {
     "title": "the chase",
-    "max_asl": 2.5,   # the average shot length of the film, s: a chase cuts every 1-2 s
+    "max_asl": 3.0,   # the average shot length of the film, s: wide chase shots cut every 2-3 s
     "pictures": {
-        "street": ("cinematic photograph of a narrow wet cobbled street at dusk, shopfronts with warm lit windows, puddles reflecting lamplight, a dark "
-                   "alley opening on the right side of the street ahead, no people", "1024x768"),
+        # three flat, frontal streets (the runners cross the frame left to right, nobody can approach the camera); A has the crate stack beside a shop door
+        "street_a": ("cinematic photograph, a flat frontal view straight across a wet cobbled street at dusk, like a stage set: the camera faces the long row of shopfronts squarely, the pavement and the cobbled road run exactly horizontally from the left edge of the frame to the right edge with no perspective receding into the distance, warm lit shop windows, plain blank painted signboards above the shops with no lettering, puddles reflecting lamplight, a tall stack of wooden crates standing against the wall beside one shop door on the pavement, no people", "1024x768"),
+        "street_b": ("cinematic photograph, a flat frontal view straight across a wet cobbled street at dusk, like a stage set: the camera faces the long row of shopfronts squarely, the pavement and the cobbled road run exactly horizontally from the left edge of the frame to the right edge with no perspective receding into the distance, warm lit shop windows, puddles reflecting lamplight, a row of a bakery, a chemist and a bookshop with plain blank painted signboards and no lettering anywhere, no crates, no people", "1024x768"),
+        "street_c": ("cinematic photograph, a flat frontal view straight across a wet cobbled street at dusk, like a stage set: the camera faces the long row of shopfronts squarely, the pavement and the cobbled road run exactly horizontally from the left edge of the frame to the right edge with no perspective receding into the distance, warm lit shop windows, puddles reflecting lamplight, a row of a tailor, a cafe and a closed ironmonger with plain blank painted signboards and no lettering anywhere, a dark archway at the right end, no crates, no people", "1024x768"),
+        "alley_view": ("cinematic photograph looking down a narrow dark wet alley between brick buildings toward a warm lit gate at the far end, no people", "1024x768"),
         "sheet_mara": (f"{SHEET}: {MARA}", "1344x768"),
         "sheet_pursuer": (f"{SHEET}: {PURSUER}", "1344x768"),
     },
     "voices": [],
+    # every shot is wide and static, the runners about a fifth of the frame high, crossing it left to right; each shot is a new street, and a runner who leaves the right
+    # edge in one shot is picked up entering the left edge in the next (the cut matches the action)
     "clips": [
-        ("break", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
-         shots([(None, "a low wide shot from the cobbles: the woman from the character sheet <Picture 1> bursts out of a shop doorway onto the wet street of <Picture 2> "
-                       "and sprints away to the right, glancing back over her shoulder."),
-                (1.8, "a handheld close-up of her face as she runs to the right, wide eyes, her breath steaming, wet hair across her cheek, the camera tracking beside her."),
-                (3.4, "an over-the-shoulder shot from behind her: the tall man in the long black coat from the character sheet <Picture 3> bursts through the same doorway "
-                       "and runs after her, to the right.")],
+        ("break", "REF2VA", ["sheet_mara", "street_b", "sheet_pursuer", "street_c"], 5.0,
+         shots([(None, "a wide static shot from across the street of <Picture 2>: the woman from the character sheet <Picture 1> runs flat out along the pavement from the left to the right, "
+                       "full body in frame, about a fifth of the frame high, glancing back, and she is ahead on the right; far behind her on the left the tall man in the long black coat from the "
+                       "character sheet <Picture 3> runs after her, small, also to the right. She is always ahead of him and he never overtakes her."),
+                (2.6, "a wide static shot from across a different street, <Picture 4>: the woman in the yellow coat runs flat out to the right, the same size, full body in frame, ahead on the right; "
+                       "the man in the long black coat runs a long way behind her on the left, also to the right. She is ahead, he chases her.")],
                CHASE_SOUND, CHASE_SCORE, look=CHASE_LOOK)),
-        ("pursuit", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
-         shots([(None, "a low tracking shot at ground level beside the runners: the boots of the woman from the character sheet <Picture 1> and of the man in the black coat from "
-                       "the character sheet <Picture 3> splash through puddles, both running to the right, his a few strides behind hers."),
-                (1.6, "a handheld medium shot from the front left: the woman runs to the right along the street of <Picture 2> and shoves a stack of wooden crates over behind her."),
-                (3.2, "a wide shot: the crates tumble across the cobbles and the man in the long black coat vaults them without breaking stride, still behind her, running to the right.")],
+        ("pursuit", "REF2VA", ["sheet_mara", "street_a", "sheet_pursuer"], 5.0,
+         shots([(None, "a wide static shot from across the street of <Picture 2>: the woman from the character sheet <Picture 1> runs along the pavement from the left to the right, "
+                       "full body in frame, about a fifth of the frame high, ahead of the man, and as she passes the tall stack of wooden crates standing beside the shop door she hauls it over behind her "
+                       "with one arm; the crates crash down across the pavement as she runs on to the right; far behind her on the left the tall man in the black coat runs after her."),
+                (2.6, "a wide static shot from across the same street: the crates lie across the pavement; the tall man in the long black coat from the character sheet <Picture 3> runs in from the left edge "
+                       "and vaults over them in his stride, the same size, full body in frame, while far ahead of him at the right edge of the frame the small yellow figure of the woman runs away "
+                       "to the right. She is ahead, he chases her.")],
                CHASE_SOUND, CHASE_SCORE, look=CHASE_LOOK)),
-        ("alley", "REF2VA", ["sheet_mara", "street", "sheet_pursuer"], 5.0,
-         shots([(None, "a tight close-up of the man in the long black coat from the character sheet <Picture 3>, running to the right, jaw set, eyes locked on his target, "
-                       "rain on his hat brim."),
-                (1.5, "a wide shot from the end of the street of <Picture 2>: the woman from the character sheet <Picture 1> swerves right into the dark alley opening and the man runs in after her."),
-                (3.0, "a high angle looking down into the narrow alley: both small figures run away from the camera toward a lit gate at the far end.")],
+        ("alley", "REF2VA", ["sheet_mara", "street_c", "sheet_pursuer", "alley_view"], 5.0,
+         shots([(None, "a wide static shot from across the street of <Picture 2>: the woman from the character sheet <Picture 1> runs flat out along the pavement from the left to the right, ahead of the man, "
+                       "full body in frame, about a fifth of the frame high, and swerves out of frame at the dark archway at the right end; far behind her on the left the man in the black coat runs after her."),
+                (2.6, "a wide static shot down the narrow alley of <Picture 4> from its mouth, the warm lamp at the gate lighting the wet cobbles: the woman, small but clearly visible in her "
+                       "yellow coat, runs away from the camera toward the lit gate at the far end, and the man in the black coat runs into the alley mouth far behind her. She is ahead, he chases her.")],
                CHASE_SOUND, CHASE_SCORE, look=CHASE_LOOK)),
     ],
     "judge": [
         ("D1 identity: her", "Image 1 is a character sheet of a woman; images 2 and 3 are two shots of a film. Is the woman in each of images 2 and 3 "
          "the same person as on the sheet (same hair, mustard cardigan, rust scarf)? If her face is not visible give your best judgement from hair and clothes.",
-         [("@sheet_mara", 0), ("break", 0.4), ("pursuit", 0.5)]),
+         [("@sheet_mara", 0), ("break", 0.8), ("pursuit", 0.5)]),
         ("D1 identity: him", "Image 1 is a character sheet of a man; images 2 and 3 are two shots of a film. Is the man in each of images 2 and 3 the "
-         "same person as on the sheet (long black coat, dark grey hat)?", [("@sheet_pursuer", 0), ("pursuit", 0.9), ("alley", 0.1)]),
-        ("D2 costume: she wears the same clothes", "Is the woman in images 1, 2 and 3 wearing the same clothes (a mustard-yellow coat or cardigan and a "
-         "rust-red scarf) in each?", [("break", 0.45), ("pursuit", 0.45), ("pursuit", 0.85)]),
-        ("D8 coverage: a variety of set-ups", "Images 1 to 6 are frames from one chase sequence. Do they show at least four clearly different camera set-ups "
-         "(for example a wide shot, a close-up of a face, a low ground-level shot of boots, an over-the-shoulder shot, a high angle)?",
-         [("break", 0.1), ("break", 0.5), ("pursuit", 0.1), ("pursuit", 0.5), ("alley", 0.1), ("alley", 0.9)]),
-        ("D7 direction: she runs to the right", "In each of these two shots the woman runs along the street. Is she running toward the RIGHT side of the frame in both "
-         "image 1 and image 2?", [("pursuit", 0.45), ("pursuit", 0.85)]),
-        ("D4 geography: he chases her", "In images 1 and 2 both a woman in a yellow coat and a man in a long black coat are running. Is she AHEAD and he BEHIND her, "
-         "chasing? Give 1 if he is beside or ahead of her or they are not clearly running.", [("pursuit", 0.85), ("alley", 0.45)]),
-        ("D5 look: the same light in all three", "Do images 1, 2 and 3 share one lighting and colour grade (an overcast blue-grey dusk with warm shopfront "
-         "lamps)? Give 1 if one of them has a bright golden sun glare, or is much darker or lighter than the others.", [("break", 0.5), ("pursuit", 0.5), ("alley", 0.5)]),
+         "same person as on the sheet (long black coat, dark grey hat)?", [("@sheet_pursuer", 0), ("pursuit", 0.15), ("pursuit", 0.9)]),
+        ("D8 camera distance: wide, full bodies", "Is each of images 1 to 4 a WIDE shot in which a runner is seen full-length (head to feet) with a lot of street around them, "
+         "and no close-up or medium shot?", [("break", 0.2), ("break", 0.8), ("pursuit", 0.15), ("alley", 0.15)]),
+        ("D7 direction: both run to the right", "In each of images 1 to 4 the people who run along the street should ALL be running toward the RIGHT of the frame. Give 1 if anyone runs "
+         "toward the left, or comes toward the camera, or someone crosses the other's path from the other direction.",
+         [("break", 0.2), ("break", 0.8), ("pursuit", 0.15), ("pursuit", 0.9)]),
+        ("D6 running: a real stride", "In each of images 1 to 3 does a runner have a running stride - legs apart, one foot off the ground, arms pumping - rather than gliding, "
+         "hovering or standing?", [("break", 0.8), ("pursuit", 0.15), ("alley", 0.15)]),
+        ("D2 obstacle: the crates belong to the street", "Image 1 is the start of a shot and image 2 is a moment later, from one chase. In image 1 a stack of wooden crates should already "
+         "stand at the edge of the street beside a shop door, before anyone touches it; in image 2 it has been knocked over. Is the stack present in image 1 at the side of the "
+         "street (not in the middle of the roadway), and is it the thing knocked over in image 2? Give 1 if crates appear from nowhere in the middle of the road.",
+         [("pursuit", 0.05), ("pursuit", 0.6)]),
+        ("D4 order: she leads, he chases", "In each of images 1 to 4 the woman in the yellow coat and the man in the long black coat run to the right. Is the WOMAN always AHEAD (further right) "
+         "and the man BEHIND her (to her left), as in a chase where he is after her? Give 1 if in any image the man is ahead of her or she is behind him. If only one of them is visible, judge "
+         "by the direction they run and give 3.", [("break", 0.2), ("break", 0.8), ("pursuit", 0.2), ("pursuit", 0.8)]),
+        ("D8 text: no garbled lettering", "Is each of images 1 to 3 free of any readable-looking but garbled shop signs, titles or lettering (signboards should be blank or clearly illegible)? "
+         "Give 1 if a sign shows strange scrambled letters.", [("break", 0.2), ("pursuit", 0.2), ("alley", 0.2)]),
+        ("D4 distance: he is far behind her", "In each of images 1, 2 and 3 a woman in a yellow coat runs along a street and a man in a long black coat chases her. Is the man FAR "
+         "behind her - many times her body length - or not in the frame with her at all? Give 1 if he is close behind or beside her.",
+         [("break", 0.1), ("pursuit", 0.9), ("alley", 0.45)]),
+        ("D5 look: the same light in all three", "Do images 1 and 2 share one lighting and colour grade (a blue-grey dusk with warm shopfront lamps)? Give 1 if one of them has a bright golden sun glare "
+         "or is much darker or lighter than the other.", [("break", 0.5), ("pursuit", 0.5)]),
         ("D1 anatomy: one body each", ANAT_BODY, [("break", 0.3), ("break", 0.9), ("pursuit", 0.3), ("pursuit", 0.9), ("alley", 0.3), ("alley", 0.6)]),
     ],
 }
@@ -351,7 +368,8 @@ def shot_cuts(film):
     fr = [o[i:i + n] for i in range(0, len(o) - n + 1, n)]
     d = [sum(abs(a - b) for a, b in zip(fr[i], fr[i + 1])) / n for i in range(len(fr) - 1)]
     med = sorted(d)[len(d) // 2]
-    return [(i + 1) / FPS for i, x in enumerate(d) if x > max(10.0, 4 * med)]
+    return [(i + 1) / FPS for i, x in enumerate(d)
+            if x > max(10.0, 4 * med) and (i == 0 or d[i - 1] < 0.5 * x) and (i + 1 >= len(d) or d[i + 1] < 0.5 * x)]   # a spike, not a burst of fast motion
 
 
 def measure_t19(local, ck):
