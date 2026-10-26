@@ -38,6 +38,8 @@ non_diegetic_music: <a score the people in the scene cannot hear, or "None.">
 - **Hands**: counts and plurals invite extras ("held in two hands ... the hands lift its lid" drew three), and an extreme
   close-up of hands distorts fingers. Keep hands to the wide and medium shots; for a macro insert show the object
   alone ("the lid swings open, the mechanism turns").
+- **A reference picture's orientation sets the direction of travel**: a locomotive pictured from the front arrives however the
+  prompt says "pulls away"; picture it from behind and say "pulls away from the camera, seen from behind, getting smaller".
 - **A prop's picture fixes its kind, not its ornament**: counts of points, stripes or letters drift (five points became
   six to eight). Pick props with a bold simple shape or colour.
 - **Do**: concrete visual and audio detail, physical descriptions of people (age, hair, clothes, posture).

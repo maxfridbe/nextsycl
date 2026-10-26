@@ -126,8 +126,8 @@ T30 = {
         "platform_a": (f"cinematic photograph of {STATION}, looking along the platform toward the train, no people", "1024x768"),
         "platform_b": (f"cinematic photograph of {STATION}, seen from the train's side: an open carriage door with a brass handrail and "
                        "the platform and lamp posts beyond, no people", "1024x768"),
-        "train": ("photograph of a vintage green steam locomotive with brass fittings and red wheels at a station platform, three-quarter "
-                  "view, golden light, no people", "1024x768"),
+        "train": ("photograph from behind of a vintage green steam train leaving a station platform: the back of the tender and the last carriages "
+                  "receding along the track toward a vanishing point, steam rising, brass fittings, golden light, no people", "1024x768"),
         "sheet_mara": (f"{SHEET}: {MARA}", "1344x768"),
         "sheet_ilya": (f"{SHEET}: {ILYA}", "1344x768"),
     },
@@ -151,10 +151,10 @@ T30 = {
              "His warm voice, close and clear; a locomotive idling, a soft hiss of steam, a distant station bell.")),
         ("away", "REF2VA", ["sheet_mara", "platform_a", "train"], 5.0, (None, None),
          lambda line: shot(
-             "A wide shot: the green steam locomotive <Picture 3> pulls slowly away along the platform of <Picture 2> toward the right, "
-             "steam billowing; the woman from the character sheet <Picture 1> stands alone on the platform in the golden light, turned "
-             "toward the train, lifting one hand in a slow wave as it goes. The camera is static.",
-             "The locomotive's slow chuffing, steam, the clack of wheels, a distant whistle.")),
+             "A wide shot from the end of the platform of <Picture 2>: the green steam train <Picture 3> pulls away from the camera along the track, seen from "
+             "behind, getting smaller and further away, steam billowing; the woman from the character sheet <Picture 1> stands alone on the platform in "
+             "the foreground in the golden light, her back to the camera, watching the train go and lifting one hand in a slow wave. The camera is static.",
+             "The locomotive's slow chuffing fading into the distance, steam, the clack of wheels, a distant whistle.")),
     ],
     "judge": [
         ("D1 identity: her", "Image 1 is a character sheet of a woman; images 2 and 3 are two shots of a film. Is the woman in each of "

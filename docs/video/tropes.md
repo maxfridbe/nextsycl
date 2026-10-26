@@ -146,3 +146,12 @@ the wide it appears to **arrive** (small, then large) where the script says it p
 (a question on the direction of travel is now). One flaw the judge did not see: a red blotch on his coat in the second clip.
 The train is the hard part of this trope, as the reference picture holds the kind of engine, not its build or the
 direction it goes.
+
+**T30 rerun, the train fixed** (hardac1, `--quick`). The reference picture was the cause of the arriving train: a front
+three-quarter view of the locomotive drew a train facing the camera and coming at it. With a **rear view** of a train leaving
+a platform as the reference and the shot worded "pulls away from the camera along the track, seen from behind, getting
+smaller and further away", the engine shrinks down the track while she waves with her back to the camera. All checks and
+all judged dimensions pass (her 216 Hz against 242, his 143 against 147; identity, place, light, eyelines, anatomy, the
+goodbye 5; the train 4, the direction of travel 5). By eye: the engine is still drawn showing its front while it recedes, a
+green tank engine rather than the reference's tender engine, and the red blotch on his coat in the second clip is still
+there (not asked of the judge; the lamp light is the likely source).
