@@ -139,7 +139,7 @@ The lid's star is still not the reference's: five points in the picture, six to 
 
 **T30, the farewell at the station** (hardac1, `--quick`, sound carried across clips; her clip 60 s, his 40 s, the wide 30 s).
 Measured: every check passed; her voice 216 Hz against the sample's 242, his 143 against 147 (her sound tail was carried into
-his clip and no voice leaked), hers higher than his. Judged: her identity 5, his 5, the place 5, the light 5, the eyelines
+his clip, which was later found to replay her last word, see below), hers higher than his. Judged: her identity 5, his 5, the place 5, the light 5, the eyelines
 across the cut 5, anatomy 5, the goodbye reads 5; **the train 2**. Looking at the sheets agrees on the people and
 disagrees on the train: it is a green engine with red wheels but smaller and a different shape from the reference, and in
 the wide it appears to **arrive** (small, then large) where the script says it pulls away, a thing the judge was not asked
@@ -155,3 +155,18 @@ all judged dimensions pass (her 216 Hz against 242, his 143 against 147; identit
 goodbye 5; the train 4, the direction of travel 5). By eye: the engine is still drawn showing its front while it recedes, a
 green tank engine rather than the reference's tender engine, and the red blotch on his coat in the second clip is still
 there (not asked of the judge; the lamp light is the likely source).
+
+**T30 restaged, and the doubled line** (reported by listening to the film). Two faults the checks had not been asked about:
+
+- *The dialogue was heard twice at a cut.* `first_audio` begins a clip's sound with the previous clip's tail; after her line that
+  tail is "keep warm", so his clip opened with "warm." (transcribed at 0.0-0.46 s) and the film said it twice. The earlier note
+  "no voice leaked" was wrong: a half-second of her voice does not move a clip's median pitch. Fix: carry sound only after a
+  clip that does not speak (T14's melody still carries), and transcribe every clip: each line once, nothing replayed at a cut.
+- *The three shots did not make one scene*: the train arrived in shot 1, he stood inside the carriage in shot 2 (an interior), the train
+  left in shot 3, so it was unclear whom she spoke to. Now the train **stands** at the platform on the right with its doors open
+  (shot 1, she looks right at a carriage door), he stands on the train in the open carriage door seen from the platform
+  (shot 2), and the same train leaves with him leaning out of the last door and her waving in the foreground (shot 3).
+  All checks pass: the lines once, no replay at a cut (she 205 Hz against 242, he 121 against 147), identity 5 and 5, the
+  geography question 5, the train leaving 5 (the old question, whether the engine shrinks, failed a train that passes and then
+  recedes and was reworded; by eye the shot does show it leaving). The skill `skills/video-scene-scripting/SKILL.md` writes
+  down the staging sheet, the sound rule and the checks so these are not repeated.

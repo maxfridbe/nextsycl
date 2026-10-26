@@ -15,6 +15,7 @@ We stand on the shoulders of giants.
 - **A single API control plane** - the front door on :8000
 - **A Docker-style CLI** - `nextsycl <kind> start | stop | ps | logs | ...`
 - **A porting methodology** - [CONTRIBUTING.md](CONTRIBUTING.md) and [the SYCL porting skill](skills/sycl-porting/SKILL.md)
+- **A video scene scripting method** - [the video scene scripting skill](skills/video-scene-scripting/SKILL.md): staging, sound at a cut, and the checks for a scene of several clips
 
 ## RUN
 

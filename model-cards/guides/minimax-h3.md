@@ -112,7 +112,7 @@ The motion must carry through the cuts, and the sound with it.
 | The cut | Use |
 |---|---|
 | the same shot goes on | `guide_clip` (22 frames) + `first_audio` |
-| a new shot in the same scene, the sound goes on (music, room tone) | `first_audio` = the clip before, `first_audio_s 0.9167`, no `guide_clip`; on every clip after the first (without it the sound starts again from nothing) |
+| a new shot in the same scene, the sound goes on (music, room tone) | `first_audio` = the clip before, `first_audio_s 0.9167`, no `guide_clip`; only after a clip that does **not speak** - after speech the tail is the last word and the next clip opens with it, heard twice - (without it the sound starts again from nothing) |
 | the same person speaks again | `ref_images` + `ref_audios` + the picture as `first_frame` and `last_frame` - on **every** clip of the person, the first too (without it the model draws a voice, a man's for a woman) |
 | the speaker changes | that person's `ref_images` + `ref_audios`; **one speaker a shot** (two in one shot put a voice on the wrong mouth) |
 | the same person, a new place | `ref_images [person's character sheet, the place's picture]`: "the woman from the character sheet `<Picture 1>` stands here, on the quay of `<Picture 2>`" |

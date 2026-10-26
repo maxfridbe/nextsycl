@@ -118,14 +118,16 @@ T14 = {
 }
 
 # ---- T30: farewell at the station ---------------------------------------------------------------------------------------
-STATION = ("a small old railway station platform in the golden hour, a green steam train waiting at the platform, iron lamp posts "
-           "with warm lamps, honey-coloured brick, wisps of steam")
+STATION = ("a small old railway station platform in the golden hour, iron lamp posts with warm lamps, honey-coloured brick")
+# the geography every shot keeps: the train STANDS at the platform on the right (doors open) until the last shot; she is on the platform
+# looking right; he is ON the train, in a carriage doorway, seen from the platform looking left; at the end the same train pulls away to the right
 T30 = {
     "title": "farewell at the station",
     "pictures": {
-        "platform_a": (f"cinematic photograph of {STATION}, looking along the platform toward the train, no people", "1024x768"),
-        "platform_b": (f"cinematic photograph of {STATION}, seen from the train's side: an open carriage door with a brass handrail and "
-                       "the platform and lamp posts beyond, no people", "1024x768"),
+        "platform_a": (f"cinematic photograph of {STATION}, looking along the platform: a green steam train stands motionless at the platform on the "
+                       "right with its carriage doors open, no steam rushing, no people", "1024x768"),
+        "platform_b": ("cinematic photograph taken from the platform, facing a standing green railway carriage: an open carriage door with a brass "
+                       "handrail, the dark carriage interior visible through the doorway, warm lamp light, no people", "1024x768"),
         "train": ("photograph from behind of a vintage green steam train leaving a station platform: the back of the tender and the last carriages "
                   "receding along the track toward a vanishing point, steam rising, brass fittings, golden light, no people", "1024x768"),
         "sheet_mara": (f"{SHEET}: {MARA}", "1344x768"),
@@ -136,24 +138,25 @@ T30 = {
         ("she", "REF2VA", ["sheet_mara", "platform_a", "@voice_mara"], None,
          ("Write to me when you arrive, and keep warm.", "mara"),
          lambda line: shot(
-             "A medium close-up, head and shoulders: the woman from the character sheet <Picture 1> stands on the platform of <Picture 2>, "
-             "turned toward the right of the frame where the train waits, the warm lamp light on her face, steam drifting behind her. She "
-             f"looks up toward the right with glistening eyes, then speaks in the voice of <Audio 1> (S1): <d>[English] {line}</d> The lips "
-             f"move with the words and she smiles bravely at the end. {LOCK}",
-             "Her warm voice, close and clear; a locomotive idling, a soft hiss of steam, a distant station bell.")),
+             "A medium close-up, head and shoulders: the woman from the character sheet <Picture 1> stands on the platform of <Picture 2>; the green "
+             "train stands motionless at the platform behind her on the right of the frame, its doors open. She looks to the right of the frame, "
+             "at an open carriage door, her eyes glistening, then speaks to the person there in the voice of <Audio 1> (S1): "
+             f"<d>[English] {line}</d> The lips move with the words and she smiles bravely at the end. {LOCK}",
+             "Her warm voice, close and clear; the quiet of a station, a soft hiss of steam from the standing locomotive.")),
         ("he", "REF2VA", ["sheet_ilya", "platform_b", "@voice_ilya"], None,
          ("I will, and you will wait for me at the harbour.", "ilya"),
          lambda line: shot(
-             "A medium close-up, head and shoulders, the reverse shot: the old man from the character sheet <Picture 1> stands in the open "
-             "carriage doorway of <Picture 2>, holding the brass handrail, turned toward the left of the frame where she stands on the "
-             f"platform, the warm lamp light on his face. He looks down toward the left with kind eyes, then speaks in the voice of <Audio 1> "
-             f"(S1): <d>[English] {line}</d> The lips move with the words and he nods and smiles at the end. {LOCK}",
-             "His warm voice, close and clear; a locomotive idling, a soft hiss of steam, a distant station bell.")),
-        ("away", "REF2VA", ["sheet_mara", "platform_a", "train"], 5.0, (None, None),
+             "A medium close-up, head and shoulders, the reverse shot, seen from the platform: the old man from the character sheet <Picture 1> "
+             "stands on the train, in the open doorway of the green carriage of <Picture 2>, one hand on the brass handrail. He looks down to the "
+             "left of the frame, at the platform where she stands, then speaks to her in the voice of <Audio 1> (S1): "
+             f"<d>[English] {line}</d> The lips move with the words and he nods and smiles at the end. {LOCK}",
+             "His warm voice, close and clear; the quiet of a station, a soft hiss of steam from the standing locomotive.")),
+        ("away", "REF2VA", ["sheet_mara", "platform_a", "train", "sheet_ilya"], 5.0, (None, None),
          lambda line: shot(
-             "A wide shot from the end of the platform of <Picture 2>: the green steam train <Picture 3> pulls away from the camera along the track, seen from "
-             "behind, getting smaller and further away, steam billowing; the woman from the character sheet <Picture 1> stands alone on the platform in "
-             "the foreground in the golden light, her back to the camera, watching the train go and lifting one hand in a slow wave. The camera is static.",
+             "A wide shot from the end of the platform of <Picture 2>: the green steam train <Picture 3> pulls away from the camera along the track on "
+             "the right, seen from behind, getting smaller and further away, steam billowing; the old man from the character sheet <Picture 4> leans "
+             "out of the open door of the last carriage, a small figure waving; the woman from the character sheet <Picture 1> stands on the platform "
+             "in the foreground on the left, her back to the camera, waving back. The camera is static.",
              "The locomotive's slow chuffing fading into the distance, steam, the clack of wheels, a distant whistle.")),
     ],
     "judge": [
@@ -169,9 +172,15 @@ T30 = {
          "woman should face right and in image 2 the man should face left. Does that hold?", [("she", 0.5), ("he", 0.5)]),
         ("D2 prop: the same train", "Image 1 is a reference picture of a green steam locomotive; image 2 is a shot of a film. Is the "
          "train in image 2 the same locomotive (green, brass fittings, red wheels)?", [("@train", 0), ("away", 0.3)]),
-        ("D6 motion: the train leaves", "Image 1, 2 and 3 are the start, middle and end of one shot of a steam locomotive. In a farewell the "
-         "train pulls away: it should get smaller and further away along the track. Does the locomotive get smaller and further away from "
-         "image 1 to image 3? Give 1 if it gets bigger and nearer.", [("away", 0.05), ("away", 0.5), ("away", 0.95)]),
+        ("D6 motion: the train leaves", "Images 1, 2 and 3 are the start, middle and end of one shot at a railway platform. A woman stands in the foreground; "
+         "a green train is beside the platform. In a farewell the train pulls away along the track. Does the train go away - at the start it is "
+         "alongside or near the platform, at the end it is further down the track, smaller, with its rear carriage showing? Give 1 if it stays put or "
+         "comes toward the camera.", [("away", 0.05), ("away", 0.5), ("away", 0.95)]),
+        ("D4 geography: she speaks to him on the train", "Images 1 to 4 are shots of one farewell at a railway station. Image 1: a woman on the platform "
+         "with a green train beside her; image 2: an old man; images 3 and 4: the train leaving. Is the geography legible? In image 1 the train should "
+         "STAND at the platform (not arrive); in image 2 the man should stand IN THE DOORWAY OF A TRAIN CARRIAGE (on the train, seen from outside, not "
+         "in a room or on the platform); in images 3 and 4 the same train should leave. Give 5 if all three hold, 1 if the train in image 1 is moving "
+         "or arriving or the man is not clearly on the train.", [("she", 0.5), ("he", 0.5), ("away", 0.2), ("away", 0.9)]),
         ("D1 anatomy: one body each", ANAT_BODY, [("she", 0.2), ("she", 0.6), ("he", 0.2), ("he", 0.6), ("away", 0.3), ("away", 0.7)]),
         ("D10 performance: the goodbye reads", "Images 1, 2 and 3 are the shots of a farewell. Does the emotion read as a tender goodbye "
          "(her glistening eyes, his kind nod, her alone and waving at the end)?", [("she", 0.7), ("he", 0.7), ("away", 0.8)]),
@@ -205,6 +214,19 @@ def ask(api, model, question, images):
     m = re.search(r'"score"\s*:\s*([1-5])', text)
     why = re.search(r'"why"\s*:\s*"([^"]*)"', text)
     return (int(m.group(1)) if m else None), (why.group(1) if why else text.strip()[:200])
+
+
+def norm_words(text):
+    return re.findall(r"[a-z']+", text.lower())
+
+
+def transcribe(api, clip):
+    """What a clip says, with times: [(word, start_s)] from the server's recogniser (whisper)"""
+    wav = Path(clip).with_suffix(".wav")
+    subprocess.run([*K.FFMPEG, "-y", "-v", "error", "-i", str(clip), "-vn", "-ac", "1", "-ar", "16000", str(wav)], check=True)
+    r = api.rpc("audio.transcribe", {"audio": base64.b64encode(wav.read_bytes()).decode(), "timestamps": True}, 900)
+    wav.unlink()
+    return [(norm_words(w["text"])[0], w["start"]) for w in r.get("words", []) if norm_words(w["text"])]
 
 
 def make(api, a, key, root):
@@ -252,7 +274,7 @@ def make(api, a, key, root):
         report["voices_hz"] = pitches
         print(f"[{key}] voices: pitch {pitches}", flush=True)
 
-    t0, local, prev_name = time.time(), [], None
+    t0, local, prev_name, prev_spoke = time.time(), [], None, False
     for i, c in enumerate(t["clips"], 1):
         if len(c) == 5:   # T14: no speech
             cid, engine, refs, secs, prompt = c
@@ -267,7 +289,8 @@ def make(api, a, key, root):
         auds = [files[r[1:]] for r in refs if r.startswith("@voice")]
         if auds:
             body["ref_audios"] = auds
-        if prev_name:   # the sound goes on across the cut: the last 22 frames' worth of the clip before (no picture is carried, so a plain cut plays nothing twice)
+        if prev_name and not prev_spoke:   # the sound goes on across the cut: the last 22 frames' worth of the clip before (no picture is carried, so a plain cut plays
+            # nothing twice) - but never the tail of a speaking clip: its last word comes back as the first 0.5 s of this one (heard twice at the cut)
             body |= {"first_audio": prev_name, "first_audio_s": round(22 / FPS, 4)}
         if upscale > 1:
             body |= {"upscale": upscale, "upscaler": "esrgan-general"}
@@ -282,6 +305,7 @@ def make(api, a, key, root):
             name = K.wait_clip(api, project, i, body["label"])
             dst = api.get(f"/v1/video/files/{name}", dst)
         prev_name = name if not (a.reuse and name == dst.name) else None
+        prev_spoke = bool(who)
         p = K.probe(dst)
         H.sheet(dst, out / f"{i:02}_{cid}.png")
         row = {"file": name, "frames": p["frames"], "asked": nf, "width": p["width"], "height": p["height"], "audio": p["audio"],
@@ -308,6 +332,32 @@ def make(api, a, key, root):
         a_hz = [c["pitch_hz"] for c in cl if c["who"] == wa and c["pitch_hz"]]
         b_hz = [c["pitch_hz"] for c in cl if c["who"] == wb and c["pitch_hz"]]
         ck[f"{wa}'s clips are higher than {wb}'s"] = bool(a_hz and b_hz) and min(a_hz) > max(b_hz)
+
+    # what is said: each line once, and a cut must not replay the end of the line before it (first_audio carries a speaking clip's last word)
+    if not a.no_transcribe:
+        for m in ("minimax-h3", "minimax-h3-q6k", "minimax-h3-q4km", "minimax-h3-ref2va"):
+            try:
+                api.rpc("system.unload", {"model": m})
+            except RuntimeError:
+                pass
+        heard, lines = {}, [(cid, c["who"]) for cid, c in report["clips"].items()]
+        for cid, dst, who in local:
+            heard[cid] = transcribe(api, dst)
+        report["heard"] = {cid: " ".join(w for w, _ in ws) for cid, ws in heard.items()}
+        prev = None
+        for (cid, dst, who), clip_def in zip(local, t["clips"]):
+            line = clip_def[4][0] if len(clip_def) == 6 else None
+            ws = heard[cid]
+            if line:
+                want = norm_words(line)
+                got = [w for w, _ in ws]
+                ck[f"{cid}: the line is said, once (heard {len(got)} words for {len(want)})"] = (
+                    sum(w in got for w in want) >= 0.7 * len(want) and len(got) <= len(want) + 2)
+            if prev is not None and prev[1]:   # the clip before spoke: its last words must not open this one
+                tail = norm_words(prev[1])[-3:]
+                early = [w for w, st in ws if st < 0.6]
+                ck[f"{cid}: does not replay the end of the line before it"] = not (early and early[0] in tail)
+            prev = (cid, line)
 
     # the judge: frames of the clips and the reference pictures, one question a dimension
     if not a.no_judge:
@@ -355,6 +405,7 @@ def main():
     ap.add_argument("--speech-model", default="qwen3-tts-custom")
     ap.add_argument("--judge-model", default="qwen3.8-27b-q4")
     ap.add_argument("--reuse", action="store_true", help="keep the clips already in --out (a run whose judge failed), and make only the missing ones")
+    ap.add_argument("--no-transcribe", action="store_true", help="skip transcribing each clip (the lines said once, no replay at a cut)")
     ap.add_argument("--no-judge", action="store_true", help="the measured checks and the sheets only")
     ap.add_argument("--ffmpeg", default="ffmpeg")
     ap.add_argument("--ffprobe", default="ffprobe")
