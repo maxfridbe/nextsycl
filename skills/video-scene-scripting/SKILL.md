@@ -29,6 +29,10 @@ Write one line per fact the viewer needs, then make each shot's prompt state its
 - One picture per place per camera position (the platform seen along its length; the carriage door seen from the platform),
   one character sheet per person, one picture per prop. Props keep their kind, not their ornament (a five-pointed star came
   out with six to eight points).
+- **Time passing = a dissolve, not a cut**: the same place at another hour jumps its background colour at a hard picture cut
+  (steps of 49 and 277 in mean colour between frames) while the sound crossfades gently. Dissolve the picture over the same
+  overlap as the sound (1.2 s: `blend_join(..., dissolve=True)`; largest step then 12.3 spread over the dissolve) and check it
+  (`colour_steps`: under 15 outside the end fade).
 - **The same place at another hour**: do not re-render it from the base picture. img2img at a strength that changed the hour
   also changed the rendering (noon and dusk came out 3x crisper, HDR-like and saturated: "the scene changes completely halfway"),
   and at a strength that kept the rendering the hour did not change. Grade the base picture (`colorbalance` + `eq` in ffmpeg):

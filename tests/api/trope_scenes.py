@@ -248,6 +248,7 @@ NEUTRAL_LOOK = "Live-action, cinematic, natural light, shallow depth of field."
 STILL = "The camera is static on a tripod; the room is empty; the furniture and the objects do not move."
 T19 = {
     "title": "the passage of time",
+    "dissolve": True,   # time passes: the picture dissolves between the hours (a hard cut jumps the background colour), over the sound's crossfade
     "first_frames": {"dawn": "room_dawn", "noon": "room_noon", "dusk": "room_dusk"},
     "pictures": {
         "room_dawn": (f"cinematic photograph of {ROOM}, early dawn light, soft pink and blue, long soft shadows, no people", "1024x768"),
@@ -312,6 +313,16 @@ def frame_change(clip):
     return sum(d) / max(1, len(d))
 
 
+def colour_steps(film, skip_end=1.0):
+    """The largest change in a film's mean picture colour between consecutive frames (sum over R, G, B of an 8x6 mean), and when, leaving out the end fade"""
+    o = subprocess.run([*K.FFMPEG, "-v", "error", "-i", str(film), "-vf", "scale=8:6,format=rgb24", "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
+    n = 8 * 6 * 3
+    fr = [o[i:i + n] for i in range(0, len(o) - n + 1, n)]
+    m = [[sum(f[c::3]) / 48 for c in range(3)] for f in fr]
+    steps = [(sum(abs(a - b) for a, b in zip(m[i], m[i + 1])), (i + 1) / FPS) for i in range(len(m) - 1) if (i + 1) / FPS < len(m) / FPS - skip_end]
+    return max(steps)
+
+
 def measure_t19(local, ck):
     """The light changes on purpose: noon brightest, dusk warmest, dawn bluest of the warm pair"""
     c = {cid: mean_rgb(dst) for cid, dst, _ in local}
@@ -369,12 +380,13 @@ def transcribe(api, clip):
     return [(norm_words(w["text"])[0], w["start"], w["end"]) for w in r.get("words", []) if norm_words(w["text"])]
 
 
-def blend_join(clips, targets, out, speech, fade=1.0, max_overlap=0.5, max_ramp=1.0):
+def blend_join(clips, targets, out, speech, fade=1.0, max_overlap=0.5, max_ramp=1.0, dissolve=False):
     """Plain picture cuts, and the sound blended at a cut where no speech sits on it: each clip's sound levelled alone to its LUFS, then
     - a cut with quiet either side (no word within the overlap and the ramp of it): the new clip's sound comes in gradually (a ramp of up to
       `max_ramp` s) and overlaps the old one's end in a crossfade of up to `max_overlap` s; the new clip's picture is trimmed by the overlap so
       sound and picture stay in step (a J-cut)
     - a cut with speech near it: a plain cut, 6 ms in and out so it does not click
+    - with `dissolve` (time passing: the same place at another hour) the picture dissolves over the same overlap as the sound crossfades, nothing trimmed
     `speech[i]` is (first_word_start, last_word_end) of clip i in seconds, or None if it says nothing. Returns (seconds, [(overlap, ramp)] a cut)"""
     n, vparts, aparts, blends = len(clips), [], [], [(0.0, 0.0)]
     durs = [K.probe(c)["frames"] / FPS for c in clips]
@@ -394,7 +406,8 @@ def blend_join(clips, targets, out, speech, fade=1.0, max_overlap=0.5, max_ramp=
         nxt_blends = i + 1 < n and blends[i + 1][0] > 0
         fout = "" if nxt_blends else f",afade=t=out:st={durs[i] - 0.006:.4f}:d=0.006"
         aparts.append(f"[{i}:a]{g}apad,atrim=end={durs[i]:.6f},asetpts=PTS-STARTPTS,alimiter=limit=0.891:level=disabled,{fin}{fout}[a{i}]")
-        vparts.append(f"[{i}:v]trim=start_frame={round(d * FPS)},setpts=PTS-STARTPTS[v{i}]")
+        vparts.append(f"[{i}:v]setpts=PTS-STARTPTS,fps={FPS},format=yuv420p[v{i}]" if dissolve
+                      else f"[{i}:v]trim=start_frame={round(d * FPS)},setpts=PTS-STARTPTS[v{i}]")
     chain, last = [], "a0"
     for i in range(1, n):
         d = blends[i][0]
@@ -406,7 +419,17 @@ def blend_join(clips, targets, out, speech, fade=1.0, max_overlap=0.5, max_ramp=
         last = nxt
     total = sum(durs) - sum(d for d, _ in blends)
     fc = aparts + vparts + chain
-    fc.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]")
+    if dissolve:   # picture: a dissolve over each blend's overlap, offset to where the clip before ends less the overlap
+        vlen, lastv = durs[0], "v0"
+        for i in range(1, n):
+            d = blends[i][0]
+            fc.append(f"[{lastv}][v{i}]xfade=transition=fade:duration={d:.4f}:offset={vlen - d:.4f}[V{i}]" if d
+                      else f"[{lastv}][v{i}]concat=n=2:v=1:a=0[V{i}]")
+            vlen += durs[i] - d
+            lastv = f"V{i}"
+        fc.append(f"[{lastv}]null[v]")
+    else:
+        fc.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]")
     fc.append(f"[v]fade=t=out:st={total - fade:.3f}:d={fade}[vf];[{last}]afade=t=out:st={total - fade:.3f}:d={fade}[af]")
     cmd = [*K.FFMPEG, "-y", "-v", "error"]
     for c in clips:
@@ -561,7 +584,8 @@ def make(api, a, key, root):
         K.join([d for _, d, _ in local], film, G, FPS, -18.0, 1.0)
         blends = [(0.0, 0.0)] * len(local)
     else:
-        total, blends = blend_join([d for _, d, _ in local], [-18.0 if who else -22.0 for _, _, who in local], film, speech)
+        total, blends = blend_join([d for _, d, _ in local], [-18.0 if who else -22.0 for _, _, who in local], film, speech,
+                                   max_overlap=1.2 if t.get("dissolve") else 0.5, max_ramp=1.2 if t.get("dissolve") else 1.0, dissolve=bool(t.get("dissolve")))
     report["blends"] = [{"cut": i, "overlap_s": d, "ramp_s": r} for i, (d, r) in enumerate(blends) if i]
     fp = K.probe(film)
     ck = report["checks"]
@@ -596,6 +620,10 @@ def make(api, a, key, root):
         b_hz = [c["pitch_hz"] for c in cl if c["who"] == wb and c["pitch_hz"]]
         ck[f"{wa}'s clips are higher than {wb}'s"] = bool(a_hz and b_hz) and min(a_hz) > max(b_hz)
 
+    if t.get("dissolve"):   # time passes: the picture must not jump in colour at the join of the hours (it did at a hard cut: steps 49 and 277)
+        big, at_s = colour_steps(film)
+        report["colour_step"] = {"largest": round(big, 1), "at_s": round(at_s, 2)}
+        ck[f"the picture does not jump in colour (largest frame-to-frame step {big:.1f} at {at_s:.1f} s: under 15)"] = big < 15
     if key in MEASURES:
         MEASURES[key](local, ck)
 

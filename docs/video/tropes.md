@@ -193,3 +193,8 @@ light that changes on purpose.
   props 5, the hours 4, one rendering 5, nobody appears 5, noon brightest (luma 122, 148, 65), dusk warmest (red/blue 1.41, 1.20, 1.66), the
   sound blended at both cuts (steps -0.9 and 4.4 dB). The judge's "one film" question scored the same dusk 4/5 once and 1/5 the
   next: asked to ignore the light of the hour it gives 5, and the crispness number is the check to trust.
+
+**T19, the colour jump at the hour cuts.** After the grade fix the user found the background colour still jumped at a few places while the sound faded
+nicely. Measured on the film: steps of 49 (dawn to noon, 5.2 s) and 277 (noon to dusk, 9.8 s) in the mean picture colour between frames, against a median of 0.7:
+the picture was cut hard while the sound crossfaded. For a passage-of-time scene the picture now dissolves over the sound's crossfade (1.2 s,
+`blend_join(..., dissolve=True)`; the film is 1.4 s shorter): the largest step is 12.3, spread over the dissolve, and a check fails a dissolving trope above 15.
