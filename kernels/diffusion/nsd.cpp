@@ -737,9 +737,10 @@ int nsd_linear_q(void* ctx, const void* x, int dt, int64_t M, int64_t K, const v
     switch (qtype) {
         case 8: blk = 32; bytes = 34; break;     // Q8_0
         case 12: blk = 256; bytes = 144; break;  // Q4_K
+        case 13: blk = 256; bytes = 176; break;  // Q5_K
         case 14: blk = 256; bytes = 210; break;  // Q6_K
         case 30: blk = 1; bytes = 2; break;      // BF16
-        default: g_err = "nsd_linear_q: GGUF type " + std::to_string(qtype) + " (Q8_0, Q4_K, Q6_K and BF16 are expanded)"; return -1;
+        default: g_err = "nsd_linear_q: GGUF type " + std::to_string(qtype) + " (Q8_0, Q4_K, Q5_K, Q6_K and BF16 are expanded)"; return -1;
     }
     if (K % blk != 0) { g_err = "nsd_linear_q: a row of " + std::to_string(K) + " values is not whole blocks of GGUF type " + std::to_string(qtype); return -1; }
     if (dt == F32) { g_err = "nsd_linear_q: activations in half or bfloat16"; return -1; }
@@ -931,6 +932,27 @@ int nsd_dequant(void* ctx, const void* src, int qtype, int64_t n, void* out, int
                 store(out, out_dt, v0 + t, d1 * (float) (high ? (q[l] >> 4) : (q[l] & 0xF)) - m1);
             }
         });
+    } else if (qtype == 13) {   // Q5_K: Q4_K's header (d, dmin, 12 bytes of scales and mins), 32 bytes of 5th bits, 128 of nibbles
+        c.q.parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
+            const size_t v0 = id[0] * 4;
+            const int64_t blk = (int64_t) (v0 / 256);
+            const int j0 = (int) (v0 % 256), j = j0 / 32, l0 = j0 % 32;
+            const uint8_t* x = b + blk * 176;
+            const float d = h2f(x), dmin = h2f(x + 2);
+            const uint8_t* sc = x + 4;
+            int s, m;
+            if (j < 4) { s = sc[j] & 63; m = sc[j + 4] & 63; }
+            else { s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4); }
+            const float d1 = d * (float) s, m1 = dmin * (float) m;
+            const uint8_t* qh = x + 16;
+            const uint8_t* q = x + 48 + (j / 2) * 32;
+            const bool high = j % 2 == 1;
+            for (int t = 0; t < 4; ++t) {
+                const int l = l0 + t;
+                const int v = (high ? (q[l] >> 4) : (q[l] & 0xF)) + (((qh[l] >> j) & 1) << 4);
+                store(out, out_dt, v0 + t, d1 * (float) v - m1);
+            }
+        });
     } else if (qtype == 14) {   // Q6_K
         c.q.parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
             const size_t v0 = id[0] * 4;
@@ -950,7 +972,7 @@ int nsd_dequant(void* ctx, const void* src, int qtype, int64_t n, void* out, int
             }
         });
     } else {
-        g_err = "nsd_dequant: only Q4_K (12) and Q6_K (14)"; return -1;
+        g_err = "nsd_dequant: only Q4_K (12), Q5_K (13) and Q6_K (14)"; return -1;
     }
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }

@@ -71,8 +71,8 @@ def load_dit(a):
     sd = {}
     for t in GGUFReader(a.dit).tensors:
         sd[t.name] = torch.from_numpy(np.ascontiguousarray(dequantize(t.data, t.tensor_type), dtype=np.float32).reshape(
-            tuple(int(x) for x in t.shape)))
-    # the file keeps a [in, out] matrix as ne = [in, out], which numpy reads as (out, in) = torch's layout already
+            tuple(int(x) for x in t.shape[::-1])))
+    # the file's ne = [in, out] lists the fastest dimension first: row-major that is torch's (out, in)
     print(model.load_state_dict(sd, strict=True))
     return P, model.float().eval()
 
@@ -146,6 +146,49 @@ def stage_vae(a):
     Image.fromarray(px).save(os.path.join(a.out, "ref.png"))
 
 
+
+def stage_probe(a):
+    """one forward at step 0, block 0 taken apart: the modulation, the norms, q k v, attention, each residual"""
+    P, model = load_dit(a)
+    te = torch.from_numpy(np.load(os.path.join(a.out, "te_final.npy")))[None]
+    lat = torch.from_numpy(np.load(os.path.join(a.out, "lat_0.npy")))[None]
+    n = lat.shape[-1]
+    t = torch.tensor([1000.0])
+    with torch.no_grad():
+        half = 128
+        freq = 10000 ** (-torch.arange(half, dtype=torch.float64) / half)
+        phase = t.double()[:, None] * freq
+        emb = torch.cat((phase.cos(), phase.sin()), -1).float()
+        time = model.time_embedding(emb)
+        mod = model.shared_block_modulation(time).view(1, 6, -1)
+        head = model.video_head_modulation(time).view(1, 2, -1)
+        save(a.out, "p_time", time[0]); save(a.out, "p_mod", mod[0]); save(a.out, "p_head", head[0])
+        video = model.video_embedder(lat.flatten(2).transpose(1, 2).contiguous())
+        rope = model.rope(n, n, te.shape[1], "cpu")
+        save(a.out, "p_rope", rope[0])
+        text = model.text_embedder(te, rope[:, n * n:])
+        x = torch.cat((video, text), 1)
+        save(a.out, "p_x0", x[0])
+        blk = model.layers[0]
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.unbind(1)
+        y = blk.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
+        save(a.out, "p_y1", y[0])
+        q = blk.q_norm(blk.proj["q"](y).unflatten(-1, (24, -1))).flatten(2)
+        k = blk.k_norm(blk.proj["k"](y).unflatten(-1, (24, -1))).flatten(2)
+        v = blk.proj["v"](y)
+        save(a.out, "p_q", q[0]); save(a.out, "p_k", k[0]); save(a.out, "p_v", v[0])
+        att = P._attention(q, k, v, rope, 24)
+        save(a.out, "p_att", att[0])
+        x1 = x + blk.proj["o"](att) * gate_a[:, None]
+        save(a.out, "p_x1", x1[0])
+        y2 = blk.norm2(x1) * (1 + scale_f[:, None]) + shift_f[:, None]
+        hidden, gate = blk.proj["ffn_up_gate"](y2).chunk(2, -1)
+        act = P._situ(hidden, gate)
+        save(a.out, "p_act", act[0])
+        x2 = x1 + blk.proj["ffn_down"](act) * gate_f[:, None]
+        save(a.out, "p_x2", x2[0])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dit"); ap.add_argument("--te"); ap.add_argument("--vae"); ap.add_argument("--tok")
@@ -160,7 +203,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     for s in a.stages.split(","):
         print("== stage", s, flush=True)
-        {"te": stage_te, "dit": stage_dit, "vae": stage_vae}[s](a)
+        {"te": stage_te, "dit": stage_dit, "vae": stage_vae, "probe": stage_probe}[s](a)
 
 
 if __name__ == "__main__":

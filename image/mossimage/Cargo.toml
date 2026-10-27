@@ -1,0 +1,13 @@
+[package]
+name = "nextsycl-image-mossimage"
+description = "MOSS-Image-SFT (OpenMOSS): 5.1B text to image, a single-stream DiT over Qwen3.5-9B's hidden states and the FLUX.2 VAE; Rust and SYCL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-image.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true

@@ -27,6 +27,7 @@ nextsycl-image-paddleocrvl.workspace = true
 nextsycl-image-olmocr2.workspace = true
 nextsycl-image-hunyuanimage21.workspace = true
 nextsycl-image-mingimage.workspace = true
+nextsycl-image-mossimage.workspace = true
 nextsycl-image-upscale.workspace = true
 nextsycl-image-starvector.workspace = true
 nextsycl-video.workspace = true
