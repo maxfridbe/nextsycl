@@ -47,6 +47,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `muse-glimmer-30b-q4`, `-q6` | **Muse Glimmer 30B** Q4_K_M / Q6_K on the B70 alone, with its drafter | 43 / 35 tok/s (25.4 / 20 without drafts) / ~1,400 tok/s, 128K |
 | `qwen-image-2.1-q8` | **Qwen-Image 2.1** text to image, edits | 1024x1024, 40 steps: 23.8 s (16.5 s int8) |
 | `hunyuanimage-2.1-distilled-q8` | **HunyuanImage 2.1** text to image at 2K (quoted text spelled by its glyph encoder) | 2048x2048, 8 steps: 7.8 s; 1024x1024: 2.5 s |
+| `moss-image-sft-q4kxl` (also `-q8`, `-q6kxl`, `-q5kxl`, `-q4km`, `-bf16`) | **MOSS-Image-SFT** text to image (sentences, tags or a JSON layout; quoted text spelled) | 1024x1024, 50 steps with CFG: 46.7 s; 512x512, 12 steps: 3.4 s |
 | `unlimited-ocr-q8`, `-q4` | **Unlimited-OCR** pictures and PDFs to Markdown (tables as HTML, boxes), its own page | a page: ~2-3 s to see, ~130 tok/s written |
 | `paddleocr-vl-1.6` | **PaddleOCR-VL** text, tables (HTML), formulas (LaTeX), charts, seals, spotting; the same OCR page | a page: ~1.2 s to see, ~200-250 tok/s written |
 | `olmocr-2-7b-q8` | **olmOCR-2** whole pages to Markdown (tables HTML, equations LaTeX), turned pages righted; the same OCR page | a page: ~3 s to see, ~55 tok/s written |

@@ -51,8 +51,11 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `unlimited-ocr-q8`, `unlimited-ocr-q4` | Unlimited-OCR (Baidu, the DeepSeek-OCR architecture): pages to Markdown, tables as HTML, boxes with `<|grounding|>`; long pages in fixed memory | `unlimited-ocr` | 6.5 GiB (decoder in half) | checked (PIL, deepencoder.py, llama.cpp), served |
 | `paddleocr-vl-1.6` | PaddleOCR-VL 1.6 (PaddlePaddle): SigLIP NaViT at the page's size + ERNIE-4.5 0.3B; text, tables, formulas, charts, seals, spotting | `paddleocr-vl` | ~3 GiB (vision float32, decoder half) | checked (transformers), served |
 | `olmocr-2-7b-q8` | olmOCR-2-7B-1025 (Ai2, a Qwen2.5-VL-7B fine-tune): pages to Markdown in reading order | `olmocr2` | ~11 GiB (decoder Q8_0, vision float32) | checked (llama.cpp), served |
+| `moss-image-sft-q4kxl` | MOSS-Image-SFT UD-Q4_K_XL (OpenMOSS, Apache-2.0): 5.1B DiT + Qwen3.5-9B text encoder + FLUX.2 VAE; sentences, tags or a JSON layout | `moss-image` | 14.0 GiB | checked, served |
+| `moss-image-sft-q8`, `-q6kxl`, `-q5kxl`, `-q4km`, `-bf16` | the same DiT in Q8_0 / UD-Q6_K_XL / UD-Q5_K_XL / Q4_K_M / BF16 (a forward 0.46 s at 1024 whichever: the matrices are expanded to half at load) | `moss-image` | 17 / 16 / 15.5 / 14 / 21.5 GiB | loaded, pictures checked by eye (the reference is the Q4_K_XL file's) |
 | `qwen-image-2.1-turbo-q8` | Qwen-Image 2.1 Turbo (Viggle v0.3 merged): 6 steps | `qwenimage21` | 16.5 GiB | checked |
 | `qwen-image-2.1-q6k`, `-uncensored-q8` | Qwen-Image 2.1 Q6_K; the uncensored model in Q8_0 | `qwenimage21` | 14.8 / 16.4 GiB | listed |
+| `moss-image-sft-q3kxl` (not offered) | UD-Q3_K_XL: its Q3_K matrices are not read yet | `moss-image` | 2.6 GiB | needs Q3_K in the dequant |
 | `qwen-image-2.1-q4km`, `-uncensored-q4km` | Q4_K_M | `qwenimage21` | 13.6 GiB | listed (needs Q5_K in the dequant) |
 
 **LoRAs** for Qwen-Image 2.1 (`--lora NAME[:SCALE]`, merged at load)

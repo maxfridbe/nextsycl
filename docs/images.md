@@ -46,6 +46,20 @@ LoRAs `qwen-image-2.1-turbo-lora`, `qwen-image-2.1-pruna-8step-lora`, `-5step-lo
 same files and schedules: turbo 6 steps 2.9e-3, Pruna 8 steps 2.2e-3, their images at most 2 / 4 of 255 off.
 On the B70 a turbo picture takes 3.2 s: 1024x768 in half, 1024x1024 with `NS_QI_INT8=1` (6 steps, the prompt and the VAE included).
 
+## MOSS-Image-SFT
+
+```sh
+nextsycl models pull moss-image-sft-q4kxl      # or -q8, -q6kxl, -q5kxl, -q4km, -bf16
+nextsycl image gen 'A small red fox in fresh snow, a wooden sign reading "WELCOME"' --model moss-image-sft-q4kxl [--size 1024x1024]
+nextsycl image check <reference dump dir> --model moss-image-sft-q4kxl [--stages sigmas,tokens,te,dit,steps,vae,full,bench]
+nextsycl image serve moss-image-sft-q4kxl --wfe      # POST /v1/images/generations, the same page as the others
+```
+
+OpenMOSS's 5.1B text to image model (50 steps, CFG 3 with block 22 left out as the guidance branch; sizes multiples of 16;
+a negative prompt is not used). Port notes, parity and speed: [ports/mossimage.md](ports/mossimage.md). B70, 1024x1024,
+50 steps with CFG, through the server: 46.7 s (the card's 3.5 Wh); 512x512, 12 steps 3.4 s. Every quant loads and draws;
+Q3_K files do not (no Q3_K in the dequant yet).
+
 ## HunyuanImage 2.1
 
 ```sh

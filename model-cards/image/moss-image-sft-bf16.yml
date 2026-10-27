@@ -1,0 +1,37 @@
+# MOSS-Image-SFT BF16 (text to image; 5.1B DiT, Qwen3.5-9B text encoder, FLUX.2 VAE; Rust + SYCL)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets.
+# The files are unsloth's: the DiT GGUF (BF16), the Qwen3.5-9B text model (Q8_0), the FLUX.2 VAE from the FP8 repo.
+id: moss-image-sft-bf16
+kind: image
+arch: moss-image
+title: 'MOSS-Image-SFT BF16 (text to image: photos, illustrations, posters; Rust + SYCL)'
+about: 'OpenMOSS''s MOSS-Image-SFT (Apache-2.0): a 5.1B single-stream DiT conditioned by Qwen3.5-9B''s hidden states, the FLUX.2 VAE; prompts in sentences, tags or a JSON layout. 9.5 GiB DiT, 8.9 GiB text encoder'
+gpus: '0'
+vram_gib: 21.5
+defaults:
+  steps: 50
+  cfg: 3.0
+  sampler: euler
+  schedule: shift
+  size: 1024x1024
+env: {}
+files:
+  transformer:
+    key: moss-image-sft-bf16
+    url: https://huggingface.co/unsloth/MOSS-Image-SFT-GGUF/resolve/a013f7442e672e67b21f485b4b4f369df5500847/MOSS-Image-SFT-BF16.gguf
+    size: 10165416000
+    sha256: 3cf74542dcce0d22c6db2fc560bef21699bc2a9d0e19cea41f13592fd4ee7712
+    path: moss-image/MOSS-Image-SFT-BF16.gguf
+  text-encoder:
+    key: moss-image-qwen35-9b-q8
+    url: https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-Q8_0.gguf
+    size: 9527502048
+    sha256: 809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4
+    path: moss-image/Qwen3.5-9B-Q8_0.gguf
+  vae:
+    key: moss-image-flux2-vae
+    url: https://huggingface.co/unsloth/MOSS-Image-SFT-FP8/resolve/8fb0d8c3a126cfd1406acaf96698dbfe9d99b680/vae/diffusion_pytorch_model.safetensors
+    size: 249521372
+    sha256: c3bdf94dc67ec69b30ea9fe1fa8340085679cae64d019f7c7e4a9921f1a7f17a
+    path: moss-image/vae/diffusion_pytorch_model.safetensors
+guide: guides/moss-image.md
