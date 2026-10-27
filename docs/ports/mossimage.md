@@ -106,7 +106,7 @@ reproducible - the same seed, the same picture. Judge a change by the velocities
 | + whole-matrix products (no slicing) | 0.509 s | |
 | + matrices expanded to half at load (`NS_MOSS_EXPAND`) | 0.464 s | 2.82 s |
 | 50 steps with CFG | ~46 s | ~290 s |
-| text encoder, 32-token prompt / 3,970 tokens | 0.11 s / 3.4 s | |
+| text encoder, 32-token prompt / 3,970 tokens | 0.11 s / 1.0 s (3.4 s before the silo's attention) | |
 | VAE decode | 0.32 s | 1.5 s |
 
 What a forward holds now, from `--stages bench` (the per-op list drains the queue between ops, so it adds ~0.25 ms an
@@ -128,12 +128,13 @@ forward in 12 ms, so it is GPU bound.
   replaced by their half expansion at load (10.2 GB for the Q4_K_XL file; the text encoder's 9.5 GB fits beside it on
   a 32 GiB card), so a forward skips ~1.1 ms of expansion a block.
 - **Left** (measured, not chased): the attention at ~110 TFLOPS (a hand-written flash kernel would have to beat
-  oneDNN's by a third to matter below 2048 px); the text encoder at long prompts. `NS_MOSS_PROFILE=1` splits it: at
-  3,970 tokens 3.4 s is 2.5 s in the 8 full-attention layers (the shared causal attention is a work-group a (head,
-  query) walking the keys one by one: built for short sequences), 0.33 s in the 24 DeltaNet layers, 0.54 s the FFN
-  and norms; at a 32-token prompt 0.11 s. A tiled causal attention on XMX (D = 256, 16 query heads over 4 kv heads)
-  would take the 2.5 s to ~0.3 s: it matters from ~1,500 tokens (a JSON layout prompt: ~1 % of a 1024 px picture's
-  time) and not at all for a sentence. The 8 GiB reserve keeps the 2048 px forward inside the card with the
-  expanded matrices.
+  oneDNN's by a third to matter below 2048 px); the text encoder at long prompts, now
+  1.0 s at 3,970 tokens (3.4 s with the shared causal attention, a work-group a (head, query) walking the keys one by
+  one). `NS_MOSS_PROFILE=1` splits it: 0.08 s in the 8 full-attention layers, 0.34 s in the 24 DeltaNet layers (the
+  delta-rule scan is sequential in the tokens), 0.55 s the FFN and norms (the shared quantized product's slicing and
+  float32 outputs: the DiT's whole-matrix trick is not applied here yet). The silo's attention takes query blocks of
+  512 rows against the keys up to their end as half products on oneDNN with a masked float32 softmax between (shapes
+  fixed per block, so primitives are reused across prompts); the text encoder's parity is unchanged (final hidden
+  rel 1.4e-2). The 8 GiB reserve keeps the 2048 px forward inside the card with the expanded matrices.
 
 Still to do: model cards for the other quants, the front door / `image serve` smoke test, README and INTEL.md rows.

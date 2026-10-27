@@ -90,6 +90,8 @@ pub const SILO: &str = "mossimage";
 
 /// The silo's fused passes (silo.h)
 pub struct Silo {
+    pub attn_supported: unsafe extern "C" fn(G, i64, i64, i64, i64) -> c_int,
+    pub attn_causal: unsafe extern "C" fn(G, P, P, P, i64, i64, i64, i64, i64, i64, *mut f32) -> c_int,
     pub supported: unsafe extern "C" fn(G, i64, i64) -> c_int,
     pub add_norm: unsafe extern "C" fn(G, *mut f32, P, P, i64, i64, P, f32, P, P, M) -> c_int,
     pub qk_rope: unsafe extern "C" fn(G, M, i64, i64, i64, i64, i64, P, P, f32, P) -> c_int,
@@ -119,6 +121,8 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             }};
         }
         Ok(Some(Silo {
+            attn_supported: sym!("ns_image_moss_silo_attn_supported"),
+            attn_causal: sym!("ns_image_moss_silo_attn_causal"),
             supported: sym!("ns_image_moss_silo_supported"),
             add_norm: sym!("ns_image_moss_silo_add_norm"),
             qk_rope: sym!("ns_image_moss_silo_qk_rope"),

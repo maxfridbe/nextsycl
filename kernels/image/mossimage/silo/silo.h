@@ -34,6 +34,15 @@ int ns_image_moss_silo_qk_rope(ns_gpu* g, void* qkv, int64_t M, int64_t H, int64
  * C a multiple of 8. */
 int ns_image_moss_silo_situ(ns_gpu* g, const void* hid, const void* gate, int64_t ldh, int64_t M, int64_t C, void* out, int64_t ldo);
 
+/* Causal attention for the text encoder (grouped heads, D = 256), q float32 [t, hq x d] (rows `qs` floats apart), k and v
+ * float32 [t, hkv x d] (rows `kvs` apart), out float32 [t, hq x d]: query blocks of 512 rows against the keys up to
+ * their end as half products on oneDNN, a masked float32 softmax between them. The shared causal attention walks the
+ * keys one at a time a (head, query) and takes 0.3 s a layer at 4,000 tokens. _supported: t from 1 to 4096, d = 256,
+ * hq a multiple of hkv. */
+int ns_image_moss_silo_attn_supported(ns_gpu* g, int64_t t, int64_t hq, int64_t hkv, int64_t d);
+int ns_image_moss_silo_attn_causal(ns_gpu* g, const float* q, const float* k, const float* v, int64_t t, int64_t hq, int64_t hkv, int64_t d, int64_t qs, int64_t kvs,
+                                   float* out);
+
 #ifdef __cplusplus
 }
 #endif

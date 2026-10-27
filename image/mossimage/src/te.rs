@@ -304,7 +304,11 @@ impl TextEncoder {
             ffi::check((k.qk_norm_rope)(gpu.raw(), s.kr.fp(), (hk * d) as i64, d as i64, s.kn.fp(), t as i64, hk as i64, d as i64, a.k_norm.fp(), g.eps, g.n_rot as i64,
                                         g.theta), "k norm rope")?;
         }
-        nsd.attention_causal(s.q.ptr(), s.kn.ptr(), s.vr.ptr(), Dt::F32, t, hq, hk, d, hq * d, hk * d, s.att.ptr())?;
+        match ffi::silo()?.filter(|sl| unsafe { (sl.attn_supported)(gpu.raw(), t as i64, hq as i64, hk as i64, d as i64) } == 1) {
+            // SAFETY: q [t, hq x d], k and v [t, hk x d] floats, the output [t, hq x d].
+            Some(sl) => ffi::check(unsafe { (sl.attn_causal)(gpu.raw(), s.q.ptr(), s.kn.ptr(), s.vr.ptr(), t as i64, hq as i64, hk as i64, d as i64, (hq * d) as i64, (hk * d) as i64, s.att.fp()) }, "causal attention")?,
+            None => nsd.attention_causal(s.q.ptr(), s.kn.ptr(), s.vr.ptr(), Dt::F32, t, hq, hk, d, hq * d, hk * d, s.att.ptr())?,
+        }
         // SAFETY: att [t, hq x d] gated by qf's gate columns.
         ffi::check(unsafe { (k.gate_mul)(gpu.raw(), s.att.fp(), s.qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64) }, "output gate")?;
         // SAFETY: t x 4096 floats in, as many halves out.
