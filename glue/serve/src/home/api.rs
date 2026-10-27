@@ -1519,6 +1519,16 @@ pub(super) fn speaks(m: &Value, voice: &str) -> bool {
     own.is_empty() || own.contains(&voice.to_lowercase())
 }
 
+/// A registry entry that upscales (an upscaler's architecture) rather than draws or reads
+pub(super) fn upscales(m: &Value) -> bool {
+    matches!(s(m, "arch").as_str(), "realesrgan" | "waifu2x")
+}
+
+/// A registry entry that writes pictures as SVG (StarVector) rather than draws them
+pub(super) fn vectorizes(m: &Value) -> bool {
+    s(m, "arch") == "starvector"
+}
+
 #[cfg(test)]
 mod tests {
     use super::{code_of, enrolled_for, rpc_error, speaks, table};
@@ -1587,14 +1597,4 @@ mod tests {
             assert_eq!(code_of(st), c);
         }
     }
-}
-
-/// A registry entry that upscales (an upscaler's architecture) rather than draws or reads
-pub(super) fn upscales(m: &Value) -> bool {
-    matches!(s(m, "arch").as_str(), "realesrgan" | "waifu2x")
-}
-
-/// A registry entry that writes pictures as SVG (StarVector) rather than draws them
-pub(super) fn vectorizes(m: &Value) -> bool {
-    s(m, "arch") == "starvector"
 }

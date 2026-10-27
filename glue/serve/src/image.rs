@@ -646,7 +646,7 @@ impl ImageServer {
     }
 
     /// The engine for an upscale, one request at a time (as a generation)
-    fn upscaler(&self, b: &Value) -> Result<std::sync::MutexGuard<'_, Option<(Box<dyn ImageEngine>, Vec<LoraUse>)>>, (u16, String)> {
+    fn upscaler(&self, b: &Value) -> Result<std::sync::MutexGuard<'_, Option<Loaded>>, (u16, String)> {
         if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model) {
             return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
         }

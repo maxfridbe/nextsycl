@@ -2,6 +2,8 @@
 resolver = "2"
 # the layout (docs/architecture.md): the shared foundation (crates/), one group a kind - its contract and one engine
 # crate an architecture (llm/, image/, video/) -, the glue that makes them a service (glue/), the program (cli/)
+# vendor/rpcgen is a copy from vibe-creative-platform (tooling/sync_rpcgen.sh): its lints are that repo's, not ours
+exclude = ["vendor/rpcgen"]
 members = [
     "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl",
     "crates/mesh", "crates/remover", "crates/codec12hz",
