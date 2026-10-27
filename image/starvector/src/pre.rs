@@ -9,7 +9,7 @@ use nextsycl_image::Picture;
 /// The side the encoder takes
 pub const SIZE: usize = 224;
 pub const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
-pub const STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_1];
+pub const STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
 
 /// RGBA bytes of any picture (gray, gray + alpha, RGB, RGBA), as PIL's convert("RGBA")
 fn rgba(p: &Picture) -> Vec<u8> {

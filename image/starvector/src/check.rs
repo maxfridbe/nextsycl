@@ -123,13 +123,13 @@ pub fn run(e: &StarVector, dir: &Path, picture: &Path, stages: &[&str], log: &mu
             let mut all = Vec::new();
             let mut agree = 0;
             let t = Instant::now();
-            for r in 0..rows {
-                if argmax(&got) == tokens[r] as usize {
+            for (r, &tok) in tokens.iter().enumerate().take(rows) {
+                if argmax(&got) == tok as usize {
                     agree += 1;
                 }
                 all.extend_from_slice(&got);
                 if r + 1 < rows {
-                    got = m.step(&[0], &[tokens[r]], len + r)?;
+                    got = m.step(&[0], &[tok], len + r)?;
                 }
             }
             log(format!("logits         {rows} rows teacher-forced in {:.2} s: the argmax is the reference's token at {agree} of {rows}", t.elapsed().as_secs_f64()));

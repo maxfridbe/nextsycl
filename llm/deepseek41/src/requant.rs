@@ -49,6 +49,7 @@ fn nearest_int(x: f32) -> i32 {
 
 /// ggml's make_qkx2_quants: n values to L in 0..=nmax as `scale * L + min` (min <= 0), the error weighted; returns
 /// (scale, -min)
+#[allow(clippy::too_many_arguments)] // ggml's own signature, kept so the port reads against it
 fn make_qkx2_quants(n: usize, nmax: i32, x: &[f32], weights: &[f32], l: &mut [u8], laux: &mut [u8], rmin: f32, rdelta: f32, nstep: i32) -> (f32, f32) {
     let (mut min, mut max) = (x[0], x[0]);
     let mut sum_w = weights[0];

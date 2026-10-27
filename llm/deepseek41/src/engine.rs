@@ -1020,6 +1020,9 @@ impl Store {
     }
 }
 
+/// the next layer's file experts a prompt pass already started: (layer, expert -> pinned slot and its reads)
+type PreReads = Option<(u64, HashMap<u64, (usize, Arc<RDone>)>)>;
+
 /// One GPU's share of the model.
 pub struct Part {
     ops: Ops,
@@ -1039,7 +1042,7 @@ pub struct Part {
     /// per layer, the std kernel's table for the grouped o_a at one row (a Q8_0 / Q6_K o_a): 8 groups' pointers, then meta
     oa_tab: Mutex<HashMap<u64, Arc<DevBuf>>>,
     /// the next layer's file experts a prompt pass already started reading (layer, expert -> pinned slot and its reads)
-    pre_reads: Mutex<Option<(u64, HashMap<u64, (usize, Arc<RDone>)>)>>,
+    pre_reads: Mutex<PreReads>,
     vq: HashMap<u64, LayerVq>,
     cbs: HashMap<u64, DevBuf>,
     /// the codebooks as float32 (the decode products' weights without a conversion each)
@@ -1308,8 +1311,8 @@ impl Part {
             lent += n * sb;
         }
         if lent > 0 && (std::env::var("NS_PROFILE").is_ok() || self.x_first.swap(false, std::sync::atomic::Ordering::Relaxed)) {
-            eprintln!("[{}: {} GiB of the passes' reserve lent to the expert stores ({:.1} GiB was free): {} more slots]", self.ops.gpu.name,
-                      format!("{:.1}", gib(lent)), gib(free as usize), want.iter().sum::<usize>());
+            eprintln!("[{}: {:.1} GiB of the passes' reserve lent to the expert stores ({:.1} GiB was free): {} more slots]", self.ops.gpu.name,
+                      gib(lent), gib(free as usize), want.iter().sum::<usize>());
         }
         Ok(())
     }
@@ -4540,8 +4543,8 @@ impl<'g> Ds41<'g> {
             }
         }
         ROUTE_HOST_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        if t == 1 && self.prof.is_some() && !p.draft.contains_key(&l) {
-            if !p.stores_of(l).is_empty() {
+        if t == 1 && self.prof.is_some() && !p.draft.contains_key(&l)
+            && !p.stores_of(l).is_empty() {
                 let (mut any, mut low) = (false, true);
                 DEC_LAYERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for (ex, v) in &by {
@@ -4561,7 +4564,6 @@ impl<'g> Ds41<'g> {
                     }
                 }
             }
-        }
         tap(&format!("ffn_shexp-{l}"), &y)?;
         // cold experts of small weight left out (NS_DS41_COLD_SKIP): their rows of the products stay zero
         let mut skip: Vec<bool> = vec![false; by.len()];
@@ -4799,15 +4801,14 @@ impl<'g> Ds41<'g> {
                 }
                 let read: HashMap<usize, (usize, Arc<RDone>)> = files.iter().filter_map(|(k, ex)| by_ex.get(ex).map(|v| (*k, v.clone()))).collect();
                 // the next layer's file experts read meanwhile: a prompt of more than a few tokens uses nearly all of them
-                if prompt_prefetch() && t >= prompt_prefetch_min() && p.layers.contains(&(l + 1)) && p.reader.is_some() {
-                    if !p.stores_of(l + 1).is_empty() {
+                if prompt_prefetch() && t >= prompt_prefetch_min() && p.layers.contains(&(l + 1)) && p.reader.is_some()
+                    && !p.stores_of(l + 1).is_empty() {
                         let nxt: Vec<u64> = (0..ne as u64).filter(|ex| !p.with_store(l + 1, *ex, |c| c.loc.contains_key(&(l + 1, *ex))).unwrap_or(true)).collect();
                         if !nxt.is_empty() {
                             let m = p.start_file_reads(l + 1, &nxt, 0)?;
                             *p.pre_reads.lock().unwrap() = Some((l + 1, m));
                         }
                     }
-                }
                 let mut pending: Option<Option<i64>> = None;
                 if let Some(w0) = waves.first() {
                     let slots: Vec<usize> = (0..w0.len()).collect();

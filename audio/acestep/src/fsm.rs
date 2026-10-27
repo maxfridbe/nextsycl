@@ -352,7 +352,7 @@ impl<'a> Fsm<'a> {
                     }
                 }
             }
-            best.sort_by(|a, b| b.1.cmp(&a.1));
+            best.sort_by_key(|b| std::cmp::Reverse(b.1));
             out = best.into_iter().map(|(t, _)| t).collect();
         }
         self.fixed_cache.insert(key, out.clone());

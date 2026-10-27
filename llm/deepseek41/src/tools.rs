@@ -293,7 +293,7 @@ fn kernels_xq(m: &Model, g: &std::sync::Arc<nextsycl_core::Gpu>, o: &crate::ops:
                         tb6.extend((src.ptr() as u64).to_le_bytes());
                     }
                     for c in 0..6 {
-                        let mut m = vec![1 | tag, c as i32, c as i32];
+                        let mut m = vec![1 | tag, c, c];
                         m.resize(10, 0);
                         for v in m {
                             tb6.extend(v.to_le_bytes());

@@ -72,6 +72,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
 pub const ACT_SCALE: f32 = 1.0 / 256.0;
 
 /// out [m, c] half = silu(x[:, :c]) * x[:, c:] * ACT_SCALE (x [m, 2c] half)
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // x and out are device addresses the kernel owns, not host pointers
 pub fn swiglu(gpu: &nextsycl_core::Gpu, x: P, m: usize, c: usize, out: M) -> nextsycl_core::Result<()> {
     let k = api()?;
     // SAFETY: x holds m x 2c halves, out m x c.

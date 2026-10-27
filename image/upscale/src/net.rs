@@ -153,7 +153,7 @@ fn conv_of(gpu: &Arc<Gpu>, l: &crate::ncnn::Layer, bin: &mut Bin, transposed: bo
         return Err(Error(format!("{}: SAME padding (-233) is not run here", l.name)));
     }
     let k = kw;
-    if co == 0 || k == 0 || wsize % (co * k * k) != 0 {
+    if co == 0 || k == 0 || !wsize.is_multiple_of(co * k * k) {
         return Err(Error(format!("{}: {wsize} weights for {co} outputs of {k}x{k}", l.name)));
     }
     let ci = wsize / (co * k * k);
@@ -272,7 +272,7 @@ impl Net {
                 "InnerProduct" => {
                     let o = p.int(0, 0) as usize;
                     let ws = p.int(2, 0) as usize;
-                    if o == 0 || ws % o != 0 {
+                    if o == 0 || !ws.is_multiple_of(o) {
                         return Err(e(format!("{ws} weights for {o} outputs")));
                     }
                     let w = r.weight(ws).map_err(e)?.to_f32();

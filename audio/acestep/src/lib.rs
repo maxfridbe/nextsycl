@@ -471,7 +471,7 @@ impl AceStep {
         if wav.iter().all(|x| x.abs() < 1e-6) {
             return Ok(self.dit.silence(wav.len() / 2 / vae::HOP));
         }
-        let mut rng = Rng::new(song.seed ^ 0x5EED_0F_5A_E1);
+        let mut rng = Rng::new(song.seed ^ 0x005E_ED0F_5AE1);
         let mut draw = || rng.normal();
         let noise: Option<&mut dyn FnMut() -> f32> = if song.vae_sample { Some(&mut draw) } else { None };
         self.vae.encode(&self.ops, s, wav, noise, &mut |a, b| progress(a as u32, b as u32))
@@ -541,6 +541,7 @@ impl AceStep {
 
     /// The flow from `noise` to the latents [frames, 64] under the packed conditions and the plan: generate_audio's
     /// loop (Euler, DCW, the switch to the non-cover branch, a repaint's injection and boundary blend)
+    #[allow(clippy::too_many_arguments)]
     pub fn sample(&self, s: &mut Scratch, song: &Song, plan: &Plan, enc: &[f32], noise: Vec<f32>, trace: &mut Trace,
                   progress: &mut dyn FnMut(u32, u32) -> Result<()>) -> Result<Vec<f32>> {
         let frames = plan.frames;

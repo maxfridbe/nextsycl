@@ -112,11 +112,10 @@ pub fn parse(text: &str) -> HashMap<String, String> {
             if !v.trim().is_empty() {
                 lines.push(v.to_string());
             }
-        } else if line.starts_with(' ') || line.starts_with('\t') {
-            if key.is_some() {
+        } else if (line.starts_with(' ') || line.starts_with('\t'))
+            && key.is_some() {
                 lines.push(line.to_string());
             }
-        }
     }
     save(&mut key, &mut lines);
     out
@@ -290,6 +289,7 @@ impl Planner {
     }
 
     /// Phase 1: the CoT text (no guidance), from the chat prompt
+    #[allow(clippy::too_many_arguments)]
     fn cot(&self, s: &mut Scratch, caption: &str, lyrics: &str, user: HashMap<&'static str, String>, rng: &mut Rng, plan: &mut Plan,
            progress: &mut dyn FnMut(u32, u32) -> Result<()>) -> Result<String> {
         let prompt = cot_prompt(caption, lyrics);
@@ -320,6 +320,7 @@ impl Planner {
     }
 
     /// Phase 2: the audio codes under guidance, `seconds` of them (5 a second)
+    #[allow(clippy::too_many_arguments)]
     fn codes(&self, s: &mut Scratch, caption: &str, lyrics: &str, cot: &str, seconds: f64, rng: &mut Rng, plan: &mut Plan,
              progress: &mut dyn FnMut(u32, u32) -> Result<()>) -> Result<Vec<u32>> {
         let cp = codes_prompt(caption, lyrics, cot, false, &self.settings.negative);
@@ -327,7 +328,7 @@ impl Planner {
         let (ci, ui) = (self.tok.encode(&cp), self.tok.encode(&up));
         plan.prompts.push(cp);
         plan.prompts.push(up);
-        let eff = seconds.min(MAX_PLANNED_SECONDS).max(10.0);
+        let eff = seconds.clamp(10.0, MAX_PLANNED_SECONDS);
         let max_new = (eff * 5.0) as usize + 10;
         let mut sc = self.lm.seq(&self.ops.gpu, ci.len() + max_new + 4)?;
         let mut su = self.lm.seq(&self.ops.gpu, ui.len() + max_new + 4)?;
@@ -416,7 +417,7 @@ impl Planner {
     pub fn plan(&self, caption: &str, lyrics: &str, user: HashMap<&'static str, String>, seconds: f64, seed: u64,
                 progress: &mut dyn FnMut(&'static str, u32, u32) -> Result<()>) -> Result<Plan> {
         let mut s = Scratch::default();
-        let mut rng = Rng::new(seed ^ 0x9_1A_77E5);
+        let mut rng = Rng::new(seed ^ 0x091A_77E5);
         let mut plan = Plan::default();
         let all_given = ["bpm", "keyscale", "timesignature", "duration"].iter().all(|k| user.contains_key(k));
         let metadata = if all_given {

@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn halves_round_trip() {
-        for f in [0.0f32, 1.0, -1.0, 0.1, 65504.0, 1e-5, -3.14159, 6e-8] {
+        for f in [0.0f32, 1.0, -1.0, 0.1, 65504.0, 1e-5, -3.1875, 6e-8] {
             let h = f32_to_f16(f);
             let back = f16_to_f32(h);
             assert!((back - f).abs() <= f.abs() * 1e-3 + 6e-8, "{f} -> {back}");

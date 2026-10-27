@@ -287,7 +287,7 @@ impl Whisper {
             let mut d = self.decode_window(&ctx, sot_index, 0.0, seek as u64, &mut step)?;
             if fallback {
                 for (k, t) in [0.2f32, 0.4, 0.6, 0.8, 1.0].iter().enumerate() {
-                    let unsure = d.avg_logprob < -1.0 && !(d.no_speech > no_speech_t);
+                    let unsure = d.avg_logprob < -1.0 && d.no_speech.partial_cmp(&no_speech_t) != Some(std::cmp::Ordering::Greater);
                     if d.ended && !unsure {
                         break;
                     }

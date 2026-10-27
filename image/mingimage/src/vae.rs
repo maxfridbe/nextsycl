@@ -44,6 +44,7 @@ struct Resnet {
     shortcut: Option<Conv>,
 }
 
+#[allow(clippy::large_enum_variant)] // one of each is built per layer at load
 enum Up {
     Res(Resnet),
     /// nearest 2x, then the conv

@@ -154,6 +154,7 @@ impl Vae {
         ffi::check(unsafe { (ops.k.snake)(ops.gpu.raw(), x.cast(), s.c as i64, l as i64, s.alpha.fp(), s.inv_beta.fp(), out.cast()) }, "snake")
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn conv(ops: &Ops, c: &Conv, x: P, l: usize, stride: usize, dil: usize, pad: usize, out: M) -> Result<usize> {
         let lo = (l + 2 * pad - dil * (c.k - 1) - 1) / stride + 1;
         ops.nsd.conv1d(x, 1, c.ci, l, c.w.ptr(), c.co, c.k, c.b.as_ref().map_or(none(), |b| b.ptr() as P), stride, dil, pad, out, lo)?;

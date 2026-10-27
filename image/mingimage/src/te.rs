@@ -515,7 +515,7 @@ impl TextEncoder {
         let fin = DevBuf::f32(gpu, t * HIDDEN)?;
         // SAFETY: t x 2048 values each way.
         ffi::check(unsafe { (k.to_float)(gpu.raw(), h.ptr(), fin.fp(), (t * HIDDEN) as i64) }, "to float")?;
-        if let Some(tr) = trace.as_deref_mut() {
+        if let Some(tr) = trace {
             tr.fin = fin.to_f32()?;
         }
         // the direct condition: [before 5 | before 12 | final] over the template, rms norm (1e-5), linear

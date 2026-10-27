@@ -106,15 +106,11 @@ pub fn repaint_blend(x: &mut [f32], clean: &[f32], mask: &[bool], cf: usize) {
 }
 
 /// APG's momentum (MomentumBuffer, -0.75): the running average of the guidance differences
+#[derive(Default)]
 pub struct Momentum {
     avg: Option<Vec<f32>>,
 }
 
-impl Default for Momentum {
-    fn default() -> Momentum {
-        Momentum { avg: None }
-    }
-}
 
 /// apg_forward (eta 0, norm threshold 2.5) over latents [frames, 64] with dims=[1] - the frames: each channel's
 /// difference (its momentum's running average) clipped to norm 2.5 over the frames, its part along the conditional
