@@ -221,6 +221,8 @@ Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`).
 | `NS_HI_PROFILE` | off | Debug: set: a GPU wait after each named step of the DiT, the totals printed after the picture (slower; shows where the time goes) | image hunyuanimage21 |
 | `NS_MOSS_*` | - | every NS_MOSS_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_MOSS_EXPAND` | auto | MOSS-Image's DiT blocks expanded from their quantized form to half on the card once at load (the per-forward expansion then goes: ~9 % of a forward; the same values): auto keeps 8 GiB free after each block (a 32 GiB card holds all 42: 10.2 GB of half beside the 9.5 GB text encoder), 0 never (the quantized matrices stay, 3.4 GB), 1 all of them | image mossimage |
+| `NS_MOSS_STEPS` | 50 | MOSS-Image's default steps for a request that names none (a turbo LoRA's card sets 4 or 8) | image/mossimage |
+| `NS_MOSS_CFG` | 3 | MOSS-Image's default guidance (a turbo LoRA's card sets 1: no unconditional branch) | image/mossimage |
 | `NS_MOSS_BENCH_SIZE` | 1024 | Debug: the picture side the `image check --stages bench` stage times a forward and the VAE at (a multiple of 16) | image mossimage (check) |
 | `NS_MOSS_BENCH_REPEAT` | 1 | Debug: the bench stage's prompt said this many times over (a long prompt through the text encoder, up to 4096 tokens) | image mossimage (check) |
 | `NS_MOSS_PROFILE` | off | Debug: set: a GPU wait after each part of a text-encoder layer, the seconds in full attention, DeltaNet and the FFN printed on stderr (slower) | image mossimage |

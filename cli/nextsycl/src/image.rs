@@ -536,7 +536,7 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     if m["arch"].as_str() == Some(nextsycl_image_mossimage::ARCH) {
         let gs = gpus(args)?;
         let mut log = |s: String| eprintln!("{s}");
-        let e = nextsycl_image_mossimage::MossImage::load(&files, &gs, &mut log).map_err(|e| e.0)?;
+        let e = nextsycl_image_mossimage::MossImage::load(&files, &gs, &Default::default(), &mut log).map_err(|e| e.0)?;
         let st = opt(args, "--stages").unwrap_or("sigmas,dit,steps");
         let worst = nextsycl_image_mossimage::check::run(&e, dir, &st.split(',').collect::<Vec<_>>(), &mut log).map_err(|e| e.0)?;
         println!("worst relative error {worst:.2e}");

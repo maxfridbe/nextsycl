@@ -87,3 +87,61 @@ pub fn host_vec(f: &Gguf, name: &str) -> Result<Vec<f32>> {
 pub fn vecd(f: &Gguf, gpu: &Arc<Gpu>, name: &str) -> Result<DevBuf> {
     DevBuf::from_f32(gpu, &host_vec(f, name)?)
 }
+
+/// A float32 as half's bits (round to nearest even; past half's range, infinity)
+pub fn f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        // a subnormal: the implicit bit joins the mantissa, shifted right
+        let m = man | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let mid = 1 << (shift - 1);
+        let up = rem > mid || (rem == mid && half & 1 == 1);
+        return sign | (half + up as u32) as u16;
+    }
+    let half = ((e as u32) << 10) | (man >> 13);
+    let rem = man & 0x1fff;
+    let up = rem > 0x1000 || (rem == 0x1000 && half & 1 == 1);
+    sign | (half + up as u32) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::f16_bits;
+
+    #[test]
+    fn half_bits_match_known_values() {
+        assert_eq!(f16_bits(0.0), 0);
+        assert_eq!(f16_bits(1.0), 0x3c00);
+        assert_eq!(f16_bits(-2.0), 0xc000);
+        assert_eq!(f16_bits(65504.0), 0x7bff);
+        assert_eq!(f16_bits(1e9), 0x7c00);
+        assert_eq!(f16_bits(f32::from_bits(0x3880_0000)), 0x0400); // 2^-14, half's smallest normal
+        assert_eq!(f16_bits(f32::from_bits(0x3800_0000)), 0x0200); // 2^-15: a subnormal
+        assert_eq!(f16_bits(1.0 + 1.0 / 2048.0), 0x3c00); // the tie goes to even
+        assert_eq!(f16_bits(1.0 + 3.0 / 2048.0), 0x3c02);
+    }
+
+    #[test]
+    fn half_bits_round_trip_through_the_reader() {
+        for bits in [0x0001u16, 0x03ff, 0x0400, 0x3555, 0x7bff, 0x8400, 0xb800] {
+            let x = nextsycl_gguf::safetensors::f16_to_f32(bits);
+            assert_eq!(f16_bits(x), bits);
+        }
+    }
+}

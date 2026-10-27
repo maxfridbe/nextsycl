@@ -137,4 +137,12 @@ forward in 12 ms, so it is GPU bound.
   fixed per block, so primitives are reused across prompts); the text encoder's parity is unchanged (final hidden
   rel 1.4e-2). The 8 GiB reserve keeps the 2048 px forward inside the card with the expanded matrices.
 
-Still to do: model cards for the other quants, the front door / `image serve` smoke test, README and INTEL.md rows.
+- **Turbo LoRAs** (`model-cards/lora/moss-image-turbo-*`): the engine reads `LoadOptions::merge_loras` and adds each
+  update into its block matrix's half rows after the expansion (`linear_acc`, half B . A^T: q | k | v stacked as the
+  expansion stacks them), the 252 modules of the 42 blocks (q, k, v, o, ffn_up_gate, ffn_down); a module the file
+  names that no block matrix has is an error. The expansion with a LoRA merged in takes 2.1 s (all 42 blocks); a 1024 px picture takes
+  2.9 s in 4 steps and 4.5 s in 8, quoted text right. The merge's parity is not checked against a reference
+  (the references are the PyTorch pipeline's, which has no LoRA loader here); the LoRA files' own tensor names and
+  shapes are all matched (rank 128 of both sides, alpha / r scale).
+
+Still to do: Q3_K in the dequant; an INTEL.md-style speed page row when there is one.

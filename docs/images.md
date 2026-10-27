@@ -60,6 +60,21 @@ a negative prompt is not used). Port notes, parity and speed: [ports/mossimage.m
 50 steps with CFG, through the server: 46.7 s (the card's 3.5 Wh); 512x512, 12 steps 3.4 s. Every quant loads and draws;
 Q3_K files do not (no Q3_K in the dequant yet).
 
+**Turbo LoRAs.** Four few-step LoRAs for MOSS-Image (the Civitai page "Moss Image Turbo LoRAs", the weights lodestones'
+and akhaliq's) run it without guidance in 4 or 8 steps:
+
+```sh
+nextsycl models pull moss-image-turbo-sft-4step-lora     # or -sft-8step-, -base-8step-, -dmd2-8step-lora (1.1 GiB each)
+nextsycl image gen 'a neon sign on a rainy street that reads "WELCOME"' --model moss-image-sft-q4kxl --lora moss-image-turbo-sft-4step-lora
+```
+
+The LoRA is merged into the half matrices at load (W += B . A, rank 128, one rounding to half; every block must
+be expanded, so `NS_MOSS_EXPAND=0` refuses a LoRA and the card must have room for them, 1.5 GiB kept free) and
+brings its steps and guidance (`NS_MOSS_STEPS`, `NS_MOSS_CFG`: 4 or 8 steps, cfg 1). One LoRA at a time, strength 1.
+B70, 1024x1024: 4 steps 2.9 s, 8 steps 4.5 s, the quoted "WELCOME" spelled right. A request's `loras` reload the model with them merged (as Qwen-Image's do), a side path is
+not offered. The 8-step LoRAs also work at 4 steps (the DMD2 one best); the 4-step one wants 6 steps around 1536 wide
+and 8 at 2048x2048.
+
 ## HunyuanImage 2.1
 
 ```sh

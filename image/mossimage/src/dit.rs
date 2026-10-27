@@ -18,10 +18,11 @@ use std::sync::Arc;
 
 use nextsycl_core::{DevBuf, Error, Gpu, Result};
 use nextsycl_diffusion::kernels::{none, Dt, Nsd};
+use nextsycl_diffusion::lora::{self, Delta};
 use nextsycl_gguf::{GType, Gguf};
 
 use crate::ffi;
-use crate::part::{host_vec, Part};
+use crate::part::{f16_bits, host_vec, Part};
 
 pub const DIM: usize = 3072;
 pub const HEADS: usize = 24;
@@ -201,38 +202,79 @@ pub fn coords(h: usize, w: usize, text: usize) -> Vec<[f32; 4]> {
 }
 
 /// Expands the blocks' matrices to half on the card while the card has room (NS_MOSS_EXPAND: `auto` (default) keeps
-/// 8 GiB free after each block, `0` never, `1` all of them): a forward then skips the expansion, ~9 % of it
-fn expand(mut layers: Vec<Block>, nsd: &Nsd, log: &mut dyn FnMut(String)) -> Result<Vec<Block>> {
+/// 8 GiB free after each block, `0` never, `1` all of them): a forward then skips the expansion, ~9 % of it.
+/// `loras`: updates merged into the expanded matrices (W += B . A, one rounding to half), which need every block
+/// expanded; one that matches no block matrix is an error
+fn expand(mut layers: Vec<Block>, nsd: &Nsd, loras: &[Delta], log: &mut dyn FnMut(String)) -> Result<Vec<Block>> {
     const RESERVE: u64 = 8 << 30;
-    let mode = std::env::var("NS_MOSS_EXPAND").unwrap_or_else(|_| "auto".into());
+    // what a LoRA's merge leaves free, as the card's guard: 1.5 GiB
+    const KEEP: u64 = 3 << 29;
+    let mut mode = std::env::var("NS_MOSS_EXPAND").unwrap_or_else(|_| "auto".into());
+    if !loras.is_empty() {
+        if mode == "0" {
+            return Err(Error("LoRAs are merged into the expanded matrices: NS_MOSS_EXPAND=0 leaves none".into()));
+        }
+        mode = "lora".into();
+    }
     if mode == "0" {
         return Ok(layers);
     }
     let gpu = nsd.gpu.clone();
     let t0 = std::time::Instant::now();
     let mut done = 0;
-    for b in layers.iter_mut() {
+    let by_key: std::collections::BTreeMap<String, Vec<&Delta>> = loras.iter().fold(Default::default(), |mut m, d| {
+        m.entry(lora::key(&d.target)).or_default().push(d);
+        m
+    });
+    let merged = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    // the updates a module names, added into its rows of the half matrix at `w`
+    let merge = |w: *mut std::ffi::c_void, p: &Part, name: &str| -> Result<()> {
+        let key = lora::key(name);
+        for d in by_key.get(&key).into_iter().flatten() {
+            if d.n != p.rows || d.k != p.k {
+                return Err(Error(format!("LoRA {}: {}x{}, the matrix is {}x{}", d.target, d.n, d.k, p.rows, p.k)));
+            }
+            let up: Vec<u8> = d.b.iter().flat_map(|x| f16_bits(*x).to_le_bytes()).collect();
+            let down: Vec<u8> = (0..d.k).flat_map(|c| (0..d.r).map(move |j| (c, j))).flat_map(|(c, j)| f16_bits(d.a[j * d.k + c]).to_le_bytes()).collect();
+            let (bd, ad) = (DevBuf::new(&gpu, up.len())?, DevBuf::new(&gpu, down.len())?);
+            bd.write(0, &up)?;
+            ad.write(0, &down)?;
+            nsd.linear_acc(bd.ptr(), Dt::F16, d.n, d.r, ad.ptr(), d.k, w)?;
+            nsd.wait()?;
+            merged.borrow_mut().insert(key.clone());
+        }
+        Ok(())
+    };
+    for (i, b) in layers.iter_mut().enumerate() {
         let need = (WIDE_VALUES + 3 * DIM * DIM + DIM * DIM + DIM * FFN) as u64 * 2;
         if mode != "1" {
             let (_, free) = gpu.memory()?;
             // the quantized copies it frees count: the block's matrices
             let freed: u64 = [&b.q, &b.k, &b.v, &b.o, &b.up_gate, &b.down].iter().map(|p| p.stored()).sum();
-            if free.is_some_and(|f| f + freed < need + RESERVE) || free.is_none() {
+            if mode == "lora" {
+                if free.is_none_or(|f| f + freed < need + KEEP) {
+                    return Err(Error(format!("LoRAs need every block expanded to half: block {i} does not fit on {} (1.5 GiB kept free)", gpu.name)));
+                }
+            } else if free.is_some_and(|f| f + freed < need + RESERVE) || free.is_none() {
                 break;
             }
         }
-        let half = |parts: &[&Part]| -> Result<DevBuf> {
-            let n: usize = parts.iter().map(|p| p.rows * p.k).sum();
+        let pre = format!("layers.{i}.proj.");
+        let half = |parts: &[(&Part, &str)]| -> Result<DevBuf> {
+            let n: usize = parts.iter().map(|(p, _)| p.rows * p.k).sum();
             let out = DevBuf::new(&gpu, n * 2)?;
             let mut at = 0;
-            for p in parts {
-                nsd.dequant(p.w.ptr(), p.qtype, p.rows * p.k, out.ptr().cast::<u16>().wrapping_add(at).cast(), Dt::F16)?;
+            for (p, name) in parts {
+                let w: *mut std::ffi::c_void = out.ptr().cast::<u16>().wrapping_add(at).cast();
+                nsd.dequant(p.w.ptr(), p.qtype, p.rows * p.k, w, Dt::F16)?;
+                merge(w, p, &format!("{pre}{name}"))?;
                 at += p.rows * p.k;
             }
             nsd.wait()?;
             Ok(out)
         };
-        let h = Half { qkv: half(&[&b.q, &b.k, &b.v])?, o: half(&[&b.o])?, up_gate: half(&[&b.up_gate])?, down: half(&[&b.down])? };
+        let h = Half { qkv: half(&[(&b.q, "q"), (&b.k, "k"), (&b.v, "v")])?, o: half(&[(&b.o, "o")])?, up_gate: half(&[(&b.up_gate, "ffn_up_gate")])?,
+                       down: half(&[(&b.down, "ffn_down")])? };
         // the quantized copies go: one byte stands in for each
         for p in [&mut b.q, &mut b.k, &mut b.v, &mut b.o, &mut b.up_gate, &mut b.down] {
             p.w = DevBuf::new(&gpu, 1)?;
@@ -240,12 +282,21 @@ fn expand(mut layers: Vec<Block>, nsd: &Nsd, log: &mut dyn FnMut(String)) -> Res
         b.half = Some(h);
         done += 1;
     }
+    let missed: std::collections::BTreeSet<&str> = loras.iter().filter(|d| !merged.borrow().contains(&lora::key(&d.target))).map(|d| d.target.as_str()).collect();
+    if !missed.is_empty() {
+        let few: Vec<&str> = missed.iter().take(4).copied().collect();
+        return Err(Error(format!("LoRA modules this engine does not merge ({} of them): {}", missed.len(), few.join(", "))));
+    }
     log(format!("moss-image dit: {done} of {} blocks expanded to half on the card in {:.1} s", layers.len(), t0.elapsed().as_secs_f64()));
+    if !loras.is_empty() {
+        log(format!("moss-image dit: {} LoRA updates merged into {} matrices", loras.len(), merged.borrow().len()));
+    }
     Ok(layers)
 }
 
 impl Dit {
-    pub fn load(f: &Gguf, nsd: &Nsd, log: &mut dyn FnMut(String)) -> Result<Dit> {
+    /// `loras`: updates merged into the block matrices at load
+    pub fn load(f: &Gguf, nsd: &Nsd, loras: &[Delta], log: &mut dyn FnMut(String)) -> Result<Dit> {
         let gpu = nsd.gpu.clone();
         let t0 = std::time::Instant::now();
         let tensor = |name: &str| f.tensor(name).ok_or_else(|| Error(format!("{}: no tensor {name}", f.paths[0].display())));
@@ -317,7 +368,7 @@ impl Dit {
             text: part("text_embedder.proj.weight")?,
             text_b: vecd("text_embedder.proj.bias")?,
             text_blocks: (0..2).map(text_block).collect::<Result<_>>()?,
-            layers: expand((0..nl).map(block).collect::<Result<_>>()?, nsd, log)?,
+            layers: expand((0..nl).map(block).collect::<Result<_>>()?, nsd, loras, log)?,
             final_norm: vecd("final_norm_video.weight")?,
             final_linear: part("final_linear_video.weight")?,
             t1: (host_vec(f, "time_embedding.0.weight")?, host_vec(f, "time_embedding.0.bias")?),

@@ -1,0 +1,19 @@
+# MOSS-Image 4-step v2.0 (akhaliq, a turbo LoRA for SFT, rank 128; Apache-2.0)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# Repackaged for ComfyUI's loader by the Civitai page "Moss Image Turbo LoRAs" (civitai.com/models/3006599); the weights are the original creators'.
+id: moss-image-turbo-sft-4step-lora
+kind: lora
+arch: moss-image
+title: 'MOSS-Image 4-step v2.0 (akhaliq, a turbo LoRA for SFT, rank 128; Apache-2.0)'
+about: 'akhaliq''s 4-step distillation of MOSS-Image-SFT as a LoRA at strength 1.0: Euler on the stock schedule, no guidance (4 steps to 1024x1024, 6 around 1536 wide, 8 at 2048x2048; fewer look hazy above 1024); also runs on Base. Brings 4 steps, cfg 1'
+base: moss-image
+env:
+  NS_MOSS_STEPS: '4'
+  NS_MOSS_CFG: '1'
+files:
+  lora:
+    key: moss-image-turbo-sft-4step-lora
+    url: https://civitai.com/api/download/models/3414934?fileId=3307673
+    size: 1189176752
+    sha256: 154c7f1455c3bf9925945c2f1ea2e4f09d0d0c67256081384a094b2b585f913f
+    path: moss-image/loras/moss_image_sft_4step_v2.0.safetensors

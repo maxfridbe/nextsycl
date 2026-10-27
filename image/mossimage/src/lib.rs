@@ -37,8 +37,8 @@ pub fn kind() -> ImageKind {
     ImageKind { archs: &[ARCH], name: "MOSS-Image-SFT (5.1B DiT, Qwen3.5-9B text encoder, FLUX.2 VAE; Rust + SYCL)", roles: ROLES, load, options: &[] }
 }
 
-fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], _o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn ImageEngine>> {
-    Ok(Box::new(MossImage::load(files, gpus, log)?))
+fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn ImageEngine>> {
+    Ok(Box::new(MossImage::load(files, gpus, o, log)?))
 }
 
 /// torch.linspace(start, end, n) in float32: from both ends, as torch does
@@ -106,6 +106,21 @@ pub struct MossImage {
     busy: Mutex<()>,
     /// the last prompts' conditions (the encoder's rows, float32 [L, 4096]); "" is the guidance branch's
     conds: Mutex<Vec<(String, Arc<dit::Prefix>)>>,
+    /// the steps and guidance a request without them gets: the model's, or the merged LoRA's (`NS_MOSS_STEPS`,
+    /// `NS_MOSS_CFG`: a turbo LoRA runs 4 or 8 steps without guidance)
+    steps: u32,
+    cfg: f32,
+}
+
+/// A setting that must be a positive number, when given
+fn number<T: std::str::FromStr + PartialOrd + Default>(o: &LoadOptions, name: &str) -> Result<Option<T>> {
+    match o.setting(name) {
+        None => Ok(None),
+        Some(v) => match v.trim().parse::<T>() {
+            Ok(x) if x > T::default() => Ok(Some(x)),
+            _ => Err(Error(format!("{name}={v}: a positive number"))),
+        },
+    }
 }
 
 fn role<'f>(files: &'f ModelFiles, r: &str) -> Result<&'f std::path::Path> {
@@ -113,7 +128,7 @@ fn role<'f>(files: &'f ModelFiles, r: &str) -> Result<&'f std::path::Path> {
 }
 
 impl MossImage {
-    pub fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], log: &mut dyn FnMut(String)) -> Result<MossImage> {
+    pub fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<MossImage> {
         let t0 = Instant::now();
         nextsycl_core::use_kind("image");
         let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?.clone();
@@ -123,9 +138,16 @@ impl MossImage {
         }
         let te = te::TextEncoder::load(role(files, "text-encoder")?, &gpu, log)?;
         let nsd = Nsd::new(&gpu)?;
-        let dit = dit::Dit::load(&f, &nsd, log)?;
+        let mut deltas = Vec::new();
+        for l in &o.merge_loras {
+            let d = nextsycl_diffusion::lora::read(&l.path, l.scale).map_err(Error)?;
+            log(format!("LoRA {} x {}: {} matrices, rank {}", l.name, l.scale, d.len(), d.first().map_or(0, |x| x.r)));
+            deltas.extend(d);
+        }
+        let dit = dit::Dit::load(&f, &nsd, &deltas, log)?;
         let vae = vae::Vae::load(role(files, "vae")?, &nsd, log)?;
-        Ok(MossImage { te, nsd, dit, vae, gpu, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64(), busy: Mutex::new(()), conds: Mutex::new(Vec::new()) })
+        Ok(MossImage { te, nsd, dit, vae, gpu, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64(), busy: Mutex::new(()), conds: Mutex::new(Vec::new()),
+                       steps: number::<u32>(o, "NS_MOSS_STEPS")?.unwrap_or(50), cfg: number::<f32>(o, "NS_MOSS_CFG")?.unwrap_or(3.0) })
     }
 
     /// The prompt through the text encoder and the DiT's text embedder, the last few kept
@@ -175,7 +197,7 @@ impl ImageEngine for MossImage {
         ARCH
     }
     fn defaults(&self) -> Defaults {
-        Defaults { width: 1024, height: 1024, steps: 50, cfg: 3.0, sampler: Sampler::Euler, schedule: Schedule::Shift, shift: SHIFT }
+        Defaults { width: 1024, height: 1024, steps: self.steps, cfg: self.cfg, sampler: Sampler::Euler, schedule: Schedule::Shift, shift: SHIFT }
     }
     fn samplers(&self) -> Vec<Sampler> {
         vec![Sampler::Euler]

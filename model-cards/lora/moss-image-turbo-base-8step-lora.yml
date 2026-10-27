@@ -1,0 +1,19 @@
+# MOSS-Image-Base 8-step DMD v0.1 (lodestones, a turbo LoRA, rank 128; Apache-2.0)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# Repackaged for ComfyUI's loader by the Civitai page "Moss Image Turbo LoRAs" (civitai.com/models/3006599); the weights are the original creators'.
+id: moss-image-turbo-base-8step-lora
+kind: lora
+arch: moss-image
+title: 'MOSS-Image-Base 8-step DMD v0.1 (lodestones, a turbo LoRA, rank 128; Apache-2.0)'
+about: 'lodestones'' data-space DMD distillation of MOSS-Image-Base to 8 steps without guidance, as a LoRA at strength 1.0 (the Base 8-step also works at 4). Brings 8 steps, cfg 1'
+base: moss-image
+env:
+  NS_MOSS_STEPS: '8'
+  NS_MOSS_CFG: '1'
+files:
+  lora:
+    key: moss-image-turbo-base-8step-lora
+    url: https://civitai.com/api/download/models/3413516?fileId=3306025
+    size: 1189176800
+    sha256: f0e6cd07f222dfaea798afe3b796e2c2995cadfd44ad56e02ca616f0467aec28
+    path: moss-image/loras/MOSS_Image_Base_8_steps_dmd_v0.1.safetensors

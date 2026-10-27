@@ -64,6 +64,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 |---|---|---|
 | `qwen-image-2.1-uncensored-lora` | the uncensored change, rank 16 | checked |
 | `qwen-image-2.1-turbo-lora` | Viggle's 6-step turbo, rank 128 (brings its sigmas) | served |
+| `moss-image-turbo-sft-4step-lora`, `-sft-8step-`, `-base-8step-`, `-dmd2-8step-lora` | MOSS-Image turbo LoRAs (akhaliq's 4 steps, lodestones' 8-step DMD for SFT and Base, the DMD2 refinement), rank 128, cfg 1 (bring their steps) | checked |
 | `qwen-image-2.1-pruna-8step-lora` | Pruna's 8-step distill (brings its sigmas) | checked |
 | `qwen-image-2.1-pruna-5step-lora` | Pruna's 5-step distill | listed |
 

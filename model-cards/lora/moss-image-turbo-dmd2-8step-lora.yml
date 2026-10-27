@@ -1,0 +1,19 @@
+# MOSS-Image 8-step DMD2 (lodestones / Kromoss, a turbo LoRA, rank 128; Apache-2.0)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# Repackaged for ComfyUI's loader by the Civitai page "Moss Image Turbo LoRAs" (civitai.com/models/3006599); the weights are the original creators'.
+id: moss-image-turbo-dmd2-8step-lora
+kind: lora
+arch: moss-image
+title: 'MOSS-Image 8-step DMD2 (lodestones / Kromoss, a turbo LoRA, rank 128; Apache-2.0)'
+about: 'lodestones'' Base 8-step distillation refined by a DMD2 GAN stage against real images, as a LoRA at strength 1.0: a little more contrast and detail than the plain DMD, the creator''s pick; runs on Base, SFT and Kromoss (also at 4 steps). Brings 8 steps, cfg 1'
+base: moss-image
+env:
+  NS_MOSS_STEPS: '8'
+  NS_MOSS_CFG: '1'
+files:
+  lora:
+    key: moss-image-turbo-dmd2-8step-lora
+    url: https://civitai.com/api/download/models/3420002?fileId=3313796
+    size: 1189176800
+    sha256: 7683fe1fb51f73f5d690f24dd6b7f46f31ab9a9873729a854ac5c9a420ffe6f2
+    path: moss-image/loras/lodestones-8-steps-dmd2-lora.safetensors
