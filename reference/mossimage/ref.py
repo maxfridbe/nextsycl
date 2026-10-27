@@ -54,6 +54,10 @@ def stage_te(a):
     h = m(input_ids=ids, use_cache=False, return_dict=True).last_hidden_state[0]
     print(f"te {time.time() - t:.1f}s")
     save(a.out, "te_final", h)
+    # the negative prompt (empty) is encoded the same way: CFG's unconditional branch reads it
+    ntext, nids = tokenize(a.tok, "")
+    save(a.out, "ids_neg", nids[0].to(torch.int32))
+    save(a.out, "te_neg", m(input_ids=nids, use_cache=False, return_dict=True).last_hidden_state[0])
 
 
 def load_dit(a):
