@@ -124,6 +124,8 @@ pub struct TextEncoder {
     tok: Tokenizer,
     layers: Vec<Layer>,
     output_norm: DevBuf,
+    /// the biggest matrix expanded to half, for the whole-matrix products
+    wide: DevBuf,
     pub bytes: u64,
 }
 
@@ -141,7 +143,19 @@ fn q8_0_row(b: &[u8]) -> Vec<f32> {
     }).collect()
 }
 
+/// Values of the biggest matrix expanded whole (the FFN's 12288 x 4096); a bigger one takes the shared sliced product
+const WIDE_VALUES: usize = 12288 * 4096;
+
 impl TextEncoder {
+    /// out float32 [t, rows] = x half [t, k] . W^T: the matrix expanded whole and one product, else the shared one
+    fn mm(&self, nsd: &Nsd, p: &Part, x: *mut std::ffi::c_void, t: usize, out: *mut std::ffi::c_void) -> Result<()> {
+        if p.rows * p.k <= WIDE_VALUES {
+            p.apply_whole(nsd, None, &self.wide, x, t, out, Dt::F32)
+        } else {
+            p.apply(nsd, x, t, None, out, Dt::F32, 0)
+        }
+    }
+
     pub fn load(path: &std::path::Path, gpu: &Arc<Gpu>, log: &mut dyn FnMut(String)) -> Result<TextEncoder> {
         let t0 = std::time::Instant::now();
         let f = Gguf::open(path).map_err(ge)?;
@@ -186,7 +200,8 @@ impl TextEncoder {
         let nsd = Nsd::new(gpu)?;
         let bytes = f.tensors.iter().filter(|t| t.name != "output.weight").map(|t| t.bytes).sum();
         log(format!("moss-image text encoder: {} layers on {} in {:.1} s", g.layers, gpu.name, t0.elapsed().as_secs_f64()));
-        Ok(TextEncoder { gpu: gpu.clone(), nsd, g, file: f, tok, layers, output_norm, bytes })
+        let wide = DevBuf::new(gpu, WIDE_VALUES * 2)?;
+        Ok(TextEncoder { gpu: gpu.clone(), nsd, g, file: f, tok, layers, output_norm, wide, bytes })
     }
 
     /// The prompt as the pipeline feeds it: the chat template (one user turn, the generation prompt, thinking on)
@@ -263,12 +278,12 @@ impl TextEncoder {
             }
             nsd.gate_add(x.ptr(), Dt::F32, t, HIDDEN, s.of.ptr(), Dt::F32, none(), none())?;
             nsd.rms_norm_mod(x.ptr(), Dt::F32, t, HIDDEN, ly.post_norm.ptr(), g.eps, none(), none(), none(), s.h.ptr(), Dt::F16)?;
-            ly.gate.apply(nsd, s.h.ptr(), t, None, s.gate.ptr(), Dt::F32, 0)?;
-            ly.up.apply(nsd, s.h.ptr(), t, None, s.up.ptr(), Dt::F32, 0)?;
+            self.mm(nsd, &ly.gate, s.h.ptr(), t, s.gate.ptr())?;
+            self.mm(nsd, &ly.up, s.h.ptr(), t, s.up.ptr())?;
             let k = ffi::api()?;
             // SAFETY: t x ffn floats each, the activation as many halves.
             ffi::check(unsafe { (k.silu_mul)(gpu.raw(), s.gate.fp(), s.up.fp(), s.act.ptr(), (t * g.ffn) as i64) }, "silu mul")?;
-            ly.down.apply(nsd, s.act.ptr(), t, None, s.of.ptr(), Dt::F32, 0)?;
+            self.mm(nsd, &ly.down, s.act.ptr(), t, s.of.ptr())?;
             nsd.gate_add(x.ptr(), Dt::F32, t, HIDDEN, s.of.ptr(), Dt::F32, none(), none())?;
             mark(nsd, 2)?;
             if let Some(tr) = trace.as_deref_mut() {
@@ -294,9 +309,9 @@ impl TextEncoder {
         let (gpu, nsd, g) = (&self.gpu, &self.nsd, &self.g);
         let k = ffi::api()?;
         let (hq, hk, d) = (g.heads, g.heads_kv, g.head);
-        a.q.apply(nsd, s.h.ptr(), t, None, s.qf.ptr(), Dt::F32, 0)?;
-        a.k.apply(nsd, s.h.ptr(), t, None, s.kr.ptr(), Dt::F32, 0)?;
-        a.v.apply(nsd, s.h.ptr(), t, None, s.vr.ptr(), Dt::F32, 0)?;
+        self.mm(nsd, &a.q, s.h.ptr(), t, s.qf.ptr())?;
+        self.mm(nsd, &a.k, s.h.ptr(), t, s.kr.ptr())?;
+        self.mm(nsd, &a.v, s.h.ptr(), t, s.vr.ptr())?;
         // SAFETY: q's rows are [hq x (d + d gate)] floats, k's [hk x d]; the outputs [t, heads x d].
         unsafe {
             ffi::check((k.qk_norm_rope)(gpu.raw(), s.qf.fp(), (hq * 2 * d) as i64, (2 * d) as i64, s.q.fp(), t as i64, hq as i64, d as i64, a.q_norm.fp(), g.eps,
@@ -313,7 +328,7 @@ impl TextEncoder {
         ffi::check(unsafe { (k.gate_mul)(gpu.raw(), s.att.fp(), s.qf.fp(), (hq * 2 * d) as i64, t as i64, hq as i64, d as i64) }, "output gate")?;
         // SAFETY: t x 4096 floats in, as many halves out.
         ffi::check(unsafe { (k.to_half)(gpu.raw(), s.att.fp(), s.h.ptr(), (t * hq * d) as i64) }, "to half")?;
-        a.o.apply(nsd, s.h.ptr(), t, None, s.of.ptr(), Dt::F32, 0)
+        self.mm(nsd, &a.o, s.h.ptr(), t, s.of.ptr())
     }
 
     /// A gated-DeltaNet layer on `s.h`: its output in `s.of`
@@ -322,10 +337,10 @@ impl TextEncoder {
         let k = ffi::api()?;
         let (hv, hk, d, cd) = (g.v_heads, g.k_heads, g.state, g.conv_dim());
         let qd = hk * d;
-        a.qkv.apply(nsd, s.h.ptr(), t, None, s.qkv.ptr(), Dt::F32, 0)?;
-        a.z.apply(nsd, s.h.ptr(), t, None, s.z.ptr(), Dt::F32, 0)?;
-        a.beta.apply(nsd, s.h.ptr(), t, None, s.beta.ptr(), Dt::F32, 0)?;
-        a.alpha.apply(nsd, s.h.ptr(), t, None, s.alpha.ptr(), Dt::F32, 0)?;
+        self.mm(nsd, &a.qkv, s.h.ptr(), t, s.qkv.ptr())?;
+        self.mm(nsd, &a.z, s.h.ptr(), t, s.z.ptr())?;
+        self.mm(nsd, &a.beta, s.h.ptr(), t, s.beta.ptr())?;
+        self.mm(nsd, &a.alpha, s.h.ptr(), t, s.alpha.ptr())?;
         // the layer's state starts empty: the recurrence's [hv][d][d] and the conv's last inputs
         let state = DevBuf::from_f32(gpu, &vec![0f32; hv * d * d])?;
         let conv_state = DevBuf::from_f32(gpu, &vec![0f32; (g.conv - 1) * cd])?;
@@ -342,7 +357,7 @@ impl TextEncoder {
             ffi::check((k.gdn_out)(gpu.raw(), s.lo.fp(), s.z.fp(), g.inner as i64, a.norm.fp(), s.att.fp(), t as i64, hv as i64, d as i64, g.eps), "gated norm")?;
             ffi::check((k.to_half)(gpu.raw(), s.att.fp(), s.h.ptr(), (t * g.inner) as i64), "to half")?;
         }
-        a.out.apply(nsd, s.h.ptr(), t, None, s.of.ptr(), Dt::F32, 0)?;
+        self.mm(nsd, &a.out, s.h.ptr(), t, s.of.ptr())?;
         // the recurrence and conv state are read by queued kernels: kept until they have run
         nsd.wait()
     }

@@ -106,7 +106,7 @@ reproducible - the same seed, the same picture. Judge a change by the velocities
 | + whole-matrix products (no slicing) | 0.509 s | |
 | + matrices expanded to half at load (`NS_MOSS_EXPAND`) | 0.464 s | 2.82 s |
 | 50 steps with CFG | ~46 s | ~290 s |
-| text encoder, 32-token prompt / 3,970 tokens | 0.11 s / 1.0 s (3.4 s before the silo's attention) | |
+| text encoder, 32-token prompt / 3,970 tokens | 0.11 s / 0.92 s (3.4 s before the silo's attention) | |
 | VAE decode | 0.32 s | 1.5 s |
 
 What a forward holds now, from `--stages bench` (the per-op list drains the queue between ops, so it adds ~0.25 ms an
@@ -131,7 +131,7 @@ forward in 12 ms, so it is GPU bound.
   oneDNN's by a third to matter below 2048 px); the text encoder at long prompts, now
   1.0 s at 3,970 tokens (3.4 s with the shared causal attention, a work-group a (head, query) walking the keys one by
   one). `NS_MOSS_PROFILE=1` splits it: 0.08 s in the 8 full-attention layers, 0.34 s in the 24 DeltaNet layers (the
-  delta-rule scan is sequential in the tokens), 0.55 s the FFN and norms (the shared quantized product's slicing and
+  delta-rule scan is sequential in the tokens), 0.43 s the FFN and norms (now whole-matrix products too; was 0.55 s with the shared quantized product's slicing and
   float32 outputs: the DiT's whole-matrix trick is not applied here yet). The silo's attention takes query blocks of
   512 rows against the keys up to their end as half products on oneDNN with a masked float32 softmax between (shapes
   fixed per block, so primitives are reused across prompts); the text encoder's parity is unchanged (final hidden
