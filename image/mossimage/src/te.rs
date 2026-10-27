@@ -235,11 +235,30 @@ impl TextEncoder {
         }
         let x = DevBuf::from_f32(gpu, &self.embed(ids)?)?;
         let s = Scratch::new(gpu, g, t)?;
+        // NS_MOSS_PROFILE: a GPU wait after each part of a layer, the totals (full attention, DeltaNet, the FFN) on stderr
+        let profile = std::env::var_os("NS_MOSS_PROFILE").is_some();
+        let mut spent = [0f64; 3];
+        let mut lap = std::time::Instant::now();
+        let mut mark = |nsd: &Nsd, part: usize| -> Result<()> {
+            if profile {
+                nsd.wait()?;
+                spent[part] += lap.elapsed().as_secs_f64();
+                lap = std::time::Instant::now();
+            }
+            Ok(())
+        };
         for (l, ly) in self.layers.iter().enumerate() {
             nsd.rms_norm_mod(x.ptr(), Dt::F32, t, HIDDEN, ly.attn_norm.ptr(), g.eps, none(), none(), none(), s.h.ptr(), Dt::F16)?;
+            mark(nsd, 2)?;
             match (&ly.full, &ly.linear) {
-                (Some(a), _) => self.full(a, &s, t)?,
-                (_, Some(a)) => self.linear(a, &s, t)?,
+                (Some(a), _) => {
+                    self.full(a, &s, t)?;
+                    mark(nsd, 0)?;
+                }
+                (_, Some(a)) => {
+                    self.linear(a, &s, t)?;
+                    mark(nsd, 1)?;
+                }
                 _ => return Err(Error(format!("layer {l}: neither attention nor DeltaNet"))),
             }
             nsd.gate_add(x.ptr(), Dt::F32, t, HIDDEN, s.of.ptr(), Dt::F32, none(), none())?;
@@ -251,10 +270,14 @@ impl TextEncoder {
             ffi::check(unsafe { (k.silu_mul)(gpu.raw(), s.gate.fp(), s.up.fp(), s.act.ptr(), (t * g.ffn) as i64) }, "silu mul")?;
             ly.down.apply(nsd, s.act.ptr(), t, None, s.of.ptr(), Dt::F32, 0)?;
             nsd.gate_add(x.ptr(), Dt::F32, t, HIDDEN, s.of.ptr(), Dt::F32, none(), none())?;
+            mark(nsd, 2)?;
             if let Some(tr) = trace.as_deref_mut() {
                 nsd.wait()?;
                 tr.layers.push(x.to_f32()?);
             }
+        }
+        if profile {
+            eprintln!("moss-image text encoder, {t} tokens: full attention {:.3} s, DeltaNet {:.3} s, FFN and norms {:.3} s", spent[0], spent[1], spent[2]);
         }
         let out = DevBuf::f32(gpu, t * HIDDEN)?;
         nsd.rms_norm_mod(x.ptr(), Dt::F32, t, HIDDEN, self.output_norm.ptr(), g.eps, none(), none(), none(), out.ptr(), Dt::F32)?;

@@ -128,8 +128,12 @@ forward in 12 ms, so it is GPU bound.
   replaced by their half expansion at load (10.2 GB for the Q4_K_XL file; the text encoder's 9.5 GB fits beside it on
   a 32 GiB card), so a forward skips ~1.1 ms of expansion a block.
 - **Left** (measured, not chased): the attention at ~110 TFLOPS (a hand-written flash kernel would have to beat
-  oneDNN's by a third to matter below 2048 px); the text encoder at long prompts (3.4 s for 3,970 tokens - the
-  full-attention layers' naive causal attention and the delta-rule scan; a prompt is encoded once a picture, 7 % of a
-  1024 px one); the 8 GiB reserve keeps the 2048 px forward inside the card with the expanded matrices.
+  oneDNN's by a third to matter below 2048 px); the text encoder at long prompts. `NS_MOSS_PROFILE=1` splits it: at
+  3,970 tokens 3.4 s is 2.5 s in the 8 full-attention layers (the shared causal attention is a work-group a (head,
+  query) walking the keys one by one: built for short sequences), 0.33 s in the 24 DeltaNet layers, 0.54 s the FFN
+  and norms; at a 32-token prompt 0.11 s. A tiled causal attention on XMX (D = 256, 16 query heads over 4 kv heads)
+  would take the 2.5 s to ~0.3 s: it matters from ~1,500 tokens (a JSON layout prompt: ~1 % of a 1024 px picture's
+  time) and not at all for a sentence. The 8 GiB reserve keeps the 2048 px forward inside the card with the
+  expanded matrices.
 
 Still to do: model cards for the other quants, the front door / `image serve` smoke test, README and INTEL.md rows.
