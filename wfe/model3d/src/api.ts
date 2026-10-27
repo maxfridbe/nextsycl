@@ -11,7 +11,7 @@ async function post(path: string, body: Record<string, unknown>): Promise<Answer
   const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   const j = (await r.json()) as Answer & { error?: { message: string } };
   if (!r.ok) throw new Error(j.error?.message ?? `HTTP ${r.status}`);
-  return { ...j, data: j.data.map(local) };
+  return Array.isArray(j.data) ? { ...j, data: j.data.map(local) } : j;
 }
 
 /** a mesh's links relative to the page */

@@ -23,7 +23,7 @@ export const api = {
     });
     const j = (await r.json()) as GenAnswer & { error?: { message: string } };
     if (!r.ok) throw new Error(j.error?.message ?? `HTTP ${r.status}`);
-    return { ...j, data: j.data.map((d) => (d.url ? { ...d, url: here(d.url) } : d)) };
+    return { ...j, data: (j.data ?? []).map((d) => (d.url ? { ...d, url: here(d.url) } : d)) };
   },
 };
 
