@@ -41,6 +41,36 @@ impl Part {
     }
 }
 
+impl Part {
+    /// Bytes the matrix takes on the card as stored
+    pub fn stored(&self) -> u64 {
+        let (blk, bytes) = match self.qtype {
+            0 => (1, 4),
+            1 | 30 => (1, 2),
+            8 => (32, 34),
+            12 => (256, 144),
+            13 => (256, 176),
+            _ => (256, 210),
+        };
+        (self.rows * self.k / blk * bytes) as u64
+    }
+
+    /// out [m, rows] = x [m, k] (half) . W^T with W expanded whole into `wide` (or `kept`, already expanded) (at least rows x k halves) and one
+    /// product straight into `out`: the shared quantized product expands a slice of rows at a time and moves its
+    /// results into their columns, which on the DiT's matrices costs a third again on the product's own time
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_whole(&self, nsd: &Nsd, kept: Option<&DevBuf>, wide: &DevBuf, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void, out_dt: Dt) -> Result<()> {
+        let w = match kept {
+            Some(h) => h.ptr(),
+            None => {
+                nsd.dequant(self.w.ptr(), self.qtype, self.rows * self.k, wide.ptr(), Dt::F16)?;
+                wide.ptr()
+            }
+        };
+        nsd.linear(x, Dt::F16, m, self.k, w, self.rows, none(), out, out_dt)
+    }
+}
+
 /// A float tensor (float32, bfloat16 or half) on the host as float32
 pub fn host_vec(f: &Gguf, name: &str) -> Result<Vec<f32>> {
     let t = f.tensor(name).ok_or_else(|| Error(format!("{}: no tensor {name}", f.paths[0].display())))?;

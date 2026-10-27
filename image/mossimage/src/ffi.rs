@@ -84,3 +84,48 @@ pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
     let why = nextsycl_core::api().map(|a| a.error()).unwrap_or_default();
     Err(nextsycl_core::Error(format!("{what}: {why}")))
 }
+
+/// The silo's name (`kernels/image/mossimage/silo` -> `dist/silo/libnextsycl-mossimage.so`)
+pub const SILO: &str = "mossimage";
+
+/// The silo's fused passes (silo.h)
+pub struct Silo {
+    pub supported: unsafe extern "C" fn(G, i64, i64) -> c_int,
+    pub add_norm: unsafe extern "C" fn(G, *mut f32, P, P, i64, i64, P, f32, P, P, M) -> c_int,
+    pub qk_rope: unsafe extern "C" fn(G, M, i64, i64, i64, i64, i64, P, P, f32, P) -> c_int,
+    pub situ: unsafe extern "C" fn(G, P, P, i64, i64, i64, M, i64) -> c_int,
+}
+
+// SAFETY: function pointers into a library that stays loaded for the process.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+/// The silo, when built (None: NS_SILO=0, or no file - the engine's own kernels throughout)
+pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
+    static S: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    S.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo(SILO).map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in silo.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo {
+            supported: sym!("ns_image_moss_silo_supported"),
+            add_norm: sym!("ns_image_moss_silo_add_norm"),
+            qk_rope: sym!("ns_image_moss_silo_qk_rope"),
+            situ: sym!("ns_image_moss_silo_situ"),
+        }))
+    })
+    .as_ref()
+    .map(|s| s.as_ref())
+    .map_err(|e| nextsycl_core::Error(e.clone()))
+}

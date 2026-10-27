@@ -164,6 +164,140 @@ pub fn run(m: &MossImage, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
         log(format!("{} steps in {:.1} s", sig.len() - 1, t0.elapsed().as_secs_f64()));
         worst = worst.max(note("latents after the steps", &dit::planes(&lat, n), &get("lat_final")?.1, log));
     }
+    if stages.contains(&"repeat") {
+        // the same forward twice on the reference's latents: any difference is a race, not rounding
+        let pre = m.dit.prefix(&m.nsd, &te, None)?;
+        let npre = m.dit.prefix(&m.nsd, &neg, None)?;
+        let mods = m.dit.mods(&m.nsd, &sig)?;
+        // the prompt side too: three prefixes of one prompt, and a checksum to compare runs by
+        let sum = |p: &dit::Prefix| -> Result<(f64, Vec<f32>)> {
+            let v = p.x.to_f32()?;
+            Ok((v.iter().map(|x| *x as f64).sum(), v))
+        };
+        let (s0, v0) = sum(&pre)?;
+        for r in 0..2 {
+            let (s1, v1) = sum(&m.dit.prefix(&m.nsd, &te, None)?)?;
+            let d = v0.iter().zip(&v1).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+            log(format!("repeat prefix {r}: sum {s0:.6} vs {s1:.6}, differs by {d:.3e}"));
+        }
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..sig.len() - 1 {
+            let Ok((_, li)) = get(&format!("lat_{i}")) else { continue };
+            let lat = DevBuf::from_f32(&gpu, &dit::tokens(&li, n))?;
+            let a = m.dit.velocity(&m.nsd, &pre, &lat, hw, &mods[i], &[], None)?.to_f32()?;
+            let b = m.dit.velocity(&m.nsd, &pre, &lat, hw, &mods[i], &[], None)?.to_f32()?;
+            let ua = m.dit.velocity(&m.nsd, &npre, &lat, hw, &mods[i], UNCOND_SKIP, None)?.to_f32()?;
+            let ub = m.dit.velocity(&m.nsd, &npre, &lat, hw, &mods[i], UNCOND_SKIP, None)?.to_f32()?;
+            let d = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+            log(format!("repeat step {i}: cond differs by {:.3e}, uncond by {:.3e}", d(&a, &b), d(&ua, &ub)));
+        }
+    }
+    if stages.contains(&"repeat") {
+        // the whole sampler twice from the same noise: the steps' latents are compared as they go
+        let pre = m.dit.prefix(&m.nsd, &te, None)?;
+        let npre = m.dit.prefix(&m.nsd, &neg, None)?;
+        let start = dit::tokens(&lat0, n);
+        // the latents after 4 steps, then step 4's forwards repeated on them
+        let l4 = m.sample(&pre, Some(&npre), 3.0, &start, hw, &sig[..=4], &mut |_| Ok(()))?;
+        let lat = DevBuf::from_f32(&gpu, &l4)?;
+        let mods = m.dit.mods(&m.nsd, &sig)?;
+        let d = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+        let c: Vec<Vec<f32>> = (0..3).map(|_| m.dit.velocity(&m.nsd, &pre, &lat, hw, &mods[4], &[], None).and_then(|v| v.to_f32())).collect::<Result<_>>()?;
+        let u: Vec<Vec<f32>> = (0..3).map(|_| m.dit.velocity(&m.nsd, &npre, &lat, hw, &mods[4], UNCOND_SKIP, None).and_then(|v| v.to_f32())).collect::<Result<_>>()?;
+        log(format!("repeat step 4 on its latents: cond {:.3e} {:.3e}, uncond {:.3e} {:.3e}", d(&c[0], &c[1]), d(&c[1], &c[2]), d(&u[0], &u[1]), d(&u[1], &u[2])));
+        // the same forward with different memory around it: buffers of other sizes held while it runs
+        let mut keep: Vec<DevBuf> = Vec::new();
+        let mut outs: Vec<Vec<f32>> = Vec::new();
+        for j in 0..5usize {
+            keep.push(DevBuf::new(&gpu, (j * 37 + 11) * 1_000_003 + 4096 * j)?);
+            outs.push(m.dit.velocity(&m.nsd, &pre, &lat, hw, &mods[4], &[], None)?.to_f32()?);
+        }
+        log(format!("repeat step 4 with other buffers held: {:?}", outs.iter().map(|o| format!("{:.2e}", d(o, &outs[0]))).collect::<Vec<_>>()));
+        let m2 = m.dit.mods(&m.nsd, &sig)?;
+        let m3 = m.dit.mods(&m.nsd, &sig)?;
+        let md = |a: &[dit::StepMod], b: &[dit::StepMod]| -> Result<f32> {
+            let mut w = 0f32;
+            for (x, y) in a.iter().zip(b) {
+                w = w.max(d(&x.blocks.to_f32()?, &y.blocks.to_f32()?)).max(d(&x.head.to_f32()?, &y.head.to_f32()?));
+            }
+            Ok(w)
+        };
+        log(format!("repeat mods: two computations differ by {:.3e}, against the first {:.3e}", md(&m2, &m3)?, md(&mods, &m2)?));
+        // sample()'s loop by hand, cond only, with the latents either updated in place on the card or through the host
+        for through_host in [false, true] {
+            let mut runs: Vec<Vec<f32>> = Vec::new();
+            for _ in 0..3 {
+                let ka = crate::ffi::api()?;
+                let mut lat = DevBuf::from_f32(&gpu, &start)?;
+                for i in 0..6 {
+                    let v = m.dit.velocity(&m.nsd, &pre, &lat, hw, &mods[i], &[], None)?;
+                    // SAFETY: n floats each.
+                    crate::ffi::check(unsafe { (ka.axpy)(gpu.raw(), lat.fp(), v.fp(), start.len() as i64, sig[i + 1] - sig[i]) }, "euler step")?;
+                    gpu.sync()?;
+                    if through_host {
+                        lat = DevBuf::from_f32(&gpu, &lat.to_f32()?)?;
+                    }
+                }
+                runs.push(lat.to_f32()?);
+            }
+            log(format!("repeat by hand, 6 steps, cond only, through host {through_host}: runs differ by {:.3e} {:.3e}", d(&runs[0], &runs[1]), d(&runs[1], &runs[2])));
+        }
+        for (what, cfg_on) in [("cond only", false), ("cond + uncond", true)] {
+            let mut runs: Vec<Vec<f32>> = Vec::new();
+            for _ in 0..3 {
+                runs.push(m.sample(&pre, if cfg_on { Some(&npre) } else { None }, 3.0, &start, hw, &sig[..=6], &mut |_| Ok(()))?);
+            }
+            log(format!("repeat sampler, 6 steps, {what}: runs differ by {:.3e} {:.3e}", d(&runs[0], &runs[1]), d(&runs[1], &runs[2])));
+        }
+    }
+    if stages.contains(&"bench") {
+        // the size the picture is made at (NS_MOSS_BENCH_SIZE, default 1024): each stage warm, then timed
+        let size: usize = std::env::var("NS_MOSS_BENCH_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+        let bh = (size / 16, size / 16);
+        let bn = bh.0 * bh.1;
+        // NS_MOSS_BENCH_REPEAT: the prompt said that many times over (a long prompt through the text encoder)
+        let reps: usize = std::env::var("NS_MOSS_BENCH_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let prompt = "A small red fox in fresh snow, soft morning light, a wooden sign beside it reading \"WELCOME\". ".repeat(reps);
+        let prompt = prompt.trim_end();
+        fn time(log: &mut dyn FnMut(String), what: &str, f: &mut dyn FnMut() -> Result<()>) -> Result<f64> {
+            f()?;
+            let t0 = std::time::Instant::now();
+            f()?;
+            let s = t0.elapsed().as_secs_f64();
+            log(format!("bench {what:<28} {s:.3} s"));
+            Ok(s)
+        }
+        let ids = m.te.ids(prompt);
+        log(format!("bench prompt of {} tokens, picture {size} x {size} ({bn} tokens)", ids.len()));
+        time(log, "text encoder", &mut || m.te.encode_ids(&ids, None).map(|_| ()))?;
+        let rows = m.te.encode_ids(&ids, None)?;
+        time(log, "text embedder (prefix)", &mut || m.dit.prefix(&m.nsd, &rows, None).map(|_| ()))?;
+        let pre = m.dit.prefix(&m.nsd, &rows, None)?;
+        let mods = m.dit.mods(&m.nsd, &sig)?;
+        let lat = DevBuf::from_f32(&gpu, &crate::noise(7, bn * dit::LATENT))?;
+        time(log, "DiT forward", &mut || m.dit.velocity(&m.nsd, &pre, &lat, bh, &mods[0], &[], None).map(|_| ()))?;
+        let t0 = std::time::Instant::now();
+        m.dit.velocity(&m.nsd, &pre, &lat, bh, &mods[0], &[], None)?;
+        log(format!("bench DiT forward: queued by the host in {:.3} s, done after {:.3} s", m.dit.queued(), t0.elapsed().as_secs_f64()));
+        let mut g = dit::Grabs { prof: Some(dit::Prof::new()), ..Default::default() };
+        m.dit.velocity(&m.nsd, &pre, &lat, bh, &mods[0], &[], Some(&mut g))?;
+        if let Some(p) = g.prof {
+            let total: f64 = p.acc.iter().map(|(_, t)| t).sum();
+            for (name, t) in &p.acc {
+                log(format!("bench   DiT op {name:<16} {t:.3} s  {:4.1} %", 100.0 * t / total));
+            }
+        }
+        let flops = 2.0 * (bn + 32) as f64 * 3072.0 * 16384.0;
+        for (what, t) in m.dit.gemm_probe(&m.nsd, bn + 32)? {
+            let fl = if what.starts_with("down") { 2.0 * (bn + 32) as f64 * 8192.0 * 3072.0 } else { flops };
+            log(format!("bench product, {what:<20} {:.2} ms  ({:.0} TFLOPS)", t * 1e3, fl / t / 1e12));
+        }
+        for (what, t, bytes) in m.dit.silo_probe(&m.nsd, bn + 32)? {
+            log(format!("bench silo {what:<26} {:.3} ms  ({:.0} GB/s)", t * 1e3, bytes / t / 1e9));
+        }
+        let toks = crate::noise(1, bn * dit::LATENT);
+        time(log, "VAE decode", &mut || m.vae.decode(&m.nsd, &toks, bh.0, bh.1).map(|_| ()))?;
+    }
     if stages.contains(&"vae") {
         let (_, lf) = get("lat_final")?;
         let (img, pw, ph) = m.vae.decode_half(&m.nsd, &dit::tokens(&lf, n), hw.0, hw.1)?;

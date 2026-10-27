@@ -1,4 +1,4 @@
-## MOSS-Image-SFT (OpenMOSS): port plan
+## MOSS-Image-SFT (OpenMOSS): the port
 
 Text to image, 5.1B, Apache-2.0, released 2026-10-16. Served here from unsloth's GGUFs
 (`unsloth/MOSS-Image-SFT-GGUF`: the DiT only, Q3_K_XL ... BF16, 2.8 - 10.2 GB). Upstream:
@@ -74,3 +74,62 @@ norms and biases. `rope.bands` [16] is a derived constant (recomputed: `1 / 1000
 4. Registry, model cards (one per quant), `image serve`, the front door (it is `image.generate`; layout JSON is
    just a prompt), docs, README speed table.
 5. Silo tuning only after 1-4 are exact.
+
+### Status (2026-10-26)
+
+Steps 0-3 done and checked on the B70 (`nextsycl image check <dump dir> --model moss-image-sft-q4kxl`, dumps made by
+`reference/mossimage/ref.py`: 512 px, 12 steps, cfg 3, seed 7; stages `sigmas,tokens,te,dit,steps,vae,full,bench`):
+
+| Stage | Against the reference (CPU float32) |
+|---|---|
+| sigmas / tokens | 3e-8 / the same 21 ids |
+| text encoder (Qwen3.5-9B Q8_0, F32 recurrences) | final hidden rel 1.4e-2 (cos 0.9999; Q8_0 weights, half activations) |
+| text embedder, video embedder | 2.8e-4 / 2.9e-4 |
+| DiT, block by block (step 0) | 1e-4 .. 3e-4, the last block 2e-3 (cos 0.999998) |
+| velocity, every sampled step | 4e-4 .. 2e-3 (cos 0.999998 +) |
+| 12 CFG steps, latents | rel 3e-2 .. 4e-2, cos 0.999 |
+| VAE | 2.9e-4 |
+| whole picture, all ours | cos 0.997 to the reference's; the same fox |
+
+The last-latents number is a noise floor, not a bug: every product reads half activations (rounding ~5e-4 a step),
+and 12 steps of CFG 3 amplify that ~30x. A forward on the same latents is bit-identical run to run; what once made two
+runs differ (rel 2e-2 to 1.4e-1 in the latents) was the step modulation's float32 product over all the steps' rows
+(summed in another order each call, ~1e-6): `Dit::mods` now does one step a product and the sampler is
+reproducible - the same seed, the same picture. Judge a change by the velocities and blocks, which do not move.
+
+### Speed (B70, 2026-10-26; a forward = one DiT pass, a step = two with CFG)
+
+| | 1024 x 1024 (4,096 image tokens) | 2048 x 2048 (16,384) |
+|---|---|---|
+| DiT forward, first port | 0.669 s | |
+| + the silo's fused passes | 0.575 s | |
+| + whole-matrix products (no slicing) | 0.509 s | |
+| + matrices expanded to half at load (`NS_MOSS_EXPAND`) | 0.464 s | 2.82 s |
+| 50 steps with CFG | ~46 s | ~290 s |
+| text encoder, 32-token prompt / 3,970 tokens | 0.11 s / 3.4 s | |
+| VAE decode | 0.32 s | 1.5 s |
+
+What a forward holds now, from `--stages bench` (the per-op list drains the queue between ops, so it adds ~0.25 ms an
+op; the sum of its rows runs ~30 % over the forward): the products run at 143-162 TFLOPS on the expanded half
+matrices (the B70's practical peak); the attention at ~110 TFLOPS (oneDNN's fused SDPA, 16 % of a 1024 forward, 36 %
+at 2048); the silo's three fused passes together cost 0.6 ms a block (add + norm + modulation 0.07 ms, q/k norm +
+rope 0.13 ms, the soft-clipped gate 0.35 ms: the residual add rides along in the next norm, the up / gate product is
+written in half); a forward's rotary table and buffers are kept per shape (10 ms a forward saved); the host queues a
+forward in 12 ms, so it is GPU bound.
+
+- **Silo** (`kernels/image/mossimage/silo`, `dist/silo/libnextsycl-mossimage.so`, `NS_SILO=0` for the A/B): add +
+  norm + modulation, q/k RMS norm + rope in one launch, the soft-clipped gate from half rows; `_supported` gates it
+  (sub-groups of 16, 3,072-wide rows). Without it the engine runs the shared kernels, ~8 % slower.
+- **Whole-matrix products** (engine, not a kernel): the shared quantized linear expands ~64 MiB of rows at a time and
+  copies each slice's products into their columns; the DiT's matrices (16384 x 3072 fused up / gate, the packed qkv)
+  now expand once into one scratch and run as one product straight into the output (4.4 -> 3.1 ms for the up / gate
+  at 4,128 rows). The values are the same; q, k, v are expanded side by side and make the packed rows in one product.
+- **Resident half** (`NS_MOSS_EXPAND`, auto): with 8 GiB to spare after each block the quantized matrices are
+  replaced by their half expansion at load (10.2 GB for the Q4_K_XL file; the text encoder's 9.5 GB fits beside it on
+  a 32 GiB card), so a forward skips ~1.1 ms of expansion a block.
+- **Left** (measured, not chased): the attention at ~110 TFLOPS (a hand-written flash kernel would have to beat
+  oneDNN's by a third to matter below 2048 px); the text encoder at long prompts (3.4 s for 3,970 tokens - the
+  full-attention layers' naive causal attention and the delta-rule scan; a prompt is encoded once a picture, 7 % of a
+  1024 px one); the 8 GiB reserve keeps the 2048 px forward inside the card with the expanded matrices.
+
+Still to do: model cards for the other quants, the front door / `image serve` smoke test, README and INTEL.md rows.
