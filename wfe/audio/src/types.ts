@@ -47,6 +47,8 @@ export interface Speech {
   enrolled?: boolean;
   /** what a request must carry besides the text */
   requires?: "voice" | "instructions" | "reference" | null;
+  /** the speakers a script may have, each its own saved voice ("Speaker 1: ...", "Speaker 2: ...": VibeVoice) */
+  speakers?: number;
 }
 
 export interface Progress {
@@ -117,6 +119,8 @@ export interface Form {
   refAudio: string;
   refName: string;
   refText: string;
+  /** speech by a script of several speakers: the saved voice of each, in order (empty: one voice speaks) */
+  voices?: string[];
 }
 
 /** A saved voice (the server's voices library). */

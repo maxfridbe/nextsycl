@@ -30,6 +30,10 @@ export interface Info {
   transparent?: boolean;
   /** whether the schedule's shift can be set */
   shift?: boolean;
+  /** the model writes pictures as SVG (POST /v1/images/vectorize) instead of drawing */
+  vectorize?: boolean;
+  /** the model enlarges pictures (POST /v1/images/upscale): its variants */
+  upscale?: { variant: string; about: string; scales: number[] }[];
   defaults?: Defaults;
   samplers?: string[];
   schedules?: string[];

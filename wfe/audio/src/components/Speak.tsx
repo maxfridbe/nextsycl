@@ -2,7 +2,7 @@
  *  recording - whichever the model does), the language, the most to make, the seed; under Advanced the engine's own
  *  options. Each field writes straight into state.form. */
 import { jsx } from "../jsx.js";
-import { canGo, cancel, deleteVoice, enrollJob, enrollVoice, generate, pickReference, randomSeed, saveVoice } from "../actions.js";
+import { canGo, cancel, cast, deleteVoice, enrollJob, enrollVoice, generate, pickReference, randomSeed, saveVoice } from "../actions.js";
 import { panelOpen, render, saveForm, state, togglePanel } from "../state.js";
 
 type Text = "text" | "instructions" | "refText" | "voice" | "language";
@@ -105,6 +105,30 @@ export function Speak() {
               ))}
             </span>
             {state.enroll ? null : <div class="hint">open this page through the front door (:8000) to enroll a voice</div>}
+          </div>
+        : null}
+      {sp.clone && (sp.speakers ?? 1) > 1
+        ? <div>
+            <div class="lab">a script of several speakers <span class="hint">{`write it as "Speaker 1: ..." / "Speaker 2: ..." lines and give each speaker a saved voice (up to ${sp.speakers}); with fewer than two chosen, one voice speaks`}</span></div>
+            {state.voices.length
+              ? <div class="row">
+                  {Array.from({ length: sp.speakers ?? 1 }, (_, i) => (
+                    <label>{`speaker ${i + 1}`}
+                      <select on={{ change: (e: Event) => {
+                        const v = [...(state.form.voices ?? [])];
+                        v[i] = (e.target as HTMLSelectElement).value;
+                        state.form.voices = v;
+                        saveForm();
+                        render();
+                      } }}>
+                        <option attrs={{ value: "" }} props={{ selected: !(state.form.voices ?? [])[i] }}>—</option>
+                        {state.voices.map((sv) => <option attrs={{ value: sv.name }} props={{ selected: (state.form.voices ?? [])[i] === sv.name }}>{sv.name}</option>)}
+                      </select>
+                    </label>
+                  ))}
+                  {cast(sp).length ? <span class="hint">{`${cast(sp).length} speakers cast`}</span> : null}
+                </div>
+              : <div class="hint">save two or more voices first (a recording, then "save as voice…" below)</div>}
           </div>
         : null}
       {sp.clone

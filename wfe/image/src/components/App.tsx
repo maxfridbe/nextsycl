@@ -39,6 +39,8 @@ export function App() {
       </div>
       <Stats />
       {state.error && !state.busy ? <pre class="err">{state.error}</pre> : null}
+      {info?.vectorize ? <pre class="err">{`${info.model} writes pictures as SVG (POST /v1/images/vectorize, image.vectorize); this page draws them (serve a drawing model)`}</pre> : null}
+      {info && (info.upscale ?? []).length ? <pre class="err">{`${info.model} enlarges pictures (POST /v1/images/upscale, image.upscale); this page draws them (serve a drawing model)`}</pre> : null}
       <Panel id="create" icon="&#xf040;" title="Create" hint={info?.arch ?? (info?.loading ? "loading the model…" : "")}>
         <Create />
       </Panel>

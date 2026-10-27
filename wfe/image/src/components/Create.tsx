@@ -156,7 +156,8 @@ export function Create() {
   const f = state.form;
   const info = state.info;
   const d = info?.defaults;
-  const ready = !!info && !info.loading;
+  // a model that enlarges or vectorizes pictures has no prompt to draw from
+  const ready = !!info && !info.loading && !info.vectorize && !(info.upscale ?? []).length;
   const select = (k: "sampler" | "schedule", list: string[]) => (
     <select on={{ change: (e: Event) => set(k, (e.target as HTMLSelectElement).value) }}>
       {list.map((x) => <option attrs={{ value: x }} props={{ selected: x === f[k] }}>{x}</option>)}

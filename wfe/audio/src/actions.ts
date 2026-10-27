@@ -131,6 +131,18 @@ export function pickReference(file: File | null): void {
   r.readAsDataURL(file);
 }
 
+/** A multi-speaker script's voices: the saved voices picked for the first speakers, in order, up to the first gap */
+export function cast(sp: { speakers?: number }): string[] {
+  if ((sp.speakers ?? 1) < 2) return [];
+  const known = new Set(state.voices.map((v) => v.name));
+  const out: string[] = [];
+  for (const n of (state.form.voices ?? []).slice(0, sp.speakers)) {
+    if (!n || !known.has(n)) break;
+    out.push(n);
+  }
+  return out.length >= 2 ? out : [];
+}
+
 /** Whether the form can go: songs need a description, speech its text (and what the model needs besides). */
 export function canGo(): boolean {
   const f = state.form;
@@ -139,7 +151,7 @@ export function canGo(): boolean {
   if (!f.text.trim()) return false;
   if (sp.requires === "voice" && !f.voice) return false;
   if (sp.requires === "instructions" && !f.instructions.trim()) return false;
-  if (sp.requires === "reference" && !f.refAudio && !state.voices.some((v) => v.name === f.voice)) return false;
+  if (sp.requires === "reference" && !f.refAudio && !state.voices.some((v) => v.name === f.voice) && cast(sp).length < 2) return false;
   return true;
 }
 
@@ -154,7 +166,9 @@ function body(): Record<string, unknown> {
     if (sp.voices.length && f.voice) b.voice = f.voice;
     if (f.language && sp.languages.length) b.language = f.language;
     if ((sp.instructions || sp.design) && f.instructions.trim()) b.instructions = f.instructions.trim();
-    if (sp.clone && !sp.voices.length && state.voices.some((v) => v.name === f.voice)) b.voice = f.voice;
+    const script = cast(sp);
+    if (script.length) b.voices = script;
+    else if (sp.clone && !sp.voices.length && state.voices.some((v) => v.name === f.voice)) b.voice = f.voice;
     else if (sp.clone && f.refAudio) {
       b.ref_audio = f.refAudio;
       if (f.refText.trim()) b.ref_text = f.refText.trim();
