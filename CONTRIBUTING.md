@@ -37,7 +37,7 @@ guide is how to port one, and the few rules every change follows.
    kernels alone. Start a silo kernel as a copy of the shared one, then change the copy. A change to a shared kernel
    itself (a bug fix, a new type) re-runs every engine that calls it - its check and its bench - before it lands.
 
-6. **A front-door method is its handler.** `glue/serve/src/home/methods.rs`: `#[rpc(name = "image.generate", tags
+7. **A front-door method is its handler.** `glue/serve/src/home/methods.rs`: `#[rpc(name = "image.generate", tags
    = "image", example = r#"{...}"#)]` on a fn with a doc comment (its summary), and a request struct with
    `#[derive(Rpc)]` (each field's doc comment its description, `#[schema(min, max, default, one_of ...)]` its
    limits). The table, the OpenAPI document's operations, system.version's list and the wfe client
@@ -48,7 +48,7 @@ guide is how to port one, and the few rules every change follows.
 
 Every rule a machine can check is a test in `cli/nextsycl/tests/architecture.rs` (its header maps each rule to its
 tests; rule 5 is a review rule), run by `cargo test`; `./build.sh test` checks the kernel libraries link against no
-other runtime. CI runs both. A new rule comes with its test. Rule 6 is checked by the compiler, `tsc` and `cargo test` (`home::api_files_tests`).
+other runtime. CI runs both. A new rule comes with its test. Rule 7 is checked by the compiler, `tsc` and `cargo test` (`home::api_files_tests`).
 
 ## Building
 
