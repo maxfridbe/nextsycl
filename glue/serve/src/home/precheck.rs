@@ -42,6 +42,17 @@ fn whole(b: &Value, k: &str, lo: u64, hi: u64) -> Result<Option<u64>, Fail> {
     }
 }
 
+/// The grid an image model's picture sides are multiples of: HunyuanImage's is 32, the others' 16
+pub fn size_multiple(m: &Value) -> u32 {
+    if m["arch"] == "hunyuanimage-2.1" { 32 } else { 16 }
+}
+
+/// Whether a guidance scale above 1 needs a negative prompt: Qwen-Image's true_cfg_scale does (its engine refuses
+/// without one); MOSS-Image's and HunyuanImage's guidance runs against an empty one
+pub fn cfg_needs_negative(m: &Value) -> bool {
+    m["arch"] == "qwen-image-2.1"
+}
+
 /// The steps an image model takes (image.info's steps): its default, and the only count a few-step model runs
 pub fn steps_of(m: &Value) -> Value {
     let own = m["env"]["NS_QI_SIGMAS"].as_str().map(|v| v.split(',').filter(|x| !x.trim().is_empty()).count());
@@ -130,8 +141,8 @@ impl Home {
             Some(sz) => {
                 let wh = sz.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)));
                 match wh {
-                    Some((w, h)) if w >= 64 && h >= 64 && w % 16 == 0 && h % 16 == 0 => {}
-                    Some(_) => return Err(bad(format!("size {sz}: both sides multiples of 16, at least 64"))),
+                    Some((w, h)) if w >= 64 && h >= 64 && w % size_multiple(&m) == 0 && h % size_multiple(&m) == 0 => {}
+                    Some(_) => return Err(bad(format!("size {sz}: both sides multiples of {}, at least 64", size_multiple(&m)))),
                     None => return Err(bad(format!("size {sz}: WIDTHxHEIGHT"))),
                 }
             }
@@ -157,7 +168,7 @@ impl Home {
             }
         }
         let cfg = number(b, "cfg", 0.0, 30.0)?.unwrap_or(1.0);
-        if cfg > 1.0 && s(b, "negative_prompt").trim().is_empty() {
+        if cfg > 1.0 && cfg_needs_negative(&m) && s(b, "negative_prompt").trim().is_empty() {
             return Err(bad(format!("cfg {cfg}: guidance above 1 needs a negative_prompt (the model's true_cfg_scale)")));
         }
         let strength = number(b, "strength", 0.05, 1.0)?.unwrap_or(1.0);
@@ -308,7 +319,16 @@ pub fn speech_lists(m: &Value) -> (Vec<String>, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{number, speech_lists, steps_of, whole};
+    use super::{cfg_needs_negative, number, size_multiple, speech_lists, steps_of, whole};
+
+    #[test]
+    fn each_engine_has_its_own_grid_and_guidance_rule() {
+        assert_eq!(size_multiple(&json!({"arch": "hunyuanimage-2.1"})), 32);
+        assert_eq!(size_multiple(&json!({"arch": "moss-image"})), 16);
+        assert!(cfg_needs_negative(&json!({"arch": "qwen-image-2.1"})));
+        // MOSS-Image's guidance (cfg 3 by default) runs against an empty negative prompt
+        assert!(!cfg_needs_negative(&json!({"arch": "moss-image"})));
+    }
     use serde_json::json;
 
     #[test]

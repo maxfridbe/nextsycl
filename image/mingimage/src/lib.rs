@@ -202,6 +202,9 @@ impl ImageEngine for MingImage {
         vec![Schedule::Shift]
     }
     /// above 1: the pipeline's guidance against the zero condition (it has no negative prompt)
+    fn transparent(&self) -> bool {
+        true
+    }
     fn guidance(&self) -> bool {
         true
     }

@@ -4,7 +4,7 @@ import { jsx } from "../jsx.js";
 import { addPicture, generate, movePicture, randomSeed, removePicture, setAspect } from "../actions.js";
 import { panelOpen, render, saveForm, state, togglePanel } from "../state.js";
 import type { Form } from "../types.js";
-import { ASPECTS, clamp, r16 } from "../util.js";
+import { ASPECTS, clamp, snap } from "../util.js";
 
 type Key = keyof Form;
 
@@ -15,7 +15,7 @@ function set<K extends Key>(k: K, v: Form[K]): void {
   render();
 }
 
-const num = (k: Key, opts: { min?: number; max?: number; step?: number; placeholder?: string; nullable?: boolean; snap16?: boolean }) => {
+const num = (k: Key, opts: { min?: number; max?: number; step?: number; placeholder?: string; nullable?: boolean; snap?: boolean }) => {
   const v = state.form[k] as number | null;
   return (
     <input
@@ -28,7 +28,7 @@ const num = (k: Key, opts: { min?: number; max?: number; step?: number; placehol
           let x = Number(t);
           if (!Number.isFinite(x)) return render();
           if (opts.min !== undefined || opts.max !== undefined) x = clamp(x, opts.min ?? -Infinity, opts.max ?? Infinity);
-          if (opts.snap16) x = r16(x);
+          if (opts.snap) x = snap(x, state.info?.grid ?? 16);
           set(k, x as Form[typeof k]);
         },
       }}
@@ -67,8 +67,9 @@ function Loras() {
               on={{ change: () => {
                 if (on) delete state.form.loras[l.id];
                 else state.form.loras[l.id] = 1;
-                // another set may bring its own steps (a few-step LoRA): the model's then
+                // another set may bring its own steps and guidance (a few-step LoRA): the model's then
                 state.form.steps = null;
+                state.form.cfg = null;
                 saveForm(); render();
               } }}
             />
@@ -179,8 +180,8 @@ export function Create() {
       </div>}
       <div class="row"><label>size</label><Aspects /></div>
       <div class="row">
-        <label>width {num("width", { min: 256, max: 4096, step: 16, snap16: true })}</label>
-        <label>height {num("height", { min: 256, max: 4096, step: 16, snap16: true })}</label>
+        <label>width {num("width", { min: 256, max: 4096, step: info?.grid ?? 16, snap: true })}</label>
+        <label>height {num("height", { min: 256, max: 4096, step: info?.grid ?? 16, snap: true })}</label>
         <label>steps {num("steps", { min: 1, max: 200, placeholder: d ? String(d.steps) : "", nullable: true })}</label>
         <label>pictures {num("n", { min: 1, max: 8 })}</label>
         <label>seed
@@ -203,10 +204,10 @@ export function Create() {
           {info?.guidance === false
             ? null
             : <label>guidance (cfg) {num("cfg", { min: 1, max: 20, step: 0.1, placeholder: d ? String(d.cfg) : "", nullable: true })}</label>}
-          <label>shift {num("shift", { min: 0, max: 20, step: 0.1, placeholder: "model's", nullable: true })}</label>
-          <label class="inline">
+          {info?.shift === false ? null : <label>shift {num("shift", { min: 0, max: 20, step: 0.1, placeholder: d ? String(d.shift) : "model's", nullable: true })}</label>}
+          {info?.transparent === false ? null : <label class="inline">
             <input attrs={{ type: "checkbox" }} props={{ checked: f.rgba }} on={{ change: () => set("rgba", !f.rgba) }} /> transparent (RGBA)
-          </label>
+          </label>}
         </div>
         {(info?.options ?? []).length
           ? <div class="row">

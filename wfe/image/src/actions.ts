@@ -2,7 +2,7 @@
 import { api } from "./api.js";
 import { render, saveForm, state } from "./state.js";
 import type { Picture } from "./types.js";
-import { r16 } from "./util.js";
+import { snap } from "./util.js";
 
 /** The first time the model is known: the form's empty fields take its defaults. */
 export function adoptDefaults(): void {
@@ -23,8 +23,9 @@ export function setAspect(a: number, b: number): void {
   const d = state.info?.defaults;
   const area = (d?.width ?? 1024) * (d?.height ?? 1024);
   const h = Math.sqrt((area * b) / a);
-  state.form.width = r16((h * a) / b);
-  state.form.height = r16(h);
+  const g = state.info?.grid ?? 16;
+  state.form.width = snap((h * a) / b, g);
+  state.form.height = snap(h, g);
   saveForm();
   render();
 }

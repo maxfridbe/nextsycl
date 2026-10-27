@@ -254,6 +254,18 @@ pub trait ImageEngine: Send + Sync {
     fn guidance(&self) -> bool {
         true
     }
+    /// the grid a picture's sides are multiples of (a page snaps its size fields to it)
+    fn grid(&self) -> u32 {
+        16
+    }
+    /// whether `ImageRequest::rgba` gives a picture with an alpha channel (a page offers the box only then)
+    fn transparent(&self) -> bool {
+        false
+    }
+    /// whether it takes `ImageRequest::shift` (the schedule's shift; else the model's own is used)
+    fn shift(&self) -> bool {
+        true
+    }
     /// the options it takes beyond the request's fields (its kind's `options`)
     fn options(&self) -> &'static [EngineOption] {
         &[]

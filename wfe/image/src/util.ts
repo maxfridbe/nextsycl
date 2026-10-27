@@ -7,8 +7,8 @@ export const fmtT = (x: number | null | undefined): string => {
   return x < 10 ? `${x.toFixed(1)}s` : `${Math.round(x)}s`;
 };
 
-/** A side to the model's grid: a multiple of 16, at least 256. */
-export const r16 = (x: number): number => Math.max(256, Math.round(x / 16) * 16);
+/** A side to the model's grid (the engine's: 16, HunyuanImage's 32): a multiple of it, at least 256. */
+export const snap = (x: number, grid: number = 16): number => Math.max(256, Math.round(x / grid) * grid);
 
 export const clamp = (x: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, x));
 

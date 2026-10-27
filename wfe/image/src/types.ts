@@ -24,6 +24,12 @@ export interface Info {
   edits?: boolean;
   /** whether it takes guidance: cfg above 1 and a negative prompt */
   guidance?: boolean;
+  /** the grid the picture's sides are multiples of */
+  grid?: number;
+  /** whether "transparent" gives an alpha channel */
+  transparent?: boolean;
+  /** whether the schedule's shift can be set */
+  shift?: boolean;
   defaults?: Defaults;
   samplers?: string[];
   schedules?: string[];

@@ -425,6 +425,9 @@ impl ImageEngine for QwenImage21 {
         Schedule::ALL.to_vec()
     }
     /// true guidance: a scale above 1 with a negative prompt (off by default: one pass a step)
+    fn transparent(&self) -> bool {
+        true
+    }
     fn guidance(&self) -> bool {
         true
     }

@@ -14,7 +14,8 @@ await writeFile(join(root, "package.json"), '{"type":"module"}');
 
 const page = await (await fetch(base + "/")).text();
 if (page.includes("__CSS__")) throw new Error("the page's stylesheet was not inlined");
-const entry = /src="([^"]+)"/.exec(page.slice(page.indexOf("<script")))[1];
+// the page's paths are relative (it is also served under /open/<id>/): the module's own, from the root
+const entry = "/" + /src="([^"]+)"/.exec(page.slice(page.indexOf("<script")))[1].replace(/^\.?\//, "");
 const seen = new Set();
 const norm = (dir, spec) => {
   const out = [];

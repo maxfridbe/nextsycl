@@ -400,16 +400,16 @@ impl ImageServer {
 
     fn info(&self) -> Value {
         let g = self.engine.lock();
-        let (arch, d, edits, loaded, samplers, schedules, guidance, opts, reads, prompts) = match g.as_ref().ok().and_then(|g| {
+        let (arch, d, edits, loaded, samplers, schedules, guidance, opts, reads, prompts, (grid, transparent, shift)) = match g.as_ref().ok().and_then(|g| {
             g.as_ref().map(|(e, l)| (e.arch(), e.defaults(), e.edits(), l.clone(), e.samplers(), e.schedules(), e.guidance(), e.options(), e.reads(),
-                                     e.ocr_prompts()))
+                                     e.ocr_prompts(), (e.grid(), e.transparent(), e.shift())))
         }) {
             Some(x) => x,
             None => return json!({"model": self.model, "loading": true}),
         };
         drop(g);
         json!({
-            "model": self.model, "arch": arch, "edits": edits, "reads": reads, "guidance": guidance, "max_pictures": MAX_PICTURES,
+            "model": self.model, "arch": arch, "edits": edits, "reads": reads, "guidance": guidance, "grid": grid, "transparent": transparent, "shift": shift, "max_pictures": MAX_PICTURES,
             "max_pages": MAX_PAGES,
             "prompts": prompts.iter().map(|p| json!({"id": p.id, "prompt": p.prompt, "title": p.title})).collect::<Vec<_>>(),
             "defaults": {"width": d.width, "height": d.height, "steps": d.steps, "cfg": d.cfg, "sampler": d.sampler.name(),

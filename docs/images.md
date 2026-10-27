@@ -56,7 +56,7 @@ nextsycl image serve moss-image-sft-q4kxl --wfe      # POST /v1/images/generatio
 ```
 
 OpenMOSS's 5.1B text to image model (50 steps, CFG 3 with block 22 left out as the guidance branch; sizes multiples of 16;
-a negative prompt is not used). Port notes, parity and speed: [ports/mossimage.md](ports/mossimage.md). B70, 1024x1024,
+the negative prompt, empty by default, is the guidance branch's prompt; the shift is a request's). Port notes, parity and speed: [ports/mossimage.md](ports/mossimage.md). B70, 1024x1024,
 50 steps with CFG, through the server: 46.7 s (the card's 3.5 Wh); 512x512, 12 steps 3.4 s. Every quant loads and draws;
 Q3_K files do not (no Q3_K in the dequant yet).
 
@@ -127,7 +127,9 @@ its LoRAs' files read-only, the output directory - default `~/.local/share/nexts
   merged, ~4 s; a few-step LoRA brings its own sigmas and steps). The answer's `nextsycl` field has the seconds, steps,
   seed, LoRAs and the card's energy (Wh). Every picture is saved with its settings in the PNG.
 - `GET /v1/models`, `/health`, `/v1/images/files/<f>`, `/api/info` (the model, its defaults, samplers, schedules,
-  LoRAs), `/api/progress`, `/api/history`, `/api/gpu`.
+  LoRAs, and what the engine takes: `guidance` (cfg and a negative prompt), `grid` (the sides' multiple: 16, HunyuanImage's
+  32), `transparent` (an alpha channel: Qwen-Image, Ming, HunyuanImage; not MOSS-Image's), `shift`: the page snaps its
+  size fields to the grid and shows only the controls the engine takes), `/api/progress`, `/api/history`, `/api/gpu`.
 - `--wfe`: the web front end at `/` (`wfe/image`, built into `dist/wfe` by `./build.sh wfe`): H3's scheme - TSX on
   vendored snabbdom, compiled offline by the vendored TypeScript, one state object, panels, H3's stylesheet - with
   every option of a request, live progress (step, s/step, time left), the card's power, VRAM and temperatures, and

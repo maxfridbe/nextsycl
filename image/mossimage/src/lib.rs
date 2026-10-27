@@ -59,10 +59,15 @@ fn grid(count: usize, shift: f32) -> Vec<f32> {
 /// The `steps` levels: the shift-5 grid snapped to the nearest of the 1000 training levels, repeats dropped, then 0
 /// (so a run has `len - 1` steps, fewer than asked when two levels snap together)
 pub fn sigmas(steps: usize) -> Vec<f32> {
+    sigmas_shift(steps, SHIFT)
+}
+
+/// `sigmas` at another shift (a request's)
+pub fn sigmas_shift(steps: usize, shift: f32) -> Vec<f32> {
     let mut training = grid(TRAIN_STEPS, 1.0);
     training.reverse();
     let mut out: Vec<f32> = Vec::new();
-    for s in grid(steps.max(1), SHIFT) {
+    for s in grid(steps.max(1), shift) {
         let upper = training.partition_point(|t| *t < s).min(TRAIN_STEPS - 1);
         let lower = upper.saturating_sub(1);
         let nearest = if (s - training[lower]).abs() <= (training[upper] - s).abs() { lower } else { upper };
@@ -138,6 +143,10 @@ impl MossImage {
         }
         let te = te::TextEncoder::load(role(files, "text-encoder")?, &gpu, log)?;
         let nsd = Nsd::new(&gpu)?;
+        // a turbo LoRA (it sets the steps) is the whole adaptation: another beside it would be a second distillation
+        if o.merge_loras.len() > 1 && o.setting("NS_MOSS_STEPS").is_some() {
+            return Err(Error(format!("{ARCH}: a turbo LoRA runs alone ({} LoRAs given)", o.merge_loras.len())));
+        }
         let mut deltas = Vec::new();
         for l in &o.merge_loras {
             let d = nextsycl_diffusion::lora::read(&l.path, l.scale).map_err(Error)?;
@@ -221,12 +230,12 @@ impl ImageEngine for MossImage {
         }
         let steps = req.steps.unwrap_or(d.steps).max(1) as usize;
         let cfg = req.cfg.filter(|c| *c >= 0.0).unwrap_or(d.cfg);
-        let sig = sigmas(steps);
+        let sig = sigmas_shift(steps, req.shift.filter(|s| s.is_finite() && *s > 0.0).unwrap_or(SHIFT));
         let of = (sig.len() - 1) as u32;
         progress(Step { picture: 0, at: 0, of, seconds: t0.elapsed().as_secs_f64() })?;
         let pre = self.condition(req.prompt.trim())?;
-        // guidance: the unconditional branch is the empty prompt with block 22 left out
-        let npre = if cfg != 1.0 { Some(self.condition("")?) } else { None };
+        // guidance: the unconditional branch is the negative prompt (empty by default) with block 22 left out
+        let npre = if cfg != 1.0 { Some(self.condition(req.negative.as_deref().map_or("", str::trim))?) } else { None };
         let hw = (h / 16, w / 16);
         let mut out = Vec::new();
         for p in 0..req.n.max(1) {

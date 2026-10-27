@@ -291,6 +291,12 @@ impl ImageEngine for HunyuanImage21 {
     fn guidance(&self) -> bool {
         true
     }
+    fn grid(&self) -> u32 {
+        32
+    }
+    fn transparent(&self) -> bool {
+        true
+    }
     fn options(&self) -> &'static [EngineOption] {
         OPTIONS
     }
