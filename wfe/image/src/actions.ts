@@ -2,7 +2,7 @@
 import { api } from "./api.js";
 import { render, saveForm, state } from "./state.js";
 import type { Picture } from "./types.js";
-import { snap } from "./util.js";
+import { fitSize, ratioOf, snap } from "./util.js";
 
 /** The first time the model is known: the form's empty fields take its defaults. */
 export function adoptDefaults(): void {
@@ -26,6 +26,27 @@ export function setAspect(a: number, b: number): void {
   const g = state.info?.grid ?? 16;
   state.form.width = snap((h * a) / b, g);
   state.form.height = snap(h, g);
+  saveForm();
+  render();
+}
+
+/** The size the form holds as a budget and a ratio: the budget of the preset it matches, else its own area. */
+export function sizeNow(): { pixels: number; ratio: number } {
+  const f = state.form;
+  const s = state.info?.sizes;
+  const g = state.info?.grid ?? 16;
+  const own = f.width / f.height;
+  const ratio = (s?.ratios ?? []).map(ratioOf).find((r) => Math.abs(r - own) < 0.02) ?? own;
+  const pixels = (s?.pixels ?? []).find((p) => { const [w, h] = fitSize(p, ratio, g); return w === f.width && h === f.height; });
+  return { pixels: pixels ?? f.width * f.height, ratio };
+}
+
+/** A size from a budget at a ratio (either may be kept from the form's own). */
+export function setBudget(pixels: number | null, ratio: number | null): void {
+  const now = sizeNow();
+  const [w, h] = fitSize(pixels ?? now.pixels, ratio ?? now.ratio, state.info?.grid ?? 16);
+  state.form.width = w;
+  state.form.height = h;
   saveForm();
   render();
 }

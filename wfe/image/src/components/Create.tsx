@@ -1,10 +1,10 @@
 /** The request, every option the engine has: prompt, negative, size (aspect presets), steps, pictures, seed, the
  *  sampler and schedule, guidance, shift, transparency, LoRAs. Each field writes straight into state.form. */
 import { jsx } from "../jsx.js";
-import { addPicture, generate, movePicture, randomSeed, removePicture, setAspect } from "../actions.js";
+import { addPicture, generate, movePicture, randomSeed, removePicture, setAspect, setBudget, sizeNow } from "../actions.js";
 import { panelOpen, render, saveForm, state, togglePanel } from "../state.js";
 import type { Form } from "../types.js";
-import { ASPECTS, clamp, snap } from "../util.js";
+import { ASPECTS, clamp, fitSize, pixelLabel, ratioOf, snap } from "../util.js";
 
 type Key = keyof Form;
 
@@ -28,13 +28,40 @@ const num = (k: Key, opts: { min?: number; max?: number; step?: number; placehol
           let x = Number(t);
           if (!Number.isFinite(x)) return render();
           if (opts.min !== undefined || opts.max !== undefined) x = clamp(x, opts.min ?? -Infinity, opts.max ?? Infinity);
-          if (opts.snap) x = snap(x, state.info?.grid ?? 16);
+          if (opts.snap) x = snap(x, state.info?.grid ?? 16, state.info?.sizes ? 64 : 256);
           set(k, x as Form[typeof k]);
         },
       }}
     />
   );
 };
+
+/** An engine that gives its sizes (MOSS-Image: OpenMOSS's presets): its ratios, and the pixel budgets - a click
+ *  computes the sides (the budget's root at the ratio, each to the grid). */
+function Presets(props: { ratios: string[]; pixels: number[] }) {
+  const f = state.form;
+  const g = state.info?.grid ?? 16;
+  const now = sizeNow();
+  return (
+    <div>
+      <div class="chips">
+        {props.ratios.map((r) => (
+          <button type="button" class={{ chip: true, on: Math.abs(ratioOf(r) - f.width / f.height) < 0.02 }}
+                  on={{ click: () => setBudget(null, ratioOf(r)) }}>{r}</button>
+        ))}
+      </div>
+      <div class="chips">
+        {props.pixels.map((p) => {
+          const [w, h] = fitSize(p, now.ratio, g);
+          return (
+            <button type="button" class={{ chip: true, on: w === f.width && h === f.height }}
+                    attrs={{ title: `${w} × ${h}` }} on={{ click: () => setBudget(p, null) }}>{pixelLabel(p)}</button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 function Aspects() {
   const f = state.form;
@@ -179,10 +206,10 @@ export function Create() {
                  on={{ change: (e: Event) => set("negative", (e.target as HTMLInputElement).value) }} />
         </label>
       </div>}
-      <div class="row"><label>size</label><Aspects /></div>
+      <div class="row"><label>size</label>{info?.sizes ? <Presets ratios={info.sizes.ratios} pixels={info.sizes.pixels} /> : <Aspects />}</div>
       <div class="row">
-        <label>width {num("width", { min: 256, max: 4096, step: info?.grid ?? 16, snap: true })}</label>
-        <label>height {num("height", { min: 256, max: 4096, step: info?.grid ?? 16, snap: true })}</label>
+        <label>width {num("width", { min: info?.sizes ? 64 : 256, max: 4096, step: info?.grid ?? 16, snap: true })}</label>
+        <label>height {num("height", { min: info?.sizes ? 64 : 256, max: 4096, step: info?.grid ?? 16, snap: true })}</label>
         <label>steps {num("steps", { min: 1, max: 200, placeholder: d ? String(d.steps) : "", nullable: true })}</label>
         <label>pictures {num("n", { min: 1, max: 8 })}</label>
         <label>seed

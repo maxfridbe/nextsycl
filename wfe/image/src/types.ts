@@ -28,6 +28,8 @@ export interface Info {
   grid?: number;
   /** whether "transparent" gives an alpha channel */
   transparent?: boolean;
+  /** the aspect ratios ("W:H") and pixel budgets it offers for a size (a size is a budget at a ratio) */
+  sizes?: { ratios: string[]; pixels: number[] } | null;
   /** whether the schedule's shift can be set */
   shift?: boolean;
   /** the model writes pictures as SVG (POST /v1/images/vectorize) instead of drawing */

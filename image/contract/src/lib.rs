@@ -228,6 +228,13 @@ impl LoadOptions {
     }
 }
 
+/// The aspect ratios and pixel budgets an engine offers for choosing a size
+#[derive(Clone, Debug)]
+pub struct SizePresets {
+    pub ratios: &'static [&'static str],
+    pub pixels: &'static [u32],
+}
+
 /// The runtime one image architecture brings
 pub trait ImageEngine: Send + Sync {
     /// its architecture (the registry entry's "arch")
@@ -261,6 +268,11 @@ pub trait ImageEngine: Send + Sync {
     /// whether `ImageRequest::rgba` gives a picture with an alpha channel (a page offers the box only then)
     fn transparent(&self) -> bool {
         false
+    }
+    /// the sizes a page can compute for it: aspect ratios ("W:H") and pixel budgets (a size is a budget at a ratio,
+    /// each side rounded to the grid; MOSS-Image's: its Gradio app's)
+    fn size_presets(&self) -> Option<SizePresets> {
+        None
     }
     /// whether it takes `ImageRequest::shift` (the schedule's shift; else the model's own is used)
     fn shift(&self) -> bool {

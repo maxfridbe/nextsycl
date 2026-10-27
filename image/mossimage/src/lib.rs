@@ -22,7 +22,7 @@ use std::time::Instant;
 use nextsycl_core::{DevBuf, Gpu};
 use nextsycl_diffusion::kernels::Nsd;
 use nextsycl_gguf::Gguf;
-use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, Picture, Result, Sampler, Schedule, Step};
+use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, Picture, Result, Sampler, Schedule, SizePresets, Step};
 
 pub const ARCH: &str = "moss-image";
 /// the transformer GGUF, the text encoder GGUF (Qwen3.5-9B), the VAE
@@ -32,6 +32,17 @@ const SHIFT: f32 = 5.0;
 const TRAIN_STEPS: usize = 1000;
 /// the block the unconditional branch leaves out
 pub const UNCOND_SKIP: &[usize] = &[22];
+
+/// The aspect ratios and pixel budgets of OpenMOSS's Gradio app (gradio_presets.py): 0.25 M (512 x 512), 1 M, 1.5 M, 2 M
+/// and 4 M pixels, from 1:8 to 8:1; their sides are `fit_size`: the budget's root at the ratio, each rounded to 16
+const RATIOS: &[&str] = &["1:8", "1:4", "1:3", "1:2", "9:16", "2:3", "3:4", "1:1", "4:3", "3:2", "16:9", "2:1", "3:1", "4:1", "8:1"];
+const PIXELS: &[u32] = &[262_144, 1_048_576, 1_572_864, 2_097_152, 4_194_304];
+
+/// OpenMOSS's `fit_size`: the budget's root at the ratio (W / H), each side rounded to 16 (halves up), at least 16
+pub fn fit_size(pixels: u32, ratio: f64) -> (u32, u32) {
+    let side = |e: f64| (((e / 16.0 + 0.5).floor() as u32) * 16).max(16);
+    (side((pixels as f64 * ratio).sqrt()), side((pixels as f64 / ratio).sqrt()))
+}
 
 pub fn kind() -> ImageKind {
     ImageKind { archs: &[ARCH], name: "MOSS-Image-SFT (5.1B DiT, Qwen3.5-9B text encoder, FLUX.2 VAE; Rust + SYCL)", roles: ROLES, load, options: &[] }
@@ -208,6 +219,9 @@ impl ImageEngine for MossImage {
     fn defaults(&self) -> Defaults {
         Defaults { width: 1024, height: 1024, steps: self.steps, cfg: self.cfg, sampler: Sampler::Euler, schedule: Schedule::Shift, shift: SHIFT }
     }
+    fn size_presets(&self) -> Option<SizePresets> {
+        Some(SizePresets { ratios: RATIOS, pixels: PIXELS })
+    }
     fn samplers(&self) -> Vec<Sampler> {
         vec![Sampler::Euler]
     }
@@ -261,6 +275,20 @@ mod tests {
         assert!((s[0] - 1.0).abs() < 1e-6);
         assert!(s.windows(2).all(|w| w[0] > w[1]));
         assert!(s.len() <= 13);
+    }
+
+    #[test]
+    fn sizes_from_a_budget_and_a_ratio_are_openmoss_s() {
+        // values from gradio_presets.fit_size
+        assert_eq!(super::fit_size(262_144, 1.0), (512, 512));
+        assert_eq!(super::fit_size(1_048_576, 16.0 / 9.0), (1360, 768));
+        assert_eq!(super::fit_size(1_048_576, 9.0 / 16.0), (768, 1360));
+        assert_eq!(super::fit_size(1_572_864, 2.0 / 3.0), (1024, 1536));
+        assert_eq!(super::fit_size(2_097_152, 1.0), (1456, 1456));
+        assert_eq!(super::fit_size(4_194_304, 1.0), (2048, 2048));
+        assert_eq!(super::fit_size(262_144, 1.0 / 8.0), (176, 1456));
+        assert_eq!(super::fit_size(4_194_304, 8.0), (5792, 720));
+        assert!(super::RATIOS.contains(&"16:9") && super::PIXELS.contains(&1_048_576));
     }
 
     #[test]

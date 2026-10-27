@@ -60,6 +60,11 @@ the negative prompt, empty by default, is the guidance branch's prompt; the shif
 50 steps with CFG, through the server: 46.7 s (the card's 3.5 Wh); 512x512, 12 steps 3.4 s. Every quant loads and draws;
 Q3_K files do not (no Q3_K in the dequant yet).
 
+**Sizes.** Any multiples of 16 from 64 to 4096 a side; the page offers OpenMOSS's own presets (its Gradio app's
+`gradio_presets.py`): 15 aspect ratios (1:8 to 8:1) and the budgets 512², 1M, 1.5M, 2M and 4M pixels, a size being the
+budget's root at the ratio with each side rounded to 16 (`fit_size`: 16:9 at 1M 1360x768, 2:3 at 1.5M 1024x1536; a
+side past 4096 is capped there). `/api/info` reports them as `sizes` (`ratios`, `pixels`).
+
 **Turbo LoRAs.** Four few-step LoRAs for MOSS-Image (the Civitai page "Moss Image Turbo LoRAs", the weights lodestones'
 and akhaliq's) run it without guidance in 4 or 8 steps:
 
@@ -128,7 +133,7 @@ its LoRAs' files read-only, the output directory - default `~/.local/share/nexts
   seed, LoRAs and the card's energy (Wh). Every picture is saved with its settings in the PNG.
 - `GET /v1/models`, `/health`, `/v1/images/files/<f>`, `/api/info` (the model, its defaults, samplers, schedules,
   LoRAs, and what the engine takes: `guidance` (cfg and a negative prompt), `grid` (the sides' multiple: 16, HunyuanImage's
-  32), `transparent` (an alpha channel: Qwen-Image, Ming, HunyuanImage; not MOSS-Image's), `shift`: the page snaps its
+  32), `sizes` (the ratios and pixel budgets a page offers: MOSS-Image's), `transparent` (an alpha channel: Qwen-Image, Ming, HunyuanImage; not MOSS-Image's), `shift`: the page snaps its
   size fields to the grid and shows only the controls the engine takes), `/api/progress`, `/api/history`, `/api/gpu`.
 - `--wfe`: the web front end at `/` (`wfe/image`, built into `dist/wfe` by `./build.sh wfe`): H3's scheme - TSX on
   vendored snabbdom, compiled offline by the vendored TypeScript, one state object, panels, H3's stylesheet - with

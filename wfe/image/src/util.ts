@@ -8,7 +8,23 @@ export const fmtT = (x: number | null | undefined): string => {
 };
 
 /** A side to the model's grid (the engine's: 16, HunyuanImage's 32): a multiple of it, at least 256. */
-export const snap = (x: number, grid: number = 16): number => Math.max(256, Math.round(x / grid) * grid);
+export const snap = (x: number, grid: number = 16, min: number = 256): number => Math.max(min, Math.round(x / grid) * grid);
+
+/** A size from a pixel budget at an aspect ratio (W / H): the budget's root, each side rounded to the grid (halves
+ *  up, as OpenMOSS's fit_size), at least one grid step and at most `max`. */
+export const fitSize = (pixels: number, ratio: number, grid: number = 16, max: number = 4096): [number, number] => {
+  const side = (e: number): number => Math.min(max, Math.max(grid, Math.floor(e / grid + 0.5) * grid));
+  return [side(Math.sqrt(pixels * ratio)), side(Math.sqrt(pixels / ratio))];
+};
+
+/** A ratio "W:H" as a number. */
+export const ratioOf = (r: string): number => {
+  const [w = 1, h = 1] = r.split(":").map(Number);
+  return w / h;
+};
+
+/** A budget's label: below 1 M the square's side, else millions of pixels. */
+export const pixelLabel = (p: number): string => (p < 1048576 ? `${Math.round(Math.sqrt(p))}²` : `${+(p / 1048576).toFixed(2)}M`);
 
 export const clamp = (x: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, x));
 
