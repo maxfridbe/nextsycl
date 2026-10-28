@@ -692,7 +692,7 @@ impl Part {
     /// The part's layers onto its GPU (and the embedding / head when `first` / `last`), its expert cache and
     /// mirror.
     #[allow(clippy::too_many_arguments)]
-    fn load(m: &Model, gpu: &Arc<Gpu>, layers: Range<u64>, extra: Range<u64>, last: bool, expert_bytes: Option<usize>, mirror_bytes: usize,
+    fn load(m: &Model, gpu: &Arc<Gpu>, layers: Range<u64>, extra: Range<u64>, last: bool, expert_bytes: Option<usize>, mirror: &std::sync::atomic::AtomicUsize,
             kv_reserve: usize, log: &mut dyn FnMut(String)) -> Result<Part> {
         let ops = Ops::new(gpu.clone())?;
         let scratch = DevBuf::f32(gpu, SCRATCH)?;
@@ -774,8 +774,20 @@ impl Part {
         };
         let per_chunk = (CHUNK / slot_bytes).max(1);
         let nv = (budget / slot_bytes).min(n_exp);
-        // host slots: the rest of the part's experts, and one spare for the swaps
-        let nr = if n_exp > nv { (mirror_bytes / slot_bytes).min(n_exp - nv + 1) } else { 0 };
+        // host slots: the rest of the part's experts, and one spare for the swaps - claimed from the pool the GPUs share
+        // (what one leaves unused the other takes, whichever loads first)
+        let want = if n_exp > nv { n_exp - nv + 1 } else { 0 };
+        let nr = {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut cur = mirror.load(Relaxed);
+            loop {
+                let take = want.min(cur / slot_bytes);
+                match mirror.compare_exchange(cur, cur - take * slot_bytes, Relaxed, Relaxed) {
+                    Ok(_) => break take,
+                    Err(c) => cur = c,
+                }
+            }
+        };
         let alloc_v = |n: usize| -> Result<Vec<DevBuf>> {
             let mut v = Vec::new();
             let mut have = 0;
@@ -1266,7 +1278,11 @@ impl<'g> Glm<'g> {
                 return Err(Error(format!("NS_SPLIT={v}: {} layer counts below {n} for {k} GPUs", k - 1)));
             }
         }
-        let mut spare = 0usize;
+        // the GPUs' parts load at once, a thread each (NS_LOAD_SEQ=1: one after the other); the pinned host mirror is one
+        // pool they claim from as they need it
+        let seq = std::env::var("NS_LOAD_SEQ").is_ok_and(|v| v == "1");
+        let pool = std::sync::atomic::AtomicUsize::new(mirror);
+        let mut plans = Vec::new();
         for (i, gpu) in gpus.iter().enumerate() {
             let range = bounds[i]..bounds[i + 1];
             for l in range.clone() {
@@ -1274,10 +1290,6 @@ impl<'g> Glm<'g> {
             }
             let last = i + 1 == gpus.len();
             let extra = if last && mtp && m.g.n_mtp > 0 { n..n + 1 } else { n..n };
-            let blocks = n + u64::from(mtp && m.g.n_mtp > 0);
-            // by layer count, plus what the GPUs before left unused (a GPU with most of its experts in VRAM needs less;
-            // the next then keeps more out of the file - 268 of the server's last GPU's experts were read from it)
-            let share = mirror * (range.end - range.start + extra.end - extra.start) as usize / blocks as usize + spare;
             // per session: each MLA layer's latents [ctx, kv_lora] in fp16 and pooled keys [ctx / 4, idx_dim], float32
             let per_layer = kv.0 * lat_row(m.g.kv_lora as usize) + (kv.0 / 4 + 1) * m.g.idx_dim as usize * 4;
             let mla = range.clone().filter(|l| m.g.is_mla(*l)).count() + (extra.end - extra.start) as usize;
@@ -1285,9 +1297,30 @@ impl<'g> Glm<'g> {
             if reserve > 0 {
                 log(format!("{}: {:.2} GiB held for the sessions' {} tokens ({} attention layers)", gpu.name, gib(reserve), kv.0 * kv.1, mla));
             }
-            let part = Part::load(&m, gpu, range, extra, last, expert_bytes, share, reserve, log)?;
-            spare = share.saturating_sub(part.host_slots * part.experts.lock().unwrap().slot_bytes);
-            parts.push(part);
+            plans.push((gpu, range, extra, last, reserve));
+        }
+        if seq {
+            for (gpu, range, extra, last, reserve) in plans {
+                parts.push(Part::load(&m, gpu, range, extra, last, expert_bytes, &pool, reserve, log)?);
+            }
+        } else {
+            let loaded: Vec<(Result<Part>, Vec<String>)> = std::thread::scope(|sc| {
+                let hs: Vec<_> = plans.into_iter().map(|(gpu, range, extra, last, reserve)| {
+                    let (m, pool) = (&m, &pool);
+                    sc.spawn(move || {
+                        let mut lines = Vec::new();
+                        let p = Part::load(m, gpu, range, extra, last, expert_bytes, pool, reserve, &mut |s| lines.push(s));
+                        (p, lines)
+                    })
+                }).collect();
+                hs.into_iter().map(|h| h.join().unwrap_or_else(|_| (Err(Error("a part's load panicked".into())), Vec::new()))).collect()
+            });
+            for (p, lines) in loaded {
+                for l in lines {
+                    log(l);
+                }
+                parts.push(p?);
+            }
         }
         let load_bytes = parts.iter().map(|p| p.weight_bytes).sum();
         let gpu_prof = std::env::var("NS_PROFILE").is_ok_and(|v| v == "gpu");

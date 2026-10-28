@@ -140,6 +140,7 @@ GLM-5.3 (`llm/glm5next`, `kernels/llm/glm5next`; docs/glm5next.md).
 | `NS_SPEC_DRAFT_TEMP` | 1.0 | The draft distribution's temperature relative to the request's (--opt-spec-draft-temp) | llm glm5next |
 | `NS_SPEC_SAMPLING` | 1 | 0 = argmax drafts, accepted when the sampled token is them, instead of speculative sampling (--opt-spec-sampling) | llm glm5next |
 | `NS_SPLIT_COPY` | 1 | Experiment: 0 = an arriving expert's gate/up waits until its down is in too | llm glm5next |
+| `NS_LOAD_SEQ` | 0 | 1 = the GPUs' parts load one after the other; 0: all at once, a thread each (the pinned host mirror is one pool they claim from as they need it) | llm glm5next |
 | `NS_SWAP_WAIT` | 0 | Experiment: 1 = decode's expert swaps wait for the GPU's queued work first (not needed) | llm glm5next |
 | `NS_TRACE_EXPERTS` | off | Debug: FILE to append every decode expert request to (GPU, tick, layer, experts) for offline policy studies | llm glm5next |
 | `NS_TRACE_GUESS` | off | Debug: FILE to append the next two layers' router guesses on this layer's input (16 best a row), for scoring prefetch | llm glm5next |
