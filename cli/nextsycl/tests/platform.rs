@@ -38,7 +38,7 @@ fn engines() -> Vec<(&'static str, Vec<&'static str>)> {
         v.push(("audio", k.archs.to_vec()));
     }
     for k in [nextsycl_model3d_trellis2::kind(), nextsycl_model3d_trellis2::kind_pixal(), nextsycl_model3d_hunyuan3d::kind(), nextsycl_model3d_unirig::kind(), nextsycl_model3d_skintokens::kind(),
-              nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_example::kind()] {
+              nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_unimate::kind(), nextsycl_model3d_example::kind()] {
         v.push(("model3d", k.archs.to_vec()));
     }
     v

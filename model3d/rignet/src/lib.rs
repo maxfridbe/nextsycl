@@ -315,7 +315,7 @@ impl Model3dEngine for RigNet {
             head: unmap(j.map(|x| x as f32)),
         }).collect();
         let mut m = req.mesh.clone();
-        m.skin = Some(Skin { joints, weights: tools::skin::top4(&dense, nj) });
+        m.skin = Some(Skin { joints, weights: tools::skin::top4(&dense, nj), motion: None });
         if m.normals.len() != m.positions.len() {
             m.compute_normals();
         }

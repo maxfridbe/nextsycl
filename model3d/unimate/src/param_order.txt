@@ -1,0 +1,363 @@
+cond_embedder.weight 512 768
+cond_embedder.bias 512
+time_embedder.mlp.0.weight 512 256
+time_embedder.mlp.0.bias 512
+time_embedder.mlp.2.weight 512 512
+time_embedder.mlp.2.bias 512
+input_layer.root_tpos_embedder.0.weight 512 12
+input_layer.root_tpos_embedder.0.bias 512
+input_layer.root_tpos_embedder.2.weight 512 512
+input_layer.root_tpos_embedder.2.bias 512
+input_layer.root_x_embedder.0.weight 512 12
+input_layer.root_x_embedder.0.bias 512
+input_layer.root_x_embedder.2.weight 512 512
+input_layer.root_x_embedder.2.bias 512
+input_layer.joint_tpos_embedder.0.weight 512 12
+input_layer.joint_tpos_embedder.0.bias 512
+input_layer.joint_tpos_embedder.2.weight 512 512
+input_layer.joint_tpos_embedder.2.bias 512
+input_layer.parent_tpos_embedder.0.weight 512 12
+input_layer.parent_tpos_embedder.0.bias 512
+input_layer.parent_tpos_embedder.2.weight 512 512
+input_layer.parent_tpos_embedder.2.bias 512
+input_layer.tpos_fuse.0.weight 512 1024
+input_layer.tpos_fuse.0.bias 512
+input_layer.tpos_fuse.2.weight 512 512
+input_layer.tpos_fuse.2.bias 512
+input_layer.joint_x_embedder.0.weight 512 12
+input_layer.joint_x_embedder.0.bias 512
+input_layer.joint_x_embedder.2.weight 512 512
+input_layer.joint_x_embedder.2.bias 512
+tpos_pool.pool.queries 1 4 512
+tpos_pool.pool.norm_q.weight 512
+tpos_pool.pool.norm_kv.weight 512
+tpos_pool.pool.cross_attn.in_proj_weight 1536 512
+tpos_pool.pool.cross_attn.in_proj_bias 1536
+tpos_pool.pool.cross_attn.out_proj.weight 512 512
+tpos_pool.pool.cross_attn.out_proj.bias 512
+tpos_pool.pool.norm_ff.weight 512
+tpos_pool.pool.ffn.w12.weight 2048 512
+tpos_pool.pool.ffn.w12.bias 2048
+tpos_pool.pool.ffn.w3.weight 512 1024
+tpos_pool.pool.ffn.w3.bias 512
+tpos_pool.pool.norm_out.weight 512
+tpos_pool.pool.out_proj.weight 512 512
+tpos_pool.pool.out_proj.bias 512
+joint_name_embedder.weight 512 768
+joint_name_embedder.bias 512
+depth_embedding.weight 21 512
+rope_j.spectral_encoder.phi.0.weight 64 1
+rope_j.spectral_encoder.phi.0.bias 64
+rope_j.spectral_encoder.phi.2.weight 64 64
+rope_j.spectral_encoder.phi.2.bias 64
+rope_j.spectral_encoder.rho.0.weight 64 512
+rope_j.spectral_encoder.rho.0.bias 64
+rope_j.spectral_encoder.rho.2.weight 32 64
+rope_j.spectral_encoder.rho.2.bias 32
+transformer_blocks.0.norm_s.weight 512
+transformer_blocks.0.s_attn.graph_dist_scale 1
+transformer_blocks.0.s_attn.graph_rel_scale 1
+transformer_blocks.0.s_attn.qkv.weight 1536 512
+transformer_blocks.0.s_attn.qkv.bias 1536
+transformer_blocks.0.s_attn.proj.weight 512 512
+transformer_blocks.0.s_attn.proj.bias 512
+transformer_blocks.0.s_attn.q_norm.weight 64
+transformer_blocks.0.s_attn.k_norm.weight 64
+transformer_blocks.0.s_attn.graph_dist_embedding.weight 6 128
+transformer_blocks.0.s_attn.graph_dist_proj.weight 8 128
+transformer_blocks.0.s_attn.graph_dist_proj.bias 8
+transformer_blocks.0.s_attn.graph_rel_embedding.weight 6 128
+transformer_blocks.0.s_attn.graph_rel_proj.weight 8 128
+transformer_blocks.0.s_attn.graph_rel_proj.bias 8
+transformer_blocks.0.norm_t.weight 512
+transformer_blocks.0.t_attn.qkv.weight 1536 512
+transformer_blocks.0.t_attn.qkv.bias 1536
+transformer_blocks.0.t_attn.proj.weight 512 512
+transformer_blocks.0.t_attn.proj.bias 512
+transformer_blocks.0.t_attn.q_norm.weight 64
+transformer_blocks.0.t_attn.k_norm.weight 64
+transformer_blocks.0.norm_mlp.weight 512
+transformer_blocks.0.mlp.w12.weight 2730 512
+transformer_blocks.0.mlp.w12.bias 2730
+transformer_blocks.0.mlp.w3.weight 512 1365
+transformer_blocks.0.mlp.w3.bias 512
+transformer_blocks.0.adaLN_modulation.1.weight 4608 512
+transformer_blocks.0.adaLN_modulation.1.bias 4608
+transformer_blocks.1.norm_s.weight 512
+transformer_blocks.1.s_attn.graph_dist_scale 1
+transformer_blocks.1.s_attn.graph_rel_scale 1
+transformer_blocks.1.s_attn.qkv.weight 1536 512
+transformer_blocks.1.s_attn.qkv.bias 1536
+transformer_blocks.1.s_attn.proj.weight 512 512
+transformer_blocks.1.s_attn.proj.bias 512
+transformer_blocks.1.s_attn.q_norm.weight 64
+transformer_blocks.1.s_attn.k_norm.weight 64
+transformer_blocks.1.s_attn.graph_dist_embedding.weight 6 128
+transformer_blocks.1.s_attn.graph_dist_proj.weight 8 128
+transformer_blocks.1.s_attn.graph_dist_proj.bias 8
+transformer_blocks.1.s_attn.graph_rel_embedding.weight 6 128
+transformer_blocks.1.s_attn.graph_rel_proj.weight 8 128
+transformer_blocks.1.s_attn.graph_rel_proj.bias 8
+transformer_blocks.1.norm_t.weight 512
+transformer_blocks.1.t_attn.qkv.weight 1536 512
+transformer_blocks.1.t_attn.qkv.bias 1536
+transformer_blocks.1.t_attn.proj.weight 512 512
+transformer_blocks.1.t_attn.proj.bias 512
+transformer_blocks.1.t_attn.q_norm.weight 64
+transformer_blocks.1.t_attn.k_norm.weight 64
+transformer_blocks.1.norm_mlp.weight 512
+transformer_blocks.1.mlp.w12.weight 2730 512
+transformer_blocks.1.mlp.w12.bias 2730
+transformer_blocks.1.mlp.w3.weight 512 1365
+transformer_blocks.1.mlp.w3.bias 512
+transformer_blocks.1.adaLN_modulation.1.weight 4608 512
+transformer_blocks.1.adaLN_modulation.1.bias 4608
+transformer_blocks.2.norm_s.weight 512
+transformer_blocks.2.s_attn.graph_dist_scale 1
+transformer_blocks.2.s_attn.graph_rel_scale 1
+transformer_blocks.2.s_attn.qkv.weight 1536 512
+transformer_blocks.2.s_attn.qkv.bias 1536
+transformer_blocks.2.s_attn.proj.weight 512 512
+transformer_blocks.2.s_attn.proj.bias 512
+transformer_blocks.2.s_attn.q_norm.weight 64
+transformer_blocks.2.s_attn.k_norm.weight 64
+transformer_blocks.2.s_attn.graph_dist_embedding.weight 6 128
+transformer_blocks.2.s_attn.graph_dist_proj.weight 8 128
+transformer_blocks.2.s_attn.graph_dist_proj.bias 8
+transformer_blocks.2.s_attn.graph_rel_embedding.weight 6 128
+transformer_blocks.2.s_attn.graph_rel_proj.weight 8 128
+transformer_blocks.2.s_attn.graph_rel_proj.bias 8
+transformer_blocks.2.norm_t.weight 512
+transformer_blocks.2.t_attn.qkv.weight 1536 512
+transformer_blocks.2.t_attn.qkv.bias 1536
+transformer_blocks.2.t_attn.proj.weight 512 512
+transformer_blocks.2.t_attn.proj.bias 512
+transformer_blocks.2.t_attn.q_norm.weight 64
+transformer_blocks.2.t_attn.k_norm.weight 64
+transformer_blocks.2.norm_mlp.weight 512
+transformer_blocks.2.mlp.w12.weight 2730 512
+transformer_blocks.2.mlp.w12.bias 2730
+transformer_blocks.2.mlp.w3.weight 512 1365
+transformer_blocks.2.mlp.w3.bias 512
+transformer_blocks.2.adaLN_modulation.1.weight 4608 512
+transformer_blocks.2.adaLN_modulation.1.bias 4608
+transformer_blocks.3.norm_s.weight 512
+transformer_blocks.3.s_attn.graph_dist_scale 1
+transformer_blocks.3.s_attn.graph_rel_scale 1
+transformer_blocks.3.s_attn.qkv.weight 1536 512
+transformer_blocks.3.s_attn.qkv.bias 1536
+transformer_blocks.3.s_attn.proj.weight 512 512
+transformer_blocks.3.s_attn.proj.bias 512
+transformer_blocks.3.s_attn.q_norm.weight 64
+transformer_blocks.3.s_attn.k_norm.weight 64
+transformer_blocks.3.s_attn.graph_dist_embedding.weight 6 128
+transformer_blocks.3.s_attn.graph_dist_proj.weight 8 128
+transformer_blocks.3.s_attn.graph_dist_proj.bias 8
+transformer_blocks.3.s_attn.graph_rel_embedding.weight 6 128
+transformer_blocks.3.s_attn.graph_rel_proj.weight 8 128
+transformer_blocks.3.s_attn.graph_rel_proj.bias 8
+transformer_blocks.3.norm_t.weight 512
+transformer_blocks.3.t_attn.qkv.weight 1536 512
+transformer_blocks.3.t_attn.qkv.bias 1536
+transformer_blocks.3.t_attn.proj.weight 512 512
+transformer_blocks.3.t_attn.proj.bias 512
+transformer_blocks.3.t_attn.q_norm.weight 64
+transformer_blocks.3.t_attn.k_norm.weight 64
+transformer_blocks.3.norm_mlp.weight 512
+transformer_blocks.3.mlp.w12.weight 2730 512
+transformer_blocks.3.mlp.w12.bias 2730
+transformer_blocks.3.mlp.w3.weight 512 1365
+transformer_blocks.3.mlp.w3.bias 512
+transformer_blocks.3.adaLN_modulation.1.weight 4608 512
+transformer_blocks.3.adaLN_modulation.1.bias 4608
+transformer_blocks.4.norm_s.weight 512
+transformer_blocks.4.s_attn.graph_dist_scale 1
+transformer_blocks.4.s_attn.graph_rel_scale 1
+transformer_blocks.4.s_attn.qkv.weight 1536 512
+transformer_blocks.4.s_attn.qkv.bias 1536
+transformer_blocks.4.s_attn.proj.weight 512 512
+transformer_blocks.4.s_attn.proj.bias 512
+transformer_blocks.4.s_attn.q_norm.weight 64
+transformer_blocks.4.s_attn.k_norm.weight 64
+transformer_blocks.4.s_attn.graph_dist_embedding.weight 6 128
+transformer_blocks.4.s_attn.graph_dist_proj.weight 8 128
+transformer_blocks.4.s_attn.graph_dist_proj.bias 8
+transformer_blocks.4.s_attn.graph_rel_embedding.weight 6 128
+transformer_blocks.4.s_attn.graph_rel_proj.weight 8 128
+transformer_blocks.4.s_attn.graph_rel_proj.bias 8
+transformer_blocks.4.norm_t.weight 512
+transformer_blocks.4.t_attn.qkv.weight 1536 512
+transformer_blocks.4.t_attn.qkv.bias 1536
+transformer_blocks.4.t_attn.proj.weight 512 512
+transformer_blocks.4.t_attn.proj.bias 512
+transformer_blocks.4.t_attn.q_norm.weight 64
+transformer_blocks.4.t_attn.k_norm.weight 64
+transformer_blocks.4.norm_mlp.weight 512
+transformer_blocks.4.mlp.w12.weight 2730 512
+transformer_blocks.4.mlp.w12.bias 2730
+transformer_blocks.4.mlp.w3.weight 512 1365
+transformer_blocks.4.mlp.w3.bias 512
+transformer_blocks.4.adaLN_modulation.1.weight 4608 512
+transformer_blocks.4.adaLN_modulation.1.bias 4608
+transformer_blocks.5.norm_s.weight 512
+transformer_blocks.5.s_attn.graph_dist_scale 1
+transformer_blocks.5.s_attn.graph_rel_scale 1
+transformer_blocks.5.s_attn.qkv.weight 1536 512
+transformer_blocks.5.s_attn.qkv.bias 1536
+transformer_blocks.5.s_attn.proj.weight 512 512
+transformer_blocks.5.s_attn.proj.bias 512
+transformer_blocks.5.s_attn.q_norm.weight 64
+transformer_blocks.5.s_attn.k_norm.weight 64
+transformer_blocks.5.s_attn.graph_dist_embedding.weight 6 128
+transformer_blocks.5.s_attn.graph_dist_proj.weight 8 128
+transformer_blocks.5.s_attn.graph_dist_proj.bias 8
+transformer_blocks.5.s_attn.graph_rel_embedding.weight 6 128
+transformer_blocks.5.s_attn.graph_rel_proj.weight 8 128
+transformer_blocks.5.s_attn.graph_rel_proj.bias 8
+transformer_blocks.5.norm_t.weight 512
+transformer_blocks.5.t_attn.qkv.weight 1536 512
+transformer_blocks.5.t_attn.qkv.bias 1536
+transformer_blocks.5.t_attn.proj.weight 512 512
+transformer_blocks.5.t_attn.proj.bias 512
+transformer_blocks.5.t_attn.q_norm.weight 64
+transformer_blocks.5.t_attn.k_norm.weight 64
+transformer_blocks.5.norm_mlp.weight 512
+transformer_blocks.5.mlp.w12.weight 2730 512
+transformer_blocks.5.mlp.w12.bias 2730
+transformer_blocks.5.mlp.w3.weight 512 1365
+transformer_blocks.5.mlp.w3.bias 512
+transformer_blocks.5.adaLN_modulation.1.weight 4608 512
+transformer_blocks.5.adaLN_modulation.1.bias 4608
+transformer_blocks.6.norm_s.weight 512
+transformer_blocks.6.s_attn.graph_dist_scale 1
+transformer_blocks.6.s_attn.graph_rel_scale 1
+transformer_blocks.6.s_attn.qkv.weight 1536 512
+transformer_blocks.6.s_attn.qkv.bias 1536
+transformer_blocks.6.s_attn.proj.weight 512 512
+transformer_blocks.6.s_attn.proj.bias 512
+transformer_blocks.6.s_attn.q_norm.weight 64
+transformer_blocks.6.s_attn.k_norm.weight 64
+transformer_blocks.6.s_attn.graph_dist_embedding.weight 6 128
+transformer_blocks.6.s_attn.graph_dist_proj.weight 8 128
+transformer_blocks.6.s_attn.graph_dist_proj.bias 8
+transformer_blocks.6.s_attn.graph_rel_embedding.weight 6 128
+transformer_blocks.6.s_attn.graph_rel_proj.weight 8 128
+transformer_blocks.6.s_attn.graph_rel_proj.bias 8
+transformer_blocks.6.norm_t.weight 512
+transformer_blocks.6.t_attn.qkv.weight 1536 512
+transformer_blocks.6.t_attn.qkv.bias 1536
+transformer_blocks.6.t_attn.proj.weight 512 512
+transformer_blocks.6.t_attn.proj.bias 512
+transformer_blocks.6.t_attn.q_norm.weight 64
+transformer_blocks.6.t_attn.k_norm.weight 64
+transformer_blocks.6.norm_mlp.weight 512
+transformer_blocks.6.mlp.w12.weight 2730 512
+transformer_blocks.6.mlp.w12.bias 2730
+transformer_blocks.6.mlp.w3.weight 512 1365
+transformer_blocks.6.mlp.w3.bias 512
+transformer_blocks.6.adaLN_modulation.1.weight 4608 512
+transformer_blocks.6.adaLN_modulation.1.bias 4608
+transformer_blocks.7.norm_s.weight 512
+transformer_blocks.7.s_attn.graph_dist_scale 1
+transformer_blocks.7.s_attn.graph_rel_scale 1
+transformer_blocks.7.s_attn.qkv.weight 1536 512
+transformer_blocks.7.s_attn.qkv.bias 1536
+transformer_blocks.7.s_attn.proj.weight 512 512
+transformer_blocks.7.s_attn.proj.bias 512
+transformer_blocks.7.s_attn.q_norm.weight 64
+transformer_blocks.7.s_attn.k_norm.weight 64
+transformer_blocks.7.s_attn.graph_dist_embedding.weight 6 128
+transformer_blocks.7.s_attn.graph_dist_proj.weight 8 128
+transformer_blocks.7.s_attn.graph_dist_proj.bias 8
+transformer_blocks.7.s_attn.graph_rel_embedding.weight 6 128
+transformer_blocks.7.s_attn.graph_rel_proj.weight 8 128
+transformer_blocks.7.s_attn.graph_rel_proj.bias 8
+transformer_blocks.7.norm_t.weight 512
+transformer_blocks.7.t_attn.qkv.weight 1536 512
+transformer_blocks.7.t_attn.qkv.bias 1536
+transformer_blocks.7.t_attn.proj.weight 512 512
+transformer_blocks.7.t_attn.proj.bias 512
+transformer_blocks.7.t_attn.q_norm.weight 64
+transformer_blocks.7.t_attn.k_norm.weight 64
+transformer_blocks.7.norm_mlp.weight 512
+transformer_blocks.7.mlp.w12.weight 2730 512
+transformer_blocks.7.mlp.w12.bias 2730
+transformer_blocks.7.mlp.w3.weight 512 1365
+transformer_blocks.7.mlp.w3.bias 512
+transformer_blocks.7.adaLN_modulation.1.weight 4608 512
+transformer_blocks.7.adaLN_modulation.1.bias 4608
+transformer_blocks.8.norm_s.weight 512
+transformer_blocks.8.s_attn.graph_dist_scale 1
+transformer_blocks.8.s_attn.graph_rel_scale 1
+transformer_blocks.8.s_attn.qkv.weight 1536 512
+transformer_blocks.8.s_attn.qkv.bias 1536
+transformer_blocks.8.s_attn.proj.weight 512 512
+transformer_blocks.8.s_attn.proj.bias 512
+transformer_blocks.8.s_attn.q_norm.weight 64
+transformer_blocks.8.s_attn.k_norm.weight 64
+transformer_blocks.8.s_attn.graph_dist_embedding.weight 6 128
+transformer_blocks.8.s_attn.graph_dist_proj.weight 8 128
+transformer_blocks.8.s_attn.graph_dist_proj.bias 8
+transformer_blocks.8.s_attn.graph_rel_embedding.weight 6 128
+transformer_blocks.8.s_attn.graph_rel_proj.weight 8 128
+transformer_blocks.8.s_attn.graph_rel_proj.bias 8
+transformer_blocks.8.norm_t.weight 512
+transformer_blocks.8.t_attn.qkv.weight 1536 512
+transformer_blocks.8.t_attn.qkv.bias 1536
+transformer_blocks.8.t_attn.proj.weight 512 512
+transformer_blocks.8.t_attn.proj.bias 512
+transformer_blocks.8.t_attn.q_norm.weight 64
+transformer_blocks.8.t_attn.k_norm.weight 64
+transformer_blocks.8.norm_mlp.weight 512
+transformer_blocks.8.mlp.w12.weight 2730 512
+transformer_blocks.8.mlp.w12.bias 2730
+transformer_blocks.8.mlp.w3.weight 512 1365
+transformer_blocks.8.mlp.w3.bias 512
+transformer_blocks.8.adaLN_modulation.1.weight 4608 512
+transformer_blocks.8.adaLN_modulation.1.bias 4608
+transformer_blocks.9.norm_s.weight 512
+transformer_blocks.9.s_attn.graph_dist_scale 1
+transformer_blocks.9.s_attn.graph_rel_scale 1
+transformer_blocks.9.s_attn.qkv.weight 1536 512
+transformer_blocks.9.s_attn.qkv.bias 1536
+transformer_blocks.9.s_attn.proj.weight 512 512
+transformer_blocks.9.s_attn.proj.bias 512
+transformer_blocks.9.s_attn.q_norm.weight 64
+transformer_blocks.9.s_attn.k_norm.weight 64
+transformer_blocks.9.s_attn.graph_dist_embedding.weight 6 128
+transformer_blocks.9.s_attn.graph_dist_proj.weight 8 128
+transformer_blocks.9.s_attn.graph_dist_proj.bias 8
+transformer_blocks.9.s_attn.graph_rel_embedding.weight 6 128
+transformer_blocks.9.s_attn.graph_rel_proj.weight 8 128
+transformer_blocks.9.s_attn.graph_rel_proj.bias 8
+transformer_blocks.9.norm_t.weight 512
+transformer_blocks.9.t_attn.qkv.weight 1536 512
+transformer_blocks.9.t_attn.qkv.bias 1536
+transformer_blocks.9.t_attn.proj.weight 512 512
+transformer_blocks.9.t_attn.proj.bias 512
+transformer_blocks.9.t_attn.q_norm.weight 64
+transformer_blocks.9.t_attn.k_norm.weight 64
+transformer_blocks.9.norm_mlp.weight 512
+transformer_blocks.9.mlp.w12.weight 2730 512
+transformer_blocks.9.mlp.w12.bias 2730
+transformer_blocks.9.mlp.w3.weight 512 1365
+transformer_blocks.9.mlp.w3.bias 512
+transformer_blocks.9.adaLN_modulation.1.weight 4608 512
+transformer_blocks.9.adaLN_modulation.1.bias 4608
+final_layer.norm_final.weight 512
+final_layer.root_cross_attn.in_proj_weight 1536 512
+final_layer.root_cross_attn.in_proj_bias 1536
+final_layer.root_cross_attn.out_proj.weight 512 512
+final_layer.root_cross_attn.out_proj.bias 512
+final_layer.root_cross_norm_q.weight 512
+final_layer.root_cross_norm_kv.weight 512
+final_layer.root_out.0.weight 512 512
+final_layer.root_out.0.bias 512
+final_layer.root_out.2.weight 12 512
+final_layer.root_out.2.bias 12
+final_layer.joint_out.0.weight 512 512
+final_layer.joint_out.0.bias 512
+final_layer.joint_out.2.weight 12 512
+final_layer.joint_out.2.bias 12
+final_layer.adaLN_modulation.1.weight 1024 512
+final_layer.adaLN_modulation.1.bias 1024

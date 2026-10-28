@@ -82,6 +82,8 @@ model3d/                   3D
                                  UNet, SD VAE, UniPC, views, bake; stage checks
   animateanymesh nextsycl-model3d-animateanymesh  AnimateAnyMesh: a mesh set in motion by a sentence (CLIP-L, DyMeshVAE,
                                  a rectified-flow MMDiT), morph targets; stage checks
+  unimate    nextsycl-model3d-unimate  UniMate: a rigged mesh's skeleton animated by a sentence (flan-T5, a graph
+                                 flow transformer, adaptive dopri5), skeletal glTF animation; stage checks
   unirig     nextsycl-model3d-unirig   UniRig: a skeleton (Michelangelo encoder, OPT decoder) and skin weights (PTv3)
   skintokens nextsycl-model3d-skintokens SkinTokens / TokenRig: a skeleton and skin weights as one token sequence (Qwen3-shaped decoder, FSQ-CVAE)
   rignet     nextsycl-model3d-rignet   RigNet (GPLv3, its own crate): a skeleton and skin weights from graph networks

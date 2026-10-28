@@ -55,6 +55,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `skintokens` | **SkinTokens (TokenRig)** a skeleton and its skin weights as one token sequence (`model3d.rig`) | a 3.6K-vertex humanoid: 3.0 s |
 | `rignet` | **RigNet** a skeleton and skin weights for a character mesh (`model3d.rig`); its own crate, **GPLv3** as RigNet's code | a 7.6K-vertex humanoid: 0.6 s |
 | `animateanymesh` | **AnimateAnyMesh** a mesh set in motion by a sentence, as morph targets (`model3d.rig` with a prompt) | a 7.6K-vertex humanoid, 16 frames: 2.8 s |
+| `unimate` | **UniMate** the skeleton of a rigged mesh set in motion by a sentence, as a glTF skeletal animation (`model3d.rig` with a prompt; weights CC BY-NC) | a 28-joint humanoid, 60 frames: 13 s |
 | `minimax-h3` | **MiniMax H3** video with sound | 896x672, 4.5 s: ~90 s |
 | `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |
 | `qwen3-tts-custom` | **Qwen3-TTS** speech | a minute of speech: 10.7 s (8.2 s int8); a sentence: 0.64 s |
