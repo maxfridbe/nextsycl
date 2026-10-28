@@ -9,9 +9,14 @@
 //!                                 voice's description), ref_audio (base64 WAV / data URL: a voice to clone),
 //!                                 ref_text, continue_from (a speech file made here: its last sentences are the
 //!                                 reference, after the voice's - the voice carries on), seconds (the most), seed,
-//!                                 response_format (wav | pcm | url), options}; stream: true / stream_format: audio
-//!                                 - the sound sent as it is made (wav with unknown lengths, or pcm: 16-bit, the
-//!                                 rate in X-Sample-Rate), stream_format: sse - speech.audio.delta events (base64
+//!                                 response_format (wav | pcm | mp3 | opus | aac | flac | url), speed (0.25 - 4),
+//!                                 sample_rate, options}; OpenAI's own shape - pcm (16-bit mono, 24 kHz) and the
+//!                                 encoded formats are always sent as the sound is made, `Transfer-Encoding:
+//!                                 chunked` (curl ... --output - | ffplay -f s16le -ar 24k -ac 1 -nodisp -); wav
+//!                                 with stream: true / stream_format: audio (unknown lengths); the rate is in
+//!                                 X-Sample-Rate. Another format, speed or rate goes through ffmpeg. `input` as a
+//!                                 list of texts: said in turn as ONE stream (the same voice and seed, `gap`
+//!                                 seconds between, 0.3), stream_format: sse - speech.audio.delta events (base64
 //!                                 16-bit PCM), then speech.audio.done with the file's link (an engine that does not
 //!                                 stream sends its sound whole at the end)
 //!   POST /v1/audio/transcriptions a recording written down (a recogniser: whisper): {audio (base64 of WAV, MP3, FLAC, Ogg,
@@ -44,6 +49,7 @@ use nextsycl_core::Gpu;
 use serde_json::{json, Value};
 
 use crate::http::{self, Conn};
+use crate::speechfmt::{self, Fmt, PCM_RATE};
 use crate::serve::cors_headers;
 use crate::telemetry::Telemetry;
 
@@ -249,21 +255,34 @@ impl AudioServer {
                     Err(e) => return http::respond_with(&mut s, 400, &err(format!("the body is not JSON: {e}")), &cors),
                 };
                 let base = req.host.as_deref().map(|h| format!("http://{h}")).unwrap_or_default();
-                let how = match streamed(&body) {
-                    Ok(h) => h,
+                let plan = match streamed(&body) {
+                    Ok(p) => p,
                     Err(m) => return http::respond_with(&mut s, 400, &err(m), &cors),
                 };
-                match how {
-                    Some(how) => {
-                        let mut out = Out { s: &mut s, how, cors: &cors, started: false, rate: 0 };
-                        let r = self.generate(&body, &base, Some(&mut out));
+                match plan {
+                    Some(plan) => {
+                        let mut out = Out::new(&mut s, plan.how, &cors, plan.speed, plan.rate);
+                        // one voice over the parts: a seed they share
+                        let mut part = body.clone();
+                        if !part["seed"].is_u64() {
+                            part["seed"] = json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos() as u64 % 1_000_000).unwrap_or(7));
+                        }
+                        let mut r = Ok((None, Vec::new()));
+                        for (i, text) in plan.parts.iter().enumerate() {
+                            // the parts as one stream: a pause between them
+                            if i > 0 && out.silence(plan.gap).is_err() {
+                                return;
+                            }
+                            part["input"] = json!(text);
+                            r = self.generate(&part, &base, Some(&mut out));
+                            if r.is_err() {
+                                break;
+                            }
+                        }
                         out.finish(r);
                     }
                     None => match self.generate(&body, &base, None) {
                         Ok((Some(v), _)) => http::respond_with(&mut s, 200, &v, &cors),
-                        Ok((None, wav)) if body["response_format"] == "pcm" => {
-                            http::respond_bytes(&mut s, 200, "audio/pcm", &wav[wav_data_at(&wav)..], &cors)
-                        }
                         Ok((None, wav)) => http::respond_bytes(&mut s, 200, "audio/wav", &wav, &cors),
                         Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
                     },
@@ -484,8 +503,8 @@ impl AudioServer {
         }
         let text = |k: &[&str]| k.iter().find_map(|k| b[*k].as_str()).filter(|p| !p.trim().is_empty()).map(str::to_string);
         let format = b["response_format"].as_str().unwrap_or("wav");
-        if !["wav", "pcm", "url"].contains(&format) {
-            return Err(bad(format!("response_format {format}: wav, pcm or url")));
+        if format != "url" && crate::speechfmt::Fmt::parse(format).is_none() {
+            return Err(bad(format!("response_format {format}: wav, pcm, mp3, opus, aac, flac or url")));
         }
         if format == "url" && self.out_dir.is_none() {
             return Err(bad("response_format url: this server keeps no files (start it with an output directory)".into()));
@@ -779,48 +798,113 @@ impl Drop for Slot<'_> {
 /// How a streamed answer is sent
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Streamed {
-    /// a WAV file, its lengths unknown, the samples as they come
-    Wav,
-    /// 16-bit PCM as it comes
-    Pcm,
+    /// the sound as it is made, in a format: wav (its lengths unknown), pcm (16-bit mono, 24 kHz as OpenAI's), or
+    /// mp3, opus, aac, flac (ffmpeg encodes as it comes); sent chunked (`Transfer-Encoding: chunked`)
+    Audio(Fmt),
     /// server-sent events (OpenAI's stream_format sse): speech.audio.delta {audio: base64 16-bit PCM} as the sound
     /// comes, then speech.audio.done (with the file's link and our numbers); an error ends it as an error event
     Sse,
 }
 
-/// Whether the request wants its sound streamed, and how: `stream: true` or `stream_format: "audio"` (the bytes of
-/// response_format wav or pcm as they come), `stream_format: "sse"` (events)
-fn streamed(b: &Value) -> Result<Option<Streamed>, String> {
-    let format = b["response_format"].as_str().unwrap_or("wav");
-    let sf = b["stream_format"].as_str();
-    if b["stream"] != true && sf.is_none() {
-        return Ok(None);
-    }
-    match (sf.unwrap_or("audio"), format) {
-        ("sse", _) => Ok(Some(Streamed::Sse)),
-        ("audio", "wav") => Ok(Some(Streamed::Wav)),
-        ("audio", "pcm") => Ok(Some(Streamed::Pcm)),
-        ("audio", f) => Err(format!("response_format {f}: a streamed answer is wav or pcm (stream_format sse's last event links the file)")),
-        (f, _) => Err(format!("stream_format {f}: audio or sse")),
-    }
+/// A streamed request: how, the texts to say in turn (one stream: `input` as a list), the pause between them, the
+/// speed, the rate asked for
+struct Plan {
+    how: Streamed,
+    parts: Vec<String>,
+    gap: f32,
+    speed: f64,
+    rate: Option<u32>,
 }
 
-/// Where a WAV made by `Audio::wav` has its samples
-fn wav_data_at(wav: &[u8]) -> usize {
-    wav.windows(4).position(|w| w == b"data").map_or(wav.len(), |i| (i + 8).min(wav.len()))
+/// Whether the request wants its sound streamed, and how. OpenAI answers a speech request as a chunked stream of the
+/// format's bytes; here that is every format but wav (whole unless `stream: true` / `stream_format: "audio"`) and
+/// url. `stream_format: "sse"` sends events. `input` may be a list of texts: they are said in turn as one stream
+/// (`gap` seconds between; a list asks for a stream). `speed` (0.25 - 4) and `sample_rate` need ffmpeg, as mp3, opus,
+/// aac and flac do
+fn streamed(b: &Value) -> Result<Option<Plan>, String> {
+    let format = b["response_format"].as_str().unwrap_or("wav");
+    let sf = b["stream_format"].as_str();
+    let speed = crate::speechfmt::speed_of(b)?;
+    let parts: Vec<String> = match &b["input"] {
+        Value::Array(a) => {
+            let v: Vec<String> = a.iter().filter_map(|x| x.as_str()).map(str::to_string).filter(|x| !x.trim().is_empty()).collect();
+            if v.is_empty() || v.len() != a.len() {
+                return Err("input: a text, or a list of texts (each not empty)".into());
+            }
+            v
+        }
+        _ => Vec::new(),
+    };
+    let gap = match &b["gap"] {
+        Value::Null => 0.3,
+        v => v.as_f64().filter(|g| (0.0..=5.0).contains(g)).ok_or("gap: seconds from 0 to 5")? as f32,
+    };
+    let rate = match &b["sample_rate"] {
+        Value::Null => None,
+        v => Some(v.as_u64().filter(|r| (8000..=96000).contains(r)).ok_or("sample_rate: Hz from 8000 to 96000")? as u32),
+    };
+    let fmt = Fmt::parse(format);
+    if !matches!(sf, None | Some("audio") | Some("sse")) {
+        return Err(format!("stream_format {}: audio or sse", sf.unwrap_or("")));
+    }
+    let list = !parts.is_empty();
+    let always = matches!(fmt, Some(Fmt::Pcm | Fmt::Mp3 | Fmt::Opus | Fmt::Aac | Fmt::Flac));
+    let asked = b["stream"] == true || sf.is_some();
+    if !(asked || always || (fmt == Some(Fmt::Wav) && (speed != 1.0 || list || rate.is_some()))) {
+        if format == "url" && (speed != 1.0 || list) {
+            return Err("speed and a list of texts: a stream (wav, pcm, mp3, opus, aac, flac), not response_format url".into());
+        }
+        return Ok(None);
+    }
+    let parts = if list { parts } else { vec![b["input"].as_str().unwrap_or("").to_string()] };
+    let how = if sf == Some("sse") {
+        if speed != 1.0 || rate.is_some() {
+            return Err("speed and sample_rate: a stream of audio, not events".into());
+        }
+        Streamed::Sse
+    } else {
+        match fmt {
+            Some(f) => Streamed::Audio(f),
+            None => return Err("response_format url: a streamed answer is audio (wav, pcm, mp3, opus, aac, flac) - stream_format sse's last event links the file".into()),
+        }
+    };
+    if let Streamed::Audio(f) = how {
+        if (!matches!(f, Fmt::Wav | Fmt::Pcm) || speed != 1.0) && !crate::speechfmt::have_ffmpeg() {
+            return Err(format!("response_format {format}{}: ffmpeg is not on this server's path", if speed != 1.0 { " with speed" } else { "" }));
+        }
+    }
+    Ok(Some(Plan { how, parts, gap, speed, rate }))
 }
 
 /// A streamed answer on its connection: the head sent with the first sound (an error before it is answered as
-/// usual), each piece of sound written as it comes
+/// usual), each piece of sound written as it comes as a chunk
 struct Out<'a> {
     s: &'a mut Conn,
     how: Streamed,
     cors: &'a str,
     started: bool,
+    /// the engine's rate
     rate: u32,
+    speed: f64,
+    /// the rate asked for (none: pcm's 24 kHz, else the engine's)
+    want: Option<u32>,
+    /// ffmpeg between the engine and the client (another format, speed or rate)
+    pipe: Option<crate::speechfmt::Pipe>,
 }
 
-impl Out<'_> {
+impl<'a> Out<'a> {
+    fn new(s: &'a mut Conn, how: Streamed, cors: &'a str, speed: f64, want: Option<u32>) -> Out<'a> {
+        Out { s, how, cors, started: false, rate: 0, speed, want, pipe: None }
+    }
+
+    /// The rate of the sound that reaches the client
+    fn out_rate(&self) -> u32 {
+        match self.how {
+            Streamed::Audio(Fmt::Pcm) => self.want.unwrap_or(PCM_RATE),
+            _ => self.want.unwrap_or(self.rate),
+        }
+    }
+
     fn start(&mut self) -> std::io::Result<()> {
         use std::io::Write;
         if self.started {
@@ -828,15 +912,27 @@ impl Out<'_> {
         }
         self.started = true;
         let kind = match self.how {
-            Streamed::Wav => "audio/wav",
-            Streamed::Pcm => "audio/pcm",
+            Streamed::Audio(f) => f.content_type(),
             Streamed::Sse => "text/event-stream",
         };
-        // no length: the answer ends when the connection closes
-        write!(self.s, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nCache-Control: no-cache\r\nX-Sample-Rate: {}\r\n{}Connection: close\r\n\r\n",
-               self.rate, self.cors)?;
-        if self.how == Streamed::Wav {
-            self.s.write_all(&nextsycl_audio::wav_stream_head(self.rate, 1))?;
+        if let Streamed::Audio(f) = self.how {
+            let to = Some(self.out_rate()).filter(|r| *r != self.rate);
+            if !matches!(f, Fmt::Wav | Fmt::Pcm) || self.speed != 1.0 || to.is_some() {
+                match crate::speechfmt::Pipe::start(self.rate, f, to, self.speed) {
+                    Ok(p) => self.pipe = Some(p),
+                    // no ffmpeg: wav and pcm go out at the engine's rate (X-Sample-Rate says which)
+                    Err(e) if matches!(f, Fmt::Wav | Fmt::Pcm) && self.speed == 1.0 => {
+                        eprintln!("nextsycl audio: {e} - sending the engine's rate");
+                        self.want = None;
+                    }
+                    Err(e) => return Err(std::io::Error::other(e)),
+                }
+            }
+        }
+        write!(self.s, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nX-Sample-Rate: {}\r\n{}Connection: close\r\n\r\n",
+               self.out_rate(), self.cors)?;
+        if self.how == Streamed::Audio(Fmt::Wav) && self.pipe.is_none() {
+            speechfmt::chunk(&mut *self.s, &nextsycl_audio::wav_stream_head(self.rate, 1))?;
         }
         self.s.flush()
     }
@@ -845,21 +941,38 @@ impl Out<'_> {
         use std::io::Write;
         self.start()?;
         let pcm = nextsycl_audio::pcm16(samples);
-        match self.how {
-            Streamed::Sse => write!(self.s, "data: {}\n\n", json!({"type": "speech.audio.delta", "audio": http::base64(&pcm)}))?,
-            _ => self.s.write_all(&pcm)?,
+        match (self.how, self.pipe.as_mut()) {
+            (Streamed::Sse, _) => speechfmt::chunk(&mut *self.s, format!("data: {}\n\n", json!({"type": "speech.audio.delta", "audio": http::base64(&pcm)})).as_bytes())?,
+            (_, Some(p)) => {
+                p.feed(&pcm)?;
+                for c in p.ready() {
+                    speechfmt::chunk(&mut *self.s, &c)?;
+                }
+            }
+            _ => speechfmt::chunk(&mut *self.s, &pcm)?,
         }
         self.s.flush()
     }
 
-    /// The end: an error not answered yet as usual, the events' last one (done or the error)
+    /// A pause between the parts of one stream
+    fn silence(&mut self, seconds: f32) -> std::io::Result<()> {
+        let n = (seconds * self.rate as f32) as usize;
+        if n == 0 || !self.started {
+            return Ok(());
+        }
+        self.send(&vec![0.0; n])
+    }
+
+    /// The end: an error not answered yet as usual, the events' last one (done or the error). An error after the
+    /// head leaves the chunks unterminated, so the client knows the sound is cut short
     fn finish(mut self, r: Result<(Option<Value>, Vec<u8>), (u16, String)>) {
         use std::io::Write;
         match (r, self.started) {
             (Err((code, m)), false) => http::respond_with(&mut *self.s, code, &err(m), self.cors),
             (Err((_, m)), true) => {
                 if self.how == Streamed::Sse {
-                    let _ = write!(self.s, "data: {}\n\n", json!({"type": "error", "error": {"message": m}}));
+                    let _ = speechfmt::chunk(&mut *self.s, format!("data: {}\n\n", json!({"type": "error", "error": {"message": m}})).as_bytes());
+                    let _ = speechfmt::chunk_end(&mut *self.s);
                 }
                 let _ = self.s.flush();
             }
@@ -868,14 +981,22 @@ impl Out<'_> {
                 if self.start().is_err() {
                     return;
                 }
+                if let Some(p) = self.pipe.take() {
+                    for c in p.finish() {
+                        if speechfmt::chunk(&mut *self.s, &c).is_err() {
+                            return;
+                        }
+                    }
+                }
                 if self.how == Streamed::Sse {
                     let mut done = json!({"type": "speech.audio.done", "sample_rate": self.rate});
                     if let Some(a) = answer {
                         done["data"] = a["data"].clone();
                         done["nextsycl"] = a["nextsycl"].clone();
                     }
-                    let _ = write!(self.s, "data: {done}\n\n");
+                    let _ = speechfmt::chunk(&mut *self.s, format!("data: {done}\n\n").as_bytes());
                 }
+                let _ = speechfmt::chunk_end(&mut *self.s);
                 let _ = self.s.flush();
             }
         }
@@ -1011,6 +1132,80 @@ mod tests {
     }
 
     use super::{gpu_failed, own_vram_mb, range};
+
+    #[test]
+    fn a_speech_request_streams_as_openai_does() {
+        use super::{streamed, Fmt, Streamed};
+        use serde_json::json;
+        let how = |b: serde_json::Value| streamed(&b).map(|p| p.map(|p| (p.how, p.parts.len())));
+        // wav and url stay whole unless asked
+        assert_eq!(how(json!({"input": "a"})), Ok(None));
+        assert_eq!(how(json!({"input": "a", "response_format": "url"})), Ok(None));
+        assert_eq!(how(json!({"input": "a", "stream": true})), Ok(Some((Streamed::Audio(Fmt::Wav), 1))));
+        // pcm and the encoded formats are a chunked stream by default
+        assert_eq!(how(json!({"input": "a", "response_format": "pcm"})), Ok(Some((Streamed::Audio(Fmt::Pcm), 1))));
+        assert_eq!(how(json!({"input": "a", "response_format": "pcm", "stream": false})), Ok(Some((Streamed::Audio(Fmt::Pcm), 1))));
+        assert_eq!(how(json!({"input": "a", "response_format": "flac"})), Ok(Some((Streamed::Audio(Fmt::Flac), 1))));
+        assert_eq!(how(json!({"input": "a", "stream_format": "sse"})), Ok(Some((Streamed::Sse, 1))));
+        // a list of texts is one stream, even as wav
+        assert_eq!(how(json!({"input": ["a", "b", "c"]})), Ok(Some((Streamed::Audio(Fmt::Wav), 3))));
+        assert!(how(json!({"input": ["a", ""]})).is_err());
+        assert!(how(json!({"input": [], "stream": true})).is_err());
+        assert!(how(json!({"input": ["a", "b"], "response_format": "url"})).is_err());
+        // speed and the rate: OpenAI's range; not with events
+        assert!(how(json!({"input": "a", "speed": 0.1})).is_err());
+        assert!(how(json!({"input": "a", "speed": 2.0, "stream_format": "sse"})).is_err());
+        assert!(how(json!({"input": "a", "gap": 9})).is_err());
+        assert!(how(json!({"input": "a", "stream_format": "ogg"})).is_err());
+        // an unknown format is generate's to refuse (400), before any sound
+        assert_eq!(how(json!({"input": "a", "response_format": "ogg"})), Ok(None));
+    }
+
+    /// Reads a chunked answer off a socket: (head, body)
+    fn dechunk(raw: &[u8]) -> (String, Vec<u8>) {
+        let at = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = String::from_utf8_lossy(&raw[..at]).to_string();
+        let (mut body, mut i) = (Vec::new(), at);
+        loop {
+            let eol = raw[i..].windows(2).position(|w| w == b"\r\n").unwrap() + i;
+            let n = usize::from_str_radix(std::str::from_utf8(&raw[i..eol]).unwrap(), 16).unwrap();
+            if n == 0 {
+                assert_eq!(&raw[eol..], b"\r\n\r\n", "the last chunk ends the answer");
+                return (head, body);
+            }
+            body.extend_from_slice(&raw[eol + 2..eol + 2 + n]);
+            i = eol + 2 + n + 2;
+        }
+    }
+
+    /// Two parts of one stream through an Out on a real socket: pcm at 24 kHz from a 48 kHz engine, a pause between
+    #[test]
+    fn parts_are_one_chunked_stream() {
+        use super::{Fmt, Out, Streamed};
+        use std::io::Read;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            let mut raw = Vec::new();
+            c.read_to_end(&mut raw).unwrap();
+            raw
+        });
+        let mut conn = crate::http::Conn::Tcp(l.accept().unwrap().0);
+        let mut out = Out::new(&mut conn, Streamed::Audio(Fmt::Pcm), "", 1.0, None);
+        out.rate = 48_000;
+        out.send(&vec![0.1; 48_000]).unwrap();
+        out.silence(0.5).unwrap();
+        out.send(&vec![0.1; 48_000]).unwrap();
+        out.finish(Ok((None, Vec::new())));
+        drop(conn);
+        let (head, body) = dechunk(&client.join().unwrap());
+        assert!(head.contains("Transfer-Encoding: chunked") && head.contains("Content-Type: audio/pcm") && head.contains("X-Sample-Rate: 24000"), "{head}");
+        // 2.5 s at 24 kHz, 16-bit (ffmpeg's resampler trims a few samples)
+        if crate::speechfmt::have_ffmpeg() {
+            assert!((body.len() as i64 - 120_000).abs() < 1500, "{}", body.len());
+        }
+    }
 
     #[test]
     fn a_device_failure_retires_the_server_a_bad_request_does_not() {

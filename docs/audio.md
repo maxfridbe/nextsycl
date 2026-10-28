@@ -135,6 +135,16 @@ on the API, chips and "save voice" buttons on the page.
   data: URL), `ref_text`, `seconds` (the most), `seed`, `options` (`greedy`, `temperature`, `top-k`, `streaming`).
   The page takes the text, the voice (chips), the description or instruction, a recording to clone and its
   transcript, the language.
+- **OpenAI's shape** (`/v1/audio/speech`): `response_format` `wav`, `pcm` (16-bit mono at 24 kHz, `X-Sample-Rate`
+  says), `mp3`, `opus` (Ogg), `aac` (ADTS), `flac` or `url`; `speed` 0.25 - 4 (pitch kept); `sample_rate` (8000 -
+  96000). `pcm` and the encoded formats are sent as the sound is made, chunked, the first sentence in under a second:
+  `curl localhost:8000/v1/audio/speech -d '{"model": "qwen3-tts-custom", "input": "Hello.", "voice": "ryan",
+  "response_format": "pcm"}' --output - | ffplay -f s16le -ar 24k -ac 1 -nodisp -`. wav is whole unless `stream:
+  true`. Anything but native wav/pcm goes through the server's `ffmpeg` (a 400 says when it is missing).
+- **Merging**: `input` as a list (`["One.", "Two."]`) is said in turn as one stream - the same voice and seed, `gap`
+  seconds (0.3) of silence between - and arrives as one file or one chunked stream. Parts that fail end the stream
+  uncleanly (the chunks are not terminated), so a client sees a cut, not a short file. `response_format: url` takes
+  one text at normal speed (a list or speed asks for a stream).
 
 ## Breeze TTS 2
 

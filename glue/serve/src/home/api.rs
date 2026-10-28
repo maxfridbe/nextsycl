@@ -1472,8 +1472,10 @@ impl Home {
         }
         if on.contains(&"audio") {
             paths.insert("/v1/audio/speech".into(), json!({"post": oa("A song (input: the lyrics, instructions: the music) or speech (input: the text; voice, \
-                language, instructions, ref_audio, ref_text); response_format wav, pcm or url; stream: true (or stream_format audio) sends \
-                the sound as it is made (wav or pcm), stream_format sse as speech.audio.delta events",
+                language, instructions, ref_audio, ref_text); response_format wav, pcm (16-bit mono 24 kHz), mp3, opus, aac, flac or url; \
+                pcm and the encoded formats are sent as the sound is made (Transfer-Encoding: chunked, as OpenAI's), wav with stream: true; \
+                speed 0.25-4; input may be a list of texts, said in turn as one stream (gap seconds between); stream_format sse sends \
+                speech.audio.delta events",
                 json!({"model": ids("audio").first(), "instructions": "warm folk", "input": "[verse]\nRiver runs slow", "response_format": "url"}), "audio.generate")}));
             paths.insert("/v1/audio/files/{name}".into(), file("A song or speech an answer links (data[].url of audio.generate / audio.speak)", "<file>.wav", "audio/wav", true));
             paths.insert("/v1/audio/voices/{name}".into(), file("A saved voice's sample (audio.voices.list's sample)", "<voice>.wav", "audio/wav", false));
