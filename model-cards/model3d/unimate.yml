@@ -1,0 +1,53 @@
+# UniMate (the skeleton of a rigged mesh set in motion by a sentence: 60 frames at 30 fps as glTF skeletal animation; code MIT, weights CC BY-NC 4.0)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: unimate
+kind: model3d
+arch: unimate
+title: 'UniMate (text-driven skeletal animation of a rigged GLB: 60 frames, joint rotations and a root path; weights CC BY-NC 4.0, non-commercial)'
+about: Friedrich-M et al., SIGGRAPH Asia 2026 - flan-T5-base text, a graph spatio-temporal flow transformer (10 blocks of attention among a frame's joints with spectral rotary positions and a graph-distance bias, attention among a joint's frames, a SwiGLU MLP, adaLN from the time, the text and the rest pose) sampled by an adaptive Dormand-Prince ODE with guidance 3; float32; run directory unimate_uniml3d_f60_v3 (graph_adaln, step 150000, the EMA weights, trained on UniML3D). The checkpoint's licence is CC BY-NC 4.0 - research and other non-commercial use only; the code is MIT. Takes a rigged mesh (UniRig or RigNet output, or any GLB with a skin of at most 71 joints and a single root), reads the joints by rules (no LLM), and returns the same mesh with an animation on its skeleton
+does: [animate]
+gpus: '0'
+vram_gib: 2.0                    # measured: about 1 GiB above idle sampled during a run (docs/3d.md); weights float32 (denoiser, flan-T5) and working buffers
+defaults:
+  cfg: 3.0
+  frames: 60
+  fps: 30
+env: {}
+files:
+  ckpt:
+    key: unimate-f60-v3-ckpt
+    url: https://huggingface.co/Linzhan/UniMate/resolve/174fc755ec248d0c98f27759b7a95648e7f05905/unimate_uniml3d_f60_v3/checkpoints/checkpoint_step_150000.pt
+    size: 1185836040
+    sha256: f991ddd87262c251f4681d18297a6163ab4f139daa28c86d5ef0a66771df7bc6
+    path: unimate/checkpoints/checkpoint_step_150000.pt
+  config:
+    key: unimate-f60-v3-config
+    url: https://huggingface.co/Linzhan/UniMate/resolve/174fc755ec248d0c98f27759b7a95648e7f05905/unimate_uniml3d_f60_v3/config.json
+    size: 3530
+    sha256: 1ffbd379d3667de7d701ed6f3418f1c9d1a66f35d2653776255008c07c051aaa
+    path: unimate/config.json
+  stats:
+    key: unimate-f60-v3-stats
+    url: https://huggingface.co/Linzhan/UniMate/resolve/174fc755ec248d0c98f27759b7a95648e7f05905/unimate_uniml3d_f60_v3/dataset_stats.npy
+    size: 950
+    sha256: 0ff2b9ef3ea9a15b024ab0670e55f659478251501e5596f9011d5bca4cf67773
+    path: unimate/dataset_stats.npy
+  t5:
+    key: flan-t5-base-weights
+    url: https://huggingface.co/google/flan-t5-base/resolve/7bcac572ce56db69c1ea7c8af255c5d7c9672fc2/model.safetensors
+    size: 990345061
+    sha256: 1dfb70afdcedceb9f9fae2f9b68e004ad934361fb35b9b2bd50b45ea90790fc8
+    path: flan-t5-base/model.safetensors
+  t5-config:
+    key: flan-t5-base-config
+    url: https://huggingface.co/google/flan-t5-base/resolve/7bcac572ce56db69c1ea7c8af255c5d7c9672fc2/config.json
+    size: 1404
+    sha256: 7c1853dbfa0e4aac093eb109a358b6ab25fe86b7c15185a91322f0ed26f0f940
+    path: flan-t5-base/config.json
+  tokenizer:
+    key: flan-t5-base-tokenizer
+    url: https://huggingface.co/google/flan-t5-base/resolve/7bcac572ce56db69c1ea7c8af255c5d7c9672fc2/tokenizer.json
+    size: 2424064
+    sha256: fe2ebbbbde2985be723e0ce18217853e4020c5e9d35bd07be2c27ab9d3ead57a
+    path: flan-t5-base/tokenizer.json
+guide: guides/unimate.md

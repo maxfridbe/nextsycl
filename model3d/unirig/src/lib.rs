@@ -307,7 +307,7 @@ impl Model3dEngine for UniRig {
         let joints = rig.joints.iter().zip(&rig.parents).enumerate()
             .map(|(i, (j, p))| Joint { name: format!("bone_{i}"), parent: *p, head: prep::from_blender(*j) }).collect();
         let mut m = req.mesh.clone();
-        m.skin = Some(Skin { joints, weights: tools::skin::top4(&dense, nj) });
+        m.skin = Some(Skin { joints, weights: tools::skin::top4(&dense, nj), motion: None });
         if m.normals.len() != m.positions.len() {
             m.compute_normals();
         }

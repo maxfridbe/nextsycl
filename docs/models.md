@@ -99,6 +99,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | id | model | engine | size | status |
 |---|---|---|---|---|
 | `animateanymesh` | AnimateAnyMesh: a mesh set in motion by a sentence - DyMeshVAE (neighbour attention over the mesh's edges), a rectified-flow MMDiT on SD 1.5's CLIP-L; 16 frames as glTF morph targets (Apache-2.0) | `animateanymesh` | 0.9 GiB | checked |
+| `unimate` | UniMate: a rigged mesh's skeleton set in motion by a sentence - flan-T5, a graph spatio-temporal flow transformer, adaptive Dormand-Prince sampling; 60 frames at 30 fps as glTF skeletal animation (code MIT, **weights CC BY-NC 4.0**) | `unimate` | 2.0 GiB | checked |
 | `unirig` | UniRig: a skeleton (an OPT-350m-shaped decoder over a Michelangelo shape encoding, 15 sampled beams) and skin weights (Point Transformer V3, bone attention, a voxel geodesic prior) for any mesh (MIT) | `unirig` | 5.4 GiB | checked |
 | `rignet` | RigNet: a skeleton (GMEdgeNet joints, RootNet, BoneNet's tree) and skin weights (SkinNet over volumetric geodesics) for a character mesh; **GPLv3**, its own crate | `rignet` | 0.2 GiB | checked |
 **3D** (`nextsycl model3d`: a picture to a textured mesh, GLB)

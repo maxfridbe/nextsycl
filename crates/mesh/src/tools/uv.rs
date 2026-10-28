@@ -96,7 +96,7 @@ pub fn unwrap(m: &Mesh, size: u32, gutter: u32) -> Mesh {
         out.colors = src.iter().map(|&v| m.colors[v as usize]).collect();
     }
     if let Some(s) = &m.skin {
-        out.skin = Some(crate::Skin { joints: s.joints.clone(), weights: src.iter().map(|&v| s.weights[v as usize]).collect() });
+        out.skin = Some(crate::Skin { joints: s.joints.clone(), weights: src.iter().map(|&v| s.weights[v as usize]).collect(), motion: s.motion.clone() });
     }
     if let Some(a) = &m.animation {
         out.animation = Some(crate::Morph { fps: a.fps, frames: a.frames.iter().map(|f| src.iter().map(|&v| f[v as usize]).collect()).collect() });

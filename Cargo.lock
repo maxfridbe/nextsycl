@@ -586,6 +586,7 @@ dependencies = [
  "nextsycl-model3d-hunyuan3d",
  "nextsycl-model3d-rignet",
  "nextsycl-model3d-trellis2",
+ "nextsycl-model3d-unimate",
  "nextsycl-model3d-unirig",
  "nextsycl-models",
  "nextsycl-serve",
@@ -1049,6 +1050,17 @@ dependencies = [
  "nextsycl-gguf",
  "nextsycl-model3d",
  "nextsycl-remover",
+ "serde_json",
+]
+
+[[package]]
+name = "nextsycl-model3d-unimate"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-model3d",
  "serde_json",
 ]
 

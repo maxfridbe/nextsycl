@@ -83,6 +83,21 @@ pub struct Joint {
 pub struct Skin {
     pub joints: Vec<Joint>,
     pub weights: Vec<[(u16, f32); 4]>,
+    /// the joints in motion (glTF skeletal animation), if any
+    pub motion: Option<SkelMotion>,
+}
+
+/// A skeleton in motion: every frame's rotation of every joint (a node's local rotation, as x y z w; the joints'
+/// rest rotations are identity) and the root joint's translation, `fps` frames a second
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SkelMotion {
+    pub fps: f32,
+    /// [frame][joint]
+    pub rotations: Vec<Vec<[f32; 4]>>,
+    /// the root joint's node translation a frame (its rest translation plus the motion's travel)
+    pub root: Vec<[f32; 3]>,
+    /// which joint `root` moves
+    pub root_joint: usize,
 }
 
 /// An animation of the vertices: every frame's positions (each as long as the mesh's), `fps` frames a second

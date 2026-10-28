@@ -51,6 +51,7 @@ nextsycl-model3d-animateanymesh.workspace = true
 nextsycl-model3d-unirig.workspace = true
 nextsycl-model3d-rignet.workspace = true
 nextsycl-model3d-trellis2.workspace = true
+nextsycl-model3d-unimate.workspace = true
 nextsycl-models.workspace = true
 nextsycl-serve.workspace = true
 serde_json.workspace = true

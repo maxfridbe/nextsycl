@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 
-use crate::{Joint, Material, Mesh, Morph, Skin, Texture};
+use crate::{Joint, Material, Mesh, Morph, SkelMotion, Skin, Texture};
 
 const GLB: u32 = 0x4654_6C67; // "glTF"
 const JSON: u32 = 0x4E4F_534A;
@@ -179,6 +179,30 @@ pub fn write(m: &Mesh) -> Result<Vec<u8>, String> {
             animations.push(json!({"name": "motion", "samplers": [{"input": input, "output": output, "interpolation": "LINEAR"}],
                                    "channels": [{"sampler": 0, "target": {"node": 0, "path": "weights"}}]}));
             weights0 = Some(vec![0.0f32; n]);
+        }
+    }
+
+    if let Some((s, mo)) = m.skin.as_ref().and_then(|s| s.motion.as_ref().map(|mo| (s, mo))) {
+        let n = mo.rotations.len();
+        if n > 0 && mo.rotations.iter().all(|f| f.len() == s.joints.len()) && mo.fps > 0.0 {
+            // skeletal animation: one rotation track a joint and a translation track for the root, one shared clock
+            let times: Vec<f32> = (0..n).map(|k| k as f32 / mo.fps).collect();
+            let tb: Vec<u8> = times.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let input = o.accessor(&tb, FLOAT, n, "SCALAR", None, json!({"min": [0.0], "max": [times[n - 1]]}));
+            let (mut samplers, mut channels) = (Vec::new(), Vec::new());
+            for j in 0..s.joints.len() {
+                let q: Vec<u8> = (0..n).flat_map(|k| mo.rotations[k][j]).flat_map(|x| x.to_le_bytes()).collect();
+                let out = o.accessor(&q, FLOAT, n, "VEC4", None, json!({}));
+                samplers.push(json!({"input": input, "output": out, "interpolation": "LINEAR"}));
+                channels.push(json!({"sampler": samplers.len() - 1, "target": {"node": 1 + j, "path": "rotation"}}));
+            }
+            if mo.root.len() == n && mo.root_joint < s.joints.len() {
+                let t: Vec<u8> = mo.root.iter().flatten().flat_map(|x| x.to_le_bytes()).collect();
+                let out = o.accessor(&t, FLOAT, n, "VEC3", None, json!({}));
+                samplers.push(json!({"input": input, "output": out, "interpolation": "LINEAR"}));
+                channels.push(json!({"sampler": samplers.len() - 1, "target": {"node": 1 + mo.root_joint, "path": "translation"}}));
+            }
+            animations.push(json!({"name": "skeleton", "samplers": samplers, "channels": channels}));
         }
     }
 
@@ -402,6 +426,7 @@ pub fn read(bytes: &[u8]) -> Result<Mesh, String> {
     let mut m = Mesh::default();
     let mut has = (true, true, true); // normals, uvs, colors in every primitive so far
     let mut prims = 0;
+    let (mut skin_of, mut skin_broken) = (None::<u64>, false);
     while let Some((ni, parent, depth)) = stack.pop() {
         if depth > 64 {
             return Err("a node tree deeper than 64 (a cycle?)".into());
@@ -460,12 +485,20 @@ pub fn read(bytes: &[u8]) -> Result<Mesh, String> {
                     m.material = Some(material);
                 }
             }
-            if prims == 0 {
-                if let (Some(si), Some(j), Some(w)) = (node["skin"].as_u64(), a["JOINTS_0"].as_u64(), a["WEIGHTS_0"].as_u64()) {
-                    m.skin = Some(read_skin(&inp, si as usize, j as usize, w as usize)?);
-                }
-            } else {
-                m.skin = None; // a skin over several primitives: not kept
+            // one skin over every primitive (the same skin node-to-node): the weights are appended in order
+            let skinned = match (node["skin"].as_u64(), a["JOINTS_0"].as_u64(), a["WEIGHTS_0"].as_u64()) {
+                (Some(si), Some(j), Some(w)) if prims == 0 || skin_of == Some(si) => Some((si, read_skin(&inp, si as usize, j as usize, w as usize)?)),
+                _ => None,
+            };
+            match skinned {
+                Some((si, sk)) => match m.skin.as_mut() {
+                    Some(have) if prims > 0 => have.weights.extend(sk.weights),
+                    _ => {
+                        skin_of = Some(si);
+                        m.skin = Some(sk);
+                    }
+                },
+                None => skin_broken = true,
             }
             prims += 1;
         }
@@ -474,6 +507,9 @@ pub fn read(bytes: &[u8]) -> Result<Mesh, String> {
         return Err("no triangles in the file".into());
     }
     let nv = m.positions.len();
+    if skin_broken {
+        m.skin = None;
+    }
     if !has.0 || m.normals.len() != nv {
         m.normals.clear();
     }
@@ -521,7 +557,7 @@ fn read_skin(inp: &In, si: usize, j: usize, w: usize) -> Result<Skin, String> {
     let weights = jv.chunks_exact(4).zip(wv.chunks_exact(4))
         .map(|(a, b)| [0, 1, 2, 3].map(|c| ((remap.get(a[c] as usize).copied().unwrap_or(0)) as u16, b[c])))
         .collect();
-    Ok(Skin { joints, weights })
+    Ok(Skin { joints, weights, motion: None })
 }
 
 fn topo(j: &[Joint]) -> Vec<usize> {
@@ -588,6 +624,39 @@ pub fn read_morph(bytes: &[u8]) -> Result<Option<Morph>, String> {
     Ok(Some(Morph { fps, frames }))
 }
 
+/// A skeletal animation read back (the "skeleton" animation's rotation tracks by joint, the translation track of the
+/// root): for tests and tools. Joints are in the skin's own order.
+pub fn read_motion(bytes: &[u8]) -> Result<Option<SkelMotion>, String> {
+    let (doc, bin) = chunks(bytes)?;
+    let inp = In { doc: &doc, bin };
+    let Some(skin) = doc["skins"][0]["joints"].as_array() else { return Ok(None) };
+    let nodes: Vec<usize> = skin.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect();
+    let Some(anim) = doc["animations"].as_array().and_then(|a| a.iter().find(|a| a["name"] == "skeleton")) else { return Ok(None) };
+    let mut mo = SkelMotion::default();
+    let mut rot: Vec<Option<Vec<[f32; 4]>>> = vec![None; nodes.len()];
+    for c in anim["channels"].as_array().map_or(&[][..], |c| c.as_slice()) {
+        let node = c["target"]["node"].as_u64().ok_or("a channel without a node")? as usize;
+        let sampler = &anim["samplers"][c["sampler"].as_u64().ok_or("a channel without a sampler")? as usize];
+        let (times, _) = inp.floats(sampler["input"].as_u64().ok_or("no input")? as usize)?;
+        let (out, k) = inp.floats(sampler["output"].as_u64().ok_or("no output")? as usize)?;
+        if times.len() > 1 && times[1] > 0.0 {
+            mo.fps = 1.0 / times[1];
+        }
+        let Some(j) = nodes.iter().position(|&n| n == node) else { continue };
+        match c["target"]["path"].as_str() {
+            Some("rotation") => rot[j] = Some(out.chunks_exact(k).map(|q| [q[0], q[1], q[2], q[3]]).collect()),
+            Some("translation") => {
+                mo.root = out.chunks_exact(k).map(|t| [t[0], t[1], t[2]]).collect();
+                mo.root_joint = j;
+            }
+            _ => {}
+        }
+    }
+    let n = rot.iter().flatten().map(Vec::len).next().unwrap_or(0);
+    mo.rotations = (0..n).map(|f| rot.iter().map(|r| r.as_ref().map_or([0.0, 0.0, 0.0, 1.0], |r| r[f])).collect()).collect();
+    Ok(Some(mo))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,6 +696,7 @@ mod tests {
             joints: vec![Joint { name: "root".into(), parent: None, head: [0.0, 0.0, 0.0] },
                          Joint { name: "tip".into(), parent: Some(0), head: [0.0, 1.0, 0.0] }],
             weights: vec![[(0, 1.0), (0, 0.0), (0, 0.0), (0, 0.0)], [(0, 0.5), (1, 0.5), (0, 0.0), (0, 0.0)], [(1, 1.0), (0, 0.0), (0, 0.0), (0, 0.0)]],
+            motion: None,
         });
         let lifted: Vec<[f32; 3]> = m.positions.iter().map(|p| [p[0], p[1], p[2] + 1.0]).collect();
         m.animation = Some(Morph { fps: 12.0, frames: vec![m.positions.clone(), lifted.clone()] });
@@ -640,6 +710,26 @@ mod tests {
         let morph = read_morph(&b).unwrap().unwrap();
         assert_eq!(morph.frames[1], lifted);
         assert!((morph.fps - 12.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_skeletal_motion_round_trips() {
+        let mut m = tri();
+        let q = |a: f32| [0.0, (a / 2.0).sin(), 0.0, (a / 2.0).cos()];
+        m.skin = Some(Skin {
+            joints: vec![Joint { name: "root".into(), parent: None, head: [0.0, 0.0, 0.0] },
+                         Joint { name: "tip".into(), parent: Some(0), head: [0.0, 1.0, 0.0] }],
+            weights: vec![[(0, 1.0), (0, 0.0), (0, 0.0), (0, 0.0)], [(0, 0.5), (1, 0.5), (0, 0.0), (0, 0.0)], [(1, 1.0), (0, 0.0), (0, 0.0), (0, 0.0)]],
+            motion: Some(SkelMotion { fps: 30.0, rotations: vec![vec![q(0.0), q(0.5)], vec![q(0.3), q(1.0)], vec![q(0.6), q(1.5)]],
+                                      root: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.5], [0.0, 0.0, 1.0]], root_joint: 0 }),
+        });
+        let b = write(&m).unwrap();
+        let back = read_motion(&b).unwrap().unwrap();
+        assert_eq!(back.rotations.len(), 3);
+        assert_eq!(back.rotations[2][1], q(1.5));
+        assert_eq!(back.root[1], [0.0, 0.0, 0.5]);
+        assert!((back.fps - 30.0).abs() < 1e-3);
+        assert!(read_morph(&b).unwrap().is_none());
     }
 
     #[test]

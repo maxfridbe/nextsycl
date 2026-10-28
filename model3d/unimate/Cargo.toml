@@ -1,0 +1,13 @@
+[package]
+name = "nextsycl-model3d-unimate"
+description = "UniMate: a rigged mesh's skeleton animated from a sentence (a flan-T5 text encoder, a graph spatio-temporal flow transformer) on Intel Arc (SYCL)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-model3d.workspace = true
+serde_json.workspace = true
