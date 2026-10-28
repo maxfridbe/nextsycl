@@ -318,7 +318,7 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
             let st: Vec<&str> = st.iter().map(String::as_str).collect();
             nextsycl_model3d_rignet::check::run(&e, &dir, &st, opt(args, "--mesh").map(Path::new), &mut log).map_err(|e| e.0)?
         }
-        a => return Err(format!("check knows {}, {}, {}, {}, {} and {} (not {a})", nextsycl_model3d_hunyuan3d::ARCH_21, nextsycl_model3d_hunyuan3d::ARCH_MINI,
+        a => return Err(format!("check knows {}, {}, {}, {}, {}, {} and {} (not {a})", nextsycl_model3d_hunyuan3d::ARCH_21, nextsycl_model3d_hunyuan3d::ARCH_MINI,
                                 nextsycl_model3d_animateanymesh::ARCH, nextsycl_model3d_unimate::ARCH, nextsycl_model3d_unirig::ARCH, nextsycl_model3d_skintokens::ARCH,
                                 nextsycl_model3d_rignet::ARCH)),
     };
