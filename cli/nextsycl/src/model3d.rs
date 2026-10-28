@@ -30,7 +30,7 @@ nextsycl model3d engines | selftest [--gpu N]";
 
 /// The 3D engines this program has (model3d/<arch>)
 pub fn engines() -> Vec<nextsycl_model3d::Model3dKind> {
-    vec![nextsycl_model3d_trellis2::kind(), nextsycl_model3d_trellis2::kind_pixal(), nextsycl_model3d_hunyuan3d::kind(), nextsycl_model3d_unirig::kind(),
+    vec![nextsycl_model3d_trellis2::kind(), nextsycl_model3d_trellis2::kind_pixal(), nextsycl_model3d_hunyuan3d::kind(), nextsycl_model3d_unirig::kind(), nextsycl_model3d_skintokens::kind(),
          nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_example::kind()]
 }
 
@@ -300,14 +300,21 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
             let st: Vec<&str> = st.iter().map(String::as_str).collect();
             nextsycl_model3d_unirig::check::run(&e, &dir, &st, opt(args, "--mesh").map(Path::new), &mut log).map_err(|e| e.0)?
         }
+        nextsycl_model3d_skintokens::ARCH => {
+            let e = nextsycl_model3d_skintokens::SkinTokens::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+            let st = stages("encoder,vae,logits,detok,fsq,decoder,weights");
+            let st: Vec<&str> = st.iter().map(String::as_str).collect();
+            nextsycl_model3d_skintokens::check::run(&e, &dir, &st, opt(args, "--mesh").map(Path::new), &mut log).map_err(|e| e.0)?
+        }
         nextsycl_model3d_rignet::ARCH => {
             let e = nextsycl_model3d_rignet::RigNet::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
             let st = stages("joints,root,bones,skin");
             let st: Vec<&str> = st.iter().map(String::as_str).collect();
             nextsycl_model3d_rignet::check::run(&e, &dir, &st, opt(args, "--mesh").map(Path::new), &mut log).map_err(|e| e.0)?
         }
-        a => return Err(format!("check knows {}, {}, {}, {} and {} (not {a})", nextsycl_model3d_hunyuan3d::ARCH_21, nextsycl_model3d_hunyuan3d::ARCH_MINI,
-                                nextsycl_model3d_animateanymesh::ARCH, nextsycl_model3d_unirig::ARCH, nextsycl_model3d_rignet::ARCH)),
+        a => return Err(format!("check knows {}, {}, {}, {}, {} and {} (not {a})", nextsycl_model3d_hunyuan3d::ARCH_21, nextsycl_model3d_hunyuan3d::ARCH_MINI,
+                                nextsycl_model3d_animateanymesh::ARCH, nextsycl_model3d_unirig::ARCH, nextsycl_model3d_skintokens::ARCH,
+                                nextsycl_model3d_rignet::ARCH)),
     };
     println!("worst relative error {worst:.2e}");
     Ok(())

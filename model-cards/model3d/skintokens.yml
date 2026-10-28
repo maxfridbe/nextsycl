@@ -1,0 +1,25 @@
+# SkinTokens / TokenRig (a skeleton and skin weights for a mesh as one token sequence; MIT)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: skintokens
+kind: model3d
+arch: skintokens
+title: 'SkinTokens / TokenRig (a skeleton and skin weights for any mesh, written as one token sequence; MIT)'
+about: VAST-AI, 2026 - one Qwen3-shaped decoder (28 layers, width 896) over a Michelangelo shape encoding writes the skeleton's tokens and then four skin tokens a joint (codes of an FSQ-CVAE's 32,768-entry codebook); the skin VAE's decoder turns a joint's codes into its weights over 54,000 surface samples, carried to the mesh's vertices by the 8 nearest. Beam search with sampling as the demo; float32. The TokenRig checkpoint carries the skin VAE (bfloat16-rounded), so the standalone skin VAE file is optional and unused at inference; both are read as published, without Python
+does: [rig]
+gpus: '0'
+vram_gib: 4.5                    # measured 3.7 GiB at the high point on a B70 rigging a 3.6K-vertex humanoid (the weights 3.0: float32 plus the decoder's bfloat16 copy; the beams' key / value pool grows with longer skeletons)
+env: {}
+files:
+  tokenrig:
+    key: skintokens-tokenrig
+    url: https://huggingface.co/VAST-AI/SkinTokens/resolve/79736cad0fd84de384d5eede659b4ebd24effe33/experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt
+    size: 1131603979
+    sha256: f4e4706a11cfb520cdde65156a0358545e4fbf8f36237aca01ea5e79d5cb5692
+    path: skintokens/experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt
+  skinvae:
+    key: skintokens-skinvae
+    url: https://huggingface.co/VAST-AI/SkinTokens/resolve/79736cad0fd84de384d5eede659b4ebd24effe33/experiments/skin_vae_2_10_32768/last.ckpt
+    size: 487311745
+    sha256: 4843f49e58afff88345806b94ca82e6cc9d8def6e7432e2853c677b154de0ed4
+    path: skintokens/experiments/skin_vae_2_10_32768/last.ckpt
+guide: guides/skintokens.md

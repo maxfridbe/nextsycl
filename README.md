@@ -52,6 +52,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `paddleocr-vl-1.6` | **PaddleOCR-VL** text, tables (HTML), formulas (LaTeX), charts, seals, spotting; the same OCR page | a page: ~1.2 s to see, ~200-250 tok/s written |
 | `olmocr-2-7b-q8` | **olmOCR-2** whole pages to Markdown (tables HTML, equations LaTeX), turned pages righted; the same OCR page | a page: ~3 s to see, ~55 tok/s written |
 | `unirig` | **UniRig** a skeleton and skin weights for any mesh (`model3d.rig`) | a 7.6K-vertex humanoid: 3.2 s |
+| `skintokens` | **SkinTokens (TokenRig)** a skeleton and its skin weights as one token sequence (`model3d.rig`) | a 3.6K-vertex humanoid: 3.0 s |
 | `rignet` | **RigNet** a skeleton and skin weights for a character mesh (`model3d.rig`); its own crate, **GPLv3** as RigNet's code | a 7.6K-vertex humanoid: 0.6 s |
 | `animateanymesh` | **AnimateAnyMesh** a mesh set in motion by a sentence, as morph targets (`model3d.rig` with a prompt) | a 7.6K-vertex humanoid, 16 frames: 2.8 s |
 | `minimax-h3` | **MiniMax H3** video with sound | 896x672, 4.5 s: ~90 s |
