@@ -21,24 +21,26 @@ Each rung is a fresh process (the load, 32-37 s, not counted). Prompts: this rep
 
 | prompt tokens | pp | tg | tokens generated | needle |
 |---:|---:|---:|---:|---|
-| 13 | 13.1 tok/s (1.0 s) | 17.62 tok/s | 256 max | - |
-| 2,533 | 471 tok/s (5.4 s) | 15.64 tok/s | 256 max | - |
-| 9,744 | 691 tok/s (14.1 s) | 17.02 tok/s | 256 max | - |
-| 24,594 | 872 tok/s (28.2 s) | 17.45 tok/s | 256 max | - |
-| 34,776 | 823 tok/s (42.3 s) | 13.98 tok/s | 320 max | found |
-| 134,126 | 935 tok/s (143.4 s) | 8.99 tok/s | 320 max | found |
-| 248,495 | 830 tok/s (299.5 s) | 8.06 tok/s | 320 max | found |
+| 13 | 14.7 tok/s (0.9 s) | 16.5 tok/s | 256 (`--ignore-eos`) | - |
+| 2,533 | 471 tok/s (5.4 s) | 15.6 tok/s | 256 | - |
+| 9,744 | 691 tok/s (14.1 s) | 17.0 tok/s | 256 | - |
+| 24,594 | 872 tok/s (28.2 s) | 17.5 tok/s | 256 | - |
+| 34,776 | 949 tok/s (36.7 s) | 18.9 tok/s | 256 (`--ignore-eos`) | found |
+| 134,126 | 933 tok/s (143.7 s) | 15.2 tok/s | 256 (`--ignore-eos`) | found |
+| 248,495 | 828 tok/s (300.1 s) | 18.0 tok/s | 256 (`--ignore-eos`) | found |
 
-One run of each rung. tg is the average over the tokens generated (up to 256 or 320), which are the model's own answer
-to that prompt: a short answer such as the secret code alone (the 134K and 248K rungs) is a few tokens, so its tg is the
-least certain.
+One run of each rung. tg is the average over 256 generated tokens. On the needle prompts the model answers with the code
+alone (11-37 tokens); those answers were first measured as they came (tg 14.0, 9.0 and 8.1 tok/s at 35K, 134K and 248K)
+and are not a decode rate - a dozen tokens include the first token's wait - so those rungs were re-run with
+`--ignore-eos` to generate 256 tokens. Past the end token the text is not an answer, and drafts of it may be accepted
+more or less often than a real answer's: read those four tg figures as indicative.
 
 ## Reading it
 
-- **pp** climbs from 471 tok/s at 2.5K to ~870-935 tok/s from 25K on and holds near 830 at 248K: a 256K prompt reads in 5 minutes.
-- **tg** is 15.6-17.6 tok/s to 25K tokens, 14.0 at 35K, 9.0 at 134K and 8.1 at 248K. Attention over a long context, not the
-  experts, is what slows it past 35K.
-- The same card at an 8K context (a shorter KV reserve, so more experts in VRAM) generated at 19-20 tok/s over 512 tokens
-  of its own prose; the 17.6 here at 13 prompt tokens is the 256K context's reserve showing.
+- **pp** climbs from 471 tok/s at 2.5K to ~870-950 tok/s from 25K on and holds at 828 at 248K: a 256K prompt reads in 5 minutes.
+- **tg** is 15-19 tok/s at every depth from 13 to 248K tokens. The differences between rungs (15.2 at 134K, 18.9 at 35K,
+  18.0 at 248K) are within what the prompt and the drafts' acceptance move, so no trend with context is shown.
+- The same cards at an 8K context (a shorter KV reserve, so more experts in VRAM) generated at 19-20 tok/s over 512 tokens
+  of prose.
 - The secret code was found at 35K, 134K and 248K tokens.
 - The cards' arenas peaked at 3.3 and 3.8 GiB on the 248K prompt; no request went past them.
