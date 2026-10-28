@@ -940,6 +940,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextsycl-llm-minimaxm3"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-gguf",
+]
+
+[[package]]
 name = "nextsycl-llm-museglimmer"
 version = "0.0.0"
 dependencies = [
