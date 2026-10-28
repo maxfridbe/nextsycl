@@ -8,7 +8,7 @@ members = [
     "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl",
     "crates/mesh", "crates/remover", "crates/codec12hz",
     "model3d/contract",
-    "model3d/example", "model3d/hunyuan3d", "model3d/animateanymesh", "model3d/unirig", "model3d/rignet", "model3d/trellis2",
+    "model3d/example", "model3d/hunyuan3d", "model3d/animateanymesh", "model3d/unirig", "model3d/skintokens", "model3d/rignet", "model3d/trellis2",
     "llm/contract", "llm/glm5next", "llm/qwen4exp", "llm/qwen35", "llm/deepseek2", "llm/deepseek4", "llm/deepseek41", "llm/museglimmer", "llm/nemotronh", "llm/example",
     "image/contract", "image/example", "image/qwenimage21", "image/unlimitedocr", "image/paddleocrvl", "image/olmocr2", "image/hunyuanimage21", "image/starvector", "image/upscale", "image/mingimage", "image/mossimage",
     "video/contract", "video/example", "video/h3",
@@ -73,6 +73,7 @@ nextsycl-model3d-example = { path = "model3d/example" }
 nextsycl-model3d-hunyuan3d = { path = "model3d/hunyuan3d" }
 nextsycl-model3d-animateanymesh = { path = "model3d/animateanymesh" }
 nextsycl-model3d-unirig = { path = "model3d/unirig" }
+nextsycl-model3d-skintokens = { path = "model3d/skintokens" }
 nextsycl-model3d-rignet = { path = "model3d/rignet" }
 nextsycl-model3d-trellis2 = { path = "model3d/trellis2" }
 nextsycl-models = { path = "glue/models" }

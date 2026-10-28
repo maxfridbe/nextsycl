@@ -1,0 +1,13 @@
+[package]
+name = "nextsycl-model3d-skintokens"
+description = "SkinTokens / TokenRig: a skeleton and its skin weights for a mesh, written as one autoregressive token sequence (a Qwen3-shaped decoder over a Michelangelo shape encoding, an FSQ-CVAE skin decoder), on Intel Arc (SYCL)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-model3d.workspace = true
+serde_json.workspace = true

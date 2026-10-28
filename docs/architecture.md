@@ -83,6 +83,7 @@ model3d/                   3D
   animateanymesh nextsycl-model3d-animateanymesh  AnimateAnyMesh: a mesh set in motion by a sentence (CLIP-L, DyMeshVAE,
                                  a rectified-flow MMDiT), morph targets; stage checks
   unirig     nextsycl-model3d-unirig   UniRig: a skeleton (Michelangelo encoder, OPT decoder) and skin weights (PTv3)
+  skintokens nextsycl-model3d-skintokens SkinTokens / TokenRig: a skeleton and skin weights as one token sequence (Qwen3-shaped decoder, FSQ-CVAE)
   rignet     nextsycl-model3d-rignet   RigNet (GPLv3, its own crate): a skeleton and skin weights from graph networks
   trellis2   nextsycl-model3d-trellis2  TRELLIS.2 and Pixal3D (arch pixal3d): DINOv3, the flow DiTs, the sparse
                                  decoders, the dual-grid mesh, the PBR bake, stage checks
@@ -498,6 +499,13 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   host side: the skeleton grammar, transformers 4.51's beam search with sampling, the voxel prior (voxelization on
   rays, Dijkstra from each joint, threads), the serialization codes, reskinning. Its silo runs the attention as two
   oneDNN products. Settings: `NS_M3D_UNIRIG_BEAMS` (`--opt-beams`), `NS_M3D_UNIRIG_PROFILE`.
+- **skintokens** - SkinTokens / TokenRig from its Lightning checkpoint (which carries the skin VAE), read without Python,
+  float32. Its kernels (`kernels/model3d/skintokens`): layer and RMS norms, GELU / sigmoid, SwiGLU, Qwen3's per-head q / k
+  norms with the rotary embedding (writing the keys and values to the beams' slot pool), grouped-query attention (dense,
+  with any strides; and a decode step's over the slot pool), gathers; the linear layers are the shared kernels' float32
+  oneDNN product. The host side: the sampler, the skeleton grammar and the skin phase's switch, transformers' beam search
+  with sampling, the FSQ codes, the 8-nearest-sample carry to the vertices. Settings: `NS_M3D_SKINTOKENS_BEAMS`
+  (`--opt-beams`), `NS_M3D_SKINTOKENS_SKIN_END` (`--opt-skin-end`).
 - **rignet** - RigNet (GPLv3, its own crate) from the authors' trained_models.zip (the checkpoints inflated at load,
   the legacy torch format read by `nextsycl_gguf::pth`). Its networks on the GPU (`kernels/model3d/rignet`: EdgeConv
   gathers and max-aggregation, global pooling; eval BatchNorm as a per-channel affine after each ReLU), the geometry on

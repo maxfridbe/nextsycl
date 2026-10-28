@@ -49,6 +49,7 @@ nextsycl-model3d-example.workspace = true
 nextsycl-model3d-hunyuan3d.workspace = true
 nextsycl-model3d-animateanymesh.workspace = true
 nextsycl-model3d-unirig.workspace = true
+nextsycl-model3d-skintokens.workspace = true
 nextsycl-model3d-rignet.workspace = true
 nextsycl-model3d-trellis2.workspace = true
 nextsycl-models.workspace = true
