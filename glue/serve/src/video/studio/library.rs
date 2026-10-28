@@ -6,7 +6,7 @@ use std::process::Command;
 
 use serde_json::{json, Map, Value};
 
-use super::queue::{dialogue_of, label_number, label_prefix, project_of, s, Queue};
+use super::queue::{clip_number, dialogue_of, label_prefix, project_of, s, Queue};
 use super::runner::snap_seconds;
 use super::{now, pyround, RpcError, Studio};
 
@@ -179,7 +179,7 @@ impl Studio {
             if !belongs(j) || !self.out.join(format!("{stem}.mp4")).exists() {
                 continue;
             }
-            let n = label_number(&s(j, "label")).unwrap_or(0);
+            let n = clip_number(j);
             if !seen.insert(n) {
                 continue;
             }
@@ -191,7 +191,7 @@ impl Studio {
             if project_of(it) != project {
                 continue;
             }
-            let n = label_number(&s(it, "label")).unwrap_or(0);
+            let n = clip_number(it);
             if !seen.insert(n) {
                 continue;
             }

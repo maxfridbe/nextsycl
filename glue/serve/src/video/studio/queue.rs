@@ -59,6 +59,16 @@ pub fn label_number(label: &str) -> Option<u64> {
     None
 }
 
+/// A clip's place in the edit: its label's "NN/MM" number, else the pass number the creative platform puts after the
+/// `#` of its `reentrant_id` ("<run>:shots:0:0#17" is the 17th; its labels, "<run>:shots:0:017", carry no "NN/MM"), else 0.
+pub fn clip_number(item: &Value) -> u64 {
+    label_number(&s(item, "label")).or_else(|| {
+        let id = s(item, "reentrant_id");
+        let tail = id.rsplit_once('#')?.1;
+        tail.chars().all(|c| c.is_ascii_digit()).then(|| tail.parse().ok()).flatten()
+    }).unwrap_or(0)
+}
+
 /// The project an item belongs to: its own, or its label's series.
 pub fn project_of(item: &Value) -> String {
     let p = s(item, "project");
@@ -514,6 +524,17 @@ mod tests {
         assert_eq!(project_of(&json!({"label": "x", "project": "P"})), "P");
         assert_eq!(dialogue_of("says: <d>[English] First   batch.</d> then <d>[English] More.</d>"), "First batch. / More.");
         assert_eq!(clean_label("a<b>c 01/02: ok"), "abc 01/02: ok");
+    }
+
+    #[test]
+    fn the_creative_platforms_clips_are_numbered_by_their_pass() {
+        let c = |label: &str, id: Value| json!({"label": label, "reentrant_id": id});
+        // labels without "NN/MM": the pass after the # (all were 0, so a timeline kept one clip of the project)
+        assert_eq!(clip_number(&c("a2c6221e-bde2:shots:0:016", json!("a2c6221e-bde2:shots:0:0#16"))), 16);
+        assert_eq!(clip_number(&c("a2c6221e-bde2:shots:0:017", json!("a2c6221e-bde2:shots:0:0#17"))), 17);
+        assert_eq!(clip_number(&c("Name 03/12: x", json!("r#9"))), 3, "a label's number comes first");
+        assert_eq!(clip_number(&c("cp-smoke:shots:0:0", Value::Null)), 0);
+        assert_eq!(clip_number(&c("x", json!("r#x1"))), 0);
     }
 
     #[test]
