@@ -1,6 +1,6 @@
 //! MiniMax-M3.1-Flash's geometry (`minimax-m3.*` metadata) and its tensors by role, checked against a file's shapes.
-//! A split GGUF keeps the metadata in shard 1 (no tensors) and the tensors in the shards after it: open shard 1 with
-//! the others as extras (`Gguf::open_with`).
+//! A split GGUF keeps the metadata in shard 1 (no tensors) and the tensors in the shards after it: `Gguf::open` on
+//! shard 1 follows the split metadata to the others.
 
 use nextsycl_gguf::{GType, Gguf};
 
@@ -138,9 +138,11 @@ impl Geometry {
     }
 }
 
-/// The row types UD-IQ1_M uses (experts IQ1_M gate/up, IQ3_XXS down; the rest Q4_K, Q5_K, Q6_K, F32); the other quants
-/// of the repo add IQ2_XXS, Q2_K, Q3_K, IQ3_S, Q4_K, Q8_0
-pub const SUPPORTED: &[GType] = &[GType::F32, GType::Q4K, GType::Q5K, GType::Q6K, GType::IQ1M, GType::IQ3XXS];
+/// The row types UD-IQ1_M uses, read from the file (the test prints them by role): experts gate/up IQ1_M (28 layers) or
+/// IQ2_XXS (29), down IQ3_XXS (54) or IQ4_XS (3); attention and the shared expert Q5_K with a layer in Q6_K, the dense
+/// layers' FFN Q5_K and Q6_K/Q8_0, embeddings and head Q4_K; norms, the router and the indexer F32. The other quants of
+/// the repo change these per layer.
+pub const SUPPORTED: &[GType] = &[GType::F32, GType::Q4K, GType::Q5K, GType::Q6K, GType::Q8_0, GType::IQ1M, GType::IQ2XXS, GType::IQ3XXS, GType::IQ4XS];
 
 #[cfg(test)]
 mod tests {
@@ -150,13 +152,26 @@ mod tests {
     #[test]
     fn the_file_matches_the_description() {
         let Ok(p) = std::env::var("NS_MM31_FILE") else { return };
-        let p = std::path::PathBuf::from(p);
-        let dir = p.parent().unwrap();
-        let mut extra: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|x| x.extension().is_some_and(|e| e == "gguf") && *x != p).collect();
-        extra.sort();
-        let g = Gguf::open_with(&p, &extra).unwrap();
+        // the loader follows the split metadata to the other shards
+        let g = Gguf::open(std::path::Path::new(&p)).unwrap();
         let geo = Geometry::from_gguf(&g).unwrap();
         assert_eq!((geo.n_layer, geo.n_embd, geo.n_expert, geo.n_expert_used, geo.n_dense), (60, 6144, 128, 4, 3));
+        // the row types by role over the layers (what the engine needs kernels for)
+        let mut roles: std::collections::BTreeMap<String, std::collections::BTreeMap<&str, u32>> = Default::default();
+        for l in 0..geo.n_layer {
+            for (name, _) in geo.layer_tensors(l) {
+                let role = name.replacen(&format!("blk.{l}."), "blk.N.", 1);
+                if let Some(t) = g.tensor(&name) {
+                    *roles.entry(role).or_default().entry(t.ty.name()).or_default() += 1;
+                }
+            }
+        }
+        for (role, types) in &roles {
+            eprintln!("{role:32} {types:?}");
+        }
+        for n in ["token_embd.weight", "output.weight"] {
+            eprintln!("{n:32} {}", g.tensor(n).map_or("missing", |t| t.ty.name()));
+        }
         geo.check(&g).unwrap();
     }
 }

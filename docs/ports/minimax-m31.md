@@ -20,7 +20,7 @@ serving).
   The metadata gives the sizes only; **the scoring (how heads combine, whether RoPE applies, how the causal edge block
   is handled) is not in the file** - take it from the reference implementation (the model repo's modeling code and
   llama.cpp's `minimax-m3` graph) and check against it before writing a kernel.
-- Types in UD-IQ1_M (shard 2's table): experts gate/up IQ1_M, down IQ3_XXS; attention Q5_K/Q4_K; dense and shared FFN
+- Types in UD-IQ1_M (the file, by role: `NS_MM31_FILE=... cargo test -p nextsycl-llm-minimaxm3 -- --nocapture` prints them): experts gate/up IQ1_M (28 layers) or IQ2_XXS (29), down IQ3_XXS (54) or IQ4_XS (3); attention Q5_K (one layer Q6_K); dense and shared FFN
   Q5_K/Q6_K; embeddings and head Q4_K; norms and the indexer F32. The other quants of the repo (IQ2_XXS, Q2_K_XL, IQ3_*,
   Q3_K_XL, Q4_K_XL, Q8_K_XL) change the expert/attention types per layer, as DeepSeek V4.1's did.
 - A DSpark draft exists (`dspark-MiniMax-M3.1-Flash-Q8_0.gguf`, 2 GB; llama.cpp `draft-dspark`, one draft token: ~1.5x
