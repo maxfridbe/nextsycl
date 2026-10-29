@@ -99,7 +99,7 @@ The llm kind's common options (`nextsycl_llm::COMMON_OPTIONS`); what each engine
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
-| `NS_PROFILE` | off | Time the passes by section (1: GPU synced at each boundary; gpu: device timestamps, no syncs; deepseek2: 1 its decode passes, prompt its prompt passes) (--opt-profile) | llm glm5next, llm qwen35 (NS_Q35_PROFILE needs gpu), llm deepseek2, kernels:ns (gpu: profiling queues) |
+| `NS_PROFILE` | off | Time the passes by section (1: GPU synced at each boundary; gpu: device timestamps, no syncs; deepseek2: 1 its decode passes, prompt its prompt passes) (--opt-profile) | llm glm5next, llm qwen35 (NS_Q35_PROFILE needs gpu), llm deepseek2, llm minimaxm3, kernels:ns (gpu: profiling queues) |
 | `NS_SPLIT` | even by layer count (glm5next); planned by free VRAM (qwen4exp, qwen35) | Layers per GPU. glm5next: A,B,... layer counts of each GPU but the last; qwen4exp, qwen35: the first layer of each GPU after the first (same for two GPUs) (--opt-split) | llm glm5next, llm qwen4exp, llm qwen35 |
 | `NS_VRAM_GUARD_GIB` | glm5next: off; qwen4exp: 1.5 | VRAM (GiB) to keep free. glm5next: a prompt read stops with an error once a GPU has less free after a chunk; qwen4exp: the load plan's margin a GPU (--opt-vram-guard-gib) | llm glm5next, llm qwen4exp; cli (passes it to the container) |
 
@@ -295,12 +295,15 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_WFE_FROM_DISK` | unset: the front ends are read from inside the binary | `1`: read the pages and modules from `dist/wfe` instead of the embedded copy (edit a page and reload, no rebuild) | serve, studio, image/audio/model3d servers |
 | `NS_WFE_DIST` | `dist/wfe` beside the repository | build time: the directory `glue/serve/build.rs` embeds into the binary | build |
 | `CARGO_MANIFEST_DIR`, `OUT_DIR` | set by cargo | where `glue/serve/build.rs` finds the repository and writes the list of embedded front-end files | build |
-| `NS_MM31_CHUNK` | 512 | The minimaxm3 engine's prompt pass rows (--opt-chunk) | llm:minimaxm3 |
+| `NS_MM31_CHUNK` | 4096 | The minimaxm3 engine's prompt pass rows: every pass reads the experts that are off the cards once, so a wider pass reads less per token (--opt-chunk) | llm:minimaxm3 |
 | `NS_MM31_SPARSE_ALL` | 0 | 1: the minimaxm3 engine's first three layers take the sparse-attention indexer too (the model config says every layer is sparse; llama.cpp's graph leaves them dense, the reference) (--opt-sparse-all) | llm:minimaxm3 |
 | `NS_MM31_VRAM_GIB` | per card: free VRAM less the 1.5 GiB arena, the sessions' caches (the load's token count x 138 KB) and 2.5 GiB | The minimaxm3 engine's budget, per card, for routed experts kept in VRAM (placed at load, hottest first by the expert profile; the rest are read from the file for each pass) (--opt-vram-gib) | llm:minimaxm3 |
 | `NS_MM31_PIN_GIB` | MemAvailable less 16 GiB, at most 32 (in all, shared by the cards in proportion to what their VRAM cannot hold) | The minimaxm3 engine's budget for routed experts kept in pinned host memory (the kernels read them over PCIe) (--opt-pin-gib) | llm:minimaxm3 |
 | `NS_MM31_SPLIT` | half the layers | With two GPUs, how many layers the first runs (the minimaxm3 engine's layer split) (--opt-split) | llm:minimaxm3 |
 | `NS_MM31_DIRECT` | 1 | 0: the minimaxm3 engine reads experts from the file through the page cache; 1: with O_DIRECT, many reads in flight (--opt-direct) | llm:minimaxm3 |
+| `NS_MM31_AHEAD` | 3 | Decode: how many experts of the next layer the minimaxm3 engine guesses (that layer's router on this layer's residual stream) and starts reading while this layer computes; 0 = none, at most 12 (--opt-ahead) | llm:minimaxm3 |
+| `NS_MM31_STREAM_DIR` | unset | A directory on another drive for the minimaxm3 engine: a copy of a share of the experts the cards do not keep is written there once (`mm31-stream-<hash>.bin`, ~17 GiB) and read beside the model's own file, so the misses of a pass come from two drives at once (--opt-stream-dir) | llm:minimaxm3 |
+| `NS_MM31_STREAM_SHARE` | 50 | With `NS_MM31_STREAM_DIR`, the percentage of the off-card experts read from that drive (--opt-stream-share) | llm:minimaxm3 |
 | `NS_MM31_FORCE` | unset | Debug: a llama.cpp dump's directory (`nextsycl llm check`): after each layer the minimaxm3 engine's hidden state is replaced by the dump's `l_out-N`, so every layer is checked on the reference's own input | llm:minimaxm3 |
 | `NS_MM31_FILE` | unset: the test is skipped | the first shard of a MiniMax-M3.1-Flash GGUF: `cargo test -p nextsycl-llm-minimaxm3` checks the file against the model description | test minimaxm3 |
 | `NS_Q3T_EAGER` | 0 | 1: the silo's frame launched kernel by kernel, not replayed as a recorded graph (the A/B for the graph) | audio qwen3tts |

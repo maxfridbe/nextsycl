@@ -39,7 +39,7 @@ fn e(x: impl std::fmt::Display) -> Error {
 
 /// Tokens a prompt pass takes (NS_MM31_CHUNK)
 pub fn prefill_chunk() -> usize {
-    std::env::var("NS_MM31_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|v: &usize| *v > 0).unwrap_or(512)
+    std::env::var("NS_MM31_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|v: &usize| *v > 0).unwrap_or(4096)
 }
 
 /// NS_MM31_SPARSE_ALL=1: the first three layers take the indexer too (the model's config says every layer is sparse;
@@ -448,8 +448,11 @@ pub struct MiniMax<'g> {
     pf: bool,
     lay: Mutex<[Vec<[f64; NCAT]>; 2]>,
     cur_wide: std::sync::atomic::AtomicBool,
+    stage_ok: std::sync::atomic::AtomicBool,
     /// profile: decode-width expert products by where the expert was (VRAM, pinned, staging): seconds, count
     src_t: Mutex<[(f64, u64); 3]>,
+    /// profile: one-token expert stages (gate, up, swiglu + quantize, down, scatter), seconds and bytes of weights read
+    stage_t: Mutex<[f64; 6]>,
     /// passes of one token, and the seconds they took (profile)
     pf_tokens: Mutex<(usize, f64)>,
 }
@@ -953,7 +956,9 @@ impl<'g> MiniMax<'g> {
             pf: std::env::var("NS_PROFILE").is_ok_and(|v| v == "1"),
             lay: Mutex::new([vec![[0.0; NCAT]; 64], vec![[0.0; NCAT]; 64]]),
             cur_wide: false.into(),
+            stage_ok: (std::env::var("NS_PROFILE").is_ok_and(|v| v == "1")).into(),
             src_t: Mutex::new([(0.0, 0); 3]),
+            stage_t: Mutex::new([0.0; 6]),
             pf_tokens: Mutex::new((0, 0.0)),
         })
     }
@@ -993,6 +998,8 @@ impl<'g> MiniMax<'g> {
             let st = self.src_t.lock().unwrap();
             v.push(format!("[decode expert products, each timed alone to the GPU: VRAM {:.2} ms x {}, pinned {:.2} ms x {}, staged from the file {:.2} ms x {}]",
                            1e3 * st[0].0 / st[0].1.max(1) as f64, st[0].1, 1e3 * st[1].0 / st[1].1.max(1) as f64, st[1].1, 1e3 * st[2].0 / st[2].1.max(1) as f64, st[2].1));
+            let sg = self.stage_t.lock().unwrap();
+            v.push(format!("[one-token expert stages, seconds in all: gate {:.3}, up {:.3}, swiglu+quantize {:.3}, down {:.3}, scatter {:.3}]", sg[0], sg[1], sg[2], sg[3], sg[4]));
             let lay = self.lay.lock().unwrap();
             let (n, secs) = *self.pf_tokens.lock().unwrap();
             for (name, tab) in [("one-token passes", &lay[0]), ("wider passes", &lay[1])] {
@@ -1246,6 +1253,68 @@ impl<'g> MiniMax<'g> {
         Ok(out)
     }
 
+    /// The one-token form of `expert_compute`: the activation quantized once for the layer (`xq`), the expert's weight and rank
+    /// read by the kernel from `meta` (ids, weights and ranks of the layer's picks, one upload), so an expert is five launches
+    #[allow(clippy::too_many_arguments)]
+    fn expert_compute1(&self, cd: &Card, m: &Moe, base: *const u8, xq: &DevBuf, ys: &DevBuf, plane: usize, meta: &DevBuf, used: usize, rank: usize) -> Result<()> {
+        let c = self.g.n_embd as usize;
+        let fe = m.gate.rows;
+        let (off_up, off_down, _) = m.layout();
+        let a = &cd.arena;
+        let raw = cd.gpu.raw();
+        let mk = a.mark();
+        let gt = a.f32(fe)?;
+        let up = a.f32(fe)?;
+        let eo = a.f32(c)?;
+        let mut tt = Instant::now();
+        let mut lapx = |i: usize| {
+            if self.pf && self.stage_ok.load(Relaxed) {
+                let _ = cd.gpu.sync();
+                self.stage_t.lock().unwrap()[i] += tt.elapsed().as_secs_f64();
+                tt = Instant::now();
+            }
+        };
+        self.mmvq_at(cd, m.gate.ty, base, xq, c, fe, 1, &gt)?;
+        lapx(0);
+        // SAFETY: base + off_up is inside the slot (total bytes).
+        self.mmvq_at(cd, m.up.ty, unsafe { base.add(off_up) }, xq, c, fe, 1, &up)?;
+        lapx(1);
+        // SAFETY: gt, up hold fe floats.
+        ffi::check(unsafe { (self.k.swiglu_oai)(raw, gt.fp(), up.fp(), gt.fp(), fe as i64, 1.702, 7.0) }, "swiglu_oai")?;
+        let hq = self.quantize(cd, &gt, 1, fe)?;
+        lapx(2);
+        // SAFETY: base + off_down is inside the slot.
+        self.mmvq_at(cd, m.down.ty, unsafe { base.add(off_down) }, &hq, fe, c, 1, &eo)?;
+        lapx(3);
+        // meta: `used` ids (all 0), `used` weights, `used` ranks; this pick's entry of each
+        // SAFETY: the three arrays hold `used` entries each and rank < used; ys holds `used` planes.
+        unsafe {
+            let p = meta.ptr().cast::<u8>();
+            let (ids, ws, rks) = (p.cast::<i32>().cast_const(), p.add(used * 4).cast::<f32>().cast_const(), p.add(used * 8).cast::<i32>().cast_const());
+            ffi::check((self.k.scatter_rank)(raw, ys.fp(), eo.fp(), ids, ws.add(rank), rks.add(rank), 1, c as i64, plane as i64), "scatter_rank")?;
+        }
+        lapx(4);
+        a.rewind(mk);
+        Ok(())
+    }
+
+    /// `dense` for one token whose activation is already quantized (`xq`): the gate and up products straight from it
+    fn dense_q(&self, cd: &Card, d: &Dense, x: &DevBuf, xq: &DevBuf) -> Result<DevBuf> {
+        let a = &cd.arena;
+        let f = d.gate.rows;
+        let gt = a.f32(f)?;
+        let up = a.f32(f)?;
+        let c = d.gate.cols;
+        self.mmvq_at(cd, d.gate.ty, d.gate.buf.ptr().cast::<u8>().cast_const(), xq, c, f, 1, &gt)?;
+        self.mmvq_at(cd, d.up.ty, d.up.buf.ptr().cast::<u8>().cast_const(), xq, c, f, 1, &up)?;
+        let _ = x;
+        // SAFETY: gt, up hold f floats.
+        ffi::check(unsafe { (self.k.swiglu_oai)(cd.gpu.raw(), gt.fp(), up.fp(), gt.fp(), f as i64, 1.702, 7.0) }, "swiglu_oai")?;
+        let out = a.f32(d.down.rows)?;
+        self.matmul(cd, &d.down, &gt, 1, &out)?;
+        Ok(out)
+    }
+
     /// One expert's three products for the `list` of (token, weight), added into `y` (queued on the card; no wait)
     fn expert_compute(&self, cd: &Card, m: &Moe, base: *const u8, x: &DevBuf, ys: &DevBuf, plane: usize, list: &[(i32, f32, i32)]) -> Result<()> {
         let c = self.g.n_embd as usize;
@@ -1393,6 +1462,26 @@ impl<'g> MiniMax<'g> {
             self.counts.ahead_wanted.fetch_add(wanted as u64, Relaxed);
             self.counts.ahead_used.fetch_add(pre.len() as u64, Relaxed);
         }
+        // one token: the activation quantized once for the shared expert and every pick, the picks' ids / weights / ranks in one upload
+        let one = if t == 1 && [&m.gate, &m.up, &m.down].iter().all(|w| self.mmvq_ok(w.ty, w.cols)) && self.mmvq_ok(m.shared.gate.ty, m.shared.gate.cols)
+            && self.mmvq_ok(m.shared.up.ty, m.shared.up.cols) {
+            let xq = self.quantize(cd, x, 1, c)?;
+            let meta = a.bytes(used * 12)?;
+            let mut mb = Vec::with_capacity(used * 12);
+            mb.extend(std::iter::repeat_n(0i32, used).flat_map(|v| v.to_le_bytes()));
+            mb.extend(wts.iter().flat_map(|w| w.to_le_bytes()));
+            mb.extend((0..used as i32).flat_map(|r| r.to_le_bytes()));
+            meta.write_async(0, &mb)?;
+            Some((xq, meta))
+        } else {
+            None
+        };
+        let run = |base: *const u8, ex: usize| -> Result<()> {
+            match &one {
+                Some((xq, meta)) => self.expert_compute1(cd, m, base, xq, &ys, plane, meta, used, per[ex][0].2 as usize),
+                None => self.expert_compute(cd, m, base, x, &ys, plane, &per[ex]),
+            }
+        };
         let slot = cd.slot;
         let total = m.layout().2;
         let mut xi = 0usize;
@@ -1413,7 +1502,10 @@ impl<'g> MiniMax<'g> {
         let mut wait = 0.0;
         let mut inflight: Option<Reads> = (!waves.is_empty()).then(|| issue(0));
         // the shared expert and the experts already on the card run while the file is read
-        let sh = self.dense(cd, &m.shared, x, t)?;
+        let sh = match &one {
+            Some((xq, _)) => self.dense_q(cd, &m.shared, x, xq)?,
+            None => self.dense(cd, &m.shared, x, t)?,
+        };
         for &ex in &hot {
             let r = cd.res[li][ex].as_ref().unwrap();
             let te = Instant::now();
@@ -1427,7 +1519,7 @@ impl<'g> MiniMax<'g> {
                 tgt.copy_within(0, &r.buf, 0, total)?;
                 tgt.ptr().cast::<u8>().cast_const()
             };
-            self.expert_compute(cd, m, base, x, &ys, plane, &per[ex])?;
+            run(base, ex)?;
             if self.pf && t <= 8 {
                 cd.gpu.sync()?;
                 let mut st = self.src_t.lock().unwrap();
@@ -1463,7 +1555,7 @@ impl<'g> MiniMax<'g> {
             let tgt = cd.xfer.view((xi % 2) * slot, total)?;
             xi += 1;
             tgt.copy_within(0, &sv, 0, total)?;
-            self.expert_compute(cd, m, tgt.ptr().cast::<u8>().cast_const(), x, &ys, plane, &per[ex])?;
+            run(tgt.ptr().cast::<u8>().cast_const(), ex)?;
             used_slots.push(slot_i);
         }
         for k in 0..waves.len() {
@@ -1485,7 +1577,7 @@ impl<'g> MiniMax<'g> {
                 tgt.copy_within(0, &sv, 0, total)?;
                 let base = tgt.ptr().cast::<u8>().cast_const();
                 let te = Instant::now();
-                self.expert_compute(cd, m, base, x, &ys, plane, &per[ex])?;
+                run(base, ex)?;
                 if self.pf && t <= 8 {
                     cd.gpu.sync()?;
                     let mut st = self.src_t.lock().unwrap();
