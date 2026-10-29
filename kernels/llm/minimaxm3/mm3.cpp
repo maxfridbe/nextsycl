@@ -45,6 +45,17 @@ int ns_llm_minimaxm3_swiglu_oai(ns_gpu* g, const float* gate, const float* up, f
     NS_CATCH
 }
 
+int ns_llm_minimaxm3_scatter_rank(ns_gpu* g, float* ys, const float* eo, const int32_t* tok, const float* w, const int32_t* rank, int64_t n, int64_t C,
+                                  int64_t plane) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<1>((size_t) (n * C)), [=](sycl::id<1> id) {
+        const int64_t k = id[0], i = k / C, j = k % C;
+        ys[(int64_t) rank[i] * plane + (int64_t) tok[i] * C + j] = w[i] * eo[k];
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_llm_minimaxm3_idx_scores(ns_gpu* g, const float* iq, const uint16_t* ik, float* bs, int64_t T, int64_t G, int64_t nblk, int64_t pos0, int64_t local) {
     NS_TRY
     g->q.submit([&](sycl::handler& h) {

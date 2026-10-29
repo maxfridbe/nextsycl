@@ -33,9 +33,14 @@ impl std::error::Error for Error {}
 pub type ModelResult<T> = std::result::Result<T, Error>;
 
 pub const OPTIONS: &[EngineOption] = &[
-    EngineOption { name: "chunk", env: "NS_MM31_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 512)", at: At::Load },
-    EngineOption { name: "vram-gib", env: "NS_MM31_VRAM_GIB", value: "GIB", help: "VRAM the kept experts may take (default: what is free after the sessions' caches and a spare)", at: At::Load },
-    EngineOption { name: "pin-gib", env: "NS_MM31_PIN_GIB", value: "GIB", help: "pinned host memory for more kept experts (default a third of what is available, at most 24)", at: At::Load },
+    EngineOption { name: "chunk", env: "NS_MM31_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 4096: every pass streams the experts that are off the cards once)", at: At::Load },
+    EngineOption { name: "vram-gib", env: "NS_MM31_VRAM_GIB", value: "GIB", help: "VRAM a card may fill with kept experts (default: what is free after the arena, the sessions' caches and a spare)", at: At::Load },
+    EngineOption { name: "pin-gib", env: "NS_MM31_PIN_GIB", value: "GIB", help: "pinned host memory, in all, for more kept experts (default: what is available less 16, at most 32)", at: At::Load },
+    EngineOption { name: "split", env: "NS_MM31_SPLIT", value: "LAYERS", help: "with two GPUs, the layers on the first (default: half)", at: At::Load },
+    EngineOption { name: "direct", env: "NS_MM31_DIRECT", value: "0|1", help: "read experts from the file with O_DIRECT (default 1; 0: through the page cache)", at: At::Load },
+    EngineOption { name: "ahead", env: "NS_MM31_AHEAD", value: "N", help: "decode: experts of the next layer guessed and read ahead (default 3, at most 12; 0 = none)", at: At::Load },
+    EngineOption { name: "stream-dir", env: "NS_MM31_STREAM_DIR", value: "DIR", help: "a directory on another drive: a copy of a share of the experts that are off the cards is written there once and read beside the model's file", at: At::Load },
+    EngineOption { name: "stream-share", env: "NS_MM31_STREAM_SHARE", value: "PERCENT", help: "with stream-dir, the share of the off-card experts read from that drive (default 50)", at: At::Load },
     EngineOption { name: "sparse-all", env: "NS_MM31_SPARSE_ALL", value: "0|1", help: "the first three layers take the indexer too (default 0: llama.cpp's graph)", at: At::Load },
 ];
 
@@ -55,7 +60,7 @@ fn info(f: &Gguf) -> std::result::Result<String, String> {
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {
-    Ok(Box::new(engine::MiniMax::load(f, gpus, o.kv, log)?))
+    Ok(Box::new(engine::MiniMax::load(f, gpus, o, log)?))
 }
 
 impl SessionState for engine::Session {
@@ -184,6 +189,12 @@ impl Engine for engine::MiniMax<'_> {
 
     fn gpu_info(&self) -> Vec<GpuInfo> {
         engine::MiniMax::gpu_info(self)
+    }
+    fn expert_stats(&self) -> nextsycl_llm::ExpertStats {
+        engine::MiniMax::expert_stats(self)
+    }
+    fn save_profile(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        engine::MiniMax::save_expert_profile(self, path)
     }
     fn report(&self, _tokens: usize) -> Vec<String> {
         self.profile_lines()

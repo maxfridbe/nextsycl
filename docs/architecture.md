@@ -321,6 +321,21 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   logit, logits cosine 0.999997; a token fed alone after the rest gives the same logits as the prompt at once. B65 +
   B70: decode 18.2 tok/s, prompt 27 tok/s (58 tokens).
 
+- **minimaxm3** - MiniMax-M3.1-Flash (`minimax-m3`, llama.cpp's graph): 60 layers (3 dense SwiGLU-OAI, 57 MoE with 128
+  experts, top 4 by sigmoid + selection bias, one shared expert), GQA 64/4 heads of 128 with per-head q/k norms and
+  MiniMax Sparse Attention (a 4-head indexer scores key blocks of 128, a query attends its best 16 blocks plus its own).
+  Its own kernels (`kernels/llm/minimaxm3/mm3.cpp`): rope, SwiGLU-OAI, the indexer scores and top-K, the sparse attend, the
+  rank-ordered expert sum; the silo (`silo/attn.cpp`) holds the prompt-pass attention (a work-group a query row and kv
+  group, 64-key tiles shared by the 16 heads); the dequant / GEMM / mmvq are glm5next's generic kernels. The 111 GiB of
+  routed experts (IQ1_M / IQ2_XXS up, IQ3_XXS / IQ4_XS down) cannot lie on the cards, so each card (layers split evenly)
+  keeps what its VRAM budget allows, then a pinned host tier, and the rest is read from the file with O_DIRECT in waves
+  (12 reader threads a card to place, 3 a missed expert at run time), a share of it from a second drive's copy
+  (`NS_MM31_STREAM_DIR`) and the next layer's guessed experts (its router on this layer's residual) read ahead. Pinned and
+  file-read experts are copied into VRAM before their products (a product reading pinned memory in place ran 5.8 ms, in
+  VRAM 0.3 ms), and the expert sums add in rank order, so the output does not depend on where an expert lay. Checked
+  teacher-forced against llama.cpp's CPU dumps (cosine >= 0.99985 per layer, next token the same). B70 + B65: tg 3.3
+  tok/s, pp 105-115 (2K-8K). Profile, ladder and what bounds it: [docs/ports/minimax-m31.md](ports/minimax-m31.md).
+
 ## The image engines
 
 - **qwen-image-2.1** (`image/qwenimage21`) - Qwen-Image 2.1's DiT, VAE and pipeline (text to image, edits).

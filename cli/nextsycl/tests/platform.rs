@@ -24,7 +24,7 @@ fn cards() -> Vec<Value> {
 fn engines() -> Vec<(&'static str, Vec<&'static str>)> {
     let mut v: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
     for k in [nextsycl_llm_glm5next::kind(), nextsycl_llm_qwen4exp::kind(), nextsycl_llm_qwen35::kind(), nextsycl_llm_deepseek2::kind(), nextsycl_llm_deepseek4::kind(),
-              nextsycl_llm_deepseek41::kind(), nextsycl_llm_museglimmer::kind(), nextsycl_llm_nemotronh::kind(), nextsycl_llm_example::kind()] {
+              nextsycl_llm_deepseek41::kind(), nextsycl_llm_museglimmer::kind(), nextsycl_llm_nemotronh::kind(), nextsycl_llm_minimaxm3::kind(), nextsycl_llm_example::kind()] {
         v.push(("llm", k.archs.to_vec()));
     }
     for k in [nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_olmocr2::kind(),
