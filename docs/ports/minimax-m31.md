@@ -174,7 +174,7 @@ The expert-use line used to print zeros; it now counts VRAM hits, pinned (host m
 prefetched and prefetch-used experts (`NS_PROFILE` is not needed), and `NS_EXPERT_PROFILE` / `save_profile` writes the
 same profile file the other expert engines use.
 
-### Left
+### Left (as of 2026-10-28; see "Second round" below)
 
 - Overlap the pinned-to-VRAM copies with compute (a second queue / the copy engine): the copy is the largest part of the
   products' time.
@@ -184,3 +184,66 @@ same profile file the other expert engines use.
 - The DSpark draft (`dspark-MiniMax-M3.1-Flash-Q8_0.gguf`, 2 GB) was not started.
 - A larger pinned tier (capped at 32 GiB of 61 GiB RAM) would move the miss rate, at the box's hang risk.
 - Not in the front door's registry yet (the card exists; no `registry` entry or chat template wiring was changed).
+
+## Second round (2026-10-29): toward 20 tok/s
+
+Target from the user: tg 20 tok/s. Reached: tg 7.4 tok/s on two cards (from 3.3), pp 113-121 tok/s at 2K-8K. What each step bought
+(B70 + B65, the 2,115-token prompt, greedy; tg averaged over the generated tokens, so the longer runs include the cache's
+warm-up; ladder: [docs/ladders/minimax-m3.1-flash-iq1m_ladder_stats.md](../ladders/minimax-m3.1-flash-iq1m_ladder_stats.md)):
+
+| step | before | after | what changed |
+| --- | --- | --- | --- |
+| start of the round (main 2306522) | pp 105.5, tg 3.26 (64 tokens) | | |
+| pinned / file-read experts copied into VRAM on the copy lane beside the compute queue (tickets order the two on the device; a ring of 4 VRAM slots, copies 2 experts ahead) | tg 3.26 | tg 3.54 (64 tokens); pp 112.6 | the copy no longer blocks the products; PCIe is the limit (lane 0, 1 or alternating: 4.04 / 4.02 / 4.03) |
+| silo decode attention (the keys split in chunks of 128 over work-groups, merged by a second kernel) | tg 3.54 | tg 4.02 (64 tokens) | the shared kernel took 0.9 ms a layer at a 2K context (53 ms a token); now 0.58 s of 63 passes |
+| decode places as a recency cache (each layer: the most recently used experts in VRAM, the next in pinned memory; a used expert that was pinned or in the file swaps into the VRAM place of the least recently used, which goes to the pinned place it leaves) | tg 3.92 (300 tokens, same build without it) | tg 6.12 (300 tokens), text identical | hit rate of the cards 70% -> 92.9%; routing is flat across unrelated prompts but strongly local inside one generation (offline replay of a traced 300-token run: the recency stack gives 87.5% VRAM + 9.2% pinned + 3.3% miss) |
+| silo fused expert products (gate+up+SwiGLU-OAI in one kernel, down in one, up to four experts a launch, float32 activations, ggml's row types IQ1_M / IQ2_XXS / IQ3_XXS / IQ4_XS) | tg 6.12 | tg 7.26 (300 tokens) | the shared kernels took three launches an expert on Q8_1 activations; text differs from the earlier engine after a few tokens (float activations) |
+| no per-layer syncs in one-token passes (tickets for the moves), stale read-ahead not waited for, matrices read in 8 pieces at once | tg 7.26 | tg 7.38 (200 tokens) | within noise except the reads: the host waited 6.2 s -> 5.4 s for expert reads over 200 tokens |
+
+Read-ahead of the next layer (`NS_MM31_AHEAD`) no longer matters much: 0 / 2 / 3 -> tg 6.95 / 7.18 / 7.22 (200 tokens).
+
+### Where a token's time goes now (2K context, 200 tokens, 27 s; `NS_PROFILE=gpu` stamps, no syncs)
+
+Device time by part, per token: attention (norm, q/k/v, norms, rope, KV store, indexer, split attention, o projection) **31 ms**,
+router 4 ms, host turnaround from the router read-back to the shared expert queued 3 ms, **experts 90 ms** (queue time between the shared expert
+and the last expert: the products themselves, the waits for pinned / file experts' copies and the host's waits for the reads),
+adds and layer end 4 ms. The host side of the 138 ms a token: 32 ms waiting for the routers' read-backs (the GPU running attention),
+31 ms waiting for expert reads (a miss costs ~4 ms: 16 MB from the SSD, 7.5 misses a token), the rest launching and waiting for
+the GPU's expert work. The fused kernels alone are fast (a gate+up launch of one IQ1_M expert: 37 us, 224 GB/s, scaling linearly with
+the experts in the launch; the profile's per-launch figures with a sync around each are 0.5 ms higher than that).
+
+### Why 20 tok/s is not within reach of this engine
+
+20 tok/s is 50 ms a token. What is left is not the experts' bytes any more but the number of dependent steps: 60 layers, each with
+~30 small kernel launches for attention (31 ms in all, launch- and latency-bound; no kernel runs more than 0.1 ms), a router
+read-back that makes the host decide per layer (3 syncs removed; the GPU still waits for the host's routing round trip), and
+copies / reads for the 7% of expert uses that are not in VRAM (pinned 9%: 0.45 ms each on PCIe; file 3.3%: ~4 ms each). With every
+expert hit in VRAM the floor is attention + experts' compute + the 60 router round trips, about 60-70 ms (15 tok/s); 20 would need
+the attention and router steps fused into few launches (or recorded as a command graph) and a draft that lands two tokens a pass.
+
+### Not done, and why
+
+- **DSpark draft** (`dspark-MiniMax-M3.1-Flash-Q8_0.gguf`): not started. A verify of k tokens runs the generic multi-row path (the silo's fused pair
+  is one-token) and reads the union of the k tokens' experts; with 7% of uses off the VRAM, the union of 2 tokens' 8 experts a layer
+  costs about twice the misses of one. Estimate (not measured): a pass of 2 rows costs 1.4-1.7x a pass of 1, so one draft token needs more than 40% acceptance
+  to break even and the gain at the quoted ~1.5x of Unsloth's code tests would be 10-30%, before the draft's own cost. Worth doing only
+  after the one-token path is cheaper.
+- **Batched expert GEMM for prompts, indexer-score kernel**: not done (pp is bound by the experts' reads and the dequant-to-half GEMMs; pp moved only through the read splitting and the copy lane, 105 -> 113 at 2K).
+- **Larger pinned tier**: not changed (32 GiB of 61 GiB RAM, the box hangs when it spills). With the recency cache the pinned tier serves 9%
+  of the uses, so more of it buys little; a cold generation (new topic) warms in ~100 tokens.
+- **Pinned experts prefetched for the guessed next layer**: the largest thing left in the experts' time (~10 ms a token by the copy waits above); not done.
+
+### Exactness after the second round
+
+Teacher-forced `check` (two cards, silo attention, chunk 4096 for `long`), unchanged to the printed digits:
+
+| prompt | min l_out | min kqv_out | result_output | next token | decode-after-prefill logits cosine |
+| --- | --- | --- | --- | --- | --- |
+| `short` (19 tokens) | 0.999849 | 0.999966 | 0.999957 | same as the reference | 0.9999773 |
+| `long` (3,881 tokens) | 0.999847 | 0.999988 | 0.999756 | same (" +") | 0.9999729 |
+
+The check's decode line is the same with `NS_MM31_FUSED=0` and `NS_MM31_DYNAMIC=0` (it compares one token against the whole prompt's wide pass, which
+reads float activations too; the float products are the closer of the two to it). **Greedy text changed**: the fused products use float32 activations instead
+of ggml's Q8_1, so a 300-token generation diverges from the 2026-10-28 engine's after 19 characters (near ties); the cache itself
+changes no byte of the text (300 tokens, `NS_MM31_DYNAMIC=0` against 1, measured with the unfused products), and the fused text is the same
+before and after the sync removal (300 tokens, byte-identical). `NS_MM31_FUSED=0` gives the earlier arithmetic.

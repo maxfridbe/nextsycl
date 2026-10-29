@@ -88,6 +88,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             silo_moe: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
                 let (a, b, c) = (s.symbol("ns_mm3s_expert_supported"), s.symbol("ns_mm3s_expert_gu"), s.symbol("ns_mm3s_expert_down"));
                 // SAFETY: the symbols are declared in mm3s.h with MoeFns's signatures.
+                #[allow(clippy::missing_transmute_annotations)]
                 (!a.is_null() && !b.is_null() && !c.is_null()).then(|| unsafe {
                     MoeFns {
                         supported: std::mem::transmute::<*mut c_void, _>(a),

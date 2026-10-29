@@ -1723,9 +1723,6 @@ impl<'g> MiniMax<'g> {
                 } else if let Some(xe) = x {
                     cache.of[xe] = None;
                 }
-                if own.is_some() && dst.is_some() && x.is_none() {
-                    cache.slots[dst.unwrap()].occ = None;
-                }
                 cache.slots[v].occ = Some(ex);
                 cache.slots[v].stamp = clock;
                 cache.of[ex] = Some(v);
@@ -2084,7 +2081,7 @@ impl<'g> MiniMax<'g> {
                 let nx = DevBuf::f32(&cd.gpu, t * c)?;
                 let mut stage = vec![0u8; t * c * 4];
                 nx.copy_from_peer(&x, &mut stage)?;
-                grave.push(std::mem::replace(&mut x, nx));
+                x = nx;
                 cur = ci;
             }
             let m0 = cd.arena.mark();
@@ -2131,8 +2128,11 @@ impl<'g> MiniMax<'g> {
             if t > 1 || self.pf {
                 cd.gpu.sync()?;
             }
-            // the queue still reads the old hidden state: freed after the pass
-            grave.push(std::mem::replace(&mut x, nx));
+            // the queue may still read the old hidden state (one-token passes run on without a sync): freed after the pass
+            let old = std::mem::replace(&mut x, nx);
+            if t == 1 {
+                grave.push(old);
+            }
             cd.arena.rewind(m0);
             self.lap(cd, l, 7, &mut tm);
             // NS_MM31_FORCE=DIR (Debug): the layer's output replaced by the reference dump's, so the next layer is
