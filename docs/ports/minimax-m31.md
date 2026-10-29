@@ -1,11 +1,11 @@
 # MiniMax-M3.1-Flash (Unsloth GGUFs): port notes and assignment
 
 Engine written and exact (2026-10-28): `llm/minimaxm3` has the model description (geometry from the metadata, every
-tensor by role and shape) and the engine (`engine.rs`: single GPU, MiniMax Sparse Attention, routed experts kept in
+tensor by role and shape) and the engine (`engine.rs`: MiniMax Sparse Attention, routed experts kept in
 VRAM / pinned host memory or read from the file per pass); its kernels are `kernels/llm/minimaxm3/mm3.cpp` (rope,
 SwiGLU-OAI, indexer scores, top-K, sparse attend) on the glm5next engine's generic dequant / GEMM / mmvq kernels. The
-speed work (silo `kernels/llm/minimaxm3/silo`, second GPU, draft) is ahead; see "Results" at the end.
-Card to come: `minimax-m3.1-flash-iq1m` (needs the shards' SHA-256 from the Hugging Face tree). Files: `unsloth/MiniMax-M3.1-Flash-GGUF`, `UD-IQ1_M/` (4 shards, 129 GB) at
+speed work (two cards, read-ahead, second drive, the silo's prompt attention; draft not done) is under "Speed work" at the end.
+Card: `model-cards/llm/minimax-m3.1-flash-iq1m.yml`. Files: `unsloth/MiniMax-M3.1-Flash-GGUF`, `UD-IQ1_M/` (4 shards, 129 GB) at
 `/var/mnt/4TBSSD/nextsycl-models/minimax-m3.1-flash-iq1m` on hardac1 (license `minimax-community`; read it before
 serving).
 
@@ -103,15 +103,84 @@ model's `config.json` on Hugging Face.
   - `msa_bs` sizes differ (the reference pads the block grid); the block selection is verified through kqv_out, not the raw scores.
 - **Speed**: see the ladder below; the engine today is input/output bound (the experts do not fit one card), the kernels untuned.
 
-### Speed (first measurement, untuned, B70 alone; pp = prompt, tg = generation)
+### Speed, first measurement (untuned, B70 alone; pp = prompt, tg = generation)
 
 | context | pp | tg | notes |
 | --- | --- | --- | --- |
 | 179 tokens, 160 generated | 2.9 tok/s | 0.89 tok/s | 19 GiB experts in VRAM + 40 GiB pinned, the rest read from the file |
 | 4,044 tokens, 48 generated | 15.9 tok/s | 0.96 tok/s | 19 GiB VRAM + 19 GiB pinned (the default at the time), chunk 1024 |
 | 3,881 tokens (check run) | 24.6 tok/s | - | 36 GiB pinned, chunk 4096 |
+| 2,115 tokens, 24 generated (re-run) | 8.1 tok/s (259.8 s) | 1.13 tok/s | the baseline of the table below |
 
-What bounds it: the 120 GB of routed experts do not fit one 32 GiB card plus 40 GiB of pinned memory (61 GiB of RAM on the box),
-so about half of each token's expert reads (4 of 128 per layer, 16 MB each) come from the SSD at ~3 GB/s - tg is a file-read
-rate, not a kernel rate. Next: the B65 as a second card holding experts, a draft (DSpark), the silo kernels for the
-IQ1_M/IQ2_XXS/IQ3_XXS mmvq and the sparse attend, and reading ahead the next layer's experts while this one computes.
+## Speed work (2026-10-28): profile, second card, read-ahead, silo
+
+### Profile of the first engine (2,115-token prompt + 24 tokens, B70 alone)
+
+`NS_PROFILE=1` times each layer's sections with a GPU wait at each boundary (`--opt-profile`; the passes are slower than
+unprofiled by that much). Where the time went: expert file reads 68% (201.8 s), expert products 19% (57.6 s), attention
+4%, the rest 5%. **The bound was the SSD**: each pass read its experts one at a time, one request in flight (~3 GB/s) with
+a GPU sync per expert.
+
+### Profile after the work (B70 + B65, stream drive, read-ahead 3; the engine prints these tables with `NS_PROFILE=1`)
+
+Decode, 172-token prompt, 63 one-token passes (16.6 s, tg 3.85 profiled / 3.98 unprofiled): expert products 51%
+(8.35 s), expert read wait 33% (5.36 s), attention projections 8% (1.28 s), indexer 2%, attend 2%, router 2%, shared/dense
+1%, other 1%. Per expert, timed alone on the GPU: VRAM 0.30 ms (x 5,772), pinned (copied to VRAM first) 0.84 ms (x 4,274),
+staged from the file 0.87 ms (x 1,566). One-token stages (summed over 64 tokens, earlier run): gate 6.54 s (it also
+holds the preceding host-to-VRAM copy), up 0.86 s, swiglu + quantize 0.14 s, down 1.31 s, scatter 0.10 s.
+Per token (~250 ms): read wait ~85 ms, expert products ~130 ms (of which the PCIe copy of the pinned and staged experts is
+the largest part: ~0.55 ms each, serialized with the compute in one in-order queue), attention ~25 ms. **What bounds
+decode now**: the SSD bytes of the ~30% of expert uses that no tier holds (~0.9 GB a token; read-ahead hides about
+half of them: 2,752 of the 5,663 needed) plus the PCIe copy of pinned / staged experts. The kernels (up / down ~0.15-0.2 ms)
+are not the limit.
+
+Prompt pass, 2,115 tokens, 4 wide passes of 512 (earlier chunk; 25.1 s at the time): expert read wait 27%
+(6.7 s), expert products 35% (8.8 s), attend 20% (5.1 s with the silo; 16.1 s = 44% before it), attention projections 12%
+(3.1 s), router / indexer / other 3%.
+
+### What was done, each measured (pp = prompt, tg = generation)
+
+| step | measure | before | after |
+| --- | --- | --- | --- |
+| second card (layers split), experts in both cards' VRAM and pinned tiers, O_DIRECT parallel placement, waves overlapping reads with products | 172-token prompt, decode | tg 1.08 tok/s, pp 8.7 | (first version, pinned read in place: 5.8 ms an expert) |
+| pinned and file-read experts copied to VRAM before the products | the same | tg 1.08, pp 8.7 | tg 2.97, pp 25.4 |
+| prompt chunk 512 -> 2048, second drive for half of the off-card experts | 2,115 tokens | pp 12.8 (165.0 s) | pp 57.7 (36.6 s); tg 1.04 -> 3.4-3.5 |
+| silo prompt-pass attention | 2,115 tokens | pp 57.7 | pp 84.4 (25.1 s); chunk 4096 later: 105.5 |
+| read-ahead of the next layer (top 3 of its guessed routing; 96% right at top 2, 82% at top 4) | 172 tokens decode | tg 2.98 (0) | 3.28 (2), 3.38 (3), 3.31 (4), 3.09 (5), 2.68 (6, profiled): wasted reads take SSD bandwidth |
+| second drive (50% of the off-card experts) with read-ahead 3 | decode | tg 3.33 | tg 3.9-4.05 |
+| expert-profile placement (`NS_EXPERT_PROFILE`, a profile from three unrelated prompts) | decode | 2.95 | 2.79-2.98: routing is flat, no gain |
+| one-token fast path (activation quantized once a layer) | decode | tg 3.98 | tg 3.97-3.99: launches are not the limit |
+
+Totals against the first engine on the same 2,115-token prompt: pp 8.1 -> 105.5 tok/s (13x), tg 1.13 -> 3.26 tok/s (2.9x);
+ladder: [docs/ladders/minimax-m3.1-flash-iq1m_ladder_stats.md](../ladders/minimax-m3.1-flash-iq1m_ladder_stats.md).
+
+### Exactness after the work
+
+Teacher-forced `check` against the llama.cpp CPU dumps (two cards, silo attention, chunk 4096 for `long`):
+
+| prompt | min l_out | min kqv_out | result_output | next token | decode-after-prefill logits cosine |
+| --- | --- | --- | --- | --- | --- |
+| `short` (19 tokens) | 0.999849 | 0.999966 | 0.999957 | same as the reference | 0.9999773 |
+| `long` (3,881 tokens) | 0.999847 | 0.999988 | 0.999756 | same (" +") | 0.9999729 |
+
+No drop against the first engine (0.99985 / 0.99997 / 0.99996 and 0.99985 / 0.99998 / 0.99976). Greedy: the 24-token
+output on the 2,115-token prompt is byte-identical to the first engine's; longer runs differ only through fp32
+summation order at near ties, and are the same across read-ahead, stream-drive and residency settings (the expert sums
+add in rank order). `NS_SILO=0` (shared attention) gives the same 24 tokens.
+
+### Counters
+
+The expert-use line used to print zeros; it now counts VRAM hits, pinned (host memory) uses, file reads ("swapped in"),
+prefetched and prefetch-used experts (`NS_PROFILE` is not needed), and `NS_EXPERT_PROFILE` / `save_profile` writes the
+same profile file the other expert engines use.
+
+### Left
+
+- Overlap the pinned-to-VRAM copies with compute (a second queue / the copy engine): the copy is the largest part of the
+  products' time.
+- Silo mmvq for IQ1_M / IQ2_XXS / IQ3_XXS / IQ4_XS (not done; the shared kernels run the expert matvecs, ~0.15-0.2 ms each)
+  and a batched expert GEMM for prompt passes (today each expert dequantizes to half and runs the generic GEMM: 8.8 s of 25 s
+  at 2K); an indexer-score kernel.
+- The DSpark draft (`dspark-MiniMax-M3.1-Flash-Q8_0.gguf`, 2 GB) was not started.
+- A larger pinned tier (capped at 32 GiB of 61 GiB RAM) would move the miss rate, at the box's hang risk.
+- Not in the front door's registry yet (the card exists; no `registry` entry or chat template wiring was changed).

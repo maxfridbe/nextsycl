@@ -1,0 +1,39 @@
+# MiniMax-M3.1-Flash UD-IQ1_M (text; both GPUs, or one with experts in host memory and read from the file)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-m3.1-flash-iq1m
+kind: llm
+arch: minimax-m3
+title: MiniMax-M3.1-Flash UD-IQ1_M (both GPUs)
+about: 'unsloth''s dynamic 1-bit quant of MiniMax-M3.1-Flash (129 GB, 111 GiB of routed experts: IQ1_M / IQ2_XXS gate and up, IQ3_XXS / IQ4_XS down; MiniMax Sparse Attention). The experts do not fit the cards: about 70% of the uses are served from VRAM and pinned host memory, the rest read from the SSD (O_DIRECT, read ahead, an optional second drive). Text only; license minimax-community, read it before serving'
+gpus: all
+vram_gib: 24.0
+ctx: '32768'
+tools: true
+tasks: true
+env: {}
+files:
+  model:
+    key: minimax-m3.1-flash-ud-iq1m-1
+    url: https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00001-of-00004.gguf
+    size: 8243332
+    sha256: 7b6e87290b1f6dc2bfdfa81d7aedde98123b05e85be09b07fa005f291b44ce2c
+    path: minimax-m3.1-flash-iq1m/MiniMax-M3.1-Flash-UD-IQ1_M-00001-of-00004.gguf
+  shard-2:
+    key: minimax-m3.1-flash-ud-iq1m-2
+    url: https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00002-of-00004.gguf
+    size: 49558582272
+    sha256: 054e8058c4ff0654e992bdfe4e730f01ec403f101de39b6b4d41ed05a0d90496
+    path: minimax-m3.1-flash-iq1m/MiniMax-M3.1-Flash-UD-IQ1_M-00002-of-00004.gguf
+  shard-3:
+    key: minimax-m3.1-flash-ud-iq1m-3
+    url: https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00003-of-00004.gguf
+    size: 49187867040
+    sha256: 731ccc249cd705a2058f24cb865c73dd6f8d38ad0a637d586b86db1e93c766c2
+    path: minimax-m3.1-flash-iq1m/MiniMax-M3.1-Flash-UD-IQ1_M-00003-of-00004.gguf
+  shard-4:
+    key: minimax-m3.1-flash-ud-iq1m-4
+    url: https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00004-of-00004.gguf
+    size: 30606383904
+    sha256: f32abc3736499cb4ba865cb82482f707208212b30027e096fe56a44f7f35dfa8
+    path: minimax-m3.1-flash-iq1m/MiniMax-M3.1-Flash-UD-IQ1_M-00004-of-00004.gguf
+guide: guides/chat.md
