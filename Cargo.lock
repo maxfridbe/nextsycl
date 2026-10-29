@@ -591,6 +591,7 @@ dependencies = [
  "nextsycl-model3d-unirig",
  "nextsycl-models",
  "nextsycl-serve",
+ "nextsycl-sys",
  "nextsycl-tok",
  "nextsycl-video",
  "nextsycl-video-example",

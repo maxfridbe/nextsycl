@@ -99,6 +99,16 @@ fn materialize(name: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
+/// The kind's library out of the binary as a path (`/proc/self/fd/N`, which a child process that inherits the
+/// descriptor opens too: `ldd` can check it), None when this binary has none or NS_LIB_FROM_DISK=1
+pub fn embedded_path(kind: &str) -> Option<PathBuf> {
+    let name = format!("libnextsycl-{kind}.so");
+    if from_disk() || embedded(&name).is_none() {
+        return None;
+    }
+    materialize(&name).ok()
+}
+
 /// dlopen a path globally (its symbols and its soname are then found by the libraries opened after it)
 fn open(path: &Path) -> Result<(), String> {
     let c = CString::new(path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;

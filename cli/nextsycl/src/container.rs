@@ -120,7 +120,7 @@ pub fn needs_runtime(args: &[String]) -> bool {
 /// Whether the kernel library loads here: every library it links found (oneAPI's are inside the image, not on a
 /// plain host)
 fn runtime_here(cfg: &Config) -> bool {
-    let lib = cfg.dist.join("libnextsycl-llm.so");
+    let lib = nextsycl_sys::embedded_path("llm").unwrap_or_else(|| cfg.dist.join("libnextsycl-llm.so"));
     Command::new("ldd").arg(&lib).output().is_ok_and(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("not found"))
 }
 

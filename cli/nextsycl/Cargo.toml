@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 nextsycl-gguf.workspace = true
 nextsycl-core.workspace = true
+nextsycl-sys.workspace = true
 nextsycl-llm.workspace = true
 nextsycl-llm-glm5next.workspace = true
 nextsycl-llm-deepseek2.workspace = true
