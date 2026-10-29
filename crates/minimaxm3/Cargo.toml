@@ -1,9 +1,0 @@
-[package]
-name = "nextsycl-llm-minimaxm3"
-description = "MiniMax-M3.1-Flash (minimax-m3): its model description; the engine follows (docs/ports/minimax-m31.md)"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-nextsycl-gguf.workspace = true

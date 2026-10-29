@@ -295,6 +295,11 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_WFE_FROM_DISK` | unset: the front ends are read from inside the binary | `1`: read the pages and modules from `dist/wfe` instead of the embedded copy (edit a page and reload, no rebuild) | serve, studio, image/audio/model3d servers |
 | `NS_WFE_DIST` | `dist/wfe` beside the repository | build time: the directory `glue/serve/build.rs` embeds into the binary | build |
 | `CARGO_MANIFEST_DIR`, `OUT_DIR` | set by cargo | where `glue/serve/build.rs` finds the repository and writes the list of embedded front-end files | build |
+| `NS_MM31_CHUNK` | 512 | The minimaxm3 engine's prompt pass rows (--opt-chunk) | llm:minimaxm3 |
+| `NS_MM31_SPARSE_ALL` | 0 | 1: the minimaxm3 engine's first three layers take the sparse-attention indexer too (the model config says every layer is sparse; llama.cpp's graph leaves them dense, the reference) (--opt-sparse-all) | llm:minimaxm3 |
+| `NS_MM31_VRAM_GIB` | free VRAM less the sessions' caches (the load's token count x 138 KB) and 2.5 GiB | The minimaxm3 engine's budget for routed experts kept in VRAM between passes (first come first kept; the rest are read from the file) (--opt-vram-gib) | llm:minimaxm3 |
+| `NS_MM31_PIN_GIB` | a third of MemAvailable, at most 24 | The minimaxm3 engine's budget for routed experts kept in pinned host memory (the kernels read them over PCIe) (--opt-pin-gib) | llm:minimaxm3 |
+| `NS_MM31_FORCE` | unset | Debug: a llama.cpp dump's directory (`nextsycl llm check`): after each layer the minimaxm3 engine's hidden state is replaced by the dump's `l_out-N`, so every layer is checked on the reference's own input | llm:minimaxm3 |
 | `NS_MM31_FILE` | unset: the test is skipped | the first shard of a MiniMax-M3.1-Flash GGUF: `cargo test -p nextsycl-llm-minimaxm3` checks the file against the model description | test minimaxm3 |
 | `NS_Q3T_EAGER` | 0 | 1: the silo's frame launched kernel by kernel, not replayed as a recorded graph (the A/B for the graph) | audio qwen3tts |
 | `NS_Q3T_STREAMING` | clone 1, built-in and designed voices 0 | the per-request option streaming's name: the text fed a token a frame; a request's options only, the variable itself is not read (--opt-streaming) | audio qwen3tts |

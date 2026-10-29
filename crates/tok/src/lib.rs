@@ -33,6 +33,9 @@ const DEEPSEEK3_SPLITS: [&str; 3] = [
 const TEKKEN_SPLIT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 /// GPT-2's own split (tokenizers' ByteLevel pre-tokenizer with use_regex, no Split of its own: Whisper's tokenizer.json)
 const GPT2_SPLIT: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+/// MiniMax-M2/M3's own (tokenizer.json's: llama.cpp's `minimax-m2` pre-type, whose second pattern is the same split with lookaheads for
+/// the cases): letters by case with an optional leading symbol, contractions after a word, digits up to 3, symbols, line breaks
+const MINIMAX2_SPLIT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const QWEN2_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 pub struct Tokenizer {
@@ -215,11 +218,12 @@ impl Tokenizer {
             // llama.cpp's QWEN2: the contractions either case, letters, single digits
             "qwen2" => (QWEN2_SPLIT, &[]),
             "gpt-4o" | "llama4" => (GPT4O_SPLIT, &[]),
+            "minimax-m2" => (MINIMAX2_SPLIT, &[]),
             // Nemotron 3.5's
             "tekken" => (TEKKEN_SPLIT, &[]),
             // DeepSeek-V4's `joyai-llm`: llama.cpp gives it DeepSeek-V3's three patterns
             "deepseek-v3" | "joyai-llm" => (DEEPSEEK3_SPLITS[2], &DEEPSEEK3_SPLITS[..2]),
-            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen2, qwen35, deepseek-v3, joyai-llm, llama4, tekken)")),
+            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen2, qwen35, deepseek-v3, joyai-llm, llama4, tekken, minimax-m2)")),
         };
         let tokens = strs(g.meta("tokenizer.ggml.tokens"));
         let types: Vec<u64> = g.meta("tokenizer.ggml.token_type").and_then(Value::as_array).map(|a| a.iter().map(|x| x.as_u64().unwrap_or(1)).collect()).unwrap_or_default();
@@ -493,9 +497,9 @@ impl Effort {
 /// Where a user turn begins in each chat template's prompt (GLM; DeepSeek R1 and V4; ChatML: Qwen, Nemotron; Muse):
 /// the server checkpoints a prompt there, since a template rewrites what follows the last user turn's start for the
 /// next turn (CONTRIBUTING.md rule 1). A template whose user turns begin otherwise adds its marker here.
-pub const USER_TURNS: &[&str] = &["<|user|>", "<\u{ff5c}User\u{ff5c}>", "<|im_start|>user", "<|start|>user"];
+pub const USER_TURNS: &[&str] = &["<|user|>", "<\u{ff5c}User\u{ff5c}>", "<|im_start|>user", "<|start|>user", "]~b]user"];
 /// The same for the assistant's turns (where the reply a prompt asks for begins)
-pub const ASSISTANT_TURNS: &[&str] = &["<|assistant|>", "<\u{ff5c}Assistant\u{ff5c}>", "<|im_start|>assistant", "<|start|>assistant"];
+pub const ASSISTANT_TURNS: &[&str] = &["<|assistant|>", "<\u{ff5c}Assistant\u{ff5c}>", "<|im_start|>assistant", "<|start|>assistant", "]~b]ai"];
 
 /// One message of a conversation.
 #[derive(Default)]
@@ -976,6 +980,108 @@ pub fn qwen_chat(messages: &[Message], _effort: Effort, tools: &[String]) -> Str
         }
     }
     s += "<|im_start|>assistant\n<think>\n";
+    s
+}
+
+/// MiniMax-M3's chat template (`tokenizer.chat_template`; llama.cpp's models/templates/MiniMax-M3.jinja), its text path:
+/// `]~!b[]~b]system` with the model's identity text and the thinking instructions (a request's effort is the thinking mode:
+/// low disabled, high / max enabled, else adaptive), `]~b]developer` with the system message (or "You are a helpful
+/// assistant.") and the tools, `]~b]user` / `]~b]ai` turns each ended by `[e~[`, an assistant turn starting with its
+/// thinking in `<mm:think>` or a bare `</mm:think>`, tool calls as `]<]minimax[>[<invoke name=...>` blocks and the tool
+/// results as one `]~b]tool` turn of `<response>`s; then `]~b]ai` (and `<mm:think>` / `</mm:think>` for enabled /
+/// disabled) to generate.
+pub fn minimax_chat(messages: &[Message], effort: Effort, tools: &[String]) -> String {
+    const NS: &str = "]<]minimax[>[";
+    const BOS: &str = "]~b]";
+    const EOS: &str = "[e~[";
+    let mode = match effort {
+        Effort::Low => "disabled",
+        Effort::High | Effort::Max => "enabled",
+        Effort::Medium => "adaptive",
+    };
+    let (root, ms) = match messages.first() {
+        Some(m) if m.role == "root" => (Some(m.content), &messages[1..]),
+        _ => (None, messages),
+    };
+    let (dev, ms) = match ms.first() {
+        Some(m) if m.role == "system" || m.role == "developer" => (Some(m.content), &ms[1..]),
+        _ => (None, ms),
+    };
+    let mut s = format!("]~!b[{BOS}system\n");
+    s += match root {
+        Some(r) if !r.is_empty() => r,
+        _ => "Your model version is MiniMax-M3, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.",
+    };
+    s += "\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\n";
+    s += match mode {
+        "enabled" => "Current thinking mode: enabled. You MUST think step by step before every response, including after receiving function/tool results.\n",
+        "disabled" => "Current thinking mode: disabled. Do not output any thinking process.\n",
+        _ => "Current thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n",
+    };
+    s += &format!("</thinking_instructions>{EOS}\n{BOS}developer\n");
+    s += match dev {
+        Some(d) if !d.is_empty() => d,
+        _ => "You are a helpful assistant.",
+    };
+    if !tools.is_empty() {
+        s += "\n\n# Tools\nYou may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:\n\n<tools>\n";
+        for t in tools {
+            s += &format!("<tool>{t}</tool>\n");
+        }
+        s += &format!("</tools>\n\nTo call tools, wrap all invocations in a single {NS}<tool_call>{NS}</tool_call> block. Parameter values containing nested objects or arrays are recursively expanded into XML elements. Example:\n\n{NS}<tool_call>\n");
+        s += &format!("{NS}<invoke name=\"tool-name-1\">{NS}<param-1>value-1{NS}</param-1>{NS}<param-2>{NS}<item>{NS}<key-a>val-a{NS}</key-a>{NS}<key-b>val-b{NS}</key-b>{NS}</item>{NS}</param-2>{NS}</invoke>\n");
+        s += &format!("{NS}<invoke name=\"tool-name-2\">{NS}<param-1>value-1{NS}</param-1>{NS}</invoke>\n{NS}</tool_call>");
+    }
+    s += &format!("{EOS}\n");
+    for (k, m) in ms.iter().enumerate() {
+        match m.role {
+            "user" => s += &format!("{BOS}user\n{}{EOS}\n", m.content),
+            "assistant" => {
+                s += &format!("{BOS}ai\n");
+                let (reasoning, content) = match m.reasoning.filter(|r| !r.trim().is_empty()) {
+                    Some(r) => (r.trim_matches('\n').to_string(), m.content.rsplit("</mm:think>").next().unwrap_or(m.content).trim_matches('\n').to_string()),
+                    None => match m.content.split_once("</mm:think>") {
+                        Some((a, b)) => (a.trim_matches('\n').rsplit("<mm:think>").next().unwrap_or("").trim_matches('\n').to_string(), b.rsplit("</mm:think>").next().unwrap_or(b).trim_matches('\n').to_string()),
+                        None => (String::new(), m.content.to_string()),
+                    },
+                };
+                if reasoning.is_empty() {
+                    s += "</mm:think>";
+                } else {
+                    s += &format!("<mm:think>{reasoning}</mm:think>");
+                }
+                s += &content;
+                if !m.calls.is_empty() {
+                    s += &format!("{NS}<tool_call>\n");
+                    for c in m.calls {
+                        s += &format!("{NS}<invoke name=\"{}\">", c.name);
+                        for (key, v) in &c.args {
+                            s += &format!("{NS}<{key}>{v}{NS}</{key}>");
+                        }
+                        s += &format!("{NS}</invoke>\n");
+                    }
+                    s += &format!("{NS}</tool_call>");
+                }
+                s += &format!("{EOS}\n");
+            }
+            "tool" => {
+                if k == 0 || ms[k - 1].role != "tool" {
+                    s += &format!("{BOS}tool");
+                }
+                s += &format!("\n<response>{}</response>", m.content);
+                if k + 1 == ms.len() || ms[k + 1].role != "tool" {
+                    s += &format!("{EOS}\n");
+                }
+            }
+            _ => {}
+        }
+    }
+    s += &format!("{BOS}ai\n");
+    match mode {
+        "disabled" => s += "</mm:think>",
+        "enabled" => s += "<mm:think>",
+        _ => {}
+    }
     s
 }
 

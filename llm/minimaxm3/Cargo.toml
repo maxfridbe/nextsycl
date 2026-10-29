@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-llm-minimaxm3"
+description = "MiniMax-M3.1-Flash (minimax-m3): its model description and its engine - GQA with MiniMax Sparse Attention, 128 experts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-llm.workspace = true
+nextsycl-tok.workspace = true

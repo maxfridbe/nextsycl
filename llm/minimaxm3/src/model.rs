@@ -140,7 +140,7 @@ impl Geometry {
 
 /// The row types UD-IQ1_M uses (experts IQ1_M gate/up, IQ3_XXS down; the rest Q4_K, Q5_K, Q6_K, F32); the other quants
 /// of the repo add IQ2_XXS, Q2_K, Q3_K, IQ3_S, Q4_K, Q8_0
-pub const SUPPORTED: &[GType] = &[GType::F32, GType::Q4K, GType::Q5K, GType::Q6K, GType::IQ1M, GType::IQ3XXS];
+pub const SUPPORTED: &[GType] = &[GType::F32, GType::Q4K, GType::Q5K, GType::Q6K, GType::Q8_0, GType::IQ1M, GType::IQ2XXS, GType::IQ3XXS, GType::IQ4XS];
 
 #[cfg(test)]
 mod tests {
