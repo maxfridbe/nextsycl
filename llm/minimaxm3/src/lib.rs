@@ -34,8 +34,10 @@ pub type ModelResult<T> = std::result::Result<T, Error>;
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "chunk", env: "NS_MM31_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 512)", at: At::Load },
-    EngineOption { name: "vram-gib", env: "NS_MM31_VRAM_GIB", value: "GIB", help: "VRAM the kept experts may take (default: what is free after the sessions' caches and a spare)", at: At::Load },
-    EngineOption { name: "pin-gib", env: "NS_MM31_PIN_GIB", value: "GIB", help: "pinned host memory for more kept experts (default a third of what is available, at most 24)", at: At::Load },
+    EngineOption { name: "vram-gib", env: "NS_MM31_VRAM_GIB", value: "GIB", help: "VRAM a card may fill with kept experts (default: what is free after the arena, the sessions' caches and a spare)", at: At::Load },
+    EngineOption { name: "pin-gib", env: "NS_MM31_PIN_GIB", value: "GIB", help: "pinned host memory, in all, for more kept experts (default: what is available less 16, at most 32)", at: At::Load },
+    EngineOption { name: "split", env: "NS_MM31_SPLIT", value: "LAYERS", help: "with two GPUs, the layers on the first (default: half)", at: At::Load },
+    EngineOption { name: "direct", env: "NS_MM31_DIRECT", value: "0|1", help: "read experts from the file with O_DIRECT (default 1; 0: through the page cache)", at: At::Load },
     EngineOption { name: "sparse-all", env: "NS_MM31_SPARSE_ALL", value: "0|1", help: "the first three layers take the indexer too (default 0: llama.cpp's graph)", at: At::Load },
 ];
 
@@ -55,7 +57,7 @@ fn info(f: &Gguf) -> std::result::Result<String, String> {
 }
 
 fn load<'g>(f: &'g Gguf, gpus: &[Arc<nextsycl_core::Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn Engine + 'g>> {
-    Ok(Box::new(engine::MiniMax::load(f, gpus, o.kv, log)?))
+    Ok(Box::new(engine::MiniMax::load(f, gpus, o, log)?))
 }
 
 impl SessionState for engine::Session {
@@ -184,6 +186,12 @@ impl Engine for engine::MiniMax<'_> {
 
     fn gpu_info(&self) -> Vec<GpuInfo> {
         engine::MiniMax::gpu_info(self)
+    }
+    fn expert_stats(&self) -> nextsycl_llm::ExpertStats {
+        engine::MiniMax::expert_stats(self)
+    }
+    fn save_profile(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        engine::MiniMax::save_expert_profile(self, path)
     }
     fn report(&self, _tokens: usize) -> Vec<String> {
         self.profile_lines()
