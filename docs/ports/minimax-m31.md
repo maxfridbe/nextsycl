@@ -1,6 +1,6 @@
 # MiniMax-M3.1-Flash (Unsloth GGUFs): port notes
 
-Prepared, not run. `llm/minimaxm3` has the model description (geometry from the metadata, every tensor by role and
+Prepared, not run. `crates/minimaxm3` has the model description (geometry from the metadata, every tensor by role and
 shape, the row types the checked file uses); the engine and its silo (`kernels/llm/minimaxm3/silo`) are the work ahead.
 Card to come: `minimax-m3.1-flash-iq1m`. Files: `unsloth/MiniMax-M3.1-Flash-GGUF`, `UD-IQ1_M/` (4 shards, 129 GB) at
 `/var/mnt/4TBSSD/nextsycl-models/minimax-m3.1-flash-iq1m` on hardac1 (license `minimax-community`; read it before
@@ -49,4 +49,4 @@ DeepSeek V4.1 IQ2_XXS; KV is small (4 KV heads x 128 x 60 layers).
 4. Card, registry entry (`minimax-m3.1-flash-iq1m`), chat template (in the GGUF), tool format.
 5. Speed: pp/tg per context length in a ladder doc, like GLM's.
 
-`NS_MM31_FILE=<shard 1>` makes `cargo test -p nextsycl-llm-minimaxm3` check the real file against the description.
+`NS_MM31_FILE=<shard 1>` makes `cargo test -p nextsycl-llm-minimaxm3 (the crate sits in crates/ until the engine exists; then it moves to llm/ with its checkpoints)` check the real file against the description.
