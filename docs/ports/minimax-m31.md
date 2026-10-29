@@ -1,8 +1,11 @@
 # MiniMax-M3.1-Flash (Unsloth GGUFs): port notes and assignment
 
-Prepared, not run. `crates/minimaxm3` has the model description (geometry from the metadata, every tensor by role and
-shape, the row types the checked file uses); the engine and its silo (`kernels/llm/minimaxm3/silo`) are the work ahead.
-Card to come: `minimax-m3.1-flash-iq1m`. Files: `unsloth/MiniMax-M3.1-Flash-GGUF`, `UD-IQ1_M/` (4 shards, 129 GB) at
+Engine written and exact (2026-10-28): `llm/minimaxm3` has the model description (geometry from the metadata, every
+tensor by role and shape) and the engine (`engine.rs`: single GPU, MiniMax Sparse Attention, routed experts kept in
+VRAM / pinned host memory or read from the file per pass); its kernels are `kernels/llm/minimaxm3/mm3.cpp` (rope,
+SwiGLU-OAI, indexer scores, top-K, sparse attend) on the glm5next engine's generic dequant / GEMM / mmvq kernels. The
+speed work (silo `kernels/llm/minimaxm3/silo`, second GPU, draft) is ahead; see "Results" at the end.
+Card to come: `minimax-m3.1-flash-iq1m` (needs the shards' SHA-256 from the Hugging Face tree). Files: `unsloth/MiniMax-M3.1-Flash-GGUF`, `UD-IQ1_M/` (4 shards, 129 GB) at
 `/var/mnt/4TBSSD/nextsycl-models/minimax-m3.1-flash-iq1m` on hardac1 (license `minimax-community`; read it before
 serving).
 
@@ -51,63 +54,64 @@ DeepSeek V4.1 IQ2_XXS; KV is small (4 KV heads x 128 x 60 layers).
 
 `NS_MM31_FILE=<shard 1>` makes `cargo test -p nextsycl-llm-minimaxm3 (the crate sits in crates/ until the engine exists; then it moves to llm/ with its checkpoints)` check the real file against the description.
 
-## What the references say (read 2026-10-28; verify each against the model's own code before relying on it)
+## Spec points verified from sources (2026-10-28)
 
-- MiniMax Sparse Attention (paper arXiv 2606.13392; vLLM `vllm/models/minimax_m3/common/sparse_attention` and
-  `indexer.py`; llama.cpp PR 24908, `src/models/minimax-m3.cpp`): block-sparse GQA. A lightweight indexer scores the
-  causal context, the scores are **max-pooled over key blocks of 128 tokens**, and the **top 16 blocks** per query are
-  kept per GQA group (4 indexer heads = the 4 KV heads, each shared by that group's 16 query heads). The query's own
-  (local) block is always kept: llama.cpp adds a 1e30 bias to the `local_blocks` most recent blocks including its own.
-  The main attention then runs over only the kept blocks (at most 16 x 128 = 2048 keys a query, whatever the context).
-  Running it dense gives wrong answers (trained with the sparsity).
-- Indexer: `indexer.q_proj` [6144 -> 4 x 128], `indexer.k_proj` [6144 -> 1 x 128] (one K head shared by the 4 indexer
-  heads), each RMS-normed (`indexer.q_norm`, `indexer.k_norm`, [128]) and then **RoPE'd like the main q/k** (llama.cpp);
-  scores are unscaled F32 dot products idx_q . idx_k, masked causally to -inf. The indexer keeps its own per-layer K
-  cache (F32 in llama.cpp; keep the indexer projections at full precision: they are F32 in the file).
-- Main attention: per-head RMSNorm of q and k (one [128] weight shared over heads), partial RoPE (first 64 of 128
-  dims; base 1e7; the rope layout - NEOX or NORM - and any YaRN factors are NOT in the GGUF metadata: take them from
-  the model's modeling code), scale 1/sqrt(128). Layers 0-2 attend densely (their FFN is dense too); the sparse path
-  applies to layers 3-59 in llama.cpp ("the first three full-attention layers": the HF card), a 1M context.
-- FFN activation is llama.cpp's **SwiGLU-OAI** (the gpt-oss form: clamped gate/up, `x * sigmoid(alpha * x) * (y + 1)`,
-  alpha 1.702, limit 7.0 in ggml's `swiglu_oai` - confirm the constants and the clamp sides from ggml-cpu/ops.cpp and
-  the HF code), for the dense layers, the routed experts and the shared expert. Routing: sigmoid gating, `exp_probs_b`
-  added for the choice only, top 4, weights normalized then x2.0.
-- Output: final RMSNorm, then the Q4_K head. The tokenizer is the GGUF's (gpt2/BPE, pre `minimax-m2`).
-- References to read (all read-only - never execute downloaded code): the HF repo `MiniMaxAI/MiniMax-M3.1-Flash`
-  (`modeling_*.py` with trust_remote_code, config.json), the vLLM source for `minimax_m3` (models/minimax_m3/*), the
-  llama.cpp sources `src/models/minimax-m3.cpp`, `ggml/src/ggml-cpu/ops.cpp` (swiglu_oai), `gguf-py` constants.
+Sources read (data only, nothing executed): llama.cpp's `src/models/minimax-m3.cpp` (the checkout on hardac1,
+`~/src/llama.cpp-glm5`, and upstream master, which agree), `conversion/minimax.py`, `src/llama-graph.cpp`
+(`build_moe_ffn`, `build_ffn`), `ggml/src/ggml-cpu/ops.cpp` (`swiglu_oai`), `src/llama-model.cpp` (rope type), and the
+model's `config.json` on Hugging Face.
 
-## Assignment (make it, then make it fast)
+- **SwiGLU-OAI**: `alpha` 1.702, `limit` 7.0 (llama.cpp's constants, "the same as gpt-oss"; config `swiglu_alpha` / `swiglu_limit`
+  agree). `x = min(gate, limit)`, `y = clamp(up, -limit, limit)`, `out = x * sigmoid(alpha x) * (y + 1)`. Dense FFN, routed
+  experts and the shared expert all use it; gate and up are separate tensors (no interleaving).
+- **RoPE**: NEOX (`LLAMA_ROPE_TYPE_NEOX` for `LLM_ARCH_MINIMAX_M3`): value i pairs with i + 32 in the first 64 of 128
+  values; base 1e7; no scaling. The indexer's q and k use the same RoPE (same `n_rot`, base) after their norm.
+- **Norms**: plain RMS with the weights as stored (the converter adds the Gemma-style +1 into every `*norm.weight`);
+  q and k are normed per head (one [128] weight for all heads), eps 1e-6.
+- **Indexer scoring** (graph, both the decode and the batch path): `score[j] = iq_h . ik_j` per indexer head h (4 heads, one per
+  key/value group), **unscaled**, no softmax, no relu; keys not visible to the query (causal, holes) are -inf; the block
+  score is the **max** over the block's 128 positions (`sparse_score_type: "max"` in the config); the query's own block (and
+  the `local_blocks` - 1 before it) get +1e30 so they always rank in; top-k (K = min(16, blocks)) per (token, group); the
+  attention then reads the positions of those blocks that the ordinary causal mask lets through. The scale is irrelevant to
+  the order. Indexer keys are cached as fp16 like K and V.
+- **Causal edge block**: the current block is always selected; its positions after the query are masked (causal), so a
+  block is attended "partially" only at the edge. Blocks with no visible key score -inf and are never picked.
+- **Router**: sigmoid of the logits; the choice is top-4 of sigmoid + `exp_probs_b`; the weights are the sigmoids (without the
+  bias) of the chosen, divided by their sum (clamped at 6.1035e-5) and multiplied by 2.0.
+- **Differences between the model and the reference, left as found**: the config says `sparse_attention_freq` is 1 on all 60
+  layers, `sparse_init_block` 0 (a block that is always kept?) and the file carries indexer tensors for layers 0-2, but
+  llama.cpp's graph (the reference every number below is checked against) runs layers 0-2 with plain dense attention, loads no
+  indexer for them and knows no init block. They differ only past 2,176 tokens of context (up to 16 blocks + the local
+  one attend everything). `NS_MM31_SPARSE_ALL=1` makes the first three layers sparse too; the default is llama.cpp's.
+- **The reference build**: the llama.cpp checkout on hardac1 stops at a GGUF with 12 tensors more than its graph loads (the
+  dense layers' indexer, which `llama_model_loader` counts and refuses). The reference dump uses a copy of shard 2 without
+  those 12 tensors and a shard 1 with `split.tensors.count` 1176 (`reference/minimaxm3/` scripts), the CPU only
+  (`llama-ns-dump --device none -ngl 0`), the prebuilt binary: nothing was built or served.
 
-Phase 1 - correctness, in this order, each step checked before the next:
-1. Move `crates/minimaxm3` to `llm/minimaxm3` as the engine crate (`ARCH = "minimaxm3"`), keep `Geometry` and the
-   NS_MM31_FILE test. The architecture tests then apply (cli/nextsycl/tests/architecture.rs: prompt-cache checkpoints
-   `cache_fingerprint` / `save` / `restore` / `read_checkpoint`, an entry in main.rs's `engines()`, every env var in
-   docs/environment.md) - read CONTRIBUTING.md and an existing engine (llm/deepseek41, llm/glm5next) first; follow them.
-2. A CPU reference of one layer and then the whole model in Rust or Python written from the reference code (no
-   llama.cpp build: it would be downloaded code), reading the GGUF with `nextsycl-gguf` and the repo's dequant
-   (kernels/llm/deepseek41/silo/std.cpp is bit-exact against ggml for IQ1_M, IQ2_XXS, IQ3_XXS; Q4_K/Q5_K/Q6_K in
-   kernels/llm/qwen35/silo/mmvq.cpp; IQ4_XS in nemotronh's nhs.cpp; Q8_0). Dump per-layer activations for a short prompt.
-3. The engine on the GPUs (B70 + B65, 32 GB each; the 129 GB file streams like DeepSeek V4.1 IQ2_XXS: non-expert
-   weights ~7 GB resident, experts in VRAM / pinned host memory / the file, per llm/deepseek4 and llm/deepseek41 -
-   reuse their expert store, `spare` chain, prefetch and two-card split rather than writing a new one). Compare each
-   layer's output with the reference (cosine, max abs), then greedy tokens identical to the reference for a prompt.
-4. The sparse attention (indexer, block scores, top-k, gather, flash decode over the selected blocks) in the model's
-   silo `kernels/llm/minimaxm3/silo/`, never in shared kernels (CONTRIBUTING.md; docs on silos).
-5. Chat: the GGUF's chat template (Jinja; see how other engines render theirs), the prompt cache, the model card
-   `model-cards/llm/minimax-m3.1-flash-iq1m.yml` (cards are data, not code; licence minimax-community), tool format.
-Phase 2 - speed (only after phase 1 is exact): measure pp and tg (label them so; never a bare tok/s) at 2K / 8K /
-32K contexts with `--ignore-eos --max 256` rungs like docs/ladders/glm-5.3-flash-uncensored_ladder_stats.md; tune the
-expert placement and prefetch, the MoE matvec for IQ1_M / IQ2_XXS / IQ3_XXS / IQ4_XS, the decode attention, and the
-two-card split; per-GPU parallel load (see llm/glm5next engine.rs `NS_LOAD_SEQ`); then an MTP/DSpark draft
-(`dspark-MiniMax-M3.1-Flash-Q8_0.gguf`) if the base is solid. Record the table in docs/ladders/.
+## Results (hardac1, B70, one card, 2026-10-28)
 
-Rules for this work (the user's): commit to the worktree branch only, never push, no Claude attribution in commits or
-comments; tune only inside the model's silo; exact before fast; test files and containers cleaned by exact name; never
-kill an engine mid-run; keep >= 1.5 GB VRAM free on each card; hardac1 `sudo` needs a password (do not use it); no
-llama.cpp server; the production registry and `/var/lib/nextsycl` are not yours to touch - build and test in your own
-copy on hardac1 (`~/src/nextsycl-m3`, rsync with --checksum, touch changed files before cargo builds, runner scripts
-under the shared lock `/tmp/ds2run.lock` like ~/src/glmrun.sh / mossrun.sh, mounting the model dir read-only), and use
-a registry of your own (NS_REGISTRY in your copy's nextsycl.conf, never the production NS_STUDIO_MODES). The production
-chat models and the audio server (Qwen3-TTS on the B70, 4 GB) may be loaded: check `system.busy` / the card's free
-memory before loading anything, and say so if the cards are not free enough instead of unloading others' work.
+- **Exactness** (`nextsycl llm check`, against llama.cpp CPU dumps; the activations into each layer taken from the reference with
+  `NS_MM31_FORCE=<dump>` so the quantization noise of IQ1_M does not accumulate; cosine against the reference):
+  - 19-token prompt (`/var/mnt/2TBSSD/m3ref/short`): every l_out >= 0.99985, kqv_out >= 0.99997, result_output 0.99996, the next token the
+    same; the last token fed alone after the rest: logits cosine 0.99998 (against the whole prompt at once).
+  - 3,881-token prompt (`long`, 31 blocks, so the top-16 selection really chooses): every kqv_out >= 0.99998, every l_out >= 0.99985,
+    result_output 0.99976, the next token the same (" +"), decode-after-prefill logits cosine 0.99997.
+  - Free-running (each layer on its own earlier output) the same checks drift to cosine 0.97-0.98 by layer 30 to 58 (the IQ1_M weights against
+    the CPU reference's Q8_K activations, and a near-tie in the indexer's or the router's choice flips a block or an expert) and the next token can differ
+    where the top two are 0.04 apart (long: "-" 13.21 against " +" 13.17); the teacher-forced runs show it is noise, not a layer that is wrong.
+  - Layer 59 of the dump has one row only (llama.cpp prunes to the output rows there), so its taps compare a shape artifact (l_out-59 0.73-0.79).
+  - `msa_bs` sizes differ (the reference pads the block grid); the block selection is verified through kqv_out, not the raw scores.
+- **Speed**: see the ladder below; the engine today is input/output bound (the experts do not fit one card), the kernels untuned.
+
+### Speed (first measurement, untuned, B70 alone; pp = prompt, tg = generation)
+
+| context | pp | tg | notes |
+| --- | --- | --- | --- |
+| 179 tokens, 160 generated | 2.9 tok/s | 0.89 tok/s | 19 GiB experts in VRAM + 40 GiB pinned, the rest read from the file |
+| 4,044 tokens, 48 generated | 15.9 tok/s | 0.96 tok/s | 19 GiB VRAM + 19 GiB pinned (the default at the time), chunk 1024 |
+| 3,881 tokens (check run) | 24.6 tok/s | - | 36 GiB pinned, chunk 4096 |
+
+What bounds it: the 120 GB of routed experts do not fit one 32 GiB card plus 40 GiB of pinned memory (61 GiB of RAM on the box),
+so about half of each token's expert reads (4 of 128 per layer, 16 MB each) come from the SSD at ~3 GB/s - tg is a file-read
+rate, not a kernel rate. Next: the B65 as a second card holding experts, a draft (DSpark), the silo kernels for the
+IQ1_M/IQ2_XXS/IQ3_XXS mmvq and the sparse attend, and reading ahead the next layer's experts while this one computes.

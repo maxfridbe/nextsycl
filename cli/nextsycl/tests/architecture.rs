@@ -214,7 +214,7 @@ fn every_environment_variable_is_documented() {
 /// Every language engine's registry entry (the program's own list: `engines()` in main.rs)
 fn llm_kinds() -> Vec<nextsycl_llm::EngineKind> {
     vec![nextsycl_llm_glm5next::kind(), nextsycl_llm_qwen4exp::kind(), nextsycl_llm_qwen35::kind(), nextsycl_llm_deepseek2::kind(),
-         nextsycl_llm_deepseek4::kind(), nextsycl_llm_deepseek41::kind(), nextsycl_llm_museglimmer::kind(), nextsycl_llm_nemotronh::kind(), nextsycl_llm_example::kind()]
+         nextsycl_llm_deepseek4::kind(), nextsycl_llm_deepseek41::kind(), nextsycl_llm_museglimmer::kind(), nextsycl_llm_nemotronh::kind(), nextsycl_llm_minimaxm3::kind(), nextsycl_llm_example::kind()]
 }
 
 /// The engines under llm/ (each but the contract)
