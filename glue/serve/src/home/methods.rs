@@ -2004,6 +2004,10 @@ pub struct VideoGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(default = "video")]
     pub chain_mode: Option<ChainMode>,
+    /// the clip's place in its project's timeline (1 and up). Say it: without it the timeline reads the label's NN/MM, else the #N of reentrant_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 1, max = 100000)]
+    pub clip: Option<i64>,
     /// noise on the first frame (harmful here: shows as confetti)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cond_noise_aug: Option<f64>,

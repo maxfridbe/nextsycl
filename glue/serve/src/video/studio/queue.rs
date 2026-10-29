@@ -59,10 +59,11 @@ pub fn label_number(label: &str) -> Option<u64> {
     None
 }
 
-/// A clip's place in the edit: its label's "NN/MM" number, else the pass number the creative platform puts after the
-/// `#` of its `reentrant_id` ("<run>:shots:0:0#17" is the 17th; its labels, "<run>:shots:0:017", carry no "NN/MM"), else 0.
+/// A clip's place in the edit: the `clip` its request stated; for clips made before that key, the label's "NN/MM"
+/// number, else the pass number the creative platform put after the `#` of its `reentrant_id`
+/// ("<run>:shots:0:0#17" is the 17th; its labels, "<run>:shots:0:017", carry no "NN/MM"), else 0.
 pub fn clip_number(item: &Value) -> u64 {
-    label_number(&s(item, "label")).or_else(|| {
+    item["clip"].as_u64().filter(|c| *c > 0).or_else(|| label_number(&s(item, "label"))).or_else(|| {
         let id = s(item, "reentrant_id");
         let tail = id.rsplit_once('#')?.1;
         tail.chars().all(|c| c.is_ascii_digit()).then(|| tail.parse().ok()).flatten()
@@ -345,6 +346,14 @@ impl Studio {
             }
         }
         it.insert("reentrant_id".into(), reentrant(p).map_or(Value::Null, |r| json!(r)));
+        // the clip's place in its project's edit (1 and up): the timeline's n, stated rather than read from the label
+        match p.get("clip").filter(|v| !v.is_null()) {
+            Some(c) => match c.as_u64().filter(|c| (1..=100_000).contains(c)) {
+                Some(c) => it.insert("clip".into(), json!(c)),
+                None => return Err(RpcError::param("clip: a whole number from 1 (the clip's place in its project's timeline)")),
+            },
+            None => it.insert("clip".into(), Value::Null),
+        };
         it.insert("steps".into(), num(p, "steps", 10.0, 1.0, 40.0, true)?);
         it.insert("seed".into(), num(p, "seed", 0.0, -2147483648.0, 2147483648.0, true)?);
         it.insert("te".into(), json!(te));
@@ -535,6 +544,9 @@ mod tests {
         assert_eq!(clip_number(&c("Name 03/12: x", json!("r#9"))), 3, "a label's number comes first");
         assert_eq!(clip_number(&c("cp-smoke:shots:0:0", Value::Null)), 0);
         assert_eq!(clip_number(&c("x", json!("r#x1"))), 0);
+        // stated: it wins over both
+        assert_eq!(clip_number(&json!({"clip": 5, "label": "Name 03/12: x", "reentrant_id": "r#9"})), 5);
+        assert_eq!(clip_number(&json!({"clip": null, "label": "Name 03/12: x"})), 3);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 /// A queue item: a video.generate body as the studio checked it (defaults filled in, files reduced to their names)
 const ITEM: &str = r#"{"type": "object", "description": "the request as checked: every video.generate key, defaults filled in (absent ones null)",
   "properties": {"prompt": {"type": "string"}, "label": {"type": "string"}, "project": {"type": "string"}, "batch": {"type": "string"},
+    "clip": {"type": "integer", "nullable": true, "description": "the clip's place in its project's timeline (1 and up); absent: read from the label's NN/MM, else the reentrant_id's #N"},
     "seconds": {"type": "number"}, "steps": {"type": "integer"}, "seed": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"},
     "engine": {"type": "string"}, "priority": {"type": "integer"}, "te": {"type": "string"}, "chain_mode": {"type": "string"},
     "first_frame": {"type": "string", "nullable": true}, "last_frame": {"type": "string", "nullable": true}, "camera": {"type": "string", "nullable": true}},
@@ -375,7 +376,7 @@ pub fn result(method: &str) -> Option<String> {
   "paused_projects": {"type": "array", "items": {"type": "string"}}, "paused_batches": {"type": "array", "items": {"type": "string"}}}}"#.into(),
         "video.projects.list" => format!(r#"{{"type": "object", "properties": {{"projects": {{"type": "array", "items": {PROJECT}}}, "paused_all": {{"type": "boolean"}}}}}}"#),
         "video.timeline" => r#"{"type": "object", "properties": {"clips": {"type": "array", "description": "by n; for each n the newest finished clip, else the running / queued one", "items": {"type": "object", "properties": {
-  "n": {"type": "integer", "description": "the NN of the label (0: no number)"}, "name": {"type": "string", "nullable": true, "description": "the clip (done or running)"},
+  "n": {"type": "integer", "description": "the request's clip; else the NN of the label, else the reentrant_id's #N (0: none)"}, "name": {"type": "string", "nullable": true, "description": "the clip (done or running)"},
   "state": {"type": "string", "enum": ["done", "running", "held", "queued"]}, "seconds": {"type": "number"}, "camera": {"type": "string", "nullable": true},
   "label": {"type": "string"}, "dialogue": {"type": "string", "description": "the spoken lines"},
   "file": {"type": "string", "nullable": true, "description": "done: the clip's URL"}, "thumb": {"type": "string", "nullable": true, "description": "done: a 240-pixel still's URL (webp)"}}}}}}"#.into(),

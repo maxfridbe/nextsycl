@@ -1531,6 +1531,12 @@ export interface VideoGenerateReq {
    * @default "video"
    */
   chain_mode?: ChainMode | null;
+  /**
+   * the clip's place in its project's timeline (1 and up). Say it: without it the timeline reads the label's NN/MM, else the #N of reentrant_id
+   * @minimum 1
+   * @maximum 100000
+   */
+  clip?: number | null;
   /** noise on the first frame (harmful here: shows as confetti) */
   cond_noise_aug?: number | null;
   /**
