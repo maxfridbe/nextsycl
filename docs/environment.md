@@ -301,6 +301,8 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_MM31_PIN_GIB` | MemAvailable less 16 GiB, at most 32 (in all, shared by the cards in proportion to what their VRAM cannot hold) | The minimaxm3 engine's budget for routed experts kept in pinned host memory (the kernels read them over PCIe) (--opt-pin-gib) | llm:minimaxm3 |
 | `NS_MM31_SPLIT` | half the layers | With two GPUs, how many layers the first runs (the minimaxm3 engine's layer split) (--opt-split) | llm:minimaxm3 |
 | `NS_MM31_DIRECT` | 1 | 0: the minimaxm3 engine reads experts from the file through the page cache; 1: with O_DIRECT, many reads in flight (--opt-direct) | llm:minimaxm3 |
+| `NS_MM31_LANE` | 1 | The copy lane (0 or 1) the minimaxm3 engine copies pinned and file-read experts into VRAM on, beside the compute queue (--opt-lane) | llm:minimaxm3 |
+| `NS_MM31_SPLIT_ATTEND` | 1 | 0: decode passes run the prompt-pass attention kernel instead of the silo's key-split one (--opt-split-attend) | llm:minimaxm3 |
 | `NS_MM31_AHEAD` | 3 | Decode: how many experts of the next layer the minimaxm3 engine guesses (that layer's router on this layer's residual stream) and starts reading while this layer computes; 0 = none, at most 12 (--opt-ahead) | llm:minimaxm3 |
 | `NS_MM31_STREAM_DIR` | unset | A directory on another drive for the minimaxm3 engine: a copy of a share of the experts the cards do not keep is written there once (`mm31-stream-<hash>.bin`, ~17 GiB) and read beside the model's own file, so the misses of a pass come from two drives at once (--opt-stream-dir) | llm:minimaxm3 |
 | `NS_MM31_STREAM_SHARE` | 50 | With `NS_MM31_STREAM_DIR`, the percentage of the off-card experts read from that drive (--opt-stream-share) | llm:minimaxm3 |

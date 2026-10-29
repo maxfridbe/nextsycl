@@ -38,6 +38,8 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "pin-gib", env: "NS_MM31_PIN_GIB", value: "GIB", help: "pinned host memory, in all, for more kept experts (default: what is available less 16, at most 32)", at: At::Load },
     EngineOption { name: "split", env: "NS_MM31_SPLIT", value: "LAYERS", help: "with two GPUs, the layers on the first (default: half)", at: At::Load },
     EngineOption { name: "direct", env: "NS_MM31_DIRECT", value: "0|1", help: "read experts from the file with O_DIRECT (default 1; 0: through the page cache)", at: At::Load },
+    EngineOption { name: "lane", env: "NS_MM31_LANE", value: "0|1", help: "the copy lane the pinned and file-read experts are copied into VRAM on (default 1)", at: At::Load },
+    EngineOption { name: "split-attend", env: "NS_MM31_SPLIT_ATTEND", value: "0|1", help: "0: decode passes use the prompt-pass attention kernel instead of the silo's key-split one", at: At::Load },
     EngineOption { name: "ahead", env: "NS_MM31_AHEAD", value: "N", help: "decode: experts of the next layer guessed and read ahead (default 3, at most 12; 0 = none)", at: At::Load },
     EngineOption { name: "stream-dir", env: "NS_MM31_STREAM_DIR", value: "DIR", help: "a directory on another drive: a copy of a share of the experts that are off the cards is written there once and read beside the model's file", at: At::Load },
     EngineOption { name: "stream-share", env: "NS_MM31_STREAM_SHARE", value: "PERCENT", help: "with stream-dir, the share of the off-card experts read from that drive (default 50)", at: At::Load },
