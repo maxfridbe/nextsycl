@@ -6,6 +6,7 @@ import { render, state } from "../state.js";
 import { navigate } from "../router.js";
 import type { ListRow } from "../types.js";
 import { clipNumber, fmtMS, labelPrefix } from "../util.js";
+import { Spinner } from "./Spinner.js";
 import { Panel } from "./Panel.js";
 
 /** A finished clip knows its project once the server has been told about projects; older
@@ -49,7 +50,8 @@ export function Completed() {
       hint={`${rows.length}${f ? ` of ${state.list.length}` : ""} clips`}
       tools={[filter]}
     >
-      <div class="box">
+      <div style={{ display: !state.slowLoaded ? "" : "none" }}><Spinner label="Loading the finished clips…" /></div>
+      <div class="box" style={{ display: state.slowLoaded ? "" : "none" }}>
         <table class="grid">
           <thead>
             <tr>

@@ -16,7 +16,13 @@ export async function loadTimeline(project?: string): Promise<void> {
     render();
     return;
   }
+  // a project not shown yet: its clips are being fetched (the periodic refresh of the shown one keeps its strip)
+  const first = p !== state.timelineProject || !state.timelineClips.length;
   state.timelineProject = p;
+  if (first) {
+    state.timelineLoading = true;
+    render();
+  }
   try {
     const r = await api.timeline(p);
     state.timelineClips = r.clips.slice().sort((a, b) => a.n - b.n);
@@ -25,6 +31,7 @@ export async function loadTimeline(project?: string): Promise<void> {
     state.error = String(e);
     state.timelineClips = [];
   }
+  state.timelineLoading = false;
   render();
 }
 

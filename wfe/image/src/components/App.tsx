@@ -2,6 +2,7 @@
  *  used - what to make, its progress, the pictures it made, the session's pictures. */
 import { jsx } from "../jsx.js";
 import { state } from "../state.js";
+import { Spinner } from "./Spinner.js";
 import { Create } from "./Create.js";
 import { Gallery, Results, Zoom } from "./Gallery.js";
 import { Panel } from "./Panel.js";
@@ -37,6 +38,7 @@ export function App() {
         <h1><span class="i" props={{ innerHTML: "&#xf03e;" }} /> {title}</h1>
         <GpuPill />
       </div>
+      {!info ? <Spinner label="Connecting to the model…" /> : info.loading ? <Spinner label="Loading the model…" /> : null}
       <Stats />
       {state.error && !state.busy ? <pre class="err">{state.error}</pre> : null}
       {info?.vectorize ? <pre class="err">{`${info.model} writes pictures as SVG (POST /v1/images/vectorize, image.vectorize); this page draws them (serve a drawing model)`}</pre> : null}

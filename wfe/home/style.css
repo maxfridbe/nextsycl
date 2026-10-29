@@ -90,3 +90,10 @@
  .movebar{background:#0f1a2a;border:1px solid #1e3a8a;border-radius:8px;padding:8px 10px;margin:0 0 8px;font-size:13px} .movebar.bad{background:#2a0f0f;border-color:#7f1d1d}
  .mvhead{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap} .mvfile{font-size:11px;overflow-wrap:anywhere;margin-top:2px}
  @media (max-width:640px){ .drow{grid-template-columns:18px 1fr} .drow .dspace,.drow .acts{grid-column:1 / -1} .drow .acts{justify-content:flex-start} .mrow .disk{grid-column:1 / -1} }
+
+/* --- loading spinner (the same block in every app's style.css; Spinner.tsx) -------------- */
+.spin{display:flex;align-items:center;gap:10px;padding:14px 4px;color:#9ca3af;font-size:13px}
+.spin::before{content:"";flex:none;width:16px;height:16px;border:2px solid #3b82f6;border-right-color:transparent;border-radius:50%;animation:nsspin .8s linear infinite}
+.spin.small{padding:4px 0;font-size:12px}.spin.small::before{width:12px;height:12px}
+@keyframes nsspin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spin::before{animation-duration:2.8s}}

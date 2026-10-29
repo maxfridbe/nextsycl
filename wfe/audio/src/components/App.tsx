@@ -2,6 +2,7 @@
  *  used - what to make, its progress, the song it made, the songs made here. */
 import { jsx } from "../jsx.js";
 import { state } from "../state.js";
+import { Spinner } from "./Spinner.js";
 import { Create } from "./Create.js";
 import { Panel } from "./Panel.js";
 import { Progress } from "./Progress.js";
@@ -38,6 +39,7 @@ export function App() {
         <h1><span class="i" props={{ innerHTML: info?.speech ? "&#xf130;" : "&#xf001;" }} /> {title}</h1>
         <GpuPill />
       </div>
+      {!info ? <Spinner label="Connecting to the model…" /> : null}
       <Stats />
       {state.error && !state.busy ? <pre class="err">{state.error}</pre> : null}
       <Panel id="create" icon="&#xf040;" title="Create" hint={info?.arch ?? "connecting…"}>

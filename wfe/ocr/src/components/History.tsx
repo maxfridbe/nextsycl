@@ -4,8 +4,10 @@ import { show } from "../actions.js";
 import { plain } from "../ocr.js";
 import { state } from "../state.js";
 import { fmtT } from "../util.js";
+import { Spinner } from "./Spinner.js";
 
 export function History() {
+  if (!state.historyLoaded) return <Spinner label="Loading the readings…" />;
   if (!state.history.length) return <div class="hint">Nothing read yet.</div>;
   return (
     <div class="hist">

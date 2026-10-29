@@ -71,6 +71,7 @@ async function pollSlow(): Promise<void> {
     state.gpu = gpu;
     state.list = list;
     state.films = films;
+    state.slowLoaded = true;
   } catch {
     /* transient */
   }

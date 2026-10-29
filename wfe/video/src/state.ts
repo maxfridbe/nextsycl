@@ -19,6 +19,10 @@ export interface AppState {
   /** films being joined, and the joins since the studio started */
   joins: Join[];
   filter: string;
+  /** false until the first answer of the slow poll (clips, films): a spinner stands in for those lists */
+  slowLoaded: boolean;
+  /** a project's clips being fetched for the first time (not the 30 s refresh of the one shown) */
+  timelineLoading: boolean;
 
   timelineProject: string | null;
   timelineClips: TimelineClip[];
@@ -50,6 +54,8 @@ export const state: AppState = {
   films: [],
   joins: [],
   filter: "",
+  slowLoaded: false,
+  timelineLoading: false,
   timelineProject: null,
   timelineClips: [],
   selected: null,

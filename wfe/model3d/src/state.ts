@@ -6,6 +6,8 @@ export interface AppState {
   progress: Progress | null;
   gpu: Gpu | null;
   history: Made[];
+  /** false until the history's first answer (a spinner stands in for the list) */
+  historyLoaded: boolean;
   form: Form;
   /** "make" (pictures to a mesh) or "rig" (a mesh rigged or animated) */
   mode: "make" | "rig";
@@ -25,6 +27,7 @@ export const state: AppState = {
   progress: null,
   gpu: null,
   history: [],
+  historyLoaded: false,
   form: { pictures: [], texture: true, seed: null, steps: null, cfg: null, resolution: null, faces: null, textureSize: null, removeBackground: true,
           mesh: "", meshName: "", file: "", prompt: "", frames: null, options: {} },
   mode: "make",

@@ -14,6 +14,7 @@ import { navigate } from "../router.js";
 import type { QueueItem } from "../types.js";
 import { clipNumber, fmtMS, fmtT } from "../util.js";
 import { Panel } from "./Panel.js";
+import { Spinner } from "./Spinner.js";
 import { cancelRunning, isCancelling } from "./Progress.js";
 
 /** A queue row carries its position so the table can number it and remove exactly it. */
@@ -106,6 +107,7 @@ export function Queue() {
   const items = s?.queue_items ?? [];
   const running = runningRow();
   // held and empty still shows: its "resume all" is the way out of the hold the queue puts itself in after failures
+  if (!s) return <Spinner label="Loading the queue…" />;
   if (!items.length && !running && !s?.paused) return <div />;
   const held = items.filter((x) => x.held).length;
   const total = items.reduce((a, x) => a + x.seconds, 0);

@@ -3,8 +3,10 @@ import { jsx } from "../jsx.js";
 import { show } from "../actions.js";
 import { state } from "../state.js";
 import { fmtT, kilo } from "../util.js";
+import { Spinner } from "./Spinner.js";
 
 export function Gallery() {
+  if (!state.historyLoaded) return <Spinner label="Loading what was made…" />;
   if (!state.history.length) return <div class="hint">none yet</div>;
   return (
     <div class="grid3d">

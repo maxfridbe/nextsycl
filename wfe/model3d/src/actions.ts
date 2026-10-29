@@ -10,6 +10,7 @@ export async function refreshHistory(): Promise<void> {
   } catch {
     /* transient */
   }
+  state.historyLoaded = true;
   render();
 }
 

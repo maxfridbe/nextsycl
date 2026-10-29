@@ -20,6 +20,8 @@ export interface AppState {
   progress: Progress | null;
   gpu: Gpu | null;
   history: Reading[];
+  /** false until the history's first answer (a spinner stands in for the list) */
+  historyLoaded: boolean;
   form: Form;
   pages: Page[];
   /** the reading shown (the last one, or one picked from the history) and the pages it read */
@@ -45,6 +47,7 @@ export const state: AppState = {
   progress: null,
   gpu: null,
   history: [],
+  historyLoaded: false,
   form: { preset: "parse", prompt: "", tiles: true, maxTokens: 8192, temperature: 0, guard: true, figures: true, perPage: true, columns: true },
   pages: [],
   result: null,

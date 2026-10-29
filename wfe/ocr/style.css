@@ -174,3 +174,10 @@ figure.page .acts .tbtn{margin-left:0;padding:1px 6px}
 }
 .doc .pagehead{font:600 12px system-ui,sans-serif;color:#57606a;text-transform:uppercase;letter-spacing:.06em;border-top:1px solid #d0d7de;margin:18px 0 6px;padding-top:10px}
 .doc .pagehead:first-child{border-top:0;margin-top:0;padding-top:0}
+
+/* --- loading spinner (the same block in every app's style.css; Spinner.tsx) -------------- */
+.spin{display:flex;align-items:center;gap:10px;padding:14px 4px;color:#9ca3af;font-size:13px}
+.spin::before{content:"";flex:none;width:16px;height:16px;border:2px solid #3b82f6;border-right-color:transparent;border-radius:50%;animation:nsspin .8s linear infinite}
+.spin.small{padding:4px 0;font-size:12px}.spin.small::before{width:12px;height:12px}
+@keyframes nsspin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spin::before{animation-duration:2.8s}}

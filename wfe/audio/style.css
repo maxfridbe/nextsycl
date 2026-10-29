@@ -161,3 +161,10 @@ body{max-width:1100px}
 .vchip{display:inline-flex;align-items:center;gap:0}
 .vchip .x{padding:2px 6px;margin-left:-2px;opacity:.6}
 .vchip .x:hover{opacity:1}
+
+/* --- loading spinner (the same block in every app's style.css; Spinner.tsx) -------------- */
+.spin{display:flex;align-items:center;gap:10px;padding:14px 4px;color:#9ca3af;font-size:13px}
+.spin::before{content:"";flex:none;width:16px;height:16px;border:2px solid #3b82f6;border-right-color:transparent;border-radius:50%;animation:nsspin .8s linear infinite}
+.spin.small{padding:4px 0;font-size:12px}.spin.small::before{width:12px;height:12px}
+@keyframes nsspin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spin::before{animation-duration:2.8s}}

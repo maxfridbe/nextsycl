@@ -3,6 +3,7 @@
 import { jsx } from "../jsx.js";
 import { render, restartService, saveConfig, ui } from "../main.js";
 import type { SettingRow } from "../types.js";
+import { Spinner } from "./Spinner.js";
 
 const READER: Record<string, string> = {
   serve: "this page", switch: "the model switch", studio: "the video studio", video: "the video daemon", llm: "the chat server",
@@ -26,7 +27,7 @@ function Row(s: SettingRow, extra = false) {
 
 export function ConfigView() {
   const c = ui.config;
-  if (!c) return <div class="hint">loading the settings…</div>;
+  if (!c) return <Spinner label="Loading the settings…" />;
   const groups = [...new Set(c.settings.map((s) => s.group ?? ""))];
   const n = Object.keys(ui.edits).length;
   const saved = ui.saved;

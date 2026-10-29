@@ -2,6 +2,7 @@
 import { jsx } from "../jsx.js";
 import { copy, ui } from "../main.js";
 import type { Operation } from "../types.js";
+import { Spinner } from "./Spinner.js";
 
 const KIND_TITLE: Record<string, string> = { system: "System", llm: "Chat", image: "Images", audio: "Audio", video: "Video", openai: "OpenAI-compatible" };
 
@@ -23,7 +24,7 @@ function CopyBtn(text: string, key: string, label = "copy") {
 
 export function Api() {
   const sp = ui.spec;
-  if (!sp) return <div class="hint">loading the spec…</div>;
+  if (!sp) return <Spinner label="Loading the API spec…" />;
   const base = sp.spec.servers[0]?.url ?? location.origin;
   const groups: Record<string, { path: string; method: string; op: Operation }[]> = {};
   for (const [path, ops] of Object.entries(sp.spec.paths)) {

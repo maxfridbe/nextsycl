@@ -4,6 +4,7 @@ import { editPicture, reuse } from "../actions.js";
 import { render, state } from "../state.js";
 import type { Picture } from "../types.js";
 import { fmtT } from "../util.js";
+import { Spinner } from "./Spinner.js";
 
 function meta(p: Picture): string {
   return `${p.pictures ? `edit of ${p.pictures} · ` : ""}seed ${p.seed} · ${p.steps} steps · ${p.width}×${p.height} · ${fmtT(p.seconds)}` +
@@ -35,6 +36,7 @@ export function Results() {
 }
 
 export function Gallery() {
+  if (!state.historyLoaded) return <Spinner label="Loading what was made…" />;
   if (!state.history.length) return <div class="hint">Nothing made yet. Ctrl+Enter in the prompt generates.</div>;
   return <div class="pics small">{state.history.map((p) => <Card p={p} big={false} />)}</div>;
 }

@@ -2,6 +2,7 @@
 import { jsx } from "../jsx.js";
 import { render, state } from "../state.js";
 import { fmtMS } from "../util.js";
+import { Spinner } from "./Spinner.js";
 import { Panel } from "./Panel.js";
 
 export function Films() {
@@ -13,7 +14,8 @@ export function Films() {
       title="Films"
       hint={`${films.length} joined · click to load at full resolution`}
     >
-      <div class="box">
+      <div style={{ display: !state.slowLoaded ? "" : "none" }}><Spinner label="Loading the films…" /></div>
+      <div class="box" style={{ display: state.slowLoaded ? "" : "none" }}>
         <table class="grid">
           <thead>
             <tr><th>film</th><th class="num">length</th><th class="num">MB</th><th /></tr>

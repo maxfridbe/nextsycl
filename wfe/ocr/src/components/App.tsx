@@ -2,6 +2,7 @@
  *  used - the pages and the instructions, the reading, the readings made here. */
 import { jsx } from "../jsx.js";
 import { state } from "../state.js";
+import { Spinner } from "./Spinner.js";
 import { History } from "./History.js";
 import { Output } from "./Output.js";
 import { Panel } from "./Panel.js";
@@ -37,6 +38,7 @@ export function App() {
         <h1><span class="i" props={{ innerHTML: "&#xf15c;" }} /> {info ? info.model : "nextsycl ocr"}</h1>
         <GpuPill />
       </div>
+      {!info ? <Spinner label="Connecting to the model…" /> : info.loading ? <Spinner label="Loading the model…" /> : null}
       <Stats />
       {state.error && !state.busy ? <pre class="err">{state.error}</pre> : null}
       {info && !info.loading && info.reads === false

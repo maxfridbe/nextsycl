@@ -12,6 +12,7 @@ import type { Scene, TimelineClip } from "../types.js";
 import { fmtMS, fmtT, here } from "../util.js";
 import { ClipProgress } from "./Progress.js";
 import { Detail } from "./Detail.js";
+import { Spinner } from "./Spinner.js";
 import { Panel } from "./Panel.js";
 
 function exportScene(): void {
@@ -200,6 +201,7 @@ export function Timeline() {
     >
       <ClipProgress />
       <ProjectProgress clips={clips} total={total} />
+      <div style={{ display: state.timelineLoading ? "" : "none" }}><Spinner label={`Loading the clips of ${project}…`} /></div>
       <div class="tl">
         <div class="tlinner" style={{ width: `${Math.round(total * px) + 40}px` }}>
           {cameras.map((k) => (

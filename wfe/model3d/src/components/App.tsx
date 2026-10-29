@@ -2,6 +2,7 @@
  *  its progress, the viewer, the meshes made here. */
 import { jsx } from "../jsx.js";
 import { state } from "../state.js";
+import { Spinner } from "./Spinner.js";
 import { Create } from "./Create.js";
 import { Gallery } from "./Gallery.js";
 import { Panel } from "./Panel.js";
@@ -40,6 +41,7 @@ export function App() {
         <GpuPill />
       </div>
       {state.error && !state.busy ? <pre class="err">{state.error}</pre> : null}
+      {!info ? <Spinner label="Connecting to the model…" /> : null}
       <Panel id="create" icon="&#xf040;" title="Create" hint={what}>
         <Create />
       </Panel>

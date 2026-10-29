@@ -6,6 +6,8 @@ export interface AppState {
   progress: Progress | null;
   gpu: Gpu | null;
   history: Picture[];
+  /** false until the history's first answer (a spinner stands in for the list) */
+  historyLoaded: boolean;
   form: Form;
   /** the last request's pictures */
   results: Picture[];
@@ -29,6 +31,7 @@ export const state: AppState = {
   progress: null,
   gpu: null,
   history: [],
+  historyLoaded: false,
   form: {
     prompt: "", negative: "", width: 1024, height: 1024, steps: null, n: 1, seed: null,
     sampler: "", schedule: "", cfg: null, shift: null, rgba: false, loras: {}, options: {},

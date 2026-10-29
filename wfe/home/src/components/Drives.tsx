@@ -3,6 +3,7 @@
 import { jsx } from "../jsx.js";
 import { driveAct, ui } from "../main.js";
 import type { Drive, Model, Move } from "../types.js";
+import { Spinner } from "./Spinner.js";
 
 const GIB = 1024 ** 3;
 const gb = (b: number) => (b / GIB).toFixed(b < 10 * GIB ? 1 : 0);
@@ -62,6 +63,7 @@ function DriveRow(d: Drive) {
 
 export function DrivesPanel() {
   const dv = ui.state?.drives;
+  if (!ui.state) return <section class="panel"><div class="pbody"><Spinner label="Loading the drives…" /></div></section>;
   if (!dv || !dv.drives.length) return null;
   return (
     <section class="panel">
