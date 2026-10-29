@@ -168,7 +168,7 @@ impl Reader {
                     Ok(0) | Err(_) => return false,
                     Ok(r) => got += r,
                 }
-                if got < need && got % 4096 != 0 {
+                if got < need && !got.is_multiple_of(4096) {
                     return false;
                 }
             }
@@ -621,8 +621,8 @@ impl<'g> MiniMax<'g> {
         }
         let mut owner = vec![0usize; n_layer];
         for c in 0..ncard {
-            for l in bounds[c]..bounds[c + 1] {
-                owner[l] = c;
+            for o in owner.iter_mut().take(bounds[c + 1]).skip(bounds[c]) {
+                *o = c;
             }
         }
         for gpu in gpus {
@@ -1316,6 +1316,7 @@ impl<'g> MiniMax<'g> {
     }
 
     /// One expert's three products for the `list` of (token, weight), added into `y` (queued on the card; no wait)
+    #[allow(clippy::too_many_arguments)]
     fn expert_compute(&self, cd: &Card, m: &Moe, base: *const u8, x: &DevBuf, ys: &DevBuf, plane: usize, list: &[(i32, f32, i32)]) -> Result<()> {
         let c = self.g.n_embd as usize;
         let fe = m.gate.rows;
