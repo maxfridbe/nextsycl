@@ -29,9 +29,12 @@ pub struct Api {
     pub swiglu_oai: unsafe extern "C" fn(Gpu, *const f32, *const f32, *mut f32, i64, f32, f32) -> c_int,
     pub idx_scores: unsafe extern "C" fn(Gpu, *const f32, *const u16, *mut f32, i64, i64, i64, i64, i64) -> c_int,
     pub idx_topk: unsafe extern "C" fn(Gpu, *mut f32, *mut i32, i64, i64, i64, i64) -> c_int,
-    #[allow(clippy::type_complexity)]
-    pub attend: unsafe extern "C" fn(Gpu, *const f32, *const u16, *const u16, *const i32, i64, *mut f32, i64, i64, i64, i64, f32) -> c_int,
+    pub attend: AttendFn,
+    /// the silo's prompt-pass attention (kernels/llm/minimaxm3/silo/mm3s.h), when the silo is there
+    pub silo_attend: Option<AttendFn>,
 }
+
+pub type AttendFn = unsafe extern "C" fn(Gpu, *const f32, *const u16, *const u16, *const i32, i64, *mut f32, i64, i64, i64, i64, f32) -> c_int;
 
 /// The table, bound once (an error when the library lacks a symbol: an older build)
 pub fn api() -> nextsycl_core::Result<&'static Api> {
@@ -72,6 +75,11 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             idx_scores: sym!("ns_llm_minimaxm3_idx_scores"),
             idx_topk: sym!("ns_llm_minimaxm3_idx_topk"),
             attend: sym!("ns_llm_minimaxm3_attend"),
+            silo_attend: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
+                let p = s.symbol("ns_mm3s_attend");
+                // SAFETY: the symbol is declared in mm3s.h with AttendFn's signature.
+                (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, AttendFn>(p) })
+            }),
         })
     })
     .as_ref()

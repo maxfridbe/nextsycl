@@ -1204,14 +1204,14 @@ impl<'g> MiniMax<'g> {
                     tap(&format!("msa_bs-{l}"), &bs)?;
                     ffi::check((self.k.idx_topk)(raw, bs.fp(), sel.ptr().cast::<i32>(), t as i64, ih as i64, nblk as i64, kk as i64), "idx_topk")?;
                     self.lap(cd, l, 1, &mut tm);
-                    ffi::check((self.k.attend)(raw, q.fp(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), sel.ptr().cast::<i32>().cast_const(),
+                    ffi::check((self.attend_fn(t, h, kv, hd))(raw, q.fp(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), sel.ptr().cast::<i32>().cast_const(),
                                                kk as i64, out.fp(), t as i64, h as i64, kv as i64, p0 as i64, scale), "attend")?;
                 }
             }
             _ => {
                 // SAFETY: caches hold n_pos positions; out t * h * hd floats.
                 unsafe {
-                    ffi::check((self.k.attend)(raw, q.fp(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), std::ptr::null(), 0, out.fp(),
+                    ffi::check((self.attend_fn(t, h, kv, hd))(raw, q.fp(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), std::ptr::null(), 0, out.fp(),
                                                t as i64, h as i64, kv as i64, p0 as i64, scale), "attend")?;
                 }
             }
@@ -1222,6 +1222,14 @@ impl<'g> MiniMax<'g> {
         self.matmul(cd, &ly.o, &out, t, &o)?;
         self.lap(cd, l, 0, &mut tm);
         Ok(o)
+    }
+
+    /// The attention kernel for `t` query rows: the silo's for a prompt pass (its tile loop needs rows to share), else the shared one
+    fn attend_fn(&self, t: usize, h: usize, kv: usize, hd: usize) -> ffi::AttendFn {
+        match self.k.silo_attend {
+            Some(f) if t >= 8 && h == kv * 16 && hd == 128 => f,
+            _ => self.k.attend,
+        }
     }
 
     fn dense(&self, cd: &Card, d: &Dense, x: &DevBuf, t: usize) -> Result<DevBuf> {
@@ -1597,6 +1605,7 @@ impl<'g> MiniMax<'g> {
             tap(&format!("attn_norm-{l}"), &xn)?;
             self.lap(cd, l, 7, &mut tm);
             let att = self.attention(cd, l, ly, s, &xn, t, p0, &mut *tap)?;
+            tm = Instant::now();
             self.add(cd, &att, &x, t * c)?;
             tap(&format!("ffn_inp-{l}"), &att)?;
             let hn = cd.arena.f32(t * c)?;
