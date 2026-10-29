@@ -1577,6 +1577,14 @@ export interface VideoGenerateReq {
   first_audio?: string | null;
   /** seconds of first_audio to continue from */
   first_audio_s?: number | null;
+  /** file: a driving soundtrack (a song, video.upload): the clip's length of it from soundtrack_start pinned under the whole clip as an audio keyframe - the picture is made to it (a singer's mouth to the singing) and the clip carries the file's own sound. Not with first_audio; a chain carries the picture only. For a whole song: a chain of clips, each from where its first frame is in the song (the previous start + (frames - context_frames) / 24), joined, the song laid under the join */
+  soundtrack?: string | null;
+  /**
+   * seconds into the soundtrack at the clip's first frame (default 0)
+   * @minimum 0
+   * @default 0
+   */
+  soundtrack_start?: number | null;
   /** anchor or file: the clip starts on this picture / clip's last frame */
   first_frame?: string | null;
   /**

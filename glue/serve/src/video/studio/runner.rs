@@ -114,6 +114,11 @@ impl Studio {
                 spec["first_audio_s"] = json!(sec);
             }
         }
+        let track = s(item, "soundtrack");
+        if !track.is_empty() {
+            spec["soundtrack"] = json!(format!("{}/{track}", self.out_in));
+            spec["soundtrack_start"] = json!(item["soundtrack_start"].as_f64().unwrap_or(0.0));
+        }
         if let Some(src) = self.resolve(st, item, "exposure_ref", &s(item, "exposure_ref")) {
             spec["first_frame_ref"] = json!(if image(&src) { format!("{}/{src}", self.out_in) } else { self.clip_file(&src, &[".last.png", ".mp4"]) });
         }

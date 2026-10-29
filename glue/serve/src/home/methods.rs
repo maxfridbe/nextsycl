@@ -2043,6 +2043,13 @@ pub struct VideoGenerateReq {
     /// seconds of first_audio to continue from
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_audio_s: Option<f64>,
+    /// file: a driving soundtrack (a song, video.upload): the clip's length of it from soundtrack_start pinned under the whole clip as an audio keyframe - the picture is made to it (a singer's mouth to the singing) and the clip carries the file's own sound. Not with first_audio; a chain carries the picture only. For a whole song: a chain of clips, each from where its first frame is in the song (the previous start + (frames - context_frames) / 24), joined, the song laid under the join
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soundtrack: Option<String>,
+    /// seconds into the soundtrack at the clip's first frame (default 0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0, default = 0)]
+    pub soundtrack_start: Option<f64>,
     /// anchor or file: the clip starts on this picture / clip's last frame
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_frame: Option<String>,

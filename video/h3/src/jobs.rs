@@ -846,6 +846,9 @@ pub struct ClipInputs<'a> {
     pub guides: Vec<(&'a Path, usize, i64)>,
     /// the last seconds of a sound (`.lastaud.safetensors` or any media file) pinned at frame 0
     pub first_audio: Option<(&'a Path, f64)>,
+    /// a driving soundtrack (a song) and the second of it at the clip's first frame: the clip's length of it is pinned
+    /// under the whole clip as an audio keyframe (the picture is made to it) and laid under the finished clip
+    pub soundtrack: Option<(&'a Path, f64)>,
     /// how much to trust the video keyframes (0.999 by default; lower = trust a degraded anchor less)
     pub cond_noise_aug: Option<f32>,
     /// the flow shifts (12 and 3 by default)
@@ -1030,6 +1033,20 @@ fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frame
         match kfs.iter_mut().find(|k| k.frame_index == 0 && k.audio.is_none()) {
             Some(k) => k.audio = Some((z, rt)),
             None => kfs.push(KeyframeIn { frame_index: 0, video: None, audio: Some((z, rt)) }),
+        }
+    }
+    if let Some((p, start)) = inp.soundtrack {
+        // the clip's length of the song, encoded; fitted to the clip's audio latent length (cut, or its last frame repeated)
+        let rate = crate::audio::SAMPLE_RATE;
+        let at = (frames as f64 / 24.0 * 40.0).round() as usize;
+        let chans = crate::media::read_audio_span(p, start, frames as f64 / 24.0, rate)?;
+        let aenc = crate::audio::AudioEncoder::load(dev, &Checkpoint::open(vaes.audio.ok_or("a soundtrack needs the audio decoder's checkpoint (audio_vae)")?)?)?;
+        let (z, rt) = aenc.encode(&chans)?;
+        let fit: Vec<f32> = (0..64).flat_map(|c| (0..at).map(move |i| (c, i))).map(|(c, i)| z[c * rt + i.min(rt - 1)]).collect();
+        ctl.say(format!("keyframe: the soundtrack {} from {start:.2} s ({} latent frames, {at} in the clip) under the whole clip", p.display(), rt));
+        match kfs.iter_mut().find(|k| k.frame_index == 0 && k.audio.is_none()) {
+            Some(k) => k.audio = Some((fit, at)),
+            None => kfs.push(KeyframeIn { frame_index: 0, video: None, audio: Some((fit, at)) }),
         }
     }
     Ok((kfs, pictures.into_inner()))
@@ -1217,6 +1234,9 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         return Err(Error(format!("the canvas must be a multiple of 32 on both sides, got {}x{}", c.width, c.height)));
     }
     let (frames, lt, at) = temporal_shape(c.seconds);
+    if c.inputs.soundtrack.is_some() && (c.inputs.first_audio.is_some() || c.inputs.source.is_some()) {
+        return Err(Error("a soundtrack is the clip's whole sound: not with first_audio or a source".into()));
+    }
     let shape = Shape { t: lt, h: c.height / 16, w: c.width / 16, audio_t: at };
     ctl.say(format!("clip   : {}x{}, {frames} frames ({:.2} s), {} steps, seed {}", c.width, c.height, frames as f64 / 24.0, c.steps, c.seed));
     // the keyframes and the references first (their pictures are part of the prompt's presentation)
@@ -1366,6 +1386,11 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         ]), &BTreeMap::new())?;
     }
     let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video: v, t: shape.t, h: shape.h, w: shape.w, audio: Some((a, shape.audio_t)) }, &c.vaes, Some(out), None, Some(out), ctl)?;
+    if let Some((p, start)) = c.inputs.soundtrack {
+        // the clip carries the song itself, not the audio decoder's rendering of it
+        crate::media::mux_sound(out, p, start, frames as f64 / 24.0)?;
+        rep["soundtrack"] = json!({"path": p.display().to_string(), "start": start, "seconds": frames as f64 / 24.0});
+    }
     let total = t_all.elapsed().as_secs_f64();
     rep["text_encoder_seconds"] = json!(te_secs);
     rep["sample_seconds"] = json!(sample_secs);
@@ -1514,6 +1539,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                         None => Vec::new(),
                     },
                     first_audio: s("first_audio").map(|p| (Path::new(p), n("first_audio_s").unwrap_or(1.0))),
+                    soundtrack: s("soundtrack").filter(|p| !p.is_empty()).map(|p| (Path::new(p), n("soundtrack_start").unwrap_or(0.0).max(0.0))),
                     cond_noise_aug: n("cond_noise_aug").map(|v| v as f32),
                     shift: match (n("shift_video"), n("shift_audio")) {
                         (None, None) => None,

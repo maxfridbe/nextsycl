@@ -107,6 +107,8 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "first_latent", env: "", value: "FILE", help: "continue from a clip's last latent (.lastlat) - jumps lighter or darker with false texture: chain a PNG", at: At::Request },
     EngineOption { name: "guide_clip", env: "", value: "MP4[:N[:I]]", help: "a clip's last N frames (5, 22, 39: 17k + 5) as a moving keyframe at frame I - motion across a cut (22 frames + a 0.9167 s first_audio)", at: At::Request },
     EngineOption { name: "first_audio", env: "", value: "FILE", help: "continue a clip's sound (.lastaud)", at: At::Request },
+    EngineOption { name: "soundtrack", env: "", value: "FILE", help: "a driving soundtrack (a song): the clip's length of it from soundtrack_start is pinned under the whole clip as an audio keyframe, the picture is made to it, and the song is laid under the clip", at: At::Request },
+    EngineOption { name: "soundtrack_start", env: "", value: "S", help: "seconds into the soundtrack at the clip's first frame (default 0)", at: At::Request },
     EngineOption { name: "first_audio_s", env: "", value: "S", help: "seconds of it (default 1, at least 0.75; a guide's length with guide_clip) - the join must overlap exactly this", at: At::Request },
     EngineOption { name: "ref_audio", env: "", value: "WAV[,WAV...]", help: "a voice to hold (up to three)", at: At::Request },
     EngineOption { name: "source", env: "", value: "MP4", help: "a clip to regenerate part of", at: At::Request },
