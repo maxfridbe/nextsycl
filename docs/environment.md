@@ -301,10 +301,12 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_MM31_PIN_GIB` | MemAvailable less 16 GiB, at most 32 (in all, shared by the cards in proportion to what their VRAM cannot hold) | The minimaxm3 engine's budget for routed experts kept in pinned host memory (the kernels read them over PCIe) (--opt-pin-gib) | llm:minimaxm3 |
 | `NS_MM31_SPLIT` | half the layers | With two GPUs, how many layers the first runs (the minimaxm3 engine's layer split) (--opt-split) | llm:minimaxm3 |
 | `NS_MM31_DIRECT` | 1 | 0: the minimaxm3 engine reads experts from the file through the page cache; 1: with O_DIRECT, many reads in flight (--opt-direct) | llm:minimaxm3 |
+| `NS_MM31_SPLITREAD` | 8 | Pieces an expert matrix is read in at once by the minimaxm3 engine (each its own request, one thread each), so a miss reads with several requests in flight (--opt-splitread) | llm:minimaxm3 |
 | `NS_MM31_LANE` | 1 | The copy lane (0 or 1) the minimaxm3 engine copies pinned and file-read experts into VRAM on, beside the compute queue (--opt-lane) | llm:minimaxm3 |
 | `NS_MM31_SPLIT_ATTEND` | 1 | 0: decode passes run the prompt-pass attention kernel instead of the silo's key-split one (--opt-split-attend) | llm:minimaxm3 |
 | `NS_MM31_FUSED` | 1 | 0: the minimaxm3 decode experts run as the shared kernels' three products each instead of the silo's fused gate+up and down launches (--opt-fused) | llm:minimaxm3 |
 | `NS_MM3S_RPS` | 2 | Debug: output rows a sub-group of the minimaxm3 silo's expert products works at once (1 or 2) | llm:minimaxm3 |
+| `NS_MM3S_KU` | 1 | Debug: blocks of a row the minimaxm3 silo's expert products decode before multiplying (1 or 2) | llm:minimaxm3 |
 | `NS_MM31_DYNAMIC` | 1 | 0: the minimaxm3 engine keeps the experts where the load put them; by default decode passes keep the most recently used experts of each layer in VRAM and the next in pinned memory (the used ones swap into VRAM, copied on the copy lanes) | llm:minimaxm3 |
 | `NS_MM31_TRACE` | unset | Debug: a file the minimaxm3 engine writes one line a layer of every one-token pass to ("layer expert expert ..."), for cache studies | llm:minimaxm3 |
 | `NS_MM31_AHEAD` | 3 | Decode: how many experts of the next layer the minimaxm3 engine guesses (that layer's router on this layer's residual stream) and starts reading while this layer computes; 0 = none, at most 12 (--opt-ahead) | llm:minimaxm3 |

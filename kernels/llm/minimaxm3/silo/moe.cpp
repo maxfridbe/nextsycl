@@ -120,7 +120,7 @@ constexpr int SG = 32, RPG = 4;
 
 // h[e * rows + r] = swiglu_oai(gate_e[r] . x, up_e[r] . x) for the entries' experts: bases[e] the expert's gate matrix, the up matrix
 // `off_up` bytes after it. A sub-group works RPS output rows (both of their matrices) at once.
-template <int T, int RPS>
+template <int T, int RPS, int KU>
 void gu(sycl::queue& q, const uint64_t* bases, int64_t off_up, const float* x, float* h, int64_t entries, int64_t rows, int64_t cols, float alpha, float limit) {
     constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32;
     const int64_t rgs = (rows + RPG * RPS - 1) / (RPG * RPS), nb = cols / 256, rowb = nb * SB;
@@ -139,20 +139,29 @@ void gu(sycl::queue& q, const uint64_t* bases, int64_t off_up, const float* x, f
             const uint8_t* gate = reinterpret_cast<const uint8_t*>(bases[e]);
             const uint8_t* up = gate + off_up;
             float ag[RPS] = {}, au[RPS] = {};
-            for (int64_t k = 0; k < nb; ++k) {
-                float wg[RPS][8], wu[RPS][8];
+            for (int64_t k0 = 0; k0 < nb; k0 += KU) {
+                // KU blocks of RPS rows (gate and up) decoded first, their loads in flight together, then multiplied
+                float wg[KU][RPS][8], wu[KU][RPS][8];
 #pragma unroll
-                for (int j = 0; j < RPS; ++j) {
-                    const int64_t r = r0 + j < rows ? r0 + j : rows - 1;
-                    Deq<T>::group(gate + r * rowb + k * SB, lane, wg[j], L);
-                    Deq<T>::group(up + r * rowb + k * SB, lane, wu[j], L);
+                for (int u = 0; u < KU; ++u) {
+                    const int64_t k = k0 + u < nb ? k0 + u : nb - 1;
+#pragma unroll
+                    for (int j = 0; j < RPS; ++j) {
+                        const int64_t r = r0 + j < rows ? r0 + j : rows - 1;
+                        Deq<T>::group(gate + r * rowb + k * SB, lane, wg[u][j], L);
+                        Deq<T>::group(up + r * rowb + k * SB, lane, wu[u][j], L);
+                    }
                 }
-                const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(x + k * 256 + lane * 8);
-                const sycl::float4 a = xv[0], b = xv[1];
 #pragma unroll
-                for (int j = 0; j < RPS; ++j) {
-                    ag[j] += wg[j][0] * a.x() + wg[j][1] * a.y() + wg[j][2] * a.z() + wg[j][3] * a.w() + wg[j][4] * b.x() + wg[j][5] * b.y() + wg[j][6] * b.z() + wg[j][7] * b.w();
-                    au[j] += wu[j][0] * a.x() + wu[j][1] * a.y() + wu[j][2] * a.z() + wu[j][3] * a.w() + wu[j][4] * b.x() + wu[j][5] * b.y() + wu[j][6] * b.z() + wu[j][7] * b.w();
+                for (int u = 0; u < KU; ++u) {
+                    if (k0 + u >= nb) break;
+                    const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(x + (k0 + u) * 256 + lane * 8);
+                    const sycl::float4 a = xv[0], b = xv[1];
+#pragma unroll
+                    for (int j = 0; j < RPS; ++j) {
+                        ag[j] += wg[u][j][0] * a.x() + wg[u][j][1] * a.y() + wg[u][j][2] * a.z() + wg[u][j][3] * a.w() + wg[u][j][4] * b.x() + wg[u][j][5] * b.y() + wg[u][j][6] * b.z() + wg[u][j][7] * b.w();
+                        au[j] += wu[u][j][0] * a.x() + wu[u][j][1] * a.y() + wu[u][j][2] * a.z() + wu[u][j][3] * a.w() + wu[u][j][4] * b.x() + wu[u][j][5] * b.y() + wu[u][j][6] * b.z() + wu[u][j][7] * b.w();
+                    }
                 }
             }
 #pragma unroll
@@ -170,7 +179,7 @@ void gu(sycl::queue& q, const uint64_t* bases, int64_t off_up, const float* x, f
 }
 
 // ys[rank[e] * plane + r] = w[e] * (down_e[r] . h_e) with h_e = h + e * cols
-template <int T, int RPS>
+template <int T, int RPS, int KU>
 void down(sycl::queue& q, const uint64_t* bases, int64_t off_down, const float* h, const float* w, const int32_t* rank, float* ys, int64_t plane, int64_t entries, int64_t rows, int64_t cols) {
     constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32;
     const int64_t rgs = (rows + RPG * RPS - 1) / (RPG * RPS), nb = cols / 256, rowb = nb * SB;
@@ -189,18 +198,26 @@ void down(sycl::queue& q, const uint64_t* bases, int64_t off_down, const float* 
             const uint8_t* base = reinterpret_cast<const uint8_t*>(bases[e]) + off_down;
             const float* he = h + e * cols;
             float acc[RPS] = {};
-            for (int64_t k = 0; k < nb; ++k) {
-                float wd[RPS][8];
+            for (int64_t k0 = 0; k0 < nb; k0 += KU) {
+                float wd[KU][RPS][8];
 #pragma unroll
-                for (int j = 0; j < RPS; ++j) {
-                    const int64_t r = r0 + j < rows ? r0 + j : rows - 1;
-                    Deq<T>::group(base + r * rowb + k * SB, lane, wd[j], L);
+                for (int u = 0; u < KU; ++u) {
+                    const int64_t k = k0 + u < nb ? k0 + u : nb - 1;
+#pragma unroll
+                    for (int j = 0; j < RPS; ++j) {
+                        const int64_t r = r0 + j < rows ? r0 + j : rows - 1;
+                        Deq<T>::group(base + r * rowb + k * SB, lane, wd[u][j], L);
+                    }
                 }
-                const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(he + k * 256 + lane * 8);
-                const sycl::float4 a = xv[0], b = xv[1];
 #pragma unroll
-                for (int j = 0; j < RPS; ++j)
-                    acc[j] += wd[j][0] * a.x() + wd[j][1] * a.y() + wd[j][2] * a.z() + wd[j][3] * a.w() + wd[j][4] * b.x() + wd[j][5] * b.y() + wd[j][6] * b.z() + wd[j][7] * b.w();
+                for (int u = 0; u < KU; ++u) {
+                    if (k0 + u >= nb) break;
+                    const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(he + (k0 + u) * 256 + lane * 8);
+                    const sycl::float4 a = xv[0], b = xv[1];
+#pragma unroll
+                    for (int j = 0; j < RPS; ++j)
+                        acc[j] += wd[u][j][0] * a.x() + wd[u][j][1] * a.y() + wd[u][j][2] * a.z() + wd[u][j][3] * a.w() + wd[u][j][4] * b.x() + wd[u][j][5] * b.y() + wd[u][j][6] * b.z() + wd[u][j][7] * b.w();
+                }
             }
 #pragma unroll
             for (int j = 0; j < RPS; ++j) {
@@ -222,7 +239,9 @@ int ns_mm3s_expert_gu(ns_gpu* g, int type, const uint64_t* bases, int64_t off_up
     NS_TRY
     if (!ns_mm3s_expert_supported(type, cols)) return ns_fail("ns_mm3s_expert_gu: type " + std::to_string(type) + " with cols " + std::to_string(cols));
     static const int rps = [] { const char* v = std::getenv("NS_MM3S_RPS"); return v ? std::atoi(v) : 2; }();
-#define RUN(T) if (rps == 1) gu<T, 1>(g->q, bases, off_up, x, h, entries, rows, cols, alpha, limit); else gu<T, 2>(g->q, bases, off_up, x, h, entries, rows, cols, alpha, limit); return 0;
+    static const int ku = [] { const char* v = std::getenv("NS_MM3S_KU"); return v ? std::atoi(v) : 1; }();
+#define GU(T, R, K) gu<T, R, K>(g->q, bases, off_up, x, h, entries, rows, cols, alpha, limit)
+#define RUN(T) if (rps == 1) { if (ku == 2) GU(T, 1, 2); else GU(T, 1, 1); } else if (rps == 4) { if (ku == 2) GU(T, 4, 2); else GU(T, 4, 1); } else { if (ku == 2) GU(T, 2, 2); else GU(T, 2, 1); } return 0;
     switch (type) {
         case T_IQ2_XXS: RUN(T_IQ2_XXS)
         case T_IQ1_M: RUN(T_IQ1_M)
@@ -239,7 +258,9 @@ int ns_mm3s_expert_down(ns_gpu* g, int type, const uint64_t* bases, int64_t off_
     NS_TRY
     if (!ns_mm3s_expert_supported(type, cols)) return ns_fail("ns_mm3s_expert_down: type " + std::to_string(type) + " with cols " + std::to_string(cols));
     static const int rps = [] { const char* v = std::getenv("NS_MM3S_RPS"); return v ? std::atoi(v) : 2; }();
-#define RUN(T) if (rps == 1) down<T, 1>(g->q, bases, off_down, h, w, rank, ys, plane, entries, rows, cols); else down<T, 2>(g->q, bases, off_down, h, w, rank, ys, plane, entries, rows, cols); return 0;
+    static const int ku = [] { const char* v = std::getenv("NS_MM3S_KU"); return v ? std::atoi(v) : 1; }();
+#define DN(T, R, K) down<T, R, K>(g->q, bases, off_down, h, w, rank, ys, plane, entries, rows, cols)
+#define RUN(T) if (rps == 1) { if (ku == 2) DN(T, 1, 2); else DN(T, 1, 1); } else if (rps == 4) { if (ku == 2) DN(T, 4, 2); else DN(T, 4, 1); } else { if (ku == 2) DN(T, 2, 2); else DN(T, 2, 1); } return 0;
     switch (type) {
         case T_IQ2_XXS: RUN(T_IQ2_XXS)
         case T_IQ1_M: RUN(T_IQ1_M)
