@@ -300,7 +300,7 @@ pub fn serve(cfg: &Config, raw: &[String]) -> Result<(), String> {
         println!("the studio is already running ({})", web_line(cfg));
         return Ok(());
     }
-    if !cfg.dist.join("wfe/video/index.html").exists() {
+    if !nextsycl_serve::wfe::exists(&cfg.dist.join("wfe"), "video/index.html") {
         return Err(format!("{}: the front end is not built yet (./build.sh wfe)", cfg.dist.join("wfe").display()));
     }
     let sock_dir = cfg.socket_dir();

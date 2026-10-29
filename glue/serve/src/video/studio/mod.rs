@@ -610,8 +610,8 @@ impl Studio {
         match path.as_str() {
             "/" | "/index.html" => {
                 // nextsycl: the built front ends' root (dist/wfe), this one's page in video/
-                let html = std::fs::read_to_string(self.ui.join("video/index.html"))?;
-                let css = std::fs::read_to_string(self.ui.join("video/style.css")).unwrap_or_default();
+                let html = crate::wfe::text(&self.ui, "video/index.html").ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "the video page is not built (./build.sh wfe)"))?;
+                let css = crate::wfe::text(&self.ui, "video/style.css").unwrap_or_default();
                 http::respond_bytes(stream, 200, "text/html; charset=utf-8", html.replace("__CSS__", &css).as_bytes())
             }
             "/api/gpu" => respond_json(&self.gpu()),
@@ -666,14 +666,14 @@ impl Studio {
                 }
                 if let Some(rel) = path.strip_prefix("/ui/") {
                     if !rel.split('/').any(|c| c == ".." || c.is_empty()) {
-                        return match std::fs::read(self.ui.join(rel)) {
+                        return match crate::wfe::read(&self.ui, rel).ok_or(()) {
                             Ok(b) => http::respond_bytes(stream, 200, http::content_type(rel), &b),
                             Err(_) => http::respond(stream, 404, &json!({"error": format!("no front-end file {rel}")})),
                         };
                     }
                 }
                 if let Some(rel) = path.strip_prefix("/static/") {
-                    if let Ok(b) = std::fs::read(self.ui.join("static").join(queue::basename(rel))) {
+                    if let Some(b) = crate::wfe::read(&self.ui, &format!("static/{}", queue::basename(rel))) {
                         return http::respond_bytes(stream, 200, http::content_type(rel), &b);
                     }
                 }
@@ -752,7 +752,7 @@ fn unescape(s: &str) -> String {
 }
 
 pub fn run(o: Options) -> http::Result<()> {
-    if !o.ui.join("video/index.html").exists() {
+    if !crate::wfe::exists(&o.ui, "video/index.html") {
         return Err(http::Error(format!("{}: no built front end there (./build.sh wfe)", o.ui.display())));
     }
     std::fs::create_dir_all(&o.dir)?;

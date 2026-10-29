@@ -144,7 +144,7 @@ impl AudioServer {
             std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
         }
         if let Some(w) = &wfe {
-            if !w.join("audio/index.html").is_file() {
+            if !crate::wfe::exists(w, "audio/index.html") {
                 return Err(format!("{}: no web front end built there (./build.sh wfe)", w.display()));
             }
         }
@@ -314,9 +314,10 @@ impl AudioServer {
 
     /// The page: index.html with the stylesheet inlined (H3's server does the same)
     fn page(&self, s: &mut Conn, cors: &str) {
-        let dir = self.wfe.as_ref().expect("checked by the route").join("audio");
-        match (std::fs::read_to_string(dir.join("index.html")), std::fs::read_to_string(dir.join("style.css"))) {
-            (Ok(h), Ok(c)) => http::respond_bytes(s, 200, "text/html; charset=utf-8", h.replace("__CSS__", &c).as_bytes(),
+        let root = self.wfe.as_ref().expect("checked by the route");
+        let dir = root.join("audio");
+        match (crate::wfe::text(root, "audio/index.html"), crate::wfe::text(root, "audio/style.css")) {
+            (Some(h), Some(c)) => http::respond_bytes(s, 200, "text/html; charset=utf-8", h.replace("__CSS__", &c).as_bytes(),
                                                   &format!("{cors}Cache-Control: no-cache\r\n")),
             _ => http::respond_with(s, 500, &err(format!("{}: the page is not built (./build.sh wfe)", dir.display())), cors),
         }
@@ -329,7 +330,7 @@ impl AudioServer {
         if rel.split('/').any(|c| c == ".." || c.is_empty()) {
             return http::respond_with(s, 404, &err("no such file"), cors);
         }
-        match std::fs::read(root.join(rel)) {
+        match crate::wfe::read(root, rel).ok_or(()) {
             Ok(b) => http::respond_bytes(s, 200, http::content_type(rel), &b, &format!("{cors}Cache-Control: no-cache\r\n")),
             Err(_) => http::respond_with(s, 404, &err(format!("no file {rel}")), cors),
         }

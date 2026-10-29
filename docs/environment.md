@@ -289,6 +289,9 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_Q3T_INT8_ROWS` | 0 | 1: int8 with a scale a row (as without the silo), not a scale every 32 weights | audio qwen3tts |
 | `NS_Q3T_PROFILE` | 0 | 1: each request's stages timed on stderr (the request, the prompt's build and prefill, the frames - with the silo the graph's recording and the time a frame; without it each stage synchronised -, the codec) | audio qwen3tts |
 | `NS_Q3T_STREAM_FIRST` | 8 | a streamed answer (stream / stream_format) hands out its first sound after this many frames (8: 0.64 s of speech); then at 25 frames and where the codec's chunk lengths fall | audio qwen3tts |
+| `NS_WFE_FROM_DISK` | unset: the front ends are read from inside the binary | `1`: read the pages and modules from `dist/wfe` instead of the embedded copy (edit a page and reload, no rebuild) | serve, studio, image/audio/model3d servers |
+| `NS_WFE_DIST` | `dist/wfe` beside the repository | build time: the directory `glue/serve/build.rs` embeds into the binary | build |
+| `CARGO_MANIFEST_DIR`, `OUT_DIR` | set by cargo | where `glue/serve/build.rs` finds the repository and writes the list of embedded front-end files | build |
 | `NS_MM31_FILE` | unset: the test is skipped | the first shard of a MiniMax-M3.1-Flash GGUF: `cargo test -p nextsycl-llm-minimaxm3` checks the file against the model description | test minimaxm3 |
 | `NS_Q3T_EAGER` | 0 | 1: the silo's frame launched kernel by kernel, not replayed as a recorded graph (the A/B for the graph) | audio qwen3tts |
 | `NS_Q3T_STREAMING` | clone 1, built-in and designed voices 0 | the per-request option streaming's name: the text fed a token a frame; a request's options only, the variable itself is not read (--opt-streaming) | audio qwen3tts |

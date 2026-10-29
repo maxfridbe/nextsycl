@@ -544,8 +544,8 @@ impl Home {
 
     fn page(&self, s: &mut Conn) {
         let dir = self.o.wfe.join("home");
-        match (std::fs::read_to_string(dir.join("index.html")), std::fs::read_to_string(dir.join("style.css"))) {
-            (Ok(h), Ok(c)) => http::respond_bytes(s, 200, "text/html; charset=utf-8", h.replace("__CSS__", &c).as_bytes(), "Cache-Control: no-cache\r\n"),
+        match (crate::wfe::text(&self.o.wfe, "home/index.html"), crate::wfe::text(&self.o.wfe, "home/style.css")) {
+            (Some(h), Some(c)) => http::respond_bytes(s, 200, "text/html; charset=utf-8", h.replace("__CSS__", &c).as_bytes(), "Cache-Control: no-cache\r\n"),
             _ => http::respond(s, 500, &err(format!("{}: the page is not built (./build.sh wfe)", dir.display()))),
         }
     }
@@ -562,7 +562,7 @@ impl Home {
             Some("svg") => "image/svg+xml",
             _ => "application/octet-stream",
         };
-        match std::fs::read(self.o.wfe.join(rel)) {
+        match crate::wfe::read(&self.o.wfe, rel).ok_or(()) {
             Ok(b) => http::respond_bytes(s, 200, kind, &b, "Cache-Control: no-cache\r\n"),
             Err(_) => http::respond(s, 404, &err(format!("no file {rel}"))),
         }

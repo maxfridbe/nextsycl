@@ -17,10 +17,11 @@ run() { podman run --rm --security-opt label=disable -e AOT -e JOBS -e ONLY -e L
           -e CARGO_HOME=/src/target/cargo-home -e NS_VERSION="${NS_VERSION:-$(./version.sh)}" "$IMAGE" bash -c "$1"; }
 case "$what" in
   kernels) run "kernels/build.sh" ;;
-  rust) run "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; cargo build --release && mkdir -p dist && cp target/release/nextsycl dist/.nextsycl.new && mv -f dist/.nextsycl.new dist/nextsycl" ;;
+  # the web front ends are embedded in the binary (glue/serve/build.rs reads dist/wfe): built first, so the binary has them
+  rust) "$0" wfe && run "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; cargo build --release && mkdir -p dist && cp target/release/nextsycl dist/.nextsycl.new && mv -f dist/.nextsycl.new dist/nextsycl" ;;
   # the web front ends (wfe/: TSX on vendored snabbdom and tsc, H3's scheme) into dist/wfe
   wfe) run "wfe/build.sh" ;;
-  all) "$0" kernels && "$0" rust && "$0" wfe ;;
+  all) "$0" kernels && "$0" rust ;;
   # the lints as errors, the unit tests and the architecture's rules (cli/nextsycl/tests/architecture.rs; no GPU
   # needed), and the kernel libraries linked against no GPU runtime but SYCL's (CONTRIBUTING.md)
   test) run "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; cargo clippy --release --all-targets -- -D warnings && cargo test --release \

@@ -213,7 +213,7 @@ impl ImageServer {
             std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
         }
         if let Some(w) = &wfe {
-            if !w.join("image/index.html").is_file() {
+            if !crate::wfe::exists(w, "image/index.html") {
                 return Err(format!("{}: no web front end built there (./build.sh wfe)", w.display()));
             }
         }
@@ -360,9 +360,10 @@ impl ImageServer {
     fn page(&self, s: &mut Conn, cors: &str) {
         // a model that reads pictures gets the OCR page
         let reads = self.engine.lock().map(|g| g.as_ref().is_some_and(|(e, _)| e.reads())).unwrap_or(false);
-        let dir = self.wfe.as_ref().expect("checked by the route").join(if reads { "ocr" } else { "image" });
-        match (std::fs::read_to_string(dir.join("index.html")), std::fs::read_to_string(dir.join("style.css"))) {
-            (Ok(h), Ok(c)) => http::respond_bytes(s, 200, "text/html; charset=utf-8", h.replace("__CSS__", &c).as_bytes(),
+        let (root, app) = (self.wfe.as_ref().expect("checked by the route"), if reads { "ocr" } else { "image" });
+        let dir = root.join(app);
+        match (crate::wfe::text(root, &format!("{app}/index.html")), crate::wfe::text(root, &format!("{app}/style.css"))) {
+            (Some(h), Some(c)) => http::respond_bytes(s, 200, "text/html; charset=utf-8", h.replace("__CSS__", &c).as_bytes(),
                                                   &format!("{cors}Cache-Control: no-cache\r\n")),
             _ => http::respond_with(s, 500, &err(format!("{}: the page is not built (./build.sh wfe)", dir.display())), cors),
         }
@@ -384,7 +385,7 @@ impl ImageServer {
             Some("html") => "text/html; charset=utf-8",
             _ => "application/octet-stream",
         };
-        match std::fs::read(root.join(rel)) {
+        match crate::wfe::read(root, rel).ok_or(()) {
             Ok(b) => http::respond_bytes(s, 200, kind, &b, &format!("{cors}Cache-Control: no-cache\r\n")),
             Err(_) => http::respond_with(s, 404, &err(format!("no file {rel}")), cors),
         }

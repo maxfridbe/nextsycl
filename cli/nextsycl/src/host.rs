@@ -98,7 +98,7 @@ pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
     use nextsycl_serve::home::{Home, Options, Ports};
     let port = |k: &str, d: u16| cfg.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
     let wfe = cfg.dist.join("wfe");
-    if !wfe.join("home/index.html").exists() {
+    if !nextsycl_serve::wfe::exists(&wfe, "home/index.html") {
         return Err(format!("{}: the page is not built yet (./build.sh wfe)", wfe.display()));
     }
     let idle = opt(args, "--idle-minutes").map(str::to_string).or_else(|| cfg.get("NS_IDLE_MINUTES")).map_or(Ok(10), |v| v.parse::<u64>().map_err(|_| "--idle-minutes N"))?;

@@ -381,7 +381,7 @@ fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
             return Err(format!("{}: not built yet (./build.sh)", cfg.dist.join(f).display()));
         }
     }
-    if args.iter().any(|a| a == "--wfe") && !cfg.dist.join("wfe/model3d/index.html").exists() {
+    if args.iter().any(|a| a == "--wfe") && !nextsycl_serve::wfe::exists(&cfg.dist.join("wfe"), "model3d/index.html") {
         return Err(format!("{}: the web front end is not built yet (./build.sh wfe)", cfg.dist.join("wfe").display()));
     }
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
