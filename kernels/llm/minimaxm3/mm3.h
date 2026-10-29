@@ -36,6 +36,12 @@ int ns_llm_minimaxm3_idx_topk(ns_gpu* g, float* bs, int32_t* sel, int64_t T, int
 int ns_llm_minimaxm3_attend(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T,
                             int64_t H, int64_t G, int64_t pos0, float scale);
 
+/* A routed expert's n rows scaled and placed: ys[rank[i] * plane + tok[i] * C + j] = w[i] * eo[i * C + j]. Each token has one
+ * expert at each rank, so every (rank, token) row is written once and the planes are summed in rank order afterwards: the sum's
+ * order does not depend on which experts were on the card or when they were computed */
+int ns_llm_minimaxm3_scatter_rank(ns_gpu* g, float* ys, const float* eo, const int32_t* tok, const float* w, const int32_t* rank, int64_t n, int64_t C,
+                                  int64_t plane);
+
 #ifdef __cplusplus
 }
 #endif

@@ -25,6 +25,7 @@ pub struct Api {
     pub mmvq: unsafe extern "C" fn(Gpu, c_int, *const c_void, *const c_void, *mut f32, i64, i64, i64) -> c_int,
     // mm3.h
     pub rope: unsafe extern "C" fn(Gpu, *mut f32, i64, i64, i64, i64, i64, i64, f32) -> c_int,
+    pub scatter_rank: unsafe extern "C" fn(Gpu, *mut f32, *const f32, *const i32, *const f32, *const i32, i64, i64, i64) -> c_int,
     pub swiglu_oai: unsafe extern "C" fn(Gpu, *const f32, *const f32, *mut f32, i64, f32, f32) -> c_int,
     pub idx_scores: unsafe extern "C" fn(Gpu, *const f32, *const u16, *mut f32, i64, i64, i64, i64, i64) -> c_int,
     pub idx_topk: unsafe extern "C" fn(Gpu, *mut f32, *mut i32, i64, i64, i64, i64) -> c_int,
@@ -66,6 +67,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             quantize_q8_1: sym!("ns_quantize_q8_1"),
             mmvq: sym!("ns_mmvq"),
             rope: sym!("ns_llm_minimaxm3_rope"),
+            scatter_rank: sym!("ns_llm_minimaxm3_scatter_rank"),
             swiglu_oai: sym!("ns_llm_minimaxm3_swiglu_oai"),
             idx_scores: sym!("ns_llm_minimaxm3_idx_scores"),
             idx_topk: sym!("ns_llm_minimaxm3_idx_topk"),
