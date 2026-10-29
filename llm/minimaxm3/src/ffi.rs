@@ -33,6 +33,14 @@ pub struct Api {
     pub silo_attend: Option<AttendFn>,
     /// the silo's decode attention (split over the keys; takes the split count and a scratch for the partial states)
     pub silo_attend_split: Option<SplitFn>,
+    /// the silo's expert products for a decode token (moe.cpp)
+    pub silo_moe: Option<MoeFns>,
+}
+
+pub struct MoeFns {
+    pub supported: unsafe extern "C" fn(c_int, i64) -> c_int,
+    pub gu: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *mut f32, i64, i64, i64, f32, f32) -> c_int,
+    pub down: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *const f32, *const i32, *mut f32, i64, i64, i64, i64) -> c_int,
 }
 
 pub type SplitFn = unsafe extern "C" fn(Gpu, *const f32, *const u16, *const u16, *const i32, i64, *mut f32, i64, i64, i64, i64, f32, i64, *mut f32) -> c_int;
@@ -77,6 +85,17 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             idx_scores: sym!("ns_llm_minimaxm3_idx_scores"),
             idx_topk: sym!("ns_llm_minimaxm3_idx_topk"),
             attend: sym!("ns_llm_minimaxm3_attend"),
+            silo_moe: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
+                let (a, b, c) = (s.symbol("ns_mm3s_expert_supported"), s.symbol("ns_mm3s_expert_gu"), s.symbol("ns_mm3s_expert_down"));
+                // SAFETY: the symbols are declared in mm3s.h with MoeFns's signatures.
+                (!a.is_null() && !b.is_null() && !c.is_null()).then(|| unsafe {
+                    MoeFns {
+                        supported: std::mem::transmute::<*mut c_void, _>(a),
+                        gu: std::mem::transmute::<*mut c_void, _>(b),
+                        down: std::mem::transmute::<*mut c_void, _>(c),
+                    }
+                })
+            }),
             silo_attend_split: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
                 let p = s.symbol("ns_mm3s_attend_split");
                 // SAFETY: the symbol is declared in mm3s.h with SplitFn's signature.
@@ -103,9 +122,9 @@ pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
 }
 
 /// A copy of `n` bytes from `src` to `dst` (same GPU) on copy lane `lane`, after ticket `after`; its ticket
-pub fn stream_copy(gpu: *mut c_void, dst: &nextsycl_core::DevBuf, src: &nextsycl_core::DevBuf, n: usize, after: Option<i64>, lane: i32) -> nextsycl_core::Result<i64> {
+pub fn stream_copy(gpu: *mut c_void, dst: &nextsycl_core::DevBuf, src: &nextsycl_core::DevBuf, n: usize, after: &[i64], lane: i32) -> nextsycl_core::Result<i64> {
     let api = nextsycl_core::api()?;
-    let deps: Vec<i64> = after.into_iter().collect();
+    let deps: Vec<i64> = after.to_vec();
     let mut t = 0i64;
     // SAFETY: both buffers hold n bytes (callers view exactly the expert's bytes); t is an out-pointer to a local.
     let rc = unsafe { (api.stream_copy)(gpu, dst.ptr().cast(), src.ptr().cast_const().cast(), n, deps.as_ptr(), deps.len() as i32, lane, &mut t) };
