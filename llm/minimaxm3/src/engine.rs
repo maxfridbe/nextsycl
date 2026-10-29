@@ -215,7 +215,15 @@ pub struct MiniMax<'g> {
     cache: std::sync::Mutex<ExpertCache>,
     /// seconds in the routed experts' reads, and in all of their products
     prof: std::sync::Mutex<[f64; 4]>,
+    /// NS_PROFILE=1: per layer, seconds by category (`CATS`), each timed to the GPU's completion (a sync at every lap)
+    pf: bool,
+    lay: std::sync::Mutex<Vec<[f64; NCAT]>>,
+    /// passes of one token, and the seconds they took (profile)
+    pf_tokens: std::sync::Mutex<(usize, f64)>,
 }
+
+const NCAT: usize = 8;
+const CATS: [&str; NCAT] = ["attn proj", "indexer", "attend", "route", "expert read", "expert products", "shared/dense", "other"];
 
 /// A tensor read from the file a row at a time (the token embedding)
 struct ConstTensor {
@@ -354,7 +362,8 @@ impl<'g> MiniMax<'g> {
                     host_left as f64 / (1u64 << 30) as f64));
         let cache = ExpertCache { map: HashMap::new(), vram_left, host_left, slabs: Vec::new() };
         Ok(MiniMax { file: f, gpu, k, g, layers, out_norm, embd, head, arena, load_seconds: t0.elapsed().as_secs_f64(), load_bytes: bytes,
-                     work: std::sync::Mutex::new(()), cache: std::sync::Mutex::new(cache), prof: std::sync::Mutex::new([0.0; 4]) })
+                     work: std::sync::Mutex::new(()), cache: std::sync::Mutex::new(cache), prof: std::sync::Mutex::new([0.0; 4]),
+                     pf: std::env::var("NS_PROFILE").is_ok_and(|v| v == "1"), lay: std::sync::Mutex::new(vec![[0.0; NCAT]; 64]), pf_tokens: std::sync::Mutex::new((0, 0.0)) })
     }
 
     pub fn gpu_info(&self) -> Vec<GpuInfo> {
@@ -364,7 +373,42 @@ impl<'g> MiniMax<'g> {
 
     pub fn profile_lines(&self) -> Vec<String> {
         let p = self.prof.lock().unwrap();
-        vec![format!("[experts: {:.2} s reading the file, {:.2} s in their products]", p[0], p[1])]
+        let mut v = vec![format!("[experts: {:.2} s reading the file, {:.2} s in their products]", p[0], p[1])];
+        if self.pf {
+            let lay = self.lay.lock().unwrap();
+            let (n, secs) = *self.pf_tokens.lock().unwrap();
+            v.push(format!("[profile: {n} one-token passes, {secs:.2} s; seconds by layer and category, each lap waits for the GPU]"));
+            let mut head = String::from("layer");
+            for c in CATS {
+                head += &format!(",{c}");
+            }
+            v.push(head);
+            let mut tot = [0.0; NCAT];
+            for (l, row) in lay.iter().enumerate().take(self.layers.len()) {
+                let mut line = format!("{l}");
+                for (i, x) in row.iter().enumerate() {
+                    line += &format!(",{x:.4}");
+                    tot[i] += x;
+                }
+                v.push(line);
+            }
+            let sum: f64 = tot.iter().sum();
+            let mut line = String::from("total");
+            for x in tot {
+                line += &format!(",{x:.3} ({:.0}%)", 100.0 * x / sum.max(1e-9));
+            }
+            v.push(line);
+        }
+        v
+    }
+
+    /// Profile lap: waits for the GPU and adds the time since `t` to layer `l`'s category `cat` (no-op unless NS_PROFILE=1)
+    fn lap(&self, l: usize, cat: usize, t: &mut Instant) {
+        if self.pf {
+            let _ = self.gpu.sync();
+            self.lay.lock().unwrap()[l][cat] += t.elapsed().as_secs_f64();
+            *t = Instant::now();
+        }
     }
 
     // ---- kernels
@@ -450,6 +494,7 @@ impl<'g> MiniMax<'g> {
         let g = &self.g;
         let (h, kv, hd) = (g.n_head as usize, g.n_kv_head as usize, g.head_dim as usize);
         let a = &self.arena;
+        let mut tm = Instant::now();
         let q = a.f32(t * h * hd)?;
         let k = a.f32(t * kv * hd)?;
         let v = a.f32(t * kv * hd)?;
@@ -477,6 +522,7 @@ impl<'g> MiniMax<'g> {
             ffi::check((self.k.to_f16)(self.raw(), k.fp(), kc.ptr().cast::<u16>().add(off), (t * kv * hd) as i64), "cache k")?;
             ffi::check((self.k.to_f16)(self.raw(), v.fp(), vc.ptr().cast::<u16>().add(off), (t * kv * hd) as i64), "cache v")?;
         }
+        self.lap(l, 0, &mut tm);
         let out = a.f32(t * h * hd)?;
         let n_pos = p0 + t;
         let scale = 1.0 / (hd as f32).sqrt();
@@ -496,6 +542,7 @@ impl<'g> MiniMax<'g> {
                     ic.bounds(p0 * il * 2, t * il * 2)?;
                     ffi::check((self.k.to_f16)(self.raw(), ik.fp(), ic.ptr().cast::<u16>().add(p0 * il), (t * il) as i64), "cache ik")?;
                 }
+                self.lap(l, 1, &mut tm);
                 let blk = g.indexer.block_size as usize;
                 let nblk = n_pos.div_ceil(blk);
                 let kk = (g.indexer.top_k as usize).min(nblk);
@@ -507,6 +554,7 @@ impl<'g> MiniMax<'g> {
                                                    g.indexer.local_blocks as i64), "idx_scores")?;
                     tap(&format!("msa_bs-{l}"), &bs)?;
                     ffi::check((self.k.idx_topk)(self.raw(), bs.fp(), sel.ptr().cast::<i32>(), t as i64, ih as i64, nblk as i64, kk as i64), "idx_topk")?;
+                    self.lap(l, 1, &mut tm);
                     ffi::check((self.k.attend)(self.raw(), q.fp(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), sel.ptr().cast::<i32>().cast_const(),
                                                kk as i64, out.fp(), t as i64, h as i64, kv as i64, p0 as i64, scale), "attend")?;
                 }
@@ -519,9 +567,11 @@ impl<'g> MiniMax<'g> {
                 }
             }
         }
+        self.lap(l, 2, &mut tm);
         tap(&format!("kqv_out-{l}"), &out)?;
         let o = a.f32(t * g.n_embd as usize)?;
         self.matmul(&ly.o, &out, t, &o)?;
+        self.lap(l, 0, &mut tm);
         Ok(o)
     }
 
@@ -543,6 +593,7 @@ impl<'g> MiniMax<'g> {
         let g = &self.g;
         let (ne, used, c) = (g.n_expert as usize, g.n_expert_used as usize, g.n_embd as usize);
         let a = &self.arena;
+        let mut tm = Instant::now();
         let logits = a.f32(t * ne)?;
         self.matmul(&m.router, x, t, &logits)?;
         tap(&format!("ffn_moe_logits-{l}"), &logits)?;
@@ -567,6 +618,7 @@ impl<'g> MiniMax<'g> {
                 per[i].push((tok as i32, w));
             }
         }
+        self.lap(l, 3, &mut tm);
         let wbuf = DevBuf::from_f32(&self.gpu, &wts)?;
         tap(&format!("ffn_moe_weights_scaled-{l}"), &wbuf)?;
         let y = a.f32(t * c)?;
@@ -637,11 +689,18 @@ impl<'g> MiniMax<'g> {
             let mut p = self.prof.lock().unwrap();
             p[0] += read_s;
             p[1] += tr.elapsed().as_secs_f64();
+            if self.pf {
+                let mut lay = self.lay.lock().unwrap();
+                lay[l][4] += read_s;
+                lay[l][5] += tr.elapsed().as_secs_f64() - read_s;
+            }
         }
+        tm = Instant::now();
         tap(&format!("ffn_moe_out-{l}"), &y)?;
         let sh = self.dense(&m.shared, x, t)?;
         tap(&format!("ffn_shexp-{l}"), &sh)?;
         self.add(&y, &sh, t * c)?;
+        self.lap(l, 6, &mut tm);
         Ok(y)
     }
 
@@ -739,22 +798,34 @@ impl<'g> MiniMax<'g> {
         }
         let c = self.g.n_embd as usize;
         let p0 = s.pos;
+        let pass_t0 = Instant::now();
         let mut x = self.embed(tokens)?;
         tap("inp_embd", &x)?;
         for (l, ly) in self.layers.iter().enumerate() {
             let m0 = self.arena.mark();
+            let mut tm = Instant::now();
             let xn = self.arena.f32(t * c)?;
             self.rms(&x, &ly.attn_norm, &xn, t, c)?;
             tap(&format!("attn_norm-{l}"), &xn)?;
+            self.lap(l, 7, &mut tm);
             let att = self.attention(l, ly, s, &xn, t, p0, &mut *tap)?;
             self.add(&att, &x, t * c)?;
             tap(&format!("ffn_inp-{l}"), &att)?;
             let hn = self.arena.f32(t * c)?;
             self.rms(&att, &ly.ffn_norm, &hn, t, c)?;
             tap(&format!("ffn_norm-{l}"), &hn)?;
+            self.lap(l, 7, &mut tm);
             let f = match &ly.ffn {
-                Ffn::Dense(d) => self.dense(d, &hn, t)?,
-                Ffn::Moe(m) => self.moe(l, m, &hn, t, &mut *tap)?,
+                Ffn::Dense(d) => {
+                    let o = self.dense(d, &hn, t)?;
+                    self.lap(l, 6, &mut tm);
+                    o
+                }
+                Ffn::Moe(m) => {
+                    let o = self.moe(l, m, &hn, t, &mut *tap)?;
+                    tm = Instant::now();
+                    o
+                }
             };
             tap(&format!("ffn_out-{l}"), &f)?;
             self.add(&f, &att, t * c)?;
@@ -764,6 +835,7 @@ impl<'g> MiniMax<'g> {
             self.gpu.sync()?;
             x = nx;
             self.arena.rewind(m0);
+            self.lap(l, 7, &mut tm);
             // NS_MM31_FORCE=DIR (Debug): the layer's output replaced by the reference dump's, so the next layer is
             // compared on the reference's own input (exactness per layer, not the noise of 60 layers added up)
             if let Some(dir) = std::env::var_os("NS_MM31_FORCE") {
@@ -784,6 +856,11 @@ impl<'g> MiniMax<'g> {
         self.matmul(&self.head, &xn, n_out, &logits)?;
         tap("result_output", &logits)?;
         let all = logits.to_f32()?;
+        if self.pf && t == 1 {
+            let mut p = self.pf_tokens.lock().unwrap();
+            p.0 += 1;
+            p.1 += pass_t0.elapsed().as_secs_f64();
+        }
         s.pos += t;
         s.last_rows = t;
         let v = self.head.rows;
