@@ -147,7 +147,8 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
         // the dense weights the deepseek41 engine requantizes to q4_K (NS_DS41_DENSE_Q4K), kept between loads
         args.extend(["-e".into(), "NS_DS41_Q4K_CACHE=/cache/q4k".into()]);
     }
-    args.extend(["-e".into(), "NEXTSYCL_LIB=/app/libnextsycl-llm.so".into(), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
+    // the kernel library is the binary's own (embedded; else /app/libnextsycl-llm.so beside it)
+    args.extend(["-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // engine settings the server reads from its environment (NS_KV=q8: the latent cache in q8; NS_SILO=0: no silos)
     for k in ["NS_KV", "NS_PREFILL_CHUNK", "NS_PIPE_TRACE", "NS_VRAM_GUARD_GIB", "NS_SILO"] {
         if let Some(v) = cfg.get(k) {

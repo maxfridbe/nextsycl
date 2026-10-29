@@ -1804,6 +1804,7 @@ static bool flash_load(Ctx& c) {
         const size_t slash = self.rfind('/');
         if (slash != std::string::npos) path = self.substr(0, slash + 1) + path;
     }
+    if (const char* e = std::getenv("NS_FLASH_LIB"); e && *e) path = e;   // the library inside the binary (an fd path)
     void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!h) { std::fprintf(stderr, "nsd: no flash attention (%s); oneDNN's kernel\n", dlerror()); return false; }
     c.flash_fn = (decltype(c.flash_fn)) dlsym(h, "nsflash_attention");
@@ -1994,6 +1995,7 @@ static bool sage_load(Ctx& c) {
         const size_t slash = self.rfind('/');
         if (slash != std::string::npos) path = self.substr(0, slash + 1) + path;
     }
+    if (const char* e = std::getenv("NS_FLASH_LIB"); e && *e) path = e;   // the library inside the binary (an fd path)
     void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!h) { std::fprintf(stderr, "h3sycl: no SageAttention (%s); attention on oneDNN's kernel\n", dlerror()); return false; }
     c.sage_fn = (decltype(c.sage_fn)) dlsym(h, "nsflash_sage_square");

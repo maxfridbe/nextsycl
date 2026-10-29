@@ -8,7 +8,10 @@
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 
+include!(concat!(env!("OUT_DIR"), "/libs_embedded.rs"));
+
 extern "C" {
+    fn memfd_create(name: *const c_char, flags: u32) -> c_int;
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlerror() -> *const c_char;
@@ -23,8 +26,10 @@ pub type Gpu = *mut c_void;
 pub struct Api {
     /// the library's handle: an engine binds its own ABI from it (`symbol`)
     handle: *mut c_void,
-    /// where it was opened from: the silos are in `silo/` beside it
+    /// where it was opened from (a name, for a library out of the binary)
     path: PathBuf,
+    /// the directory the silos are in (`silo/`): beside the library, or beside the executable for one out of the binary
+    dir: PathBuf,
     pub last_error: unsafe extern "C" fn() -> *const c_char,
     pub version: unsafe extern "C" fn() -> *const c_char,
     pub gpu_count: unsafe extern "C" fn() -> c_int,
@@ -58,6 +63,53 @@ pub struct Api {
 unsafe impl Send for Api {}
 unsafe impl Sync for Api {}
 
+/// NS_LIB_FROM_DISK=1: the kernel libraries from files, not from the binary (rebuild a kernel without relinking)
+fn from_disk() -> bool {
+    std::env::var("NS_LIB_FROM_DISK").is_ok_and(|v| v == "1")
+}
+
+/// A library of the binary by file name
+fn embedded(name: &str) -> Option<&'static [u8]> {
+    LIBS.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
+}
+
+/// An embedded library as a file the loader can open: an anonymous memory file (the descriptor stays open, a library's
+/// path may be handed to kernels later), its /proc/self/fd path. Once a name.
+fn materialize(name: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    static MADE: std::sync::Mutex<Vec<(String, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, p)) = made.iter().find(|(n, _)| n == name) {
+        return Ok(p.clone());
+    }
+    let bytes = embedded(name).ok_or_else(|| format!("{name}: not in this binary"))?;
+    let c = CString::new(name).map_err(|e| e.to_string())?;
+    // SAFETY: memfd_create with a valid C string; the descriptor is checked.
+    let fd = unsafe { memfd_create(c.as_ptr(), 0) };
+    if fd < 0 {
+        return Err(format!("{name}: memfd_create: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: a descriptor just made and owned here.
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    f.write_all(bytes).map_err(|e| format!("{name}: {e}"))?;
+    std::mem::forget(f);
+    let p = PathBuf::from(format!("/proc/self/fd/{fd}"));
+    made.push((name.to_string(), p.clone()));
+    Ok(p)
+}
+
+/// dlopen a path globally (its symbols and its soname are then found by the libraries opened after it)
+fn open(path: &Path) -> Result<(), String> {
+    let c = CString::new(path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
+    // SAFETY: dlopen with a valid C string; the handle is checked.
+    let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+    if h.is_null() {
+        return Err(format!("{}: {}", path.display(), dl_error()));
+    }
+    Ok(())
+}
+
 fn dl_error() -> String {
     // SAFETY: dlerror returns null or a C string valid until the next dl* call on this thread.
     let p = unsafe { dlerror() };
@@ -71,9 +123,15 @@ fn dl_error() -> String {
 
 impl Api {
     /// A kind's kernel library (`libnextsycl-<kind>.so`: "llm", "image", "video"): `NEXTSYCL_LIB` when set, else the
-    /// library beside the executable, else in `dist/` of the working directory.
+    /// copy inside the binary (unless NS_LIB_FROM_DISK=1), else the library beside the executable, else in `dist/` of
+    /// the working directory.
     pub fn load(kind: &str) -> Result<Api, String> {
         let name = format!("libnextsycl-{kind}.so");
+        if std::env::var_os("NEXTSYCL_LIB").is_none() && !from_disk() {
+            if let Some(api) = Api::load_embedded(&name)? {
+                return Ok(api);
+            }
+        }
         let p = std::env::var_os("NEXTSYCL_LIB").map(PathBuf::from).or_else(|| {
             let exe = std::env::current_exe().ok()?;
             let beside = exe.parent()?.join(&name);
@@ -82,8 +140,35 @@ impl Api {
         Api::load_from(&p.unwrap_or_else(|| PathBuf::from("dist").join(&name)))
     }
 
-    #[allow(clippy::missing_transmute_annotations)] // the target type is each field's, from ns.h
+    /// The kind's library out of the binary (None when this binary has none): oneDNN and the flash-attention library
+    /// first (the kind's library needs the one by its name; the flash path is handed to the kernels in NS_FLASH_LIB),
+    /// each as an anonymous memory file opened by its /proc/self/fd path
+    fn load_embedded(name: &str) -> Result<Option<Api>, String> {
+        if embedded(name).is_none() {
+            return Ok(None);
+        }
+        if embedded("libdnnl.so.3").is_some() {
+            let p = materialize("libdnnl.so.3")?;
+            open(&p)?;
+        }
+        if embedded("libnextsycl-flash.so").is_some() && std::env::var_os("NS_FLASH_LIB").is_none() {
+            let p = materialize("libnextsycl-flash.so")?;
+            // before the kernels (which read it) are loaded
+            std::env::set_var("NS_FLASH_LIB", &p);
+        }
+        let p = materialize(name)?;
+        let dir = std::env::var_os("NS_SILO_DIR").map(PathBuf::from).and_then(|d| d.parent().map(Path::to_path_buf))
+            .or_else(|| std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf))).unwrap_or_else(|| PathBuf::from("dist"));
+        Api::load_at(&p, PathBuf::from(format!("{name} (in the binary)")), dir).map(Some)
+    }
+
     pub fn load_from(path: &Path) -> Result<Api, String> {
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        Api::load_at(path, path.to_path_buf(), dir)
+    }
+
+    #[allow(clippy::missing_transmute_annotations)] // the target type is each field's, from ns.h
+    fn load_at(path: &Path, shown: PathBuf, dir: PathBuf) -> Result<Api, String> {
         let c = CString::new(path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
         // SAFETY: dlopen with a valid C string; the handle is checked.
         let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
@@ -104,7 +189,8 @@ impl Api {
         }
         Ok(Api {
             handle: h,
-            path: path.to_path_buf(),
+            path: shown,
+            dir,
             last_error: sym!("ns_last_error"),
             version: sym!("ns_version"),
             gpu_count: sym!("ns_gpu_count"),
@@ -140,6 +226,11 @@ impl Api {
         })
     }
 
+    /// Where the library was opened from (a name and "in the binary" for an embedded one)
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// A symbol of the library by name (null when it has none): an engine's own ABI (`kernels/<kind>/<arch>`) is
     /// bound by its crate, not here.
     pub fn symbol(&self, name: &str) -> *mut c_void {
@@ -160,7 +251,7 @@ impl Api {
         let name = std::env::var("NS_SILO_NAME").ok().filter(|n| !n.is_empty()).unwrap_or_else(|| arch.to_string());
         let required = std::env::var("NS_SILO_REQUIRED").is_ok_and(|v| v == "1");
         let dir = std::env::var_os("NS_SILO_DIR").map(PathBuf::from)
-                                                  .unwrap_or_else(|| self.path.parent().unwrap_or(Path::new(".")).join("silo"));
+                                                  .unwrap_or_else(|| self.dir.join("silo"));
         let path = dir.join(format!("libnextsycl-{name}.so"));
         if !path.exists() {
             if required {
