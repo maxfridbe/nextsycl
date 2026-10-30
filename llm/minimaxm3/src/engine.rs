@@ -782,7 +782,7 @@ pub struct MiniMax<'g> {
     /// features of the pass on the last card, and those taken on the first (position -> (target, values)), for the drafter
     route_t0: Mutex<Option<Instant>>,
     ds_f: Mutex<Option<DevBuf>>,
-    ds_caps: Mutex<HashMap<usize, Vec<(usize, Vec<f32>)>>>,
+    ds_caps: Mutex<HashMap<usize, Captures>>,
     out_norm: DevBuf,
     embd: ConstTensor,
     head: Mat,
@@ -871,6 +871,9 @@ fn draft_pmin() -> f32 {
 fn draft_tokens(block: usize) -> usize {
     std::env::var("NS_MM31_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize).min(block).min(6)
 }
+
+/// A pass's features taken on the first card: (target, values)
+type Captures = Vec<(usize, Vec<f32>)>;
 
 /// A tensor read from the file a row at a time (the token embedding)
 struct ConstTensor {
@@ -2021,9 +2024,9 @@ impl<'g> MiniMax<'g> {
                     let mut base = Vec::with_capacity(per_layer.len());
                     let mut each = vec![0usize; per_layer.len()];
                     for (li, b) in per_layer.iter().enumerate() {
-                        if *b > 0 {
-                            each[li] = (bytes / moe) / *b;
-                            used += each[li] * *b;
+                        if let Some(n) = (bytes / moe).checked_div(*b) {
+                            each[li] = n;
+                            used += n * *b;
                         }
                     }
                     if used > 0 {
@@ -2659,8 +2662,8 @@ impl<'g> MiniMax<'g> {
                 Job::Pre(ex, s, _) => (*ex, Some(*s)),
                 Job::Wave(ex, ..) => (*ex, None),
             };
-            if fz.is_some() {
-                let (js, jn) = fz.as_ref().unwrap().4[i];
+            if let Some(z) = &fz {
+                let (js, jn) = z.4[i];
                 run_group(js, jn)?;
             } else {
                 match &land[i] {
