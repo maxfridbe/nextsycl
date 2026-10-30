@@ -318,7 +318,7 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_MM31_KBENCH` | 0 | Debug: 1 = at the first session, each decode kernel timed alone on real weights on each card (GB/s) | llm:minimaxm3 |
 | `NS_MM31_BELL` | 1 | 0 = one token's router result comes back by a blocking read, not through a doorbell in pinned memory with the shared expert queued behind it | llm:minimaxm3 |
 | `NS_MM31_ORDER` | unset | `asis` = two cards in the order `--gpu` gives; by default the B65 takes the first layers and the B70 the rest and the head | llm:minimaxm3 |
-| `NS_MM31_SPARE_GIB` | 1.85 | VRAM per card the minimaxm3 engine leaves free besides its arena and session caches when it sizes the experts (at least 1.6) | llm:minimaxm3 |
+| `NS_MM31_SPARE_GIB` | 1.9 | VRAM per card the minimaxm3 engine leaves free besides its arena and session caches when it sizes the experts (at least 1.6) | llm:minimaxm3 |
 | `NS_MM31_EXTRA` | 1 | 0 = the prompt passes' scratch stays allocated in decode, not freed and given to expert places | llm:minimaxm3 |
 | `NS_MM31_DRAFT` | unset | The DSpark drafter's GGUF for the minimaxm3 engine (`dspark-MiniMax-M3.1-Flash-Q8_0.gguf`): drafts verified in the decode pass; unset: no drafts | llm:minimaxm3 |
 | `NS_MM31_DRAFTS` | 1 | Tokens drafted a step (at most 6 and the drafter's block) | llm:minimaxm3 |

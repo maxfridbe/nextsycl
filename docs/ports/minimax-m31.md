@@ -320,3 +320,85 @@ Also found: demotions could pick a pinned place a fallback copy was still readin
 
 - Second drive for all experts (user's decision: 111 GiB). A multi-row fused path, then DSpark. Not in the front door's registry yet.
 - A stream file is per placement: `NS_MM31_STREAM_DIR` now deletes another placement's file first (36 GiB each; they filled the system drive during this round's benches).
+
+## Fourth round (2026-10-30): the user's list
+
+Every number on the same prompts as the third round (2,137 / 7,990 / 31,085 tokens). "ms a token" is on one fixed 300-token text fed one token at a time (`NS_SCORE_ROWS=1 --score`), so numerics that change greedy text do not change the measure.
+
+### What each step bought (ms a token over 300 tokens; first 50 tokens in brackets)
+
+| step | pp 2K | pp 8K | ms a token | greedy tg 300 |
+|---|---|---|---|---|
+| end of round 3 | 198.8 | 331.9 | 99.5 (139.8), on the new kernels below | 9.93 |
+| row-type kernels through word loads (byte loads were a message each), shared down back on Q8_1 (float Q6_K 76 GB/s against 444) | 198.8 -> 221 | 332 -> 347 | | 9.93 -> 9.87 |
+| doorbell: router writes to pinned memory, rings, the shared expert runs behind it | | | 99.3 -> 95.1 | |
+| B65 first, B70 the rest and the head | 216-218 | 337-357 | 95.1 -> 89.4 | 10.15 |
+| prompt scratch freed in decode (1.3 GiB a card as expert places), spare 2.5 -> 1.9 GiB | | | 89.4 -> 83.8 | 11.22 |
+| small tables by kernel from a pinned ring, not the runtime's memcpy | | | 84.0 -> 82.0 | |
+| expert profile: seed placement, hottest counted most recent | | | 82.0 -> 74.9 (115 -> 85) | 12.26 |
+| page cache at run time | | 373 | 74.9 -> 73.4 | |
+| table work-groups 16 row pairs, not 4 | | | 73.4 -> 71.9 | 13.3 |
+
+tg 20 was not reached: tg 11.4 at 2K over 200 tokens (12.5 with the expert profile); 72 ms a token on the fixed text with the profile. pp 230 / 373 / 305 (2K / 8K / 31K). Numerics change the text, so ms on the fixed text is given beside greedy tg. Repeats vary: with the page cache, three 100-token runs gave tg 10.1 / 13.0 / 10.9 (O_DIRECT: 10.2 / 10.2 / 10.2), and a 2K pp sometimes reads 147-160 where 213-230 is usual; the cause of that outlier was not found.
+
+### 1. Layer order (B70+B65, default arena, before the later steps)
+
+| order | first card's layers | pp 2K | pp 8K | ms a token (first 50) | greedy tg 300 | file reads a token |
+|---|---|---|---:|---|---:|---:|
+| B70 first | 36 | 221 | 347 | 99.5 (140) | 9.92 | 10.3 |
+| B65 first | 3 | 179 | 264 | 155.9 (203) | 6.77 | 23.7 |
+| B65 first | 8 | 189 | 285 | 132.1 (173) | 7.43 | 16.3 |
+| B65 first | 12 | 200 | 309 | 114.5 (155) | 7.84 | 11.8 |
+| B65 first | 18 | 216 | 341 | 94.3 (131) | 9.63 | 8.6 |
+| B65 first | 24 | 218 | 357 | 95.3 (151) | 10.15 | 9.0 |
+| B65 first | 30 | | 337 | 92.8 (134) | | 9.6 |
+
+The B65 taking only the dense layers leaves its VRAM idle: experts cannot live on the other card, so hit rate is what decides. Per card at 18/42: B65 98.0 / 0.7 / 1.3%, B70 80.1 / 14.1 / 5.8%. Default now: B65 first, 24 layers, B70 the rest and the head.
+
+### 2. Memory
+
+During decode (`NS_MM31_SPARE_GIB`, gpustat sampled every second): each card 30.1 GiB used of 31.9, 1.6-1.9 free. In them: weights 3.3 / 4.5 GiB, experts 24.7 / 22.6 GiB. Idle before this round: the prompt arena 1.5 GiB and ~1 GiB of spare above the floor.
+
+| VRAM for experts a card | 14 | 18 | 21 | 24 | spare 1.7 |
+|---|---|---|---|---|---|
+| ms a token | 124.1 | 105.8 | 95.9 | 89.4 | 87.6 |
+| VRAM / pinned / file a token | 175 / 35 / 18 | 189 / 25 / 14 | 197 / 20 / 11 | 202 / 17 / 10 | 203 / 16 / 9 |
+
+About 2.2 ms a token per GiB on both cards. Taken: prompt scratch freed in decode, 192 MiB kept (the slab comes back as empty places in every layer; dropped again before the next prompt pass), spare 1.9 GiB (peak gpustat free 1.45 GiB at 1.7, so 1.9 keeps the 1.5 GiB floor). Not worth it: indexer to half (0.25 GiB a card, ~0.5 ms); KV at 2K is 0.2 GiB.
+
+| pinned GiB | 8 | 16 | 24 | 31 |
+|---|---|---|---|---|
+| ms a token | 118.2 | 105.7 | 96.4 | 89.4 |
+
+About 1.3 ms per GiB. The 32 GiB cap holds. The page cache now does real work: run-time reads go through it (O_DIRECT only at load) and it is reclaimable, 74.9 -> 73.4 ms.
+
+### 3. Placement
+
+Six prompts of different kinds, 200 tokens each: a layer's top 54 experts carry 79% of the uses across the corpus, but only 45-62% of a held-out text's (static top 54 / 84 against recency's 88%), and experts touched a layer are 121-128 of 128. So a profile cannot replace recency; as a seed it removes most of the cold start: first 50 tokens 115 -> 85 ms, mean 82.0 -> 74.9 (`NS_EXPERT_PROFILE`, hottest counted most recent; the service sets it already). The same ranking across a card's layers is already the unequal budget (misses by layer 688-1468). Replay: LFU, recency + frequency and LRU-2 give 86.9-87.0% VRAM against LRU's 86.7, file reads the same: dropped. Which reads will happen: guesses on the CPU ahead 3 experts: 73.4 -> 78.9 ms, dropped.
+
+### 4. Strata's tricks
+
+**Loads** (`NS_MM31_KBENCH=1`, B70, GB/s of weights; the ceiling ~520-570 on these shapes with dp4a): the row kernels read bytes one message each. Rewritten as word loads: gu IQ1_M 228 -> 268, IQ2_XXS 291; down IQ3_XXS 315-331; float Q6_K 76 -> 349; Q5_K float 382 -> 442; Q8_1 Q5_K 524, Q6_K 444; half GEMM 528; to_half 38 MB out in 76 us (a 500 GB/s store limit), router F32 300. B65 about half (140-170 on gu). Benched numbers vary with the idle clock (B70 123-252 us for a gu), so ms a token is the verdict: 16-row groups for table kernels 73.4 -> 71.9.
+
+**Device plan**: skipped, measured. Host from the doorbell to the VRAM experts queued is 28 us a layer; the shared expert queued behind the router takes 100-200 us, so the GPU does not idle for the host: nothing is left to save. Launches: queuing one costs the host 1.3-7 us, 0.85-1.45 us on the device (stamps with profiling on read 30 us, misleadingly); ~24 launches a layer are not a limit. Doorbell itself: 99.3 -> 95.1 ms.
+
+**Small tables by kernel**: 84.0 -> 82.0 ms.
+
+**Draft**: DSpark ported (`NS_MM31_DRAFT`, `NS_MM31_DRAFTS`, `NS_MM31_DRAFT_PMIN`, 1.75 GiB on the last card), verify rows on the fused path, `spec-check` bit-exact against one-token decode (0 of 30 rows differ). Acceptance 72% at 1 draft, 90% at 6 with confidence 0.8. Results, draft against none: 2K 300 tokens 12.48 and 14.05 (two builds) against 12.69 and 13.33; 8K 200 tokens 12.50 against 11.56; a code prompt 13.48 against 11.65. A draft pass 8.8 ms; consecutive tokens share only 1.43 of 4 experts a layer, so a verify row costs nearly a pass. Gain ~0-16%, and it takes 2.2 ms a token back in lost VRAM: optional, not default.
+
+**Prompt**: wave 1 read early, half route, XMX attention; dequant vector stores done. Now (profiled, 11 s with syncs): expert products 63%, read wait 12%, attend 11%, projections 4%, indexer 3%, router 4%. Fused indexer on XMX: at most the 3%, not done. Routed-only staging: 92% of a 2K pass's experts have over 8 rows, nearly all needed. Direct products below 8 rows: 8% of the experts. Reader threads: the read wait is 12%. Page cache in place of WILLNEED. Chunk: 4096 stays (2K 1100: 181; 8K 2048: 252, 3000: 322, 4096: 373). Split-K flash kernel in the fused decode. What bounds pp: each expert writes then reads 38 MB of half three times at the card's ~500 GB/s; on Arc the fused decode-in-local XMX GEMM has been slower (skill notes), not retried here.
+
+**Decode overlap**: a token's layers depend on each other; a hop is one 24 KB round through the host (read-back 10-16 us). The only parallel work would be the draft beside a verify pass, and a verify pass needs the draft first. Nothing to overlap.
+
+### Floor
+
+Device a token (all-VRAM layers 0.42 ms B65, 0.24 ms B70; attention 20 ms): **no misses at all: ~45 ms, tg 22**. Misses in steady state: 5.5 file x 3.4 ms + 15 pinned x 0.55 ms = ~27 ms: ms 72. tg 20 needs more residency (VRAM + pinned) than 80 of 111 GiB, about 8 more GiB of pinned for each 10 ms, past the 32 GiB cap, or a smaller quant.
+
+### Exactness
+
+| prompt | min l_out | min kqv_out | result_output | next token | decode-after-prefill logits cosine |
+|---|---|---|---|---|---|
+| `short` | 0.999849 | 0.999966 | 0.999957 | same | 0.9540083 |
+| `long` | 0.999848 | 0.999988 | 0.999756 | same (" +") | 0.9797325 |
+
+Against the third round's 0.9555839 / 0.9795699 the decode column moves -0.0016 / +0.0002. Greedy text changes again at near ties (Q8_1 on the shared down from byte 656, B65 first from byte 49). Two runs of the final path byte-identical; `spec-check`: verify rows bit-identical to one-token decode.

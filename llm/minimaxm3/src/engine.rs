@@ -1172,8 +1172,8 @@ impl<'g> MiniMax<'g> {
             let (total, free) = gpu.memory()?;
             let free = free.unwrap_or(total) as usize;
             // the arena, the sessions' caches, and 1.5 GiB kept free (a spare of 1 GiB more: the driver's own use)
-            // NS_MM31_SPARE_GIB: the room left besides the arena and the caches (default 1.85; never below the 1.5 GiB floor plus what the driver takes)
-            let spare = (env_f64("NS_MM31_SPARE_GIB").unwrap_or(1.85).max(1.6) * GIB as f64) as usize;
+            // NS_MM31_SPARE_GIB: the room left besides the arena and the caches (default 1.9; never below the 1.5 GiB floor plus what the driver takes)
+            let spare = (env_f64("NS_MM31_SPARE_GIB").unwrap_or(1.9).max(1.6) * GIB as f64) as usize;
             let ds_kv = if c + 1 == ncard && ds.is_some() { 5 * kv_tokens * 2 * (g.n_kv_head * g.head_dim) as usize * 2 } else { 0 };
             let reserve = arena_bytes + kv.1.max(1) * kv_tokens * per_tok(&ranges[c]) + spare + ds_kv;
             let room = free.saturating_sub(reserve);

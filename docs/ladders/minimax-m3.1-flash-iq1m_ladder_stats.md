@@ -8,7 +8,7 @@ bounds it: [docs/ports/minimax-m31.md](../ports/minimax-m31.md).
 
 | | |
 |---|---|
-| GPUs | Intel Arc Pro B70 (layers 0-35) + Arc Pro B65 (layers 36-59), 31.9 GiB each; the single-card rows use the B70 alone |
+| GPUs | Intel Arc Pro B65 (layers 0-23) + Arc Pro B70 (layers 24-59), 31.9 GiB each; the single-card rows use the B70 alone |
 | host | 61 GiB RAM, Fedora, in the `h3-build` image; the front door idle (`system.busy` false) |
 | model file | Crucial P310 4 TB NVMe (~5.2 GB/s at 8 parallel direct reads), the 4 shards of `UD-IQ1_M/` |
 | second drive | the system NVMe (`NS_MM31_STREAM_DIR`): a copy of the off-card experts, written once (8 s, 34 GiB), a read's pieces going round the two drives |
@@ -20,7 +20,22 @@ bounds it: [docs/ports/minimax-m31.md](../ports/minimax-m31.md).
 Each rung is a fresh process (the load, 22-33 s on two cards, not counted). Prompts: the repository text repeated
 to length (`p2k` 7,600 characters, `p8k` 30,000, `p32k` 120,000), chat template applied.
 
-## Results (2026-10-30)
+## Results (2026-10-30, fourth round)
+
+| prompt tokens | cards | pp | tg | tokens generated |
+|---:|---|---:|---:|---:|
+| 2,137 | B65 + B70 | 229.9 tok/s (9.3 s) | 11.41 tok/s | 200 |
+| 7,990 | B65 + B70 | 373.1 tok/s (21.4 s) | 10.30 tok/s | 200 |
+| 31,085 | B65 + B70 | 305.4 tok/s (101.8 s) | 9.65 tok/s | 100 |
+| 2,137 | B65 + B70, expert profile | 230.1 tok/s | 12.54 tok/s | 200 |
+| 7,990 | B65 + B70, expert profile | 381.9 tok/s | 11.56 tok/s | 200 |
+| 31,085 | B65 + B70, expert profile | 310.9 tok/s | 11.52 tok/s | 100 |
+| 2,137 | B70 alone | 188.9 tok/s | 7.69 tok/s | 200 |
+| 7,990 | B70 alone | 275.1 tok/s | 6.30 tok/s | 100 |
+
+B65 first with 24 layers, the second drive with the off-card experts (34 GiB), profile from six other prompts.
+
+## Results (third round)
 
 | prompt tokens | cards | pp | tg | tokens generated |
 |---:|---|---:|---:|---:|
