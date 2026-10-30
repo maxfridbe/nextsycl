@@ -1175,7 +1175,7 @@ impl<'g> MiniMax<'g> {
             // NS_MM31_SPARE_GIB: the room left besides the arena and the caches (default 1.85; never below the 1.5 GiB floor plus what the driver takes)
             let spare = (env_f64("NS_MM31_SPARE_GIB").unwrap_or(1.85).max(1.6) * GIB as f64) as usize;
             let ds_kv = if c + 1 == ncard && ds.is_some() { 5 * kv_tokens * 2 * (g.n_kv_head * g.head_dim) as usize * 2 } else { 0 };
-            let reserve = arena_bytes + kv_tokens * per_tok(&ranges[c]) + spare + ds_kv;
+            let reserve = arena_bytes + kv.1.max(1) * kv_tokens * per_tok(&ranges[c]) + spare + ds_kv;
             let room = free.saturating_sub(reserve);
             let v = match env_f64("NS_MM31_VRAM_GIB").or(o.expert_bytes.map(|b| b as f64 / GIB as f64)) {
                 Some(v) => ((v * GIB as f64) as usize).min(room),

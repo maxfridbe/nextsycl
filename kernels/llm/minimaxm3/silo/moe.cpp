@@ -275,18 +275,19 @@ void mv3(sycl::queue& q, const uint8_t* m0, const uint8_t* m1, const uint8_t* m2
 // `off_up` bytes after it. A sub-group works RPS output rows (both of their matrices) at once.
 template <int T, int RPS, int KU>
 void gu(sycl::queue& q, const uint64_t* bases, int64_t off_up, const float* x, const int32_t* tok, float* h, int64_t entries, int64_t rows, int64_t cols, float alpha, float limit) {
-    constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32;
-    const int64_t rgs = (rows + RPG * RPS - 1) / (RPG * RPS), nb = cols / 256, rowb = nb * SB;
+    // a work-group fills its table once: more rows a group, fewer table reads (IQ1_M: 8 KB a group, against 45 KB of weights a row pair)
+    constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32, RG = (N64 > 0 || N32 > 0) ? 16 : 4;
+    const int64_t rgs = (rows + RG * RPS - 1) / (RG * RPS), nb = cols / 256, rowb = nb * SB;
     q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<uint64_t, 1> l64(sycl::range<1>(N64 > 0 ? N64 : 1), hd);
         sycl::local_accessor<uint32_t, 1> l32(sycl::range<1>(N32 > 0 ? N32 : 1), hd);
-        hd.parallel_for(sycl::nd_range<1>(entries * rgs * RPG * SG, RPG * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        hd.parallel_for(sycl::nd_range<1>(entries * rgs * RG * SG, RG * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             const auto sg = it.get_sub_group();
-            for (int i = it.get_local_linear_id(); i < N64; i += RPG * SG) l64[i] = Tabs<T>::t64(i);
-            for (int i = it.get_local_linear_id(); i < N32; i += RPG * SG) l32[i] = Tabs<T>::t32(i);
+            for (int i = it.get_local_linear_id(); i < N64; i += RG * SG) l64[i] = Tabs<T>::t64(i);
+            for (int i = it.get_local_linear_id(); i < N32; i += RG * SG) l32[i] = Tabs<T>::t32(i);
             if (N64 > 0 || N32 > 0) sycl::group_barrier(it.get_group());
             const Lut L{l64.template get_multi_ptr<sycl::access::decorated::no>().get(), l32.template get_multi_ptr<sycl::access::decorated::no>().get()};
-            const int64_t gi = it.get_group(0), e = gi / rgs, r0 = ((gi % rgs) * RPG + sg.get_group_id()[0]) * RPS;
+            const int64_t gi = it.get_group(0), e = gi / rgs, r0 = ((gi % rgs) * RG + sg.get_group_id()[0]) * RPS;
             const int lane = sg.get_local_id()[0];
             if (r0 >= rows) return;
             const uint8_t* gate = reinterpret_cast<const uint8_t*>(bases[e]);
@@ -335,18 +336,19 @@ void gu(sycl::queue& q, const uint64_t* bases, int64_t off_up, const float* x, c
 // ys[rank[e] * plane + r] = w[e] * (down_e[r] . h_e) with h_e = h + e * cols
 template <int T, int RPS, int KU>
 void down(sycl::queue& q, const uint64_t* bases, int64_t off_down, const float* h, const float* w, const int32_t* rank, const int32_t* tok, float* ys, int64_t plane, int64_t entries, int64_t rows, int64_t cols) {
-    constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32;
-    const int64_t rgs = (rows + RPG * RPS - 1) / (RPG * RPS), nb = cols / 256, rowb = nb * SB;
+    // a work-group fills its table once: more rows a group, fewer table reads (IQ1_M: 8 KB a group, against 45 KB of weights a row pair)
+    constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32, RG = (N64 > 0 || N32 > 0) ? 16 : 4;
+    const int64_t rgs = (rows + RG * RPS - 1) / (RG * RPS), nb = cols / 256, rowb = nb * SB;
     q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<uint64_t, 1> l64(sycl::range<1>(N64 > 0 ? N64 : 1), hd);
         sycl::local_accessor<uint32_t, 1> l32(sycl::range<1>(N32 > 0 ? N32 : 1), hd);
-        hd.parallel_for(sycl::nd_range<1>(entries * rgs * RPG * SG, RPG * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        hd.parallel_for(sycl::nd_range<1>(entries * rgs * RG * SG, RG * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             const auto sg = it.get_sub_group();
-            for (int i = it.get_local_linear_id(); i < N64; i += RPG * SG) l64[i] = Tabs<T>::t64(i);
-            for (int i = it.get_local_linear_id(); i < N32; i += RPG * SG) l32[i] = Tabs<T>::t32(i);
+            for (int i = it.get_local_linear_id(); i < N64; i += RG * SG) l64[i] = Tabs<T>::t64(i);
+            for (int i = it.get_local_linear_id(); i < N32; i += RG * SG) l32[i] = Tabs<T>::t32(i);
             if (N64 > 0 || N32 > 0) sycl::group_barrier(it.get_group());
             const Lut L{l64.template get_multi_ptr<sycl::access::decorated::no>().get(), l32.template get_multi_ptr<sycl::access::decorated::no>().get()};
-            const int64_t gi = it.get_group(0), e = gi / rgs, r0 = ((gi % rgs) * RPG + sg.get_group_id()[0]) * RPS;
+            const int64_t gi = it.get_group(0), e = gi / rgs, r0 = ((gi % rgs) * RG + sg.get_group_id()[0]) * RPS;
             const int lane = sg.get_local_id()[0];
             if (r0 >= rows) return;
             const uint8_t* base = reinterpret_cast<const uint8_t*>(bases[e]) + off_down;
