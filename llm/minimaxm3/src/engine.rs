@@ -86,6 +86,12 @@ fn no_fused() -> bool {
     std::env::var("NS_MM31_FUSED").is_ok_and(|v| v == "0")
 }
 
+/// NS_MM31_SILO_HALF=0: a prompt pass's experts dequantize to half on the shared kernel, not the silo's
+fn no_silo_half() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("NS_MM31_SILO_HALF").is_ok_and(|v| v == "0"))
+}
+
 /// NS_MM31_SPLIT_ATTEND=0: the decode passes run the attention kernel of the prompt passes or the shared one
 fn no_split() -> bool {
     std::env::var("NS_MM31_SPLIT_ATTEND").is_ok_and(|v| v == "0")
@@ -536,7 +542,7 @@ struct Moe {
     shared: Dense,
     /// where an expert's bytes are in the stream file (the second drive's copy of the experts that are not on the cards), or MAX
     stream: Vec<u64>,
-    /// the shared expert's gate address, a weight of 1 and a rank of 0, for the fused kernels
+    /// the shared expert's down matrix's address, a weight of 1 and a rank of 0, for the fused kernel
     shared_meta: DevBuf,
     /// the shards of the stream files (one a drive of NS_MM31_STREAM_DIR)
     stream_shards: Vec<usize>,
@@ -971,7 +977,7 @@ impl<'g> MiniMax<'g> {
         }
         for ly in &layers {
             if let Ffn::Moe(m) = &ly.ffn {
-                let mut b: Vec<u8> = (m.shared.gate.buf.ptr() as u64).to_le_bytes().to_vec();
+                let mut b: Vec<u8> = (m.shared.down.buf.ptr() as u64).to_le_bytes().to_vec();
                 b.extend(1f32.to_le_bytes());
                 b.extend(0i32.to_le_bytes());
                 m.shared_meta.write(0, &b)?;
@@ -1525,9 +1531,9 @@ impl<'g> MiniMax<'g> {
         let v = a.f32(t * kv * hd)?;
         // one token, the silo's fused launches: q, k, v at once, then the norms, RoPE and stores at once
         let one = self.one_fns(t).filter(|f| {
-            let ok = |ty: GType, c: usize| unsafe { (self.k.silo_moe.as_ref().unwrap().supported)(ty.code() as i32, c as i64) != 0 };
             let _ = f;
-            ly.q.ty == ly.k.ty && ly.q.ty == ly.v.ty && ok(ly.q.ty, ly.q.cols) && ok(ly.o.ty, ly.o.cols) && ly.idx.as_ref().is_none_or(|ix| ix.q.ty == GType::F32 && ix.k.ty == GType::F32)
+            self.mmvq_ok(ly.q.ty, ly.q.cols) && self.mmvq_ok(ly.k.ty, ly.k.cols) && self.mmvq_ok(ly.v.ty, ly.v.cols) && self.mmvq_ok(ly.o.ty, ly.o.cols)
+                && ly.idx.as_ref().is_none_or(|ix| ix.q.ty == GType::F32 && ix.k.ty == GType::F32)
         });
         let mut iq_done: Option<DevBuf> = None;
         if let Some(f) = one {
@@ -1536,8 +1542,7 @@ impl<'g> MiniMax<'g> {
             kc.bounds(off * 2, kv * hd * 2)?;
             // SAFETY: q, k, v hold their rows; the stores are inside the caches (checked just above; v and ik have the same extent per position).
             unsafe {
-                ffi::check((f.mv3)(raw, ly.q.ty.code() as i32, ly.q.buf.ptr().cast_const(), ly.k.buf.ptr().cast_const(), ly.v.buf.ptr().cast_const(), xn.fp().cast_const(), q.fp(), k.fp(), v.fp(),
-                                   ly.q.rows as i64, ly.k.rows as i64, ly.v.rows as i64, ly.q.cols as i64), "q k v")?;
+                self.q_products(cd, xn, &[(&ly.q, &q), (&ly.k, &k), (&ly.v, &v)])?;
                 let n_rot = g.n_rot as i64;
                 let (kp, vp) = (kc.ptr().cast::<u16>().add(off), vc.ptr().cast::<u16>().add(off));
                 match (&ly.idx, &s.ik[l]) {
@@ -1653,14 +1658,47 @@ impl<'g> MiniMax<'g> {
         tap(&format!("kqv_out-{l}"), &out)?;
         let o = a.f32(t * g.n_embd as usize)?;
         match one {
-            // SAFETY: out holds cols floats, o rows.
-            Some(f) => unsafe {
-                ffi::check((f.mv3)(raw, ly.o.ty.code() as i32, ly.o.buf.ptr().cast_const(), std::ptr::null(), std::ptr::null(), out.fp().cast_const(), o.fp(), std::ptr::null_mut(), std::ptr::null_mut(), ly.o.rows as i64, 0, 0, ly.o.cols as i64), "o")?;
-            },
+            Some(_) => self.q_products(cd, &out, &[(&ly.o, &o)])?,
             None => self.matmul(cd, &ly.o, &out, t, &o)?,
         }
         self.lap(cd, l, 0, &mut tm);
         Ok(o)
+    }
+
+    /// One token's products of matrices with one activation `x`, quantized once to Q8_1 (the silo's tuned kernels, the shared one for a type they do not take)
+    fn q_products(&self, cd: &Card, x: &DevBuf, mats: &[(&Mat, &DevBuf)]) -> Result<()> {
+        let cols = mats[0].0.cols;
+        let m = cd.arena.mark();
+        // SAFETY: plain size queries.
+        let nq = unsafe { (self.k.q8_1_bytes)(cols as i64, 1) };
+        let q8 = cd.arena.bytes(nq)?;
+        match &self.k.silo_q {
+            Some(f) => {
+                // SAFETY: plain size query.
+                let ns = unsafe { (f.split_bytes)(cols as i64, 1) };
+                let xs = cd.arena.bytes(ns)?;
+                // SAFETY: x holds cols floats; q8 and xs their sizes above; each y its matrix's rows.
+                unsafe {
+                    ffi::check((f.quantize)(cd.gpu.raw(), x.fp().cast_const(), q8.ptr(), xs.ptr(), cols as i64, 1), "quantize")?;
+                    for (w, y) in mats {
+                        if (f.supported)(w.ty.code() as i32, w.cols as i64) != 0 {
+                            ffi::check((f.mmvq)(cd.gpu.raw(), w.ty.code() as i32, w.buf.ptr().cast_const(), q8.ptr().cast_const(), xs.ptr().cast_const(), y.fp(), w.cols as i64, w.rows as i64, 1), "mmvq")?;
+                        } else {
+                            self.mmvq_at(cd, w.ty, w.buf.ptr().cast::<u8>().cast_const(), &q8, w.cols, w.rows, 1, y)?;
+                        }
+                    }
+                }
+            }
+            None => {
+                // SAFETY: x holds cols floats, q8 the blocks.
+                ffi::check(unsafe { (self.k.quantize_q8_1)(cd.gpu.raw(), x.fp(), q8.ptr(), cols as i64, 1) }, "quantize_q8_1")?;
+                for (w, y) in mats {
+                    self.mmvq_at(cd, w.ty, w.buf.ptr().cast::<u8>().cast_const(), &q8, w.cols, w.rows, 1, y)?;
+                }
+            }
+        }
+        cd.arena.rewind(m);
+        Ok(())
     }
 
     /// The silo's fused steps of a one-token pass (NS_MM31_FUSE1=0: the separate launches)
@@ -1917,9 +1955,9 @@ impl<'g> MiniMax<'g> {
             self.guess_ahead(l, gs.take())?;
         }
         // one token: the activation quantized once for the shared expert and every pick, the picks' ids / weights / ranks in one upload
-        let fused_sh = self.one_fns(t).is_some() && !no_fused() && m.shared.gate.ty == m.shared.up.ty && self.k.silo_moe.as_ref().is_some_and(|f| {
+        let fused_sh = self.one_fns(t).is_some() && !no_fused() && self.mmvq_ok(m.shared.gate.ty, c) && self.mmvq_ok(m.shared.up.ty, c) && self.k.silo_moe.as_ref().is_some_and(|f| {
             // SAFETY: plain queries.
-            unsafe { (f.supported)(m.shared.gate.ty.code() as i32, c as i64) != 0 && (f.supported)(m.shared.down.ty.code() as i32, m.shared.gate.rows as i64) != 0 }
+            unsafe { (f.supported)(m.shared.down.ty.code() as i32, m.shared.gate.rows as i64) != 0 }
         });
         let one = if !fused_sh && t == 1 && [&m.gate, &m.up, &m.down].iter().all(|w| self.mmvq_ok(w.ty, w.cols)) && self.mmvq_ok(m.shared.gate.ty, m.shared.gate.cols)
             && self.mmvq_ok(m.shared.up.ty, m.shared.up.cols) {
@@ -1967,15 +2005,14 @@ impl<'g> MiniMax<'g> {
                 let f = self.k.silo_moe.as_ref().unwrap();
                 let fe = m.shared.gate.rows;
                 let h = a.f32(fe)?;
+                let hu = a.f32(fe)?;
                 let o = a.f32(c)?;
-                let meta = &m.shared_meta;
-                let p = meta.ptr().cast::<u8>().cast_const();
-                // SAFETY: meta holds the gate's address and, after it, a weight of 1 and a rank of 0 (written at load); the up and down matrices are that far from the gate's bytes.
+                self.q_products(cd, x, &[(&m.shared.gate, &h), (&m.shared.up, &hu)])?;
+                let p = m.shared_meta.ptr().cast::<u8>().cast_const();
+                // SAFETY: h, hu hold fe floats; meta the down matrix's address, a weight of 1 and a rank of 0 (written at load); o c floats.
                 unsafe {
-                    let gp = m.shared.gate.buf.ptr().cast::<u8>().cast_const();
-                    let (off_u, off_d) = (m.shared.up.buf.ptr().cast::<u8>().cast_const().offset_from(gp) as i64, m.shared.down.buf.ptr().cast::<u8>().cast_const().offset_from(gp) as i64);
-                    ffi::check((f.gu)(cd.gpu.raw(), m.shared.gate.ty.code() as i32, p.cast::<u64>(), off_u, x.fp().cast_const(), h.fp(), 1, fe as i64, c as i64, 1.702, 7.0), "shared gu")?;
-                    ffi::check((f.down)(cd.gpu.raw(), m.shared.down.ty.code() as i32, p.cast::<u64>(), off_d, h.fp().cast_const(), p.add(8).cast::<f32>(), p.add(12).cast::<i32>(), o.fp(), c as i64, 1, c as i64, fe as i64), "shared down")?;
+                    ffi::check((self.k.swiglu_oai)(cd.gpu.raw(), h.fp(), hu.fp(), h.fp(), fe as i64, 1.702, 7.0), "swiglu_oai")?;
+                    ffi::check((f.down)(cd.gpu.raw(), m.shared.down.ty.code() as i32, p.cast::<u64>(), 0, h.fp().cast_const(), p.add(8).cast::<f32>(), p.add(12).cast::<i32>(), o.fp(), c as i64, 1, c as i64, fe as i64), "shared down")?;
                 }
                 o
             }
@@ -2184,6 +2221,12 @@ impl<'g> MiniMax<'g> {
         } else {
             for (ex, b) in &vram_hot {
                 run(b.ptr().cast::<u8>().cast_const(), *ex)?;
+                // the second half of the ring is free from the start: wave 1 starts as soon as wave 0 is in, while these experts run
+                if joined == 0 && waves.len() > 1 && inflight.as_ref().is_some_and(|hs| hs.iter().all(|h| h.is_finished())) {
+                    join_all(inflight.take().unwrap())?;
+                    joined = 1;
+                    inflight = Some(issue(1));
+                }
             }
         }
         for i in 0..njobs {
@@ -2399,7 +2442,10 @@ impl<'g> MiniMax<'g> {
         let w16 = cd.arena.bytes(nv * 2)?;
         // SAFETY: wp holds the matrix's rows * cols values in the type; w16 holds as many halves; x16 n * cols, y n * rows.
         unsafe {
-            ffi::check((self.k.dequant_f16)(cd.gpu.raw(), w.ty.code() as i32, wp.cast(), nv as i64, w16.ptr().cast::<u16>()), "dequant_f16")?;
+            match self.k.silo_one.as_ref().filter(|_| !no_silo_half()) {
+                Some(f) => ffi::check((f.to_half)(cd.gpu.raw(), w.ty.code() as i32, wp.cast(), nv as i64, w16.ptr().cast::<u16>()), "to_half")?,
+                None => ffi::check((self.k.dequant_f16)(cd.gpu.raw(), w.ty.code() as i32, wp.cast(), nv as i64, w16.ptr().cast::<u16>()), "dequant_f16")?,
+            }
             if self.pf {
                 let t0 = Instant::now();
                 cd.gpu.sync()?;

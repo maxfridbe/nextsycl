@@ -316,9 +316,56 @@ void down(sycl::queue& q, const uint64_t* bases, int64_t off_down, const float* 
     });
 }
 
+// out[nb][256] = the blocks as fp16 (a prompt pass's experts, for the half GEMM): a sub-group a block, each lane its 8 values as one 16-byte store
+template <int T>
+void to_half(sycl::queue& q, const uint8_t* src, uint16_t* out, int64_t nb) {
+    constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32, BPG = 16;
+    q.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<uint64_t, 1> l64(sycl::range<1>(N64 > 0 ? N64 : 1), hd);
+        sycl::local_accessor<uint32_t, 1> l32(sycl::range<1>(N32 > 0 ? N32 : 1), hd);
+        const int64_t groups = (nb + BPG - 1) / BPG;
+        hd.parallel_for(sycl::nd_range<1>(groups * BPG * SG, BPG * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const auto sg = it.get_sub_group();
+            for (int i = it.get_local_linear_id(); i < N64; i += BPG * SG) l64[i] = Tabs<T>::t64(i);
+            for (int i = it.get_local_linear_id(); i < N32; i += BPG * SG) l32[i] = Tabs<T>::t32(i);
+            if (N64 > 0 || N32 > 0) sycl::group_barrier(it.get_group());
+            const Lut L{l64.template get_multi_ptr<sycl::access::decorated::no>().get(), l32.template get_multi_ptr<sycl::access::decorated::no>().get()};
+            const int64_t k = it.get_group(0) * BPG + sg.get_group_id()[0];
+            if (k >= nb) return;
+            const int lane = sg.get_local_id()[0];
+            float w[8];
+            Deq<T>::group(src + k * SB, lane, w, L);
+            uint32_t o[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t a = sycl::bit_cast<uint16_t>((sycl::half) w[2 * j]), b = sycl::bit_cast<uint16_t>((sycl::half) w[2 * j + 1]);
+                o[j] = a | (b << 16);
+            }
+            *reinterpret_cast<sycl::uint4*>(out + k * 256 + lane * 8) = sycl::uint4(o[0], o[1], o[2], o[3]);
+        });
+    });
+}
+
 }  // namespace
 
 extern "C" {
+
+// the blocks of a matrix as fp16: nv values (a multiple of 256), out 16-byte aligned
+int ns_mm3s_to_half(ns_gpu* g, int type, const void* src, int64_t nv, uint16_t* out) {
+    NS_TRY
+    if (nv % 256 || type == T_F32 || !sb_bytes(type)) return ns_fail("ns_mm3s_to_half: type " + std::to_string(type));
+    const auto* b = (const uint8_t*) src;
+    switch (type) {
+        case T_IQ2_XXS: to_half<T_IQ2_XXS>(g->q, b, out, nv / 256); return 0;
+        case T_IQ1_M: to_half<T_IQ1_M>(g->q, b, out, nv / 256); return 0;
+        case T_IQ3_XXS: to_half<T_IQ3_XXS>(g->q, b, out, nv / 256); return 0;
+        case T_IQ4_XS: to_half<T_IQ4_XS>(g->q, b, out, nv / 256); return 0;
+        case T_Q5_K: to_half<T_Q5_K>(g->q, b, out, nv / 256); return 0;
+        case T_Q6_K: to_half<T_Q6_K>(g->q, b, out, nv / 256); return 0;
+        default: return ns_fail("ns_mm3s_to_half: type");
+    }
+    NS_CATCH
+}
 
 int ns_mm3s_expert_supported(int type, int64_t cols) { return sb_bytes(type) != 0 && cols > 0 && cols % 256 == 0; }
 

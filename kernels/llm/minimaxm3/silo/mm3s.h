@@ -39,6 +39,8 @@ int ns_mm3s_mv3(ns_gpu* g, int type, const void* m0, const void* m1, const void*
 /* A decode token's attention after its projections: q, k, iq, ik normed and rotated in place, k, v, ik stored as fp16 (at the token's position), a launch; IH = 0: no indexer */
 int ns_mm3s_attn_post(ns_gpu* g, float* q, float* k, const float* v, float* iq, float* ik, const float* qn, const float* kn, const float* iqn, const float* ikn, uint16_t* kc, uint16_t* vc, uint16_t* ic,
                       int64_t H, int64_t G, int64_t IH, int64_t HD, int64_t n_rot, int64_t pos, float base, float eps);
+/* A matrix's blocks as fp16 for a prompt pass's half GEMM: nv values, a multiple of 256; out 16-byte aligned */
+int ns_mm3s_to_half(ns_gpu* g, int type, const void* src, int64_t nv, uint16_t* out);
 /* att = o + x, hn = rms_norm(att) * w */
 int ns_mm3s_add_norm(ns_gpu* g, float* att, const float* o, const float* x, const float* w, float* hn, int64_t C, float eps);
 /* out = the `used` planes of ys in rank order + sh + att */
