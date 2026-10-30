@@ -273,7 +273,7 @@ void mv3(sycl::queue& q, const uint8_t* m0, const uint8_t* m1, const uint8_t* m2
 // h[e * rows + r] = swiglu_oai(gate_e[r] . x, up_e[r] . x) for the entries' experts: bases[e] the expert's gate matrix, the up matrix
 // `off_up` bytes after it. A sub-group works RPS output rows (both of their matrices) at once.
 template <int T, int RPS, int KU>
-void gu(sycl::queue& q, const uint64_t* bases, int64_t off_up, const float* x, float* h, int64_t entries, int64_t rows, int64_t cols, float alpha, float limit) {
+void gu(sycl::queue& q, const uint64_t* bases, int64_t off_up, const float* x, const int32_t* tok, float* h, int64_t entries, int64_t rows, int64_t cols, float alpha, float limit) {
     constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32;
     const int64_t rgs = (rows + RPG * RPS - 1) / (RPG * RPS), nb = cols / 256, rowb = nb * SB;
     q.submit([&](sycl::handler& hd) {
@@ -290,6 +290,7 @@ void gu(sycl::queue& q, const uint64_t* bases, int64_t off_up, const float* x, f
             if (r0 >= rows) return;
             const uint8_t* gate = reinterpret_cast<const uint8_t*>(bases[e]);
             const uint8_t* up = gate + off_up;
+            const float* xr = x + (int64_t) tok[e] * cols;
             float ag[RPS] = {}, au[RPS] = {};
             for (int64_t k0 = 0; k0 < nb; k0 += KU) {
                 // KU blocks of RPS rows (gate and up) decoded first, their loads in flight together, then multiplied
@@ -307,7 +308,7 @@ void gu(sycl::queue& q, const uint64_t* bases, int64_t off_up, const float* x, f
 #pragma unroll
                 for (int u = 0; u < KU; ++u) {
                     if (k0 + u >= nb) break;
-                    const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(x + (k0 + u) * 256 + lane * 8);
+                    const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(xr + (k0 + u) * 256 + lane * 8);
                     const sycl::float4 a = xv[0], b = xv[1];
 #pragma unroll
                     for (int j = 0; j < RPS; ++j) {
@@ -332,7 +333,7 @@ void gu(sycl::queue& q, const uint64_t* bases, int64_t off_up, const float* x, f
 
 // ys[rank[e] * plane + r] = w[e] * (down_e[r] . h_e) with h_e = h + e * cols
 template <int T, int RPS, int KU>
-void down(sycl::queue& q, const uint64_t* bases, int64_t off_down, const float* h, const float* w, const int32_t* rank, float* ys, int64_t plane, int64_t entries, int64_t rows, int64_t cols) {
+void down(sycl::queue& q, const uint64_t* bases, int64_t off_down, const float* h, const float* w, const int32_t* rank, const int32_t* tok, float* ys, int64_t plane, int64_t entries, int64_t rows, int64_t cols) {
     constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32;
     const int64_t rgs = (rows + RPG * RPS - 1) / (RPG * RPS), nb = cols / 256, rowb = nb * SB;
     q.submit([&](sycl::handler& hd) {
@@ -374,7 +375,7 @@ void down(sycl::queue& q, const uint64_t* bases, int64_t off_down, const float* 
 #pragma unroll
             for (int j = 0; j < RPS; ++j) {
                 const float s = sycl::reduce_over_group(sg, acc[j], sycl::plus<float>());
-                if (lane == 0 && r0 + j < rows) ys[(int64_t) rank[e] * plane + r0 + j] = w[e] * s;
+                if (lane == 0 && r0 + j < rows) ys[(int64_t) rank[e] * plane + (int64_t) tok[e] * rows + r0 + j] = w[e] * s;
             }
         });
     });
@@ -498,6 +499,17 @@ int ns_mm3s_attn_post(ns_gpu* g, float* q, float* k, const float* v, float* iq, 
     NS_CATCH
 }
 
+// A doorbell: when the work queued before it is done, *flag (pinned host memory) = seq, so the host learns it without waiting for the queue (it runs on behind this)
+int ns_mm3s_doorbell(ns_gpu* g, uint32_t* flag, uint32_t seq) {
+    NS_TRY
+    g->q.single_task([=]() {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst, sycl::memory_scope::system, sycl::access::address_space::global_space> a(*flag);
+        a.store(seq);
+    });
+    return 0;
+    NS_CATCH
+}
+
 // att = o + x; hn = rms_norm(att) * w, in a launch
 int ns_mm3s_add_norm(ns_gpu* g, float* att, const float* o, const float* x, const float* w, float* hn, int64_t C, float eps) {
     NS_TRY
@@ -527,13 +539,13 @@ int ns_mm3s_finish(ns_gpu* g, const float* ys, int64_t used, const float* sh, co
     NS_CATCH
 }
 
-int ns_mm3s_expert_gu(ns_gpu* g, int type, const uint64_t* bases, int64_t off_up, const float* x, float* h, int64_t entries, int64_t rows, int64_t cols, float alpha,
+int ns_mm3s_expert_gu(ns_gpu* g, int type, const uint64_t* bases, int64_t off_up, const float* x, const int32_t* tok, float* h, int64_t entries, int64_t rows, int64_t cols, float alpha,
                       float limit) {
     NS_TRY
     if (!ns_mm3s_expert_supported(type, cols)) return ns_fail("ns_mm3s_expert_gu: type " + std::to_string(type) + " with cols " + std::to_string(cols));
     static const int rps = [] { const char* v = std::getenv("NS_MM3S_RPS"); return v ? std::atoi(v) : 2; }();
     static const int ku = [] { const char* v = std::getenv("NS_MM3S_KU"); return v ? std::atoi(v) : 1; }();
-#define GU(T, R, K) gu<T, R, K>(g->q, bases, off_up, x, h, entries, rows, cols, alpha, limit)
+#define GU(T, R, K) gu<T, R, K>(g->q, bases, off_up, x, tok, h, entries, rows, cols, alpha, limit)
 #define RUN(T) if (rps == 1) { if (ku == 2) GU(T, 1, 2); else GU(T, 1, 1); } else if (rps == 4) { if (ku == 2) GU(T, 4, 2); else GU(T, 4, 1); } else { if (ku == 2) GU(T, 2, 2); else GU(T, 2, 1); } return 0;
     switch (type) {
         case T_IQ2_XXS: RUN(T_IQ2_XXS)
@@ -548,13 +560,13 @@ int ns_mm3s_expert_gu(ns_gpu* g, int type, const uint64_t* bases, int64_t off_up
     NS_CATCH
 }
 
-int ns_mm3s_expert_down(ns_gpu* g, int type, const uint64_t* bases, int64_t off_down, const float* h, const float* w, const int32_t* rank, float* ys, int64_t plane, int64_t entries,
+int ns_mm3s_expert_down(ns_gpu* g, int type, const uint64_t* bases, int64_t off_down, const float* h, const float* w, const int32_t* rank, const int32_t* tok, float* ys, int64_t plane, int64_t entries,
                         int64_t rows, int64_t cols) {
     NS_TRY
     if (!ns_mm3s_expert_supported(type, cols)) return ns_fail("ns_mm3s_expert_down: type " + std::to_string(type) + " with cols " + std::to_string(cols));
     static const int rps = [] { const char* v = std::getenv("NS_MM3S_RPS"); return v ? std::atoi(v) : 2; }();
     static const int ku = [] { const char* v = std::getenv("NS_MM3S_KU"); return v ? std::atoi(v) : 1; }();
-#define DN(T, R, K) down<T, R, K>(g->q, bases, off_down, h, w, rank, ys, plane, entries, rows, cols)
+#define DN(T, R, K) down<T, R, K>(g->q, bases, off_down, h, w, rank, tok, ys, plane, entries, rows, cols)
 #define RUN(T) if (rps == 1) { if (ku == 2) DN(T, 1, 2); else DN(T, 1, 1); } else if (rps == 4) { if (ku == 2) DN(T, 4, 2); else DN(T, 4, 1); } else { if (ku == 2) DN(T, 2, 2); else DN(T, 2, 1); } return 0;
     switch (type) {
         case T_IQ2_XXS: RUN(T_IQ2_XXS)

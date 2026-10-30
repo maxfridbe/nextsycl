@@ -54,14 +54,15 @@ pub struct OneFns {
     pub add_norm: unsafe extern "C" fn(Gpu, *mut f32, *const f32, *const f32, *const f32, *mut f32, i64, f32) -> c_int,
     pub finish: unsafe extern "C" fn(Gpu, *const f32, i64, *const f32, *const f32, *mut f32, i64) -> c_int,
     pub to_half: unsafe extern "C" fn(Gpu, c_int, *const c_void, i64, *mut u16) -> c_int,
+    pub doorbell: unsafe extern "C" fn(Gpu, *mut u32, u32) -> c_int,
 }
 
 pub type PostFn = unsafe extern "C" fn(Gpu, *mut f32, *mut f32, *const f32, *mut f32, *mut f32, *const f32, *const f32, *const f32, *const f32, *mut u16, *mut u16, *mut u16, i64, i64, i64, i64, i64, i64, f32, f32) -> c_int;
 
 pub struct MoeFns {
     pub supported: unsafe extern "C" fn(c_int, i64) -> c_int,
-    pub gu: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *mut f32, i64, i64, i64, f32, f32) -> c_int,
-    pub down: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *const f32, *const i32, *mut f32, i64, i64, i64, i64) -> c_int,
+    pub gu: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *const i32, *mut f32, i64, i64, i64, f32, f32) -> c_int,
+    pub down: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *const f32, *const i32, *const i32, *mut f32, i64, i64, i64, i64) -> c_int,
 }
 
 pub type SplitFn = unsafe extern "C" fn(Gpu, *const f32, *const u16, *const u16, *const i32, i64, *mut f32, i64, i64, i64, i64, f32, i64, *mut f32) -> c_int;
@@ -134,15 +135,17 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             silo_one: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
                 let (a, b, c, d) = (s.symbol("ns_mm3s_mv3"), s.symbol("ns_mm3s_attn_post"), s.symbol("ns_mm3s_add_norm"), s.symbol("ns_mm3s_finish"));
                 let e = s.symbol("ns_mm3s_to_half");
+                let bell = s.symbol("ns_mm3s_doorbell");
                 // SAFETY: the symbols are declared in mm3s.h with OneFns's signatures.
                 #[allow(clippy::missing_transmute_annotations)]
-                (!a.is_null() && !b.is_null() && !c.is_null() && !d.is_null() && !e.is_null()).then(|| unsafe {
+                (!a.is_null() && !b.is_null() && !c.is_null() && !d.is_null() && !e.is_null() && !bell.is_null()).then(|| unsafe {
                     OneFns {
                         mv3: std::mem::transmute::<*mut c_void, _>(a),
                         post: std::mem::transmute::<*mut c_void, _>(b),
                         add_norm: std::mem::transmute::<*mut c_void, _>(c),
                         finish: std::mem::transmute::<*mut c_void, _>(d),
                         to_half: std::mem::transmute::<*mut c_void, _>(e),
+                        doorbell: std::mem::transmute::<*mut c_void, _>(bell),
                     }
                 })
             }),

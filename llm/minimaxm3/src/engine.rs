@@ -92,6 +92,12 @@ fn half_proj() -> bool {
     *N.get_or_init(|| std::env::var("NS_MM31_HALF_PROJ").map_or(true, |v| v != "0"))
 }
 
+/// NS_MM31_BELL=0: the router's result comes back by a blocking read, not the doorbell with the shared expert running behind it
+fn bell() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("NS_MM31_BELL").map_or(true, |v| v != "0"))
+}
+
 /// NS_MM31_SILO_HALF=0: a prompt pass's experts dequantize to half on the shared kernel, not the silo's
 fn no_silo_half() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -107,6 +113,9 @@ fn no_split() -> bool {
 fn copy_lane() -> i32 {
     std::env::var("NS_MM31_LANE").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(0, 2)
 }
+
+/// The scratch of decode passes (rows < 8)
+const DECODE_ARENA: usize = 192 << 20;
 
 /// Reads in flight while a card's experts are placed at load
 const LOAD_THREADS: usize = 12;
@@ -552,6 +561,13 @@ struct Moe {
     stream_shards: Vec<usize>,
 }
 
+impl Card {
+    fn ar(&self) -> &Arena {
+        // SAFETY: the pointer is arena_small's or the boxed arena_big's; it changes only between passes (use_arena, under the work lock), and no scratch of a pass outlives it.
+        unsafe { &*self.cur_arena.load(Relaxed) }
+    }
+}
+
 impl Moe {
     /// an expert's slot: [gate | up | down], each 256-aligned: (offset of up, offset of down, total bytes)
     fn layout(&self) -> (usize, usize, usize) {
@@ -598,7 +614,15 @@ struct Layer {
 /// One GPU: its layers, scratch, the experts it keeps and the ring its file reads land in
 struct Card {
     gpu: Arc<Gpu>,
-    arena: Arena,
+    /// the scratch one-token passes take (small)
+    arena_small: Box<Arena>,
+    /// the scratch of prompt passes, while they run; decode gets its VRAM as expert places (`extra`)
+    arena_big: Mutex<Option<Box<Arena>>>,
+    /// which of them `ar` gives: changed only under the engine's work lock, between passes
+    cur_arena: std::sync::atomic::AtomicPtr<Arena>,
+    arena_bytes: usize,
+    /// while decoding: the slab of the extra expert places, and how many places a layer had without it
+    extra: Mutex<Option<(DevBuf, Vec<usize>)>>,
     layers: std::ops::Range<usize>,
     /// [layer - first][expert]
     res: Vec<Vec<Option<Resident>>>,
@@ -613,6 +637,9 @@ struct Card {
     pfs: Mutex<PfState>,
     /// tickets of the last layer's copies that read the xfer slots (the next layer's first copies into them wait for these)
     xdeps: Mutex<Vec<i64>>,
+    /// the doorbell's word and the router's result (pinned), and the last value rung
+    bell: HostBuf,
+    bell_seq: std::sync::atomic::AtomicU32,
     /// two hidden states: one token's layers take turns writing one and reading the other (no allocation a layer)
     flip: [DevBuf; 2],
     /// slabs the resident experts live in (kept for their views)
@@ -1027,7 +1054,9 @@ impl<'g> MiniMax<'g> {
             let (total, free) = gpu.memory()?;
             let free = free.unwrap_or(total) as usize;
             // the arena, the sessions' caches, and 1.5 GiB kept free (a spare of 1 GiB more: the driver's own use)
-            let reserve = arena_bytes + kv_tokens * per_tok(&ranges[c]) + GIB + (3 << 29);
+            // NS_MM31_SPARE_GIB: the room left besides the arena and the caches (default 2.5; never below the 1.5 GiB floor plus what the driver takes)
+            let spare = (env_f64("NS_MM31_SPARE_GIB").unwrap_or(2.5).max(1.6) * GIB as f64) as usize;
+            let reserve = arena_bytes + kv_tokens * per_tok(&ranges[c]) + spare;
             let room = free.saturating_sub(reserve);
             let v = match env_f64("NS_MM31_VRAM_GIB").or(o.expert_bytes.map(|b| b as f64 / GIB as f64)) {
                 Some(v) => ((v * GIB as f64) as usize).min(room),
@@ -1101,7 +1130,8 @@ impl<'g> MiniMax<'g> {
                     hk += tot;
                 }
             }
-            let arena = Arena::new(gpu, arena_bytes)?;
+            let arena_small = Box::new(Arena::new(gpu, DECODE_ARENA)?);
+            let cur_arena = std::sync::atomic::AtomicPtr::new(&*arena_small as *const Arena as *mut Arena);
             let dev: Vec<DevBuf> = vslabs.iter().filter(|n| **n > 0).map(|n| DevBuf::new(gpu, *n)).collect::<Result<_>>()?;
             let host: Vec<HostBuf> = hslabs.iter().filter(|n| **n > 0).map(|n| HostBuf::new(gpu, *n)).collect::<Result<_>>()?;
             let stage = HostBuf::new(gpu, stage_bytes)?;
@@ -1115,19 +1145,29 @@ impl<'g> MiniMax<'g> {
             let xfer = DevBuf::new(gpu, NX * slot_max)?;
             let cache: Vec<Mutex<LayerCache>> = res
                 .iter()
-                .map(|row| {
+                .enumerate()
+                .map(|(li, row)| {
                     let mut slots = Vec::new();
                     let mut of = vec![None; row.len()];
+                    // with a profile the hottest count as the most recent, so the first misses push out the coldest
+                    let mut order: Vec<usize> = (0..row.len()).collect();
+                    if let Some(p) = &profile {
+                        order.sort_by(|a, b| p.get(&(range.start + li, *a)).copied().unwrap_or(0.0).total_cmp(&p.get(&(range.start + li, *b)).copied().unwrap_or(0.0)));
+                    }
+                    let mut rank = vec![0u64; row.len()];
+                    for (i, ex) in order.iter().enumerate() {
+                        rank[*ex] = i as u64 + 1;
+                    }
                     for (ex, r) in row.iter().enumerate() {
                         if let Some(r) = r {
                             of[ex] = Some(slots.len());
-                            slots.push(CSlot { buf: r.buf.view(0, r.buf.len).expect("a place's own view"), vram: r.vram, occ: Some(ex), stamp: 0, ready: -1 });
+                            slots.push(CSlot { buf: r.buf.view(0, r.buf.len).expect("a place's own view"), vram: r.vram, occ: Some(ex), stamp: if profile.is_some() { rank[ex] } else { 0 }, ready: -1 });
                         }
                     }
-                    Mutex::new(LayerCache { slots, of, clock: 0 })
+                    Mutex::new(LayerCache { slots, of, clock: if profile.is_some() { row.len() as u64 + 1 } else { 0 } })
                 })
                 .collect();
-            cards.push(Card { gpu: gpu.clone(), arena, layers: range, res, cache, stage, slot: slot_max, xfer, pfs: Mutex::new(PfState { free: (0..PF_SLOTS).collect(), map: HashMap::new() }), xdeps: Mutex::new(Vec::new()), flip: [DevBuf::f32(gpu, g.n_embd as usize)?, DevBuf::f32(gpu, g.n_embd as usize)?], _vram: dev, _host: host, kept: (vk, hk) });
+            cards.push(Card { gpu: gpu.clone(), arena_small, arena_big: Mutex::new(None), cur_arena, arena_bytes, extra: Mutex::new(None), layers: range, res, cache, stage, slot: slot_max, xfer, pfs: Mutex::new(PfState { free: (0..PF_SLOTS).collect(), map: HashMap::new() }), xdeps: Mutex::new(Vec::new()), bell: HostBuf::new(gpu, 4096)?, bell_seq: 0.into(), flip: [DevBuf::f32(gpu, 8 * g.n_embd as usize)?, DevBuf::f32(gpu, 8 * g.n_embd as usize)?], _vram: dev, _host: host, kept: (vk, hk) });
         }
 
         // the second drive: a copy of the experts the cards do not keep (a share of them), read beside the model's own file,
@@ -1506,10 +1546,10 @@ impl<'g> MiniMax<'g> {
         }
         if t <= 8 && self.mmvq_ok(w.ty, w.cols) {
             // decode width: the products straight from the stored blocks
-            let m = cd.arena.mark();
+            let m = cd.ar().mark();
             let xq = self.quantize(cd, x, t, w.cols)?;
             self.mmvq_at(cd, w.ty, w.buf.ptr().cast::<u8>().cast_const(), &xq, w.cols, w.rows, t, y)?;
-            cd.arena.rewind(m);
+            cd.ar().rewind(m);
             return Ok(());
         }
         let row_bytes = w.ty.bytes(w.cols as u64).ok_or_else(|| e("row bytes"))? as usize;
@@ -1519,9 +1559,9 @@ impl<'g> MiniMax<'g> {
             unsafe { (ms.supported)(w.ty.code() as i32, w.cols as i64) != 0 }
         })) {
             let chunk = (48 << 20) / (w.cols * 2);
-            let m = cd.arena.mark();
-            let x16 = cd.arena.bytes(t * w.cols * 2)?;
-            let tmp = cd.arena.bytes(chunk.min(w.rows) * w.cols * 2)?;
+            let m = cd.ar().mark();
+            let x16 = cd.ar().bytes(t * w.cols * 2)?;
+            let tmp = cd.ar().bytes(chunk.min(w.rows) * w.cols * 2)?;
             // SAFETY: x holds t * cols floats, x16 as many halves.
             ffi::check(unsafe { (self.k.to_f16)(raw, x.fp(), x16.ptr().cast::<u16>(), (t * w.cols) as i64) }, "to_f16")?;
             let mut r0 = 0;
@@ -1535,12 +1575,12 @@ impl<'g> MiniMax<'g> {
                 }
                 r0 += nr;
             }
-            cd.arena.rewind(m);
+            cd.ar().rewind(m);
             return Ok(());
         }
         let chunk = (24 << 20) / w.cols;
-        let m = cd.arena.mark();
-        let tmp = cd.arena.f32(chunk.min(w.rows) * w.cols)?;
+        let m = cd.ar().mark();
+        let tmp = cd.ar().f32(chunk.min(w.rows) * w.cols)?;
         let mut r0 = 0;
         while r0 < w.rows {
             let nr = chunk.min(w.rows - r0);
@@ -1553,7 +1593,7 @@ impl<'g> MiniMax<'g> {
             }
             r0 += nr;
         }
-        cd.arena.rewind(m);
+        cd.ar().rewind(m);
         Ok(())
     }
 
@@ -1584,7 +1624,7 @@ impl<'g> MiniMax<'g> {
     fn attention(&self, cd: &Card, l: usize, ly: &Layer, s: &Session, xn: &DevBuf, t: usize, p0: usize, tap: Tap) -> Result<DevBuf> {
         let g = &self.g;
         let (h, kv, hd) = (g.n_head as usize, g.n_kv_head as usize, g.head_dim as usize);
-        let a = &cd.arena;
+        let a = cd.ar();
         let raw = cd.gpu.raw();
         let mut tm = Instant::now();
         let q = a.f32(t * h * hd)?;
@@ -1600,27 +1640,41 @@ impl<'g> MiniMax<'g> {
         if let Some(f) = one {
             let (kc, vc) = (&s.k[l], &s.v[l]);
             let off = p0 * kv * hd;
-            kc.bounds(off * 2, kv * hd * 2)?;
-            // SAFETY: q, k, v hold their rows; the stores are inside the caches (checked just above; v and ik have the same extent per position).
-            unsafe {
-                self.q_products(cd, xn, &[(&ly.q, &q), (&ly.k, &k), (&ly.v, &v)])?;
-                let n_rot = g.n_rot as i64;
-                let (kp, vp) = (kc.ptr().cast::<u16>().add(off), vc.ptr().cast::<u16>().add(off));
-                match (&ly.idx, &s.ik[l]) {
-                    (Some(ix), Some(ic)) => {
-                        let (ih, il) = (g.indexer.n_head as usize, g.indexer.key_len as usize);
-                        ic.bounds(p0 * il * 2, il * 2)?;
-                        let iq = a.f32(ih * il)?;
-                        let ik = a.f32(il)?;
-                        ffi::check((f.mv3)(raw, 0, ix.q.buf.ptr().cast_const(), ix.k.buf.ptr().cast_const(), std::ptr::null(), xn.fp().cast_const(), iq.fp(), ik.fp(), std::ptr::null_mut(),
+            kc.bounds(off * 2, t * kv * hd * 2)?;
+            self.q_products(cd, xn, t, &[(&ly.q, &q), (&ly.k, &k), (&ly.v, &v)])?;
+            let n_rot = g.n_rot as i64;
+            let (ih, il) = (g.indexer.n_head as usize, g.indexer.key_len as usize);
+            let mut ip: Option<(DevBuf, DevBuf)> = None;
+            if let (Some(ix), Some(ic)) = (&ly.idx, &s.ik[l]) {
+                ic.bounds(p0 * il * 2, t * il * 2)?;
+                let (iq, ik) = (a.f32(t * ih * il)?, a.f32(t * il)?);
+                for r in 0..t {
+                    // SAFETY: row r of xn, iq, ik; F32 matrices of their rows.
+                    unsafe {
+                        ffi::check((f.mv3)(raw, 0, ix.q.buf.ptr().cast_const(), ix.k.buf.ptr().cast_const(), std::ptr::null(), xn.fp().cast_const().add(r * ix.q.cols), iq.fp().add(r * ih * il), ik.fp().add(r * il), std::ptr::null_mut(),
                                            ix.q.rows as i64, ix.k.rows as i64, 0, ix.q.cols as i64), "indexer q k")?;
-                        ffi::check((f.post)(raw, q.fp(), k.fp(), v.fp().cast_const(), iq.fp(), ik.fp(), ly.qn.fp().cast_const(), ly.kn.fp().cast_const(), ix.qn.fp().cast_const(), ix.kn.fp().cast_const(),
-                                            kp, vp, ic.ptr().cast::<u16>().add(p0 * il), h as i64, kv as i64, ih as i64, hd as i64, n_rot, p0 as i64, g.rope_base as f32, g.rms_eps as f32), "attn post")?;
-                        iq_done = Some(iq);
                     }
-                    _ => ffi::check((f.post)(raw, q.fp(), k.fp(), v.fp().cast_const(), std::ptr::null_mut(), std::ptr::null_mut(), ly.qn.fp().cast_const(), ly.kn.fp().cast_const(), std::ptr::null(), std::ptr::null(),
-                                             kp, vp, std::ptr::null_mut(), h as i64, kv as i64, 0, hd as i64, n_rot, p0 as i64, g.rope_base as f32, g.rms_eps as f32), "attn post")?,
                 }
+                ip = Some((iq, ik));
+            }
+            for r in 0..t {
+                let pos = p0 + r;
+                // SAFETY: row r of each; the stores at position pos are inside the caches (checked above).
+                unsafe {
+                    let (qr, kr, vr) = (q.fp().add(r * h * hd), k.fp().add(r * kv * hd), v.fp().add(r * kv * hd));
+                    let (kp, vp) = (kc.ptr().cast::<u16>().add(pos * kv * hd), vc.ptr().cast::<u16>().add(pos * kv * hd));
+                    match (&ly.idx, &s.ik[l], &ip) {
+                        (Some(ix), Some(ic), Some((iq, ik))) => {
+                            ffi::check((f.post)(raw, qr, kr, vr.cast_const(), iq.fp().add(r * ih * il), ik.fp().add(r * il), ly.qn.fp().cast_const(), ly.kn.fp().cast_const(), ix.qn.fp().cast_const(), ix.kn.fp().cast_const(),
+                                                kp, vp, ic.ptr().cast::<u16>().add(pos * il), h as i64, kv as i64, ih as i64, hd as i64, n_rot, pos as i64, g.rope_base as f32, g.rms_eps as f32), "attn post")?;
+                        }
+                        _ => ffi::check((f.post)(raw, qr, kr, vr.cast_const(), std::ptr::null_mut(), std::ptr::null_mut(), ly.qn.fp().cast_const(), ly.kn.fp().cast_const(), std::ptr::null(), std::ptr::null(),
+                                                 kp, vp, std::ptr::null_mut(), h as i64, kv as i64, 0, hd as i64, n_rot, pos as i64, g.rope_base as f32, g.rms_eps as f32), "attn post")?,
+                    }
+                }
+            }
+            if let Some((iq, _)) = ip {
+                iq_done = Some(iq);
             }
         }
         let n_rot = g.n_rot as i64;
@@ -1719,7 +1773,7 @@ impl<'g> MiniMax<'g> {
         tap(&format!("kqv_out-{l}"), &out)?;
         let o = a.f32(t * g.n_embd as usize)?;
         match one {
-            Some(_) => self.q_products(cd, &out, &[(&ly.o, &o)])?,
+            Some(_) => self.q_products(cd, &out, t, &[(&ly.o, &o)])?,
             None => self.matmul(cd, &ly.o, &out, t, &o)?,
         }
         self.lap(cd, l, 0, &mut tm);
@@ -1727,48 +1781,137 @@ impl<'g> MiniMax<'g> {
     }
 
     /// One token's products of matrices with one activation `x`, quantized once to Q8_1 (the silo's tuned kernels, the shared one for a type they do not take)
-    fn q_products(&self, cd: &Card, x: &DevBuf, mats: &[(&Mat, &DevBuf)]) -> Result<()> {
+    fn q_products(&self, cd: &Card, x: &DevBuf, t: usize, mats: &[(&Mat, &DevBuf)]) -> Result<()> {
         let cols = mats[0].0.cols;
-        let m = cd.arena.mark();
+        let m = cd.ar().mark();
         // SAFETY: plain size queries.
-        let nq = unsafe { (self.k.q8_1_bytes)(cols as i64, 1) };
-        let q8 = cd.arena.bytes(nq)?;
+        let nq = unsafe { (self.k.q8_1_bytes)(cols as i64, t as i64) };
+        let q8 = cd.ar().bytes(nq)?;
         match &self.k.silo_q {
             Some(f) => {
                 // SAFETY: plain size query.
-                let ns = unsafe { (f.split_bytes)(cols as i64, 1) };
-                let xs = cd.arena.bytes(ns)?;
+                let ns = unsafe { (f.split_bytes)(cols as i64, t as i64) };
+                let xs = cd.ar().bytes(ns)?;
                 // SAFETY: x holds cols floats; q8 and xs their sizes above; each y its matrix's rows.
                 unsafe {
-                    ffi::check((f.quantize)(cd.gpu.raw(), x.fp().cast_const(), q8.ptr(), xs.ptr(), cols as i64, 1), "quantize")?;
+                    ffi::check((f.quantize)(cd.gpu.raw(), x.fp().cast_const(), q8.ptr(), xs.ptr(), cols as i64, t as i64), "quantize")?;
                     for (w, y) in mats {
                         if (f.supported)(w.ty.code() as i32, w.cols as i64) != 0 {
-                            ffi::check((f.mmvq)(cd.gpu.raw(), w.ty.code() as i32, w.buf.ptr().cast_const(), q8.ptr().cast_const(), xs.ptr().cast_const(), y.fp(), w.cols as i64, w.rows as i64, 1), "mmvq")?;
+                            ffi::check((f.mmvq)(cd.gpu.raw(), w.ty.code() as i32, w.buf.ptr().cast_const(), q8.ptr().cast_const(), xs.ptr().cast_const(), y.fp(), w.cols as i64, w.rows as i64, t as i64), "mmvq")?;
                         } else {
-                            self.mmvq_at(cd, w.ty, w.buf.ptr().cast::<u8>().cast_const(), &q8, w.cols, w.rows, 1, y)?;
+                            self.mmvq_at(cd, w.ty, w.buf.ptr().cast::<u8>().cast_const(), &q8, w.cols, w.rows, t, y)?;
                         }
                     }
                 }
             }
             None => {
                 // SAFETY: x holds cols floats, q8 the blocks.
-                ffi::check(unsafe { (self.k.quantize_q8_1)(cd.gpu.raw(), x.fp(), q8.ptr(), cols as i64, 1) }, "quantize_q8_1")?;
+                ffi::check(unsafe { (self.k.quantize_q8_1)(cd.gpu.raw(), x.fp(), q8.ptr(), cols as i64, t as i64) }, "quantize_q8_1")?;
                 for (w, y) in mats {
-                    self.mmvq_at(cd, w.ty, w.buf.ptr().cast::<u8>().cast_const(), &q8, w.cols, w.rows, 1, y)?;
+                    self.mmvq_at(cd, w.ty, w.buf.ptr().cast::<u8>().cast_const(), &q8, w.cols, w.rows, t, y)?;
                 }
             }
         }
-        cd.arena.rewind(m);
+        cd.ar().rewind(m);
         Ok(())
+    }
+
+    /// The shared expert of one token: gate and up on Q8_1 activations, SwiGLU, down on Q8_1 (444 GB/s on Q6_K against the float product's 76 then, 350 now)
+    fn shared_fused(&self, cd: &Card, m: &Moe, x: &DevBuf, t: usize) -> Result<DevBuf> {
+        let (a, c) = (cd.ar(), self.g.n_embd as usize);
+        let fe = m.shared.gate.rows;
+        let h = a.f32(t * fe)?;
+        let hu = a.f32(t * fe)?;
+        let o = a.f32(t * c)?;
+        self.q_products(cd, x, t, &[(&m.shared.gate, &h), (&m.shared.up, &hu)])?;
+        // SAFETY: h, hu hold t * fe floats.
+        ffi::check(unsafe { (self.k.swiglu_oai)(cd.gpu.raw(), h.fp(), hu.fp(), h.fp(), (t * fe) as i64, 1.702, 7.0) }, "swiglu_oai")?;
+        self.q_products(cd, &h, t, &[(&m.shared.down, &o)])?;
+        Ok(o)
     }
 
     /// The silo's fused steps of a one-token pass (NS_MM31_FUSE1=0: the separate launches)
     fn one_fns(&self, t: usize) -> Option<&ffi::OneFns> {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if t != 1 || *OFF.get_or_init(|| std::env::var("NS_MM31_FUSE1").is_ok_and(|v| v == "0")) || self.k.silo_moe.is_none() {
+        if t >= 8 || *OFF.get_or_init(|| std::env::var("NS_MM31_FUSE1").is_ok_and(|v| v == "0")) || self.k.silo_moe.is_none() {
             return None;
         }
         self.k.silo_one.as_ref()
+    }
+
+    /// The scratch and places a pass of `t` rows wants: prompt passes the big arena (the extra places dropped and their slab freed first), decode the small one and, with the big
+    /// one freed, its VRAM as empty expert places in every layer of the card. NS_MM31_EXTRA=0: the big arena stays.
+    fn use_arena(&self, t: usize) -> Result<()> {
+        let keep_big = std::env::var("NS_MM31_EXTRA").is_ok_and(|v| v == "0");
+        for cd in &self.cards {
+            let mut big = cd.arena_big.lock().unwrap();
+            if t >= 8 || keep_big {
+                if big.is_none() {
+                    // the extra places first: what they hold is in the file
+                    let mut ex = cd.extra.lock().unwrap();
+                    if ex.is_some() {
+                        // the copies still reading or writing the slab: the compute queue waits for them, the host for the queue
+                        for cm in &cd.cache {
+                            let c = cm.lock().unwrap();
+                            for sl in c.slots.iter().filter(|sl| sl.ready >= 0) {
+                                ffi::await_ticket(cd.gpu.raw(), sl.ready)?;
+                            }
+                        }
+                        cd.gpu.sync()?;
+                    }
+                    if let Some((_slab, base)) = ex.take() {
+                        for (li, n) in base.iter().enumerate() {
+                            let mut c = cd.cache[li].lock().unwrap();
+                            for i in *n..c.slots.len() {
+                                if let Some(o) = c.slots[i].occ {
+                                    c.of[o] = None;
+                                }
+                            }
+                            c.slots.truncate(*n);
+                        }
+                    }
+                    *big = Some(Box::new(Arena::new(&cd.gpu, cd.arena_bytes)?));
+                }
+                let bp: *const Arena = &**big.as_ref().unwrap();
+                cd.cur_arena.store(bp as *mut Arena, Relaxed);
+            } else if big.is_some() || (cd.extra.lock().unwrap().is_none() && !keep_big) {
+                cd.gpu.sync()?;
+                cd.cur_arena.store(&*cd.arena_small as *const Arena as *mut Arena, Relaxed);
+                *big = None;
+                // the slab in places, the same share a layer as the kept ones
+                let mut ex = cd.extra.lock().unwrap();
+                if ex.is_none() {
+                    let per_layer: Vec<usize> = cd.layers.clone().map(|l| if let Ffn::Moe(m) = &self.layers[l].ffn { m.layout().2.next_multiple_of(256) } else { 0 }).collect();
+                    let moe = per_layer.iter().filter(|b| **b > 0).count().max(1);
+                    let bytes = cd.arena_bytes.saturating_sub(DECODE_ARENA);
+                    let mut used = 0usize;
+                    let mut base = Vec::with_capacity(per_layer.len());
+                    let mut each = vec![0usize; per_layer.len()];
+                    for (li, b) in per_layer.iter().enumerate() {
+                        if *b > 0 {
+                            each[li] = (bytes / moe) / *b;
+                            used += each[li] * *b;
+                        }
+                    }
+                    if used > 0 {
+                        let slab = DevBuf::new(&cd.gpu, used)?;
+                        let mut at = 0usize;
+                        for (li, b) in per_layer.iter().enumerate() {
+                            let Some(cm) = cd.cache.get(li) else { continue };
+                            let mut c = cm.lock().unwrap();
+                            base.push(c.slots.len());
+                            for _ in 0..each[li] {
+                                let buf = slab.view(at, *b)?;
+                                c.slots.push(CSlot { buf, vram: true, occ: None, stamp: 0, ready: -1 });
+                                at += *b;
+                            }
+                        }
+                        *ex = Some((slab, base));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The attention kernel for `t` query rows: the silo's for a prompt pass (its tile loop needs rows to share), else the shared one
@@ -1780,7 +1923,7 @@ impl<'g> MiniMax<'g> {
     }
 
     fn dense(&self, cd: &Card, d: &Dense, x: &DevBuf, t: usize) -> Result<DevBuf> {
-        let a = &cd.arena;
+        let a = cd.ar();
         let f = d.gate.rows;
         let gt = a.f32(t * f)?;
         let up = a.f32(t * f)?;
@@ -1800,7 +1943,7 @@ impl<'g> MiniMax<'g> {
         let c = self.g.n_embd as usize;
         let fe = m.gate.rows;
         let (off_up, off_down, _) = m.layout();
-        let a = &cd.arena;
+        let a = cd.ar();
         let raw = cd.gpu.raw();
         let mk = a.mark();
         let gt = a.f32(fe)?;
@@ -1840,7 +1983,7 @@ impl<'g> MiniMax<'g> {
 
     /// `dense` for one token whose activation is already quantized (`xq`): the gate and up products straight from it
     fn dense_q(&self, cd: &Card, d: &Dense, x: &DevBuf, xq: &DevBuf) -> Result<DevBuf> {
-        let a = &cd.arena;
+        let a = cd.ar();
         let f = d.gate.rows;
         let gt = a.f32(f)?;
         let up = a.f32(f)?;
@@ -1861,7 +2004,7 @@ impl<'g> MiniMax<'g> {
         let c = self.g.n_embd as usize;
         let fe = m.gate.rows;
         let (off_up, off_down, _) = m.layout();
-        let a = &cd.arena;
+        let a = cd.ar();
         let raw = cd.gpu.raw();
         let n = list.len();
         let mk = a.mark();
@@ -1920,9 +2063,11 @@ impl<'g> MiniMax<'g> {
     fn moe(&self, cd: &Card, l: usize, m: &Moe, x: &DevBuf, att: &DevBuf, nx: Option<&DevBuf>, t: usize, tap: Tap) -> Result<DevBuf> {
         let g = &self.g;
         let (ne, used, c) = (g.n_expert as usize, g.n_expert_used as usize, g.n_embd as usize);
-        let a = &cd.arena;
+        let a = cd.ar();
         let mut tm = Instant::now();
-        let logits = a.f32(t * ne)?;
+        // one token, with the doorbell: the router writes to pinned host memory and rings; the shared expert is queued behind it, so the GPU works through the host's routing
+        let bell_on = t == 1 && bell() && self.one_fns(t).is_some();
+        let logits = if bell_on { cd.bell.device_view(64, ne * 4)? } else { a.f32(t * ne)? };
         let f1 = self.one_fns(t).filter(|_| {
             // SAFETY: plain queries.
             unsafe { self.k.silo_moe.as_ref().is_some_and(|f| (f.supported)(m.router.ty.code() as i32, c as i64) != 0) }
@@ -1930,19 +2075,55 @@ impl<'g> MiniMax<'g> {
         match f1 {
             // SAFETY: x holds cols floats, logits rows.
             Some(f) => unsafe {
-                ffi::check((f.mv3)(cd.gpu.raw(), m.router.ty.code() as i32, m.router.buf.ptr().cast_const(), std::ptr::null(), std::ptr::null(), x.fp().cast_const(), logits.fp(), std::ptr::null_mut(), std::ptr::null_mut(), m.router.rows as i64, 0, 0, c as i64), "router")?;
+                for r in 0..t {
+                    ffi::check((f.mv3)(cd.gpu.raw(), m.router.ty.code() as i32, m.router.buf.ptr().cast_const(), std::ptr::null(), std::ptr::null(), x.fp().cast_const().add(r * c), logits.fp().add(r * ne), std::ptr::null_mut(), std::ptr::null_mut(), m.router.rows as i64, 0, 0, c as i64), "router")?;
+                }
             },
             None => self.matmul(cd, &m.router, x, t, &logits)?,
         }
-        tap(&format!("ffn_moe_logits-{l}"), &logits)?;
-        if t == 1 {
+        let mut sh_early: Option<DevBuf> = None;
+        let lg_bell: Option<Vec<f32>> = if bell_on {
+            let f = self.one_fns(t).unwrap();
+            let seq = cd.bell_seq.fetch_add(1, Relaxed) + 1;
+            let flag = cd.bell.device_view(0, 64)?.ptr().cast::<u32>();
+            // SAFETY: flag points at the card's pinned bell, which lives as long as the card.
+            ffi::check(unsafe { (f.doorbell)(cd.gpu.raw(), flag, seq) }, "doorbell")?;
             self.stamp(cd, 2);
-        }
-        let tw0 = Instant::now();
-        let lg = logits.to_f32()?;
-        if t == 1 {
-            self.counts.rb_ns.fetch_add(tw0.elapsed().as_nanos() as u64, Relaxed);
-        }
+            sh_early = Some(self.shared_fused(cd, m, x, 1)?);
+            let t0 = Instant::now();
+            // SAFETY: the kernel writes the word with system scope; a bound of 10 s, then the queue is drained (a lost ring must not spin forever).
+            let af = unsafe { &*flag.cast::<std::sync::atomic::AtomicU32>() };
+            let mut spins = 0u64;
+            while af.load(std::sync::atomic::Ordering::Acquire) != seq {
+                std::hint::spin_loop();
+                spins += 1;
+                if spins & 0xfff == 0 && t0.elapsed().as_secs() >= 10 {
+                    cd.gpu.sync()?;
+                    break;
+                }
+            }
+            // SAFETY: ne floats at offset 64 of the bell, written before it rang.
+            let v = unsafe { std::slice::from_raw_parts(cd.bell.device_view(64, ne * 4)?.ptr().cast::<f32>(), ne) }.to_vec();
+            self.counts.rb_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            Some(v)
+        } else {
+            None
+        };
+        tap(&format!("ffn_moe_logits-{l}"), &logits)?;
+        let lg = match lg_bell {
+            Some(v) => v,
+            None => {
+                if t == 1 {
+                    self.stamp(cd, 2);
+                }
+                let tw0 = Instant::now();
+                let v = logits.to_f32()?;
+                if t == 1 {
+                    self.counts.rb_ns.fetch_add(tw0.elapsed().as_nanos() as u64, Relaxed);
+                }
+                v
+            }
+        };
         // the stream after this layer's attention: the guesses of the next layers' routing (no GPU time, one more read)
         if let (Some(gs), true) = (&self.guesser, t == 1 && l + 1 < self.layers.len()) {
             gs.post(l, att.to_f32()?);
@@ -2078,18 +2259,8 @@ impl<'g> MiniMax<'g> {
             self.stamp(cd, 3);
         }
         let sh = match (&one, fused_sh) {
-            (_, true) => {
-                let fe = m.shared.gate.rows;
-                let h = a.f32(fe)?;
-                let hu = a.f32(fe)?;
-                let o = a.f32(c)?;
-                self.q_products(cd, x, &[(&m.shared.gate, &h), (&m.shared.up, &hu)])?;
-                // SAFETY: h, hu hold fe floats.
-                ffi::check(unsafe { (self.k.swiglu_oai)(cd.gpu.raw(), h.fp(), hu.fp(), h.fp(), fe as i64, 1.702, 7.0) }, "swiglu_oai")?;
-                // Q8_1 here too: 444 GB/s on Q6_K against the float product's 76
-                self.q_products(cd, &h, &[(&m.shared.down, &o)])?;
-                o
-            }
+            (_, _) if sh_early.is_some() => sh_early.take().unwrap(),
+            (_, true) => self.shared_fused(cd, m, x, t)?,
             (Some((xq, _)), _) => self.dense_q(cd, &m.shared, x, xq)?,
             (None, _) => self.dense(cd, &m.shared, x, t)?,
         };
@@ -2174,44 +2345,60 @@ impl<'g> MiniMax<'g> {
         let fe = m.gate.rows;
         let (off_up, off_down, _) = m.layout();
         let fz = match &self.k.silo_moe {
-            Some(f) if t == 1 && !no_fused() && m.gate.ty == m.up.ty
+            Some(f) if t < 8 && self.one_fns(t).is_some() && !no_fused() && m.gate.ty == m.up.ty
                 // SAFETY: plain queries.
                 && unsafe { (f.supported)(m.gate.ty.code() as i32, c as i64) != 0 && (f.supported)(m.down.ty.code() as i32, fe as i64) != 0 } => {
-                let nall = vram_hot.len() + njobs;
-                let h = a.f32(nall.max(1) * fe)?;
-                let meta = a.bytes(nall.max(1) * 16)?;
-                let mut ptrs: Vec<u64> = vram_hot.iter().map(|(_, b)| b.ptr() as u64).collect();
-                let mut exs: Vec<usize> = vram_hot.iter().map(|(e, _)| *e).collect();
+                // an entry an (expert, row): one token, the expert's; a verify pass's rows each run an expert they route to
+                let mut ptrs: Vec<u64> = Vec::new();
+                let mut info: Vec<(i32, f32, i32)> = Vec::new();
+                for (e, b) in &vram_hot {
+                    for it in &per[*e] {
+                        ptrs.push(b.ptr() as u64);
+                        info.push(*it);
+                    }
+                }
+                let nvh = ptrs.len();
+                let mut jstart: Vec<(usize, usize)> = Vec::with_capacity(njobs);
                 for (i, jb) in jobs.iter().enumerate() {
-                    ptrs.push(match &land[i] {
+                    let ex = match jb {
+                        Job::Pinned(e, _) | Job::Pre(e, ..) | Job::Wave(e, ..) => *e,
+                    };
+                    let base = match &land[i] {
                         Some((_, b, _)) => b.ptr() as u64,
                         None => cd.xfer.view((i % NX) * slot, total)?.ptr() as u64,
-                    });
-                    exs.push(match jb {
-                        Job::Pinned(e, _) | Job::Pre(e, ..) | Job::Wave(e, ..) => *e,
-                    });
+                    };
+                    jstart.push((ptrs.len(), per[ex].len()));
+                    for it in &per[ex] {
+                        ptrs.push(base);
+                        info.push(*it);
+                    }
                 }
-                let mut mb: Vec<u8> = Vec::with_capacity(nall * 16);
+                let nall = ptrs.len();
+                let h = a.f32(nall.max(1) * fe)?;
+                let meta = a.bytes(nall.max(1) * 20)?;
+                let mut mb: Vec<u8> = Vec::with_capacity(nall * 20);
                 mb.extend(ptrs.iter().flat_map(|p| p.to_le_bytes()));
-                mb.extend(exs.iter().flat_map(|e| wts[per[*e][0].2 as usize].to_le_bytes()));
-                mb.extend(exs.iter().flat_map(|e| per[*e][0].2.to_le_bytes()));
+                mb.extend(info.iter().flat_map(|i| i.1.to_le_bytes()));
+                mb.extend(info.iter().flat_map(|i| i.2.to_le_bytes()));
+                mb.extend(info.iter().flat_map(|i| i.0.to_le_bytes()));
                 meta.write_async(0, &mb)?;
-                Some((h, meta, nall))
+                Some((h, meta, nall, nvh, jstart))
             }
             _ => None,
         };
-        let nv = vram_hot.len();
+        let nv = fz.as_ref().map_or(0, |z| z.3);
         let run_group = |start: usize, n: usize| -> Result<()> {
-            let (h, meta, nall) = fz.as_ref().unwrap();
+            let (h, meta, nall, _, _) = fz.as_ref().unwrap();
             let f = self.k.silo_moe.as_ref().unwrap();
             let raw = cd.gpu.raw();
             let p = meta.ptr().cast::<u8>().cast_const();
-            // SAFETY: the meta upload holds nall addresses, weights and ranks (entries start..start + n among them); h holds nall * fe floats;
-            // ys used * plane floats.
+            // SAFETY: the meta upload holds nall addresses, weights, ranks and rows (entries start..start + n among them); h holds nall * fe floats;
+            // ys used * plane floats; a row below t.
             unsafe {
                 let bases = p.add(start * 8).cast::<u64>();
                 let w = p.add(nall * 8 + start * 4).cast::<f32>();
                 let rk = p.add(nall * 12 + start * 4).cast::<i32>();
+                let tok = p.add(nall * 16 + start * 4).cast::<i32>();
                 let prof = self.pf && self.stage_ok.load(Relaxed);
                 let kind = if start < nv { 0 } else { 2 };
                 let mut tt = Instant::now();
@@ -2219,13 +2406,13 @@ impl<'g> MiniMax<'g> {
                     cd.gpu.sync()?;
                     tt = Instant::now();
                 }
-                ffi::check((f.gu)(raw, m.gate.ty.code() as i32, bases, off_up as i64, x.fp().cast_const(), h.fp().add(start * fe), n as i64, fe as i64, c as i64, 1.702, 7.0), "expert gu")?;
+                ffi::check((f.gu)(raw, m.gate.ty.code() as i32, bases, off_up as i64, x.fp().cast_const(), tok, h.fp().add(start * fe), n as i64, fe as i64, c as i64, 1.702, 7.0), "expert gu")?;
                 if prof {
                     cd.gpu.sync()?;
                     self.stage_t.lock().unwrap()[if kind == 0 && m.gate.ty.code() == 29 { 4 } else { kind }] += tt.elapsed().as_secs_f64();
                     tt = Instant::now();
                 }
-                ffi::check((f.down)(raw, m.down.ty.code() as i32, bases, off_down as i64, h.fp().add(start * fe).cast_const(), w, rk, ys.fp(), plane as i64, n as i64, c as i64, fe as i64),
+                ffi::check((f.down)(raw, m.down.ty.code() as i32, bases, off_down as i64, h.fp().add(start * fe).cast_const(), w, rk, tok, ys.fp(), plane as i64, n as i64, c as i64, fe as i64),
                            "expert down")?;
                 if prof {
                     cd.gpu.sync()?;
@@ -2295,8 +2482,8 @@ impl<'g> MiniMax<'g> {
             issued += 1;
         }
         if fz.is_some() {
-            if !vram_hot.is_empty() {
-                run_group(0, vram_hot.len())?;
+            if nv > 0 {
+                run_group(0, nv)?;
             }
         } else {
             for (ex, b) in &vram_hot {
@@ -2322,7 +2509,8 @@ impl<'g> MiniMax<'g> {
                 Job::Wave(ex, ..) => (*ex, None),
             };
             if fz.is_some() {
-                run_group(vram_hot.len() + i, 1)?;
+                let (js, jn) = fz.as_ref().unwrap().4[i];
+                run_group(js, jn)?;
             } else {
                 match &land[i] {
                     Some((_, b, _)) => run(b.ptr().cast::<u8>().cast_const(), ex)?,
@@ -2392,7 +2580,7 @@ impl<'g> MiniMax<'g> {
             }
         }
         // the ring is read by copies the compute queue waits for: the next layer's reads start after its router's read-back, which waits for them
-        if self.pf || t > 1 {
+        if self.pf || t >= 8 {
             cd.gpu.sync()?;
         }
         if t == 1 {
@@ -2422,8 +2610,8 @@ impl<'g> MiniMax<'g> {
         tm = Instant::now();
         if let (Some(f), Some(nx)) = (self.one_fns(t), nx) {
             // SAFETY: ys holds `used` planes of c floats; sh, att and nx c floats.
-            ffi::check(unsafe { (f.finish)(cd.gpu.raw(), ys.fp().cast_const(), used as i64, sh.fp().cast_const(), att.fp().cast_const(), nx.fp(), c as i64) }, "finish")?;
-            return nx.view(0, c * 4);
+            ffi::check(unsafe { (f.finish)(cd.gpu.raw(), ys.fp().cast_const(), used as i64, sh.fp().cast_const(), att.fp().cast_const(), nx.fp(), plane as i64) }, "finish")?;
+            return nx.view(0, plane * 4);
         }
         let y = ys.view(0, plane * 4)?;
         for r in 1..used {
@@ -2508,8 +2696,8 @@ impl<'g> MiniMax<'g> {
         let Some(mf) = self.k.silo_moe.as_ref() else { return Ok(()) };
         let Some(one) = self.k.silo_one.as_ref() else { return Ok(()) };
         for cd in &self.cards {
-            let m0 = cd.arena.mark();
-            let x = cd.arena.f32(c)?;
+            let m0 = cd.ar().mark();
+            let x = cd.ar().f32(c)?;
             let vals: Vec<u8> = (0..c).flat_map(|i| (((i * 2654435761) % 1000) as f32 * 0.002 - 1.0).to_le_bytes()).collect();
             x.write(0, &vals)?;
             let mut seen: Vec<String> = Vec::new();
@@ -2525,35 +2713,36 @@ impl<'g> MiniMax<'g> {
                     if bases.len() == used {
                         let fe = m.gate.rows;
                         let (off_up, off_down, _) = m.layout();
-                        let meta = cd.arena.bytes(used * 16)?;
+                        let meta = cd.ar().bytes(used * 20)?;
                         let mut mb: Vec<u8> = bases.iter().flat_map(|b| b.to_le_bytes()).collect();
                         mb.extend((0..used).flat_map(|_| 1f32.to_le_bytes()));
                         mb.extend((0..used as i32).flat_map(|r| r.to_le_bytes()));
+                        mb.extend((0..used).flat_map(|_| 0i32.to_le_bytes()));
                         meta.write(0, &mb)?;
-                        let h = cd.arena.f32(used * fe)?;
-                        let ys = cd.arena.f32(used * c)?;
+                        let h = cd.ar().f32(used * fe)?;
+                        let ys = cd.ar().f32(used * c)?;
                         let p = meta.ptr().cast::<u8>().cast_const();
                         let code = m.gate.ty.code() as i32;
                         // SAFETY: meta holds 4 addresses of whole experts, weights and ranks; h and ys their sizes.
                         unsafe {
-                            bench(format!("gu 4 {:?} l{l}", m.gate.ty), used * (m.gate.stride + m.up.stride), cd, &mut || ffi::check((mf.gu)(cd.gpu.raw(), code, p.cast::<u64>(), off_up as i64, x.fp().cast_const(), h.fp(), used as i64, fe as i64, c as i64, 1.702, 7.0), "gu"))?;
-                            bench(format!("down 4 {:?} l{l}", m.down.ty), used * m.down.stride, cd, &mut || ffi::check((mf.down)(cd.gpu.raw(), m.down.ty.code() as i32, p.cast::<u64>(), off_down as i64, h.fp().cast_const(), p.add(used * 8).cast::<f32>(), p.add(used * 12).cast::<i32>(), ys.fp(), c as i64, used as i64, c as i64, fe as i64), "down"))?;
-                            let w16 = cd.arena.bytes(fe * c * 2)?;
+                            bench(format!("gu 4 {:?} l{l}", m.gate.ty), used * (m.gate.stride + m.up.stride), cd, &mut || ffi::check((mf.gu)(cd.gpu.raw(), code, p.cast::<u64>(), off_up as i64, x.fp().cast_const(), p.add(used * 16).cast::<i32>(), h.fp(), used as i64, fe as i64, c as i64, 1.702, 7.0), "gu"))?;
+                            bench(format!("down 4 {:?} l{l}", m.down.ty), used * m.down.stride, cd, &mut || ffi::check((mf.down)(cd.gpu.raw(), m.down.ty.code() as i32, p.cast::<u64>(), off_down as i64, h.fp().cast_const(), p.add(used * 8).cast::<f32>(), p.add(used * 12).cast::<i32>(), p.add(used * 16).cast::<i32>(), ys.fp(), c as i64, used as i64, c as i64, fe as i64), "down"))?;
+                            let w16 = cd.ar().bytes(fe * c * 2)?;
                             let base = bases[0] as *const std::ffi::c_void;
                             bench(format!("to_half {:?} l{l} ({:.0} MB out)", m.gate.ty, (fe * c * 2) as f64 / 1e6), m.gate.stride, cd, &mut || ffi::check((one.to_half)(cd.gpu.raw(), code, base, (fe * c) as i64, w16.ptr().cast::<u16>()), "to_half"))?;
-                            let x16 = cd.arena.bytes(64 * c * 2)?;
-                            let y = cd.arena.f32(64 * fe)?;
+                            let x16 = cd.ar().bytes(64 * c * 2)?;
+                            let y = cd.ar().f32(64 * fe)?;
                             bench(format!("half GEMM 64 rows {fe}x{c}"), fe * c * 2, cd, &mut || ffi::check((self.k.gemm_f16)(cd.gpu.raw(), 64, fe as i64, c as i64, x16.ptr().cast::<u16>().cast_const(), c as i64, w16.ptr().cast::<u16>().cast_const(), y.fp(), fe as i64, 0), "gemm"))?;
                         }
                     }
                     for (nm, w) in [("attn q", &ly.q), ("attn o", &ly.o), ("shared gate", &m.shared.gate), ("shared down", &m.shared.down), ("router", &m.router)] {
-                        let xc = cd.arena.f32(w.cols)?;
+                        let xc = cd.ar().f32(w.cols)?;
                         let vc: Vec<u8> = (0..w.cols).flat_map(|i| (((i * 2654435761) % 1000) as f32 * 0.002 - 1.0).to_le_bytes()).collect();
                         xc.write(0, &vc)?;
-                        let y = cd.arena.f32(w.rows)?;
+                        let y = cd.ar().f32(w.rows)?;
                         let bytes = w.ty.bytes((w.rows * w.cols) as u64).unwrap_or(0) as usize;
                         if w.ty != GType::F32 {
-                            bench(format!("{nm} {:?} {}x{} Q8", w.ty, w.rows, w.cols), bytes, cd, &mut || self.q_products(cd, &xc, &[(w, &y)]))?;
+                            bench(format!("{nm} {:?} {}x{} Q8", w.ty, w.rows, w.cols), bytes, cd, &mut || self.q_products(cd, &xc, 1, &[(w, &y)]))?;
                         }
                         // SAFETY: sizes as named.
                         let supp = unsafe { (mf.supported)(w.ty.code() as i32, w.cols as i64) != 0 } && w.rows % 8 == 0;
@@ -2564,9 +2753,9 @@ impl<'g> MiniMax<'g> {
                         }
                     }
                 }
-                cd.arena.rewind(cd.arena.mark());
+                cd.ar().rewind(cd.ar().mark());
             }
-            cd.arena.rewind(m0);
+            cd.ar().rewind(m0);
         }
         Ok(())
     }
@@ -2581,7 +2770,7 @@ impl<'g> MiniMax<'g> {
     fn quantize(&self, cd: &Card, x: &DevBuf, n: usize, cols: usize) -> Result<DevBuf> {
         // SAFETY: plain size query.
         let bytes = unsafe { (self.k.q8_1_bytes)(cols as i64, n as i64) };
-        let q = cd.arena.bytes(bytes)?;
+        let q = cd.ar().bytes(bytes)?;
         // SAFETY: x holds n * cols floats (the callers'), q the blocks.
         ffi::check(unsafe { (self.k.quantize_q8_1)(cd.gpu.raw(), x.fp(), q.ptr(), cols as i64, n as i64) }, "quantize_q8_1")?;
         Ok(q)
@@ -2598,9 +2787,9 @@ impl<'g> MiniMax<'g> {
 
     /// y [n, rows] = x16 [n, cols] . W^T for a matrix of stored blocks at `wp`: dequantized to fp16 on the GPU, multiplied by oneMKL
     fn half_product(&self, cd: &Card, w: &Experts, wp: *const u8, x16: &DevBuf, n: usize, y: &DevBuf) -> Result<()> {
-        let m = cd.arena.mark();
+        let m = cd.ar().mark();
         let nv = w.rows * w.cols;
-        let w16 = cd.arena.bytes(nv * 2)?;
+        let w16 = cd.ar().bytes(nv * 2)?;
         // SAFETY: wp holds the matrix's rows * cols values in the type; w16 holds as many halves; x16 n * cols, y n * rows.
         unsafe {
             match self.k.silo_one.as_ref().filter(|_| !no_silo_half()) {
@@ -2620,7 +2809,7 @@ impl<'g> MiniMax<'g> {
                 self.wide_t.lock().unwrap().1 += t0.elapsed().as_secs_f64();
             }
         }
-        cd.arena.rewind(m);
+        cd.ar().rewind(m);
         Ok(())
     }
 
@@ -2692,6 +2881,7 @@ impl<'g> MiniMax<'g> {
             return Err(e("more rows asked than tokens"));
         }
         self.cur_wide.store(t > 1, Relaxed);
+        self.use_arena(t)?;
         if let Some(gs) = &self.guesser {
             gs.take(); // the last token's guesses for its last layers
         }
@@ -2748,23 +2938,28 @@ impl<'g> MiniMax<'g> {
                 x = nx;
                 cur = ci;
             }
-            let m0 = cd.arena.mark();
+            let m0 = cd.ar().mark();
             let mut tm = Instant::now();
             if t == 1 {
                 self.stamp(cd, 0);
             }
-            let xn = cd.arena.f32(t * c)?;
+            let xn = cd.ar().f32(t * c)?;
             self.rms(cd, &x, &ly.attn_norm, &xn, t, c)?;
             tap(&format!("attn_norm-{l}"), &xn)?;
             self.lap(cd, l, 7, &mut tm);
             let att = self.attention(cd, l, ly, s, &xn, t, p0, &mut *tap)?;
             tm = Instant::now();
-            let hn = cd.arena.f32(t * c)?;
+            let hn = cd.ar().f32(t * c)?;
             match self.one_fns(t) {
                 // SAFETY: all hold c floats.
                 Some(f) => {
-                    ffi::check(unsafe { (f.add_norm)(cd.gpu.raw(), att.fp(), att.fp().cast_const(), x.fp().cast_const(), ly.ffn_norm.fp().cast_const(), hn.fp(), c as i64, self.g.rms_eps as f32) }, "add norm")?;
-                    self.stamp(cd, 1);
+                    for r in 0..t {
+                        // SAFETY: row r of each.
+                        ffi::check(unsafe { (f.add_norm)(cd.gpu.raw(), att.fp().add(r * c), att.fp().cast_const().add(r * c), x.fp().cast_const().add(r * c), ly.ffn_norm.fp().cast_const(), hn.fp().add(r * c), c as i64, self.g.rms_eps as f32) }, "add norm")?;
+                    }
+                    if t == 1 {
+                        self.stamp(cd, 1);
+                    }
                 }
                 None => {
                     self.add(cd, &att, &x, t * c)?;
@@ -2784,35 +2979,35 @@ impl<'g> MiniMax<'g> {
                     o
                 }
                 Ffn::Moe(m) => {
-                    let nb = if t == 1 { Some(&cd.flip[l % 2]) } else { None };
+                    let nb = if t < 8 { Some(&cd.flip[l % 2]) } else { None };
                     let o = self.moe(cd, l, m, &hn, &att, nb, t, &mut *tap)?;
                     tm = Instant::now();
                     o
                 }
             };
             tap(&format!("ffn_out-{l}"), &f)?;
-            let nx = if t == 1 && self.one_fns(t).is_some() && matches!(ly.ffn, Ffn::Moe(_)) {
+            let nx = if self.one_fns(t).is_some() && matches!(ly.ffn, Ffn::Moe(_)) {
                 // the fused end of the layer wrote the output into the card's flip buffer
                 f
             } else {
                 self.add(cd, &f, &att, t * c)?;
                 tap(&format!("l_out-{l}"), &f)?;
-                let nx = if t == 1 { cd.flip[l % 2].view(0, c * 4)? } else { DevBuf::f32(&cd.gpu, t * c)? };
+                let nx = if t < 8 { cd.flip[l % 2].view(0, t * c * 4)? } else { DevBuf::f32(&cd.gpu, t * c)? };
                 nx.copy_within(0, &f, 0, t * c * 4)?;
                 nx
             };
             if t == 1 {
                 self.stamp(cd, 5);
             }
-            if t > 1 || self.pf {
+            if t >= 8 || self.pf {
                 cd.gpu.sync()?;
             }
             // the queue may still read the old hidden state (one-token passes run on without a sync): freed after the pass
             let old = std::mem::replace(&mut x, nx);
-            if t == 1 {
+            if t < 8 {
                 grave.push(old);
             }
-            cd.arena.rewind(m0);
+            cd.ar().rewind(m0);
             self.lap(cd, l, 7, &mut tm);
             // NS_MM31_FORCE=DIR (Debug): the layer's output replaced by the reference dump's, so the next layer is
             // compared on the reference's own input (exactness per layer, not the noise of 60 layers added up)
@@ -2841,6 +3036,7 @@ impl<'g> MiniMax<'g> {
             return Err(e(format!("the context is full ({} of {})", s.pos + tokens.len(), s.max_ctx)));
         }
         self.cur_wide.store(true, Relaxed);
+        self.use_arena(chunk)?;
         let start = s.pos;
         let sess: &Session = s;
         let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<f32>, usize, usize)>(1);
