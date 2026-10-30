@@ -319,7 +319,7 @@ void down(sycl::queue& q, const uint64_t* bases, int64_t off_down, const float* 
 // out[nb][256] = the blocks as fp16 (a prompt pass's experts, for the half GEMM): a sub-group a block, each lane its 8 values as one 16-byte store
 template <int T>
 void to_half(sycl::queue& q, const uint8_t* src, uint16_t* out, int64_t nb) {
-    constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32, BPG = 16;
+    constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32, BPG = 32;
     q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<uint64_t, 1> l64(sycl::range<1>(N64 > 0 ? N64 : 1), hd);
         sycl::local_accessor<uint32_t, 1> l32(sycl::range<1>(N32 > 0 ? N32 : 1), hd);

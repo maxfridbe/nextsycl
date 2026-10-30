@@ -753,7 +753,7 @@ pub struct MiniMax<'g> {
     gclean: Mutex<[[(f64, u64); 3]; 2]>,
     /// whether the layer now running had all its experts in VRAM (set by moe, read by the stamps' flush)
     stamp_clean: Mutex<Vec<usize>>,
-    /// NS_MM31_TOKLOG=FILE: a line a one-token pass: milliseconds, experts from VRAM, pinned memory and the file
+    /// NS_MM31_TOKLOG=FILE: a line a pass of up to 8 rows: milliseconds, experts from VRAM, pinned memory and the file, rows
     toklog: Option<Mutex<std::fs::File>>,
     lay: Mutex<[Vec<[f64; NCAT]>; 2]>,
     cur_wide: std::sync::atomic::AtomicBool,
@@ -762,6 +762,8 @@ pub struct MiniMax<'g> {
     stage_t: Mutex<[f64; 6]>,
     /// profile: a wide pass's expert products, seconds in the dequantization to half and in the GEMM
     wide_t: Mutex<(f64, f64)>,
+    /// profile: a wide pass's experts by the rows each takes (at most 4, 8, 16, 32, more)
+    wide_rows: Mutex<[u64; 5]>,
     /// passes of one token, and the seconds they took (profile)
     pf_tokens: Mutex<(usize, f64)>,
 }
@@ -1186,6 +1188,15 @@ impl<'g> MiniMax<'g> {
                     let t_b = Instant::now();
                     log(format!("stream file {}: {:.1} GiB of {} experts, written once", path.display(), gib(at as usize), list.len()));
                     std::fs::create_dir_all(dir).map_err(|x| e(format!("{}: {x}", dir.display())))?;
+                    // another placement's copy is of no use now: a stream file a directory (they filled a system drive on 2026-10-30, 36 GiB a placement)
+                    if let Ok(rd) = std::fs::read_dir(dir) {
+                        for d in rd.flatten() {
+                            let n = d.file_name().to_string_lossy().into_owned();
+                            if n.starts_with("mm31-stream-") && (n.ends_with(".bin") || n.ends_with(".part")) {
+                                let _ = std::fs::remove_file(d.path());
+                            }
+                        }
+                    }
                     let part = path.with_extension("part");
                     let out = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&part).map_err(|x| e(format!("{}: {x}", part.display())))?;
                     out.set_len(at).map_err(e)?;
@@ -1337,6 +1348,7 @@ impl<'g> MiniMax<'g> {
             stage_ok: (std::env::var("NS_PROFILE").is_ok_and(|v| v == "1")).into(),
             stage_t: Mutex::new([0.0; 6]),
             wide_t: Mutex::new((0.0, 0.0)),
+            wide_rows: Mutex::new([0; 5]),
             pf_tokens: Mutex::new((0, 0.0)),
         })
     }
@@ -1385,7 +1397,7 @@ impl<'g> MiniMax<'g> {
             let sg = self.stage_t.lock().unwrap();
             v.push(format!("[one-token expert stages (fused kernels: gate+up+swiglu, down; VRAM group, then each copied expert with its copy wait), seconds in all: gu {:.3}, down {:.3}; copied gu {:.3}, down {:.3}; gu of the IQ1_M layers {:.3}]", sg[0], sg[1], sg[2], sg[3], sg[4]));
             let wt = self.wide_t.lock().unwrap();
-            v.push(format!("[wide passes' expert products: {:.3} s dequantizing to half, {:.3} s in the half GEMM]", wt.0, wt.1));
+            v.push(format!("[wide passes' expert products: {:.3} s dequantizing to half, {:.3} s in the half GEMM; experts by rows (<=4, <=8, <=16, <=32, more): {:?}]", wt.0, wt.1, self.wide_rows.lock().unwrap()));
             let lay = self.lay.lock().unwrap();
             let (n, secs) = *self.pf_tokens.lock().unwrap();
             for (name, tab) in [("one-token passes", &lay[0]), ("wider passes", &lay[1])] {
@@ -1956,6 +1968,13 @@ impl<'g> MiniMax<'g> {
         let ys = a.f32(used * plane)?;
         let li = l - cd.layers.start;
         let need: Vec<usize> = (0..ne).filter(|&i| !per[i].is_empty()).collect();
+        if self.pf && t > 8 {
+            let mut wr = self.wide_rows.lock().unwrap();
+            for &i in &need {
+                let n = per[i].len();
+                wr[if n <= 4 { 0 } else if n <= 8 { 1 } else if n <= 16 { 2 } else if n <= 32 { 3 } else { 4 }] += 1;
+            }
+        }
         let (mut hot, mut miss): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
         let mut cache = cd.cache[li].lock().unwrap();
         let xprev: Vec<i64> = std::mem::take(&mut *cd.xdeps.lock().unwrap());
@@ -2584,9 +2603,9 @@ impl<'g> MiniMax<'g> {
             p.0 += 1;
             p.1 += pass_t0.elapsed().as_secs_f64();
         }
-        if let (Some(f), 1) = (&self.toklog, t) {
+        if let (Some(f), true) = (&self.toklog, t <= 8) {
             use std::io::Write;
-            let _ = writeln!(f.lock().unwrap(), "{:.2} {} {} {}", pass_t0.elapsed().as_secs_f64() * 1e3, self.counts.vram.load(Relaxed) - c0.0, self.counts.pinned.load(Relaxed) - c0.1, self.counts.file.load(Relaxed) - c0.2);
+            let _ = writeln!(f.lock().unwrap(), "{:.2} {} {} {} {t}", pass_t0.elapsed().as_secs_f64() * 1e3, self.counts.vram.load(Relaxed) - c0.0, self.counts.pinned.load(Relaxed) - c0.1, self.counts.file.load(Relaxed) - c0.2);
         }
         s.pos += t;
         s.last_rows = t;

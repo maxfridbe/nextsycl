@@ -6,7 +6,7 @@
 //
 // - the scales and d from one aligned load of the block's head, not byte loads - small global loads are slow on Xe2:
 //   Q4_K 507 (366), Q5_K 525 (415); the same for IQ4_XS
-// - rows a sub-group sharing each lane's activations (ROWS, NS_Q35_MMVQ_ROWS): measured per type, one row wins now
+// - rows a sub-group sharing each lane's activations (ROWS): measured per type, one row wins now
 // - IQ4_XS / IQ4_NL: a byte of two nibbles -> its two codebook bytes from a 256-entry table in local memory, about
 //   ten operations for eight weights instead of ~80 selects: IQ4_XS ~490 (361), IQ4_NL 486 (326)
 // - Q3_K and IQ3_S (Strata's are the generic kernels: 89 and 118): the same wide scheme, IQ3_S's grid and sign masks
@@ -402,14 +402,8 @@ struct WideIQ2S {
     static float dot(const W& r, const X& v) { return dot2(r, v); }
 };
 
-int lut_groups() {   // NS_Q35_MMVQ_GROUPS: the work-groups of a kernel with a table (default 512)
-    static const int v = std::getenv("NS_Q35_MMVQ_GROUPS") ? std::max(1, std::atoi(std::getenv("NS_Q35_MMVQ_GROUPS"))) : 512;
-    return v;
-}
-int rows_override() {   // NS_Q35_MMVQ_ROWS=1|2|4: every 256-block type's rows a sub-group (0: each type's own)
-    static const int v = std::getenv("NS_Q35_MMVQ_ROWS") ? std::atoi(std::getenv("NS_Q35_MMVQ_ROWS")) : 0;
-    return v;
-}
+int lut_groups() { return 512; }   // the work-groups of a kernel with a table
+int rows_override() { return 0; }   // each type's own rows a sub-group
 
 // 256-blocks: 8 lanes a block, 4 blocks a sub-group step, R rows a sub-group sharing each lane's activations
 template <typename F, int NCOLS, int R>

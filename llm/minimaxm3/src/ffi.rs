@@ -152,7 +152,9 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
                 (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, SplitFn>(p) })
             }),
             silo_attend: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
-                let p = s.symbol("ns_mm3s_attend");
+                // NS_MM31_ATTX=0: the vector-unit prompt attention, not the XMX one
+                let name = if std::env::var("NS_MM31_ATTX").is_ok_and(|v| v == "0") { "ns_mm3s_attend" } else { "ns_mm3s_attend_x" };
+                let p = s.symbol(name);
                 // SAFETY: the symbol is declared in mm3s.h with AttendFn's signature.
                 (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, AttendFn>(p) })
             }),

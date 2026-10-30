@@ -19,6 +19,10 @@ int ns_mm3s_attend_supported(int64_t H, int64_t G, int64_t head);
 int ns_mm3s_attend(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G,
                    int64_t pos0, float scale);
 
+/* ns_mm3s_attend on XMX (attnx.cpp): the same arguments and result, q to half, scores and output accumulated in float */
+int ns_mm3s_attend_x(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G,
+                     int64_t pos0, float scale);
+
 /* The same for a few query rows (decode): the keys split in chunks of 128, a work-group each (S = ceil(keys / 128) chunks,
  * keys = K * 128 selected or pos0 + T), their partial softmax states in `part` (T * G * S * 16 * 130 floats), merged by a second kernel */
 int ns_mm3s_attend_split(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G,
