@@ -657,6 +657,8 @@ pub struct Session {
     k: Vec<DevBuf>,
     v: Vec<DevBuf>,
     ik: Vec<Option<DevBuf>>,
+    /// the drafter's caches, a (k, v) a layer, on the last card
+    ds: Vec<(DevBuf, DevBuf)>,
     last_rows: usize,
 }
 
@@ -711,14 +713,16 @@ impl Checkpoint {
 pub struct Decoder {
     logits: Option<Vec<f32>>,
     next: Option<u32>,
+    pub drafted: u64,
+    pub accepted: u64,
 }
 
 impl Decoder {
     pub fn new(logits: Vec<f32>) -> Decoder {
-        Decoder { logits: Some(logits), next: None }
+        Decoder { logits: Some(logits), next: None, drafted: 0, accepted: 0 }
     }
     pub fn after(next: u32) -> Decoder {
-        Decoder { logits: None, next: Some(next) }
+        Decoder { logits: None, next: Some(next), drafted: 0, accepted: 0 }
     }
     pub fn pending(&mut self) -> Option<u32> {
         self.next.take()
@@ -738,6 +742,9 @@ struct Counts {
     ahead_wanted: AtomicU64,
     /// experts moved into VRAM by recency (each demoting the least recent one to pinned memory)
     promoted: AtomicU64,
+    /// the drafter's passes and the nanoseconds of the host in them
+    draft_ns: AtomicU64,
+    draft_n: AtomicU64,
     /// one-token passes, per card: experts from VRAM, pinned memory and the file
     card_uses: [[AtomicU64; 3]; 2],
     /// nanoseconds the host waited for the router's read-back in one-token passes (the GPU's work up to there)
@@ -759,6 +766,10 @@ pub struct MiniMax<'g> {
     k: &'static ffi::Api,
     pub g: Geometry,
     layers: Vec<Layer>,
+    ds: Option<Dspark>,
+    /// features of the pass on the last card, and those taken on the first (position -> (target, values)), for the drafter
+    ds_f: Mutex<Option<DevBuf>>,
+    ds_caps: Mutex<HashMap<usize, Vec<(usize, Vec<f32>)>>>,
     out_norm: DevBuf,
     embd: ConstTensor,
     head: Mat,
@@ -793,6 +804,59 @@ pub struct MiniMax<'g> {
     wide_rows: Mutex<[u64; 5]>,
     /// passes of one token, and the seconds they took (profile)
     pf_tokens: Mutex<(usize, f64)>,
+}
+
+/// The DSpark drafter (NS_MM31_DRAFT=its GGUF; llama.cpp's src/models/dflash.cpp, common/speculative.cpp): five dense layers that draft a block at once. The hidden states
+/// going into the target layers `targets` of the positions the model passes over go through fc and a norm into each layer's k and v caches. A draft is one pass of
+/// [the last token, MASK..] attending to those and to the block (not causal), through the model's embedding and head; the Markov head adds a bias from the token before.
+struct Dspark {
+    layers: Vec<DLayer>,
+    fc: Mat,
+    enc_norm: DevBuf,
+    norm: DevBuf,
+    /// markov_w1: its Q8_0 rows on the host (one row a draft)
+    w1: Vec<u8>,
+    w1_row: usize,
+    w2: Mat,
+    targets: Vec<usize>,
+    window: usize,
+    block: usize,
+    mask: u32,
+    silu: bool,
+    /// the confidence head on the host: weights over [the row's normed output; markov_w1 of the token before], and its bias
+    conf: Vec<f32>,
+    conf_b: f32,
+}
+
+struct DLayer {
+    attn_norm: DevBuf,
+    q: Mat,
+    k: Mat,
+    v: Mat,
+    o: Mat,
+    q_norm: DevBuf,
+    k_norm: DevBuf,
+    ffn_norm: DevBuf,
+    gate: Mat,
+    up: Mat,
+    down: Mat,
+}
+
+fn half_to_f32(h: u16) -> f32 {
+    let (s, e, m) = ((h >> 15) as u32, ((h >> 10) & 31) as i32, (h & 1023) as u32);
+    let v = if e == 0 { m as f32 * 2f32.powi(-24) } else if e == 31 { if m == 0 { f32::INFINITY } else { f32::NAN } } else { (1.0 + m as f32 / 1024.0) * 2f32.powi(e - 15) };
+    if s == 1 { -v } else { v }
+}
+
+/// NS_MM31_DRAFT_PMIN: drafts stop at the first the confidence head rates below this (default 0: none stopped)
+fn draft_pmin() -> f32 {
+    static N: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("NS_MM31_DRAFT_PMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
+}
+
+/// NS_MM31_DRAFTS: tokens drafted a step (default 1; at most the block)
+fn draft_tokens(block: usize) -> usize {
+    std::env::var("NS_MM31_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize).min(block).min(6)
 }
 
 /// A tensor read from the file a row at a time (the token embedding)
@@ -952,13 +1016,14 @@ impl<'g> MiniMax<'g> {
         let k = ffi::api()?;
         let n_layer = g.n_layer as usize;
         let ncard = gpus.len().min(n_layer);
-        let gpus = &gpus[..ncard];
+        // two cards: the slower one (the B65) takes the first layers, the B70 the rest and the head (per token 89 against 95 ms on one text; NS_MM31_ORDER=asis: the order given)
+        let mut ordered: Vec<Arc<Gpu>> = gpus[..ncard].to_vec();
+        if ncard == 2 && std::env::var("NS_MM31_ORDER").map_or(true, |v| v != "asis") {
+            ordered.sort_by_key(|g| !g.name.contains("B65"));
+        }
+        let gpus = &ordered[..];
         // layers over the cards: even by default (NS_MM31_SPLIT=N: N layers on the first of two)
         let mut bounds: Vec<usize> = (0..=ncard).map(|i| n_layer * i / ncard).collect();
-        // two cards: 60% of the layers on the first (the B70; layers cost it ~0.6 of the B65's): tg the same, pp 121 -> 124 on one prompt pass and 159 -> 172 when two cards work at once
-        if ncard == 2 {
-            bounds[1] = n_layer * 3 / 5;
-        }
         if let Some(n) = std::env::var("NS_MM31_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| ncard == 2 && *n > 0 && *n < n_layer) {
             bounds[1] = n;
         }
@@ -1036,6 +1101,42 @@ impl<'g> MiniMax<'g> {
         let guesser = (!guess_layers.is_empty()).then(|| Guesser::start(guess_layers, g.rms_eps as f32));
         let eps_dim = g.n_embd as usize;
         let last = gpus.last().unwrap();
+        let ds = match std::env::var("NS_MM31_DRAFT") {
+            Ok(path) if !path.is_empty() => {
+                let df = Gguf::open(std::path::Path::new(&path)).map_err(|x| e(x.0))?;
+                let dn = df.arch_meta("block_count").and_then(|v| v.as_u64()).ok_or_else(|| e("the drafter has no block_count"))? as usize;
+                let targets: Vec<usize> = df.arch_meta("target_layers").and_then(|v| v.as_array()).ok_or_else(|| e("the drafter has no target_layers"))?.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect();
+                let mut dl = Vec::new();
+                for l in 0..dn {
+                    let n = |x: &str| format!("blk.{l}.{x}.weight");
+                    dl.push(DLayer {
+                        attn_norm: vecf(&df, last, &n("attn_norm"), eps_dim)?,
+                        q: mat(&df, last, &n("attn_q"), &mut bytes)?,
+                        k: mat(&df, last, &n("attn_k"), &mut bytes)?,
+                        v: mat(&df, last, &n("attn_v"), &mut bytes)?,
+                        o: mat(&df, last, &n("attn_output"), &mut bytes)?,
+                        q_norm: vecf(&df, last, &n("attn_q_norm"), g.head_dim as usize)?,
+                        k_norm: vecf(&df, last, &n("attn_k_norm"), g.head_dim as usize)?,
+                        ffn_norm: vecf(&df, last, &n("ffn_norm"), eps_dim)?,
+                        gate: mat(&df, last, &n("ffn_gate"), &mut bytes)?,
+                        up: mat(&df, last, &n("ffn_up"), &mut bytes)?,
+                        down: mat(&df, last, &n("ffn_down"), &mut bytes)?,
+                    });
+                }
+                let w1t = df.tensor("markov_w1.weight").ok_or_else(|| e("the drafter has no markov_w1"))?;
+                let w1_row = w1t.ty.bytes(w1t.shape[1]).ok_or_else(|| e("markov_w1 row"))? as usize;
+                let window = df.arch_meta("attention.sliding_window").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+                let block = df.arch_meta("block_size").and_then(|v| v.as_u64()).unwrap_or(7) as usize;
+                let mask = df.meta("tokenizer.ggml.mask_token_id").and_then(|v| v.as_u64()).ok_or_else(|| e("the drafter has no mask token"))? as u32;
+                log(format!("the DSpark drafter: {dn} layers, targets {targets:?}, block {block}, window {window}, {} a step", draft_tokens(block)));
+                Some(Dspark { layers: dl, fc: mat(&df, last, "fc.weight", &mut bytes)?, enc_norm: vecf(&df, last, "enc.output_norm.weight", eps_dim)?, norm: vecf(&df, last, "output_norm.weight", eps_dim)?,
+                              w1: df.read(w1t).map_err(|x| e(x.0))?, w1_row, w2: mat(&df, last, "markov_w2.weight", &mut bytes)?, targets, window, block, mask,
+                              silu: std::env::var("NS_MM31_DRAFT_SILU").is_ok_and(|v| v == "1"),
+                              conf: df.tensor("conf_proj.weight").and_then(|t| df.read(t).ok()).map_or(Vec::new(), |b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
+                              conf_b: df.tensor("conf_proj.bias").and_then(|t| df.read(t).ok()).map_or(0.0, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])) })
+            }
+            _ => None,
+        };
         let out_norm = vecf(f, last, "output_norm.weight", eps_dim)?;
         let head = mat(f, last, "output.weight", &mut bytes)?;
         let et = f.tensor("token_embd.weight").ok_or_else(|| e("token_embd.weight missing"))?;
@@ -1054,9 +1155,10 @@ impl<'g> MiniMax<'g> {
             let (total, free) = gpu.memory()?;
             let free = free.unwrap_or(total) as usize;
             // the arena, the sessions' caches, and 1.5 GiB kept free (a spare of 1 GiB more: the driver's own use)
-            // NS_MM31_SPARE_GIB: the room left besides the arena and the caches (default 2.5; never below the 1.5 GiB floor plus what the driver takes)
-            let spare = (env_f64("NS_MM31_SPARE_GIB").unwrap_or(2.5).max(1.6) * GIB as f64) as usize;
-            let reserve = arena_bytes + kv_tokens * per_tok(&ranges[c]) + spare;
+            // NS_MM31_SPARE_GIB: the room left besides the arena and the caches (default 1.85; never below the 1.5 GiB floor plus what the driver takes)
+            let spare = (env_f64("NS_MM31_SPARE_GIB").unwrap_or(1.85).max(1.6) * GIB as f64) as usize;
+            let ds_kv = if c + 1 == ncard && ds.is_some() { 5 * kv_tokens * 2 * (g.n_kv_head * g.head_dim) as usize * 2 } else { 0 };
+            let reserve = arena_bytes + kv_tokens * per_tok(&ranges[c]) + spare + ds_kv;
             let room = free.saturating_sub(reserve);
             let v = match env_f64("NS_MM31_VRAM_GIB").or(o.expert_bytes.map(|b| b as f64 / GIB as f64)) {
                 Some(v) => ((v * GIB as f64) as usize).min(room),
@@ -1370,6 +1472,9 @@ impl<'g> MiniMax<'g> {
             k,
             g,
             layers,
+            ds,
+            ds_f: Mutex::new(None),
+            ds_caps: Mutex::new(HashMap::new()),
             out_norm,
             embd,
             head,
@@ -1440,6 +1545,9 @@ impl<'g> MiniMax<'g> {
             }
         }
         let c = &self.counts;
+        if c.draft_n.load(Relaxed) > 0 {
+            v.push(format!("[drafter: {} passes, {:.1} ms each]", c.draft_n.load(Relaxed), c.draft_ns.load(Relaxed) as f64 * 1e-6 / c.draft_n.load(Relaxed) as f64));
+        }
         let (a, b, d) = (c.vram.load(Relaxed), c.pinned.load(Relaxed), c.file.load(Relaxed));
         v.push(format!("[experts used: {a} from VRAM, {b} from pinned host memory, {d} read from the file ({:.1}% on the cards); {:.1} GiB read from the file in all; {} moved into VRAM by recency; the host waited {:.2} s for the routers' read-backs in one-token passes, {:.2} s for expert reads and {:.2} s for the layers' final syncs]",
                        100.0 * (a + b) as f64 / (a + b + d).max(1) as f64, self.reader.bytes.load(Relaxed) as f64 / GIB as f64, c.promoted.load(Relaxed), c.rb_ns.load(Relaxed) as f64 * 1e-9, c.join_ns.load(Relaxed) as f64 * 1e-9, c.end_ns.load(Relaxed) as f64 * 1e-9));
@@ -2891,6 +2999,7 @@ impl<'g> MiniMax<'g> {
         let x = self.embed(&self.cards[0], tokens)?;
         tap("inp_embd", &x)?;
         let (x, grave) = self.run_layers(s, x, t, p0, 0..self.layers.len(), &mut *tap)?;
+        self.inject(t, p0, s)?;
         let all = self.head_rows(&x, t, n_out, &mut *tap)?;
         drop(grave);
         if self.pf && t == 1 {
@@ -2938,6 +3047,7 @@ impl<'g> MiniMax<'g> {
                 x = nx;
                 cur = ci;
             }
+            self.capture(l, cd, &x, t, p0)?;
             let m0 = cd.ar().mark();
             let mut tm = Instant::now();
             if t == 1 {
@@ -3021,7 +3131,181 @@ impl<'g> MiniMax<'g> {
                 }
             }
         }
+        if range.end == self.layers.len() {
+            self.capture(range.end, self.cards.last().unwrap(), &x, t, p0)?;
+        }
         Ok((x, grave))
+    }
+
+    /// The hidden state going into layer `l`, when it is a target of the drafter: into the features on the last card, or read to the host on the first
+    fn capture(&self, l: usize, cd: &Card, x: &DevBuf, t: usize, p0: usize) -> Result<()> {
+        let Some(d) = &self.ds else { return Ok(()) };
+        let Some(k) = d.targets.iter().position(|v| *v == l) else { return Ok(()) };
+        let c = self.g.n_embd as usize;
+        let last = self.cards.last().unwrap();
+        if std::ptr::eq(cd, last) {
+            let mut f = self.ds_f.lock().unwrap();
+            if f.as_ref().is_none_or(|b| b.floats() < t * d.targets.len() * c) {
+                *f = Some(DevBuf::f32(&cd.gpu, t * d.targets.len() * c)?);
+            }
+            let one = self.k.silo_one.as_ref().ok_or_else(|| e("the drafter needs the silo"))?;
+            // SAFETY: x [t, c], the features [t, targets x c].
+            ffi::check(unsafe { (one.put_cols)(cd.gpu.raw(), x.fp().cast_const(), f.as_ref().unwrap().fp(), t as i64, c as i64, (d.targets.len() * c) as i64, (k * c) as i64) }, "put_cols")?;
+        } else {
+            let v = x.view(0, t * c * 4)?.to_f32()?;
+            self.ds_caps.lock().unwrap().entry(p0).or_default().push((k, v));
+        }
+        Ok(())
+    }
+
+    /// The drafter's caches at positions p0.. from the pass's features (a pass on the last card, after its layers)
+    fn inject(&self, t: usize, p0: usize, s: &Session) -> Result<()> {
+        let Some(d) = &self.ds else { return Ok(()) };
+        let g = &self.g;
+        let (c, kv, hd) = (g.n_embd as usize, g.n_kv_head as usize, g.head_dim as usize);
+        let cd = self.cards.last().unwrap();
+        let raw = cd.gpu.raw();
+        let one = self.k.silo_one.as_ref().ok_or_else(|| e("the drafter needs the silo"))?;
+        let fb = self.ds_f.lock().unwrap();
+        let f = fb.as_ref().ok_or_else(|| e("no features"))?;
+        if let Some(caps) = self.ds_caps.lock().unwrap().remove(&p0) {
+            for (k, v) in caps {
+                let b = DevBuf::f32(&cd.gpu, t * c)?;
+                // SAFETY: plain floats as bytes.
+                b.write(0, unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 4) })?;
+                // SAFETY: as in capture.
+                ffi::check(unsafe { (one.put_cols)(raw, b.fp().cast_const(), f.fp(), t as i64, c as i64, (d.targets.len() * c) as i64, (k * c) as i64) }, "put_cols")?;
+                cd.gpu.sync()?;
+            }
+        }
+        let a = cd.ar();
+        let m0 = a.mark();
+        let gx = a.f32(t * c)?;
+        self.matmul(cd, &d.fc, f, t, &gx)?;
+        self.rms(cd, &gx, &d.enc_norm, &gx, t, c)?;
+        let n_rot = g.n_rot as i64;
+        let kd = kv * hd;
+        for (dl, (kc, vc)) in d.layers.iter().zip(&s.ds) {
+            let mk = a.mark();
+            let (kx, vx) = (a.f32(t * kd)?, a.f32(t * kd)?);
+            self.matmul(cd, &dl.k, &gx, t, &kx)?;
+            self.matmul(cd, &dl.v, &gx, t, &vx)?;
+            self.rms(cd, &kx, &dl.k_norm, &kx, t * kv, hd)?;
+            // SAFETY: rows as named; the stores inside the caches (max_ctx + block positions).
+            unsafe {
+                ffi::check((self.k.rope)(raw, kx.fp(), t as i64, kv as i64, kd as i64, hd as i64, n_rot, p0 as i64, g.rope_base as f32), "rope k")?;
+                ffi::check((self.k.to_f16)(raw, kx.fp(), kc.ptr().cast::<u16>().add(p0 * kd), (t * kd) as i64), "cache k")?;
+                ffi::check((self.k.to_f16)(raw, vx.fp(), vc.ptr().cast::<u16>().add(p0 * kd), (t * kd) as i64), "cache v")?;
+            }
+            a.rewind(mk);
+        }
+        a.rewind(m0);
+        Ok(())
+    }
+
+    /// Drafts for the positions after `tail` (committed, fed next at s.pos): one pass of the drafter over [tail, MASK..] at s.pos.., the Markov chain over its rows
+    fn draft_in(&self, s: &Session, tail: u32) -> Result<Vec<u32>> {
+        let Some(d) = &self.ds else { return Ok(Vec::new()) };
+        let rows = draft_tokens(d.block).min(s.max_ctx.saturating_sub(s.pos + 1));
+        if rows == 0 || s.pos == 0 {
+            return Ok(Vec::new());
+        }
+        let _w = self.work.lock().unwrap();
+        let t_d = Instant::now();
+        self.use_arena(1)?;
+        let g = &self.g;
+        let (c, kv, hd, h) = (g.n_embd as usize, g.n_kv_head as usize, g.head_dim as usize, g.n_head as usize);
+        let cd = self.cards.last().unwrap();
+        let raw = cd.gpu.raw();
+        let one = self.k.silo_one.as_ref().ok_or_else(|| e("the drafter needs the silo"))?;
+        let a = cd.ar();
+        let m0 = a.mark();
+        let n = s.pos;
+        let mut toks = vec![d.mask; rows];
+        toks[0] = tail;
+        let x = self.embed(cd, &toks)?;
+        let (kd, qd) = (kv * hd, h * hd);
+        let w0 = (n + rows).saturating_sub(d.window);
+        let keys = n + rows - w0;
+        let sp = keys.div_ceil(128);
+        for (dl, (kc, vc)) in d.layers.iter().zip(&s.ds) {
+            let mk = a.mark();
+            let xn = a.f32(rows * c)?;
+            self.rms(cd, &x, &dl.attn_norm, &xn, rows, c)?;
+            let (q, kx, vx) = (a.f32(rows * qd)?, a.f32(rows * kd)?, a.f32(rows * kd)?);
+            self.q_products(cd, &xn, rows, &[(&dl.q, &q), (&dl.k, &kx), (&dl.v, &vx)])?;
+            for r in 0..rows {
+                let pos = n + r;
+                // SAFETY: row r of each, position pos inside the caches.
+                unsafe {
+                    ffi::check((one.post)(raw, q.fp().add(r * qd), kx.fp().add(r * kd), vx.fp().cast_const().add(r * kd), std::ptr::null_mut(), std::ptr::null_mut(), dl.q_norm.fp().cast_const(), dl.k_norm.fp().cast_const(), std::ptr::null(), std::ptr::null(),
+                                       kc.ptr().cast::<u16>().add(pos * kd), vc.ptr().cast::<u16>().add(pos * kd), std::ptr::null_mut(), h as i64, kv as i64, 0, hd as i64, g.n_rot as i64, pos as i64, g.rope_base as f32, g.rms_eps as f32), "draft post")?;
+                }
+            }
+            let att = a.f32(rows * qd)?;
+            let part = a.f32(rows * kv * sp * 16 * 130)?;
+            // SAFETY: the caches hold the keys named; part its size.
+            ffi::check(unsafe { (one.attend_block)(raw, q.fp().cast_const(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), att.fp(), rows as i64, h as i64, kv as i64, n as i64, w0 as i64, sp as i64, part.fp()) }, "draft attention")?;
+            let o = a.f32(rows * c)?;
+            self.q_products(cd, &att, rows, &[(&dl.o, &o)])?;
+            self.add(cd, &x, &o, rows * c)?;
+            self.rms(cd, &x, &dl.ffn_norm, &xn, rows, c)?;
+            let fe = dl.gate.rows;
+            let (gt, up) = (a.f32(rows * fe)?, a.f32(rows * fe)?);
+            self.q_products(cd, &xn, rows, &[(&dl.gate, &gt), (&dl.up, &up)])?;
+            // SAFETY: rows * fe floats; alpha 1.702 limit 7 (swigluoai); with NS_MM31_DRAFT_SILU=1 a huge limit and alpha 1, the plain silu * (up + 1).
+            ffi::check(unsafe { (self.k.swiglu_oai)(raw, gt.fp(), up.fp(), gt.fp(), (rows * fe) as i64, if d.silu { 1.0 } else { 1.702 }, if d.silu { 1e30 } else { 7.0 }) }, "draft swiglu")?;
+            self.q_products(cd, &gt, rows, &[(&dl.down, &o)])?;
+            self.add(cd, &x, &o, rows * c)?;
+            a.rewind(mk);
+        }
+        // the head, then the Markov chain
+        let xn = a.f32(rows * c)?;
+        self.rms(cd, &x, &d.norm, &xn, rows, c)?;
+        let logits = a.f32(rows * self.head.rows)?;
+        self.matmul(cd, &self.head, &xn, rows, &logits)?;
+        let v = self.head.rows;
+        let (bias, row, best) = (a.f32(v)?, a.f32(d.w2.cols)?, a.bytes(4)?);
+        let pmin = draft_pmin();
+        let embd = if pmin > 0.0 && !d.conf.is_empty() { Some(xn.to_f32()?) } else { None };
+        let mut out = Vec::with_capacity(rows);
+        let mut prev = tail as usize;
+        for r in 0..rows {
+            // markov_w1's row of the token before: Q8_0, 34 bytes (half d, 32 int8) a 32 values
+            let bytes = &d.w1[prev * d.w1_row..(prev + 1) * d.w1_row];
+            let vals: Vec<u8> = bytes.chunks_exact(34).flat_map(|b| {
+                let dd = half_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                b[2..].iter().map(move |q| dd * (*q as i8) as f32).collect::<Vec<f32>>()
+            }).flat_map(|v| v.to_le_bytes()).collect();
+            if let Some(em) = &embd {
+                let w1v: Vec<f32> = vals.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                let mut z = d.conf_b;
+                for (w, x) in d.conf.iter().zip(em[r * c..(r + 1) * c].iter().chain(w1v.iter())) {
+                    z += w * x;
+                }
+                let p = 1.0 / (1.0 + (-z).exp());
+                if p < pmin {
+                    break;
+                }
+            }
+            row.write(0, &vals)?;
+            self.q_products(cd, &row, 1, &[(&d.w2, &bias)])?;
+            // SAFETY: logits row r and bias hold v floats, best one int.
+            ffi::check(unsafe { (one.argmax_add)(raw, logits.fp().cast_const().add(r * v), bias.fp().cast_const(), v as i64, best.ptr().cast::<i32>()) }, "argmax")?;
+            let mut bb = [0u8; 4];
+            best.read(0, &mut bb)?;
+            prev = i32::from_le_bytes(bb).max(0) as usize;
+            out.push(prev as u32);
+        }
+        a.rewind(m0);
+        self.counts.draft_ns.fetch_add(t_d.elapsed().as_nanos() as u64, Relaxed);
+        self.counts.draft_n.fetch_add(1, Relaxed);
+        Ok(out)
+    }
+
+    /// Tokens drafted a step
+    pub fn draft_count(&self) -> usize {
+        self.ds.as_ref().map_or(0, |d| draft_tokens(d.block))
     }
 
     /// A long prompt with the two cards working at once: the first card's layers on a chunk while the second card has the chunk before (the host carries the hidden
@@ -3069,6 +3353,7 @@ impl<'g> MiniMax<'g> {
                     // SAFETY: plain floats viewed as their bytes.
                     nx.write(0, unsafe { std::slice::from_raw_parts(h.as_ptr().cast::<u8>(), h.len() * 4) })?;
                     let (x, grave) = self.run_layers(sess, nx, t, p0, split..n, &mut none)?;
+                    self.inject(t, p0, sess)?;
                     let r = self.head_rows(&x, t, 1, &mut none)?;
                     drop(grave);
                     Ok(r)
@@ -3123,7 +3408,15 @@ impl<'g> MiniMax<'g> {
             v.push(DevBuf::new(gpu, max_ctx * kv * hd * 2)?);
             ik.push(if ly.idx.is_some() { Some(DevBuf::new(gpu, max_ctx * il * 2)?) } else { None });
         }
-        Ok(Session { pos: 0, max_ctx, k, v, ik, last_rows: 0 })
+        let mut ds_c = Vec::new();
+        if let Some(d) = &self.ds {
+            let gpu = &self.cards.last().unwrap().gpu;
+            for _ in &d.layers {
+                let n = (max_ctx + d.block) * kv * hd * 2;
+                ds_c.push((DevBuf::new(gpu, n)?, DevBuf::new(gpu, n)?));
+            }
+        }
+        Ok(Session { pos: 0, max_ctx, k, v, ik, ds: ds_c, last_rows: 0 })
     }
 
     pub fn reset_session(&self, s: &mut Session) -> Result<()> {
@@ -3191,18 +3484,39 @@ impl<'g> MiniMax<'g> {
         Ok(out)
     }
 
-    /// The next committed token: drawn from the prompt's logits, or after feeding the one committed before
+    /// The next committed token(s): drawn from the prompt's logits, or after feeding the one committed before, with the drafts checked in the same pass (exact: a row after
+    /// a draft is kept only when the row before chose that draft)
     pub fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
-        let y = match (d.logits.take(), d.next.take()) {
-            (Some(l), _) => smp.sample(&l),
-            (None, Some(x)) => {
-                let l = self.pass(s, &[x], 1, tap)?.pop().unwrap_or_default();
-                smp.sample(&l)
+        match (d.logits.take(), d.next.take()) {
+            (Some(l), _) => {
+                let y = smp.sample(&l);
+                d.next = Some(y);
+                Ok(vec![y])
             }
-            (None, None) => return Err(e("a decoder with nothing to draw from")),
-        };
-        d.next = Some(y);
-        Ok(vec![y])
+            (None, Some(x)) => {
+                let drafts = self.draft_in(s, x)?;
+                d.drafted += drafts.len() as u64;
+                let mut toks = vec![x];
+                toks.extend(&drafts);
+                let rows = self.pass(s, &toks, toks.len(), tap)?;
+                let mut out = Vec::new();
+                for (i, l) in rows.iter().enumerate() {
+                    let y = smp.sample(l);
+                    out.push(y);
+                    if drafts.get(i) != Some(&y) {
+                        break;
+                    }
+                    d.accepted += 1;
+                }
+                let keep = out.len().min(toks.len());
+                if keep < toks.len() {
+                    self.rollback(s, keep)?;
+                }
+                d.next = Some(*out.last().unwrap());
+                Ok(out)
+            }
+            (None, None) => Err(e("a decoder with nothing to draw from")),
+        }
     }
 
     pub fn save(&self, s: &Session) -> Result<Checkpoint> {

@@ -33,8 +33,9 @@ struct Slm {
 };
 
 // SPLIT (decode): a work-group a (query row, group, split of 128 keys), each head's partial softmax state [m, l, values] into `part` (T * G * S * 16 * 130 floats, log2 units), merged after
-template <bool SPLIT>
-void attx(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G, int64_t pos0, int64_t S, float* part) {
+// BLOCK (a draft block): every row sees the keys from w0 to the block's last row (not causal), with no selection
+template <bool SPLIT, bool BLOCK = false>
+void attx(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G, int64_t pos0, int64_t S, float* part, int64_t w0 = 0) {
     constexpr int NSG = 2 * NG, WG = NSG * SG;
     const float qscale = 1.0f / sycl::sqrt((float) D) * 1.4426950408889634f;
     const uint8_t* kc8 = (const uint8_t*) kc;
@@ -46,7 +47,7 @@ void attx(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, con
             auto sg = it.get_sub_group();
             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id(), tid = (int) it.get_local_id(0);
             const int hg = sgi >> 1, hd = sgi & 1;  // this sub-group's row set and its half of the features
-            const int64_t grp = it.get_group(0), spl = grp % S, gid = grp / S, t = gid / G, gi = gid % G, pos = pos0 + t;
+            const int64_t grp = it.get_group(0), spl = grp % S, gid = grp / S, t = gid / G, gi = gid % G, pos = BLOCK ? pos0 + T - 1 : pos0 + t;
             uint32_t* base = slm.get_multi_ptr<sycl::access::decorated::no>().get();
             uint32_t* kp = base;
             uint32_t* vp = kp + L::k;
@@ -56,7 +57,7 @@ void attx(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, con
             float* lrow = mrow + NG * M;
             float* crow = lrow + NG * M;
             half* qh = (half*) base;
-            const int64_t total = sel ? K * 128 : pos + 1;
+            const int64_t total = sel ? K * 128 : pos + 1 - w0;
 
             for (int i = tid; i < NG * M; i += WG) {
                 mrow[i] = -INFINITY;
@@ -82,7 +83,7 @@ void attx(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, con
             const int64_t c_lo = SPLIT ? spl * 128 : 0, c_hi = SPLIT ? sycl::min<int64_t>(total, (spl + 1) * 128) : total;
             for (int64_t c0 = c_lo; c0 < c_hi; c0 += CH) {
                 // the chunk's first key; 16 keys in a row (a block is 128 of them)
-                int64_t j0 = c0;
+                int64_t j0 = c0 + w0;
                 bool none = false;
                 if (sel) {
                     const int32_t b = sel[(t * G + gi) * K + c0 / 128];
@@ -245,6 +246,14 @@ int ns_mm3s_attend_x(ns_gpu* g, const float* q, const uint16_t* kc, const uint16
     NS_TRY
     if (!ns_mm3s_attend_supported(H, G, D)) return ns_fail("ns_mm3s_attend_x: 16 heads a group of 128 values");
     attx<false>(g, q, kc, vc, sel, K, out, T, H, G, pos0, 1, nullptr);
+    return 0;
+    NS_CATCH
+}
+
+int ns_mm3s_attend_block(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, float* out, int64_t T, int64_t H, int64_t G, int64_t pos0, int64_t w0, int64_t S, float* part) {
+    NS_TRY
+    if (!ns_mm3s_attend_supported(H, G, D)) return ns_fail("ns_mm3s_attend_block: 16 heads a group of 128 values");
+    attx<true, true>(g, q, kc, vc, nullptr, 0, out, T, H, G, pos0, S, part, w0);
     return 0;
     NS_CATCH
 }

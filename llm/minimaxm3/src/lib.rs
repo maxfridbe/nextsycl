@@ -36,7 +36,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "chunk", env: "NS_MM31_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 4096: every pass streams the experts that are off the cards once)", at: At::Load },
     EngineOption { name: "vram-gib", env: "NS_MM31_VRAM_GIB", value: "GIB", help: "VRAM a card may fill with kept experts (default: what is free after the arena, the sessions' caches and a spare)", at: At::Load },
     EngineOption { name: "pin-gib", env: "NS_MM31_PIN_GIB", value: "GIB", help: "pinned host memory, in all, for more kept experts (default: what is available less 16, at most 32)", at: At::Load },
-    EngineOption { name: "split", env: "NS_MM31_SPLIT", value: "LAYERS", help: "with two GPUs, the layers on the first (default: 60%)", at: At::Load },
+    EngineOption { name: "split", env: "NS_MM31_SPLIT", value: "LAYERS", help: "with two GPUs, the layers on the first, the B65 unless NS_MM31_ORDER=asis (default: half)", at: At::Load },
     EngineOption { name: "direct", env: "NS_MM31_DIRECT", value: "0|1", help: "read experts from the file with O_DIRECT (default 1; 0: through the page cache)", at: At::Load },
     EngineOption { name: "splitread", env: "NS_MM31_SPLITREAD", value: "N", help: "pieces an expert matrix is read in at once, each its own request (default 8)", at: At::Load },
     EngineOption { name: "lane", env: "NS_MM31_LANE", value: "0|1", help: "the copy lane the pinned and file-read experts are copied into VRAM on (default 1)", at: At::Load },
@@ -85,7 +85,7 @@ impl SessionState for engine::Session {
 
 impl DecoderState for engine::Decoder {
     fn drafts(&self) -> (u64, u64) {
-        (0, 0)
+        (self.drafted, self.accepted)
     }
     fn pending(&mut self) -> Option<u32> {
         engine::Decoder::pending(self)
@@ -128,7 +128,7 @@ impl Engine for engine::MiniMax<'_> {
         self.load_bytes
     }
     fn has_draft(&self) -> bool {
-        false
+        self.draft_count() > 0
     }
     fn prefill_chunk(&self) -> usize {
         engine::prefill_chunk()

@@ -510,6 +510,37 @@ int ns_mm3s_doorbell(ns_gpu* g, uint32_t* flag, uint32_t seq) {
     NS_CATCH
 }
 
+// f[r * stride + at + c] = x[r * C + c]: a hidden state into its column of the drafter's features
+int ns_mm3s_put_cols(ns_gpu* g, const float* x, float* f, int64_t T, int64_t C, int64_t stride, int64_t at) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<1>((size_t) (T * C)), [=](sycl::id<1> id) {
+        const int64_t r = id[0] / C, c = id[0] % C;
+        f[r * stride + at + c] = x[r * C + c];
+    });
+    return 0;
+    NS_CATCH
+}
+
+// *best = the argmax of base + bias over n values, in a launch
+int ns_mm3s_argmax_add(ns_gpu* g, const float* base, const float* bias, int64_t n, int32_t* best) {
+    NS_TRY
+    constexpr int WG = 512;
+    g->q.parallel_for(sycl::nd_range<1>((size_t) WG, WG), [=](sycl::nd_item<1> it) {
+        const int lid = (int) it.get_local_id(0);
+        float bv = -INFINITY;
+        int32_t bi = -1;
+        for (int64_t i = lid; i < n; i += WG) {
+            const float v = base[i] + bias[i];
+            if (v > bv) { bv = v; bi = (int32_t) i; }
+        }
+        const float m = sycl::reduce_over_group(it.get_group(), bv, sycl::maximum<float>());
+        const int32_t w = sycl::reduce_over_group(it.get_group(), bv == m ? bi : (int32_t) 0x7fffffff, sycl::minimum<int32_t>());
+        if (lid == 0) *best = w;
+    });
+    return 0;
+    NS_CATCH
+}
+
 // att = o + x; hn = rms_norm(att) * w, in a launch
 int ns_mm3s_add_norm(ns_gpu* g, float* att, const float* o, const float* x, const float* w, float* hn, int64_t C, float eps) {
     NS_TRY

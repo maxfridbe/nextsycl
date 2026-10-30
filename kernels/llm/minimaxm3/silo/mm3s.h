@@ -51,6 +51,12 @@ int ns_mm3s_attn_post(ns_gpu* g, float* q, float* k, const float* v, float* iq, 
 int ns_mm3s_to_half(ns_gpu* g, int type, const void* src, int64_t nv, uint16_t* out);
 /* When the work queued before it is done, *flag (pinned host memory) = seq */
 int ns_mm3s_doorbell(ns_gpu* g, uint32_t* flag, uint32_t seq);
+/* f[r * stride + at + c] = x[r * C + c] */
+int ns_mm3s_put_cols(ns_gpu* g, const float* x, float* f, int64_t T, int64_t C, int64_t stride, int64_t at);
+/* *best = the argmax of base + bias over n values */
+int ns_mm3s_argmax_add(ns_gpu* g, const float* base, const float* bias, int64_t n, int32_t* best);
+/* A draft block on XMX: T rows at pos0.. see the keys from w0 to the block's last row, not causal; S = ceil(keys / 128), part T * G * S * 16 * 130 floats */
+int ns_mm3s_attend_block(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, float* out, int64_t T, int64_t H, int64_t G, int64_t pos0, int64_t w0, int64_t S, float* part);
 /* att = o + x, hn = rms_norm(att) * w */
 int ns_mm3s_add_norm(ns_gpu* g, float* att, const float* o, const float* x, const float* w, float* hn, int64_t C, float eps);
 /* out = the `used` planes of ys in rank order + sh + att */
