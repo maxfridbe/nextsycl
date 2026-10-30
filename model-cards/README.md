@@ -17,7 +17,7 @@ about: Qwen's dense Qwen3.8 27B ...
 gpus: '0'                       # the GPUs it loads on: '0', '1', '0,1', or 'all' (weakest first)
 vram_gib: 29.0                  # its memory on each card when it runs, as measured (the front door keeps the card
                                 #   free for it before it has measured the model itself; else from the files' sizes)
-ram_gib: 42.5                   # optional: its host memory when it runs, not counting reclaimable cache, as measured (pinned tiers, process); the
+ram_gib: 46                     # optional: its host memory when it runs, not counting reclaimable cache, as measured (pinned tiers, process); the
                                 #   front door checks it against MemAvailable before a load, idle models go for it, else it waits or answers no_room
 ram_cache_gib: 12.7             # optional: the reclaimable page cache it keeps warm: MemAvailable counts it, other models' loads do not
 headroom_gib: 3.3               # optional: of vram_gib, the working memory beyond the weights (KV for its context, arenas,
