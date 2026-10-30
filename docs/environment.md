@@ -326,7 +326,7 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_MM31_DRAFT_PMIN` | 0 | Drafts stop at the first the DSpark confidence head rates below this | llm:minimaxm3 |
 | `NS_MM31_KCOPY` | 1 | 0 = the experts' tables through the runtime's memcpy, not a kernel from a pinned ring | llm:minimaxm3 |
 | `NS_MM31_CACHE_GIB` | unset | At most this many GiB of next-ranked experts read once into the page cache at load (0: none; default: what the margin allows) | llm:minimaxm3 |
-| `NS_MM31_CACHE_MARGIN_GIB` | 10 | MemAvailable the warm tier leaves | llm:minimaxm3 |
+| `NS_MM31_CACHE_MARGIN_GIB` | 4 | MemAvailable the warm tier leaves | llm:minimaxm3 |
 | `NS_MM31_KEEPALIVE_US` | unset | Experiment: an empty kernel on every card this often, so the GT does not sleep between a token's layers | llm:minimaxm3 |
 | `NS_MM31_CACHE_DROP` | 1 | 0 = at load, what earlier runs left of the model's files stays in the page cache | llm:minimaxm3 |
 | `NS_MM31_DECODE_CACHE` | 0 | 1 = decode's reads of experts outside the warm tier through the page cache too | llm:minimaxm3 |

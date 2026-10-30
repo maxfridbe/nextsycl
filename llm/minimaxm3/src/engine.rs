@@ -1538,7 +1538,7 @@ impl<'g> MiniMax<'g> {
         }
         // the warm tier: the next-ranked experts read once through the page cache, up to what leaves NS_MM31_CACHE_MARGIN_GIB available. Not pinned, not locked: the kernel takes them
         // back when anything needs the memory, and a prompt pass's other experts go O_DIRECT, so they do not push these out
-        let margin = (env_f64("NS_MM31_CACHE_MARGIN_GIB").unwrap_or(10.0) * GIB as f64) as usize;
+        let margin = (env_f64("NS_MM31_CACHE_MARGIN_GIB").unwrap_or(4.0) * GIB as f64) as usize;
         let mut budget = match env_f64("NS_MM31_CACHE_GIB") {
             Some(v) => ((v * GIB as f64) as usize).min(mem_available().saturating_sub(margin)),
             None => mem_available().saturating_sub(margin),

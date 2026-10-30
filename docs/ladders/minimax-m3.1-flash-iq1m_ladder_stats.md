@@ -20,6 +20,17 @@ bounds it: [docs/ports/minimax-m31.md](../ports/minimax-m31.md).
 Each rung is a fresh process (the load, 22-33 s on two cards, not counted). Prompts: the repository text repeated
 to length (`p2k` 7,600 characters, `p8k` 30,000, `p32k` 120,000), chat template applied.
 
+## Results (2026-10-30, fifth round)
+
+| prompt tokens | cards | pp | tg | tokens generated |
+|---:|---|---:|---:|---:|
+| 2,137 | B65 + B70, expert profile | 263.7 tok/s (8.1 s) | 14.08 tok/s | 200 |
+| 2,137 | B65 + B70, expert profile | 264.4 tok/s (8.1 s) | 14.19 tok/s | 300 |
+| 7,990 | B65 + B70, expert profile | 428.6 tok/s (18.6 s) | 12.69 tok/s | 200 |
+| 31,085 | B65 + B70, expert profile | 333.3 tok/s (93.3 s) | 12.42 tok/s | 100 |
+
+40 GiB pinned at most, the warm tier 12.4 GiB, second drive for the off-card experts. Without a profile, margin 10: 257.4 / 423.5 / 326.1 pp, tg 12.53 / 11.11 / 10.37. B70 alone, margin 10, no profile: 2,137 tokens pp 203.8, tg 8.05 (200 tokens); 7,990 tokens pp 289.0, tg 6.46 (100 tokens).
+
 ## Results (2026-10-30, fourth round)
 
 | prompt tokens | cards | pp | tg | tokens generated |

@@ -402,3 +402,52 @@ Device a token (all-VRAM layers 0.42 ms B65, 0.24 ms B70; attention 20 ms): **no
 | `long` | 0.999848 | 0.999988 | 0.999756 | same (" +") | 0.9797325 |
 
 Against the third round's 0.9555839 / 0.9795699 the decode column moves -0.0016 / +0.0002. Greedy text changes again at near ties (Q8_1 on the shared down from byte 656, B65 first from byte 49). Two runs of the final path byte-identical; `spec-check`: verify rows bit-identical to one-token decode.
+
+## Fifth round (2026-10-30): more residency, and why runs differed
+
+B65 + B70, the same prompts, with the expert profile. ms a token is the fixed 300-token text. Start of the round (151d754): pp 235 at 2K, 371 at 8K, tg 13.21 (300 tokens), 72.9 ms. End: **pp 264 / 429 / 333** (2K / 8K / 31K), **tg 14.19 over 300 tokens, 14.08 / 12.69 / 12.42** over 200 / 200 / 100, **66.9 ms** (three runs 66.8-66.9). tg 20 not reached.
+
+### The cause of the varying runs
+
+Decode's reads went through the page cache, including experts not in any tier. Over 300 tokens that filled the free memory (MemFree under 1 GiB, Cached up to 58 GiB in the slow runs), woke reclaim and compaction, and the runs came out at 67-96 ms a token. With only the warm tier cached and everything else O_DIRECT, five runs gave 67.3-67.5 ms and six greedy runs tg 13.82-14.04, pp 246-257, no outlier, the same text. Three runs with decode's reads cached again: 70.5, 85.8, 76.1 ms. Not the cause: read wait (13-15 ms in slow and fast runs alike), CPU placement (both CCDs still gave a slow run), GPU clock. The mechanism between reclaim and a slower token was not traced; the correlation and the fix are measured. The 147-160 pp outliers have not come back in the 6 repeats and the ladder; that is all that was checked.
+
+### Warm tier and pinned memory
+
+Warm tier: at load the model's stale cache is dropped (`posix_fadvise`, own files only), the next-ranked experts are read twice (so they are on the active list), up to what leaves `NS_MM31_CACHE_MARGIN_GIB` available. No mlock, no tmpfs; Mlocked stayed 0. Other reads in prompt passes and decode are O_DIRECT.
+
+| pinned GiB | warm GiB | ms a token | file reads a token | MemAvailable min, MiB | |
+|---|---|---|---|---|---|
+| 32 | 0 | 74.3 | 5.5 | 24,783 | margin 10 |
+| 32 | 14.5 | 70.7 | 5.5 | 24,746 | margin 10 |
+| 36 | 10.4 | 69.3 | 4.6 | 20,540 | margin 10 |
+| 40 | 7.3 | 67.4 | 3.6 | 16,643 | margin 10, five runs |
+| 40 | 0 | 68.9-70.1 | 3.6-4.2 | 16,432-18,533 | two runs |
+| 40 | 12.4 | **66.8-66.9** | 3.6 | 16,392-16,732 | margin 4, three runs: the default |
+| 44 | 2.2 | 66.5 | 2.9 | 12,314 | margin 10, one run |
+| 48 | | 68.6-69.5 | 2.1 | 8,092 | before the fix: below 8 GiB, stop |
+
+Per GiB: pinned 32 -> 40 gives 0.4 ms a GiB; the warm tier 0.25 ms (14.5 GiB: 3.6 ms) at 32 and ~0.2 (12.4 GiB: 2-3 ms) at 40. **Pinned is worth about twice the cache per GiB**, and the cache is reclaimable. **Default: pinned at most 40 GiB** (44 was the last clean step, one back), cap `PIN_DEFAULT_GIB`, no other clamp (`NS_MM31_PIN_GIB` is taken as given); it still leaves 16 GiB available at load, so with memory held elsewhere it takes less. 48 is the rule's stop and was not rerun after the fix. No swap activity above 34 MiB, no GPU reset, in any run.
+
+### Peaks at the default (for the front door's gate)
+
+| | |
+|---|---|
+| VRAM a card | B70 31,114 MiB, B65 31,211 MiB at a 31K prompt (1,557 MiB free), gpustat at 50 ms samples (it refreshes every 3 s); 1,654 / 1,669 free at 2K. `vram_gib` in the card: 30.5 |
+| pinned | 39 GiB of experts + 1.04 GiB of staging, 40.0 GiB |
+| host, without reclaimable cache | MemTotal less the lowest MemAvailable: 62,864 - 16,392 = 46,472 MiB, 45.4 GiB for the whole box, of which about 3 GiB with production idle |
+
+### What did not help
+
+- **GPU clock**: active samples sit at the maximum (B70 2800, B65 2400 MHz, p50 and nearly p10 too); the card is simply idle during the other card's layers. A keep-alive kernel every 200 us: 84.1 and 74.1 ms, measured before the variance fix, no sign of a gain; not rerun. Pinning the minimum frequency has no gain to report: there is no lower clock to lift. Not tested with root.
+- **Attention** (20 ms) by step, seconds over 300 tokens, B65 24 layers / B70 36: q k v 0.84 / 1.10, o 0.65 / 0.81, attend 0.41 / 0.60, indexer 0.16 / 0.24, top-k 0.10 / 0.14, scores 0.05 / 0.07, norms rope stores 0.04 / 0.05. q, k, v and o are 11 of the 20 ms, on the kernels already at 520 GB/s on the B70 (ceiling about 570), and no form of the Q5_K weights is cheaper to read without changing them. The rest are single milliseconds. No kernel written; no VRAM-for-ms trade found.
+- **VRAM from weights**: nothing done. The embeddings were never in VRAM (a row from the file each token); the head lives on the last card only. Decode reads every other weight. The indexer as half would free ~0.22 GiB a card, ~0.5 ms by the slope: computed, not run. gpustat keeps 1.5 GiB free (1,557 MiB at the tightest), so the spare stays 1.9.
+- **Read path**: the shared expert and the VRAM experts are queued before the reads are waited for (code, and read layers cost 3.3-3.6 ms against 0.24-0.41 clean with a 2-3 ms wait), the misses of a layer are read at once. Second copy on the 2 TB: not rerun, it read at 1.8 GB/s in round 3 and a stripe goes at its slowest drive. Second-drive copy on the system drive for off-card experts is kept as an option.
+
+### Exactness
+
+| prompt | min l_out | min kqv_out | result_output | next token | decode cosine |
+|---|---|---|---|---|---|
+| `short` | 0.999849 | 0.999966 | 0.999957 | same | 0.9540083 |
+| `long` | 0.999848 | 0.999988 | 0.999756 | same (" +") | 0.9797325 |
+
+Unchanged from round 4. Greedy text: the same md5 across six runs at margin 10 and the final margin 4 run. The round 4 note on a byte-838 difference was wrong about its timing: that pair came before the demotion fix, and no later pair has differed.
