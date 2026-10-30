@@ -436,6 +436,21 @@ Per GiB: pinned 32 -> 40 gives 0.4 ms a GiB; the warm tier 0.25 ms (14.5 GiB: 3.
 | pinned | 39 GiB of experts + 1.04 GiB of staging, 40.0 GiB |
 | host, without reclaimable cache | MemTotal less the lowest MemAvailable: 62,864 - 16,392 = 46,472 MiB, 45.4 GiB for the whole box, of which about 3 GiB with production idle |
 
+### Through the front door
+
+A private `serve` from the build copy (own port, registry and config) with production idle, 8K context:
+
+| | |
+|---|---|
+| load | 26.6 s in the engine; the first chat answers in 31-38 s |
+| VRAM, loaded and between requests | B65 30,579, B70 30,698 MiB |
+| VRAM during a 2,144-token prompt | 31,069 / 31,076 MiB (1,692 free, gpustat refreshes every 3 s), back to 30,579 / 30,698 after: the prompt scratch is freed |
+| speeds through serve | pp 223 (2,144 tokens in 9.6 s), tg 13.20 over 24 tokens, two sessions at once answered |
+| host | MemAvailable 59,447 MiB idle, lowest 12,435: 45.9 GiB, so `ram_gib: 46` (the 45.4 above is the whole box, on a different baseline). The warm cache, `ram_cache_gib: 12.7`, is on top and counted as available by the kernel |
+| unload | 0.7 s; VRAM 0 / 0, MemAvailable back to 59,405 MiB |
+
+Eviction, with PaddleOCR-VL as the other load: without a header MiniMax goes at once and the load takes 3 s; asking only host memory (`vram_gib` 0.05, `ram_gib` 20) evicts it too; with `X-Keep-Up-S: 150` it stays, the load gets `no_room` after 91.7 s (for VRAM and, separately, naming host memory), and after the 150 s the same load evicts it and succeeds in 6 s. No GPU resets, lowest MemAvailable 12.1 GiB. Not run this way: a video job (the room rule for a waiting worker has unit tests only).
+
 ### What did not help
 
 - **GPU clock**: active samples sit at the maximum (B70 2800, B65 2400 MHz, p50 and nearly p10 too); the card is simply idle during the other card's layers. A keep-alive kernel every 200 us: 84.1 and 74.1 ms, measured before the variance fix, no sign of a gain; not rerun. Pinning the minimum frequency has no gain to report: there is no lower clock to lift. Not tested with root.

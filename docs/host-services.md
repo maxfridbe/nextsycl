@@ -28,7 +28,14 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     the studio has nothing to make, a chat model answering nothing that no `X-Keep-Up-S` keeps - never a render or a
     request), and it answers
     503 `no_room` when the room does not come free (a job waits up to 30 minutes first, saying what for; a chat
-    load, like the others, 90 s). **Disabled**: unloaded, gone from Open WebUI's list and from the API.
+    load, like the others, 90 s). A model whose card says `ram_gib` also waits for host memory by the same rule:
+    MemAvailable, less the warm cache of a running model that says `ram_cache_gib` (the kernel counts that cache as
+    available, and the model will fill it again), must leave `ram_gib` plus 4 GiB. Idle holders go for it, kept or
+    working ones stay; a model without `ram_gib` skips the check. A video job waiting on any card, shared or not,
+    gets the room rule too: idle chat on that card goes (however it was started), a kept or answering one stays and
+    `video.status` says `waiting_for` until the 30-minute limit fails the job with `no_room`. The shared GPU also
+    keeps its lock and its `llm.mode none` hook, which do not look at `X-Keep-Up-S`. **Disabled**: unloaded, gone
+    from Open WebUI's list and from the API.
     The registry's `enabled` and `gpus` are the state (`nextsycl models enable|disable` agree); the enabled video
     models are the video daemon's engines (serve starts, restarts and stops it).
   - **The API**, behind `Authorization: Bearer <token>` (`NS_API_TOKEN`, else one made and kept in `serve.json`
