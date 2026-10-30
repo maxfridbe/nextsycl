@@ -14,6 +14,7 @@ pub mod device;
 pub mod dit;
 pub mod dtype;
 pub mod esrgan;
+pub mod exposure;
 pub mod jobs;
 pub mod media;
 pub mod gguf;
@@ -115,6 +116,10 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "regen", env: "", value: "FROM-TO", help: "the seconds of the source to regenerate", at: At::Request },
     EngineOption { name: "regen_box", env: "", value: "X0,Y0,X1,Y1", help: "the region of the source to regenerate (pixels: left, top, right, bottom)", at: At::Request },
     EngineOption { name: "cond_noise_aug", env: "", value: "X", help: "DO NOT USE: noise added to the keyframes, which are never denoised - it decodes as coloured confetti (seen at 0.03)", at: At::Request },
+    EngineOption { name: "exposure_fix", env: "", value: "BOOL", help: "after the decode: lift the frames by exposure_offset, match a motion guide's frames to the guide's luma and ease the frames after it to the clip's steady level (a flash after the cut); off by default", at: At::Request },
+    EngineOption { name: "exposure_offset", env: "", value: "LUMA", help: "with exposure_fix: luma (0-255) added to every frame, the decoder's darkening (default 2.3)", at: At::Request },
+    EngineOption { name: "exposure_ease", env: "", value: "FRAMES", help: "with exposure_fix: frames after the guide over which the luma eases to the steady level (default 24)", at: At::Request },
+    EngineOption { name: "exposure_target", env: "", value: "LUMA", help: "with exposure_fix and no guide_clip: the luma (0-255) of the clip's first frame (default: the first_frame picture's)", at: At::Request },
     EngineOption { name: "shift_video", env: "", value: "X", help: "the video schedule's shift (default 12)", at: At::Request },
     EngineOption { name: "shift_audio", env: "", value: "X", help: "the audio schedule's shift (default 3)", at: At::Request },
     EngineOption { name: "pixel_upscaler", env: "", value: "FILE", help: "an ESRGAN network to enlarge the frames (instead of the latents)", at: At::Request },

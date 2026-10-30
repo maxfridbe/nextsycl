@@ -133,6 +133,14 @@ impl Studio {
                 spec["guide_clip"] = json!(format!("{}{}{}", self.clip_file(&src, &[".mp4"]), if rest.is_empty() { "" } else { ":" }, rest.join(":")));
             }
         }
+        if item["exposure_fix"].as_bool() == Some(true) {
+            spec["exposure_fix"] = json!(true);
+            for k in ["exposure_offset", "exposure_ease", "exposure_target"] {
+                if let Some(v) = item[k].as_f64() {
+                    spec[k] = json!(v);
+                }
+            }
+        }
         let src = s(item, "source");
         if !src.is_empty() {
             if let Some(src) = self.resolve(st, item, "source", &src) {

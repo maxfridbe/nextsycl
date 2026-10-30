@@ -510,13 +510,13 @@ pub struct Latents {
 
 /// Latents in memory -> frames and sound (and an .mp4); see `decode`.
 pub fn decode_latents(dev: &Arc<Device>, threads: usize, lat: Latents, vaes: &Vaes, out: Option<&Path>, check: Option<&Path>, ctl: &mut Ctl) -> Result<Value> {
-    decode_latents_chain(dev, threads, lat, vaes, out, check, None, ctl)
+    decode_latents_chain(dev, threads, lat, vaes, out, check, None, None, ctl)
 }
 
 /// The same; `chain`: also write the next clip's anchors beside it - `<base>.last.png` (the last frame, lossless)
 /// and `<base>.lastaud.safetensors` (the last 2 s of sound at the model's own level).
 #[allow(clippy::too_many_arguments)]
-pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vaes: &Vaes, out: Option<&Path>, check: Option<&Path>, chain: Option<&Path>, ctl: &mut Ctl) -> Result<Value> {
+pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vaes: &Vaes, out: Option<&Path>, check: Option<&Path>, chain: Option<&Path>, exposure: Option<&crate::exposure::Exposure>, ctl: &mut Ctl) -> Result<Value> {
     let vae = vaes.video;
     let t_all = Instant::now();
     let (t, mut h, mut w) = (lat.t, lat.h, lat.w);
@@ -632,6 +632,12 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
             }
         }
         sound = Some(crate::media::Audio { channels: ch, sample_rate: crate::audio::SAMPLE_RATE });
+    }
+    if let Some(x) = exposure {
+        let r = x.apply(&mut px, frames, fh * fw);
+        let f = |v: &[f32]| v.iter().take(48).map(|l| format!("{:.0}", l * 255.0)).collect::<Vec<_>>().join(" ");
+        ctl.say(format!("exposure: {} frames corrected; luma (first 48) before {} / after {}", r.corrected, f(&r.before), f(&r.after)));
+        report["exposure"] = json!({"corrected": r.corrected, "luma_before": r.before, "luma_after": r.after});
     }
     if let Some(base) = chain {
         let plane = fh * fw;
@@ -832,6 +838,14 @@ pub struct ClipSpec<'a> {
     pub inputs: ClipInputs<'a>,
 }
 
+/// The request's `exposure_fix` settings
+#[derive(Clone, Copy, Debug)]
+pub struct ExposureOpts {
+    pub offset: f32,
+    pub ease: usize,
+    pub target: Option<f32>,
+}
+
 /// What a clip is anchored to, as the reference's options name them (reference/h3x.py gen --help).
 #[derive(Default)]
 pub struct ClipInputs<'a> {
@@ -849,6 +863,9 @@ pub struct ClipInputs<'a> {
     /// a driving soundtrack (a song) and the second of it at the clip's first frame: the clip's length of it is pinned
     /// under the whole clip as an audio keyframe (the picture is made to it) and laid under the finished clip
     pub soundtrack: Option<(&'a Path, f64)>,
+    /// the exposure fixed after the decode (off by default; see exposure.rs): the lift, the ease-out frames, a luma
+    /// (0..1) for the first frame when no guide gives one
+    pub exposure_fix: Option<ExposureOpts>,
     /// how much to trust the video keyframes (0.999 by default; lower = trust a degraded anchor less)
     pub cond_noise_aug: Option<f32>,
     /// the flow shifts (12 and 3 by default)
@@ -944,11 +961,16 @@ fn clip_inpaint(inp: &ClipInputs, shape: Shape) -> Result<Option<denoiser::Inpai
     Ok(Some(denoiser::Inpaint { source_v, source_a, mask_v, mask_a }))
 }
 
+/// The frame a run of frames starts at and their luma (0..1)
+type Anchor = (usize, Vec<f32>);
+
 /// The video keyframes and audio keyframe of a clip, encoded (the encoders loaded only when a picture or sound
 /// needs them).
-fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (usize, usize, usize), ctl: &mut Ctl) -> Result<(Vec<KeyframeIn>, Vec<Frames>)> {
+fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (usize, usize, usize), ctl: &mut Ctl) -> Result<(Vec<KeyframeIn>, Vec<Frames>, Option<Anchor>)> {
     let mut kfs: Vec<KeyframeIn> = Vec::new();
     let pictures = std::cell::RefCell::new(Vec::new());
+    // the luma of the frames the clip should start with (the exposure fix): a guide's, else the first picture's
+    let mut anchor: Option<Anchor> = None;
     let needs_venc = inp.first_frame.is_some() || inp.last_frame.is_some() || !inp.guides.is_empty();
     let venc = match needs_venc {
         true => Some(crate::venc::VideoEncoder::load(dev, &Checkpoint::open(vaes.video)?)?),
@@ -1006,6 +1028,9 @@ fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frame
         if index + got > frames {
             return Err(Error(format!("a {got}-frame guide at frame {idx} does not fit in the clip's {frames} frames")));
         }
+        if inp.exposure_fix.is_some() && anchor.is_none() {
+            anchor = Some((index, (start..start + got).map(|f| crate::media::luma(&px[f * fsz..(f + 1) * fsz])).collect()));
+        }
         let (z, vt) = venc.as_ref().expect("encoder loaded").encode(&px[start * fsz..(start + got) * fsz], got, h, w, &mut || ctl.check())?;
         ctl.say(format!("keyframe: motion guide, last {got} frames of {} ({vt} latent frames) at frame {index}", p.display()));
         kfs.push(KeyframeIn { frame_index: index, video: Some((z, vt)), audio: None });
@@ -1049,7 +1074,7 @@ fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frame
             None => kfs.push(KeyframeIn { frame_index: 0, video: None, audio: Some((fit, at)) }),
         }
     }
-    Ok((kfs, pictures.into_inner()))
+    Ok((kfs, pictures.into_inner(), anchor))
 }
 
 /// A video's frames at the model's 24 fps fitted to `n` (the last repeated when it is shorter), at the clip's size
@@ -1244,8 +1269,19 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     if let Some(a) = c.inputs.cond_noise_aug {
         cond.visual_aug = a;
     }
-    let (keyframes, kf_pictures) = clip_keyframes(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), ctl)?;
+    let (keyframes, kf_pictures, guide_luma) = clip_keyframes(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), ctl)?;
     cond.keyframes = keyframes;
+    // the exposure fix's anchor: the guide's frames' luma, else the request's, else the first picture's
+    let exposure = c.inputs.exposure_fix.map(|o| {
+        let first = c.inputs.first_frame.is_some().then(|| kf_pictures.first().map(|f| crate::media::luma(&f.frames[0]))).flatten();
+        let (anchor_at, anchor) = match (guide_luma, o.target.or(first)) {
+            (Some(g), _) => g,
+            (None, Some(l)) => (0, vec![l]),
+            (None, None) => (0, Vec::new()),
+        };
+        ctl.say(format!("exposure: fix on - lift {:.1}, ease {} frames, anchor {} frame(s) at {anchor_at}", o.offset, o.ease, anchor.len()));
+        crate::exposure::Exposure { offset: o.offset, ease: o.ease, anchor, anchor_at }
+    });
     let (mut pieces, refs) = clip_refs(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), ctl)?;
     cond.refs = refs;
     if pieces.is_empty() && c.inputs.te_pictures && !kf_pictures.is_empty() {
@@ -1385,7 +1421,7 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
             ("samples.audio".to_string(), (vec![1, 32, 2, shape.audio_t], a.clone())),
         ]), &BTreeMap::new())?;
     }
-    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video: v, t: shape.t, h: shape.h, w: shape.w, audio: Some((a, shape.audio_t)) }, &c.vaes, Some(out), None, Some(out), ctl)?;
+    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video: v, t: shape.t, h: shape.h, w: shape.w, audio: Some((a, shape.audio_t)) }, &c.vaes, Some(out), None, Some(out), exposure.as_ref(), ctl)?;
     if let Some((p, start)) = c.inputs.soundtrack {
         // the clip carries the song itself, not the audio decoder's rendering of it
         crate::media::mux_sound(out, p, start, frames as f64 / 24.0)?;
@@ -1540,6 +1576,11 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     },
                     first_audio: s("first_audio").map(|p| (Path::new(p), n("first_audio_s").unwrap_or(1.0))),
                     soundtrack: s("soundtrack").filter(|p| !p.is_empty()).map(|p| (Path::new(p), n("soundtrack_start").unwrap_or(0.0).max(0.0))),
+                    exposure_fix: spec.get("exposure_fix").and_then(Value::as_bool).filter(|b| *b).map(|_| ExposureOpts {
+                        offset: n("exposure_offset").unwrap_or(2.3) as f32,
+                        ease: n("exposure_ease").unwrap_or(24.0).max(0.0) as usize,
+                        target: n("exposure_target").map(|v| (v / 255.0) as f32),
+                    }),
                     cond_noise_aug: n("cond_noise_aug").map(|v| v as f32),
                     shift: match (n("shift_video"), n("shift_audio")) {
                         (None, None) => None,

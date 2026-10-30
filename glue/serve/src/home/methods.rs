@@ -2050,6 +2050,21 @@ pub struct VideoGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0, default = 0)]
     pub soundtrack_start: Option<f64>,
+    /// true: fix the clip's exposure after the decode - every frame lifted by exposure_offset (the decoder darkens), a guide_clip's frames matched to the guide's own luma, and the frames after it eased over exposure_ease frames from the guide's last luma to the clip's steady level (the flash that follows a cut). Off by default; a request without it is unchanged. The report carries luma_before and luma_after per frame under exposure
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_fix: Option<bool>,
+    /// with exposure_fix: luma (0-255) added to every frame (default 2.3)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0, max = 20, default = 2.3)]
+    pub exposure_offset: Option<f64>,
+    /// with exposure_fix: frames after the guide over which the luma eases to the steady level (default 24; 0: only the guide's own frames are matched)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0, max = 240, default = 24)]
+    pub exposure_ease: Option<i64>,
+    /// with exposure_fix and no guide_clip: the luma (0-255) the clip's first frame should have (default: the first_frame picture's)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0, max = 255)]
+    pub exposure_target: Option<f64>,
     /// anchor or file: the clip starts on this picture / clip's last frame
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_frame: Option<String>,

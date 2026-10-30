@@ -201,7 +201,7 @@ fn ignored_keys() -> Vec<String> {
 
 pub fn inputs_of(quant: &str) -> Value {
     let common = ["prompt", "seconds", "frames", "steps", "seed", "width", "height", "te", "first_frame", "last_frame", "exposure_ref", "guide_clip",
-                  "first_audio", "first_audio_s", "soundtrack", "soundtrack_start", "ref_audios", "loras", "upscale", "upscaler", "shift_video", "shift_audio", "sampler", "schedule", "chain", "source", "regen", "regen_box"];
+                  "first_audio", "first_audio_s", "soundtrack", "soundtrack_start", "exposure_fix", "exposure_offset", "exposure_ease", "exposure_target", "ref_audios", "loras", "upscale", "upscaler", "shift_video", "shift_audio", "sampler", "schedule", "chain", "source", "regen", "regen_box"];
     if quant == "REF2VA" {
         json!({"takes": common.iter().chain(["ref_images", "ref_videos", "ref_image_size", "ref_video_sound", "te_pictures"].iter()).collect::<Vec<_>>(),
                "not": ["control_video", "control_mask", "control_source", "control_strength", "control_start", "control_end"],
@@ -444,6 +444,17 @@ impl Studio {
             None => {
                 it.insert("soundtrack".into(), Value::Null);
                 it.insert("soundtrack_start".into(), Value::Null);
+            }
+        }
+        // the exposure fix after the decode: off unless asked for; its settings only with it
+        if p.get("exposure_fix").and_then(|v| v.as_bool()) == Some(true) {
+            it.insert("exposure_fix".into(), json!(true));
+            it.insert("exposure_offset".into(), num(p, "exposure_offset", 2.3, 0.0, 20.0, false)?);
+            it.insert("exposure_ease".into(), num(p, "exposure_ease", 24.0, 0.0, 240.0, true)?);
+            it.insert("exposure_target".into(), if p.get("exposure_target").is_some_and(|v| !v.is_null()) { num(p, "exposure_target", 0.0, 0.0, 255.0, false)? } else { Value::Null });
+        } else {
+            for k in ["exposure_fix", "exposure_offset", "exposure_ease", "exposure_target"] {
+                it.insert(k.into(), Value::Null);
             }
         }
         if !it["control_video"].is_null() || !it["control_mask"].is_null() {

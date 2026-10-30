@@ -1585,6 +1585,28 @@ export interface VideoGenerateReq {
    * @default 0
    */
   soundtrack_start?: number | null;
+  /** true: fix the clip's exposure after the decode - every frame lifted by exposure_offset (the decoder darkens), a guide_clip's frames matched to the guide's own luma, and the frames after it eased over exposure_ease frames from the guide's last luma to the clip's steady level (the flash that follows a cut). Off by default; a request without it is unchanged. The report carries luma_before and luma_after per frame under exposure */
+  exposure_fix?: boolean | null;
+  /**
+   * with exposure_fix: luma (0-255) added to every frame (default 2.3)
+   * @minimum 0
+   * @maximum 20
+   * @default 2.3
+   */
+  exposure_offset?: number | null;
+  /**
+   * with exposure_fix: frames after the guide over which the luma eases to the steady level (default 24; 0: only the guide's own frames are matched)
+   * @minimum 0
+   * @maximum 240
+   * @default 24
+   */
+  exposure_ease?: number | null;
+  /**
+   * with exposure_fix and no guide_clip: the luma (0-255) the clip's first frame should have (default: the first_frame picture's)
+   * @minimum 0
+   * @maximum 255
+   */
+  exposure_target?: number | null;
   /** anchor or file: the clip starts on this picture / clip's last frame */
   first_frame?: string | null;
   /**
