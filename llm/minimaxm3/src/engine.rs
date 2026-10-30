@@ -2534,15 +2534,49 @@ impl<'g> MiniMax<'g> {
         if let Some(gs) = &self.guesser {
             gs.take(); // the last token's guesses for its last layers
         }
-        let c = self.g.n_embd as usize;
         let p0 = s.pos;
         let pass_t0 = Instant::now();
         let c0 = (self.counts.vram.load(Relaxed), self.counts.pinned.load(Relaxed), self.counts.file.load(Relaxed));
-        let mut x = self.embed(&self.cards[0], tokens)?;
-        let mut grave: Vec<DevBuf> = Vec::new();
+        let x = self.embed(&self.cards[0], tokens)?;
         tap("inp_embd", &x)?;
-        let mut cur = 0usize;
-        for (l, ly) in self.layers.iter().enumerate() {
+        let (x, grave) = self.run_layers(s, x, t, p0, 0..self.layers.len(), &mut *tap)?;
+        let all = self.head_rows(&x, t, n_out, &mut *tap)?;
+        drop(grave);
+        if self.pf && t == 1 {
+            let mut p = self.pf_tokens.lock().unwrap();
+            p.0 += 1;
+            p.1 += pass_t0.elapsed().as_secs_f64();
+        }
+        if let (Some(f), 1) = (&self.toklog, t) {
+            use std::io::Write;
+            let _ = writeln!(f.lock().unwrap(), "{:.2} {} {} {}", pass_t0.elapsed().as_secs_f64() * 1e3, self.counts.vram.load(Relaxed) - c0.0, self.counts.pinned.load(Relaxed) - c0.1, self.counts.file.load(Relaxed) - c0.2);
+        }
+        s.pos += t;
+        s.last_rows = t;
+        let v = self.head.rows;
+        Ok((0..n_out).map(|i| all[i * v..(i + 1) * v].to_vec()).collect())
+    }
+
+    /// The head for the last `n_out` rows of the hidden state `x` (on the last card)
+    fn head_rows(&self, x: &DevBuf, t: usize, n_out: usize, tap: Tap) -> Result<Vec<f32>> {
+        let c = self.g.n_embd as usize;
+        let cd = self.cards.last().unwrap();
+        let xr = x.view((t - n_out) * c * 4, n_out * c * 4)?;
+        let xn = DevBuf::f32(&cd.gpu, n_out * c)?;
+        self.rms(cd, &xr, &self.out_norm, &xn, n_out, c)?;
+        tap("result_norm", &xn)?;
+        let logits = DevBuf::f32(&cd.gpu, n_out * self.head.rows)?;
+        self.matmul(cd, &self.head, &xn, n_out, &logits)?;
+        tap("result_output", &logits)?;
+        logits.to_f32()
+    }
+
+    /// The layers of `range` on the hidden state `x`; the states the queue may still read come back with the result (freed after the pass)
+    fn run_layers(&self, s: &Session, mut x: DevBuf, t: usize, p0: usize, range: std::ops::Range<usize>, tap: Tap) -> Result<(DevBuf, Vec<DevBuf>)> {
+        let c = self.g.n_embd as usize;
+        let mut grave: Vec<DevBuf> = Vec::new();
+        let mut cur = self.owner[range.start];
+        for (l, ly) in self.layers.iter().enumerate().take(range.end).skip(range.start) {
             let ci = self.owner[l];
             let cd = &self.cards[ci];
             if ci != cur {
@@ -2630,30 +2664,78 @@ impl<'g> MiniMax<'g> {
                 }
             }
         }
-        // the head, for the last n_out rows
-        let cd = self.cards.last().unwrap();
-        let xr = x.view((t - n_out) * c * 4, n_out * c * 4)?;
-        let xn = DevBuf::f32(&cd.gpu, n_out * c)?;
-        self.rms(cd, &xr, &self.out_norm, &xn, n_out, c)?;
-        tap("result_norm", &xn)?;
-        let logits = DevBuf::f32(&cd.gpu, n_out * self.head.rows)?;
-        self.matmul(cd, &self.head, &xn, n_out, &logits)?;
-        tap("result_output", &logits)?;
-        let all = logits.to_f32()?;
-        drop(grave);
-        if self.pf && t == 1 {
-            let mut p = self.pf_tokens.lock().unwrap();
-            p.0 += 1;
-            p.1 += pass_t0.elapsed().as_secs_f64();
+        Ok((x, grave))
+    }
+
+    /// A long prompt with the two cards working at once: the first card's layers on a chunk while the second card has the chunk before (the host carries the hidden
+    /// states between them; each card's chunks stay in order, so its caches fill as in the plain loop). NS_MM31_PIPE=0: chunk after chunk. The stage's taps are not called.
+    fn feed_pipe(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync)) -> Result<(usize, Vec<f32>)> {
+        let _w = self.work.lock().unwrap();
+        let split = self.cards[0].layers.end;
+        let n = self.layers.len();
+        let c = self.g.n_embd as usize;
+        let chunk = prefill_chunk();
+        if s.pos + tokens.len() > s.max_ctx {
+            return Err(e(format!("the context is full ({} of {})", s.pos + tokens.len(), s.max_ctx)));
         }
-        if let (Some(f), 1) = (&self.toklog, t) {
-            use std::io::Write;
-            let _ = writeln!(f.lock().unwrap(), "{:.2} {} {} {}", pass_t0.elapsed().as_secs_f64() * 1e3, self.counts.vram.load(Relaxed) - c0.0, self.counts.pinned.load(Relaxed) - c0.1, self.counts.file.load(Relaxed) - c0.2);
-        }
-        s.pos += t;
-        s.last_rows = t;
-        let v = self.head.rows;
-        Ok((0..n_out).map(|i| all[i * v..(i + 1) * v].to_vec()).collect())
+        self.cur_wide.store(true, Relaxed);
+        let start = s.pos;
+        let sess: &Session = s;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<f32>, usize, usize)>(1);
+        let (done, logits, last) = std::thread::scope(|sc| -> Result<(usize, Vec<f32>, usize)> {
+            let first = sc.spawn(move || -> Result<()> {
+                let mut none = |_: &str, _: &DevBuf| -> nextsycl_core::Result<()> { Ok(()) };
+                let mut done = 0usize;
+                for ch in tokens.chunks(chunk) {
+                    if done > 0 && stop(done) {
+                        break;
+                    }
+                    let x = self.embed(&self.cards[0], ch)?;
+                    let (x, grave) = self.run_layers(sess, x, ch.len(), start + done, 0..split, &mut none)?;
+                    let h = x.to_f32()?;
+                    drop(grave);
+                    if tx.send((h, ch.len(), start + done)).is_err() {
+                        break;
+                    }
+                    done += ch.len();
+                }
+                Ok(())
+            });
+            let mut none = |_: &str, _: &DevBuf| -> nextsycl_core::Result<()> { Ok(()) };
+            let cd = &self.cards[1];
+            let (mut done, mut logits, mut last) = (0usize, Vec::new(), 0usize);
+            let mut res: Result<()> = Ok(());
+            for (h, t, p0) in rx.iter() {
+                let step = (|| -> Result<Vec<f32>> {
+                    let nx = DevBuf::f32(&cd.gpu, t * c)?;
+                    // SAFETY: plain floats viewed as their bytes.
+                    nx.write(0, unsafe { std::slice::from_raw_parts(h.as_ptr().cast::<u8>(), h.len() * 4) })?;
+                    let (x, grave) = self.run_layers(sess, nx, t, p0, split..n, &mut none)?;
+                    let r = self.head_rows(&x, t, 1, &mut none)?;
+                    drop(grave);
+                    Ok(r)
+                })();
+                match step {
+                    Ok(r) => {
+                        logits = r;
+                        done += t;
+                        last = t;
+                    }
+                    Err(x) => {
+                        res = Err(x);
+                        break;
+                    }
+                }
+            }
+            // the receiver goes first, so a first card blocked on a send after an error ends too
+            drop(rx);
+            first.join().unwrap_or_else(|_| Err(e("the first card's thread panicked")))?;
+            res?;
+            Ok((done, logits, last))
+        })?;
+        s.pos = start + done;
+        s.last_rows = last;
+        Ok((done, logits))
     }
 
     pub fn session(&self, max_ctx: usize) -> Result<Session> {
@@ -2711,6 +2793,10 @@ impl<'g> MiniMax<'g> {
     }
 
     pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
+        // NS_MM31_PIPE=0: the chunks one after the other (with the stages' taps, for `check` with a small chunk)
+        if self.cards.len() == 2 && tokens.len() > prefill_chunk() && std::env::var("NS_MM31_PIPE").map_or(true, |v| v != "0") {
+            return self.feed_pipe(s, tokens, stop);
+        }
         let mut logits = Vec::new();
         let mut done = 0;
         for c in tokens.chunks(prefill_chunk()) {
