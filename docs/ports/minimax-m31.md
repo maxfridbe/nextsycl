@@ -436,6 +436,21 @@ Per GiB: pinned 32 -> 40 gives 0.4 ms a GiB; the warm tier 0.25 ms (14.5 GiB: 3.
 | pinned | 39 GiB of experts + 1.04 GiB of staging, 40.0 GiB |
 | host, without reclaimable cache | MemTotal less the lowest MemAvailable: 62,864 - 16,392 = 46,472 MiB, 45.4 GiB for the whole box, of which about 3 GiB with production idle |
 
+### Round 6: the draft and pinned-only guesses, again (seed profile, interleaved, greedy, 300 tokens, no second drive)
+
+| prompt | none pp / tg (3 runs each) | draft, 6 tokens, confidence 0.8, pp / tg | accepted |
+|---|---|---|---|
+| 2K | 254.9 / 13.95 | 243.7 / 14.25 | 125 of 138 |
+| 8K | 417.8 / 11.89 | 395.6 / 13.20 | 179 of 189 |
+| code, 190 tokens | 58.2 / 12.48 | 55.0 / 13.76 | 163 of 173 |
+| 31K (1 run) | 330.1 / 11.22 | 325.1 / 13.34 | 175 of 178 |
+
+One draft a step loses: 2K tg 13.3, code tg 12.0 (before the reserve below). The text is the same in every run of a prompt. Spreads are about 0.03 tg. So the draft at 6 / 0.8 gains tg 2% at 2K and 10-19% beyond, costs pp 1.5-5% and about 2.0 GiB of B70 experts plus a 2 GB file. It is not on by default: `NS_MM31_DRAFT` stays unset, and the card does not name the file. Not run through a server or with two sessions.
+
+The first set (without the reserve) peaked at 31,716 MiB on the B70, about 1,050 free, under the 1.5 GiB floor: 2K tg 14.52, 8K tg 13.50, code tg 13.9. The sizing now keeps 700 MiB more on the last card with a draft: at most 30,989 MiB, 1,779 free. Those are the numbers in the table.
+
+Guesses that only copy pinned experts (`NS_MM31_AHEAD=3`, `NS_MM31_AHEAD_READS=0`): pinned swaps a token 17.7 -> 9.4 and fixed text 67.8 -> 71.7 ms, tg 13.94 -> 13.15; with 4 empty places (`NS_MM31_FREE=4`) 75.0 ms, tg 12.55. The routers' memory takes VRAM hits back (206.7 -> 214.8 hits a token is only part of it), and the second read-back and host work cost more than the copies saved. Off.
+
 ### Through the front door
 
 A private `serve` from the build copy (own port, registry and config) with production idle, 8K context:
