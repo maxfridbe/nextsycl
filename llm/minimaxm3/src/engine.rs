@@ -104,6 +104,12 @@ fn kcopy_on() -> bool {
     *N.get_or_init(|| std::env::var("NS_MM31_KCOPY").map_or(true, |v| v != "0"))
 }
 
+/// NS_MM31_DECODE_CACHE=1: decode's reads of experts outside the warm tier through the page cache too (they fill the free memory and wake reclaim)
+fn decode_cached() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("NS_MM31_DECODE_CACHE").is_ok_and(|v| v == "1"))
+}
+
 /// NS_MM31_SILO_HALF=0: a prompt pass's experts dequantize to half on the shared kernel, not the silo's
 fn no_silo_half() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -122,6 +128,9 @@ fn copy_lane() -> i32 {
 
 /// The scratch of decode passes (rows < 8)
 const DECODE_ARENA: usize = 192 << 20;
+
+/// Pinned host memory for experts by default, at most
+const PIN_DEFAULT_GIB: usize = 40;
 
 /// Reads in flight while a card's experts are placed at load
 const LOAD_THREADS: usize = 12;
@@ -1253,7 +1262,8 @@ impl<'g> MiniMax<'g> {
         let host_total = match env_f64("NS_MM31_PIN_GIB").or(o.mirror_bytes.map(|b| b as f64 / GIB as f64)) {
             Some(v) => (v * GIB as f64) as usize,
             // what is available less 16 GiB for the system, the page cache and the other programs, at most 32 GiB
-            None => mem_available().saturating_sub(16 * GIB + ncard * stage_bytes).min(32 * GIB),
+            // 40 GiB: the sweep's last clean step (44) backed off one; see docs/ports/minimax-m31.md. Less when production holds memory: 16 GiB stay available at load
+            None => mem_available().saturating_sub(16 * GIB + ncard * stage_bytes).min(PIN_DEFAULT_GIB * GIB),
         };
         // pinned memory in proportion to what the cards cannot hold in VRAM
         let short: Vec<usize> = exp_bytes.iter().zip(&vram_left).map(|(a, b)| a.saturating_sub(*b)).collect();
@@ -2551,7 +2561,7 @@ impl<'g> MiniMax<'g> {
                 // SAFETY: the ring holds 2 * WAVE slots of `slot` >= an expert's bytes.
                 let dst = unsafe { ring.ptr().cast::<u8>().add(((k % 2) * WAVE + j) * slot) };
                 let mut src = m.src(ex);
-                src.cached |= t < 8;
+                src.cached |= t < 8 && decode_cached();
                 hs.extend(spawn_reads(&self.reader, src, dst));
             }
             hs

@@ -35,7 +35,7 @@ pub type ModelResult<T> = std::result::Result<T, Error>;
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "chunk", env: "NS_MM31_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 4096: every pass streams the experts that are off the cards once)", at: At::Load },
     EngineOption { name: "vram-gib", env: "NS_MM31_VRAM_GIB", value: "GIB", help: "VRAM a card may fill with kept experts (default: what is free after the arena, the sessions' caches and a spare)", at: At::Load },
-    EngineOption { name: "pin-gib", env: "NS_MM31_PIN_GIB", value: "GIB", help: "pinned host memory, in all, for more kept experts (default: what is available less 16, at most 32)", at: At::Load },
+    EngineOption { name: "pin-gib", env: "NS_MM31_PIN_GIB", value: "GIB", help: "pinned host memory, in all, for more kept experts (default: what is available less 16, at most 40)", at: At::Load },
     EngineOption { name: "split", env: "NS_MM31_SPLIT", value: "LAYERS", help: "with two GPUs, the layers on the first, the B65 unless NS_MM31_ORDER=asis (default: 40%)", at: At::Load },
     EngineOption { name: "direct", env: "NS_MM31_DIRECT", value: "0|1", help: "1: O_DIRECT all the time; 0: never; default: at load, then through the page cache", at: At::Load },
     EngineOption { name: "splitread", env: "NS_MM31_SPLITREAD", value: "N", help: "pieces an expert matrix is read in at once, each its own request (default 8)", at: At::Load },

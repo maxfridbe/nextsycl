@@ -298,9 +298,9 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_MM31_CHUNK` | 4096 | The minimaxm3 engine's prompt pass rows: every pass reads the experts that are off the cards once, so a wider pass reads less per token (--opt-chunk) | llm:minimaxm3 |
 | `NS_MM31_SPARSE_ALL` | 0 | 1: the minimaxm3 engine's first three layers take the sparse-attention indexer too (the model config says every layer is sparse; llama.cpp's graph leaves them dense, the reference) (--opt-sparse-all) | llm:minimaxm3 |
 | `NS_MM31_VRAM_GIB` | per card: free VRAM less the 1.5 GiB arena, the sessions' caches (the load's token count x 138 KB) and 2.5 GiB | The minimaxm3 engine's budget, per card, for routed experts kept in VRAM (placed at load, hottest first by the expert profile; the rest are read from the file for each pass) (--opt-vram-gib) | llm:minimaxm3 |
-| `NS_MM31_PIN_GIB` | MemAvailable less 16 GiB, at most 32 (in all, shared by the cards in proportion to what their VRAM cannot hold) | The minimaxm3 engine's budget for routed experts kept in pinned host memory (the kernels read them over PCIe) (--opt-pin-gib) | llm:minimaxm3 |
+| `NS_MM31_PIN_GIB` | MemAvailable less 16 GiB, at most 40 (in all, shared by the cards in proportion to what their VRAM cannot hold) | The minimaxm3 engine's budget for routed experts kept in pinned host memory (the kernels read them over PCIe) (--opt-pin-gib) | llm:minimaxm3 |
 | `NS_MM31_SPLIT` | half the layers | With two GPUs, how many layers the first runs (the minimaxm3 engine's layer split) (--opt-split) | llm:minimaxm3 |
-| `NS_MM31_DIRECT` | unset | `1` = expert reads with O_DIRECT always, `0` = through the page cache always; default: the warm tier and decode through the cache, the rest of load and prompts O_DIRECT (--opt-direct) | llm:minimaxm3 |
+| `NS_MM31_DIRECT` | unset | `1` = expert reads with O_DIRECT always, `0` = through the page cache always; default: the warm tier through the cache, everything else O_DIRECT (--opt-direct) | llm:minimaxm3 |
 | `NS_MM31_SPLITREAD` | 8 | Pieces an expert matrix is read in at once by the minimaxm3 engine (each its own request, one thread each), so a miss reads with several requests in flight (--opt-splitread) | llm:minimaxm3 |
 | `NS_MM31_LANE` | 1 | The copy lane (0 or 1) the minimaxm3 engine copies pinned and file-read experts into VRAM on, beside the compute queue (--opt-lane) | llm:minimaxm3 |
 | `NS_MM31_SPLIT_ATTEND` | 1 | 0: decode passes run the prompt-pass attention kernel instead of the silo's key-split one (--opt-split-attend) | llm:minimaxm3 |
@@ -329,6 +329,7 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_MM31_CACHE_MARGIN_GIB` | 10 | MemAvailable the warm tier leaves | llm:minimaxm3 |
 | `NS_MM31_KEEPALIVE_US` | unset | Experiment: an empty kernel on every card this often, so the GT does not sleep between a token's layers | llm:minimaxm3 |
 | `NS_MM31_CACHE_DROP` | 1 | 0 = at load, what earlier runs left of the model's files stays in the page cache | llm:minimaxm3 |
+| `NS_MM31_DECODE_CACHE` | 0 | 1 = decode's reads of experts outside the warm tier through the page cache too | llm:minimaxm3 |
 | `NS_MM31_SILO_HALF` | 1 | 0 = a prompt pass's matrices dequantize to half on the shared kernel, not the silo's | llm:minimaxm3 |
 | `NS_MM31_HALF_PROJ` | 1 | 0 = a prompt pass's q, k, v, o and shared-expert products in float32, not half (the half GEMM) | llm:minimaxm3 |
 | `NS_MM31_PIPE` | 1 | 0 = a prompt longer than a chunk runs chunk after chunk, with the stages' taps; by default two cards work at once (a chunk on the first while the second has the one before; the taps are not called) | llm:minimaxm3 |
