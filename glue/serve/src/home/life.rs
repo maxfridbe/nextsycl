@@ -13,11 +13,14 @@
 //!   spills into host memory and the box can hang), and answers 503 no_room when it does not come free. Free is what
 //!   every process leaves (the root sampler's gpustat file counts other users'), less what loads started here have
 //!   yet to take.
+//!   A model whose entry or card says `ram_gib` passes the same rule for host memory: MemAvailable less the reclaimable cache the loaded models
+//!   declare (`ram_cache_gib`) must leave its `ram_gib` and RAM_MARGIN_MB; idle holders on any card go for it, else it waits or answers no_room. A model without it: VRAM only.
 //! - GPU work this page does not manage (a test, a benchmark) holds the run lock (crate::gpulock, NS_GPU_LOCK): while
 //!   it is held no model loads - requests are refused with `cards_taken` (503, retryable), jobs wait, the video queue
 //!   pauses (mod.rs video_hold); what is loaded keeps answering.
 //! - video: the daemon (`nextsycl video start`) with the enabled video models as its engines, on their GPUs; its
-//!   workers load per clip and let the card go when idle. No video model enabled: the daemon is stopped.
+//!   workers load per clip and let the card go when idle. No video model enabled: the daemon is stopped. A worker waiting for its card's memory (any card, shared or
+//!   not) has the same room rule applied for it (video_room_loop): idle holders there go, a chat model kept or answering stays, and the worker gives up after VIDEO_ROOM_WAIT_S.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -36,6 +39,65 @@ pub(super) const MARGIN_MB: u64 = 1536;
 /// status saying what for)
 const ROOM_WAIT_S: u64 = 90;
 pub(super) const JOB_ROOM_WAIT_S: u64 = 1800;
+/// Host memory to leave beyond a model's `ram_gib`
+pub(super) const RAM_MARGIN_MB: u64 = 4096;
+
+/// Host memory free for a load, MiB: MemAvailable less the cache the loaded models keep warm (reclaimable, so MemAvailable counts it, but taking it costs them their speed)
+pub(super) fn host_free_mb(available_mb: u64, warm_mb: u64) -> u64 {
+    available_mb.saturating_sub(warm_mb)
+}
+
+/// /proc/meminfo's MemAvailable, MiB
+fn mem_available_mb() -> Option<u64> {
+    let m = std::fs::read_to_string("/proc/meminfo").ok()?;
+    m.lines().find(|l| l.starts_with("MemAvailable:"))?.split_whitespace().nth(1)?.parse::<u64>().ok().map(|kb| kb / 1024)
+}
+
+/// Of the idle holders (already in going-first order), those that must go so `want` is free: none needed, some, or None when even all of them do not make it
+pub(super) fn pick_plan(free: u64, want: u64, idle: Vec<Holder>) -> Option<Vec<Holder>> {
+    let mut got = free;
+    let mut plan = Vec::new();
+    for h in idle {
+        if got >= want {
+            break;
+        }
+        got += h.mb;
+        plan.push(h);
+    }
+    (got >= want).then_some(plan)
+}
+
+/// Whether the chat model loaded may go for room: answering nothing, not changing, kept by nobody (running work never goes; X-Keep-Up-S keeps it until its time is out)
+/// The chat model as the room rule sees it
+#[derive(Debug, PartialEq)]
+pub(super) enum ChatHold {
+    NoModel,
+    Idle(String),
+    /// answering, changing or kept, or something that would say did not answer (`None`: not up yet)
+    Held(Option<String>),
+}
+
+/// `None` for answering or kept: who would say did not answer
+pub(super) fn chat_hold_of(id: String, answering: Option<bool>, changing: bool, kept_here: bool, kept_by_switcher: Option<bool>) -> ChatHold {
+    match (answering, kept_by_switcher) {
+        (Some(a), Some(k)) if chat_may_go(a, changing, kept_here, k) => ChatHold::Idle(id),
+        _ => ChatHold::Held(Some(id)),
+    }
+}
+
+pub(super) fn chat_may_go(answering: bool, changing: bool, kept_here: bool, kept_by_switcher: bool) -> bool {
+    !answering && !changing && !kept_here && !kept_by_switcher
+}
+
+/// The daemon's workers waiting for a card's memory, from its /engine/status: (GPU, MiB they need) - shared or not, the state reads the same
+/// ("waiting for the GPU: 2.4 GiB free, 27.5 GiB needed")
+pub(super) fn waiting_workers(status: &Value) -> Vec<(usize, u64)> {
+    status["gpus"].as_array().into_iter().flatten().filter_map(|g| {
+        let st = g["engine"].as_str()?.strip_prefix("waiting for the GPU: ")?;
+        let need: f64 = st.split(", ").nth(1)?.split_whitespace().next()?.parse().ok()?;
+        Some((g["gpu"].as_u64()? as usize, (need * 1024.0) as u64))
+    }).collect()
+}
 
 
 /// Idle work that holds memory on a card and can go for a model that needs the room
@@ -756,6 +818,10 @@ impl Home {
                 if self.chat_loaded(&self.models()).as_deref() == Some(id) {
                     call_for(&self.target("video"), "POST", "/rpc/llm.mode", Some(&json!({"mode": "none"})), 120)
                         .map_err(|e| (502, format!("the studio's llm.mode: {e}")))?;
+                    // started some other way than the studio's mode: still up, stopped as such
+                    if self.chat_loaded(&self.models()).as_deref() == Some(id) {
+                        return self.exec(format!("llm stop ({id})"), &["llm".into(), "stop".into()]).map(|_| ()).map_err(|e| (500, e));
+                    }
                 }
                 Ok(())
             }
@@ -895,6 +961,10 @@ impl Home {
             }
             return Ok(Err(self.no_room(&cards, &gpus, id, want(gpus[0]))));
         };
+        let ram_plan = match self.ram_room(&cards, id, kind, None) {
+            Ok(p) => p,
+            Err(why) => return Ok(Err(why)),
+        };
         let x = match (empty, idle) {
             (Some(e), _) => e,
             (None, Some(i)) => i,
@@ -907,8 +977,11 @@ impl Home {
         };
         self.stop_slot(kind, x, id)?;
         // an idle model whose kind is busy changing its own server stays: the next try plans again
-        if let Err((_, e)) = self.free(&plan, kind, id) {
+        if let Err((_, e)) = self.free(&plan, kind, id).and_then(|_| self.free(&ram_plan, kind, id)) {
             return Ok(Err(e));
+        }
+        if !self.wait_ram(&cards, id) {
+            return Ok(Err(format!("host memory did not come free for {id}")));
         }
         // the memory let go in a moment; when it does not (or something else took it), no load: the next try plans again
         if !self.wait_room(gpu, want(gpu)) {
@@ -969,15 +1042,19 @@ impl Home {
     /// only (for a second copy, which is no reason to stop a video or chat model). The kind asking is never asked to
     /// free its own kind's chat or video.
     pub(super) fn room_plan(&self, cards: &Value, g: usize, want: u64, asking: &str, light: bool) -> Option<Vec<Holder>> {
-        let c = cards.get(g)?;
-        let free = self.free_mb(cards, g);
+        let free = cards.get(g).map(|_| self.free_mb(cards, g))?;
         if free >= want {
             return Some(Vec::new());
         }
+        pick_plan(free, want, self.idle_on(cards, g, asking, light))
+    }
+
+    /// The idle holders on card `g`, the lightest to bring back first: picture and sound servers, then the video worker, then a chat model
+    fn idle_on(&self, cards: &Value, g: usize, asking: &str, light: bool) -> Vec<Holder> {
         let inflight = |p: u16| self.inflight.lock().unwrap().get(&p).copied().unwrap_or(0);
         let mut idle: Vec<Holder> = Vec::new();
         let mut video_checked = None;
-        for p in c["procs"].as_array().into_iter().flatten() {
+        for p in cards.get(g).and_then(|c| c["procs"].as_array()).into_iter().flatten() {
             let mb = p["vram_mb"].as_u64().unwrap_or(0);
             let model = p["model_id"].as_str().or(p["model"].as_str()).unwrap_or("?").to_string();
             match p["kind"].as_str() {
@@ -1002,18 +1079,92 @@ impl Home {
                 _ => {}
             }
         }
-        // the lightest to bring back first: picture and sound servers, then the video worker, then a chat model
         idle.sort_by_key(|h| (h.order, std::cmp::Reverse(h.mb)));
-        let mut got = free;
-        let mut plan = Vec::new();
-        for h in idle {
-            if got >= want {
-                break;
+        idle
+    }
+
+    /// A model's own host memory, MiB, and the cache it keeps warm (its entry's, else its model card's `ram_gib`, `ram_cache_gib`)
+    fn ram_of(&self, id: &str) -> (Option<u64>, u64) {
+        let all = self.models();
+        let Some(m) = all.iter().find(|m| m["id"] == id) else { return (None, 0) };
+        let cards = self.o.cfg.cards();
+        let card = cards.iter().find(|c| [s(m, "catalog"), s(m, "id")].iter().any(|i| !i.is_empty() && c["id"] == i.as_str()));
+        let f = |k: &str| m[k].as_f64().or_else(|| card.and_then(|c| c[k].as_f64())).filter(|g| *g > 0.0).map(|g| (g * 1024.0) as u64);
+        (f("ram_gib"), f("ram_cache_gib").unwrap_or(0))
+    }
+
+    /// Host memory free for a load now, MiB (None: not known here)
+    fn host_free_now(&self, cards: &Value) -> Option<u64> {
+        let mut seen = std::collections::BTreeSet::new();
+        for p in cards.as_array().into_iter().flatten().flat_map(|c| c["procs"].as_array().into_iter().flatten()) {
+            if let Some(i) = p["model_id"].as_str() {
+                seen.insert(i.to_string());
             }
-            got += h.mb;
-            plan.push(h);
         }
-        (got >= want).then_some(plan)
+        let warm: u64 = seen.iter().map(|i| self.ram_of(i).1).sum();
+        Some(host_free_mb(mem_available_mb()?, warm))
+    }
+
+    /// The host memory rule for `id` (a model with `ram_gib`; none: no rule): what must go (idle holders on any card, their `ram_gib` and warm cache counted), or why it cannot
+    /// load now. `leaving`: the chat model that goes anyway when this one comes.
+    fn ram_room(&self, cards: &Value, id: &str, asking: &str, leaving: Option<&str>) -> Result<Vec<Holder>, String> {
+        let (Some(need), _) = self.ram_of(id) else { return Ok(Vec::new()) };
+        let Some(mut free) = self.host_free_now(cards) else { return Ok(Vec::new()) };
+        if let Some(l) = leaving {
+            let (r, c) = self.ram_of(l);
+            free += r.unwrap_or(0) + c;
+        }
+        let want = need + RAM_MARGIN_MB;
+        if free >= want {
+            return Ok(Vec::new());
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut idle: Vec<Holder> = Vec::new();
+        for g in 0..cards.as_array().map_or(0, |a| a.len()) {
+            for mut h in self.idle_on(cards, g, asking, false) {
+                if !names.insert(h.model.clone()) {
+                    continue;
+                }
+                let (r, c) = self.ram_of(&h.model);
+                h.mb = r.unwrap_or(0) + c;
+                idle.push(h);
+            }
+        }
+        pick_plan(free, want, idle).ok_or_else(|| format!("host memory is held by work that is not idle - {:.1} GiB free; {id} needs ~{:.1} GiB", free as f64 / 1024.0, want as f64 / 1024.0))
+    }
+
+    /// Wait (30 s at most) until the host has `id`'s memory free after holders went
+    fn wait_ram(&self, cards: &Value, id: &str) -> bool {
+        let (Some(need), _) = self.ram_of(id) else { return true };
+        let t0 = Instant::now();
+        loop {
+            if self.host_free_now(cards).is_none_or(|f| f >= need + RAM_MARGIN_MB) {
+                return true;
+            }
+            if t0.elapsed() >= Duration::from_secs(30) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// The same room rule for the video daemon's workers waiting for a card's memory: on any card, however the model there was started. Running forever beside the card sampler.
+    pub(super) fn video_room_loop(&self) {
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            if self.cards_taken().is_some() || !listening(self.o.ports.video) {
+                continue;
+            }
+            let Ok(st) = call_for(&self.target("video"), "GET", "/engine/status", None, 4) else { continue };
+            for (g, need) in waiting_workers(&st) {
+                let cards = self.named_cards(&self.models());
+                if let Some(plan) = self.room_plan(&cards, g, need, "video", false) {
+                    if let Err((_, e)) = self.free(&plan, "video", "a video job") {
+                        eprintln!("video: GPU {g}: {e}");
+                    }
+                }
+            }
+        }
     }
 
     /// Stop the idle holders of a plan (for `id`; the kind `kind` asking holds its own lock; another kind's is tried, and
@@ -1092,22 +1243,37 @@ impl Home {
     /// that sent X-Keep-Up-S (Open WebUI's connection does: 300 s) keeps it that long after it ended, here or through
     /// the switcher (its GET /keep); a request without the header keeps nothing
     fn chat_idle(&self) -> Option<String> {
-        let id = self.chat_loaded(&self.models())?;
-        let v = call_for(&Target::Unix(self.chat_socket()), "GET", "/server/requests", None, 3).ok()?;
-        if v["active"].as_array().is_some_and(|a| !a.is_empty()) || self.chat_mode().1.is_some() {
-            return None;
+        match self.chat_hold() {
+            ChatHold::Idle(id) => Some(id),
+            ChatHold::NoModel | ChatHold::Held(_) => None,
         }
-        if self.chat_keep.lock().unwrap().get(&id).is_some_and(|until| *until > now()) {
-            return None;
+    }
+
+    /// `chat_idle`, telling "no model" from "held": a server or switcher that does not answer counts as held
+    fn chat_hold(&self) -> ChatHold {
+        let Some(id) = self.chat_loaded(&self.models()) else {
+            // one on its way up is somebody's request
+            return if self.chat_mode().1.is_some() { ChatHold::Held(None) } else { ChatHold::NoModel };
+        };
+        let answering = call_for(&Target::Unix(self.chat_socket()), "GET", "/server/requests", None, 3).ok()
+            .map(|v| v["active"].as_array().is_some_and(|a| !a.is_empty()));
+        let kept_here = self.chat_keep.lock().unwrap().get(&id).is_some_and(|until| *until > now());
+        let kept_by_switcher = if listening(self.o.ports.switch) {
+            call_for(&Target::Tcp(format!("127.0.0.1:{}", self.o.ports.switch)), "GET", "/keep", None, 3).ok()
+                .map(|k| k["kept"][id.as_str()].as_f64().is_some_and(|s| s > 0.0))
+        } else {
+            Some(false)
+        };
+        chat_hold_of(id, answering, self.chat_mode().1.is_some(), kept_here, kept_by_switcher)
+    }
+
+    /// `GET /chat/held`, what the video daemon asks before it stops the chat model
+    pub(super) fn chat_held_answer(&self) -> Value {
+        match self.chat_hold() {
+            ChatHold::NoModel => json!({"held": false, "model": null}),
+            ChatHold::Idle(id) => json!({"held": false, "model": id}),
+            ChatHold::Held(id) => json!({"held": true, "model": id}),
         }
-        if listening(self.o.ports.switch) {
-            // the switcher not answering: kept, to be safe
-            let k = call_for(&Target::Tcp(format!("127.0.0.1:{}", self.o.ports.switch)), "GET", "/keep", None, 3).ok()?;
-            if k["kept"][id.as_str()].as_f64().is_some_and(|s| s > 0.0) {
-                return None;
-            }
-        }
-        Some(id)
     }
 
     /// A chat request's keep (X-Keep-Up-S / keep_up_s): `id` kept that long from now
@@ -1147,8 +1313,24 @@ impl Home {
             let want = |g: usize| (need.get(&g).copied().unwrap_or(0) + MARGIN_MB).saturating_sub(chat_on(g));
             let free = |g: usize| self.free_mb(&cards, g);
             let short: Vec<usize> = gpus.iter().copied().filter(|g| free(*g) < want(*g)).collect();
+            let loaded = self.chat_loaded(&all);
+            let ram = self.ram_room(&cards, id, "llm", loaded.as_deref());
             if short.is_empty() {
-                return Ok(());
+                match ram {
+                    Ok(p) if p.is_empty() => return Ok(()),
+                    Ok(p) => {
+                        if self.free(&p, "llm", id).is_ok() && self.wait_ram(&cards, id) {
+                            return Ok(());
+                        }
+                    }
+                    Err(why) => {
+                        if t0.elapsed() > Duration::from_secs(ROOM_WAIT_S) {
+                            return Err((503, format!("{why}; {id} loads once one of them idles out or is stopped")));
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(3));
+                continue;
             }
             let mut freed = false;
             for g in &short {
@@ -1265,6 +1447,7 @@ impl Home {
         for g in gpus {
             args.extend(["--gpu".into(), g.to_string()]);
         }
+        args.extend(["--door".into(), self.o.door.clone()]);
         self.exec(format!("video start ({})", want.join(", ")), &args).map(|_| ())
     }
 }
@@ -1272,6 +1455,59 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chat_holder(mb: u64) -> Holder {
+        Holder { what: Free::Chat("m".into()), mb, model: "m".into(), order: 2 }
+    }
+
+    #[test]
+    fn chat_hold_tells_idle_from_held_and_a_silent_source_is_held() {
+        let h = |a, c, k, s| chat_hold_of("m".into(), a, c, k, s);
+        assert_eq!(h(Some(false), false, false, Some(false)), ChatHold::Idle("m".into()));
+        for held in [h(Some(true), false, false, Some(false)), h(Some(false), true, false, Some(false)), h(Some(false), false, true, Some(false)),
+                     h(Some(false), false, false, Some(true)), h(None, false, false, Some(false)), h(Some(false), false, false, None)] {
+            assert_eq!(held, ChatHold::Held(Some("m".into())));
+        }
+    }
+
+    #[test]
+    fn an_idle_chat_model_goes_for_a_worker_and_a_kept_or_answering_one_stays() {
+        assert!(chat_may_go(false, false, false, false));
+        assert!(!chat_may_go(true, false, false, false), "running work never goes");
+        assert!(!chat_may_go(false, true, false, false), "changing");
+        assert!(!chat_may_go(false, false, true, false), "X-Keep-Up-S through the front door");
+        assert!(!chat_may_go(false, false, false, true), "X-Keep-Up-S through the switcher");
+    }
+
+    #[test]
+    fn a_worker_waiting_on_any_card_is_seen_shared_or_not() {
+        let st = json!({"gpus": [
+            {"gpu": 0, "shared": false, "engine": "waiting for the GPU: 1.6 GiB free, 27.5 GiB needed"},
+            {"gpu": 1, "shared": true, "engine": "waiting for the GPU: 2.0 GiB free, 8.0 GiB needed"},
+        ]});
+        assert_eq!(waiting_workers(&st), vec![(0, 28160), (1, 8192)]);
+        let st = json!({"gpus": [{"gpu": 0, "engine": "loaded"}, {"gpu": 1, "engine": "waiting for the GPU lock (held: x)"}, {"gpu": 2, "engine": "unloaded"}]});
+        assert!(waiting_workers(&st).is_empty(), "the lock's wait and a loaded worker are not this");
+    }
+
+    #[test]
+    fn room_comes_from_idle_holders_or_there_is_none() {
+        assert_eq!(pick_plan(30000, 28000, vec![chat_holder(30000)]).map(|p| p.len()), Some(0), "room without stopping anyone");
+        assert_eq!(pick_plan(1600, 28000, vec![chat_holder(30000)]).map(|p| p.len()), Some(1), "the idle chat model goes");
+        assert!(pick_plan(1600, 28000, vec![]).is_none(), "kept or answering: not in the list, so no room");
+        assert!(pick_plan(1600, 28000, vec![chat_holder(100)]).is_none(), "not enough even with it");
+    }
+
+    #[test]
+    fn host_memory_counts_the_warm_cache_as_taken() {
+        // MemAvailable counts a loaded model's warm cache; a new load must not rely on taking it
+        assert_eq!(host_free_mb(16400, 12700), 3700);
+        assert_eq!(host_free_mb(1000, 12700), 0);
+        // a 42.5 GiB model with the margin does not fit beside it; with the holder's memory back it does
+        let want = (42.5 * 1024.0) as u64 + RAM_MARGIN_MB;
+        assert!(host_free_mb(16400, 12700) < want);
+        assert_eq!(pick_plan(3700, want, vec![chat_holder(43520 + 12700)]).map(|p| p.len()), Some(1));
+    }
 
     #[test]
     fn a_recogniser_transcribes_and_speaks_nothing() {

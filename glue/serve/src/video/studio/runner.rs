@@ -392,6 +392,7 @@ impl Studio {
         out.insert("failure".into(), if failed { failure(state, j["error"].as_str().unwrap_or(""), &log) } else { Value::Null });
         // the card the engine runs it on (while it waits for one: the one it asked for, if any)
         out.insert("gpu".into(), if idle { Value::Null } else { j["gpu"].clone() });
+        out.insert("waiting_for".into(), if idle { Value::Null } else { self.engine_waiting() });
         out.insert("exited".into(), json!(idle));
         out.insert("rc".into(), if idle { json!(if done { 0 } else { 1 }) } else { Value::Null });
         out.insert("elapsed".into(), json!(elapsed as i64));

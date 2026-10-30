@@ -70,7 +70,7 @@ fn door(tag: &str, models: Vec<Value>, cards: Vec<Value>) -> String {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let ports = Ports { llm: 0, switch: 0, image: 0, audio: 0, model3d: 0, image2: 0, audio2: 0, model3d2: 0, video: 0, chat_ui: 0 };
     let cfg = Box::new(Mem { dir: dir.clone(), models: Mutex::new(models), cards });
-    let home = Home::new(Options { wfe: dir.join("wfe"), exe: PathBuf::from("/nonexistent/nextsycl"), ports, serve_host: "127.0.0.1".into(), cfg, idle_minutes: 0 })
+    let home = Home::new(Options { wfe: dir.join("wfe"), exe: PathBuf::from("/nonexistent/nextsycl"), ports, serve_host: "127.0.0.1".into(), door: "127.0.0.1:1".into(), cfg, idle_minutes: 0 })
         .expect("the front door starts");
     let addr = format!("127.0.0.1:{port}");
     let a = addr.clone();

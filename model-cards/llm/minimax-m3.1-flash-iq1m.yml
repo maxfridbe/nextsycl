@@ -6,7 +6,9 @@ arch: minimax-m3
 title: MiniMax-M3.1-Flash UD-IQ1_M (both GPUs)
 about: 'unsloth''s dynamic 1-bit quant of MiniMax-M3.1-Flash (129 GB, 111 GiB of routed experts: IQ1_M / IQ2_XXS gate and up, IQ3_XXS / IQ4_XS down; MiniMax Sparse Attention). The experts do not fit the cards: about 70% of the uses are served from VRAM and pinned host memory, the rest read from the SSD (O_DIRECT, read ahead, an optional second drive). Text only; license minimax-community, read it before serving'
 gpus: all
-vram_gib: 24.0
+vram_gib: 30.5
+ram_gib: 46
+ram_cache_gib: 12.7
 ctx: '32768'
 tools: true
 tasks: true

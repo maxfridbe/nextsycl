@@ -576,6 +576,7 @@ dependencies = [
  "nextsycl-llm-deepseek41",
  "nextsycl-llm-example",
  "nextsycl-llm-glm5next",
+ "nextsycl-llm-minimaxm3",
  "nextsycl-llm-museglimmer",
  "nextsycl-llm-nemotronh",
  "nextsycl-llm-qwen35",
@@ -944,7 +945,10 @@ dependencies = [
 name = "nextsycl-llm-minimaxm3"
 version = "0.0.0"
 dependencies = [
+ "nextsycl-core",
  "nextsycl-gguf",
+ "nextsycl-llm",
+ "nextsycl-tok",
 ]
 
 [[package]]

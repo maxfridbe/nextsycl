@@ -195,6 +195,7 @@ fn daemon(cfg: &Config, args: &[String]) -> Result<(), String> {
         idle: (idle > 0).then(|| std::time::Duration::from_secs(idle as u64)),
         gpu_lock: opt(args, "--gpu-lock").map(PathBuf::from),
         llm_switcher: opt(args, "--llm-switcher").map(str::to_string),
+        door: opt(args, "--door").map(str::to_string),
         threads: opt(args, "--threads").map_or(Ok(8), |v| num(v, "--threads"))?,
     })
     .map_err(|e| e.0)
@@ -219,6 +220,13 @@ fn emit(v: Value) {
 ///
 /// It waits until its card has the room before it loads (never into a card still occupied), keeps the model for the
 /// next jobs, and stops a job only between its steps.
+/// How long a video worker waits for its card's memory (the front door's job limit, JOB_ROOM_WAIT_S)
+const ROOM_WAIT_S: u64 = 1800;
+
+fn room_wait_over(waited_s: u64) -> bool {
+    waited_s > ROOM_WAIT_S
+}
+
 fn worker(cfg: &Config, args: &[String]) -> Result<(), String> {
     use std::io::BufRead;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -268,12 +276,16 @@ fn worker(cfg: &Config, args: &[String]) -> Result<(), String> {
         let g = nextsycl_core::Gpu::open(gpu).map_err(|e| e.0)?;
         let total = g.memory().map_or(u64::MAX, |(t, _)| t);
         let need = (den + (8u64 << 30)).min(total);
+        let t0 = std::time::Instant::now();
         loop {
             if abort.load(Ordering::SeqCst) {
                 return Ok(());
             }
             match g.memory().ok().and_then(|(_, f)| f) {
                 Some(free) if free < need => {
+                    if room_wait_over(t0.elapsed().as_secs()) {
+                        return Err(format!("no_room: GPU {gpu} has {:.1} GiB free, {:.1} GiB needed, after {ROOM_WAIT_S} s: held by work that is not idle or a model kept loaded", gib(free), gib(need)));
+                    }
                     emit(json!({"event": "engine", "state": format!("waiting for the GPU: {:.1} GiB free, {:.1} GiB needed", gib(free), gib(need))}));
                     std::thread::sleep(Duration::from_secs(5));
                 }
@@ -384,5 +396,15 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
             }
         }
         _ => Err(USAGE.into()),
+    }
+}
+
+#[cfg(test)]
+mod room_tests {
+    #[test]
+    fn a_worker_stops_waiting_after_the_limit() {
+        assert!(!super::room_wait_over(0));
+        assert!(!super::room_wait_over(super::ROOM_WAIT_S));
+        assert!(super::room_wait_over(super::ROOM_WAIT_S + 1));
     }
 }

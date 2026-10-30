@@ -298,9 +298,9 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_MM31_CHUNK` | 4096 | The minimaxm3 engine's prompt pass rows: every pass reads the experts that are off the cards once, so a wider pass reads less per token (--opt-chunk) | llm:minimaxm3 |
 | `NS_MM31_SPARSE_ALL` | 0 | 1: the minimaxm3 engine's first three layers take the sparse-attention indexer too (the model config says every layer is sparse; llama.cpp's graph leaves them dense, the reference) (--opt-sparse-all) | llm:minimaxm3 |
 | `NS_MM31_VRAM_GIB` | per card: free VRAM less the 1.5 GiB arena, the sessions' caches (the load's token count x 138 KB) and 2.5 GiB | The minimaxm3 engine's budget, per card, for routed experts kept in VRAM (placed at load, hottest first by the expert profile; the rest are read from the file for each pass) (--opt-vram-gib) | llm:minimaxm3 |
-| `NS_MM31_PIN_GIB` | MemAvailable less 16 GiB, at most 32 (in all, shared by the cards in proportion to what their VRAM cannot hold) | The minimaxm3 engine's budget for routed experts kept in pinned host memory (the kernels read them over PCIe) (--opt-pin-gib) | llm:minimaxm3 |
+| `NS_MM31_PIN_GIB` | MemAvailable less 16 GiB, at most 40 (in all, shared by the cards in proportion to what their VRAM cannot hold) | The minimaxm3 engine's budget for routed experts kept in pinned host memory (the kernels read them over PCIe) (--opt-pin-gib) | llm:minimaxm3 |
 | `NS_MM31_SPLIT` | half the layers | With two GPUs, how many layers the first runs (the minimaxm3 engine's layer split) (--opt-split) | llm:minimaxm3 |
-| `NS_MM31_DIRECT` | 1 | 0: the minimaxm3 engine reads experts from the file through the page cache; 1: with O_DIRECT, many reads in flight (--opt-direct) | llm:minimaxm3 |
+| `NS_MM31_DIRECT` | unset | `1` = expert reads with O_DIRECT always, `0` = through the page cache always; default: the warm tier through the cache, everything else O_DIRECT (--opt-direct) | llm:minimaxm3 |
 | `NS_MM31_SPLITREAD` | 8 | Pieces an expert matrix is read in at once by the minimaxm3 engine (each its own request, one thread each), so a miss reads with several requests in flight (--opt-splitread) | llm:minimaxm3 |
 | `NS_MM31_LANE` | 1 | The copy lane (0 or 1) the minimaxm3 engine copies pinned and file-read experts into VRAM on, beside the compute queue (--opt-lane) | llm:minimaxm3 |
 | `NS_MM31_SPLIT_ATTEND` | 1 | 0: decode passes run the prompt-pass attention kernel instead of the silo's key-split one (--opt-split-attend) | llm:minimaxm3 |
@@ -309,9 +309,34 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_MM3S_KU` | 1 | Debug: blocks of a row the minimaxm3 silo's expert products decode before multiplying (1 or 2) | llm:minimaxm3 |
 | `NS_MM31_DYNAMIC` | 1 | 0: the minimaxm3 engine keeps the experts where the load put them; by default decode passes keep the most recently used experts of each layer in VRAM and the next in pinned memory (the used ones swap into VRAM, copied on the copy lanes) | llm:minimaxm3 |
 | `NS_MM31_TRACE` | unset | Debug: a file the minimaxm3 engine writes one line a layer of every one-token pass to ("layer expert expert ..."), for cache studies | llm:minimaxm3 |
-| `NS_MM31_AHEAD` | 3 | Decode: how many experts of the next layer the minimaxm3 engine guesses (that layer's router on this layer's residual stream) and starts reading while this layer computes; 0 = none, at most 12 (--opt-ahead) | llm:minimaxm3 |
-| `NS_MM31_STREAM_DIR` | unset | A directory on another drive for the minimaxm3 engine: a copy of a share of the experts the cards do not keep is written there once (`mm31-stream-<hash>.bin`, ~17 GiB) and read beside the model's own file, so the misses of a pass come from two drives at once (--opt-stream-dir) | llm:minimaxm3 |
-| `NS_MM31_STREAM_SHARE` | 50 | With `NS_MM31_STREAM_DIR`, the percentage of the off-card experts read from that drive (--opt-stream-share) | llm:minimaxm3 |
+| `NS_MM31_AHEAD` | 0 | Decode: how many experts of each layer ahead the minimaxm3 engine guesses (their routers on the CPU, in a thread, on this layer's residual stream) and starts reading or copying while this layer computes; 0 = none (measured the fastest: tg 9.93 against 9.71 at 3, 300 tokens), at most 12 (--opt-ahead) | llm:minimaxm3 |
+| `NS_MM31_AHEAD_LAYERS` | 2 | Decode: how many layers ahead the minimaxm3 engine guesses the routing of (at most 16; 0 = none, and the routers stay off the host) | llm:minimaxm3 |
+| `NS_MM31_PRECOPY` | 1 | Decode: 0 = a guessed expert in pinned memory waits for its layer instead of being copied into an empty VRAM place ahead | llm:minimaxm3 |
+| `NS_MM31_FREE` | 2 | Decode: empty VRAM places the minimaxm3 engine keeps per layer (1 to 8): a pinned or read expert lands there in one copy, the least recently used are demoted beside the compute | llm:minimaxm3 |
+| `NS_MM31_FUSE1` | 1 | 0 = one-token passes run the separate launches, not the silo's fused attention steps | llm:minimaxm3 |
+| `NS_MM31_ATTX` | 1 | 0 = a prompt pass's attention on the silo's vector-unit kernel, not its XMX one (half queries) | llm:minimaxm3 |
+| `NS_MM31_KBENCH` | 0 | Debug: 1 = at the first session, each decode kernel timed alone on real weights on each card (GB/s) | llm:minimaxm3 |
+| `NS_MM31_BELL` | 1 | 0 = one token's router result comes back by a blocking read, not through a doorbell in pinned memory with the shared expert queued behind it | llm:minimaxm3 |
+| `NS_MM31_ORDER` | unset | `asis` = two cards in the order `--gpu` gives; by default the B65 takes the first layers and the B70 the rest and the head | llm:minimaxm3 |
+| `NS_MM31_SPARE_GIB` | 1.9 | VRAM per card the minimaxm3 engine leaves free besides its arena and session caches when it sizes the experts (at least 1.6) | llm:minimaxm3 |
+| `NS_MM31_EXTRA` | 1 | 0 = the prompt passes' scratch stays allocated in decode, not freed and given to expert places | llm:minimaxm3 |
+| `NS_MM31_DRAFT` | unset | The DSpark drafter's GGUF for the minimaxm3 engine (`dspark-MiniMax-M3.1-Flash-Q8_0.gguf`): drafts verified in the decode pass; unset: no drafts | llm:minimaxm3 |
+| `NS_MM31_DRAFTS` | 1 | Tokens drafted a step (at most 6 and the drafter's block) | llm:minimaxm3 |
+| `NS_MM31_DRAFT_SILU` | 0 | 1 = the drafter's feed-forward as plain SiLU (llama.cpp's checkout), not its metadata's swigluoai | llm:minimaxm3 |
+| `NS_MM31_DRAFT_PMIN` | 0 | Drafts stop at the first the DSpark confidence head rates below this | llm:minimaxm3 |
+| `NS_MM31_KCOPY` | 1 | 0 = the experts' tables through the runtime's memcpy, not a kernel from a pinned ring | llm:minimaxm3 |
+| `NS_MM31_CACHE_GIB` | unset | At most this many GiB of next-ranked experts read once into the page cache at load (0: none; default: what the margin allows) | llm:minimaxm3 |
+| `NS_MM31_CACHE_MARGIN_GIB` | 4 | MemAvailable the warm tier leaves | llm:minimaxm3 |
+| `NS_MM31_KEEPALIVE_US` | unset | Experiment: an empty kernel on every card this often, so the GT does not sleep between a token's layers | llm:minimaxm3 |
+| `NS_MM31_CACHE_DROP` | 1 | 0 = at load, what earlier runs left of the model's files stays in the page cache | llm:minimaxm3 |
+| `NS_MM31_DECODE_CACHE` | 0 | 1 = decode's reads of experts outside the warm tier through the page cache too | llm:minimaxm3 |
+| `NS_MM31_SILO_HALF` | 1 | 0 = a prompt pass's matrices dequantize to half on the shared kernel, not the silo's | llm:minimaxm3 |
+| `NS_MM31_HALF_PROJ` | 1 | 0 = a prompt pass's q, k, v, o and shared-expert products in float32, not half (the half GEMM) | llm:minimaxm3 |
+| `NS_MM31_PIPE` | 1 | 0 = a prompt longer than a chunk runs chunk after chunk, with the stages' taps; by default two cards work at once (a chunk on the first while the second has the one before; the taps are not called) | llm:minimaxm3 |
+| `NS_MM31_TOKLOG` | unset | Debug: a file the minimaxm3 engine writes a line to for every pass of up to 8 rows: milliseconds, experts from VRAM, pinned memory and the file, rows | llm:minimaxm3 |
+| `NS_MM31_STREAM_DIR` | unset | Directories on other drives (a `:` list) for the minimaxm3 engine: a copy of the experts the cards do not keep at load is written to each once (`mm31-stream-<hash>.bin`, ~34 GiB; a copy for another placement in the directory is deleted first) and a read's pieces go round the drives (--opt-stream-dir) | llm:minimaxm3 |
+| `NS_MM31_STREAM_ALL` | 0 | 1 = with `NS_MM31_STREAM_DIR`, every expert, not only those off the cards at load (~111 GiB a drive) | llm:minimaxm3 |
+| `NS_MM31_STREAM_SHARE` | 100 | With `NS_MM31_STREAM_DIR`, the percentage of the off-card experts read from that drive (--opt-stream-share) | llm:minimaxm3 |
 | `NS_MM31_FORCE` | unset | Debug: a llama.cpp dump's directory (`nextsycl llm check`): after each layer the minimaxm3 engine's hidden state is replaced by the dump's `l_out-N`, so every layer is checked on the reference's own input | llm:minimaxm3 |
 | `NS_MM31_FILE` | unset: the test is skipped | the first shard of a MiniMax-M3.1-Flash GGUF: `cargo test -p nextsycl-llm-minimaxm3` checks the file against the model description | test minimaxm3 |
 | `NS_Q3T_EAGER` | 0 | 1: the silo's frame launched kernel by kernel, not replayed as a recorded graph (the A/B for the graph) | audio qwen3tts |

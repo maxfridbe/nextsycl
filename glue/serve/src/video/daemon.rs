@@ -77,7 +77,38 @@ pub struct Options {
     /// A front end's model switcher (`POST {"mode": ...}`, answers `{"result": {"mode": ...}}`): its model is asked
     /// to stop before loading and restored after unloading.
     pub llm_switcher: Option<String>,
+    /// The front door (host:port), when it runs this daemon: its `GET /chat/held` says whether the chat model may be
+    /// stopped. `None` (a daemon on its own): nobody to ask, the switcher is told as it always was.
+    pub door: Option<String>,
     pub threads: usize,
+}
+
+/// The door's word on the chat model: held (answering or kept) unless it says otherwise; a door that does not answer
+/// counts as held, as the door itself treats a switcher that does not answer. No door: not held.
+fn chat_held(door: Option<&str>) -> bool {
+    let Some(door) = door else { return false };
+    match http::call_for(&http::Target::Tcp(door.to_string()), "GET", "/chat/held", None, 15) {
+        Ok(v) => v["held"] != false,
+        Err(e) => {
+            eprintln!("[daemon] the front door does not answer ({e}): the chat model counts as held");
+            true
+        }
+    }
+}
+
+/// The switcher told to stop the chat model, unless it is held: the mode to restore later (`None`: nothing to restore)
+fn stop_chat(door: Option<&str>, switcher: &str) -> std::result::Result<Option<String>, String> {
+    if chat_held(door) {
+        eprintln!("[daemon] the chat model is answering or kept: it stays, the job waits for room");
+        return Ok(None);
+    }
+    let (host, path) = http::split_url(switcher)?;
+    let cur = http::call(&http::Target::Tcp(host.clone()), "POST", &path, Some(&json!({})))?;
+    let mode = cur.pointer("/result/mode").and_then(|m| m.as_str()).unwrap_or("none").to_string();
+    if mode != "none" {
+        http::call(&http::Target::Tcp(host), "POST", &path, Some(&json!({"mode": "none"})))?;
+    }
+    Ok(Some(mode))
 }
 
 /// An engine process and its event stream.
@@ -244,16 +275,10 @@ impl Daemon {
         }
     }
 
-    /// Asks the front end's model to stop; returns the mode to restore later.
+    /// Asks the front end's model to stop, unless the door says it is held; returns the mode to restore later.
     fn switch_llm_off(&self) -> Result<Option<String>> {
         let Some(url) = &self.opts.llm_switcher else { return Ok(None) };
-        let (host, path) = http::split_url(url).map_err(Error)?;
-        let cur = http::call(&http::Target::Tcp(host.clone()), "POST", &path, Some(&json!({}))).map_err(Error)?;
-        let mode = cur.pointer("/result/mode").and_then(|m| m.as_str()).unwrap_or("none").to_string();
-        if mode != "none" {
-            http::call(&http::Target::Tcp(host), "POST", &path, Some(&json!({"mode": "none"}))).map_err(Error)?;
-        }
-        Ok(Some(mode))
+        stop_chat(self.opts.door.as_deref(), url).map_err(Error)
     }
 
     fn restore_llm(&self, mode: &Option<String>) {
@@ -267,7 +292,11 @@ impl Daemon {
         }
     }
 
-    /// The first engine on a shared GPU takes the lock and stops the front end's model.
+    /// The first engine on a shared GPU takes the lock and stops the front end's model - unless that model is
+    /// answering or kept: then it stays and no mode is saved, the worker waits for room like one on any card (the door's
+    /// video_room_loop stops the model when its keep ends; the 30-minute limit and waiting_for are the worker's), and
+    /// nothing reloads afterwards. The lock is taken either way: it keeps the card's other users out, and neither the
+    /// chat side nor its modes read it, so a chat model cannot wait on a job that waits on it.
     fn acquire_hooks(&self, k: usize, cancel: &AtomicBool) -> Result<()> {
         let mut h = self.hooks.lock().unwrap();
         if h.users == 0 {
@@ -898,4 +927,74 @@ fn rss_gib(pid: u32) -> Option<f64> {
     let st = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let kb: f64 = st.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok()?;
     Some(kb / (1024.0 * 1024.0))
+}
+
+#[cfg(test)]
+mod chat_hook_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    /// A one-answer-to-everything server; the requests it was sent
+    fn fake(answer: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let got = seen.clone();
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                let mut b = [0u8; 4096];
+                let mut n = c.read(&mut b).unwrap_or(0);
+                // the body may come after the head
+                std::thread::sleep(Duration::from_millis(20));
+                c.set_nonblocking(true).ok();
+                n += c.read(&mut b[n..]).unwrap_or(0);
+                c.set_nonblocking(false).ok();
+                got.lock().unwrap().push(String::from_utf8_lossy(&b[..n]).to_string());
+                let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}", answer.len());
+            }
+        });
+        (addr, seen)
+    }
+
+    fn closed_port() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    }
+
+    const UP: &str = r#"{"result":{"mode":"chat-a"}}"#;
+
+    #[test]
+    fn held_chat_is_not_told_and_nothing_is_saved() {
+        let (door, _) = fake(r#"{"held":true}"#);
+        let (sw, seen) = fake(UP);
+        assert_eq!(stop_chat(Some(&door), &format!("http://{sw}/rpc/llm.mode")), Ok(None));
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn chat_not_held_is_stopped_and_its_mode_saved() {
+        let (door, _) = fake(r#"{"held":false}"#);
+        let (sw, seen) = fake(UP);
+        assert_eq!(stop_chat(Some(&door), &format!("http://{sw}/rpc/llm.mode")), Ok(Some("chat-a".to_string())));
+        assert!(seen.lock().unwrap().iter().any(|b| b.contains(r#""mode":"none""#)));
+    }
+
+    #[test]
+    fn a_silent_door_counts_as_held() {
+        let (sw, seen) = fake(UP);
+        assert_eq!(stop_chat(Some(&closed_port()), &format!("http://{sw}/rpc/llm.mode")), Ok(None));
+        assert!(seen.lock().unwrap().is_empty());
+        // and an answer that does not say
+        let (door, _) = fake(r#"{}"#);
+        assert!(chat_held(Some(&door)));
+    }
+
+    #[test]
+    fn without_a_door_the_switcher_is_told_as_ever() {
+        let (sw, seen) = fake(UP);
+        assert_eq!(stop_chat(None, &format!("http://{sw}/rpc/llm.mode")), Ok(Some("chat-a".to_string())));
+        assert!(seen.lock().unwrap().iter().any(|b| b.contains(r#""mode":"none""#)));
+    }
 }

@@ -35,15 +35,15 @@ pub type ModelResult<T> = std::result::Result<T, Error>;
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "chunk", env: "NS_MM31_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 4096: every pass streams the experts that are off the cards once)", at: At::Load },
     EngineOption { name: "vram-gib", env: "NS_MM31_VRAM_GIB", value: "GIB", help: "VRAM a card may fill with kept experts (default: what is free after the arena, the sessions' caches and a spare)", at: At::Load },
-    EngineOption { name: "pin-gib", env: "NS_MM31_PIN_GIB", value: "GIB", help: "pinned host memory, in all, for more kept experts (default: what is available less 16, at most 32)", at: At::Load },
-    EngineOption { name: "split", env: "NS_MM31_SPLIT", value: "LAYERS", help: "with two GPUs, the layers on the first (default: half)", at: At::Load },
-    EngineOption { name: "direct", env: "NS_MM31_DIRECT", value: "0|1", help: "read experts from the file with O_DIRECT (default 1; 0: through the page cache)", at: At::Load },
+    EngineOption { name: "pin-gib", env: "NS_MM31_PIN_GIB", value: "GIB", help: "pinned host memory, in all, for more kept experts (default: what is available less 16, at most 40)", at: At::Load },
+    EngineOption { name: "split", env: "NS_MM31_SPLIT", value: "LAYERS", help: "with two GPUs, the layers on the first, the B65 unless NS_MM31_ORDER=asis (default: 40%)", at: At::Load },
+    EngineOption { name: "direct", env: "NS_MM31_DIRECT", value: "0|1", help: "1: O_DIRECT all the time; 0: never; default: at load, then through the page cache", at: At::Load },
     EngineOption { name: "splitread", env: "NS_MM31_SPLITREAD", value: "N", help: "pieces an expert matrix is read in at once, each its own request (default 8)", at: At::Load },
     EngineOption { name: "lane", env: "NS_MM31_LANE", value: "0|1", help: "the copy lane the pinned and file-read experts are copied into VRAM on (default 1)", at: At::Load },
     EngineOption { name: "split-attend", env: "NS_MM31_SPLIT_ATTEND", value: "0|1", help: "0: decode passes use the prompt-pass attention kernel instead of the silo's key-split one", at: At::Load },
     EngineOption { name: "fused", env: "NS_MM31_FUSED", value: "0|1", help: "0: decode experts run as the shared kernels' three products each, not the silo's fused gate+up and down launches", at: At::Load },
     EngineOption { name: "dynamic", env: "NS_MM31_DYNAMIC", value: "0|1", help: "0: the experts stay where the load put them; by default decode keeps each layer's most recently used experts in VRAM and the next in pinned memory", at: At::Load },
-    EngineOption { name: "ahead", env: "NS_MM31_AHEAD", value: "N", help: "decode: experts of the next layer guessed and read ahead (default 3, at most 12; 0 = none)", at: At::Load },
+    EngineOption { name: "ahead", env: "NS_MM31_AHEAD", value: "N", help: "decode: experts of the layers ahead guessed and read ahead (default 0 = none, at most 12)", at: At::Load },
     EngineOption { name: "stream-dir", env: "NS_MM31_STREAM_DIR", value: "DIR", help: "a directory on another drive: a copy of a share of the experts that are off the cards is written there once and read beside the model's file", at: At::Load },
     EngineOption { name: "stream-share", env: "NS_MM31_STREAM_SHARE", value: "PERCENT", help: "with stream-dir, the share of the off-card experts read from that drive (default 50)", at: At::Load },
     EngineOption { name: "sparse-all", env: "NS_MM31_SPARSE_ALL", value: "0|1", help: "the first three layers take the indexer too (default 0: llama.cpp's graph)", at: At::Load },
@@ -85,7 +85,7 @@ impl SessionState for engine::Session {
 
 impl DecoderState for engine::Decoder {
     fn drafts(&self) -> (u64, u64) {
-        (0, 0)
+        (self.drafted, self.accepted)
     }
     fn pending(&mut self) -> Option<u32> {
         engine::Decoder::pending(self)
@@ -128,7 +128,7 @@ impl Engine for engine::MiniMax<'_> {
         self.load_bytes
     }
     fn has_draft(&self) -> bool {
-        false
+        self.draft_count() > 0
     }
     fn prefill_chunk(&self) -> usize {
         engine::prefill_chunk()

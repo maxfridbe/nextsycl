@@ -35,12 +35,38 @@ pub struct Api {
     pub silo_attend_split: Option<SplitFn>,
     /// the silo's expert products for a decode token (moe.cpp)
     pub silo_moe: Option<MoeFns>,
+    /// the silo's fused steps of a decode token (moe.cpp)
+    pub silo_one: Option<OneFns>,
+    /// the silo's decode products on Q8_1 activations (mmvq.cpp)
+    pub silo_q: Option<QFns>,
 }
+
+pub struct QFns {
+    pub supported: unsafe extern "C" fn(c_int, i64) -> c_int,
+    pub split_bytes: unsafe extern "C" fn(i64, i64) -> usize,
+    pub quantize: unsafe extern "C" fn(Gpu, *const f32, *mut c_void, *mut c_void, i64, i64) -> c_int,
+    pub mmvq: unsafe extern "C" fn(Gpu, c_int, *const c_void, *const c_void, *const c_void, *mut f32, i64, i64, i64) -> c_int,
+}
+
+pub struct OneFns {
+    pub mv3: unsafe extern "C" fn(Gpu, c_int, *const c_void, *const c_void, *const c_void, *const f32, *mut f32, *mut f32, *mut f32, i64, i64, i64, i64) -> c_int,
+    pub post: PostFn,
+    pub add_norm: unsafe extern "C" fn(Gpu, *mut f32, *const f32, *const f32, *const f32, *mut f32, i64, f32) -> c_int,
+    pub finish: unsafe extern "C" fn(Gpu, *const f32, i64, *const f32, *const f32, *mut f32, i64) -> c_int,
+    pub to_half: unsafe extern "C" fn(Gpu, c_int, *const c_void, i64, *mut u16) -> c_int,
+    pub doorbell: unsafe extern "C" fn(Gpu, *mut u32, u32) -> c_int,
+    pub kcopy: unsafe extern "C" fn(Gpu, *mut u32, *const u32, i64) -> c_int,
+    pub put_cols: unsafe extern "C" fn(Gpu, *const f32, *mut f32, i64, i64, i64, i64) -> c_int,
+    pub argmax_add: unsafe extern "C" fn(Gpu, *const f32, *const f32, i64, *mut i32) -> c_int,
+    pub attend_block: unsafe extern "C" fn(Gpu, *const f32, *const u16, *const u16, *mut f32, i64, i64, i64, i64, i64, i64, *mut f32) -> c_int,
+}
+
+pub type PostFn = unsafe extern "C" fn(Gpu, *mut f32, *mut f32, *const f32, *mut f32, *mut f32, *const f32, *const f32, *const f32, *const f32, *mut u16, *mut u16, *mut u16, i64, i64, i64, i64, i64, i64, f32, f32) -> c_int;
 
 pub struct MoeFns {
     pub supported: unsafe extern "C" fn(c_int, i64) -> c_int,
-    pub gu: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *mut f32, i64, i64, i64, f32, f32) -> c_int,
-    pub down: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *const f32, *const i32, *mut f32, i64, i64, i64, i64) -> c_int,
+    pub gu: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *const i32, *mut f32, i64, i64, i64, f32, f32) -> c_int,
+    pub down: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *const f32, *const i32, *const i32, *mut f32, i64, i64, i64, i64) -> c_int,
 }
 
 pub type SplitFn = unsafe extern "C" fn(Gpu, *const f32, *const u16, *const u16, *const i32, i64, *mut f32, i64, i64, i64, i64, f32, i64, *mut f32) -> c_int;
@@ -97,13 +123,53 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
                     }
                 })
             }),
+            silo_q: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
+                let (a, b, c, d) = (s.symbol("ns_mm3q_mmvq_supported"), s.symbol("ns_mm3q_q8_split_bytes"), s.symbol("ns_mm3q_quantize_q8"), s.symbol("ns_mm3q_mmvq"));
+                // SAFETY: the symbols are declared in mm3q.h with QFns's signatures.
+                #[allow(clippy::missing_transmute_annotations)]
+                (!a.is_null() && !b.is_null() && !c.is_null() && !d.is_null()).then(|| unsafe {
+                    QFns {
+                        supported: std::mem::transmute::<*mut c_void, _>(a),
+                        split_bytes: std::mem::transmute::<*mut c_void, _>(b),
+                        quantize: std::mem::transmute::<*mut c_void, _>(c),
+                        mmvq: std::mem::transmute::<*mut c_void, _>(d),
+                    }
+                })
+            }),
+            silo_one: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
+                let (a, b, c, d) = (s.symbol("ns_mm3s_mv3"), s.symbol("ns_mm3s_attn_post"), s.symbol("ns_mm3s_add_norm"), s.symbol("ns_mm3s_finish"));
+                let e = s.symbol("ns_mm3s_to_half");
+                let bell = s.symbol("ns_mm3s_doorbell");
+                let kc = s.symbol("ns_mm3s_kcopy");
+                let (pc, am, ab) = (s.symbol("ns_mm3s_put_cols"), s.symbol("ns_mm3s_argmax_add"), s.symbol("ns_mm3s_attend_block"));
+                // SAFETY: the symbols are declared in mm3s.h with OneFns's signatures.
+                #[allow(clippy::missing_transmute_annotations)]
+                (!a.is_null() && !b.is_null() && !c.is_null() && !d.is_null() && !e.is_null() && !bell.is_null() && !kc.is_null() && !pc.is_null() && !am.is_null() && !ab.is_null()).then(|| unsafe {
+                    OneFns {
+                        mv3: std::mem::transmute::<*mut c_void, _>(a),
+                        post: std::mem::transmute::<*mut c_void, _>(b),
+                        add_norm: std::mem::transmute::<*mut c_void, _>(c),
+                        finish: std::mem::transmute::<*mut c_void, _>(d),
+                        to_half: std::mem::transmute::<*mut c_void, _>(e),
+                        doorbell: std::mem::transmute::<*mut c_void, _>(bell),
+                        kcopy: std::mem::transmute::<*mut c_void, _>(kc),
+                        put_cols: std::mem::transmute::<*mut c_void, _>(pc),
+                        argmax_add: std::mem::transmute::<*mut c_void, _>(am),
+                        attend_block: std::mem::transmute::<*mut c_void, _>(ab),
+                    }
+                })
+            }),
             silo_attend_split: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
-                let p = s.symbol("ns_mm3s_attend_split");
+                // NS_MM31_ATTX=0: the vector-unit decode attention, not the XMX one
+                let name = if std::env::var("NS_MM31_ATTX").is_ok_and(|v| v == "0") { "ns_mm3s_attend_split" } else { "ns_mm3s_attend_x_split" };
+                let p = s.symbol(name);
                 // SAFETY: the symbol is declared in mm3s.h with SplitFn's signature.
                 (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, SplitFn>(p) })
             }),
             silo_attend: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
-                let p = s.symbol("ns_mm3s_attend");
+                // NS_MM31_ATTX=0: the vector-unit prompt attention, not the XMX one
+                let name = if std::env::var("NS_MM31_ATTX").is_ok_and(|v| v == "0") { "ns_mm3s_attend" } else { "ns_mm3s_attend_x" };
+                let p = s.symbol(name);
                 // SAFETY: the symbol is declared in mm3s.h with AttendFn's signature.
                 (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, AttendFn>(p) })
             }),

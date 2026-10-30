@@ -207,6 +207,11 @@ impl Studio {
         }
     }
 
+    /// What a job waits for while a worker has no room: the daemon's state for the first such card
+    pub(super) fn engine_waiting(&self) -> Value {
+        http::call(&Target::Unix(self.socket.clone()), "GET", "/engine/status", None).map_or(Value::Null, |v| waiting_of(&v))
+    }
+
     pub fn has_runnable(&self) -> bool {
         let st = self.st.lock().unwrap();
         self.running(&st) || st.q.items.iter().any(|i| !st.q.held(i))
@@ -804,4 +809,24 @@ pub fn run(o: Options) -> http::Result<()> {
         });
     }
     Ok(())
+}
+
+/// The first slot waiting for its card's memory or the lock, in words
+pub(crate) fn waiting_of(status: &Value) -> Value {
+    status["gpus"].as_array().into_iter().flatten().find_map(|g| {
+        let st = g["engine"].as_str().filter(|e| e.starts_with("waiting for"))?;
+        Some(json!(format!("GPU {}: {st}", g["gpu"])))
+    }).unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod waiting_tests {
+    use super::*;
+
+    #[test]
+    fn a_job_says_what_it_waits_for() {
+        let v = json!({"gpus": [{"gpu": 0, "engine": "loaded"}, {"gpu": 1, "engine": "waiting for the GPU: 1.6 GiB free, 27.5 GiB needed"}]});
+        assert_eq!(waiting_of(&v), json!("GPU 1: waiting for the GPU: 1.6 GiB free, 27.5 GiB needed"));
+        assert_eq!(waiting_of(&json!({"gpus": [{"gpu": 0, "engine": "unloaded"}]})), Value::Null);
+    }
 }

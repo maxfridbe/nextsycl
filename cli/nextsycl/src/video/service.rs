@@ -168,6 +168,10 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     if let Some(sw) = cfg.get("NS_VIDEO_LLM_SWITCHER") {
         daemon_args.extend(["--llm-switcher".into(), sw]);
     }
+    // serve says where it is (--door); a daemon started by hand has no door to ask
+    if let Some(door) = super::opt(raw, "--door") {
+        daemon_args.extend(["--door".into(), door.to_string()]);
+    }
     args.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engine's own settings: from the configuration (NSD_*, H3_*), then the --opt-NAMEs
     for (k, v) in cfg.with_prefix("NSD_").into_iter().chain(cfg.with_prefix("H3_")) {

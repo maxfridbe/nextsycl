@@ -102,6 +102,8 @@ pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
         return Err(format!("{}: the page is not built yet (./build.sh wfe)", wfe.display()));
     }
     let idle = opt(args, "--idle-minutes").map(str::to_string).or_else(|| cfg.get("NS_IDLE_MINUTES")).map_or(Ok(10), |v| v.parse::<u64>().map_err(|_| "--idle-minutes N"))?;
+    let host = opt(args, "--host").unwrap_or("0.0.0.0");
+    let port_s = opt(args, "--port").map(str::to_string).or_else(|| cfg.get("NS_SERVE_PORT")).unwrap_or("8000".into());
     let o = Options {
         wfe,
         exe: std::env::current_exe().map_err(|e| e.to_string())?,
@@ -111,11 +113,11 @@ pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
             video: port("NS_VIDEO_PORT", 8090), chat_ui: port("NS_CHAT_UI_PORT", 8080),
         },
         serve_host: opt(args, "--serve-host").unwrap_or("0.0.0.0").to_string(),
+        door: format!("{}:{port_s}", if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host }),
         cfg: Box::new(Store(Config::load())),
         idle_minutes: idle,
     };
-    let addr = format!("{}:{}", opt(args, "--host").unwrap_or("0.0.0.0"), opt(args, "--port").map(str::to_string).or_else(|| cfg.get("NS_SERVE_PORT")).unwrap_or("8000".into()));
-    Home::new(o)?.run(&addr)
+    Home::new(o)?.run(&format!("{host}:{port_s}"))
 }
 
 /// `nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--power-window 15] [--pci ADDR] [--vram-mb N] [--once]`
