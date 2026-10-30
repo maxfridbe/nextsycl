@@ -18,8 +18,36 @@ constexpr int HD = 128;     // values a head
 constexpr int PER = 16;     // query heads a key/value group
 constexpr int TILE = 64;    // keys a step
 constexpr int WG = 256;     // threads a work-group: 16 heads x 16 lanes
+constexpr int SPLIT = 128;  // keys a split (a work-group of the decode kernel)
 constexpr int KS = HD + 1;  // a staged row's stride (floats): odd, so rows do not share a bank
 }  // namespace
+
+// the splits' partial results of every head merged: out = sum_s acc_s e^(m_s - M) / sum_s l_s e^(m_s - M)
+static int combine(ns_gpu* g, float* out, int64_t T, int64_t H, int64_t G, int64_t S, const float* part) {
+    NS_TRY
+    g->q.parallel_for(sycl::nd_range<1>((size_t) (T * H * HD), HD), [=](sycl::nd_item<1> it) {
+        const int64_t grp = it.get_group(0);
+        const int d = (int) it.get_local_id(0);
+        const int64_t t = grp / H, hq = grp % H, gi = hq / PER, hh = hq % PER;
+        const float* base = part + (((t * G + gi) * S) * PER + hh) * (HD + 2);
+        const int64_t stride = (int64_t) PER * (HD + 2);
+        float M = -INFINITY;
+        for (int64_t s = 0; s < S; ++s) M = sycl::fmax(M, base[s * stride]);
+        float L = 0.f, A = 0.f;
+        if (M > -INFINITY) {
+            for (int64_t s = 0; s < S; ++s) {
+                const float ms = base[s * stride];
+                if (ms == -INFINITY) continue;
+                const float w = sycl::exp(ms - M);
+                L += base[s * stride + 1] * w;
+                A += base[s * stride + 2 + d] * w;
+            }
+        }
+        out[(t * H + hq) * HD + d] = L > 0.f ? A / L : 0.f;
+    });
+    return 0;
+    NS_CATCH
+}
 
 extern "C" {
 
@@ -126,6 +154,116 @@ int ns_mm3s_attend(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t
         });
     });
     return 0;
+    NS_CATCH
+}
+
+int ns_mm3s_attend_split(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G,
+                         int64_t pos0, float scale, int64_t S, float* part) {
+    NS_TRY
+    if (!ns_mm3s_attend_supported(H, G, HD)) return ns_fail("ns_mm3s_attend_split: 16 heads a group of 128 values");
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> qs(sycl::range<1>(PER * HD), h);
+        sycl::local_accessor<float, 1> kt(sycl::range<1>(TILE * KS), h);
+        sycl::local_accessor<float, 1> pt(sycl::range<1>(PER * TILE), h);
+        sycl::local_accessor<int32_t, 1> jj(sycl::range<1>(TILE), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) (T * G * S * WG), WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int64_t grp = it.get_group(0);
+            const int tid = (int) it.get_local_id(0);
+            const int64_t sp = grp % S, tg = grp / S;
+            const int64_t t = tg / G, gi = tg % G;
+            const int64_t pos = pos0 + t;
+            const int hh = tid >> 4, l16 = tid & 15;  // this thread's head in the group and lane
+            auto sg = it.get_sub_group();
+            for (int e = tid; e < PER * HD; e += WG) qs[e] = q[(t * H + gi * PER + e / HD) * HD + e % HD];
+            float m = -INFINITY, l = 0.f;
+            float acc[HD / 16];
+#pragma unroll
+            for (int i = 0; i < HD / 16; ++i) acc[i] = 0.f;
+            const int64_t total = sel ? K * 128 : pos + 1;
+            const int64_t c_lo = sp * SPLIT, c_hi = sycl::min<int64_t>(total, (sp + 1) * SPLIT);
+            for (int64_t c0 = c_lo; c0 < c_hi; c0 += TILE) {
+                const int n = (int) sycl::min<int64_t>(TILE, c_hi - c0);
+                if (tid < TILE) {
+                    int64_t j = -1;
+                    if (tid < n) {
+                        const int64_t idx = c0 + tid;
+                        j = idx;
+                        if (sel) {
+                            const int32_t b = sel[(t * G + gi) * K + idx / 128];
+                            j = b < 0 ? -1 : (int64_t) b * 128 + idx % 128;
+                        }
+                        if (j > pos) j = -1;
+                    }
+                    jj[tid] = (int32_t) j;
+                }
+                sycl::group_barrier(it.get_group());
+                // the keys' tile
+                for (int e = tid; e < TILE * HD; e += WG) {
+                    const int i = e / HD, d = e % HD;
+                    const int32_t j = jj[i];
+                    kt[i * KS + d] = j >= 0 ? (float) ((const sycl::half*) kc)[((int64_t) j * G + gi) * HD + d] : 0.f;
+                }
+                sycl::group_barrier(it.get_group());
+                // scores of this head for keys l16, l16 + 16, ...
+                float cm = -INFINITY;
+#pragma unroll
+                for (int u = 0; u < TILE / 16; ++u) {
+                    const int k = l16 + 16 * u;
+                    float s = -INFINITY;
+                    if (jj[k] >= 0) {
+                        float a = 0.f;
+                        for (int d = 0; d < HD; ++d) a += qs[hh * HD + d] * kt[k * KS + d];
+                        s = a * scale;
+                    }
+                    pt[hh * TILE + k] = s;
+                    cm = sycl::fmax(cm, s);
+                }
+                // the head's 16 lanes sit in one half of a sub-group: xor masks below 16 stay inside it
+#pragma unroll
+                for (int mk = 8; mk >= 1; mk >>= 1) cm = sycl::fmax(cm, sycl::permute_group_by_xor(sg, cm, mk));
+                const float nm = sycl::fmax(m, cm);
+                const float corr = m == -INFINITY ? 0.f : sycl::exp(m - nm);
+                float ls = 0.f;
+#pragma unroll
+                for (int u = 0; u < TILE / 16; ++u) {
+                    const int k = l16 + 16 * u;
+                    const float s = pt[hh * TILE + k];
+                    const float ev = (nm > -INFINITY && s != -INFINITY) ? sycl::exp(s - nm) : 0.f;
+                    pt[hh * TILE + k] = ev;
+                    ls += ev;
+                }
+#pragma unroll
+                for (int mk = 8; mk >= 1; mk >>= 1) ls += sycl::permute_group_by_xor(sg, ls, mk);
+                l = l * corr + ls;
+#pragma unroll
+                for (int i = 0; i < HD / 16; ++i) acc[i] *= corr;
+                m = nm;
+                sycl::group_barrier(it.get_group());
+                // the values' tile replaces the keys'
+                for (int e = tid; e < TILE * HD; e += WG) {
+                    const int i = e / HD, d = e % HD;
+                    const int32_t j = jj[i];
+                    kt[i * KS + d] = j >= 0 ? (float) ((const sycl::half*) vc)[((int64_t) j * G + gi) * HD + d] : 0.f;
+                }
+                sycl::group_barrier(it.get_group());
+                // acc[i] holds value d = l16 + 16 i; the keys in order
+                for (int k = 0; k < n; ++k) {
+                    const float p = pt[hh * TILE + k];
+#pragma unroll
+                    for (int i = 0; i < HD / 16; ++i) acc[i] += p * kt[k * KS + l16 + 16 * i];
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            float* o = part + (((t * G + gi) * S + sp) * PER + hh) * (HD + 2);
+            if (l16 == 0) {
+                o[0] = m;
+                o[1] = l;
+            }
+#pragma unroll
+            for (int i = 0; i < HD / 16; ++i) o[2 + l16 + 16 * i] = acc[i];
+        });
+    });
+    return combine(g, out, T, H, G, S, part);
     NS_CATCH
 }
 

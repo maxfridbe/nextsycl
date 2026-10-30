@@ -332,9 +332,12 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   (12 reader threads a card to place, 3 a missed expert at run time), a share of it from a second drive's copy
   (`NS_MM31_STREAM_DIR`) and the next layer's guessed experts (its router on this layer's residual) read ahead. Pinned and
   file-read experts are copied into VRAM before their products (a product reading pinned memory in place ran 5.8 ms, in
-  VRAM 0.3 ms), and the expert sums add in rank order, so the output does not depend on where an expert lay. Checked
-  teacher-forced against llama.cpp's CPU dumps (cosine >= 0.99985 per layer, next token the same). B70 + B65: tg 3.3
-  tok/s, pp 105-115 (2K-8K). Profile, ladder and what bounds it: [docs/ports/minimax-m31.md](ports/minimax-m31.md).
+  VRAM 0.3 ms), and the expert sums add in rank order, so the output does not depend on where an expert lay. During decode each layer's places are a recency cache: the
+  most recently used experts live in VRAM, the next in pinned memory, a used expert from either swaps into the VRAM place of the least recent (copies on the card's
+  copy lanes, ordered against the compute queue by tickets), and a one-token pass runs its experts through the silo's fused kernel pair (`silo/moe.cpp`:
+  gate+up+SwiGLU-OAI and down, up to four experts a launch, float32 activations) and its attention through the key-split decode kernel. Checked
+  teacher-forced against llama.cpp's CPU dumps (cosine >= 0.99985 per layer, next token the same). B70 + B65: tg 7.4
+  tok/s, pp 113-121 (2K-8K). Profile, ladder and what bounds it: [docs/ports/minimax-m31.md](ports/minimax-m31.md).
 
 ## The image engines
 

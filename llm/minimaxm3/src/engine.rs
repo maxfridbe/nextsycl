@@ -67,6 +67,35 @@ const SLAB: usize = 1 << 30;
 
 /// Experts a wave of file reads holds (two waves are in the staging ring: one read while the other computes)
 const WAVE: usize = 8;
+/// VRAM slots a copied expert lands in (the copy lane runs up to LA experts ahead of the products)
+const NX: usize = 4;
+const LA: usize = 2;
+
+/// NS_MM31_TRACE=FILE: one line a layer of a one-token pass ("layer e e e e"), for the cache studies
+fn trace_route(l: usize, per: &[Vec<(i32, f32, i32)>]) {
+    use std::io::Write;
+    static F: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let f = F.get_or_init(|| std::env::var("NS_MM31_TRACE").ok().and_then(|p| std::fs::File::create(p).ok()).map(Mutex::new));
+    if let Some(f) = f {
+        let ex: Vec<String> = per.iter().enumerate().filter(|(_, v)| !v.is_empty()).map(|(i, _)| i.to_string()).collect();
+        let _ = writeln!(f.lock().unwrap(), "{l} {}", ex.join(" "));
+    }
+}
+
+/// NS_MM31_FUSED=0: the decode experts run as the shared kernels' three products each, not the silo's fused pair
+fn no_fused() -> bool {
+    std::env::var("NS_MM31_FUSED").is_ok_and(|v| v == "0")
+}
+
+/// NS_MM31_SPLIT_ATTEND=0: the decode passes run the attention kernel of the prompt passes or the shared one
+fn no_split() -> bool {
+    std::env::var("NS_MM31_SPLIT_ATTEND").is_ok_and(|v| v == "0")
+}
+
+/// Which copy lane (0, 1, or 2 = alternating) the expert copies use (NS_MM31_LANE)
+fn copy_lane() -> i32 {
+    std::env::var("NS_MM31_LANE").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(0, 2)
+}
 
 /// Reads in flight while a card's experts are placed at load
 const LOAD_THREADS: usize = 12;
@@ -211,18 +240,28 @@ fn join_all(hs: Reads) -> Result<()> {
 }
 
 fn spawn_reads(r: &Arc<Reader>, src: Src, dst: *mut u8) -> Reads {
-    src.mats
-        .iter()
-        .map(|&(shard, off, len, at)| {
+    // a matrix is read as `parts` pieces at once (each its own request: the drive is kept busy with several), NS_MM31_SPLITREAD
+    static PARTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let parts = *PARTS.get_or_init(|| std::env::var("NS_MM31_SPLITREAD").ok().and_then(|v| v.parse().ok()).filter(|v: &usize| *v > 0).unwrap_or(8));
+    let mut hs = Reads::new();
+    for &(shard, off, len, at) in &src.mats {
+        let n = parts.min(len.div_ceil(1 << 20)).max(1);
+        let piece = len.div_ceil(n).next_multiple_of(4096);
+        let mut done = 0usize;
+        while done < len {
+            let l = piece.min(len - done);
             let r = r.clone();
-            // SAFETY: at + len is inside the slot dst points to (the slot sizes are computed from these).
-            let p = SendPtr(unsafe { dst.add(at) });
-            std::thread::spawn(move || {
+            // SAFETY: at + done + l is inside the slot dst points to (the slot sizes are computed from these).
+            let p = SendPtr(unsafe { dst.add(at + done) });
+            let o = off + done as u64;
+            hs.push(std::thread::spawn(move || {
                 let p = p;
-                r.read(shard, off, p.0, len)
-            })
-        })
-        .collect()
+                r.read(shard, o, p.0, l)
+            }));
+            done += l;
+        }
+    }
+    hs
 }
 
 // ---- the model's parts
@@ -231,6 +270,36 @@ fn spawn_reads(r: &Arc<Reader>, src: Src, dst: *mut u8) -> Reads {
 struct Resident {
     buf: DevBuf,
     vram: bool,
+}
+
+/// One place for an expert's bytes on a card (VRAM or pinned host memory), and whose they are now
+struct CSlot {
+    buf: DevBuf,
+    vram: bool,
+    occ: Option<usize>,
+    stamp: u64,
+}
+
+/// A layer's places and where each expert is: the cache the decode passes keep by recency (the most recently used experts in
+/// VRAM, the next in pinned memory, the rest in the file)
+struct LayerCache {
+    slots: Vec<CSlot>,
+    of: Vec<Option<usize>>,
+    clock: u64,
+    /// tickets of the moves of the last pass that touched this layer's places (the next pass waits for them)
+    pend: Vec<i64>,
+}
+
+/// What a promotion moves besides the expert's own copy: the VRAM place it takes (its old expert goes to `dst`, a pinned place, or is dropped)
+struct Post {
+    vslot: DevBuf,
+    dst: Option<DevBuf>,
+}
+
+/// NS_MM31_DYNAMIC=0: the experts stay where the load put them
+fn dynamic() -> bool {
+    std::env::var("NS_MM31_DYNAMIC").is_ok_and(|v| v != "0")
+        || std::env::var("NS_MM31_DYNAMIC").is_err()
 }
 
 /// One layer's routed experts in the file: [experts][rows][cols] in `ty`
@@ -319,6 +388,8 @@ struct Card {
     layers: std::ops::Range<usize>,
     /// [layer - first][expert]
     res: Vec<Vec<Option<Resident>>>,
+    /// the decode-time cache over the same places, a layer each (`res` is the load's table, used while placing)
+    cache: Vec<Mutex<LayerCache>>,
     /// staging ring for streamed experts: 2 waves of WAVE slots of `slot` bytes (pinned, read in place by the kernels)
     stage: HostBuf,
     slot: usize,
@@ -326,6 +397,8 @@ struct Card {
     /// pinned memory in place ran at ~3 GB/s (5.8 ms an expert against 0.30 ms from VRAM)
     xfer: DevBuf,
     pfs: Mutex<PfState>,
+    /// tickets of the last layer's copies that read the xfer slots (the next layer's first copies into them wait for these)
+    xdeps: Mutex<Vec<i64>>,
     /// slabs the resident experts live in (kept for their views)
     _vram: Vec<DevBuf>,
     _host: Vec<HostBuf>,
@@ -420,6 +493,13 @@ struct Counts {
     ahead_used: AtomicU64,
     /// experts the next layer needed that were not on the card (the guess's target)
     ahead_wanted: AtomicU64,
+    /// experts moved into VRAM by recency (each demoting the least recent one to pinned memory)
+    promoted: AtomicU64,
+    /// nanoseconds the host waited for the router's read-back in one-token passes (the GPU's work up to there)
+    rb_ns: AtomicU64,
+    /// nanoseconds the host waited for expert reads (all passes) and the layers' final syncs
+    join_ns: AtomicU64,
+    end_ns: AtomicU64,
 }
 
 const NCAT: usize = 8;
@@ -446,11 +526,13 @@ pub struct MiniMax<'g> {
     /// NS_PROFILE=1: per layer, seconds by category (`CATS`), each timed to the GPU's completion (a sync at every lap);
     /// one table for one-token passes, one for wider ones
     pf: bool,
+    /// NS_PROFILE=gpu: device timestamps at six points of every layer of one-token passes (the queues keep them), no syncs
+    gpf: bool,
+    stamps: Mutex<Vec<(u8, i64, usize)>>,
+    gtab: Mutex<[f64; 6]>,
     lay: Mutex<[Vec<[f64; NCAT]>; 2]>,
     cur_wide: std::sync::atomic::AtomicBool,
     stage_ok: std::sync::atomic::AtomicBool,
-    /// profile: decode-width expert products by where the expert was (VRAM, pinned, staging): seconds, count
-    src_t: Mutex<[(f64, u64); 3]>,
     /// profile: one-token expert stages (gate, up, swiglu + quantize, down, scatter), seconds and bytes of weights read
     stage_t: Mutex<[f64; 6]>,
     /// passes of one token, and the seconds they took (profile)
@@ -771,8 +853,22 @@ impl<'g> MiniMax<'g> {
                 let buf = if p.vram { dev[p.slab].view(p.off, tot)? } else { host[p.slab].device_view(p.off, tot)? };
                 res[p.layer - range.start][p.ex] = Some(Resident { buf, vram: p.vram });
             }
-            let xfer = DevBuf::new(gpu, 2 * slot_max)?;
-            cards.push(Card { gpu: gpu.clone(), arena, layers: range, res, stage, slot: slot_max, xfer, pfs: Mutex::new(PfState { free: (0..PF_SLOTS).collect(), map: HashMap::new() }), _vram: dev, _host: host, kept: (vk, hk) });
+            let xfer = DevBuf::new(gpu, NX * slot_max)?;
+            let cache: Vec<Mutex<LayerCache>> = res
+                .iter()
+                .map(|row| {
+                    let mut slots = Vec::new();
+                    let mut of = vec![None; row.len()];
+                    for (ex, r) in row.iter().enumerate() {
+                        if let Some(r) = r {
+                            of[ex] = Some(slots.len());
+                            slots.push(CSlot { buf: r.buf.view(0, r.buf.len).expect("a place's own view"), vram: r.vram, occ: Some(ex), stamp: 0 });
+                        }
+                    }
+                    Mutex::new(LayerCache { slots, of, clock: 0, pend: Vec::new() })
+                })
+                .collect();
+            cards.push(Card { gpu: gpu.clone(), arena, layers: range, res, cache, stage, slot: slot_max, xfer, pfs: Mutex::new(PfState { free: (0..PF_SLOTS).collect(), map: HashMap::new() }), xdeps: Mutex::new(Vec::new()), _vram: dev, _host: host, kept: (vk, hk) });
         }
 
         // the second drive: a copy of the experts the cards do not keep (a share of them), read beside the model's own file,
@@ -954,10 +1050,12 @@ impl<'g> MiniMax<'g> {
             counts: Counts::default(),
             usage: (0..64 * 128).map(|_| AtomicU64::new(0)).collect(),
             pf: std::env::var("NS_PROFILE").is_ok_and(|v| v == "1"),
+            gpf: std::env::var("NS_PROFILE").is_ok_and(|v| v == "gpu"),
+            stamps: Mutex::new(Vec::new()),
+            gtab: Mutex::new([0.0; 6]),
             lay: Mutex::new([vec![[0.0; NCAT]; 64], vec![[0.0; NCAT]; 64]]),
             cur_wide: false.into(),
             stage_ok: (std::env::var("NS_PROFILE").is_ok_and(|v| v == "1")).into(),
-            src_t: Mutex::new([(0.0, 0); 3]),
             stage_t: Mutex::new([0.0; 6]),
             pf_tokens: Mutex::new((0, 0.0)),
         })
@@ -988,18 +1086,20 @@ impl<'g> MiniMax<'g> {
 
     pub fn profile_lines(&self) -> Vec<String> {
         let mut v = Vec::new();
+        if self.gpf {
+            self.flush_stamps();
+            let g = self.gtab.lock().unwrap();
+            v.push(format!("[device time of one-token passes by part, seconds in all: attention {:.3}, router {:.3}, host turnaround (router read-back to the shared expert queued) {:.3}, experts {:.3}, adds and layer end {:.3}]", g[1], g[2], g[3], g[4], g[5]));
+        }
         let c = &self.counts;
         let (a, b, d) = (c.vram.load(Relaxed), c.pinned.load(Relaxed), c.file.load(Relaxed));
-        v.push(format!("[experts used: {a} from VRAM, {b} from pinned host memory, {d} read from the file ({:.1}% on the cards); {:.1} GiB read from the file in all]",
-                       100.0 * (a + b) as f64 / (a + b + d).max(1) as f64, self.reader.bytes.load(Relaxed) as f64 / GIB as f64));
+        v.push(format!("[experts used: {a} from VRAM, {b} from pinned host memory, {d} read from the file ({:.1}% on the cards); {:.1} GiB read from the file in all; {} moved into VRAM by recency; the host waited {:.2} s for the routers' read-backs in one-token passes, {:.2} s for expert reads and {:.2} s for the layers' final syncs]",
+                       100.0 * (a + b) as f64 / (a + b + d).max(1) as f64, self.reader.bytes.load(Relaxed) as f64 / GIB as f64, c.promoted.load(Relaxed), c.rb_ns.load(Relaxed) as f64 * 1e-9, c.join_ns.load(Relaxed) as f64 * 1e-9, c.end_ns.load(Relaxed) as f64 * 1e-9));
         v.push(format!("[read ahead: {} experts guessed and read for the next layer, {} of the {} off-card experts it needed were among them]", c.ahead.load(Relaxed),
                        c.ahead_used.load(Relaxed), c.ahead_wanted.load(Relaxed)));
         if self.pf {
-            let st = self.src_t.lock().unwrap();
-            v.push(format!("[decode expert products, each timed alone to the GPU: VRAM {:.2} ms x {}, pinned {:.2} ms x {}, staged from the file {:.2} ms x {}]",
-                           1e3 * st[0].0 / st[0].1.max(1) as f64, st[0].1, 1e3 * st[1].0 / st[1].1.max(1) as f64, st[1].1, 1e3 * st[2].0 / st[2].1.max(1) as f64, st[2].1));
             let sg = self.stage_t.lock().unwrap();
-            v.push(format!("[one-token expert stages, seconds in all: gate {:.3}, up {:.3}, swiglu+quantize {:.3}, down {:.3}, scatter {:.3}]", sg[0], sg[1], sg[2], sg[3], sg[4]));
+            v.push(format!("[one-token expert stages (fused kernels: gate+up+swiglu, down; VRAM group, then each copied expert with its copy wait), seconds in all: gu {:.3}, down {:.3}; copied gu {:.3}, down {:.3}; gu of the IQ1_M layers {:.3}]", sg[0], sg[1], sg[2], sg[3], sg[4]));
             let lay = self.lay.lock().unwrap();
             let (n, secs) = *self.pf_tokens.lock().unwrap();
             for (name, tab) in [("one-token passes", &lay[0]), ("wider passes", &lay[1])] {
@@ -1211,15 +1311,31 @@ impl<'g> MiniMax<'g> {
                     tap(&format!("msa_bs-{l}"), &bs)?;
                     ffi::check((self.k.idx_topk)(raw, bs.fp(), sel.ptr().cast::<i32>(), t as i64, ih as i64, nblk as i64, kk as i64), "idx_topk")?;
                     self.lap(cd, l, 1, &mut tm);
-                    ffi::check((self.attend_fn(t, h, kv, hd))(raw, q.fp(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), sel.ptr().cast::<i32>().cast_const(),
-                                               kk as i64, out.fp(), t as i64, h as i64, kv as i64, p0 as i64, scale), "attend")?;
+                    match self.k.silo_attend_split {
+                        Some(f) if t < 8 && h == kv * 16 && hd == 128 && !no_split() => {
+                            let s = (kk * 128).div_ceil(128);
+                            let part = a.f32(t * kv * s * 16 * 130)?;
+                            ffi::check(f(raw, q.fp(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), sel.ptr().cast::<i32>().cast_const(), kk as i64,
+                                         out.fp(), t as i64, h as i64, kv as i64, p0 as i64, scale, s as i64, part.fp()), "attend split")?;
+                        }
+                        _ => ffi::check((self.attend_fn(t, h, kv, hd))(raw, q.fp(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), sel.ptr().cast::<i32>().cast_const(),
+                                                   kk as i64, out.fp(), t as i64, h as i64, kv as i64, p0 as i64, scale), "attend")?,
+                    }
                 }
             }
             _ => {
                 // SAFETY: caches hold n_pos positions; out t * h * hd floats.
                 unsafe {
-                    ffi::check((self.attend_fn(t, h, kv, hd))(raw, q.fp(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), std::ptr::null(), 0, out.fp(),
-                                               t as i64, h as i64, kv as i64, p0 as i64, scale), "attend")?;
+                    match self.k.silo_attend_split {
+                        Some(f) if t < 8 && h == kv * 16 && hd == 128 && !no_split() => {
+                            let s = (p0 + t).div_ceil(128);
+                            let part = a.f32(t * kv * s * 16 * 130)?;
+                            ffi::check(f(raw, q.fp(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), std::ptr::null(), 0, out.fp(), t as i64, h as i64,
+                                         kv as i64, p0 as i64, scale, s as i64, part.fp()), "attend split")?;
+                        }
+                        _ => ffi::check((self.attend_fn(t, h, kv, hd))(raw, q.fp(), kc.ptr().cast::<u16>().cast_const(), vc.ptr().cast::<u16>().cast_const(), std::ptr::null(), 0, out.fp(),
+                                                   t as i64, h as i64, kv as i64, p0 as i64, scale), "attend")?,
+                    }
                 }
             }
         }
@@ -1400,7 +1516,14 @@ impl<'g> MiniMax<'g> {
             },
             None => None,
         };
+        if t == 1 {
+            self.stamp(cd, 2);
+        }
+        let tw0 = Instant::now();
         let lg = logits.to_f32()?;
+        if t == 1 {
+            self.counts.rb_ns.fetch_add(tw0.elapsed().as_nanos() as u64, Relaxed);
+        }
         let guess = match guess {
             Some((pl, nm)) => Some((pl.to_f32()?, nm)),
             None => None,
@@ -1425,6 +1548,9 @@ impl<'g> MiniMax<'g> {
                 per[i].push((tok as i32, w, r as i32));
             }
         }
+        if t == 1 {
+            trace_route(l, &per);
+        }
         let wbuf = DevBuf::from_f32(&cd.gpu, &wts)?;
         tap(&format!("ffn_moe_weights_scaled-{l}"), &wbuf)?;
         self.lap(cd, l, 3, &mut tm);
@@ -1434,11 +1560,18 @@ impl<'g> MiniMax<'g> {
         let li = l - cd.layers.start;
         let need: Vec<usize> = (0..ne).filter(|&i| !per[i].is_empty()).collect();
         let (mut hot, mut miss): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+        let mut cache = cd.cache[li].lock().unwrap();
+        // the moves the last pass left running on this layer's places: the compute queue waits for them, and so does every copy below
+        let pend: Vec<i64> = std::mem::take(&mut cache.pend);
+        for &tk in &pend {
+            ffi::await_ticket(cd.gpu.raw(), tk)?;
+        }
+        let xprev: Vec<i64> = std::mem::take(&mut *cd.xdeps.lock().unwrap());
         for &ex in &need {
-            match &cd.res[li][ex] {
-                Some(r) => {
+            match cache.of[ex] {
+                Some(si) => {
                     hot.push(ex);
-                    let ctr = if r.vram { &self.counts.vram } else { &self.counts.pinned };
+                    let ctr = if cache.slots[si].vram { &self.counts.vram } else { &self.counts.pinned };
                     ctr.fetch_add(1, Relaxed);
                 }
                 None => miss.push(ex),
@@ -1485,7 +1618,6 @@ impl<'g> MiniMax<'g> {
         };
         let slot = cd.slot;
         let total = m.layout().2;
-        let mut xi = 0usize;
         let mut used_slots: Vec<usize> = Vec::new();
         // the staging ring: wave k reads into slots [(k % 2) * WAVE, +WAVE)
         let ring = cd.stage.device_view(0, cd.stage.len)?;
@@ -1502,31 +1634,238 @@ impl<'g> MiniMax<'g> {
         let tr = Instant::now();
         let mut wait = 0.0;
         let mut inflight: Option<Reads> = (!waves.is_empty()).then(|| issue(0));
-        // the shared expert and the experts already on the card run while the file is read
+        // the shared expert and the experts already in VRAM run while the file is read and the pinned ones are copied
+        if t == 1 {
+            self.stamp(cd, 3);
+        }
         let sh = match &one {
             Some((xq, _)) => self.dense_q(cd, &m.shared, x, xq)?,
             None => self.dense(cd, &m.shared, x, t)?,
         };
+        // the experts that need a copy into VRAM (pinned, read ahead, read in a wave), in the order they run; a copy runs on the
+        // copy lane beside the compute queue (tickets order the two on the device), into a ring of NX VRAM slots
+        enum Job {
+            Pinned(usize, DevBuf),
+            Pre(usize, usize, Option<Reads>),
+            Wave(usize, usize, usize),
+        }
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut vram_hot: Vec<(usize, DevBuf)> = Vec::new();
         for &ex in &hot {
-            let r = cd.res[li][ex].as_ref().unwrap();
-            let te = Instant::now();
-            let base = if r.vram {
-                r.buf.ptr().cast::<u8>().cast_const()
+            let sl = &cache.slots[cache.of[ex].unwrap()];
+            if sl.vram {
+                vram_hot.push((ex, sl.buf.view(0, total)?));
             } else {
-                // pinned: copied into VRAM first (the queue is in order: the copy runs before the products, and the next
-                // copy, into the other slot, after the products that read this one's predecessor)
-                let tgt = cd.xfer.view((xi % 2) * slot, total)?;
-                xi += 1;
-                tgt.copy_within(0, &r.buf, 0, total)?;
-                tgt.ptr().cast::<u8>().cast_const()
+                jobs.push(Job::Pinned(ex, sl.buf.view(0, total)?));
+            }
+        }
+        for (ex, slot_i, hs) in pre {
+            jobs.push(Job::Pre(ex, slot_i, Some(hs)));
+        }
+        for (k, w) in waves.iter().enumerate() {
+            for (j, &ex) in w.iter().enumerate() {
+                jobs.push(Job::Wave(ex, k, j));
+            }
+        }
+        let njobs = jobs.len();
+        let ring_used = jobs.iter().any(|j| !matches!(j, Job::Pinned(..)));
+        // the recency cache: every expert that had to be copied into VRAM takes the place of the least recently used one there
+        // (not one this pass needs), whose bytes go to the pinned place the newcomer leaves (a pinned hit) or the least recent
+        // pinned one's (a read from the file), or are dropped; the table changes now, the bytes move on the copy lanes
+        let mut posts: Vec<Option<Post>> = (0..njobs).map(|_| None).collect();
+        cache.clock += 1;
+        let clock = cache.clock;
+        for (e, _) in &vram_hot {
+            let si = cache.of[*e].unwrap();
+            cache.slots[si].stamp = clock;
+        }
+        if t <= 8 && dynamic() {
+            let mut inneed = vec![false; ne];
+            for &ex in &need {
+                inneed[ex] = true;
+            }
+            let mut claimed = vec![false; cache.slots.len()];
+            for (ji, job) in jobs.iter().enumerate() {
+                let (ex, own) = match job {
+                    Job::Pinned(ex, _) => (*ex, cache.of[*ex]),
+                    Job::Pre(ex, ..) | Job::Wave(ex, ..) => (*ex, None),
+                };
+                let pick = |cache: &LayerCache, claimed: &[bool], vram: bool| -> Option<usize> {
+                    cache.slots.iter().enumerate()
+                        .filter(|(i, s)| s.vram == vram && !claimed[*i] && s.occ.is_none_or(|o| !inneed[o]))
+                        .min_by_key(|(_, s)| (s.occ.is_some(), s.stamp))
+                        .map(|(i, _)| i)
+                };
+                let Some(v) = pick(&cache, &claimed, true) else { continue };
+                claimed[v] = true;
+                let x = cache.slots[v].occ;
+                let xstamp = cache.slots[v].stamp;
+                let dst = match (own, x) {
+                    (Some(p), _) => {
+                        claimed[p] = true;
+                        Some(p)
+                    }
+                    (None, Some(_)) => pick(&cache, &claimed, false).inspect(|&p| claimed[p] = true),
+                    (None, None) => None,
+                };
+                // the table
+                if let Some(p) = dst {
+                    if let Some(y) = cache.slots[p].occ {
+                        if y != ex {
+                            cache.of[y] = None;
+                        }
+                    }
+                    cache.slots[p].occ = x;
+                    cache.slots[p].stamp = xstamp;
+                    if let Some(xe) = x {
+                        cache.of[xe] = Some(p);
+                    }
+                } else if let Some(xe) = x {
+                    cache.of[xe] = None;
+                }
+                cache.slots[v].occ = Some(ex);
+                cache.slots[v].stamp = clock;
+                cache.of[ex] = Some(v);
+                let dstb = match (dst, x) {
+                    (Some(p), Some(_)) => Some(cache.slots[p].buf.view(0, total)?),
+                    _ => None,
+                };
+                posts[ji] = Some(Post { vslot: cache.slots[v].buf.view(0, total)?, dst: dstb });
+                self.counts.promoted.fetch_add(1, Relaxed);
+            }
+        }
+        drop(cache);
+        // the silo's fused products (decode, one token): the experts of a launch in one kernel pair, their addresses, weights and ranks
+        // in one upload; the VRAM-resident ones first (one launch), then each copied one as it lands
+        let fe = m.gate.rows;
+        let (off_up, off_down, _) = m.layout();
+        let fz = match &self.k.silo_moe {
+            Some(f) if t == 1 && !no_fused() && m.gate.ty == m.up.ty
+                // SAFETY: plain queries.
+                && unsafe { (f.supported)(m.gate.ty.code() as i32, c as i64) != 0 && (f.supported)(m.down.ty.code() as i32, fe as i64) != 0 } => {
+                let nall = vram_hot.len() + njobs;
+                let h = a.f32(nall.max(1) * fe)?;
+                let meta = a.bytes(nall.max(1) * 16)?;
+                let mut ptrs: Vec<u64> = vram_hot.iter().map(|(_, b)| b.ptr() as u64).collect();
+                let mut exs: Vec<usize> = vram_hot.iter().map(|(e, _)| *e).collect();
+                for (i, jb) in jobs.iter().enumerate() {
+                    ptrs.push(cd.xfer.view((i % NX) * slot, total)?.ptr() as u64);
+                    exs.push(match jb {
+                        Job::Pinned(e, _) | Job::Pre(e, ..) | Job::Wave(e, ..) => *e,
+                    });
+                }
+                let mut mb: Vec<u8> = Vec::with_capacity(nall * 16);
+                mb.extend(ptrs.iter().flat_map(|p| p.to_le_bytes()));
+                mb.extend(exs.iter().flat_map(|e| wts[per[*e][0].2 as usize].to_le_bytes()));
+                mb.extend(exs.iter().flat_map(|e| per[*e][0].2.to_le_bytes()));
+                meta.write_async(0, &mb)?;
+                Some((h, meta, nall))
+            }
+            _ => None,
+        };
+        let nv = vram_hot.len();
+        let run_group = |start: usize, n: usize| -> Result<()> {
+            let (h, meta, nall) = fz.as_ref().unwrap();
+            let f = self.k.silo_moe.as_ref().unwrap();
+            let raw = cd.gpu.raw();
+            let p = meta.ptr().cast::<u8>().cast_const();
+            // SAFETY: the meta upload holds nall addresses, weights and ranks (entries start..start + n among them); h holds nall * fe floats;
+            // ys used * plane floats.
+            unsafe {
+                let bases = p.add(start * 8).cast::<u64>();
+                let w = p.add(nall * 8 + start * 4).cast::<f32>();
+                let rk = p.add(nall * 12 + start * 4).cast::<i32>();
+                let prof = self.pf && self.stage_ok.load(Relaxed);
+                let kind = if start < nv { 0 } else { 2 };
+                let mut tt = Instant::now();
+                if prof {
+                    cd.gpu.sync()?;
+                    tt = Instant::now();
+                }
+                ffi::check((f.gu)(raw, m.gate.ty.code() as i32, bases, off_up as i64, x.fp().cast_const(), h.fp().add(start * fe), n as i64, fe as i64, c as i64, 1.702, 7.0), "expert gu")?;
+                if prof {
+                    cd.gpu.sync()?;
+                    self.stage_t.lock().unwrap()[if kind == 0 && m.gate.ty.code() == 29 { 4 } else { kind }] += tt.elapsed().as_secs_f64();
+                    tt = Instant::now();
+                }
+                ffi::check((f.down)(raw, m.down.ty.code() as i32, bases, off_down as i64, h.fp().add(start * fe).cast_const(), w, rk, ys.fp(), plane as i64, n as i64, c as i64, fe as i64),
+                           "expert down")?;
+                if prof {
+                    cd.gpu.sync()?;
+                    self.stage_t.lock().unwrap()[kind + 1] += tt.elapsed().as_secs_f64();
+                }
+            }
+            Ok(())
+        };
+        let mut tickets: Vec<i64> = Vec::with_capacity(njobs); // a job's compute ticket, once queued
+        let mut copy_t: Vec<i64> = Vec::with_capacity(njobs); // a job's copy ticket
+        let mut done_t: Vec<Option<i64>> = Vec::with_capacity(njobs); // the ticket of the moves after a promoted job's copy
+        let mut joined = 0usize; // waves whose reads are joined
+        let lane = copy_lane();
+        let issue_copy = |jobs: &mut Vec<Job>, j: usize, tickets: &[i64], copy_t: &mut Vec<i64>, done_t: &mut Vec<Option<i64>>, joined: &mut usize, inflight: &mut Option<Reads>, wait: &mut f64| -> Result<()> {
+            let src: DevBuf = match &mut jobs[j] {
+                Job::Pinned(_, b) => b.view(0, total)?,
+                Job::Pre(_, slot_i, hs) => {
+                    let tw = Instant::now();
+                    join_all(hs.take().unwrap())?;
+                    *wait += tw.elapsed().as_secs_f64();
+                    ring.view((2 * WAVE + *slot_i) * slot, total)?
+                }
+                Job::Wave(_, k, jj) => {
+                    while *joined <= *k {
+                        let tw = Instant::now();
+                        join_all(inflight.take().unwrap())?;
+                        *wait += tw.elapsed().as_secs_f64();
+                        if *joined >= 1 {
+                            // wave joined-1's products are done: its half of the ring is free for the reads after
+                            cd.gpu.sync()?;
+                        }
+                        *joined += 1;
+                        if *joined < waves.len() {
+                            *inflight = Some(issue(*joined));
+                        }
+                    }
+                    ring.view(((*k % 2) * WAVE + *jj) * slot, total)?
+                }
             };
-            run(base, ex)?;
-            if self.pf && t <= 8 {
-                cd.gpu.sync()?;
-                let mut st = self.src_t.lock().unwrap();
-                let i = if r.vram { 0 } else { 1 };
-                st[i].0 += te.elapsed().as_secs_f64();
-                st[i].1 += 1;
+            let tgt = cd.xfer.view((j % NX) * slot, total)?;
+            let mut after: Vec<i64> = pend.clone();
+            if j >= NX {
+                after.push(tickets[j - NX]);
+                after.extend(done_t[j - NX]);
+            } else {
+                after.extend(&xprev);
+            }
+            let ct = ffi::stream_copy(cd.gpu.raw(), &tgt, &src, total, &after, if lane == 2 { (j % 2) as i32 } else { lane })?;
+            copy_t.push(ct);
+            // a promotion: the VRAM place's old expert to its new place (after this copy has read the pinned one it may take), then
+            // the new expert from the ring slot into the place
+            done_t.push(match &posts[j] {
+                Some(p) => {
+                    let mut deps = vec![ct];
+                    deps.extend(&pend);
+                    if let Some(d) = &p.dst {
+                        deps = vec![ffi::stream_copy(cd.gpu.raw(), d, &p.vslot, total, &deps, 0)?];
+                    }
+                    Some(ffi::stream_copy(cd.gpu.raw(), &p.vslot, &tgt, total, &deps, 0)?)
+                }
+                None => None,
+            });
+            Ok(())
+        };
+        let mut issued = 0usize;
+        // the first copies go out before the VRAM experts run, so the copy lane is busy during them
+        while issued < njobs && issued < LA && !matches!(jobs[issued], Job::Wave(..)) {
+            issue_copy(&mut jobs, issued, &tickets, &mut copy_t, &mut done_t, &mut joined, &mut inflight, &mut wait)?;
+            issued += 1;
+        }
+        if fz.is_some() {
+            if !vram_hot.is_empty() {
+                run_group(0, vram_hot.len())?;
+            }
+        } else {
+            for (ex, b) in &vram_hot {
+                run(b.ptr().cast::<u8>().cast_const(), *ex)?;
             }
         }
         // read ahead for the next layer now: its reads run during this layer's products
@@ -1537,7 +1876,7 @@ impl<'g> MiniMax<'g> {
             order.sort_by(|&i, &j| (probs[j] + nm.bias[j]).total_cmp(&(probs[i] + nm.bias[i])).then(i.cmp(&j)));
             let mut pfs = cd.pfs.lock().unwrap();
             for &ex in order.iter().take(ahead()) {
-                if cd.res[nli][ex].is_some() || pfs.map.contains_key(&(l + 1, ex)) {
+                if cd.cache[nli].lock().unwrap().of[ex].is_some() || pfs.map.contains_key(&(l + 1, ex)) {
                     continue;
                 }
                 let Some(slot_i) = pfs.free.pop() else { break };
@@ -1547,59 +1886,69 @@ impl<'g> MiniMax<'g> {
                 self.counts.ahead.fetch_add(1, Relaxed);
             }
         }
-        // the ones read ahead: their reads joined, then the products
-        for (ex, slot_i, hs) in pre {
-            let tw = Instant::now();
-            join_all(hs)?;
-            wait += tw.elapsed().as_secs_f64();
-            let sv = ring.view((2 * WAVE + slot_i) * slot, total)?;
-            let tgt = cd.xfer.view((xi % 2) * slot, total)?;
-            xi += 1;
-            tgt.copy_within(0, &sv, 0, total)?;
-            run(tgt.ptr().cast::<u8>().cast_const(), ex)?;
-            used_slots.push(slot_i);
-        }
-        for k in 0..waves.len() {
-            let tw = Instant::now();
-            join_all(inflight.take().unwrap())?;
-            wait += tw.elapsed().as_secs_f64();
-            if k >= 1 {
-                // wave k-1's products are done: its half of the ring is free for wave k+1's reads
-                cd.gpu.sync()?;
+        for i in 0..njobs {
+            while issued <= i {
+                issue_copy(&mut jobs, issued, &tickets, &mut copy_t, &mut done_t, &mut joined, &mut inflight, &mut wait)?;
+                issued += 1;
             }
-            if k + 1 < waves.len() {
-                inflight = Some(issue(k + 1));
+            // the compute queue waits, on the device, for the copy
+            ffi::await_ticket(cd.gpu.raw(), copy_t[i])?;
+            let (ex, pre_slot) = match &jobs[i] {
+                Job::Pinned(ex, _) => (*ex, None),
+                Job::Pre(ex, s, _) => (*ex, Some(*s)),
+                Job::Wave(ex, ..) => (*ex, None),
+            };
+            if fz.is_some() {
+                run_group(vram_hot.len() + i, 1)?;
+            } else {
+                run(cd.xfer.view((i % NX) * slot, total)?.ptr().cast::<u8>().cast_const(), ex)?;
             }
-            for (j, &ex) in waves[k].iter().enumerate() {
-                // SAFETY: slot (k % 2) * WAVE + j of the ring, filled by the joined reads.
-                let sv = ring.view(((k % 2) * WAVE + j) * slot, total)?;
-                let tgt = cd.xfer.view((xi % 2) * slot, total)?;
-                xi += 1;
-                tgt.copy_within(0, &sv, 0, total)?;
-                let base = tgt.ptr().cast::<u8>().cast_const();
-                let te = Instant::now();
-                run(base, ex)?;
-                if self.pf && t <= 8 {
-                    cd.gpu.sync()?;
-                    let mut st = self.src_t.lock().unwrap();
-                    st[2].0 += te.elapsed().as_secs_f64();
-                    st[2].1 += 1;
+            tickets.push(ffi::mark(cd.gpu.raw())?);
+            if let Some(s) = pre_slot {
+                used_slots.push(s);
+            }
+            // the copies after this one, while it computes: the next may wait for its reads, the ones after only when no read is due
+            while issued < njobs && issued <= i + LA {
+                if issued > i + 1 && !matches!(jobs[issued], Job::Pinned(..)) {
+                    break;
                 }
+                issue_copy(&mut jobs, issued, &tickets, &mut copy_t, &mut done_t, &mut joined, &mut inflight, &mut wait)?;
+                issued += 1;
             }
+        }
+        if t == 1 {
+            self.stamp(cd, 4);
         }
         // the ring is read by queued kernels until they finish: the next layer's reads must not start before
-        cd.gpu.sync()?;
+        let te = Instant::now();
+        // the tickets the next layer and the next pass wait for
         {
-            // slots of this layer's read-ahead come back (guesses nobody used: their reads waited for first)
+            let mut xd = cd.xdeps.lock().unwrap();
+            xd.clear();
+            xd.extend(tickets.iter().rev().take(NX));
+            xd.extend(done_t.iter().rev().take(NX).flatten());
+            cd.cache[li].lock().unwrap().pend = done_t.iter().flatten().copied().collect();
+        }
+        if ring_used || self.pf || t > 1 {
+            cd.gpu.sync()?;
+        }
+        if t == 1 {
+            self.counts.end_ns.fetch_add(te.elapsed().as_nanos() as u64, Relaxed);
+        }
+        {
+            // slots of this layer's read-ahead come back; guesses nobody used go back when their reads are done (none waited for)
             let mut pfs = cd.pfs.lock().unwrap();
             pfs.free.extend(used_slots);
-            let stale: Vec<(usize, usize)> = pfs.map.keys().filter(|k| k.0 <= l).copied().collect();
+            let stale: Vec<(usize, usize)> = pfs.map.iter().filter(|(k, v)| k.0 <= l && v.1.iter().all(|h| h.is_finished())).map(|(k, _)| *k).collect();
             for k in stale {
                 if let Some((slot_i, hs)) = pfs.map.remove(&k) {
                     let _ = join_all(hs);
                     pfs.free.push(slot_i);
                 }
             }
+        }
+        if t == 1 {
+            self.counts.join_ns.fetch_add((wait * 1e9) as u64, Relaxed);
         }
         if self.pf {
             let w = self.cur_wide.load(Relaxed) as usize;
@@ -1661,8 +2010,51 @@ impl<'g> MiniMax<'g> {
 
     // ---- passes
 
+    /// NS_PROFILE=gpu: a device timestamp tagged `tag` on card `cd` (0 layer start, 1 attention done, 2 router logits done, 3 shared
+    /// expert queued, 4 experts queued, 5 layer end)
+    fn stamp(&self, cd: &Card, tag: u8) {
+        if !self.gpf {
+            return;
+        }
+        if let Ok(api) = nextsycl_core::api() {
+            let mut t = 0i64;
+            // SAFETY: an out-pointer to a local.
+            if unsafe { (api.stamp)(cd.gpu.raw(), &mut t) } == 0 {
+                self.stamps.lock().unwrap().push((tag, t, cd.gpu.index));
+            }
+        }
+    }
+
+    /// the stamps of the passes before, turned into seconds between the neighbouring tags (their queues are idle: all done)
+    fn flush_stamps(&self) {
+        let mut st = self.stamps.lock().unwrap();
+        if st.is_empty() {
+            return;
+        }
+        if let Ok(api) = nextsycl_core::api() {
+            let mut tab = self.gtab.lock().unwrap();
+            let cards: Vec<*mut std::ffi::c_void> = self.cards.iter().map(|c| c.gpu.raw()).collect();
+            for w in st.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                if a.2 != b.2 || b.0 != a.0 + 1 {
+                    continue;
+                }
+                let raw = cards[self.cards.iter().position(|c| c.gpu.index == a.2).unwrap_or(0)];
+                let mut ns = 0f64;
+                // SAFETY: tickets of this card's queue, out-pointer to a local.
+                if unsafe { (api.elapsed)(raw, a.1, b.1, &mut ns) } == 0 {
+                    tab[b.0 as usize] += ns * 1e-9;
+                }
+            }
+        }
+        st.clear();
+    }
+
     fn pass(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
         let _w = self.work.lock().unwrap();
+        if self.gpf {
+            self.flush_stamps();
+        }
         let t = tokens.len();
         if t == 0 {
             return Err(e("no tokens"));
@@ -1678,6 +2070,7 @@ impl<'g> MiniMax<'g> {
         let p0 = s.pos;
         let pass_t0 = Instant::now();
         let mut x = self.embed(&self.cards[0], tokens)?;
+        let mut grave: Vec<DevBuf> = Vec::new();
         tap("inp_embd", &x)?;
         let mut cur = 0usize;
         for (l, ly) in self.layers.iter().enumerate() {
@@ -1693,6 +2086,9 @@ impl<'g> MiniMax<'g> {
             }
             let m0 = cd.arena.mark();
             let mut tm = Instant::now();
+            if t == 1 {
+                self.stamp(cd, 0);
+            }
             let xn = cd.arena.f32(t * c)?;
             self.rms(cd, &x, &ly.attn_norm, &xn, t, c)?;
             tap(&format!("attn_norm-{l}"), &xn)?;
@@ -1700,6 +2096,9 @@ impl<'g> MiniMax<'g> {
             let att = self.attention(cd, l, ly, s, &xn, t, p0, &mut *tap)?;
             tm = Instant::now();
             self.add(cd, &att, &x, t * c)?;
+            if t == 1 {
+                self.stamp(cd, 1);
+            }
             tap(&format!("ffn_inp-{l}"), &att)?;
             let hn = cd.arena.f32(t * c)?;
             self.rms(cd, &att, &ly.ffn_norm, &hn, t, c)?;
@@ -1723,8 +2122,17 @@ impl<'g> MiniMax<'g> {
             tap(&format!("l_out-{l}"), &f)?;
             let nx = DevBuf::f32(&cd.gpu, t * c)?;
             nx.copy_within(0, &f, 0, t * c * 4)?;
-            cd.gpu.sync()?;
-            x = nx;
+            if t == 1 {
+                self.stamp(cd, 5);
+            }
+            if t > 1 || self.pf {
+                cd.gpu.sync()?;
+            }
+            // the queue may still read the old hidden state (one-token passes run on without a sync): freed after the pass
+            let old = std::mem::replace(&mut x, nx);
+            if t == 1 {
+                grave.push(old);
+            }
             cd.arena.rewind(m0);
             self.lap(cd, l, 7, &mut tm);
             // NS_MM31_FORCE=DIR (Debug): the layer's output replaced by the reference dump's, so the next layer is
@@ -1748,6 +2156,7 @@ impl<'g> MiniMax<'g> {
         self.matmul(cd, &self.head, &xn, n_out, &logits)?;
         tap("result_output", &logits)?;
         let all = logits.to_f32()?;
+        drop(grave);
         if self.pf && t == 1 {
             let mut p = self.pf_tokens.lock().unwrap();
             p.0 += 1;

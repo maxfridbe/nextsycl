@@ -19,6 +19,21 @@ int ns_mm3s_attend_supported(int64_t H, int64_t G, int64_t head);
 int ns_mm3s_attend(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G,
                    int64_t pos0, float scale);
 
+/* The same for a few query rows (decode): the keys split in chunks of 128, a work-group each (S = ceil(keys / 128) chunks,
+ * keys = K * 128 selected or pos0 + T), their partial softmax states in `part` (T * G * S * 16 * 130 floats), merged by a second kernel */
+int ns_mm3s_attend_split(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G,
+                         int64_t pos0, float scale, int64_t S, float* part);
+
+/* The routed experts of a decode token in ggml's row types (IQ1_M, IQ2_XXS, IQ3_XXS, IQ4_XS) on float32 activations. bases [entries]: device
+ * addresses of the experts' [gate | up | down] blobs. gu: h [entries][rows] = swiglu_oai(gate . x, up . x), the up matrix off_up bytes after the
+ * gate's, rows = the expert width, cols = the model width. down: ys[rank[e] * plane + r] = w[e] * (down_e[r] . h_e), the down matrix off_down
+ * bytes after the base (rows = the model width, cols = the expert width) */
+int ns_mm3s_expert_supported(int type, int64_t cols);
+int ns_mm3s_expert_gu(ns_gpu* g, int type, const uint64_t* bases, int64_t off_up, const float* x, float* h, int64_t entries, int64_t rows, int64_t cols, float alpha,
+                      float limit);
+int ns_mm3s_expert_down(ns_gpu* g, int type, const uint64_t* bases, int64_t off_down, const float* h, const float* w, const int32_t* rank, float* ys, int64_t plane,
+                        int64_t entries, int64_t rows, int64_t cols);
+
 #ifdef __cplusplus
 }
 #endif

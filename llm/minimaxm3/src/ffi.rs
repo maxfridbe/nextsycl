@@ -31,7 +31,19 @@ pub struct Api {
     pub attend: AttendFn,
     /// the silo's prompt-pass attention (kernels/llm/minimaxm3/silo/mm3s.h), when the silo is there
     pub silo_attend: Option<AttendFn>,
+    /// the silo's decode attention (split over the keys; takes the split count and a scratch for the partial states)
+    pub silo_attend_split: Option<SplitFn>,
+    /// the silo's expert products for a decode token (moe.cpp)
+    pub silo_moe: Option<MoeFns>,
 }
+
+pub struct MoeFns {
+    pub supported: unsafe extern "C" fn(c_int, i64) -> c_int,
+    pub gu: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *mut f32, i64, i64, i64, f32, f32) -> c_int,
+    pub down: unsafe extern "C" fn(Gpu, c_int, *const u64, i64, *const f32, *const f32, *const i32, *mut f32, i64, i64, i64, i64) -> c_int,
+}
+
+pub type SplitFn = unsafe extern "C" fn(Gpu, *const f32, *const u16, *const u16, *const i32, i64, *mut f32, i64, i64, i64, i64, f32, i64, *mut f32) -> c_int;
 
 pub type AttendFn = unsafe extern "C" fn(Gpu, *const f32, *const u16, *const u16, *const i32, i64, *mut f32, i64, i64, i64, i64, f32) -> c_int;
 
@@ -73,6 +85,23 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             idx_scores: sym!("ns_llm_minimaxm3_idx_scores"),
             idx_topk: sym!("ns_llm_minimaxm3_idx_topk"),
             attend: sym!("ns_llm_minimaxm3_attend"),
+            silo_moe: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
+                let (a, b, c) = (s.symbol("ns_mm3s_expert_supported"), s.symbol("ns_mm3s_expert_gu"), s.symbol("ns_mm3s_expert_down"));
+                // SAFETY: the symbols are declared in mm3s.h with MoeFns's signatures.
+                #[allow(clippy::missing_transmute_annotations)]
+                (!a.is_null() && !b.is_null() && !c.is_null()).then(|| unsafe {
+                    MoeFns {
+                        supported: std::mem::transmute::<*mut c_void, _>(a),
+                        gu: std::mem::transmute::<*mut c_void, _>(b),
+                        down: std::mem::transmute::<*mut c_void, _>(c),
+                    }
+                })
+            }),
+            silo_attend_split: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
+                let p = s.symbol("ns_mm3s_attend_split");
+                // SAFETY: the symbol is declared in mm3s.h with SplitFn's signature.
+                (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, SplitFn>(p) })
+            }),
             silo_attend: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
                 let p = s.symbol("ns_mm3s_attend");
                 // SAFETY: the symbol is declared in mm3s.h with AttendFn's signature.
@@ -91,4 +120,31 @@ pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
     }
     let why = nextsycl_core::api().map(|a| a.error()).unwrap_or_default();
     Err(nextsycl_core::Error(format!("{what}: {why}")))
+}
+
+/// A copy of `n` bytes from `src` to `dst` (same GPU) on copy lane `lane`, after ticket `after`; its ticket
+pub fn stream_copy(gpu: *mut c_void, dst: &nextsycl_core::DevBuf, src: &nextsycl_core::DevBuf, n: usize, after: &[i64], lane: i32) -> nextsycl_core::Result<i64> {
+    let api = nextsycl_core::api()?;
+    let deps: Vec<i64> = after.to_vec();
+    let mut t = 0i64;
+    // SAFETY: both buffers hold n bytes (callers view exactly the expert's bytes); t is an out-pointer to a local.
+    let rc = unsafe { (api.stream_copy)(gpu, dst.ptr().cast(), src.ptr().cast_const().cast(), n, deps.as_ptr(), deps.len() as i32, lane, &mut t) };
+    check(rc, "stream_copy")?;
+    Ok(t)
+}
+
+/// A ticket for everything queued on the compute queue so far
+pub fn mark(gpu: *mut c_void) -> nextsycl_core::Result<i64> {
+    let api = nextsycl_core::api()?;
+    let mut t = 0i64;
+    // SAFETY: t is an out-pointer to a local.
+    check(unsafe { (api.mark)(gpu, &mut t) }, "mark")?;
+    Ok(t)
+}
+
+/// The compute queue waits, on the device, for ticket `t`
+pub fn await_ticket(gpu: *mut c_void, t: i64) -> nextsycl_core::Result<()> {
+    let api = nextsycl_core::api()?;
+    // SAFETY: plain call.
+    check(unsafe { (api.await_)(gpu, t) }, "await")
 }
