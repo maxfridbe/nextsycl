@@ -548,8 +548,6 @@ struct Moe {
     shared: Dense,
     /// where an expert's bytes are in the stream file (the second drive's copy of the experts that are not on the cards), or MAX
     stream: Vec<u64>,
-    /// the shared expert's down matrix's address, a weight of 1 and a rank of 0, for the fused kernel
-    shared_meta: DevBuf,
     /// the shards of the stream files (one a drive of NS_MM31_STREAM_DIR)
     stream_shards: Vec<usize>,
 }
@@ -713,6 +711,8 @@ struct Counts {
     ahead_wanted: AtomicU64,
     /// experts moved into VRAM by recency (each demoting the least recent one to pinned memory)
     promoted: AtomicU64,
+    /// one-token passes, per card: experts from VRAM, pinned memory and the file
+    card_uses: [[AtomicU64; 3]; 2],
     /// nanoseconds the host waited for the router's read-back in one-token passes (the GPU's work up to there)
     rb_ns: AtomicU64,
     /// nanoseconds the host waited for expert reads (all passes) and the layers' final syncs
@@ -791,7 +791,8 @@ fn mat(f: &Gguf, gpu: &Arc<Gpu>, name: &str, bytes: &mut u64) -> Result<Mat> {
     let t = f.tensor(name).ok_or_else(|| e(format!("{name}: missing")))?;
     let (rows, cols) = (t.shape[0] as usize, t.shape[1] as usize);
     let raw = f.read(t).map_err(|x| e(x.0))?;
-    let buf = DevBuf::new(gpu, raw.len())?;
+    // 64 bytes more: the silo's word loads may pass the last block's end
+    let buf = DevBuf::new(gpu, raw.len() + 64)?;
     buf.write(0, &raw)?;
     *bytes += raw.len() as u64;
     Ok(Mat { buf, ty: t.ty, rows, cols })
@@ -876,11 +877,6 @@ fn load_part(f: &Gguf, g: &Geometry, gpu: &Arc<Gpu>, range: std::ops::Range<usiz
                 up: experts(f, n("ffn_up_exps"), ne)?,
                 down: experts(f, n("ffn_down_exps"), ne)?,
                 stream: Vec::new(),
-                shared_meta: {
-
-
-                    DevBuf::new(gpu, 16)?
-                },
                 stream_shards: Vec::new(),
                 shared: Dense {
                     gate: mat(f, gpu, &n("ffn_gate_shexp"), &mut bytes)?,
@@ -986,14 +982,6 @@ impl<'g> MiniMax<'g> {
             }
             bytes += p.bytes;
             layers.extend(p.layers);
-        }
-        for ly in &layers {
-            if let Ffn::Moe(m) = &ly.ffn {
-                let mut b: Vec<u8> = (m.shared.down.buf.ptr() as u64).to_le_bytes().to_vec();
-                b.extend(1f32.to_le_bytes());
-                b.extend(0i32.to_le_bytes());
-                m.shared_meta.write(0, &b)?;
-            }
         }
         // the routers on the host, for the guesses (dequantized on the GPU that holds them)
         let mut guess_layers: Vec<Option<GuessLayer>> = Vec::new();
@@ -1320,6 +1308,20 @@ impl<'g> MiniMax<'g> {
         let kept: usize = cards.iter().map(|c| c.kept.0 + c.kept.1).sum();
         log(format!("experts placed: {:.1} GiB in {:.1} s ({})", gib(kept), t_fill.elapsed().as_secs_f64(),
                     cards.iter().map(|c| format!("{}: {:.1} GiB VRAM + {:.1} GiB pinned", c.gpu.name, gib(c.kept.0), gib(c.kept.1))).collect::<Vec<_>>().join("; ")));
+        for (i, c) in cards.iter().enumerate() {
+            let (total, free) = c.gpu.memory()?;
+            log(format!("memory, card {i} {}: after load {:.2} GiB used, {:.2} GiB free; weights {:.2} GiB, experts VRAM {:.2} GiB, arena {:.2} GiB, stage (pinned) {:.2} GiB, xfer {:.3} GiB, KV reserved for {} tokens {:.2} GiB",
+                        c.gpu.name, gib((total - free.unwrap_or(total)) as usize), gib(free.unwrap_or(total) as usize), gib(layers[c.layers.clone()].iter().map(|l| {
+                            let m = [&l.q, &l.k, &l.v, &l.o];
+                            let mut b: usize = m.iter().map(|w| w.buf.len).sum();
+                            if let Some(ix) = &l.idx { b += ix.q.buf.len + ix.k.buf.len; }
+                            match &l.ffn {
+                                Ffn::Dense(d) => b += d.gate.buf.len + d.up.buf.len + d.down.buf.len,
+                                Ffn::Moe(m) => b += m.router.buf.len + m.shared.gate.buf.len + m.shared.up.buf.len + m.shared.down.buf.len,
+                            }
+                            b
+                        }).sum()), gib(c.kept.0), gib(arena_bytes), gib(c.stage.len), gib(c.xfer.len), kv_tokens, gib(kv_tokens * (c.layers.len() * 2 * (g.n_kv_head * g.head_dim) as usize * 2 + layers[c.layers.clone()].iter().filter(|l| l.idx.is_some()).count() * g.indexer.key_len as usize * 2))));
+        }
         Ok(MiniMax {
             file: f,
             guesser,
@@ -1386,6 +1388,15 @@ impl<'g> MiniMax<'g> {
             let gc = self.gclean.lock().unwrap();
             for (i, card) in gc.iter().enumerate() {
                 v.push(format!("[card {i}: experts' device time, all in VRAM {:.3} ms x {} layers; some pinned, none read {:.3} ms x {} layers; some read from the file {:.3} ms x {} layers]", 1e3 * card[0].0 / card[0].1.max(1) as f64, card[0].1, 1e3 * card[1].0 / card[1].1.max(1) as f64, card[1].1, 1e3 * card[2].0 / card[2].1.max(1) as f64, card[2].1));
+            }
+        }
+        for (i, cu) in self.counts.card_uses.iter().enumerate() {
+            let (a, b, d) = (cu[0].load(Relaxed), cu[1].load(Relaxed), cu[2].load(Relaxed));
+            let n = (a + b + d).max(1) as f64;
+            if let Some(cd) = self.cards.get(i) {
+                let (total, free) = cd.gpu.memory().unwrap_or((0, None));
+                v.push(format!("[one-token uses, card {i} {} layers {}-{}: VRAM {:.1}% pinned {:.1}% file {:.1}% of {}; kept {:.1} GiB VRAM + {:.1} GiB pinned; card {:.2} GiB used, {:.2} GiB free]", cd.gpu.name, cd.layers.start, cd.layers.end - 1,
+                               100.0 * a as f64 / n, 100.0 * b as f64 / n, 100.0 * d as f64 / n, a + b + d, gib(cd.kept.0), gib(cd.kept.1), gib((total - free.unwrap_or(total)) as usize), gib(free.unwrap_or(total) as usize)));
             }
         }
         let c = &self.counts;
@@ -1993,6 +2004,15 @@ impl<'g> MiniMax<'g> {
             }
         }
         self.counts.file.fetch_add(miss.len() as u64, Relaxed);
+        if t == 1 {
+            let ci = self.owner[l].min(1);
+            let cu = &self.counts.card_uses[ci];
+            cu[2].fetch_add(miss.len() as u64, Relaxed);
+            for &ex in &hot {
+                let v = cache.slots[cache.of[ex].unwrap()].vram;
+                cu[if v { 0 } else { 1 }].fetch_add(1, Relaxed);
+            }
+        }
         // experts of this layer read ahead during the one before: taken from the table; the rest wait for their wave
         let mut pre: Vec<(usize, usize, Reads)> = Vec::new();
         {
@@ -2059,18 +2079,15 @@ impl<'g> MiniMax<'g> {
         }
         let sh = match (&one, fused_sh) {
             (_, true) => {
-                let f = self.k.silo_moe.as_ref().unwrap();
                 let fe = m.shared.gate.rows;
                 let h = a.f32(fe)?;
                 let hu = a.f32(fe)?;
                 let o = a.f32(c)?;
                 self.q_products(cd, x, &[(&m.shared.gate, &h), (&m.shared.up, &hu)])?;
-                let p = m.shared_meta.ptr().cast::<u8>().cast_const();
-                // SAFETY: h, hu hold fe floats; meta the down matrix's address, a weight of 1 and a rank of 0 (written at load); o c floats.
-                unsafe {
-                    ffi::check((self.k.swiglu_oai)(cd.gpu.raw(), h.fp(), hu.fp(), h.fp(), fe as i64, 1.702, 7.0), "swiglu_oai")?;
-                    ffi::check((f.down)(cd.gpu.raw(), m.shared.down.ty.code() as i32, p.cast::<u64>(), 0, h.fp().cast_const(), p.add(8).cast::<f32>(), p.add(12).cast::<i32>(), o.fp(), c as i64, 1, c as i64, fe as i64), "shared down")?;
-                }
+                // SAFETY: h, hu hold fe floats.
+                ffi::check(unsafe { (self.k.swiglu_oai)(cd.gpu.raw(), h.fp(), hu.fp(), h.fp(), fe as i64, 1.702, 7.0) }, "swiglu_oai")?;
+                // Q8_1 here too: 444 GB/s on Q6_K against the float product's 76
+                self.q_products(cd, &h, &[(&m.shared.down, &o)])?;
                 o
             }
             (Some((xq, _)), _) => self.dense_q(cd, &m.shared, x, xq)?,
@@ -2473,6 +2490,87 @@ impl<'g> MiniMax<'g> {
         Ok(())
     }
 
+    /// NS_MM31_KBENCH=1: each decode kernel timed alone on real weights, each card (GB/s of weights read), printed at the first session
+    fn kernel_bench(&self) -> Result<()> {
+        let (c, used) = (self.g.n_embd as usize, 4usize);
+        let bench = |name: String, bytes: usize, cd: &Card, f: &mut dyn FnMut() -> Result<()>| -> Result<()> {
+            cd.gpu.sync()?;
+            let mut best = f64::MAX;
+            for _ in 0..8 {
+                let t0 = Instant::now();
+                f()?;
+                cd.gpu.sync()?;
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            eprintln!("[kbench {} {name}: {:.0} us, {:.0} GB/s]", cd.gpu.name.split_whitespace().rev().nth(1).unwrap_or("?"), best * 1e6, bytes as f64 / best * 1e-9);
+            Ok(())
+        };
+        let Some(mf) = self.k.silo_moe.as_ref() else { return Ok(()) };
+        let Some(one) = self.k.silo_one.as_ref() else { return Ok(()) };
+        for cd in &self.cards {
+            let m0 = cd.arena.mark();
+            let x = cd.arena.f32(c)?;
+            let vals: Vec<u8> = (0..c).flat_map(|i| (((i * 2654435761) % 1000) as f32 * 0.002 - 1.0).to_le_bytes()).collect();
+            x.write(0, &vals)?;
+            let mut seen: Vec<String> = Vec::new();
+            for l in cd.layers.clone() {
+                let Ffn::Moe(m) = &self.layers[l].ffn else { continue };
+                let ly = &self.layers[l];
+                let kinds = format!("{:?}{:?}", m.gate.ty, m.down.ty);
+                if !seen.contains(&kinds) {
+                    seen.push(kinds);
+                    let cache = cd.cache[l - cd.layers.start].lock().unwrap();
+                    let bases: Vec<u64> = cache.slots.iter().filter(|s| s.vram && s.occ.is_some()).take(used).map(|s| s.buf.ptr() as u64).collect();
+                    drop(cache);
+                    if bases.len() == used {
+                        let fe = m.gate.rows;
+                        let (off_up, off_down, _) = m.layout();
+                        let meta = cd.arena.bytes(used * 16)?;
+                        let mut mb: Vec<u8> = bases.iter().flat_map(|b| b.to_le_bytes()).collect();
+                        mb.extend((0..used).flat_map(|_| 1f32.to_le_bytes()));
+                        mb.extend((0..used as i32).flat_map(|r| r.to_le_bytes()));
+                        meta.write(0, &mb)?;
+                        let h = cd.arena.f32(used * fe)?;
+                        let ys = cd.arena.f32(used * c)?;
+                        let p = meta.ptr().cast::<u8>().cast_const();
+                        let code = m.gate.ty.code() as i32;
+                        // SAFETY: meta holds 4 addresses of whole experts, weights and ranks; h and ys their sizes.
+                        unsafe {
+                            bench(format!("gu 4 {:?} l{l}", m.gate.ty), used * (m.gate.stride + m.up.stride), cd, &mut || ffi::check((mf.gu)(cd.gpu.raw(), code, p.cast::<u64>(), off_up as i64, x.fp().cast_const(), h.fp(), used as i64, fe as i64, c as i64, 1.702, 7.0), "gu"))?;
+                            bench(format!("down 4 {:?} l{l}", m.down.ty), used * m.down.stride, cd, &mut || ffi::check((mf.down)(cd.gpu.raw(), m.down.ty.code() as i32, p.cast::<u64>(), off_down as i64, h.fp().cast_const(), p.add(used * 8).cast::<f32>(), p.add(used * 12).cast::<i32>(), ys.fp(), c as i64, used as i64, c as i64, fe as i64), "down"))?;
+                            let w16 = cd.arena.bytes(fe * c * 2)?;
+                            let base = bases[0] as *const std::ffi::c_void;
+                            bench(format!("to_half {:?} l{l} ({:.0} MB out)", m.gate.ty, (fe * c * 2) as f64 / 1e6), m.gate.stride, cd, &mut || ffi::check((one.to_half)(cd.gpu.raw(), code, base, (fe * c) as i64, w16.ptr().cast::<u16>()), "to_half"))?;
+                            let x16 = cd.arena.bytes(64 * c * 2)?;
+                            let y = cd.arena.f32(64 * fe)?;
+                            bench(format!("half GEMM 64 rows {fe}x{c}"), fe * c * 2, cd, &mut || ffi::check((self.k.gemm_f16)(cd.gpu.raw(), 64, fe as i64, c as i64, x16.ptr().cast::<u16>().cast_const(), c as i64, w16.ptr().cast::<u16>().cast_const(), y.fp(), fe as i64, 0), "gemm"))?;
+                        }
+                    }
+                    for (nm, w) in [("attn q", &ly.q), ("attn o", &ly.o), ("shared gate", &m.shared.gate), ("shared down", &m.shared.down), ("router", &m.router)] {
+                        let xc = cd.arena.f32(w.cols)?;
+                        let vc: Vec<u8> = (0..w.cols).flat_map(|i| (((i * 2654435761) % 1000) as f32 * 0.002 - 1.0).to_le_bytes()).collect();
+                        xc.write(0, &vc)?;
+                        let y = cd.arena.f32(w.rows)?;
+                        let bytes = w.ty.bytes((w.rows * w.cols) as u64).unwrap_or(0) as usize;
+                        if w.ty != GType::F32 {
+                            bench(format!("{nm} {:?} {}x{} Q8", w.ty, w.rows, w.cols), bytes, cd, &mut || self.q_products(cd, &xc, &[(w, &y)]))?;
+                        }
+                        // SAFETY: sizes as named.
+                        let supp = unsafe { (mf.supported)(w.ty.code() as i32, w.cols as i64) != 0 } && w.rows % 8 == 0;
+                        if supp {
+                            bench(format!("{nm} {:?} float", w.ty), bytes, cd, &mut || unsafe {
+                                ffi::check((one.mv3)(cd.gpu.raw(), w.ty.code() as i32, w.buf.ptr().cast_const(), std::ptr::null(), std::ptr::null(), xc.fp().cast_const(), y.fp(), std::ptr::null_mut(), std::ptr::null_mut(), w.rows as i64, 0, 0, w.cols as i64), "mv")
+                            })?;
+                        }
+                    }
+                }
+                cd.arena.rewind(cd.arena.mark());
+            }
+            cd.arena.rewind(m0);
+        }
+        Ok(())
+    }
+
     /// Whether a matrix of this type and width has a decode-width kernel
     fn mmvq_ok(&self, ty: GType, cols: usize) -> bool {
         // SAFETY: plain query.
@@ -2803,6 +2901,9 @@ impl<'g> MiniMax<'g> {
     }
 
     pub fn session(&self, max_ctx: usize) -> Result<Session> {
+        if std::env::var("NS_MM31_KBENCH").is_ok_and(|v| v == "1") {
+            self.kernel_bench()?;
+        }
         let g = &self.g;
         let (kv, hd) = (g.n_kv_head as usize, g.head_dim as usize);
         let il = g.indexer.key_len as usize;

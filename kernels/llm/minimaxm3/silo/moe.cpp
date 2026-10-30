@@ -36,10 +36,36 @@ constexpr int sb_bytes(int type) {
     }
 }
 
-// blocks are 2-byte aligned only
-inline uint32_t ld16(const uint8_t* p) { return (uint32_t) p[0] | ((uint32_t) p[1] << 8); }
-inline uint32_t ld32(const uint8_t* p) { return ld16(p) | (ld16(p + 2) << 16); }
-inline float h2f(const uint8_t* p) { return (float) sycl::bit_cast<sycl::half>((uint16_t) ld16(p)); }
+// Blocks may be 2-byte aligned. Small global loads are a message each on Xe2 (a lane of a sub-group reads in step with the others): a lane's bytes come from one or two
+// word loads, then shifts (Strata's lesson: check the loads first). ld32 is a word at any 2-byte address; ld8w the 8 bytes at one, as two words; the words beyond a block stay
+// inside the allocation (matrices are padded by 64 bytes, experts sit in 256-byte slots).
+inline uint32_t ld32(const uint8_t* p) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const uint32_t* q = reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3));
+    if (a & 2) {
+        const sycl::uint2 v = *reinterpret_cast<const sycl::uint2*>(q);
+        return (v.x() >> 16) | (v.y() << 16);
+    }
+    return q[0];
+}
+inline uint32_t ld16(const uint8_t* p) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    return (*reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3)) >> (8 * (a & 3))) & 0xffffu;
+}
+inline void ld8w(const uint8_t* p, uint32_t& lo, uint32_t& hi) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const sycl::uint2 v = *reinterpret_cast<const sycl::uint2*>(a & ~uintptr_t(3));
+    if (a & 2) {
+        const uint32_t x = *reinterpret_cast<const uint32_t*>((a & ~uintptr_t(3)) + 8);
+        lo = (v.x() >> 16) | (v.y() << 16);
+        hi = (v.y() >> 16) | (x << 16);
+    } else {
+        lo = v.x();
+        hi = v.y();
+    }
+}
+inline float h2f16(uint32_t h) { return (float) sycl::bit_cast<sycl::half>((uint16_t) (h & 0xffffu)); }
+inline float h2f(const uint8_t* p) { return h2f16(ld16(p)); }
 inline uint32_t ksign(uint32_t x) { x &= 127u; return x | ((sycl::popcount(x) & 1u) << 7); }
 inline float sgn(uint32_t signs, int j) { return ((signs >> j) & 1u) ? -1.f : 1.f; }
 
@@ -58,16 +84,28 @@ template <> struct Tabs<T_IQ1_M> { static constexpr int N64 = 0, N32 = 2048; sta
 
 template <int T> struct Deq;
 
+// kvalues_iq4nl, little end first: low 8 values, then the high 8
+constexpr uint64_t iq4_word(int from) {
+    constexpr int8_t K[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= (uint64_t) (uint8_t) K[from + i] << (8 * i);
+    return v;
+}
+constexpr uint64_t IQ4_LO = iq4_word(0), IQ4_HI = iq4_word(8);
+
 // IQ2_XXS: d; 32 u16: per 32 values four grid bytes then 28 bits of signs (4 x 7) and a 4-bit scale
 template <> struct Deq<T_IQ2_XXS> {
     static void group(const uint8_t* b, int g, float* w, const Lut& L) {
         const int ib32 = g >> 2, l = g & 3;
-        const uint8_t* q2 = b + 2 + 8 * ib32;
-        const uint32_t a0 = ld32(q2), a1 = ld32(q2 + 4);
+        uint32_t a0, a1;
+        ld8w(b + 2 + 8 * ib32, a0, a1);
         const float db = h2f(b) * (0.5f + (a1 >> 28)) * 0.25f;
-        const uint8_t* grid = (const uint8_t*) (L.a + ((a0 >> (8 * l)) & 255));
+        const sycl::uint2 ge = *reinterpret_cast<const sycl::uint2*>(L.a + ((a0 >> (8 * l)) & 255));
         const uint32_t signs = ksign(a1 >> (7 * l));
-        for (int j = 0; j < 8; ++j) w[j] = db * grid[j] * sgn(signs, j);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) w[j] = db * (float) ((ge.x() >> (8 * j)) & 255) * sgn(signs, j);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) w[j + 4] = db * (float) ((ge.y() >> (8 * j)) & 255) * sgn(signs, j + 4);
     }
 };
 
@@ -75,15 +113,15 @@ template <> struct Deq<T_IQ2_XXS> {
 template <> struct Deq<T_IQ3_XXS> {
     static void group(const uint8_t* b, int g, float* w, const Lut& L) {
         const int ib32 = g >> 2, l = g & 3;
-        const uint8_t* qs = b + 2 + 8 * ib32;
+        const uint32_t idx = ld16(b + 2 + 8 * ib32 + 2 * l);
         const uint32_t aux = ld32(b + 2 + 64 + 4 * ib32);
         const float db = h2f(b) * (0.5f + (aux >> 28)) * 0.5f;
         const uint32_t signs = ksign(aux >> (7 * l));
-        const uint8_t* g1 = (const uint8_t*) (L.b + qs[2 * l]);
-        const uint8_t* g2 = (const uint8_t*) (L.b + qs[2 * l + 1]);
+        const uint32_t g1 = L.b[idx & 255], g2 = L.b[idx >> 8];
+#pragma unroll
         for (int j = 0; j < 4; ++j) {
-            w[j] = db * g1[j] * sgn(signs, j);
-            w[j + 4] = db * g2[j] * sgn(signs, j + 4);
+            w[j] = db * (float) ((g1 >> (8 * j)) & 255) * sgn(signs, j);
+            w[j + 4] = db * (float) ((g2 >> (8 * j)) & 255) * sgn(signs, j + 4);
         }
     }
 };
@@ -93,12 +131,18 @@ template <> struct Deq<T_IQ3_XXS> {
 template <> struct Deq<T_IQ4_XS> {
     static void group(const uint8_t* b, int g, float* w, const Lut&) {
         const int ib = g >> 2, q = g & 3;
-        const uint32_t sh = ld16(b + 2);
-        const uint32_t ls = ((b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4);
-        const float dl = h2f(b) * ((int) ls - 32);
-        const uint8_t* qs = b + 8 + 16 * ib + 8 * (q & 1);
+        const sycl::uint2 hd = *reinterpret_cast<const sycl::uint2*>(b);  // d, scales_h, scales_l[4]; 136-byte blocks: 8-aligned
+        const uint32_t sh = hd.x() >> 16;
+        const uint32_t ls = ((hd.y() >> (8 * (ib >> 1)) >> (4 * (ib & 1))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4);
+        const float dl = h2f16(hd.x()) * ((int) ls - 32);
+        const sycl::uint2 qq = *reinterpret_cast<const sycl::uint2*>(b + 8 + 16 * ib + 8 * (q & 1));
         const int s = 4 * (q >> 1);
-        for (int j = 0; j < 8; ++j) w[j] = dl * (float) kvalues_iq4nl[(qs[j] >> s) & 15];
+        // kvalues_iq4nl as two words of 16 int8 in nibble order, sign extended below
+        auto kv = [](uint32_t n) { const int8_t t = (int8_t) ((n < 8 ? IQ4_LO : IQ4_HI) >> (8 * (n & 7))); return (float) t; };
+#pragma unroll
+        for (int j = 0; j < 4; ++j) w[j] = dl * kv((qq.x() >> (8 * j + s)) & 15);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) w[j + 4] = dl * kv((qq.y() >> (8 * j + s)) & 15);
     }
 };
 
@@ -107,15 +151,21 @@ template <> struct Deq<T_IQ4_XS> {
 template <> struct Deq<T_IQ1_M> {
     static void group(const uint8_t* b, int g, float* w, const Lut& L) {
         const int ib = g >> 2, l = g & 3;
-        const uint32_t s0 = ld16(b + 48), s1 = ld16(b + 50), s2 = ld16(b + 52), s3 = ld16(b + 54);
+        const sycl::uint2 sv = *reinterpret_cast<const sycl::uint2*>(b + 48);  // the four scale u16s; 56-byte blocks: 8-aligned
+        const uint32_t s0 = sv.x() & 0xffffu, s1 = sv.x() >> 16, s2 = sv.y() & 0xffffu, s3 = sv.y() >> 16;
         const uint32_t db = (s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000);
         const float d = (float) sycl::bit_cast<sycl::half>((uint16_t) db);
-        const uint32_t sc = ld16(b + 48 + 2 * (ib >> 1));
+        const int si = ib >> 1;
+        const uint32_t sc = (si & 2 ? sv.y() : sv.x()) >> (16 * (si & 1));
         const float dl = d * (float) (2 * ((sc >> (6 * (ib & 1) + 3 * (l >> 1))) & 7) + 1);
-        const uint32_t qhb = (b[32 + 2 * ib + (l >> 1)] >> (4 * (l & 1)));
+        const int qo = 2 * ib + (l >> 1);
+        const uint32_t qhw = *reinterpret_cast<const uint32_t*>(b + 32 + (qo & ~3));
+        const uint32_t qhb = (qhw >> (8 * (qo & 3))) >> (4 * (l & 1));
         const float delta = (qhb & 8) ? -IQ1S_DELTA : IQ1S_DELTA;
         // SYCL builds have ggml's GPU form of the grid: the entry + 1 in nibbles, values 0-3 the even nibbles, 4-7 the odd
-        const uint32_t e = L.b[b[4 * ib + l] | ((qhb & 7) << 8)];
+        const int qi = 4 * ib + l;
+        const uint32_t qw = *reinterpret_cast<const uint32_t*>(b + (qi & ~3));
+        const uint32_t e = L.b[((qw >> (8 * (qi & 3))) & 255) | ((qhb & 7) << 8)];
         for (int j = 0; j < 8; ++j) w[j] = dl * ((int) ((e >> (j < 4 ? 8 * j : 8 * (j - 4) + 4)) & 0xF) - 1 + delta);
     }
 };
@@ -134,26 +184,40 @@ template <> struct Deq<T_Q5_K> {
     static void group(const uint8_t* b, int g, float* w, const Lut&) {
         const int v = g * 8, j = v >> 6, u = v & 63, hi = u >> 5, l0 = u & 31;
         const int is = 2 * j + hi;
-        const uint8_t* q = b + 4;
-        const uint32_t sc = is < 4 ? (q[is] & 63) : ((q[is + 4] & 0xF) | ((q[is - 4] >> 6) << 4));
-        const uint32_t mn = is < 4 ? (q[is + 4] & 63) : ((q[is + 4] >> 4) | ((q[is] >> 6) << 4));
-        const float d1 = h2f(b) * sc, m1 = h2f(b + 2) * mn;
-        const uint8_t* qh = b + 16 + l0;
-        const uint8_t* qs = b + 48 + 32 * j + l0;
-        const int bit = 1 << is;
-        for (int k = 0; k < 8; ++k) w[k] = d1 * ((hi ? (qs[k] >> 4) : (qs[k] & 0xF)) + ((qh[k] & bit) ? 16 : 0)) - m1;
+        const sycl::uint4 hd = *reinterpret_cast<const sycl::uint4*>(b);  // d, dmin, 12 scale bytes; 176-byte blocks: 16-aligned
+        const uint32_t sw[3] = {hd.y(), hd.z(), hd.w()};
+        auto qb = [&](int i) { return (sw[i >> 2] >> (8 * (i & 3))) & 0xffu; };
+        const uint32_t sc = is < 4 ? (qb(is) & 63) : ((qb(is + 4) & 0xF) | ((qb(is - 4) >> 6) << 4));
+        const uint32_t mn = is < 4 ? (qb(is + 4) & 63) : ((qb(is + 4) >> 4) | ((qb(is) >> 6) << 4));
+        const float d1 = h2f16(hd.x()) * sc, m1 = h2f16(hd.x() >> 16) * mn;
+        const sycl::uint2 qh = *reinterpret_cast<const sycl::uint2*>(b + 16 + l0);
+        const sycl::uint2 qs = *reinterpret_cast<const sycl::uint2*>(b + 48 + 32 * j + l0);
+        const int s = hi ? 4 : 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t h0 = (qh.x() >> (8 * k + is)) & 1u, h1 = (qh.y() >> (8 * k + is)) & 1u;
+            w[k] = d1 * (float) (((qs.x() >> (8 * k + s)) & 0xF) + (h0 << 4)) - m1;
+            w[k + 4] = d1 * (float) (((qs.y() >> (8 * k + s)) & 0xF) + (h1 << 4)) - m1;
+        }
     }
 };
 template <> struct Deq<T_Q6_K> {
     static void group(const uint8_t* b, int g, float* w, const Lut&) {
         const int v = g * 8, n = v >> 7, u = v & 127, quarter = u >> 5, l0 = u & 31;
-        const float d = h2f(b + 208);
-        const float sc = d * (float) (int8_t) b[192 + n * 8 + (l0 >> 4) + 2 * quarter];
-        const uint8_t* ql = b + n * 64 + (quarter & 1) * 32 + l0;
-        const uint8_t* qh = b + 128 + n * 32 + l0;
-        for (int k = 0; k < 8; ++k) {
-            const int lo = quarter < 2 ? (ql[k] & 0xF) : (ql[k] >> 4);
-            w[k] = sc * (float) ((lo | (((qh[k] >> (2 * quarter)) & 3) << 4)) - 32);
+        const uintptr_t a = reinterpret_cast<uintptr_t>(b);
+        const uint32_t ds = *reinterpret_cast<const uint32_t*>((a + 208) & ~uintptr_t(3));
+        const float d = h2f16(ds >> (8 * ((a + 208) & 3)));
+        const int so = 192 + n * 8 + (l0 >> 4) + 2 * quarter;
+        const uint32_t sw = *reinterpret_cast<const uint32_t*>((a + so) & ~uintptr_t(3));
+        const float sc = d * (float) (int8_t) (sw >> (8 * ((a + so) & 3)));
+        uint32_t ql0, ql1, qh0, qh1;
+        ld8w(b + n * 64 + (quarter & 1) * 32 + l0, ql0, ql1);
+        ld8w(b + 128 + n * 32 + l0, qh0, qh1);
+        const int ls = quarter < 2 ? 0 : 4, hs = 2 * quarter;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            w[k] = sc * (float) ((int) (((ql0 >> (8 * k + ls)) & 0xF) | (((qh0 >> (8 * k + hs)) & 3) << 4)) - 32);
+            w[k + 4] = sc * (float) ((int) (((ql1 >> (8 * k + ls)) & 0xF) | (((qh1 >> (8 * k + hs)) & 3) << 4)) - 32);
         }
     }
 };
