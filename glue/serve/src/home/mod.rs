@@ -306,6 +306,8 @@ impl Home {
         });
         let me = h.clone();
         std::thread::spawn(move || me.sample_cards());
+        let me = h.clone();
+        std::thread::spawn(move || me.video_room_loop());
         h.resume_jobs();
         // the video daemon as the enabled video models say (it is this page's to start and stop)
         let me = h.clone();
