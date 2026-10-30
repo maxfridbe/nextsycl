@@ -212,7 +212,7 @@ adds and layer end 4 ms. The host side of the 138 ms a token: 32 ms waiting for 
 the GPU's expert work. The fused kernels alone are fast (a gate+up launch of one IQ1_M expert: 37 us, 224 GB/s, scaling linearly with
 the experts in the launch; the profile's per-launch figures with a sync around each are 0.5 ms higher than that).
 
-### Why 20 tok/s is not within reach of this engine
+### Why 20 tok/s is not within reach of this engine (the second round's estimate; the third round's measured floor is below)
 
 20 tok/s is 50 ms a token. What is left is not the experts' bytes any more but the number of dependent steps: 60 layers, each with
 ~30 small kernel launches for attention (31 ms in all, launch- and latency-bound; no kernel runs more than 0.1 ms), a router
@@ -247,3 +247,76 @@ reads float activations too; the float products are the closer of the two to it)
 of ggml's Q8_1, so a 300-token generation diverges from the 2026-10-28 engine's after 19 characters (near ties); the cache itself
 changes no byte of the text (300 tokens, `NS_MM31_DYNAMIC=0` against 1, measured with the unfused products), and the fused text is the same
 before and after the sync removal (300 tokens, byte-identical). `NS_MM31_FUSED=0` gives the earlier arithmetic.
+
+## Third round (2026-10-30): both speeds, by what the profile showed
+
+Reached on two cards: **pp 199 / 332 / 289** at 2K / 8K / 31K (from 113 / 121 / 89), **tg 9.5 / 8.5 / 7.1** (from 7.4 / 7.5 / 6.0); tg 20 was not reached: floor below. The
+prompts of the earlier rounds were gone from the box; the new ones (`README.md + docs/architecture.md + CONTRIBUTING.md` repeated) are 2,137 / 7,990 / 31,085 tokens (was 2,115 / 7,925 / 31,211).
+Main measured on them: pp 112.5, tg 7.06 (300 tokens).
+
+### The order changed: what the profile said
+
+The assignment's order was device-side routing, fused attention, silo mmvq, miss reduction. A profile by layer kind (`NS_PROFILE=gpu`, the `[card N: ...]` lines) said otherwise. On main, per token:
+
+| | layers a token | experts' device time a layer |
+| --- | --- | --- |
+| all four in VRAM | 34 (B70 0.40 ms, B65 0.70 ms) | |
+| some pinned, none read | 13 | 1.86 / 2.29 ms |
+| some read from the file | 10 | 4.68 / 4.58 ms |
+
+so misses cost ~65 of the ~140 ms, and a pinned miss cost three copies (1.5 ms) rather than one (0.45 ms). The host turnaround between router and shared expert was 3.7 ms a token.
+
+**Step 1, device-side routing: skipped.** It removes at most that turnaround, and 22 of 57 layers then had a miss (21 now) and would have to stop the queued work: a stop every ~2.7 layers. It cannot pay until misses are rare.
+
+### What each step bought (B70 + B65, 2,137 tokens unless said; tg over 300 tokens)
+
+| step | pp before | pp after | tg before | tg after | text |
+| --- | --- | --- | --- | --- | --- |
+| a miss lands directly in an empty VRAM place of the layer, one copy (`NS_MM31_FREE` kept empty, the least recently used demoted on the other lane beside the compute); no end-of-layer sync | 112.5 | 112.7 | 7.06 | 7.91 | identical |
+| reads from a pool of threads, not 24 spawned an expert; pieces go round the drives; second drive holds all the experts off the cards at load (share 100, 34 GiB) | 112.7 | 110.1 | 7.91 | 8.06 | identical |
+| silo steps of a token: indexer projections in one launch, norms + RoPE + stores in one, add + norm in one, layer end in one, router on float; q, k, v, o and the shared gate/up on a copy of the qwen35 silo's Q5_K kernels (525 GB/s against ~214) | 110.1 | 115.6 | 8.06 | 8.59 | identical |
+| prompt passes: q, k, v, o and shared expert on half (`NS_MM31_HALF_PROJ`; the float GEMM was 5x slower), silo dequantize-to-half; 60% of the layers on the B70 | 115.6 | 150.0 (8K 172) | 8.59 | 8.43-8.60 | below |
+| long prompts: both cards at once (a chunk on the B70 while the B65 has the one before; `NS_MM31_PIPE`), logits bit-identical to chunk after chunk | - | 8K 121 -> 159 (with 60% split 172) | | | |
+| attention on XMX, prompt passes (`attnx.cpp`: the qwen35 flash kernel shaped for 16 heads of 128 and selected blocks; a 2K pass 14.2 -> 10.8 s) | 150.0 | 197.7 (8K 332, 31K 288) | 8.43 | 8.44 | from byte 232, with the row above |
+| attention on XMX, decode (a work-group a split of 128 keys) | 197.7 | 197.9 | 8.59 | 9.48 | changes at byte 49: half queries |
+| no read-ahead by default (`NS_MM31_AHEAD` 0: guesses on the CPU in a thread, at 1, 2, 3 and 6 layers ahead, never gained; they cost a second read-back a layer) | 198.3 | 197.8 | 9.71 | 9.93 | |
+
+### Tried and dropped, measured
+
+- **Warming the cache from the prompt's last 64 rows**: pp 198 -> 160 (2.6 s more), tg 9.47 -> 9.50: the decode routes differently from the prompt's end. Not kept.
+- **Chunks**: 4096 stays. 2K: 4096 198, 1024 91 (before XMX); 8K: 4096 333, 8192 235; 31K: 4096 288, 8192 303, at 2 GiB more scratch a card. Every pass moves all the off-card experts once, so small chunks lose.
+- **Third drive** (the 2 TB, 1.8 GB/s): a stripe goes at its slowest drive, no gain.
+- **Global LRU over a card's layers** (replay of a 300-token trace): 85.5 against 84.8% in VRAM, not worth it. **1.5x the cache** in the same replay moves pinned into VRAM but leaves file misses at 4% (first touches in the long tail: 100 of 128 experts a layer are touched in 300 tokens).
+- **Fused multi-row expert kernels for prompts**: not written. 92% of the experts of a 2K pass take more than 8 rows and a direct product costs 37 us a row against ~0.9 ms for half + GEMM: break-even ~12-14 rows, 8% of the work at best.
+- **Float Q5_K products at decode** (`mv3`): 214 GB/s, no gain over the shared kernel, and they moved the text; replaced by the tuned Q8_1 ones.
+
+### Where a token's time goes now, and the floor
+
+300 tokens, 2K: 100 ms average; 138 ms over the first 50 (cold: 25 file reads a token), 85-109 ms after (10.5 tg), ~7 file reads and ~20 pinned copies a token. Device time a token: attention 20 ms, router 0.7, host turnaround 7 (profiled), experts 67 (all-VRAM layers 0.38 / 0.67 ms; pinned 0.95 / 1.02; read 4.2 / 4.1). Host: 61 ms waiting for read-backs (the GPU's work up to the router), 29 ms for expert reads.
+
+**The floor with no misses at all is ~52 ms, tg 19**: attention 20 + 33 layers x 0.38 + 24 x 0.67 + router + turnaround. Misses add ~35 ms in steady state (7 x ~3.7 ms read + 20 x 0.55 ms copied), and those are physical: 16 MB from a drive at 4.5-6 GB/s, 16 MB over PCIe; hit rates are bound by the long tail of routing, not the policy. So tg 20 needs either no misses (VRAM for all 111 GiB) or a draft.
+
+- **Every expert on a second drive** (`NS_MM31_STREAM_ALL=1`, 111 GiB on the system NVMe, written once in 78 s): tg 9.93 -> 10.49 (300 tokens), pp unchanged. Available, not default.
+- **DSpark draft: not done, on measurement.** A 2-row verify costs 2.07x a 1-row pass (255.5 against 123.1 ms, `NS_SCORE_ROWS`, the unfused multi-row path) and touches 2.4x the file reads, so one draft token gains nothing at any acceptance. A fused 2-row path would have to come first; even at 1.6x and Unsloth's ~1.5x on code that is <10%, before the draft's own passes and with a 2 GB model to serve.
+
+### Exactness
+
+`check` (two cards, chunk 4096), the same columns as before:
+
+| prompt | min l_out | min kqv_out | result_output | next token | decode-after-prefill logits cosine |
+| --- | --- | --- | --- | --- | --- |
+| `short` (19 tokens) | 0.999849 | 0.999966 | 0.999957 | same as the reference | 0.9555839 |
+| `long` (3,881 tokens) | 0.999848 | 0.999988 | 0.999756 | same (" +") | 0.9795699 |
+
+Teacher-forced columns: unchanged or better in the sixth digit, and this is the prompt path (half projections, half expert route, XMX attention).
+
+**The decode column of the earlier tables measured nothing.** `NS_MM31_FORCE` replaced a layer's output when the dump's size matched; the dump's layer 59 has one row, so at one token the last layer's output *was* the reference's, whatever the engine had done (a broken XMX decode kernel, cosine ~0.05 per layer and garbage text, still printed 0.9999729). The force now applies to wide passes only and the column is a real free-running decode against the forced whole prompt. On that measure, the earlier states: fused products and shared attention (the second round's engine, `NS_MM31_ATTX=0 NS_MM31_FUSE1=0 NS_MM31_FUSED=0`) 0.9628573 / 0.9800251; vector-unit attention with this round's other steps 0.9632365 / 0.9802953; XMX 0.9555839 / 0.9795699. So the XMX decode attention lowers this one-token column slightly (half queries, a free-running token). Over 400 teacher-forced decode rows of a text the model has not seen, its perplexity is no worse: **16.42 with XMX, 16.63 with the vector-unit attention**, the likeliest token the text's 43.25% against 43.00%.
+
+**Greedy text changed.** The cache, reads and silo steps leave a 300-token text byte-identical to main's (`cmp`). The half route of prompt passes and XMX prompt attention move it from byte 232, XMX decode (half queries) from byte 49: near ties, both readable and on topic. `NS_MM31_ATTX=0 NS_MM31_HALF_PROJ=0` gives the earlier arithmetic, at pp 121, tg 8.6.
+
+Also found: demotions could pick a pinned place a fallback copy was still reading (more experts in a layer than empty places), so a text could differ between runs; fixed, three runs byte-identical.
+
+### Left
+
+- Second drive for all experts (user's decision: 111 GiB). A multi-row fused path, then DSpark. Not in the front door's registry yet.
+- A stream file is per placement: `NS_MM31_STREAM_DIR` now deletes another placement's file first (36 GiB each; they filled the system drive during this round's benches).

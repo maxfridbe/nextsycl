@@ -2133,7 +2133,13 @@ impl<'g> MiniMax<'g> {
             if t > 8 || !dynamic() {
                 continue;
             }
-            let Some(v) = cache.slots.iter().position(|sl| sl.vram && sl.occ.is_none()) else { continue };
+            let Some(v) = cache.slots.iter().position(|sl| sl.vram && sl.occ.is_none()) else {
+                // no empty place: it stays where it is, and this pass's copy reads it, so the demotions below must not pick its place
+                if let Some(p) = own {
+                    cache.slots[p].stamp = clock;
+                }
+                continue;
+            };
             if let Some(p) = own {
                 cache.slots[p].occ = None;
                 left.push((ji, p));
