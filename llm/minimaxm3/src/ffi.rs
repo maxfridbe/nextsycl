@@ -55,6 +55,7 @@ pub struct OneFns {
     pub finish: unsafe extern "C" fn(Gpu, *const f32, i64, *const f32, *const f32, *mut f32, i64) -> c_int,
     pub to_half: unsafe extern "C" fn(Gpu, c_int, *const c_void, i64, *mut u16) -> c_int,
     pub doorbell: unsafe extern "C" fn(Gpu, *mut u32, u32) -> c_int,
+    pub kcopy: unsafe extern "C" fn(Gpu, *mut u32, *const u32, i64) -> c_int,
     pub put_cols: unsafe extern "C" fn(Gpu, *const f32, *mut f32, i64, i64, i64, i64) -> c_int,
     pub argmax_add: unsafe extern "C" fn(Gpu, *const f32, *const f32, i64, *mut i32) -> c_int,
     pub attend_block: unsafe extern "C" fn(Gpu, *const f32, *const u16, *const u16, *mut f32, i64, i64, i64, i64, i64, i64, *mut f32) -> c_int,
@@ -139,10 +140,11 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
                 let (a, b, c, d) = (s.symbol("ns_mm3s_mv3"), s.symbol("ns_mm3s_attn_post"), s.symbol("ns_mm3s_add_norm"), s.symbol("ns_mm3s_finish"));
                 let e = s.symbol("ns_mm3s_to_half");
                 let bell = s.symbol("ns_mm3s_doorbell");
+                let kc = s.symbol("ns_mm3s_kcopy");
                 let (pc, am, ab) = (s.symbol("ns_mm3s_put_cols"), s.symbol("ns_mm3s_argmax_add"), s.symbol("ns_mm3s_attend_block"));
                 // SAFETY: the symbols are declared in mm3s.h with OneFns's signatures.
                 #[allow(clippy::missing_transmute_annotations)]
-                (!a.is_null() && !b.is_null() && !c.is_null() && !d.is_null() && !e.is_null() && !bell.is_null() && !pc.is_null() && !am.is_null() && !ab.is_null()).then(|| unsafe {
+                (!a.is_null() && !b.is_null() && !c.is_null() && !d.is_null() && !e.is_null() && !bell.is_null() && !kc.is_null() && !pc.is_null() && !am.is_null() && !ab.is_null()).then(|| unsafe {
                     OneFns {
                         mv3: std::mem::transmute::<*mut c_void, _>(a),
                         post: std::mem::transmute::<*mut c_void, _>(b),
@@ -150,6 +152,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
                         finish: std::mem::transmute::<*mut c_void, _>(d),
                         to_half: std::mem::transmute::<*mut c_void, _>(e),
                         doorbell: std::mem::transmute::<*mut c_void, _>(bell),
+                        kcopy: std::mem::transmute::<*mut c_void, _>(kc),
                         put_cols: std::mem::transmute::<*mut c_void, _>(pc),
                         argmax_add: std::mem::transmute::<*mut c_void, _>(am),
                         attend_block: std::mem::transmute::<*mut c_void, _>(ab),

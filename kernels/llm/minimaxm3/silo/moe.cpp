@@ -11,6 +11,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -517,6 +518,49 @@ int ns_mm3s_put_cols(ns_gpu* g, const float* x, float* f, int64_t T, int64_t C, 
         const int64_t r = id[0] / C, c = id[0] % C;
         f[r * stride + at + c] = x[r * C + c];
     });
+    return 0;
+    NS_CATCH
+}
+
+// What queuing a launch costs the host, microseconds: [0] g's queue, [1] a plain in-order queue, [2] the same with discarded events, [3] enqueue functions on it,
+// [4] on g's queue with a local accessor (the expert kernels' shape)
+int ns_mm3s_launch_bench(ns_gpu* g, double* out) {
+    NS_TRY
+    constexpr int N = 256;
+    int* p = sycl::malloc_device<int>(1024, g->q);
+    auto time = [&](auto&& fn) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < N; ++i) fn();
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / N;
+        return us;
+    };
+    out[0] = time([&] { g->q.parallel_for(sycl::range<1>(256), [=](sycl::id<1> i) { p[i] = 1; }); });
+    g->q.wait();
+    sycl::queue qb(g->ctx, g->dev, sycl::property::queue::in_order());
+    out[1] = time([&] { qb.parallel_for(sycl::range<1>(256), [=](sycl::id<1> i) { p[i] = 2; }); });
+    qb.wait();
+    sycl::queue qd(g->ctx, g->dev, sycl::property_list{sycl::property::queue::in_order(), sycl::ext::oneapi::property::queue::discard_events()});
+    out[2] = time([&] { qd.parallel_for(sycl::range<1>(256), [=](sycl::id<1> i) { p[i] = 3; }); });
+    qd.wait();
+    namespace oe = sycl::ext::oneapi::experimental;
+    out[3] = time([&] { oe::nd_launch(qd, sycl::nd_range<1>(256, 32), [=](sycl::nd_item<1> it) { p[it.get_global_linear_id()] = 4; }); });
+    qd.wait();
+    out[4] = time([&] {
+        g->q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<int, 1> l(sycl::range<1>(64), h);
+            h.parallel_for(sycl::nd_range<1>(256, 32), [=](sycl::nd_item<1> it) { l[0] = 1; p[it.get_global_linear_id()] = l[0]; });
+        });
+    });
+    g->q.wait();
+    sycl::free(p, g->q);
+    return 0;
+    NS_CATCH
+}
+
+// A small table from pinned memory into VRAM in a kernel, not through the runtime's memcpy (which goes to the copy engine, behind the experts' swaps)
+int ns_mm3s_kcopy(ns_gpu* g, uint32_t* dst, const uint32_t* src, int64_t words) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<1>((size_t) words), [=](sycl::id<1> i) { dst[i] = src[i]; });
     return 0;
     NS_CATCH
 }

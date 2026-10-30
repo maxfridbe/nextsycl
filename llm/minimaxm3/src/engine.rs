@@ -98,6 +98,12 @@ fn bell() -> bool {
     *N.get_or_init(|| std::env::var("NS_MM31_BELL").map_or(true, |v| v != "0"))
 }
 
+/// NS_MM31_KCOPY=0: the experts' tables through the runtime's memcpy, not a kernel from a pinned ring
+fn kcopy_on() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("NS_MM31_KCOPY").map_or(true, |v| v != "0"))
+}
+
 /// NS_MM31_SILO_HALF=0: a prompt pass's experts dequantize to half on the shared kernel, not the silo's
 fn no_silo_half() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -301,6 +307,8 @@ unsafe impl Send for SendPtr {}
 struct Reader {
     files: Vec<(std::fs::File, Option<std::fs::File>)>,
     bytes: AtomicU64,
+    /// after the load: reads through the page cache, which then holds what the prompt and the last tokens read (reclaimable, not pinned: the third tier)
+    cached: std::sync::atomic::AtomicBool,
 }
 
 /// O_DIRECT's value on Linux x86-64 / aarch64 (no libc crate in the workspace for one constant)
@@ -315,7 +323,7 @@ impl Reader {
             let d = if direct { std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(p).ok() } else { None };
             files.push((b, d));
         }
-        Ok(Reader { files, bytes: AtomicU64::new(0) })
+        Ok(Reader { files, bytes: AtomicU64::new(0), cached: false.into() })
     }
 
     /// `len` bytes at file offset `off` of shard `shard` into `dst`
@@ -324,7 +332,7 @@ impl Reader {
         // SAFETY: the caller owns dst[..len] and no one else touches it until this returns.
         let out = unsafe { std::slice::from_raw_parts_mut(dst, len) };
         let (b, d) = &self.files[shard];
-        let Some(d) = d else { return b.read_exact_at(out, off) };
+        let Some(d) = d.as_ref().filter(|_| !self.cached.load(Relaxed)) else { return b.read_exact_at(out, off) };
         let a0 = off & !4095;
         let end = off + len as u64;
         let a1 = end.div_ceil(4096) * 4096;
@@ -639,6 +647,7 @@ struct Card {
     xdeps: Mutex<Vec<i64>>,
     /// the doorbell's word and the router's result (pinned), and the last value rung
     bell: HostBuf,
+    ring_at: AtomicUsize,
     bell_seq: std::sync::atomic::AtomicU32,
     /// two hidden states: one token's layers take turns writing one and reading the other (no allocation a layer)
     flip: [DevBuf; 2],
@@ -742,6 +751,9 @@ struct Counts {
     ahead_wanted: AtomicU64,
     /// experts moved into VRAM by recency (each demoting the least recent one to pinned memory)
     promoted: AtomicU64,
+    /// the host's time from the doorbell to the layer's VRAM experts queued (what the shared expert behind the router hides), and how many
+    route_ns: AtomicU64,
+    route_n: AtomicU64,
     /// the drafter's passes and the nanoseconds of the host in them
     draft_ns: AtomicU64,
     draft_n: AtomicU64,
@@ -768,6 +780,7 @@ pub struct MiniMax<'g> {
     layers: Vec<Layer>,
     ds: Option<Dspark>,
     /// features of the pass on the last card, and those taken on the first (position -> (target, values)), for the drafter
+    route_t0: Mutex<Option<Instant>>,
     ds_f: Mutex<Option<DevBuf>>,
     ds_caps: Mutex<HashMap<usize, Vec<(usize, Vec<f32>)>>>,
     out_norm: DevBuf,
@@ -1024,6 +1037,10 @@ impl<'g> MiniMax<'g> {
         let gpus = &ordered[..];
         // layers over the cards: even by default (NS_MM31_SPLIT=N: N layers on the first of two)
         let mut bounds: Vec<usize> = (0..=ncard).map(|i| n_layer * i / ncard).collect();
+        // two cards: 40% of the layers on the first (the B65): per token as good as half, prompts better (8K pp 357 against 337)
+        if ncard == 2 {
+            bounds[1] = n_layer * 2 / 5;
+        }
         if let Some(n) = std::env::var("NS_MM31_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| ncard == 2 && *n > 0 && *n < n_layer) {
             bounds[1] = n;
         }
@@ -1269,7 +1286,7 @@ impl<'g> MiniMax<'g> {
                     Mutex::new(LayerCache { slots, of, clock: if profile.is_some() { row.len() as u64 + 1 } else { 0 } })
                 })
                 .collect();
-            cards.push(Card { gpu: gpu.clone(), arena_small, arena_big: Mutex::new(None), cur_arena, arena_bytes, extra: Mutex::new(None), layers: range, res, cache, stage, slot: slot_max, xfer, pfs: Mutex::new(PfState { free: (0..PF_SLOTS).collect(), map: HashMap::new() }), xdeps: Mutex::new(Vec::new()), bell: HostBuf::new(gpu, 4096)?, bell_seq: 0.into(), flip: [DevBuf::f32(gpu, 8 * g.n_embd as usize)?, DevBuf::f32(gpu, 8 * g.n_embd as usize)?], _vram: dev, _host: host, kept: (vk, hk) });
+            cards.push(Card { gpu: gpu.clone(), arena_small, arena_big: Mutex::new(None), cur_arena, arena_bytes, extra: Mutex::new(None), layers: range, res, cache, stage, slot: slot_max, xfer, pfs: Mutex::new(PfState { free: (0..PF_SLOTS).collect(), map: HashMap::new() }), xdeps: Mutex::new(Vec::new()), bell: HostBuf::new(gpu, 4096 + 32 * 2048)?, ring_at: AtomicUsize::new(0), bell_seq: 0.into(), flip: [DevBuf::f32(gpu, 8 * g.n_embd as usize)?, DevBuf::f32(gpu, 8 * g.n_embd as usize)?], _vram: dev, _host: host, kept: (vk, hk) });
         }
 
         // the second drive: a copy of the experts the cards do not keep (a share of them), read beside the model's own file,
@@ -1447,6 +1464,10 @@ impl<'g> MiniMax<'g> {
                 r?;
             }
         }
+        // NS_MM31_DIRECT=1: O_DIRECT at run time too
+        if std::env::var("NS_MM31_DIRECT").map_or(true, |v| v != "1") {
+            reader.cached.store(true, Relaxed);
+        }
         let kept: usize = cards.iter().map(|c| c.kept.0 + c.kept.1).sum();
         log(format!("experts placed: {:.1} GiB in {:.1} s ({})", gib(kept), t_fill.elapsed().as_secs_f64(),
                     cards.iter().map(|c| format!("{}: {:.1} GiB VRAM + {:.1} GiB pinned", c.gpu.name, gib(c.kept.0), gib(c.kept.1))).collect::<Vec<_>>().join("; ")));
@@ -1473,6 +1494,7 @@ impl<'g> MiniMax<'g> {
             g,
             layers,
             ds,
+            route_t0: Mutex::new(None),
             ds_f: Mutex::new(None),
             ds_caps: Mutex::new(HashMap::new()),
             out_norm,
@@ -1545,6 +1567,9 @@ impl<'g> MiniMax<'g> {
             }
         }
         let c = &self.counts;
+        if c.route_n.load(Relaxed) > 0 {
+            v.push(format!("[host from the doorbell to the VRAM experts queued: {:.1} us a layer]", c.route_ns.load(Relaxed) as f64 * 1e-3 / c.route_n.load(Relaxed) as f64));
+        }
         if c.draft_n.load(Relaxed) > 0 {
             v.push(format!("[drafter: {} passes, {:.1} ms each]", c.draft_n.load(Relaxed), c.draft_ns.load(Relaxed) as f64 * 1e-6 / c.draft_n.load(Relaxed) as f64));
         }
@@ -2213,6 +2238,7 @@ impl<'g> MiniMax<'g> {
             // SAFETY: ne floats at offset 64 of the bell, written before it rang.
             let v = unsafe { std::slice::from_raw_parts(cd.bell.device_view(64, ne * 4)?.ptr().cast::<f32>(), ne) }.to_vec();
             self.counts.rb_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            *self.route_t0.lock().unwrap() = Some(Instant::now());
             Some(v)
         } else {
             None
@@ -2489,7 +2515,20 @@ impl<'g> MiniMax<'g> {
                 mb.extend(info.iter().flat_map(|i| i.1.to_le_bytes()));
                 mb.extend(info.iter().flat_map(|i| i.2.to_le_bytes()));
                 mb.extend(info.iter().flat_map(|i| i.0.to_le_bytes()));
-                meta.write_async(0, &mb)?;
+                // NS_MM31_KCOPY=0: the runtime's memcpy
+                match self.k.silo_one.as_ref().filter(|_| kcopy_on() && mb.len() <= 2048) {
+                    Some(one) => {
+                        // a slot of the pinned ring (64 KiB from the bell's page on): its bytes are read by the kernel queued now, before the ring comes round (32 layers later, read-backs between)
+                        let at = cd.ring_at.fetch_add(1, Relaxed) % 32;
+                        let tb = cd.bell.device_view(4096 + at * 2048, 2048)?;
+                        // SAFETY: mb.len() <= 2048 bytes into the slot; whole words; meta holds them.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(mb.as_ptr(), tb.ptr().cast::<u8>(), mb.len());
+                            ffi::check((one.kcopy)(cd.gpu.raw(), meta.ptr().cast::<u32>(), tb.ptr().cast::<u32>().cast_const(), (mb.len() / 4) as i64), "kcopy")?;
+                        }
+                    }
+                    None => meta.write_async(0, &mb)?,
+                }
                 Some((h, meta, nall, nvh, jstart))
             }
             _ => None,
@@ -2592,6 +2631,10 @@ impl<'g> MiniMax<'g> {
         if fz.is_some() {
             if nv > 0 {
                 run_group(0, nv)?;
+            }
+            if let Some(t0) = self.route_t0.lock().unwrap().take() {
+                self.counts.route_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+                self.counts.route_n.fetch_add(1, Relaxed);
             }
         } else {
             for (ex, b) in &vram_hot {
@@ -2808,6 +2851,39 @@ impl<'g> MiniMax<'g> {
             let x = cd.ar().f32(c)?;
             let vals: Vec<u8> = (0..c).flat_map(|i| (((i * 2654435761) % 1000) as f32 * 0.002 - 1.0).to_le_bytes()).collect();
             x.write(0, &vals)?;
+            if let Some(sl) = nextsycl_core::silo(crate::ARCH).ok().flatten() {
+                let sym = sl.symbol("ns_mm3s_launch_bench");
+                if !sym.is_null() {
+                    let mut o = [0f64; 5];
+                    // SAFETY: the symbol has this signature; o its five values.
+                    unsafe {
+                        let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64) -> i32 = std::mem::transmute(sym);
+                        f(cd.gpu.raw(), o.as_mut_ptr());
+                    }
+                    eprintln!("[kbench {}: queuing a launch, host us: the queue {:.1}, a plain in-order queue {:.1}, discarded events {:.1}, enqueue functions {:.1}, the queue with a local accessor {:.1}]", cd.gpu.name.split_whitespace().rev().nth(1).unwrap_or("?"), o[0], o[1], o[2], o[3], o[4]);
+                }
+            }
+            // what a launch costs by itself: the host's time to queue one, the device's gap between two empty ones; a small read-back
+            if let Ok(api) = nextsycl_core::api() {
+                let mut tk = [0i64; 64];
+                cd.gpu.sync()?;
+                let t0 = Instant::now();
+                for t in tk.iter_mut() {
+                    // SAFETY: an out-pointer to the array's element.
+                    unsafe { (api.stamp)(cd.gpu.raw(), t) };
+                }
+                let host = t0.elapsed().as_secs_f64() / 64.0;
+                cd.gpu.sync()?;
+                let mut ns = 0f64;
+                // SAFETY: tickets of this queue; an out-pointer to a local.
+                unsafe { (api.elapsed)(cd.gpu.raw(), tk[0], tk[63], &mut ns) };
+                let rb = cd.ar().f32(128)?;
+                let t1 = Instant::now();
+                for _ in 0..32 {
+                    rb.to_f32()?;
+                }
+                eprintln!("[kbench {}: an empty launch: {:.1} us of the host to queue, {:.2} us on the device; a 512-byte read-back on an idle queue: {:.1} us]", cd.gpu.name.split_whitespace().rev().nth(1).unwrap_or("?"), host * 1e6, ns * 1e-3 / 63.0, t1.elapsed().as_secs_f64() * 1e6 / 32.0);
+            }
             let mut seen: Vec<String> = Vec::new();
             for l in cd.layers.clone() {
                 let Ffn::Moe(m) = &self.layers[l].ffn else { continue };
