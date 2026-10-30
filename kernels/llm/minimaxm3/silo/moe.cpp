@@ -11,6 +11,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 
@@ -20,7 +21,7 @@
 
 namespace {
 
-enum : int { T_IQ2_XXS = 16, T_IQ3_XXS = 18, T_IQ4_XS = 23, T_IQ1_M = 29 };
+enum : int { T_F32 = 0, T_Q5_K = 13, T_Q6_K = 14, T_IQ2_XXS = 16, T_IQ3_XXS = 18, T_IQ4_XS = 23, T_IQ1_M = 29 };
 
 constexpr int sb_bytes(int type) {
     switch (type) {
@@ -28,6 +29,9 @@ constexpr int sb_bytes(int type) {
         case T_IQ3_XXS: return 98;
         case T_IQ4_XS: return 136;
         case T_IQ1_M: return 56;
+        case T_Q5_K: return 176;
+        case T_Q6_K: return 210;
+        case T_F32: return 1024;
         default: return 0;
     }
 }
@@ -116,7 +120,91 @@ template <> struct Deq<T_IQ1_M> {
     }
 };
 
+// float32 rows (the indexer's): a group is 8 values as they are
+template <> struct Deq<T_F32> {
+    static void group(const uint8_t* b, int g, float* w, const Lut&) {
+        const sycl::float4* p = reinterpret_cast<const sycl::float4*>(b + 32 * g);
+        const sycl::float4 a = p[0], c = p[1];
+        w[0] = a.x(); w[1] = a.y(); w[2] = a.z(); w[3] = a.w(); w[4] = c.x(); w[5] = c.y(); w[6] = c.z(); w[7] = c.w();
+    }
+};
+
+// Q5_K and Q6_K: ggml's dequantize_row_q5_k / q6_k, group g of a block (the deepseek41 silo's)
+template <> struct Deq<T_Q5_K> {
+    static void group(const uint8_t* b, int g, float* w, const Lut&) {
+        const int v = g * 8, j = v >> 6, u = v & 63, hi = u >> 5, l0 = u & 31;
+        const int is = 2 * j + hi;
+        const uint8_t* q = b + 4;
+        const uint32_t sc = is < 4 ? (q[is] & 63) : ((q[is + 4] & 0xF) | ((q[is - 4] >> 6) << 4));
+        const uint32_t mn = is < 4 ? (q[is + 4] & 63) : ((q[is + 4] >> 4) | ((q[is] >> 6) << 4));
+        const float d1 = h2f(b) * sc, m1 = h2f(b + 2) * mn;
+        const uint8_t* qh = b + 16 + l0;
+        const uint8_t* qs = b + 48 + 32 * j + l0;
+        const int bit = 1 << is;
+        for (int k = 0; k < 8; ++k) w[k] = d1 * ((hi ? (qs[k] >> 4) : (qs[k] & 0xF)) + ((qh[k] & bit) ? 16 : 0)) - m1;
+    }
+};
+template <> struct Deq<T_Q6_K> {
+    static void group(const uint8_t* b, int g, float* w, const Lut&) {
+        const int v = g * 8, n = v >> 7, u = v & 127, quarter = u >> 5, l0 = u & 31;
+        const float d = h2f(b + 208);
+        const float sc = d * (float) (int8_t) b[192 + n * 8 + (l0 >> 4) + 2 * quarter];
+        const uint8_t* ql = b + n * 64 + (quarter & 1) * 32 + l0;
+        const uint8_t* qh = b + 128 + n * 32 + l0;
+        for (int k = 0; k < 8; ++k) {
+            const int lo = quarter < 2 ? (ql[k] & 0xF) : (ql[k] >> 4);
+            w[k] = sc * (float) ((lo | (((qh[k] >> (2 * quarter)) & 3) << 4)) - 32);
+        }
+    }
+};
+
 constexpr int SG = 32, RPG = 4;
+
+// y_m[r] = m_m[r] . x for up to three matrices of one type and one width in a launch (a layer's q, k, v), rows of each a multiple of RPG * RPS
+template <int T, int RPS>
+void mv3(sycl::queue& q, const uint8_t* m0, const uint8_t* m1, const uint8_t* m2, const float* x, float* y0, float* y1, float* y2, int64_t r0n, int64_t r1n, int64_t r2n, int64_t cols) {
+    constexpr int SB = sb_bytes(T), N64 = Tabs<T>::N64, N32 = Tabs<T>::N32;
+    const int64_t total = r0n + r1n + r2n, nb = cols / 256, rowb = nb * SB;
+    const int64_t rgs = (total + RPG * RPS - 1) / (RPG * RPS);
+    q.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<uint64_t, 1> l64(sycl::range<1>(N64 > 0 ? N64 : 1), hd);
+        sycl::local_accessor<uint32_t, 1> l32(sycl::range<1>(N32 > 0 ? N32 : 1), hd);
+        hd.parallel_for(sycl::nd_range<1>(rgs * RPG * SG, RPG * SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const auto sg = it.get_sub_group();
+            for (int i = it.get_local_linear_id(); i < N64; i += RPG * SG) l64[i] = Tabs<T>::t64(i);
+            for (int i = it.get_local_linear_id(); i < N32; i += RPG * SG) l32[i] = Tabs<T>::t32(i);
+            if (N64 > 0 || N32 > 0) sycl::group_barrier(it.get_group());
+            const Lut L{l64.template get_multi_ptr<sycl::access::decorated::no>().get(), l32.template get_multi_ptr<sycl::access::decorated::no>().get()};
+            const int64_t r00 = (it.get_group(0) * RPG + sg.get_group_id()[0]) * RPS;
+            const int lane = sg.get_local_id()[0];
+            if (r00 >= total) return;
+            const bool in0 = r00 < r0n, in1 = !in0 && r00 < r0n + r1n;
+            const uint8_t* base = in0 ? m0 : in1 ? m1 : m2;
+            float* yo = in0 ? y0 : in1 ? y1 : y2;
+            const int64_t rs = in0 ? r00 : in1 ? r00 - r0n : r00 - r0n - r1n;
+            const int64_t rn = in0 ? r0n : in1 ? r1n : r2n;
+            float acc[RPS] = {};
+            for (int64_t k = 0; k < nb; ++k) {
+                float w[RPS][8];
+#pragma unroll
+                for (int j = 0; j < RPS; ++j) {
+                    const int64_t r = rs + j < rn ? rs + j : rn - 1;
+                    Deq<T>::group(base + r * rowb + k * SB, lane, w[j], L);
+                }
+                const sycl::float4* xv = reinterpret_cast<const sycl::float4*>(x + k * 256 + lane * 8);
+                const sycl::float4 a = xv[0], b = xv[1];
+#pragma unroll
+                for (int j = 0; j < RPS; ++j)
+                    acc[j] += w[j][0] * a.x() + w[j][1] * a.y() + w[j][2] * a.z() + w[j][3] * a.w() + w[j][4] * b.x() + w[j][5] * b.y() + w[j][6] * b.z() + w[j][7] * b.w();
+            }
+#pragma unroll
+            for (int j = 0; j < RPS; ++j) {
+                const float v = sycl::reduce_over_group(sg, acc[j], sycl::plus<float>());
+                if (lane == 0 && rs + j < rn) yo[rs + j] = v;
+            }
+        });
+    });
+}
 
 // h[e * rows + r] = swiglu_oai(gate_e[r] . x, up_e[r] . x) for the entries' experts: bases[e] the expert's gate matrix, the up matrix
 // `off_up` bytes after it. A sub-group works RPS output rows (both of their matrices) at once.
@@ -234,6 +322,100 @@ extern "C" {
 
 int ns_mm3s_expert_supported(int type, int64_t cols) { return sb_bytes(type) != 0 && cols > 0 && cols % 256 == 0; }
 
+int ns_mm3s_mv3(ns_gpu* g, int type, const void* m0, const void* m1, const void* m2, const float* x, float* y0, float* y1, float* y2, int64_t r0, int64_t r1, int64_t r2, int64_t cols) {
+    NS_TRY
+    if (!ns_mm3s_expert_supported(type, cols)) return ns_fail("ns_mm3s_mv3: type " + std::to_string(type) + " with cols " + std::to_string(cols));
+    if ((r0 % (RPG * 2)) || (r1 % (RPG * 2))) return ns_fail("ns_mm3s_mv3: rows of the first matrices");
+    const auto* a = (const uint8_t*) m0; const auto* b = (const uint8_t*) m1; const auto* c = (const uint8_t*) m2;
+#define MV(T) mv3<T, 2>(g->q, a, b, c, x, y0, y1, y2, r0, r1, r2, cols); return 0;
+    switch (type) {
+        case T_F32: MV(T_F32)
+        case T_Q5_K: MV(T_Q5_K)
+        case T_Q6_K: MV(T_Q6_K)
+        case T_IQ2_XXS: MV(T_IQ2_XXS)
+        case T_IQ1_M: MV(T_IQ1_M)
+        case T_IQ3_XXS: MV(T_IQ3_XXS)
+        case T_IQ4_XS: MV(T_IQ4_XS)
+        default: return ns_fail("ns_mm3s_mv3: type");
+    }
+#undef MV
+    NS_CATCH
+}
+
+// After the projections of a decode token: q and k (and the indexer's q and k) RMS-normed per head and rotated (NEOX), k, v and the indexer's k stored as fp16,
+// all in a launch, a work-group a head
+int ns_mm3s_attn_post(ns_gpu* g, float* q, float* k, const float* v, float* iq, float* ik, const float* qn, const float* kn, const float* iqn, const float* ikn, uint16_t* kc, uint16_t* vc, uint16_t* ic,
+                      int64_t H, int64_t G, int64_t IH, int64_t HD, int64_t n_rot, int64_t pos, float base, float eps) {
+    NS_TRY
+    if (n_rot % 2 || n_rot > HD) return ns_fail("ns_mm3s_attn_post: n_rot");
+    const int64_t half = n_rot / 2, heads = H + 2 * G + (IH > 0 ? IH + 1 : 0);
+    const float ts = powf(base, -2.0f / (float) n_rot);
+    g->q.parallel_for(sycl::nd_range<1>((size_t) (heads * HD), (size_t) HD), [=](sycl::nd_item<1> it) {
+        const int64_t gr = it.get_group(0);
+        const int lid = (int) it.get_local_id(0);
+        float* p;
+        const float* w = nullptr;
+        uint16_t* store = nullptr;
+        if (gr < H) { p = q + gr * HD; w = qn; }
+        else if (gr < H + G) { p = k + (gr - H) * HD; w = kn; store = kc + (gr - H) * HD; }
+        else if (gr < H + 2 * G) { p = const_cast<float*>(v) + (gr - H - G) * HD; store = vc + (gr - H - G) * HD; }
+        else if (gr < H + 2 * G + IH) { p = iq + (gr - H - 2 * G) * HD; w = iqn; }
+        else { p = ik; w = ikn; store = ic; }
+        float out = p[lid];
+        if (w) {
+            float sq = out * out;
+            sq = sycl::reduce_over_group(it.get_group(), sq, sycl::plus<float>());
+            const float inv = 1.f / sycl::sqrt(sq / (float) HD + eps);
+            const bool rot = lid < 2 * half;
+            if (rot) {
+                const int i = lid % half;
+                const int other = lid < half ? lid + half : lid - half;
+                float theta = (float) pos;
+                for (int j = 0; j < i; ++j) theta *= ts;
+                const float c = sycl::cos(theta), s = sycl::sin(theta);
+                const float me = out * inv * w[lid], them = p[other] * inv * w[other];
+                out = lid < half ? me * c - them * s : them * s + me * c;
+            } else {
+                out = out * inv * w[lid];
+            }
+        }
+        sycl::group_barrier(it.get_group());
+        if (w) p[lid] = out;
+        if (store) reinterpret_cast<sycl::half*>(store)[lid] = (sycl::half) out;
+    });
+    return 0;
+    NS_CATCH
+}
+
+// att = o + x; hn = rms_norm(att) * w, in a launch
+int ns_mm3s_add_norm(ns_gpu* g, float* att, const float* o, const float* x, const float* w, float* hn, int64_t C, float eps) {
+    NS_TRY
+    constexpr int WG = 256;
+    g->q.parallel_for(sycl::nd_range<1>((size_t) WG, WG), [=](sycl::nd_item<1> it) {
+        float s = 0.f;
+        const int lid = (int) it.get_local_id(0);
+        for (int64_t c = lid; c < C; c += WG) { const float v = o[c] + x[c]; s += v * v; }
+        s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+        const float inv = 1.f / sycl::sqrt(s / (float) C + eps);
+        for (int64_t c = lid; c < C; c += WG) { const float v = o[c] + x[c]; att[c] = v; hn[c] = v * inv * w[c]; }
+    });
+    return 0;
+    NS_CATCH
+}
+
+// out = the rank planes summed in rank order + sh + att
+int ns_mm3s_finish(ns_gpu* g, const float* ys, int64_t used, const float* sh, const float* att, float* out, int64_t C) {
+    NS_TRY
+    g->q.parallel_for(sycl::range<1>((size_t) C), [=](sycl::id<1> id) {
+        const int64_t c = id[0];
+        float a = ys[c];
+        for (int64_t r = 1; r < used; ++r) a += ys[r * C + c];
+        out[c] = a + sh[c] + att[c];
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_mm3s_expert_gu(ns_gpu* g, int type, const uint64_t* bases, int64_t off_up, const float* x, float* h, int64_t entries, int64_t rows, int64_t cols, float alpha,
                       float limit) {
     NS_TRY
@@ -247,6 +429,8 @@ int ns_mm3s_expert_gu(ns_gpu* g, int type, const uint64_t* bases, int64_t off_up
         case T_IQ1_M: RUN(T_IQ1_M)
         case T_IQ3_XXS: RUN(T_IQ3_XXS)
         case T_IQ4_XS: RUN(T_IQ4_XS)
+        case T_Q5_K: RUN(T_Q5_K)
+        case T_Q6_K: RUN(T_Q6_K)
         default: return ns_fail("ns_mm3s_expert_gu: type");
     }
 #undef RUN
@@ -266,6 +450,8 @@ int ns_mm3s_expert_down(ns_gpu* g, int type, const uint64_t* bases, int64_t off_
         case T_IQ1_M: RUN(T_IQ1_M)
         case T_IQ3_XXS: RUN(T_IQ3_XXS)
         case T_IQ4_XS: RUN(T_IQ4_XS)
+        case T_Q5_K: RUN(T_Q5_K)
+        case T_Q6_K: RUN(T_Q6_K)
         default: return ns_fail("ns_mm3s_expert_down: type");
     }
 #undef RUN

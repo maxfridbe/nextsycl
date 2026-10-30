@@ -34,6 +34,16 @@ int ns_mm3s_expert_gu(ns_gpu* g, int type, const uint64_t* bases, int64_t off_up
 int ns_mm3s_expert_down(ns_gpu* g, int type, const uint64_t* bases, int64_t off_down, const float* h, const float* w, const int32_t* rank, float* ys, int64_t plane,
                         int64_t entries, int64_t rows, int64_t cols);
 
+/* y_i[r] = m_i[r] . x for up to three matrices of one type and width in a launch (r_i rows; r0 and r1 multiples of 8; float activations) */
+int ns_mm3s_mv3(ns_gpu* g, int type, const void* m0, const void* m1, const void* m2, const float* x, float* y0, float* y1, float* y2, int64_t r0, int64_t r1, int64_t r2, int64_t cols);
+/* A decode token's attention after its projections: q, k, iq, ik normed and rotated in place, k, v, ik stored as fp16 (at the token's position), a launch; IH = 0: no indexer */
+int ns_mm3s_attn_post(ns_gpu* g, float* q, float* k, const float* v, float* iq, float* ik, const float* qn, const float* kn, const float* iqn, const float* ikn, uint16_t* kc, uint16_t* vc, uint16_t* ic,
+                      int64_t H, int64_t G, int64_t IH, int64_t HD, int64_t n_rot, int64_t pos, float base, float eps);
+/* att = o + x, hn = rms_norm(att) * w */
+int ns_mm3s_add_norm(ns_gpu* g, float* att, const float* o, const float* x, const float* w, float* hn, int64_t C, float eps);
+/* out = the `used` planes of ys in rank order + sh + att */
+int ns_mm3s_finish(ns_gpu* g, const float* ys, int64_t used, const float* sh, const float* att, float* out, int64_t C);
+
 #ifdef __cplusplus
 }
 #endif
