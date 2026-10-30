@@ -1032,7 +1032,8 @@ impl<'g> MiniMax<'g> {
         let kv_tokens = if kv.0 > 0 { kv.0 } else { 32768 };
         let n_sparse_of = |r: &std::ops::Range<usize>| layers[r.clone()].iter().filter(|l| l.idx.is_some()).count();
         let per_tok = |r: &std::ops::Range<usize>| r.len() * 2 * (g.n_kv_head * g.head_dim) as usize * 2 + n_sparse_of(r) * g.indexer.key_len as usize * 2;
-        let arena_bytes = 1536usize << 20;
+        // a prompt pass of 4096 rows fits 1.5 GiB; larger chunks take about 250 KiB a row
+        let arena_bytes = (1536usize << 20).max(prefill_chunk() * (250 << 10));
         let mut vram_left = Vec::new();
         for (c, gpu) in gpus.iter().enumerate() {
             let (total, free) = gpu.memory()?;
@@ -2711,7 +2712,8 @@ impl<'g> MiniMax<'g> {
             self.lap(cd, l, 7, &mut tm);
             // NS_MM31_FORCE=DIR (Debug): the layer's output replaced by the reference dump's, so the next layer is
             // compared on the reference's own input (exactness per layer, not the noise of 60 layers added up)
-            if let Some(dir) = std::env::var_os("NS_MM31_FORCE") {
+            // (wide passes only: at one token the dump's layer 59, one row, would replace the output and the decode line would measure nothing)
+            if let Some(dir) = std::env::var_os("NS_MM31_FORCE").filter(|_| t > 1) {
                 let path = std::path::Path::new(&dir).join(format!("l_out-{l}.f32"));
                 if let Ok(raw) = std::fs::read(&path) {
                     if raw.len() == t * c * 4 {

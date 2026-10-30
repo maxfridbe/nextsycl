@@ -31,13 +31,10 @@ struct Slm {
     static constexpr int q = NG * M * HALF_D / 2;
     static constexpr int words = (k + v + s > q ? k + v + s : q) + p + st;
 };
-}  // namespace
 
-extern "C" {
-
-int ns_mm3s_attend_x(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G, int64_t pos0, float /*scale*/) {
-    NS_TRY
-    if (!ns_mm3s_attend_supported(H, G, D)) return ns_fail("ns_mm3s_attend_x: 16 heads a group of 128 values");
+// SPLIT (decode): a work-group a (query row, group, split of 128 keys), each head's partial softmax state [m, l, values] into `part` (T * G * S * 16 * 130 floats, log2 units), merged after
+template <bool SPLIT>
+void attx(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G, int64_t pos0, int64_t S, float* part) {
     constexpr int NSG = 2 * NG, WG = NSG * SG;
     const float qscale = 1.0f / sycl::sqrt((float) D) * 1.4426950408889634f;
     const uint8_t* kc8 = (const uint8_t*) kc;
@@ -45,11 +42,11 @@ int ns_mm3s_attend_x(ns_gpu* g, const float* q, const uint16_t* kc, const uint16
     using L = Slm;
     g->q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(L::words), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * G) * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * G * S) * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             auto sg = it.get_sub_group();
             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id(), tid = (int) it.get_local_id(0);
             const int hg = sgi >> 1, hd = sgi & 1;  // this sub-group's row set and its half of the features
-            const int64_t gid = it.get_group(0), t = gid / G, gi = gid % G, pos = pos0 + t;
+            const int64_t grp = it.get_group(0), spl = grp % S, gid = grp / S, t = gid / G, gi = gid % G, pos = pos0 + t;
             uint32_t* base = slm.get_multi_ptr<sycl::access::decorated::no>().get();
             uint32_t* kp = base;
             uint32_t* vp = kp + L::k;
@@ -82,7 +79,8 @@ int ns_mm3s_attend_x(ns_gpu* g, const float* q, const uint16_t* kc, const uint16
 #pragma unroll
             for (int u = 0; u < HALF_D / 16; ++u) jm::joint_matrix_fill(sg, o[u], 0.0f);
 
-            for (int64_t c0 = 0; c0 < total; c0 += CH) {
+            const int64_t c_lo = SPLIT ? spl * 128 : 0, c_hi = SPLIT ? sycl::min<int64_t>(total, (spl + 1) * 128) : total;
+            for (int64_t c0 = c_lo; c0 < c_hi; c0 += CH) {
                 // the chunk's first key; 16 keys in a row (a block is 128 of them)
                 int64_t j0 = c0;
                 bool none = false;
@@ -91,7 +89,7 @@ int ns_mm3s_attend_x(ns_gpu* g, const float* q, const uint16_t* kc, const uint16
                     if (b < 0) none = true;
                     j0 = (int64_t) b * 128 + c0 % 128;
                 }
-                const int n_here = (int) sycl::min<int64_t>(CH, total - c0);
+                const int n_here = (int) sycl::min<int64_t>(CH, c_hi - c0);
                 // the keys this query may see: j0 + n <= pos, n < n_here
                 const auto vis = [=](int n) { return !none && n < n_here && j0 + n <= pos; };
                 for (int i = tid; i < CH * (D / 8); i += WG) {  // K: key n, features 8c .. 8c + 7 -> words [4c .. 4c + 3][n]
@@ -185,17 +183,76 @@ int ns_mm3s_attend_x(ns_gpu* g, const float* q, const uint16_t* kc, const uint16
                 }
                 sycl::group_barrier(it.get_group());
             }
-            // the heads' outputs: O / l
             const float* lr = lrow + hg * M;
-            float* ob = out + (t * H + gi * 16 + hg * M) * D + hd * HALF_D;
+            const float* mr = mrow + hg * M;
+            if constexpr (SPLIT) {
+                float* pb = part + (((t * G + gi) * S + spl) * 16 + hg * M) * (D + 2);
+                // through local memory: a tile's row stride must be a multiple of 16 for the global store, and this one is 130
+                float* scratch = sp + sgi * (M * 16);
 #pragma unroll
-            for (int u = 0; u < HALF_D / 16; ++u) {
-                int e = 0;
-                jm::joint_matrix_apply(sg, o[u], [&](float& x) { x = lr[e] > 0.0f ? x / lr[e] : 0.0f; ++e; });
-                jm::joint_matrix_store(sg, o[u], gp(ob + u * 16), (size_t) D, jm::layout::row_major);
+                for (int u = 0; u < HALF_D / 16; ++u) {
+                    jm::joint_matrix_store(sg, o[u], lp(scratch), (size_t) 16, jm::layout::row_major);
+                    sycl::group_barrier(sg);
+                    for (int r = 0; r < M; ++r) pb[r * (D + 2) + 2 + hd * HALF_D + u * 16 + lane] = scratch[r * 16 + lane];
+                    sycl::group_barrier(sg);
+                }
+                if (sgi % 2 == 0)
+                    for (int r = lane; r < M; r += SG) {
+                        pb[r * (D + 2)] = mr[r];
+                        pb[r * (D + 2) + 1] = lr[r];
+                    }
+            } else {
+                // the heads' outputs: O / l
+                float* ob = out + (t * H + gi * 16 + hg * M) * D + hd * HALF_D;
+#pragma unroll
+                for (int u = 0; u < HALF_D / 16; ++u) {
+                    int e = 0;
+                    jm::joint_matrix_apply(sg, o[u], [&](float& x) { x = lr[e] > 0.0f ? x / lr[e] : 0.0f; ++e; });
+                    jm::joint_matrix_store(sg, o[u], gp(ob + u * 16), (size_t) D, jm::layout::row_major);
+                }
             }
         });
     });
+    if constexpr (SPLIT) {
+        // out = sum_s acc_s 2^(m_s - M) / sum_s l_s 2^(m_s - M)
+        g->q.parallel_for(sycl::nd_range<1>((size_t) (T * H * D), D), [=](sycl::nd_item<1> it) {
+            const int64_t grp = it.get_group(0);
+            const int d = (int) it.get_local_id(0);
+            const int64_t t = grp / H, hq = grp % H, gi = hq / 16, hh = hq % 16;
+            const float* base = part + (((t * G + gi) * S) * 16 + hh) * (D + 2);
+            const int64_t stride = (int64_t) 16 * (D + 2);
+            float M_ = -INFINITY;
+            for (int64_t s = 0; s < S; ++s) M_ = sycl::fmax(M_, base[s * stride]);
+            float L = 0.f, A = 0.f;
+            if (M_ > -INFINITY) {
+                for (int64_t s = 0; s < S; ++s) {
+                    const float ms = base[s * stride];
+                    if (ms == -INFINITY) continue;
+                    const float w = sycl::exp2(ms - M_);
+                    L += base[s * stride + 1] * w;
+                    A += base[s * stride + 2 + d] * w;
+                }
+            }
+            out[(t * H + hq) * D + d] = L > 0.f ? A / L : 0.f;
+        });
+    }
+}
+}  // namespace
+
+extern "C" {
+
+int ns_mm3s_attend_x(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G, int64_t pos0, float /*scale*/) {
+    NS_TRY
+    if (!ns_mm3s_attend_supported(H, G, D)) return ns_fail("ns_mm3s_attend_x: 16 heads a group of 128 values");
+    attx<false>(g, q, kc, vc, sel, K, out, T, H, G, pos0, 1, nullptr);
+    return 0;
+    NS_CATCH
+}
+
+int ns_mm3s_attend_x_split(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G, int64_t pos0, float /*scale*/, int64_t S, float* part) {
+    NS_TRY
+    if (!ns_mm3s_attend_supported(H, G, D)) return ns_fail("ns_mm3s_attend_x_split: 16 heads a group of 128 values");
+    attx<true>(g, q, kc, vc, sel, K, out, T, H, G, pos0, S, part);
     return 0;
     NS_CATCH
 }

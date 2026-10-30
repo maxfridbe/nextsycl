@@ -23,6 +23,10 @@ int ns_mm3s_attend(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t
 int ns_mm3s_attend_x(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G,
                      int64_t pos0, float scale);
 
+/* ns_mm3s_attend_split on XMX: the same arguments, q to half */
+int ns_mm3s_attend_x_split(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G,
+                           int64_t pos0, float scale, int64_t S, float* part);
+
 /* The same for a few query rows (decode): the keys split in chunks of 128, a work-group each (S = ceil(keys / 128) chunks,
  * keys = K * 128 selected or pos0 + T), their partial softmax states in `part` (T * G * S * 16 * 130 floats), merged by a second kernel */
 int ns_mm3s_attend_split(ns_gpu* g, const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* sel, int64_t K, float* out, int64_t T, int64_t H, int64_t G,

@@ -147,7 +147,9 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
                 })
             }),
             silo_attend_split: nextsycl_core::silo(crate::ARCH).ok().flatten().and_then(|s| {
-                let p = s.symbol("ns_mm3s_attend_split");
+                // NS_MM31_ATTX=0: the vector-unit decode attention, not the XMX one
+                let name = if std::env::var("NS_MM31_ATTX").is_ok_and(|v| v == "0") { "ns_mm3s_attend_split" } else { "ns_mm3s_attend_x_split" };
+                let p = s.symbol(name);
                 // SAFETY: the symbol is declared in mm3s.h with SplitFn's signature.
                 (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, SplitFn>(p) })
             }),
