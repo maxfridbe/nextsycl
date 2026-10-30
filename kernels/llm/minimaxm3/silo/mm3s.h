@@ -53,6 +53,8 @@ int ns_mm3s_to_half(ns_gpu* g, int type, const void* src, int64_t nv, uint16_t* 
 int ns_mm3s_doorbell(ns_gpu* g, uint32_t* flag, uint32_t seq);
 /* f[r * stride + at + c] = x[r * C + c] */
 int ns_mm3s_put_cols(ns_gpu* g, const float* x, float* f, int64_t T, int64_t C, int64_t stride, int64_t at);
+/* An empty kernel on this thread's own queue, waited for */
+int ns_mm3s_ping(ns_gpu* g);
 /* A small table (whole words) from pinned memory into VRAM in a kernel */
 int ns_mm3s_kcopy(ns_gpu* g, uint32_t* dst, const uint32_t* src, int64_t words);
 /* *best = the argmax of base + bias over n values */

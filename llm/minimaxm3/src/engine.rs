@@ -296,6 +296,17 @@ thread_local! {
     static BOUNCE: std::cell::RefCell<Bounce> = const { std::cell::RefCell::new(Bounce { ptr: std::ptr::null_mut(), cap: 0 }) };
 }
 
+extern "C" {
+    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+}
+
+/// The file's pages out of the page cache (POSIX_FADV_DONTNEED): writing the stream file must not leave 34 GiB there in place of the warm tier
+fn drop_cache(f: &std::fs::File, len: i64) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a valid descriptor; advice only.
+    unsafe { posix_fadvise(f.as_raw_fd(), 0, len, 4) };
+}
+
 /// A destination pointer a reader thread may write through (the owner keeps the memory and waits for the thread)
 #[derive(Clone, Copy)]
 struct SendPtr(*mut u8);
@@ -307,8 +318,8 @@ unsafe impl Send for SendPtr {}
 struct Reader {
     files: Vec<(std::fs::File, Option<std::fs::File>)>,
     bytes: AtomicU64,
-    /// after the load: reads through the page cache, which then holds what the prompt and the last tokens read (reclaimable, not pinned: the third tier)
-    cached: std::sync::atomic::AtomicBool,
+    /// NS_MM31_DIRECT: Some(true) O_DIRECT always, Some(false) the page cache always, None by the expert (the warm tier and decode through the cache, the rest direct)
+    force: Option<bool>,
 }
 
 /// O_DIRECT's value on Linux x86-64 / aarch64 (no libc crate in the workspace for one constant)
@@ -323,16 +334,21 @@ impl Reader {
             let d = if direct { std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(p).ok() } else { None };
             files.push((b, d));
         }
-        Ok(Reader { files, bytes: AtomicU64::new(0), cached: false.into() })
+        let force = match std::env::var("NS_MM31_DIRECT").as_deref() {
+            Ok("1") => Some(true),
+            Ok("0") => Some(false),
+            _ => None,
+        };
+        Ok(Reader { files, bytes: AtomicU64::new(0), force })
     }
 
     /// `len` bytes at file offset `off` of shard `shard` into `dst`
-    fn read(&self, shard: usize, off: u64, dst: *mut u8, len: usize) -> std::io::Result<()> {
+    fn read(&self, shard: usize, off: u64, dst: *mut u8, len: usize, cached: bool) -> std::io::Result<()> {
         self.bytes.fetch_add(len as u64, Relaxed);
         // SAFETY: the caller owns dst[..len] and no one else touches it until this returns.
         let out = unsafe { std::slice::from_raw_parts_mut(dst, len) };
         let (b, d) = &self.files[shard];
-        let Some(d) = d.as_ref().filter(|_| !self.cached.load(Relaxed)) else { return b.read_exact_at(out, off) };
+        let Some(d) = d.as_ref().filter(|_| self.force.unwrap_or(!cached)) else { return b.read_exact_at(out, off) };
         let a0 = off & !4095;
         let end = off + len as u64;
         let a1 = end.div_ceil(4096) * 4096;
@@ -370,6 +386,31 @@ struct Src {
     mats: [(usize, u64, usize, usize); 3],
     /// the same expert's other copies, on other drives: (shard, offset of the expert's region there); the pieces of a read go round the drives
     alts: Vec<(usize, u64)>,
+    /// through the page cache (the warm tier's, and decode's)
+    cached: bool,
+}
+
+impl Src {
+    /// The pieces of a read: (shard, file offset, bytes, offset in the slot). A read of an expert always takes the same pieces, so what the warm tier cached is found again
+    fn pieces(&self, parts: usize) -> Vec<(usize, u64, usize, usize)> {
+        let mut v = Vec::new();
+        for &(shard, off, len, at) in &self.mats {
+            let n = parts.min(len.div_ceil(1 << 20)).max(1);
+            let piece = len.div_ceil(n).next_multiple_of(4096);
+            let (mut done, mut i) = (0usize, 0usize);
+            while done < len {
+                let l = piece.min(len - done);
+                let (sh, o) = match i % (1 + self.alts.len()) {
+                    0 => (shard, off + done as u64),
+                    k => (self.alts[k - 1].0, self.alts[k - 1].1 + (at + done) as u64),
+                };
+                v.push((sh, o, l, at + done));
+                done += l;
+                i += 1;
+            }
+        }
+        v
+    }
 }
 
 /// One piece of a read, done or not: the pool's worker sets it
@@ -453,44 +494,35 @@ fn join_all(hs: Reads) -> Result<()> {
 }
 
 fn spawn_reads(r: &Arc<Reader>, src: Src, dst: *mut u8) -> Reads {
-    // a matrix is read as `parts` pieces at once (each its own request: the drive is kept busy with several), NS_MM31_SPLITREAD
-    static PARTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let parts = *PARTS.get_or_init(|| std::env::var("NS_MM31_SPLITREAD").ok().and_then(|v| v.parse().ok()).filter(|v: &usize| *v > 0).unwrap_or(8));
+    let parts = read_parts();
     let mut hs = Reads::new();
     let pool = read_pool();
     let mut q = pool.q.lock().unwrap();
-    for &(shard, off, len, at) in &src.mats {
-        let n = parts.min(len.div_ceil(1 << 20)).max(1);
-        let piece = len.div_ceil(n).next_multiple_of(4096);
-        let mut done = 0usize;
-        let mut i = 0usize;
-        while done < len {
-            let l = piece.min(len - done);
-            let r = r.clone();
-            // SAFETY: at + done + l is inside the slot dst points to (the slot sizes are computed from these).
-            let p = SendPtr(unsafe { dst.add(at + done) });
-            // the pieces go round the drives that hold a copy
-            let (sh, o) = match i % (1 + src.alts.len()) {
-                0 => (shard, off + done as u64),
-                k => (src.alts[k - 1].0, src.alts[k - 1].1 + (at + done) as u64),
-            };
-            let st = Arc::new(PieceState::default());
-            let st2 = st.clone();
-            q.push_back(Box::new(move || {
-                let p = p;
-                if let Err(x) = r.read(sh, o, p.0, l) {
-                    *st2.err.lock().unwrap() = Some(x.to_string());
-                }
-                st2.done.store(true, std::sync::atomic::Ordering::Release);
-            }));
-            hs.push(ReadHandle(st));
-            done += l;
-            i += 1;
-        }
+    let cached = src.cached;
+    for (sh, o, l, at) in src.pieces(parts) {
+        let r = r.clone();
+        // SAFETY: at + l is inside the slot dst points to (the slot sizes are computed from these).
+        let p = SendPtr(unsafe { dst.add(at) });
+        let st = Arc::new(PieceState::default());
+        let st2 = st.clone();
+        q.push_back(Box::new(move || {
+            let p = p;
+            if let Err(x) = r.read(sh, o, p.0, l, cached) {
+                *st2.err.lock().unwrap() = Some(x.to_string());
+            }
+            st2.done.store(true, std::sync::atomic::Ordering::Release);
+        }));
+        hs.push(ReadHandle(st));
     }
     drop(q);
     pool.cv.notify_all();
     hs
+}
+
+/// The pieces a matrix is read in at once (NS_MM31_SPLITREAD)
+fn read_parts() -> usize {
+    static PARTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PARTS.get_or_init(|| std::env::var("NS_MM31_SPLITREAD").ok().and_then(|v| v.parse().ok()).filter(|v: &usize| *v > 0).unwrap_or(8))
 }
 
 // ---- the model's parts
@@ -565,6 +597,8 @@ struct Moe {
     shared: Dense,
     /// where an expert's bytes are in the stream file (the second drive's copy of the experts that are not on the cards), or MAX
     stream: Vec<u64>,
+    /// experts kept in the page cache (the warm tier)
+    warm: Vec<bool>,
     /// the shards of the stream files (one a drive of NS_MM31_STREAM_DIR)
     stream_shards: Vec<usize>,
 }
@@ -590,7 +624,7 @@ impl Moe {
             None => Vec::new(),
         };
         let m = |w: &Experts, at: usize| (w.shard, w.offset + (ex * w.stride) as u64, w.stride, at);
-        Src { mats: [m(&self.gate, 0), m(&self.up, u), m(&self.down, d)], alts }
+        Src { mats: [m(&self.gate, 0), m(&self.up, u), m(&self.down, d)], alts, cached: self.warm[ex] }
     }
 }
 
@@ -754,6 +788,8 @@ struct Counts {
     /// the host's time from the doorbell to the layer's VRAM experts queued (what the shared expert behind the router hides), and how many
     route_ns: AtomicU64,
     route_n: AtomicU64,
+    /// a decode's file reads by the wait for them: under 1 ms, under 2 ms, longer
+    read_wait: [AtomicU64; 3],
     /// the drafter's passes and the nanoseconds of the host in them
     draft_ns: AtomicU64,
     draft_n: AtomicU64,
@@ -800,6 +836,9 @@ pub struct MiniMax<'g> {
     gpf: bool,
     stamps: Mutex<Vec<(u8, i64, usize)>>,
     gtab: Mutex<[f64; 6]>,
+    /// NS_PROFILE=gpu: a one-token attention's steps, stamps (step, ticket, card) and seconds [card][step]: q k v, indexer q k, norms + rope + stores, scores, top-k, attend, o
+    astamps: Mutex<Vec<(u8, i64, usize)>>,
+    atab: Mutex<[[f64; 8]; 2]>,
     /// NS_PROFILE=gpu: experts' device time by card (seconds, layers) for layers whose experts were all in VRAM, and for the others
     gclean: Mutex<[[(f64, u64); 3]; 2]>,
     /// whether the layer now running had all its experts in VRAM (set by moe, read by the stamps' flush)
@@ -984,6 +1023,7 @@ fn load_part(f: &Gguf, g: &Geometry, gpu: &Arc<Gpu>, range: std::ops::Range<usiz
                 up: experts(f, n("ffn_up_exps"), ne)?,
                 down: experts(f, n("ffn_down_exps"), ne)?,
                 stream: Vec::new(),
+                warm: vec![false; ne],
                 stream_shards: Vec::new(),
                 shared: Dense {
                     gate: mat(f, gpu, &n("ffn_gate_shexp"), &mut bytes)?,
@@ -1116,6 +1156,24 @@ impl<'g> MiniMax<'g> {
                     norm: nraw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
                     bias: m.bias.clone(),
                 }));
+            }
+        }
+        if let Some(us) = std::env::var("NS_MM31_KEEPALIVE_US").ok().and_then(|v| v.parse::<u64>().ok()).filter(|v| *v > 0) {
+            // an empty kernel on a queue of its own, on every card, every `us`: the GT never goes to sleep between a token's layers (for the experiment: it runs as long as the process)
+            if let Some(sl) = nextsycl_core::silo(crate::ARCH).ok().flatten() {
+                let sym = sl.symbol("ns_mm3s_ping");
+                if !sym.is_null() {
+                    // SAFETY: the symbol has this signature.
+                    let f: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32 = unsafe { std::mem::transmute(sym) };
+                    for gpu in gpus.iter() {
+                        let g2 = gpu.clone();
+                        std::thread::spawn(move || loop {
+                            // SAFETY: the card outlives the process's use of it here (the Arc is held).
+                            unsafe { f(g2.raw()) };
+                            std::thread::sleep(std::time::Duration::from_micros(us));
+                        });
+                    }
+                }
             }
         }
         let guesser = (!guess_layers.is_empty()).then(|| Guesser::start(guess_layers, g.rms_eps as f32));
@@ -1366,7 +1424,7 @@ impl<'g> MiniMax<'g> {
                                     tmp.resize(r, 0);
                                     let res = (|| -> Result<()> {
                                         for &(shard, off, len, at) in &m.src(x).mats {
-                                            reader.read(shard, off, tmp[at..].as_mut_ptr(), len).map_err(e)?;
+                                            reader.read(shard, off, tmp[at..].as_mut_ptr(), len, false).map_err(e)?;
                                         }
                                         out.write_all_at(&tmp, offs[i]).map_err(e)
                                     })();
@@ -1382,6 +1440,7 @@ impl<'g> MiniMax<'g> {
                         return Err(x);
                     }
                     out.sync_all().map_err(e)?;
+                    drop_cache(&out, at as i64);
                     std::fs::rename(&part, &path).map_err(e)?;
                     log(format!("stream file written in {:.0} s", t_b.elapsed().as_secs_f64()));
                 }
@@ -1428,13 +1487,13 @@ impl<'g> MiniMax<'g> {
                                 if r.vram {
                                     tmp.resize(tot, 0);
                                     for &(shard, off, len, at) in &src.mats {
-                                        reader.read(shard, off, tmp[at..].as_mut_ptr(), len).map_err(e)?;
+                                        reader.read(shard, off, tmp[at..].as_mut_ptr(), len, false).map_err(e)?;
                                     }
                                     r.buf.write(0, &tmp)
                                 } else {
                                     for &(shard, off, len, at) in &src.mats {
                                         // SAFETY: at + len is inside this expert's slot, which no one else writes.
-                                        reader.read(shard, off, unsafe { r.buf.ptr().cast::<u8>().add(at) }, len).map_err(e)?;
+                                        reader.read(shard, off, unsafe { r.buf.ptr().cast::<u8>().add(at) }, len, false).map_err(e)?;
                                     }
                                     Ok(())
                                 }
@@ -1467,9 +1526,83 @@ impl<'g> MiniMax<'g> {
                 r?;
             }
         }
-        // NS_MM31_DIRECT=1: O_DIRECT at run time too
-        if std::env::var("NS_MM31_DIRECT").map_or(true, |v| v != "1") {
-            reader.cached.store(true, Relaxed);
+        // the warm tier: the next-ranked experts read once through the page cache, up to what leaves NS_MM31_CACHE_MARGIN_GIB available. Not pinned, not locked: the kernel takes them
+        // back when anything needs the memory, and a prompt pass's other experts go O_DIRECT, so they do not push these out
+        let margin = (env_f64("NS_MM31_CACHE_MARGIN_GIB").unwrap_or(10.0) * GIB as f64) as usize;
+        let mut budget = match env_f64("NS_MM31_CACHE_GIB") {
+            Some(v) => ((v * GIB as f64) as usize).min(mem_available().saturating_sub(margin)),
+            None => mem_available().saturating_sub(margin),
+        };
+        let mut cand: Vec<(f64, usize, usize, usize)> = Vec::new();
+        for c in &cards {
+            for l in c.layers.clone() {
+                if let Ffn::Moe(m) = &layers[l].ffn {
+                    for x in 0..g.n_expert as usize {
+                        if c.res[l - c.layers.start][x].is_none() {
+                            let w = profile.as_ref().map_or(0.0, |p| p.get(&(l, x)).copied().unwrap_or(0.0));
+                            cand.push((w, (x * 37 + l * 11) % g.n_expert as usize, l, x));
+                        }
+                    }
+                    let _ = m;
+                }
+            }
+        }
+        cand.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut chosen: Vec<(usize, usize)> = Vec::new();
+        let mut warm_bytes = 0usize;
+        for &(_, _, l, x) in &cand {
+            let Ffn::Moe(m) = &layers[l].ffn else { continue };
+            let b = m.layout().2;
+            if b > budget {
+                break;
+            }
+            budget -= b;
+            warm_bytes += b;
+            chosen.push((l, x));
+        }
+        // what earlier runs left of these files goes first: a stale cache would crowd the warm tier out (MemFree near zero, reclaim during reads) and make runs differ
+        if std::env::var("NS_MM31_CACHE_DROP").map_or(true, |v| v != "0") {
+            for (b, _) in &reader.files {
+                drop_cache(b, 0);
+            }
+        }
+        if !chosen.is_empty() {
+            let t_w = Instant::now();
+            let next = AtomicUsize::new(0);
+            let errs: Mutex<Vec<Error>> = Mutex::new(Vec::new());
+            std::thread::scope(|sc| {
+                for _ in 0..LOAD_THREADS {
+                    sc.spawn(|| {
+                        let mut tmp: Vec<u8> = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Relaxed);
+                            let Some(&(l, x)) = chosen.get(i) else { break };
+                            let Ffn::Moe(m) = &layers[l].ffn else { continue };
+                            let mut src = m.src(x);
+                            src.cached = true;
+                            // twice: a second read moves the pages to the active list, so the kernel's reclaim takes others first
+                            for _ in 0..2 {
+                                for &(sh, o, n, _) in &src.pieces(read_parts()) {
+                                    tmp.resize(n, 0);
+                                    if let Err(x) = reader.read(sh, o, tmp.as_mut_ptr(), n, true) {
+                                        errs.lock().unwrap().push(e(x));
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            if let Some(x) = errs.into_inner().unwrap().into_iter().next() {
+                return Err(x);
+            }
+            for &(l, x) in &chosen {
+                if let Ffn::Moe(m) = &mut layers[l].ffn {
+                    m.warm[x] = true;
+                }
+            }
+            log(format!("warm tier: {} experts, {:.1} GiB, through the page cache in {:.1} s; MemAvailable {:.1} GiB", chosen.len(), gib(warm_bytes), t_w.elapsed().as_secs_f64(), gib(mem_available())));
         }
         let kept: usize = cards.iter().map(|c| c.kept.0 + c.kept.1).sum();
         log(format!("experts placed: {:.1} GiB in {:.1} s ({})", gib(kept), t_fill.elapsed().as_secs_f64(),
@@ -1513,6 +1646,8 @@ impl<'g> MiniMax<'g> {
             gpf: std::env::var("NS_PROFILE").is_ok_and(|v| v == "gpu"),
             stamps: Mutex::new(Vec::new()),
             gtab: Mutex::new([0.0; 6]),
+            astamps: Mutex::new(Vec::new()),
+            atab: Mutex::new([[0.0; 8]; 2]),
             gclean: Mutex::new([[(0.0, 0); 3]; 2]),
             stamp_clean: Mutex::new(Vec::new()),
             toklog: std::env::var("NS_MM31_TOKLOG").ok().and_then(|p| std::fs::File::create(p).ok()).map(Mutex::new),
@@ -1555,6 +1690,10 @@ impl<'g> MiniMax<'g> {
             self.flush_stamps();
             let g = self.gtab.lock().unwrap();
             v.push(format!("[device time of one-token passes by part, seconds in all: attention {:.3}, router {:.3}, host turnaround (router read-back to the shared expert queued) {:.3}, experts {:.3}, adds and layer end {:.3}]", g[1], g[2], g[3], g[4], g[5]));
+            let at = self.atab.lock().unwrap();
+            for (i, r) in at.iter().enumerate() {
+                v.push(format!("[attention on card {i}, seconds in all: q k v {:.3}, indexer q k {:.3}, norms rope stores {:.3}, scores {:.3}, top-k {:.3}, attend {:.3}, o {:.3}]", r[1], r[2], r[3], r[4], r[5], r[6], r[7]));
+            }
             let gc = self.gclean.lock().unwrap();
             for (i, card) in gc.iter().enumerate() {
                 v.push(format!("[card {i}: experts' device time, all in VRAM {:.3} ms x {} layers; some pinned, none read {:.3} ms x {} layers; some read from the file {:.3} ms x {} layers]", 1e3 * card[0].0 / card[0].1.max(1) as f64, card[0].1, 1e3 * card[1].0 / card[1].1.max(1) as f64, card[1].1, 1e3 * card[2].0 / card[2].1.max(1) as f64, card[2].1));
@@ -1570,6 +1709,7 @@ impl<'g> MiniMax<'g> {
             }
         }
         let c = &self.counts;
+        v.push(format!("[decode's file reads by the host's wait: {} under 1 ms, {} under 2 ms, {} longer]", c.read_wait[0].load(Relaxed), c.read_wait[1].load(Relaxed), c.read_wait[2].load(Relaxed)));
         if c.route_n.load(Relaxed) > 0 {
             v.push(format!("[host from the doorbell to the VRAM experts queued: {:.1} us a layer]", c.route_ns.load(Relaxed) as f64 * 1e-3 / c.route_n.load(Relaxed) as f64));
         }
@@ -1777,7 +1917,13 @@ impl<'g> MiniMax<'g> {
             let (kc, vc) = (&s.k[l], &s.v[l]);
             let off = p0 * kv * hd;
             kc.bounds(off * 2, t * kv * hd * 2)?;
+            if t == 1 {
+                self.astamp(cd, 0);
+            }
             self.q_products(cd, xn, t, &[(&ly.q, &q), (&ly.k, &k), (&ly.v, &v)])?;
+            if t == 1 {
+                self.astamp(cd, 1);
+            }
             let n_rot = g.n_rot as i64;
             let (ih, il) = (g.indexer.n_head as usize, g.indexer.key_len as usize);
             let mut ip: Option<(DevBuf, DevBuf)> = None;
@@ -1792,6 +1938,9 @@ impl<'g> MiniMax<'g> {
                     }
                 }
                 ip = Some((iq, ik));
+            }
+            if t == 1 {
+                self.astamp(cd, 2);
             }
             for r in 0..t {
                 let pos = p0 + r;
@@ -1808,6 +1957,9 @@ impl<'g> MiniMax<'g> {
                                                  kp, vp, std::ptr::null_mut(), h as i64, kv as i64, 0, hd as i64, n_rot, pos as i64, g.rope_base as f32, g.rms_eps as f32), "attn post")?,
                     }
                 }
+            }
+            if t == 1 {
+                self.astamp(cd, 3);
             }
             if let Some((iq, _)) = ip {
                 iq_done = Some(iq);
@@ -1875,8 +2027,14 @@ impl<'g> MiniMax<'g> {
                     ffi::check((self.k.idx_scores)(raw, iq.fp(), ic.ptr().cast::<u16>().cast_const(), bs.fp(), t as i64, ih as i64, nblk as i64, p0 as i64,
                                                    g.indexer.local_blocks as i64), "idx_scores")?;
                     tap(&format!("msa_bs-{l}"), &bs)?;
+                    if t == 1 {
+                        self.astamp(cd, 4);
+                    }
                     ffi::check((self.k.idx_topk)(raw, bs.fp(), sel.ptr().cast::<i32>(), t as i64, ih as i64, nblk as i64, kk as i64), "idx_topk")?;
                     self.lap(cd, l, 1, &mut tm);
+                    if t == 1 {
+                        self.astamp(cd, 5);
+                    }
                     match self.k.silo_attend_split {
                         Some(f) if t < 8 && h == kv * 16 && hd == 128 && !no_split() => {
                             let s = (kk * 128).div_ceil(128);
@@ -1906,10 +2064,18 @@ impl<'g> MiniMax<'g> {
             }
         }
         self.lap(cd, l, 2, &mut tm);
+        if t == 1 {
+            self.astamp(cd, 6);
+        }
         tap(&format!("kqv_out-{l}"), &out)?;
         let o = a.f32(t * g.n_embd as usize)?;
         match one {
-            Some(_) => self.q_products(cd, &out, t, &[(&ly.o, &o)])?,
+            Some(_) => {
+                self.q_products(cd, &out, t, &[(&ly.o, &o)])?;
+                if t == 1 {
+                    self.astamp(cd, 7);
+                }
+            }
             None => self.matmul(cd, &ly.o, &out, t, &o)?,
         }
         self.lap(cd, l, 0, &mut tm);
@@ -2384,7 +2550,9 @@ impl<'g> MiniMax<'g> {
             for (j, &ex) in waves[k].iter().enumerate() {
                 // SAFETY: the ring holds 2 * WAVE slots of `slot` >= an expert's bytes.
                 let dst = unsafe { ring.ptr().cast::<u8>().add(((k % 2) * WAVE + j) * slot) };
-                hs.extend(spawn_reads(&self.reader, m.src(ex), dst));
+                let mut src = m.src(ex);
+                src.cached |= t < 8;
+                hs.extend(spawn_reads(&self.reader, src, dst));
             }
             hs
         };
@@ -2588,6 +2756,11 @@ impl<'g> MiniMax<'g> {
                     while *joined <= *k {
                         let tw = Instant::now();
                         join_all(inflight.take().unwrap())?;
+                        if t < 8 {
+                            let n = waves[*joined].len().max(1) as u64;
+                            let per = tw.elapsed().as_secs_f64() / n as f64;
+                            self.counts.read_wait[if per < 0.001 { 0 } else if per < 0.002 { 1 } else { 2 }].fetch_add(n, Relaxed);
+                        }
                         *wait += tw.elapsed().as_secs_f64();
                         if *joined >= 1 {
                             // wave joined-1's products are done: its half of the ring is free for the reads after
@@ -2823,7 +2996,7 @@ impl<'g> MiniMax<'g> {
                         let ring = cd.stage.device_view(0, cd.stage.len)?;
                         // SAFETY: slot_i of the read-ahead region of the stage, past the 2 * WAVE ring slots.
                         let dst = unsafe { ring.ptr().cast::<u8>().add((2 * WAVE + slot_i) * cd.slot) };
-                        pfs.map.insert((m, ex), (slot_i, spawn_reads(&self.reader, nm.src(ex), dst)));
+                        pfs.map.insert((m, ex), (slot_i, spawn_reads(&self.reader, Src { cached: true, ..nm.src(ex) }, dst)));
                         self.counts.ahead.fetch_add(1, Relaxed);
                     }
                 }
@@ -3017,8 +3190,41 @@ impl<'g> MiniMax<'g> {
         }
     }
 
+    /// NS_PROFILE=gpu, one token: a stamp after attention step `step` (0 the start)
+    fn astamp(&self, cd: &Card, step: u8) {
+        if !self.gpf {
+            return;
+        }
+        if let Ok(api) = nextsycl_core::api() {
+            let mut t = 0i64;
+            // SAFETY: an out-pointer to a local.
+            if unsafe { (api.stamp)(cd.gpu.raw(), &mut t) } == 0 {
+                self.astamps.lock().unwrap().push((step, t, cd.gpu.index));
+            }
+        }
+    }
+
     /// the stamps of the passes before, turned into seconds between the neighbouring tags (their queues are idle: all done)
     fn flush_stamps(&self) {
+        {
+            let mut st = self.astamps.lock().unwrap();
+            if let Ok(api) = nextsycl_core::api() {
+                let mut tab = self.atab.lock().unwrap();
+                for w in st.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    if a.2 != b.2 || b.0 != a.0 + 1 {
+                        continue;
+                    }
+                    let ci = self.cards.iter().position(|c| c.gpu.index == a.2).unwrap_or(0);
+                    let mut ns = 0f64;
+                    // SAFETY: tickets of this queue, an out-pointer to a local.
+                    if unsafe { (api.elapsed)(self.cards[ci].gpu.raw(), a.1, b.1, &mut ns) } == 0 {
+                        tab[ci.min(1)][b.0 as usize] += ns * 1e-9;
+                    }
+                }
+            }
+            st.clear();
+        }
         let mut st = self.stamps.lock().unwrap();
         if st.is_empty() {
             return;
@@ -3075,6 +3281,7 @@ impl<'g> MiniMax<'g> {
         let p0 = s.pos;
         let pass_t0 = Instant::now();
         let c0 = (self.counts.vram.load(Relaxed), self.counts.pinned.load(Relaxed), self.counts.file.load(Relaxed));
+        let j0 = self.counts.join_ns.load(Relaxed);
         let x = self.embed(&self.cards[0], tokens)?;
         tap("inp_embd", &x)?;
         let (x, grave) = self.run_layers(s, x, t, p0, 0..self.layers.len(), &mut *tap)?;
@@ -3088,7 +3295,7 @@ impl<'g> MiniMax<'g> {
         }
         if let (Some(f), true) = (&self.toklog, t <= 8) {
             use std::io::Write;
-            let _ = writeln!(f.lock().unwrap(), "{:.2} {} {} {} {t}", pass_t0.elapsed().as_secs_f64() * 1e3, self.counts.vram.load(Relaxed) - c0.0, self.counts.pinned.load(Relaxed) - c0.1, self.counts.file.load(Relaxed) - c0.2);
+            let _ = writeln!(f.lock().unwrap(), "{:.2} {} {} {} {t} {:.2}", pass_t0.elapsed().as_secs_f64() * 1e3, self.counts.vram.load(Relaxed) - c0.0, self.counts.pinned.load(Relaxed) - c0.1, self.counts.file.load(Relaxed) - c0.2, (self.counts.join_ns.load(Relaxed) - j0) as f64 * 1e-6);
         }
         s.pos += t;
         s.last_rows = t;

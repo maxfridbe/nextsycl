@@ -559,6 +559,15 @@ int ns_mm3s_launch_bench(ns_gpu* g, double* out) {
     NS_CATCH
 }
 
+// An empty kernel on a queue of this thread's own, waited for (the keep-alive experiment)
+int ns_mm3s_ping(ns_gpu* g) {
+    NS_TRY
+    static thread_local sycl::queue q(g->ctx, g->dev, sycl::property::queue::in_order());
+    q.single_task([=]() {}).wait();
+    return 0;
+    NS_CATCH
+}
+
 // A small table from pinned memory into VRAM in a kernel, not through the runtime's memcpy (which goes to the copy engine, behind the experts' swaps)
 int ns_mm3s_kcopy(ns_gpu* g, uint32_t* dst, const uint32_t* src, int64_t words) {
     NS_TRY
