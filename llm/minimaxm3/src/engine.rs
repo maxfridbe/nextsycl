@@ -240,7 +240,7 @@ unsafe fn host_matvec_fma(m: &[f32], x: &[f32], y: &mut [f32]) {
 
 /// Experts of the next layer guessed and read ahead (NS_MM31_AHEAD; 0 = none)
 fn ahead() -> usize {
-    std::env::var("NS_MM31_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(3).min(PF_SLOTS)
+    std::env::var("NS_MM31_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(PF_SLOTS)
 }
 
 // ---- the file's reads
