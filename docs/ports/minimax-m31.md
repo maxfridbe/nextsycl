@@ -444,7 +444,7 @@ A private `serve` from the build copy (own port, registry and config) with produ
 |---|---|
 | load | 26.6 s in the engine; the first chat answers in 31-38 s |
 | VRAM, loaded and between requests | B65 30,579, B70 30,698 MiB |
-| VRAM during a 2,144-token prompt | 31,069 / 31,076 MiB (1,692 free, gpustat refreshes every 3 s), back to 30,579 / 30,698 after: the prompt scratch is freed |
+| VRAM during a 2,144-token prompt | 31,069 / 31,076 MiB (about 1,595 free, gpustat refreshes every 3 s), back to 30,579 / 30,698 after: the prompt scratch is freed |
 | speeds through serve | pp 223 (2,144 tokens in 9.6 s), tg 13.20 over 24 tokens, two sessions at once answered |
 | host | MemAvailable 59,447 MiB idle, lowest 12,435: 45.9 GiB, so `ram_gib: 46` (the 45.4 above is the whole box, on a different baseline). The warm cache, `ram_cache_gib: 12.7`, is on top and counted as available by the kernel |
 | unload | 0.7 s; VRAM 0 / 0, MemAvailable back to 59,405 MiB |
