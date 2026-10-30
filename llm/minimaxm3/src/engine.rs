@@ -86,6 +86,12 @@ fn no_fused() -> bool {
     std::env::var("NS_MM31_FUSED").is_ok_and(|v| v == "0")
 }
 
+/// NS_MM31_HALF_PROJ=0: a prompt pass's q, k, v, o and shared-expert products in float, not half
+fn half_proj() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("NS_MM31_HALF_PROJ").map_or(true, |v| v != "0"))
+}
+
 /// NS_MM31_SILO_HALF=0: a prompt pass's experts dequantize to half on the shared kernel, not the silo's
 fn no_silo_half() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -111,7 +117,7 @@ const PF_SLOTS: usize = 12;
 /// Layers ahead whose routing is guessed (NS_MM31_AHEAD_LAYERS; each from this layer's stream, on the CPU)
 fn ahead_layers() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("NS_MM31_AHEAD_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(3).min(16))
+    *N.get_or_init(|| std::env::var("NS_MM31_AHEAD_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(2).min(16))
 }
 
 /// NS_MM31_PRECOPY=0: a guessed expert in pinned memory waits for its layer instead of being copied into an empty VRAM place ahead
@@ -924,6 +930,10 @@ impl<'g> MiniMax<'g> {
         let gpus = &gpus[..ncard];
         // layers over the cards: even by default (NS_MM31_SPLIT=N: N layers on the first of two)
         let mut bounds: Vec<usize> = (0..=ncard).map(|i| n_layer * i / ncard).collect();
+        // two cards: 60% of the layers on the first (the B70; layers cost it ~0.6 of the B65's): tg the same, pp 121 -> 124 on one prompt pass and 159 -> 172 when two cards work at once
+        if ncard == 2 {
+            bounds[1] = n_layer * 3 / 5;
+        }
         if let Some(n) = std::env::var("NS_MM31_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| ncard == 2 && *n > 0 && *n < n_layer) {
             bounds[1] = n;
         }
@@ -1135,12 +1145,14 @@ impl<'g> MiniMax<'g> {
         if let Some(dirs) = std::env::var_os("NS_MM31_STREAM_DIR") {
             let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&dirs).collect();
             let share = env_f64("NS_MM31_STREAM_SHARE").unwrap_or(100.0).clamp(0.0, 100.0) as u64;
+            let stream_all = std::env::var("NS_MM31_STREAM_ALL").is_ok_and(|v| v == "1");
             let mut list: Vec<(usize, usize)> = Vec::new();
             for c in &cards {
                 for l in c.layers.clone() {
                     if let Ffn::Moe(_) = &layers[l].ffn {
                         for x in 0..g.n_expert as usize {
-                            if c.res[l - c.layers.start][x].is_none() && ((l * 2654435761 + x * 40503) >> 3) as u64 % 100 < share {
+                            // NS_MM31_STREAM_ALL=1: every expert (111 GiB a drive), so whatever falls out of the cards later is read from two drives too
+                            if (stream_all || c.res[l - c.layers.start][x].is_none()) && ((l * 2654435761 + x * 40503) >> 3) as u64 % 100 < share {
                                 list.push((l, x));
                             }
                         }
@@ -1477,6 +1489,31 @@ impl<'g> MiniMax<'g> {
             return Ok(());
         }
         let row_bytes = w.ty.bytes(w.cols as u64).ok_or_else(|| e("row bytes"))? as usize;
+        // a prompt pass: the matrix and the activations as half, the half GEMM (the experts' route; a fourth of the float one's time), NS_MM31_HALF_PROJ=0: float
+        if let Some(f) = self.k.silo_one.as_ref().filter(|_| t > 8 && half_proj() && self.k.silo_moe.as_ref().is_some_and(|ms| {
+            // SAFETY: plain query.
+            unsafe { (ms.supported)(w.ty.code() as i32, w.cols as i64) != 0 }
+        })) {
+            let chunk = (48 << 20) / (w.cols * 2);
+            let m = cd.arena.mark();
+            let x16 = cd.arena.bytes(t * w.cols * 2)?;
+            let tmp = cd.arena.bytes(chunk.min(w.rows) * w.cols * 2)?;
+            // SAFETY: x holds t * cols floats, x16 as many halves.
+            ffi::check(unsafe { (self.k.to_f16)(raw, x.fp(), x16.ptr().cast::<u16>(), (t * w.cols) as i64) }, "to_f16")?;
+            let mut r0 = 0;
+            while r0 < w.rows {
+                let nr = chunk.min(w.rows - r0);
+                // SAFETY: the byte range of rows [r0, r0 + nr) is inside w.buf; tmp holds nr * cols halves; y has the t * rows floats checked above.
+                unsafe {
+                    let src = w.buf.ptr().cast::<u8>().add(r0 * row_bytes).cast();
+                    ffi::check((f.to_half)(raw, w.ty.code() as i32, src, (nr * w.cols) as i64, tmp.ptr().cast::<u16>()), "to_half")?;
+                    ffi::check((self.k.gemm_f16)(raw, t as i64, nr as i64, w.cols as i64, x16.ptr().cast::<u16>().cast_const(), w.cols as i64, tmp.ptr().cast::<u16>().cast_const(), y.fp().add(r0), w.rows as i64, 0), "gemm_f16")?;
+                }
+                r0 += nr;
+            }
+            cd.arena.rewind(m);
+            return Ok(());
+        }
         let chunk = (24 << 20) / w.cols;
         let m = cd.arena.mark();
         let tmp = cd.arena.f32(chunk.min(w.rows) * w.cols)?;
