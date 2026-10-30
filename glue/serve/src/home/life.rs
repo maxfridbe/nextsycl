@@ -68,6 +68,23 @@ pub(super) fn pick_plan(free: u64, want: u64, idle: Vec<Holder>) -> Option<Vec<H
 }
 
 /// Whether the chat model loaded may go for room: answering nothing, not changing, kept by nobody (running work never goes; X-Keep-Up-S keeps it until its time is out)
+/// The chat model as the room rule sees it
+#[derive(Debug, PartialEq)]
+pub(super) enum ChatHold {
+    NoModel,
+    Idle(String),
+    /// answering, changing or kept, or something that would say did not answer (`None`: not up yet)
+    Held(Option<String>),
+}
+
+/// `None` for answering or kept: who would say did not answer
+pub(super) fn chat_hold_of(id: String, answering: Option<bool>, changing: bool, kept_here: bool, kept_by_switcher: Option<bool>) -> ChatHold {
+    match (answering, kept_by_switcher) {
+        (Some(a), Some(k)) if chat_may_go(a, changing, kept_here, k) => ChatHold::Idle(id),
+        _ => ChatHold::Held(Some(id)),
+    }
+}
+
 pub(super) fn chat_may_go(answering: bool, changing: bool, kept_here: bool, kept_by_switcher: bool) -> bool {
     !answering && !changing && !kept_here && !kept_by_switcher
 }
@@ -1226,18 +1243,37 @@ impl Home {
     /// that sent X-Keep-Up-S (Open WebUI's connection does: 300 s) keeps it that long after it ended, here or through
     /// the switcher (its GET /keep); a request without the header keeps nothing
     fn chat_idle(&self) -> Option<String> {
-        let id = self.chat_loaded(&self.models())?;
-        let v = call_for(&Target::Unix(self.chat_socket()), "GET", "/server/requests", None, 3).ok()?;
-        let answering = v["active"].as_array().is_some_and(|a| !a.is_empty());
+        match self.chat_hold() {
+            ChatHold::Idle(id) => Some(id),
+            ChatHold::NoModel | ChatHold::Held(_) => None,
+        }
+    }
+
+    /// `chat_idle`, telling "no model" from "held": a server or switcher that does not answer counts as held
+    fn chat_hold(&self) -> ChatHold {
+        let Some(id) = self.chat_loaded(&self.models()) else {
+            // one on its way up is somebody's request
+            return if self.chat_mode().1.is_some() { ChatHold::Held(None) } else { ChatHold::NoModel };
+        };
+        let answering = call_for(&Target::Unix(self.chat_socket()), "GET", "/server/requests", None, 3).ok()
+            .map(|v| v["active"].as_array().is_some_and(|a| !a.is_empty()));
         let kept_here = self.chat_keep.lock().unwrap().get(&id).is_some_and(|until| *until > now());
         let kept_by_switcher = if listening(self.o.ports.switch) {
-            // the switcher not answering: kept, to be safe
-            let k = call_for(&Target::Tcp(format!("127.0.0.1:{}", self.o.ports.switch)), "GET", "/keep", None, 3).ok()?;
-            k["kept"][id.as_str()].as_f64().is_some_and(|s| s > 0.0)
+            call_for(&Target::Tcp(format!("127.0.0.1:{}", self.o.ports.switch)), "GET", "/keep", None, 3).ok()
+                .map(|k| k["kept"][id.as_str()].as_f64().is_some_and(|s| s > 0.0))
         } else {
-            false
+            Some(false)
         };
-        chat_may_go(answering, self.chat_mode().1.is_some(), kept_here, kept_by_switcher).then_some(id)
+        chat_hold_of(id, answering, self.chat_mode().1.is_some(), kept_here, kept_by_switcher)
+    }
+
+    /// `GET /chat/held`, what the video daemon asks before it stops the chat model
+    pub(super) fn chat_held_answer(&self) -> Value {
+        match self.chat_hold() {
+            ChatHold::NoModel => json!({"held": false, "model": null}),
+            ChatHold::Idle(id) => json!({"held": false, "model": id}),
+            ChatHold::Held(id) => json!({"held": true, "model": id}),
+        }
     }
 
     /// A chat request's keep (X-Keep-Up-S / keep_up_s): `id` kept that long from now
@@ -1411,6 +1447,7 @@ impl Home {
         for g in gpus {
             args.extend(["--gpu".into(), g.to_string()]);
         }
+        args.extend(["--door".into(), self.o.door.clone()]);
         self.exec(format!("video start ({})", want.join(", ")), &args).map(|_| ())
     }
 }
@@ -1421,6 +1458,16 @@ mod tests {
 
     fn chat_holder(mb: u64) -> Holder {
         Holder { what: Free::Chat("m".into()), mb, model: "m".into(), order: 2 }
+    }
+
+    #[test]
+    fn chat_hold_tells_idle_from_held_and_a_silent_source_is_held() {
+        let h = |a, c, k, s| chat_hold_of("m".into(), a, c, k, s);
+        assert_eq!(h(Some(false), false, false, Some(false)), ChatHold::Idle("m".into()));
+        for held in [h(Some(true), false, false, Some(false)), h(Some(false), true, false, Some(false)), h(Some(false), false, true, Some(false)),
+                     h(Some(false), false, false, Some(true)), h(None, false, false, Some(false)), h(Some(false), false, false, None)] {
+            assert_eq!(held, ChatHold::Held(Some("m".into())));
+        }
     }
 
     #[test]

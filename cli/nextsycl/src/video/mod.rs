@@ -195,6 +195,7 @@ fn daemon(cfg: &Config, args: &[String]) -> Result<(), String> {
         idle: (idle > 0).then(|| std::time::Duration::from_secs(idle as u64)),
         gpu_lock: opt(args, "--gpu-lock").map(PathBuf::from),
         llm_switcher: opt(args, "--llm-switcher").map(str::to_string),
+        door: opt(args, "--door").map(str::to_string),
         threads: opt(args, "--threads").map_or(Ok(8), |v| num(v, "--threads"))?,
     })
     .map_err(|e| e.0)

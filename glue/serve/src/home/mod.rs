@@ -136,6 +136,8 @@ pub struct Options {
     pub ports: Ports,
     /// the address servers started from here listen on (their pages are linked from other machines)
     pub serve_host: String,
+    /// where this page listens, as this box reaches it (host:port): the video daemon asks it before stopping chat
+    pub door: String,
     /// the registry and the settings (the program's: home::registry::Store)
     pub cfg: Box<dyn registry::Store>,
     /// unload an enabled model after this many minutes without a request (0: never)
@@ -439,6 +441,13 @@ impl Home {
             ("GET", "/") | ("GET", "/index.html") => self.page(&mut s),
             ("GET", p) if p.starts_with("/ui/") || p.starts_with("/static/") => self.asset(&mut s, p),
             ("GET", "/health") => http::respond(&mut s, 200, &json!({"status": "ok"})),
+            // for the video daemon, which has no token: read-only and from this box only
+            ("GET", "/chat/held") => {
+                if !s.same_box() {
+                    return http::respond(&mut s, 404, &err("not found".to_string()));
+                }
+                http::respond(&mut s, 200, &self.chat_held_answer())
+            }
             ("GET", "/openapi.yml") | ("GET", "/openapi.yaml") => {
                 let spec = self.openapi(&req, false);
                 http::respond_bytes(&mut s, 200, "application/yaml; charset=utf-8", yaml::to_yaml(&spec).as_bytes(), "Cache-Control: no-cache\r\n")

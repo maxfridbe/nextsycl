@@ -34,6 +34,17 @@ pub enum Conn {
 }
 
 impl Conn {
+    /// The peer is on this machine: loopback, or this machine's own address the connection came in on
+    pub fn same_box(&self) -> bool {
+        match self {
+            Conn::Unix(_) => true,
+            Conn::Tcp(c) => match (c.peer_addr(), c.local_addr()) {
+                (Ok(p), Ok(l)) => p.ip().is_loopback() || p.ip() == l.ip(),
+                _ => false,
+            },
+        }
+    }
+
     pub fn connect(t: &Target) -> std::io::Result<Conn> {
         Ok(match t {
             Target::Unix(p) => Conn::Unix(UnixStream::connect(p)?),
