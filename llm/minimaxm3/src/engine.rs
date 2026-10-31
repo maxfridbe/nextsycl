@@ -2330,6 +2330,7 @@ impl<'g> MiniMax<'g> {
         let idx: Vec<u8> = list.iter().flat_map(|(i, _, _)| i.to_le_bytes()).collect();
         let wv: Vec<u8> = list.iter().flat_map(|(_, w, _)| w.to_le_bytes()).collect();
         let rk: Vec<u8> = list.iter().flat_map(|(_, _, r)| r.to_le_bytes()).collect();
+        // before the products: the same uploads between the GEMM and the scatter cost a prompt pass 15% (docs/ports/minimax-m31.md)
         let ib = a.bytes(idx.len())?;
         ib.write_async(0, &idx)?;
         let wb = a.bytes(wv.len())?;

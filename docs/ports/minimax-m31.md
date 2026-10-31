@@ -520,7 +520,41 @@ So at the typical 64 rows a GEMM is 16-20% above the card's read time on a B70 a
 | both copy lanes (`NS_MM31_LANE=2`), 3 runs | 217 -> 216-218 | same | nothing |
 | small tables by kernel from a pinned ring, not memcpy, 3 runs | 256-258 -> 256-261; 8K 417-418 -> 420-424 | same | about 1%; dropped |
 
-The baseline of the first three rows reads 217 because their build, with `expert_compute` split into two functions (more arena marks and one more upload an expert), lost 15% with the helper off (254 -> 217, six runs, text the same). Upload count is not why: the last row's one upload and three uploads read the same. **Unexplained, and the best lead left**: something in the arena's order or the rewinds moves a pass by 15%, in both directions perhaps. Not traced: the window ended.
+The baseline of the first three rows reads 217 because their build, with `expert_compute` split into two functions (more arena marks and one more upload an expert), lost 15% with the helper off (254 -> 217, six runs, text the same). Upload count is not why: the last row's one upload and three uploads read the same. Traced below: it was where the upload sat, not the arena.
+
+### Round 7: alignment (none kept)
+
+Pinned 40 GiB as production, 2K prompt, warmed, interleaved. No idea gained; no code stayed. Text was the same in every run below (40 and 300 tokens).
+
+**The 15% of the split**, one binary, 3 runs each, 40 tokens:
+
+| order in `expert_compute` | pp 2K | tg |
+|---|---|---|
+| main: tables, then the products, then scatter | 255.2, 256.2, 256.2 | 13.17-13.23 |
+| the split: rows' table, products, rewind, three tables, scatter | 215.9, 202.7, 217.3 | 13.17-13.21 |
+| the same without the rewind | 215.8, 216.9, 215.8 | 13.14-13.18 |
+| result buffer first, one set of tables before the products | 253.3, 257.0, 257.6 | 13.20-13.22 |
+| main with one more upload before the products | 254.3, 254.6, 254.7 | 13.15-13.22 |
+
+So arena order and rewinds do not matter. Uploading tables between an expert's GEMM and its scatter costs about 1.5 s over 21K products' experts (about 200 us an expert); the same uploads before the products cost nothing. Why that one place costs was not traced (a runtime memcpy behind a just-finished GEMM is the suspect). Main already uploads first and the kernel copy of the tables above gained 1%, so no better order is left to gain: rule, keep runtime uploads ahead of the products.
+
+**Expert start offsets**, kernel bench on real experts copied to each start offset from 2 MB alignment (0, 8, 16, 32, 48, 64, 128, 192, 256, 512, 1K, 2K, 4K, 8K, 64K, 1M, 2M), one expert a launch, best of 8, 3 rounds; GB/s of weights:
+
+| kernel | B70 | B65 |
+|---|---|---|
+| gu IQ1_M | 227-235 | 105-115 |
+| gu IQ2_XXS | 243-249 | 106-114 |
+| down IQ3_XXS | 209-220 | 144-146 |
+| down IQ4_XS | 144-146 | not on this card |
+| to_half IQ1_M | 59-61 | 46-47 |
+| to_half IQ2_XXS | 70-73 | 57-60 |
+| to_half + half GEMM, by the half matrix's offset (0 to 2M) | 269-272 | 184-186 |
+
+The spread is no larger than a repeat at one offset (B65 gu at offset 0: 101-110) and follows no pattern. Row and block alignment were not swept apart: blocks are 56-136 bytes and rows are not aligned to anything these offsets could fix together. So the ceiling of these kernels is not alignment; if Nemotron's expert-up has the same limit, alignment will not lift it (not tested on Nemotron).
+
+**VRAM pages**: no root, so no debugfs. `zeVirtualMemQueryPageSize` says 64 KB under 2 MB and 2 MB from 2 MB up, on both cards; that is for a reservation, not proof for `malloc_device`. A read probe (ns a read by stride over 1 GiB, B70 fresh buffer / expert slab): 64 KB 0.04 / 0.04, 256 KB 0.05 / 0.05, 1 MB 0.10 / 0.10, 2 MB 0.17 / 0.17, 4 MB 0.33 / 0.34, 16 MB 0.32 / 0.33; B65 the same shape. No step at 64 KB and one from 1-4 MB: it looks like 2 MB pages already, in fresh buffers and slabs alike; indirect. Expert slabs are 1 GiB, their starts aligned to bits 21-25; slots inside them to bits 14-16. The same expert in its slot and 2 MB aligned in a fresh buffer, 4 rounds: B70 gu IQ1_M 228-229 / 228-230, IQ2_XXS 240-245 / 243-245, down IQ3_XXS 209-215 / 208-213; B65 gu 104-105 / 105-110, 100-105 / 101-106, down 140-145 / 140-146. Nothing to gain.
+
+**Pinned on 2 MB pages**: `madvise(MADV_HUGEPAGE)` on all 41 slabs was accepted, but the process's `AnonHugePages` stayed 0 (sampled every 2 s), so **2 MB pages were not obtained** and this does not test them; these pages seem not to be plain anonymous memory. It would not matter: a pinned expert into VRAM runs at 28 GB/s on both copy lanes with or without the call (the x8 link), and `to_half` reading pinned memory at 23 GB/s. With it, 3 runs against 3: pp 244.8, 258.2, 253.9 against 257.0, 233.8, 254.5; tg 13.53-13.94 against 13.58-13.94.
 
 ### Through the front door
 
