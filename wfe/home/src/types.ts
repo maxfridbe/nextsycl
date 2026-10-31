@@ -49,6 +49,10 @@ export interface Model {
   /** a chat model spread over every card (its model card: gpus all): its cards are not a choice */
   spans?: boolean;
   state: ModelState;
+  /** never stopped for room, loaded again after a restart (system.pin) */
+  pinned?: boolean;
+  /** seconds a request's rsvp_s holds it for yet */
+  held_s?: number;
   vouch_mb: Record<string, number>;
   /** of vouch_mb, the headroom (Vouched) */
   headroom_mb: Record<string, number>;

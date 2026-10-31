@@ -244,6 +244,8 @@ impl Home {
         let job = match again {
             Some(j) => j,
             None => {
+                // its limit on the time to start: a known wait over it is declined here, nothing queued or stopped
+                self.admit(name, b)?;
                 let n = {
                     let mut n = self.next.lock().unwrap();
                     *n += 1;
@@ -255,13 +257,14 @@ impl Home {
                 let text = |k: &str| Some(s(b, k).trim().chars().take(60).collect::<String>()).filter(|x| !x.is_empty());
                 let mut body = b.clone();
                 if let Some(o) = body.as_object_mut() {
-                    for k in ["wait", "label", "reentrant_id", "reentrantid", "priority", "held", "queue", "project", "batch"] {
+                    for k in ["wait", "label", "reentrant_id", "reentrantid", "priority", "held", "queue", "project", "batch", "rsvp_s", "max_willing_to_wait_s"] {
                         o.remove(k);
                     }
                 }
                 let mut j = json!({"id": id, "kind": kind, "method": name, "label": label, "reentrant_id": rid, "state": "queued",
                                    "created": now(), "started": null, "ended": null, "priority": priority, "held": b["held"] == true,
-                                   "project": text("project"), "batch": text("batch"), "body": body});
+                                   "project": text("project"), "batch": text("batch"), "body": body,
+                                   "rsvp_s": b["rsvp_s"], "max_willing_to_wait_s": b["max_willing_to_wait_s"]});
                 // an enrolment says whose voice (its body is dropped when it ends)
                 if name == "audio.voices.enroll" {
                     j["voice"] = b["name"].clone();
@@ -311,6 +314,9 @@ impl Home {
                             r["job"] = v;
                             Ok(r)
                         }
+                        // (the limit's fields kept: they are what a caller reads)
+                        _ if j["error"]["code"] == "wait_too_long" => Err((503, super::backplane::tag("wait_too_long",
+                            &json!({"eta": j["error"]["eta"], "max_willing_to_wait_s": j["error"]["max_willing_to_wait_s"], "waited_s": j["error"]["waited_s"]}), &s(&j["error"], "message")))),
                         _ => Err((j["error"]["status"].as_u64().unwrap_or(500) as u16, s(&j["error"], "message"))),
                     };
                 }
@@ -342,7 +348,22 @@ impl Home {
         }
         let mut body = j["body"].clone();
         body["request_id"] = json!(id);
+        let created = j["created"].as_f64().unwrap_or_else(now);
+        super::backplane::begin(&method, &j, created);
         let r = self.work(&method, &body);
+        // the model held for what it reserved, the run in the history
+        let outcome = match &r {
+            Ok(_) => "ok",
+            Err((st, _)) if *st == 499 || self.job_cancelled(id) => "cancelled",
+            Err(_) => "failed",
+        };
+        let granted = self.finish_request(&method, &j["body"], outcome);
+        let r = r.map(|mut v| {
+            if let (Some(g), true) = (granted, v.is_object()) {
+                v["rsvp_granted_s"] = json!(g);
+            }
+            v
+        });
         let cancel = self.job_cancelled(id);
         self.stages.lock().unwrap().remove(id);
         self.jobs.update(id, |j| {
@@ -375,7 +396,7 @@ impl Home {
     /// while it runs, its place while it waits
     fn job_view(&self, j: &Value, running: Option<&[(String, Value)]>) -> Value {
         let mut v = json!({});
-        for k in ["id", "kind", "method", "label", "reentrant_id", "created", "started", "ended", "restarted", "priority", "project", "batch", "voice"] {
+        for k in ["id", "kind", "method", "label", "reentrant_id", "created", "started", "ended", "restarted", "priority", "project", "batch", "voice", "max_willing_to_wait_s"] {
             if !j[k].is_null() {
                 v[k] = j[k].clone();
             }
@@ -454,6 +475,24 @@ impl Home {
         v["state"] = json!(state);
         v["stage"] = json!(stage);
         v["waiting_for"] = waiting_for;
+        // its ETA while it waits or runs, and the time left of a running one (from its progress when it has one, else
+        // its history's run time less what it has run)
+        if matches!(s(j, "state").as_str(), "queued" | "running") && j["body"].is_object() {
+            let method = s(j, "method");
+            if s(j, "state") == "running" {
+                let model = self.request_model(&method, &j["body"], &self.models());
+                let eta = self.history.eta(&method, &model, &j["body"], true, Some(0.0));
+                let ran = now() - j["started"].as_f64().unwrap_or_else(now);
+                let frac = v["progress"]["fraction"].as_f64().filter(|f| *f > 0.02 && *f < 1.0);
+                let left = frac.map(|f| ran * (1.0 - f) / f).or_else(|| eta["run_s"].as_f64().map(|r| (r - ran).max(0.0)));
+                v["eta_remaining_s"] = json!(left.map(|x| x.round()));
+                v["eta"] = eta;
+            } else {
+                let eta = self.eta_for(&method, &j["body"], j["id"].as_str());
+                v["eta_remaining_s"] = json!(eta["total_s"].as_f64().map(|x| x.round()));
+                v["eta"] = eta;
+            }
+        }
         if let (Some(a), Some(b)) = (j["started"].as_f64(), j["ended"].as_f64()) {
             v["seconds"] = json!(((b - a) * 10.0).round() / 10.0);
         }
@@ -625,6 +664,46 @@ impl Home {
         self.dispatch(kind);
         Ok(json!({"cancelled": open.len(), "stopped": stopped, "already_ended": false, "label": open[0]["label"], "reentrant_id": open[0]["reentrant_id"],
                   "jobs": open.iter().map(|j| j["id"].clone()).collect::<Vec<_>>()}))
+    }
+
+    /// Jobs in their queue that will not start in time for their limit: failed with wait_too_long - by the clock (waited
+    /// past it), or by an updated ETA (the queue moved, a holder got busier)
+    pub(crate) fn withdraw_queued(self: &Arc<Self>) {
+        let queued: Vec<Value> = self.jobs.list.lock().unwrap().iter().filter(|j| j["state"] == "queued" && j["max_willing_to_wait_s"].is_number()).cloned().collect();
+        for j in queued {
+            let (id, kind, method) = (s(&j, "id"), s(&j, "kind"), s(&j, "method"));
+            let limit = j["max_willing_to_wait_s"].as_f64().unwrap_or(0.0);
+            let waited = now() - j["created"].as_f64().unwrap_or_else(now);
+            let eta = self.eta_for(&method, &j["body"], Some(&id));
+            if !(waited > limit || eta["wait_s"].as_f64().is_some_and(|w| waited + w > limit)) {
+                continue;
+            }
+            let f = super::backplane::withdrawn(&eta, limit, waited);
+            self.jobs.update(&id, |j| {
+                if j["state"] == "queued" {
+                    j["state"] = json!("failed");
+                    j["ended"] = json!(now());
+                    j["error"] = super::api::rpc_error(&method, f.0, None, &f.1);
+                    j["body"] = Value::Null;
+                }
+            });
+            self.dispatch(&kind);
+        }
+    }
+
+    /// The work ahead on the kind's servers (`exclude`: a job's own, only what is ahead of it counts; None: a job ahead
+    /// has no history): the running less what they have run, the waiting, over the servers
+    pub(crate) fn jobs_ahead_s(&self, kind: &str, exclude: Option<&str>, est: &dyn Fn(&Value) -> Option<f64>) -> Option<f64> {
+        let mine = exclude.and_then(|id| self.jobs.get(id)).map(|j| order(&j));
+        let jobs: Vec<Value> = self.jobs.list.lock().unwrap().iter().filter(|j| j["kind"] == kind && Some(s(j, "id").as_str()) != exclude)
+            .filter(|j| j["state"] == "running" || (j["state"] == "queued" && mine.is_none_or(|o| order(j) < o))).cloned().collect();
+        let paused = self.jobs.paused.lock().unwrap()[kind].clone();
+        let mut sum = 0.0;
+        for j in jobs.iter().filter(|j| j["state"] == "running" || !held(j, &paused)) {
+            let e = est(j)?;
+            sum += if j["state"] == "running" { (e - (now() - j["started"].as_f64().unwrap_or_else(now))).max(0.0) } else { e };
+        }
+        Some(sum / self.slots(kind).len().max(1) as f64)
     }
 
     /// The jobs not ended (system.busy)

@@ -22,6 +22,16 @@ export interface AudioDescribePromptGuideMdReq {
 
 /** What audio.generate takes. */
 export interface AudioGenerateReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /** acestep-1.5, a task on a recording: the recording (WAV, MP3, FLAC, Ogg, M4A as base64 or a data: URL, or upload:<name> from audio.upload); the song is as long as it (repaint: to repaint_end) */
   audio?: string | null;
   /**
@@ -196,6 +206,16 @@ export interface AudioQueueResumeReq {
 /** What audio.speak takes. */
 export interface AudioSpeakReq {
   /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
+  /**
    * a group inside the project
    * @maxLength 60
    */
@@ -286,6 +306,16 @@ export type AudioTask = "text2music" | "cover" | "repaint" | "edit" | "lego";
 
 /** What audio.transcribe takes. */
 export interface AudioTranscribeReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /** the recording: WAV, MP3, FLAC, Ogg or M4A as base64, a data: URL, or upload:<name> (audio.upload); any rate, mixed to mono */
   audio: string;
   /**
@@ -382,6 +412,16 @@ export interface AudioVoicesAddReq {
 
 /** What audio.voices.design takes. */
 export interface AudioVoicesDesignReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /** the voice: age, gender, timbre, pace, emotion, accent */
   instructions: string;
   language?: string | null;
@@ -404,6 +444,16 @@ export interface AudioVoicesDesignReq {
 
 /** What audio.voices.enroll takes. */
 export interface AudioVoicesEnrollReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /** this card only (default: the model's cards, the first with room) */
   gpu?: number | null;
   /**
@@ -497,6 +547,16 @@ export interface ImageDescribePromptGuideMdReq {
 /** What image.edit takes. */
 export interface ImageEditReq {
   /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
+  /**
    * a group inside the project
    * @maxLength 60
    */
@@ -573,6 +633,16 @@ export interface ImageEditReq {
 
 /** What image.generate takes. */
 export interface ImageGenerateReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /**
    * a group inside the project
    * @maxLength 60
@@ -681,6 +751,16 @@ export interface ImageJobsReq {
 
 /** What image.ocr takes. */
 export interface ImageOcrReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /** find blocks set side by side (a gutter between) and read each on its own (default true) */
   columns?: boolean | null;
   /** several pages: each read on its own with its tiles (default true); false: the model's one-pass multi-page reading */
@@ -786,6 +866,16 @@ export interface ImageUploadReq {
 /** What image.upscale takes. */
 export interface ImageUpscaleReq {
   /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
+  /**
    * a group inside the project
    * @maxLength 60
    */
@@ -853,6 +943,16 @@ export interface ImageUpscaleReq {
 
 /** What image.vectorize takes. */
 export interface ImageVectorizeReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /**
    * a group inside the project
    * @maxLength 60
@@ -941,6 +1041,16 @@ export interface ImageVectorizeReq {
 /** What llm.chat takes. */
 export interface LlmChatReq {
   /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
+  /**
    * keep the model loaded this long after the answer: picture, sound and video work does not stop it for room meanwhile (as /v1/chat/completions' X-Keep-Up-S header, which Open WebUI sends: 300). Absent: nothing kept - once idle the model may be stopped for other work
    * @minimum 0
    * @maximum 86400
@@ -1001,6 +1111,16 @@ export interface Model3dDescribePromptGuideMdReq {
 
 /** What model3d.generate takes. */
 export interface Model3dGenerateReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /**
    * a group inside the project
    * @maxLength 60
@@ -1170,6 +1290,16 @@ export interface Model3dQueueResumeReq {
 
 /** What model3d.rig takes. */
 export interface Model3dRigReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /**
    * a group inside the project
    * @maxLength 60
@@ -1342,6 +1472,20 @@ export interface SystemEnableReq {
   [key: string]: unknown;
 }
 
+/** What system.eta takes. */
+export interface SystemEtaReq {
+  /** the method the request would call (image.generate, llm.chat ...) */
+  method: string;
+  /** the request's parameters as the method takes them (only the size-driving ones matter) */
+  params?: unknown | null;
+  /** the model (default: the one the request would pick) */
+  model?: string | null;
+  /** the longest you would wait for it to start: the answer says whether it would be accepted (would_accept) */
+  max_willing_to_wait_s?: number | null;
+  /** other keys */
+  [key: string]: unknown;
+}
+
 /** What system.files.delete takes. */
 export interface SystemFilesDeleteReq {
   kind: FileKind;
@@ -1438,6 +1582,14 @@ export interface SystemMoveReq {
   [key: string]: unknown;
 }
 
+/** What system.pin takes. */
+export interface SystemPinReq {
+  /** the model's registry id (system.models) */
+  model: string;
+  /** other keys */
+  [key: string]: unknown;
+}
+
 /** What system.ping takes. */
 export interface SystemPingReq {
   /** other keys */
@@ -1460,6 +1612,14 @@ export interface SystemStateReq {
 
 /** What system.unload takes. */
 export interface SystemUnloadReq {
+  /** the model's registry id (system.models) */
+  model: string;
+  /** other keys */
+  [key: string]: unknown;
+}
+
+/** What system.unpin takes. */
+export interface SystemUnpinReq {
   /** the model's registry id (system.models) */
   model: string;
   /** other keys */
@@ -1502,6 +1662,16 @@ export interface VideoDescribePromptGuideMdReq {
 
 /** What video.engines.list takes. */
 export interface VideoEnginesListReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /** other keys */
   [key: string]: unknown;
 }
@@ -1514,6 +1684,16 @@ export interface VideoFilmsListReq {
 
 /** What video.generate takes. */
 export interface VideoGenerateReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /**
    * a group inside the project, held or cleared together
    * @maxLength 60
@@ -1861,6 +2041,16 @@ export interface VideoUploadReq {
 /** What video.upscale takes. */
 export interface VideoUpscaleReq {
   /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
+  /**
    * a group inside the project
    * @maxLength 60
    */
@@ -2035,6 +2225,24 @@ export interface Methods {
    * @example {"model":"minimax-music3"}
    */
   "system.unload": { req: SystemUnloadReq; resp: any };
+  /**
+   * Pin an enabled model: it loads now (in the background) and stays: no idle unload, never stopped for another model's room (that one answers 503 no_room naming the pin). Kept across a restart of the front door; disabling the model unpins it
+   * @tags system
+   * @example {"model":"qwen-image-2.1-q8"}
+   */
+  "system.pin": { req: SystemPinReq; resp: any };
+  /**
+   * Unpin a model: only the flag is cleared; it stays loaded until the idle rules take it
+   * @tags system
+   * @example {"model":"qwen-image-2.1-q8"}
+   */
+  "system.unpin": { req: SystemUnpinReq; resp: any };
+  /**
+   * The ETA a request would get now - {wait_s, run_s, total_s, samples, basis (shape | model | none), spread} from the last 100 requests of its shape - and whether max_willing_to_wait_s would accept it; nothing is started, queued or loaded, so a caller can ask first and choose another machine
+   * @tags system
+   * @example {"max_willing_to_wait_s":120,"method":"image.generate","params":{"height":1024,"steps":28,"width":1024}}
+   */
+  "system.eta": { req: SystemEtaReq; resp: any };
   /**
    * The settings file (nextsycl.conf): its text, every setting the program reads (value, default, what reads it), the file's others
    * @tags system
@@ -2511,6 +2719,7 @@ export interface Methods {
   /**
    * The denoisers the daemon has, and the video.generate keys each takes: INT8 / Q6_K / Q4_K_M (text and image to video: anchors, guides, ControlNet, masked runs) and REF2VA (reference pictures and clips; no ControlNet or masked runs). ref_audios, anchors and guides work with every one
    * @tags video
+   * @example {}
    */
   "video.engines.list": { req: VideoEnginesListReq; resp: any };
   /**
@@ -2538,7 +2747,7 @@ export interface Methods {
 }
 
 /** The methods that take no parameters (their body may be left out). */
-export type NoParamMethods = "system.state" | "system.busy" | "system.ping" | "system.version" | "system.models" | "system.models.pulls" | "system.cards" | "system.config" | "system.drives" | "system.move.cancel" | "llm.requests" | "llm.models" | "image.queue.list" | "image.progress" | "image.history" | "audio.progress" | "audio.history" | "audio.queue.list" | "model3d.progress" | "model3d.history" | "model3d.queue.list" | "video.status" | "video.queue.list" | "video.projects.list" | "video.films.list" | "video.templates.list" | "video.engines.list" | "video.canvases.list" | "video.summary";
+export type NoParamMethods = "system.state" | "system.busy" | "system.ping" | "system.version" | "system.models" | "system.models.pulls" | "system.cards" | "system.config" | "system.drives" | "system.move.cancel" | "llm.requests" | "llm.models" | "image.queue.list" | "image.progress" | "image.history" | "audio.progress" | "audio.history" | "audio.queue.list" | "model3d.progress" | "model3d.history" | "model3d.queue.list" | "video.status" | "video.queue.list" | "video.projects.list" | "video.films.list" | "video.templates.list" | "video.canvases.list" | "video.summary";
 
 /** Every error's body, whatever the HTTP status: branch on `code`, never on the status (docs/RPC_RULES.md). */
 export interface RpcError {
@@ -2648,6 +2857,24 @@ export function client(post: Post, raw?: PostRaw) {
      * @example {"model":"minimax-music3"}
      */
     "system.unload": (req: SystemUnloadReq): Promise<any> => post("system.unload", req),
+    /**
+     * Pin an enabled model: it loads now (in the background) and stays: no idle unload, never stopped for another model's room (that one answers 503 no_room naming the pin). Kept across a restart of the front door; disabling the model unpins it
+     * @tags system
+     * @example {"model":"qwen-image-2.1-q8"}
+     */
+    "system.pin": (req: SystemPinReq): Promise<any> => post("system.pin", req),
+    /**
+     * Unpin a model: only the flag is cleared; it stays loaded until the idle rules take it
+     * @tags system
+     * @example {"model":"qwen-image-2.1-q8"}
+     */
+    "system.unpin": (req: SystemUnpinReq): Promise<any> => post("system.unpin", req),
+    /**
+     * The ETA a request would get now - {wait_s, run_s, total_s, samples, basis (shape | model | none), spread} from the last 100 requests of its shape - and whether max_willing_to_wait_s would accept it; nothing is started, queued or loaded, so a caller can ask first and choose another machine
+     * @tags system
+     * @example {"max_willing_to_wait_s":120,"method":"image.generate","params":{"height":1024,"steps":28,"width":1024}}
+     */
+    "system.eta": (req: SystemEtaReq): Promise<any> => post("system.eta", req),
     /**
      * The settings file (nextsycl.conf): its text, every setting the program reads (value, default, what reads it), the file's others
      * @tags system
@@ -3124,8 +3351,9 @@ export function client(post: Post, raw?: PostRaw) {
     /**
      * The denoisers the daemon has, and the video.generate keys each takes: INT8 / Q6_K / Q4_K_M (text and image to video: anchors, guides, ControlNet, masked runs) and REF2VA (reference pictures and clips; no ControlNet or masked runs). ref_audios, anchors and guides work with every one
      * @tags video
+     * @example {}
      */
-    "video.engines.list": (req: VideoEnginesListReq = {}): Promise<any> => post("video.engines.list", req),
+    "video.engines.list": (req: VideoEnginesListReq): Promise<any> => post("video.engines.list", req),
     /**
      * The canvases and their measured cost
      * @tags video

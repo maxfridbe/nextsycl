@@ -45,6 +45,9 @@ guide is how to port one, and the few rules every change follows.
    time. The generator, rpcgen, is vibe-creative-platform's, vendored in `vendor/rpcgen`: change it there, then
    `tooling/sync_rpcgen.sh` (a test fails on a copy edited here, and on a stale client). What happened is in the
    answer's envelope (`error.code`, `retryable`), never only in the HTTP status.
+8. **The cards are one backplane.** Every enabled model of every kind loads on demand; only an idle holder neither
+   pinned nor held is stopped for room, running work never; a method that runs a model takes `rsvp_s` and
+   `max_willing_to_wait_s` (`home/backplane.rs`, `RUNS_MODEL`), and the page has no start or stop.
 
 Every rule a machine can check is a test in `cli/nextsycl/tests/architecture.rs` (its header maps each rule to its
 tests; rule 5 is a review rule), run by `cargo test`; `./build.sh test` checks the kernel libraries link against no

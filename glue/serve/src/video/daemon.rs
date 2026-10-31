@@ -34,6 +34,9 @@
 //!   POST /engine/jobs/<id>/cancel
 //!   POST /engine/jobs/<id>/remove    forget a job that is not running
 //!   POST /engine/unload              {"gpu": N} or every GPU: give it back now (after the running job)
+//!   (a job that names no GPU keeps off a card the front door's `GET /video/blocked` says a pin or hold has taken, while
+//!   another can run it; one already waiting for such a card's memory goes back in the queue: its worker has loaded nothing)
+//!   POST /engine/keep                {"gpu": N (or every GPU), "seconds": S}: its idle unload held off that long (the front door's pins and holds; 0 ends it)
 //!   POST /engine/shutdown            cancel the queue, finish or cancel the running jobs, unload, exit
 //! ```
 //!
@@ -81,6 +84,52 @@ pub struct Options {
     /// stopped. `None` (a daemon on its own): nobody to ask, the switcher is told as it always was.
     pub door: Option<String>,
     pub threads: usize,
+}
+
+/// Whether a worker idle this long goes: past the limit and not kept
+fn idle_over(idle: Duration, limit: Duration, keep_until: Option<Instant>) -> bool {
+    idle >= limit && keep_until.is_none_or(|k| k <= Instant::now())
+}
+
+/// A slot as the choice of a job sees it
+#[derive(Clone, Copy)]
+struct Seat {
+    gpu: usize,
+    shared: bool,
+    free: bool,
+}
+
+/// Whether slot `me` takes a job that names no GPU. A card a pin or hold has taken (`blocked`) goes last, while another
+/// free card can run the job; else a shared GPU only while every unshared one is busy (loading there stops the other
+/// program's model, which a free unshared GPU would not). Every card blocked: as if none were, the job waits on one.
+fn takes_unnamed(me: Seat, seats: &[Seat], blocked: &[usize]) -> bool {
+    let open = |o: &&Seat| o.gpu != me.gpu && o.free && !blocked.contains(&o.gpu);
+    if blocked.contains(&me.gpu) && seats.iter().any(|o| open(&o)) {
+        return false;
+    }
+    !(me.shared && seats.iter().any(|o| open(&o) && !o.shared))
+}
+
+/// Whether a job naming no GPU, waiting on `me`'s card for memory, should go back in the queue: a pin or hold has that
+/// card and another free one can run it
+fn should_move(me: Seat, seats: &[Seat], blocked: &[usize], engine_state: &str) -> bool {
+    engine_state.starts_with("waiting for the GPU: ") && blocked.contains(&me.gpu) && seats.iter().any(|o| o.gpu != me.gpu && o.free && !blocked.contains(&o.gpu))
+}
+
+/// Whether a cancelled job's worker should be told to leave now: it is still waiting for memory (or only starting), so
+/// it has loaded nothing and would otherwise sit there until room came, loading the weights to find the cancel
+fn cancel_ends_worker(cancelled: bool, engine_state: &str) -> bool {
+    cancelled && (engine_state.starts_with("waiting for the GPU: ") || engine_state == "starting the engine process")
+}
+
+/// What run_job answers for a job sent back to the queue
+const MOVED: &str = "moved to another card";
+
+/// The cards the door says a pin or hold has taken. A door that does not answer: none (the job waits where it lands, as it did).
+fn door_blocked(door: &str) -> Vec<usize> {
+    http::call_for(&http::Target::Tcp(door.to_string()), "GET", "/video/blocked", None, 5).ok()
+        .and_then(|v| v["blocked"].as_array().map(|a| a.iter().filter_map(|g| g.as_u64()).map(|g| g as usize).collect()))
+        .unwrap_or_default()
 }
 
 /// The door's word on the chat model: held (answering or kept) unless it says otherwise; a door that does not answer
@@ -191,6 +240,8 @@ struct Slot {
     engine: String, // unloaded, starting..., waiting for the GPU..., loading, loaded, unloading
     running: Option<u64>,
     last_active: Instant,
+    /// its idle unload held off until then (POST /engine/keep)
+    keep_until: Option<Instant>,
     unload_requested: bool,
     info: Value,
     worker_pid: Option<u32>,
@@ -216,6 +267,8 @@ struct Hooks {
 }
 
 struct Daemon {
+    /// the cards the front door says a pin or hold has taken (refreshed every 3 s; none without a door)
+    blocked: Mutex<Vec<usize>>,
     opts: Options,
     /// the GPUs `h3d gpus` found at start
     found: Vec<Value>,
@@ -441,6 +494,10 @@ impl Daemon {
     }
 
     /// Hands a job to the slot's worker and relays its events until the result.
+    fn seats(s: &Shared) -> Vec<Seat> {
+        s.slots.iter().map(|o| Seat { gpu: o.gpu, shared: o.shared, free: o.running.is_none() }).collect()
+    }
+
     fn run_job(&self, k: usize, proc: &mut Option<Proc>, id: u64, spec: &Value, cancel: &AtomicBool) -> std::result::Result<Value, String> {
         let want = self.opts.engine_path(job_engine(spec)).map(|(n, _)| n).ok_or("no such engine")?;
         let mut held = false;
@@ -489,7 +546,25 @@ impl Daemon {
                         self.engine_event(k, &ev);
                     }
                 },
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let state = self.s.lock().unwrap().slots[k].engine.clone();
+                    if cancel_ends_worker(cancel.load(Ordering::Relaxed), &state) {
+                        self.end_worker(k, proc, false);
+                        return Err("cancelled while it waited for room: nothing was loaded".to_string());
+                    }
+                    // still waiting for this card's memory, and a pin or hold has it: the worker has loaded nothing and
+                    // leaves when asked (never a kill); another slot takes the job
+                    let moving = !cancel_sent && spec.get("gpu").is_none() && {
+                        let s = self.s.lock().unwrap();
+                        let seats = Self::seats(&s);
+                        should_move(seats[k], &seats, &self.blocked.lock().unwrap(), &s.slots[k].engine)
+                    };
+                    if moving {
+                        self.log_job(id, "engine : a pin or hold has this card and another is free: moving there".to_string());
+                        self.end_worker(k, proc, false);
+                        return Err(MOVED.to_string());
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     // its output closed: it has ended or is ending
                     for _ in 0..600 {
@@ -533,12 +608,11 @@ impl Daemon {
                         break Next::Unload;
                     }
                     let gpu = s.slots[k].gpu;
-                    // a shared GPU takes a job that names no GPU only while every unshared one is busy: loading there
-                    // stops the other program's model, which a free unshared GPU would not
-                    let unshared_free = s.slots[k].shared && s.slots.iter().any(|o| !o.shared && o.running.is_none());
+                    let seats = Self::seats(&s);
+                    let takes = takes_unnamed(seats[k], &seats, &self.blocked.lock().unwrap());
                     let mine = s.queue.iter().position(|id| match s.jobs[id].wants_gpu() {
                         Some(g) => g == gpu,
-                        None => !unshared_free,
+                        None => takes,
                     });
                     if let Some(pos) = mine {
                         let id = s.queue.remove(pos).unwrap();
@@ -552,7 +626,7 @@ impl Daemon {
                     }
                     let idle = s.slots[k].last_active.elapsed();
                     if let Some(limit) = self.opts.idle {
-                        if proc.is_some() && idle >= limit {
+                        if proc.is_some() && idle_over(idle, limit, s.slots[k].keep_until) {
                             break Next::Unload;
                         }
                     }
@@ -573,6 +647,17 @@ impl Daemon {
                 Next::Run(id, spec, cancel) => {
                     let outcome = self.run_job(k, &mut proc, id, &spec, &cancel);
                     let mut s = self.s.lock().unwrap();
+                    if outcome.as_ref().err().is_some_and(|e| e == MOVED) {
+                        let j = s.jobs.get_mut(&id).unwrap();
+                        j.state = "queued";
+                        j.started = None;
+                        j.gpu = None;
+                        s.queue.push_front(id);
+                        s.slots[k].running = None;
+                        s.slots[k].last_active = Instant::now();
+                        self.cv.notify_all();
+                        continue;
+                    }
                     let j = s.jobs.get_mut(&id).unwrap();
                     j.finished = Some(now());
                     match outcome {
@@ -716,6 +801,19 @@ impl Daemon {
                     }
                 }
             }
+            ("POST", ["keep"]) => {
+                let want = body.get("gpu").and_then(|g| g.as_u64()).map(|g| g as usize);
+                let until = Instant::now() + Duration::from_secs_f64(body.get("seconds").and_then(|x| x.as_f64()).unwrap_or(0.0).clamp(0.0, 86400.0));
+                let hit: Vec<usize> = s.slots.iter_mut().filter(|sl| want.is_none_or(|g| g == sl.gpu)).map(|sl| {
+                    sl.keep_until = Some(until);
+                    sl.gpu
+                }).collect();
+                if hit.is_empty() {
+                    (400, json!({"error": "no such GPU served"}))
+                } else {
+                    (200, json!({"kept": hit}))
+                }
+            }
             ("POST", ["unload"]) => {
                 let want = body.get("gpu").and_then(|g| g.as_u64()).map(|g| g as usize);
                 let mut hit = Vec::new();
@@ -802,6 +900,7 @@ pub fn serve(opts: Options) -> Result<()> {
             engine: "unloaded".into(),
             running: None,
             last_active: Instant::now(),
+            keep_until: None,
             unload_requested: false,
             info: Value::Null,
             worker_pid: None,
@@ -830,12 +929,22 @@ pub fn serve(opts: Options) -> Result<()> {
     let n = slots.len();
     let socket = opts.socket.clone();
     let d = Arc::new(Daemon {
+        blocked: Mutex::new(Vec::new()),
         opts,
         found,
         s: Mutex::new(Shared { jobs: BTreeMap::new(), queue: VecDeque::new(), next: 1, shutdown: false, slots }),
         cv: Condvar::new(),
         hooks: Mutex::new(Hooks::default()),
     });
+    if let Some(door) = d.opts.door.clone() {
+        let me = d.clone();
+        std::thread::spawn(move || loop {
+            let now_blocked = door_blocked(&door);
+            *me.blocked.lock().unwrap() = now_blocked;
+            me.cv.notify_all();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+    }
     let threads: Vec<_> = (0..n)
         .map(|k| {
             let d = d.clone();
@@ -935,6 +1044,72 @@ mod chat_hook_tests {
     use std::io::Read;
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+
+    fn seat(gpu: usize, shared: bool, free: bool) -> Seat {
+        Seat { gpu, shared, free }
+    }
+
+    #[test]
+    fn a_job_naming_no_gpu_keeps_off_a_card_a_pin_has_while_another_is_free() {
+        // the live case: GPU 0 taken by a pin and a hold, GPU 1 empty, both shared
+        let s = [seat(0, true, true), seat(1, true, true)];
+        assert!(!takes_unnamed(s[0], &s, &[0]), "the blocked card leaves it");
+        assert!(takes_unnamed(s[1], &s, &[0]), "the free card takes it");
+        // nothing blocked: first come, as before
+        assert!(takes_unnamed(s[0], &s, &[]) && takes_unnamed(s[1], &s, &[]));
+        // every card blocked, or the other busy: it waits where it lands
+        assert!(takes_unnamed(s[0], &s, &[0, 1]));
+        assert!(takes_unnamed(s[0], &[seat(0, true, true), seat(1, true, false)], &[0]));
+    }
+
+    #[test]
+    fn the_shared_preference_stands_and_cannot_starve_a_job() {
+        let s = [seat(0, false, true), seat(1, true, true)];
+        assert!(takes_unnamed(s[0], &s, &[]) && !takes_unnamed(s[1], &s, &[]), "a free unshared card first");
+        // the unshared card blocked: the shared one takes it, or neither would
+        assert!(!takes_unnamed(s[0], &s, &[0]) && takes_unnamed(s[1], &s, &[0]));
+        // the shared card blocked (a chat model held there, say): the unshared one
+        assert!(takes_unnamed(s[0], &s, &[1]) && !takes_unnamed(s[1], &s, &[1]));
+    }
+
+    #[test]
+    fn a_job_waiting_for_memory_moves_only_off_a_blocked_card_to_a_free_one() {
+        let waiting = "waiting for the GPU: 24.8 GiB free, 27.5 GiB needed";
+        let s = [seat(0, true, false), seat(1, true, true)];
+        assert!(should_move(s[0], &s, &[0], waiting));
+        assert!(!should_move(s[0], &s, &[], waiting), "not blocked: it waits, idle holders are going");
+        assert!(!should_move(s[0], &s, &[0, 1], waiting), "nowhere better");
+        assert!(!should_move(s[0], &[seat(0, true, false), seat(1, true, false)], &[0], waiting), "the other is busy");
+        assert!(!should_move(s[0], &s, &[0], "loading"), "memory on the card: it stays");
+        assert!(!should_move(s[0], &s, &[0], "waiting for the GPU lock (held: x)"), "not this wait");
+    }
+
+    #[test]
+    fn a_cancel_ends_a_worker_that_has_loaded_nothing_and_no_other() {
+        let waiting = "waiting for the GPU: 27.4 GiB free, 27.5 GiB needed";
+        assert!(cancel_ends_worker(true, waiting));
+        assert!(cancel_ends_worker(true, "starting the engine process"));
+        assert!(!cancel_ends_worker(false, waiting), "not cancelled: it waits");
+        for s in ["loading", "loaded", "waiting for the GPU lock (held: x)"] {
+            assert!(!cancel_ends_worker(true, s), "{s}: the worker takes the cancel itself");
+        }
+    }
+
+    #[test]
+    fn the_doors_word_on_blocked_cards_and_its_silence() {
+        let (door, _) = fake(r#"{"blocked":[0]}"#);
+        assert_eq!(door_blocked(&door), vec![0]);
+        assert!(door_blocked(&closed_port()).is_empty(), "a silent door blocks nothing");
+    }
+
+    #[test]
+    fn a_kept_worker_outlasts_its_idle_limit() {
+        let (idle, limit) = (Duration::from_secs(700), Duration::from_secs(600));
+        assert!(idle_over(idle, limit, None), "nothing keeps it");
+        assert!(!idle_over(Duration::from_secs(10), limit, None), "not idle long enough");
+        assert!(!idle_over(idle, limit, Some(Instant::now() + Duration::from_secs(60))), "kept");
+        assert!(idle_over(idle, limit, Some(Instant::now() - Duration::from_secs(1))), "the keep is over");
+    }
 
     /// A one-answer-to-everything server; the requests it was sent
     fn fake(answer: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {

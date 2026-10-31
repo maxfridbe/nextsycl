@@ -12,6 +12,9 @@
 //! 5. Exact before fast: a review rule (the pull request's parity check and measurements), not a test.
 //! 6. Tuning in silos: `silos_are_their_engines_own` (a silo is opened by its engine, included by nothing outside
 //!    its arch, and gates its ops with `_supported` checks).
+//! 7. A front-door method is its handler: `home::api_files_tests` (the client and the document agree with the table).
+//! 8. One backplane: `every_model_method_takes_the_backplanes_fields`, `the_page_has_no_start_or_stop`,
+//!    `room_passes_over_pins_and_holds` (and the behaviour in glue/serve/tests/backplane.rs).
 //!
 //! And every environment variable the code reads has a row in docs/environment.md:
 //! `every_environment_variable_is_documented`.
@@ -345,4 +348,40 @@ fn silos_are_their_engines_own() {
         }
     }
     assert!(bad.is_empty(), "silos broken (rule 6, CONTRIBUTING.md):\n  {}", bad.join("\n  "));
+}
+
+/// Rule 8: every method named in RUNS_MODEL declares the two fields in its request struct
+#[test]
+fn every_model_method_takes_the_backplanes_fields() {
+    let src = std::fs::read_to_string(root().join("glue/serve/src/home/backplane.rs")).unwrap();
+    let list = src.split("RUNS_MODEL: &[&str] = &[").nth(1).unwrap().split("];").next().unwrap();
+    let names: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+    assert!(names.len() >= 15 && names.contains(&"video.generate") && names.contains(&"llm.chat"), "{names:?}");
+    let methods = std::fs::read_to_string(root().join("glue/serve/src/home/methods.rs")).unwrap();
+    for name in names {
+        let st: String = name.split(['.', '_']).map(|w| { let mut c = w.chars(); c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect()) }).collect::<String>() + "Req";
+        let body = methods.split(&format!("pub struct {st} {{")).nth(1).unwrap_or_else(|| panic!("{name}: no struct {st}")).split("\n}").next().unwrap();
+        for f in ["pub rsvp_s:", "pub max_willing_to_wait_s:"] {
+            assert!(body.contains(f), "{name} ({st}) does not declare {f}");
+        }
+    }
+}
+
+/// Rule 8: requests load and idle unloads; the page offers no start or stop (the RPCs stay, for tools)
+#[test]
+fn the_page_has_no_start_or_stop() {
+    let page = std::fs::read_to_string(root().join("wfe/home/src/components/App.tsx")).unwrap();
+    for b in ["btn(\"load\"", "btn(\"unload\"", "\"start\"", "\"stop\""] {
+        assert!(!page.contains(b), "the page has {b}");
+    }
+}
+
+/// Rule 8: the two places a holder is chosen for room look at its pin and hold first
+#[test]
+fn room_passes_over_pins_and_holds() {
+    let life = std::fs::read_to_string(root().join("glue/serve/src/home/life.rs")).unwrap();
+    let idle_on = life.split("fn idle_on(").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    assert!(idle_on.contains("self.kept("), "idle_on must pass over pinned and held models");
+    let place = life.split("fn place(").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    assert!(place.contains("free_to_go"), "a server's slot must not go to another model while its model is pinned or held");
 }

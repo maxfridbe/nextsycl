@@ -55,6 +55,7 @@ function settle(): void {
     const done = !m || Date.now() - p.since > 1_200_000
       || (p.what === "load" && ["loaded", "busy", "ready"].includes(m.state))
       || (p.what === "unload" && !["loaded", "busy", "loading"].includes(m.state))
+      || (p.what === "pin" && m.pinned === true) || (p.what === "unpin" && !m.pinned)
       || (p.what === "enable" && m.enabled) || (p.what === "disable" && !m.enabled);
     // a failed load shows in the actions: stop spinning
     const failed = p.what === "load" && m && m.state === "unloaded" && Date.now() - p.since > 8000

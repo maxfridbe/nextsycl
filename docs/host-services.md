@@ -15,7 +15,40 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
   - **The page**: every GPU's memory by process, and below it, hatched, what the enabled models are vouched for (as
     seen while they ran, else an estimate from their files; chat models and video engines count once a card - one
     runs at a time - and an overbooked card is flagged: whichever loads first holds it). Every registered model by
-    kind: enable it on its GPU(s), start it now (the button spins until it answers), stop it, disable it, its page.
+    kind: enable it on its GPU(s), pin it, disable it, its page. There is no start or stop: requests load a model and
+    idle or a need for room unloads it (`system.load` and `system.unload` remain for tools).
+  - **The backplane** (the same on every box): every enabled model of every kind loads on demand, stopping only idle
+    holders neither pinned nor held; nothing running is ever stopped for room. A load needs its `vram_gib` + 1.5 GiB
+    free on a card, and its `ram_gib` + 4 GiB of host memory where it says one. Any `video.*` call brings a stopped
+    daemon up (120 s at most). A clip that names no card keeps off a card a pin or hold has taken while another can run
+    it (the daemon asks the door's `GET /video/blocked`), and one already waiting for such a card's memory moves.
+    - `system.pin` / `system.unpin {model}`: loaded now in the background (`{model, pinned: true, loading: true}`), never
+      stopped for room or idleness, `pinned` in the registry, loaded again after a restart (not during maintenance or a
+      GPU run). A load that fails leaves the pin set: a run on the page, tried again every 5 minutes. A video pin keeps the
+      daemon and its workers once loaded; weights load with the first clip. Unpin clears the flag only. `system.unload`
+      remains a tool's say, also on a pinned model (the pin brings it back); disabling unpins.
+    - `rsvp_s` on a method that runs a model: held that long after the request ends (answered, failed or cancelled),
+      clamped to `NS_MAX_RSVP_S` (86400; unset or 0: that), never shortened by a later one. 0 releases: the model goes as
+      soon as it is idle, unless an earlier hold stands. The result says `rsvp_granted_s`. A clip's hold starts when it
+      leaves the studio's queue. X-Keep-Up-S and `keep_up_s` are kept beside it in `holds.json` (read by the switcher;
+      `/chat/held` and the switcher's `/keep` answer as before): they stop other kinds taking a chat model, while another
+      chat model may still take a kept one, as Open WebUI's picker always could. A pinned or `rsvp_s`-held chat model gives
+      way to nothing (503 `no_room`).
+    - ETA: the last 100 requests per shape and per model in `history/*.jsonl` beside serve.json, clips read in from the
+      studio's records so a clip's wait is known hot or cold. `eta = {wait_s, run_s, total_s, samples, basis:
+      shape|model|none, spread: [low, high], shape}`: `wait_s` 0 for a loaded model with a free server, else the work ahead
+      plus the model's spin-up from history, null when a part has none. `POST /rpc/system.eta {method, params, model,
+      max_willing_to_wait_s}` is read-only and adds `would_accept`. Queued and running jobs carry `eta` and
+      `eta_remaining_s`; `video.status` keeps its number `eta` and adds `eta_remaining_s` and `eta_estimate`.
+    - `max_willing_to_wait_s`: the limit on the time to start, replacing the default waits. A known wait over it answers
+      `{"ok": false, "error": {"code": "wait_too_long", "retryable": true, "status": 503, "eta": {...},
+      "max_willing_to_wait_s": N}}` at once, nothing queued or stopped. An unknown wait goes ahead and is withdrawn at
+      the limit (the same error with `waited_s`), a queued job too when its updated ETA will miss it. A loaded model with a
+      free server always starts.
+    - `no_room` is retryable and names each card and holder, then `; pinned: X (unpin to free the room)` and `; held by
+      rsvp_s: X (until its hold ends: X N s)`; a chat swap says `the chat server holds one model at a time and pinned: X
+      (unpin to free the room)` or `held by rsvp_s: X (N s more)`. /rpc answers HTTP 200 with the outcome in the body; /v1
+      uses the HTTP status.
   - **Model pages** through the door: an image, audio or 3D model's own page is `/open/<id>/` (the model starts if it
     is not up; every request under it, the page's API calls too, is passed to its server as `/<rest>`). Those servers
     check no token, so run the door with `--serve-host 127.0.0.1` (the example unit does): they listen on this

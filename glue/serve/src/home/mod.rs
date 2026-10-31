@@ -2,7 +2,8 @@
 //!
 //! - **The page** (`/`, wfe/home): every GPU - its memory by process, and the memory the enabled models are vouched
 //!   for (hatched; several may vouch for one card: whichever loads first holds it) - and every registered model:
-//!   enable it on GPU(s), start (load now: the button spins until it answers) and stop (unload), its page, its state;
+//!   enable it on GPU(s), pin it, its page, its state (no start or stop: requests load, idle or a need for room unloads;
+//!   system.load and system.unload remain for tools);
 //!   an API tab with the bearer token and a curl for every method; maintenance mode on and off (maint.rs).
 //! - **The drives** (disks.rs, crate::drives): each drive the models are on - device, link, free space, a read speed
 //!   measured on demand - and moving a model's files to another one (copied, checked, the registry repointed, the old
@@ -22,9 +23,11 @@
 //! llm.mode, which owns the chat card.
 
 mod api;
+mod backplane;
 mod config;
 mod disks;
 mod enroll;
+mod history;
 mod jobs;
 mod life;
 mod maint;
@@ -176,8 +179,18 @@ pub struct Home {
     jobs: jobs::Jobs,
     /// a job's stage while its server is chosen, and what it waits for: job id -> (stage, waiting_for)
     stages: Mutex<BTreeMap<String, (String, String)>>,
-    /// chat model id -> kept until (unix seconds): X-Keep-Up-S on /v1/chat/completions, keep_up_s on llm.chat
-    chat_keep: Mutex<BTreeMap<String, f64>>,
+    /// the holds (crate::hold: rsvp_s, X-Keep-Up-S, keep_up_s) in holds.json beside the registry, this door their one writer
+    holds_file: PathBuf,
+    holds_mx: Mutex<()>,
+    /// history/*.jsonl beside serve.json: what work took (history.rs)
+    history: history::History,
+    /// the clips watched for a limit or a reservation, and the ones withdrawn at their limit, by label (backplane.rs)
+    video_watch: Mutex<Vec<backplane::Watch>>,
+    withdrawn: Mutex<BTreeMap<String, Value>>,
+    /// the last chat request here
+    chat_last: Mutex<f64>,
+    /// the cards given from outside (fix_cards), not sampled
+    cards_fixed: std::sync::atomic::AtomicBool,
     /// loads started here and not yet answering (or answering a moment ago): card, server port, MiB placed for, when
     /// it answered - what they have yet to take counts as taken (life.rs free_mb)
     pending: Mutex<Vec<Pending>>,
@@ -298,11 +311,15 @@ impl Home {
         let jobs = jobs::Jobs::load(state_file.with_file_name("jobs.json"));
         let maint_file = crate::maintenance::file_beside(&registry::registry(&o.cfg));
         let maint_bypass = Mutex::new(st["maintenance_bypass"].as_str().unwrap_or("").to_string());
+        let holds_file = crate::hold::file_beside(&registry::registry(&o.cfg));
+        let history = history::History::open(state_file.with_file_name("history"));
         let h = Arc::new(Home {
             o, token, state_file, jobs,
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
-            seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), answers: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()), chat_keep: Mutex::new(BTreeMap::new()),
+            seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), answers: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()),
+            holds_file, holds_mx: Mutex::new(()), history, video_watch: Mutex::new(Vec::new()), withdrawn: Mutex::new(BTreeMap::new()),
+            chat_last: Mutex::new(now()), cards_fixed: std::sync::atomic::AtomicBool::new(false),
             pending: Mutex::new(Vec::new()), lock_paused: Mutex::new(None), progress: Mutex::new(BTreeMap::new()),
             maint_file, maint_bypass, disks: disks::Disks::new(&st), pulls: pulls::Pulls::default(),
         });
@@ -310,6 +327,8 @@ impl Home {
         std::thread::spawn(move || me.sample_cards());
         let me = h.clone();
         std::thread::spawn(move || me.video_room_loop());
+        let me = h.clone();
+        std::thread::spawn(move || me.backplane_loop());
         h.resume_jobs();
         // the video daemon as the enabled video models say (it is this page's to start and stop)
         let me = h.clone();
@@ -320,6 +339,12 @@ impl Home {
             }
         });
         Ok(h)
+    }
+
+    /// The cards as given, from now on not sampled: a test's box with no GPU in it
+    pub fn fix_cards(&self, cards: Value) {
+        self.cards_fixed.store(true, std::sync::atomic::Ordering::Relaxed);
+        *self.cards.lock().unwrap() = cards;
     }
 
     /// Every card every 2 s (busy % and power are deltas); what each model was seen to take, kept
@@ -344,7 +369,9 @@ impl Home {
             if let Some(st) = std::fs::read(&stat).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
                 merge_gpustat(&mut v, &st, now());
             }
-            *self.cards.lock().unwrap() = Value::from(v);
+            if !self.cards_fixed.load(std::sync::atomic::Ordering::Relaxed) {
+                *self.cards.lock().unwrap() = Value::from(v);
+            }
             // a GPU run holding the cards pauses the video queue until it ends (crate::gpulock)
             self.video_hold(self.cards_taken().is_some());
             // the most each model took on each card, kept for the vouching estimates
@@ -448,6 +475,13 @@ impl Home {
                 }
                 http::respond(&mut s, 200, &self.chat_held_answer())
             }
+            // likewise: the cards a pin or hold has taken, for a clip that names no card
+            ("GET", "/video/blocked") => {
+                if !s.same_box() {
+                    return http::respond(&mut s, 404, &err("not found".to_string()));
+                }
+                http::respond(&mut s, 200, &self.video_blocked())
+            }
             ("GET", "/openapi.yml") | ("GET", "/openapi.yaml") => {
                 let spec = self.openapi(&req, false);
                 http::respond_bytes(&mut s, 200, "application/yaml; charset=utf-8", yaml::to_yaml(&spec).as_bytes(), "Cache-Control: no-cache\r\n")
@@ -516,6 +550,9 @@ impl Home {
                     let to = format!("/open/{id}/{query}");
                     return http::respond_bytes(s, 302, "text/plain; charset=utf-8", b"", &format!("Location: {to}\r\nCache-Control: no-cache\r\n"));
                 };
+                if let Err((c, e)) = self.video_up() {
+                    return http::respond(s, c, &err(e));
+                }
                 let studio = http::Target::Tcp(format!("127.0.0.1:{}", self.o.ports.video));
                 if let Err(e) = http::forward_to(&mut *s, &studio, req, &format!("/{sub}{query}")) {
                     http::respond(s, 502, &err(format!("the video studio does not answer: {e}")));
@@ -695,7 +732,7 @@ impl Home {
         }
     }
 
-    /// The page's buttons: {"do": enable | disable | load | unload | measure | move | move_cancel, "model", "gpus": [..],
+    /// The page's buttons: {"do": enable | disable | pin | unpin | load | unload | measure | move | move_cancel, "model", "gpus": [..],
     /// "force", "drive"}; a load, a measurement and a move run on (the state shows them), the others answer when done
     fn action(self: &Arc<Self>, b: &Value) -> Result<Value, (u16, String)> {
         let model = b["model"].as_str().unwrap_or("").to_string();
@@ -703,6 +740,8 @@ impl Home {
             "enable" => self.enable(&model, b.get("gpus")).map(|m| json!({"model": m})),
             "disable" => self.disable(&model, b["force"] == true).map(|_| json!({"model": model, "enabled": false})),
             "gpus" => self.set_gpus(&model, b.get("gpus")),
+            "pin" => self.pin(&model).map(|_| json!({"model": model, "pinned": true, "loading": true})),
+            "unpin" => self.unpin(&model).map(|_| json!({"model": model, "pinned": false})),
             "load" => {
                 self.load_async(&model)?;
                 Ok(json!({"model": model, "loading": true}))
@@ -719,7 +758,7 @@ impl Home {
             // the page's checkbox: NS_AUTO_PULL in the settings file (read live: no restart)
             "auto_pull" => self.config_set(&json!({"set": {"NS_AUTO_PULL": if b["on"] == true { json!("1") } else { Value::Null }}}))
                 .map(|_| json!({"auto_pull": self.auto_pull()})),
-            other => Err((400, format!("no action {other:?} (enable, disable, gpus, load, unload, config, restart, maintenance, measure, move, move_cancel, pull, pull_cancel, auto_pull)"))),
+            other => Err((400, format!("no action {other:?} (enable, disable, gpus, pin, unpin, load, unload, config, restart, maintenance, measure, move, move_cancel, pull, pull_cancel, auto_pull)"))),
         }
     }
 }
