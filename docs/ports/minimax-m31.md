@@ -459,7 +459,7 @@ Guesses that only copy pinned experts (`NS_MM31_AHEAD=3`, `NS_MM31_AHEAD_READS=0
 
 **What a pinned expert costs** (fixed text, 279 tokens, 3 runs, least squares by token): ms = 46.7 + 0.68 pinned + 2.6 file, about 11 ms a token for 16.4 pinned swaps. A pure GPU product is ~0.12 ms of that (4 experts: gu 276 us, down 203 us, B70).
 
-**Products on the host** (commit "expert products on the host's cores", reverted in the next commit; AVX2 and FMA on 8-float groups, not the AVX-512 VNNI of deepseek2, since these products are float). One expert alone, Ryzen 9 9950X, ms by threads:
+**Products on the host** (commit b73bc9d, since reverted; AVX2 and FMA on 8-float groups, not the AVX-512 VNNI of deepseek2, since these products are float). One expert alone, Ryzen 9 9950X, ms by threads:
 
 | types | MB | 1 | 4 | 8 | 12 | 16 |
 |---|---|---|---|---|---|---|
