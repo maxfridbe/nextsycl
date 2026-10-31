@@ -259,6 +259,8 @@ case "$kind $cmd" in
 esac
 "#, d = dir.display())).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // (another test's fork may hold the file open for write a moment: running it then would fail, text file busy)
+    std::thread::sleep(Duration::from_millis(300));
     // what a restart finds is what the last box's ports held: nothing on these
     for e in std::fs::read_dir(&dir).unwrap().flatten() {
         if e.file_name().to_string_lossy().starts_with("up-") {
