@@ -152,7 +152,7 @@ fn serve_one(dir: &Path, port: u16, is_video: bool, id: &str, mut s: TcpStream) 
             "/rpc/jobs.list" => json!({"ok": true, "result": {"jobs": std::fs::read(dir.join("clips.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or(json!([]))}}),
             "/rpc/admission" => json!({"ok": true, "result": std::fs::read(dir.join("admission.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or(json!({"reentered": false, "gate": "free"}))}),
             "/rpc/generate" if dir.join("admission.json").exists() => json!({"ok": true, "result": {"queued": false, "state": "running", "reentered": true, "job": {"label": "the first"}}}),
-            "/rpc/generate" => json!({"ok": true, "result": {"queued": false, "label": body["label"]}}),
+            "/rpc/generate" => json!({"ok": true, "result": {"queued": body["queue"] == true, "label": body["label"]}}),
             _ => json!({"ok": true, "result": status}),
         };
         return answer(&mut s, 200, &v);
