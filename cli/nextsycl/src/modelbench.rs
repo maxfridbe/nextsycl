@@ -11,7 +11,7 @@
 //! is held the front door loads nothing beside it. What is already loaded stays, so put the box in maintenance and let
 //! the cards empty first. It never edits a card unless `--write` is given, which puts the proposed block into the card's file.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

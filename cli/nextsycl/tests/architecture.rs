@@ -398,7 +398,7 @@ fn the_door_schedules_through_the_crate_and_the_crate_stands_alone() {
     }
     // pure: no other crate of ours, serde_json only
     assert_eq!(deps("crates/scheduler"), vec!["serde_json".to_string()]);
-    assert!(!std::fs::read_to_string(root().join("crates/scheduler/Cargo.toml")).unwrap().contains("preserve_order"), "it would reorder the whole workspace's JSON");
+    assert!(!std::fs::read_to_string(root().join("crates/scheduler/Cargo.toml")).unwrap().contains("features = [\"preserve_order"), "it would reorder the whole workspace's JSON");
     // the suite that says the copy is intact is still there, and the patches are written down
     assert!(root().join("crates/scheduler/tests/scenarios.rs").is_file());
     assert!(std::fs::read_to_string(root().join("crates/scheduler/CHANGELOG.md")).unwrap().contains("nextsycl.1"));

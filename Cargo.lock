@@ -45,6 +45,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "backplane-scheduler"
+version = "0.1.0+nextsycl.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -546,6 +553,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 name = "nextsycl"
 version = "0.0.0"
 dependencies = [
+ "backplane-scheduler",
  "nextsycl-audio",
  "nextsycl-audio-acestep",
  "nextsycl-audio-breezetts2",
@@ -598,6 +606,7 @@ dependencies = [
  "nextsycl-video-example",
  "nextsycl-video-h3",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -1103,6 +1112,7 @@ dependencies = [
 name = "nextsycl-models"
 version = "0.0.0"
 dependencies = [
+ "backplane-scheduler",
  "nextsycl-gguf",
  "serde_json",
  "serde_yaml",
@@ -1133,6 +1143,7 @@ dependencies = [
 name = "nextsycl-serve"
 version = "0.0.0"
 dependencies = [
+ "backplane-scheduler",
  "nextsycl-audio",
  "nextsycl-core",
  "nextsycl-diffusion",
