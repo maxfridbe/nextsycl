@@ -116,6 +116,12 @@ fn should_move(me: Seat, seats: &[Seat], blocked: &[usize], engine_state: &str) 
     engine_state.starts_with("waiting for the GPU: ") && blocked.contains(&me.gpu) && seats.iter().any(|o| o.gpu != me.gpu && o.free && !blocked.contains(&o.gpu))
 }
 
+/// Whether a cancelled job's worker should be told to leave now: it is still waiting for memory (or only starting), so
+/// it has loaded nothing and would otherwise sit there until room came, loading the weights to find the cancel
+fn cancel_ends_worker(cancelled: bool, engine_state: &str) -> bool {
+    cancelled && (engine_state.starts_with("waiting for the GPU: ") || engine_state == "starting the engine process")
+}
+
 /// What run_job answers for a job sent back to the queue
 const MOVED: &str = "moved to another card";
 
@@ -541,6 +547,11 @@ impl Daemon {
                     }
                 },
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let state = self.s.lock().unwrap().slots[k].engine.clone();
+                    if cancel_ends_worker(cancel.load(Ordering::Relaxed), &state) {
+                        self.end_worker(k, proc, false);
+                        return Err("cancelled while it waited for room: nothing was loaded".to_string());
+                    }
                     // still waiting for this card's memory, and a pin or hold has it: the worker has loaded nothing and
                     // leaves when asked (never a kill); another slot takes the job
                     let moving = !cancel_sent && spec.get("gpu").is_none() && {
@@ -1071,6 +1082,17 @@ mod chat_hook_tests {
         assert!(!should_move(s[0], &[seat(0, true, false), seat(1, true, false)], &[0], waiting), "the other is busy");
         assert!(!should_move(s[0], &s, &[0], "loading"), "memory on the card: it stays");
         assert!(!should_move(s[0], &s, &[0], "waiting for the GPU lock (held: x)"), "not this wait");
+    }
+
+    #[test]
+    fn a_cancel_ends_a_worker_that_has_loaded_nothing_and_no_other() {
+        let waiting = "waiting for the GPU: 27.4 GiB free, 27.5 GiB needed";
+        assert!(cancel_ends_worker(true, waiting));
+        assert!(cancel_ends_worker(true, "starting the engine process"));
+        assert!(!cancel_ends_worker(false, waiting), "not cancelled: it waits");
+        for s in ["loading", "loaded", "waiting for the GPU lock (held: x)"] {
+            assert!(!cancel_ends_worker(true, s), "{s}: the worker takes the cancel itself");
+        }
     }
 
     #[test]

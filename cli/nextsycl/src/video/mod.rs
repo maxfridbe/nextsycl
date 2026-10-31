@@ -227,6 +227,42 @@ fn room_wait_over(waited_s: u64) -> bool {
     waited_s > ROOM_WAIT_S
 }
 
+/// How a worker's wait for its card's memory ended
+#[derive(Debug, PartialEq)]
+enum RoomWait {
+    /// there is room: load
+    Room,
+    /// asked to exit, or its job was cancelled: nothing was loaded and nothing will be
+    Stopped,
+    /// ROOM_WAIT_S passed, this much free
+    Over(u64),
+}
+
+/// Wait for `need` bytes free on the card, looking at `stop` every `look` (a cancel ends this within a look), and once
+/// more when the room comes: a job cancelled by then loads nothing
+fn wait_for_room(free: &dyn Fn() -> Option<u64>, need: u64, stop: &dyn Fn() -> bool, over: &dyn Fn() -> bool, say: &mut dyn FnMut(u64), look: std::time::Duration) -> RoomWait {
+    loop {
+        if stop() {
+            return RoomWait::Stopped;
+        }
+        match free() {
+            Some(f) if f < need => {
+                if over() {
+                    return RoomWait::Over(f);
+                }
+                say(f);
+                for _ in 0..25 {
+                    if stop() {
+                        return RoomWait::Stopped;
+                    }
+                    std::thread::sleep(look);
+                }
+            }
+            _ => return if stop() { RoomWait::Stopped } else { RoomWait::Room },
+        }
+    }
+}
+
 fn worker(cfg: &Config, args: &[String]) -> Result<(), String> {
     use std::io::BufRead;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -277,20 +313,16 @@ fn worker(cfg: &Config, args: &[String]) -> Result<(), String> {
         let total = g.memory().map_or(u64::MAX, |(t, _)| t);
         let need = (den + (8u64 << 30)).min(total);
         let t0 = std::time::Instant::now();
-        loop {
-            if abort.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            match g.memory().ok().and_then(|(_, f)| f) {
-                Some(free) if free < need => {
-                    if room_wait_over(t0.elapsed().as_secs()) {
-                        return Err(format!("no_room: GPU {gpu} has {:.1} GiB free, {:.1} GiB needed, after {ROOM_WAIT_S} s: held by work that is not idle or a model kept loaded", gib(free), gib(need)));
-                    }
-                    emit(json!({"event": "engine", "state": format!("waiting for the GPU: {:.1} GiB free, {:.1} GiB needed", gib(free), gib(need))}));
-                    std::thread::sleep(Duration::from_secs(5));
-                }
-                _ => break,
-            }
+        // (before the load a worker has one job, the one it was started for: any cancel is that job's)
+        let waited = wait_for_room(&|| g.memory().ok().and_then(|(_, f)| f), need,
+            &|| abort.load(Ordering::SeqCst) || cancel_for.load(Ordering::SeqCst) != 0,
+            &|| room_wait_over(t0.elapsed().as_secs()),
+            &mut |free| emit(json!({"event": "engine", "state": format!("waiting for the GPU: {:.1} GiB free, {:.1} GiB needed", gib(free), gib(need))})),
+            Duration::from_millis(200));
+        match waited {
+            RoomWait::Room => {}
+            RoomWait::Stopped => return Ok(()),
+            RoomWait::Over(free) => return Err(format!("no_room: GPU {gpu} has {:.1} GiB free, {:.1} GiB needed, after {ROOM_WAIT_S} s: held by work that is not idle or a model kept loaded", gib(free), gib(need))),
         }
     }
     emit(json!({"event": "engine", "state": "loading"}));
@@ -403,6 +435,20 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
 mod room_tests {
     #[test]
     fn a_worker_stops_waiting_after_the_limit() {
+        // a cancel ends the wait at once, even with no room ever coming; room and a cancel together load nothing
+        use std::cell::Cell;
+        use std::time::Duration;
+        let look = Duration::from_millis(1);
+        let looks = Cell::new(0);
+        let r = super::wait_for_room(&|| Some(1), 10, &|| { looks.set(looks.get() + 1); looks.get() > 3 }, &|| false, &mut |_| {}, look);
+        assert_eq!(r, super::RoomWait::Stopped);
+        assert!(looks.get() < 10, "within a look or so");
+        let looks = Cell::new(0);
+        let r = super::wait_for_room(&|| Some(100), 10, &|| { looks.set(looks.get() + 1); looks.get() > 1 }, &|| false, &mut |_| {}, look);
+        assert_eq!(r, super::RoomWait::Stopped, "the cancel came as the room did: no load");
+        assert_eq!(super::wait_for_room(&|| Some(100), 10, &|| false, &|| false, &mut |_| {}, look), super::RoomWait::Room);
+        assert_eq!(super::wait_for_room(&|| None, 10, &|| false, &|| false, &mut |_| {}, look), super::RoomWait::Room, "a card that does not say: as before");
+        assert_eq!(super::wait_for_room(&|| Some(1), 10, &|| false, &|| true, &mut |_| {}, look), super::RoomWait::Over(1));
         assert!(!super::room_wait_over(0));
         assert!(!super::room_wait_over(super::ROOM_WAIT_S));
         assert!(super::room_wait_over(super::ROOM_WAIT_S + 1));
