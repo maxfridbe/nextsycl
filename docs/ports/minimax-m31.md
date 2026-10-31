@@ -556,6 +556,63 @@ The spread is no larger than a repeat at one offset (B65 gu at offset 0: 101-110
 
 **Pinned on 2 MB pages**: `madvise(MADV_HUGEPAGE)` on all 41 slabs was accepted, but the process's `AnonHugePages` stayed 0 (sampled every 2 s), so **2 MB pages were not obtained** and this does not test them; these pages seem not to be plain anonymous memory. It would not matter: a pinned expert into VRAM runs at 28 GB/s on both copy lanes with or without the call (the x8 link), and `to_half` reading pinned memory at 23 GB/s. With it, 3 runs against 3: pp 244.8, 258.2, 253.9 against 257.0, 233.8, 254.5; tg 13.53-13.94 against 13.58-13.94.
 
+### Round 7: other alignments (none kept)
+
+Pinned 40 GiB, 2K prompt unless said, warmed, interleaved, 3 runs each, 300 tokens. Baseline pp 254.6-257.4, tg 13.93-13.95.
+
+**Rows and blocks in the weights** (real gate and up rows repacked losslessly, a copy of the gu kernel with the strides as arguments, us for one expert, three rounds; only gu was bounded, the down kernel not):
+
+| layout | size | B70 IQ1_M | B70 IQ2_XXS | B65 IQ1_M | B65 IQ2_XXS |
+|---|---|---|---|---|---|
+| as stored | | 37-38 | 44 | 81-83 | 97-99 |
+| rows to 64 bytes | +0-1% | 37-38 | 43-45 | 79-82 | 97-99 |
+| rows to 256 | +13-14% | 38 | 44 | 81 | 97-100 |
+| rows to 4096 | +159-205% | 38 | 44 | 82 | 96 |
+| blocks to 8 bytes | +0 / +9% | 37 | 46 | 81-83 | 104-105 |
+| blocks to 64 bytes | +14 / +94% | 38 | 52-59 | 82-84 | 115-118 |
+| the same bytes kept in cache: one block | | 44 | 52-53 | 96-99 | 117-119 |
+| the same bytes kept in cache: 4 rows | | 47-48 | 50-51 | 94 | 115-116 |
+
+(A sixth, cold sample of 61-74 us at the start of the B70 IQ2_XXS rows is left out.) Reads that never leave the cache are no faster, slower if anything: this kernel is not bound by memory or by how rows meet lines, so no padding can bring it towards 520-570 GB/s. And padding would cost residency: +14% on the IQ1_M matrices alone is several GiB of VRAM at 2.2 ms a token per GiB, for nothing back. Not tried: a layout that changes the decode itself (a record a group, one load a lane): at least 2.3x the bytes for IQ1_M, computed.
+
+**Batches**: oneMKL's half GEMM goes in steps by rows, best of three rounds, us:
+
+| rows | 32 | 33 | 64 | 65 | 128 | 129 | 192 | 256 | 320 | 512 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| B70, gate and up | 70 | 67 | 72 | 83 | 99 | 139 | 139 | 142 | 128 | 159 |
+| B65, gate and up | 78 | 88 | 93 | 140 | 178 | 137 | 146 | 178 | 223 | 271 |
+| B70, down | 66 | 62 | 74 | 76 | 91 | 82 | 90 | 100 | 112 | 170 |
+| B65, down | 78 | 77 | 83 | 136 | 164 | 141 | 149 | 185 | 217 | 266 |
+
+So a larger batch can be quicker. Padding where the bench says (B65 gate and up 65-128 -> 129, B70 129-319 -> 320, down 97-128 -> 129; the extra rows' results unread) in the engine: pp 2K 239.5-257.2 against 254.6-257.4, pp 8K 420.2-420.6 against 414.4-416.8, about +1%. **The text changes** (different GEMM paths, near ties); 8K tg 13.47 against 11.88 is on different text, so it is no gain. Dropped. Chunk sizes as multiples were not retried: rows an expert takes depend on routing, not on the chunk, and earlier rounds swept chunks.
+
+Fused decode rows (`NS_MM3S_RPS`, `NS_MM3S_KU`; 4 experts a launch, GB/s): RPS 2, KU 1 stays best for gu (B70 IQ1_M 276; RPS 1 219, RPS 4 226, RPS 4 KU 2 5). Down alone likes RPS 4 (B70 IQ3_XXS 316 -> 347, B65 172 -> 188), and with gu left at 2: **tg 14.00-14.02 against 13.93-13.95, +0.5%, text the same, pp the same** (253.8-255.4). Real but too small to keep; a test-only variable, not on main.
+
+**Drive** (Crucial P310 on ext4: `max_sectors_kb` 128 hardware limit, optimal I/O 4 KB, no scheduler; 16 MB O_DIRECT at random offsets of a shard, median ms over 40, three rounds, Python threads):
+
+| reads | ms |
+|---|---|
+| 16 MB, one read | 3.05-3.29 |
+| 8 MB x 2 / 4 MB x 4 | 3.04-3.49 / 3.08-3.50 |
+| 2 MB x 8 (today) | 3.26-3.48 |
+| 1 MB x 8 / x 16 / x 32 | 3.14-3.38 / 3.37-3.46 / 3.28-3.48 |
+| 512 KB x 16 / x 32 | 3.24-3.37 / 3.08-3.56 |
+| 128 KB x 32 / x 64 / x 128 | 3.25-3.49 / 3.24-3.57 / 4.53-5.15 |
+| 2 MB x 8 starting aligned to 64 KB / 128 KB / 1 MB / 2 MB / 16 MB | 3.11-3.46 / 3.08-3.51 / 3.14-3.44 / 3.18-3.40 / 3.13-3.34 |
+| 2 MB x 8 starting 4 KB past a 128 KB edge | 3.09-3.36 |
+
+The drive reads about 5 GB/s however it is asked; no start alignment shows. One read of a matrix in the engine (`NS_MM31_SPLITREAD=1`): pp 251.2-256.2, tg 13.86-13.90, slightly worse. Stripe and NAND geometry are not exposed, so boundaries could only be tested by these offsets. The reader's bounce copy (O_DIRECT into its own buffer, because GGUF offsets are not page aligned) is 0.34-0.38 ms of 16 MB in this bench: about 1.3 ms of a 67 ms token at 3.6 file reads, a bound of 2%, needing a slot layout matched to each matrix's file offset. Not attempted.
+
+**CPU**: the 9950X's CCDs are CPUs 0-7 + 16-23 and 8-15 + 24-31, one I/O die; sysfs gives no NUMA node for either card. `podman --cpuset-cpus` fails rootless (no cpuset controller) and `taskset` on the runner does not reach the engine (read back: 0-31), so affinity was set from the host on the running process and read back. Same order, all threads:
+
+| set | pp 2K | tg | launch on the queue, B70, us | read-back, B70, us |
+|---|---|---|---|---|
+| all | 229.6, 255.1, 257.0 | 13.85, 13.91, 13.36 | 9.6 | 9.1 |
+| CCD 0 | 253.2, 254.9, 257.6 | 13.92, 13.45, 13.35 | 10.6 | 8.2 |
+| CCD 1 | 256.4, 257.1, 256.8 | 13.66, 13.18, 13.34 | 9.9 | 10.6 |
+
+No gain; the later rounds drop together on every set, which is the box, not the set (not traced). One launch-bench run a set. Threads pinned one by one to a matched card were not tried: nothing here suggests a side to match.
+
 ### Through the front door
 
 A private `serve` from the build copy (own port, registry and config) with production idle, 8K context:
