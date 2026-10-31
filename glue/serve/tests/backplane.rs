@@ -690,6 +690,9 @@ fn a_free_card_means_no_wait_and_a_full_box_the_running_clips() {
     let busy = b.ok("system.busy", json!({}))["video"].clone();
     assert_eq!((busy["slots"].clone(), busy["accepts"].clone()), (json!(2), json!(false)), "{busy}");
     assert!(b.ok("system.busy", json!({}))["reasons"].as_array().unwrap().len() >= 2);
+    // the status after a clip took the last card reads full, and that clip started: it waited for nothing
+    let r = b.ok("video.generate", json!({"prompt": "x"}));
+    assert_eq!((r["queued"].clone(), r["eta"]["wait_s"].as_f64()), (json!(false), Some(0.0)), "{r}");
 
     // host memory left no card for a further clip: one possible
     std::fs::write(b.dir.join("studio.json"), { let mut s = status(0); s["slots_why"] = json!("host memory"); s }.to_string()).unwrap();

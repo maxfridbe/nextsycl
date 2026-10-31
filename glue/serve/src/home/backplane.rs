@@ -472,7 +472,8 @@ impl Home {
         // any limit: the limit is on starting a clip, and this one was taken
         let there = r["label"].as_str().or(r["job"]["label"].as_str()).filter(|l| !l.is_empty()).map(str::to_string);
         let label = if again { there.unwrap_or_default() } else { Some(s(sent, "label")).filter(|l| !l.is_empty()).or(there).unwrap_or_default() };
-        if again && r["queued"] != true {
+        // (asked after the clip took its card: one that started waits for nothing, whatever the other card has left)
+        if r["queued"] != true {
             r["eta"]["wait_s"] = json!(0.0);
             r["eta"]["total_s"] = r["eta"]["run_s"].clone();
         }
