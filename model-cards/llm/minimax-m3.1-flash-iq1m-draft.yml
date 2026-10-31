@@ -1,0 +1,51 @@
+# MiniMax-M3.1-Flash UD-IQ1_M with its DSpark drafter (both GPUs): not registered anywhere; tested through a real server, docs/ports/minimax-m31.md round 7
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-m3.1-flash-iq1m-draft
+kind: llm
+arch: minimax-m3
+title: MiniMax-M3.1-Flash UD-IQ1_M with the DSpark drafter (both GPUs)
+about: 'minimax-m3.1-flash-iq1m with its 2 GB DSpark drafter on the last card: up to 6 drafts a step at confidence 0.8, the same text. Measured through a server against the plain card: tg up about 4-7% on code and long prompts, about level on prose, down to 13% on free prose it drafts little of; pp 6-11% lower; drafts only with one request decoding. Text only; license minimax-community, read it before serving'
+gpus: all
+vram_gib: 30.5
+ram_gib: 48
+ram_cache_gib: 12.7
+ctx: '32768'
+tools: true
+tasks: true
+env:
+  NS_MM31_DRAFT: '{draft}'
+  NS_MM31_DRAFTS: '6'
+  NS_MM31_DRAFT_PMIN: '0.8'
+  NS_MM31_PIN_GIB: '40'     # through a server the default is 43 GiB; with the drafter that took MemAvailable to 6.4 GiB, at 40 its low is 11.1 GiB
+files:
+  model:
+    key: minimax-m3.1-flash-ud-iq1m-1
+    url: https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00001-of-00004.gguf
+    size: 8243332
+    sha256: 7b6e87290b1f6dc2bfdfa81d7aedde98123b05e85be09b07fa005f291b44ce2c
+    path: minimax-m3.1-flash-iq1m/MiniMax-M3.1-Flash-UD-IQ1_M-00001-of-00004.gguf
+  shard-2:
+    key: minimax-m3.1-flash-ud-iq1m-2
+    url: https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00002-of-00004.gguf
+    size: 49558582272
+    sha256: 054e8058c4ff0654e992bdfe4e730f01ec403f101de39b6b4d41ed05a0d90496
+    path: minimax-m3.1-flash-iq1m/MiniMax-M3.1-Flash-UD-IQ1_M-00002-of-00004.gguf
+  shard-3:
+    key: minimax-m3.1-flash-ud-iq1m-3
+    url: https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00003-of-00004.gguf
+    size: 49187867040
+    sha256: 731ccc249cd705a2058f24cb865c73dd6f8d38ad0a637d586b86db1e93c766c2
+    path: minimax-m3.1-flash-iq1m/MiniMax-M3.1-Flash-UD-IQ1_M-00003-of-00004.gguf
+  shard-4:
+    key: minimax-m3.1-flash-ud-iq1m-4
+    url: https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00004-of-00004.gguf
+    size: 30606383904
+    sha256: f32abc3736499cb4ba865cb82482f707208212b30027e096fe56a44f7f35dfa8
+    path: minimax-m3.1-flash-iq1m/MiniMax-M3.1-Flash-UD-IQ1_M-00004-of-00004.gguf
+  draft:
+    key: minimax-m3.1-flash-dspark
+    url: https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/dspark-MiniMax-M3.1-Flash-Q8_0.gguf
+    size: 2089384768
+    sha256: 60bac0eaf82aa959ce8c13d03bf875d915e60182a643010a18ff369328d65164
+    path: minimax-m3.1-flash-dspark/dspark-MiniMax-M3.1-Flash-Q8_0.gguf
+guide: guides/chat.md

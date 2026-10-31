@@ -445,7 +445,7 @@ Per GiB: pinned 32 -> 40 gives 0.4 ms a GiB; the warm tier 0.25 ms (14.5 GiB: 3.
 | code, 190 tokens | 58.2 / 12.48 | 55.0 / 13.76 | 163 of 173 |
 | 31K (1 run) | 330.1 / 11.22 | 325.1 / 13.34 | 175 of 178 |
 
-One draft a step loses: 2K tg 13.3, code tg 12.0 (before the reserve below). The text is the same in every run of a prompt. Spreads are about 0.03 tg. So the draft at 6 / 0.8 gains tg 2% at 2K and 10-19% beyond, costs pp 1.5-5% and about 2.0 GiB of B70 experts plus a 2 GB file. It is not on by default: `NS_MM31_DRAFT` stays unset, and the card does not name the file. Not run through a server or with two sessions.
+One draft a step loses: 2K tg 13.3, code tg 12.0 (before the reserve below). The text is the same in every run of a prompt. Spreads are about 0.03 tg. So the draft at 6 / 0.8 gains tg 2% at 2K and 10-19% beyond, costs pp 1.5-5% and about 2.0 GiB of B70 experts plus a 2 GB file. It is not on by default: `NS_MM31_DRAFT` stays unset, and the card does not name the file. Through a server and with two sessions: round 7, below.
 
 The first set (without the reserve) peaked at 31,716 MiB on the B70, about 1,050 free, under the 1.5 GiB floor: 2K tg 14.52, 8K tg 13.50, code tg 13.9. The sizing now keeps 700 MiB more on the last card with a draft: at most 30,989 MiB, 1,779 free. Those are the numbers in the table.
 
@@ -468,6 +468,59 @@ Guesses that only copy pinned experts (`NS_MM31_AHEAD=3`, `NS_MM31_AHEAD_READS=0
 | IQ2_XXS / IQ4_XS | 19.8 | 5.93 | 1.57 | 0.81 | 0.56 | 0.50 |
 
 On the same bytes and synthetic activations the output matches the silo's kernels to cosine 1.00000000, rel err 6-8e-7. In the engine (pinned experts on the host while the card runs the VRAM group, promotion copies still issued, the output row uploaded by a kernel), 0.78 ms each at 16 threads and 0.74 at 12: fixed text 66.5 -> 68.1 and 67.7 ms after the first 50 tokens, tg 13.95 -> 13.41 and 13.36 at 2K. The host's time from doorbell to queued VRAM experts went from 16 to 50 us a layer, about 2 ms a token. Not exact either: perplexity 1.6961 -> 1.7062 and the greedy text changes (same across runs and thread counts). That is more than the rel err of one product explains, and the cause was not found. The 8K tg with it (12.7-12.9 against 11.90) is on different text, so it is no gain.
+
+### Round 7: the draft through a server (2026-10-31)
+
+The build copy's own engine server on a spare port, 32K context, 2 sessions, as production; request by request in `~/src/m3/a7.py` (OpenAI streaming); VRAM from the process's DRM fdinfo at 50 ms (the gpustat file refreshes more slowly). Draft 6 tokens at confidence 0.8 against none, medians of 3 servers:
+
+| prompt | tg none | tg draft | read s none | read s draft | accepted |
+|---|---|---|---|---|---|
+| code, 300 | 10.74 | 11.42 | 3.5 | 3.7 | 163 of 173 |
+| prose, 300 | 10.53 | 10.80 | 4.0 | 4.3 | 160 of 169 |
+| 2K, 300 | 11.29 | 12.07 | 9.8 | 10.2 | 150 of 158 |
+| 8K, 200 | 13.01 | 14.14 | 22.8 | 24.1 | 104 of 106 |
+| 31K, 300 (1 server) | 9.51 | 10.52 | 101 | 104 | 179 of 194 |
+| free prose, 150, repeated | 16.4 | 14.2 | 3.5-4.2 | 3.9-4.0 | 21 of 21 |
+
+Slower here than `generate` because the server's two 32K sessions take VRAM from the experts. With pinned at 40 (below) one server: code 11.20, prose 10.46, 2K 11.75, 8K 13.95, 31K 10.60, reads 3.9 / 4.5 / 10.5 / 25.5 / 108 s: tg about +4 / -1 / +4 / +7 / +11%, pp -6 to -11%.
+
+Correct: the text equals no draft for streaming, two at once, a request joining mid-decode, a third queued, `max_tokens` 1-200 (counts exact), a natural stop, a client gone after 1 / 40 / 41 / 97 chunks (the same prompt after gives the uncut text), one of two cut, a client gone during a read, logprobs, `logprob_chain`, the end of a 2,400-token context. No GPU reset. VRAM peak at 50 ms: B65 1,538 MiB free, B70 1,754 (none: 1,549 / 1,554).
+
+What is not free or not right:
+
+- **Host memory**: through a server pinned is 43 GiB, not 40 (`mirror_bytes` from the server skips `PIN_DEFAULT_GIB`; the plain production card too). With the drafter MemAvailable fell to 6,373 and 7,778 MiB, under the 8 GiB floor (none: 8,134-12,394). 2 GiB more cache margin did not help (7,020: the warm cache is reclaimable). `NS_MM31_PIN_GIB=40` did: low 11,415 MiB, on the single chats, interleaved turns and long prompts only; the two-at-once and cancel cases were not rerun at 40. So 59.4 - 11.4: `ram_gib` 48.
+- **Stalls**: one solo request with the drafter at 43 GiB paused 23.5 s (tg 4.45, the sampler itself stalled 3.1 s); baseline had 16-20 s on small requests. Memory pressure is the suspect, not traced. At 40 GiB no solo chat paused, in one shortened run, but a small request right after the 31K prompt still took 18 s, as with no draft, so the small-request stall is not the drafter's.
+- **Two sessions take no drafts** (`step_together`) but still pay for the drafter's caches on each pass: one session tg 5.58 -> 4.25, the other level. The drafter's pass also runs when its confidence stops it, so free prose loses 13%.
+- **Live reuse at a length stop**: when a step's accepted drafts run past `max_tokens`, the session holds tokens past the answer, the next prompt is no extension of it, and the turn reads from a checkpoint: reused 190 against 309, read 3.0 against 1.6 s, and that turn's text changes (a different split of prompt and decode). The fix is in `glue/serve` (trim to the common prefix with a rollback), not done here.
+- **Checkpoints do not hold the drafter's caches**: after a restore they hold another conversation's. Measured: no cost, 125 of 137 accepted with the caches overwritten by two 8K prompts and with its own, the same text. Why it does not matter was not traced.
+
+Result: correct, within the limits at 40 GiB pinned, a small gain. The card `minimax-m3.1-flash-iq1m-draft` says what it needs (`NS_MM31_DRAFT: '{draft}'`, `NS_MM31_DRAFTS: '6'`, `NS_MM31_DRAFT_PMIN: '0.8'`, `NS_MM31_PIN_GIB: '40'`, the file, `ram_gib: 48`); it is not registered, and the plain card is unchanged.
+
+### Round 7: prompt speed, measured (none kept)
+
+Baseline (warmed, 3 runs) pp 256-261 at 2K, 420-424 at 8K. **No gain was kept.** Text below is the greedy 300 tokens.
+
+**Threads**: the lead was gaps in a static schedule (Intel reports up to 15% of MoE GEMM time). The prompt path's GEMM is oneMKL's, closed, so it cannot be read or changed; the silo's kernels are decode's and `to_half`. Per-thread timing could not be taken: these cards have no device clock in kernels (`ext_oneapi_clock_device` is false; `to_half` with stamps refused to run), and OA counters need root. A bound instead, kernel bench on real weights, 38 MB half matrix, microseconds, best of 8:
+
+| card | bare read of it, all threads | GEMM 8 / 32 / 64 rows | GEMM 128 / 256 / 512 rows | 64 rows in 2 launches |
+|---|---|---|---|---|
+| B70 | 59-63 | 65-91 / 56-76 / 70-105 | 101-179 / 141 / 158 | 76 |
+| B65 | 65-66 | 87 / 68-78 / 91-95 | 185-190 / 179 / 270 | 128-130 |
+
+So at the typical 64 rows a GEMM is 16-20% above the card's read time on a B70 and 28-40% on a B65, compute included, and the GEMM is 27% of a pass: **perfect scheduling could give 4-7% of pp at the very most**. Prepacking does not apply to weights dequantized a pass. Not pursued. `vllm-xpu-kernels` (Apache 2.0) was read and nothing copied: its persistent work-groups are Xe3 kernels pulling (expert, slice, tile) from one launch.
+
+**Where a 2K pass goes** (`NS_PROFILE=1`, 10.1 s with syncs): expert products 70%, attention 12% + projections 4% + indexer 3%, router 4%, read wait 3% (12% in round 4's profile; this run is warmed and has the warm tier). Of the products: 4.05 s `to_half`, 2.25 s GEMM. 21.6K products at the bench's 60-96 us would be about 1.6-2 s of `to_half`, so about half of it is the compute queue waiting for copies of 4,077 off-card experts (16 MB over PCIe, 0.65 ms each): inferred, not measured apart.
+
+**Idle by card** (each engine's busy at 50 ms from fdinfo): 2K: only the B70 58%, only the B65 40%, both 0%, neither 2%. 8K: 38 / 28 / both 33 / 1. Half the box idles at 2K: the real load problem, not threads.
+
+| tried, warmed and interleaved | pp 2K | text | verdict |
+|---|---|---|---|
+| the idle card takes the file's experts (reads into its ring, its GEMM, rows back by host), one-chunk passes, 3 runs | 217 -> 217-224 | changes, and differs between runs | noise; dropped |
+| also 50% / 100% of the pinned experts (host copy into its ring) | 217 -> 172 / 136 | changes, 50% differs between runs | slower; dropped |
+| both copy lanes (`NS_MM31_LANE=2`), 3 runs | 217 -> 216-218 | same | nothing |
+| small tables by kernel from a pinned ring, not memcpy, 3 runs | 256-258 -> 256-261; 8K 417-418 -> 420-424 | same | about 1%; dropped |
+
+The baseline of the first three rows reads 217 because their build, with `expert_compute` split into two functions (more arena marks and one more upload an expert), lost 15% with the helper off (254 -> 217, six runs, text the same). Upload count is not why: the last row's one upload and three uploads read the same. **Unexplained, and the best lead left**: something in the arena's order or the rewinds moves a pass by 15%, in both directions perhaps. Not traced: the window ended.
 
 ### Through the front door
 

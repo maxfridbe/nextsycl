@@ -12,7 +12,8 @@ ram_cache_gib: 12.7
 ctx: '32768'
 tools: true
 tasks: true
-env: {}
+env:
+  NS_MM31_PIN_GIB: '40'     # through a server the default is 43 GiB, which took MemAvailable to 8.1 GiB
 files:
   model:
     key: minimax-m3.1-flash-ud-iq1m-1
