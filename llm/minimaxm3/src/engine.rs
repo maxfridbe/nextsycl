@@ -150,6 +150,12 @@ fn precopy() -> bool {
     *N.get_or_init(|| std::env::var("NS_MM31_PRECOPY").map_or(true, |v| v != "0"))
 }
 
+/// NS_MM31_AHEAD_READS=0: a guessed expert in the file waits for its layer; only those in pinned memory are copied ahead
+fn ahead_reads() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("NS_MM31_AHEAD_READS").map_or(true, |v| v != "0"))
+}
+
 /// What the guessing thread needs of a layer
 struct GuessLayer {
     router: Vec<f32>,
@@ -1244,7 +1250,8 @@ impl<'g> MiniMax<'g> {
             // the arena, the sessions' caches, and 1.5 GiB kept free (a spare of 1 GiB more: the driver's own use)
             // NS_MM31_SPARE_GIB: the room left besides the arena and the caches (default 1.9; never below the 1.5 GiB floor plus what the driver takes)
             let spare = (env_f64("NS_MM31_SPARE_GIB").unwrap_or(1.9).max(1.6) * GIB as f64) as usize;
-            let ds_kv = if c + 1 == ncard && ds.is_some() { 5 * kv_tokens * 2 * (g.n_kv_head * g.head_dim) as usize * 2 } else { 0 };
+            // the drafter's layers' caches and its passes' scratch (peaks 250-576 MiB past the sizing without this, at 2K-8K: under the 1.5 GiB floor)
+            let ds_kv = if c + 1 == ncard && ds.is_some() { 5 * kv_tokens * 2 * (g.n_kv_head * g.head_dim) as usize * 2 + (700 << 20) } else { 0 };
             let reserve = arena_bytes + kv.1.max(1) * kv_tokens * per_tok(&ranges[c]) + spare + ds_kv;
             let room = free.saturating_sub(reserve);
             let v = match env_f64("NS_MM31_VRAM_GIB").or(o.expert_bytes.map(|b| b as f64 / GIB as f64)) {
@@ -2999,7 +3006,7 @@ impl<'g> MiniMax<'g> {
                         self.counts.promoted.fetch_add(1, Relaxed);
                     }
                     None => {
-                        if pfs.map.contains_key(&(m, ex)) {
+                        if !ahead_reads() || pfs.map.contains_key(&(m, ex)) {
                             continue;
                         }
                         let Some(slot_i) = pfs.free.pop() else { break };
