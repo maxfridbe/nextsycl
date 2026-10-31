@@ -312,7 +312,6 @@ ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Vo
 | `NS_MM31_AHEAD` | 0 | Decode: how many experts of each layer ahead the minimaxm3 engine guesses (their routers on the CPU, in a thread, on this layer's residual stream) and starts reading or copying while this layer computes; 0 = none (measured the fastest: tg 9.93 against 9.71 at 3, 300 tokens), at most 12 (--opt-ahead) | llm:minimaxm3 |
 | `NS_MM31_AHEAD_LAYERS` | 2 | Decode: how many layers ahead the minimaxm3 engine guesses the routing of (at most 16; 0 = none, and the routers stay off the host) | llm:minimaxm3 |
 | `NS_MM31_PRECOPY` | 1 | Decode: 0 = a guessed expert in pinned memory waits for its layer instead of being copied into an empty VRAM place ahead | llm:minimaxm3 |
-| `NS_MM31_CPU_EXPERTS` | 0 | Decode: this many host threads multiply a token's experts in pinned memory while the card runs the rest, in AVX2 and FMA (workers spin 5 ms between products, then sleep); 0 = the experts are copied to the card and run there | llm:minimaxm3 |
 | `NS_MM31_AHEAD_READS` | 1 | Decode: 0 = guessed experts in the file wait for their layer; only those in pinned memory are copied ahead (with `NS_MM31_AHEAD` above 0) | llm:minimaxm3 |
 | `NS_MM31_FREE` | 2 | Decode: empty VRAM places the minimaxm3 engine keeps per layer (1 to 8): a pinned or read expert lands there in one copy, the least recently used are demoted beside the compute | llm:minimaxm3 |
 | `NS_MM31_FUSE1` | 1 | 0 = one-token passes run the separate launches, not the silo's fused attention steps | llm:minimaxm3 |
