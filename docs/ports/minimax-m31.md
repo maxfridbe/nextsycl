@@ -451,6 +451,24 @@ The first set (without the reserve) peaked at 31,716 MiB on the B70, about 1,050
 
 Guesses that only copy pinned experts (`NS_MM31_AHEAD=3`, `NS_MM31_AHEAD_READS=0`): pinned swaps a token 17.7 -> 9.4 and fixed text 67.8 -> 71.7 ms, tg 13.94 -> 13.15; with 4 empty places (`NS_MM31_FREE=4`) 75.0 ms, tg 12.55. The routers' memory takes VRAM hits back (206.7 -> 214.8 hits a token is only part of it), and the second read-back and host work cost more than the copies saved. Off.
 
+### Round 6: second drive, slices, CPU products (none kept)
+
+**Second drive, all experts** (`NS_MM31_STREAM_ALL=1`, 111.3 GiB on the 2TB, 7 minutes to write): tg 13.91 -> 13.44 at 2K, 11.72 -> 11.16 at 8K, 11.19 -> 10.72 at 31K; pp no better. **A 50% share** (2K, 8K, warmed baseline): pp 254 -> 257 and 415 -> 411, tg 13.94 -> 13.67 and 11.90 -> 11.55. Both copies deleted. A run straight after a run that read another file can lose up to half its pp (2K 118.8, 8K 270), probably the page cache; a throwaway run first removes it. So compare pp only on warmed runs.
+
+**Half slices of 8 MB in prompt passes**: pp 257 -> 227 at 2K, 416 -> 384 at 8K, 327 -> 354 at 31K, and the greedy text changes at every length. Removed.
+
+**What a pinned expert costs** (fixed text, 279 tokens, 3 runs, least squares by token): ms = 46.7 + 0.68 pinned + 2.6 file, about 11 ms a token for 16.4 pinned swaps. A pure GPU product is ~0.12 ms of that (4 experts: gu 276 us, down 203 us, B70).
+
+**Products on the host** (commit "expert products on the host's cores", reverted in the next commit; AVX2 and FMA on 8-float groups, not the AVX-512 VNNI of deepseek2, since these products are float). One expert alone, Ryzen 9 9950X, ms by threads:
+
+| types | MB | 1 | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|
+| IQ1_M / IQ3_XXS | 15.5 | 7.85 | 2.01 | 1.06 | 0.77-1.01 | 0.68-0.70 |
+| IQ2_XXS / IQ3_XXS | 17.0 | 5.32 | 1.38 | 0.72-0.80 | 0.49-0.53 | 0.46 (one median 1.16) |
+| IQ2_XXS / IQ4_XS | 19.8 | 5.93 | 1.57 | 0.81 | 0.56 | 0.50 |
+
+On the same bytes and synthetic activations the output matches the silo's kernels to cosine 1.00000000, rel err 6-8e-7. In the engine (pinned experts on the host while the card runs the VRAM group, promotion copies still issued, the output row uploaded by a kernel), 0.78 ms each at 16 threads and 0.74 at 12: fixed text 66.5 -> 68.1 and 67.7 ms after the first 50 tokens, tg 13.95 -> 13.41 and 13.36 at 2K. The host's time from doorbell to queued VRAM experts went from 16 to 50 us a layer, about 2 ms a token. Not exact either: perplexity 1.6961 -> 1.7062 and the greedy text changes (same across runs and thread counts). That is more than the rel err of one product explains, and the cause was not found. The 8K tg with it (12.7-12.9 against 11.90) is on different text, so it is no gain.
+
 ### Through the front door
 
 A private `serve` from the build copy (own port, registry and config) with production idle, 8K context:
