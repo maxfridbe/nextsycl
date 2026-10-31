@@ -99,10 +99,25 @@ export interface Status {
   preview?: string | null;    // while it samples: a picture of the shot so far (PNG URL, new each step)
   failure?: Failure | null;   // failed or cancelled: the error as data
   gpu?: number | null;        // the card the clip runs on
+  running_clips?: ClipRow[];  // every clip being made; the fields above describe the first
+  ended_clips?: ClipRow[];    // the latest that ended, newest first
+  slots_total?: number;       // the cards the daemon serves
+  slots_free?: number;        // clips that can start now
+  slots_why?: string | null;  // why fewer than the free cards
+  accepts?: boolean;          // one more clip can start, the queue served first
+}
+
+export interface ClipRow {
+  label?: string; name?: string; project?: string; reentrant_id?: string | null;
+  engine?: Engine; seconds?: number; steps?: number; width?: number; height?: number;
+  stage?: string; pct?: number; eta?: number; elapsed?: number; gpu?: number | null;
+  energy_wh?: number | null; waiting_for?: string | null; preview?: string | null;
+  steps_done?: number; steps_total?: number; frames?: number;
+  idle?: boolean; done?: boolean; error?: string | null; failure?: Failure | null; file?: string | null;
 }
 
 export interface Failure {
-  code: "out_of_memory" | "engine_lost" | "invalid_input" | "engine_error" | "cancelled";
+  code: "out_of_memory" | "engine_lost" | "invalid_input" | "engine_error" | "cancelled" | "dependency_failed";
   retryable: boolean;         // true only for engine_lost
   message: string; hint: string;
 }
@@ -145,7 +160,7 @@ export interface Methods {
   "files.stat": [{ name: string }, { name: string; bytes: number; sha256: string; mtime: number }];
   "files.delete": [{ name: string }, { deleted: string[] }];
   "generate": [GenerateRequest, GenerateAnswer];
-  "cancel": [{ label?: string }, { stopped: boolean; removed: number; label?: string }];
+  "cancel": [{ label?: string; name?: string; reentrant_id?: string }, { stopped: boolean; removed: number; label?: string }];
   "queue.move": [{ label: string; position?: number; priority?: number }, { label: string; position: number; queue: string[] }];
   "queue.remove": [{ label: string }, { removed: number; label: string }];
   "queue.list": [Record<string, never>, { queue: GenerateRequest[] }];

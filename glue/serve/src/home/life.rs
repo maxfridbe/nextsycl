@@ -936,7 +936,7 @@ impl Home {
     }
 
     /// Host memory free for a load now, MiB (None: not known here)
-    fn host_free_now(&self, cards: &[Card]) -> Option<u64> {
+    pub(super) fn host_free_now(&self, cards: &[Card]) -> Option<u64> {
         let seen: std::collections::BTreeSet<&str> = cards.iter().flat_map(|c| c.procs.iter()).filter(|p| p.kind.is_some()).map(|p| p.model.as_str()).collect();
         let warm: u64 = seen.iter().map(|i| self.ram_of(i).1).sum();
         Some(host_free_mb(mem_available_mb()?, warm))

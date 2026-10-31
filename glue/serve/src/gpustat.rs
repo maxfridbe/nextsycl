@@ -246,9 +246,9 @@ impl Card {
     }
 }
 
-/// A card's line in the file's `cards`: which card, its memory
+/// A card's line in the file's `cards`: which card, its memory, its energy counter (a clip's energy is its own card's)
 fn slim(r: &Value) -> Value {
-    json!({"pci": r["pci"], "name": r["name"], "vram_used_mb": r["vram_used_mb"], "vram_total_mb": r["vram_total_mb"]})
+    json!({"pci": r["pci"], "name": r["name"], "vram_used_mb": r["vram_used_mb"], "vram_total_mb": r["vram_total_mb"], "energy_j": r["energy_j"]})
 }
 
 /// Samples until the process ends (or once)

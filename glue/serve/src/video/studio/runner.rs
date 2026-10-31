@@ -13,7 +13,7 @@ use super::http::Target;
 use serde_json::{json, Value};
 
 use super::queue::{label_number, label_prefix, project_of, s};
-use super::{now, write_atomic, Job, State, Studio};
+use super::{now, write_atomic, Job, State, Studio, MAX_ENDED};
 
 /// A finished clip of the series: (number, file stem, camera).
 type SeriesClip = (u64, String, String);
@@ -42,9 +42,18 @@ impl Studio {
         v
     }
 
-    /// The newest finished clip anywhere.
-    fn last_clip(&self, st: &State) -> Option<String> {
-        st.last_file.clone().or_else(|| self.listing().first().map(|r| s(r, "file").trim_end_matches(".mp4").to_string()))
+    /// The newest finished clip of the item's project (two chains run at once: not the other's); with none, anywhere
+    /// (such a clip starts alone: slots.rs)
+    fn last_clip(&self, st: &State, item: &Value) -> Option<String> {
+        let p = project_of(item);
+        let own = (!p.is_empty()).then(|| self.sidecars().into_iter().filter(|(_, side)| project_of(&side["job"]) == p).map(|(stem, _)| stem).max()).flatten();
+        own.or_else(|| st.last_file.clone()).or_else(|| self.listing().first().map(|r| s(r, "file").trim_end_matches(".mp4").to_string()))
+    }
+
+    /// Whether `prev` has a clip of the item's own to fall on
+    pub(super) fn has_own(&self, item: &Value) -> bool {
+        let p = project_of(item);
+        !self.series(&s(item, "label")).is_empty() || (!p.is_empty() && self.sidecars().iter().any(|(_, side)| project_of(&side["job"]) == p))
     }
 
     /// An anchor word (or a file) -> a clip stem / file name in out/.
@@ -56,8 +65,8 @@ impl Studio {
             if first { it.next() } else { it.next_back() }.map(|c| c.1.clone())
         };
         match v {
-            "prev" if which == "last_frame" => self.last_clip(st),
-            "prev" => series.last().map(|c| c.1.clone()).or_else(|| self.last_clip(st)),
+            "prev" if which == "last_frame" => self.last_clip(st, item),
+            "prev" => series.last().map(|c| c.1.clone()).or_else(|| self.last_clip(st, item)),
             "prev_cam" => same_cam(false).or_else(|| series.last().map(|c| c.1.clone())),
             "first" => series.first().map(|c| c.1.clone()),
             "first_cam" => same_cam(true),
@@ -208,28 +217,101 @@ impl Studio {
         rec["name"] = json!(name);
         rec["started"] = json!(now());
         rec["project"] = json!(project_of(&item));
-        let energy0 = self.gpu()["energy_j"].as_f64();
+        // every card's counter: which card this clip gets, the daemon says later
+        let tele = self.gpu();
+        let energy0 = tele["energy_j"].as_f64();
         rec["energy0"] = json!(energy0);
+        rec["energy0_cards"] = card_energies(&tele);
         let _ = write_atomic(&self.dir.join("job.json"), &serde_json::to_vec(&rec).unwrap_or_default());
         eprintln!("queue -> {name} (engine job {id}): {}", s(&item, "label"));
-        st.current_item = Some(item);
-        st.job = Some(Job { rec, engine_id: id, energy0, saved: false, stall: (0, now()), finished: false, last: Value::Null });
-        st.torn = false;
+        st.running.push(Job { rec, engine_id: id, energy0, saved: false, stall: (0, now()), finished: false, last: Value::Null, item: Some(item), settled: false, view: Value::Null, retrying: false });
+        self.save_running(st);
         Ok(())
     }
 
-    /// The current job as the front end sees it (the legacy `status()`): progress, stage, times, error; writes the
-    /// clip's record once it is done.
+    /// The clips being made, for a restart of the studio
+    fn save_running(&self, st: &State) {
+        *self.running_names.lock().unwrap() = st.running.iter().map(|j| s(&j.rec, "name")).collect();
+        let recs: Vec<&Value> = st.running.iter().map(|j| &j.rec).collect();
+        let _ = write_atomic(&self.dir.join("jobs.json"), &serde_json::to_vec(&recs).unwrap_or_default());
+    }
+
+    /// The daemon's state, once a pass, with the door's word on the cards and the host beside it
+    pub(super) fn engine_state(&self) -> Option<Value> {
+        let mut e = self.engine("GET", "/engine/status", None).ok()?;
+        let word = self.door_word.lock().unwrap().clone();
+        e["blocked"] = word["blocked"].clone();
+        e["host_free_mb"] = word["host_free_mb"].clone();
+        Some(e)
+    }
+
+    /// Clips possible now, with the host's memory by the door's figure, else this machine's
+    pub(super) fn room(&self, st: &State, es: Option<&Value>) -> super::slots::Room {
+        let loading = st.running.iter().filter(|j| !worker_loaded(&j.last)).count();
+        let host = es.and_then(|e| e["host_free_mb"].as_u64()).or_else(|| std::fs::read_to_string(&self.meminfo).ok().and_then(|m| super::slots::mem_available_mb(&m)));
+        super::slots::room(es, st.running.len(), loading, host)
+    }
+
+    /// Every running clip asked about; those that ended go to `ended`. What `status` answers from.
+    pub(super) fn refresh(&self, st: &mut State, es: Option<&Value>) {
+        let mut running = std::mem::take(&mut st.running);
+        for job in &mut running {
+            job.view = self.view(job, es, &mut st.last_file);
+        }
+        let before = running.len();
+        for job in running {
+            if job.finished {
+                st.ended.push(job);
+            } else {
+                st.running.push(job);
+            }
+        }
+        if st.running.len() != before {
+            self.save_running(st);
+        }
+        let over = st.ended.len().saturating_sub(MAX_ENDED);
+        // an unsettled failure is the scheduler's still: settled ones go first
+        for _ in 0..over {
+            let at = st.ended.iter().position(|j| j.settled).unwrap_or(0);
+            st.ended.remove(at);
+        }
+    }
+
+    /// The front end's status: the queue and holds; the top-level clip fields describe the first running clip, else the
+    /// last that ended (as when there was one clip), `running_clips` is every clip running, `ended_clips` the latest ended.
+    /// Writes a clip's record once it is done.
     pub(super) fn status(&self, st: &mut State) -> Value {
+        let es = self.engine_state();
+        self.refresh(st, es.as_ref());
         let mut out = serde_json::Map::new();
-        let Some(job) = st.job.as_mut() else {
-            out.insert("idle".into(), json!(true));
-            out.insert("job".into(), Value::Null); // nothing made since the studio started
-            out.extend(st.q.payload());
-            out.insert("all_projects".into(), json!(self.all_projects(&st.q)));
-            out.insert("llm".into(), self.llm.status());
-            return Value::Object(out);
-        };
+        let top = st.running.first().or(st.ended.last()).map(|j| j.view.clone());
+        match top.as_ref().and_then(Value::as_object) {
+            Some(v) => out.extend(v.clone()),
+            None => {
+                out.insert("idle".into(), json!(true));
+                out.insert("job".into(), Value::Null); // nothing made since the studio started
+            }
+        }
+        let room = self.room(st, es.as_ref());
+        let recs: Vec<Value> = st.running.iter().map(|j| j.rec.clone()).collect();
+        let plan = super::slots::plan(&st.q, &recs, room.free, &|i| self.has_own(i));
+        let accepts = room.free > plan.starts.len();
+        out.insert("running_clips".into(), json!(st.running.iter().map(|j| row(&j.view)).collect::<Vec<_>>()));
+        out.insert("ended_clips".into(), json!(st.ended.iter().rev().take(MAX_ENDED).map(|j| row(&j.view)).collect::<Vec<_>>()));
+        out.insert("slots_total".into(), json!(room.total));
+        out.insert("slots_free".into(), json!(room.free));
+        out.insert("slots_why".into(), json!(room.why));
+        out.insert("accepts".into(), json!(accepts));
+        out.extend(st.q.payload());
+        out.insert("all_projects".into(), json!(self.all_projects(&st.q)));
+        out.insert("llm".into(), self.llm.status());
+        Value::Object(out)
+    }
+
+    /// One clip as the front end sees it (the legacy `status()`'s clip part): progress, stage, times, error; writes its record
+    /// once it is done.
+    fn view(&self, job: &mut Job, es: Option<&Value>, last_file: &mut Option<String>) -> Value {
+        let mut out = serde_json::Map::new();
         if !job.finished {
             match self.engine("GET", &format!("/engine/jobs/{}", job.engine_id), None) {
                 Ok(j) => job.last = j,
@@ -293,7 +375,7 @@ impl Studio {
         if done {
             pct = 100.0;
             stage = "done".into();
-            st.last_file = Some(name.clone());
+            *last_file = Some(name.clone());
         }
         // times, in the legacy record's labels
         let mut times = serde_json::Map::new();
@@ -325,7 +407,12 @@ impl Studio {
         }
         // energy
         let mut energy = Value::Null;
-        if let (Some(e0), Some(e1)) = (job.energy0, self.gpu()["energy_j"].as_f64()) {
+        // this clip's card only: the other card's clip is not this one's energy. Not known while it has no card
+        let tele = self.gpu();
+        let pci = es.and_then(|e| e["gpus"].as_array()).and_then(|g| g.iter().find(|x| x["gpu"] == j["gpu"])).map(|g| s(g, "pci")).unwrap_or_default();
+        let card = j["gpu"].as_u64().map(|g| g as usize);
+        let e0 = card.and_then(|g| job.rec["energy0_cards"][g.to_string()].as_f64().or(if g == 0 && job.rec["energy0_cards"].is_null() { job.energy0 } else { None }));
+        if let (Some(e0), Some(e1)) = (e0, card.and_then(|g| card_energy(&tele, g, &pci))) {
             if e1 >= e0 {
                 energy = json!(((e1 - e0) / 3600.0 * 10.0).round() / 10.0);
                 if !job.finished {
@@ -392,7 +479,7 @@ impl Studio {
         out.insert("failure".into(), if failed { failure(state, j["error"].as_str().unwrap_or(""), &log) } else { Value::Null });
         // the card the engine runs it on (while it waits for one: the one it asked for, if any)
         out.insert("gpu".into(), if idle { Value::Null } else { j["gpu"].clone() });
-        out.insert("waiting_for".into(), if idle { Value::Null } else { self.engine_waiting() });
+        out.insert("waiting_for".into(), if idle { Value::Null } else { es.map_or(Value::Null, |e| super::waiting_on(e, &j["gpu"])) });
         out.insert("exited".into(), json!(idle));
         out.insert("rc".into(), if idle { json!(if done { 0 } else { 1 }) } else { Value::Null });
         out.insert("elapsed".into(), json!(elapsed as i64));
@@ -411,82 +498,135 @@ impl Studio {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
         out.insert("preview".into(), pv_at.map_or(Value::Null, |t| json!(format!("/out/{name}.preview.png?t={t}"))));
         out.insert("engine_log".into(), json!(log.iter().rev().take(12).rev().collect::<Vec<_>>()));
-        out.extend(st.q.payload());
-        out.insert("all_projects".into(), json!(self.all_projects(&st.q)));
-        out.insert("llm".into(), self.llm.status());
         Value::Object(out)
     }
 
     pub(super) fn running(&self, st: &State) -> bool {
-        st.job.as_ref().is_some_and(|j| !j.finished)
+        !st.running.is_empty()
     }
 
-    /// Stop the running clip (at the engine's next block boundary).
-    pub(super) fn cancel(&self, st: &mut State) -> Result<(), String> {
-        let id = st.job.as_ref().filter(|j| !j.finished).map(|j| j.engine_id).ok_or("no job is running")?;
-        st.current_item = None; // no retry
-        self.engine("POST", &format!("/engine/jobs/{id}/cancel"), None).map(|_| ())
+    /// Stop running clips (at the engine's next block boundary): those `pick` chooses
+    pub(super) fn cancel(&self, st: &mut State, pick: &dyn Fn(&Job) -> bool) -> Result<usize, String> {
+        let mut n = 0;
+        for j in st.running.iter_mut().filter(|j| pick(j)) {
+            j.item = None; // no retry
+            self.engine("POST", &format!("/engine/jobs/{}/cancel", j.engine_id), None)?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// What ended since the last look: one failure or more in a pass count once toward the hold (one engine crash can end two
+    /// clips), each goes round once more, ahead of the queue; a second failure of the same clip is not run again.
+    fn settle(&self, st: &mut State) {
+        let mut again = Vec::new();
+        let mut failed = false;
+        for j in st.ended.iter_mut().filter(|j| !j.settled) {
+            j.settled = true;
+            if j.view["done"] == true {
+                st.fails = 0;
+            } else if j.view["error"].is_string() {
+                if let Some(mut it) = j.item.take() {
+                    failed = true;
+                    if !j.rec["retry"].as_bool().unwrap_or(false) {
+                        it["retried"] = json!(true);
+                        again.push(it);
+                        j.retrying = true;
+                    }
+                }
+            }
+        }
+        self.drop_dependents(st);
+        if !failed {
+            return;
+        }
+        st.fails += 1;
+        let hold = st.fails > 1;
+        for it in again.into_iter().rev() {
+            st.q.items.insert(0, it);
+        }
+        st.q.save(&self.dir);
+        if hold {
+            st.q.paused = true;
+            st.fails = 0;
+            st.q.save_paused(&self.dir);
+            eprintln!("queue: two failures in a row, holding the queue");
+        }
+    }
+
+    /// Queued clips whose predecessor failed for good or was cancelled leave the queue with that as their answer (status by
+    /// label or reentrant_id, ended_clips); nothing makes them from an older clip. Those behind them in the series go too.
+    fn drop_dependents(&self, st: &mut State) {
+        let mut at = 0;
+        while at < st.q.items.len() {
+            let Some(on) = self.failed_dep(st, &st.q.items[at]) else {
+                at += 1;
+                continue;
+            };
+            let item = st.q.items.remove(at);
+            let message = format!("{on} failed or was cancelled and this clip needs its output: nothing was started");
+            eprintln!("queue: {} dropped: {message}", s(&item, "label"));
+            let view = json!({"idle": true, "job": item, "stage": "failed", "pct": 0, "done": false, "error": format!("failed: {message}"), "exited": true, "rc": 1, "eta": 0, "elapsed": 0,
+                              "gpu": null, "waiting_for": null, "preview": null, "file": null,
+                              "failure": {"code": "dependency_failed", "retryable": false, "message": message, "hint": "make that clip again, then this one"}});
+            st.ended.push(Job { rec: item, engine_id: 0, energy0: None, saved: false, stall: (0, now()), finished: true, last: Value::Null, item: None, settled: true, view, retrying: false });
+            st.q.save(&self.dir);
+        }
     }
 
     /// One scheduler tick (every second).
     pub(super) fn tick(&self) {
         self.llm.idle_watchdog(self);
         let mut st = self.st.lock().unwrap();
-        if self.running(&st) {
-            let _ = self.status(&mut st);
-            // the watchdog: no new log line for the stall time -> stop it (becomes a failure -> the retry path)
-            if let Some(j) = st.job.as_mut() {
-                let n = j.last["log"].as_array().map_or(0, |a| a.len());
-                if n != j.stall.0 {
-                    j.stall = (n, now());
-                } else if now() - j.stall.1 > self.stall_s as f64 && j.last["state"] == "running" {
-                    eprintln!("watchdog: {} wrote nothing for {} min, stopping it", s(&j.rec, "name"), self.stall_s / 60);
-                    let id = j.engine_id;
-                    let _ = self.engine("POST", &format!("/engine/jobs/{id}/cancel"), None);
-                    j.stall.1 = now();
-                }
-            }
-            if self.running(&st) {
-                return;
+        let es = self.engine_state();
+        self.refresh(&mut st, es.as_ref());
+        // the watchdog: no new log line for the stall time -> stop it (becomes a failure -> the retry path)
+        for j in &mut st.running {
+            let n = j.last["log"].as_array().map_or(0, |a| a.len());
+            if n != j.stall.0 {
+                j.stall = (n, now());
+            } else if now() - j.stall.1 > self.stall_s as f64 && j.last["state"] == "running" {
+                eprintln!("watchdog: {} wrote nothing for {} min, stopping it", s(&j.rec, "name"), self.stall_s / 60);
+                let id = j.engine_id;
+                let _ = self.engine("POST", &format!("/engine/jobs/{id}/cancel"), None);
+                j.stall.1 = now();
             }
         }
         if st.q.items.is_empty() || st.q.items.iter().all(|i| st.q.held(i)) {
             return;
         }
-        let stv = self.status(&mut st);
-        if stv["error"].is_string() && st.current_item.is_some() && st.job.as_ref().is_some_and(|j| !j.saved && j.rec["retried"].is_null()) {
-            st.fails += 1;
-            if st.fails <= 1 {
-                let mut again = st.current_item.take().unwrap();
-                again["retried"] = json!(true);
-                st.q.items.insert(0, again);
-                st.q.save(&self.dir);
-            } else {
+        self.settle(&mut st);
+        let room = self.room(&st, es.as_ref());
+        let recs: Vec<Value> = st.running.iter().map(|j| j.rec.clone()).collect();
+        let plan = super::slots::plan(&st.q, &recs, room.free, &|i| self.has_own(i));
+        if plan.starts.is_empty() {
+            return;
+        }
+        let mut items: Vec<Value> = Vec::new();
+        for i in plan.starts.iter().rev() {
+            items.insert(0, st.q.items.remove(*i));
+        }
+        st.q.save(&self.dir);
+        let mut left = items.into_iter();
+        while let Some(mut item) = left.next() {
+            let retry = item.as_object_mut().and_then(|o| o.remove("retried")).is_some();
+            if retry {
+                item["retry"] = json!(true);
+            }
+            if let Err(e) = self.launch(&mut st, item.clone()) {
+                eprintln!("queue: launching failed ({e}); back at the front, queue held");
+                if let Some(o) = item.as_object_mut() {
+                    o.remove("retry");
+                }
+                let back: Vec<Value> = std::iter::once(item).chain(left).collect();
+                for it in back.into_iter().rev() {
+                    st.q.items.insert(0, it);
+                }
                 st.q.paused = true;
-                st.fails = 0;
+                st.q.save(&self.dir);
                 st.q.save_paused(&self.dir);
-                st.current_item = None;
-                eprintln!("queue: two failures in a row, holding the queue");
                 return;
             }
-        } else if stv["done"] == true {
-            st.fails = 0;
-        }
-        if let Some(j) = st.job.as_mut() {
-            j.rec["retried"] = json!(true); // looked at once: never re-queued again
-        }
-        let Some(idx) = st.q.items.iter().position(|i| !st.q.held(i)) else { return };
-        let mut item = st.q.items.remove(idx);
-        st.q.save(&self.dir);
-        if let Some(o) = item.as_object_mut() {
-            o.remove("retried");
-        }
-        if let Err(e) = self.launch(&mut st, item.clone()) {
-            eprintln!("queue: launching failed ({e}); back at the front, queue held");
-            st.q.items.insert(0, item);
-            st.q.paused = true;
-            st.q.save(&self.dir);
-            st.q.save_paused(&self.dir);
         }
     }
 
@@ -513,9 +653,49 @@ pub fn snap_seconds(s: f64) -> f64 {
     frames_of(s) as f64 / 24.0
 }
 
-/// The record of a job as it was when the studio restarted, if it is still worth following.
-pub fn recover(dir: &Path) -> Option<Value> {
-    std::fs::read(dir.join("job.json")).ok().and_then(|b| serde_json::from_slice(&b).ok())
+/// The records of the clips being made when the studio stopped (a studio from before two clips at once left `job.json`).
+pub fn recover(dir: &Path) -> Vec<Value> {
+    if let Some(v) = std::fs::read(dir.join("jobs.json")).ok().and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok()) {
+        return v;
+    }
+    std::fs::read(dir.join("job.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).into_iter().collect()
+}
+
+/// Whether a clip's worker has loaded: its drop in host memory has happened (the text encoder's line comes after the load)
+fn worker_loaded(last: &Value) -> bool {
+    last["log"].as_array().is_some_and(|l| l.iter().any(|x| x.as_str().is_some_and(|x| x.starts_with("tokens :") || x.starts_with("encoded:"))))
+}
+
+/// The telemetry's energy counter of each card, by index (a gpustat from before per-card counters: only the first's)
+fn card_energies(tele: &Value) -> Value {
+    let mut m = serde_json::Map::new();
+    for (i, c) in tele["cards"].as_array().into_iter().flatten().enumerate() {
+        if let Some(e) = c["energy_j"].as_f64() {
+            m.insert(i.to_string(), json!(e));
+        }
+    }
+    if m.is_empty() {
+        if let Some(e) = tele["energy_j"].as_f64() {
+            m.insert("0".into(), json!(e));
+        }
+    }
+    Value::Object(m)
+}
+
+/// One card's counter now: by PCI address, else by index; the telemetry's top line is its first card
+fn card_energy(tele: &Value, gpu: usize, pci: &str) -> Option<f64> {
+    let cards = tele["cards"].as_array();
+    let row = cards.and_then(|c| c.iter().find(|x| !pci.is_empty() && x["pci"] == pci).or_else(|| c.get(gpu)));
+    row.and_then(|r| r["energy_j"].as_f64()).or(if gpu == 0 || (!pci.is_empty() && tele["pci"] == pci) { tele["energy_j"].as_f64() } else { None })
+}
+
+/// A clip's line in `running_clips` and `ended_clips`
+fn row(v: &Value) -> Value {
+    let j = &v["job"];
+    json!({"label": j["label"], "name": j["name"], "project": j["project"], "reentrant_id": j["reentrant_id"], "engine": j["engine"], "seconds": j["seconds"], "steps": j["steps"],
+           "width": j["width"], "height": j["height"], "energy_wh": j["energy_wh"], "job": j,
+           "stage": v["stage"], "pct": v["pct"], "eta": v["eta"], "elapsed": v["elapsed"], "gpu": v["gpu"], "waiting_for": v["waiting_for"], "preview": v["preview"],
+           "steps_done": v["steps_done"], "steps_total": v["steps_total"], "frames": v["frames"], "idle": v["idle"], "done": v["done"], "error": v["error"], "failure": v["failure"], "file": v["file"]})
 }
 
 /// A failed clip's kind: {code, retryable, message, hint}. Read from the engine's error and its last lines.

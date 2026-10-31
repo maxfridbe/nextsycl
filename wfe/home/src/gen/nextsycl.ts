@@ -1640,8 +1640,12 @@ export type Upscaler = "esrgan-general" | "esrgan-anime" | "latent";
 
 /** What video.cancel takes. */
 export interface VideoCancelReq {
-  /** a clip's label (none: the running clip) */
+  /** a clip's label; running ones stopped, queued ones dropped (none of these three: the running clip, refused as ambiguous when two run) */
   label?: string | null;
+  /** a clip's name (h3_...), as video.status's running_clips say */
+  name?: string | null;
+  /** a clip's reentrant_id */
+  reentrant_id?: string | null;
   /** other keys */
   [key: string]: unknown;
 }
@@ -1834,7 +1838,7 @@ export interface VideoGenerateReq {
   /** read as written - tokenized whole, no template, no sections parsed. H3 was trained on three fields in a fixed order: integrated_multimodal_description (shots, actions, camera, dialogue), overall_soundscape, non_diegetic_music; video.describePromptGuideMD has the form and its rules */
   prompt: string;
   /**
-   * queue the clip when the studio is busy (false: 409 busy)
+   * queue the clip when it cannot start now, the default (false: 409 busy instead)
    * @default false
    */
   queue?: boolean | null;
@@ -2005,6 +2009,12 @@ export interface VideoQueueResumeReq {
 
 /** What video.status takes. */
 export interface VideoStatusReq {
+  /** one clip's status: its label. The top-level fields are then its own (running, lately ended, queued, or its record); none named: the first running clip, every one in running_clips */
+  label?: string | null;
+  /** one clip's status: its name (h3_...) */
+  name?: string | null;
+  /** one clip's status: its reentrant_id */
+  reentrant_id?: string | null;
   /** other keys */
   [key: string]: unknown;
 }
@@ -2142,7 +2152,7 @@ export interface Methods {
    */
   "system.state": { req: SystemStateReq; resp: any };
   /**
-   * Is anything working: a clip made or waiting to run, a picture, sound or chat answered, a model loading. video.accepts says whether video.generate starts a clip at once (else 409 busy without queue: true)
+   * Is anything working: a clip made or waiting to run, a picture, sound or chat answered, a model loading. video.accepts says whether one more clip can start now (else 409 busy without queue: true), video.slots how many clips are possible at once now, video.clips each one being made
    * @tags system
    */
   "system.busy": { req: SystemBusyReq; resp: any };
@@ -2626,14 +2636,15 @@ export interface Methods {
    */
   "model3d.describePromptGuideMD": { req: Model3dDescribePromptGuideMdReq; resp: any };
   /**
-   * Make a clip: it starts at once when the studio is idle (queued: false, the job), else it is queued with queue: true (queued: true, its position) or refused with 409 busy. Anchors (first_frame, last_frame, exposure_ref, first_audio, guide_clip, source) take prev, prev_cam, first, first_cam - clips of the label's series, see label - or a file in the clips directory (video.upload, or a finished clip's name)
+   * Make a clip: it starts at once when a card is free (one clip per usable card; queued: false, the job), else it is queued and starts on whichever card frees first (queued: true, its position); only queue: false answers 409 busy. A clip that needs another's output (an anchor of its series, or a running clip's files) waits for it even with a card free, and answers dependency_failed if that clip failed or was cancelled. A re-submit naming a clip by reentrant_id (running, queued or made), or the same prompt and seed under the label of a clip running or queued now, is that clip (reentered: true), past any max_willing_to_wait_s; a finished clip's label does not count, so a new clip may reuse it. Anchors (first_frame, last_frame, exposure_ref, first_audio, guide_clip, source) take prev, prev_cam, first, first_cam - clips of the label's series, see label - or a file in the clips directory (video.upload, or a finished clip's name)
    * @tags video
    * @example {"label":"Fox 01/03: snow","prompt":"integrated_multimodal_description: [Shot 1] Live-action, a red fox trots through deep snow at dawn.\n\noverall_soundscape: soft wind, crunching snow.\n\nnon_diegetic_music: None.","queue":true,"seconds":5,"steps":8}
    */
   "video.generate": { req: VideoGenerateReq; resp: any };
   /**
-   * The clip running or last: stage, percent, ETA, timings, a preview picture of the shot while it samples (preview), the queue, version
+   * The clip running or last: stage, percent, ETA, timings, a preview picture of the shot while it samples (preview), the queue, version. Every clip being made is in running_clips, the top-level fields describe the first; label, name or reentrant_id ask for one clip, and the top-level fields are then its own
    * @tags video
+   * @example {}
    */
   "video.status": { req: VideoStatusReq; resp: any };
   /**
@@ -2643,7 +2654,7 @@ export interface Methods {
    */
   "video.wait": { req: VideoWaitReq; resp: any };
   /**
-   * Stop the running clip at its next step; with a label, that clip only: stopped if it runs, dropped from the queue if it waits
+   * Stop a running clip at its next step; with a label, name or reentrant_id, that clip only: stopped if it runs, dropped from the queue if it waits. Naming none with two running is refused (ambiguous)
    * @tags video
    * @example {"label":"Fox 02/03: the den"}
    */
@@ -2747,7 +2758,7 @@ export interface Methods {
 }
 
 /** The methods that take no parameters (their body may be left out). */
-export type NoParamMethods = "system.state" | "system.busy" | "system.ping" | "system.version" | "system.models" | "system.models.pulls" | "system.cards" | "system.config" | "system.drives" | "system.move.cancel" | "llm.requests" | "llm.models" | "image.queue.list" | "image.progress" | "image.history" | "audio.progress" | "audio.history" | "audio.queue.list" | "model3d.progress" | "model3d.history" | "model3d.queue.list" | "video.status" | "video.queue.list" | "video.projects.list" | "video.films.list" | "video.templates.list" | "video.canvases.list" | "video.summary";
+export type NoParamMethods = "system.state" | "system.busy" | "system.ping" | "system.version" | "system.models" | "system.models.pulls" | "system.cards" | "system.config" | "system.drives" | "system.move.cancel" | "llm.requests" | "llm.models" | "image.queue.list" | "image.progress" | "image.history" | "audio.progress" | "audio.history" | "audio.queue.list" | "model3d.progress" | "model3d.history" | "model3d.queue.list" | "video.queue.list" | "video.projects.list" | "video.films.list" | "video.templates.list" | "video.canvases.list" | "video.summary";
 
 /** Every error's body, whatever the HTTP status: branch on `code`, never on the status (docs/RPC_RULES.md). */
 export interface RpcError {
@@ -2774,7 +2785,7 @@ export function client(post: Post, raw?: PostRaw) {
      */
     "system.state": (req: SystemStateReq = {}): Promise<any> => post("system.state", req),
     /**
-     * Is anything working: a clip made or waiting to run, a picture, sound or chat answered, a model loading. video.accepts says whether video.generate starts a clip at once (else 409 busy without queue: true)
+     * Is anything working: a clip made or waiting to run, a picture, sound or chat answered, a model loading. video.accepts says whether one more clip can start now (else 409 busy without queue: true), video.slots how many clips are possible at once now, video.clips each one being made
      * @tags system
      */
     "system.busy": (req: SystemBusyReq = {}): Promise<any> => post("system.busy", req),
@@ -3258,16 +3269,17 @@ export function client(post: Post, raw?: PostRaw) {
      */
     "model3d.describePromptGuideMD": (req: Model3dDescribePromptGuideMdReq): Promise<any> => post("model3d.describePromptGuideMD", req),
     /**
-     * Make a clip: it starts at once when the studio is idle (queued: false, the job), else it is queued with queue: true (queued: true, its position) or refused with 409 busy. Anchors (first_frame, last_frame, exposure_ref, first_audio, guide_clip, source) take prev, prev_cam, first, first_cam - clips of the label's series, see label - or a file in the clips directory (video.upload, or a finished clip's name)
+     * Make a clip: it starts at once when a card is free (one clip per usable card; queued: false, the job), else it is queued and starts on whichever card frees first (queued: true, its position); only queue: false answers 409 busy. A clip that needs another's output (an anchor of its series, or a running clip's files) waits for it even with a card free, and answers dependency_failed if that clip failed or was cancelled. A re-submit naming a clip by reentrant_id (running, queued or made), or the same prompt and seed under the label of a clip running or queued now, is that clip (reentered: true), past any max_willing_to_wait_s; a finished clip's label does not count, so a new clip may reuse it. Anchors (first_frame, last_frame, exposure_ref, first_audio, guide_clip, source) take prev, prev_cam, first, first_cam - clips of the label's series, see label - or a file in the clips directory (video.upload, or a finished clip's name)
      * @tags video
      * @example {"label":"Fox 01/03: snow","prompt":"integrated_multimodal_description: [Shot 1] Live-action, a red fox trots through deep snow at dawn.\n\noverall_soundscape: soft wind, crunching snow.\n\nnon_diegetic_music: None.","queue":true,"seconds":5,"steps":8}
      */
     "video.generate": (req: VideoGenerateReq): Promise<any> => post("video.generate", req),
     /**
-     * The clip running or last: stage, percent, ETA, timings, a preview picture of the shot while it samples (preview), the queue, version
+     * The clip running or last: stage, percent, ETA, timings, a preview picture of the shot while it samples (preview), the queue, version. Every clip being made is in running_clips, the top-level fields describe the first; label, name or reentrant_id ask for one clip, and the top-level fields are then its own
      * @tags video
+     * @example {}
      */
-    "video.status": (req: VideoStatusReq = {}): Promise<any> => post("video.status", req),
+    "video.status": (req: VideoStatusReq): Promise<any> => post("video.status", req),
     /**
      * Long poll: answers when the status's version changes, or at the timeout
      * @tags video
@@ -3275,7 +3287,7 @@ export function client(post: Post, raw?: PostRaw) {
      */
     "video.wait": (req: VideoWaitReq): Promise<any> => post("video.wait", req),
     /**
-     * Stop the running clip at its next step; with a label, that clip only: stopped if it runs, dropped from the queue if it waits
+     * Stop a running clip at its next step; with a label, name or reentrant_id, that clip only: stopped if it runs, dropped from the queue if it waits. Naming none with two running is refused (ambiguous)
      * @tags video
      * @example {"label":"Fox 02/03: the den"}
      */

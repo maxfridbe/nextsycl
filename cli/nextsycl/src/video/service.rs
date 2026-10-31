@@ -368,6 +368,8 @@ pub fn studio(raw: &[String]) -> Result<(), String> {
         gpustat: super::opt(raw, "--gpustat").unwrap_or("/run/gpustat.json").into(),
         llm_modes: super::opt(raw, "--llm-modes").map(PathBuf::from),
         engines,
+        // its cards and host memory by the front door's word: this machine's, unless told otherwise ("off": none)
+        door: Some(super::opt(raw, "--door").map(str::to_string).or_else(|| std::env::var("NS_VIDEO_DOOR").ok()).unwrap_or_else(|| "127.0.0.1:8000".to_string())).filter(|d| d != "off"),
     })
     .map_err(|e| e.0)
 }

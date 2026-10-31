@@ -147,14 +147,14 @@ const MODEL_STATE: &str = r#"{"type": "object", "properties": {"id": {"type": "s
 /// video.status (and video.wait)
 fn status() -> String {
     format!(r#"{{"type": "object", "required": ["idle", "job", "queue", "queue_items", "version"],
-  "description": "the clip running, or the last one (idle: true then; no job at all after a restart with nothing made)",
+  "description": "the first clip running, or the last one (idle: true then; no job at all after a restart with nothing made); with label, name or reentrant_id, that clip; every clip being made is in running_clips",
   "properties": {{"idle": {{"type": "boolean", "description": "no clip is being made (one may still wait in the queue: queue_items)"}},
     "version": {{"type": "string", "description": "changes whenever anything here does (video.wait)"}},
     "job": {{"allOf": [{JOB}], "nullable": true, "description": "null: nothing made since the studio started"}}, "stage": {{"type": "string", "description": "starting, text encoder, sampling N/M, video decoded, done, failed ..."}},
     "pct": {{"type": "integer"}}, "eta": {{"type": "integer", "description": "seconds left (estimate)"}}, "elapsed": {{"type": "integer"}},
     "done": {{"type": "boolean"}}, "error": {{"type": "string", "nullable": true, "description": "failed or cancelled, with the engine's last lines (text, as before; failure has it as data)"}},
     "failure": {{"type": "object", "nullable": true, "description": "failed or cancelled: what kind, and whether the same request again can help", "properties": {{
-      "code": {{"type": "string", "enum": ["out_of_memory", "engine_lost", "invalid_input", "engine_error", "cancelled"]}},
+      "code": {{"type": "string", "enum": ["out_of_memory", "engine_lost", "invalid_input", "engine_error", "cancelled", "dependency_failed"]}},
       "retryable": {{"type": "boolean", "description": "true only for engine_lost (the engine process ended or stopped answering); out_of_memory needs fewer frames, a smaller canvas or engine"}},
       "message": {{"type": "string", "description": "the engine's error"}}, "hint": {{"type": "string"}}}}}},
     "gpu": {{"type": "integer", "nullable": true, "description": "the card the clip runs on (null when idle; while it waits for a card, the one it asked for or null)"}},
@@ -163,6 +163,10 @@ fn status() -> String {
     "file": {{"type": "string", "nullable": true, "description": "done: the clip's URL (/v1/video/files/<name>.mp4)"}},
     "preview": {{"type": "string", "nullable": true, "description": "while it samples: a picture of the shot so far (/v1/video/files/<name>.preview.png?t=<when>, PNG, 4x the latent grid: 320x176 for 1280x704) - the denoised estimate's middle frame after each step, its colours from a fitted latent-to-RGB map (close, not the decoder's). The URL changes with each step; null when idle or before the first step"}},
     "engine_log": {{"type": "array", "items": {{"type": "string"}}}},
+    "running_clips": {{"type": "array", "description": "every clip being made, oldest first: its own stage, pct, eta, elapsed, gpu, energy_wh, waiting_for, preview, label, name, project, reentrant_id", "items": {{"type": "object", "additionalProperties": true}}}},
+    "ended_clips": {{"type": "array", "description": "the latest that ended, newest first, with done, error, failure, file", "items": {{"type": "object", "additionalProperties": true}}}},
+    "slots_total": {{"type": "integer", "description": "the cards the daemon serves"}}, "slots_free": {{"type": "integer", "description": "clips that can start now"}},
+    "slots_why": {{"type": "string", "nullable": true, "description": "why fewer than the free cards (host memory)"}}, "accepts": {{"type": "boolean", "description": "one more clip can start, the queue served first"}},
     "queue": {{"type": "array", "items": {{"type": "string"}}, "description": "the queue's labels in run order"}},
     "queue_items": {{"type": "array", "items": {QUEUE_ITEM}}}, "queue_len": {{"type": "integer"}},
     "paused": {{"type": "boolean"}}, "paused_projects": {{"type": "array", "items": {{"type": "string"}}}}, "paused_batches": {{"type": "array", "items": {{"type": "string"}}}},
@@ -208,8 +212,10 @@ pub fn result(method: &str) -> Option<String> {
     "stage": {"type": "string", "nullable": true}, "pct": {"type": "integer", "nullable": true}, "eta_s": {"type": "integer", "nullable": true}, "elapsed_s": {"type": "integer", "nullable": true},
     "gpu": {"type": "integer", "nullable": true, "description": "the card the clip is made on (null when nothing runs, or while the clip waits for a card the engine has not given it yet)"}, "energy_wh": {"type": "number", "nullable": true, "description": "the clip's energy so far"},
     "queued": {"type": "integer"}, "runnable": {"type": "integer", "description": "queued and not held"}, "held": {"type": "integer"},
-    "accepts": {"type": "boolean", "description": "video.generate without queue: true starts at once"},
-    "slots": {"type": "integer", "description": "clips made at once: 1. The studio makes one clip at a time; the daemon has a worker on each card (cards, and the video rows of the slots list) and the clip goes to whichever is free, so two video rows never mean two clips"},
+    "accepts": {"type": "boolean", "description": "one more clip can start: video.generate without queue: true starts at once (a clip that carries on from its own series' running clip still waits for it)"},
+    "slots": {"type": "integer", "description": "clips possible at once now: those running plus those that can start. One a usable card: a card a pin or hold has (GET /video/blocked) is not counted, nor one host memory could not take a further worker for (slots_why)"},
+    "slots_why": {"type": "string", "nullable": true, "description": "why slots is short of the free cards"},
+    "clips": {"type": "array", "description": "every clip being made; the fields above describe the first", "items": {"type": "object", "properties": {"label": {"type": "string"}, "name": {"type": "string"}, "stage": {"type": "string"}, "pct": {"type": "integer"}, "eta_s": {"type": "integer"}, "elapsed_s": {"type": "integer"}, "gpu": {"type": "integer", "nullable": true}, "energy_wh": {"type": "number", "nullable": true}, "waiting_for": {"type": "string", "nullable": true}}}},
     "cards": {"type": "integer", "description": "cards the video daemon can make a clip on"}}},
   "slots": {"type": "array", "description": "every place work runs: image and audio servers (two each: one per card), the video daemon's cards, the chat server", "items": {"type": "object", "properties": {
     "kind": {"type": "string", "enum": ["image", "audio", "video", "llm"]}, "slot": {}, "port": {"type": "integer"}, "gpu": {"type": "integer", "nullable": true, "description": "its card (null: not running)"},
@@ -369,7 +375,7 @@ pub fn result(method: &str) -> Option<String> {
         "video.status" => status(),
         "video.wait" => status().replacen(r#""required": ["idle","#, r#""required": ["changed", "idle","#, 1)
             .replacen(r#""properties": {"idle""#, r#""properties": {"changed": {"type": "boolean", "description": "false: the timeout passed"}, "idle""#, 1),
-        "video.cancel" => r#"{"type": "object", "properties": {"stopped": {"type": "boolean", "description": "the running clip was stopped (at its next step)"},
+        "video.cancel" => r#"{"type": "object", "properties": {"stopped": {"type": "boolean", "description": "a running clip was stopped (at its next step)"},
   "removed": {"type": "integer", "description": "queued clips dropped"}, "label": {"type": "string"}}}"#.into(),
         "video.queue.list" => format!(r#"{{"type": "object", "properties": {{"queue": {{"type": "array", "items": {ITEM}}}}}}}"#),
         "video.queue.move" => r#"{"type": "object", "properties": {"label": {"type": "string"}, "position": {"type": "integer"}, "queue": {"type": "array", "items": {"type": "string"}, "description": "the labels in run order"}}}"#.into(),
@@ -420,7 +426,7 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
         "video.generate" => &[(400, "invalid_params", "a value outside its limits (the message names it), frames not 17k + 5 (the message names the nearest), an unknown engine or sampler, more references than allowed, references with a ControlNet, a bad chain"),
                               (404, "not_found", "a file named (first_frame, ref_images, control_video ...) is not in the clips directory"),
                               (409, "busy", "a clip is being made or a runnable one waits, and queue is not true")],
-        "video.cancel" => &[(404, "not_found", "label: no running or queued clip with it"), (409, "not_running", "no label and no clip is being made")],
+        "video.cancel" => &[(404, "not_found", "label: no running or queued clip with it"), (409, "ambiguous", "no clip named and two running: name one"), (409, "not_running", "no label and no clip is being made")],
         "video.queue.move" | "video.queue.remove" => &[(404, "not_found", "no queued clip with that label")],
         "video.jobs.get" => &[(404, "not_found", "no record of that clip")],
         "video.upload" => &[(400, "invalid_params", "not a picture, clip or sound (png jpg jpeg webp mp4 mov webm mkv wav mp3 flac m4a ogg), or empty")],
@@ -495,7 +501,7 @@ stop it with <kind>.cancel {label}; wait: false answers at once. A kind makes as
 in a queue as video's: priority, held, project and batch on submit, <kind>.queue.list / move / pause / resume. \
 Pictures and recordings used again (an init picture, edit references, a voice sample) can be sent once with <kind>.upload and named as \
 \"upload:<name>\" after. \
-reentrant_id (every generate, video's too): a submit naming the id of a job queued, running or done gets that job back, nothing new is started \
+reentrant_id (every generate, video's too): a submit naming the id of a job queued, running or done gets that job back, nothing new is started, past any max_willing_to_wait_s \
 (a failed or cancelled one is made again).";
 
 #[cfg(test)]

@@ -249,6 +249,7 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `H3_THREADS` | 8 | threads reading the checkpoint at load (--opt-threads) | video h3 |
 | `H3_VAE_ATTN_PER_TILE` | off | 1: the video decoder's attention a tile at a time (--opt-vae-attn-per-tile) | video h3 |
 | `NS_VIDEO_CHARACTERS` | docs/video/characters.example.json | characters for the speech tool | cli (video tools) |
+| `NS_VIDEO_DOOR` | 127.0.0.1:8000 | the front door the studio asks which cards a pin or hold has and the host's free memory (`--door` wins; off: none) | studio |
 | `NS_VIDEO_ENGINES` | none | the video daemon's other models, space-separated registry ids (serve: the enabled video models decide) | cli (video start), serve |
 | `NS_VIDEO_GPUS` | all | the video daemon's GPUs, e.g. "0 1" (serve: the enabled video models' GPUs) | cli (video start) |
 | `NS_VIDEO_GPUSTAT` | /run/gpustat.json | the GPU telemetry file (`nextsycl gpustat`, root: every user's processes) the studio reads; the front door plans loads with its `vram_used_mb` per card where it sees more than its own sampler | cli (video serve), studio, serve |
@@ -257,6 +258,7 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `NS_VIDEO_LISTEN` | 127.0.0.1 | the studio's address | cli (video serve) |
 | `NS_VIDEO_LLM_MODES` | none | the studio's chat modes file (the language models it switches) | cli (video serve), studio |
 | `NS_VIDEO_LLM_SWITCHER` | none | a model switcher URL: its chat model stops before a video load on a shared card and comes back after | cli (video start) |
+| `NS_VIDEO_MEMINFO` | /proc/meminfo | where the studio reads MemAvailable when the door has not said (tests give a file) | studio |
 | `NS_VIDEO_MODEL` | the first video model | the model jobs get unless they name one: a registry id (serve: the enabled video models decide) | cli (video start), serve |
 | `NS_VIDEO_MODELS_DIR` | none | a directory mounted as /models in the video container: what clips, templates and scene files name as /models/... (upscalers, LoRAs) | cli (video start) |
 | `NS_VIDEO_OUT` | ~/.local/share/nextsycl/video | where clips go | cli (video), studio |

@@ -102,8 +102,39 @@ export interface LlmStatus {
   url: string | null;
 }
 
+/** One clip being made (or lately ended): running_clips, ended_clips */
+export interface ClipRow {
+  label?: string;
+  name?: string;
+  project?: string;
+  job?: Job;
+  engine?: string;
+  seconds?: number;
+  steps?: number;
+  width?: number;
+  height?: number;
+  stage?: string;
+  pct?: number;
+  eta?: number;
+  elapsed?: number;
+  gpu?: number | null;
+  energy_wh?: number | null;
+  waiting_for?: string | null;
+  preview?: string | null;
+  done?: boolean;
+  error?: string | null;
+  failure?: { code: string; retryable: boolean; message: string; hint?: string } | null;
+}
+
 export interface Status {
   idle: boolean;
+  /** every clip being made; the fields below describe the first */
+  running_clips?: ClipRow[];
+  /** the latest that ended, newest first */
+  ended_clips?: ClipRow[];
+  /** the cards the daemon serves, the clips that can start now */
+  slots_total?: number;
+  slots_free?: number;
   llm?: LlmStatus;
   paused: boolean;
   paused_projects: string[];
@@ -321,7 +352,7 @@ export interface Methods {
   status: [Record<string, never>, Status];
   wait: [{ version?: string; timeout_s?: number }, Status];
   generate: [GenerateRequest, { queued: boolean; position?: number; job?: Job }];
-  cancel: [{ label?: string }, { stopped: boolean; removed: number; label?: string }];
+  cancel: [{ label?: string; name?: string; reentrant_id?: string }, { stopped: boolean; removed: number; label?: string }];
   "queue.remove": [{ index?: number; label?: string }, { removed: number; index?: number; label: string }];
   "queue.list": [Record<string, never>, { queue: GenerateRequest[] }];
   "queue.clear": [Scope, { cleared: number }];

@@ -186,7 +186,7 @@ impl Studio {
             out.push(json!({"n": n, "name": stem, "state": "done", "seconds": j["seconds"], "camera": j["camera"], "label": j["label"],
                             "dialogue": dialogue_of(&s(j, "prompt")), "thumb": format!("/thumb/{stem}.webp")}));
         }
-        let running = st.job.as_ref().filter(|j| !j.finished).map(|j| j.rec.clone());
+        let running: Vec<Value> = st.running.iter().map(|j| j.rec.clone()).collect();
         for (it, state) in running.iter().map(|r| (r, "running")).chain(st.q.items.iter().map(|i| (i, if st.q.held(i) { "held" } else { "queued" }))) {
             if project_of(it) != project {
                 continue;
@@ -210,7 +210,7 @@ impl Studio {
         for c in self.timeline(st, project) {
             let src = match c["name"].as_str().and_then(|n| sides.get(n)) {
                 Some(side) => side["job"].clone(),
-                None => st.job.iter().map(|j| &j.rec).chain(st.q.items.iter()).find(|i| i["label"] == c["label"]).cloned().unwrap_or(Value::Null),
+                None => st.running.iter().chain(st.ended.iter().rev()).map(|j| &j.rec).chain(st.q.items.iter()).find(|i| i["label"] == c["label"]).cloned().unwrap_or(Value::Null),
             };
             if s(&src, "prompt").is_empty() {
                 continue;
@@ -407,10 +407,14 @@ impl Studio {
         let wh_per_vs = if with_wh.is_empty() { 0.0 } else { with_wh.iter().map(|d| d.3.unwrap()).sum::<f64>() / with_wh.iter().map(|d| d.1).sum::<f64>().max(1e-9) };
         let stv = self.status(st);
         let running = stv["idle"] != true;
-        let cur_left = if running { stv["eta"].as_f64().unwrap_or(0.0).max(0.0) } else { 0.0 };
-        let cur_vid = if running { snap_seconds(stv["job"]["seconds"].as_f64().unwrap_or(0.0)) } else { 0.0 };
+        // every running clip's; the queue shared over the cards
+        let clips = stv["running_clips"].as_array().cloned().unwrap_or_default();
+        let cur_left = clips.iter().map(|c| c["eta"].as_f64().unwrap_or(0.0).max(0.0)).sum::<f64>();
+        let cur_vid = clips.iter().map(|c| snap_seconds(c["seconds"].as_f64().unwrap_or(0.0))).sum::<f64>();
+        let cards = stv["slots_total"].as_f64().unwrap_or(1.0).max(1.0);
         let q_vid: f64 = st.q.items.iter().map(|i| snap_seconds(i["seconds"].as_f64().unwrap_or(0.0))).sum();
-        let remaining = cur_left + q_vid * wall_per_vs;
+        let longest = clips.iter().map(|c| c["eta"].as_f64().unwrap_or(0.0).max(0.0)).fold(0.0, f64::max);
+        let remaining = ((cur_left + q_vid * wall_per_vs) / cards).max(longest);
         let project = stv["job"].get("project").and_then(|p| p.as_str()).unwrap_or("").to_string();
         json!({"rate_wall_per_video_s": (wall_per_vs * 10.0).round() / 10.0, "rate_wh_per_video_s": (wh_per_vs * 100.0).round() / 100.0,
                "sample_clips": recent.len(), "running": running, "current_eta_s": cur_left, "current_video_s": cur_vid,

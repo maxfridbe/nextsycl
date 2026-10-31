@@ -148,6 +148,38 @@ fn video_missing(enabled: &[String], running: Option<&[String]>) -> bool {
     !enabled.is_empty() && running.is_none_or(|r| enabled.iter().any(|e| !r.contains(e)))
 }
 
+/// The clips a studio's status says are running: its `running_clips`; a studio that only says one, that one
+pub(super) fn clip_rows(st: &Value) -> Vec<Value> {
+    if let Some(a) = st["running_clips"].as_array() {
+        return a.clone();
+    }
+    if st.is_null() || st["idle"] == true {
+        return Vec::new();
+    }
+    vec![json!({"label": st["job"]["label"], "name": st["job"]["name"], "eta": st["eta"], "elapsed": st["elapsed"], "stage": st["stage"], "pct": st["pct"], "gpu": st["gpu"],
+                "waiting_for": st["waiting_for"], "energy_wh": st["job"]["energy_wh"], "job": st["job"]})]
+}
+
+/// Clips that can start now by a studio's status (one that does not say: one when idle)
+pub(super) fn slots_free(st: &Value) -> usize {
+    st["slots_free"].as_u64().map_or(usize::from(st["idle"] == true), |n| n as usize)
+}
+
+/// When the next card comes free for a clip behind `queued`: every card's work ahead of it, the earliest-free card taking the
+/// next. `remaining`: the running clips' times left; `free`: cards free now
+fn clip_wait(remaining: &[f64], free: usize, queued: &[f64]) -> f64 {
+    let mut cards: Vec<f64> = remaining.iter().copied().chain(std::iter::repeat_n(0.0, free)).collect();
+    if cards.is_empty() {
+        cards.push(0.0);
+    }
+    let earliest = |c: &[f64]| c.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |x| x.0);
+    for q in queued {
+        let i = earliest(&cards);
+        cards[i] += q;
+    }
+    cards[earliest(&cards)]
+}
+
 fn video_enabled(all: &[Value]) -> Vec<String> {
     all.iter().filter(|m| registry::kind_of(m) == "video" && m["enabled"] != false).map(|m| s(m, "id")).collect()
 }
@@ -273,21 +305,49 @@ impl Home {
             let kept = c.procs.iter().filter(|p| p.kind.as_deref() != Some("video")).any(|p| snap.kept.contains(&p.model) || (p.kind.as_deref() == Some("llm") && chat_held));
             kept && self.room_plan(&snap, g, want + super::life::MARGIN_MB, "video", false, None).is_none()
         }).map(|c| c.index).collect();
-        json!({"blocked": blocked})
+        // host memory by the door's rule (the warm cache of what is loaded not counted as free): the studio decides a further
+        // clip from it (video/studio/slots.rs), since a queued clip starts without passing here
+        json!({"blocked": blocked, "host_free_mb": self.host_free_now(&snap.cards)})
     }
 
-    /// The work ahead of a clip in the studio's queue, from what it says of the running clip and history for the queued (None: some of it has none)
-    fn clips_ahead_s(&self, model: &str) -> Option<f64> {
+    /// What the studio says of a clip before it is sent (None: it does not answer): `reentered` when it is a clip already
+    /// there, else `gate`: free, or series / all with `on`, the clips it must wait for
+    pub(super) fn video_admission(&self, b: &Value) -> Option<Value> {
+        if !super::listening(self.o.ports.video) {
+            return None;
+        }
+        let v = call_for(&self.target("video"), "POST", "/rpc/admission", Some(&stripped(b)), 4).ok()?;
+        Some(v.get("result").cloned().unwrap_or(v))
+    }
+
+    /// The wait for a card for a clip: from what the studio says of the running clips, and history for the queued (None: some
+    /// of it has none). A free card with nothing ahead for it: none. `gate`: a clip that carries on from a running one waits
+    /// for that one too.
+    fn clips_ahead_s(&self, model: &str, gate: Option<&Value>) -> Option<f64> {
         if !super::listening(self.o.ports.video) {
             return Some(0.0);
         }
         let v = call_for(&self.target("video"), "POST", "/rpc/status", Some(&json!({})), 4).ok()?;
         let st = v.get("result").cloned().unwrap_or(v);
-        let mut sum = if st["idle"] == true { 0.0 } else { st["eta"].as_f64()?.max(0.0) };
+        let rows = clip_rows(&st);
+        let remaining = rows.iter().map(|c| c["eta"].as_f64().map(|e| e.max(0.0))).collect::<Option<Vec<f64>>>()?;
+        let mut queued = Vec::new();
         for it in st["queue_items"].as_array().into_iter().flatten().filter(|i| i["held"] != true) {
-            sum += self.history.eta("video.generate", model, it, true, Some(0.0))["run_s"].as_f64()?;
+            queued.push(self.history.eta("video.generate", model, it, true, Some(0.0))["run_s"].as_f64()?);
         }
-        Some(sum)
+        let wait = clip_wait(&remaining, slots_free(&st), &queued);
+        let chained = gate.filter(|g| g["gate"] == "series" || g["gate"] == "all").map_or(0.0, |g| {
+            rows.iter().filter(|c| g["on"].as_array().is_some_and(|on| on.iter().any(|n| *n == c["label"] || *n == c["name"]))).filter_map(|c| c["eta"].as_f64()).fold(0.0, f64::max)
+        });
+        Some(wait.max(chained))
+    }
+
+    /// A worker holding `model` on a card free now, with nothing queued for it
+    fn clip_hot(&self, model: &str) -> bool {
+        let Ok(v) = call_for(&self.target("video"), "POST", "/rpc/status", Some(&json!({})), 4) else { return false };
+        let st = v.get("result").cloned().unwrap_or(v);
+        let queued = st["queue_items"].as_array().is_some_and(|a| a.iter().any(|i| i["held"] != true));
+        self.video_daemon().is_some_and(|d| d.0.iter().any(|e| e == model)) && slots_free(&st) > 0 && !queued
     }
 
     /// The ETA of a request of `method` with body `b`, now: `exclude` is its own job when it is queued (only what is
@@ -308,8 +368,9 @@ impl Home {
                 (hot, if hot { Some(0.0) } else { None })
             }
             _ => {
-                let hot = self.video_daemon().is_some_and(|d| d.0.contains(&model)) && self.video_idle();
-                (hot, if hot { Some(0.0) } else { self.clips_ahead_s(&model) })
+                let gate = self.video_admission(b).filter(|g| g["gate"] == "series" || g["gate"] == "all");
+                let hot = gate.is_none() && self.clip_hot(&model);
+                (hot, if hot { Some(0.0) } else { self.clips_ahead_s(&model, gate.as_ref()) })
             }
         };
         self.history.eta(method, &model, b, hot, ahead)
@@ -324,10 +385,20 @@ impl Home {
         if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty()) {
             params["model"] = json!(m);
         }
-        let eta = self.eta_for(method, &params, None);
+        let mut eta = self.eta_for(method, &params, None);
         let max = b["max_willing_to_wait_s"].as_f64();
-        let would = eta::would_accept(&eta, max);
-        Ok(json!({"method": method, "eta": eta, "max_willing_to_wait_s": max, "would_accept": would}))
+        // a clip already here: its re-submit has no wait to weigh (video_admit lets it through)
+        let again = method == "video.generate" && self.video_admission(&params).is_some_and(|a| a["reentered"] == true);
+        if again {
+            eta["wait_s"] = json!(0.0);
+            eta["total_s"] = eta["run_s"].clone();
+        }
+        let would = again || eta::would_accept(&eta, max);
+        let mut r = json!({"method": method, "eta": eta, "max_willing_to_wait_s": max, "would_accept": would});
+        if again {
+            r["reentered"] = json!(true);
+        }
+        Ok(r)
     }
 
     /// Admission of a request with its limit: wait_too_long when its wait is known and longer, nothing queued or stopped
@@ -380,7 +451,12 @@ impl Home {
     /// the clip it watches)
     pub(super) fn video_admit(&self, b: &Value) -> Result<Value, Fail> {
         check_fields(b)?;
-        self.admit("video.generate", b)?;
+        // a re-submit of a clip already here (running, queued, made) is that clip, whatever its wait: asked before the limit
+        // (a platform restarted mid-chain was told "would start in 391 s" for its own running pass and moved the chain)
+        let again = limit_of(b).is_some() && self.video_admission(b).is_some_and(|a| a["reentered"] == true);
+        if !again {
+            self.admit("video.generate", b)?;
+        }
         let mut q = stripped(b);
         if OWN_FIELDS.iter().any(|k| !b[*k].is_null()) && s(&q, "label").is_empty() {
             q["label"] = json!(format!("clip-{}", now() as u64));
@@ -391,8 +467,16 @@ impl Home {
     /// A clip the studio took: its eta on the answer, the door watching it when it promised anything
     pub(super) fn video_taken(&self, b: &Value, sent: &Value, r: &mut Value) {
         r["eta"] = self.eta_for("video.generate", sent, None);
-        let label = Some(s(sent, "label")).filter(|l| !l.is_empty()).or_else(|| r["label"].as_str().map(str::to_string)).unwrap_or_default();
-        let (rsvp_s, limit) = (b["rsvp_s"].as_f64().filter(|x| *x >= 0.0), limit_of(b));
+        let again = r["reentered"] == true;
+        // a clip re-entered: named by what it is called there (the door may have made up a label for the request), and past
+        // any limit: the limit is on starting a clip, and this one was taken
+        let there = r["label"].as_str().or(r["job"]["label"].as_str()).filter(|l| !l.is_empty()).map(str::to_string);
+        let label = if again { there.unwrap_or_default() } else { Some(s(sent, "label")).filter(|l| !l.is_empty()).or(there).unwrap_or_default() };
+        if again && r["queued"] != true {
+            r["eta"]["wait_s"] = json!(0.0);
+            r["eta"]["total_s"] = r["eta"]["run_s"].clone();
+        }
+        let (rsvp_s, limit) = (b["rsvp_s"].as_f64().filter(|x| *x >= 0.0), limit_of(b).filter(|_| !again));
         if let Some(secs) = rsvp_s {
             r["rsvp_granted_s"] = json!(hold::granted(secs, self.max_rsvp()));
         }
@@ -422,6 +506,9 @@ impl Home {
                 r["eta_remaining_s"] = r["eta"].clone();
                 let e = run_of(&r["job"]);
                 r["eta_estimate"] = e;
+                for c in r["running_clips"].as_array_mut().into_iter().flatten() {
+                    c["eta_remaining_s"] = c["eta"].clone();
+                }
             }
             "queue.list" => {
                 for it in r["queue"].as_array_mut().into_iter().flatten() {
@@ -442,12 +529,13 @@ impl Home {
         let Ok(v) = call_for(&self.target("video"), "POST", "/rpc/status", Some(&json!({})), 4) else { return };
         let st = v.get("result").cloned().unwrap_or(v);
         let queued = |l: &str| st["queue_items"].as_array().into_iter().flatten().any(|i| i["label"] == l);
-        let running = |l: &str| st["idle"] != true && st["job"]["label"] == l;
+        let rows = clip_rows(&st);
+        let row = |l: &str| rows.iter().find(|c| c["label"] == l);
         let mut list = std::mem::take(&mut *self.video_watch.lock().unwrap());
         list.retain_mut(|w| {
-            let (q, r) = (queued(&w.label), running(&w.label));
+            let (q, r) = (queued(&w.label), row(&w.label).is_some());
             if let Some(limit) = w.limit {
-                let waiting = q || (r && !st["waiting_for"].is_null());
+                let waiting = q || row(&w.label).is_some_and(|c| !c["waiting_for"].is_null());
                 let waited = now() - w.t0;
                 if waiting && waited > limit {
                     let call = if q { "/rpc/queue.remove" } else { "/rpc/cancel" };
@@ -596,6 +684,16 @@ impl Home {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_clip_waits_for_the_first_card_to_come_free_behind_the_queue() {
+        use super::clip_wait;
+        assert_eq!(clip_wait(&[1000.0], 1, &[]), 0.0, "a free card");
+        assert_eq!(clip_wait(&[1000.0, 400.0], 0, &[]), 400.0, "the first to end");
+        assert_eq!(clip_wait(&[1000.0], 1, &[100.0]), 100.0, "the queued one takes the free card");
+        assert_eq!(clip_wait(&[1000.0, 400.0], 0, &[100.0, 100.0]), 600.0, "both queued go on the card that frees first");
+        assert_eq!(clip_wait(&[], 0, &[30.0, 30.0]), 60.0, "a studio that says nothing: one card");
+    }
+
     use super::*;
 
     #[test]

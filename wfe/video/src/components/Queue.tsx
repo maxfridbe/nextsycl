@@ -15,7 +15,7 @@ import type { QueueItem } from "../types.js";
 import { clipNumber, fmtMS, fmtT } from "../util.js";
 import { Panel } from "./Panel.js";
 import { Spinner } from "./Spinner.js";
-import { cancelRunning, isCancelling } from "./Progress.js";
+import { cancelRunning, isCancelling, runningClips } from "./Progress.js";
 
 /** A queue row carries its position so the table can number it and remove exactly it. */
 type Row = QueueItem & { index: number };
@@ -74,41 +74,40 @@ async function act(p: Promise<unknown>): Promise<void> {
   await refresh();
 }
 
-function runningRow() {
-  const s = state.status;
-  if (!s || s.idle || !s.job) return null;
-  const j = s.job;
-  const pct = s.pct ?? 0;
-  return (
-    <tr class="running">
-      <td class="num"><span class="i" props={{ innerHTML: "&#xf110;" }} /></td>
-      <td class="lab">
-        {j.label || <span class="hint">(no label)</span>}
-        <div class="minibar"><div class="fill" style={{ width: `${pct}%` }} /></div>
-        <span class="hint">
-          {`${s.stage ?? "running"} · ${pct}%${s.eta ? ` · ${fmtT(s.eta)} left` : ""}`}
-        </span>
-      </td>
-      <td class="num">{j.seconds}</td>
-      <td class="num">{j.steps}</td>
-      <td class="hint">{`${j.width}x${j.height}`}</td>
-      <td class="hint">{j.engine ?? ""}</td>
-      <td class="acts">
-        {isCancelling()
-          ? <span class="hint">cancelling…</span>
-          : rowBtn("cancel", "stop this clip (at its next step)", () => void cancelRunning(), "danger")}
-      </td>
-    </tr>
-  );
+function runningRows() {
+  return runningClips().map((c) => {
+    const pct = c.pct ?? 0;
+    return (
+      <tr class="running">
+        <td class="num"><span class="i" props={{ innerHTML: "&#xf110;" }} /></td>
+        <td class="lab">
+          {c.label || <span class="hint">(no label)</span>}
+          <div class="minibar"><div class="fill" style={{ width: `${pct}%` }} /></div>
+          <span class="hint">
+            {`${c.gpu != null ? `GPU ${c.gpu} · ` : ""}${c.stage ?? "running"} · ${pct}%${c.eta ? ` · ${fmtT(c.eta)} left` : ""}`}
+          </span>
+        </td>
+        <td class="num">{c.seconds}</td>
+        <td class="num">{c.steps}</td>
+        <td class="hint">{`${c.width}x${c.height}`}</td>
+        <td class="hint">{c.engine ?? ""}</td>
+        <td class="acts">
+          {isCancelling(c.name)
+            ? <span class="hint">cancelling…</span>
+            : rowBtn("cancel", "stop this clip (at its next step)", () => void cancelRunning(c.name), "danger")}
+        </td>
+      </tr>
+    );
+  });
 }
 
 export function Queue() {
   const s = state.status;
   const items = s?.queue_items ?? [];
-  const running = runningRow();
+  const running = runningRows();
   // held and empty still shows: its "resume all" is the way out of the hold the queue puts itself in after failures
   if (!s) return <Spinner label="Loading the queue…" />;
-  if (!items.length && !running && !s?.paused) return <div />;
+  if (!items.length && !running.length && !s?.paused) return <div />;
   const held = items.filter((x) => x.held).length;
   const total = items.reduce((a, x) => a + x.seconds, 0);
   const { order, rows } = group(items);

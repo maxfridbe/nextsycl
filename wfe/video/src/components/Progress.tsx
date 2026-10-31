@@ -1,4 +1,4 @@
-/** What the GPU is doing on the one clip it is rendering right now: stage, bar, ETA.
+/** What the cards are doing, one row a clip being made (one clip per card): stage, bar, ETA, its own cancel.
  *
  *  This sits directly above the project bar in the timeline panel, so the two read as a
  *  pair: this clip, then the whole film. Idle after a failure, it says why the last clip
@@ -8,23 +8,34 @@ import { jsx } from "../jsx.js";
 import { api, rpc } from "../api.js";
 import { navigate } from "../router.js";
 import { refresh, render, state } from "../state.js";
+import type { ClipRow } from "../types.js";
 import { clipNumber, fmtT } from "../util.js";
 
-/** The clip a cancel was asked for: its buttons read "cancelling…" until the engine stops it at its next step
+/** The clips a cancel was asked for: their buttons read "cancelling…" until the engine stops them at the next step
  *  (seconds, mid-step), so the click shows at once */
-let cancelling: string | null = null;
+const cancelling = new Set<string>();
 
-export function isCancelling(): boolean {
+/** The clips being made, one row each (a studio that says only one: that one) */
+export function runningClips(): ClipRow[] {
   const s = state.status;
-  return !!cancelling && !!s && !s.idle && s.job?.name === cancelling;
+  if (!s || s.idle) return [];
+  if (s.running_clips) return s.running_clips;
+  return s.job
+    ? [{ label: s.job.label, name: s.job.name, project: s.job.project, job: s.job, seconds: s.job.seconds, steps: s.job.steps,
+         width: s.job.width, height: s.job.height, engine: s.job.engine, stage: s.stage, pct: s.pct, eta: s.eta, elapsed: s.elapsed, error: s.error }]
+    : [];
 }
 
-/** Stop the running clip, then show the result now rather than at the next poll. */
-export async function cancelRunning(): Promise<void> {
-  cancelling = state.status?.job?.name ?? null;
+export function isCancelling(name?: string): boolean {
+  return !!name && cancelling.has(name) && runningClips().some((c) => c.name === name);
+}
+
+/** Stop this clip, then show the result now rather than at the next poll. */
+export async function cancelRunning(name?: string): Promise<void> {
+  if (name) cancelling.add(name);
   render();
   try {
-    await rpc("cancel", {});
+    await rpc("cancel", name ? { name } : {});
     state.error = null;
   } catch (e) {
     state.error = String(e);
@@ -34,15 +45,19 @@ export async function cancelRunning(): Promise<void> {
 
 function lastFailure() {
   const s = state.status;
-  const f = s?.failure;
-  if (!s || !s.idle || s.stage !== "failed" || (!f && !s.error)) return null;
+  // the last clip to end, if it failed: while another still runs, the top-level fields describe that one
+  const last = s?.ended_clips?.[0];
+  const f = last ? last.failure : s?.failure;
+  const err = last ? last.error : s?.error;
+  const job = last ? last.job : s?.job;
+  if (!s || (!f && !err) || (!last && (!s.idle || s.stage !== "failed"))) return null;
   // asked for: said plainly, not as a failure
   if (f?.code === "cancelled") {
-    return <div class="hint">{`Last clip cancelled${s.job?.label ? ` · ${s.job.label}` : ""}.`}</div>;
+    return <div class="hint">{`Last clip cancelled${job?.label ? ` · ${job.label}` : ""}.`}</div>;
   }
-  const message = f?.message ?? (s.error ?? "").split("\n")[0] ?? "";
-  const label = s.job?.label ? `${s.job.label} · ` : "";
-  const size = s.job?.width && s.job.height ? `${s.job.width}x${s.job.height}, ${s.job.seconds ?? "?"} s` : "";
+  const message = f?.message ?? (err ?? "").split("\n")[0] ?? "";
+  const label = job?.label ? `${job.label} · ` : "";
+  const size = job?.width && job.height ? `${job.width}x${job.height}, ${job.seconds ?? "?"} s` : "";
   return (
     <div class="lastfail">
       <div>
@@ -78,19 +93,29 @@ export function ClipProgress() {
       </div>
     );
   }
-  const pct = s.pct ?? 0;
-  const icon = s.error ? "&#xf071;" : s.done ? "&#xf00c;" : "&#xf110;";
-  const label = s.job?.label ?? "";
-  const project = s.job?.project ?? null;
+  return (
+    <div>
+      {runningClips().map(clipRow)}
+      {lastFailure()}
+    </div>
+  );
+}
+
+function clipRow(c: ClipRow) {
+  const pct = c.pct ?? 0;
+  const icon = c.error ? "&#xf071;" : c.done ? "&#xf00c;" : "&#xf110;";
+  const label = c.label ?? "";
+  const project = c.project ?? null;
   const n = clipNumber(label);
   const jump = project && n
     ? () => navigate({ tab: "jobs", project, clip: n })
     : null;
   return (
-    <div class="clipprog">
+    <div class="clipprog" key={c.name ?? label}>
       <div class="bar"><div class="fill" style={{ width: `${pct}%` }} /></div>
       <div class="stage">
         <span class="i" props={{ innerHTML: icon }} />{" "}
+        {c.gpu != null ? <span class="hint">{`GPU ${c.gpu} · `}</span> : null}
         {label
           ? <a
               class={{ cliplink: true, plain: !jump }}
@@ -98,18 +123,19 @@ export function ClipProgress() {
               on={jump ? { click: jump } : {}}
             >{label}</a>
           : null}
-        {label ? " · " : ""}{s.stage ?? ""}{" "}
+        {label ? " · " : ""}{c.stage ?? ""}{" "}
         <span class="hint">
-          {`${pct}%${s.eta ? ` · ${fmtT(s.eta)} left` : ""}${s.elapsed ? ` · ${fmtT(s.elapsed)} elapsed` : ""}`}
+          {`${pct}%${c.eta ? ` · ${fmtT(c.eta)} left` : ""}${c.elapsed ? ` · ${fmtT(c.elapsed)} elapsed` : ""}`}
         </span>
         <button
           type="button"
           class="tbtn"
-          attrs={{ disabled: isCancelling() }}
-          on={{ click: () => void cancelRunning() }}
-        >{isCancelling() ? "cancelling…" : "cancel"}</button>
+          attrs={{ disabled: isCancelling(c.name) }}
+          on={{ click: () => void cancelRunning(c.name) }}
+        >{isCancelling(c.name) ? "cancelling…" : "cancel"}</button>
       </div>
-      {s.error ? <pre class="err">{s.error}</pre> : null}
+      {c.waiting_for ? <div class="hint">{c.waiting_for}</div> : null}
+      {c.error ? <pre class="err">{c.error}</pre> : null}
     </div>
   );
 }

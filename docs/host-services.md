@@ -47,6 +47,29 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
       plus the model's spin-up from history, null when a part has none. `POST /rpc/system.eta {method, params, model,
       max_willing_to_wait_s}` is read-only and adds `would_accept`. Queued and running jobs carry `eta` and
       `eta_remaining_s`; `video.status` keeps its number `eta` and adds `eta_remaining_s` and `eta_estimate`.
+    - **Clips**: the studio makes one clip per usable card at once. `video.generate` (with `queue` absent or true) starts at
+      once on a free card, else it is queued (`queued: true`) and starts on whichever card frees first; a clip of a paused project or batch waits with them; only `queue: false`
+      answers `busy`. A client sends no `queue`, a `reentrant_id`, and follows `video.status {reentrant_id}`.
+      A usable card is served by the daemon, runs and waits for nothing, and no pin or hold has it (`GET /video/blocked`).
+      The studio reads that route itself every 3 s (`NS_VIDEO_DOOR`). Host memory: a further clip must leave 8 GiB of the door's
+      host figure (`host_free_mb` beside `blocked`, the warm cache not counted; no door: MemAvailable) with a worker counted as 15 GiB, those still loading too; the first
+      clip has no such check. `video/studio/slots.rs` decides, since a queued clip starts without passing the door.
+      **A clip that needs another's output runs after it, even with a card free**: one naming an anchor (`prev`, `first`, `chain`
+      with no `from`) waits for its own project's or label series' running clips, what is queued behind it in that series stays
+      behind it; one naming a running clip's files waits for that clip. Unrelated clips and other series pass it. `prev` is the
+      newest clip *of its project*; with nothing of its own, the newest made anywhere, and it waits for every running clip. A
+      predecessor that failed for good or was cancelled drops its queued dependents (`failure.code` `dependency_failed`, by
+      `video.status`) and refuses new ones (error `dependency_failed`) until it is made again: never an older clip in its place.
+      Anchors are files beside the clips and a worker keeps only weights, so a chain may move to whichever card is free.
+      `system.busy.video`: `slots` is
+      clips possible at once now, `accepts` that one more can start, `clips` each being made; the other fields describe the
+      first. `video.status`: top-level fields the first running clip, `running_clips` / `ended_clips` every clip, `slots_free`;
+      `label`, `name` or `reentrant_id` ask for one clip's own. `video.cancel` names one (with two running and none named:
+      `ambiguous`). Each clip's energy is its own card's (gpustat's per-card `energy_j`; older gpustat: the first card only).
+    - **Re-entry before the limit**: a `video.generate` naming a clip by `reentrant_id` (running, queued or made), or the same
+      prompt and seed with no other `reentrant_id` under the label of a clip *running or queued now*, is that clip (`reentered: true`) and is not
+      weighed against `max_willing_to_wait_s` (`system.eta` says `would_accept`, `reentered`). A finished or failed clip's label does
+      not count: a new clip may reuse it, and is new.
     - `max_willing_to_wait_s`: the limit on the time to start, replacing the default waits. A known wait over it answers
       `{"ok": false, "error": {"code": "wait_too_long", "retryable": true, "status": 503, "eta": {...},
       "max_willing_to_wait_s": N}}` at once, nothing queued or stopped. An unknown wait goes ahead and is withdrawn at
@@ -107,7 +130,7 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     `reentrant_id` on every generate (video's too) makes a submit idempotent. A kind makes as many jobs at once as
     it has servers; the rest wait in a queue as video's (`priority`, `held`, `project`, `batch`, `queue: false`;
     `<kind>.queue.list|move|pause|resume`), and `stage` / `waiting_for` say what a job waits for. `system.busy` says where work runs
-    (slots: two image and audio servers, the video daemon's cards) and each card's share; `system.version` lists the
+    (slots: two image and audio servers, the video daemon's cards; `video.slots`: clips possible at once now) and each card's share; `system.version` lists the
     features by name; `system.files.stat|delete` give a file's bytes and SHA-256 or remove it (a clip with every
     file of it). video.generate also takes `frames` (exactly 17k + 5), a `chain` object (context_frames, sound,
     still, color_reanchor) and answers frames, seconds and the keys it `ignored` (negative_prompt: H3 runs at cfg 1).

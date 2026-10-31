@@ -403,3 +403,21 @@ fn the_door_schedules_through_the_crate_and_the_crate_stands_alone() {
     assert!(root().join("crates/scheduler/tests/scenarios.rs").is_file());
     assert!(std::fs::read_to_string(root().join("crates/scheduler/CHANGELOG.md")).unwrap().contains("nextsycl.1"));
 }
+
+/// Directive 2026-10-31: the studio makes one clip per usable card, a re-entry is answered before a limit, and a chain's
+/// anchors are its own
+#[test]
+fn clips_run_per_card_and_a_re_entry_is_asked_before_the_limit() {
+    let read = |p: &str| std::fs::read_to_string(root().join(p)).unwrap();
+    let back = read("glue/serve/src/home/backplane.rs");
+    let admit = back.split("fn video_admit(").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    let (again, limit) = (admit.find("video_admission(").expect("the door asks about re-entry"), admit.find("self.admit(").expect("and weighs the limit"));
+    assert!(again < limit, "re-entry before the limit");
+    let studio = read("glue/serve/src/video/studio/mod.rs");
+    assert!(studio.contains("pub running: Vec<Job>") && !studio.contains("pub job: Option<Job>"), "no single current job");
+    let runner = read("glue/serve/src/video/studio/runner.rs");
+    assert!(runner.contains("slots::plan(") && runner.contains("project_of(&side[\"job\"]) == p"), "the queue goes through slots.rs, prev is the project's own");
+    let slots = read("glue/serve/src/video/studio/slots.rs");
+    assert!(slots.contains("WORKER_RAM_MB: u64 = 15 * 1024") && slots.contains("RAM_FLOOR_MB: u64 = 8 * 1024"), "the host memory rule");
+    assert!(read("docs/host-services.md").contains("Re-entry before the limit"));
+}

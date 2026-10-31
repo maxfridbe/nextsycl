@@ -302,6 +302,11 @@ pub fn engine_quant(id: &str) -> String {
 }
 
 impl Studio {
+    /// A file beside the clips, or of a clip being made (the request then waits for that clip: slots.rs)
+    fn here_or_coming(&self, f: &str) -> bool {
+        self.out.join(f).exists() || self.running_names.lock().unwrap().iter().any(|n| f.split('.').next() == Some(n.as_str()))
+    }
+
     /// A request -> a queue item, checked (the legacy `build_item`, plus the engine's new options).
     pub fn build_item(&self, p: &Value) -> Result<Value, RpcError> {
         let prompt = p.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -390,7 +395,7 @@ impl Studio {
             json!(ff)
         } else {
             let b = basename(ff);
-            if !self.out.join(&b).exists() {
+            if !self.here_or_coming(&b) {
                 return Err(RpcError::not_found(&format!("first_frame {b} not found")));
             }
             json!(b)
@@ -402,7 +407,7 @@ impl Studio {
                 return Err(RpcError::param(&format!("{k}: at most {max} ({} given)", list.len())));
             }
             for f in &list {
-                if !self.out.join(f).exists() {
+                if !self.here_or_coming(f) {
                     return Err(RpcError::not_found(&format!("{what} {f} not found in out/")));
                 }
             }
@@ -423,7 +428,7 @@ impl Studio {
         for k in ["control_video", "control_mask", "control_source"] {
             let v = p.get(k).and_then(|v| v.as_str()).map(basename).filter(|v| !v.is_empty());
             if let Some(f) = &v {
-                if !self.out.join(f).exists() {
+                if !self.here_or_coming(f) {
                     return Err(RpcError::not_found(&format!("{k} {f} not found in out/")));
                 }
             }

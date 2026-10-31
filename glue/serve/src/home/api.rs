@@ -41,6 +41,7 @@ const FEATURES: &[&str] = &[
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
+    "video.slots.cards", "video.running_clips", "video.status.clip", "video.cancel.name", "video.reentry.before_limit", "video.reentry.label",
     "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request", "video.soundtrack", "video.exposure_fix",
     "backplane", "system.busy.engines", "models.profile", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand",
 ];
@@ -435,7 +436,7 @@ impl Home {
                 return Some((200, json!({"ok": false, "error": e})));
             }
         }
-        // a clip's limit: declined here when its wait is known and too long; what the door keeps is not the studio's
+        // a clip's limit: declined here when its wait is known and too long - but not a clip already there; what the door keeps is not the studio's
         let admitted = if method == "generate" {
             match self.video_admit(b) {
                 Ok(x) => Some(x),
@@ -475,6 +476,13 @@ impl Home {
         for k in ["file", "preview"] {
             if let Some(f) = r[k].as_str().and_then(|f| f.strip_prefix("/out/")).map(str::to_string) {
                 r[k] = json!(url("files", &f));
+            }
+            for list in ["running_clips", "ended_clips"] {
+                for c in r.get_mut(list).and_then(Value::as_array_mut).into_iter().flatten() {
+                    if let Some(f) = c[k].as_str().and_then(|f| f.strip_prefix("/out/")).map(str::to_string) {
+                        c[k] = json!(url("files", &f));
+                    }
+                }
             }
         }
         for c in r.get_mut("clips").and_then(Value::as_array_mut).into_iter().flatten() {
@@ -521,24 +529,30 @@ impl Home {
             let st = call_for(&self.target("video"), "POST", "/rpc/status", Some(&json!({})), 10).ok().map(|v| v["result"].clone()).unwrap_or(Value::Null);
             let items = st["queue_items"].as_array().cloned().unwrap_or_default();
             let held = items.iter().filter(|i| i["held"] == true).count();
-            let running = !st.is_null() && st["idle"] != true;
+            let rows = super::backplane::clip_rows(&st);
+            let running = !rows.is_empty();
             let runnable = items.len() - held;
-            if running {
-                reasons.push(format!("clip {} {}", st["job"]["label"].as_str().unwrap_or(""), st["stage"].as_str().unwrap_or("")));
+            for c in &rows {
+                reasons.push(format!("clip {} {}", c["label"].as_str().unwrap_or(""), c["stage"].as_str().unwrap_or("")));
             }
             if runnable > 0 {
                 reasons.push(format!("{runnable} clip(s) queued"));
             }
-            // the studio's job as the engine reports it, else the card the daemon shows busy
+            // the studio's first clip as the engine reports it, else the card the daemon shows busy
             let gpu = Some(st["gpu"].clone()).filter(|g| running && !g.is_null())
                 .or_else(|| slots.iter().find(|x| x["kind"] == "video" && x["busy"] == true).map(|x| x["gpu"].clone())).unwrap_or(Value::Null);
             let on = |k: &str| if running { st[k].clone() } else { Value::Null };
+            let free = super::backplane::slots_free(&st);
+            let clips: Vec<Value> = rows.iter().map(|c| json!({"label": c["label"], "name": c["name"], "stage": c["stage"], "pct": c["pct"], "eta_s": c["eta"], "elapsed_s": c["elapsed"],
+                                                               "gpu": c["gpu"], "energy_wh": c["energy_wh"], "waiting_for": c["waiting_for"]})).collect();
+            // a studio that does not say (one before two clips at once): nothing running and nothing runnable
+            let accepts = !st.is_null() && st["accepts"].as_bool().unwrap_or(!running && runnable == 0);
             json!({"running": running, "label": if running { st["job"]["label"].clone() } else { Value::Null }, "name": if running { st["job"]["name"].clone() } else { Value::Null },
                    "stage": on("stage"), "pct": on("pct"), "eta_s": on("eta"), "elapsed_s": on("elapsed"), "gpu": gpu,
                    "energy_wh": if running { st["job"]["energy_wh"].clone() } else { Value::Null },
                    "queued": items.len(), "runnable": runnable, "held": held,
-                   "accepts": !st.is_null() && !running && runnable == 0, "reachable": !st.is_null(),
-                   "slots": 1, "cards": slots.iter().filter(|x| x["kind"] == "video").count()})
+                   "accepts": accepts, "reachable": !st.is_null(),
+                   "slots": rows.len() + free, "slots_why": st["slots_why"], "clips": clips, "cards": slots.iter().filter(|x| x["kind"] == "video").count()})
         } else {
             Value::Null
         };
