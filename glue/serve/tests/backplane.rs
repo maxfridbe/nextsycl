@@ -61,8 +61,17 @@ impl Store for Mem {
     }
 }
 
+/// A port no other box of this run has been given: asking the system for a free one and letting it go hands the same
+/// one to two boxes now and then, and a client then talks to another test's door
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let _ = NEXT.compare_exchange(0, 20000 + (std::process::id() % 5000) as u16, Ordering::Relaxed, Ordering::Relaxed);
+    loop {
+        let p = NEXT.fetch_add(1, Ordering::Relaxed);
+        if TcpListener::bind(("127.0.0.1", p)).is_ok() {
+            return p;
+        }
+    }
 }
 
 fn read_request(s: &mut TcpStream) -> Option<(String, String, Value)> {
@@ -259,8 +268,6 @@ case "$kind $cmd" in
 esac
 "#, d = dir.display())).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // (another test's fork may hold the file open for write a moment: running it then would fail, text file busy)
-    std::thread::sleep(Duration::from_millis(300));
     // what a restart finds is what the last box's ports held: nothing on these
     for e in std::fs::read_dir(&dir).unwrap().flatten() {
         if e.file_name().to_string_lossy().starts_with("up-") {
