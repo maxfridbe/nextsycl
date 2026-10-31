@@ -150,6 +150,12 @@ fn precopy() -> bool {
     *N.get_or_init(|| std::env::var("NS_MM31_PRECOPY").map_or(true, |v| v != "0"))
 }
 
+/// NS_MM31_CPU_EXPERTS=N: a token's experts in pinned memory multiplied by N host threads while the card runs the rest; 0: none
+fn cpu_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("NS_MM31_CPU_EXPERTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
 /// NS_MM31_AHEAD_READS=0: a guessed expert in the file waits for its layer; only those in pinned memory are copied ahead
 fn ahead_reads() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -696,6 +702,9 @@ struct Card {
     xdeps: Mutex<Vec<i64>>,
     /// the doorbell's word and the router's result (pinned), and the last value rung
     bell: HostBuf,
+    /// NS_MM31_CPU_EXPERTS: pinned, the layer's activations, then a ring of output rows
+    cpu_io: Option<HostBuf>,
+    cpu_at: AtomicUsize,
     ring_at: AtomicUsize,
     bell_seq: std::sync::atomic::AtomicU32,
     /// two hidden states: one token's layers take turns writing one and reading the other (no allocation a layer)
@@ -800,6 +809,8 @@ struct Counts {
     ahead_wanted: AtomicU64,
     /// experts moved into VRAM by recency (each demoting the least recent one to pinned memory)
     promoted: AtomicU64,
+    cpu_n: AtomicU64,
+    cpu_ns: AtomicU64,
     /// the host's time from the doorbell to the layer's VRAM experts queued (what the shared expert behind the router hides), and how many
     route_ns: AtomicU64,
     route_n: AtomicU64,
@@ -865,6 +876,7 @@ pub struct MiniMax<'g> {
     stage_ok: std::sync::atomic::AtomicBool,
     /// profile: one-token expert stages (gate, up, swiglu + quantize, down, scatter), seconds and bytes of weights read
     stage_t: Mutex<[f64; 6]>,
+    cpu_pool: Option<crate::cpu::Pool>,
     /// profile: a wide pass's expert products, seconds in the dequantization to half and in the GEMM
     wide_t: Mutex<(f64, f64)>,
     /// profile: a wide pass's experts by the rows each takes (at most 4, 8, 16, 32, more)
@@ -1364,7 +1376,7 @@ impl<'g> MiniMax<'g> {
                     Mutex::new(LayerCache { slots, of, clock: if profile.is_some() { row.len() as u64 + 1 } else { 0 } })
                 })
                 .collect();
-            cards.push(Card { gpu: gpu.clone(), arena_small, arena_big: Mutex::new(None), cur_arena, arena_bytes, extra: Mutex::new(None), layers: range, res, cache, stage, slot: slot_max, xfer, pfs: Mutex::new(PfState { free: (0..PF_SLOTS).collect(), map: HashMap::new() }), xdeps: Mutex::new(Vec::new()), bell: HostBuf::new(gpu, 4096 + 32 * 2048)?, ring_at: AtomicUsize::new(0), bell_seq: 0.into(), flip: [DevBuf::f32(gpu, 8 * g.n_embd as usize)?, DevBuf::f32(gpu, 8 * g.n_embd as usize)?], _vram: dev, _host: host, kept: (vk, hk) });
+            cards.push(Card { gpu: gpu.clone(), arena_small, arena_big: Mutex::new(None), cur_arena, arena_bytes, extra: Mutex::new(None), cpu_io: if cpu_threads() > 0 { Some(HostBuf::new(gpu, 33 * g.n_embd as usize * 4)?) } else { None }, cpu_at: AtomicUsize::new(0), layers: range, res, cache, stage, slot: slot_max, xfer, pfs: Mutex::new(PfState { free: (0..PF_SLOTS).collect(), map: HashMap::new() }), xdeps: Mutex::new(Vec::new()), bell: HostBuf::new(gpu, 4096 + 32 * 2048)?, ring_at: AtomicUsize::new(0), bell_seq: 0.into(), flip: [DevBuf::f32(gpu, 8 * g.n_embd as usize)?, DevBuf::f32(gpu, 8 * g.n_embd as usize)?], _vram: dev, _host: host, kept: (vk, hk) });
         }
 
         // the second drive: a copy of the experts the cards do not keep (a share of them), read beside the model's own file,
@@ -1672,6 +1684,7 @@ impl<'g> MiniMax<'g> {
             cur_wide: false.into(),
             stage_ok: (std::env::var("NS_PROFILE").is_ok_and(|v| v == "1")).into(),
             stage_t: Mutex::new([0.0; 6]),
+            cpu_pool: (cpu_threads() > 0 && crate::cpu::supported()).then(|| crate::cpu::Pool::new(cpu_threads())),
             wide_t: Mutex::new((0.0, 0.0)),
             wide_rows: Mutex::new([0; 5]),
             pf_tokens: Mutex::new((0, 0.0)),
@@ -1736,6 +1749,9 @@ impl<'g> MiniMax<'g> {
         let (a, b, d) = (c.vram.load(Relaxed), c.pinned.load(Relaxed), c.file.load(Relaxed));
         v.push(format!("[experts used: {a} from VRAM, {b} from pinned host memory, {d} read from the file ({:.1}% on the cards); {:.1} GiB read from the file in all; {} moved into VRAM by recency; the host waited {:.2} s for the routers' read-backs in one-token passes, {:.2} s for expert reads and {:.2} s for the layers' final syncs]",
                        100.0 * (a + b) as f64 / (a + b + d).max(1) as f64, self.reader.bytes.load(Relaxed) as f64 / GIB as f64, c.promoted.load(Relaxed), c.rb_ns.load(Relaxed) as f64 * 1e-9, c.join_ns.load(Relaxed) as f64 * 1e-9, c.end_ns.load(Relaxed) as f64 * 1e-9));
+        if c.cpu_n.load(Relaxed) > 0 {
+            v.push(format!("[experts on the host's {} threads: {}, {:.3} ms each]", cpu_threads(), c.cpu_n.load(Relaxed), c.cpu_ns.load(Relaxed) as f64 * 1e-6 / c.cpu_n.load(Relaxed) as f64));
+        }
         v.push(format!("[read ahead: {} experts guessed and read for the next layer, {} of the {} off-card experts it needed were among them]", c.ahead.load(Relaxed),
                        c.ahead_used.load(Relaxed), c.ahead_wanted.load(Relaxed)));
         if self.pf {
@@ -2387,6 +2403,12 @@ impl<'g> MiniMax<'g> {
         // one token, with the doorbell: the router writes to pinned host memory and rings; the shared expert is queued behind it, so the GPU works through the host's routing
         let bell_on = t == 1 && bell() && self.one_fns(t).is_some();
         let logits = if bell_on { cd.bell.device_view(64, ne * 4)? } else { a.f32(t * ne)? };
+        let cpu_here = bell_on && self.cpu_pool.is_some() && m.gate.ty == m.up.ty && crate::cpu::sb_bytes(m.gate.ty.code() as i32) > 0 && crate::cpu::sb_bytes(m.down.ty.code() as i32) > 0;
+        if cpu_here {
+            let (one, io) = (self.one_fns(t).unwrap(), cd.cpu_io.as_ref().unwrap().device_view(0, c * 4)?);
+            // SAFETY: x and the pinned buffer hold c floats; queued before the router, so it is there when the bell rings.
+            ffi::check(unsafe { (one.kcopy)(cd.gpu.raw(), io.ptr().cast::<u32>(), x.fp().cast::<u32>().cast_const(), c as i64) }, "kcopy")?;
+        }
         let f1 = self.one_fns(t).filter(|_| {
             // SAFETY: plain queries.
             unsafe { self.k.silo_moe.as_ref().is_some_and(|f| (f.supported)(m.router.ty.code() as i32, c as i64) != 0) }
@@ -2623,6 +2645,7 @@ impl<'g> MiniMax<'g> {
         }
         // the recency cache: every expert that has to come into VRAM lands directly in an empty VRAM place of the layer; the pinned
         // place it leaves is free after the copy. Without an empty place it runs from the ring and stays where it is.
+        let cpu_job: Vec<bool> = jobs.iter().map(|j| cpu_here && matches!(j, Job::Pinned(..))).collect();
         let mut land: Vec<Option<(usize, DevBuf, i64)>> = (0..njobs).map(|_| None).collect();
         let mut src_ready: Vec<i64> = vec![-1; njobs];
         cache.clock += 1;
@@ -2760,7 +2783,45 @@ impl<'g> MiniMax<'g> {
         let mut copy_t: Vec<i64> = Vec::with_capacity(njobs); // a job's copy ticket
         let mut joined = 0usize; // waves whose reads are joined
         let lane = copy_lane();
+        // a pinned place an earlier demotion wrote: the host reads it, so it must be done. The queue waits for it, and rings when it has
+        if cpu_job.iter().zip(&src_ready).any(|(c, r)| *c && *r >= 0) {
+            for (j, r) in src_ready.iter_mut().enumerate() {
+                if cpu_job[j] && *r >= 0 {
+                    ffi::await_ticket(cd.gpu.raw(), *r)?;
+                    *r = -1;
+                }
+            }
+            let f = self.one_fns(t).unwrap();
+            let seq = cd.bell_seq.fetch_add(1, Relaxed) + 1;
+            let flag = cd.bell.device_view(0, 64)?.ptr().cast::<u32>();
+            // SAFETY: as at the router's bell.
+            ffi::check(unsafe { (f.doorbell)(cd.gpu.raw(), flag, seq) }, "doorbell")?;
+            let af = unsafe { &*flag.cast::<std::sync::atomic::AtomicU32>() };
+            let t0 = Instant::now();
+            while af.load(std::sync::atomic::Ordering::Acquire) != seq {
+                std::hint::spin_loop();
+                if t0.elapsed().as_secs() >= 10 {
+                    cd.gpu.sync()?;
+                    break;
+                }
+            }
+            let mut cache = cd.cache[li].lock().unwrap();
+            for (ji, jb) in jobs.iter().enumerate() {
+                if let (true, Job::Pinned(ex, _)) = (cpu_job[ji], jb) {
+                    if let Some(p) = cache.of[*ex] {
+                        if !cache.slots[p].vram {
+                            cache.slots[p].ready = -1;
+                        }
+                    }
+                }
+            }
+        }
         let issue_copy = |jobs: &mut Vec<Job>, j: usize, tickets: &[i64], copy_t: &mut Vec<i64>, joined: &mut usize, inflight: &mut Option<Reads>, wait: &mut f64| -> Result<()> {
+            // no copy for a product on the host, unless the expert is moving into VRAM for its next use
+            if cpu_job[j] && land[j].is_none() {
+                copy_t.push(-1);
+                return Ok(());
+            }
             let src: DevBuf = match &mut jobs[j] {
                 Job::Pinned(_, b) => b.view(0, total)?,
                 Job::Pre(_, slot_i, hs) => {
@@ -2844,6 +2905,39 @@ impl<'g> MiniMax<'g> {
             while issued <= i {
                 issue_copy(&mut jobs, issued, &tickets, &mut copy_t, &mut joined, &mut inflight, &mut wait)?;
                 issued += 1;
+            }
+            if cpu_job[i] {
+                let Job::Pinned(ex, b) = &jobs[i] else { unreachable!() };
+                let t0 = Instant::now();
+                let (fe, one) = (m.gate.rows, self.one_fns(t).unwrap());
+                let (off_up, off_down, _) = m.layout();
+                let io = cd.cpu_io.as_ref().unwrap();
+                let xh = io.device_view(0, c * 4)?;
+                let at = cd.cpu_at.fetch_add(1, Relaxed) % 32;
+                let yb = io.device_view((1 + at) * c * 4, c * 4)?;
+                let mut hv = vec![0f32; fe];
+                let it = per[*ex][0];
+                // SAFETY: the activations are in the pinned buffer (the router has rung); the output slot is this job's until its copy below has run (32 jobs later at the soonest, read-backs between).
+                unsafe {
+                    let xs = std::slice::from_raw_parts(xh.ptr().cast::<f32>().cast_const(), c);
+                    let ys_h = std::slice::from_raw_parts_mut(yb.ptr().cast::<f32>(), c);
+                    crate::cpu::expert(self.cpu_pool.as_ref().unwrap(), m.gate.ty.code() as i32, m.down.ty.code() as i32, b.ptr().cast::<u8>().cast_const(), off_up, off_down, fe, c, xs, &mut hv, ys_h);
+                    for v in ys_h.iter_mut() {
+                        *v *= it.1;
+                    }
+                    ffi::check((one.kcopy)(cd.gpu.raw(), ys.fp().add(it.2 as usize * plane).cast::<u32>(), yb.ptr().cast::<u32>().cast_const(), c as i64), "kcopy")?;
+                }
+                self.counts.cpu_n.fetch_add(1, Relaxed);
+                self.counts.cpu_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+                tickets.push(ffi::mark(cd.gpu.raw())?);
+                while issued < njobs && issued <= i + LA {
+                    if issued > i + 1 && !matches!(jobs[issued], Job::Pinned(..)) {
+                        break;
+                    }
+                    issue_copy(&mut jobs, issued, &tickets, &mut copy_t, &mut joined, &mut inflight, &mut wait)?;
+                    issued += 1;
+                }
+                continue;
             }
             // the compute queue waits, on the device, for the copy
             ffi::await_ticket(cd.gpu.raw(), copy_t[i])?;
@@ -3022,6 +3116,83 @@ impl<'g> MiniMax<'g> {
         Ok(())
     }
 
+    /// NS_MM31_KBENCH=1: an expert in pinned memory on the host's cores against the silo's kernels on the same bytes and activations: time by thread count, and how far the output is
+    fn cpu_bench(&self, cd: &Card, l: usize, m: &Moe) -> Result<()> {
+        let (c, fe) = (self.g.n_embd as usize, m.gate.rows);
+        let (tg, td) = (m.gate.ty.code() as i32, m.down.ty.code() as i32);
+        if !crate::cpu::supported() || crate::cpu::sb_bytes(tg) == 0 || crate::cpu::sb_bytes(td) == 0 || m.gate.ty != m.up.ty {
+            return Ok(());
+        }
+        let cache = cd.cache[l - cd.layers.start].lock().unwrap();
+        let bases: Vec<usize> = cache.slots.iter().filter(|s| !s.vram && s.occ.is_some()).take(8).map(|s| s.buf.ptr() as usize).collect();
+        drop(cache);
+        let Some(&b0) = bases.first() else { return Ok(()) };
+        let (off_up, off_down, total) = m.layout();
+        let xv: Vec<f32> = (0..c).map(|i| ((i * 2654435761) % 1000) as f32 * 0.002 - 1.0).collect();
+        let mut h = vec![0f32; fe];
+        let mut y = vec![0f32; c];
+        for threads in [1usize, 4, 8, 12, 16] {
+            let pool = crate::cpu::Pool::new(threads);
+            let mut times = Vec::new();
+            for round in 0..3 {
+                // a different expert each time: the first touch of its bytes is what a token pays
+                for (i, b) in bases.iter().enumerate() {
+                    let t0 = Instant::now();
+                    crate::cpu::expert(&pool, tg, td, *b as *const u8, off_up, off_down, fe, c, &xv, &mut h, &mut y);
+                    if round > 0 || i > 0 {
+                        times.push(t0.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+            }
+            times.sort_by(|a, b| a.total_cmp(b));
+            eprintln!("[cpu l{l} {:?}/{:?} {:.1} MB: {threads} threads {:.3} ms median, {:.3} best]", m.gate.ty, m.down.ty, total as f64 / 1e6, times[times.len() / 2], times[0]);
+        }
+        let pool = crate::cpu::Pool::new(8);
+        crate::cpu::expert(&pool, tg, td, b0 as *const u8, off_up, off_down, fe, c, &xv, &mut h, &mut y);
+        // the same bytes through the kernels
+        let mf = self.k.silo_moe.as_ref().ok_or_else(|| e("no silo"))?;
+        let m0 = cd.ar().mark();
+        let x = cd.ar().f32(c)?;
+        let xb: Vec<u8> = xv.iter().flat_map(|v| v.to_le_bytes()).collect();
+        x.write(0, &xb)?;
+        let meta = cd.ar().bytes(20)?;
+        let mut mb: Vec<u8> = (b0 as u64).to_le_bytes().to_vec();
+        mb.extend(1f32.to_le_bytes());
+        mb.extend(0i32.to_le_bytes());
+        mb.extend(0i32.to_le_bytes());
+        meta.write(0, &mb)?;
+        let (gh, gy) = (cd.ar().f32(fe)?, cd.ar().f32(c)?);
+        let p = meta.ptr().cast::<u8>().cast_const();
+        // SAFETY: meta holds the one entry; h and y its sizes; b0 a whole expert.
+        unsafe {
+            ffi::check((mf.gu)(cd.gpu.raw(), tg, p.cast::<u64>(), off_up as i64, x.fp().cast_const(), p.add(16).cast::<i32>(), gh.fp(), 1, fe as i64, c as i64, 1.702, 7.0), "gu")?;
+            ffi::check((mf.down)(cd.gpu.raw(), td, p.cast::<u64>(), off_down as i64, gh.fp().cast_const(), p.add(8).cast::<f32>(), p.add(12).cast::<i32>(), p.add(16).cast::<i32>(), gy.fp(), c as i64, 1, c as i64, fe as i64), "down")?;
+        }
+        cd.gpu.sync()?;
+        let rd = |b: &DevBuf, n: usize| -> Result<Vec<f32>> {
+            let mut v = vec![0u8; n * 4];
+            b.read(0, &mut v)?;
+            Ok(v.chunks_exact(4).map(|q| f32::from_le_bytes([q[0], q[1], q[2], q[3]])).collect())
+        };
+        let (hg, yg) = (rd(&gh, fe)?, rd(&gy, c)?);
+        let cmp = |a: &[f32], b: &[f32]| {
+            let (mut ab, mut aa, mut bb, mut dd) = (0f64, 0f64, 0f64, 0f64);
+            for (p, q) in a.iter().zip(b) {
+                let (p, q) = (*p as f64, *q as f64);
+                ab += p * q;
+                aa += p * p;
+                bb += q * q;
+                dd += (p - q) * (p - q);
+            }
+            (ab / (aa * bb).sqrt(), (dd / bb).sqrt())
+        };
+        let (ch, eh) = cmp(&h, &hg);
+        let (cy, ey) = cmp(&y, &yg);
+        eprintln!("[cpu l{l} against the kernels: hidden cosine {ch:.8} rel err {eh:.2e}, output cosine {cy:.8} rel err {ey:.2e}]");
+        cd.ar().rewind(m0);
+        Ok(())
+    }
+
     /// NS_MM31_KBENCH=1: each decode kernel timed alone on real weights, each card (GB/s of weights read), printed at the first session
     fn kernel_bench(&self) -> Result<()> {
         let (c, used) = (self.g.n_embd as usize, 4usize);
@@ -3084,6 +3255,7 @@ impl<'g> MiniMax<'g> {
                 let kinds = format!("{:?}{:?}", m.gate.ty, m.down.ty);
                 if !seen.contains(&kinds) {
                     seen.push(kinds);
+                    self.cpu_bench(cd, l, m)?;
                     let cache = cd.cache[l - cd.layers.start].lock().unwrap();
                     let bases: Vec<u64> = cache.slots.iter().filter(|s| s.vram && s.occ.is_some()).take(used).map(|s| s.buf.ptr() as u64).collect();
                     drop(cache);

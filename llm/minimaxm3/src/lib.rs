@@ -4,7 +4,9 @@
 //! kernels are in `kernels/llm/minimaxm3/`; the dequantization, GEMMs and norms are the glm5next engine's generic
 //! kernels in the same library. docs/ports/minimax-m31.md has the notes.
 
+mod cpu;
 pub mod engine;
+mod grids;
 mod ffi;
 pub mod model;
 
