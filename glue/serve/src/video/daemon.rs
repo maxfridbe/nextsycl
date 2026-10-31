@@ -34,6 +34,7 @@
 //!   POST /engine/jobs/<id>/cancel
 //!   POST /engine/jobs/<id>/remove    forget a job that is not running
 //!   POST /engine/unload              {"gpu": N} or every GPU: give it back now (after the running job)
+//!   POST /engine/keep                {"gpu": N (or every GPU), "seconds": S}: its idle unload held off that long (the front door's pins and holds; 0 ends it)
 //!   POST /engine/shutdown            cancel the queue, finish or cancel the running jobs, unload, exit
 //! ```
 //!
@@ -81,6 +82,16 @@ pub struct Options {
     /// stopped. `None` (a daemon on its own): nobody to ask, the switcher is told as it always was.
     pub door: Option<String>,
     pub threads: usize,
+}
+
+/// Whether a worker idle this long goes: past the limit and not kept
+fn idle_over(idle: Duration, limit: Duration, keep_until: Option<Instant>) -> bool {
+    idle >= limit && keep_until.is_none_or(|k| k <= Instant::now())
+}
+
+/// A job that only loads its engine (the front door's pin)
+fn is_load(spec: &Value) -> bool {
+    spec["kind"] == "load"
 }
 
 /// The door's word on the chat model: held (answering or kept) unless it says otherwise; a door that does not answer
@@ -191,6 +202,8 @@ struct Slot {
     engine: String, // unloaded, starting..., waiting for the GPU..., loading, loaded, unloading
     running: Option<u64>,
     last_active: Instant,
+    /// its idle unload held off until then (POST /engine/keep)
+    keep_until: Option<Instant>,
     unload_requested: bool,
     info: Value,
     worker_pid: Option<u32>,
@@ -460,6 +473,10 @@ impl Daemon {
                 }
             }
         }
+        // a load alone (the front door's pin): its worker is up, there is nothing to run
+        if is_load(spec) {
+            return Ok(json!({"loaded": want}));
+        }
         let p = proc.as_mut().unwrap();
         writeln!(p.stdin, "{}", json!({"job": id, "spec": spec})).map_err(|e| format!("the engine process does not listen: {e}"))?;
         let _ = p.stdin.flush();
@@ -552,7 +569,7 @@ impl Daemon {
                     }
                     let idle = s.slots[k].last_active.elapsed();
                     if let Some(limit) = self.opts.idle {
-                        if proc.is_some() && idle >= limit {
+                        if proc.is_some() && idle_over(idle, limit, s.slots[k].keep_until) {
                             break Next::Unload;
                         }
                     }
@@ -716,6 +733,19 @@ impl Daemon {
                     }
                 }
             }
+            ("POST", ["keep"]) => {
+                let want = body.get("gpu").and_then(|g| g.as_u64()).map(|g| g as usize);
+                let until = Instant::now() + Duration::from_secs_f64(body.get("seconds").and_then(|x| x.as_f64()).unwrap_or(0.0).clamp(0.0, 86400.0));
+                let hit: Vec<usize> = s.slots.iter_mut().filter(|sl| want.is_none_or(|g| g == sl.gpu)).map(|sl| {
+                    sl.keep_until = Some(until);
+                    sl.gpu
+                }).collect();
+                if hit.is_empty() {
+                    (400, json!({"error": "no such GPU served"}))
+                } else {
+                    (200, json!({"kept": hit}))
+                }
+            }
             ("POST", ["unload"]) => {
                 let want = body.get("gpu").and_then(|g| g.as_u64()).map(|g| g as usize);
                 let mut hit = Vec::new();
@@ -802,6 +832,7 @@ pub fn serve(opts: Options) -> Result<()> {
             engine: "unloaded".into(),
             running: None,
             last_active: Instant::now(),
+            keep_until: None,
             unload_requested: false,
             info: Value::Null,
             worker_pid: None,

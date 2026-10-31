@@ -374,6 +374,46 @@ pub struct SystemLoadReq {
     pub rest: serde_json::Map<String, serde_json::Value>,
 }
 
+/// What system.pin takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct SystemPinReq {
+    /// the model's registry id (system.models)
+    pub model: String,
+    /// answer when it has loaded (the default; a model that cannot load is not left pinned). false: at once, the pin stands and the load is tried until it holds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<bool>,
+    /// what else the caller sent: passed on as it came
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
+/// What system.unpin takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct SystemUnpinReq {
+    /// the model's registry id (system.models)
+    pub model: String,
+    /// what else the caller sent: passed on as it came
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
+/// What system.eta takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct SystemEtaReq {
+    /// the method it would call (one that runs a model: image.generate, llm.chat, video.generate ...)
+    pub method: String,
+    /// the longest it would wait to start: the answer's would_accept
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
+    /// what else the caller sent, `params` among them: the request's own body (its model, size, steps ...), which shapes the estimate
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
 /// What system.unload takes.
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
@@ -487,6 +527,14 @@ pub struct SystemMoveCancelReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct LlmChatReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// keep the model loaded this long after the answer: picture, sound and video work does not stop it for room meanwhile (as /v1/chat/completions' X-Keep-Up-S header, which Open WebUI sends: 300). Absent: nothing kept - once idle the model may be stopped for other work
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0, max = 86400)]
@@ -540,6 +588,14 @@ pub struct LlmDescribePromptGuideMdReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct ImageGenerateReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// a group inside the project
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 60)]
@@ -620,6 +676,14 @@ pub struct ImageGenerateReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct ImageEditReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// a group inside the project
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 60)]
@@ -690,6 +754,14 @@ pub struct ImageEditReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct ImageUpscaleReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// a group inside the project
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 60)]
@@ -752,6 +824,14 @@ pub struct ImageUpscaleReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct ImageVectorizeReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// a group inside the project
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 60)]
@@ -820,6 +900,14 @@ pub struct ImageVectorizeReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct VideoUpscaleReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// a group inside the project
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 60)]
@@ -889,6 +977,14 @@ pub struct VideoUpscaleReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct ImageOcrReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// find blocks set side by side (a gutter between) and read each on its own (default true)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub columns: Option<bool>,
@@ -1108,6 +1204,14 @@ pub struct ImageDescribePromptGuideMdReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct AudioGenerateReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// acestep-1.5, a task on a recording: the recording (WAV, MP3, FLAC, Ogg, M4A as base64 or a data: URL, or upload:<name> from audio.upload); the song is as long as it (repaint: to repaint_end)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
@@ -1207,6 +1311,14 @@ pub struct AudioGenerateReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct AudioSpeakReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// a group inside the project
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 60)]
@@ -1289,6 +1401,14 @@ pub struct AudioSpeakReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct AudioTranscribeReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// the recording: WAV, MP3, FLAC, Ogg or M4A as base64, a data: URL, or upload:<name> (audio.upload); any rate, mixed to mono
     pub audio: String,
     /// a group inside the project
@@ -1390,6 +1510,14 @@ pub struct AudioVoicesAddReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct AudioVoicesDesignReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// the voice: age, gender, timbre, pace, emotion, accent
     pub instructions: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1419,6 +1547,14 @@ pub struct AudioVoicesDesignReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct AudioVoicesEnrollReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// this card only (default: the model's cards, the first with room)
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
     pub gpu: Option<i64>,
@@ -1641,6 +1777,14 @@ pub struct AudioDescribePromptGuideMdReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct Model3dGenerateReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// a group inside the project
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 60)]
@@ -1725,6 +1869,14 @@ pub struct Model3dGenerateReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct Model3dRigReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// a group inside the project
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 60)]
@@ -1989,6 +2141,14 @@ pub struct Model3dDescribePromptGuideMdReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct VideoGenerateReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// a group inside the project, held or cleared together
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 60)]
@@ -2501,6 +2661,24 @@ fn system_load(h: &Arc<Home>, req: SystemLoadReq) -> Answer {
 #[rpc(name = "system.unload", tags = "system", example = r#"{"model": "minimax-music3"}"#)]
 fn system_unload(h: &Arc<Home>, req: SystemUnloadReq) -> Answer {
     h.legacy("system.unload", req)
+}
+
+/// Pin a model: loaded now, never stopped for room, kept in the registry and loaded again after a restart
+#[rpc(name = "system.pin", tags = "system", example = r#"{"model": "qwen-image-2.1-q8"}"#)]
+fn system_pin(h: &Arc<Home>, req: SystemPinReq) -> Answer {
+    h.legacy("system.pin", req)
+}
+
+/// Unpin a model: it may be stopped for room again and unloads when idle
+#[rpc(name = "system.unpin", tags = "system", example = r#"{"model": "qwen-image-2.1-q8"}"#)]
+fn system_unpin(h: &Arc<Home>, req: SystemUnpinReq) -> Answer {
+    h.legacy("system.unpin", req)
+}
+
+/// How long a request would wait and run, from the model's history and what is ahead of it, and whether a limit would accept it; loads nothing, queues nothing
+#[rpc(name = "system.eta", tags = "system", example = r#"{"max_willing_to_wait_s": 60, "method": "image.generate", "params": {"model": "qwen-image-2.1-q8", "size": "1024x1024"}}"#)]
+fn system_eta(h: &Arc<Home>, req: SystemEtaReq) -> Answer {
+    h.legacy("system.eta", req)
 }
 
 /// The settings file (nextsycl.conf): its text, every setting the program reads (value, default, what reads it), the file's others
@@ -3028,7 +3206,7 @@ fn video_describe_prompt_guide_md(h: &Arc<Home>, req: VideoDescribePromptGuideMd
 rpcgen::rpc_methods![sync Arc<Home>, RpcFail;
     system_state, system_busy, system_ping, system_version, system_files_stat, system_files_delete,
     system_models, system_models_pull, system_models_pulls, system_models_pull_cancel, system_cards, system_enable,
-    system_gpus, system_disable, system_load, system_unload, system_config, system_config_set,
+    system_gpus, system_disable, system_load, system_unload, system_pin, system_unpin, system_eta, system_config, system_config_set,
     system_restart, system_maintenance, system_drives, system_drive_measure, system_move, system_move_cancel,
     llm_chat, llm_requests, llm_models, llm_describe_prompt_guide_md, image_generate, image_edit,
     image_upscale, image_vectorize, video_upscale, image_ocr, image_info, image_status,

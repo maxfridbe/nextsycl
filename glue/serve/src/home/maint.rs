@@ -17,7 +17,7 @@ type Fail = (u16, String);
 /// The methods that start work or load a model (refused in maintenance); the rest - state, listings, status,
 /// cancels, guides, uploads, unloading - answer as always
 pub(super) fn starts_work(method: &str) -> bool {
-    matches!(method, "system.enable" | "system.load" | "llm.chat" | "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak"
+    matches!(method, "system.enable" | "system.load" | "system.pin" | "llm.chat" | "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak"
                      | "audio.transcribe" | "audio.voices.design" | "audio.voices.enroll" | "video.generate" | "model3d.generate" | "model3d.rig"
                      | "image.upscale" | "video.upscale" | "image.vectorize")
 }
@@ -161,7 +161,7 @@ impl Home {
         for id in ids.clone() {
             let me = self.clone();
             std::thread::spawn(move || {
-                if let Err((_, e)) = me.unload(&id) {
+                if let Err((_, e)) = me.unload_now(&id) {
                     eprintln!("maintenance: {id} not unloaded: {e}");
                 }
             });

@@ -16,7 +16,9 @@
 //! keeps nothing: once it is answered, the model may be preempted.
 //!
 //! With `idle`, the loaded model is unloaded (the studio's llm.mode "none") once nothing has asked for it that long
-//! and it is not answering; the next request loads it again.
+//! and it is not answering; the next request loads it again. A model pinned or held stays (the registry's `pinned`,
+//! the front door's holds in `holds`, this switcher's own keeps), and a pinned or reserved one is not swapped out
+//! for another: that request gets 503 no_room.
 //!
 //! In maintenance (crate::maintenance: the front door's notice beside the registry), chat requests are answered with
 //! the notice (503, Retry-After) and no model is loaded; the list stays as it is.
@@ -41,6 +43,8 @@ pub struct Model {
     pub title: String,
     pub tools: bool,
     pub tasks: bool,
+    /// never unloaded or swapped out (system.pin)
+    pub pinned: bool,
 }
 
 /// The registry's enabled chat models, read on every request (an added or disabled model shows at once)
@@ -65,6 +69,8 @@ pub struct Switch {
     pub maintenance: Option<std::path::PathBuf>,
     /// the GPU run lock (crate::gpulock): while a run holds it no model is loaded or swapped in
     pub gpu_lock: Option<std::path::PathBuf>,
+    /// the front door's holds (crate::hold), read before a swap or an idle unload
+    pub holds: Option<std::path::PathBuf>,
     swap: Mutex<()>,
     last_use: Mutex<HashMap<String, Instant>>,
     /// model id -> kept until (X-Keep-Up-S)
@@ -92,7 +98,7 @@ impl Switch {
     pub fn new(models: Models, aliases: HashMap<String, String>, upstream: Target, studio_url: &str, wait: Duration, in_use: Duration)
                -> Result<Switch, String> {
         let (host, path) = http::split_url(studio_url)?;
-        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, images: None, idle: None, maintenance: None, gpu_lock: None, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()), keep: Mutex::new(HashMap::new()) })
+        Ok(Switch { models, aliases, upstream, studio: (Target::Tcp(host), path), wait, in_use, images: None, idle: None, maintenance: None, gpu_lock: None, holds: None, swap: Mutex::new(()), last_use: Mutex::new(HashMap::new()), keep: Mutex::new(HashMap::new()) })
     }
 
     pub fn run(self: Arc<Self>, addr: &str) -> Result<(), String> {
@@ -117,7 +123,7 @@ impl Switch {
             let models = (self.models)();
             let Some(on) = self.loaded().and_then(|c| self.served(&c, &models)) else { continue };
             let since = *self.last_use.lock().unwrap().entry(on.clone()).or_insert_with(Instant::now);
-            if since.elapsed() < idle || self.busy() {
+            if since.elapsed() < idle || self.busy() || self.stays(&on, &models) {
                 continue;
             }
             let Ok(_g) = self.swap.try_lock() else { continue };
@@ -129,6 +135,24 @@ impl Switch {
                 Err(e) => eprintln!("  the studio's llm.mode: {e}"),
             }
         }
+    }
+
+    /// Whether the idle timer leaves the model up: pinned, held by the door, or kept here
+    fn stays(&self, id: &str, models: &[Model]) -> bool {
+        let kept = self.keep.lock().unwrap().get(id).is_some_and(|until| *until > Instant::now());
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        let held = self.holds.as_deref().is_some_and(|f| crate::hold::read(f).get(id).is_some_and(|h| h.left(t) > 0.0));
+        kept || held || models.iter().any(|m| m.id == id && m.pinned)
+    }
+
+    /// Why `id`, loaded, gives no way to another chat model: pinned or reserved (a keep yields, as it always has)
+    fn no_swap(&self, id: &str, models: &[Model]) -> Option<String> {
+        if models.iter().any(|m| m.id == id && m.pinned) {
+            return Some(format!("pinned: {id} (unpin to free the room)"));
+        }
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        let left = self.holds.as_deref().and_then(|f| crate::hold::read(f).get(id).map(|h| h.reserved(t))).unwrap_or(0.0);
+        (left > 0.0).then(|| format!("held by rsvp_s: {id} ({} s more)", left.ceil() as u64))
     }
 
     /// The studio's llm.mode: its state, or (with a mode) a swap to it
@@ -173,6 +197,9 @@ impl Switch {
         let other = cur.as_deref().and_then(|c| self.served(c, &models));
         if other.as_deref() == Some(want.id.as_str()) {
             return None;
+        }
+        if let Some(why) = other.as_deref().and_then(|o| self.no_swap(o, &models)) {
+            return Some((503, json!({"error": {"message": format!("the chat server is {why}; {} loads once it is free", want.title), "type": "no_room", "code": "no_room"}})));
         }
         if let Some(c) = &cur {
             let recent = other.as_ref().is_some_and(|o| self.last_use.lock().unwrap().get(o).is_some_and(|t| t.elapsed() < self.in_use));
@@ -313,6 +340,38 @@ impl Switch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sw(holds: Option<std::path::PathBuf>) -> Switch {
+        let mut s = Switch::new(Box::new(Vec::new), HashMap::new(), Target::Tcp("127.0.0.1:1".into()), "http://127.0.0.1:1/rpc/llm.mode",
+                                Duration::from_secs(1), Duration::from_secs(1)).unwrap();
+        s.holds = holds;
+        s
+    }
+
+    fn model(id: &str, pinned: bool) -> Model {
+        Model { id: id.into(), title: id.into(), tools: true, tasks: true, pinned }
+    }
+
+    #[test]
+    fn a_pinned_or_reserved_model_stays_and_a_keep_only_stays_from_idle() {
+        let dir = std::env::temp_dir().join(format!("nextsycl-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = crate::hold::file_beside(&dir.join("models.json"));
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+        let mut h = crate::hold::Holds::new();
+        crate::hold::grant_rsvp(&mut h, "reserved", 600.0, 86400, t);
+        crate::hold::grant_keep(&mut h, "kept", 600, 86400, t);
+        crate::hold::write(&f, &h).unwrap();
+        let s = sw(Some(f));
+        let m = vec![model("pinned", true), model("plain", false), model("reserved", false), model("kept", false)];
+        assert!(s.no_swap("pinned", &m).unwrap().starts_with("pinned: pinned (unpin"));
+        assert!(s.no_swap("reserved", &m).unwrap().starts_with("held by rsvp_s: reserved ("));
+        assert!(s.no_swap("kept", &m).is_none(), "another chat model may still take a kept one");
+        assert!(s.no_swap("plain", &m).is_none());
+        assert!(s.stays("pinned", &m) && s.stays("reserved", &m) && s.stays("kept", &m), "the idle timer leaves all three");
+        assert!(!s.stays("plain", &m));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn the_keep_header_says_how_long() {

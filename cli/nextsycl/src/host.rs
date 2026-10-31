@@ -31,7 +31,7 @@ pub fn switch(args: &[String]) -> Result<(), String> {
         // the chat models (entries of other kinds - image, video, audio, lora - are not chat models)
         all.iter().filter(|m| m["enabled"] != false && models::kind_of(m) == "llm").filter_map(|m| {
             let id = m["id"].as_str()?.to_string();
-            Some(Model { title: m["title"].as_str().unwrap_or(&id).to_string(), tools: m["tools"] != false, tasks: m["tasks"] != false, id })
+            Some(Model { title: m["title"].as_str().unwrap_or(&id).to_string(), tools: m["tools"] != false, tasks: m["tasks"] != false, pinned: m["pinned"] == true, id })
         }).collect()
     });
     let mut aliases = HashMap::new();
@@ -49,6 +49,8 @@ pub fn switch(args: &[String]) -> Result<(), String> {
     sw.maintenance = Some(nextsycl_serve::maintenance::file_beside(&models::registry(&Config::load())));
     // the GPU run lock (NS_GPU_LOCK): no chat model swapped in while a run holds it
     sw.gpu_lock = nextsycl_serve::gpulock::path(Config::load().get("NS_GPU_LOCK"));
+    // the front door's holds, beside the registry
+    sw.holds = Some(nextsycl_serve::hold::file_beside(&models::registry(&Config::load())));
     // the same idle time as the front door's (NS_IDLE_MINUTES), unless given
     let idle = opt(args, "--idle-minutes").map(str::to_string).or_else(|| Config::load().get("NS_IDLE_MINUTES"));
     sw.idle = idle.map(|v| v.parse::<f64>().map_err(|_| "--idle-minutes N")).transpose()?.filter(|m| *m > 0.0)

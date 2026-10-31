@@ -51,6 +51,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_CHAT_UI_PORT` | 8080 | Open WebUI's port (the page's link) | serve |
 | `NS_CORS` | loopback origins only | more web origins that may call the servers from a browser, comma-separated (`*`: any) | cli (llm, image, audio start) |
 | `NS_GPU_LOCK` | /tmp/ds2run.lock | the lock file (flock) GPU work the front door does not manage holds while it runs - tests, benchmarks, builds: while it is held no model loads (requests get the retryable error `cards_taken`, 503, retry_after_s; /v1 Retry-After), image / audio / 3D jobs wait, the video queue pauses, the switcher swaps in no chat model. `off`: none | serve, switch |
+| `NS_MAX_RSVP_S` | 86400 | the longest hold a request's `rsvp_s` (or X-Keep-Up-S, `keep_up_s`) may ask for, in seconds; more is clamped to it. Read on every grant | serve |
 | `NS_IDLE_MINUTES` | 10 | an enabled model unloads after this long without a request (0: never); the switcher uses the same unless --idle-minutes | serve, switch |
 | `NS_IMAGE_PORT` | 8086 | the image server's port, as the front door reaches it | serve |
 | `NS_IMAGE_PORT2` | 8096 | the second image server's port (`image start --slot 1`), as `NS_AUDIO_PORT2` | serve |

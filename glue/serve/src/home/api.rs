@@ -42,6 +42,7 @@ const FEATURES: &[&str] = &[
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
     "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request", "video.soundtrack", "video.exposure_fix",
+    "backplane", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -76,6 +77,13 @@ pub(crate) fn retryable(status: u16, code: &str) -> bool {
 /// An OpenAI route's error: {"error": {message, type}}; cards taken by a GPU run (crate::gpulock) as maintenance's,
 /// with its code and Retry-After; a model not downloaded says so (code model_not_downloaded, its size, the call)
 fn openai_error(s: &mut Conn, st: u16, m: &str) {
+    if let Some((code, fields, words)) = super::backplane::untag(m) {
+        let mut e = json!({"message": words, "type": code, "code": code});
+        if let (Some(o), Some(f)) = (e.as_object_mut(), fields.as_object()) {
+            o.extend(f.clone());
+        }
+        return http::respond(s, st, &json!({"error": e}));
+    }
     if let Some((f, words)) = super::pulls::untag(m) {
         let mut e = json!({"message": words, "type": "model_not_downloaded", "code": "model_not_downloaded"});
         if let (Some(o), Some(f)) = (e.as_object_mut(), f.as_object()) {
@@ -101,6 +109,14 @@ pub(crate) fn error_of(status: u16, m: &str) -> Value {
 /// An /rpc error in full: error_of with the method, the request key at fault when the message starts with one
 /// ("steps 8: ...", "images[0]: ...", "voice bogus: ..."), and a code of its own where the status's is too broad
 pub(crate) fn rpc_error(method: &str, status: u16, code: Option<&str>, m: &str) -> Value {
+    // an error of the backplane's own (wait_too_long): its code and fields
+    if let Some((c, fields, words)) = super::backplane::untag(m) {
+        let mut e = rpc_error(method, status, Some(&c), &words);
+        if let (Some(o), Some(f)) = (e.as_object_mut(), fields.as_object()) {
+            o.extend(f.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.clone(), v.clone())));
+        }
+        return e;
+    }
     // a model a card offers that is not downloaded (pulls.rs): its own code and what fetches it
     if let Some((fields, words)) = super::pulls::untag(m) {
         let mut e = rpc_error(method, status, Some("model_not_downloaded"), &words);
@@ -409,7 +425,27 @@ impl Home {
         if let Err((st, m)) = self.checked(name, b, &all) {
             return Some(envelope(st, m));
         }
-        let (st, mut v) = match http::call_status(&self.target("video"), "POST", &format!("/rpc/{method}"), Some(b), 120) {
+        // any video call brings a stopped daemon up
+        if let Err((st, m)) = self.video_up() {
+            return Some(envelope(st, m));
+        }
+        // a clip withdrawn at its limit says so when asked for
+        if method == "status" {
+            if let Some(e) = b["label"].as_str().and_then(|l| self.video_withdrawn(l)) {
+                return Some((200, json!({"ok": false, "error": e})));
+            }
+        }
+        // a clip's limit: declined here when its wait is known and too long; what the door keeps is not the studio's
+        let admitted = if method == "generate" {
+            match self.video_admit(b) {
+                Ok(x) => Some(x),
+                Err((st, m)) => return Some(envelope(st, m)),
+            }
+        } else {
+            None
+        };
+        let body = admitted.as_ref().map_or(b, |x| &x.0);
+        let (st, mut v) = match http::call_status(&self.target("video"), "POST", &format!("/rpc/{method}"), Some(body), 120) {
             Ok(r) => r,
             Err(e) => return Some(envelope(502, format!("the video studio does not answer: {e}"))),
         };
@@ -430,6 +466,10 @@ impl Home {
             v["error"] = e;
             return Some((st, v));
         }
+        if let Some((sent, e)) = &admitted {
+            self.video_taken(b, sent, e, &mut v["result"]);
+        }
+        self.video_annotate(method, &mut v);
         let url = |kind: &str, n: &str| format!("http://{host}/v1/video/{kind}/{n}");
         let r = &mut v["result"];
         for k in ["file", "preview"] {
@@ -549,12 +589,29 @@ impl Home {
         let resolved = self.uploads_in(name, b)?;
         let b = resolved.as_ref().unwrap_or(b);
         // pictures, songs and speech run as jobs (jobs.rs), which call work
+        if super::backplane::runs_model(name) {
+            super::backplane::check_fields(b)?;
+        }
         if super::jobs::METHODS.contains(&name) {
             let all = self.models();
             self.checked(name, b, &all)?;
             // what the server would refuse, refused now (wait: false would answer OK, then fail)
             self.precheck(name, b, &all)?;
             return self.submit(name, b);
+        }
+        // a method that runs a model and is not a job (chat, OCR): the same promises, on this thread
+        if super::backplane::runs_model(name) {
+            let e = self.admit(name, b)?;
+            super::backplane::begin(b, e, now());
+            let body = super::backplane::stripped(b);
+            let r = self.work(name, &body);
+            let granted = self.finish_request(name, &body, r.is_ok());
+            return r.map(|mut v| {
+                if let (Some(g), true) = (granted, v.is_object()) {
+                    v["rsvp_granted_s"] = json!(g);
+                }
+                v
+            });
         }
         self.work(name, b)
     }
@@ -607,6 +664,9 @@ impl Home {
             ("system", "load") if b["wait"] == true => self.load(&model()).map(|_| json!({"model": model(), "loaded": true})),
             ("system", "load") => self.load_async(&model()).map(|_| json!({"model": model(), "loading": true})),
             ("system", "unload") => self.unload(&model()).map(|_| json!({"model": model(), "loaded": false})),
+            ("system", "pin") => self.pin(&model(), b["wait"] != false),
+            ("system", "unpin") => self.unpin(&model()),
+            ("system", "eta") => self.eta_answer(b),
             ("system", "config") => Ok(self.config()),
             ("system", "configSet") => self.config_set(b),
             ("system", "restart") => self.restart(&s(b, "service")),
@@ -629,13 +689,16 @@ impl Home {
             }
             ("llm", "chat") => {
                 let t = self.chat_target(b["model"].as_str())?;
+                if let Some(id) = b["model"].as_str().map(str::to_string).or_else(|| self.chat_loaded(&all)) {
+                    self.request_on(&id);
+                }
                 let mut body = b.clone();
                 body["stream"] = json!(false);
                 let keep = body.as_object_mut().and_then(|o| o.remove("keep_up_s"));
                 let r = relay(&t, "POST", "/v1/chat/completions", Some(&body), 1800);
                 // kept from the end of the answer (the model that answered)
                 if let Some(k) = keep.filter(|k| !k.is_null()) {
-                    let secs = k.as_f64().filter(|x| *x >= 0.0).map_or(crate::switch::KEEP_UP_S, |x| (x as u64).min(86400));
+                    let secs = k.as_f64().filter(|x| *x >= 0.0).map_or(crate::switch::KEEP_UP_S, |x| x as u64);
                     if let Some(id) = self.chat_loaded(&self.models()) {
                         self.keep_chat(&id, secs);
                     }

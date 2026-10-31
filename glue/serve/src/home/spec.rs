@@ -245,6 +245,9 @@ pub fn result(method: &str) -> Option<String> {
         "system.gpus" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "gpus": {"type": "array", "items": {"type": "integer"}}, "changed": {"type": "boolean"},
   "was": {"type": "array", "items": {"type": "integer"}}}}"#.into(),
         "system.load" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "loaded": {"type": "boolean", "description": "wait: true"}, "loading": {"type": "boolean", "description": "without wait: it loads in the background (system.busy / system.models)"}}}"#.into(),
+        "system.pin" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "pinned": {"type": "boolean"}, "loaded": {"type": "boolean", "description": "with wait (the default)"}, "loading": {"type": "boolean", "description": "wait: false"}}}"#.into(),
+        "system.unpin" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "pinned": {"type": "boolean", "enum": [false]}}}"#.into(),
+        "system.eta" => r#"{"type": "object", "properties": {"method": {"type": "string"}, "model": {"type": "string", "nullable": true}, "hot": {"type": "boolean", "description": "loaded now: never declined"}, "would_accept": {"type": "boolean"}, "max_willing_to_wait_s": {"type": "number", "nullable": true}, "eta": {"type": "object", "properties": {"wait_s": {"type": "number", "nullable": true, "description": "time to start; null: no history"}, "run_s": {"type": "number", "nullable": true}, "total_s": {"type": "number", "nullable": true}, "samples": {"type": "integer"}, "basis": {"type": "string", "enum": ["shape", "model", "none"]}, "spread": {"type": "number", "nullable": true, "description": "seconds, the middle 80 % of the runs"}, "shape": {"type": "string"}}}}}"#.into(),
         "system.unload" => r#"{"type": "object", "properties": {"model": {"type": "string"}, "loaded": {"type": "boolean", "enum": [false]}}}"#.into(),
         "system.config" => r#"{"type": "object", "properties": {"path": {"type": "string"}, "text": {"type": "string"},
   "settings": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "group": {"type": "string"}, "value": {}, "default": {}, "what": {"type": "string"}, "readers": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": true}},
@@ -420,6 +423,8 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
         "video.queue.move" | "video.queue.remove" => &[(404, "not_found", "no queued clip with that label")],
         "video.jobs.get" => &[(404, "not_found", "no record of that clip")],
         "video.upload" => &[(400, "invalid_params", "not a picture, clip or sound (png jpg jpeg webp mp4 mov webm mkv wav mp3 flac m4a ogg), or empty")],
+        "system.pin" => &[(404, "not_found", "no such model"), (409, "conflict", "disabled, or its files are moving"), (503, "no_room", "its cards are held; names each card and holder (retryable); the model is not left pinned")],
+        "system.eta" => &[(400, "invalid_params", "not a method that runs a model")],
         "system.load" => &[(404, "not_found", "no such model"), (503, "no_room", "its cards are held by other models now (retryable)")],
         "system.enable" | "system.disable" | "system.unload" | "system.gpus" => &[(404, "not_found", "no such model"), (409, "conflict", "enable: the model's files are moving (system.move)")],
         "system.drive.measure" => &[(404, "not_found", "no such drive (system.drives)"), (409, "busy", "a model loads from it, a move uses it, or another drive is being measured")],
@@ -472,10 +477,11 @@ unauthorized 401, not_found 404 (also an unknown method), conflict 409 (a model 
 busy 409 (video.generate while a clip is made, or an image / audio job that would wait, without queue: true), not_running 409 (video.cancel with nothing running), \
 model_not_downloaded 409 (the model named is a card's that is not downloaded: error.model, error.bytes, error.fits, error.pull = system.models.pull; NS_AUTO_PULL fetches it instead), \
 cancelled 499 (image.cancel / audio.cancel stopped it), unavailable 502 (the kind's server does not answer), \
-no_room 503 (the model's cards are held by work that is not idle; idle models are stopped for it first), \
+no_room 503 (the model's cards are held by work that is not idle, by a pin or by a hold; idle models neither pinned nor held are stopped for it first; the message names each card and holder, \"pinned: X (unpin to free the room)\", \"held by rsvp_s: X (N s more)\"), \
+wait_too_long 503 (max_willing_to_wait_s: error.eta, error.max_willing_to_wait_s, and error.waited_s when it was withdrawn at the limit; retryable), \
 maintenance 503 (system.maintenance is on: what starts work - chat, generation, edits, speech, system.load / enable - is refused; error.maintenance has the notice, \
 error.retry_after_s when to try again; status, listings and cancels answer as always), timeout 504, internal 500. \
-Every error has retryable: true for no_room, maintenance, unavailable, timeout and video's busy (the same call may work later), false otherwise \
+Every error has retryable: true for no_room, wait_too_long, maintenance, unavailable, timeout and video's busy (the same call may work later), false otherwise \
 (change the request: a bad value, a disabled or missing model, a cancel).";
 
 /// The label convention the video methods share

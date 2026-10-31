@@ -11,6 +11,7 @@ pub mod drives;
 pub mod files;
 pub mod gpulock;
 pub mod gpustat;
+pub mod hold;
 pub mod home;
 pub mod idle;
 pub mod maintenance;
