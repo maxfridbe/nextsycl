@@ -257,7 +257,7 @@ pub fn shape_of(method: &str, model: &str, p: &Value) -> String {
         "llm.chat" => {
             let chars: usize = p["messages"].as_array().into_iter().flatten().map(|m| m["content"].as_str().map_or(0, |c| c.chars().count())).sum();
             put("prompt", Some(pow2(chars as f64 / 4.0)));
-            put("max", num(p, "max_tokens").map(|x| pow2(x)));
+            put("max", num(p, "max_tokens").map(pow2));
         }
         // 3D: its main knobs
         "model3d.generate" | "model3d.rig" => {
