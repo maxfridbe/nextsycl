@@ -690,7 +690,7 @@ impl Home {
             self.withdraw_queued();
             self.watch_videos();
             self.watch_chat_load();
-            if tick % 15 == 0 {
+            if tick.is_multiple_of(15) {
                 self.keep_up();
                 self.chat_idle_out();
             }
