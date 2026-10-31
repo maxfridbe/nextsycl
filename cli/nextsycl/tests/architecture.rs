@@ -381,7 +381,7 @@ fn the_page_has_no_start_or_stop() {
 fn room_passes_over_pins_and_holds() {
     let life = std::fs::read_to_string(root().join("glue/serve/src/home/life.rs")).unwrap();
     let idle_on = life.split("fn idle_on(").nth(1).unwrap().split("\n    }\n").next().unwrap();
-    assert!(idle_on.contains("protected_why"), "idle_on must pass over pinned and held models");
+    assert!(idle_on.contains("self.kept("), "idle_on must pass over pinned and held models");
     let place = life.split("fn place(").nth(1).unwrap().split("\n    }\n").next().unwrap();
     assert!(place.contains("free_to_go"), "a server's slot must not go to another model while its model is pinned or held");
 }

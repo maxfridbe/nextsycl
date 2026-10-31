@@ -173,7 +173,7 @@ function ModelRow(m: Model) {
       </div>
       <div class="mstate"><span class={{ tag: true, [m.state]: true }}>{STATE_TEXT[m.state] ?? m.state}</span>
         {m.pinned ? <span class="hint" attrs={{ title: "never stopped for room" }}> · pinned</span> : null}
-        {m.held_s ? <span class="hint" attrs={{ title: "held by rsvp_s or X-Keep-Up-S: not stopped for room" }}> · held {Math.ceil(m.held_s / 60)} min</span> : null}</div>
+        {m.held_s ? <span class="hint" attrs={{ title: "held by a request's rsvp_s: not stopped for room" }}> · held for {m.held_s} more s</span> : null}</div>
       <div class="acts">
         <span class="onoff" attrs={{ title: m.enabled ? "enabled: it loads on its first request and unloads after the idle time" : "disabled: off the API (and Open WebUI's list)" }}>
           <label class={{ on: !m.enabled }}>

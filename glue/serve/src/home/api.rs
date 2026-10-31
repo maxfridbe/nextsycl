@@ -444,7 +444,7 @@ impl Home {
         } else {
             None
         };
-        let body = admitted.as_ref().map_or(b, |x| &x.0);
+        let body = admitted.as_ref().unwrap_or(b);
         let (st, mut v) = match http::call_status(&self.target("video"), "POST", &format!("/rpc/{method}"), Some(body), 120) {
             Ok(r) => r,
             Err(e) => return Some(envelope(502, format!("the video studio does not answer: {e}"))),
@@ -466,8 +466,8 @@ impl Home {
             v["error"] = e;
             return Some((st, v));
         }
-        if let Some((sent, e)) = &admitted {
-            self.video_taken(b, sent, e, &mut v["result"]);
+        if let Some(sent) = &admitted {
+            self.video_taken(b, sent, &mut v["result"]);
         }
         self.video_annotate(method, &mut v);
         let url = |kind: &str, n: &str| format!("http://{host}/v1/video/{kind}/{n}");
@@ -601,11 +601,16 @@ impl Home {
         }
         // a method that runs a model and is not a job (chat, OCR): the same promises, on this thread
         if super::backplane::runs_model(name) {
-            let e = self.admit(name, b)?;
-            super::backplane::begin(b, e, now());
+            self.admit(name, b)?;
+            super::backplane::begin(name, b, now());
             let body = super::backplane::stripped(b);
             let r = self.work(name, &body);
-            let granted = self.finish_request(name, &body, r.is_ok());
+            let outcome = match &r {
+                Ok(_) => "ok",
+                Err((499, _)) => "cancelled",
+                Err(_) => "failed",
+            };
+            let granted = self.finish_request(name, &body, outcome);
             return r.map(|mut v| {
                 if let (Some(g), true) = (granted, v.is_object()) {
                     v["rsvp_granted_s"] = json!(g);
@@ -664,8 +669,8 @@ impl Home {
             ("system", "load") if b["wait"] == true => self.load(&model()).map(|_| json!({"model": model(), "loaded": true})),
             ("system", "load") => self.load_async(&model()).map(|_| json!({"model": model(), "loading": true})),
             ("system", "unload") => self.unload(&model()).map(|_| json!({"model": model(), "loaded": false})),
-            ("system", "pin") => self.pin(&model(), b["wait"] != false),
-            ("system", "unpin") => self.unpin(&model()),
+            ("system", "pin") => self.pin(&model()).map(|_| json!({"model": model(), "pinned": true, "loading": true})),
+            ("system", "unpin") => self.unpin(&model()).map(|_| json!({"model": model(), "pinned": false})),
             ("system", "eta") => self.eta_answer(b),
             ("system", "config") => Ok(self.config()),
             ("system", "configSet") => self.config_set(b),

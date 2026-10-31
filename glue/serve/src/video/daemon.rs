@@ -89,11 +89,6 @@ fn idle_over(idle: Duration, limit: Duration, keep_until: Option<Instant>) -> bo
     idle >= limit && keep_until.is_none_or(|k| k <= Instant::now())
 }
 
-/// A job that only loads its engine (the front door's pin)
-fn is_load(spec: &Value) -> bool {
-    spec["kind"] == "load"
-}
-
 /// The door's word on the chat model: held (answering or kept) unless it says otherwise; a door that does not answer
 /// counts as held, as the door itself treats a switcher that does not answer. No door: not held.
 fn chat_held(door: Option<&str>) -> bool {
@@ -472,10 +467,6 @@ impl Daemon {
                     return Err(e.0);
                 }
             }
-        }
-        // a load alone (the front door's pin): its worker is up, there is nothing to run
-        if is_load(spec) {
-            return Ok(json!({"loaded": want}));
         }
         let p = proc.as_mut().unwrap();
         writeln!(p.stdin, "{}", json!({"job": id, "spec": spec})).map_err(|e| format!("the engine process does not listen: {e}"))?;
@@ -966,6 +957,15 @@ mod chat_hook_tests {
     use std::io::Read;
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_kept_worker_outlasts_its_idle_limit() {
+        let (idle, limit) = (Duration::from_secs(700), Duration::from_secs(600));
+        assert!(idle_over(idle, limit, None), "nothing keeps it");
+        assert!(!idle_over(Duration::from_secs(10), limit, None), "not idle long enough");
+        assert!(!idle_over(idle, limit, Some(Instant::now() + Duration::from_secs(60))), "kept");
+        assert!(idle_over(idle, limit, Some(Instant::now() - Duration::from_secs(1))), "the keep is over");
+    }
 
     /// A one-answer-to-everything server; the requests it was sent
     fn fake(answer: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {

@@ -138,11 +138,7 @@ fn serve_one(dir: &Path, port: u16, is_video: bool, id: &str, mut s: TcpStream) 
                 let gpus = if w.trim().is_empty() { json!([{"gpu": 0, "engine": "unloaded"}]) } else { json!([{"gpu": 0, "engine": "loaded", "denoiser": w.trim()}]) };
                 json!({"engines": names, "gpus": gpus})
             }
-            "/engine/jobs" => {
-                let _ = std::fs::write(dir.join("worker"), body["engine"].as_str().unwrap_or(""));
-                json!({"id": 1})
-            }
-            "/engine/keep" => json!({"kept": [0]}),
+                        "/engine/keep" => json!({"kept": [0]}),
             "/rpc/llm.mode" => json!({"ok": true, "result": {}}),
             "/rpc/jobs.list" => json!({"ok": true, "result": {"jobs": std::fs::read(dir.join("clips.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or(json!([]))}}),
             "/rpc/generate" => json!({"ok": true, "result": {"queued": false, "label": body["label"]}}),
@@ -154,8 +150,7 @@ fn serve_one(dir: &Path, port: u16, is_video: bool, id: &str, mut s: TcpStream) 
         ("GET", "/api/info") => json!({"model": id, "loading": false}),
         ("GET", "/api/progress") => json!({"busy": file("busy").exists(), "waiting": 0}),
         ("GET", "/v1/models") => json!({"data": [{"id": id, "status": {"value": "loaded"}}]}),
-        ("POST", "/api/keepalive") => return answer(&mut s, 404, &json!({"error": "no route"})),
-        ("POST", p) if p.starts_with("/v1/") => {
+                ("POST", p) if p.starts_with("/v1/") => {
             if let Ok(t) = std::fs::read_to_string(file("slow")) {
                 std::thread::sleep(Duration::from_secs_f64(t.trim().parse().unwrap_or(0.0)));
             }
@@ -365,13 +360,6 @@ impl Box_ {
         self.ok("system.models", json!({}))["models"].as_array().unwrap().iter().find(|m| m["id"] == id).unwrap().clone()
     }
 
-    fn history(&self, id: &str, rows: &[Value]) {
-        let d = self.dir.join("history");
-        std::fs::create_dir_all(&d).unwrap();
-        let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
-        std::fs::write(d.join(format!("{id}.jsonl")), text).unwrap();
-    }
-
     fn make(&self, id: &str, extra: Value) -> Value {
         let mut b = json!({"model": id, "prompt": "a lighthouse", "size": "1024x1024", "steps": 4, "label": format!("{id}-{}", self.exec_log().len())});
         for (k, v) in extra.as_object().unwrap() {
@@ -379,6 +367,22 @@ impl Box_ {
         }
         self.rpc("image.generate", b)
     }
+}
+
+/// A box whose history is there before its door starts: (key, rows) as the door's files hold them
+fn seeded(tag: &str, entries: Vec<Value>, rows: &[(&str, &[Value])]) -> (PathBuf, Arc<Mutex<Vec<Value>>>) {
+    let d = std::env::temp_dir().join(format!("nextsycl-backplane-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("history")).unwrap();
+    for (i, (key, recs)) in rows.iter().enumerate() {
+        let lines: String = recs.iter().map(|r| format!("{r}\n")).collect();
+        std::fs::write(d.join(format!("history/seed{i}.jsonl")), format!("#key {key}\n{lines}")).unwrap();
+    }
+    (d, Arc::new(Mutex::new(entries)))
+}
+
+fn run_row(model: &str, shape: &str, run_s: f64, wait_s: f64) -> Value {
+    json!({"method": "image.generate", "model": model, "shape": shape, "wait_s": wait_s, "run_s": run_s, "outcome": "ok"})
 }
 
 #[test]
@@ -391,46 +395,46 @@ fn only_idle_holders_neither_pinned_nor_held_go_for_room() {
     assert!(b.up("b") && !b.up("a"), "the idle holder went: {}", b.exec_log());
 
     // a pin holds: no room for a, and the job says who and why
-    assert_eq!(b.ok("system.pin", json!({"model": "b"})), json!({"model": "b", "pinned": true, "loaded": true}));
+    assert_eq!(b.ok("system.pin", json!({"model": "b"})), json!({"model": "b", "pinned": true, "loading": true}));
     assert_eq!(b.model_state("b")["pinned"], true);
-    let e = b.err("system.unload", json!({"model": "b"}));
-    assert_eq!((e["code"].clone(), e["status"].clone()), (json!("conflict"), json!(409)), "{e}");
-    assert!(b.up("b"));
     let j = b.ok("image.generate", json!({"model": "a", "prompt": "x", "label": "after-pin", "wait": false}));
     assert_eq!(j["state"], "queued");
     b.until("the job says the pin", 20, |b| {
         let s = b.ok("image.status", json!({"label": "after-pin"}));
-        s["waiting_for"].as_str().is_some_and(|w| w.contains("GPU 0") && w.contains("pinned: b (unpin to free the room)"))
+        s["waiting_for"].as_str().is_some_and(|w| w.contains("GPU 0") && w.contains("; pinned: b (unpin to free the room)"))
     });
     assert!(b.up("b") && !b.up("a"), "a pinned model is never stopped");
-    // unpinned: the waiting job goes on, on the room b leaves
+    // unpinned: the flag only, and the waiting job goes on, on the room b leaves
     assert_eq!(b.ok("system.unpin", json!({"model": "b"})), json!({"model": "b", "pinned": false}));
+    assert_eq!(b.models.lock().unwrap().iter().find(|m| m["id"] == "b").unwrap()["pinned"], false);
     b.until("the job finishes once unpinned", 20, |b| b.ok("image.status", json!({"label": "after-pin"}))["state"] == "done");
     assert!(b.up("a") && !b.up("b"));
 
-    // rsvp_s: granted, named in the refusal, a smaller value does not shorten it, 0 releases
+    // rsvp_s: what was granted is the answer, a shorter later one does not shorten the hold
     let r = b.make("c", json!({"rsvp_s": 500}));
-    assert_eq!(r["result"]["rsvp_granted_s"], 500, "{r}");
+    assert_eq!(r["result"]["rsvp_granted_s"].as_f64(), Some(500.0), "{r}");
     let r = b.make("c", json!({"rsvp_s": 10}));
-    assert!(r["result"]["rsvp_granted_s"].as_u64().unwrap() > 400, "{r}");
-    assert!(b.model_state("c")["held_s"].as_u64().unwrap() > 400);
+    assert_eq!(r["result"]["rsvp_granted_s"].as_f64(), Some(10.0), "{r}");
+    assert!(b.model_state("c")["held_s"].as_f64().unwrap() > 400.0);
+    let r = b.make("c", json!({"rsvp_s": 0}));
+    assert_eq!(r["result"]["rsvp_granted_s"].as_f64(), Some(0.0), "{r}");
+    assert!(b.model_state("c")["held_s"].as_f64().unwrap() > 400.0, "0 does not undo an earlier hold");
     b.ok("image.generate", json!({"model": "a", "prompt": "x", "label": "after-rsvp", "wait": false}));
     b.until("the job says the hold", 20, |b| {
-        b.ok("image.status", json!({"label": "after-rsvp"}))["waiting_for"].as_str().is_some_and(|w| w.contains("held by rsvp_s: c (") && w.contains(" s more)"))
+        b.ok("image.status", json!({"label": "after-rsvp"}))["waiting_for"].as_str().is_some_and(|w| w.contains("; held by rsvp_s: c (until its hold ends: c "))
     });
     assert!(b.up("c"));
-    let e = b.ok("image.status", json!({"label": "after-rsvp"}));
-    assert_ne!(e["state"], "done");
-    // (the job above holds the kind's only server's turn: c is released by the tool's unload, which ends its hold)
+    // a tool's unload takes it; the job goes on
     b.ok("system.unload", json!({"model": "c"}));
-    assert_eq!(b.model_state("c")["held_s"], 0);
-    b.until("the job finishes once released", 20, |b| b.ok("image.status", json!({"label": "after-rsvp"}))["state"] == "done");
-    // rsvp_s 0 on a request releases what an earlier one held
-    let r = b.make("a", json!({"rsvp_s": 300}));
-    assert_eq!(r["result"]["rsvp_granted_s"], 300);
-    let r = b.make("a", json!({"rsvp_s": 0}));
-    assert_eq!(r["result"]["rsvp_granted_s"], 0);
-    assert_eq!(b.model_state("a")["held_s"], 0);
+    b.until("the job finishes", 20, |b| b.ok("image.status", json!({"label": "after-rsvp"}))["state"] == "done");
+}
+
+#[test]
+fn rsvp_zero_with_nothing_holding_lets_the_model_go_once_idle() {
+    let b = start("release", vec![image("m", 8.0)], None, None);
+    let r = b.make("m", json!({"rsvp_s": 0}));
+    assert_eq!(r["result"]["rsvp_granted_s"].as_f64(), Some(0.0), "{r}");
+    b.until("it goes without waiting out its idle time", 15, |b| !b.up("m"));
 }
 
 #[test]
@@ -448,14 +452,20 @@ fn a_busy_server_is_never_stopped_and_the_memory_rule_stands() {
 }
 
 #[test]
-fn a_pin_comes_back_after_a_restart_and_a_hold_survives_one() {
+fn a_pin_comes_back_after_a_restart_a_failed_load_stays_pinned_and_a_hold_survives() {
     let dir;
     let models;
     {
-        let b = start("restart", vec![image("p", 8.0), image("h", 8.0)], None, None);
+        let b = start("restart", vec![image("p", 8.0), image("h", 8.0), image("toobig", 40.0)], None, None);
         b.ok("system.pin", json!({"model": "p"}));
+        b.until("the pinned model loads", 15, |b| b.up("p"));
         assert_eq!(b.make("h", json!({"rsvp_s": 900}))["ok"], true);
         assert_eq!(b.models.lock().unwrap().iter().find(|m| m["id"] == "p").unwrap()["pinned"], true, "in the registry");
+        // no room for it: answered at once, and the pin stays set while the load fails in the background
+        assert_eq!(b.ok("system.pin", json!({"model": "toobig"})), json!({"model": "toobig", "pinned": true, "loading": true}));
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(!b.up("toobig") && b.up("p") && b.up("h"), "{}", b.exec_log());
+        assert_eq!(b.model_state("toobig")["pinned"], true);
         dir = b.dir.clone();
         models = b.models.clone();
         b.stop.store(true, Ordering::Relaxed);
@@ -466,53 +476,63 @@ fn a_pin_comes_back_after_a_restart_and_a_hold_survives_one() {
     assert!(!b.up("p"), "a fresh box holds nothing");
     b.until("the pinned model loads again by itself", 20, |b| b.up("p"));
     assert_eq!(b.model_state("p")["pinned"], true);
-    assert!(b.model_state("h")["held_s"].as_u64().unwrap() > 800, "the hold is in its file");
+    assert!(b.model_state("h")["held_s"].as_f64().unwrap() > 800.0, "the hold is in its file");
 }
 
 #[test]
 fn a_known_wait_over_the_limit_is_declined_and_nothing_happens() {
-    let b = start("declined", vec![image("cold", 8.0), image("hot", 8.0)], None, None);
-    b.history("cold", &[json!({"shape": "image.generate/1024x1024/s4", "run_s": 30.0}), json!({"shape": "load", "load_s": 500.0})]);
+    let shape = "image.generate|cold|w=1024,h=1024,steps=4";
+    let seed = seeded("declined", vec![image("cold", 8.0), image("hot", 8.0)], &[
+        (&format!("shape|{shape}"), &[run_row("cold", shape, 30.0, 500.0)]),
+        ("model|cold", &[run_row("cold", shape, 30.0, 500.0)]),
+    ]);
+    let b = start("declined", vec![], Some(seed), None);
     // read-only: what it would be, and nothing moved
-    let v = b.ok("system.eta", json!({"method": "image.generate", "params": {"model": "cold", "size": "1024x1024", "steps": 4}, "max_willing_to_wait_s": 60}));
-    assert_eq!((v["eta"]["wait_s"].clone(), v["eta"]["run_s"].clone(), v["eta"]["total_s"].clone()), (json!(500.0), json!(30.0), json!(530.0)), "{v}");
-    assert_eq!((v["eta"]["basis"].clone(), v["eta"]["samples"].clone(), v["would_accept"].clone(), v["hot"].clone()), (json!("shape"), json!(1), json!(false), json!(false)), "{v}");
+    let v = b.ok("system.eta", json!({"method": "image.generate", "params": {"size": "1024x1024", "steps": 4}, "model": "cold", "max_willing_to_wait_s": 60}));
+    assert_eq!((v["eta"]["wait_s"].as_f64(), v["eta"]["run_s"].as_f64(), v["eta"]["total_s"].as_f64()), (Some(500.0), Some(30.0), Some(530.0)), "{v}");
+    assert_eq!((v["eta"]["basis"].clone(), v["eta"]["samples"].clone(), v["would_accept"].clone()), (json!("shape"), json!(1), json!(false)), "{v}");
+    assert_eq!(v["eta"]["spread"], json!([30.0, 30.0]), "{v}");
+    assert_eq!(v["eta"]["shape"], shape);
     assert!(!b.exec_log().contains("start cold"));
     assert_eq!(b.ok("system.eta", json!({"method": "image.generate", "params": {"model": "cold"}}))["eta"]["basis"], "model", "another shape: the model's runs");
-    assert_eq!(b.err("system.eta", json!({"method": "system.busy"}))["code"], "invalid_params");
+    let e = b.err("system.eta", json!({"method": "system.busy"}));
+    assert_eq!(e["code"], "invalid_params");
+    assert!(e["message"].as_str().unwrap().contains("a method that runs a model"));
 
     let e = b.make("cold", json!({"max_willing_to_wait_s": 60}));
     assert_eq!(e["ok"], false, "{e}");
     let e = &e["error"];
-    assert_eq!((e["code"].clone(), e["retryable"].clone(), e["status"].clone(), e["max_willing_to_wait_s"].clone()), (json!("wait_too_long"), json!(true), json!(503), json!(60.0)), "{e}");
-    assert_eq!(e["eta"]["wait_s"], 500.0);
+    assert_eq!((e["code"].clone(), e["retryable"].clone(), e["status"].clone(), e["max_willing_to_wait_s"].as_f64()), (json!("wait_too_long"), json!(true), json!(503), Some(60.0)), "{e}");
+    assert_eq!(e["eta"]["wait_s"].as_f64(), Some(500.0));
     assert!(e.get("waited_s").is_none());
     assert!(!b.exec_log().contains("start cold"), "nothing started");
     assert_eq!(b.ok("image.jobs", json!({}))["queued"], json!([]), "nothing queued");
 
-    // a hot model is never declined, whatever its history says
+    // a loaded model with a free server always starts, with or without history
     assert_eq!(b.make("hot", json!({}))["ok"], true);
-    b.history("hot", &[json!({"shape": "load", "load_s": 900.0, "run_s": 900.0})]);
+    let v = b.ok("system.eta", json!({"method": "image.generate", "params": {"model": "hot"}, "max_willing_to_wait_s": 0}));
+    assert_eq!((v["eta"]["wait_s"].as_f64(), v["would_accept"].clone()), (Some(0.0), json!(true)), "{v}");
     let v = b.make("hot", json!({"max_willing_to_wait_s": 0}));
     assert_eq!(v["ok"], true, "{v}");
-    assert_eq!(v["result"]["job"]["eta"]["basis"], "model");
 }
 
 #[test]
 fn an_unknown_wait_goes_ahead_and_is_withdrawn_at_the_limit() {
     let b = start("withdrawn", vec![image("holder", 28.0), image("fresh", 28.0), image("fresh2", 28.0)], None, None);
     b.ok("system.pin", json!({"model": "holder"}));
+    b.until("the pinned model loads", 15, |b| b.up("holder"));
     let v = b.ok("system.eta", json!({"method": "image.generate", "params": {"model": "fresh"}, "max_willing_to_wait_s": 2}));
     assert_eq!((v["eta"]["wait_s"].clone(), v["eta"]["basis"].clone(), v["would_accept"].clone()), (Value::Null, json!("none"), json!(true)), "no history: unknown, accepted: {v}");
     // the first runs and waits for room; it is withdrawn from there
     let e = b.err("image.generate", json!({"model": "fresh", "prompt": "x", "label": "w1", "max_willing_to_wait_s": 2}));
     assert_eq!(e["code"], "wait_too_long", "{e}");
     assert!(e["waited_s"].as_f64().unwrap() >= 2.0, "{e}");
-    assert_eq!(e["max_willing_to_wait_s"], 2.0);
+    assert_eq!(e["max_willing_to_wait_s"].as_f64(), Some(2.0));
     assert!(!b.up("fresh") && b.up("holder"));
     assert_eq!(b.ok("image.status", json!({"label": "w1"}))["error"]["code"], "wait_too_long", "the job's own record says so too");
-    // one waiting behind another in the queue is withdrawn there
+    // one waiting behind others in the queue is withdrawn there (a kind runs as many at once as it has servers)
     b.ok("image.generate", json!({"model": "fresh", "prompt": "x", "label": "w2", "wait": false}));
+    b.ok("image.generate", json!({"model": "fresh", "prompt": "x", "label": "w2b", "wait": false}));
     b.ok("image.generate", json!({"model": "fresh2", "prompt": "x", "label": "w3", "wait": false, "max_willing_to_wait_s": 1}));
     b.until("the queued job is withdrawn", 15, |b| b.ok("image.status", json!({"label": "w3"}))["error"]["code"] == "wait_too_long");
     assert_eq!(b.ok("image.status", json!({"label": "w3"}))["state"], "failed");
@@ -521,6 +541,7 @@ fn an_unknown_wait_goes_ahead_and_is_withdrawn_at_the_limit() {
     assert_eq!(s["eta"]["basis"], "none", "{s}");
     assert!(s.get("eta_remaining_s").is_some(), "{s}");
     b.ok("image.cancel", json!({"label": "w2"}));
+    b.ok("image.cancel", json!({"label": "w2b"}));
 }
 
 #[test]
@@ -528,12 +549,12 @@ fn history_answers_after_a_run_and_a_bad_value_is_refused() {
     let b = start("history", vec![image("m", 8.0)], None, None);
     assert_eq!(b.make("m", json!({}))["ok"], true);
     assert_eq!(b.make("m", json!({}))["ok"], true);
-    let text = std::fs::read_to_string(b.dir.join("history/m.jsonl")).unwrap();
-    assert_eq!(text.lines().filter(|l| l.contains("\"run_s\"")).count(), 2, "{text}");
-    assert_eq!(text.lines().filter(|l| l.contains("\"load_s\"")).count(), 1, "{text}");
     let v = b.ok("system.eta", json!({"method": "image.generate", "params": {"model": "m", "size": "1024x1024", "steps": 4}}));
-    assert_eq!((v["eta"]["samples"].clone(), v["eta"]["basis"].clone(), v["hot"].clone(), v["eta"]["wait_s"].clone()), (json!(2), json!("shape"), json!(true), json!(0.0)), "{v}");
-    assert_eq!(b.err("image.generate", json!({"model": "m", "prompt": "x", "rsvp_s": -5}))["code"], "invalid_params");
+    assert_eq!((v["eta"]["samples"].clone(), v["eta"]["basis"].clone(), v["eta"]["wait_s"].as_f64()), (json!(2), json!("shape"), Some(0.0)), "{v}");
+    assert_eq!(v.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), vec!["eta", "max_willing_to_wait_s", "method", "would_accept"]);
+    b.until("the history in its files", 5, |b| std::fs::read_dir(b.dir.join("history")).is_ok_and(|d| d.count() >= 2));
+    let e = b.err("image.generate", json!({"model": "m", "prompt": "x", "rsvp_s": -5}));
+    assert_eq!((e["code"].clone(), e["message"].clone()), (json!("invalid_params"), json!("rsvp_s: seconds, 0 or more")));
     assert_eq!(b.err("image.generate", json!({"model": "m", "prompt": "x", "max_willing_to_wait_s": "soon"}))["status"], 400);
     let f = b.ok("system.version", json!({}));
     for name in ["system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long"] {
@@ -546,7 +567,7 @@ fn history_answers_after_a_run_and_a_bad_value_is_refused() {
 fn rsvp_is_clamped_by_the_setting() {
     let b = start("clamp", vec![image("m", 8.0)], None, Some("60"));
     let r = b.make("m", json!({"rsvp_s": 86400}));
-    assert_eq!(r["result"]["rsvp_granted_s"], 60, "{r}");
+    assert_eq!(r["result"]["rsvp_granted_s"].as_f64(), Some(60.0), "{r}");
 }
 
 #[test]
@@ -560,73 +581,76 @@ fn a_video_call_brings_the_daemon_up_and_a_clip_has_its_eta_hot_or_not() {
     assert_eq!(b.rpc("video.status", json!({}))["ok"], true);
     assert!(up.exists(), "the call started it: {}", b.exec_log());
 
-    // the studio's records are the history: no worker up, yet the wait is known
+    // the studio's records are the history: no worker up, a clip ahead, yet the wait is known
     std::fs::write(b.dir.join("clips.json"), json!([{"total": 100.0, "file": "a.mp4", "seconds": 5, "steps": 8, "canvas": "768x576", "mtime": 1, "engine": "INT8"}]).to_string()).unwrap();
-    b.until("the clips read in", 25, |b| b.dir.join("history/clips.jsonl").exists());
     let q = json!({"model": "clips", "width": 768, "height": 576, "seconds": 5, "steps": 8});
-    let v = b.ok("system.eta", json!({"method": "video.generate", "params": q}));
-    assert_eq!((v["hot"].clone(), v["eta"]["wait_s"].clone(), v["eta"]["run_s"].clone(), v["eta"]["basis"].clone()), (json!(false), json!(0.0), json!(100.0), json!("shape")), "{v}");
-
-    // a clip ahead: known, and over a limit it is declined without reaching the studio
+    b.until("the clips read in", 40, |b| b.ok("system.eta", json!({"method": "video.generate", "params": q}))["eta"]["samples"] == 1);
     std::fs::write(b.dir.join("studio.json"), json!({"idle": false, "eta": 1000, "job": {"label": "other"}, "queue_items": [], "waiting_for": null}).to_string()).unwrap();
+    let v = b.ok("system.eta", json!({"method": "video.generate", "params": q}));
+    assert_eq!((v["eta"]["wait_s"].as_f64(), v["eta"]["run_s"].as_f64(), v["eta"]["basis"].clone()), (Some(1000.0), Some(100.0), json!("shape")), "{v}");
+
+    // over a limit it is declined without reaching the studio
     let e = b.err("video.generate", json!({"prompt": "x", "max_willing_to_wait_s": 10}));
-    assert_eq!((e["code"].clone(), e["eta"]["wait_s"].clone()), (json!("wait_too_long"), json!(1000.0)), "{e}");
+    assert_eq!((e["code"].clone(), e["eta"]["wait_s"].as_f64()), (json!("wait_too_long"), Some(1000.0)), "{e}");
     assert!(!b.seen().contains("/rpc/generate"));
     let s = b.ok("video.status", json!({}));
     assert_eq!((s["eta"].clone(), s["eta_remaining_s"].clone()), (json!(1000), json!(1000)), "its number stays, what every job has is added: {s}");
 
-    // a clip whose wait is not known (no history yet) that queued past its limit is taken out and says so
-    std::fs::write(b.dir.join("clips.json"), "[]").unwrap();
-    std::fs::remove_file(b.dir.join("history/clips.jsonl")).unwrap();
-    std::fs::write(b.dir.join("studio.json"), json!({"idle": true, "queue_items": [{"label": "late", "held": false}]}).to_string()).unwrap();
-    let r = b.ok("video.generate", json!({"prompt": "x", "label": "late", "queue": true, "max_willing_to_wait_s": 1}));
-    assert!(r["eta"].is_object(), "{r}");
-    b.until("the clip is withdrawn", 15, |b| b.seen().contains("/rpc/queue.remove"));
-    let e = b.err("video.status", json!({"label": "late"}));
-    assert_eq!(e["code"], "wait_too_long", "{e}");
-    assert!(e["waited_s"].as_f64().unwrap() >= 1.0);
-
     // a clip's reservation: said on the answer, held when the clip is over
     std::fs::write(b.dir.join("studio.json"), json!({"idle": true, "queue_items": []}).to_string()).unwrap();
     let r = b.ok("video.generate", json!({"prompt": "x", "rsvp_s": 300}));
-    assert_eq!(r["rsvp_granted_s"], 300, "{r}");
+    assert_eq!(r["rsvp_granted_s"].as_f64(), Some(300.0), "{r}");
     assert!(b.seen().lines().filter(|l| l.contains("/rpc/generate")).all(|l| !l.contains("rsvp_s") && !l.contains("max_willing")), "the door's fields stay here");
-    b.until("the hold starts as the clip ends", 10, |b| b.model_state("clips")["held_s"].as_u64().unwrap_or(0) > 0);
+    b.until("the hold starts as the clip ends", 10, |b| b.model_state("clips")["held_s"].as_f64().unwrap_or(0.0) > 0.0);
 
-    // a pin loads the engine and keeps its worker from its idle unload
-    assert_eq!(b.ok("system.pin", json!({"model": "clips"}))["loaded"], true);
-    assert!(b.seen().contains("\"kind\":\"load\""), "{}", b.seen());
-    b.until("the worker told to stay", 40, |b| b.seen().contains("/engine/keep"));
+    // a hold or pin asks the daemon to keep its workers; a pin loads no weights by itself
+    b.until("the workers told to stay", 15, |b| b.seen().lines().any(|l| l.contains("/engine/keep") && l.contains("\"seconds\":60")));
+    assert_eq!(b.ok("system.pin", json!({"model": "clips"})), json!({"model": "clips", "pinned": true, "loading": true}));
+    assert!(!b.seen().contains("/engine/jobs"), "{}", b.seen());
 }
 
 #[test]
-fn chat_holds_are_one_hold_a_keep_yields_to_chat_and_a_reservation_does_not() {
+fn a_clip_with_no_history_that_queued_past_its_limit_is_taken_out() {
+    let b = start("video2", vec![clip_model("clips")], None, None);
+    b.until("the daemon up", 15, |b| b.dir.join(format!("up-{}", b.video)).exists());
+    std::fs::write(b.dir.join("studio.json"), json!({"idle": true, "queue_items": [{"label": "late", "held": false}]}).to_string()).unwrap();
+    let r = b.ok("video.generate", json!({"prompt": "x", "label": "late", "queue": true, "max_willing_to_wait_s": 1}));
+    assert!(r["eta"]["wait_s"].is_null(), "{r}");
+    b.until("the clip is withdrawn", 15, |b| b.seen().contains("/rpc/queue.remove") && b.rpc("video.status", json!({"label": "late"}))["ok"] == false);
+    let e = b.err("video.status", json!({"label": "late"}));
+    assert_eq!(e["code"], "wait_too_long", "{e}");
+    assert!(e["waited_s"].as_f64().unwrap() >= 1.0);
+}
+
+#[test]
+fn a_keep_yields_to_chat_and_stays_from_other_work_and_a_reservation_yields_to_nothing() {
     let b = start("chat", vec![chat("a", 10.0), chat("b", 10.0), image("pic", 28.0)], None, None);
     let msg = json!([{"role": "user", "content": "hi"}]);
-    // X-Keep-Up-S through /v1: the one hold, seen in /chat/held and system.models
+    // X-Keep-Up-S through /v1: seen in /chat/held; held_s is rsvp_s's alone
     let (st, _) = b.raw("POST", "/v1/chat/completions", "X-Keep-Up-S: 300\r\n", &json!({"model": "a", "messages": msg}));
     assert_eq!(st, 200);
     assert!(b.up("a"));
-    assert!(b.model_state("a")["held_s"].as_u64().unwrap() > 250);
+    assert_eq!(b.model_state("a")["held_s"].as_f64(), Some(0.0));
     let (st, v) = b.raw("GET", "/chat/held", "", &json!({}));
     assert_eq!((st, v), (200, json!({"held": true, "model": "a"})));
     // a kept chat model is not stopped for a picture ...
     b.ok("image.generate", json!({"model": "pic", "prompt": "x", "label": "pic1", "wait": false}));
-    b.until("the job names the hold", 20, |b| b.ok("image.status", json!({"label": "pic1"}))["waiting_for"].as_str().is_some_and(|w| w.contains("held by rsvp_s: a (")));
+    b.until("the job waits", 20, |b| b.ok("image.status", json!({"label": "pic1"}))["waiting_for"].as_str().is_some_and(|w| w.contains("a 10.0 GiB")));
     assert!(b.up("a"));
     b.ok("image.cancel", json!({"label": "pic1"}));
     // ... yet another chat model may take its place, as Open WebUI's picker always could
-    assert_eq!(b.ok("llm.chat", json!({"model": "b", "messages": msg, "rsvp_s": 400}))["rsvp_granted_s"], 400);
+    assert_eq!(b.ok("llm.chat", json!({"model": "b", "messages": msg, "rsvp_s": 400}))["rsvp_granted_s"].as_f64(), Some(400.0));
     assert!(b.up("b") && !b.up("a"), "{}", b.exec_log());
+    assert!(b.model_state("b")["held_s"].as_f64().unwrap() > 300.0);
     // a reservation does not give way
     let e = b.err("llm.chat", json!({"model": "a", "messages": msg}));
     assert_eq!((e["code"].clone(), e["retryable"].clone(), e["status"].clone()), (json!("no_room"), json!(true), json!(503)), "{e}");
-    assert!(e["message"].as_str().unwrap().contains("held by rsvp_s: b ("), "{e}");
+    let m = e["message"].as_str().unwrap();
+    assert!(m.starts_with("the chat server holds one model at a time and held by rsvp_s: b (") && m.ends_with("a loads once it is released"), "{e}");
     // /v1's refusal is the HTTP status
     let (st, v) = b.raw("POST", "/v1/chat/completions", "", &json!({"model": "a", "messages": msg}));
     assert_eq!(st, 503, "{v}");
     // a pin neither
-    b.ok("system.unload", json!({"model": "b"}));
     b.ok("system.pin", json!({"model": "b"}));
     let e = b.err("llm.chat", json!({"model": "a", "messages": msg}));
     assert!(e["message"].as_str().unwrap().contains("pinned: b (unpin to free the room)"), "{e}");
@@ -636,22 +660,26 @@ fn chat_holds_are_one_hold_a_keep_yields_to_chat_and_a_reservation_does_not() {
 
 #[test]
 fn a_pinned_or_held_server_is_told_to_stay_and_a_plain_one_is_not() {
-    let b = start("stay", vec![image("p", 8.0), image("h", 8.0)], None, None);
+    let b = start("stay", vec![image("p", 8.0), image("plain", 8.0)], None, None);
+    assert_eq!(b.make("plain", json!({}))["ok"], true);
     b.ok("system.pin", json!({"model": "p"}));
-    assert_eq!(b.make("h", json!({"rsvp_s": 600}))["ok"], true);
-    // any POST counts as work to a server's --idle-exit: both of the box's image servers hear it
-    b.until("the pinned model's server told to stay", 40, |b| b.seen().lines().filter(|l| l.contains("/api/keepalive")).count() >= 2);
+    b.until("the pinned model loads", 15, |b| b.up("p"));
+    let touches = |b: &Box_| b.seen().lines().filter(|l| l.contains("GET / ")).count();
+    b.until("the pinned model's server told to stay", 15, |b| touches(b) >= 1);
+    let log = b.exec_log();
+    assert!(log.lines().any(|l| l.contains("start p ") && !l.contains("--idle-exit")) || !log.contains("--idle-exit"), "{log}");
     b.ok("system.unpin", json!({"model": "p"}));
-    b.ok("system.unload", json!({"model": "h"}));
-    let before = b.seen().lines().filter(|l| l.contains("/api/keepalive")).count();
-    std::thread::sleep(Duration::from_secs(34));
-    assert_eq!(b.seen().lines().filter(|l| l.contains("/api/keepalive")).count(), before, "an unpinned model idles out as any other");
+    std::thread::sleep(Duration::from_secs(11));
+    let before = touches(&b);
+    std::thread::sleep(Duration::from_secs(11));
+    assert_eq!(touches(&b), before, "an unpinned model idles out as any other");
 }
 
 #[test]
 fn maintenance_refuses_a_pin_and_reloads_none() {
     let b = start("maint", vec![image("p", 8.0)], None, None);
     b.ok("system.pin", json!({"model": "p"}));
+    b.until("the pinned model loads", 15, |b| b.up("p"));
     b.ok("system.maintenance", json!({"on": true, "message": "kernel work", "unload": true}));
     b.until("maintenance's unload takes a pinned model too", 10, |b| !b.up("p"));
     assert_eq!(b.err("system.pin", json!({"model": "p"}))["code"], "maintenance");

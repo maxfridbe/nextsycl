@@ -27,7 +27,7 @@ mod backplane;
 mod config;
 mod disks;
 mod enroll;
-mod eta;
+mod history;
 mod jobs;
 mod life;
 mod maint;
@@ -182,13 +182,12 @@ pub struct Home {
     /// the holds (crate::hold: rsvp_s, X-Keep-Up-S, keep_up_s) in holds.json beside the registry, this door their one writer
     holds_file: PathBuf,
     holds_mx: Mutex<()>,
-    /// history/*.jsonl beside serve.json: what work took (eta.rs)
-    history: PathBuf,
+    /// history/*.jsonl beside serve.json: what work took (history.rs)
+    history: history::History,
     /// the clips watched for a limit or a reservation, and the ones withdrawn at their limit, by label (backplane.rs)
     video_watch: Mutex<Vec<backplane::Watch>>,
     withdrawn: Mutex<BTreeMap<String, Value>>,
-    /// a chat model seen coming up and since when (its load time), and the last chat request here
-    chat_starting: Mutex<Option<(String, f64)>>,
+    /// the last chat request here
     chat_last: Mutex<f64>,
     /// the cards given from outside (fix_cards), not sampled
     cards_fixed: std::sync::atomic::AtomicBool,
@@ -313,14 +312,14 @@ impl Home {
         let maint_file = crate::maintenance::file_beside(&registry::registry(&o.cfg));
         let maint_bypass = Mutex::new(st["maintenance_bypass"].as_str().unwrap_or("").to_string());
         let holds_file = crate::hold::file_beside(&registry::registry(&o.cfg));
-        let history = state_file.with_file_name("history");
+        let history = history::History::open(state_file.with_file_name("history"));
         let h = Arc::new(Home {
             o, token, state_file, jobs,
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), answers: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()),
             holds_file, holds_mx: Mutex::new(()), history, video_watch: Mutex::new(Vec::new()), withdrawn: Mutex::new(BTreeMap::new()),
-            chat_starting: Mutex::new(None), chat_last: Mutex::new(now()), cards_fixed: std::sync::atomic::AtomicBool::new(false),
+            chat_last: Mutex::new(now()), cards_fixed: std::sync::atomic::AtomicBool::new(false),
             pending: Mutex::new(Vec::new()), lock_paused: Mutex::new(None), progress: Mutex::new(BTreeMap::new()),
             maint_file, maint_bypass, disks: disks::Disks::new(&st), pulls: pulls::Pulls::default(),
         });
@@ -734,8 +733,8 @@ impl Home {
             "enable" => self.enable(&model, b.get("gpus")).map(|m| json!({"model": m})),
             "disable" => self.disable(&model, b["force"] == true).map(|_| json!({"model": model, "enabled": false})),
             "gpus" => self.set_gpus(&model, b.get("gpus")),
-            "pin" => self.pin(&model, false),
-            "unpin" => self.unpin(&model),
+            "pin" => self.pin(&model).map(|_| json!({"model": model, "pinned": true, "loading": true})),
+            "unpin" => self.unpin(&model).map(|_| json!({"model": model, "pinned": false})),
             "load" => {
                 self.load_async(&model)?;
                 Ok(json!({"model": model, "loading": true}))

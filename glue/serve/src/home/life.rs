@@ -175,6 +175,12 @@ pub(crate) struct Slot {
     busy: bool,
 }
 
+impl Slot {
+    pub(super) fn is_busy(&self) -> bool {
+        self.busy
+    }
+}
+
 /// A request's server, chosen by `ensure`: counted as having work until dropped (after the answer)
 pub(crate) struct Lease<'a> {
     target: Target,
@@ -591,7 +597,7 @@ impl Home {
             let (caps, methods) = capabilities(m);
             json!({"id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "state": state,
                    "spans": spans_all(m, &mc),
-                   "pinned": m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0, |h| h.left(now()).ceil() as u64),
+                   "pinned": enabled && m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round()),
                    "capabilities": caps, "methods": methods,
                    "vouch_mb": vouch.iter().map(|(g, mb)| (g.to_string(), json!(mb))).collect::<serde_json::Map<String, Value>>(),
                    "measured": measured,
@@ -700,7 +706,7 @@ impl Home {
         let on = held_on(&self.named_cards(&self.models()), id);
         let kept = one_card(&m) && !on.is_empty() && on.iter().all(|c| g.contains(c));
         if m["enabled"] != false && matches!(state.as_str(), "loaded" | "busy" | "loading") && kind != "video" && !kept {
-            self.unload_now(id)?;
+            self.unload(id)?;
         }
         registry::update(&self.o.cfg, id, |e| e["gpus"] = json!(g.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","))).map_err(|e| (500, e))?;
         if kind == "video" && m["enabled"] != false {
@@ -723,13 +729,10 @@ impl Home {
         if registry::kind_of(&m) == "video" && !force && self.rendering() {
             return Err((409, "a clip is rendering: pause the studio's queue and wait, or force (the clip stops at its next step)".into()));
         }
-        self.unload_now(id)?;
-        self.release_hold(id);
+        self.unload(id)?;
         registry::update(&self.o.cfg, id, |e| {
             e["enabled"] = json!(false);
-            if let Some(o) = e.as_object_mut() {
-                o.remove("pinned");
-            }
+            e["pinned"] = json!(false);
         }).map_err(|e| (500, e))?;
         if registry::kind_of(&m) == "video" {
             self.video_apply(force).map_err(|e| (500, e))?;
@@ -808,17 +811,8 @@ impl Home {
         }
     }
 
-    /// `system.unload`: a pinned model stays (unpin it first); its hold, if any, ends with it
+    /// Unload `id` if it is loaded (after the requests it is answering): a tool's say (a pin brings it back)
     pub(crate) fn unload(&self, id: &str) -> Result<(), (u16, String)> {
-        if self.pinned(id) {
-            return Err((409, format!("{id} is pinned: system.unpin first")));
-        }
-        self.release_hold(id);
-        self.unload_now(id)
-    }
-
-    /// Unload `id` if it is loaded (after the requests it is answering)
-    pub(crate) fn unload_now(&self, id: &str) -> Result<(), (u16, String)> {
         let m = self.entry(id)?;
         let kind = registry::kind_of(&m);
         match kind {
@@ -863,7 +857,8 @@ impl Home {
         if m["enabled"] == false {
             return Err((409, format!("{id} is disabled (enable it on :8000 or nextsycl models enable {id})")));
         }
-        let limit = Duration::from_secs(if job.is_some() { JOB_ROOM_WAIT_S } else { ROOM_WAIT_S });
+        // (the caller's max_willing_to_wait_s replaces these and enforces itself)
+        let limit = if super::backplane::has_limit() { Duration::MAX } else { Duration::from_secs(if job.is_some() { JOB_ROOM_WAIT_S } else { ROOM_WAIT_S }) };
         let mut t0 = Instant::now();
         loop {
             if job.is_some_and(|j| self.job_cancelled(j)) {
@@ -872,7 +867,7 @@ impl Home {
             // its files moving to another drive: it waits for the move like for room
             if let Some(why) = self.moving_why(id) {
                 self.note(job, "waiting", &why);
-                if let Some(f) = super::backplane::past_limit() {
+                if let Some(f) = self.past_limit() {
                     return Err(f);
                 }
                 if t0.elapsed() > limit {
@@ -889,7 +884,7 @@ impl Home {
                 Err(why) => why,
             };
             // its limit on the time to start (max_willing_to_wait_s), once a try found no way: a hot model is on its server by now
-            if let Some(f) = super::backplane::past_limit() {
+            if let Some(f) = self.past_limit() {
                 return Err(f);
             }
             // a GPU run holds the cards: a request is refused at once (cards_taken, retryable); a job waits in its queue
@@ -932,7 +927,7 @@ impl Home {
         let want = |g: usize| need.get(&g).copied().unwrap_or(0) + MARGIN_MB;
         let cards = self.named_cards(&self.models());
         // a server that holds another model and could go now
-        let free_to_go = |x: &Slot| x.model.as_deref().is_none_or(|o| self.protected_why(o).is_none());
+        let free_to_go = |x: &Slot| x.model.as_deref().is_none_or(|o| !self.kept(o));
         let idle_other = |x: &&Slot| x.model.is_some() && x.model.as_deref() != Some(id) && !x.busy && !x.loading && inflight(x.port) == 0 && free_to_go(x);
         if !mine.is_empty() {
             // its servers all have work: another copy on a card of its without one that has the room now (or once idle
@@ -1035,7 +1030,7 @@ impl Home {
             if job.is_some_and(|j| self.job_cancelled(j)) {
                 return Err((499, format!("cancelled while it waited for {other}'s requests")));
             }
-            if let Some(f) = super::backplane::past_limit() {
+            if let Some(f) = self.past_limit() {
                 return Err(f);
             }
             if t0.elapsed() > Duration::from_secs(JOB_ROOM_WAIT_S) {
@@ -1060,13 +1055,7 @@ impl Home {
         let free = |g: usize| self.free_mb(cards, g);
         let busy: Vec<String> = gpus.iter().map(|g| {
             let mut holders: Vec<String> = cards.get(*g).and_then(|c| c["procs"].as_array()).into_iter().flatten()
-                .map(|p| {
-                    let gib = p["vram_mb"].as_u64().unwrap_or(0) as f64 / 1024.0;
-                    match p["model_id"].as_str().and_then(|m| self.protected_why(m)) {
-                        Some(why) => format!("{why} {gib:.1} GiB"),
-                        None => format!("{} {gib:.1} GiB", p["model"].as_str().or(p["program"].as_str()).unwrap_or("?")),
-                    }
-                })
+                .map(|p| format!("{} {:.1} GiB", p["model"].as_str().or(p["program"].as_str()).unwrap_or("?"), p["vram_mb"].as_u64().unwrap_or(0) as f64 / 1024.0))
                 .collect();
             // what only the root sampler sees (processes of other users)
             if let Some(mb) = cards.get(*g).and_then(|c| c["vram_unseen_mb"].as_u64()).filter(|mb| *mb >= 256) {
@@ -1074,8 +1063,8 @@ impl Home {
             }
             format!("GPU {g}: {:.1} GiB free ({})", free(*g) as f64 / 1024.0, holders.join(", "))
         }).collect();
-        format!("{} held by work that is not idle - {}; {id} needs ~{:.1} GiB", if gpus.len() > 1 { "its cards are" } else { "its card is" },
-                busy.join("; "), want as f64 / 1024.0)
+        format!("{} held by work that is not idle - {}; {id} needs ~{:.1} GiB{}", if gpus.len() > 1 { "its cards are" } else { "its card is" },
+                busy.join("; "), want as f64 / 1024.0, self.kept_words(cards, gpus))
     }
 
     /// What could go from card `g` so `want` MiB is free there: none needed (Some(empty)), the idle holders to stop
@@ -1100,7 +1089,7 @@ impl Home {
             let mb = p["vram_mb"].as_u64().unwrap_or(0);
             let model = p["model_id"].as_str().or(p["model"].as_str()).unwrap_or("?").to_string();
             // pinned or held: it stays, whoever asks
-            if self.protected_why(&model).is_some() {
+            if self.kept(&model) {
                 continue;
             }
             match p["kind"].as_str() {
@@ -1114,7 +1103,7 @@ impl Home {
                 Some("video") if !light && asking != "video" => {
                     let ok = *video_checked.get_or_insert_with(|| self.video_idle());
                     // the worker by what its slot says it holds (its process's arguments may not name a registered model)
-                    let held_engine = self.video_daemon().is_some_and(|(_, loaded)| loaded.iter().any(|(e, on)| *on == g && self.protected_why(e).is_some()));
+                    let held_engine = self.video_daemon().is_some_and(|(_, loaded)| loaded.iter().any(|(e, on)| *on == g && self.kept(e)));
                     if ok && !held_engine {
                         idle.push(Holder { what: Free::Video(g), mb, model, order: 1 });
                     }
@@ -1179,10 +1168,8 @@ impl Home {
             }
         }
         pick_plan(free, want, idle).ok_or_else(|| {
-            let held: Vec<String> = cards.as_array().into_iter().flatten().flat_map(|c| c["procs"].as_array().into_iter().flatten())
-                .filter_map(|p| p["model_id"].as_str().and_then(|m| self.protected_why(m))).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-            let who = if held.is_empty() { String::new() } else { format!(" ({})", held.join(", ")) };
-            format!("host memory is held by work that is not idle{who} - {:.1} GiB free; {id} needs ~{:.1} GiB", free as f64 / 1024.0, want as f64 / 1024.0)
+            let all: Vec<usize> = (0..cards.as_array().map_or(0, Vec::len)).collect();
+            format!("host memory is held by work that is not idle - {:.1} GiB free; {id} needs ~{:.1} GiB{}", free as f64 / 1024.0, want as f64 / 1024.0, self.kept_words(cards, &all))
         })
     }
 
@@ -1287,7 +1274,7 @@ impl Home {
     }
 
     /// Whether the studio has nothing to make: no clip running, none runnable in the queue
-    fn video_idle(&self) -> bool {
+    pub(super) fn video_idle(&self) -> bool {
         call_for(&self.target("video"), "POST", "/rpc/status", Some(&json!({})), 4).ok().map(|v| v.get("result").cloned().unwrap_or(v))
             .is_some_and(|st| st["idle"] == true && st["queue_items"].as_array().is_none_or(|a| a.iter().all(|i| i["held"] == true)))
     }
@@ -1310,7 +1297,7 @@ impl Home {
         };
         let answering = call_for(&Target::Unix(self.chat_socket()), "GET", "/server/requests", None, 3).ok()
             .map(|v| v["active"].as_array().is_some_and(|a| !a.is_empty()));
-        // the one hold: rsvp_s, this door's keeps, or a pin
+        // a pin, rsvp_s or this door's keeps
         let kept_here = self.pinned(&id) || self.holds().get(&id).is_some_and(|h| h.left(now()) > 0.0);
         let kept_by_switcher = if listening(self.o.ports.switch) {
             call_for(&Target::Tcp(format!("127.0.0.1:{}", self.o.ports.switch)), "GET", "/keep", None, 3).ok()
@@ -1348,7 +1335,7 @@ impl Home {
         }
         // one chat server: a pinned or reserved model there does not give way to this one
         if let Some(why) = self.chat_loaded(&all).and_then(|c| self.swap_blocked(&c)) {
-            return Err((503, format!("the chat server is {why}; {id} loads once it is free")));
+            return Err((503, format!("the chat server holds one model at a time and {why}; {id} loads once it is released")));
         }
         // a GPU run holds the cards (crate::gpulock): no chat model loads beside it
         if let Some(why) = self.cards_taken() {
@@ -1356,8 +1343,9 @@ impl Home {
         }
         let gpus = self.gpus_of(m);
         let t0 = Instant::now();
+        let room_wait = if super::backplane::has_limit() { Duration::MAX } else { Duration::from_secs(ROOM_WAIT_S) };
         loop {
-            if let Some(f) = super::backplane::past_limit() {
+            if let Some(f) = self.past_limit() {
                 return Err(f);
             }
             let cards = self.named_cards(&all);
@@ -1380,7 +1368,7 @@ impl Home {
                         }
                     }
                     Err(why) => {
-                        if t0.elapsed() > Duration::from_secs(ROOM_WAIT_S) {
+                        if t0.elapsed() > room_wait {
                             return Err((503, format!("{why}; {id} loads once one of them idles out or is stopped")));
                         }
                     }
@@ -1397,7 +1385,7 @@ impl Home {
                     }
                 }
             }
-            if t0.elapsed() > Duration::from_secs(ROOM_WAIT_S) {
+            if t0.elapsed() > room_wait {
                 let lack = short.iter().map(|g| self.no_room(&cards, &[*g], id, want(*g))).collect::<Vec<_>>().join(" / ");
                 return Err((503, format!("{lack}; {id} loads once one of them idles out or is stopped")));
             }
@@ -1427,19 +1415,17 @@ impl Home {
 
     fn start_at_(&self, kind: &str, id: &str, x: &Slot, gpu: usize) -> Result<(), (u16, String)> {
         let secs = (self.o.idle_minutes * 60).to_string();
+        // (a pinned model's server does not end itself when idle)
         let mut args = vec![kind.to_string(), "start".into(), id.into(), "--gpu".into(), gpu.to_string(), "--port".into(), x.port.to_string(),
                             "--host".into(), self.o.serve_host.clone(), "--wfe".into(), "--slot".into(), x.slot.to_string()];
-        if self.o.idle_minutes > 0 {
+        if self.o.idle_minutes > 0 && !self.pinned(id) {
             args.extend(["--idle-exit".into(), secs]);
         }
         self.loading.lock().unwrap().insert(id.to_string(), now());
         let r = self.exec(format!("{kind} start {id} on GPU {gpu}{}", if x.slot > 0 { format!(" (server {})", x.slot + 1) } else { String::new() }), &args);
         self.loading.lock().unwrap().remove(id);
         r.map_err(|e| (502, e))?;
-        let t0 = Instant::now();
-        self.wait_up(x.port, id)?;
-        self.loaded_in(id, t0.elapsed().as_secs_f64());
-        Ok(())
+        self.wait_up(x.port, id)
     }
 
     /// A request on its way to the server on `port` (counted until the lease is dropped)

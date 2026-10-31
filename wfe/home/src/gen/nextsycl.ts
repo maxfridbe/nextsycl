@@ -28,7 +28,7 @@ export interface AudioGenerateReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -211,7 +211,7 @@ export interface AudioSpeakReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -312,7 +312,7 @@ export interface AudioTranscribeReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -418,7 +418,7 @@ export interface AudioVoicesDesignReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -450,7 +450,7 @@ export interface AudioVoicesEnrollReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -552,7 +552,7 @@ export interface ImageEditReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -639,7 +639,7 @@ export interface ImageGenerateReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -757,7 +757,7 @@ export interface ImageOcrReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -871,7 +871,7 @@ export interface ImageUpscaleReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -949,7 +949,7 @@ export interface ImageVectorizeReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -1046,7 +1046,7 @@ export interface LlmChatReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -1117,7 +1117,7 @@ export interface Model3dGenerateReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -1296,7 +1296,7 @@ export interface Model3dRigReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -1474,12 +1474,13 @@ export interface SystemEnableReq {
 
 /** What system.eta takes. */
 export interface SystemEtaReq {
-  /** the method it would call (one that runs a model: image.generate, llm.chat, video.generate ...) */
+  /** the method the request would call (image.generate, llm.chat ...) */
   method: string;
-  /**
-   * the longest it would wait to start: the answer's would_accept
-   * @minimum 0
-   */
+  /** the request's parameters as the method takes them (only the size-driving ones matter) */
+  params?: unknown | null;
+  /** the model (default: the one the request would pick) */
+  model?: string | null;
+  /** the longest you would wait for it to start: the answer says whether it would be accepted (would_accept) */
   max_willing_to_wait_s?: number | null;
   /** other keys */
   [key: string]: unknown;
@@ -1585,8 +1586,6 @@ export interface SystemMoveReq {
 export interface SystemPinReq {
   /** the model's registry id (system.models) */
   model: string;
-  /** answer when it has loaded (the default; a model that cannot load is not left pinned). false: at once, the pin stands and the load is tried until it holds */
-  wait?: boolean | null;
   /** other keys */
   [key: string]: unknown;
 }
@@ -1663,6 +1662,16 @@ export interface VideoDescribePromptGuideMdReq {
 
 /** What video.engines.list takes. */
 export interface VideoEnginesListReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
   /** other keys */
   [key: string]: unknown;
 }
@@ -1681,7 +1690,7 @@ export interface VideoGenerateReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -2037,7 +2046,7 @@ export interface VideoUpscaleReq {
    */
   rsvp_s?: number | null;
   /**
-   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
    * @minimum 0
    */
   max_willing_to_wait_s?: number | null;
@@ -2217,21 +2226,21 @@ export interface Methods {
    */
   "system.unload": { req: SystemUnloadReq; resp: any };
   /**
-   * Pin a model: loaded now, never stopped for room, kept in the registry and loaded again after a restart
+   * Pin an enabled model: it loads now (in the background) and stays: no idle unload, never stopped for another model's room (that one answers 503 no_room naming the pin). Kept across a restart of the front door; disabling the model unpins it
    * @tags system
    * @example {"model":"qwen-image-2.1-q8"}
    */
   "system.pin": { req: SystemPinReq; resp: any };
   /**
-   * Unpin a model: it may be stopped for room again and unloads when idle
+   * Unpin a model: only the flag is cleared; it stays loaded until the idle rules take it
    * @tags system
    * @example {"model":"qwen-image-2.1-q8"}
    */
   "system.unpin": { req: SystemUnpinReq; resp: any };
   /**
-   * How long a request would wait and run, from the model's history and what is ahead of it, and whether a limit would accept it; loads nothing, queues nothing
+   * The ETA a request would get now - {wait_s, run_s, total_s, samples, basis (shape | model | none), spread} from the last 100 requests of its shape - and whether max_willing_to_wait_s would accept it; nothing is started, queued or loaded, so a caller can ask first and choose another machine
    * @tags system
-   * @example {"max_willing_to_wait_s":60,"method":"image.generate","params":{"model":"qwen-image-2.1-q8","size":"1024x1024"}}
+   * @example {"max_willing_to_wait_s":120,"method":"image.generate","params":{"height":1024,"steps":28,"width":1024}}
    */
   "system.eta": { req: SystemEtaReq; resp: any };
   /**
@@ -2710,6 +2719,7 @@ export interface Methods {
   /**
    * The denoisers the daemon has, and the video.generate keys each takes: INT8 / Q6_K / Q4_K_M (text and image to video: anchors, guides, ControlNet, masked runs) and REF2VA (reference pictures and clips; no ControlNet or masked runs). ref_audios, anchors and guides work with every one
    * @tags video
+   * @example {}
    */
   "video.engines.list": { req: VideoEnginesListReq; resp: any };
   /**
@@ -2737,7 +2747,7 @@ export interface Methods {
 }
 
 /** The methods that take no parameters (their body may be left out). */
-export type NoParamMethods = "system.state" | "system.busy" | "system.ping" | "system.version" | "system.models" | "system.models.pulls" | "system.cards" | "system.config" | "system.drives" | "system.move.cancel" | "llm.requests" | "llm.models" | "image.queue.list" | "image.progress" | "image.history" | "audio.progress" | "audio.history" | "audio.queue.list" | "model3d.progress" | "model3d.history" | "model3d.queue.list" | "video.status" | "video.queue.list" | "video.projects.list" | "video.films.list" | "video.templates.list" | "video.engines.list" | "video.canvases.list" | "video.summary";
+export type NoParamMethods = "system.state" | "system.busy" | "system.ping" | "system.version" | "system.models" | "system.models.pulls" | "system.cards" | "system.config" | "system.drives" | "system.move.cancel" | "llm.requests" | "llm.models" | "image.queue.list" | "image.progress" | "image.history" | "audio.progress" | "audio.history" | "audio.queue.list" | "model3d.progress" | "model3d.history" | "model3d.queue.list" | "video.status" | "video.queue.list" | "video.projects.list" | "video.films.list" | "video.templates.list" | "video.canvases.list" | "video.summary";
 
 /** Every error's body, whatever the HTTP status: branch on `code`, never on the status (docs/RPC_RULES.md). */
 export interface RpcError {
@@ -2848,21 +2858,21 @@ export function client(post: Post, raw?: PostRaw) {
      */
     "system.unload": (req: SystemUnloadReq): Promise<any> => post("system.unload", req),
     /**
-     * Pin a model: loaded now, never stopped for room, kept in the registry and loaded again after a restart
+     * Pin an enabled model: it loads now (in the background) and stays: no idle unload, never stopped for another model's room (that one answers 503 no_room naming the pin). Kept across a restart of the front door; disabling the model unpins it
      * @tags system
      * @example {"model":"qwen-image-2.1-q8"}
      */
     "system.pin": (req: SystemPinReq): Promise<any> => post("system.pin", req),
     /**
-     * Unpin a model: it may be stopped for room again and unloads when idle
+     * Unpin a model: only the flag is cleared; it stays loaded until the idle rules take it
      * @tags system
      * @example {"model":"qwen-image-2.1-q8"}
      */
     "system.unpin": (req: SystemUnpinReq): Promise<any> => post("system.unpin", req),
     /**
-     * How long a request would wait and run, from the model's history and what is ahead of it, and whether a limit would accept it; loads nothing, queues nothing
+     * The ETA a request would get now - {wait_s, run_s, total_s, samples, basis (shape | model | none), spread} from the last 100 requests of its shape - and whether max_willing_to_wait_s would accept it; nothing is started, queued or loaded, so a caller can ask first and choose another machine
      * @tags system
-     * @example {"max_willing_to_wait_s":60,"method":"image.generate","params":{"model":"qwen-image-2.1-q8","size":"1024x1024"}}
+     * @example {"max_willing_to_wait_s":120,"method":"image.generate","params":{"height":1024,"steps":28,"width":1024}}
      */
     "system.eta": (req: SystemEtaReq): Promise<any> => post("system.eta", req),
     /**
@@ -3341,8 +3351,9 @@ export function client(post: Post, raw?: PostRaw) {
     /**
      * The denoisers the daemon has, and the video.generate keys each takes: INT8 / Q6_K / Q4_K_M (text and image to video: anchors, guides, ControlNet, masked runs) and REF2VA (reference pictures and clips; no ControlNet or masked runs). ref_audios, anchors and guides work with every one
      * @tags video
+     * @example {}
      */
-    "video.engines.list": (req: VideoEnginesListReq = {}): Promise<any> => post("video.engines.list", req),
+    "video.engines.list": (req: VideoEnginesListReq): Promise<any> => post("video.engines.list", req),
     /**
      * The canvases and their measured cost
      * @tags video

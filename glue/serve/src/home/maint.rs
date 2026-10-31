@@ -161,7 +161,7 @@ impl Home {
         for id in ids.clone() {
             let me = self.clone();
             std::thread::spawn(move || {
-                if let Err((_, e)) = me.unload_now(&id) {
+                if let Err((_, e)) = me.unload(&id) {
                     eprintln!("maintenance: {id} not unloaded: {e}");
                 }
             });

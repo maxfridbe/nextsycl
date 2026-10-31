@@ -1,41 +1,41 @@
-//! The backplane: what a caller may promise and be promised about the cards, the same on every box.
+//! The backplane: what a caller may promise and be promised about the cards, the same on every box (nextcuda's
+//! docs/control-plane.md is the description both follow).
 //!
-//! - **Pin** (`system.pin` / `system.unpin`): loaded now, never stopped for room, `pinned` in the registry, loaded
-//!   again after a restart. A pinned model's server is kept from its own idle exit.
-//! - **`rsvp_s`** (optional on a method that runs a model): the model is held that long after the request ends - clamped
-//!   to NS_MAX_RSVP_S, never shortened by a smaller value, 0 releases; the result says `rsvp_granted_s`. X-Keep-Up-S and
-//!   keep_up_s are the same hold (crate::hold).
-//! - **ETA** (`system.eta`, and `eta` / `eta_remaining_s` on jobs): from each model's history (eta.rs), the work ahead in
-//!   the queues, and its load time when it is not up.
+//! - **Pin** (`system.pin` / `system.unpin`): loaded now in the background, never stopped for room or for idleness,
+//!   `pinned` in the registry, loaded again after a restart. A load that fails leaves the pin set and is tried again.
+//! - **`rsvp_s`** (optional on a method that runs a model): the model is held that long after the request ends, answered,
+//!   failed or cancelled - clamped to NS_MAX_RSVP_S, never shortened by a later, shorter one; 0 releases (it goes as soon
+//!   as it is idle, unless an earlier hold still stands); the result says `rsvp_granted_s`. crate::hold has the arithmetic.
+//! - **ETA** (`system.eta`, and `eta` / `eta_remaining_s` on jobs): history.rs from what work took, here the work ahead.
 //! - **`max_willing_to_wait_s`**: the limit on the time to START. A known wait over it is declined at once
-//!   (`wait_too_long`, nothing queued, nothing stopped); an unknown one goes ahead and is withdrawn at the limit; a hot
-//!   model (loaded) is never declined.
-//! - **On demand**: any `video.*` call brings a stopped daemon up (VIDEO_UP_S at most). Models unload when idle or when
-//!   room is needed; only idle holders neither pinned nor held go (life.rs idle_on).
+//!   (`wait_too_long`, nothing queued, nothing stopped); an unknown one goes ahead and is withdrawn at the limit; a loaded
+//!   model with a free server always starts. Given, it replaces the default waits (90 s a request, 30 min a job).
+//! - **On demand**: any `video.*` call brings a stopped daemon up (VIDEO_UP_S at most), and a watcher brings back one that
+//!   crashed. Models unload when idle or when room is needed; only idle holders neither pinned nor held go (life.rs idle_on).
 //!
 //! A request's limit, reservation and timings travel with its thread (`REQ`), so the room rule in life.rs can honour
 //! them without every method's arm passing them along.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use super::history::{shape_of, Record};
 use super::life::s;
-use super::{eta, now, registry, Home};
+use super::{now, registry, Home};
 use crate::hold;
-use crate::http::{call_for, call_status, Target};
+use crate::http::{call_for, Target};
 
 type Fail = (u16, String);
 
 /// How long a video call waits for a stopped daemon
 pub(super) const VIDEO_UP_S: u64 = 120;
-/// How long a pinned clip engine may take to load
-const VIDEO_LOAD_S: u64 = 900;
 
 /// The methods that run a model: what takes `rsvp_s` and `max_willing_to_wait_s` and what `system.eta` answers for
-pub(super) const RUNS_MODEL: &[&str] = &["llm.chat", "image.generate", "image.edit", "image.upscale", "image.vectorize", "image.ocr", "video.upscale", "video.generate",
+pub(super) const RUNS_MODEL: &[&str] = &["llm.chat", "image.generate", "image.edit", "image.upscale", "image.vectorize", "image.ocr", "video.upscale", "video.generate", "video.engines.list",
     "audio.generate", "audio.speak", "audio.transcribe", "audio.voices.design", "audio.voices.enroll", "model3d.generate", "model3d.rig"];
 
 /// The fields of the backplane that are the door's, not a server's
@@ -59,27 +59,32 @@ pub(super) fn untag(m: &str) -> Option<(String, Value, String)> {
     Some((code.to_string(), serde_json::from_str(fields).ok()?, words.to_string()))
 }
 
-/// wait_too_long: the wait known or waited, the limit, nothing started
-pub(super) fn wait_too_long(eta: &Value, limit: f64, waited: Option<f64>) -> Fail {
-    let mut f = json!({"eta": eta, "max_willing_to_wait_s": limit});
-    let words = match waited {
-        Some(w) => {
-            f["waited_s"] = json!((w * 10.0).round() / 10.0);
-            format!("withdrawn: not started after {w:.0} s, the limit was {limit} s")
-        }
-        None => format!("the wait is ~{:.0} s, the limit is {limit} s; nothing was queued", eta["wait_s"].as_f64().unwrap_or(0.0)),
-    };
-    (503, tag("wait_too_long", &f, &words))
+/// wait_too_long, declined before anything started
+fn declined(eta: &Value, wait: f64, limit: f64) -> Fail {
+    (503, tag("wait_too_long", &json!({"eta": eta, "max_willing_to_wait_s": limit}),
+              &format!("it would start in about {wait:.0} s, past the {limit:.0} s you will wait; nothing was started for it")))
+}
+
+/// wait_too_long, withdrawn after waiting
+pub(super) fn withdrawn(eta: &Value, limit: f64, waited: f64) -> Fail {
+    (503, tag("wait_too_long", &json!({"eta": eta, "max_willing_to_wait_s": limit, "waited_s": waited.round()}),
+              &format!("it had not started after {waited:.0} s, past the {limit:.0} s you will wait; withdrawn")))
+}
+
+/// A request's limit: a number, 0 or more (anything else: none)
+pub(super) fn limit_of(b: &Value) -> Option<f64> {
+    b["max_willing_to_wait_s"].as_f64().filter(|x| *x >= 0.0)
 }
 
 /// What a request on this thread promised and what became of it
 #[derive(Clone, Debug, Default)]
 struct Req {
+    method: String,
+    params: Value,
     rsvp_s: Option<f64>,
     limit: Option<f64>,
     /// when its wait began
     t0: f64,
-    eta: Value,
     /// the model it went to, and when it was sent there
     model: Option<String>,
     sent: Option<f64>,
@@ -89,9 +94,9 @@ thread_local! {
     static REQ: RefCell<Option<Req>> = const { RefCell::new(None) };
 }
 
-/// This thread's request, from its body: what it promised, with `eta` as admission saw it and `t0` when it came
-pub(super) fn begin(b: &Value, eta: Value, t0: f64) {
-    let r = Req { rsvp_s: b["rsvp_s"].as_f64(), limit: b["max_willing_to_wait_s"].as_f64(), t0, eta, model: None, sent: None };
+/// This thread's request, from its body: what it promised, `t0` when it came
+pub(super) fn begin(method: &str, b: &Value, t0: f64) {
+    let r = Req { method: method.to_string(), params: stripped(b), rsvp_s: b["rsvp_s"].as_f64().filter(|x| *x >= 0.0), limit: limit_of(b), t0, model: None, sent: None };
     REQ.with(|x| *x.borrow_mut() = Some(r));
 }
 
@@ -105,27 +110,17 @@ pub(super) fn sent_to(id: &str) {
     });
 }
 
-/// The request's own limit, passed: the failure to answer with (it has not started)
-pub(super) fn past_limit() -> Option<Fail> {
-    REQ.with(|x| {
-        let b = x.borrow();
-        let r = b.as_ref()?;
-        let limit = r.limit?;
-        let waited = now() - r.t0;
-        (r.sent.is_none() && waited > limit).then(|| wait_too_long(&r.eta, limit, Some(waited)))
-    })
+/// Whether this thread's request gave a limit: it replaces the default waits
+pub(super) fn has_limit() -> bool {
+    REQ.with(|x| x.borrow().as_ref().is_some_and(|r| r.limit.is_some()))
 }
 
-/// What a request's `rsvp_s` and `max_willing_to_wait_s` must be
+/// `rsvp_s` as it must be (the fields' types are the request struct's check)
 pub(super) fn check_fields(b: &Value) -> Result<(), Fail> {
-    for k in OWN_FIELDS {
-        match &b[k] {
-            Value::Null => {}
-            v if v.as_f64().is_some_and(|x| x >= 0.0) => {}
-            v => return Err((400, format!("{k} {v}: seconds, 0 or more"))),
-        }
+    match b.get("rsvp_s") {
+        Some(v) if !v.is_null() && !v.as_f64().is_some_and(|x| x >= 0.0) => Err((400, "rsvp_s: seconds, 0 or more".into())),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// The request's body as a server should see it
@@ -143,17 +138,10 @@ pub(super) fn stripped(b: &Value) -> Value {
 pub(super) struct Watch {
     label: String,
     model: String,
+    params: Value,
     rsvp_s: Option<f64>,
     limit: Option<f64>,
     t0: f64,
-    eta: Value,
-}
-
-/// A job the limit passed while it stood in its queue
-pub(super) fn past_in_queue(j: &Value, at: f64) -> Option<f64> {
-    let limit = j["max_willing_to_wait_s"].as_f64()?;
-    let waited = at - j["created"].as_f64()?;
-    (waited > limit).then_some(waited)
 }
 
 /// A video engine named by a clip's row: a Ref2VA clip's, else the one the daemon defaults to
@@ -163,8 +151,17 @@ fn clip_model(row: &Value, all: &[Value]) -> Option<String> {
     on.iter().find(|m| s(m, "id").contains("ref2va") == refs).or(on.first()).map(|m| s(m, "id"))
 }
 
+/// Whether the daemon lacks an enabled model's engine (`running`: its engines; none: it is down)
+fn video_missing(enabled: &[String], running: Option<&[String]>) -> bool {
+    !enabled.is_empty() && running.is_none_or(|r| enabled.iter().any(|e| !r.contains(e)))
+}
+
+fn video_enabled(all: &[Value]) -> Vec<String> {
+    all.iter().filter(|m| registry::kind_of(m) == "video" && m["enabled"] != false).map(|m| s(m, "id")).collect()
+}
+
 impl Home {
-    fn max_rsvp(&self) -> u64 {
+    fn max_rsvp(&self) -> f64 {
         hold::max_rsvp_s(self.o.cfg.get("NS_MAX_RSVP_S"))
     }
 
@@ -182,296 +179,215 @@ impl Home {
         r
     }
 
-    /// `rsvp_s` for `id` now: the seconds held
-    pub(super) fn grant_rsvp(&self, id: &str, secs: f64) -> u64 {
+    /// `rsvp_s` for `id` now: the seconds granted
+    pub(super) fn grant_rsvp(&self, id: &str, secs: f64) -> f64 {
         let max = self.max_rsvp();
         self.change_holds(|h| hold::grant_rsvp(h, id, secs, max, now()))
     }
 
-    /// A chat request's keep (X-Keep-Up-S / keep_up_s): the same hold
+    /// A chat request's keep (X-Keep-Up-S / keep_up_s)
     pub(crate) fn keep_chat(&self, id: &str, secs: u64) {
         let max = self.max_rsvp();
         self.change_holds(|h| hold::grant_keep(h, id, secs, max, now()));
-    }
-
-    /// Hold `id` no more (it went away on purpose)
-    pub(super) fn release_hold(&self, id: &str) {
-        self.change_holds(|h| h.remove(id));
     }
 
     pub(super) fn pinned(&self, id: &str) -> bool {
         registry::find(&self.o.cfg, id).ok().flatten().is_some_and(|m| m["pinned"] == true)
     }
 
-    /// Seconds the switcher keeps a chat model for (its X-Keep-Up-S)
-    fn switcher_keep(&self, id: &str) -> f64 {
-        if self.o.ports.switch == 0 {
-            return 0.0;
-        }
-        call_for(&Target::Tcp(format!("127.0.0.1:{}", self.o.ports.switch)), "GET", "/keep", None, 3).ok()
-            .and_then(|k| k["kept"][id].as_f64()).unwrap_or(0.0)
+    /// Seconds rsvp_s holds `id` for yet
+    pub(super) fn held_s(&self, id: &str) -> f64 {
+        self.holds().get(id).map_or(0.0, |h| h.reserved(now()))
     }
 
-    /// Why `id` may not be stopped for room, in the words no_room uses: pinned, or held; none: it may
-    pub(super) fn protected_why(&self, id: &str) -> Option<String> {
-        if self.pinned(id) {
-            return Some(format!("pinned: {id} (unpin to free the room)"));
-        }
-        let left = self.holds().get(id).map_or(0.0, |h| h.left(now())).max(self.switcher_keep(id));
-        (left > 0.0).then(|| format!("held by rsvp_s: {id} ({} s more)", left.ceil() as u64))
+    /// Whether `id` stays when room is needed: pinned or held by rsvp_s. (A chat model's keep stays too, in chat_hold.)
+    pub(super) fn kept(&self, id: &str) -> bool {
+        self.pinned(id) || self.held_s(id) > 0.0
     }
 
-    /// Why the chat model loaded may not give way to another chat model: pinned or reserved. A keep yields, as it always has.
+    /// Why the chat model loaded gives no way to another chat model: pinned or held by rsvp_s. A keep yields, as in nextcuda.
     pub(super) fn swap_blocked(&self, id: &str) -> Option<String> {
         if self.pinned(id) {
             return Some(format!("pinned: {id} (unpin to free the room)"));
         }
-        let left = self.holds().get(id).map_or(0.0, |h| h.reserved(now()));
-        (left > 0.0).then(|| format!("held by rsvp_s: {id} ({} s more)", left.ceil() as u64))
+        let left = self.held_s(id);
+        (left > 0.0).then(|| format!("held by rsvp_s: {id} ({left:.0} s more)"))
     }
 
-    /// `system.pin {model, wait}`: pinned and loaded. With `wait` (the default) it answers when loaded; a model that
-    /// cannot be is not left pinned, and the failure (no_room ...) is the answer. `wait: false` answers at once; the
-    /// pin stands and the load is tried until it holds.
-    pub(crate) fn pin(self: &Arc<Self>, id: &str, wait: bool) -> Result<Value, Fail> {
+    /// What no_room adds about the models on these cards that will not go
+    pub(super) fn kept_words(&self, cards: &Value, gpus: &[usize]) -> String {
+        let mut on: Vec<String> = gpus.iter().filter_map(|g| cards.get(*g)).flat_map(|c| c["procs"].as_array().into_iter().flatten())
+            .filter_map(|p| p["model_id"].as_str().or(p["model"].as_str())).map(str::to_string).collect();
+        on.sort();
+        on.dedup();
+        let pinned: Vec<&String> = on.iter().filter(|m| self.pinned(m)).collect();
+        let held: Vec<&String> = on.iter().filter(|m| !self.pinned(m) && self.held_s(m) > 0.0).collect();
+        let name = |v: &[&String]| v.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(", ");
+        let mut w = String::new();
+        if !pinned.is_empty() {
+            w += &format!("; pinned: {} (unpin to free the room)", name(&pinned));
+        }
+        if !held.is_empty() {
+            w += &format!("; held by rsvp_s: {} (until its hold ends: {})", name(&held), held.iter().map(|h| format!("{h} {:.0} s", self.held_s(h))).collect::<Vec<_>>().join(", "));
+        }
+        w
+    }
+
+    /// `system.pin`: the flag beside `enabled`, then loaded in the background. A load that fails leaves the pin set: it is a run on the page, and tried again.
+    pub(crate) fn pin(self: &Arc<Self>, id: &str) -> Result<(), Fail> {
         let m = self.entry(id)?;
         if m["enabled"] == false {
             return Err((409, format!("{id} is disabled: enable it first")));
         }
-        if let Some(why) = self.moving_why(id) {
-            return Err((409, why));
-        }
-        let was = m["pinned"] == true;
         registry::update(&self.o.cfg, id, |e| e["pinned"] = json!(true)).map_err(|e| (500, e))?;
-        if !wait {
-            let me = self.clone();
-            let i = id.to_string();
-            std::thread::spawn(move || me.pin_load_logged(&i));
-            return Ok(json!({"model": id, "pinned": true, "loading": true}));
-        }
-        match self.pin_load(id) {
-            Ok(()) => Ok(json!({"model": id, "pinned": true, "loaded": true})),
-            Err(e) => {
-                if !was {
-                    let _ = registry::update(&self.o.cfg, id, |e| {
-                        if let Some(o) = e.as_object_mut() {
-                            o.remove("pinned");
-                        }
-                    });
-                }
-                Err(e)
-            }
-        }
+        self.load_async(id)
     }
 
-    /// `system.unpin {model}`: it may be stopped for room again and unloads when idle
-    pub(crate) fn unpin(&self, id: &str) -> Result<Value, Fail> {
+    /// `system.unpin`: the flag only. The model stays loaded until the idle rules take it.
+    pub(crate) fn unpin(&self, id: &str) -> Result<(), Fail> {
         self.entry(id)?;
-        registry::update(&self.o.cfg, id, |e| {
-            if let Some(o) = e.as_object_mut() {
-                o.remove("pinned");
-            }
-        }).map_err(|e| (500, e))?;
-        Ok(json!({"model": id, "pinned": false}))
+        registry::update(&self.o.cfg, id, |e| e["pinned"] = json!(false)).map_err(|e| (500, e))?;
+        Ok(())
     }
 
-    /// A pinned model on its cards
-    fn pin_load(&self, id: &str) -> Result<(), Fail> {
-        if let Some(why) = self.cards_taken() {
-            if !self.is_hot(id) {
-                return Err((503, why));
-            }
-        }
-        let m = self.entry(id)?;
-        match registry::kind_of(&m) {
-            "video" => {
-                self.video_up()?;
-                self.video_load(id)
-            }
-            _ => self.load(id),
-        }
-    }
-
-    fn pin_load_logged(&self, id: &str) {
-        if self.loading.lock().unwrap().insert(id.to_string(), now()).is_some() {
-            return;
-        }
-        let r = self.pin_load(id);
-        self.loading.lock().unwrap().remove(id);
-        if let Err((_, e)) = r {
-            let (rid, log) = self.new_run(format!("pinned: load {id}"));
-            let _ = std::fs::write(log, &e);
-            self.finish(rid, 1);
-        }
-    }
-
-    /// A clip engine loaded with no clip (a job the daemon ends once its worker is up), for a pin
-    fn video_load(&self, id: &str) -> Result<(), Fail> {
-        let up = |h: &Home| h.video_daemon().is_some_and(|(_, loaded)| loaded.iter().any(|(e, _)| e == id));
-        if up(self) {
-            return Ok(());
-        }
-        call_for(&self.target("video"), "POST", "/engine/jobs", Some(&json!({"kind": "load", "engine": id})), 30)
-            .map_err(|e| (502, format!("the video daemon: {e}")))?;
-        let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(VIDEO_LOAD_S) {
-            if up(self) {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_secs(2));
-        }
-        Err((503, format!("{id} did not load in {} minutes (its card may be held)", VIDEO_LOAD_S / 60)))
-    }
-
-    /// The daemon up, for a video call: started when it is stopped, waited for (VIDEO_UP_S)
+    /// The daemon up with the enabled models' engines, for a video call: started when it is not, waited for (VIDEO_UP_S)
     pub(super) fn video_up(&self) -> Result<(), Fail> {
-        if super::listening(self.o.ports.video) {
+        let enabled = video_enabled(&self.models());
+        let running = self.video_daemon().map(|d| d.0);
+        if !video_missing(&enabled, running.as_deref()) {
             return Ok(());
         }
-        self.video_apply(false).map_err(|e| (502, format!("the video daemon did not start: {e}")))?;
+        if let Err(e) = self.video_apply(false) {
+            // a daemon that runs and cannot change now (a clip renders) answers with the engines it has
+            return if running.is_some() { Ok(()) } else { Err((502, format!("the video engine is not running and did not start: {e}"))) };
+        }
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(VIDEO_UP_S) {
-            if super::listening(self.o.ports.video) {
+            if !video_missing(&enabled, self.video_daemon().map(|d| d.0).as_deref()) {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        Err((502, format!("the video daemon did not come up in {VIDEO_UP_S} s")))
+        Err((504, format!("the video engine did not come up in {VIDEO_UP_S} s (nextsycl video start; the runs on this page have its log)")))
     }
 
-    /// Whether the model is on its cards now
-    pub(super) fn is_hot(&self, id: &str) -> bool {
-        let all = self.models();
-        let Some(m) = all.iter().find(|m| m["id"] == id) else { return false };
-        match registry::kind_of(m) {
-            "llm" => self.chat_loaded(&all).as_deref() == Some(id),
-            "video" => self.video_daemon().is_some_and(|(_, l)| l.iter().any(|(e, _)| e == id)),
-            k => self.servers(k).iter().any(|x| x.model.as_deref() == Some(id) && !x.loading),
-        }
-    }
-
-    /// The model a request would run on, without loading or fetching anything: the one it names, else the loaded or first enabled one that does the method
-    fn request_model(&self, method: &str, b: &Value, all: &[Value]) -> Option<String> {
+    /// The model a request would run on, without loading or fetching anything: the one it names, else the loaded or
+    /// first enabled one that does the method ("" when none does)
+    pub(super) fn request_model(&self, method: &str, b: &Value, all: &[Value]) -> String {
         if let Some(id) = b["model"].as_str().filter(|x| !x.is_empty()) {
-            return all.iter().find(|m| m["id"] == id).map(|m| s(m, "id"));
+            return id.to_string();
         }
         let can: Vec<String> = all.iter().filter(|m| m["enabled"] != false && super::life::capabilities(m).1.contains(&method)).map(|m| s(m, "id")).collect();
-        can.iter().find(|id| self.is_hot(id)).or(can.first()).cloned()
-    }
-
-    /// Whether a load of `m` has room now (with the idle, unprotected holders gone)
-    fn room_now(&self, m: &Value) -> bool {
-        if self.cards_taken().is_some() {
-            return false;
-        }
-        let all = self.models();
-        let cards = self.named_cards(&all);
-        let kind = registry::kind_of(m);
-        let gpus = self.gpus_of(m);
-        let card_mb = cards.get(gpus[0]).and_then(|c| c["vram_total_mb"].as_u64()).unwrap_or(32768);
-        let (need, _) = self.vouched_mb(m, card_mb);
-        let want = |g: usize| need.get(&g).copied().unwrap_or(0) + super::life::MARGIN_MB;
-        if kind == "llm" {
-            if self.chat_loaded(&all).is_some_and(|c| self.swap_blocked(&c).is_some()) {
-                return false;
-            }
-            let chat_on = |g: usize| cards.get(g).and_then(|c| c["procs"].as_array()).into_iter().flatten()
-                .filter(|p| p["kind"] == "llm").map(|p| p["vram_mb"].as_u64().unwrap_or(0)).sum::<u64>();
-            return gpus.iter().all(|g| self.room_plan(&cards, *g, want(*g).saturating_sub(chat_on(*g)), "llm", false).is_some());
-        }
-        gpus.iter().any(|g| self.room_plan(&cards, *g, want(*g), kind, false).is_some())
-    }
-
-    /// Seconds of work ahead of a new request on a chat model or clip engine (None: unknown)
-    fn ahead_s(&self, kind: &str, id: &str, rows: &[Value]) -> Option<f64> {
-        match kind {
-            "llm" => {
-                let active = call_for(&Target::Unix(self.chat_socket()), "GET", "/server/requests", None, 3).ok()?["active"].as_array()?.len();
-                if active == 0 {
-                    return Some(0.0);
-                }
-                eta::estimate(rows, "").run_s.map(|r| r * active as f64)
-            }
-            "video" => {
-                if !super::listening(self.o.ports.video) {
-                    return Some(0.0);
-                }
-                let v = call_for(&self.target("video"), "POST", "/rpc/status", Some(&json!({})), 4).ok()?;
-                let st = v.get("result").cloned().unwrap_or(v);
-                let running = if st["idle"] == true { 0.0 } else { st["eta"].as_f64()?.max(0.0) };
-                let mut sum = running;
-                for it in st["queue_items"].as_array().into_iter().flatten().filter(|i| i["held"] != true) {
-                    sum += eta::estimate(rows, &eta::shape_of("video.generate", it)).run_s?;
-                }
-                let _ = id;
-                Some(sum)
-            }
-            k => self.jobs_ahead_s(k),
-        }
-    }
-
-    /// What a request would wait for and how long it would run: (eta, hot, the model). A clip's history includes its
-    /// engine's load, so a cold clip engine's wait is what is ahead of it, known from its history whether or not it is hot.
-    pub(super) fn eta_for(&self, method: &str, b: &Value) -> (Value, bool, Option<String>) {
-        let all = self.models();
-        let shape = eta::shape_of(method, b);
-        let Some(id) = self.request_model(method, b, &all) else {
-            return (eta::eta_json(&eta::estimate(&[], &shape), None, &shape), false, None);
+        let loaded = |id: &String| match all.iter().find(|m| m["id"] == id.as_str()).map_or("", registry::kind_of) {
+            "llm" => self.chat_loaded(all).as_deref() == Some(id.as_str()),
+            "video" => self.video_daemon().is_some_and(|d| d.1.iter().any(|(e, _)| e == id)),
+            k => self.servers(k).iter().any(|x| x.model.as_deref() == Some(id.as_str())),
         };
-        let rows = eta::rows(&self.history, &id);
-        let est = eta::estimate(&rows, &shape);
-        let hot = self.is_hot(&id);
-        let m = all.iter().find(|m| m["id"] == id.as_str());
-        let kind = m.map_or("llm", registry::kind_of);
-        let mut wait = self.ahead_s(kind, &id, &rows);
-        if !hot {
-            // no room even with the idle holders gone: how long that lasts is not known here
-            if m.is_none_or(|m| !self.room_now(m)) {
-                wait = None;
-            } else if kind != "video" {
-                wait = wait.zip(eta::load_s(&rows)).map(|(w, l)| w + l);
-            }
-        }
-        (eta::eta_json(&est, wait, &shape), hot, Some(id))
+        can.iter().find(|id| loaded(id)).or(can.first()).cloned().unwrap_or_default()
     }
 
-    /// `system.eta {method, params, max_willing_to_wait_s}`: read-only
+    /// The seconds a job has left or will take, from history (None: no history)
+    fn job_run_est(&self, j: &Value, all: &[Value]) -> Option<f64> {
+        let method = s(j, "method");
+        let model = self.request_model(&method, &j["body"], all);
+        self.history.eta(&method, &model, &j["body"], true, Some(0.0))["run_s"].as_f64()
+    }
+
+    /// The work ahead of a clip in the studio's queue, from what it says of the running clip and history for the queued (None: some of it has none)
+    fn clips_ahead_s(&self, model: &str) -> Option<f64> {
+        if !super::listening(self.o.ports.video) {
+            return Some(0.0);
+        }
+        let v = call_for(&self.target("video"), "POST", "/rpc/status", Some(&json!({})), 4).ok()?;
+        let st = v.get("result").cloned().unwrap_or(v);
+        let mut sum = if st["idle"] == true { 0.0 } else { st["eta"].as_f64()?.max(0.0) };
+        for it in st["queue_items"].as_array().into_iter().flatten().filter(|i| i["held"] != true) {
+            sum += self.history.eta("video.generate", model, it, true, Some(0.0))["run_s"].as_f64()?;
+        }
+        Some(sum)
+    }
+
+    /// The ETA of a request of `method` with body `b`, now: `exclude` is its own job when it is queued (only what is
+    /// ahead counts). Nothing is started or changed.
+    pub(crate) fn eta_for(&self, method: &str, b: &Value, exclude: Option<&str>) -> Value {
+        let all = self.models();
+        let model = self.request_model(method, b, &all);
+        let kind = super::jobs::kind_of_method(method);
+        let (hot, ahead) = match kind {
+            "image" | "audio" | "model3d" => {
+                let sv = self.servers(kind);
+                let inflight = |p: u16| self.inflight.lock().unwrap().get(&p).copied().unwrap_or(0);
+                let hot = sv.iter().any(|x| x.model.as_deref() == Some(model.as_str()) && !x.loading && !x.is_busy() && inflight(x.port) == 0);
+                (hot, self.jobs_ahead_s(kind, exclude, &|j| self.job_run_est(j, &all)))
+            }
+            "llm" => {
+                let hot = self.chat_loaded(&all).as_deref() == Some(model.as_str());
+                (hot, if hot { Some(0.0) } else { None })
+            }
+            _ => {
+                let hot = self.video_daemon().is_some_and(|d| d.0.contains(&model)) && self.video_idle();
+                (hot, if hot { Some(0.0) } else { self.clips_ahead_s(&model) })
+            }
+        };
+        self.history.eta(method, &model, b, hot, ahead)
+    }
+
+    /// `system.eta {method, params, model, max_willing_to_wait_s}`: read-only
     pub(crate) fn eta_answer(&self, b: &Value) -> Result<Value, Fail> {
         let name = s(b, "method");
         let method = super::methods::find(&name).map(|m| m.full()).filter(|m| runs_model(m))
-            .ok_or_else(|| (400, format!("method {name}: one that runs a model ({})", RUNS_MODEL.join(", "))))?;
-        check_fields(b)?;
-        let params = if b["params"].is_object() { b["params"].clone() } else { json!({}) };
-        let limit = b["max_willing_to_wait_s"].as_f64().or(params["max_willing_to_wait_s"].as_f64());
-        let (e, hot, model) = self.eta_for(method, &params);
-        Ok(json!({"method": method, "model": model, "hot": hot, "eta": e, "would_accept": eta::would_accept(hot, e["wait_s"].as_f64(), limit),
-                  "max_willing_to_wait_s": limit}))
-    }
-
-    /// Admission of a request with its limit: its eta, or wait_too_long with nothing queued or stopped
-    pub(super) fn admit(&self, method: &str, b: &Value) -> Result<Value, Fail> {
-        let (e, hot, _) = self.eta_for(method, b);
-        let limit = b["max_willing_to_wait_s"].as_f64();
-        if !eta::would_accept(hot, e["wait_s"].as_f64(), limit) {
-            return Err(wait_too_long(&e, limit.unwrap_or(0.0), None));
+            .ok_or_else(|| (400, format!("method {name}: a method that runs a model (image.generate, llm.chat ...)")))?;
+        let mut params = if b["params"].is_object() { b["params"].clone() } else { json!({}) };
+        if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty()) {
+            params["model"] = json!(m);
         }
-        Ok(e)
+        let eta = self.eta_for(method, &params, None);
+        let max = b["max_willing_to_wait_s"].as_f64();
+        let would = max.is_none_or(|m| eta["wait_s"].as_f64().is_none_or(|w| w <= m));
+        Ok(json!({"method": method, "eta": eta, "max_willing_to_wait_s": max, "would_accept": would}))
     }
 
-    /// The request on this thread ended: its model held for what it reserved, its run added to the history. The seconds granted, when it reserved.
-    pub(super) fn finish_request(&self, method: &str, b: &Value, ok: bool) -> Option<u64> {
+    /// Admission of a request with its limit: wait_too_long when its wait is known and longer, nothing queued or stopped
+    pub(super) fn admit(&self, method: &str, b: &Value) -> Result<(), Fail> {
+        let Some(limit) = limit_of(b) else { return Ok(()) };
+        let eta = self.eta_for(method, b, None);
+        match eta["wait_s"].as_f64() {
+            Some(w) if w > limit => Err(declined(&eta, w, limit)),
+            _ => Ok(()),
+        }
+    }
+
+    /// The request's own limit, passed before it was sent: the failure to answer with
+    pub(super) fn past_limit(&self) -> Option<Fail> {
+        let (method, params, limit, waited) = REQ.with(|x| {
+            let b = x.borrow();
+            let r = b.as_ref()?;
+            let limit = r.limit?;
+            let waited = now() - r.t0;
+            (r.sent.is_none() && waited > limit).then(|| (r.method.clone(), r.params.clone(), limit, waited))
+        })?;
+        Some(withdrawn(&self.eta_for(&method, &params, None), limit, waited))
+    }
+
+    /// The request on this thread ended (`outcome`: ok, failed, cancelled): its model held for what it reserved, its
+    /// wait and run in the history. The seconds granted, when it reserved.
+    pub(super) fn finish_request(&self, method: &str, b: &Value, outcome: &str) -> Option<f64> {
         let r = REQ.with(|x| x.borrow_mut().take())?;
-        let id = r.model?;
+        let id = r.model.or_else(|| b["model"].as_str().filter(|m| !m.is_empty()).map(str::to_string));
         let end = now();
-        if ok {
+        if let Some(id) = &id {
             let sent = r.sent.unwrap_or(end);
-            eta::append(&self.history, &id, json!({"at": end, "method": method, "shape": eta::shape_of(method, b),
-                                                   "wait_s": (sent - r.t0).max(0.0), "run_s": (end - sent).max(0.0)}));
+            self.history.record(Record { method: method.into(), model: id.clone(), shape: shape_of(method, id, b), wait_s: (sent - r.t0).max(0.0), run_s: (end - sent).max(0.0), outcome: outcome.into() });
         }
-        r.rsvp_s.map(|secs| self.grant_rsvp(&id, secs))
+        let secs = r.rsvp_s?;
+        Some(match &id {
+            Some(id) => self.grant_rsvp(id, secs),
+            None => hold::granted(secs, self.max_rsvp()),
+        })
     }
 
-    /// A lease or chat target for this thread's request: the model held from now (what it reserved starts over when the request ends), so nothing can take it in between
+    /// A lease or chat target for this thread's request: the model held from now (what it reserved starts over when the
+    /// request ends), so nothing can take it between its answer and that
     pub(super) fn request_on(&self, id: &str) {
         sent_to(id);
         let secs = REQ.with(|x| x.borrow().as_ref().and_then(|r| r.rsvp_s)).filter(|s| *s > 0.0);
@@ -480,37 +396,30 @@ impl Home {
         }
     }
 
-    /// A load's time, for the model's history
-    pub(super) fn loaded_in(&self, id: &str, secs: f64) {
-        eta::append(&self.history, id, json!({"at": now(), "shape": "load", "load_s": secs}));
-    }
-
-    /// video.generate through the door: admitted against its limit, watched for its limit and reservation; `b`'s label
-    /// made when it had none (the door names the clip it watches)
-    pub(super) fn video_admit(&self, b: &Value) -> Result<(Value, Value), Fail> {
+    /// video.generate through the door: admitted against its limit; `b`'s label made when it had none (the door names
+    /// the clip it watches)
+    pub(super) fn video_admit(&self, b: &Value) -> Result<Value, Fail> {
         check_fields(b)?;
-        let e = self.admit("video.generate", b)?;
+        self.admit("video.generate", b)?;
         let mut q = stripped(b);
-        let wants = OWN_FIELDS.iter().any(|k| !b[*k].is_null());
-        if wants && s(&q, "label").is_empty() {
+        if OWN_FIELDS.iter().any(|k| !b[*k].is_null()) && s(&q, "label").is_empty() {
             q["label"] = json!(format!("clip-{}", now() as u64));
         }
-        Ok((q, e))
+        Ok(q)
     }
 
     /// A clip the studio took: its eta on the answer, the door watching it when it promised anything
-    pub(super) fn video_taken(&self, b: &Value, sent: &Value, e: &Value, r: &mut Value) {
-        r["eta"] = e.clone();
+    pub(super) fn video_taken(&self, b: &Value, sent: &Value, r: &mut Value) {
+        r["eta"] = self.eta_for("video.generate", sent, None);
         let label = Some(s(sent, "label")).filter(|l| !l.is_empty()).or_else(|| r["label"].as_str().map(str::to_string)).unwrap_or_default();
-        let (rsvp_s, limit) = (b["rsvp_s"].as_f64(), b["max_willing_to_wait_s"].as_f64());
+        let (rsvp_s, limit) = (b["rsvp_s"].as_f64().filter(|x| *x >= 0.0), limit_of(b));
         if let Some(secs) = rsvp_s {
-            let max = self.max_rsvp();
-            r["rsvp_granted_s"] = json!(secs.min(max as f64).round() as u64);
+            r["rsvp_granted_s"] = json!(hold::granted(secs, self.max_rsvp()));
         }
         if (rsvp_s.is_some() || limit.is_some()) && !label.is_empty() {
             let all = self.models();
-            let model = self.request_model("video.generate", b, &all).unwrap_or_default();
-            self.video_watch.lock().unwrap().push(Watch { label, model, rsvp_s, limit, t0: now(), eta: e.clone() });
+            let model = self.request_model("video.generate", b, &all);
+            self.video_watch.lock().unwrap().push(Watch { label, model, params: sent.clone(), rsvp_s, limit, t0: now() });
         }
     }
 
@@ -524,9 +433,8 @@ impl Home {
     pub(super) fn video_annotate(&self, method: &str, v: &mut Value) {
         let all = self.models();
         let run_of = |it: &Value| -> Value {
-            let shape = eta::shape_of("video.generate", it);
             let id = clip_model(it, &all).unwrap_or_default();
-            eta::eta_json(&eta::estimate(&eta::rows(&self.history, &id), &shape), None, &shape)
+            self.history.eta("video.generate", &id, it, true, Some(0.0))
         };
         let r = &mut v["result"];
         match method {
@@ -538,7 +446,7 @@ impl Home {
             "queue.list" => {
                 for it in r["queue"].as_array_mut().into_iter().flatten() {
                     let e = run_of(it);
-                    it["eta_remaining_s"] = e["run_s"].clone();
+                    it["eta_remaining_s"] = e["total_s"].clone();
                     it["eta"] = e;
                 }
             }
@@ -564,7 +472,7 @@ impl Home {
                 if waiting && waited > limit {
                     let call = if q { "/rpc/queue.remove" } else { "/rpc/cancel" };
                     let _ = call_for(&self.target("video"), "POST", call, Some(&json!({"label": w.label})), 15);
-                    let f = wait_too_long(&w.eta, limit, Some(waited));
+                    let f = withdrawn(&self.eta_for("video.generate", &w.params, None), limit, waited);
                     self.withdrawn.lock().unwrap().insert(w.label.clone(), super::api::rpc_error("video.generate", f.0, None, &f.1));
                     return false;
                 }
@@ -583,84 +491,75 @@ impl Home {
         self.video_watch.lock().unwrap().extend(list);
     }
 
-    /// Clips made (the studio's records) into the history, so a clip's wait is known hot or not, from the first call after a restart too
+    /// Clips made (the studio's records) into the history, so a clip's wait is known hot or not, from the first call
+    /// after a restart too. `clips.seen` beside them: the ones already read.
     fn ingest_clips(&self) {
         if !super::listening(self.o.ports.video) {
             return;
         }
         let Ok(v) = call_for(&self.target("video"), "POST", "/rpc/jobs.list", Some(&json!({"limit": 100})), 15) else { return };
         let all = self.models();
+        let file = self.history.dir().join("clips.seen");
+        let mut seen: std::collections::BTreeSet<String> = std::fs::read_to_string(&file).unwrap_or_default().lines().map(str::to_string).collect();
         let mut rows: Vec<Value> = v["result"]["jobs"].as_array().cloned().unwrap_or_default();
         rows.reverse();
+        let mut changed = false;
         for row in rows {
-            let (Some(total), Some(file), Some(id)) = (row["total"].as_f64(), row["file"].as_str(), clip_model(&row, &all)) else { continue };
-            if eta::rows(&self.history, &id).iter().any(|r| r["file"] == file) {
+            let (Some(total), Some(name), Some(id)) = (row["total"].as_f64(), row["file"].as_str(), clip_model(&row, &all)) else { continue };
+            if !seen.insert(name.to_string()) {
                 continue;
             }
+            changed = true;
             let (w, h) = s(&row, "canvas").split_once('x').map_or((0, 0), |(a, b)| (a.parse().unwrap_or(0), b.parse().unwrap_or(0)));
-            let shape = eta::shape_of("video.generate", &json!({"width": w, "height": h, "seconds": row["seconds"], "steps": row["steps"]}));
-            eta::append(&self.history, &id, json!({"at": row["mtime"], "method": "video.generate", "shape": shape, "file": file, "run_s": total}));
+            let shape = shape_of("video.generate", &id, &json!({"width": w, "height": h, "seconds": row["seconds"], "steps": row["steps"]}));
+            self.history.record(Record { method: "video.generate".into(), model: id, shape, wait_s: 0.0, run_s: total, outcome: "ok".into() });
+        }
+        if changed {
+            let _ = std::fs::write(&file, seen.into_iter().collect::<Vec<_>>().join("\n"));
         }
     }
 
-    /// A chat model coming up, whoever asked (Open WebUI through the switcher too): how long it took
-    fn watch_chat_load(&self) {
-        if !super::listening(self.o.ports.video) {
-            return;
-        }
-        let starting = self.chat_mode().1;
-        let mut seen = self.chat_starting.lock().unwrap();
-        match (&*seen, starting) {
-            (None, Some(id)) => *seen = Some((id, now())),
-            (Some((id, t)), None) => {
-                let (id, t) = (id.clone(), *t);
-                *seen = None;
-                drop(seen);
-                if self.chat_loaded(&self.models()).as_deref() == Some(id.as_str()) {
-                    self.loaded_in(&id, now() - t);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Pinned and held models told to stay: a server's own idle exit counts any POST as work, a clip worker's idle
-    /// unload is held off by /engine/keep. A door that dies keeps nothing up for long.
-    fn keep_up(&self) {
-        let holds = self.holds();
+    /// Every 10 s: what is kept told to stay (a server's --idle-exit clock is its own, and GET / is a page load, work to
+    /// it; a video worker by /engine/keep, 60 s from this tick), and a model whose last rsvp_s was 0 gone once idle
+    fn keep_tick(&self) {
         let all = self.models();
+        let holds = self.holds();
         let at = now();
-        let kept = |m: &Value| m["pinned"] == true || holds.get(m["id"].as_str().unwrap_or("")).is_some_and(|h| h.left(at) > 0.0);
-        for kind in ["image", "audio", "model3d"] {
-            if !all.iter().any(|m| registry::kind_of(m) == kind && kept(m)) {
-                continue;
-            }
-            for x in self.servers(kind) {
-                let id = x.model.clone().unwrap_or_default();
-                if all.iter().any(|m| m["id"] == id.as_str() && kept(m)) {
-                    let _ = call_status(&Target::Tcp(format!("127.0.0.1:{}", x.port)), "POST", "/api/keepalive", Some(&json!({})), 3);
-                }
+        let kept = |id: &str| all.iter().any(|m| m["id"] == id && m["pinned"] == true) || holds.get(id).is_some_and(|h| h.reserved(at) > 0.0);
+        let releasing: Vec<String> = holds.iter().filter(|(id, h)| h.release && !kept(id)).map(|(id, _)| id.clone()).collect();
+        for m in all.iter().filter(|m| matches!(registry::kind_of(m), "image" | "audio" | "model3d")) {
+            let (id, kind) = (s(m, "id"), registry::kind_of(m));
+            let Some(x) = self.servers(kind).into_iter().find(|x| x.model.as_deref() == Some(id.as_str())) else { continue };
+            if kept(&id) {
+                let _ = call_for(&Target::Tcp(format!("127.0.0.1:{}", x.port)), "GET", "/", None, 3);
+            } else if releasing.contains(&id) && !x.is_busy() && !x.loading && self.inflight.lock().unwrap().get(&x.port).copied().unwrap_or(0) == 0 {
+                self.change_holds(|h| h.remove(&id));
+                let _ = self.unload(&id);
             }
         }
-        if all.iter().any(|m| registry::kind_of(m) == "video" && kept(m)) {
-            for (id, g) in self.video_daemon().map_or(Vec::new(), |d| d.1) {
-                if all.iter().any(|m| m["id"] == id.as_str() && kept(m)) {
-                    let _ = call_for(&self.target("video"), "POST", "/engine/keep", Some(&json!({"gpu": g, "seconds": 120})), 5);
-                }
+        if all.iter().any(|m| registry::kind_of(m) == "video" && m["enabled"] != false && kept(&s(m, "id"))) {
+            let _ = call_for(&self.target("video"), "POST", "/engine/keep", Some(&json!({"seconds": 60})), 3);
+        }
+        for id in releasing {
+            if self.chat_idle().as_deref() == Some(id.as_str()) {
+                self.change_holds(|h| h.remove(&id));
+                let _ = self.unload(&id);
             }
         }
     }
 
-    /// The pinned models not up, loaded again (after a restart, or a server that died); not while the box is set aside
-    fn reload_pinned(self: &Arc<Self>) {
+    /// The pinned, enabled models not up, loaded in the background (their daemon is video_apply's: not a video model).
+    /// Each tried every 5 minutes at most; a failed load is a run. Not while the box is set aside.
+    fn reload_pinned(self: &Arc<Self>, tried: &mut BTreeMap<String, Instant>) {
         if self.maintenance().is_some() || self.cards_taken().is_some() {
             return;
         }
-        for m in self.models().iter().filter(|m| m["pinned"] == true && m["enabled"] != false) {
+        for m in self.models().iter().filter(|m| m["pinned"] == true && m["enabled"] != false && registry::kind_of(m) != "video") {
             let id = s(m, "id");
-            if !self.is_hot(&id) && !self.loading.lock().unwrap().contains_key(&id) && self.moving_why(&id).is_none() {
-                let me = self.clone();
-                std::thread::spawn(move || me.pin_load_logged(&id));
+            let state = self.model_states(std::slice::from_ref(m), &json!([])).first().map(|x| s(x, "state")).unwrap_or_default();
+            if state == "unloaded" && tried.get(&id).is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
+                tried.insert(id.clone(), Instant::now());
+                let _ = self.load_async(&id);
             }
         }
     }
@@ -675,31 +574,41 @@ impl Home {
             return;
         }
         if let Some(id) = self.chat_idle() {
-            if let Err((_, e)) = self.unload_now(&id) {
+            if let Err((_, e)) = self.unload(&id) {
                 eprintln!("{id}: idle, not unloaded: {e}");
             }
         }
     }
 
-    /// Running forever beside the card sampler: limits, watches, keeps, pins
+    /// Running forever beside the card sampler: limits and watches every 2 s, keeps every 10, the daemon and the pins every 30
     pub(super) fn backplane_loop(self: Arc<Self>) {
         let mut tick = 0u64;
+        let mut gone = 0;
+        let mut tried = BTreeMap::new();
         loop {
             std::thread::sleep(Duration::from_secs(2));
             tick += 1;
             self.withdraw_queued();
             self.watch_videos();
-            self.watch_chat_load();
-            if tick.is_multiple_of(15) {
-                self.keep_up();
+            if tick.is_multiple_of(5) {
+                self.keep_tick();
                 self.chat_idle_out();
             }
             if tick % 15 == 7 {
                 self.ingest_clips();
             }
-            // first soon after a start (the sampler has seen the cards by then)
-            if tick % 30 == 3 {
-                self.reload_pinned();
+            // first soon after a start (the sampler has seen the cards, the daemon has had its first apply)
+            if tick % 15 == 2 {
+                self.reload_pinned(&mut tried);
+                // the daemon back when it is gone, twice in a row (a deploy stops and starts it within seconds)
+                let enabled = video_enabled(&self.models());
+                gone = if video_missing(&enabled, self.video_daemon().map(|d| d.0).as_deref()) { gone + 1 } else { 0 };
+                if gone >= 2 {
+                    if let Err(e) = self.video_apply(false) {
+                        eprintln!("video: {e}");
+                    }
+                    gone = 0;
+                }
             }
         }
     }
@@ -711,44 +620,41 @@ mod tests {
 
     #[test]
     fn an_error_of_ours_keeps_its_fields_through_a_message() {
-        let f = wait_too_long(&json!({"wait_s": 50.0}), 10.0, None);
+        let f = declined(&json!({"wait_s": 50.0}), 50.0, 10.0);
         assert_eq!(f.0, 503);
         let (code, fields, words) = untag(&f.1).unwrap();
         assert_eq!(code, "wait_too_long");
         assert_eq!(fields["max_willing_to_wait_s"], 10.0);
         assert_eq!(fields["eta"]["wait_s"], 50.0);
-        assert!(fields.get("waited_s").is_none() && words.contains("nothing was queued"));
-        let (_, fields, _) = untag(&wait_too_long(&json!({}), 10.0, Some(12.0)).1).unwrap();
+        assert!(fields.get("waited_s").is_none() && words.contains("nothing was started"));
+        let (_, fields, _) = untag(&withdrawn(&json!({}), 10.0, 12.4).1).unwrap();
         assert_eq!(fields["waited_s"], 12.0, "withdrawn: how long it waited");
         assert!(untag("an ordinary message").is_none());
     }
 
     #[test]
-    fn a_request_past_its_limit_before_it_was_sent_is_withdrawn() {
-        begin(&json!({"max_willing_to_wait_s": 5}), json!({}), now() - 10.0);
-        assert!(past_limit().is_some());
-        sent_to("m");
-        assert!(past_limit().is_none(), "started: the limit is on the time to start");
-        begin(&json!({}), json!({}), now() - 10.0);
-        assert!(past_limit().is_none(), "no limit");
+    fn a_limit_replaces_the_default_waits_and_a_negative_is_none() {
+        begin("image.generate", &json!({"max_willing_to_wait_s": 5}), now());
+        assert!(has_limit());
+        begin("image.generate", &json!({"max_willing_to_wait_s": -5}), now());
+        assert!(!has_limit());
         REQ.with(|x| *x.borrow_mut() = None);
     }
 
     #[test]
-    fn the_fields_are_the_doors_own_and_seconds() {
+    fn the_fields_are_the_doors_own() {
         assert!(check_fields(&json!({"rsvp_s": 0, "max_willing_to_wait_s": 3.5})).is_ok());
-        assert!(check_fields(&json!({"rsvp_s": -1})).is_err());
-        assert!(check_fields(&json!({"max_willing_to_wait_s": "soon"})).is_err());
-        let b = stripped(&json!({"rsvp_s": 5, "max_willing_to_wait_s": 5, "prompt": "x"}));
-        assert_eq!(b, json!({"prompt": "x"}));
+        assert_eq!(check_fields(&json!({"rsvp_s": -1})).unwrap_err().1, "rsvp_s: seconds, 0 or more");
+        assert_eq!(stripped(&json!({"rsvp_s": 5, "max_willing_to_wait_s": 5, "prompt": "x"})), json!({"prompt": "x"}));
     }
 
     #[test]
-    fn a_job_in_its_queue_is_past_its_limit_by_when_it_was_made() {
-        let j = json!({"created": 100.0, "max_willing_to_wait_s": 10});
-        assert_eq!(past_in_queue(&j, 105.0), None);
-        assert_eq!(past_in_queue(&j, 115.0), Some(15.0));
-        assert_eq!(past_in_queue(&json!({"created": 100.0}), 1e9), None);
+    fn a_daemon_lacking_an_engine_counts_as_missing() {
+        let e = vec!["a".to_string(), "b".to_string()];
+        assert!(video_missing(&e, None));
+        assert!(video_missing(&e, Some(&["a".to_string()])));
+        assert!(!video_missing(&e, Some(&["b".to_string(), "a".to_string()])));
+        assert!(!video_missing(&[], None), "no video model enabled: nothing is missing");
     }
 
     #[test]

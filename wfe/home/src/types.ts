@@ -51,7 +51,7 @@ export interface Model {
   state: ModelState;
   /** never stopped for room, loaded again after a restart (system.pin) */
   pinned?: boolean;
-  /** seconds a request's rsvp_s or X-Keep-Up-S holds it for yet */
+  /** seconds a request's rsvp_s holds it for yet */
   held_s?: number;
   vouch_mb: Record<string, number>;
   /** of vouch_mb, the headroom (Vouched) */

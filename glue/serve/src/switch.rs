@@ -152,7 +152,7 @@ impl Switch {
         }
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
         let left = self.holds.as_deref().and_then(|f| crate::hold::read(f).get(id).map(|h| h.reserved(t))).unwrap_or(0.0);
-        (left > 0.0).then(|| format!("held by rsvp_s: {id} ({} s more)", left.ceil() as u64))
+        (left > 0.0).then(|| format!("held by rsvp_s: {id} ({left:.0} s more)"))
     }
 
     /// The studio's llm.mode: its state, or (with a mode) a swap to it
@@ -199,7 +199,7 @@ impl Switch {
             return None;
         }
         if let Some(why) = other.as_deref().and_then(|o| self.no_swap(o, &models)) {
-            return Some((503, json!({"error": {"message": format!("the chat server is {why}; {} loads once it is free", want.title), "type": "no_room", "code": "no_room"}})));
+            return Some((503, json!({"error": {"message": format!("the chat server holds one model at a time and {why}; {} loads once it is released", want.title), "type": "model_unavailable", "code": "no_room", "retryable": true}})));
         }
         if let Some(c) = &cur {
             let recent = other.as_ref().is_some_and(|o| self.last_use.lock().unwrap().get(o).is_some_and(|t| t.elapsed() < self.in_use));
@@ -359,8 +359,8 @@ mod tests {
         let f = crate::hold::file_beside(&dir.join("models.json"));
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
         let mut h = crate::hold::Holds::new();
-        crate::hold::grant_rsvp(&mut h, "reserved", 600.0, 86400, t);
-        crate::hold::grant_keep(&mut h, "kept", 600, 86400, t);
+        crate::hold::grant_rsvp(&mut h, "reserved", 600.0, 86400.0, t);
+        crate::hold::grant_keep(&mut h, "kept", 600, 86400.0, t);
         crate::hold::write(&f, &h).unwrap();
         let s = sw(Some(f));
         let m = vec![model("pinned", true), model("plain", false), model("reserved", false), model("kept", false)];

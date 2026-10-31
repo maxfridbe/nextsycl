@@ -380,9 +380,6 @@ pub struct SystemLoadReq {
 pub struct SystemPinReq {
     /// the model's registry id (system.models)
     pub model: String,
-    /// answer when it has loaded (the default; a model that cannot load is not left pinned). false: at once, the pin stands and the load is tried until it holds
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wait: Option<bool>,
     /// what else the caller sent: passed on as it came
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,
@@ -403,13 +400,18 @@ pub struct SystemUnpinReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct SystemEtaReq {
-    /// the method it would call (one that runs a model: image.generate, llm.chat, video.generate ...)
+    /// the method the request would call (image.generate, llm.chat ...)
     pub method: String,
-    /// the longest it would wait to start: the answer's would_accept
+    /// the request's parameters as the method takes them (only the size-driving ones matter)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(min = 0)]
+    pub params: Option<serde_json::Value>,
+    /// the model (default: the one the request would pick)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// the longest you would wait for it to start: the answer says whether it would be accepted (would_accept)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_willing_to_wait_s: Option<f64>,
-    /// what else the caller sent, `params` among them: the request's own body (its model, size, steps ...), which shapes the estimate
+    /// what else the caller sent: passed on as it came
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,
 }
@@ -531,7 +533,7 @@ pub struct LlmChatReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -592,7 +594,7 @@ pub struct ImageGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -680,7 +682,7 @@ pub struct ImageEditReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -758,7 +760,7 @@ pub struct ImageUpscaleReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -828,7 +830,7 @@ pub struct ImageVectorizeReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -904,7 +906,7 @@ pub struct VideoUpscaleReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -981,7 +983,7 @@ pub struct ImageOcrReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -1208,7 +1210,7 @@ pub struct AudioGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -1315,7 +1317,7 @@ pub struct AudioSpeakReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -1405,7 +1407,7 @@ pub struct AudioTranscribeReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -1514,7 +1516,7 @@ pub struct AudioVoicesDesignReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -1551,7 +1553,7 @@ pub struct AudioVoicesEnrollReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -1781,7 +1783,7 @@ pub struct Model3dGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -1873,7 +1875,7 @@ pub struct Model3dRigReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -2145,7 +2147,7 @@ pub struct VideoGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub rsvp_s: Option<f64>,
-    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded is never declined
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
@@ -2520,6 +2522,14 @@ pub struct VideoTemplatesListReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct VideoEnginesListReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
     /// what else the caller sent: passed on as it came
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,
@@ -2663,20 +2673,20 @@ fn system_unload(h: &Arc<Home>, req: SystemUnloadReq) -> Answer {
     h.legacy("system.unload", req)
 }
 
-/// Pin a model: loaded now, never stopped for room, kept in the registry and loaded again after a restart
+/// Pin an enabled model: it loads now (in the background) and stays: no idle unload, never stopped for another model's room (that one answers 503 no_room naming the pin). Kept across a restart of the front door; disabling the model unpins it
 #[rpc(name = "system.pin", tags = "system", example = r#"{"model": "qwen-image-2.1-q8"}"#)]
 fn system_pin(h: &Arc<Home>, req: SystemPinReq) -> Answer {
     h.legacy("system.pin", req)
 }
 
-/// Unpin a model: it may be stopped for room again and unloads when idle
+/// Unpin a model: only the flag is cleared; it stays loaded until the idle rules take it
 #[rpc(name = "system.unpin", tags = "system", example = r#"{"model": "qwen-image-2.1-q8"}"#)]
 fn system_unpin(h: &Arc<Home>, req: SystemUnpinReq) -> Answer {
     h.legacy("system.unpin", req)
 }
 
-/// How long a request would wait and run, from the model's history and what is ahead of it, and whether a limit would accept it; loads nothing, queues nothing
-#[rpc(name = "system.eta", tags = "system", example = r#"{"max_willing_to_wait_s": 60, "method": "image.generate", "params": {"model": "qwen-image-2.1-q8", "size": "1024x1024"}}"#)]
+/// The ETA a request would get now - {wait_s, run_s, total_s, samples, basis (shape | model | none), spread} from the last 100 requests of its shape - and whether max_willing_to_wait_s would accept it; nothing is started, queued or loaded, so a caller can ask first and choose another machine
+#[rpc(name = "system.eta", tags = "system", example = r#"{"method": "image.generate", "params": {"width": 1024, "height": 1024, "steps": 28}, "max_willing_to_wait_s": 120}"#)]
 fn system_eta(h: &Arc<Home>, req: SystemEtaReq) -> Answer {
     h.legacy("system.eta", req)
 }
