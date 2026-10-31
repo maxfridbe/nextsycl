@@ -206,7 +206,7 @@ fn a_reservation_refused_plans_again_rather_than_failing() {
 }
 
 #[test]
-fn the_first_listed_card_with_room_now_when_asked_and_no_stopping_for_a_listed_one() {
+fn the_first_listed_card_when_asked_stopping_idle_work_there_before_going_on() {
     let (mut with, mut without) = (host(&[CARD, CARD + 1000]), host(&[CARD, CARD + 1000]));
     with.k.first_listed.set(true);
     for (h, card) in [(&mut with, 0), (&mut without, 1)] {
@@ -216,7 +216,9 @@ fn the_first_listed_card_with_room_now_when_asked_and_no_stopping_for_a_listed_o
     }
     let plan = |p: Option<Vec<Holder>>| p;
     let with_stop = room::pick_first([(0, 100, plan(Some(vec![Holder { what: room::Free::Video(0), mb: 1, model: "x".into(), order: 1 }]))), (1, 9000, plan(Some(vec![])))].into_iter());
-    assert_eq!(with_stop.unwrap().0, 1, "room now beats stopping something on an earlier card");
+    assert_eq!(with_stop.unwrap().0, 0, "stopping idle work on the first card beats room on a later one");
+    let blocked = room::pick_first([(0, 100, plan(None)), (1, 9000, plan(Some(vec![])))].into_iter());
+    assert_eq!(blocked.unwrap().0, 1, "a card that cannot be cleared is passed over");
 }
 
 fn info(id: &str, kind: &str, p: Profile) -> ModelInfo {

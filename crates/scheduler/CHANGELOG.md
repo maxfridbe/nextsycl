@@ -17,7 +17,7 @@ unchanged, `tests/hooks.rs` is nextsycl's. Every hook on `Host` has a default th
   split out for it.
 - `Host::reserve` + `room::may_start`: a last check that also takes the room, closing the exclusive-while-loading race and two kinds planning
   for one card. `Host::free_mb`: the wait after holders went without a whole snapshot each second.
-- `Host::first_listed_card` / `room::pick_first`: among cards with room now, the first listed instead of the emptiest.
+- `Host::first_listed_card` / `room::pick_first`: the first listed card that can hold the model, stopping idle work there before going to a later card (the user's choice for hardac1, B70 first).
 - `History::whole_run`: a method whose records include its load adds no spin-up to its wait.
 
 ## 0.1.0 - 2026-10-31

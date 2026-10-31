@@ -196,19 +196,9 @@ pub fn pick_card(plans: impl Iterator<Item = (usize, u64, Option<Vec<Holder>>)>)
     now.map(|(g, _, p)| (g, p)).or(later)
 }
 
-/// `pick_card`, first listed: the first card with the room now, before the first whose room needs idle work stopped
+/// `pick_card`, first listed: the first card that can hold the model, stopping idle work there before going to a later card
 pub fn pick_first(plans: impl Iterator<Item = (usize, u64, Option<Vec<Holder>>)>) -> Option<(usize, Vec<Holder>)> {
-    let mut later = None;
-    for (g, _, plan) in plans {
-        match plan {
-            Some(p) if p.is_empty() => return Some((g, p)),
-            Some(p) => {
-                later.get_or_insert((g, p));
-            }
-            None => {}
-        }
-    }
-    later
+    plans.into_iter().find_map(|(g, _, plan)| plan.map(|p| (g, p)))
 }
 
 /// A test for another model's id: may it NOT share a card with the asking model
