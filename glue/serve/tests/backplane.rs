@@ -240,6 +240,10 @@ fn clip_model(id: &str) -> Value {
 
 /// `tag`: the box's name; its registry; `dir`: a directory to come back to (a restart), else its own
 fn start(tag: &str, entries: Vec<Value>, keep_dir: Option<(PathBuf, Arc<Mutex<Vec<Value>>>)>, max_rsvp: Option<&str>) -> Box_ {
+    start_on(tag, entries, keep_dir, max_rsvp, 1)
+}
+
+fn start_on(tag: &str, entries: Vec<Value>, keep_dir: Option<(PathBuf, Arc<Mutex<Vec<Value>>>)>, max_rsvp: Option<&str>, ncards: usize) -> Box_ {
     let (dir, models) = keep_dir.unwrap_or_else(|| {
         let d = std::env::temp_dir().join(format!("nextsycl-backplane-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -295,7 +299,7 @@ esac
     let cfg = Box::new(Mem { dir: dir.clone(), models: models.clone(), max_rsvp: max_rsvp.map(str::to_string) });
     let addr = format!("127.0.0.1:{door}");
     let home = Home::new(Options { wfe: dir.join("wfe"), exe: script, ports, serve_host: "127.0.0.1".into(), door: addr.clone(), cfg, idle_minutes: 0 }).expect("the front door starts");
-    fake_cards(dir.clone(), home.clone(), models.clone(), vec![img, img2, aud, m3d, llm, video], 1, stop.clone());
+    fake_cards(dir.clone(), home.clone(), models.clone(), vec![img, img2, aud, m3d, llm, video], ncards, stop.clone());
     let (h, a) = (home.clone(), addr.clone());
     std::thread::spawn(move || {
         let _ = h.run(&a);
@@ -616,6 +620,44 @@ fn a_video_call_brings_the_daemon_up_and_a_clip_has_its_eta_hot_or_not() {
     b.until("the workers told to stay", 15, |b| b.seen().lines().any(|l| l.contains("/engine/keep") && l.contains("\"seconds\":60")));
     assert_eq!(b.ok("system.pin", json!({"model": "clips"})), json!({"model": "clips", "pinned": true, "loading": true}));
     assert!(!b.seen().contains("/engine/jobs"), "{}", b.seen());
+}
+
+#[test]
+fn a_card_is_blocked_for_clips_only_by_a_pin_or_hold_that_leaves_no_room() {
+    let mut clips = clip_model("clips");
+    clips["gpus"] = json!("0,1");
+    let b = start_on("blocked", vec![clips, image("p", 20.0), image("small", 1.0)], None, None, 2);
+    let blocked = |b: &Box_| b.raw("GET", "/video/blocked", "", &json!({})).1;
+    assert_eq!(blocked(&b), json!({"blocked": []}), "nothing held");
+    // idle and in the way: it would go, so the card is not blocked
+    assert_eq!(b.make("p", json!({}))["ok"], true);
+    assert_eq!(blocked(&b), json!({"blocked": []}));
+    b.ok("system.pin", json!({"model": "p"}));
+    assert_eq!(blocked(&b), json!({"blocked": [0]}), "GPU 0 pinned, GPU 1 free");
+    b.ok("system.unpin", json!({"model": "p"}));
+    assert_eq!(b.make("p", json!({"rsvp_s": 600}))["ok"], true);
+    assert_eq!(blocked(&b), json!({"blocked": [0]}), "held likewise");
+}
+
+#[test]
+fn a_clip_naming_no_engine_is_the_daemons_default_in_its_eta_and_its_answer() {
+    // (the Ref2VA engine first in the registry, as on the box; it has the slow runs, the default the quick)
+    let h3 = "video.generate|minimax-h3|w=768,h=576,frames=120,steps=8";
+    let row = |model: &str, shape: &str, run: f64| json!({"method": "video.generate", "model": model, "shape": shape, "wait_s": 0.0, "run_s": run, "outcome": "ok"});
+    let seed = seeded("default-engine", vec![clip_model("minimax-h3-ref2va"), clip_model("minimax-h3")], &[
+        (&format!("shape|{h3}"), &[row("minimax-h3", h3, 35.0)]),
+        ("model|minimax-h3", &[row("minimax-h3", h3, 35.0)]),
+        ("model|minimax-h3-ref2va", &[row("minimax-h3-ref2va", "video.generate|minimax-h3-ref2va", 371.0)]),
+    ]);
+    let b = start("default-engine", vec![], Some(seed), None);
+    b.until("the daemon up", 15, |b| b.dir.join(format!("up-{}", b.video)).exists());
+    let q = json!({"width": 768, "height": 576, "seconds": 5, "steps": 8});
+    let v = b.ok("system.eta", json!({"method": "video.generate", "params": q}));
+    assert_eq!((v["eta"]["shape"].as_str(), v["eta"]["run_s"].as_f64(), v["eta"]["basis"].as_str()), (Some(h3), Some(35.0), Some("shape")), "{v}");
+    let mut body = q.clone();
+    body["prompt"] = json!("x");
+    let r = b.ok("video.generate", body);
+    assert_eq!((r["eta"]["shape"].as_str(), r["eta"]["run_s"].as_f64()), (Some(h3), Some(35.0)), "{r}");
 }
 
 #[test]

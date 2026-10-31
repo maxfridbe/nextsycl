@@ -1290,7 +1290,7 @@ impl Home {
     }
 
     /// `chat_idle`, telling "no model" from "held": a server or switcher that does not answer counts as held
-    fn chat_hold(&self) -> ChatHold {
+    pub(super) fn chat_hold(&self) -> ChatHold {
         let Some(id) = self.chat_loaded(&self.models()) else {
             // one on its way up is somebody's request
             return if self.chat_mode().1.is_some() { ChatHold::Held(None) } else { ChatHold::NoModel };

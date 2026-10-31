@@ -20,7 +20,8 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
   - **The backplane** (the same on every box): every enabled model of every kind loads on demand, stopping only idle
     holders neither pinned nor held; nothing running is ever stopped for room. A load needs its `vram_gib` + 1.5 GiB
     free on a card, and its `ram_gib` + 4 GiB of host memory where it says one. Any `video.*` call brings a stopped
-    daemon up (120 s at most).
+    daemon up (120 s at most). A clip that names no card keeps off a card a pin or hold has taken while another can run
+    it (the daemon asks the door's `GET /video/blocked`), and one already waiting for such a card's memory moves.
     - `system.pin` / `system.unpin {model}`: loaded now in the background (`{model, pinned: true, loading: true}`), never
       stopped for room or idleness, `pinned` in the registry, loaded again after a restart (not during maintenance or a
       GPU run). A load that fails leaves the pin set: a run on the page, tried again every 5 minutes. A video pin keeps the

@@ -144,11 +144,21 @@ pub(super) struct Watch {
     t0: f64,
 }
 
-/// A video engine named by a clip's row: a Ref2VA clip's, else the one the daemon defaults to
+/// The video model a clip (a request or a record) runs on: Ref2VA's for reference pictures or clips, the one named by
+/// its engine (Q6_K: the id with q6k), else the daemon's default - as video_apply starts it, minimax-h3 when enabled,
+/// else the first (a clip says no model, INT8 is that default)
 fn clip_model(row: &Value, all: &[Value]) -> Option<String> {
     let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "video" && m["enabled"] != false).collect();
-    let refs = row["engine"] == "REF2VA";
-    on.iter().find(|m| s(m, "id").contains("ref2va") == refs).or(on.first()).map(|m| s(m, "id"))
+    let id_with = |w: &str| on.iter().find(|m| s(m, "id").to_lowercase().contains(w)).map(|m| s(m, "id"));
+    let engine = s(row, "engine").trim().to_uppercase();
+    let named = if engine == "REF2VA" || row["ref_images"].is_array() || row["ref_videos"].is_array() {
+        id_with("ref2va")
+    } else if engine.is_empty() || engine == "INT8" || engine == "Q8_0" {
+        None
+    } else {
+        id_with(&engine.to_lowercase().replace('_', ""))
+    };
+    named.or_else(|| on.iter().find(|m| m["id"] == "minimax-h3").or(on.first()).map(|m| s(m, "id")))
 }
 
 /// Whether the daemon lacks an enabled model's engine (`running`: its engines; none: it is down)
@@ -277,6 +287,10 @@ impl Home {
         if let Some(id) = b["model"].as_str().filter(|x| !x.is_empty()) {
             return id.to_string();
         }
+        // a clip's engine is what the request says, loaded or not
+        if method == "video.generate" {
+            return clip_model(b, all).unwrap_or_default();
+        }
         let can: Vec<String> = all.iter().filter(|m| m["enabled"] != false && super::life::capabilities(m).1.contains(&method)).map(|m| s(m, "id")).collect();
         let loaded = |id: &String| match all.iter().find(|m| m["id"] == id.as_str()).map_or("", registry::kind_of) {
             "llm" => self.chat_loaded(all).as_deref() == Some(id.as_str()),
@@ -284,6 +298,26 @@ impl Home {
             k => self.servers(k).iter().any(|x| x.model.as_deref() == Some(id.as_str())),
         };
         can.iter().find(|id| loaded(id)).or(can.first()).cloned().unwrap_or_default()
+    }
+
+    /// `GET /video/blocked`, what the video daemon asks before a clip that names no card takes one: the cards where a
+    /// worker would not fit even with the idle holders gone, because of a pinned or held model there (a chat model
+    /// answering or kept is held). A card only busy is not in it: that ends by itself, and the job waits as it did.
+    pub(super) fn video_blocked(&self) -> Value {
+        let all = self.models();
+        let cards = self.named_cards(&all);
+        let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "video" && m["enabled"] != false).collect();
+        let chat_held = matches!(self.chat_hold(), super::life::ChatHold::Held(_));
+        let blocked: Vec<usize> = (0..cards.as_array().map_or(0, Vec::len)).filter(|g| {
+            let card_mb = cards[*g]["vram_total_mb"].as_u64().unwrap_or(32768);
+            let want = on.iter().filter_map(|m| self.vouched_mb(m, card_mb).0.get(g).copied()).max();
+            let Some(want) = want else { return false };
+            let kept = cards[*g]["procs"].as_array().into_iter().flatten().filter(|p| p["kind"] != "video").any(|p| {
+                p["model_id"].as_str().or(p["model"].as_str()).is_some_and(|m| self.kept(m)) || (p["kind"] == "llm" && chat_held)
+            });
+            kept && self.room_plan(&cards, *g, want + super::life::MARGIN_MB, "video", false).is_none()
+        }).collect();
+        json!({"blocked": blocked})
     }
 
     /// The seconds a job has left or will take, from history (None: no history)
@@ -663,5 +697,12 @@ mod tests {
         assert_eq!(clip_model(&json!({"engine": "INT8"}), &all).as_deref(), Some("minimax-h3"));
         assert_eq!(clip_model(&json!({"engine": "REF2VA"}), &all).as_deref(), Some("minimax-h3-ref2va"));
         assert_eq!(clip_model(&json!({}), &[]), None);
+        // no engine: the daemon's default, wherever it stands in the registry
+        let all = vec![json!({"id": "minimax-h3-ref2va", "kind": "video"}), json!({"id": "minimax-h3-q6k", "kind": "video"}), json!({"id": "minimax-h3", "kind": "video"})];
+        assert_eq!(clip_model(&json!({"prompt": "x"}), &all).as_deref(), Some("minimax-h3"));
+        assert_eq!(clip_model(&json!({"engine": "int8"}), &all).as_deref(), Some("minimax-h3"));
+        assert_eq!(clip_model(&json!({"engine": "Q6_K"}), &all).as_deref(), Some("minimax-h3-q6k"));
+        assert_eq!(clip_model(&json!({"ref_images": []}), &all).as_deref(), Some("minimax-h3-ref2va"));
+        assert_eq!(clip_model(&json!({"prompt": "x"}), &[json!({"id": "other", "kind": "video"})]).as_deref(), Some("other"), "no minimax-h3: the first");
     }
 }

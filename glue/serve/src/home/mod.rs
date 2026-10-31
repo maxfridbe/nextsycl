@@ -475,6 +475,13 @@ impl Home {
                 }
                 http::respond(&mut s, 200, &self.chat_held_answer())
             }
+            // likewise: the cards a pin or hold has taken, for a clip that names no card
+            ("GET", "/video/blocked") => {
+                if !s.same_box() {
+                    return http::respond(&mut s, 404, &err("not found".to_string()));
+                }
+                http::respond(&mut s, 200, &self.video_blocked())
+            }
             ("GET", "/openapi.yml") | ("GET", "/openapi.yaml") => {
                 let spec = self.openapi(&req, false);
                 http::respond_bytes(&mut s, 200, "application/yaml; charset=utf-8", yaml::to_yaml(&spec).as_bytes(), "Cache-Control: no-cache\r\n")
