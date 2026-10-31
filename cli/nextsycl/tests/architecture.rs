@@ -14,7 +14,8 @@
 //!    its arch, and gates its ops with `_supported` checks).
 //! 7. A front-door method is its handler: `home::api_files_tests` (the client and the document agree with the table).
 //! 8. One backplane: `every_model_method_takes_the_backplanes_fields`, `the_page_has_no_start_or_stop`,
-//!    `room_passes_over_pins_and_holds` (and the behaviour in glue/serve/tests/backplane.rs).
+//!    `room_passes_over_pins_and_holds`, `the_door_schedules_through_the_crate_and_the_crate_stands_alone` (and the
+//!    behaviour in glue/serve/tests/backplane.rs and crates/scheduler/tests).
 //!
 //! And every environment variable the code reads has a row in docs/environment.md:
 //! `every_environment_variable_is_documented`.
@@ -379,9 +380,26 @@ fn the_page_has_no_start_or_stop() {
 /// Rule 8: the two places a holder is chosen for room look at its pin and hold first
 #[test]
 fn room_passes_over_pins_and_holds() {
+    let dir = root().join("crates/scheduler/src");
+    let room = std::fs::read_to_string(dir.join("room.rs")).unwrap();
+    assert!(room.contains("evictable(idle, &snap.kept)"), "room_plan must pass over pinned and held models");
+    let place = std::fs::read_to_string(dir.join("place.rs")).unwrap();
+    assert!(place.contains("x.model.is_some() && !kept(x)"), "a server's slot must not go to another model while its model is pinned or held");
+}
+
+#[test]
+fn the_door_schedules_through_the_crate_and_the_crate_stands_alone() {
+    // the only wait for a server is the crate's driver
     let life = std::fs::read_to_string(root().join("glue/serve/src/home/life.rs")).unwrap();
-    let idle_on = life.split("fn idle_on(").nth(1).unwrap().split("\n    }\n").next().unwrap();
-    assert!(idle_on.contains("self.kept("), "idle_on must pass over pinned and held models");
-    let place = life.split("fn place(").nth(1).unwrap().split("\n    }\n").next().unwrap();
-    assert!(place.contains("free_to_go"), "a server's slot must not go to another model while its model is pinned or held");
+    let ensure = life.split("fn ensure_for(").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    assert!(ensure.contains("place::ensure(") && !ensure.contains("loop {"), "ensure_for must drive place::ensure, with no wait loop of its own");
+    for gone in ["fn place(", "fn drain(", "fn idle_on(", "fn pick_plan("] {
+        assert!(!life.contains(gone), "{gone}: the scheduler's, not life.rs's");
+    }
+    // pure: no other crate of ours, serde_json only
+    assert_eq!(deps("crates/scheduler"), vec!["serde_json".to_string()]);
+    assert!(!std::fs::read_to_string(root().join("crates/scheduler/Cargo.toml")).unwrap().contains("preserve_order"), "it would reorder the whole workspace's JSON");
+    // the suite that says the copy is intact is still there, and the patches are written down
+    assert!(root().join("crates/scheduler/tests/scenarios.rs").is_file());
+    assert!(std::fs::read_to_string(root().join("crates/scheduler/CHANGELOG.md")).unwrap().contains("nextsycl.1"));
 }

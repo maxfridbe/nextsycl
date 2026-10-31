@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+backplane-scheduler.workspace = true
 nextsycl-gguf.workspace = true
 nextsycl-core.workspace = true
 nextsycl-sys.workspace = true
@@ -58,3 +59,4 @@ nextsycl-model3d-unimate.workspace = true
 nextsycl-models.workspace = true
 nextsycl-serve.workspace = true
 serde_json.workspace = true
+serde_yaml = "0.9"

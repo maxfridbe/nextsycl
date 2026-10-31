@@ -17,6 +17,13 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     runs at a time - and an overbooked card is flagged: whichever loads first holds it). Every registered model by
     kind: enable it on its GPU(s), pin it, disable it, its page. There is no start or stop: requests load a model and
     idle or a need for room unloads it (`system.load` and `system.unload` remain for tools).
+  - **The scheduler is a crate:** the decisions below - placement, room, pins and holds, concurrency profiles, ETAs, the waits - are
+    `crates/scheduler` (`backplane-scheduler`, nextcuda's, copied with its patches listed in its CHANGELOG.md), driven over `Sched` in `home/life.rs`. A
+    model card's `concurrency` and `coexistence` (model-cards/README.md; absent: one copy, shared; bad values refused at load, naming the file) are on each
+    model row, and `system.busy.engines` has one `{id, kind, copies_now, recommended_copies, max_copies_per_card, mode, status}` per enabled model. An exclusive
+    model is alone on its card and nothing starts beside it, a load under way included, for picture, sound and 3D servers and chat; the video daemon's own
+    worker is not gated by it. `nextsycl models bench <id> [--copies 1,2] [--beside <id>...] [--requests N] [--gpu N] [--write]` measures a block, under
+    NS_GPU_LOCK, with the box in maintenance; only `--write` edits the card.
   - **The backplane** (the same on every box): every enabled model of every kind loads on demand, stopping only idle
     holders neither pinned nor held; nothing running is ever stopped for room. A load needs its `vram_gib` + 1.5 GiB
     free on a card, and its `ram_gib` + 4 GiB of host memory where it says one. Any `video.*` call brings a stopped

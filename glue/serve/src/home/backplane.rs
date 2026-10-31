@@ -7,6 +7,7 @@
 //!   failed or cancelled - clamped to NS_MAX_RSVP_S, never shortened by a later, shorter one; 0 releases (it goes as soon
 //!   as it is idle, unless an earlier hold still stands); the result says `rsvp_granted_s`. crate::hold has the arithmetic.
 //! - **ETA** (`system.eta`, and `eta` / `eta_remaining_s` on jobs): history.rs from what work took, here the work ahead.
+//!   The decisions - room, waits, history, ETAs - are crates/scheduler's; this is what the door keeps around them.
 //! - **`max_willing_to_wait_s`**: the limit on the time to START. A known wait over it is declined at once
 //!   (`wait_too_long`, nothing queued, nothing stopped); an unknown one goes ahead and is withdrawn at the limit; a loaded
 //!   model with a free server always starts. Given, it replaces the default waits (90 s a request, 30 min a job).
@@ -21,6 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use backplane_scheduler::{eta, rsvp};
 use serde_json::{json, Value};
 
 use super::history::{shape_of, Record};
@@ -45,30 +47,10 @@ pub(super) fn runs_model(name: &str) -> bool {
     RUNS_MODEL.contains(&name)
 }
 
-const TAG: &str = "backplane:";
-
-/// An error of the backplane's own as a Fail's message: its code and the fields it carries beside its words
-pub(super) fn tag(code: &str, fields: &Value, words: &str) -> String {
-    format!("{TAG}{code}\u{1f}{fields}\u{1f}{words}")
-}
-
-/// A message's code, fields and words (none: an ordinary message)
+/// A message's code, fields and words, when it is an error of the backplane's own (wait_too_long: crates/scheduler's tag)
 pub(super) fn untag(m: &str) -> Option<(String, Value, String)> {
-    let mut it = m.strip_prefix(TAG)?.splitn(3, '\u{1f}');
-    let (code, fields, words) = (it.next()?, it.next()?, it.next()?);
-    Some((code.to_string(), serde_json::from_str(fields).ok()?, words.to_string()))
-}
-
-/// wait_too_long, declined before anything started
-fn declined(eta: &Value, wait: f64, limit: f64) -> Fail {
-    (503, tag("wait_too_long", &json!({"eta": eta, "max_willing_to_wait_s": limit}),
-              &format!("it would start in about {wait:.0} s, past the {limit:.0} s you will wait; nothing was started for it")))
-}
-
-/// wait_too_long, withdrawn after waiting
-pub(super) fn withdrawn(eta: &Value, limit: f64, waited: f64) -> Fail {
-    (503, tag("wait_too_long", &json!({"eta": eta, "max_willing_to_wait_s": limit, "waited_s": waited.round()}),
-              &format!("it had not started after {waited:.0} s, past the {limit:.0} s you will wait; withdrawn")))
+    let (fields, words) = rsvp::wait_untag(m)?;
+    Some(("wait_too_long".to_string(), fields, words))
 }
 
 /// A request's limit: a number, 0 or more (anything else: none)
@@ -210,11 +192,6 @@ impl Home {
         self.holds().get(id).map_or(0.0, |h| h.reserved(now()))
     }
 
-    /// Whether `id` stays when room is needed: pinned or held by rsvp_s. (A chat model's keep stays too, in chat_hold.)
-    pub(super) fn kept(&self, id: &str) -> bool {
-        self.pinned(id) || self.held_s(id) > 0.0
-    }
-
     /// Why the chat model loaded gives no way to another chat model: pinned or held by rsvp_s. A keep yields, as in nextcuda.
     pub(super) fn swap_blocked(&self, id: &str) -> Option<String> {
         if self.pinned(id) {
@@ -222,25 +199,6 @@ impl Home {
         }
         let left = self.held_s(id);
         (left > 0.0).then(|| format!("held by rsvp_s: {id} ({left:.0} s more)"))
-    }
-
-    /// What no_room adds about the models on these cards that will not go
-    pub(super) fn kept_words(&self, cards: &Value, gpus: &[usize]) -> String {
-        let mut on: Vec<String> = gpus.iter().filter_map(|g| cards.get(*g)).flat_map(|c| c["procs"].as_array().into_iter().flatten())
-            .filter_map(|p| p["model_id"].as_str().or(p["model"].as_str())).map(str::to_string).collect();
-        on.sort();
-        on.dedup();
-        let pinned: Vec<&String> = on.iter().filter(|m| self.pinned(m)).collect();
-        let held: Vec<&String> = on.iter().filter(|m| !self.pinned(m) && self.held_s(m) > 0.0).collect();
-        let name = |v: &[&String]| v.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(", ");
-        let mut w = String::new();
-        if !pinned.is_empty() {
-            w += &format!("; pinned: {} (unpin to free the room)", name(&pinned));
-        }
-        if !held.is_empty() {
-            w += &format!("; held by rsvp_s: {} (until its hold ends: {})", name(&held), held.iter().map(|h| format!("{h} {:.0} s", self.held_s(h))).collect::<Vec<_>>().join(", "));
-        }
-        w
     }
 
     /// `system.pin`: the flag beside `enabled`, then loaded in the background. A load that fails leaves the pin set: it is a run on the page, and tried again.
@@ -305,26 +263,17 @@ impl Home {
     /// answering or kept is held). A card only busy is not in it: that ends by itself, and the job waits as it did.
     pub(super) fn video_blocked(&self) -> Value {
         let all = self.models();
-        let cards = self.named_cards(&all);
+        let snap = self.snapshot();
         let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "video" && m["enabled"] != false).collect();
         let chat_held = matches!(self.chat_hold(), super::life::ChatHold::Held(_));
-        let blocked: Vec<usize> = (0..cards.as_array().map_or(0, Vec::len)).filter(|g| {
-            let card_mb = cards[*g]["vram_total_mb"].as_u64().unwrap_or(32768);
-            let want = on.iter().filter_map(|m| self.vouched_mb(m, card_mb).0.get(g).copied()).max();
+        let blocked: Vec<usize> = snap.cards.iter().filter(|c| {
+            let g = c.index;
+            let want = on.iter().filter_map(|m| self.vouched_mb(m, c.total_mb).0.get(&g).copied()).max();
             let Some(want) = want else { return false };
-            let kept = cards[*g]["procs"].as_array().into_iter().flatten().filter(|p| p["kind"] != "video").any(|p| {
-                p["model_id"].as_str().or(p["model"].as_str()).is_some_and(|m| self.kept(m)) || (p["kind"] == "llm" && chat_held)
-            });
-            kept && self.room_plan(&cards, *g, want + super::life::MARGIN_MB, "video", false).is_none()
-        }).collect();
+            let kept = c.procs.iter().filter(|p| p.kind.as_deref() != Some("video")).any(|p| snap.kept.contains(&p.model) || (p.kind.as_deref() == Some("llm") && chat_held));
+            kept && self.room_plan(&snap, g, want + super::life::MARGIN_MB, "video", false, None).is_none()
+        }).map(|c| c.index).collect();
         json!({"blocked": blocked})
-    }
-
-    /// The seconds a job has left or will take, from history (None: no history)
-    fn job_run_est(&self, j: &Value, all: &[Value]) -> Option<f64> {
-        let method = s(j, "method");
-        let model = self.request_model(&method, &j["body"], all);
-        self.history.eta(&method, &model, &j["body"], true, Some(0.0))["run_s"].as_f64()
     }
 
     /// The work ahead of a clip in the studio's queue, from what it says of the running clip and history for the queued (None: some of it has none)
@@ -351,8 +300,8 @@ impl Home {
             "image" | "audio" | "model3d" => {
                 let sv = self.servers(kind);
                 let inflight = |p: u16| self.inflight.lock().unwrap().get(&p).copied().unwrap_or(0);
-                let hot = sv.iter().any(|x| x.model.as_deref() == Some(model.as_str()) && !x.loading && !x.is_busy() && inflight(x.port) == 0);
-                (hot, self.jobs_ahead_s(kind, exclude, &|j| self.job_run_est(j, &all)))
+                let hot = sv.iter().any(|x| x.model.as_deref() == Some(model.as_str()) && !x.loading && !x.busy && inflight(x.port) == 0);
+                (hot, self.jobs_ahead_s(kind, exclude, &all))
             }
             "llm" => {
                 let hot = self.chat_loaded(&all).as_deref() == Some(model.as_str());
@@ -377,7 +326,7 @@ impl Home {
         }
         let eta = self.eta_for(method, &params, None);
         let max = b["max_willing_to_wait_s"].as_f64();
-        let would = max.is_none_or(|m| eta["wait_s"].as_f64().is_none_or(|w| w <= m));
+        let would = eta::would_accept(&eta, max);
         Ok(json!({"method": method, "eta": eta, "max_willing_to_wait_s": max, "would_accept": would}))
     }
 
@@ -385,10 +334,7 @@ impl Home {
     pub(super) fn admit(&self, method: &str, b: &Value) -> Result<(), Fail> {
         let Some(limit) = limit_of(b) else { return Ok(()) };
         let eta = self.eta_for(method, b, None);
-        match eta["wait_s"].as_f64() {
-            Some(w) if w > limit => Err(declined(&eta, w, limit)),
-            _ => Ok(()),
-        }
+        eta::check_wait(&eta, limit)
     }
 
     /// The request's own limit, passed before it was sent: the failure to answer with
@@ -400,7 +346,7 @@ impl Home {
             let waited = now() - r.t0;
             (r.sent.is_none() && waited > limit).then(|| (r.method.clone(), r.params.clone(), limit, waited))
         })?;
-        Some(withdrawn(&self.eta_for(&method, &params, None), limit, waited))
+        Some(eta::wait_expired(&self.eta_for(&method, &params, None), limit, waited))
     }
 
     /// The request on this thread ended (`outcome`: ok, failed, cancelled): its model held for what it reserved, its
@@ -506,7 +452,7 @@ impl Home {
                 if waiting && waited > limit {
                     let call = if q { "/rpc/queue.remove" } else { "/rpc/cancel" };
                     let _ = call_for(&self.target("video"), "POST", call, Some(&json!({"label": w.label})), 15);
-                    let f = withdrawn(&self.eta_for("video.generate", &w.params, None), limit, waited);
+                    let f = eta::wait_expired(&self.eta_for("video.generate", &w.params, None), limit, waited);
                     self.withdrawn.lock().unwrap().insert(w.label.clone(), super::api::rpc_error("video.generate", f.0, None, &f.1));
                     return false;
                 }
@@ -533,7 +479,7 @@ impl Home {
         }
         let Ok(v) = call_for(&self.target("video"), "POST", "/rpc/jobs.list", Some(&json!({"limit": 100})), 15) else { return };
         let all = self.models();
-        let file = self.history.dir().join("clips.seen");
+        let file = self.history_dir.join("clips.seen");
         let mut seen: std::collections::BTreeSet<String> = std::fs::read_to_string(&file).unwrap_or_default().lines().map(str::to_string).collect();
         let mut rows: Vec<Value> = v["result"]["jobs"].as_array().cloned().unwrap_or_default();
         rows.reverse();
@@ -566,7 +512,7 @@ impl Home {
             let Some(x) = self.servers(kind).into_iter().find(|x| x.model.as_deref() == Some(id.as_str())) else { continue };
             if kept(&id) {
                 let _ = call_for(&Target::Tcp(format!("127.0.0.1:{}", x.port)), "GET", "/", None, 3);
-            } else if releasing.contains(&id) && !x.is_busy() && !x.loading && self.inflight.lock().unwrap().get(&x.port).copied().unwrap_or(0) == 0 {
+            } else if releasing.contains(&id) && !x.busy && !x.loading && self.inflight.lock().unwrap().get(&x.port).copied().unwrap_or(0) == 0 {
                 self.change_holds(|h| h.remove(&id));
                 let _ = self.unload(&id);
             }
@@ -654,14 +600,14 @@ mod tests {
 
     #[test]
     fn an_error_of_ours_keeps_its_fields_through_a_message() {
-        let f = declined(&json!({"wait_s": 50.0}), 50.0, 10.0);
+        let f = eta::check_wait(&json!({"wait_s": 50.0}), 10.0).unwrap_err();
         assert_eq!(f.0, 503);
         let (code, fields, words) = untag(&f.1).unwrap();
         assert_eq!(code, "wait_too_long");
         assert_eq!(fields["max_willing_to_wait_s"], 10.0);
         assert_eq!(fields["eta"]["wait_s"], 50.0);
         assert!(fields.get("waited_s").is_none() && words.contains("nothing was started"));
-        let (_, fields, _) = untag(&withdrawn(&json!({}), 10.0, 12.4).1).unwrap();
+        let (_, fields, _) = untag(&eta::wait_expired(&json!({}), 10.0, 12.4).1).unwrap();
         assert_eq!(fields["waited_s"], 12.0, "withdrawn: how long it waited");
         assert!(untag("an ordinary message").is_none());
     }

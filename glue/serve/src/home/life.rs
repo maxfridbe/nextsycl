@@ -1,6 +1,8 @@
 //! What the enabled models do: their state, the memory they are vouched for, enabling and disabling, loading on
-//! demand and unloading. Only an idle holder neither pinned nor held goes for room (idle_on, place; backplane.rs has
-//! pins, holds, ETAs and limits); nothing running is ever stopped for it.
+//! demand and unloading. The decisions - which card, which idle holder goes, who may share a card, when to wait - are
+//! crates/scheduler's (backplane-scheduler; nextcuda's, copied), run over `Sched` at the end of this file, the box's side
+//! of its Host traits. Only an idle holder neither pinned nor held goes for room (backplane.rs has pins, holds, ETAs and
+//! limits); nothing running is ever stopped for it.
 //!
 //! - chat (llm): the video studio's llm.mode loads one at a time (it knows when a render holds the card); the switcher
 //!   loads on Open WebUI's request and unloads after the idle time; enabled = listed by the switcher. A box with
@@ -27,19 +29,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use backplane_scheduler::host::{Guard, Host};
+use backplane_scheduler::place::{self, PlaceReq};
+use backplane_scheduler::profile::Profile;
+use backplane_scheduler::room::{self, Card, Holder, Idleness, ModelInfo, Proc, Snapshot};
+pub(super) use backplane_scheduler::room::{JOB_ROOM_WAIT_S, MARGIN_MB, ROOM_WAIT_S};
 use serde_json::{json, Value};
 
 use super::{now, Home};
 use crate::http::{call_for, Target};
 use super::registry;
 
-/// Memory to keep free on a card beyond a model's (the xe driver has no out-of-memory: past the card it spills)
-pub(super) const MARGIN_MB: u64 = 1536;
-
-/// How long a request waits for a card to have room before 503 no_room (a job waits longer: JOB_ROOM_WAIT_S, its
-/// status saying what for)
-const ROOM_WAIT_S: u64 = 90;
-pub(super) const JOB_ROOM_WAIT_S: u64 = 1800;
 /// Host memory to leave beyond a model's `ram_gib`
 pub(super) const RAM_MARGIN_MB: u64 = 4096;
 
@@ -52,20 +52,6 @@ pub(super) fn host_free_mb(available_mb: u64, warm_mb: u64) -> u64 {
 fn mem_available_mb() -> Option<u64> {
     let m = std::fs::read_to_string("/proc/meminfo").ok()?;
     m.lines().find(|l| l.starts_with("MemAvailable:"))?.split_whitespace().nth(1)?.parse::<u64>().ok().map(|kb| kb / 1024)
-}
-
-/// Of the idle holders (already in going-first order), those that must go so `want` is free: none needed, some, or None when even all of them do not make it
-pub(super) fn pick_plan(free: u64, want: u64, idle: Vec<Holder>) -> Option<Vec<Holder>> {
-    let mut got = free;
-    let mut plan = Vec::new();
-    for h in idle {
-        if got >= want {
-            break;
-        }
-        got += h.mb;
-        plan.push(h);
-    }
-    (got >= want).then_some(plan)
 }
 
 /// Whether the chat model loaded may go for room: answering nothing, not changing, pinned and held by nobody (running work never goes; a hold keeps it until its time is out)
@@ -100,25 +86,6 @@ pub(super) fn waiting_workers(status: &Value) -> Vec<(usize, u64)> {
     }).collect()
 }
 
-
-/// Idle work that holds memory on a card and can go for a model that needs the room
-pub(super) struct Holder {
-    what: Free,
-    /// its memory there
-    mb: u64,
-    model: String,
-    /// which go first: picture and sound servers (0), the video worker (1), a chat model (2)
-    order: u8,
-}
-
-pub(super) enum Free {
-    /// an image or audio server: (kind, slot)
-    Server(String, usize),
-    /// the video daemon's worker on this card
-    Video(usize),
-    /// the chat model
-    Chat(String),
-}
 
 /// The video daemon's engines (model ids), and (engine, GPU) per loaded worker
 type VideoDaemon = (Vec<String>, Vec<(String, usize)>);
@@ -166,20 +133,8 @@ fn card_of_port(cards: &Value, port: u16) -> Option<usize> {
         .and_then(|c| c["index"].as_u64()).map(|g| g as usize)
 }
 
-/// One of the kind's servers: its slot (`--slot`), port, model (when one answers), and whether it loads or has work
-pub(crate) struct Slot {
-    slot: usize,
-    pub(super) port: u16,
-    pub(super) model: Option<String>,
-    pub(super) loading: bool,
-    busy: bool,
-}
-
-impl Slot {
-    pub(super) fn is_busy(&self) -> bool {
-        self.busy
-    }
-}
+/// One of the kind's servers (the scheduler's type): its slot, port, model, and whether it loads or has work
+pub(crate) type Slot = room::Server;
 
 /// A request's server, chosen by `ensure`: counted as having work until dropped (after the answer)
 pub(crate) struct Lease<'a> {
@@ -473,8 +428,10 @@ impl Home {
             // the box went "offline" for the start of every picture (2026-10-22) - what it said last, busy
             let last = (sent > 0).then(|| self.answers.lock().unwrap().get(&port).cloned()).flatten();
             let st = last.map(|(m, l, _)| (m, l, true)).or_else(|| self.server_at(port));
-            Slot { slot, port, model: st.as_ref().map(|x| x.0.clone()), loading: st.as_ref().is_some_and(|x| x.1),
-                   busy: st.as_ref().is_some_and(|x| x.2) || sent > 0 }
+            // a load started here that does not answer yet: its model, loading (so no other kind plans as if the card held nothing)
+            let starting = if st.is_none() { self.pending.lock().unwrap().iter().find(|p| p.port == port && p.answered.is_none()).map(|p| p.model.clone()) } else { None };
+            Slot { slot, port, model: st.as_ref().map(|x| x.0.clone()).or(starting.clone()), loading: st.as_ref().is_some_and(|x| x.1) || starting.is_some(),
+                   busy: st.as_ref().is_some_and(|x| x.2) || sent > 0, inflight: sent }
         }).collect()
     }
 
@@ -595,7 +552,18 @@ impl Home {
                 state = "disabled";
             }
             let (caps, methods) = capabilities(m);
-            json!({"id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "state": state,
+            // the profile its model card says ("unmeasured" until a bench does) and the copies running now
+            let prof = self.profile_of(m);
+            let (concurrency, coexistence) = prof.to_json();
+            let copies_now = match kind.as_str() {
+                "llm" => usize::from(chat.0.as_deref() == Some(id.as_str())),
+                "image" | "audio" | "model3d" => slots_of(&kind).iter().filter(|x| x.model.as_deref() == Some(id.as_str()) && !x.loading).count(),
+                "video" => video.as_ref().map_or(0, |(_, loaded)| loaded.iter().filter(|(e, _)| *e == id).count()),
+                _ => 0,
+            };
+            json!({"concurrency": concurrency, "coexistence": coexistence, "copies_now": copies_now,
+                   "recommended_copies": prof.concurrency.recommended_copies, "max_copies_per_card": prof.concurrency.max_copies_per_card,
+                   "id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "state": state,
                    "spans": spans_all(m, &mc),
                    "pinned": enabled && m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round()),
                    "capabilities": caps, "methods": methods,
@@ -857,267 +825,104 @@ impl Home {
         if m["enabled"] == false {
             return Err((409, format!("{id} is disabled (enable it on :8000 or nextsycl models enable {id})")));
         }
-        // (the caller's max_willing_to_wait_s replaces these and enforces itself)
-        let limit = if super::backplane::has_limit() { Duration::MAX } else { Duration::from_secs(if job.is_some() { JOB_ROOM_WAIT_S } else { ROOM_WAIT_S }) };
-        let mut t0 = Instant::now();
-        loop {
-            if job.is_some_and(|j| self.job_cancelled(j)) {
-                return Err((499, format!("cancelled while it waited for {id}")));
-            }
-            // its files moving to another drive: it waits for the move like for room
-            if let Some(why) = self.moving_why(id) {
-                self.note(job, "waiting", &why);
-                if let Some(f) = self.past_limit() {
-                    return Err(f);
-                }
-                if t0.elapsed() > limit {
-                    return Err((409, why));
-                }
-                std::thread::sleep(Duration::from_secs(3));
-                continue;
-            }
-            let why = match self.place(&m, id, kind, job)? {
-                Ok(lease) => {
-                    self.request_on(id);
-                    return Ok(lease);
-                }
-                Err(why) => why,
-            };
-            // its limit on the time to start (max_willing_to_wait_s), once a try found no way: a hot model is on its server by now
-            if let Some(f) = self.past_limit() {
-                return Err(f);
-            }
-            // a GPU run holds the cards: a request is refused at once (cards_taken, retryable); a job waits in its queue
-            // as long as the run lasts (as in maintenance), its room wait starting when the run ends
-            if why.starts_with("cards taken:") {
-                if job.is_none() {
-                    return Err((503, why));
-                }
-                self.note(job, "cards_taken", &why);
-                std::thread::sleep(Duration::from_secs(3));
-                t0 = Instant::now();
-                continue;
-            }
-            self.note(job, "waiting", &why);
-            if t0.elapsed() > limit {
-                return Err((503, format!("{why}; {id} loads once one of them idles out or is stopped")));
-            }
-            std::thread::sleep(Duration::from_secs(3));
-        }
+        // (the caller's max_willing_to_wait_s replaces these and enforces itself: Host::give_up)
+        let default = if super::backplane::has_limit() { Duration::MAX } else { Duration::from_secs(if job.is_some() { JOB_ROOM_WAIT_S } else { ROOM_WAIT_S }) };
+        let info = self.model_info(&m);
+        let card_mb = self.cards.lock().unwrap().get(info.gpus[0]).and_then(|c| c["vram_total_mb"].as_u64()).unwrap_or(32768);
+        let (need_mb, _) = self.vouched_mb(&m, card_mb);
+        let asked_mb = self.asked.lock().unwrap().get(id).copied().unwrap_or(0);
+        let req = PlaceReq { model: &info, job, need_mb: &need_mb, asked_mb };
+        // the scheduler's driver is the only wait: cancel, files moving, cards taken, the limit, room
+        let (_, port) = place::ensure(&Sched(self), &req, default, None, &Value::Null)?;
+        self.request_on(id);
+        Ok(Lease { target: Target::Tcp(format!("127.0.0.1:{port}")), port, home: self })
     }
 
-    /// One try at a server for `id` (the kind's lock held while it lasts): a lease, or why there is none yet (no card
-    /// of its has the room, even with the idle models there stopped)
-    fn place(&self, m: &Value, id: &str, kind: &str, job: Option<&str>) -> Result<Result<Lease<'_>, String>, (u16, String)> {
-        let gpus = self.gpus_of(m);
-        let _g = self.kind_lock[kind].lock().unwrap();
-        let sv = self.servers(kind);
-        let inflight = |p: u16| self.inflight.lock().unwrap().get(&p).copied().unwrap_or(0);
-        let mine: Vec<&Slot> = sv.iter().filter(|x| x.model.as_deref() == Some(id)).collect();
-        // a server of it with nothing to do
-        if let Some(x) = mine.iter().find(|x| !x.busy && inflight(x.port) == 0) {
-            if x.loading {
-                self.note(job, "loading", &format!("{id} loading (server {})", x.slot + 1));
-                self.wait_up(x.port, id)?;
-            }
-            return Ok(Ok(self.lease(x.port)));
-        }
-        let card_mb = |c: &Value| c["vram_total_mb"].as_u64().unwrap_or(0);
-        let (need, _) = self.vouched_mb(m, self.cards.lock().unwrap().get(gpus[0]).map_or(32768, card_mb));
-        let want = |g: usize| need.get(&g).copied().unwrap_or(0) + MARGIN_MB;
-        let cards = self.named_cards(&self.models());
-        // a server that holds another model and could go now
-        let free_to_go = |x: &Slot| x.model.as_deref().is_none_or(|o| !self.kept(o));
-        let idle_other = |x: &&Slot| x.model.is_some() && x.model.as_deref() != Some(id) && !x.busy && !x.loading && inflight(x.port) == 0 && free_to_go(x);
-        if !mine.is_empty() {
-            // its servers all have work: another copy on a card of its without one that has the room now (or once idle
-            // picture and sound servers there stop), in a slot no server holds or one an idle model holds - else the copy
-            // with the fewest requests (its server queues it)
-            let on: Vec<usize> = mine.iter().filter_map(|x| card_of_port(&cards, x.port)).collect();
-            let spare = sv.iter().find(|x| x.model.is_none()).or_else(|| sv.iter().find(idle_other));
-            // (no second copy while a GPU run holds the cards)
-            let plan = gpus.iter().copied().filter(|g| !on.contains(g)).filter(|_| self.cards_taken().is_none())
-                .find_map(|g| self.room_plan(&cards, g, want(g), kind, true).map(|p| (g, p)));
-            if let (Some(x), Some((gpu, plan))) = (spare, plan) {
-                // (a plan another request's lock stands in the way of: no copy now, the requests share the first)
-                let started = self.free(&plan, kind, id).and_then(|_| {
-                    self.stop_slot(kind, x, id)?;
-                    if !self.wait_room(gpu, want(gpu)) {
-                        return Err((503, format!("GPU {gpu} did not come free")));
+    /// One consistent view of the box for the scheduler: the cards (their free memory as `free_mb` counts it, loads under
+    /// way among their holders), the servers, the models with their profiles, pins and holds
+    pub(super) fn snapshot(&self) -> Snapshot {
+        self.snapshot_of(&self.models(), true)
+    }
+
+    /// `snapshot`; without `servers` it asks no server, for what needs the cards alone (the last check before a start)
+    fn snapshot_of(&self, all: &[Value], servers: bool) -> Snapshot {
+        let named = self.named_cards(all);
+        let daemon = if named.as_array().into_iter().flatten().any(|c| c["procs"].as_array().into_iter().flatten().any(|p| p["kind"] == "video")) { self.video_daemon() } else { None };
+        let pending: Vec<super::Pending> = self.pending.lock().unwrap().iter().filter(|p| p.port != 0).cloned().collect();
+        let cards = named.as_array().into_iter().flatten().enumerate().map(|(i, c)| {
+            let index = c["index"].as_u64().map_or(i, |g| g as usize);
+            let total_mb = c["vram_total_mb"].as_u64().unwrap_or(0);
+            let mut procs: Vec<Proc> = c["procs"].as_array().into_iter().flatten().map(|p| {
+                let kind = p["kind"].as_str().filter(|k| matches!(*k, "llm" | "image" | "audio" | "video" | "model3d")).map(str::to_string);
+                let mut model = p["model_id"].as_str().or(p["model"].as_str()).or(p["program"].as_str()).unwrap_or("?").to_string();
+                // a video worker by what its slot says it holds (its process's arguments may not name a registered model)
+                if kind.as_deref() == Some("video") {
+                    if let Some((e, _)) = daemon.as_ref().and_then(|d| d.1.iter().find(|(_, on)| *on == index)) {
+                        model = e.clone();
                     }
-                    self.note(job, "loading", &format!("a second copy of {id} loading on GPU {gpu} (server {})", x.slot + 1));
-                    self.start_at(kind, id, x, gpu, want(gpu))
-                });
-                match started {
-                    Ok(()) => return Ok(Ok(self.lease(x.port))),
-                    Err((_, e)) => eprintln!("{id}: a second copy did not start ({e}); the requests share the first"),
+                }
+                Proc { kind, model, port: p["port"].as_str().and_then(|x| x.parse().ok()), mb: p["vram_mb"].as_u64().unwrap_or(0) }
+            }).collect();
+            // what only the root sampler sees (processes of other users): no resident, but the message names it
+            if let Some(mb) = c["vram_unseen_mb"].as_u64().filter(|mb| *mb >= 256) {
+                procs.push(Proc { kind: None, model: "processes of other users".into(), port: None, mb });
+            }
+            // a load under way is a resident before its memory shows
+            for p in pending.iter().filter(|p| p.gpu == index && p.answered.is_none()) {
+                if !procs.iter().any(|x| x.port == Some(p.port)) {
+                    procs.push(Proc { kind: Some(p.kind.clone()), model: p.model.clone(), port: Some(p.port), mb: 0 });
                 }
             }
-            let x = mine.iter().min_by_key(|x| inflight(x.port)).unwrap();
-            if x.loading {
-                self.note(job, "loading", &format!("{id} loading (server {})", x.slot + 1));
-                self.wait_up(x.port, id)?;
-            }
-            return Ok(Ok(self.lease(x.port)));
-        }
-        // not loaded, and a GPU run holds the cards (crate::gpulock): nothing loads beside it
-        if let Some(why) = self.cards_taken() {
-            return Ok(Err(why));
-        }
-        // not loaded: the first card of its with the room now, or once idle models there go (picture and sound
-        // servers, an idle video worker, a chat model not kept by X-Keep-Up-S); a slot no server holds, else one an
-        // idle model holds, else one a busy model of the kind holds, after its requests
-        let plan = gpus.iter().copied().find_map(|g| self.room_plan(&cards, g, want(g), kind, false).map(|p| (g, p)));
-        let empty = sv.iter().find(|x| x.model.is_none());
-        let idle = sv.iter().filter(idle_other).min_by_key(|x| card_of_port(&cards, x.port).is_none_or(|g| Some(g) != plan.as_ref().map(|p| p.0)));
-        let on_mine = |x: &&Slot| x.model.is_some() && card_of_port(&cards, x.port).is_some_and(|g| gpus.contains(&g));
-        let Some((gpu, plan)) = plan else {
-            // no room even then: a busy server of another model of the kind on a card of its goes after its requests
-            // (it holds the room), then the next try loads it
-            let held = |x: &Slot| card_of_port(&cards, x.port).map(|g| {
-                let mb = cards[g]["procs"].as_array().into_iter().flatten().filter(|p| p["port"].as_str() == Some(x.port.to_string().as_str()))
-                    .map(|p| p["vram_mb"].as_u64().unwrap_or(0)).sum::<u64>();
-                (g, mb)
-            });
-            let frees = |x: &&Slot| held(x).is_some_and(|(g, mb)| self.room_plan(&cards, g, want(g).saturating_sub(mb), kind, false).is_some());
-            if let Some(x) = sv.iter().filter(on_mine).filter(|x| free_to_go(x)).filter(frees).min_by_key(|x| inflight(x.port)) {
-                self.drain(x, kind, id, job)?;
-                return Ok(Err(format!("server {} stopped for {id}", x.slot + 1)));
-            }
-            return Ok(Err(self.no_room(&cards, &gpus, id, want(gpus[0]))));
-        };
-        let ram_plan = match self.ram_room(&cards, id, kind, None) {
-            Ok(p) => p,
-            Err(why) => return Ok(Err(why)),
-        };
-        let x = match (empty, idle) {
-            (Some(e), _) => e,
-            (None, Some(i)) => i,
-            // every server busy with another model: the one with the fewest requests, after them
-            _ => {
-                // (a pinned or held model keeps its server: with every server so, there is no room)
-                let Some(x) = sv.iter().filter(|x| x.model.is_some() && free_to_go(x)).min_by_key(|x| (!on_mine(x) as u8, inflight(x.port))) else {
-                    return Ok(Err(self.no_room(&cards, &gpus, id, want(gpus[0]))));
-                };
-                self.drain(x, kind, id, job)?;
-                x
-            }
-        };
-        self.stop_slot(kind, x, id)?;
-        // an idle model whose kind is busy changing its own server stays: the next try plans again
-        if let Err((_, e)) = self.free(&plan, kind, id).and_then(|_| self.free(&ram_plan, kind, id)) {
-            return Ok(Err(e));
-        }
-        if !self.wait_ram(&cards, id) {
-            return Ok(Err(format!("host memory did not come free for {id}")));
-        }
-        // the memory let go in a moment; when it does not (or something else took it), no load: the next try plans again
-        if !self.wait_room(gpu, want(gpu)) {
-            return Ok(Err(self.no_room(&self.named_cards(&self.models()), &[gpu], id, want(gpu))));
-        }
-        self.note(job, "loading", &format!("{id} loading on GPU {gpu} (server {})", x.slot + 1));
-        self.start_at(kind, id, x, gpu, want(gpu))?;
-        Ok(Ok(self.lease(x.port)))
-    }
-
-    /// Server `x` (another model's) after its requests: waited for, with the kind's lock held, so no new request is
-    /// sent to it meanwhile; then stopped
-    fn drain(&self, x: &Slot, kind: &str, id: &str, job: Option<&str>) -> Result<(), (u16, String)> {
-        let Some(other) = &x.model else { return Ok(()) };
-        let inflight = |p: u16| self.inflight.lock().unwrap().get(&p).copied().unwrap_or(0);
-        let t0 = Instant::now();
-        while self.server_at(x.port).is_some_and(|(_, _, busy)| busy) || inflight(x.port) > 0 {
-            if job.is_some_and(|j| self.job_cancelled(j)) {
-                return Err((499, format!("cancelled while it waited for {other}'s requests")));
-            }
-            if let Some(f) = self.past_limit() {
-                return Err(f);
-            }
-            if t0.elapsed() > Duration::from_secs(JOB_ROOM_WAIT_S) {
-                return Err((503, format!("{other} has been busy for 30 minutes; {id} waits for it")));
-            }
-            self.note(job, "waiting", &format!("server {} finishing {other}'s requests, then {id} loads there", x.slot + 1));
-            std::thread::sleep(Duration::from_secs(2));
-        }
-        self.stop_slot(kind, x, id)
-    }
-
-    /// Stop the server in slot `x` when it holds a model (one of the kind, its lock held), for `id`
-    fn stop_slot(&self, kind: &str, x: &Slot, id: &str) -> Result<(), (u16, String)> {
-        if let Some(other) = self.server_at(x.port).map(|s| s.0) {
-            self.exec(format!("{kind} stop ({other}, for {id})"), &[kind.into(), "stop".into(), "--slot".into(), x.slot.to_string()]).map_err(|e| (500, e))?;
-        }
-        Ok(())
-    }
-
-    /// The message for no room: each card, what it has free and who holds the rest (busy or idle)
-    pub(super) fn no_room(&self, cards: &Value, gpus: &[usize], id: &str, want: u64) -> String {
-        let free = |g: usize| self.free_mb(cards, g);
-        let busy: Vec<String> = gpus.iter().map(|g| {
-            let mut holders: Vec<String> = cards.get(*g).and_then(|c| c["procs"].as_array()).into_iter().flatten()
-                .map(|p| format!("{} {:.1} GiB", p["model"].as_str().or(p["program"].as_str()).unwrap_or("?"), p["vram_mb"].as_u64().unwrap_or(0) as f64 / 1024.0))
-                .collect();
-            // what only the root sampler sees (processes of other users)
-            if let Some(mb) = cards.get(*g).and_then(|c| c["vram_unseen_mb"].as_u64()).filter(|mb| *mb >= 256) {
-                holders.push(format!("processes of other users {:.1} GiB", mb as f64 / 1024.0));
-            }
-            format!("GPU {g}: {:.1} GiB free ({})", free(*g) as f64 / 1024.0, holders.join(", "))
+            Card { index, name: s(c, "name"), total_mb, used_mb: total_mb.saturating_sub(self.free_mb(&named, i)), procs }
         }).collect();
-        format!("{} held by work that is not idle - {}; {id} needs ~{:.1} GiB{}", if gpus.len() > 1 { "its cards are" } else { "its card is" },
-                busy.join("; "), want as f64 / 1024.0, self.kept_words(cards, gpus))
+        let servers = if servers { ["image", "audio", "model3d"].into_iter().map(|k| (k.to_string(), self.servers(k))).collect() } else { BTreeMap::new() };
+        let models: BTreeMap<String, ModelInfo> = all.iter().filter(|m| registry::kind_of(m) != "lora").map(|m| (s(m, "id"), self.model_info(m))).collect();
+        let pinned: std::collections::BTreeSet<String> = all.iter().filter(|m| m["pinned"] == true).map(|m| s(m, "id")).collect();
+        let at = now();
+        let held_left: BTreeMap<String, f64> = self.holds().iter().map(|(id, h)| (id.clone(), h.reserved(at))).filter(|(_, l)| *l > 0.0).collect();
+        // (a chat model's keep is not here: it is chat_idle's, so it yields to another chat model)
+        let mut kept = pinned.clone();
+        kept.extend(held_left.keys().cloned());
+        Snapshot { cards, servers, models, pinned, kept, held_left }
     }
 
-    /// What could go from card `g` so `want` MiB is free there: none needed (Some(empty)), the idle holders to stop
-    /// (Some), or no way now (None). Idle: a picture or sound server without work, the video daemon's worker while the
-    /// studio has nothing to make, a chat model answering nothing and not kept (chat_idle). `light`: picture and sound servers
-    /// only (for a second copy, which is no reason to stop a video or chat model). The kind asking is never asked to
-    /// free its own kind's chat or video.
-    pub(super) fn room_plan(&self, cards: &Value, g: usize, want: u64, asking: &str, light: bool) -> Option<Vec<Holder>> {
-        let free = cards.get(g).map(|_| self.free_mb(cards, g))?;
-        if free >= want {
-            return Some(Vec::new());
-        }
-        pick_plan(free, want, self.idle_on(cards, g, asking, light))
+    /// A registered model as the scheduler needs it
+    pub(super) fn model_info(&self, m: &Value) -> ModelInfo {
+        ModelInfo { id: s(m, "id"), kind: registry::kind_of(m).to_string(), enabled: m["enabled"] != false, gpus: self.gpus_of(m), profile: self.profile_of(m) }
     }
 
-    /// The idle holders on card `g`, the lightest to bring back first: picture and sound servers, then the video worker, then a chat model
-    fn idle_on(&self, cards: &Value, g: usize, asking: &str, light: bool) -> Vec<Holder> {
-        let inflight = |p: u16| self.inflight.lock().unwrap().get(&p).copied().unwrap_or(0);
-        let mut idle: Vec<Holder> = Vec::new();
-        let mut video_checked = None;
-        for p in cards.get(g).and_then(|c| c["procs"].as_array()).into_iter().flatten() {
-            let mb = p["vram_mb"].as_u64().unwrap_or(0);
-            let model = p["model_id"].as_str().or(p["model"].as_str()).unwrap_or("?").to_string();
-            // pinned or held: it stays, whoever asks
-            if self.kept(&model) {
-                continue;
-            }
-            match p["kind"].as_str() {
-                Some(k @ ("image" | "audio" | "model3d")) => {
-                    let Some(port) = p["port"].as_str().and_then(|x| x.parse::<u16>().ok()) else { continue };
-                    let Some(x) = self.servers(k).into_iter().find(|x| x.port == port) else { continue };
-                    if !x.busy && !x.loading && inflight(port) == 0 {
-                        idle.push(Holder { what: Free::Server(k.to_string(), x.slot), mb, model, order: 0 });
-                    }
-                }
-                Some("video") if !light && asking != "video" => {
-                    let ok = *video_checked.get_or_insert_with(|| self.video_idle());
-                    // the worker by what its slot says it holds (its process's arguments may not name a registered model)
-                    let held_engine = self.video_daemon().is_some_and(|(_, loaded)| loaded.iter().any(|(e, on)| *on == g && self.kept(e)));
-                    if ok && !held_engine {
-                        idle.push(Holder { what: Free::Video(g), mb, model, order: 1 });
-                    }
-                }
-                Some("llm") if !light && asking != "llm" => {
-                    if let Some(id) = self.chat_idle() {
-                        idle.push(Holder { what: Free::Chat(id), mb, model, order: 2 });
-                    }
-                }
-                _ => {}
-            }
+    /// A model's profile: its entry's, else its model card's (validated when the cards load), else one copy, shared
+    pub(crate) fn profile_of(&self, m: &Value) -> Profile {
+        if m.get("concurrency").is_some() || m.get("coexistence").is_some() {
+            return Profile::of_entry(m);
         }
-        idle.sort_by_key(|h| (h.order, std::cmp::Reverse(h.mb)));
-        idle
+        self.o.cfg.cards().iter().find(|c| [s(m, "catalog"), s(m, "id")].iter().any(|id| !id.is_empty() && c["id"] == id.as_str()))
+            .map_or_else(Profile::default, Profile::of_entry)
+    }
+
+    /// `system.busy`'s `engines`: what a dispatcher needs of each enabled model
+    pub(super) fn engines(states: &[Value]) -> Vec<Value> {
+        states.iter().filter(|m| m["enabled"] == true).map(|m| json!({"id": m["id"], "kind": m["kind"], "copies_now": m["copies_now"],
+            "recommended_copies": m["recommended_copies"], "max_copies_per_card": m["max_copies_per_card"],
+            "mode": m["coexistence"]["mode"], "status": m["concurrency"]["status"]})).collect()
+    }
+
+    /// The message for no room
+    pub(super) fn no_room(&self, snap: &Snapshot, gpus: &[usize], m: &ModelInfo, want: u64) -> String {
+        room::no_room(snap, gpus, m, want)
+    }
+
+    /// The scheduler's room plan for card `g`, with this box's idleness
+    pub(super) fn room_plan(&self, snap: &Snapshot, g: usize, want: u64, asking: &str, light: bool, m: Option<&ModelInfo>) -> Option<Vec<Holder>> {
+        room::room_plan(snap, &Sched(self), g, want, asking, light, m)
+    }
+
+    pub(super) fn free(&self, plan: &[Holder], kind: &str, id: &str) -> Result<(), (u16, String)> {
+        place::free_plan(&Sched(self), plan, kind, id)
+    }
+
+    pub(super) fn wait_room(&self, g: usize, want: u64) -> bool {
+        place::wait_room(&Sched(self), g, want)
     }
 
     /// A model's own host memory, MiB, and the cache it keeps warm (its entry's, else its model card's `ram_gib`, `ram_cache_gib`)
@@ -1131,22 +936,17 @@ impl Home {
     }
 
     /// Host memory free for a load now, MiB (None: not known here)
-    fn host_free_now(&self, cards: &Value) -> Option<u64> {
-        let mut seen = std::collections::BTreeSet::new();
-        for p in cards.as_array().into_iter().flatten().flat_map(|c| c["procs"].as_array().into_iter().flatten()) {
-            if let Some(i) = p["model_id"].as_str() {
-                seen.insert(i.to_string());
-            }
-        }
+    fn host_free_now(&self, cards: &[Card]) -> Option<u64> {
+        let seen: std::collections::BTreeSet<&str> = cards.iter().flat_map(|c| c.procs.iter()).filter(|p| p.kind.is_some()).map(|p| p.model.as_str()).collect();
         let warm: u64 = seen.iter().map(|i| self.ram_of(i).1).sum();
         Some(host_free_mb(mem_available_mb()?, warm))
     }
 
     /// The host memory rule for `id` (a model with `ram_gib`; none: no rule): what must go (idle holders on any card, their `ram_gib` and warm cache counted), or why it cannot
     /// load now. `leaving`: the chat model that goes anyway when this one comes.
-    fn ram_room(&self, cards: &Value, id: &str, asking: &str, leaving: Option<&str>) -> Result<Vec<Holder>, String> {
+    fn ram_room(&self, snap: &Snapshot, id: &str, asking: &str, leaving: Option<&str>) -> Result<Vec<Holder>, String> {
         let (Some(need), _) = self.ram_of(id) else { return Ok(Vec::new()) };
-        let Some(mut free) = self.host_free_now(cards) else { return Ok(Vec::new()) };
+        let Some(mut free) = self.host_free_now(&snap.cards) else { return Ok(Vec::new()) };
         if let Some(l) = leaving {
             let (r, c) = self.ram_of(l);
             free += r.unwrap_or(0) + c;
@@ -1157,28 +957,29 @@ impl Home {
         }
         let mut names = std::collections::BTreeSet::new();
         let mut idle: Vec<Holder> = Vec::new();
-        for g in 0..cards.as_array().map_or(0, |a| a.len()) {
-            for mut h in self.idle_on(cards, g, asking, false) {
+        for c in &snap.cards {
+            for mut h in room::evictable(room::idle_on(snap, &Sched(self), c.index, asking, false), &snap.kept) {
                 if !names.insert(h.model.clone()) {
                     continue;
                 }
-                let (r, c) = self.ram_of(&h.model);
-                h.mb = r.unwrap_or(0) + c;
+                let (r, w) = self.ram_of(&h.model);
+                h.mb = r.unwrap_or(0) + w;
                 idle.push(h);
             }
         }
-        pick_plan(free, want, idle).ok_or_else(|| {
-            let all: Vec<usize> = (0..cards.as_array().map_or(0, Vec::len)).collect();
-            format!("host memory is held by work that is not idle - {:.1} GiB free; {id} needs ~{:.1} GiB{}", free as f64 / 1024.0, want as f64 / 1024.0, self.kept_words(cards, &all))
+        room::plan_room(free, want, idle).ok_or_else(|| {
+            let all: Vec<usize> = snap.cards.iter().map(|c| c.index).collect();
+            format!("host memory is held by work that is not idle - {:.1} GiB free; {id} needs ~{:.1} GiB{}", free as f64 / 1024.0, want as f64 / 1024.0, room::kept_words(snap, &all, None))
         })
     }
 
     /// Wait (30 s at most) until the host has `id`'s memory free after holders went
-    fn wait_ram(&self, cards: &Value, id: &str) -> bool {
+    fn wait_ram(&self, id: &str) -> bool {
         let (Some(need), _) = self.ram_of(id) else { return true };
+        let cards = self.snapshot_of(&self.models(), false).cards;
         let t0 = Instant::now();
         loop {
-            if self.host_free_now(cards).is_none_or(|f| f >= need + RAM_MARGIN_MB) {
+            if self.host_free_now(&cards).is_none_or(|f| f >= need + RAM_MARGIN_MB) {
                 return true;
             }
             if t0.elapsed() >= Duration::from_secs(30) {
@@ -1197,66 +998,13 @@ impl Home {
             }
             let Ok(st) = call_for(&self.target("video"), "GET", "/engine/status", None, 4) else { continue };
             for (g, need) in waiting_workers(&st) {
-                let cards = self.named_cards(&self.models());
-                if let Some(plan) = self.room_plan(&cards, g, need, "video", false) {
+                let snap = self.snapshot();
+                if let Some(plan) = self.room_plan(&snap, g, need, "video", false, None) {
                     if let Err((_, e)) = self.free(&plan, "video", "a video job") {
                         eprintln!("video: GPU {g}: {e}");
                     }
                 }
             }
-        }
-    }
-
-    /// Stop the idle holders of a plan (for `id`; the kind `kind` asking holds its own lock; another kind's is tried, and
-    /// a server whose lock is taken is left: the next try plans again)
-    pub(super) fn free(&self, plan: &[Holder], kind: &str, id: &str) -> Result<(), (u16, String)> {
-        for h in plan {
-            match &h.what {
-                Free::Server(k, slot) => {
-                    let guard = if k == kind { None } else {
-                        match self.kind_lock[k.as_str()].try_lock() {
-                            Ok(g) => Some(g),
-                            Err(_) => return Err((503, format!("{} is changing its {k} server; {id} tries again", h.model))),
-                        }
-                    };
-                    // still idle (it may have taken a request since)
-                    let x = self.servers(k).into_iter().find(|x| x.slot == *slot);
-                    if x.as_ref().is_some_and(|x| !x.busy && !x.loading && x.model.is_some()) {
-                        self.exec(format!("{k} stop ({}, idle, for {id})", h.model), &[k.clone(), "stop".into(), "--slot".into(), slot.to_string()]).map_err(|e| (500, e))?;
-                    }
-                    drop(guard);
-                }
-                Free::Video(g) => {
-                    if self.video_idle() {
-                        call_for(&self.target("video"), "POST", "/engine/unload", Some(&json!({"gpu": g})), 30).map_err(|e| (502, format!("the video daemon: {e}")))?;
-                        let (rid, log) = self.new_run(format!("video: GPU {g}'s idle worker let go, for {id}"));
-                        let _ = std::fs::write(log, "");
-                        self.finish(rid, 0);
-                    }
-                }
-                Free::Chat(chat) => {
-                    if self.chat_idle().as_deref() == Some(chat.as_str()) {
-                        self.unload(chat)?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Wait (30 s at most) until card `g` has `want` MiB free: a stopped process lets go of its memory in a moment.
-    /// False: it did not come free (the load must not start - past the card the xe driver spills into host memory)
-    pub(super) fn wait_room(&self, g: usize, want: u64) -> bool {
-        let t0 = Instant::now();
-        loop {
-            let cards = self.cards.lock().unwrap().clone();
-            if self.free_mb(&cards, g) >= want {
-                return true;
-            }
-            if t0.elapsed() >= Duration::from_secs(30) {
-                return false;
-            }
-            std::thread::sleep(Duration::from_secs(1));
         }
     }
 
@@ -1267,8 +1015,8 @@ impl Home {
         let Some(c) = cards.get(g) else { return 0 };
         let pending: Vec<(u16, u64)> = {
             let mut l = self.pending.lock().unwrap();
-            l.retain(|p| p.3.is_none_or(|t| t.elapsed() < Duration::from_secs(6)));
-            l.iter().filter(|p| p.0 == g).map(|p| (p.1, p.2)).collect()
+            l.retain(|p| p.answered.is_none_or(|t| t.elapsed() < Duration::from_secs(6)));
+            l.iter().filter(|p| p.gpu == g).map(|p| (p.port, p.mb)).collect()
         };
         free_on(c, &pending)
     }
@@ -1341,29 +1089,34 @@ impl Home {
         if let Some(why) = self.cards_taken() {
             return Err((503, why));
         }
-        let gpus = self.gpus_of(m);
+        let info = self.model_info(m);
+        let gpus = info.gpus.clone();
         let t0 = Instant::now();
         let room_wait = if super::backplane::has_limit() { Duration::MAX } else { Duration::from_secs(ROOM_WAIT_S) };
         loop {
             if let Some(f) = self.past_limit() {
                 return Err(f);
             }
-            let cards = self.named_cards(&all);
-            let card_mb = |g: usize| cards.get(g).and_then(|c| c["vram_total_mb"].as_u64()).unwrap_or(32768);
+            let full = self.snapshot_of(&all, true);
+            let card_mb = |g: usize| full.cards.iter().find(|c| c.index == g).map_or(32768, |c| c.total_mb);
             let (need, _) = self.vouched_mb(m, card_mb(gpus[0]));
-            // what the chat model loaded now holds on a card (it leaves)
-            let chat_on = |g: usize| cards.get(g).and_then(|c| c["procs"].as_array()).into_iter().flatten()
-                .filter(|p| p["kind"] == "llm").map(|p| p["vram_mb"].as_u64().unwrap_or(0)).sum::<u64>();
-            let want = |g: usize| (need.get(&g).copied().unwrap_or(0) + MARGIN_MB).saturating_sub(chat_on(g));
-            let free = |g: usize| self.free_mb(&cards, g);
-            let short: Vec<usize> = gpus.iter().copied().filter(|g| free(*g) < want(*g)).collect();
+            // the chat model loaded now leaves when this one comes: what it holds counts as free and it is no resident
+            let chat_on = |g: usize| full.cards.iter().find(|c| c.index == g).into_iter().flat_map(|c| c.procs.iter()).filter(|p| p.kind.as_deref() == Some("llm")).map(|p| p.mb).sum::<u64>();
+            let mut snap = full.clone();
+            for c in &mut snap.cards {
+                c.used_mb = c.used_mb.saturating_sub(chat_on(c.index));
+                c.procs.retain(|p| p.kind.as_deref() != Some("llm"));
+            }
+            let want = |g: usize| need.get(&g).copied().unwrap_or(0) + MARGIN_MB;
+            let plans: Vec<(usize, Option<Vec<Holder>>)> = gpus.iter().map(|g| (*g, self.room_plan(&snap, *g, want(*g), "llm", false, Some(&info)))).collect();
+            let short: Vec<usize> = plans.iter().filter(|(_, p)| !p.as_ref().is_some_and(Vec::is_empty)).map(|(g, _)| *g).collect();
             let loaded = self.chat_loaded(&all);
-            let ram = self.ram_room(&cards, id, "llm", loaded.as_deref());
+            let ram = self.ram_room(&full, id, "llm", loaded.as_deref());
             if short.is_empty() {
                 match ram {
                     Ok(p) if p.is_empty() => return Ok(()),
                     Ok(p) => {
-                        if self.free(&p, "llm", id).is_ok() && self.wait_ram(&cards, id) {
+                        if self.free(&p, "llm", id).is_ok() && self.wait_ram(id) {
                             return Ok(());
                         }
                     }
@@ -1377,16 +1130,17 @@ impl Home {
                 continue;
             }
             let mut freed = false;
-            for g in &short {
-                if let Some(plan) = self.room_plan(&cards, *g, want(*g), "llm", false) {
-                    if self.free(&plan, "llm", id).is_ok() {
-                        self.wait_room(*g, want(*g));
+            for (g, plan) in plans.iter().filter(|(g, _)| short.contains(g)) {
+                if let Some(plan) = plan {
+                    if self.free(plan, "llm", id).is_ok() {
+                        // (the real card still holds the chat model that leaves)
+                        self.wait_room(*g, want(*g).saturating_sub(chat_on(*g)));
                         freed = true;
                     }
                 }
             }
             if t0.elapsed() > room_wait {
-                let lack = short.iter().map(|g| self.no_room(&cards, &[*g], id, want(*g))).collect::<Vec<_>>().join(" / ");
+                let lack = short.iter().map(|g| self.no_room(&full, &[*g], &info, want(*g))).collect::<Vec<_>>().join(" / ");
                 return Err((503, format!("{lack}; {id} loads once one of them idles out or is stopped")));
             }
             if !freed {
@@ -1401,37 +1155,30 @@ impl Home {
         crate::gpulock::held(&f).map(|h| crate::gpulock::message(&f, &h))
     }
 
-    /// `id` started in slot `x` on card `gpu` (placed for `want` MiB, the spare included), answering; until it answers,
-    /// the memory it has yet to take counts as taken there (free_mb)
-    fn start_at(&self, kind: &str, id: &str, x: &Slot, gpu: usize, want: u64) -> Result<(), (u16, String)> {
-        self.pending.lock().unwrap().push((gpu, x.port, want.saturating_sub(MARGIN_MB), None));
-        let r = self.start_at_(kind, id, x, gpu);
+    /// `id` started in server `slot` on card `gpu`, answering; until a moment after it answers, the memory it has yet to
+    /// take counts as taken there (free_mb; `Sched::reserve` took it)
+    fn start_at(&self, kind: &str, id: &str, slot: usize, port: u16, gpu: usize) -> Result<(), (u16, String)> {
+        let r = self.start_at_(kind, id, slot, port, gpu);
         // kept a few seconds more: the cards are sampled every 2 s, the server's memory shows on the next
-        for p in self.pending.lock().unwrap().iter_mut().filter(|p| p.1 == x.port && p.3.is_none()) {
-            p.3 = Some(Instant::now());
+        for p in self.pending.lock().unwrap().iter_mut().filter(|p| p.port == port && p.answered.is_none()) {
+            p.answered = Some(Instant::now());
         }
         r
     }
 
-    fn start_at_(&self, kind: &str, id: &str, x: &Slot, gpu: usize) -> Result<(), (u16, String)> {
+    fn start_at_(&self, kind: &str, id: &str, slot: usize, port: u16, gpu: usize) -> Result<(), (u16, String)> {
         let secs = (self.o.idle_minutes * 60).to_string();
         // (a pinned model's server does not end itself when idle)
-        let mut args = vec![kind.to_string(), "start".into(), id.into(), "--gpu".into(), gpu.to_string(), "--port".into(), x.port.to_string(),
-                            "--host".into(), self.o.serve_host.clone(), "--wfe".into(), "--slot".into(), x.slot.to_string()];
+        let mut args = vec![kind.to_string(), "start".into(), id.into(), "--gpu".into(), gpu.to_string(), "--port".into(), port.to_string(),
+                            "--host".into(), self.o.serve_host.clone(), "--wfe".into(), "--slot".into(), slot.to_string()];
         if self.o.idle_minutes > 0 && !self.pinned(id) {
             args.extend(["--idle-exit".into(), secs]);
         }
         self.loading.lock().unwrap().insert(id.to_string(), now());
-        let r = self.exec(format!("{kind} start {id} on GPU {gpu}{}", if x.slot > 0 { format!(" (server {})", x.slot + 1) } else { String::new() }), &args);
+        let r = self.exec(format!("{kind} start {id} on GPU {gpu}{}", if slot > 0 { format!(" (server {})", slot + 1) } else { String::new() }), &args);
         self.loading.lock().unwrap().remove(id);
         r.map_err(|e| (502, e))?;
-        self.wait_up(x.port, id)
-    }
-
-    /// A request on its way to the server on `port` (counted until the lease is dropped)
-    fn lease(&self, port: u16) -> Lease<'_> {
-        *self.inflight.lock().unwrap().entry(port).or_insert(0) += 1;
-        Lease { target: Target::Tcp(format!("127.0.0.1:{port}")), port, home: self }
+        self.wait_up(port, id)
     }
 
     fn wait_up(&self, port: u16, id: &str) -> Result<(), (u16, String)> {
@@ -1497,9 +1244,122 @@ impl Home {
     }
 }
 
+/// The box as the scheduler sees it: crates/scheduler decides, this does (its README's table of what each method is)
+pub(super) struct Sched<'h>(pub(super) &'h Home);
+
+impl Idleness for Sched<'_> {
+    fn video_idle(&self) -> bool {
+        self.0.video_idle()
+    }
+    fn chat_idle(&self) -> Option<String> {
+        self.0.chat_idle()
+    }
+}
+
+impl Host for Sched<'_> {
+    fn now(&self) -> f64 {
+        now()
+    }
+    fn sleep(&self, secs: f64) {
+        std::thread::sleep(Duration::from_secs_f64(secs));
+    }
+    fn snapshot(&self) -> Snapshot {
+        self.0.snapshot()
+    }
+    fn server(&self, kind: &str, port: u16) -> Option<room::Server> {
+        self.0.servers(kind).into_iter().find(|x| x.port == port)
+    }
+    fn start(&self, kind: &str, id: &str, slot: usize, port: u16, gpu: usize) -> Result<(), (u16, String)> {
+        self.0.start_at(kind, id, slot, port, gpu)
+    }
+    fn stop(&self, kind: &str, slot: usize, _port: u16, label: &str) -> Result<(), (u16, String)> {
+        self.0.exec(label.to_string(), &[kind.into(), "stop".into(), "--slot".into(), slot.to_string()]).map(|_| ()).map_err(|e| (500, e))
+    }
+    fn free_video(&self, gpu: usize, for_id: &str) -> Result<(), (u16, String)> {
+        call_for(&self.0.target("video"), "POST", "/engine/unload", Some(&json!({"gpu": gpu})), 30).map_err(|e| (502, format!("the video daemon: {e}")))?;
+        let (rid, log) = self.0.new_run(format!("video: GPU {gpu}'s idle worker let go, for {for_id}"));
+        let _ = std::fs::write(log, "");
+        self.0.finish(rid, 0);
+        Ok(())
+    }
+    fn free_chat(&self, chat: &str) -> Result<(), (u16, String)> {
+        self.0.unload(chat)
+    }
+    fn try_lock_kind<'a>(&'a self, kind: &str) -> Option<Box<dyn Guard + 'a>> {
+        self.0.kind_lock.get(kind)?.try_lock().ok().map(|g| Box::new(g) as Box<dyn Guard + 'a>)
+    }
+    fn wait_lock_kind<'a>(&'a self, kind: &str) -> Box<dyn Guard + 'a> {
+        Box::new(self.0.kind_lock[kind].lock().unwrap())
+    }
+    fn placed(&self, port: u16) {
+        *self.0.inflight.lock().unwrap().entry(port).or_insert(0) += 1;
+    }
+    fn wait_loaded(&self, port: u16, id: &str) -> Result<(), (u16, String)> {
+        self.0.wait_up(port, id)
+    }
+    fn note(&self, job: Option<&str>, stage: &str, why: &str) {
+        self.0.note(job, stage, why);
+    }
+    fn cancelled(&self, job: &str) -> bool {
+        self.0.job_cancelled(job)
+    }
+    fn learn_ask(&self, id: &str, err: &str, gpu: usize, want: u64) -> bool {
+        let Some((need, had)) = place::asked_mb(err) else { return false };
+        let ask = place::ask_mb(need, had, self.free_mb(gpu));
+        eprintln!("{id}: its server asked {need} MiB with {had} MiB free on GPU {gpu}; planned {want} MiB, from now {ask}");
+        let mut a = self.0.asked.lock().unwrap();
+        let more = ask > want && a.get(id).is_none_or(|x| ask > *x);
+        if more {
+            a.insert(id.to_string(), ask);
+        }
+        more
+    }
+    fn barred(&self) -> Option<String> {
+        self.0.cards_taken()
+    }
+    fn not_ready(&self, id: &str) -> Option<String> {
+        self.0.moving_why(id)
+    }
+    fn give_up(&self) -> Option<(u16, String)> {
+        self.0.past_limit()
+    }
+    fn ram_plan(&self, snap: &Snapshot, m: &ModelInfo) -> Result<Vec<Holder>, String> {
+        self.0.ram_room(snap, &m.id, &m.kind, None)
+    }
+    fn wait_ram(&self, id: &str) -> bool {
+        self.0.wait_ram(id)
+    }
+    fn free_mb(&self, g: usize) -> u64 {
+        // the sampler's cards, no server asked: this is asked every second while memory lets go
+        let cards = self.0.cards.lock().unwrap().clone();
+        self.0.free_mb(&cards, g)
+    }
+    fn reserve(&self, m: &ModelInfo, _slot: usize, port: u16, gpu: usize, want: u64) -> Result<(), String> {
+        // one at a time over every kind: the check and the taking are one step
+        let _a = self.0.admit.lock().unwrap();
+        let snap = self.0.snapshot_of(&self.0.models(), false);
+        room::may_start(&snap.cards, &snap.models, m, gpu, want)?;
+        self.0.pending.lock().unwrap().push(super::Pending { gpu, port, mb: want.saturating_sub(MARGIN_MB), answered: None, kind: m.kind.clone(), model: m.id.clone() });
+        Ok(())
+    }
+    fn first_listed_card(&self) -> bool {
+        // the order a model's cards are ticked in is the order to try them (the B70 before the B65 on hardac1)
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use backplane_scheduler::profile::Mode;
+    use backplane_scheduler::room::Free;
+
+    #[test]
+    fn exclusive_mode_reads_from_an_entry_and_the_default_is_shared() {
+        assert_eq!(Profile::of_entry(&json!({"id": "x"})).coexistence.mode, Mode::Shared);
+        let m = json!({"coexistence": {"mode": "exclusive", "exclusive_reason": "x"}});
+        assert_eq!(Profile::of_entry(&m).coexistence.mode, Mode::Exclusive);
+    }
 
     fn chat_holder(mb: u64) -> Holder {
         Holder { what: Free::Chat("m".into()), mb, model: "m".into(), order: 2 }
@@ -1537,10 +1397,10 @@ mod tests {
 
     #[test]
     fn room_comes_from_idle_holders_or_there_is_none() {
-        assert_eq!(pick_plan(30000, 28000, vec![chat_holder(30000)]).map(|p| p.len()), Some(0), "room without stopping anyone");
-        assert_eq!(pick_plan(1600, 28000, vec![chat_holder(30000)]).map(|p| p.len()), Some(1), "the idle chat model goes");
-        assert!(pick_plan(1600, 28000, vec![]).is_none(), "kept or answering: not in the list, so no room");
-        assert!(pick_plan(1600, 28000, vec![chat_holder(100)]).is_none(), "not enough even with it");
+        assert_eq!(room::plan_room(30000, 28000, vec![chat_holder(30000)]).map(|p| p.len()), Some(0), "room without stopping anyone");
+        assert_eq!(room::plan_room(1600, 28000, vec![chat_holder(30000)]).map(|p| p.len()), Some(1), "the idle chat model goes");
+        assert!(room::plan_room(1600, 28000, vec![]).is_none(), "kept or answering: not in the list, so no room");
+        assert!(room::plan_room(1600, 28000, vec![chat_holder(100)]).is_none(), "not enough even with it");
     }
 
     #[test]
@@ -1551,7 +1411,7 @@ mod tests {
         // a 42.5 GiB model with the margin does not fit beside it; with the holder's memory back it does
         let want = (42.5 * 1024.0) as u64 + RAM_MARGIN_MB;
         assert!(host_free_mb(16400, 12700) < want);
-        assert_eq!(pick_plan(3700, want, vec![chat_holder(43520 + 12700)]).map(|p| p.len()), Some(1));
+        assert_eq!(room::plan_room(3700, want, vec![chat_holder(43520 + 12700)]).map(|p| p.len()), Some(1));
     }
 
     #[test]

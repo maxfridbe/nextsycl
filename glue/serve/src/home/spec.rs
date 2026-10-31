@@ -201,6 +201,7 @@ pub fn result(method: &str) -> Option<String> {
   "loading": {"type": "array", "items": {"type": "string"}, "description": "models loading"},
   "working": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string"}}}, "description": "picture and sound models answering a request"},
   "llm": {"type": "object", "properties": {"active": {"type": "integer", "description": "chat requests being answered"}}},
+  "engines": {"type": "array", "description": "one per enabled model, for a dispatcher: copies running now and what its model card says", "items": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string"}, "copies_now": {"type": "integer"}, "recommended_copies": {"type": "integer"}, "max_copies_per_card": {"type": "integer"}, "mode": {"type": "string", "description": "shared or exclusive"}, "status": {"type": "string", "description": "measured or unmeasured (one copy, shared)"}}}},
   "jobs": {"type": "array", "description": "image and audio jobs not ended (held ones too; they are no reason for busy)", "items": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string"}, "label": {"type": "string"}, "state": {"type": "string"}, "held": {"type": "boolean"}}}},
   "video": {"type": "object", "nullable": true, "description": "null: no video model enabled", "properties": {
     "running": {"type": "boolean"}, "label": {"type": "string", "nullable": true}, "name": {"type": "string", "nullable": true},

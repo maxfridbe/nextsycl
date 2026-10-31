@@ -11,6 +11,7 @@
 //!                                     step compared: cosine and relative error per tensor, then the next token
 
 mod bench;
+mod modelbench;
 mod client;
 mod container;
 mod drives;
@@ -1161,6 +1162,7 @@ fn main() -> ExitCode {
         // the llm commands' names from before the kinds (nextsycl start = nextsycl llm start, ...)
         Some("start") => service::start(&cfg, rest),
         Some("models") if rest.first().is_some_and(|a| a == "move") => drives::move_cmd(&cfg, rest),
+        Some("models") if rest.first().is_some_and(|a| a == "bench") => modelbench::cmd(&cfg, rest),
         Some("drives") => drives::cmd(&cfg, rest),
         Some("models") => models::cmd(&cfg, rest, &|g: &Gguf| {
             let all = engines();

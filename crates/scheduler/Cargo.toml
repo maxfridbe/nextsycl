@@ -1,0 +1,13 @@
+[package]
+name = "backplane-scheduler"
+description = "The backplane's scheduler: placement, room planning, pins and holds, model-card concurrency profiles, ETAs. Pure; the host supplies cards, servers, a clock and files through traits."
+version = "0.1.0+nextsycl.1"
+edition = "2021"
+license = "MIT"
+
+# std and serde_json only (no nextcuda crate, no process spawning, no HTTP, no GPU API).
+# Copied out of the workspace: remove nothing here; `cargo test` in the directory works as it is when it is its own
+# workspace (add an empty `[workspace]` table below) and as a member of another workspace when it is not.
+[dependencies]
+# (no preserve_order, unlike nextcuda: in a workspace the feature would reorder every crate's JSON)
+serde_json = "1"

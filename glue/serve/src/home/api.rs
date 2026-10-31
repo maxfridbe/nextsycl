@@ -42,7 +42,7 @@ const FEATURES: &[&str] = &[
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
     "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request", "video.soundtrack", "video.exposure_fix",
-    "backplane", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand",
+    "backplane", "system.busy.engines", "models.profile", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -557,7 +557,7 @@ impl Home {
         let maintenance = self.maintenance().map(|n| super::maint::public(&n));
         json!({"busy": !reasons.is_empty(), "reasons": reasons, "loading": loading, "working": working, "llm": {"active": active},
                "maintenance": maintenance, "cards_taken": self.cards_taken(),
-               "jobs": jobs, "video": video, "cards": per_card, "slots": slots, "parallel": self.parallel(all)})
+               "jobs": jobs, "video": video, "cards": per_card, "slots": slots, "parallel": self.parallel(all), "engines": Self::engines(&states)})
     }
 
     /// How many requests of each image and audio model run at once: a copy a card it is enabled on, as many as the

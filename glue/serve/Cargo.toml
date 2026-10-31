@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+backplane-scheduler.workspace = true
 nextsycl-core.workspace = true
 nextsycl-diffusion.workspace = true
 nextsycl-llm.workspace = true

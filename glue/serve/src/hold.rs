@@ -4,15 +4,16 @@
 //! unloads a chat model. One difference is kept from before: a hold by `rsvp_s` also stops another chat model taking
 //! the one chat server, while a keep yields to one - Open WebUI sends its keep on every chat, and picking another model
 //! there has always worked. A pin is a hold with no end (the registry's `pinned`). `rsvp_s: 0` releases: the model
-//! goes as soon as it is idle, unless an earlier hold still stands.
+//! goes as soon as it is idle, unless an earlier hold still stands. The arithmetic of a hold is crates/scheduler's (`rsvp`);
+//! the file and the keep are this box's.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use backplane_scheduler::rsvp;
 use serde_json::{json, Value};
 
-/// `NS_MAX_RSVP_S`'s default: a day
-pub const MAX_RSVP_S: f64 = 86400.0;
+pub use backplane_scheduler::rsvp::DEFAULT_MAX_RSVP_S as MAX_RSVP_S;
 
 /// Until when (unix seconds) a model is kept, and of that until when by rsvp_s
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -43,12 +44,12 @@ pub fn file_beside(registry: &Path) -> PathBuf {
 
 /// A setting's NS_MAX_RSVP_S (unset, 0 or not a number: a day)
 pub fn max_rsvp_s(setting: Option<String>) -> f64 {
-    setting.and_then(|v| v.trim().parse::<f64>().ok()).filter(|c| *c > 0.0).unwrap_or(MAX_RSVP_S)
+    rsvp::cap_of(setting)
 }
 
 /// The seconds granted for an ask: against the cap, 0 or more
 pub fn granted(asked: f64, max: f64) -> f64 {
-    asked.clamp(0.0, max)
+    rsvp::granted(Some(asked), max).unwrap_or(0.0)
 }
 
 fn now() -> f64 {
@@ -83,12 +84,9 @@ pub fn write(file: &Path, holds: &Holds) -> Result<(), String> {
 pub fn grant_rsvp(holds: &mut Holds, id: &str, secs: f64, max: f64, now: f64) -> f64 {
     let g = granted(secs, max);
     let h = holds.entry(id.to_string()).or_default();
-    if g > 0.0 {
-        h.rsvp_until = h.rsvp_until.max(now + g);
-        h.release = false;
-    } else {
-        h.release = h.rsvp_until <= now;
-    }
+    let next = rsvp::extend(Some(rsvp::Hold { until: h.rsvp_until, release: h.release }), now, g);
+    h.rsvp_until = next.until;
+    h.release = next.release;
     g
 }
 

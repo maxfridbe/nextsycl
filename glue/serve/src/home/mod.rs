@@ -184,6 +184,7 @@ pub struct Home {
     holds_mx: Mutex<()>,
     /// history/*.jsonl beside serve.json: what work took (history.rs)
     history: history::History,
+    history_dir: PathBuf,
     /// the clips watched for a limit or a reservation, and the ones withdrawn at their limit, by label (backplane.rs)
     video_watch: Mutex<Vec<backplane::Watch>>,
     withdrawn: Mutex<BTreeMap<String, Value>>,
@@ -194,6 +195,10 @@ pub struct Home {
     /// loads started here and not yet answering (or answering a moment ago): card, server port, MiB placed for, when
     /// it answered - what they have yet to take counts as taken (life.rs free_mb)
     pending: Mutex<Vec<Pending>>,
+    /// one load at a time takes its room: the last check and the taking are one step (life.rs Sched::reserve)
+    admit: Mutex<()>,
+    /// what a server refused to load for, MiB, by model: planned for from then on
+    asked: Mutex<BTreeMap<String, u64>>,
     /// the video queue paused while a GPU run held the cards (crate::gpulock): what to put back when it ends
     lock_paused: Mutex<Option<Value>>,
     /// the progress of running jobs no server runs (an enrolment: enroll.rs), by job id
@@ -229,8 +234,18 @@ fn merge_gpustat(cards: &mut [Value], st: &Value, now: f64) {
     }
 }
 
-/// A load under way: card, server port, MiB placed for, when it answered
-type Pending = (usize, u16, u64, Option<std::time::Instant>);
+/// A load under way (port 0: a job's, no server)
+#[derive(Clone)]
+pub(super) struct Pending {
+    gpu: usize,
+    port: u16,
+    /// MiB placed for
+    mb: u64,
+    /// when it answered
+    answered: Option<std::time::Instant>,
+    kind: String,
+    model: String,
+}
 
 pub(crate) fn now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
@@ -312,15 +327,16 @@ impl Home {
         let maint_file = crate::maintenance::file_beside(&registry::registry(&o.cfg));
         let maint_bypass = Mutex::new(st["maintenance_bypass"].as_str().unwrap_or("").to_string());
         let holds_file = crate::hold::file_beside(&registry::registry(&o.cfg));
-        let history = history::History::open(state_file.with_file_name("history"));
+        let history_dir = state_file.with_file_name("history");
+        let history = history::open(history_dir.clone());
         let h = Arc::new(Home {
             o, token, state_file, jobs,
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), answers: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()),
-            holds_file, holds_mx: Mutex::new(()), history, video_watch: Mutex::new(Vec::new()), withdrawn: Mutex::new(BTreeMap::new()),
+            holds_file, holds_mx: Mutex::new(()), history, history_dir, video_watch: Mutex::new(Vec::new()), withdrawn: Mutex::new(BTreeMap::new()),
             chat_last: Mutex::new(now()), cards_fixed: std::sync::atomic::AtomicBool::new(false),
-            pending: Mutex::new(Vec::new()), lock_paused: Mutex::new(None), progress: Mutex::new(BTreeMap::new()),
+            pending: Mutex::new(Vec::new()), admit: Mutex::new(()), asked: Mutex::new(BTreeMap::new()), lock_paused: Mutex::new(None), progress: Mutex::new(BTreeMap::new()),
             maint_file, maint_bypass, disks: disks::Disks::new(&st), pulls: pulls::Pulls::default(),
         });
         let me = h.clone();

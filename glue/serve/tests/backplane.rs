@@ -267,7 +267,7 @@ while [ $# -gt 0 ]; do case "$1" in --port) port=$2;; --slot) slot=$2;; --gpu) g
 case "$kind $cmd" in
   "video start") echo "video 0 video" > "$D/up-{video}";;
   "video stop") rm -f "$D/up-{video}";;
-  *" start") echo "$id $gpu $kind" > "$D/up-$port"; echo "$port" > "$D/slot-$kind-$slot"; sleep 0.2;;
+  *" start") [ -e "$D/slow-$id" ] && sleep "$(cat "$D/slow-$id")"; echo "$id $gpu $kind" > "$D/up-$port"; echo "$port" > "$D/slot-$kind-$slot"; sleep 0.2;;
   *" stop") p=$(cat "$D/slot-$kind-$slot" 2>/dev/null); rm -f "$D/up-$p";;
 esac
 "#, d = dir.display())).unwrap();
@@ -741,4 +741,67 @@ fn maintenance_refuses_a_pin_and_reloads_none() {
     b.ok("system.maintenance", json!({"on": false}));
     b.until("reloaded when the mode ends", 70, |b| b.up("p"));
     let _ = &b.home;
+}
+
+fn with_block(mut m: Value, k: &str, v: Value) -> Value {
+    m[k] = v;
+    m
+}
+
+#[test]
+fn system_busy_says_each_enabled_models_engine_row() {
+    let excl = with_block(image("alone", 1.0), "coexistence", json!({"mode": "exclusive", "exclusive_reason": "fills the card"}));
+    let mut off = image("off", 1.0);
+    off["enabled"] = json!(false);
+    let b = start("engines", vec![image("plain", 1.0), excl, off], None, None);
+    assert_eq!(b.make("plain", json!({}))["ok"], true);
+    let e = b.ok("system.busy", json!({}))["engines"].clone();
+    let row = |id: &str| e.as_array().unwrap().iter().find(|r| r["id"] == id).cloned();
+    assert!(row("off").is_none(), "{e}");
+    assert_eq!(row("plain").unwrap(), json!({"id": "plain", "kind": "image", "copies_now": 1, "recommended_copies": 1, "max_copies_per_card": 1, "mode": "shared", "status": "unmeasured"}));
+    assert_eq!(row("alone").unwrap()["mode"], "exclusive");
+    assert_eq!(row("alone").unwrap()["copies_now"], 0);
+    let st = b.model_state("plain");
+    assert_eq!((st["concurrency"]["status"].as_str(), st["coexistence"]["mode"].as_str()), (Some("unmeasured"), Some("shared")));
+}
+
+#[test]
+fn an_exclusive_model_clears_idle_residents_and_nothing_starts_beside_it() {
+    let excl = with_block(image("alone", 1.0), "coexistence", json!({"mode": "exclusive", "exclusive_reason": "fills the card"}));
+    let b = start("exclusive", vec![image("a", 1.0), excl, image("c", 1.0)], None, None);
+    assert_eq!(b.make("a", json!({}))["ok"], true);
+    // the memory would fit: it goes anyway
+    assert_eq!(b.make("alone", json!({}))["ok"], true);
+    assert!(!b.up("a") && b.up("alone"), "{}", b.exec_log());
+    // pinned, it cannot go, so nothing joins it: the answer names it (past the limit the error is the limit's)
+    b.ok("system.pin", json!({"model": "alone"}));
+    let e = b.make("c", json!({"max_willing_to_wait_s": 2, "wait": true}));
+    assert_eq!(e["ok"], false, "{e}");
+    assert!(!b.up("c"), "{}", b.exec_log());
+}
+
+#[test]
+fn nothing_starts_beside_an_exclusive_model_still_loading_in_another_kind() {
+    let mut alone = with_block(image("alone", 1.0), "coexistence", json!({"mode": "exclusive", "exclusive_reason": "fills the card"}));
+    alone["kind"] = json!("audio");
+    let b = start("exclusive-loading", vec![alone, image("c", 1.0)], None, None);
+    std::fs::write(b.dir.join("slow-alone"), "4").unwrap();
+    b.ok("system.load", json!({"model": "alone"}));
+    b.until("its start", 5, |b| b.exec_log().contains("audio start alone"));
+    // it holds no memory yet and answers nothing: the cards show nothing there
+    assert!(!b.up("alone"));
+    let e = b.make("c", json!({"max_willing_to_wait_s": 1}));
+    assert_eq!(e["ok"], false, "{e}");
+    assert!(!b.exec_log().contains("image start c"), "{}", b.exec_log());
+    assert_eq!(b.model_state("alone")["state"], "loading");
+}
+
+#[test]
+fn a_model_loads_on_the_first_of_its_cards_with_room_not_the_emptiest() {
+    let mut two = image("two", 1.0);
+    two["gpus"] = json!("0,1");
+    let b = start_on("first-listed", vec![image("a", 1.0), two], None, None, 2);
+    assert_eq!(b.make("a", json!({}))["ok"], true);
+    assert_eq!(b.make("two", json!({}))["ok"], true);
+    assert!(b.exec_log().contains("image start two --gpu 0"), "{}", b.exec_log());
 }
