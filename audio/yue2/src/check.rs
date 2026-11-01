@@ -119,7 +119,7 @@ pub fn self_check(e: &Yue2, log: &mut dyn FnMut(String)) -> Result<f64> {
     let pos = e.lm.positions(frames + 2)?;
     let temb = DevBuf::from_f32(g, &e.lm.time_embedding(1.0))?;
     let v = DevBuf::f32(g, frames * LATENT)?;
-    let mut run = |how: u8, name: &str, s: &mut Scratch, log: &mut dyn FnMut(String)| -> Result<Vec<f32>> {
+    let run = |how: u8, name: &str, s: &mut Scratch, log: &mut dyn FnMut(String)| -> Result<Vec<f32>> {
         let t0 = Instant::now();
         e.lm.velocity_as(s, &c, &st, frames, &temb, &pos, v.ptr(), how)?;
         let o = v.to_f32()?;
