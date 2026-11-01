@@ -1,0 +1,20 @@
+# Open-H3-Regenerate-2K, the refiner part only, cut to rank 16 (Kijai's extraction of NVlabs' open replacement for the
+# closed H3-Regenerate-2K): a three-step refine of a latent upscaled from a 768p draft (1344x768) toward 2560x1440.
+# It does not hold the LMS Sharp or the lightx2v turbo parts: those ride beside it as their own LoRAs. Sampling (NVlabs'):
+# three Euler steps on sigmas 0.909375, 0.857143, 0.666667, 0, CFG 1, the start (1 - 0.909375) x the upscaled latent + 0.909375 x noise.
+id: h3-open-regenerate-2k-refiner-r16
+kind: lora
+arch: minimax-h3
+base: minimax-h3
+license: minimax-h3-community
+commercial: true
+license_note: 'Derived from NVlabs'' Open-H3-Regenerate-2K (a MiniMax H3 Model Derivative): the MiniMax H3 Community License applies (not licensed in the European Union, the United Kingdom, South Korea or the United States; written authorization from MiniMax above US$20 million yearly revenue; its Acceptable Use Policy; its outputs may not train another model). A rank-reduced extraction by Kijai; it loses some of the full rank-384 refiner.'
+title: 'H3 Open-Regenerate-2K refiner (rank 16)'
+about: the refiner LoRA of NVlabs' Open-H3-Regenerate-2K, rank 16 (155 MB; the rank-384 form is 5.9 GB)
+files:
+  model:
+    key: h3-open-regenerate-2k-refiner-r16
+    url: https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/f5c3b1d5a63e008a691fca1b6096fd57a5307536/loras/minimax_h3_open_regenerate_2k_refiner_rank_16_bf16.safetensors
+    size: 155133472
+    sha256: add559cd92e2b17b42ac080516b476df120903e485fc98add4538e0217820fbd
+    path: minimax-h3/loras/minimax_h3_open_regenerate_2k_refiner_rank_16_bf16.safetensors

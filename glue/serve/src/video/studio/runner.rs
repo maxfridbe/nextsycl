@@ -162,7 +162,7 @@ impl Studio {
                 spec[k] = json!(v);
             }
         }
-        for k in ["regen", "regen_box", "sampler", "schedule"] {
+        for k in ["regen", "regen_box", "sampler", "schedule", "knots"] {
             if item[k].is_string() {
                 spec[k] = item[k].clone();
             }

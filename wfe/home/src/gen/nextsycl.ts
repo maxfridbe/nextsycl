@@ -1884,6 +1884,8 @@ export interface VideoGenerateReq {
   sampler?: string | null;
   /** ComfyUI's name */
   schedule?: string | null;
+  /** a distilled model's own noise levels, as timesteps of 1000 falling to 0 (Pika H3 Flex: "1000,750,500,250,100,40,0" with sampler lcm); the run takes one step between two */
+  knots?: string | null;
   /**
    * length; snapped up to the model's frame grid (17k + 5 frames at 24 fps: 4 s -> 107 frames); the model is trained on 5.2-15.1 s. The answer's frames and seconds say what is made
    * @minimum 1

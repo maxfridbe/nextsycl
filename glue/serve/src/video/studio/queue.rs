@@ -201,7 +201,7 @@ fn ignored_keys() -> Vec<String> {
 
 pub fn inputs_of(quant: &str) -> Value {
     let common = ["prompt", "seconds", "frames", "steps", "seed", "width", "height", "te", "first_frame", "last_frame", "exposure_ref", "guide_clip",
-                  "first_audio", "first_audio_s", "soundtrack", "soundtrack_start", "exposure_fix", "exposure_offset", "exposure_ease", "exposure_target", "ref_audios", "loras", "upscale", "upscaler", "shift_video", "shift_audio", "sampler", "schedule", "chain", "source", "regen", "regen_box"];
+                  "first_audio", "first_audio_s", "soundtrack", "soundtrack_start", "exposure_fix", "exposure_offset", "exposure_ease", "exposure_target", "ref_audios", "loras", "upscale", "upscaler", "shift_video", "shift_audio", "sampler", "schedule", "knots", "chain", "source", "regen", "regen_box"];
     if quant == "REF2VA" {
         json!({"takes": common.iter().chain(["ref_images", "ref_videos", "ref_image_size", "ref_video_sound", "te_pictures"].iter()).collect::<Vec<_>>(),
                "not": ["control_video", "control_mask", "control_source", "control_strength", "control_start", "control_end"],
@@ -339,6 +339,18 @@ impl Studio {
         it.insert("prompt".into(), json!(prompt));
         it.insert("sampler".into(), sampler);
         it.insert("schedule".into(), schedule);
+        // a distilled model's own noise levels: timesteps of 1000, falling, from at most 1000 to 0 (Pika H3 Flex: 1000,750,500,250,100,40,0)
+        let knots = match p.get("knots").and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()) {
+            None => Value::Null,
+            Some(v) => {
+                let k: Vec<f64> = v.split(',').map(|x| x.trim().parse::<f64>().map_err(|_| RpcError::param("knots: numbers, comma separated"))).collect::<Result<_, _>>()?;
+                if !(2..=33).contains(&k.len()) || k.iter().any(|x| !(0.0..=1000.0).contains(x)) || k.windows(2).any(|w| w[1] >= w[0]) || k[k.len() - 1] != 0.0 {
+                    return Err(RpcError::param("knots: 2 to 33 falling timesteps of 1000, the last 0 (1000,750,500,250,100,40,0)"));
+                }
+                json!(v)
+            }
+        };
+        it.insert("knots".into(), knots);
         // frames, when given, set the length exactly (seconds = frames / 24); else seconds snapped up to the grid
         match p.get("frames").filter(|v| !v.is_null()) {
             Some(f) => {

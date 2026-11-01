@@ -831,6 +831,10 @@ pub struct ClipSpec<'a> {
     /// the sampler and the schedule (Euler on H3's own shifted schedule by default; the others are ComfyUI's)
     pub sampler: nextsycl_diffusion::Sampler,
     pub schedule: nextsycl_diffusion::Schedule,
+    /// the noise levels of a distilled model's own schedule, as timesteps out of 1000 from 1000 down to 0 (Pika H3 Flex:
+    /// 1000, 750, 500, 250, 100, 40, 0): each goes through the video shift, and the run takes one step between two
+    /// (empty: `steps` on `schedule`)
+    pub knots: Vec<f32>,
     pub te: TeFiles<'a>,
     pub vaes: Vaes<'a>,
     /// LoRAs and their strengths (they stack)
@@ -1364,17 +1368,21 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     let n_v = 24 * shape.t * shape.h * shape.w;
     let (noise_v, noise_a) = crate::noise::clip_noise(c.seed, n_v, 32 * 2 * shape.audio_t);
     // H3's own schedule (the video shift), or one of ComfyUI's at that shift
-    let sigmas = if c.schedule == nextsycl_diffusion::Schedule::Shift {
+    let sigmas = if c.knots.len() >= 2 {
+        c.knots.iter().map(|k| denoiser::shifted(k / 1000.0, schedule.shift_video)).collect()
+    } else if c.schedule == nextsycl_diffusion::Schedule::Shift {
         denoiser::sigmas(c.steps, schedule.shift_video)
     } else {
         nextsycl_diffusion::samplers::sigmas_for(c.sampler, c.schedule, c.steps as u32, schedule.shift_video)
     };
-    if c.sampler != nextsycl_diffusion::Sampler::Euler || c.schedule != nextsycl_diffusion::Schedule::Shift {
+    if c.knots.len() >= 2 {
+        ctl.say(format!("sampler: {} on the knots {:?} ({} steps, shift {})", c.sampler.name(), c.knots, sigmas.len() - 1, schedule.shift_video));
+    } else if c.sampler != nextsycl_diffusion::Sampler::Euler || c.schedule != nextsycl_diffusion::Schedule::Shift {
         ctl.say(format!("sampler: {} on the {} schedule ({} levels)", c.sampler.name(), c.schedule.name(), sigmas.len()));
     }
     ctl.say(format!("tokens : {} in the denoiser", d.tokens()));
     let nblocks = e.model.blocks.len();
-    let steps = c.steps;
+    let steps = sigmas.len() - 1;
     let t0 = Instant::now();
     let (v, a) = {
         let dev = e.dev.clone();
@@ -1538,6 +1546,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     Some(x) => nextsycl_diffusion::Schedule::parse(x).ok_or_else(|| Error(format!("schedule {x}?")))?,
                     None => nextsycl_diffusion::Schedule::Shift,
                 },
+                knots: s("knots").map(|k| k.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(),
                 te: TeFiles {
                     te: Path::new(s("te").unwrap_or("/models/teacher/qwen3vl_32b_minimax_h3-Q4_K_M.gguf")),
                     tokenizer: Path::new(s("tokenizer").unwrap_or("/app/tokenizer")),

@@ -250,7 +250,7 @@ pub struct Scratch {
 }
 
 /// The widest LoRA the scratch has room for.
-pub const MAX_LORA_RANK: usize = 128;
+pub const MAX_LORA_RANK: usize = 384;
 
 impl Scratch {
     pub fn new(dev: &Arc<Device>, cfg: &Config, tokens: usize, dtype: DType) -> Result<Scratch> {

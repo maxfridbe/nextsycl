@@ -60,7 +60,7 @@ export interface GenerateRequest {
   ref_video_sound?: boolean; te_pictures?: boolean;
   control_video?: string; control_mask?: string; control_source?: string;
   control_strength?: number; control_start?: number; control_end?: number;
-  sampler?: string; schedule?: string;
+  sampler?: string; schedule?: string; knots?: string;
 }
 
 export interface Chain {
