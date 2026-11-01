@@ -1,0 +1,45 @@
+# YuE2-3B Q8_0 (songs with vocals from a style and lyrics: a score first, then the music; 48 kHz stereo; non-commercial)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets.
+# The files are scragnog's GGUF conversions of M-A-P's YuE2-3B (rev 1a96eca = 8f24312's weights, model.safetensors
+# sha256 1d55c42c...) and YuE2-Vae (807ce9d5...), pinned at eb7de0903bf4dfbd14a2384ae0c0d14150cfa2c7. CC BY-NC 4.0:
+# attribution, non-commercial use only (a commercial licence: the YuE2 team, gezhang@umich.edu).
+# sheetsage2-f16.gguf (same repo and revision) is M-A-P's SheetSage2 (m-a-p/SheetSage2 on MERT-v2-FullSong, also CC BY-NC
+# 4.0: attribution, non-commercial), HOT-Step's conversion of the adapters-merged weights: a recording to its lead sheet
+# (ABC) - the score of a cover, sung by YuE2 in the request's style with the request's words.
+id: yue2-3b-q8
+kind: audio
+arch: yue2
+title: 'YuE2-3B Q8_0 (songs with vocals in English and Mandarin from a style and lyrics; a melody and chords score first; 48 kHz stereo; non-commercial, CC BY-NC 4.0)'
+about: 'M-A-P''s YuE2-3B, non-commercial (CC BY-NC 4.0): one AR-NAR Mixture-of-Transformers backbone (28 layers of 2048, an AR and a NAR path a layer) writes an ABC score (cot full: melody and chords; melody; or off) and the semantic codes (25 a second, up to six minutes), then the acoustic latents by flow matching (32 midpoint steps), and YuE2-Vae (Oobleck, SnakeBeta) decodes 48 kHz stereo. The language model in Q8_0 (3.9 GB, every matrix kept in its blocks), the VAE float32. audio.generate: instructions the style, input the lyrics (section tags on lines of their own), seconds the most (the model ends the song), cfg the codes'' guidance (1; 1.01 for cot off), options cot and abc (a score to sing over: a cover''s melody, or an earlier song''s score with new words); the answer carries the score it sang over. A cover: audio a recording (its score by SheetSage2 - the melody for cot melody, the default then; melody and chords for cot full - sung in the new style with the words given: the song''s own or new ones; option score-only for the transcription alone)'
+license: cc-by-nc-4.0
+commercial: false
+gpus: '0,1'
+split: true                      # nextsycl: the language model, the song's caches and the flow on the first card, the VAE on the second
+vram_gib: 7.6                    # the first card's: 3.5 GiB of weights, a six-minute song's caches (~2 GiB) and its flow rows
+headroom_gib: 4.1                #   (7.1 GiB measured for a 224 s song); the second holds the VAE and a tile's (1.2 GiB) and
+                                 #   SheetSage2 (1.3 GiB, a window's encoder activations ~1.9: it runs before the song, the VAE after)
+defaults:
+  seconds: 360.0
+  steps: 32
+  cfg: 1.0
+env: {}
+files:
+  lm:
+    key: yue2-lm-q8
+    url: https://huggingface.co/scragnog/YuE2-GGUF/resolve/eb7de0903bf4dfbd14a2384ae0c0d14150cfa2c7/yue2-lm-q8_0.gguf
+    size: 3916164544
+    sha256: 30c109196a3cfd94edda644946dcdf46aacbc4fce10a18551e2165aa86c7108a
+    path: yue2/yue2-lm-q8_0.gguf
+  vae:
+    key: yue2-vae-standard
+    url: https://huggingface.co/scragnog/YuE2-GGUF/resolve/eb7de0903bf4dfbd14a2384ae0c0d14150cfa2c7/yue2-vae-standard-f32.gguf
+    size: 530348768
+    sha256: c4ffc363b246f404c1d150075da4c41c4a031524036042ce45aeb500d4d5fe71
+    path: yue2/yue2-vae-standard-f32.gguf
+  sheetsage:
+    key: sheetsage2-f16
+    url: https://huggingface.co/scragnog/YuE2-GGUF/resolve/eb7de0903bf4dfbd14a2384ae0c0d14150cfa2c7/sheetsage2-f16.gguf
+    size: 1360020736
+    sha256: 6a205c7ca90f60b388d925c0e4aea8f4ed8bb4404520bb49dbd095d1b7320bd1
+    path: yue2/sheetsage2-f16.gguf
+guide: guides/yue2.md

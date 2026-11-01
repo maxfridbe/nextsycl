@@ -100,7 +100,7 @@ impl Home {
         }
     }
 
-    /// A song's task: one made from a recording needs the recording and a model that takes one (acestep)
+    /// A song's task: one made from a recording needs the recording and a model that takes one (acestep; yue2 a cover)
     fn precheck_song(&self, b: &Value, all: &[Value]) -> Result<(), Fail> {
         let task = b["task"].as_str().or(b["options"]["task"].as_str()).unwrap_or("text2music");
         if !["text2music", "cover", "repaint", "edit", "lego"].contains(&task) {
@@ -120,8 +120,24 @@ impl Home {
         number(b, "repaint_end", -1.0, 600.0)?;
         if has_audio || task != "text2music" {
             let id = self.pick("audio", b, all)?;
-            if all.iter().any(|m| m["id"] == id.as_str() && s(m, "arch") != "acestep") {
-                return Err(bad(format!("{id} makes no song from a recording: name a model that does (acestep-1.5)")));
+            if let Some(m) = all.iter().find(|m| m["id"] == id.as_str()) {
+                match s(m, "arch").as_str() {
+                    "acestep" => {}
+                    // yue2: a cover - the recording's score (SheetSage2, its sheetsage file) sung in the new style
+                    "yue2" if task == "text2music" || task == "cover" => {
+                        if m["files"].is_object() && m["files"]["sheetsage"].is_null() {
+                            return Err(bad(format!("{id} makes a cover with its sheetsage file (SheetSage2), which it has not: nextsycl models pull {id}")));
+                        }
+                        if b["abc"].as_str().is_some_and(|a| !a.trim().is_empty()) {
+                            return Err(bad(format!("{id}: a recording (audio) or a score (abc) - the recording's score is its transcription")));
+                        }
+                        if b["cot"].as_str().or(b["options"]["cot"].as_str()) == Some("off") {
+                            return Err(bad(format!("{id}: a cover sings over the recording's score - cot melody (the default) or full")));
+                        }
+                    }
+                    "yue2" => return Err(bad(format!("{id} makes covers (a recording's melody sung anew); task {task} is acestep-1.5's"))),
+                    _ => return Err(bad(format!("{id} makes no song from a recording: name a model that does (acestep-1.5; yue2-3b-q8 for a cover)"))),
+                }
             }
         }
         Ok(())

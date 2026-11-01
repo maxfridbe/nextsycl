@@ -47,6 +47,7 @@ nextsycl-audio-s2pro.workspace = true
 nextsycl-audio-voxtraltts.workspace = true
 nextsycl-audio-whisper.workspace = true
 nextsycl-audio-acestep.workspace = true
+nextsycl-audio-yue2.workspace = true
 nextsycl-model3d.workspace = true
 nextsycl-model3d-example.workspace = true
 nextsycl-model3d-hunyuan3d.workspace = true

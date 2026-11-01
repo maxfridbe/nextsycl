@@ -208,10 +208,15 @@ impl Tokenizer {
     }
 
     pub fn from_gguf(g: &Gguf) -> Result<Tokenizer, String> {
+        Self::from_gguf_as(g, g.meta("tokenizer.ggml.pre").and_then(Value::as_str).unwrap_or(""))
+    }
+
+    /// `from_gguf` with the pre-tokenizer named by the caller: a file whose converter left `tokenizer.ggml.pre` out
+    /// (YuE2's GGUF carries Qwen's tiktoken pattern in its own key; its split is `qwen2`'s)
+    pub fn from_gguf_as(g: &Gguf, pre: &str) -> Result<Tokenizer, String> {
         if g.meta("tokenizer.ggml.model").and_then(Value::as_str) != Some("gpt2") {
             return Err("only byte-level BPE (tokenizer.ggml.model gpt2) is read".into());
         }
-        let pre = g.meta("tokenizer.ggml.pre").and_then(Value::as_str).unwrap_or("");
         let (split, pre_splits): (&str, &[&str]) = match pre {
             "glm4" | "glm5" | "chatglm-bpe" => (GLM4_SPLIT, &[]),
             "qwen35" => (QWEN35_SPLIT, &[]),
@@ -314,6 +319,14 @@ impl Tokenizer {
 
     pub fn id(&self, token: &str) -> Option<u32> {
         self.ids.get(token).copied()
+    }
+
+    /// Text to ids with no special token read out of it (tiktoken's encode_ordinary: a "<|endoftext|>" in the text is
+    /// its characters' tokens)
+    pub fn encode_ordinary(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.encode_plain(text, &mut out);
+        out
     }
 
     /// More special tokens, matched in the text as they are (a model's own markers its tokenizer files do not list -

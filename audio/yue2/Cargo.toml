@@ -1,0 +1,15 @@
+[package]
+name = "nextsycl-audio-yue2"
+description = "YuE2 (M-A-P YuE2-3B) on SYCL: a song with vocals from a style and lyrics - an AR-NAR Mixture-of-Transformers writing a score and semantic codes, then acoustic latents by flow matching, YuE2-Vae's 48 kHz stereo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
+nextsycl-audio.workspace = true
+serde_json.workspace = true
+unicode-normalization = "0.1"

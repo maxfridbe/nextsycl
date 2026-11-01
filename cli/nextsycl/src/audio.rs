@@ -14,6 +14,10 @@ nextsycl audio gen \"<text to say>\" --model qwen3-tts-... [--voice NAME] [--lan
                    [--ref-audio FILE.wav [--ref-text TEXT]] [--cfg X] [--seconds N] [--seed N] [--out FILE|DIR]   (speech)
 nextsycl audio gen \"Speaker 1: ...\\nSpeaker 2: ...\" --model vibevoice-1.5b [--ref-audio S1.wav --ref-audio S2.wav ... |
                    --voices NAME,NAME ...]   (a multi-speaker script: a recording or saved voice a speaker, in order)
+nextsycl audio gen \"<style>\" --model yue2-3b-q8 --lyrics-file FILE [--opt-cot full|melody|off] [--abc-file SCORE.abc]   (a song over a
+                   score: a cover's melody, or an earlier song's .abc with new words; its own score saved beside it)
+nextsycl audio gen \"<new style>\" --model yue2-3b-q8 --source RECORDING --lyrics-file ITS-WORDS [--opt-cot melody|full]   (a cover: the
+                   recording's score by SheetSage2 sung in the new style with the words given; --opt-score-only true: only the score, RECORDING's .abc)
 nextsycl audio gen \"<description>\" --model acestep-1.5 --source FILE --opt-task cover | repaint | edit | lego [--opt-repaint-start S]
                    [--opt-repaint-end S] [--opt-cover-strength X] [--opt-source-lyrics TEXT] ...   (a song made from a recording)
 nextsycl audio serve [MODEL] [--port 8087] [--host 127.0.0.1] [--gpu N | --gpus A,B] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
@@ -36,7 +40,7 @@ nextsycl audio engines | selftest [--gpu N]";
 pub fn engines() -> Vec<nextsycl_audio::AudioKind> {
     vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_voxcpm2::kind(), nextsycl_audio_breezetts2::kind(),
          nextsycl_audio_vibevoice::kind(), nextsycl_audio_s2pro::kind(),
-         nextsycl_audio_voxtraltts::kind(), nextsycl_audio_whisper::kind(), nextsycl_audio_acestep::kind(), nextsycl_audio_example::kind()]
+         nextsycl_audio_voxtraltts::kind(), nextsycl_audio_whisper::kind(), nextsycl_audio_acestep::kind(), nextsycl_audio_yue2::kind(), nextsycl_audio_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -51,6 +55,8 @@ fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
         let whisper = std::fs::read_to_string(dir.join("config.json")).is_ok_and(|c| c.contains("\"model_type\": \"whisper\""));
         let (arch, files) = if whisper {
             (nextsycl_audio_whisper::ARCH, nextsycl_audio_whisper::files_in(dir).map_err(|e| e.0)?)
+        } else if std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().starts_with("yue2-lm-")) {
+            (nextsycl_audio_yue2::ARCH, nextsycl_audio_yue2::files_in(dir).map_err(|e| e.0)?)
         } else if dir.join("acestep-v15-turbo").is_dir() {
             (nextsycl_audio_acestep::ARCH, nextsycl_audio_acestep::files_in(dir).map_err(|e| e.0)?)
         } else if let Ok(f) = nextsycl_audio_breezetts2::files_in(dir) {
@@ -199,8 +205,12 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         },
     };
     // the request's own --opt-NAMEs (those taken at load went into the load options)
-    let given: nextsycl_core::options::Given = nextsycl_core::options::given(args).into_iter()
+    let mut given: nextsycl_core::options::Given = nextsycl_core::options::given(args).into_iter()
         .filter(|(n, _)| k.options.iter().any(|o| (o.name == n.as_str() || o.env == n.as_str()) && o.at != nextsycl_core::At::Load)).collect();
+    // a score from a file (YuE2's abc: a cover's melody, or an earlier song's score with new words)
+    if let Some(f) = opt(args, "--abc-file") {
+        given.insert("abc".into(), std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?);
+    }
     nextsycl_core::options::resolve(&given, k.options, nextsycl_core::At::Request, k.name)?;
     let req = AudioRequest {
         prompt: prompt.clone(),
@@ -221,7 +231,7 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         },
     };
     if req.source.is_some() && !e.sources() {
-        return Err(format!("--source: {} makes no song from a recording (acestep does: --opt-task cover | repaint | edit)", e.arch()));
+        return Err(format!("--source: {} makes no song from a recording (acestep does: --opt-task cover | repaint | edit; yue2 with its sheetsage file: a cover)", e.arch()));
     }
     let t0 = std::time::Instant::now();
     // frames a second of sound: speech 12.5 (S2 Pro 21.5), songs 25
@@ -260,6 +270,19 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         Ok(())
     }).map_err(|e| e.0)?;
     eprintln!();
+    // no sound, a score (yue2's score-only: a recording's transcription): the score alone, named for the recording
+    if audio.samples.is_empty() {
+        let sc = e.score().ok_or("the engine made neither sound nor a score")?;
+        let stem = opt(args, "--source").and_then(|f| Path::new(f).file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "score".into());
+        let path = match opt(args, "--out").map(PathBuf::from) {
+            Some(o) if o.is_dir() => o.join(format!("{stem}.abc")),
+            Some(o) => o.with_extension("abc"),
+            None => PathBuf::from(format!("{stem}.abc")),
+        };
+        std::fs::write(&path, &sc).map_err(|e| format!("{}: {e}", path.display()))?;
+        println!("score {}  ({} lines in {:.1} s)", path.display(), sc.lines().count(), t0.elapsed().as_secs_f64());
+        return Ok(());
+    }
     let parts: Vec<String> = spans.iter().map(|(p, t, n)| {
         let t = *t;
         match *p {
@@ -285,6 +308,12 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
     let lyr = lyrics.unwrap_or_default();
     audio.write_wav(&path, &[("INAM", &prompt), ("ICMT", &comment), ("ILYR", &lyr)])?;
     println!("saved {}  ({:.1} s of sound in {:.1} s)", path.display(), audio.seconds(), t0.elapsed().as_secs_f64());
+    // the score it sang over, beside it (--abc-file it with the same seed and style and new lyrics: the same melody)
+    if let Some(sc) = e.score() {
+        let p = path.with_extension("abc");
+        std::fs::write(&p, sc).map_err(|e| format!("{}: {e}", p.display()))?;
+        println!("score {}", p.display());
+    }
     Ok(())
 }
 
@@ -378,6 +407,18 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("ar,dit,voc").split(',').collect();
         let e = nextsycl_audio_minimaxmusic3::MiniMaxMusic3::load_on(&files, &gpus(args)?, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_minimaxmusic3::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_yue2::ARCH && opt(args, "--stages").is_some_and(|st| st.split(',').all(|x| nextsycl_audio_yue2::sheet::check::STAGES.contains(&x))) {
+        // SheetSage2's stages alone: its file, on the first card given
+        let g = gpus(args)?.into_iter().next().ok_or("no GPU")?;
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or_default().split(',').collect();
+        let p = files.get("sheetsage").ok_or("the model has no sheetsage file (SheetSage2: a cover's score)")?;
+        let e = nextsycl_audio_yue2::sheet::SheetSage::load(p, &g).map_err(|e| e.0)?;
+        nextsycl_audio_yue2::sheet::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_yue2::ARCH {
+        let gs = gpus(args)?;
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("tokens,ar,neg,noise,vel,steps,solve,vae").split(',').collect();
+        let e = nextsycl_audio_yue2::Yue2::load(&files, &gs, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_yue2::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else if m["arch"] == nextsycl_audio_acestep::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("text,te,enc,velocity,sample,vae").split(',').collect();
         let e = nextsycl_audio_acestep::AceStep::load(&files, &gpus(args)?, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
@@ -387,9 +428,9 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let e = nextsycl_audio_whisper::Whisper::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_whisper::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {}, {}, {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
+        return Err(format!("check knows {}, {}, {}, {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
                            nextsycl_audio_voxcpm2::ARCH, nextsycl_audio_breezetts2::ARCH, nextsycl_audio_vibevoice::ARCH, nextsycl_audio_s2pro::ARCH,
-                           nextsycl_audio_voxtraltts::ARCH, nextsycl_audio_whisper::ARCH, nextsycl_audio_acestep::ARCH));
+                           nextsycl_audio_voxtraltts::ARCH, nextsycl_audio_whisper::ARCH, nextsycl_audio_acestep::ARCH, nextsycl_audio_yue2::ARCH));
     };
     println!("worst relative error {worst:.2e}");
     Ok(())

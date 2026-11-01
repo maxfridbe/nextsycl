@@ -270,11 +270,12 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 
 ## Audio
 
-ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`), Whisper (`NS_WH_`). A per-request option's variable is only its name: it rides in the request (`"options"`), the engine does not read the environment for it.
+ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`), Whisper (`NS_WH_`). A per-request option's variable is only its name: it rides in the request (`"options"`), the engine does not read the environment for it.
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
 | `NS_AUDIO_OUT` | ~/.local/share/nextsycl/audio | where songs, speech and saved voices are kept | cli (audio), serve |
+| `NS_YUE2_COT` | full | what YuE2 writes before the music: full (a melody and chords score), melody, off (--opt-cot; a request's `cot` wins) | audio yue2 |
 | `NS_ACE_CHECKPOINT` | acestep-v15-turbo | the ACE-Step DiT checkpoint a model directory loads (acestep-v15-base: the base model, for lego) | audio acestep |
 | `NS_ACE_DCW` | the turbo's: 1, the base's: 0 | the wavelet-domain correction of each step (DCW; as the reference: on for turbo) (--opt-dcw) | audio acestep |
 | `NS_ACE_DECODE_CHUNK` | by the card | the VAE decode's window in latent frames, 128-512 (the reference's for the card's free memory: 256 from 12 GB, 128 below) (--opt-decode-chunk) | audio acestep |
