@@ -157,8 +157,10 @@ pub fn run(e: &Yue2, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)) -
     let mut worst = 1f64;
     let mut s = Scratch::default();
     let abc = ids("abc").unwrap_or_default();
-    let sem_prefix = ids("sem_prefix")?;
-    let codes = ids("codes")?;
+    // a prompt-only dump (ref.py --stages tokens) has the first prompt alone
+    let prompt_only = !dir.join("sem_prefix.npy").exists();
+    let sem_prefix = if prompt_only { Vec::new() } else { ids("sem_prefix")? };
+    let codes = if prompt_only { Vec::new() } else { ids("codes")? };
     if stages.contains(&"tokens") {
         let ours = prompt::prefix(&e.tok, cot, style, lyrics);
         let want = ids("prefix")?;
@@ -168,6 +170,9 @@ pub fn run(e: &Yue2, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)) -
             let at = ours.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(ours.len().min(want.len()));
             log(format!("  first difference at {at}: ours {:?} theirs {:?}", &ours[at..(at + 8).min(ours.len())], &want[at..(at + 8).min(want.len())]));
             worst = 0.0;
+        }
+        if prompt_only {
+            return Ok(worst);
         }
         let sp = prompt::semantic(&want, cot, &abc);
         log(format!("tokens: semantic prompt {} ({} tokens)", if sp == sem_prefix { "identical" } else { "DIFFER" }, sem_prefix.len()));
@@ -277,7 +282,10 @@ pub fn run(e: &Yue2, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)) -
         let got: Vec<f32> = (0..n).flat_map(|i| [wav[i], wav[n + i]]).collect();
         worst = worst.min(note(&format!("vae ({:.2} s of audio, {:.1} s)", n as f64 / 48000.0, t0.elapsed().as_secs_f64()), &got, &want, log));
         let a = nextsycl_audio::Audio { rate: crate::RATE, channels: 2, samples: got };
-        a.write_wav(&dir.join("ours.wav"), &[]).map_err(Error)?;
+        // beside the dump, when the dump may be written to
+        if let Err(w) = a.write_wav(&dir.join("ours.wav"), &[]) {
+            log(format!("ours.wav not written: {w}"));
+        }
     }
     Ok(worst)
 }

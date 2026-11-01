@@ -4,22 +4,51 @@ YuE2 turns a style prompt and lyrics into a whole song with vocals, 48 kHz stere
 engine is a port of nextcuda's (`audio/yue2`, its `docs/ports/yue2.md` at f6f57a5 records the model and the protocol: what
 is said there about the prompts, the phases and the VAE holds here) from CUDA to SYCL on the Arc Pro B70 and B65.
 
-## Status: not yet checked against a reference
+## Status: checked against upstream on the B65
 
-**Rule 5 is open.** `reference/yue2/ref.py` needs upstream's wheel, which is not run on this box; its dumps have not arrived. The
-stage checks (`nextsycl audio check DIR --stages tokens,ar,neg,noise,vel,steps,solve,vae`, and SheetSage2's) are ported
-and have never been run here. Everything below is the engine against itself and real songs judged by ear-free measures.
-The silo was therefore written before parity: it is checked against the engine's own kernels, not against a reference.
+Dumps of upstream's yue2_infer 0.1.5 and SheetSage2 (`reference/yue2/*.py`, made on the nextcuda box: CPU, float32, the same Q8_0 file; short song,
+8 ODE steps), read by `nextsycl audio check`. Everything in this table ran on the **B65** (`--gpus 1`), the B70 being in use; the B70 has not run these stages.
+
+| Stage | cot full | cot off | Result |
+|---|---|---|---|
+| prompt ids | 66 identical | 58 identical | pass (melody: 67 identical) |
+| semantic prompt | 228 identical | 58 identical | pass |
+| the twin's prompt | - | 12 identical | pass |
+| AR teacher-forced logits, worst row | rel 5.09e-4, cos 1.000000 | rel 1.90e-4, cos 1.000000 | pass |
+| AR argmax | 16 of 16 rows | 9 of 9 rows | pass |
+| the twin's logits | - | rel 1.06e-4 | pass |
+| torch.randn noise | rel 3.12e-8 | rel 3.12e-8 | pass |
+| first velocity | rel 6.61e-4 | rel 6.52e-4 | pass |
+| midpoint steps from the reference's state, worst | rel 1.06e-4 | rel 2.16e-4 | pass |
+| 8 steps from the noise | rel 3.94e-4, cos 1.000000 | rel 1.89e-3, cos 0.999998 | pass |
+| VAE | rel 1.46e-6 | rel 1.74e-6 | pass |
+
+`NS_SILO=0` (cot full, the shared kernels) gives the same figures to the digits shown: the silo costs nothing here.
+
+SheetSage2, on the USAF Band's Jingle Bells (132.8 s, public domain), `/ref/sheet`:
+
+| Stage | Result |
+|---|---|
+| wave (MP3 to 24 kHz mono) | rel 5.80e-7, same length: pass |
+| mel | rel 5.55e-8: pass |
+| encoder memory, float32 angles | rel 6.19e-3, cos 0.999981: pass |
+| decoder, teacher-forced logits | rel 4.00e-4; masked argmax 1961 of 1962: pass |
+| generate from the reference's memory | first differs at token 1578, a one-step tie; common subsequence 98.9 %: close, not identical |
+| notation from the reference's tokens | byte for byte, both scores: pass |
+| transcribe, end to end, float32 angles | 259 of 259 notes, both ABC scores byte for byte: pass |
+
+**What this dump cannot prove.** It was made without bf16 autocast (its `memory` equals its `memory_fp32`). The engine's default rotary table is upstream's
+under bf16 autocast, as nextcuda found it; against this dump that default gives cos 0.934704 and 92 of 259 notes, the very figure nextcuda records for the
+two tables' distance, and `NS_YUE2_SS2_ANGLES=fp32` gives the rows above. So the encoder is proved with float32 angles; the bf16 table itself is
+carried from nextcuda and has no reference here. Also not checked here: upstream as it runs in bf16 on a card (`ref.py --dtype bf16`).
+
+Beyond the reference:
 
 | Claim | State | How |
 |---|---|---|
-| prompts, tokenizer | unproved here | no reference; Whisper hears the sung words |
-| AR logits, NAR velocities, VAE vs upstream | unproved here | needs the dumps |
-| SheetSage2 vs upstream | unproved here | ran end to end on a song of ours (a score, a cover) |
-| kernels run, no GPU reset | proved | every run below; reset count stayed 10 |
+| kernels run, no GPU reset | proved | every run; reset count stayed 10 |
 | same request, same card: same WAV | proved | 8 s song twice, abc, codes, latents and samples identical (once the flow heads were fixed) |
 | silo = engine's kernels | proved | 81 s song, `NS_SILO=0` vs the silo on the final build: 0 samples differ |
-| fast arithmetic vs float32 | measured | below |
 | real songs in English and Mandarin | measured | below; not listened to |
 
 ## What changed from nextcuda
@@ -107,7 +136,9 @@ The split gains nothing in time on these cards; it only moves memory. A guided s
 | B70 + B65 | 6.62 GiB | 2.83 GiB |
 | one card, B70 / B65 | 8.13 / 8.14 GiB | |
 
-No song here reached the 360 s cap, so its peak is not measured. `concurrency` and `coexistence` are not on the card: not measured.
+| one card at the 360 s cap, B65 (9000 codes forced, `NS_YUE2_MIN_CODES`; 181.6 s) | 8.27 GiB | |
+
+A free-running song never reached the cap (long lyrics ended at 98 and 234 s). `concurrency` and `coexistence` are not on the card: not measured.
 
 ## Known
 

@@ -279,9 +279,17 @@ impl Mert {
         // token) is made with that table; with exact float32 angles the memory is another (cosine 0.934 to upstream's,
         // measured on the test recording). So the table here is upstream's, bf16 step by bf16 step.
         let inv: Vec<f32> = (0..HEAD / 2).map(|i| 1.0 / 10000f32.powf((2 * i) as f32 / HEAD as f32)).collect();
+        // NS_YUE2_SS2_ANGLES=fp32: float32 angles, for a check against a reference run without bf16 autocast
+        let exact_angles = std::env::var("NS_YUE2_SS2_ANGLES").is_ok_and(|v| v.trim() == "fp32");
         let mut cs = Vec::with_capacity(FRAMES * HEAD);
         for t in 0..FRAMES {
             for f in &inv {
+                if exact_angles {
+                    let a = t as f32 * f;
+                    cs.push(a.cos());
+                    cs.push(a.sin());
+                    continue;
+                }
                 let a = bf16(bf16(t as f32) * bf16(*f));
                 cs.push(bf16((a as f64).cos() as f32));
                 cs.push(bf16((a as f64).sin() as f32));

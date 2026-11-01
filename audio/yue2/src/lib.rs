@@ -265,7 +265,9 @@ impl Yue2 {
     #[allow(clippy::too_many_arguments)]
     fn draw_codes(&self, s: &mut Scratch, pos: &mut Cache, mut neg: Option<&mut Cache>, first: (Vec<f32>, Option<Vec<f32>>), song: &Song, t0: Instant,
                   progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Vec<u32>> {
-        let samp = Sampling { max_tokens: song.max_codes, min_tokens: sample::SEMANTIC.min_tokens.min(song.max_codes), ..sample::SEMANTIC };
+        // NS_YUE2_MIN_CODES (debug): the song may not end before this many codes - a worst case for measuring memory, no song to keep
+        let floor = std::env::var("NS_YUE2_MIN_CODES").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(sample::SEMANTIC.min_tokens);
+        let samp = Sampling { max_tokens: song.max_codes, min_tokens: floor.min(song.max_codes), ..sample::SEMANTIC };
         let mut rng = Rng::new(song.seed);
         let keep = if song.cot == Cot::Off { 3 } else { 1 };
         let n = CODEC_SIZE as usize + 1;

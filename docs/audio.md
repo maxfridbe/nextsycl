@@ -82,9 +82,8 @@ latents by flow matching; YuE2-Vae decodes 48 kHz stereo. A song's score comes b
 beside the CLI's WAV); give it as `abc` with the same seed and style and new lyrics and the melody stays. A recording
 (`audio`) is transcribed by SheetSage2 and sung anew: a cover. The guide: `model-cards/guides/yue2.md`.
 
-**Not yet checked against a reference.** Songs are sung as written (Whisper's reading) in English and Mandarin; the
-engine is compared with its own float32 arithmetic (`nextsycl audio check DIR --stages self`), rel 1.8e-4 on logits and 9.5e-4 on the flow's velocity.
-Speed on 142 s of Mandarin: B70 39 s (tg 207 codes/s), B65 54 s (tg 152 codes/s). One card holds it: 8.1 GiB at 234 s.
+**Checked against upstream on the B65** ([ports/yue2.md](ports/yue2.md)): prompts identical; AR logits rel at most 5.1e-4, argmax all rows; first velocity 6.6e-4; 8 flow steps 3.9e-4 (cot off 1.9e-3); VAE 1.5e-6; SheetSage2 end to end identical with float32 angles (its bf16 rotary table has no reference here). Songs are sung as written (Whisper's reading) in English and Mandarin.
+Speed on 142 s of Mandarin: B70 39 s (tg 207 codes/s), B65 54 s (tg 152 codes/s). One card holds it: 8.3 GiB at the 360 s cap.
 
 ## Speech
 

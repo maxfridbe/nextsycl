@@ -493,7 +493,7 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   score and semantic codes, then flow-matched latents, YuE2-Vae's 48 kHz stereo, SheetSage2 for a recording's score. Its
   kernels (`kernels/audio/yue2`): the Q8_0 decode product, the attention's inputs from a host rotary table, the decode's
   attention, the flow's fixed-order heads; the flow's attention is the shared flash kernel, the VAE MiniMax Music's
-  convolutions and ACE-Step's snake. Its silo repacks the Q8_0 matrices (decode 3x, the same samples). Not yet checked against a reference.
+  convolutions and ACE-Step's snake. Its silo repacks the Q8_0 matrices (decode 3x, the same samples). Checked against upstream's dumps on the B65.
 
 ## The 3D engines
 

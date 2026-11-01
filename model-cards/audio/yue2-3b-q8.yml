@@ -14,7 +14,7 @@ about: 'M-A-P''s YuE2-3B, non-commercial (CC BY-NC 4.0): one AR-NAR Mixture-of-T
 license: cc-by-nc-4.0
 commercial: false
 gpus: '0,1'                      # a whole copy can run on either card (the B70 first); `audio gen --gpus 0,1` also splits one song: LM there, VAE here
-vram_gib: 8.4                    # on one card: 8.14 GiB measured for a 234 s song at the six-minute cache, B70 and B65; 8.4 allows a longer flow pass
+vram_gib: 8.4                    # on one card: 8.27 GiB measured at the 360 s cap (B65; 8.14 at 234 s on both cards)
 headroom_gib: 3.4                #   of it, beyond the 5.05 GiB of weights (the language model, the VAE, SheetSage2)
 defaults:
   seconds: 360.0

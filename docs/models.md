@@ -84,7 +84,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 |---|---|---|---|---|
 | `minimax-music3` | MiniMax Music 3: the 8B semantic language model and RVQ depth decoder (half on the card), the 2.4B flow transformer, the Flow-VAE decoder; up to 6 minutes, 44.1 kHz stereo | `minimaxmusic3` | 26.6 GiB | checked, served |
 | `minimax-music3-int8` | the same files, the language model and depth decoder in int8 at load: half the VRAM, 1.7x the frames a second | `minimaxmusic3` | 26.6 GiB | checked, served |
-| `yue2-3b-q8` | YuE2-3B Q8_0 (non-commercial, CC BY-NC 4.0): songs with vocals from a style and lyrics, English and Mandarin, a melody / chords score first (sung again with new words over the same score), covers by SheetSage2, up to 6 minutes, 48 kHz stereo | `yue2` | 5.5 GiB | runs; not yet checked against a reference: [ports/yue2.md](ports/yue2.md) |
+| `yue2-3b-q8` | YuE2-3B Q8_0 (non-commercial, CC BY-NC 4.0): songs with vocals from a style and lyrics, English and Mandarin, a melody / chords score first (sung again with new words over the same score), covers by SheetSage2, up to 6 minutes, 48 kHz stereo | `yue2` | 5.5 GiB | checked on the B65: [ports/yue2.md](ports/yue2.md) |
 | `qwen3-tts-custom` | Qwen3-TTS 12 Hz 1.7B CustomVoice: nine built-in voices, styled by an instruction; 10 languages, 24 kHz | `qwen3tts` | 4.5 GiB | checked, served |
 | `qwen3-tts-design` | Qwen3-TTS VoiceDesign: a voice made up from a description | `qwen3tts` | 4.5 GiB | checked, served |
 | `qwen3-tts-base` | Qwen3-TTS Base: a voice cloned from a recording (its x-vector; with its transcript, in context) | `qwen3tts` | 4.5 GiB | checked, served |
