@@ -57,17 +57,24 @@ pub const CHUNK: usize = 512;
 /// rows a block of the per-row work (the projections, the MLP) of a pass: the MLP's float32 [rows, 12288] bounded
 const ROWS: usize = 2048;
 
-/// A matrix [n, k], Q8_0 as stored
+/// A matrix [n, k], Q8_0 as stored, or (`scales` Some: the silo's) repacked: quants from its start, scales from that offset
 pub struct Mat {
     pub w: DevBuf,
     pub n: usize,
     pub k: usize,
+    pub scales: Option<usize>,
 }
 
 impl Mat {
-    /// rows [r0, ..) of it
+    /// rows [r0, ..) of it as stored
     fn rows_at(&self, r0: usize) -> P {
         self.w.ptr().cast::<u8>().wrapping_add(r0 * self.k / 32 * Q8_BLOCK).cast_const().cast()
+    }
+
+    /// rows [r0, ..) of it repacked: (quants, scales)
+    fn packed_at(&self, r0: usize, sc: usize) -> (P, P) {
+        let p = self.w.ptr().cast::<u8>().cast_const();
+        (p.wrapping_add(r0 * self.k).cast(), p.wrapping_add(sc + r0 * (self.k / 32) * 2).cast())
     }
 }
 
@@ -187,6 +194,10 @@ pub struct Lm {
     t2: (Vec<f32>, Vec<f32>),
     /// the latent position table, bfloat16 bits [24576, 2048] on the host (a chunk's rows go up once)
     pos: Vec<u16>,
+    /// the products' inputs: half (the default) or bf16 (NS_YUE2_ACT=bf16); oneDNN's product is in that type
+    act: Dt,
+    /// the silo: its matrices repacked (None: as stored)
+    silo: Option<&'static ffi::Silo>,
     /// RoPE's (cos, sin), float32 [CONTEXT, 64, 2]: upstream's float32 angles (position * inv_freq)
     cs: DevBuf,
     pub bytes: u64,
@@ -207,12 +218,25 @@ impl Lm {
         }
         let nsd = Nsd::new(gpu)?;
         let k = ffi::api()?;
+        // SAFETY: the GPU is open; the check reads its properties.
+        let silo = ffi::silo()?.filter(|s| unsafe { (s.supported)(gpu.raw(), HIDDEN as i64) } == 1);
         let bytes = std::cell::Cell::new(0u64);
         let up = |b: &[u8]| -> Result<DevBuf> {
             let d = DevBuf::new(gpu, b.len())?;
             d.write(0, b)?;
             bytes.set(bytes.get() + b.len() as u64);
             Ok(d)
+        };
+        // the matrix repacked by the silo, the stored copy let go; the embedding table stays as stored
+        let pack = |m: Mat| -> Result<Mat> {
+            let Some(si) = silo else { return Ok(m) };
+            // SAFETY: pure functions of the shape; the buffer holds their bytes, m.w the rows as stored.
+            let (bytes_n, sc) = unsafe { ((si.bytes)(m.n as i64, m.k as i64), (si.scales_at)(m.n as i64, m.k as i64)) };
+            let d = DevBuf::new(gpu, bytes_n)?;
+            ffi::check(unsafe { (si.pack)(gpu.raw(), m.w.ptr(), m.n as i64, m.k as i64, d.ptr()) }, "repacking a matrix")?;
+            gpu.sync()?;
+            bytes.set(bytes.get() + bytes_n as u64 - m.w.len as u64);
+            Ok(Mat { w: d, n: m.n, k: m.k, scales: Some(sc) })
         };
         // Q8_0 matrices stacked along their rows (one matrix of all their outputs)
         let mats = |names: &[String]| -> Result<Mat> {
@@ -231,7 +255,8 @@ impl Lm {
                 rows += r;
                 all.extend(f.read(t).map_err(ge)?);
             }
-            Ok(Mat { w: up(&all)?, n: rows, k: kk })
+            let m = Mat { w: up(&all)?, n: rows, k: kk, scales: None };
+            pack(m)
         };
         let vecd = |name: &str| -> Result<DevBuf> {
             let v = host_vec(f, name)?;
@@ -253,7 +278,11 @@ impl Lm {
             let p = format!("blk.{i}");
             layers.push(Layer { nar: path(&p, "nar_attn", "nar_ffn")?, ar: path(&p, "attn", "ffn")? });
         }
-        let embed = mats(&["token_embd.weight".to_string()])?;
+        // the table as stored: rows are read one at a time (ns_audio_yue2_embed_q8)
+        let embed = {
+            let t = f.tensor("token_embd.weight").ok_or_else(|| Error("no token_embd.weight".into()))?;
+            Mat { w: up(&f.read(t).map_err(ge)?)?, n: t.shape[0] as usize, k: t.shape[1] as usize, scales: None }
+        };
         let head = mats(&["output.weight".to_string()])?;
         if embed.n != VOCAB || head.n != VOCAB {
             return Err(Error("token_embd / output: not 184704 rows".into()));
@@ -272,6 +301,8 @@ impl Lm {
             t1: (host_vec(f, "time_embd.0.weight")?, host_vec(f, "time_embd.0.bias")?),
             t2: (host_vec(f, "time_embd.1.weight")?, host_vec(f, "time_embd.1.bias")?),
             pos,
+            silo,
+            act: if std::env::var("NS_YUE2_ACT").is_ok_and(|v| v.trim() == "bf16") { Dt::BF16 } else { Dt::F16 },
             cs: DevBuf::from_f32(gpu, &rope_table())?,
             embed: embed.w,
             head,
@@ -305,8 +336,30 @@ impl Lm {
         self.nsd.rms_norm_mod(x, Dt::F32, m, HIDDEN, w.ptr(), EPS, none(), none(), none(), out, out_dt)
     }
 
-    fn lin(&self, x: P, dt: Dt, m: usize, w: &Mat, out: M) -> Result<()> {
-        self.nsd.linear_q(x, dt, m, w.k, w.w.ptr(), Q8_0, w.n, none(), out, Dt::F32, 0)
+    fn lin(&self, s: &mut Scratch, x: P, dt: Dt, m: usize, w: &Mat, out: M) -> Result<()> {
+        match (self.silo, w.scales) {
+            (Some(si), Some(sc)) => {
+                // the whole matrix as half (the largest, gate | up, is 50 MB), one GEMM
+                let h = s.get(&self.gpu, "wh", w.n * w.k * 2)?;
+                let (q, sv) = w.packed_at(0, sc);
+                // SAFETY: the matrix's quants and scales, h its n x k halves.
+                ffi::check(unsafe { (si.half)(self.g(), q, sv, w.n as i64, w.k as i64, h) }, "the matrix as half")?;
+                self.nsd.linear(x, dt, m, w.k, h, w.n, none(), out, Dt::F32)
+            }
+            _ => self.nsd.linear_q(x, dt, m, w.k, w.w.ptr(), Q8_0, w.n, none(), out, Dt::F32, 0),
+        }
+    }
+
+    /// A decode product against a matrix's rows [r0, r0 + n)
+    fn mv(&self, x: P, m: usize, w: &Mat, r0: usize, n: usize, out: M, ldo: usize, acc: bool) -> Result<()> {
+        match (self.silo, w.scales) {
+            (Some(si), Some(sc)) => {
+                let (q, sv) = w.packed_at(r0, sc);
+                // SAFETY: x m x k floats, the rows' quants and scales, out m rows of ldo floats.
+                ffi::check(unsafe { (si.gemv)(self.g(), x.cast(), m as i64, w.k as i64, q, sv, n as i64, out.cast(), ldo as i64, acc as i32) }, "q8 product")
+            }
+            _ => self.gemv(x, m, w.rows_at(r0), w.k, n, out, ldo, acc),
+        }
     }
 
     fn add(&self, x: M, y: P, m: usize) -> Result<()> {
@@ -345,15 +398,14 @@ impl Lm {
         let qkv = s.get(g, "qkv", rb * QKV * 4)?;
         let gu = s.get(g, "gu", rb * 2 * FFN * 4)?;
         let y = s.get(g, "y", rb * HIDDEN * 4)?;
-        // the products' inputs: bf16, the reference's own type (no range risk in the MLP's down projection)
-        let pdt = Dt::BF16;
+        let pdt = self.act;
         for (li, l) in self.layers.iter().enumerate() {
             let p = if nar { &l.nar } else { &l.ar };
             let (kc, vc) = (c.k[li].ptr(), c.v[li].ptr());
             for b0 in (0..m).step_by(rb) {
                 let bm = rb.min(m - b0);
                 self.rms(at(x, b0 * HIDDEN * 4), bm, &p.norm1, h, pdt)?;
-                self.lin(h, pdt, bm, &p.qkv, qkv)?;
+                self.lin(s, h, pdt, bm, &p.qkv, qkv)?;
                 // SAFETY: qkv holds bm rows of 4096, q m rows of 2048 half, the caches cap rows (checked above).
                 ffi::check(unsafe { (self.k.qkv)(self.g(), qkv.cast(), bm as i64, p.qn.fp(), p.kn.fp(), EPS, self.cs.fp(), (pos0 + b0) as i64,
                                                  at(q, b0 * QW * 2), kc, vc, (pos0 + b0) as i64) }, "q / k / v")?;
@@ -375,15 +427,139 @@ impl Lm {
             for b0 in (0..m).step_by(rb) {
                 let bm = rb.min(m - b0);
                 let xb = at(x, b0 * HIDDEN * 4);
-                self.lin(at(o, b0 * QW * 2), Dt::F16, bm, &p.o, y)?;
+                self.lin(s, at(o, b0 * QW * 2), Dt::F16, bm, &p.o, y)?;
                 self.add(xb, y, bm)?;
                 self.rms(xb, bm, &p.norm2, h, pdt)?;
-                self.lin(h, pdt, bm, &p.gu, gu)?;
+                self.lin(s, h, pdt, bm, &p.gu, gu)?;
                 self.nsd.swiglu(gu, Dt::F32, bm, FFN, h, pdt)?;
-                self.lin(h, pdt, bm, &p.down, y)?;
+                self.lin(s, h, pdt, bm, &p.down, y)?;
                 self.add(xb, y, bm)?;
             }
         }
+        Ok(())
+    }
+
+    /// `layers` for the self-check, the slow arithmetic that makes the yardstick: every product float32 from the Q8_0
+    /// blocks (ns_audio_yue2_gemv_q8), and - `exact_attn` - each query row's attention summed in float32 against the
+    /// cache (ns_audio_yue2_attn; else the shared kernel `layers` uses)
+    fn layers_exact(&self, s: &mut Scratch, c: &Cache, x: M, m: usize, pos0: usize, nar: bool, exact_attn: bool) -> Result<()> {
+        if pos0 + m > c.cap {
+            return Err(Error(format!("{m} rows at {pos0}: past the cache's {}", c.cap)));
+        }
+        const R: usize = 8;
+        let g = &self.gpu;
+        let h = s.get(g, "eh", R * HIDDEN * 4)?;
+        let qkv = s.get(g, "eqkv", R * QKV * 4)?;
+        let gu = s.get(g, "egu", R * 2 * FFN * 4)?;
+        let ff = s.get(g, "eff", R * FFN * 4)?;
+        let q = s.get(g, "eq", m * QW * 2)?;
+        let o = s.get(g, "eo", m * QW * 2)?;
+        let of = s.get(g, "eof", m * QW * 4)?;
+        let qg = s.get(g, "eqg", m * QW * 2)?;
+        let og = s.get(g, "eog", m * QW * 2)?;
+        // SAFETY: a pure function of the length.
+        let part_n = unsafe { (self.k.attn_scratch)((pos0 + m) as i64) } as usize;
+        let part = s.get(g, "epart", part_n.max(1) * 4)?;
+        for (li, l) in self.layers.iter().enumerate() {
+            let p = if nar { &l.nar } else { &l.ar };
+            let (kc, vc) = (c.k[li].ptr(), c.v[li].ptr());
+            for b0 in (0..m).step_by(R) {
+                let bm = R.min(m - b0);
+                self.rms(at(x, b0 * HIDDEN * 4), bm, &p.norm1, h, Dt::F32)?;
+                self.mv(h, bm, &p.qkv, 0, QKV, qkv, QKV, false)?;
+                // SAFETY: as in `layers`.
+                ffi::check(unsafe { (self.k.qkv)(self.g(), qkv.cast(), bm as i64, p.qn.fp(), p.kn.fp(), EPS, self.cs.fp(), (pos0 + b0) as i64,
+                                                 at(q, b0 * QW * 2), kc, vc, (pos0 + b0) as i64) }, "q / k / v")?;
+            }
+            if exact_attn {
+                for r in 0..m {
+                    let n = if nar { pos0 + m } else { pos0 + r + 1 };
+                    // SAFETY: q row r, the cache's n rows, of row r, part sized for the longest.
+                    ffi::check(unsafe { (self.k.attn)(self.g(), at(q, r * QW * 2), kc, vc, n as i64, at(of, r * QW * 4).cast(), part.cast()) }, "attention")?;
+                }
+            } else {
+                if nar {
+                    // SAFETY: q, qg, og, o hold m rows of 2048 half.
+                    ffi::check(unsafe { (self.k.heads)(self.g(), q, qg, m as i64, 1) }, "the query heads")?;
+                    self.nsd.attention_qk(qg, 2 * m, KW, kc, vc, pos0 + m, KW, Dt::F16, KV_HEADS, HEAD, og, Dt::F16)?;
+                    // SAFETY: as above.
+                    ffi::check(unsafe { (self.k.heads)(self.g(), og, o, m as i64, 0) }, "the query heads")?;
+                } else {
+                    let q0 = q.cast::<u8>().wrapping_sub(pos0 * QW * 2).cast_const().cast();
+                    self.nsd.attention_causal_rows(q0, kc, vc, Dt::F16, pos0, m, HEADS, KV_HEADS, HEAD, QW, KW, o)?;
+                }
+                // SAFETY: o m rows of half, of as floats.
+                ffi::check(unsafe { (self.k.to_f32)(self.g(), o, (m * QW) as i64, of.cast()) }, "float32")?;
+            }
+            for b0 in (0..m).step_by(R) {
+                let bm = R.min(m - b0);
+                let xb = at(x, b0 * HIDDEN * 4);
+                self.mv(at(of, b0 * QW * 4), bm, &p.o, 0, HIDDEN, xb, HIDDEN, true)?;
+                self.rms(xb, bm, &p.norm2, h, Dt::F32)?;
+                self.mv(h, bm, &p.gu, 0, 2 * FFN, gu, 2 * FFN, false)?;
+                self.nsd.swiglu(gu, Dt::F32, bm, FFN, ff, Dt::F32)?;
+                self.mv(ff, bm, &p.down, 0, HIDDEN, xb, HIDDEN, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The prompt pass in the slow arithmetic: as `prefill`, a chunk of one block of rows
+    pub fn prefill_exact(&self, s: &mut Scratch, c: &mut Cache, ids: &[u32], keep: &[usize]) -> Result<Vec<f32>> {
+        let mut out = vec![0f32; keep.len() * HIDDEN];
+        for (ci, chunk) in ids.chunks(CHUNK).enumerate() {
+            let m = chunk.len();
+            let x = s.get(&self.gpu, "px", m * HIDDEN * 4)?;
+            self.embed(s, chunk, x)?;
+            self.layers_exact(s, c, x, m, c.len, false, true)?;
+            for (i, r) in keep.iter().enumerate() {
+                if (ci * CHUNK..ci * CHUNK + m).contains(r) {
+                    let mut b = vec![0u8; HIDDEN * 4];
+                    s.buf("px").read((r - ci * CHUNK) * HIDDEN * 4, &mut b)?;
+                    for (j, v) in b.chunks_exact(4).enumerate() {
+                        out[i * HIDDEN + j] = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+                    }
+                }
+            }
+            c.len += m;
+        }
+        Ok(out)
+    }
+
+    /// Each decode kernel alone, `n` runs each with the queue drained, for the self-check: (name, microseconds a run)
+    pub fn decode_probe(&self, s: &mut Scratch, c: &Cache, n: usize, log: &mut dyn FnMut(String)) -> Result<()> {
+        let g = self.gpu.clone();
+        let p = &self.layers[0].ar;
+        let x = s.get(&g, "bx", 2 * HIDDEN * 4)?;
+        s.buf("bx").fill(0)?;
+        let qkv = s.get(&g, "bqkv", 2 * QKV * 4)?;
+        let gu = s.get(&g, "bgu", 2 * 2 * FFN * 4)?;
+        let ff = s.get(&g, "bff", 2 * FFN * 4)?;
+        let oo = s.get(&g, "boo", 2 * QW * 4)?;
+        let q = s.get(&g, "bq", 2 * QW * 2)?;
+        let keys = c.len;
+        // SAFETY: a pure function of the length.
+        let part_n = unsafe { (self.k.attn_scratch)(keys as i64) } as usize;
+        let part = s.get(&g, "bpart", part_n.max(1) * 4)?;
+        let mut t = |name: &str, f: &mut dyn FnMut() -> Result<()>| -> Result<()> {
+            g.sync()?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                f()?;
+                g.sync()?;
+            }
+            log(format!("decode kernel {name:<28} {:.0} us", t0.elapsed().as_secs_f64() * 1e6 / n as f64));
+            Ok(())
+        };
+        t("an empty sync", &mut || Ok(()))?;
+        t("rms norm 2 rows", &mut || self.rms(x, 2, &p.norm1, x, Dt::F32))?;
+        t("q8 qkv 2 rows", &mut || self.mv(x, 2, &p.qkv, 0, QKV, qkv, QKV, false))?;
+        t("q8 gate+up 2 rows", &mut || self.mv(x, 2, &p.gu, 0, 2 * FFN, gu, 2 * FFN, false))?;
+        t("q8 gate+up 1 row", &mut || self.mv(x, 1, &p.gu, 0, 2 * FFN, gu, 2 * FFN, false))?;
+        t("q8 down 2 rows", &mut || self.mv(ff, 2, &p.down, 0, HIDDEN, x, HIDDEN, false))?;
+        t("swiglu 2 rows", &mut || self.nsd.swiglu(gu, Dt::F32, 2, FFN, ff, Dt::F32))?;
+        // SAFETY: as in `step`; one row at the cache's last position, its row rewritten as it was (a probe only).
+        t("attention 1 row", &mut || ffi::check(unsafe { (self.k.attn)(self.g(), q, c.k[0].ptr(), c.v[0].ptr(), keys as i64, oo.cast(), part.cast()) }, "attention"))?;
         Ok(())
     }
 
@@ -439,7 +615,7 @@ impl Lm {
         for (li, l) in self.layers.iter().enumerate() {
             let p = &l.ar;
             self.rms(x, n, &p.norm1, h, Dt::F32)?;
-            self.gemv(h, n, p.qkv.w.ptr(), HIDDEN, QKV, qkv, QKV, false)?;
+            self.mv(h, n, &p.qkv, 0, QKV, qkv, QKV, false)?;
             for (i, c) in caches.iter().enumerate() {
                 let (kc, vc) = (c.k[li].ptr(), c.v[li].ptr());
                 // SAFETY: row i of qkv; the cache has row c.len (checked above).
@@ -449,11 +625,11 @@ impl Lm {
                 ffi::check(unsafe { (self.k.attn)(self.g(), at(q, i * QW * 2), kc, vc, (c.len + 1) as i64, at(o, i * QW * 4).cast(), part.cast()) },
                            "attention")?;
             }
-            self.gemv(o, n, p.o.w.ptr(), QW, HIDDEN, x, HIDDEN, true)?;
+            self.mv(o, n, &p.o, 0, HIDDEN, x, HIDDEN, true)?;
             self.rms(x, n, &p.norm2, h, Dt::F32)?;
-            self.gemv(h, n, p.gu.w.ptr(), HIDDEN, 2 * FFN, gu, 2 * FFN, false)?;
+            self.mv(h, n, &p.gu, 0, 2 * FFN, gu, 2 * FFN, false)?;
             self.nsd.swiglu(gu, Dt::F32, n, FFN, ff, Dt::F32)?;
-            self.gemv(ff, n, p.down.w.ptr(), FFN, HIDDEN, x, HIDDEN, true)?;
+            self.mv(ff, n, &p.down, 0, HIDDEN, x, HIDDEN, true)?;
         }
         for c in caches.iter_mut() {
             c.len += 1;
@@ -468,7 +644,7 @@ impl Lm {
         let hn = s.get(g, "hn", m * HIDDEN * 4)?;
         let lo = s.get(g, "lo", m * n * 4)?;
         self.rms(x, m, &self.norm, hn, Dt::F32)?;
-        self.gemv(hn, m, self.head.rows_at(r0), HIDDEN, n, lo, n, false)?;
+        self.mv(hn, m, &self.head, r0, n, lo, n, false)?;
         let mut b = vec![0u8; m * n * 4];
         s.buf("lo").read(0, &mut b)?;
         Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
@@ -519,6 +695,11 @@ impl Lm {
     /// time embedding (float32 [2048] on the card), `pos` the chunk's position rows [frames + 2, 2048]; out float32
     /// [frames, 64] on the card (`nar_velocity` / CachedNAR.velocity)
     pub fn velocity(&self, s: &mut Scratch, c: &Cache, xt: &DevBuf, frames: usize, temb: &DevBuf, pos: &DevBuf, out: M) -> Result<()> {
+        self.velocity_as(s, c, xt, frames, temb, pos, out, 0)
+    }
+
+    /// `velocity` in an arithmetic: 0 the engine's, 1 the products float32 and the shared attention, 2 all float32 (the self-check)
+    pub fn velocity_as(&self, s: &mut Scratch, c: &Cache, xt: &DevBuf, frames: usize, temb: &DevBuf, pos: &DevBuf, out: M, how: u8) -> Result<()> {
         let g = &self.gpu;
         let f2 = frames + 2;
         let xin = s.get(g, "nin", f2 * LATENT * 4)?;
@@ -528,12 +709,17 @@ impl Lm {
         let b = s.buf("nin");
         b.fill(0)?;
         b.copy_within(LATENT * 4, xt, 0, frames * LATENT * 4)?;
-        self.nsd.linear(xin, Dt::F32, f2, LATENT, self.v2l_w.ptr(), HIDDEN, self.v2l_b.ptr(), x, Dt::F32)?;
+        // SAFETY: xin f2 x 64 floats, the head [2048, 64] and its bias, x f2 x 2048.
+        ffi::check(unsafe { (self.k.linear_f32)(self.g(), xin.cast(), f2 as i64, LATENT as i64, self.v2l_w.fp(), HIDDEN as i64, self.v2l_b.fp(), x.cast()) }, "vae2llm")?;
         // SAFETY: x and pos hold f2 x 2048 floats, temb 2048.
         ffi::check(unsafe { (self.k.add_vec_rows)(self.g(), x.cast(), f2 as i64, HIDDEN as i64, temb.fp(), pos.fp()) }, "the latent rows")?;
-        self.layers(s, c, x, f2, c.len, true)?;
+        match how {
+            0 => self.layers(s, c, x, f2, c.len, true)?,
+            _ => self.layers_exact(s, c, x, f2, c.len, true, how == 2)?,
+        }
         self.rms(at(x, HIDDEN * 4), frames, &self.norm, hn, Dt::F32)?;
-        self.nsd.linear(hn, Dt::F32, frames, HIDDEN, self.l2v_w.ptr(), LATENT, self.l2v_b.ptr(), out, Dt::F32)
+        // SAFETY: hn frames x 2048 floats, the head [64, 2048] and its bias, out frames x 64.
+        ffi::check(unsafe { (self.k.linear_f32)(self.g(), hn.cast(), frames as i64, HIDDEN as i64, self.l2v_w.fp(), LATENT as i64, self.l2v_b.fp(), out.cast()) }, "llm2vae")
     }
 
     /// out = a + s b over n floats on the card

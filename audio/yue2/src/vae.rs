@@ -2,7 +2,7 @@
 //! at 25 Hz to 48 kHz stereo. A 7-tap convolution to 2048 channels, six blocks (SnakeBeta, a transposed convolution of
 //! twice the stride - strides 6, 5, 4, 4, 2, 2, channels halving to 64 -, three residual units at dilations 1, 3, 9),
 //! SnakeBeta and a 7-tap convolution to two channels; no tanh. The weight norm is folded in the GGUF; float32
-//! throughout (nsd's convolutions: an unfolding and one GEMM a tile). A song is decoded as `decode_tiled` does:
+//! throughout (MiniMax Music 3's oneDNN convolutions, strict float32). A song is decoded as `decode_tiled` does:
 //! cores of 512 frames with 16 more either side (the decoder's support is 12), each core's samples kept exactly, no
 //! blending - the full decoder's waveform.
 
@@ -124,7 +124,9 @@ impl Vae {
 
     fn conv(&self, c: &Conv, x: P, l: usize, dil: usize, pad: usize, out: M) -> Result<usize> {
         let lo = (l + 2 * pad - dil * (c.k - 1) - 1) + 1;
-        self.nsd.conv1d(x, 1, c.ci, l, c.w.ptr(), c.co, c.k, c.b.as_ref().map_or(none(), |b| b.ptr() as P), 1, dil, pad, out, lo)?;
+        let b = c.b.as_ref().map_or(std::ptr::null(), |b| b.fp().cast_const());
+        // SAFETY: x [ci, l] floats, the weights [co, ci, k], out [co, lo].
+        ffi::check(unsafe { (self.k.conv1d)(self.gpu.raw(), x.cast(), 1, c.ci as i64, l as i64, c.w.fp(), c.co as i64, c.k as i64, b, 1, dil as i64, pad as i64, out.cast(), lo as i64) }, "conv1d")?;
         Ok(lo)
     }
 
@@ -159,8 +161,10 @@ impl Vae {
             self.snake(&blk.s, x, l, a)?;
             let pad = blk.stride.div_ceil(2);
             let lo = (l - 1) * blk.stride - 2 * pad + blk.up.k;
-            self.nsd.conv_transpose1d(a, 1, blk.up.ci, l, blk.up.w.ptr(), blk.up.co, blk.up.k, blk.up.b.as_ref().map_or(none(), |b| b.ptr() as P),
-                                      blk.stride, pad, b, lo)?;
+            let bias = blk.up.b.as_ref().map_or(std::ptr::null(), |b| b.fp().cast_const());
+            // SAFETY: a [ci, l] floats, the weights as stored, b [co, lo].
+            ffi::check(unsafe { (self.k.conv_transpose1d)(self.gpu.raw(), a.cast(), 1, blk.up.ci as i64, l as i64, blk.up.w.fp(), blk.up.co as i64, blk.up.k as i64, bias,
+                                                          blk.stride as i64, pad as i64, b.cast(), lo as i64) }, "conv_transpose1d")?;
             l = lo;
             std::mem::swap(&mut x, &mut b);
             for r in &blk.res {

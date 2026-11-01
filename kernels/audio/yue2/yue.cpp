@@ -325,6 +325,23 @@ int ns_audio_yue2_add_vec_rows(ns_gpu* g, float* x, int64_t R, int64_t C, const 
     NS_CATCH
 }
 
+int ns_audio_yue2_linear_f32(ns_gpu* g, const float* x, int64_t M, int64_t K, const float* w, int64_t N, const float* bias, float* out) {
+    NS_TRY
+    if (M * N <= 0) return 0;
+    // an output a work-item, its inputs summed in one fixed order (oneDNN's float32 GEMM sums in a different order
+    // each call: run-to-run noise the flow's half activations then amplify)
+    g->q.parallel_for(sycl::range<1>((size_t) (M * N)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], m = i / N, n = i % N;
+        const float* xr = x + m * K;
+        const float* wr = w + n * K;
+        float a = bias[n];
+        for (int64_t k = 0; k < K; ++k) a += xr[k] * wr[k];
+        out[i] = a;
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_audio_yue2_axpy(ns_gpu* g, float* out, const float* a, const float* b, int64_t n, float s) {
     NS_TRY
     if (n <= 0) return 0;

@@ -490,6 +490,14 @@ impl AudioEngine for Yue2 {
             return Err(Error("score-only: a recording's score - give the recording (source)".into()));
         }
         self.latents(&song, &mut made, t0, progress)?;
+        // a debug dump of what the stages made (raw little-endian): two runs compared stage by stage
+        if let Ok(d) = std::env::var("NS_YUE2_DUMP") {
+            let p = Path::new(&d);
+            let ints = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            std::fs::write(p.join("abc.u32"), ints(&made.abc)).map_err(|e| Error(e.to_string()))?;
+            std::fs::write(p.join("codes.u32"), ints(&made.codes)).map_err(|e| Error(e.to_string()))?;
+            std::fs::write(p.join("latents.f32"), f32_bytes(&made.latents)).map_err(|e| Error(e.to_string()))?;
+        }
         if song.cot != Cot::Off {
             *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(String::from_utf8_lossy(&self.tok.decode_bytes(&made.abc)).into_owned());
         }

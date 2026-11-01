@@ -68,8 +68,83 @@ fn note(name: &str, got: &[f32], want: &[f32], log: &mut dyn FnMut(String)) -> f
     if got.len() != want.len() { 0.0 } else { cos }
 }
 
+/// The engine against itself, no reference needed (`--stages self`): its fast arithmetic (half / bf16 oneDNN products,
+/// the shared attention) against its slow one (every product float32 from the Q8_0 blocks, every attention summed in
+/// float32), and each against a second run. This measures rounding and the kernels; it cannot show that the model's
+/// structure is right (both paths share it): that is the reference's.
+pub fn self_check(e: &Yue2, log: &mut dyn FnMut(String)) -> Result<f64> {
+    let mut worst = 1f64;
+    let mut s = Scratch::default();
+    let prefix = prompt::prefix(&e.tok, Cot::Melody, "Indie folk, warm male vocal, acoustic guitar", "[Verse]\nI walked along the river when the city lights were low\n");
+    let frames = 200usize;
+    let codes: Vec<u32> = (0..frames as u32).map(|i| CODEC_OFFSET + (i.wrapping_mul(7919) ^ (i << 3)) % prompt::CODEC_SIZE).collect();
+    let mut seq = prefix.clone();
+    seq.extend_from_slice(&codes);
+    seq.push(MUSIC_END);
+    let n = seq.len();
+    let rows: Vec<usize> = (0..8).map(|i| n - 1 - i * 25).collect();
+    let logits = |e: &Yue2, s: &mut Scratch, x: &[f32]| e.lm.logits_of(s, x, 0, VOCAB);
+    // the prompt pass: the engine's, again, the slow one, and a token at a time through the decode
+    let t0 = Instant::now();
+    let mut c = e.lm.cache(n + frames + 2)?;
+    let a = e.lm.prefill(&mut s, &mut c, &seq, &rows)?;
+    let la = logits(e, &mut s, &a)?;
+    log(format!("prefill {n} rows in {:.2} s", t0.elapsed().as_secs_f64()));
+    let mut c2 = e.lm.cache(n + 1)?;
+    let b = e.lm.prefill(&mut s, &mut c2, &seq, &rows)?;
+    log(format!("prefill twice: {}", if a == b { "identical" } else { "DIFFER" }));
+    worst = worst.min(note("prefill again", &logits(e, &mut s, &b)?, &la, log));
+    drop(c2);
+    let t0 = Instant::now();
+    let mut c3 = e.lm.cache(n + 1)?;
+    let x = e.lm.prefill_exact(&mut s, &mut c3, &seq, &rows)?;
+    let lx = logits(e, &mut s, &x)?;
+    log(format!("prefill in float32, {:.2} s", t0.elapsed().as_secs_f64()));
+    worst = worst.min(note("prefill vs float32", &la, &lx, log));
+    drop(c3);
+    let mut c4 = e.lm.cache(n + 1)?;
+    let mut last = Vec::new();
+    for t in &seq[..n] {
+        e.lm.step(&mut s, &mut [&mut c4], &[*t])?;
+        let dx = s.buf("dx").ptr();
+        last = e.lm.logits(&mut s, dx, 1, 0, VOCAB)?;
+    }
+    worst = worst.min(note("decode a token at a time vs float32 (last row)", &last, &lx[..VOCAB], log));
+    e.lm.decode_probe(&mut s, &c4, 200, log)?;
+    drop(c4);
+    // the flow: a velocity at t = 1 from the noise, then the same state after the arithmetic each way
+    let g = &e.lm.gpu;
+    let noise = Mt19937::new(7).randn(frames * LATENT);
+    let st = DevBuf::from_f32(g, &noise)?;
+    let pos = e.lm.positions(frames + 2)?;
+    let temb = DevBuf::from_f32(g, &e.lm.time_embedding(1.0))?;
+    let v = DevBuf::f32(g, frames * LATENT)?;
+    let mut run = |how: u8, name: &str, s: &mut Scratch, log: &mut dyn FnMut(String)| -> Result<Vec<f32>> {
+        let t0 = Instant::now();
+        e.lm.velocity_as(s, &c, &st, frames, &temb, &pos, v.ptr(), how)?;
+        let o = v.to_f32()?;
+        log(format!("velocity, {name}: {:.3} s", t0.elapsed().as_secs_f64()));
+        Ok(o)
+    };
+    let f1 = run(0, "the engine's", &mut s, log)?;
+    let f2 = run(0, "the engine's again", &mut s, log)?;
+    log(format!("velocity twice: {}", if f1 == f2 { "identical" } else { "DIFFER" }));
+    worst = worst.min(note("velocity again", &f2, &f1, log));
+    let p = run(1, "float32 products, the shared attention", &mut s, log)?;
+    let x = run(2, "all float32", &mut s, log)?;
+    worst = worst.min(note("velocity vs all float32", &f1, &x, log));
+    worst = worst.min(note("shared attention vs float32 attention", &p, &x, log));
+    if f1.iter().any(|v| !v.is_finite()) {
+        return Err(Error("the engine's velocity is not finite".into()));
+    }
+    Ok(worst)
+}
+
 /// Runs the stages; the lowest cosine seen
 pub fn run(e: &Yue2, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)) -> Result<f64> {
+    if stages.contains(&"self") {
+        return self_check(e, log);
+    }
     let get = |name: &str| -> Result<(Vec<usize>, Vec<f32>)> { read_npy(&dir.join(format!("{name}.npy"))).map(|(s, v)| (s, v.into_iter().map(|x| x as f32).collect())) };
     let ids = |name: &str| -> Result<Vec<u32>> { Ok(read_npy(&dir.join(format!("{name}.npy")))?.1.iter().map(|x| *x as u32).collect()) };
     let req: serde_json::Value = std::fs::read(dir.join("request.json")).ok().and_then(|b| serde_json::from_slice(&b).ok())

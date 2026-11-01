@@ -76,6 +76,15 @@ int ns_audio_yue2_to_half(ns_gpu* g, const float* x, int64_t n, void* out) {
     NS_CATCH
 }
 
+int ns_audio_yue2_to_f32(ns_gpu* g, const void* x, int64_t n, float* out) {
+    NS_TRY
+    if (n <= 0) return 0;
+    const half* h = (const half*) x;
+    g->q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) { out[id] = (float) h[id]; });
+    return 0;
+    NS_CATCH
+}
+
 int ns_audio_yue2_glu(ns_gpu* g, const float* x, int64_t T, int64_t C, float* out) {
     NS_TRY
     if (T * C <= 0) return 0;

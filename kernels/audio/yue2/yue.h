@@ -40,6 +40,10 @@ int ns_audio_yue2_heads(ns_gpu* g, const void* in, void* out, int64_t S, int to_
 /* x[r, c] += a[c] + rows[r, c] (x, rows float32 [R, C]; a float32 [C]): the NAR rows' time embedding and positions */
 int ns_audio_yue2_add_vec_rows(ns_gpu* g, float* x, int64_t R, int64_t C, const float* a, const float* rows);
 
+/* out [M, N] = x [M, K] w^T + bias, float32 throughout, each sum in one fixed order: the flow heads (a song's result
+ * must not change from run to run) */
+int ns_audio_yue2_linear_f32(ns_gpu* g, const float* x, int64_t M, int64_t K, const float* w, int64_t N, const float* bias, float* out);
+
 /* out = a + s b (n floats; out may be a): the midpoint solver's steps */
 int ns_audio_yue2_axpy(ns_gpu* g, float* out, const float* a, const float* b, int64_t n, float s);
 
@@ -54,6 +58,7 @@ int ns_audio_yue2_axpy(ns_gpu* g, float* out, const float* a, const float* b, in
 int ns_audio_yue2_dwconv(ns_gpu* g, const float* x, int64_t T, int64_t C, const float* w, int64_t K, const float* bias, float* out);
 int ns_audio_yue2_grn(ns_gpu* g, const float* x, int64_t T, int64_t C, const float* gamma, const float* beta, void* out, float* part);
 int ns_audio_yue2_to_half(ns_gpu* g, const float* x, int64_t n, void* out);
+int ns_audio_yue2_to_f32(ns_gpu* g, const void* x, int64_t n, float* out);
 int ns_audio_yue2_glu(ns_gpu* g, const float* x, int64_t T, int64_t C, float* out);
 
 #ifdef __cplusplus
