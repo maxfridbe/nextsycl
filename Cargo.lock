@@ -565,6 +565,7 @@ dependencies = [
  "nextsycl-audio-voxcpm2",
  "nextsycl-audio-voxtraltts",
  "nextsycl-audio-whisper",
+ "nextsycl-audio-yue2",
  "nextsycl-core",
  "nextsycl-gguf",
  "nextsycl-image",
@@ -738,6 +739,19 @@ dependencies = [
  "nextsycl-gguf",
  "nextsycl-tok",
  "serde_json",
+]
+
+[[package]]
+name = "nextsycl-audio-yue2"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-audio",
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-tok",
+ "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]
