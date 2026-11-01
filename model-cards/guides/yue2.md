@@ -23,7 +23,7 @@ Name the voice (male / female vocal, its character) and leave out what should no
   line, and so did 5 other seeds. If a take loses its words anyway, change the seed; `cot: melody` or `cot: off` draw
   other plans.
 - One sung line per line; repeat a chorus in full where it comes back (the model sings what is written).
-- English and Mandarin are what it was made for (upstream's demos: English rock, metal, folk; Mandarin pop, funk); write
+- English and Mandarin are what it was made for (upstream's demos: English rock, metal, folk; Mandarin pop, funk; here: English folk and rock, Mandarin ballad); write
   Mandarin in characters, phrases separated by spaces.
 
 ```
@@ -75,4 +75,6 @@ nextsycl audio gen "-" --model yue2-3b-q8 --source song.mp3 --opt-score-only tru
 `seconds` is the most it makes (up to 360; the model ends the song when the lyrics are sung - a verse and two choruses
 run about a minute and a half). `cfg` guides the codes against the instruction alone (1: none; try 1.2 for a closer
 reading of the style). `steps` are the flow's (32, upstream's). Each song is one seed: the same request and seed make the
-same song on this engine.
+same WAV on the same card; the B70 and the B65 draw different songs from one seed (their rounding differs, and the codes are
+drawn from it). A score sung again with new words keeps its melody; the same score and the same words do not repeat the
+first take, whose score was decoded a token at a time.

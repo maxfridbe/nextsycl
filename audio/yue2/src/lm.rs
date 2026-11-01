@@ -13,9 +13,9 @@
 //! ```
 //!
 //! The matrices stay in the GGUF's Q8_0 blocks on the card (q | k | v and gate | up stacked into one matrix each: the
-//! same rows, one product): a prefill or a flow pass multiplies through nsd_linear_q (a slice made bf16 / half, one
+//! same rows, one product): a prefill or a flow pass multiplies through nsd_linear_q (a slice made half, one
 //! oneDNN GEMM), a decode step reads the blocks straight (ns_audio_yue2_gemv_q8). The residual stream is float32, the
-//! products' inputs bf16 (the reference's own type) or half (the attention's output), the cache half.
+//! products' inputs and outputs half, the cache half (bf16 measured coarser: docs/ports/yue2.md).
 #![allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
 
 use std::collections::BTreeMap;
@@ -194,7 +194,7 @@ pub struct Lm {
     t2: (Vec<f32>, Vec<f32>),
     /// the latent position table, bfloat16 bits [24576, 2048] on the host (a chunk's rows go up once)
     pos: Vec<u16>,
-    /// the products' inputs: half (the default) or bf16 (NS_YUE2_ACT=bf16); oneDNN's product is in that type
+    /// the products' inputs: half (measured closer to float32 than bf16: docs/ports/yue2.md), or bf16 without the silo (NS_YUE2_ACT=bf16); oneDNN's product is in that type
     act: Dt,
     /// the silo: its matrices repacked (None: as stored)
     silo: Option<&'static ffi::Silo>,
@@ -302,7 +302,7 @@ impl Lm {
             t2: (host_vec(f, "time_embd.1.weight")?, host_vec(f, "time_embd.1.bias")?),
             pos,
             silo,
-            act: if std::env::var("NS_YUE2_ACT").is_ok_and(|v| v.trim() == "bf16") { Dt::BF16 } else { Dt::F16 },
+            act: if silo.is_none() && std::env::var("NS_YUE2_ACT").is_ok_and(|v| v.trim() == "bf16") { Dt::BF16 } else { Dt::F16 },
             cs: DevBuf::from_f32(gpu, &rope_table())?,
             embed: embed.w,
             head,

@@ -276,7 +276,7 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 |---|---|---|---|
 | `NS_AUDIO_OUT` | ~/.local/share/nextsycl/audio | where songs, speech and saved voices are kept | cli (audio), serve |
 | `NS_YUE2_DUMP` | off | Debug: a folder to write each song's abc.u32, codes.u32 and latents.f32 into (raw little-endian), to compare runs stage by stage | audio yue2 |
-| `NS_YUE2_ACT` | half | the flow's and prefill's product inputs: half, or bf16 (coarser; oneDNN's product stays in the type) | audio yue2 |
+| `NS_YUE2_ACT` | half | the flow's and prefill's product inputs: half, or bf16 with NS_SILO=0 only (coarser: oneDNN's product stays in the type) | audio yue2 |
 | `NS_YUE2_COT` | full | what YuE2 writes before the music: full (a melody and chords score), melody, off (--opt-cot; a request's `cot` wins) | audio yue2 |
 | `NS_ACE_CHECKPOINT` | acestep-v15-turbo | the ACE-Step DiT checkpoint a model directory loads (acestep-v15-base: the base model, for lego) | audio acestep |
 | `NS_ACE_DCW` | the turbo's: 1, the base's: 0 | the wavelet-domain correction of each step (DCW; as the reference: on for turbo) (--opt-dcw) | audio acestep |

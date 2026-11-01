@@ -73,6 +73,19 @@ all of its weights and, seven times, the depth decoder's (14 GB and 8 GB a frame
 memory bandwidth. A load takes 6 s with the files in the page cache (20 s from the disk). Running the flow stage
 beside the frames on a second queue of the same card was tried: the card takes the two in turns (114.5 s, not less).
 
+## YuE2
+
+`audio.generate` with `model: yue2-3b-q8`: M-A-P's YuE2 (non-commercial, CC BY-NC 4.0) in Rust and SYCL (`audio/yue2`,
+`kernels/audio/yue2`; its record: [ports/yue2.md](ports/yue2.md)). One AR-NAR backbone writes a score (ABC: melody and
+chords for `cot: full`, the default; a melody for `melody`; none for `off`) and the semantic codes, then the acoustic
+latents by flow matching; YuE2-Vae decodes 48 kHz stereo. A song's score comes back with it (`nextsycl.score`, and an `.abc`
+beside the CLI's WAV); give it as `abc` with the same seed and style and new lyrics and the melody stays. A recording
+(`audio`) is transcribed by SheetSage2 and sung anew: a cover. The guide: `model-cards/guides/yue2.md`.
+
+**Not yet checked against a reference.** Songs are sung as written (Whisper's reading) in English and Mandarin; the
+engine is compared with its own float32 arithmetic (`nextsycl audio check DIR --stages self`), rel 1.8e-4 on logits and 9.5e-4 on the flow's velocity.
+Speed on 142 s of Mandarin: B70 39 s (tg 207 codes/s), B65 54 s (tg 152 codes/s). One card holds it: 8.1 GiB at 234 s.
+
 ## Speech
 
 Qwen3-TTS (`audio/qwen3tts`, the 12 Hz 1.7B checkpoints): text to speech in Chinese, English, Japanese, Korean, German,

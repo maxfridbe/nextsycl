@@ -59,6 +59,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `unimate` | **UniMate** the skeleton of a rigged mesh set in motion by a sentence, as a glTF skeletal animation (`model3d.rig` with a prompt; weights CC BY-NC) | a 28-joint humanoid, 60 frames: 13 s |
 | `minimax-h3` | **MiniMax H3** video with sound | 896x672, 4.5 s: ~90 s |
 | `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |
+| `yue2-3b-q8` | **YuE2-3B** songs with vocals, English and Mandarin; non-commercial (CC BY-NC 4.0); not yet checked against a reference | 142 s of song: 39 s (B70), 54 s (B65) |
 | `qwen3-tts-custom` | **Qwen3-TTS** speech | a minute of speech: 10.7 s (8.2 s int8); a sentence: 0.64 s |
 
 The earlier VQ GGUF of V4.1 (1.6-bit experts, tg ~23 tok/s) repeated itself past ~2K tokens and was dropped for Unsloth's: [docs/ports/deepseek41-unsloth.md](docs/ports/deepseek41-unsloth.md).
