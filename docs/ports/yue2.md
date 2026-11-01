@@ -18,7 +18,7 @@ The silo was therefore written before parity: it is checked against the engine's
 | SheetSage2 vs upstream | unproved here | ran end to end on a song of ours (a score, a cover) |
 | kernels run, no GPU reset | proved | every run below; reset count stayed 10 |
 | same request, same card: same WAV | proved | 8 s song twice, abc, codes, latents and samples identical (once the flow heads were fixed) |
-| silo = engine's kernels | proved | 81 s song built without the silo vs with it: 0 samples differ; `NS_SILO=0` on the final build: see Known |
+| silo = engine's kernels | proved | 81 s song, `NS_SILO=0` vs the silo on the final build: 0 samples differ |
 | fast arithmetic vs float32 | measured | below |
 | real songs in English and Mandarin | measured | below; not listened to |
 
