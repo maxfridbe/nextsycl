@@ -89,7 +89,18 @@ impl nextsycl_serve::home::registry::Store for Store {
         nextsycl_models::catalog::Catalog::load(&self.0).ok()?.guide(entry)
     }
     fn cards(&self) -> Vec<serde_json::Value> {
-        nextsycl_models::catalog::Catalog::load(&self.0).map(|c| c.models).unwrap_or_default()
+        // read at most every 30 s (the scheduler asks often); a card made bad after the door started: the last good cards stay, named in the log
+        static CARDS: std::sync::Mutex<Option<(std::time::Instant, Vec<serde_json::Value>)>> = std::sync::Mutex::new(None);
+        let mut c = CARDS.lock().unwrap();
+        if c.as_ref().is_none_or(|(at, _)| at.elapsed() > std::time::Duration::from_secs(30)) {
+            let keep = c.take().map(|x| x.1).unwrap_or_default();
+            let read = nextsycl_models::catalog::Catalog::load(&self.0).map(|c| c.models).unwrap_or_else(|e| {
+                eprintln!("model cards: {e}; the last good ones stay");
+                keep
+            });
+            *c = Some((std::time::Instant::now(), read));
+        }
+        c.as_ref().map(|x| x.1.clone()).unwrap_or_default()
     }
     fn card_files(&self, id: &str) -> Vec<(String, u64)> {
         nextsycl_models::catalog::Catalog::load(&self.0).ok().and_then(|c| c.model(id).map(|m| c.file_list(m))).unwrap_or_default()

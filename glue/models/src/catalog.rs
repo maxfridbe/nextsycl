@@ -69,6 +69,8 @@ impl Catalog {
                 if v["kind"].as_str() != Some(kind) {
                     return Err(format!("{}: its kind is not its folder ({kind})", p.display()));
                 }
+                // its concurrency and coexistence (crates/scheduler `profile`; absent: one copy, shared): bad values refused here, by file
+                backplane_scheduler::profile::Profile::from_card(&v).map_err(|e| format!("{}: {e}", p.display()))?;
                 cards.push((p, v));
             }
         }
@@ -663,4 +665,20 @@ mod tests {
         let e = entry(&m, &paths, &BTreeMap::from([("mtp".to_string(), "/d/rt".to_string())]));
         assert_eq!(e["env"]["B"], "/d/rt");
     }
+
+    #[test]
+    fn a_cards_profile_is_read_absent_is_fine_and_bad_values_are_refused_by_file() {
+        let d = std::env::temp_dir().join(format!("nextsycl-cards-profile-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("image")).unwrap();
+        std::fs::write(d.join("image/plain.yml"), "id: plain\nkind: image\n").unwrap();
+        std::fs::write(d.join("image/full.yml"), "id: full\nkind: image\nconcurrency:\n  max_copies_per_card: 2\n  recommended_copies: 1\n  scaling: {\"1\": 1.0, \"2\": 1.18}\ncoexistence:\n  mode: shared\n  shared_with: [\"kind:audio\"]\n").unwrap();
+        assert_eq!(Catalog::from_dir(&d).unwrap().models.len(), 2);
+        for bad in ["concurrency:\n  max_copies_per_card: 0\n", "coexistence:\n  mode: alone\n", "coexistence:\n  mode: exclusive\n"] {
+            std::fs::write(d.join("image/bad.yml"), format!("id: bad\nkind: image\n{bad}")).unwrap();
+            let e = Catalog::from_dir(&d).err().unwrap();
+            assert!(e.contains("bad.yml"), "{e}");
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
 }

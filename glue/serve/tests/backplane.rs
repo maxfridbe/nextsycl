@@ -150,7 +150,9 @@ fn serve_one(dir: &Path, port: u16, is_video: bool, id: &str, mut s: TcpStream) 
                         "/engine/keep" => json!({"kept": [0]}),
             "/rpc/llm.mode" => json!({"ok": true, "result": {}}),
             "/rpc/jobs.list" => json!({"ok": true, "result": {"jobs": std::fs::read(dir.join("clips.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or(json!([]))}}),
-            "/rpc/generate" => json!({"ok": true, "result": {"queued": false, "label": body["label"]}}),
+            "/rpc/admission" => json!({"ok": true, "result": std::fs::read(dir.join("admission.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or(json!({"reentered": false, "gate": "free"}))}),
+            "/rpc/generate" if dir.join("admission.json").exists() => json!({"ok": true, "result": {"queued": false, "state": "running", "reentered": true, "job": {"label": "the first"}}}),
+            "/rpc/generate" => json!({"ok": true, "result": {"queued": body["queue"] == true, "label": body["label"]}}),
             _ => json!({"ok": true, "result": status}),
         };
         return answer(&mut s, 200, &v);
@@ -267,7 +269,7 @@ while [ $# -gt 0 ]; do case "$1" in --port) port=$2;; --slot) slot=$2;; --gpu) g
 case "$kind $cmd" in
   "video start") echo "video 0 video" > "$D/up-{video}";;
   "video stop") rm -f "$D/up-{video}";;
-  *" start") echo "$id $gpu $kind" > "$D/up-$port"; echo "$port" > "$D/slot-$kind-$slot"; sleep 0.2;;
+  *" start") [ -e "$D/slow-$id" ] && sleep "$(cat "$D/slow-$id")"; echo "$id $gpu $kind" > "$D/up-$port"; echo "$port" > "$D/slot-$kind-$slot"; sleep 0.2;;
   *" stop") p=$(cat "$D/slot-$kind-$slot" 2>/dev/null); rm -f "$D/up-$p";;
 esac
 "#, d = dir.display())).unwrap();
@@ -627,7 +629,7 @@ fn a_card_is_blocked_for_clips_only_by_a_pin_or_hold_that_leaves_no_room() {
     let mut clips = clip_model("clips");
     clips["gpus"] = json!("0,1");
     let b = start_on("blocked", vec![clips, image("p", 20.0), image("small", 1.0)], None, None, 2);
-    let blocked = |b: &Box_| b.raw("GET", "/video/blocked", "", &json!({})).1;
+    let blocked = |b: &Box_| json!({"blocked": b.raw("GET", "/video/blocked", "", &json!({})).1["blocked"]});
     assert_eq!(blocked(&b), json!({"blocked": []}), "nothing held");
     // idle and in the way: it would go, so the card is not blocked
     assert_eq!(b.make("p", json!({}))["ok"], true);
@@ -658,6 +660,86 @@ fn a_clip_naming_no_engine_is_the_daemons_default_in_its_eta_and_its_answer() {
     body["prompt"] = json!("x");
     let r = b.ok("video.generate", body);
     assert_eq!((r["eta"]["shape"].as_str(), r["eta"]["run_s"].as_f64()), (Some(h3), Some(35.0)), "{r}");
+}
+
+#[test]
+fn a_free_card_means_no_wait_and_a_full_box_the_running_clips() {
+    let b = start("video-free", vec![clip_model("clips")], None, None);
+    b.until("the daemon up", 15, |b| b.dir.join(format!("up-{}", b.video)).exists());
+    std::fs::write(b.dir.join("clips.json"), json!([{"total": 100.0, "file": "a.mp4", "seconds": 5, "steps": 8, "canvas": "768x576", "mtime": 1, "engine": "INT8"}]).to_string()).unwrap();
+    let q = json!({"model": "clips", "width": 768, "height": 576, "seconds": 5, "steps": 8});
+    b.until("the clips read in", 40, |b| b.ok("system.eta", json!({"method": "video.generate", "params": q}))["eta"]["samples"] == 1);
+    let clip = json!({"label": "A", "name": "h3_a", "eta": 1000, "elapsed": 5, "stage": "sampling 2/8", "pct": 30, "gpu": 0, "energy_wh": 1.0, "waiting_for": null, "job": {"label": "A"}});
+    let status = |free: u64| json!({"idle": false, "eta": 1000, "job": {"label": "A"}, "stage": "sampling 2/8", "gpu": 0, "queue_items": [], "waiting_for": null, "running_clips": [clip], "slots_free": free, "accepts": free > 0});
+
+    // one clip on the first card, the second free: no running clip's time on it, a limit passes, the box says so
+    std::fs::write(b.dir.join("studio.json"), status(1).to_string()).unwrap();
+    let v = b.ok("system.eta", json!({"method": "video.generate", "params": q, "max_willing_to_wait_s": 10}));
+    assert_eq!((v["eta"]["wait_s"].as_f64(), v["would_accept"].clone()), (Some(0.0), json!(true)), "{v}");
+    let r = b.ok("video.generate", json!({"prompt": "x", "max_willing_to_wait_s": 10}));
+    assert_eq!(r["queued"], false, "{r}");
+    let busy = b.ok("system.busy", json!({}))["video"].clone();
+    assert_eq!((busy["slots"].clone(), busy["accepts"].clone(), busy["label"].clone(), busy["clips"][0]["gpu"].clone()), (json!(2), json!(true), json!("A"), json!(0)), "{busy}");
+
+    // both cards taken: the earliest card's time, and it says none can start
+    let mut two = status(0);
+    two["running_clips"] = json!([clip, {"label": "B", "name": "h3_b", "eta": 400, "stage": "sampling 1/8", "gpu": 1, "job": {"label": "B"}}]);
+    std::fs::write(b.dir.join("studio.json"), two.to_string()).unwrap();
+    let v = b.ok("system.eta", json!({"method": "video.generate", "params": q}));
+    assert_eq!(v["eta"]["wait_s"].as_f64(), Some(400.0), "the first to end frees a card: {v}");
+    let busy = b.ok("system.busy", json!({}))["video"].clone();
+    assert_eq!((busy["slots"].clone(), busy["accepts"].clone()), (json!(2), json!(false)), "{busy}");
+    assert!(b.ok("system.busy", json!({}))["reasons"].as_array().unwrap().len() >= 2);
+    // the status after a clip took the last card reads full, and that clip started: it waited for nothing
+    let r = b.ok("video.generate", json!({"prompt": "x"}));
+    assert_eq!((r["queued"].clone(), r["eta"]["wait_s"].as_f64()), (json!(false), Some(0.0)), "{r}");
+
+    // host memory left no card for a further clip: one possible
+    std::fs::write(b.dir.join("studio.json"), { let mut s = status(0); s["slots_why"] = json!("host memory"); s }.to_string()).unwrap();
+    let busy = b.ok("system.busy", json!({}))["video"].clone();
+    assert_eq!((busy["slots"].clone(), busy["accepts"].clone(), busy["slots_why"].clone()), (json!(1), json!(false), json!("host memory")), "{busy}");
+
+    // a clip that carries on from a running one waits for that one, a card free or not
+    std::fs::write(b.dir.join("studio.json"), status(1).to_string()).unwrap();
+    std::fs::write(b.dir.join("admission.json"), json!({"reentered": false, "gate": "series", "on": ["A"]}).to_string()).unwrap();
+    let v = b.ok("system.eta", json!({"method": "video.generate", "params": q}));
+    assert_eq!(v["eta"]["wait_s"].as_f64(), Some(1000.0), "{v}");
+}
+
+#[test]
+fn a_re_submit_of_a_clip_already_there_beats_the_limit() {
+    let b = start("video-again", vec![clip_model("clips")], None, None);
+    b.until("the daemon up", 15, |b| b.dir.join(format!("up-{}", b.video)).exists());
+    std::fs::write(b.dir.join("clips.json"), json!([{"total": 100.0, "file": "a.mp4", "seconds": 5, "steps": 8, "canvas": "768x576", "mtime": 1, "engine": "INT8"}]).to_string()).unwrap();
+    let q = json!({"model": "clips", "width": 768, "height": 576, "seconds": 5, "steps": 8});
+    b.until("the clips read in", 40, |b| b.ok("system.eta", json!({"method": "video.generate", "params": q}))["eta"]["samples"] == 1);
+    std::fs::write(b.dir.join("studio.json"), json!({"idle": false, "eta": 391, "job": {"label": "the first"}, "queue_items": [], "waiting_for": null}).to_string()).unwrap();
+    let again = json!({"prompt": "x", "reentrant_id": "run#7", "max_willing_to_wait_s": 10});
+
+    // not a clip it has: the limit declines it (the live failure's answer), the studio never sees it
+    let e = b.err("video.generate", again.clone());
+    assert_eq!(e["code"], "wait_too_long", "{e}");
+    assert!(!b.seen().contains("/rpc/generate"));
+    let v = b.ok("system.eta", json!({"method": "video.generate", "params": {"reentrant_id": "run#7"}, "max_willing_to_wait_s": 10}));
+    assert_eq!(v["would_accept"], false, "{v}");
+
+    // a clip it has: that clip, with no limit left on it
+    std::fs::write(b.dir.join("admission.json"), json!({"reentered": true, "state": "running", "job": {"label": "the first"}}).to_string()).unwrap();
+    let v = b.ok("system.eta", json!({"method": "video.generate", "params": {"reentrant_id": "run#7"}, "max_willing_to_wait_s": 10}));
+    assert_eq!((v["would_accept"].clone(), v["reentered"].clone(), v["eta"]["wait_s"].as_f64()), (json!(true), json!(true), Some(0.0)), "{v}");
+    let r = b.ok("video.generate", again.clone());
+    assert_eq!((r["reentered"].clone(), r["job"]["label"].clone(), r["eta"]["wait_s"].as_f64()), (json!(true), json!("the first"), Some(0.0)), "{r}");
+    assert!(b.seen().contains("/rpc/generate"));
+    // and nothing withdraws it at the limit afterwards
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!b.seen().contains("/rpc/cancel") && !b.seen().contains("/rpc/queue.remove"), "{}", b.seen());
+}
+
+#[test]
+fn the_door_tells_the_studio_its_host_figure() {
+    let b = start("video-host", vec![clip_model("clips")], None, None);
+    let v = b.raw("GET", "/video/blocked", "", &json!({})).1;
+    assert!(v["blocked"].is_array() && v["host_free_mb"].as_u64().is_some_and(|m| m > 0), "{v}");
 }
 
 #[test]
@@ -741,4 +823,67 @@ fn maintenance_refuses_a_pin_and_reloads_none() {
     b.ok("system.maintenance", json!({"on": false}));
     b.until("reloaded when the mode ends", 70, |b| b.up("p"));
     let _ = &b.home;
+}
+
+fn with_block(mut m: Value, k: &str, v: Value) -> Value {
+    m[k] = v;
+    m
+}
+
+#[test]
+fn system_busy_says_each_enabled_models_engine_row() {
+    let excl = with_block(image("alone", 1.0), "coexistence", json!({"mode": "exclusive", "exclusive_reason": "fills the card"}));
+    let mut off = image("off", 1.0);
+    off["enabled"] = json!(false);
+    let b = start("engines", vec![image("plain", 1.0), excl, off], None, None);
+    assert_eq!(b.make("plain", json!({}))["ok"], true);
+    let e = b.ok("system.busy", json!({}))["engines"].clone();
+    let row = |id: &str| e.as_array().unwrap().iter().find(|r| r["id"] == id).cloned();
+    assert!(row("off").is_none(), "{e}");
+    assert_eq!(row("plain").unwrap(), json!({"id": "plain", "kind": "image", "copies_now": 1, "recommended_copies": 1, "max_copies_per_card": 1, "mode": "shared", "status": "unmeasured"}));
+    assert_eq!(row("alone").unwrap()["mode"], "exclusive");
+    assert_eq!(row("alone").unwrap()["copies_now"], 0);
+    let st = b.model_state("plain");
+    assert_eq!((st["concurrency"]["status"].as_str(), st["coexistence"]["mode"].as_str()), (Some("unmeasured"), Some("shared")));
+}
+
+#[test]
+fn an_exclusive_model_clears_idle_residents_and_nothing_starts_beside_it() {
+    let excl = with_block(image("alone", 1.0), "coexistence", json!({"mode": "exclusive", "exclusive_reason": "fills the card"}));
+    let b = start("exclusive", vec![image("a", 1.0), excl, image("c", 1.0)], None, None);
+    assert_eq!(b.make("a", json!({}))["ok"], true);
+    // the memory would fit: it goes anyway
+    assert_eq!(b.make("alone", json!({}))["ok"], true);
+    assert!(!b.up("a") && b.up("alone"), "{}", b.exec_log());
+    // pinned, it cannot go, so nothing joins it: the answer names it (past the limit the error is the limit's)
+    b.ok("system.pin", json!({"model": "alone"}));
+    let e = b.make("c", json!({"max_willing_to_wait_s": 2, "wait": true}));
+    assert_eq!(e["ok"], false, "{e}");
+    assert!(!b.up("c"), "{}", b.exec_log());
+}
+
+#[test]
+fn nothing_starts_beside_an_exclusive_model_still_loading_in_another_kind() {
+    let mut alone = with_block(image("alone", 1.0), "coexistence", json!({"mode": "exclusive", "exclusive_reason": "fills the card"}));
+    alone["kind"] = json!("audio");
+    let b = start("exclusive-loading", vec![alone, image("c", 1.0)], None, None);
+    std::fs::write(b.dir.join("slow-alone"), "4").unwrap();
+    b.ok("system.load", json!({"model": "alone"}));
+    b.until("its start", 5, |b| b.exec_log().contains("audio start alone"));
+    // it holds no memory yet and answers nothing: the cards show nothing there
+    assert!(!b.up("alone"));
+    let e = b.make("c", json!({"max_willing_to_wait_s": 1}));
+    assert_eq!(e["ok"], false, "{e}");
+    assert!(!b.exec_log().contains("image start c"), "{}", b.exec_log());
+    assert_eq!(b.model_state("alone")["state"], "loading");
+}
+
+#[test]
+fn a_model_loads_on_the_first_of_its_cards_with_room_not_the_emptiest() {
+    let mut two = image("two", 1.0);
+    two["gpus"] = json!("0,1");
+    let b = start_on("first-listed", vec![image("a", 1.0), two], None, None, 2);
+    assert_eq!(b.make("a", json!({}))["ok"], true);
+    assert_eq!(b.make("two", json!({}))["ok"], true);
+    assert!(b.exec_log().contains("image start two --gpu 0"), "{}", b.exec_log());
 }

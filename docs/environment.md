@@ -51,6 +51,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_CHAT_UI_PORT` | 8080 | Open WebUI's port (the page's link) | serve |
 | `NS_CORS` | loopback origins only | more web origins that may call the servers from a browser, comma-separated (`*`: any) | cli (llm, image, audio start) |
 | `NS_GPU_LOCK` | /tmp/ds2run.lock | the lock file (flock) GPU work the front door does not manage holds while it runs - tests, benchmarks, builds: while it is held no model loads (requests get the retryable error `cards_taken`, 503, retry_after_s; /v1 Retry-After), image / audio / 3D jobs wait, the video queue pauses, the switcher swaps in no chat model. `off`: none | serve, switch |
+| `NS_BENCH_LOCKED` | - | set to 1 by `nextsycl models bench` when it re-runs itself under the run lock (flock on NS_GPU_LOCK); not for setting by hand | models bench |
 | `NS_MAX_RSVP_S` | 86400 | the longest hold a request's `rsvp_s` (or X-Keep-Up-S, `keep_up_s`) may ask for, in seconds; more is clamped to it. Read on every grant | serve |
 | `NS_IDLE_MINUTES` | 10 | an enabled model unloads after this long without a request (0: never); the switcher uses the same unless --idle-minutes | serve, switch |
 | `NS_IMAGE_PORT` | 8086 | the image server's port, as the front door reaches it | serve |
@@ -248,6 +249,7 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `H3_THREADS` | 8 | threads reading the checkpoint at load (--opt-threads) | video h3 |
 | `H3_VAE_ATTN_PER_TILE` | off | 1: the video decoder's attention a tile at a time (--opt-vae-attn-per-tile) | video h3 |
 | `NS_VIDEO_CHARACTERS` | docs/video/characters.example.json | characters for the speech tool | cli (video tools) |
+| `NS_VIDEO_DOOR` | 127.0.0.1:8000 | the front door the studio asks which cards a pin or hold has and the host's free memory (`--door` wins; off: none) | studio |
 | `NS_VIDEO_ENGINES` | none | the video daemon's other models, space-separated registry ids (serve: the enabled video models decide) | cli (video start), serve |
 | `NS_VIDEO_GPUS` | all | the video daemon's GPUs, e.g. "0 1" (serve: the enabled video models' GPUs) | cli (video start) |
 | `NS_VIDEO_GPUSTAT` | /run/gpustat.json | the GPU telemetry file (`nextsycl gpustat`, root: every user's processes) the studio reads; the front door plans loads with its `vram_used_mb` per card where it sees more than its own sampler | cli (video serve), studio, serve |
@@ -256,6 +258,7 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `NS_VIDEO_LISTEN` | 127.0.0.1 | the studio's address | cli (video serve) |
 | `NS_VIDEO_LLM_MODES` | none | the studio's chat modes file (the language models it switches) | cli (video serve), studio |
 | `NS_VIDEO_LLM_SWITCHER` | none | a model switcher URL: its chat model stops before a video load on a shared card and comes back after | cli (video start) |
+| `NS_VIDEO_MEMINFO` | /proc/meminfo | where the studio reads MemAvailable when the door has not said (tests give a file) | studio |
 | `NS_VIDEO_MODEL` | the first video model | the model jobs get unless they name one: a registry id (serve: the enabled video models decide) | cli (video start), serve |
 | `NS_VIDEO_MODELS_DIR` | none | a directory mounted as /models in the video container: what clips, templates and scene files name as /models/... (upscalers, LoRAs) | cli (video start) |
 | `NS_VIDEO_OUT` | ~/.local/share/nextsycl/video | where clips go | cli (video), studio |
@@ -267,11 +270,16 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 
 ## Audio
 
-ACE-Step 1.5 (`NS_ACE_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`), Whisper (`NS_WH_`). A per-request option's variable is only its name: it rides in the request (`"options"`), the engine does not read the environment for it.
+ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`), Whisper (`NS_WH_`). A per-request option's variable is only its name: it rides in the request (`"options"`), the engine does not read the environment for it.
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
 | `NS_AUDIO_OUT` | ~/.local/share/nextsycl/audio | where songs, speech and saved voices are kept | cli (audio), serve |
+| `NS_YUE2_DUMP` | off | Debug: a folder to write each song's abc.u32, codes.u32 and latents.f32 into (raw little-endian), to compare runs stage by stage | audio yue2 |
+| `NS_YUE2_ACT` | half | the flow's and prefill's product inputs: half, or bf16 with NS_SILO=0 only (coarser: oneDNN's product stays in the type) | audio yue2 |
+| `NS_YUE2_MIN_CODES` | 200 | Debug: the song may not end before this many codes: the 360 s worst case, for measuring memory | audio yue2 |
+| `NS_YUE2_SS2_ANGLES` | bf16 | Debug: SheetSage2's rotary table: bf16 (upstream's transcribe, under bf16 autocast), or fp32 (a reference dumped without autocast) | audio yue2 |
+| `NS_YUE2_COT` | full | what YuE2 writes before the music: full (a melody and chords score), melody, off (--opt-cot; a request's `cot` wins) | audio yue2 |
 | `NS_ACE_CHECKPOINT` | acestep-v15-turbo | the ACE-Step DiT checkpoint a model directory loads (acestep-v15-base: the base model, for lego) | audio acestep |
 | `NS_ACE_DCW` | the turbo's: 1, the base's: 0 | the wavelet-domain correction of each step (DCW; as the reference: on for turbo) (--opt-dcw) | audio acestep |
 | `NS_ACE_DECODE_CHUNK` | by the card | the VAE decode's window in latent frames, 128-512 (the reference's for the card's free memory: 256 from 12 GB, 128 below) (--opt-decode-chunk) | audio acestep |

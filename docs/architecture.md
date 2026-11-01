@@ -489,6 +489,12 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   voice). No clone from a recording, design or instructions: the open weights have no audio encoder; saved voices are
   enrolled by `nextsycl audio voice enroll` (PyTorch XPU, `reference/voxtraltts/enroll.py`: experimental).
 
+- **YuE2** (`audio/yue2`; [ports/yue2.md](ports/yue2.md)): an AR-NAR Mixture-of-Transformers (28 layers of 2048) writing a
+  score and semantic codes, then flow-matched latents, YuE2-Vae's 48 kHz stereo, SheetSage2 for a recording's score. Its
+  kernels (`kernels/audio/yue2`): the Q8_0 decode product, the attention's inputs from a host rotary table, the decode's
+  attention, the flow's fixed-order heads; the flow's attention is the shared flash kernel, the VAE MiniMax Music's
+  convolutions and ACE-Step's snake. Its silo repacks the Q8_0 matrices (decode 3x, the same samples). Checked against upstream's dumps on the B65.
+
 ## The 3D engines
 
 - **hunyuan3d** - Hunyuan3D (Tencent) from its own files: 2mini-turbo (Tencent's DiT safetensors with its

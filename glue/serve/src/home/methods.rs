@@ -139,6 +139,17 @@ pub enum RepaintMode {
     Aggressive,
 }
 
+/// YuE2's plan before the music: full (a melody and chords score) | melody (a melody alone) | off (none)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Rpc)]
+pub enum SongCot {
+    #[serde(rename = "full")]
+    Full,
+    #[serde(rename = "melody")]
+    Melody,
+    #[serde(rename = "off")]
+    Off,
+}
+
 /// ACE-Step 1.5's task: text2music | cover | repaint | edit | lego
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Rpc)]
 pub enum AudioTask {
@@ -1214,6 +1225,14 @@ pub struct AudioGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]
     pub max_willing_to_wait_s: Option<f64>,
+    /// yue2-3b-q8: a score (ABC text) to sing over instead of one drawn (cot melody or full) - a cover's melody, or the
+    /// score an earlier song came back with (its score) to sing it again with new words: the same seed and style keep the melody
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 200000)]
+    pub abc: Option<String>,
+    /// yue2-3b-q8: what it writes before the music - full (a melody and chords score; default), melody (a melody alone: covers), off (none; the codes guided 1.01 by default)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cot: Option<SongCot>,
     /// acestep-1.5, a task on a recording: the recording (WAV, MP3, FLAC, Ogg, M4A as base64 or a data: URL, or upload:<name> from audio.upload); the song is as long as it (repaint: to repaint_end)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
@@ -2265,7 +2284,7 @@ pub struct VideoGenerateReq {
     pub project: Option<String>,
     /// read as written - tokenized whole, no template, no sections parsed. H3 was trained on three fields in a fixed order: integrated_multimodal_description (shots, actions, camera, dialogue), overall_soundscape, non_diegetic_music; video.describePromptGuideMD has the form and its rules
     pub prompt: String,
-    /// queue the clip when the studio is busy (false: 409 busy)
+    /// queue the clip when it cannot start now, the default (false: 409 busy instead)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(default = false)]
     pub queue: Option<bool>,
@@ -2351,6 +2370,15 @@ pub struct VideoGenerateReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct VideoStatusReq {
+    /// one clip's status: its label. The top-level fields are then its own (running, lately ended, queued, or its record); none named: the first running clip, every one in running_clips
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// one clip's status: its name (h3_...)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// one clip's status: its reentrant_id
+    #[serde(rename = "reentrant_id", default, skip_serializing_if = "Option::is_none")]
+    pub reentrant_id: Option<String>,
     /// what else the caller sent: passed on as it came
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,
@@ -2376,9 +2404,15 @@ pub struct VideoWaitReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct VideoCancelReq {
-    /// a clip's label (none: the running clip)
+    /// a clip's label; running ones stopped, queued ones dropped (none of these three: the running clip, refused as ambiguous when two run)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// a clip's name (h3_...), as video.status's running_clips say
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// a clip's reentrant_id
+    #[serde(rename = "reentrant_id", default, skip_serializing_if = "Option::is_none")]
+    pub reentrant_id: Option<String>,
     /// what else the caller sent: passed on as it came
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,
@@ -2583,7 +2617,7 @@ fn system_state(h: &Arc<Home>, req: SystemStateReq) -> Answer {
     h.legacy("system.state", req)
 }
 
-/// Is anything working: a clip made or waiting to run, a picture, sound or chat answered, a model loading. video.accepts says whether video.generate starts a clip at once (else 409 busy without queue: true)
+/// Is anything working: a clip made or waiting to run, a picture, sound or chat answered, a model loading. video.accepts says whether one more clip can start now (else 409 busy without queue: true), video.slots how many clips are possible at once now, video.clips each one being made
 #[rpc(name = "system.busy", tags = "system", example = r#"{}"#)]
 fn system_busy(h: &Arc<Home>, req: SystemBusyReq) -> Answer {
     h.legacy("system.busy", req)
@@ -2877,7 +2911,7 @@ fn image_describe_prompt_guide_md(h: &Arc<Home>, req: ImageDescribePromptGuideMd
     h.legacy("image.describePromptGuideMD", req)
 }
 
-/// A song from a description and lyrics, or from a recording (acestep-1.5: a cover, a repaint or an extension, new words over it); the model loads first if it must; the answer links the WAV
+/// A song from a description and lyrics, or from a recording (acestep-1.5: a cover, a repaint or an extension, new words over it; yue2-3b-q8: a cover - the recording's score sung anew); the model loads first if it must; the answer links the WAV (yue2-3b-q8: and the score it sang over, nextsycl.score)
 #[rpc(name = "audio.generate", tags = "audio", example = r#"{"input": "[verse]\nRiver runs slow tonight\n[chorus]\nCarry me home", "instructions": "warm acoustic folk, 90 BPM, a soft male voice", "model": "minimax-music3", "seconds": 60}"#)]
 fn audio_generate(h: &Arc<Home>, req: AudioGenerateReq) -> Answer {
     h.legacy("audio.generate", req)
@@ -3087,13 +3121,13 @@ fn model3d_describe_prompt_guide_md(h: &Arc<Home>, req: Model3dDescribePromptGui
     h.legacy("model3d.describePromptGuideMD", req)
 }
 
-/// Make a clip: it starts at once when the studio is idle (queued: false, the job), else it is queued with queue: true (queued: true, its position) or refused with 409 busy. Anchors (first_frame, last_frame, exposure_ref, first_audio, guide_clip, source) take prev, prev_cam, first, first_cam - clips of the label's series, see label - or a file in the clips directory (video.upload, or a finished clip's name)
+/// Make a clip: it starts at once when a card is free (one clip per usable card; queued: false, the job), else it is queued and starts on whichever card frees first (queued: true, its position); only queue: false answers 409 busy. A clip that needs another's output (an anchor of its series, or a running clip's files) waits for it even with a card free, and answers dependency_failed if that clip failed or was cancelled. A re-submit naming a clip by reentrant_id (running, queued or made), or the same prompt and seed under the label of a clip running or queued now, is that clip (reentered: true), past any max_willing_to_wait_s; a finished clip's label does not count, so a new clip may reuse it. Anchors (first_frame, last_frame, exposure_ref, first_audio, guide_clip, source) take prev, prev_cam, first, first_cam - clips of the label's series, see label - or a file in the clips directory (video.upload, or a finished clip's name)
 #[rpc(name = "video.generate", tags = "video", example = r#"{"label": "Fox 01/03: snow", "prompt": "integrated_multimodal_description: [Shot 1] Live-action, a red fox trots through deep snow at dawn.\n\noverall_soundscape: soft wind, crunching snow.\n\nnon_diegetic_music: None.", "queue": true, "seconds": 5, "steps": 8}"#)]
 fn video_generate(h: &Arc<Home>, req: VideoGenerateReq) -> Answer {
     h.legacy("video.generate", req)
 }
 
-/// The clip running or last: stage, percent, ETA, timings, a preview picture of the shot while it samples (preview), the queue, version
+/// The clip running or last: stage, percent, ETA, timings, a preview picture of the shot while it samples (preview), the queue, version. Every clip being made is in running_clips, the top-level fields describe the first; label, name or reentrant_id ask for one clip, and the top-level fields are then its own
 #[rpc(name = "video.status", tags = "video", example = r#"{}"#)]
 fn video_status(h: &Arc<Home>, req: VideoStatusReq) -> Answer {
     h.legacy("video.status", req)
@@ -3105,7 +3139,7 @@ fn video_wait(h: &Arc<Home>, req: VideoWaitReq) -> Answer {
     h.legacy("video.wait", req)
 }
 
-/// Stop the running clip at its next step; with a label, that clip only: stopped if it runs, dropped from the queue if it waits
+/// Stop a running clip at its next step; with a label, name or reentrant_id, that clip only: stopped if it runs, dropped from the queue if it waits. Naming none with two running is refused (ambiguous)
 #[rpc(name = "video.cancel", tags = "video", example = r#"{"label": "Fox 02/03: the den"}"#)]
 fn video_cancel(h: &Arc<Home>, req: VideoCancelReq) -> Answer {
     h.legacy("video.cancel", req)

@@ -315,8 +315,7 @@ impl Home {
                             Ok(r)
                         }
                         // (the limit's fields kept: they are what a caller reads)
-                        _ if j["error"]["code"] == "wait_too_long" => Err((503, super::backplane::tag("wait_too_long",
-                            &json!({"eta": j["error"]["eta"], "max_willing_to_wait_s": j["error"]["max_willing_to_wait_s"], "waited_s": j["error"]["waited_s"]}), &s(&j["error"], "message")))),
+                        _ if j["error"]["code"] == "wait_too_long" => Err((503, backplane_scheduler::rsvp::wait_tag(json!({"eta": j["error"]["eta"], "max_willing_to_wait_s": j["error"]["max_willing_to_wait_s"], "waited_s": j["error"]["waited_s"]}), &s(&j["error"], "message")))),
                         _ => Err((j["error"]["status"].as_u64().unwrap_or(500) as u16, s(&j["error"], "message"))),
                     };
                 }
@@ -483,8 +482,7 @@ impl Home {
                 let model = self.request_model(&method, &j["body"], &self.models());
                 let eta = self.history.eta(&method, &model, &j["body"], true, Some(0.0));
                 let ran = now() - j["started"].as_f64().unwrap_or_else(now);
-                let frac = v["progress"]["fraction"].as_f64().filter(|f| *f > 0.02 && *f < 1.0);
-                let left = frac.map(|f| ran * (1.0 - f) / f).or_else(|| eta["run_s"].as_f64().map(|r| (r - ran).max(0.0)));
+                let left = backplane_scheduler::eta::running_left(&eta, ran, v["progress"]["fraction"].as_f64());
                 v["eta_remaining_s"] = json!(left.map(|x| x.round()));
                 v["eta"] = eta;
             } else {
@@ -675,10 +673,10 @@ impl Home {
             let limit = j["max_willing_to_wait_s"].as_f64().unwrap_or(0.0);
             let waited = now() - j["created"].as_f64().unwrap_or_else(now);
             let eta = self.eta_for(&method, &j["body"], Some(&id));
-            if !(waited > limit || eta["wait_s"].as_f64().is_some_and(|w| waited + w > limit)) {
+            if !backplane_scheduler::eta::late(&eta, limit, waited) {
                 continue;
             }
-            let f = super::backplane::withdrawn(&eta, limit, waited);
+            let f = backplane_scheduler::eta::withdrawn(&eta, limit, waited);
             self.jobs.update(&id, |j| {
                 if j["state"] == "queued" {
                     j["state"] = json!("failed");
@@ -692,18 +690,17 @@ impl Home {
     }
 
     /// The work ahead on the kind's servers (`exclude`: a job's own, only what is ahead of it counts; None: a job ahead
-    /// has no history): the running less what they have run, the waiting, over the servers
-    pub(crate) fn jobs_ahead_s(&self, kind: &str, exclude: Option<&str>, est: &dyn Fn(&Value) -> Option<f64>) -> Option<f64> {
-        let mine = exclude.and_then(|id| self.jobs.get(id)).map(|j| order(&j));
-        let jobs: Vec<Value> = self.jobs.list.lock().unwrap().iter().filter(|j| j["kind"] == kind && Some(s(j, "id").as_str()) != exclude)
-            .filter(|j| j["state"] == "running" || (j["state"] == "queued" && mine.is_none_or(|o| order(j) < o))).cloned().collect();
+    /// has no history): the running less what they have run, the waiting not held, over the servers
+    pub(crate) fn jobs_ahead_s(&self, kind: &str, exclude: Option<&str>, all: &[Value]) -> Option<f64> {
         let paused = self.jobs.paused.lock().unwrap()[kind].clone();
-        let mut sum = 0.0;
-        for j in jobs.iter().filter(|j| j["state"] == "running" || !held(j, &paused)) {
-            let e = est(j)?;
-            sum += if j["state"] == "running" { (e - (now() - j["started"].as_f64().unwrap_or_else(now))).max(0.0) } else { e };
-        }
-        Some(sum / self.slots(kind).len().max(1) as f64)
+        let list: Vec<Value> = self.jobs.list.lock().unwrap().iter().filter(|j| j["kind"] == kind)
+            .filter(|j| j["state"] == "running" || (j["state"] == "queued" && (!held(j, &paused) || j["id"].as_str() == exclude))).cloned().collect();
+        let views: Vec<backplane_scheduler::eta::JobView> = list.iter().map(|j| {
+            let method = s(j, "method");
+            backplane_scheduler::eta::JobView { id: s(j, "id"), kind: s(j, "kind"), model: self.request_model(&method, &j["body"], all), method, body: j["body"].clone(),
+                                                state: s(j, "state"), started: j["started"].as_f64(), order: order(j) }
+        }).collect();
+        backplane_scheduler::eta::ahead_s(&self.history, now(), &views, kind, exclude, self.slots(kind).len())
     }
 
     /// The jobs not ended (system.busy)

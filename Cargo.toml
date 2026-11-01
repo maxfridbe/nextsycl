@@ -5,7 +5,7 @@ resolver = "2"
 # vendor/rpcgen is a copy from vibe-creative-platform (tooling/sync_rpcgen.sh): its lints are that repo's, not ours
 exclude = ["vendor/rpcgen"]
 members = [
-    "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl",
+    "crates/scheduler", "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl",
     "crates/mesh", "crates/remover", "crates/codec12hz",
     "model3d/contract",
     "model3d/example", "model3d/hunyuan3d", "model3d/animateanymesh", "model3d/unirig", "model3d/skintokens", "model3d/rignet", "model3d/trellis2", "model3d/unimate",
@@ -13,7 +13,7 @@ members = [
     "image/contract", "image/example", "image/qwenimage21", "image/unlimitedocr", "image/paddleocrvl", "image/olmocr2", "image/hunyuanimage21", "image/starvector", "image/upscale", "image/mingimage", "image/mossimage",
     "video/contract", "video/example", "video/h3",
     "audio/contract", "audio/example", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2", "audio/vibevoice",
-    "audio/s2pro", "audio/voxtraltts", "audio/whisper", "audio/acestep",
+    "audio/s2pro", "audio/voxtraltts", "audio/whisper", "audio/acestep", "audio/yue2",
     "glue/models", "glue/serve",
     "cli/nextsycl",
 ]
@@ -24,6 +24,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
+backplane-scheduler = { path = "crates/scheduler" }
 nextsycl-sys = { path = "crates/sys" }
 nextsycl-core = { path = "crates/core" }
 nextsycl-gguf = { path = "crates/gguf" }
@@ -69,6 +70,7 @@ nextsycl-audio-s2pro = { path = "audio/s2pro" }
 nextsycl-audio-voxtraltts = { path = "audio/voxtraltts" }
 nextsycl-audio-whisper = { path = "audio/whisper" }
 nextsycl-audio-acestep = { path = "audio/acestep" }
+nextsycl-audio-yue2 = { path = "audio/yue2" }
 nextsycl-model3d = { path = "model3d/contract" }
 nextsycl-model3d-example = { path = "model3d/example" }
 nextsycl-model3d-hunyuan3d = { path = "model3d/hunyuan3d" }

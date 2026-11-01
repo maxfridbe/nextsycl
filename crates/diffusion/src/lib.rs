@@ -14,6 +14,7 @@ pub mod lora;
 pub mod picture;
 pub mod samplers;
 pub mod schedule;
+pub mod torch_rng;
 
 pub use picture::Picture;
 pub use schedule::{sigmas, Schedule};

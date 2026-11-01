@@ -19,10 +19,10 @@ function WorkerCard() {
 
   const [title, sub] = paused
     ? busy
-      ? ["Finishing current clip", "then the worker stops; no new work will start"]
+      ? [(s.running_clips?.length ?? 1) > 1 ? "Finishing the current clips" : "Finishing current clip", "then the worker stops; no new work will start"]
       : ["Paused", `worker stopped${held ? ` \u00b7 ${held} clips waiting` : ""}`]
     : busy
-      ? ["Running", `${s.queue_items.length} queued`]
+      ? ["Running", `${(s.running_clips?.length ?? 1) > 1 ? `${s.running_clips?.length} clips at once · ` : ""}${s.queue_items.length} queued`]
       : ["Idle", s.queue_items.length ? `${s.queue_items.length} queued` : "nothing queued"];
 
   return (

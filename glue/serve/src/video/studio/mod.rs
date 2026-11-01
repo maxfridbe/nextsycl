@@ -4,7 +4,9 @@
 //! and answers its routes the same way (docs/LEGACY-API.md), so the front end, scene files and queue tools work as
 //! they did; the clips themselves are made by the engine (`generate` jobs) instead of a PyTorch container.
 //!
-//! State: the queue and holds (`queue.json`, `paused.json`) and the running job (`job.json`) in the studio's own
+//! Clips run one per usable card (slots.rs): `State.running` holds them, each with its own engine job, progress and record.
+//!
+//! State: the queue and holds (`queue.json`, `paused.json`) and the running clips (`jobs.json`) in the studio's own
 //! directory; each finished clip's record (`<clip>.json`) beside its mp4 in the clips directory.
 
 pub mod http;
@@ -12,6 +14,7 @@ pub mod library;
 pub mod llm;
 pub mod queue;
 pub mod runner;
+pub mod slots;
 pub mod speech;
 
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -92,16 +95,28 @@ pub struct Job {
     pub finished: bool,
     /// the engine's last answer about the job
     pub last: Value,
+    /// the queue item it came from, to run again once if it fails (None: cancelled, or found again after a restart)
+    pub item: Option<Value>,
+    /// the scheduler has looked at how it ended
+    pub settled: bool,
+    /// what status last said of it
+    pub view: Value,
+    /// it failed and goes round once more: its dependents wait for that try
+    pub retrying: bool,
 }
+
+/// How many ended clips are kept to answer for (`video.status {label}`, `ended_clips`)
+pub const MAX_ENDED: usize = 16;
 
 #[derive(Default)]
 pub struct State {
     pub q: Queue,
-    pub job: Option<Job>,
+    /// the clips being made, oldest first
+    pub running: Vec<Job>,
+    /// the latest that ended, oldest first
+    pub ended: Vec<Job>,
     pub last_file: Option<String>,
-    pub current_item: Option<Value>,
     pub fails: u32,
-    pub torn: bool,
 }
 
 #[derive(Default)]
@@ -126,6 +141,13 @@ pub struct Studio {
     pub llm: &'static llm::Llm,
     /// the films being joined and joined since the start (`/api/join`), newest last
     pub joins: Arc<Mutex<Vec<Value>>>,
+    /// where host memory is read when the door has not said (slots.rs)
+    pub meminfo: PathBuf,
+    /// the front door's last word (`GET /video/blocked`): which cards a pin or hold has, host memory. Refreshed by its own
+    /// thread, never under `st`: the door asks this studio while it answers.
+    pub door_word: Mutex<Value>,
+    /// the clips being made, by name: a request may name their files before they exist (the check runs outside `st`)
+    pub running_names: Mutex<Vec<String>>,
 }
 
 pub struct Options {
@@ -141,6 +163,8 @@ pub struct Options {
     pub logs: PathBuf,
     /// nextsycl: the front end's denoiser names and the daemon's model ids (INT8 -> minimax-h3, ...)
     pub engines: Vec<(String, String)>,
+    /// the front door, host:port (None: on its own)
+    pub door: Option<String>,
 }
 
 impl Studio {
@@ -207,11 +231,6 @@ impl Studio {
         }
     }
 
-    /// What a job waits for while a worker has no room: the daemon's state for the first such card
-    pub(super) fn engine_waiting(&self) -> Value {
-        http::call(&Target::Unix(self.socket.clone()), "GET", "/engine/status", None).map_or(Value::Null, |v| waiting_of(&v))
-    }
-
     pub fn has_runnable(&self) -> bool {
         let st = self.st.lock().unwrap();
         self.running(&st) || st.q.items.iter().any(|i| !st.q.held(i))
@@ -220,7 +239,8 @@ impl Studio {
     fn versioned_status(&self) -> Value {
         let mut st = self.st.lock().unwrap();
         let mut v = self.status(&mut st);
-        let sig = json!([v["job"]["name"], v["stage"], v["pct"], v["steps_done"], v["done"], v["error"], v["exited"], st.q.items.len(), st.last_file]);
+        let clips: Vec<Value> = v["running_clips"].as_array().into_iter().flatten().map(|c| json!([c["name"], c["stage"], c["pct"], c["steps_done"], c["waiting_for"]])).collect();
+        let sig = json!([v["job"]["name"], v["stage"], v["pct"], v["steps_done"], v["done"], v["error"], v["exited"], st.q.items.len(), st.last_file, clips, v["slots_free"]]);
         let mut h: u64 = 1469598103934665603;
         for b in sig.to_string().bytes() {
             h = (h ^ b as u64).wrapping_mul(1099511628211);
@@ -275,58 +295,165 @@ impl Studio {
         };
         let mut st = self.st.lock().unwrap();
         let _ = self.status(&mut st); // registers a just-finished clip before anything replaces it
-        // the clip a reentrant_id already names (queued, running or made): that one, not another
-        if let Some(r) = item["reentrant_id"].as_str() {
-            if let Some(mut v) = self.reentered(&st, r) {
-                v["reentered"] = json!(true);
-                v["ignored"] = json!(ignored);
-                return Ok(v);
-            }
+        // the clip it names (`reentered`): that one, not another
+        if let Some(mut v) = self.reentered(&st, &item, p["queue"] == true) {
+            v["reentered"] = json!(true);
+            v["ignored"] = json!(ignored);
+            return Ok(v);
         }
-        // busy: a clip running, or a runnable item waiting (an all-held queue does not block a direct request)
-        let busy = self.running(&st) || st.q.items.iter().any(|i| !st.q.held(i));
-        if busy {
-            if p["queue"] != true {
-                return Err(RpcError::new("busy", "a job is running; pass queue:true to queue it", 409));
+        // what it needs failed or was cancelled: said now, not made from an older clip
+        if let Some(on) = self.failed_dep(&st, &item) {
+            return Err(RpcError::new("dependency_failed", &format!("{on} failed or was cancelled and this clip needs its output: nothing was started; make that clip again first, or name the file to carry on from"), 409));
+        }
+        // a card left over and nothing keeps it back: it starts; else it is queued, on whichever card frees first
+        // (`queue: false`: busy instead. An all-held queue does not block it)
+        let es = self.engine_state();
+        let room = self.room(&st, es.as_ref());
+        let recs: Vec<Value> = st.running.iter().map(|j| j.rec.clone()).collect();
+        let retry_ahead = slots::anchored(&item) && st.ended.iter().any(|j| !j.settled && j.item.is_some() && slots::same_series(&item, &j.rec));
+        // its own project or batch paused: it waits with them, a free card or not
+        let own_hold = st.q.paused_projects.contains(&project_of(&item)) || st.q.paused_batches.contains(&s(&item, "batch"));
+        let why = slots::direct(&item, &st.q, &recs, room.free, &|i| self.has_own(i)).err()
+            .or_else(|| retry_ahead.then(|| "the clip before it failed and goes round again".to_string()))
+            .or_else(|| own_hold.then(|| "its project or batch is paused".to_string()));
+        if let Some(why) = why {
+            if p["queue"] == false {
+                let why = match &room.why {
+                    Some(r) if room.free == 0 => r.clone(),
+                    _ => why,
+                };
+                return Err(RpcError::new("busy", &format!("{why}; leave queue out to queue it"), 409));
             }
             let held = st.q.held(&item);
             let (label, project, batch) = (s(&item, "label"), project_of(&item), s(&item, "batch"));
             let at = st.q.slot(item["priority"].as_i64().unwrap_or(0));
             st.q.items.insert(at, item);
             st.q.save(&self.dir);
-            if st.q.paused {
+            // (the legacy route: asking for the queue resumes it. A call that only found no card leaves a hold alone)
+            if st.q.paused && p["queue"] == true {
                 st.q.paused = false;
                 st.q.save_paused(&self.dir);
             }
             return Ok(with(json!({"queued": true, "position": at + 1, "label": label, "project": project, "batch": batch, "held": held, "reentered": false})));
         }
         self.launch(&mut st, item).map_err(|e| RpcError::new("internal", &e, 503))?;
-        Ok(with(json!({"queued": false, "job": st.job.as_ref().map(|j| j.rec.clone()), "reentered": false})))
+        // what ended before this one is not run again behind it
+        for j in &mut st.ended {
+            j.settled = true;
+        }
+        Ok(with(json!({"queued": false, "job": st.running.last().map(|j| j.rec.clone()), "reentered": false})))
     }
 
-    /// The clip a reentrant_id names: running, queued (or held), or made (its record); a failed one is not kept
-    fn reentered(&self, st: &State, r: &str) -> Option<Value> {
+    /// What keeps a clip from ever running as asked: a predecessor that failed or was cancelled (slots.rs)
+    fn failed_dep(&self, st: &State, item: &Value) -> Option<String> {
+        let ended: Vec<(&Value, bool)> = st.ended.iter().filter(|j| !j.retrying && j.engine_id != 0).map(|j| (&j.rec, j.view["done"] != true)).collect();
+        slots::failed_dependency(item, &ended)
+    }
+
+    /// The clip a request names, if any. By `reentrant_id`: running, queued (or held), or made (its record); a failed one is
+    /// not kept. By label, only when it is the same request - the same prompt and seed, and no other reentrant_id - and the clip
+    /// is running now or (`asked_queue` false: an explicit queue: true wants one more) waiting in the queue. A finished clip's
+    /// label says nothing: a new clip may reuse it, and is new.
+    fn reentered(&self, st: &State, item: &Value, asked_queue: bool) -> Option<Value> {
         let len = |rec: &Value| json!({"frames": rec["frames"].as_u64().unwrap_or_else(|| runner::frames_of(rec["seconds"].as_f64().unwrap_or(10.0))), "seconds": rec["seconds"]});
-        if let Some(j) = st.job.as_ref().filter(|j| !j.finished && j.rec["reentrant_id"] == r) {
-            let mut v = json!({"queued": false, "state": "running", "job": j.rec});
+        let running = |j: &Job| {
+            let mut v = json!({"queued": false, "state": "running", "job": j.rec, "label": j.rec["label"]});
             v["frames"] = len(&j.rec)["frames"].clone();
             v["seconds"] = j.rec["seconds"].clone();
-            return Some(v);
-        }
-        if let Some((i, it)) = st.q.items.iter().enumerate().find(|(_, i)| i["reentrant_id"] == r) {
+            v
+        };
+        let waiting = |i: usize, it: &Value| {
             let held = st.q.held(it);
-            return Some(json!({"queued": true, "state": if held { "held" } else { "queued" }, "position": i + 1, "label": s(it, "label"),
-                               "project": project_of(it), "batch": s(it, "batch"), "held": held, "frames": len(it)["frames"], "seconds": it["seconds"]}));
+            json!({"queued": true, "state": if held { "held" } else { "queued" }, "position": i + 1, "label": s(it, "label"),
+                   "project": project_of(it), "batch": s(it, "batch"), "held": held, "frames": len(it)["frames"], "seconds": it["seconds"]})
+        };
+        let rid = item["reentrant_id"].as_str();
+        if let Some(r) = rid {
+            if let Some(j) = st.running.iter().find(|j| j.rec["reentrant_id"] == r) {
+                return Some(running(j));
+            }
+            if let Some((i, it)) = st.q.items.iter().enumerate().find(|(_, i)| i["reentrant_id"] == r) {
+                return Some(waiting(i, it));
+            }
+            if let Some((stem, side)) = self.sidecars().into_iter().find(|(_, side)| side["job"]["reentrant_id"] == r) {
+                return Some(json!({"queued": false, "state": "done", "name": stem, "file": format!("/out/{stem}.mp4"), "job": side["job"], "label": side["job"]["label"],
+                                   "frames": side["frames"], "seconds": side["job"]["seconds"]}));
+            }
         }
-        let (stem, side) = self.sidecars().into_iter().find(|(_, side)| side["job"]["reentrant_id"] == r)?;
-        Some(json!({"queued": false, "state": "done", "name": stem, "file": format!("/out/{stem}.mp4"), "job": side["job"],
-                    "frames": side["frames"], "seconds": side["job"]["seconds"]}))
+        let label = s(item, "label");
+        if label.is_empty() {
+            return None;
+        }
+        let same = |rec: &Value| s(rec, "label") == label && rec["prompt"] == item["prompt"] && rec["seed"] == item["seed"] && (rid.is_none() || rec["reentrant_id"].is_null());
+        st.running.iter().find(|j| same(&j.rec)).map(running)
+            .or_else(|| st.q.items.iter().enumerate().find(|(_, it)| !asked_queue && same(it)).map(|(i, it)| waiting(i, it)))
+    }
+
+    /// What the door asks before a clip's limit (`POST /rpc/admission`, read-only): is this a clip already here, and if
+    /// not, what must end before it can start. Any error in the request: nothing to say, the generate says it.
+    fn admission(&self, p: &Value) -> Value {
+        let Ok((mut p, _)) = queue::unchain(p) else { return json!({"reentered": false, "gate": "free"}) };
+        // system.eta may ask with the shape only
+        if p.get("prompt").is_none_or(Value::is_null) {
+            p["prompt"] = json!("?");
+        }
+        let Ok(item) = self.build_item(&p) else { return json!({"reentered": false, "gate": "free"}) };
+        let mut st = self.st.lock().unwrap();
+        let _ = self.status(&mut st); // a clip just finished is registered first
+        if let Some(mut v) = self.reentered(&st, &item, p["queue"] == true) {
+            v["reentered"] = json!(true);
+            return v;
+        }
+        let recs: Vec<Value> = st.running.iter().map(|j| j.rec.clone()).collect();
+        let (gate, on) = match slots::gate(&item, &recs, self.has_own(&item)) {
+            slots::Gate::Free => ("free", Vec::new()),
+            slots::Gate::Series(on) => ("series", on),
+            slots::Gate::All(on) => ("all", on),
+        };
+        json!({"reentered": false, "gate": gate, "on": on})
+    }
+
+    /// `status` for one clip, named by `name`, `label` or `reentrant_id`: the top-level fields are its own. Running, then the
+    /// latest that ended, then waiting in the queue, then its record. None named: None.
+    fn clip_status(&self, p: &Value, base: &mut Value) -> Result<bool, RpcError> {
+        let pick = |k: &str| p.get(k).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+        let (name, label, rid) = (pick("name"), pick("label"), queue::reentrant(p));
+        if name.is_none() && label.is_none() && rid.is_none() {
+            return Ok(false);
+        }
+        let hit = |rec: &Value| name.as_deref().map_or(label.as_deref().map_or_else(|| rec["reentrant_id"].as_str() == rid.as_deref(), |l| rec["label"] == l), |n| rec["name"] == n);
+        let st = self.st.lock().unwrap();
+        let live = st.running.iter().find(|j| hit(&j.rec)).or_else(|| st.ended.iter().rev().find(|j| hit(&j.rec))).map(|j| j.view.clone());
+        let found = live.or_else(|| {
+            let (i, it) = st.q.items.iter().enumerate().find(|(_, i)| hit(i))?;
+            let held = st.q.held(it);
+            Some(json!({"idle": false, "job": it, "stage": if held { "held" } else { "queued" }, "pct": 0, "done": false, "error": null, "failure": null, "gpu": null,
+                        "waiting_for": format!("{i} clip(s) ahead in the queue"), "exited": false, "rc": null, "elapsed": 0, "preview": null, "file": null,
+                        "steps_done": 0, "steps_total": it["steps"], "frames": it["frames"], "position": i + 1}))
+        }).or_else(|| {
+            let (stem, side) = self.sidecars().into_iter().filter(|(stem, side)| name.as_deref().map_or_else(|| hit(&side["job"]), |n| stem == n)).max_by(|a, b| a.0.cmp(&b.0))?;
+            Some(json!({"idle": true, "job": side["job"], "stage": "done", "pct": 100, "done": true, "error": null, "failure": null, "gpu": null, "waiting_for": null,
+                        "exited": true, "rc": 0, "eta": 0, "elapsed": side["wall"], "preview": null, "file": format!("/out/{stem}.mp4"), "times": side["times"], "frames": side["frames"]}))
+        });
+        let Some(found) = found else {
+            let what = name.map(|n| format!("name {n:?}")).or(label.map(|l| format!("label {l:?}"))).unwrap_or(format!("reentrant_id {:?}", rid.unwrap_or_default()));
+            return Err(RpcError::not_found(&format!("no clip by {what}: running, queued, lately ended or made")));
+        };
+        for (k, v) in found.as_object().into_iter().flatten() {
+            base[k] = v.clone();
+        }
+        Ok(true)
     }
 
     fn rpc(&self, method: &str, p: &Value) -> Result<Value, RpcError> {
         let ps = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         Ok(match method {
-            "status" => self.versioned_status(),
+            "status" => {
+                let mut v = self.versioned_status();
+                self.clip_status(p, &mut v)?;
+                v
+            }
+            "admission" => self.admission(p),
             "gpu" => self.gpu(),
             "summary" => self.summary(&mut self.st.lock().unwrap()),
             "engines.list" => json!({"engines": self.engines()}),
@@ -366,21 +493,29 @@ impl Studio {
             }
             "cancel" => {
                 let mut st = self.st.lock().unwrap();
-                let label = ps("label");
-                if label.is_empty() {
-                    self.cancel(&mut st).map_err(|e| RpcError::new("not_running", &e, 409))?;
+                let (label, name, rid) = (ps("label"), ps("name"), queue::reentrant(p));
+                if label.is_empty() && name.is_empty() && rid.is_none() {
+                    // the running clip: with two, which one is the caller's to say
+                    match st.running.len() {
+                        0 => return Err(RpcError::new("not_running", "no job is running", 409)),
+                        1 => {}
+                        n => return Err(RpcError::new("ambiguous", &format!("{n} clips are running: name one (label, name or reentrant_id); video.status lists them in running_clips"), 409)),
+                    }
+                    self.cancel(&mut st, &|_| true).map_err(|e| RpcError::new("not_running", &e, 409))?;
                     json!({"stopped": true, "removed": 0})
                 } else {
-                    // one clip by its label: the running one stopped, queued ones dropped
-                    let running = self.running(&st) && st.job.as_ref().is_some_and(|j| s(&j.rec, "label") == label);
-                    if running {
-                        self.cancel(&mut st).map_err(|e| RpcError::new("not_running", &e, 409))?;
+                    // one clip: the running one stopped, queued ones of its label dropped
+                    let hit = |rec: &Value| (!label.is_empty() && s(rec, "label") == label) || (!name.is_empty() && s(rec, "name") == name) || rid.as_deref().is_some_and(|r| rec["reentrant_id"] == r);
+                    let stopped = self.cancel(&mut st, &|j| hit(&j.rec)).map_err(|e| RpcError::new("not_running", &e, 409))?;
+                    let before = st.q.items.len();
+                    st.q.items.retain(|i| !hit(i));
+                    st.q.save(&self.dir);
+                    let removed = before - st.q.items.len();
+                    if stopped == 0 && removed == 0 {
+                        let what = if !name.is_empty() { format!("named {name:?}") } else if !label.is_empty() { format!("labelled {label:?}") } else { format!("with reentrant_id {:?}", rid.unwrap_or_default()) };
+                        return Err(RpcError::not_found(&format!("no running or queued clip {what}")));
                     }
-                    let removed = self.remove(&mut st, &label);
-                    if !running && removed == 0 {
-                        return Err(RpcError::not_found(&format!("no running or queued clip labelled {label:?}")));
-                    }
-                    json!({"stopped": running, "removed": removed, "label": label})
+                    json!({"stopped": stopped > 0, "removed": removed, "label": label})
                 }
             }
             "queue.remove" => {
@@ -477,7 +612,7 @@ impl Studio {
                 return Err(RpcError::param(&format!("{n}: not a clip name (h3_YYYYMMDD_HHMMSS) or an upload (ref_...)")));
             }
             let mut st = self.st.lock().unwrap();
-            if st.job.as_ref().is_some_and(|j| !j.finished && s(&j.rec, "name") == stem) {
+            if st.running.iter().any(|j| s(&j.rec, "name") == stem) {
                 return Err(RpcError::new("busy", &format!("{stem} is being made (video.cancel first)"), 409));
             }
             let pre = format!("{stem}.");
@@ -639,8 +774,8 @@ impl Studio {
             "/api/clip" => {
                 let label = qv("label");
                 let st = self.st.lock().unwrap();
-                let running = st.job.as_ref().filter(|j| !j.finished).map(|j| (j.rec.clone(), "running"));
-                let found = running.into_iter().chain(st.q.items.iter().map(|i| (i.clone(), if st.q.held(i) { "held" } else { "queued" }))).find(|(i, _)| s(i, "label") == label);
+                let running = st.running.iter().map(|j| (j.rec.clone(), "running"));
+                let found = running.chain(st.q.items.iter().map(|i| (i.clone(), if st.q.held(i) { "held" } else { "queued" }))).find(|(i, _)| s(i, "label") == label);
                 match found {
                     Some((mut i, state)) => {
                         i["dialogue"] = json!(queue::dialogue_of(&s(&i, "prompt")));
@@ -764,17 +899,18 @@ pub fn run(o: Options) -> http::Result<()> {
     std::fs::create_dir_all(&o.logs)?;
     let llm: &'static llm::Llm = Box::leak(Box::new(llm::Llm::load(o.llm_modes.clone(), &o.dir, o.logs.clone())));
     let mut st = State { q: Queue::load(&o.dir), ..State::default() };
-    // a job that was running when the studio stopped: follow it again if the engine still knows it
-    if let Some(rec) = runner::recover(&o.dir) {
+    // the clips running when the studio stopped: followed again if the engine still knows them
+    for rec in runner::recover(&o.dir) {
         if let Some(id) = rec["id"].as_str().and_then(|i| i.parse::<u64>().ok()) {
             // a clip already saved is nothing to follow: restored as the current job, with no engine state to show,
             // it read as "waiting for the engine" until the next clip (2026-10-09)
             let saved = o.out.join(format!("{}.json", s(&rec, "name"))).exists();
             if !saved {
-                st.job = Some(Job { energy0: rec["energy0"].as_f64(), rec, engine_id: id, saved, stall: (0, now()), finished: false, last: Value::Null });
+                st.running.push(Job { energy0: rec["energy0"].as_f64(), rec, engine_id: id, saved, stall: (0, now()), finished: false, last: Value::Null, item: None, settled: true, view: Value::Null, retrying: false });
             }
         }
     }
+    let st_names: Vec<String> = st.running.iter().map(|j| s(&j.rec, "name")).collect();
     let studio = Arc::new(Studio {
         out: o.out,
         out_in: o.out_in,
@@ -788,7 +924,18 @@ pub fn run(o: Options) -> http::Result<()> {
         cache: Mutex::new(Cache::default()),
         llm,
         joins: Arc::new(Mutex::new(Vec::new())),
+        meminfo: std::env::var_os("NS_VIDEO_MEMINFO").map_or_else(|| PathBuf::from("/proc/meminfo"), PathBuf::from),
+        door_word: Mutex::new(Value::Null),
+        running_names: Mutex::new(st_names),
     });
+    if let Some(door) = o.door {
+        let me = studio.clone();
+        std::thread::spawn(move || loop {
+            let word = crate::http::call_for(&Target::Tcp(door.clone()), "GET", "/video/blocked", None, 5).unwrap_or(Value::Null);
+            *me.door_word.lock().unwrap() = word;
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        });
+    }
     let listener = TcpListener::bind(&o.listen).map_err(|e| http::Error(format!("cannot listen on {}: {e}", o.listen)))?;
     let _ = queue::ENGINES.set(o.engines.clone());
     eprintln!("nextsycl video studio {} on http://{}/ - clips in {}, engine via {}", crate::VERSION, o.listen, studio.out.display(), studio.socket.display());
@@ -819,6 +966,15 @@ pub(crate) fn waiting_of(status: &Value) -> Value {
     }).unwrap_or(Value::Null)
 }
 
+/// What the clip on card `gpu` waits for; a clip with no card yet: the first slot that waits
+pub(crate) fn waiting_on(status: &Value, gpu: &Value) -> Value {
+    if gpu.is_null() {
+        return waiting_of(status);
+    }
+    let st = status["gpus"].as_array().into_iter().flatten().find(|g| g["gpu"] == *gpu).and_then(|g| g["engine"].as_str()).filter(|e| e.starts_with("waiting for"));
+    st.map_or(Value::Null, |st| json!(format!("GPU {gpu}: {st}")))
+}
+
 #[cfg(test)]
 mod waiting_tests {
     use super::*;
@@ -828,5 +984,8 @@ mod waiting_tests {
         let v = json!({"gpus": [{"gpu": 0, "engine": "loaded"}, {"gpu": 1, "engine": "waiting for the GPU: 1.6 GiB free, 27.5 GiB needed"}]});
         assert_eq!(waiting_of(&v), json!("GPU 1: waiting for the GPU: 1.6 GiB free, 27.5 GiB needed"));
         assert_eq!(waiting_of(&json!({"gpus": [{"gpu": 0, "engine": "unloaded"}]})), Value::Null);
+        // each clip its own card's wait
+        assert_eq!(waiting_on(&v, &json!(0)), Value::Null);
+        assert_eq!(waiting_on(&v, &json!(1)), json!("GPU 1: waiting for the GPU: 1.6 GiB free, 27.5 GiB needed"));
     }
 }

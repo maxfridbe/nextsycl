@@ -66,3 +66,23 @@ name and the kind its folder; a file key is defined once (defining it again the 
 a card names is defined; links are https and pinned, with a size and a SHA-256; a model's guide exists; every
 `{role}` in `env` is one of its files or local parts. An entry registered without a card (`models add`) gets the
 guide of a card of its architecture, else of its kind.
+## Concurrency and coexistence
+
+Optional; a card with neither block is *unmeasured*: one copy, shared with anything that fits. Bad values refuse the whole catalog at load, naming the file
+(`crates/scheduler/src/profile.rs` is the schema). `nextsycl models bench` proposes the blocks; do not write them by guess.
+
+```yaml
+concurrency:
+  max_copies_per_card: 2          # >= 1, default 1
+  recommended_copies: 1           # 1..max, default 1: extra copies start only when requests wait
+  scaling: {"1": 1.0, "2": 1.18}  # total throughput of n copies relative to one (quote the keys)
+  measured: {date: "2026-10-31", card: B70, method: nextsycl models bench, notes: ""}
+coexistence:
+  mode: shared                    # shared | exclusive
+  shared_with: ["kind:audio", "model:whisper-large-v3-turbo"]   # empty: anything that fits
+  exclusive_reason: ""            # required when exclusive
+  peak_extra_gib: 1.5
+```
+
+Recommended is where one more copy still gains at least 25% total; exclusive when co-running fails or either side drops below 50%.
+

@@ -91,7 +91,7 @@ impl Home {
         let gpu = self.enroll_card(&name, &gpus, job)?;
         let steps = b["steps"].as_u64().unwrap_or(STEPS);
         let r = self.enroll_run(&name, gpu, steps, job);
-        self.pending.lock().unwrap().retain(|p| !(p.0 == gpu && p.1 == 0));
+        self.pending.lock().unwrap().retain(|p| !(p.gpu == gpu && p.port == 0));
         let secs = r?;
         let report: Value = lib.enrolled_path(&name, &arch).and_then(|p| std::fs::read(p.with_extension("json")).ok())
             .and_then(|t| serde_json::from_slice(&t).ok()).unwrap_or(Value::Null);
@@ -120,15 +120,15 @@ impl Home {
                 t0 = Instant::now();
                 continue;
             }
-            let cards = self.named_cards(&self.models());
-            let loading = |g: usize| self.pending.lock().unwrap().iter().any(|p| p.0 == g && p.3.is_none());
-            let plan = gpus.iter().copied().filter(|g| !loading(*g)).find_map(|g| self.room_plan(&cards, g, want, "enroll", false).map(|p| (g, p)));
+            let snap = self.snapshot();
+            let loading = |g: usize| self.pending.lock().unwrap().iter().any(|p| p.gpu == g && p.answered.is_none());
+            let plan = gpus.iter().copied().filter(|g| !loading(*g)).find_map(|g| self.room_plan(&snap, g, want, "enroll", false, None).map(|p| (g, p)));
             if let Some((g, plan)) = plan {
                 if self.free(&plan, "enroll", &what).is_ok() && self.wait_room(g, want) {
                     let mut p = self.pending.lock().unwrap();
                     // (a load that started meanwhile on that card: the next try)
-                    if !p.iter().any(|x| x.0 == g && x.3.is_none()) {
-                        p.push((g, 0, ENROLL_MB, None));
+                    if !p.iter().any(|x| x.gpu == g && x.answered.is_none()) {
+                        p.push(super::Pending { gpu: g, port: 0, mb: ENROLL_MB, answered: None, kind: String::new(), model: String::new() });
                         return Ok(g);
                     }
                 }
@@ -137,7 +137,8 @@ impl Home {
             let why = if busy.len() == gpus.len() {
                 format!("a model loading on GPU {}; {what} waits for it", busy.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(", "))
             } else {
-                self.no_room(&cards, gpus, name, want)
+                let who = backplane_scheduler::room::ModelInfo { id: name.to_string(), kind: "enroll".into(), enabled: true, gpus: gpus.to_vec(), profile: Default::default() };
+                self.no_room(&snap, gpus, &who, want)
             };
             self.note(job, "waiting", &why);
             if t0.elapsed() > Duration::from_secs(super::life::JOB_ROOM_WAIT_S) {
