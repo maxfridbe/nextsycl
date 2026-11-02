@@ -5,9 +5,12 @@ by default (`--no-mtp` turns it off).
 
 ## Review another DeepSeek engine: Promethevs (2026-11-02)
 
-- [ ] Read https://github.com/Magnvs7/Promethevs ("deepseek 2017", the user's words: which model version it means is to be
-  checked) for optimizations our DeepSeek engines do not have. Read only: its code is outside code, not to be run on hardac1
-  without the user's word. Not looked at yet.
+Findings: [docs/reviews/promethevs.md](docs/reviews/promethevs.md).
+
+- [x] Read https://github.com/Magnvs7/Promethevs for optimizations our DeepSeek engines do not have (nothing of it run)
+- [ ] Audit a quant token by token against an exact path (first: Q3_K_XL as the stand-in, no download)
+- [ ] MTP drafts' acceptance with greedy decoding (ours 55% sampled, theirs 94.6% greedy)
+- [ ] A low-bit draft head (ours Q8_0 holds 6.7 GB of VRAM)
 
 ## DeepSeek-V4.1 on Unsloth's GGUFs (2026-10-21)
 
