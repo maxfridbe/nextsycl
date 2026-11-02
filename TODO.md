@@ -3,6 +3,12 @@
 Paused 2026-10-06. State: GLM-5.3-Flash (ds4 IQ2 file) on B70 + B65, served as the box's chat mode `glm53`, MTP on
 by default (`--no-mtp` turns it off).
 
+## Review another DeepSeek engine: Promethevs (2026-11-02)
+
+- [ ] Read https://github.com/Magnvs7/Promethevs ("deepseek 2017", the user's words: which model version it means is to be
+  checked) for optimizations our DeepSeek engines do not have. Read only: its code is outside code, not to be run on hardac1
+  without the user's word. Not looked at yet.
+
 ## DeepSeek-V4.1 on Unsloth's GGUFs (2026-10-21)
 
 Why: V4.1 on the VQ file (~1.6 bit experts) degrades past ~2K generated tokens (a story's unique-word ratio 0.6 -> 0.2,
