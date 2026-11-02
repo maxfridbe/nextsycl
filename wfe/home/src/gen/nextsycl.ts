@@ -397,6 +397,8 @@ export interface AudioTranscribeReq {
    * @default true
    */
   words?: boolean | null;
+  /** also answer `spoken`: the stretches with words in them, a pause between words of this many seconds or more ending one (a sung song's instrumental parts fall between them); none: not worked out */
+  gap_s?: number | null;
   /** other keys */
   [key: string]: unknown;
 }
@@ -544,6 +546,9 @@ export type ChainMode = "video" | "png" | "latent" | "none";
 
 /** A file's kind (where it lives): image | audio | video | model3d */
 export type FileKind = "image" | "audio" | "video" | "model3d";
+
+/** H3's pace: standard (the options as named) | pika-flex (the model's six-step mode in one word) */
+export type H3Speed = "standard" | "pika-flex";
 
 /** What image.cancel takes. */
 export interface ImageCancelReq {
@@ -1941,6 +1946,8 @@ export interface VideoGenerateReq {
   schedule?: string | null;
   /** a distilled model's own noise levels, as timesteps of 1000 falling to 0 (Pika H3 Flex: "1000,750,500,250,100,40,0" with sampler lcm); the run takes one step between two */
   knots?: string | null;
+  /** H3: `pika-flex` is the model's six-step mode in one word (the Pika H3 Flex adapter, the lcm sampler on its knots, six steps; the adapter must be pulled: nextsycl models pull pika-h3-flex-fl2va); standard: as the other options say */
+  speed?: H3Speed | null;
   /**
    * length; snapped up to the model's frame grid (17k + 5 frames at 24 fps: 4 s -> 107 frames); the model is trained on 5.2-15.1 s. The answer's frames and seconds say what is made
    * @minimum 1

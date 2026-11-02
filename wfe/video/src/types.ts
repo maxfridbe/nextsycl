@@ -15,7 +15,12 @@ export type ChainMode = "png" | "video" | "latent" | "none";
 export type Engine = string;
 export type ClipState = "done" | "running" | "queued" | "held";
 
+/** H3's pace: standard (the options as named) | pika-flex (the model's six-step mode in one word) */
+export type H3Speed = "standard" | "pika-flex";
+
 export interface GenerateRequest {
+  knots?: string | null;
+  speed?: H3Speed | null;
   prompt: string;
   seconds?: number;
   steps?: number;

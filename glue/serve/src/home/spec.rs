@@ -80,6 +80,7 @@ fn transcript() -> String {
   "language": {{"type": "string", "description": "the language written down (a code: en), detected or as asked"}}, "duration": {{"type": "number", "description": "seconds of recording"}},
   "segments": {{"type": "array", "items": {timed}, "description": "stretches timed by the model's timestamp tokens"}},
   "words": {{"type": "array", "items": {timed}, "description": "each word timed by the alignment heads' attention (empty with words: false)"}},
+  "spoken": {{"type": "array", "items": {{"type": "object", "properties": {{"start": {{"type": "number"}}, "end": {{"type": "number"}}}}}}, "description": "with gap_s: the stretches that have words in them, seconds from the recording's start; what lies between them is silent or instrumental"}},
   "created": {{"type": "integer"}}, "run": {{"type": "object", "properties": {{"took": {{"type": "number"}}, "wh": {{"type": "number", "nullable": true}}, "seconds": {{"type": "number"}}}}}}}}}}"#)
 }
 

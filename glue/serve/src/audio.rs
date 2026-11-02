@@ -491,8 +491,12 @@ impl AudioServer {
                 o
             }).collect()
         };
-        Ok(json!({"model": self.model, "text": t.text, "language": t.language, "duration": r(t.duration), "segments": timed(&t.segments), "words": timed(&t.words),
-                  "created": now(), "nextsycl": {"took": took, "wh": wh, "seconds": r(t.duration)}}))
+        let mut out = json!({"model": self.model, "text": t.text, "language": t.language, "duration": r(t.duration), "segments": timed(&t.segments), "words": timed(&t.words),
+                             "created": now(), "nextsycl": {"took": took, "wh": wh, "seconds": r(t.duration)}});
+        if let Some(gap) = b["gap_s"].as_f64().filter(|g| *g > 0.0) {
+            out["spoken"] = json!(spoken_spans(&t.words, gap).iter().map(|(a, z)| json!({"start": r(*a), "end": r(*z)})).collect::<Vec<_>>());
+        }
+        Ok(out)
     }
 
     /// Runs a request: (JSON for response_format url or a streamed answer's end, else none) and the WAV's bytes;
@@ -1234,3 +1238,29 @@ mod tests {
     }
 }
 
+
+/// The stretches of a recording that have words in them: consecutive words joined unless `gap` seconds or more of
+/// nothing lie between one's end and the next's start.
+pub fn spoken_spans(words: &[nextsycl_audio::Timed], gap: f64) -> Vec<(f64, f64)> {
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for w in words.iter().filter(|w| w.end > w.start && !w.text.trim().is_empty()) {
+        match out.last_mut() {
+            Some(last) if w.start - last.1 < gap => last.1 = last.1.max(w.end),
+            _ => out.push((w.start, w.end)),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod spoken_tests {
+    use super::*;
+
+    #[test]
+    fn a_long_pause_between_words_ends_a_spoken_stretch() {
+        let w = |a: f64, b: f64, t: &str| nextsycl_audio::Timed { start: a, end: b, text: t.into(), probability: None };
+        let words = [w(11.7, 12.4, "93"), w(12.5, 13.0, "percent"), w(46.0, 46.8, "skin"), w(50.7, 51.2, "again"), w(60.0, 60.0, "x"), w(61.0, 62.0, " ")];
+        assert_eq!(spoken_spans(&words, 3.0), vec![(11.7, 13.0), (46.0, 46.8), (50.7, 51.2)]);
+        assert_eq!(spoken_spans(&words, 5.0), vec![(11.7, 13.0), (46.0, 51.2)]);
+    }
+}

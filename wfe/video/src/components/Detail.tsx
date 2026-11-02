@@ -18,6 +18,7 @@ const settings = (j: Job) => [
   row("&#xf02b;", "label", j.label),
   row("&#xf017;", "seconds", j.seconds),
   row("&#xf1de;", "steps", j.steps),
+  row("&#xf0e4;", "pace", j.speed === "pika-flex" || (j.knots && j.sampler === "lcm") ? "Pika Flex" : "standard"),
   row("&#xf074;", "seed", j.seed),
   row("&#xf19d;", "encoder", j.te),
   row("&#xf085;", "engine", j.engine ?? "Q4_K_M"),

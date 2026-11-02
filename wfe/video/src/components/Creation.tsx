@@ -3,7 +3,7 @@ import { jsx } from "../jsx.js";
 import { rpc } from "../api.js";
 import { load, refresh, render, save, state } from "../state.js";
 import { navigate } from "../router.js";
-import type { Canvas, Engine, GenerateRequest } from "../types.js";
+import type { Canvas, Engine, GenerateRequest, H3Speed } from "../types.js";
 import { CanvasPicker, estimate } from "./CanvasPicker.js";
 import { ClipProgress } from "./Progress.js";
 import { Panel } from "./Panel.js";
@@ -12,6 +12,8 @@ interface Form {
   prompt: string;
   seconds: number;
   steps: number;
+  /** standard (the steps and sampler as named) or pika-flex (six steps in one word: the server adds the adapter) */
+  speed: H3Speed;
   seed: number;
   te: "teacher" | "student";
   label: string;
@@ -46,6 +48,7 @@ export const form: Form = {
     "\n\nnon_diegetic_music: None.",
   seconds: 10,
   steps: 8,
+  speed: "standard",
   seed: 0,
   te: "teacher",
   label: "",
@@ -71,7 +74,7 @@ export const form: Form = {
 /** The settings a reload keeps (canvas, length, steps, engine, ...): the last ones used, in localStorage. References and
  *  controls are left out - they name uploads that may be gone. */
 const KEPT = ["prompt", "seconds", "steps", "seed", "te", "width", "height", "engine", "upscale", "upscaler", "sampler",
-              "schedule"] as const;
+              "schedule", "speed"] as const;
 
 function remember(): void {
   save("h3form", Object.fromEntries(KEPT.map((k) => [k, form[k]])));
@@ -90,6 +93,7 @@ export function useSettings(j: GenerateRequest): void {
   if (j.prompt && j.prompt !== "(recovered)") form.prompt = j.prompt;
   if (j.seconds) form.seconds = j.seconds;
   if (j.steps) form.steps = j.steps;
+  form.speed = j.speed ?? (j.knots && j.sampler === "lcm" ? "pika-flex" : "standard");
   if (j.seed != null) form.seed = j.seed;
   if (j.te) form.te = j.te;
   if (j.width) form.width = j.width;
@@ -134,8 +138,12 @@ async function generate(): Promise<void> {
     chain_mode: "png",
     queue: true,
   };
-  if (form.sampler) body.sampler = form.sampler;
-  if (form.schedule) body.schedule = form.schedule;
+  // Pika Flex sets its own steps, sampler and noise levels: only the word goes
+  if (form.speed === "pika-flex") body.speed = "pika-flex";
+  else {
+    if (form.sampler) body.sampler = form.sampler;
+    if (form.schedule) body.schedule = form.schedule;
+  }
   if (form.refImages.length) body.ref_images = form.refImages;
   if (form.refVideos.length) {
     body.ref_videos = form.refVideos;
@@ -182,8 +190,12 @@ function fitNow() {
   const e = plan?.engines.find((x) => x.ready && x.quant === want);
   if (!plan || !e) return null;
   const canvas = { width: form.width, height: form.height } as Canvas;
-  return { est: estimate(plan, canvas, e, form.seconds, form.steps), cap: plan.cap_gib, margin: plan.margin_gib };
+  return { est: estimate(plan, canvas, e, form.seconds, stepsNow()), cap: plan.cap_gib, margin: plan.margin_gib };
 }
+
+/** The steps the run will take: Pika Flex is six whatever the box says */
+const PIKA_STEPS = 6;
+const stepsNow = (): number => (form.speed === "pika-flex" ? PIKA_STEPS : form.steps);
 
 const num = (
   label: string, key: "seconds" | "steps" | "seed" | "upscale",
@@ -383,7 +395,18 @@ export function Creation() {
       </div>
       <div class="row">
         {num("seconds", "seconds", 1, 15, 0.01)}
-        {num("steps", "steps", 1, 40, 1)}
+        <label attrs={{ title: "standard: the steps and sampler below. Pika Flex: the model's own six-step mode (its adapter, the lcm sampler, six steps)" }}>
+          pace
+          <span class="engbtns">
+            <button type="button" class={{ sel: form.speed === "standard" }}
+              on={{ click: () => { form.speed = "standard"; remember(); render(); } }}>Standard</button>
+            <button type="button" class={{ sel: form.speed === "pika-flex" }}
+              on={{ click: () => { form.speed = "pika-flex"; remember(); render(); } }}>Pika Flex · 6 steps</button>
+          </span>
+        </label>
+        {form.speed === "pika-flex"
+          ? <label>steps<span class="hint">6 (set by Pika Flex)</span></label>
+          : num("steps", "steps", 1, 40, 1)}
         {num("seed", "seed", 0, 2147483647, 1)}
         {num("upscale", "upscale", 1, 4, 0.5)}
         <label attrs={{ title: "ESRGAN: decoded at the sampled size, the frames enlarged by a network on the GPU - about half the decode stage's time (a 5 s clip at 1152x864 on a B65: 19.6 s against 41.9). latent: the latents enlarged, then decoded at the larger size - the decoder's own fine texture." }}>
@@ -395,9 +418,9 @@ export function Creation() {
           </select>
         </label>
         <EffectPicker />
-        {named("sampler", "sampler", state.plan?.samplers, "euler (default)",
+        {form.speed === "pika-flex" ? null : named("sampler", "sampler", state.plan?.samplers, "euler (default)",
           "ComfyUI's samplers on the flow model. euler is the distilled default; ancestral and sde samplers add fresh noise each step; the multistep ones (dpmpp_2m, uni_pc) reuse earlier steps. Some take two or three model calls a step.")}
-        {named("schedule", "schedule", state.plan?.schedules, "shifted (default)",
+        {form.speed === "pika-flex" ? null : named("schedule", "schedule", state.plan?.schedules, "shifted (default)",
           "The sigma schedule. shifted is the model's own; karras and exponential suit noise-prediction models and do poorly here.")}
         <label>
           encoder
@@ -442,14 +465,14 @@ export function Creation() {
         id="canvas"
         icon="&#xf0b2;"
         title="Canvas and length"
-        hint={`${form.width}×${form.height} · ${form.seconds}s · ${form.steps} steps`}
+        hint={`${form.width}×${form.height} · ${form.seconds}s · ${stepsNow()} steps`}
       >
         <CanvasPicker
           width={form.width}
           height={form.height}
           engine={readyEngine()}
           seconds={form.seconds}
-          steps={form.steps}
+          steps={stepsNow()}
           onPick={(w, h, e, sec) => {
             form.width = w;
             form.height = h;

@@ -211,7 +211,7 @@ fn ignored_keys() -> Vec<String> {
 
 pub fn inputs_of(quant: &str) -> Value {
     let common = ["prompt", "title", "seconds", "frames", "steps", "seed", "width", "height", "te", "first_frame", "last_frame", "exposure_ref", "guide_clip",
-                  "first_audio", "first_audio_s", "soundtrack", "soundtrack_start", "exposure_fix", "exposure_offset", "exposure_ease", "exposure_target", "ref_audios", "loras", "upscale", "upscaler", "shift_video", "shift_audio", "sampler", "schedule", "knots", "chain", "source", "regen", "regen_box"];
+                  "first_audio", "first_audio_s", "soundtrack", "soundtrack_start", "exposure_fix", "exposure_offset", "exposure_ease", "exposure_target", "ref_audios", "loras", "upscale", "upscaler", "shift_video", "shift_audio", "sampler", "schedule", "knots", "speed", "chain", "source", "regen", "regen_box"];
     if quant == "REF2VA" {
         json!({"takes": common.iter().chain(["ref_images", "ref_videos", "ref_image_size", "ref_video_sound", "te_pictures"].iter()).collect::<Vec<_>>(),
                "not": ["control_video", "control_mask", "control_source", "control_strength", "control_start", "control_end"],
@@ -410,6 +410,22 @@ impl Studio {
         }
         let loras: Vec<String> = p.get("loras").and_then(|v| v.as_array()).map(|a| a.iter().map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string()).chars().take(200).collect()).collect()).unwrap_or_default();
         it.insert("loras".into(), json!(loras));
+        // speed: the model's own six-step mode (Pika H3 Flex): its adapter, the lcm sampler on its knots and six steps, whatever
+        // sampler, knots, steps or other LoRAs were also named (those stay beside it)
+        match p.get("speed").and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()) {
+            None | Some("standard") => {}
+            Some("pika-flex") => {
+                let paths: Vec<String> = self.engines().iter().filter_map(|e| e["path"].as_str().map(str::to_string)).collect();
+                let adapter = pika_flex_lora(&paths).ok_or_else(|| RpcError::param("speed pika-flex: the Pika H3 Flex adapter is not on this box (nextsycl models pull pika-h3-flex-fl2va)"))?;
+                it.insert("sampler".into(), json!("lcm"));
+                it.insert("knots".into(), json!(PIKA_FLEX_KNOTS));
+                it.insert("steps".into(), json!(6));
+                let mut ls = vec![format!("{adapter}:1.0")];
+                ls.extend(loras);
+                it.insert("loras".into(), json!(ls));
+            }
+            Some(v) => return Err(RpcError::param(&format!("speed {v}? (standard, pika-flex)"))),
+        }
         // a first frame that is not an anchor word is a file in out/
         let ff = p.get("first_frame").and_then(|v| v.as_str()).unwrap_or("");
         let ff = if ff.is_empty() {
@@ -578,8 +594,34 @@ impl Queue {
     }
 }
 
+/// The six-step mode of MiniMax H3 (Pika H3 Flex): the adapter (model-cards/lora/pika-h3-flex-fl2va.yml) and the noise
+/// levels it was post-trained on
+const PIKA_FLEX_LORA_FILE: &str = "pika_h3_flex_fl2va_comfy_bf16.safetensors";
+const PIKA_FLEX_KNOTS: &str = "1000,750,500,250,100,40,0";
+
+/// Where the adapter is on this box: in the `loras` folder next to the denoisers' `diffusion_models`
+fn pika_flex_lora(denoisers: &[String]) -> Option<String> {
+    denoisers.iter().find_map(|p| {
+        let f = std::path::Path::new(p).parent()?.parent()?.join("loras").join(PIKA_FLEX_LORA_FILE);
+        f.is_file().then(|| f.display().to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_pika_flex_adapter_is_found_beside_the_denoisers() {
+        let root = std::env::temp_dir().join(format!("ns-pika-flex-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("diffusion_models")).unwrap();
+        std::fs::create_dir_all(root.join("loras")).unwrap();
+        let denoiser = root.join("diffusion_models/h3.gguf").display().to_string();
+        assert_eq!(super::pika_flex_lora(std::slice::from_ref(&denoiser)), None);
+        let file = root.join("loras").join(super::PIKA_FLEX_LORA_FILE);
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(super::pika_flex_lora(&["/nowhere/a/b.gguf".into(), denoiser]), Some(file.display().to_string()));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     use super::*;
 
     #[test]

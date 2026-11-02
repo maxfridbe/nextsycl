@@ -17,6 +17,8 @@ export type ErrorCode =
 /** "prev" = previous clip of this series, "first" = the series hub, "*_cam" = same camera only. */
 export type Anchor = "prev" | "prev_cam" | "first" | "first_cam" | (string & {});
 export type ChainMode = "png" | "video" | "latent" | "none";
+/** H3's pace: standard (the options as named) | pika-flex (the model's six-step mode in one word) */
+export type H3Speed = "standard" | "pika-flex";
 /** engines.list's quant: INT8 (default; Q8_0 is read as it), Q6_K, Q4_K_M, REF2VA (chosen by itself for ref_images / ref_videos) */
 export type Engine = "INT8" | "Q6_K" | "Q4_K_M" | "REF2VA" | (string & {});
 export type ClipState = "done" | "running" | "queued" | "held";
@@ -61,6 +63,8 @@ export interface GenerateRequest {
   control_video?: string; control_mask?: string; control_source?: string;
   control_strength?: number; control_start?: number; control_end?: number;
   sampler?: string; schedule?: string; knots?: string;
+  /** H3: `pika-flex` is the model's six-step mode in one word (the Pika H3 Flex adapter, the lcm sampler on its knots, six steps; the adapter must be pulled: nextsycl models pull pika-h3-flex-fl2va); standard or none: the options as named */
+  speed?: H3Speed | null;
 }
 
 export interface Chain {

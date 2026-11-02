@@ -191,6 +191,15 @@ pub enum ChainMode {
     None,
 }
 
+/// H3's pace: standard (the options as named) | pika-flex (the model's six-step mode in one word)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Rpc)]
+pub enum H3Speed {
+    #[serde(rename = "standard")]
+    Standard,
+    #[serde(rename = "pika-flex")]
+    PikaFlex,
+}
+
 /// A reference picture's size: match | max
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Rpc)]
 pub enum RefImageSize {
@@ -1515,6 +1524,9 @@ pub struct AudioTranscribeReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(default = true)]
     pub words: Option<bool>,
+    /// also answer `spoken`: the stretches with words in them, a pause between words of this many seconds or more ending one (a sung song's instrumental parts fall between them); none: not worked out
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_s: Option<f64>,
     /// what else the caller sent: passed on as it came
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,
@@ -2373,6 +2385,9 @@ pub struct VideoGenerateReq {
     /// a distilled model's own noise levels, as timesteps of 1000 falling to 0 (Pika H3 Flex: "1000,750,500,250,100,40,0" with sampler lcm); the run takes one step between two
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knots: Option<String>,
+    /// H3: `pika-flex` is the model's six-step mode in one word (the Pika H3 Flex adapter, the lcm sampler on its knots, six steps; the adapter must be pulled: nextsycl models pull pika-h3-flex-fl2va); standard: as the other options say
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<H3Speed>,
     /// length; snapped up to the model's frame grid (17k + 5 frames at 24 fps: 4 s -> 107 frames); the model is trained on 5.2-15.1 s. The answer's frames and seconds say what is made
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 1, max = 15.1, default = 10)]
