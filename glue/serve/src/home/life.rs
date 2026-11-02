@@ -577,32 +577,19 @@ impl Home {
         }).collect()
     }
 
-    /// Each card's vouched memory: the enabled models on it (chat models count once - the largest, or the loaded one:
-    /// one runs at a time), and whether that passes the card
+    /// Each card's vouched memory: the enabled models on it, counted by `vouched_rows`, and whether that passes the card
     pub(crate) fn vouch(&self, cards: &mut Value, models: &[Value]) {
         for c in cards.as_array_mut().into_iter().flatten() {
             let gi = c["index"].as_u64().unwrap_or(0).to_string();
             let total = c["vram_total_mb"].as_u64().unwrap_or(0);
             let on: Vec<&Value> = models.iter().filter(|m| m["enabled"] == true && m["vouch_mb"].get(&gi).is_some()).collect();
-            let mb = |m: &Value| m["vouch_mb"][&gi].as_u64().unwrap_or(0);
-            let hr = |m: &Value| m["headroom_mb"][&gi].as_u64().unwrap_or(0);
-            // chat models and video engines count once a card: one of each runs there at a time (the loaded one, else
-            // the largest)
-            let mut list: Vec<Value> = on.iter().filter(|m| !matches!(m["kind"].as_str(), Some("llm" | "video")))
-                .map(|m| json!({"model": m["id"], "kind": m["kind"], "mb": mb(m), "headroom_mb": hr(m), "headroom_given": m["headroom_given"],
-                                "measured": m["measured"], "state": m["state"]})).collect();
-            for kind in ["llm", "video"] {
-                let group: Vec<&&Value> = on.iter().filter(|m| m["kind"] == kind).collect();
-                if let Some(c) = group.iter().find(|m| m["state"] == "loaded").or_else(|| group.iter().max_by_key(|m| mb(m))) {
-                    list.push(json!({"model": c["id"], "kind": kind, "mb": mb(c), "headroom_mb": hr(c), "headroom_given": c["headroom_given"],
-                                     "measured": c["measured"], "state": c["state"], "of": group.len()}));
-                }
-            }
-            let sum: u64 = list.iter().map(|v| v["mb"].as_u64().unwrap_or(0)).sum();
+            let list = vouched_rows(&on, &gi);
+            let counted = || list.iter().filter(|v| v["counted"] == true);
+            let sum: u64 = counted().map(|v| v["mb"].as_u64().unwrap_or(0)).sum();
             c["vouched"] = json!(list);
             c["vouched_mb"] = json!(sum);
             // of it, the models' headroom (their working memory beyond the weights)
-            c["vouched_headroom_mb"] = json!(list.iter().map(|v| v["headroom_mb"].as_u64().unwrap_or(0)).sum::<u64>());
+            c["vouched_headroom_mb"] = json!(counted().map(|v| v["headroom_mb"].as_u64().unwrap_or(0)).sum::<u64>());
             c["overbooked"] = json!(sum > total);
         }
     }
@@ -1348,8 +1335,41 @@ impl Host for Sched<'_> {
     }
 }
 
+/// A card's rows, every enabled model allowed on it. Chat models and video engines count once a card: one of each runs
+/// there at a time (the loaded one, else the largest); the others are listed as alternatives, `counted: false`.
+fn vouched_rows(on: &[&Value], gi: &str) -> Vec<Value> {
+    let mb = |m: &Value| m["vouch_mb"][gi].as_u64().unwrap_or(0);
+    let row = |m: &Value, counted: bool| json!({"model": m["id"], "kind": m["kind"], "mb": mb(m), "headroom_mb": m["headroom_mb"][gi].as_u64().unwrap_or(0),
+                                                "headroom_given": m["headroom_given"], "measured": m["measured"], "state": m["state"], "counted": counted});
+    let mut list: Vec<Value> = on.iter().filter(|m| !matches!(m["kind"].as_str(), Some("llm" | "video"))).map(|m| row(m, true)).collect();
+    for kind in ["llm", "video"] {
+        let group: Vec<&Value> = on.iter().filter(|m| m["kind"] == kind).copied().collect();
+        let Some(chosen) = group.iter().find(|m| m["state"] == "loaded").or_else(|| group.iter().max_by_key(|m| mb(m))) else { continue };
+        let mut r = row(chosen, true);
+        r["of"] = json!(group.len());
+        list.push(r);
+        list.extend(group.iter().filter(|m| m["id"] != chosen["id"]).map(|m| row(m, false)));
+    }
+    list
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_engine_on_a_card_is_listed_and_one_of_a_group_counted() {
+        let m = |id: &str, kind: &str, mb: u64, state: &str| json!({"id": id, "kind": kind, "vouch_mb": {"0": mb}, "headroom_mb": {"0": 0}, "state": state});
+        let (a, b, c, d) = (m("h3", "video", 10, "unloaded"), m("other", "video", 9, "unloaded"), m("voice", "audio", 2, "unloaded"), m("chat", "llm", 5, "unloaded"));
+        let rows = super::vouched_rows(&[&a, &b, &c, &d], "0");
+        let counted = |id: &str| rows.iter().find(|r| r["model"] == id).unwrap()["counted"].clone();
+        assert_eq!(rows.len(), 4);
+        assert_eq!((counted("h3"), counted("other"), counted("voice"), counted("chat")), (json!(true), json!(false), json!(true), json!(true)));
+        // the loaded one counts, not the largest
+        let b = m("other", "video", 9, "loaded");
+        let rows = super::vouched_rows(&[&a, &b], "0");
+        assert_eq!(rows.iter().filter(|r| r["counted"] == true).map(|r| r["model"].clone()).collect::<Vec<_>>(), vec![json!("other")]);
+        assert_eq!(rows.len(), 2);
+    }
+
     use super::*;
     use backplane_scheduler::profile::Mode;
     use backplane_scheduler::room::Free;

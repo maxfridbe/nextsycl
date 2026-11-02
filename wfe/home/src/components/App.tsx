@@ -57,7 +57,7 @@ function CardView(c: Card) {
       </div>
       <div class="meter vouch" attrs={{ title: `${gib(c.vouched_mb)} GiB vouched for by the enabled models` }}>
         {/* each model's weights, then its headroom: the same color, the stripes the other way */}
-        {c.vouched.map((v) => {
+        {c.vouched.filter((v) => v.counted).map((v) => {
           const h = Math.min(v.headroom_mb ?? 0, v.mb);
           const live = ["loaded", "busy"].includes(v.state);
           const seg = (mb: number, rev: boolean) => mb > 0
@@ -93,7 +93,9 @@ function CardView(c: Card) {
         {c.vouched.filter((v) => !["loaded", "busy"].includes(v.state)).map((v) => (
           <li class="dim">
             <span class="sw hatch" style={{ "--c": color(v.kind) } as Record<string, string>} />
-            <span class="what">{v.model}{v.of && v.of > 1 ? <span class="hint"> (one of {v.of} {v.kind === "llm" ? "chat models" : "video engines"}: one runs at a time)</span> : null}
+            <span class="what">{v.model}{v.counted
+                ? (v.of && v.of > 1 ? <span class="hint"> (one of {v.of} {v.kind === "llm" ? "chat models" : "video engines"}: one runs at a time)</span> : null)
+                : <span class="hint"> (one {v.kind === "llm" ? "chat model" : "video engine"} runs at a time; not counted)</span>}
               <span class="hint"> {v.state}{v.measured ? "" : " · estimate"}</span></span>
             <span class="mb">{Alloc(v.mb, v.headroom_mb ?? 0, v.kind, v.headroom_given)}</span>
           </li>
@@ -159,7 +161,7 @@ function ModelRow(m: Model) {
   const btn = (what: string, label: string, cls: string, title: string, extra: Record<string, unknown> = {}) => (
     <button class={cls} attrs={{ disabled: !!p || m.state === "loading", title }}
       on={{ click: () => void act(what, m.id, extra) }}>
-      {spin(what) ? <span class="spin" /> : null}{label}
+      {spin(what) ? <span class="btnspin" /> : null}{label}
     </button>
   );
   const vouch = Object.entries(m.vouch_mb).map(([g, mb], i) =>
@@ -185,7 +187,7 @@ function ModelRow(m: Model) {
             <input attrs={{ type: "radio", name: `en-${m.id}`, disabled: !!p || m.state === "loading" }} props={{ checked: m.enabled }}
               on={{ change: () => { if (!m.enabled) void act("enable", m.id, { gpus: ui.pick[m.id] ?? m.gpus }); } }} /> enabled
           </label>
-          {p && (p.what === "enable" || p.what === "disable") ? <span class="spin" /> : null}
+          {p && (p.what === "enable" || p.what === "disable") ? <span class="btnspin" /> : null}
         </span>
         {GpuPicker(m)}
         {m.enabled
@@ -269,11 +271,11 @@ function AvailableRow(a: Available) {
       <div class="acts">
         {going
           ? <button class="ghost" attrs={{ disabled: !!p, title: "stop it: what was fetched is kept, a download again resumes it" }}
-              on={{ click: () => void act("pull_cancel", a.id) }}>{p ? <span class="spin" /> : null}cancel</button>
+              on={{ click: () => void act("pull_cancel", a.id) }}>{p ? <span class="btnspin" /> : null}cancel</button>
           : <button attrs={{ disabled: !!p || !a.fits || a.runs_here === false,
                              title: a.runs_here === false ? `these cards cannot run it (${a.why_not}); system.models.pull still fetches it`
                                : a.fits ? `download ${size(a.bytes)} into ${a.folder}, check it, and register it (enabled)` : "no models folder has the room (NS_MODEL_DIRS adds folders)" }}
-              on={{ click: () => void act("pull", a.id) }}>{p ? <span class="spin" /> : <span class="i" props={{ innerHTML: "&#xf019;" }} />} {failed ? "retry" : "download"}</button>}
+              on={{ click: () => void act("pull", a.id) }}>{p ? <span class="btnspin" /> : <span class="i" props={{ innerHTML: "&#xf019;" }} />} {failed ? "retry" : "download"}</button>}
       </div>
     </div>
   );

@@ -56,7 +56,7 @@ export function ConfigView() {
                   ? [<span>to take effect, restart: </span>,
                      ...saved.restart.filter((r) => r !== "cli").map((r) => (
                        <button class="small" attrs={{ disabled: !!ui.restarting[r] }} on={{ click: () => void restartService(r) }}>
-                         {ui.restarting[r] ? <span class="spin" /> : null}{READER[r] ?? r}
+                         {ui.restarting[r] ? <span class="btnspin" /> : null}{READER[r] ?? r}
                        </button>
                      ))]
                   : null}

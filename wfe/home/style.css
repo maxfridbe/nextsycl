@@ -62,7 +62,7 @@
  .gpu.on{border-color:#3b82f6;color:#e5e7eb} .gpu input{margin:0} .gpu.fixed{cursor:default;opacity:.75}
  .onoff{display:inline-flex;gap:4px;align-items:center} .onoff label{font-size:11px;border:1px solid #2f3646;border-radius:6px;padding:3px 6px;color:#9ca3af;cursor:pointer;display:inline-flex;gap:4px;align-items:center}
  .onoff label.on{border-color:#3b82f6;color:#e5e7eb} .onoff input{margin:0}
- .spin{display:inline-block;width:11px;height:11px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:sp .8s linear infinite;margin-right:6px;vertical-align:-1px}
+ .btnspin{display:inline-block;width:11px;height:11px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:sp .8s linear infinite;margin-right:6px;vertical-align:-1px}
  @keyframes sp{to{transform:rotate(360deg)}}
  button.small{padding:3px 8px;font-size:12px}
  code{font-family:ui-monospace,monospace;font-size:12px;background:#0c0e13;border:1px solid #222733;border-radius:4px;padding:1px 5px}

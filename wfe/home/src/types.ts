@@ -19,7 +19,7 @@ export interface Proc {
 
 /** a model vouched for on a card: `mb` all of it, `headroom_mb` of that its working memory beyond the weights (KV for
  *  its context, arenas, a song's or an image's activations) - from its model card when given, else from its files */
-export interface Vouched { model: string; kind: string; mb: number; headroom_mb: number; headroom_given: boolean; measured: boolean; state: string; of?: number }
+export interface Vouched { model: string; kind: string; mb: number; headroom_mb: number; headroom_given: boolean; measured: boolean; state: string; of?: number; /** in the card's vouched total; false: another of its group is the one counted (one runs at a time) */ counted: boolean }
 
 export interface Card {
   index: number;

@@ -1184,7 +1184,7 @@ impl Home {
             json!({"gpu": c["index"], "name": c["name"], "bus": c["pci"], "vram_total_mb": total, "vram_used_mb": used, "vram_free_mb": total.saturating_sub(used),
                    "busy_pct": c["busy_pct"], "power_w": c["power_w"], "power_cap_w": c["power_cap_w"], "temp_c": c["temp_pkg"], "temp_vram_c": c["temp_vram"],
                    "models": models, "processes": procs, "vouched_mb": c["vouched_mb"], "overbooked": c["overbooked"],
-                   "enabled_models": c["vouched"].as_array().into_iter().flatten().map(|v| v["model"].clone()).collect::<Vec<_>>()})
+                   "enabled_models": c["vouched"].as_array().into_iter().flatten().filter(|v| v["counted"] == true).map(|v| v["model"].clone()).collect::<Vec<_>>()})
         }).collect();
         json!({"cards": list})
     }

@@ -55,7 +55,7 @@ function DriveRow(d: Drive) {
             : <span class="hint">{d.rate_gb_s != null ? `link ${d.rate_gb_s} GB/s` : "not measured"}</span>}
         </span>
         <button class="ghost small" attrs={{ disabled: d.measuring || !!ui.state?.drives?.measuring, title: "read up to 4 GiB of its largest model files past the page cache (nothing written); not while a model loads from it" }}
-          on={{ click: () => void driveAct({ do: "measure", drive: d.id }) }}>{d.measuring ? <span class="spin" /> : null}{d.measuring ? "measuring" : "measure"}</button>
+          on={{ click: () => void driveAct({ do: "measure", drive: d.id }) }}>{d.measuring ? <span class="btnspin" /> : null}{d.measuring ? "measuring" : "measure"}</button>
       </div>
     </div>
   );
