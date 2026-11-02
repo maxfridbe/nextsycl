@@ -253,9 +253,131 @@ pub fn to_q4k(src: &[u8], n: usize, from: From) -> Vec<u8> {
     out
 }
 
+/// E2M1, doubled: an MXFP4 scale is half its E8M0 value (ggml's kvalues_mxfp4_f)
+const MXFP4_VALUES: [f32; 16] = [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0];
+
+/// 32 values of MXFP4 (17 bytes: an E8M0 scale, the nibbles of value j the low one of byte j, of j + 16 the high)
+fn mxfp4_block(b: &[u8], x: &mut [f32]) {
+    let e = b[0] as u32;
+    let d = f32::from_bits(if e < 2 { 0x0020_0000u32 << e } else { (e - 1) << 23 });
+    for (v, o) in x.iter_mut().enumerate().take(32) {
+        let nib = if v < 16 { b[1 + v] & 0xF } else { b[1 + v - 16] >> 4 };
+        *o = MXFP4_VALUES[nib as usize] * d;
+    }
+}
+
+/// One 256-value block as an 84-byte Q2_K block: ggml's scheme (16 sub-blocks of 16 values, each a scale and a minimum in 4 bits
+/// against the block's largest, 2-bit levels) with this file's quantizer (its error squared, where ggml's Q2_K takes it absolute)
+fn q2k_block(x: &[f32], out: &mut [u8]) {
+    let (mut l, mut laux) = ([0u8; 256], [0u8; 16]);
+    let (mut scales, mut mins, mut weights) = ([0f32; 16], [0f32; 16], [0f32; 16]);
+    for j in 0..16 {
+        let xs = &x[16 * j..16 * j + 16];
+        for i in 0..16 {
+            weights[i] = xs[i].abs();
+        }
+        let (s, m) = make_qkx2_quants(16, 3, xs, &weights, &mut l[16 * j..16 * j + 16], &mut laux, -0.5, 0.1, 15);
+        scales[j] = s;
+        mins[j] = m;
+    }
+    let (max_scale, max_min) = (scales.iter().fold(0f32, |a, v| a.max(*v)), mins.iter().fold(0f32, |a, v| a.max(*v)));
+    let (d, dmin) = (f32_to_f16(max_scale / 15.0), f32_to_f16(max_min / 15.0));
+    let (dd, dm) = (f16_to_f32(d), f16_to_f32(dmin));
+    for j in 0..16 {
+        let ls = if dd > 0.0 { nearest_int(scales[j] / dd).clamp(0, 15) } else { 0 };
+        let lm = if dm > 0.0 { nearest_int(mins[j] / dm).clamp(0, 15) } else { 0 };
+        out[j] = ls as u8 | ((lm as u8) << 4);
+        // the levels again against the stored scales
+        let (sl, ml) = (dd * ls as f32, dm * lm as f32);
+        if sl > 0.0 {
+            for i in 0..16 {
+                l[16 * j + i] = nearest_int((x[16 * j + i] + ml) / sl).clamp(0, 3) as u8;
+            }
+        }
+    }
+    out[16..80].fill(0);
+    for (v, q) in l.iter().enumerate() {
+        let (half, u) = (v >> 7, v & 127);
+        out[16 + half * 32 + (u & 31)] |= q << (2 * (u >> 5));
+    }
+    out[80..82].copy_from_slice(&d.to_le_bytes());
+    out[82..84].copy_from_slice(&dmin.to_le_bytes());
+}
+
+/// MXFP4 -> Q2_K, `n` values (a multiple of 256), on all cores
+pub fn mxfp4_to_q2k(src: &[u8], n: usize) -> Vec<u8> {
+    assert!(n.is_multiple_of(256) && src.len() == n / 32 * 17);
+    let nb = n / 256;
+    let mut out = vec![0u8; nb * 84];
+    let threads = std::thread::available_parallelism().map_or(8, |p| p.get()).min(32);
+    let per = nb.div_ceil(threads).max(1);
+    std::thread::scope(|sc| {
+        for (ti, chunk) in out.chunks_mut(per * 84).enumerate() {
+            sc.spawn(move || {
+                let mut x = [0f32; 256];
+                for (bi, ob) in chunk.chunks_mut(84).enumerate() {
+                    let b = (ti * per + bi) * 8 * 17;
+                    for k in 0..8 {
+                        mxfp4_block(&src[b + k * 17..b + (k + 1) * 17], &mut x[k * 32..(k + 1) * 32]);
+                    }
+                    q2k_block(&x, ob);
+                }
+            });
+        }
+    });
+    out
+}
+
+/// A DSpark drafter file with its MXFP4 experts as Q2_K, everything else as it was: `nextsycl llm requant-draft`
+pub fn draft_file(input: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
+    use nextsycl_gguf::{GType, Gguf, writer::Writer};
+    let f = Gguf::open(input).map_err(|x| x.0)?;
+    let low = |t: &nextsycl_gguf::Tensor| t.ty == GType::MXFP4 && t.name.contains("_exps.");
+    let meta: Vec<(&str, nextsycl_gguf::Value)> = f.metadata.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let dir: Vec<(String, GType, Vec<u64>)> = f.tensors.iter().map(|t| (t.name.clone(), if low(t) { GType::Q2K } else { t.ty }, t.shape.clone())).collect();
+    if !f.tensors.iter().any(low) {
+        return Err("no MXFP4 experts in the file".into());
+    }
+    let mut w = Writer::create(output, &meta, &dir).map_err(|x| x.0)?;
+    for t in &f.tensors {
+        let raw = f.read(t).map_err(|x| x.0)?;
+        if low(t) {
+            w.data(&mxfp4_to_q2k(&raw, t.elements() as usize)).map_err(|x| x.0)?;
+        } else {
+            w.data(&raw).map_err(|x| x.0)?;
+        }
+    }
+    w.finish().map_err(|x| x.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q2k_of_mxfp4_decodes_close_as_the_silo_reads_it() {
+        // an MXFP4 block of known values, through Q2_K, decoded as std.cpp's Deq<T_Q2_K>
+        let mut src = Vec::new();
+        for k in 0..8u8 {
+            src.push(127 + k % 3);
+            src.extend((0..16u8).map(|j| j.wrapping_mul(7).wrapping_add(k)));
+        }
+        let mut x = [0f32; 256];
+        for k in 0..8 {
+            mxfp4_block(&src[k * 17..(k + 1) * 17], &mut x[k * 32..(k + 1) * 32]);
+        }
+        let q = mxfp4_to_q2k(&src, 256);
+        assert_eq!(q.len(), 84);
+        let (d, dmin) = (f16_to_f32(u16::from_le_bytes([q[80], q[81]])), f16_to_f32(u16::from_le_bytes([q[82], q[83]])));
+        let y: Vec<f32> = (0..256usize).map(|v| {
+            let (half, u) = (v >> 7, v & 127);
+            let (jj, sec, l0) = (u >> 5, (u & 31) >> 4, u & 15);
+            let sc = q[half * 8 + jj * 2 + sec] as u32;
+            d * (sc & 15) as f32 * ((q[16 + half * 32 + sec * 16 + l0] >> (2 * jj)) & 3) as f32 - dmin * (sc >> 4) as f32
+        }).collect();
+        let err = (x.iter().zip(&y).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / x.iter().map(|a| a * a).sum::<f32>()).sqrt();
+        assert!(err < 0.5, "relative error {err}");
+    }
 
     /// q4_K blocks dequantized as ggml's dequantize_row_q4_K
     fn deq(b: &[u8]) -> Vec<f32> {

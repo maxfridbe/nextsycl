@@ -50,7 +50,47 @@ pub fn info(f: &Gguf) -> Result<String, String> {
         print!("{out}");
         return Err(format!("{} layout problem(s)", errs.len()));
     }
+    out += &vram_plan(&m);
     Ok(out)
+}
+
+/// A weight's VRAM as loaded: BF16 and F16 are expanded to float32 (Part::load), all else stays in its file's bytes
+fn loaded_bytes(t: &nextsycl_gguf::Tensor) -> u64 {
+    match t.ty {
+        nextsycl_gguf::GType::BF16 | nextsycl_gguf::GType::F16 => t.elements() * 4,
+        _ => t.bytes,
+    }
+}
+
+/// What a 32 GiB card has left for routed experts: total, less the weights, a pass's room, the arena, the sessions' caches and
+/// what stays free; None when the weights and the rest do not fit
+pub fn experts_left(total: u64, dense: u64, others: u64, free: u64) -> Option<u64> {
+    total.checked_sub(dense)?.checked_sub(others)?.checked_sub(free)
+}
+
+/// The VRAM a load of this file would take on the B70 + B65 by the same rules as `Part::load`, with no GPU touched: its weights by
+/// card (24 / 16 layers, the split the compute units give; the head on the last), and the experts' room left at
+/// NS_DS41_FREE_GIB=1.5. An estimate to read before a load: the load itself sizes from what the driver says is free.
+fn vram_plan(m: &Model) -> String {
+    let g = &m.g;
+    let skip = |r: Role| matches!(r, Role::Experts | Role::ExpGate | Role::ExpUp | Role::ExpDown | Role::TokenEmbd | Role::EngramK);
+    let dense = |ls: std::ops::Range<u64>| -> u64 { ls.flat_map(|l| m.roles(l).into_iter().map(move |r| (l, r))).filter(|(_, r)| !skip(*r)).filter_map(|(l, r)| m.tensor(l, r)).map(loaded_bytes).sum() };
+    let cut = g.kv_sources.iter().chain(&g.index_sources).copied().min_by_key(|c| c.abs_diff(g.n_layer * 256 / 416)).unwrap_or(g.n_layer / 2);
+    let head: u64 = [Role::OutputNorm, Role::Output].into_iter().filter_map(|r| m.tensor(0, r)).map(loaded_bytes).sum();
+    let chunk = crate::engine::prefill_chunk() as u64;
+    // Part::load's pass room, big and small arenas and their margin (the sessions' caches at a 128K context: about 2 GiB)
+    let others = (900 << 20) + chunk * (400 << 10) + crate::engine::arena_bytes() as u64 + (512 << 20) + (512 << 20) + (2 << 30);
+    let (total, free) = (32u64 << 30, (3u64 << 30) / 2);
+    let span = m.tensor(0, Role::ExpGate).map_or(0, |t| t.bytes / g.n_expert) + m.tensor(0, Role::ExpUp).map_or(0, |t| t.bytes / g.n_expert) + m.tensor(0, Role::ExpDown).map_or(0, |t| t.bytes / g.n_expert);
+    let mut s = format!("plan     : VRAM on two 32 GiB cards at a chunk of {chunk}, split at layer {cut} (estimate, no GPU read)\n");
+    for (name, w) in [("first", dense(0..cut)), ("last", dense(cut..g.n_layer) + head)] {
+        match experts_left(total, w, others, free) {
+            Some(left) => s += &format!("  {name:<6} card: weights {:.2} GiB, passes and caches {:.2} GiB, 1.50 free, experts {:.2} GiB ({} of layer 0's, {:.1} MiB each)\n", gib(w), gib(others), gib(left),
+                                        left.checked_div(span).unwrap_or(0), span as f64 / 1048576.0),
+            None => s += &format!("  {name:<6} card: weights {:.2} GiB, passes and caches {:.2} GiB: DOES NOT FIT with 1.50 free\n", gib(w), gib(others)),
+        }
+    }
+    s
 }
 
 /// E4M3FN byte -> float
@@ -1259,4 +1299,13 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
         println!("{:<26} [{rows} x {cols}]: expanded rel err {rel:.2e}, 2-column product rel err {yrel:.2e} (first {n} rows)", t.name);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod plan_tests {
+    #[test]
+    fn the_experts_room_is_what_the_rest_leaves() {
+        assert_eq!(super::experts_left(32, 10, 5, 1), Some(16));
+        assert_eq!(super::experts_left(32, 30, 5, 1), None);
+    }
 }

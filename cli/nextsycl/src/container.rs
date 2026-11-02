@@ -109,7 +109,7 @@ pub fn needs_runtime(args: &[String]) -> bool {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     let cmd = if a.first() == Some(&"llm") { &a[1..] } else { &a[..] };
     a.contains(&"--here")
-        || matches!(cmd.first(), Some(&("gpus" | "generate" | "spec-check" | "batch-check" | "kernels" | "check" | "selftest")))
+        || matches!(cmd.first(), Some(&("gpus" | "generate" | "spec-check" | "batch-check" | "audit" | "kernels" | "check" | "selftest")))
         || (cmd.first() == Some(&"serve") && cmd.get(1).is_some_and(|m| Path::new(m).exists()))
         || (matches!(a.first(), Some(&("image" | "video" | "audio" | "model3d" | "3d"))) && matches!(a.get(1), Some(&("selftest" | "check"))))
         // commands that make an answer from a file (a recording, a picture): they need no --here
