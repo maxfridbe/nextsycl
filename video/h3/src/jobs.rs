@@ -835,6 +835,8 @@ pub struct ClipSpec<'a> {
     /// 1000, 750, 500, 250, 100, 40, 0): each goes through the video shift, and the run takes one step between two
     /// (empty: `steps` on `schedule`)
     pub knots: Vec<f32>,
+    /// a refine pass over a draft instead of a clip from noise (see `Refine`)
+    pub refine: Option<Refine<'a>>,
     pub te: TeFiles<'a>,
     pub vaes: Vaes<'a>,
     /// LoRAs and their strengths (they stack)
@@ -907,6 +909,43 @@ pub struct ClipInputs<'a> {
     pub regen: Option<(f64, f64)>,
     /// and only inside this box, in pixels (x0, y0, x1, y1)
     pub regen_box: Option<(usize, usize, usize, usize)>,
+}
+
+/// A refine pass (NVlabs' Open-H3-Regenerate-2K, the refiner LoRA in `lora`): a draft's latents upscaled to this clip's
+/// canvas, a little noise over them, and a few steps from a noise level below 1. The draft's sound is kept.
+pub struct Refine<'a> {
+    /// the draft's `.latents.safetensors`
+    pub from: &'a Path,
+    /// the latent upscaler
+    pub upscaler: &'a Path,
+    /// the noise levels, falling to 0 (NVlabs': 0.909375, 0.857143, 0.666667, 0)
+    pub sigmas: Vec<f32>,
+}
+
+/// The "noise" a sampler that starts at `noise * s0` needs to start at `(1 - s0) * clean + s0 * noise`
+fn refine_noise(noise: &[f32], clean: &[f32], s0: f32) -> Vec<f32> {
+    noise.iter().zip(clean).map(|(n, c)| n + c * (1.0 - s0) / s0).collect()
+}
+
+/// A refine pass's start: the draft's video latents upscaled x2 to `shape`, every video latent generated, its sound kept
+fn refine_inpaint(dev: &Arc<Device>, r: &Refine, shape: Shape, cancel: &AtomicBool, ctl: &mut Ctl) -> Result<denoiser::Inpaint> {
+    let ck = Checkpoint::open(r.from)?;
+    let (ev, ea) = (ck.get("samples.video")?.clone(), ck.get("samples.audio")?.clone());
+    let (t, h, w) = (ev.shape[2], ev.shape[3], ev.shape[4]);
+    if t != shape.t || h * 2 != shape.h || w * 2 != shape.w || ea.shape[3] != shape.audio_t {
+        return Err(Error(format!("{}: a draft of {t} frames {w}x{h} does not double to {} frames {}x{}", r.from.display(), shape.t, shape.w, shape.h)));
+    }
+    let v = crate::dtype::bytes_to_f32(&ck.read("samples.video")?, ev.dtype)?;
+    let source_a = crate::dtype::bytes_to_f32(&ck.read("samples.audio")?, ea.dtype)?;
+    let t0 = Instant::now();
+    let (source_v, _, _) = crate::upscale::Upscaler::load(dev, &Checkpoint::open(r.upscaler)?)?.upscale(&v, t, h, w, 2.0, &mut || {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error("cancelled".into()));
+        }
+        Ok(())
+    })?;
+    ctl.say(format!("refine : draft {w}x{h} -> {}x{} latents in {:.1} s, from sigma {}", shape.w, shape.h, t0.elapsed().as_secs_f64(), r.sigmas[0]));
+    Ok(denoiser::Inpaint { source_v, source_a, mask_v: vec![1.0; shape.t * shape.h * shape.w], mask_a: vec![0.0; shape.audio_t] })
 }
 
 /// The masks of a masked run from the source latents and the stretch / box to regenerate.
@@ -1328,7 +1367,10 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         schedule.shift_video = sv;
         schedule.shift_audio = sa;
     }
-    let inpaint = clip_inpaint(&c.inputs, shape)?;
+    let inpaint = match &c.refine {
+        Some(r) => Some(refine_inpaint(&e.dev, r, shape, ctl.cancel, ctl)?),
+        None => clip_inpaint(&c.inputs, shape)?,
+    };
     // the ControlNet: its hint, and its blocks beside the denoiser's
     let hint = clip_control_hint(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), shape, ctl)?;
     let control = match (&hint, c.inputs.controlnet) {
@@ -1368,7 +1410,9 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     let n_v = 24 * shape.t * shape.h * shape.w;
     let (noise_v, noise_a) = crate::noise::clip_noise(c.seed, n_v, 32 * 2 * shape.audio_t);
     // H3's own schedule (the video shift), or one of ComfyUI's at that shift
-    let sigmas = if c.knots.len() >= 2 {
+    let sigmas = if let Some(r) = &c.refine {
+        r.sigmas.clone()
+    } else if c.knots.len() >= 2 {
         c.knots.iter().map(|k| denoiser::shifted(k / 1000.0, schedule.shift_video)).collect()
     } else if c.schedule == nextsycl_diffusion::Schedule::Shift {
         denoiser::sigmas(c.steps, schedule.shift_video)
@@ -1380,6 +1424,10 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     } else if c.sampler != nextsycl_diffusion::Sampler::Euler || c.schedule != nextsycl_diffusion::Schedule::Shift {
         ctl.say(format!("sampler: {} on the {} schedule ({} levels)", c.sampler.name(), c.schedule.name(), sigmas.len()));
     }
+    let noise_v = match (&c.refine, &inpaint) {
+        (Some(_), Some(p)) => refine_noise(&noise_v, &p.source_v, sigmas[0]),
+        _ => noise_v,
+    };
     ctl.say(format!("tokens : {} in the denoiser", d.tokens()));
     let nblocks = e.model.blocks.len();
     let steps = sigmas.len() - 1;
@@ -1547,6 +1595,14 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     None => nextsycl_diffusion::Schedule::Shift,
                 },
                 knots: s("knots").map(|k| k.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(),
+                refine: match s("refine_from") {
+                    Some(f) => Some(Refine {
+                        from: Path::new(f),
+                        upscaler: Path::new(s("refine_upscaler").ok_or("refine_from needs \"refine_upscaler\": the latent upscaler's file")?),
+                        sigmas: s("refine_sigmas").unwrap_or("0.909375,0.857143,0.666667,0").split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+                    }),
+                    None => None,
+                },
                 te: TeFiles {
                     te: Path::new(s("te").unwrap_or("/models/teacher/qwen3vl_32b_minimax_h3-Q4_K_M.gguf")),
                     tokenizer: Path::new(s("tokenizer").unwrap_or("/app/tokenizer")),
@@ -1650,5 +1706,18 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
             encode_with(&e.dev, e.threads, &pictures, &prompt, &files, s("out").map(Path::new), s("check").map(Path::new), ctl)
         }
         other => Err(Error(format!("unknown job kind {other:?} (known: bench-blocks, check-block, denoise, decode, encode, generate)"))),
+    }
+}
+
+#[cfg(test)]
+mod refine_tests {
+    #[test]
+    fn a_refine_starts_on_the_upscaled_draft_under_its_noise() {
+        let (noise, clean, s0) = ([0.5f32, -1.0], [2.0f32, 4.0], 0.909375f32);
+        let n = super::refine_noise(&noise, &clean, s0);
+        for i in 0..2 {
+            let want = (1.0 - s0) * clean[i] + s0 * noise[i];
+            assert!((n[i] * s0 - want).abs() < 1e-6, "{i}: {} vs {want}", n[i] * s0);
+        }
     }
 }
