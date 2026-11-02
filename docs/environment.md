@@ -663,7 +663,7 @@ engine's settings (NS_PREFETCH, NS_NGRAM, NS_PREFILL_CHUNK, NS_PROFILE, ...).
 | `NS_DS41_GATE_EXPERTS` | none | the margin gate's second GGUF set (its first shard) | llm deepseek41 |
 | `NS_DS41_GATE_SELF` | 0 | 1 (a check): the gate's recomputations read the model's own experts from their store instead of the second set: with the model itself as `NS_DS41_GATE_EXPERTS`, the same rows to the bit as the second-set path | llm deepseek41 |
 | `NS_DS41_GATE_NEAR` | 0 | with `NS_DS41_GATE`: an overturn by less than this many logits keeps the cheap word, unless that word has a digit or an operator (0: off) | llm deepseek41 |
-| `NS_DS41_DRAFTER` | none | the DSpark drafter file (Unsloth's `dspark-*.gguf`) of an Unsloth-form model, with `NS_DS41_MTP=1`; else `dspark-*.gguf` in the model's folder or its parent's | llm deepseek41 |
+| `NS_DS41_DRAFTER` | none | the DSpark drafter file (Unsloth's `dspark-*.gguf`, or `llm requant-draft`'s Q2_K `lowbit-dspark-*.gguf`) of an Unsloth-form model, with `NS_DS41_MTP=1`; else `dspark-*.gguf` in the model's folder or its parent's | llm deepseek41 |
 | `NS_DS41_STD_DIR` | none | `llm kernels` on an Unsloth-form file writes each expert type's raw bytes and its GPU expansion here, and compares with `<tag>.ref.f32` (ggml's own dequantize_row_*) when there | llm deepseek41 |
 | `NS_DS41_SPARE` | 8 | decode's empty VRAM slots kept a store: an expert swapped in takes one (its copy up waits for no copy down), the least recently used are moved down afterwards (0: a swap moves its victim down first) | llm deepseek41 |
 | `NS_DS41_QSIM` | on | 0: the model's low-precision simulations (fp8 window keys and attention output, fp4 compressed and indexer keys) left out - a check against a reference without them | llm deepseek41 |
