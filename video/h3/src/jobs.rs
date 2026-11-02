@@ -5,7 +5,7 @@
 //! stopped in the middle of a kernel can leave the xe driver stuck.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -920,6 +920,42 @@ pub struct Refine<'a> {
     pub upscaler: &'a Path,
     /// the noise levels, falling to 0 (NVlabs': 0.909375, 0.857143, 0.666667, 0)
     pub sigmas: Vec<f32>,
+    /// set by `generate_windows`: this run is one window of a longer draft, and stops at its latents
+    pub window: bool,
+    /// and the whole draft already upscaled, so every window starts from the same upscale
+    pub upscaled: Option<Vec<f32>>,
+    /// the window's first latent frame in the draft (a multiple of 5, a group's start)
+    pub start: usize,
+    /// the window before this one: its finished latents, the frame there that lines up with this window's first, and
+    /// how many of its frames this window keeps instead of generating
+    pub keep: Option<(PathBuf, usize, usize)>,
+}
+
+/// The latent frames of one refine window: 3 s, what a 32 GB card holds at 2560x1472
+const REFINE_WINDOW: usize = 22;
+/// Latent frames between window starts (a group of 5 is 17 pixel frames)
+const REFINE_STRIDE: usize = 15;
+
+/// A draft's windows: (first latent frame, frames kept from the window before). The last two frames of a window are
+/// replaced by the next one's, whose context reaches past them; the last window is moved back to end with the draft.
+fn refine_windows(total: usize, win: usize, stride: usize) -> Vec<(usize, usize)> {
+    let mut out = vec![(0, 0)];
+    let mut s = 0;
+    while s + win < total {
+        let next = (s + stride).min(total - win);
+        out.push((next, s + win - next - 2));
+        s = next;
+    }
+    out
+}
+
+/// One latent frame range [start, start + t) of [C, T, H, W]
+fn crop_frames(v: &[f32], channels: usize, total: usize, n: usize, start: usize, t: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(channels * t * n);
+    for ch in 0..channels {
+        out.extend_from_slice(&v[(ch * total + start) * n..(ch * total + start + t) * n]);
+    }
+    out
 }
 
 /// The "noise" a sampler that starts at `noise * s0` needs to start at `(1 - s0) * clean + s0 * noise`
@@ -927,25 +963,54 @@ fn refine_noise(noise: &[f32], clean: &[f32], s0: f32) -> Vec<f32> {
     noise.iter().zip(clean).map(|(n, c)| n + c * (1.0 - s0) / s0).collect()
 }
 
+/// The draft's video latents doubled
+fn upscale_draft(dev: &Arc<Device>, r: &Refine, cancel: &AtomicBool) -> Result<Vec<f32>> {
+    let ck = Checkpoint::open(r.from)?;
+    let ev = ck.get("samples.video")?.clone();
+    let v = crate::dtype::bytes_to_f32(&ck.read("samples.video")?, ev.dtype)?;
+    Ok(crate::upscale::Upscaler::load(dev, &Checkpoint::open(r.upscaler)?)?.upscale(&v, ev.shape[2], ev.shape[3], ev.shape[4], 2.0, &mut || {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error("cancelled".into()));
+        }
+        Ok(())
+    })?.0)
+}
+
 /// A refine pass's start: the draft's video latents upscaled x2 to `shape`, every video latent generated, its sound kept
 fn refine_inpaint(dev: &Arc<Device>, r: &Refine, shape: Shape, cancel: &AtomicBool, ctl: &mut Ctl) -> Result<denoiser::Inpaint> {
     let ck = Checkpoint::open(r.from)?;
     let (ev, ea) = (ck.get("samples.video")?.clone(), ck.get("samples.audio")?.clone());
     let (t, h, w) = (ev.shape[2], ev.shape[3], ev.shape[4]);
-    if t != shape.t || h * 2 != shape.h || w * 2 != shape.w || ea.shape[3] != shape.audio_t {
+    if h * 2 != shape.h || w * 2 != shape.w || r.start + shape.t > t || (!r.window && (t != shape.t || ea.shape[3] != shape.audio_t)) {
         return Err(Error(format!("{}: a draft of {t} frames {w}x{h} does not double to {} frames {}x{}", r.from.display(), shape.t, shape.w, shape.h)));
     }
-    let v = crate::dtype::bytes_to_f32(&ck.read("samples.video")?, ev.dtype)?;
-    let source_a = crate::dtype::bytes_to_f32(&ck.read("samples.audio")?, ea.dtype)?;
+    // a window's sound starts where its first pixel frame does: 5 latent frames are 17 pixel frames, 40 audio latents a second
+    let audio_start = ((r.start as f64 / 5.0 * 17.0 / 24.0 * 40.0).round() as usize).min(ea.shape[3].saturating_sub(shape.audio_t));
+    let a = crate::dtype::bytes_to_f32(&ck.read("samples.audio")?, ea.dtype)?;
+    let source_a = crop_frames(&a, 64, ea.shape[3], 1, audio_start, shape.audio_t);
     let t0 = Instant::now();
-    let (source_v, _, _) = crate::upscale::Upscaler::load(dev, &Checkpoint::open(r.upscaler)?)?.upscale(&v, t, h, w, 2.0, &mut || {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(Error("cancelled".into()));
-        }
-        Ok(())
-    })?;
+    let mut source_v = match &r.upscaled {
+        Some(z) => crop_frames(z, 24, t, shape.h * shape.w, r.start, shape.t),
+        None => upscale_draft(dev, r, cancel)?,
+    };
     ctl.say(format!("refine : draft {w}x{h} -> {}x{} latents in {:.1} s, from sigma {}", shape.w, shape.h, t0.elapsed().as_secs_f64(), r.sigmas[0]));
-    Ok(denoiser::Inpaint { source_v, source_a, mask_v: vec![1.0; shape.t * shape.h * shape.w], mask_a: vec![0.0; shape.audio_t] })
+    let n = shape.h * shape.w;
+    let mut mask_v = vec![1.0; shape.t * n];
+    if let Some((p, at, frames)) = &r.keep {
+        let (at, frames) = (*at, *frames);
+        let ck = Checkpoint::open(p)?;
+        let e = ck.get("samples.video")?.clone();
+        if e.shape[3] != shape.h || e.shape[4] != shape.w || at + frames > e.shape[2] || frames > shape.t {
+            return Err(Error(format!("{}: no {frames} frames from {at} for a {}x{} window", p.display(), shape.w, shape.h)));
+        }
+        let prev = crate::dtype::bytes_to_f32(&ck.read("samples.video")?, e.dtype)?;
+        for ch in 0..24 {
+            source_v[ch * shape.t * n..(ch * shape.t + frames) * n].copy_from_slice(&prev[(ch * e.shape[2] + at) * n..(ch * e.shape[2] + at + frames) * n]);
+        }
+        mask_v[..frames * n].fill(0.0);
+        ctl.say(format!("refine : keeping {frames} frames from {}", p.display()));
+    }
+    Ok(denoiser::Inpaint { source_v, source_a, mask_v, mask_a: vec![0.0; shape.audio_t] })
 }
 
 /// The masks of a masked run from the source latents and the stretch / box to regenerate.
@@ -1408,7 +1473,15 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         d.masks = Some(denoiser::RowMasks::new(p, shape));
     }
     let n_v = 24 * shape.t * shape.h * shape.w;
-    let (noise_v, noise_a) = crate::noise::clip_noise(c.seed, n_v, 32 * 2 * shape.audio_t);
+    let (noise_v, noise_a) = match &c.refine {
+        // a window of a longer draft: its part of the whole draft's noise, so windows agree where they overlap
+        Some(r) if r.window => {
+            let total = Checkpoint::open(r.from)?.get("samples.video")?.shape[2];
+            let (v, a) = crate::noise::clip_noise(c.seed, 24 * total * shape.h * shape.w, 32 * 2 * shape.audio_t);
+            (crop_frames(&v, 24, total, shape.h * shape.w, r.start, shape.t), a)
+        }
+        _ => crate::noise::clip_noise(c.seed, n_v, 32 * 2 * shape.audio_t),
+    };
     // H3's own schedule (the video shift), or one of ComfyUI's at that shift
     let sigmas = if let Some(r) = &c.refine {
         r.sigmas.clone()
@@ -1477,6 +1550,9 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
             ("samples.audio".to_string(), (vec![1, 32, 2, shape.audio_t], a.clone())),
         ]), &BTreeMap::new())?;
     }
+    if c.refine.as_ref().is_some_and(|r| r.window) {
+        return Ok(json!({"sample_seconds": sample_secs}));
+    }
     let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video: v, t: shape.t, h: shape.h, w: shape.w, audio: Some((a, shape.audio_t)) }, &c.vaes, Some(out), None, Some(out), exposure.as_ref(), ctl)?;
     if let Some((p, start)) = c.inputs.soundtrack {
         // the clip carries the song itself, not the audio decoder's rendering of it
@@ -1488,6 +1564,72 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     rep["sample_seconds"] = json!(sample_secs);
     rep["total_seconds"] = json!(total);
     ctl.say(format!("clip   : {} in {total:.1} s", out.display()));
+    Ok(rep)
+}
+
+/// A refine pass over a draft too long for one card: overlapping windows, each keeping the frames it shares with the
+/// window before, the finished latents joined and decoded once.
+fn generate_windows(e: &Engine, mut c: ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<Value> {
+    let t_all = Instant::now();
+    if c.inputs.soundtrack.is_some() || c.inputs.exposure_fix.is_some() {
+        return Err(Error("a refine in windows takes no soundtrack or exposure_fix".into()));
+    }
+    let (frames, lt, at) = temporal_shape(c.seconds);
+    let (h, w) = (c.height / 16, c.width / 16);
+    let n = h * w;
+    let (draft_a, draft_at) = {
+        let r = c.refine.as_ref().ok_or("generate_windows needs a refine")?;
+        let ck = Checkpoint::open(r.from)?;
+        let (ev, ea) = (ck.get("samples.video")?.clone(), ck.get("samples.audio")?.clone());
+        if ev.shape[2] != lt || ev.shape[3] * 2 != h || ev.shape[4] * 2 != w || ea.shape[3] != at {
+            return Err(Error(format!("{}: a draft of {} frames {}x{} does not double to {lt} frames {w}x{h}", r.from.display(), ev.shape[2], ev.shape[4], ev.shape[3])));
+        }
+        (crate::dtype::bytes_to_f32(&ck.read("samples.audio")?, ea.dtype)?, ea.shape[3])
+    };
+    let t0 = Instant::now();
+    let upscaled = upscale_draft(&e.dev, c.refine.as_ref().ok_or("generate_windows needs a refine")?, ctl.cancel)?;
+    ctl.say(format!("refine : whole draft upscaled in {:.1} s", t0.elapsed().as_secs_f64()));
+    c.refine.as_mut().ok_or("generate_windows needs a refine")?.upscaled = Some(upscaled);
+    let plan = refine_windows(lt, REFINE_WINDOW, REFINE_STRIDE);
+    let mut video = vec![0f32; 24 * lt * n];
+    let part = |i: usize, ext: &str| out.with_extension(format!("w{i}.{ext}"));
+    let mut prev_start = 0;
+    c.seconds = (REFINE_WINDOW - 2) as f64 / 5.0 * 17.0 / 24.0 + 5.0 / 24.0;
+    let mut sampled = 0.0;
+    for (i, &(start, keep)) in plan.iter().enumerate() {
+        ctl.say(format!("window : {}/{} from latent frame {start}, keeping {keep}", i + 1, plan.len()));
+        let r = c.refine.as_mut().ok_or("generate_windows needs a refine")?;
+        r.window = true;
+        r.start = start;
+        r.keep = (i > 0).then(|| (part(i - 1, "latents.safetensors"), start - prev_start, keep));
+        let rep = generate(e, &c, &part(i, "mp4"), ctl)?;
+        sampled += rep["sample_seconds"].as_f64().unwrap_or(0.0);
+        let ck = Checkpoint::open(&part(i, "latents.safetensors"))?;
+        let v = crate::dtype::bytes_to_f32(&ck.read("samples.video")?, ck.get("samples.video")?.dtype)?;
+        for ch in 0..24 {
+            for t in keep..REFINE_WINDOW {
+                video[(ch * lt + start + t) * n..(ch * lt + start + t + 1) * n].copy_from_slice(&v[(ch * REFINE_WINDOW + t) * n..(ch * REFINE_WINDOW + t + 1) * n]);
+            }
+        }
+        if i > 0 {
+            let _ = std::fs::remove_file(part(i - 1, "latents.safetensors"));
+        }
+        for ext in ["lastlat.safetensors", "preview.png"] {
+            let _ = std::fs::remove_file(part(i, ext));
+        }
+        prev_start = start;
+    }
+    let _ = std::fs::remove_file(part(plan.len() - 1, "latents.safetensors"));
+    crate::safetensors::write_f32(&out.with_extension("latents.safetensors"), &BTreeMap::from([
+        ("samples.video".to_string(), (vec![1, 24, lt, h, w], video.clone())),
+        ("samples.audio".to_string(), (vec![1, 32, 2, draft_at], draft_a.clone())),
+    ]), &BTreeMap::new())?;
+    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video, t: lt, h, w, audio: Some((draft_a, draft_at)) }, &c.vaes, Some(out), None, Some(out), None, ctl)?;
+    let total = t_all.elapsed().as_secs_f64();
+    rep["windows"] = json!(plan.len());
+    rep["sample_seconds"] = json!(sampled);
+    rep["total_seconds"] = json!(total);
+    ctl.say(format!("clip   : {} ({frames} frames, {} windows) in {total:.1} s", out.display(), plan.len()));
     Ok(rep)
 }
 
@@ -1564,8 +1706,9 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
             let s = |k: &str| spec.get(k).and_then(|d| d.as_str()).map(Path::new);
             let latents = s("latents").ok_or("decode needs \"latents\": a latents file the engine can read")?;
             let video = s("vae").ok_or("decode needs \"vae\": the video decoder's checkpoint")?;
-            let upscale = s("upscaler").map(|p| (p, spec.get("upscale").and_then(|v| v.as_f64()).unwrap_or(2.0) as f32));
             let factor = spec.get("upscale").and_then(|v| v.as_f64()).unwrap_or(2.0) as f32;
+            // "upscale": 1 decodes at the latents' own size, whatever upscaler the model's card names
+            let upscale = s("upscaler").filter(|_| factor > 1.0).map(|p| (p, factor));
             let pixel = s("pixel_upscaler").map(|p| (p, factor));
             decode(&e.dev, e.threads, latents, &Vaes { video, audio: s("audio_vae"), upscale, pixel }, s("out"), s("check"), ctl)
         }
@@ -1600,6 +1743,10 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                         from: Path::new(f),
                         upscaler: Path::new(s("refine_upscaler").ok_or("refine_from needs \"refine_upscaler\": the latent upscaler's file")?),
                         sigmas: s("refine_sigmas").unwrap_or("0.909375,0.857143,0.666667,0").split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+                        window: false,
+                        upscaled: None,
+                        start: 0,
+                        keep: None,
                     }),
                     None => None,
                 },
@@ -1690,7 +1837,11 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                 })
                 .unwrap_or_default();
             let c = ClipSpec { lora, ..c };
-            generate(e, &c, Path::new(out), ctl)
+            if c.refine.is_some() && temporal_shape(c.seconds).1 > REFINE_WINDOW {
+                generate_windows(e, c, Path::new(out), ctl)
+            } else {
+                generate(e, &c, Path::new(out), ctl)
+            }
         }
         "encode" => {
             let s = |k: &str| spec.get(k).and_then(|d| d.as_str());
@@ -1711,6 +1862,20 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
 
 #[cfg(test)]
 mod refine_tests {
+    #[test]
+    fn a_long_draft_is_cut_into_windows_that_end_with_it() {
+        assert_eq!(super::refine_windows(22, 22, 15), vec![(0, 0)]);
+        assert_eq!(super::refine_windows(37, 22, 15), vec![(0, 0), (15, 5)]);
+        assert_eq!(super::refine_windows(87, 22, 15), vec![(0, 0), (15, 5), (30, 5), (45, 5), (60, 5), (65, 15)]);
+    }
+
+    #[test]
+    fn a_window_is_cut_from_every_channel() {
+        // 2 channels, 3 frames of 2 values
+        let v: Vec<f32> = (0..12).map(|x| x as f32).collect();
+        assert_eq!(super::crop_frames(&v, 2, 3, 2, 1, 2), vec![2.0, 3.0, 4.0, 5.0, 8.0, 9.0, 10.0, 11.0]);
+    }
+
     #[test]
     fn a_refine_starts_on_the_upscaled_draft_under_its_noise() {
         let (noise, clean, s0) = ([0.5f32, -1.0], [2.0f32, 4.0], 0.909375f32);

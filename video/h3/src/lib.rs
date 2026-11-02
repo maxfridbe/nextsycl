@@ -121,7 +121,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "exposure_ease", env: "", value: "FRAMES", help: "with exposure_fix: frames after the guide over which the luma eases to the steady level (default 24)", at: At::Request },
     EngineOption { name: "exposure_target", env: "", value: "LUMA", help: "with exposure_fix and no guide_clip: the luma (0-255) of the clip's first frame (default: the first_frame picture's)", at: At::Request },
     EngineOption { name: "knots", env: "", value: "T,T,..", help: "a distilled model's own noise levels, as timesteps of 1000 from 1000 down to 0 (Pika H3 Flex: 1000,750,500,250,100,40,0 with the lcm sampler); one step between two", at: At::Request },
-    EngineOption { name: "refine_from", env: "", value: "FILE", help: "a refine pass (with the 2K refiner LoRA): a draft's .latents.safetensors, doubled to this clip's canvas, its sound kept", at: At::Request },
+    EngineOption { name: "refine_from", env: "", value: "FILE", help: "a refine pass (with the 2K refiner LoRA): a draft's .latents.safetensors, doubled to this clip's canvas, its sound kept; a draft over 3 s goes in overlapping windows", at: At::Request },
     EngineOption { name: "refine_upscaler", env: "", value: "FILE", help: "with refine_from: the latent upscaler", at: At::Request },
     EngineOption { name: "refine_sigmas", env: "", value: "S,S,..", help: "with refine_from: the noise levels (default 0.909375,0.857143,0.666667,0)", at: At::Request },
     EngineOption { name: "shift_video", env: "", value: "X", help: "the video schedule's shift (default 12)", at: At::Request },
