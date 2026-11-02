@@ -10,6 +10,7 @@
 //!                                     the forward pass on a reference dump's prompt (reference/llama-dump), every
 //!                                     step compared: cosine and relative error per tensor, then the next token
 
+mod audit;
 mod bench;
 mod modelbench;
 mod client;
@@ -104,6 +105,11 @@ language models (nextsycl llm ...; the names without `llm` still work):
   nextsycl llm check <model.gguf> <dump dir> [--gpu N[,M]]    the forward pass against a reference dump
   nextsycl llm spec-check <model.gguf> --prompt TEXT [--n N] [--rows R (2..5)] [--gpu 0,1] [--prefill | --prompt-decode]
                                 verify passes against one-token decode, logits compared
+  nextsycl llm requant-draft <dspark.gguf> <out.gguf>   a DSpark drafter's MXFP4 experts as Q2_K (read with NS_DS41_DRAFTER)
+  nextsycl llm audit <model.gguf> (--prompts FILE [--n N] | --follow RECORD) --out RECORD [--note TEXT] [--gpu 0,1] [--no-mtp]
+                                a reference's greedy run recorded, or a quant's teacher-forced on such a record
+  nextsycl llm audit-report --ref RECORD --run RECORD [--gates 0.1,0.45,0.9,inf] [--exact]
+                                agreement token by token, at each gate, the differences by margin band
   nextsycl llm kernels <model.gguf> [--gpu N]   each weight type's decode kernel against the exact path
   nextsycl llm prepare <model.gguf>             the files its engine makes beside it (deepseek4: the MTP sidecar)
 
@@ -1066,6 +1072,10 @@ fn llm(cfg: &nextsycl_models::Config, args: &[String]) -> Result<(), String> {
         Some("generate") => generate(args),
         Some("spec-check") => spec_check(args),
         Some("batch-check") => batch_check(args),
+        // no GPU: a DSpark drafter file's MXFP4 experts as Q2_K
+        Some("requant-draft") if args.len() == 3 => nextsycl_llm_deepseek41::requant::draft_file(Path::new(&args[1]), Path::new(&args[2])),
+        Some("audit") => audit::run(args),
+        Some("audit-report") => audit::report(args),
         // the files an engine makes beside a model (as after a pull: deepseek4's draft block from its shard)
         Some("prepare") if args.len() == 2 => {
             let f = Gguf::open(Path::new(&args[1])).map_err(|e| e.0)?;

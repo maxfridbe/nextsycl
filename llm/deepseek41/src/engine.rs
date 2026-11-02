@@ -87,6 +87,15 @@ pub static WALL_STREAMS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 pub static WALL_LAYERS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WALL_HEAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WALL_SAMPLE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// the margin gate: tokens recomputed, those whose best token changed, those the near-tie rule let stand, the recomputations' time
+/// and the part of it reading the second set
+/// resident experts a speculative row took for missing ones (NS_DS41_SUBST)
+pub static SUBSTITUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GATE_REDONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GATE_OVERTURNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GATE_NEAR_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GATE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GATE_READ_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
@@ -1089,10 +1098,21 @@ pub struct Part {
     /// a prompt pass's pinned slots for the experts only the file holds: read on threads while the GPU multiplies the
     /// others, then copied up through the ring; the copy last reading each slot
     pstage: Option<PStage>,
+    /// the margin gate's: the second set's experts' places by layer, VRAM for one layer's routed experts of it, and whether the
+    /// pass running now reads them
+    xv: HashMap<u64, LayerVq>,
+    xbuf: Option<DevBuf>,
+    exact_pass: std::sync::atomic::AtomicBool,
 }
 
 /// A prompt pass's pinned slots for the file's experts: the buffer, a slot's bytes, the copy last reading each
 type PStage = (Mutex<HostBuf>, usize, Mutex<Vec<Option<i64>>>);
+
+/// The margin gate's second GGUF set: its model and every layer's experts' places in it (NS_DS41_GATE_EXPERTS)
+struct GateSet {
+    m: Model<'static>,
+    tok: Option<nextsycl_tok::Tokenizer>,
+}
 
 /// Decode's file reads ahead: a few threads with their own handles on the model's files, reading an expert's bytes into
 /// a pinned staging slot while the GPU works (the next layer's likely experts, from its router's guess)
@@ -1191,6 +1211,42 @@ struct Shared {
 }
 
 impl Part {
+    /// The experts' layout the running pass reads: the margin gate's second set in a recomputation, the model's otherwise
+    fn evq(&self, l: u64) -> &LayerVq {
+        if self.exact_pass.load(std::sync::atomic::Ordering::Relaxed) && !gate_self() { &self.xv[&l] } else { &self.vq[&l] }
+    }
+
+    /// The second set's experts `need` of layer l, read from its file into `xbuf` (buffered: a repeated expert from the page
+    /// cache): a view of each. The queue is drained first: the layer before's products may still read the buffer
+    fn exact_slots(&self, m: &Model, l: u64, need: &[u64]) -> Result<Vec<DevBuf>> {
+        let (buf, vq) = (self.xbuf.as_ref().ok_or("the margin gate has no buffer")?, &self.xv[&l]);
+        if need.len() * vq.span.next_multiple_of(256) > buf.len {
+            return Err(Error(format!("the margin gate's buffer: {} experts of {} bytes in {}", need.len(), vq.span, buf.len)));
+        }
+        self.ops.gpu.sync()?;
+        let tr = Instant::now();
+        let mut hosts: Vec<Vec<u8>> = need.iter().map(|_| vec![0u8; vq.span]).collect();
+        let read: Vec<Result<()>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = hosts.iter_mut().zip(need).map(|(h, &x)| sc.spawn(move || -> Result<()> {
+                for i in 0..3 {
+                    let (t, off, n, _) = vq.mat_of(x, i).ok_or("an expert's matrix")?;
+                    let at = vq.mat_at(x, i);
+                    // from the set's own files: read_slab's handles are the model's
+                    m.file.read_into(t, off, &mut h[at..at + n]).map_err(e)?;
+                }
+                Ok(())
+            })).collect();
+            hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(Error("a gate reader panicked".into())))).collect()
+        });
+        read.into_iter().collect::<Result<()>>()?;
+        GATE_READ_NS.fetch_add(tr.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let span = vq.span.next_multiple_of(256);
+        hosts.iter().enumerate().map(|(k, h)| {
+            buf.write(k * span, h)?;
+            buf.view(k * span, span)
+        }).collect()
+    }
+
     fn mat(&self, l: u64, r: Role) -> Result<&Mat> {
         self.mats.get(&(l, r)).ok_or_else(|| Error(format!("block {l}: matrix {r:?} not on this GPU")))
     }
@@ -1494,7 +1550,7 @@ impl Part {
     #[allow(clippy::too_many_arguments)]
     fn exp_mmv(&self, l: u64, down: bool, table: &DevBuf, entries: usize, x: &DevBuf, y: (&DevBuf, usize), y_rows: usize, rows: usize, cols: usize, var: i32,
                lut: Option<(usize, usize)>, ncmax: usize) -> Result<()> {
-        let v = &self.vq[&l];
+        let v = self.evq(l);
         if let Some(s) = &v.std {
             // the XQ file's: each entry's type its own (in its first meta word); one column an entry on the split-Q8
             // products like the rest, else the float32 kernel
@@ -2283,6 +2339,8 @@ pub struct Ds41<'g> {
     pub vision: Option<crate::vision::Vision>,
     /// DRY against repeated runs (NS_DS41_DRY) and the tokens that break a run
     dry: Option<(crate::dry::Dry, crate::dry::Vocab)>,
+    /// the margin gate's second set (NS_DS41_GATE), when on
+    gate_set: Option<GateSet>,
 }
 
 /// the decode products' kernel variants (ds41.h: ns_ds41_vq_mmv): 0 a sub-group a row (float32 codebook), 1 a lane a row
@@ -2806,7 +2864,7 @@ impl Part {
         let pstage = if ring_bytes > 0 && nfs > 0 { Some((Mutex::new(HostBuf::new(gpu, nfs * ring_slot)?), ring_slot, Mutex::new(vec![None; nfs]))) } else { None };
         Ok(Part { ops, arena, big, small, layers, mats, vecs, groups, scratch, q8, biases: Mutex::new(HashMap::new()), oa_tab: Mutex::new(HashMap::new()), pre_reads: Mutex::new(None), vq, cbs, cbf, cbh, vq_pick, stores, store_of, draft,
                   hold: std::sync::atomic::AtomicBool::new(false), kv_reserve, x_due: std::sync::atomic::AtomicBool::new(lent && lend_extra()), x_first: std::sync::atomic::AtomicBool::new(true), expert_slots: nv_all, host_slots: nr_all, weight_bytes: bytes,
-                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage, devtab, xtags,
+                  up: Mutex::new((HostBuf::new(gpu, UP_BYTES)?, 0)), back: Mutex::new(HostBuf::new(gpu, BACK_BYTES)?), sel, cand, zeros, ring, ring_free: Mutex::new(None), pstage, devtab, xtags, xv: HashMap::new(), xbuf: None, exact_pass: std::sync::atomic::AtomicBool::new(false),
                   reader: if file_ahead() > 0 { Some(FileReader::new(&m.file.paths, env_usize("NS_DS41_READERS", 16).max(env_usize("NS_DS41_PROMPT_READERS", 32)))?) } else { None } })
     }
 }
@@ -2880,6 +2938,19 @@ impl<'g> Ds41<'g> {
         // prose (a verify pass's rows cost nearly what one-token passes do: the decode products are ALU-bound), and
         // without them the last GPU holds ~2.9 GiB more experts
         let mtp = draft && g.n_mtp > 0 && mtp_on();
+        // options that only act on drafts do nothing without them: said at the load, not found out from the numbers
+        if !mtp && (mtp_greedy() || subst_on()) {
+            return Err(Error("NS_DS41_MTP_GREEDY and NS_DS41_SUBST act on the draft towers' verify passes: they need NS_DS41_MTP=1 and drafts on".into()));
+        }
+        // the margin gate's second set, opened and held for the process; each part's reserve takes VRAM for a layer's experts of it
+        let gate_set = gate_open(&m, gate(), log)?;
+        let mut gate_vq: HashMap<u64, LayerVq> = HashMap::new();
+        if let Some(gs) = &gate_set {
+            for l in 0..n {
+                gate_vq.insert(l, layer_vq(&gs.m, l)?);
+            }
+        }
+        let gate_span = gate_vq.iter().map(|(l, v)| g.experts(*l).1 as usize * v.span.next_multiple_of(256)).max().unwrap_or(0);
         let mut plans = Vec::new();
         for (i, gpu) in gpus.iter().enumerate() {
             let range = bounds[i]..bounds[i + 1];
@@ -2900,7 +2971,7 @@ impl<'g> Ds41<'g> {
                 + match mirror_src {
                     Some(sl) if i == 1 => (kv.0 / g.ratio(sl) as usize + 1) * (512 + g.idx_dim as usize) * 2 * kv.1,
                     _ => 0,
-                };
+                } + gate_span;
             if reserve > 0 {
                 log(format!("{}: {:.2} GiB held for the sessions' {} tokens", gpu.name, gib(reserve), kv.0 * kv.1));
             }
@@ -2924,6 +2995,17 @@ impl<'g> Ds41<'g> {
                 log(l);
             }
             parts.push(p?);
+        }
+        for p in parts.iter_mut().filter(|_| gate_set.is_some()) {
+            for l in p.layers.clone() {
+                let v = gate_vq.remove(&l).ok_or("the margin gate: a layer without experts")?;
+                let s = v.std.as_ref().ok_or("the margin gate: the second set's experts are not in ggml's row types")?;
+                if !p.ops.std_supported(s.ty[0].code(), g.n_embd as usize) || !p.ops.std_supported(s.ty[2].code(), g.ffn_expert as usize) {
+                    return Err(Error(format!("the margin gate: block {l}: experts of {} | {} are not taken by the kernels", s.ty[0].name(), s.ty[2].name())));
+                }
+                p.xv.insert(l, v);
+            }
+            p.xbuf = Some(DevBuf::new(&p.ops.gpu, gate_span)?);
         }
         let engram = if g.engram_layers.is_empty() {
             None
@@ -2959,7 +3041,7 @@ impl<'g> Ds41<'g> {
             log(format!("layers {}.. on the second GPU: kv source {sl}'s keys mirrored there", bounds[1]));
         }
         Ok(Ds41 { m, parts, owner, load_seconds: t0.elapsed().as_secs_f64(), load_bytes, engram, prof, mtp, mirror_src, cand_q: Mutex::new(Default::default()),
-                  pipelining: std::sync::atomic::AtomicBool::new(false), vision, dry })
+                  pipelining: std::sync::atomic::AtomicBool::new(false), vision, dry, gate_set })
     }
 
     pub fn gpu_info(&self) -> Vec<GpuInfo> {
@@ -4371,10 +4453,28 @@ impl<'g> Ds41<'g> {
                 let mut out = Vec::with_capacity(toks.len());
                 // row i follows toks[..=i]: the history to there
                 let at0 = sess.pos - toks.len();
+                let mut gated = false;
                 for (i, r) in rows.iter().enumerate() {
                     let gen = sess.gen_from.min(at0 + i + 1);
-                    let y = smp.sample(&self.shaped(r, &sess.hist[gen..at0 + i + 1]));
+                    // a row under the margin gate: the rows after it dropped, it recomputed; it is the pass's last
+                    let redo = if self.gate_set.is_some() && gate_fires(r, gate()) {
+                        if i + 1 < toks.len() {
+                            self.rollback(sess, i + 1)?;
+                        }
+                        gated = true;
+                        self.gate_redo(sess, r, &mut *tap)?
+                    } else {
+                        None
+                    };
+                    let y = commit(smp, &self.shaped(redo.as_deref().unwrap_or(r), &sess.hist[gen..at0 + i + 1]), self.mtp && mtp_greedy());
                     out.push(y);
+                    if gated {
+                        if i < dr.len() {
+                            dec.drafted += 1;
+                            dec.accepted += (y == dr[i]) as u64;
+                        }
+                        break;
+                    }
                     if i < dr.len() {
                         dec.drafted += 1;
                         if y == dr[i] {
@@ -4384,7 +4484,7 @@ impl<'g> Ds41<'g> {
                     }
                     break;
                 }
-                if out.len() < toks.len() {
+                if out.len() < toks.len() && !gated {
                     self.rollback(sess, out.len())?;
                 }
                 let tail = *out.last().unwrap();
@@ -4394,8 +4494,13 @@ impl<'g> Ds41<'g> {
                 if let Some(x) = dec.next.take() {
                     dec.logits = self.forward(sess, &[x], &mut *tap)?;
                 }
+                if self.gate_set.is_some() && gate_fires(&dec.logits, gate()) {
+                    if let Some(r) = self.gate_redo(sess, &dec.logits, &mut *tap)? {
+                        dec.logits = r;
+                    }
+                }
                 let ts = Instant::now();
-                let y = smp.sample(&self.shaped(&dec.logits, &sess.hist[sess.gen_from.min(sess.pos)..sess.pos]));
+                let y = commit(smp, &self.shaped(&dec.logits, &sess.hist[sess.gen_from.min(sess.pos)..sess.pos]), self.mtp && mtp_greedy());
                 WALL_SAMPLE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 (vec![y], y)
             }
@@ -4406,6 +4511,44 @@ impl<'g> Ds41<'g> {
         };
         dec.next = Some(tail);
         Ok(out)
+    }
+
+    /// The last fed token again with its layers' routed experts from the margin gate's second set (the rows it writes stand in the
+    /// caches). The corrected logits; None when the near-tie rule lets `row` stand.
+    fn gate_redo(&self, sess: &mut Session, row: &[f32], tap: Tap) -> Result<Option<Vec<f32>>> {
+        let t0 = Instant::now();
+        let x = *sess.hist.get(sess.pos.wrapping_sub(1)).ok_or("the margin gate: no token to recompute")?;
+        sess.pos -= 1;
+        sess.hist.truncate(sess.pos);
+        for p in &self.parts {
+            p.exact_pass.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let r = self.forward(sess, &[x], tap);
+        for p in &self.parts {
+            p.exact_pass.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        let r = r?;
+        // the products done before the buffer's next use, and its time in the count
+        for p in &self.parts {
+            p.ops.gpu.sync()?;
+        }
+        let ord = std::sync::atomic::Ordering::Relaxed;
+        GATE_REDONE.fetch_add(1, ord);
+        GATE_NS.fetch_add(t0.elapsed().as_nanos() as u64, ord);
+        let (cheap, exact) = (top_two(row).0, top_two(&r).0);
+        if cheap == exact {
+            return Ok(Some(r));
+        }
+        GATE_OVERTURNED.fetch_add(1, ord);
+        let near = gate_near();
+        if near > 0.0 && r[exact as usize] - r[cheap as usize] < near {
+            let tok = self.gate_set.as_ref().and_then(|g| g.tok.as_ref()).ok_or("the margin gate: the near-tie rule has no tokenizer")?;
+            if !tok.decode(&[cheap]).chars().any(digit_or_operator) {
+                GATE_NEAR_KEPT.fetch_add(1, ord);
+                return Ok(None);
+            }
+        }
+        Ok(Some(r))
     }
 
     /// One decode step of several conversations: each its own pass (the same result as alone)
@@ -4427,7 +4570,8 @@ impl<'g> Ds41<'g> {
         let (ne, used) = { let (a, b) = g.experts(l); (a as usize, b as usize) };
         let lim = g.swiglu_limit as f32;
         let pf = prefetch_limit();
-        let next_main = l + 1 < g.n_layer && !g.is_mtp(l) && p.layers.contains(&(l + 1));
+        let exact_pass = p.exact_pass.load(std::sync::atomic::Ordering::Relaxed);
+        let next_main = l + 1 < g.n_layer && !g.is_mtp(l) && p.layers.contains(&(l + 1)) && !exact_pass;
         let (logits, guess) = if t <= MMVQ_COLS && pf > 0 && next_main {
             let (a, b) = p.mm2((l, Role::Router), (l + 1, Role::Router), x, t)?;
             (a, Some(b))
@@ -4445,7 +4589,7 @@ impl<'g> Ds41<'g> {
         // one decode token routed on the GPU: its VRAM experts' products queued now, from the slot table; the host
         // reads the routing (ids, weights, which had no VRAM slot) after, for the rest and its bookkeeping
         let img_any = tokens.iter().any(|t| crate::vision::is_image(*t));
-        let groute = t == 1 && gpu_route() && !self.mtp && !p.draft.contains_key(&l) && !p.stores_of(l).is_empty() && used <= 8 && !img_any;
+        let groute = t == 1 && !exact_pass && gpu_route() && !self.mtp && !p.draft.contains_key(&l) && !p.stores_of(l).is_empty() && used <= 8 && !img_any;
         let mut early: Option<(DevBuf, DevBuf, DevBuf)> = None;
         let mut early_read = None;
         if groute {
@@ -4536,6 +4680,21 @@ impl<'g> Ds41<'g> {
         } else {
             (0..t).map(pick).collect()
         };
+        // a verify pass's rows after the first may take resident experts for missing ones; the first row commits the anchor on its
+        // routed experts, and what it needs comes in anyway
+        let mut rows = rows;
+        if subst_on() && !exact_pass && (2..=MMVQ_COLS).contains(&t) && !img_any && !p.draft.contains_key(&l) && !p.stores_of(l).is_empty() {
+            let first: Vec<usize> = rows[0].iter().map(|x| x.0).collect();
+            let here = |x: usize| first.contains(&x) || p.with_store(l, x as u64, |c| c.loc.contains_key(&(l, x as u64))).unwrap_or(true);
+            for (ti, row) in rows.iter_mut().enumerate().skip(1) {
+                let key: Vec<f32> = lv[ti * ne..(ti + 1) * ne].iter().zip(bias.iter()).map(|(z, b)| sqrt_softplus(*z) + b).collect();
+                let mut ranked: Vec<usize> = (0..ne).collect();
+                ranked.sort_by(|a, c| key[*c].total_cmp(&key[*a]).then(a.cmp(c)));
+                let (sel, n) = substitute_row(row, &ranked, here, subst_keep());
+                *row = sel;
+                SUBSTITUTED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let mut by: BTreeMap<usize, Vec<(i32, f32)>> = BTreeMap::new();
         for (ti, sel) in rows.into_iter().enumerate() {
             for (i, w) in sel {
@@ -4568,7 +4727,7 @@ impl<'g> Ds41<'g> {
         // cold experts of small weight left out (NS_DS41_COLD_SKIP): their rows of the products stay zero
         let mut skip: Vec<bool> = vec![false; by.len()];
         let prompt_skip = t > MMVQ_COLS && cold_skip_prompt() > 0.0 && p.ring.is_some() && !p.draft.contains_key(&l);
-        if ((cold_skip() > 0.0 && t <= MMVQ_COLS) || prompt_skip) && by.len() > 1 && !p.draft.contains_key(&l) {
+        if !exact_pass && ((cold_skip() > 0.0 && t <= MMVQ_COLS) || prompt_skip) && by.len() > 1 && !p.draft.contains_key(&l) {
             let (thr, maxn) = if t <= MMVQ_COLS { (cold_skip(), usize::MAX) } else { (cold_skip_prompt(), cold_skip_prompt_max()) };
             for (k, (ex, v)) in by.iter().enumerate() {
                 let key = (l, *ex as u64);
@@ -4608,8 +4767,12 @@ impl<'g> Ds41<'g> {
         }
         let promote = t <= MMVQ_COLS;
         let staging = !promote && p.ring.is_some() && !p.draft.contains_key(&l);
-        let (slots_of, arriving, copies) =
-            if staging { (Vec::new(), Vec::new(), None) } else { self.timed(p, "experts: misses", || p.ensure(&self.m, l, &need, promote))? };
+        let (slots_of, arriving, copies) = if exact_pass && !gate_self() {
+            let gs = self.gate_set.as_ref().ok_or("an exact pass without the gate's set")?;
+            let v = p.exact_slots(&gs.m, l, &need)?;
+            let n = v.len();
+            (v, vec![false; n], None)
+        } else if staging { (Vec::new(), Vec::new(), None) } else { self.timed(p, "experts: misses", || p.ensure(&self.m, l, &need, promote))? };
         // the slots of the experts left out: a view of the first one's (never read)
         let (slots_of, arriving) = if skipped > 0 && !slots_of.is_empty() {
             let (mut so, mut ar) = (Vec::with_capacity(skip.len()), Vec::with_capacity(skip.len()));
@@ -4633,7 +4796,7 @@ impl<'g> Ds41<'g> {
         } else {
             (slots_of, arriving)
         };
-        let vq = &p.vq[&l];
+        let vq = p.evq(l);
         let nbit = vq.nbit;
         let total: usize = by.values().map(|v| v.len()).sum();
         let lists: Vec<&Vec<(i32, f32)>> = by.values().collect();
@@ -5102,6 +5265,119 @@ impl<'g> Ds41<'g> {
 /// Keys from which an index source's top-k is taken in two levels (NS_DS41_IDX_TWO, default 196,608; 0: never): below
 /// it one radix select over every key was as fast (B70: 1.6 against 2.0 ms at 131K keys and 256 rows, 1.7 against 1.4
 /// at 262K; B65 2.8 / 3.0 and 3.4 / 1.9)
+/// The token a row commits: the sampler's, or with `greedy` (NS_DS41_MTP_GREEDY: every token its row's best, whatever the request's
+/// temperature) the argmax, recorded; a sampler that dictates its tokens (an audit) always decides
+fn commit(smp: &mut dyn Sampler, logits: &[f32], greedy: bool) -> u32 {
+    if greedy && !smp.forced() {
+        let y = argmax(logits);
+        smp.record(logits, y);
+        y
+    } else {
+        smp.sample(logits)
+    }
+}
+
+/// NS_DS41_MTP_GREEDY: with the towers, drafts accepted and tokens committed by the argmax
+pub fn mtp_greedy() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_MTP_GREEDY", 0) != 0)
+}
+
+/// NS_DS41_SUBST: a verify pass's rows after its first keep this many best routed experts as they are, and may replace any other
+/// held by neither VRAM nor host memory with a resident one (0: off)
+fn subst_keep() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_SUBST", 0))
+}
+fn subst_on() -> bool {
+    std::env::var("NS_DS41_SUBST").is_ok_and(|v| !v.is_empty() && v != "off")
+}
+
+/// A speculative row's experts (best first) with those past `keep` that are not `here` replaced, each by the next of `ranked` (the
+/// layer's experts, best first) that is here and not in the row; the missing expert's weight goes to its substitute. How many
+/// were replaced: a missing expert with no substitute left stays
+pub fn substitute_row(sel: &[(usize, f32)], ranked: &[usize], here: impl Fn(usize) -> bool, keep: usize) -> (Vec<(usize, f32)>, usize) {
+    let mut out = sel.to_vec();
+    let (mut n, mut at) = (0, 0);
+    for k in keep.min(out.len())..out.len() {
+        if here(out[k].0) {
+            continue;
+        }
+        while at < ranked.len() && (!here(ranked[at]) || out.iter().any(|x| x.0 == ranked[at])) {
+            at += 1;
+        }
+        let Some(&r) = ranked.get(at) else { break };
+        out[k].0 = r;
+        n += 1;
+    }
+    (out, n)
+}
+
+/// The best token of a row and its top-two logit gap
+pub fn top_two(l: &[f32]) -> (u32, f32) {
+    let (mut bi, mut b, mut c) = (0usize, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (i, &v) in l.iter().enumerate() {
+        if v > b {
+            (bi, c, b) = (i, b, v);
+        } else if v > c {
+            c = v;
+        }
+    }
+    (bi as u32, b - c)
+}
+
+/// Whether a row's margin is under the gate (an infinite gate: every row)
+pub fn gate_fires(row: &[f32], gate: f32) -> bool {
+    gate > 0.0 && top_two(row).1 < gate
+}
+
+/// What the near-tie rule never lets stand: a word with a digit or an operator in it
+fn digit_or_operator(c: char) -> bool {
+    c.is_ascii_digit() || "+-*/=<>%^&|~!".contains(c)
+}
+
+/// NS_DS41_GATE_SELF=1 (a check): a recomputation runs as usual (host routing, no reads ahead) but reads the model's own experts from
+/// their store: with the second set the model itself, the rows must come out the same to the bit
+fn gate_self() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_usize("NS_DS41_GATE_SELF", 0) != 0)
+}
+
+/// The margin gate's top-two gap (NS_DS41_GATE; 0: off, `inf`: every token)
+pub fn gate() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_GATE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
+}
+
+/// The near-tie rule (NS_DS41_GATE_NEAR; 0: off): an overturn by less than this keeps the cheap word
+fn gate_near() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_DS41_GATE_NEAR").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
+}
+
+/// The margin gate's second set, with the gate on: a gate without a usable set fails the load rather than doing nothing
+fn gate_open(m: &Model, gate: f32, log: &mut dyn FnMut(String)) -> Result<Option<GateSet>> {
+    if std::env::var("NS_DS41_GATE").is_ok_and(|v| !v.is_empty()) && std::env::var("NS_DS41_GATE").is_ok_and(|v| v.parse::<f32>().is_err()) {
+        return Err(Error("NS_DS41_GATE: a number or inf".into()));
+    }
+    if gate <= 0.0 {
+        return Ok(None);
+    }
+    let path = std::env::var("NS_DS41_GATE_EXPERTS").map_err(|_| Error("NS_DS41_GATE is on: NS_DS41_GATE_EXPERTS must name the second GGUF set (its first shard)".into()))?;
+    if !m.g.std || m.g.xq {
+        return Err(Error("the margin gate takes a model in ggml's row types".into()));
+    }
+    let f: &'static nextsycl_gguf::Gguf = Box::leak(Box::new(nextsycl_gguf::Gguf::open(std::path::Path::new(&path)).map_err(|x| Error(format!("{path}: {}", x.0)))?));
+    let x = Model::open(f).map_err(e)?;
+    let (a, b) = (&m.g, &x.g);
+    if !b.std || b.xq || (a.n_layer, a.n_expert, a.n_expert_used, a.n_embd, a.ffn_expert) != (b.n_layer, b.n_expert, b.n_expert_used, b.n_embd, b.ffn_expert) {
+        return Err(Error(format!("{path}: another geometry or form than the model's: the gate cannot read its experts")));
+    }
+    let tok = if gate_near() > 0.0 { Some(nextsycl_tok::Tokenizer::from_gguf(m.file).map_err(Error)?) } else { None };
+    log(format!("margin gate {gate}: tokens under it recomputed with the routed experts of {path}"));
+    Ok(Some(GateSet { m: x, tok }))
+}
+
 fn idx_two_min() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| match env_usize("NS_DS41_IDX_TWO", 196_608) {
@@ -5116,4 +5392,56 @@ fn fused() -> bool {
 /// The fused chains that end in the simulation (kv_post, att_post): not without it
 fn kv_fused() -> bool {
     fused() && crate::ops::qsim_on()
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    #[test]
+    fn top_two_finds_the_gap_wherever_the_best_lies() {
+        assert_eq!(top_two(&[1.0, 3.0, 2.5]), (1, 0.5));
+        assert_eq!(top_two(&[3.0, 1.0, 2.0]), (0, 1.0));
+        assert_eq!(top_two(&[1.0, 2.0, 3.0]), (2, 1.0));
+    }
+
+    #[test]
+    fn commit_is_the_sampler_with_the_option_off() {
+        let mut calls = 0;
+        let mut smp = |_: &[f32]| { calls += 1; 7u32 };
+        assert_eq!(commit(&mut smp, &[0.0, 1.0], false), 7);
+        assert_eq!(commit(&mut smp, &[0.0, 1.0], true), 1);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn substitutes_keep_the_best_and_only_replace_the_missing() {
+        // experts 0..6, best first: 1 and 3 are not here
+        let here = |x: usize| x != 1 && x != 3;
+        let sel = [(0, 0.5), (1, 0.3), (2, 0.1), (3, 0.1)];
+        let ranked = [0, 1, 2, 3, 4, 5];
+        assert_eq!(substitute_row(&sel, &ranked, here, 0), (vec![(0, 0.5), (4, 0.3), (2, 0.1), (5, 0.1)], 2));
+        // the two best stay as routed, missing or not
+        assert_eq!(substitute_row(&sel, &ranked, here, 2), (vec![(0, 0.5), (1, 0.3), (2, 0.1), (4, 0.1)], 1));
+        // all here: nothing changes
+        assert_eq!(substitute_row(&sel, &ranked, |_| true, 0), (sel.to_vec(), 0));
+        // no substitute left: the missing one stays
+        assert_eq!(substitute_row(&[(1, 1.0)], &[1], here, 0), (vec![(1, 1.0)], 0));
+    }
+
+    #[test]
+    fn the_gate_off_never_fires_and_infinite_always() {
+        let row = [0.0, 0.0];
+        assert!(!gate_fires(&row, 0.0));
+        assert!(gate_fires(&row, 0.45));
+        assert!(!gate_fires(&[5.0, 0.0], 0.45));
+        assert!(gate_fires(&[5.0, 0.0], f32::INFINITY));
+    }
+
+    #[test]
+    fn the_near_tie_rule_never_keeps_digits_or_operators() {
+        assert!("x1".chars().any(digit_or_operator));
+        assert!(" +".chars().any(digit_or_operator));
+        assert!(!" word".chars().any(digit_or_operator));
+    }
 }

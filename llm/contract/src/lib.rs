@@ -42,6 +42,10 @@ pub trait Sampler {
     fn device(&self) -> Option<DeviceSampling> {
         None
     }
+    /// true: `sample` dictates the token (an audit following a reference), whatever an engine's own options would pick
+    fn forced(&self) -> bool {
+        false
+    }
 }
 
 /// A request's sampling as an engine may run it on the GPU (`Sampler::device`)

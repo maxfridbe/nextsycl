@@ -8,6 +8,10 @@ by default (`--no-mtp` turns it off).
 Findings: [docs/reviews/promethevs.md](docs/reviews/promethevs.md).
 
 - [x] Read https://github.com/Magnvs7/Promethevs for optimizations our DeepSeek engines do not have (nothing of it run)
+- [x] `llm audit` / `audit-report` against Q8_K_XL (routed experts original); margin gate `NS_DS41_GATE`, `mtp-greedy`, `subst`, Q2_K drafter: all off by default, numbers in the review
+- [ ] Why two numeric paths of the same weights agree only 97-98% (the audit's floor): residency ruled out, QSIM not the whole of it
+- [ ] Gates between 0.9 and inf (2, 4): the records say most of the agreement is there; a resident or cached exact tier for their cost
+- [ ] Register `deepseek-v4.1-flash-q8kxl` if the user wants it served (card written, not registered)
 - [ ] Audit a quant token by token against an exact path (first: Q3_K_XL as the stand-in, no download)
 - [ ] MTP drafts' acceptance with greedy decoding (ours 55% sampled, theirs 94.6% greedy)
 - [ ] A low-bit draft head (ours Q8_0 holds 6.7 GB of VRAM)

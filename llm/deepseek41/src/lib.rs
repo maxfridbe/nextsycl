@@ -59,6 +59,11 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "prefetch", env: "NS_PREFETCH", value: "N", help: "experts swapped in ahead of their layer (default 8; 0 none)", at: At::Load },
     EngineOption { name: "lend", env: "NS_LEND", value: "0|1", help: "the prompt arena holds experts while no chunk needs it (default 1)", at: At::Load },
     EngineOption { name: "expert-profile", env: "NS_EXPERT_PROFILE", value: "FILE", help: "which experts fill VRAM first", at: At::Load },
+    EngineOption { name: "mtp-greedy", env: "NS_DS41_MTP_GREEDY", value: "0|1", help: "with the towers: every token its row's argmax, whatever the request's temperature (default 0)", at: At::Load },
+    EngineOption { name: "subst", env: "NS_DS41_SUBST", value: "KEEP", help: "a verify pass's rows after the first keep their KEEP best routed experts and may replace other missing ones by resident ones (unset: off; lossy)", at: At::Load },
+    EngineOption { name: "gate", env: "NS_DS41_GATE", value: "GAP|inf", help: "tokens whose top-two logit gap is under this are recomputed on a second set's routed experts, the sampler reading the corrected logits (default 0: off; needs gate-experts)", at: At::Load },
+    EngineOption { name: "gate-experts", env: "NS_DS41_GATE_EXPERTS", value: "GGUF", help: "the margin gate's second GGUF set, its first shard", at: At::Load },
+    EngineOption { name: "gate-near", env: "NS_DS41_GATE_NEAR", value: "GAP", help: "with the gate: an overturn by less than this keeps the cheap word, unless it has a digit or an operator (default 0: off)", at: At::Load },
     EngineOption { name: "arena-mib", env: "NS_ARENA_MIB", value: "MIB", help: "the prompt path's temporaries", at: At::Load },
 ];
 
@@ -261,6 +266,15 @@ impl Engine for engine::Ds41<'_> {
             v.push(format!("[cold experts (neither in VRAM nor host memory) of {} decode layers: {} layers have one, {} of them all under 0.1 of the routing weight; by share <0.05 / <0.1 / <0.15 / <0.2 / <0.3 / more: {}]",
                            ld(&engine::DEC_LAYERS), ld(&engine::COLD_LAYERS), ld(&engine::COLD_LAYERS_LOW),
                            engine::COLD_BINS.iter().map(ld).map(|x| x.to_string()).collect::<Vec<_>>().join(" / ")));
+        }
+        if std::env::var("NS_DS41_SUBST").is_ok() {
+            v.push(format!("[resident experts taken for missing ones in speculative rows (NS_DS41_SUBST): {}]", engine::SUBSTITUTED.load(std::sync::atomic::Ordering::Relaxed)));
+        }
+        if engine::gate() > 0.0 {
+            let ld = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+            v.push(format!("[margin gate {}: {} tokens recomputed, {} of them changed the best token, {} let stand by the near-tie rule; {:.2} s, {:.2} s of it reading the second set]",
+                           engine::gate(), ld(&engine::GATE_REDONE), ld(&engine::GATE_OVERTURNED), ld(&engine::GATE_NEAR_KEPT),
+                           ld(&engine::GATE_NS) as f64 * 1e-9, ld(&engine::GATE_READ_NS) as f64 * 1e-9));
         }
         let gn = engine::GUESS_N.load(std::sync::atomic::Ordering::Relaxed).max(1) as f64;
         v.push(format!("[the guess's k-th best expert among the next layer's picks (of {gn} decode layers), k = 1..16: {}]",

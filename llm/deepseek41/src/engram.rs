@@ -351,11 +351,7 @@ impl Engram {
                                 Ok(()) => {
                                     let mut out = job.fetch.out.lock().unwrap();
                                     if s.ty == GType::MXFP8 {
-                                        // [scale, 32 codes] x 8 -> 256 codes, then the 8 scales
-                                        for blk in 0..hd / 32 {
-                                            out[at + blk * 32..at + blk * 32 + 32].copy_from_slice(&part[blk * 33 + 1..blk * 33 + 33]);
-                                            out[at + hd + blk] = part[blk * 33];
-                                        }
+                                        mxfp8_row(&part[..s.src], &mut out[at..at + row_bytes(hd)], hd);
                                     } else {
                                         out[at..at + s.src].copy_from_slice(&part[..s.src]);
                                     }
@@ -516,8 +512,31 @@ fn libc_o_direct() -> i32 {
     if cfg!(target_arch = "aarch64") { 0o200000 } else { 0o40000 }
 }
 
+/// An MXFP8 row ([E8M0 scale, 32 E4M3 codes] a block) in the safetensors form the GPU expands: the codes, then the scales
+fn mxfp8_row(src: &[u8], out: &mut [u8], hd: usize) {
+    for blk in 0..hd / 32 {
+        out[blk * 32..blk * 32 + 32].copy_from_slice(&src[blk * 33 + 1..blk * 33 + 33]);
+        out[hd + blk] = src[blk * 33];
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_mxfp8_row_becomes_codes_then_scales() {
+        let hd = 64;
+        let mut src = Vec::new();
+        for blk in 0..2u8 {
+            src.push(100 + blk);
+            src.extend((0..32u8).map(|i| i + blk * 40));
+        }
+        assert_eq!(src.len(), nextsycl_gguf::GType::MXFP8.bytes(hd as u64).unwrap() as usize);
+        let mut out = vec![0u8; super::row_bytes(hd)];
+        super::mxfp8_row(&src, &mut out, hd);
+        assert_eq!((out[0], out[31], out[32], out[63]), (0, 31, 40, 71));
+        assert_eq!(&out[hd..hd + 2], &[100, 101]);
+    }
+
     /// The hash of DeepSeek's NgramHashState on a small table: the product XOR a lookback at a time, modulo the
     /// head's prime, plus its offset
     #[test]
