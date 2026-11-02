@@ -9,6 +9,13 @@ import type { VNode } from "../../vendor/snabbdom/vnode.js";
 import { App } from "./components/App.js";
 import type { Config, ConfigSaved, Spec, State } from "./types.js";
 
+/** Fold a model section shut or open again. */
+export function toggleKind(kind: string): void {
+  ui.collapsed[kind] = !ui.collapsed[kind];
+  try { localStorage.setItem("ns-collapsed", JSON.stringify(ui.collapsed)); } catch { /* a private window: it is only not kept */ }
+  render();
+}
+
 export const ui = {
   state: null as State | null,
   spec: null as Spec | null,
@@ -24,6 +31,8 @@ export const ui = {
   saved: null as ConfigSaved | null,
   /** restarts under way, by service */
   restarting: {} as Record<string, boolean>,
+  /** the model sections (by kind) folded shut: kept across reloads */
+  collapsed: (() => { try { return JSON.parse(localStorage.getItem("ns-collapsed") ?? "{}") as Record<string, boolean>; } catch { return {} as Record<string, boolean>; } })(),
   /** per model: the GPUs picked before enabling */
   pick: {} as Record<string, number[]>,
   /** per model: an action under way from this page (its button spins until the state says it is done) */

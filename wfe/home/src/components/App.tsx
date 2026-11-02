@@ -1,7 +1,7 @@
 /** The page: the host strip and the tabs - Status (the GPUs with what holds them and what is vouched for them, the
  *  models by kind with enable / pin, the front ends, the actions' output) and API. */
 import { jsx } from "../jsx.js";
-import { act, autoPull, copy, maintenance, render, setTab, ui } from "../main.js";
+import { act, autoPull, copy, maintenance, render, setTab, toggleKind, ui } from "../main.js";
 import type { Available, Card, Model, Proc, Service } from "../types.js";
 import { Api } from "./Api.js";
 import { ConfigView } from "./Config.js";
@@ -43,6 +43,101 @@ function procName(p: Proc): string {
   return [p.kind, p.command, p.model].filter((x) => x).join(" ");
 }
 
+/** Where a category sits in every list: chat, images, audio, video, 3D, then the rest. */
+const kindRank = (k: string) => { const i = KINDS.findIndex((x) => x.kind === k); return i < 0 ? KINDS.length : i; };
+
+/** One line of a card's allocations: a model and the job it is making, what it holds now and what it is vouched for. */
+interface AllocRow {
+  key: string;
+  kind: string;
+  name: string;
+  /** the job a running process is making: its title (else its label), and the label beside it */
+  job: string;
+  jobLabel: string;
+  state: string;
+  /** memory the model's processes hold now */
+  held: number;
+  /** what it is vouched for on this card, and the headroom of that */
+  vouched: number;
+  headroom: number;
+  headroomGiven: boolean;
+  /** false: an alternative of a group that runs one at a time, left out of the vouched total */
+  counted: boolean;
+  of?: number | null;
+  measured: boolean;
+  port?: string | null;
+  tip: string;
+}
+
+/** The card's processes and the memory vouched for it as one list, a line a model: the lines with a job on top (next to
+ *  the model that makes it), then by category (chat, images, audio, video, 3D), then the larger first. */
+function allocRows(c: Card): AllocRow[] {
+  const rows: AllocRow[] = [];
+  const used = new Set<Proc>();
+  for (const v of c.vouched) {
+    const mine = c.procs.filter((p) => p.model_id === v.model && !used.has(p) && ["loaded", "busy"].includes(v.state));
+    mine.forEach((p) => used.add(p));
+    const job = mine.find((p) => p.job_title || p.job_label);
+    rows.push({
+      key: `v:${v.model}`, kind: v.kind, name: v.model, job: job?.job_title || job?.job_label || "", jobLabel: job?.job_title ? job.job_label ?? "" : "",
+      state: v.state, held: mine.reduce((n, p) => n + p.vram_mb, 0), vouched: v.mb, headroom: Math.min(v.headroom_mb ?? 0, v.mb),
+      headroomGiven: v.headroom_given, counted: v.counted, of: v.of, measured: v.measured, port: mine[0]?.port ?? null,
+      tip: mine.map((p) => p.args ?? `pid ${p.pid}`).join("\n"),
+    });
+  }
+  for (const p of c.procs.filter((q) => !used.has(q))) {
+    rows.push({
+      key: `p:${p.pid}`, kind: p.kind ?? "", name: procName(p), job: p.job_title || p.job_label || "", jobLabel: p.job_title ? p.job_label ?? "" : "",
+      state: "loaded", held: p.vram_mb, vouched: 0, headroom: 0, headroomGiven: false, counted: true, measured: true, port: p.port ?? null,
+      tip: p.args ?? `pid ${p.pid}`,
+    });
+  }
+  const rank = kindRank;
+  const size = (r: AllocRow) => Math.max(r.held, r.vouched);
+  return rows.sort((x, y) => (+!x.job - +!y.job) || rank(x.kind) - rank(y.kind) || size(y) - size(x) || x.name.localeCompare(y.name));
+}
+
+/** The chunk a line holds of the card, as a bar the card's width: hatched what it is vouched for (its headroom the other
+ *  way), solid what it holds now. */
+function AllocBar(r: AllocRow, total: number) {
+  const pct = (mb: number) => `${Math.min(100, (mb / total) * 100)}%`;
+  const weights = Math.max(0, r.vouched - r.headroom);
+  return (
+    <span class={{ abar: true, alt: !r.counted }} attrs={{ title: `${r.name}: ${r.held ? `${gib(r.held)} GiB held now of ` : ""}${r.vouched ? `${gib(r.vouched)} GiB vouched` : "not vouched"} on a ${gib(total)} GiB card` }}>
+      {weights > 0 ? <i class={{ hatch: true, live: r.held > 0 }} style={{ width: pct(weights), "--c": color(r.kind) } as Record<string, string>} /> : null}
+      {r.headroom > 0 ? <i class={{ hatch: true, rev: true }} style={{ width: pct(r.headroom), "--c": color(r.kind) } as Record<string, string>} /> : null}
+      {r.held > 0 ? <b style={{ width: pct(r.held), background: color(r.kind) }} /> : null}
+    </span>
+  );
+}
+
+const GROUP_WORD: Record<string, string> = { llm: "chat models", video: "video engines" };
+
+function AllocLine(total: number) {
+  return (r: AllocRow) => {
+    const live = r.held > 0;
+    return (
+      <li key={r.key} class={{ dim: !live, alt: !r.counted }} attrs={{ title: r.tip }}>
+        <span class={{ sw: true, hatch: !live }} style={{ background: live ? color(r.kind) : "transparent", "--c": color(r.kind) } as Record<string, string>} />
+        <span class="what">{r.name}{r.port ? <span class="hint"> :{r.port}</span> : null}
+          {r.job
+            ? <span class="jobname" attrs={{ title: r.jobLabel }}> · {r.job}{r.jobLabel ? <span class="hint"> {r.jobLabel}</span> : null}</span>
+            : null}
+          {r.of && r.of > 1
+            ? <span class="hint"> {r.counted
+                ? `(one of ${r.of} ${GROUP_WORD[r.kind] ?? "models"}: one runs at a time)`
+                : `(an alternative: one of ${r.of} ${GROUP_WORD[r.kind] ?? "models"} runs at a time, so it is not counted)`}</span>
+            : null}
+          {!live ? <span class="hint"> {r.state}{r.measured ? "" : " · estimate"}</span> : null}
+          {r.vouched > 0 && r.headroom > 0 && live ? <span class="hint"> · vouched {Alloc(r.vouched, r.headroom, r.kind, r.headroomGiven)}</span> : null}
+        </span>
+        {AllocBar(r, total)}
+        <span class="mb">{live ? `${gib(r.held)} GiB` : Alloc(r.vouched, r.headroom, r.kind, r.headroomGiven)}</span>
+      </li>
+    );
+  };
+}
+
 function CardView(c: Card) {
   const total = Math.max(c.vram_total_mb, 1);
   const free = c.vram_total_mb - c.vram_used_mb;
@@ -57,7 +152,7 @@ function CardView(c: Card) {
       </div>
       <div class="meter vouch" attrs={{ title: `${gib(c.vouched_mb)} GiB vouched for by the enabled models` }}>
         {/* each model's weights, then its headroom: the same color, the stripes the other way */}
-        {c.vouched.filter((v) => v.counted).map((v) => {
+        {[...c.vouched].filter((v) => v.counted).sort((a, b) => kindRank(a.kind) - kindRank(b.kind) || b.mb - a.mb).map((v) => {
           const h = Math.min(v.headroom_mb ?? 0, v.mb);
           const live = ["loaded", "busy"].includes(v.state);
           const seg = (mb: number, rev: boolean) => mb > 0
@@ -77,29 +172,7 @@ function CardView(c: Card) {
         {c.pcie?.cur ? <span>PCIe <b>{c.pcie.cur.gen ? `${c.pcie.cur.gen}.0` : "?"} x{c.pcie.cur.width}</b></span> : null}
       </div>
       <ul class="procs">
-        {c.procs.map((p) => {
-          // a loaded model's process: what it is vouched for beside what it holds now
-          const v = c.vouched.find((x) => x.model === p.model_id && ["loaded", "busy"].includes(x.state));
-          return (
-          <li attrs={{ title: p.args ?? `pid ${p.pid}` }}>
-            <span class="sw" style={{ background: color(p.kind) }} />
-            <span class="what">{procName(p)}{p.port ? <span class="hint"> :{p.port}</span> : null}
-              {p.job_title || p.job_label ? <span> · {p.job_title || p.job_label}{p.job_title && p.job_label ? <span class="hint"> {p.job_label}</span> : null}</span> : null}
-              {v && v.headroom_mb > 0 ? <span class="hint"> · vouched {Alloc(v.mb, v.headroom_mb, v.kind, v.headroom_given)}</span> : null}</span>
-            <span class="mb">{gib(p.vram_mb)} GiB</span>
-          </li>
-          );
-        })}
-        {c.vouched.filter((v) => !["loaded", "busy"].includes(v.state)).map((v) => (
-          <li class="dim">
-            <span class="sw hatch" style={{ "--c": color(v.kind) } as Record<string, string>} />
-            <span class="what">{v.model}{v.counted
-                ? (v.of && v.of > 1 ? <span class="hint"> (one of {v.of} {v.kind === "llm" ? "chat models" : "video engines"}: one runs at a time)</span> : null)
-                : <span class="hint"> (one {v.kind === "llm" ? "chat model" : "video engine"} runs at a time; not counted)</span>}
-              <span class="hint"> {v.state}{v.measured ? "" : " · estimate"}</span></span>
-            <span class="mb">{Alloc(v.mb, v.headroom_mb ?? 0, v.kind, v.headroom_given)}</span>
-          </li>
-        ))}
+        {allocRows(c).map(AllocLine(total))}
         {!c.procs.length && !c.vouched.length ? <li class="dim"><span class="what hint">free, nothing enabled here</span></li> : null}
       </ul>
     </div>
@@ -222,11 +295,16 @@ function Models() {
           const list = st.models.filter((m) => m.kind === k.kind);
           if (!list.length) return null;
           const on = list.filter((m) => m.enabled).length;
+          const shut = !!ui.collapsed[k.kind];
           return (
-            <div class="kind">
-              <h4 style={{ color: color(k.kind) }}><span class="i" props={{ innerHTML: k.icon }} /> {k.title}
+            <div class={{ kind: true, shut }} key={k.kind}>
+              <h4 style={{ color: color(k.kind) }} class={{ fold: true }}
+                attrs={{ role: "button", tabindex: 0, "aria-expanded": String(!shut), title: shut ? `show the ${k.title.toLowerCase()} models` : `fold the ${k.title.toLowerCase()} models away` }}
+                on={{ click: () => toggleKind(k.kind), keydown: (e: KeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleKind(k.kind); } } }}>
+                <span class="chev" props={{ innerHTML: shut ? "&#9656;" : "&#9662;" }} />
+                <span class="i" props={{ innerHTML: k.icon }} /> {k.title}
                 <span class="hint"> {on} of {list.length} enabled</span></h4>
-              {list.map(ModelRow)}
+              {shut ? null : list.map(ModelRow)}
             </div>
           );
         })}
