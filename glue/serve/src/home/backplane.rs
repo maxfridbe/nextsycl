@@ -148,6 +148,26 @@ fn video_missing(enabled: &[String], running: Option<&[String]>) -> bool {
     !enabled.is_empty() && running.is_none_or(|r| enabled.iter().any(|e| !r.contains(e)))
 }
 
+/// The running jobs and clips put on the cards' processes (`job_label`, `job_title`: a process's own `title` is its
+/// model's): a clip on its card's video process, a job on a free process of its model.
+pub(super) fn name_procs(cards: &mut Value, clips: &[Value], jobs: &[Value]) {
+    let mut left: Vec<&Value> = jobs.iter().filter(|j| j["state"] == "running").collect();
+    for c in cards.as_array_mut().into_iter().flatten() {
+        let g = c["index"].clone();
+        for p in c["procs"].as_array_mut().into_iter().flatten() {
+            let found = if p["kind"] == "video" {
+                clips.iter().find(|x| x["gpu"] == g)
+            } else {
+                left.iter().position(|j| !p["model_id"].is_null() && j["model"] == p["model_id"]).map(|i| left.remove(i))
+            };
+            if let Some(w) = found {
+                p["job_label"] = w["label"].clone();
+                p["job_title"] = w["title"].clone();
+            }
+        }
+    }
+}
+
 /// The clips a studio's status says are running: its `running_clips`; a studio that only says one, that one
 pub(super) fn clip_rows(st: &Value) -> Vec<Value> {
     if let Some(a) = st["running_clips"].as_array() {
@@ -156,7 +176,7 @@ pub(super) fn clip_rows(st: &Value) -> Vec<Value> {
     if st.is_null() || st["idle"] == true {
         return Vec::new();
     }
-    vec![json!({"label": st["job"]["label"], "name": st["job"]["name"], "eta": st["eta"], "elapsed": st["elapsed"], "stage": st["stage"], "pct": st["pct"], "gpu": st["gpu"],
+    vec![json!({"label": st["job"]["label"], "title": st["job"]["title"], "name": st["job"]["name"], "eta": st["eta"], "elapsed": st["elapsed"], "stage": st["stage"], "pct": st["pct"], "gpu": st["gpu"],
                 "waiting_for": st["waiting_for"], "energy_wh": st["job"]["energy_wh"], "job": st["job"]})]
 }
 
@@ -749,5 +769,25 @@ mod tests {
         assert_eq!(clip_model(&json!({"engine": "Q6_K"}), &all).as_deref(), Some("minimax-h3-q6k"));
         assert_eq!(clip_model(&json!({"ref_images": []}), &all).as_deref(), Some("minimax-h3-ref2va"));
         assert_eq!(clip_model(&json!({"prompt": "x"}), &[json!({"id": "other", "kind": "video"})]).as_deref(), Some("other"), "no minimax-h3: the first");
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use serde_json::json;
+
+    #[test]
+    fn the_cards_processes_say_what_they_make_by_title() {
+        let mut cards = json!([
+            {"index": 0, "procs": [{"kind": "video", "title": "the model's"}]},
+            {"index": 1, "procs": [{"kind": "image", "model_id": "q"}, {"kind": "image", "model_id": "q"}, {"kind": "audio", "model_id": "z"}]}]);
+        let clips = [json!({"gpu": 0, "label": "run:shots:0:019", "title": "Blackbird - pass 12"})];
+        let jobs = [json!({"state": "running", "model": "q", "label": "a", "title": "An image"}), json!({"state": "queued", "model": "z", "label": "b", "title": "waits"})];
+        super::name_procs(&mut cards, &clips, &jobs);
+        assert_eq!(cards[0]["procs"][0]["job_title"], "Blackbird - pass 12");
+        assert_eq!(cards[0]["procs"][0]["title"], "the model's", "the process's own title stays its model's");
+        assert_eq!(cards[1]["procs"][0]["job_title"], "An image");
+        assert!(cards[1]["procs"][1]["job_label"].is_null(), "one job, one process");
+        assert!(cards[1]["procs"][2]["job_label"].is_null(), "a queued job is on no process");
     }
 }

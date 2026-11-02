@@ -5,7 +5,7 @@ import { api } from "../api.js";
 import { render, state } from "../state.js";
 import { navigate } from "../router.js";
 import type { ListRow } from "../types.js";
-import { clipNumber, fmtMS, labelPrefix } from "../util.js";
+import { jobLabelBeside, jobName, clipNumber, fmtMS, labelPrefix } from "../util.js";
 import { Spinner } from "./Spinner.js";
 import { Panel } from "./Panel.js";
 
@@ -33,7 +33,7 @@ async function open(row: ListRow): Promise<void> {
 export function Completed() {
   const f = state.filter.toLowerCase();
   const rows = state.list.filter(
-    (x) => !f || `${x.file} ${x.label ?? ""} ${x.project ?? ""}`.toLowerCase().includes(f),
+    (x) => !f || `${x.file} ${x.title ?? ""} ${x.label ?? ""} ${x.project ?? ""}`.toLowerCase().includes(f),
   );
   const filter = (
     <input
@@ -70,7 +70,7 @@ export function Completed() {
               return (
                 <tr class={{ click: true, sel: selected }} on={{ click: () => void open(x) }}>
                   <td>{x.file.replace(/\.mp4$/, "").replace(/^h3_/, "")}</td>
-                  <td class="lab accent">{x.label ?? ""}</td>
+                  <td class="lab accent">{jobName(x)}{jobLabelBeside(x) ? <span class="hint"> {jobLabelBeside(x)}</span> : null}</td>
                   <td class="hint">{project}</td>
                   <td class="num">{x.seconds ?? ""}</td>
                   <td class="num">{x.steps ?? ""}</td>

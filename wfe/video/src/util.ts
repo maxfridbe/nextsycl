@@ -12,6 +12,11 @@ export const fmtT = (x: number | null | undefined): string => {
   return `${Math.round(x)}s`;
 };
 
+/** What a job is called in a list: the title people gave it, else the label */
+export const jobName = (x: { title?: string | null; label?: string | null }): string => x.title || x.label || "";
+/** The label to show small beside the title (none when the label is already the name) */
+export const jobLabelBeside = (x: { title?: string | null; label?: string | null }): string => (x.title && x.label ? x.label : "");
+
 export const clipNumber = (label: string): number => {
   const m = /\s(\d+)\//.exec(label);
   return m?.[1] ? parseInt(m[1], 10) : 0;

@@ -9,7 +9,7 @@ import { api } from "../api.js";
 import { cameraName, render, setCameraName, state } from "../state.js";
 import { navigate } from "../router.js";
 import type { Scene, TimelineClip } from "../types.js";
-import { fmtMS, fmtT, here } from "../util.js";
+import { jobName, fmtMS, fmtT, here } from "../util.js";
 import { ClipProgress } from "./Progress.js";
 import { Detail } from "./Detail.js";
 import { Spinner } from "./Spinner.js";
@@ -93,7 +93,7 @@ function ClipCard(props: { placed: Placed; px: number }) {
       class={{ tlc: true, [clip.state]: true, sel: state.selected === clip.n }}
       dataset={{ n: String(clip.n) }}
       style={{ left: `${Math.round(at * props.px)}px`, width: `${Math.max(26, Math.round((clip.seconds || 0) * props.px))}px` }}
-      attrs={{ title: `${clip.label}\n${alt}` }}
+      attrs={{ title: `${jobName(clip)}\n${alt}` }}
       on={{ click: () => navigate({ clip: clip.n }) }}
     >
       {clip.thumb
@@ -144,7 +144,7 @@ function ProjectProgress(props: { clips: TimelineClip[]; total: number }) {
           ? <div
               class="now"
               style={{ left: `${Math.round(((doneSeconds + (running.seconds || 0) / 2) / Math.max(total, 1)) * 100)}%` }}
-              attrs={{ title: running.label }}
+              attrs={{ title: jobName(running) }}
             />
           : null}
       </div>

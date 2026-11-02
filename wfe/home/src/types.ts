@@ -9,6 +9,9 @@ export interface Proc {
   model?: string | null;
   /** its model's registry id, when its file is a registered one */
   model_id?: string | null;
+  /** what it is making: the job's label and the name people gave it */
+  job_label?: string | null;
+  job_title?: string | null;
   port?: string | null;
   gpus?: string[];
   args?: string;

@@ -257,11 +257,11 @@ impl Home {
                 let text = |k: &str| Some(s(b, k).trim().chars().take(60).collect::<String>()).filter(|x| !x.is_empty());
                 let mut body = b.clone();
                 if let Some(o) = body.as_object_mut() {
-                    for k in ["wait", "label", "reentrant_id", "reentrantid", "priority", "held", "queue", "project", "batch", "rsvp_s", "max_willing_to_wait_s"] {
+                    for k in ["wait", "label", "title", "reentrant_id", "reentrantid", "priority", "held", "queue", "project", "batch", "rsvp_s", "max_willing_to_wait_s"] {
                         o.remove(k);
                     }
                 }
-                let mut j = json!({"id": id, "kind": kind, "method": name, "label": label, "reentrant_id": rid, "state": "queued",
+                let mut j = json!({"id": id, "kind": kind, "method": name, "label": label, "title": crate::video::studio::queue::title_of(b), "reentrant_id": rid, "state": "queued",
                                    "created": now(), "started": null, "ended": null, "priority": priority, "held": b["held"] == true,
                                    "project": text("project"), "batch": text("batch"), "body": body,
                                    "rsvp_s": b["rsvp_s"], "max_willing_to_wait_s": b["max_willing_to_wait_s"]});
@@ -395,7 +395,7 @@ impl Home {
     /// while it runs, its place while it waits
     fn job_view(&self, j: &Value, running: Option<&[(String, Value)]>) -> Value {
         let mut v = json!({});
-        for k in ["id", "kind", "method", "label", "reentrant_id", "created", "started", "ended", "restarted", "priority", "project", "batch", "voice", "max_willing_to_wait_s"] {
+        for k in ["id", "kind", "method", "label", "title", "reentrant_id", "created", "started", "ended", "restarted", "priority", "project", "batch", "voice", "max_willing_to_wait_s"] {
             if !j[k].is_null() {
                 v[k] = j[k].clone();
             }
@@ -707,7 +707,7 @@ impl Home {
     pub(crate) fn jobs_open(&self) -> Vec<Value> {
         let paused = self.jobs.paused.lock().unwrap().clone();
         self.jobs.list.lock().unwrap().iter().filter(|j| !ended(j))
-            .map(|j| json!({"id": j["id"], "kind": j["kind"], "label": j["label"], "state": j["state"],
+            .map(|j| json!({"id": j["id"], "kind": j["kind"], "label": j["label"], "title": j["title"], "state": j["state"], "model": j["body"]["model"],
                             "held": j["state"] == "queued" && held(j, &paused[j["kind"].as_str().unwrap_or("")])})).collect()
     }
 }

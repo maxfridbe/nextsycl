@@ -666,6 +666,13 @@ impl Home {
             ids.into_iter().filter_map(|id| self.run_json(id, 2048)).collect()
         };
         let mut cards = cards;
+        // what the processes are making, by the names people gave it
+        let clips = if cards.to_string().contains("\"kind\":\"video\"") {
+            call_for(&self.target("video"), "POST", "/rpc/status", Some(&json!({})), 3).ok().map(|v| backplane::clip_rows(&v["result"])).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        backplane::name_procs(&mut cards, &clips, &self.jobs_open());
         self.vouch(&mut cards, &models);
         let maintenance = self.maintenance().map(|n| {
             let mut v = maint::public(&n);

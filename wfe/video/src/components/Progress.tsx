@@ -9,7 +9,7 @@ import { api, rpc } from "../api.js";
 import { navigate } from "../router.js";
 import { refresh, render, state } from "../state.js";
 import type { ClipRow } from "../types.js";
-import { clipNumber, fmtT } from "../util.js";
+import { jobLabelBeside, jobName, clipNumber, fmtT } from "../util.js";
 
 /** The clips a cancel was asked for: their buttons read "cancelling…" until the engine stops them at the next step
  *  (seconds, mid-step), so the click shows at once */
@@ -21,7 +21,7 @@ export function runningClips(): ClipRow[] {
   if (!s || s.idle) return [];
   if (s.running_clips) return s.running_clips;
   return s.job
-    ? [{ label: s.job.label, name: s.job.name, project: s.job.project, job: s.job, seconds: s.job.seconds, steps: s.job.steps,
+    ? [{ label: s.job.label, title: s.job.title, name: s.job.name, project: s.job.project, job: s.job, seconds: s.job.seconds, steps: s.job.steps,
          width: s.job.width, height: s.job.height, engine: s.job.engine, stage: s.stage, pct: s.pct, eta: s.eta, elapsed: s.elapsed, error: s.error }]
     : [];
 }
@@ -53,10 +53,10 @@ function lastFailure() {
   if (!s || (!f && !err) || (!last && (!s.idle || s.stage !== "failed"))) return null;
   // asked for: said plainly, not as a failure
   if (f?.code === "cancelled") {
-    return <div class="hint">{`Last clip cancelled${job?.label ? ` · ${job.label}` : ""}.`}</div>;
+    return <div class="hint">{`Last clip cancelled${job && jobName(job) ? ` · ${jobName(job)}` : ""}.`}</div>;
   }
   const message = f?.message ?? (err ?? "").split("\n")[0] ?? "";
-  const label = job?.label ? `${job.label} · ` : "";
+  const label = job && jobName(job) ? `${jobName(job)} · ` : "";
   const size = job?.width && job.height ? `${job.width}x${job.height}, ${job.seconds ?? "?"} s` : "";
   return (
     <div class="lastfail">
@@ -104,9 +104,9 @@ export function ClipProgress() {
 function clipRow(c: ClipRow) {
   const pct = c.pct ?? 0;
   const icon = c.error ? "&#xf071;" : c.done ? "&#xf00c;" : "&#xf110;";
-  const label = c.label ?? "";
+  const label = jobName(c);
   const project = c.project ?? null;
-  const n = clipNumber(label);
+  const n = clipNumber(c.label ?? "");
   const jump = project && n
     ? () => navigate({ tab: "jobs", project, clip: n })
     : null;
@@ -123,6 +123,7 @@ function clipRow(c: ClipRow) {
               on={jump ? { click: jump } : {}}
             >{label}</a>
           : null}
+        {jobLabelBeside(c) ? <span class="hint"> {jobLabelBeside(c)}</span> : null}
         {label ? " · " : ""}{c.stage ?? ""}{" "}
         <span class="hint">
           {`${pct}%${c.eta ? ` · ${fmtT(c.eta)} left` : ""}${c.elapsed ? ` · ${fmtT(c.elapsed)} elapsed` : ""}`}

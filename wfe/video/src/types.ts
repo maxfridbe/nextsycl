@@ -22,6 +22,7 @@ export interface GenerateRequest {
   seed?: number;
   te?: "teacher" | "student";
   label?: string;
+  title?: string | null;
   width?: number;
   height?: number;
   engine?: Engine;
@@ -71,6 +72,7 @@ export interface Job extends GenerateRequest {
 
 export interface QueueItem {
   label: string;
+  title?: string | null;
   seconds: number;
   steps: number;
   engine?: Engine;
@@ -105,6 +107,7 @@ export interface LlmStatus {
 /** One clip being made (or lately ended): running_clips, ended_clips */
 export interface ClipRow {
   label?: string;
+  title?: string | null;
   name?: string;
   project?: string;
   job?: Job;
@@ -166,6 +169,7 @@ export interface TimelineClip {
   seconds: number;
   camera: string | null;
   label: string;
+  title?: string | null;
   dialogue: string;
   thumb: string | null;
 }
@@ -179,6 +183,7 @@ export interface Join { project: string; clips: number; file: string; state: "ru
 export interface ListRow {
   file: string;
   label?: string;
+  title?: string | null;
   project?: string;
   camera?: string | null;
   seconds?: number;

@@ -84,6 +84,7 @@ function CardView(c: Card) {
           <li attrs={{ title: p.args ?? `pid ${p.pid}` }}>
             <span class="sw" style={{ background: color(p.kind) }} />
             <span class="what">{procName(p)}{p.port ? <span class="hint"> :{p.port}</span> : null}
+              {p.job_title || p.job_label ? <span> · {p.job_title || p.job_label}{p.job_title && p.job_label ? <span class="hint"> {p.job_label}</span> : null}</span> : null}
               {v && v.headroom_mb > 0 ? <span class="hint"> · vouched {Alloc(v.mb, v.headroom_mb, v.kind, v.headroom_given)}</span> : null}</span>
             <span class="mb">{gib(p.vram_mb)} GiB</span>
           </li>

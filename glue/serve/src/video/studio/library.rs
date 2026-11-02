@@ -87,7 +87,7 @@ impl Studio {
                 let mut row = json!({"file": n, "size": size, "mtime": mt as i64});
                 if let Some(side) = sides.get(n.trim_end_matches(".mp4")) {
                     let j = &side["job"];
-                    for (k, v) in [("total", side["times"]["TOTAL"].clone()), ("steps", j["steps"].clone()), ("te", j["te"].clone()), ("label", j["label"].clone()),
+                    for (k, v) in [("total", side["times"]["TOTAL"].clone()), ("steps", j["steps"].clone()), ("te", j["te"].clone()), ("label", j["label"].clone()), ("title", j["title"].clone()),
                                    ("seconds", j["seconds"].clone()), ("energy_wh", side["energy_wh"].clone()), ("engine", j["engine"].clone()),
                                    ("speech_pct", j["speech_pct"].clone()), ("camera", j["camera"].clone())] {
                         row[k] = v;
@@ -183,7 +183,7 @@ impl Studio {
             if !seen.insert(n) {
                 continue;
             }
-            out.push(json!({"n": n, "name": stem, "state": "done", "seconds": j["seconds"], "camera": j["camera"], "label": j["label"],
+            out.push(json!({"n": n, "name": stem, "state": "done", "seconds": j["seconds"], "camera": j["camera"], "label": j["label"], "title": j["title"],
                             "dialogue": dialogue_of(&s(j, "prompt")), "thumb": format!("/thumb/{stem}.webp")}));
         }
         let running: Vec<Value> = st.running.iter().map(|j| j.rec.clone()).collect();
@@ -196,7 +196,7 @@ impl Studio {
                 continue;
             }
             out.push(json!({"n": n, "name": it.get("name").cloned().unwrap_or(Value::Null), "state": state, "seconds": it["seconds"], "camera": it["camera"],
-                            "label": it["label"], "dialogue": dialogue_of(&s(it, "prompt")), "thumb": Value::Null}));
+                            "label": it["label"], "title": it["title"], "dialogue": dialogue_of(&s(it, "prompt")), "thumb": Value::Null}));
         }
         out.sort_by_key(|c| c["n"].as_u64().unwrap_or(0));
         out
@@ -216,7 +216,7 @@ impl Studio {
                 continue;
             }
             let mut m = Map::new();
-            for (k, v) in [("n", c["n"].clone()), ("camera", src["camera"].clone()), ("seconds", src["seconds"].clone()), ("label", src["label"].clone()), ("prompt", src["prompt"].clone())] {
+            for (k, v) in [("n", c["n"].clone()), ("camera", src["camera"].clone()), ("seconds", src["seconds"].clone()), ("label", src["label"].clone()), ("title", src["title"].clone()), ("prompt", src["prompt"].clone())] {
                 m.insert(k.into(), v);
             }
             for k in SCENE_DEFAULTABLE {

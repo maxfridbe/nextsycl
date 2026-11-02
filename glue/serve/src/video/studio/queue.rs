@@ -99,6 +99,16 @@ pub fn dialogue_of(prompt: &str) -> String {
     out.join(" / ")
 }
 
+/// A job's name for people: a request's `title`, on one line, 120 characters at most (none: null, the label shows).
+/// Never matched on, so nothing else is asked of it.
+pub fn title_of(p: &Value) -> Value {
+    let t: String = p["title"].as_str().unwrap_or("").chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    match t.trim().chars().take(120).collect::<String>() {
+        t if t.is_empty() => Value::Null,
+        t => json!(t),
+    }
+}
+
 /// The legacy label filter: word characters and ` -.,:'()!?/`, 80 at most.
 fn clean_label(l: &str) -> String {
     let kept: String = l.chars().filter(|c| c.is_alphanumeric() || *c == '_' || " -.,:'()!?/".contains(*c)).collect();
@@ -200,7 +210,7 @@ fn ignored_keys() -> Vec<String> {
 }
 
 pub fn inputs_of(quant: &str) -> Value {
-    let common = ["prompt", "seconds", "frames", "steps", "seed", "width", "height", "te", "first_frame", "last_frame", "exposure_ref", "guide_clip",
+    let common = ["prompt", "title", "seconds", "frames", "steps", "seed", "width", "height", "te", "first_frame", "last_frame", "exposure_ref", "guide_clip",
                   "first_audio", "first_audio_s", "soundtrack", "soundtrack_start", "exposure_fix", "exposure_offset", "exposure_ease", "exposure_target", "ref_audios", "loras", "upscale", "upscaler", "shift_video", "shift_audio", "sampler", "schedule", "knots", "chain", "source", "regen", "regen_box"];
     if quant == "REF2VA" {
         json!({"takes": common.iter().chain(["ref_images", "ref_videos", "ref_image_size", "ref_video_sound", "te_pictures"].iter()).collect::<Vec<_>>(),
@@ -376,6 +386,7 @@ impl Studio {
         it.insert("steps".into(), num(p, "steps", 10.0, 1.0, 40.0, true)?);
         it.insert("seed".into(), num(p, "seed", 0.0, -2147483648.0, 2147483648.0, true)?);
         it.insert("te".into(), json!(te));
+        it.insert("title".into(), title_of(p));
         it.insert("label".into(), json!(clean_label(&p.get("label").map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).unwrap_or_default())));
         let engine = engine_name(p.get("engine").and_then(|v| v.as_str()));
         if engine != "INT8" && !engine_known(&engine) {
@@ -556,7 +567,7 @@ impl Queue {
         let mut m = Map::new();
         m.insert("queue".into(), json!(self.items.iter().map(|i| { let l = s(i, "label"); if l.is_empty() { s(i, "prompt").chars().take(40).collect() } else { l } }).collect::<Vec<_>>()));
         m.insert("queue_items".into(), json!(self.items.iter().map(|i| json!({
-            "label": s(i, "label"), "seconds": i["seconds"], "steps": i["steps"], "engine": i["engine"], "chain": !i["first_frame"].is_null(),
+            "label": s(i, "label"), "title": i["title"], "seconds": i["seconds"], "steps": i["steps"], "engine": i["engine"], "chain": !i["first_frame"].is_null(),
             "size": format!("{}x{}", i["width"].as_i64().unwrap_or(640), i["height"].as_i64().unwrap_or(480)),
             "project": project_of(i), "batch": s(i, "batch"), "held": self.held(i)})).collect::<Vec<_>>()));
         m.insert("paused".into(), json!(self.paused));
@@ -570,6 +581,16 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_title_is_one_line_of_120_at_most_and_none_is_null() {
+        assert_eq!(title_of(&json!({"title": "  Blackbird (Mach 3.2) - shots - pass 12 of 24 "})), json!("Blackbird (Mach 3.2) - shots - pass 12 of 24"));
+        assert_eq!(title_of(&json!({"title": "a\nb"})), json!("a b"));
+        assert_eq!(title_of(&json!({"title": "é".repeat(200)})).as_str().unwrap().chars().count(), 120);
+        for none in [json!({}), json!({"title": "  "}), json!({"title": 7})] {
+            assert_eq!(title_of(&none), Value::Null);
+        }
+    }
 
     #[test]
     fn labels() {

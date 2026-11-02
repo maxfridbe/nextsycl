@@ -69,6 +69,11 @@ export interface AudioGenerateReq {
    * @maxLength 120
    */
   label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
   /** acestep-1.5: the lyrics' language as a code (en, zh, ja, es ...; default unknown) */
   language?: string | null;
   /** the model's id; none: the loaded one, else the first enabled */
@@ -248,6 +253,11 @@ export interface AudioSpeakReq {
    * @maxLength 120
    */
   label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
   /** english, chinese, japanese ... or auto (default). Checked when submitted against the model's list (Qwen3-TTS: chinese, english, german, italian, portuguese, spanish, japanese, korean, french, russian); VoxCPM2 has no list and takes any */
   language?: string | null;
   /** the model's id; none: the loaded one, else the first enabled */
@@ -340,6 +350,11 @@ export interface AudioTranscribeReq {
    * @maxLength 120
    */
   label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
   /** a code or a name (en, english, de, german ...); none or auto: detected on the first 30 s */
   language?: string | null;
   /** the model's id; none: the loaded one, else the first enabled */
@@ -468,6 +483,11 @@ export interface AudioVoicesEnrollReq {
    * @maxLength 120
    */
   label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
   /** the model to enroll it for (default: the registered one that speaks enrolled voices) */
   model?: string | null;
   /** the saved voice (audio.voices.list) */
@@ -581,6 +601,11 @@ export interface ImageEditReq {
    */
   label?: string | null;
   /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
+  /**
    * LoRAs for this request (a registered LoRA's id - system.models kind lora - or a file), each with its strength: Qwen-Image 2.1 runs them beside the loaded weights for this request only (no reload; each file read once and kept, a few-step LoRA's sigmas applied); other models reload with them merged
    * @items {"oneOf":[{"description":"name:scale","type":"string"},{"properties":{"name":{"type":"string"},"scale":{"default":1,"type":"number"}},"required":["name"],"type":"object"}]}
    */
@@ -669,6 +694,11 @@ export interface ImageGenerateReq {
    * @maxLength 120
    */
   label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
   /**
    * LoRAs for this request (a registered LoRA's id - system.models kind lora - or a file), each with its strength: Qwen-Image 2.1 runs them beside the loaded weights for this request only (no reload; each file read once and kept, a few-step LoRA's sigmas applied); other models reload with them merged
    * @items {"oneOf":[{"description":"name:scale","type":"string"},{"properties":{"name":{"type":"string"},"scale":{"default":1,"type":"number"}},"required":["name"],"type":"object"}]}
@@ -899,6 +929,11 @@ export interface ImageUpscaleReq {
    * @maxLength 120
    */
   label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
   /** the model's id; none: the loaded one, else the first enabled */
   model?: string | null;
   /**
@@ -984,6 +1019,11 @@ export interface ImageVectorizeReq {
    * @maxLength 120
    */
   label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
   /**
    * the sequence at most as the model counts it (the picture's 257 rows and the prompt first: 5000 leaves 4741 tokens of SVG)
    * @minimum 260
@@ -1157,6 +1197,11 @@ export interface Model3dGenerateReq {
    * @maxLength 120
    */
   label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
   /** a mesh to paint instead of making one (a model whose card says paint: Hunyuan3D 2.1, hunyuan3d-2.1-paint): a GLB or OBJ as base64 or a data: URL; image says how it is painted */
   mesh?: string | null;
   /** the model's id; none: the loaded one, else the first enabled */
@@ -1328,6 +1373,11 @@ export interface Model3dRigReq {
    * @maxLength 120
    */
   label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
   /** the mesh: GLB or OBJ as base64, a data: URL or upload:<name> (model3d.upload) */
   mesh?: string | null;
   /** the model's id; none: the loaded one, else the first enabled */
@@ -1824,6 +1874,11 @@ export interface VideoGenerateReq {
    * @maxLength 80
    */
   label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
   /** anchor or file: the clip ends on this picture (prev: the newest clip anywhere) */
   last_frame?: string | null;
   /**
@@ -2096,6 +2151,11 @@ export interface VideoUpscaleReq {
    * @maxLength 120
    */
   label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
   /** the model's id; none: the loaded one, else the first enabled */
   model?: string | null;
   /** as image.upscale */

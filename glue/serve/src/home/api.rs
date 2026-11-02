@@ -41,7 +41,7 @@ const FEATURES: &[&str] = &[
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
-    "video.slots.cards", "video.running_clips", "video.status.clip", "video.cancel.name", "video.reentry.before_limit", "video.reentry.label",
+    "video.slots.cards", "video.running_clips", "video.status.clip", "video.cancel.name", "video.reentry.before_limit", "video.reentry.label", "jobs.title",
     "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request", "video.soundtrack", "video.exposure_fix",
     "backplane", "system.busy.engines", "models.profile", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand",
 ];
@@ -543,11 +543,11 @@ impl Home {
                 .or_else(|| slots.iter().find(|x| x["kind"] == "video" && x["busy"] == true).map(|x| x["gpu"].clone())).unwrap_or(Value::Null);
             let on = |k: &str| if running { st[k].clone() } else { Value::Null };
             let free = super::backplane::slots_free(&st);
-            let clips: Vec<Value> = rows.iter().map(|c| json!({"label": c["label"], "name": c["name"], "stage": c["stage"], "pct": c["pct"], "eta_s": c["eta"], "elapsed_s": c["elapsed"],
+            let clips: Vec<Value> = rows.iter().map(|c| json!({"label": c["label"], "title": c["title"], "name": c["name"], "stage": c["stage"], "pct": c["pct"], "eta_s": c["eta"], "elapsed_s": c["elapsed"],
                                                                "gpu": c["gpu"], "energy_wh": c["energy_wh"], "waiting_for": c["waiting_for"]})).collect();
             // a studio that does not say (one before two clips at once): nothing running and nothing runnable
             let accepts = !st.is_null() && st["accepts"].as_bool().unwrap_or(!running && runnable == 0);
-            json!({"running": running, "label": if running { st["job"]["label"].clone() } else { Value::Null }, "name": if running { st["job"]["name"].clone() } else { Value::Null },
+            json!({"running": running, "label": if running { st["job"]["label"].clone() } else { Value::Null }, "title": if running { st["job"]["title"].clone() } else { Value::Null }, "name": if running { st["job"]["name"].clone() } else { Value::Null },
                    "stage": on("stage"), "pct": on("pct"), "eta_s": on("eta"), "elapsed_s": on("elapsed"), "gpu": gpu,
                    "energy_wh": if running { st["job"]["energy_wh"].clone() } else { Value::Null },
                    "queued": items.len(), "runnable": runnable, "held": held,
@@ -560,13 +560,20 @@ impl Home {
         for x in slots.iter_mut().filter(|x| x["kind"] == "llm") {
             x["busy"] = json!(active > 0);
         }
+        let clips_now: Vec<Value> = video["clips"].as_array().cloned().unwrap_or_default();
+        let mut cards = cards;
+        super::backplane::name_procs(&mut cards, &clips_now, &jobs);
         let per_card: Vec<Value> = cards.as_array().into_iter().flatten().map(|c| {
             let g = c["index"].clone();
             let here: Vec<&Value> = slots.iter().filter(|x| x["gpu"] == g || x["gpus"].as_array().is_some_and(|a| a.contains(&g))).collect();
             let models: Vec<Value> = c["procs"].as_array().into_iter().flatten().filter_map(|p| p["model_id"].as_str().map(|m| json!(m))).collect();
             json!({"gpu": g, "name": c["name"], "vram_total_mb": c["vram_total_mb"], "vram_used_mb": c["vram_used_mb"], "busy_pct": c["busy_pct"],
                    "power_w": c["power_w"], "models": models, "busy": here.iter().any(|x| x["busy"] == true),
-                   "work": here.iter().filter(|x| x["busy"] == true).map(|x| json!({"kind": x["kind"], "model": x["model"]})).collect::<Vec<_>>()})
+                   "work": here.iter().filter(|x| x["busy"] == true).map(|x| json!({"kind": x["kind"], "model": x["model"]})).collect::<Vec<_>>(),
+                   // what is being made there, by the names people gave it
+                   "jobs": clips_now.iter().filter(|x| x["gpu"] == g).map(|x| json!({"kind": "video", "label": x["label"], "title": x["title"]}))
+                       .chain(c["procs"].as_array().into_iter().flatten().filter(|p| p["kind"] != "video" && !p["job_label"].is_null())
+                              .map(|p| json!({"kind": p["kind"], "label": p["job_label"], "title": p["job_title"]}))).collect::<Vec<_>>()})
         }).collect();
         let maintenance = self.maintenance().map(|n| super::maint::public(&n));
         json!({"busy": !reasons.is_empty(), "reasons": reasons, "loading": loading, "working": working, "llm": {"active": active},

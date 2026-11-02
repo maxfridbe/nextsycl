@@ -627,6 +627,10 @@ pub struct ImageGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// LoRAs for this request (a registered LoRA's id - system.models kind lora - or a file), each with its strength: Qwen-Image 2.1 runs them beside the loaded weights for this request only (no reload; each file read once and kept, a few-step LoRA's sigmas applied); other models reload with them merged
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(json = r#"{"items": {"oneOf": [{"type": "string", "description": "name:scale"}, {"properties": {"name": {"type": "string"}, "scale": {"default": 1, "type": "number"}}, "required": ["name"], "type": "object"}]}}"#)]
@@ -711,6 +715,10 @@ pub struct ImageEditReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// LoRAs for this request (a registered LoRA's id - system.models kind lora - or a file), each with its strength: Qwen-Image 2.1 runs them beside the loaded weights for this request only (no reload; each file read once and kept, a few-step LoRA's sigmas applied); other models reload with them merged
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(json = r#"{"items": {"oneOf": [{"type": "string", "description": "name:scale"}, {"properties": {"name": {"type": "string"}, "scale": {"default": 1, "type": "number"}}, "required": ["name"], "type": "object"}]}}"#)]
@@ -789,6 +797,10 @@ pub struct ImageUpscaleReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// the model's id; none: the loaded one, else the first enabled
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -862,6 +874,10 @@ pub struct ImageVectorizeReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// the sequence at most as the model counts it (the picture's 257 rows and the prompt first: 5000 leaves 4741 tokens of SVG)
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
     #[schema(min = 260, max = 8192, default = 5000)]
@@ -940,6 +956,10 @@ pub struct VideoUpscaleReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// the model's id; none: the loaded one, else the first enabled
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -1267,6 +1287,10 @@ pub struct AudioGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// acestep-1.5: the lyrics' language as a code (en, zh, ja, es ...; default unknown)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
@@ -1364,6 +1388,10 @@ pub struct AudioSpeakReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// english, chinese, japanese ... or auto (default). Checked when submitted against the model's list (Qwen3-TTS: chinese, english, german, italian, portuguese, spanish, japanese, korean, french, russian); VoxCPM2 has no list and takes any
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
@@ -1444,6 +1472,10 @@ pub struct AudioTranscribeReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// a code or a name (en, english, de, german ...); none or auto: detected on the first 30 s
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
@@ -1583,6 +1615,10 @@ pub struct AudioVoicesEnrollReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// the model to enroll it for (default: the registered one that speaks enrolled voices)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -1834,6 +1870,10 @@ pub struct Model3dGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// a mesh to paint instead of making one (a model whose card says paint: Hunyuan3D 2.1, hunyuan3d-2.1-paint): a GLB or OBJ as base64 or a data: URL; image says how it is painted
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<String>,
@@ -1920,6 +1960,10 @@ pub struct Model3dRigReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// the mesh: GLB or OBJ as base64, a data: URL or upload:<name> (model3d.upload)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<String>,
@@ -2264,6 +2308,10 @@ pub struct VideoGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 80)]
     pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
     /// anchor or file: the clip ends on this picture (prev: the newest clip anywhere)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_frame: Option<String>,

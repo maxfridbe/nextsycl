@@ -692,7 +692,7 @@ fn card_energy(tele: &Value, gpu: usize, pci: &str) -> Option<f64> {
 /// A clip's line in `running_clips` and `ended_clips`
 fn row(v: &Value) -> Value {
     let j = &v["job"];
-    json!({"label": j["label"], "name": j["name"], "project": j["project"], "reentrant_id": j["reentrant_id"], "engine": j["engine"], "seconds": j["seconds"], "steps": j["steps"],
+    json!({"label": j["label"], "title": j["title"], "name": j["name"], "project": j["project"], "reentrant_id": j["reentrant_id"], "engine": j["engine"], "seconds": j["seconds"], "steps": j["steps"],
            "width": j["width"], "height": j["height"], "energy_wh": j["energy_wh"], "job": j,
            "stage": v["stage"], "pct": v["pct"], "eta": v["eta"], "elapsed": v["elapsed"], "gpu": v["gpu"], "waiting_for": v["waiting_for"], "preview": v["preview"],
            "steps_done": v["steps_done"], "steps_total": v["steps_total"], "frames": v["frames"], "idle": v["idle"], "done": v["done"], "error": v["error"], "failure": v["failure"], "file": v["file"]})
