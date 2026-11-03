@@ -1072,6 +1072,22 @@ fn clip_inpaint(inp: &ClipInputs, shape: Shape) -> Result<Option<denoiser::Inpai
 /// The frame a run of frames starts at and their luma (0..1)
 type Anchor = (usize, Vec<f32>);
 
+/// guide_clip -> the guides: "<clip or picture>[:frames[:at]]", several comma-separated (frames 22 and at 0 by default; a
+/// picture or frames under 5: one frame, a keyframe for the pose alone)
+fn parse_guides(g: &str) -> Vec<(&Path, usize, i64)> {
+    g.split(',').map(str::trim).filter(|x| !x.is_empty()).map(|one| {
+        let mut it = one.split(':');
+        let p = it.next().unwrap_or(one);
+        let n = it.next().and_then(|v| v.parse().ok()).unwrap_or(if is_still(Path::new(p)) { 1 } else { 22 });
+        let i = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        (Path::new(p), n, i)
+    }).collect()
+}
+
+fn is_still(p: &Path) -> bool {
+    p.extension().and_then(|e| e.to_str()).is_some_and(|e| ["png", "jpg", "jpeg", "webp"].contains(&e.to_lowercase().as_str()))
+}
+
 /// The video keyframes and audio keyframe of a clip, encoded (the encoders loaded only when a picture or sound
 /// needs them).
 fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (usize, usize, usize), ctl: &mut Ctl) -> Result<(Vec<KeyframeIn>, Vec<Frames>, Option<Anchor>)> {
@@ -1120,7 +1136,10 @@ fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frame
         kfs.push(picture(p, frames - 1, "last frame", ctl)?);
     }
     for (p, n, idx) in &inp.guides {
-        let (px, mut got) = crate::media::read_frames_tail(p, *n, w, h, crate::media::Fit::Cover)?;
+        // a still is fitted as first_frame / last_frame are (stretched), a clip's frames as before (cover)
+        let still = is_still(p);
+        let fit = if still { crate::media::Fit::Stretch } else { crate::media::Fit::Cover };
+        let (mut px, mut got) = crate::media::read_frames_tail(p, *n, w, h, fit)?;
         // guide clips run 5, 22, 39 ... frames (17k + 5); fewer than 5: the first picture alone
         let fsz = w * h * 3;
         let mut start = 0;
@@ -1135,6 +1154,17 @@ fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frame
         let index = if *idx >= 0 { *idx as usize } else { (frames as i64 + idx).max(0) as usize };
         if index + got > frames {
             return Err(Error(format!("a {got}-frame guide at frame {idx} does not fit in the clip's {frames} frames")));
+        }
+        // a one-frame guide (a picture) takes exposure_ref's gain as a first_frame / last_frame picture does; a moving guide
+        // is used as it is
+        if let (1, Some(rl)) = (got, reference_luma) {
+            let f = &mut px[start * fsz..(start + 1) * fsz];
+            let l = crate::media::luma(f);
+            if l > 1e-4 {
+                let g = (rl / l).clamp(0.75, 1.35);
+                f.iter_mut().for_each(|v| *v = (*v * g).clamp(0.0, 1.0));
+                ctl.say(format!("exposure: guide {} Y {:.1} -> {:.1}, gain {g:.3}", p.display(), l * 255.0, rl * 255.0));
+            }
         }
         if inp.exposure_fix.is_some() && anchor.is_none() {
             anchor = Some((index, (start..start + got).map(|f| crate::media::luma(&px[f * fsz..(f + 1) * fsz])).collect()));
@@ -1776,16 +1806,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     first_frame: s("first_frame").map(Path::new),
                     last_frame: s("last_frame").map(Path::new),
                     frame_ref: s("first_frame_ref").map(Path::new),
-                    guides: match s("guide_clip") {
-                        Some(g) => {
-                            let mut it = g.split(':');
-                            let p = it.next().unwrap_or(g);
-                            let n = it.next().and_then(|v| v.parse().ok()).unwrap_or(22);
-                            let i = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-                            vec![(Path::new(p), n, i)]
-                        }
-                        None => Vec::new(),
-                    },
+                    guides: s("guide_clip").map(parse_guides).unwrap_or_default(),
                     first_audio: s("first_audio").map(|p| (Path::new(p), n("first_audio_s").unwrap_or(1.0))),
                     soundtrack: s("soundtrack").filter(|p| !p.is_empty()).map(|p| (Path::new(p), n("soundtrack_start").unwrap_or(0.0).max(0.0))),
                     exposure_fix: spec.get("exposure_fix").and_then(Value::as_bool).filter(|b| *b).map(|_| ExposureOpts {
@@ -1862,6 +1883,16 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
 
 #[cfg(test)]
 mod refine_tests {
+    #[test]
+    fn guide_clip_takes_several_guides() {
+        use std::path::Path;
+        assert_eq!(super::parse_guides("/o/a.mp4"), vec![(Path::new("/o/a.mp4"), 22, 0)]);
+        assert_eq!(super::parse_guides("/o/a.mp4:22:0,/o/b.png:1:120"), vec![(Path::new("/o/a.mp4"), 22, 0), (Path::new("/o/b.png"), 1, 120)]);
+        // a picture alone is one frame at 0; at may be negative (from the end); empty pieces are dropped
+        assert_eq!(super::parse_guides("/o/a.mp4:39, /o/b.PNG,,/o/c.jpg:1:-1"),
+                   vec![(Path::new("/o/a.mp4"), 39, 0), (Path::new("/o/b.PNG"), 1, 0), (Path::new("/o/c.jpg"), 1, -1)]);
+    }
+
     #[test]
     fn a_long_draft_is_cut_into_windows_that_end_with_it() {
         assert_eq!(super::refine_windows(22, 22, 15), vec![(0, 0)]);

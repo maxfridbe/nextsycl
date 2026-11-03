@@ -131,16 +131,22 @@ impl Studio {
         if let Some(src) = self.resolve(st, item, "exposure_ref", &s(item, "exposure_ref")) {
             spec["first_frame_ref"] = json!(if image(&src) { format!("{}/{src}", self.out_in) } else { self.clip_file(&src, &[".last.png", ".mp4"]) });
         }
-        // a motion guide: "<anchor or file>[:frames[:at]]"
+        // motion guides: "<anchor or file>[:frames[:at]]", several comma-separated (a picture: a one-frame keyframe)
         let g = s(item, "guide_clip");
-        if !g.is_empty() {
-            let mut parts = g.splitn(3, ':');
+        let (mut srcs, mut files) = (Vec::new(), Vec::new());
+        for one in g.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+            let mut parts = one.splitn(3, ':');
             let src = parts.next().unwrap_or("");
             if let Some(src) = self.resolve(st, item, "guide_clip", src) {
                 let rest: Vec<&str> = parts.collect();
-                resolved["guide_clip"] = json!(src);
-                spec["guide_clip"] = json!(format!("{}{}{}", self.clip_file(&src, &[".mp4"]), if rest.is_empty() { "" } else { ":" }, rest.join(":")));
+                let file = if image(&src) { format!("{}/{src}", self.out_in) } else { self.clip_file(&src, &[".mp4"]) };
+                files.push(format!("{file}{}{}", if rest.is_empty() { "" } else { ":" }, rest.join(":")));
+                srcs.push(src);
             }
+        }
+        if !files.is_empty() {
+            resolved["guide_clip"] = json!(srcs.join(","));
+            spec["guide_clip"] = json!(files.join(","));
         }
         if item["exposure_fix"].as_bool() == Some(true) {
             spec["exposure_fix"] = json!(true);

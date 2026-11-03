@@ -43,7 +43,7 @@ const FEATURES: &[&str] = &[
     "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
     "video.slots.cards", "video.running_clips", "video.status.clip", "video.cancel.name", "video.reentry.before_limit", "video.reentry.label", "jobs.title", "video.speed",
     "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request", "video.soundtrack", "video.exposure_fix",
-    "backplane", "system.busy.engines", "models.profile", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand",
+    "backplane", "system.busy.engines", "models.profile", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand", "video.multi_guide",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults

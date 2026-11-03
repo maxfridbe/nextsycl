@@ -73,7 +73,7 @@ pub fn room(engine: Option<&Value>, running: usize, loading: usize, host_mb: Opt
 /// The anchors an item resolves when it starts, as written
 fn anchor_words(item: &Value) -> Vec<String> {
     let mut v: Vec<String> = ["first_frame", "last_frame", "first_audio", "exposure_ref", "source"].iter().map(|k| s(item, k)).collect();
-    v.push(s(item, "guide_clip").split(':').next().unwrap_or("").to_string());
+    v.extend(s(item, "guide_clip").split(',').map(|g| g.trim().split(':').next().unwrap_or("").to_string()));
     v
 }
 
@@ -337,6 +337,8 @@ mod tests {
         assert_eq!(failed_dependency(&json!({"label": "A 03/09: x"}), &[(&bad, true)]), None);
         // by file
         assert_eq!(failed_dependency(&json!({"guide_clip": "h3_b:22:0"}), &[(&bad, true)]).as_deref(), Some("A 02/09: x"));
+        // every guide of several counts
+        assert_eq!(failed_dependency(&json!({"guide_clip": "anchor.png:1:120, h3_b:22:0"}), &[(&bad, true)]).as_deref(), Some("A 02/09: x"));
     }
 
     #[test]

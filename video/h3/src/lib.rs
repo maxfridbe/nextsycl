@@ -106,7 +106,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "last_frame", env: "", value: "PNG", help: "the clip ends on this picture", at: At::Request },
     EngineOption { name: "first_frame_ref", env: "", value: "PNG", help: "exposure match: the first and last frame pictures rescaled to this picture's luminance (a chain's drift; clip 1's frame)", at: At::Request },
     EngineOption { name: "first_latent", env: "", value: "FILE", help: "continue from a clip's last latent (.lastlat) - jumps lighter or darker with false texture: chain a PNG", at: At::Request },
-    EngineOption { name: "guide_clip", env: "", value: "MP4[:N[:I]]", help: "a clip's last N frames (5, 22, 39: 17k + 5) as a moving keyframe at frame I - motion across a cut (22 frames + a 0.9167 s first_audio)", at: At::Request },
+    EngineOption { name: "guide_clip", env: "", value: "MP4[:N[:I]][,...]", help: "a clip's last N frames (5, 22, 39: 17k + 5) as a moving keyframe at frame I - motion across a cut (22 frames + a 0.9167 s first_audio); several comma-separated; a PNG (or N under 5) is one frame, the pose at frame I, no motion", at: At::Request },
     EngineOption { name: "first_audio", env: "", value: "FILE", help: "continue a clip's sound (.lastaud)", at: At::Request },
     EngineOption { name: "soundtrack", env: "", value: "FILE", help: "a driving soundtrack (a song): the clip's length of it from soundtrack_start is pinned under the whole clip as an audio keyframe, the picture is made to it, and the song is laid under the clip", at: At::Request },
     EngineOption { name: "soundtrack_start", env: "", value: "S", help: "seconds into the soundtrack at the clip's first frame (default 0)", at: At::Request },

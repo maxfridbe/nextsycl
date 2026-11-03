@@ -2309,7 +2309,7 @@ pub struct VideoGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
     #[schema(min = 22, max = 362)]
     pub frames: Option<i64>,
-    /// a motion guide: "<anchor or file>[:frames[:at]]" - the last frames of a clip as one moving keyframe
+    /// motion guides: "<anchor or file>[:frames[:at]]", several comma-separated (feature video.multi_guide), e.g. "prev:22:0,anchor.png:1:120" - a clip's last frames (default 22) as one moving keyframe at frame at (default 0; negative: from the end); a picture (or frames under 5) is one frame: the pose at that frame, no motion, the clip flowing into it and away from it. exposure_ref's gain applies to a one-frame guide (as to first_frame / last_frame), not to a moving one. A guide that does not fit fails the clip ("does not fit in the clip's N frames")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide_clip: Option<String>,
     /// as width
