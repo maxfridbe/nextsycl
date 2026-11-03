@@ -578,18 +578,17 @@ impl Home {
         let maintenance = self.maintenance().map(|n| super::maint::public(&n));
         json!({"busy": !reasons.is_empty(), "reasons": reasons, "loading": loading, "working": working, "llm": {"active": active},
                "maintenance": maintenance, "cards_taken": self.cards_taken(),
-               "jobs": jobs, "video": video, "cards": per_card, "slots": slots, "parallel": self.parallel(all), "engines": Self::engines(&states)})
+               "jobs": jobs, "video": video, "cards": per_card, "slots": slots, "parallel": self.parallel(all, video["slots"].as_u64().map(|n| n as usize)), "engines": Self::engines(&states)})
     }
 
-    /// How many requests of each image and audio model run at once: a copy a card it is enabled on, as many as the
-    /// kind has servers (a second copy starts when the first has work and its card has the room then)
-    fn parallel(&self, all: &[Value]) -> Value {
+    /// How many requests of each image, audio and video model run at once: a copy a card it is enabled on, as many as the
+    /// kind has servers (a second copy starts when the first has work and its card has the room then); video's servers are
+    /// the studio's clip slots (one clip a usable card; `video_slots` None: the studio does not answer, 0)
+    fn parallel(&self, all: &[Value], video_slots: Option<usize>) -> Value {
         let mut out = serde_json::Map::new();
-        for kind in super::jobs::KINDS {
-            let servers = self.slots(kind).len();
-            let models: serde_json::Map<String, Value> = all.iter().filter(|m| registry::kind_of(m) == kind && m["enabled"] != false)
-                .map(|m| (s(m, "id"), json!(self.gpus_of(m).len().min(servers)))).collect();
-            out.insert(kind.into(), json!({"servers": servers, "models": models}));
+        let kinds = super::jobs::KINDS.iter().map(|k| (*k, self.slots(k).len())).chain([("video", video_slots.unwrap_or(0))]);
+        for (kind, servers) in kinds {
+            out.insert(kind.into(), json!({"servers": servers, "models": parallel_models(all, kind, servers, |m| self.gpus_of(m).len())}));
         }
         Value::Object(out)
     }
@@ -1693,5 +1692,27 @@ mod tests {
         for (st, c) in [(400, "invalid_params"), (401, "unauthorized"), (404, "not_found"), (502, "unavailable"), (504, "timeout"), (500, "internal")] {
             assert_eq!(code_of(st), c);
         }
+    }
+}
+
+/// `parallel`'s models of a kind: each enabled model id -> its jobs that run at once (its cards, at most the kind's servers)
+fn parallel_models(all: &[Value], kind: &str, servers: usize, cards: impl Fn(&Value) -> usize) -> serde_json::Map<String, Value> {
+    all.iter().filter(|m| registry::kind_of(m) == kind && m["enabled"] != false).map(|m| (s(m, "id"), json!(cards(m).min(servers)))).collect()
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use serde_json::json;
+
+    #[test]
+    fn video_runs_a_clip_a_usable_card() {
+        let all = vec![json!({"id": "minimax-h3", "kind": "video", "gpus": "all"}), json!({"id": "minimax-h3-q6k", "kind": "video", "gpus": "1"}),
+                       json!({"id": "off", "kind": "video", "enabled": false}), json!({"id": "qwen-image", "kind": "image"})];
+        let cards = |m: &serde_json::Value| if m["gpus"] == "1" { 1 } else { 2 };
+        let two = super::parallel_models(&all, "video", 2, cards);
+        assert_eq!(serde_json::Value::Object(two), json!({"minimax-h3": 2, "minimax-h3-q6k": 1}));
+        // one card with room (the studio's slots): one clip, never two on a card
+        assert_eq!(serde_json::Value::Object(super::parallel_models(&all, "video", 1, cards)), json!({"minimax-h3": 1, "minimax-h3-q6k": 1}));
+        assert_eq!(serde_json::Value::Object(super::parallel_models(&all, "video", 0, cards)), json!({"minimax-h3": 0, "minimax-h3-q6k": 0}));
     }
 }
