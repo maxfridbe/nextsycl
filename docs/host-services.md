@@ -199,7 +199,8 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
     `system.load` / `enable`, the OpenAI POST routes - is refused with error code `maintenance` (503, retryable,
     `retry_after_s`, the notice in `error.maintenance`; `/v1` answers HTTP 503 with `Retry-After`). Status, listings,
     cancels and guides answer as always, and `system.busy` / `version` / `state` carry the notice. Queued image and
-    audio jobs wait (stage `maintenance`); the video queue pauses (what was paused before is put back when it ends);
+    audio jobs wait (stage `maintenance`); the video queue is held by a named hold, `maintenance`, that only maintenance's end lifts (a person's pause, or a
+    GPU run's `gpu run` hold, stays as it was; `queue.resume` with no scope lifts every hold);
     running work finishes; `--unload` unloads the models not answering. Open WebUI's chats are answered with the
     notice by the switcher (it reads `maintenance.json` beside the registry). Turning it on prints a bypass key:
     requests with `X-Maintenance-Bypass: <key>` go through, so a developer can test through :8000 meanwhile.

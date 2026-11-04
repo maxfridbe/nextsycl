@@ -251,29 +251,18 @@ impl Studio {
         v
     }
 
-    fn hold(&self, on: bool, project: &str, batch: &str) -> Value {
+    /// queue.pause / queue.resume: a batch, a project, a named hold (`by`: only that hold lifts), or the whole queue (a
+    /// whole-queue resume lifts every hold, the named ones too - a person's word wins)
+    fn hold(&self, on: bool, project: &str, batch: &str, by: &str) -> Value {
         let mut st = self.st.lock().unwrap();
-        let scope = if !batch.is_empty() {
-            if on { st.q.paused_batches.insert(batch.into()) } else { st.q.paused_batches.remove(batch) };
-            format!("batch {batch}")
-        } else if !project.is_empty() {
-            if on { st.q.paused_projects.insert(project.into()) } else { st.q.paused_projects.remove(project) };
-            format!("project {project}")
-        } else {
-            st.q.paused = on;
-            if !on {
-                st.q.paused_projects.clear();
-                st.q.paused_batches.clear();
-            }
-            "queue".into()
-        };
+        let scope = st.q.hold(on, project, batch, by);
         if !on {
             st.fails = 0;
         }
         st.q.save_paused(&self.dir);
         let held = st.q.items.iter().filter(|i| st.q.held(i)).count();
         json!({if on { "paused" } else { "resumed" }: scope, "queued": st.q.items.len(), "held": held, "paused_all": st.q.paused,
-               "paused_projects": st.q.paused_projects, "paused_batches": st.q.paused_batches})
+               "paused_projects": st.q.paused_projects, "paused_batches": st.q.paused_batches, "held_by": st.q.held_by})
     }
 
     fn generate(&self, p: &Value) -> Result<Value, RpcError> {
@@ -475,8 +464,8 @@ impl Studio {
             }
             "generate" => self.generate(p)?,
             "queue.list" => json!({"queue": self.st.lock().unwrap().q.items}),
-            "queue.pause" => self.hold(true, &ps("project"), &ps("batch")),
-            "queue.resume" => self.hold(false, &ps("project"), &ps("batch")),
+            "queue.pause" => self.hold(true, &ps("project"), &ps("batch"), &ps("by")),
+            "queue.resume" => self.hold(false, &ps("project"), &ps("batch"), &ps("by")),
             "queue.clear" => {
                 let mut st = self.st.lock().unwrap();
                 let before = st.q.items.len();
@@ -707,7 +696,7 @@ impl Studio {
             return match path.as_str() {
                 "/api/queue/pause" => {
                     let on = body["on"] == true;
-                    self.hold(on, body["project"].as_str().unwrap_or("").trim(), body["batch"].as_str().unwrap_or("").trim());
+                    self.hold(on, body["project"].as_str().unwrap_or("").trim(), body["batch"].as_str().unwrap_or("").trim(), "");
                     http::respond(stream, 200, &json!({"ok": true}))
                 }
                 "/api/join" => match self.join(body["project"].as_str().unwrap_or("").trim()) {

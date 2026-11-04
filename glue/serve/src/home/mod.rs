@@ -336,7 +336,7 @@ impl Home {
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), answers: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()),
             holds_file, holds_mx: Mutex::new(()), history, history_dir, video_watch: Mutex::new(Vec::new()), withdrawn: Mutex::new(BTreeMap::new()),
             chat_last: Mutex::new(now()), cards_fixed: std::sync::atomic::AtomicBool::new(false),
-            pending: Mutex::new(Vec::new()), admit: Mutex::new(()), asked: Mutex::new(BTreeMap::new()), lock_paused: Mutex::new(None), progress: Mutex::new(BTreeMap::new()),
+            pending: Mutex::new(Vec::new()), admit: Mutex::new(()), asked: Mutex::new(BTreeMap::new()), lock_paused: Mutex::new(Some(json!({"by": "gpu run", "left": true}))), progress: Mutex::new(BTreeMap::new()),
             maint_file, maint_bypass, disks: disks::Disks::new(&st), pulls: pulls::Pulls::default(),
         });
         let me = h.clone();
@@ -416,19 +416,19 @@ impl Home {
         }
     }
 
-    /// The video queue while a GPU run holds the cards: paused when the run starts, put back as it was when it ends
-    /// (maintenance on meanwhile: that mode's pause stands, the queue stays as it is until the mode ends)
+    /// The video queue while a GPU run holds the cards: held ("gpu run") when the run starts, that hold lifted when it ends
+    /// (maintenance's hold and a person's pause are their own: neither is touched). From start the record says a hold
+    /// may be left from before a restart, so the first tick with the cards free lifts it
     fn video_hold(&self, taken: bool) {
         let mut paused = self.lock_paused.lock().unwrap();
-        if self.maintenance().is_some() {
-            return;
-        }
-        if taken && paused.is_none() {
+        if taken && paused.as_ref().is_none_or(|p| p["left"] == true) {
             eprintln!("{}: the video queue paused", self.cards_taken().unwrap_or_default());
-            *paused = Some(self.video_pause());
+            *paused = Some(self.video_pause("gpu run"));
         } else if !taken {
             if let Some(r) = paused.take() {
-                eprintln!("the GPU run ended: the video queue as it was");
+                if r["left"] != true {
+                    eprintln!("the GPU run ended: the video queue as it was");
+                }
                 self.video_restore(&r);
             }
         }

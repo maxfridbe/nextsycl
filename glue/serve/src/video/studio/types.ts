@@ -187,10 +187,10 @@ export interface Methods {
   "summary": [Record<string, never>, unknown];
 }
 
-export interface Scope { project?: string; batch?: string; }
+export interface Scope { project?: string; batch?: string; by?: string /* a named hold: pause/resume only that one */ }
 export interface HoldResult {
   queued: number; held: number; paused_all: boolean;
-  paused_projects: string[]; paused_batches: string[];
+  paused_projects: string[]; paused_batches: string[]; held_by: string[];
 }
 
 export async function rpc<M extends keyof Methods>(

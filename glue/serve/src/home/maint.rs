@@ -82,7 +82,7 @@ impl Home {
                                "until": eta.map_or(Value::Null, |e| json!(now() + e)),
                                "video_restore": cur.as_ref().map_or(Value::Null, |c| c["video_restore"].clone())});
             if cur.is_none() {
-                n["video_restore"] = self.video_pause();
+                n["video_restore"] = self.video_pause("maintenance");
             }
             maintenance::write(&self.maint_file, Some(&n)).map_err(|e| (500, e))?;
             let key = {
@@ -114,18 +114,15 @@ impl Home {
         }
     }
 
-    /// The video studio's queue paused; what was paused before (to put back): none when no studio answers
-    pub(super) fn video_pause(&self) -> Value {
+    /// The video studio's queue held by a named hold (`by`: "maintenance", "gpu run") that only its own restore lifts - a
+    /// person's pause, or another hold, is left as it is either way; none when no studio answers
+    pub(super) fn video_pause(&self, by: &str) -> Value {
         if !self.kinds_on(&self.models()).contains(&"video") {
             return Value::Null;
         }
         let t = self.target("video");
-        let was_all = call_for(&t, "POST", "/rpc/projects.list", Some(&json!({})), 30).ok().is_some_and(|v| v["result"]["paused_all"] == true);
-        match call_for(&t, "POST", "/rpc/queue.pause", Some(&json!({})), 30) {
-            Ok(v) if v["ok"] != false => {
-                let r = &v["result"];
-                json!({"projects": r["paused_projects"], "batches": r["paused_batches"], "was_all": was_all})
-            }
+        match call_for(&t, "POST", "/rpc/queue.pause", Some(&json!({"by": by})), 30) {
+            Ok(v) if v["ok"] != false => json!({"by": by}),
             Ok(v) => {
                 eprintln!("maintenance: the video queue not paused: {}", v["error"]["message"]);
                 Value::Null
@@ -137,12 +134,17 @@ impl Home {
         }
     }
 
-    /// The video queue as it was: resumed, then the projects and batches paused before paused again
+    /// The video queue as it was: the named hold lifted (a record from before named holds: resumed, then the projects
+    /// and batches paused before paused again)
     pub(super) fn video_restore(&self, r: &Value) {
         if r.is_null() || r["was_all"] == true {
             return;
         }
         let t = self.target("video");
+        if let Some(by) = r["by"].as_str() {
+            let _ = call_for(&t, "POST", "/rpc/queue.resume", Some(&json!({"by": by})), 30);
+            return;
+        }
         let _ = call_for(&t, "POST", "/rpc/queue.resume", Some(&json!({})), 30);
         for p in r["projects"].as_array().into_iter().flatten() {
             let _ = call_for(&t, "POST", "/rpc/queue.pause", Some(&json!({"project": p})), 30);

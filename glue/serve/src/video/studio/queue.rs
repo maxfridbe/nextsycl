@@ -24,6 +24,9 @@ pub struct Queue {
     pub paused: bool,
     pub paused_projects: BTreeSet<String>,
     pub paused_batches: BTreeSet<String>,
+    /// Holds by name (the front door's "maintenance", "gpu run"): each lifts only its own, so one cannot take another's
+    /// pause - or a person's - for its own and leave it behind
+    pub held_by: BTreeSet<String>,
 }
 
 pub fn s(v: &Value, k: &str) -> String {
@@ -533,14 +536,37 @@ impl Queue {
     pub fn held(&self, item: &Value) -> bool {
         let p = project_of(item);
         let b = s(item, "batch");
-        self.paused || (!p.is_empty() && self.paused_projects.contains(&p)) || (!b.is_empty() && self.paused_batches.contains(&b))
+        self.paused || !self.held_by.is_empty() || (!p.is_empty() && self.paused_projects.contains(&p)) || (!b.is_empty() && self.paused_batches.contains(&b))
+    }
+
+    /// A pause or a resume by scope: a named hold (`by`: only that one), a batch, a project, or the whole queue (a
+    /// whole-queue resume lifts everything, the named holds too - a person's word wins); the scope's name
+    pub fn hold(&mut self, on: bool, project: &str, batch: &str, by: &str) -> String {
+        if !by.is_empty() {
+            if on { self.held_by.insert(by.into()) } else { self.held_by.remove(by) };
+            format!("hold {by}")
+        } else if !batch.is_empty() {
+            if on { self.paused_batches.insert(batch.into()) } else { self.paused_batches.remove(batch) };
+            format!("batch {batch}")
+        } else if !project.is_empty() {
+            if on { self.paused_projects.insert(project.into()) } else { self.paused_projects.remove(project) };
+            format!("project {project}")
+        } else {
+            self.paused = on;
+            if !on {
+                self.paused_projects.clear();
+                self.paused_batches.clear();
+                self.held_by.clear();
+            }
+            "queue".into()
+        }
     }
 
     pub fn load(dir: &Path) -> Queue {
         let items = std::fs::read(dir.join("queue.json")).ok().and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok()).unwrap_or_default();
         let p: Value = std::fs::read(dir.join("paused.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
         let set = |k: &str| -> BTreeSet<String> { p.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default() };
-        Queue { items, paused: p.get("all").and_then(|v| v.as_bool()).unwrap_or(false), paused_projects: set("projects"), paused_batches: set("batches") }
+        Queue { items, paused: p.get("all").and_then(|v| v.as_bool()).unwrap_or(false), paused_projects: set("projects"), paused_batches: set("batches"), held_by: set("by") }
     }
 
     pub fn save(&self, dir: &Path) {
@@ -548,7 +574,7 @@ impl Queue {
     }
 
     pub fn save_paused(&self, dir: &Path) {
-        let v = json!({"all": self.paused, "projects": self.paused_projects, "batches": self.paused_batches});
+        let v = json!({"all": self.paused, "projects": self.paused_projects, "batches": self.paused_batches, "by": self.held_by});
         let _ = super::write_atomic(&dir.join("paused.json"), &serde_json::to_vec(&v).unwrap_or_default());
     }
 
@@ -589,6 +615,7 @@ impl Queue {
         m.insert("paused".into(), json!(self.paused));
         m.insert("paused_projects".into(), json!(self.paused_projects));
         m.insert("paused_batches".into(), json!(self.paused_batches));
+        m.insert("held_by".into(), json!(self.held_by));
         m.insert("projects".into(), json!(self.projects()));
         m
     }
@@ -632,6 +659,38 @@ mod tests {
         for none in [json!({}), json!({"title": "  "}), json!({"title": 7})] {
             assert_eq!(title_of(&none), Value::Null);
         }
+    }
+
+    #[test]
+    fn a_named_hold_lifts_only_itself_and_never_sticks() {
+        let it = json!({"label": "x", "project": "P"});
+        let mut q = Queue::default();
+        // 2026-11-03: maintenance on/off around each test run, a GPU run's hold between - the queue left held for a day
+        for _ in 0..3 {
+            q.hold(true, "", "", "gpu run");
+            q.hold(true, "", "", "maintenance");
+            q.hold(false, "", "", "gpu run");
+            assert!(q.held(&it), "maintenance still holds it");
+            q.hold(false, "", "", "maintenance");
+            assert!(!q.held(&it), "every hold lifted: the queue goes on");
+        }
+        // a person's pause stands through a hold's on and off
+        q.hold(true, "", "", "");
+        q.hold(true, "", "", "maintenance");
+        q.hold(false, "", "", "maintenance");
+        assert!(q.held(&it) && q.paused);
+        // and a person's resume of the whole queue lifts every hold
+        q.hold(true, "", "", "gpu run");
+        q.hold(true, "P", "", "");
+        q.hold(false, "", "", "");
+        assert!(!q.held(&it) && q.held_by.is_empty() && q.paused_projects.is_empty());
+        // kept across a restart
+        let dir = std::env::temp_dir().join(format!("ns-holds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        q.hold(true, "", "", "maintenance");
+        q.save_paused(&dir);
+        assert!(Queue::load(&dir).held(&it));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
