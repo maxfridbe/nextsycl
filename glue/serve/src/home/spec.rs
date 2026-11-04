@@ -133,7 +133,7 @@ const VOICE: &str = r#"{"type": "object", "properties": {"name": {"type": "strin
 
 const MODEL_STATE: &str = r#"{"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string", "enum": ["llm", "image", "audio", "video"]},
   "title": {"type": "string"}, "arch": {"type": "string"}, "enabled": {"type": "boolean"}, "gpus": {"type": "array", "items": {"type": "integer"}},
-  "state": {"type": "string", "enum": ["disabled", "unloaded", "loading", "loaded", "busy", "ready", "not_downloaded"], "description": "busy: an image or audio model answering; ready: a video model the daemon has, not loaded; not_downloaded: a card's model not here (system.models.pull)"},
+  "state": {"type": "string", "enum": ["disabled", "unloaded", "loading", "loaded", "busy", "ready", "not_downloaded"], "description": "busy: an image, audio or 3D model answering, or a video model making a clip; ready: a video model the daemon has, not loaded; not_downloaded: a card's model not here (system.models.pull)"},
   "downloaded": {"type": "boolean", "description": "false: a model a card offers that is not downloaded (enabled false; bytes, drive, folder, fits, pull say what fetching it takes)"},
   "bytes": {"type": "integer", "description": "not downloaded: its files' bytes"}, "fits": {"type": "boolean", "description": "not downloaded: the folder it would go to has the room"},
   "drive": {"type": "string"}, "folder": {"type": "string"}, "free": {"type": "integer"},
@@ -205,7 +205,7 @@ pub fn result(method: &str) -> Option<String> {
   "reasons": {"type": "array", "items": {"type": "string"}, "description": "what is working, in words"},
   "loading": {"type": "array", "items": {"type": "string"}, "description": "models loading"},
   "working": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string"}}}, "description": "picture and sound models answering a request"},
-  "llm": {"type": "object", "properties": {"active": {"type": "integer", "description": "chat requests being answered"}}},
+  "llm": {"type": "object", "properties": {"active": {"type": "integer", "description": "chat requests being answered"}, "parallel": {"type": "integer", "nullable": true, "description": "the chat requests the loaded chat model answers together (more wait in its queue); null: no chat model loaded. One chat model runs at a time"}}},
   "engines": {"type": "array", "description": "one per enabled model, for a dispatcher: copies running now and what its model card says", "items": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string"}, "copies_now": {"type": "integer"}, "recommended_copies": {"type": "integer"}, "max_copies_per_card": {"type": "integer"}, "mode": {"type": "string", "description": "shared or exclusive"}, "status": {"type": "string", "description": "measured or unmeasured (one copy, shared)"}}}},
   "jobs": {"type": "array", "description": "image and audio jobs not ended (held ones too; they are no reason for busy)", "items": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string"}, "label": {"type": "string"}, "title": {"type": "string", "nullable": true}, "model": {"type": "string", "nullable": true}, "state": {"type": "string"}, "held": {"type": "boolean"}}}},
   "video": {"type": "object", "nullable": true, "description": "null: no video model enabled", "properties": {

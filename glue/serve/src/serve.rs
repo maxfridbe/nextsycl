@@ -666,7 +666,7 @@ impl Server {
             ("GET", "/server/requests") => {
                 let done: Vec<Value> = self.done.lock().unwrap().iter().rev().cloned().collect();
                 let running: Vec<Value> = self.running.lock().unwrap().values().cloned().collect();
-                respond(&mut s, 200, &json!({"running": running.first().cloned(), "active": running, "done": done, "keep": self.keep}))
+                respond(&mut s, 200, &json!({"running": running.first().cloned(), "active": running, "done": done, "keep": self.keep, "parallel": self.parallel}))
             }
             ("GET", p) if p.starts_with("/server/requests/") => {
                 let id: Option<u64> = p["/server/requests/".len()..].trim_start_matches('#').parse().ok();

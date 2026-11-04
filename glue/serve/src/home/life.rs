@@ -88,7 +88,14 @@ pub(super) fn waiting_workers(status: &Value) -> Vec<(usize, u64)> {
 
 
 /// The video daemon's engines (model ids), and (engine, GPU) per loaded worker
-type VideoDaemon = (Vec<String>, Vec<(String, usize)>);
+/// The video daemon's engines by name, and its loaded slots: (model id, card, running a clip)
+type VideoDaemon = (Vec<String>, Vec<(String, usize, bool)>);
+
+/// A video slot's model id: the daemon's `denoiser`, else the engine's own `info.model` (a daemon older than the engine
+/// can match only paths, and leaves denoiser null)
+fn video_model(g: &Value) -> Option<&str> {
+    g["denoiser"].as_str().or_else(|| g["info"]["model"].as_str())
+}
 
 /// Whether something listens on 127.0.0.1:`port`
 fn listening(port: u16) -> bool {
@@ -451,7 +458,7 @@ impl Home {
         if all.iter().any(|m| registry::kind_of(m) == "video" && m["enabled"] != false) {
             if let Ok(st) = call_for(&self.target("video"), "GET", "/engine/status", None, 4) {
                 for g in st["gpus"].as_array().into_iter().flatten() {
-                    v.push(json!({"kind": "video", "slot": g["gpu"], "gpu": g["gpu"], "model": g["denoiser"],
+                    v.push(json!({"kind": "video", "slot": g["gpu"], "gpu": g["gpu"], "model": video_model(g),
                                   "loading": false, "busy": !g["running"].is_null(), "up": g["engine"].as_str().is_some_and(|e| e != "unloaded")}));
                 }
             }
@@ -491,7 +498,7 @@ impl Home {
         // a slot's engine is "unloaded" or holds a denoiser (by its model id)
         let loaded = v["gpus"].as_array().into_iter().flatten()
             .filter(|g| g["engine"].as_str().is_some_and(|e| e != "unloaded"))
-            .filter_map(|g| Some((g["denoiser"].as_str()?.to_string(), g["gpu"].as_u64()? as usize)))
+            .filter_map(|g| Some((video_model(g)?.to_string(), g["gpu"].as_u64()? as usize, !g["running"].is_null())))
             .collect();
         Some((names, loaded))
     }
@@ -539,7 +546,8 @@ impl Home {
                     }
                 }
                 "video" => match &video {
-                    Some((_, loaded)) if loaded.iter().any(|(e, _)| *e == id) => "loaded",
+                    Some((_, loaded)) if loaded.iter().any(|(e, _, run)| *e == id && *run) => "busy",
+                    Some((_, loaded)) if loaded.iter().any(|(e, _, _)| *e == id) => "loaded",
                     Some((names, _)) if names.contains(&id) => "ready",
                     _ => "unloaded",
                 },
@@ -558,7 +566,7 @@ impl Home {
             let copies_now = match kind.as_str() {
                 "llm" => usize::from(chat.0.as_deref() == Some(id.as_str())),
                 "image" | "audio" | "model3d" => slots_of(&kind).iter().filter(|x| x.model.as_deref() == Some(id.as_str()) && !x.loading).count(),
-                "video" => video.as_ref().map_or(0, |(_, loaded)| loaded.iter().filter(|(e, _)| *e == id).count()),
+                "video" => video.as_ref().map_or(0, |(_, loaded)| loaded.iter().filter(|(e, _, _)| *e == id).count()),
                 _ => 0,
             };
             json!({"concurrency": concurrency, "coexistence": coexistence, "copies_now": copies_now,
@@ -844,7 +852,7 @@ impl Home {
                 let mut model = p["model_id"].as_str().or(p["model"].as_str()).or(p["program"].as_str()).unwrap_or("?").to_string();
                 // a video worker by what its slot says it holds (its process's arguments may not name a registered model)
                 if kind.as_deref() == Some("video") {
-                    if let Some((e, _)) = daemon.as_ref().and_then(|d| d.1.iter().find(|(_, on)| *on == index)) {
+                    if let Some((e, _, _)) = daemon.as_ref().and_then(|d| d.1.iter().find(|(_, on, _)| *on == index)) {
                         model = e.clone();
                     }
                 }
@@ -1344,7 +1352,7 @@ fn vouched_rows(on: &[&Value], gi: &str) -> Vec<Value> {
     let mut list: Vec<Value> = on.iter().filter(|m| !matches!(m["kind"].as_str(), Some("llm" | "video"))).map(|m| row(m, true)).collect();
     for kind in ["llm", "video"] {
         let group: Vec<&Value> = on.iter().filter(|m| m["kind"] == kind).copied().collect();
-        let Some(chosen) = group.iter().find(|m| m["state"] == "loaded").or_else(|| group.iter().max_by_key(|m| mb(m))) else { continue };
+        let Some(chosen) = group.iter().find(|m| matches!(m["state"].as_str(), Some("loaded" | "busy"))).or_else(|| group.iter().max_by_key(|m| mb(m))) else { continue };
         let mut r = row(chosen, true);
         r["of"] = json!(group.len());
         list.push(r);
@@ -1355,6 +1363,15 @@ fn vouched_rows(on: &[&Value], gi: &str) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_video_slot_names_its_model_by_the_daemon_or_the_engine() {
+        use serde_json::json;
+        // the daemon of 2026-11-03 left denoiser null for an engine naming its model by id: the slot read "not loaded"
+        assert_eq!(super::video_model(&json!({"denoiser": null, "info": {"model": "minimax-h3-ref2va"}})), Some("minimax-h3-ref2va"));
+        assert_eq!(super::video_model(&json!({"denoiser": "minimax-h3", "info": {"model": "/m/h3.gguf"}})), Some("minimax-h3"));
+        assert_eq!(super::video_model(&json!({"engine": "unloaded"})), None);
+    }
+
     #[test]
     fn every_engine_on_a_card_is_listed_and_one_of_a_group_counted() {
         let m = |id: &str, kind: &str, mb: u64, state: &str| json!({"id": id, "kind": kind, "vouch_mb": {"0": mb}, "headroom_mb": {"0": 0}, "state": state});

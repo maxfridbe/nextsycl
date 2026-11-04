@@ -505,16 +505,19 @@ impl Home {
         let loading: Vec<Value> = with("loading").iter().map(|m| m["id"].clone()).collect();
         let working: Vec<Value> = with("busy").iter().map(|m| json!({"id": m["id"], "kind": m["kind"]})).collect();
         let mut reasons: Vec<String> = loading.iter().map(|m| format!("{} loading", m.as_str().unwrap_or(""))).collect();
-        reasons.extend(working.iter().map(|m| format!("{} answering", m["id"].as_str().unwrap_or(""))));
-        let active = if self.kinds_on(all).contains(&"llm") {
+        // a video engine making a clip is named by its clip below
+        reasons.extend(working.iter().filter(|m| m["kind"] != "video").map(|m| format!("{} answering", m["id"].as_str().unwrap_or(""))));
+        // the chat server's requests now, and how many it answers together (None: no chat server, or one before it said)
+        let chat = if self.kinds_on(all).contains(&"llm") {
             let dir = self.o.cfg.get("NS_SOCKET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
                 std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())).join("nextsycl")
             });
             call_for(&crate::http::Target::Unix(dir.join("nextsycl.sock")), "GET", "/server/requests", None, 3).ok()
-                .and_then(|v| v["active"].as_array().map(|a| a.len())).unwrap_or(0)
         } else {
-            0
+            None
         };
+        let active = chat.as_ref().and_then(|v| v["active"].as_array().map(|a| a.len())).unwrap_or(0);
+        let chat_parallel = chat.as_ref().and_then(|v| v["parallel"].as_u64());
         if active > 0 {
             reasons.push(format!("{active} chat request(s)"));
         }
@@ -576,7 +579,7 @@ impl Home {
                               .map(|p| json!({"kind": p["kind"], "label": p["job_label"], "title": p["job_title"]}))).collect::<Vec<_>>()})
         }).collect();
         let maintenance = self.maintenance().map(|n| super::maint::public(&n));
-        json!({"busy": !reasons.is_empty(), "reasons": reasons, "loading": loading, "working": working, "llm": {"active": active},
+        json!({"busy": !reasons.is_empty(), "reasons": reasons, "loading": loading, "working": working, "llm": {"active": active, "parallel": chat_parallel},
                "maintenance": maintenance, "cards_taken": self.cards_taken(),
                "jobs": jobs, "video": video, "cards": per_card, "slots": slots, "parallel": self.parallel(all, video["slots"].as_u64().map(|n| n as usize)), "engines": Self::engines(&states)})
     }

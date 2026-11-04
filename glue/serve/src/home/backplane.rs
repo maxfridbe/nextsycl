@@ -304,7 +304,7 @@ impl Home {
         let can: Vec<String> = all.iter().filter(|m| m["enabled"] != false && super::life::capabilities(m).1.contains(&method)).map(|m| s(m, "id")).collect();
         let loaded = |id: &String| match all.iter().find(|m| m["id"] == id.as_str()).map_or("", registry::kind_of) {
             "llm" => self.chat_loaded(all).as_deref() == Some(id.as_str()),
-            "video" => self.video_daemon().is_some_and(|d| d.1.iter().any(|(e, _)| e == id)),
+            "video" => self.video_daemon().is_some_and(|d| d.1.iter().any(|(e, _, _)| e == id)),
             k => self.servers(k).iter().any(|x| x.model.as_deref() == Some(id.as_str())),
         };
         can.iter().find(|id| loaded(id)).or(can.first()).cloned().unwrap_or_default()

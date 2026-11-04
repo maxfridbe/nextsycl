@@ -218,8 +218,14 @@ impl Options {
     }
     /// The name of the engine a worker reported loading (its `model` path).
     fn engine_of_path(&self, model: Option<&Value>) -> Option<String> {
-        let m = PathBuf::from(model?.as_str()?);
-        self.engine_names().into_iter().find(|n| self.engine_path(Some(n)).is_some_and(|(_, p)| p == m))
+        // an engine's info names its model by id (minimax-h3-ref2va); an older one by its denoiser's path
+        let v = model?.as_str()?;
+        let names = self.engine_names();
+        if names.iter().any(|n| n == v) {
+            return Some(v.to_string());
+        }
+        let m = PathBuf::from(v);
+        names.into_iter().find(|n| self.engine_path(Some(n)).is_some_and(|(_, p)| p == m))
     }
     fn engine_names(&self) -> Vec<String> {
         std::iter::once(self.model_name.clone()).chain(self.engines.iter().map(|(n, _)| n.clone())).collect()
