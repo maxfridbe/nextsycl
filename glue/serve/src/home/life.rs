@@ -91,6 +91,19 @@ pub(super) fn waiting_workers(status: &Value) -> Vec<(usize, u64)> {
 /// The video daemon's engines by name, and its loaded slots: (model id, card, running a clip)
 type VideoDaemon = (Vec<String>, Vec<(String, usize, bool)>);
 
+/// What a backplane runs of a model at once, from its cards and the kind's servers: (max copies, recommended copies,
+/// jobs or chat requests together). One copy a server, at most its profile's copies a card on each card it is enabled
+/// on; a chat model is one copy answering `chat_parallel` requests together.
+fn backplane_copies(kind: &str, cards: usize, servers: usize, prof: &Profile, chat_parallel: usize) -> (usize, usize, usize) {
+    if kind == "llm" {
+        return (1, 1, chat_parallel.max(1));
+    }
+    let c = &prof.concurrency;
+    let max = (cards * c.max_copies_per_card as usize).min(servers);
+    let rec = (cards * c.recommended_copies as usize).min(max);
+    (max, rec, rec)
+}
+
 /// A video slot's model id: the daemon's `denoiser`, else the engine's own `info.model` (a daemon older than the engine
 /// can match only paths, and leaves denoiser null)
 fn video_model(g: &Value) -> Option<&str> {
@@ -569,8 +582,20 @@ impl Home {
                 "video" => video.as_ref().map_or(0, |(_, loaded)| loaded.iter().filter(|(e, _, _)| *e == id).count()),
                 _ => 0,
             };
+            // what this backplane runs of it at once, never per card: copies (its cards, at most the kind's servers; a chat
+            // model one) and the jobs / chat requests they take together
+            let servers = if kind == "video" { gpus.len() } else { self.slots(&kind).len() };
+            let chat_parallel = m["env"]["NS_PARALLEL"].as_str().or(self.o.cfg.get("NS_PARALLEL").as_deref()).and_then(|v| v.trim().parse().ok()).unwrap_or(2);
+            let (max_copies, recommended_copies, at_once) = backplane_copies(&kind, gpus.len(), servers, &prof, chat_parallel);
+            let mut concurrency = concurrency;
+            if let Some(o) = concurrency.as_object_mut() {
+                // the card's figures are a copy's on one card: the backplane's are below
+                o.remove("max_copies_per_card");
+                o.remove("recommended_copies");
+                o.remove("scaling");
+            }
             json!({"concurrency": concurrency, "coexistence": coexistence, "copies_now": copies_now,
-                   "recommended_copies": prof.concurrency.recommended_copies, "max_copies_per_card": prof.concurrency.max_copies_per_card,
+                   "max_copies": max_copies, "recommended_copies": recommended_copies, "at_once": at_once,
                    "id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "state": state,
                    "spans": spans_all(m, &mc),
                    "pinned": enabled && m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round()),
@@ -898,7 +923,7 @@ impl Home {
     /// `system.busy`'s `engines`: what a dispatcher needs of each enabled model
     pub(super) fn engines(states: &[Value]) -> Vec<Value> {
         states.iter().filter(|m| m["enabled"] == true).map(|m| json!({"id": m["id"], "kind": m["kind"], "copies_now": m["copies_now"],
-            "recommended_copies": m["recommended_copies"], "max_copies_per_card": m["max_copies_per_card"],
+            "max_copies": m["max_copies"], "recommended_copies": m["recommended_copies"], "at_once": m["at_once"],
             "mode": m["coexistence"]["mode"], "status": m["concurrency"]["status"]})).collect()
     }
 
@@ -1363,6 +1388,21 @@ fn vouched_rows(on: &[&Value], gi: &str) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copies_are_the_backplanes_never_a_cards() {
+        use super::{backplane_copies, Profile};
+        let one = Profile::default();
+        // two cards, two servers: two clips / pictures at once; enabled on one card: one
+        assert_eq!(backplane_copies("video", 2, 2, &one, 2), (2, 2, 2));
+        assert_eq!(backplane_copies("audio", 1, 2, &one, 2), (1, 1, 1));
+        // a card fitting two copies is still held to the kind's servers
+        let two = Profile::of_entry(&serde_json::json!({"concurrency": {"max_copies_per_card": 2, "recommended_copies": 2}}));
+        assert_eq!(backplane_copies("image", 2, 2, &two, 2), (2, 2, 2));
+        assert_eq!(backplane_copies("image", 1, 2, &two, 2), (2, 2, 2));
+        // a chat model: one copy, its requests together
+        assert_eq!(backplane_copies("llm", 2, 1, &one, 4), (1, 1, 4));
+    }
+
     #[test]
     fn a_video_slot_names_its_model_by_the_daemon_or_the_engine() {
         use serde_json::json;

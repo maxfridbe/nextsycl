@@ -20,7 +20,7 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
   - **The scheduler is a crate:** the decisions below - placement, room, pins and holds, concurrency profiles, ETAs, the waits - are
     `crates/scheduler` (`backplane-scheduler`, nextcuda's, copied with its patches listed in its CHANGELOG.md), driven over `Sched` in `home/life.rs`. A
     model card's `concurrency` and `coexistence` (model-cards/README.md; absent: one copy, shared; bad values refused at load, naming the file) are on each
-    model row, and `system.busy.engines` has one `{id, kind, copies_now, recommended_copies, max_copies_per_card, mode, status}` per enabled model. An exclusive
+    model row, and `system.busy.engines` has one `{id, kind, copies_now, max_copies, recommended_copies, at_once, mode, status}` per enabled model, every count this backplane's (a model card's per-card figures times the cards it is enabled on, at most the kind's servers; a chat model one copy, `at_once` its requests decoded together). An exclusive
     model is alone on its card and nothing starts beside it, a picture, sound or 3D load under way included (chat too asks, but a chat model's own load shows
     only when its memory does); the video daemon's own worker is not gated by it. `nextsycl models bench <id> [--copies 1,2] [--beside <id>...] [--requests N] [--gpu N] [--write]` measures a block, under
     NS_GPU_LOCK, with the box in maintenance; only `--write` edits the card.

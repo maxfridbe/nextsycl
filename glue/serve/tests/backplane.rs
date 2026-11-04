@@ -840,7 +840,8 @@ fn system_busy_says_each_enabled_models_engine_row() {
     let e = b.ok("system.busy", json!({}))["engines"].clone();
     let row = |id: &str| e.as_array().unwrap().iter().find(|r| r["id"] == id).cloned();
     assert!(row("off").is_none(), "{e}");
-    assert_eq!(row("plain").unwrap(), json!({"id": "plain", "kind": "image", "copies_now": 1, "recommended_copies": 1, "max_copies_per_card": 1, "mode": "shared", "status": "unmeasured"}));
+    // every count is the backplane's (one card here), none a card's
+    assert_eq!(row("plain").unwrap(), json!({"id": "plain", "kind": "image", "copies_now": 1, "max_copies": 1, "recommended_copies": 1, "at_once": 1, "mode": "shared", "status": "unmeasured"}));
     assert_eq!(row("alone").unwrap()["mode"], "exclusive");
     assert_eq!(row("alone").unwrap()["copies_now"], 0);
     let st = b.model_state("plain");
