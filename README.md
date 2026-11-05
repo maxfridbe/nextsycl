@@ -34,7 +34,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `deepseek-v4.1-flash-xq`, `-fast` | **DeepSeek-V4.1-Flash-1017 XQ v3, uncensored** (IndrasMirror; experts in Q3_K / Q2_0 / ternary PTQ1_0 each by its own, 142 GiB; DeepSeek's Engram shards beside it). [Port notes](docs/ports/deepseek41-xq.md) | tg 10.7 exact / ~22 `-fast` (512 tokens) / pp 78-410, 128K; thinks by default |
 | `minimax-m3.1-flash-iq1m` | **MiniMax-M3.1-Flash** UD-IQ1_M (129 GB; 128-expert MoE with sparse attention; the experts beyond the cards' 47 GiB read from SSD / pinned RAM; text only) | tg ~7.4 (6.0 at 31K, still warming; was 0.9) / pp 113-121 tok/s, 2K-8K (89 at 31K); [ladder](docs/ladders/minimax-m3.1-flash-iq1m_ladder_stats.md) |
 | `nemotron-3.5-super-q2kxl` | **Nemotron 3.5 Super 120B-A12B** (unsloth UD-Q2_K_XL; hybrid Mamba-2 / latent MoE / attention; text only) | ~40 tok/s with its MTP drafts (30 without) / ~790-1,140 tok/s, 32K (128K tested: 868 / 34) |
-| `nemotron-3.5-super-iq1m` | **Nemotron 3.5 Super** UD-IQ1_M (the same; or on the B70 alone, experts in pinned RAM: ~21 tok/s / ~350 tok/s at 2K) | ~46 tok/s with MTP (32 without) / ~880-1,470 tok/s, 32K (128K tested: 1,120 / 38); `-b70`: the B70 alone, ~21 / 450-560 |
+| `nemotron-3.5-super-iq1m` | **Nemotron 3.5 Super** UD-IQ1_M (the same; or on the B70 alone, experts in pinned RAM: ~21 tok/s / ~350 tok/s at 2K) | ~46 tok/s with MTP (32 without) / ~880-1,470 tok/s, 32K (128K tested: 1,120 / 38); `-b70`: the B70 alone, ~21 / 450-560; [ladder](docs/ladders/nemotron-3.5-super-iq1m_ladder_stats.md) |
 
 **On one 32 GB card** (measured on an Arc Pro B70):
 
@@ -43,7 +43,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `qwen3.8-flash-next-iq2_xs` | **Qwen3.8-Flash-Next** 125B MoE IQ2_XS (MTP drafts) | ~80 tok/s / ~1,200 tok/s, 128K |
 | `qwen3.8-flash-next-coder-iq1_m` | **Qwen3.8-Flash-Next Coder** IQ1_M | ~77 tok/s / ~1,400 tok/s, 128K |
 | `qwen3.8-27b-q4` | **Qwen3.8-27B** dense UD-Q4_K_M (MTP drafts) | 43-49 tok/s, 128K |
-| `muse-glimmer-30b-q8` | **Muse Glimmer 30B** abliterated, dense Q8_0 with its DFlash drafter (reasons on its to=self channel) | 30-77 tok/s by text (18.7 without drafts) / ~1,350 tok/s (1,215 at 35K), 128K |
+| `muse-glimmer-30b-q8` | **Muse Glimmer 30B** abliterated, dense Q8_0 with its DFlash drafter (reasons on its to=self channel) | 30-77 tok/s by text (18.7 without drafts) / ~1,350 tok/s (1,215 at 35K), 128K; [ladder](docs/ladders/muse-glimmer-30b-q8_ladder_stats.md): pp 962 / 795 / 530 at 3K / 35K / 100K |
 | `muse-glimmer-30b-q8-b70`, `-b65` | the same on one card alone, without the drafter (it does not fit beside the model) | 18.7 (B70) / 16.9 (B65) tok/s, 128K |
 | `muse-glimmer-30b-q4`, `-q6` | **Muse Glimmer 30B** Q4_K_M / Q6_K on the B70 alone, with its drafter | 43 / 35 tok/s (25.4 / 20 without drafts) / ~1,400 tok/s, 128K |
 | `qwen-image-2.1-q8` | **Qwen-Image 2.1** text to image, edits | 1024x1024, 40 steps: 23.8 s (16.5 s int8) |
