@@ -248,6 +248,7 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `H3_TE_PIN_LOCK` | /tmp/h3-te-pin.lock | the lock file that lets one worker a host hold the pinned text-encoder copy | video h3 |
 | `H3_THREADS` | 8 | threads reading the checkpoint at load (--opt-threads) | video h3 |
 | `H3_VAE_ATTN_PER_TILE` | off | 1: the video decoder's attention a tile at a time (--opt-vae-attn-per-tile) | video h3 |
+| `H3_VAE_FLOAT32` | off | 1: every tile of the fp16 video decoder in float32 (~8x slower; for checks). Without it, only a tile that comes out non-finite in half precision is decoded again in float32, and the job log names it | video h3 |
 | `NS_VIDEO_CHARACTERS` | docs/video/characters.example.json | characters for the speech tool | cli (video tools) |
 | `NS_VIDEO_DOOR` | 127.0.0.1:8000 | the front door the studio asks which cards a pin or hold has and the host's free memory (`--door` wins; off: none) | studio |
 | `NS_VIDEO_ENGINES` | none | the video daemon's other models, space-separated registry ids (serve: the enabled video models decide) | cli (video start), serve |

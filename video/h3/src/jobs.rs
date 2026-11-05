@@ -568,6 +568,11 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
     let secs = t0.elapsed().as_secs_f64();
     let (mut fh, mut fw) = (h * 16, w * 16);
     ctl.say(format!("decoded: {frames} frames of {fw}x{fh} in {secs:.1} s ({tiles} batches of tiles)"));
+    let redone = std::mem::take(&mut *dec.redone.lock().unwrap());
+    for r in &redone {
+        ctl.say(format!("vae    : non-finite in half precision, decoded again in float32: {r}"));
+    }
+    report["vae_float32_tiles"] = json!(redone.len());
     let mut px = px;
     if let Some((pp, s)) = vaes.pixel {
         // the size the latent upscaler would have given: its latent size, in pixels

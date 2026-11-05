@@ -97,10 +97,35 @@ pub struct VideoDecoder {
     lat_std: Vec<f32>,
     pub load_seconds: f64,
     pub load_bytes: u64,
+    /// host threads for widening the weights to float32
+    threads: usize,
+    /// the tiles that came out non-finite in half precision and were decoded again in float32, one line each
+    /// (taken by the job after the decode, for its log)
+    pub redone: std::sync::Mutex<Vec<String>>,
 }
 
 fn f32_tensor(dev: &Arc<Device>, shape: &[usize], v: &[f32]) -> Result<Tensor> {
     Tensor::from_bytes(dev, DType::F32, shape, &v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>())
+}
+
+/// A 16-bit tensor as a float32 one (converted on the host, `threads` at a time).
+fn widened(dev: &Arc<Device>, t: &Tensor, threads: usize) -> Result<Tensor> {
+    let dt = t.dtype;
+    let src = t.to_bytes()?;
+    let mut dst = vec![0u8; src.len() * 2];
+    let per = (src.len() / 2).div_ceil(threads.max(1)).max(1) * 2;
+    std::thread::scope(|s| {
+        for (a, b) in src.chunks(per).zip(dst.chunks_mut(per * 2)) {
+            s.spawn(move || {
+                for (h, o) in a.chunks_exact(2).zip(b.chunks_exact_mut(4)) {
+                    let h = u16::from_le_bytes([h[0], h[1]]);
+                    let v = if dt == DType::BF16 { crate::dtype::bf16_to_f32(h) } else { crate::dtype::f16_to_f32(h) };
+                    o.copy_from_slice(&v.to_le_bytes());
+                }
+            });
+        }
+    });
+    Tensor::from_bytes(dev, DType::F32, &t.shape, &dst)
 }
 
 fn act_bytes(v: &[f32], dt: DType) -> Vec<u8> {
@@ -211,14 +236,19 @@ impl VideoDecoder {
             lat_std: host(ck, "latents_std")?,
             load_seconds: loaded.seconds,
             load_bytes: loaded.bytes,
+            threads,
+            redone: Default::default(),
         })
     }
 
     /// Tiles of the same size, decoded together: latents [24, t, h, w] each (denormalized, after the 1x1x1
     /// convolution) -> raw pixels [3, 4t, 16h, 16w] each. The tiles share the linears (one matrix product over all
     /// their tokens: a tile alone, ~1,800 tokens, is a thin product for this card) and keep their own attention.
-    fn tiles(&self, zs: &[Vec<f32>], t: usize, h: usize, w: usize) -> Result<Vec<Vec<f32>>> {
+    /// `act`: the activations' type, the decoder's own or float32 (16-bit weights only: each block's linears are
+    /// widened to float32 for the block, then dropped - a tile that overflowed half precision, decoded again).
+    fn tiles(&self, zs: &[Vec<f32>], t: usize, h: usize, w: usize, act_dt: DType) -> Result<Vec<Vec<f32>>> {
         let dev = &self.dev;
+        let wide = act_dt != self.act;
         let nb = zs.len();
         let n = t * h * w;
         let s = n + REGISTERS + 1;
@@ -233,13 +263,21 @@ impl VideoDecoder {
             }
         }
         let input = f32_tensor(dev, &[nb * n, LATENT_C], &rows)?;
-        let x = Tensor::new(dev, self.act, &[rows_all, DIM])?;
+        let x = Tensor::new(dev, act_dt, &[rows_all, DIM])?;
+        let wide_suffix;
+        let suffix = match wide {
+            true => {
+                wide_suffix = f32_tensor(dev, &self.suffix.shape, &self.suffix.to_f32()?)?;
+                &wide_suffix
+            }
+            false => &self.suffix,
+        };
         {
-            let e = Tensor::new(dev, self.act, &[nb * n, DIM])?;
+            let e = Tensor::new(dev, act_dt, &[nb * n, DIM])?;
             self.x_embed.forward(&input, &e)?;
             for k in 0..nb {
                 x.copy_rows(k * s, &e, k * n, n)?;
-                x.copy_rows(k * s + n, &self.suffix, 0, REGISTERS + 1)?;
+                x.copy_rows(k * s + n, suffix, 0, REGISTERS + 1)?;
             }
         }
         // positions: cell centres in [-1, 1] per axis, the suffix at 0; angles carry the 2 pi; the same per tile
@@ -258,13 +296,13 @@ impl VideoDecoder {
         let cs = f32_tensor(dev, &[rows_all, ROT_DIM / 2, 2], &all)?;
         let zero_rows = Tensor::from_bytes(dev, DType::I32, &[rows_all], &vec![0u8; rows_all * 4])?;
 
-        let hbuf = Tensor::new(dev, self.act, &[rows_all, DIM])?;
-        let qkv = Tensor::new(dev, self.act, &[rows_all, 3 * DIM])?;
-        let att = Tensor::new(dev, self.act, &[rows_all, DIM])?;
-        let att1 = Tensor::new(dev, self.act, &[s, DIM])?;
-        let proj = Tensor::new(dev, self.act, &[rows_all, DIM])?;
-        let f1 = Tensor::new(dev, self.act, &[rows_all, 2 * 4 * DIM])?;
-        let act = Tensor::new(dev, self.act, &[rows_all, 4 * DIM])?;
+        let hbuf = Tensor::new(dev, act_dt, &[rows_all, DIM])?;
+        let qkv = Tensor::new(dev, act_dt, &[rows_all, 3 * DIM])?;
+        let att = Tensor::new(dev, act_dt, &[rows_all, DIM])?;
+        let att1 = Tensor::new(dev, act_dt, &[s, DIM])?;
+        let proj = Tensor::new(dev, act_dt, &[rows_all, DIM])?;
+        let f1 = Tensor::new(dev, act_dt, &[rows_all, 2 * 4 * DIM])?;
+        let act = Tensor::new(dev, act_dt, &[rows_all, 4 * DIM])?;
         let prof = std::env::var_os("NSD_PROFILE").is_some();
         let per_tile = std::env::var("H3_VAE_ATTN_PER_TILE").is_ok_and(|v| v == "1");
         let tb = std::time::Instant::now();
@@ -286,10 +324,27 @@ impl VideoDecoder {
             }
             Ok(())
         };
+        let widen = |l: &Lin| -> Result<Lin> {
+            match l {
+                Lin::F(l) => Ok(Lin::F(Linear {
+                    weight: widened(dev, &l.weight, self.threads)?,
+                    bias: l.bias.as_ref().map(|b| f32_tensor(dev, &b.shape, &b.to_f32()?)).transpose()?,
+                })),
+                Lin::I8(_) => Err(Error("the int8 decoder has no float32 path".into())),
+            }
+        };
         for b in &self.blocks {
+            let wide_lins;
+            let [qkv_l, out_l, w1_l, w2_l] = match wide {
+                true => {
+                    wide_lins = [widen(&b.qkv)?, widen(&b.out)?, widen(&b.w1)?, widen(&b.w2)?];
+                    [&wide_lins[0], &wide_lins[1], &wide_lins[2], &wide_lins[3]]
+                }
+                false => [&b.qkv, &b.out, &b.w1, &b.w2],
+            };
             ops::rms_norm_mod(&x, &b.norm1, EPS, None, &hbuf)?;
             lap("norm")?;
-            b.qkv.forward(&hbuf, &qkv)?;
+            qkv_l.forward(&hbuf, &qkv)?;
             lap("linear qkv")?;
             let all_rows = |i: usize| Rows { t: &qkv, offset: i * DIM, stride: 3 * DIM, tokens: rows_all, heads: HEADS, dim: HEAD_DIM };
             ops::rms_rope(all_rows(0), &self.ones, EPS, &cs, ROT_DIM)?;
@@ -312,28 +367,32 @@ impl VideoDecoder {
                 ops::attention_batch(part(0), part(1), part(2), nb, &att)?;
             }
             lap("attention")?;
-            match (&b.out, b.folded) {
+            match (out_l, b.folded) {
                 (Lin::F(l), true) => l.forward_acc(&att, &x)?,
                 _ => {
-                    b.out.forward(&att, &proj)?;
+                    out_l.forward(&att, &proj)?;
                     ops::gate_add(&x, &proj, &zero_rows, &b.scale1)?;
                 }
             }
             lap("linear out + add")?;
             ops::rms_norm_mod(&x, &b.norm2, EPS, None, &hbuf)?;
             lap("norm")?;
-            b.w1.forward(&hbuf, &f1)?;
+            w1_l.forward(&hbuf, &f1)?;
             lap("linear w1")?;
             ops::swiglu(&f1, &act)?;
             lap("gated activation")?;
-            match (&b.w2, b.folded) {
+            match (w2_l, b.folded) {
                 (Lin::F(l), true) => l.forward_acc(&act, &x)?,
                 _ => {
-                    b.w2.forward(&act, &proj)?;
+                    w2_l.forward(&act, &proj)?;
                     ops::gate_add(&x, &proj, &zero_rows, &b.scale2)?;
                 }
             }
             lap("linear w2 + add")?;
+            if wide {
+                // the widened weights are freed at the end of the block: the queue must be done with them
+                dev.wait()?;
+            }
         }
         if prof {
             let sum: f64 = stages.iter().map(|s| s.1).sum();
@@ -347,7 +406,7 @@ impl VideoDecoder {
         }
         let normed = Tensor::new(dev, DType::F32, &[nb * n, DIM])?;
         {
-            let img = Tensor::new(dev, self.act, &[nb * n, DIM])?;
+            let img = Tensor::new(dev, act_dt, &[nb * n, DIM])?;
             for k in 0..nb {
                 img.copy_rows(k * n, &x, k * s, n)?;
             }
@@ -384,8 +443,10 @@ impl VideoDecoder {
         Ok(res)
     }
 
-    /// Latents [24, t, h, w] (raw, denormalized) through tiling: pixels [3, 4t, 16h, 16w], raw.
-    fn tiled(&self, z: &[f32], t: usize, h: usize, w: usize, tick: &mut dyn FnMut() -> Result<()>) -> Result<Vec<f32>> {
+    /// Latents [24, t, h, w] (raw, denormalized) through tiling: pixels [3, 4t, 16h, 16w], raw. A half-precision tile
+    /// that comes out non-finite (an overflow inside it: its attention spreads the NaN over the whole tile, which
+    /// would be written black) is decoded again alone in float32 and noted in `redone` (`what` names the piece).
+    fn tiled(&self, z: &[f32], t: usize, h: usize, w: usize, what: &str, tick: &mut dyn FnMut() -> Result<()>) -> Result<Vec<f32>> {
         let (fh, fw, ft) = (h * PATCH, w * PATCH, t * PATCH_T);
         let (ys, yo) = split_tiles(fh);
         let (xs, xo) = split_tiles(fw);
@@ -412,9 +473,27 @@ impl VideoDecoder {
         }
         let mut decoded: Vec<Vec<f32>> = Vec::with_capacity(zs.len());
         let t0 = std::time::Instant::now();
+        // H3_VAE_FLOAT32=1: every tile in float32 (16-bit weights; slower, for checks)
+        let all_wide = self.act == DType::F16 && std::env::var("H3_VAE_FLOAT32").is_ok_and(|v| v == "1");
         for batch in zs.chunks(TILE_BATCH) {
             tick()?;
-            decoded.extend(self.tiles(batch, t, lh, lw)?);
+            decoded.extend(self.tiles(batch, t, lh, lw, if all_wide { DType::F32 } else { self.act })?);
+        }
+        // the tiles that overflowed half precision, decoded again in float32 a batch at a time (the weights are
+        // widened once a batch)
+        let bad: Vec<usize> = match self.act == DType::F16 && !all_wide {
+            true => (0..decoded.len()).filter(|&i| !decoded[i].iter().all(|v| v.is_finite())).collect(),
+            false => Vec::new(),
+        };
+        for idx in bad.chunks(TILE_BATCH) {
+            tick()?;
+            let batch: Vec<Vec<f32>> = idx.iter().map(|&i| zs[i].clone()).collect();
+            for (&i, again) in idx.iter().zip(self.tiles(&batch, t, lh, lw, DType::F32)?) {
+                let (y0, x0) = (ys[i / xs.len()], xs[i % xs.len()]);
+                let still = if again.iter().all(|v| v.is_finite()) { "" } else { " (still not finite in float32)" };
+                self.redone.lock().unwrap().push(format!("{what}, tile x {x0}-{} y {y0}-{}{still}", x0 + tw, y0 + th));
+                decoded[i] = again;
+            }
         }
         let t_tiles = t0.elapsed().as_secs_f64();
         let t0 = std::time::Instant::now();
@@ -489,7 +568,7 @@ impl VideoDecoder {
         let (fh, fw) = (h * PATCH, w * PATCH);
         let plane = fh * fw;
         if t == 1 {
-            let raw = self.tiled(&zp, 1, h, w, tick)?;
+            let raw = self.tiled(&zp, 1, h, w, "the frame", tick)?;
             // the last of the 4 decoded frames
             let mut out = vec![0f32; OUT_C * plane];
             for c in 0..OUT_C {
@@ -526,7 +605,7 @@ impl VideoDecoder {
                     zc[(c * ct + k) * n..][..n].copy_from_slice(&zp[lat_frame(t0 + k, c)]);
                 }
             }
-            let raw = self.tiled(&zc, ct, h, w, tick)?;
+            let raw = self.tiled(&zc, ct, h, w, &format!("latent frames {t0}-{} of {t}", (t1 - 1).min(t - 1)), tick)?;
             let nf = ct * PATCH_T;
             let frame = |f: usize| -> Vec<f32> { (0..OUT_C).flat_map(|c| raw[(c * nf + f) * plane..][..plane].to_vec()).collect() };
             for j in 0..2 {
