@@ -30,6 +30,11 @@ int ns_image_seedvr2_silo_conv_taps_acc(ns_gpu* g, const void* const* frames, in
  * pointwise convolutions: one product over all the pixels) */
 int ns_image_seedvr2_silo_linear(ns_gpu* g, const void* x, int64_t M, int64_t K, const void* w, int64_t N, const float* bias, void* out);
 
+/* Group norm (+ SiLU when silu) of F frames of N voxels x C channels (C a multiple of 8), G groups, weight and bias
+ * float32 [C]: as the engine's ns_image_seedvr2_group_norm, the statistics folded into a scale and shift a channel */
+int ns_image_seedvr2_silo_group_norm(ns_gpu* g, const void* x, int64_t F, int64_t N, int64_t C, int64_t G, const float* weight, const float* bias,
+                                     float eps, int silu, void* out);
+
 /* Attention of B windows of S rows each, bfloat16 throughout (scores float32): q, k, v rows `stride` apart (the
  * packed qkv: k at q + H D, v at q + 2 H D), window b's rows from row b S; out [B S, H D] bfloat16. */
 int ns_image_seedvr2_silo_attention(ns_gpu* g, const void* q, const void* k, const void* v, int64_t B, int64_t S, int64_t H, int64_t D,

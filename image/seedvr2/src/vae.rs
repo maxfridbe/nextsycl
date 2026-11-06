@@ -413,10 +413,16 @@ impl Vae {
         let k = ffi::api()?;
         let out = Vol::new(&self.gpu, x.t, x.h, x.w, x.c)?;
         // two reads and a write
+        // the silo's when it is there (channels in eights)
+        // SAFETY: the silo's entry point, on this GPU's context.
+        let f = match ffi::silo()?.filter(|sl| x.c.is_multiple_of(8) && unsafe { (sl.supported)(self.gpu.raw()) } == 1) {
+            Some(sl) => sl.group_norm,
+            None => k.group_norm,
+        };
         prof::timed(&self.gpu, "vae group norm", 0.0, 6.0 * (x.px() * x.c) as f64, || {
             // SAFETY: t frames of h x w x c bfloat16 in and out.
             ffi::check(unsafe {
-                (k.group_norm)(self.gpu.raw(), x.buf.ptr(), x.t as i64, (x.h * x.w) as i64, x.c as i64, GROUPS as i64, n.w.fp(), n.b.fp(), EPS, silu as i32,
+                f(self.gpu.raw(), x.buf.ptr(), x.t as i64, (x.h * x.w) as i64, x.c as i64, GROUPS as i64, n.w.fp(), n.b.fp(), EPS, silu as i32,
                                out.buf.ptr())
             }, "group norm")
         })?;
