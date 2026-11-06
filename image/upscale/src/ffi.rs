@@ -81,3 +81,52 @@ pub fn check(rc: c_int, what: &str) -> Result<()> {
 pub fn g(gpu: &Gpu) -> G {
     gpu.raw()
 }
+
+pub const SILO: &str = "upscale";
+
+/// A silo convolution: x, H, W, Ci, x's pixel stride, w, Co, k, stride, pad top / left / bottom / right, bias, act, a,
+/// slopes, n, residual (or null) and its two weights, out, out's pixel stride
+pub type SiloConv = unsafe extern "C" fn(G, P, i64, i64, i64, i64, P, i64, i64, i64, i64, i64, i64, i64, *const f32, c_int, f32, *const f32, i64, P, f32, f32,
+                                         M, i64) -> c_int;
+
+/// The silo's kernels (kernels/image/upscale/silo/silo.h)
+pub struct Silo {
+    pub supported: unsafe extern "C" fn(G) -> c_int,
+    /// a convolution with its zero padding and activation fused (act 3: PReLU, slopes given)
+    pub conv: SiloConv,
+    /// a channel slice copied into a wider buffer, 8 halves a work-item (src, P, Cs, dst, Cd, off)
+    pub copy_channels: unsafe extern "C" fn(G, P, i64, i64, M, i64, i64) -> c_int,
+    /// the nearest upsampling by a whole factor (x, H, W, C, r, out)
+    pub upsample: unsafe extern "C" fn(G, P, i64, i64, i64, i64, M) -> c_int,
+}
+
+// SAFETY: function pointers into a library that stays loaded for the process.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+/// The silo, when built and this GPU runs it (None: NS_SILO=0, or no file - the shared convolutions throughout)
+pub fn silo(gpu: &Gpu) -> Result<Option<&'static Silo>> {
+    static S: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    let s = S.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo(SILO).map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in silo.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo { supported: sym!("ns_image_up_silo_supported"), conv: sym!("ns_image_up_silo_conv"),
+                        copy_channels: sym!("ns_image_up_silo_copy_channels"), upsample: sym!("ns_image_up_silo_upsample") }))
+    })
+    .as_ref()
+    .map_err(|e| Error(e.clone()))?;
+    // SAFETY: the silo's entry point, on this GPU's context.
+    Ok(s.as_ref().filter(|sl| unsafe { (sl.supported)(gpu.raw()) } == 1))
+}

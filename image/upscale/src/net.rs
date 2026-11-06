@@ -41,6 +41,11 @@ struct Conv {
     b: Option<DevBuf>,
     /// a transposed convolution: dilate the input by `stride` first (then the convolution's own stride is 1)
     dilate: usize,
+    /// the PReLU that alone reads this convolution's output, fused into it (its slopes and their count)
+    prelu: Option<(DevBuf, usize)>,
+    /// the Eltwise sum that alone reads this convolution's output, fused into it: out = a x conv + b x the layer's
+    /// second input (RRDB's 0.2 x block + x)
+    residual: Option<(f32, f32)>,
 }
 
 enum Op {
@@ -66,10 +71,23 @@ struct Layer {
     outputs: Vec<usize>,
 }
 
+/// A dense block's concatenations made in place (RRDB: concat(x, x1), concat(x, x1, x2), ... each read by the next
+/// convolution): one buffer of all their channels, x copied in once, each convolution writing its channels into it
+/// and each concatenation a view of its first channels - no copies (they were 42 % of x4plus's time)
+struct Chain {
+    /// x, the block's input (a blob that is not a Split's)
+    base: usize,
+    /// the convolutions that write into the buffer, in order, and their channels
+    convs: Vec<(usize, usize)>,
+}
+
 pub struct Net {
     layers: Vec<Layer>,
     /// how many layers read each blob
     readers: Vec<usize>,
+    chains: Vec<Chain>,
+    /// a layer's place in a chain: a convolution's (chain, its index in the chain's convs), a concatenation's (chain, -)
+    in_chain: Vec<Option<(usize, usize)>>,
     input: usize,
     output: usize,
     pub name: String,
@@ -194,6 +212,8 @@ fn conv_of(gpu: &Arc<Gpu>, l: &crate::ncnn::Layer, bin: &mut Bin, transposed: bo
         w: half_buf(gpu, &w16)?,
         b: b.map(|v| DevBuf::from_f32(gpu, &v)).transpose()?,
         dilate,
+        prelu: None,
+        residual: None,
     })
 }
 
@@ -294,6 +314,39 @@ impl Net {
             return Err(Error(format!("{name}: {} bytes of weights left over (the graph and the weights do not belong together)", r.rest())));
         }
         let input = input.ok_or_else(|| Error(format!("{name}: no Input layer")))?;
+        // a PReLU right after the convolution it alone reads (SRVGG's every layer): fused into the convolution, its
+        // output the PReLU's blob
+        let mut fused: Vec<Layer> = Vec::with_capacity(layers.len());
+        for l in layers {
+            if let (Op::PRelu { .. }, Some(prev)) = (&l.op, fused.last_mut()) {
+                let only = g.layers.iter().filter(|x| x.inputs.iter().any(|i| prev.outputs.first() == Some(i))).count() == 1;
+                if let Op::Conv(c) = &mut prev.op {
+                    if only && c.act.kind == 0 && c.prelu.is_none() && prev.outputs.len() == 1 && l.inputs.first() == prev.outputs.first() {
+                        let Op::PRelu { slopes, n } = l.op else { unreachable!() };
+                        c.prelu = Some((slopes, n));
+                        prev.outputs = l.outputs.clone();
+                        prev.name = format!("{} + {}", prev.name, l.name);
+                        continue;
+                    }
+                }
+            }
+            if let (Op::Eltwise { op: 0, coeffs }, Some(prev)) = (&l.op, fused.last_mut()) {
+                let only = g.layers.iter().filter(|x| x.inputs.iter().any(|i| prev.outputs.first() == Some(i))).count() == 1;
+                if let Op::Conv(c) = &mut prev.op {
+                    let co = |i: usize| coeffs.get(i).copied().unwrap_or(1.0);
+                    if only && l.inputs.len() == 2 && c.residual.is_none() && c.dilate == 1 && prev.outputs.len() == 1 && l.inputs.first() == prev.outputs.first()
+                        && co(1) != 0.0 {
+                        c.residual = Some((co(0), co(1)));
+                        prev.inputs.push(l.inputs[1]);
+                        prev.outputs = l.outputs.clone();
+                        prev.name = format!("{} + {}", prev.name, l.name);
+                        continue;
+                    }
+                }
+            }
+            fused.push(l);
+        }
+        let layers = fused;
         let output = *layers.last().and_then(|l| l.outputs.first()).ok_or_else(|| Error(format!("{name}: no layers")))?;
         let mut readers = vec![0usize; g.blobs.len()];
         for l in &layers {
@@ -301,7 +354,107 @@ impl Net {
                 readers[*i] += 1;
             }
         }
-        Ok(Net { layers, readers, input, output, name: name.to_string() })
+        // (the slices need the silo's convolution; NS_UP_CHAIN=0: every concatenation copied)
+        let (chains, in_chain) = if std::env::var("NS_UP_CHAIN").is_ok_and(|v| v.trim() == "0") || ffi::silo(gpu)?.is_none() {
+            (Vec::new(), vec![None; layers.len()])
+        } else {
+            Self::chains(&layers, g.blobs.len())
+        };
+        Ok(Net { layers, readers, chains, in_chain, input, output, name: name.to_string() })
+    }
+
+    /// The dense blocks' concatenations that can be made in place (`Chain`)
+    fn chains(layers: &[Layer], nblobs: usize) -> (Vec<Chain>, Vec<Option<(usize, usize)>>) {
+        // a blob through its Splits to the blob they copy; who makes each; who reads each (Splits looked through)
+        let mut src: Vec<usize> = (0..nblobs).collect();
+        let mut producer: Vec<Option<usize>> = vec![None; nblobs];
+        let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); nblobs];
+        for (i, l) in layers.iter().enumerate() {
+            if matches!(l.op, Op::Split) {
+                for o in &l.outputs {
+                    src[*o] = src[l.inputs[0]];
+                }
+                continue;
+            }
+            for inp in &l.inputs {
+                consumers[src[*inp]].push(i);
+            }
+            for o in &l.outputs {
+                producer[*o] = Some(i);
+            }
+        }
+        // chains: a concatenation of two blobs starts one, a concatenation of a chain's blobs and one more extends it
+        let mut lists: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+        for (i, l) in layers.iter().enumerate() {
+            if !matches!(l.op, Op::Concat) {
+                continue;
+            }
+            let r: Vec<usize> = l.inputs.iter().map(|b| src[*b]).collect();
+            if let Some(c) = lists.iter_mut().find(|(list, _)| r.len() == list.len() + 1 && r[..list.len()] == list[..]) {
+                c.0.push(r[r.len() - 1]);
+                c.1.push(i);
+            } else if r.len() == 2 {
+                lists.push((r, vec![i]));
+            }
+        }
+        let conv_ok = |li: usize| matches!(&layers[li].op, Op::Conv(c) if c.dilate == 1) && layers[li].outputs.len() == 1;
+        let mut chains = Vec::new();
+        let mut in_chain = vec![None; layers.len()];
+        for (list, concats) in lists {
+            // every added blob a convolution's that only the chain's concatenations read; every concatenation read by
+            // convolutions alone (they read a channel slice); x not itself a slice
+            let added_ok = list[1..].iter().all(|b| producer[*b].is_some_and(conv_ok) && consumers[*b].iter().all(|c| concats.contains(c)));
+            let read_ok = concats.iter().all(|c| consumers[src[layers[*c].outputs[0]]].iter().all(|r| conv_ok(*r)));
+            let base_ok = producer[list[0]].is_none_or(|p| !matches!(layers[p].op, Op::Concat));
+            if !(added_ok && read_ok && base_ok) {
+                continue;
+            }
+            let id = chains.len();
+            let convs: Vec<(usize, usize)> = list[1..].iter().map(|b| {
+                let p = producer[*b].expect("checked");
+                let Op::Conv(c) = &layers[p].op else { unreachable!() };
+                (p, c.co)
+            }).collect();
+            for (k, (p, _)) in convs.iter().enumerate() {
+                in_chain[*p] = Some((id, k));
+            }
+            for c in &concats {
+                in_chain[*c] = Some((id, usize::MAX));
+            }
+            chains.push(Chain { base: list[0], convs });
+        }
+        (chains, in_chain)
+    }
+
+    /// A layer's name in the profile (NS_UP_PROFILE), its FLOPs and the bytes it must move at least
+    fn cost(op: &Op, ins: &[(usize, Shape)]) -> (String, f64, f64) {
+        let i0 = ins.first().map(|x| x.1).unwrap_or(Shape { h: 0, w: 0, c: 0, vec: true });
+        let px = (i0.h * i0.w) as f64;
+        match op {
+            Op::Conv(c) => {
+                let (h, w) = ((i0.h.max(1) - 1) * c.dilate + 1 + c.pad[0] + c.pad[2], (i0.w.max(1) - 1) * c.dilate + 1 + c.pad[1] + c.pad[3]);
+                let (oh, ow) = (h.saturating_sub(c.k) / c.stride + 1, w.saturating_sub(c.k) / c.stride + 1);
+                let opx = (oh * ow) as f64;
+                let act = match (c.act.kind, c.prelu.is_some()) {
+                    (_, true) => " prelu",
+                    (1, _) => " relu",
+                    (2, _) => " leaky",
+                    (4, _) => " sigmoid",
+                    _ => "",
+                };
+                let act = if c.residual.is_some() { format!("{act} + residual") } else { act.to_string() };
+                (format!("conv {}x{} {} -> {}{act}", c.k, c.k, c.ci, c.co), 2.0 * opx * (c.co * c.ci * c.k * c.k) as f64,
+                 2.0 * (px * c.ci as f64 + opx * c.co as f64) + (c.co * c.ci * c.k * c.k * 2) as f64)
+            }
+            Op::PRelu { .. } => ("prelu".into(), 0.0, 4.0 * px * i0.c as f64),
+            Op::PixelShuffle(_) => ("pixel shuffle".into(), 0.0, 4.0 * px * i0.c as f64),
+            Op::Interp { .. } => ("interp".into(), 0.0, 2.0 * px * i0.c as f64),
+            Op::Eltwise { .. } => ("eltwise".into(), 0.0, 2.0 * px * i0.c as f64 * (ins.len() + 1) as f64),
+            Op::Concat => ("concat".into(), 0.0, 4.0 * ins.iter().map(|x| (x.1.h * x.1.w * x.1.c) as f64).sum::<f64>()),
+            Op::Crop { .. } => ("crop".into(), 0.0, 4.0 * px * i0.c as f64),
+            Op::Input | Op::Split => ("(no work)".into(), 0.0, 0.0),
+            Op::Mean | Op::Dense { .. } | Op::Scale => ("mean / dense / scale".into(), 0.0, 2.0 * px * i0.c as f64),
+        }
     }
 
     /// The graph over `x` [h, w, 3] half (taken over: it goes back to the pool when read): the output blob's buffer
@@ -312,6 +465,10 @@ impl Net {
         // storage: buffers by id, the readers left; a blob names its storage
         let mut store: Vec<Option<(DevBuf, usize)>> = Vec::new();
         let mut blob: Vec<Option<(usize, Shape)>> = vec![None; self.readers.len()];
+        // a blob that is a channel slice of a chain's buffer: its first channel and the buffer's channels a pixel
+        let mut view: Vec<Option<(usize, usize)>> = vec![None; self.readers.len()];
+        // each chain's buffer once made: its storage and channels a pixel
+        let mut chain_buf: Vec<Option<(usize, usize)>> = vec![None; self.chains.len()];
         let readers = |b: usize| if b == self.output { self.readers[b] + 1 } else { self.readers[b] };
         let put = |store: &mut Vec<Option<(DevBuf, usize)>>, buf: DevBuf, refs: usize| -> usize {
             store.push(Some((buf, refs)));
@@ -324,11 +481,17 @@ impl Net {
         }
         let first = put(&mut store, x, readers(self.input));
         blob[self.input] = Some((first, shape));
-        for l in &self.layers {
+        for (li, l) in self.layers.iter().enumerate() {
             let e = |m: String| Error(format!("{}: {}: {m}", self.name, l.name));
+            // only a convolution reads a channel slice (and a Split or a chain's concatenation passes it on)
+            if !matches!(l.op, Op::Conv(_) | Op::Split | Op::Concat) && l.inputs.iter().any(|i| view[*i].is_some()) {
+                return Err(e("a channel slice where a whole picture is needed".into()));
+            }
             let ins: Vec<(usize, Shape)> = l.inputs.iter().map(|i| blob[*i].ok_or_else(|| e(format!("blob {i} has no value yet")))).collect::<Result<_>>()?;
             let ptr = |store: &Vec<Option<(DevBuf, usize)>>, s: usize| store[s].as_ref().map(|(b, _)| b.ptr()).unwrap_or(std::ptr::null_mut());
             let mut outs: Vec<(DevBuf, Shape)> = Vec::new();
+            let (what, flops, bytes) = Self::cost(&l.op, &ins);
+            crate::prof::timed(gpu, &what, flops, bytes, || -> Result<()> {
             match &l.op {
                 Op::Input => {}
                 Op::Split => {
@@ -338,12 +501,91 @@ impl Net {
                             st.1 += readers(*o);
                         }
                         blob[*o] = Some((s, sh));
+                        view[*o] = view[l.inputs[0]];
                     }
                 }
                 Op::Conv(c) => {
                     let (s, sh) = ins[0];
                     if sh.vec || sh.c != c.ci {
                         return Err(e(format!("{} channels in, the kernel takes {}", sh.c, c.ci)));
+                    }
+                    let silo = ffi::silo(gpu)?.filter(|_| c.dilate == 1);
+                    let (x_off, x_ld) = view[l.inputs[0]].unwrap_or((0, sh.c));
+                    if silo.is_none() && view[l.inputs[0]].is_some() {
+                        return Err(e("a channel slice in, without the silo's convolution".into()));
+                    }
+                    if let Some(sl) = silo {
+                        // the silo's: the padding and the activation in the convolution
+                        let [pt, pl, pb, pr] = c.pad;
+                        let (h, w) = (sh.h + pt + pb, sh.w + pl + pr);
+                        if h < c.k || w < c.k {
+                            return Err(e(format!("{h}x{w} is smaller than the {}x{} kernel", c.k, c.k)));
+                        }
+                        let (oh, ow) = ((h - c.k) / c.stride + 1, (w - c.k) / c.stride + 1);
+                        let bias = c.b.as_ref().map(|b| b.ptr() as *const f32).unwrap_or(std::ptr::null());
+                        let (act, slopes, n) = match &c.prelu {
+                            Some((sl, n)) => (3, sl.ptr() as *const f32, *n as i64),
+                            None => (c.act.kind, std::ptr::null(), 0),
+                        };
+                        // into a chain's buffer (made with x copied in by its first convolution), or a buffer of its own
+                        let place = match self.in_chain[li] {
+                            Some((ch, ki)) if self.chains.len() > ch && ki != usize::MAX => {
+                                let chain = &self.chains[ch];
+                                let (bs, bsh) = blob[chain.base].ok_or_else(|| e("the dense block's input is gone".into()))?;
+                                if view[chain.base].is_some() || (bsh.h, bsh.w) != (oh, ow) {
+                                    return Err(e("the dense block's input is not a whole picture of the block's size".into()));
+                                }
+                                let cap = bsh.c + chain.convs.iter().map(|x| x.1).sum::<usize>();
+                                if ki == 0 || chain_buf[ch].is_none() {
+                                    let wbuf = pool.get(oh * ow * cap * 2)?;
+                                    // SAFETY: the buffer holds P x cap halves, x P x its channels.
+                                    let copy = if bsh.c % 8 == 0 && cap % 8 == 0 { sl.copy_channels } else { k.copy_channels };
+                                    check(unsafe { copy(gp, ptr(&store, bs), (oh * ow) as i64, bsh.c as i64, wbuf.ptr(), cap as i64, 0) }, "the block's input")?;
+                                    store.push(Some((wbuf, 0)));
+                                    chain_buf[ch] = Some((store.len() - 1, cap));
+                                }
+                                let (wid, cap) = chain_buf[ch].expect("made");
+                                let off = bsh.c + chain.convs[..ki].iter().map(|x| x.1).sum::<usize>();
+                                Some((wid, off, cap))
+                            }
+                            _ => None,
+                        };
+                        let own = if place.is_none() { Some(pool.get(oh * ow * c.co * 2)?) } else { None };
+                        let (optr, out_ld) = match (&own, place) {
+                            (Some(b), _) => (b.ptr(), c.co),
+                            (None, Some((wid, off, cap))) => (ptr(&store, wid).cast::<u16>().wrapping_add(off).cast(), cap),
+                            _ => unreachable!(),
+                        };
+                        let xptr = ptr(&store, s).cast::<u16>().wrapping_add(x_off).cast::<std::ffi::c_void>();
+                        let (rptr, ra, rb) = match c.residual {
+                            Some((ra, rb)) => {
+                                let (rs, rsh) = ins[1];
+                                if view[l.inputs[1]].is_some() || (rsh.h, rsh.w, rsh.c) != (oh, ow, c.co) || place.is_some() {
+                                    return Err(e("the residual is not a whole picture of the output's shape".into()));
+                                }
+                                (ptr(&store, rs) as *const std::ffi::c_void, ra, rb)
+                            }
+                            None => (std::ptr::null(), 1.0, 1.0),
+                        };
+                        // SAFETY: the input holds sh.h x sh.w pixels x_ld halves apart, the output oh x ow pixels out_ld apart,
+                        // the weights co x ci x k x k.
+                        check(unsafe {
+                            (sl.conv)(gp, xptr, sh.h as i64, sh.w as i64, c.ci as i64, x_ld as i64, c.w.ptr(), c.co as i64, c.k as i64, c.stride as i64,
+                                      pt as i64, pl as i64, pb as i64, pr as i64, bias, act, c.act.a, slopes, n, rptr, ra, rb, optr, out_ld as i64)
+                        }, "convolution (silo)")?;
+                        match (own, place) {
+                            (Some(b), _) => outs.push((b, Shape { h: oh, w: ow, c: c.co, vec: false })),
+                            (None, Some((wid, off, cap))) => {
+                                let o = l.outputs[0];
+                                if let Some(st) = store[wid].as_mut() {
+                                    st.1 += readers(o);
+                                }
+                                blob[o] = Some((wid, Shape { h: oh, w: ow, c: c.co, vec: false }));
+                                view[o] = Some((off, cap));
+                            }
+                            _ => unreachable!(),
+                        }
+                        return Ok(());
                     }
                     let mut src = ptr(&store, s) as *const _;
                     let (mut h, mut w) = (sh.h, sh.w);
@@ -381,6 +623,18 @@ impl Net {
                         // SAFETY: out holds oh x ow x co halves.
                         check(unsafe { (k.act)(gp, out.ptr(), (oh * ow) as i64, c.co as i64, c.act.kind, c.act.a, std::ptr::null(), 0) }, "activation")?;
                     }
+                    if let Some((slopes, n)) = &c.prelu {
+                        // SAFETY: as above, slopes n floats.
+                        check(unsafe { (k.act)(gp, out.ptr(), (oh * ow) as i64, c.co as i64, 3, 0.0, slopes.ptr() as *const f32, *n as i64) }, "prelu")?;
+                    }
+                    if let Some((ra, rb)) = c.residual {
+                        let (rs, rsh) = ins[1];
+                        if (rsh.h, rsh.w, rsh.c) != (oh, ow, c.co) {
+                            return Err(e("the residual is not of the output's shape".into()));
+                        }
+                        // SAFETY: out and the residual hold oh x ow x co halves (out read and written in place).
+                        check(unsafe { (k.add)(gp, out.ptr(), ptr(&store, rs), (oh * ow * c.co) as i64, 0, ra, rb, out.ptr()) }, "residual")?;
+                    }
                     for t in tmp {
                         pool.put(t);
                     }
@@ -410,8 +664,15 @@ impl Net {
                     let ho = if *oh > 0 { *oh } else { (sh.h as f32 * hs) as usize };
                     let wo = if *ow > 0 { *ow } else { (sh.w as f32 * ws) as usize };
                     let out = pool.get(ho * wo * sh.c * 2)?;
-                    // SAFETY: as above.
-                    check(unsafe { (k.resize)(gp, ptr(&store, s), sh.h as i64, sh.w as i64, sh.c as i64, ho as i64, wo as i64, *kind, out.ptr()) }, "interp")?;
+                    // nearest by a whole factor in the silo (16-byte pieces), else the engine's resize
+                    let r = ho / sh.h.max(1);
+                    let whole = *kind == 1 && r >= 1 && ho == sh.h * r && wo == sh.w * r;
+                    match ffi::silo(gpu)?.filter(|_| whole) {
+                        // SAFETY: x holds h x w x c halves, out (h r) x (w r) x c.
+                        Some(sl) => check(unsafe { (sl.upsample)(gp, ptr(&store, s), sh.h as i64, sh.w as i64, sh.c as i64, r as i64, out.ptr()) }, "upsample")?,
+                        // SAFETY: as above.
+                        None => check(unsafe { (k.resize)(gp, ptr(&store, s), sh.h as i64, sh.w as i64, sh.c as i64, ho as i64, wo as i64, *kind, out.ptr()) }, "interp")?,
+                    }
                     outs.push((out, Shape { h: ho, w: wo, c: sh.c, vec: false }));
                 }
                 Op::Eltwise { op, coeffs } => {
@@ -435,6 +696,20 @@ impl Net {
                     let c: usize = ins.iter().map(|x| x.1.c).sum();
                     if ins.iter().any(|(_, s)| s.h != sh.h || s.w != sh.w || s.vec) {
                         return Err(e("concatenated pictures of different sizes".into()));
+                    }
+                    if let Some((ch, _)) = self.in_chain[li] {
+                        // the chain's buffer holds them side by side already: its first c channels
+                        let (wid, cap) = chain_buf[ch].ok_or_else(|| e("the dense block's buffer was never made".into()))?;
+                        let o = l.outputs[0];
+                        if let Some(st) = store[wid].as_mut() {
+                            st.1 += readers(o);
+                        }
+                        blob[o] = Some((wid, Shape { h: sh.h, w: sh.w, c, vec: false }));
+                        view[o] = Some((0, cap));
+                        return Ok(());
+                    }
+                    if l.inputs.iter().any(|i| view[*i].is_some()) {
+                        return Err(e("a channel slice concatenated outside its block".into()));
                     }
                     let out = pool.get(sh.h * sh.w * c * 2)?;
                     let mut off = 0;
@@ -488,6 +763,8 @@ impl Net {
                     outs.push((out, sh));
                 }
             }
+            Ok(())
+            })?;
             // what it read, counted down (a buffer whose readers are all done goes back)
             for (s, _) in &ins {
                 let done = match store[*s].as_mut() {

@@ -752,6 +752,10 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 | `NS_MM3_CHECK_STEPS` | 3 | chunks check: flow steps a window | audio minimaxmusic3 (check) |
 | `NS_TEST_H3_TOKENIZER` | test skipped | the H3 tokenizer's directory (vocab.json, merges.txt, tokenizer_config.json) for its reference-match test | video h3 (cargo test) |
 | `NS_TEST_STARVECTOR_TOKENIZER` | test skipped | StarVector's tokenizer.json, for its prompt / stop tokens and decoding test | image starvector (cargo test) |
+| `NS_UP_PROFILE` | unset | N: the upscalers time each layer alone (a wait before and after) and print a table against the card's peaks every N pictures (a clip's frames) | image upscale |
+| `NS_UP_SYNC` | unset | 1: the upscalers wait for the card after every tile, as before (by default the tiles' work queues back to back) | image upscale |
+| `NS_UP_TILE` | 200 | Real-ESRGAN's tile when a request names none; 0: the whole picture as one tile (faster for animevideov3, but further from realesrgan-ncnn-vulkan's output, whose tiles are 200) | image upscale |
+| `NS_UP_CHAIN` | 1 | 0: Real-ESRGAN's dense blocks concatenate by copying (by default the convolutions write into one buffer of the block's channels, with the silo) | image upscale |
 | `NS_UP_DUMP` | unset | Debug: a directory: the upscalers write each layer's output there as raw halves (its blob, layer and shape in the name), and the tile's input - for comparing with a reference layer by layer | image upscale |
 | `NS_TEST_WHISPER_CONFIG` | test skipped | whisper-large-v3-turbo's config.json for its sizes' test | audio whisper (cargo test) |
 | `NS_TEST_WHISPER_GENERATION` | test skipped | whisper-large-v3-turbo's generation_config.json (with NS_TEST_WHISPER_TOKENIZER) for the vocabulary, rules and alignment tests | audio whisper (cargo test) |

@@ -16,6 +16,7 @@
 pub mod ffi;
 pub mod ncnn;
 pub mod net;
+pub mod prof;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -138,7 +139,13 @@ impl Upscaler {
                 return Err(Error(format!("{variant} makes {:?}x, not {scale}x", v.scales)));
             }
             let stem = if variant == "realesr-animevideov3" { format!("{variant}-x{scale}") } else { variant.clone() };
-            return Ok(Plan { stem, scale, prepad: 10, border: 0, passes: 1, variant, noise: None, tile: req.tile.unwrap_or(200).max(32) as usize });
+            // the tile: the request's, else NS_UP_TILE (0: the whole picture, one tile), else the program's 200
+            let tile = match req.tile.or_else(|| std::env::var("NS_UP_TILE").ok().and_then(|v| v.trim().parse::<u32>().ok())) {
+                Some(0) => usize::MAX,
+                Some(t) => t.max(32) as usize,
+                None => 200,
+            };
+            return Ok(Plan { stem, scale, prepad: 10, border: 0, passes: 1, variant, noise: None, tile });
         }
         let variant = req.variant.clone().filter(|v| !v.is_empty()).unwrap_or_else(|| "models-cunet".into());
         let v = WAIFU2X.iter().find(|x| x.id == variant).ok_or_else(|| Error(format!("{variant}: waifu2x has {}", names(WAIFU2X))))?;
@@ -176,7 +183,7 @@ impl Upscaler {
         let s = p.scale;
         let (ow, oh) = (w * s, h * s);
         let dst = DevBuf::new(&self.gpu, ow * oh * ch)?;
-        let t = p.tile;
+        let t = p.tile.min(w.max(h));
         let (xt, yt) = (w.div_ceil(t), h.div_ceil(t));
         let mut st = self.state.lock().unwrap_or_else(|q| q.into_inner());
         for yi in 0..yt {
@@ -231,7 +238,11 @@ impl Upscaler {
                 }
                 *done += 1;
                 drop(st);
-                self.gpu.sync()?;
+                // no wait for the card here (the queue is in order: the pool's buffers are reused safely): the
+                // tiles' work queues back to back; the progress counts tiles queued
+                if std::env::var_os("NS_UP_SYNC").is_some() {
+                    self.gpu.sync()?;
+                }
                 progress(Step { picture: 0, at: *done, of, seconds: t0.elapsed().as_secs_f64() })?;
                 st = self.state.lock().unwrap_or_else(|q| q.into_inner());
             }
@@ -287,7 +298,8 @@ impl ImageEngine for Upscaler {
         {
             let (mut a, mut b) = (w, h);
             for _ in 0..p.passes {
-                of += (a.div_ceil(p.tile) * b.div_ceil(p.tile)) as u32;
+                let t = p.tile.min(a.max(b));
+                of += (a.div_ceil(t) * b.div_ceil(t)) as u32;
                 a *= p.scale;
                 b *= p.scale;
             }
@@ -308,8 +320,9 @@ impl ImageEngine for Upscaler {
                 st.pool.clear();
             }
         }
+        prof::picture_done(&self.gpu);
         let total = p.scale.pow(p.passes as u32) as u32;
         Ok((Picture { width: w as u32, height: h as u32, channels: ch as u8, data },
-            UpscaleInfo { variant: p.variant, scale: total, noise: p.noise, tile: p.tile as u32, tiles: done, seconds: t0.elapsed().as_secs_f64() }))
+            UpscaleInfo { variant: p.variant, scale: total, noise: p.noise, tile: if p.tile == usize::MAX { 0 } else { p.tile as u32 }, tiles: done, seconds: t0.elapsed().as_secs_f64() }))
     }
 }
