@@ -61,19 +61,21 @@ int ns_image_seedvr2_norm_mod(ns_gpu* g, const float* x, int64_t M, int64_t C, c
                               const float* shift, void* out);
 /* x float32 [M, C] += y bfloat16 [M, C] * gate float32 [C] */
 int ns_image_seedvr2_gate_add(ns_gpu* g, float* x, const void* y, int64_t M, int64_t C, const float* gate);
-/* The q and k heads of the packed qkv rows (bfloat16, row stride `stride`; q at column 0, k at column H D): each head's
+/* (half: the qkv rows and the attention's output are IEEE half - the shared attention's fast path - and gather's
+ * half_to_bf16 turns them back as it gathers; text_mean reads half.)
+ * The q and k heads of the packed qkv rows (bfloat16, row stride `stride`; q at column 0, k at column H D): each head's
  * RMS norm (weights wq / wk float32 [D]), rounded to bfloat16 as the reference's norm leaves it, then the rotary
  * rotation of its first 2 P features in interleaved pairs (2 j, 2 j + 1) - rotary_embedding_torch's rotate_half - by
  * cs float32 [M, P, 2] (cos, sin), cs NULL: no rotation. In place. */
 int ns_image_seedvr2_qk_norm_rope(ns_gpu* g, void* qkv, int64_t M, int64_t H, int64_t D, int64_t stride, const float* wq, const float* wk,
-                                  float eps, const float* cs, int64_t P);
+                                  float eps, const float* cs, int64_t P, int half);
 /* out[r] = row idx[r] of a (idx < na) or of b (idx - na): rows of `cols` bfloat16, sources' rows `lda` / `ldb` apart,
  * out's `cols` apart */
 int ns_image_seedvr2_gather(ns_gpu* g, const void* a, int64_t na, int64_t lda, const void* b, int64_t ldb, const int32_t* idx, int64_t rows,
-                            int64_t cols, void* out);
+                            int64_t cols, void* out, int half_to_bf16);
 /* The text rows of the windows coalesced: out[l] = the mean over the n windows of att[base[w] + l] (bfloat16 rows of
  * C), l < L - the reference's unconcat_coalesce */
-int ns_image_seedvr2_text_mean(ns_gpu* g, const void* att, const int32_t* base, int64_t n, int64_t L, int64_t C, void* out);
+int ns_image_seedvr2_text_mean(ns_gpu* g, const void* att, const int32_t* base, int64_t n, int64_t L, int64_t C, void* out, int half);
 
 #ifdef __cplusplus
 }

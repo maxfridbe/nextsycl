@@ -40,7 +40,7 @@ fn ge(e: nextsycl_gguf::Error) -> Error {
 
 /// A channels-last volume [t, h, w, c] of bfloat16 on the card
 pub struct Vol {
-    pub buf: DevBuf,
+    pub buf: std::mem::ManuallyDrop<DevBuf>,
     pub t: usize,
     pub h: usize,
     pub w: usize,
@@ -48,16 +48,29 @@ pub struct Vol {
 }
 
 // A free does not wait for the queue (sycl::free): a large buffer let go while a queued kernel still reads it can be
-// unmapped under it (a whole chunk came out black). A volume waits for the queue before its memory goes.
+// unmapped under it. A volume let go is kept until its card's next wait (`settle`: the resnets and slices end with
+// one), then freed - a wait on every one drained the queue thousands of times a chunk (the B70 a quarter idle).
+static LATER: [Mutex<Vec<DevBuf>>; 8] = [const { Mutex::new(Vec::new()) }; 8];
+
 impl Drop for Vol {
     fn drop(&mut self) {
-        let _ = self.buf.gpu().sync();
+        // SAFETY: the buffer is taken once, here, and the volume is not used after.
+        let b = unsafe { std::mem::ManuallyDrop::take(&mut self.buf) };
+        LATER[b.gpu().index % 8].lock().unwrap().push(b);
     }
+}
+
+/// The card's queue drained, then the volumes let go since the last time freed
+pub fn settle(nsd: &Nsd) -> Result<()> {
+    nsd.wait()?;
+    let gone = std::mem::take(&mut *LATER[nsd.gpu.index % 8].lock().unwrap());
+    drop(gone);
+    Ok(())
 }
 
 impl Vol {
     pub fn new(gpu: &Arc<Gpu>, t: usize, h: usize, w: usize, c: usize) -> Result<Vol> {
-        Ok(Vol { buf: DevBuf::new(gpu, (t * h * w * c * 2).max(2))?, t, h, w, c })
+        Ok(Vol { buf: std::mem::ManuallyDrop::new(DevBuf::new(gpu, (t * h * w * c * 2).max(2))?), t, h, w, c })
     }
     fn frame_bytes(&self) -> usize {
         self.h * self.w * self.c * 2
@@ -375,7 +388,7 @@ impl Vae {
             // SAFETY: out and short hold the same number of bfloat16 values.
             ffi::check(unsafe { (k.add)(self.gpu.raw(), out.buf.ptr(), short.buf.ptr(), (out.px() * out.c) as i64) }, "residual add")
         })?;
-        nsd.wait()?;
+        settle(nsd)?;
         Ok(out)
     }
 
@@ -421,7 +434,7 @@ impl Vae {
         }
         Ok(())
         })?;
-        nsd.wait()?;
+        settle(nsd)?;
         Ok(x)
     }
 
@@ -494,7 +507,7 @@ impl Vae {
         let x = self.mid(nsd, &self.enc_mid, x)?;
         let x = self.norm(&x, &self.enc_norm, true)?;
         let out = self.conv(nsd, &self.enc_out, Arc::new(x))?;
-        nsd.wait()?;
+        settle(nsd)?;
         Ok(out)
     }
 
@@ -539,7 +552,7 @@ impl Vae {
             let x = self.norm(&x, &self.dec_norm, true)?;
             self.conv(nsd, &self.dec_out, Arc::new(x))
         })?;
-        nsd.wait()?;
+        settle(nsd)?;
         Ok(out)
     }
 

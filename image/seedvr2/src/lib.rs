@@ -296,16 +296,37 @@ impl Card {
             }, "resize")
         })?;
         // the resize reads it: done before it goes (a free does not wait for the queue)
-        gpu.sync()?;
+        nsd.wait()?;
         drop(up);
         let t0 = Instant::now();
         let cond = self.vae.encode(nsd, &input)?;
         let t_enc = t0.elapsed().as_secs_f64();
+        vae::settle(nsd)?;
         let (t, h, w) = (1 + (frames - 1) / 4, oh / 8, ow / 8);
         let n = noise(seed, cond.len());
         let s = self.shape(dit, t, h, w)?;
         let t1 = Instant::now();
-        let v = dit.forward(nsd, &s, &n, &cond, &mut |_, _, _| Ok(()))?;
+        let mut v = dit.forward(nsd, &s, &n, &cond, &mut |_, _, _| Ok(()))?;
+        // a call that came back non-finite (now and then, cause open: see docs/ports/seedvr2.md) is made again, each
+        // block's output checked on the way to say where it starts; the second one is used when it is whole
+        if v.iter().any(|x| !x.is_finite()) {
+            let mut first = None;
+            let again = dit.forward(nsd, &s, &n, &cond, &mut |i, xv, xt| {
+                if first.is_none() && (xv.to_f32()?.iter().any(|x| !x.is_finite()) || xt.to_f32()?.iter().any(|x| !x.is_finite())) {
+                    first = Some(i);
+                }
+                Ok(())
+            })?;
+            let ok = again.iter().all(|x| x.is_finite());
+            let (bad, at) = dit.verify()?;
+            eprintln!("seedvr2 chunk: the DiT's output was non-finite; made again: {} (non-finite from block {}); its weights on the card: {bad} bytes \
+                       differ from the host's{}", if ok { "whole" } else { "non-finite again" }, first.map_or("none".to_string(), |b| b.to_string()),
+                      at.map(|(f, t)| format!(", the first at {f} ({t})")).unwrap_or_default());
+            if !ok {
+                return Err(Error("the DiT's output is non-finite twice".into()));
+            }
+            v = again;
+        }
         // the VAE's slices at full resolution want the room: the DiT's weights go back up for the next chunk's call
         dit.evict();
         let t_dit = t1.elapsed().as_secs_f64();
@@ -340,6 +361,7 @@ impl Card {
             out.extend(host.chunks_exact(fb).map(|f| f.to_vec()));
             Ok(())
         })?;
+        vae::settle(nsd)?;
         let t_all = t0.elapsed().as_secs_f64();
         eprintln!("seedvr2 chunk: {frames} frames at {ow}x{oh} on {} (gpu {}): encode {t_enc:.1} s, dit {t_dit:.1} s (its weights up included), decode {:.1} s; \
                    wall {w0:.1} (encode from {:.1}, dit from {:.1}, decode from {:.1}) to {:.1}", gpu.name, gpu.index, t_all - t_enc - t_dit,

@@ -63,7 +63,7 @@ int ns_image_seedvr2_group_norm(ns_gpu* g, const void* x, int64_t F, int64_t N, 
     if (C % 8 == 0) {
         // 16-byte loads of 8 channels: the voxels split over P parts per frame, each part's 8 channels summed in
         // registers; then the groups' statistics; then the normalisation, 8 channels a work-item
-        constexpr int64_t P = 1024;
+        constexpr int64_t P = 4096;                // parts a frame: short loops, many work-items (the pass is latency-bound)
         const int64_t C8 = C / 8;
         float* part = grow(g, sz(F * P * C * 2 + F * G * 2));
         if (!part) return ns_fail("ns_image_seedvr2_group_norm: no room for the partial sums");
@@ -390,19 +390,18 @@ int ns_image_seedvr2_gate_add(ns_gpu* g, float* x, const void* y, int64_t M, int
     NS_CATCH
 }
 
-int ns_image_seedvr2_qk_norm_rope(ns_gpu* g, void* qkv, int64_t M, int64_t H, int64_t D, int64_t stride, const float* wq, const float* wk,
-                                  float eps, const float* cs, int64_t P) {
-    NS_TRY
-    if (M <= 0 || H <= 0) return 0;
-    if (D != 128) return ns_fail("ns_image_seedvr2_qk_norm_rope: heads of 128 features only");
-    if (2 * P > D) return ns_fail("ns_image_seedvr2_qk_norm_rope: more rotary pairs than a head has");
-    bf* x = (bf*) qkv;
+}  // extern "C"
+
+namespace {
+template <typename T>
+void qk_norm_rope(ns_gpu* g, void* qkv, int64_t M, int64_t H, int64_t stride, const float* wq, const float* wk, float eps, const float* cs, int64_t P) {
+    T* x = (T*) qkv;
     // a work-group of D a (row, head, q or k); the pair partners are neighbouring lanes of one sub-group
     g->q.parallel_for(sycl::nd_range<1>(sz(M * H * 2) * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
         const int64_t grp = (int64_t) it.get_group(0);
         const int64_t r = grp / (H * 2), h = (grp / 2) % H, which = grp % 2;
         const int64_t d = (int64_t) it.get_local_id(0);
-        bf* head = x + (size_t) r * stride + (size_t) (which * H + h) * 128;
+        T* head = x + (size_t) r * stride + (size_t) (which * H + h) * 128;
         const float v = (float) head[d];
         const float s2 = sycl::reduce_over_group(it.get_group(), v * v, sycl::plus<float>());
         const float w = which ? wk[d] : wq[d];
@@ -414,16 +413,40 @@ int ns_image_seedvr2_qk_norm_rope(ns_gpu* g, void* qkv, int64_t M, int64_t H, in
             const float c = cs[((size_t) r * P + j) * 2], s = cs[((size_t) r * P + j) * 2 + 1];
             o = d % 2 == 0 ? n * c - partner * s : n * c + partner * s;
         }
-        head[d] = (bf) o;
+        head[d] = (T) o;
     });
+}
+}  // namespace
+
+extern "C" {
+
+int ns_image_seedvr2_qk_norm_rope(ns_gpu* g, void* qkv, int64_t M, int64_t H, int64_t D, int64_t stride, const float* wq, const float* wk,
+                                  float eps, const float* cs, int64_t P, int half) {
+    NS_TRY
+    if (M <= 0 || H <= 0) return 0;
+    if (D != 128) return ns_fail("ns_image_seedvr2_qk_norm_rope: heads of 128 features only");
+    if (2 * P > D) return ns_fail("ns_image_seedvr2_qk_norm_rope: more rotary pairs than a head has");
+    if (half) qk_norm_rope<sycl::half>(g, qkv, M, H, stride, wq, wk, eps, cs, P);
+    else qk_norm_rope<bf>(g, qkv, M, H, stride, wq, wk, eps, cs, P);
     return 0;
     NS_CATCH
 }
 
 int ns_image_seedvr2_gather(ns_gpu* g, const void* a, int64_t na, int64_t lda, const void* b, int64_t ldb, const int32_t* idx, int64_t rows,
-                            int64_t cols, void* out) {
+                            int64_t cols, void* out, int half_to_bf16) {
     NS_TRY
     if (rows <= 0 || cols <= 0) return 0;
+    if (half_to_bf16) {
+        const sycl::half* as = (const sycl::half*) a;
+        const sycl::half* bs = (const sycl::half*) b;
+        bf* o = (bf*) out;
+        g->q.parallel_for(sycl::range<2>(sz(rows), sz(cols)), [=](sycl::id<2> id) {
+            const int64_t r = id[0], c = id[1];
+            const int64_t s = idx[r];
+            o[(size_t) r * cols + c] = (bf) (float) (s < na ? as[(size_t) s * lda + c] : bs[(size_t) (s - na) * ldb + c]);
+        });
+        return 0;
+    }
     const bf* as = (const bf*) a;
     const bf* bs = (const bf*) b;
     bf* o = (bf*) out;
@@ -436,15 +459,19 @@ int ns_image_seedvr2_gather(ns_gpu* g, const void* a, int64_t na, int64_t lda, c
     NS_CATCH
 }
 
-int ns_image_seedvr2_text_mean(ns_gpu* g, const void* att, const int32_t* base, int64_t n, int64_t L, int64_t C, void* out) {
+int ns_image_seedvr2_text_mean(ns_gpu* g, const void* att, const int32_t* base, int64_t n, int64_t L, int64_t C, void* out, int half) {
     NS_TRY
     if (n <= 0 || L <= 0 || C <= 0) return 0;
     const bf* as = (const bf*) att;
+    const sycl::half* hs = (const sycl::half*) att;
     bf* o = (bf*) out;
     g->q.parallel_for(sycl::range<2>(sz(L), sz(C)), [=](sycl::id<2> id) {
         const int64_t l = id[0], c = id[1];
         float s = 0.0f;
-        for (int64_t w = 0; w < n; ++w) s += (float) as[((size_t) base[w] + l) * C + c];
+        for (int64_t w = 0; w < n; ++w) {
+            const size_t i = ((size_t) base[w] + l) * C + c;
+            s += half ? (float) hs[i] : (float) as[i];
+        }
         o[(size_t) l * C + c] = (bf) (s / (float) n);
     });
     return 0;

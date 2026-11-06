@@ -23,9 +23,9 @@ pub struct Api {
     pub to_f32: unsafe extern "C" fn(G, P, *mut f32, i64) -> c_int,
     pub norm_mod: unsafe extern "C" fn(G, *const f32, i64, i64, *const f32, f32, *const f32, *const f32, M) -> c_int,
     pub gate_add: unsafe extern "C" fn(G, *mut f32, P, i64, i64, *const f32) -> c_int,
-    pub qk_norm_rope: unsafe extern "C" fn(G, M, i64, i64, i64, i64, *const f32, *const f32, f32, *const f32, i64) -> c_int,
-    pub gather: unsafe extern "C" fn(G, P, i64, i64, P, i64, *const i32, i64, i64, M) -> c_int,
-    pub text_mean: unsafe extern "C" fn(G, P, *const i32, i64, i64, i64, M) -> c_int,
+    pub qk_norm_rope: unsafe extern "C" fn(G, M, i64, i64, i64, i64, *const f32, *const f32, f32, *const f32, i64, c_int) -> c_int,
+    pub gather: unsafe extern "C" fn(G, P, i64, i64, P, i64, *const i32, i64, i64, M, c_int) -> c_int,
+    pub text_mean: unsafe extern "C" fn(G, P, *const i32, i64, i64, i64, M, c_int) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -87,6 +87,7 @@ pub const SILO: &str = "seedvr2";
 pub struct Silo {
     pub supported: unsafe extern "C" fn(G) -> c_int,
     pub conv_taps: unsafe extern "C" fn(G, *const P, i64, i64, i64, i64, P, i64, i64, i64, i64, i64, i64, *const f32, M) -> c_int,
+    pub attention: unsafe extern "C" fn(G, P, P, P, i64, i64, i64, i64, i64, M) -> c_int,
 }
 
 // SAFETY: function pointers into a library that stays loaded for the process.
@@ -111,7 +112,8 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
                 }
             }};
         }
-        Ok(Some(Silo { supported: sym!("ns_image_seedvr2_silo_supported"), conv_taps: sym!("ns_image_seedvr2_silo_conv_taps") }))
+        Ok(Some(Silo { supported: sym!("ns_image_seedvr2_silo_supported"), conv_taps: sym!("ns_image_seedvr2_silo_conv_taps"),
+                        attention: sym!("ns_image_seedvr2_silo_attention") }))
     })
     .as_ref()
     .map(|s| s.as_ref())

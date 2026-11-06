@@ -23,6 +23,11 @@ int ns_image_seedvr2_silo_supported(ns_gpu* g);
 int ns_image_seedvr2_silo_conv_taps(ns_gpu* g, const void* const* frames, int64_t nframes, int64_t H, int64_t W, int64_t Ci, const void* w,
                                     int64_t Co, int64_t kt, int64_t kh, int64_t kw, int64_t ph, int64_t pw, const float* bias, void* out);
 
+/* Attention of B windows of S rows each, bfloat16 throughout (scores float32): q, k, v rows `stride` apart (the
+ * packed qkv: k at q + H D, v at q + 2 H D), window b's rows from row b S; out [B S, H D] bfloat16. */
+int ns_image_seedvr2_silo_attention(ns_gpu* g, const void* q, const void* k, const void* v, int64_t B, int64_t S, int64_t H, int64_t D,
+                                    int64_t stride, void* out);
+
 #ifdef __cplusplus
 }
 #endif

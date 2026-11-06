@@ -169,6 +169,8 @@ pub struct Dit {
     /// call (~25 GB/s) and is let go after
     host: HostBuf,
     dev: Mutex<Option<DevBuf>>,
+    /// each matrix's first byte in the slab and its tensors (to name a byte that went wrong)
+    places: Vec<(usize, String)>,
     /// a modulation that leaves the norm as it is (scale 1, shift 0)
     ones: DevBuf,
     zeros: DevBuf,
@@ -322,7 +324,9 @@ impl Dit {
         };
         let (vid_in_w, vid_out_w) = (mat(&["vid_in.proj.weight".into()])?, mat(&["vid_out.proj.weight".into()])?);
         let mut host = HostBuf::new(&gpu, size.get())?;
-        for (names, at) in plan.take() {
+        let planned = plan.take();
+        let places: Vec<(usize, String)> = planned.iter().map(|(n, at)| (*at, n.join(" + "))).collect();
+        for (names, at) in planned {
             let mut at = at;
             for n in names {
                 let b = bytes(&n)?;
@@ -349,6 +353,7 @@ impl Dit {
             vid_out_w,
             host,
             dev: Mutex::new(None),
+            places,
             vid_out_b: vec("vid_out.proj.bias")?,
             ones: DevBuf::from_f32(&gpu, &vec![1.0; dim])?,
             zeros: DevBuf::from_f32(&gpu, &vec![0.0; dim])?,
@@ -388,6 +393,32 @@ impl Dit {
             *g = Some(d);
         }
         Ok(g)
+    }
+
+    /// The card's copy against the host's: the bytes that differ and the first of them with its tensor (a check after
+    /// a call went non-finite)
+    pub fn verify(&self) -> Result<(usize, Option<(usize, String)>)> {
+        let g = self.dev.lock().unwrap();
+        let Some(d) = g.as_ref() else { return Ok((0, None)) };
+        const PIECE: usize = 512 << 20;
+        let host = self.host.as_slice();
+        let mut back = vec![0u8; PIECE];
+        let (mut bad, mut first) = (0usize, None);
+        for at in (0..host.len()).step_by(PIECE) {
+            let n = PIECE.min(host.len() - at);
+            d.read(at, &mut back[..n])?;
+            for (i, (a, b)) in back[..n].iter().zip(&host[at..at + n]).enumerate() {
+                if a != b {
+                    bad += 1;
+                    first.get_or_insert(at + i);
+                }
+            }
+        }
+        let named = first.map(|f| {
+            let t = self.places.iter().rev().find(|(at, _)| *at <= f).map(|(at, n)| format!("{n} +{}", f - at)).unwrap_or_default();
+            (f, t)
+        });
+        Ok((bad, named))
     }
 
     /// The card's copy let go (the next call uploads it again)
@@ -514,6 +545,10 @@ impl Dit {
             (2.0 * m * kk * nn, 2.0 * (m * kk + kk * nn + m * nn))
         };
         let rowwise = |m: usize, c: usize| 8.0 * (m * c) as f64; // a float32 row read, a bfloat16 row written, and back
+        // the attention in bfloat16 on the silo (as the reference); else the shared one in half (q, k, v made half for it)
+        let silo = ffi::silo()?;
+        let half = silo.is_none() as i32;
+        let qkv_dt = if silo.is_some() { Dt::BF16 } else { Dt::F16 };
         for (bi, b) in self.blocks.iter().enumerate() {
             let y = &s.layouts[b.shifted as usize];
             prof::timed(gpu, "dit norm + modulation", 0.0, rowwise(n + l, d), || {
@@ -526,16 +561,17 @@ impl Dit {
             })?;
             let (f, by) = mm(n + l, d, i3);
             prof::timed(gpu, "dit linear qkv", f, by, || {
-                nsd.linear(hb.ptr(), Dt::BF16, n, d, w(b.vid.qkv), i3, none(), qkv.ptr(), Dt::BF16)?;
-                nsd.linear(htb.ptr(), Dt::BF16, l, d, w(b.txt.qkv), i3, none(), qkvt.ptr(), Dt::BF16)
+                // q, k, v in half: the shared attention reads half in place (bfloat16 it copies to half first)
+                nsd.linear(hb.ptr(), Dt::BF16, n, d, w(b.vid.qkv), i3, none(), qkv.ptr(), qkv_dt)?;
+                nsd.linear(htb.ptr(), Dt::BF16, l, d, w(b.txt.qkv), i3, none(), qkvt.ptr(), qkv_dt)
             })?;
             prof::timed(gpu, "dit qk norm, rope, window gathers", 0.0, 2.0 * 2.0 * ((n + l) * 2 * d + y.rows * i3 + (y.rows + n) * d) as f64, || unsafe {
                 ffi::check((k.qk_norm_rope)(gpu.raw(), qkv.ptr(), n as i64, self.heads as i64, HEAD as i64, i3 as i64, b.vid.norm_q.fp(), b.vid.norm_k.fp(), EPS,
-                                            y.cs.fp(), p), "qk norm")?;
+                                            y.cs.fp(), p, half), "qk norm")?;
                 ffi::check((k.qk_norm_rope)(gpu.raw(), qkvt.ptr(), l as i64, self.heads as i64, HEAD as i64, i3 as i64, b.txt.norm_q.fp(), b.txt.norm_k.fp(),
-                                            EPS, self.txt_cs.as_ref().map(|c| c.fp() as *const f32).unwrap_or(std::ptr::null()), p), "qk norm")?;
+                                            EPS, self.txt_cs.as_ref().map(|c| c.fp() as *const f32).unwrap_or(std::ptr::null()), p, half), "qk norm")?;
                 ffi::check((k.gather)(gpu.raw(), qkv.ptr(), n as i64, i3 as i64, qkvt.ptr(), i3 as i64, y.fwd.ptr().cast(), y.rows as i64, i3 as i64,
-                                      packed.ptr()), "windows")
+                                      packed.ptr(), 0), "windows")
             })?;
             // 4 S^2 D a head and window (q k^T and the weighted sum)
             let af: f64 = y.runs.iter().map(|&(_, len, count)| 4.0 * (len * len * d) as f64 * count as f64).sum();
@@ -543,14 +579,21 @@ impl Dit {
                 for &(r0, len, count) in &y.runs {
                     let q = packed.ptr().cast::<u16>().wrapping_add(r0 * i3);
                     let o = att.ptr().cast::<u16>().wrapping_add(r0 * d).cast::<c_void>();
-                    nsd.attention_batch(q.cast::<c_void>(), q.wrapping_add(d).cast::<c_void>(), q.wrapping_add(2 * d).cast::<c_void>(), Dt::BF16, count, len,
-                                        self.heads, HEAD, i3, o, Dt::BF16)?;
+                    match silo {
+                        // SAFETY: count windows of len packed rows (stride i3) from r0, out the same rows of d.
+                        Some(sl) => ffi::check(unsafe {
+                            (sl.attention)(gpu.raw(), q.cast(), q.wrapping_add(d).cast(), q.wrapping_add(2 * d).cast(), count as i64, len as i64,
+                                           self.heads as i64, HEAD as i64, i3 as i64, o)
+                        }, "silo attention")?,
+                        None => nsd.attention_batch(q.cast::<c_void>(), q.wrapping_add(d).cast::<c_void>(), q.wrapping_add(2 * d).cast::<c_void>(),
+                                                    Dt::F16, count, len, self.heads, HEAD, i3, o, Dt::F16)?,
+                    }
                 }
                 Ok(())
             })?;
             prof::timed(gpu, "dit qk norm, rope, window gathers", 0.0, 2.0 * 2.0 * (n * d + y.windows * l * d) as f64, || unsafe {
-                ffi::check((k.gather)(gpu.raw(), att.ptr(), y.rows as i64, d as i64, att.ptr(), d as i64, y.rev.ptr().cast(), n as i64, d as i64, av.ptr()), "windows back")?;
-                ffi::check((k.text_mean)(gpu.raw(), att.ptr(), y.base.ptr().cast(), y.windows as i64, l as i64, d as i64, at.ptr()), "text mean")
+                ffi::check((k.gather)(gpu.raw(), att.ptr(), y.rows as i64, d as i64, att.ptr(), d as i64, y.rev.ptr().cast(), n as i64, d as i64, av.ptr(), half), "windows back")?;
+                ffi::check((k.text_mean)(gpu.raw(), att.ptr(), y.base.ptr().cast(), y.windows as i64, l as i64, d as i64, at.ptr(), half), "text mean")
             })?;
             // the last block's text is never read again
             let tl = if bi == last { 0 } else { l };

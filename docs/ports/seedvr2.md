@@ -98,4 +98,19 @@ the whole request (`video.upscale` through the image server, ffmpeg included), B
 
 | # | change | 3B s/frame | 7B s/frame | notes |
 |---|---|---|---|---|
-| 0 | the first working port (one card, everything serial) | 1.54 (243 frames: 373.6 s) | 1.51 (33-frame chunk) | VAE 87 % of a chunk |
+| 0 | the first working port (one card; chunks in a worker thread, the host's frames beside it) | 1.51 (367.5 s); two cards 0.93 (225.5 s) | 1.51 (one 33-frame chunk, 50 s) | VAE 87 % of a chunk; B70 compute engine busy 77 % (fdinfo) |
+| 1 | silo: the causal convolutions as 2-D taps over the frames where they are (the copies of the kept frames gone: 9 % of a chunk); group norm, shuffle and residual add vectorised (16-byte loads), group norm's statistics reduced in parallel; the DiT's window tables kept across chunks | 1.03 (250.3 s); two cards 0.60 (146.5 s) | | convolutions 51-57 % -> 61-67 % of the XMX peak; group norm 143 -> 269 GB/s |
+| 2 | a let-go volume freed at the card's next wait instead of a wait at every free (the queue was drained thousands of times a chunk); the DiT's attention fed half (the shared attention's in-place path) | 0.98 (239.0 s); two cards 0.57 (139.0 s) | | B70 compute busy 73 -> 80 %; DiT attention 1.54 -> 1.09 s a chunk. The half q, k, v overflowed on the 7B (see below): replaced in step 3 |
+
+### Non-finite chunks (found and fixed)
+
+Now and then a whole chunk came out black: the DiT's output all NaN (counted: 0 in the condition latent, every value
+of the DiT's output), in different chunks from run to run, the 7B more than the 3B. Ruled out by measurement: the frees
+(made safe; still NaN), the weights' upload (read back after it: 0 bytes differ; made in pieces), a race within a call
+(a second call of the same chunk went NaN again, from the same block). The shared attention runs in half: its scores
+are float32, but v, the probabilities and the output are half, and its bfloat16 input is copied to half first - a
+value past 65,504 is inf, and through the text tokens every window shares, NaN everywhere after that block. Feeding it
+half straight from the qkv projection made it worse (the 7B NaN from block 3). The reference runs this attention in
+bfloat16 (flash attention); the silo's `ns_image_seedvr2_silo_attention` is oneDNN's fused attention graph in bfloat16
+(float32 scores), read in place from the packed rows. A chunk that still comes back non-finite is made again once, the
+first block that goes wrong logged and the weights on the card compared with the host's.
