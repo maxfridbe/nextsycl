@@ -231,6 +231,7 @@ Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`).
 | `NS_MOSS_PROFILE` | off | Debug: set: a GPU wait after each part of a text-encoder layer, the seconds in full attention, DeltaNet and the FFN printed on stderr (slower) | image mossimage |
 | `NS_SVR_*` | - | every NS_SVR_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_SVR_CHUNK` | 33 | SeedVR2's frames that go through the model together (1 + 4 n): more is steadier over time and takes more of the card (the DiT's tokens grow with it; the VAE's slices do not) (--opt-chunk) | image seedvr2 |
+| `NS_SVR_MIN_FREE_GIB` | off | SeedVR2 refuses to load on a card with less free memory than this (another process holding the card: a run beside it would push it past its memory) | image seedvr2 |
 | `NS_SVR_OVERLAP` | 4 | SeedVR2's frames neighbouring chunks share, made twice and crossfaded (a raised cosine across them) (--opt-overlap) | image seedvr2 |
 | `NS_SVR_GPUS` | the server's card | SeedVR2's cards, by index ("0,1"): each holds the VAE and its own pinned copy of the DiT, and a clip's chunks go to whichever card is free (crossfaded and handed out in order) | image seedvr2 |
 | `NS_SVR_MEMLOG` | off | Debug: set: the card's memory in use printed at each of SeedVR2's large allocations (the VAE's convolutions and attention, the DiT's buffers) | image seedvr2 |

@@ -219,6 +219,18 @@ impl SeedVr2 {
                 .and_then(Gpu::open)).collect::<Result<_>>()?,
             None => gpus.to_vec(),
         };
+        // NS_SVR_MIN_FREE_GIB: no load on a card with less free than that (another process holding it: a run beside it
+        // would push the card past its memory)
+        if let Some(min) = o.setting("NS_SVR_MIN_FREE_GIB").and_then(|v| v.trim().parse::<f64>().ok()).filter(|m| *m > 0.0) {
+            for gpu in &mine {
+                if let Ok((_, Some(free))) = gpu.memory() {
+                    let gib = free as f64 / (1u64 << 30) as f64;
+                    if gib < min {
+                        return Err(Error(format!("{}: {gib:.1} GiB free, less than NS_SVR_MIN_FREE_GIB={min}", gpu.name)));
+                    }
+                }
+            }
+        }
         let mut cards = Vec::new();
         for gpu in &mine {
             cards.push(Card { gpu: gpu.clone(), nsd: Nsd::new(gpu)?, vae: vae::Vae::load(&vae_file, gpu, log)?, dit: Mutex::new(None),
