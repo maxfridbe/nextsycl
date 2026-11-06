@@ -1,0 +1,41 @@
+# SeedVR2 (ByteDance-Seed): one-step diffusion video restoration and upscaling, 3B and 7B (image/seedvr2). The code
+# (github.com/ByteDance-Seed/SeedVR) and the weights (huggingface.co/ByteDance-Seed/SeedVR2-3B, -7B: "SeedVR and
+# SeedVR2 are licensed under the Apache 2.0") are Apache-2.0; the files here are numz's fp16 safetensors of them
+# (huggingface.co/numz/SeedVR2_comfyUI, Apache-2.0) and the official positive prompt's embedding.
+# An image-kind card: the image server serves image.upscale and video.upscale (the video kind is MiniMax H3's daemon)
+id: seedvr2
+kind: image
+arch: seedvr2
+title: 'SeedVR2 video upscaler (3B and 7B: one-step diffusion restoration, steady over time)'
+about: 'ByteDance-Seed''s SeedVR2 as its official inference runs it: frames resized bicubic to the size asked, the causal 3-D VAE''s latent, one call of the NaDiT (3B: 32 blocks of 2560, mmrope; 7B: 36 of 3072) at t = 1000 with the fixed positive prompt, the decode and the wavelet colour fix. A clip goes through in chunks of 33 frames together (NS_SVR_CHUNK), 4 shared and crossfaded (NS_SVR_OVERLAP): natural detail on faces and skin, no per-frame flicker. Variants seedvr2-3b (default) and seedvr2-7b, scales 1 to 4'
+gpus: '0'
+vram_gib: 28.0                  # the 7B at 1728x960 (see docs/ports/seedvr2.md); the 3B takes less
+defaults: {}
+env: {}
+files:
+  vae:
+    key: seedvr2-vae-fp16
+    url: https://huggingface.co/numz/SeedVR2_comfyUI/resolve/09ced71023636e9bc8cdf9cdecfb2625d1e691e8/ema_vae_fp16.safetensors
+    size: 501324814
+    sha256: 20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1
+    path: seedvr2/ema_vae_fp16.safetensors
+  text:
+    key: seedvr2-pos-emb
+    url: https://huggingface.co/ByteDance-Seed/SeedVR2-3B/resolve/37255ff8cccfb01071b87f635a5948ca8d53117c/pos_emb.pt
+    member: pos_emb/data/0       # the tensor's storage: bfloat16 [58, 5120], read without unpickling
+    size: 593920
+    sha256: 92ff754e036702f20f1782b0f5327c3d120aac6370ddc2ef0cdfdb06988f70ab
+    path: seedvr2/pos_emb.bf16
+  dit-3b:
+    key: seedvr2-3b-fp16
+    url: https://huggingface.co/numz/SeedVR2_comfyUI/resolve/09ced71023636e9bc8cdf9cdecfb2625d1e691e8/seedvr2_ema_3b_fp16.safetensors
+    size: 6783018808
+    sha256: 2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304
+    path: seedvr2/seedvr2_ema_3b_fp16.safetensors
+  dit-7b:
+    key: seedvr2-7b-fp16
+    url: https://huggingface.co/numz/SeedVR2_comfyUI/resolve/09ced71023636e9bc8cdf9cdecfb2625d1e691e8/seedvr2_ema_7b_fp16.safetensors
+    size: 16479334424
+    sha256: 7b8241aa957606ab6cfb66edabc96d43234f9819c5392b44d2492d9f0b0bbe4a
+    path: seedvr2/seedvr2_ema_7b_fp16.safetensors
+guide: guides/upscale.md

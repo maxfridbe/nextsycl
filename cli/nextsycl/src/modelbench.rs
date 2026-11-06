@@ -40,7 +40,7 @@ struct Std {
 fn standard(entry: &Value) -> Result<Std, String> {
     let (kind, arch) = (entry["kind"].as_str().unwrap_or("llm"), entry["arch"].as_str().unwrap_or(""));
     match kind {
-        "image" if arch.contains("ocr") || arch.contains("esrgan") || arch == "waifu2x" || arch == "starvector" || arch == "olmocr2" => {
+        "image" if arch.contains("ocr") || arch.contains("esrgan") || arch == "waifu2x" || arch == "seedvr2" || arch == "starvector" || arch == "olmocr2" => {
             Err(format!("{arch} takes a picture in: no standard request for it yet"))
         }
         "image" => Ok(Std { path: "/v1/images/generations", body: json!({"prompt": "a red fox sitting in fresh snow at dawn, photograph", "size": "512x512", "n": 1}), unit: "images", units: 1.0 }),

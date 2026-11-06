@@ -193,6 +193,8 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
         }
         "image" if arch.contains("ocr") => (vec!["ocr", "read_pages", "pdf"], vec!["image.ocr"]),
         "image" if arch == "realesrgan" || arch == "waifu2x" => (vec!["upscale", "upscale_video", "tiles"], vec!["image.upscale", "video.upscale"]),
+        // a clip upscaled whole (frames in chunks together: steady over time)
+        "image" if arch == "seedvr2" => (vec!["upscale", "upscale_video", "temporal"], vec!["image.upscale", "video.upscale"]),
         "image" if arch == "starvector" => (vec!["vectorize", "svg"], vec!["image.vectorize"]),
         "image" => {
             let mut c = vec!["generate", "edit", "compose", "img2img", "loras"];

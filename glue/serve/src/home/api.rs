@@ -265,24 +265,25 @@ impl Home {
     }
 
     /// The upscaler for image.upscale / video.upscale: the one named (it must upscale), else - by the variant asked
-    /// (waifu2x's are models-*) - the loaded or first enabled one of that family, else any
+    /// (waifu2x's are models-*, SeedVR2's seedvr2-*) - the loaded or first enabled one of that family, else any
     pub(super) fn upscaler_for(&self, b: &Value, all: &[Value]) -> Result<String, Fail> {
         if b["model"].as_str().is_some_and(|x| !x.is_empty()) {
             let id = self.pick("image", b, all)?;
             if all.iter().any(|m| m["id"] == id.as_str() && !upscales(m)) {
-                return Err((400, format!("{id} draws pictures; upscaling needs an upscaler (real-esrgan, waifu2x)")));
+                return Err((400, format!("{id} draws pictures; upscaling needs an upscaler (real-esrgan, waifu2x, seedvr2)")));
             }
             return Ok(id);
         }
         let want = match b["variant"].as_str() {
             Some(v) if v.starts_with("models-") => Some("waifu2x"),
+            Some(v) if v.starts_with("seedvr2") => Some("seedvr2"),
             Some(v) if !v.is_empty() => Some("realesrgan"),
             _ => None,
         };
         let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "image" && m["enabled"] != false && upscales(m)
             && want.is_none_or(|a| s(m, "arch") == a)).collect();
         self.loaded_of("image").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
-            .ok_or_else(|| (409, format!("no upscaler{} is enabled (system.enable real-esrgan / waifu2x)", want.map(|a| format!(" ({a})")).unwrap_or_default())))
+            .ok_or_else(|| (409, format!("no upscaler{} is enabled (system.enable real-esrgan / waifu2x / seedvr2)", want.map(|a| format!(" ({a})")).unwrap_or_default())))
     }
 
     /// The recogniser for audio.transcribe: the one named (it must listen), else the loaded or first enabled one
@@ -1620,7 +1621,7 @@ pub(super) fn speaks(m: &Value, voice: &str) -> bool {
 
 /// A registry entry that upscales (an upscaler's architecture) rather than draws or reads
 pub(super) fn upscales(m: &Value) -> bool {
-    matches!(s(m, "arch").as_str(), "realesrgan" | "waifu2x")
+    matches!(s(m, "arch").as_str(), "realesrgan" | "waifu2x" | "seedvr2")
 }
 
 /// A registry entry that writes pictures as SVG (StarVector) rather than draws them

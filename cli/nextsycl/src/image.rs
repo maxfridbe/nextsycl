@@ -17,6 +17,7 @@ nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora 
 nextsycl image start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
 nextsycl image ocr PICTURE|PDF... [--one-pass] [--no-columns] [--model ID|FILE.gguf] [--prompt TEXT] [--no-tiles] [--no-figures] [--max N] [--temp T] [--out FILE] [--gpu N] [--dump-views DIR]
 nextsycl image check <dump dir> [--model ID|FILE.gguf] [--stages te,dit,steps,vae] [--lora NAME[:SCALE]]... [--tokens N] [--gpu N]
+                   (seedvr2: --stages resize,enc,dit,dec,colorfix --variant seedvr2-3b|seedvr2-7b --frames PNG_DIR)
 nextsycl image upscale PICTURE [--model real-esrgan|waifu2x | --dir NCNN_DIR] [--variant V] [--scale N] [--noise N] [--tile N] [--out FILE] [--gpu N]
 nextsycl image upscale-check PICTURE REFERENCE.png [upscale's options]   (against realesrgan- / waifu2x-ncnn-vulkan's output: PSNR, worst pixel)
 nextsycl image vectorize PICTURE [--model starvector-1b-im2svg | --dir CHECKPOINT_DIR] [--max-length N] [--beams N] [--greedy] [--top-p P] [--seed S] [--out FILE.svg] [--gpu N]
@@ -26,7 +27,8 @@ nextsycl image engines | selftest [--gpu N]";
 /// The image engines this program has (image/<arch>)
 pub fn engines() -> Vec<nextsycl_image::ImageKind> {
     vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_olmocr2::kind(), nextsycl_image_hunyuanimage21::kind(),
-         nextsycl_image_upscale::kind(), nextsycl_image_starvector::kind(), nextsycl_image_mingimage::kind(), nextsycl_image_mossimage::kind(), nextsycl_image_example::kind()]
+         nextsycl_image_upscale::kind(), nextsycl_image_starvector::kind(), nextsycl_image_mingimage::kind(), nextsycl_image_mossimage::kind(), nextsycl_image_seedvr2::kind(),
+         nextsycl_image_example::kind()]
 }
 
 /// `--gpu 0` or `--gpu 0,1` (an engine that splits over two cards takes the second too)
@@ -542,6 +544,20 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         println!("worst relative error {worst:.2e}");
         return Ok(());
     }
+    if m["arch"].as_str() == Some(nextsycl_image_seedvr2::ARCH) {
+        let gs = gpus(args)?;
+        let mut log = |s: String| eprintln!("{s}");
+        let e = nextsycl_image_seedvr2::SeedVr2::load(&files, &gs, &options(cfg, &m, args)?, &mut log).map_err(|e| e.0)?;
+        let st = opt(args, "--stages").unwrap_or("resize,enc,dit,dec,colorfix");
+        let variant = match opt(args, "--variant").unwrap_or("seedvr2-3b") {
+            "seedvr2-7b" => "seedvr2-7b",
+            _ => "seedvr2-3b",
+        };
+        let frames = opt(args, "--frames").map(Path::new);
+        let worst = nextsycl_image_seedvr2::check::run(&e, dir, frames, variant, &st.split(',').collect::<Vec<_>>(), &mut log).map_err(|e| e.0)?;
+        println!("worst relative error {worst:.2e}");
+        return Ok(());
+    }
     if m["arch"] != nextsycl_image_qwenimage21::ARCH {
         return Err(format!("check knows {}, {}, {}, {} and the OCR engines", nextsycl_image_qwenimage21::ARCH, nextsycl_image_hunyuanimage21::ARCH, nextsycl_image_mingimage::ARCH,
                            nextsycl_image_mossimage::ARCH));
@@ -626,7 +642,7 @@ fn run(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     a.extend(mount(&out, &out.to_string_lossy(), false));
     a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engines' own settings from the configuration (NS_QI_INT8=1 ...)
-    for (k, v) in cfg.with_prefix("NS_QI_").into_iter().chain(cfg.with_prefix("NS_HI_")).chain(cfg.with_prefix("NS_MOSS_")).chain(cfg.with_prefix("NSD_")) {
+    for (k, v) in cfg.with_prefix("NS_QI_").into_iter().chain(cfg.with_prefix("NS_HI_")).chain(cfg.with_prefix("NS_MOSS_")).chain(cfg.with_prefix("NS_SVR_")).chain(cfg.with_prefix("NSD_")) {
         a.extend(["-e".into(), format!("{k}={v}")]);
     }
     a.extend([ce.image.clone(), "bash".into(), "-c".into(),

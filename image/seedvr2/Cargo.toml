@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-image-seedvr2"
+description = "SeedVR2 (ByteDance-Seed): one-step diffusion video restoration and upscaling, 3B and 7B NaDiT over a causal 3-D VAE; Rust and SYCL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-image.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true

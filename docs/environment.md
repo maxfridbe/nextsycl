@@ -229,6 +229,15 @@ Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`).
 | `NS_MOSS_BENCH_SIZE` | 1024 | Debug: the picture side the `image check --stages bench` stage times a forward and the VAE at (a multiple of 16) | image mossimage (check) |
 | `NS_MOSS_BENCH_REPEAT` | 1 | Debug: the bench stage's prompt said this many times over (a long prompt through the text encoder, up to 4096 tokens) | image mossimage (check) |
 | `NS_MOSS_PROFILE` | off | Debug: set: a GPU wait after each part of a text-encoder layer, the seconds in full attention, DeltaNet and the FFN printed on stderr (slower) | image mossimage |
+| `NS_SVR_*` | - | every NS_SVR_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
+| `NS_SVR_CHUNK` | 33 | SeedVR2's frames that go through the model together (1 + 4 n): more is steadier over time and takes more of the card (the DiT's tokens grow with it; the VAE's slices do not) (--opt-chunk) | image seedvr2 |
+| `NS_SVR_OVERLAP` | 4 | SeedVR2's frames neighbouring chunks share, made twice and crossfaded (a raised cosine across them) (--opt-overlap) | image seedvr2 |
+| `NS_SVR_GPUS` | the server's card | SeedVR2's cards, by index ("0,1"): each holds the VAE and its own pinned copy of the DiT, and a clip's chunks go to whichever card is free (crossfaded and handed out in order) | image seedvr2 |
+| `NS_SVR_MEMLOG` | off | Debug: set: the card's memory in use printed at each of SeedVR2's large allocations (the VAE's convolutions and attention, the DiT's buffers) | image seedvr2 |
+| `NS_SVR_PIECE` | about 1 GiB | Debug: the frames SeedVR2's VAE takes at a time at full resolution (its default: as many as fit in about 1 GiB at the widest layer; 1 at 1728x960). Any number gives the same frames - the convolutions carry their last frames over - so a check can show it | image seedvr2 |
+| `NS_SVR_VERIFY` | off | Debug: set: SeedVR2's DiT weights read back from the card after each upload and compared with the host's (a line with the bytes that differ) | image seedvr2 |
+| `NS_SVR_PROFILE` | off | Debug: set: each of SeedVR2's GPU steps timed alone (a wait before and after), summed by kind with the FLOPs and bytes its shapes imply; a table a chunk against the card's bfloat16 XMX peak (Xe cores x 2048 x clock) and 608 GB/s (slower; for finding where the time goes) | image seedvr2 |
+| `NS_SVR_SEED` | 666 | SeedVR2's noise seed (the reference's); chunk n draws from seed + n (--opt-seed) | image seedvr2 |
 | `NS_QI_*` | - | every NS_QI_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_QI_DUMP` | off | Debug: a directory: what the denoiser is given (embeds, pads, cond latents, noise) written there as raw float32 files | image qwenimage21 |
 | `NS_QI_INT8` | 0 | 1: the DiT's block matrices in int8 ConvRot (~1.4x a step, half the VRAM) (--opt-int8) | image qwenimage21 |

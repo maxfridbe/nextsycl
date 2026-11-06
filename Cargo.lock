@@ -576,6 +576,7 @@ dependencies = [
  "nextsycl-image-olmocr2",
  "nextsycl-image-paddleocrvl",
  "nextsycl-image-qwenimage21",
+ "nextsycl-image-seedvr2",
  "nextsycl-image-starvector",
  "nextsycl-image-unlimitedocr",
  "nextsycl-image-upscale",
@@ -870,6 +871,16 @@ dependencies = [
  "nextsycl-image",
  "nextsycl-qwen3vl",
  "serde_json",
+]
+
+[[package]]
+name = "nextsycl-image-seedvr2"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-image",
 ]
 
 [[package]]

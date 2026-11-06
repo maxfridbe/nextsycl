@@ -2887,7 +2887,7 @@ fn image_vectorize(h: &Arc<Home>, req: ImageVectorizeReq) -> Answer {
     h.legacy("image.vectorize", req)
 }
 
-/// A clip made bigger frame by frame by an upscaler (as image.upscale: the variant, scale, noise, tile), its sound copied as it was; an MP4 back. A job in the image queue (image.status, image.cancel)
+/// A clip made bigger by an upscaler (as image.upscale: the variant, scale, noise, tile) - frame by frame, or SeedVR2 the clip whole (frames in chunks together) -, its sound copied as it was; an MP4 back. A job in the image queue (image.status, image.cancel)
 #[rpc(name = "video.upscale", tags = "video", example = r#"{"file": "h3_20261019_121939", "model": "real-esrgan", "scale": 2, "variant": "realesr-animevideov3"}"#)]
 fn video_upscale(h: &Arc<Home>, req: VideoUpscaleReq) -> Answer {
     h.legacy("video.upscale", req)

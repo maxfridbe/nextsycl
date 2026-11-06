@@ -114,7 +114,7 @@ pub struct OcrOutput {
 pub struct UpscaleRequest {
     pub picture: Picture,
     /// the variant of the family (Real-ESRGAN: realesrgan-x4plus, realesrgan-x4plus-anime, realesr-animevideov3;
-    /// waifu2x: models-cunet, models-upconv_7_anime_style_art_rgb, models-upconv_7_photo)
+    /// waifu2x: models-cunet, models-upconv_7_anime_style_art_rgb, models-upconv_7_photo; SeedVR2: seedvr2-3b, seedvr2-7b)
     pub variant: Option<String>,
     /// the factor (Real-ESRGAN: 2, 3, 4 as the variant takes; waifu2x: 1, 2, 4 ... 32)
     pub scale: Option<u32>,
@@ -312,7 +312,18 @@ pub trait ImageEngine: Send + Sync {
     }
     /// a picture made bigger, reporting each tile done (`Step::at` of `of`)
     fn upscale(&self, _req: &UpscaleRequest, _progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<(Picture, UpscaleInfo)> {
-        Err(Error(format!("{} does not upscale (an upscaler: real-esrgan, waifu2x)", self.arch())))
+        Err(Error(format!("{} does not upscale (an upscaler: real-esrgan, waifu2x, seedvr2)", self.arch())))
+    }
+    /// whether it upscales a clip as a whole (`upscale_clip`: frames together, for steadiness over time) rather than a
+    /// frame at a time (`upscale`)
+    fn upscales_clips(&self) -> bool {
+        false
+    }
+    /// a clip made bigger as a whole: its frames taken from `next` in order (None: the clip has ended; each the size
+    /// of `req.picture`), each frame made handed to `put` in order (an error from either stops it: a cancel)
+    fn upscale_clip(&self, _req: &UpscaleRequest, _next: &mut dyn FnMut() -> Result<Option<Picture>>, _put: &mut dyn FnMut(Picture) -> Result<()>)
+        -> Result<UpscaleInfo> {
+        Err(Error(format!("{} upscales a frame at a time (upscale)", self.arch())))
     }
     /// whether it writes a picture as SVG (`vectorize`: StarVector)
     fn vectorizes(&self) -> bool {

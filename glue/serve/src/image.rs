@@ -656,7 +656,7 @@ impl ImageServer {
         self.waiting.fetch_sub(1, Ordering::Relaxed);
         match g.as_ref() {
             None => Err((503, "the engine is not loaded".into())),
-            Some((e, _)) if e.upscale_variants().is_empty() => Err((400, format!("{} makes pictures; it does not upscale them (real-esrgan, waifu2x do)", self.model))),
+            Some((e, _)) if e.upscale_variants().is_empty() => Err((400, format!("{} makes pictures; it does not upscale them (real-esrgan, waifu2x, seedvr2 do)", self.model))),
             _ => Ok(g),
         }
     }
@@ -716,7 +716,8 @@ impl ImageServer {
 
     /// POST /v1/videos/upscale: {video (base64 / data URL) | path (a clip on this machine: the front door's `file`),
     /// variant, scale, noise, tile, crf} - every frame through the upscaler (ffmpeg decodes and encodes, the audio
-    /// copied as it was), an MP4 back as a link (the server keeps it) or base64
+    /// copied as it was; an engine that takes a clip whole - SeedVR2 - reads and hands back the frames itself), an MP4
+    /// back as a link (the server keeps it) or base64
     fn upscale_video(&self, b: &Value, base: &str) -> Result<Value, (u16, String)> {
         use std::io::{Read, Write};
         use std::process::{Command, Stdio};
@@ -773,14 +774,9 @@ impl ImageServer {
         let p = &self.progress;
         let r: Result<(), (u16, String)> = (|| {
             let mut stdout = dec.stdout.take().ok_or((500u16, "ffmpeg's output".to_string()))?;
-            loop {
-                if stdout.read_exact(&mut buf).is_err() {
-                    break;
-                }
-                let mut req = req0.clone();
-                req.picture = nextsycl_image::Picture { width: w as u32, height: h as u32, channels: 3, data: buf.clone() };
-                let (pic, info) = engine.upscale(&req, &mut |_| if self.cancel.stopping() { Err(nextsycl_core::Error("cancelled".into())) } else { Ok(()) })
-                    .map_err(|e| (if e.0 == "cancelled" { 499u16 } else { 400 }, e.0))?;
+            let fail = |e: nextsycl_core::Error| (if e.0 == "cancelled" { 499u16 } else { 400 }, e.0);
+            // a made frame to the encoder (started on the first: its size is the frames')
+            let mut put = |pic: &nextsycl_image::Picture| -> Result<(), (u16, String)> {
                 if enc.is_none() {
                     out_size = (pic.width as usize, pic.height as usize);
                     // the source's audio, as it was; H.264 4:2:0 for any player
@@ -793,9 +789,40 @@ impl ImageServer {
                 enc.as_mut().and_then(|e| e.stdin.as_mut()).ok_or((500u16, "ffmpeg's input".to_string()))?
                     .write_all(&pic.data).map_err(|e| (500u16, format!("the encoder: {e}")))?;
                 n += 1;
-                info_last = Some(info);
                 *p.lock().unwrap() = json!({"busy": true, "prompt": format!("upscale a clip {w}x{h}"), "at": n, "of": frames.max(n), "phase": "frames",
                                             "seconds": t0.elapsed().as_secs_f64()});
+                Ok(())
+            };
+            if engine.upscales_clips() {
+                // the clip as a whole (frames in chunks, together): the engine reads and hands back frames as it goes
+                let mut next = || -> nextsycl_core::Result<Option<nextsycl_image::Picture>> {
+                    if self.cancel.stopping() {
+                        return Err(nextsycl_core::Error("cancelled".into()));
+                    }
+                    Ok(stdout.read_exact(&mut buf).is_ok().then(|| nextsycl_image::Picture { width: w as u32, height: h as u32, channels: 3, data: buf.clone() }))
+                };
+                let mut put_err = None;
+                let info = engine.upscale_clip(&req0, &mut next, &mut |pic| put(&pic).map_err(|e| {
+                    let msg = e.1.clone();
+                    put_err = Some(e);
+                    nextsycl_core::Error(msg)
+                }));
+                info_last = Some(match (info, put_err) {
+                    (_, Some(e)) => return Err(e),
+                    (i, None) => i.map_err(fail)?,
+                });
+                return Ok(());
+            }
+            loop {
+                if stdout.read_exact(&mut buf).is_err() {
+                    break;
+                }
+                let mut req = req0.clone();
+                req.picture = nextsycl_image::Picture { width: w as u32, height: h as u32, channels: 3, data: buf.clone() };
+                let (pic, info) = engine.upscale(&req, &mut |_| if self.cancel.stopping() { Err(nextsycl_core::Error("cancelled".into())) } else { Ok(()) })
+                    .map_err(fail)?;
+                put(&pic)?;
+                info_last = Some(info);
             }
             Ok(())
         })();
