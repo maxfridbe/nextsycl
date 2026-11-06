@@ -14,7 +14,9 @@
 #include <string>
 
 #include <sycl/sycl.hpp>
-#include "sycl_tla_sdpa_sparse.hpp"
+// ARK's wrapper and its sparse mainloop copied into ark/ (MIT / BSD-3-Clause, notices kept): the mainloop's prefetch
+// changed (ark/stla/xe_sparse_sdpa_fwd_mainloop.hpp, "nextsycl")
+#include "ark/sycl_tla_sdpa_sparse.hpp"
 #include "../silo.h"
 
 namespace {
