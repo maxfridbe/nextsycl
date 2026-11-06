@@ -225,6 +225,11 @@ impl Tcd {
     }
 
     /// A new stream for latents of [h8, w8] (the pasts emptied, the first 3 frames to drop)
+    /// The per-size state let go
+    pub fn release(&mut self) {
+        self.state = None;
+    }
+
     pub fn reset(&mut self, h8: usize, w8: usize) -> Result<()> {
         if !self.state.as_ref().is_some_and(|s| s.h8 == h8 && s.w8 == w8) {
             self.state = None;

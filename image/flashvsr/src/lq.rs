@@ -110,6 +110,11 @@ impl LqProj {
     }
 
     /// A new stream for frames of [16 hp, 16 wp] (the memory emptied)
+    /// The per-size state let go
+    pub fn release(&mut self) {
+        self.state = None;
+    }
+
     pub fn reset(&mut self, hp: usize, wp: usize) -> Result<()> {
         if !self.state.as_ref().is_some_and(|s| s.hp == hp && s.wp == wp) {
             self.state = None;

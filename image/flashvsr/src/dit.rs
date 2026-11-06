@@ -378,6 +378,15 @@ impl Stage {
     }
 
     /// The ring and the buffers for grids of nb blocks (made again when the grid changes)
+    /// The per-size buffers let go (the KV ring and the work rows)
+    pub fn release(&mut self) {
+        self.work = None;
+        for l in &mut self.layers {
+            l.kv = None;
+            l.km = None;
+        }
+    }
+
     pub fn prepare(&mut self, nb: usize) -> Result<()> {
         if self.work.as_ref().is_some_and(|w| w.nb == nb) {
             return Ok(());

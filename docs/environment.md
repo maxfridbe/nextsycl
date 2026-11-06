@@ -243,6 +243,7 @@ Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`).
 | `NS_SVR_SEED` | 666 | SeedVR2's noise seed (the reference's); chunk n draws from seed + n (--opt-seed) | image seedvr2 |
 | `NS_FVSR_*` | - | every NS_FVSR_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_FVSR_GPUS` | the server's card | FlashVSR's cards, by index ("0,1": the DiT's 30 blocks split over both, the cards pipelined; the LQ projection and the patches on the first) (--opt-gpus) | image flashvsr |
+| `NS_FVSR_KEEP` | 0 | 1: FlashVSR keeps a clip's buffers (the KV ring, the decoder's past: 13-17 GiB at 1728 x 960) for the next clip; by default they are let go when a clip ends, so an idle server leaves the card to other models | image flashvsr |
 | `NS_FVSR_SPLIT` | 30; 14,16 on two | FlashVSR's DiT blocks a card, in order (they sum to 30) (--opt-split) | image flashvsr |
 | `NS_FVSR_DECODER` | first | FlashVSR's card for the tiny decoder with two cards: first or last (--opt-decoder) | image flashvsr |
 | `NS_FVSR_TILE` | by size | 1: FlashVSR runs a clip in tiles of 1792 x 1024 of the upscaled frame (each its own stream over segments of 192 frames, the overlaps blended); 0: whole; by default whole when the stream fits the card(s), else tiles (x4) | image flashvsr |

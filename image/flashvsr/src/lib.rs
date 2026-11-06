@@ -494,6 +494,24 @@ impl FlashVsr {
         4 * fsize * 3 + 6 * rows0 / 3 * DIM * 4 + 2 * 16 * 6 * (th / 8) * (tw / 8) * 4 + rows0 * (64 * 6 + DIM * 4 + 128 * 4 + DIM * 2) + 24 * fsize * 3
     }
 
+    /// Every card's per-size buffers let go (the weights stay); NS_FVSR_KEEP=1 keeps them for the next clip of the
+    /// same size
+    pub fn release(&self) -> Result<()> {
+        if std::env::var("NS_FVSR_KEEP").is_ok_and(|v| v.trim() == "1") {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        for gpu in &self.gpus {
+            gpu.sync()?;
+        }
+        for s in inner.stages.iter_mut() {
+            s.release();
+        }
+        inner.lq.release();
+        inner.tcd.release();
+        Ok(())
+    }
+
     /// Whether a size's stream fits the cards (else it runs in tiles)
     pub fn fits(&self, geo: &Geometry) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1022,7 +1040,13 @@ impl ImageEngine for FlashVsr {
         let geo = Geometry::new(w as usize, h as usize, set.scale);
         let mut next_rgb = || -> Result<Option<Vec<u8>>> { next()?.map(|p| rgb(p, w, h)).transpose() };
         let tiled = self.tiled(&geo);
-        let n = if tiled { self.run_tiled(geo, &set, &mut next_rgb, put)? } else { self.run(geo, &set, false, &mut next_rgb, put, &mut NoHooks)? };
+        let n = if tiled { self.run_tiled(geo, &set, &mut next_rgb, put) } else { self.run(geo, &set, false, &mut next_rgb, put, &mut NoHooks) };
+        // the clip's buffers let go (the KV ring, the decoder's past, the projection's frames: 13-17 GiB at 1728 x 960)
+        // so an idle server leaves its cards to the other models (another upscaler on the same card answered no_room
+        // beside it); the next clip makes them again in a few ms
+        let released = self.release();
+        let n = n?;
+        released?;
         let seconds = t0.elapsed().as_secs_f64();
         eprintln!("flashvsr: {w}x{h} -> {}x{}{}, {n} frames in {seconds:.1} s ({:.3} s a frame) on {} card(s); sparse_ratio {}, local_range {}", geo.sw, geo.sh,
                   if tiled { " in tiles" } else { "" }, seconds / n.max(1) as f64, self.gpus.len(), set.sparse_ratio, set.local_range);
