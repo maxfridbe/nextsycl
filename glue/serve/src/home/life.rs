@@ -115,6 +115,12 @@ fn listening(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300)).is_ok()
 }
 
+/// What an engine's no room asks for beyond the card's free memory, MiB: its "needs N GiB more"
+fn needs_more_mb(why: &str) -> Option<u64> {
+    let n = why.split("needs ").nth(1)?.split(" GiB more").next()?.trim().parse::<f64>().ok()?;
+    (n > 0.0).then(|| (n * 1024.0).ceil() as u64)
+}
+
 /// A card's free memory, MiB: total less used, less what each load under way (its server's port, the MiB it was
 /// placed for) has not taken yet - two loads planned at once on one card must not both count the same free memory
 fn free_on(c: &Value, pending: &[(u16, u64)]) -> u64 {
@@ -949,6 +955,31 @@ impl Home {
         place::wait_room(&Sched(self), g, want)
     }
 
+    /// A loaded engine that answered no room for one request ("needs N GiB more on <card>": SeedVR2, FlashVSR): idle
+    /// holders on its cards other than itself stop for it, as they would for its load. True when one did - the caller
+    /// sends the request once more
+    pub(crate) fn room_for_request(&self, id: &str, why: &str) -> bool {
+        let Some(more_mb) = needs_more_mb(why) else { return false };
+        let all = self.models();
+        let Some(m) = all.iter().find(|m| m["id"] == id) else { return false };
+        let info = self.model_info(m);
+        let snap = self.snapshot_of(&all, true);
+        let mut freed = false;
+        for g in &info.gpus {
+            let Some(c) = snap.cards.iter().find(|c| c.index == *g) else { continue };
+            let want = c.free() + more_mb;
+            let idle: Vec<Holder> = room::evictable(room::idle_on(&snap, &Sched(self), *g, &info.kind, false), &snap.kept)
+                .into_iter().filter(|h| h.model != id).collect();
+            if let Some(plan) = room::plan_with_blockers(c.free(), want, idle, &[], false, &|_| false).filter(|p| !p.is_empty()) {
+                if self.free(&plan, &info.kind, id).is_ok() {
+                    self.wait_room(*g, want);
+                    freed = true;
+                }
+            }
+        }
+        freed
+    }
+
     /// A model's own host memory, MiB, and the cache it keeps warm (its entry's, else its model card's `ram_gib`, `ram_cache_gib`)
     fn ram_of(&self, id: &str) -> (Option<u64>, u64) {
         let all = self.models();
@@ -1474,6 +1505,13 @@ mod tests {
         assert_eq!(waiting_workers(&st), vec![(0, 28160), (1, 8192)]);
         let st = json!({"gpus": [{"gpu": 0, "engine": "loaded"}, {"gpu": 1, "engine": "waiting for the GPU lock (held: x)"}, {"gpu": 2, "engine": "unloaded"}]});
         assert!(waiting_workers(&st).is_empty(), "the lock's wait and a loaded worker are not this");
+    }
+
+    #[test]
+    fn an_engines_no_room_says_how_much_more_it_needs() {
+        assert_eq!(needs_more_mb("no room: seedvr2: 2688 x 608 needs 10.9 GiB more on Intel(R) Arc(TM) Pro B70 Graphics and it has 13.7 free"), Some(11162));
+        // a failed allocation names no amount: nothing to free for it
+        assert_eq!(needs_more_mb("device allocation of 1024 bytes failed"), None);
     }
 
     #[test]

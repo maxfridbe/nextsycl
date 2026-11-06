@@ -844,7 +844,11 @@ impl Home {
                     }
                     body["path"] = json!(path.to_string_lossy());
                 }
-                relay(&t, "POST", "/v1/videos/upscale", Some(&body), 86400)
+                // the engine's own no room for this clip's size: idle work on its card stops for it, then once more
+                match relay(&t, "POST", "/v1/videos/upscale", Some(&body), 86400) {
+                    Err((503, why)) if self.room_for_request(&id, &why) => relay(&t, "POST", "/v1/videos/upscale", Some(&body), 86400),
+                    r => r,
+                }
             }
             ("audio", "transcribe") => {
                 let id = self.recogniser(b, &all)?;
