@@ -15,7 +15,7 @@ license_note: 'Apache-2.0 for the weights (JunhaoZhuang/FlashVSR-v1.1) and the c
 title: 'FlashVSR v1.1 video upscaler (one-step diffusion, the whole clip as one stream, 2x-4x; real footage and faces)'
 about: 'OpenImagingLab''s FlashVSR v1.1: Wan 2.1 T2V-1.3B distilled to one step, streaming 8 frames a step with a KV cache of the last three latent pairs and locality-constrained block-sparse attention, a causal LQ projection in and a tiny conditional decoder out. Temporally steady, natural detail on real footage; a film runs as one stream (no seams, no length limit). The DiT 2.8 GB in half; one card holds the whole stream at 1728 x 960 and 2560 x 1408 out (x2 of the platform''s 864 x 480 and 1280 x 704); x4 runs in 2 x 2 tiles of 1792 x 1024. Request keys: scale 2-4, seed, and the options sparse_ratio (1.5), local_range (11), color_fix (1). Two cards: env NS_FVSR_GPUS 0,1 (the DiT''s blocks split, pipelined)'
 gpus: '0'
-vram_gib: 22.0                  # one card at 1728 x 960 out (1792 x 1024 inside): see docs/ports/flashvsr.md for the measured peaks
+vram_gib: 18.0                  # one card at 1728 x 960 out: 17.3 GiB measured (2560 x 1408: 29.9; docs/ports/flashvsr.md)
 defaults: {}
 env: {}
 files:

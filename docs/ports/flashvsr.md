@@ -113,3 +113,70 @@ on its RTX 5070 + 3060, 1.16 at x4.
 
 A detour: the pinned memory read and written by the kernels in place (over PCIe) made a frame 0.210 s - a kernel's
 small reads across the bus; the queue's copies (the copy engines) are what step 3 keeps.
+
+### Speed now (the final build: the whole 243-frame clip unless said)
+
+| size | one card (B70) | two cards (B70 + B65) |
+|---|---|---|
+| 864x480 -> 1728x960 (x2) | **0.156 s/frame** - B70 97 % busy, 1.2 CPU cores, 17.3 GiB | **0.107** - 86 / 87 % busy, 1.6 cores, 10.7 / 7.8 GiB |
+| 1280x704 -> 2560x1408 (x2) | **0.310**, whole - 97 %, 1.2 cores, 29.9 GiB (2.0 free) | **0.213** - 83 / 88 %, 1.6 cores, 18.2 / 13.5 GiB |
+| 864x480 -> 3456x1920 (x4: 2 x 2 tiles of 1792 x 1024) | **0.753** - 97 %, 1.0 core, 17.3 GiB | **0.547** - 81 / 83 %, 1.4 cores, 10.7 / 7.8 GiB |
+| 1280x704 -> 5120x2816 (x4: 3 x 3 tiles; 65 frames) | **1.542** - 98 %, 1.0 core, 17.3 GiB | **1.286** - 70 / 73 % (each tile's stream fills the pipeline anew), 1.3 cores, 10.7 / 7.8 GiB |
+
+Busy is the compute engine's share of the run (the xe driver's per-client counters in /proc/PID/fdinfo, every 0.5 s);
+the memory the process's resident VRAM at its peak (fdinfo's drm-resident-vram0, sampled), the same as the card's least
+free memory the engine saw. CPU: the server process's cores (ffmpeg's own processes not counted). A 5,665-frame film at
+2x of 864 x 480: about 15 minutes on the B70, 10 on both cards.
+
+### Where the time goes (one card; `NS_FVSR_PROFILE=1`, 65 frames, each step waited for)
+
+Peaks: the B70's XMX 183.5 TFLOPS (32 Xe cores x 2048 FLOPs a clock x 2.8 GHz; half and bfloat16 alike), its memory
+608 GB/s, pinned host -> card ~28 GB/s. FLOPs from the shapes (a product 2 M K N, a convolution 2 px Co Ci k^2, the
+sparse attention 4 x 128^3 for each 128 x 128 block a query block selected - counted from its lists); bytes as the least
+each step must move (the attention's: each selected K / V block read once a query block, an upper bound - neighbouring
+query blocks share most of theirs in the cache).
+
+| step | 1728x960: share | s | TFLOPS (% of peak) | GB/s | 2560x1408: share | TFLOPS (%) |
+|---|---|---|---|---|---|---|
+| DiT sparse attention (silo, ARK on sycl-tla, 128-query tile) | 42.3 % | 4.65 | 58.5 (31.9 %) | 462 (block reads) | 44.0 % | 57.3 (31.2 %) |
+| DiT products (oneDNN, half, epilogues fused) | 24.7 % | 2.72 | 119.8 (65.3 %) | 138 | 25.2 % | 119.9 (65.3 %) |
+| LQ projection convolutions | 6.3 % | 0.69 | 129.2 (70.4 %) | 23 | 5.5 % | 150.2 (81.8 %) |
+| decoder convolutions at 1/2 | 5.4 % | 0.60 | 113.1 (61.6 %) | 231 | 4.9 % | 128.1 (69.8 %) |
+| decoder convolutions at full size (bands) | 5.3 % | 0.59 | 135.3 (73.8 %) | 235 | 5.3 % | 139.2 (75.9 %) |
+| decoder convolutions at 1/8 | 3.7 % | 0.40 | 87.0 (47.4 %) | 48 | 3.0 % | 108.5 (59.1 %) |
+| DiT norms, RoPE (bandwidth) | 3.4 % | 0.38 | - | 412 (68 %) | 3.4 % | - |
+| decoder convolutions at 1/4 | 3.3 % | 0.36 | 92.7 (50.5 %) | 95 | 2.7 % | 116.4 (63.4 %) |
+| DiT cross-attention (silo, ARK dense) | 1.6 % | 0.18 | 68.2 (37.2 %) | 133 | 1.6 % | 70.9 (38.7 %) |
+| DiT draft (block means, scores, top k, lists) | 1.4 % | 0.15 | - | 155 | 2.0 % | - |
+| decoder's last convolution (128 -> 3) | 1.4 % | 0.15 | 6.2 (3.4 %) | 235 | 1.2 % | 7.0 (3.8 %) |
+| decoder upsample, input; colour fix and bytes | 1.3 % | 0.13 | - | 490 (81 %) | 1.3 % | - |
+
+The attention is the next lever: at a third of the peak it is the largest share, and its kernel reads each selected
+K / V block from memory for every 128 queries (ARK's 256-query tile, which shares them between two query blocks,
+walks the union of their lists and was no faster; tiles of 16 sub-groups or 16 keys a step were slower).
+
+### Memory (one card)
+
+At 2560 x 1408 the KV ring alone is 19.4 GiB (30 layers x 4 pair slots x 28,160 tokens x 3,072 halves): the steps that
+made the size fit whole are the weights read in place (oneDNN's reordered copies were 2.4 GiB, and a second copy a
+layout), the decoder's full-size end in bands (three 0.9 GB buffers become 0.17 GB ones), and the head's rows, TGrow 21
+and the MLP's hidden rows trimmed. The run peaks at 29.9 of 31.9 GiB; `room_for` (lib.rs) refuses a size whose stream,
+weights, 1.5 GiB margin and 1 GiB of runtime pass the card's memory with a plain error (400), and a size that fits an
+empty card but not beside what holds it now with no_room (503, retryable) - before anything is allocated. A size
+that cannot fit whole runs in tiles instead (x4; `NS_FVSR_TILE=0` forbids them, which is how the 400 is shown).
+
+### Checked through the server
+
+`video.upscale` with the platform's keys at the top level (`seed: 3, sparse_ratio: 2.0, local_range: 9,
+color_fix: 0`) and in `options`; `image.upscale` of a picture (a still clip); a size that can never fit (x4 of
+1280 x 704 whole: 400, "needs 103.3 GiB ... and the card has 31.9 in all"); an unknown option (400, the list of
+options). The plain kernels (`NS_SILO=0`) give the reference's figures too (latents 1.08e-3, 61.6 dB).
+
+### Open
+
+- The attention kernel (above). nextcuda's FlashAttention-2 walk of the lists, or a kernel that keeps a key block for
+  neighbouring query blocks, are the candidates.
+- The decoder's 128 -> 3 convolution on oneDNN is at 3 % of peak (1.4 % of the time): a direct kernel would do.
+- No clip of the platform is 1280 x 704: those rows are the 864 x 480 clip scaled up. x4 seams were not examined by eye.
+- The front door itself was not run here (production's): its routing (flashvsr-* variants, the model's capabilities)
+  is in glue/serve and unit-tested; the image server is what was exercised.
