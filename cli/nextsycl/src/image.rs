@@ -651,6 +651,12 @@ fn run(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
         }
     }
     a.extend(mount(&out, &out.to_string_lossy(), false));
+    // video.upscale's `file`: a clip made here, read where the studio keeps it (the front door hands the server its
+    // path) - the clips' directory read-only, unless it is the output's own
+    let clips = crate::video::service::out_dir(cfg);
+    if clips.is_dir() && clips != out {
+        a.extend(mount(&clips, &clips.to_string_lossy(), true));
+    }
     a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engines' own settings from the configuration (NS_QI_INT8=1 ...)
     for (k, v) in cfg.with_prefix("NS_QI_").into_iter().chain(cfg.with_prefix("NS_HI_")).chain(cfg.with_prefix("NS_MOSS_")).chain(cfg.with_prefix("NS_SVR_")).chain(cfg.with_prefix("NS_FVSR_")).chain(cfg.with_prefix("NSD_")) {
