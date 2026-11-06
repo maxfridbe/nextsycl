@@ -17,6 +17,10 @@ numz's ComfyUI node's (Apache-2.0).
 
 ### Files
 
+numz's files against the official checkpoints (`convcheck`: the official fp32 tensor cast to fp16, bit for bit): the VAE
+identical (250 tensors); the 3B's 603 of 635 tensors differ by at most 0.00195, one fp16 step at their size (another
+rounding of the same weights). The parity below runs the reference code on numz's files.
+
 | Part | File | Size |
 |---|---|---|
 | VAE | `numz/SeedVR2_comfyUI` `ema_vae_fp16.safetensors` | 501 MB |
@@ -82,14 +86,18 @@ input:
 The engine is bfloat16 as the official inference (autocast): the reference's own bfloat16-autocast run is 1.9e-2 from
 its float32 run at v, the engine 1.2e-2. The VAE in pieces of 1 and 2 frames gives the same numbers to every digit.
 
-### Speed (B70, 864x480 -> 1728x960, chunks of 33)
+### Speed (864x480 -> 1728x960, chunks of 33, the 243-frame clip through `video.upscale`)
 
-| | encode | DiT | decode | a chunk | a frame |
-|---|---|---|---|---|---|
-| 3B | 10.8 s | 5.3 s | 29.5 s | 45.7 s | 1.38 s (~1.5 s with the overlap) |
-| 7B | 10.8 s | 9.6 s | 29.5 s | 50 s | 1.5 s (~1.7 s with the overlap) |
+| | one card (B70) | two cards (B70 + B65) | peak VRAM a card |
+|---|---|---|---|
+| 3B, step 2 | 0.98 s/frame (1.02 frames/s) | 0.57 s/frame (1.75 frames/s) | 25.1 GiB B70, 23.0 GiB B65 |
+| 7B, step 1 | 1.28 s/frame (0.78 frames/s; 50 s of it the switch from the 3B) | 0.875 s/frame (1.14 frames/s) | 26.3 GiB B70, 23.1 GiB B65 |
+| first port (step 0) | 3B 1.51, 7B 1.51 (a 33-frame chunk) | 3B 0.93 | 23.9 GiB |
 
-The VAE is most of it (oneDNN's convolutions on the shared path, no silo yet): the open work is its silo.
+The 7B's DiT is 16.5 GB: it fits beside the VAE because its weights stay in pinned host memory and go up for each call
+(0.7 s at 28 GB/s), let go before the decode (the VAE's kept frames at full resolution take ~17 GB). Two cards each keep
+their own pinned copy (2 x 16.5 GB of host memory for the 7B). A film of 5,500 frames: ~1 h 40 (3B, one card), ~52 min
+(3B, two cards).
 
 ### Optimisation log
 
@@ -101,6 +109,7 @@ the whole request (`video.upscale` through the image server, ffmpeg included), B
 | 0 | the first working port (one card; chunks in a worker thread, the host's frames beside it) | 1.51 (367.5 s); two cards 0.93 (225.5 s) | 1.51 (one 33-frame chunk, 50 s) | VAE 87 % of a chunk; B70 compute engine busy 77 % (fdinfo) |
 | 1 | silo: the causal convolutions as 2-D taps over the frames where they are (the copies of the kept frames gone: 9 % of a chunk); group norm, shuffle and residual add vectorised (16-byte loads), group norm's statistics reduced in parallel; the DiT's window tables kept across chunks | 1.03 (250.3 s); two cards 0.60 (146.5 s) | | convolutions 51-57 % -> 61-67 % of the XMX peak; group norm 143 -> 269 GB/s |
 | 2 | a let-go volume freed at the card's next wait instead of a wait at every free (the queue was drained thousands of times a chunk); the DiT's attention fed half (the shared attention's in-place path) | 0.98 (239.0 s); two cards 0.57 (139.0 s) | | B70 compute busy 73 -> 80 %; DiT attention 1.54 -> 1.09 s a chunk. The half q, k, v overflowed on the 7B (see below): replaced in step 3 |
+| 3 | the DiT's window attention in bfloat16 on the silo (oneDNN's fused graph; the half path made chunks NaN); group norm's statistics over 4096 parts | parity: v 1.16e-2 (3B); speed queued behind the films | | the NaN chunks gone in the checks so far |
 
 ### Non-finite chunks (found and fixed)
 
@@ -114,3 +123,36 @@ half straight from the qkv projection made it worse (the 7B NaN from block 3). T
 bfloat16 (flash attention); the silo's `ns_image_seedvr2_silo_attention` is oneDNN's fused attention graph in bfloat16
 (float32 scores), read in place from the packed rows. A chunk that still comes back non-finite is made again once, the
 first block that goes wrong logged and the weights on the card compared with the host's.
+
+### Where the time goes (B70, one 33-frame chunk of the 3B at 864x480 -> 1728x960, step 2)
+
+`NS_SVR_PROFILE=1`: each step timed alone (a wait before and after: the chunk takes 34.1 s so instead of ~31), its
+FLOPs counted from the shapes - a convolution 2 To Ho Wo Co Ci kt kh kw, a GEMM 2 M K N, attention 4 S^2 D a head
+and window (q k^T and the weighted sum; S the window's tokens plus the text's) - and its bytes as the least it must
+move (inputs, outputs and weights once). Peaks: XMX bfloat16 = Xe cores (compute units / 8) x 2048 FLOPs a clock x
+the clock: the B70's 32 cores at 2.8 GHz 183.5 TFLOPS (Intel's B580: 233 int8 TOPS from 20 cores at 2.85 GHz,
+bfloat16 half that); a GEMM of 8192^3 reaches 170.6 (93 %: `image check --stages bench`). Memory 608 GB/s (256-bit
+GDDR6 at 19 Gbps). PCIe: pinned host -> card 28.0 GB/s measured (`nextsycl gpus`: 25.8 GB/s with its own buffers).
+
+| step | share | s | TFLOPS (% of 183.5) | GB/s (% of 608) | why it sits where it does |
+|---|---|---|---|---|---|
+| VAE 3x3x3 convolutions (silo taps), all | 59 % | 16.6 | 112-122 (61-66 %) at 864x480 and up; 87 (47 %) at 216x120 | 74-294 | compute-bound: oneDNN's 2-D convolutions; the small first and last layers (3 or 16 channels) 1-6 TFLOPS but 2 % of the time |
+| VAE group norm (+SiLU) | 10.7 % | 3.0 | - | 265 (44 %) | three passes (statistics, groups, apply); the next to fuse |
+| DiT MLP | 5.6 % | 1.5 | 128 (70 %) | | GEMMs |
+| DiT window attention | 3.9 % | 1.1 | 20 (11 %) | | windows of ~870 tokens, 20 heads: short sequences for the fused kernel (the bfloat16 silo graph since step 3) |
+| VAE 1x1x1 convolutions | 3.3 % | 0.9 | 26 (14 %) | 140 | the upsamplers' channel expansion: the shared linear with a bias; open |
+| VAE mid attention | 3.1 % | 0.9 | 30 (16 %) | | one head of 512 over 25,920 pixels: GEMM + softmax + GEMM a block of rows |
+| VAE residual add | 2.8 % | 0.8 | - | 456 (75 %) | bandwidth |
+| DiT qkv / out linears | 3.4 % | 0.9 | 99-125 (54-68 %) | | GEMMs |
+| DiT qk norm, rope, gathers, gates, norms | 3.9 % | 1.1 | - | 236-424 (39-70 %) | bandwidth |
+| DiT weights up (PCIe) | 0.8 % | 0.24 | - | 28.3 GB/s (101 % of the measured link) | |
+| colour fix + RGB bytes, resize, frames up / down | 0.3 % | 0.08 | - | 48-695 | |
+| ffmpeg decode / x264 encode (host) | - | - | - | - | on the calling thread while the card works: the run takes 0.8 cores (one card), 1.6 (two) |
+
+Per chunk (wall, unprofiled): encode 9.6 s, DiT 5.2 s (its weights up included), decode 19.2 s.
+
+Utilisation (`gpumon.py`: the xe driver's per-client engine counters in /proc/PID/fdinfo, every 0.5 s): one card, the
+B70's compute engine busy 73 % (step 1) -> 80 % (step 2) of the run; the rest is the host between kernels (a wait for
+each slice's frames, the DiT's input and output, noise) - the next thing to overlap. Two cards: B70 64-69 %, B65 87-97 %
+(the B70 finishes its chunks first and waits for the last one); the copy engines 1-3 %. CPU 0.8 / 1.6 cores. The host's
+work (ffmpeg, crossfade, the frames' order) runs on the calling thread beside the cards' workers.
