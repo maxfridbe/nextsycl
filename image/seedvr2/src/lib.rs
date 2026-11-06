@@ -346,6 +346,12 @@ impl SeedVr2 {
 
     /// A card's DiT of a variant, loaded (the other let go first)
     pub fn dit_for(&self, card: &Card, variant: &'static str, log: &mut dyn FnMut(String)) -> Result<Arc<dit::Dit>> {
+        self.dit_from(card, variant, None, log)
+    }
+
+    /// The same, the matrices copied from another card's slab of this variant when given (pinned memory is one
+    /// context's: each card keeps its own copy, but the file is read and converted once)
+    fn dit_from(&self, card: &Card, variant: &'static str, from: Option<&dit::Dit>, log: &mut dyn FnMut(String)) -> Result<Arc<dit::Dit>> {
         let mut g = card.dit.lock().unwrap();
         if let Some((v, d)) = g.as_ref() {
             if *v == variant {
@@ -355,17 +361,23 @@ impl SeedVr2 {
         let path = self.dits.get(variant).ok_or_else(|| Error(format!("{variant}: its DiT is not here (pulled: {})",
                                                                       self.dits.keys().copied().collect::<Vec<_>>().join(", "))))?;
         *g = None;
-        let d = Arc::new(dit::Dit::load(path, &self.text, self.text_len, &card.nsd, log)?);
+        let d = Arc::new(dit::Dit::load(path, &self.text, self.text_len, &card.nsd, from.map(|d| d.host_slab()), log)?);
         *g = Some((variant, d.clone()));
         Ok(d)
     }
 
-    /// Every card's DiT of a variant, loaded side by side (each card's own pinned copy)
+    /// Every card's DiT of a variant: the first card's read from the file, the others' copied from its slab side by
+    /// side (reading and converting the file on every card at once took 40 s for the 7B on two, one card 15)
     fn dits_for(&self, variant: &'static str) -> Result<Vec<Arc<dit::Dit>>> {
-        std::thread::scope(|sc| {
-            let hs: Vec<_> = self.cards.iter().map(|c| sc.spawn(move || self.dit_for(c, variant, &mut |m| eprintln!("{m}")))).collect();
-            hs.into_iter().map(|h| h.join().map_err(|_| Error("a DiT load panicked".into()))?).collect()
-        })
+        let first = self.dit_for(&self.cards[0], variant, &mut |m| eprintln!("{m}"))?;
+        let first = &first;
+        let rest: Vec<Arc<dit::Dit>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = self.cards[1..].iter()
+                .map(|c| sc.spawn(move || self.dit_from(c, variant, Some(first), &mut |m| eprintln!("{m}"))))
+                .collect();
+            hs.into_iter().map(|h| h.join().map_err(|_| Error("a DiT load panicked".into()))?).collect::<Result<Vec<_>>>()
+        })?;
+        Ok(std::iter::once(first.clone()).chain(rest).collect())
     }
 
     fn variant(&self, req: &UpscaleRequest) -> Result<&'static str> {

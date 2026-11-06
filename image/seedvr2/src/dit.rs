@@ -206,8 +206,83 @@ fn time_embedding(st: &SafeTensors, dim: usize) -> Result<Vec<f32>> {
     Ok(e)
 }
 
+/// Threads that fill a slab (reads of the file and the conversion to bfloat16, or a copy)
+fn fill_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16)
+}
+
+/// `dst` = `src` (the same length), copied by several threads
+fn fill_copy(dst: &mut [u8], src: &[u8]) {
+    let piece = dst.len().div_ceil(fill_threads()).max(1);
+    std::thread::scope(|sc| {
+        for (d, s) in dst.chunks_mut(piece).zip(src.chunks(piece)) {
+            sc.spawn(move || d.copy_from_slice(s));
+        }
+    });
+}
+
+/// Each tensor of `parts` (its name, its first byte in `dst`) read and converted to bfloat16 at its place, the tensors
+/// shared out between threads (each reads its own: positioned reads of the file)
+fn fill_convert(dst: &mut [u8], parts: &[(String, usize)], st: &SafeTensors) -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // each part's slice of dst, handed out whole: the places are disjoint (laid out one after another)
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    order.sort_by_key(|&i| parts[i].1);
+    let mut slices: Vec<Option<&mut [u8]>> = (0..parts.len()).map(|_| None).collect();
+    let mut rest = dst;
+    let mut at = 0usize;
+    for &i in &order {
+        let t = st.need(&parts[i].0).map_err(ge)?;
+        let len = t.elements() as usize * 2;
+        let skip = parts[i].1.checked_sub(at).ok_or_else(|| Error(format!("{}: overlaps the tensor before it in the slab", parts[i].0)))?;
+        if skip + len > rest.len() {
+            return Err(Error(format!("{}: past the slab's end", parts[i].0)));
+        }
+        let (_, tail) = std::mem::take(&mut rest).split_at_mut(skip);
+        let (mine, tail) = tail.split_at_mut(len);
+        slices[i] = Some(mine);
+        rest = tail;
+        at = parts[i].1 + len;
+    }
+    let jobs: Vec<Mutex<Option<&mut [u8]>>> = slices.into_iter().map(Mutex::new).collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..fill_threads())
+            .map(|_| {
+                sc.spawn(|| -> Result<()> {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= parts.len() {
+                            return Ok(());
+                        }
+                        let out = jobs[i].lock().unwrap().take().expect("each part once");
+                        let n = &parts[i].0;
+                        let t = st.need(n).map_err(ge)?;
+                        let raw = st.read(t).map_err(ge)?;
+                        match t.dtype.as_str() {
+                            "BF16" => out.copy_from_slice(&raw),
+                            "F16" => out.chunks_exact_mut(2).zip(raw.chunks_exact(2))
+                                .for_each(|(o, c)| o.copy_from_slice(&bf16(f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).to_le_bytes())),
+                            "F32" => out.chunks_exact_mut(2).zip(raw.chunks_exact(4))
+                                .for_each(|(o, c)| o.copy_from_slice(&bf16(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes())),
+                            d => return Err(Error(format!("{n}: {d} weights (F16, BF16 or F32 expected)"))),
+                        }
+                    }
+                })
+            })
+            .collect();
+        hs.into_iter().try_for_each(|h| h.join().map_err(|_| Error("a slab filler panicked".into()))?)
+    })
+}
+
 impl Dit {
-    pub fn load(path: &std::path::Path, txt: &[u16], txt_len: usize, nsd: &Nsd, log: &mut dyn FnMut(String)) -> Result<Dit> {
+    /// The matrices' slab in pinned host memory (for another card's load of the same file)
+    pub fn host_slab(&self) -> &[u8] {
+        self.host.as_slice()
+    }
+
+    /// `from`: another card's slab of this file (`host_slab()`), copied instead of read and converted again
+    pub fn load(path: &std::path::Path, txt: &[u16], txt_len: usize, nsd: &Nsd, from: Option<&[u8]>, log: &mut dyn FnMut(String)) -> Result<Dit> {
         let t0 = std::time::Instant::now();
         let gpu = nsd.gpu.clone();
         let st = SafeTensors::open(path).map_err(ge)?;
@@ -326,12 +401,20 @@ impl Dit {
         let mut host = HostBuf::new(&gpu, size.get())?;
         let planned = plan.take();
         let places: Vec<(usize, String)> = planned.iter().map(|(n, at)| (*at, n.join(" + "))).collect();
-        for (names, at) in planned {
-            let mut at = at;
-            for n in names {
-                let b = bytes(&n)?;
-                host.as_mut_slice()[at..at + b.len()].copy_from_slice(&b);
-                at += b.len();
+        match from.filter(|f| f.len() == host.len) {
+            // another card's slab of the same file: the same layout, copied
+            Some(f) => fill_copy(host.as_mut_slice(), f),
+            None => {
+                let mut parts = Vec::new();
+                for (names, at) in planned {
+                    let mut at = at;
+                    for n in names {
+                        let t = st.need(&n).map_err(ge)?;
+                        parts.push((n, at));
+                        at += t.elements() as usize * 2;
+                    }
+                }
+                fill_convert(host.as_mut_slice(), &parts, &st)?;
             }
         }
         let what = format!("{} blocks of {dim} ({} heads), {} MLP of {hidden}, {}", layers, dim / HEAD, if swiglu { "SwiGLU" } else { "GELU" },
