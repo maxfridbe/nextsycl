@@ -90,8 +90,8 @@ its float32 run at v, the engine 1.2e-2. The VAE in pieces of 1 and 2 frames giv
 
 | | one card (B70) | two cards (B70 + B65) | peak VRAM a card |
 |---|---|---|---|
-| 3B, step 2 | 0.98 s/frame (1.02 frames/s) | 0.57 s/frame (1.75 frames/s) | 25.1 GiB B70, 23.0 GiB B65 |
-| 7B, step 1 | 1.28 s/frame (0.78 frames/s; 50 s of it the switch from the 3B) | 0.875 s/frame (1.14 frames/s) | 26.3 GiB B70, 23.1 GiB B65 |
+| 3B, step 3 | 0.79 s/frame (1.27 frames/s) | 0.48 s/frame (2.06 frames/s) | 24.5 GiB B70, 24.5 GiB B65 |
+| 7B, step 3 | 0.96 s/frame (1.05 frames/s; ~50 s of it the switch from the 3B) | 0.73 s/frame (1.37 frames/s; the same, on both cards) | 24.5 GiB B70, 24.5 GiB B65 |
 | first port (step 0) | 3B 1.51, 7B 1.51 (a 33-frame chunk) | 3B 0.93 | 23.9 GiB |
 
 The 7B's DiT is 16.5 GB: it fits beside the VAE because its weights stay in pinned host memory and go up for each call
@@ -109,7 +109,7 @@ the whole request (`video.upscale` through the image server, ffmpeg included), B
 | 0 | the first working port (one card; chunks in a worker thread, the host's frames beside it) | 1.51 (367.5 s); two cards 0.93 (225.5 s) | 1.51 (one 33-frame chunk, 50 s) | VAE 87 % of a chunk; B70 compute engine busy 77 % (fdinfo) |
 | 1 | silo: the causal convolutions as 2-D taps over the frames where they are (the copies of the kept frames gone: 9 % of a chunk); group norm, shuffle and residual add vectorised (16-byte loads), group norm's statistics reduced in parallel; the DiT's window tables kept across chunks | 1.03 (250.3 s); two cards 0.60 (146.5 s) | | convolutions 51-57 % -> 61-67 % of the XMX peak; group norm 143 -> 269 GB/s |
 | 2 | a let-go volume freed at the card's next wait instead of a wait at every free (the queue was drained thousands of times a chunk); the DiT's attention fed half (the shared attention's in-place path) | 0.98 (239.0 s); two cards 0.57 (139.0 s) | | B70 compute busy 73 -> 80 %; DiT attention 1.54 -> 1.09 s a chunk. The half q, k, v overflowed on the 7B (see below): replaced in step 3 |
-| 3 | the DiT's window attention in bfloat16 on the silo (oneDNN's fused graph; the half path made chunks NaN); group norm's statistics over 4096 parts | parity: v 1.16e-2 (3B) | a 33-frame chunk, profiled: 30.1 s (encode 8.0, DiT 6.9, decode 15.2; ~0.91 s/frame before the overlap), was ~50 s at step 0; whole clip queued behind the films | 7B chunk clean (no non-finite value), peak 24.5 GiB; group norm 360 GB/s (59 %), window attention 17 % of peak; whether whole clips are free of black chunks is still open |
+| 3 | the DiT's window attention in bfloat16 on the silo (oneDNN's fused graph; the half path made chunks NaN); group norm's statistics over 4096 parts | 0.79 (191.9 s); two cards 0.48 (117.7 s) | 0.96 (232.1 s, the switch from the 3B in it); two cards 0.73 (177.5 s) | four whole clips: 0 black frames, no non-finite value; one card and two give the same frames. Busy (compute): 3B B70 85 %; 3B two cards B70 80 / B65 82 %; 7B B70 82 %; 7B two cards 63 / 65 % (the 7B's load on both cards inside the run). A 7B chunk 30.1 s profiled (encode 8.0, DiT 6.9, decode 15.2); group norm 360 GB/s, window attention 17 % of peak |
 
 ### Non-finite chunks (found and fixed)
 
@@ -156,3 +156,11 @@ B70's compute engine busy 73 % (step 1) -> 80 % (step 2) of the run; the rest is
 each slice's frames, the DiT's input and output, noise) - the next thing to overlap. Two cards: B70 64-69 %, B65 87-97 %
 (the B70 finishes its chunks first and waits for the last one); the copy engines 1-3 %. CPU 0.8 / 1.6 cores. The host's
 work (ffmpeg, crossfade, the frames' order) runs on the calling thread beside the cards' workers.
+
+### Seams (step 3, the raised-cosine crossfade)
+
+The face's mean change from frame to frame (0-255) over the 243-frame clip: inside chunks 4.41 (3B) / 4.78 (7B), at
+the seams' overlap frames 3.73 / 4.22 (worst 6.0 / 6.9) - no jump at the seams (the Hann version: 4.45 at the seams,
+worst 7.5, a cut in the middle of each overlap). The bicubic source changes 2.50 a frame: SeedVR2's detail moves with
+the picture more than a blurred one does (Real-ESRGAN 2.94). An earlier figure of 2.56 inside chunks was measured on a
+run with black chunks and is withdrawn.
