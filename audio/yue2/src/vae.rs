@@ -135,7 +135,8 @@ impl Vae {
         let mut l = frames;
         for s in STRIDES {
             let (k, p) = (2 * s, s.div_ceil(2));
-            l = (l - 1) * s - 2 * p + k;
+            // k before the padding is taken off: (l - 1) s is 0 for one frame (k = 2 s >= 2 p)
+            l = (l - 1) * s + k - 2 * p;
         }
         l
     }
