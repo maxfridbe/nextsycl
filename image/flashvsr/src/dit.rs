@@ -613,7 +613,7 @@ mod tests {
             let c = Chunk::of(n, 8, 14, 10, 11);
             assert_eq!(c.slot, (n + 2) % SLOTS);
             // the slot it overwrites held pair n - 2, which chunk n no longer sees
-            assert_eq!((n + 2 - SLOTS) % SLOTS, c.slot);
+            assert_eq!((n + SLOTS - 2) % SLOTS, c.slot);
             assert_eq!(c.seen(), 4 * 112);
         }
         let c0 = Chunk::of(0, 8, 14, 10, 11);
