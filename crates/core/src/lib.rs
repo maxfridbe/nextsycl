@@ -25,6 +25,21 @@ impl From<&str> for Error {
     }
 }
 
+/// The start of an error that means the card has no room now (other work holds it; the same call may work later):
+/// the servers answer it as 503 no_room, retryable
+pub const NO_ROOM: &str = "no room: ";
+
+impl Error {
+    pub fn no_room(m: impl std::fmt::Display) -> Error {
+        Error(format!("{NO_ROOM}{m}"))
+    }
+
+    /// No room now: `Error::no_room`, or a device allocation that failed (ns_alloc)
+    pub fn is_no_room(&self) -> bool {
+        self.0.starts_with(NO_ROOM) || (self.0.contains("device allocation of ") && self.0.contains(" bytes failed"))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 static API: OnceLock<std::result::Result<Api, String>> = OnceLock::new();

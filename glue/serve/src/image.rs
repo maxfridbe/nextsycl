@@ -774,7 +774,7 @@ impl ImageServer {
         let p = &self.progress;
         let r: Result<(), (u16, String)> = (|| {
             let mut stdout = dec.stdout.take().ok_or((500u16, "ffmpeg's output".to_string()))?;
-            let fail = |e: nextsycl_core::Error| (if e.0 == "cancelled" { 499u16 } else { 400 }, e.0);
+            let fail = |e: nextsycl_core::Error| (if e.0 == "cancelled" { 499u16 } else if e.is_no_room() { 503 } else { 400 }, e.0);
             // a made frame to the encoder (started on the first: its size is the frames')
             let mut put = |pic: &nextsycl_image::Picture| -> Result<(), (u16, String)> {
                 if enc.is_none() {

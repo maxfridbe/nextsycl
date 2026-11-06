@@ -125,6 +125,29 @@ pub fn geometry(w: u32, h: u32, scale: f64) -> (usize, usize, usize, usize, usiz
     (rw, rh, round_even((rw - ow) as f64 / 2.0) as usize, round_even((rh - oh) as f64 / 2.0) as usize, ow, oh)
 }
 
+/// The card memory a chunk of frames this size takes beyond what the loaded engine holds (GiB): the decoder's kept
+/// frames and the full-resolution slices grow with the pixels (24.5 GiB peak at 1728x960, the VAE's ~1 GiB in it)
+pub fn chunk_gib(rw: usize, rh: usize) -> f64 {
+    23.5 * (rw * rh) as f64 / (1728.0 * 960.0)
+}
+
+/// Kept free on a card beside a run (the box spills and hangs past its memory)
+const MARGIN_GIB: f64 = 1.5;
+
+/// Whether a chunk of `rw` x `rh` fits beside what holds the card now: Err no room (it fits an empty card; the same
+/// call may work later) or a size no card of this one's memory takes
+pub fn room_for(card: &str, rw: usize, rh: usize, total_gib: f64, free_gib: f64) -> Result<()> {
+    let need = chunk_gib(rw, rh) + MARGIN_GIB;
+    // the engine's own (the VAE, the runtime) is held on an empty card too
+    if need + 1.5 > total_gib {
+        return Err(Error(format!("seedvr2: {rw} x {rh} needs {need:.1} GiB on {card} and it has {total_gib:.1} in all: a smaller scale or source")));
+    }
+    if need > free_gib {
+        return Err(Error::no_room(format!("seedvr2: {rw} x {rh} needs {:.1} GiB more on {card} and it has {free_gib:.1} free", need - free_gib)));
+    }
+    Ok(())
+}
+
 /// The earlier chunk's weights over `n` overlapping frames: a raised cosine across the whole overlap (4 frames: 0.90,
 /// 0.65, 0.35, 0.10). ComfyUI-SeedVR2's Hann window fades over the middle third only, which for its 4-frame overlap
 /// is a cut between the second and third frame: a jump in the detail at every seam (measured on an H3 clip: the face
@@ -436,7 +459,14 @@ impl ImageEngine for SeedVr2 {
         let scale = req.scale.unwrap_or(2).clamp(1, 4) as f64;
         let dits = self.dits_for(variant)?;
         let (sw, sh) = (req.picture.width, req.picture.height);
-        let (.., ow, oh) = geometry(sw, sh, scale);
+        let (rw, rh, _, _, ow, oh) = geometry(sw, sh, scale);
+        // every card the chunks go to has the room now, or no room (retryable) before a frame is read
+        for card in &self.cards {
+            if let Ok((total, Some(free))) = card.gpu.memory() {
+                let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                room_for(&card.gpu.name, rw, rh, gib(total), gib(free))?;
+            }
+        }
         let fb_in = sw as usize * sh as usize * 3;
         // a frame as RGB bytes of the source's size (alpha dropped)
         let rgb = |p: Picture| -> Result<Vec<u8>> {
@@ -582,5 +612,16 @@ mod tests {
         let w = crossfade(5);
         assert!((0..5).all(|i| (w[i] + w[4 - i] - 1.0).abs() < 1e-6) && (w[2] - 0.5).abs() < 1e-6, "{w:?}");
         assert!(crossfade(1).len() == 1 && (crossfade(1)[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_full_card_is_no_room_and_a_size_no_card_takes_is_not() {
+        // the film size beside an idle card, then beside 10 GiB another process holds
+        assert!(room_for("B70", 1728, 960, 31.9, 30.0).is_ok());
+        let e = room_for("B70", 1728, 960, 31.9, 20.0).unwrap_err();
+        assert!(e.is_no_room() && e.0.contains("needs 5.0 GiB more on B70 and it has 20.0 free"), "{e}");
+        // 1280x704 x2: more than the card has in all - change the request, not wait
+        let e = room_for("B70", 2560, 1408, 31.9, 30.0).unwrap_err();
+        assert!(!e.is_no_room(), "{e}");
     }
 }
