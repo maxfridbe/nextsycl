@@ -4,7 +4,7 @@ id: real-esrgan
 kind: image
 arch: realesrgan
 title: 'Real-ESRGAN upscaler (x4plus for photographs, x4plus-anime, animevideov3 2x / 3x / 4x for video frames)'
-about: 'xinntao''s Real-ESRGAN as realesrgan-ncnn-vulkan ships it: RealESRGAN_x4plus (RRDB, 23 blocks), its 6-block anime model and the compact SRVGG realesr-animevideov3 at 2x, 3x and 4x - the ncnn graphs and half weights run on the shared convolutions, in tiles of 200 with 10 pixels of mirrored context (the program''s own), alpha upscaled bicubically. Checked against the program: 58-63 dB on a photograph, every variant'
+about: 'xinntao''s Real-ESRGAN as realesrgan-ncnn-vulkan ships it: RealESRGAN_x4plus (RRDB, 23 blocks), its 6-block anime model and the compact SRVGG realesr-animevideov3 at 2x, 3x and 4x - the ncnn graphs and half weights run on the upscale silo''s convolutions (oneDNN, the activations, residuals and dense blocks'' concatenations fused; docs/ports/real-esrgan.md), in tiles of 200 with 10 pixels of mirrored context (the program''s own), alpha upscaled bicubically. Checked against the program: 58-63 dB on a photograph, every variant'
 gpus: '0'
 vram_gib: 1.0                   # measured (nvidia-smi, the process): x4plus 0.9 GB at its 200-pixel tiles, animevideov3 0.3 GB on a 720p
                                  # frame; a larger `tile` takes more (x4plus at 512: 3.2 GB)
