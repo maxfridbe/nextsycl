@@ -114,7 +114,8 @@ pub struct OcrOutput {
 pub struct UpscaleRequest {
     pub picture: Picture,
     /// the variant of the family (Real-ESRGAN: realesrgan-x4plus, realesrgan-x4plus-anime, realesr-animevideov3;
-    /// waifu2x: models-cunet, models-upconv_7_anime_style_art_rgb, models-upconv_7_photo; SeedVR2: seedvr2-3b, seedvr2-7b)
+    /// waifu2x: models-cunet, models-upconv_7_anime_style_art_rgb, models-upconv_7_photo; SeedVR2: seedvr2-3b, seedvr2-7b;
+    /// FlashVSR: flashvsr-v1.1)
     pub variant: Option<String>,
     /// the factor (Real-ESRGAN: 2, 3, 4 as the variant takes; waifu2x: 1, 2, 4 ... 32)
     pub scale: Option<u32>,
@@ -122,6 +123,11 @@ pub struct UpscaleRequest {
     pub noise: Option<i32>,
     /// the tile's side in input pixels (the picture goes through the model in tiles this big, overlapped)
     pub tile: Option<u32>,
+    /// the noise's seed (a diffusion upscaler's: FlashVSR's one step); None: the engine's default
+    pub seed: Option<u64>,
+    /// the engine's own options for this request, by name (an API request's `options`, or its top-level fields the
+    /// engine declares for requests: FlashVSR's sparse_ratio, local_range, color_fix), checked against those it declares
+    pub extra: Given,
 }
 
 /// What an upscale was made with
@@ -312,7 +318,7 @@ pub trait ImageEngine: Send + Sync {
     }
     /// a picture made bigger, reporting each tile done (`Step::at` of `of`)
     fn upscale(&self, _req: &UpscaleRequest, _progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<(Picture, UpscaleInfo)> {
-        Err(Error(format!("{} does not upscale (an upscaler: real-esrgan, waifu2x, seedvr2)", self.arch())))
+        Err(Error(format!("{} does not upscale (an upscaler: real-esrgan, waifu2x, seedvr2, flashvsr)", self.arch())))
     }
     /// whether it upscales a clip as a whole (`upscale_clip`: frames together, for steadiness over time) rather than a
     /// frame at a time (`upscale`)

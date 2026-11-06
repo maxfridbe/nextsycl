@@ -239,6 +239,15 @@ Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`).
 | `NS_SVR_VERIFY` | off | Debug: set: SeedVR2's DiT weights read back from the card after each upload and compared with the host's (a line with the bytes that differ) | image seedvr2 |
 | `NS_SVR_PROFILE` | off | Debug: set: each of SeedVR2's GPU steps timed alone (a wait before and after), summed by kind with the FLOPs and bytes its shapes imply; a table a chunk against the card's bfloat16 XMX peak (Xe cores x 2048 x clock) and 608 GB/s (slower; for finding where the time goes) | image seedvr2 |
 | `NS_SVR_SEED` | 666 | SeedVR2's noise seed (the reference's); chunk n draws from seed + n (--opt-seed) | image seedvr2 |
+| `NS_FVSR_*` | - | every NS_FVSR_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
+| `NS_FVSR_GPUS` | the server's card | FlashVSR's cards, by index ("0,1": the DiT's 30 blocks split over both, the cards pipelined; the LQ projection and the patches on the first) (--opt-gpus) | image flashvsr |
+| `NS_FVSR_SPLIT` | 30; 14,16 on two | FlashVSR's DiT blocks a card, in order (they sum to 30) (--opt-split) | image flashvsr |
+| `NS_FVSR_DECODER` | first | FlashVSR's card for the tiny decoder with two cards: first or last (--opt-decoder) | image flashvsr |
+| `NS_FVSR_TILE` | by size | 1: FlashVSR runs a clip in tiles of 1792 x 1024 of the upscaled frame (each its own stream over segments of 192 frames, the overlaps blended); 0: whole; by default whole when the stream fits the card(s), else tiles (x4) | image flashvsr |
+| `NS_FVSR_QTILE` | 129 | Debug: the silo's block-sparse attention kernel: 129 (a work-group a 128-query block, 32 keys a step), 128 (64 keys a step), 130 (64 features a step of q k^T), 131 (three pipeline stages), 64 (ARK's 64-query tile, a LUT row each 64 queries) or 256 (ARK's: two 128-query rows a work-group) | image flashvsr |
+| `NS_FVSR_WREORDER` | 0 | Debug: 1: FlashVSR's linear layers' weights in oneDNN's own layout (a reordered copy of each beside it: 2.4 GB more for the DiT) rather than read as they are |
+| `NS_FVSR_PIPELINE` | 1 | Debug: 0: FlashVSR's two cards take turns instead of overlapping (the second card's blocks of chunk k beside the first's decoder of k - 1 and blocks of k + 1) |
+| `NS_FVSR_PROFILE` | off | Debug: set: each of FlashVSR's GPU steps timed alone (a wait before and after), summed by kind with the FLOPs and bytes its shapes imply; a table at the end of a clip against the card's XMX peak and 608 GB/s (slower; for finding where the time goes) | image flashvsr |
 | `NS_QI_*` | - | every NS_QI_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_QI_DUMP` | off | Debug: a directory: what the denoiser is given (embeds, pads, cond latents, noise) written there as raw float32 files | image qwenimage21 |
 | `NS_QI_INT8` | 0 | 1: the DiT's block matrices in int8 ConvRot (~1.4x a step, half the VRAM) (--opt-int8) | image qwenimage21 |

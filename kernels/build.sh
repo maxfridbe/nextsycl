@@ -113,6 +113,28 @@ else
        -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate \
        -o "$OUT/.libnextsycl-flash.so.new" && mv -f "$OUT/.libnextsycl-flash.so.new" "$OUT/libnextsycl-flash.so"
 fi
+# silos on sycl-tla (kernels/<kind>/<arch>/silo/tla/*.cpp -> dist/silo/libnextsycl-<arch>.so: FlashVSR's attention on ARK's
+# kernels): built as flash is - sycl-tla's flags, compiled ahead - on their own (they call nothing of the shared part);
+# skipped without the headers, or when the library is newer than every source
+for d in $(ls -d */*/silo/tla 2>/dev/null); do
+  arch=$(basename "$(dirname "$(dirname "$d")")")
+  lib="$OUT/silo/libnextsycl-$arch.so"
+  if [ ! -f "$ARK/wrapper/include/sycl_tla_sdpa_sparse.hpp" ]; then
+    echo "==> silo/libnextsycl-$arch.so: skipped (no sycl-tla / ARK headers in this image)"; continue
+  fi
+  if [ -f "$lib" ] && [ -z "$(find "$d" "$(dirname "$d")" -maxdepth 1 -newer "$lib" \( -name '*.cpp' -o -name '*.h' \) 2>/dev/null)" ]; then
+    echo "==> silo/libnextsycl-$arch.so: up to date"; continue
+  fi
+  echo "==> silo/libnextsycl-$arch.so (sycl-tla, compiled ahead for ${AOT:-bmg-g31}; a few minutes)"
+  icpx -O3 -fsycl -fPIC -shared -std=c++17 -fno-sycl-instrument-device-code -w \
+       -DARK_XPU=1 -DARK_SYCL_TLA=1 -DCUTLASS_ENABLE_SYCL=1 -DSYCL_INTEL_TARGET=1 \
+       -isystem "$TLA/include" -isystem "$TLA/applications" -isystem "$TLA/tools/util/include" \
+       -isystem "$TLA/examples/common" -isystem "$TLA/examples/06_bmg_flash_attention" \
+       -I"$ARK/wrapper/include" -I"$ARK/bestla" "$d"/*.cpp \
+       -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen "-device ${AOT:-bmg-g31}" -Xspirv-translator \
+       -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate \
+       -o "$OUT/silo/.libnextsycl-$arch.so.new" && mv -f "$OUT/silo/.libnextsycl-$arch.so.new" "$lib"
+done
 # oneDNN beside the image, video, audio and 3D libraries (they find it there: rpath $ORIGIN)
 cp -L "$DNNL/lib/libdnnl.so.3" "$OUT/.libdnnl.so.3.new" && mv -f "$OUT/.libdnnl.so.3.new" "$OUT/libdnnl.so.3"
 # the name before the split (libnextsycl.so = the llm library), for runners and services that still name it

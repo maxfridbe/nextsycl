@@ -643,7 +643,26 @@ impl ImageServer {
             scale: int("scale")?.map(|v| v.clamp(1, 32) as u32),
             noise: int("noise")?.map(|v| v as i32),
             tile: int("tile")?.map(|v| v.clamp(32, 4096) as u32),
+            seed: int("seed")?.map(|v| v.max(0) as u64),
+            extra: Default::default(),
         })
+    }
+
+    /// An upscale's engine options: its "options" object, and the top-level fields named as options the engine takes per
+    /// request (FlashVSR's sparse_ratio, local_range, color_fix: the keys the platform sends), checked against them
+    fn upscale_extra(b: &Value, engine: &dyn nextsycl_image::ImageEngine, model: &str) -> Result<nextsycl_core::options::Given, (u16, String)> {
+        let text = |v: &Value| v.as_str().map_or_else(|| v.to_string(), str::to_string);
+        let mut given: nextsycl_core::options::Given = b["options"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), text(v))).collect();
+        for o in engine.options().iter().filter(|o| o.at != nextsycl_core::At::Load) {
+            if let Some(v) = b.get(o.name).filter(|v| !v.is_null()) {
+                given.entry(o.name.to_string()).or_insert_with(|| text(v));
+            }
+        }
+        if given.is_empty() {
+            return Ok(given);
+        }
+        nextsycl_core::options::resolve(&given, engine.options(), nextsycl_core::At::Request, model).map_err(|m| (400u16, m))?;
+        Ok(nextsycl_core::options::by_name(&given, engine.options()))
     }
 
     /// The engine for an upscale, one request at a time (as a generation)
@@ -656,7 +675,7 @@ impl ImageServer {
         self.waiting.fetch_sub(1, Ordering::Relaxed);
         match g.as_ref() {
             None => Err((503, "the engine is not loaded".into())),
-            Some((e, _)) if e.upscale_variants().is_empty() => Err((400, format!("{} makes pictures; it does not upscale them (real-esrgan, waifu2x, seedvr2 do)", self.model))),
+            Some((e, _)) if e.upscale_variants().is_empty() => Err((400, format!("{} makes pictures; it does not upscale them (real-esrgan, waifu2x, seedvr2, flashvsr do)", self.model))),
             _ => Ok(g),
         }
     }
@@ -676,6 +695,8 @@ impl ImageServer {
             return Err((499, "cancelled".into()));
         };
         let (engine, _) = g.as_ref().expect("checked");
+        let mut req = req;
+        req.extra = Self::upscale_extra(b, engine.as_ref(), &self.model)?;
         let j0 = self.tele.joules();
         let p = &self.progress;
         let what = format!("upscale {}x{}", req.picture.width, req.picture.height);
@@ -759,6 +780,11 @@ impl ImageServer {
             return Err((499, "cancelled".into()));
         };
         let (engine, _) = g.as_ref().expect("checked");
+        let mut req0 = req0;
+        if let Err(e) = Self::upscale_extra(b, engine.as_ref(), &self.model).map(|x| req0.extra = x) {
+            cleanup(&src.0, src.1);
+            return Err(e);
+        }
         let t0 = Instant::now();
         let j0 = self.tele.joules();
         let name = format!("{stamp}-{}-upscaled.mp4", self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"));

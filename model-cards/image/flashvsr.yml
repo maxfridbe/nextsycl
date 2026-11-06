@@ -1,0 +1,46 @@
+# FlashVSR v1.1 (OpenImagingLab): one-step diffusion video super-resolution, a clip as one stream (image/flashvsr). The
+# code (github.com/OpenImagingLab/FlashVSR @ 0d403ee3: LICENSE Apache-2.0) and the weights (huggingface.co/
+# JunhaoZhuang/FlashVSR-v1.1 @ 2aa7e1f3: `license: apache-2.0`) are Apache-2.0, without a non-commercial clause; the base
+# model, Wan 2.1 T2V-1.3B, is Apache-2.0 too. The files: the DiT (float32 safetensors, made half at load), the LQ
+# projection and the tiny conditional decoder (PyTorch checkpoints, read without unpickling code), and the official
+# repository's fixed prompt embedding (examples/WanVSR/prompt_tensor/posi_prompt.pth). The silo's attention kernels are
+# Intel's ARK (auto-round, MIT / Apache-2.0) on sycl-tla.
+# An image-kind card: the image server serves image.upscale and video.upscale (the video kind is MiniMax H3's daemon)
+id: flashvsr
+kind: image
+arch: flashvsr
+license: apache-2.0
+commercial: true
+license_note: 'Apache-2.0 for the weights (JunhaoZhuang/FlashVSR-v1.1) and the code (OpenImagingLab/FlashVSR); the base model, Wan 2.1 T2V-1.3B, is Apache-2.0 too'
+title: 'FlashVSR v1.1 video upscaler (one-step diffusion, the whole clip as one stream, 2x-4x; real footage and faces)'
+about: 'OpenImagingLab''s FlashVSR v1.1: Wan 2.1 T2V-1.3B distilled to one step, streaming 8 frames a step with a KV cache of the last three latent pairs and locality-constrained block-sparse attention, a causal LQ projection in and a tiny conditional decoder out. Temporally steady, natural detail on real footage; a film runs as one stream (no seams, no length limit). The DiT 2.8 GB in half; one card holds the whole stream at 1728 x 960 and 2560 x 1408 out (x2 of the platform''s 864 x 480 and 1280 x 704); x4 runs in 2 x 2 tiles of 1792 x 1024. Request keys: scale 2-4, seed, and the options sparse_ratio (1.5), local_range (11), color_fix (1). Two cards: env NS_FVSR_GPUS 0,1 (the DiT''s blocks split, pipelined)'
+gpus: '0'
+vram_gib: 22.0                  # one card at 1728 x 960 out (1792 x 1024 inside): see docs/ports/flashvsr.md for the measured peaks
+defaults: {}
+env: {}
+files:
+  dit:
+    key: flashvsr-v11-dit
+    url: https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1/resolve/2aa7e1f3ab50e743537d1eca243fb0bff442b336/diffusion_pytorch_model_streaming_dmd.safetensors
+    size: 5676070392
+    sha256: bd28180edcf3446c028e32fc6b731a80bf7e4da2ab4caac3186b9499964d37be
+    path: flashvsr/diffusion_pytorch_model_streaming_dmd.safetensors
+  lq-proj:
+    key: flashvsr-v11-lq-proj
+    url: https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1/resolve/2aa7e1f3ab50e743537d1eca243fb0bff442b336/LQ_proj_in.ckpt
+    size: 575694948
+    sha256: d6d011cdaaba6a52645086caa08fa04124e746f6ca568140a24007591142bfd2
+    path: flashvsr/LQ_proj_in.ckpt
+  decoder:
+    key: flashvsr-v11-tcdecoder
+    url: https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1/resolve/2aa7e1f3ab50e743537d1eca243fb0bff442b336/TCDecoder.ckpt
+    size: 189018333
+    sha256: e224bdcf2f52745cbf4d393ff5374c2ba09e90285d5d19062d2bf63b915b6161
+    path: flashvsr/TCDecoder.ckpt
+  prompt:
+    key: flashvsr-posi-prompt
+    url: https://github.com/OpenImagingLab/FlashVSR/raw/0d403ee351905cb1d5eb802855cc4c1f0f4cf929/examples/WanVSR/prompt_tensor/posi_prompt.pth
+    size: 4195504
+    sha256: 4601107a11e4e11a936a6b79df579e54dbc99872132bf542151f0ffd65b4b1ef
+    path: flashvsr/posi_prompt.pth
+guide: guides/upscale.md
