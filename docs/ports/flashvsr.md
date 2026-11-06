@@ -110,15 +110,19 @@ on its RTX 5070 + 3060, 1.16 at x4.
 | 1 | the attention a work-group a 128-query block, 32 keys a step (7.05 -> 4.62 s of 65 frames' attention); K and V one product straight into the ring (rows of 3,072); the RoPE as two small tables (not 22 MB a chunk made on the host); the decoder's full-size end in bands of 256 rows | 0.158 | 0.116; 15 / 15: 0.110 | out of memory (oneDNN's reordered copy of each weight, a copy a layout) | 0.227 |
 | 2 | the linear layers' weights read as they are (no reordered copies: 2.4 GiB less, and the products 2.88 -> 2.71 s); the two cards' split tried | 0.157 | 14 / 16: 0.107 (both 86-87 % busy); 16 / 14: 0.113 | 0.310 (whole, 30.3 of 31.9 GiB) | |
 | 3 | frames and bytes through pinned memory by the queue's copies (one wait a chunk, not a copy and a wait a frame); 14 / 16 the default; 2560 x 1408's buffers trimmed (the head's rows in the LQ tokens' buffer, TGrow 21 a frame at a time, the MLP 8,192 rows at a time) | 0.155 | 0.107 | 0.309 (29.9 GiB) | 0.214 |
+| 4 | the sparse attention's prefetch: each 32-key step of a 128-key block prefetched the whole next block (4 x its 32 KB a block); now one step's tile of it (ARK's mainloop copied into the silo, `silo/tla/ark/`). The clip's buffers let go when it ends (below) | 0.140 (95 % busy) | 0.099 (86 / 80 %) | | |
+
+Step 4's attention: 4.65 -> 3.54 s of 65 frames' (58.5 -> 76.8 TFLOPS, 31.9 -> 41.9 % of the peak; 42.3 -> 35.5 % of
+the time); the check unchanged (decoded worst 8.9e-4, 61.49 dB).
 
 A detour: the pinned memory read and written by the kernels in place (over PCIe) made a frame 0.210 s - a kernel's
 small reads across the bus; the queue's copies (the copy engines) are what step 3 keeps.
 
-### Speed now (the final build: the whole 243-frame clip unless said)
+### Speed now (the final build: the whole 243-frame clip unless said; the rows below the first are step 3's)
 
 | size | one card (B70) | two cards (B70 + B65) |
 |---|---|---|
-| 864x480 -> 1728x960 (x2) | **0.156 s/frame** - B70 97 % busy, 1.2 CPU cores, 17.3 GiB | **0.107** - 86 / 87 % busy, 1.6 cores, 10.7 / 7.8 GiB |
+| 864x480 -> 1728x960 (x2) | **0.140 s/frame** (step 4; 0.156 at step 3) - B70 95 % busy, 17.3 GiB | **0.099** (0.107) - 86 / 80 % busy, 10.7 / 7.8 GiB |
 | 1280x704 -> 2560x1408 (x2) | **0.310**, whole - 97 %, 1.2 cores, 29.9 GiB (2.0 free) | **0.213** - 83 / 88 %, 1.6 cores, 18.2 / 13.5 GiB |
 | 864x480 -> 3456x1920 (x4: 2 x 2 tiles of 1792 x 1024) | **0.753** - 97 %, 1.0 core, 17.3 GiB | **0.547** - 81 / 83 %, 1.4 cores, 10.7 / 7.8 GiB |
 | 1280x704 -> 5120x2816 (x4: 3 x 3 tiles; 65 frames) | **1.542** - 98 %, 1.0 core, 17.3 GiB | **1.286** - 70 / 73 % (each tile's stream fills the pipeline anew), 1.3 cores, 10.7 / 7.8 GiB |
@@ -165,6 +169,10 @@ weights, 1.5 GiB margin and 1 GiB of runtime pass the card's memory with a plain
 empty card but not beside what holds it now with no_room (503, retryable) - before anything is allocated. A size
 that cannot fit whole runs in tiles instead (x4; `NS_FVSR_TILE=0` forbids them, which is how the 400 is shown).
 
+When a clip ends its buffers go (the KV ring, the decoder's past, the projection's state): the server's VRAM falls from
+17.7 to 3.9 GiB within half a second of the answer (fdinfo, 1728 x 960). Kept, an idle FlashVSR held its card from
+SeedVR2 on the same card (no_room in production); `NS_FVSR_KEEP=1` keeps them for the next clip.
+
 ### Checked through the server
 
 `video.upscale` with the platform's keys at the top level (`seed: 3, sparse_ratio: 2.0, local_range: 9,
@@ -174,9 +182,9 @@ options). The plain kernels (`NS_SILO=0`) give the reference's figures too (late
 
 ### Open
 
-- The attention kernel (above). nextcuda's FlashAttention-2 walk of the lists, or a kernel that keeps a key block for
-  neighbouring query blocks, are the candidates.
+- The attention kernel (above, 42 % of the peak since step 4). nextcuda's FlashAttention-2 walk of the lists, or a
+  kernel that keeps a key block for neighbouring query blocks, are the candidates.
 - The decoder's 128 -> 3 convolution on oneDNN is at 3 % of peak (1.4 % of the time): a direct kernel would do.
 - No clip of the platform is 1280 x 704: those rows are the 864 x 480 clip scaled up. x4 seams were not examined by eye.
-- The front door itself was not run here (production's): its routing (flashvsr-* variants, the model's capabilities)
-  is in glue/serve and unit-tested; the image server is what was exercised.
+- Through the production front door (:8000, 2026-11-06): x4 of 864 x 480 0.753 s/frame; a 1344 x 768 film clip
+  (`file`) at x2, 2688 x 1536, 0.526 s/frame, 19.2 GiB; no black frame in any.
