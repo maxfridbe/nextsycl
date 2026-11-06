@@ -44,6 +44,8 @@ image/                     IMAGES
   hunyuanimage21 nextsycl-image-hunyuanimage21  HunyuanImage 2.1: the 17B DiT (base or MeanFlow-distilled), Qwen2.5-VL and
                                  byT5 text encoders, the 32x VAE, APG guidance, stage checks
   unlimitedocr nextsycl-image-unlimitedocr  Unlimited-OCR: pages to Markdown (SAM-B + CLIP-L, a DeepSeek-V2 MoE decoder)
+  flashvsr   nextsycl-image-flashvsr  FlashVSR v1.1: streaming one-step video super-resolution (Wan 2.1 1.3B, block-sparse
+                                 attention over a KV ring, the LQ projection, the tiny conditional decoder), stage checks
   example    nextsycl-image-example  a template
 
 video/                     VIDEO
@@ -406,6 +408,19 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   same GGUFs (ns-ocr-dump with the prompt placing the image: every tower block cos >= 0.99996, the decoder >= 0.998 -
   llama.cpp's CPU products quantize activations to 8 bits - and 32 of 32 greedy tokens). B70: a page seen at ~600
   tok/s, written at ~55-58; test-ocr.py passes all three transcripts.
+- **flashvsr** (`image/flashvsr`) - OpenImagingLab's FlashVSR v1.1 (Apache-2.0), served as `video.upscale` and
+  `image.upscale` (`model-cards/image/flashvsr.yml`; docs/ports/flashvsr.md has the port, its checks and its speed): a
+  clip as one stream, 8 frames a step - the LQ projection (causal 3-D convolutions as 2-D ones over their taps), Wan 2.1
+  T2V-1.3B once at t = 1000 (30 blocks of 1536; the tokens in window order throughout; block-sparse self-attention of
+  128 x 128 blocks chosen per head from block means, over a ring of four latent-pair slots a layer: three cached, the
+  chunk's own), the tiny conditional decoder (its full-size end a band of rows at a time), the AdaIN colour fix. Half
+  with float32 accumulation and a float32 residual stream (nextcuda's numerics); the products and convolutions are
+  oneDNN's with their epilogues fused (`kernels/image/flashvsr/dnn.cpp`), the attention the silo's - Intel's ARK sparse
+  and dense SDPA on sycl-tla (`kernels/image/flashvsr/silo/tla`, built by kernels/build.sh's silo/tla stanza), a
+  128-query tile of its own. One card by default; `NS_FVSR_GPUS=0,1` splits the blocks 14 / 16 and pipelines the cards;
+  a size whose stream does not fit runs in 1792 x 1024 tiles over segments of 192 frames (x4). Checked against
+  reference/flashvsr/ref.py (the official pipeline on the CPU in float32): the latents 1.2e-3 relative, the decoded
+  frames 9e-4, the bytes 61.5 dB. B70: 0.157 s a frame at 2x of 864 x 480, B70 + B65 0.107.
 
 ## The audio engines
 

@@ -68,21 +68,48 @@ The checkpoints are read by `nextsycl_gguf::pth` (the pickle's tensors only, no 
 
 ### Checked (exact before fast)
 
-`reference/flashvsr/ref.py` (nextcuda's, a thread limit added) runs the official pipeline on the CPU in float32 (block
-_sparse_attn stood in for by its exact equivalent: per head, softmax over the selected blocks' keys, a row with none 0)
-and dumps each stage; `nextsycl image check DIR --model flashvsr` feeds the engine the reference's prepared frames and
-noise and compares as it goes. The input: 33 frames of an H3 film (h3_20261105_134939), 512 x 384 -> 1024 x 768
-(nextcuda's size), sparse_ratio 2.0, local_range 11 (the reference's run; 12 minutes on 16 threads of the 9950X).
+`reference/flashvsr/ref.py` (nextcuda's, a thread limit added) runs the official pipeline on the CPU in float32
+(block_sparse_attn stood in for by its exact equivalent: per head, softmax over the selected blocks' keys, a row with
+none 0) and dumps each stage; `nextsycl image check DIR --model flashvsr` feeds the engine the reference's prepared
+frames and noise and compares as it goes (relative L2 error and cosine, the residual stream in the reference's token
+order). The input: 33 frames of an H3 film (h3_20261105_134939, scaled to 512 x 384), x2 -> 1024 x 768 (nextcuda's
+size; its frames are not published, so a clip of ours), sparse_ratio 2.0, local_range 11 - the reference's run took 12
+minutes on 16 threads of the 9950X. The dumps and our frames stay on hardac1 (/var/mnt/2TBSSD/nsref/flashvsr/d33).
 
-(results below)
+| stage | chunk 0 (6 latent frames): rel / cos | chunk 1 (2): rel / cos |
+|---|---|---|
+| LQ projection (block 0's residual) | 2.16e-4 / 1.000000 | 2.28e-4 / 1.000000 |
+| after block 0 | 1.51e-4 / 1.000000 | 1.52e-4 / 1.000000 |
+| after block 15 | 1.35e-3 / 0.999999 | 1.26e-3 / 0.999999 |
+| after block 29 | 8.25e-4 / 1.000000 | 8.74e-4 / 1.000000 |
+| latents (noise - the DiT's output) | 1.19e-3 / 0.999999 | 1.18e-3 / 0.999999 |
+| decoded frames (37, before the colour fix) | worst 8.9e-4 (max 1.5e-2) | |
+| the bytes (after the colour fix) | PSNR 61.5 dB mean, 61.2 dB worst, against the reference's | |
+
+nextcuda's figures on its own clip: the LQ projection 3.8e-4, block 0 2e-4, block 15 2.3e-3, block 29 1.9e-3, the
+latents 1.8e-3, the decoded frames 9e-4, 64.1 dB. Ours are as close or closer at every stage; the bytes' PSNR is
+content-dependent (it counts the pixels a rounding moves across a byte boundary) and comes from the same check code.
+
+Half precision (nextcuda's choice, with float32 accumulation and a float32 residual stream) holds: no non-finite value
+at any stage (SeedVR2's fp16 attention overflowed; here q and k are RMS-normed before the attention and the residual
+stream stays float32). The first port (ARK's 64-query tile) and every tile since (128 queries with 64 or 32 keys a
+step, 256) give the same figures to the digits shown (the summation order moves the latents' error between 1.13e-3
+and 1.19e-3); the decoder in bands gives the same frames as whole.
 
 ### Speed: the optimisation log
 
 Each figure is a whole `video.upscale` request through the image server (ffmpeg decode and x264 encode included) of
 the 243-frame H3 clip h3_20261105_134939 (864 x 480; the 1280 x 704 rows are the same clip scaled up with Lanczos -
 none of the platform's clips is that size), seconds / frames, sparse_ratio 1.5, local_range 11. One card is the B70
-(gpu 0); two are the B70 + B65 (`NS_FVSR_GPUS=0,1`, blocks 17 / 13, the decoder on the B70).
+(gpu 0); two are the B70 + B65 (`NS_FVSR_GPUS=0,1`, the decoder on the B70). s/frame; nextcuda: 0.225 at 864x480 x2
+on its RTX 5070 + 3060, 1.16 at x4.
 
-| # | change | 864x480 x2, one card | two cards | 1280x704 x2, one card | two cards | 864x480 x4, one card |
-|---|---|---|---|---|---|---|
-| 0 | the first working port | 0.192 | 0.139 | 0.539 (did not fit whole: 2 x 2 tiles) | 0.288 | 0.824 (97 frames, 2 x 2 tiles) |
+| # | change | 864x480 x2, one card | two cards | 1280x704 x2, one card | two cards |
+|---|---|---|---|---|---|
+| 0 | the first working port (ARK's 64-query sparse tile; 17 / 13 blocks) | 0.192 | 0.139 | 0.539 (did not fit whole: 2 x 2 tiles) | 0.288 |
+| 1 | the attention a work-group a 128-query block, 32 keys a step (7.05 -> 4.62 s of 65 frames' attention); K and V one product straight into the ring (rows of 3,072); the RoPE as two small tables (not 22 MB a chunk made on the host); the decoder's full-size end in bands of 256 rows | 0.158 | 0.116; 15 / 15: 0.110 | out of memory (oneDNN's reordered copy of each weight, a copy a layout) | 0.227 |
+| 2 | the linear layers' weights read as they are (no reordered copies: 2.4 GiB less, and the products 2.88 -> 2.71 s); the two cards' split tried | 0.157 | 14 / 16: 0.107 (both 86-87 % busy); 16 / 14: 0.113 | 0.310 (whole, 30.3 of 31.9 GiB) | |
+| 3 | frames and bytes through pinned memory by the queue's copies (one wait a chunk, not a copy and a wait a frame); 14 / 16 the default; 2560 x 1408's buffers trimmed (the head's rows in the LQ tokens' buffer, TGrow 21 a frame at a time, the MLP 8,192 rows at a time) | 0.155 | 0.107 | 0.309 (29.9 GiB) | 0.214 |
+
+A detour: the pinned memory read and written by the kernels in place (over PCIe) made a frame 0.210 s - a kernel's
+small reads across the bus; the queue's copies (the copy engines) are what step 3 keeps.

@@ -265,13 +265,17 @@ impl Back<'_> {
 }
 
 /// The decoder and the colour fix on their card: a chunk's latents to frames, bytes, out. The condition frames go up
-/// and the bytes come back through pinned host memory the kernels read and write in place, so a chunk waits for its
-/// card once, at its end (not a copy and a wait a frame)
+/// and the bytes come back through pinned host memory, copied by the queue in its order (the copy engines' full rate;
+/// kernels reading the pinned memory in place over PCIe made a frame 30 % slower), so a chunk waits for its card once,
+/// at its end - not a copy and a wait a frame
 struct Dec<'a> {
     tcd: &'a mut Tcd,
     /// the condition frames' bytes, up to 24 [th, tw, 3]; the made frames' bytes, up to 24 [sh, sw, 3]
     pin_cond: HostBuf,
     pin_out: HostBuf,
+    /// their copies on the card
+    cond_u8: &'a DevBuf,
+    out_u8: &'a DevBuf,
     cond: &'a DevBuf,
     scratch: &'a DevBuf,
     ms: &'a DevBuf,
@@ -293,17 +297,16 @@ impl Dec<'_> {
         let nc = bytes.len() / fsize;
         // (the card is done with these pinned bytes: the last chunk ended with a wait for it)
         self.pin_cond.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        let cond_u8 = self.pin_cond.device_view(0, bytes.len())?;
+        self.cond_u8.copy_within(0, &self.pin_cond.device_view(0, bytes.len())?, 0, bytes.len())?;
         // SAFETY (the calls below): the buffers hold what they read and write (sized by the run).
-        ck(unsafe { (k.u8_to_half)(gd, cond_u8.ptr() as *const u8, (nc * fsize) as i64, self.cond.ptr()) }, "cond")?;
+        ck(unsafe { (k.u8_to_half)(gd, self.cond_u8.ptr() as *const u8, (nc * fsize) as i64, self.cond.ptr()) }, "cond")?;
         let pre = if pc == 0 { 0 } else { 8 * pc + 13 };
         let front = if pc == 0 { 3 } else { 0 };
         let real = |i: usize| ended.is_none_or(|n| i < n);
         let mut idx = pre;
         let fb = geo.sw * geo.sh * 3;
         let mut made = 0usize;
-        let (cond, scratch, ms, gpu, color_fix) = (self.cond, self.scratch, self.ms, self.gpu.clone(), self.color_fix);
-        let pin_out = &self.pin_out;
+        let (cond, scratch, ms, gpu, color_fix, out_all) = (self.cond, self.scratch, self.ms, self.gpu.clone(), self.color_fix, self.out_u8);
         for t in 0..f {
             let cp = unsafe { (cond.ptr() as *mut u8).add(4 * t * fsize * 2) };
             self.tcd.frame(lat, f, t, cp as *const _, &mut |dec| {
@@ -314,7 +317,7 @@ impl Dec<'_> {
                 }
                 hooks.decoded(i, dec)?;
                 let lqf = unsafe { (cond.ptr() as *mut u8).add((i - pre + front) * fsize * 2) };
-                let out_u8 = pin_out.device_view(made * fb, fb)?;
+                let out_u8 = out_all.view(made * fb, fb)?;
                 made += 1;
                 prof::timed(&gpu, "colour fix + bytes", 0.0, (geo.sw * geo.sh * 3 * 4) as f64, || {
                     let msp = if color_fix {
@@ -330,7 +333,10 @@ impl Dec<'_> {
                 Ok(())
             })?;
         }
-        // the chunk's one wait: its frames' bytes are in pinned memory then
+        // the chunk's one wait: its frames' bytes copied down to pinned memory
+        if made > 0 {
+            self.pin_out.device_view(0, made * fb)?.copy_within(0, self.out_u8, 0, made * fb)?;
+        }
         self.gpu.sync()?;
         for j in 0..made {
             let mut pic = Picture::new(geo.sw as u32, geo.sh as u32, 3);
@@ -561,6 +567,7 @@ impl FlashVsr {
         // chunk has at most 7 calls, and every chunk's end waits for the card: a slot is free when it comes round again)
         let mut pin_lq = HostBuf::new(&first_gpu, 8 * 4 * fsize)?;
         let mut lq_slot = 0usize;
+        let frames_u8 = DevBuf::new(&first_gpu, 4 * fsize)?;
         let frames_h = DevBuf::new(&first_gpu, 4 * fsize * 2)?;
         let lqtok = DevBuf::new(&first_gpu, 6 * hp * wp * DIM * 4)?;
         let rows0 = 3 * nb * 128;
@@ -602,7 +609,10 @@ impl FlashVsr {
         let back = Back { ends: &self.ends, stages: rest, xs: xs_b, css: css_b, x0, noise: &noise_l, hbuf: &hbuf, pred: &pred, lat: &lat, last: last_gpu.clone(),
                               first: first_gpu.clone(), sync_end: pipelined || !Arc::ptr_eq(&dec_gpu, &last_gpu), seed: set.seed, lat_base: set.lat_base, h8, w8 };
         // the decoder: chunk pc's latents (in lat_d) with its frames as the condition, its frames out
-        let mut dec = Dec { tcd, pin_cond: HostBuf::new(&dec_gpu, 24 * fsize)?, pin_out: HostBuf::new(&dec_gpu, 24 * geo.sw * geo.sh * 3)?, cond: &cond,
+        let cond_u8 = DevBuf::new(&dec_gpu, 24 * fsize)?;
+        let out_u8 = DevBuf::new(&dec_gpu, 24 * geo.sw * geo.sh * 3)?;
+        let mut dec = Dec { tcd, pin_cond: HostBuf::new(&dec_gpu, 24 * fsize)?, pin_out: HostBuf::new(&dec_gpu, 24 * geo.sw * geo.sh * 3)?, cond_u8: &cond_u8,
+                            out_u8: &out_u8, cond: &cond,
                             scratch: &scratch, ms: &ms, gpu: dec_gpu.clone(), geo, color_fix: set.color_fix };
         let mut made = 0usize;
         let mut low = vec![u64::MAX; self.gpus.len()];
@@ -683,7 +693,7 @@ impl FlashVsr {
                         let at = (lq_slot % 8) * 4 * fsize;
                         lq_slot += 1;
                         pin_lq.as_mut_slice()[at..at + bytes.len()].copy_from_slice(&bytes);
-                        let frames_u8 = pin_lq.device_view(at, bytes.len())?;
+                        frames_u8.copy_within(0, &pin_lq.device_view(at, bytes.len())?, 0, bytes.len())?;
                         ck(unsafe { (k.u8_to_half)(gf, frames_u8.ptr() as *const u8, (n * fsize) as i64, frames_h.ptr()) }, "frames")?;
                         let out = lqtok.view(got * hp * wp * DIM * 4, hp * wp * DIM * 4)?;
                         if lq.stream(&frames_h, n, &out)? {
@@ -816,19 +826,18 @@ pub fn blend_tile(dst: &mut [u8], tw: usize, p: &[u8], tile_w: usize, tile_h: us
         let ay = if r < ovy { (r as f32 + 0.5) / ovy as f32 } else { 1.0 };
         let o = ((y0 + r) * tw + x0) * 3;
         let q = r * tile_w * 3;
-        for c in 0..tile_w {
+        // the columns blended: the left overlap, or the whole row inside the top one; the rest copied as they are
+        let mixed = if ay < 1.0 { tile_w } else { ovx.min(tile_w) };
+        for c in 0..mixed {
             let ax = if c < ovx { (c as f32 + 0.5) / ovx as f32 } else { 1.0 };
             let wgt = ax.min(ay);
             for ch in 0..3 {
                 let i = o + c * 3 + ch;
-                if wgt >= 1.0 {
-                    dst[i] = p[q + c * 3 + ch];
-                } else {
-                    let (d, v) = (dst[i] as f32, p[q + c * 3 + ch] as f32);
-                    dst[i] = (d + (v - d) * wgt).round() as u8;
-                }
+                let (d, v) = (dst[i] as f32, p[q + c * 3 + ch] as f32);
+                dst[i] = (d + (v - d) * wgt).round() as u8;
             }
         }
+        dst[o + mixed * 3..o + tile_w * 3].copy_from_slice(&p[q + mixed * 3..q + tile_w * 3]);
     }
 }
 

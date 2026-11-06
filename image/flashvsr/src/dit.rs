@@ -437,7 +437,7 @@ impl Stage {
         // with 32: 4.6)
         let (qrow, qtile) = match std::env::var("NS_FVSR_QTILE").ok().and_then(|v| v.trim().parse::<i64>().ok()) {
             Some(64) => (64usize, 64i64),
-            Some(t @ (128..=131 | 256)) => (128, t),
+            Some(t @ (128..=133 | 256)) => (128, t),
             _ => (128, 129),
         };
         let rep = 128 / qrow;

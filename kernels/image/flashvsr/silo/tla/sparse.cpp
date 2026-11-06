@@ -49,15 +49,15 @@ namespace {
 // loads serves all its 128 queries (ARK ships tiles of 64, which load each key block twice, and 256, which walks the
 // union of two rows' lists with half its sub-groups idle on a block only one row chose). ARK's 64-row configuration
 // with twice the sub-groups (8 of 16 rows); KT: the keys a step.
-// (KT: keys a step; DT: the features of q k^T a step; ST: the pipeline's stages)
-template <int KT, int DT = 32, int ST = 2>
+// (KT: keys a step; DT: the features of q k^T a step; ST: the pipeline's stages; SG: sub-groups, 128 / SG query rows each)
+template <int KT, int DT = 32, int ST = 2, int SG = 8>
 int launch_q128(const ark::sparse_detail::Options& o) {
     using namespace cute;
     using half = cute::half_t;
     using ShapeQK = Shape<_128, Int<KT>, Int<DT>>;
     using ShapePV = Shape<_128, _32, Int<KT>>;
     using ShapeOut = Shape<_128, _128>;
-    using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
+    using SubgroupLayoutQK = Layout<Shape<Int<SG>, _1, _1>>;
     return ark::sparse_detail::SparseSDPAConfig<false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK, void, ST, false, half, half, half, half>::template run<false>(o);
 }
 }  // namespace
@@ -78,8 +78,8 @@ int ns_image_flashvsr_silo_sparse(void* queue, const void* q, const void* k, con
                                   int64_t kv_rs, const int32_t* lut, const int32_t* counts, int64_t qrow, int64_t q_tile) try {
     if (Sq <= 0 || Skv <= 0 || H <= 0) return fail("silo sparse: an empty problem");
     if (Sq % qrow || Skv % 128) return fail("silo sparse: rows in whole blocks (queries of " + std::to_string(qrow) + ", keys of 128)");
-    if (!((q_tile == 64 && qrow == 64) || (q_tile == 256 && qrow == 128) || (q_tile >= 128 && q_tile <= 131 && qrow == 128)))
-        return fail("silo sparse: q_tile 64 with LUT rows of 64, or 128 - 131 / 256 with 128");
+    if (!((q_tile == 64 && qrow == 64) || (q_tile == 256 && qrow == 128) || (q_tile >= 128 && q_tile <= 133 && qrow == 128)))
+        return fail("silo sparse: q_tile 64 with LUT rows of 64, or 128 - 133 / 256 with 128");
     const int64_t ld = H * 128;
     if (kv_rs < ld) return fail("silo sparse: key rows shorter than their heads");
     if (Sq * ld > INT32_MAX || Skv * kv_rs > INT32_MAX) return fail("silo sparse: sizes out of range");
@@ -114,6 +114,8 @@ int ns_image_flashvsr_silo_sparse(void* queue, const void* q, const void* k, con
                  : q_tile == 129 ? launch_q128<32>(o)
                  : q_tile == 130 ? launch_q128<32, 64>(o)
                  : q_tile == 131 ? launch_q128<32, 32, 3>(o)
+                 : q_tile == 132 ? launch_q128<32, 32, 2, 16>(o)
+                 : q_tile == 133 ? launch_q128<16, 32, 2, 8>(o)
                                  : ark::sparse_detail::launch_sparse_sdpa_prefill_kernel_128<false, false, half, half, half>(o);
     if (rc != 0) return fail("silo sparse: the kernel refused the problem");
     return 0;
