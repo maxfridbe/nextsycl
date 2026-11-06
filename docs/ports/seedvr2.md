@@ -185,6 +185,10 @@ GDDR6 at 19 Gbps). PCIe: pinned host -> card 28.0 GB/s measured (`nextsycl gpus`
 
 Per chunk (wall, unprofiled): encode 9.6 s, DiT 5.2 s (its weights up included), decode 19.2 s.
 
+On the B65 (98.3 TFLOPS: 2026-11-06, step 8, a 33-frame chunk) the 3x3x3 convolutions reach 84-91 % of its peak (83-89
+TFLOPS), group norm 383 GB/s, the VAE's mid attention 0.87 s (30 %). Tried: that attention as the silo's fused graph
+(oneDNN, q k v one product into packed rows; check unchanged) - 1.11 s, slower: not kept.
+
 Since this profile: the residual add's pass is gone into the convolutions (step 6), the 1x1x1 convolutions are one
 product a volume (step 6), and the waits at the frees (step 5) - the compute engine busy 96 % of a one-card run. Open:
 group norm (three passes, ~10 %), the VAE's mid attention, the convolutions themselves at 61-66 % of the peak.

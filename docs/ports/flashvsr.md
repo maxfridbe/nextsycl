@@ -116,8 +116,8 @@ Tried after step 4 (B70, 65 frames' attention, 3.58 s for the default 129): skip
 row's maximum moved in a sub-group (exact) - 3.58 s, no gain, taken out; 64 keys a step (128) 5.78 s. **Known bad: a
 P V tile 64 columns wide (`NS_FVSR_QTILE` 134, and 136 with 64 keys a step) hung the B70** - the compute engine at
 100 % for 8 minutes on the first chunk of 1728 x 960 (it takes 11 s for 65 frames), SIGTERM did not end it, the
-process was killed (2026-11-06 15:28). Both shapes are gone from the silo; 135 (4 sub-groups of 32 rows) is measured
-on the B65 below.
+process was killed (2026-11-06 15:28). Both shapes are gone from the silo. 4 sub-groups of 32 rows (135), on the B65:
+26.0 s against the default's 5.7 (0.555 s a frame against 0.247) - also dropped; the silo is step 4's.
 
 Step 4's attention: 4.65 -> 3.54 s of 65 frames' (58.5 -> 76.8 TFLOPS, 31.9 -> 41.9 % of the peak; 42.3 -> 35.5 % of
 the time); the check unchanged (decoded worst 8.9e-4, 61.49 dB).
