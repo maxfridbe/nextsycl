@@ -118,8 +118,8 @@ int ns_image_seedvr2_silo_supported(ns_gpu* g) {
     return g ? 1 : 0;
 }
 
-int ns_image_seedvr2_silo_conv_taps(ns_gpu* g, const void* const* frames, int64_t nframes, int64_t H, int64_t W, int64_t Ci, const void* w,
-                                    int64_t Co, int64_t kt, int64_t kh, int64_t kw, int64_t ph, int64_t pw, const float* bias, void* out) {
+static int conv_taps(ns_gpu* g, const void* const* frames, int64_t nframes, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co,
+                     int64_t kt, int64_t kh, int64_t kw, int64_t ph, int64_t pw, const float* bias, void* out, bool acc) {
     NS_TRY
     const int64_t To = nframes - kt + 1;
     if (To <= 0 || H <= 0 || W <= 0) return ns_fail("ns_image_seedvr2_silo_conv_taps: fewer frames than taps");
@@ -132,7 +132,7 @@ int ns_image_seedvr2_silo_conv_taps(ns_gpu* g, const void* const* frames, int64_
             int64_t n = 1;
             while (t + n < To && static_cast<const char*>(frames[t + j + n]) == static_cast<const char*>(frames[t + j + n - 1]) + fin) ++n;
             void* o = static_cast<char*>(out) + (size_t) t * fout;
-            const int rc = tap(g, d, frames[t + j], n, H, W, Ci, w, Co, kt, j, kh, kw, ph, pw, j == 0 ? bias : nullptr, j > 0, o);
+            const int rc = tap(g, d, frames[t + j], n, H, W, Ci, w, Co, kt, j, kh, kw, ph, pw, j == 0 ? bias : nullptr, j > 0 || acc, o);
             if (rc != 0) return rc;
             t += n;
         }
@@ -140,6 +140,16 @@ int ns_image_seedvr2_silo_conv_taps(ns_gpu* g, const void* const* frames, int64_
     return 0;
     } catch (const dnnl::error& e) { return ns_fail(std::string("oneDNN: ") + e.what());
     NS_CATCH
+}
+
+int ns_image_seedvr2_silo_conv_taps(ns_gpu* g, const void* const* frames, int64_t nframes, int64_t H, int64_t W, int64_t Ci, const void* w,
+                                    int64_t Co, int64_t kt, int64_t kh, int64_t kw, int64_t ph, int64_t pw, const float* bias, void* out) {
+    return conv_taps(g, frames, nframes, H, W, Ci, w, Co, kt, kh, kw, ph, pw, bias, out, false);
+}
+
+int ns_image_seedvr2_silo_conv_taps_acc(ns_gpu* g, const void* const* frames, int64_t nframes, int64_t H, int64_t W, int64_t Ci, const void* w,
+                                        int64_t Co, int64_t kt, int64_t kh, int64_t kw, int64_t ph, int64_t pw, const float* bias, void* out) {
+    return conv_taps(g, frames, nframes, H, W, Ci, w, Co, kt, kh, kw, ph, pw, bias, out, true);
 }
 
 }  // extern "C"

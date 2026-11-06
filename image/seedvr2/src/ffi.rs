@@ -87,6 +87,10 @@ pub const SILO: &str = "seedvr2";
 pub struct Silo {
     pub supported: unsafe extern "C" fn(G) -> c_int,
     pub conv_taps: unsafe extern "C" fn(G, *const P, i64, i64, i64, i64, P, i64, i64, i64, i64, i64, i64, *const f32, M) -> c_int,
+    /// the same, added to the output's values (a resnet's residual)
+    pub conv_taps_acc: unsafe extern "C" fn(G, *const P, i64, i64, i64, i64, P, i64, i64, i64, i64, i64, i64, *const f32, M) -> c_int,
+    /// the VAE's pointwise convolutions: one product over the pixels
+    pub linear: unsafe extern "C" fn(G, P, i64, i64, P, i64, *const f32, M) -> c_int,
     pub attention: unsafe extern "C" fn(G, P, P, P, i64, i64, i64, i64, i64, M) -> c_int,
 }
 
@@ -113,6 +117,7 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             }};
         }
         Ok(Some(Silo { supported: sym!("ns_image_seedvr2_silo_supported"), conv_taps: sym!("ns_image_seedvr2_silo_conv_taps"),
+                        conv_taps_acc: sym!("ns_image_seedvr2_silo_conv_taps_acc"), linear: sym!("ns_image_seedvr2_silo_linear"),
                         attention: sym!("ns_image_seedvr2_silo_attention") }))
     })
     .as_ref()

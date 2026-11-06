@@ -22,6 +22,13 @@ int ns_image_seedvr2_silo_supported(ns_gpu* g);
  * float32 [Co] or NULL; out [nframes - kt + 1, H, W, Co]. */
 int ns_image_seedvr2_silo_conv_taps(ns_gpu* g, const void* const* frames, int64_t nframes, int64_t H, int64_t W, int64_t Ci, const void* w,
                                     int64_t Co, int64_t kt, int64_t kh, int64_t kw, int64_t ph, int64_t pw, const float* bias, void* out);
+/* The same, added to what out holds (a resnet's residual: its sum fused into the convolution, no pass of its own) */
+int ns_image_seedvr2_silo_conv_taps_acc(ns_gpu* g, const void* const* frames, int64_t nframes, int64_t H, int64_t W, int64_t Ci, const void* w,
+                                        int64_t Co, int64_t kt, int64_t kh, int64_t kw, int64_t ph, int64_t pw, const float* bias, void* out);
+
+/* out [M, N] = x [M, K] . w^T + bias: bfloat16 in and out, w [N, K] read as it is, bias float32 [N] or NULL (the VAE's
+ * pointwise convolutions: one product over all the pixels) */
+int ns_image_seedvr2_silo_linear(ns_gpu* g, const void* x, int64_t M, int64_t K, const void* w, int64_t N, const float* bias, void* out);
 
 /* Attention of B windows of S rows each, bfloat16 throughout (scores float32): q, k, v rows `stride` apart (the
  * packed qkv: k at q + H D, v at q + 2 H D), window b's rows from row b S; out [B S, H D] bfloat16. */

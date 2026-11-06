@@ -48,8 +48,11 @@ pub struct Vol {
 }
 
 // A free does not wait for the queue (sycl::free): a large buffer let go while a queued kernel still reads it can be
-// unmapped under it. A volume let go is kept until its card's next wait (`settle`: the resnets and slices end with
-// one), then freed - a wait on every one drained the queue thousands of times a chunk (the B70 a quarter idle).
+// unmapped under it. A volume let go is kept until its card's next wait (`settle`: the slices end with one), then
+// freed - a wait on every one drained the queue thousands of times a chunk (the B70 a quarter idle). Meanwhile a new
+// volume of the same size takes a kept one: the queue is in order, so the kernels that still read it run before any
+// that writes it again - no wait, no allocation (a slice's volumes come in a few sizes, over and over). `relieve`
+// settles only when the kept ones pass NS_SVR_POOL_GIB (2), so the card waits a few times a slice, not at every resnet.
 static LATER: [Mutex<Vec<DevBuf>>; 8] = [const { Mutex::new(Vec::new()) }; 8];
 
 impl Drop for Vol {
@@ -68,9 +71,29 @@ pub fn settle(nsd: &Nsd) -> Result<()> {
     Ok(())
 }
 
+/// The volumes let go held past NS_SVR_POOL_GIB (default 2): settled (a wait, then freed); else nothing
+pub fn relieve(nsd: &Nsd) -> Result<()> {
+    let limit = std::env::var("NS_SVR_POOL_GIB").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(2.0);
+    let held: usize = LATER[nsd.gpu.index % 8].lock().unwrap().iter().map(|b| b.len).sum();
+    if held as f64 > limit * (1u64 << 30) as f64 {
+        settle(nsd)?;
+    }
+    Ok(())
+}
+
 impl Vol {
     pub fn new(gpu: &Arc<Gpu>, t: usize, h: usize, w: usize, c: usize) -> Result<Vol> {
-        Ok(Vol { buf: std::mem::ManuallyDrop::new(DevBuf::new(gpu, (t * h * w * c * 2).max(2))?), t, h, w, c })
+        let len = (t * h * w * c * 2).max(2);
+        // a let-go volume of the size (see LATER), else a new one
+        let kept = {
+            let mut l = LATER[gpu.index % 8].lock().unwrap();
+            l.iter().position(|b| b.len == len).map(|i| l.swap_remove(i))
+        };
+        let buf = match kept {
+            Some(b) => b,
+            None => DevBuf::new(gpu, len)?,
+        };
+        Ok(Vol { buf: std::mem::ManuallyDrop::new(buf), t, h, w, c })
     }
     fn frame_bytes(&self) -> usize {
         self.h * self.w * self.c * 2
@@ -292,6 +315,12 @@ impl Vae {
     /// One causal convolution of x (its kept frames, or the first frame repeated, in front). The silo's taps read the
     /// frames where they are; the engine's own path copies them into one volume first
     fn conv(&self, nsd: &Nsd, c: &Conv, x: Arc<Vol>) -> Result<Vol> {
+        self.conv_to(nsd, c, x, None)
+    }
+
+    /// The same, its result added to `onto` (a resnet's residual: the silo's taps sum onto it in the convolution; the
+    /// engine's own path adds after)
+    fn conv_to(&self, nsd: &Nsd, c: &Conv, x: Arc<Vol>, onto: Option<Vol>) -> Result<Vol> {
         let gpu = &self.gpu;
         let k = ffi::api()?;
         if x.c != c.ci {
@@ -301,8 +330,13 @@ impl Vae {
             // a pointwise convolution is a linear layer
             let out = Vol::new(gpu, x.t, x.h, x.w, c.co)?;
             let (m, kk, n) = (x.px() as f64, c.ci as f64, c.co as f64);
-            prof::timed(gpu, "vae conv 1x1x1 (linear)", 2.0 * m * kk * n, 2.0 * (m * kk + kk * n + m * n), || {
-                nsd.linear(x.buf.ptr(), Dt::BF16, x.px(), c.ci, c.w.ptr(), c.co, c.b.ptr(), out.buf.ptr(), Dt::BF16)
+            // SAFETY: the silo's entry point, on this GPU's context.
+            let silo = ffi::silo()?.filter(|sl| unsafe { (sl.supported)(gpu.raw()) } == 1);
+            prof::timed(gpu, "vae conv 1x1x1 (linear)", 2.0 * m * kk * n, 2.0 * (m * kk + kk * n + m * n), || match silo {
+                // SAFETY: x holds px x ci bfloat16, out px x co, the weight co x ci, the bias co floats.
+                Some(sl) => ffi::check(unsafe { (sl.linear)(gpu.raw(), x.buf.ptr(), x.px() as i64, c.ci as i64, c.w.ptr(), c.co as i64, c.b.fp(), out.buf.ptr()) },
+                                       "silo linear"),
+                None => nsd.linear(x.buf.ptr(), Dt::BF16, x.px(), c.ci, c.w.ptr(), c.co, c.b.ptr(), out.buf.ptr(), Dt::BF16),
             })?;
             return Ok(out);
         }
@@ -318,21 +352,28 @@ impl Vae {
         let to = (st - c.k[0]) / c.s[0] + 1;
         let ho = (x.h + c.pad[0] + c.pad[1] - c.k[1]) / c.s[1] + 1;
         let wo = (x.w + c.pad[2] + c.pad[3] - c.k[2]) / c.s[2] + 1;
-        let out = Vol::new(gpu, to, ho, wo, c.co)?;
+        let silo = ffi::silo()?.filter(|_| c.s == [1, 1, 1] && c.pad[0] == c.pad[1] && c.pad[2] == c.pad[3]);
+        // SAFETY: the silo's entry point, on this GPU's context.
+        let silo = silo.filter(|sl| unsafe { (sl.supported)(gpu.raw()) } == 1);
+        let onto = onto.filter(|o| (o.t, o.h, o.w, o.c) == (to, ho, wo, c.co));
+        let fused = onto.is_some() && silo.is_some();
+        let (out, rest) = match onto {
+            Some(o) if fused => (o, None),
+            o => (Vol::new(gpu, to, ho, wo, c.co)?, o),
+        };
         crate::note(gpu, &format!("a conv {}x{}x{} {} -> {}", st, x.h, x.w, c.ci, c.co));
         let taps = (c.k[0] * c.k[1] * c.k[2]) as f64;
         let flops = 2.0 * (to * ho * wo) as f64 * c.co as f64 * c.ci as f64 * taps;
         let what = format!("vae conv {}x{}x{} {}x{} {}->{}", c.k[0], c.k[1], c.k[2], x.w, x.h, c.ci, c.co);
-        let silo = ffi::silo()?.filter(|_| c.s == [1, 1, 1] && c.pad[0] == c.pad[1] && c.pad[2] == c.pad[3]);
-        // SAFETY: the silo's entry point, on this GPU's context.
-        if let Some(sl) = silo.filter(|sl| unsafe { (sl.supported)(gpu.raw()) } == 1) {
+        if let Some(sl) = silo {
+            let f = if fused { sl.conv_taps_acc } else { sl.conv_taps };
             let ptrs: Vec<*const c_void> = seq.iter().map(|(v, i)| v.buf.ptr().cast::<u8>().wrapping_add(i * fb).cast_const().cast()).collect();
             // each tap reads its frames once and writes (or adds to) the output
             let bytes = 2.0 * c.k[0] as f64 * ((to * x.h * x.w * c.ci) as f64 + 2.0 * (to * ho * wo * c.co) as f64);
             prof::timed(gpu, &format!("{what} (silo taps)"), flops, bytes, || {
                 // SAFETY: st frame pointers of h x w x ci bfloat16 each, out to x ho x wo x co, w the weight's [co, ci, k...].
                 ffi::check(unsafe {
-                    (sl.conv_taps)(gpu.raw(), ptrs.as_ptr(), st as i64, x.h as i64, x.w as i64, c.ci as i64, c.w.ptr(), c.co as i64, c.k[0] as i64,
+                    f(gpu.raw(), ptrs.as_ptr(), st as i64, x.h as i64, x.w as i64, c.ci as i64, c.w.ptr(), c.co as i64, c.k[0] as i64,
                                    c.k[1] as i64, c.k[2] as i64, c.pad[0] as i64, c.pad[2] as i64, c.b.fp(), out.buf.ptr())
                 }, "silo conv taps")
             })?;
@@ -356,6 +397,14 @@ impl Vae {
             })?;
         }
         *mem = seq.split_off(st - c.keep);
+        drop(mem);
+        if let Some(r) = rest {
+            // the residual not fused: added after
+            prof::timed(gpu, "vae residual add", 0.0, 6.0 * (out.px() * out.c) as f64, || {
+                // SAFETY: out and r hold the same number of bfloat16 values.
+                ffi::check(unsafe { (k.add)(gpu.raw(), out.buf.ptr(), r.buf.ptr(), (out.px() * out.c) as i64) }, "residual add")
+            })?;
+        }
         Ok(out)
     }
 
@@ -378,17 +427,14 @@ impl Vae {
         let a = self.norm(&x, &r.norm1, true)?;
         let a = self.conv(nsd, &r.conv1, Arc::new(a))?;
         let a = self.norm(&a, &r.norm2, true)?;
-        let out = self.conv(nsd, &r.conv2, Arc::new(a))?;
         let short = match &r.shortcut {
             Some(c) => self.conv(nsd, c, Arc::new(x))?,
             None => x,
         };
-        let k = ffi::api()?;
-        prof::timed(&self.gpu, "vae residual add", 0.0, 6.0 * (out.px() * out.c) as f64, || {
-            // SAFETY: out and short hold the same number of bfloat16 values.
-            ffi::check(unsafe { (k.add)(self.gpu.raw(), out.buf.ptr(), short.buf.ptr(), (out.px() * out.c) as i64) }, "residual add")
-        })?;
-        settle(nsd)?;
+        // the second convolution summed onto the residual (x is no other's: conv1 read its norm, the shortcut keeps
+        // nothing)
+        let out = self.conv_to(nsd, &r.conv2, Arc::new(a), Some(short))?;
+        relieve(nsd)?;
         Ok(out)
     }
 
@@ -434,6 +480,7 @@ impl Vae {
         }
         Ok(())
         })?;
+        // (a wait: q, k, v and the scores are plain buffers, freed as this returns)
         settle(nsd)?;
         Ok(x)
     }

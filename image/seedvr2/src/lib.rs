@@ -14,6 +14,11 @@
 //! neighbouring chunks overlapping by `overlap` frames, crossfaded over the whole overlap. The DiT's windows join a chunk's
 //! frames in time (four to eight latent frames a window), which is what keeps a chunk steady; the overlap carries it
 //! across the chunks' seams.
+//!
+//! A size whose chunk does not fit a card (the VAE's kept frames grow with the pixels: 1280 x 704 at 2x is twice the
+//! card) goes through in spatial tiles of the made frame - each tile the whole pipeline over its part of the resized
+//! frames, its noise the clip's own over its part (so the tiles agree where they overlap) - the overlaps blended
+//! linearly, as FlashVSR's x4 does.
 
 pub mod check;
 pub mod dit;
@@ -110,6 +115,19 @@ pub fn noise(seed: u64, n: usize) -> Vec<f32> {
     out
 }
 
+/// A tile's part of latent noise [t, h8, w8, c] (the tile's offsets and sides are multiples of 8)
+fn crop_noise(full: &[f32], t: usize, h8: usize, w8: usize, tile: Tile, c: usize) -> Vec<f32> {
+    let (y0, x0, h, w) = (tile.y0 / 8, tile.x0 / 8, tile.h / 8, tile.w / 8);
+    let mut out = Vec::with_capacity(t * h * w * c);
+    for f in 0..t {
+        for y in 0..h {
+            let at = ((f * h8 + y0 + y) * w8 + x0) * c;
+            out.extend_from_slice(&full[at..at + w * c]);
+        }
+    }
+    out
+}
+
 /// Python's round (halves to even)
 fn round_even(x: f64) -> i64 {
     let r = x.round();
@@ -133,13 +151,72 @@ pub fn chunk_gib(rw: usize, rh: usize) -> f64 {
 
 /// Kept free on a card beside a run (the box spills and hangs past its memory)
 const MARGIN_GIB: f64 = 1.5;
+/// What the engine itself holds on an empty card (the VAE, the runtime)
+const ENGINE_GIB: f64 = 1.5;
+/// The tiles' overlap, made-frame pixels (blended linearly across)
+const TILE_OVERLAP: usize = 128;
+
+/// A part of the made frame [x0, x0 + w) x [y0, y0 + h) (multiples of 16)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tile {
+    pub x0: usize,
+    pub y0: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// Offsets of n tiles of `size` along `total`, spread evenly, each a multiple of 16
+fn offsets(total: usize, size: usize, n: usize) -> Vec<usize> {
+    (0..n).map(|i| if n == 1 { 0 } else { (i * (total - size) / (n - 1)) / 16 * 16 }).collect()
+}
+
+/// The tiles of an ow x oh frame on a card of `total_gib`: the frame whole when its chunk fits, else the fewest tiles
+/// (overlapping by TILE_OVERLAP) whose chunk does; None when not even 4 x 4 do
+pub fn tiles_for(ow: usize, oh: usize, total_gib: f64) -> Option<Vec<Tile>> {
+    let fits = |w: usize, h: usize| chunk_gib(w, h) + MARGIN_GIB + ENGINE_GIB <= total_gib;
+    let mut shapes: Vec<(usize, usize)> = (1..=4).flat_map(|nx| (1..=4).map(move |ny| (nx, ny))).collect();
+    // the fewest tiles first, then the least made twice
+    shapes.sort_by_key(|&(nx, ny)| (nx * ny, nx.max(ny)));
+    for (nx, ny) in shapes {
+        let side = |total: usize, n: usize| if n == 1 { total } else { ((total + (n - 1) * TILE_OVERLAP).div_ceil(n)).div_ceil(16) * 16 };
+        let (w, h) = (side(ow, nx).min(ow), side(oh, ny).min(oh));
+        if !fits(w, h) {
+            continue;
+        }
+        let (xs, ys) = (offsets(ow, w, nx), offsets(oh, h, ny));
+        return Some(ys.iter().flat_map(|&y0| xs.iter().map(move |&x0| Tile { x0, y0, w, h })).collect());
+    }
+    None
+}
+
+/// A tile's frame `p` [h, w, 3] put into `dst` [oh, ow, 3], blended linearly over its overlaps with the tiles before it
+/// (left, above: `ovx`, `ovy` pixels), the rest copied
+#[allow(clippy::too_many_arguments)]
+pub fn blend_tile(dst: &mut [u8], ow: usize, p: &[u8], t: &Tile, ovx: usize, ovy: usize) {
+    for r in 0..t.h {
+        let ay = if r < ovy { (r as f32 + 0.5) / ovy as f32 } else { 1.0 };
+        let o = ((t.y0 + r) * ow + t.x0) * 3;
+        let q = r * t.w * 3;
+        let mixed = if ay < 1.0 { t.w } else { ovx.min(t.w) };
+        for c in 0..mixed {
+            let ax = if c < ovx { (c as f32 + 0.5) / ovx as f32 } else { 1.0 };
+            let wgt = ax.min(ay);
+            for ch in 0..3 {
+                let i = o + c * 3 + ch;
+                let (d, v) = (dst[i] as f32, p[q + c * 3 + ch] as f32);
+                dst[i] = (d + (v - d) * wgt).round() as u8;
+            }
+        }
+        dst[o + mixed * 3..o + t.w * 3].copy_from_slice(&p[q + mixed * 3..q + t.w * 3]);
+    }
+}
 
 /// Whether a chunk of `rw` x `rh` fits beside what holds the card now: Err no room (it fits an empty card; the same
 /// call may work later) or a size no card of this one's memory takes
 pub fn room_for(card: &str, rw: usize, rh: usize, total_gib: f64, free_gib: f64) -> Result<()> {
     let need = chunk_gib(rw, rh) + MARGIN_GIB;
     // the engine's own (the VAE, the runtime) is held on an empty card too
-    if need + 1.5 > total_gib {
+    if need + ENGINE_GIB > total_gib {
         return Err(Error(format!("seedvr2: {rw} x {rh} needs {need:.1} GiB on {card} and it has {total_gib:.1} in all: a smaller scale or source")));
     }
     if need > free_gib {
@@ -178,8 +255,10 @@ type ShapeKey = ((usize, usize, usize, usize), Arc<dit::Shape>);
 /// A chunk for a card: its frames (RGB bytes of the source's size, 1 + 4 n of them), where it sits in the clip
 struct Job {
     index: usize,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     frames: usize,
+    /// which of the frame's tiles (an index into the clip's tiles)
+    tile: usize,
 }
 
 pub struct SeedVr2 {
@@ -314,11 +393,16 @@ impl Card {
 
     /// One chunk through the whole pipeline: frames of RGB bytes (the source's size, 1 + 4 n of them) -> the made
     /// frames, RGB bytes of the out size
-    pub fn chunk(&self, dit: &Arc<dit::Dit>, rgb: &[u8], frames: usize, src: (u32, u32), scale: f64, seed: u64) -> Result<Vec<Vec<u8>>> {
+    /// `tile`: the part of the made frame this call makes (None: all of it)
+    #[allow(clippy::too_many_arguments)]
+    pub fn chunk(&self, dit: &Arc<dit::Dit>, rgb: &[u8], frames: usize, src: (u32, u32), scale: f64, seed: u64, tile: Option<Tile>) -> Result<Vec<Vec<u8>>> {
         let gpu = &self.gpu;
         let nsd = &self.nsd;
         let k = ffi::api()?;
-        let (rw, rh, cx, cy, ow, oh) = geometry(src.0, src.1, scale);
+        let (rw, rh, cx, cy, fw, fh) = geometry(src.0, src.1, scale);
+        let t0_ = tile.unwrap_or(Tile { x0: 0, y0: 0, w: fw, h: fh });
+        // the tile's part of the resize: its own crop of the resized frames
+        let (cx, cy, ow, oh) = (cx + t0_.x0, cy + t0_.y0, t0_.w, t0_.h);
         let w0 = wall();
         let up = DevBuf::new(gpu, rgb.len())?;
         prof::timed(gpu, "frames up (host -> card)", 0.0, rgb.len() as f64, || up.write(0, rgb))?;
@@ -338,7 +422,8 @@ impl Card {
         let t_enc = t0.elapsed().as_secs_f64();
         vae::settle(nsd)?;
         let (t, h, w) = (1 + (frames - 1) / 4, oh / 8, ow / 8);
-        let n = noise(seed, cond.len());
+        // the clip's noise over the whole latent frame, the tile's part of it (the same where tiles overlap)
+        let n = if tile.is_none() { noise(seed, cond.len()) } else { crop_noise(&noise(seed, t * (fh / 8) * (fw / 8) * vae::LATENT), t, fh / 8, fw / 8, t0_, vae::LATENT) };
         let s = self.shape(dit, t, h, w)?;
         let t1 = Instant::now();
         let mut v = dit.forward(nsd, &s, &n, &cond, &mut |_, _, _| Ok(()))?;
@@ -454,17 +539,35 @@ impl ImageEngine for SeedVr2 {
         -> Result<UpscaleInfo> {
         let t0 = Instant::now();
         let _busy = self.busy.lock().unwrap();
+        // the frames handed out (the log's per-frame figure)
+        let made = std::cell::Cell::new(0usize);
+        let mut counted = |p: Picture| {
+            made.set(made.get() + 1);
+            put(p)
+        };
+        let put = &mut counted;
         LOW.iter().for_each(|l| l.store(u64::MAX, Ordering::Relaxed));
         let variant = self.variant(req)?;
         let scale = req.scale.unwrap_or(2).clamp(1, 4) as f64;
         let dits = self.dits_for(variant)?;
         let (sw, sh) = (req.picture.width, req.picture.height);
-        let (rw, rh, _, _, ow, oh) = geometry(sw, sh, scale);
-        // every card the chunks go to has the room now, or no room (retryable) before a frame is read
+        let (_, _, _, _, ow, oh) = geometry(sw, sh, scale);
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        // the tiles: the whole frame when a chunk of it fits the smallest card, else the fewest that do
+        // (NS_SVR_TILES=1 forces tiles as if the frame did not fit; 0 forbids them)
+        let total = self.cards.iter().filter_map(|c| c.gpu.memory().ok().map(|m| gib(m.0))).fold(f64::INFINITY, f64::min);
+        let tiles: Vec<Tile> = match std::env::var("NS_SVR_TILES").as_deref() {
+            Ok("0") => vec![Tile { x0: 0, y0: 0, w: ow, h: oh }],
+            Ok("1") => tiles_for(ow, oh, (chunk_gib(ow, oh) + MARGIN_GIB + ENGINE_GIB) * 0.99).filter(|t| t.len() > 1)
+                .unwrap_or_else(|| vec![Tile { x0: 0, y0: 0, w: ow, h: oh }]),
+            _ => tiles_for(ow, oh, total).unwrap_or_else(|| vec![Tile { x0: 0, y0: 0, w: ow, h: oh }]),
+        };
+        let tiled = tiles.len() > 1;
+        // every card the chunks go to has the room now, or no room (retryable) before a frame is read; a size no tiling
+        // fits is a plain error
         for card in &self.cards {
             if let Ok((total, Some(free))) = card.gpu.memory() {
-                let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-                room_for(&card.gpu.name, rw, rh, gib(total), gib(free))?;
+                room_for(&card.gpu.name, tiles[0].w, tiles[0].h, gib(total), gib(free))?;
             }
         }
         let fb_in = sw as usize * sh as usize * 3;
@@ -482,26 +585,37 @@ impl ImageEngine for SeedVr2 {
         };
         let pic = |data: Vec<u8>| Picture { width: ow as u32, height: oh as u32, channels: 3, data };
         let step = self.chunk - self.overlap;
-        // One worker a card takes the chunks as they come (a free card the next one); this thread reads the frames,
-        // makes the chunks, and fades and hands out the made frames in order - so the host's work and the cards' run
-        // side by side. At most one chunk waits beyond those running.
-        let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
-        let job_rx = Mutex::new(job_rx);
-        let (res_tx, res_rx) = std::sync::mpsc::channel::<(usize, Result<Vec<Vec<u8>>>)>();
+        // One worker a card runs the chunks this thread routes to it; this thread reads the frames, makes the chunks,
+        // and fades and hands out the made frames in order - so the host's work and the cards' run side by side. A
+        // chunk goes to the card that would finish it first (its queue times its chunks' measured time: the B65 is
+        // slower than the B70, and a clip's last chunk on it left the B70 idle to the end), at most two a card.
+        let mut job_txs = Vec::new();
+        let mut job_rxs = Vec::new();
+        for _ in &self.cards {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            job_txs.push(tx);
+            job_rxs.push(rx);
+        }
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<(usize, usize, usize, f64, Result<Vec<Vec<u8>>>)>();
+        let tiles_ref = &tiles;
         let chunks = std::thread::scope(|sc| -> Result<u32> {
-            for (card, dit) in self.cards.iter().zip(&dits) {
-                let (job_rx, res_tx) = (&job_rx, res_tx.clone());
+            for (ci, ((card, dit), job_rx)) in self.cards.iter().zip(&dits).zip(job_rxs).enumerate() {
+                let res_tx = res_tx.clone();
                 let seed = self.seed;
-                sc.spawn(move || loop {
-                    let job = job_rx.lock().unwrap().recv();
-                    let Ok(job) = job else { break };
-                    let r = card.chunk(dit, &job.bytes, job.frames, (sw, sh), scale, seed.wrapping_add(job.index as u64));
-                    if res_tx.send((job.index, r)).is_err() {
+                sc.spawn(move || while let Ok(job) = job_rx.recv() {
+                    let tile = if tiles_ref.len() > 1 { Some(tiles_ref[job.tile]) } else { None };
+                    let t = Instant::now();
+                    let r = card.chunk(dit, &job.bytes, job.frames, (sw, sh), scale, seed.wrapping_add(job.index as u64), tile);
+                    if res_tx.send((job.index, job.tile, ci, t.elapsed().as_secs_f64(), r)).is_err() {
                         break;
                     }
                 });
             }
             drop(res_tx);
+            // the jobs not yet routed; each card's routed and unfinished; its chunks' time (0: none measured yet)
+            let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
+            let mut inflight = vec![0usize; self.cards.len()];
+            let mut ema = vec![0f64; self.cards.len()];
             let mut run = || -> Result<u32> {
                 // the frames read and not yet a chunk's; each chunk's (frames, shared, kept); the made frames of the last
                 // chunk's overlap, not yet handed out
@@ -509,9 +623,11 @@ impl ImageEngine for SeedVr2 {
                 let mut meta: Vec<(usize, usize, usize)> = Vec::new();
                 let mut tail: Vec<Vec<u8>> = Vec::new();
                 let mut made_by: BTreeMap<usize, Vec<Vec<u8>>> = BTreeMap::new();
+                // a tiled chunk's tiles as they come, until it has them all
+                let mut parts: BTreeMap<usize, Vec<Option<Vec<Vec<u8>>>>> = BTreeMap::new();
                 let (mut ended, mut done, mut running, mut emitted) = (false, false, 0usize, 0usize);
                 loop {
-                    while !done && running < self.cards.len() + 1 {
+                    while !done && running < self.cards.len() + tiles.len() {
                         while !ended && pending.len() < self.chunk {
                             match next()? {
                                 Some(p) => pending.push(rgb(p)?),
@@ -532,8 +648,11 @@ impl ImageEngine for SeedVr2 {
                         }
                         let last = ended && pending.len() <= self.chunk;
                         meta.push((real, shared, if last { 0 } else { self.overlap.min(real) }));
-                        job_tx.send(Job { index: meta.len() - 1, bytes, frames: len }).map_err(|_| Error("the cards' workers ended".into()))?;
-                        running += 1;
+                        let bytes = Arc::new(bytes);
+                        for ti in 0..tiles.len() {
+                            queue.push_back(Job { index: meta.len() - 1, bytes: bytes.clone(), frames: len, tile: ti });
+                            running += 1;
+                        }
                         if last {
                             done = true;
                         } else {
@@ -543,9 +662,39 @@ impl ImageEngine for SeedVr2 {
                     if running == 0 {
                         break;
                     }
-                    let (i, r) = res_rx.recv().map_err(|_| Error("the cards' workers ended".into()))?;
+                    // route what waits: each job to the card that would finish it first
+                    while !queue.is_empty() {
+                        let known = ema.iter().copied().filter(|e| *e > 0.0).fold(f64::INFINITY, f64::min);
+                        let est = |c: usize| if ema[c] > 0.0 { ema[c] } else if known.is_finite() { known } else { 1.0 };
+                        let Some(c) = (0..self.cards.len()).filter(|&c| inflight[c] < 2)
+                            .min_by(|&a, &b| ((inflight[a] + 1) as f64 * est(a)).total_cmp(&((inflight[b] + 1) as f64 * est(b)))) else { break };
+                        job_txs[c].send(queue.pop_front().unwrap()).map_err(|_| Error("the cards' workers ended".into()))?;
+                        inflight[c] += 1;
+                    }
+                    let (i, ti, ci, secs, r) = res_rx.recv().map_err(|_| Error("the cards' workers ended".into()))?;
                     running -= 1;
-                    made_by.insert(i, r?);
+                    inflight[ci] -= 1;
+                    ema[ci] = if ema[ci] > 0.0 { 0.7 * ema[ci] + 0.3 * secs } else { secs };
+                    if !tiled {
+                        made_by.insert(i, r?);
+                    } else {
+                        let slot = parts.entry(i).or_insert_with(|| vec![None; tiles.len()]);
+                        slot[ti] = Some(r?);
+                        if slot.iter().all(Option::is_some) {
+                            // the tiles into whole frames, in order (each blended over those before it)
+                            let got: Vec<Vec<Vec<u8>>> = parts.remove(&i).unwrap().into_iter().map(Option::unwrap).collect();
+                            let n = got[0].len();
+                            let mut whole = vec![vec![0u8; ow * oh * 3]; n];
+                            for (k, t) in tiles.iter().enumerate() {
+                                let ovx = tiles[..k].iter().filter(|o| o.y0 == t.y0 && o.x0 < t.x0).map(|o| o.x0 + o.w - t.x0).max().unwrap_or(0);
+                                let ovy = tiles[..k].iter().filter(|o| o.x0 == t.x0 && o.y0 < t.y0).map(|o| o.y0 + o.h - t.y0).max().unwrap_or(0);
+                                for (f, frame) in whole.iter_mut().enumerate() {
+                                    blend_tile(frame, ow, &got[k][f], t, ovx, ovy);
+                                }
+                            }
+                            made_by.insert(i, whole);
+                        }
+                    }
                     // the chunks made so far, in order: the overlap faded from the earlier chunk, the rest handed out
                     while let Some(mut made) = made_by.remove(&emitted) {
                         let (real, shared, keep) = meta[emitted];
@@ -571,7 +720,7 @@ impl ImageEngine for SeedVr2 {
             };
             let r = run();
             // the workers end when the jobs do (a running chunk is finished first)
-            drop(job_tx);
+            drop(job_txs);
             r
         })?;
         let seconds = t0.elapsed().as_secs_f64();
@@ -581,8 +730,9 @@ impl ImageEngine for SeedVr2 {
             format!("{} {:.1} of {:.1} GiB", c.gpu.name, if low == u64::MAX { 0.0 } else { (total - low.min(total)) as f64 / (1u64 << 30) as f64 },
                     total as f64 / (1u64 << 30) as f64)
         };
-        eprintln!("seedvr2: {variant} {sw}x{sh} -> {ow}x{oh}, {chunks} chunks of {} frames on {} card(s) in {seconds:.1} s; at most in use: {}", self.chunk,
-                  self.cards.len(), self.cards.iter().map(use_of).collect::<Vec<_>>().join(", "));
+        eprintln!("seedvr2: {variant} {sw}x{sh} -> {ow}x{oh}{}, {chunks} chunks of {} frames on {} card(s) in {seconds:.1} s ({:.3} s a frame); at most in use: {}",
+                  if tiled { format!(" in {} tiles of {}x{}", tiles.len(), tiles[0].w, tiles[0].h) } else { String::new() }, self.chunk,
+                  self.cards.len(), seconds / made.get().max(1) as f64, self.cards.iter().map(use_of).collect::<Vec<_>>().join(", "));
         Ok(UpscaleInfo { variant: variant.into(), scale: scale as u32, noise: None, tile: self.chunk as u32, tiles: chunks, seconds })
     }
 }
@@ -612,6 +762,36 @@ mod tests {
         let w = crossfade(5);
         assert!((0..5).all(|i| (w[i] + w[4 - i] - 1.0).abs() < 1e-6) && (w[2] - 0.5).abs() < 1e-6, "{w:?}");
         assert!(crossfade(1).len() == 1 && (crossfade(1)[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_film_sizes_fit_a_card_whole_or_in_tiles() {
+        // 1728 x 960 whole on the B70; 2560 x 1408 (1280 x 704 at 2x) in two tiles, each chunk fitting the card
+        assert_eq!(tiles_for(1728, 960, 31.9).unwrap(), vec![Tile { x0: 0, y0: 0, w: 1728, h: 960 }]);
+        let t = tiles_for(2560, 1408, 31.9).unwrap();
+        assert!(t.len() > 1, "{t:?}");
+        for x in &t {
+            assert!(chunk_gib(x.w, x.h) + MARGIN_GIB + ENGINE_GIB <= 31.9 && x.w % 16 == 0 && x.h % 16 == 0 && x.x0 % 16 == 0 && x.y0 % 16 == 0, "{x:?}");
+            assert!(x.x0 + x.w <= 2560 && x.y0 + x.h <= 1408);
+        }
+        // together they cover the frame, overlapping
+        assert_eq!(t.iter().map(|x| x.x0 + x.w).max(), Some(2560));
+        assert_eq!(t.iter().map(|x| x.y0 + x.h).max(), Some(1408));
+        // 4x of 1280 x 704 still finds a tiling; a card of 4 GiB none
+        assert!(tiles_for(5120, 2816, 31.9).is_some());
+        assert!(tiles_for(1728, 960, 4.0).is_none());
+    }
+
+    #[test]
+    fn a_tile_takes_its_part_of_the_clips_noise() {
+        let full: Vec<f32> = (0..2 * 4 * 6 * 2).map(|v| v as f32).collect();
+        // latent [2, 4, 6, 2]; the tile at made-frame (16, 8), 24 x 16: latent x 2..5, y 1..3
+        let c = crop_noise(&full, 2, 4, 6, Tile { x0: 16, y0: 8, w: 24, h: 16 }, 2);
+        assert_eq!(c.len(), 2 * 2 * 3 * 2);
+        // frame 0, latent row 1, columns 2..5
+        assert_eq!(&c[..6], &full[16..22]);
+        // frame 1, latent row 2
+        assert_eq!(&c[3 * 2 * 3..], &full[((4 + 2) * 6 + 2) * 2..((4 + 2) * 6 + 5) * 2]);
     }
 
     #[test]

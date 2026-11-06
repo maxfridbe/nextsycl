@@ -64,7 +64,23 @@ The DiT's matrices live in pinned host memory and go up to the card for each cal
 let go after: the VAE's causal convolutions keep their last two input frames from slice to slice (exactly the
 reference's slicing), ~17 GB of them at 1728x960 in the decoder, and the full-resolution part of each slice runs a
 frame or two at a time (`NS_SVR_PIECE`; the same frames whatever the piece: the kept frames carry over). At 864x480 ->
-1728x960 the card peaks at 23.9 GiB (3B) and 24.4 GiB (7B) of the B70's 31.9.
+1728x960 the card peaks at 22.9 GiB (3B) and 24.1 GiB (7B) of the B70's 31.9 (step 6; 23.9 / 24.4 at first).
+
+`chunk_gib` (23.5 GiB at 1728x960, scaled by the pixels) plus the engine's 1.5 GiB and the 1.5 GiB margin is what
+`room_for` asks of a card: a size no card of its memory takes is a plain error (400), one that fits an empty card but
+not beside what holds it now is `no_room` (503, retry later). The measured peaks sit 1.5-2 GiB under the estimate
+(22.9 against 25.0 at 1728x960, 27.2 against 29.4 for a 2560x768 tile): it never says a chunk fits when it does not.
+
+### Tiles (1280x704 -> 2560x1408 on one card)
+
+A 2560x1408 chunk needs ~51 GiB: past any card. `tiles_for` picks the fewest spatial tiles whose chunk fits the
+card (up to 4 x 4; each side a multiple of 16, overlapping by 128 made pixels, spread evenly): at 1280x704 x2 two
+tiles of 2560x768, one above the other. Each tile is the whole pipeline over its part of the frame (resize window,
+encode, DiT, decode, colour fix), its noise the tile's crop of the whole frame's noise (`crop_noise`), so a tile's
+chunk is the same work as a frame of that size; the frames are put together as the tiles come back, blended
+linearly over the overlap. `room_for` is asked of the first tile, so `no_room` and the plain error stay truthful.
+Tiled and whole differ as diffusion does with a different window: 864x480 x2 made in two tiles (`NS_SVR_TILES=1`)
+against whole, 38.8 dB PSNR. The chunks of all the tiles go to the card expected to finish them first (below).
 
 ### Checked (exact before fast)
 
@@ -86,18 +102,28 @@ input:
 The engine is bfloat16 as the official inference (autocast): the reference's own bfloat16-autocast run is 1.9e-2 from
 its float32 run at v, the engine 1.2e-2. The VAE in pieces of 1 and 2 frames gives the same numbers to every digit.
 
-### Speed (864x480 -> 1728x960, chunks of 33, the 243-frame clip through `video.upscale`)
+Checked again after step 6 (the table above is the first port's, the DiT's attention then half): 3B resize 0.999999 /
+1.3e-3, encode 0.999958 / 9.2e-3, block 31 0.999800 / 2.0e-2, v 0.999933 / 1.16e-2, x0 0.999885 / 1.5e-2, decode
+0.999991 / 4.2e-3, colour fix 0.999997 / 2.6e-3; 7B block 0 0.999999 / 1.7e-3, 17 0.999963 / 8.7e-3, 35 0.999656 /
+2.6e-2, v 0.999892 / 1.5e-2, x0 0.999820 / 1.9e-2 (the bfloat16 attention of step 3: the reference's own bfloat16
+run is further, 1.9e-2 at v).
+
+### Speed (chunks of 33, the 243-frame clip through `video.upscale`, step 6)
 
 | | one card (B70) | two cards (B70 + B65) | peak VRAM a card |
 |---|---|---|---|
+| 3B, 864x480 -> 1728x960 | 0.718 s/frame (1.39 frames/s) | 0.466 s/frame (2.15 frames/s) | 22.9 GiB |
+| 7B, 864x480 -> 1728x960 | 0.876 (the switch from the 3B in it) | 0.718 (the 7B's load on both cards in it) | 24.1 GiB |
+| 3B, 1280x704 -> 2560x1408 (2 tiles) | 1.668 | 1.057 | 27.2 GiB |
+| 7B, 1280x704 -> 2560x1408 (2 tiles) | 2.081 | 1.410 | 27.2 GiB |
 | 3B, step 3 | 0.79 s/frame (1.27 frames/s) | 0.48 s/frame (2.06 frames/s) | 24.5 GiB B70, 24.5 GiB B65 |
 | 7B, step 3 | 0.96 s/frame (1.05 frames/s; ~50 s of it the switch from the 3B) | 0.73 s/frame (1.37 frames/s; the same, on both cards) | 24.5 GiB B70, 24.5 GiB B65 |
 | first port (step 0) | 3B 1.51, 7B 1.51 (a 33-frame chunk) | 3B 0.93 | 23.9 GiB |
 
 The 7B's DiT is 16.5 GB: it fits beside the VAE because its weights stay in pinned host memory and go up for each call
 (0.7 s at 28 GB/s), let go before the decode (the VAE's kept frames at full resolution take ~17 GB). Two cards each keep
-their own pinned copy (2 x 16.5 GB of host memory for the 7B). A film of 5,500 frames: ~1 h 40 (3B, one card), ~52 min
-(3B, two cards).
+their own pinned copy (2 x 16.5 GB of host memory for the 7B). A film of 5,500 frames at 864x480: ~1 h 6 (3B, one
+card), ~43 min (3B, two cards).
 
 ### Optimisation log
 
@@ -110,6 +136,10 @@ the whole request (`video.upscale` through the image server, ffmpeg included), B
 | 1 | silo: the causal convolutions as 2-D taps over the frames where they are (the copies of the kept frames gone: 9 % of a chunk); group norm, shuffle and residual add vectorised (16-byte loads), group norm's statistics reduced in parallel; the DiT's window tables kept across chunks | 1.03 (250.3 s); two cards 0.60 (146.5 s) | | convolutions 51-57 % -> 61-67 % of the XMX peak; group norm 143 -> 269 GB/s |
 | 2 | a let-go volume freed at the card's next wait instead of a wait at every free (the queue was drained thousands of times a chunk); the DiT's attention fed half (the shared attention's in-place path) | 0.98 (239.0 s); two cards 0.57 (139.0 s) | | B70 compute busy 73 -> 80 %; DiT attention 1.54 -> 1.09 s a chunk. The half q, k, v overflowed on the 7B (see below): replaced in step 3 |
 | 3 | the DiT's window attention in bfloat16 on the silo (oneDNN's fused graph; the half path made chunks NaN); group norm's statistics over 4096 parts | 0.79 (191.9 s); two cards 0.48 (117.7 s) | 0.96 (232.1 s, the switch from the 3B in it); two cards 0.73 (177.5 s) | four whole clips: 0 black frames, no non-finite value; one card and two give the same frames. Busy (compute): 3B B70 85 %; 3B two cards B70 80 / B65 82 %; 7B B70 82 %; 7B two cards 63 / 65 % (the 7B's load on both cards inside the run). A 7B chunk 30.1 s profiled (encode 8.0, DiT 6.9, decode 15.2); group norm 360 GB/s, window attention 17 % of peak |
+| 3b | (step 3 measured again on this branch's build, the same day as 4-6) | 0.791 (192.3 s) | | check unchanged (v 0.999933 / 1.16e-2, decode 0.999993 / 3.6e-3, colour fix 0.999997 / 2.6e-3) |
+| 4 | spatial tiles when the frame's chunk does not fit a card (above); 1280x704 x2 on one card | 864x480 unchanged; 1280x704: 1.84 (446.6 s, 2 tiles of 2560x768) | | peak 29.5 GiB of 31.9; tiled vs whole at 864x480 38.8 dB |
+| 5 | a let-go VAE volume kept for the next of its size (in queue order no wait needed; settled only past `NS_SVR_POOL_GIB`, 2 GiB) instead of a wait and free at every resnet; two cards: each chunk to the card with the least (in flight + 1) x its running chunk time, two in flight a card, instead of a fixed share (the B70 sat idle at the clip's end) | 0.737 (179.0 s); two cards 0.477 (115.8 s); 1280x704 1.715 (416.7 s), two cards 1.082 (263.0 s) | | busy: one card 96 %; two 95 / 81 %; 1280x704 two 89 / 98 %. Peak 23.5 GiB, 1280x704 27.4. Check identical to every digit |
+| 6 | the resnets' residual summed in the second convolution (the silo's taps onto the shortcut: oneDNN's sum post-op; no add pass); the pointwise (1x1x1) convolutions one oneDNN product over all the pixels on the silo (`ns_image_seedvr2_silo_linear`) instead of the shared linear 8,192 rows a call | 0.718 (174.5 s); two cards 0.466 (113.3 s); 1280x704 1.668 (405.3 s), two cards 1.057 (256.9 s) | 0.876 (212.9 s, the switch from the 3B in it); two cards 0.718 (174.5 s, the load on both cards in it); 1280x704 2.081 (505.6 s), two cards 1.410 (342.5 s) | busy: 3B 96 %; 7B 88 %; 7B two cards 75 / 62 % (the load); 7B 1280x704 87 %, two cards 75 / 83 %. Peak 22.9 GiB (3B), 24.1 (7B), 1280x704 27.2. Check: encode 0.999958 / 9.2e-3, decode 0.999991 / 4.2e-3 (the sum rounded once into bfloat16, not twice), colour fix unchanged 0.999997 / 2.6e-3; v unchanged |
 
 ### Non-finite chunks (found and fixed)
 
@@ -150,6 +180,10 @@ GDDR6 at 19 Gbps). PCIe: pinned host -> card 28.0 GB/s measured (`nextsycl gpus`
 | ffmpeg decode / x264 encode (host) | - | - | - | - | on the calling thread while the card works: the run takes 0.8 cores (one card), 1.6 (two) |
 
 Per chunk (wall, unprofiled): encode 9.6 s, DiT 5.2 s (its weights up included), decode 19.2 s.
+
+Since this profile: the residual add's pass is gone into the convolutions (step 6), the 1x1x1 convolutions are one
+product a volume (step 6), and the waits at the frees (step 5) - the compute engine busy 96 % of a one-card run. Open:
+group norm (three passes, ~10 %), the VAE's mid attention, the convolutions themselves at 61-66 % of the peak.
 
 Utilisation (`gpumon.py`: the xe driver's per-client engine counters in /proc/PID/fdinfo, every 0.5 s): one card, the
 B70's compute engine busy 73 % (step 1) -> 80 % (step 2) of the run; the rest is the host between kernels (a wait for
