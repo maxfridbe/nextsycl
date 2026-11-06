@@ -110,14 +110,14 @@ Checked again after step 6 (the table above is the first port's, the DiT's atten
 half attention (`NS_SILO=0`) gives v 0.999916 / 1.29e-2, block 35 0.999728 / 2.3e-2, the first port's figures. The 3B's
 v stayed at 1.2e-2 through the same change.
 
-### Speed (chunks of 33, the 243-frame clip through `video.upscale`, step 8; the 1280x704 rows step 6's)
+### Speed (chunks of 33, the 243-frame clip through `video.upscale`, step 8)
 
 | | one card (B70) | two cards (B70 + B65) | peak VRAM a card |
 |---|---|---|---|
 | 3B, 864x480 -> 1728x960 | 0.700 s/frame (1.43 frames/s) | 0.452 s/frame (2.21 frames/s) | 22.9 GiB |
 | 7B, 864x480 -> 1728x960 | 0.808 (the switch from the 3B in it) | 0.550 (step 7; the 7B's load on both cards in it) | 24.2 GiB |
-| 3B, 1280x704 -> 2560x1408 (2 tiles) | 1.668 | 1.057 | 27.2 GiB |
-| 7B, 1280x704 -> 2560x1408 (2 tiles) | 2.081 | 1.410 | 27.2 GiB |
+| 3B, 1280x704 -> 2560x1408 (2 tiles) | 1.619 (step 6: 1.668) | 1.016 (1.057) | 27.3 GiB |
+| 7B, 1280x704 -> 2560x1408 (2 tiles) | 1.835 (2.081) | 1.253 (1.410) | 27.3 GiB |
 | 3B, step 3 | 0.79 s/frame (1.27 frames/s) | 0.48 s/frame (2.06 frames/s) | 24.5 GiB B70, 24.5 GiB B65 |
 | 7B, step 3 | 0.96 s/frame (1.05 frames/s; ~50 s of it the switch from the 3B) | 0.73 s/frame (1.37 frames/s; the same, on both cards) | 24.5 GiB B70, 24.5 GiB B65 |
 | first port (step 0) | 3B 1.51, 7B 1.51 (a 33-frame chunk) | 3B 0.93 | 23.9 GiB |
@@ -143,7 +143,7 @@ the whole request (`video.upscale` through the image server, ffmpeg included), B
 | 5 | a let-go VAE volume kept for the next of its size (in queue order no wait needed; settled only past `NS_SVR_POOL_GIB`, 2 GiB) instead of a wait and free at every resnet; two cards: each chunk to the card with the least (in flight + 1) x its running chunk time, two in flight a card, instead of a fixed share (the B70 sat idle at the clip's end) | 0.737 (179.0 s); two cards 0.477 (115.8 s); 1280x704 1.715 (416.7 s), two cards 1.082 (263.0 s) | | busy: one card 96 %; two 95 / 81 %; 1280x704 two 89 / 98 %. Peak 23.5 GiB, 1280x704 27.4. Check identical to every digit |
 | 6 | the resnets' residual summed in the second convolution (the silo's taps onto the shortcut: oneDNN's sum post-op; no add pass); the pointwise (1x1x1) convolutions one oneDNN product over all the pixels on the silo (`ns_image_seedvr2_silo_linear`) instead of the shared linear 8,192 rows a call | 0.718 (174.5 s); two cards 0.466 (113.3 s); 1280x704 1.668 (405.3 s), two cards 1.057 (256.9 s) | 0.876 (212.9 s, the switch from the 3B in it); two cards 0.718 (174.5 s, the load on both cards in it); 1280x704 2.081 (505.6 s), two cards 1.410 (342.5 s) | busy: 3B 96 %; 7B 88 %; 7B two cards 75 / 62 % (the load); 7B 1280x704 87 %, two cards 75 / 83 %. Peak 22.9 GiB (3B), 24.1 (7B), 1280x704 27.2. Check: encode 0.999958 / 9.2e-3, decode 0.999991 / 4.2e-3 (the sum rounded once into bfloat16, not twice), colour fix unchanged 0.999997 / 2.6e-3; v unchanged |
 | 7 | the DiT's slab (its matrices in pinned memory) read and converted to bfloat16 once, by threads with positioned reads; a second card's copied from the first's, not read and converted again beside it (the 7B on two cards spent 40 s loading inside the request, on one 15-23) | (3B unchanged) | two cards 0.550 (133.6 s); the 7B loads in 10.4 s | busy 7B two cards 90 / 78 %. Check identical to every digit |
-| 8 | the VAE's group norm on the silo (`silo/norm.cpp`): the statistics, weight and bias folded into one scale and shift a (frame, channel); the apply pass's frame, voxel and channels from a 3-D range (it took them apart with 64-bit divisions every 8 channels) | 0.700 (170.0 s); two cards 0.452 (109.9 s) | 0.808 (196.2 s, the switch from the 3B in it) | group norm 360 -> 502 GB/s (83 % of the memory's peak), 7.3 % of a chunk (was 10.7). Busy 96 %; two cards 95 / 80 %; 7B 92 %. Check: decode 0.999991 / 4.2e-3, encode 0.999958 / 9.2e-3, the rest unchanged |
+| 8 | the VAE's group norm on the silo (`silo/norm.cpp`): the statistics, weight and bias folded into one scale and shift a (frame, channel); the apply pass's frame, voxel and channels from a 3-D range (it took them apart with 64-bit divisions every 8 channels) | 0.700 (170.0 s); two cards 0.452 (109.9 s); 1280x704 1.619 (393.3 s), two cards 1.016 (246.8 s) | 0.808 (196.2 s, the switch from the 3B in it); 1280x704 1.835 (445.8 s), two cards 1.253 (304.5 s) | group norm 360 -> 502 GB/s (83 % of the memory's peak), 7.3 % of a chunk (was 10.7). Busy 96 %; two cards 95 / 80 %; 7B 92 %. Check: decode 0.999991 / 4.2e-3, encode 0.999958 / 9.2e-3, the rest unchanged |
 
 ### Non-finite chunks (found and fixed)
 

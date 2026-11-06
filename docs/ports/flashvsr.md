@@ -110,7 +110,14 @@ on its RTX 5070 + 3060, 1.16 at x4.
 | 1 | the attention a work-group a 128-query block, 32 keys a step (7.05 -> 4.62 s of 65 frames' attention); K and V one product straight into the ring (rows of 3,072); the RoPE as two small tables (not 22 MB a chunk made on the host); the decoder's full-size end in bands of 256 rows | 0.158 | 0.116; 15 / 15: 0.110 | out of memory (oneDNN's reordered copy of each weight, a copy a layout) | 0.227 |
 | 2 | the linear layers' weights read as they are (no reordered copies: 2.4 GiB less, and the products 2.88 -> 2.71 s); the two cards' split tried | 0.157 | 14 / 16: 0.107 (both 86-87 % busy); 16 / 14: 0.113 | 0.310 (whole, 30.3 of 31.9 GiB) | |
 | 3 | frames and bytes through pinned memory by the queue's copies (one wait a chunk, not a copy and a wait a frame); 14 / 16 the default; 2560 x 1408's buffers trimmed (the head's rows in the LQ tokens' buffer, TGrow 21 a frame at a time, the MLP 8,192 rows at a time) | 0.155 | 0.107 | 0.309 (29.9 GiB) | 0.214 |
-| 4 | the sparse attention's prefetch: each 32-key step of a 128-key block prefetched the whole next block (4 x its 32 KB a block); now one step's tile of it (ARK's mainloop copied into the silo, `silo/tla/ark/`). The clip's buffers let go when it ends (below) | 0.140 (95 % busy) | 0.099 (86 / 80 %) | | |
+| 4 | the sparse attention's prefetch: each 32-key step of a 128-key block prefetched the whole next block (4 x its 32 KB a block); now one step's tile of it (ARK's mainloop copied into the silo, `silo/tla/ark/`). The clip's buffers let go when it ends (below) | 0.140 (95 % busy) | 0.099 (86 / 80 %) | 0.279 (96 %, 29.9 GiB) | 0.194 (85 / 84 %) |
+
+Tried after step 4 (B70, 65 frames' attention, 3.58 s for the default 129): skipping the output's rescale when no
+row's maximum moved in a sub-group (exact) - 3.58 s, no gain, taken out; 64 keys a step (128) 5.78 s. **Known bad: a
+P V tile 64 columns wide (`NS_FVSR_QTILE` 134, and 136 with 64 keys a step) hung the B70** - the compute engine at
+100 % for 8 minutes on the first chunk of 1728 x 960 (it takes 11 s for 65 frames), SIGTERM did not end it, the
+process was killed (2026-11-06 15:28). Both shapes are gone from the silo; 135 (4 sub-groups of 32 rows) is measured
+on the B65 below.
 
 Step 4's attention: 4.65 -> 3.54 s of 65 frames' (58.5 -> 76.8 TFLOPS, 31.9 -> 41.9 % of the peak; 42.3 -> 35.5 % of
 the time); the check unchanged (decoded worst 8.9e-4, 61.49 dB).
@@ -118,12 +125,12 @@ the time); the check unchanged (decoded worst 8.9e-4, 61.49 dB).
 A detour: the pinned memory read and written by the kernels in place (over PCIe) made a frame 0.210 s - a kernel's
 small reads across the bus; the queue's copies (the copy engines) are what step 3 keeps.
 
-### Speed now (the final build: the whole 243-frame clip unless said; the rows below the first are step 3's)
+### Speed now (the final build: the whole 243-frame clip unless said; the x4 rows are step 3's)
 
 | size | one card (B70) | two cards (B70 + B65) |
 |---|---|---|
 | 864x480 -> 1728x960 (x2) | **0.140 s/frame** (step 4; 0.156 at step 3) - B70 95 % busy, 17.3 GiB | **0.099** (0.107) - 86 / 80 % busy, 10.7 / 7.8 GiB |
-| 1280x704 -> 2560x1408 (x2) | **0.310**, whole - 97 %, 1.2 cores, 29.9 GiB (2.0 free) | **0.213** - 83 / 88 %, 1.6 cores, 18.2 / 13.5 GiB |
+| 1280x704 -> 2560x1408 (x2) | **0.279** (step 4; 0.310 at step 3), whole - 96 %, 29.9 GiB (2.0 free) | **0.194** (0.213) - 85 / 84 %, 18.2 / 13.6 GiB |
 | 864x480 -> 3456x1920 (x4: 2 x 2 tiles of 1792 x 1024) | **0.753** - 97 %, 1.0 core, 17.3 GiB | **0.547** - 81 / 83 %, 1.4 cores, 10.7 / 7.8 GiB |
 | 1280x704 -> 5120x2816 (x4: 3 x 3 tiles; 65 frames) | **1.542** - 98 %, 1.0 core, 17.3 GiB | **1.286** - 70 / 73 % (each tile's stream fills the pipeline anew), 1.3 cores, 10.7 / 7.8 GiB |
 
