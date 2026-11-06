@@ -94,6 +94,21 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// A file name's start no other request has: the second, this process, a count and random bits (two requests in one
+/// second, or two servers in containers sharing an output directory - and the same pid there - once took one name, and
+/// the first to fail deleted the other's clip)
+fn unique() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let r = std::collections::hash_map::RandomState::new().build_hasher().finish() as u32;
+    format!("{}-{}-{}-{r:08x}", now(), std::process::id(), N.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Create `path` only when nothing is there (O_EXCL): a name `unique` gave stays one request's
+fn claim(path: &std::path::Path) -> Result<std::fs::File, (u16, String)> {
+    std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| (500u16, format!("{}: {e}", path.display())))
+}
+
 fn err(m: impl Into<String>) -> Value {
     json!({"error": {"message": m.into(), "type": "invalid_request_error"}})
 }
@@ -719,7 +734,7 @@ impl ImageServer {
         let png = pic.png_bytes(&meta).map_err(|e| (500u16, e))?;
         let mut item = json!({"width": pic.width, "height": pic.height, "variant": info.variant, "scale": info.scale, "noise": info.noise});
         if let Some(dir) = &self.out_dir {
-            let name = format!("{}-{}-x{}.png", now(), self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"), info.scale);
+            let name = format!("{}-{}-x{}.png", unique(), self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"), info.scale);
             std::fs::write(dir.join(&name), &png).map_err(|e| (500u16, format!("{}: {e}", dir.display())))?;
             let mut h = self.history.lock().unwrap();
             h.push_front(json!({"kind": "upscale", "url": format!("/v1/images/files/{name}"), "prompt": format!("{} {}x", info.variant, info.scale),
@@ -744,12 +759,12 @@ impl ImageServer {
         use std::process::{Command, Stdio};
         let bad = |m: String| (400u16, m);
         let dir = self.out_dir.clone().ok_or_else(|| bad("video.upscale needs a server that keeps files (start it with an output directory)".into()))?;
-        let stamp = now();
+        let stamp = unique();
         let src = match (b["video"].as_str().filter(|v| !v.is_empty()), b["path"].as_str().filter(|v| !v.is_empty())) {
             (Some(v), _) => {
                 let bytes = http::unbase64(v).map_err(|e| bad(format!("video: {e}")))?;
-                let f = std::env::temp_dir().join(format!("nc-upscale-{stamp}-{}.in", std::process::id()));
-                std::fs::write(&f, bytes).map_err(|e| (500u16, format!("{}: {e}", f.display())))?;
+                let f = std::env::temp_dir().join(format!("nc-upscale-{stamp}.in"));
+                claim(&f)?.write_all(&bytes).map_err(|e| (500u16, format!("{}: {e}", f.display())))?;
                 (f, true)
             }
             (None, Some(p)) if std::path::Path::new(p).is_file() => (PathBuf::from(p), false),
@@ -789,6 +804,10 @@ impl ImageServer {
         let j0 = self.tele.joules();
         let name = format!("{stamp}-{}-upscaled.mp4", self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"));
         let out_path = dir.join(&name);
+        if let Err(e) = claim(&out_path) {
+            cleanup(&src.0, src.1);
+            return Err(e);
+        }
         let crf = b["crf"].as_u64().unwrap_or(16).min(40).to_string();
         let mut dec = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src.0).args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| (500u16, format!("ffmpeg: {e}")))?;
@@ -1039,7 +1058,7 @@ impl ImageServer {
             let png = pic.png_bytes(&meta).map_err(|e| (500u16, e))?;
             let mut item = json!({"revised_prompt": prompt, "seed": s, "width": pic.width, "height": pic.height});
             if let Some(dir) = &self.out_dir {
-                let name = format!("{}-{}-{s}.png", now(), self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"));
+                let name = format!("{}-{}-{s}.png", unique(), self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"));
                 std::fs::write(dir.join(&name), &png).map_err(|e| (500u16, format!("{}: {e}", dir.display())))?;
                 let link = format!("{base}/v1/images/files/{name}");
                 let mut h = self.history.lock().unwrap();
@@ -1057,5 +1076,21 @@ impl ImageServer {
             data.push(item);
         }
         Ok(json!({"created": now(), "data": data, "nextsycl": {"seconds": seconds, "steps": steps, "seed": seed, "loras": lora_txt, "wh": wh}}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_requests_in_one_second_get_their_own_files() {
+        let (a, b) = (unique(), unique());
+        assert_ne!(a, b);
+        let dir = std::env::temp_dir().join(format!("ns-claim-{}", unique()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.mp4");
+        assert!(claim(&f).is_ok() && claim(&f).is_err(), "a claimed name is not taken twice");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
