@@ -61,15 +61,19 @@ if [ "$fail" = 1 ]; then
   [ -n "${LINK_ANYWAY:-}" ] || exit 1
 fi
 # objects of sources that are gone (moved or removed) would link twice or stale: only the current sources' objects
-ALL=$(all_sources)
+# (the list is made once and read from a string: `printf | ... | grep -q` under pipefail failed whenever grep's early
+# exit cut the pipe, and that deleted a current object - ns_ns.cpp.o went so on 2026-11-06)
+KEEP=$(all_sources | tr / _ | sed 's/$/.o/')
 for o in "$OBJ"/*.o; do
-  printf '%s\n' $ALL | tr / _ | sed 's/$/.o/' | grep -qx "$(basename "$o")" || rm -f "$o" "$o.log"
+  grep -qxF "$(basename "$o")" <<< "$KEEP" || rm -f "$o" "$o.log"
 done
 # one library a kind: the shared part and that kind's engines (llm also the Strata kernels its engines use), so a
 # program of one kind never loads another kind's code. Each is linked beside its old self, then renamed over it: a
 # running server keeps the library it mapped (writing over a mapped library in place would change the code under it)
 for k in $KINDS; do
-  objs="$(ls "$OBJ"/ns_*.o) $(ls "$OBJ"/${k}_*.o 2>/dev/null | grep -v '_silo_' || true)"
+  # the shared part is in every library: without it the link still succeeds and the library loads nowhere
+  nsobjs=$(ls "$OBJ"/ns_*.o)
+  objs="$nsobjs $(ls "$OBJ"/${k}_*.o 2>/dev/null | grep -v '_silo_' || true)"
   extra=()
   if [ "$k" = llm ]; then
     objs="$objs $(ls "$OBJ"/strata_*.o)"
