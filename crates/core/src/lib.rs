@@ -34,9 +34,12 @@ impl Error {
         Error(format!("{NO_ROOM}{m}"))
     }
 
-    /// No room now: `Error::no_room`, or a device allocation that failed (ns_alloc)
+    /// No room now: `Error::no_room`, a device allocation that failed (ns_alloc), or the runtime out of device memory
+    /// in a copy or a kernel's own allocation (Level Zero's error 39 - another engine's work grew on the card)
     pub fn is_no_room(&self) -> bool {
-        self.0.starts_with(NO_ROOM) || (self.0.contains("device allocation of ") && self.0.contains(" bytes failed"))
+        self.0.starts_with(NO_ROOM)
+            || (self.0.contains("device allocation of ") && self.0.contains(" bytes failed"))
+            || self.0.contains("OUT_OF_DEVICE_MEMORY")
     }
 }
 
@@ -483,5 +486,19 @@ impl Arena {
         if mark < *off {
             *off = mark;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn the_runtime_out_of_device_memory_is_no_room() {
+        let e = Error("copying to the GPU: sycl: level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)".into());
+        assert!(e.is_no_room());
+        assert!(Error::no_room("seedvr2: needs 2.0 GiB more").is_no_room());
+        assert!(Error("device allocation of 1024 bytes failed".into()).is_no_room());
+        assert!(!Error("sycl: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)".into()).is_no_room());
     }
 }

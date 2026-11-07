@@ -45,6 +45,11 @@ pub const KINDS: [&str; 3] = ["image", "audio", "model3d"];
 /// Finished jobs kept
 const KEEP: usize = 200;
 
+/// A job its card had no room for: how long it waits for room (when it names no max_willing_to_wait_s), and how
+/// often it tries again, seconds
+const NO_ROOM_WAIT_S: f64 = 1800.0;
+const NO_ROOM_EVERY_S: f64 = 10.0;
+
 pub struct Jobs {
     list: Mutex<Vec<Value>>,
     ended: Condvar,
@@ -349,7 +354,18 @@ impl Home {
         body["request_id"] = json!(id);
         let created = j["created"].as_f64().unwrap_or_else(now);
         super::backplane::begin(&method, &j, created);
-        let r = self.work(&method, &body);
+        let mut r = self.work(&method, &body);
+        // no room on its card (another engine's work grew there after this one was placed): the job waits and runs
+        // again, as long as its max_willing_to_wait_s (else NO_ROOM_WAIT_S) allows - not a failure the caller retries
+        let until = now() + j["max_willing_to_wait_s"].as_f64().unwrap_or(NO_ROOM_WAIT_S);
+        while let Err((503, m)) = &r {
+            if backplane_scheduler::rsvp::wait_untag(m).is_some() || self.job_cancelled(id) || now() + NO_ROOM_EVERY_S > until {
+                break;
+            }
+            self.note(Some(id), "waiting", &format!("no room on its card now, again in {NO_ROOM_EVERY_S} s: {m}"));
+            std::thread::sleep(Duration::from_secs_f64(NO_ROOM_EVERY_S));
+            r = self.work(&method, &body);
+        }
         // the model held for what it reserved, the run in the history
         let outcome = match &r {
             Ok(_) => "ok",
