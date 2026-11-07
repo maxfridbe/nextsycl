@@ -187,10 +187,37 @@ color_fix: 0`) and in `options`; `image.upscale` of a picture (a still clip); a 
 1280 x 704 whole: 400, "needs 103.3 GiB ... and the card has 31.9 in all"); an unknown option (400, the list of
 options). The plain kernels (`NS_SILO=0`) give the reference's figures too (latents 1.08e-3, 61.6 dB).
 
+### The attention, measured further (B65, 2026-11-06; main a3fcd0a's build)
+
+The B65 (98.3 TFLOPS half: fewer Xe cores than the B70, the same memory), 65 frames of 864 x 480 x2, each step
+timed alone: the sparse attention 5.62 s, 37.3 % of the timed work, 48.4 TFLOPS (49 % of the B65's peak); the DiT's
+products 4.06 s (27 %, 80 TFLOPS, 82 %); the decoder's convolutions 2.83 s together (19 %, 65-89 %); the LQ
+projection 1.16 s (7.7 %, 78 %); norms and RoPE 0.53 s; the cross-attention 0.26 s (47 %); the decoder's 128 -> 3
+convolution 0.25 s (1.7 %, 3.8 %); the draft (block means, scores, top k, lists) 0.17 s (1.1 %). At 2560 x 1408 the
+same shares (attention 39 %, 47 %). Whole clips on the B65: 864x480 x2 0.215 s/frame, 1280x704 x2 0.434, 864x480 x4
+1.040; the check as before (decoded 8.9e-4, 61.52 dB).
+
+What limits the attention:
+
+| try | attention, 65 frames | what it says |
+|---|---|---|
+| main (129: 128 query rows a work-group, 8 sub-groups of 16, 32 keys a step) | 5.62 s (49 %) | |
+| every LUT row walking the same blocks 0, 1, 2, ... (a probe, `NS_FVSR_ATTN_PROBE`, not kept: wrong output, the same work, the K / V blocks perfectly reused in L2 and L1) | 5.65 s | **not bound by memory**: the blocks' reads from L2 / DRAM cost nothing measurable. Keeping K / V tiles in shared local memory and sharing them between the work-group's sub-groups attacks traffic that is not the limit: each sub-group still has to bring the whole K and V tile into its own registers for its matrix products, from SLM or from L1 alike (the same load path on Xe2, and SLM has no 2-D block loads with the VNNI transform the B operand needs) |
+| the query rows held in registers instead of reloaded for every key tile (an `NS_FVSR_QREG` build of the mainloop) | 10.40 s (27 %) - 1.85x slower; 864x480 0.277 s/frame, 1280x704 0.550, x4 1.333 | **bound by the register file**: the sub-group's output accumulator (16 rows x 128 float32 = 8 KiB) already holds half of a thread's 256 registers; 4 KiB more of query halves the threads an Xe core keeps resident (or spills) |
+| 4 sub-groups of 32 rows (135) | 26.0 s | the same, worse: 16 KiB of accumulator a sub-group |
+| a P V tile 64 columns wide (134, 136) | hung the B70 | known bad |
+
+So the lever is not K / V reuse but registers per sub-group. The design that would move it: the output's 128 columns
+split between two sub-groups that share one block of query rows (each 4 KiB of accumulator: twice the resident
+threads, or room for the query rows), the scores computed once and the probabilities passed through shared local
+memory - a new kernel (the sycl-tla collective rewritten), not a shape of this one. The other parts are near their
+peaks (the products 82 %, the decoder's large convolutions 78-89 %); after the attention the next levers are small:
+the 128 -> 3 convolution (1.7 % of the time at 3.8 % of peak: a direct kernel, ~1.4 % back) and the decoder's 1/8
+and 1/4 convolutions (7 % at 66-68 %).
+
 ### Open
 
-- The attention kernel (above, 42 % of the peak since step 4). nextcuda's FlashAttention-2 walk of the lists, or a
-  kernel that keeps a key block for neighbouring query blocks, are the candidates.
+- The attention kernel (above): the output split across sub-groups, probabilities through SLM.
 - The decoder's 128 -> 3 convolution on oneDNN is at 3 % of peak (1.4 % of the time): a direct kernel would do.
 - No clip of the platform is 1280 x 704: those rows are the 864 x 480 clip scaled up. x4 seams were not examined by eye.
 - Through the production front door (:8000, 2026-11-06): x4 of 864 x 480 0.753 s/frame; a 1344 x 768 film clip
