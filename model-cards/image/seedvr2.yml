@@ -8,7 +8,7 @@ kind: image
 arch: seedvr2
 title: 'SeedVR2 video upscaler (3B and 7B: one-step diffusion restoration, steady over time)'
 about: 'ByteDance-Seed''s SeedVR2 as its official inference runs it: frames resized bicubic to the size asked, the causal 3-D VAE''s latent, one call of the NaDiT (3B: 32 blocks of 2560, mmrope; 7B: 36 of 3072) at t = 1000 with the fixed positive prompt, the decode and the wavelet colour fix. A clip goes through in chunks of 33 frames together (NS_SVR_CHUNK), 4 shared and crossfaded (NS_SVR_OVERLAP): natural detail on faces and skin, no per-frame flicker. Variants seedvr2-3b (default) and seedvr2-7b, scales 1 to 4'
-gpus: '0'
+gpus: '0,1'                     # the B70 and the B65 (shared with the studio): a copy a card, two clips at once
 vram_gib: 26.0                  # the 7B at 1728x960 peaks at 24.5 GiB (see docs/ports/seedvr2.md); one card by default
 defaults: {}
 env: {}
