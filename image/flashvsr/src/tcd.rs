@@ -52,6 +52,8 @@ struct Conv {
     co: usize,
     ci: usize,
     k: usize,
+    /// its profile names with the shape (NS_FVSR_PROFILE=shapes): plain, and summed onto its output
+    shaped: [&'static str; 2],
 }
 
 impl Conv {
@@ -84,7 +86,8 @@ impl Conv {
             26 => "decoder: the last convolution (3 out)",
             _ => "decoder: convolutions at full size",
         };
-        Ok(Conv { what, w: wd, b, co, ci, k })
+        let shaped = [&*Box::leak(format!("{what} [{k}x{k} {ci} -> {co}]").into_boxed_str()), &*Box::leak(format!("{what} [{k}x{k} {ci} -> {co}, summed]").into_boxed_str())];
+        Ok(Conv { what, w: wd, b, co, ci, k, shaped })
     }
 
     fn bytes(&self) -> usize {
@@ -97,7 +100,8 @@ impl Conv {
         let k = ffi::api()?;
         let px = h * w;
         let flops = 2.0 * (px * self.co * self.ci * self.k * self.k) as f64;
-        prof::timed(gpu, self.what, flops, ((px * (self.ci + self.co * if accum { 2 } else { 1 })) * 2 + self.bytes()) as f64, || {
+        let what = if prof::shapes() { self.shaped[accum as usize] } else { self.what };
+        prof::timed(gpu, what, flops, ((px * (self.ci + self.co * if accum { 2 } else { 1 })) * 2 + self.bytes()) as f64, || {
             let b = self.b.as_ref().map_or(std::ptr::null(), |b| b.fp() as *const f32);
             // SAFETY: x holds h x w pixels of ldx halves, out h x w x co halves, the weights co x ci x k x k.
             check(unsafe { (k.conv)(g(gpu), x, 1, h as i64, w as i64, self.ci as i64, ldx as i64, self.w.ptr(), self.co as i64, self.k as i64,

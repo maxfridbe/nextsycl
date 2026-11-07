@@ -24,6 +24,12 @@ struct Stat {
 static ON: OnceLock<bool> = OnceLock::new();
 static STATS: Mutex<BTreeMap<String, Stat>> = Mutex::new(BTreeMap::new());
 
+/// NS_FVSR_PROFILE=shapes: the decoder's convolutions named by their shapes too
+pub fn shapes() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("NS_FVSR_PROFILE").is_ok_and(|v| v.trim() == "shapes"))
+}
+
 pub fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("NS_FVSR_PROFILE").is_some())
 }

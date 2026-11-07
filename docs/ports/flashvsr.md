@@ -215,6 +215,30 @@ peaks (the products 82 %, the decoder's large convolutions 78-89 %); after the a
 the 128 -> 3 convolution (1.7 % of the time at 3.8 % of peak: a direct kernel, ~1.4 % back) and the decoder's 1/8
 and 1/4 convolutions (7 % at 66-68 %).
 
+### The decoder's small convolutions (B65, 2026-11-06)
+
+`NS_FVSR_PROFILE=shapes` names the decoder's convolutions by shape (65 frames of 864 x 480 x2, oneDNN):
+
+| convolution | s | TFLOPS (% of 98.3) |
+|---|---|---|
+| full size 3x3 128 -> 128 | 0.90 | 88 (90 %) |
+| 1/2 3x3 128 -> 128 (plain / summed onto x) | 0.37 / 0.39 | 80 / 75 |
+| 1/2 3x3 256 -> 128 | 0.13 | 78 |
+| 1/4 3x3 256 -> 256 (plain / summed) | 0.21 / 0.21 | 71 / 66 |
+| 1/4 3x3 512 -> 256 | 0.09 | 57 |
+| 1/8 3x3 512 -> 512 (plain / summed) | 0.25 / 0.21 | 68 / 68 |
+| 1/8 3x3 784 -> 512 | 0.08 | 47 |
+| the last, 3x3 128 -> 3 | 0.25 | 3.7 |
+
+Tried for the last one, both slower, not kept: a direct kernel (a work-item a pixel, the weights in local memory,
+float32 sums) 0.57 s; four pixels a work-item 5.6 s (private arrays spilled); the convolution made with 16 outputs (the
+weights zero-padded, a shape for the matrix engines) and its 3 channels taken after 0.30 s - oneDNN's 3-output
+convolution is not compute-bound at 3.7 % but bound by its 288 band-sized calls (0.9 ms each, the same with 16
+outputs). The 1/8 and 1/4 convolutions together are 1.05 s of the 15.1 timed (7 %); at the large ones' 85-90 % they
+would save ~0.2 s (1.3 %). They run a frame at a time (the decoder's causal past); a chunk's frames through each layer
+together (the past is the frame before's input to the same layer) would give oneDNN larger problems - a restructuring
+of tcd.rs, not a shape, left for later. None of the decoder's parts is the lever the attention is.
+
 ### Open
 
 - The attention kernel (above): the output split across sub-groups, probabilities through SLM.
