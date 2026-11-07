@@ -239,9 +239,43 @@ would save ~0.2 s (1.3 %). They run a frame at a time (the decoder's causal past
 together (the past is the frame before's input to the same layer) would give oneDNN larger problems - a restructuring
 of tcd.rs, not a shape, left for later. None of the decoder's parts is the lever the attention is.
 
+### The split-output attention: tried, stopped (B65, 2026-11-06)
+
+The design: a work-group of 16 sub-groups for one 128-row query block, eight pairs of 16 query rows; each 64-key
+tile in local memory once for the work-group (K transposed, the B operand of q k^T row-major); in a pair, one
+sub-group scores keys 0-31 and the other 32-63, their row maxima and sums meet in local memory, the probabilities
+(half) are written there, and each multiplies all 64 by its 64 of V's 128 columns - 16 x 64 float32 of output a
+sub-group (4 KiB, not ARK's 8) with its 16 query rows held in registers (4 KiB). Written as plain SYCL with
+joint_matrix (8x16 accumulators, 8x16 A, 16x16 B; the B65 offers M <= 8, N 16, K 16 for half) behind
+`NS_FVSR_ATTN=split`.
+
+| | result |
+|---|---|
+| a unit test of the layouts it relies on (an accumulator's wi_data[i] = row i of the lane's column; A and B row-major from global and local memory) | as assumed |
+| its scores against the CPU (a 128 x 128 head) | exact (worst 3.8e-3 on values ~10) |
+| its probabilities | wrong for every row but the first of each 8-row tile - the per-row maxima and exponentials read through `get_wi_data` (an internal API) after `reduce_over_group` do not land on the rows the scores did; not resolved |
+| the whole pipeline (`image check`) | 8.5 dB (wrong, as above) |
+| its speed (65 frames, 864 x 480 x2) | **121.1 s against ARK's 5.62 - 2.2 % of the B65's peak, 21x slower** |
+
+Why it stopped (the coordinator's rule: report if a solid attempt does not beat 49 %): the bytes a sub-group must
+bring into its registers per FLOP do not shrink much when the output is split. Per 32 keys, ARK's sub-group (16 rows x
+128 columns) loads Q 4 KiB + K 8 + V 8 = 20 KiB for 262k FLOPs (0.076 B/FLOP); a split sub-group (its 16 rows, 16 of
+the keys for q k^T, 64 of the columns for P V) loads K 4 + V 4 + P 1 = 9 KiB for 131k FLOPs (0.069 B/FLOP, Q held) -
+10 % less, before the exchange through local memory and its barriers. A 64-key tile's work-group does ~2.1 MFLOP and
+reads ~144 KiB from local memory into registers; at ~128 B a clock an Xe core's local memory needs ~1,150 clocks for
+that, about as long as the matrix engines need for the FLOPs (~1,000): the local-memory path is the same wall the L1
+path is, and Xe2 has no 2-D block loads (with the VNNI / transpose the B operand wants) from local memory - the
+loads ARK's kernel gets from L1. The ceiling of this design is about ARK's, not past it; reaching even that needs
+the sycl-tla collective rewritten with 2-D block loads and prefetch, not joint_matrix over local memory (this first
+version's scattered transposing stores and three work-group barriers a tile cost it 20x). The attempt's source (a
+patch, not merged: wrong output) is kept beside the build copy on hardac1 (~/src/nextsycl-flashvsr/split-attempt.patch).
+
 ### Open
 
-- The attention kernel (above): the output split across sub-groups, probabilities through SLM.
+- The attention: 37 % of a frame at 49 % of the peak, bound by registers and the on-core load path; the split-output
+  design measured and analysed above does not lift that ceiling. What would: fewer bytes per FLOP into registers -
+  larger query tiles a sub-group (needs the accumulator somewhere other than registers), or fp8/int8 K/V (changes the
+  numbers: not exact).
 - The decoder's 128 -> 3 convolution on oneDNN is at 3 % of peak (1.4 % of the time): a direct kernel would do.
 - No clip of the platform is 1280 x 704: those rows are the 864 x 480 clip scaled up. x4 seams were not examined by eye.
 - Through the production front door (:8000, 2026-11-06): x4 of 864 x 480 0.753 s/frame; a 1344 x 768 film clip
