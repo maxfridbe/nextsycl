@@ -131,6 +131,10 @@ its LoRAs' files read-only, the output directory - default `~/.local/share/nexts
   `negative_prompt`, `loras` (`["name:scale"]` or `[{name, scale}]` - another set reloads the model with them
   merged, ~4 s; a few-step LoRA brings its own sigmas and steps). The answer's `nextsycl` field has the seconds, steps,
   seed, LoRAs and the card's energy (Wh). Every picture is saved with its settings in the PNG.
+- `POST /v1/images/remove-background` (a remover: `birefnet`, `isnet-general-use`; the front door's
+  `image.remove_background`) - `image`, `mask`, `post_process_mask`, `response_format`: the RGBA picture at its size
+  (its own colours, the mask as straight alpha) and with `mask` the 8-bit grey mask, as `b64_json` / `mask_b64_json`
+  or `url` / `mask_url`; `nextsycl.seconds`. docs/ports/remove-background.md has the checks against rembg.
 - `GET /v1/models`, `/health`, `/v1/images/files/<f>`, `/api/info` (the model, its defaults, samplers, schedules,
   LoRAs, and what the engine takes: `guidance` (cfg and a negative prompt), `grid` (the sides' multiple: 16, HunyuanImage's
   32), `sizes` (the ratios and pixel budgets a page offers: MOSS-Image's), `transparent` (an alpha channel: Qwen-Image, Ming, HunyuanImage; not MOSS-Image's), `shift`: the page snaps its

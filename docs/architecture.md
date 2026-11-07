@@ -421,6 +421,15 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   a size whose stream does not fit runs in 1792 x 1024 tiles over segments of 192 frames (x4). Checked against
   reference/flashvsr/ref.py (the official pipeline on the CPU in float32): the latents 1.2e-3 relative, the decoded
   frames 9e-4, the bytes 61.5 dB. B70: 0.157 s a frame at 2x of 864 x 480, B70 + B65 0.107.
+- **rembg** (`image/rembg`) - background removal, served as `image.remove_background` (nextcuda's API: the RGBA picture
+  at its own size - its colours, the mask as straight alpha - and with `mask` the 8-bit grey mask; docs/ports/
+  remove-background.md has the checks and speeds). Two architectures: `birefnet`, the foundation's remover
+  (`crates/remover`, BiRefNet Swin-L in float32, the 3D engines' cut-out) with its own preparation (PIL's bilinear to
+  1024, ImageNet normalization; the sigmoid as 8 bits, PIL's bicubic back), and `isnet`, IS-Net general-use as rembg
+  runs it - its weights read from rembg's ONNX file by a small protobuf reader (no ONNX runtime), the RSU U-net in
+  float32 (the shared vision im2col and oneDNN's GEMM, its own ceil-mode pool, half-pixel upsampling, bias + ReLU and
+  sigmoid in `kernels/image/rembg`), rembg's Lanczos preparation and min-max mask. `post_process_mask` (either model)
+  is rembg's opening, 5 x 5 Gaussian and threshold, written to OpenCV's 8-bit fixed point.
 
 ## The audio engines
 

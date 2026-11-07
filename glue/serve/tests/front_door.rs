@@ -184,11 +184,11 @@ fn maintenance_refuses_work_and_answers_the_rest() {
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!((st, v["error"]["code"].clone()), (503, json!("maintenance")), "{text}");
     // every way to start work is refused, the newer ones too: upscaling, vectorizing, a recording
-    for method in ["image.upscale", "image.vectorize", "video.upscale", "audio.transcribe"] {
+    for method in ["image.upscale", "image.vectorize", "image.remove_background", "video.upscale", "audio.transcribe"] {
         let e = err(&a, method, json!({"image": "AAAA"}));
         assert_eq!(e["code"], "maintenance", "{method} starts work: {e}");
     }
-    for path in ["/v1/images/upscale", "/v1/images/vectorize", "/v1/videos/upscale", "/v1/audio/transcriptions"] {
+    for path in ["/v1/images/upscale", "/v1/images/vectorize", "/v1/images/remove-background", "/v1/videos/upscale", "/v1/audio/transcriptions"] {
         let (st, text) = http(&a, "POST", path, Some(TOKEN), Some(&json!({"image": "AAAA"})));
         assert_eq!(st, 503, "{path} starts work: {text}");
     }
@@ -305,6 +305,41 @@ fn a_recording_goes_to_a_recogniser_and_to_nothing_else() {
     assert_eq!(e["code"], "maintenance", "{e}");
     let (st, text) = http(&a, "POST", "/v1/audio/transcriptions", Some(TOKEN), Some(&json!({"audio": "AAAA"})));
     assert_eq!(st, 503, "{text}");
+}
+
+#[test]
+fn a_background_goes_to_a_remover_and_a_model_that_draws_is_refused_in_the_platforms_words() {
+    let mut drawer = entry("qwen-image-2.1-q8", "image", &[], true);
+    drawer["arch"] = json!("qwenimage21");
+    // only a model that draws: nobody to remove backgrounds (409, never retry as is)
+    let a = door("rembg-none", vec![drawer.clone()], vec![]);
+    let e = err(&a, "image.remove_background", json!({"image": "AAAA"}));
+    assert_eq!(e["status"], 409, "{e}");
+    assert!(e["message"].as_str().is_some_and(|m| m.contains("no background remover")), "{e}");
+    let mut biref = entry("birefnet", "image", &[], true);
+    biref["arch"] = json!("birefnet");
+    let mut isnet = entry("isnet-general-use", "image", &[], true);
+    isnet["arch"] = json!("isnet");
+    let a = door("rembg", vec![drawer, biref, isnet], vec![]);
+    // naming a model that is not a remover: invalid_params with nextcuda's message, at submit - waiting or not
+    for wait in [true, false] {
+        let e = err(&a, "image.remove_background", json!({"image": "AAAA", "model": "qwen-image-2.1-q8", "wait": wait, "post_process_mask": true}));
+        assert_eq!((e["status"].clone(), e["code"].clone(), e["retryable"].clone()), (json!(400), json!("invalid_params"), json!(false)), "{e}");
+        assert_eq!(e["message"], "qwen-image-2.1-q8 does not remove backgrounds (birefnet, isnet-general-use do)", "{e}");
+    }
+    // the other way round: a remover named for a picture to draw
+    let e = err(&a, "image.generate", json!({"prompt": "a fox", "model": "birefnet"}));
+    assert_eq!(e["status"], 400, "{e}");
+    // the removers advertise image.remove_background and nothing else; the method and its feature are listed
+    let all = ok(&a, "system.models", json!({}));
+    let list: Vec<Value> = all.as_array().cloned().or_else(|| all["models"].as_array().cloned()).unwrap_or_default();
+    for id in ["birefnet", "isnet-general-use"] {
+        let m = list.iter().find(|m| m["id"] == id).unwrap_or_else(|| panic!("{id} not listed in {all}"));
+        assert_eq!(m["methods"], json!(["image.remove_background"]), "{m}");
+    }
+    let v = ok(&a, "system.version", json!({}));
+    assert!(v["methods"].as_array().unwrap().iter().any(|m| m == "image.remove_background"));
+    assert!(v["features"].as_array().unwrap().iter().any(|m| m == "image.remove_background"));
 }
 
 #[test]

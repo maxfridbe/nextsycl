@@ -42,6 +42,14 @@ const VECTORIZED: &str = r#"{"type": "object", "properties": {"created": {"type"
     "closed": {"type": "boolean", "description": "</svg> ended it (false: max_length stopped it, an element maybe half written)"}, "tokens": {"type": "integer"}}}},
   "run": {"type": "object", "properties": {"seconds": {"type": "number"}, "prompt_seconds": {"type": "number"}, "tokens": {"type": "integer"}, "tok_s": {"type": "number"}, "wh": {"type": "number", "nullable": true}}}}}"#;
 
+/// image.remove_background's answer (nextcuda's shape: the platform reads both)
+const CUT_OUT: &str = r#"{"type": "object", "properties": {"created": {"type": "integer"},
+  "data": {"type": "array", "items": {"type": "object", "properties": {"url": {"type": "string", "description": "response_format url: the RGBA PNG (/v1/images/files/<name>.png) - GET it with the token"},
+    "b64_json": {"type": "string", "description": "the RGBA PNG as base64 (the default): the picture's own colours, the mask as straight alpha (not premultiplied)"},
+    "mask_url": {"type": "string", "description": "mask: true, url: the 8-bit grey mask PNG (/v1/images/files/<name>-mask.png)"}, "mask_b64_json": {"type": "string", "description": "mask: true: the mask PNG as base64"},
+    "width": {"type": "integer", "description": "the picture's own size"}, "height": {"type": "integer"}, "model": {"type": "string", "description": "the model that made it"}}}},
+  "nextsycl": {"type": "object", "properties": {"seconds": {"type": "number"}}}}}"#;
+
 const PICTURES: &str = r#"{"type": "object", "properties": {"created": {"type": "integer"},
   "data": {"type": "array", "items": {"type": "object", "properties": {"url": {"type": "string", "description": "response_format url (the default here): GET it with the token"},
     "b64_json": {"type": "string", "description": "response_format b64_json: the PNG"}, "revised_prompt": {"type": "string"}, "seed": {"type": "integer"},
@@ -299,6 +307,8 @@ pub fn result(method: &str) -> Option<String> {
   {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (image.status {{label}} for the rest)"}}]}}"#),
         "image.vectorize" => format!(r#"{{"oneOf": [{{"allOf": [{VECTORIZED}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the SVG, and the job"}},
   {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (image.status {{label}} for the rest)"}}]}}"#),
+        "image.remove_background" => format!(r#"{{"oneOf": [{{"allOf": [{CUT_OUT}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the cut-out picture (and mask), and the job"}},
+  {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (image.status {{label}} for the rest)"}}]}}"#),
         "image.upscale" | "video.upscale" => format!(r#"{{"oneOf": [{{"allOf": [{UPSCALED}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the upscaled picture or clip, and the job"}},
   {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (image.status {{label}} for the rest)"}}]}}"#),
         "model3d.generate" | "model3d.rig" => format!(r#"{{"oneOf": [{{"allOf": [{}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the mesh, and the job"}},
@@ -444,8 +454,8 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
         "system.models.pull" => &[(404, "not_found", "no model card of that id"), (409, "conflict", "it is downloaded already"),
                                   (503, "no_room", "no models folder has the room for it (with 1% of the drive, at least 4 GiB, kept free)")],
         "system.models.pull.cancel" => &[(409, "conflict", "no download of that model is under way")],
-        "image.generate" | "image.edit" | "image.ocr" | "image.upscale" | "image.vectorize" | "video.upscale" | "audio.generate" | "audio.speak" | "audio.transcribe" | "audio.voices.design" | "audio.voices.enroll" | "model3d.generate" | "model3d.rig" =>
-            &[(400, "invalid_params", "a value refused, when the job is submitted (wait false too): steps a few-step model does not run, a size, a sampler, a picture that does not decode, a voice or language the speech model does not have, a priority outside -9..9 ..."),
+        "image.generate" | "image.edit" | "image.ocr" | "image.upscale" | "image.vectorize" | "image.remove_background" | "video.upscale" | "audio.generate" | "audio.speak" | "audio.transcribe" | "audio.voices.design" | "audio.voices.enroll" | "model3d.generate" | "model3d.rig" =>
+            &[(400, "invalid_params", "a value refused, when the job is submitted (wait false too): steps a few-step model does not run, a size, a sampler, a picture that does not decode, a voice or language the speech model does not have, a model that cannot do it (image.remove_background: \"<id> does not remove backgrounds (birefnet, isnet-general-use do)\"), a priority outside -9..9 ..."),
               (404, "not_found", "no such model; a continue_from or upload:<name> that is not here (error.field names which)"), (409, "conflict", "the model is disabled, or none that can do it is enabled (never retry as is)"),
               (409, "busy", "queue: false and the job would not start at once (retryable)"),
               NOT_DOWNLOADED,
@@ -498,7 +508,7 @@ pub const LABELS: &str = "Every job-making request takes a title (120 characters
 Video labels: \"<series> NN/MM: text\" (\"Harbour 03/12: the lamp\"). NN orders video.timeline (the edit order); \
 the series (the text before NN) is where the anchors prev / prev_cam / first / first_cam look, and the project when the request names none. \
 video.cancel, video.queue.move and video.queue.remove name clips by label.\n\n\
-Jobs: image.generate, image.edit, image.upscale, image.vectorize, video.upscale (in the image queue), audio.generate, audio.speak and audio.transcribe run as jobs here - the call can drop and the job goes on; \
+Jobs: image.generate, image.edit, image.upscale, image.vectorize, image.remove_background, video.upscale (in the image queue), audio.generate, audio.speak and audio.transcribe run as jobs here - the call can drop and the job goes on; \
 label one (else its id is its label), read it with <kind>.status {label} (stage and waiting_for say what it waits for), list them with <kind>.jobs, \
 stop it with <kind>.cancel {label}; wait: false answers at once. A kind makes as many jobs at once as it has servers (one a card); the rest wait \
 in a queue as video's: priority, held, project and batch on submit, <kind>.queue.list / move / pause / resume. \

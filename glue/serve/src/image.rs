@@ -20,6 +20,9 @@
 //!                                 the pictures it marks; default true), max_tokens, temperature, ngram (0: no
 //!                                 repetition rule) -> text (the model's markup kept), tokens, seconds; the text
 //!                                 so far is in /api/progress while it is written
+//!   POST /v1/images/remove-background  {image, model, mask, post_process_mask, response_format}: the picture's
+//!                                 background removed by a remover (BiRefNet, IS-Net) - the RGBA PNG (its own colours,
+//!                                 the mask as straight alpha) and with mask the 8-bit grey mask, linked or as base64
 //!   GET  /v1/images/files/<f>     a picture made here (saved in the output directory)
 //!   GET  /v1/models, /health
 //!   GET  /api/info                the model, its defaults, samplers, schedules, the LoRAs it can take
@@ -337,6 +340,17 @@ impl ImageServer {
                     Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
                 }
             }
+            ("POST", "/v1/images/remove-background") => {
+                let body: Value = match serde_json::from_slice(&req.body) {
+                    Ok(v) => v,
+                    Err(e) => return http::respond_with(&mut s, 400, &err(format!("the body is not JSON: {e}")), &cors),
+                };
+                let base = req.host.as_deref().map(|h| format!("http://{h}")).unwrap_or_default();
+                match self.remove_background(&body, &base) {
+                    Ok(v) => http::respond_with(&mut s, 200, &v, &cors),
+                    Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
+                }
+            }
             ("POST", "/v1/images/upscale") | ("POST", "/v1/videos/upscale") => {
                 let body: Value = match serde_json::from_slice(&req.body) {
                     Ok(v) => v,
@@ -438,6 +452,7 @@ impl ImageServer {
                 "loaded": loaded.iter().find(|l| l.name == k.id).map(|l| l.scale)})).collect::<Vec<_>>(),
             "saves": self.out_dir.is_some(), "wfe": self.wfe.is_some(),
             "vectorize": self.engine.lock().ok().and_then(|g| g.as_ref().map(|(e, _)| e.vectorizes())).unwrap_or(false),
+            "remove_background": self.engine.lock().ok().and_then(|g| g.as_ref().map(|(e, _)| e.removes_background())).unwrap_or(false),
             "upscale": self.engine.lock().ok().and_then(|g| g.as_ref().map(|(e, _)| e.upscale_variants())).unwrap_or_default().iter()
                 .map(|v| json!({"variant": v.id, "about": v.about, "scales": v.scales, "noise": v.noise})).collect::<Vec<_>>(),
         })
@@ -641,6 +656,77 @@ impl ImageServer {
         }
         Ok(json!({"created": now(), "data": [{"svg": out.svg, "closed": out.closed, "tokens": out.tokens}],
                   "nextsycl": {"seconds": out.prompt_seconds + out.seconds, "prompt_seconds": out.prompt_seconds, "tokens": out.tokens, "tok_s": tok_s, "wh": wh}}))
+    }
+
+    /// POST /v1/images/remove-background: {image (base64 / data URL), model, mask, post_process_mask, response_format} -
+    /// the picture's background removed: the RGBA picture (its own RGB, straight alpha) and with mask the 8-bit mask, both
+    /// its size, kept and linked (url: <name>.png and <name>-mask.png) or as base64 (b64_json, the default)
+    fn remove_background(&self, b: &Value, base: &str) -> Result<Value, (u16, String)> {
+        let bad = |m: String| (400u16, m);
+        let raw = b["image"].as_str().filter(|v| !v.is_empty()).ok_or_else(|| bad("image: the picture (base64 or a data: URL) is required".into()))?;
+        let pic = init_picture(raw).map_err(bad)?;
+        if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model) {
+            return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
+        }
+        let url = b["response_format"].as_str() == Some("url");
+        if url && self.out_dir.is_none() {
+            return Err(bad("response_format url: this server keeps no files (start it with an output directory)".into()));
+        }
+        let (want_mask, post) = (b["mask"].as_bool().unwrap_or(false), b["post_process_mask"].as_bool().unwrap_or(false));
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let g = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        let (engine, _) = match g.as_ref() {
+            None => return Err((503, "the engine is not loaded".into())),
+            Some((e, _)) if !e.removes_background() => return Err(bad(format!("{} does not remove backgrounds (birefnet, isnet-general-use do)", self.model))),
+            Some(x) => x,
+        };
+        let Some(_running) = self.cancel.begin(b["request_id"].as_str()) else {
+            return Err((499, "cancelled".into()));
+        };
+        let j0 = self.tele.joules();
+        let t0 = Instant::now();
+        *self.progress.lock().unwrap() = json!({"busy": true, "prompt": format!("remove the background of {}x{}", pic.width, pic.height), "at": 0, "of": 1,
+                                                "phase": "mask", "seconds": 0.0});
+        let out = engine.remove_background(&pic, post);
+        *self.progress.lock().unwrap() = json!({"busy": false});
+        let (rgba, mask) = out.map_err(|e| (500u16, e.0))?;
+        let seconds = t0.elapsed().as_secs_f64();
+        let wh = match (j0, self.tele.joules()) {
+            (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
+            _ => None,
+        };
+        let meta = [("model", self.model.clone()), ("post_process_mask", post.to_string()), ("seconds", format!("{seconds:.3}"))];
+        let png = rgba.png_bytes(&meta).map_err(|e| (500u16, e))?;
+        let mpng = if want_mask { Some(mask.png_bytes(&meta).map_err(|e| (500u16, e))?) } else { None };
+        let mut item = json!({"width": pic.width, "height": pic.height, "model": self.model});
+        if let Some(dir) = &self.out_dir {
+            use std::io::Write;
+            let stem = format!("{}-{}-cutout", unique(), self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"));
+            let name = format!("{stem}.png");
+            claim(&dir.join(&name))?.write_all(&png).map_err(|e| (500u16, format!("{}: {e}", dir.display())))?;
+            let mname = format!("{stem}-mask.png");
+            if let Some(m) = &mpng {
+                claim(&dir.join(&mname))?.write_all(m).map_err(|e| (500u16, format!("{}: {e}", dir.display())))?;
+            }
+            let mut h = self.history.lock().unwrap();
+            h.push_front(json!({"kind": "cutout", "url": format!("/v1/images/files/{name}"), "prompt": format!("background removed{}", if post { ", hard mask" } else { "" }),
+                                "width": pic.width, "height": pic.height, "seconds": seconds, "wh": wh, "created": now()}));
+            h.truncate(200);
+            if url {
+                item["url"] = json!(format!("{base}/v1/images/files/{name}"));
+                if mpng.is_some() {
+                    item["mask_url"] = json!(format!("{base}/v1/images/files/{mname}"));
+                }
+            }
+        }
+        if !url {
+            item["b64_json"] = json!(http::base64(&png));
+            if let Some(m) = &mpng {
+                item["mask_b64_json"] = json!(http::base64(m));
+            }
+        }
+        Ok(json!({"created": now(), "data": [item], "nextsycl": {"seconds": seconds}}))
     }
 
     /// An upscale request's settings (image.upscale and video.upscale share them)

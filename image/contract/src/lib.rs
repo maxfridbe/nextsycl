@@ -339,6 +339,16 @@ pub trait ImageEngine: Send + Sync {
     fn vectorize(&self, _req: &VectorizeRequest, _text: &mut dyn FnMut(&str) -> Result<()>) -> Result<VectorizeOutput> {
         Err(Error(format!("{} does not vectorize pictures (starvector does)", self.arch())))
     }
+    /// whether it removes pictures' backgrounds (`remove_background`: BiRefNet, IS-Net)
+    fn removes_background(&self) -> bool {
+        false
+    }
+    /// the picture's object kept, its background removed: (the picture as RGBA - its own RGB, straight alpha: the mask -
+    /// and the mask alone, 8 bits a pixel), both the picture's size; `post_process`: rembg's post_process_mask (an
+    /// opening, a blur, a threshold: a hard 0 / 255 mask)
+    fn remove_background(&self, _pic: &Picture, _post_process: bool) -> Result<(Picture, Picture)> {
+        Err(Error(format!("{} does not remove backgrounds (birefnet, isnet-general-use do)", self.arch())))
+    }
 }
 
 /// How an engine loads: its files, its GPUs, the options, a log

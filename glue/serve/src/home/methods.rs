@@ -854,6 +854,75 @@ pub struct ImageUpscaleReq {
     pub rest: serde_json::Map<String, serde_json::Value>,
 }
 
+/// What image.remove_background takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct ImageRemoveBackgroundReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
+    /// a group inside the project
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 60)]
+    pub batch: Option<String>,
+    /// queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = false)]
+    pub held: Option<bool>,
+    /// the picture: PNG, JPEG or WebP as base64, a data: URL or upload:<name> (image.upload)
+    pub image: String,
+    /// names the job for <kind>.status and <kind>.cancel (default: its id)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
+    /// true: the mask on its own too (an 8-bit grey PNG: mask_b64_json or mask_url)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = false)]
+    pub mask: Option<bool>,
+    /// the model's id (birefnet, isnet-general-use); none: the loaded one, else the first enabled
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// rembg's post_process_mask: an opening (3 x 3 ellipse), a 5 x 5 Gaussian (sigma 2) and a threshold at 127 - a hard 0 / 255 mask (what the platform asked rembg for); either model
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = false)]
+    pub post_process_mask: Option<bool>,
+    /// a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = -9, max = 9, default = 0)]
+    pub priority: Option<i64>,
+    /// a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 60)]
+    pub project: Option<String>,
+    /// false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub queue: Option<bool>,
+    /// idempotent submit (as image.generate)
+    #[serde(rename = "reentrant_id", default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 200)]
+    pub reentrant_id: Option<String>,
+    /// b64_json (default): the PNGs as base64; url: the server keeps them and links them
+    #[serde(rename = "response_format", default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
+    /// true: answer when it ends; false: answer at once with the job
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub wait: Option<bool>,
+    /// what else the caller sent: passed on as it came
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
 /// What image.vectorize takes.
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
@@ -2887,6 +2956,12 @@ fn image_vectorize(h: &Arc<Home>, req: ImageVectorizeReq) -> Answer {
     h.legacy("image.vectorize", req)
 }
 
+/// A picture's background removed (BiRefNet, IS-Net general-use as rembg runs it): the RGBA picture at its own size - its colours, the mask as straight alpha - and with mask: true the 8-bit mask alone; post_process_mask: rembg's hard mask; b64_json (default) or url. A job like image.upscale (wait, reentrant_id, status, cancel)
+#[rpc(name = "image.remove_background", tags = "image", example = r#"{"image": "upload:up_1792400000_chair.png", "mask": true, "model": "birefnet", "post_process_mask": true}"#)]
+fn image_remove_background(h: &Arc<Home>, req: ImageRemoveBackgroundReq) -> Answer {
+    h.legacy("image.remove_background", req)
+}
+
 /// A clip made bigger by an upscaler (as image.upscale: the variant, scale, noise, tile) - frame by frame, or SeedVR2 the clip whole (frames in chunks together) -, its sound copied as it was; an MP4 back. A job in the image queue (image.status, image.cancel)
 #[rpc(name = "video.upscale", tags = "video", example = r#"{"file": "h3_20261019_121939", "model": "real-esrgan", "scale": 2, "variant": "realesr-animevideov3"}"#)]
 fn video_upscale(h: &Arc<Home>, req: VideoUpscaleReq) -> Answer {
@@ -3319,7 +3394,7 @@ rpcgen::rpc_methods![sync Arc<Home>, RpcFail;
     system_gpus, system_disable, system_load, system_unload, system_pin, system_unpin, system_eta, system_config, system_config_set,
     system_restart, system_maintenance, system_drives, system_drive_measure, system_move, system_move_cancel,
     llm_chat, llm_requests, llm_models, llm_describe_prompt_guide_md, image_generate, image_edit,
-    image_upscale, image_vectorize, video_upscale, image_ocr, image_info, image_status,
+    image_upscale, image_vectorize, image_remove_background, video_upscale, image_ocr, image_info, image_status,
     image_jobs, image_queue_list, image_queue_move, image_queue_pause, image_queue_resume, image_upload,
     image_cancel, image_canvases_list, image_progress, image_history, image_describe_prompt_guide_md, audio_generate,
     audio_speak, audio_transcribe, audio_voices_list, audio_voices_add, audio_voices_design, audio_voices_enroll, audio_voices_remove,

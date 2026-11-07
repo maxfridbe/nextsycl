@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-image-rembg"
+description = "Background removal on the GPU: BiRefNet (the foundation's remover) and IS-Net general-use (rembg's); Rust and SYCL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-image.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-remover.workspace = true

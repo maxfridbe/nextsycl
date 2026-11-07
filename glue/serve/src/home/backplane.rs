@@ -37,7 +37,7 @@ type Fail = (u16, String);
 pub(super) const VIDEO_UP_S: u64 = 120;
 
 /// The methods that run a model: what takes `rsvp_s` and `max_willing_to_wait_s` and what `system.eta` answers for
-pub(super) const RUNS_MODEL: &[&str] = &["llm.chat", "image.generate", "image.edit", "image.upscale", "image.vectorize", "image.ocr", "video.upscale", "video.generate", "video.engines.list",
+pub(super) const RUNS_MODEL: &[&str] = &["llm.chat", "image.generate", "image.edit", "image.upscale", "image.vectorize", "image.remove_background", "image.ocr", "video.upscale", "video.generate", "video.engines.list",
     "audio.generate", "audio.speak", "audio.transcribe", "audio.voices.design", "audio.voices.enroll", "model3d.generate", "model3d.rig"];
 
 /// The fields of the backplane that are the door's, not a server's

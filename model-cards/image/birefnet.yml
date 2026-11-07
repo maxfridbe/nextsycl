@@ -1,0 +1,17 @@
+# BiRefNet (ZhengPeng7; MIT): background removal - image.remove_background. The foundation's remover (crates/remover:
+# Swin-L at two scales and its decoder, float32 on the GPU), the one the 3D engines cut pictures out with, served by
+# image/rembg; its file is theirs (defined in model3d/trellis2.yml), downloaded once
+id: birefnet
+kind: image
+arch: birefnet
+license: mit
+commercial: true
+title: 'BiRefNet background removal (an object cut out: RGBA and its mask)'
+about: 'ZhengPeng7''s BiRefNet (general, Swin-L, 1024 x 1024): the picture''s object kept, its background made transparent - the RGBA picture (its own colours, the mask as straight alpha) and the 8-bit mask at the picture''s size; post_process_mask is rembg''s opening, blur and threshold. Float32 on one card; checked against BiRefNet''s own code (docs/ports/remove-background.md)'
+gpus: '0'
+vram_gib: 3.0
+defaults: {}
+env: {}
+files:
+  remover: birefnet             # defined in model3d/trellis2.yml
+guide: guides/remove-background.md

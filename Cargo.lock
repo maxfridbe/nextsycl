@@ -577,6 +577,7 @@ dependencies = [
  "nextsycl-image-olmocr2",
  "nextsycl-image-paddleocrvl",
  "nextsycl-image-qwenimage21",
+ "nextsycl-image-rembg",
  "nextsycl-image-seedvr2",
  "nextsycl-image-starvector",
  "nextsycl-image-unlimitedocr",
@@ -882,6 +883,16 @@ dependencies = [
  "nextsycl-image",
  "nextsycl-qwen3vl",
  "serde_json",
+]
+
+[[package]]
+name = "nextsycl-image-rembg"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-image",
+ "nextsycl-remover",
 ]
 
 [[package]]

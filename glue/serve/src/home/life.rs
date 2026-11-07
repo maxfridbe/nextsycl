@@ -204,6 +204,7 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
         // a clip upscaled as one stream (a KV cache over the frames before: no seams)
         "image" if arch == "flashvsr" => (vec!["upscale", "upscale_video", "temporal", "stream"], vec!["image.upscale", "video.upscale"]),
         "image" if arch == "starvector" => (vec!["vectorize", "svg"], vec!["image.vectorize"]),
+        "image" if arch == "birefnet" || arch == "isnet" => (vec!["remove_background", "mask", "rgba"], vec!["image.remove_background"]),
         "image" => {
             let mut c = vec!["generate", "edit", "compose", "img2img", "loras"];
             if m["env"]["NS_QI_SIGMAS"].is_string() {

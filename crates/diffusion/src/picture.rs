@@ -107,7 +107,13 @@ impl Picture {
 
     fn encode_png(&self, out: impl std::io::Write, text: &[(&str, String)]) -> Result<(), String> {
         let mut enc = png::Encoder::new(out, self.width, self.height);
-        enc.set_color(if self.channels == 4 { png::ColorType::Rgba } else { png::ColorType::Rgb });
+        // a mask (one channel) is a grey PNG
+        enc.set_color(match self.channels {
+            4 => png::ColorType::Rgba,
+            2 => png::ColorType::GrayscaleAlpha,
+            1 => png::ColorType::Grayscale,
+            _ => png::ColorType::Rgb,
+        });
         enc.set_depth(png::BitDepth::Eight);
         for (k, v) in text {
             // tEXt holds Latin-1 only: other text (an em dash, Chinese) goes as iTXt, UTF-8

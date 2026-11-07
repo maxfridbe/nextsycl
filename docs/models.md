@@ -54,6 +54,8 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `olmocr-2-7b-q8` | olmOCR-2-7B-1025 (Ai2, a Qwen2.5-VL-7B fine-tune): pages to Markdown in reading order | `olmocr2` | ~11 GiB (decoder Q8_0, vision float32) | checked (llama.cpp), served |
 | `moss-image-sft-q4kxl` | MOSS-Image-SFT UD-Q4_K_XL (OpenMOSS, Apache-2.0): 5.1B DiT + Qwen3.5-9B text encoder + FLUX.2 VAE; sentences, tags or a JSON layout | `moss-image` | 14.0 GiB | checked, served |
 | `moss-image-sft-q8`, `-q6kxl`, `-q5kxl`, `-q4km`, `-bf16` | the same DiT in Q8_0 / UD-Q6_K_XL / UD-Q5_K_XL / Q4_K_M / BF16 (a forward 0.46 s at 1024 whichever: the matrices are expanded to half at load) | `moss-image` | 17 / 16 / 15.5 / 14 / 21.5 GiB | loaded, pictures checked by eye (the reference is the Q4_K_XL file's) |
+| `birefnet` | BiRefNet (ZhengPeng7, MIT, Swin-L): `image.remove_background` - the RGBA cut-out and its mask; the 3D engines' remover | `rembg` | 0.4 GiB file, ~3 GiB working | checked (its own code; docs/ports/remove-background.md) |
+| `isnet-general-use` | IS-Net general-use as rembg runs it (Apache-2.0 weights, rembg's ONNX file): `image.remove_background` | `rembg` | 0.2 GiB file, ~2 GiB working | checked (rembg 2.0.67) |
 | `qwen-image-2.1-turbo-q8` | Qwen-Image 2.1 Turbo (Viggle v0.3 merged): 6 steps | `qwenimage21` | 16.5 GiB | checked |
 | `qwen-image-2.1-q6k`, `-uncensored-q8` | Qwen-Image 2.1 Q6_K; the uncensored model in Q8_0 | `qwenimage21` | 14.8 / 16.4 GiB | listed |
 | `moss-image-sft-q3kxl` (not offered) | UD-Q3_K_XL: its Q3_K matrices are not read yet | `moss-image` | 2.6 GiB | needs Q3_K in the dequant |

@@ -1,0 +1,23 @@
+# IS-Net general-use (xuebinqin/DIS; Apache-2.0) as rembg ships it (danielgatis/rembg's isnet-general-use.onnx, MIT):
+# background removal - image.remove_background, rembg's own preparation and mask (image/rembg: the network in Rust and
+# SYCL, its weights read from the ONNX file; no ONNX runtime)
+id: isnet-general-use
+kind: image
+arch: isnet
+license: apache-2.0
+commercial: true
+license_note: 'The IS-Net weights are DIS''s (Apache-2.0); the ONNX file is rembg''s release (MIT)'
+title: 'IS-Net general-use background removal (rembg''s default: what the platform cut pictures out with)'
+about: 'IS-Net (DIS) general-use as rembg runs it: Pillow''s Lanczos to 1024, the U-net of RSU blocks in float32 on the GPU, the mask scaled to its range and back to the picture''s size; post_process_mask is rembg''s opening, blur and threshold. The RGBA picture (its own colours, the mask as straight alpha) and the 8-bit mask at the picture''s size. Checked against rembg 2.0.67 on onnxruntime (docs/ports/remove-background.md)'
+gpus: '0'
+vram_gib: 2.0
+defaults: {}
+env: {}
+files:
+  isnet:
+    key: rembg-isnet-general-use
+    url: https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx
+    size: 178648008
+    sha256: 60920e99c45464f2ba57bee2ad08c919a52bbf852739e96947fbb4358c0d964a
+    path: isnet/isnet-general-use.onnx
+guide: guides/remove-background.md

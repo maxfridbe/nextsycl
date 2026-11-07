@@ -88,6 +88,11 @@ impl Home {
         queue_fields(b)?;
         match name {
             "image.generate" | "image.edit" => self.precheck_image(name == "image.edit", b, all),
+            // a model that is not a remover, refused at submit (wait: false too) in the platform's words
+            "image.remove_background" => match b["model"].as_str().and_then(|id| super::api::not_a_remover(id, all)) {
+                Some(why) => Err(bad(why)),
+                None => Ok(()),
+            },
             "audio.speak" => self.precheck_speak(b, all),
             "audio.voices.enroll" => self.precheck_enroll(b, all),
             "audio.generate" => {

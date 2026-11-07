@@ -23,13 +23,15 @@ nextsycl image upscale PICTURE [--model real-esrgan|waifu2x | --dir NCNN_DIR] [-
 nextsycl image upscale-check PICTURE REFERENCE.png [upscale's options]   (against realesrgan- / waifu2x-ncnn-vulkan's output: PSNR, worst pixel)
 nextsycl image vectorize PICTURE [--model starvector-1b-im2svg | --dir CHECKPOINT_DIR] [--max-length N] [--beams N] [--greedy] [--top-p P] [--seed S] [--out FILE.svg] [--gpu N]
 nextsycl image vectorize PICTURE --check REFERENCE_DIR [--stages pixels,encoder,prefill,logits,greedy] [--dir ...]   (against reference/starvector/ref.py's dumps)
+nextsycl image remove-background PICTURE [--model birefnet|isnet-general-use | --file MODEL_FILE] [--post-process] [--out FILE.png] [--mask FILE.png] [--gpu N]
+nextsycl image remove-background --check REFERENCE_DIR [--model ... | --file ...] [--gpu N]   (against reference/rembg/ref.py's dumps)
 nextsycl image engines | selftest [--gpu N]";
 
 /// The image engines this program has (image/<arch>)
 pub fn engines() -> Vec<nextsycl_image::ImageKind> {
     vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_olmocr2::kind(), nextsycl_image_hunyuanimage21::kind(),
          nextsycl_image_upscale::kind(), nextsycl_image_starvector::kind(), nextsycl_image_mingimage::kind(), nextsycl_image_mossimage::kind(), nextsycl_image_seedvr2::kind(),
-         nextsycl_image_flashvsr::kind(), nextsycl_image_example::kind()]
+         nextsycl_image_flashvsr::kind(), nextsycl_image_rembg::kind(), nextsycl_image_example::kind()]
 }
 
 /// `--gpu 0` or `--gpu 0,1` (an engine that splits over two cards takes the second too)
@@ -483,6 +485,71 @@ fn vectorize_cmd(cfg: &Config, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `image remove-background`: a remover in this process (`--check DIR`: each picture's stages against the reference's
+/// dumps); `--file` a model file without a registry entry (an .onnx is IS-Net's, else BiRefNet's safetensors)
+fn remove_background_cmd(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let mut pos = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--post-process" {
+            continue;
+        }
+        if a.starts_with("--") {
+            it.next();
+        } else {
+            pos.push(a.clone());
+        }
+    }
+    nextsycl_core::use_kind("image");
+    let (arch, files) = match opt(args, "--file") {
+        Some(f) => {
+            let isnet = f.ends_with(".onnx");
+            let role = if isnet { "isnet" } else { "remover" };
+            let arch = if isnet { nextsycl_image_rembg::ARCH_ISNET } else { nextsycl_image_rembg::ARCH_BIREFNET };
+            (arch.to_string(), ModelFiles::from([(role.to_string(), PathBuf::from(f))]))
+        }
+        None => {
+            let (m, files) = model(cfg, Some(opt(args, "--model").unwrap_or("birefnet")))?;
+            (m["arch"].as_str().unwrap_or("").to_string(), files)
+        }
+    };
+    let gs = gpus(args)?;
+    let mut log = |s: String| eprintln!("{s}");
+    if let Some(d) = opt(args, "--check") {
+        let rows = if arch == nextsycl_image_rembg::ARCH_ISNET {
+            let f = files.get("isnet").ok_or("isnet: no file")?;
+            let net = nextsycl_image_rembg::isnet::IsNet::load(&nextsycl_image_rembg::onnx::Model::open(f).map_err(|e| e.0)?, &gs[0]).map_err(|e| e.0)?;
+            nextsycl_image_rembg::check::isnet(&net, Path::new(d), &mut log).map_err(|e| e.0)?
+        } else {
+            let f = files.get("remover").ok_or("birefnet: no remover file")?;
+            let r = nextsycl_image_rembg::Remover::load(f, &gs[0]).map_err(|e| e.0)?;
+            nextsycl_image_rembg::check::birefnet(&r, Path::new(d), &mut log).map_err(|e| e.0)?
+        };
+        let worst = rows.iter().map(|r| r.net.1).fold(0.0, f64::max);
+        let mask = rows.iter().map(|r| r.mask.0).fold(1.0, f64::min);
+        let pp = rows.iter().map(|r| r.pp.0).fold(1.0, f64::min);
+        println!("{} pictures on {}: worst relative error of the prediction {worst:.2e}; masks at least {:.4}% equal (at most {} apart); post-processed at least {:.4}% equal",
+                 rows.len(), gs[0].name, mask * 100.0, rows.iter().map(|r| r.mask.1).max().unwrap_or(0), pp * 100.0);
+        return Ok(());
+    }
+    let input = pos.first().ok_or(USAGE)?;
+    let kinds = engines();
+    let k = nextsycl_image::kind_for(&kinds, &arch)?;
+    let e = (k.load)(&files, &gs, &Default::default(), &mut log).map_err(|e| e.0)?;
+    let pic = nextsycl_image::Picture::decode(&std::fs::read(input).map_err(|e| format!("{input}: {e}"))?)?;
+    let t0 = std::time::Instant::now();
+    let (rgba, mask) = e.remove_background(&pic, args.iter().any(|a| a == "--post-process")).map_err(|e| e.0)?;
+    eprintln!("{}x{}: the background removed in {:.3} s on {}", pic.width, pic.height, t0.elapsed().as_secs_f64(), gs[0].name);
+    let out = opt(args, "--out").map(str::to_string).unwrap_or_else(|| format!("{}-cutout.png", input.trim_end_matches(|c: char| c != '.').trim_end_matches('.')));
+    rgba.write_png(Path::new(&out), &[("model", arch.clone())])?;
+    eprintln!("saved {out}");
+    if let Some(m) = opt(args, "--mask") {
+        mask.write_png(Path::new(m), &[("model", arch.clone())])?;
+        eprintln!("saved {m}");
+    }
+    Ok(())
+}
+
 fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let dir = Path::new(args.first().ok_or(USAGE)?);
     nextsycl_core::use_kind("image");
@@ -741,6 +808,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("upscale") => upscale_cmd(cfg, rest, false),
         Some("upscale-check") => upscale_cmd(cfg, rest, true),
         Some("vectorize") => vectorize_cmd(cfg, rest),
+        Some("remove-background") => remove_background_cmd(cfg, rest),
         Some("ocr") => ocr(cfg, rest),
         Some("serve") => serve(cfg, rest),
         Some("start") => SERVED.start(cfg, rest, |d| run(cfg, rest, d)),

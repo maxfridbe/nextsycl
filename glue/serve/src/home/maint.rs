@@ -19,13 +19,13 @@ type Fail = (u16, String);
 pub(super) fn starts_work(method: &str) -> bool {
     matches!(method, "system.enable" | "system.load" | "system.pin" | "llm.chat" | "image.generate" | "image.edit" | "image.ocr" | "audio.generate" | "audio.speak"
                      | "audio.transcribe" | "audio.voices.design" | "audio.voices.enroll" | "video.generate" | "model3d.generate" | "model3d.rig"
-                     | "image.upscale" | "video.upscale" | "image.vectorize")
+                     | "image.upscale" | "video.upscale" | "image.vectorize" | "image.remove_background")
 }
 
 /// The OpenAI routes that start work
 fn openai_starts_work(method: &str, path: &str) -> bool {
     method == "POST" && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/images/generations" | "/v1/images/edits" | "/v1/audio/speech" | "/v1/audio/transcriptions" | "/v1/model3d/generate" | "/v1/model3d/rig"
-                                       | "/v1/images/upscale" | "/v1/videos/upscale" | "/v1/images/vectorize")
+                                       | "/v1/images/upscale" | "/v1/videos/upscale" | "/v1/images/vectorize" | "/v1/images/remove-background")
 }
 
 impl Home {

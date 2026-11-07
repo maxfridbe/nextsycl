@@ -885,6 +885,85 @@ export interface ImageQueueResumeReq {
   [key: string]: unknown;
 }
 
+/** What image.remove_background takes. */
+export interface ImageRemoveBackgroundReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
+  /**
+   * a group inside the project
+   * @maxLength 60
+   */
+  batch?: string | null;
+  /**
+   * queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
+   * @default false
+   */
+  held?: boolean | null;
+  /** the picture: PNG, JPEG or WebP as base64, a data: URL or upload:<name> (image.upload) */
+  image: string;
+  /**
+   * names the job for <kind>.status and <kind>.cancel (default: its id)
+   * @maxLength 120
+   */
+  label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
+  /**
+   * true: the mask on its own too (an 8-bit grey PNG: mask_b64_json or mask_url)
+   * @default false
+   */
+  mask?: boolean | null;
+  /** the model's id (birefnet, isnet-general-use); none: the loaded one, else the first enabled */
+  model?: string | null;
+  /**
+   * rembg's post_process_mask: an opening (3 x 3 ellipse), a 5 x 5 Gaussian (sigma 2) and a threshold at 127 - a hard 0 / 255 mask (what the platform asked rembg for); either model
+   * @default false
+   */
+  post_process_mask?: boolean | null;
+  /**
+   * a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
+   * @minimum -9
+   * @maximum 9
+   * @default 0
+   */
+  priority?: number | null;
+  /**
+   * a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}
+   * @maxLength 60
+   */
+  project?: string | null;
+  /**
+   * false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn
+   * @default true
+   */
+  queue?: boolean | null;
+  /**
+   * idempotent submit (as image.generate)
+   * @maxLength 200
+   */
+  reentrant_id?: string | null;
+  /** b64_json (default): the PNGs as base64; url: the server keeps them and links them */
+  response_format?: ResponseFormat | null;
+  /**
+   * true: answer when it ends; false: answer at once with the job
+   * @default true
+   */
+  wait?: boolean | null;
+  /** other keys */
+  [key: string]: unknown;
+}
+
 /** What image.status takes. */
 export interface ImageStatusReq {
   /** the job's label (looked up first) */
@@ -2424,6 +2503,12 @@ export interface Methods {
    */
   "image.vectorize": { req: ImageVectorizeReq; resp: any };
   /**
+   * A picture's background removed (BiRefNet, IS-Net general-use as rembg runs it): the RGBA picture at its own size - its colours, the mask as straight alpha - and with mask: true the 8-bit mask alone; post_process_mask: rembg's hard mask; b64_json (default) or url. A job like image.upscale (wait, reentrant_id, status, cancel)
+   * @tags image
+   * @example {"image":"upload:up_1792400000_chair.png","mask":true,"model":"birefnet","post_process_mask":true}
+   */
+  "image.remove_background": { req: ImageRemoveBackgroundReq; resp: any };
+  /**
    * A clip made bigger by an upscaler (as image.upscale: the variant, scale, noise, tile) - frame by frame, or SeedVR2 the clip whole (frames in chunks together) -, its sound copied as it was; an MP4 back. A job in the image queue (image.status, image.cancel)
    * @tags video
    * @example {"file":"h3_20261019_121939","model":"real-esrgan","scale":2,"variant":"realesr-animevideov3"}
@@ -3056,6 +3141,12 @@ export function client(post: Post, raw?: PostRaw) {
      * @example {"image":"upload:up_1792400000_logo.png","max_length":5000,"model":"starvector-1b-im2svg"}
      */
     "image.vectorize": (req: ImageVectorizeReq): Promise<any> => post("image.vectorize", req),
+    /**
+     * A picture's background removed (BiRefNet, IS-Net general-use as rembg runs it): the RGBA picture at its own size - its colours, the mask as straight alpha - and with mask: true the 8-bit mask alone; post_process_mask: rembg's hard mask; b64_json (default) or url. A job like image.upscale (wait, reentrant_id, status, cancel)
+     * @tags image
+     * @example {"image":"upload:up_1792400000_chair.png","mask":true,"model":"birefnet","post_process_mask":true}
+     */
+    "image.remove_background": (req: ImageRemoveBackgroundReq): Promise<any> => post("image.remove_background", req),
     /**
      * A clip made bigger by an upscaler (as image.upscale: the variant, scale, noise, tile) - frame by frame, or SeedVR2 the clip whole (frames in chunks together) -, its sound copied as it was; an MP4 back. A job in the image queue (image.status, image.cancel)
      * @tags video
