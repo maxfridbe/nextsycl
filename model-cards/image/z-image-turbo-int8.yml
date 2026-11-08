@@ -1,0 +1,34 @@
+# Z-Image-Turbo int8 (ConvRot: the card's int8 products, ~1.4x the BF16's speed; Rust + SYCL)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets.
+# The DiT is Comfy-Org's int8 ConvRot file (every block matrix int8 with a scale per row, its inputs rotated by a
+# normalized Hadamard matrix in groups of 256; the activations quantized per row on the fly); the text encoder, VAE and
+# tokenizer are z-image-turbo's. The same pictures as the BF16 card's in composition, small details differ (PSNR 27.5 dB
+# against it at 1024 x 1024; docs/ports/z-image-turbo.md).
+id: z-image-turbo-int8
+kind: image
+arch: z-image
+license: apache-2.0
+commercial: true
+license_note: 'Apache-2.0 for the weights (Tongyi-MAI/Z-Image-Turbo) and the text encoder (Qwen3-4B); the int8 file and the single-file text encoder are repackings of them (Comfy-Org), the VAE is the Flux.1 VAE as the model repository ships it'
+title: 'Z-Image-Turbo int8 (text to image in 8 steps, int8 products: faster, a little less exact; Rust + SYCL)'
+about: 'Tongyi-MAI''s Z-Image-Turbo with Comfy-Org''s int8 ConvRot DiT (5.6 GiB on the card instead of 11.2, products at the int8 rate), Qwen3-4B in bf16, the Flux.1 VAE; the same compositions as z-image-turbo, small details differ'
+gpus: '0'
+vram_gib: 19.0
+defaults:
+  steps: 8
+  cfg: 1.0
+  sampler: euler
+  schedule: shift
+  size: 1024x1024
+env: {}
+files:
+  transformer:
+    key: z-image-turbo-int8-convrot
+    url: https://huggingface.co/Comfy-Org/z_image_turbo/resolve/6fc90a3b1b653e935a0d175e260736de25b84df5/split_files/diffusion_models/z_image_turbo_int8_convrot.safetensors
+    size: 6201001296
+    sha256: be517ebd47c912a5626a588e1aeea43e6be4a43c0cdcd2b48a2a780d9f358635
+    path: z-image-turbo/z_image_turbo_int8_convrot.safetensors
+  text-encoder: z-image-turbo-qwen3-4b
+  vae: z-image-turbo-vae
+  tokenizer: z-image-turbo-tokenizer
+guide: guides/z-image-turbo.md

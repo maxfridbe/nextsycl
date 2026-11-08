@@ -126,6 +126,48 @@ pub fn run(m: &ZImage, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String))
             worst = worst.max(note(&format!("velocity, step {i}"), &v, &want, log));
         }
     }
+    if stages.contains(&"bench") {
+        // each stage warm, then timed, at the dump's size; one forward profiled part by part; the products alone
+        fn time(log: &mut dyn FnMut(String), what: &str, f: &mut dyn FnMut() -> Result<()>) -> Result<f64> {
+            f()?;
+            let t0 = std::time::Instant::now();
+            f()?;
+            let s = t0.elapsed().as_secs_f64();
+            log(format!("bench {what:<26} {s:.3} s"));
+            Ok(s)
+        }
+        log(format!("bench prompt of {} tokens, latents {lh} x {lw} ({n} image tokens)", ids.len()));
+        time(log, "text encoder", &mut || m.te.encode_ids(&ids, te::LAYERS, None).map(|_| ()))?;
+        time(log, "caption (context refiner)", &mut || m.dit.prefix(&m.nsd, &cap, None).map(|_| ()))?;
+        let pre = m.dit.prefix(&m.nsd, &cap, None)?;
+        let mods = m.dit.mods(&m.nsd, &sig)?;
+        let lat = nextsycl_core::DevBuf::from_f32(&m.nsd.gpu, &dit::patchify(&lat0, lh, lw))?;
+        time(log, "DiT forward", &mut || m.dit.velocity(&m.nsd, &pre, &lat, hw, &mods[0], None).map(|_| ()))?;
+        let mut g = dit::Grabs { profile: true, ..Default::default() };
+        m.dit.velocity(&m.nsd, &pre, &lat, hw, &mods[0], Some(&mut g))?;
+        let total: f64 = g.prof.iter().map(|(_, t)| t).sum();
+        for (name, t) in &g.prof {
+            log(format!("bench   DiT part {name:<18} {t:.3} s  {:4.1} %", 100.0 * t / total));
+        }
+        for (what, t, fl) in m.dit.gemm_probe(&m.nsd, np + pre.rows)? {
+            log(format!("bench product {what:<12} {:.2} ms  ({:.0} TFLOPS)", t * 1e3, fl / t / 1e12));
+        }
+        time(log, "VAE decode", &mut || m.vae.decode(&m.nsd, &lat0, lh, lw).map(|_| ()))?;
+    }
+    if stages.contains(&"sizes") {
+        // the whole request (text encoder, 8 steps, VAE) at the model's own sizes of the 1024 budget, the larger squares
+        // and the largest sides: each made twice, the second timed
+        use nextsycl_image::ImageEngine;
+        let mut sizes: Vec<(u32, u32)> = crate::SIZES[..11].to_vec();
+        sizes.extend([(1280, 1280), (1536, 1024), (1536, 1536), (2048, 1152), (2048, 2048)]);
+        for (w, h) in sizes {
+            let req = nextsycl_image::ImageRequest { prompt: prompt.clone(), width: Some(w), height: Some(h), seed: 42, n: 1, ..Default::default() };
+            m.generate(&req, &mut |_| Ok(()))?;
+            let t0 = std::time::Instant::now();
+            m.generate(&req, &mut |_| Ok(()))?;
+            log(format!("size {w}x{h}: {:.2} s a picture", t0.elapsed().as_secs_f64()));
+        }
+    }
     let mut ours_lat = None;
     if stages.contains(&"steps") {
         let pre = m.dit.prefix(&m.nsd, &cap, None)?;

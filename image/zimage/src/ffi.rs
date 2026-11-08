@@ -72,6 +72,51 @@ pub const ACT_SCALE: f32 = 1.0 / 256.0;
 /// without pushing their small values into half's subnormals as 1/256 does)
 pub const QKV_SCALE: f32 = 1.0 / 16.0;
 
+/// The silo's name (`kernels/image/zimage/silo` -> `dist/silo/libnextsycl-zimage.so`)
+pub const SILO: &str = "zimage";
+
+/// The silo's fused passes (silo.h)
+pub struct Silo {
+    pub supported: unsafe extern "C" fn(G, i64, i64) -> c_int,
+    pub norm_gate_norm: unsafe extern "C" fn(G, *const f32, *mut f32, i64, i64, *const f32, f32, *const f32, *const f32, f32, *const f32, M) -> c_int,
+    pub qk_rope: unsafe extern "C" fn(G, M, i64, i64, i64, i64, i64, *const f32, *const f32, f32, *const f32) -> c_int,
+    pub swiglu: unsafe extern "C" fn(G, P, i64, i64, f32, M) -> c_int,
+}
+
+// SAFETY: function pointers into a library that stays loaded for the process.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+/// The silo, when built (None: NS_SILO=0, or no file - the engine's own kernels throughout)
+pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
+    static S: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    S.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo(SILO).map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in silo.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo {
+            supported: sym!("ns_image_zimage_silo_supported"),
+            norm_gate_norm: sym!("ns_image_zimage_silo_norm_gate_norm"),
+            qk_rope: sym!("ns_image_zimage_silo_qk_rope"),
+            swiglu: sym!("ns_image_zimage_silo_swiglu"),
+        }))
+    })
+    .as_ref()
+    .map(|s| s.as_ref())
+    .map_err(|e| nextsycl_core::Error(e.clone()))
+}
+
 /// A call's return code as a result (the reason from the library)
 pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
     if rc == 0 {

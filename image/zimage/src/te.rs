@@ -108,7 +108,7 @@ impl TextEncoder {
             let h = DevBuf::new(gpu, rows * kk * 2)?;
             nsd.dequant(src.ptr(), 30, rows * kk, h.ptr(), Dt::F16)?;
             nsd.wait()?;
-            Ok(Part { w: Weights::Half(h), rows, k: kk })
+            Ok(Part { w: Weights::Half(h), rows, k: kk, scale: 1.0 })
         };
         let mut layers = Vec::with_capacity(LAYERS);
         let mut bytes = 0u64;

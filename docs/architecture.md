@@ -46,6 +46,8 @@ image/                     IMAGES
   unlimitedocr nextsycl-image-unlimitedocr  Unlimited-OCR: pages to Markdown (SAM-B + CLIP-L, a DeepSeek-V2 MoE decoder)
   flashvsr   nextsycl-image-flashvsr  FlashVSR v1.1: streaming one-step video super-resolution (Wan 2.1 1.3B, block-sparse
                                  attention over a KV ring, the LQ projection, the tiny conditional decoder), stage checks
+  zimage     nextsycl-image-zimage  Z-Image-Turbo: the 6B single-stream DiT (Ming-Image's transformer) on Qwen3-4B's
+                                 states, Flux.1's VAE, 8 steps without guidance; a silo of fused passes, stage checks
   example    nextsycl-image-example  a template
 
 video/                     VIDEO

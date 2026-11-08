@@ -95,6 +95,22 @@ B70, 1024x1024: 4 steps 2.9 s, 8 steps 4.5 s, the quoted "WELCOME" spelled right
 not offered. The 8-step LoRAs also work at 4 steps (the DMD2 one best); the 4-step one wants 6 steps around 1536 wide
 and 8 at 2048x2048.
 
+## Z-Image-Turbo
+
+```sh
+nextsycl models pull z-image-turbo
+nextsycl image gen 'A small red fox in fresh snow, a wooden sign reading "WELCOME"' --model z-image-turbo [--size 1280x720] [--steps 8] [--shift 3]
+nextsycl image check <reference dump dir> --model z-image-turbo [--stages tokens,te,dit,steps,vae,full,bench,sizes]
+```
+
+Tongyi-MAI's 6B text to image model (Apache-2.0), distilled to 8 steps without guidance: Z-Image's single-stream DiT
+(the transformer Ming-Image is built on) conditioned by Qwen3-4B's hidden states, Flux.1's VAE. The files are the
+official weights to the bit (unsloth's BF16 GGUF of the DiT, ComfyUI's single-file Qwen3-4B), all on one card.
+No negative prompt and no guidance (cfg 1, or the pipeline's 0; another is refused); sizes are multiples of 16 from
+256 to 2048 a side, the page offering the model's own demo sizes (1024, 1280 and 1536 squared budgets, 1:1 to 21:9);
+steps 1 to 50 (8: the model's), the shift a request's (3: the model's). Port notes, parity and speed:
+[ports/z-image-turbo.md](ports/z-image-turbo.md).
+
 ## HunyuanImage 2.1
 
 ```sh

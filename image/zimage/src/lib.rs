@@ -23,7 +23,6 @@ use std::time::Instant;
 
 use nextsycl_core::{DevBuf, Gpu};
 use nextsycl_diffusion::kernels::Nsd;
-use nextsycl_gguf::Gguf;
 use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, Picture, Result, Sampler, Schedule, SizePresets, Step};
 
 pub const ARCH: &str = "z-image";
@@ -132,13 +131,13 @@ impl ZImage {
         nextsycl_core::use_kind("image");
         let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?.clone();
         let te_gpu = gpus.get(1).cloned().unwrap_or_else(|| gpu.clone());
-        let f = Gguf::open(role(files, "transformer")?).map_err(|e| Error(e.0))?;
-        if f.architecture() != "lumina2" {
-            return Err(Error(format!("{ARCH}: the transformer file is a {} model, not Z-Image's DiT (lumina2)", f.architecture())));
+        let f = dit::Source::open(role(files, "transformer")?)?;
+        if !matches!(f.what().as_str(), "lumina2" | "int8 ConvRot") {
+            return Err(Error(format!("{ARCH}: the transformer file is a {} model, not Z-Image's DiT (a lumina2 GGUF or ComfyUI's int8 ConvRot file)", f.what())));
         }
         // the plan: the DiT (float matrices made half: their size as stored or less), the encoder on its card, the VAE
         // and the activations of a 1024 x 1024 picture
-        let dit_b: u64 = f.tensors.iter().map(|t| if t.ty.code() == 0 { t.bytes / 2 } else { t.bytes }).sum();
+        let dit_b = f.card_bytes();
         let te_b = te::plan_bytes(role(files, "text-encoder")?)?;
         let work = dit::work_bytes(4096 + 512) + vae::Vae::work_bytes(1 << 20) + (1u64 << 28);
         let same = Arc::ptr_eq(&gpu, &te_gpu);
