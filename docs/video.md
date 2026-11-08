@@ -15,7 +15,7 @@ nextsycl video job <kind> ... --here                            # a job in this 
 nextsycl video stop [--web | --all]
 ```
 
-- **The engine** (`video/h3`, the `VideoEngine` contract): H3's h3-core, its jobs (generate, encode, decode,
+- **The engine** (`video/h3`, the `VideoEngine` contract; its code is the foundation crate `crates/h3`, which P-H3-Image's image engine runs too): H3's h3-core, its jobs (generate, encode, decode,
   denoise, check-block, bench-blocks) and mp4 writer, on the diffusion kernels of `libnextsycl-video.so` (H3's under
   the `nsd_` prefix; SageAttention from `libnextsycl-flash.so`). Its options: `nextsycl video engines`.
 - **The daemon** (`glue/serve` video::daemon): H3's queue, one worker process a GPU slot (it loads on the first

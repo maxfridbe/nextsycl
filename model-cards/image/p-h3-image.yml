@@ -1,0 +1,45 @@
+# P-H3-Image (int8 ConvRot: text to image and edits at 8 MP, 8 steps; Rust + SYCL)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: p-h3-image
+kind: image
+arch: p-h3-image
+license: minimax-h3-community
+commercial: true
+license_note: 'P-H3-Image (Pruna AI, 2026), a Model Derivative of MiniMax H3: the MiniMax H3 Community License applies (not licensed in the European Union, the United Kingdom, South Korea or the United States; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; its outputs may not train another model). The text encoder''s Qwen3-VL-4B parts are Apache-2.0. Keep the NOTICE with redistributed copies.'
+title: 'P-H3-Image (int8 ConvRot: text to image and edits at 8 MP, 8 steps; Rust + SYCL)'
+about: 'Pruna AI''s image model on MiniMax H3''s 50-block denoiser (Pruna''s int8 ConvRot file: int8 products), Qwen3-VL-4B + text connector in int8, the VAE''s transformer decoder in int8; prompts rendered as written (no prompt upsampler)'
+gpus: '0,1'
+vram_gib: 26.5                  # one card at 8 MP, the text encoder kept: 26.2 GiB measured (docs/ports/p-h3-image.md)
+defaults:
+  steps: 8
+  cfg: 1.0
+  sampler: euler
+  schedule: simple
+  size: 2912x2912
+env: {}
+files:
+  denoiser:
+    key: ph3-denoiser-int8
+    url: https://huggingface.co/PrunaAI/P-H3-Image-Comfy/resolve/44a0fb73f299da1bb715bdb5ff59ce3fd3c6f543/diffusion_models/p-h3-image_int8_convrot.safetensors
+    size: 21213068840
+    sha256: b156fd4fe9d169e58cb2b07f9594ec740ff8f0e052d62b009e6dd034de5865e7
+    path: p-h3-image/diffusion_models/p-h3-image_int8_convrot.safetensors
+  text-encoder:
+    key: ph3-te-int8
+    url: https://huggingface.co/PrunaAI/P-H3-Image-Comfy/resolve/44a0fb73f299da1bb715bdb5ff59ce3fd3c6f543/text_encoders/p-h3-image_text_encoder_int8_convrot.safetensors
+    size: 5120870504
+    sha256: fb42c9ff0597e61729475d0b48b69b591ffe06d0b442a79dde22b14fadbe1c0f
+    path: p-h3-image/text_encoders/p-h3-image_text_encoder_int8_convrot.safetensors
+  tokenizer:
+    key: ph3-tokenizer
+    url: https://huggingface.co/PrunaAI/P-H3-Image/resolve/7f98acef503cf2bcfba821a78cb1cf1a9928b2df/tokenizer/tokenizer.json
+    size: 11422650
+    sha256: be75606093db2094d7cd20f3c2f385c212750648bd6ea4fb2bf507a6a4c55506
+    path: p-h3-image/tokenizer/tokenizer.json
+  vae:
+    key: ph3-vae-int8
+    url: https://huggingface.co/PrunaAI/P-H3-Image-Comfy/resolve/44a0fb73f299da1bb715bdb5ff59ce3fd3c6f543/vae/p-h3-image_vae_int8_convrot.safetensors
+    size: 3146996440
+    sha256: 583e0d43354b6b833aa9a0815a5fac831b1ef6d0c19a7eaa0616980a3dab5ffe
+    path: p-h3-image/vae/p-h3-image_vae_int8_convrot.safetensors
+guide: guides/p-h3-image.md
