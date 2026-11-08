@@ -20,6 +20,20 @@ fn cards() -> Vec<Value> {
     nextsycl_models::catalog::Catalog::from_dir(&root().join("model-cards")).expect("the model cards read").models
 }
 
+/// `nextsycl serve <id>` hands the engine the registry's `ctx` as text (`as_str`), so a card that writes a bare number
+/// (`ctx: 32768`) starts the engine with an empty `--ctx` and it exits at once: write it as text (`'32768'`, `131072,32768`)
+#[test]
+fn every_llm_card_writes_ctx_as_text() {
+    let mut seen = 0;
+    for c in cards().into_iter().filter(|c| c["kind"] == "llm") {
+        if let Some(v) = c.get("ctx") {
+            seen += 1;
+            assert!(v.is_string(), "{}: ctx must be text ('32768' or '131072,32768'), not {v}", c["catalog"]);
+        }
+    }
+    assert!(seen > 10, "the llm cards with a ctx were not found ({seen})");
+}
+
 /// Each engine as (kind, the architectures it loads) - the program's own lists: `engines()` in image.rs, audio.rs, model3d.rs, main.rs
 fn engines() -> Vec<(&'static str, Vec<&'static str>)> {
     let mut v: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
