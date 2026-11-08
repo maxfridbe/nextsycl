@@ -120,9 +120,6 @@ function AllocLine(total: number) {
       <li key={r.key} class={{ dim: !live, alt: !r.counted }} attrs={{ title: r.tip }}>
         <span class={{ sw: true, hatch: !live }} style={{ background: live ? color(r.kind) : "transparent", "--c": color(r.kind) } as Record<string, string>} />
         <span class="what">{r.name}{r.port ? <span class="hint"> :{r.port}</span> : null}
-          {r.job
-            ? <span class="jobname" attrs={{ title: r.jobLabel }}> · {r.job}{r.jobLabel ? <span class="hint"> {r.jobLabel}</span> : null}</span>
-            : null}
           {r.of && r.of > 1
             ? <span class="hint"> {r.counted
                 ? `(one of ${r.of} ${GROUP_WORD[r.kind] ?? "models"}: one runs at a time)`
@@ -133,6 +130,9 @@ function AllocLine(total: number) {
         </span>
         {AllocBar(r, total)}
         <span class="mb">{live ? `${gib(r.held)} GiB` : Alloc(r.vouched, r.headroom, r.kind, r.headroomGiven)}</span>
+        {r.job
+          ? <div class="jobline" attrs={{ title: r.jobLabel }}><span class="i" props={{ innerHTML: "&#xf0da;" }} /> <b>{r.job}</b>{r.jobLabel ? <span class="hint"> {r.jobLabel}</span> : null}</div>
+          : null}
       </li>
     );
   };
