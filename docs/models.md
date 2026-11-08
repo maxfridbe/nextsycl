@@ -34,6 +34,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `muse-glimmer-30b-q8` | Muse Glimmer 30B Abliterated Q8_0 (dense gated attention: 39 sliding-window layers of 2,048, 13 full; post norms, soft-capped logits), 128K + 32K; its DFlash drafter (15 drafts a step, verify rows exact: the same text as without); its reasoning as `reasoning_content` | `muse-glimmer` | 29.1 GiB | checked (llama.cpp, 6K tokens), served |
 | `muse-glimmer-30b-q8-b70`, `muse-glimmer-30b-q8-b65` | the same on the B70 or the B65 alone, no drafter (the engine drops it anyway when it does not fit), 128K + 32K | `muse-glimmer` | 26.2 GiB | served |
 | `muse-glimmer-30b-q4`, `muse-glimmer-30b-q6` | Muse Glimmer 30B Q4_K_M / Q6_K on the B70 alone with its DFlash drafter (the silo's K-quant products on XMX, verify exact), 128K + 32K | `muse-glimmer` | 15.8 / 21.3 GiB + 1.5 | checked (spec-check 0), served |
+| `ripple-65b-ad-q4km` | Ripple-65B-Preview AD-Q4_K_M (Ricursive's dense 65B: 64 sliding-window layers of 1,024, 16 global without positions; gated attention, value residual), both GPUs, 32K; 10.5 tok/s tg, 531 / 409 tok/s pp at 2K / 31K | `ricursive` | 37.7 GiB | checked (CPU reference), not served |
 
 **3D** (`nextsycl model3d`: a mesh from a picture)
 

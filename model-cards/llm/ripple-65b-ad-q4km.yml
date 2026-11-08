@@ -1,0 +1,24 @@
+# Ripple-65B-Preview AD-Q4_K_M (4-bit; both GPUs, 32K)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: ripple-65b-ad-q4km
+kind: llm
+arch: ricursive
+title: Ripple-65B-Preview AD-Q4_K_M (4-bit; both GPUs, 32K)
+about: 'Ricursive''s dense Ripple-65B-Preview (Apache-2.0): 80 layers of gated attention (64 over a 1,024 sliding window with rotary positions, 16 global with none), a clamped dense SwiGLU, per-head q/k norms and a value residual from the embeddings; AtomicChat''s AD-Q4_K_M GGUF (Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS, 37.7 GiB; mean KLD 0.0136 against BF16); it thinks in <think> blocks before its answer; layers split over both GPUs'
+gpus: all
+vram_gib: 29.9                   # its memory on the larger card when it runs at 32K (measured: B70 27.8 + caches 2.0; the B65 holds ~14.3)
+ctx: 32768
+tools: true
+tasks: true
+env: {}
+silo:                   # its tuned kernels: kernels/llm/ricursive/silo (dist/silo/libnextsycl-ricursive.so)
+  name: ricursive
+  required: false       # the shared kernels run it too, slower
+files:
+  model:
+    key: ripple-65b-ad-q4km
+    url: https://huggingface.co/AtomicChat/Ripple-65B-Preview-GGUF/resolve/df550a7178a87bbfb6ee2bdbd37603c553d536ee/Ripple-65B-Preview-AD-Q4_K_M.gguf
+    size: 40426079712
+    sha256: 9016e260f93992f0acc7cb590b012fe21fffddf767b53774387fac1b30ca7bfc
+    path: ripple-65b/Ripple-65B-Preview-AD-Q4_K_M.gguf
+guide: guides/chat.md

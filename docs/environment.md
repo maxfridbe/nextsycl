@@ -741,6 +741,24 @@ Muse Glimmer 30B (`llm/museglimmer`, its kernels `kernels/llm/museglimmer`).
 | `NS_MG_KQ_SHAPE` | 0 | Experiment: the silo's K-quant (Q4_K, Q6_K) decode products' shape (tiles of 16 rows a sub-group, sub-groups a work-group, groups of 64 a step) - 0: by the width (16, 13 or 8 sub-groups splitting a row's groups evenly, 2 a step); 1: 1, 8, 2; 2: 1, 4, 2; 3: 1, 8, 4; 4: 2, 8, 2; 5: 1, 16, 2; 6: 1, 13, 2; 7: 1, 13, 4 (`llm kernels` times them) | kernels:llm museglimmer (silo) |
 | `NS_MG_PROFILE` | off | Debug: 1 times every kernel (the queue drained before and after each) and lists them after the run | llm museglimmer |
 
+### ricursive
+
+Ripple-65B (`llm/ricursive`, its kernels `kernels/llm/ricursive`).
+
+| Variable | Default | What it does | Read by |
+|---|---|---|---|
+| `NS_RC_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (at least 16); a sliding-window layer's ring is a window and a chunk (--opt-chunk) | llm ricursive |
+| `NS_RC_HOST` | 0 | Layers the ricursive engine keeps in pinned host memory on the last GPU though VRAM has room (a measurement of streaming; layers that fit no GPU go there anyway) (--opt-host-layers) | llm ricursive |
+| `NS_RC_STREAM` | direct | How a ricursive host layer is read: direct (the products read the pinned memory in place over PCIe) or copy (the layer copied to a staging buffer in VRAM first) (--opt-stream) | llm ricursive |
+| `NS_RC_HOST_SPARE_GIB` | 8 | Host memory the ricursive engine keeps free whatever it pins for streamed layers (--opt-host-spare-gib) | llm ricursive |
+| `NS_RC_LAYERS` | all | Load only the first N layers of the ricursive model, the head after them (a reference check on a truncated model) (--opt-layers) | llm ricursive |
+| `NS_RC_DUMP` | unset | A directory the ricursive engine writes every tapped tensor of a pass to (embd, l_out-N, result_norm) as float32, for reference/ricursive-65b/compare.py (--opt-dump) | llm ricursive |
+| `NS_RC_FLASH` | 1 | The ricursive engine's attention on XMX from its silo (0: the shared kernel, a parity A/B) (--opt-flash) | llm ricursive |
+| `NS_RC_MMVQ` | 1 | 0: the ricursive engine multiplies every one-row pass (the head excepted) through the half GEMM instead of the Q8_1 decode products (a precision A/B; slow) (--opt-mmvq) | llm ricursive |
+| `NS_RC_PROFILE` | 0 | 1: the ricursive engine syncs the GPU after each operation and prints the time by operation every 32 one-row passes (a profile; it slows the run) (--opt-profile) | llm ricursive |
+| `NS_RC_MMVQ_GROUPS` | 512 | Experiment: work-groups of the ricursive silo's matrix-vector kernels with a lookup table | kernels:ricursive silo |
+| `NS_RC_MMVQ_ROWS` | 0 (each type's own) | Experiment: rows a sub-group (1, 2 or 4) for every 256-block type of the ricursive silo's matrix-vector kernels | kernels:ricursive silo |
+
 ## Tests and checks
 
 Inputs of the checks and unit tests that need files outside the repository (unset: the test is skipped), and the parity tools.

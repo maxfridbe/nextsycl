@@ -19,6 +19,7 @@ nextsycl-llm-minimaxm3.workspace = true
 nextsycl-llm-qwen4exp.workspace = true
 nextsycl-llm-qwen35.workspace = true
 nextsycl-llm-nemotronh.workspace = true
+nextsycl-llm-ricursive.workspace = true
 nextsycl-llm-museglimmer.workspace = true
 nextsycl-tok.workspace = true
 nextsycl-llm-example.workspace = true

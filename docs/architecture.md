@@ -310,6 +310,21 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   matrices the silo does not all take gets float rows from the decode norms (the shared products need them). The chat template's channels (a `to=self` message, then `to=user`) come back as
   `reasoning_content` and `content` (nextsycl_tok::muse_channels).
 
+- **ricursive** (`llm/ricursive`) - Ricursive Ripple-65B-Preview (Apache-2.0; AtomicChat's AD-Q4_K_M, 37.7 GiB: Q4_K /
+  Q5_K / Q6_K / Q8_0, an IQ4_XS embedding): 80 dense blocks of 5,120 with 80 / 8 heads of 128, a SwiGLU of 40,960 clamped
+  at 20, four RMS norms a block (the post norms before the residual), per-head q / k norms, a sigmoid output gate from its
+  own projection, and a value residual (v reads `x0 + sigmoid(lambda)(h - x0)`, x0 the scaled embeddings); 64 layers over a
+  1,024 sliding window with NEOX rotary positions (theta 1e4), every fifth global with no positions. A windowed layer's
+  cache is a ring of window + chunk, a global layer's the context; checkpoints are position-ordered, so a different ring
+  restores. Layers split over the cards by what fits (the last card first: the B70 holds 56, the B65 24 at 32K), what fits no
+  card stays in pinned host memory and is read in place over PCIe (or through a staging copy: PCIe-bound either way,
+  ~2 tok/s tg on one card alone with ~20 layers streamed against 10.5 on two cards). Its kernels
+  (`kernels/llm/ricursive/rc.cpp`): the q / k norm with the rotation, the ring store, the attention, the gate, the value
+  residual, the post norm into the residual; its silo: the Q4_K / Q5_K decode products, the weight expansion, the
+  norm with Q8_1 blocks (qwen35's, copied) and flash attention on XMX for 10 query heads a key head (museglimmer's,
+  changed): pp 188 -> 531 tok/s at 2K, 57 -> 409 at 31K. Checked against a numpy float32 reference
+  (`reference/ricursive-65b`, GGUF-dequantized and BF16 weights): cosine 0.99999 per layer on 5 layers of 1,343 tokens.
+  Notes: `docs/ports/ripple-65b.md`.
 - **nemotronh** - NVIDIA Nemotron 3.5 Super VL 120B-A12B (`nemotron_h_moe`, llama.cpp's nemotron-h graph): 88
   pre-norm residual blocks of three kinds - 40 Mamba-2 mixers (an input projection to z | x B C | dt, a causal conv +
   SiLU, the selective scan with 128 heads of 64 in 8 groups and a state of 128, a SiLU(z)-gated group RMS norm), 40

@@ -595,6 +595,7 @@ dependencies = [
  "nextsycl-llm-nemotronh",
  "nextsycl-llm-qwen35",
  "nextsycl-llm-qwen4exp",
+ "nextsycl-llm-ricursive",
  "nextsycl-model3d",
  "nextsycl-model3d-animateanymesh",
  "nextsycl-model3d-example",
@@ -1085,6 +1086,17 @@ dependencies = [
  "nextsycl-gguf",
  "nextsycl-llm",
  "nextsycl-tok",
+]
+
+[[package]]
+name = "nextsycl-llm-ricursive"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-gguf",
+ "nextsycl-llm",
+ "nextsycl-tok",
+ "serde_json",
 ]
 
 [[package]]
