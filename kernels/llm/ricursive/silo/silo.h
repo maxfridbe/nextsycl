@@ -14,8 +14,8 @@ extern "C" {
 typedef struct ns_gpu ns_gpu;
 
 /* Decode products (mmvq.cpp; the shared one is ns_mmvq): y [ncols, n_out] = W [n_out, n_in] (ggml type, stored
- * blocks) . x (ncols 1..8, the split Q8_1 layout below). Covers Q3_K, Q4_K, Q5_K, IQ4_NL, IQ3_S, IQ4_XS at a width of
- * whole blocks */
+ * blocks) . x (ncols 1..8, the split Q8_1 layout below). Covers Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ3_S, IQ4_XS at a
+ * width of whole blocks (Q6_K only with NS_RC_Q6K=1: ~3% faster, not bit for bit the shared kernel's) */
 int ns_rc_mmvq_supported(int type, int64_t n_in);
 /* The silo's split Q8_1 layout: a column's quants [ncols][n_in] int8 (16-byte aligned, contiguous), then the blocks'
  * scales [ncols][n_in / 32] half, then each 16 quants' sum [ncols][n_in / 16] int16 - from standard Q8_1 blocks

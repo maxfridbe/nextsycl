@@ -9,6 +9,7 @@
 mod chat;
 pub mod engine;
 mod ffi;
+pub mod lookup;
 
 use std::any::Any;
 use std::sync::Arc;
@@ -30,6 +31,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "layers", env: "NS_RC_LAYERS", value: "N", help: "load only the first N layers, the head after them (a reference check on a truncated model)", at: At::Load },
     EngineOption { name: "flash", env: "NS_RC_FLASH", value: "0|1", help: "the silo's attention on XMX (default 1; 0 runs the shared kernel: a parity A/B)", at: At::Load },
     EngineOption { name: "mmvq", env: "NS_RC_MMVQ", value: "0|1", help: "0: every one-row pass through the half GEMM, not the Q8_1 decode products (a precision A/B; slow)", at: At::Load },
+    EngineOption { name: "ngram", env: "NS_RC_NGRAM", value: "K", help: "prompt-lookup drafts: up to K (0..7) tokens that followed the last 3 earlier in the conversation, verified in one pass; exact (default 3; 0: off)", at: At::Load },
     EngineOption { name: "profile", env: "NS_RC_PROFILE", value: "0|1", help: "1: sync the GPU after each operation and print the time by operation every 32 one-row passes (slows the run)", at: At::Load },
     EngineOption { name: "dump", env: "NS_RC_DUMP", value: "DIR", help: "write every tapped tensor of a pass (embd, l_out-N, result_norm) there as float32 (a check against reference/ricursive-65b)", at: At::Load },
 ];
@@ -71,6 +73,12 @@ impl SessionState for engine::Session {
 impl DecoderState for engine::Decoder {
     fn drafts(&self) -> (u64, u64) {
         (0, 0)
+    }
+    fn lookup_drafts(&self) -> (u64, u64) {
+        (self.drafted, self.accepted)
+    }
+    fn set_context(&mut self, tokens: &[u32]) {
+        engine::Decoder::set_context(self, tokens)
     }
     fn pending(&mut self) -> Option<u32> {
         engine::Decoder::pending(self)
@@ -119,7 +127,8 @@ impl Engine for engine::Ricursive<'_> {
         engine::Ricursive::prefill_chunk(self)
     }
     fn max_verify(&self) -> usize {
-        1
+        // the prompt-lookup drafts' pass (NS_RC_NGRAM): a decode-width pass at most
+        engine::MAX_ROWS
     }
     fn cache_fingerprint(&self) -> String {
         // checkpoints hold the attention caches in half, the sliding layers' last window and the global layers' all

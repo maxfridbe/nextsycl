@@ -38,7 +38,7 @@ bytes, sha256 9016e260...ca7bfc7, checked after the download). The references ar
 
 - **Engine** (`llm/ricursive`): the contract of `llm/contract` complete - `Engine`, sessions, checkpoints (save, restore,
   read; fingerprint `ricursive f16-kv nsrc-1 w1024`: rule 1, prompt caching, covered by `architecture.rs` once registered),
-  rollback, `copy_session`. No draft, no MTP (`max_verify` 1). The chat template (`chat.rs`) is the model's jinja, written out:
+  rollback, `copy_session`. No draft model or MTP; prompt-lookup drafts (below) verify up to 4 rows a pass (`max_verify` 8). The chat template (`chat.rs`) is the model's jinja, written out:
   `<|im_start|>role\n...<|im_end|>`, tools as `<tools>` JSON and calls as `<tool_call>` JSON objects (the parser is
   `nextsycl_tok::json_tool_calls`), `<think>\n...\n</think>` reasoning kept in earlier assistant turns when present.
 - **Kernels** (`kernels/llm/ricursive/rc.cpp`, `ns_rc_*`): q / k norm with the rotation (sliding layers only), the ring
@@ -150,6 +150,63 @@ VRAM left the engine picks a smaller prompt chunk (512; 2,048 when it fits), and
 - No disk tier was built: a dense layer has no hot subset, so a drive (the 4TB P310 reads ~5 GB/s, a quarter of PCIe's
   pinned rate) would only make streamed layers slower.
 
+## Speed levers, second pass (2026-11-08; B65 + B70, 32,768 context, greedy, tg = generation, pp = prompt)
+
+Before: tg 9.4-10.5 at 96 ms a token (memory floor ~82 ms). Measured on hardac1 in a build copy, one lever at a time.
+
+**1. Prompt-lookup speculation (`NS_RC_NGRAM=K`, default 3; `llm/ricursive/src/lookup.rs`).** Ripple ships no drafter, so the
+drafts are the conversation's own repeats: when the last 3 tokens occurred before, the up to K tokens that followed them
+are verified with the pending token in one pass (the weights are read once for all the rows). A draft is kept only when the
+token the sampler draws for its row is the draft, so the text is the same as without (and at a temperature, what is
+committed is distributed as plain sampling). A run of verify passes whose first draft missed backs off (the next 2, 4,
+... 32 steps propose nothing). The rows of a verify pass are bit for bit the one-token passes' (`nextsycl llm spec-check`,
+4 and 8 rows, 40 positions: max |diff| 0, no top-1 differences).
+
+| text (200-300 tokens) | K = 0 (before) | K = 3 (default) | drafts accepted | same text |
+|---|---:|---:|---:|---|
+| code the answer copies (2.6K prompt) | 10.37 tg | **12.03 tg** (+16%) | 50 of 63 | yes |
+| documentation Q&A, 2.5K prompt | 9.89 tg | **11.71 tg** | 30 of 47 | yes |
+| the same, 9.4K prompt | 9.75 | **11.76** | 37 of 57 | yes |
+| the same, 34K prompt | 9.12 | **11.92** | 61 of 89 | yes |
+| fresh prose (40-token prompt, a story) | 10.53 / 10.77 | **11.19 / 11.19** | 14 of 20 | yes |
+| raw document ids, 2K / 8K / 31K prompts, 64 tokens | 10.05 / 9.80 / 9.34 | 16.7 / 17.2 / 21.5 | 27 of 28, 28 of 28, 39 of 39 | yes |
+
+(The first run after an idle GPU reads ~4% slow in tg and ~8% in pp; the table's K = 0 figures for code are the steady
+ones.) pp is unchanged (2.6K: 504; 9.4K: 505; 34K: 389 tok/s). Other K on the code text: K = 2 11.8, K = 4 12.0, K = 7 11.7 (a
+pass of more rows costs a little more: 105 ms against 99 ms). A 2-gram fallback when no 3-gram repeats drafted more and
+won less (11.7 on code, 10.8 on prose) and was dropped. Prose needs no regression guard here: the story repeated its own
+phrases enough that K = 3 won 4-6%; the backoff keeps a text that never repeats at one probe in a few steps (each probe
+costs a verify pass, ~1-5% of a step).
+
+**2. Q6_K decode product in the silo (`NS_RC_Q6K=1`, off by default).** `WideQ6K` in `silo/mmvq.cpp` (lane = half, 16-value
+half, pair of 32-value groups; 16-byte loads of the two `ql` runs and the `qh` run; quants taken unsigned with 32 x the
+activations' 16-sum subtracted). tg 10.37 -> 10.62 (+2.4%) on the code text, interleaved A/B/A/B; the same text on five
+of six real prompts, but **not bit for bit**: its float sums add in another order, the 34K-token documentation prompt
+diverged (and a junk prompt at token 3), and the teacher-forced logits differ from the shared kernel's by KL 0.0013 on 256
+tokens (the silo's own Q4_K / Q5_K products differ from the shared ones by 0.0011). Kept as an opt-in, not the default,
+since the rule here is identical greedy text. A Q8_0 product of the same scheme gained nothing measurable (k / v are 1,024
+rows: launch bound) and also changed the text; dropped. Fusing the small kernels (gate | quantize, swiglu | quantize, vres |
+quantize, q / k norm | rope | store: 5 of ~27 launches a layer, bit-exact in principle) was estimated at 2-3 ms of 96 and not
+built; a graph of the whole pass is the larger prize and not tried.
+
+**3. Two-card tensor parallel: measured, not built.** `llm/ricursive/examples/hopbench.rs`: one GPU-to-GPU hop through the
+host (the engine's `hop`, a pinned or pageable staging area) costs **13 us at 20 KB** (the 5,120-float residual), 16 us at 80 KB,
+34 us at 320 KB; a bare queue sync 0.3 us. Per layer a split needs two all-reduces (after `attn_output` and after `ffn_down`, both
+before a post norm that needs the full vector): 160 a token, each two hops (~30 us) plus the idle gap while the host waits and
+relaunches (~15 us): ~7 ms a token. The B65 reads weights at ~360 GB/s against the B70's ~500 (from the split table above:
+a layer moved from the B70 to the B65 costs 0.4 ms more), so reading all 40.4 GB on both at once is ~47 ms (a layer split reads
+them one card after the other, ~82 ms). Projection: 47 (weights) + 12 (small kernels, launched on both) + 7 (attention, halved)
++ 7 (all-reduces) = ~66-72 ms a token, **1.3-1.45x (tg 13.5-15), not the 17-20 first guessed**; the band straddles the 1.3x
+line. It is also not exact: a column-split `attn_output` / `ffn_down` adds the partial sums in another order than the one
+kernel does, so the greedy text would change as the Q6_K kernel's does (an all-gather split of every matrix keeps each row's
+arithmetic but doubles the exchanges, ~13 ms, ~1.3x, and the key-split merge of the decode attention depends on the head
+count). Needs the owner's word before building: a rewrite of the load (sliced matrices), the block, the caches and the
+checkpoints. Its other prize is pp (both cards compute every chunk) and 1.5 GiB of VRAM back on the B70.
+
+**4. Prompt pipelining across cards: not started.** pp is compute-bound with the cards in series; chunks flowing through
+the B65 layers while the previous one is on the B70 could reach ~1.6x at best (stages ~33 and ~56 units), but each device's
+single arena would need to become one per chunk in flight.
+
 ## Memory (card memory read from the cards after the load, caches added)
 
 At the 32,768 context the plan is layers 0-23 on the B65 and 24-79 on the B70 (more layers go to the B70 when the context
@@ -173,10 +230,12 @@ download of this port's checks was deleted afterwards (`fetch_tensors.py` makes 
 
 ## Known, open
 
-- Q6_K and Q8_0 products are the shared kernels (320 and 295 GB/s against the silo's ~500): ~4 ms of 96.
+- Q6_K and Q8_0 products are the shared kernels (320 and 295 GB/s against the silo's ~500): ~4 ms of 96. A Q6_K silo
+  product exists behind `NS_RC_Q6K=1` (+2.4% tg) but is not bit for bit the shared one's; Q8_0's was dropped (above).
 - ~2,000 small launches a token (norm, quantize, rotation, store, gate, post norm ...); fusing them, or a graph, is the
   next ~10 ms.
-- No draft: Ripple ships none; the engine verifies one token a pass.
+- No draft model: Ripple ships none; prompt-lookup drafts (`NS_RC_NGRAM`, default 3) stand in, and help only text that
+  repeats its context. A two-card tensor-parallel split (projection ~1.3-1.45x tg) and prompt pipelining are open.
 - The plain `Ripple-65B-Preview-Q4_K_M.gguf` was not downloaded; the engine reads any file whose tensors are among the
   types above (IQ4_XS embeddings are the only one the shared dequantizer lacks, handled on the host).
 - A disk tier was not built: see above.

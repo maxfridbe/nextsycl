@@ -38,9 +38,11 @@ struct Q81Block { sycl::half2 ds; int8_t qs[32]; };
 struct Q4KBlock { sycl::half2 dm; uint8_t scales[12]; uint8_t qs[128]; };
 struct Q5KBlock { sycl::half2 dm; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; };
 struct Q3KBlock { uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; sycl::half d; };
+struct Q6KBlock { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; sycl::half d; };
 struct IQ4XSBlock { sycl::half d; uint16_t scales_h; uint8_t scales_l[4]; uint8_t qs[128]; };
 struct IQ4NLBlock { sycl::half d; uint8_t qs[16]; };
 static_assert(sizeof(Q81Block) == 36 && sizeof(Q4KBlock) == 144 && sizeof(Q5KBlock) == 176 && sizeof(Q3KBlock) == 110);
+static_assert(sizeof(Q6KBlock) == 210);
 static_assert(sizeof(IQ4XSBlock) == 136 && sizeof(IQ4NLBlock) == 18 && sizeof(block_iq3_s) == 110);
 
 inline int dp4a(int a, int b, int c) { return dpct::dp4a(a, b, c); }   // signed bytes, int32 accumulate (Strata's)
@@ -133,6 +135,42 @@ struct WideQ5K {
     using X = WideQ4K::X;
     static X xload(int g, const XA& xa, int b0) { return WideQ4K::xload(g, xa, b0); }
     static float dot(const W& r, const X& v) { return WideQ4K::dot(r, v); }
+};
+
+// ---- Q6_K (210-byte blocks, 2-byte aligned): a block is two halves h of 128 values; in a half, value 32 gg + l (gg 0..3,
+// l 0..31) is ql[64 h + 32 (gg & 1) + l] (nibble gg >> 1) | the 2 bits (2 gg) of qh[32 h + l] << 4, less 32, scale
+// sc[8 h + l / 16 + 2 gg]. Lane g = (half h, l-half lh, pair gp): groups 2 gp and 2 gp + 1, l in 16 lh .. 16 lh + 15 -
+// 16-byte loads of the two ql runs and the qh run (the pair's other lane reads the same bytes: the cache's). The
+// quants are taken unsigned (0..63) and 32 x the activations' 16-sum comes off, as the K-quants' mins do.
+struct WideQ6K {
+    using Block = Q6KBlock;
+    static constexpr bool SPLIT = true;
+    static constexpr int ROWS_MULTI = 1;
+    static constexpr int ROWS = 1;
+    static constexpr int LUT = 0;
+    static uint32_t lut(int) { return 0; }
+    struct W { sycl::int4 q0, q1; float d0, d1; };
+    static W load(const Block* b, int g, const uint32_t*) {
+        W r;
+        const int h = g >> 2, lh = (g >> 1) & 1, gp = g & 1, nib = 4 * gp;
+        const sycl::int4 qa = load16_a2(b->ql + 64 * h + 16 * lh), qb = load16_a2(b->ql + 64 * h + 32 + 16 * lh), hh = load16_a2(b->qh + 32 * h + 16 * lh);
+        auto mk = [&](int qv, int hv, int hs) { return ((qv >> nib) & 0x0f0f0f0f) | (((hv >> hs) & 0x03030303) << 4); };
+        r.q0 = sycl::int4(mk(qa.x(), hh.x(), nib), mk(qa.y(), hh.y(), nib), mk(qa.z(), hh.z(), nib), mk(qa.w(), hh.w(), nib));
+        r.q1 = sycl::int4(mk(qb.x(), hh.x(), nib + 2), mk(qb.y(), hh.y(), nib + 2), mk(qb.z(), hh.z(), nib + 2), mk(qb.w(), hh.w(), nib + 2));
+        const float d = (float) b->d;
+        r.d0 = d * (float) b->scales[8 * h + lh + nib];       // group 2 gp: sc[8 h + lh + 2 gg], 2 gg = 4 gp = nib
+        r.d1 = d * (float) b->scales[8 * h + lh + nib + 2];
+        return r;
+    }
+    struct X { sycl::int4 u0, u1; float dx0, dx1; int s0, s1; };
+    static X xload(int g, const XA& xa, int b0) {
+        const int h = g >> 2, lh = (g >> 1) & 1, gp = g & 1;
+        const int a = b0 + 4 * h + 2 * gp, c = a + 1;
+        return X{xa.q16(a, lh), xa.q16(c, lh), xa.dd(a), xa.dd(c), xa.sum16(a, lh), xa.sum16(c, lh)};
+    }
+    static float dot(const W& r, const X& v) {
+        return v.dx0 * r.d0 * (float) (dp4a4(r.q0, v.u0, 0) - 32 * v.s0) + v.dx1 * r.d1 * (float) (dp4a4(r.q1, v.u1, 0) - 32 * v.s1);
+    }
 };
 
 // ---- IQ4: a byte of two nibbles -> their codebook bytes (unsigned) at bits 0 and 16, from the work-group's table
@@ -411,6 +449,13 @@ int rows_override() {   // NS_RC_MMVQ_ROWS=1|2|4: every 256-block type's rows a 
     return v;
 }
 
+// NS_RC_Q6K=1: Q6_K through this file's product instead of the shared kernel's (default off). It is ~3% faster in tg (B70 +
+// B65, 2K: 10.2 -> 10.6) and the same text on real prompts, but not bit for bit: its float sums add in another order,
+// and near ties flip (a junk prompt diverged at token 3; KL against the shared kernel's logits 0.0013 on 256
+// teacher-forced tokens, as large as the silo's own Q4_K / Q5_K products against the shared ones). A Q8_0 product of
+// the same scheme gained nothing measurable and was dropped.
+bool q6k_on() { static const bool v = std::getenv("NS_RC_Q6K") != nullptr; return v; }
+
 // 256-blocks: 8 lanes a block, 4 blocks a sub-group step, R rows a sub-group sharing each lane's activations
 template <typename F, int NCOLS, int R>
 void wide_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ xq, const int8_t* __restrict__ x, float* __restrict__ y, int n_in, int n_out,
@@ -627,6 +672,7 @@ size_t ns_rc_q8_split_bytes(int64_t n_in, int64_t ncols) { return (size_t) (ncol
 int ns_rc_mmvq_supported(int type, int64_t n_in) {
     switch (type) {
         case 11: case 12: case 13: case 16: case 17: case 18: case 21: case 22: case 23: return n_in % QK == 0;
+        case 14: return n_in % QK == 0 && q6k_on();
         case 20: return n_in % 32 == 0;
         default: return 0;
     }
@@ -641,6 +687,7 @@ int ns_rc_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const voi
         case 11: wide<WideQ3K>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
         case 12: wide<WideQ4K>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
         case 13: wide<WideQ5K>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
+        case 14: wide<WideQ6K>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
         case 20: iq4nl(g->q, w, x_split, y, ni, no, nc); break;
         case 21: wide<WideIQ3S>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
         case 23: wide<WideIQ4XS>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;

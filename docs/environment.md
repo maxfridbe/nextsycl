@@ -756,6 +756,8 @@ Ripple-65B (`llm/ricursive`, its kernels `kernels/llm/ricursive`).
 | `NS_RC_FLASH` | 1 | The ricursive engine's attention on XMX from its silo (0: the shared kernel, a parity A/B) (--opt-flash) | llm ricursive |
 | `NS_RC_MMVQ` | 1 | 0: the ricursive engine multiplies every one-row pass (the head excepted) through the half GEMM instead of the Q8_1 decode products (a precision A/B; slow) (--opt-mmvq) | llm ricursive |
 | `NS_RC_PROFILE` | 0 | 1: the ricursive engine syncs the GPU after each operation and prints the time by operation every 32 one-row passes (a profile; it slows the run) (--opt-profile) | llm ricursive |
+| `NS_RC_NGRAM` | 3 | Prompt-lookup drafts of the ricursive engine: up to K (0..7) tokens that followed the last 3 earlier in the conversation, verified with the pending token in one pass; exact (a draft is kept only when the sampled token is it); 0 = off (--opt-ngram) | llm ricursive |
+| `NS_RC_Q6K` | unset | Set: the ricursive silo's Q6_K decode product instead of the shared kernel's (~3% faster tg; same text on real prompts, but its sums add in another order, so near ties can flip) | kernels:ricursive silo |
 | `NS_RC_MMVQ_GROUPS` | 512 | Experiment: work-groups of the ricursive silo's matrix-vector kernels with a lookup table | kernels:ricursive silo |
 | `NS_RC_MMVQ_ROWS` | 0 (each type's own) | Experiment: rows a sub-group (1, 2 or 4) for every 256-block type of the ricursive silo's matrix-vector kernels | kernels:ricursive silo |
 

@@ -28,6 +28,7 @@ use nextsycl_gguf::{GType, Gguf, Tensor};
 use nextsycl_llm::{Error, GpuInfo, Result, Sampler, Tap};
 
 use crate::ffi;
+use crate::lookup::{commit_run, Lookup};
 
 fn e(x: impl std::fmt::Display) -> Error {
     Error(x.to_string())
@@ -239,19 +240,45 @@ impl Checkpoint {
 pub struct Decoder {
     logits: Option<Vec<f32>>,
     next: Option<u32>,
+    /// the conversation's tokens and where each 3-gram last continued (prompt lookup, NS_RC_NGRAM)
+    look: Option<Lookup>,
+    pub drafted: u64,
+    pub accepted: u64,
 }
 
 impl Decoder {
     pub fn new(logits: Vec<f32>) -> Decoder {
-        Decoder { logits: Some(logits), next: None }
+        Decoder { logits: Some(logits), next: None, look: None, drafted: 0, accepted: 0 }
     }
     pub fn after(next: u32) -> Decoder {
-        Decoder { logits: None, next: Some(next) }
+        Decoder { logits: None, next: Some(next), look: None, drafted: 0, accepted: 0 }
     }
     pub fn pending(&mut self) -> Option<u32> {
         self.next.take()
     }
+    /// The conversation so far (its prompt and what is committed): drafts from its repeats (NS_RC_NGRAM)
+    pub fn set_context(&mut self, tokens: &[u32]) {
+        if ngram_k() == 0 {
+            return;
+        }
+        let mut l = Lookup::default();
+        for &t in tokens {
+            l.push(t);
+        }
+        self.look = Some(l);
+    }
 }
+
+/// Prompt-lookup drafts a verify pass checks at most (NS_RC_NGRAM=K, 0..7; default 3; 0 = off). Measured on hardac1
+/// (tg, 300 tokens, greedy): code that copies its prompt 10.2 -> 12.05 at K=3 and 4 (11.8 at 2, 11.7 at 7: a pass of
+/// more rows costs a little more), prose 10.7 -> 11.1; the output is identical to K=0.
+pub fn ngram_k() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_RC_NGRAM").ok().and_then(|v| v.parse().ok()).unwrap_or(3usize).min(MAX_ROWS - 1))
+}
+
+/// Rows of a decode-width pass (the products take up to 8)
+pub const MAX_ROWS: usize = 8;
 
 /// One GPU's share: its layers [lb, le) (the first `res` of them in VRAM, the rest streamed from pinned host memory),
 /// a prompt chunk's work memory and the half buffer its products expand into
@@ -976,15 +1003,40 @@ impl<'g> Ricursive<'g> {
         Ok(out)
     }
 
+    /// The next committed token(s): one, or more when prompt-lookup drafts (NS_RC_NGRAM) are accepted - each exactly when
+    /// the token drawn for its row is the draft; the cache keeps only what is committed
     pub fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
-        let tok = match (d.logits.take(), d.next.take()) {
-            (Some(l), _) => smp.sample(&l),
-            (None, Some(x)) => {
-                let l = self.pass(s, &[x], 1, tap)?.pop().unwrap_or_default();
-                smp.sample(&l)
+        let mut logits = d.logits.take();
+        if logits.is_none() {
+            let Some(x) = d.next.take() else { return Err(e("a decoder with nothing to draw from")) };
+            let mut drafts = d.look.as_mut().map_or_else(Vec::new, |l| l.propose(ngram_k()));
+            drafts.truncate(s.max_ctx.saturating_sub(s.pos + 1));
+            if !drafts.is_empty() {
+                let mut toks = vec![x];
+                toks.extend_from_slice(&drafts);
+                let rows = self.pass(s, &toks, toks.len(), tap)?;
+                let (out, matched) = commit_run(&drafts, |i| smp.sample(&rows[i]));
+                d.drafted += drafts.len().min(out.len()) as u64;
+                d.accepted += matched as u64;
+                if out.len() < toks.len() {
+                    self.rollback(s, out.len())?;
+                }
+                if let Some(l) = d.look.as_mut() {
+                    l.result(matched);
+                    for &y in &out {
+                        l.push(y);
+                    }
+                }
+                d.next = out.last().copied();
+                return Ok(out);
             }
-            (None, None) => return Err(e("a decoder with nothing to draw from")),
-        };
+            logits = Some(self.pass(s, &[x], 1, tap)?.pop().unwrap_or_default());
+        }
+        let l = logits.ok_or_else(|| e("a decoder with nothing to draw from"))?;
+        let tok = smp.sample(&l);
+        if let Some(lk) = d.look.as_mut() {
+            lk.push(tok);
+        }
         d.next = Some(tok);
         Ok(vec![tok])
     }
