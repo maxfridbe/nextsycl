@@ -643,3 +643,121 @@ Eviction, with PaddleOCR-VL as the other load: without a header MiniMax goes at 
 | `long` | 0.999848 | 0.999988 | 0.999756 | same (" +") | 0.9797325 |
 
 Unchanged from round 4. Greedy text: the same md5 across six runs at margin 10 and the final margin 4 run. The round 4 note on a byte-838 difference was wrong about its timing: that pair came before the demotion fix, and no later pair has differed.
+
+## Round 8 (2026-11-08): profile again, CPU products, kernels, drafter, copies
+
+B65 + B70 as deployed (B65 first with 24 layers, expert profile seeded, pinned 40 GiB, warm tier 11.5 GiB), main 19bd250, the ladder prompts and
+the corpus prompts c1 (code), c2 (prose), c4 (chat). Greedy, 300 tokens, warm runs; "ms a pass" is the token log's mean over the 299 one-token
+passes (`NS_MM31_TOKLOG`). Another agent's CPU reference runs (python, 16 threads) and AOT builds ran on the host through most of the round
+(load 5-15, logged with each run); a repeat of one binary moved 74.9 -> 80.7 and 76.0 -> 91.9 ms a pass, so every comparison below is interleaved and
+repeated, and nothing smaller than the spread of its own repeats is called a gain.
+
+### Where a token goes (2K, 300 tokens, `NS_PROFILE=gpu` device stamps; the profiled run reads tg 12.30, 76.1 ms a pass)
+
+| | ms a token |
+|---|---|
+| attention (B65 24 layers 7.4, B70 36 layers 12.4; q k v 6.5, o 4.9, attend 3.3, indexer 1.3, top-k 0.8, scores 0.4, norms/rope/stores 0.3) | 19.8 |
+| router | 1.1 |
+| host turnaround, router read-back to the shared expert queued (profiled) | 7.0 |
+| experts, layers with all four in VRAM (B65 0.405 ms x 16.5 layers, B70 0.238 ms x 20.7) | 11.6 |
+| experts, layers with a pinned expert and no read (B65 0.643 ms x 3.3, B70 0.910 ms x 12.4) | 13.3 |
+| experts, layers with a file read (B65 4.94 ms x 1.2, B70 4.01 ms x 2.8) | 17.2 |
+
+Uses a token: 202.8 VRAM, 20.9 pinned, 4.3 file (B65 94.0 / 4.6 / 1.5%, B70 86.0 / 11.9 / 2.1%). The host waited 49.8 ms a token for the routers'
+read-backs (the GPU working) and 14.2 ms for reads. So: misses (~9 ms of pinned copies, ~15 ms of file layers) and attention (20 ms, q/k/v/o at
+~400 GB/s) bound a token; the VRAM experts' compute is 12 ms. The same run unprofiled: pp 238, tg 13.14, 76.0 ms a pass (fifth round's 66.9 ms was the
+fixed-text measure; today's greedy 2K text uses 20.9 pinned experts a token, not 16.4).
+
+### CPU products on AVX-512 (`NS_MM31_CPU_EXPERTS`, the user's approval of 2026-10-30): exact, no gain, removed
+
+Bound first. Host read bandwidth (Ryzen 9 9950X, DDR5): 17 MB at 54 GB/s on 1 thread, 58 GB/s at 4-16 threads: an expert can not cost less than
+~0.29 ms on the host, against 0.68 ms through PCIe, so at most ~0.3 ms x 20.9 = ~6 ms a token. The products (`cpu.rs`: IQ1_M, IQ2_XXS gate/up and
+IQ3_XXS down, a 64-bit gather a group, the GPU's weight formula bit for bit, a spinning pool) match a scalar port of the silo's formulas at relative error
+2e-7 (unit test). Standalone, 96 cold experts, an expert in ms by threads: 8: 0.63, 12: 0.44, 16: 0.42, 24: 0.38, 32: 0.38 (single-thread 4.2 ms).
+
+The hook bug of the AVX2 attempt (b73bc9d): the reverted pool let a worker late from one job take an index of the next and run the *old* closure on it,
+writing into the previous expert's freed buffers (here: `free(): invalid pointer`, a crash at 8 tokens). The new pool tags parts with the job's
+generation; a 3,000-job unit test checks that no part runs twice or on another job. Also fixed: an expert multiplied on the host and promoted into
+VRAM now leaves its copy's ticket on the place, so its next use waits for the copy.
+
+| 2K, 300 tokens, ms a pass (2 rounds) | round 1 | round 2 | text |
+|---|---|---|---|
+| CPU off | 74.9 | 80.7 | f6ff55e5 (main's) |
+| 16 threads | 77.0 | 73.9 | 764eca8a |
+| 24 threads | 75.7 | 77.6 | 764eca8a |
+
+In the engine a host product took 0.66 ms (16 threads) / 0.59 ms (24) against the bench's 0.42 / 0.38. Pinned memory is not the cause: the same
+experts from their pinned places and from heap copies, with the cards idle, 0.36-0.47 ms both (`NS_MM31_KBENCH=1` with the switch). During decode the
+products share DRAM with the cards' own DMA from host memory (promotions and demotions, 28 GB/s a card) and the drive's reads, and the GPU path already
+overlaps the next copy with the current product, so 0.6 ms on the host buys nothing. The text differs from the GPU path's after a few dozen tokens
+(the sums in another order at near ties) and is the same for 16 and 24 threads. Kept in history (the round's first commit), removed from the engine.
+
+### Silo kernels: int8 grid table and sign bits (exact, slower, not kept)
+
+The fused gu/down kernels are ALU-bound (reads that stay in cache are no faster, round 7). Two exact rewrites of the group decode:
+
+- IQ1_M's grid in local memory as eight signed bytes (value - 1) a grid entry, so a weight is a byte-to-float, an add and a multiply (16 KB of local memory a
+  work-group instead of 8);
+- IQ2_XXS / IQ3_XXS signs by flipping the sign bit (a multiply by +-1 is exact) instead of a select and a multiply.
+
+The greedy text was byte-identical to main's (300 tokens, md5 f6ff55e5): the weights are the same bits. Kernel bench (`NS_MM31_KBENCH=1`, 4 experts,
+us; B65 repeats within 2%, the B70's swing +-50% run to run - its gu IQ1_M, the same code, read 153, 232 and 122 us - so only the B65 decides):
+
+| B65 | main | both rewrites | sign bits only |
+|---|---|---|---|
+| gu IQ1_M | 231 | 489 | 231 (main's) |
+| gu IQ2_XXS | 254-258 | 511 | 250-253 (main's) |
+| down IQ3_XXS | 168-171 | 186 | 186-191 |
+
+Both slower on the B65; the sign-bit form also halved pp in two of three runs (122, 109, 167 against 238, 174: the prompt path's dequantize-to-half
+shares the group code). Removed; the silo is main's. `NS_MM31_KBENCH` now also prints the time per launch over 16 back-to-back launches.
+
+### Drafter: backoff kept, doorbell for verify rows dropped
+
+The DSpark pass costs ~9 ms whether its confidence head lets a draft through or not. **Backoff** (`NS_MM31_DRAFT_BACKOFF`): after a pass
+that drafts nothing (with 2, the default, after two in a row), the next 1, 3, 7, 15 steps go without one; a pass that drafts ends it. **Doorbell for verify rows**: the router of a 2-7 row pass rings the
+pinned bell like a one-token pass (the shared expert queued behind it). Both exact (verify is exact: every run of a prompt has the same text, also
+without the drafter).
+
+| tg, 300 tokens, 2 rounds | no draft | drafter (main) | + backoff + verify doorbell | + verify doorbell only |
+|---|---|---|---|---|
+| code c1 | 11.80 | 12.75 / 12.67 (163 of 173) | 12.43 / 12.39 (141 of 148) | 12.15 / 12.69 |
+| prose c2 | 16.20 | 12.82 / 14.44 (46 of 48) | 14.15 / 14.89 (5 of 6) | 14.32 / 14.52 |
+| chat c4 | 15.64 | 14.13 / 14.16 (60 of 70) | 14.39 / 14.23 (10 of 11) | 14.17 / 13.87 |
+
+The verify doorbell is neutral (-2% to +5% by prompt, the same drafts): removed. The backoff gains 1-3% on prose and chat and costs ~2% on code
+(it skips some passes that would have drafted). Backing off only after **two** empty passes in a row (`NS_MM31_DRAFT_BACKOFF=2`, now the default)
+keeps both: code 12.71 / 12.52 (150 of 160 accepted; main's drafter 12.75 / 12.67), prose 14.72 / 14.99 (5 of 5; main's drafter 12.82 / 14.44,
+backoff 1 14.15 / 14.89). So the draft card gains ~5-10% on prose and chat against main's draft card and stays within ~1% on code.
+
+What the drafter costs when it drafts nothing: on prose a one-row pass takes ~70 ms with the drafter against ~62 without (its caches fed every pass, and
+the 2 GiB of B70 VRAM it holds back from experts), so even with no drafter pass the draft card stays below the plain card on prose and chat. It pays
+on code and long prompts only (round 7's server numbers).
+
+### File reads copied piece by piece (`NS_MM31_PIECE_COPY`, default on): kept
+
+A file-read expert was copied to VRAM after all its pieces (8 a matrix) were in. Now each piece goes to the copy lane as it lands, so the card waits for
+the last piece's copy, not the read and then a 16 MB copy (~0.57 ms). Exact (the same bytes; the same text in every run).
+
+| ms a pass (tg) | whole copy | piece by piece |
+|---|---|---|
+| 2K, 3 rounds | 76.0, 74.9, 74.5 (tg 13.14-13.39) | 73.9, 74.0, 73.9 (tg 13.50-13.52) |
+| 8K, 3 rounds | 90.8, 89.3, 89.4 (tg 11.01-11.19) | 90.4, 87.8, 89.5 (tg 11.05-11.38) |
+| 31K, 2 rounds | 93.8, 93.5 (tg 10.65, 10.69) | 96.1, ~93 (tg 10.34, 10.83) |
+| code c1, 2 rounds (tg, no draft) | tg 11.76, 11.60 | tg 11.93, 11.97 |
+
+31K round 1 piece-copy was a slow first-50-token start (111.5 ms) on a loaded box; round 2 was tg 10.83 vs 10.69. Same text md5 in every run (31K cf42207b, c1 6dbfdf2c).
+
+-1.6% a pass at 2K, -0.7% at 8K, lower in every pair; pp unchanged (240-246 at 2K, 402-405 at 8K).
+
+### Other things measured
+
+- **Build copies**: rsync keeps the source's times, so after a sync cargo may keep a binary built from older sources (the first CPU-tier run ran
+  without the tier). Touch the synced sources before `./build.sh rust`.
+
+### Left
+
+- The verify-pass rows still cost ~0.7 of a pass each (round 6): decode the shared experts of a verify pass once for all their rows (the fused kernels
+  decode per (expert, row)); worth it only with a cheaper drafter.
+- Attention's projections (11 ms) are at ~400 GB/s of the ~520 the same kernels reach alone: the gap is launch ramp-up on 35-74 MB matrices.
+- tg 20 still needs more residency or fewer misses: the floor without misses is ~45 ms (round 4), today's misses ~24 ms.
