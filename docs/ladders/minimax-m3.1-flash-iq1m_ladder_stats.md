@@ -20,6 +20,19 @@ bounds it: [docs/ports/minimax-m31.md](../ports/minimax-m31.md).
 Each rung is a fresh process (the load, 22-33 s on two cards, not counted). Prompts: the repository text repeated
 to length (`p2k` 7,600 characters, `p8k` 30,000, `p32k` 120,000), chat template applied.
 
+## Results (2026-11-08, round 8: piece-by-piece copies, drafter back-off)
+
+Warm, greedy, one pass each, B65 + B70, plain card (no draft). Same text as before in every run.
+
+| prompt | pp | tg |
+|---|---:|---:|
+| 2K | 238-246 tok/s | 13.5 tok/s |
+| 8K | 402-405 tok/s | 11.0-11.4 tok/s |
+| 31K | 322-326 tok/s | 10.7-10.8 tok/s |
+| code (190 tokens) | 35-54 tok/s | 11.6-12.0 tok/s |
+
+The box was shared and noisy; gains are small (tg +1.6% at 2K, +0.7% at 8K from piece-by-piece copies; draft card up to +5-10% on prose and chat from back-off, code within 1%). Details in docs/ports/minimax-m31.md, round 8.
+
 ## Results (2026-10-30, fifth round)
 
 | prompt tokens | cards | pp | tg | tokens generated |

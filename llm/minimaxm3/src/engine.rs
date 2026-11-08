@@ -435,7 +435,8 @@ struct PieceState {
     err: Mutex<Option<String>>,
 }
 
-struct ReadHandle(Arc<PieceState>);
+/// a piece's state, the expert's index in its wave, and the piece's (offset in the slot, bytes)
+struct ReadHandle(Arc<PieceState>, usize, usize, usize);
 
 impl ReadHandle {
     fn is_finished(&self) -> bool {
@@ -508,7 +509,7 @@ fn join_all(hs: Reads) -> Result<()> {
     first.map_or(Ok(()), Err)
 }
 
-fn spawn_reads(r: &Arc<Reader>, src: Src, dst: *mut u8) -> Reads {
+fn spawn_reads(r: &Arc<Reader>, src: Src, dst: *mut u8, tag: usize) -> Reads {
     let parts = read_parts();
     let mut hs = Reads::new();
     let pool = read_pool();
@@ -527,7 +528,7 @@ fn spawn_reads(r: &Arc<Reader>, src: Src, dst: *mut u8) -> Reads {
             }
             st2.done.store(true, std::sync::atomic::Ordering::Release);
         }));
-        hs.push(ReadHandle(st));
+        hs.push(ReadHandle(st, tag, at, l));
     }
     drop(q);
     pool.cv.notify_all();
@@ -773,14 +774,17 @@ pub struct Decoder {
     next: Option<u32>,
     pub drafted: u64,
     pub accepted: u64,
+    /// the drafter's backoff: steps left without a drafter pass, and the passes in a row that drafted nothing
+    idle: u32,
+    empty: u32,
 }
 
 impl Decoder {
     pub fn new(logits: Vec<f32>) -> Decoder {
-        Decoder { logits: Some(logits), next: None, drafted: 0, accepted: 0 }
+        Decoder { logits: Some(logits), next: None, drafted: 0, accepted: 0, idle: 0, empty: 0 }
     }
     pub fn after(next: u32) -> Decoder {
-        Decoder { logits: None, next: Some(next), drafted: 0, accepted: 0 }
+        Decoder { logits: None, next: Some(next), drafted: 0, accepted: 0, idle: 0, empty: 0 }
     }
     pub fn pending(&mut self) -> Option<u32> {
         self.next.take()
@@ -919,6 +923,18 @@ fn half_to_f32(h: u16) -> f32 {
 fn draft_pmin() -> f32 {
     static N: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("NS_MM31_DRAFT_PMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
+}
+
+/// NS_MM31_PIECE_COPY=0: a file-read expert of a decode pass copied to VRAM when all its pieces are in (default: each piece as it lands)
+fn piece_copy() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("NS_MM31_PIECE_COPY").map_or(true, |v| v != "0"))
+}
+
+/// NS_MM31_DRAFT_BACKOFF=N: the drafter backs off after N passes in a row that drafted nothing (default 2: after 1, code lost the drafts of single quiet steps); 0: a drafter pass every step
+fn draft_backoff() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("NS_MM31_DRAFT_BACKOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
 }
 
 /// NS_MM31_DRAFTS: tokens drafted a step (default 1; at most the block)
@@ -2570,7 +2586,7 @@ impl<'g> MiniMax<'g> {
                 let dst = unsafe { ring.ptr().cast::<u8>().add(((k % 2) * WAVE + j) * slot) };
                 let mut src = m.src(ex);
                 src.cached |= t < 8 && decode_cached();
-                hs.extend(spawn_reads(&self.reader, src, dst));
+                hs.extend(spawn_reads(&self.reader, src, dst, j));
             }
             hs
         };
@@ -2762,6 +2778,48 @@ impl<'g> MiniMax<'g> {
         let mut joined = 0usize; // waves whose reads are joined
         let lane = copy_lane();
         let issue_copy = |jobs: &mut Vec<Job>, j: usize, tickets: &[i64], copy_t: &mut Vec<i64>, joined: &mut usize, inflight: &mut Option<Reads>, wait: &mut f64| -> Result<()> {
+            // where the copy lands, and what it waits for on the device
+            let mut after: Vec<i64> = Vec::new();
+            if src_ready[j] >= 0 {
+                after.push(src_ready[j]);
+            }
+            let tgt = match &land[j] {
+                Some((_, tgt, ready)) => {
+                    if *ready >= 0 {
+                        after.push(*ready);
+                    }
+                    tgt.view(0, total)?
+                }
+                None => {
+                    if j >= NX {
+                        after.push(tickets[j - NX]);
+                    } else {
+                        after.extend(&xprev);
+                    }
+                    cd.xfer.view((j % NX) * slot, total)?
+                }
+            };
+            let ln = if lane == 2 { (j % 2) as i32 } else { lane };
+            // a wave's whole join: its reads waited for, the ring half of the wave before it free once the queue is idle, the next wave's reads issued
+            let join_wave = |joined: &mut usize, inflight: &mut Option<Reads>, wait: &mut f64, hs: Reads| -> Result<()> {
+                let tw = Instant::now();
+                join_all(hs)?;
+                if t < 8 {
+                    let n = waves[*joined].len().max(1) as u64;
+                    let per = tw.elapsed().as_secs_f64() / n as f64;
+                    self.counts.read_wait[if per < 0.001 { 0 } else if per < 0.002 { 1 } else { 2 }].fetch_add(n, Relaxed);
+                }
+                *wait += tw.elapsed().as_secs_f64();
+                if *joined >= 1 {
+                    // wave joined-1's products are done: its half of the ring is free for the reads after
+                    cd.gpu.sync()?;
+                }
+                *joined += 1;
+                if *joined < waves.len() {
+                    *inflight = Some(issue(*joined));
+                }
+                Ok(())
+            };
             let src: DevBuf = match &mut jobs[j] {
                 Job::Pinned(_, b) => b.view(0, total)?,
                 Job::Pre(_, slot_i, hs) => {
@@ -2771,49 +2829,42 @@ impl<'g> MiniMax<'g> {
                     ring.view((2 * WAVE + *slot_i) * slot, total)?
                 }
                 Job::Wave(_, k, jj) => {
-                    while *joined <= *k {
+                    let (k, jj) = (*k, *jj);
+                    while *joined < k {
+                        let hs = inflight.take().unwrap();
+                        join_wave(joined, inflight, wait, hs)?;
+                    }
+                    let src = ring.view(((k % 2) * WAVE + jj) * slot, total)?;
+                    if t < 8 && piece_copy() && *joined == k {
+                        // a decode pass: each piece of this expert copied as it lands, so the queue waits for the last piece's copy, not the whole read and then the copy
+                        let all = inflight.take().unwrap();
+                        let (mine, rest): (Reads, Reads) = all.into_iter().partition(|h| h.1 == jj);
+                        let mut ct = -1;
                         let tw = Instant::now();
-                        join_all(inflight.take().unwrap())?;
-                        if t < 8 {
-                            let n = waves[*joined].len().max(1) as u64;
-                            let per = tw.elapsed().as_secs_f64() / n as f64;
-                            self.counts.read_wait[if per < 0.001 { 0 } else if per < 0.002 { 1 } else { 2 }].fetch_add(n, Relaxed);
+                        for (i, h) in mine.into_iter().enumerate() {
+                            let (at, n) = (h.2, h.3);
+                            h.wait()?;
+                            ct = ffi::stream_copy(cd.gpu.raw(), &tgt.view(at, n)?, &src.view(at, n)?, n, if i == 0 { &after } else { &[] }, ln)?;
                         }
                         *wait += tw.elapsed().as_secs_f64();
-                        if *joined >= 1 {
-                            // wave joined-1's products are done: its half of the ring is free for the reads after
-                            cd.gpu.sync()?;
+                        if rest.is_empty() {
+                            // the wave's last expert: its join, with nothing left to wait for
+                            join_wave(joined, inflight, wait, Reads::new())?;
+                        } else {
+                            *inflight = Some(rest);
                         }
-                        *joined += 1;
-                        if *joined < waves.len() {
-                            *inflight = Some(issue(*joined));
-                        }
+                        copy_t.push(ct);
+                        return Ok(());
                     }
-                    ring.view(((*k % 2) * WAVE + *jj) * slot, total)?
+                    // the wave's first expert joins it; the rest of the wave find it joined
+                    if *joined == k {
+                        let hs = inflight.take().unwrap();
+                        join_wave(joined, inflight, wait, hs)?;
+                    }
+                    src
                 }
             };
-            let mut after: Vec<i64> = Vec::new();
-            if src_ready[j] >= 0 {
-                after.push(src_ready[j]);
-            }
-            let ct = match &land[j] {
-                Some((_, tgt, ready)) => {
-                    if *ready >= 0 {
-                        after.push(*ready);
-                    }
-                    ffi::stream_copy(cd.gpu.raw(), tgt, &src, total, &after, if lane == 2 { (j % 2) as i32 } else { lane })?
-                }
-                None => {
-                    if j >= NX {
-                        after.push(tickets[j - NX]);
-                    } else {
-                        after.extend(&xprev);
-                    }
-                    let tgt = cd.xfer.view((j % NX) * slot, total)?;
-                    ffi::stream_copy(cd.gpu.raw(), &tgt, &src, total, &after, if lane == 2 { (j % 2) as i32 } else { lane })?
-                }
-            };
-            copy_t.push(ct);
+            copy_t.push(ffi::stream_copy(cd.gpu.raw(), &tgt, &src, total, &after, ln)?);
             Ok(())
         };
         let mut issued = 0usize;
@@ -3014,7 +3065,7 @@ impl<'g> MiniMax<'g> {
                         let ring = cd.stage.device_view(0, cd.stage.len)?;
                         // SAFETY: slot_i of the read-ahead region of the stage, past the 2 * WAVE ring slots.
                         let dst = unsafe { ring.ptr().cast::<u8>().add((2 * WAVE + slot_i) * cd.slot) };
-                        pfs.map.insert((m, ex), (slot_i, spawn_reads(&self.reader, Src { cached: true, ..nm.src(ex) }, dst)));
+                        pfs.map.insert((m, ex), (slot_i, spawn_reads(&self.reader, Src { cached: true, ..nm.src(ex) }, dst, 0)));
                         self.counts.ahead.fetch_add(1, Relaxed);
                     }
                 }
@@ -3035,7 +3086,17 @@ impl<'g> MiniMax<'g> {
                 cd.gpu.sync()?;
                 best = best.min(t0.elapsed().as_secs_f64());
             }
-            eprintln!("[kbench {} {name}: {:.0} us, {:.0} GB/s]", cd.gpu.name.split_whitespace().rev().nth(1).unwrap_or("?"), best * 1e6, bytes as f64 / best * 1e-9);
+            // 16 launches back to back, a sync at the end: the kernel's own time without the host's launch and wait
+            let mut b16 = f64::MAX;
+            for _ in 0..4 {
+                let t0 = Instant::now();
+                for _ in 0..16 {
+                    f()?;
+                }
+                cd.gpu.sync()?;
+                b16 = b16.min(t0.elapsed().as_secs_f64() / 16.0);
+            }
+            eprintln!("[kbench {} {name}: {:.0} us, {:.0} GB/s; back to back {:.1} us, {:.0} GB/s]", cd.gpu.name.split_whitespace().rev().nth(1).unwrap_or("?"), best * 1e6, bytes as f64 / best * 1e-9, b16 * 1e6, bytes as f64 / b16 * 1e-9);
             Ok(())
         };
         let Some(mf) = self.k.silo_moe.as_ref() else { return Ok(()) };
@@ -3798,7 +3859,22 @@ impl<'g> MiniMax<'g> {
                 Ok(vec![y])
             }
             (None, Some(x)) => {
-                let drafts = self.draft_in(s, x)?;
+                // a drafter pass costs ~9 ms whether its confidence head lets a draft through or not: after NS_MM31_DRAFT_BACKOFF passes in a row that
+                // drafted nothing (default 2; 0: a pass every step) the next 1, 3, 7, 15 steps go without one; a pass that drafts ends the backoff
+                let drafts = if d.idle > 0 {
+                    d.idle -= 1;
+                    Vec::new()
+                } else {
+                    let v = self.draft_in(s, x)?;
+                    if v.is_empty() && self.ds.is_some() && draft_backoff() > 0 {
+                        // the passes before backing off, then 1, 3, 7, 15 steps without one
+                        d.empty = (d.empty + 1).min(draft_backoff() + 3);
+                        d.idle = (1 << (d.empty + 1).saturating_sub(draft_backoff())) - 1;
+                    } else {
+                        d.empty = 0;
+                    }
+                    v
+                };
                 d.drafted += drafts.len() as u64;
                 let mut toks = vec![x];
                 toks.extend(&drafts);
