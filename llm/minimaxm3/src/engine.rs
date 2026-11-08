@@ -150,13 +150,6 @@ fn precopy() -> bool {
     *N.get_or_init(|| std::env::var("NS_MM31_PRECOPY").map_or(true, |v| v != "0"))
 }
 
-/// NS_MM31_CPU_EXPERTS=N: a one-token pass's experts in pinned memory multiplied on N host threads (AVX-512, cpu.rs) while the card runs the
-/// rest, instead of copied to the card first; 0 (the default): none
-fn cpu_threads() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("NS_MM31_CPU_EXPERTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
-}
-
 /// NS_MM31_AHEAD_READS=0: a guessed expert in the file waits for its layer; only those in pinned memory are copied ahead
 fn ahead_reads() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -704,9 +697,6 @@ struct Card {
     xdeps: Mutex<Vec<i64>>,
     /// the doorbell's word and the router's result (pinned), and the last value rung
     bell: HostBuf,
-    /// NS_MM31_CPU_EXPERTS: pinned, the layer's activations, then a ring of 32 output rows
-    cpu_io: Option<HostBuf>,
-    cpu_at: AtomicUsize,
     ring_at: AtomicUsize,
     bell_seq: std::sync::atomic::AtomicU32,
     /// two hidden states: one token's layers take turns writing one and reading the other (no allocation a layer)
@@ -814,9 +804,6 @@ struct Counts {
     ahead_wanted: AtomicU64,
     /// experts moved into VRAM by recency (each demoting the least recent one to pinned memory)
     promoted: AtomicU64,
-    /// experts multiplied on the host (NS_MM31_CPU_EXPERTS), and the host's time in them
-    cpu_n: AtomicU64,
-    cpu_ns: AtomicU64,
     /// the host's time from the doorbell to the layer's VRAM experts queued (what the shared expert behind the router hides), and how many
     route_ns: AtomicU64,
     route_n: AtomicU64,
@@ -882,8 +869,6 @@ pub struct MiniMax<'g> {
     stage_ok: std::sync::atomic::AtomicBool,
     /// profile: one-token expert stages (gate, up, swiglu + quantize, down, scatter), seconds and bytes of weights read
     stage_t: Mutex<[f64; 6]>,
-    /// NS_MM31_CPU_EXPERTS: the host's threads for expert products
-    cpu_pool: Option<crate::cpu::Pool>,
     /// profile: a wide pass's expert products, seconds in the dequantization to half and in the GEMM
     wide_t: Mutex<(f64, f64)>,
     /// profile: a wide pass's experts by the rows each takes (at most 4, 8, 16, 32, more)
@@ -1395,7 +1380,7 @@ impl<'g> MiniMax<'g> {
                     Mutex::new(LayerCache { slots, of, clock: if profile.is_some() { row.len() as u64 + 1 } else { 0 } })
                 })
                 .collect();
-            cards.push(Card { gpu: gpu.clone(), arena_small, arena_big: Mutex::new(None), cur_arena, arena_bytes, extra: Mutex::new(None), layers: range, res, cache, stage, slot: slot_max, xfer, pfs: Mutex::new(PfState { free: (0..PF_SLOTS).collect(), map: HashMap::new() }), xdeps: Mutex::new(Vec::new()), bell: HostBuf::new(gpu, 4096 + 32 * 2048)?, cpu_io: if cpu_threads() > 0 { Some(HostBuf::new(gpu, 33 * g.n_embd as usize * 4)?) } else { None }, cpu_at: AtomicUsize::new(0), ring_at: AtomicUsize::new(0), bell_seq: 0.into(), flip: [DevBuf::f32(gpu, 8 * g.n_embd as usize)?, DevBuf::f32(gpu, 8 * g.n_embd as usize)?], _vram: dev, _host: host, kept: (vk, hk) });
+            cards.push(Card { gpu: gpu.clone(), arena_small, arena_big: Mutex::new(None), cur_arena, arena_bytes, extra: Mutex::new(None), layers: range, res, cache, stage, slot: slot_max, xfer, pfs: Mutex::new(PfState { free: (0..PF_SLOTS).collect(), map: HashMap::new() }), xdeps: Mutex::new(Vec::new()), bell: HostBuf::new(gpu, 4096 + 32 * 2048)?, ring_at: AtomicUsize::new(0), bell_seq: 0.into(), flip: [DevBuf::f32(gpu, 8 * g.n_embd as usize)?, DevBuf::f32(gpu, 8 * g.n_embd as usize)?], _vram: dev, _host: host, kept: (vk, hk) });
         }
 
         // the second drive: a copy of the experts the cards do not keep (a share of them), read beside the model's own file,
@@ -1703,7 +1688,6 @@ impl<'g> MiniMax<'g> {
             cur_wide: false.into(),
             stage_ok: (std::env::var("NS_PROFILE").is_ok_and(|v| v == "1")).into(),
             stage_t: Mutex::new([0.0; 6]),
-            cpu_pool: (cpu_threads() > 0).then(|| crate::cpu::Pool::new(cpu_threads())),
             wide_t: Mutex::new((0.0, 0.0)),
             wide_rows: Mutex::new([0; 5]),
             pf_tokens: Mutex::new((0, 0.0)),
@@ -1768,9 +1752,6 @@ impl<'g> MiniMax<'g> {
         let (a, b, d) = (c.vram.load(Relaxed), c.pinned.load(Relaxed), c.file.load(Relaxed));
         v.push(format!("[experts used: {a} from VRAM, {b} from pinned host memory, {d} read from the file ({:.1}% on the cards); {:.1} GiB read from the file in all; {} moved into VRAM by recency; the host waited {:.2} s for the routers' read-backs in one-token passes, {:.2} s for expert reads and {:.2} s for the layers' final syncs]",
                        100.0 * (a + b) as f64 / (a + b + d).max(1) as f64, self.reader.bytes.load(Relaxed) as f64 / GIB as f64, c.promoted.load(Relaxed), c.rb_ns.load(Relaxed) as f64 * 1e-9, c.join_ns.load(Relaxed) as f64 * 1e-9, c.end_ns.load(Relaxed) as f64 * 1e-9));
-        if c.cpu_n.load(Relaxed) > 0 {
-            v.push(format!("[experts multiplied on the host's {} threads: {}, {:.3} ms each]", cpu_threads(), c.cpu_n.load(Relaxed), c.cpu_ns.load(Relaxed) as f64 * 1e-6 / c.cpu_n.load(Relaxed) as f64));
-        }
         v.push(format!("[read ahead: {} experts guessed and read for the next layer, {} of the {} off-card experts it needed were among them]", c.ahead.load(Relaxed),
                        c.ahead_used.load(Relaxed), c.ahead_wanted.load(Relaxed)));
         if self.pf {
@@ -2423,13 +2404,6 @@ impl<'g> MiniMax<'g> {
         // one token, with the doorbell: the router writes to pinned host memory and rings; the shared expert is queued behind it, so the GPU works through the host's routing
         let bell_on = t == 1 && bell() && self.one_fns(t).is_some();
         let logits = if bell_on { cd.bell.device_view(64, ne * 4)? } else { a.f32(t * ne)? };
-        // NS_MM31_CPU_EXPERTS: the activation into pinned memory before the router, so it is there when the bell rings
-        let cpu_here = t == 1 && bell_on && self.cpu_pool.is_some() && m.gate.ty == m.up.ty && crate::cpu::supported(m.gate.ty.code() as i32, m.down.ty.code() as i32);
-        if cpu_here {
-            let (one, io) = (self.one_fns(t).unwrap(), cd.cpu_io.as_ref().unwrap().device_view(0, c * 4)?);
-            // SAFETY: x and the pinned buffer hold c floats.
-            ffi::check(unsafe { (one.kcopy)(cd.gpu.raw(), io.ptr().cast::<u32>(), x.fp().cast::<u32>().cast_const(), c as i64) }, "kcopy")?;
-        }
         let f1 = self.one_fns(t).filter(|_| {
             // SAFETY: plain queries.
             unsafe { self.k.silo_moe.as_ref().is_some_and(|f| (f.supported)(m.router.ty.code() as i32, c as i64) != 0) }
@@ -2666,8 +2640,6 @@ impl<'g> MiniMax<'g> {
         }
         // the recency cache: every expert that has to come into VRAM lands directly in an empty VRAM place of the layer; the pinned
         // place it leaves is free after the copy. Without an empty place it runs from the ring and stays where it is.
-        // the experts multiplied on the host: those in pinned memory (a promotion still copies one into VRAM for its next use, on the copy lane)
-        let cpu_job: Vec<bool> = jobs.iter().map(|j| cpu_here && matches!(j, Job::Pinned(..))).collect();
         let mut land: Vec<Option<(usize, DevBuf, i64)>> = (0..njobs).map(|_| None).collect();
         let mut src_ready: Vec<i64> = vec![-1; njobs];
         cache.clock += 1;
@@ -2805,35 +2777,7 @@ impl<'g> MiniMax<'g> {
         let mut copy_t: Vec<i64> = Vec::with_capacity(njobs); // a job's copy ticket
         let mut joined = 0usize; // waves whose reads are joined
         let lane = copy_lane();
-        // a pinned place an earlier demotion wrote is read by the host here: the queue waits for those copies and rings when they are done
-        if cpu_job.iter().zip(&src_ready).any(|(c, r)| *c && *r >= 0) {
-            for (j, r) in src_ready.iter_mut().enumerate() {
-                if cpu_job[j] && *r >= 0 {
-                    ffi::await_ticket(cd.gpu.raw(), *r)?;
-                    *r = -1;
-                }
-            }
-            let f = self.one_fns(t).unwrap();
-            let seq = cd.bell_seq.fetch_add(1, Relaxed) + 1;
-            let flag = cd.bell.device_view(0, 64)?.ptr().cast::<u32>();
-            // SAFETY: as at the router's bell: the card's pinned word, a bound of 10 s.
-            ffi::check(unsafe { (f.doorbell)(cd.gpu.raw(), flag, seq) }, "doorbell")?;
-            let af = unsafe { &*flag.cast::<std::sync::atomic::AtomicU32>() };
-            let t0 = Instant::now();
-            while af.load(std::sync::atomic::Ordering::Acquire) != seq {
-                std::hint::spin_loop();
-                if t0.elapsed().as_secs() >= 10 {
-                    cd.gpu.sync()?;
-                    break;
-                }
-            }
-        }
         let issue_copy = |jobs: &mut Vec<Job>, j: usize, tickets: &[i64], copy_t: &mut Vec<i64>, joined: &mut usize, inflight: &mut Option<Reads>, wait: &mut f64| -> Result<()> {
-            // no copy for a product on the host, unless the expert moves into VRAM for its next use
-            if cpu_job[j] && land[j].is_none() {
-                copy_t.push(-1);
-                return Ok(());
-            }
             // where the copy lands, and what it waits for on the device
             let mut after: Vec<i64> = Vec::new();
             if src_ready[j] >= 0 {
@@ -2953,35 +2897,6 @@ impl<'g> MiniMax<'g> {
                 issue_copy(&mut jobs, issued, &tickets, &mut copy_t, &mut joined, &mut inflight, &mut wait)?;
                 issued += 1;
             }
-            if cpu_job[i] {
-                let Job::Pinned(ex, b) = &jobs[i] else { unreachable!() };
-                let t0 = Instant::now();
-                let one = self.one_fns(t).unwrap();
-                let io = cd.cpu_io.as_ref().unwrap();
-                let xh = io.device_view(0, c * 4)?;
-                let at = cd.cpu_at.fetch_add(1, Relaxed) % 32;
-                let yb = io.device_view((1 + at) * c * 4, c * 4)?;
-                let it = per[*ex][0];
-                // SAFETY: the activation is in the pinned buffer (the router has rung after its copy); the expert's pinned place is not written by any copy
-                // queued or running (waited for above); the output slot is this job's until its copy below has run (32 host products later at the soonest, a bell between).
-                unsafe {
-                    let xs = std::slice::from_raw_parts(xh.ptr().cast::<f32>().cast_const(), c);
-                    let ys_h = std::slice::from_raw_parts_mut(yb.ptr().cast::<f32>(), c);
-                    crate::cpu::expert(self.cpu_pool.as_ref().unwrap(), m.gate.ty.code() as i32, m.down.ty.code() as i32, b.ptr().cast::<u8>().cast_const(), off_up, off_down, fe, c, xs, it.1, ys_h);
-                    ffi::check((one.kcopy)(cd.gpu.raw(), ys.fp().add(it.2 as usize * plane).cast::<u32>(), yb.ptr().cast::<u32>().cast_const(), c as i64), "kcopy")?;
-                }
-                self.counts.cpu_n.fetch_add(1, Relaxed);
-                self.counts.cpu_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
-                tickets.push(ffi::mark(cd.gpu.raw())?);
-                while issued < njobs && issued <= i + LA {
-                    if issued > i + 1 && !matches!(jobs[issued], Job::Pinned(..)) {
-                        break;
-                    }
-                    issue_copy(&mut jobs, issued, &tickets, &mut copy_t, &mut joined, &mut inflight, &mut wait)?;
-                    issued += 1;
-                }
-                continue;
-            }
             // the compute queue waits, on the device, for the copy
             ffi::await_ticket(cd.gpu.raw(), copy_t[i])?;
             let (ex, pre_slot) = match &jobs[i] {
@@ -3032,12 +2947,6 @@ impl<'g> MiniMax<'g> {
             let mut cache = cd.cache[li].lock().unwrap();
             for &(j, p) in &left {
                 cache.slots[p].ready = copy_t[j];
-            }
-            // an expert multiplied on the host and promoted: nothing in this pass waited for its copy into VRAM, so its next use does
-            for (j, l) in land.iter().enumerate() {
-                if let (true, Some((v, _, _))) = (cpu_job[j], l) {
-                    cache.slots[*v].ready = copy_t[j];
-                }
             }
             let empty = cache.slots.iter().filter(|sl| sl.vram && sl.occ.is_none()).count();
             for _ in empty..free_places() {
@@ -3237,38 +3146,6 @@ impl<'g> MiniMax<'g> {
                 let kinds = format!("{:?}{:?}", m.gate.ty, m.down.ty);
                 if !seen.contains(&kinds) {
                     seen.push(kinds);
-                    // NS_MM31_CPU_EXPERTS: an expert multiplied on the host from its pinned place, against the same bytes copied to the heap (is pinned memory slow for the CPU?)
-                    if let (Some(pool), true) = (&self.cpu_pool, crate::cpu::supported(m.gate.ty.code() as i32, m.down.ty.code() as i32) && m.gate.ty == m.up.ty) {
-                        let cache = cd.cache[l - cd.layers.start].lock().unwrap();
-                        let pins: Vec<usize> = cache.slots.iter().filter(|s| !s.vram && s.occ.is_some()).take(8).map(|s| s.buf.ptr() as usize).collect();
-                        drop(cache);
-                        let (off_up, off_down, total) = m.layout();
-                        let (fe, xv) = (m.gate.rows, (0..c).map(|i| ((i * 2654435761) % 1000) as f32 * 0.002 - 1.0).collect::<Vec<f32>>());
-                        let mut y = vec![0f32; c];
-                        let heap: Vec<Vec<u8>> = pins.iter().map(|&p| {
-                            // SAFETY: a pinned place holds a whole expert of `total` bytes.
-                            unsafe { std::slice::from_raw_parts(p as *const u8, total) }.to_vec()
-                        }).collect();
-                        let mut tp = Vec::new();
-                        let mut th = Vec::new();
-                        for _ in 0..3 {
-                            for (p, h) in pins.iter().zip(&heap) {
-                                let t0 = Instant::now();
-                                // SAFETY: whole experts of these types, x and y of their sizes.
-                                unsafe { crate::cpu::expert(pool, m.gate.ty.code() as i32, m.down.ty.code() as i32, *p as *const u8, off_up, off_down, fe, c, &xv, 1.0, &mut y) };
-                                tp.push(t0.elapsed().as_secs_f64() * 1e3);
-                                let t0 = Instant::now();
-                                // SAFETY: as above, on the heap copy.
-                                unsafe { crate::cpu::expert(pool, m.gate.ty.code() as i32, m.down.ty.code() as i32, h.as_ptr(), off_up, off_down, fe, c, &xv, 1.0, &mut y) };
-                                th.push(t0.elapsed().as_secs_f64() * 1e3);
-                            }
-                        }
-                        tp.sort_by(|a, b| a.total_cmp(b));
-                        th.sort_by(|a, b| a.total_cmp(b));
-                        if !tp.is_empty() {
-                            eprintln!("[kbench cpu l{l} {:?}/{:?}: an expert on {} threads from pinned memory {:.3} ms median, from the heap {:.3} ms median (8 experts x 3)]", m.gate.ty, m.down.ty, cpu_threads(), tp[tp.len() / 2], th[th.len() / 2]);
-                        }
-                    }
                     let cache = cd.cache[l - cd.layers.start].lock().unwrap();
                     let bases: Vec<u64> = cache.slots.iter().filter(|s| s.vram && s.occ.is_some()).take(used).map(|s| s.buf.ptr() as u64).collect();
                     drop(cache);

@@ -357,7 +357,6 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | `NS_MM31_ATTX` | 1 | 0 = a prompt pass's attention on the silo's vector-unit kernel, not its XMX one (half queries) | llm:minimaxm3 |
 | `NS_MM31_KBENCH` | 0 | Debug: 1 = at the first session, each decode kernel timed alone on real weights on each card (GB/s) | llm:minimaxm3 |
 | `NS_MM31_BELL` | 1 | 0 = one token's router result comes back by a blocking read, not through a doorbell in pinned memory with the shared expert queued behind it | llm:minimaxm3 |
-| `NS_MM31_CPU_EXPERTS` | 0 | N > 0: a one-token pass's experts in pinned host memory are multiplied on N host threads (AVX-512; IQ1_M / IQ2_XXS gate and up with IQ3_XXS down) while the card runs the rest, not copied to the card first (a promotion still copies them into VRAM for their next use) | llm:minimaxm3 |
 | `NS_MM31_PIECE_COPY` | on | `0`: a file-read expert of a decode pass is copied to VRAM when all its pieces are in. By default each piece is copied as it lands, so the card waits for the last piece's copy rather than the whole read and then the copy | llm:minimaxm3 |
 | `NS_MM31_ORDER` | unset | `asis` = two cards in the order `--gpu` gives; by default the B65 takes the first layers and the B70 the rest and the head | llm:minimaxm3 |
 | `NS_MM31_SPARE_GIB` | 1.9 | VRAM per card the minimaxm3 engine leaves free besides its arena and session caches when it sizes the experts (at least 1.6) | llm:minimaxm3 |
