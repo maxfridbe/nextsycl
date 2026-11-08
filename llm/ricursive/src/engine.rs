@@ -290,6 +290,8 @@ pub struct Ricursive<'g> {
     copy_stream: bool,
     /// the silo's XMX attention (NS_RC_FLASH=0: the shared kernel, an A/B)
     flash: bool,
+    /// the Q8_1 decode products (NS_RC_MMVQ=0: every product through the half GEMM, a precision A/B)
+    mmvq: bool,
     /// NS_RC_PROFILE=1: GPU time by operation over the decode passes (a sync after each; slows the run)
     prof: Option<Mutex<Prof>>,
     host_layers: usize,
@@ -550,7 +552,7 @@ impl<'g> Ricursive<'g> {
         }).collect::<Vec<_>>().join(", ");
         log(format!("ricursive: card memory in use before any session (weights, work memory, half buffer): {used}"));
         Ok(Ricursive { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, hosts, output_norm, output_buf, output, embd, chunk,
-                       work: Mutex::new(()), dump: std::env::var("NS_RC_DUMP").ok().filter(|d| !d.is_empty()).map(Into::into), copy_stream, flash: std::env::var("NS_RC_FLASH").map_or(true, |v| v != "0"), prof: std::env::var("NS_RC_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Prof::default())), host_layers, load_s,
+                       work: Mutex::new(()), dump: std::env::var("NS_RC_DUMP").ok().filter(|d| !d.is_empty()).map(Into::into), copy_stream, flash: std::env::var("NS_RC_FLASH").map_or(true, |v| v != "0"), mmvq: std::env::var("NS_RC_MMVQ").map_or(true, |v| v != "0"), prof: std::env::var("NS_RC_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Prof::default())), host_layers, load_s,
                        load_bytes: loaded })
     }
 
@@ -624,7 +626,7 @@ impl<'g> Ricursive<'g> {
         let code = w.ty.code() as i32;
         // SAFETY: arithmetic only.
         let mmvq = unsafe { (k.mmvq_supported)(code) } != 0;
-        if t <= 8 && mmvq {
+        if t <= 8 && mmvq && (self.mmvq || rows > self.g.n_ff) {
             // SAFETY: arithmetic only.
             let silo = self.silo.filter(|s| unsafe { (s.mmvq_supported)(code, kk) } != 0);
             let own;

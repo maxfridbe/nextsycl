@@ -6,7 +6,7 @@ arch: ricursive
 title: Ripple-65B-Preview AD-Q4_K_M (4-bit; both GPUs, 32K)
 about: 'Ricursive''s dense Ripple-65B-Preview (Apache-2.0): 80 layers of gated attention (64 over a 1,024 sliding window with rotary positions, 16 global with none), a clamped dense SwiGLU, per-head q/k norms and a value residual from the embeddings; AtomicChat''s AD-Q4_K_M GGUF (Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS, 37.7 GiB; mean KLD 0.0136 against BF16); it thinks in <think> blocks before its answer; layers split over both GPUs'
 gpus: all
-vram_gib: 0                      # replaced by the measurement below
+vram_gib: 29.9                   # its memory on the larger card when it runs at 32K (measured: B70 27.8 + caches 2.0; the B65 holds ~14.3)
 ctx: 32768
 tools: true
 tasks: true

@@ -88,7 +88,7 @@ agree to KL 0.001. Decoding against the prompt path was not compared (a gap).
 
 ## Speed (B65 + B70, `llm generate --ids`, 64 tokens `--ignore-eos`, greedy, 2026-11-08; pp = prompt, tg = generation)
 
-Layers 0-20 on the B65, 21-79 on the B70 (the default), 37.4 GiB of weights, the context 32,768.
+Layers 0-23 on the B65, 24-79 on the B70 (the default plan at this context), 37.4 GiB of weights, the context 32,768.
 
 | prompt | pp, shared attention (first engine) | pp, XMX attention (silo) | tg, XMX attention |
 |---|---:|---:|---:|
@@ -101,38 +101,47 @@ tg with the first engine was 9.8 (2K) and 7.45 (31K): the XMX attention is most 
 
 What bounds them:
 
-- **tg** reads 40.4 GB a token across two cards in series: the B70 holds 59 layers (~29 GB), the B65 21 (~10 GB). The
+- **tg** reads 40.4 GB a token across two cards in series: the B70 holds 56 layers (~28.7 GB with the head), the B65 24 (~12 GB). The
   decode products run at 450-500 GB/s (Q4_K 497, Q5_K 455 GB/s measured per call with `NS_RC_PROFILE=1`; Q6_K 320,
-  Q8_0 295), so the memory floor is ~75 ms (13 tok/s) and the engine takes ~96 ms. Profile of a decode pass, 2K context
+  Q8_0 295), so the memory floor is ~82 ms (12.2 tok/s) and the engine takes ~96 ms. Profile of a decode pass, 2K context
   (milliseconds, a sync after each operation so a little inflated): Q4_K products 45, Q5_K 29, Q6_K 11, Q8_0 3, the
   small kernels between them 13 (about 640 groups of them a pass, 20 us each as timed), attention with its norms and cache store 11.
   The remaining gap is those small kernels and the Q6_K / Q8_0 products (the shared kernel, not yet in the silo).
 - **pp** is compute: the half GEMM after expanding each matrix (the expansion reads the 40 GB again per chunk of 2,048
   rows: 2K tokens in 3.8 s) and, at depth, the 16 global layers' attention; 409 tok/s at 31K.
-- **Split.** The B70 first is the fastest of the splits tried (tg at 2K: first layer of the B70 at 21: 10.6; at 30: 10.2;
-  at 40: 9.9; at 12, where 9 layers no longer fit its VRAM and stream over PCIe: 3.4).
+- **Split** (4,096 context, tg at 2K): the B70 first layer 21 (the default there) 10.6 tok/s; 30: 10.2; 40: 9.9; 12, where
+  the B70's layers no longer fit its VRAM and some stream over PCIe: 3.4. More on the faster card is faster.
 
 ### Offload (one card, the rest in pinned host memory, 2026-11-08)
 
-The B65 alone (the B70 was held by the front door's other models while this was measured): 20 layers (9.8 GiB) in pinned
-host memory, 60 on the card, chunk 512, context 8,704 so that the caches fit.
+One card at a 8,704-token context (2,304 for the staging copy), the layers that do not fit in pinned host memory. With less
+VRAM left the engine picks a smaller prompt chunk (512; 2,048 when it fits), and every chunk reads each host layer once.
 
-| stream | pp 2,000 | pp 8,000 | tg |
-|---|---:|---:|---:|
-| in place over PCIe (default) | 343 tok/s | 296 tok/s | 1.9 tok/s |
-| through a staging copy (context 2,304: the staging buffer needs its VRAM) | 385 tok/s | not enough VRAM | 2.0 tok/s |
+| card | host layers | stream | pp 2,000 | pp 8,000 | tg |
+|---|---|---|---:|---:|---:|
+| B70 alone | 19 (9.4 GiB), chunk 512 | in place over PCIe | 285 tok/s | 313 tok/s | 2.1 tok/s |
+| B70 alone | 22 (10.7 GiB), chunk 2,048, context 2,304 | staging copy | 495 tok/s | does not fit | 2.06 tok/s |
+| B65 alone | 20 (9.8 GiB), chunk 512 | in place over PCIe | 343 tok/s | 296 tok/s | 1.9 tok/s |
+| B65 alone | 22 (10.7 GiB), chunk 512, context 2,304 | staging copy | 385 tok/s | does not fit | 2.0 tok/s |
 
-- Streaming is bound by PCIe: 9.8 GiB a token at ~21 GB/s is 0.5 s; adding the 60 resident layers' 63 ms gives the 1.9
-  measured. Direct and copy are the same speed; copy costs a layer of VRAM, so direct is the default.
-- Prompts are far less hurt (a chunk of 512 reads the host layers once, 296-343 tok/s against 531): a prompt-heavy,
-  one-card use works, a chat does not. **Two cards are the answer for chat: 10 tok/s against 1.9.**
-- `MemAvailable` stayed above 40 GiB through these (the 8 GiB guard is the engine's: it refuses to pin past it).
+- Streaming is bound by PCIe, not by the card: ~9.4 GiB a token at ~24 GB/s is 0.4 s; adding the resident layers' ~65 ms
+  gives the 2.1 measured. In place and copy decode alike; copy costs a layer of VRAM (so less context or a smaller chunk),
+  so in place is the default.
+- A prompt chunk reads the host layers once, so a bigger chunk streams less per token: 2,048 rows read them once for 2,000
+  tokens (495 tok/s) where chunks of 512 read them four times (285). Prompt-heavy one-card use works at 285-495 tok/s;
+  chat does not (2 tok/s). **Two cards are the answer for chat: 10.5 tok/s against 2.1.**
+- `MemAvailable` stayed above 40 GiB through these (the engine refuses to pin past 8 GiB free, `NS_RC_HOST_SPARE_GIB`).
+- No disk tier was built: a dense layer has no hot subset, so a drive (the 4TB P310 reads ~5 GB/s, a quarter of PCIe's
+  pinned rate) would only make streamed layers slower.
 
-## Memory
+## Memory (card memory read from the cards after the load, caches added)
 
-See the card's `vram_gib` (the maximum over the two cards, from the engine's own log line, "card memory in use before any
-session", plus the caches at 32K: 16 global layers x 32,768 x 4,096 B = 2.0 GiB and 64 rings of 3,072 positions =
-0.77 GiB). MEMORY_TABLE
+At the 32,768 context the plan is layers 0-23 on the B65 and 24-79 on the B70 (more layers go to the B70 when the context
+is shorter: 21 / 59 at 4,096). Weights, work memory and the half buffer, measured: B65 13.5 GiB, B70 27.8 GiB. The caches
+at 32K (a global layer 32,768 x 4,096 B = 0.125 GiB, a sliding ring of 3,072 positions 0.012 GiB): B65 4 global + 20
+sliding = 0.79 GiB, B70 12 global + 44 sliding = 2.04 GiB. So B65 ~14.3 GiB, B70 ~29.9 GiB of 31.9 (1.5 GiB kept free:
+the engine refuses a session that would not leave it). Host memory: none in the two-card plan beyond the staging of the
+load. `vram_gib` in the card is 29.9, the B70's.
 
 ## Known, open
 

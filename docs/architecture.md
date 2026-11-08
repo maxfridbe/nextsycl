@@ -316,9 +316,9 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   own projection, and a value residual (v reads `x0 + sigmoid(lambda)(h - x0)`, x0 the scaled embeddings); 64 layers over a
   1,024 sliding window with NEOX rotary positions (theta 1e4), every fifth global with no positions. A windowed layer's
   cache is a ring of window + chunk, a global layer's the context; checkpoints are position-ordered, so a different ring
-  restores. Layers split over the cards by what fits (the last card first: the B70 holds 59, the B65 21), what fits no
+  restores. Layers split over the cards by what fits (the last card first: the B70 holds 56, the B65 24 at 32K), what fits no
   card stays in pinned host memory and is read in place over PCIe (or through a staging copy: PCIe-bound either way,
-  1.9 tok/s tg on a B65 alone with 20 layers streamed against 10.5 on two cards). Its kernels
+  ~2 tok/s tg on one card alone with ~20 layers streamed against 10.5 on two cards). Its kernels
   (`kernels/llm/ricursive/rc.cpp`): the q / k norm with the rotation, the ring store, the attention, the gate, the value
   residual, the post norm into the residual; its silo: the Q4_K / Q5_K decode products, the weight expansion, the
   norm with Q8_1 blocks (qwen35's, copied) and flash attention on XMX for 10 query heads a key head (museglimmer's,
