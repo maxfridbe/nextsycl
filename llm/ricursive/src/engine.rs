@@ -288,6 +288,10 @@ pub struct Ricursive<'g> {
     /// NS_RC_DUMP=DIR: every tapped tensor of a pass written there as float32
     dump: Option<std::path::PathBuf>,
     copy_stream: bool,
+    /// the silo's XMX attention (NS_RC_FLASH=0: the shared kernel, an A/B)
+    flash: bool,
+    /// NS_RC_PROFILE=1: GPU time by operation over the decode passes (a sync after each; slows the run)
+    prof: Option<Mutex<Prof>>,
     host_layers: usize,
     load_s: f64,
     load_bytes: u64,
@@ -298,6 +302,19 @@ fn chunk_setting() -> Option<usize> {
 }
 
 /// A prompt chunk's work memory (the arena) for `chunk` rows
+/// NS_RC_PROFILE's accumulators
+struct Prof {
+    last: Instant,
+    by: std::collections::BTreeMap<String, (f64, u64)>,
+    passes: u64,
+}
+
+impl Default for Prof {
+    fn default() -> Self {
+        Prof { last: Instant::now(), by: Default::default(), passes: 0 }
+    }
+}
+
 fn arena_bytes(g: &Geometry, chunk: usize) -> usize {
     let (qd, kd) = (g.heads * g.head, g.heads_kv * g.head);
     chunk * (6 * g.n_embd + 4 * qd + 3 * kd + 2 * g.n_ff) * 4 + chunk * g.n_ff.max(qd) * 2 + 16 * g.vocab * 4 + (128 << 20)
@@ -521,8 +538,13 @@ impl<'g> Ricursive<'g> {
         }).collect::<Vec<_>>().join(", ");
         log(format!("ricursive: {nl} layers of {} ({} sliding, {} global), {:.1} GiB on {wh} in {load_s:.0} s; prompt chunks of {chunk}", g.n_embd,
                     (0..nl).filter(|l| g.swa[*l]).count(), (0..nl).filter(|l| !g.swa[*l]).count(), loaded as f64 / GIB));
+        let used = devs.iter().map(|d| match d.gpu.memory() {
+            Ok((t, Some(fr))) => format!("{:.1} of {:.1} GiB", (t - fr.min(t)) as f64 / GIB, t as f64 / GIB),
+            _ => "?".into(),
+        }).collect::<Vec<_>>().join(", ");
+        log(format!("ricursive: card memory in use before any session (weights, work memory, half buffer): {used}"));
         Ok(Ricursive { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, hosts, output_norm, output_buf, output, embd, chunk,
-                       work: Mutex::new(()), dump: std::env::var("NS_RC_DUMP").ok().filter(|d| !d.is_empty()).map(Into::into), copy_stream, host_layers, load_s,
+                       work: Mutex::new(()), dump: std::env::var("NS_RC_DUMP").ok().filter(|d| !d.is_empty()).map(Into::into), copy_stream, flash: std::env::var("NS_RC_FLASH").map_or(true, |v| v != "0"), prof: std::env::var("NS_RC_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Prof::default())), host_layers, load_s,
                        load_bytes: loaded })
     }
 
@@ -537,6 +559,21 @@ impl<'g> Ricursive<'g> {
     }
     pub fn streams(&self) -> usize {
         self.host_layers
+    }
+
+    /// Charge the GPU time since the last tick to `label` (NS_RC_PROFILE only)
+    fn tick(&self, label: &str) {
+        let Some(p) = &self.prof else { return };
+        for d in &self.devs {
+            let _ = d.gpu.sync();
+        }
+        let mut p = p.lock().unwrap();
+        let now = Instant::now();
+        let dt = now.duration_since(p.last).as_secs_f64();
+        p.last = now;
+        let e = p.by.entry(label.to_string()).or_insert((0.0, 0));
+        e.0 += dt;
+        e.1 += 1;
     }
 
     fn dev(&self) -> &Dev {
@@ -566,6 +603,14 @@ impl<'g> Ricursive<'g> {
 
     /// y [t, w.rows] = x [t, w.cols] . W^T, W in `wb` at `w.off`; `xq`: x's Q8_1 forms when the norm made them
     fn matmul(&self, w: &Mat, wb: &DevBuf, x: &DevBuf, xq: Option<&Q8>, t: usize, y: &DevBuf) -> Result<()> {
+        self.tick("other");
+        let label = format!("mm {:?} t{}", w.ty, if t <= 8 { "<=8" } else { ">8" });
+        let r = self.matmul_inner(w, wb, x, xq, t, y);
+        self.tick(&label);
+        r
+    }
+
+    fn matmul_inner(&self, w: &Mat, wb: &DevBuf, x: &DevBuf, xq: Option<&Q8>, t: usize, y: &DevBuf) -> Result<()> {
         let k = self.k;
         let (n, kk) = (w.rows as i64, w.cols as i64);
         let (rows, cols) = (w.rows, w.cols);
@@ -724,10 +769,24 @@ impl<'g> Ricursive<'g> {
                                         g.theta, p0 as i64), "k norm rope")?;
             ffi::check((k.kv_store)(self.raw(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64, ring as i64, p0 as i64, kc.ptr(), vc.ptr()),
                        "kv store")?;
+            let (ti, hqi, hki, di) = (t as i64, hq as i64, hk as i64, d as i64);
+            let flash = self.silo.filter(|_| self.flash).filter(|s| (s.flash_prompt_supported)(ti, hqi, hki, di) != 0 || (s.flash_decode_supported)(ti, hqi, hki, di) != 0);
+            if let Some(s) = flash {
+                let (q, kk, vv) = (qn.fp(), kc.ptr(), vc.ptr());
+                if t > 16 {
+                    ffi::check((s.flash_prompt)(self.raw(), q, kk, vv, ti, hqi, hki, di, ring as i64, p0 as i64, window as i64, att.fp()), "attention")?;
+                } else {
+                    let sc = (s.flash_decode_scratch)(ti, hqi, hki, di, p0 as i64, window as i64) as usize;
+                    let part = self.arena().f32(sc.max(1))?;
+                    ffi::check((s.flash_decode)(self.raw(), q, kk, vv, ti, hqi, hki, di, ring as i64, p0 as i64, window as i64, att.fp(), part.fp()), "attention")?;
+                }
+            } else {
             let sc = (k.attn_scratch)(t as i64, hq as i64, hk as i64, d as i64, window as i64, p0 as i64) as usize;
             let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
             ffi::check((k.attn)(self.raw(), qn.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64, ring as i64, window as i64, p0 as i64, att.fp(),
                                 part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())), "attention")?;
+            }
+            self.tick("qk norm, rope, kv store, attention");
             ffi::check((k.gate_mul)(self.raw(), att.fp(), gt.fp(), (t * hq * d) as i64), "output gate")?;
         }
         let o = self.arena().f32(t * ne)?;
@@ -809,6 +868,22 @@ impl<'g> Ricursive<'g> {
             at += m;
         }
         let all = logits.to_f32()?;
+        self.tick("logits readback");
+        if let Some(p) = &self.prof {
+            let mut p = p.lock().unwrap();
+            if t == 1 {
+                p.passes += 1;
+                if p.passes % 32 == 0 {
+                    let tot: f64 = p.by.values().map(|v| v.0).sum();
+                    let mut v: Vec<_> = p.by.iter().collect();
+                    v.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+                    eprintln!("[ricursive profile: {} one-row passes; {:.1} ms a pass (prompt passes included in the totals)]", p.passes, tot * 1e3 / p.passes as f64);
+                    for (k, (secs, n)) in v {
+                        eprintln!("  {:<40} {:>9.1} ms total {:>7} calls {:>8.1} us each", k, secs * 1e3, n, secs * 1e6 / *n as f64);
+                    }
+                }
+            }
+        }
         Ok(all.chunks(self.output.rows).map(|c| c.to_vec()).collect())
     }
 

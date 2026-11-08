@@ -35,6 +35,18 @@ int ns_rc_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t*
  * layout; C a multiple of 256 */
 int ns_rc_rms_q8(ns_gpu* g, const float* x, const float* w, float* y, void* q8_1, void* xs, int64_t rows, int64_t C, float eps);
 
+/* Attention on XMX (attn.cpp; the shared one is rc.h's ns_rc_attn): out [T, Hq x 128] = softmax(q k^T / sqrt(128)) v for
+ * rows q [T, Hq x 128] at positions p0.., causal, within the window (win <= 0: every key), against the ring caches
+ * [Hkv][cap][128] half (slot pos % cap). Heads of 128 and 10 query heads a key head; _prompt covers more than 16 rows,
+ * _decode 1..16 (the keys cut at absolute positions over ~512 work-groups, merged through `scratch`, _scratch floats) */
+int ns_rc_flash_prompt_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t D);
+int ns_rc_flash_prompt(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
+                       int64_t win, float* out);
+int ns_rc_flash_decode_supported(int64_t T, int64_t Hq, int64_t Hkv, int64_t D);
+int64_t ns_rc_flash_decode_scratch(int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t p0, int64_t win);
+int ns_rc_flash_decode(ns_gpu* g, const float* q, const void* kc, const void* vc, int64_t T, int64_t Hq, int64_t Hkv, int64_t D, int64_t cap, int64_t p0,
+                       int64_t win, float* out, float* scratch);
+
 #ifdef __cplusplus
 }
 #endif

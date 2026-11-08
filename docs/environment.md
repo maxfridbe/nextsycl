@@ -200,6 +200,7 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_RC_HOST_SPARE_GIB` | 8 | Host memory the ricursive engine keeps free whatever it pins for streamed layers (--opt-host-spare-gib) | llm ricursive |
 | `NS_RC_LAYERS` | all | Load only the first N layers of the ricursive model, the head after them (a reference check on a truncated model) (--opt-layers) | llm ricursive |
 | `NS_RC_DUMP` | unset | A directory the ricursive engine writes every tapped tensor of a pass to (embd, l_out-N, result_norm) as float32, for reference/ricursive-65b/compare.py (--opt-dump) | llm ricursive |
+| `NS_RC_FLASH` | 1 | The ricursive engine's attention on XMX from its silo (0: the shared kernel, a parity A/B) (--opt-flash) | llm ricursive |
 | `NS_RC_MMVQ_GROUPS` | 512 | Experiment: work-groups of the ricursive silo's matrix-vector kernels with a lookup table | kernels:ricursive silo |
 | `NS_RC_MMVQ_ROWS` | 0 (each type's own) | Experiment: rows a sub-group (1, 2 or 4) for every 256-block type of the ricursive silo's matrix-vector kernels | kernels:ricursive silo |
 | `NS_Q35_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (at least 16) (--opt-chunk) | llm qwen35 |

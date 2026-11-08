@@ -99,6 +99,12 @@ pub struct Silo {
     pub dequant_f16_supported: unsafe extern "C" fn(c_int) -> c_int,
     pub dequant_f16: unsafe extern "C" fn(G, c_int, P, i64, *mut u16) -> c_int,
     pub rms_q8: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, M, M, i64, i64, f32) -> c_int,
+    /// (T, Hq, Hkv, D) -> 1 when the XMX attention covers the rows
+    pub flash_prompt_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
+    pub flash_prompt: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32) -> c_int,
+    pub flash_decode_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
+    pub flash_decode_scratch: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
+    pub flash_decode: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, i64, *mut f32, *mut f32) -> c_int,
 }
 
 /// The silo (None: the shared kernels for everything)
@@ -128,6 +134,11 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             dequant_f16_supported: sym!("ns_rc_dequant_f16_supported"),
             dequant_f16: sym!("ns_rc_dequant_f16"),
             rms_q8: sym!("ns_rc_rms_q8"),
+            flash_prompt_supported: sym!("ns_rc_flash_prompt_supported"),
+            flash_prompt: sym!("ns_rc_flash_prompt"),
+            flash_decode_supported: sym!("ns_rc_flash_decode_supported"),
+            flash_decode_scratch: sym!("ns_rc_flash_decode_scratch"),
+            flash_decode: sym!("ns_rc_flash_decode"),
         }))
     })
     .as_ref()
