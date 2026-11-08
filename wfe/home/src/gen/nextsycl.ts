@@ -598,7 +598,7 @@ export interface ImageEditReq {
    * @default false
    */
   held?: boolean | null;
-  /** up to 8, base64, data: URLs or upload:<name> (image.upload) - PNG, JPEG, WebP; each at most 40 MP, the request at most 256 MiB; each is resized to about 1 MP, so 2048 px on the long side is plenty */
+  /** up to 8, base64, data: URLs or upload:<name> (image.upload) - PNG, JPEG, WebP; each at most 40 MP, the request at most 256 MiB; each is resized as its model takes it: Qwen-Image 2.1 about 1 MP (2048 px on the long side is plenty); P-H3-Image keeps picture 1 within 4 to 8 MP (the canvas without a size) and the others within 1 to 8 MP */
   images: string[];
   /**
    * names the job for <kind>.status and <kind>.cancel (default: its id)
@@ -649,7 +649,7 @@ export interface ImageEditReq {
   /** url (default) or b64_json */
   response_format?: string | null;
   seed?: number | null;
-  /** default: the last picture's aspect */
+  /** default: the model's - Qwen-Image 2.1 the last picture's aspect at its area; P-H3-Image picture 1's size within 4 to 8 MP (sides multiples of 32) */
   size?: string | null;
   steps?: number | null;
   /**

@@ -1,6 +1,6 @@
 //! Reading a `.safetensors` checkpoint: an 8-byte length, a JSON header (name -> type, shape, byte range), then the
 //! tensors' bytes back to back. A `.gguf` file opens as a checkpoint too (the denoiser's llama.cpp-quantized forms,
-//! Q4_K / Q6_K): its float tensors as such, its k-quant matrices as their raw blocks with `kquant` set.
+//! Q4_K / Q6_K; Q8_0 / Q5_K): its float tensors as such, its k-quant matrices as their raw blocks with `kquant` set.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -77,9 +77,11 @@ impl Checkpoint {
                     GType::F32 => (DType::F32, None),
                     GType::F16 => (DType::F16, None),
                     GType::BF16 => (DType::BF16, None),
-                    GType::Q4K | GType::Q6K => (DType::U8, Some(e.ty)),
+                    GType::Q8_0 | GType::Q4K | GType::Q5K | GType::Q6K => (DType::U8, Some(e.ty)),
                 };
-                (e.name.clone(), Entry { name: e.name, dtype, shape: e.shape, offset: e.offset, bytes: e.bytes, kquant })
+                // ComfyUI-GGUF files made by stable-diffusion.cpp name the tensors under the ComfyUI model's prefix
+                let name = e.name.strip_prefix("model.diffusion_model.").unwrap_or(&e.name).to_string();
+                (name.clone(), Entry { name, dtype, shape: e.shape, offset: e.offset, bytes: e.bytes, kquant })
             })
             .collect();
         Ok(Checkpoint { path: path.to_path_buf(), entries, metadata: BTreeMap::new(), file_bytes })

@@ -576,6 +576,7 @@ dependencies = [
  "nextsycl-image-mossimage",
  "nextsycl-image-olmocr2",
  "nextsycl-image-paddleocrvl",
+ "nextsycl-image-ph3image",
  "nextsycl-image-qwenimage21",
  "nextsycl-image-rembg",
  "nextsycl-image-seedvr2",
@@ -792,6 +793,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextsycl-h3"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-qwen3vl",
+ "nextsycl-tok",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "nextsycl-image"
 version = "0.0.0"
 dependencies = [
@@ -871,6 +885,18 @@ dependencies = [
  "nextsycl-gguf",
  "nextsycl-image",
  "nextsycl-tok",
+]
+
+[[package]]
+name = "nextsycl-image-ph3image"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-h3",
+ "nextsycl-image",
+ "nextsycl-qwen3vl",
 ]
 
 [[package]]
@@ -1238,14 +1264,9 @@ dependencies = [
 name = "nextsycl-video-h3"
 version = "0.0.0"
 dependencies = [
- "nextsycl-core",
- "nextsycl-diffusion",
- "nextsycl-gguf",
- "nextsycl-qwen3vl",
- "nextsycl-tok",
+ "nextsycl-h3",
  "nextsycl-video",
  "serde_json",
- "unicode-normalization",
 ]
 
 [[package]]

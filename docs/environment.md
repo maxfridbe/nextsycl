@@ -213,7 +213,7 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 
 ## Image
 
-Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`).
+Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`), P-H3-Image (`image/ph3image`).
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
@@ -251,6 +251,13 @@ Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`).
 | `NS_FVSR_WREORDER` | 0 | Debug: 1: FlashVSR's linear layers' weights in oneDNN's own layout (a reordered copy of each beside it: 2.4 GB more for the DiT) rather than read as they are |
 | `NS_FVSR_PIPELINE` | 1 | Debug: 0: FlashVSR's two cards take turns instead of overlapping (the second card's blocks of chunk k beside the first's decoder of k - 1 and blocks of k + 1) |
 | `NS_FVSR_PROFILE` | off | Debug: set: each of FlashVSR's GPU steps timed alone (a wait before and after), summed by kind with the FLOPs and bytes its shapes imply; a table at the end of a clip against the card's XMX peak and 608 GB/s (slower; for finding where the time goes); `shapes`: the decoder's convolutions named by their shapes too | image flashvsr |
+| `NS_PH3_*` | - | every NS_PH3_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
+| `NS_PH3_THREADS` | 8 | P-H3-Image's readers of the denoiser and the VAE at load (--opt-threads) | image ph3image |
+| `NS_PH3_PROFILE` | off | Debug: set: P-H3-Image's decoder waits after each stage and prints the seconds by stage (slower) | image ph3image |
+| `NS_PH3_SAGE_MIN_S` | 1024 | the shortest denoiser sequence P-H3-Image's silo runs SageAttention for (int8 q, k); shorter ones on the shared kernels' attention (oneDNN, bf16). Sage from 1,024 tokens is ~15 % faster a step at 1 and 4 MP; the shared kernels' own threshold (NSD_SAGE_MIN_S) is 8,192 (--opt-sage-min-s) | image ph3image |
+| `NS_PH3_VAE_BATCH` | 16 | P-H3-Image's decoder tiles (256 px, 261 tokens each) decoded together: their products shared (--opt-vae-batch) | image ph3image |
+| `NS_PH3_TE_RESIDENT` | auto | P-H3-Image's text encoder (~5 GiB) kept on the card between requests: auto when the card has room for it beside an 8 MP picture's work after the denoiser and the decoder, 1 always, 0 loaded for each request (--opt-te-resident) | image ph3image |
+| `NS_PH3_CHECK_SEED` | 3 | Debug: the seed `image check` draws P-H3-Image's noise from (the reference's `--seed`) | image ph3image (check) |
 | `NS_QI_*` | - | every NS_QI_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_QI_DUMP` | off | Debug: a directory: what the denoiser is given (embeds, pads, cond latents, noise) written there as raw float32 files | image qwenimage21 |
 | `NS_QI_INT8` | 0 | 1: the DiT's block matrices in int8 ConvRot (~1.4x a step, half the VRAM) (--opt-int8) | image qwenimage21 |

@@ -46,6 +46,21 @@ LoRAs `qwen-image-2.1-turbo-lora`, `qwen-image-2.1-pruna-8step-lora`, `-5step-lo
 same files and schedules: turbo 6 steps 2.9e-3, Pruna 8 steps 2.2e-3, their images at most 2 / 4 of 255 off.
 On the B70 a turbo picture takes 3.2 s: 1024x768 in half, 1024x1024 with `NS_QI_INT8=1` (6 steps, the prompt and the VAE included).
 
+## P-H3-Image
+
+```sh
+nextsycl models pull p-h3-image                 # or -q8 (AtomicChat's Q8_0), -lora (MiniMax H3's FL2VA int8 + Pruna's LoRA)
+nextsycl image gen 'A photograph by an experienced street photographer of ...' --model p-h3-image [--size 2912x2912]
+nextsycl image edit 'Snow covers the street. Keep the figures exactly as they are.' --image PICTURE [--image REFERENCE]... --model p-h3-image
+nextsycl image check <reference dump dir> --model p-h3-image [--stages te,venc,dit,steps,vae,silo]
+```
+
+Pruna AI's image model on MiniMax H3's denoiser (crates/h3, the video engine's): 8 steps on the checkpoint's own sigmas, no
+guidance, sides multiples of 32, best at 8 MP (2912x2912 by default; the page's 1 / 4 / 8 MP presets give Pruna's sizes). An
+edit takes up to 8 pictures (picture 1 edited, the others references named Picture 2 ...); without a size it is made at
+picture 1's size within 4 to 8 MP. Prompts are rendered as written (Pruna's Qwen3.5-9B prompt upsampler is not run: write
+full prompts, model-cards/guides/p-h3-image.md). Parity, speed and what is open: [ports/p-h3-image.md](ports/p-h3-image.md).
+
 ## MOSS-Image-SFT
 
 ```sh

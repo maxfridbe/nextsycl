@@ -49,6 +49,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `qwen-image-2.1-q8` | **Qwen-Image 2.1** text to image, edits | 1024x1024, 40 steps: 23.8 s (16.5 s int8) |
 | `hunyuanimage-2.1-distilled-q8` | **HunyuanImage 2.1** text to image at 2K (quoted text spelled by its glyph encoder) | 2048x2048, 8 steps: 7.8 s; 1024x1024: 2.5 s |
 | `moss-image-sft-q4kxl` (also `-q8`, `-q6kxl`, `-q5kxl`, `-q4km`, `-bf16`) | **MOSS-Image-SFT** text to image (sentences, tags or a JSON layout; quoted text spelled) | 1024x1024, 50 steps with CFG: 46.7 s; 512x512, 12 steps: 3.4 s |
+| `p-h3-image` (also `-q8`, `-lora`) | **P-H3-Image** text to image at 8 MP and edits with up to 8 pictures (MiniMax H3's denoiser, 8 steps) | B65: 2912x2912 34 s, 2048x2048 15.6 s, 1024x1024 4.6 s |
 | `unlimited-ocr-q8`, `-q4` | **Unlimited-OCR** pictures and PDFs to Markdown (tables as HTML, boxes), its own page | a page: ~2-3 s to see, ~130 tok/s written |
 | `paddleocr-vl-1.6` | **PaddleOCR-VL** text, tables (HTML), formulas (LaTeX), charts, seals, spotting; the same OCR page | a page: ~1.2 s to see, ~200-250 tok/s written |
 | `olmocr-2-7b-q8` | **olmOCR-2** whole pages to Markdown (tables HTML, equations LaTeX), turned pages righted; the same OCR page | a page: ~3 s to see, ~55 tok/s written |

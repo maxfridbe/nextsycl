@@ -58,6 +58,8 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `isnet-general-use` | IS-Net general-use as rembg runs it (Apache-2.0 weights, rembg's ONNX file): `image.remove_background` | `rembg` | 0.2 GiB file, ~2 GiB working | checked (rembg 2.0.67) |
 | `qwen-image-2.1-turbo-q8` | Qwen-Image 2.1 Turbo (Viggle v0.3 merged): 6 steps | `qwenimage21` | 16.5 GiB | checked |
 | `qwen-image-2.1-q6k`, `-uncensored-q8` | Qwen-Image 2.1 Q6_K; the uncensored model in Q8_0 | `qwenimage21` | 14.8 / 16.4 GiB | listed |
+| `p-h3-image` | P-H3-Image (Pruna AI, MiniMax H3 Community License): MiniMax H3's 50-block denoiser on one latent frame (Pruna's int8 ConvRot file), Qwen3-VL-4B + text connector, the transformer VAE decoder in int8; text to image at 8 MP and edits with up to 8 pictures, 8 steps, no guidance; prompts rendered as written | `p-h3-image` | 26.5 GiB | checked, served (image server) |
+| `p-h3-image-q8`, `-lora` | the denoiser as AtomicChat's Q8_0 GGUF (the closest to bf16, 1.6x slower), or MiniMax H3's FL2VA int8 file with Pruna's LoRA on the side path (no second large download, 11 % slower) | `p-h3-image` | 25.5 / 25.5 GiB | checked |
 | `moss-image-sft-q3kxl` (not offered) | UD-Q3_K_XL: its Q3_K matrices are not read yet | `moss-image` | 2.6 GiB | needs Q3_K in the dequant |
 | `qwen-image-2.1-q4km`, `-uncensored-q4km` | Q4_K_M | `qwenimage21` | 13.6 GiB | listed (needs Q5_K in the dequant) |
 

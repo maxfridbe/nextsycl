@@ -2,7 +2,8 @@
 //! It reads ComfyUI's int8 ConvRot file (`qwen3vl_8b_int8_convrot.safetensors`: every matrix int8 with a scale per
 //! output row, its input features rotated by a normalized regular Hadamard matrix in groups of 256) and its tokenizer
 //! (`tokenizer.json`), and returns the last layer's hidden state for every token - before the final norm, as the
-//! image pipelines take it.
+//! image pipelines take it - or the hidden states after chosen layers (`encode_taps`: P-H3-Image's text encoder, the
+//! 4B in a file of its own under `model.language_model.`, read after layers 13, 19, 25, 31 and the final norm).
 //!
 //! One layer, as the reference computes it (activations float32; each linear quantizes its rotated input per row):
 //!
@@ -53,6 +54,10 @@ pub struct TextEncoder {
     /// the vision tower, when the file has it (`model.visual.*`): pictures in the prompt
     pub vision: Option<vision::Vision>,
     file: SafeTensors,
+    /// where the language model's tensors are: `model.` (the 8B's file) or `model.language_model.` (the 4B's)
+    prefix: &'static str,
+    /// the final norm, float32 [hidden] (`encode_taps` reads after it)
+    norm: Option<DevBuf>,
     pub tok: Tokenizer,
     gpu: Arc<Gpu>,
     layers: Vec<Layer>,
@@ -97,20 +102,27 @@ fn upload_f32(gpu: &Arc<Gpu>, v: &[f32]) -> Result<DevBuf> {
 impl TextEncoder {
     /// The encoder from its int8 ConvRot file and tokenizer, its layers on `gpu`
     pub fn load(file: &Path, tokenizer: &Path, gpu: &Arc<Gpu>, log: &mut dyn FnMut(String)) -> Result<TextEncoder> {
+        Self::load_with(file, tokenizer, gpu, true, log)
+    }
+
+    /// The same; `vision`: the vision tower too, when the file has it (else `load_vision` brings it when a picture
+    /// needs it: P-H3-Image's text-to-image keeps its 1.6 GiB off the card)
+    pub fn load_with(file: &Path, tokenizer: &Path, gpu: &Arc<Gpu>, vision: bool, log: &mut dyn FnMut(String)) -> Result<TextEncoder> {
         let t0 = std::time::Instant::now();
         let st = SafeTensors::open(file).map_err(ge)?;
         let tok = Tokenizer::from_hf_json(tokenizer).map_err(Error)?;
-        let emb = st.need("model.embed_tokens.weight").map_err(ge)?;
+        let prefix = if st.tensor("model.language_model.embed_tokens.weight").is_some() { "model.language_model." } else { "model." };
+        let emb = st.need(&format!("{prefix}embed_tokens.weight")).map_err(ge)?;
         let hidden = *emb.shape.get(1).ok_or_else(|| Error("the token embedding is not 2-D".into()))? as usize;
-        let n_layer = (0..).take_while(|l| st.tensor(&format!("model.layers.{l}.input_layernorm.weight")).is_some()).count();
-        let q = st.need("model.layers.0.self_attn.q_proj.weight").map_err(ge)?;
-        let k = st.need("model.layers.0.self_attn.k_proj.weight").map_err(ge)?;
-        let g = st.need("model.layers.0.mlp.gate_proj.weight").map_err(ge)?;
+        let n_layer = (0..).take_while(|l| st.tensor(&format!("{prefix}layers.{l}.input_layernorm.weight")).is_some()).count();
+        let q = st.need(&format!("{prefix}layers.0.self_attn.q_proj.weight")).map_err(ge)?;
+        let k = st.need(&format!("{prefix}layers.0.self_attn.k_proj.weight")).map_err(ge)?;
+        let g = st.need(&format!("{prefix}layers.0.mlp.gate_proj.weight")).map_err(ge)?;
         let heads = q.shape[0] as usize / HEAD;
         let kv_heads = k.shape[0] as usize / HEAD;
         let ffn = g.shape[0] as usize;
-        for name in ["model.layers.0.self_attn.q_proj.comfy_quant", "model.embed_tokens.comfy_quant"] {
-            let raw = st.read(st.need(name).map_err(ge)?).map_err(ge)?;
+        for name in [format!("{prefix}layers.0.self_attn.q_proj.comfy_quant"), format!("{prefix}embed_tokens.comfy_quant")] {
+            let raw = st.read(st.need(&name).map_err(ge)?).map_err(ge)?;
             let meta: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| Error(format!("{name}: {e}")))?;
             if meta["format"] != "int8_tensorwise" || meta["convrot"] != true || meta["convrot_groupsize"] != GROUP {
                 return Err(Error(format!("{}: {name} is {meta}, not int8 ConvRot in groups of {GROUP}", file.display())));
@@ -134,7 +146,7 @@ impl TextEncoder {
         };
         let mut layers = Vec::with_capacity(n_layer);
         for l in 0..n_layer {
-            let p = format!("model.layers.{l}.");
+            let p = format!("{prefix}layers.{l}.");
             let (qkv, qkv_s) = int8(&[&format!("{p}self_attn.q_proj"), &format!("{p}self_attn.k_proj"), &format!("{p}self_attn.v_proj")])?;
             let (o, o_s) = int8(&[&format!("{p}self_attn.o_proj")])?;
             let (gu, gu_s) = int8(&[&format!("{p}mlp.gate_proj"), &format!("{p}mlp.up_proj")])?;
@@ -149,14 +161,26 @@ impl TextEncoder {
         }
         log(format!("qwen3vl: {n_layer} layers ({hidden} wide, {heads} / {kv_heads} heads, {ffn} ffn) on {} in {:.1} s", gpu.name,
                     t0.elapsed().as_secs_f64()));
-        let vision = if st.tensor("model.visual.patch_embed.proj.weight").is_some() { Some(vision::Vision::load(&st, gpu, log)?) } else { None };
-        Ok(TextEncoder { vision, file: st, tok, gpu: gpu.clone(), layers, hidden, heads, kv_heads, ffn, theta: 5_000_000.0, hadamard: hadamard(GROUP) })
+        let vision = if vision && st.tensor("model.visual.patch_embed.proj.weight").is_some() { Some(vision::Vision::load(&st, gpu, log)?) } else { None };
+        let norm = match st.tensor(&format!("{prefix}norm.weight")) {
+            Some(_) => Some(upload_f32(gpu, &st.f32(&format!("{prefix}norm.weight")).map_err(ge)?)?),
+            None => None,
+        };
+        Ok(TextEncoder { vision, file: st, prefix, norm, tok, gpu: gpu.clone(), layers, hidden, heads, kv_heads, ffn, theta: 5_000_000.0, hadamard: hadamard(GROUP) })
+    }
+
+    /// The vision tower from the file, if it is not loaded yet (and the file has one)
+    pub fn load_vision(&mut self, log: &mut dyn FnMut(String)) -> Result<()> {
+        if self.vision.is_none() && self.file.tensor("model.visual.patch_embed.proj.weight").is_some() {
+            self.vision = Some(vision::Vision::load(&self.file, &self.gpu, log)?);
+        }
+        Ok(())
     }
 
     /// The tokens' embedding rows, dequantized and un-rotated, float32 [S, hidden] on the host
     fn embed(&self, ids: &[u32]) -> Result<Vec<f32>> {
-        let t = self.file.need("model.embed_tokens.weight").map_err(ge)?;
-        let s = self.file.need("model.embed_tokens.weight_scale").map_err(ge)?;
+        let t = self.file.need(&format!("{}embed_tokens.weight", self.prefix)).map_err(ge)?;
+        let s = self.file.need(&format!("{}embed_tokens.weight_scale", self.prefix)).map_err(ge)?;
         let d = self.hidden;
         let mut out = vec![0f32; ids.len() * d];
         let mut row = vec![0u8; d];
@@ -225,6 +249,20 @@ impl TextEncoder {
     /// their `<|image_pad|>` runs) at their tokens, Qwen3-VL's interleaved M-RoPE (24 / 20 / 20 pairs: t, then h and w
     /// on every third pair from the second), the deepstack features added after the first layers
     pub fn encode_seen(&self, nsd: &Nsd, ids: &[u32], seen: &[&vision::Seen], n: usize) -> Result<DevBuf> {
+        let mut taps = self.encode_taps(nsd, ids, seen, &[n.min(self.layers.len())], false)?;
+        taps.pop().ok_or_else(|| Error("no hidden state".into()))
+    }
+
+    /// The hidden states at `taps`, in transformers' numbering of `output_hidden_states` (0: the embeddings, K: after
+    /// layer K; with `final_norm`, the number of layers is the last layer's output after the final norm, as transformers
+    /// gives its last entry), float32 [S, hidden] each on the GPU, in the order asked. A layer's own output: the
+    /// deepstack features of the first layers are added after it is taken.
+    pub fn encode_taps(&self, nsd: &Nsd, ids: &[u32], seen: &[&vision::Seen], taps: &[usize], final_norm: bool) -> Result<Vec<DevBuf>> {
+        let n = taps.iter().copied().max().unwrap_or(0);
+        if n > self.layers.len() {
+            return Err(Error(format!("hidden state {n} of a {}-layer model", self.layers.len())));
+        }
+        let mut kept: Vec<(usize, DevBuf)> = Vec::new();
         let s = ids.len();
         let (d, h, kv, f) = (self.hidden, self.heads, self.kv_heads, self.ffn);
         let qkv_w = (h + 2 * kv) * HEAD;
@@ -275,6 +313,15 @@ impl TextEncoder {
         }
         let cs = upload_f32(gpu, &cs)?;
         let f32p = |b: &DevBuf, at: usize| -> *mut std::ffi::c_void { b.fp().wrapping_add(at).cast() };
+        let keep = |at: usize, x: &DevBuf, kept: &mut Vec<(usize, DevBuf)>| -> Result<()> {
+            if taps.contains(&at) {
+                let c = DevBuf::f32(gpu, s * d)?;
+                c.copy_within(0, x, 0, s * d * 4)?;
+                kept.push((at, c));
+            }
+            Ok(())
+        };
+        keep(0, &x, &mut kept)?;
         for (li, l) in self.layers.iter().take(n).enumerate() {
             nsd.rms_norm_mod(x.ptr(), Dt::F32, s, d, l.in_norm.ptr(), EPS, none(), none(), none(), hb.ptr(), Dt::F32)?;
             nsd.int8_linear(hb.ptr(), Dt::F32, s, d, l.qkv.ptr(), qkv_w, l.qkv_s.ptr(), qkv_w, none(), qkv.ptr(), Dt::F32, GROUP)?;
@@ -288,6 +335,9 @@ impl TextEncoder {
             nsd.swiglu(gu.ptr(), Dt::F32, s, f, act.ptr(), Dt::F32)?;
             nsd.int8_linear(act.ptr(), Dt::F32, s, f, l.down.ptr(), d, l.down_s.ptr(), d, none(), o.ptr(), Dt::F32, GROUP)?;
             nsd.gate_add(x.ptr(), Dt::F32, s, d, o.ptr(), Dt::F32, none(), none())?;
+            if li + 1 < self.layers.len() || !final_norm {
+                keep(li + 1, &x, &mut kept)?;
+            }
             // deepstack: the pictures' features of this depth added at their tokens
             for ((st, len), v) in runs.iter().zip(seen) {
                 if let Some(ds) = v.deep.get(li) {
@@ -295,8 +345,23 @@ impl TextEncoder {
                 }
             }
         }
+        if final_norm && taps.contains(&self.layers.len()) {
+            let w = self.norm.as_ref().ok_or_else(|| Error("the file has no final norm".into()))?;
+            nsd.rms_norm_mod(x.ptr(), Dt::F32, s, d, w.ptr(), EPS, none(), none(), none(), x.ptr(), Dt::F32)?;
+            kept.push((self.layers.len(), x));
+        }
         nsd.wait()?;
-        Ok(x)
+        let mut out = Vec::with_capacity(taps.len());
+        for t in taps {
+            let i = kept.iter().position(|(a, _)| a == t).ok_or_else(|| Error(format!("hidden state {t} was not kept (each once)")))?;
+            out.push(kept.swap_remove(i).1);
+        }
+        Ok(out)
+    }
+
+    /// The number of layers
+    pub fn layers(&self) -> usize {
+        self.layers.len()
     }
 
     /// `text` tokenized as it is (the caller builds the chat template)

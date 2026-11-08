@@ -718,7 +718,7 @@ pub struct ImageEditReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(default = false)]
     pub held: Option<bool>,
-    /// up to 8, base64, data: URLs or upload:<name> (image.upload) - PNG, JPEG, WebP; each at most 40 MP, the request at most 256 MiB; each is resized to about 1 MP, so 2048 px on the long side is plenty
+    /// up to 8, base64, data: URLs or upload:<name> (image.upload) - PNG, JPEG, WebP; each at most 40 MP, the request at most 256 MiB; each is resized as its model takes it: Qwen-Image 2.1 about 1 MP (2048 px on the long side is plenty); P-H3-Image keeps picture 1 within 4 to 8 MP (the canvas without a size) and the others within 1 to 8 MP
     pub images: Vec<String>,
     /// names the job for <kind>.status and <kind>.cancel (default: its id)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -762,7 +762,7 @@ pub struct ImageEditReq {
     pub response_format: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
     pub seed: Option<i64>,
-    /// default: the last picture's aspect
+    /// default: the model's - Qwen-Image 2.1 the last picture's aspect at its area; P-H3-Image picture 1's size within 4 to 8 MP (sides multiples of 32)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
