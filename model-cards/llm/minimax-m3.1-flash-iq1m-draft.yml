@@ -1,4 +1,4 @@
-# MiniMax-M3.1-Flash UD-IQ1_M with its DSpark drafter (both GPUs): not registered anywhere; tested through a real server, docs/ports/minimax-m31.md round 7
+# MiniMax-M3.1-Flash UD-IQ1_M with its DSpark drafter (both GPUs): registered on hardac1 2026-11-08; tested through a real server, docs/ports/minimax-m31.md round 7
 # model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
 id: minimax-m3.1-flash-iq1m-draft
 kind: llm
