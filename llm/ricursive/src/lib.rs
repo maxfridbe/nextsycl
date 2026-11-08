@@ -29,6 +29,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "host-spare-gib", env: "NS_RC_HOST_SPARE_GIB", value: "GIB", help: "host memory kept free whatever is pinned for streamed layers (default 8)", at: At::Load },
     EngineOption { name: "layers", env: "NS_RC_LAYERS", value: "N", help: "load only the first N layers, the head after them (a reference check on a truncated model)", at: At::Load },
     EngineOption { name: "flash", env: "NS_RC_FLASH", value: "0|1", help: "the silo's attention on XMX (default 1; 0 runs the shared kernel: a parity A/B)", at: At::Load },
+    EngineOption { name: "profile", env: "NS_RC_PROFILE", value: "0|1", help: "1: sync the GPU after each operation and print the time by operation every 32 one-row passes (slows the run)", at: At::Load },
     EngineOption { name: "dump", env: "NS_RC_DUMP", value: "DIR", help: "write every tapped tensor of a pass (embd, l_out-N, result_norm) there as float32 (a check against reference/ricursive-65b)", at: At::Load },
 ];
 

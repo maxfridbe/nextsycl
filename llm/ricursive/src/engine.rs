@@ -88,7 +88,7 @@ impl Geometry {
         if g.head != 128 || g.heads_kv == 0 || !g.heads.is_multiple_of(g.heads_kv) || !matches!(g.heads / g.heads_kv, 1 | 2 | 4 | 6 | 8 | 10) {
             return Err(format!("attention heads of {} ({} / {}): head 128 with 1, 2, 4, 6, 8 or 10 query heads a key head", g.head, g.heads, g.heads_kv));
         }
-        if g.n_embd % 256 != 0 || g.n_ff % 256 != 0 || g.window == 0 && g.swa.iter().any(|s| *s) {
+        if !g.n_embd.is_multiple_of(256) || !g.n_ff.is_multiple_of(256) || g.window == 0 && g.swa.iter().any(|s| *s) {
             return Err(format!("widths {} / {} and a window of {}: multiples of 256, and a window for the sliding layers", g.n_embd, g.n_ff, g.window));
         }
         Ok(g)
@@ -440,8 +440,8 @@ impl<'g> Ricursive<'g> {
                 // how many of its layers fit VRAM: the layers in order while the weights and caches do
                 let mut have = fixed(i, true);
                 let mut res = 0;
-                for l in lb..le {
-                    let need = layer_w[l] as i64 + cache_of(l) as i64;
+                for (l, w) in layer_w.iter().enumerate().take(le).skip(lb) {
+                    let need = *w as i64 + cache_of(l) as i64;
                     if need > have {
                         break;
                     }
@@ -503,8 +503,7 @@ impl<'g> Ricursive<'g> {
         let mut loaded = 0u64;
         let mut hosts: Vec<HostBuf> = Vec::new();
         let mut layers = Vec::with_capacity(nl);
-        for l in 0..nl {
-            let di = layer_dev[l];
+        for (l, &di) in layer_dev.iter().enumerate() {
             let gpu = &gpus[di];
             let (lb, _, res) = bounds3[di];
             let host = l >= lb + res;
@@ -902,9 +901,9 @@ impl<'g> Ricursive<'g> {
             }
         }
         let mut layers = Vec::with_capacity(n);
-        for l in 0..n {
+        for (l, &r) in ring.iter().enumerate() {
             let gpu = &self.devs[self.layer_dev[l]].gpu;
-            let b = g.heads_kv * ring[l] * g.head * 2;
+            let b = g.heads_kv * r * g.head * 2;
             layers.push((DevBuf::new(gpu, b)?, DevBuf::new(gpu, b)?));
         }
         Ok(Session { pos: 0, max_ctx, layers, ring, last_rows: 0 })
@@ -1006,7 +1005,7 @@ impl<'g> Ricursive<'g> {
             for (j, c) in [&s.layers[l].0, &s.layers[l].1].into_iter().enumerate() {
                 let b = &ck.bufs[2 * l + j];
                 let per = g.heads_kv * ROW;
-                if per == 0 || b.len() % per != 0 || b.len() / per > ck.pos {
+                if per == 0 || !b.len().is_multiple_of(per) || b.len() / per > ck.pos {
                     return Err(e("a checkpoint of another shape"));
                 }
                 let n = b.len() / per;
