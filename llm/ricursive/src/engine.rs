@@ -357,6 +357,8 @@ impl<'g> Ricursive<'g> {
         if gpus.is_empty() {
             return Err(e("no GPU"));
         }
+        // what each card already holds (other programs'), to tell this engine's share
+        let others: Vec<u64> = gpus.iter().map(|d| d.memory().map_or(0, |(t, fr)| t - fr.unwrap_or(t).min(t))).collect();
         let g = Geometry::read(f).map_err(e)?;
         check_tensors(f, &g).map_err(e)?;
         let nl = std::env::var("NS_RC_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n >= 1 && *n <= g.layers).unwrap_or(g.layers);
@@ -492,6 +494,7 @@ impl<'g> Ricursive<'g> {
             log(format!("ricursive: all of it fits {}: {} of the {given} GPUs not used", gpus_used.iter().map(|g| g.name.clone()).collect::<Vec<_>>().join(" + "),
                         given - gpus_used.len()));
         }
+        let gpus_all: Vec<Arc<Gpu>> = gpus.to_vec();
         let gpus = gpus_used;
         let mut layer_dev = vec![0usize; nl];
         for (i, &(lb, le, _)) in bounds3.iter().enumerate() {
@@ -537,8 +540,12 @@ impl<'g> Ricursive<'g> {
         }).collect::<Vec<_>>().join(", ");
         log(format!("ricursive: {nl} layers of {} ({} sliding, {} global), {:.1} GiB on {wh} in {load_s:.0} s; prompt chunks of {chunk}", g.n_embd,
                     (0..nl).filter(|l| g.swa[*l]).count(), (0..nl).filter(|l| !g.swa[*l]).count(), loaded as f64 / GIB));
-        let used = devs.iter().map(|d| match d.gpu.memory() {
-            Ok((t, Some(fr))) => format!("{:.1} of {:.1} GiB", (t - fr.min(t)) as f64 / GIB, t as f64 / GIB),
+        let used = devs.iter().enumerate().map(|(i, d)| match d.gpu.memory() {
+            Ok((t, Some(fr))) => {
+                let now = t - fr.min(t);
+                let gi = gpus_all.iter().position(|x| x.index == d.gpu.index).unwrap_or(i);
+                format!("{} {:.2} GiB (+ {:.2} GiB of other programs) of {:.1}", d.gpu.name, now.saturating_sub(others[gi]) as f64 / GIB, others[gi] as f64 / GIB, t as f64 / GIB)
+            }
             _ => "?".into(),
         }).collect::<Vec<_>>().join(", ");
         log(format!("ricursive: card memory in use before any session (weights, work memory, half buffer): {used}"));

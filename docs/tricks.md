@@ -18,7 +18,7 @@ That is why the same trick shows up copied from silo to silo, and why carrying a
 it into that model's silo.
 
 The silos today (`ls -d kernels/*/*/silo`): llm `deepseek41`, `deepseek4`, `museglimmer`, `nemotronh`, `qwen35`,
-`qwen4exp`; audio `qwen3tts`, `voxcpm2`; image `hunyuanimage21`; model3d `animateanymesh`, `hunyuan3d`, `trellis2`,
+`qwen4exp`, `ricursive`; audio `qwen3tts`, `voxcpm2`; image `hunyuanimage21`; model3d `animateanymesh`, `hunyuan3d`, `trellis2`,
 `unirig`. Two language engines have no silo but carry many of the tricks in their own kernels: `glm5next`
 (`kernels/llm/glm5next`) and `deepseek2` (`kernels/llm/deepseek2`); they get columns too. Engine-level tricks (expert
 tiers, drafts, pipelines) live in `llm/<arch>/src` and count for the engine's column.
@@ -36,7 +36,7 @@ The last column says where the trick is described; the numbers are in the sectio
 ## The language models
 
 `g5` glm5next (no silo), `q4x` qwen4exp, `q35` qwen35, `ds2` deepseek2 (no silo), `ds4` deepseek4, `ds41` deepseek41,
-`mg` museglimmer, `nh` nemotronh.
+`mg` museglimmer, `nh` nemotronh, `rc` ricursive.
 
 ### Kernels
 
