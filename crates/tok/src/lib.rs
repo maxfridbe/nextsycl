@@ -665,17 +665,22 @@ pub fn json_tool_calls(answer: &str) -> (String, Vec<ToolCall>) {
     let mut calls = Vec::new();
     let mut rest = &answer[start..];
     while let Some(i) = rest.find("<tool_call>") {
-        let body_start = i + "<tool_call>".len();
-        let end = rest[body_start..].find("</tool_call>").map_or(rest.len(), |e| body_start + e);
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest[body_start..end].trim()) {
-            if let Some(name) = v["name"].as_str().filter(|n| !n.is_empty()) {
-                let args = v["arguments"].as_object().map(|o| {
-                    o.iter().map(|(k, a)| (k.clone(), a.as_str().map_or_else(|| a.to_string(), str::to_string))).collect()
-                }).unwrap_or_default();
-                calls.push(ToolCall { name: name.to_string(), args });
+        // the JSON value is read as a value, not cut at the first closing tag: a string argument may hold the tag's text
+        let body = rest[i + "<tool_call>".len()..].trim_start();
+        let mut stream = serde_json::Deserializer::from_str(body).into_iter::<serde_json::Value>();
+        let used = match stream.next() {
+            Some(Ok(v)) => {
+                if let Some(name) = v["name"].as_str().filter(|n| !n.is_empty()) {
+                    let args = v["arguments"].as_object().map(|o| {
+                        o.iter().map(|(k, a)| (k.clone(), a.as_str().map_or_else(|| a.to_string(), str::to_string))).collect()
+                    }).unwrap_or_default();
+                    calls.push(ToolCall { name: name.to_string(), args });
+                }
+                stream.byte_offset()
             }
-        }
-        rest = &rest[(end + "</tool_call>".len()).min(rest.len())..];
+            _ => 0,
+        };
+        rest = &body[used..];
     }
     (answer[..start].trim_end().to_string(), calls)
 }
@@ -1369,6 +1374,63 @@ mod tests {
         assert_eq!(glm_chat(&m, Effort::Max, &[tool]), want);
         // without tools, as before
         assert_eq!(glm_chat(&m[..2], Effort::Low, &[]), "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>Be brief.<|user|>Weather in Paris?<|assistant|><think>");
+    }
+
+    #[test]
+    fn ripples_json_tool_calls_edges() {
+        let call = |n: &str, a: &[(&str, &str)]| ToolCall { name: n.into(), args: a.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+        // no call: the answer as it is
+        assert_eq!(json_tool_calls("plain {\"name\": \"x\"}"), ("plain {\"name\": \"x\"}".to_string(), vec![]));
+        // a call cut off before its closing tag (max_tokens) still parses when its JSON is whole
+        assert_eq!(tool_calls("<tool_call>\n{\"name\": \"now\", \"arguments\": {}}").1, vec![call("now", &[])]);
+        // cut off inside the JSON: no call, the text before it kept
+        assert_eq!(tool_calls("Hi.\n<tool_call>\n{\"name\": \"now\", \"argum"), ("Hi.".to_string(), vec![]));
+        // a malformed call is skipped and the next one still parses
+        let a = "<tool_call>\n{\"name\": oops}\n</tool_call>\n<tool_call>\n{\"name\": \"ok\", \"arguments\": {\"a\": \"1\"}}\n</tool_call>";
+        assert_eq!(tool_calls(a).1, vec![call("ok", &[("a", "1")])]);
+        // a call without a usable name is skipped: missing, empty, not a string
+        assert_eq!(tool_calls("<tool_call>{\"arguments\": {}}</tool_call>").1, vec![]);
+        assert_eq!(tool_calls("<tool_call>{\"name\": \"\", \"arguments\": {}}</tool_call>").1, vec![]);
+        assert_eq!(tool_calls("<tool_call>{\"name\": 7, \"arguments\": {}}</tool_call>").1, vec![]);
+        // arguments missing, null or not an object: the call with no arguments
+        assert_eq!(tool_calls("<tool_call>{\"name\": \"f\"}</tool_call>").1, vec![call("f", &[])]);
+        assert_eq!(tool_calls("<tool_call>{\"name\": \"f\", \"arguments\": null}</tool_call>").1, vec![call("f", &[])]);
+        assert_eq!(tool_calls("<tool_call>{\"name\": \"f\", \"arguments\": \"x\"}</tool_call>").1, vec![call("f", &[])]);
+        // argument types: a string as its text, everything else as JSON
+        let a = "<tool_call>{\"name\": \"f\", \"arguments\": {\"b\": true, \"n\": null, \"o\": {\"k\": [1, 2]}, \"x\": 1.5}}</tool_call>";
+        assert_eq!(tool_calls(a).1, vec![call("f", &[("b", "true"), ("n", "null"), ("o", "{\"k\":[1,2]}"), ("x", "1.5")])]);
+        // string arguments: quotes, line breaks, braces and unicode survive
+        let a = "<tool_call>{\"name\": \"f\", \"arguments\": {\"s\": \"say \\\"hi\\\"\\nfn() { x }\\u00e9\"}}</tool_call>";
+        assert_eq!(tool_calls(a).1, vec![call("f", &[("s", "say \"hi\"\nfn() { x }\u{e9}")])]);
+        // a string argument holding the closing tag's text does not end the call early
+        let a = "<tool_call>{\"name\": \"write\", \"arguments\": {\"text\": \"a </tool_call> b <tool_call> c\"}}</tool_call>";
+        assert_eq!(tool_calls(a).1, vec![call("write", &[("text", "a </tool_call> b <tool_call> c")])]);
+        // no space or line break around the JSON, and several calls on one line
+        let a = "<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>";
+        assert_eq!(tool_calls(a), (String::new(), vec![call("a", &[]), call("b", &[])]));
+        // text between and after the calls is dropped, as for the other forms: only what comes before the first stays
+        let a = "Before.\n<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call>\nbetween\n<tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>\nafter";
+        assert_eq!(tool_calls(a), ("Before.".to_string(), vec![call("a", &[]), call("b", &[])]));
+    }
+
+    #[test]
+    fn tool_calls_picks_the_form_the_first_call_is_in() {
+        // Qwen's form whose argument is JSON stays Qwen's
+        let q = "<tool_call>\n<function=f>\n<parameter=a>\n{\"x\": 1}\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(tool_calls(q).1, vec![ToolCall { name: "f".into(), args: vec![("a".into(), "{\"x\": 1}".into())] }]);
+        // GLM's form whose argument is JSON stays GLM's
+        let g = "<tool_call>f<arg_key>a</arg_key><arg_value>{\"x\": 1}</arg_value></tool_call>";
+        assert_eq!(tool_calls(g).1, vec![ToolCall { name: "f".into(), args: vec![("a".into(), "{\"x\": 1}".into())] }]);
+        // GLM's form with a line break before the name
+        assert_eq!(tool_calls("<tool_call>\nnow\n</tool_call>").1, vec![ToolCall { name: "now".into(), args: vec![] }]);
+        // Ripple's form, with and without a line break before the JSON
+        let r = ToolCall { name: "f".into(), args: vec![("a".into(), "1".into())] };
+        assert_eq!(tool_calls("<tool_call>\n{\"name\": \"f\", \"arguments\": {\"a\": 1}}\n</tool_call>").1, vec![r.clone()]);
+        assert_eq!(tool_calls("<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": 1}}</tool_call>").1, vec![r]);
+        // braces in an answer with no call tag change nothing
+        assert_eq!(tool_calls("{\"name\": \"f\"}"), ("{\"name\": \"f\"}".to_string(), vec![]));
+        // the Qwen and GLM tests above go through tool_calls too: all three forms in one place
+        assert_eq!(tool_calls("x<tool_call>\n<function=n>\n</function>\n</tool_call>").1.len(), 1);
     }
 
     #[test]
