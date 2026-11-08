@@ -52,6 +52,7 @@
  .hr .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 3px -1px 1px;border:1px solid var(--c)}
  .card.over{border-color:#b45309}
  .procs li.dim{opacity:.75} .procs li.alt{opacity:.55}
+ .phead .eye{margin-left:auto} .phead .eye.on{background:#2a2f3a}
  .abar{position:relative;flex:0 0 96px;height:8px;background:#1b1f27;border-radius:3px;overflow:hidden;display:flex;border:1px solid #2a2f3a}
  .abar i,.abar b{display:block;height:100%;flex:0 0 auto} .abar b{position:absolute;left:0;top:2px;height:2px}
  .abar.alt{border-style:dashed}

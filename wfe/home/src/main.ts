@@ -16,6 +16,13 @@ export function toggleKind(kind: string): void {
   render();
 }
 
+/** Hide the reservations (the enabled models not loaded) from each card's list, or show them again. */
+export function toggleRsvp(): void {
+  ui.hideRsvp = !ui.hideRsvp;
+  try { localStorage.setItem("ns-hide-rsvp", ui.hideRsvp ? "1" : "0"); } catch { /* a private window: it is only not kept */ }
+  render();
+}
+
 export const ui = {
   state: null as State | null,
   spec: null as Spec | null,
@@ -31,6 +38,8 @@ export const ui = {
   saved: null as ConfigSaved | null,
   /** restarts under way, by service */
   restarting: {} as Record<string, boolean>,
+  /** the cards' lists show only what is loaded (the reservations hidden): kept across reloads */
+  hideRsvp: (() => { try { return localStorage.getItem("ns-hide-rsvp") === "1"; } catch { return false; } })(),
   /** the model sections (by kind) folded shut: kept across reloads */
   collapsed: (() => { try { return JSON.parse(localStorage.getItem("ns-collapsed") ?? "{}") as Record<string, boolean>; } catch { return {} as Record<string, boolean>; } })(),
   /** per model: the GPUs picked before enabling */
