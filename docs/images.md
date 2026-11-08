@@ -108,8 +108,10 @@ Tongyi-MAI's 6B text to image model (Apache-2.0), distilled to 8 steps without g
 official weights to the bit (unsloth's BF16 GGUF of the DiT, ComfyUI's single-file Qwen3-4B), all on one card.
 No negative prompt and no guidance (cfg 1, or the pipeline's 0; another is refused); sizes are multiples of 16 from
 256 to 2048 a side, the page offering the model's own demo sizes (1024, 1280 and 1536 squared budgets, 1:1 to 21:9);
-steps 1 to 50 (8: the model's), the shift a request's (3: the model's). Port notes, parity and speed:
-[ports/z-image-turbo.md](ports/z-image-turbo.md).
+steps 1 to 50 (8: the model's), the shift a request's (3: the model's). A 1024 x 1024 picture, the whole request: B70
+4.5 s, B65 6.8 s (2048 x 2048: 24.7 s / 38.1 s), 19.4 GiB on the card. `z-image-turbo-int8` (Comfy-Org's int8
+ConvRot DiT, the card's int8 products) takes 3.3 s / 4.8 s and 13.8 GiB, the same compositions with small details
+drawn differently. Port notes, parity and speed: [ports/z-image-turbo.md](ports/z-image-turbo.md).
 
 ## HunyuanImage 2.1
 

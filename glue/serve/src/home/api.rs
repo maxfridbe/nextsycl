@@ -1294,7 +1294,7 @@ impl Home {
         let rule = match model["arch"].as_str() {
             Some("moss-image") => "any width and height that are multiples of 16, 64 to 4096; 1024 x 1024 is the default and 2048 x 2048 works (no tiling), several times the time".to_string(),
             Some("hunyuanimage-2.1") => "any width and height that are multiples of 32; 2048 x 2048 is native".to_string(),
-            Some("z-image") => "any width and height that are multiples of 16, 256 to 2048; 1024 x 1024 is the default, the model's own sizes are 1024, 1280 and 1536 squared budgets from 1:1 to 21:9".to_string(),
+            Some("z-image") => "any width and height that are multiples of 16, 256 to 2048 a side (2048 x 2048 the largest; 23.7 GiB on the card); 1024 x 1024 is the default, the model's own sizes are 1024, 1280 and 1536 squared budgets from 1:1 to 21:9".to_string(),
             _ => "any width and height that are multiples of 16; the model was trained up to about 1.8 megapixels (1328 x 1328) - larger works, slower and less sure".to_string(),
         };
         Ok(json!({"model": id, "rule": rule, "canvases": list}))

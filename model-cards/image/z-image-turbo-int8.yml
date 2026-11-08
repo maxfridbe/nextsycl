@@ -13,7 +13,7 @@ license_note: 'Apache-2.0 for the weights (Tongyi-MAI/Z-Image-Turbo) and the tex
 title: 'Z-Image-Turbo int8 (text to image in 8 steps, int8 products: faster, a little less exact; Rust + SYCL)'
 about: 'Tongyi-MAI''s Z-Image-Turbo with Comfy-Org''s int8 ConvRot DiT (5.6 GiB on the card instead of 11.2, products at the int8 rate), Qwen3-4B in bf16, the Flux.1 VAE; the same compositions as z-image-turbo, small details differ'
 gpus: '0'
-vram_gib: 19.0
+vram_gib: 17.0                   # the card at 2048 x 2048 (measured, B70 and B65 16.2); 13.8 at 1024 x 1024
 defaults:
   steps: 8
   cfg: 1.0

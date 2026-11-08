@@ -101,6 +101,10 @@ pub fn run(m: &ZImage, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String))
     let np = dit::padded(n);
     let ours_sig = crate::sigmas(sig.len() - 1, crate::SHIFT);
     note("sigmas", &ours_sig, &sig, log);
+    // the starting noise: ours from the seed against torch.randn's (seed.txt, when the dump has it)
+    if let Some(seed) = std::fs::read_to_string(dir.join("seed.txt")).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+        worst = worst.max(note(&format!("noise from seed {seed}"), &crate::noise(seed, lat0.len()), &lat0, log));
+    }
     if stages.contains(&"dit") {
         let mut g = dit::Grabs::default();
         let pre = m.dit.prefix(&m.nsd, &cap, Some(&mut g))?;

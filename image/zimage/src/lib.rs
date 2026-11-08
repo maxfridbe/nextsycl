@@ -4,7 +4,7 @@
 //!
 //! ```text
 //!   prompt -> Qwen3's chat template -> Qwen3-4B, the residual stream after layer 35 of every token [L, 2560]
-//!   noise [16, H/8, W/8] (seeded) -> Euler over linspace(1, 1/n, n) shifted (shift 3), the DiT's velocity each step
+//!   noise [16, H/8, W/8] (torch.randn from the seed) -> Euler over linspace(1, 1/n, n) shifted (shift 3), the DiT's velocity each step
 //!   latents -> Flux.1's VAE (16 channels; / 0.3611 + 0.1159) -> RGB
 //! ```
 //!
@@ -34,9 +34,11 @@ pub const SHIFT: f32 = 3.0;
 /// the steps the Turbo is distilled for (8 NFE: the README's num_inference_steps=9 on the pipeline of its day, 8 on
 /// today's, whose levels end at 1/n rather than 0)
 pub const STEPS: u32 = 8;
-/// a side's limits (multiples of 16, the pipeline's vae_scale_factor * 2)
+/// a side's limits (multiples of 16, the pipeline's vae_scale_factor * 2) and the largest picture: 2048 x 2048 (the
+/// platform's shape caps it at 2.36 MP for 12 GB cards; here it fits a card: 23.7 GiB, 24.7 s on a B70)
 pub const MIN_SIDE: usize = 256;
 pub const MAX_SIDE: usize = 2048;
+pub const MAX_PIXELS: usize = 4_194_304;
 /// The aspect ratios and pixel budgets of the model's own demo (Tongyi-MAI/Z-Image-Turbo's Space, app.py RES_CHOICES):
 /// 1024, 1280 and 1536 squared, 1:1 to 21:9 either way
 const RATIOS: &[&str] = &["1:1", "9:7", "7:9", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "21:9", "9:21"];
@@ -52,7 +54,10 @@ pub fn kind() -> ImageKind {
     ImageKind { archs: &[ARCH], name: "Z-Image-Turbo (6B single-stream DiT, Qwen3-4B text encoder, Flux VAE; 8 steps; Rust + SYCL)", roles: ROLES, load, options: &[] }
 }
 
-fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], _o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn ImageEngine>> {
+fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn ImageEngine>> {
+    if !o.merge_loras.is_empty() {
+        return Err(Error("loras: Z-Image-Turbo takes none".into()));
+    }
     Ok(Box::new(ZImage::load(files, gpus, log)?))
 }
 
@@ -74,33 +79,85 @@ pub fn sigmas(steps: usize, shift: f32) -> Vec<f32> {
     out
 }
 
-/// A size the model takes: multiples of 16, MIN_SIDE to MAX_SIDE a side
+/// A size the model takes: multiples of 16, MIN_SIDE to MAX_SIDE a side, at most MAX_PIXELS
 pub fn check_size(w: usize, h: usize) -> Result<()> {
-    if !w.is_multiple_of(16) || !h.is_multiple_of(16) || w < MIN_SIDE || h < MIN_SIDE || w > MAX_SIDE || h > MAX_SIDE {
-        return Err(Error(format!("{w}x{h}: multiples of 16, from {MIN_SIDE} to {MAX_SIDE} a side (the model's own sizes: 1024x1024, 1280x720, 1536x1024 ...)")));
+    if !w.is_multiple_of(16) || !h.is_multiple_of(16) || w < MIN_SIDE || h < MIN_SIDE || w > MAX_SIDE || h > MAX_SIDE || w * h > MAX_PIXELS {
+        return Err(Error(format!("{w}x{h}: multiples of 16, from {MIN_SIDE} to {MAX_SIDE} a side, at most {MAX_PIXELS} pixels (2048 x 2048; the model's own \
+                                  sizes: 1024x1024, 1280x720, 1536x1024 ...)")));
     }
     Ok(())
 }
 
-/// A seeded standard-normal draw (splitmix64, Box-Muller): the starting noise
-pub fn noise(seed: u64, n: usize) -> Vec<f32> {
-    let mut s = seed;
-    let mut next = || {
-        s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
-    };
-    let mut out = Vec::with_capacity(n + 1);
-    while out.len() < n {
-        let (u, v) = (next().max(1e-300), next());
-        let r = (-2.0 * u.ln()).sqrt();
-        out.push((r * (std::f64::consts::TAU * v).cos()) as f32);
-        out.push((r * (std::f64::consts::TAU * v).sin()) as f32);
+/// MT19937, as torch's CPU generator (`torch.Generator("cpu").manual_seed(seed)`) runs it
+struct Mt {
+    s: [u32; 624],
+    i: usize,
+}
+
+impl Mt {
+    fn new(seed: u64) -> Mt {
+        let mut s = [0u32; 624];
+        s[0] = seed as u32;
+        for j in 1..624 {
+            s[j] = 1_812_433_253u32.wrapping_mul(s[j - 1] ^ (s[j - 1] >> 30)).wrapping_add(j as u32);
+        }
+        Mt { s, i: 624 }
     }
-    out.truncate(n);
-    out
+
+    fn next(&mut self) -> u32 {
+        if self.i >= 624 {
+            for j in 0..624 {
+                let y = (self.s[j] & 0x8000_0000) | (self.s[(j + 1) % 624] & 0x7fff_ffff);
+                self.s[j] = self.s[(j + 397) % 624] ^ (y >> 1) ^ if y & 1 == 1 { 0x9908_b0df } else { 0 };
+            }
+            self.i = 0;
+        }
+        let mut y = self.s[self.i];
+        self.i += 1;
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c_5680;
+        y ^= (y << 15) & 0xefc6_0000;
+        y ^ (y >> 18)
+    }
+
+    /// uniform_real_distribution<float>(0, 1): the low 24 bits over 2^24
+    fn uniform(&mut self) -> f32 {
+        (self.next() & 0x00ff_ffff) as f32 / (1u32 << 24) as f32
+    }
+}
+
+/// The starting noise for `seed`: torch.randn(n) from a CPU generator seeded so (ATen's normal_fill: n uniforms, then
+/// Box-Muller over blocks of 16 - pair (j, j + 8) - and, when n is not a multiple of 16, the last 16 drawn again), so a
+/// seed makes the picture diffusers (and nextcuda) make with it; the transcendental functions may differ by an ulp
+pub fn noise(seed: u64, n: usize) -> Vec<f32> {
+    let mut g = Mt::new(seed);
+    let mut d: Vec<f32> = (0..n).map(|_| g.uniform()).collect();
+    let fill16 = |d: &mut [f32]| {
+        for j in 0..8 {
+            let (u1, u2) = (1.0 - d[j], d[j + 8]);
+            let r = (-2.0 * u1.ln()).sqrt();
+            let th = (2.0 * std::f64::consts::PI) as f32 * u2;
+            d[j] = r * th.cos();
+            d[j + 8] = r * th.sin();
+        }
+    };
+    if n < 16 {
+        // (torch takes another path for fewer than 16 values; no latent is that small: a block of 16, cut)
+        let mut b = noise(seed, 16);
+        b.truncate(n);
+        return b;
+    }
+    for c in d.chunks_exact_mut(16) {
+        fill16(c);
+    }
+    if !n.is_multiple_of(16) {
+        let tail = &mut d[n - 16..];
+        for v in tail.iter_mut() {
+            *v = g.uniform();
+        }
+        fill16(tail);
+    }
+    d
 }
 
 pub struct ZImage {
@@ -242,9 +299,19 @@ impl ImageEngine for ZImage {
         if req.edit.is_some() {
             return Err(Error(format!("{ARCH}: text to image only")));
         }
-        // guidance 0 is the pipeline's "none" (its scale multiplies pos - neg), 1 the contract's
-        if req.negative.as_deref().is_some_and(|n| !n.trim().is_empty()) || req.cfg.is_some_and(|c| c != 0.0 && c != 1.0) {
-            return Err(Error(format!("{ARCH}: no guidance (no negative prompt, cfg 1 or 0): the Turbo is distilled to run without it")));
+        // the platform's refusals (as nextcuda words them); guidance 0 is the pipeline's "none" (its scale multiplies
+        // pos - neg), 1 the contract's
+        if req.negative.as_deref().is_some_and(|n| !n.trim().is_empty()) {
+            return Err(Error("Z-Image-Turbo takes no negative prompt: it is distilled from guidance (8 steps, one pass a step, no CFG)".into()));
+        }
+        if let Some(c) = req.cfg.filter(|c| *c != 0.0 && *c != 1.0) {
+            return Err(Error(format!("cfg {c}: Z-Image-Turbo runs without guidance (leave cfg out, or 0 or 1)")));
+        }
+        if !req.loras.is_empty() {
+            return Err(Error("loras: Z-Image-Turbo takes none".into()));
+        }
+        if req.rgba {
+            return Err(Error("rgba: Z-Image-Turbo makes opaque pictures".into()));
         }
         let (w, h) = (req.width.unwrap_or(d.width) as usize, req.height.unwrap_or(d.height) as usize);
         check_size(w, h)?;
@@ -256,8 +323,9 @@ impl ImageEngine for ZImage {
         if !(shift.is_finite() && shift > 0.0 && shift <= 20.0) {
             return Err(Error(format!("shift {shift}: above 0, at most 20 (the model's: {SHIFT})")));
         }
-        let prompt = req.prompt.trim();
-        if prompt.is_empty() {
+        // the prompt as written (the pipeline's template takes it untouched)
+        let prompt = req.prompt.as_str();
+        if prompt.trim().is_empty() {
             return Err(Error(format!("{ARCH}: an empty prompt")));
         }
         self.check_room(w, h, self.te.ids(prompt).len())?;
@@ -307,9 +375,24 @@ mod tests {
         assert!(super::check_size(1000, 1000).is_err());
         assert!(super::check_size(128, 1024).is_err());
         assert!(super::check_size(4096, 1024).is_err());
+        // 2048 x 2048 the largest; a side past 2048 or under 256 is refused whatever the pixels
+        assert!(super::check_size(2048, 2048).is_ok());
+        assert!(super::check_size(2064, 256).is_err());
+        assert!(super::check_size(240, 1024).is_err());
         // every size of the model's demo is taken
         assert!(super::SIZES.iter().all(|(w, h)| super::check_size(*w as usize, *h as usize).is_ok()));
         assert_eq!(super::SIZES.len(), 33);
+    }
+
+    #[test]
+    fn the_noise_is_torchs() {
+        // MT19937's own check values, then torch.manual_seed(0); torch.randn(4, 4)
+        let mut g = super::Mt::new(5489);
+        assert_eq!(g.next(), 3_499_211_612);
+        assert_eq!(super::Mt::new(42).next(), 1_608_637_542);
+        let want = [-1.1258, -1.1524, -0.2506, -0.4339, 0.8487, 0.6920, -0.3160, -2.1152, 0.3223, -1.2633, 0.3500, 0.3081, 0.1198, 1.2377, 1.1168, -0.2473];
+        let got = super::noise(0, 16);
+        assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4), "{got:?}");
     }
 
     #[test]

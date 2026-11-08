@@ -2,18 +2,31 @@
 for `nextsycl image check`. diffusers' own classes at commit 84532a058702c74ae5d1dd6ceb05683fc5d5e768 (main,
 pipelines/z_image/pipeline_z_image.py and models/transformers/transformer_z_image.py) run as they are, on the files the
 engine loads: the DiT's GGUF (ComfyUI's names, renamed to diffusers' and its fused qkv split; each matrix kept as
-stored and expanded to float32 for its own product only), the text encoder's single safetensors file (ComfyUI's
-qwen_3_4b, into transformers' Qwen3Model) and the VAE's diffusers file. The denoising loop is the pipeline's, copied
-so that every step can be dumped.
+stored and expanded to float32 for its own product only - any GGUF type gguf-py reads: BF16, Q8_0 ...), the text
+encoder (ComfyUI's single-file qwen_3_4b, the official text_encoder/ directory of shards, or a llama.cpp GGUF such as
+Qwen/Qwen3-4B-GGUF's, into transformers' Qwen3Model) and the VAE's diffusers file. The denoising loop is the
+pipeline's, copied so that every step can be dumped. Self-contained: this file and the model's files, nothing of
+nextsycl's.
 
-    python -I ref.py --dit DIT.gguf --te TE.safetensors --hf HF_DIR --out DIR [--prompt TEXT] [--size 1024x1024]
+Setup (any machine, CPU only; ~30 GB of memory at 1024 x 1024, 8 steps ~11 min on 16 cores):
+
+    python3 -m venv venv
+    venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+    venv/bin/pip install transformers accelerate safetensors numpy pillow gguf
+    venv/bin/pip install git+https://github.com/huggingface/diffusers@84532a058702c74ae5d1dd6ceb05683fc5d5e768
+    HF_DIR: Tongyi-MAI/Z-Image-Turbo at revision f332072aa78be7aecdf3ee76d5c247082da564a6 - its *.json files,
+    tokenizer/ and vae/ (and transformer/, text_encoder/ for --files)
+
+(measured with torch 2.15.0+cpu, transformers 5.22.2.)
+
+    python -I ref.py --dit DIT.gguf --te TE --hf HF_DIR --out DIR [--prompt TEXT] [--size 1024x1024]
                      [--steps 8] [--seed 42] [--stages te,dit,vae] [--threads 16]
     python -I ref.py --files --dit DIT.gguf --te TE.safetensors --hf HF_DIR      (the files against the official ones)
 
 HF_DIR: Tongyi-MAI/Z-Image-Turbo at f332072a (its configs, tokenizer and VAE; with --files its float32 transformer
 and its text encoder's shards too).
 
-Dumps (DIR, .npy float32 unless said): prompt.txt; text.txt (the chat template); ids.npy (int32: the template's
+Dumps (DIR, .npy float32 unless said): prompt.txt; seed.txt; text.txt (the chat template); ids.npy (int32: the template's
 tokens, the pipeline's attention-masked rows); te_h1, te_h18, te_h35 (= cap, the pipeline's hidden_states[-2]),
 te_h36 [L, 2560] (hidden_states[k]: k = 0 the embeddings, 36 the last layer's after the final norm); sigmas
 [steps + 1]; lat_0 [16, h, w] (torch.randn from the seed); per step i: lat_i (the input), vel_i (the DiT's output,
@@ -155,29 +168,63 @@ def template(hf, prompt):
     return text, ti.input_ids, ti.attention_mask.bool()
 
 
+# llama.cpp's Qwen3 names (a GGUF text encoder, e.g. Qwen/Qwen3-4B-GGUF's) -> transformers' (Qwen3's rotary halves need no
+# permutation)
+GGUF_TE = {"token_embd": "embed_tokens", "output_norm": "norm", "attn_norm": "input_layernorm", "ffn_norm": "post_attention_layernorm",
+           "attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj", "attn_output": "self_attn.o_proj",
+           "attn_q_norm": "self_attn.q_norm", "attn_k_norm": "self_attn.k_norm", "ffn_gate": "mlp.gate_proj", "ffn_up": "mlp.up_proj",
+           "ffn_down": "mlp.down_proj"}
+
+
+def te_tensors(path):
+    """name (transformers' Qwen3Model) -> a function giving the float32 tensor, from one safetensors file (ComfyUI's
+    qwen_3_4b), a directory of shards (the official text_encoder/) or a GGUF (llama.cpp's names)"""
+    if path.endswith(".gguf"):
+        from gguf import GGUFReader
+        from gguf.quants import dequantize
+        out = {}
+        for t in GGUFReader(path).tensors:
+            parts = t.name.split(".")
+            if parts[0] == "blk":
+                name = f"layers.{parts[1]}.{GGUF_TE[parts[2]]}.{parts[3]}"
+            elif parts[0] in GGUF_TE:
+                name = f"{GGUF_TE[parts[0]]}.{parts[1]}"
+            else:
+                continue
+            shape = [int(x) for x in reversed(list(t.shape))]
+            out[name] = (lambda t=t, shape=shape: torch.from_numpy(np.ascontiguousarray(dequantize(t.data, t.tensor_type), dtype=np.float32).reshape(shape)))
+        return out
+    from safetensors.torch import load_file
+    files = [os.path.join(path, f) for f in sorted(os.listdir(path)) if f.endswith(".safetensors")] if os.path.isdir(path) else [path]
+    out = {}
+    for f in files:
+        for k, v in load_file(f).items():
+            if k.startswith("model."):
+                out[k[len("model."):]] = (lambda v=v: v.float())
+    return out
+
+
 def load_te(path, hf):
-    """transformers' Qwen3Model on the file's tensors: the linears' bfloat16 matrices kept so and made float32 for their
+    """transformers' Qwen3Model on the file's tensors: the linears' matrices kept as stored and made float32 for their
     own product (as the DiT's), everything else float32"""
     from accelerate import init_empty_weights
-    from safetensors.torch import load_file
     from transformers import Qwen3Config, Qwen3Model
     cfg = Qwen3Config.from_pretrained(os.path.join(hf, "text_encoder"))
     with init_empty_weights():
         m = Qwen3Model(cfg)
-    sd = {k[len("model."):]: v for k, v in load_file(path).items() if k.startswith("model.")}
+    sd = te_tensors(path)
     used = set()
     for mname, mod in list(m.named_modules()):
         for cname, child in list(mod.named_children()):
             if isinstance(child, nn.Linear):
                 full = f"{mname}.{cname}" if mname else cname
-                w = sd[full + ".weight"]
-                setattr(mod, cname, LazyLinear(lambda w=w: w.float(), None, full))
+                setattr(mod, cname, LazyLinear(sd[full + ".weight"], None, full))
                 used.add(full + ".weight")
     for name, p in list(m.named_parameters()):
         if name in used:
             continue
         mod_name, _, attr = name.rpartition(".")
-        setattr(m.get_submodule(mod_name) if mod_name else m, attr, nn.Parameter(sd[name].float(), requires_grad=False))
+        setattr(m.get_submodule(mod_name) if mod_name else m, attr, nn.Parameter(sd[name](), requires_grad=False))
         used.add(name)
     left = [k for k in sd if k not in used]
     if left:
@@ -250,6 +297,7 @@ def main():
     stages = a.stages.split(",")
     width, height = (int(v) for v in a.size.split("x"))
     open(os.path.join(out, "prompt.txt"), "w").write(a.prompt)
+    open(os.path.join(out, "seed.txt"), "w").write(str(a.seed))
     text, ids, mask = template(a.hf, a.prompt)
     open(os.path.join(out, "text.txt"), "w").write(text)
     save(out, "ids", ids[0][mask[0]].to(torch.int32))

@@ -138,3 +138,55 @@ the DiT 5.7 s warm (29 s from a cold page cache), the text encoder 2.8 s (15 s c
   half per call), so it is slower - a forward 0.712 s against 0.511 - and less exact: velocities 2.3e-2 at step 0 (BF16:
   2.6e-3), the picture cos 0.994 to the reference. It would save 4.6 GiB of card memory (6.6 GiB of DiT), which a
   32 GiB card does not need for this model.
+- **int8 ConvRot (Comfy-Org, `z-image-turbo-int8`)**: offered beside the BF16 default, for speed and room. Every block
+  matrix is int8 with a scale per row, its inputs rotated by a normalized Hadamard matrix in groups of 256; the shared
+  `nsd_int8_linear` rotates and quantizes each activation row on the fly and multiplies at the card's int8 rate (the
+  products 218-288 TOPS against 124-152 TFLOPS in half; the q | k | v scale goes into the row scales, the adaLN
+  matrices are un-rotated on the host). A forward 0.350 s (BF16 0.511), the DiT 5.6 GiB on the card (11.2). Exactness:
+  velocities 1.1e-2 .. 4.7e-2 against the reference (cos >= 0.9989), the picture cos 0.992 and PSNR 27.5 dB against the
+  BF16 engine's (which is 43.5 dB from the reference's): the same composition, colours and lettering, small details
+  (embroidery, strands of hair) drawn differently.
+
+| size | int8, B70 | int8, B65 |
+|---|---|---|
+| 1024 x 1024 | 3.26 s | 4.76 s |
+| 1152 x 896 | 3.19 s | 4.65 s |
+| 1248 x 832 | 3.26 s | 4.80 s |
+| 1280 x 720 | 2.87 s | 4.15 s |
+| 1344 x 576 | 2.39 s | 3.42 s |
+| 1280 x 1280 | 5.53 s | 8.20 s |
+| 1536 x 1024 | 5.25 s | 7.77 s |
+| 1536 x 1536 | 8.86 s | 13.12 s |
+| 2048 x 2048 | 19.89 s | 29.82 s |
+
+Card memory with int8: 13.8 GiB at 1024 x 1024, 16.2 GiB at 2048 x 2048 (both cards).
+
+### The request (the platform's shape, as nextcuda e5743a1 serves it)
+
+`image.generate` with `model`, `prompt` (used as written; `revised_prompt` echoes it), `size` (default 1024x1024),
+`seed`, `n`, `steps` (1-50, default 8), `shift` (above 0, at most 20, default 3), `response_format`. Refused at the front
+door (`home/precheck.rs` `z_image_rules`, 400) and again by the engine: a non-empty `negative_prompt` ("Z-Image-Turbo
+takes no negative prompt: it is distilled from guidance (8 steps, one pass a step, no CFG)"), `cfg` other than absent,
+0 or 1, steps or shift out of range, a side not a multiple of 16 or outside 256-2048, more than 4,194,304 pixels, a
+sampler other than euler or a schedule other than shift, `loras`, `rgba`, an init picture, `image.edit`. **One
+difference from nextcuda**: their cap is 2,359,296 pixels (1536², 2048 x 1152 - Flux's VAE without tiling on a 12 GB
+card); ours is 2048 x 2048 (4.19 MP, measured: 23.7 GiB on the card, 24.7 s on the B70, 38 s on the B65).
+
+**The noise is torch's**: `noise(seed)` is `torch.randn` from a CPU generator seeded so (MT19937, ATen's normal_fill:
+Box-Muller over blocks of 16), so a seed gives the picture diffusers (and nextcuda, which draws the same way) give it:
+against the dumps' `lat_0` rel 3.2e-8 (seeds 42 and 7; the last bits are the transcendentals'). From the reference's
+noise and our own text encoder, the whole pipeline's picture: cos 0.9996 (1024) / 0.9991 (720).
+
+### What is open
+
+- **img2img and edits**: refused (`text to image only`). diffusers has Z-Image img2img, inpaint and ControlNet
+  pipelines; they need Flux.1's VAE encoder (not loaded) and, for edits, Z-Image-Edit's weights.
+- **nextcuda's files** (unsloth's Q8_0 DiT, Qwen/Qwen3-4B-GGUF's Q8_0 text encoder): the reference reads both (`--dit`
+  takes any GGUF type, `--te` a llama.cpp GGUF), so their runtime can be checked against it on their files; the GGUF
+  text-encoder path of ref.py is written but not run here (the file was not downloaded). Their claim that Z-Image's
+  text encoder is Qwen3-4B's but for layer 35's MLP (never read) was not checked.
+- **Faster still (BF16)**: the products run at the card's practical half peak and the attention is the flash kernel;
+  left at 1024 x 1024 are the norms and gates (50 ms a forward, one fused pass each now) and the out product (1 ms a
+  block at 128 TFLOPS). The host queues ahead of the GPU, so graphs would not show.
+- **A request's LoRAs**, and the base model's guidance options (`cfg_normalization`, `cfg_truncation`): not supported;
+  the Turbo runs without guidance.

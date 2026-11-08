@@ -53,6 +53,55 @@ pub fn cfg_needs_negative(m: &Value) -> bool {
     m["arch"] == "qwen-image-2.1"
 }
 
+/// The largest Z-Image-Turbo picture: 2048 x 2048 (nextcuda's cap is 2.36 MP for 12 GB cards; ours fit 4.19 MP: 23.7 GiB)
+pub const Z_IMAGE_MAX_PIXELS: u64 = 4_194_304;
+
+/// Z-Image-Turbo's request rules (the platform's shape, as nextcuda serves it): sides multiples of 16 from 256 to 2048,
+/// at most Z_IMAGE_MAX_PIXELS; steps 1 to 50; shift above 0, at most 20; no guidance (cfg absent, 0 or 1; no negative
+/// prompt); euler and shift only; no LoRAs, transparency or init picture; text to image only
+pub fn z_image_rules(edit: bool, b: &Value) -> Result<(), String> {
+    if edit {
+        return Err("Z-Image-Turbo makes pictures from text only: no image.edit".into());
+    }
+    if !b["negative_prompt"].as_str().unwrap_or("").trim().is_empty() {
+        return Err("Z-Image-Turbo takes no negative prompt: it is distilled from guidance (8 steps, one pass a step, no CFG)".into());
+    }
+    match &b["cfg"] {
+        Value::Null => {}
+        v if v.as_f64() == Some(0.0) || v.as_f64() == Some(1.0) => {}
+        v => return Err(format!("cfg {v}: Z-Image-Turbo runs without guidance (leave cfg out, or 0 or 1)")),
+    }
+    if let Some(sz) = b["size"].as_str().filter(|s| *s != "auto") {
+        let (w, h) = sz.split_once('x').and_then(|(w, h)| Some((w.parse::<u64>().ok()?, h.parse::<u64>().ok()?))).ok_or_else(|| format!("size {sz}: WIDTHxHEIGHT"))?;
+        if w % 16 != 0 || h % 16 != 0 || !(256..=2048).contains(&w) || !(256..=2048).contains(&h) || w * h > Z_IMAGE_MAX_PIXELS {
+            return Err(format!("size {sz}: sides multiples of 16 from 256 to 2048, at most {Z_IMAGE_MAX_PIXELS} pixels (2048 x 2048)"));
+        }
+    }
+    if !b["steps"].is_null() && b["steps"].as_u64().is_none_or(|s| !(1..=50).contains(&s)) {
+        return Err(format!("steps {}: from 1 to 50 (the Turbo's own: 8)", b["steps"]));
+    }
+    if !b["shift"].is_null() && b["shift"].as_f64().is_none_or(|s| !(s > 0.0 && s <= 20.0)) {
+        return Err(format!("shift {}: above 0, at most 20 (the model's: 3)", b["shift"]));
+    }
+    let named = |k: &str| b[k].as_str().filter(|v| !v.is_empty() && *v != "default").map(str::to_ascii_lowercase);
+    if let Some(v) = named("sampler").filter(|v| v != "euler") {
+        return Err(format!("sampler {v}: Z-Image-Turbo runs euler only"));
+    }
+    if let Some(v) = named("schedule").filter(|v| v != "shift") {
+        return Err(format!("schedule {v}: Z-Image-Turbo runs shift only"));
+    }
+    if b["loras"].as_array().is_some_and(|l| !l.is_empty()) {
+        return Err("loras: Z-Image-Turbo takes none".into());
+    }
+    if b["rgba"] == true || b["transparent"] == true {
+        return Err("rgba: Z-Image-Turbo makes opaque pictures".into());
+    }
+    if ["image", "init_image"].iter().any(|k| b[*k].as_str().is_some_and(|v| !v.is_empty())) {
+        return Err("image: Z-Image-Turbo makes pictures from text only (no init picture)".into());
+    }
+    Ok(())
+}
+
 /// The steps an image model takes (image.info's steps): its default, and the only count a few-step model runs
 pub fn steps_of(m: &Value) -> Value {
     let own = m["env"]["NS_QI_SIGMAS"].as_str().map(|v| v.split(',').filter(|x| !x.trim().is_empty()).count());
@@ -151,6 +200,9 @@ impl Home {
     fn precheck_image(&self, edit: bool, b: &Value, all: &[Value]) -> Result<(), Fail> {
         let id = self.pick("image", b, all)?;
         let m = all.iter().find(|x| x["id"] == id.as_str()).cloned().unwrap_or(Value::Null);
+        if m["arch"] == "z-image" {
+            z_image_rules(edit, b).map_err(bad)?;
+        }
         whole(b, "n", 1, 8)?;
         if let Some(f) = b["response_format"].as_str() {
             if !["url", "b64_json"].contains(&f) {
@@ -351,6 +403,23 @@ mod tests {
         assert!(!cfg_needs_negative(&json!({"arch": "moss-image"})));
     }
     use serde_json::json;
+
+    #[test]
+    fn z_image_turbo_takes_the_platforms_shape() {
+        let ok = |b: serde_json::Value| super::z_image_rules(false, &b);
+        assert!(ok(json!({"prompt": "p", "size": "1024x1024", "steps": 8, "shift": 3.0, "cfg": 0})).is_ok());
+        assert!(ok(json!({"prompt": "p", "size": "2048x1152", "cfg": 1, "sampler": "euler", "schedule": "shift"})).is_ok());
+        assert!(ok(json!({"prompt": "p", "size": "2048x2048"})).is_ok());
+        assert_eq!(ok(json!({"negative_prompt": "blurry"})).unwrap_err(),
+                   "Z-Image-Turbo takes no negative prompt: it is distilled from guidance (8 steps, one pass a step, no CFG)");
+        assert!(ok(json!({"negative_prompt": "  "})).is_ok());
+        for bad in [json!({"cfg": 3}), json!({"size": "1000x1000"}), json!({"size": "240x1024"}), json!({"size": "2064x1024"}), json!({"steps": 0}),
+                    json!({"steps": 51}), json!({"shift": 0}), json!({"shift": 21}), json!({"sampler": "dpmpp_2m"}), json!({"schedule": "karras"}),
+                    json!({"loras": ["x"]}), json!({"rgba": true}), json!({"image": "upload:x.png"})] {
+            assert!(ok(bad.clone()).is_err(), "{bad}");
+        }
+        assert!(super::z_image_rules(true, &json!({"prompt": "p"})).is_err());
+    }
 
     #[test]
     fn a_few_step_model_locks_its_steps() {
