@@ -194,6 +194,14 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_PEAK_GBS` | 608 | Debug: memory bandwidth (GB/s) the NS_Q35_PROFILE tables show each kernel's share of | llm qwen35 |
 | `NS_PEAK_TF16` | 183 | Debug: f16 TFLOP/s peak the NS_Q35_PROFILE tables compare the f16 GEMMs with | llm qwen35 |
 | `NS_PEAK_TF32` | 22.9 | Debug: f32 TFLOP/s peak the NS_Q35_PROFILE tables compare the other kernels with | llm qwen35 |
+| `NS_RC_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (at least 16); a sliding-window layer's ring is a window and a chunk (--opt-chunk) | llm ricursive |
+| `NS_RC_HOST` | 0 | Layers the ricursive engine keeps in pinned host memory on the last GPU though VRAM has room (a measurement of streaming; layers that fit no GPU go there anyway) (--opt-host-layers) | llm ricursive |
+| `NS_RC_STREAM` | direct | How a ricursive host layer is read: direct (the products read the pinned memory in place over PCIe) or copy (the layer copied to a staging buffer in VRAM first) (--opt-stream) | llm ricursive |
+| `NS_RC_HOST_SPARE_GIB` | 8 | Host memory the ricursive engine keeps free whatever it pins for streamed layers (--opt-host-spare-gib) | llm ricursive |
+| `NS_RC_LAYERS` | all | Load only the first N layers of the ricursive model, the head after them (a reference check on a truncated model) (--opt-layers) | llm ricursive |
+| `NS_RC_DUMP` | unset | A directory the ricursive engine writes every tapped tensor of a pass to (embd, l_out-N, result_norm) as float32, for reference/ricursive-65b/compare.py (--opt-dump) | llm ricursive |
+| `NS_RC_MMVQ_GROUPS` | 512 | Experiment: work-groups of the ricursive silo's matrix-vector kernels with a lookup table | kernels:ricursive silo |
+| `NS_RC_MMVQ_ROWS` | 0 (each type's own) | Experiment: rows a sub-group (1, 2 or 4) for every 256-block type of the ricursive silo's matrix-vector kernels | kernels:ricursive silo |
 | `NS_Q35_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (at least 16) (--opt-chunk) | llm qwen35 |
 | `NS_Q35_DRAFTS` | 3 | tokens drafted a step with MTP or EAGLE-4 (at most 7; 0: none) (--opt-drafts) | llm qwen35 |
 | `NS_Q35_EAGLE` | unset (MTP) | the EAGLE-4 draft's folder (config.json, model.safetensors: Qwen3.8-27B's `LlamaForCausalLMEagle4`), or `auto`: an `eagle4/` folder beside the model; loaded in MTP's place on one GPU (--opt-eagle) | llm qwen35 |

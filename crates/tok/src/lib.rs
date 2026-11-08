@@ -16,6 +16,9 @@ const GLM4_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[
 /// GPT-4o's split (Llama 4's `llama4`, Muse Glimmer's): tokenizer.json's pattern - letters in case runs with their
 /// contraction, digits in threes, a slash after punctuation
 const GPT4O_SPLIT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// llama.cpp's DBRX / LLAMA3 pre-tokenizer (`dbrx`: Ricursive Ripple-65B's, with the cl100k vocabulary): the contractions
+/// in either case, letters with one lead mark, digits in threes, punctuation runs, line breaks and spaces
+const DBRX_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const QWEN35_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// llama.cpp's LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM (DeepSeek-V3 / R1's `deepseek-v3`): three patterns applied in turn,
@@ -220,6 +223,7 @@ impl Tokenizer {
         let (split, pre_splits): (&str, &[&str]) = match pre {
             "glm4" | "glm5" | "chatglm-bpe" => (GLM4_SPLIT, &[]),
             "qwen35" => (QWEN35_SPLIT, &[]),
+            "dbrx" => (DBRX_SPLIT, &[]),
             // llama.cpp's QWEN2: the contractions either case, letters, single digits
             "qwen2" => (QWEN2_SPLIT, &[]),
             "gpt-4o" | "llama4" => (GPT4O_SPLIT, &[]),
@@ -228,7 +232,7 @@ impl Tokenizer {
             "tekken" => (TEKKEN_SPLIT, &[]),
             // DeepSeek-V4's `joyai-llm`: llama.cpp gives it DeepSeek-V3's three patterns
             "deepseek-v3" | "joyai-llm" => (DEEPSEEK3_SPLITS[2], &DEEPSEEK3_SPLITS[..2]),
-            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen2, qwen35, deepseek-v3, joyai-llm, llama4, tekken, minimax-m2)")),
+            _ => return Err(format!("pre-tokenizer {pre:?} is not one this tokenizer has (glm4, qwen2, qwen35, dbrx, deepseek-v3, joyai-llm, llama4, tekken, minimax-m2)")),
         };
         let tokens = strs(g.meta("tokenizer.ggml.tokens"));
         let types: Vec<u64> = g.meta("tokenizer.ggml.token_type").and_then(Value::as_array).map(|a| a.iter().map(|x| x.as_u64().unwrap_or(1)).collect()).unwrap_or_default();
@@ -654,9 +658,34 @@ pub fn glm_tool_calls(answer: &str) -> (String, Vec<ToolCall>) {
     (answer[..start].trim_end().to_string(), calls)
 }
 
-/// The tool calls in an answer, in whichever form its template asked for: Qwen's `<function=...>` blocks or GLM's
-/// `NAME<arg_key>...` (the first call's body tells which)
+/// The tool calls in a Ripple answer: `<tool_call>` blocks each holding one JSON object `{"name": ..., "arguments":
+/// {...}}`. A string argument is its text; anything else (a number, a list, an object) its JSON.
+pub fn json_tool_calls(answer: &str) -> (String, Vec<ToolCall>) {
+    let Some(start) = answer.find("<tool_call>") else { return (answer.to_string(), Vec::new()) };
+    let mut calls = Vec::new();
+    let mut rest = &answer[start..];
+    while let Some(i) = rest.find("<tool_call>") {
+        let body_start = i + "<tool_call>".len();
+        let end = rest[body_start..].find("</tool_call>").map_or(rest.len(), |e| body_start + e);
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest[body_start..end].trim()) {
+            if let Some(name) = v["name"].as_str().filter(|n| !n.is_empty()) {
+                let args = v["arguments"].as_object().map(|o| {
+                    o.iter().map(|(k, a)| (k.clone(), a.as_str().map_or_else(|| a.to_string(), str::to_string))).collect()
+                }).unwrap_or_default();
+                calls.push(ToolCall { name: name.to_string(), args });
+            }
+        }
+        rest = &rest[(end + "</tool_call>".len()).min(rest.len())..];
+    }
+    (answer[..start].trim_end().to_string(), calls)
+}
+
+/// The tool calls in an answer, in whichever form its template asked for: Qwen's `<function=...>` blocks, Ripple's
+/// JSON objects, or GLM's `NAME<arg_key>...` (the first call's body tells which)
 pub fn tool_calls(answer: &str) -> (String, Vec<ToolCall>) {
+    if answer.find("<tool_call>").is_some_and(|i| answer[i + "<tool_call>".len()..].trim_start().starts_with('{')) {
+        return json_tool_calls(answer);
+    }
     let qwen = answer.find("<tool_call>").is_some_and(|i| answer[i + "<tool_call>".len()..].trim_start().starts_with("<function="));
     if qwen { qwen_tool_calls(answer) } else { glm_tool_calls(answer) }
 }
@@ -1259,6 +1288,26 @@ mod tests {
         assert_eq!(calls[0].args, vec![("city".to_string(), "Paris".to_string()), ("note".to_string(), "two\nlines".to_string())]);
         assert_eq!(calls[1], ToolCall { name: "now".into(), args: vec![] });
         assert_eq!(qwen_tool_calls("plain"), ("plain".to_string(), vec![]));
+    }
+
+    #[test]
+    fn ripples_json_tool_calls_parse() {
+        let a = "Checking.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 3, \"tags\": [\"a\"]}}\n</tool_call>\n<tool_call>\n{\"name\": \"now\", \"arguments\": {}}\n</tool_call>";
+        let (text, calls) = tool_calls(a);
+        assert_eq!(text, "Checking.");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].args, vec![("city".to_string(), "Paris".to_string()), ("days".to_string(), "3".to_string()), ("tags".to_string(), "[\"a\"]".to_string())]);
+        assert_eq!(calls[1], ToolCall { name: "now".into(), args: vec![] });
+    }
+
+    #[test]
+    fn dbrx_split_keeps_the_text() {
+        let r = Regex::new(DBRX_SPLIT).unwrap();
+        let t = "It's 12345 km  away!\n\nOK";
+        let parts: Vec<&str> = r.find_iter(t).map(|m| m.unwrap().as_str()).collect();
+        assert_eq!(parts.concat(), t);
+        assert!(parts.contains(&"'s") && parts.contains(&"123") && parts.contains(&"45"));
     }
 
     #[test]

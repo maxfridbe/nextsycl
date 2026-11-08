@@ -1,0 +1,13 @@
+[package]
+name = "nextsycl-llm-ricursive"
+description = "Ricursive Ripple-65B (ricursive: a dense 65B with sliding-window RoPE layers and global NoPE layers, sandwich norms, an output gate and a value residual) - its model description and its engine, layers over two GPUs or streamed from pinned host memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-llm.workspace = true
+nextsycl-tok.workspace = true
+serde_json.workspace = true
