@@ -84,7 +84,23 @@ The truncated models are checked, not the whole 80 layers against the CPU (a 65B
 token; the box has 61 GiB of RAM). The whole-model numbers the model card quotes for the file (mean KLD 0.0136, 95.9%) are
 the maker's; this port did not reproduce them (no whole BF16 model was fetched and no llama.cpp run was made). What the
 whole-model run shows: greedy text is coherent (answers a question, thinks in `<think>`), and the two attention kernels
-agree to KL 0.001. Decoding against the prompt path was not compared (a gap).
+agree to KL 0.001.
+
+### Decode (one-row passes) against the reference, and served
+
+- `llm check` on the 5-layer model (a dump directory made from the reference's tensors) runs the prompt in one pass and then
+  its last token alone after the rest. The prompt pass: every layer cosine 0.999998 or better, the same next token as the
+  reference (89888). The one-row pass against the reference's last row, per layer: cosine 0.9991 (layer 0) to 0.9998 (layer
+  4), rel RMS 4.2% down to 2.1%, and the same result with the shared products (`NS_SILO=0`), the shared attention
+  (`NS_RC_FLASH=0`) or both: that error is the Q8_1 quantization of the activations (the same one llama.cpp's
+  mat-vec products make; the layer outputs are post-normed, so a sub-layer's relative error shows undiluted). With every
+  one-row product through the half GEMM instead (`NS_RC_MMVQ=0`) the one-row pass is as exact as the prompt pass (0.9999994
+  at layer 0). On the whole model the cost is small: 256 teacher-forced tokens after an 8,454-token prompt, perplexity 26.93
+  with the Q8_1 products against 27.00 with the half GEMM, KL 0.00038 (max 0.025), top token the same 99.2%.
+- Served (`nextsycl serve` on a spare port, both cards, behind the GPU lock; 2026-11-08): a chat, then the same chat with a
+  second turn reused 57 of its 74 prompt tokens from the live session; after an unrelated chat took the live session, the
+  second turn again reused 71 of 74 from a saved checkpoint and gave the same text. A tool request returned a parsed
+  `tool_calls` entry (`get_weather {"city":"Paris"}`). tg through the server 10.4-10.9 tok/s.
 
 ## Speed (B65 + B70, `llm generate --ids`, 64 tokens `--ignore-eos`, greedy, 2026-11-08; pp = prompt, tg = generation)
 
@@ -142,6 +158,18 @@ at 32K (a global layer 32,768 x 4,096 B = 0.125 GiB, a sliding ring of 3,072 pos
 sliding = 0.79 GiB, B70 12 global + 44 sliding = 2.04 GiB. So B65 ~14.3 GiB, B70 ~29.9 GiB of 31.9 (1.5 GiB kept free:
 the engine refuses a session that would not leave it). Host memory: none in the two-card plan beyond the staging of the
 load. `vram_gib` in the card is 29.9, the B70's.
+
+## Reproduce
+
+```
+python3 -I reference/ricursive-65b/fetch_tensors.py --revision REV --layers 3 --out DIR      # BF16 tensors by range, 6.4 GB
+python3 -I reference/ricursive-65b/ripple_ref.py (--st DIR | --gguf FILE) --layers 3 --ids IDS --out REF
+NS_RC_LAYERS=3 NS_RC_DUMP=OUT nextsycl llm generate FILE --ids IDS --max 1 --gpu 0
+python3 -I reference/ricursive-65b/compare.py --ref REF --run OUT
+```
+
+`NS_RC_PROFILE=1` prints the time by operation; `NS_RC_FLASH=0`, `NS_RC_MMVQ=0`, `NS_SILO=0` are the A/B switches. The BF16
+download of this port's checks was deleted afterwards (`fetch_tensors.py` makes it again).
 
 ## Known, open
 
