@@ -17,6 +17,8 @@ pub const BF16: c_int = 2;
 pub struct Api {
     pub last_error: unsafe extern "C" fn() -> *const c_char,
     pub open: unsafe extern "C" fn() -> *mut c_void,
+    /// a context around an existing `sycl::queue*` (another engine's GPU: one queue for everything on the card)
+    pub create: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
     pub gpu_count: unsafe extern "C" fn() -> c_int,
     pub gpu_info: unsafe extern "C" fn(c_int, *mut c_char, c_int, *mut u64, *mut c_char, c_int) -> c_int,
     pub open_gpu: unsafe extern "C" fn(c_int) -> *mut c_void,
@@ -183,6 +185,7 @@ impl Api {
         Ok(Api {
             last_error: sym!("nsd_last_error"),
             open: sym!("nsd_open"),
+            create: sym!("nsd_create"),
             gpu_count: sym!("nsd_gpu_count"),
             gpu_info: sym!("nsd_gpu_info"),
             open_gpu: sym!("nsd_open_gpu"),

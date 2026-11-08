@@ -110,14 +110,14 @@ pub struct Block {
 
 const LINEARS: [&str; 4] = ["attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"];
 
-pub(crate) fn small(dev: &Arc<Device>, ck: &Checkpoint, name: &str) -> Result<Tensor> {
+pub fn small(dev: &Arc<Device>, ck: &Checkpoint, name: &str) -> Result<Tensor> {
     let e = ck.get(name)?;
     let v = bytes_to_f32(&ck.read(name)?, e.dtype)?;
     let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
     Tensor::from_bytes(dev, DType::F32, &[v.len()], &bytes)
 }
 
-pub(crate) fn host(ck: &Checkpoint, name: &str) -> Result<Vec<f32>> {
+pub fn host(ck: &Checkpoint, name: &str) -> Result<Vec<f32>> {
     bytes_to_f32(&ck.read(name)?, ck.get(name)?.dtype)
 }
 
@@ -278,6 +278,10 @@ pub(crate) fn side(lora: Option<&crate::lora::BlockLora>, j: usize, x: &Tensor, 
 /// Called after each stage of a block with the stage's name and its result: how a run is checked against a reference.
 pub type Tap<'a> = &'a mut dyn FnMut(&str, &Tensor) -> Result<()>;
 
+/// Another engine's attention for the blocks (a silo's: q, k, v rows of the qkv buffer -> out), used where it returns
+/// true; false (or none set) leaves a call to the shared kernels
+pub type AttentionFn = Box<dyn Fn(Rows, Rows, Rows, &Tensor) -> Result<bool> + Send + Sync>;
+
 /// The block stack.
 pub struct Blocks {
     pub cfg: Config,
@@ -287,6 +291,8 @@ pub struct Blocks {
     /// the k-quant form's (`None` for int8): which, and the bfloat16 buffer each matrix is expanded into
     pub kquant: Option<GType>,
     wbuf: Option<Tensor>,
+    /// the attention the blocks call, when an engine brings its own (P-H3-Image's silo); else the shared kernels'
+    pub attention: Option<AttentionFn>,
 }
 
 impl Blocks {
@@ -319,7 +325,7 @@ impl Blocks {
             }
             None => None,
         };
-        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf })
+        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf, attention: None })
     }
 
     /// `out = linear(x)` with one of the blocks' matrices.
@@ -353,7 +359,9 @@ impl Blocks {
         ops::rms_rope(part(0), &b.q_norm, cfg.qk_eps, &step.cs, cfg.rot_dim)?;
         ops::rms_rope(part(1), &b.k_norm, cfg.qk_eps, &step.cs, cfg.rot_dim)?;
         tap("qkv_rotated", &s.qkv)?;
-        ops::attention(part(0), part(1), part(2), &s.att)?;
+        if !self.attention.as_ref().map_or(Ok(false), |f| f(part(0), part(1), part(2), &s.att))? {
+            ops::attention(part(0), part(1), part(2), &s.att)?;
+        }
         tap("att", &s.att)?;
         self.mm(&b.out_proj, &s.att, &s.proj)?;
         side(lora, 1, &s.att, &s.proj, &s.lora)?;

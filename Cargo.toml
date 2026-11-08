@@ -6,11 +6,11 @@ resolver = "2"
 exclude = ["vendor/rpcgen"]
 members = [
     "crates/scheduler", "crates/sys", "crates/core", "crates/gguf", "crates/tok", "crates/diffusion", "crates/qwen3vl",
-    "crates/mesh", "crates/remover", "crates/codec12hz",
+    "crates/mesh", "crates/remover", "crates/codec12hz", "crates/h3",
     "model3d/contract",
     "model3d/example", "model3d/hunyuan3d", "model3d/animateanymesh", "model3d/unirig", "model3d/skintokens", "model3d/rignet", "model3d/trellis2", "model3d/unimate",
     "llm/contract", "llm/glm5next", "llm/qwen4exp", "llm/qwen35", "llm/deepseek2", "llm/deepseek4", "llm/deepseek41", "llm/museglimmer", "llm/nemotronh", "llm/minimaxm3", "llm/example",
-    "image/contract", "image/example", "image/qwenimage21", "image/unlimitedocr", "image/paddleocrvl", "image/olmocr2", "image/hunyuanimage21", "image/starvector", "image/upscale", "image/mingimage", "image/mossimage", "image/seedvr2", "image/flashvsr", "image/rembg",
+    "image/contract", "image/example", "image/qwenimage21", "image/unlimitedocr", "image/paddleocrvl", "image/olmocr2", "image/hunyuanimage21", "image/starvector", "image/upscale", "image/mingimage", "image/mossimage", "image/seedvr2", "image/flashvsr", "image/rembg", "image/ph3image",
     "video/contract", "video/example", "video/h3",
     "audio/contract", "audio/example", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2", "audio/vibevoice",
     "audio/s2pro", "audio/voxtraltts", "audio/whisper", "audio/acestep", "audio/yue2",
@@ -34,6 +34,7 @@ nextsycl-qwen3vl = { path = "crates/qwen3vl" }
 nextsycl-mesh = { path = "crates/mesh" }
 nextsycl-remover = { path = "crates/remover" }
 nextsycl-codec12hz = { path = "crates/codec12hz" }
+nextsycl-h3 = { path = "crates/h3" }
 nextsycl-llm = { path = "llm/contract" }
 nextsycl-llm-glm5next = { path = "llm/glm5next" }
 nextsycl-llm-qwen4exp = { path = "llm/qwen4exp" }
@@ -59,6 +60,7 @@ nextsycl-image-mingimage = { path = "image/mingimage" }
 nextsycl-image-mossimage = { path = "image/mossimage" }
 nextsycl-image-seedvr2 = { path = "image/seedvr2" }
 nextsycl-image-flashvsr = { path = "image/flashvsr" }
+nextsycl-image-ph3image = { path = "image/ph3image" }
 nextsycl-video = { path = "video/contract" }
 nextsycl-video-example = { path = "video/example" }
 nextsycl-video-h3 = { path = "video/h3" }

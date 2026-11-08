@@ -1,0 +1,14 @@
+[package]
+name = "nextsycl-image-ph3image"
+description = "P-H3-Image (PrunaAI): MiniMax H3's denoiser on one latent frame - text to image and edits with up to 8 pictures in 8 steps, a Qwen3-VL-4B text encoder and a transformer VAE decoder; Rust and SYCL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-image.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-h3.workspace = true
+nextsycl-qwen3vl.workspace = true

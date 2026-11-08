@@ -261,6 +261,32 @@ impl VideoEncoder {
         Ok((z, keep_t))
     }
 
+    /// One picture (H, W multiples of 16; RGB [H, W, 3] in [0, 1]) -> the 48 moments after the 1x1x1 convolution,
+    /// not normalized: [48, H/16, W/16], the posterior's mean (the first 24) and log-variance (the last 24) - what
+    /// P-H3-Image samples an edit's conditioning from.
+    pub fn moments_of_picture(&self, px: &[f32], h: usize, w: usize, tick: &mut dyn FnMut() -> Result<()>) -> Result<Vec<f32>> {
+        if !h.is_multiple_of(RATIO) || !w.is_multiple_of(RATIO) || px.len() != h * w * 3 {
+            return Err(Error(format!("moments: {} values for a {w}x{h} picture (multiples of 16)", px.len())));
+        }
+        let norm: Vec<f32> = px.iter().enumerate().map(|(i, v)| (v - IMAGENET_MEAN[i % 3]) / IMAGENET_STD[i % 3]).collect();
+        let (all, t) = self.tiled(&norm, 1, h, w, tick)?;
+        let n = (h / RATIO) * (w / RATIO);
+        let last = &all[(t - 1) * n * 48..t * n * 48];
+        let mut z = vec![0f32; 48 * n];
+        for i in 0..n {
+            let m = &last[i * 48..][..48];
+            for o in 0..48 {
+                z[o * n + i] = self.quant_b[o] + self.quant_w[o * 48..(o + 1) * 48].iter().zip(m).map(|(a, b)| a * b).sum::<f32>();
+            }
+        }
+        Ok(z)
+    }
+
+    /// The latent statistics the conditioning is normalized by: (mean, std), 24 each
+    pub fn latent_stats(&self) -> (&[f32], &[f32]) {
+        (&self.mean, &self.std)
+    }
+
     /// One temporal clip through spatial tiles of 256 px, cross-faded in latent space: [t', lh, lw, 48].
     fn tiled(&self, clip: &[f32], t: usize, h: usize, w: usize, tick: &mut dyn FnMut() -> Result<()>) -> Result<(Vec<f32>, usize)> {
         let (ys, yo) = split_tiles(h);

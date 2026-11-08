@@ -33,6 +33,7 @@ nextsycl-image-mingimage.workspace = true
 nextsycl-image-mossimage.workspace = true
 nextsycl-image-seedvr2.workspace = true
 nextsycl-image-flashvsr.workspace = true
+nextsycl-image-ph3image.workspace = true
 nextsycl-image-upscale.workspace = true
 nextsycl-image-rembg.workspace = true
 nextsycl-image-starvector.workspace = true

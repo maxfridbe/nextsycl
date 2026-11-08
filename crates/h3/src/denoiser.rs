@@ -349,6 +349,10 @@ pub struct Conditions {
     pub seed: u64,
     /// the references (ref2va), in the order the prompt presents them
     pub refs: Vec<RefIn>,
+    /// the references' picture latents come mixed with their noise already (`visual_aug * latent + (1 - visual_aug) *
+    /// noise`, the caller's draw: P-H3-Image takes it from the request's generator, before the image's own noise);
+    /// they are still presented at max(t, visual_aug)
+    pub premixed: bool,
 }
 
 /// A reference's normalized latents
@@ -380,6 +384,7 @@ impl Default for Conditions {
             audio_aug: crate::layout::AUDIO_COND_TIMESTEP as f32,
             seed: 0,
             refs: Vec::new(),
+            premixed: false,
         }
     }
 }
@@ -481,7 +486,8 @@ impl<'a> Denoiser<'a> {
                 if v.len() != outer.video_c * t * h * w {
                     return Err(Error(format!("a reference of {} values for {} x {t} x {h} x {w}", v.len(), outer.video_c)));
                 }
-                Ok((s.start, embed(aug(patchify(v, outer.video_c, t, h, w), cond.visual_aug, cond.seed), &outer.video_patch)?))
+                let rows = patchify(v, outer.video_c, t, h, w);
+                Ok((s.start, embed(if cond.premixed { rows } else { aug(rows, cond.visual_aug, cond.seed) }, &outer.video_patch)?))
             };
             for r in &cond.refs {
                 let mut next = || segs.next().ok_or_else(|| Error("reference rows missing from the layout".into()));

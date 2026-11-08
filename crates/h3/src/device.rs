@@ -65,6 +65,21 @@ impl Device {
         Ok(Arc::new(Device { api, ctx, index }))
     }
 
+    /// A context on GPU `index` around an existing in-order `sycl::queue*` (nextsycl-core's GPU: its queue), so this
+    /// engine's work, the core's and a silo's are ordered on the one queue.
+    ///
+    /// # Safety
+    /// `queue` is a live `sycl::queue*` of GPU `index` that outlives the context (its owner is held beside it).
+    pub unsafe fn on_queue(queue: *mut c_void, index: usize) -> Result<Arc<Device>> {
+        let api = Api::load()?;
+        // SAFETY: the caller's queue outlives the context (the core's GPU is held beside it); NULL is the failure.
+        let ctx = unsafe { (api.create)(queue) };
+        if ctx.is_null() {
+            return Err(Error(format!("GPU {index}: {}", api.error())));
+        }
+        Ok(Arc::new(Device { api, ctx, index }))
+    }
+
     /// Opens the first GPU.
     pub fn open() -> Result<Arc<Device>> {
         let api = Api::load()?;

@@ -6,13 +6,15 @@ use std::path::{Path, PathBuf};
 
 use crate::{Ctx, Error, Result};
 
-/// A tensor's element type, by llama.cpp's numbering (the ones the MiniMax H3 files use).
+/// A tensor's element type, by llama.cpp's numbering (the ones the MiniMax H3 files use; Q8_0 and Q5_K: P-H3-Image's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GType {
     F32,
     F16,
     BF16,
+    Q8_0,
     Q4K,
+    Q5K,
     Q6K,
 }
 
@@ -22,7 +24,9 @@ impl GType {
             0 => GType::F32,
             1 => GType::F16,
             30 => GType::BF16,
+            8 => GType::Q8_0,
             12 => GType::Q4K,
+            13 => GType::Q5K,
             14 => GType::Q6K,
             other => return Err(Error(format!("GGUF tensor type {other} is not supported"))),
         })
@@ -31,7 +35,9 @@ impl GType {
     /// The library's code for `h3s_dequant`.
     pub fn quant_code(self) -> Option<i32> {
         match self {
+            GType::Q8_0 => Some(8),
             GType::Q4K => Some(12),
+            GType::Q5K => Some(13),
             GType::Q6K => Some(14),
             _ => None,
         }
@@ -42,7 +48,9 @@ impl GType {
         match self {
             GType::F32 => n * 4,
             GType::F16 | GType::BF16 => n * 2,
+            GType::Q8_0 => n / 32 * 34,
             GType::Q4K => n / 256 * 144,
+            GType::Q5K => n / 256 * 176,
             GType::Q6K => n / 256 * 210,
         }
     }

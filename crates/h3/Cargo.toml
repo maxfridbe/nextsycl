@@ -1,0 +1,15 @@
+[package]
+name = "nextsycl-h3"
+description = "MiniMax H3's engine on Intel Arc (SYCL): the device, checkpoints, the denoiser, the sampler, the encoders, decoders and jobs - run by the video engine (H3) and the image engine (P-H3-Image)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-qwen3vl.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
+serde_json.workspace = true
+unicode-normalization = "0.1"
