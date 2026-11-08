@@ -1,0 +1,49 @@
+# Z-Image-Turbo (text to image in 8 steps: photographs, English and Chinese text; Rust + SYCL)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets.
+# The files are the official weights to the bit: unsloth's BF16 GGUF of the DiT (ComfyUI's layout; its 521 tensors
+# equal Tongyi-MAI's float32 shards, whose every value is a bfloat16), ComfyUI's single-file Qwen3-4B (its 398
+# tensors equal the official text encoder's shards), and the official VAE and tokenizer (Tongyi-MAI/Z-Image-Turbo @
+# f332072a). docs/ports/z-image-turbo.md has the check.
+id: z-image-turbo
+kind: image
+arch: z-image
+license: apache-2.0
+commercial: true
+license_note: 'Apache-2.0 for the weights (Tongyi-MAI/Z-Image-Turbo) and the text encoder (Qwen3-4B); the GGUF and the single-file text encoder are repackings of them (unsloth, Comfy-Org), the VAE is the Flux.1 VAE as the model repository ships it'
+title: 'Z-Image-Turbo (text to image in 8 steps: photographs, English and Chinese text; Rust + SYCL)'
+about: 'Tongyi-MAI''s Z-Image-Turbo: a 6B single-stream DiT distilled to 8 steps without guidance, conditioned by Qwen3-4B''s hidden states, the Flux.1 VAE; BF16 (the official weights exactly), all on one card'
+gpus: '0'
+vram_gib: 23.0
+defaults:
+  steps: 8
+  cfg: 1.0
+  sampler: euler
+  schedule: shift
+  size: 1024x1024
+env: {}
+files:
+  transformer:
+    key: z-image-turbo-bf16
+    url: https://huggingface.co/unsloth/Z-Image-Turbo-GGUF/resolve/b40f712c569ecfff42f2307dcc43399ae1d71318/z-image-turbo-BF16.gguf
+    size: 12311939136
+    sha256: 9ccc4fb8b84519b8aa201abcffd900d19ee146b409ae9897625d235b104ef9c5
+    path: z-image-turbo/z-image-turbo-BF16.gguf
+  text-encoder:
+    key: z-image-turbo-qwen3-4b
+    url: https://huggingface.co/Comfy-Org/z_image_turbo/resolve/6fc90a3b1b653e935a0d175e260736de25b84df5/split_files/text_encoders/qwen_3_4b.safetensors
+    size: 8044982048
+    sha256: 6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a
+    path: z-image-turbo/qwen_3_4b.safetensors
+  vae:
+    key: z-image-turbo-vae
+    url: https://huggingface.co/Tongyi-MAI/Z-Image-Turbo/resolve/f332072aa78be7aecdf3ee76d5c247082da564a6/vae/diffusion_pytorch_model.safetensors
+    size: 167666902
+    sha256: f5b59a26851551b67ae1fe58d32e76486e1e812def4696a4bea97f16604d40a3
+    path: z-image-turbo/z_image_turbo_vae.safetensors
+  tokenizer:
+    key: z-image-turbo-tokenizer
+    url: https://huggingface.co/Tongyi-MAI/Z-Image-Turbo/resolve/f332072aa78be7aecdf3ee76d5c247082da564a6/tokenizer/tokenizer.json
+    size: 11422654
+    sha256: aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
+    path: z-image-turbo/tokenizer.json
+guide: guides/z-image-turbo.md

@@ -1,0 +1,13 @@
+[package]
+name = "nextsycl-image-zimage"
+description = "Z-Image-Turbo (Tongyi-MAI): 6B single-stream DiT text to image in 8 steps, Qwen3-4B text encoder, Flux VAE; Rust and SYCL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-image.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
