@@ -365,7 +365,7 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | `NS_MM31_DRAFTS` | 1 | Tokens drafted a step (at most 6 and the drafter's block) | llm:minimaxm3 |
 | `NS_MM31_DRAFT_SILU` | 0 | 1 = the drafter's feed-forward as plain SiLU (llama.cpp's checkout), not its metadata's swigluoai | llm:minimaxm3 |
 | `NS_MM31_DRAFT_PMIN` | 0 | Drafts stop at the first the DSpark confidence head rates below this | llm:minimaxm3 |
-| `NS_MM31_DRAFT_BACKOFF` | 1 | N: after N DSpark drafter passes in a row that draft nothing, the next 1, 3, 7, then 15 steps go without one, until a pass drafts again; `0`: a drafter pass every step | llm:minimaxm3 |
+| `NS_MM31_DRAFT_BACKOFF` | 2 | N: after N DSpark drafter passes in a row that draft nothing, the next 1, 3, 7, then 15 steps go without one, until a pass drafts again; `0`: a drafter pass every step | llm:minimaxm3 |
 | `NS_MM31_KCOPY` | 1 | 0 = the experts' tables through the runtime's memcpy, not a kernel from a pinned ring | llm:minimaxm3 |
 | `NS_MM31_CACHE_GIB` | unset | At most this many GiB of next-ranked experts read once into the page cache at load (0: none; default: what the margin allows) | llm:minimaxm3 |
 | `NS_MM31_CACHE_MARGIN_GIB` | 4 | MemAvailable the warm tier leaves | llm:minimaxm3 |

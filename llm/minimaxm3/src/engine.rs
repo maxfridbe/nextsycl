@@ -931,10 +931,10 @@ fn piece_copy() -> bool {
     *N.get_or_init(|| std::env::var("NS_MM31_PIECE_COPY").map_or(true, |v| v != "0"))
 }
 
-/// NS_MM31_DRAFT_BACKOFF=N: the drafter backs off after N passes in a row that drafted nothing (default 1); 0: a drafter pass every step
+/// NS_MM31_DRAFT_BACKOFF=N: the drafter backs off after N passes in a row that drafted nothing (default 2: after 1, code lost the drafts of single quiet steps); 0: a drafter pass every step
 fn draft_backoff() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("NS_MM31_DRAFT_BACKOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
+    *N.get_or_init(|| std::env::var("NS_MM31_DRAFT_BACKOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
 }
 
 /// NS_MM31_DRAFTS: tokens drafted a step (default 1; at most the block)
@@ -3860,7 +3860,7 @@ impl<'g> MiniMax<'g> {
             }
             (None, Some(x)) => {
                 // a drafter pass costs ~9 ms whether its confidence head lets a draft through or not: after NS_MM31_DRAFT_BACKOFF passes in a row that
-                // drafted nothing (default 1; 0: a pass every step) the next 1, 3, 7, 15 steps go without one; a pass that drafts ends the backoff
+                // drafted nothing (default 2; 0: a pass every step) the next 1, 3, 7, 15 steps go without one; a pass that drafts ends the backoff
                 let drafts = if d.idle > 0 {
                     d.idle -= 1;
                     Vec::new()
