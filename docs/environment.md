@@ -357,6 +357,8 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | `NS_MM31_ATTX` | 1 | 0 = a prompt pass's attention on the silo's vector-unit kernel, not its XMX one (half queries) | llm:minimaxm3 |
 | `NS_MM31_KBENCH` | 0 | Debug: 1 = at the first session, each decode kernel timed alone on real weights on each card (GB/s) | llm:minimaxm3 |
 | `NS_MM31_BELL` | 1 | 0 = one token's router result comes back by a blocking read, not through a doorbell in pinned memory with the shared expert queued behind it | llm:minimaxm3 |
+| `NS_MM31_CPU_EXPERTS` | 0 | N > 0: a one-token pass's experts in pinned host memory are multiplied on N host threads (AVX-512; IQ1_M / IQ2_XXS gate and up with IQ3_XXS down) while the card runs the rest, not copied to the card first (a promotion still copies them into VRAM for their next use) | llm:minimaxm3 |
+| `NS_MM31_PIECE_COPY` | on | `0`: a file-read expert of a decode pass is copied to VRAM when all its pieces are in. By default each piece is copied as it lands, so the card waits for the last piece's copy rather than the whole read and then the copy | llm:minimaxm3 |
 | `NS_MM31_ORDER` | unset | `asis` = two cards in the order `--gpu` gives; by default the B65 takes the first layers and the B70 the rest and the head | llm:minimaxm3 |
 | `NS_MM31_SPARE_GIB` | 1.9 | VRAM per card the minimaxm3 engine leaves free besides its arena and session caches when it sizes the experts (at least 1.6) | llm:minimaxm3 |
 | `NS_MM31_EXTRA` | 1 | 0 = the prompt passes' scratch stays allocated in decode, not freed and given to expert places | llm:minimaxm3 |
@@ -364,6 +366,7 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | `NS_MM31_DRAFTS` | 1 | Tokens drafted a step (at most 6 and the drafter's block) | llm:minimaxm3 |
 | `NS_MM31_DRAFT_SILU` | 0 | 1 = the drafter's feed-forward as plain SiLU (llama.cpp's checkout), not its metadata's swigluoai | llm:minimaxm3 |
 | `NS_MM31_DRAFT_PMIN` | 0 | Drafts stop at the first the DSpark confidence head rates below this | llm:minimaxm3 |
+| `NS_MM31_DRAFT_BACKOFF` | 1 | N: after N DSpark drafter passes in a row that draft nothing, the next 1, 3, 7, then 15 steps go without one, until a pass drafts again; `0`: a drafter pass every step | llm:minimaxm3 |
 | `NS_MM31_KCOPY` | 1 | 0 = the experts' tables through the runtime's memcpy, not a kernel from a pinned ring | llm:minimaxm3 |
 | `NS_MM31_CACHE_GIB` | unset | At most this many GiB of next-ranked experts read once into the page cache at load (0: none; default: what the margin allows) | llm:minimaxm3 |
 | `NS_MM31_CACHE_MARGIN_GIB` | 4 | MemAvailable the warm tier leaves | llm:minimaxm3 |
