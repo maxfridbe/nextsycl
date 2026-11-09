@@ -562,6 +562,45 @@ void iq4nl(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int
         default: launch_iq4nl<8>(q, w, x, y, n_in, n_out); return;
     }
 }
+// ---- Q8_0 with few rows or a narrow input (DeltaNet's alpha / beta, 48 x 5,120; the DSpine draft's k / v / o): the decode
+// kernels' grids are too small for these (35 us for 250 KB). A sub-group a row, its lanes taking the blocks of 32 in turn,
+// 4 rows a work-group; each lane keeps the sums of all its columns, the sub-group adds them.
+template <int NCOLS>
+void q80_small_kernel(const uint8_t* __restrict__ w, const int8_t* __restrict__ x, float* __restrict__ y, int n_in, int n_out, const sycl::nd_item<1>& item) {
+    auto sg = item.get_sub_group();
+    const int lane = (int) sg.get_local_linear_id();
+    const int64_t row = (int64_t) item.get_group(0) * 4 + (int) sg.get_group_linear_id();
+    if (row >= n_out) return;
+    const int nb = n_in / 32;
+    const uint8_t* wr = w + row * (int64_t) nb * 34;
+    XA xa[NCOLS];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) xa[j] = xcol(x, n_in, NCOLS, j);
+    float acc[NCOLS] = {};
+    for (int b = lane; b < nb; b += 32) {
+        const uint8_t* p = wr + (int64_t) b * 34;
+        const float d = (float) *reinterpret_cast<const sycl::half*>(p);
+        const sycl::int4 lo = load16_a2(p + 2), hi = load16_a2(p + 18);
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) acc[j] += d * xa[j].dd(b) * (float) dp4a4(hi, xa[j].q16(b, 1), dp4a4(lo, xa[j].q16(b, 0), 0));
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        float v = acc[j];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+        if (lane == 0) y[(int64_t) j * n_out + row] = v;
+    }
+}
+template <int NCOLS>
+void launch_q80_small(sycl::queue& q, const void* w, const void* xs, float* y, int n_in, int n_out) {
+    const auto* wp = static_cast<const uint8_t*>(w);
+    const auto* x = static_cast<const int8_t*>(xs);
+    const size_t groups = ((size_t) n_out + 3) / 4;
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * 128), sycl::range<1>(128)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+        q80_small_kernel<NCOLS>(wp, x, y, n_in, n_out, it);
+    });
+}
 }  // namespace
 
 extern "C" {
@@ -630,6 +669,24 @@ int ns_q35_quantize_q8(ns_gpu* g, const float* x, void* q8_1, void* xs, int64_t 
 
 size_t ns_q35_q8_split_bytes(int64_t n_in, int64_t ncols) { return split_base(n_in, ncols) + xmx_tail_bytes(n_in); }
 
+int ns_q35_q80_small(ns_gpu* g, const void* w, const void* x_split, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
+    NS_TRY
+    const int ni = (int) n_in, no = (int) n_out;
+    switch (ncols) {
+        case 1: launch_q80_small<1>(g->q, w, x_split, y, ni, no); break;
+        case 2: launch_q80_small<2>(g->q, w, x_split, y, ni, no); break;
+        case 3: launch_q80_small<3>(g->q, w, x_split, y, ni, no); break;
+        case 4: launch_q80_small<4>(g->q, w, x_split, y, ni, no); break;
+        case 5: launch_q80_small<5>(g->q, w, x_split, y, ni, no); break;
+        case 6: launch_q80_small<6>(g->q, w, x_split, y, ni, no); break;
+        case 7: launch_q80_small<7>(g->q, w, x_split, y, ni, no); break;
+        case 8: launch_q80_small<8>(g->q, w, x_split, y, ni, no); break;
+        default: return ns_fail("ns_q35_q80_small: 1..8 columns");
+    }
+    return 0;
+    NS_CATCH
+}
+
 int ns_q35_mmvq_supported(int type, int64_t n_in) {
     switch (type) {
         case 11: case 12: case 13: case 16: case 17: case 18: case 21: case 22: case 23: return n_in % QK == 0;
@@ -686,9 +743,14 @@ int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const vo
     NS_TRY
     if (ncols < 1 || ncols > 8) return ns_fail("ns_q35_mmvq: 1..8 columns");
     // the columns, types and widths XMX covers (xmm.cpp): the DPAS products (NS_Q35_XMX = the fewest columns; 0 off)
+    static const bool check = std::getenv("NS_Q35_XMX_CHECK") != nullptr;
+    if (type == 8 && ns_q35_q80_small_covers(n_in, n_out, ncols)) {
+        const int rc = ns_q35_q80_small(g, w, x_split, y, n_in, n_out, ncols);
+        if (rc == 0 && check) xmx_check(g, type, w, x_q8_1, x_split, y, n_in, n_out, ncols);
+        return rc;
+    }
     if (ns_q35_xmx_covers(type, n_in, n_out, ncols)) {
         const int rc = ns_q35_xmx_mmvq(g, type, w, x_split, y, n_in, n_out, ncols);
-        static const bool check = std::getenv("NS_Q35_XMX_CHECK") != nullptr;
         if (rc == 0 && check) xmx_check(g, type, w, x_q8_1, x_split, y, n_in, n_out, ncols);
         return rc;
     }

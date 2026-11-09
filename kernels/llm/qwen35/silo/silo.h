@@ -32,6 +32,8 @@ int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const vo
 int ns_q35_xmx_min_cols(void);
 int ns_q35_xmx_supported(int type, int64_t n_in, int64_t n_out);
 int ns_q35_xmx_covers(int type, int64_t n_in, int64_t n_out, int64_t ncols);
+int ns_q35_q80_small_covers(int64_t n_in, int64_t n_out, int64_t ncols);
+int ns_q35_q80_small(ns_gpu* g, const void* w, const void* x_split, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 int ns_q35_xmx_prep(ns_gpu* g, const void* xs, int64_t n_in, int64_t ncols, int halves);
 int ns_q35_xmx_mmvq(ns_gpu* g, int type, const void* w, const void* xs, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 

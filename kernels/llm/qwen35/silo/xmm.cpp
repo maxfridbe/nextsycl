@@ -323,7 +323,7 @@ template <int TY>
 void xmx_shape(int shape, sycl::queue& q, const uint8_t* w, const int8_t* xa, const float* ts, const float* tm, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
     // sub-groups a work-group (they split a tile's K) and groups of 64 weights a step. By default 8 and 1 where there are 512 or
     // more 16-row tiles (B70, Q4_K: 10,240 rows 64 us, 17,408 rows 122 us), else 4 and 1 (5,120 rows: down 105 us against 135)
-    if (shape == 0) shape = (n_out + 15) / 16 >= 512 ? 10 : 9;
+    if (shape == 0) shape = n_in < 8192 && n_out < 8192 ? 4 : (n_out + 15) / 16 >= 512 ? 10 : 9;
     switch (shape) {
         case 1: xmx_mmvq<TY, 4, 2>(q, w, xa, ts, tm, y, n_in, n_out, ncols); break;
         case 3: xmx_mmvq<TY, 8, 4>(q, w, xa, ts, tm, y, n_in, n_out, ncols); break;
@@ -396,8 +396,13 @@ int ns_q35_xmx_supported(int type, int64_t n_in, int64_t n_out) {
     if (type == Q80) return q80 && n_in % 64 == 0;
     return (type == Q4K || type == Q5K || type == IQ4XS || (type == Q6K && q6)) && n_in % 256 == 0;
 }
+int ns_q35_q80_small_covers(int64_t n_in, int64_t n_out, int64_t ncols) {
+    static const int on = env_int("NS_Q35_Q80_SMALL", 1);
+    return on && ns_q35_xmx_min_cols() > 0 && ncols >= ns_q35_xmx_min_cols() && ncols <= 8 && n_in % 32 == 0 && (n_out < 2048 || n_in < 4096);
+}
 int ns_q35_xmx_covers(int type, int64_t n_in, int64_t n_out, int64_t ncols) {
-    return ns_q35_xmx_min_cols() > 0 && ncols >= ns_q35_xmx_min_cols() && ncols <= 8 && ns_q35_xmx_supported(type, n_in, n_out);
+    if (ns_q35_xmx_min_cols() <= 0 || ncols < ns_q35_xmx_min_cols() || ncols > 8) return 0;
+    return ns_q35_xmx_supported(type, n_in, n_out) || (type == Q80 && ns_q35_q80_small_covers(n_in, n_out, ncols));
 }
 
 int ns_q35_xmx_mmvq(ns_gpu* g, int type, const void* w, const void* xs, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
@@ -413,7 +418,7 @@ int ns_q35_xmx_mmvq(ns_gpu* g, int type, const void* w, const void* xs, float* y
     if (type == Q6K) {
         const int8_t* xb = reinterpret_cast<const int8_t*>(tm + (n_in / 32) * 8);
         static const int sh6 = env_int("NS_Q35_XMX_SHAPE6", 0);
-        const int sk = sh6 ? sh6 : (n_out + 15) / 16 >= 512 ? 8 : 4;
+        const int sk = sh6 ? sh6 : n_in < 8192 && n_out < 8192 ? 6 : (n_out + 15) / 16 >= 512 ? 8 : 4;
         if (sk == 4) xmx_q6k<4, 1>(g->q, wb, xa, xb, ts, y, n_in, n_out, ncols);
         else if (sk == 5) xmx_q6k<8, 2>(g->q, wb, xa, xb, ts, y, n_in, n_out, ncols);
         else if (sk == 6) xmx_q6k<16, 1>(g->q, wb, xa, xb, ts, y, n_in, n_out, ncols);
