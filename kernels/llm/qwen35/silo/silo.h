@@ -54,6 +54,23 @@ int ns_q35_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t
  * layout; C a multiple of 256 */
 int ns_q35_rms_q8(ns_gpu* g, const float* x, const float* w, float* y, void* q8_1, void* xs, int64_t rows, int64_t C, float eps);
 
+/* The DSpine draft's code bridge and refinement (dspine.cpp; llm/qwen35/src/dspine.rs): row-wise steps over at most 8 rows.
+ * bridge_norm: y = x / (rms + eps), rms[r] = sqrt(max(mean x^2, tiny)) of each row [rows, C].
+ * codes: row 0 = anchor_code (sqrt(C) x the anchor token's codebook row), row r > 0 = sqrt_c x proj / (|proj| + eps).
+ * message: packed [rows, 3R] = (q | s | v) rows: msg[0] = 0, msg[i] = sigmoid(q[i] + s[i-1] + bias) x v[i-1].
+ * write: out[0] = raw[0], out[i] = raw[i] + rms[i] x delta[i]. */
+int ns_q35_dsp_bridge_norm(ns_gpu* g, const float* x, float* y, float* rms, int64_t rows, int64_t C, float eps);
+int ns_q35_dsp_codes(ns_gpu* g, const float* proj, const float* anchor_code, float* codes, int64_t rows, int64_t C, float sqrt_c, float eps);
+int ns_q35_dsp_message(ns_gpu* g, const float* packed, const float* gate_bias, float* msg, int64_t rows, int64_t R);
+int ns_q35_dsp_write(ns_gpu* g, const float* raw, const float* delta, const float* rms, float* out, int64_t rows, int64_t H);
+/* The refinement (n draft rows, K candidates each): base[r][k] = (raw[r] . norm_w) . head row of candidate k (rows_f16
+ * [n][K][H] half); pick: for each (row r, sender k) - the anchor for row 0, else row r - 1's candidate k - the candidate
+ * of row r with the best base + rms[r] x (m . tg), m = sigmoid(q[r] + tsv[sender][:R] + bias) x tsv[sender][R:] (tables
+ * [vocab][2R] and [vocab][R] half): idx[r][k] */
+int ns_q35_dsp_base(ns_gpu* g, const float* raw, const float* norm_w, const void* rows_f16, float* base, int64_t n, int64_t K, int64_t H);
+int ns_q35_dsp_pick(ns_gpu* g, const float* base, const float* rms, const float* q, int64_t qs, const int32_t* cand, int32_t anchor, const void* tsv_f16,
+                    const void* tg_f16, const float* gate_bias, int32_t* idx, int64_t n, int64_t K, int64_t R);
+
 #ifdef __cplusplus
 }
 #endif

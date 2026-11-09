@@ -4,6 +4,7 @@
 //! `kernels/llm/qwen35/`; the products from the stored blocks, the norms, the conv and the delta-rule scan are the
 //! glm5next engine's generic kernels in the same library.
 
+mod dspine;
 mod eagle;
 pub mod engine;
 mod ffi;
@@ -25,8 +26,10 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "mtp", env: "NS_Q35_MTP", value: "FILE", help: "the MTP draft block's GGUF (default: the one in an MTP/ folder beside the model)", at: At::Load },
     EngineOption { name: "vision", env: "NS_Q35_VISION", value: "FILE|0", help: "the vision tower's mmproj GGUF (default: an mmproj*.gguf beside the model; 0: no pictures)", at: At::Load },
     EngineOption { name: "image-tokens", env: "NS_Q35_IMAGE_TOKENS", value: "N", help: "the most prompt positions a picture takes (default 4096; larger pictures are scaled down)", at: At::Load },
-    EngineOption { name: "drafts", env: "NS_Q35_DRAFTS", value: "N", help: "tokens drafted a step with MTP or EAGLE-4 (default 3, at most 7; 0: none)", at: At::Load },
+    EngineOption { name: "drafts", env: "NS_Q35_DRAFTS", value: "N", help: "tokens drafted a step with MTP, EAGLE-4 or DSpine (default 3, at most 7; 0: none)", at: At::Load },
     EngineOption { name: "eagle", env: "NS_Q35_EAGLE", value: "DIR|auto", help: "the EAGLE-4 draft's folder (config.json, model.safetensors), or auto: an eagle4/ folder beside the model (default: none). One GPU; in MTP's place", at: At::Load },
+    EngineOption { name: "dspine", env: "NS_Q35_DSPINE", value: "DIR|auto", help: "the DSpine draft's folder (config.json, model.safetensors: Qwen3.8-27B-DSpine-b16), or auto: a dspine/ folder beside the model (default: none). One GPU; in MTP's place", at: At::Load },
+    EngineOption { name: "dspine-ctx", env: "NS_Q35_DSPINE_CTX", value: "TOKENS", help: "positions the DSpine draft's cache holds (default 32768, 20 KiB each); no drafts past them", at: At::Load },
     EngineOption { name: "eagle-ctx", env: "NS_Q35_EAGLE_CTX", value: "TOKENS", help: "positions the EAGLE-4 draft's cache holds (default 32768, 20 KiB each); no drafts past them", at: At::Load },
 ];
 
@@ -123,9 +126,10 @@ impl Engine for engine::Qwen35<'_> {
         } else {
             format!("{}-kv{}", self.kv_tys.iter().map(|t| t.name()).collect::<Vec<_>>().join(","), if self.kv_rotated() { " rot" } else { "" })
         };
-        let draft = match (self.has_draft(), self.drafts_with_eagle()) {
-            (true, true) => " eagle4",
-            (true, false) => " mtp",
+        let draft = match (self.has_draft(), self.drafts_with_eagle(), self.drafts_with_dspine()) {
+            (true, _, true) => " dspine",
+            (true, true, _) => " eagle4",
+            (true, false, _) => " mtp",
             _ => "",
         };
         format!("qwen35 {kv} nsq35-1{draft}")

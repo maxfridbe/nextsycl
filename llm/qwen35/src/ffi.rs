@@ -161,6 +161,18 @@ pub struct Silo {
     pub dequant_f16_supported: unsafe extern "C" fn(c_int) -> c_int,
     pub dequant_f16: unsafe extern "C" fn(G, c_int, P, i64, *mut u16) -> c_int,
     pub rms_q8: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, M, M, i64, i64, f32) -> c_int,
+    /// the DSpine draft's kernels (silo/dspine.cpp); None: a silo built before them
+    pub dsp: Option<Dsp>,
+}
+
+/// The DSpine draft's code bridge and refinement kernels (silo.h: ns_q35_dsp_*)
+pub struct Dsp {
+    pub bridge_norm: unsafe extern "C" fn(G, *const f32, *mut f32, *mut f32, i64, i64, f32) -> c_int,
+    pub codes: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, i64, i64, f32, f32) -> c_int,
+    pub message: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, i64, i64) -> c_int,
+    pub write: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, i64, i64) -> c_int,
+    pub base: unsafe extern "C" fn(G, *const f32, *const f32, P, *mut f32, i64, i64, i64) -> c_int,
+    pub pick: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, i64, *const i32, i32, P, P, *const f32, *mut i32, i64, i64, i64) -> c_int,
 }
 
 /// The silo (None: the shared kernels for everything)
@@ -195,6 +207,18 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             dequant_f16_supported: sym!("ns_q35_dequant_f16_supported"),
             dequant_f16: sym!("ns_q35_dequant_f16"),
             rms_q8: sym!("ns_q35_rms_q8"),
+            dsp: if lib.symbol("ns_q35_dsp_pick").is_null() {
+                None
+            } else {
+                Some(Dsp {
+                    bridge_norm: sym!("ns_q35_dsp_bridge_norm"),
+                    codes: sym!("ns_q35_dsp_codes"),
+                    message: sym!("ns_q35_dsp_message"),
+                    write: sym!("ns_q35_dsp_write"),
+                    base: sym!("ns_q35_dsp_base"),
+                    pick: sym!("ns_q35_dsp_pick"),
+                })
+            },
         }))
     })
     .as_ref()
