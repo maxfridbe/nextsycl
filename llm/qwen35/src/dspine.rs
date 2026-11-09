@@ -155,9 +155,60 @@ pub fn path(model: &Path) -> Option<PathBuf> {
     }
 }
 
-/// NS_Q35_DSPINE_CTX: the draft cache's positions (default 32768; a position takes 20 KiB: five layers' keys and values)
-pub fn ctx_setting() -> usize {
-    std::env::var("NS_Q35_DSPINE_CTX").ok().and_then(|v| v.parse().ok()).filter(|v| *v >= 256).unwrap_or(32768)
+/// The most rows a verify pass (and so a draft block) holds: the ring's slack
+pub const RING_SLACK: usize = 8;
+
+/// A span of rows for the ring cache: `n` rows from row `row` of the source go to slots `slot`.. of every head's cache
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub row: usize,
+    pub slot: usize,
+    pub n: usize,
+}
+
+/// The draft's context k / v cache as a ring of the attention window. Position p lives in slot `p % r`, r = window + 8 (the
+/// slack a verify pass's rows overwrite and a rollback needs: rows p0.. overwrite the positions p0 - r.., all before the first
+/// key any rolled-back position still reads). The attention kernel reads a contiguous run of keys, so the ring is mirrored:
+/// slot s is also stored at s + r, and the `slots` = 2 r allocated per head let every window (r - 1 + 8 keys at most, from a slot
+/// below r) read straight through the wrap. Rotary is applied before the store, at the absolute position. A session shorter
+/// than the window (+ slack) never wraps: one flat cache (r = slots = max_ctx), as before
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ring {
+    pub r: usize,
+    pub slots: usize,
+    pub mirrored: bool,
+}
+
+impl Ring {
+    pub fn new(window: usize, max_ctx: usize) -> Ring {
+        if window == 0 || max_ctx <= window + RING_SLACK {
+            Ring { r: max_ctx.max(1), slots: max_ctx.max(1), mirrored: false }
+        } else {
+            let r = window + RING_SLACK;
+            Ring { r, slots: 2 * r, mirrored: true }
+        }
+    }
+
+    /// Where `n` rows of positions p.. are stored: runs that do not cross the wrap, each also at its mirror
+    pub fn spans(&self, p: usize, n: usize) -> Vec<Span> {
+        let mut out = Vec::new();
+        let mut row = 0;
+        while row < n {
+            let slot = (p + row) % self.r;
+            let take = (self.r - slot).min(n - row);
+            out.push(Span { row, slot, n: take });
+            if self.mirrored {
+                out.push(Span { row, slot: slot + self.r, n: take });
+            }
+            row += take;
+        }
+        out
+    }
+
+    /// The slot of the first key a block at p0 reads (`window_start`): the run from there is `p0 - start + rows` keys long
+    pub fn start_slot(&self, start: usize) -> usize {
+        start % self.r
+    }
 }
 
 /// The first key a block of queries at positions p0.. reads from the cache (their rows share it): the first row's whole
@@ -282,7 +333,6 @@ pub struct Dspine {
     pub tsv: DevBuf,
     /// the anchor's code row [code] float32 (written each draft)
     pub anchor_code: DevBuf,
-    pub ctx: usize,
     pub bytes: u64,
 }
 
@@ -413,7 +463,7 @@ impl Dspine {
         let anchor_code = DevBuf::f32(gpu, c)?;
         gpu.sync()?;
         Ok(Dspine { st, fc: [fcs.remove(0), fcs.remove(0), fcs.remove(0), fcs.remove(0), fcs.remove(0)], hidden_norm, norm, layers: ls, read, packed: packed_mat, gate_bias,
-                    write, tg, tsv, anchor_code, ctx: ctx_setting(), bytes, cfg })
+                    write, tg, tsv, anchor_code, bytes, cfg })
     }
 
     /// sqrt(C) x the codebook row of `token` (the anchor's code), float32
@@ -556,6 +606,68 @@ mod tests {
         assert_eq!(window_start(8192, 8192), 1);
         assert_eq!(window_start(20000, 8192), 20000 + 1 - 8192);
         assert_eq!(window_start(20000, 0), 0);
+    }
+
+    /// A model of the cache: slot -> the position stored there; reads the run a block at p0 reads
+    fn store(c: &mut [Option<usize>], ring: &Ring, p: usize, n: usize) {
+        for sp in ring.spans(p, n) {
+            for i in 0..sp.n {
+                c[sp.slot + i] = Some(p + sp.row + i);
+            }
+        }
+    }
+
+    fn run(c: &[Option<usize>], ring: &Ring, p0: usize, window: usize, t: usize) -> Vec<Option<usize>> {
+        let start = window_start(p0, window);
+        let s0 = ring.start_slot(start);
+        c[s0..s0 + (p0 - start) + t].to_vec()
+    }
+
+    #[test]
+    fn ring_sizes() {
+        let r = Ring::new(8192, 131072);
+        assert_eq!((r.r, r.slots, r.mirrored), (8200, 16400, true));
+        let f = Ring::new(8192, 4096);
+        assert_eq!((f.r, f.slots, f.mirrored), (4096, 4096, false));
+        assert_eq!(Ring::new(8192, 8200).slots, 8200);
+        assert_eq!(Ring::new(8192, 8201).slots, 2 * 8200);
+        assert_eq!(Ring::new(0, 100000).slots, 100000);
+    }
+
+    #[test]
+    fn ring_spans_split_at_the_wrap_and_mirror() {
+        let r = Ring { r: 10, slots: 20, mirrored: true };
+        assert_eq!(r.spans(3, 4), vec![Span { row: 0, slot: 3, n: 4 }, Span { row: 0, slot: 13, n: 4 }]);
+        assert_eq!(r.spans(8, 5), vec![Span { row: 0, slot: 8, n: 2 }, Span { row: 0, slot: 18, n: 2 }, Span { row: 2, slot: 0, n: 3 }, Span { row: 2, slot: 10, n: 3 }]);
+        assert_eq!(r.spans(30, 10), vec![Span { row: 0, slot: 0, n: 10 }, Span { row: 0, slot: 10, n: 10 }]);
+        let f = Ring { r: 10, slots: 10, mirrored: false };
+        assert_eq!(f.spans(2, 3), vec![Span { row: 0, slot: 2, n: 3 }]);
+    }
+
+    #[test]
+    fn ring_reads_the_window_after_wraps_and_rollbacks() {
+        // a small window: passes of 8 rows then rejected drafts (keep 1..8), a block read after each, checked against the
+        // positions [window_start, p0 + t) a flat cache would hold
+        for window in [16usize, 20, 33] {
+            let ring = Ring::new(window, 1000);
+            assert!(ring.mirrored);
+            let mut c = vec![None; ring.slots];
+            let mut pos = 0usize;
+            let mut seed = 12345u64;
+            while pos < 400 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let t = if pos < 40 { 1 + (seed >> 40) as usize % 30 } else { 8 };
+                store(&mut c, &ring, pos, t); // a pass of t rows at pos
+                let keep = if t == 8 { 1 + (seed >> 33) as usize % 8 } else { t }; // the verify keeps some rows
+                pos += keep;
+                // the draft block at pos: its rows are stored, then the run is read
+                let tb = 1 + (seed >> 20) as usize % 8;
+                store(&mut c, &ring, pos, tb);
+                let start = window_start(pos, window);
+                let want: Vec<Option<usize>> = (start..pos + tb).map(Some).collect();
+                assert_eq!(run(&c, &ring, pos, window, tb), want, "window {window} pos {pos} t {tb}");
+            }
+        }
     }
 
     #[test]

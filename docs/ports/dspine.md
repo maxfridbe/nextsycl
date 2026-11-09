@@ -17,7 +17,7 @@ reference keeps exact; not fetched).
 - **Context**: for every committed position, `ctx = hidden_norm(fc(concat of the target's residual stream after layers 1,
   16, 31, 46, 61))` (fc 25,600 -> 5,120). Each of the five draft layers keeps k / v of `ctx` (its own k_proj / v_proj, k_norm,
   rotary at the position) in its cache; the engine writes them behind every target pass (prompt chunks and verify rows;
-  20 KiB a position, `NS_Q35_DSPINE_CTX` positions, 32,768 by default).
+  20 KiB a position, in a ring of the attention window: see "Long context" below).
 - **Block**: rows `[anchor, mask, mask, ...]` (the last committed token, not yet fed to the target; mask token 248070) at the
   positions after the context, embedded with the *target's* embedding. Attention: context fully visible (window 8,192), the
   block causal. 32 query / 8 key heads of 128, q / k norm, NeoX rotary at theta 1e7, SwiGLU of 17,408.
@@ -38,7 +38,26 @@ reference keeps exact; not fetched).
   the attention is the engine's D=128 kernel (it covers one key head a query head: the four query heads of a key head are
   four calls, rope over a strided gather, and the o projection's columns split four ways to match - no new attention
   kernel). The bridge is float32. One GPU only (the aux states come from one device); `steps_together` is false, as EAGLE's.
-  GPU memory: 2.58 GiB with the default 32K cache (1.71 GiB weights, 0.76 tables, 0.1 bridge, 0.64 cache).
+  GPU memory: 2.58 GiB of weights, tables and bridge (1.71 + 0.76 + 0.1) and a ring cache of 0.31 GiB a session, at any context.
+
+## Long context: the draft's cache is a ring of the window
+
+The draft attends only the last 8,192 context positions, so it keeps only those (`dspine::Ring`; before, every position: 20 KiB
+each, 32K by default, and no drafts past the cache - a 13.6K-token prompt was fine, a 40K one fell back to plain decode).
+Position p lives in slot `p % r`, `r = window + 8` = 8,200 (the 8 of slack: a verify pass writes up to 8 rows ahead, and after a
+rejected draft the rollback needs the keys those rows overwrote - positions p0 + j - r, all before the first key any rolled-back
+position still reads, so the rollback is exact with nothing saved). The attention kernel reads one contiguous run of keys, so the
+ring is *mirrored*: every slot is also written at `slot + r`, 2 r slots a head (16,400 positions, 0.31 GiB a session, whatever
+the context), and any window (at most r - 1 + 8 keys, from a slot below r) reads straight through the wrap; a write that crosses the
+wrap is split in two (`Ring::spans`). Rotary is applied before the store at the absolute position (`r0`), so wrapped slots need
+nothing; the context rows' k / v and the block's own keys use the same spans. A session no longer than window + 8 does not wrap (one
+flat cache, as before). `NS_Q35_DSPINE_CTX` is gone (the cache is the window); a session's cache copy / checkpoint takes a ring
+whole. No kernel changed: the ring is host-side index logic around the same `kv_store` and attention calls.
+
+Exactness (B65, greedy 256 tokens, 7 drafts, Q4_K_M, 32K session so the ring wraps from position 8,200): output byte for byte
+the previous flat-cache build's (whose attention was already masked to the same last 8,192 positions) on code, prose, the 13.6K
+document (the window slides) and a 20.5K document; drafts accepted identical (200 / 178 / 186 / 198). Unit tests
+(`dspine::tests::ring_*`) replay random verify / rollback / block sequences against a model of the cache and check the window read.
 
 ## Checked
 
@@ -98,7 +117,45 @@ Not done: 15 drafts / 16-row verify (the engine's verify pass is capped at 8 row
 cap is engine-wide, not silo) and a confidence cut of the verified rows. What is left is the draft (~11 ms) and the DeltaNet
 recurrence at 8 rows (a shared kernel, left alone).
 
+### Long context (ring cache, B70, 2026-11-09)
+
+Greedy 256 tokens, UD-Q4_K_M, 7 DSpine drafts against the live card's MTP (3 drafts); tg tok/s, tokens a verify round in
+brackets (256 / (256 - drafts accepted)), pp tok/s. `-f16`: half attention cache, 128K session (what the live MTP card uses);
+`-q8`: `NS_Q35_KV=auto` (q8_0), 256K session (the DSpine card):
+
+| prompt | MTP f16 | MTP q8 | DSpine q8 (card) | DSpine f16 |
+|---|---:|---:|---:|---:|
+| code (34 tokens): tg | 53.7 (3.3) | 55.8 (3.1) | 70.0 (4.4) | **71.4** (4.5) |
+| code: pp | 100 | 100 | 102 | 102 |
+| prose (32): tg | **50.2** (2.9) | 45.2 (2.6) | 47.9 (3.2) | 48.1 (3.2) |
+| 13.6K document: tg | **49.9** (3.1) | 48.9 (3.2) | 40.7 (3.7) | 37.8 (3.6) |
+| 13.6K document: pp | 1,114 | 1,061 | 1,077 | 1,125 |
+| 69.4K document: tg | 37.7 (3.2) | **38.6** (3.3) | 34.9 (4.1) | 37.9 (4.1) |
+| 69.4K document: pp | 550 | 510 | 530 | 593 |
+
+DSpine drafts at 69K (the cache used to stop at 32K: past it, plain decode, tg ~27) and accepts more a round than MTP at
+every depth (4.1 against 3.2 at 69K), but a round costs more (an 8-row verify pass against 4, plus the draft's own ~11 ms; not profiled at depth). So on long documents MTP wins or ties (tg 38 against 35-38 at 69K, 50
+against 38-41 at 14K); DSpine wins on code (+30%) at any depth short enough to matter. Prompt reading is the same (the draft's context rows cost
+~2%). Each figure is one run; run to run tg moves by 1-2 tok/s.
+
+VRAM on the B70 (peak card memory, `system.busy`'s vram_used_mb, 32,768 MB card; the server, both sessions made, 7 drafts):
+
+| ctx (registry form) | KV | VRAM | free |
+|---|---|---:|---:|
+| 32768 (one generate session) | f16 | 22,688 MB (22.2 GiB) | 10.0 GiB |
+| 65536 | f16 | 24,736 MB (24.2 GiB) | 7.8 GiB |
+| 131072 | f16 | 28,794 MB (28.1 GiB) | 3.9 GiB |
+| `131072,32768` (the live card's form) | f16 | not made: "a session of 32768 tokens needs 2.46 GiB; 3.72 GiB are free (1.5 GiB kept spare)" | - |
+| `131072,32768` | q8 (`NS_Q35_KV=auto`) | 26,525 MB (25.9 GiB) | 6.1 GiB |
+| `262144,32768` | q8 | 30,877 MB (30.2 GiB) | 1.85 GiB |
+
+A 256K session in q8_0 is the largest that keeps 1.5 GiB (about 11K more tokens would still fit; no tried step between). The
+q8_0 cache costs half what half does (34 KiB a token against 64) at KL 0.00024 against half (docs/environment.md, `NS_Q35_KV`);
+MTP is a little slower with it on prose (45 against 50) and the same elsewhere. The live MTP card (128K + 32K, half) is 29 GB; the
+DSpine card (256K + 32K, q8_0) is 30.2 GiB with the draft's 2.6 GiB and rings of 0.3 GiB a session. Peak memory did not grow with a 69K prompt
+(29,348 MB in one 256K generate session before and after).
+
 ## Env
 
-`NS_Q35_DSPINE=DIR|auto` (auto: a `dspine/` folder beside the model), `NS_Q35_DSPINE_CTX`, `NS_Q35_DSPINE_DUMP=DIR` (debug dump
-for the reference), `NS_Q35_DRAFTS` (the drafts a step, at most 7), and the silo's `NS_Q35_XMX*` (docs/environment.md). No model card: not a default and not a clear win.
+`NS_Q35_DSPINE=DIR|auto` (auto: a `dspine/` folder beside the model), `NS_Q35_DSPINE_DUMP=DIR` (debug dump
+for the reference), `NS_Q35_DRAFTS` (the drafts a step, at most 7), and the silo's `NS_Q35_XMX*` (docs/environment.md). The card `qwen3.8-27b-q4-dspine` (code) is registered by hand, not a default.

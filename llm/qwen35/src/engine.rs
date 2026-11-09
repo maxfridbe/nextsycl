@@ -245,7 +245,10 @@ struct MtpState {
     pending: DevBuf,
     chain: DevBuf,
     heads: usize,
+    /// positions a head holds (DSpine: the ring's slots, mirror included)
     cap: usize,
+    /// DSpine's ring over the window (else the cache is linear)
+    ring: Option<crate::dspine::Ring>,
 }
 
 enum LState {
@@ -867,8 +870,8 @@ impl<'g> Qwen35<'g> {
         }
         log(match (&mtp, &eagle) {
             _ if dspine.is_some() => {
-                let x = dspine.as_ref().map(|x| (x.cfg.target_layers.clone(), x.cfg.window, x.ctx, x.bytes)).unwrap_or_default();
-                format!("qwen35: DSpine drafts ({drafts} a step; target layers {:?}, window {}, its cache {} positions, {:.2} GiB)", x.0, x.1, x.2, gib(x.3))
+                let x = dspine.as_ref().map(|x| (x.cfg.target_layers.clone(), x.cfg.window, x.bytes)).unwrap_or_default();
+                format!("qwen35: DSpine drafts ({drafts} a step; target layers {:?}, window {}; {:.2} GiB of weights and tables, its cache a ring of the window: 0.31 GiB a session)", x.0, x.1, gib(x.2))
             }
             (_, Some(x)) => format!("qwen35: EAGLE-4 drafts ({drafts} a step; aux layers {:?}, window {}, its cache {} positions, {:.2} GiB)", x.ids,
                                     x.window, x.ctx, gib(x.bytes)),
@@ -1763,7 +1766,7 @@ impl<'g> Qwen35<'g> {
             None => None,
         };
         // DSpine: the residual stream after its five layers (its cache holding these positions)
-        let dsp = self.dspine.as_ref().zip(s.mtp.as_ref()).filter(|(_, ms)| p0 + t <= ms.cap);
+        let dsp = self.dspine.as_ref().zip(s.mtp.as_ref());
         let daux = match dsp {
             Some(_) => Some(self.arena().f32(5 * t * g.n_embd)?),
             None => None,
@@ -2139,6 +2142,7 @@ impl<'g> Qwen35<'g> {
         let (kvh, d) = (ds.cfg.kv_heads, ds.cfg.head_dim);
         let (kw, rb) = (kvh * d, d * 2);
         let layer_bytes = kvh * ms.cap * rb;
+        let ring = ms.ring.ok_or_else(|| e("dspine: a session without its ring"))?;
         if let Ok(dir) = std::env::var("NS_Q35_DSPINE_DUMP") {
             // the aux rows [5][t][n_embd] of this pass, for a reference (p0 in the name)
             let mut b = vec![0u8; 5 * t * ne * 4];
@@ -2169,8 +2173,10 @@ impl<'g> Qwen35<'g> {
                 unsafe {
                     self.op("dspine rope", none, 8 * n * kw, 10 * n * kw,
                             || (k.rope)(self.raw(), kn.fp(), kw as i64, d as i64, kr.fp(), kw as i64, n as i64, kvh as i64, d as i64, d as i64, ds.cfg.theta, (r0 + a) as i64))?;
-                    self.op("dspine kv store", none, 12 * n * kw, 0,
-                            || (k.kv_store)(self.raw(), kr.fp(), kw as i64, vv.fp(), kw as i64, n as i64, kvh as i64, d as i64, ms.cap as i64, (p0 + a) as i64, kc.ptr(), vc.ptr()))?;
+                    for sp in ring.spans(p0 + a, n) {
+                        self.op("dspine kv store", none, 12 * sp.n * kw, 0,
+                                || (k.kv_store)(self.raw(), kr.fp().add(sp.row * kw), kw as i64, vv.fp().add(sp.row * kw), kw as i64, sp.n as i64, kvh as i64, d as i64, ms.cap as i64, sp.slot as i64, kc.ptr(), vc.ptr()))?;
+                    }
                 }
             }
             self.arena().rewind(mark);
@@ -2204,10 +2210,11 @@ impl<'g> Qwen35<'g> {
     /// DSpine drafts after `tail` (committed at s.pos, not fed): a block [tail, mask x k] through its five layers over its
     /// context cache, the bridge after each, then the head, each row's 16 candidates and the serial refinement (dspine.rs)
     fn dspine_draft(&self, ds: &crate::dspine::Dspine, s: &Session, ms: &MtpState, tail: u32) -> Result<Vec<u32>> {
-        let kmax = self.drafts.min(s.max_ctx.saturating_sub(s.pos + 1)).min(ms.cap.saturating_sub(s.pos + 1));
+        let kmax = self.drafts.min(s.max_ctx.saturating_sub(s.pos + 1));
         if kmax == 0 {
             return Ok(Vec::new());
         }
+        let ring = ms.ring.ok_or_else(|| e("dspine: a session without its ring"))?;
         let dsp = self.silo.and_then(|x| x.dsp.as_ref()).ok_or_else(|| e("the DSpine draft needs the silo's dspine kernels (rebuild the silo)"))?;
         let (ne, k, cfg) = (self.g.n_embd, self.k, &ds.cfg);
         let (kvh, hq, d, rk, c) = (cfg.kv_heads, cfg.heads, cfg.head_dim, cfg.rank, cfg.code);
@@ -2250,10 +2257,13 @@ impl<'g> Qwen35<'g> {
             unsafe {
                 self.op("dspine rope", none, 8 * t * kw, 10 * t * kw,
                         || (k.rope)(self.raw(), kn.fp(), kw as i64, d as i64, kr.fp(), kw as i64, t as i64, kvh as i64, d as i64, d as i64, cfg.theta, r0 as i64))?;
-                self.op("dspine kv store", none, 12 * t * kw, 0,
-                        || (k.kv_store)(self.raw(), kr.fp(), kw as i64, vv.fp(), kw as i64, t as i64, kvh as i64, d as i64, ms.cap as i64, p0 as i64, kc.ptr(), vc.ptr()))?;
+                for sp in ring.spans(p0, t) {
+                    self.op("dspine kv store", none, 12 * sp.n * kw, 0,
+                            || (k.kv_store)(self.raw(), kr.fp().add(sp.row * kw), kw as i64, vv.fp().add(sp.row * kw), kw as i64, sp.n as i64, kvh as i64, d as i64, ms.cap as i64, sp.slot as i64, kc.ptr(), vc.ptr()))?;
+                }
             }
-            let (ks, vs) = (ms.k.view(l * layer_bytes + start * rb, layer_bytes - start * rb)?, ms.v.view(l * layer_bytes + start * rb, layer_bytes - start * rb)?);
+            let s0 = ring.start_slot(start);
+            let (ks, vs) = (ms.k.view(l * layer_bytes + s0 * rb, layer_bytes - s0 * rb)?, ms.v.view(l * layer_bytes + s0 * rb, layer_bytes - s0 * rb)?);
             let att_tmp = self.arena().f32(t * ne)?;
             // four calls, each one query head of every key head (4 h + j): rope over a strided gather, the attention one head a
             // key head, the o projection's matching columns (dspine::o_columns)
@@ -2490,7 +2500,7 @@ impl<'g> Qwen35<'g> {
         // memory (no out-of-memory error) and can take the machine down
         let last_ty = self.kv_tys[self.last()];
         let mtp_kv = match (&self.mtp, &self.eagle) {
-            _ if self.dspine.is_some() => self.dspine.as_ref().map_or(0, |ds| 2 * ds.cfg.layers * ds.cfg.kv_heads * max_ctx.min(ds.ctx) * ds.cfg.head_dim * 2),
+            _ if self.dspine.is_some() => self.dspine.as_ref().map_or(0, |ds| 2 * ds.cfg.layers * ds.cfg.kv_heads * crate::dspine::Ring::new(ds.cfg.window, max_ctx).slots * ds.cfg.head_dim * 2),
             (_, Some(ea)) => 2 * ea.heads * max_ctx.min(ea.ctx) * ea.head_dim * 2,
             (Some(_), _) => 2 * g.heads_kv * max_ctx * last_ty.row(g.head),
             _ => 0,
@@ -2523,7 +2533,7 @@ impl<'g> Qwen35<'g> {
         }
         // the draft's cache: MTP's in the target's form, EAGLE's [40][its positions][128] half
         let shape = match (&self.mtp, &self.eagle) {
-            _ if self.dspine.is_some() => self.dspine.as_ref().map(|ds| (ds.cfg.layers * ds.cfg.kv_heads, max_ctx.min(ds.ctx), ds.cfg.head_dim * 2)),
+            _ if self.dspine.is_some() => self.dspine.as_ref().map(|ds| (ds.cfg.layers * ds.cfg.kv_heads, crate::dspine::Ring::new(ds.cfg.window, max_ctx).slots, ds.cfg.head_dim * 2)),
             (_, Some(ea)) => Some((ea.heads, max_ctx.min(ea.ctx), ea.head_dim * 2)),
             (Some(_), _) => Some((g.heads_kv, max_ctx, last_ty.row(g.head))),
             _ => None,
@@ -2533,7 +2543,7 @@ impl<'g> Qwen35<'g> {
                 let n = heads * cap * rb;
                 let gpu = &self.devs[self.last()].gpu;
                 let ms = MtpState { k: DevBuf::new(gpu, n)?, v: DevBuf::new(gpu, n)?, pending: DevBuf::f32(gpu, g.n_embd)?, chain: DevBuf::f32(gpu, g.n_embd)?,
-                                    heads, cap };
+                                    heads, cap, ring: self.dspine.as_ref().map(|ds| crate::dspine::Ring::new(ds.cfg.window, max_ctx)) };
                 ms.pending.fill(0)?;
                 Some(ms)
             }
@@ -2583,7 +2593,8 @@ impl<'g> Qwen35<'g> {
         }
         if let (Some(d), Some(sm)) = (&dst.mtp, &src.mtp) {
             let rb = kv_rb(&sm.k, sm.heads, sm.cap);
-            let n = src.pos.min(sm.cap).min(d.cap) * rb;
+            // a DSpine ring (mirror included) is copied whole
+            let n = if sm.ring.is_some_and(|r| r.mirrored) { sm.cap.min(d.cap) } else { src.pos.min(sm.cap).min(d.cap) } * rb;
             for h in 0..sm.heads {
                 d.k.copy_within(h * d.cap * rb, &sm.k, h * sm.cap * rb, n)?;
                 d.v.copy_within(h * d.cap * rb, &sm.v, h * sm.cap * rb, n)?;
@@ -2988,7 +2999,7 @@ impl<'g> Qwen35<'g> {
         }
         if let Some(ms) = &s.mtp {
             let rb = kv_rb(&ms.k, ms.heads, ms.cap);
-            let n = s.pos.min(ms.cap) * rb;
+            let n = if ms.ring.is_some_and(|r| r.mirrored) { ms.cap } else { s.pos.min(ms.cap) } * rb;
             for c in [&ms.k, &ms.v] {
                 let mut b = vec![0u8; ms.heads * n];
                 for h in 0..ms.heads {
@@ -3042,7 +3053,7 @@ impl<'g> Qwen35<'g> {
         }
         if let Some(ms) = &s.mtp {
             let rb = kv_rb(&ms.k, ms.heads, ms.cap);
-            let n = ck.pos.min(ms.cap) * rb;
+            let n = if ms.ring.is_some_and(|r| r.mirrored) { ms.cap } else { ck.pos.min(ms.cap) } * rb;
             for c in [&ms.k, &ms.v] {
                 let b = it.next().ok_or_else(|| e("a checkpoint without the draft block's cache"))?;
                 if b.len() != ms.heads * n {

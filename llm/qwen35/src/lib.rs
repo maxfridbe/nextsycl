@@ -29,7 +29,6 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "drafts", env: "NS_Q35_DRAFTS", value: "N", help: "tokens drafted a step with MTP, EAGLE-4 or DSpine (default 3, at most 7; 0: none)", at: At::Load },
     EngineOption { name: "eagle", env: "NS_Q35_EAGLE", value: "DIR|auto", help: "the EAGLE-4 draft's folder (config.json, model.safetensors), or auto: an eagle4/ folder beside the model (default: none). One GPU; in MTP's place", at: At::Load },
     EngineOption { name: "dspine", env: "NS_Q35_DSPINE", value: "DIR|auto", help: "the DSpine draft's folder (config.json, model.safetensors: Qwen3.8-27B-DSpine-b16), or auto: a dspine/ folder beside the model (default: none). One GPU; in MTP's place", at: At::Load },
-    EngineOption { name: "dspine-ctx", env: "NS_Q35_DSPINE_CTX", value: "TOKENS", help: "positions the DSpine draft's cache holds (default 32768, 20 KiB each); no drafts past them", at: At::Load },
     EngineOption { name: "eagle-ctx", env: "NS_Q35_EAGLE_CTX", value: "TOKENS", help: "positions the EAGLE-4 draft's cache holds (default 32768, 20 KiB each); no drafts past them", at: At::Load },
 ];
 

@@ -197,7 +197,6 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_Q35_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (at least 16) (--opt-chunk) | llm qwen35 |
 | `NS_Q35_DRAFTS` | 3 | tokens drafted a step with MTP, EAGLE-4 or DSpine (at most 7; 0: none) (--opt-drafts) | llm qwen35 |
 | `NS_Q35_DSPINE` | unset (MTP) | the DSpine draft's folder (config.json, model.safetensors: Tencent's `Qwen3.8-27B-DSpine-b16`), or `auto`: a `dspine/` folder beside the model; loaded in MTP's place (and EAGLE-4's) on one GPU (--opt-dspine) | llm qwen35 |
-| `NS_Q35_DSPINE_CTX` | 32768 | positions the DSpine draft's cache holds (20 KiB each: five layers' keys and values); no drafts past them (--opt-dspine-ctx) | llm qwen35 |
 | `NS_Q35_DSPINE_DUMP` | unset | Debug: a folder the DSpine draft writes its inputs and outputs into (aux states of every pass, each draft's rows), for `tooling/dspine-ref.py` | llm qwen35 |
 | `NS_Q35_EAGLE` | unset (MTP) | the EAGLE-4 draft's folder (config.json, model.safetensors: Qwen3.8-27B's `LlamaForCausalLMEagle4`), or `auto`: an `eagle4/` folder beside the model; loaded in MTP's place on one GPU (--opt-eagle) | llm qwen35 |
 | `NS_Q35_EAGLE_HEAD` | low | the EAGLE-4 draft's head: low (its low-rank head's 128 candidates scored by the full head, as trained: 35 MB read a draft step) or full (the full head's argmax: 1.35 GB) | llm qwen35 |

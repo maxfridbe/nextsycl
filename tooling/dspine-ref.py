@@ -5,7 +5,8 @@ The engine, run with NS_Q35_DSPINE_DUMP=DIR, writes the target's aux states of e
 float32) and, for each draft, draft-<pos>.bin: the block, its embeddings, the final rows, the last layer's raw / rms /
 packed, the head's logits, the candidates' head rows (half), the candidates, the refinement's picks and the drafts. This
 redoes the draft from the aux states and the checkpoint's weights (CPU, float32, bfloat16 weights widened) and prints how
-close the engine's numbers are:
+close the engine's numbers are (the attention window of 8,192 positions included: past it the engine's cache is a ring that no
+longer holds the older positions, and the reference reads only the window too):
 
   python3 -I dspine-ref.py CHECKPOINT_DIR DUMP_DIR [draft-<pos>.bin ...]
 
@@ -122,8 +123,13 @@ def main():
         cand = take(np.int32, n * K).reshape(n, K)
         pick = take(np.int32, n * K).reshape(n, K)
         drafts = take(np.uint32, n)
-        ctx = ctx_all[:pos]
-        assert pos == len(ctx) and (window == 0 or pos + t <= window), "this reference does not do the window"
+        # the window as the engine reads it (dspine::window_start): the first row's whole window - the context keys from
+        # position pos + 1 - window - then the block, causal; positions older than that are not read (the engine's ring
+        # no longer holds them)
+        start = max(0, pos + 1 - window) if window else 0
+        ctx = ctx_all[start:pos]
+        assert pos <= len(ctx_all), "the dump holds fewer positions than the draft's"
+        nc = len(ctx)
         cb_anchor = np.sqrt(C) * ck.rows(b + "codebook", [int(tail)])[0]
         x = x0.copy()
         sqrt_c = math.sqrt(C)
@@ -137,14 +143,14 @@ def main():
             v = (ln @ vp.T).reshape(t, HKV, D)
             kc = rms((ctx @ kp.T).reshape(-1, HKV, D), kn)
             vc = (ctx @ vp.T).reshape(-1, HKV, D)
-            kc = rope(kc, np.arange(pos, dtype=np.float32), theta)
+            kc = rope(kc, np.arange(start, pos, dtype=np.float32), theta)
             q = rope(q, np.arange(pos, pos + t, dtype=np.float32), theta)
             k = rope(k, np.arange(pos, pos + t, dtype=np.float32), theta)
             K_all, V_all = np.concatenate([kc, k]), np.concatenate([vc, v])
             att = np.zeros((t, HQ, D), np.float32)
-            mask = np.zeros((t, pos + t), bool)
+            mask = np.zeros((t, nc + t), bool)
             for i in range(t):
-                mask[i, :pos + i + 1] = True
+                mask[i, :nc + i + 1] = True
             for h in range(HQ):
                 s = np.einsum("td,sd->ts", q[:, h], K_all[:, h // (HQ // HKV)]) / math.sqrt(D)
                 s = np.where(mask, s, -1e30)
