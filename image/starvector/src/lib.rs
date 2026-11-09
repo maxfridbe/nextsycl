@@ -32,7 +32,7 @@ pub const DEFAULT_MIN_LENGTH: u32 = 4096;
 
 /// The length a request that names none is held to, from how much drawing the picture holds (`pre::edges`): the
 /// model wrote 913 tokens for a flat logo of 4,677 edge pixels (0.2 a pixel) and ends on its own well before any limit
-/// - so an allowance of a token an edge pixel (five times that) on top of the prefix, never under DEFAULT_MIN_LENGTH,
+/// so an allowance of a token an edge pixel (five times that) on top of the prefix, never under DEFAULT_MIN_LENGTH,
 /// never over the cap. A picture that fills the cap (13,000 edge pixels: a busy burst of wedges) gets all of it; the
 /// time is bounded by the cap (about 1 minute at 120 tokens/s).
 pub fn default_max_length(edges: usize) -> u32 {
