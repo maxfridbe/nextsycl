@@ -5,6 +5,12 @@
 
 namespace q35silo {
 
+// The split activation layout's size (silo.h: ns_q35_q8_split_bytes): the quants, scales and 16-sums of ncols columns
+// (256-aligned), then the XMX tail (xmm.cpp: block b's 8 tokens x 32 quants at b x 256, then [block][8] float scales
+// and scale x quant sums, then Q6_K's upper 16 quants alone, as xa's) that the 3..8 column products read
+inline size_t split_base(int64_t n_in, int64_t ncols) { return (size_t) ((ncols * n_in + ncols * (n_in / 32) * 2 + ncols * (n_in / 16) * 2 + 255) / 256 * 256); }
+inline size_t xmx_tail_bytes(int64_t n_in) { return (size_t) (n_in / 32) * (256 + 32 + 32 + 256); }
+
 // 16 bytes at a 2-byte aligned address from aligned 16-byte loads (Strata's load16_a2): the second chunk only when
 // the address is unaligned, so it never reads past an allocation's last chunk
 inline sycl::int4 load16_a2(const void* p) {

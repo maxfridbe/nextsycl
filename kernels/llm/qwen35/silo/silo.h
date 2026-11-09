@@ -25,6 +25,16 @@ size_t ns_q35_q8_split_bytes(int64_t n_in, int64_t ncols);
 int ns_q35_quantize_q8(ns_gpu* g, const float* x, void* q8_1, void* xs, int64_t n_in, int64_t ncols);
 int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const void* x_split, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 
+/* Decode products on XMX (xmm.cpp; ns_q35_mmvq routes to it for NS_Q35_XMX or more columns, default 5, on the types and
+ * widths it covers: Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0 at 2,048 or more rows and 4,096 or more columns of x). Reads the split layout's XMX tail (ns_q35_q8_split_bytes
+ * includes it; this builds it). Its sums are the dp4a ones' integers, added in another order: a column is not bit for
+ * bit a one-column pass's */
+int ns_q35_xmx_min_cols(void);
+int ns_q35_xmx_supported(int type, int64_t n_in, int64_t n_out);
+int ns_q35_xmx_covers(int type, int64_t n_in, int64_t n_out, int64_t ncols);
+int ns_q35_xmx_prep(ns_gpu* g, const void* xs, int64_t n_in, int64_t ncols, int halves);
+int ns_q35_xmx_mmvq(ns_gpu* g, int type, const void* w, const void* xs, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+
 /* Prompt attention (attn.cpp; the engine's own is ns_q35_attn): flash attention on XMX. out [T, Hq x 256] = softmax(q k^T
  * / 16) v for rows q [T, Hq x 256] (qs floats apart) at positions p0.., causal, against the half caches [Hkv][cap][256].
  * Covers more than 8 rows, heads of 256, 6 query heads a key head */

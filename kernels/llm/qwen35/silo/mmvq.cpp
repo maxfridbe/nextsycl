@@ -22,8 +22,14 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <tuple>
+#include <vector>
 
 // ggml's IQ grids (iq3s_grid)
 #define GGML_COMMON_DECL_SYCL
@@ -622,7 +628,7 @@ int ns_q35_quantize_q8(ns_gpu* g, const float* x, void* q8_1, void* xs, int64_t 
     NS_CATCH
 }
 
-size_t ns_q35_q8_split_bytes(int64_t n_in, int64_t ncols) { return (size_t) (ncols * n_in + ncols * (n_in / 32) * 2 + ncols * (n_in / 16) * 2); }
+size_t ns_q35_q8_split_bytes(int64_t n_in, int64_t ncols) { return split_base(n_in, ncols) + xmx_tail_bytes(n_in); }
 
 int ns_q35_mmvq_supported(int type, int64_t n_in) {
     switch (type) {
@@ -632,10 +638,10 @@ int ns_q35_mmvq_supported(int type, int64_t n_in) {
     }
 }
 
-int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const void* x_split, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
-    NS_TRY
-    if (ncols < 1 || ncols > 8) return ns_fail("ns_q35_mmvq: 1..8 columns");
-    if (!ns_q35_mmvq_supported(type, n_in)) return ns_fail("ns_q35_mmvq: ggml type " + std::to_string(type) + " at this width is not its own");
+// the shared decode product (kernels/llm/glm5next/mmvq.cpp, in the same library): the reference of NS_Q35_XMX_CHECK
+int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+
+static int dp4a_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const void* x_split, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
     const int ni = (int) n_in, no = (int) n_out, nc = (int) ncols;
     switch (type) {
         case 11: wide<WideQ3K>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
@@ -648,8 +654,46 @@ int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const vo
         case 17: wide<WideIQ2XS>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
         case 18: wide<WideIQ3XXS>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
         case 22: wide<WideIQ2S>(g->q, w, x_q8_1, x_split, y, ni, no, nc); break;
+        default: return ns_mmvq(g, type, w, x_q8_1, y, n_in, n_out, ncols);
     }
     return 0;
+}
+
+// NS_Q35_XMX_CHECK=1: each XMX product against the dp4a (or shared) one on the same inputs; the worst relative difference
+// (to the largest value) a kind of product has shown is printed when it is first seen and each time it doubles
+static void xmx_check(ns_gpu* g, int type, const void* w, const void* x_q8_1, const void* x_split, const float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
+    static std::map<std::tuple<int, int64_t, int64_t, int64_t>, std::pair<long, double>> seen;
+    static std::mutex mu;
+    const size_t n = (size_t) (ncols * n_out);
+    float* ref = sycl::malloc_device<float>(n, g->q);
+    if (dp4a_mmvq(g, type, w, x_q8_1, x_split, ref, n_in, n_out, ncols) != 0) { sycl::free(ref, g->q); return; }
+    std::vector<float> a(n), b(n);
+    g->q.memcpy(a.data(), y, n * 4).wait();
+    g->q.memcpy(b.data(), ref, n * 4).wait();
+    sycl::free(ref, g->q);
+    double worst = 0, big = 1e-30;
+    for (size_t i = 0; i < n; ++i) { worst = std::max(worst, (double) std::fabs(a[i] - b[i])); big = std::max(big, (double) std::fabs(b[i])); }
+    std::lock_guard<std::mutex> lk(mu);
+    auto& e = seen[{type, n_in, n_out, ncols}];
+    const double rel = worst / big;
+    if (e.first++ == 0 || rel > 2 * e.second) {
+        e.second = std::max(e.second, rel);
+        std::fprintf(stderr, "[xmx check type %d %ldx%ld, %ld columns: max abs diff %.3g of max %.3g (%.2e), call %ld]\n", type, (long) n_out, (long) n_in, (long) ncols, worst, big, rel, e.first);
+    }
+}
+
+int ns_q35_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, const void* x_split, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
+    NS_TRY
+    if (ncols < 1 || ncols > 8) return ns_fail("ns_q35_mmvq: 1..8 columns");
+    // the columns, types and widths XMX covers (xmm.cpp): the DPAS products (NS_Q35_XMX = the fewest columns; 0 off)
+    if (ns_q35_xmx_covers(type, n_in, n_out, ncols)) {
+        const int rc = ns_q35_xmx_mmvq(g, type, w, x_split, y, n_in, n_out, ncols);
+        static const bool check = std::getenv("NS_Q35_XMX_CHECK") != nullptr;
+        if (rc == 0 && check) xmx_check(g, type, w, x_q8_1, x_split, y, n_in, n_out, ncols);
+        return rc;
+    }
+    if (!ns_q35_mmvq_supported(type, n_in)) return ns_fail("ns_q35_mmvq: ggml type " + std::to_string(type) + " at this width is not its own");
+    return dp4a_mmvq(g, type, w, x_q8_1, x_split, y, n_in, n_out, ncols);
     NS_CATCH
 }
 

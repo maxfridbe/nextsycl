@@ -1018,7 +1018,10 @@ impl<'g> Qwen35<'g> {
             // the silo's product for the types it covers (kernels/llm/qwen35/silo; it reads the split layout too), the
             // shared one otherwise
             // SAFETY: arithmetic only.
-            let silo = self.silo.filter(|s| unsafe { (s.mmvq_supported)(w.ty.code() as i32, kk) } != 0);
+            let silo = self.silo.filter(|s| {
+                // SAFETY: arithmetic only.
+                unsafe { (s.mmvq_supported)(w.ty.code() as i32, kk) != 0 || s.xmx_covers.is_some_and(|f| f(w.ty.code() as i32, kk, n, t as i64) != 0) }
+            });
             let own;
             let qb = match xq {
                 Some(q) => q,

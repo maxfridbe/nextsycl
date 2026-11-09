@@ -161,6 +161,8 @@ pub struct Silo {
     pub dequant_f16_supported: unsafe extern "C" fn(c_int) -> c_int,
     pub dequant_f16: unsafe extern "C" fn(G, c_int, P, i64, *mut u16) -> c_int,
     pub rms_q8: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, M, M, i64, i64, f32) -> c_int,
+    /// (type, n_in, n_out, columns): whether the XMX products cover it (kernels/llm/qwen35/silo/xmm.cpp); None: a silo built before them
+    pub xmx_covers: Option<unsafe extern "C" fn(c_int, i64, i64, i64) -> c_int>,
     /// the DSpine draft's kernels (silo/dspine.cpp); None: a silo built before them
     pub dsp: Option<Dsp>,
 }
@@ -207,6 +209,12 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             dequant_f16_supported: sym!("ns_q35_dequant_f16_supported"),
             dequant_f16: sym!("ns_q35_dequant_f16"),
             rms_q8: sym!("ns_q35_rms_q8"),
+            xmx_covers: if lib.symbol("ns_q35_xmx_covers").is_null() {
+                None
+            } else {
+                // SAFETY: declared in silo.h with this signature.
+                Some(unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(c_int, i64, i64, i64) -> c_int>(lib.symbol("ns_q35_xmx_covers")) })
+            },
             dsp: if lib.symbol("ns_q35_dsp_pick").is_null() {
                 None
             } else {
