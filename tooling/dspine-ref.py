@@ -89,12 +89,11 @@ def main():
         _, p0, t = os.path.basename(p)[:-4].split("-")
         passes.append((int(p0), int(t), p))
     passes.sort()
-    feats = []
+    # a verify pass's rows past what was kept are written again by the next pass (from the kept position): the later
+    # pass (a greater p0) wins
+    feats = np.zeros((max(p0 + t for p0, t, _ in passes), 5 * H), np.float32)
     for p0, t, p in passes:
-        a = np.fromfile(p, np.float32).reshape(5, t, H)
-        assert p0 == sum(x.shape[0] for x in feats), "passes must be contiguous from position 0"
-        feats.append(a.transpose(1, 0, 2).reshape(t, 5 * H))
-    feats = np.concatenate(feats)
+        feats[p0:p0 + t] = np.fromfile(p, np.float32).reshape(5, t, H).transpose(1, 0, 2).reshape(t, 5 * H)
     print(f"context: {len(feats)} positions from {len(passes)} passes")
     ctx_all = rms(feats @ ck.t("fc.weight").T, ck.t("hidden_norm.weight"))
     files = sys.argv[3:] or sorted(glob.glob(os.path.join(dump, "draft-*.bin")))
