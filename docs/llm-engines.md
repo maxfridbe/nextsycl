@@ -43,6 +43,11 @@ engine's kernels (GDN is KDA with one decay a head), the attention and the gates
   55.8 and 83%; prose 43.1 / 42.8 at 63%; a 14K prompt read 960 / 1,111 tok/s - its layer runs over every prompt
   row), and it does not draft past its cache (`NS_Q35_EAGLE_CTX`, 32K) or step conversations together, so MTP stays
   the default.
+- **DSpine** (`llm/qwen35/src/dspine.rs`, opt-in: `NS_Q35_DSPINE=DIR`): Tencent's `Qwen3.8-27B-DSpine-b16` parallel block draft
+  (five layers over the target's residual stream after layers 1, 16, 31, 46, 61, a code bridge passing each position's feature
+  to the next, a serial refinement of each row's 16 candidates). Exact and checked against a numpy reference, but not faster
+  than MTP except on code with the Q8_0 file (5 drafts, +15-19%): a verify row costs more than the extra accepted tokens
+  buy. [Port notes and numbers](ports/dspine.md).
 - **Two cards** (`--gpu all`, or `--gpu 1,0`: the B65, then the B70; the `-256k` catalog entries): the layers split
   so the last GPU (the server orders them weakest first) takes as many as fit beside the head, the draft block and
   the planned context's caches, and the one before it the rest - a GPU the layers do not reach is not used, so a
