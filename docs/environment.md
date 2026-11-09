@@ -202,6 +202,14 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 | `NS_Q35_EAGLE` | unset (MTP) | the EAGLE-4 draft's folder (config.json, model.safetensors: Qwen3.8-27B's `LlamaForCausalLMEagle4`), or `auto`: an `eagle4/` folder beside the model; loaded in MTP's place on one GPU (--opt-eagle) | llm qwen35 |
 | `NS_Q35_EAGLE_HEAD` | low | the EAGLE-4 draft's head: low (its low-rank head's 128 candidates scored by the full head, as trained: 35 MB read a draft step) or full (the full head's argmax: 1.35 GB) | llm qwen35 |
 | `NS_Q35_EAGLE_CTX` | 32768 | positions the EAGLE-4 draft's cache holds (20 KiB each); no drafts past them (--opt-eagle-ctx) | llm qwen35 |
+| `NS_Q35_XMX` | 5 | The fewest columns (a verify round's rows) at which the qwen35 silo uses its XMX (DPAS int8) matrix products for Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0 instead of dp4a; 0 off (MTP's 2-4 rows stay dp4a and exact) | kernels:qwen35 silo |
+| `NS_Q35_XMX_MIN_OUT` | 2048 | Experiment: the fewest output rows a matrix needs for the XMX product (narrower ones keep dp4a, or the small Q8_0 kernel) | kernels:qwen35 silo |
+| `NS_Q35_XMX_Q80` | 1 | 0: Q8_0 matrices keep their dp4a product (no XMX) | kernels:qwen35 silo |
+| `NS_Q35_XMX_Q6K` | 1 | 0: Q6_K matrices keep their dp4a product (no XMX) | kernels:qwen35 silo |
+| `NS_Q35_Q80_SMALL` | 1 | 0: narrow or short Q8_0 matrices (DeltaNet alpha/beta, the DSpine draft's k/v/o) keep the shared dp4a product instead of the sub-group-a-row kernel | kernels:qwen35 silo |
+| `NS_Q35_XMX_SHAPE` | 0 (by matrix size) | Experiment: work-group shape (1-10) of the XMX products of 64-weight types | kernels:qwen35 silo |
+| `NS_Q35_XMX_SHAPE6` | 0 (by matrix size) | Experiment: work-group shape (4, 5, 6, else 8x1) of the XMX Q6_K product | kernels:qwen35 silo |
+| `NS_Q35_XMX_CHECK` | unset | Debug: 1 runs each XMX product again with dp4a and prints the worst relative difference per type, shape and column count | kernels:qwen35 silo |
 | `NS_Q35_MMVQ_GROUPS` | 512 | Experiment: work-groups of the silo's matrix-vector kernels with a lookup table | kernels:qwen35 silo |
 | `NS_Q35_MMVQ_ROWS` | 0 (each type's own) | Experiment: rows a sub-group (1, 2 or 4) for every 256-block type of the silo's matrix-vector kernels | kernels:qwen35 silo |
 | `NS_Q35_MTP` | the first .gguf in an MTP/ folder beside the model | the MTP draft block's GGUF (--opt-mtp) | llm qwen35 |

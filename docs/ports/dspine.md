@@ -2,8 +2,8 @@
 
 Tencent's `Qwen3.8-27B-DSpine-b16` (huggingface.co/tencent/Qwen3.8-27B-DSpine-b16, Apache-2.0, 2.03 B parameters in bfloat16,
 `DFlashDraftModel`): a speculative-decoding *draft* for the dense Qwen3.8-27B, run by the `qwen35` engine in MTP's place.
-Opt-in (`NS_Q35_DSPINE=DIR`), exact (the target's own sampler verifies every draft). **It does not beat MTP here** except
-on code against the Q8_0 file; numbers below. Reference: Tencent's `dspine_mlx` (read, not run); the numpy reference in
+Opt-in (`NS_Q35_DSPINE=DIR`), exact (the target's own sampler verifies every draft). With the silo's XMX verify products it beats MTP on code (71 tg
+against 59, Q4); on prose and long documents MTP still wins; numbers below. Reference: Tencent's `dspine_mlx` (read, not run); the numpy reference in
 `tooling/dspine-ref.py` redoes the draft from the checkpoint and checks the engine's.
 
 Files: `llm/qwen35/src/dspine.rs` (config, weights, tables, pure logic with tests), `llm/qwen35/src/engine.rs`
@@ -67,19 +67,38 @@ Q8_0 (4,096-token context and draft cache: the file, the draft and the verify sn
 | code | 18.3 | 42.0 / 40.4 (two runs) | 41.3 | **48.2 / 47.9** | 39.3 / 39.7 |
 | prose | 18.5 | **36.7** | 33.8 | 33.0 | 27.6 |
 
-Why it does not win: DSpine's blocks are accepted further (4.7 tokens a round with 7 drafts on code against MTP's 3.3), but a
-verify row costs ~6.5 ms on the Q4 file (the silo's decode products are compute-bound at 8 columns: 84 ms for an 8-row pass
-against 37 for one row; the device-side probe, `NS_Q35_PROFILE=1`), and the draft itself is ~11 ms (the five layers' 2 GB of
-weights at ~300 GB/s, the head's 7 rows 3 ms). A round costs ~59 / 73 / 85 ms at 3 / 5 / 7 drafts against MTP's 56 for 3: the
-extra rows buy ~0.3 tokens each, ~21 ms a token against MTP's ~17. Where a row is cheap (Q8_0 is bandwidth-bound: its rows are
-nearly free) and the text is predictable (code), 5 drafts win by ~15-19%; on prose and on a long document the drafts are
-accepted less and MTP's cheap round wins. With DSpine's first three drafts accepted as often as MTP's (87% against 86% on code)
-the draft's cost is all that is left.
+### After the XMX verify products (silo, 2026-11-09)
 
-What would change it: a verify that is cheaper per row past 4 (XMX decode products for 8-16 columns in the silo), a
-confidence cut of the verified rows, a cheaper draft (the bridge's float32 products and the 130 launches of a draft).
+Verdict: no bug in the port (acceptance matches the card: 4.5 tokens a round on code at 7 drafts; the first three drafts are
+accepted as often as MTP's). The time was the verify pass: the silo's dp4a decode products are compute-bound from 5 columns
+on. `kernels/llm/qwen35/silo/xmm.cpp` now runs Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0 matrices of 5..8 columns on DPAS (int8
+joint_matrix, weights expanded into SLM tiles, work-group shape by matrix size), and a sub-group-a-row Q8_0 kernel serves the
+narrow ones (DeltaNet alpha / beta, the draft's k / v / o). 1..4 columns (MTP, 3-draft DSpine) are unchanged. Checked with
+`NS_Q35_XMX_CHECK=1` against dp4a: 1e-7 to 1e-6 relative.
+
+UD-Q4_K_M, B70, greedy 256 tokens, 32K context; tg tok/s (tokens a round = 256 / (256 - accepted)); pp is unchanged by this
+(34 prompt tokens: pp ~100 in every mode; 13.6K tokens: pp 1,070 plain, 1,110 MTP, 1,125 DSpine):
+
+| prompt | plain tg | MTP tg (tok/round) | DSpine 3 | DSpine 5 | DSpine 7 |
+|---|---:|---:|---:|---:|---:|
+| code | 27.4 | 58.8 (3.3) | 59.8 (3.4) | 68.5 (4.1) | **71.4** (4.5) |
+| prose | 27.4 | 51.9 (2.9) | 47.7 (2.8) | 47.9 (3.0) | **48.2** (3.2) |
+| 13.6K document | 23.2 | **49.8** (3.1) | 35.4 (2.8) | 41.5 (3.6) | 37.7 (3.6) |
+
+Before (the table above): code 54.6 / 56.9 / 56.7 at 7 / 5 / 3 drafts, prose 37.0 / 41.6 / 47.7, document 33.2 / 34.6 / 35.4.
+So DSpine now beats MTP on code by 21% (7 drafts) and nearly closes prose (48 against 52); on the long document MTP still wins
+(the draft's attention over 13.6K positions and the context K/V it writes cost more with context).
+
+Exactness: MTP and 3-draft DSpine stay byte-identical to plain greedy (XMX is off below 5 columns). With 5 or 7 drafts the XMX
+products sum floats in a different order than dp4a, so greedy text diverges from plain at a near-tie (byte 585 of 1,041 on code,
+394 on prose, 196 on the document); the text is as valid, not the same. `NS_Q35_XMX=0` restores byte-exact output at 7 drafts
+(checked on code; tg 51.6); `NS_Q35_XMX=9` also keeps XMX off the verify rows.
+
+Not done: 15 drafts / 16-row verify (the engine's verify pass is capped at 8 rows by the decode products and snapshots; that
+cap is engine-wide, not silo) and a confidence cut of the verified rows. What is left is the draft (~11 ms) and the DeltaNet
+recurrence at 8 rows (a shared kernel, left alone).
 
 ## Env
 
 `NS_Q35_DSPINE=DIR|auto` (auto: a `dspine/` folder beside the model), `NS_Q35_DSPINE_CTX`, `NS_Q35_DSPINE_DUMP=DIR` (debug dump
-for the reference), `NS_Q35_DRAFTS` (the drafts a step, at most 7). No model card: not a default and not a clear win.
+for the reference), `NS_Q35_DRAFTS` (the drafts a step, at most 7), and the silo's `NS_Q35_XMX*` (docs/environment.md). No model card: not a default and not a clear win.
