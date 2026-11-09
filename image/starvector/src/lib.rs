@@ -5,10 +5,11 @@
 //! beams or plain sampling on request). Rust and SYCL: the shared kernels and the upscaler's sigmoid; the picture's
 //! preprocessing (PIL's arithmetic) and the decoding (transformers' beam search) on the host.
 //!
-//! The platform's vectorize stage closes or cuts an SVG the limit stopped short; this engine returns what the model
-//! wrote, and whether "</svg>" ended it.
+//! An SVG the length limit stopped short is finished here (`close`): cut back to its last whole piece, every open element
+//! closed, "</svg>" last, checked to parse as XML - the answer says it was `truncated`.
 
 pub mod check;
+pub mod close;
 pub mod ffi;
 pub mod gen;
 pub mod model;
@@ -23,8 +24,25 @@ use nextsycl_image::{Defaults, Error, Gpu, ImageEngine, ImageKind, ImageRequest,
                      VectorizeOutput, VectorizeRequest};
 
 pub const ARCH: &str = "starvector";
-/// The platform's default length (its vectorize "detail" 0.5: 2000 + 0.5 x 6000)
-pub const DEFAULT_MAX_LENGTH: u32 = 5000;
+/// The longest sequence there is: StarCoder's 8192 positions (the picture's 257 rows, the prompt and the SVG's tokens);
+/// a request's max_length is held to it
+pub const MAX_LENGTH_CAP: u32 = model::POSITIONS as u32;
+/// The shortest default length (a request that names no max_length gets at least this)
+pub const DEFAULT_MIN_LENGTH: u32 = 4096;
+
+/// The length a request that names none is held to, from how much drawing the picture holds (`pre::edges`): the
+/// model wrote 913 tokens for a flat logo of 4,677 edge pixels (0.2 a pixel) and ends on its own well before any limit
+/// - so an allowance of a token an edge pixel (five times that) on top of the prefix, never under DEFAULT_MIN_LENGTH,
+/// never over the cap. A picture that fills the cap (13,000 edge pixels: a busy burst of wedges) gets all of it; the
+/// time is bounded by the cap (about 1 minute at 120 tokens/s).
+pub fn default_max_length(edges: usize) -> u32 {
+    let prefix = (model::QUERY + 6) as u64;
+    (prefix + edges as u64).clamp(DEFAULT_MIN_LENGTH as u64, MAX_LENGTH_CAP as u64) as u32
+}
+
+
+/// tokens between two decodes of the text written so far (a piece for the caller's stream)
+const PIECE: usize = 64;
 /// beams at most (the logits buffer's rows)
 pub const MAX_BEAMS: u32 = 8;
 
@@ -103,13 +121,13 @@ impl StarVector {
     }
 
     /// The settings a request asks for, the model's own where it says nothing
-    pub fn settings(&self, req: &VectorizeRequest) -> Result<gen::Settings> {
+    pub fn settings(&self, req: &VectorizeRequest, edges: usize) -> Result<gen::Settings> {
         let beams = req.beams.unwrap_or(2);
         if !(1..=MAX_BEAMS).contains(&beams) {
             return Err(Error(format!("beams {beams}: 1 to {MAX_BEAMS}")));
         }
         let prefix = model::QUERY + self.vocab.prompt.len();
-        let max_length = if req.max_length == 0 { DEFAULT_MAX_LENGTH } else { req.max_length } as usize;
+        let max_length = if req.max_length == 0 { default_max_length(edges) } else { req.max_length } as usize;
         // max_length counts the prefix (transformers: inputs_embeds' length comes off it); StarCoder has 8192 positions
         let max_new = max_length.min(model::POSITIONS).saturating_sub(prefix);
         if max_new == 0 {
@@ -157,8 +175,8 @@ impl ImageEngine for StarVector {
     }
     fn vectorize(&self, req: &VectorizeRequest, text: &mut dyn FnMut(&str) -> Result<()>) -> Result<VectorizeOutput> {
         let t0 = Instant::now();
-        let s = self.settings(req)?;
         let pixels = pre::pixels(&req.picture);
+        let s = self.settings(req, pre::edges(&pixels))?;
         let mut m = self.model.lock().unwrap_or_else(|p| p.into_inner());
         let (_enc, adapter) = m.encode(&pixels)?;
         let prefix = self.prefix(&m, &adapter);
@@ -169,20 +187,66 @@ impl ImageEngine for StarVector {
         let mut shown = 0usize;
         let vocab = &self.vocab;
         let out = gen::decode(&mut run, &s, &mut |lead| {
-            // the leading beam's text as it grows (with beams it may change course: what is new of it, then)
+            // called every token (the caller's cancel check rides on it); the text is decoded every PIECE tokens - the leading
+            // beam's text as it grows (with beams it may change course: what is new of it, then) - as decoding the whole
+            // text a token made the host work grow with the square of the length
+            if lead.len() % PIECE != 0 {
+                return text("");
+            }
             let txt = vocab.decode(&[vocab.prompt.as_slice(), lead].concat());
             let piece = if txt.len() >= shown && txt.is_char_boundary(shown) { txt[shown..].to_string() } else { String::new() };
             shown = txt.len();
             text(&piece)
         })?;
-        let svg = vocab.decode(&[vocab.prompt.as_slice(), out.tokens.as_slice()].concat());
+        let wrote = vocab.decode(&[vocab.prompt.as_slice(), out.tokens.as_slice()].concat());
+        // what the limit cut short is closed; what the model closed itself is checked and kept
+        let fin = close::finish(&wrote);
         Ok(VectorizeOutput {
-            svg,
-            closed: out.stopped,
+            svg: fin.svg,
+            closed: fin.valid,
+            truncated: !out.stopped,
+            repaired: fin.repaired,
+            max_length: (s.max_new + model::QUERY + vocab.prompt.len()) as u32,
             tokens: out.tokens.len() as u32,
             prompt_tokens: len as u32,
             prompt_seconds,
             seconds: t0.elapsed().as_secs_f64() - prompt_seconds,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_length_follows_the_drawing_between_the_floor_and_the_cap() {
+        assert_eq!(default_max_length(0), DEFAULT_MIN_LENGTH);
+        assert_eq!(default_max_length(100), DEFAULT_MIN_LENGTH, "a plain icon gets the floor");
+        let logo = default_max_length(4677);
+        assert!(logo > DEFAULT_MIN_LENGTH && logo < MAX_LENGTH_CAP, "{logo}");
+        assert!(default_max_length(5000) <= default_max_length(6000), "more drawing, more room");
+        assert_eq!(default_max_length(100_000), MAX_LENGTH_CAP);
+        assert_eq!(MAX_LENGTH_CAP, 8192);
+    }
+
+    #[test]
+    fn edges_count_the_pixel_pairs_that_differ() {
+        let flat = vec![0.5f32; 3 * pre::SIZE * pre::SIZE];
+        assert_eq!(pre::edges(&flat), 0);
+        // the left half black, the right half white: one vertical edge, SIZE pairs
+        let mut split = flat.clone();
+        for c in 0..3 {
+            for y in 0..pre::SIZE {
+                for x in 0..pre::SIZE {
+                    split[c * pre::SIZE * pre::SIZE + y * pre::SIZE + x] = if x < pre::SIZE / 2 { -2.0 } else { 2.0 };
+                }
+            }
+        }
+        assert_eq!(pre::edges(&split), pre::SIZE);
+        // a mild difference (under 24 grey levels) is not an edge
+        let mut soft = flat;
+        soft[0] += 0.05;
+        assert_eq!(pre::edges(&soft), 0);
     }
 }

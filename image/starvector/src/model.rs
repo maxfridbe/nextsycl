@@ -40,6 +40,8 @@ const LAYERS: usize = 24;
 const FF: usize = 8192;
 pub const POSITIONS: usize = 8192;
 const EPS: f32 = 1e-5;
+/// rows a decode step has at most (the beams): the silo's norm is used up to this many, the shared one for the encoder and the prefix
+const MAX_BEAMS_ROWS: usize = 8;
 
 /// float32 to IEEE half (round to nearest even)
 pub fn f32_to_f16(x: f32) -> u16 {
@@ -322,6 +324,16 @@ impl Model {
     }
 
     fn ln(&self, x: P, m: usize, c: usize, n: &Ln, out: M, dt: Dt) -> Result<()> {
+        // a decode step (a few rows, half out): the silo's, a work-group a row - the shared one sums a row in one work-item
+        if m <= MAX_BEAMS_ROWS && dt == Dt::F16 {
+            if let Some(sl) = crate::ffi::silo()? {
+                // SAFETY: plain query, then a norm of m float32 rows of c into m half rows.
+                if unsafe { (sl.ln_supported)(self.gpu.raw(), m as i64, c as i64) } == 1 {
+                    let rc = unsafe { (sl.layer_norm)(self.gpu.raw(), x, m as i64, c as i64, n.w.ptr() as P, n.b.ptr() as P, EPS, out) };
+                    return self.up_check(rc, "layer norm");
+                }
+            }
+        }
         self.nsd.layer_norm(x, Dt::F32, m, c, n.w.ptr(), n.b.ptr(), EPS, out, dt)
     }
 
@@ -502,6 +514,12 @@ impl Model {
     fn layers(&self, m: usize, beams: &[usize], pos: usize) -> Result<()> {
         let n = &self.nsd;
         let prefix = beams.len() == 1 && m > 1;
+        // the silo's decode attention, when it is built and runs these sizes
+        let silo = match crate::ffi::silo()? {
+            // SAFETY: a plain query of the silo's sizes.
+            Some(sl) if !prefix && unsafe { (sl.attn_supported)(self.gpu.raw(), beams.len() as i64, (pos + 1) as i64, HEADS as i64, HD as i64) } == 1 => Some(sl),
+            _ => None,
+        };
         for (li, b) in self.blocks.iter().enumerate() {
             self.ln(self.x.ptr(), m, D, &b.ln1, self.h.ptr(), Dt::F16)?;
             self.linear(self.h.ptr(), m, &b.q, self.q.ptr(), Dt::F16)?;
@@ -517,9 +535,24 @@ impl Model {
                     let c = &self.caches[bi];
                     c.k[li].copy_within(pos * HD * 2, &self.kb, i * HD * 2, HD * 2)?;
                     c.v[li].copy_within(pos * HD * 2, &self.vb, i * HD * 2, HD * 2)?;
-                    // the kernel reads query row `pos` of the pointer it is given: this beam's row, shifted back
-                    let q = at(&self.q, (i * D * 2) as isize - (pos * D * 2) as isize);
-                    n.attention_causal_rows(q, c.k[li].ptr(), c.v[li].ptr(), Dt::F16, pos, 1, HEADS, 1, HD, D, HD, at(&self.att, (i * D * 2) as isize))?;
+                }
+                if let Some(sl) = silo {
+                    // every beam at once, the keys split across work-groups
+                    let ks: Vec<P> = beams.iter().map(|&bi| self.caches[bi].k[li].ptr() as P).collect();
+                    let vs: Vec<P> = beams.iter().map(|&bi| self.caches[bi].v[li].ptr() as P).collect();
+                    // SAFETY: q and att hold a row of 16 x 128 halves a beam; each cache holds pos + 1 rows of 128 halves.
+                    let rc = unsafe {
+                        (sl.decode_attn)(self.gpu.raw(), self.q.ptr() as P, ks.as_ptr(), vs.as_ptr(), beams.len() as i64, (pos + 1) as i64, HEADS as i64, HD as i64,
+                                         self.att.ptr())
+                    };
+                    self.up_check(rc, "decode attention")?;
+                } else {
+                    for (i, &bi) in beams.iter().enumerate() {
+                        let c = &self.caches[bi];
+                        // the kernel reads query row `pos` of the pointer it is given: this beam's row, shifted back
+                        let q = at(&self.q, (i * D * 2) as isize - (pos * D * 2) as isize);
+                        n.attention_causal_rows(q, c.k[li].ptr(), c.v[li].ptr(), Dt::F16, pos, 1, HEADS, 1, HD, D, HD, at(&self.att, (i * D * 2) as isize))?;
+                    }
                 }
             }
             self.linear(self.att.ptr(), m, &b.o, self.y.ptr(), Dt::F16)?;

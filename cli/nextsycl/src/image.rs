@@ -474,7 +474,7 @@ fn vectorize_cmd(cfg: &Config, args: &[String]) -> Result<(), String> {
     use nextsycl_image::ImageEngine;
     let out = e.vectorize(&req, &mut |_| Ok(())).map_err(|e| e.0)?;
     eprintln!("{} tokens in {:.2} s after {:.2} s for the picture and prompt ({:.1} tokens/s){} on {}", out.tokens, out.seconds, out.prompt_seconds,
-              out.tokens as f64 / out.seconds.max(1e-9), if out.closed { ", ended by </svg>" } else { ", stopped at the length limit" }, gs[0].name);
+              out.tokens as f64 / out.seconds.max(1e-9), if out.truncated { ", stopped at the length limit (the SVG closed)" } else { ", ended by </svg>" }, gs[0].name);
     match opt(args, "--out") {
         Some(o) => {
             std::fs::write(o, &out.svg).map_err(|e| format!("{o}: {e}"))?;

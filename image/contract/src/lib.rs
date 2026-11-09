@@ -168,11 +168,19 @@ impl Default for VectorizeRequest {
 /// What a vectorization made
 #[derive(Clone, Debug, Default)]
 pub struct VectorizeOutput {
-    /// the SVG as the model wrote it ("<svg" and the tokens after it, decoded as its tokenizer decodes): it may stop
-    /// short of "</svg>" at the length limit (the caller closes or cuts it)
+    /// the SVG: complete and well-formed XML ("<svg" to "</svg>"). A model that ended it itself is returned as it
+    /// wrote it; when the length limit stopped it short the engine closes what it had (see `truncated`)
     pub svg: String,
-    /// it ended with "</svg>" (else the length limit stopped it)
+    /// `svg` is complete: it ends with "</svg>" and parses (false only when even the closed text did not parse)
     pub closed: bool,
+    /// the length limit stopped the model before it wrote "</svg>": `svg` is what it had written, cut back to its
+    /// last whole piece and closed
+    pub truncated: bool,
+    /// the engine changed the model's text (cut a partial token, closed open elements, added a namespace)
+    pub repaired: bool,
+    /// the sequence length the request was held to (max_length as the model counts it: the picture's rows and the
+    /// prompt included)
+    pub max_length: u32,
     pub tokens: u32,
     pub prompt_tokens: u32,
     /// seconds to see the picture and read the prompt, then to write

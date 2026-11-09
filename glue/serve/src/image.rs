@@ -650,11 +650,12 @@ impl ImageServer {
         let tok_s = out.tokens as f64 / out.seconds.max(1e-9);
         {
             let mut h = self.history.lock().unwrap();
-            h.push_front(json!({"kind": "vectorize", "prompt": format!("{} tokens{}", out.tokens, if out.closed { "" } else { ", cut at max_length" }),
+            h.push_front(json!({"kind": "vectorize", "prompt": format!("{} tokens{}", out.tokens, if out.truncated { ", cut at max_length" } else { "" }),
                                 "seconds": out.prompt_seconds + out.seconds, "wh": wh, "created": now()}));
             h.truncate(200);
         }
-        Ok(json!({"created": now(), "data": [{"svg": out.svg, "closed": out.closed, "tokens": out.tokens}],
+        Ok(json!({"created": now(), "data": [{"svg": out.svg, "closed": out.closed, "truncated": out.truncated, "repaired": out.repaired, "tokens": out.tokens,
+                                              "max_length": out.max_length}],
                   "nextsycl": {"seconds": out.prompt_seconds + out.seconds, "prompt_seconds": out.prompt_seconds, "tokens": out.tokens, "tok_s": tok_s, "wh": wh}}))
     }
 

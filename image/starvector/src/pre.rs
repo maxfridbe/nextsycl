@@ -145,6 +145,23 @@ pub fn resize(rgb: &[u8], w: usize, h: usize, ow: usize, oh: usize) -> Vec<u8> {
     out
 }
 
+/// How much drawing the picture holds, as the model sees it: the pixel pairs (right and below neighbours) in the encoder's
+/// input [3, 224, 224] that differ by more than 24 grey levels in some channel - the length of the picture's edges in
+/// pixels. A flat logo has a few hundred; a busy illustration several thousand.
+pub fn edges(px: &[f32]) -> usize {
+    const T: f32 = 24.0 / 255.0 / 0.26; // 24 levels in the normalised scale (the channels' deviations are 0.26 - 0.28)
+    let at = |c: usize, x: usize, y: usize| px[c * SIZE * SIZE + y * SIZE + x];
+    let mut n = 0;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let right = x + 1 < SIZE && (0..3).any(|c| (at(c, x, y) - at(c, x + 1, y)).abs() > T);
+            let below = y + 1 < SIZE && (0..3).any(|c| (at(c, x, y) - at(c, x, y + 1)).abs() > T);
+            n += right as usize + below as usize;
+        }
+    }
+    n
+}
+
 /// The encoder's input [3, 224, 224] (channels first, normalised) from a picture as the platform sends it
 pub fn pixels(p: &Picture) -> Vec<f32> {
     let flat = flatten_on_white(p);

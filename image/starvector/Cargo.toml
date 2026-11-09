@@ -12,3 +12,4 @@ nextsycl-gguf.workspace = true
 nextsycl-tok.workspace = true
 nextsycl-image.workspace = true
 serde_json.workspace = true
+roxmltree.workspace = true

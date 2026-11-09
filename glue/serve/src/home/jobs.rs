@@ -165,6 +165,12 @@ pub fn reentrant(b: &Value) -> Option<String> {
     ["reentrant_id", "reentrantid"].iter().find_map(|k| b[*k].as_str()).map(str::trim).filter(|r| !r.is_empty()).map(|r| r.chars().take(200).collect())
 }
 
+/// A cancel body that names a job by an id and by neither label nor reentrant_id: without a name `<kind>.cancel` stops
+/// whatever the kind's servers are making, so a client that sends only an id would stop everybody's work
+pub(crate) fn bare_id(b: &Value) -> bool {
+    s(b, "label").is_empty() && reentrant(b).is_none() && ["id", "job_id", "request_id", "job"].iter().any(|k| !b[*k].is_null())
+}
+
 /// Where a new job of `priority` goes among the waiting (in run order): after the last of its priority or higher
 fn place_for(waiting: &[Value], priority: i64) -> f64 {
     let p = |j: &Value| j["priority"].as_i64().unwrap_or(0);
@@ -629,6 +635,10 @@ impl Home {
     /// `<kind>.cancel {label}`: its jobs not ended stopped (a running one between steps, a waiting one at once); without
     /// a label whatever the kind's servers are making
     pub(crate) fn job_cancel(self: &Arc<Self>, kind: &str, b: &Value) -> Result<Value, Fail> {
+        if bare_id(b) {
+            return Err((400, format!("{kind}.cancel names its job by label or reentrant_id: a bare id is refused (it would fall through to stopping whatever runs). \
+                                      A job's label is the one it was submitted with (its id when it gave none)")));
+        }
         let label = s(b, "label");
         if label.is_empty() && reentrant(b).is_none() {
             let mut stopped = 0;
@@ -734,6 +744,19 @@ mod tests {
 
     fn job(id: &str, order: f64, priority: i64) -> Value {
         json!({"id": id, "kind": "image", "state": "queued", "order": order, "priority": priority})
+    }
+
+    #[test]
+    fn a_cancel_by_a_bare_id_is_refused() {
+        // an id alone (or with an empty label) would stop whatever runs
+        assert!(bare_id(&json!({"id": "j123"})));
+        assert!(bare_id(&json!({"id": "j123", "label": ""})));
+        assert!(bare_id(&json!({"request_id": "j123", "reentrant_id": "  "})));
+        // named by label or reentrant_id (an id beside it is ignored), or no job named at all (the pages' stop-all)
+        assert!(!bare_id(&json!({"label": "mine"})));
+        assert!(!bare_id(&json!({"reentrant_id": "r1", "id": "j123"})));
+        assert!(!bare_id(&json!({"label": "mine", "id": "j123"})));
+        assert!(!bare_id(&json!({})));
     }
 
     #[test]

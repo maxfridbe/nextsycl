@@ -956,9 +956,9 @@ pub struct ImageVectorizeReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub title: Option<String>,
-    /// the sequence at most as the model counts it (the picture's 257 rows and the prompt first: 5000 leaves 4741 tokens of SVG)
+    /// the sequence at most as the model counts it (the picture's 257 rows and the prompt first: 5000 leaves 4741 tokens of SVG; the cap is 8192, StarCoder's positions). None: derived from the picture - 4096 for a flat logo, up to 8192 for a busy one. When the limit stops the model the answer's SVG is closed and `truncated` is true
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
-    #[schema(min = 260, max = 8192, default = 5000)]
+    #[schema(min = 260, max = 8192)]
     pub max_length: Option<i64>,
     /// the model's id; none: the loaded one, else the first enabled
     #[serde(default, skip_serializing_if = "Option::is_none")]

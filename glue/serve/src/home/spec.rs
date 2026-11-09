@@ -38,8 +38,11 @@ const UPSCALED: &str = r#"{"type": "object", "properties": {"created": {"type": 
 
 /// image.vectorize's answer
 const VECTORIZED: &str = r#"{"type": "object", "properties": {"created": {"type": "integer"},
-  "data": {"type": "array", "items": {"type": "object", "properties": {"svg": {"type": "string", "description": "the SVG as the model wrote it (from <svg)"},
-    "closed": {"type": "boolean", "description": "</svg> ended it (false: max_length stopped it, an element maybe half written)"}, "tokens": {"type": "integer"}}}},
+  "data": {"type": "array", "items": {"type": "object", "properties": {"svg": {"type": "string", "description": "the SVG: complete and well-formed (from <svg to </svg>). When max_length stopped the model it is what it had written, cut back to its last whole element or attribute and closed"},
+    "closed": {"type": "boolean", "description": "svg ends with </svg> and parses as XML (true unless even the closed text did not parse)"},
+    "truncated": {"type": "boolean", "description": "max_length stopped the model before it wrote </svg>: the picture may be unfinished (raise max_length to give it room)"},
+    "repaired": {"type": "boolean", "description": "the engine changed the model's text (cut, closed, added the SVG namespace)"},
+    "max_length": {"type": "integer", "description": "the sequence length the request was held to (the one asked for, else derived from the picture)"}, "tokens": {"type": "integer"}}}},
   "run": {"type": "object", "properties": {"seconds": {"type": "number"}, "prompt_seconds": {"type": "number"}, "tokens": {"type": "integer"}, "tok_s": {"type": "number"}, "wh": {"type": "number", "nullable": true}}}}}"#;
 
 /// image.remove_background's answer (nextcuda's shape: the platform reads both)

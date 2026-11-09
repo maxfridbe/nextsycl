@@ -90,6 +90,7 @@ nextsycl-model3d-unimate = { path = "model3d/unimate" }
 nextsycl-models = { path = "glue/models" }
 nextsycl-serve = { path = "glue/serve" }
 serde_json = "1"
+roxmltree = "0.20"
 
 [profile.release]
 debug = 1
