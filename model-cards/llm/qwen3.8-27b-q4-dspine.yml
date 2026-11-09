@@ -1,0 +1,33 @@
+# Qwen3.8-27B UD-Q4_K_M with Tencent's DSpine draft (7 drafts; the B70, 32K) - for code
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: qwen3.8-27b-q4-dspine
+kind: llm
+arch: qwen35
+title: Qwen3.8-27B UD-Q4_K_M + DSpine draft (code; the B70, 32K)
+about: 'The Qwen3.8-27B UD-Q4_K_M card with Tencent''s DSpine-b16 draft (5 layers, 2 B) in MTP''s place, 7 drafts a step. tg 71 on code against MTP''s 59 (greedy, B70), but 48 on prose against 52 and 41 on a 13.6K-token document against 50: use it for code. The XMX verify products make 5+ drafts differ from plain greedy at near-ties (NS_Q35_XMX=0 restores bytes, tg 52). 32K context only: the draft takes 2.6 GiB.'
+gpus: '0'
+vram_gib: 26.0                   # measured on a B70 at 32K; the draft's weights, tables and cache are 2.6 GiB of it
+ctx: '32768'
+tools: true
+tasks: true
+env:
+  NS_Q35_DSPINE: auto            # the dspine/ folder beside the model (the two files below)
+  NS_Q35_DRAFTS: '7'             # drafts a step (at most 7: a verify pass is at most 8 rows)
+silo:                   # its tuned kernels: kernels/llm/qwen35/silo (dist/silo/libnextsycl-qwen35.so)
+  name: qwen35
+  required: true        # no load on the shared kernels alone (2-4x slower decode)
+files:
+  model: q27-q4
+  dspine:
+    key: q27-dspine
+    url: https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16/resolve/5f54174d301dbca65d9aa4448dc47e56732d9a12/model.safetensors
+    size: 4051831880
+    sha256: ac90f1df842ea66b23e4224f3e86624add547526f689ffe9e9c6b7a5937116b1
+    path: qwen3.8-27b/dspine/model.safetensors
+  dspine_config:
+    key: q27-dspine-config
+    url: https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16/resolve/5f54174d301dbca65d9aa4448dc47e56732d9a12/config.json
+    size: 2302
+    sha256: c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815
+    path: qwen3.8-27b/dspine/config.json
+guide: guides/chat.md
