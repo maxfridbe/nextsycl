@@ -87,4 +87,10 @@ no reentrant_id stops *whatever the kind's servers are making* (the pages' stop 
 other people's jobs. Refused for `image`, `audio` and `model3d` cancels (`jobs::bare_id`, tested). A body with nothing at all keeps
 its meaning (stop everything), as the pages use it.
 
-Test through a build copy's front door (own registry, ports 18000+, B70 only): see the numbers at the end.
+Tested through a build copy's front door (own registry, ports 18000+, B70 only, `NS_GPU_LOCK` of its own): a looping
+`image.vectorize` (max_length 8192, `wait: false`, label `svtest-cancel-1`) running at 800 tokens: `image.cancel {id}` refused
+and the job kept running; `image.cancel {label}` answered `{cancelled: 1, stopped: 1}`, the job was `cancelled` and `system.busy`
+false **0.5 s** later (the model stays loaded, idle: 3 GB on the card until its idle unload); the next `image.vectorize` through the
+same door ran at once (911 tokens in 6.8 s, `closed: true, truncated: false`), and a `max_length: 700` one came back
+`closed: true, truncated: true, repaired: true`, 441 tokens, ending `...</g></g></svg>`. A job still *waiting* is cancelled at once
+(`stopped: 0`).
