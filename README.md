@@ -52,6 +52,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `moss-image-sft-q4kxl` (also `-q8`, `-q6kxl`, `-q5kxl`, `-q4km`, `-bf16`) | **MOSS-Image-SFT** text to image (sentences, tags or a JSON layout; quoted text spelled) | 1024x1024, 50 steps with CFG: 46.7 s; 512x512, 12 steps: 3.4 s |
 | `z-image-turbo` (also `-int8`) | **Z-Image-Turbo** text to image in 8 steps (photographs; English and Chinese text) | 1024x1024: B70 4.5 s (int8 3.3 s), B65 6.8 s (4.8 s) |
 | `p-h3-image` (also `-q8`, `-lora`) | **P-H3-Image** text to image at 8 MP and edits with up to 8 pictures (MiniMax H3's denoiser, 8 steps) | B65: 2912x2912 34 s, 2048x2048 15.6 s, 1024x1024 4.6 s |
+| `minimax-h3-image` (also `-q5`, `-q8`, `-q3`, `-int8`) | **MiniMax-H3-Image** text to image and edits up to 16 MP in 6 steps (H3's denoiser) | B70, 6 steps: 2048x2048 11.0 s (int8 7.2 s), 4096x4096 52 s (int8 37.6 s) |
 | `unlimited-ocr-q8`, `-q4` | **Unlimited-OCR** pictures and PDFs to Markdown (tables as HTML, boxes), its own page | a page: ~2-3 s to see, ~130 tok/s written |
 | `paddleocr-vl-1.6` | **PaddleOCR-VL** text, tables (HTML), formulas (LaTeX), charts, seals, spotting; the same OCR page | a page: ~1.2 s to see, ~200-250 tok/s written |
 | `olmocr-2-7b-q8` | **olmOCR-2** whole pages to Markdown (tables HTML, equations LaTeX), turned pages righted; the same OCR page | a page: ~3 s to see, ~55 tok/s written |
