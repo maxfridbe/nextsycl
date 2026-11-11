@@ -150,6 +150,11 @@ impl Block {
         })
     }
 
+    /// The four block matrices, in product order: qkv, out, fc1, fc2
+    pub fn linears(&self) -> [&Weight; 4] {
+        [&self.qkv, &self.out_proj, &self.fc1, &self.fc2]
+    }
+
     /// The block's six tables for the timestep embeddings `t_emb` [R, t_dim]: shift, scale, gate for the attention
     /// half, then for the MLP half; each [R * modalities, hidden], row = timestep index * modalities + modality.
     pub fn tables(&self, cfg: &Config, t_emb: &[f32]) -> [Vec<f32>; 6] {
@@ -282,6 +287,10 @@ pub type Tap<'a> = &'a mut dyn FnMut(&str, &Tensor) -> Result<()>;
 /// true; false (or none set) leaves a call to the shared kernels
 pub type AttentionFn = Box<dyn Fn(Rows, Rows, Rows, &Tensor) -> Result<bool> + Send + Sync>;
 
+/// Another engine's whole product with a k-quant block matrix (the matrix, x, out, the stack's 16-bit expansion buffer
+/// for its own use): true when it did it; false leaves the expansion and the product to the rest
+pub type ProductFn = Box<dyn Fn(&KLinear, &Tensor, &Tensor, &Tensor) -> Result<bool> + Send + Sync>;
+
 /// The block stack.
 pub struct Blocks {
     pub cfg: Config,
@@ -293,6 +302,9 @@ pub struct Blocks {
     wbuf: Option<Tensor>,
     /// the attention the blocks call, when an engine brings its own (P-H3-Image's silo); else the shared kernels'
     pub attention: Option<AttentionFn>,
+    /// the k-quant products, when an engine brings its own (MiniMax-H3-Image's silo); else the shared expansion and
+    /// product
+    pub product: Option<ProductFn>,
 }
 
 impl Blocks {
@@ -325,15 +337,28 @@ impl Blocks {
             }
             None => None,
         };
-        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf, attention: None })
+        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf, attention: None, product: None })
     }
 
     /// `out = linear(x)` with one of the blocks' matrices.
     fn mm(&self, w: &Weight, x: &Tensor, out: &Tensor) -> Result<()> {
         match w {
             Weight::I8(l) => l.forward(x, out),
-            Weight::K(l) => l.forward(x, out, self.wbuf.as_ref().ok_or("a k-quant matrix without its expansion buffer")?),
+            Weight::K(l) => {
+                let wbuf = self.wbuf.as_ref().ok_or("a k-quant matrix without its expansion buffer")?;
+                if let Some(f) = &self.product {
+                    if f(l, x, out, wbuf)? {
+                        return Ok(());
+                    }
+                }
+                l.forward(x, out, wbuf)
+            }
         }
+    }
+
+    /// The expansion buffer of a k-quant stack (None for int8): what an engine's checks expand into
+    pub fn expansion_buffer(&self) -> Option<&Tensor> {
+        self.wbuf.as_ref()
     }
 
     /// Runs block `index` on the stream `x` [S, hidden], in place.

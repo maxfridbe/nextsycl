@@ -178,6 +178,58 @@ impl Outer {
     }
 }
 
+/// Where a step's time goes (NS_H3I_PROFILE): the queue drained after each stage, milliseconds summed per stage over
+/// the blocks; printed once a step. The waits cost a little: the totals are for finding, not for tables.
+#[derive(Default)]
+pub struct Profile {
+    pub stages: Vec<(&'static str, f64)>,
+}
+
+impl Profile {
+    /// Adds `ms` to `stage` (kept in first-seen order)
+    pub fn add(&mut self, stage: &'static str, ms: f64) {
+        match self.stages.iter_mut().find(|(n, _)| *n == stage) {
+            Some((_, t)) => *t += ms,
+            None => self.stages.push((stage, ms)),
+        }
+    }
+
+    pub fn total(&self) -> f64 {
+        self.stages.iter().map(|(_, t)| t).sum()
+    }
+
+    /// One line: the total, then each stage and its share
+    pub fn line(&self) -> String {
+        let total = self.total().max(1e-9);
+        let parts: Vec<String> = self.stages.iter().map(|(n, t)| format!("{n} {t:.0} ms ({:.0} %)", 100.0 * t / total)).collect();
+        format!("{total:.0} ms: {}", parts.join(", "))
+    }
+}
+
+/// What ran before a block's tap of this name (crates/h3 `dit::Blocks::block` taps after each stage, in order)
+pub fn stage_of(tap: &str) -> &'static str {
+    match tap {
+        "h1" | "h2" => "norm",
+        "qkv" => "qkv",
+        "qkv_rotated" => "rope",
+        "att" => "attention",
+        "attn_out" => "out",
+        "x1" | "x2" => "gate",
+        "fc1" => "fc1",
+        "mlp" => "swiglu+fc2",
+        _ => "other",
+    }
+}
+
+/// A step made ready (`Run::prepare`)
+pub struct Prepared {
+    pub sigma: f32,
+    sigma_in: f32,
+    ts: Timesteps,
+    t_emb: Vec<f32>,
+    step: Step,
+}
+
 /// One picture's network: the refined text, the layout, the edit's conditioning rows and the buffers
 pub struct Run<'a> {
     pub blocks: &'a Blocks,
@@ -191,6 +243,8 @@ pub struct Run<'a> {
     /// the latent's height and width
     pub h: usize,
     pub w: usize,
+    /// each step's time by stage, printed (NS_H3I_PROFILE)
+    pub profile: bool,
 }
 
 impl<'a> Run<'a> {
@@ -224,7 +278,8 @@ impl<'a> Run<'a> {
             cond_rows.push((s.start, embed(&dev, &outer.video_patch, cfg.hidden, &rows)?));
         }
         let s = layout.tokens();
-        Ok(Run { x: Tensor::new(&dev, DType::BF16, &[s, cfg.hidden])?, scratch: Scratch::new(&dev, cfg, s, DType::BF16)?, blocks, outer, layout, text, tags, cond_rows, h, w })
+        Ok(Run { x: Tensor::new(&dev, DType::BF16, &[s, cfg.hidden])?, scratch: Scratch::new(&dev, cfg, s, DType::BF16)?, blocks, outer, layout, text, tags, cond_rows, h, w,
+                 profile: false })
     }
 
     pub fn tokens(&self) -> usize {
@@ -247,14 +302,45 @@ impl<'a> Run<'a> {
     /// The network at noise level `sigma` for a step to `next`: latents [24, h, w] in, the velocity out (the negated
     /// heads, as the reference returns them). `between(i)` before block i (an error stops).
     pub fn net(&mut self, latent: &[f32], sigma: f32, next: f32, between: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
-        let cfg = self.blocks.cfg;
-        let o = self.outer;
-        let dev = self.x.buf.device().clone();
+        let p = self.prepare(sigma)?;
+        self.net_prepared(p, latent, next, between)
+    }
+
+    /// What a step at noise level `sigma` fixes before the blocks run (the timestep rows, the tables of every block,
+    /// the rotations): host work and small uploads (~40 ms; making the next step's on another thread while the card
+    /// runs this one was tried: int8 on the B70, 6 steps at 1 / 4 / 8.5 MP, 1.83 / 6.50 / 14.55 s against 1.84 / 6.54 / 14.57 -
+    /// no gain, so it is not kept)
+    pub fn prepare(&self, sigma: f32) -> Result<Prepared> {
+        let cfg = &self.blocks.cfg;
+        let dev = self.x.buf.device();
         // the model gets sigma as timestep = sigma * 1000 and divides it again
         let sigma_in = (sigma * 1000.0) / 1000.0;
         let ts = self.timesteps(sigma_in);
-        let t_emb = ts.embeddings(&o.t_table, cfg.t_dim);
-        let step = Step::new(&dev, self.blocks, &ts.rows, &self.layout.positions, &o.inv_freq, &t_emb)?;
+        let t_emb = ts.embeddings(&self.outer.t_table, cfg.t_dim);
+        let step = Step::new(dev, self.blocks, &ts.rows, &self.layout.positions, &self.outer.inv_freq, &t_emb)?;
+        Ok(Prepared { sigma, sigma_in, ts, t_emb, step })
+    }
+
+    /// The network for a prepared step (`prepare(sigma)`) to `next`: as `net`
+    pub fn net_prepared(&self, p: Prepared, latent: &[f32], next: f32, between: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
+        let cfg = self.blocks.cfg;
+        let o = self.outer;
+        let dev = self.x.buf.device().clone();
+        let Prepared { sigma, sigma_in, ts, t_emb, step } = p;
+        let profiling = self.profile;
+        let mut prof = Profile::default();
+        if profiling {
+            dev.wait()?;
+        }
+        let mut clock = std::time::Instant::now();
+        let lap = |p: &mut Profile, c: &mut std::time::Instant, stage: &'static str| -> Result<()> {
+            if profiling {
+                dev.wait()?;
+                p.add(stage, c.elapsed().as_secs_f64() * 1e3);
+                *c = std::time::Instant::now();
+            }
+            Ok(())
+        };
         let (tx, img) = (self.layout.segment(Kind::Text).ok_or("no text rows")?, self.layout.segment(Kind::Video).ok_or("no image rows")?);
         let n = img.stop - img.start;
         if latent.len() != LATENT_C * self.h * self.w || n * PATCH * PATCH != self.h * self.w {
@@ -266,11 +352,22 @@ impl<'a> Run<'a> {
         for (start, rows) in &self.cond_rows {
             self.x.copy_rows(*start, rows, 0, rows.shape[0])?;
         }
+        lap(&mut prof, &mut clock, "embed")?;
         for i in 0..self.blocks.blocks.len() {
             between(i)?;
-            self.blocks.block(i, &self.x, &step, &self.scratch, None, None)?;
+            if profiling {
+                let mut tap = |name: &str, _: &Tensor| lap(&mut prof, &mut clock, stage_of(name));
+                self.blocks.block(i, &self.x, &step, &self.scratch, None, Some(&mut tap))?;
+            } else {
+                self.blocks.block(i, &self.x, &step, &self.scratch, None, None)?;
+            }
         }
-        self.head_out(&ts, &t_emb, img.start, n, sigma_in, next)
+        let v = self.head_out(&ts, &t_emb, img.start, n, sigma_in, next)?;
+        lap(&mut prof, &mut clock, "head")?;
+        if profiling {
+            eprintln!("profile {} tokens, sigma {sigma:.3}: {}", self.tokens(), prof.line());
+        }
+        Ok(v)
     }
 
     /// The final layer and the step's head on the image rows [start, start + n): the velocity [24, h, w]
@@ -359,6 +456,20 @@ mod tests {
         assert_eq!((s12[0], s12[12]), (1.0, 0.0));
         assert!((s12[1] - (1.0 + PDD_SIGMAS[1]) / 2.0).abs() < 1e-6);
         assert!(s12.windows(2).all(|w| w[1] < w[0]));
+    }
+
+    #[test]
+    fn the_profile_sums_stages_in_order() {
+        let mut p = Profile::default();
+        for tap in ["h1", "qkv", "qkv_rotated", "att", "attn_out", "x1", "h2", "fc1", "mlp", "x2"] {
+            p.add(stage_of(tap), 1.0);
+        }
+        let names: Vec<&str> = p.stages.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["norm", "qkv", "rope", "attention", "out", "gate", "fc1", "swiglu+fc2"]);
+        assert_eq!(p.stages[0].1, 2.0);
+        assert_eq!(p.total(), 10.0);
+        assert!(p.line().starts_with("10 ms: norm 2 ms (20 %)"));
+        assert_eq!(stage_of("something else"), "other");
     }
 
     #[test]

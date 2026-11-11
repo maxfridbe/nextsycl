@@ -41,8 +41,8 @@ Other step counts read that grid at even positions and blend the heads by the sh
 |---|---|---|---|
 | `minimax-h3-image` | Q4_K_M GGUF | 10.1 GiB | the GGUF maker's recommendation |
 | `minimax-h3-image-q5` | Q5_K_M GGUF | 12.3 GiB | closer to bf16 |
-| `minimax-h3-image-q8` | Q8_0 GGUF | 19.1 GiB | the closest to bf16 of the GGUFs |
-| `minimax-h3-image-q3` | Q3_K_M GGUF | 14.7 GiB | read as Q6_K blocks (same values): the smallest download, not the smallest on the card |
+| `minimax-h3-image-q8` | Q8_0 GGUF | 19.1 GiB | the closest to bf16 of the GGUFs, and the fastest of them up to 4 MP (int8 products) |
+| `minimax-h3-image-q3` | Q3_K_M GGUF | 7.7 GiB | the smallest download and the smallest on the card; the most error |
 | `minimax-h3-image-int8` | ComfyUI int8 ConvRot | 18.0 GiB | int8 products: ~30 % faster than the GGUFs; about as close as Q8_0 |
 
 All share H3's Qwen3-VL 32B text encoder (Q4_K_M, streamed from pinned host memory: ~14 GiB of RAM) and the image

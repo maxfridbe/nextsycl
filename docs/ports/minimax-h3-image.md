@@ -101,21 +101,120 @@ Where the time goes:
 - Against P-H3-Image's int8 path (the baseline asked for: 8 MP, B70 22 s): MiniMax-H3-Image int8 at 8.5 MP is 15.6 s on
   the B70 (6 steps against P-H3-Image's 8: the same per step, ~2.4 s), 23.7 s on the B65 (P-H3-Image's B65 8 MP: 34 s).
 
+## Second pass: performance (2026-11-11)
+
+The tables above are the first pass. This pass measured where a step goes, then tried each lever and kept only what
+won. Same machine, `image gen --local`, the second picture of n = 2, 6 steps, B70 = card 0, B65 = card 1; "steps" is the
+6 denoiser steps alone; the refiner and decode are listed apart.
+
+### Where a step goes (NS_H3I_PROFILE, Q4_K_M, B70)
+
+The new profile drains the queue after each stage of each block (so it runs a few percent slow), and the silo's Sage
+reports its own phases:
+
+| stage, ms per step (share) | 1 MP (1,074 tokens) | 16.8 MP (16,434 tokens) |
+|---|---|---|
+| qkv product (expansion + GEMM) | 152 (27 %) | 1,433 (17 %) |
+| attention | 32 (6 %) | 2,846 (34 %) |
+| out product | 48 (8 %) | 472 (6 %) |
+| fc1 product | 192 (34 %) | 1,879 (23 %) |
+| swiglu + fc2 product | 109 (19 %) | 1,111 (13 %) |
+| norms, rope, gates | 35 (6 %) | 523 (6 %) |
+| patch embed, head | 3 (1 %) | 21 (0 %) |
+| total | 570 | 8,284 |
+
+- The k-quant expansion alone (one block's four matrices, synthetic blocks): the shared kernels' Q4_K 2.00 ms, the silo's
+  1.05 ms - 100 against 53 ms a step.
+- Sage at 16.8 MP, 50 calls: preparation 165 ms, the ARK kernel 2,630 ms (147 TFLOPS counted as 4 S^2 D H), the result's
+  conversion 46 ms. The kernel is 92 % of attention; the passes around it are 2.5 % of a step.
+- The bf16 GEMM is already near the card's rate: oneDNN measured alone on the B70 (dqbench, bf16 x bf16, [N, K]
+  weights) 163 - 176 TFLOPS from 4,096 rows up, 112 - 170 at 1,074 rows; the 8,192-row chunks of the shared nsd_linear
+  cost +2.4 ms a block at 16,434 rows (qkv 2 x 11.63 + 0.26 ms against 21.86 in one product).
+
+### What was tried
+
+| change | measured | kept |
+|---|---|---|
+| silo expansion of Q4_K / Q5_K / Q8_0 (16 values a work-item from 16-byte loads; bit-exact: `check --stages expand`, 0 of 2,312,110,080 values differ for each file) | 53 against 100 ms a step alone; a picture, Q4_K_M B70 against the shared expansion the same day (NS_H3I_SILO_EXPAND=0): 1 MP 3.68 against 3.73 s, 4 MP 10.44 against 10.58, 16.8 MP 50.17 against 50.33 | yes (small, exact) |
+| Q3_K read as stored (110 bytes a block) and expanded in the silo, instead of transcoded to Q6_K (210) | card after load 8.8 against 15.8 GiB; exact against the Q6_K form; speed: see the tables (the first version, 44 scattered byte loads a lane, was 3.6x Q4_K's expansion: 1 MP 4.51 s; staged through local memory now) | yes |
+| Q8_0 products by oneDNN's int8 weight decompression (s8 values, half scales every 32 along K, fpmath bf16; repacked once at load in place, same bytes) | B70 1 MP 2.64 against 4.06 s (-35 %), 4 MP 10.02 against 10.90 (-8 %), 16.8 MP 50.18 against 50.58 | yes |
+| one bf16 product over all rows (the silo's oneDNN call instead of nsd_linear's 8,192-row chunks) for the expanded kinds | dqbench alone: -2.4 ms a block at 16,434 rows; in a picture (Q4_K_M B70 16.8 MP, same day): 50.73 s against 50.33 with the shared chunked path and 50.17 with the silo's expansion + chunks | no (the silo chunks as nsd_linear does) |
+| Q4_K by oneDNN decompression (u4 + scales + integer zero points; float zero points, which Q4_K's mins need, are refused) | dqbench B70, 4,120 rows: qkv 8.40 ms against bf16 5.50 + expansion; fc1 11.37 against 7.42 - 112 TFLOPS against 171 | no |
+| Q3_K / Q6_K by s4 / s8 decompression (group 16) | s4 142 TFLOPS, s8 g16 154 - 166 against bf16 171 at 4,120+ rows: slower than expansion + bf16 from 4 MP up | no |
+| int8 products for GGUFs (requantize at load) | would need the int8 file's memory (8 bits a value) and adds a second rounding: the int8 ConvRot file already is that, closer to bf16 | no (documented) |
+| the next step's tables on a thread while the card runs this one (~40 ms of host work a step) | int8 B70 1 / 4 / 8.5 MP 1.83 / 6.50 / 14.55 s against 1.84 / 6.54 / 14.57 | no |
+| the token refiner kept on the card (NS_H3I_KEEP_REFINER=1) | saves 0.08 - 0.17 s a picture for 1.49 GiB on the card | off by default (option) |
+| the VAE encoder kept from the first edit | not measurable with `--local` (one request a process); it would hold the encoder on the card between edits | no (written, removed unmeasured) |
+| the text encoder's file read ahead at load (posix_fadvise WILLNEED) for the first request's 12 s cold read | not measurable here: the 17 GiB file was in the page cache in every run (first pictures' text 1.7 - 4.6 s), and evicting it to measure would also evict it for production's H3 video engine, which reads the same file | no (written, removed unmeasured) |
+| decoder batch 32 / 64 tiles at 16.8 MP (NS_H3I_VAE_BATCH) | decode 2.20 / 2.25 s against 2.15 at 16 | no |
+| Sage kernel tiles (ARK's SageConfig: q 256 x kv 64, 2 stages) | not tried: it needs a sycl-tla build of the silo, and kernels/build.sh builds an engine's silo either from silo/*.cpp or from silo/tla (both write libnextsycl-<arch>.so) | open |
+
+### Parity after the kept changes (576 x 384, seed 3, 6 steps, B70)
+
+Teacher-forced velocities are unchanged within the run-to-run spread of the GPU path (the int8 per-step numbers repeat
+to the last digit; the k-quant ones move in the third digit between runs even with bit-exact matrices). The 6-step free
+run's end latents move more from run to run: int8 three runs 1.41e-1, 1.17e-1, 1.47e-1 with no change at all.
+
+| | int8 | Q8_0 (decompression) | Q5_K_M | Q4_K_M | Q3_K_M (as stored) |
+|---|---|---|---|---|---|
+| refined text | 5.8e-3 | 7.2e-3 | 3.0e-2 | 5.8e-2 | 1.2e-1 |
+| stream after block 49, step 0 | 5.4e-2 | 4.3e-2 | 1.1e-1 | 1.9e-1 | 3.2e-1 |
+| velocity, steps 0 .. 5 | 1.9e-2 - 5.9e-2 | 2.1e-2 - 5.4e-2 | 5.2e-2 - 1.2e-1 | 9.2e-2 - 1.4e-1 | 1.6e-1 - 2.5e-1 |
+| velocity cosine, worst | 0.99825 | 0.99853 | 0.99303 | 0.99072 | 0.96938 |
+| final latents | 1.2e-1 | 1.1e-1 | 2.7e-1 | 3.8e-1 | 5.3e-1 |
+| first pass: velocity / worst cosine | same digits | 2.1e-2 - 5.3e-2 / 0.99860 | 5.6e-2 - 1.2e-1 / 0.99330 | 9.2e-2 - 1.3e-1 / 0.99104 | 1.6e-1 - 2.5e-1 / 0.96938 |
+
+### Speed now (6 denoiser steps, seconds; before = the first pass's tables above)
+
+The second picture of n = 2 (no text encoder); "steps" only. Add the refiner (loaded per picture: 0.08 - 0.13 s) and the
+decode (0.09 s at 1 MP, 0.45 at 4, 0.83 at 8.5, 1.64 at 16.8 on the B70; 0.13 / 0.64 / 1.17 / 2.33 on the B65). Card
+0 had 10 - 15 GB of another, idle workload resident during these runs (the front door reported no card busy): run-to-run
+spread is about 1 %.
+
+| B70 | Q4_K_M before -> now | Q8_0 | Q5_K_M | Q3_K_M | int8 |
+|---|---|---|---|---|---|
+| 1 MP | 3.72 -> 3.68 | - -> 2.64 (expanded: 4.06) | - -> 3.72 | - -> 3.87 | 1.84 -> 1.83 |
+| 4 MP | 10.52 -> 10.44 | 10.83 -> 10.02 | 10.58 -> 10.58 | 10.66 -> 10.61 | 6.54 -> 6.50 |
+| 8.5 MP | 22.27 -> 22.22 | - -> 21.79 | - | - -> 22.30 (a) | 14.57 -> 14.55 |
+| 16.8 MP | 50.27 -> 50.17 | 50.58 -> 50.18 | 50.36 -> 50.28 | 50.08 -> 49.93 | 35.77 -> 35.69 |
+| card after load, GiB | 11.1 | 20.1 | 13.4 | 15.8 -> **8.8** | 18.7 |
+| card peak at 16.8 MP (b) | 14.4 | 22.9 (c) | 16.5 | 18.8 -> **12.1** | 21.7 |
+
+| B65 | Q4_K_M before -> now | int8 |
+|---|---|---|
+| 1 MP | 5.45 -> 5.25 | 2.75 -> 2.74 |
+| 4 MP | 15.88 -> 15.63 | 9.94 -> 9.88 |
+| 8.5 MP | 34.63 -> 34.38 | 22.34 -> 22.32 |
+| 16.8 MP | 79.01 -> 78.74 | 55.32 -> 55.30 |
+
+(a) the build with one product over all rows (8.5 MP is 10,629 rows: one chunk more); 1 MP is under 8,192 rows either
+way. (b) the front door's reading, 10^6-byte MB / 2^30 as the first pass gave it. (c) not remeasured without the kept
+refiner: the Q8_0 repack is in place (same bytes) and adds no buffer.
+
+The int8 file's code path is unchanged by this pass (its numbers are a re-measure). In short: Q8_0 is now the fastest
+GGUF up to 4 MP (-28 % at 1 MP against Q4_K_M, -7.5 % at 4 MP against its own first pass); Q3_K_M is now the smallest file
+on the card (8.8 GiB after load against Q4_K_M's 11.1) at Q4_K_M's speed; Q4_K_M and Q5_K_M gain ~1 % from the silo's
+expansion on the B70 and 0.3 - 4 % on the B65 (5.45 -> 5.25 s at 1 MP); the int8 file stays the fastest overall (1.4 - 2x the
+GGUFs).
+
 ## Kept and lost
 
 - Kept: text to image and edits (up to 16 pictures), 1 - 16.9 MP, the heads' 6-step grid and other step counts read off
   it as stable-diffusion.cpp does, every file the model has (Q3_K_M, Q4_K_M, Q5_K_M, Q8_0 GGUFs; int8 ConvRot).
+- Second pass, kept: the silo's expansion for the GGUFs (exact), Q3_K held as stored (Q3_K_M now
+  the smallest on the card), Q8_0 by int8 decompression, the token refiner kept as an option, the step profile
+  (NS_H3I_PROFILE) and the bit-for-bit expansion check (`image check --stages expand`).
 - Lost / not run: MiniMax's prompt enhancer (MiniMaxAI/MiniMax-H3-Image-PE, a Qwen3.8-27B fine-tune) - prompts are
   rendered as written; Comfy-Org's w4a8 file (needs a 4-bit codebook kernel); the bf16 file (40 GB: does not fit a card;
-  it is the reference). Q3_K_M holds Q6_K's size on the card (14.7 GiB of blocks, more than Q4_K_M's 10.1): it saves
-  download, not memory.
+  it is the reference).
 
 ## Open
 
-- Faster GGUF products: a fused Q4_K / Q5_K / Q8_0 x bf16 XMX kernel in the silo would only remove the few-percent
-  expansion; the real lever for GGUF speed is int8 products, which the int8 file already gives with less error. Not done.
-- Attention at 16 MP (half of a step by P-H3-Image's split): a better long-sequence kernel would help most there.
+- Attention at 16.8 MP is a third of a step and 92 % of it is ARK's Sage kernel at 147 TFLOPS: tile / pipeline variants
+  need a sycl-tla silo (see above). The int8 P V variant ARK has would be faster and looser; not tried as a default.
+- GGUF speed: the bf16 products run at 160 - 175 TFLOPS of the B70's; what is left is int8 math, which only the int8
+  file gives exactly. A Q4_K kernel that reads nibbles inside an XMX GEMM could save the expansion (53 ms a step) and
+  the extra weight traffic at 1 MP; oneDNN's own (u4) was slower.
 - Edit parity against the reference (ref.py has no edit stage); the vision tower and VAE encoder are H3's, checked in
   the video port.
-- Keep the refiner and the VAE encoder resident between requests.
 - The license: hosted service to third parties needs MiniMax's written authorization (see the cards).

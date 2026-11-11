@@ -1,4 +1,4 @@
-# MiniMax-H3-Image Q3_K_M (the smallest download; Rust + SYCL)
+# MiniMax-H3-Image Q3_K_M (the smallest download and the smallest on the card; Rust + SYCL)
 # model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
 id: minimax-h3-image-q3
 kind: image
@@ -6,10 +6,10 @@ arch: minimax-h3-image
 license: minimax-h3-image-community
 commercial: false
 license_note: 'MiniMax-H3-Image Community License Agreement (MiniMax, 2026-11-10): not licensed in the European Union, the United Kingdom, South Korea or the United States; written authorization from MiniMax (platform.minimax.io/license) before offering it as a hosted service to third parties or above US$1 million yearly revenue; commercial products show "MiniMax-H3-Image"; its Acceptable Use Policy binds every user; its outputs may not improve another model; redistributed copies carry the agreement and a NOTICE. The text encoder is MiniMax H3''s (its own license).'
-title: 'MiniMax-H3-Image Q3_K_M (the smallest download; Rust + SYCL)'
-about: 'as minimax-h3-image with Hearthscale''s Q3_K_M GGUF: its Q3_K matrices are read as the same values in Q6_K blocks (the shared kernels expand Q6_K, not Q3_K), so it holds 14.7 GiB of blocks on the card - more than Q4_K_M - and has Q3_K''s error: a download-size choice, not a memory one'
+title: 'MiniMax-H3-Image Q3_K_M (the smallest on the card; Rust + SYCL)'
+about: 'as minimax-h3-image with Hearthscale''s Q3_K_M GGUF: its Q3_K matrices stay as stored on the card (7.7 GiB of blocks, 3.44 bits a value) and the engine''s silo expands them to bf16 a matrix at a time, at Q4_K_M''s speed; Q3_K''s error (the largest of the files, lettering still right at the default size). Without the silo they are read as Q6_K blocks (14.7 GiB)'
 gpus: '0,1'
-vram_gib: 19.5                  # B70, 4096x4096: 18.8 GiB peak (15.8 after load: Q3_K read as Q6_K)
+vram_gib: 12.5                  # B70, 4096x4096: 12.1 GiB peak (8.8 after load: Q3_K as stored)
 defaults:
   steps: 6
   cfg: 1.0
