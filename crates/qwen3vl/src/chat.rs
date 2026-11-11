@@ -79,6 +79,23 @@ pub struct WriteOptions {
     pub stop: Vec<u32>,
 }
 
+/// One written token's attention, as `Writer::write` asks an engine's own kernel for it: q [hq][d] at `q`; the cache's
+/// keys and values `n` rows of stride `kvs` floats (head g at g * d) from `k` / `v`; out [hq][d]. All float32 on the card
+pub struct OneRow {
+    pub q: *const std::ffi::c_void,
+    pub k: *const std::ffi::c_void,
+    pub v: *const std::ffi::c_void,
+    pub n: usize,
+    pub kvs: usize,
+    pub hq: usize,
+    pub hkv: usize,
+    pub d: usize,
+    pub out: *mut std::ffi::c_void,
+}
+
+/// An engine's one-row attention (`OneRow`); none: the shared causal attention by rows
+pub type Attend<'a> = Option<&'a dyn Fn(&OneRow) -> Result<()>>;
+
 /// splitmix64: a sampled token's randomness, the same for the same seed
 struct Rng(u64);
 
@@ -177,8 +194,9 @@ impl Writer {
 
     /// The prompt `ids` (pictures `seen` at their `<|image_pad|>` runs) read, then tokens written until a stop id,
     /// `max_tokens`, or `each` (given the text so far as it grows) answering false
-    pub fn write(&self, enc: &TextEncoder, nsd: &Nsd, ids: &[u32], seen: &[&vision::Seen], o: &WriteOptions, each: &mut dyn FnMut(&str) -> bool)
-                 -> Result<Written> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn write(&self, enc: &TextEncoder, nsd: &Nsd, ids: &[u32], seen: &[&vision::Seen], o: &WriteOptions, attend: Attend,
+                 each: &mut dyn FnMut(&str) -> bool) -> Result<Written> {
         let t0 = Instant::now();
         let s = ids.len();
         if s == 0 {
@@ -298,7 +316,10 @@ impl Writer {
                 nsd.int8_linear(hb1.ptr(), Dt::F32, 1, d, l.qkv.ptr(), qkv_w, l.qkv_s.ptr(), qkv_w, none(), r, Dt::F32, GROUP)?;
                 nsd.rms_rope(r, Dt::F32, 1, h, HEAD, qkv_w, l.q_norm.ptr(), EPS, cs1.ptr(), HEAD)?;
                 nsd.rms_rope(f32p(c, row * qkv_w + h * HEAD), Dt::F32, 1, kv, HEAD, qkv_w, l.k_norm.ptr(), EPS, cs1.ptr(), HEAD)?;
-                nsd.attention_causal_rows(c.ptr(), f32p(c, h * HEAD), f32p(c, (h + kv) * HEAD), Dt::F32, row, 1, h, kv, HEAD, qkv_w, qkv_w, att1.ptr())?;
+                match attend {
+                    Some(a) => a(&OneRow { q: r, k: f32p(c, h * HEAD), v: f32p(c, (h + kv) * HEAD), n: row + 1, kvs: qkv_w, hq: h, hkv: kv, d: HEAD, out: att1.ptr() })?,
+                    None => nsd.attention_causal_rows(c.ptr(), f32p(c, h * HEAD), f32p(c, (h + kv) * HEAD), Dt::F32, row, 1, h, kv, HEAD, qkv_w, qkv_w, att1.ptr())?,
+                }
                 nsd.int8_linear(att1.ptr(), Dt::F32, 1, h * HEAD, l.o.ptr(), d, l.o_s.ptr(), d, none(), o1.ptr(), Dt::F32, GROUP)?;
                 nsd.gate_add(x1.ptr(), Dt::F32, 1, d, o1.ptr(), Dt::F32, none(), none())?;
                 nsd.rms_norm_mod(x1.ptr(), Dt::F32, 1, d, l.post_norm.ptr(), EPS, none(), none(), none(), hb1.ptr(), Dt::F32)?;

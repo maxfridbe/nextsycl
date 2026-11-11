@@ -19,8 +19,10 @@ use std::time::Instant;
 use nextsycl_diffusion::kernels::Nsd;
 use nextsycl_image::{Defaults, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, OcrOutput, OcrPrompt, OcrRequest, Picture, Result, Sampler,
                      Schedule, Step};
-use nextsycl_qwen3vl::chat::{WriteOptions, Writer};
+use nextsycl_qwen3vl::chat::{OneRow, WriteOptions, Writer};
 use nextsycl_qwen3vl::TextEncoder;
+
+mod ffi;
 
 pub const ARCH: &str = "qwen3vl-describe";
 pub const ROLES: &[&str] = &["text-encoder", "tokenizer"];
@@ -104,7 +106,21 @@ impl Describer {
                                seed: req.seed, stop: self.stop.clone() };
         let seen_s = t0.elapsed().as_secs_f64();
         let mut shown_len = 0usize;
-        let out = self.writer.write(&self.enc, &self.nsd, &ids, &[&seen], &o, &mut |so_far| {
+        // a written token's attention on the silo (flash decoding) when it is built and takes the sizes
+        let (hq, hkv) = (self.enc.heads, self.enc.kv_heads);
+        let silo = ffi::silo()?.filter(|s| unsafe { (s.attn1_supported)(hq as i64, hkv as i64, 128) } == 1);
+        let scratch = match silo {
+            Some(s) => Some(nextsycl_core::DevBuf::f32(&self.nsd.gpu, unsafe { (s.attn1_scratch)((ids.len() + o.max_tokens) as i64, hq as i64, 128) } as usize)?),
+            None => None,
+        };
+        let gpu = self.nsd.gpu.clone();
+        let attend = |a: &OneRow| -> Result<()> {
+            let (s, sc) = (silo.expect("checked"), scratch.as_ref().expect("checked"));
+            // SAFETY: the writer's cache and rows hold the sizes named; the scratch is sized for the longest cache
+            ffi::check(unsafe { (s.attn1)(gpu.raw(), a.q.cast(), a.k.cast(), a.v.cast(), a.n as i64, a.kvs as i64, a.hq as i64, a.hkv as i64, a.d as i64,
+                                          sc.fp(), a.out.cast()) }, "the silo's one-row attention")
+        };
+        let out = self.writer.write(&self.enc, &self.nsd, &ids, &[&seen], &o, silo.map(|_| &attend as &dyn Fn(&OneRow) -> Result<()>), &mut |so_far| {
             text(&so_far[shown_len..]);
             shown_len = so_far.len();
             true
