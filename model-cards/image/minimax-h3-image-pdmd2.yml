@@ -1,6 +1,6 @@
 # MiniMax-H3-Image in 2 steps (int8 ConvRot + the pDMD 2-step LoRA: the live editor's card; Rust + SYCL)
 # model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
-id: minimax-h3-image-2step
+id: minimax-h3-image-pdmd2
 kind: image
 arch: minimax-h3-image
 license: minimax-h3-image-community

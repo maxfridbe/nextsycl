@@ -212,7 +212,9 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
         "image" if arch == "birefnet" || arch == "isnet" => (vec!["remove_background", "mask", "rgba"], vec!["image.remove_background"]),
         "image" => {
             let mut c = vec!["generate", "edit", "compose", "img2img", "loras"];
-            if m["env"]["NS_QI_SIGMAS"].is_string() {
+            // a few-step preset: Qwen-Image's sigmas, or MiniMax-H3-Image's step count of 4 or fewer (the pDMD 2-step card)
+            let h3i_steps = m["env"]["NS_H3I_STEPS"].as_str().and_then(|v| v.trim().parse::<u32>().ok()).or_else(|| m["env"]["NS_H3I_STEPS"].as_u64().map(|v| v as u32));
+            if m["env"]["NS_QI_SIGMAS"].is_string() || h3i_steps.is_some_and(|n| n <= 4) {
                 c.push("few_step");
             }
             (c, vec!["image.generate", "image.edit"])
@@ -1546,6 +1548,22 @@ mod tests {
         assert!(caps.contains(&"word_timestamps") && !caps.contains(&"speech"));
         let (_, methods) = capabilities(&json!({"id": "voxcpm2", "kind": "audio", "arch": "voxcpm2", "speech": ["clone"]}));
         assert!(methods.contains(&"audio.speak") && !methods.contains(&"audio.transcribe"));
+    }
+
+    #[test]
+    fn the_pdmd_2step_card_is_a_few_step_editor() {
+        let card = json!({"id": "minimax-h3-image-pdmd2", "kind": "image", "arch": "minimax-h3-image", "env": {"NS_H3I_STEPS": "2", "NS_H3I_SHIFT": "12"}});
+        let (caps, methods) = capabilities(&card);
+        assert!(caps.contains(&"few_step") && caps.contains(&"edit") && caps.contains(&"generate"));
+        assert_eq!(methods, vec!["image.generate", "image.edit"]);
+        // the 6-step base card is not few-step
+        let (caps, _) = capabilities(&json!({"id": "minimax-h3-image", "kind": "image", "arch": "minimax-h3-image", "env": {}}));
+        assert!(!caps.contains(&"few_step") && caps.contains(&"edit"));
+        let (caps, _) = capabilities(&json!({"id": "x", "kind": "image", "arch": "minimax-h3-image", "env": {"NS_H3I_STEPS": "6"}}));
+        assert!(!caps.contains(&"few_step"));
+        // both image methods hold the model by rsvp_s like every method that runs one (the live editor's rsvp_s: 900)
+        assert!(super::super::backplane::runs_model("image.generate") && super::super::backplane::runs_model("image.edit"));
+        assert!(super::super::backplane::OWN_FIELDS.contains(&"rsvp_s"));
     }
 
     #[test]

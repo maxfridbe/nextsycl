@@ -39,7 +39,7 @@ Other step counts read that grid at even positions and blend the heads by the sh
 
 ## 2 steps (the pDMD LoRA)
 
-`minimax-h3-image-2step` adds the pDMD 2-NFE LoRA (Apache-2.0; pdmd2026, ComfyUI layout) at strength 1 and samples **2
+`minimax-h3-image-pdmd2` adds the pDMD 2-NFE LoRA (Apache-2.0; pdmd2026, ComfyUI layout) at strength 1 and samples **2
 steps** on ComfyUI's shift-12 schedule (sigmas 1, 0.923, 0) - a third of the denoiser's work. Its recipe, from the LoRA's
 card: no guidance, prompts long and complete; if 2 steps drifts on a prompt, ask for 3 or 4 (`steps`). The LoRA alone
 (`minimax-h3-image-pdmd-2step-lora`) rides on any of the cards above as a request LoRA (`loras`) and brings the same
@@ -65,7 +65,7 @@ card: no guidance, prompts long and complete; if 2 steps drifts on a prompt, ask
 | `minimax-h3-image-q8` | Q8_0 GGUF | 19.1 GiB | the closest to bf16 of the GGUFs, and the fastest of them up to 4 MP (int8 products) |
 | `minimax-h3-image-q3` | Q3_K_M GGUF | 7.7 GiB | the smallest download and the smallest on the card; the most error |
 | `minimax-h3-image-int8` | ComfyUI int8 ConvRot | 18.0 GiB | int8 products: ~30 % faster than the GGUFs; about as close as Q8_0 |
-| `minimax-h3-image-2step` | int8 ConvRot + pDMD LoRA | 18.0 + 1.8 GiB | 2 steps; the text encoder's and pictures' results cached: the live editor's card |
+| `minimax-h3-image-pdmd2` | int8 ConvRot + pDMD LoRA | 18.0 + 1.8 GiB | 2 steps; the text encoder's and pictures' results cached: the live editor's card |
 
 All share H3's Qwen3-VL 32B text encoder (Q4_K_M, streamed from pinned host memory: ~14 GiB of RAM) and the image
 VAE (0.75 GiB on the card).
