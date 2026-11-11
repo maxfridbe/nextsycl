@@ -352,13 +352,23 @@ impl Ask {
 /// The answer cut into the prompt and the negative: `PROMPT:` / `NEGATIVE:` labels (any case, bold or not), else the
 /// whole text as the prompt; quotes around the whole, code fences and Markdown emphasis dropped
 pub fn parse_answer(text: &str) -> (String, Option<String>) {
-    let t = text.replace("```", "").replace("**", "").replace("__", "");
+    let mut t = text.replace("```", "").replace("**", "").replace("__", "");
+    let lower = t.to_ascii_lowercase();
+    // "prompt:" not the end of "negative prompt:"
+    let mut labels = lower.match_indices("prompt:").filter(|(i, _)| !lower[..*i].ends_with("negative ")).map(|(i, k)| (i, i + k.len()));
+    let p = labels.next();
+    // the describer sometimes writes the prompt, then "PROMPT:" and the same again until the token cap: stop at the second label
+    if let Some((ss, _)) = labels.next() {
+        t.truncate(ss);
+    }
     let lower = t.to_ascii_lowercase();
     let find = |k: &str| lower.find(k).map(|i| (i, i + k.len()));
-    // "prompt:" not the end of "negative prompt:"
-    let p = lower.match_indices("prompt:").find(|(i, _)| !lower[..*i].ends_with("negative ")).map(|(i, k)| (i, i + k.len()));
     let n = find("negative prompt:").or_else(|| find("negative:"));
+    // a label after at least eight unlabelled words: those words are the prompt
+    let lead = p.filter(|(ps, _)| n.map_or(true, |(ns, _)| ns > *ps) && t[..*ps].split_whitespace().count() >= 8);
     let (prompt, negative) = match (p, n) {
+        (Some((ps, _)), Some((_, ne))) if lead.is_some() => (&t[..ps], Some(&t[ne..])),
+        (Some((ps, _)), None) if lead.is_some() => (&t[..ps], None),
         (Some((_, pe)), Some((ns, ne))) if ns > pe => (&t[pe..ns], Some(&t[ne..])),
         (Some((ps, pe)), Some((_, ne))) if ne <= ps => (&t[pe..], Some(&t[ne..ps])),
         (Some((_, pe)), None) => (&t[pe..], None),
@@ -661,6 +671,17 @@ mod tests {
         assert_eq!(parse_answer("NEGATIVE: blur\nPROMPT: a fox"), ("a fox".into(), Some("blur".into())));
         assert_eq!(parse_answer("Negative prompt: blur\nPrompt: a fox"), ("a fox".into(), Some("blur".into())));
         assert_eq!(parse_answer("PROMPT: a fox\nNEGATIVE:"), ("a fox".into(), None));
+    }
+
+    #[test]
+    fn an_unlabelled_prompt_then_its_repeat_is_one_prompt() {
+        let p = "A flat vector graphic of a red barn on a green field under a pale blue sky";
+        assert_eq!(parse_answer(&format!("{p}\nPROMPT: {p}\nPROMPT: {p}\nPROMPT: {p}")), (p.into(), None));
+        // a label first, then the prompt written again after a second label
+        assert_eq!(parse_answer("PROMPT: a fox\nPROMPT: a fox\nPROMPT: a fox"), ("a fox".into(), None));
+        // a short lead is not a prompt: the labelled text is
+        assert_eq!(parse_answer("Sure! PROMPT: a red fox in snow"), ("a red fox in snow".into(), None));
+        assert_eq!(parse_answer(&format!("{p}\nPROMPT: {p}\nNEGATIVE: blur")), (p.into(), Some("blur".into())));
     }
 
     #[test]
