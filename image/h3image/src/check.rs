@@ -157,6 +157,9 @@ pub fn run(e: &H3Image, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)
             write_npy(&out, &[24, lh, lw], &lat.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), "<f4")?;
         }
     }
+    if stages.contains(&"expand") {
+        worst = worst.max(expansions(e, log)?);
+    }
     if stages.contains(&"vae") {
         let (s, lat) = d.f32("lat_final")?;
         let (lh, lw) = (s[1], s[2]);
@@ -179,9 +182,69 @@ pub fn run(e: &H3Image, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)
     Ok(worst)
 }
 
+/// The bfloat16 values of two expansions that differ, by bit pattern (0: the same bits)
+pub fn differing(a: &[f32], b: &[f32]) -> usize {
+    a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count() + a.len().abs_diff(b.len())
+}
+
+/// The `expand` stage (no dumps): the silo's expansion of the denoiser's own block matrices against the shared
+/// kernels' (a Q3_K matrix against its Q6_K form, read again from the file and transcoded on the host), bit for bit,
+/// for blocks 0, 10, 20, 30, 40 and the last; the share of differing values (0 when exact)
+fn expansions(e: &H3Image, log: &mut dyn FnMut(String)) -> Result<f64> {
+    use nextsycl_h3::device::Tensor;
+    use nextsycl_h3::dit::Weight;
+    use nextsycl_h3::dtype::DType;
+    use nextsycl_h3::gguf::GType;
+    use nextsycl_h3::safetensors::Checkpoint;
+    let Some(s) = crate::ffi::silo().map_err(|er| Error(er.0))? else {
+        log("expand         no silo: nothing to compare".into());
+        return Ok(0.0);
+    };
+    let Some(wbuf) = e.blocks.expansion_buffer() else {
+        log("expand         an int8 checkpoint: nothing expanded".into());
+        return Ok(0.0);
+    };
+    let other = Tensor::new(&e.dev, DType::BF16, &wbuf.shape).map_err(h3e)?;
+    let file = Checkpoint::open(&e.ck.path).map_err(h3e)?;
+    let n_blocks = e.blocks.blocks.len();
+    let (mut total, mut diff) = (0usize, 0usize);
+    for bi in [0, 10, 20, 30, 40, n_blocks - 1].into_iter().filter(|b| *b < n_blocks) {
+        for (j, w) in e.blocks.blocks[bi].linears().into_iter().enumerate() {
+            let Weight::K(l) = w else { continue };
+            if !crate::ffi::expands(s, l.kind) {
+                log(format!("expand         {:?}: not one the silo reads", l.kind));
+                return Ok(0.0);
+            }
+            let n = l.n * l.k;
+            crate::ffi::expand_into(e.gpu(), s, &l.blocks, l.kind, n, wbuf).map_err(h3e)?;
+            if l.kind == GType::Q3K {
+                let name = format!("blocks.{bi}.{}", ["attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"][j]) + ".weight";
+                let q6 = Tensor::from_bytes(&e.dev, DType::U8, &[GType::Q6K.bytes(n)], &file.read(&name).map_err(h3e)?).map_err(h3e)?;
+                nextsycl_h3::ops::expand_into(&q6, GType::Q6K, n, &other).map_err(h3e)?;
+            } else {
+                nextsycl_h3::ops::expand_into(&l.blocks, l.kind, n, &other).map_err(h3e)?;
+            }
+            let (a, b) = (wbuf.to_f32().map_err(h3e)?, other.to_f32().map_err(h3e)?);
+            let dn = differing(&a[..n], &b[..n]);
+            log(format!("expand         block {bi:2} matrix {j} ({:?}, {} x {}): {dn} of {n} values differ", l.kind, l.n, l.k));
+            total += n;
+            diff += dn;
+        }
+    }
+    log(format!("expand         {diff} of {total} values differ"));
+    Ok(diff as f64 / total.max(1) as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn differing_counts_bit_patterns() {
+        assert_eq!(differing(&[1.0, -0.0, f32::NAN], &[1.0, 0.0, f32::NAN]), 1);
+        assert_eq!(differing(&[1.0, 2.0], &[1.0]), 1);
+        assert_eq!(differing(&[], &[]), 0);
+    }
 
     #[test]
     fn npy_round_trip() {

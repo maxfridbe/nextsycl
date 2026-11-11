@@ -98,12 +98,25 @@ pub struct KLinear {
 impl KLinear {
     /// `out = linear(x)`: x [M, K] and out [M, N] in one 16-bit type; `w` holds at least N x K values of it.
     pub fn forward(&self, x: &Tensor, out: &Tensor, w: &Tensor) -> Result<()> {
+        self.fits(x, out, w)?;
+        expand_into(&self.blocks, self.kind, self.n * self.k, w)?;
+        self.product(x, out, w)
+    }
+
+    fn fits(&self, x: &Tensor, out: &Tensor, w: &Tensor) -> Result<()> {
         let (n, k) = (self.n, self.k);
         let m = x.elements() / k;
         if x.elements() != m * k || out.elements() != m * n || w.dtype != x.dtype || w.elements() < n * k {
             return Err(Error(format!("klinear: x {:?} {:?}, out {:?}, buffer {:?} {:?} for a [{n}, {k}] weight", x.dtype, x.shape, out.shape, w.dtype, w.shape)));
         }
-        expand_into(&self.blocks, self.kind, n * k, w)?;
+        Ok(())
+    }
+
+    /// `out = linear(x)` with the matrix already expanded into `w` (by `forward`'s expansion, or an engine's own)
+    pub fn product(&self, x: &Tensor, out: &Tensor, w: &Tensor) -> Result<()> {
+        self.fits(x, out, w)?;
+        let (n, k) = (self.n, self.k);
+        let m = x.elements() / k;
         let dev = x.buf.device();
         let code = x.dtype.kernel_code()?;
         // SAFETY: device pointers of this device; w holds the [n, k] matrix just expanded, sizes checked above.

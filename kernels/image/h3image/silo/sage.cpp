@@ -15,7 +15,9 @@
 
 #include <sycl/sycl.hpp>
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -97,6 +99,14 @@ Buffers& buffers(ns_gpu* g, size_t n, size_t nsc) {
     return *b;
 }
 
+// NS_H3I_PROFILE: the queue drained after each phase, milliseconds summed per phase, printed every 50 calls (a step)
+struct Prof {
+    bool on = std::getenv("NS_H3I_PROFILE") != nullptr && std::strcmp(std::getenv("NS_H3I_PROFILE"), "0") != 0;
+    double ms[4] = {0, 0, 0, 0};
+    int calls = 0;
+};
+Prof prof;
+
 inline float bf(uint16_t h) {
     return sycl::bit_cast<float>((uint32_t) h << 16);
 }
@@ -132,6 +142,16 @@ int ns_image_h3i_silo_sage(ns_gpu* g, const void* qkv, int64_t S, int64_t H, int
     sycl::half* hv = b.hv;
     sycl::half* ao = b.ao;
     const uint16_t* x = static_cast<const uint16_t*>(qkv);
+    auto clock = std::chrono::steady_clock::now();
+    auto lap = [&](int i) {
+        if (!prof.on) return;
+        q.wait();
+        const auto now = std::chrono::steady_clock::now();
+        prof.ms[i] += std::chrono::duration<double, std::milli>(now - clock).count();
+        clock = now;
+    };
+    lap(3);   // whatever was queued before: not counted below
+    prof.ms[3] = 0;
 
     // k's column sums: a work-item a (slice of SLICE rows, 8 columns)
     q.memset(ksum, 0, (size_t) HD * sizeof(float));
@@ -197,7 +217,9 @@ int ns_image_h3i_silo_sage(ns_gpu* g, const void* qkv, int64_t S, int64_t H, int
             *reinterpret_cast<sycl::vec<int8_t, 8>*>(dst + (h * S + r) * D + d) = o;
         }
     });
+    lap(0);
     if (flash.sage(&q, iq, ik, hv, ao, qs, ks, (int) BLOCK, S, H, D, 1.0f / std::sqrt((float) D)) != 0) return ns_fail(flash.err());
+    lap(1);
     // the result [H, S, D] half -> [S, H * D] bfloat16, 8 values a work-item
     uint16_t* o = static_cast<uint16_t*>(out);
     q.parallel_for(sycl::range<2>((size_t) S, (size_t) (HD / 8)), [=](sycl::id<2> id) {
@@ -207,6 +229,13 @@ int ns_image_h3i_silo_sage(ns_gpu* g, const void* qkv, int64_t S, int64_t H, int
         for (int j = 0; j < 8; ++j) w[j] = to_bf((float) v[j]);
         *reinterpret_cast<sycl::vec<uint16_t, 8>*>(o + s * HD + c) = w;
     });
+    lap(2);
+    if (prof.on && ++prof.calls % 50 == 0) {
+        const double f = 4.0 * (double) S * S * D * H * 50;
+        std::fprintf(stderr, "h3image silo sage, 50 calls of %lld tokens: preparation %.0f ms, kernel %.0f ms (%.1f TFLOPS), result %.0f ms\n",
+                     (long long) S, prof.ms[0], prof.ms[1], f / prof.ms[1] / 1e9, prof.ms[2]);
+        prof.ms[0] = prof.ms[1] = prof.ms[2] = 0;
+    }
     return 0;
 } catch (const std::exception& e) {
     return ns_fail(std::string("h3image silo sage: ") + e.what());

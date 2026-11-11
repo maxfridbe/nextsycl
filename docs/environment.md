@@ -271,6 +271,8 @@ Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`),
 | `NS_H3I_THREADS` | 8 | MiniMax-H3-Image's readers of the denoiser and the VAE at load (--opt-threads) | image h3image |
 | `NS_H3I_VAE_BATCH` | 16 | MiniMax-H3-Image's decoder tiles (256 px, 261 tokens each) decoded together: their products shared (--opt-vae-batch) | image h3image |
 | `NS_H3I_SAGE_MIN_S` | 1024 | the shortest denoiser sequence MiniMax-H3-Image's silo runs SageAttention for (int8 q, k); shorter ones on the shared kernels' attention (oneDNN, bf16) (--opt-sage-min-s) | image h3image |
+| `NS_H3I_SILO_EXPAND` | 1 | MiniMax-H3-Image's GGUF block matrices expanded to bfloat16 by its silo (Q8_0, Q3_K, Q4_K, Q5_K; the same bits as the shared kernels', 16 values a work-item), and Q3_K held on the card as stored (3.44 bits a value) instead of as Q6_K; `0`: the shared kernels' expansion, Q3_K transcoded to Q6_K (--opt-silo-expand) | image h3image |
+| `NS_H3I_PROFILE` | unset | Debug: MiniMax-H3-Image prints each denoiser step's time by stage (norm, qkv, rope, attention, out, gate, fc1, swiglu+fc2, head) and, for a GGUF, the k-quant expansion alone; the queue is drained between stages, so the step is a little slower (--opt-profile) | image h3image |
 | `NS_H3I_CHECK_SEED` | 3 | Debug: the seed `image check` draws MiniMax-H3-Image's noise from (reference/h3-image/ref.py's `--seed`) | image h3image (check) |
 | `NS_QI_*` | - | every NS_QI_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_QI_DUMP` | off | Debug: a directory: what the denoiser is given (embeds, pads, cond latents, noise) written there as raw float32 files | image qwenimage21 |

@@ -66,6 +66,8 @@ const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "vae-batch", env: "NS_H3I_VAE_BATCH", value: "N", help: "the decoder's tiles decoded together (default 16)", at: At::Load },
     EngineOption { name: "te-pin", env: "H3_TE_PIN", value: "0|1", help: "keep the text encoder in pinned host memory between requests (default 1 when the host has the room)", at: At::Load },
     EngineOption { name: "sage-min-s", env: "NS_H3I_SAGE_MIN_S", value: "TOKENS", help: "the shortest denoiser sequence the silo's SageAttention takes (default 1024; shorter: oneDNN's)", at: At::Load },
+    EngineOption { name: "silo-expand", env: "NS_H3I_SILO_EXPAND", value: "0|1", help: "the silo's GGUF expansion to bfloat16, Q3_K read as stored (default 1; 0: the shared kernels', Q3_K held as Q6_K)", at: At::Load },
+    EngineOption { name: "profile", env: "NS_H3I_PROFILE", value: "0|1", help: "debug: each step's time by stage on stderr (the queue drained between stages)", at: At::Load },
     EngineOption { name: "sigmas", env: "", value: "S,S,..,0", help: "another sampling grid than the heads' six steps: strictly falling from 1, ending at 0", at: At::Request },
 ];
 
@@ -129,6 +131,8 @@ pub struct H3Image {
     loaded: Instant,
     load_s: f64,
     busy: Mutex<()>,
+    /// NS_H3I_PROFILE: each step's time by stage
+    pub profile: bool,
 }
 
 fn role<'f>(files: &'f ModelFiles, r: &str) -> Result<&'f Path> {
@@ -147,14 +151,26 @@ impl H3Image {
         // H3's kernels on the kind's queue of the card (the denoiser, the decoder and the text encoder ordered on it)
         // SAFETY: the core's GPU (its queue's owner) is kept in the engine beside the device.
         let dev = unsafe { Device::on_queue(gpu.queue(), gpu.index) }.map_err(h3e)?;
-        let ck = Checkpoint::open(role(files, "denoiser")?).map_err(h3e)?;
+        let mut ck = Checkpoint::open(role(files, "denoiser")?).map_err(h3e)?;
+        let silo = ffi::silo().map_err(|e| Error(e.0))?;
+        // the silo's k-quant expansion (NS_H3I_SILO_EXPAND, default on): the block matrices' Q3_K then read as stored
+        let expand = silo.filter(|_| o.setting("NS_H3I_SILO_EXPAND").is_none_or(|v| v != "0"));
+        if expand.is_some_and(|s| ffi::expands(s, nextsycl_h3::gguf::GType::Q3K)) {
+            keep_q3k(&mut ck);
+        }
         let mut blocks = nextsycl_h3::dit::Blocks::load(&dev, &ck, None, threads).map_err(h3e)?;
         // the silo's attention (dist/silo/libnextsycl-h3image.so: P-H3-Image's, copied) from NS_H3I_SAGE_MIN_S tokens;
         // without it, or below that, the shared kernels' (SageAttention from 8,192 tokens, oneDNN's below)
-        if let Some(s) = ffi::silo().map_err(|e| Error(e.0))? {
+        if let Some(s) = silo {
             let min_s = o.setting("NS_H3I_SAGE_MIN_S").and_then(|v| v.parse().ok()).unwrap_or(1024);
             blocks.attention = Some(ffi::attention(&gpu, s, min_s));
             log(format!("{ARCH}: the {} silo's attention from {min_s} tokens", ffi::SILO));
+        }
+        if let (Some(s), Some(kind)) = (expand, blocks.kquant) {
+            if ffi::expands(s, kind) {
+                blocks.expand = Some(ffi::expander(&gpu, s));
+                log(format!("{ARCH}: the {} silo's {kind:?} expansion", ffi::SILO));
+            }
         }
         let outer = net::Outer::load(&dev, &ck, &blocks.cfg).map_err(h3e)?;
         let form = match ck.entries.values().find(|e| e.name == "blocks.0.mlp.fc1.weight") {
@@ -169,8 +185,14 @@ impl H3Image {
         }
         log(format!("{ARCH}: VAE decoder {:.2} GiB in {:.1} s; {:.1} GiB used on the card", decoder.load_bytes as f64 / (1u64 << 30) as f64,
                     decoder.load_seconds, dev.mem_used() as f64 / (1u64 << 30) as f64));
+        let profile = o.setting("NS_H3I_PROFILE").is_some_and(|v| v != "0" && !v.is_empty());
+        if profile {
+            if let Some(kind) = blocks.kquant {
+                log(format!("{ARCH}: profile: {}", expansion_profile(&dev, &gpu, &blocks.cfg, kind, silo).map_err(h3e)?));
+            }
+        }
         Ok(H3Image { gpu, dev, ck, blocks, outer, decoder, files: files.clone(), threads, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64(),
-                     busy: Mutex::new(()) })
+                     busy: Mutex::new(()), profile })
     }
 
     /// The tokenizer's directory (vocab.json, merges.txt, tokenizer_config.json)
@@ -239,7 +261,13 @@ impl H3Image {
     pub fn sample(&self, text: Tensor, tags: &[i32], refs: &[(Vec<f32>, usize, usize)], lh: usize, lw: usize, seed: u64, sigmas: &[f32],
                   step: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
         let mut x = Mt19937::new(seed).randn(net::LATENT_C * lh * lw);
+        let t_run = Instant::now();
         let mut run = net::Run::new(&self.blocks, &self.outer, text, Some(tags.to_vec()), lh, lw, refs, seed).map_err(h3e)?;
+        if self.profile {
+            self.dev.wait().map_err(h3e)?;
+            eprintln!("profile: the picture's buffers and conditioning rows {:.0} ms", t_run.elapsed().as_secs_f64() * 1e3);
+            run.profile = true;
+        }
         for i in 0..sigmas.len() - 1 {
             let v = run.net(&x, sigmas[i], sigmas[i + 1], &mut |_| Ok(())).map_err(h3e)?;
             net::euler(&mut x, &v, sigmas[i], sigmas[i + 1]);
@@ -357,7 +385,69 @@ impl ImageEngine for H3Image {
     }
 }
 
+/// Whether `name` is one of the denoiser blocks' four matrices (`blocks.<i>.attn.qkv_proj.weight` ...): what the
+/// silo expands (the token refiner's go through the shared kernels)
+pub fn is_block_matrix(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("blocks.") else { return false };
+    let Some((idx, tail)) = rest.split_once('.') else { return false };
+    idx.parse::<usize>().is_ok() && ["attn.qkv_proj.weight", "attn.out_proj.weight", "mlp.fc1.weight", "mlp.fc2.weight"].contains(&tail)
+}
+
+/// The block matrices' Q3_K entries read as the file stores them (110 bytes a block of 256) rather than transcoded
+/// to Q6_K (210): for the silo's expansion, which reads Q3_K. The count changed.
+pub fn keep_q3k(ck: &mut Checkpoint) -> usize {
+    use nextsycl_h3::gguf::GType;
+    let mut n = 0;
+    for e in ck.entries.values_mut().filter(|e| e.stored == Some(GType::Q3K) && is_block_matrix(&e.name)) {
+        e.kquant = Some(GType::Q3K);
+        e.stored = None;
+        e.bytes = GType::Q3K.bytes(e.shape.iter().product());
+        n += 1;
+    }
+    n
+}
+
+/// The k-quant expansion alone (NS_H3I_PROFILE): one block's four matrices expanded to bfloat16 from blocks of `kind`
+/// (the bytes are arbitrary: only the time is read), each twice, the second timed - by the shared kernels (Q3_K: its
+/// Q6_K form, what they expand) and by the silo when it reads `kind`
+fn expansion_profile(dev: &Arc<Device>, gpu: &Gpu, cfg: &nextsycl_h3::dit::Config, kind: nextsycl_h3::gguf::GType, silo: Option<&ffi::Silo>)
+                     -> nextsycl_h3::Result<String> {
+    use nextsycl_h3::gguf::GType;
+    let w = cfg.heads * cfg.head_dim;
+    let shapes = [("qkv", 3 * w, cfg.hidden), ("out", cfg.hidden, w), ("fc1", 2 * cfg.ffn, cfg.hidden), ("fc2", cfg.hidden, cfg.ffn)];
+    let most = shapes.iter().map(|(_, n, k)| n * k).max().unwrap_or(0);
+    let shared_kind = if kind == GType::Q3K { GType::Q6K } else { kind };
+    let out = Tensor::new(dev, DType::BF16, &[most])?;
+    let src = Tensor::new(dev, DType::U8, &[shared_kind.bytes(most).max(kind.bytes(most))])?;
+    let mut lines = Vec::new();
+    let mut time = |who: &str, f: &dyn Fn(usize) -> nextsycl_h3::Result<()>| -> nextsycl_h3::Result<()> {
+        let (mut parts, mut total) = (Vec::new(), 0.0);
+        for (name, n, k) in shapes {
+            f(n * k)?;
+            dev.wait()?;
+            let t = Instant::now();
+            f(n * k)?;
+            dev.wait()?;
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            total += ms;
+            parts.push(format!("{name} {ms:.2}"));
+        }
+        lines.push(format!("{who} {total:.2} ms a block ({} ms), x {} = {:.0} ms a step", parts.join(", "), cfg.blocks, total * cfg.blocks as f64));
+        Ok(())
+    };
+    time(&format!("shared {shared_kind:?}"), &|n| nextsycl_h3::ops::expand_into(&src, shared_kind, n, &out))?;
+    if let Some(s) = silo.filter(|s| ffi::expands(s, kind)) {
+        time(&format!("silo {kind:?}"), &|n| ffi::expand_into(gpu, s, &src, kind, n, &out))?;
+    }
+    Ok(format!("expansion: {}", lines.join("; ")))
+}
+
 impl H3Image {
+    /// The card the engine runs on (the silo's calls take it)
+    pub fn gpu(&self) -> &Gpu {
+        &self.gpu
+    }
+
     fn gpu_name(&self) -> String {
         format!("{} (card {})", self.dev.name(), self.gpu.index)
     }
@@ -385,6 +475,51 @@ mod tests {
         for r in [1.0, 4.0 / 3.0, 3.0 / 4.0, 1.5, 2.0 / 3.0, 16.0 / 9.0, 9.0 / 16.0] {
             let (w, h) = size_at(16_777_216, r);
             assert!(w as u64 * h as u64 <= MAX_PIXELS && w % 32 == 0 && h % 32 == 0, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn only_the_block_matrices_are_expanded_by_the_silo() {
+        assert!(is_block_matrix("blocks.0.attn.qkv_proj.weight"));
+        assert!(is_block_matrix("blocks.49.mlp.fc2.weight"));
+        assert!(!is_block_matrix("blocks.3.attn.q_norm.weight"));
+        assert!(!is_block_matrix("blocks.x.mlp.fc1.weight"));
+        assert!(!is_block_matrix("txt_refiner.blocks.0.mlp.fc1.weight"));
+        assert!(!is_block_matrix("blocks.1.mlp.fc1.weight_scale"));
+    }
+
+    #[test]
+    fn q3k_block_matrices_are_kept_as_stored() {
+        use nextsycl_h3::gguf::GType;
+        use nextsycl_h3::safetensors::Entry;
+        let entry = |name: &str| Entry { name: name.into(), dtype: DType::U8, shape: vec![512, 256], offset: 0, bytes: GType::Q6K.bytes(512 * 256),
+                                         kquant: Some(GType::Q6K), stored: Some(GType::Q3K) };
+        let mut ck = Checkpoint { path: "x.gguf".into(), entries: Default::default(), metadata: Default::default(), file_bytes: 0 };
+        for n in ["blocks.0.mlp.fc1.weight", "blocks.7.attn.out_proj.weight", "token_refiner.blocks.0.mlp.fc1.weight"] {
+            ck.entries.insert(n.into(), entry(n));
+        }
+        let mut q4 = entry("blocks.1.mlp.fc2.weight");
+        (q4.kquant, q4.stored, q4.bytes) = (Some(GType::Q4K), None, GType::Q4K.bytes(512 * 256));
+        ck.entries.insert(q4.name.clone(), q4);
+        assert_eq!(keep_q3k(&mut ck), 2);
+        let e = &ck.entries["blocks.0.mlp.fc1.weight"];
+        assert_eq!((e.kquant, e.stored, e.bytes, e.file_bytes()), (Some(GType::Q3K), None, 512 * 110, 512 * 110));
+        assert_eq!(e.stored_shape(), vec![512 * 110]);
+        // the refiner's stays transcoded (the shared kernels expand it), the Q4_K one is untouched
+        let r = &ck.entries["token_refiner.blocks.0.mlp.fc1.weight"];
+        assert_eq!((r.kquant, r.stored), (Some(GType::Q6K), Some(GType::Q3K)));
+        assert_eq!(ck.entries["blocks.1.mlp.fc2.weight"].kquant, Some(GType::Q4K));
+        assert_eq!(keep_q3k(&mut ck), 0);
+    }
+
+    #[test]
+    fn the_silo_takes_ggufs_codes() {
+        use nextsycl_h3::gguf::GType;
+        assert_eq!([GType::Q8_0, GType::Q3K, GType::Q4K, GType::Q5K].map(ffi::gguf_code), [Some(8), Some(11), Some(12), Some(13)]);
+        assert_eq!(ffi::gguf_code(GType::Q6K), None);
+        // the codes are the GGUF file's own type numbers, as the shared kernels take them
+        for k in [GType::Q8_0, GType::Q4K, GType::Q5K] {
+            assert_eq!(ffi::gguf_code(k), k.quant_code());
         }
     }
 
