@@ -135,10 +135,10 @@ reports its own phases:
 
 | change | measured | kept |
 |---|---|---|
-| silo expansion of Q4_K / Q5_K / Q8_0 (16 values a work-item from 16-byte loads; bit-exact: `check --stages expand`, 0 of 2,312,110,080 values differ for each file) | 53 against 100 ms a step alone; a picture: Q4_K B70 1 MP 3.69 against 3.72 s, 4 MP 10.46 against 10.58 (same build, NS_H3I_SILO_EXPAND=0) | yes (small, exact) |
+| silo expansion of Q4_K / Q5_K / Q8_0 (16 values a work-item from 16-byte loads; bit-exact: `check --stages expand`, 0 of 2,312,110,080 values differ for each file) | 53 against 100 ms a step alone; a picture, Q4_K_M B70 against the shared expansion the same day (NS_H3I_SILO_EXPAND=0): 1 MP 3.68 against 3.73 s, 4 MP 10.44 against 10.58, 16.8 MP 50.17 against 50.33 | yes (small, exact) |
 | Q3_K read as stored (110 bytes a block) and expanded in the silo, instead of transcoded to Q6_K (210) | card after load 8.8 against 15.8 GiB; exact against the Q6_K form; speed: see the tables (the first version, 44 scattered byte loads a lane, was 3.6x Q4_K's expansion: 1 MP 4.51 s; staged through local memory now) | yes |
 | Q8_0 products by oneDNN's int8 weight decompression (s8 values, half scales every 32 along K, fpmath bf16; repacked once at load in place, same bytes) | B70 1 MP 2.64 against 4.06 s (-35 %), 4 MP 10.02 against 10.90 (-8 %), 16.8 MP 50.18 against 50.58 | yes |
-| one bf16 product over all rows (the silo's oneDNN call instead of nsd_linear's 8,192-row chunks) for the expanded kinds | dqbench: -2.4 ms a block at 16,434 rows (~0.7 s a 16.8 MP picture) | yes |
+| one bf16 product over all rows (the silo's oneDNN call instead of nsd_linear's 8,192-row chunks) for the expanded kinds | dqbench alone: -2.4 ms a block at 16,434 rows; in a picture (Q4_K_M B70 16.8 MP, same day): 50.73 s against 50.33 with the shared chunked path and 50.17 with the silo's expansion + chunks | no (the silo chunks as nsd_linear does) |
 | Q4_K by oneDNN decompression (u4 + scales + integer zero points; float zero points, which Q4_K's mins need, are refused) | dqbench B70, 4,120 rows: qkv 8.40 ms against bf16 5.50 + expansion; fc1 11.37 against 7.42 - 112 TFLOPS against 171 | no |
 | Q3_K / Q6_K by s4 / s8 decompression (group 16) | s4 142 TFLOPS, s8 g16 154 - 166 against bf16 171 at 4,120+ rows: slower than expansion + bf16 from 4 MP up | no |
 | int8 products for GGUFs (requantize at load) | would need the int8 file's memory (8 bits a value) and adds a second rounding: the int8 ConvRot file already is that, closer to bf16 | no (documented) |
@@ -201,7 +201,7 @@ GGUFs).
 
 - Kept: text to image and edits (up to 16 pictures), 1 - 16.9 MP, the heads' 6-step grid and other step counts read off
   it as stable-diffusion.cpp does, every file the model has (Q3_K_M, Q4_K_M, Q5_K_M, Q8_0 GGUFs; int8 ConvRot).
-- Second pass, kept: the silo's expansion and one-product GEMM for the GGUFs (exact), Q3_K held as stored (Q3_K_M now
+- Second pass, kept: the silo's expansion for the GGUFs (exact), Q3_K held as stored (Q3_K_M now
   the smallest on the card), Q8_0 by int8 decompression, the token refiner kept as an option, the step profile
   (NS_H3I_PROFILE) and the bit-for-bit expansion check (`image check --stages expand`).
 - Lost / not run: MiniMax's prompt enhancer (MiniMaxAI/MiniMax-H3-Image-PE, a Qwen3.8-27B fine-tune) - prompts are
