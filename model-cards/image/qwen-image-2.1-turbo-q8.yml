@@ -27,3 +27,6 @@ files:
   vae: qwen-image-21-vae
   tokenizer: qwen-image-21-tokenizer
 guide: guides/qwen-image-2.1.md
+encoder:                         # its text encoder (image.describe describer native: qwen-image-2.1-te-describe reads the same file)
+  name: Qwen3-VL-8B-Instruct
+  sees: true

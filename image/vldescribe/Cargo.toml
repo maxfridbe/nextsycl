@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-image-vldescribe"
+description = "An image model's own Qwen3-VL text encoder writing what it sees (image.describe's describer native): the int8 ConvRot file with its head and vision tower, a key / value cache, the shared kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-image.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-qwen3vl.workspace = true

@@ -36,3 +36,7 @@ files:
     sha256: d80e9c2e5cfc9844869961ff5a58c9a9e52182df6bfb30b26018dd7f348721af
     path: minimax-h3-image/vae/minimax_h3_image_vae_fp16.safetensors
 guide: guides/minimax-h3-image.md
+encoder:                         # its text encoder (image.describe describer native: none)
+  name: Qwen3-VL-32B, MiniMax H3's
+  sees: true
+  why: 'the file stops after layer 50 of the 64, with no final norm or output head: it gives hidden states and cannot write text'

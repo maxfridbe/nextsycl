@@ -1,0 +1,22 @@
+# Qwen-Image 2.1's text encoder (Qwen3-VL-8B-Instruct, int8 ConvRot) as a describer: image.describe describer native
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# The Qwen-Image 2.1 cards' own files (nothing new downloaded: the keys are qwen-image-2.1-q8's). The file is the whole
+# Qwen3-VL-8B-Instruct - 36 layers, the final norm, lm_head and the vision tower, every matrix int8 ConvRot - so the
+# encoder Qwen-Image conditions on can also write: image/vldescribe (arch qwen3vl-describe) runs it with a key / value
+# cache. Every Qwen-Image 2.1 card names the same text-encoder file, so this is their native describer.
+id: qwen-image-2.1-te-describe
+kind: image
+arch: qwen3vl-describe
+license: apache-2.0
+commercial: true
+license_note: 'Qwen3-VL-8B-Instruct (Apache-2.0), as Qwen-Image 2.1 ships it (int8 ConvRot by abenzerps)'
+title: 'Qwen-Image 2.1 text encoder (Qwen3-VL-8B-Instruct) as a describer'
+about: 'the Qwen3-VL-8B-Instruct text encoder Qwen-Image 2.1 conditions on, loaded whole (lm_head, vision tower) to write prompts from pictures: image.describe describer native for every qwen-image-2.1 model; int8 ConvRot, shared kernels, no prompt cache'
+base_model: Qwen3-VL-8B-Instruct
+gpus: '0,1'
+vram_gib: 14.0                   # an estimate until measured: 9.3 GiB int8 weights + the tower in float32 + the cache
+env: {}
+files:
+  text-encoder: qwen-image-21-te-int8
+  tokenizer: qwen-image-21-tokenizer
+guide: guides/describe-native.md

@@ -40,3 +40,6 @@ files:
     sha256: aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
     path: qwen-image-2.1/tokenizer/tokenizer.json
 guide: guides/qwen-image-2.1.md
+encoder:                         # its text encoder (image.describe describer native: qwen-image-2.1-te-describe reads the same file)
+  name: Qwen3-VL-8B-Instruct
+  sees: true

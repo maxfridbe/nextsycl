@@ -544,7 +544,8 @@ impl ImageServer {
             figures: b["figures"].as_bool(),
             each_page: b["each_page"].as_bool(),
             columns: b["columns"].as_bool(),
-            extra: Default::default(),
+            // a system turn for a reader that takes one (a native describer: image.describe's instruction)
+            extra: b["system"].as_str().filter(|x| !x.trim().is_empty()).map(|x| [("system".to_string(), x.to_string())].into_iter().collect()).unwrap_or_default(),
         };
         let n_pages = req.pages.len();
         self.waiting.fetch_add(1, Ordering::Relaxed);

@@ -46,3 +46,7 @@ files:
     sha256: bc050c80629454ecda3a203964bac3747e89a52d18bb2b7361a8651b9b9a2edb
     path: hunyuanimage21/pig_hunyuan_image_vae_fp32-f16.gguf
 guide: guides/hunyuanimage-2.1.md
+encoder:                         # its text encoder (image.describe describer native: none)
+  name: Qwen2.5-VL-7B-Instruct
+  sees: true
+  why: 'its Q4_0 GGUF holds the vision tower and the output head but no model settings or tokenizer, and no engine here writes with Qwen2.5-VL from it'

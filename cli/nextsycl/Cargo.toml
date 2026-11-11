@@ -32,6 +32,7 @@ nextsycl-image-olmocr2.workspace = true
 nextsycl-image-hunyuanimage21.workspace = true
 nextsycl-image-mingimage.workspace = true
 nextsycl-image-zimage.workspace = true
+nextsycl-image-vldescribe.workspace = true
 nextsycl-image-mossimage.workspace = true
 nextsycl-image-seedvr2.workspace = true
 nextsycl-image-flashvsr.workspace = true

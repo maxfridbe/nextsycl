@@ -17,9 +17,10 @@ nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora 
 nextsycl image start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
 nextsycl image ocr PICTURE|PDF... [--one-pass] [--no-columns] [--model ID|FILE.gguf] [--prompt TEXT] [--no-tiles] [--no-figures] [--max N] [--temp T] [--out FILE] [--gpu N] [--dump-views DIR]
 nextsycl image describe PICTURE [--target FAMILY|IMAGE_MODEL] [--detail short|medium|long] [--words N] [--negative] [--language L]
-                        [--instructions TEXT] [--max-pixels N] [--temperature T] [--seed N] [--model ID] [--server HOST:PORT] [--json]
+                        [--instructions TEXT] [--max-pixels N] [--temperature T] [--seed N] [--model ID | --native DESCRIBER_ID] [--server HOST:PORT] [--json]
                    (the prompt that would draw PICTURE, by a chat model that reads pictures: the box's switcher, NS_SWITCH_PORT,
-                    or a `nextsycl llm serve` at --server; families: natural qwen-image z-image h3 hunyuanimage moss-image ming-image tags)
+                    or a `nextsycl llm serve` at --server; families: natural qwen-image z-image h3 hunyuanimage moss-image ming-image tags;
+                    --native: an image model's text encoder as the describer, served by `nextsycl image serve DESCRIBER_ID` at --server)
 nextsycl image check <dump dir> [--model ID|FILE.gguf] [--stages te,dit,steps,vae (p-h3-image: + venc)] [--lora NAME[:SCALE]]... [--tokens N] [--gpu N]
                    (seedvr2: --stages resize,enc,dit,dec,colorfix --variant seedvr2-3b|seedvr2-7b --frames PNG_DIR;
                     flashvsr: reference/flashvsr/ref.py's dumps, every stage)
@@ -36,7 +37,7 @@ pub fn engines() -> Vec<nextsycl_image::ImageKind> {
     vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_olmocr2::kind(), nextsycl_image_hunyuanimage21::kind(),
          nextsycl_image_upscale::kind(), nextsycl_image_starvector::kind(), nextsycl_image_mingimage::kind(), nextsycl_image_mossimage::kind(), nextsycl_image_seedvr2::kind(),
          nextsycl_image_flashvsr::kind(), nextsycl_image_rembg::kind(), nextsycl_image_ph3image::kind(), nextsycl_image_h3image::kind(), nextsycl_image_zimage::kind(),
-         nextsycl_image_example::kind()]
+         nextsycl_image_vldescribe::kind(), nextsycl_image_example::kind()]
 }
 
 /// `--gpu 0` or `--gpu 0,1` (an engine that splits over two cards takes the second too)
@@ -201,7 +202,11 @@ fn describe_cmd(cfg: &Config, args: &[String]) -> Result<(), String> {
         .unwrap_or_else(|| format!("127.0.0.1:{}", cfg.get("NS_SWITCH_PORT").unwrap_or_else(|| "8001".into())));
     let model = opt(args, "--model").unwrap_or("qwen3.8-27b-q4-describe");
     let never = || false;
-    let r = describe(&nextsycl_serve::http::Target::Tcp(server), model, &ask, &bytes, &never).map_err(|(st, m)| format!("{st}: {m}"))?;
+    // --native ID: an image model's text encoder as the describer, served by `nextsycl image serve ID` at --server
+    let r = match opt(args, "--native") {
+        Some(id) => nextsycl_serve::describe::describe_native(&nextsycl_serve::http::Target::Tcp(server), id, id, &ask, &bytes),
+        None => describe(&nextsycl_serve::http::Target::Tcp(server), model, &ask, &bytes, &never),
+    }.map_err(|(st, m)| format!("{st}: {m}"))?;
     if args.iter().any(|a| a == "--json") {
         println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         return Ok(());

@@ -18,6 +18,7 @@
 //! Text-only prompts: the three M-RoPE axes carry the same position, so the rotation is plain RoPE. Images in the
 //! prompt (an edit's reference pictures through the vision tower) are not read yet.
 
+pub mod chat;
 pub mod vision;
 
 use std::path::Path;
