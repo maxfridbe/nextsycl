@@ -118,35 +118,47 @@ int ns_image_h3i_silo_expand(ns_gpu* g, const void* src, int qtype, int64_t n, v
             put16(o + lane * 16, v);
         });
     } else if (qtype == 11) {   // Q3_K: hmask[32], qs[64], 12 bytes of 6-bit scales, d (f16): 110 bytes, not aligned
-        q.parallel_for(range, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
-            const size_t lane = it.get_global_id(0);
-            if (lane >= lanes) return;
-            const size_t bi = lane / 16;
-            const int l = (int) (lane % 16);
-            const uint8_t* x = b + bi * 110;
-            // values 16 l .. 16 l + 15: half c of 128, shift pair j, positions i0 .. i0 + 15 of 32; scale l
-            const int c = l / 8, j = (l % 8) / 2, i0 = (l % 2) * 16;
-            const uint8_t* sc = x + 96;
-            auto word = [&](int i) { return (uint32_t) sc[4 * i] | ((uint32_t) sc[4 * i + 1] << 8) | ((uint32_t) sc[4 * i + 2] << 16) | ((uint32_t) sc[4 * i + 3] << 24); };
-            const uint32_t a0 = word(0), a1 = word(1), tmp = word(2);
-            constexpr uint32_t K1 = 0x03030303u, K2 = 0x0f0f0f0fu;
-            const int wi = l / 4;
-            const uint32_t aux = wi == 0 ? (a0 & K2) | ((tmp & K1) << 4)
-                               : wi == 1 ? (a1 & K2) | (((tmp >> 2) & K1) << 4)
-                               : wi == 2 ? ((a0 >> 4) & K2) | (((tmp >> 4) & K1) << 4)
-                                         : ((a1 >> 4) & K2) | (((tmp >> 6) & K1) << 4);
-            const int s = (int) ((aux >> (8 * (l % 4))) & 0xFF) - 32;
-            const float ds = half_at(x + 108) * (float) s;
-            const uint8_t bit = (uint8_t) (1u << (4 * c + j));
-            float v[16];
+        // a work-group's 16 blocks (1,760 bytes) staged in local memory by consecutive byte loads first: read from the
+        // card straight, each lane's 44 scattered byte loads made Q3_K's expansion 3.6x Q4_K's
+        constexpr int BPG = (int) (wg / 16), BYTES = BPG * 110;
+        const size_t nblocks = lanes / 16;
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<uint8_t, 1> slm(sycl::range<1>(BYTES), h);
+            h.parallel_for(range, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                const size_t b0 = it.get_group(0) * BPG;
+                const int lid = (int) it.get_local_id(0);
+                const size_t have = sycl::min<size_t>(BPG, nblocks - sycl::min(nblocks, b0)) * 110;
+                for (int i = lid; i < BYTES; i += (int) wg)
+                    if ((size_t) i < have) slm[i] = b[b0 * 110 + i];
+                sycl::group_barrier(it.get_group());
+                const size_t lane = it.get_global_id(0);
+                if (lane >= lanes) return;
+                const int l = (int) (lane % 16);
+                const uint8_t* x = &slm[(lid / 16) * 110];
+                // values 16 l .. 16 l + 15: half c of 128, shift pair j, positions i0 .. i0 + 15 of 32; scale l
+                const int c = l / 8, j = (l % 8) / 2, i0 = (l % 2) * 16;
+                const uint8_t* sc = x + 96;
+                auto word = [&](int i) { return (uint32_t) sc[4 * i] | ((uint32_t) sc[4 * i + 1] << 8) | ((uint32_t) sc[4 * i + 2] << 16) | ((uint32_t) sc[4 * i + 3] << 24); };
+                const uint32_t a0 = word(0), a1 = word(1), tmp = word(2);
+                constexpr uint32_t K1 = 0x03030303u, K2 = 0x0f0f0f0fu;
+                const int wi = l / 4;
+                const uint32_t aux = wi == 0 ? (a0 & K2) | ((tmp & K1) << 4)
+                                   : wi == 1 ? (a1 & K2) | (((tmp >> 2) & K1) << 4)
+                                   : wi == 2 ? ((a0 >> 4) & K2) | (((tmp >> 4) & K1) << 4)
+                                             : ((a1 >> 4) & K2) | (((tmp >> 6) & K1) << 4);
+                const int s = (int) ((aux >> (8 * (l % 4))) & 0xFF) - 32;
+                const float ds = half_at(x + 108) * (float) s;
+                const uint8_t bit = (uint8_t) (1u << (4 * c + j));
+                float v[16];
 #pragma unroll
-            for (int t = 0; t < 16; ++t) {
-                const int i = i0 + t;
-                const int low = (x[32 + 32 * c + i] >> (2 * j)) & 3;
-                const int val = low - ((x[i] & bit) ? 0 : 4);
-                v[t] = ds * (float) val;
-            }
-            put16(o + lane * 16, v);
+                for (int t = 0; t < 16; ++t) {
+                    const int i = i0 + t;
+                    const int low = (x[32 + 32 * c + i] >> (2 * j)) & 3;
+                    const int val = low - ((x[i] & bit) ? 0 : 4);
+                    v[t] = ds * (float) val;
+                }
+                put16(o + lane * 16, v);
+            });
         });
     } else {   // Q8_0: d (f16), 32 int8 (34 bytes); a lane half a block
         q.parallel_for(range, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
