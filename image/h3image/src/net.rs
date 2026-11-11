@@ -307,8 +307,9 @@ impl<'a> Run<'a> {
     }
 
     /// What a step at noise level `sigma` fixes before the blocks run (the timestep rows, the tables of every block,
-    /// the rotations): host work and small uploads, which a sampler can make for the next step on another thread
-    /// while the card runs this one
+    /// the rotations): host work and small uploads (~40 ms; making the next step's on another thread while the card
+    /// runs this one was tried: int8 on the B70, 6 steps at 1 / 4 / 8.5 MP, 1.83 / 6.50 / 14.55 s against 1.84 / 6.54 / 14.57 -
+    /// no gain, so it is not kept)
     pub fn prepare(&self, sigma: f32) -> Result<Prepared> {
         let cfg = &self.blocks.cfg;
         let dev = self.x.buf.device();

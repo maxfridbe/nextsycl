@@ -69,7 +69,7 @@ const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "silo-expand", env: "NS_H3I_SILO_EXPAND", value: "0|1", help: "the silo's GGUF expansion to bfloat16, Q3_K read as stored (default 1; 0: the shared kernels', Q3_K held as Q6_K)", at: At::Load },
     EngineOption { name: "q8-product", env: "NS_H3I_Q8_PRODUCT", value: "0|1", help: "Q8_0: the silo's products read the int8 values (oneDNN weight decompression; default 1; 0: expanded to bfloat16 first)", at: At::Load },
     EngineOption { name: "te-prefetch", env: "NS_H3I_TE_PREFETCH", value: "0|1", help: "read the text encoder's file ahead into the page cache at load when the host has the room (default 1)", at: At::Load },
-    EngineOption { name: "keep-refiner", env: "NS_H3I_KEEP_REFINER", value: "0|1", help: "keep the token refiner on the card between pictures (default 1; 0: loaded for each picture)", at: At::Load },
+    EngineOption { name: "keep-refiner", env: "NS_H3I_KEEP_REFINER", value: "0|1", help: "keep the token refiner on the card between pictures (default 0: loaded for each picture, 0.08 - 0.17 s; 1: kept, 1.5 GiB more on the card)", at: At::Load },
     EngineOption { name: "keep-encoder", env: "NS_H3I_KEEP_ENCODER", value: "0|1", help: "keep the VAE encoder on the card from the first edit on (default 1; 0: loaded for each edit)", at: At::Load },
     EngineOption { name: "profile", env: "NS_H3I_PROFILE", value: "0|1", help: "debug: each step's time by stage on stderr (the queue drained between stages)", at: At::Load },
     EngineOption { name: "sigmas", env: "", value: "S,S,..,0", help: "another sampling grid than the heads' six steps: strictly falling from 1, ending at 0", at: At::Request },
@@ -137,7 +137,7 @@ pub struct H3Image {
     busy: Mutex<()>,
     /// NS_H3I_PROFILE: each step's time by stage
     pub profile: bool,
-    /// the token refiner, loaded once (NS_H3I_KEEP_REFINER, default on); None: loaded for each picture
+    /// the token refiner, loaded once (NS_H3I_KEEP_REFINER=1); None (the default): loaded for each picture
     refiner: Option<TextRefiner>,
     /// the VAE encoder of edits, kept from the first edit (NS_H3I_KEEP_ENCODER, default on)
     encoder: Mutex<Option<nextsycl_h3::venc::VideoEncoder>>,
@@ -205,7 +205,8 @@ impl H3Image {
         }
         log(format!("{ARCH}: VAE decoder {:.2} GiB in {:.1} s; {:.1} GiB used on the card", decoder.load_bytes as f64 / (1u64 << 30) as f64,
                     decoder.load_seconds, dev.mem_used() as f64 / (1u64 << 30) as f64));
-        let refiner = if on("NS_H3I_KEEP_REFINER") {
+        // kept only when asked: it holds 1.5 GiB on the card to save 0.08 - 0.17 s a picture
+        let refiner = if o.setting("NS_H3I_KEEP_REFINER").is_some_and(|v| v == "1") {
             let before = dev.mem_used();
             let r = TextRefiner::load(&dev, &ck, threads).map_err(h3e)?;
             log(format!("{ARCH}: token refiner {:.2} GiB, kept", (dev.mem_used() - before) as f64 / (1u64 << 30) as f64));
@@ -315,25 +316,11 @@ impl H3Image {
             eprintln!("profile: the picture's buffers and conditioning rows {:.0} ms", t_run.elapsed().as_secs_f64() * 1e3);
             run.profile = true;
         }
-        let run = &run;
-        // the next step's tables made on another thread while the card runs this one (40 ms of host work a step)
-        std::thread::scope(|sc| -> Result<()> {
-            let mut ahead: Option<std::thread::ScopedJoinHandle<nextsycl_h3::Result<net::Prepared>>> = None;
-            for i in 0..sigmas.len() - 1 {
-                let p = match ahead.take() {
-                    Some(h) => h.join().map_err(|_| Error("the step tables' thread panicked".into()))?,
-                    None => run.prepare(sigmas[i]),
-                }
-                .map_err(h3e)?;
-                if let Some(&s) = sigmas.get(i + 1).filter(|_| i + 2 < sigmas.len()) {
-                    ahead = Some(sc.spawn(move || run.prepare(s)));
-                }
-                let v = run.net_prepared(p, &x, sigmas[i + 1], &mut |_| Ok(())).map_err(h3e)?;
-                net::euler(&mut x, &v, sigmas[i], sigmas[i + 1]);
-                step(i)?;
-            }
-            Ok(())
-        })?;
+        for i in 0..sigmas.len() - 1 {
+            let v = run.net(&x, sigmas[i], sigmas[i + 1], &mut |_| Ok(())).map_err(h3e)?;
+            net::euler(&mut x, &v, sigmas[i], sigmas[i + 1]);
+            step(i)?;
+        }
         Ok(x)
     }
 }
