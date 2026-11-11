@@ -7,7 +7,7 @@ license: minimax-h3-image-community
 commercial: false
 license_note: 'MiniMax-H3-Image Community License Agreement (MiniMax, 2026-11-10): not licensed in the European Union, the United Kingdom, South Korea or the United States; written authorization from MiniMax (platform.minimax.io/license) before offering it as a hosted service to third parties or above US$1 million yearly revenue; commercial products show "MiniMax-H3-Image"; its Acceptable Use Policy binds every user; its outputs may not improve another model; redistributed copies carry the agreement and a NOTICE. The text encoder is MiniMax H3''s (its own license).'
 title: 'MiniMax-H3-Image Q8_0 (the closest GGUF to bf16; Rust + SYCL)'
-about: 'as minimax-h3-image with Hearthscale''s Q8_0 GGUF (Q8_0 matrices expanded to bf16 a matrix at a time, 19.1 GiB on the card); the GGUF maker lists Q8_0 as the closest to the bf16 weights'
+about: 'as minimax-h3-image with Hearthscale''s Q8_0 GGUF (19.1 GiB on the card; its products read the int8 values with their half scales - oneDNN weight decompression in the engine''s silo - so it is the fastest GGUF up to 4 MP: 1 MP 2.6 s, 4 MP 10.0 s for 6 steps on the B70; 16 MP as the others); the GGUF maker lists Q8_0 as the closest to the bf16 weights'
 gpus: '0,1'
 vram_gib: 23.5                  # B70, 4096x4096: 22.9 GiB peak (20.1 after load)
 defaults:
