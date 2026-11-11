@@ -15,6 +15,7 @@ pub mod dtype;
 pub mod esrgan;
 pub mod exposure;
 pub mod jobs;
+pub mod kquant;
 pub mod media;
 pub mod gguf;
 pub mod layout;

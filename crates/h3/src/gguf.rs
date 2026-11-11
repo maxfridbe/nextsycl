@@ -6,13 +6,15 @@ use std::path::{Path, PathBuf};
 
 use crate::{Ctx, Error, Result};
 
-/// A tensor's element type, by llama.cpp's numbering (the ones the MiniMax H3 files use; Q8_0 and Q5_K: P-H3-Image's).
+/// A tensor's element type, by llama.cpp's numbering (the ones the MiniMax H3 files use; Q8_0 and Q5_K: P-H3-Image's;
+/// Q3_K: MiniMax-H3-Image's Q3_K_M file, read as Q6_K - see `kquant::q3k_to_q6k`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GType {
     F32,
     F16,
     BF16,
     Q8_0,
+    Q3K,
     Q4K,
     Q5K,
     Q6K,
@@ -25,6 +27,7 @@ impl GType {
             1 => GType::F16,
             30 => GType::BF16,
             8 => GType::Q8_0,
+            11 => GType::Q3K,
             12 => GType::Q4K,
             13 => GType::Q5K,
             14 => GType::Q6K,
@@ -32,7 +35,7 @@ impl GType {
         })
     }
 
-    /// The library's code for `h3s_dequant`.
+    /// The library's code for `h3s_dequant` (Q3_K has none: it reaches the card transcoded to Q6_K).
     pub fn quant_code(self) -> Option<i32> {
         match self {
             GType::Q8_0 => Some(8),
@@ -49,6 +52,7 @@ impl GType {
             GType::F32 => n * 4,
             GType::F16 | GType::BF16 => n * 2,
             GType::Q8_0 => n / 32 * 34,
+            GType::Q3K => n / 256 * 110,
             GType::Q4K => n / 256 * 144,
             GType::Q5K => n / 256 * 176,
             GType::Q6K => n / 256 * 210,

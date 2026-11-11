@@ -1,6 +1,7 @@
 //! Reading a `.safetensors` checkpoint: an 8-byte length, a JSON header (name -> type, shape, byte range), then the
 //! tensors' bytes back to back. A `.gguf` file opens as a checkpoint too (the denoiser's llama.cpp-quantized forms,
-//! Q4_K / Q6_K; Q8_0 / Q5_K): its float tensors as such, its k-quant matrices as their raw blocks with `kquant` set.
+//! Q4_K / Q6_K; Q8_0 / Q5_K; Q3_K, read as Q6_K): its float tensors as such, its k-quant matrices as their raw blocks
+//! with `kquant` set.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -23,9 +24,20 @@ pub struct Entry {
     /// A llama.cpp k-quant (a GGUF file's Q4_K / Q6_K matrix): `bytes` of its blocks, `dtype` U8, `shape` the
     /// matrix's own.
     pub kquant: Option<GType>,
+    /// What the file holds when it is not what `kquant` says: a Q3_K matrix, transcoded to Q6_K as it is read (`bytes`
+    /// are then the Q6_K blocks'; the file's are `file_bytes()`)
+    pub stored: Option<GType>,
 }
 
 impl Entry {
+    /// The tensor's bytes in the file
+    pub fn file_bytes(&self) -> usize {
+        match self.stored {
+            Some(t) => t.bytes(self.shape.iter().product()),
+            None => self.bytes,
+        }
+    }
+
     /// The shape of the bytes as they go to the device: a k-quant's blocks are a flat byte buffer.
     pub fn stored_shape(&self) -> Vec<usize> {
         match self.kquant {
@@ -62,7 +74,7 @@ impl Checkpoint {
             if bytes != shape.iter().product::<usize>() * dtype.size() || t.offset + t.bytes > file_bytes {
                 return Err(Error(format!("header entry {}: byte range does not match its shape", t.name)));
             }
-            entries.insert(t.name.clone(), Entry { name: t.name, dtype, shape, offset: t.offset, bytes, kquant: None });
+            entries.insert(t.name.clone(), Entry { name: t.name, dtype, shape, offset: t.offset, bytes, kquant: None, stored: None });
         }
         Ok(Checkpoint { path: path.to_path_buf(), entries, metadata: st.metadata, file_bytes })
     }
@@ -73,15 +85,21 @@ impl Checkpoint {
             .entries
             .into_values()
             .map(|e| {
-                let (dtype, kquant) = match e.ty {
-                    GType::F32 => (DType::F32, None),
-                    GType::F16 => (DType::F16, None),
-                    GType::BF16 => (DType::BF16, None),
-                    GType::Q8_0 | GType::Q4K | GType::Q5K | GType::Q6K => (DType::U8, Some(e.ty)),
+                let (dtype, kquant, stored) = match e.ty {
+                    GType::F32 => (DType::F32, None, None),
+                    GType::F16 => (DType::F16, None, None),
+                    GType::BF16 => (DType::BF16, None, None),
+                    GType::Q8_0 | GType::Q4K | GType::Q5K | GType::Q6K => (DType::U8, Some(e.ty), None),
+                    // the same values as Q6_K blocks (crate::kquant), which the kernels expand
+                    GType::Q3K => (DType::U8, Some(GType::Q6K), Some(GType::Q3K)),
+                };
+                let bytes = match stored {
+                    Some(_) => GType::Q6K.bytes(e.elements()),
+                    None => e.bytes,
                 };
                 // ComfyUI-GGUF files made by stable-diffusion.cpp name the tensors under the ComfyUI model's prefix
                 let name = e.name.strip_prefix("model.diffusion_model.").unwrap_or(&e.name).to_string();
-                (name.clone(), Entry { name, dtype, shape: e.shape, offset: e.offset, bytes: e.bytes, kquant })
+                (name.clone(), Entry { name, dtype, shape: e.shape, offset: e.offset, bytes, kquant, stored })
             })
             .collect();
         Ok(Checkpoint { path: path.to_path_buf(), entries, metadata: BTreeMap::new(), file_bytes })
@@ -96,13 +114,17 @@ impl Checkpoint {
         self.entries.get(name).ok_or_else(|| Error(format!("{}: no tensor named {name}", self.path.display())))
     }
 
-    /// One tensor's bytes, read from the file.
+    /// One tensor's bytes, read from the file (a Q3_K matrix's as Q6_K blocks).
     pub fn read(&self, name: &str) -> Result<Vec<u8>> {
         let e = self.get(name)?;
         let f = File::open(&self.path)?;
-        let mut v = vec![0u8; e.bytes];
+        let mut v = vec![0u8; e.file_bytes()];
         f.read_exact_at(&mut v, e.offset).ctx(format!("reading {name}"))?;
-        Ok(v)
+        match e.stored {
+            Some(GType::Q3K) => crate::kquant::q3k_to_q6k(&v).ctx(name),
+            Some(other) => Err(Error(format!("{name}: {other:?} is not transcoded"))),
+            None => Ok(v),
+        }
     }
 
     /// The per-layer quantization record ComfyUI stores beside a quantized weight (`<layer>.comfy_quant`: JSON as

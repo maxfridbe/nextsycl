@@ -59,6 +59,18 @@ struct Level {
     time: usize,
 }
 
+/// H3's latent statistics (ComfyUI `comfy/ldm/minimax/vae.py` LATENTS_MEAN / LATENTS_STD), for VAE files without them
+pub const LATENTS_MEAN: [f32; 24] = [
+    0.858_090_34, -0.960_659_15, 1.066_164, -0.509_032_5, -0.272_758_2, -1.367_541_4, -0.255_325_5, -0.269_075_55, -0.537_684_1, -0.046_409_73,
+    0.665_737, 0.196_901_28, -0.546_060_8, -0.403_534_2, -0.236_830_25, 0.259_284_53, -0.301_339_45, 0.211_341_99, -1.120_684_9, 0.358_193_34,
+    -0.042_251_438, 0.260_483, 0.228_640_93, 0.705_603_2,
+];
+pub const LATENTS_STD: [f32; 24] = [
+    1.222_377_4, 1.276_726_4, 1.683_177_5, 1.754_945_5, 1.563_621_6, 2.194_143_5, 0.965_313_8, 1.056_988_6, 0.841_948_9, 0.772_995_3, 1.895_593_8,
+    0.946_841_8, 0.799_680_95, 0.449_889, 0.719_74, 0.693_629_3, 2.961_095, 2.769_42, 3.049_618_5, 2.108_805_4, 3.276_226_3, 3.162_735_7,
+    2.281_681_3, 2.612_784_4,
+];
+
 pub struct VideoEncoder {
     dev: Arc<Device>,
     dt: DType,
@@ -136,8 +148,9 @@ impl VideoEncoder {
             conv_out: conv("encoder.conv_out")?,
             quant_w: host(ck, "quant_conv.weight")?,
             quant_b: host(ck, "quant_conv.bias")?,
-            mean: host(ck, "latents_mean")?,
-            std: host(ck, "latents_std")?,
+            // MiniMax-H3-Image's VAE file carries no statistics: H3's (ComfyUI's LATENTS_MEAN / LATENTS_STD) then
+            mean: if ck.entries.contains_key("latents_mean") { host(ck, "latents_mean")? } else { LATENTS_MEAN.to_vec() },
+            std: if ck.entries.contains_key("latents_std") { host(ck, "latents_std")? } else { LATENTS_STD.to_vec() },
         })
     }
 

@@ -1,0 +1,11 @@
+[package]
+name = "nextsycl-image-h3image"
+description = "MiniMax-H3-Image: MiniMax H3's denoiser on one latent frame with a six-head bank - text to image and edits up to 16 MP in 6 steps, H3's Qwen3-VL 32B text encoder and a 2D transformer VAE decoder; Rust and SYCL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-image.workspace = true
+nextsycl-h3.workspace = true

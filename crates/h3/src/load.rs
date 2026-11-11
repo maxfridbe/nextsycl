@@ -30,10 +30,17 @@ pub fn load(dev: &Arc<Device>, ckpt: &Checkpoint, threads: usize, keep: impl Fn(
     let mut wanted: Vec<_> = ckpt.entries.values().filter(|e| keep(&e.name)).collect();
     wanted.sort_by_key(|e| e.offset);
     let mut tensors = BTreeMap::new();
-    let mut jobs = Vec::new(); // (tensor index, offset in the tensor, file offset, bytes)
+    let mut jobs = Vec::new(); // (tensor index, offset in the tensor, file offset, bytes); bytes 0: the whole tensor, transcoded
     let mut order = Vec::new();
     for (i, e) in wanted.iter().enumerate() {
         let t = Tensor::new(dev, e.dtype, &e.stored_shape()).ctx(format!("allocating {}", e.name))?;
+        if e.stored.is_some() {
+            // a Q3_K matrix: read whole and transcoded (Checkpoint::read), then sent
+            jobs.push((i, 0, e.offset, 0));
+            order.push(e.name.clone());
+            tensors.insert(e.name.clone(), t);
+            continue;
+        }
         let mut off = 0;
         while off < e.bytes {
             let n = BLOCK.min(e.bytes - off);
@@ -58,6 +65,10 @@ pub fn load(dev: &Arc<Device>, ckpt: &Checkpoint, threads: usize, keep: impl Fn(
                             return Ok(());
                         }
                         let (ti, off, foff, n) = jobs[j];
+                        if n == 0 {
+                            bufs[ti].write(0, &ckpt.read(&order[ti])?)?;
+                            continue;
+                        }
                         f.read_exact_at(&mut block[..n], foff).ctx("reading the checkpoint")?;
                         bufs[ti].write(off, &block[..n])?;
                     }
@@ -71,6 +82,6 @@ pub fn load(dev: &Arc<Device>, ckpt: &Checkpoint, threads: usize, keep: impl Fn(
     if let Some(e) = failed.into_inner().unwrap() {
         return Err(e);
     }
-    let bytes = wanted.iter().map(|e| e.bytes as u64).sum();
+    let bytes = wanted.iter().map(|e| e.file_bytes() as u64).sum();
     Ok(Loaded { tensors, bytes, seconds: t0.elapsed().as_secs_f64() })
 }
