@@ -37,6 +37,11 @@ int ns_image_h3i_silo_q8_repack(ns_gpu* g, void* blocks, int64_t N, int64_t K, v
 
 /* out [M, N] = x [M, K] . W^T, x and out bfloat16, W a repacked Q8_0 matrix (q8_repack): oneDNN's weight
  * decompression (int8, half scales every 32 along K, fpmath bf16) - no expansion pass */
+/* out [M, N] = x [M, K] . W^T, all bfloat16, W [N, K] (an expanded block matrix): one oneDNN product over all M rows
+ * (the shared nsd_linear takes 8,192 rows at a time: at 16 MP, 16,434 rows, that is three products, the last of 50
+ * rows reading the whole matrix again) */
+int ns_image_h3i_silo_linear(ns_gpu* g, const void* x, int64_t M, int64_t K, const void* w, int64_t N, void* out);
+
 int ns_image_h3i_silo_q8_linear(ns_gpu* g, const void* x, int64_t M, int64_t K, const void* w, int64_t N, void* out);
 
 #ifdef __cplusplus

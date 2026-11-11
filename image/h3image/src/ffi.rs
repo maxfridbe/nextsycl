@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use nextsycl_core::Gpu;
 use nextsycl_h3::device::Tensor;
-use nextsycl_h3::dit::{AttentionFn, ExpandFn, ProductFn};
+use nextsycl_h3::dit::{AttentionFn, ProductFn};
 use nextsycl_h3::dtype::DType;
 use nextsycl_h3::gguf::GType;
 use nextsycl_h3::ops::KLinear;
@@ -25,6 +25,7 @@ pub struct Silo {
     pub expand: unsafe extern "C" fn(*mut c_void, *const c_void, i32, i64, *mut c_void) -> i32,
     pub q8_repack: unsafe extern "C" fn(*mut c_void, *mut c_void, i64, i64, *mut c_void) -> i32,
     pub q8_linear: unsafe extern "C" fn(*mut c_void, *const c_void, i64, i64, *const c_void, i64, *mut c_void) -> i32,
+    pub linear: unsafe extern "C" fn(*mut c_void, *const c_void, i64, i64, *const c_void, i64, *mut c_void) -> i32,
 }
 
 fn silo_error(what: &str) -> Error {
@@ -33,7 +34,7 @@ fn silo_error(what: &str) -> Error {
 
 /// Every Q8_0 block matrix of `blocks` rewritten in place for the silo's product (int8 values, then the half scales
 /// [K / 32, N]: the same bytes a block), through the stack's expansion buffer; then the products are the silo's
-/// (`q8_product`) - the shared expansion can no longer read these matrices. The count rewritten.
+/// (`products`) - the shared expansion can no longer read these matrices. The count rewritten.
 pub fn q8_repack(gpu: &Gpu, s: &Silo, blocks: &nextsycl_h3::dit::Blocks) -> nextsycl_h3::Result<usize> {
     use nextsycl_h3::dit::Weight;
     let tmp = blocks.expansion_buffer().ok_or("q8 repack: no expansion buffer")?;
@@ -57,25 +58,58 @@ pub fn q8_repack(gpu: &Gpu, s: &Silo, blocks: &nextsycl_h3::dit::Blocks) -> next
     Ok(n)
 }
 
-/// The products with repacked Q8_0 block matrices (`q8_repack`) on the silo: oneDNN's int8 weight decompression,
-/// bfloat16 activations, no expansion
-pub fn q8_product(gpu: &Arc<Gpu>, s: &'static Silo) -> ProductFn {
+/// Which product the silo makes for a block matrix of `kind` (`q8_repacked`: the Q8_0 matrices were rewritten by
+/// `q8_repack`): the Q8_0 decompression product, its expansion and one bfloat16 product, or none (the shared path)
+#[derive(Debug, PartialEq, Eq)]
+pub enum Route {
+    Q8,
+    Expand,
+    Shared,
+}
+
+pub fn route(kind: GType, expands: bool, q8_repacked: bool) -> Route {
+    if kind == GType::Q8_0 && q8_repacked {
+        Route::Q8
+    } else if expands {
+        Route::Expand
+    } else {
+        Route::Shared
+    }
+}
+
+/// The block products on the silo, bfloat16 activations: a repacked Q8_0 matrix through oneDNN's int8 weight
+/// decompression (no expansion), the other kinds the silo reads expanded into the stack's buffer and multiplied in
+/// one product over all the rows (`expand`: NS_H3I_SILO_EXPAND); the engine's device must share `gpu`'s queue
+/// (`Device::on_queue`)
+pub fn products(gpu: &Arc<Gpu>, s: &'static Silo, q8_repacked: bool, expand: bool) -> ProductFn {
     let gpu = gpu.clone();
-    Box::new(move |l: &KLinear, x: &Tensor, out: &Tensor| {
-        if l.kind != GType::Q8_0 {
-            return Ok(false);
-        }
+    Box::new(move |l: &KLinear, x: &Tensor, out: &Tensor, wbuf: &Tensor| {
+        let r = route(l.kind, expand && expands(s, l.kind), q8_repacked);
         let m = x.elements() / l.k;
-        if x.dtype != DType::BF16 || out.dtype != DType::BF16 || x.elements() != m * l.k || out.elements() != m * l.n {
-            return Err(Error(format!("q8 product: x {:?} {:?}, out {:?} {:?} for a [{}, {}] matrix (bfloat16 only: the matrix is repacked)",
-                                     x.dtype, x.shape, out.dtype, out.shape, l.n, l.k)));
+        let fits = x.dtype == DType::BF16 && out.dtype == DType::BF16 && x.elements() == m * l.k && out.elements() == m * l.n;
+        match r {
+            Route::Shared => Ok(false),
+            Route::Q8 if !fits => Err(Error(format!("q8 product: x {:?} {:?}, out {:?} {:?} for a [{}, {}] matrix (bfloat16 only: the matrix is repacked)",
+                                                    x.dtype, x.shape, out.dtype, out.shape, l.n, l.k))),
+            Route::Expand if !fits || wbuf.dtype != DType::BF16 => Ok(false),
+            Route::Q8 => {
+                // SAFETY: device buffers on the GPU's queue, sizes checked above.
+                let rc = unsafe { (s.q8_linear)(gpu.raw(), x.buf.ptr().cast_const(), m as i64, l.k as i64, l.blocks.buf.ptr().cast_const(), l.n as i64, out.buf.ptr()) };
+                if rc != 0 {
+                    return Err(silo_error("Q8_0 product"));
+                }
+                Ok(true)
+            }
+            Route::Expand => {
+                expand_into(&gpu, s, &l.blocks, l.kind, l.n * l.k, wbuf)?;
+                // SAFETY: device buffers on the GPU's queue, sizes checked above; wbuf holds the [n, k] matrix just expanded.
+                let rc = unsafe { (s.linear)(gpu.raw(), x.buf.ptr().cast_const(), m as i64, l.k as i64, wbuf.buf.ptr().cast_const(), l.n as i64, out.buf.ptr()) };
+                if rc != 0 {
+                    return Err(silo_error("product"));
+                }
+                Ok(true)
+            }
         }
-        // SAFETY: device buffers on the GPU's queue, sizes checked above.
-        let rc = unsafe { (s.q8_linear)(gpu.raw(), x.buf.ptr().cast_const(), m as i64, l.k as i64, l.blocks.buf.ptr().cast_const(), l.n as i64, out.buf.ptr()) };
-        if rc != 0 {
-            return Err(silo_error("Q8_0 product"));
-        }
-        Ok(true)
     })
 }
 
@@ -110,19 +144,6 @@ pub fn expand_into(gpu: &Gpu, s: &Silo, blocks: &Tensor, kind: GType, n: usize, 
     Ok(())
 }
 
-/// The blocks' k-quant expansion on the silo for the kinds it reads (the rest, and a 16-bit buffer other than
-/// bfloat16, stay on the shared kernels'); the engine's device must share `gpu`'s queue (`Device::on_queue`)
-pub fn expander(gpu: &Arc<Gpu>, s: &'static Silo) -> ExpandFn {
-    let gpu = gpu.clone();
-    Box::new(move |l: &KLinear, w: &Tensor| {
-        if w.dtype != DType::BF16 || !expands(s, l.kind) {
-            return Ok(false);
-        }
-        expand_into(&gpu, s, &l.blocks, l.kind, l.n * l.k, w)?;
-        Ok(true)
-    })
-}
-
 /// The silo, when built (None: NS_SILO=0, or no file - the shared kernels throughout)
 // each field's declared type is the annotation: the transmute target is inferred from it
 #[allow(clippy::missing_transmute_annotations)]
@@ -147,6 +168,7 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             expand: sym!("ns_image_h3i_silo_expand"),
             q8_repack: sym!("ns_image_h3i_silo_q8_repack"),
             q8_linear: sym!("ns_image_h3i_silo_q8_linear"),
+            linear: sym!("ns_image_h3i_silo_linear"),
         }))
     })
     .as_ref()

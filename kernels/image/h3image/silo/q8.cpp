@@ -102,4 +102,27 @@ int ns_image_h3i_silo_q8_linear(ns_gpu* g, const void* x, int64_t M, int64_t K, 
     return ns_fail(std::string("h3image silo q8 linear: ") + e.what());
 }
 
+int ns_image_h3i_silo_linear(ns_gpu* g, const void* x, int64_t M, int64_t K, const void* w, int64_t N, void* out) try {
+    if (M <= 0) return 0;
+    std::lock_guard<std::mutex> lk(mu);
+    Dnn& d = dnn(g);
+    memory::desc src({M, K}, dt::bf16, memory::format_tag::ab);
+    memory::desc wei({K, N}, dt::bf16, memory::format_tag::ba);   // the [N, K] matrix, read transposed
+    memory::desc dst({M, N}, dt::bf16, memory::format_tag::ab);
+    // keyed apart from the Q8_0 products: K negated
+    auto key = std::make_tuple(M, -K, N);
+    auto it = d.prims.find(key);
+    if (it == d.prims.end()) {
+        if (d.prims.size() >= 256) {
+            g->q.wait();
+            d.prims.clear();
+        }
+        it = d.prims.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(d.eng, src, wei, dst))).first;
+    }
+    it->second.execute(d.st, {{DNNL_ARG_SRC, usm(src, d.eng, x)}, {DNNL_ARG_WEIGHTS, usm(wei, d.eng, w)}, {DNNL_ARG_DST, usm(dst, d.eng, out)}});
+    return 0;
+} catch (const std::exception& e) {
+    return ns_fail(std::string("h3image silo linear: ") + e.what());
+}
+
 }  // extern "C"

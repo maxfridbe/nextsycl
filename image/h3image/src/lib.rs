@@ -68,6 +68,7 @@ const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "sage-min-s", env: "NS_H3I_SAGE_MIN_S", value: "TOKENS", help: "the shortest denoiser sequence the silo's SageAttention takes (default 1024; shorter: oneDNN's)", at: At::Load },
     EngineOption { name: "silo-expand", env: "NS_H3I_SILO_EXPAND", value: "0|1", help: "the silo's GGUF expansion to bfloat16, Q3_K read as stored (default 1; 0: the shared kernels', Q3_K held as Q6_K)", at: At::Load },
     EngineOption { name: "q8-product", env: "NS_H3I_Q8_PRODUCT", value: "0|1", help: "Q8_0: the silo's products read the int8 values (oneDNN weight decompression; default 1; 0: expanded to bfloat16 first)", at: At::Load },
+    EngineOption { name: "te-prefetch", env: "NS_H3I_TE_PREFETCH", value: "0|1", help: "read the text encoder's file ahead into the page cache at load when the host has the room (default 1)", at: At::Load },
     EngineOption { name: "keep-refiner", env: "NS_H3I_KEEP_REFINER", value: "0|1", help: "keep the token refiner on the card between pictures (default 1; 0: loaded for each picture)", at: At::Load },
     EngineOption { name: "keep-encoder", env: "NS_H3I_KEEP_ENCODER", value: "0|1", help: "keep the VAE encoder on the card from the first edit on (default 1; 0: loaded for each edit)", at: At::Load },
     EngineOption { name: "profile", env: "NS_H3I_PROFILE", value: "0|1", help: "debug: each step's time by stage on stderr (the queue drained between stages)", at: At::Load },
@@ -141,6 +142,8 @@ pub struct H3Image {
     /// the VAE encoder of edits, kept from the first edit (NS_H3I_KEEP_ENCODER, default on)
     encoder: Mutex<Option<nextsycl_h3::venc::VideoEncoder>>,
     keep_encoder: bool,
+    /// the Q8_0 block matrices were rewritten for the silo's product (the shared expansion cannot read them)
+    pub q8_repacked: bool,
 }
 
 fn role<'f>(files: &'f ModelFiles, r: &str) -> Result<&'f Path> {
@@ -175,17 +178,19 @@ impl H3Image {
             log(format!("{ARCH}: the {} silo's attention from {min_s} tokens", ffi::SILO));
         }
         let on = |name: &str| o.setting(name).is_none_or(|v| v != "0");
-        if let (Some(s), Some(kind)) = (expand, blocks.kquant) {
-            if ffi::expands(s, kind) {
-                blocks.expand = Some(ffi::expander(&gpu, s));
-                log(format!("{ARCH}: the {} silo's {kind:?} expansion", ffi::SILO));
+        // Q8_0: the silo's products read the int8 values themselves (NS_H3I_Q8_PRODUCT, default on); the other kinds
+        // it reads: its expansion, then one product over all the rows (NS_H3I_SILO_EXPAND)
+        let mut q8_repacked = false;
+        if let (Some(s), Some(kind)) = (silo, blocks.kquant) {
+            let q8 = kind == nextsycl_h3::gguf::GType::Q8_0 && on("NS_H3I_Q8_PRODUCT");
+            q8_repacked = q8;
+            let route = ffi::route(kind, expand.is_some() && ffi::expands(s, kind), q8);
+            if route != ffi::Route::Shared {
+                let n = if q8 { ffi::q8_repack(&gpu, s, &blocks).map_err(h3e)? } else { 0 };
+                blocks.product = Some(ffi::products(&gpu, s, q8, expand.is_some()));
+                log(format!("{ARCH}: the {} silo's {kind:?} products ({})", ffi::SILO,
+                            if q8 { format!("{n} matrices repacked, int8 decompression, no expansion") } else { "its expansion, one product".into() }));
             }
-        }
-        // Q8_0: the silo's products read the int8 values themselves (NS_H3I_Q8_PRODUCT, default on)
-        if let Some(s) = silo.filter(|_| blocks.kquant == Some(nextsycl_h3::gguf::GType::Q8_0) && on("NS_H3I_Q8_PRODUCT")) {
-            let n = ffi::q8_repack(&gpu, s, &blocks).map_err(h3e)?;
-            blocks.product = Some(ffi::q8_product(&gpu, s));
-            log(format!("{ARCH}: the {} silo's Q8_0 products ({n} matrices repacked, no expansion)", ffi::SILO));
         }
         let outer = net::Outer::load(&dev, &ck, &blocks.cfg).map_err(h3e)?;
         let form = match ck.entries.values().find(|e| e.name == "blocks.0.mlp.fc1.weight") {
@@ -209,6 +214,9 @@ impl H3Image {
             None
         };
         let keep_encoder = on("NS_H3I_KEEP_ENCODER");
+        if on("NS_H3I_TE_PREFETCH") {
+            prefetch(role(files, "text-encoder")?, log);
+        }
         let profile = o.setting("NS_H3I_PROFILE").is_some_and(|v| v != "0" && !v.is_empty());
         if profile {
             if let Some(kind) = blocks.kquant {
@@ -216,7 +224,7 @@ impl H3Image {
             }
         }
         Ok(H3Image { gpu, dev, ck, blocks, outer, decoder, files: files.clone(), threads, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64(),
-                     busy: Mutex::new(()), profile, refiner, encoder: Mutex::new(None), keep_encoder })
+                     busy: Mutex::new(()), profile, refiner, encoder: Mutex::new(None), keep_encoder, q8_repacked })
     }
 
     /// The tokenizer's directory (vocab.json, merges.txt, tokenizer_config.json)
@@ -438,6 +446,34 @@ impl ImageEngine for H3Image {
     }
 }
 
+extern "C" {
+    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+}
+const POSIX_FADV_WILLNEED: i32 = 3;
+
+/// Whether the host has the room to read a file of `bytes` ahead into the page cache: MemAvailable (kB, from
+/// /proc/meminfo) keeps 16 GiB beyond it
+pub fn room_for_prefetch(meminfo: &str, bytes: u64) -> bool {
+    let avail_kb = meminfo.lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok());
+    avail_kb.is_some_and(|kb| kb * 1024 >= bytes + (16u64 << 30))
+}
+
+/// The text encoder's file read ahead into the page cache (posix_fadvise WILLNEED, on its own thread): the first
+/// request then copies it into pinned memory from RAM instead of the drive. Skipped without the room.
+fn prefetch(path: &Path, log: &mut dyn FnMut(String)) {
+    let Ok(f) = std::fs::File::open(path) else { return };
+    let bytes = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if !room_for_prefetch(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default(), bytes) {
+        log(format!("{ARCH}: the text encoder is not read ahead (MemAvailable would fall under 16 GiB)"));
+        return;
+    }
+    log(format!("{ARCH}: reading the text encoder ahead ({:.1} GiB into the page cache)", bytes as f64 / (1u64 << 30) as f64));
+    std::thread::spawn(move || {
+        // SAFETY: the descriptor is the open file's, kept open by `f` for the call; WILLNEED only advises the kernel.
+        unsafe { posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(&f), 0, 0, POSIX_FADV_WILLNEED) };
+    });
+}
+
 /// Whether `name` is one of the denoiser blocks' four matrices (`blocks.<i>.attn.qkv_proj.weight` ...): what the
 /// silo expands (the token refiner's go through the shared kernels)
 pub fn is_block_matrix(name: &str) -> bool {
@@ -566,6 +602,17 @@ mod tests {
     }
 
     #[test]
+    fn products_route_by_kind() {
+        use ffi::{route, Route};
+        use nextsycl_h3::gguf::GType;
+        assert_eq!(route(GType::Q8_0, true, true), Route::Q8);
+        assert_eq!(route(GType::Q8_0, true, false), Route::Expand);
+        assert_eq!(route(GType::Q8_0, false, false), Route::Shared);
+        assert_eq!(route(GType::Q4K, true, true), Route::Expand);
+        assert_eq!(route(GType::Q6K, false, true), Route::Shared);
+    }
+
+    #[test]
     fn the_silo_takes_ggufs_codes() {
         use nextsycl_h3::gguf::GType;
         assert_eq!([GType::Q8_0, GType::Q3K, GType::Q4K, GType::Q5K].map(ffi::gguf_code), [Some(8), Some(11), Some(12), Some(13)]);
@@ -574,6 +621,15 @@ mod tests {
         for k in [GType::Q8_0, GType::Q4K, GType::Q5K] {
             assert_eq!(ffi::gguf_code(k), k.quant_code());
         }
+    }
+
+    #[test]
+    fn the_text_encoder_is_read_ahead_only_with_room() {
+        let info = "MemTotal:       64000000 kB\nMemFree:         1000000 kB\nMemAvailable:   40000000 kB\n";
+        let gib = 1u64 << 30;
+        assert!(room_for_prefetch(info, 18 * gib));
+        assert!(!room_for_prefetch(info, 23 * gib));
+        assert!(!room_for_prefetch("MemTotal: 1 kB\n", 1));
     }
 
     #[test]

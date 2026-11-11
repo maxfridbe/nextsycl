@@ -287,13 +287,9 @@ pub type Tap<'a> = &'a mut dyn FnMut(&str, &Tensor) -> Result<()>;
 /// true; false (or none set) leaves a call to the shared kernels
 pub type AttentionFn = Box<dyn Fn(Rows, Rows, Rows, &Tensor) -> Result<bool> + Send + Sync>;
 
-/// Another engine's expansion of a k-quant block matrix into the 16-bit buffer the product reads (a silo's: the
-/// matrix, the buffer), used where it returns true; false (or none set) leaves it to the shared kernels' nsd_dequant
-pub type ExpandFn = Box<dyn Fn(&KLinear, &Tensor) -> Result<bool> + Send + Sync>;
-
-/// Another engine's whole product with a k-quant block matrix (the matrix, x, out), with no expansion: true when it
-/// did it; false leaves the expansion and the product to the rest
-pub type ProductFn = Box<dyn Fn(&KLinear, &Tensor, &Tensor) -> Result<bool> + Send + Sync>;
+/// Another engine's whole product with a k-quant block matrix (the matrix, x, out, the stack's 16-bit expansion buffer
+/// for its own use): true when it did it; false leaves the expansion and the product to the rest
+pub type ProductFn = Box<dyn Fn(&KLinear, &Tensor, &Tensor, &Tensor) -> Result<bool> + Send + Sync>;
 
 /// The block stack.
 pub struct Blocks {
@@ -306,9 +302,8 @@ pub struct Blocks {
     wbuf: Option<Tensor>,
     /// the attention the blocks call, when an engine brings its own (P-H3-Image's silo); else the shared kernels'
     pub attention: Option<AttentionFn>,
-    /// the k-quant expansion, when an engine brings its own (MiniMax-H3-Image's silo); else the shared kernels'
-    pub expand: Option<ExpandFn>,
-    /// the k-quant products themselves, when an engine brings them (MiniMax-H3-Image's Q8_0); tried first
+    /// the k-quant products, when an engine brings its own (MiniMax-H3-Image's silo); else the shared expansion and
+    /// product
     pub product: Option<ProductFn>,
 }
 
@@ -342,7 +337,7 @@ impl Blocks {
             }
             None => None,
         };
-        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf, attention: None, expand: None, product: None })
+        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf, attention: None, product: None })
     }
 
     /// `out = linear(x)` with one of the blocks' matrices.
@@ -350,16 +345,13 @@ impl Blocks {
         match w {
             Weight::I8(l) => l.forward(x, out),
             Weight::K(l) => {
+                let wbuf = self.wbuf.as_ref().ok_or("a k-quant matrix without its expansion buffer")?;
                 if let Some(f) = &self.product {
-                    if f(l, x, out)? {
+                    if f(l, x, out, wbuf)? {
                         return Ok(());
                     }
                 }
-                let wbuf = self.wbuf.as_ref().ok_or("a k-quant matrix without its expansion buffer")?;
-                match &self.expand {
-                    Some(f) if f(l, wbuf)? => l.product(x, out, wbuf),
-                    _ => l.forward(x, out, wbuf),
-                }
+                l.forward(x, out, wbuf)
             }
         }
     }

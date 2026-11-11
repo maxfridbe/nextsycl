@@ -204,7 +204,7 @@ fn expansions(e: &H3Image, log: &mut dyn FnMut(String)) -> Result<f64> {
         log("expand         an int8 checkpoint: nothing expanded".into());
         return Ok(0.0);
     };
-    if e.blocks.product.is_some() {
+    if e.q8_repacked {
         log("expand         the silo's own products (Q8_0 repacked): nothing expanded (NS_H3I_Q8_PRODUCT=0 to compare)".into());
         return Ok(0.0);
     }
