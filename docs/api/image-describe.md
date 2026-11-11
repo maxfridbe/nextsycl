@@ -16,7 +16,7 @@ without reading nextsycl's code.
   kind. The OCR models (olmOCR-2, a Qwen2.5-VL-7B fine-tune; Unlimited-OCR; PaddleOCR-VL) are trained to transcribe
   pages, not to caption scenes.
 - **A model card, not code, sizes it**: `qwen3.8-27b-q4-describe` (model-cards/llm) is `qwen3.8-27b-q4`'s own files
-  (nothing new downloaded) with a 16K + 8K context instead of 128K + 32K, so it takes 19.6 GiB of a card instead of 29 and
+  (nothing new downloaded) with a 16K + 8K context instead of 128K + 32K, so it takes 19.2 GiB of a card (measured, B70) instead of 29 and
   fits beside an image model or another card's work. Any chat model whose card carries a `vision` file (or a `sidecars`
   pattern naming a vision tower) can describe; `system.models` lists `vision` and `describe` in its capabilities and
   `image.describe` in its methods.
@@ -184,4 +184,95 @@ The command line does the same against a chat server: `nextsycl image describe b
 
 ## Measured (hardac1, 2026-11-10)
 
-See [Speed](#speed) and [Round trip](#round-trip) below.
+All through `nextsycl image describe --json` (the same `describe::describe` the front door runs) from a build copy,
+against that copy's `nextsycl llm serve` of Qwen3.8-27B UD-Q4_K_M + mmproj-F16 + its MTP drafts (`--ctx 16384,8192`,
+the card's settings); the front door's job wrapper (queue, label, cancel) is covered by unit tests, not run on the box.
+
+### Speed
+
+The B70, one describe each, `target: z-image`, the barn picture drawn at each size, `max_pixels` its own area. "Cold"
+is a new picture (the instruction from the prompt cache, the picture read); "again" the same picture a second time
+(the whole prompt from the cache: what a repeat or a re-roll costs).
+
+| picture | vision positions (prompt tokens) | pp tok/s (cold) | prompt s | tg tok/s | generated | whole describe, cold | again |
+|---|---|---|---|---|---|---|---|
+| 512 x 512 | 256 (558) | 332 (first request after load) | 1.68 | 56.4 | 134 | 4.07 s | 2.45 s |
+| 1024 x 1024 (the default cap) | 1,024 (1,326) | 582 | 1.80 | 48.9 | 114 | 4.15 s | 2.18 s |
+| 2048 x 2048 (`max_pixels` 4194304) | 4,096 (4,398) | 451 | 9.13 | 47.1 | 111 | 11.53 s | 2.23 s |
+
+- pp counts the tokens read (prompt less reused) over the prompt's time, the vision tower included; tg 44-60 tok/s over
+  all describes (MTP drafts: ~70 % accepted in the server's log). A medium prompt is 90-160 tokens: ~2-3 s of writing.
+- The five round-trip pictures (0.8-1 MP): 3.4-4.3 s each, pp 600-680, tg 46-60 (first table below); the styles test
+  (16 describes, 8 families x 2 pictures): 2.4-6.0 s, pp 800-1,020 once the family's instruction was cached.
+- Thinking left on (no `think_budget`) on the teapot: 286 tokens written (563 characters of thinking first) against
+  120 without - about twice the writing time for the same prompt, which is why it is closed.
+- **B65: not measured** - its card was busy with production song jobs (acestep) for the whole session and the rule is
+  not to share a busy card. `tests/api/test-describe.py --speed 512,1024,2048` measures it when the card is free.
+
+Memory: 19.1-19.2 GiB on the card with the model loaded and after describes (front door's `system.busy` view: 19,595
+MB loaded, 19,617 MB after; the card's other tenants not counted); host: the server container 0.45 GB after load,
+1.6-6.0 GB after a run (the prompt cache's checkpoints in RAM and the page cache of the mmproj; no pinned weights). The
+card says `vram_gib: 20.0`.
+
+### Round trip
+
+Five pictures made for this (none downloaded, nothing committed but the script that draws them): `shapes` (red circle,
+blue square, green triangle on white), `barn` (flat barn, sun, sky gradient), `sign` (blocky yellow "OPEN" on navy) -
+drawn by tests/api/test-describe.py in pure Python -, and `teapot` (a product photo) and `lighthouse` (a flat vector
+illustration), rendered by Z-Image-Turbo from the script's fixed prompts (seeds 1234, 4321). Each was described,
+drawn again from the prompt alone (seed 7, `suggested_size`), and compared:
+
+- **colour**: histogram intersection, 4 x 4 x 4 bins (coarse: a navy 10 levels darker lands in another bin - the
+  sign's 0.003 on Z-Image is that, the letters and ground are right);
+- **tint**: 1 - mean RGB distance of the 16 x 16 thumbnails, cell by cell (colour in place);
+- **layout**: correlation of the 16 x 16 grey thumbnails;
+- **judge**: the describer itself shown both pictures, "0-10, how closely picture 2 reproduces picture 1" (the same model
+  that wrote the prompt: a lenient judge, here as a sanity check, not a measurement);
+- **baseline** (in brackets): the same original against the *other four* pictures' copies - what "unrelated" scores.
+
+**`target: z-image-turbo`, drawn by Z-Image-Turbo** (8 steps, ~1 MP):
+
+| picture | colour (baseline) | tint (baseline) | layout (baseline) | judge |
+|---|---|---|---|---|
+| barn | 0.389 (0.038) | 0.829 (0.602) | +0.539 (-0.078) | 6 |
+| shapes | 0.834 (0.151) | 0.901 (0.534) | +0.844 (-0.057) | 9 |
+| sign | 0.003 (0.064) | 0.884 (0.465) | +0.488 (-0.044) | 6 |
+| teapot | 0.768 (0.172) | 0.826 (0.643) | +0.315 (+0.055) | 9 |
+| lighthouse | 0.821 (0.083) | 0.918 (0.621) | +0.903 (+0.002) | 7 |
+
+**`target: p-h3-image` (family h3), drawn by P-H3-Image** (8 steps, ~4 MP: 2368x1760, 2048x2048, 2720x1536):
+
+| picture | colour (baseline) | tint (baseline) | layout (baseline) | judge |
+|---|---|---|---|---|
+| barn | 0.211 (0.062) | 0.825 (0.612) | +0.613 (-0.034) | 7 |
+| shapes | 0.658 (0.139) | 0.753 (0.481) | +0.592 (-0.052) | 9 |
+| sign | 0.891 (0.053) | 0.926 (0.532) | +0.780 (-0.054) | 8 |
+| teapot | 0.675 (0.167) | 0.795 (0.597) | +0.357 (+0.100) | 9 |
+| lighthouse | 0.586 (0.139) | 0.905 (0.610) | +0.955 (+0.074) | 7 |
+
+Every copy beats its baseline on tint and layout, most by a wide margin; by eye the copies are the same scene - same
+objects, colours, places and style - not the same picture (the barn came back with a gambrel roof, the sign's letters
+smooth rather than blocky, the teapot's background shelf moved). That is as tight as a prompt can hold a picture:
+nothing here measures fine detail, and the judge is the describer grading its own work. Prompts written for the z-image
+round trip (medium):
+
+- shapes: *A flat vector graphic on a plain white background featuring three solid geometric shapes arranged in a
+  triangular layout. In the upper left quadrant, a large bright red circle sits with smooth edges. In the upper right
+  quadrant, a solid royal blue square is positioned at the same height as the circle. Centered in the lower half of
+  the frame, a vibrant green equilateral triangle points upward, with its base aligned horizontally. ...*
+- sign: *A flat vector graphic featuring the word "OPEN" centered on a solid dark navy blue background. The text is
+  rendered in a bold, blocky, pixelated font made of thick golden-yellow rectangular segments ...*
+- teapot: *A close-up product photo of a glossy turquoise ceramic teapot with a rounded body, a curved spout on the
+  left, a C-shaped handle on the right, and a domed lid topped with a small spherical knob. The teapot sits on a light
+  oak wooden table, with a folded cream linen napkin resting to its left. ...*
+
+The same pictures for every family (styles test): qwen-image / hunyuanimage open on "A flat vector illustration ..."
+in painter's terms with a negative ("3D render, photograph, realistic, shading ..."); h3 opens on what the picture is
+and ends "No other text."; ming-image turned the sign into "A minimalist logo design ..."; tags gave
+`flat vector graphic, single word "OPEN" centered, bold geometric sans-serif font, golden yellow letters, dark navy
+blue background, ...`. A wart: the h3 instruction says not to mention text when there is none, and the describer still
+ends some text-free prompts with "no other text" - harmless to the model, not what the guide asks.
+
+Reproduce (on a box with the method deployed): `tests/api/test-describe.py --target z-image-turbo --render
+z-image-turbo --judge <chat server>`; on a box where the describer and the image model share one card,
+`--stage render|describe|draw|score` runs the parts one at a time.

@@ -1,7 +1,7 @@
 # Qwen3.8-27B UD-Q4_K_M, pictures to prompts (image.describe; one card, 16K + 8K)
 # model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
 # The same files as qwen3.8-27b-q4 (nothing new downloaded: the keys below are that card's), with a context sized for
-# a picture and its prompt rather than a conversation, so it takes ~19 GiB of a card instead of 29 and sits beside an
+# a picture and its prompt rather than a conversation, so it takes ~19.2 GiB of a card instead of 29 and sits beside an
 # image model. image.describe picks it (the enabled chat model that reads pictures and takes the least memory) unless
 # the loaded chat model reads pictures itself. docs/api/image-describe.md.
 id: qwen3.8-27b-q4-describe
@@ -10,7 +10,7 @@ arch: qwen35
 title: Qwen3.8-27B UD-Q4_K_M, pictures to prompts (16K)
 about: 'Qwen''s dense Qwen3.8 27B with its vision tower (Qwen3-VL''s ViT): reads a picture and writes the prompt that would draw it, for image.describe; Unsloth''s dynamic 4-bit, MTP drafts, a short context; no tools, no background tasks'
 gpus: '0'
-vram_gib: 20.0                   # its memory on the card when it runs
+vram_gib: 20.0                   # its memory on the card when it runs (19.2 GiB measured on a B70 after describes)
 ctx: '16384,8192'
 tools: false
 tasks: false
