@@ -170,6 +170,9 @@ pub fn run(e: &H3Image, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)
     if stages.contains(&"live") {
         live(e, dir, log)?;
     }
+    if stages.contains(&"bench") {
+        bench(e, dir, log)?;
+    }
     if stages.contains(&"vae") {
         let (s, lat) = d.f32("lat_final")?;
         let (lh, lw) = (s[1], s[2]);
@@ -250,6 +253,44 @@ fn live(e: &H3Image, dir: &Path, log: &mut dyn FnMut(String)) -> Result<()> {
     Ok(())
 }
 
+/// A list of "WxH" sizes
+pub fn parse_sizes(s: &str) -> Result<Vec<(u32, u32)>> {
+    s.split(',').map(|x| {
+        let (a, b) = x.trim().split_once('x').ok_or_else(|| Error(format!("{x}: WxH")))?;
+        Ok((a.parse().map_err(|_| Error(format!("{x}: WxH")))?, b.parse().map_err(|_| Error(format!("{x}: WxH")))?))
+    }).collect()
+}
+
+/// The `bench` stage: one picture at each size of NS_H3I_BENCH_SIZES (default 1, 4, 8.5 and 16.8 MP) and each step count
+/// of NS_H3I_BENCH_STEPS (default 2, 3, 4) through `generate`, after one warm-up at the first size; the engine's own line
+/// splits each (text + refiner, the steps, the decode). With the text cache on, only the warm-up runs the text encoder.
+fn bench(e: &H3Image, dir: &Path, log: &mut dyn FnMut(String)) -> Result<()> {
+    use nextsycl_image::{ImageEngine, ImageRequest};
+    let sizes = parse_sizes(&std::env::var("NS_H3I_BENCH_SIZES").unwrap_or_else(|_| "1024x1024,2048x2048,2912x2912,4096x4096".into()))?;
+    let steps: Vec<u32> = std::env::var("NS_H3I_BENCH_STEPS").unwrap_or_else(|_| "2,3,4".into()).split(',')
+        .map(|s| s.trim().parse().map_err(|_| Error(format!("NS_H3I_BENCH_STEPS: {s}?")))).collect::<Result<_>>()?;
+    let prompt = std::fs::read_to_string(dir.join("prompt.txt")).map(|p| p.trim().to_string()).unwrap_or_else(|_| "a lighthouse at dusk".into());
+    let run = |w: u32, h: u32, s: u32| -> Result<(f64, Picture)> {
+        let req = ImageRequest { prompt: prompt.clone(), width: Some(w), height: Some(h), steps: Some(s), seed: 7, n: 1, ..Default::default() };
+        let t0 = std::time::Instant::now();
+        let mut p = e.generate(&req, &mut |_| Ok(()))?;
+        Ok((t0.elapsed().as_secs_f64(), p.pop().ok_or_else(|| Error("no picture".into()))?))
+    };
+    let (w0, h0) = sizes[0];
+    let (warm, _) = run(w0, h0, steps[0])?;
+    log(format!("bench warm-up {w0}x{h0} {} steps: {warm:.2} s (the text encoder's first read)", steps[0]));
+    for (w, h) in sizes {
+        for s in &steps {
+            let (secs, p) = run(w, h, *s)?;
+            log(format!("bench {w}x{h} {s} steps: {secs:.2} s ({:.1} GiB used on the card)", e.dev.mem_used() as f64 / (1u64 << 30) as f64));
+            if *s == steps[0] {
+                p.write_png(&dir.join(format!("bench_{w}x{h}_{s}.png")), &[("prompt", prompt.clone())]).map_err(Error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The bfloat16 values of two expansions that differ, by bit pattern (0: the same bits)
 pub fn differing(a: &[f32], b: &[f32]) -> usize {
     a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count() + a.len().abs_diff(b.len())
@@ -310,6 +351,25 @@ fn expansions(e: &H3Image, log: &mut dyn FnMut(String)) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_parse() {
+        assert_eq!(parse_sizes("1024x1024, 2912x2912").unwrap(), vec![(1024, 1024), (2912, 2912)]);
+        assert!(parse_sizes("1024").is_err() && parse_sizes("ax1").is_err());
+    }
+
+    #[test]
+    fn a_live_session_reuses_what_it_can() {
+        let s = live_steps("a lighthouse");
+        // the first frame cold; the next one only changes the seed (the prompt cached); then a prompt edit
+        assert_eq!((s[0].prompt.as_str(), s[1].prompt.as_str()), ("a lighthouse", "a lighthouse"));
+        assert_ne!(s[0].seed, s[1].seed);
+        assert_ne!(s[2].prompt, s[1].prompt);
+        // edits of frame 0 as a reference, the same one twice; the polish starts from frame 0 at sigma 0.5, not a reference
+        assert!(s[3..6].iter().all(|x| x.source == Some((0, true))) && s[3].prompt == s[4].prompt && s[5].prompt != s[4].prompt);
+        let last = s.last().unwrap();
+        assert_eq!((last.source, last.start_sigma, last.steps), (Some((0, false)), Some(0.5), Some(3)));
+    }
 
     #[test]
     fn differing_counts_bit_patterns() {

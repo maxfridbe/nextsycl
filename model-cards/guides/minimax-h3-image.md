@@ -21,7 +21,9 @@ yourself.
 Give the picture to change (and up to 15 more as references) and say what to change: `Give him a red knitted beanie.
 Keep everything else exactly the same.` The prompt can name the pictures as `<Picture 1>`, `<Picture 2>` ...; each is
 shown to the text encoder as "Picture i: " and its vision tokens, and to the denoiser as its own latents. Without a
-size the canvas is picture 1's, its short edge brought into 1,024 .. 2,048. No masks, no strength below 1.
+size the canvas is picture 1's, its short edge brought into 1,024 .. 2,048. No masks. A strength below 1 (or
+`options.start-sigma`) also starts the denoise from picture 1's latents instead of noise; with `reference: false` the
+picture is only that start (an img2img: the prompt alone guides it).
 
 ## Sizes
 
@@ -35,6 +37,25 @@ Sides are multiples of 32, from 256 to 16 MP. The ratio and budget presets give 
 Other step counts read that grid at even positions and blend the heads by the share of the grid each step spans
 (fewer steps are faster and softer); `options.sigmas` takes a grid of your own.
 
+## 2 steps (the pDMD LoRA)
+
+`minimax-h3-image-2step` adds the pDMD 2-NFE LoRA (Apache-2.0; pdmd2026, ComfyUI layout) at strength 1 and samples **2
+steps** on ComfyUI's shift-12 schedule (sigmas 1, 0.923, 0) - a third of the denoiser's work. Its recipe, from the LoRA's
+card: no guidance, prompts long and complete; if 2 steps drifts on a prompt, ask for 3 or 4 (`steps`). The LoRA alone
+(`minimax-h3-image-pdmd-2step-lora`) rides on any of the cards above as a request LoRA (`loras`) and brings the same
+2-step / shift-12 preset; any other strength scales the distillation.
+
+- **Detail pass**: render at half size, then `image.edit` the result at the final size with `reference: false`,
+  `strength: 0.5` and `options: {"start-sigma": 0.5}`, `steps: 3` - the demo Space's grid (0.5, 0.471, 0.367, 0; the
+  start sigma wins over the strength, which only has to be below 1 for an img2img); 0.4 - 0.55 polishes, 0.7 adds detail
+  but may drift or speckle flat areas. A `strength` without start-sigma is ComfyUI's denoise instead: under shift 12,
+  strength 0.5 at 3 steps starts at sigma 0.923, not 0.5.
+- **Edits** take the picture as a reference at 2 steps (as the base model's); to stay closer to the source, add a start
+  sigma of 0.55 or less (`options.start-sigma`): the denoise then starts from the picture's own latents.
+- **Repeats are cheap**: the card keeps the text encoder's result for the last 8 prompts and the VAE latents of the
+  last 8 pictures, so another seed, size or polish of the same prompt, or another edit of the same picture, costs only
+  the denoise and the decode. A changed prompt runs the 32B text encoder again.
+
 ## Files
 
 | Model | Denoiser | On the card | Notes |
@@ -44,6 +65,7 @@ Other step counts read that grid at even positions and blend the heads by the sh
 | `minimax-h3-image-q8` | Q8_0 GGUF | 19.1 GiB | the closest to bf16 of the GGUFs, and the fastest of them up to 4 MP (int8 products) |
 | `minimax-h3-image-q3` | Q3_K_M GGUF | 7.7 GiB | the smallest download and the smallest on the card; the most error |
 | `minimax-h3-image-int8` | ComfyUI int8 ConvRot | 18.0 GiB | int8 products: ~30 % faster than the GGUFs; about as close as Q8_0 |
+| `minimax-h3-image-2step` | int8 ConvRot + pDMD LoRA | 18.0 + 1.8 GiB | 2 steps; the text encoder's and pictures' results cached: the live editor's card |
 
 All share H3's Qwen3-VL 32B text encoder (Q4_K_M, streamed from pinned host memory: ~14 GiB of RAM) and the image
 VAE (0.75 GiB on the card).
