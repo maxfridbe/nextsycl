@@ -150,6 +150,11 @@ fn field_of(method: &str, m: &str) -> Option<String> {
     let me = table::methods().iter().find(|x| x.kind == kind && x.name == name)?;
     let first: String = m.trim_start_matches('"').chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
     let names = || me.fields.iter().map(|f| f.name.as_str()).chain(["strength", "image", "reference", "continue_from"]);
+    // describer native refused for its target ("target z-image: its text encoder (Qwen3-4B) does not read pictures; use
+    // describer best"): the describer is at fault, not the target (nextcuda's words and field)
+    if m.ends_with("use describer best") && names().any(|f| f == "describer") {
+        return Some("describer".into());
+    }
     // a field the message says is needed wins over its first word ("image.generate needs \"prompt\"" starts with
     // image, a field too): the fields' order is no longer what decided it
     names().find(|f| m.contains(&format!("needs \"{f}\""))).or_else(|| names().find(|f| first == *f)).map(str::to_string)
@@ -838,6 +843,9 @@ impl Home {
                 };
                 r["describer"] = json!(c.describer);
                 r["describer_model"] = json!(c.id);
+                // the describer's memory on its card: as measured on this box once it has run, else its card's figure
+                r["memory_mb"] = json!(all.iter().find(|m| m["id"] == c.id.as_str())
+                    .and_then(|m| self.vouched_mb(m, 32768).0.values().copied().max()));
                 Ok(r)
             }
             ("image", "describers") => {
@@ -1813,21 +1821,21 @@ mod tests {
 
     #[test]
     fn a_describers_error_names_the_describer_field_and_a_native_one_does_not_draw() {
-        for m in ["describer native: target z-image-turbo: its text encoder (Qwen3-4B) does not read pictures; use describer best",
+        for m in ["target z-image-turbo: its text encoder (Qwen3-4B) does not read pictures; use describer best",
                   "describer nope: no such describer here (image.describers lists them)"] {
             assert_eq!(rpc_error("image.describe", 400, None, m)["field"], "describer", "{m}");
         }
         assert_eq!(rpc_error("image.describe", 400, None, "model glm: an llm model that does not read pictures")["field"], "model");
         // a native describer reads (image.describe), it does not draw: not image.generate's, not a target
-        let d = json!({"id": "qwen-image-2.1-te-describe", "kind": "image", "arch": crate::describe::NATIVE_ARCH});
+        let d = json!({"id": "qwen3-vl-8b-instruct", "kind": "image", "arch": crate::describe::NATIVE_ARCH});
         let (c, m) = super::super::life::capabilities(&d);
         assert!(c.contains(&"describe") && m == vec!["image.describe"]);
-        assert_eq!(describe_target("qwen-image-2.1-te-describe", std::slice::from_ref(&d)).unwrap_err().0, 400);
+        assert_eq!(describe_target("qwen3-vl-8b-instruct", std::slice::from_ref(&d)).unwrap_err().0, 400);
         assert!(!reads_pictures(&d), "best stays a chat model");
         // describe_native: an image model whose encoder a native describer card reads
         let all = vec![json!({"id": "qi", "kind": "image", "arch": "qwen-image-2.1"}), json!({"id": "zt", "kind": "image", "arch": "z-image"}), d];
         let cards = vec![json!({"id": "qi", "kind": "image", "files": {"text-encoder": "te"}}), json!({"id": "zt", "kind": "image", "files": {"text-encoder": "zte"}}),
-                         json!({"id": "qwen-image-2.1-te-describe", "kind": "image", "arch": crate::describe::NATIVE_ARCH, "files": {"text-encoder": "te"}})];
+                         json!({"id": "qwen3-vl-8b-instruct", "kind": "image", "arch": crate::describe::NATIVE_ARCH, "files": {"text-encoder": "te"}})];
         assert!(super::super::life::describes_native(&all[0], &all, &cards));
         assert!(!super::super::life::describes_native(&all[1], &all, &cards));
         assert!(!super::super::life::describes_native(&all[2], &all, &cards), "the describer itself does not draw");

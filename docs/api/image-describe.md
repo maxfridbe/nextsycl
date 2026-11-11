@@ -20,7 +20,7 @@ without reading nextsycl's code.
   On nextsycl that is Qwen-Image 2.1 (Qwen3-VL-8B-Instruct) and P-H3-Image (Qwen3-VL-4B): the image engines use those
   files as encoders only, so a small engine of its own (`image/vldescribe`, arch `qwen3vl-describe`: the same layers
   plus a key / value cache and the head, the shared kernels) runs them, each from a *describer card*
-  (`qwen-image-2.1-te-describe`, `p-h3-image-te-describe`: the image model's own files, nothing downloaded). Smaller
+  (`qwen3-vl-8b-instruct`, `qwen3-vl-4b-instruct`: the image model's own files, nothing downloaded). Smaller
   models than `best`'s: see Measured. [Describers](#describers-best-native-or-an-id) has the rules and which targets can.
 - **A model card, not code, sizes it**: `qwen3.8-27b-q4-describe` (model-cards/llm) is `qwen3.8-27b-q4`'s own files
   (nothing new downloaded) with a 16K + 8K context instead of 128K + 32K, so it takes 19.2 GiB of a card (measured, B70) instead of 29 and
@@ -76,6 +76,7 @@ without reading nextsycl's code.
   "model": "qwen3.8-27b-q4-describe",
   "describer": "best",
   "describer_model": "qwen3.8-27b-q4-describe",
+  "memory_mb": 19617,
   "detail": "medium",
   "language": "English",
   "words": 94,
@@ -100,6 +101,8 @@ without reading nextsycl's code.
   a native describer named by its id: the first image model, by id, whose encoder it is).
 - `describer_model` - the id of the describer that ran (nextsycl's addition: a chat model's or a native describer
   card's id, as `image.describers` lists them).
+- `memory_mb` - the describer's memory on its card, MB: what this box measured once it has run, else its model card's
+  `vram_gib` (null when neither is known). Same field as nextcuda's.
 - `seen` - the size the describer saw (after `max_pixels`); `width` / `height` - the picture as sent.
 - `suggested_size` - the target's best area at the picture's aspect (clamped 1:4 .. 4:1), sides on its grid:
   1 MP / multiples of 16 for natural, qwen-image, z-image (256-2048), moss-image, ming-image, tags; 4 MP / multiples
@@ -130,8 +133,8 @@ Which targets have a native describer (verified against the model cards' files a
 
 | target (family) | its text encoder | `describer: native` |
 |---|---|---|
-| `qwen-image-2.1-*` (`qwen-image`) | Qwen3-VL-8B-Instruct, int8 ConvRot (`qwen3vl_8b_int8_convrot.safetensors`: 36 layers, final norm, `lm_head`, vision tower, deepstack mergers) | **works**: `qwen-image-2.1-te-describe` |
-| `p-h3-image*` (`h3`) | Qwen3-VL-4B, int8 ConvRot (`p-h3-image_text_encoder_int8_convrot.safetensors`: 36 layers, final norm, vision tower; no `lm_head` - Qwen3-VL-4B ties it to the token embedding, which the file keeps) | **works**: `p-h3-image-te-describe` |
+| `qwen-image-2.1-*` (`qwen-image`) | Qwen3-VL-8B-Instruct, int8 ConvRot (`qwen3vl_8b_int8_convrot.safetensors`: 36 layers, final norm, `lm_head`, vision tower, deepstack mergers) | **works**: `qwen3-vl-8b-instruct` |
+| `p-h3-image*` (`h3`) | Qwen3-VL-4B, int8 ConvRot (`p-h3-image_text_encoder_int8_convrot.safetensors`: 36 layers, final norm, vision tower; no `lm_head` - Qwen3-VL-4B ties it to the token embedding, which the file keeps) | **works**: `qwen3-vl-4b-instruct` |
 | `minimax-h3-image*` (`h3`) | MiniMax H3's Qwen3-VL-32B (`qwen3vl_32b_minimax_h3-Q4_K_M.gguf` + its vision tower) | `invalid_params`: the file stops after layer 50 of the 64 with no final norm or output head (`minimax_h3_te: unnormalized_hidden_after_layer_50`) - hidden states only, it cannot write. (A family target `h3` picks P-H3-Image's when that is enabled) |
 | `hunyuanimage-2.1-*` (`hunyuanimage`) | Qwen2.5-VL-7B-Instruct, Q4_0 GGUF (`qwen2.5-vl-7b-test-q4_0.gguf`: 28 layers, `output.weight`, and the 32-block vision tower in the same file) | `invalid_params` for now: the file reads pictures but carries no model settings or tokenizer, and no engine here writes with it (the olmOCR-2 engine is a Qwen2.5-VL writer, but for Q8_0 with an mmproj and its own settings). A card + a Q4_0 reader for that engine would do it |
 | `z-image-turbo*` (`z-image`) | Qwen3-4B (text only) | `invalid_params`: does not read pictures |
@@ -148,7 +151,7 @@ How it is told (model cards, read at run time - a new encoder is a card, not cod
   (one that reads but cannot write) why;
 - a native describer card (`kind: image`, `arch: qwen3vl-describe`, `base_model`) names the image model's own
   `text-encoder` and `tokenizer` files by key; an image model whose card names the same `text-encoder` key is the one
-  it is native for. Registering it (`system.models.pull {"model": "qwen-image-2.1-te-describe"}`) links the files
+  it is native for. Registering it (`system.models.pull {"model": "qwen3-vl-8b-instruct"}`) links the files
   already on the box: nothing is downloaded.
 
 A native describer runs on an image server like any image model (its card's `gpus`, room made first, the image
@@ -166,19 +169,21 @@ are fixed, the rest is this list.
   "describers": [
     {"id": "qwen3.8-27b-q4-describe", "name": "Qwen3.8-27B UD-Q4_K_M, pictures to prompts (16K)", "base_model": "Qwen3.8-27B",
      "kind": "chat", "size_gb": 18.76, "vram_gib": 20.0, "image_models": [], "downloaded": true, "enabled": true, "best": true},
-    {"id": "qwen-image-2.1-te-describe", "name": "Qwen-Image 2.1 text encoder (Qwen3-VL-8B-Instruct) as a describer",
+    {"id": "qwen3-vl-8b-instruct", "name": "Qwen-Image 2.1 text encoder (Qwen3-VL-8B-Instruct) as a describer",
      "base_model": "Qwen3-VL-8B-Instruct", "kind": "native", "size_gb": 9.36, "vram_gib": 14.0,
      "image_models": ["qwen-image-2.1-q4km", "qwen-image-2.1-q6k", "qwen-image-2.1-q8", "qwen-image-2.1-turbo-q8",
                       "qwen-image-2.1-uncensored-q4km", "qwen-image-2.1-uncensored-q8"],
      "downloaded": true, "enabled": true, "best": false},
-    {"id": "p-h3-image-te-describe", "name": "P-H3-Image text encoder (Qwen3-VL-4B) as a describer", "base_model": "Qwen3-VL-4B",
+    {"id": "qwen3-vl-4b-instruct", "name": "P-H3-Image text encoder (Qwen3-VL-4B) as a describer", "base_model": "Qwen3-VL-4B",
      "kind": "native", "size_gb": 5.13, "vram_gib": 8.0, "image_models": ["p-h3-image", "p-h3-image-lora", "p-h3-image-q8"],
      "downloaded": false, "enabled": false, "best": false}
   ]}}
 ```
 
 - `describers[]` - every chat model that reads pictures and every native describer, registered first (registry
-  order), then the cards not registered. `id` is what `describer` takes.
+  order), then the cards not registered. `id` is what `describer` takes. Native describers are named for the language
+  model they are (`qwen3-vl-8b-instruct`, `qwen3-vl-4b-instruct`), as nextcuda names its own, so a UI can keep an id
+  across the two runtimes; a chat describer's id is its model's.
 - `name` - the card's (or entry's) title; `base_model` - the language model it is (the card's `base_model`, else its
   title); `kind` - `chat` or `native`.
 - `size_gb` - its files, GB of 10^9 bytes (a native describer's are its image models' own: nothing more on disk);
@@ -199,9 +204,9 @@ The envelope `{"ok": false, "error": {"code", "message", "retryable", "status", 
 
 | code (status) | when | retryable |
 |---|---|---|
-| `invalid_params` (400) | no `image`; a picture that does not decode or is over 40 MP; a `target` that is neither a family nor an image model that draws ("target ocr-model: it does not draw pictures from prompts"); a value out of its range (`max_words 3: from 8 to 400`); a `describer` / `model` that does not read pictures ("describer glm-5.3: an llm model that does not read pictures; ..."); `describer` not a string; `describer: native` beside `model`, or `describer` and `model` naming two describers; **`describer: native` and a target whose encoder cannot describe** - field `describer`, the message names the target and its encoder: "describer native: target z-image-turbo: its text encoder (Qwen3-4B) does not read pictures; use describer best", "describer native: target minimax-h3-image: its text encoder (Qwen3-VL-32B, MiniMax H3's) reads pictures but cannot write text here (the file stops after layer 50 ...); use describer best", "describer native: target natural is a prompt style, not an image model: it has no text encoder of its own; ..." | no |
+| `invalid_params` (400) | no `image`; a picture that does not decode or is over 40 MP; a `target` that is neither a family nor an image model that draws ("target ocr-model: it does not draw pictures from prompts"); a value out of its range (`max_words 3: from 8 to 400`); a `describer` / `model` that does not read pictures ("describer glm-5.3: an llm model that does not read pictures; ..."); `describer` not a string; `describer: native` beside `model`, or `describer` and `model` naming two describers; **`describer: native` and a target whose encoder cannot describe** - field `describer`, the message names the target and its encoder: "target z-image-turbo: its text encoder (Qwen3-4B) does not read pictures; use describer best", "target minimax-h3-image: its text encoder (Qwen3-VL-32B, MiniMax H3's) reads pictures but cannot write text here (the file stops after layer 50 ...); use describer best", "target natural is a prompt style, not an image model: it has no text encoder of its own; ..." | no |
 | `not_found` (404) | `describer` / `model` names no describer here or in the cards ("describer x: no such describer here (image.describers lists them)"); `image: upload:<name>` not here | no |
-| `conflict` (409) | `best` and no chat model that reads pictures is enabled (`system.enable qwen3.8-27b-q4-describe`); the describer named is disabled; `native` with a family target and no model of that family enabled ("describer native: no h3 model is enabled here ..."); the chat switcher refuses to swap away from a chat model in use ("... is loaded and in use; switching ... would cut that conversation off") | no (the last: later) |
+| `conflict` (409) | `best` and no chat model that reads pictures is enabled (`system.enable qwen3.8-27b-q4-describe`); the describer named is disabled; `native` with a family target and no model of that family enabled ("target h3: no model of the family is enabled here (system.models); name one as the target, or use describer best"); the chat switcher refuses to swap away from a chat model in use ("... is loaded and in use; switching ... would cut that conversation off") | no (the last: later) |
 | `model_not_downloaded` (409) | the describer (named, or `native`'s) is a card's that is not registered - for a native describer its files are the image model's: `system.models.pull` links them, nothing is downloaded; for a target that is itself not downloaded its encoder files are missing too. The error carries `model` (the describer card's id), `bytes`, `fits`, `pull`. With `NS_AUTO_PULL` it is fetched instead | no |
 | `busy` (409) | `queue: false` and the job would not start now | yes |
 | `cancelled` (499) | `image.cancel {label}` / `{reentrant_id}` stopped it | no |
@@ -272,19 +277,19 @@ curl -s $D/rpc/image.describers -H "Authorization: Bearer $T" -H 'Content-Type: 
 curl -s $D/rpc/image.describe -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   -d '{"image": "upload:up_1794470000_barn.png", "target": "qwen-image-2.1-q8", "describer": "native"}'
 #   -> result.describer "native", result.model "qwen-image-2.1-q8 text encoder (Qwen3-VL-8B-Instruct)",
-#      result.describer_model "qwen-image-2.1-te-describe"
+#      result.describer_model "qwen3-vl-8b-instruct"
 # a family: its enabled model whose encoder describer is smallest (h3: P-H3-Image's Qwen3-VL-4B)
 curl -s $D/rpc/image.describe -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   -d '{"image": "upload:up_1794470000_barn.png", "target": "h3", "describer": "native"}'
 # a target whose encoder cannot see -> {"ok": false, "error": {"code": "invalid_params", "field": "describer",
-#   "message": "describer native: target z-image-turbo: its text encoder (Qwen3-4B) does not read pictures; use describer best", ...}}
+#   "message": "target z-image-turbo: its text encoder (Qwen3-4B) does not read pictures; use describer best", ...}}
 curl -s $D/rpc/image.describe -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   -d '{"image": "upload:up_1794470000_barn.png", "target": "z-image-turbo", "describer": "native"}'
 # a describer by its id (any from image.describers; "model" is the older name for the same)
 curl -s $D/rpc/image.describe -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
-  -d '{"image": "upload:up_1794470000_barn.png", "target": "p-h3-image", "describer": "p-h3-image-te-describe"}'
+  -d '{"image": "upload:up_1794470000_barn.png", "target": "p-h3-image", "describer": "qwen3-vl-4b-instruct"}'
 # a native describer registered once (its files are the image model's: nothing is downloaded)
-curl -s $D/rpc/system.models.pull -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -d '{"model": "p-h3-image-te-describe"}'
+curl -s $D/rpc/system.models.pull -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -d '{"model": "qwen3-vl-4b-instruct"}'
 # and back: draw the prompt
 curl -s $D/rpc/image.generate -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   -d '{"model": "z-image-turbo", "prompt": "<result.prompt>", "size": "<result.suggested_size.size>", "seed": 7}'

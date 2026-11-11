@@ -427,6 +427,15 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   same GGUFs (ns-ocr-dump with the prompt placing the image: every tower block cos >= 0.99996, the decoder >= 0.998 -
   llama.cpp's CPU products quantize activations to 8 bits - and 32 of 32 greedy tokens). B70: a page seen at ~600
   tok/s, written at ~55-58; test-ocr.py passes all three transcripts.
+- **vldescribe** (`image/vldescribe`, arch `qwen3vl-describe`) - an image model's own Qwen3-VL text encoder as a
+  describer (image.describe `describer: native`): Qwen-Image 2.1's Qwen3-VL-8B-Instruct and P-H3-Image's Qwen3-VL-4B
+  int8 ConvRot files are whole language models (36 layers, the final norm, `lm_head` - the 4B's tied to its token
+  embedding - and the vision tower). `nextsycl_qwen3vl::chat::Writer` adds what the encoder lacks for writing: the
+  head, a key / value cache (each layer's q | k | v rows, float32) and a greedy or top-p pick; the prompt's pass is the
+  encoder's (pictures, interleaved M-RoPE, deepstack), a written token goes through every layer as one row (the shared
+  int8 linear, RMS + RoPE and causal attention by rows). It serves the image kind's reading contract (`ocr`: a picture,
+  an instruction, a system turn in `extra["system"]`), so a describer card (`model-cards/image/qwen3-vl-*-instruct.yml`,
+  the image model's own files) runs on an image server like any image model. No kernels of its own.
 - **flashvsr** (`image/flashvsr`) - OpenImagingLab's FlashVSR v1.1 (Apache-2.0), served as `video.upscale` and
   `image.upscale` (`model-cards/image/flashvsr.yml`; docs/ports/flashvsr.md has the port, its checks and its speed): a
   clip as one stream, 8 frames a step - the LQ projection (causal 3-D convolutions as 2-D ones over their taps), Wan 2.1

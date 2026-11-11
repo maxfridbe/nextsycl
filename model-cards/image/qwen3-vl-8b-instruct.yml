@@ -4,7 +4,7 @@
 # Qwen3-VL-8B-Instruct - 36 layers, the final norm, lm_head and the vision tower, every matrix int8 ConvRot - so the
 # encoder Qwen-Image conditions on can also write: image/vldescribe (arch qwen3vl-describe) runs it with a key / value
 # cache. Every Qwen-Image 2.1 card names the same text-encoder file, so this is their native describer.
-id: qwen-image-2.1-te-describe
+id: qwen3-vl-8b-instruct
 kind: image
 arch: qwen3vl-describe
 license: apache-2.0

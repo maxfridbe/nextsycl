@@ -4,7 +4,7 @@
 # Qwen3-VL-4B language model under model.language_model. - 36 layers and the final norm; its head is tied to the token
 # embedding (Qwen3-VL-4B ties them), which the file keeps - and the vision tower, so the encoder P-H3-Image conditions on
 # can also write: image/vldescribe (arch qwen3vl-describe). The text connector in the file is not used.
-id: p-h3-image-te-describe
+id: qwen3-vl-4b-instruct
 kind: image
 arch: qwen3vl-describe
 license: apache-2.0

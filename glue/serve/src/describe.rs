@@ -772,15 +772,15 @@ pub fn native_for_model(target: &str, all: &[Value], cards: &[Value]) -> Result<
     };
     let use_best = "use describer best";
     let Some(card) = card else {
-        return Err((400, format!("describer native: target {target}: no model card says what its text encoder is; {use_best}")));
+        return Err((400, format!("target {target}: no model card says what its text encoder is; {use_best}")));
     };
     let enc = encoder_of(card);
     let Some(d) = natives_of(card, cards).into_iter().next() else {
         return Err((400, match enc {
-            Some((name, false, _)) => format!("describer native: target {target}: its text encoder ({name}) does not read pictures; {use_best}"),
-            Some((name, true, why)) => format!("describer native: target {target}: its text encoder ({name}) reads pictures but cannot write text here ({}); {use_best}",
+            Some((name, false, _)) => format!("target {target}: its text encoder ({name}) does not read pictures; {use_best}"),
+            Some((name, true, why)) => format!("target {target}: its text encoder ({name}) reads pictures but cannot write text here ({}); {use_best}",
                                                why.unwrap_or_else(|| "no describer card for it".into())),
-            None => format!("describer native: target {target}: its card names no text encoder; {use_best}"),
+            None => format!("target {target}: its card names no text encoder; {use_best}"),
         }));
     };
     let name = enc.map(|e| e.0).unwrap_or_else(|| sv(d, "base_model"));
@@ -788,7 +788,7 @@ pub fn native_for_model(target: &str, all: &[Value], cards: &[Value]) -> Result<
     // registered under its card's id (or pulled under another id from it)
     let reg = all.iter().find(|m| is_native(m) && (m["id"] == id.as_str() || m["catalog"] == id.as_str()));
     if let Some(r) = reg.filter(|r| r["enabled"] == false) {
-        return Err((409, format!("describer native: {} (target {target}'s text encoder) is disabled (system.enable)", sv(r, "id"))));
+        return Err((409, format!("describer native: {} (target {target}'s text encoder) is disabled (system.enable it, or use describer best)", sv(r, "id"))));
     }
     Ok(Choice { describer: "native".into(), id: reg.map(|r| sv(r, "id")).unwrap_or(id), native: true, model: format!("{target} text encoder ({name})"),
                 registered: reg.is_some() })
@@ -798,11 +798,11 @@ pub fn native_for_model(target: &str, all: &[Value], cards: &[Value]) -> Result<
 /// least memory (its card's vram_gib); none can: the first one's reason
 pub fn native_for_family(family: Family, all: &[Value], cards: &[Value]) -> Result<Choice, Fail> {
     if matches!(family, Family::Natural | Family::Tags) {
-        return Err((400, format!("describer native: target {} is a prompt style, not an image model: it has no text encoder of its own; name an image model (or its family) as the target, or use describer best", family.name())));
+        return Err((400, format!("target {} is a prompt style, not an image model: it has no text encoder of its own; name an image model (or its family) as the target, or use describer best", family.name())));
     }
     let models: Vec<&Value> = all.iter().filter(|m| m["kind"] == "image" && m["enabled"] != false && Family::of_arch(&sv(m, "arch")) == Some(family)).collect();
     if models.is_empty() {
-        return Err((409, format!("describer native: no {} model is enabled here (system.models); name one as the target, or use describer best", family.name())));
+        return Err((409, format!("target {}: no model of the family is enabled here (system.models); name one as the target, or use describer best", family.name())));
     }
     let mem = |c: &Choice| cards.iter().chain(all).find(|m| m["id"] == c.id.as_str()).and_then(|m| m["vram_gib"].as_f64()).unwrap_or(f64::MAX);
     let mut first_err = None;
@@ -1049,7 +1049,7 @@ mod tests {
             json!({"id": "p-h3-image", "kind": "image", "arch": "p-h3-image", "catalog": "p-h3-image"}),
             json!({"id": "z-image-turbo", "kind": "image", "arch": "z-image", "catalog": "z-image-turbo"}),
             json!({"id": "minimax-h3-image", "kind": "image", "arch": "minimax-h3-image"}),
-            json!({"id": "qwen-image-2.1-te-describe", "kind": "image", "arch": NATIVE_ARCH, "catalog": "qwen-image-2.1-te-describe", "vram_gib": 14.0}),
+            json!({"id": "qwen3-vl-8b-instruct", "kind": "image", "arch": NATIVE_ARCH, "catalog": "qwen3-vl-8b-instruct", "vram_gib": 14.0}),
         ];
         let cards = vec![
             json!({"id": "qwen3.8-27b-q4-describe", "kind": "llm", "arch": "qwen35", "base_model": "Qwen3.8-27B", "title": "Q27 describe", "files": {"model": "q27-q4", "vision": "q27-mmproj"}, "vram_gib": 20.0}),
@@ -1062,8 +1062,8 @@ mod tests {
             json!({"id": "minimax-h3-image", "kind": "image", "arch": "minimax-h3-image", "files": {"text-encoder": "h3-te"},
                    "encoder": {"name": "Qwen3-VL-32B", "sees": true, "why": "cut after layer 50"}}),
             json!({"id": "hunyuanimage-2.1-q8", "kind": "image", "arch": "hunyuanimage-2.1", "files": {"text-encoder": "hy-te"}}),
-            json!({"id": "qwen-image-2.1-te-describe", "kind": "image", "arch": NATIVE_ARCH, "base_model": "Qwen3-VL-8B-Instruct", "title": "QI TE", "files": {"text-encoder": "qi-te"}, "vram_gib": 14.0}),
-            json!({"id": "p-h3-image-te-describe", "kind": "image", "arch": NATIVE_ARCH, "base_model": "Qwen3-VL-4B", "title": "PH3 TE", "files": {"text-encoder": "ph3-te"}, "vram_gib": 8.0}),
+            json!({"id": "qwen3-vl-8b-instruct", "kind": "image", "arch": NATIVE_ARCH, "base_model": "Qwen3-VL-8B-Instruct", "title": "QI TE", "files": {"text-encoder": "qi-te"}, "vram_gib": 14.0}),
+            json!({"id": "qwen3-vl-4b-instruct", "kind": "image", "arch": NATIVE_ARCH, "base_model": "Qwen3-VL-4B", "title": "PH3 TE", "files": {"text-encoder": "ph3-te"}, "vram_gib": 8.0}),
         ];
         (all, cards)
     }
@@ -1096,7 +1096,7 @@ mod tests {
     #[test]
     fn a_describer_by_id_reads_pictures() {
         // a native describer named by its id: the image model it is the encoder of, in the model words
-        let c = pick(json!({"describer": "qwen-image-2.1-te-describe"}), "qwen-image").unwrap();
+        let c = pick(json!({"describer": "qwen3-vl-8b-instruct"}), "qwen-image").unwrap();
         assert!(c.native && c.registered && c.model == "qwen-image-2.1-q4km text encoder (Qwen3-VL-8B-Instruct)", "{c:?}");
         // a card's, not downloaded: chosen, registered false (model_not_downloaded or a pull follows)
         let c = pick(json!({"describer": "qwen3.8-27b-q8"}), "natural").unwrap();
@@ -1117,23 +1117,23 @@ mod tests {
     #[test]
     fn native_is_the_targets_own_encoder_or_why_not() {
         let c = pick(json!({"describer": "native"}), "qwen-image-2.1-turbo-q8").unwrap();
-        assert_eq!((c.describer.as_str(), c.id.as_str(), c.native, c.registered), ("native", "qwen-image-2.1-te-describe", true, true));
+        assert_eq!((c.describer.as_str(), c.id.as_str(), c.native, c.registered), ("native", "qwen3-vl-8b-instruct", true, true));
         assert_eq!(c.model, "qwen-image-2.1-turbo-q8 text encoder (Qwen3-VL-8B-Instruct)");
         // its describer a card's, not registered: model_not_downloaded follows
         let c = pick(json!({"describer": "native"}), "p-h3-image").unwrap();
-        assert_eq!((c.id.as_str(), c.registered, c.model.as_str()), ("p-h3-image-te-describe", false, "p-h3-image text encoder (Qwen3-VL-4B)"));
+        assert_eq!((c.id.as_str(), c.registered, c.model.as_str()), ("qwen3-vl-4b-instruct", false, "p-h3-image text encoder (Qwen3-VL-4B)"));
         // a target that is a card's id only (not registered here)
-        assert_eq!(pick(json!({"describer": "native"}), "qwen-image-2.1-q4km").unwrap().id, "qwen-image-2.1-te-describe");
+        assert_eq!(pick(json!({"describer": "native"}), "qwen-image-2.1-q4km").unwrap().id, "qwen3-vl-8b-instruct");
         let e = pick(json!({"describer": "native"}), "z-image-turbo").unwrap_err();
-        assert_eq!(e, (400, "describer native: target z-image-turbo: its text encoder (Qwen3-4B) does not read pictures; use describer best".to_string()));
+        assert_eq!(e, (400, "target z-image-turbo: its text encoder (Qwen3-4B) does not read pictures; use describer best".to_string()));
         let e = pick(json!({"describer": "native"}), "minimax-h3-image").unwrap_err();
         assert!(e.0 == 400 && e.1.contains("reads pictures but cannot write text here (cut after layer 50)"), "{}", e.1);
         let e = pick(json!({"describer": "native"}), "hunyuanimage-2.1-q8").unwrap_err();
         assert!(e.0 == 400 && e.1.contains("its card names no text encoder"), "{}", e.1);
         // a family: its enabled model whose describer takes the least memory; none sees: the first's reason
         let c = pick(json!({"describer": "native"}), "h3").unwrap();
-        assert_eq!(c.id, "p-h3-image-te-describe");
-        assert_eq!(pick(json!({"describer": "native"}), "qwen-image").unwrap().id, "qwen-image-2.1-te-describe");
+        assert_eq!(c.id, "qwen3-vl-4b-instruct");
+        assert_eq!(pick(json!({"describer": "native"}), "qwen-image").unwrap().id, "qwen3-vl-8b-instruct");
         assert_eq!(pick(json!({"describer": "native"}), "z-image").unwrap_err().0, 400);
         assert_eq!(pick(json!({"describer": "native"}), "moss-image").unwrap_err().0, 409, "no moss model enabled");
         for f in ["natural", "tags"] {
@@ -1149,11 +1149,11 @@ mod tests {
     #[test]
     fn the_listing_has_every_describer_and_its_image_models() {
         let (all, cards) = a_box();
-        let v = listing(&all, &cards, &|id| if id == "qwen-image-2.1-te-describe" { Some(9_350_798_360) } else { None }, Some("qwen3.8-27b-q4-describe"));
+        let v = listing(&all, &cards, &|id| if id == "qwen3-vl-8b-instruct" { Some(9_350_798_360) } else { None }, Some("qwen3.8-27b-q4-describe"));
         assert_eq!((v["default"].as_str(), v["best"].as_str()), (Some("best"), Some("qwen3.8-27b-q4-describe")));
         let list = v["describers"].as_array().unwrap();
         let ids: Vec<&str> = list.iter().map(|d| d["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["qwen3.8-27b-q4-describe", "qwen-image-2.1-te-describe", "qwen3.8-27b-q8", "p-h3-image-te-describe"]);
+        assert_eq!(ids, ["qwen3.8-27b-q4-describe", "qwen3-vl-8b-instruct", "qwen3.8-27b-q8", "qwen3-vl-4b-instruct"]);
         let qi = &list[1];
         assert_eq!((qi["kind"].as_str(), qi["base_model"].as_str(), qi["size_gb"].as_f64(), qi["downloaded"].as_bool()), (Some("native"), Some("Qwen3-VL-8B-Instruct"), Some(9.35), Some(true)));
         assert_eq!(qi["image_models"], json!(["qwen-image-2.1-q4km", "qwen-image-2.1-q8", "qwen-image-2.1-turbo-q8"]));
@@ -1164,10 +1164,10 @@ mod tests {
     #[test]
     fn a_native_describe_asks_the_reading_server_with_the_same_instruction() {
         let a = ask(json!({"seed": 3}), Family::QwenImage);
-        let b = a.ocr_body("qwen-image-2.1-te-describe", "AAAA");
+        let b = a.ocr_body("qwen3-vl-8b-instruct", "AAAA");
         let (sys, user) = a.instruction();
         assert_eq!((b["system"].as_str(), b["prompt"].as_str(), b["image"].as_str()), (Some(sys.as_str()), Some(user.as_str()), Some("AAAA")));
-        assert_eq!((b["model"].as_str(), b["seed"].as_u64(), b["max_tokens"].as_u64()), (Some("qwen-image-2.1-te-describe"), Some(3), Some(a.max_tokens as u64)));
+        assert_eq!((b["model"].as_str(), b["seed"].as_u64(), b["max_tokens"].as_u64()), (Some("qwen3-vl-8b-instruct"), Some(3), Some(a.max_tokens as u64)));
         // its answer as a stream's: the numbers in the chat server's names; the cap reached is length
         let s = streamed_of_ocr(&json!({"text": "PROMPT: a fox", "prompt_tokens": 1100, "tokens": 40, "prompt_seconds": 2.0, "write_seconds": 4.0, "wh": 0.1}), 220);
         assert_eq!((s.content.as_str(), s.done["finish"].as_str(), s.done["generated"].as_u64(), s.done["reused"].as_u64()), ("PROMPT: a fox", Some("stop"), Some(40), Some(0)));
