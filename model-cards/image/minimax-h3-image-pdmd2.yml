@@ -9,7 +9,7 @@ license_note: 'MiniMax-H3-Image Community License Agreement (MiniMax, 2026-11-10
 title: 'MiniMax-H3-Image in 2 steps (int8 + the pDMD 2-step LoRA; Rust + SYCL)'
 about: 'minimax-h3-image-int8 with the pDMD 2-NFE LoRA on the side path at strength 1: 2 steps on ComfyUI''s shift-12 schedule (1, 0.923, 0) instead of the heads'' six, no guidance; edits as the base model''s; an init picture (img2img, the detail pass) starts from its latents at a start sigma; the text encoder''s and the VAE encoder''s results kept for the last 8 prompts and pictures and the token refiner kept on the card, so a repeated prompt or picture costs only the denoise'
 gpus: '0,1'
-vram_gib: 25.5                  # provisional: int8 18.7 GiB after load + the LoRA 1.8 + the refiner 1.5 + 16 MP work
+vram_gib: 24.0                  # B70, 4096x4096 2 steps: 22.3 GiB by the engine's count (int8 18.7 + the LoRA 1.82 + the refiner 1.5 + the work)
 defaults:
   steps: 2
   cfg: 1.0

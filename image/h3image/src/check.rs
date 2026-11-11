@@ -141,7 +141,20 @@ pub fn run(e: &H3Image, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)
                 }
                 let (_, lat) = d.f32(&format!("lat_{i}"))?;
                 let t0 = std::time::Instant::now();
-                let v = run.net(&lat, sig[i], sig[i + 1], &mut |_| Ok(())).map_err(h3e)?;
+                // step 0: the stream after blocks 0, 1 and 24 against the reference's (where an error starts)
+                let p = run.prepare(sig[i]).map_err(h3e)?;
+                let mut early = Vec::new();
+                let v = run.net_prepared(p, &lat, sig[i + 1], &mut |b| {
+                    if i == 0 && [1, 2, 25].contains(&b) {
+                        early.push((b - 1, run.stream()?));
+                    }
+                    Ok(())
+                }).map_err(h3e)?;
+                for (b, got) in early {
+                    if d.has(&format!("blk_{b}")) {
+                        note(&format!("blk_{b}"), &got, &d.f32(&format!("blk_{b}"))?.1, log);
+                    }
+                }
                 let secs = t0.elapsed().as_secs_f64();
                 if d.has(&format!("head_{i}")) {
                     let want = d.f32(&format!("head_{i}"))?.1;

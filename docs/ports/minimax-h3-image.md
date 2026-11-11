@@ -218,3 +218,129 @@ GGUFs).
 - Edit parity against the reference (ref.py has no edit stage); the vision tower and VAE encoder are H3's, checked in
   the video port.
 - The license: hosted service to third parties needs MiniMax's written authorization (see the cards).
+
+## The pDMD 2-step LoRA (2026-11-11)
+
+akhaliq/minimax-h3-image-pdmd-2step @ ef1e3b9a: pDMD's 2-NFE LoRA (pdmd2026, Apache-2.0; rank 128 on attention + FFN of
+the 50 blocks and the 2 refiner blocks) in ComfyUI's layout (`minimax_h3_pdmd_2nfe_comfyui.safetensors`, Iwannapose's
+conversion), at strength 1, sampled in 2 steps instead of 6. Card `minimax-h3-image-pdmd2` (int8 ConvRot + the LoRA);
+the LoRA alone `minimax-h3-image-pdmd-2step-lora` (rides on any MiniMax-H3-Image card, brings steps 2 / shift 12).
+
+### Fit (checked before building anything)
+
+- The LoRA's 208 modules against our files' tensors by name and shape (safetensors / GGUF headers): all 208 fit, 0
+  missing, 0 wrong shape, in Hearthscale's Q3_K_M / Q4_K_M / Q5_K_M / Q8_0 GGUFs and Comfy-Org's int8 ConvRot file. The
+  "pruned" checkpoint is 20.1B parameters at the full widths (5,376; qkv 3 x 7,168; fc1 28,672; fc2 14,336; 50 blocks):
+  what MiniMax's 33.1B count adds is the per-block AdaLN projections (~13B) the pruned file replaces with its
+  timestep-curve tables - none of them LoRA'd. Nothing bigger needed downloading.
+- The same check on P-H3-Image's files: the int8 ConvRot file and the Q8_0 GGUF (tensors prefixed
+  `model.diffusion_model.`, stripped by the reader) fit all 208, as does H3 FL2VA int8 (`p-h3-image-lora`'s base). The
+  P-H3-Image engine needs no change to run it (a load-time LoRA on its side path, `options.sigmas` "1,0.923077,0"): not
+  run here, no card made.
+- The ComfyUI conversion against the diffusers original (`lora_model_0.safetensors`) by byte ranges, blocks 0 and 37:
+  qkv A is [A_q; A_k; A_v], B block-diagonal (zeros elsewhere), fc1 B's halves swapped to ComfyUI's [gate; value];
+  alpha / rank 1 everywhere (qkv 384 / 384). ComfyUI and this engine split qkv as contiguous [q | k | v].
+- One difference between the routes: MiniMax-H3-Image's six-head bank. ComfyUI (the route the LoRA's card verified)
+  blends the heads by the PDD grid at every step; the diffusers route (training, the demo Space) has one head
+  [96, 5376]. The engine follows ComfyUI; `NS_H3I_HEADS=first` takes head 0 alone.
+
+### How it runs
+
+- **Side path, not merged**: crates/h3's `out += B (A x)` after each of a block's four products and the refiner's, in
+  bfloat16 (the video engine's LoRA code; integer `alpha` tensors are now read - the conversion stores I64). 1.82 GiB on
+  the card. Merging was not built: an int8 ConvRot or k-quant matrix would have to be expanded, added to and quantized
+  again (a second rounding), and all the side path costs is +10 - 14 % (below). The fused qkv B stays block-diagonal
+  at rank 384: 2/3 zeros, ~0.57 GiB and ~1.4 % of a block's multiply-adds that three rank-128 products would save
+  (nextcuda stores it compact) - not done.
+- **Schedule**: ComfyUI's MiniMaxH3SigmaShift (shift_video 12) + BasicScheduler "simple": the 1,000-entry flow table read
+  at even indices, 2 steps -> 1, 0.923077, 0; the heads still weighted by their own grid. Unit-tested against ComfyUI's
+  arithmetic; nextcuda's 2-step list is the same.
+- **img2img / detail pass / edit from a picture**: on a shifted schedule a strength below 1 is the start sigma itself
+  (the live editor's contract: s0 taken back to the shift's time, even steps from there; 0.55 at 2 steps -> 0.55,
+  0.367, 0); on the heads' grid it stays ComfyUI's denoise. `options.start-sigma` gives the demo Space's detail grid (s0,
+  0.943 s0, 0.733 s0, 0 at 3 steps). The start is s0 noise + (1 - s0) the picture's latents (ComfyUI's CONST scaling; the
+  posterior sampled under seed 42 as MiniMaxH3ImageVAE.encode does). `reference: false`: a text-only img2img; with the
+  reference the edit is anchored and starts from the picture.
+- **Caches** (`live.rs`, the card's settings): the text encoder's result and the refined text for the last 8 prompts
+  (key: prompt + picture hashes), the VAE latents of the last 8 pictures per size and use; the token refiner kept.
+
+### Parity (ref.py `--lora --shift 12 --steps 2`: the bf16 file in float32, the LoRA merged in float32; 576 x 384, seed 3; B65)
+
+| | int8 | Q8_0 | Q5_K_M | Q4_K_M | Q3_K_M |
+|---|---|---|---|---|---|
+| refined text (refiner LoRA'd) | 5.8e-3 | 7.4e-3 | 3.0e-2 | 5.8e-2 | 1.2e-1 |
+| stream after block 24, step 0 | 7.2e-3 | - | - | 2.7e-2 | - |
+| stream after block 49, step 0 | 1.6e-1 | 1.4e-1 | 2.8e-1 | 4.2e-1 | 5.4e-1 |
+| velocity, steps 0 / 1 | 6.7e-2 / 9.1e-2 | 5.1e-2 / 8.0e-2 | 1.3e-1 / 1.8e-1 | 2.5e-1 / 2.9e-1 | 3.8e-1 / 3.5e-1 |
+| velocity cosine, worst | 0.99587 | 0.99681 | 0.98405 | 0.95678 | 0.92670 |
+| final latents (2 steps from the reference's noise) | 2.9e-1 | 2.1e-1 | 4.6e-1 | 6.4e-1 | 7.5e-1 |
+| no LoRA, same schedule: block 49 / velocity 0 | 5.4e-2 / 1.9e-2 | 4.3e-2 / 2.1e-2 | | 1.8e-1 / 1.1e-1 | |
+
+- Schedule, head weights, noise, decoder: exact (the decoder 3.2e-4, 98.6 % of the bytes equal, 100 % within 1).
+- The side path is exact to the base model's own error: after blocks 0 / 1 / 24 the stream's error is the same with and
+  without the LoRA (int8 6.5e-3 / 4.8e-3 / 7.2e-3 against 6.2e-3 / 4.7e-3 / 6.0e-3; Q4_K_M 2.8e-2 / 1.9e-2 / 2.7e-2
+  against 2.8e-2 / 1.9e-2 / 3.2e-2). The extra error grows in blocks 25 - 49, where the LoRA reshapes the stream (its own
+  effect in the reference: 2.6 % of the stream after block 24, 53 % after block 49, 42 % of the step-0 velocity): the
+  2-step network amplifies the quantization error already there, ~3x at every quant, Q8_0 included.
+- So: **int8 and Q8_0 take the LoRA acceptably** (worst cosine 0.996 - 0.997); Q5_K_M marginal (0.984); Q4_K_M (0.957)
+  and Q3_K_M (0.927) visibly worse, as P-H3-Image's Q4 + LoRA was. Only the int8 card is made.
+- `NS_H3I_HEADS=first` against the reference's head-0 run: velocity 6.7e-2 / 1.4e-1 (the same story).
+- The pictures: the reference at 576 x 384 shows a crosshatch texture (either head choice). At 1 - 4 MP the engine's
+  2-step pictures follow the prompt and compose well but keep a fine crosshatch on flat textures (sand), as the
+  reference does; the 3-step polish from sigma 0.5 removes it (crisp detail, composition held). The strength-1 edit
+  changes the scene strongly and keeps the composition (nextcuda's finding too); their sigma-0.55 edit was not run.
+
+### Speed (B70; the denoiser steps alone / the decode; the text encoder cached after the first request)
+
+| B70, seconds | int8 + LoRA 2 steps | 3 steps | 4 steps | int8 no LoRA 2 | Q8_0 + LoRA 2 | Q4_K_M + LoRA 2 / 3 / 4 | Q4_K_M no LoRA 2 |
+|---|---|---|---|---|---|---|---|
+| 1024 x 1024 (1 MP) | 0.70 / 0.09 | 1.06 | 1.41 | 0.62 | 0.96 | 1.31 / 1.98 / 2.63 | 1.23 |
+| 2048 x 2048 (4 MP) | 2.61 / 0.44 | 3.76 | 5.02 | 2.29 | 3.82 | 3.90 / 5.74 / 7.64 | 3.57 |
+| 2912 x 2912 (8.5 MP) | 5.49 / 0.85 | 8.13 | 10.83 | 4.87 | 7.95 | 8.07 / 11.99 / 15.98 | 7.42 |
+| 4096 x 4096 (16.8 MP) | 13.18 / 1.63 | 19.82 | 26.43 | 11.99 | 17.94 | 17.99 / 26.96 / 35.94 | 16.83 |
+| card memory (the engine's count) | 22.1 - 22.3 GiB | | | 20.2 - 20.5 | 23.4 - 23.6 | 14.5 - 14.6 | 12.7 - 12.8 |
+
+- Against the stock 6 steps (the second pass: int8 B70 steps 1.83 / 6.50 / 14.55 / 35.69 s) 2 steps + LoRA is 2.6 -
+  2.7x faster; the side path costs +10 - 14 % (int8), +6 - 9 % (Q4_K_M).
+- A whole picture with the prompt cached (steps + decode), int8 B70, 2 steps: 1 MP 0.79 s, 4 MP 3.05 s, 8.5 MP 6.34 s,
+  16.8 MP 14.81 s (the LoRA card's H200 bf16 figure at 16 MP: ~17.4 s).
+- Not measured: the B65 bench tables (the queue put every bench on the B70); the B65's 1 MP frame is in the live table.
+
+### A live editor's latency (`image check --stages live`: int8 + LoRA, 1024 x 1024, B65, one process)
+
+| request | wall s | what ran |
+|---|---|---|
+| frame, cold (the first request) | 17.06 | the text encoder's first read 15.0 (file into pinned memory), 2 steps 1.31, decode 0.72 |
+| same prompt, next seed | **1.20** | 2 steps 1.05 + decode 0.15 (text and refiner cached) |
+| prompt edited (a few words) | 2.50 | the text encoder 1.28 (58 tokens, pinned) + the steps + decode |
+| edit of frame 0, cold | 24.98 | vision tower + 1,052-token encode 19.2, the picture's latents 2.78, 2 steps 2.83 |
+| the same edit, next seed | **2.88** | 2 steps 2.75 (the picture's tokens ride along) + decode; all else cached |
+| the edit's prompt changed | 12.08 | the encode again with the picture 9.2 (vision tower + 1,052 tokens); latents cached |
+| polish of frame 0 from sigma 0.5, 3 steps | 3.36 | VAE encoder load + encode 1.66 (cached the next time), 3 steps 1.55 |
+
+The platform's 5070 + 3060 figures for comparison (theirs): generate warm 4.2 s, full edit 8 s, img2img from 0.55 5.4 s.
+What is cached: per prompt + pictures the encoder's rows and the refined text (a new prompt re-runs the whole encoder,
+the vision tower too: the vision prefix is not cached apart); per picture and size its latents. The text encoder
+(Qwen3-VL 32B Q4_K_M) streams from pinned host memory at each encode: the floor for a new prompt (1.3 s short, 9 s with
+a 1 MP picture). Cheaper prompt edits need the encoder resident (no room beside int8 on 32 GB) or the vision prefix
+cached by picture - not done.
+
+Cancel: the engine looks for a cancel every 10 blocks (`POLL_BLOCKS`) and after each step: at 1 MP a step is 0.35 s on
+the B70 (0.52 s on the B65), so the denoise stops within 0.07 - 0.1 s (one fifth of a step); not inside the text encoder
+(1.3 - 9 s) or the decode (0.09 s). Cancel-to-free through the front door end to end was not measured.
+
+### The live editor's API (the platform's contract, checked)
+
+| item | state |
+|---|---|
+| capabilities `generate`, `edit`, `img2img`, `few_step` | `few_step` added (NS_H3I_STEPS <= 4); the rest already there; `state` and `copies_now` already in system.models |
+| image.edit `strength` < 1 = start sigma; `reference` true / false | added for shifted schedules; `reference` already parsed by the image server (default true) |
+| caches of the picture's latents and the conditionings | added (8 / 8); the vision prefix apart: not done |
+| cancel by label within a fraction of a step | added (every 10 blocks); end-to-end time not measured |
+| rsvp_s on image.generate / image.edit | already (both run a model: backplane RUNS_MODEL; tested); a shorter later value does not shorten a hold; `rsvp_s: 0` releases only once no earlier hold stands - not an immediate release |
+| system.unload ends the model's hold | added: the hold (rsvp_s or keep) is removed on unload (tested) |
+| seed fixed between frames, `size` on the grid (768 x 768) | already (the grid is 32, seeds as given) |
+
+No new method was needed: `image.generate` / `image.edit` with `wait`, `label`, `queue: false` and `image.cancel
+{label}` cover rapid frames; a preview size then a polish is two calls (the polish an `image.edit` with
+`reference: false`, a `strength` and `options.start-sigma`).
