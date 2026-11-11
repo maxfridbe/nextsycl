@@ -184,7 +184,7 @@ export async function maintenance(on: boolean): Promise<void> {
   void poll();
 }
 
-export type Tab = "status" | "api" | "config";
+export type Tab = "status" | "api" | "config" | "describe";
 
 export async function loadConfig(): Promise<void> {
   try {

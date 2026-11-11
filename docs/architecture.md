@@ -98,7 +98,9 @@ model3d/                   3D
 glue/                      WHAT MAKES ENGINES A PRODUCT (libraries too)
   models     nextsycl-models     the registry of what a machine serves, settings, the catalog of supported models
   serve      nextsycl-serve      the servers: OpenAI-compatible APIs over a kind's contract (llm, image, audio), the prompt
-                                 cache, telemetry; video: the daemon (queue, a worker process a GPU) and the studio
+                                 cache, telemetry; video: the daemon (queue, a worker process a GPU) and the studio;
+                                 describe: image.describe - a picture to its prompt through a chat model that reads
+                                 pictures (no engine of its own: docs/api/image-describe.md)
 
 cli/
   nextsycl   nextsycl            the program: argument parsing and output; lists the engines it has, by kind

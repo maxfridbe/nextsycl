@@ -147,6 +147,19 @@ the products, runs guidance's two passes as one batch and the VAE's group norm o
 `gen` runs the engine in-process (the server path, `image serve | start | ps`, comes next); the PNG keeps the
 prompt, model, seed, size and steps. `check` compares each stage with the dumps of `reference/qwenimage21/ref.py`.
 
+## Pictures to prompts (`image.describe`)
+
+```sh
+nextsycl image describe barn.png --target z-image-turbo [--detail short|medium|long] [--negative] [--json] [--server HOST:PORT]
+```
+
+The prompt that would draw a picture, written the way the target image model reads prompts (families: natural,
+qwen-image, z-image, h3, hunyuanimage, moss-image, ming-image, tags), with a negative prompt for the models that read
+one and a canvas at the picture's aspect for the target. The describer is a chat model that reads pictures
+(`qwen3.8-27b-q4-describe`: Qwen3.8-27B and its vision tower, a short context); the front door's `image.describe` runs it
+as a job in the image queue (label, cancel), the home page's Describe tab calls it. The contract, the measured speeds and
+a round trip (describe, draw the prompt again, compare) are in [docs/api/image-describe.md](api/image-describe.md).
+
 ## The image server and its web front end
 
 ```sh

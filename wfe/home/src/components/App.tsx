@@ -4,6 +4,7 @@ import { jsx } from "../jsx.js";
 import { act, autoPull, copy, maintenance, render, setTab, toggleKind, toggleRsvp, ui } from "../main.js";
 import type { Available, Card, Model, Proc, Service } from "../types.js";
 import { Api } from "./Api.js";
+import { Describe } from "./Describe.js";
 import { ConfigView } from "./Config.js";
 import { DrivesPanel, ModelDisk } from "./Drives.js";
 import { Spinner } from "./Spinner.js";
@@ -480,10 +481,11 @@ export function App() {
       <div class="tabs">
         <button class={{ tab: true, on: ui.tab === "status" }} on={{ click: () => setTab("status") }}>Status</button>
         <button class={{ tab: true, on: ui.tab === "api" }} on={{ click: () => setTab("api") }}>API</button>
+        <button class={{ tab: true, on: ui.tab === "describe" }} on={{ click: () => setTab("describe") }}>Describe</button>
         <button class={{ tab: true, on: ui.tab === "config" }} on={{ click: () => setTab("config") }}>Config</button>
       </div>
       {ui.error ? <pre class="err" on={{ click: () => { ui.error = null; render(); } }}>{ui.error}</pre> : null}
-      {ui.tab === "api" ? <Api /> : ui.tab === "config" ? <ConfigView /> : <Status />}
+      {ui.tab === "api" ? <Api /> : ui.tab === "config" ? <ConfigView /> : ui.tab === "describe" ? <Describe /> : <Status />}
     </div>
   );
 }

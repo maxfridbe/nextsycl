@@ -21,6 +21,8 @@ use serde_json::{json, Value};
 use crate::http::{self, Conn, Target};
 
 type Fail = (u16, String);
+/// width, height
+pub type Size = (u32, u32);
 
 /// The prompt styles: one for each way our image models read a prompt
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -386,7 +388,7 @@ pub fn suggested_size(width: u32, height: u32, family: Family) -> (u32, u32) {
 
 /// The picture as the describer is shown it: decoded (PNG, JPEG, WebP), transparency on white, at most `max_pixels`
 /// (Lanczos), as PNG; and its size as sent and as shown
-pub fn prepare(bytes: &[u8], max_pixels: u64) -> Result<(Vec<u8>, (u32, u32), (u32, u32)), String> {
+pub fn prepare(bytes: &[u8], max_pixels: u64) -> Result<(Vec<u8>, Size, Size), String> {
     let p = crate::image::picture(bytes, "image")?;
     let (w, h) = (p.width, p.height);
     let rgb = if p.channels == 4 {
